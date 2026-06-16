@@ -28,6 +28,7 @@ use crate::view::View;
 
 mod buffers;
 mod changelist;
+mod cmdcomplete;
 mod cmdline;
 mod command;
 mod complete;
@@ -61,6 +62,7 @@ mod windows;
 
 // The command grammar + its normal/visual executor. The parse↔execute contract
 // types stay private to `command`; only the shared vocabulary is re-exported.
+pub use self::cmdcomplete::CmdlineCompleteReq;
 pub use self::command::{
     command_pending_after, command_status, CommandContinuation, CommandPending, CommandStatus,
 };
@@ -831,6 +833,16 @@ pub struct Editor {
     /// can't (the `lsp` source's `textEdit` + `additionalTextEdits`). `None` when the
     /// last accept was a native `buffer` insert (already applied in core).
     pub complete_accept_request: Option<usize>,
+    /// The command-line completion engine's configuration (`nx.cmdline_complete`).
+    /// Disabled until a config arrives, so an editor with no command-line completion
+    /// is byte-for-byte unchanged. See [`cmdcomplete`](crate::editor::cmdcomplete).
+    cmdcomplete: cmdcomplete::CmdlineCompleteConfig,
+    /// A pending command-line completion request: core stamps the token being
+    /// completed here on `<Tab>` (and on each edit while the menu is open), and the
+    /// server resolves it against the bundled catalog source — fetching candidates
+    /// in one round-trip and rebuilding the menu via [`Editor::open_cmdline_menu`].
+    /// `None` when idle. See [`cmdcomplete`](crate::editor::cmdcomplete).
+    pub cmdline_complete_request: Option<cmdcomplete::CmdlineCompleteReq>,
     pub should_quit: bool,
     /// Editor options set via `:set` (number column, …).
     pub options: Options,
@@ -1305,6 +1317,8 @@ impl Editor {
             complete_query_changes: Vec::new(),
             complete_gen: 0,
             complete_accept_request: None,
+            cmdcomplete: cmdcomplete::CmdlineCompleteConfig::default(),
+            cmdline_complete_request: None,
             should_quit: false,
             options: Options::default(),
             qf: QfStack::default(),

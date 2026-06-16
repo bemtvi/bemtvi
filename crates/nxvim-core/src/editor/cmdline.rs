@@ -77,6 +77,42 @@ impl Editor {
         // `cancel` / `submit` change the mode (closing the line), so they return
         // before the trailing incsearch refresh.
         match action {
+            // `<Tab>`: cycle the wildmenu selection forward while it is open, else
+            // open / refresh it (the wildmenu sibling of the insert-mode completion
+            // trigger). `<S-Tab>` (`complete_prev`) is its backward twin.
+            "complete" => {
+                if self.cmdline_menu_open() {
+                    self.cmdline_complete_next();
+                } else {
+                    self.cmdline_complete_trigger();
+                }
+                return Ok(());
+            }
+            "complete_prev" => {
+                if self.cmdline_menu_open() {
+                    self.cmdline_complete_prev();
+                } else {
+                    self.cmdline_complete_trigger();
+                }
+                return Ok(());
+            }
+            // With the popup open, the history keys overload to wildmenu navigation:
+            // `<C-p>`/`<Up>` (prev) and `<C-n>`/`<Down>` (next) cycle the selection
+            // instead of recalling history (vim's wildmenu key sharing).
+            "history_prev" if self.cmdline_menu_open() => {
+                self.cmdline_complete_prev();
+                return Ok(());
+            }
+            "history_next" if self.cmdline_menu_open() => {
+                self.cmdline_complete_next();
+                return Ok(());
+            }
+            // With the completion popup open, `<Esc>` closes it first — a second
+            // `<Esc>` then cancels the line (vim's wildmenu dismissal).
+            "cancel" if self.cmdline_menu_open() => {
+                self.close_cmdline_menu();
+                return Ok(());
+            }
             "cancel" => {
                 self.cancel_cmdline();
                 return Ok(());
@@ -117,6 +153,9 @@ impl Editor {
         if let CmdlineKind::Search(dir) = self.cmdline_kind {
             self.update_incsearch_preview(dir);
         }
+        // An edit / cursor move refreshes an open completion popup against the new
+        // token (a no-op when no cmdline menu is open — typing never opens it).
+        self.cmdline_complete_refresh();
         Ok(())
     }
 
@@ -125,6 +164,11 @@ impl Editor {
     /// origin mode. A confirm dialog never reaches here — it is resolved by
     /// [`handle_confirm`](Self::handle_confirm) on the raw-read path.
     fn submit_cmdline(&mut self) {
+        // Accept the highlighted wildmenu row (rewriting the command-name token) before
+        // the line resolves, so `<CR>` accepts-then-executes; a noselect popup (nothing
+        // highlighted) leaves the typed line unchanged. Either way the popup closes.
+        self.cmdline_complete_accept();
+        self.close_cmdline_menu();
         let text = std::mem::take(&mut self.cmdline);
         self.cmdline_col = 0;
         let kind = self.cmdline_kind;
@@ -203,6 +247,9 @@ impl Editor {
                 if let CmdlineKind::Search(dir) = self.cmdline_kind {
                     self.update_incsearch_preview(dir);
                 }
+                // Narrow an open completion popup against the new prefix (no-op when
+                // none is open — typing never opens the wildmenu, only `<Tab>` does).
+                self.cmdline_complete_refresh();
             }
         }
     }
@@ -213,6 +260,8 @@ impl Editor {
     /// so the dock-navigation path can close the line directly (the `cancel` action
     /// is the keymap-driven entry).
     pub(crate) fn cancel_cmdline(&mut self) {
+        // Abandoning the line also dismisses any open completion popup.
+        self.close_cmdline_menu();
         if matches!(self.cmdline_kind, CmdlineKind::Search(_)) {
             self.cursor = self.search_origin;
             self.clamp_cursor();

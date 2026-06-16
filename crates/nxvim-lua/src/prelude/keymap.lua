@@ -540,6 +540,14 @@ for _, name in ipairs({
   "history_prev",
   "history_next",
   "insert_register",
+  -- `<Tab>` / `<S-Tab>`: open the command-line completion popup (nx.cmdline_complete,
+  -- the float-list widget's fifth orchestration), then cycle the selection forward /
+  -- backward while it is open. The other navigation + accept keys overload the
+  -- existing cmdline keys when the popup is open — `<CR>` (submit) accepts the
+  -- highlighted row then executes, `<C-n>`/`<C-p>` (history) cycle the selection, and
+  -- `<Esc>` (cancel) closes the popup before it cancels the line.
+  "complete",
+  "complete_prev",
 }) do
   nx.cmdline.actions[name] = function()
     nx._cmdline_action(name)
@@ -565,6 +573,8 @@ for _, m in ipairs({
   { "<Down>", "history_next", "Newer history entry" },
   { "<C-n>", "history_next", "Newer history entry" },
   { "<C-r>", "insert_register", "Insert register" },
+  { "<Tab>", "complete", "Command completion" },
+  { "<S-Tab>", "complete_prev", "Command completion (previous)" },
 }) do
   nx.keymap.set("cmdline", m[1], nx.cmdline.actions[m[2]], { default = true, desc = m[3] })
 end

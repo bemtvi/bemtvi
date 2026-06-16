@@ -1551,6 +1551,18 @@ pub(crate) fn install_runtime_api(
             Ok(())
         })?,
     )?;
+    // `nx._cmdline_complete_setup(docs)`: enable the command-line completion engine
+    // (the float-list widget's fifth orchestration). `docs` toggles the docs/params
+    // preview pane (Phase 3). The candidate source itself is the Lua function
+    // `nx._cmdline_complete_run`, which the server calls synchronously per `<Tab>`.
+    let sh = shared.clone();
+    nx.set(
+        "_cmdline_complete_setup",
+        lua.create_function(move |_, docs: bool| {
+            sh.borrow_mut().cmdline_complete_setups.push(docs);
+            Ok(())
+        })?,
+    )?;
 
     // `nx._statusline_setup(win, kind, left, right)`: queue a `nx.statusline.setup{}`
     // / `reset()` request ([`StatuslineSetupReq`]). `win` is `nil` for the global

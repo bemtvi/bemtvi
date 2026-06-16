@@ -35,12 +35,14 @@ use crate::view::MenuView;
 /// `Cursor` anchors it under the cursor (the `nx.ui.select` / completion shape);
 /// `Editor` centers it over the editor (the picker shape); `Bottom` pins it to the
 /// editor's bottom-right corner (the which-key content-float shape — menus never
-/// request it).
+/// request it); `Cmdline` floats it directly **above the command line**, anchored
+/// under the token being completed (the `nx.cmdline_complete` shape).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MenuPlacement {
     Cursor,
     Editor,
     Bottom,
+    Cmdline,
 }
 
 /// Which orchestration drives this `Menu`. The widget is one shape; the kind
@@ -56,6 +58,13 @@ pub(crate) enum MenuKind {
     Select,
     Picker,
     Complete,
+    /// Command-line completion (`nx.cmdline_complete`) — the wildmenu sibling of
+    /// `Complete`. Like `Complete` it does **not** grab input (the command line
+    /// keeps focus, keys keep editing the line) and its rows carry their own
+    /// [`MenuItem::insert`] text; unlike it, the accept replaces a token of the
+    /// command line, not buffer text, and it floats above the command line
+    /// ([`MenuPlacement::Cmdline`]).
+    Cmdline,
 }
 
 /// Where a picker's prompt sits relative to its results list — above it (`Top`,
@@ -449,6 +458,35 @@ impl Menu {
         }
         Some(&self.all_items[self.item_at(self.cursor)])
     }
+
+    /// Advance the selection one row, wrapping. A noselect popup (the completion /
+    /// cmdline wildmenu just opened) activates the selection on the first call and
+    /// highlights row 0; thereafter it cycles forward. A no-op on an empty view.
+    /// Shared by the insert-completion popup and the command-line wildmenu.
+    fn select_next(&mut self) {
+        let len = self.view_len();
+        if len == 0 {
+        } else if !self.selected_active {
+            self.selected_active = true;
+            self.cursor = 0;
+        } else {
+            self.cursor = (self.cursor + 1) % len;
+        }
+    }
+
+    /// Retreat the selection one row, wrapping. A noselect popup activates the
+    /// selection on the first call and highlights the **last** row; thereafter it
+    /// cycles backward. A no-op on an empty view.
+    fn select_prev(&mut self) {
+        let len = self.view_len();
+        if len == 0 {
+        } else if !self.selected_active {
+            self.selected_active = true;
+            self.cursor = len - 1;
+        } else {
+            self.cursor = (self.cursor + len - 1) % len;
+        }
+    }
 }
 
 impl Editor {
@@ -537,6 +575,124 @@ impl Editor {
         });
     }
 
+    /// Open / rebuild the **command-line completion** popup (`nx.cmdline_complete`):
+    /// the catalog `candidates` (each `(label, insert, doc)`) are fuzzy-ranked against
+    /// `prefix` (the command-name token typed so far) and become a
+    /// [`MenuKind::Cmdline`] menu floating above the command line, anchored under the
+    /// token. `anchor` is the byte offset of the token in [`Editor::cmdline`] (accept
+    /// replaces `[anchor .. cmdline_col)` — Phase 2); `anchor_width` is the display
+    /// width of the line before it (the float's column after the `:` prompt). Nothing
+    /// matching closes any open popup (the wildmenu just disappears). Opens noselect —
+    /// no row highlighted until the user navigates (Phase 2). The server calls this
+    /// after resolving an [`Editor::cmdline_complete_request`] against the Lua source.
+    pub fn open_cmdline_menu(
+        &mut self,
+        anchor: usize,
+        anchor_width: usize,
+        prefix: &str,
+        candidates: Vec<(String, String, Option<String>)>,
+        docs: bool,
+    ) {
+        let labels: Vec<&str> = candidates.iter().map(|(l, _, _)| l.as_str()).collect();
+        let ranked = crate::fuzzy::rank(prefix, &labels);
+        if ranked.is_empty() {
+            self.close_cmdline_menu();
+            return;
+        }
+        let mut all_items = Vec::with_capacity(ranked.len());
+        let mut filtered = Vec::with_capacity(ranked.len());
+        let mut match_spans = Vec::with_capacity(ranked.len());
+        for (key, (idx, spans)) in ranked.into_iter().enumerate() {
+            let (label, insert, doc) = candidates[idx].clone();
+            all_items.push(MenuItem {
+                label,
+                key,
+                preview: None,
+                insert: Some(insert),
+                priority: 0,
+                source_accept: false,
+                doc,
+                resolve: None,
+            });
+            filtered.push(key);
+            match_spans.push(spans);
+        }
+        self.menu = Some(Menu {
+            kind: MenuKind::Cmdline,
+            anchor,
+            anchor_width,
+            all_items,
+            filtered: Some(filtered),
+            match_spans,
+            cursor: 0,
+            // Noselect: nothing highlighted until the user navigates (Phase 2), so
+            // `<CR>` keeps executing the typed line until a row is chosen.
+            selected_active: false,
+            placement: MenuPlacement::Cmdline,
+            prompt: None,
+            complete_prefix: prefix.to_string(),
+            prompt_pos: PromptPos::default(),
+            dynamic: false,
+            preview: false,
+            preview_scroll: None,
+            docs,
+            generation: 0,
+            items_gen: 0,
+            width: None,
+            height: None,
+        });
+    }
+
+    /// Close the popup **only if it is a command-line completion menu** — leaves an
+    /// open `select` / picker / insert-completion menu untouched. A no-op when
+    /// nothing (or a non-cmdline menu) is open.
+    pub(crate) fn close_cmdline_menu(&mut self) {
+        if self.menu_kind() == Some(MenuKind::Cmdline) {
+            self.menu = None;
+        }
+    }
+
+    /// `&mut` to the open menu iff it is a command-line completion menu.
+    fn cmdline_menu_mut(&mut self) -> Option<&mut Menu> {
+        self.menu.as_mut().filter(|m| m.kind == MenuKind::Cmdline)
+    }
+
+    /// Move the command-line wildmenu selection forward (`<Tab>` / `<C-n>` / `<Down>`
+    /// while the popup is open). Like the insert-completion popup it opens **noselect**
+    /// — the first `next` highlights row 0, the first `prev` the last row — and only
+    /// then does `<CR>` accept (until then it runs the typed line unchanged). A no-op
+    /// unless a cmdline menu is open.
+    pub(crate) fn cmdline_complete_next(&mut self) {
+        if let Some(m) = self.cmdline_menu_mut() {
+            m.select_next();
+        }
+    }
+
+    pub(crate) fn cmdline_complete_prev(&mut self) {
+        if let Some(m) = self.cmdline_menu_mut() {
+            m.select_prev();
+        }
+    }
+
+    /// The actively-selected command-line completion's `(anchor, insert_text)`,
+    /// closing the menu. `None` when no cmdline menu is open **or nothing is selected
+    /// yet** (the popup is noselect until the user navigates) — the caller then runs
+    /// the typed line unchanged. The caller rewrites `[anchor .. cmdline_col)` with the
+    /// insert text ([`Editor::cmdline_complete_accept`]).
+    pub(crate) fn cmdline_complete_take_accept(&mut self) -> Option<(usize, String)> {
+        let m = self.cmdline_menu_mut()?;
+        if !m.selected_active {
+            return None;
+        }
+        let row = m.all_items.get(m.item_at(m.cursor))?;
+        let acc = (
+            m.anchor,
+            row.insert.clone().unwrap_or_else(|| row.label.clone()),
+        );
+        self.menu = None;
+        Some(acc)
+    }
+
     /// The open menu's current query generation — the token the server stamps onto
     /// source runs and pushes, so a stale push is dropped. `0` when no menu (or a
     /// promptless `select`) is open.
@@ -616,7 +772,7 @@ impl Editor {
     pub(crate) fn menu_grabs_input(&self) -> bool {
         self.menu
             .as_ref()
-            .is_some_and(|m| m.kind != MenuKind::Complete)
+            .is_some_and(|m| !matches!(m.kind, MenuKind::Complete | MenuKind::Cmdline))
     }
 
     /// Open or refresh the completion popup at generation `gen`: the synchronous
@@ -720,27 +876,13 @@ impl Editor {
     /// menu is open.
     pub(crate) fn complete_select_next(&mut self) {
         if let Some(m) = self.completion_menu_mut() {
-            let len = m.view_len();
-            if len == 0 {
-            } else if !m.selected_active {
-                m.selected_active = true;
-                m.cursor = 0;
-            } else {
-                m.cursor = (m.cursor + 1) % len;
-            }
+            m.select_next();
         }
     }
 
     pub(crate) fn complete_select_prev(&mut self) {
         if let Some(m) = self.completion_menu_mut() {
-            let len = m.view_len();
-            if len == 0 {
-            } else if !m.selected_active {
-                m.selected_active = true;
-                m.cursor = len - 1;
-            } else {
-                m.cursor = (m.cursor + len - 1) % len;
-            }
+            m.select_prev();
         }
     }
 

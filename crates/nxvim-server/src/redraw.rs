@@ -1212,6 +1212,30 @@ impl EditHost {
                 let rows = editor.menu_rows(start, list_rows);
                 (row, col, width, height, rows, m.selected - start)
             }
+            MenuPlacement::Cmdline => {
+                // The `nx.cmdline_complete` wildmenu: a bordered list floating just
+                // above the command line (the bottom of the text area). The whole
+                // (small) list is projected — like `select`, no scroll subtlety.
+                // `anchor_offset` is the display width of the line before the token
+                // (0 for the leading command name), so the box left-aligns under it.
+                let rows = editor.menu_rows(0, m.total);
+                let count = rows.len().min(MAX_H);
+                let content_w = rows
+                    .iter()
+                    .map(|(l, _)| l.chars().count())
+                    .max()
+                    .unwrap_or(1)
+                    .max(1);
+                let col = m.anchor_offset.min(text_width.saturating_sub(1));
+                let max_w = text_width.saturating_sub(col).max(1);
+                let width = content_w.min(max_w);
+                // A full bordered box (2 rows of chrome) sitting on the last text rows,
+                // so its bottom border abuts the command line below.
+                const VCHROME: usize = 2;
+                let height = count.min(text_height.saturating_sub(VCHROME).max(1));
+                let row = text_height.saturating_sub(height + VCHROME);
+                (row, col, width, height, rows, m.selected)
+            }
         };
 
         // The preview pane (Phase 3): a column on the right of an editor-placement
@@ -1265,6 +1289,12 @@ impl EditHost {
         // below the cursor. Absent ⇒ a full border (the `select` / picker default).
         if m.completion {
             map.push((Value::from("border_top"), Value::from(false)));
+        }
+        // The command-line wildmenu (`nx.cmdline_complete`) floats above the command
+        // line, not the focused window — so the client anchors it to the command-line
+        // area (frame-bottom, no number gutter) instead of the window's text inner.
+        if matches!(m.placement, MenuPlacement::Cmdline) {
+            map.push((Value::from("cmdline"), Value::from(true)));
         }
         // The prompt query: present (even when empty) for a picker, absent for a
         // promptless `nx.ui.select`. Its presence tells the client to draw a prompt row,
@@ -1453,7 +1483,9 @@ impl EditHost {
                 };
                 (row, col, width, height)
             }
-            MenuPlacement::Editor => {
+            // Content floats are never cmdline-placed (only the `nx.cmdline_complete`
+            // menu is); a stray one falls back to editor-centered.
+            MenuPlacement::Editor | MenuPlacement::Cmdline => {
                 let width = content_w.min(text_width.saturating_sub(CHROME).max(1));
                 let height = count.min(text_height.saturating_sub(CHROME).max(1));
                 let row = text_height.saturating_sub(height + CHROME) / 2;

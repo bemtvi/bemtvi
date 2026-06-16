@@ -32,13 +32,13 @@ pub use buffer::{Buffer, BufferEdit, DiskChange, EditBatch};
 pub use clipboard::Clipboard;
 pub use editor::{
     command_pending_after, command_status, language_of_path, BorderStyle, BufferId, ClickSurface,
-    CommandContinuation, CommandPending, CommandStatus, CompleteConfig, CompleteKeys, Cursor,
-    DecorViewport, Editor, FileChangeAction, FileChangeReason, FileChangelist, FileMarkEntry,
-    FloatAnchor, FloatConfig, FloatRelative, GlobalMarkEntry, JumpPos, MenuExtent, MenuItem,
-    MenuPlacement, NumberedMark, PendingOpen, PendingQuitAll, PendingSave, PersistState,
-    PreviewScroll, PreviewTarget, PromptPos, QfAction, QfEntry, QfList, QfStack, QfWhich,
-    RegisterEntry, ShadaRequest, StatuslineClick, TabId, TerminalOp, UndoEntry, UndoTreeView,
-    WindowConfigSpec, WindowId,
+    CmdlineCompleteReq, CommandContinuation, CommandPending, CommandStatus, CompleteConfig,
+    CompleteKeys, Cursor, DecorViewport, Editor, FileChangeAction, FileChangeReason,
+    FileChangelist, FileMarkEntry, FloatAnchor, FloatConfig, FloatRelative, GlobalMarkEntry,
+    JumpPos, MenuExtent, MenuItem, MenuPlacement, NumberedMark, PendingOpen, PendingQuitAll,
+    PendingSave, PersistState, PreviewScroll, PreviewTarget, PromptPos, QfAction, QfEntry, QfList,
+    QfStack, QfWhich, RegisterEntry, ShadaRequest, StatuslineClick, TabId, TerminalOp, UndoEntry,
+    UndoTreeView, WindowConfigSpec, WindowId,
 };
 pub use encoding::Encoding;
 pub use extmark::{

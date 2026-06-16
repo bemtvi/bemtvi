@@ -1,0 +1,23 @@
+Command-line completion (nx.cmdline_complete) — the wildmenu demo.
+
+Open the command line with `:` and press <Tab> to float a fuzzy list of
+matching command names above the line. Try these:
+
+    :e<Tab>        edit, enew, …            (everything with an `e`)
+    :w<Tab>        write, wq, wall, wqall   (everything with a `w`)
+    :tab<Tab>      tabnew, tabclose, tabnext, tabprevious, …
+    :b<Tab>        buffers, buffer, bnext, bprevious, bdelete, …
+    :se<Tab>       set, setlocal, setfiletype
+
+Cycle the highlight with <Tab>/<S-Tab> (or <C-n>/<C-p>, or the arrows), then
+press <CR> to accept-and-run the highlighted command. <Esc> dismisses the
+wildmenu but keeps the line so you can keep typing.
+
+Worked example — turn `:ene` into a fresh empty buffer:
+
+    :ene<Tab>      `enew` leads the list (top fuzzy match for `ene`)
+    <Tab>          highlight it
+    <CR>           accept + run :enew — this buffer is replaced by an empty one
+
+The list narrows live: type `:e<Tab>`, then press `d`, and the popup collapses
+to just `edit` (the `ed` subsequence drops `enew`).

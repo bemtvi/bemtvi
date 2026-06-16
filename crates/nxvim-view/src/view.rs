@@ -406,6 +406,12 @@ pub struct MenuData {
     /// which sits flush against the line below the cursor; `true` (the default,
     /// when the key is absent) for a `select` / picker.
     pub border_top: bool,
+    /// Whether this is the **command-line** completion wildmenu
+    /// (`nx.cmdline_complete`). When set, the client anchors the box to the
+    /// command-line area (frame-bottom, no number gutter) rather than the focused
+    /// window's text inner — `col` is then a column within the command line and the
+    /// box floats just above it. `false` (key absent) for every other menu.
+    pub cmdline: bool,
     /// Per visible row (parallel to `items`), the matched-character spans to
     /// highlight as half-open **char** ranges (empty for rows with no match).
     pub match_spans: Vec<Vec<(u16, u16)>>,
@@ -631,6 +637,7 @@ impl View {
                 query_cursor: map_u16(m, "query_cursor"),
                 prompt_bottom: map_get(m, "prompt_pos").and_then(Value::as_str) == Some("bottom"),
                 border_top: map_get(m, "border_top").and_then(Value::as_bool) != Some(false),
+                cmdline: map_get(m, "cmdline").and_then(Value::as_bool) == Some(true),
                 match_spans: parse_multi_spans(map_get(m, "match_spans")),
                 preview: match map_get(m, "preview") {
                     Some(Value::Map(p)) => Some(MenuPreview {

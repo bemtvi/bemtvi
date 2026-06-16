@@ -281,7 +281,12 @@ pub(crate) fn render(
     // over the focused window's text area, with input focus. A picker returns its
     // prompt caret position so we can draw the terminal cursor there.
     let menu_cursor = match (&view.menu, focused_inner) {
-        (Some(menu), Some((inner, _, _))) => render_menu(frame, inner, menu, &view.styles),
+        // The command-line wildmenu anchors to the command-line area (frame-bottom,
+        // no gutter), every other menu to the focused window's text inner.
+        (Some(menu), Some((inner, _, _))) => {
+            let base = if menu.cmdline { cmd_area } else { inner };
+            render_menu(frame, base, menu, &view.styles)
+        }
         _ => None,
     };
 
@@ -2083,31 +2088,57 @@ fn render_menu(
     // below the cursor), so it costs one fewer row than a fully bordered box. It
     // also shifts one cell left so the *left* border doesn't push the list off the
     // word: `menu.col` is the content anchor (the word start), and the box's left
-    // border sits one cell before it.
-    let (borders, vborder) = if menu.border_top {
+    // border sits one cell before it. The command-line wildmenu is the mirror image:
+    // it omits its *bottom* border so the list sits flush against the command line
+    // it floats above.
+    let (borders, vborder) = if menu.cmdline {
+        (Borders::LEFT | Borders::RIGHT | Borders::TOP, 1)
+    } else if menu.border_top {
         (Borders::ALL, 2)
     } else {
         (Borders::LEFT | Borders::RIGHT | Borders::BOTTOM, 1)
     };
     let left_shift = u16::from(!menu.border_top);
-    let x = text_area
-        .x
-        .saturating_add(menu.col)
-        .saturating_sub(left_shift);
-    let y = text_area.y.saturating_add(menu.row);
-    let width = menu
-        .width
-        .saturating_add(2)
-        .min(text_area.right().saturating_sub(x));
-    let height = menu
-        .height
-        .saturating_add(vborder)
-        .min(text_area.bottom().saturating_sub(y));
-    let area = Rect {
-        x,
-        y,
-        width,
-        height,
+    let area = if menu.cmdline {
+        // The command-line wildmenu: a fully-bordered box floating just *above* the
+        // command line. `text_area` here is the command-line area (frame-bottom, no
+        // number gutter), so the box aligns to the command line, not the focused
+        // window. `col` is a column within the command line (the token's start), and
+        // the box grows upward from the command-line row.
+        let x = text_area.x.saturating_add(menu.col);
+        let width = menu
+            .width
+            .saturating_add(2)
+            .min(text_area.width.saturating_sub(menu.col).max(1));
+        // The box can use every row above the command line.
+        let height = menu.height.saturating_add(vborder).min(text_area.y);
+        let y = text_area.y.saturating_sub(height);
+        Rect {
+            x,
+            y,
+            width,
+            height,
+        }
+    } else {
+        let x = text_area
+            .x
+            .saturating_add(menu.col)
+            .saturating_sub(left_shift);
+        let y = text_area.y.saturating_add(menu.row);
+        let width = menu
+            .width
+            .saturating_add(2)
+            .min(text_area.right().saturating_sub(x));
+        let height = menu
+            .height
+            .saturating_add(vborder)
+            .min(text_area.bottom().saturating_sub(y));
+        Rect {
+            x,
+            y,
+            width,
+            height,
+        }
     };
     if area.width < 3 || area.height < vborder + 1 {
         return None;
@@ -2206,6 +2237,12 @@ fn render_menu(
     } else {
         for r in 0..list_rows {
             lines.push(list_line(r));
+        }
+        // The command-line wildmenu floats *above* its input, so flip the list to
+        // keep the best match (row 0) at the bottom, nearest the command cursor —
+        // the mirror of a below-cursor completion popup.
+        if menu.cmdline {
+            lines.reverse();
         }
     }
     frame.render_widget(Paragraph::new(Text::from(lines)), list_area);

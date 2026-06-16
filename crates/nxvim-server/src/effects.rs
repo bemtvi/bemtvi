@@ -714,6 +714,12 @@ impl EditHost {
             self.complete_snippets_active = req.snippets;
             self.complete_snippets_priority = req.snippets_priority;
         }
+        // `nx.cmdline_complete.setup{}`: enable the command-line completion engine
+        // (the float-list widget's fifth orchestration). The last config wins; `docs`
+        // toggles the params/help preview pane (Phase 3).
+        for docs in self.lua.take_cmdline_complete_setups() {
+            self.editor.configure_cmdline_complete(docs);
+        }
         // `nx.snippet.setup{}` jump keys, `nx.snippet.add` registrations, and
         // `nx.snippet.expand(body)` immediate expansions.
         for req in self.lua.take_snippet_setups() {
@@ -2171,6 +2177,35 @@ impl EditHost {
                 self.complete_lsp_dispatch(gen);
                 // The built-in `snippets` source is feature-agnostic (core engine).
                 self.complete_snippet_dispatch(gen);
+                self.apply_lua_effects();
+            }
+            // Command-line completion (`nx.cmdline_complete`): core stamped the token
+            // being completed on `<Tab>` (or an edit while the wildmenu is open).
+            // Resolve it synchronously against the bundled catalog source — the filter
+            // is a microsecond table scan, so unlike the insert sources there is no
+            // streaming / generation machinery — and rebuild the menu from the result.
+            if let Some(req) = self.editor.cmdline_complete_request.take() {
+                let docs = self.editor.cmdline_complete_docs();
+                match self.lua.run_cmdline_complete(&req.line, req.col) {
+                    Ok(cands) => {
+                        let cands: Vec<(String, String, Option<String>)> = cands
+                            .into_iter()
+                            .map(|(label, insert, doc)| {
+                                (label, insert, (!doc.is_empty()).then_some(doc))
+                            })
+                            .collect();
+                        self.editor.open_cmdline_menu(
+                            req.anchor,
+                            req.anchor_width,
+                            &req.prefix,
+                            cands,
+                            docs,
+                        );
+                    }
+                    Err(e) => self
+                        .editor
+                        .echo(format!("E5108: Error in nx.cmdline_complete source: {e}")),
+                }
                 self.apply_lua_effects();
             }
             // nx.decor: a window whose visible range changed (scroll / resize / edit

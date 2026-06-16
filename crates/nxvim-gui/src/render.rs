@@ -777,8 +777,9 @@ impl Renderer {
         self.build_pmenu(view, focus_origin, doc_scroll, overlay_quads, overlay_items);
 
         // The floating selectable-list menu (`nx.ui.select`), in the same overlay
-        // layer and anchored the same way (the focused window's region origin).
-        self.build_menu(view, focus_origin, overlay_quads, overlay_items);
+        // layer and anchored the same way (the focused window's region origin) — except
+        // the command-line wildmenu, which anchors to the command-line row (`cmd_row`).
+        self.build_menu(view, focus_origin, cmd_row, overlay_quads, overlay_items);
 
         // The list-less content float (`nx.ui.float`; LSP hover / signature help),
         // same overlay layer, anchored at the focused window's region origin.
@@ -1784,6 +1785,7 @@ impl Renderer {
         &mut self,
         view: &View,
         origin: (u16, u16),
+        cmd_row: u16,
         quads: &mut Vec<Quad>,
         items: &mut Vec<TextItem>,
     ) {
@@ -1821,13 +1823,27 @@ impl Renderer {
         // padding doesn't push the list off the word (`menu.col` is the content
         // anchor; the box origin sits one cell before it). `select` / picker are
         // fully bordered and anchored at `menu.col`.
-        let top_pad = u16::from(menu.border_top);
-        let left_shift = u16::from(!menu.border_top);
-        let bx = (text_x0 + menu.col).saturating_sub(left_shift);
-        let by = wy + menu.row;
+        // The command-line wildmenu is anchored to the command line, not the focused
+        // window: it floats just *above* the `cmd_row` (frame col 0, no gutter) and
+        // drops its *bottom* border so the list sits flush against the input — the
+        // mirror of the below-cursor completion popup (which drops its top border).
+        let top_pad = u16::from(menu.border_top || menu.cmdline);
+        let left_shift = u16::from(!menu.border_top && !menu.cmdline);
         let box_w = menu.width + 2;
-        let box_h = menu.height + 1 + top_pad;
-        if menu.border_top {
+        // Borders counted into the box height: a top edge for a bordered / cmdline box,
+        // a bottom edge for everything except the cmdline wildmenu (flush to the input).
+        let box_h = menu.height + top_pad + u16::from(!menu.cmdline);
+        let (bx, by) = if menu.cmdline {
+            (origin.0 + menu.col, cmd_row.saturating_sub(box_h))
+        } else {
+            (
+                (text_x0 + menu.col).saturating_sub(left_shift),
+                wy + menu.row,
+            )
+        };
+        if menu.cmdline {
+            self.fill_box_no_bottom(quads, (bx, by, box_w, box_h), popup_bg, border);
+        } else if menu.border_top {
             self.fill_box(quads, (bx, by, box_w, box_h), popup_bg, border);
         } else {
             self.fill_box_no_top(quads, (bx, by, box_w, box_h), popup_bg, border);
@@ -1908,7 +1924,10 @@ impl Renderer {
             let Some(label) = menu.items.get(idx) else {
                 continue;
             };
-            let row = content_y0 + list_y0 + r;
+            // The command-line wildmenu floats above its input, so flip the list to
+            // keep the best match (row 0) at the bottom, nearest the command cursor.
+            let display_r = if menu.cmdline { list_rows - 1 - r } else { r };
+            let row = content_y0 + list_y0 + display_r;
             if sel == Some(idx) {
                 self.fill_cells(quads, cx, row, list_w, sel_bg);
             }
@@ -2134,6 +2153,45 @@ impl Renderer {
         let c = color_to_rgba(srgb_to_color(border));
         let edges = [
             (px, py + ph - t, pw, t), // bottom
+            (px, py, t, ph),          // left
+            (px + pw - t, py, t, ph), // right
+        ];
+        for (x, y, w, h) in edges {
+            quads.push(Quad {
+                x,
+                y,
+                w,
+                h,
+                color: c,
+            });
+        }
+    }
+
+    /// Like [`fill_box`] but without the **bottom** edge — the command-line
+    /// wildmenu's flush look, abutting the command line it floats above. Fills the bg
+    /// and draws the top / left / right border edges only.
+    fn fill_box_no_bottom(
+        &self,
+        quads: &mut Vec<Quad>,
+        rect: (u16, u16, u16, u16),
+        bg: u32,
+        border: u32,
+    ) {
+        let (x, y, w, h) = rect;
+        let (px, py) = self.cell_px(x, y);
+        let pw = self.cell_w * w as f32;
+        let ph = self.cell_h * h as f32;
+        quads.push(Quad {
+            x: px,
+            y: py,
+            w: pw,
+            h: ph,
+            color: color_to_rgba(srgb_to_color(bg)),
+        });
+        let t = (self.cell_w * 0.12).max(1.0);
+        let c = color_to_rgba(srgb_to_color(border));
+        let edges = [
+            (px, py, pw, t),          // top
             (px, py, t, ph),          // left
             (px + pw - t, py, t, ph), // right
         ];

@@ -365,6 +365,12 @@ const PRELUDE_MODULES: &[(&str, &str)] = &[
         "nxvim:prelude/complete",
         include_str!("prelude/complete.lua"),
     ),
+    // nx.cmdline_complete: command-line completion (the widget's fifth orchestration
+    // — `<Tab>` command-name suggestions with a docs pane).
+    (
+        "nxvim:prelude/cmdline_complete",
+        include_str!("prelude/cmdline_complete.lua"),
+    ),
     // nx.snippet: the native snippet engine (tabstop session + snippets source).
     ("nxvim:prelude/snippet", include_str!("prelude/snippet.lua")),
     // nx.statusline: the declarative segment registry (lualine shape). Loads after
@@ -459,6 +465,11 @@ pub(crate) struct Shared {
     /// `nx.complete.setup{}` configurations, drained by the server into
     /// `Editor::configure_complete` (the native completion engine, Phase 4-A).
     pub(crate) complete_setups: Vec<CompleteSetupReq>,
+    /// `nx.cmdline_complete.setup{}` configurations (the command-line completion
+    /// engine — the float-list widget's fifth orchestration). Each carries the
+    /// `docs` flag; the server drains it into `Editor::configure_cmdline_complete`.
+    /// Empty until a config arrives, so command-line completion is off by default.
+    pub(crate) cmdline_complete_setups: Vec<bool>,
     /// Pending `nx.complete.trigger()` requests (a manual completion open). Each is
     /// payload-free; the server runs `Editor::complete_manual_trigger` once if any
     /// arrived since the last drain.
@@ -981,6 +992,12 @@ impl LuaRuntime {
     }
 
     take_queue! {
+        /// Take the `nx.cmdline_complete.setup{}` configurations queued since the
+        /// last drain, for the server to enable the command-line completion engine.
+        take_cmdline_complete_setups -> Vec<bool> = cmdline_complete_setups
+    }
+
+    take_queue! {
         /// Take the async completion candidates streamed since the last drain, for
         /// the server to append (generation-gated) to the open completion popup.
         take_complete_pushes -> Vec<CompletePush> = complete_pushes
@@ -1176,6 +1193,37 @@ impl LuaRuntime {
         t.set("row", lua_int(row as i64))?;
         t.set("col", lua_int(col as i64))?;
         run.call::<()>((lua_int(gen as i64), t))
+    }
+
+    /// Resolve a command-line completion request synchronously (`nx._cmdline_complete_run`):
+    /// the bundled `nx.cmdline_complete` source filters its curated command catalog
+    /// (merged with `nx.user_command.get()`) for the command line `line` / cursor `col`
+    /// and **returns** the candidate list directly — a `{ {label, insert, doc}, … }`
+    /// array. Unlike the insert-completion sources (async / streamed, for slow rg / lsp
+    /// scans), the catalog filter is a microsecond table scan, so it is a single
+    /// round-trip on the input path; the server fuzzy-ranks + renders the result via
+    /// `Editor::open_cmdline_menu`. `col` is a 0-based char offset into `line`.
+    pub fn run_cmdline_complete(
+        &self,
+        line: &str,
+        col: usize,
+    ) -> mlua::Result<Vec<(String, String, String)>> {
+        let nx = self.nx()?;
+        let run: mlua::Function = nx.get("_cmdline_complete_run")?;
+        let list: Table = run.call((self.lua.create_string(line)?, lua_int(col as i64)))?;
+        let mut out = Vec::new();
+        for item in list.sequence_values::<Table>() {
+            let item = item?;
+            let label: String = item.get("label")?;
+            // `insert` defaults to the label (complete to the whole command name);
+            // `doc` defaults to empty (no docs pane until Phase 3).
+            let insert: String = item
+                .get::<Option<String>>("insert")?
+                .unwrap_or_else(|| label.clone());
+            let doc: String = item.get::<Option<String>>("doc")?.unwrap_or_default();
+            out.push((label, insert, doc));
+        }
+        Ok(out)
     }
 
     /// Whether any `nx.decor` provider is registered — the gate the server checks

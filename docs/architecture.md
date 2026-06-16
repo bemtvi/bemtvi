@@ -1046,17 +1046,24 @@ screen," and that is exactly the shape of these tests.
   mirrored placeholders; see
   [the snippet plan](plans/2026-06-15-nx-snippet-engine.md)). Still ahead: statusline
   segments, tree docks, `nx.decor`, and the manifest loader / package manager.
-- `:TSInstall`-style grammar fetch & compile (grammars are loaded from the data
-  dir today; installing them there is manual / a follow-up) and a `:set`-driven
-  highlight toggle. (Treesitter **injections** have landed — engine-native, see
-  [*Syntax highlighting*](#syntax-highlighting-treesitter).) Treesitter is the
+- **Treesitter control.** `:TSInstall` / `:TSUpdate` / `:TSInstallInfo` have
+  **landed**: the native arm fetches + compiles each grammar into the data dir
+  off the editor thread (`nxvim_ts::install`, with a pinned checksum-verified Zig
+  fetched on demand when no system `cc`/`clang`/`gcc`/`zig`/`$NXVIM_CC` is found),
+  and the browser arm fetches a *prebuilt* `.wasm` grammar instead; a real
+  nvim-treesitter plugin that registers `:TSInstall` shadows the native arm. The
+  `:set`-driven highlight toggle has landed too. (Residual `:TSInstall` edges —
+  grammars needing `tree-sitter generate`, no install-from-`HEAD` — are tracked in
+  [*Known approximations*](known-approximations.md).) Treesitter **injections**
+  have landed (engine-native, see
+  [*Syntax highlighting*](#syntax-highlighting-treesitter)). Treesitter is the
   **native engine**; control is `nx.treesitter` (see
   [*`nx.treesitter` — control, not a parser API*](#nxtreesitter--control-not-a-parser-api)):
   highlight on/off + language are declarative buffer state (`nx.bo.filetype` /
   `nx.bo.ts_highlight`, also reachable from `:set`), query customization is
   `nx.treesitter.set_query`, and **injections** are engine-native. There is no Lua
   parser/AST platform (the vendored `vim.treesitter` Lua was deleted — ADR 0002);
-  Lua-driven indent remains deferred.
+  **Lua-driven indent remains the one deferred item on this axis.**
 - **Window-local options.** Multiple **windows** (splits, the layout tree,
   per-window view state, the `<C-w>` family, and the `nvim_win_*` / Lua API),
   **floating windows** (`nvim_open_win` with `relative`, the z-ordered overlay

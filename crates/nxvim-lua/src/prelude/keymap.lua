@@ -417,6 +417,44 @@ function nx._panel_select_buffer(line)
   end
 end
 
+-- ----- the pending-key event (which-key / showcmd) -------------------------
+-- nx.on_key_pending(fn): subscribe to the engine-computed pending-key signal. The
+-- server fires it whenever the *pending key-context changes* — a mapped prefix
+-- grows (you type <leader>, then w) or clears (the sequence completed, broke, or
+-- the idle flush resolved it) — NOT per keystroke (ADR 0002 rule 4: no per-key
+-- Lua). The handler receives
+--   ctx = { mode, keys, continuations = { { key, desc, kind = "map"|"group" }, … } }
+-- where `keys` is the withheld prefix in vim notation ("" when the context cleared,
+-- which a which-key popup treats as "close") and each continuation is one key that
+-- extends the prefix — `kind = "map"` completes a mapping (carrying its `desc`),
+-- `kind = "group"` only leads on to longer mappings. This is the render-time oracle
+-- a native which-key plugin debounces (nx.utils.debounce) and draws as a persistent,
+-- bottom-anchored nx.ui.float. Continuations come from the mapped-prefix trie today
+-- (user + native-default maps); the built-in g/z/operator grammar is a later source.
+nx._on_key_pending = nx._on_key_pending or {}
+
+function nx.on_key_pending(fn)
+  if type(fn) ~= "function" then
+    error("nx.on_key_pending: expects a function", 2)
+  end
+  nx._on_key_pending[#nx._on_key_pending + 1] = fn
+  -- Tell the server a listener exists so it starts computing + pushing the signal;
+  -- it skips the whole path while none are registered.
+  nx._key_pending_register()
+end
+
+-- nx._key_pending_dispatch(ctx): fan one pending-key event out to every registered
+-- handler (called from Rust on each pending-context change). A throwing handler is
+-- isolated (surfaced via nx.notify) so one bad listener can't starve the others.
+function nx._key_pending_dispatch(ctx)
+  for _, fn in ipairs(nx._on_key_pending) do
+    local ok, err = pcall(fn, ctx)
+    if not ok then
+      nx.notify("nx.on_key_pending handler error: " .. tostring(err), "error")
+    end
+  end
+end
+
 -- ----- vim.api.nvim_*_keymap compatibility aliases -------------------------
 -- The muscle-memory `vim.api.nvim_*` names for the keymap natives above, each
 -- forwarding to the canonical `nx.keymap.*` (same function object, same

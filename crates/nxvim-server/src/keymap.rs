@@ -39,7 +39,7 @@
 
 use std::collections::HashMap;
 
-use nxvim_core::{command_status, parse_keys, CommandStatus, Key, Mode};
+use nxvim_core::{command_status, key_to_notation, parse_keys, CommandStatus, Key, Mode};
 use nxvim_lua::{RawKeymap, RawRhs};
 
 #[cfg(feature = "native")]
@@ -102,6 +102,59 @@ pub struct Mapping {
     /// server runs it via `run_keymap_expr` and feeds the returned keys. Only a Lua
     /// RHS is affected — a string RHS ignores it (nxvim has no expression evaluator).
     pub expr: bool,
+    /// The `desc` opt, surfaced to the [`KeyPending`] event (which-key / showcmd) as
+    /// a continuation's label. `None` for a map with no description and for the
+    /// native defaults. Unused by matching.
+    pub desc: Option<String>,
+}
+
+/// A snapshot of the live pending key-context the **`KeyPending`** event carries to
+/// Lua (which-key / showcmd): the mode it was computed in, the withheld prefix in
+/// vim notation, and the immediate continuations that extend it. Built by
+/// [`Keymaps::pending_context`] from the mapped-prefix trie — source A (user and
+/// native-default maps). The built-in command grammar (`g`/`z`/operator-pending)
+/// and active-widget key tables (sources B/C of the design) are a later extension;
+/// this is the engine signal that unblocks a mapped-prefix (leader-key) which-key.
+#[derive(Clone, Debug, PartialEq)]
+pub struct KeyPending {
+    /// The editor-mode short code the prefix is live in (`"n"`, `"i"`, `"v"`, …).
+    pub mode: String,
+    /// The withheld prefix as re-parseable vim notation (`"g"`, `"<Space>w"`).
+    pub keys: String,
+    /// Every immediate continuation of the prefix, sorted by key notation so the
+    /// event payload is deterministic (the trie's child map is unordered).
+    pub continuations: Vec<Continuation>,
+}
+
+/// One key that extends a pending prefix in the [`KeyPending`] event.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Continuation {
+    /// The continuation key as vim notation (`"w"`, `"<C-w>"`).
+    pub key: String,
+    /// The `desc` of the mapping this key completes, when it completes one.
+    pub desc: Option<String>,
+    /// Whether this key completes a mapping or only leads deeper into the trie.
+    pub kind: ContinuationKind,
+}
+
+/// Whether a [`Continuation`] completes a mapping or only extends toward one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ContinuationKind {
+    /// The key completes a mapping (it may *also* lead deeper to a longer one).
+    Map,
+    /// The key only extends toward longer mappings — no mapping ends on it. A
+    /// which-key popup renders these as a `+prefix` group.
+    Group,
+}
+
+impl ContinuationKind {
+    /// The lowercase tag the Lua event payload carries (`"map"` / `"group"`).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ContinuationKind::Map => "map",
+            ContinuationKind::Group => "group",
+        }
+    }
 }
 
 /// A built-in default mapping the server installs at startup (design D6/B2): the
@@ -191,6 +244,35 @@ impl Trie {
             (None, false) => Classify::Prefix,                // live prefix, not yet complete
             (None, true) => Classify::None,                   // unreachable in a well-formed trie
         }
+    }
+
+    /// The immediate continuations of `keys` — the children of the trie node `keys`
+    /// leads to — or `None` when `keys` is not a live prefix in this trie. A child
+    /// that terminates a mapping is a [`Map`](ContinuationKind::Map) carrying its
+    /// `desc`; one that only leads deeper is a [`Group`](ContinuationKind::Group).
+    /// Sorted by key notation so the [`KeyPending`] payload is deterministic.
+    fn continuations(&self, keys: &[Key]) -> Option<Vec<Continuation>> {
+        let mut node = &self.root;
+        for k in keys {
+            node = node.children.get(k)?;
+        }
+        let mut out: Vec<Continuation> = node
+            .children
+            .iter()
+            .map(|(k, child)| {
+                let (kind, desc) = match &child.mapping {
+                    Some(m) => (ContinuationKind::Map, m.desc.clone()),
+                    None => (ContinuationKind::Group, None),
+                };
+                Continuation {
+                    key: key_to_notation(*k),
+                    desc,
+                    kind,
+                }
+            })
+            .collect();
+        out.sort_by(|a, b| a.key.cmp(&b.key));
+        Some(out)
     }
 
     /// The longest prefix of `keys` that is a complete mapping, with its length —
@@ -317,6 +399,7 @@ impl Keymaps {
                 nowait: false,
                 silent: false,
                 expr: false,
+                desc: None,
             };
             for &bucket in mode_buckets(d.mode) {
                 self.tries
@@ -343,6 +426,7 @@ impl Keymaps {
                 nowait: entry.nowait,
                 silent: entry.silent,
                 expr: entry.expr,
+                desc: entry.desc.clone(),
             };
             for mode in &entry.modes {
                 // A declared map-mode (`'n'`, `'v'`/`'x'`, `''` = all, …) fans out
@@ -366,6 +450,27 @@ impl Keymaps {
     /// reorder past a genuinely-withheld prefix.
     pub fn pending_empty(&self) -> bool {
         self.pending.is_empty()
+    }
+
+    /// The live pending key-context for `mode` (the **`KeyPending`** oracle), or
+    /// `None` when nothing is withheld — the withheld prefix plus its continuations
+    /// from the current buffer's mapped-prefix trie. A `None` (empty `pending`) tells
+    /// the caller there is no active prefix, which it emits as a *cleared* event so a
+    /// which-key popup closes. Computed against the current trie, so it already
+    /// reflects buffer-local maps and the precedence ladder the matcher matches on.
+    pub fn pending_context(&self, mode: Mode) -> Option<KeyPending> {
+        if self.pending.is_empty() {
+            return None;
+        }
+        let continuations = self
+            .tries
+            .get(&mode_key(mode))?
+            .continuations(&self.pending)?;
+        Some(KeyPending {
+            mode: mode.short_code().to_string(),
+            keys: self.pending.iter().copied().map(key_to_notation).collect(),
+            continuations,
+        })
     }
 
     /// Feed one input key in `mode` and return the steps it produced. The server

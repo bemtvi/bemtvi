@@ -552,6 +552,11 @@ pub struct EditHost {
     /// `EditHost::input` runs every key through before `editor.input`. Rebuilt from
     /// `nx._keymaps` when its version advances (checked once per input batch).
     keymaps: Keymaps,
+    /// The last pending key-context pushed to `nx.on_key_pending` listeners, for the
+    /// change-detection that keeps the **`KeyPending`** event fire-on-change (not
+    /// per keystroke). `None` means the context is currently empty (or never set);
+    /// `emit_key_pending` re-pushes only when the live context differs from this.
+    last_key_pending: Option<crate::keymap::KeyPending>,
     /// Callback ids queued by `vim.schedule`, drained inside `run_pending` so a
     /// scheduled fn runs at the end of the current convergence (not nested in its
     /// caller). A scheduled fn may schedule more, so this feeds the fixpoint loop.
@@ -774,6 +779,7 @@ impl EditHost {
             last_tab_id: None,
             known_tabs: Vec::new(),
             keymaps: Keymaps::default(),
+            last_key_pending: None,
             scheduled: VecDeque::new(),
             buf_mirror_ticks: HashMap::new(),
             buf_mirror_lines: HashMap::new(),

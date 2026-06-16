@@ -1601,6 +1601,45 @@ impl EditHost {
         }
     }
 
+    /// Push the **`KeyPending`** event to `nx.on_key_pending` listeners when the live
+    /// pending key-context differs from the last one pushed — the which-key / showcmd
+    /// oracle (the design's "fires whenever the pending key-context changes"). Gated
+    /// on a registered listener so a no-which-key config never walks the trie or
+    /// re-enters Lua. The change-detection (`last_key_pending`) is what keeps the
+    /// event fire-on-change rather than per keystroke: an unchanged context (a key
+    /// that didn't move the prefix, an off-tick timer) is a no-op, and the prefix
+    /// clearing fires exactly one *cleared* event (`keys = ""`). A handler that opens
+    /// a float queues an effect applied here; deferred work re-loops the fixpoint.
+    fn emit_key_pending(&mut self) {
+        if !self.lua.has_key_pending_listeners() {
+            return;
+        }
+        let ctx = self.keymaps.pending_context(self.editor.mode);
+        if ctx == self.last_key_pending {
+            return;
+        }
+        self.last_key_pending = ctx.clone();
+        // A cleared context (empty `pending`) is pushed as `keys = ""` with no
+        // continuations, in the mode it cleared in — a which-key popup reads that as
+        // "close". A live context carries its prefix + continuations.
+        let (mode, keys, conts) = match &ctx {
+            Some(kp) => {
+                let conts: Vec<(&str, Option<&str>, &str)> = kp
+                    .continuations
+                    .iter()
+                    .map(|c| (c.key.as_str(), c.desc.as_deref(), c.kind.as_str()))
+                    .collect();
+                (kp.mode.as_str(), kp.keys.as_str(), conts)
+            }
+            None => (self.editor.mode.short_code(), "", Vec::new()),
+        };
+        if let Err(e) = self.lua.run_key_pending(mode, keys, &conts) {
+            self.editor
+                .echo(format!("E5108: Error in nx.on_key_pending handler: {e}"));
+        }
+        self.apply_lua_effects();
+    }
+
     /// The settle contract for an off-tick event arm: drive every queued effect to
     /// convergence (`run_pending`, which also drains `self.scheduled`) and repaint
     /// once. `dirty` forces a repaint even when no Lua callback ran (e.g. an LSP
@@ -1799,6 +1838,13 @@ impl EditHost {
                     self.apply_lua_effects();
                 }
             }
+            // nx.on_key_pending: the matcher's withheld prefix settled this batch —
+            // push the pending-key signal (which-key / showcmd) iff it *changed* since
+            // the last push. Inside the fixpoint so a handler that opens a float has
+            // its effect applied + drained here (and the change-gate makes a repeat
+            // round a no-op). Gated on a registered listener, so the common config
+            // never reaches the trie walk.
+            self.emit_key_pending();
             // Float-list widget results: a confirmed (`Some(key)`) or cancelled
             // (`None`) outcome fires the waiting consumer off the same tick, inside
             // the fixpoint (it may open another widget / queue lua). A `nx.picker`

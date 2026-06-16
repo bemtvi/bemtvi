@@ -1617,6 +1617,20 @@ pub(crate) fn install_runtime_api(
         })?,
     )?;
 
+    // `nx._key_pending_register()`: an `nx.on_key_pending` listener was registered —
+    // flip the live gate so the server starts computing + pushing the pending-key
+    // signal on each input batch. While it stays unset the server never walks the
+    // trie for continuations or re-enters Lua, so the common no-which-key config pays
+    // nothing per keystroke. The pending-key (which-key / showcmd) oracle.
+    let sh = shared.clone();
+    nx.set(
+        "_key_pending_register",
+        lua.create_function(move |_, ()| {
+            sh.borrow_mut().key_pending_active = true;
+            Ok(())
+        })?,
+    )?;
+
     // `nx._confirm(label, accelerators, default, cb_id)`: queue a `vim.fn.confirm`
     // button dialog ([`ConfirmReq`]). The server opens the command line as a
     // single-key confirm prompt showing `label`; a keypress matching one of

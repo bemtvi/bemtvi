@@ -133,6 +133,22 @@ help / diagnostics are unaffected.
 
 ## The pending-key event (the oracle) — design decisions (2026-06-15)
 
+> **Source A LANDED (2026-06-16).** `nx.on_key_pending(fn)` ships the
+> engine-computed `KeyPending` signal over the **mapped-prefix trie** (user +
+> native-default maps): the server computes the pending context once per input
+> batch (`Keymaps::pending_context`), fires on *change* (a server-side
+> `last_key_pending` diff — fire-on-change, not per keystroke), and pushes
+> `{ mode, keys, continuations = {{ key, desc, kind = "map"|"group" }} }` to Lua.
+> Continuations are sorted by key notation (deterministic), carry each map's `desc`,
+> and distinguish a completing `map` from a `group` that only leads deeper; a
+> *cleared* context is `keys = ""` so a popup closes. The emit is gated on a
+> registered listener (no which-key ⇒ no trie walk, no re-entry), drained inside the
+> `run_pending` fixpoint next to `nx.decor` so a handler that opens a float settles
+> in the same tick. Tests: `crates/nxvim-server/tests/key_pending.rs`.
+> **Still source A only** — the built-in command grammar (B) and active-widget key
+> tables (C) below are the follow-up; the mapped-prefix (leader-key) which-key is
+> what A unblocks.
+
 which-key needs to know the *pending key context*, which the keymap matcher
 already tracks (`Keymaps::pending` + the per-mode trie) but didn't expose. The
 shape, after working it through:

@@ -501,6 +501,12 @@ pub(crate) struct Shared {
     /// no provider is set it skips the whole off-tick decor path (never slices the
     /// visible lines, never re-enters Lua). Phase 2 of `nx.decor`.
     pub(crate) decor_active: bool,
+    /// Whether any `nx.on_key_pending` listener has been registered
+    /// (`nx._key_pending_register`). The gate the server checks before computing /
+    /// pushing the pending-key signal: while no listener is set it never walks the
+    /// trie for continuations or re-enters Lua, so a no-which-key config pays nothing
+    /// per keystroke.
+    pub(crate) key_pending_active: bool,
     /// `vim.fn.confirm` button-dialog requests, drained by the server into the
     /// editor's command line (`Editor::open_confirm`) after the chunk.
     pub(crate) confirms: Vec<ConfirmReq>,
@@ -1081,6 +1087,44 @@ impl LuaRuntime {
     /// on scroll. Phase 2 of `nx.decor`.
     pub fn has_decor_providers(&self) -> bool {
         self.shared.borrow().decor_active
+    }
+
+    /// Whether any `nx.on_key_pending` listener has been registered
+    /// (`nx._key_pending_register`). The server gates the pending-key signal on this:
+    /// while unset it never computes continuations or re-enters Lua.
+    pub fn has_key_pending_listeners(&self) -> bool {
+        self.shared.borrow().key_pending_active
+    }
+
+    /// Fire the **`KeyPending`** event into Lua (`nx._key_pending_dispatch`). The
+    /// server calls this only when the pending key-context *changed* (a mapped prefix
+    /// grew or cleared). The payload is `{ mode, keys, continuations }` where each
+    /// continuation is `{ key, desc, kind = "map"|"group" }`; a *cleared* context is
+    /// `keys = ""` with no continuations, which a which-key popup treats as "close".
+    pub fn run_key_pending(
+        &self,
+        mode: &str,
+        keys: &str,
+        continuations: &[(&str, Option<&str>, &str)],
+    ) -> mlua::Result<()> {
+        let nx = self.nx()?;
+        let run: mlua::Function = nx.get("_key_pending_dispatch")?;
+        let ctx = self.lua.create_table()?;
+        ctx.set("mode", self.lua.create_string(mode)?)?;
+        ctx.set("keys", self.lua.create_string(keys)?)?;
+        let arr = self.lua.create_table()?;
+        for (i, (key, desc, kind)) in continuations.iter().enumerate() {
+            let cont = self.lua.create_table()?;
+            cont.set("key", self.lua.create_string(key)?)?;
+            match desc {
+                Some(d) => cont.set("desc", self.lua.create_string(d)?)?,
+                None => cont.set("desc", mlua::Value::Nil)?,
+            }
+            cont.set("kind", self.lua.create_string(kind)?)?;
+            arr.set(i + 1, cont)?;
+        }
+        ctx.set("continuations", arr)?;
+        run.call::<()>(ctx)
     }
 
     /// Dispatch the registered `nx.decor` providers for a window whose visible range

@@ -16,8 +16,11 @@
 -- already-settled promise, matching Promises/A+ §2.2.4.
 --
 -- It is an nxvim-native surface (no `vim.*` twin — neovim core has no Promise), so
--- it lives entirely on `nx`. Loaded after prelude/ui.lua so both `nx.schedule`
--- (microtasks) and `nx.timer` (nx.promise.delay) are already installed.
+-- it lives entirely on `nx`. As the async FOUNDATION every later surface builds on
+-- (process / picker / complete / nx.ui), it loads early — right after the runtime
+-- services it needs: `nx.schedule` (the microtask primitive the reactions run on)
+-- and `nx.timer` (the wall-clock deferral `nx.promise.delay` uses), both installed
+-- in prelude/runtime.lua just above.
 
 local vim = vim
 nx = nx or {}

@@ -1,11 +1,16 @@
 //! Behavior tests for `nx.ui.select` (alias `vim.ui.select`) — the floating
 //! selectable-list widget (`docs/specs/2026-06-14-nx-ui-float-widget.md`).
 //!
+//! `nx.ui.select` is PROMISE-ONLY: `nx.ui.select(items, opts)` resolves to the
+//! chosen item (nil on cancel). The `vim.ui.select` compat alias keeps neovim's
+//! `(item, index)` callback shape.
+//!
 //! Black-box like the rest: a real server sources an `init.lua`, the menu is
-//! driven over the same msgpack-RPC a UI uses, and the assertions are on the
-//! captured `on_choice` result (read back through `nvim_exec_lua`) and the
-//! projected `menu` redraw surface. The callback side-effects round-trip through
-//! request/reply so they need no redraw timing; the surface check polls for the
+//! driven over the same msgpack-RPC a UI uses, and the assertions are on the value
+//! the promise's `:next` records (read back through `nvim_exec_lua`) and the
+//! projected `menu` redraw surface. Delivering the menu result fires the resolver
+//! and `apply_lua_effects` drains the `:next` reaction in the same tick, so the
+//! effect is visible on the next ordered read; the surface check polls for the
 //! latest redraw (the reader task ferries notifications asynchronously).
 
 use nxvim_rpc::{Incoming, Rpc};
@@ -60,16 +65,16 @@ fn menu_of(map: &[(Value, Value)]) -> Vec<(Value, Value)> {
 }
 
 #[tokio::test]
-async fn confirm_returns_chosen_item_and_one_based_index() {
+async fn select_promise_resolves_with_chosen_item() {
     let dir = temp_dir("ui_select_confirm");
     let (rpc, _incoming) = start(&dir, "").await;
 
-    // Open a three-item chooser; the callback records the choice into globals.
+    // Open a three-item chooser; the :next handler records the choice into globals.
     exec_lua(
         &rpc,
-        "_G.item, _G.idx, _G.called = nil, nil, false
-         nx.ui.select({ 'alpha', 'beta', 'gamma' }, {}, function(item, idx)
-           _G.item, _G.idx, _G.called = item, idx, true
+        "_G.item, _G.called = nil, false
+         nx.ui.select({ 'alpha', 'beta', 'gamma' }, {}):next(function(item)
+           _G.item, _G.called = item, true
          end)",
     )
     .await;
@@ -86,25 +91,67 @@ async fn confirm_returns_chosen_item_and_one_based_index() {
         exec_lua(&rpc, "return _G.item").await.as_str(),
         Some("beta")
     );
-    // 1-based index, as neovim's vim.ui.select hands its callback.
+}
+
+#[tokio::test]
+async fn vim_ui_select_callback_keeps_item_and_one_based_index() {
+    let dir = temp_dir("ui_select_vim_alias");
+    let (rpc, _incoming) = start(&dir, "").await;
+
+    // The vim.ui.select compat alias keeps neovim's (item, index) callback shape —
+    // plugins that read the 1-based index still work.
+    exec_lua(
+        &rpc,
+        "_G.item, _G.idx = nil, nil
+         vim.ui.select({ 'alpha', 'beta', 'gamma' }, {}, function(item, idx)
+           _G.item, _G.idx = item, idx
+         end)",
+    )
+    .await;
+
+    feed(&rpc, "j");
+    feed(&rpc, "<CR>");
+
+    assert_eq!(
+        exec_lua(&rpc, "return _G.item").await.as_str(),
+        Some("beta")
+    );
     assert_eq!(exec_lua(&rpc, "return _G.idx").await.as_u64(), Some(2));
 }
 
 #[tokio::test]
-async fn cancel_fires_callback_with_nil() {
+async fn nx_ui_select_rejects_the_old_callback_shape() {
+    let dir = temp_dir("ui_select_guard");
+    let (rpc, _incoming) = start(&dir, "").await;
+
+    // Passing an on_choice to the promise-only nx.ui.select fails loudly.
+    let err = exec_lua(
+        &rpc,
+        "local ok, e = pcall(function() nx.ui.select({ 'a' }, {}, function() end) end)
+         return ok == false and e or '<no error>'",
+    )
+    .await;
+    assert!(
+        err.as_str().unwrap_or("").contains("promise-only"),
+        "expected a promise-only migration error, got {err:?}"
+    );
+}
+
+#[tokio::test]
+async fn cancel_resolves_with_nil() {
     let dir = temp_dir("ui_select_cancel");
     let (rpc, _incoming) = start(&dir, "").await;
 
     exec_lua(
         &rpc,
         "_G.item, _G.called = 'unset', false
-         nx.ui.select({ 'a', 'b' }, {}, function(item) _G.item, _G.called = item, true end)",
+         nx.ui.select({ 'a', 'b' }, {}):next(function(item) _G.item, _G.called = item, true end)",
     )
     .await;
 
     feed(&rpc, "<Esc>");
 
-    // The callback fired (so a caller can clean up) but with no item.
+    // The promise resolved (so a caller can clean up) but with no item.
     assert_eq!(
         exec_lua(&rpc, "return _G.called").await,
         Value::Boolean(true)
@@ -117,15 +164,15 @@ async fn format_item_displays_label_but_callback_gets_original() {
     let dir = temp_dir("ui_select_format");
     let (rpc, _incoming) = start(&dir, "").await;
 
-    // Items are tables; format_item renders a label, but on_choice must receive
-    // the original table — only the index crosses the bridge.
+    // Items are tables; format_item renders a label, but the promise must resolve
+    // to the original table — only the index crosses the bridge.
     exec_lua(
         &rpc,
         "_G.chosen = nil
          nx.ui.select(
            { { id = 10 }, { id = 20 }, { id = 30 } },
-           { format_item = function(it) return 'row ' .. it.id end },
-           function(item) _G.chosen = item.id end)",
+           { format_item = function(it) return 'row ' .. it.id end }
+         ):next(function(item) _G.chosen = item.id end)",
     )
     .await;
 
@@ -140,12 +187,13 @@ async fn empty_list_cancels_without_opening() {
     let dir = temp_dir("ui_select_empty");
     let (rpc, _incoming) = start(&dir, "").await;
 
-    // An empty list resolves to a cancel in the Lua wrapper, synchronously,
-    // without queuing a menu — so `called` is already true on return.
+    // An empty list resolves to a cancel in the Lua wrapper without queuing a menu;
+    // the resolve runs synchronously in the executor and the :next reaction drains
+    // at convergence of this exec_lua tick — so `called` is true on the next read.
     exec_lua(
         &rpc,
         "_G.item, _G.called = 'unset', false
-         nx.ui.select({}, {}, function(item) _G.item, _G.called = item, true end)",
+         nx.ui.select({}, {}):next(function(item) _G.item, _G.called = item, true end)",
     )
     .await;
 
@@ -189,11 +237,8 @@ async fn menu_surface_projects_items_and_tracks_selection() {
     let dir = temp_dir("ui_select_surface");
     let (rpc, mut incoming) = start(&dir, "").await;
 
-    exec_lua(
-        &rpc,
-        "nx.ui.select({ 'one', 'two', 'three' }, {}, function() end)",
-    )
-    .await;
+    // The returned promise is unconsumed here — we only assert on the menu surface.
+    exec_lua(&rpc, "nx.ui.select({ 'one', 'two', 'three' }, {})").await;
 
     let map = poll_menu(&rpc, &mut incoming)
         .await

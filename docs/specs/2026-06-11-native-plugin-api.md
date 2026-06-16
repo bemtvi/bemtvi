@@ -81,7 +81,7 @@ same surface, later. The in-process Lua host is v1.
 | `nx.hl.set(ns, buf, marks)` | batch-published decorations (known up front) | the extmark layer + priorities |
 | `nx.decor.provider` | viewport-scoped decoration publisher — lazy, recomputed on scroll, off the frame | the decoration-provider drive (`decor_on_win`), debounced off `redraw`; folds into the extmark layer |
 | `nx.keymap` / `nx.command` / `nx.cmd` | maps, user commands, ex dispatch | existing |
-| `nx.ui.input` / `select` / `confirm` / `float` | small async UI primitives | cmdline + floats + pmenu |
+| `nx.ui.input` / `select` / `confirm` / `float` | small async UI primitives (input/select/confirm are promise-only; float is fire-and-forget) | cmdline + floats + pmenu |
 | `nx.complete` | **native completion engine**; plugins = sources | pmenu + docs float, native LSP, evloop debounce; Rust fuzzy matcher (new) |
 | `nx.statusline` | segment registry + layout; event-keyed invalidation | server-side statusline render |
 | `nx.picker` | **native fuzzy picker** (prompt + list + preview); plugins = sources | floats + the panel's input-grab pattern; matcher shared with completion |
@@ -312,13 +312,13 @@ local view = nx.tree.view {
       if node.dir then t:toggle(node) else nx.cmd("edit " .. nx.fnameescape(node.path)) end
     end,
     ["a"] = function(node, t)
-      nx.ui.input({ prompt = "New file: " }, function(name)        -- async, not blocking
+      nx.ui.input({ prompt = "New file: " }):next(function(name)   -- promise, not blocking
         if not name then return end
         nx.fs.write(join(dir_of(node), name), "", function() t:refresh(node) end)
       end)
     end,
     ["d"] = function(node, t)
-      nx.ui.confirm("Delete " .. node.path .. "?", function(yes)
+      nx.ui.confirm("Delete " .. node.path .. "?"):next(function(yes)
         if yes then nx.fs.remove(node.path, function() t:refresh(t:parent(node)) end) end
       end)
     end,

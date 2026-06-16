@@ -111,8 +111,27 @@ are unaffected (separate `_system_async` path; `vim.*` is the compat layer, exem
 
 ## Out of scope (later promise-only cuts)
 
-`nx.ui.select`/`input`/`confirm` (`on_choice`/`on_confirm` → promise), `nx.lsp`
-request verbs → promise, `nx.fs.*` → promise, one-shot `nx.timer` (already
+`nx.lsp` request verbs → promise, `nx.fs.*` → promise, one-shot `nx.timer` (already
 `nx.promise.delay`). Each is its own small unit on the same principle; this plan is
 the **process** surface only, because it's where the callback shape actually has
 call sites today.
+
+### Follow-up cut: `nx.ui.*` — LANDED (2026-06-16)
+
+The `nx.ui.select` / `input` / `confirm` chooser/prompt surfaces are now
+promise-only on the same principle (`on_choice`/`on_confirm` → a returned promise):
+
+- `nx.ui.input(opts)` → promise of the entered text (`nil` on cancel).
+- `nx.ui.select(items, opts)` → promise of the chosen **item** (`nil` on cancel);
+  the 1-based index is dropped from the promise.
+- `nx.ui.confirm(message, opts)` → promise of a boolean.
+- `nx.ui.float` is unchanged (fire-and-forget content float — no result).
+
+Passing the old callback argument errors loudly (names the migration). The
+`vim.ui.input` / `vim.ui.select` muscle-memory aliases keep neovim's callback
+signatures (the bounded compat layer is exempt) — `vim.ui.select` still hands its
+callback `(item, index)`, adapted from the shared `select_into` core. As part of
+this cut, `prelude/promise.lua` moved **earlier** in the prelude load order (right
+after `runtime.lua`): it is the async foundation every later surface builds on, and
+its only load-time need is `nx.schedule` — the `nx.timer` dependency cited in its
+old header is call-time only (`nx.promise.delay`).

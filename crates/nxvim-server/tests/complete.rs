@@ -329,7 +329,7 @@ async fn select_menu_keeps_its_full_border() {
     // borderless/flush treatment is completion-only.
     let dir = temp_dir("complete_select_border");
     let (rpc, mut incoming) = start(&dir, "").await;
-    exec_lua(&rpc, "nx.ui.select({ 'one', 'two' }, {}, function() end)").await;
+    exec_lua(&rpc, "nx.ui.select({ 'one', 'two' }, {})").await;
     let menu = menu_of(&poll_menu(&rpc, &mut incoming).await.expect("select opens"));
     assert!(
         map_get(&menu, "border_top").is_none(),

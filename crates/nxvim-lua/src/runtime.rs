@@ -328,6 +328,12 @@ const PRELUDE_MODULES: &[(&str, &str)] = &[
     // runtime services (schedule / notify / callbacks).
     ("nxvim:prelude/stdlib", include_str!("prelude/stdlib.lua")),
     ("nxvim:prelude/runtime", include_str!("prelude/runtime.lua")),
+    // nx.promise / nx.async — Promises/A+ over the deferral primitives (nx.schedule
+    // for microtasks, nx.timer for nx.promise.delay), both from runtime.lua just
+    // above. It is the async FOUNDATION every later surface builds on (process /
+    // picker / complete / nx.ui), so it loads early — right after the runtime
+    // services it needs and before any of them.
+    ("nxvim:prelude/promise", include_str!("prelude/promise.lua")),
     // The Rust↔Lua mirror state, shared resolvers, context lock, and the scalar
     // surfaces (variables / options / registers) the entity API reads.
     ("nxvim:prelude/state", include_str!("prelude/state.lua")),
@@ -338,11 +344,10 @@ const PRELUDE_MODULES: &[(&str, &str)] = &[
     // Autocmds / augroups / user commands / ex-command drivers / vim.cmd.
     ("nxvim:prelude/autocmd", include_str!("prelude/autocmd.lua")),
     ("nxvim:prelude/keymap", include_str!("prelude/keymap.lua")),
-    // nx.timer (vim.defer_fn) over the event-loop bridge.
+    // The async nx.ui.* primitives (input / select / confirm return promises; float
+    // is fire-and-forget). The deferral primitives nx.schedule / nx.timer live in
+    // runtime.lua; this module is the UI surface only.
     ("nxvim:prelude/ui", include_str!("prelude/ui.lua")),
-    // nx.promise / nx.async — Promises/A+ over the microtask (nx.schedule) and
-    // timer (nx.timer) primitives installed just above.
-    ("nxvim:prelude/promise", include_str!("prelude/promise.lua")),
     // nx.run / nx.run_stream / nx.await_each: promise-only process API (replaces the
     // callback-shaped nx.spawn). After promise.lua (builds on nx.promise/async).
     ("nxvim:prelude/process", include_str!("prelude/process.lua")),

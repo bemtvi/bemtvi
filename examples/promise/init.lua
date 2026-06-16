@@ -10,8 +10,9 @@
 -- `nx.promise` is the foundation — the exact browser object model: nx.promise.new
 -- / :next / :catch / :finally and the all / all_settled / race / any / resolve /
 -- reject / try combinators — plus nx.async/nx.await coroutine sugar so a chain of
--- awaits reads top-to-bottom. (The remaining callback APIs — nx.ui.select, LSP —
--- are being migrated to promises on the same principle.)
+-- awaits reads top-to-bottom. (nx.run and the nx.ui.* chooser/prompt surfaces are
+-- already promise-only; the remaining callback APIs — LSP — follow on the same
+-- principle.)
 --
 -- Everything below runs at startup with NO keypresses. Watch the message line
 -- (`:messages` for the full history); each demo also records into `_G.promise_demo`,

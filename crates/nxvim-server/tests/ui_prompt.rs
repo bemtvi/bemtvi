@@ -1,14 +1,15 @@
 //! Behavior tests for `nx.ui.input` (alias `vim.ui.input`) and `nx.ui.confirm` —
 //! the two command-line prompt primitives of the `nx.ui.*` async UI surface
-//! (`docs/specs/2026-06-11-native-plugin-api.md`). Both are callback-shaped and
-//! non-blocking (ADR 0002 rule 3): the Lua call returns at once and the result
-//! arrives on a later tick when the user submits / cancels.
+//! (`docs/specs/2026-06-11-native-plugin-api.md`). Both are PROMISE-ONLY and
+//! non-blocking (ADR 0002 rule 3): the Lua call returns a promise at once and it
+//! settles on a later tick when the user submits / cancels.
 //!
 //! Black-box like the rest: a real server sources an `init.lua`, the prompt is
-//! driven over the same msgpack-RPC a UI uses, and the assertion is on the
-//! captured callback result, read back through `nvim_exec_lua`. The callback
-//! side-effects round-trip through request/reply (the feed is processed before the
-//! read on the same ordered connection), so they need no redraw timing.
+//! driven over the same msgpack-RPC a UI uses, and the assertion is on the value
+//! the promise's `:next` records, read back through `nvim_exec_lua`. Delivering the
+//! prompt result fires the resolver and `apply_lua_effects` drains the `:next`
+//! reaction to fixpoint in the same tick (the microtask-convergence path), so the
+//! effect is visible on the next ordered read — no redraw timing needed.
 
 use nxvim_rpc::{Incoming, Rpc};
 use nxvim_server::ServerInit;
@@ -40,7 +41,7 @@ async fn input_returns_typed_text_on_enter() {
     exec_lua(
         &rpc,
         "_G.result, _G.called = nil, false
-         nx.ui.input({ prompt = 'Name: ' }, function(text)
+         nx.ui.input({ prompt = 'Name: ' }):next(function(text)
            _G.result, _G.called = text, true
          end)",
     )
@@ -61,20 +62,20 @@ async fn input_returns_typed_text_on_enter() {
 }
 
 #[tokio::test]
-async fn input_cancel_fires_callback_with_nil() {
+async fn input_cancel_resolves_with_nil() {
     let dir = temp_dir("ui_input_cancel");
     let (rpc, _incoming) = start(&dir, "").await;
 
     exec_lua(
         &rpc,
         "_G.result, _G.called = 'unset', false
-         nx.ui.input({ prompt = 'Name: ' }, function(text) _G.result, _G.called = text, true end)",
+         nx.ui.input({ prompt = 'Name: ' }):next(function(text) _G.result, _G.called = text, true end)",
     )
     .await;
 
     feed(&rpc, "<Esc>");
 
-    // The callback fired (so a caller can clean up) but with no text.
+    // The promise resolved (so a caller can clean up) but with no text.
     assert_eq!(
         exec_lua(&rpc, "return _G.called").await,
         Value::Boolean(true)
@@ -90,7 +91,7 @@ async fn input_prefills_default_and_returns_it_unedited() {
     exec_lua(
         &rpc,
         "_G.result = nil
-         nx.ui.input({ prompt = 'File: ', default = 'init.lua' }, function(t) _G.result = t end)",
+         nx.ui.input({ prompt = 'File: ', default = 'init.lua' }):next(function(t) _G.result = t end)",
     )
     .await;
 
@@ -112,7 +113,7 @@ async fn input_empty_enter_is_empty_string_not_nil() {
     exec_lua(
         &rpc,
         "_G.result = 'unset'
-         nx.ui.input({}, function(t) _G.result = t end)",
+         nx.ui.input({}):next(function(t) _G.result = t end)",
     )
     .await;
 
@@ -129,13 +130,13 @@ async fn input_backspace_past_start_does_not_cancel() {
     exec_lua(
         &rpc,
         "_G.result, _G.called = 'unset', false
-         nx.ui.input({ prompt = 'Name: ' }, function(text) _G.result, _G.called = text, true end)",
+         nx.ui.input({ prompt = 'Name: ' }):next(function(text) _G.result, _G.called = text, true end)",
     )
     .await;
 
     // Type a char, then backspace it AND backspace again past the empty start.
     // Unlike the ex/search command line, a vim.ui.input prompt must stay open
-    // (only <Esc> cancels) — so the callback has not fired yet.
+    // (only <Esc> cancels) — so the promise has not settled yet.
     feed(&rpc, "a<BS><BS>");
     assert_eq!(
         exec_lua(&rpc, "return _G.called").await,
@@ -152,13 +153,41 @@ async fn input_backspace_past_start_does_not_cancel() {
 }
 
 #[tokio::test]
-async fn vim_ui_input_is_the_alias() {
+async fn vim_ui_input_callback_alias_still_works() {
     let dir = temp_dir("ui_input_alias");
     let (rpc, _incoming) = start(&dir, "").await;
 
+    // vim.ui.input keeps neovim's callback shape (the compat layer adapts the
+    // nx.ui.input promise back to on_confirm) — plugins that pass a callback work.
+    exec_lua(
+        &rpc,
+        "_G.result = nil
+         vim.ui.input({ prompt = 'Name: ' }, function(text) _G.result = text end)",
+    )
+    .await;
+    feed(&rpc, "via alias<CR>");
     assert_eq!(
-        exec_lua(&rpc, "return vim.ui.input == nx.ui.input").await,
-        Value::Boolean(true)
+        exec_lua(&rpc, "return _G.result").await.as_str(),
+        Some("via alias")
+    );
+}
+
+#[tokio::test]
+async fn nx_ui_input_rejects_the_old_callback_shape() {
+    let dir = temp_dir("ui_input_guard");
+    let (rpc, _incoming) = start(&dir, "").await;
+
+    // Passing an on_confirm to the promise-only nx.ui.input fails loudly (no silent
+    // no-op) — the error names the migration. pcall captures the raised message.
+    let err = exec_lua(
+        &rpc,
+        "local ok, e = pcall(function() nx.ui.input({}, function() end) end)
+         return ok == false and e or '<no error>'",
+    )
+    .await;
+    assert!(
+        err.as_str().unwrap_or("").contains("promise-only"),
+        "expected a promise-only migration error, got {err:?}"
     );
 }
 
@@ -172,7 +201,7 @@ async fn confirm_yes_is_true() {
     exec_lua(
         &rpc,
         "_G.answer, _G.called = nil, false
-         nx.ui.confirm('Delete file?', function(ok) _G.answer, _G.called = ok, true end)",
+         nx.ui.confirm('Delete file?'):next(function(ok) _G.answer, _G.called = ok, true end)",
     )
     .await;
 
@@ -196,7 +225,7 @@ async fn confirm_no_is_false() {
     exec_lua(
         &rpc,
         "_G.answer = nil
-         nx.ui.confirm('Delete file?', function(ok) _G.answer = ok end)",
+         nx.ui.confirm('Delete file?'):next(function(ok) _G.answer = ok end)",
     )
     .await;
 
@@ -217,7 +246,7 @@ async fn confirm_enter_takes_the_default() {
     exec_lua(
         &rpc,
         "_G.a = nil
-         nx.ui.confirm('Save?', function(ok) _G.a = ok end)",
+         nx.ui.confirm('Save?'):next(function(ok) _G.a = ok end)",
     )
     .await;
     feed(&rpc, "<CR>");
@@ -227,7 +256,7 @@ async fn confirm_enter_takes_the_default() {
     exec_lua(
         &rpc,
         "_G.b = nil
-         nx.ui.confirm('Overwrite?', { default = false }, function(ok) _G.b = ok end)",
+         nx.ui.confirm('Overwrite?', { default = false }):next(function(ok) _G.b = ok end)",
     )
     .await;
     feed(&rpc, "<CR>");
@@ -242,7 +271,7 @@ async fn confirm_escape_is_false() {
     exec_lua(
         &rpc,
         "_G.answer = nil
-         nx.ui.confirm('Quit without saving?', function(ok) _G.answer = ok end)",
+         nx.ui.confirm('Quit without saving?'):next(function(ok) _G.answer = ok end)",
     )
     .await;
 
@@ -261,7 +290,7 @@ async fn confirm_escape_is_false() {
 async fn example_config_loads_and_confirm_map_acts() {
     // The shipped `examples/ui-prompt` config must load (it references nx.ui.input
     // and nx.ui.confirm at setup time) and wire its leader maps. Drive the `\d`
-    // confirm map end-to-end: accepting it runs the line delete in the callback.
+    // confirm map end-to-end: accepting it runs the line delete in the :next handler.
     let example = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../../examples/ui-prompt")
         .canonicalize()
@@ -278,8 +307,8 @@ async fn example_config_loads_and_confirm_map_acts() {
     feed(&rpc, "iline one<CR>line two<Esc>gg");
     assert_eq!(lines(&rpc).await, vec!["line one", "line two"]);
 
-    // `\d` (leader = "\") opens the yes/no confirm; `y` accepts and the callback
-    // runs `normal! dd`, deleting the current line.
+    // `\d` (leader = "\") opens the yes/no confirm; `y` accepts and the :next
+    // handler runs `:delete`, removing the current line.
     feed(&rpc, "\\d");
     feed(&rpc, "y");
 

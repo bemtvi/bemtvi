@@ -217,12 +217,12 @@ try {
   // ---- 9. nx.ui.select opens a floating menu and confirms a choice ----
   // The widget runs entirely in the wasm edit-host (no server). Open a three-item
   // chooser, assert the bordered list paints with the labels, move + confirm, and
-  // read back the choice the callback captured.
+  // read back the choice the promise resolved to (nx.ui.select is promise-only).
   const luaResult = (code) => page.evaluate((c) => window.__nxvim.execLua(c).then((r) => r.result), code);
   await page.evaluate(() => window.__nxvim.execLua(
-    "_G.picked, _G.pickedIdx = nil, nil\n" +
-    "nx.ui.select({ 'alpha', 'beta', 'gamma' }, {}, function(item, idx)\n" +
-    "  _G.picked, _G.pickedIdx = item, idx\n" +
+    "_G.picked = nil\n" +
+    "nx.ui.select({ 'alpha', 'beta', 'gamma' }, {}):next(function(item)\n" +
+    "  _G.picked = item\n" +
     "end)"));
   await sleep(100);
   const menuRows = await page.evaluate(() =>
@@ -237,9 +237,8 @@ try {
   // execLua returns a rendered `ok:<value>` string, so match on content (as the
   // other verify scripts do) rather than an exact JS value.
   const picked = String(await luaResult("return _G.picked"));
-  const pickedIdx = String(await luaResult("return _G.pickedIdx"));
-  check("nx.ui.select: <CR> confirms the highlighted row (item + 1-based index)",
-    /beta/.test(picked) && /\b2\b/.test(pickedIdx), JSON.stringify({ picked, pickedIdx }));
+  check("nx.ui.select: <CR> confirms the highlighted row (promise resolves to the item)",
+    /beta/.test(picked), JSON.stringify({ picked }));
   const menuGone = await page.evaluate(() => document.querySelectorAll("#grid .pmenu .row").length === 0);
   check("nx.ui.select: the menu closes after confirm", menuGone);
 
@@ -250,9 +249,8 @@ try {
   await page.evaluate(() => window.__nxvim.execLua(
     "_G.chosen = nil\n" +
     "nx.picker.source { name = 'demo',\n" +
-    "  items = function(ctx, push, done)\n" +
-    "    for _, c in ipairs({ 'crimson', 'cornflower', 'cerulean', 'magenta' }) do push { text = c } end\n" +
-    "    done()\n" +
+    "  items = function(ctx)\n" +
+    "    for _, c in ipairs({ 'crimson', 'cornflower', 'cerulean', 'magenta' }) do ctx.push { text = c } end\n" +
     "  end,\n" +
     "  confirm = function(item) _G.chosen = item.text end }\n" +
     "nx.picker.open('demo')"));

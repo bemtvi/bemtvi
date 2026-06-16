@@ -71,7 +71,8 @@ function nx._run_cb(id, keep, ...)
     -- A spent one-shot timer (defer_fn / uv timer) is no longer active. This is
     -- the only place that transition is observable Lua-side; clearing it here
     -- keeps a handle's :is_active() honest (a no-op for non-timer callbacks,
-    -- whose ids are never in this table). See prelude/ui.lua.
+    -- whose ids are never in this table). nx._timer_active / nx.timer are defined
+    -- just below.
     if nx._timer_active then
       nx._timer_active[id] = nil
     end
@@ -107,6 +108,45 @@ function nx.schedule_wrap(fn)
   end
 end
 vim.schedule_wrap = nx.schedule_wrap
+
+-- ----- nx.timer [alias vim.defer_fn] -----------------------------------------
+-- The wall-clock sibling of nx.schedule: where nx.schedule runs `fn` at the end of
+-- the current convergence (same tick, a microtask), nx.timer runs it `timeout` ms
+-- from now on a LATER tick. It rides the event-loop actor through the
+-- nx._timer_start / nx._timer_stop bridge: a callback id is registered in
+-- nx._cb_fns, the actor sleeps and fires LoopEvent::Timer, and the server runs the
+-- callback by id on its thread. Both deferral primitives live here, next to the
+-- nx._cb_fns registry and the nx._run_cb cleanup above (which clears
+-- nx._timer_active for a spent one-shot). nx.promise.delay builds on this.
+nx._timer_active = nx._timer_active or {}
+
+-- A minimal timer handle returned by nx.timer, so a caller can :stop() the
+-- deferral before it fires (neovim returns a uv timer; nxvim returns this). It is
+-- NOT the libuv handle API — the `nx` timer surface is the supported one.
+local defer_handle = {}
+defer_handle.__index = defer_handle
+function defer_handle:stop()
+  nx._timer_active[self._id] = nil
+  nx._timer_stop(self._id)
+  nx._cb_fns[self._id] = nil
+  return 0
+end
+function defer_handle:is_active()
+  return nx._timer_active[self._id] == true
+end
+
+-- nx.timer(fn, timeout): the canonical timer / defer primitive (aliased by
+-- vim.defer_fn) — run `fn` once, `timeout` ms from now, on the loop — the
+-- off-tick deferral configs use for retry patterns. Returns a handle so the
+-- caller can :stop() it before it fires.
+function nx.timer(fn, timeout)
+  local id = nx._next_cb_id()
+  nx._cb_fns[id] = fn
+  nx._timer_active[id] = true -- armed; the returned handle's :is_active() reads this
+  nx._timer_start(id, timeout or 0, 0) -- one-shot
+  return setmetatable({ _id = id }, defer_handle)
+end
+vim.defer_fn = nx.timer
 
 -- pid registry for async vim.system handles. The event-loop actor reports a
 -- spawned child's OS pid back to the server, which records it here keyed by the

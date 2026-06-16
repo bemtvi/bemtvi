@@ -169,8 +169,9 @@ Thin drivers — the widget does the work:
   `confirm(item)`; multi-select sends marks to a confirm-all. LSP locations
   (definition/references/symbols) route here in `nx.lsp` Phase C.
 - **`nx.ui.select`** opens `{ list, no preview, no prompt (optional filter),
-  cursor }`; confirm calls back the chosen index. Code actions and any
-  `nx.ui.select` caller use it.
+  cursor }`; confirm resolves the returned promise to the chosen item (it is
+  promise-only; the `vim.ui.select` compat alias keeps neovim's `(item, index)`
+  callback). Code actions and any `nx.ui.select` caller use it.
 
 The public surface stays exactly the three task-shaped engines the plugin-API
 spec names. Optionally, a low-level `nx.ui.menu` exposes the widget directly for

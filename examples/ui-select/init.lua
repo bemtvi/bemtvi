@@ -5,11 +5,13 @@
 --     NXVIM_CONFIG=examples/ui-select \
 --       cargo run -p nxvim -- examples/ui-select/sample.txt
 --
--- `nx.ui.select(items, opts, on_choice)` is the callback-shaped chooser
--- (aliased by `vim.ui.select`). The SERVER owns the widget: it floats a
--- bordered list under the cursor, grabs every key, and resolves to one choice.
--- Lua only renders the labels up front and reacts to the result — nothing
--- blocks, no input loop runs in Lua (ADR 0002 / the float-widget spec).
+-- `nx.ui.select(items, opts)` returns a PROMISE of the chosen item (nil on
+-- cancel) — react with `:next(fn)`, or await it inside `nx.async`. The SERVER
+-- owns the widget: it floats a bordered list under the cursor, grabs every key,
+-- and resolves to one choice. Lua only renders the labels up front and reacts to
+-- the result — nothing blocks, no input loop runs in Lua (ADR 0002 / the
+-- float-widget spec). (The 1-based index is dropped from the promise; the
+-- `vim.ui.select` compat alias keeps the callback `(item, index)` shape.)
 --
 -- Navigate the open menu with:  j / k  (or  <C-n> / <C-p>,  arrows,  gg / G)
 -- Confirm with:  <CR>          Cancel with:  <Esc>  or  q
@@ -17,25 +19,25 @@
 --------------------------------------------------------------------------------
 -- 1. <leader>p — a plain string chooser.
 --    TYPE:  \p           A menu of three fruits floats under the cursor.
---    Move with j/k, press <CR>. The choice (and its 1-based index) is echoed.
---    Press <Esc> instead and you'll see the cancel branch fire.
+--    Move with j/k, press <CR>. The chosen fruit is echoed; the promise resolves
+--    to nil on <Esc>, so you'll see the cancel branch fire.
 --------------------------------------------------------------------------------
 vim.g.mapleader = "\\"
 
 nx.keymap.set("n", "<leader>p", function()
-  nx.ui.select({ "apple", "banana", "cherry" }, { prompt = "Pick a fruit:" }, function(item, idx)
+  nx.ui.select({ "apple", "banana", "cherry" }, { prompt = "Pick a fruit:" }):next(function(item)
     if item == nil then
       nx.notify("nothing picked (cancelled)")
     else
-      nx.notify(("picked %s (#%d)"):format(item, idx))
+      nx.notify("picked " .. item)
     end
   end)
 end)
 
 --------------------------------------------------------------------------------
 -- 2. <leader>c — choose a command to run.
---    Shows that `on_choice` can act on the editor: each entry carries a command
---    string, run via nx.cmd when chosen. TYPE:  \c  then pick one.
+--    Shows that the resolved value can act on the editor: each entry carries a
+--    command string, run via nx.cmd when chosen. TYPE:  \c  then pick one.
 --------------------------------------------------------------------------------
 nx.keymap.set("n", "<leader>c", function()
   local actions = {
@@ -45,13 +47,13 @@ nx.keymap.set("n", "<leader>c", function()
   }
   nx.ui.select(actions, {
     prompt = "Action:",
-    -- format_item renders the display label; on_choice still gets the ORIGINAL
-    -- table, so the chosen entry's `cmd` round-trips even though only strings
-    -- cross the bridge.
+    -- format_item renders the display label; the promise still resolves to the
+    -- ORIGINAL table, so the chosen entry's `cmd` round-trips even though only
+    -- strings cross the bridge.
     format_item = function(a)
       return a.label
     end,
-  }, function(choice)
+  }):next(function(choice)
     if choice then
       nx.cmd(choice.cmd)
     end
@@ -59,17 +61,19 @@ nx.keymap.set("n", "<leader>c", function()
 end)
 
 --------------------------------------------------------------------------------
--- 3. A long list scrolls. <leader>n opens twenty entries; the box caps its
---    height and scrolls to keep the highlight visible as you j/k through it.
+-- 3. A long list scrolls, AWAITED linearly. <leader>n opens twenty entries; the
+--    box caps its height and scrolls to keep the highlight visible as you j/k
+--    through it. Here the chooser is awaited inside `nx.async` — `nx.await` of the
+--    select promise reads like a blocking read, but nothing blocks (the coroutine
+--    suspends and resumes when you confirm).
 --------------------------------------------------------------------------------
-nx.keymap.set("n", "<leader>n", function()
+nx.keymap.set("n", "<leader>n", nx.async(function()
   local nums = {}
   for i = 1, 20 do
     nums[i] = "line " .. i
   end
-  nx.ui.select(nums, { prompt = "Jump near:" }, function(item, idx)
-    if idx then
-      nx.notify("chose " .. item)
-    end
-  end)
-end)
+  local item = nx.await(nx.ui.select(nums, { prompt = "Jump near:" }))
+  if item then
+    nx.notify("chose " .. item)
+  end
+end))

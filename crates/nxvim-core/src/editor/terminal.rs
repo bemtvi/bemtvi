@@ -141,12 +141,16 @@ impl Editor {
     /// flag is cleared by [`Editor::terminal_closed`]). The edit chokepoints
     /// (`edit_each_cursor`, `apply_operator_to_range`, `paste`, …) consult this.
     pub(crate) fn modifiable(&self) -> bool {
-        // A live terminal buffer and the quickfix list window are both read-only:
-        // edits are refused at the chokepoints with `E21`, exactly as vim treats a
-        // `nomodifiable` buffer. The quickfix window otherwise behaves as a normal
-        // window (motions, search, `<C-w>`, `:` all work); only `<CR>` is special
-        // (jumps to the entry), handled in [`Editor::input`].
-        !self.buffer().terminal && !self.is_quickfix_buffer()
+        // A live terminal buffer, the quickfix list window, and a plugin-owned
+        // `nx.view` surface are all read-only: edits are refused at the chokepoints
+        // with `E21`, exactly as vim treats a `nomodifiable` buffer. The view also
+        // routes its *interactive* keys away through the `view` keymap bucket (so
+        // `dd` is inert before it even reaches a chokepoint), but consulting this
+        // here is what closes the *ex-command* path — `:d`, `:s`, `:normal` reach the
+        // edit chokepoints, not the input router, so without this a `:d` would
+        // corrupt the plugin's content. These windows otherwise behave normally
+        // (motions, search, `<C-w>`, `:` all work); only `<CR>` is special.
+        !self.buffer().terminal && !self.is_quickfix_buffer() && !self.is_view_buffer()
     }
 
     /// Echo vim's `E21` when an edit is refused on a read-only (live terminal) buffer.

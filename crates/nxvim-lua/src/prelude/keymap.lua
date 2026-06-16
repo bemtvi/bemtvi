@@ -515,6 +515,55 @@ for _, m in ipairs({
   nx.keymap.set("explorer", m[1], nx.explorer.actions[m[2]], { default = true, desc = m[3] })
 end
 
+-- ----- rebindable nx.view keys ----------------------------------------------
+-- A plugin-owned `nx.view` buffer (the dockable file-tree / list surface) is
+-- driven through the keymap engine, exactly like the explorer: the server selects
+-- the `view` bucket while a view is focused in normal mode, so navigation and
+-- `<CR>` are configurable with `nx.keymap.set('view', '<key>', nx.view.actions
+-- .<name>)`. Each action fires through the engine (nx._view_action ->
+-- Editor::apply_view_action); `confirm` records the cursor line for the view's
+-- `on_select`. `:`/`/`/`?` fall through to the command line; every other unmapped
+-- key is inert, so the plugin's content can't be edited.
+nx.view = nx.view or {}
+nx.view.actions = nx.view.actions or {}
+for _, name in ipairs({
+  "confirm",
+  "next",
+  "prev",
+  "first",
+  "last",
+  "half_down",
+  "half_up",
+  "page_down",
+  "page_up",
+}) do
+  nx.view.actions[name] = function()
+    nx._view_action(name)
+  end
+end
+
+-- The default view bindings — `default = true`, so a user override wins and an
+-- empty-function map disables a key.
+for _, m in ipairs({
+  { "<CR>", "confirm", "Select entry" },
+  { "j", "next", "Next entry" },
+  { "<Down>", "next", "Next entry" },
+  { "k", "prev", "Previous entry" },
+  { "<Up>", "prev", "Previous entry" },
+  { "gg", "first", "First entry" },
+  { "<Home>", "first", "First entry" },
+  { "G", "last", "Last entry" },
+  { "<End>", "last", "Last entry" },
+  { "<C-d>", "half_down", "Half-page down" },
+  { "<C-u>", "half_up", "Half-page up" },
+  { "<C-f>", "page_down", "Page down" },
+  { "<PageDown>", "page_down", "Page down" },
+  { "<C-b>", "page_up", "Page up" },
+  { "<PageUp>", "page_up", "Page up" },
+}) do
+  nx.keymap.set("view", m[1], nx.view.actions[m[2]], { default = true, desc = m[3] })
+end
+
 -- ----- rebindable command-line keys -----------------------------------------
 -- The command line (`:` ex, `/`,`?` search, `vim.ui.input` prompt) is driven
 -- through the keymap engine, NOT a hardcoded grab. It reuses the command-mode `c`

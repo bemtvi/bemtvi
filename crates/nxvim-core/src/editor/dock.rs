@@ -425,6 +425,23 @@ impl Editor {
         }
     }
 
+    /// `nx.layer.focus(target)` / `nx.layer.main()` — move focus to a layer by
+    /// name: `"main"` crosses back to the main editor area
+    /// ([`ensure_main_layer`](Editor::ensure_main_layer)), a dock side keyword
+    /// (`"left"`/`"right"`/`"top"`/`"bottom"`) focuses that dock
+    /// ([`focus_dock`](Editor::focus_dock)). An unknown name is reported (no silent
+    /// fallback). The Main-layer cross is what lets a dock plugin (a file tree) send
+    /// focus back to the editor after opening a file.
+    pub fn focus_layer_named(&mut self, target: &str) {
+        if target == "main" {
+            self.ensure_main_layer();
+        } else if DockSide::from_keyword(target).is_some() {
+            self.focus_dock_named(target);
+        } else {
+            self.echo(format!("E474: Invalid layer: {target}"));
+        }
+    }
+
     /// `nx.dock.toggle(side)` — toggle a dock's visibility by side keyword.
     pub fn toggle_dock_named(&mut self, side: &str) {
         match DockSide::from_keyword(side) {

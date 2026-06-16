@@ -140,6 +140,17 @@ vendored Lua — the engine seam is kept, the command skin is replaced by a noun
 
 ## Consequences
 
+- **`nx.view` widens the plugin-owned *content* surface — not the entity-mutation
+  one.** The buffer-text/lifecycle API (`nvim_buf_set_lines`, `nvim_create_buf`, …)
+  stays deliberately absent (point 3). But a tree dock needs plugin-controlled
+  lines, so the panel's "read-only, plugin-owned, line-controlled buffer with a
+  `<CR>` handler" is generalized off its bottom-edge assumption into `nx.view`: a
+  mountable (dock / split), inert content surface whose lines a plugin replaces
+  wholesale (`set_lines`), decorates via the ordinary extmark layer, and whose
+  selections dispatch to `on_select`. It is a *new category of read-only content
+  buffer*, owned and mutated only by the core through queued ops — not a general
+  buffer-mutation API. Same shape as the directory-listing explorer buffer, lifted
+  to a first-class plugin primitive.
 - **The UI-orchestration surfaces split native seam / Lua feature**: the server
   owns the frame and exposes a *provider registry* (instead of rendering hooks)
   for completion, the picker, statusline segments, snippets, and tree docks; the

@@ -953,6 +953,9 @@ impl Editor {
         if self.mode == Mode::Normal && self.is_explorer_buffer() {
             return KeyContext::Explorer;
         }
+        if self.mode == Mode::Normal && self.is_view_buffer() {
+            return KeyContext::View;
+        }
         KeyContext::Editing
     }
 

@@ -92,6 +92,7 @@ impl MatchScope {
             MatchScope::Widget('S') => "select",
             MatchScope::Widget('L') => "panel",
             MatchScope::Widget('E') => "explorer",
+            MatchScope::Widget('W') => "view",
             MatchScope::Widget(_) => "",
         }
     }
@@ -108,6 +109,7 @@ pub fn widget_bucket(ctx: KeyContext) -> Option<char> {
         KeyContext::Select => Some('S'),
         KeyContext::Panel => Some('L'),
         KeyContext::Explorer => Some('E'),
+        KeyContext::View => Some('W'),
     }
 }
 
@@ -800,6 +802,7 @@ fn mode_buckets(code: &str) -> &'static [char] {
         "select" => &['S'],
         "panel" => &['L'],
         "explorer" => &['E'],
+        "view" => &['W'],
         // The command line reuses the existing command-mode bucket (`mode_key(Mode::
         // Command) == 'c'`); `cmdline` is just the readable alias for it, so its
         // default maps and a user `set('c', …)` compile into the same trie.

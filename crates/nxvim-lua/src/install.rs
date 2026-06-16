@@ -20,11 +20,11 @@ use crate::convert::{
 use crate::host::{create_dir_all_mode, get_runtime_file, glob_paths, parse_mode, stdpath};
 use crate::ops::{
     BufOp, CompletePush, CompleteSetupReq, ConfirmReq, DecorMark, DecorPublish, DockOp, ExtmarkOp,
-    FeedKeysOp, GlobalOptionOp, HlSet, LoopOp, LspOp, OptionValue, PanelOp, PickerOpenReq,
+    FeedKeysOp, GlobalOptionOp, HlSet, LayerOp, LoopOp, LspOp, OptionValue, PanelOp, PickerOpenReq,
     PickerPush, PreviewPush, QfItem, QfSetOp, RegisterSetOp, SnippetAddReq, SnippetSetupReq,
     StatuslineKind, StatuslinePublishReq, StatuslineSetupReq, StatuslineTarget, TabOp,
-    TerminalOpenReq, TsOp, UiFloatReq, UiInputReq, UiSelectReq, VirtChunkData, VirtDecorData,
-    WindowOp,
+    TerminalOpenReq, TsOp, UiFloatReq, UiInputReq, UiSelectReq, ViewOp, VirtChunkData,
+    VirtDecorData, WindowOp,
 };
 use crate::runtime::{resolve_lua_fs, Shared};
 use crate::vimregex;
@@ -389,6 +389,120 @@ pub(crate) fn install_vim(lua: &Lua, shared: &Rc<RefCell<Shared>>) -> mlua::Resu
         )?,
     )?;
     nx.set("dock", dock)?;
+
+    // `nx.open(path, { where })` — open a file/dir in the editing area, queuing a
+    // [`LayerOp::Open`]. `where = "main"` crosses to the Main layer first (so an open
+    // fired from a dock keymap lands in the main editor, not the sidebar); the
+    // default opens in the current window like `:edit`.
+    let sh = shared.clone();
+    nx.set(
+        "open",
+        lua.create_function(move |_, (path, opts): (String, Option<mlua::Table>)| {
+            let where_main = match opts {
+                Some(o) => o.get::<Option<String>>("where")?.as_deref() == Some("main"),
+                None => false,
+            };
+            sh.borrow_mut()
+                .layer_ops
+                .push(LayerOp::Open { path, where_main });
+            Ok(())
+        })?,
+    )?;
+    // `nx.layer` — focus the main editor area or a dock by name, queuing a
+    // [`LayerOp::Focus`]. `nx.layer.main()` is the shorthand for `focus("main")`.
+    let layer = lua.create_table()?;
+    let sh = shared.clone();
+    layer.set(
+        "focus",
+        lua.create_function(move |_, target: String| {
+            sh.borrow_mut().layer_ops.push(LayerOp::Focus { target });
+            Ok(())
+        })?,
+    )?;
+    let sh = shared.clone();
+    layer.set(
+        "main",
+        lua.create_function(move |_, ()| {
+            sh.borrow_mut().layer_ops.push(LayerOp::Focus {
+                target: "main".to_string(),
+            });
+            Ok(())
+        })?,
+    )?;
+    nx.set("layer", layer)?;
+
+    // `nx.view` raw bridges — each queues a [`ViewOp`] the server drains into the
+    // core's view registry. The handle object (`nx.view.create` returning a table
+    // with `:set_lines` / `:mount` / `:on_select` / …) is authored in the prelude
+    // over these primitives; the Lua-side state (per-line userdata, the `on_select`
+    // callback) lives in that handle, so only these content / mount / lifecycle
+    // signals cross the bridge. `id` is the Lua-allocated handle id.
+    let view = lua.create_table()?;
+    let sh = shared.clone();
+    view.set(
+        "_create",
+        lua.create_function(move |_, (id, name, filetype): (u64, String, String)| {
+            sh.borrow_mut()
+                .view_ops
+                .push(ViewOp::Create { id, name, filetype });
+            Ok(())
+        })?,
+    )?;
+    let sh = shared.clone();
+    view.set(
+        "_set_lines",
+        lua.create_function(move |_, (id, lines): (u64, Vec<String>)| {
+            sh.borrow_mut()
+                .view_ops
+                .push(ViewOp::SetLines { id, lines });
+            Ok(())
+        })?,
+    )?;
+    let sh = shared.clone();
+    view.set(
+        "_mount_dock",
+        lua.create_function(move |_, (id, side, size): (u64, String, Option<u64>)| {
+            sh.borrow_mut()
+                .view_ops
+                .push(ViewOp::MountDock { id, side, size });
+            Ok(())
+        })?,
+    )?;
+    let sh = shared.clone();
+    view.set(
+        "_mount_split",
+        lua.create_function(move |_, (id, vertical): (u64, bool)| {
+            sh.borrow_mut()
+                .view_ops
+                .push(ViewOp::MountSplit { id, vertical });
+            Ok(())
+        })?,
+    )?;
+    let sh = shared.clone();
+    view.set(
+        "_unmount",
+        lua.create_function(move |_, id: u64| {
+            sh.borrow_mut().view_ops.push(ViewOp::Unmount { id });
+            Ok(())
+        })?,
+    )?;
+    let sh = shared.clone();
+    view.set(
+        "_focus",
+        lua.create_function(move |_, id: u64| {
+            sh.borrow_mut().view_ops.push(ViewOp::Focus { id });
+            Ok(())
+        })?,
+    )?;
+    let sh = shared.clone();
+    view.set(
+        "_destroy",
+        lua.create_function(move |_, id: u64| {
+            sh.borrow_mut().view_ops.push(ViewOp::Destroy { id });
+            Ok(())
+        })?,
+    )?;
+    nx.set("view", view)?;
 
     // `nx.terminal`: open a terminal job programmatically — the API twin of the
     // `:terminal` ex-command, same "Lua queues, core mutates" flow as `nx.dock`.
@@ -1996,6 +2110,17 @@ pub(crate) fn install_runtime_api(
         "_explorer_action",
         lua.create_function(move |_, name: String| {
             sh.borrow_mut().explorer_actions.push(name);
+            Ok(())
+        })?,
+    )?;
+    // `nx._view_action(name)`: a `view`-bucket keymap fired the named action
+    // (next / prev / first / last / half + page scroll / confirm) on the focused
+    // `nx.view` buffer; the server applies it via `Editor::apply_view_action`.
+    let sh = shared.clone();
+    nx.set(
+        "_view_action",
+        lua.create_function(move |_, name: String| {
+            sh.borrow_mut().view_actions.push(name);
             Ok(())
         })?,
     )?;

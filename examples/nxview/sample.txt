@@ -1,0 +1,12 @@
+nx.view sample buffer
+=====================
+
+This file is open in the MAIN editor area. The left sidebar is a `nx.view` —
+a plugin-owned, read-only content surface mounted in a dock.
+
+- Press <leader>e to toggle the sidebar.
+- Move with j / k inside it.
+- Press <CR> on an entry to open it here, in the main area.
+
+The sidebar can't be edited (try `i` or `dd` in it — nothing happens): a view is
+inert to the editing grammar, so the plugin's content is never corrupted.

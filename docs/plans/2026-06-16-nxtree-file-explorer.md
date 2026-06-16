@@ -1,7 +1,10 @@
 # nxtree — a dockable, extensible file explorer (pure-Lua plugin)
 
-Status: **planned** — 2026-06-16. Native phases 1–2 (plus the separately-sketched
-`nx.fs` dependency) unblock the Lua plugin (phases 3–5).
+Status: **native phases 1–2 landed** — 2026-06-16. `nx.open` / `nx.layer` (Phase 1)
+and `nx.view` (Phase 2) are implemented and tested (`crates/nxvim-server/tests/nx_view.rs`,
+`examples/nxview/`); together with the landed `nx.fs` dependency they unblock the
+Lua plugin (phases 3–5, still planned). Phase 2 ships dock + split mounts; a `float`
+mount fails loud as not-yet-implemented.
 
 A real file tree, built as a **pure-Lua plugin on `nx.*`** per the dogfooding
 directive ([ADR 0002](../decisions/0002-native-plugin-system.md)). A small set of

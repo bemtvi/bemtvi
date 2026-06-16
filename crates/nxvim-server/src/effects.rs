@@ -15,9 +15,9 @@ use nxvim_core::{
 };
 use nxvim_lua::{
     BoMirror, BufBytesEdit, BufMirror, BufOp, CallbackArgs, DecorPublish, DockOp, ExtmarkMirror,
-    ExtmarkOp, FloatMirror, GoMirror, HlDefMirror, HlSet, JumpMirror, LoopOp, OptionValue, PanelOp,
-    QfItem, QfMirror, StatuslineKind, StatuslineTarget, TabMirror, TabOp, TsOp, VirtDecorData,
-    WindowMirror, WindowOp,
+    ExtmarkOp, FloatMirror, GoMirror, HlDefMirror, HlSet, JumpMirror, LayerOp, LoopOp, OptionValue,
+    PanelOp, QfItem, QfMirror, StatuslineKind, StatuslineTarget, TabMirror, TabOp, TsOp, ViewOp,
+    VirtDecorData, WindowMirror, WindowOp,
 };
 use rmpv::Value;
 use std::collections::HashSet;
@@ -303,6 +303,14 @@ impl EditHost {
                 self.editor.echo(format!("E5108: {e}"));
             }
         }
+        // View actions a `view`-bucket keymap fired (`nx._view_action`): apply each
+        // to the focused `nx.view` buffer (navigate / `<CR>` confirm). Unknown names
+        // fail loud.
+        for action in self.lua.take_view_actions() {
+            if let Err(e) = self.editor.apply_view_action(&action) {
+                self.editor.echo(format!("E5108: {e}"));
+            }
+        }
         // Cmdline actions a `cmdline`-bucket keymap fired (`nx._cmdline_action`):
         // apply each to the open command line. Unknown names fail loud.
         for action in self.lua.take_cmdline_actions() {
@@ -349,6 +357,37 @@ impl EditHost {
                         self.editor.set_dock_option_num(&side, &name, i64::from(b))
                     }
                 },
+            }
+        }
+        // `nx.view` requests from the view handle methods drive the core's view
+        // registry (plugin-owned, read-only content surfaces). Drained *before* the
+        // layer crosses below so a `v:mount{...}` (which focuses the view) followed by
+        // a `nx.layer.main()` in the same chunk lands focus back in the main area — the
+        // file-tree "mount, then return focus to the editor" idiom.
+        for op in self.lua.take_view_ops() {
+            match op {
+                ViewOp::Create { id, name, filetype } => {
+                    self.editor.create_view(id, name, filetype)
+                }
+                ViewOp::SetLines { id, lines } => self.editor.set_view_lines(id, lines),
+                ViewOp::MountDock { id, side, size } => {
+                    self.editor
+                        .mount_view_dock(id, &side, size.map(|s| s as usize))
+                }
+                ViewOp::MountSplit { id, vertical } => self.editor.mount_view_split(id, vertical),
+                ViewOp::Unmount { id } => self.editor.unmount_view(id),
+                ViewOp::Focus { id } => self.editor.focus_view(id),
+                ViewOp::Destroy { id } => self.editor.destroy_view(id),
+            }
+        }
+        // Layer crosses from `nx.open` / `nx.layer.*` drive the core's layer machine
+        // (the main editor area + each open dock).
+        for op in self.lua.take_layer_ops() {
+            match op {
+                LayerOp::Open { path, where_main } => {
+                    self.editor.open_path_in_layer(&path, where_main)
+                }
+                LayerOp::Focus { target } => self.editor.focus_layer_named(&target),
             }
         }
         // Terminal-open requests from `nx.terminal.open` open a terminal job in the
@@ -1524,6 +1563,10 @@ impl EditHost {
         let _ = self
             .lua
             .set_tab_mirror(&tabs, self.editor.current_tab_id().0);
+        // Live `nx.view` surfaces, mirrored so a view's `:set_decor` (extmarks on the
+        // backing buffer) and `:line()` read the current buffer number / cursor line
+        // without a server round-trip. Cheap (one entry per open view, usually zero).
+        let _ = self.lua.set_view_mirror(&self.editor.view_mirror());
         // Global options, mirrored so `vim.o` reads the core's current value (the
         // default until set, and values set via the `:set` ex path). Cheap (the
         // five search flags, showtabline/laststatus, statusline/tabline/guifont,
@@ -2177,6 +2220,17 @@ impl EditHost {
                 }
                 self.apply_lua_effects();
             }
+            // `<CR>` selections on a focused `nx.view` buffer: fire the view's Lua
+            // `on_select(line, userdata)` handler. The callback may itself queue lua /
+            // view ops (a file tree expanding a node, opening a file), so this is
+            // inside the fixpoint, draining effects after each.
+            for (id, line) in std::mem::take(&mut self.editor.view_selects) {
+                if let Err(e) = self.lua.run_view_select(id, line) {
+                    self.editor
+                        .echo(format!("E5108: Error in nx.view on_select: {e}"));
+                }
+                self.apply_lua_effects();
+            }
             // `vim.ui.input` results (Phase 8): a submitted (`Some`) or cancelled
             // (`None`) prompt fires the waiting callback off the same tick. The
             // callback may itself open another prompt / queue lua, so this is
@@ -2339,6 +2393,7 @@ impl EditHost {
             if self.editor.lua_queue.is_empty()
                 && self.editor.deferred_commands.is_empty()
                 && self.editor.panel_selects.is_empty()
+                && self.editor.view_selects.is_empty()
                 && self.editor.prompt_results.is_empty()
                 && self.editor.menu_results.is_empty()
                 && self.editor.picker_query_changes.is_empty()
@@ -2355,6 +2410,7 @@ impl EditHost {
                 self.editor.lua_queue.clear();
                 self.editor.deferred_commands.clear();
                 self.editor.panel_selects.clear();
+                self.editor.view_selects.clear();
                 self.editor.prompt_results.clear();
                 self.editor.menu_results.clear();
                 self.editor.picker_query_changes.clear();

@@ -913,6 +913,10 @@ impl Editor {
     /// `n` (count only, no edit). Fails loud on a bad delimiter, an unknown
     /// flag, the not-yet-built `c` flag, an invalid pattern, or no match.
     fn ex_substitute(&mut self, range: ExRange, args: &str) {
+        if !self.modifiable() {
+            self.refuse_edit();
+            return;
+        }
         let spec = args.trim();
         match spec.chars().next() {
             // No delimiter: a bare `:s` (or `:s {flags} [count]`) repeats the last
@@ -1222,6 +1226,10 @@ impl Editor {
     /// `:[range]d[elete]` — delete the range's lines (default: the current line),
     /// landing the cursor on the line that takes their place (first non-blank).
     fn ex_delete(&mut self, range: ExRange) {
+        if !self.modifiable() {
+            self.refuse_edit();
+            return;
+        }
         self.push_undo();
         let start = self.buffer().line_start(range.lo);
         // Up to the start of the line after the range — or the buffer end when the
@@ -1244,6 +1252,10 @@ impl Editor {
     /// a line regardless of its own kind, matching vim's `:put`. An empty register
     /// reports `E353` rather than silently doing nothing.
     fn ex_put(&mut self, range: ExRange, args: &str, above: bool) {
+        if !self.modifiable() {
+            self.refuse_edit();
+            return;
+        }
         let arg = args.trim();
         let reg = arg.chars().next();
         let text = match self.register_text(reg) {
@@ -1657,6 +1669,23 @@ impl Editor {
             .iter()
             .find(|(_, ob)| ob.buffer.modified)
             .map(|(id, _)| *id)
+    }
+
+    /// `nx.open(path, { where })` — open `path` (a file or directory) in the editing
+    /// area. With `where_main`, first cross back to the **Main** layer so an open
+    /// fired from a dock keymap (a file tree's `<CR>`) lands in the main editor
+    /// rather than inside the sidebar; otherwise it opens in the current window like
+    /// `:edit`. Reuses the `:edit` open dispatch wholesale (the in-window explorer
+    /// for a directory, the shared open kernel for a file, off-tick aware).
+    pub fn open_path_in_layer(&mut self, path: &str, where_main: bool) {
+        if path.is_empty() {
+            self.echo("E32: No file name");
+            return;
+        }
+        if where_main {
+            self.ensure_main_layer();
+        }
+        self.ex_edit(path, false);
     }
 
     fn ex_edit(&mut self, args: &str, bang: bool) {

@@ -58,6 +58,7 @@ mod syntax;
 mod tabs;
 mod terminal;
 mod undo;
+mod view;
 mod windows;
 
 // The command grammar + its normal/visual executor. The parse↔execute contract
@@ -89,6 +90,7 @@ pub use self::terminal::TerminalOp;
 pub use self::undo::{UndoEntry, UndoTreeView};
 // The window layout subsystem (tree types + layout algebra + window methods).
 pub(crate) use self::jumps::JumpEntry;
+pub(crate) use self::view::ViewState;
 pub use self::windows::{BorderStyle, FloatAnchor, FloatConfig, FloatRelative, WindowConfigSpec};
 pub(crate) use self::windows::{PendingScroll, TabLabel, WindowLayout, WindowTree};
 // Search vocabulary shared by the command line, the parser, and the View.
@@ -785,6 +787,18 @@ pub struct Editor {
     /// index, line text)`. Drained by the server to fire the `on_select`
     /// scripting callback and the `nxvim_panel_select` RPC notification.
     pub panel_selects: Vec<(usize, String)>,
+    /// Live `nx.view` surfaces, keyed by the Lua-allocated view handle id. The
+    /// value records the backing [`BufferId`] (the read-only, plugin-owned content
+    /// buffer carrying `view: Some(id)`) and how the view is currently mounted, so
+    /// `set_lines` / `focus` / `unmount` can resolve the id back to its buffer and
+    /// window region. Empty until the first `nx.view.create`. nxvim-native; not a
+    /// neovim concept.
+    pub(crate) views: HashMap<u64, ViewState>,
+    /// `<CR>` selections made on a focused `nx.view` buffer: each is `(view id,
+    /// 0-based cursor line)`. Drained by the server to fire the view's Lua
+    /// `on_select(line, userdata)` callback. The view analogue of
+    /// [`Editor::panel_selects`].
+    pub view_selects: Vec<(u64, usize)>,
     /// The floating selectable-list widget, when open (`nx.ui.select`; the shared
     /// picker / completion surface). Grabs input focus like the panel, but floats
     /// over the text. See [`menu`](crate::editor::MenuPlacement).
@@ -1308,6 +1322,8 @@ impl Editor {
             panel: None,
             last_panel: None,
             panel_selects: Vec::new(),
+            views: HashMap::new(),
+            view_selects: Vec::new(),
             menu: None,
             menu_results: Vec::new(),
             content_float: None,
@@ -1528,6 +1544,16 @@ impl Editor {
         // [`Editor::handle_explorer_text`].
         if self.mode == Mode::Normal && self.is_explorer_buffer() {
             self.handle_explorer_text(key);
+            return;
+        }
+
+        // A plugin-owned `nx.view` buffer owns its keys in normal mode the same way:
+        // its nameable keys route through the `view` keymap bucket (fired as
+        // `apply_view_action` ahead of this), so only an *unmapped* key reaches here.
+        // Editing keys are inert so the plugin's content can't be corrupted; only
+        // `:`/`/`/`?` fall through. See [`Editor::handle_view_text`].
+        if self.mode == Mode::Normal && self.is_view_buffer() {
+            self.handle_view_text(key);
             return;
         }
 

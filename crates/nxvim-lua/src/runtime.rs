@@ -17,10 +17,10 @@ use crate::host::seed_package_path;
 use crate::install::{install_runtime_api, install_vim, PANEL_ON_SELECT};
 use crate::ops::{
     BufOp, CallbackArgs, CompletePush, CompleteSetupReq, ConfirmReq, DecorPublish, DiagnosticData,
-    DockOp, ExtmarkOp, FeedKeysOp, GlobalOptionOp, HlSet, InlayHintMirrorData, LoopOp,
+    DockOp, ExtmarkOp, FeedKeysOp, GlobalOptionOp, HlSet, InlayHintMirrorData, LayerOp, LoopOp,
     LspClientData, LspOp, PanelOp, PickerOpenReq, PickerPush, QfSetOp, RawKeymap, RawRhs,
     RegisterSetOp, SemanticTokenData, SnippetAddReq, SnippetSetupReq, StatuslinePublishReq,
-    StatuslineSetupReq, TabOp, TerminalOpenReq, TsOp, UiFloatReq, UiInputReq, UiSelectReq,
+    StatuslineSetupReq, TabOp, TerminalOpenReq, TsOp, UiFloatReq, UiInputReq, UiSelectReq, ViewOp,
     WindowOp,
 };
 
@@ -348,6 +348,10 @@ const PRELUDE_MODULES: &[(&str, &str)] = &[
     // Autocmds / augroups / user commands / ex-command drivers / vim.cmd.
     ("nxvim:prelude/autocmd", include_str!("prelude/autocmd.lua")),
     ("nxvim:prelude/keymap", include_str!("prelude/keymap.lua")),
+    // nx.view: plugin-owned, dockable read-only content surfaces (the file-tree /
+    // list widget). Loads after keymap (which seeds `nx.view.actions` + the `view`
+    // bucket defaults) over the `nx.view._*` Rust bridges.
+    ("nxvim:prelude/view", include_str!("prelude/view.lua")),
     // The async nx.ui.* primitives (input / select / confirm return promises; float
     // is fire-and-forget). The deferral primitives nx.schedule / nx.timer live in
     // runtime.lua; this module is the UI surface only.
@@ -415,6 +419,12 @@ pub(crate) struct Shared {
     pub(crate) panel_ops: Vec<PanelOp>,
     /// Dock requests from `nx.dock.*`, applied to the core after the chunk.
     pub(crate) dock_ops: Vec<DockOp>,
+    /// Layer crosses from `nx.open` / `nx.layer.*`, applied to the core after the
+    /// chunk.
+    pub(crate) layer_ops: Vec<LayerOp>,
+    /// `nx.view` content / mount / lifecycle requests, applied to the core after the
+    /// chunk.
+    pub(crate) view_ops: Vec<ViewOp>,
     /// Terminal-open requests from `nx.terminal.open`, applied to the core
     /// (`Editor::open_terminal`) after the chunk.
     pub(crate) terminal_ops: Vec<TerminalOpenReq>,
@@ -539,6 +549,10 @@ pub(crate) struct Shared {
     /// `Editor::apply_explorer_action` — the rebindable file-explorer keys (open /
     /// up / next / prev / first / last / half + page scroll).
     pub(crate) explorer_actions: Vec<String>,
+    /// Named `view` actions a `view`-bucket keymap fired (`nx._view_action`),
+    /// drained by the server into `Editor::apply_view_action` — the rebindable
+    /// `nx.view` keys (next / prev / first / last / half + page scroll / confirm).
+    pub(crate) view_actions: Vec<String>,
     /// Named `cmdline` actions a `cmdline`-bucket (`'c'`) keymap fired
     /// (`nx._cmdline_action`), drained by the server into `Editor::apply_cmdline_action`
     /// — the rebindable command-line keys (cancel / submit / backspace / delete /
@@ -890,6 +904,18 @@ impl LuaRuntime {
     }
 
     take_queue! {
+        /// Take the layer crosses queued by `nx.open` / `nx.layer.*` since the last
+        /// drain, for the server to apply to the core's layer machine.
+        take_layer_ops -> Vec<LayerOp> = layer_ops
+    }
+
+    take_queue! {
+        /// Take the `nx.view` requests queued since the last drain, for the server to
+        /// apply to the core's view registry.
+        take_view_ops -> Vec<ViewOp> = view_ops
+    }
+
+    take_queue! {
         /// Take the terminal-open requests queued by `nx.terminal.open` since the
         /// last drain, for the server to apply to the core (`Editor::open_terminal`).
         take_terminal_open_reqs -> Vec<TerminalOpenReq> = terminal_ops
@@ -1091,6 +1117,12 @@ impl LuaRuntime {
         /// Take the named explorer actions fired since the last drain, for the server
         /// to apply to the file explorer via `Editor::apply_explorer_action`.
         take_explorer_actions -> Vec<String> = explorer_actions
+    }
+
+    take_queue! {
+        /// Take the named `view` actions a `view`-bucket keymap fired, for the server
+        /// to apply to the focused `nx.view` via `Editor::apply_view_action`.
+        take_view_actions -> Vec<String> = view_actions
     }
 
     take_queue! {
@@ -1513,6 +1545,37 @@ impl LuaRuntime {
         if let Some(f) = cb {
             f.call::<()>((line.to_string(), index as i64 + 1))?;
         }
+        Ok(())
+    }
+
+    /// Fire view `id`'s `on_select` callback (`nx._view_select`) for its cursor at
+    /// `line` (0-based, passed to Lua 1-based). A no-op when the view has no handler.
+    /// Errors (a throwing handler) are returned for the server to surface. Called
+    /// when the user hits `<CR>` on a focused `nx.view` buffer.
+    pub fn run_view_select(&self, id: u64, line: usize) -> mlua::Result<()> {
+        let nx = self.nx()?;
+        let f: Option<mlua::Function> = nx.get("_view_select")?;
+        if let Some(f) = f {
+            f.call::<()>((id, line as i64 + 1))?;
+        }
+        Ok(())
+    }
+
+    /// Refresh the `nx.view` Rust→Lua mirror: `nx._view_buf[id]` (the backing
+    /// buffer number, the extmark / read target) and `nx._view_line[id]` (the view
+    /// window's 1-based cursor line) for every live view. Pushed each tick before
+    /// Lua runs (like the buffer mirror), so a view's `:set_decor` / `:line()` read
+    /// against the current state without a server round-trip.
+    pub fn set_view_mirror(&self, views: &[(u64, u64, u64)]) -> mlua::Result<()> {
+        let nx = self.nx()?;
+        let bufs = self.lua.create_table()?;
+        let lines = self.lua.create_table()?;
+        for &(id, buf, line) in views {
+            bufs.set(id, buf)?;
+            lines.set(id, line)?;
+        }
+        nx.set("_view_buf", bufs)?;
+        nx.set("_view_line", lines)?;
         Ok(())
     }
 

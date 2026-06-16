@@ -89,6 +89,59 @@ pub enum DockOp {
     },
 }
 
+/// A request to cross between editor **layers**, queued by `nx.open` / `nx.layer.*`
+/// and drained by the server into the core (which owns the layer machine — the main
+/// editor area plus each open dock). nxvim's own surface (layers are not a neovim
+/// concept). The plumbing a dock plugin (a file tree) uses to open a file in the
+/// *main* editor and bounce focus back and forth.
+#[derive(Clone, Debug)]
+pub enum LayerOp {
+    /// `nx.open(path, { where })` — open `path` (file or directory). `where_main`
+    /// crosses to the Main layer first (the `where = "main"` form); `false` opens in
+    /// the current window (the default `where = "current"`).
+    Open { path: String, where_main: bool },
+    /// `nx.layer.focus(target)` / `nx.layer.main()` — focus a layer by name:
+    /// `"main"` or a dock side keyword (`"left"`/`"right"`/`"top"`/`"bottom"`).
+    Focus { target: String },
+}
+
+/// A request to a **plugin-owned view** (`nx.view` — the dockable, read-only content
+/// surface that generalizes the bottom panel), queued by the `nx.view` handle
+/// methods and drained by the server into the core (which owns the view registry +
+/// backing buffers). `id` is the Lua-allocated handle id every op addresses the view
+/// by. nxvim's own surface; not a neovim concept. The Lua-side state (per-line
+/// userdata, the `on_select` callback) stays in the handle table — only these
+/// content / mount / lifecycle signals cross the bridge.
+#[derive(Clone, Debug)]
+pub enum ViewOp {
+    /// `nx.view.create{ name, filetype }` — register view `id` and mint its backing
+    /// read-only buffer (`filetype` drives treesitter / decoration; empty ⇒ none).
+    Create {
+        id: u64,
+        name: String,
+        filetype: String,
+    },
+    /// `v:set_lines(lines)` — replace view `id`'s content wholesale.
+    SetLines { id: u64, lines: Vec<String> },
+    /// `v:mount{ dock = side, size? }` — show view `id` in the dock on `side` and
+    /// focus it. `size` is columns (left/right) or rows (top/bottom); `None` ⇒ the
+    /// side's default.
+    MountDock {
+        id: u64,
+        side: String,
+        size: Option<u64>,
+    },
+    /// `v:mount{ split = "vsplit" | "split" }` — show view `id` in a new split of the
+    /// main editor area and focus it (`vertical` for `vsplit`).
+    MountSplit { id: u64, vertical: bool },
+    /// `v:unmount()` — remove view `id` from view, keeping the backing buffer alive.
+    Unmount { id: u64 },
+    /// `v:focus()` — move focus to the window showing view `id`.
+    Focus { id: u64 },
+    /// `v:close()` — unmount view `id` and drop its backing buffer + registry entry.
+    Destroy { id: u64 },
+}
+
 /// A request to open a terminal job, queued by `nx.terminal.open{...}` and
 /// drained by the server into [`Editor::open_terminal`](nxvim_core::Editor) — the
 /// programmatic twin of the `:terminal` ex-command, on the same "Lua queues, core

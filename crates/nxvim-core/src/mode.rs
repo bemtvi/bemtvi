@@ -50,6 +50,11 @@ pub enum KeyContext {
     /// falls through to the command line; every other unmapped key is inert (the
     /// listing can't be edited).
     Explorer,
+    /// A plugin-owned `nx.view` buffer owns normal-mode input; its `view` bucket
+    /// applies. Like [`Explorer`](KeyContext::Explorer): `:`/`/`/`?` fall through to
+    /// the command line, every other unmapped key is inert, and `<CR>` dispatches to
+    /// the view's Lua `on_select`.
+    View,
 }
 
 impl Mode {

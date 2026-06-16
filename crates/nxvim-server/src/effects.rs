@@ -15,8 +15,8 @@ use nxvim_core::{
 use nxvim_lua::{
     BoMirror, BufBytesEdit, BufMirror, BufOp, CallbackArgs, DecorPublish, DockOp, ExtmarkMirror,
     ExtmarkOp, FloatMirror, GoMirror, HlDefMirror, HlSet, JumpMirror, LoopOp, OptionValue, PanelOp,
-    QfItem, QfMirror, StatuslineKind, StatuslineTarget, TabMirror, TabOp, TsOp, WindowMirror,
-    WindowOp,
+    QfItem, QfMirror, StatuslineKind, StatuslineTarget, TabMirror, TabOp, TsOp, VirtDecorData,
+    WindowMirror, WindowOp,
 };
 use rmpv::Value;
 use std::collections::HashSet;
@@ -70,6 +70,46 @@ fn qf_mirror_items(list: &nxvim_core::QfList) -> Vec<QfMirror> {
             valid: e.valid,
         })
         .collect()
+}
+
+/// Resolve the Lua-bridge [`VirtDecorData`] (string-tagged positions/modes) into
+/// the typed `nxvim_core::VirtDecor` the editor stores. `virt_text_win_col` wins
+/// over `virt_text_pos` (matching neovim, where a fixed column overrides the
+/// relative placement). The position / hl-mode strings were validated loud at the
+/// scripting boundary, so an unknown value here falls back to the neovim default.
+fn virt_decor_to_core(d: VirtDecorData) -> nxvim_core::VirtDecor {
+    use nxvim_core::{HlMode, VirtChunk, VirtTextPos};
+    let chunks = |cs: Vec<nxvim_lua::VirtChunkData>| -> Vec<VirtChunk> {
+        cs.into_iter()
+            .map(|c| VirtChunk {
+                text: c.text,
+                hl_group: c.hl_group,
+            })
+            .collect()
+    };
+    let virt_text_pos = if let Some(col) = d.virt_text_win_col {
+        VirtTextPos::WinCol(col.max(0) as u16)
+    } else {
+        match d.virt_text_pos.as_deref() {
+            Some("inline") => VirtTextPos::Inline,
+            Some("overlay") => VirtTextPos::Overlay,
+            Some("right_align") => VirtTextPos::RightAlign,
+            _ => VirtTextPos::Eol,
+        }
+    };
+    let hl_mode = match d.hl_mode.as_deref() {
+        Some("combine") => HlMode::Combine,
+        Some("blend") => HlMode::Blend,
+        _ => HlMode::Replace,
+    };
+    nxvim_core::VirtDecor {
+        virt_text: chunks(d.virt_text),
+        virt_text_pos,
+        virt_text_hide: d.virt_text_hide,
+        hl_mode,
+        virt_lines: d.virt_lines.into_iter().map(chunks).collect(),
+        virt_lines_above: d.virt_lines_above,
+    }
 }
 
 fn byte_of(buf: &nxvim_core::Buffer, row: i64, col: i64) -> usize {
@@ -863,6 +903,7 @@ impl EditHost {
                 end_col,
                 hl_group,
                 priority,
+                decor,
             } => {
                 let bid = BufferId(bufnr);
                 let Some(buf) = self.editor.buffer_of(bid) else {
@@ -873,9 +914,10 @@ impl EditHost {
                     (Some(r), Some(c)) => Some(byte_of(buf, r, c).max(start)),
                     _ => None,
                 };
+                let decor = decor.map(|d| Box::new(virt_decor_to_core(*d)));
                 if let Some(buf) = self.editor.buffer_of_mut(bid) {
                     buf.extmarks
-                        .set(ns, Some(id), start, end, hl_group, priority);
+                        .set(ns, Some(id), start, end, hl_group, priority, decor);
                 }
             }
             ExtmarkOp::Del { bufnr, ns, id } => {
@@ -1825,6 +1867,9 @@ impl EditHost {
                 end_col: mark.end_col,
                 hl_group: mark.hl,
                 priority: mark.priority.unwrap_or(nxvim_core::DEFAULT_PRIORITY),
+                // nx.decor providers publish hl-only marks; virtual text on a
+                // provider mark is a separate, not-yet-wired surface.
+                decor: None,
             });
         }
     }

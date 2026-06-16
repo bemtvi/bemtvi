@@ -11,8 +11,9 @@ use crate::parse::{
     chrome_style, map_get, map_str, map_str_array, map_u16, map_u64, parse_border,
     parse_cursor_list, parse_diagnostics, parse_diagnostics_signs, parse_diagnostics_virt,
     parse_highlights, parse_inlay_hints, parse_multi_spans, parse_numbers, parse_pair,
-    parse_pmenu_items, parse_spans, parse_status, parse_styles, DiagSign, DiagSpan, DiagVirt,
-    HlSpan, IncSearchSpans, InlayHint, PmenuItem, SearchSpans, StatusSegment,
+    parse_pmenu_items, parse_spans, parse_status, parse_styles, parse_virt_text, DiagSign,
+    DiagSpan, DiagVirt, HlSpan, IncSearchSpans, InlayHint, PmenuItem, SearchSpans, StatusSegment,
+    VirtPlacement,
 };
 use crate::style::{Border, Style};
 
@@ -139,6 +140,12 @@ pub struct WindowView {
     /// at its column, shifting the real glyphs (and the cursor) right. Empty inner
     /// vecs for rows with no hints (and for a buffer with inlay hints disabled).
     pub inlay_hints: Vec<Vec<InlayHint>>,
+    /// Per visible row, the extmark virtual-text placements (`virt_text`): each is a
+    /// position + screen column + hl-mode + chunk run. Empty inner vecs for rows
+    /// with no virtual text. The renderer paints eol placements after end-of-text
+    /// and inline ones spliced into the row (later positions: overlay / right_align
+    /// / win_col).
+    pub virt_text: Vec<Vec<VirtPlacement>>,
     /// A scroll gesture for this window, when its viewport just moved.
     pub scroll: Option<ScrollData>,
     /// Per visible row, the 1-based buffer line number (`None` for `~` fillers).
@@ -754,6 +761,7 @@ fn parse_window(m: &[(Value, Value)], styles: &[Style]) -> WindowView {
         highlights: parse_highlights(map_get(m, "highlights")),
         diagnostics: parse_diagnostics(map_get(m, "diagnostics")),
         diagnostics_virt: parse_diagnostics_virt(map_get(m, "diagnostics_virt")),
+        virt_text: parse_virt_text(map_get(m, "virt_text")),
         diagnostics_signs: parse_diagnostics_signs(map_get(m, "diagnostics_signs")),
         sign_column: map_get(m, "sign_column")
             .and_then(Value::as_bool)

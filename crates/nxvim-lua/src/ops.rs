@@ -356,10 +356,43 @@ pub enum BufOp {
 /// (the conversion needs the rope, which the Lua side can't see). The Lua front
 /// has already updated its `nx._extmarks` mirror (read-after-write within the
 /// chunk); this op makes the core catch up after the chunk.
+/// One `{text, hl_group}` chunk of a `virt_text` / `virt_lines` payload, lowered
+/// from the neovim chunk form by the Lua bridge. `hl_group == None` draws in the
+/// window's normal colors. The server maps this into `nxvim_core`'s `VirtChunk`.
+#[derive(Clone, Debug)]
+pub struct VirtChunkData {
+    pub text: String,
+    pub hl_group: Option<String>,
+}
+
+/// The virtual-text decoration payload of `nvim_buf_set_extmark`, carried by
+/// [`ExtmarkOp::Set`]. The Lua bridge ([`crate::install`]) lowers the neovim
+/// `decoration` table into this plain form (no mlua types); the server
+/// ([`apply_extmark_op`](../../nxvim_server)) resolves the `virt_text_pos` /
+/// `hl_mode` strings and `virt_text_win_col` into `nxvim_core`'s typed
+/// `VirtTextPos` / `HlMode` before storing the mark. Fields mirror neovim's.
+#[derive(Clone, Debug, Default)]
+pub struct VirtDecorData {
+    pub virt_text: Vec<VirtChunkData>,
+    /// `"eol"` | `"inline"` | `"overlay"` | `"right_align"`; `None` ⇒ eol default.
+    pub virt_text_pos: Option<String>,
+    /// Fixed 0-based window column (neovim's `virt_text_win_col`); wins over `pos`.
+    pub virt_text_win_col: Option<i64>,
+    pub virt_text_hide: bool,
+    /// `"replace"` | `"combine"` | `"blend"`; `None` ⇒ replace default.
+    pub hl_mode: Option<String>,
+    pub virt_lines: Vec<Vec<VirtChunkData>>,
+    pub virt_lines_above: bool,
+}
+
 #[derive(Clone, Debug)]
 pub enum ExtmarkOp {
     /// Create-or-replace a mark `(bufnr, ns, id)`. `end_row`/`end_col` are absent
     /// for a point mark; `hl_group` is absent when the mark carries no highlight.
+    /// `decor` carries the virtual-text/lines payload (`None` for a plain
+    /// position/highlight mark); the Lua bridge has lowered the neovim
+    /// `decoration` table into [`VirtDecorData`], and the server resolves that
+    /// into `nxvim_core`'s `VirtDecor` (the position/hl-mode strings → enums).
     Set {
         bufnr: u64,
         ns: u32,
@@ -370,6 +403,7 @@ pub enum ExtmarkOp {
         end_col: Option<i64>,
         hl_group: Option<String>,
         priority: u32,
+        decor: Option<Box<VirtDecorData>>,
     },
     /// Delete mark `(bufnr, ns, id)`.
     Del { bufnr: u64, ns: u32, id: u64 },

@@ -23,7 +23,7 @@ pub use hit_test::{resize_handle_at, Geometry, ResizeCursor};
 pub use keys::{encode_paste, notation, Key};
 pub use parse::{
     DiagSign, DiagSpan, DiagVirt, HlSpan, IncSearchSpans, InlayHint, PmenuItem, SearchSpans,
-    StatusSegment,
+    StatusSegment, VirtChunk, VirtPlacement,
 };
 pub use style::{Border, Style};
 pub use view::{

@@ -38,6 +38,25 @@ pub type DiagSign = (String, u8, Option<usize>);
 /// (frame-palette index) or a built-in dim foreground when `None`.
 pub type InlayHint = (u16, String, Option<usize>);
 
+/// One chunk of extmark virtual text: `(text, style_id)`. `style_id` indexes the
+/// frame palette when the server resolved the chunk's `hl_group` through a loaded
+/// colorscheme; `None` paints in the window's normal foreground.
+pub type VirtChunk = (String, Option<usize>);
+
+/// One extmark virtual-text placement on a row. `pos` is where it sits — `0`=eol,
+/// `1`=inline, `2`=overlay, `3`=right_align, `4`=win_col; `col` is the screen
+/// column it anchors at (used by inline / overlay / win_col, `0` for eol /
+/// right_align); `hl_mode` is `0`=replace, `1`=combine, `2`=blend. The wire shape
+/// is fixed across all positions so adding a position needs no re-parse, only new
+/// render handling.
+#[derive(Clone, Debug, PartialEq)]
+pub struct VirtPlacement {
+    pub pos: u8,
+    pub col: u16,
+    pub hl_mode: u8,
+    pub chunks: Vec<VirtChunk>,
+}
+
 /// Per visible row, the screen-column spans of every search match (`hlsearch`).
 pub type SearchSpans = Vec<Vec<(u16, u16)>>;
 /// Per visible row, the single span the live `incsearch` preview rests on.
@@ -277,6 +296,54 @@ pub(crate) fn parse_diagnostics_signs(value: Option<&Value>) -> Vec<Option<DiagS
                         t[1].as_u64()? as u8,
                         t[2].as_u64().map(|id| id as usize),
                     ))
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Parse the `virt_text` redraw key into per-row extmark virtual-text placements:
+/// each row is an array of `[pos, col, hl_mode, [[text, style_id], …]]` (empty for
+/// rows with none). Malformed placements / chunks are dropped. Same per-row-list
+/// shape as [`parse_inlay_hints`], but each entry carries a position + chunk run.
+pub(crate) fn parse_virt_text(value: Option<&Value>) -> Vec<Vec<VirtPlacement>> {
+    value
+        .and_then(Value::as_array)
+        .map(|rows| {
+            rows.iter()
+                .map(|row| {
+                    row.as_array()
+                        .map(|ps| {
+                            ps.iter()
+                                .filter_map(|p| {
+                                    let t = p.as_array()?;
+                                    if t.len() != 4 {
+                                        return None;
+                                    }
+                                    let chunks = t[3]
+                                        .as_array()?
+                                        .iter()
+                                        .filter_map(|c| {
+                                            let c = c.as_array()?;
+                                            if c.len() != 2 {
+                                                return None;
+                                            }
+                                            Some((
+                                                c[0].as_str()?.to_string(),
+                                                c[1].as_u64().map(|id| id as usize),
+                                            ))
+                                        })
+                                        .collect();
+                                    Some(VirtPlacement {
+                                        pos: t[0].as_u64()? as u8,
+                                        col: t[1].as_u64()? as u16,
+                                        hl_mode: t[2].as_u64()? as u8,
+                                        chunks,
+                                    })
+                                })
+                                .collect()
+                        })
+                        .unwrap_or_default()
                 })
                 .collect()
         })

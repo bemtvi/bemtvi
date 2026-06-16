@@ -359,3 +359,177 @@ async fn virtual_text_is_accepted_and_stored() {
         "virt_text should create a mark and be retrievable via details, got {s:?}"
     );
 }
+
+/// Row 0's `virt_text` placements from a redraw, each as `(pos, col, [chunk text,
+/// …])`. The wire shape is `[pos, col, hl_mode, [[text, style_id], …]]` per
+/// placement; `pos` is `0`=eol / `1`=inline, `col` the screen column (eol → `0`).
+fn virt_text_row0(params: &[Value]) -> Vec<(u64, u64, Vec<String>)> {
+    let Some(rows) = window0(params)
+        .and_then(|win| win.iter().find(|(k, _)| k.as_str() == Some("virt_text")))
+        .and_then(|(_, v)| v.as_array())
+    else {
+        return Vec::new();
+    };
+    let Some(row0) = rows.first().and_then(Value::as_array) else {
+        return Vec::new();
+    };
+    row0.iter()
+        .filter_map(|p| {
+            let a = p.as_array()?;
+            let pos = a[0].as_u64()?;
+            let col = a[1].as_u64()?;
+            let chunks = a[3]
+                .as_array()?
+                .iter()
+                .filter_map(|c| c.as_array()?[0].as_str().map(str::to_string))
+                .collect();
+            Some((pos, col, chunks))
+        })
+        .collect()
+}
+
+/// Poll (bounded) for a redraw whose row-0 `virt_text` satisfies `done`.
+async fn wait_for_virt_text(
+    rpc: &Rpc,
+    incoming: &mut UnboundedReceiver<Incoming>,
+    done: impl Fn(&[(u64, u64, Vec<String>)]) -> bool,
+) -> Vec<(u64, u64, Vec<String>)> {
+    for _ in 0..100 {
+        barrier(rpc).await;
+        tokio::task::yield_now().await;
+        if let Some(params) = drain_latest_redraw(incoming) {
+            let vt = virt_text_row0(&params);
+            if done(&vt) {
+                return vt;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    panic!("virt_text never satisfied the condition within timeout");
+}
+
+/// The headline for Phase 2: an extmark with `virt_text` at the default `eol`
+/// position surfaces in the redraw `virt_text` payload as an end-of-line placement
+/// (`pos == 0`) carrying its chunk text — so the client paints it after the line.
+#[tokio::test]
+async fn eol_virt_text_paints_after_the_line() {
+    let (rpc, mut incoming) = start().await;
+    feed(&rpc, "ihello<Esc>");
+    exec_lua(
+        &rpc,
+        r#"
+        local ns = vim.api.nvim_create_namespace('eolvt')
+        vim.api.nvim_buf_set_extmark(0, ns, 0, 0, {
+          virt_text = {{' <-- mark', 'Comment'}}, virt_text_pos = 'eol',
+        })
+        "#,
+    )
+    .await;
+
+    let vt = wait_for_virt_text(&rpc, &mut incoming, |vt| {
+        vt.iter()
+            .any(|(pos, _, chunks)| *pos == 0 && chunks.iter().any(|c| c.contains("<-- mark")))
+    })
+    .await;
+    let eol = vt
+        .iter()
+        .find(|(pos, _, _)| *pos == 0)
+        .expect("an eol placement");
+    assert_eq!(
+        eol.2,
+        vec![" <-- mark".to_string()],
+        "the eol virt_text chunk text reaches the client verbatim"
+    );
+}
+
+/// Phase 3: an extmark with `virt_text_pos = 'inline'` surfaces as an inline
+/// placement (`pos == 1`) whose `col` is the screen column of its byte anchor —
+/// the client splices the chunk into the row there. The anchor sits after a tab,
+/// so the column is the *display* column (not the byte offset), exercising the
+/// `virtcol` mapping the server shares with inlay hints / highlights.
+#[tokio::test]
+async fn inline_virt_text_anchors_at_its_screen_column() {
+    let (rpc, mut incoming) = start().await;
+    // `\tword` — one leading tab (the default tabstop, 4 display cells) then
+    // "word"; the mark at byte col 1 (just after the tab) is at screen column 4,
+    // so the screen column is the *display* column, not the byte offset.
+    feed(&rpc, "i<Tab>word<Esc>");
+    exec_lua(
+        &rpc,
+        r#"
+        local ns = vim.api.nvim_create_namespace('inlinevt')
+        vim.api.nvim_buf_set_extmark(0, ns, 0, 1, {
+          virt_text = {{'HINT', 'Comment'}}, virt_text_pos = 'inline',
+        })
+        "#,
+    )
+    .await;
+
+    let vt = wait_for_virt_text(&rpc, &mut incoming, |vt| {
+        vt.iter()
+            .any(|(pos, _, chunks)| *pos == 1 && chunks.iter().any(|c| c == "HINT"))
+    })
+    .await;
+    let inline = vt
+        .iter()
+        .find(|(pos, _, _)| *pos == 1)
+        .expect("an inline placement");
+    assert_eq!(
+        (inline.1, &inline.2),
+        (4, &vec!["HINT".to_string()]),
+        "inline virt_text anchors at screen column 4 (past the leading tab)"
+    );
+}
+
+/// Phase 4: the `overlay`, `right_align`, and `win_col` positions each project with
+/// their distinct `pos` tag and column — overlay at its anchor's screen column,
+/// right_align with `col == 0` (the client flushes it to the right edge), and
+/// win_col at its fixed window column independent of the mark anchor.
+#[tokio::test]
+async fn overlay_rightalign_wincol_positions_project() {
+    let (rpc, mut incoming) = start().await;
+    feed(&rpc, "ihello world<Esc>");
+    exec_lua(
+        &rpc,
+        r#"
+        local ns = vim.api.nvim_create_namespace('pos')
+        vim.api.nvim_buf_set_extmark(0, ns, 0, 2, {
+          virt_text = {{'OV', 'Comment'}}, virt_text_pos = 'overlay',
+        })
+        vim.api.nvim_buf_set_extmark(0, ns, 0, 0, {
+          virt_text = {{'RA', 'Comment'}}, virt_text_pos = 'right_align',
+        })
+        vim.api.nvim_buf_set_extmark(0, ns, 0, 0, {
+          virt_text = {{'WC', 'Comment'}}, virt_text_win_col = 40,
+        })
+        "#,
+    )
+    .await;
+
+    let vt = wait_for_virt_text(&rpc, &mut incoming, |vt| {
+        [2, 3, 4]
+            .iter()
+            .all(|want| vt.iter().any(|(pos, _, _)| pos == want))
+    })
+    .await;
+    let find = |pos: u64| {
+        vt.iter()
+            .find(|(p, _, _)| *p == pos)
+            .map(|(_, c, t)| (*c, t.clone()))
+    };
+    assert_eq!(
+        find(2),
+        Some((2, vec!["OV".to_string()])),
+        "overlay projects at its anchor's screen column (2)"
+    );
+    assert_eq!(
+        find(3),
+        Some((0, vec!["RA".to_string()])),
+        "right_align projects with col 0 (the client positions it at the right edge)"
+    );
+    assert_eq!(
+        find(4),
+        Some((40, vec!["WC".to_string()])),
+        "win_col projects at its fixed window column (40)"
+    );
+}

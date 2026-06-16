@@ -67,12 +67,72 @@ pub const SEMANTIC_HL_PRIORITY: u32 = 125;
 /// treesitter span, semantic token, or user extmark should bleed onto them.
 pub const SPECIAL_KEY_PRIORITY: u32 = u32::MAX;
 
+/// One run of virtual text: a string with an optional highlight group. A
+/// `virt_text` / `virt_lines` payload is a list of these (neovim's
+/// `{ {text, hl_group}, … }` chunk form). `hl_group == None` paints in the
+/// window's normal colors.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VirtChunk {
+    pub text: String,
+    pub hl_group: Option<String>,
+}
+
+/// Where a mark's `virt_text` is drawn, relative to the buffer line it anchors
+/// to (neovim's `virt_text_pos`, plus the fixed-column `virt_text_win_col`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum VirtTextPos {
+    /// After the line's last character (the default; the diagnostics path's shape).
+    #[default]
+    Eol,
+    /// Spliced into the line at the mark's column, pushing real text right.
+    Inline,
+    /// Drawn over the cells starting at the mark's column (replacing them).
+    Overlay,
+    /// Right-aligned to the window's right edge.
+    RightAlign,
+    /// Pinned to a fixed window column (0-based), independent of the mark column.
+    WinCol(u16),
+}
+
+/// How a `virt_text` chunk's highlight combines with whatever it draws over
+/// (neovim's `hl_mode`). Only meaningful for `Overlay` / `Inline`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum HlMode {
+    /// The chunk's own `hl_group` fully replaces the underlying highlight.
+    #[default]
+    Replace,
+    /// Combine the chunk highlight with the underlying highlight.
+    Combine,
+    /// Blend the chunk's background with the underlying text.
+    Blend,
+}
+
+/// The virtual-text payload of an extmark: `virt_text` (inline / eol / overlay /
+/// right-aligned text on the anchored line) and `virt_lines` (whole extra screen
+/// rows above or below the line). Boxed onto [`Extmark`] so the common hl-only
+/// mark stays small. `None` on an [`Extmark`] means a plain position / highlight
+/// mark with no virtual content.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct VirtDecor {
+    pub virt_text: Vec<VirtChunk>,
+    pub virt_text_pos: VirtTextPos,
+    /// Hide the `virt_text` when the line is covered (e.g. by a visual block);
+    /// stored for parity, honored by the renderer.
+    pub virt_text_hide: bool,
+    pub hl_mode: HlMode,
+    /// Each inner `Vec` is one virtual line's chunk run; the outer order is the
+    /// top-to-bottom draw order.
+    pub virt_lines: Vec<Vec<VirtChunk>>,
+    /// Draw `virt_lines` above the anchored line rather than below it.
+    pub virt_lines_above: bool,
+}
+
 /// A single extmark, identified within its buffer by `(namespace, id)`.
 ///
 /// `start`/`end` are byte offsets into the buffer rope, kept current by
-/// [`ExtmarkStore::shift`]. `end` is `None` for a *point* mark (no range); a
-/// point mark with only `hl_group` contributes nothing visible in v1 (no
-/// virtual text / signs yet) but still tracks its position.
+/// [`ExtmarkStore::shift`]. `end` is `None` for a *point* mark (no range). A
+/// point mark with neither `hl_group` nor [`decor`](Self::decor) still tracks
+/// its position (for `get_extmarks`); `decor` carries any virtual text/lines.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Extmark {
     pub id: u64,
@@ -80,6 +140,7 @@ pub struct Extmark {
     pub end: Option<usize>,
     pub hl_group: Option<String>,
     pub priority: u32,
+    pub decor: Option<Box<VirtDecor>>,
 }
 
 /// Marks within one namespace, plus that namespace's monotonic id allocator.
@@ -107,6 +168,7 @@ impl ExtmarkStore {
     /// allocated from the namespace's counter; with `Some(id)` the caller's id is
     /// used (replacing any existing mark) and the counter is advanced past it so
     /// a later auto-id can't collide. Returns the id used.
+    #[allow(clippy::too_many_arguments)] // positional mark setter; fields mirror neovim's
     pub fn set(
         &mut self,
         ns: u32,
@@ -115,6 +177,7 @@ impl ExtmarkStore {
         end: Option<usize>,
         hl_group: Option<String>,
         priority: u32,
+        decor: Option<Box<VirtDecor>>,
     ) -> u64 {
         let slot = self.by_ns.entry(ns).or_default();
         let id = match id {
@@ -136,6 +199,7 @@ impl ExtmarkStore {
                 end,
                 hl_group,
                 priority,
+                decor,
             },
         );
         id

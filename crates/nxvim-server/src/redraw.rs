@@ -308,6 +308,13 @@ impl EditHost {
         #[cfg(not(feature = "native"))]
         let special_key = special_key_spans(&win.lines, win.tabstop);
         let status = self.status_value(win, mode_label, statusline_fmt, styles);
+        // Extmark virtual text is a native-only projection (the wasm edit-host has no
+        // server-side extmark store frame loop); the browser emits an empty array so
+        // the redraw map keeps a stable shape.
+        #[cfg(feature = "native")]
+        let virt_text = self.virt_text_for(win.buffer, &win.numbers, styles);
+        #[cfg(not(feature = "native"))]
+        let virt_text = Value::Array(Vec::new());
         #[cfg(feature = "native")]
         let (diagnostics, diagnostics_virt, diagnostics_signs, sign_column, inlay_hints) = (
             self.diagnostics_for(win.buffer, &win.numbers, styles),
@@ -437,6 +444,7 @@ impl EditHost {
             (Value::from("highlights"), highlights),
             (Value::from("diagnostics"), diagnostics),
             (Value::from("diagnostics_virt"), diagnostics_virt),
+            (Value::from("virt_text"), virt_text),
             (Value::from("diagnostics_signs"), diagnostics_signs),
             (Value::from("sign_column"), Value::from(sign_column)),
             (Value::from("inlay_hints"), inlay_hints),

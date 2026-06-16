@@ -455,7 +455,7 @@ function nx.buf.set_extmark(buffer, ns, line, col, opts)
     priority = priority,
     decoration = decoration,
   }
-  nx._extmark_set(b, ns, mark_id, line, col, end_row, opts.end_col, hl_group, priority)
+  nx._extmark_set(b, ns, mark_id, line, col, end_row, opts.end_col, hl_group, priority, decoration)
   return mark_id
 end
 

@@ -23,7 +23,8 @@ use crate::ops::{
     FeedKeysOp, GlobalOptionOp, HlSet, LoopOp, LspOp, OptionValue, PanelOp, PickerOpenReq,
     PickerPush, PreviewPush, QfItem, QfSetOp, RegisterSetOp, SnippetAddReq, SnippetSetupReq,
     StatuslineKind, StatuslinePublishReq, StatuslineSetupReq, StatuslineTarget, TabOp,
-    TerminalOpenReq, TsOp, UiFloatReq, UiInputReq, UiSelectReq, WindowOp,
+    TerminalOpenReq, TsOp, UiFloatReq, UiInputReq, UiSelectReq, VirtChunkData, VirtDecorData,
+    WindowOp,
 };
 use crate::runtime::{resolve_lua_fs, Shared};
 use crate::vimregex;
@@ -56,6 +57,85 @@ impl UserData for LuaRegex {
             })
         });
     }
+}
+
+/// Parse one neovim virtual-text chunk `{ text, hl_group? }` into a
+/// [`VirtChunkData`]. `hl_group` may be a string or absent; a list-of-groups
+/// (neovim's stacked form) is rejected loud rather than silently dropped, matching
+/// the `hl_group` handling in `nvim_buf_set_extmark`.
+fn virt_chunk_from_table(t: &Table) -> mlua::Result<VirtChunkData> {
+    let text: String = t.get(1)?;
+    let hl_group = match t.get::<mlua::Value>(2)? {
+        mlua::Value::Nil => None,
+        mlua::Value::String(s) => Some(s.to_str()?.to_owned()),
+        _ => {
+            return Err(mlua::Error::RuntimeError(
+                "virt_text chunk hl_group must be a string (group lists not supported yet)".into(),
+            ))
+        }
+    };
+    Ok(VirtChunkData { text, hl_group })
+}
+
+/// Parse a chunk list (`{ {text, hl}, … }`) into `Vec<VirtChunkData>`.
+fn virt_chunks_from_table(list: &Table) -> mlua::Result<Vec<VirtChunkData>> {
+    let mut out = Vec::new();
+    for chunk in list.clone().sequence_values::<Table>() {
+        out.push(virt_chunk_from_table(&chunk?)?);
+    }
+    Ok(out)
+}
+
+/// Lower a `nvim_buf_set_extmark` `decoration` table (the virtual-text payload the
+/// prelude collected) into a [`VirtDecorData`]. Returns `None` when it carries
+/// neither `virt_text` nor `virt_lines` — a decoration of only not-yet-rendered
+/// keys (signs, conceal, …) stores nothing renderable, so no op payload is needed.
+fn virt_decor_from_table(t: &Table) -> mlua::Result<Option<VirtDecorData>> {
+    let virt_text = match t.get::<Option<Table>>("virt_text")? {
+        Some(list) => virt_chunks_from_table(&list)?,
+        None => Vec::new(),
+    };
+    let virt_lines = match t.get::<Option<Table>>("virt_lines")? {
+        Some(lines) => {
+            let mut out = Vec::new();
+            for line in lines.sequence_values::<Table>() {
+                out.push(virt_chunks_from_table(&line?)?);
+            }
+            out
+        }
+        None => Vec::new(),
+    };
+    if virt_text.is_empty() && virt_lines.is_empty() {
+        return Ok(None);
+    }
+    // Reject an unknown `virt_text_pos` / `hl_mode` loud here (at the scripting
+    // boundary, where the error names the bad value) so the server can match the
+    // string against a closed set without a silent fallback.
+    let virt_text_pos = t.get::<Option<String>>("virt_text_pos")?;
+    if let Some(p) = &virt_text_pos {
+        if !matches!(p.as_str(), "eol" | "inline" | "overlay" | "right_align") {
+            return Err(mlua::Error::RuntimeError(format!(
+                "nvim_buf_set_extmark: virt_text_pos '{p}' is not one of eol|inline|overlay|right_align"
+            )));
+        }
+    }
+    let hl_mode = t.get::<Option<String>>("hl_mode")?;
+    if let Some(m) = &hl_mode {
+        if !matches!(m.as_str(), "replace" | "combine" | "blend") {
+            return Err(mlua::Error::RuntimeError(format!(
+                "nvim_buf_set_extmark: hl_mode '{m}' is not one of replace|combine|blend"
+            )));
+        }
+    }
+    Ok(Some(VirtDecorData {
+        virt_text,
+        virt_text_pos,
+        virt_text_win_col: t.get::<Option<i64>>("virt_text_win_col")?,
+        virt_text_hide: t.get::<Option<bool>>("virt_text_hide")?.unwrap_or(false),
+        hl_mode,
+        virt_lines,
+        virt_lines_above: t.get::<Option<bool>>("virt_lines_above")?.unwrap_or(false),
+    }))
 }
 
 pub(crate) fn install_vim(lua: &Lua, shared: &Rc<RefCell<Shared>>) -> mlua::Result<()> {
@@ -673,8 +753,10 @@ pub(crate) fn install_runtime_api(
     // (prelude) has resolved `bufnr`, allocated the id, and updated its
     // `nx._extmarks` mirror (write-through); the server converts the 0-based
     // `(row, col)` positions to byte offsets against the live rope.
-    // `(bufnr, ns, id, row, col, end_row, end_col, hl_group, priority)` — the
-    // positional payload the prelude's `nvim_buf_set_extmark` forwards.
+    // `(bufnr, ns, id, row, col, end_row, end_col, hl_group, priority, decoration)`
+    // — the positional payload the prelude's `nvim_buf_set_extmark` forwards.
+    // `decoration` is the accepted-but-previously-unrendered virtual-text table
+    // (`virt_text` / `virt_lines` / …), lowered here into a [`VirtDecorData`].
     type ExtmarkSetArgs = (
         u64,
         u32,
@@ -685,12 +767,17 @@ pub(crate) fn install_runtime_api(
         Option<i64>,
         Option<String>,
         u32,
+        Option<Table>,
     );
     let sh = shared.clone();
     nx.set(
         "_extmark_set",
         lua.create_function(
-            move |_, (bufnr, ns, id, row, col, end_row, end_col, hl_group, priority): ExtmarkSetArgs| {
+            move |_, (bufnr, ns, id, row, col, end_row, end_col, hl_group, priority, decoration): ExtmarkSetArgs| {
+                let decor = match decoration {
+                    Some(t) => virt_decor_from_table(&t)?.map(Box::new),
+                    None => None,
+                };
                 sh.borrow_mut().extmark_ops.push(ExtmarkOp::Set {
                     bufnr,
                     ns,
@@ -701,6 +788,7 @@ pub(crate) fn install_runtime_api(
                     end_col,
                     hl_group,
                     priority,
+                    decor,
                 });
                 Ok(())
             },

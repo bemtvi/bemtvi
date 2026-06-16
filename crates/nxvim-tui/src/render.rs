@@ -15,7 +15,7 @@ use crate::images::ImageStore;
 use nxvim_view::{
     DiagSign, DiagSpan, DiagVirt, HlSpan, IncSearchSpans, InlayHint, MenuData, MenuPreview,
     PanelData, PmenuData, RegionTabline, SearchSpans, Separator, StatusSegment, TabData, View,
-    WindowRegion, WindowView,
+    VirtPlacement, WindowRegion, WindowView,
 };
 
 /// Width in cells of the diagnostic sign column when reserved (vim's fixed
@@ -639,6 +639,7 @@ fn render_window(
     let empty_search: SearchSpans = Vec::new();
     let empty_diag: Vec<Vec<DiagSpan>> = Vec::new();
     let empty_virt: Vec<Option<DiagVirt>> = Vec::new();
+    let empty_virt_text: Vec<Vec<VirtPlacement>> = Vec::new();
     let empty_signs: Vec<Option<DiagSign>> = Vec::new();
 
     // Owned slide-band snapshots, populated only while animating (a `skip/take`
@@ -810,6 +811,11 @@ fn render_window(
         Some(_) => &empty_virt,
         None => &win.diagnostics_virt,
     };
+    // Extmark virtual text, like diagnostics, paints on the settled viewport only.
+    let frame_virt_text: &[Vec<VirtPlacement>] = match anim {
+        Some(_) => &empty_virt_text,
+        None => &win.virt_text,
+    };
     // Signs, like diagnostics, are painted on the settled viewport only — a slide
     // band carries none (the reserved column stays blank while animating, so the
     // text below it doesn't jump). Painted now that the palette resolves style ids.
@@ -831,6 +837,7 @@ fn render_window(
         frame_hl,
         frame_diag,
         frame_virt,
+        frame_virt_text,
         frame_inlay,
         frame_numbers,
         win.tabstop.max(1) as usize,
@@ -866,7 +873,13 @@ fn render_window(
     // window's once settled (both indexed by the cursor's screen row). Returned so
     // the caller places the focused window's cursor past the splice in either case.
     let cursor_shift =
-        inlay_cursor_shift(frame_inlay, cursor_row, win.cursor_screen_col, win.leftcol);
+        inlay_cursor_shift(frame_inlay, cursor_row, win.cursor_screen_col, win.leftcol)
+            + virt_cursor_shift(
+                frame_virt_text,
+                cursor_row,
+                win.cursor_screen_col,
+                win.leftcol,
+            );
     (text_inner, cursor_row, cursor_shift)
 }
 
@@ -1098,6 +1111,7 @@ fn render_text(
     highlights: &[Vec<HlSpan>],
     diagnostics: &[Vec<DiagSpan>],
     diagnostics_virt: &[Option<DiagVirt>],
+    virt_text: &[Vec<VirtPlacement>],
     inlay_hints: &[Vec<InlayHint>],
     numbers: &[Option<usize>],
     tabstop: usize,
@@ -1109,6 +1123,7 @@ fn render_text(
     let empty_diag: Vec<DiagSpan> = Vec::new();
     let empty_search: Vec<(u16, u16)> = Vec::new();
     let empty_inlay: Vec<InlayHint> = Vec::new();
+    let empty_virt_text: Vec<VirtPlacement> = Vec::new();
     let text = Text::from(
         lines
             .iter()
@@ -1121,11 +1136,12 @@ fn render_text(
                 let hl = highlights.get(row).unwrap_or(&empty);
                 let diag = diagnostics.get(row).unwrap_or(&empty_diag);
                 let virt = diagnostics_virt.get(row).and_then(Option::as_ref);
+                let vtext = virt_text.get(row).unwrap_or(&empty_virt_text);
                 let inlay = inlay_hints.get(row).unwrap_or(&empty_inlay);
                 // A row with no buffer line is a `~` end-of-buffer filler.
                 let is_filler = matches!(numbers.get(row), Some(None));
                 highlight_line(
-                    l, sel, sec_sel, matches, cur, hl, diag, virt, inlay, width, is_filler,
+                    l, sel, sec_sel, matches, cur, hl, diag, virt, vtext, inlay, width, is_filler,
                     tabstop, leftcol, theme,
                 )
             })
@@ -1162,6 +1178,7 @@ fn highlight_line(
     hl: &[HlSpan],
     diag: &[DiagSpan],
     virt: Option<&DiagVirt>,
+    vtext: &[VirtPlacement],
     inlay: &[InlayHint],
     max_width: usize,
     is_filler: bool,
@@ -1193,12 +1210,28 @@ fn highlight_line(
     // selection / search / highlight / diagnostic spans remain correct per glyph
     // (the style travels with the glyph, not its painted position); only the
     // cursor, painted separately, needs the matching shift (see `inlay_shift`).
+    // Inline `virt_text` placements splice into the stream just like inlay hints
+    // (server-sorted ascending by screen column). Both push the following glyphs —
+    // and the cursor (see `virt_cursor_shift`) — right.
+    let inline: Vec<&VirtPlacement> = vtext.iter().filter(|p| p.pos == VIRT_POS_INLINE).collect();
+    // Overlay + win_col placements draw *over* the cells at their column (no shift),
+    // suppressing the real glyphs they cover. Sorted ascending by column so the
+    // walk meets them in order.
+    let mut overlays: Vec<&VirtPlacement> = vtext
+        .iter()
+        .filter(|p| p.pos == VIRT_POS_OVERLAY || p.pos == VIRT_POS_WIN_COL)
+        .collect();
+    overlays.sort_by_key(|p| p.col);
+
     let mut spans: Vec<Span> = Vec::new();
     let mut run = String::new();
     let mut run_style = Style::default();
     let mut col = 0usize;
     let mut hi = 0usize; // next hint to emit
-    let mut inserted = 0usize; // visible hint cells spliced in so far
+    let mut vi = 0usize; // next inline virt_text placement to emit
+    let mut oi = 0usize; // next overlay placement to emit
+    let mut overlay_end = 0usize; // absolute col real glyphs are suppressed up to
+    let mut inserted = 0usize; // visible hint / inline-virt cells spliced in so far
     for ch in expanded.chars() {
         while hi < inlay.len() && (inlay[hi].0 as usize) <= col {
             emit_inlay_hint(
@@ -1214,7 +1247,37 @@ fn highlight_line(
             );
             hi += 1;
         }
-        if col >= leftcol {
+        while vi < inline.len() && (inline[vi].col as usize) <= col {
+            emit_inline_virt(
+                inline[vi],
+                &mut spans,
+                &mut run,
+                &mut run_style,
+                col,
+                leftcol,
+                max_width,
+                &mut inserted,
+                theme,
+            );
+            vi += 1;
+        }
+        while oi < overlays.len() && (overlays[oi].col as usize) <= col {
+            overlay_end = overlay_end.max(emit_overlay(
+                overlays[oi],
+                &mut spans,
+                &mut run,
+                &mut run_style,
+                col,
+                leftcol,
+                max_width,
+                inserted,
+                theme,
+            ));
+            oi += 1;
+        }
+        // A glyph the overlay covers (`col < overlay_end`) is suppressed: the
+        // overlay text painted it. Past the overlay, painting resumes normally.
+        if col >= leftcol && col >= overlay_end {
             let style = cell_style(col, sel, secondary_sel, search, incsearch, hl, diag, theme);
             if style != run_style && !run.is_empty() {
                 spans.push(Span::styled(std::mem::take(&mut run), run_style));
@@ -1242,10 +1305,25 @@ fn highlight_line(
         );
         hi += 1;
     }
+    // Inline virt_text anchored at or past end-of-text.
+    while vi < inline.len() {
+        emit_inline_virt(
+            inline[vi],
+            &mut spans,
+            &mut run,
+            &mut run_style,
+            col,
+            leftcol,
+            max_width,
+            &mut inserted,
+            theme,
+        );
+        vi += 1;
+    }
 
     // Visible cells painted so far (text past the horizontal scroll, plus the
-    // inline hint cells). The virt text below is clamped against this so it never
-    // overruns the viewport.
+    // inline hint / virt_text cells). The eol virt text below is clamped against
+    // this so it never overruns the viewport.
     let mut painted = col.saturating_sub(leftcol) + inserted;
 
     // Extend the selection past end-of-text (selected newline / linewise fill),
@@ -1265,6 +1343,74 @@ fn highlight_line(
             let pad = " ".repeat(e - start);
             spans.push(Span::styled(pad, selection_style(Style::default(), theme)));
             painted += e - start;
+        }
+    }
+
+    // Overlay / win_col placements anchored at or past end-of-text: pad to the
+    // placement's column, then draw its chunks (e.g. a fixed-column guide on a short
+    // line). No suppression past EOL — there are no real glyphs left to cover.
+    if !is_filler {
+        while oi < overlays.len() {
+            let p = overlays[oi];
+            oi += 1;
+            let target = (p.col as usize).saturating_sub(leftcol) + inserted;
+            if target < painted || target >= max_width {
+                continue; // behind the cursor of painted text, or off the right edge
+            }
+            if target > painted {
+                spans.push(Span::raw(" ".repeat(target - painted)));
+                painted = target;
+            }
+            painted += push_virt_chunks(&mut spans, &p.chunks, painted, max_width, theme);
+        }
+    }
+
+    // Extmark end-of-line virtual text. Each `eol` placement paints after a
+    // one-cell gap past the text painted so far; its chunks paint in order, each in
+    // its own resolved style. Truncated to the remaining viewport width; never on a
+    // `~` filler row.
+    if !is_filler {
+        for placement in vtext {
+            if placement.pos != VIRT_POS_EOL {
+                continue;
+            }
+            if painted + 1 >= max_width {
+                break;
+            }
+            spans.push(Span::raw(" "));
+            painted += 1;
+            painted += push_virt_chunks(&mut spans, &placement.chunks, painted, max_width, theme);
+        }
+    }
+
+    // Right-aligned virtual text: flush every `right_align` placement's chunks to
+    // the window's right edge (stacked in placement order). Skipped on a `~` filler
+    // row, and clamped to start no earlier than the painted text (so it never
+    // overlaps real content — it left-justifies and truncates if the row is full).
+    if !is_filler {
+        let ra: Vec<&(String, Option<usize>)> = vtext
+            .iter()
+            .filter(|p| p.pos == VIRT_POS_RIGHT_ALIGN)
+            .flat_map(|p| p.chunks.iter())
+            .collect();
+        if !ra.is_empty() {
+            let total: usize = ra.iter().map(|(t, _)| str_width(t)).sum();
+            let start = max_width.saturating_sub(total).max(painted);
+            if start > painted && start < max_width {
+                spans.push(Span::raw(" ".repeat(start - painted)));
+                painted = start;
+            }
+            for (text, id) in ra {
+                if painted >= max_width {
+                    break;
+                }
+                let shown = truncate_to_width(text, max_width - painted);
+                if shown.is_empty() {
+                    break;
+                }
+                painted += str_width(&shown);
+                spans.push(Span::styled(shown, virt_chunk_style(*id, theme)));
+            }
         }
     }
 
@@ -1310,6 +1456,38 @@ fn virt_text_style(severity: u8, id: Option<usize>, theme: &LineTheme) -> Style 
     Style::default().fg(severity_color(severity))
 }
 
+/// The `virt_text` placement `pos` tags (mirror the server's `VirtTextPos`):
+/// `0`=eol (after end-of-text), `1`=inline (spliced into the row, shifting text),
+/// `2`=overlay (drawn over the cells at its column, no shift), `3`=right_align
+/// (flush to the window's right edge), `4`=win_col (overlaid at a fixed window
+/// column).
+const VIRT_POS_EOL: u8 = 0;
+const VIRT_POS_INLINE: u8 = 1;
+const VIRT_POS_OVERLAY: u8 = 2;
+const VIRT_POS_RIGHT_ALIGN: u8 = 3;
+const VIRT_POS_WIN_COL: u8 = 4;
+
+/// The style for one extmark virtual-text chunk: the colorscheme palette entry the
+/// server resolved its `hl_group` to, or the window's normal foreground when the
+/// chunk carried no group (or it didn't resolve).
+///
+/// This is the `hl_mode = 'replace'` rendering (the default): the chunk paints in
+/// its own resolved style. The `combine` / `blend` modes — merging the chunk's
+/// highlight with the cells underneath an overlay — are a later refinement; today
+/// every mode renders as `replace`.
+fn virt_chunk_style(id: Option<usize>, theme: &LineTheme) -> Style {
+    id.and_then(|i| theme.palette.get(i))
+        .copied()
+        .unwrap_or_default()
+}
+
+/// Total display width of `s` in screen cells (wide chars by their width).
+fn str_width(s: &str) -> usize {
+    s.chars()
+        .map(|c| UnicodeWidthChar::width(c).unwrap_or(0))
+        .sum()
+}
+
 /// Splice one inlay hint into the row's span stream at its anchor column: flush
 /// any pending text run, then push the hint's text (truncated to whatever viewport
 /// width is left), styled by its resolved `LspInlayHint` palette entry or a dim
@@ -1344,6 +1522,100 @@ fn emit_inlay_hint(
     spans.push(Span::styled(shown, inlay_hint_style(*id, theme)));
 }
 
+/// Push virtual-text chunks into `spans` starting at viewport column `painted`,
+/// each truncated to the remaining viewport width and styled by its resolved
+/// palette id (the window's normal color when the chunk carried no group, or it
+/// didn't resolve). Returns the total display width added. Shared by the eol,
+/// overlay, win_col, and right_align render paths.
+fn push_virt_chunks(
+    spans: &mut Vec<Span<'static>>,
+    chunks: &[(String, Option<usize>)],
+    painted: usize,
+    max_width: usize,
+    theme: &LineTheme,
+) -> usize {
+    let mut added = 0usize;
+    for (text, id) in chunks {
+        let at = painted + added;
+        if at >= max_width {
+            break;
+        }
+        let shown = truncate_to_width(text, max_width - at);
+        if shown.is_empty() {
+            break;
+        }
+        added += str_width(&shown);
+        spans.push(Span::styled(shown, virt_chunk_style(*id, theme)));
+    }
+    added
+}
+
+/// Draw one overlay / win_col `virt_text` placement *over* the cells at its column:
+/// flush the pending text run, then push the chunks at the placement's viewport
+/// position. Returns the absolute column the overlay extends to, so the caller
+/// suppresses the real glyphs it covers (overlay replaces, it does not shift). A
+/// placement scrolled off the left (`col < leftcol`) paints nothing and suppresses
+/// nothing.
+#[allow(clippy::too_many_arguments)]
+fn emit_overlay(
+    placement: &VirtPlacement,
+    spans: &mut Vec<Span<'static>>,
+    run: &mut String,
+    run_style: &mut Style,
+    col: usize,
+    leftcol: usize,
+    max_width: usize,
+    inserted: usize,
+    theme: &LineTheme,
+) -> usize {
+    if (placement.col as usize) < leftcol {
+        return col;
+    }
+    if !run.is_empty() {
+        spans.push(Span::styled(std::mem::take(run), *run_style));
+    }
+    let painted = col.saturating_sub(leftcol) + inserted;
+    col + push_virt_chunks(spans, &placement.chunks, painted, max_width, theme)
+}
+
+/// Splice one inline `virt_text` placement into the row's span stream at its anchor
+/// column: flush the pending text run, then push each chunk (truncated to the
+/// remaining viewport width) in its own resolved style. The inline analogue of
+/// [`emit_inlay_hint`], but for a multi-chunk run. A placement scrolled off the
+/// left (`col < leftcol`) is skipped; `inserted` accumulates the visible cells so
+/// the caller tracks the shift the splice adds to the following glyphs (and the
+/// cursor, via [`virt_cursor_shift`]).
+#[allow(clippy::too_many_arguments)]
+fn emit_inline_virt(
+    placement: &VirtPlacement,
+    spans: &mut Vec<Span<'static>>,
+    run: &mut String,
+    run_style: &mut Style,
+    col: usize,
+    leftcol: usize,
+    max_width: usize,
+    inserted: &mut usize,
+    theme: &LineTheme,
+) {
+    if (placement.col as usize) < leftcol {
+        return; // scrolled off the left edge.
+    }
+    let mut flushed = false;
+    for (text, id) in &placement.chunks {
+        let painted = col.saturating_sub(leftcol) + *inserted;
+        let shown = truncate_to_width(text, max_width.saturating_sub(painted));
+        if shown.is_empty() {
+            break; // no room left in the viewport.
+        }
+        if !flushed && !run.is_empty() {
+            spans.push(Span::styled(std::mem::take(run), *run_style));
+            flushed = true;
+        }
+        *inserted += UnicodeWidthStr::width(shown.as_str());
+        spans.push(Span::styled(shown, virt_chunk_style(*id, theme)));
+    }
+}
+
 /// The combined width of the inline inlay hints on `cursor_row` that sit at or
 /// before `cursor_col` (and inside the horizontal scroll) — how far the inline
 /// splice pushes the cursor to the right. A hint exactly at the cursor column is
@@ -1362,6 +1634,26 @@ fn inlay_cursor_shift(
         .flatten()
         .filter(|(hcol, _, _)| *hcol >= leftcol && *hcol <= cursor_col)
         .map(|(_, text, _)| UnicodeWidthStr::width(text.as_str()) as u16)
+        .sum()
+}
+
+/// The combined width of the inline `virt_text` placements on `cursor_row` at or
+/// before `cursor_col` (and inside the horizontal scroll) — how far the inline
+/// splice pushes the cursor right. The `virt_text` analogue of
+/// [`inlay_cursor_shift`], summing each inline placement's chunk widths.
+fn virt_cursor_shift(
+    virt_text: &[Vec<VirtPlacement>],
+    cursor_row: u16,
+    cursor_col: u16,
+    leftcol: u16,
+) -> u16 {
+    virt_text
+        .get(cursor_row as usize)
+        .into_iter()
+        .flatten()
+        .filter(|p| p.pos == VIRT_POS_INLINE && p.col >= leftcol && p.col <= cursor_col)
+        .flat_map(|p| p.chunks.iter())
+        .map(|(text, _)| UnicodeWidthStr::width(text.as_str()) as u16)
         .sum()
 }
 

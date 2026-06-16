@@ -41,8 +41,8 @@ pub use editor::{
 };
 pub use encoding::Encoding;
 pub use extmark::{
-    Extmark, ExtmarkStore, DEFAULT_PRIORITY, SEMANTIC_HL_PRIORITY, SPECIAL_KEY_PRIORITY,
-    TS_HL_PRIORITY,
+    Extmark, ExtmarkStore, HlMode, VirtChunk, VirtDecor, VirtTextPos, DEFAULT_PRIORITY,
+    SEMANTIC_HL_PRIORITY, SPECIAL_KEY_PRIORITY, TS_HL_PRIORITY,
 };
 pub use highlight::{parse_color, Highlights, HlDef, Rgb, Style};
 pub use host::{DirEntry, FileStat, HostFs, StdHostFs};

@@ -289,6 +289,7 @@ impl Editor {
             Some(end),
             Some(hl.to_string()),
             DEFAULT_PRIORITY,
+            None,
         )
     }
 

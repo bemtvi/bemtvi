@@ -41,7 +41,7 @@ impl Editor {
             .get_mut(bid)
             .buffer
             .extmarks
-            .set(CURSOR_NS, id, at, None, None, 0)
+            .set(CURSOR_NS, id, at, None, None, 0, None)
     }
 
     /// The live byte anchor of secondary-cursor mark `id`, or `None` if it was
@@ -58,7 +58,7 @@ impl Editor {
             .get_mut(bid)
             .buffer
             .extmarks
-            .set(ANCHOR_NS, Some(id), at, None, None, 0);
+            .set(ANCHOR_NS, Some(id), at, None, None, 0, None);
     }
 
     /// The live byte position of the visual anchor paired with cursor `id`, or

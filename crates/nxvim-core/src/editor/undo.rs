@@ -68,7 +68,7 @@ impl UndoTree {
         snap.extmarks.clear(crate::extmark::CURSOR_NS, None);
         for &at in positions {
             snap.extmarks
-                .set(crate::extmark::CURSOR_NS, None, at, None, None, 0);
+                .set(crate::extmark::CURSOR_NS, None, at, None, None, 0, None);
         }
     }
 

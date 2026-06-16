@@ -15,8 +15,20 @@
 //! [`ExtmarkStore`](nxvim_core::ExtmarkStore) every frame: the set is small and
 //! always reflects the current marks, so there is no cache to stale.
 
+use crate::redraw::StyleTable;
 use crate::EditHost;
-use nxvim_core::BufferId;
+use nxvim_core::{unicode, BufferId, HlMode, VirtChunk, VirtTextPos};
+use rmpv::Value;
+
+/// Placement `pos` tags on the `virt_text` wire array (mirror the client's
+/// `VIRT_POS_*`). The shape `[pos, col, hl_mode, chunks]` is fixed across all
+/// positions, so adding one is a server-emit + client-render change, never a
+/// re-parse.
+const POS_EOL: u64 = 0;
+const POS_INLINE: u64 = 1;
+const POS_OVERLAY: u64 = 2;
+const POS_RIGHT_ALIGN: u64 = 3;
+const POS_WIN_COL: u64 = 4;
 
 /// One highlight interval over a single line, in **byte offsets within that
 /// line**. `priority`/`order` decide who wins where intervals overlap (higher
@@ -78,6 +90,145 @@ impl EditHost {
             .filter_map(|(i, m)| clip(m, base_order + i as u32))
             .collect();
         out
+    }
+}
+
+impl EditHost {
+    /// Build the per-row `virt_text` payload: for each visible row, the extmark
+    /// virtual-text placements anchored on that buffer line, as an array of
+    /// `[pos, col, hl_mode, [[text, style_id], …]]` (empty for rows with none).
+    /// `pos` is `0`=eol / `1`=inline / `2`=overlay / `3`=right_align / `4`=win_col;
+    /// `col` is the screen column the inline/overlay text anchors at (the fixed
+    /// window column for win_col; `0` for eol/right_align). `hl_mode` is
+    /// `0`=replace / `1`=combine / `2`=blend. Each chunk's `style_id` indexes the
+    /// per-frame `styles` palette when its `hl_group` resolves (`Nil` otherwise, so
+    /// the client paints in normal colors). Marks on a line are emitted in
+    /// `(start byte, priority, id)` order so stacked virtual text is stable.
+    ///
+    /// Read live from the buffer's [`ExtmarkStore`](nxvim_core::ExtmarkStore), like
+    /// the hl spans.
+    pub(crate) fn virt_text_for(
+        &self,
+        buffer: BufferId,
+        numbers: &[Option<usize>],
+        styles: &mut StyleTable,
+    ) -> Value {
+        let nil_rows = || Value::Array(numbers.iter().map(|_| Value::Nil).collect());
+        let Some(buf) = self.editor.buffer_of(buffer) else {
+            return nil_rows();
+        };
+        // Bucket virt_text marks by their anchor buffer line (0-based). Cheap: the
+        // mark set is small and scanned once per frame.
+        use std::collections::HashMap;
+        let mut by_line: HashMap<usize, Vec<&nxvim_core::Extmark>> = HashMap::new();
+        for m in buf.extmarks.iter_all() {
+            let Some(decor) = m.decor.as_deref() else {
+                continue;
+            };
+            if decor.virt_text.is_empty() {
+                continue;
+            }
+            by_line
+                .entry(buf.byte_to_line(m.start))
+                .or_default()
+                .push(m);
+        }
+        if by_line.is_empty() {
+            return Value::Array(numbers.iter().map(|_| Value::Array(Vec::new())).collect());
+        }
+        let tabstop = buf.options.effective_tabstop();
+        let rows = numbers
+            .iter()
+            .map(|num| {
+                let Some(n) = num else {
+                    return Value::Array(Vec::new());
+                };
+                let line_idx = n - 1;
+                let Some(marks) = by_line.get(&line_idx) else {
+                    return Value::Array(Vec::new());
+                };
+                let mut marks = marks.clone();
+                marks.sort_by_key(|m| (m.start, m.priority, m.id));
+                // Inline placements need the line text + its start byte to map the
+                // mark's byte anchor to a screen column (the same tab/wide-char
+                // `virtcol` the inlay hints and hl spans use). Computed once per row.
+                let line_start = buf.line_start(line_idx);
+                let text = buf.line(line_idx);
+                // Screen column of a mark's byte anchor within this line (the
+                // tab/wide-char `virtcol` the inlay hints + hl spans share); used by
+                // the inline and overlay positions.
+                let anchor_col = |m: &nxvim_core::Extmark| -> u64 {
+                    let byte_col = m.start.saturating_sub(line_start).min(text.len());
+                    unicode::virtcol(&text, byte_col, tabstop) as u64
+                };
+                let placements: Vec<Value> = marks
+                    .iter()
+                    .map(|m| {
+                        // Every mark in `marks` has `decor` (the bucket only kept
+                        // marks whose decor carries virt_text).
+                        let decor = m.decor.as_deref().expect("virt_text mark has decor");
+                        let (pos, col) = match decor.virt_text_pos {
+                            VirtTextPos::Eol => (POS_EOL, 0),
+                            VirtTextPos::Inline => (POS_INLINE, anchor_col(m)),
+                            VirtTextPos::Overlay => (POS_OVERLAY, anchor_col(m)),
+                            VirtTextPos::RightAlign => (POS_RIGHT_ALIGN, 0),
+                            // A fixed window column, independent of the mark anchor.
+                            VirtTextPos::WinCol(n) => (POS_WIN_COL, n as u64),
+                        };
+                        self.virt_placement_value(
+                            pos,
+                            col,
+                            hl_mode_code(decor.hl_mode),
+                            &decor.virt_text,
+                            styles,
+                        )
+                    })
+                    .collect();
+                Value::Array(placements)
+            })
+            .collect();
+        Value::Array(rows)
+    }
+
+    /// Encode one virtual-text placement as `[pos, col, hl_mode, chunks]`, resolving
+    /// each chunk's `hl_group` to a frame-palette style id (`Nil` when the group is
+    /// absent or unresolved — the client then paints in normal colors).
+    fn virt_placement_value(
+        &self,
+        pos: u64,
+        col: u64,
+        hl_mode: u64,
+        chunks: &[VirtChunk],
+        styles: &mut StyleTable,
+    ) -> Value {
+        let chunks: Vec<Value> = chunks
+            .iter()
+            .map(|c| {
+                let style_id = match c.hl_group.as_deref() {
+                    Some(group) => match self.editor.highlights.resolve(group) {
+                        Some(style) => Value::from(styles.intern(style) as u64),
+                        None => Value::Nil,
+                    },
+                    None => Value::Nil,
+                };
+                Value::Array(vec![Value::from(c.text.as_str()), style_id])
+            })
+            .collect();
+        Value::Array(vec![
+            Value::from(pos),
+            Value::from(col),
+            Value::from(hl_mode),
+            Value::Array(chunks),
+        ])
+    }
+}
+
+/// The wire code for a [`HlMode`]: `0`=replace, `1`=combine, `2`=blend.
+fn hl_mode_code(mode: HlMode) -> u64 {
+    match mode {
+        HlMode::Replace => 0,
+        HlMode::Combine => 1,
+        HlMode::Blend => 2,
     }
 }
 

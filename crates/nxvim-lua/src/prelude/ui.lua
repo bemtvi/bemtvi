@@ -16,6 +16,8 @@
 --                   hover surface). Fire-and-forget by default (no result); with
 --                   `persist = true` it returns a resource HANDLE (:update/:close/
 --                   :is_open), not an async result — so it stays non-promise.
+--   nx.ui.open    — hand a path/URL to the OS opener (open / explorer / xdg-open).
+--                   PROMISE-ONLY: nx.ui.open(uri) -> a promise of the run result.
 -- `nx` async is promise-only (ADR 0002 / docs/plans/2026-06-16-nx-promise-only-async.md):
 -- a one-shot async API returns a promise, never a callback. The callback shape lives
 -- on the `vim.ui.*` muscle-memory aliases (the bounded compat layer), which adapt the
@@ -280,4 +282,30 @@ function nx.ui.float(contents, opts)
   end
   -- Transient (id 0): dismissed by the next key, no handle.
   nx._ui_float(0, lines, opts.title, opts.border or "rounded", opts.relative or "cursor")
+end
+
+-- ----- nx.ui.open [alias vim.ui.open] ----------------------------------------
+-- nx.ui.open(uri) -> a PROMISE of the opener's exit result { code, stdout, stderr }
+-- (the nx.run shape). Hands `uri` — a file path or a URL — to the OS opener chosen
+-- by platform (nx._ui_opener: `open` on macOS, `explorer` on Windows, `xdg-open`
+-- elsewhere) and runs it off-tick. Like nx.run it RESOLVES rather than rejects: a
+-- missing opener surfaces as code = -1 and a non-zero opener exit as that code —
+-- the caller decides what to do with it. Promise-only (ADR 0002): no callback arg.
+function nx.ui.open(uri)
+  if type(uri) ~= "string" then
+    error("nx.ui.open: uri must be a string", 2)
+  end
+  -- nx._ui_opener() returns a fresh argv prefix each call; the uri is the target.
+  local argv = nx._ui_opener()
+  argv[#argv + 1] = uri
+  return nx.run({ cmd = argv })
+end
+
+-- vim.ui.open(path): neovim's opener alias (ADR 0002 whitelist). neovim returns a
+-- blocking handle (SystemObj) plus an error string; nxvim has no blocking handle,
+-- so this returns the async PROMISE instead — truthy on the optimistic path, the
+-- closest faithful mapping. Callers that ignore the return (the common
+-- `vim.ui.open(url)`) work unchanged.
+function vim.ui.open(path)
+  return nx.ui.open(path)
 end

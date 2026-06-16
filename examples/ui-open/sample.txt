@@ -1,0 +1,10 @@
+https://nxvim.dev/docs    <- put the cursor on this URL and press \O to open it
+
+nx.ui.open playground — try the maps from init.lua:
+
+  \o   open https://nxvim.dev in your browser (nx.ui.open + :next on the result)
+  \O   open the path/URL under the cursor (gx-style, via vim.fn.expand("<cWORD>"))
+  \v   open https://github.com through the vim.ui.open alias
+
+The opener is a separate process (open / explorer / xdg-open), so nothing opens
+inside the editor — watch your browser / file manager instead.

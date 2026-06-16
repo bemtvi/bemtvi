@@ -49,6 +49,7 @@ export const VERSIONS = {
   'tree-sitter-c-sharp': '0.23.5',
   '@tree-sitter-grammars/tree-sitter-zig': '1.1.2',
   '@tree-sitter-grammars/tree-sitter-lua': '0.4.1',
+  '@tree-sitter-grammars/tree-sitter-toml': '0.7.0',
 };
 
 // Per language:
@@ -122,6 +123,12 @@ export const REGISTRY = {
     wasm: 'tree-sitter-zig.wasm',
     extensions: ['zig'],
     sample: 'const std = @import("std");\npub fn main() !void {\n    var x: u32 = 42;\n    const s = "hi";\n    if (x > 0) { std.debug.print("{}", .{x}); }\n}\ntest "t" {}',
+  },
+  toml: {
+    pkg: '@tree-sitter-grammars/tree-sitter-toml',
+    wasm: 'tree-sitter-toml.wasm',
+    extensions: ['toml'],
+    sample: '# config\ntitle = "nxvim"\n[package]\nname = "demo"\nversion = "0.1.0"\nedition = 2024\nratio = 1.5\nenabled = true\nports = [8080, 8081]\n[deps]\nserde = { version = "1.0", features = ["derive"] }\n[[bin]]\nname = "main"\npublished = 2026-06-15',
   },
   ruby: {
     pkg: 'tree-sitter-ruby',

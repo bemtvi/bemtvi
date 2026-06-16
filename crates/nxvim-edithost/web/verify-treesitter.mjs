@@ -196,6 +196,23 @@ try {
   check("repair: indents.scm was actually re-fetched (not a silent no-op)",
     cdnFetches.some((p) => /indents\.scm$/.test(p)), JSON.stringify(cdnFetches));
 
+  // ---- 6. Another registry language installs + highlights (toml) ----
+  // Guards toml's REGISTRY entry (package / version / wasm subpath) end to end: a typo
+  // there fails silently at runtime, not at build. toml ships no indents.scm (the GH
+  // mirror is blocked in this test), so this asserts highlighting only.
+  cdnFetches = [];
+  await page.evaluate(() => window.__nxvim.feed(":e demo.toml<CR>"));
+  await page.evaluate(() => window.__nxvim.feed('ggdGititle = "nxvim"<CR>[package]<CR>version = "0.1.0"<Esc>'));
+  const tomlBefore = await page.evaluate(() =>
+    [...document.querySelectorAll("#grid .win .row span[style]")].filter((s) => /color\s*:/.test(s.getAttribute("style"))).length);
+  check("uninstalled: toml renders plain before :TSInstall", tomlBefore === 0, String(tomlBefore));
+
+  await page.evaluate(() => window.__nxvim.feed(":TSInstall toml<CR>"));
+  const toml = await waitColored(page);
+  check("install: toml highlights after :TSInstall (CDN → register)", toml.ok, toml.detail);
+  check("install: fetched toml grammar from the CDN",
+    cdnFetches.some((p) => p.endsWith("tree-sitter-toml.wasm")), JSON.stringify(cdnFetches));
+
   await browser.close();
 } finally {
   cleanup();

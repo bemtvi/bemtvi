@@ -23,6 +23,7 @@
     "tree-sitter-java": "0.23.5",
     "tree-sitter-c-sharp": "0.23.5",
     "@tree-sitter-grammars/tree-sitter-zig": "1.1.2",
-    "@tree-sitter-grammars/tree-sitter-lua": "0.4.1"
+    "@tree-sitter-grammars/tree-sitter-lua": "0.4.1",
+    "@tree-sitter-grammars/tree-sitter-toml": "0.7.0"
   }
 }

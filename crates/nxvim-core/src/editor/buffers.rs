@@ -516,6 +516,11 @@ impl Editor {
                 ob.buffer.image = true;
                 ob.buffer.set_path(Some(path));
                 ob.buffer.modified = false;
+                // Bump the preview version so the client re-fetches/re-decodes: off-tick
+                // can't stat, so a reopen (`:e`) or a watch-driven reload — both routed
+                // here — wouldn't otherwise change the marker, and the client would keep
+                // showing the cached picture after the file changed on disk.
+                ob.buffer.image_gen = ob.buffer.image_gen.wrapping_add(1);
             }
             return;
         }

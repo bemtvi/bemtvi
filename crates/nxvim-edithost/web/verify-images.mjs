@@ -199,6 +199,47 @@ try {
     `viaConfig=${JSON.stringify(viaConfig)}`,
   );
 
+  // ── 6. Refresh on disk: the file changes, a re-`:e` re-fetches the new picture ────────
+  // Off-tick previews carry no disk stat, so the marker version is a reopen/reload
+  // generation; `:e` bumps it, and the client (which fetches bytes itself) re-fetches.
+  // Seed a 4×4 image, open it, then replace the OPFS file with a 16×16 one and re-`:e`
+  // — the rendered <img> must pick up the new dimensions (proving a real re-decode, not
+  // a stale cache).
+  const seedPng = (size) =>
+    page.evaluate(async (size) => {
+      const c = document.createElement("canvas");
+      c.width = size;
+      c.height = size;
+      c.getContext("2d").fillRect(0, 0, size, size);
+      const blob = await new Promise((res) => c.toBlob(res, "image/png"));
+      const bytes = new Uint8Array(await blob.arrayBuffer());
+      const root = await navigator.storage.getDirectory();
+      const fh = await root.getFileHandle("refresh.png", { create: true });
+      const w = await fh.createWritable();
+      await w.write(bytes);
+      await w.close();
+    }, size);
+
+  await seedPng(4);
+  await page.evaluate(() => window.__nxvim.feed(":e /refresh.png<CR>"));
+  const first = await until(
+    page,
+    () => { const img = document.querySelector("#grid img"); return img && img.complete ? img.naturalWidth : 0; },
+    (w) => w === 4,
+  );
+  await seedPng(16); // the file changed on disk
+  await page.evaluate(() => window.__nxvim.feed(":e /refresh.png<CR>")); // re-edit → version bumps → re-fetch
+  const second = await until(
+    page,
+    () => { const img = document.querySelector("#grid img"); return img && img.complete ? img.naturalWidth : 0; },
+    (w) => w === 16,
+  );
+  check(
+    "refresh on disk: a re-:e after the file changed re-fetches and re-decodes the new image",
+    first === 4 && second === 16,
+    `first=${first} (want 4), second=${second} (want 16)`,
+  );
+
   await browser.close();
 } finally {
   cleanup();

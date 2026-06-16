@@ -187,6 +187,15 @@ pub struct Buffer {
     /// stays the empty `"\n"`, so the buffer reads as empty/inert. `false` for every
     /// ordinary file / scratch / directory / terminal buffer.
     pub image: bool,
+    /// A monotonic version for an **off-tick image preview** ([`Buffer::image`] with
+    /// no [`disk`](Buffer::disk) stat — the daemon/WASM open path, which can't stat
+    /// synchronously). Bumped each time the buffer is (re)marked an image preview
+    /// (`enqueue_open`), it's projected as the [`crate::view::ImageView`]'s version so
+    /// the client re-fetches/re-decodes on a reopen (`:e`) or a watch-driven reload —
+    /// the off-tick analogue of the native path's "re-decode when (size, mtime)
+    /// moved". `0` and unused for an ordinary buffer or a *local* image preview (which
+    /// carries a real disk stat instead).
+    pub image_gen: u64,
     /// The file as last seen on disk (mtime + size), captured on read and
     /// refreshed on each successful [`Buffer::write`]. Drives
     /// [`Buffer::disk_changed`], which lets the editor refuse to overwrite a file
@@ -225,6 +234,7 @@ impl Buffer {
             terminal: false,
             terminal_title: None,
             image: false,
+            image_gen: 0,
             disk: None,
         }
     }
@@ -314,6 +324,7 @@ impl Buffer {
             terminal: false,
             terminal_title: None,
             image: false,
+            image_gen: 0,
         })
     }
 
@@ -398,6 +409,7 @@ impl Buffer {
             extmarks: crate::extmark::ExtmarkStore::default(),
             marks: HashMap::new(),
             image: false,
+            image_gen: 0,
             // A directory listing is never written back to disk, so it needs no
             // change tracking.
             disk: None,

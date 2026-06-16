@@ -757,18 +757,31 @@ fn window_view(ed: &Editor, w: &WindowLayout) -> WindowView {
     // An image-preview buffer carries no text to paint; hand the client the path
     // so it renders the picture over this window's body instead of `lines`.
     let image = buf.image.then(|| {
-        let disk = buf.disk_stat();
-        ImageView {
-            path: buf
-                .path
-                .as_ref()
-                .map(|p| p.to_string_lossy().into_owned())
-                .unwrap_or_default(),
-            size: disk.map_or(0, |d| d.size),
-            mtime_ms: disk
-                .and_then(|d| d.mtime)
-                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                .map_or(0, |d| d.as_millis() as u64),
+        let path = buf
+            .path
+            .as_ref()
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        match buf.disk_stat() {
+            // Local preview: a real on-disk version, so the client re-decodes when the
+            // file's (size, mtime) moves (the watch/reload re-stats it).
+            Some(disk) => ImageView {
+                path,
+                size: disk.size,
+                mtime_ms: disk
+                    .mtime
+                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                    .map_or(0, |d| d.as_millis() as u64),
+            },
+            // Off-tick preview (daemon / WASM): no synchronous stat, so use the
+            // reopen/reload generation as the version — it bumps on `:e` and on a
+            // watch-driven reload, so the client (which fetches the bytes out of band)
+            // re-fetches/re-decodes then, and not on every redraw in between.
+            None => ImageView {
+                path,
+                size: 0,
+                mtime_ms: buf.image_gen,
+            },
         }
     });
 

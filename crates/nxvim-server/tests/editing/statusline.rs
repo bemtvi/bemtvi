@@ -436,6 +436,253 @@ async fn nx_statusline_unknown_segment_errors_loudly() {
     assert!(s.contains("nonesuch"), "names the segment: {s:?}");
 }
 
+/// Every window's status line as a string, in layout order — for asserting that
+/// a `nx.statusline` custom segment renders a distinct cell per window.
+fn all_window_status_texts(map: &[(Value, Value)]) -> Vec<String> {
+    field(map, "windows")
+        .and_then(Value::as_array)
+        .expect("a windows array")
+        .iter()
+        .map(|w| {
+            let Value::Map(wm) = w else {
+                panic!("window is not a map")
+            };
+            wm.iter()
+                .find(|(k, _)| k.as_str() == Some("status"))
+                .and_then(|(_, v)| v.as_array())
+                .map(|segs| {
+                    segs.iter()
+                        .filter_map(|seg| {
+                            let Value::Map(m) = seg else { return None };
+                            m.iter()
+                                .find(|(k, _)| k.as_str() == Some("text"))
+                                .and_then(|(_, v)| v.as_str())
+                                .map(str::to_string)
+                        })
+                        .collect::<String>()
+                })
+                .unwrap_or_default()
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn nx_statusline_custom_segment_caches_per_window() {
+    let (rpc, mut incoming) = start(None).await;
+    // A custom segment whose cell encodes the window's id and whether it is the
+    // focused window — proving each window renders against its own `ctx`.
+    exec_lua(
+        &rpc,
+        r#"
+        nx.statusline.segment{
+          name = 'wi',
+          render = function(ctx) return { { text = 'w' .. ctx.win .. (ctx.focused and '*' or '-') } } end,
+        }
+        nx.statusline.setup{ left = { 'wi' }, right = {} }
+        "#,
+    )
+    .await;
+    // Sole window: focused.
+    let map = redraw_after(&rpc, &mut incoming, "<Esc>").await;
+    let st = all_window_status_texts(&map);
+    assert_eq!(st.len(), 1, "one window: {st:?}");
+    assert!(st[0].contains('*'), "the sole window is focused: {st:?}");
+
+    // Split into two windows: distinct per-window cells, exactly one focused.
+    let map = redraw_after(&rpc, &mut incoming, ":split<CR>").await;
+    let st = all_window_status_texts(&map);
+    assert_eq!(st.len(), 2, "two windows after :split: {st:?}");
+    assert_ne!(st[0], st[1], "per-window cells differ by window id: {st:?}");
+    assert_eq!(
+        st.iter().filter(|s| s.contains('*')).count(),
+        1,
+        "exactly one window is focused: {st:?}"
+    );
+    assert_eq!(
+        st.iter().filter(|s| s.contains('-')).count(),
+        1,
+        "the other window is unfocused: {st:?}"
+    );
+}
+
+#[tokio::test]
+async fn nx_statusline_custom_segment_follows_focus_change() {
+    let (rpc, mut incoming) = start(None).await;
+    // The `focused` flag must track focus moving between windows — re-rendered by
+    // the server on the focus change, with no declared `WinEnter` event needed.
+    exec_lua(
+        &rpc,
+        r#"
+        nx.statusline.segment{
+          name = 'wi',
+          render = function(ctx) return { { text = 'w' .. ctx.win .. (ctx.focused and '*' or '-') } } end,
+        }
+        nx.statusline.setup{ left = { 'wi' }, right = {} }
+        "#,
+    )
+    .await;
+    let before = all_window_status_texts(&redraw_after(&rpc, &mut incoming, ":split<CR>").await);
+    assert_eq!(before.len(), 2, "two windows: {before:?}");
+
+    // Move focus to the other window: the `*`/`-` markers swap windows.
+    let after = all_window_status_texts(&redraw_after(&rpc, &mut incoming, "<C-w>w").await);
+    assert_eq!(after.len(), 2, "still two windows: {after:?}");
+    assert_eq!(
+        after.iter().filter(|s| s.contains('*')).count(),
+        1,
+        "still exactly one focused window: {after:?}"
+    );
+    assert_ne!(
+        before, after,
+        "the focused marker followed the focus change: {before:?} -> {after:?}"
+    );
+}
+
+#[tokio::test]
+async fn nx_statusline_custom_segment_tracks_per_window_buffer() {
+    // A segment reading its window's buffer (`ctx.buf`) shows a different value in
+    // each window when they hold different buffers — re-rendered server-side when a
+    // window swaps its buffer, with no declared event on the segment.
+    let dir = temp_dir("nx_stl_perwin_buf");
+    let a = dir.join("a.txt");
+    let b = dir.join("b.txt");
+    std::fs::write(&a, "a\n").expect("write a");
+    std::fs::write(&b, "b\n").expect("write b");
+    let (rpc, mut incoming) = start(Some(a.to_str().unwrap().to_string())).await;
+    exec_lua(
+        &rpc,
+        r#"
+        nx.statusline.segment{
+          name = 'buftail',
+          render = function(ctx)
+            local name = nx.buf.name(ctx.buf)
+            return { { text = name:match('[^/]+$') or '?' } }
+          end,
+        }
+        nx.statusline.setup{ left = { 'buftail' }, right = {} }
+        "#,
+    )
+    .await;
+    // Split, then edit b.txt in the focused window: the two windows now show
+    // different buffers, so the segment differs between them.
+    feed(&rpc, ":split<CR>");
+    let map = redraw_after(&rpc, &mut incoming, &format!(":edit {}<CR>", b.display())).await;
+    let st = all_window_status_texts(&map);
+    assert_eq!(st.len(), 2, "two windows: {st:?}");
+    assert!(
+        st.iter().any(|s| s.contains("a.txt")),
+        "one window still shows a.txt: {st:?}"
+    );
+    assert!(
+        st.iter().any(|s| s.contains("b.txt")),
+        "the other window shows b.txt: {st:?}"
+    );
+}
+
+#[tokio::test]
+async fn nx_statusline_window_local_layout_overrides_global() {
+    let (rpc, mut incoming) = start(None).await;
+    // A global layout shows the filename in every window…
+    exec_lua(
+        &rpc,
+        r#"nx.statusline.setup{ left = { 'filename' }, right = {} }"#,
+    )
+    .await;
+    let both = all_window_status_texts(&redraw_after(&rpc, &mut incoming, ":split<CR>").await);
+    assert_eq!(both.len(), 2, "two windows: {both:?}");
+    assert!(
+        both.iter().all(|s| s.contains("[No Name]")),
+        "both windows inherit the global filename layout: {both:?}"
+    );
+
+    // …but a window-local layout (win = 0, the focused window) overrides it for
+    // that one window — it shows the mode while the other still shows the filename.
+    exec_lua(
+        &rpc,
+        r#"nx.statusline.setup{ win = 0, left = { 'mode' }, right = {} }"#,
+    )
+    .await;
+    let st = all_window_status_texts(&redraw_after(&rpc, &mut incoming, "<Esc>").await);
+    assert_eq!(
+        st.iter().filter(|s| s.contains("NORMAL")).count(),
+        1,
+        "exactly one window uses the local mode layout: {st:?}"
+    );
+    assert_eq!(
+        st.iter().filter(|s| s.contains("[No Name]")).count(),
+        1,
+        "the other window still inherits the global layout: {st:?}"
+    );
+}
+
+#[tokio::test]
+async fn nx_statusline_window_can_opt_back_to_format() {
+    let (rpc, mut incoming) = start(None).await;
+    // The per-region mix: a global segment layout is active, but one window opts
+    // back to the `'statusline'` %-format.
+    feed(&rpc, ":set statusline=ZZZ<CR>");
+    exec_lua(
+        &rpc,
+        r#"nx.statusline.setup{ left = { 'filename' }, right = {} }"#,
+    )
+    .await;
+    feed(&rpc, ":split<CR>");
+    exec_lua(&rpc, r#"nx.statusline.setup{ win = 0, format = true }"#).await;
+    let st = all_window_status_texts(&redraw_after(&rpc, &mut incoming, "<Esc>").await);
+    assert_eq!(st.len(), 2, "two windows: {st:?}");
+    assert!(
+        st.iter().any(|s| s.trim() == "ZZZ"),
+        "the opted-out window shows the %-format: {st:?}"
+    );
+    assert!(
+        st.iter().any(|s| s.contains("[No Name]")),
+        "the other window still shows the segment layout: {st:?}"
+    );
+
+    // reset(0) drops the override so the window re-inherits the global layout.
+    exec_lua(&rpc, r#"nx.statusline.reset(0)"#).await;
+    let st = all_window_status_texts(&redraw_after(&rpc, &mut incoming, "<Esc>").await);
+    assert!(
+        st.iter().all(|s| s.contains("[No Name]")),
+        "reset re-inherits the global layout in both windows: {st:?}"
+    );
+    assert!(
+        !st.iter().any(|s| s.trim() == "ZZZ"),
+        "the %-format override is gone: {st:?}"
+    );
+}
+
+#[tokio::test]
+async fn nx_statusline_layout_does_not_leak_into_custom_tabline() {
+    let (rpc, mut incoming) = start(None).await;
+    // A segment layout drives the status line, but a custom `'tabline'` must still
+    // render through the %-format engine — the layout is a status-line surface only.
+    exec_lua(
+        &rpc,
+        r#"nx.statusline.setup{ left = { 'filename' }, right = {} }"#,
+    )
+    .await;
+    feed(&rpc, ":set showtabline=2<CR>");
+    let map = redraw_after(&rpc, &mut incoming, ":set tabline=TABXYZ<CR>").await;
+    let tabline: String = field(&map, "tabline_segments")
+        .and_then(Value::as_array)
+        .expect("tabline_segments array")
+        .iter()
+        .filter_map(|seg| {
+            let Value::Map(m) = seg else { return None };
+            m.iter()
+                .find(|(k, _)| k.as_str() == Some("text"))
+                .and_then(|(_, v)| v.as_str())
+                .map(str::to_string)
+        })
+        .collect();
+    assert_eq!(
+        tabline.trim(),
+        "TABXYZ",
+        "the custom tabline renders the %-format, not the segment layout: {tabline:?}"
+    );
+}
+
 // ----- laststatus (per-window status visibility + global status, Phase 6) -----
 //
 // `'laststatus'` decides where status lines go: `0` never, `1` only with ≥2

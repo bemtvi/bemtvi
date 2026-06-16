@@ -38,7 +38,8 @@ pub use ops::{
     BufOp, CallbackArgs, ConfirmReq, DecorMark, DecorPublish, DiagnosticData, DockOp, ExtmarkOp,
     FeedKeysOp, GlobalOptionOp, HlSet, InlayHintMirrorData, LoopOp, LspClientData, LspOp,
     LspServerCapabilities, OptionValue, PanelOp, QfItem, QfSetOp, RawKeymap, RawRhs, RegisterSetOp,
-    SemanticTokenData, TabOp, TerminalOpenReq, TsOp, UiInputReq, WindowOp,
+    SemanticTokenData, StatuslineKind, StatuslineTarget, TabOp, TerminalOpenReq, TsOp, UiInputReq,
+    WindowOp,
 };
 pub use runtime::{
     BoMirror, BufBytesEdit, BufMirror, ExtmarkMirror, FloatMirror, GoMirror, HlDefMirror,

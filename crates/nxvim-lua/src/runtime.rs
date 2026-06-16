@@ -478,8 +478,15 @@ pub(crate) struct Shared {
     /// active `SegmentLayout` (which takes precedence over `'statusline'`).
     pub(crate) statusline_setups: Vec<StatuslineSetupReq>,
     /// Published custom-segment cells (`nx._statusline_publish`), drained by the
-    /// server into its per-name statusline-segment cell cache.
+    /// server into its per-`(win, name)` statusline-segment cell cache.
     pub(crate) statusline_publishes: Vec<StatuslinePublishReq>,
+    /// Custom-segment names marked dirty by `nx.statusline.invalidate(name)` (and
+    /// the autocmd callbacks a declared `events` list installs). The server folds
+    /// these into its pending-re-render set and re-renders them — per window, with
+    /// a fresh window mirror — after the current input settles (`run_pending`), so
+    /// a segment invalidated from an autocmd that fired with a stale mirror still
+    /// renders against the post-transition window/focus state.
+    pub(crate) statusline_invalidates: Vec<String>,
     /// `nx.snippet.setup{}` jump-key configurations, drained by the server into
     /// `Editor::set_snippet_keys`.
     pub(crate) snippet_setups: Vec<SnippetSetupReq>,
@@ -985,8 +992,14 @@ impl LuaRuntime {
 
     take_queue! {
         /// Take the custom statusline-segment cell publishes queued since the last
-        /// drain, for the server to fold into its per-name segment cache.
+        /// drain, for the server to fold into its per-`(win, name)` segment cache.
         take_statusline_publishes -> Vec<StatuslinePublishReq> = statusline_publishes
+    }
+
+    take_queue! {
+        /// Take the custom-segment names invalidated since the last drain, for the
+        /// server to re-render (per window) after the current input settles.
+        take_statusline_invalidates -> Vec<String> = statusline_invalidates
     }
 
     take_queue! {
@@ -1082,6 +1095,20 @@ impl LuaRuntime {
         let nx = self.nx()?;
         let run: mlua::Function = nx.get("_picker_run")?;
         run.call::<()>((lua_int(gen as i64), query.to_string()))
+    }
+
+    /// Re-render the custom statusline segment `name` for **every** window
+    /// (`nx.statusline._rerender`). The Lua wrapper iterates the window mirror,
+    /// runs the segment's `render(ctx)` against each window's `{ buf, win, focused }`
+    /// context, and publishes the resolved cells per window via
+    /// `nx._statusline_publish`. Driven by the server from `run_pending` (with a
+    /// freshly pushed window mirror) when the segment is invalidated or the window
+    /// layout changed; the resulting publishes land in `statusline_publishes`.
+    pub fn run_statusline_rerender(&self, name: &str) -> mlua::Result<()> {
+        let nx = self.nx()?;
+        let statusline: Table = nx.get("statusline")?;
+        let rerender: mlua::Function = statusline.get("_rerender")?;
+        rerender.call::<()>(name.to_string())
     }
 
     /// Run the configured `nx.complete` **async** sources for generation `gen`

@@ -114,20 +114,28 @@ are no longer listed here — only the edges that still diverge are.
   callback has no coroutine to yield from. See `examples/sync-prompts/`.
 - **`nx.statusline` segment registry — v1 deferrals.** The lualine-shaped surface
   is built (`nx.statusline.setup`/`segment`/`invalidate`; built-ins composed in
-  `nxvim_core::statusline::compose_segments`, custom segments published from Lua
+  `nxvim_core::statusline::compose_segments`, custom segments rendered per window
   and cached server-side; see
-  `docs/plans/2026-06-15-nx-statusline-segments.md`). What it does **not** do yet:
-  (1) **no per-window active/inactive differentiation** — built-ins render
-  per-window, but custom segments share one cache keyed by segment name (the
-  focused-window value); `ctx.focused` is passed but always `true`. (2) The custom
-  segment `ctx` carries `{ buf, win, focused }` but **no `width`** (the server
-  doesn't mirror the per-window statusline width to Lua). (3) **Layout is global**,
-  not `setlocal`-per-window, and there is no per-region mix of the segment layout
-  with the `'statusline'` format (the layout wins wholesale while set). (4) No
-  mouse-click segment regions (shared with the deferred tabline `%@…@` work).
-  (5) `git` / `lsp_progress` are *plugin* segments (custom-segment examples), not
-  built-ins. The built-in set is `mode` / `filename` / `filepath` / `filetype` /
-  `encoding` / `location` / `modified` / `readonly` / `diagnostics`.
+  `docs/plans/2026-06-15-nx-statusline-segments.md`). Custom segments **are now
+  per-window**: each is rendered once per window against that window's
+  `{ buf, win, focused }`, cached by `(window, name)`, and re-rendered when the
+  segment is invalidated or the window layout changes (split/close, focus move, or
+  a window swapping its buffer) — so `ctx.focused` and `ctx.buf` are correct in
+  every window. The server orchestrates the re-render from `run_pending` with a
+  fresh window mirror (`EditHost::refresh_statusline_segments`), so an invalidate
+  fired from an autocmd that ran before the transition still renders against the
+  settled layout. Layouts are also **per-window / `setlocal`-able**:
+  `nx.statusline.setup{win=…}` sets a window-local layout that overrides the
+  global one, `setup{win=…, format=true}` opts a window back to the `'statusline'`
+  `%`-format even under a global segment layout (the per-region mix), and
+  `nx.statusline.reset(win)` drops the override (`EditHost::resolve_window_layout`).
+  What it does **not** do yet: (1) The custom segment `ctx` carries
+  `{ buf, win, focused }` but **no `width`** (the server doesn't mirror the
+  per-window statusline width to Lua). (2) No mouse-click segment regions (shared
+  with the deferred tabline `%@…@` work). (3) `git` / `lsp_progress` are *plugin*
+  segments (custom-segment examples), not built-ins. The built-in set is `mode` /
+  `filename` / `filepath` / `filetype` / `encoding` / `location` / `modified` /
+  `readonly` / `diagnostics`.
 
 ## Cross-cutting root causes
 

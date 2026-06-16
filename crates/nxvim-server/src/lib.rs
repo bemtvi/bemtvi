@@ -374,6 +374,17 @@ struct WasmTimer {
     repeat_ms: u64,
 }
 
+/// A window-local status line override (`nx.statusline.setup{win=…}`), stored in
+/// [`EditHost::statusline_window`]. Absence from that map means the window
+/// inherits the global layout.
+enum WindowStatusline {
+    /// The window shows its own segment layout, overriding the global one.
+    Segments(nxvim_core::statusline::SegmentLayout),
+    /// The window uses the `'statusline'` `%`-format even while a global segment
+    /// layout is active (the per-region mix).
+    Format,
+}
+
 pub struct EditHost {
     editor: Editor,
     lua: LuaRuntime,
@@ -506,14 +517,40 @@ pub struct EditHost {
     /// body to expand.
     snippet_complete: Vec<snippet::SnippetEntry>,
 
-    /// The active `nx.statusline.setup{}` layout (ordered segment names per side).
-    /// `Some` takes precedence over the `'statusline'` `%`-format for every window;
-    /// `None` ⇒ the format path. Set by draining `statusline_setups`.
+    /// The active **global** `nx.statusline.setup{}` layout (ordered segment names
+    /// per side). `Some` takes precedence over the `'statusline'` `%`-format for
+    /// every window without a [window-local override](EditHost::statusline_window);
+    /// `None` ⇒ those windows use the format path. Set by draining `statusline_setups`.
     statusline_layout: Option<nxvim_core::statusline::SegmentLayout>,
-    /// Per-name cache of custom statusline-segment cells published from Lua
-    /// (`nx._statusline_publish`). Read during redraw and updated only when a
-    /// segment is invalidated — never per frame (ADR 0002 rule 4).
-    statusline_cache: std::collections::HashMap<String, Vec<nxvim_core::statusline::StatusSegment>>,
+    /// Window-local status line overrides (`nx.statusline.setup{win=…}` /
+    /// `reset(win)`) — the `setlocal 'statusline'` analogue. A window present here
+    /// overrides the global layout: [`Segments`](WindowStatusline::Segments) shows
+    /// its own layout, [`Format`](WindowStatusline::Format) opts back to the
+    /// `%`-format (the per-region mix). Absence ⇒ inherit the global layout. Pruned
+    /// when a window closes.
+    statusline_window: HashMap<WindowId, WindowStatusline>,
+    /// Per-`(window, name)` cache of custom statusline-segment cells published from
+    /// Lua (`nx._statusline_publish`). Each custom segment is rendered once per
+    /// window (its `render(ctx)` sees that window's buffer / focus), so the redraw
+    /// path looks a segment up by the window it is painting. Updated only when a
+    /// segment is invalidated or the window layout changes — never per frame
+    /// (ADR 0002 rule 4); see [`EditHost::refresh_statusline_segments`].
+    statusline_cache:
+        std::collections::HashMap<(u64, String), Vec<nxvim_core::statusline::StatusSegment>>,
+    /// The custom (non-built-in) segment names the active layout references, so the
+    /// server knows which segments to (re)render. Derived when a `setup{}` layout
+    /// is drained.
+    statusline_custom: Vec<String>,
+    /// Custom segment names awaiting a re-render (invalidated, or freshly set up).
+    /// Drained per window in [`EditHost::refresh_statusline_segments`] once the
+    /// input settles, with a fresh window mirror.
+    statusline_pending: std::collections::HashSet<String>,
+    /// The window layout the cache was last rendered against —
+    /// `(window id, buffer id)` per window plus the focused window. A change here
+    /// (a split/close, a focus move, or a window's buffer swapping) re-renders
+    /// every custom segment so per-window `focused` / `buf` contexts stay correct,
+    /// and prunes cache entries for windows that closed.
+    statusline_layout_key: Option<(Vec<(u64, u64)>, u64)>,
 
     /// The buffer that was current the last time lifecycle events were emitted;
     /// `None` until the startup seed. A change here means a `BufEnter` (fired on
@@ -768,7 +805,11 @@ impl EditHost {
             complete_snippets_priority: 0,
             snippet_complete: Vec::new(),
             statusline_layout: None,
+            statusline_window: HashMap::new(),
             statusline_cache: std::collections::HashMap::new(),
+            statusline_custom: Vec::new(),
+            statusline_pending: std::collections::HashSet::new(),
+            statusline_layout_key: None,
             last_buffer_id: None,
             announced: HashSet::new(),
             known_buffers: Vec::new(),

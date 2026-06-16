@@ -145,12 +145,24 @@ Mirror the `nx.complete` shape:
 
 ## Out of scope (v1)
 
-- **Per-window active/inactive differentiation.** Built-ins render per-window
-  natively; custom segments share one cache (the focused-window value). The
-  `ctx.focused` field is passed but the cache is keyed by segment name only.
+- ~~**Per-window active/inactive differentiation.**~~ **Done** (follow-up, 2026-06-16):
+  custom segments are rendered once per window against that window's
+  `{ buf, win, focused }` and cached by `(window, name)`. The server re-renders
+  from `run_pending` (fresh window mirror) when a segment is invalidated or the
+  window layout changes — split/close, focus move, or a window swapping its buffer
+  — and prunes the cache for closed windows. So `ctx.focused`/`ctx.buf` are now
+  correct in every window. (`EditHost::refresh_statusline_segments`;
+  `nx.statusline._rerender` iterates `nx.win.list()`.)
 - A `width` field in the custom-segment `ctx` (segments rarely need it; the
   server doesn't yet mirror the per-window statusline width to Lua).
-- `'statusline'`-format fallback *per region* / a setup option to mix the two.
+- ~~`'statusline'`-format fallback *per region* / a setup option to mix the two.~~
+  **Done** (follow-up, 2026-06-16): `nx.statusline.setup{win=…}` is a window-local
+  layout overriding the global one; `setup{win=…, format=true}` opts a window back
+  to the `%`-format under a global layout (the mix); `nx.statusline.reset(win)`
+  drops the override. Server resolves per window in `EditHost::resolve_window_layout`
+  (window override → global → `%`-format); window-local overrides are pruned when a
+  window closes. The custom `'tabline'` is now also kept on the `%`-format path
+  (never a segment layout).
 - Mouse-click segment regions (shared with the deferred tabline `%@…@` work).
 - A built-in `git` / `lsp_progress` segment — these are *plugin* segments by
   design (the spec ships them as custom-segment examples), not built-ins.

@@ -22,8 +22,8 @@ use crate::ops::{
     BufOp, CompletePush, CompleteSetupReq, ConfirmReq, DecorMark, DecorPublish, DockOp, ExtmarkOp,
     FeedKeysOp, GlobalOptionOp, HlSet, LoopOp, LspOp, OptionValue, PanelOp, PickerOpenReq,
     PickerPush, PreviewPush, QfItem, QfSetOp, RegisterSetOp, SnippetAddReq, SnippetSetupReq,
-    StatuslinePublishReq, StatuslineSetupReq, TabOp, TerminalOpenReq, TsOp, UiFloatReq, UiInputReq,
-    UiSelectReq, WindowOp,
+    StatuslineKind, StatuslinePublishReq, StatuslineSetupReq, StatuslineTarget, TabOp,
+    TerminalOpenReq, TsOp, UiFloatReq, UiInputReq, UiSelectReq, WindowOp,
 };
 use crate::runtime::{resolve_lua_fs, Shared};
 use crate::vimregex;
@@ -1464,28 +1464,42 @@ pub(crate) fn install_runtime_api(
         })?,
     )?;
 
-    // `nx._statusline_setup(left, right)`: queue a `nx.statusline.setup{}` layout
-    // ([`StatuslineSetupReq`]) — the ordered segment names for each half. The Lua
-    // wrapper validated every name against the built-ins / registered segments.
+    // `nx._statusline_setup(win, kind, left, right)`: queue a `nx.statusline.setup{}`
+    // / `reset()` request ([`StatuslineSetupReq`]). `win` is `nil` for the global
+    // layout or a window id for a window-local override; `kind` is `"segments"`
+    // (with the validated `left` / `right` name lists), `"format"` (use the
+    // `%`-format), or `"inherit"` (drop the override). The Lua wrapper validated
+    // every segment name against the built-ins / registered segments.
     let sh = shared.clone();
     nx.set(
         "_statusline_setup",
-        lua.create_function(move |_, (left, right): (Vec<String>, Vec<String>)| {
-            sh.borrow_mut()
-                .statusline_setups
-                .push(StatuslineSetupReq { left, right });
-            Ok(())
-        })?,
+        lua.create_function(
+            move |_, (win, kind, left, right): (Option<u64>, String, Vec<String>, Vec<String>)| {
+                let target = match win {
+                    Some(w) => StatuslineTarget::Window(w),
+                    None => StatuslineTarget::Global,
+                };
+                let kind = match kind.as_str() {
+                    "format" => StatuslineKind::Format,
+                    "inherit" => StatuslineKind::Inherit,
+                    _ => StatuslineKind::Segments { left, right },
+                };
+                sh.borrow_mut()
+                    .statusline_setups
+                    .push(StatuslineSetupReq { target, kind });
+                Ok(())
+            },
+        )?,
     )?;
-    // `nx._statusline_publish(name, texts, groups)`: queue a custom segment's
-    // resolved cells ([`StatuslinePublishReq`]) — parallel `texts` / `groups`
-    // arrays (an empty group ⇒ the base `StatusLine` highlight). The server caches
-    // them by `name` and paints them until the next invalidation.
+    // `nx._statusline_publish(win, name, texts, groups)`: queue a custom segment's
+    // resolved cells for one window ([`StatuslinePublishReq`]) — parallel `texts` /
+    // `groups` arrays (an empty group ⇒ the base `StatusLine` highlight). The server
+    // caches them by `(win, name)` and paints them until the next re-render.
     let sh = shared.clone();
     nx.set(
         "_statusline_publish",
         lua.create_function(
-            move |_, (name, texts, groups): (String, Vec<String>, Vec<String>)| {
+            move |_, (win, name, texts, groups): (u64, String, Vec<String>, Vec<String>)| {
                 let cells = texts
                     .into_iter()
                     .enumerate()
@@ -1496,10 +1510,22 @@ pub(crate) fn install_runtime_api(
                     .collect();
                 sh.borrow_mut()
                     .statusline_publishes
-                    .push(StatuslinePublishReq { name, cells });
+                    .push(StatuslinePublishReq { win, name, cells });
                 Ok(())
             },
         )?,
+    )?;
+    // `nx._statusline_invalidate(name)`: mark a custom segment dirty. The server
+    // re-renders it (per window) after the current input settles, with a fresh
+    // window mirror — so an invalidate fired from an autocmd that ran before the
+    // window/focus transition still renders against the post-transition state.
+    let sh = shared.clone();
+    nx.set(
+        "_statusline_invalidate",
+        lua.create_function(move |_, name: String| {
+            sh.borrow_mut().statusline_invalidates.push(name);
+            Ok(())
+        })?,
     )?;
 
     // `nx._snippet_setup(next, prev)`: queue the tabstop-jump key configuration

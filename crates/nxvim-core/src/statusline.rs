@@ -797,6 +797,25 @@ pub struct SegmentLayout {
     pub right: Vec<String>,
 }
 
+/// Whether `name` is a built-in segment (resolved natively each frame from the
+/// [`StatuslineCtx`]) rather than a custom Lua segment. The server uses this to
+/// tell which names a `nx.statusline.setup{}` layout must re-render through Lua.
+/// Keep in lockstep with the match in [`builtin_segment`].
+pub fn is_builtin_segment(name: &str) -> bool {
+    matches!(
+        name,
+        "mode"
+            | "filename"
+            | "filepath"
+            | "filetype"
+            | "encoding"
+            | "location"
+            | "modified"
+            | "readonly"
+            | "diagnostics"
+    )
+}
+
 /// Resolve one **built-in** segment to its cells from the [`StatuslineCtx`].
 ///
 /// Returns `Some(cells)` for a known built-in — including `Some(vec![])` when a

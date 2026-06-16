@@ -11,7 +11,9 @@
 //! accounting for wide characters and tabs.
 
 use crate::buffer::Buffer;
-use crate::editor::{BorderStyle, BufferId, Cursor, Editor, MenuPlacement, TabLabel, WindowLayout};
+use crate::editor::{
+    BorderStyle, BufferId, Cursor, Editor, MenuPlacement, TabLabel, WindowId, WindowLayout,
+};
 use crate::mode::Mode;
 use crate::statusline::StatuslineCtx;
 use crate::unicode;
@@ -252,6 +254,10 @@ pub struct Separator {
 /// window this is the whole text area — identical to the pre-windows view.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WindowView {
+    /// This window's stable id (the handle `nvim_list_wins` /
+    /// `nvim_get_current_win` report). The server keys per-window projected state
+    /// by it — the `nx.statusline` custom-segment cache, rendered per window.
+    pub id: WindowId,
     /// Where this window sits within its [`region`](WindowView::region) (origin
     /// `(0, 0)` per region; the client offsets by the region's screen origin).
     pub rect: ViewRect,
@@ -739,6 +745,7 @@ fn window_view(ed: &Editor, w: &WindowLayout) -> WindowView {
     });
 
     WindowView {
+        id: w.id,
         rect: ViewRect {
             x: w.rect.x,
             y: w.rect.y,

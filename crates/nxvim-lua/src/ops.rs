@@ -888,28 +888,58 @@ pub struct PickerOpenReq {
     pub preview: bool,
 }
 
-/// A `nx.statusline.setup{}` request: the ordered segment *names* for the left
-/// and right halves of the status line (the lualine-shaped surface). The Lua
-/// wrapper (`prelude/statusline.lua`) validates each name against the built-ins
-/// and the registered custom segments first. Queued in
-/// [`crate::runtime::Shared::statusline_setups`]; the server stores it as the
-/// active `SegmentLayout`, which takes precedence over the `'statusline'`
-/// format while set.
+/// Whether a [`StatuslineSetupReq`] sets the **global** segment layout (applies to
+/// every window that has no override) or a **window-local** one (overrides the
+/// global layout for that one window — the `setlocal 'statusline'` analogue).
 #[derive(Clone, Debug)]
-pub struct StatuslineSetupReq {
-    pub left: Vec<String>,
-    pub right: Vec<String>,
+pub enum StatuslineTarget {
+    Global,
+    Window(u64),
 }
 
-/// A custom statusline segment's resolved cells, published from Lua
-/// (`nx._statusline_publish`) when the segment is (re)rendered — at `setup{}`,
-/// on `nx.statusline.invalidate(name)`, or on one of its declared autocmd
-/// events. `cells` is `(text, group)` per cell, an empty `group` meaning the
-/// base `StatusLine` highlight. Queued in
-/// [`crate::runtime::Shared::statusline_publishes`]; the server caches it by
-/// `name` and reads it during redraw (no per-frame Lua — ADR 0002 rule 4).
+/// What a [`StatuslineSetupReq`] sets its [target](StatuslineTarget) to.
+#[derive(Clone, Debug)]
+pub enum StatuslineKind {
+    /// A lualine-shaped segment layout: the ordered segment *names* for the left
+    /// and right halves. The Lua wrapper validated each name against the built-ins
+    /// and the registered custom segments first.
+    Segments {
+        left: Vec<String>,
+        right: Vec<String>,
+    },
+    /// Use the `'statusline'` `%`-format instead of a segment layout — for a
+    /// window this is the per-region "mix": it shows the format even while a global
+    /// segment layout is active. For the global target it clears the global layout.
+    Format,
+    /// Drop a window-local override so the window re-inherits the global layout
+    /// (`nx.statusline.reset(win)`). For the global target it clears the layout.
+    Inherit,
+}
+
+/// A `nx.statusline.setup{}` / `nx.statusline.reset()` request: set the global or a
+/// window-local status line to a segment layout, the `%`-format, or inherit.
+/// Queued in [`crate::runtime::Shared::statusline_setups`]; the server resolves
+/// each window's effective status line from the global layout plus these
+/// per-window overrides during redraw.
+#[derive(Clone, Debug)]
+pub struct StatuslineSetupReq {
+    pub target: StatuslineTarget,
+    pub kind: StatuslineKind,
+}
+
+/// A custom statusline segment's resolved cells **for one window**, published
+/// from Lua (`nx._statusline_publish`) when the server re-renders the segment —
+/// at `setup{}`, on `nx.statusline.invalidate(name)`, on a declared autocmd
+/// event, or when the window set / focus / a window's buffer changes. The
+/// segment is rendered once per window (its `render(ctx)` sees that window's
+/// `{ buf, win, focused }`), so a publish carries the `win` it is for. `cells`
+/// is `(text, group)` per cell, an empty `group` meaning the base `StatusLine`
+/// highlight. Queued in [`crate::runtime::Shared::statusline_publishes`]; the
+/// server caches it by `(win, name)` and reads it during redraw (no per-frame
+/// Lua — ADR 0002 rule 4).
 #[derive(Clone, Debug)]
 pub struct StatuslinePublishReq {
+    pub win: u64,
     pub name: String,
     pub cells: Vec<(String, Option<String>)>,
 }

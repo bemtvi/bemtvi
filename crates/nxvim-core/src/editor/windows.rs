@@ -847,6 +847,10 @@ fn equalize_node(node: &mut Node) {
 /// (`floating`/`border`/`title`) the client paints it with. Tiled windows carry
 /// `floating: false`, `border: None`, `title: None`.
 pub(crate) struct WindowLayout {
+    /// This window's stable id (the handle `nvim_list_wins` /
+    /// `nvim_get_current_win` report), so the projection can key per-window state
+    /// (the `nx.statusline` custom-segment cache) by window.
+    pub(crate) id: WindowId,
     pub(crate) buffer: BufferId,
     pub(crate) cursor: Cursor,
     pub(crate) top: usize,
@@ -1503,6 +1507,7 @@ impl Editor {
                     None => (false, BorderStyle::None, None),
                 };
                 out.push(WindowLayout {
+                    id,
                     buffer: w.buffer,
                     cursor: if focused { self.cursor } else { w.saved_cursor },
                     top: if focused { self.top } else { w.saved_top },

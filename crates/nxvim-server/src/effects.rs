@@ -6,7 +6,7 @@
 use crate::evloop::{LoopCommand, LoopEvent};
 #[cfg(feature = "native")]
 use crate::lsp::CODE_ACTION_PANEL_TITLE;
-use crate::EditHost;
+use crate::{EditHost, WindowStatusline};
 use nxvim_core::highlight::HlDef;
 use nxvim_core::{
     parse_color, BorderStyle, BufferId, DecorViewport, FloatAnchor, FloatConfig, FloatRelative,
@@ -15,7 +15,8 @@ use nxvim_core::{
 use nxvim_lua::{
     BoMirror, BufBytesEdit, BufMirror, BufOp, CallbackArgs, DecorPublish, DockOp, ExtmarkMirror,
     ExtmarkOp, FloatMirror, GoMirror, HlDefMirror, HlSet, JumpMirror, LoopOp, OptionValue, PanelOp,
-    QfItem, QfMirror, TabMirror, TabOp, TsOp, WindowMirror, WindowOp,
+    QfItem, QfMirror, StatuslineKind, StatuslineTarget, TabMirror, TabOp, TsOp, WindowMirror,
+    WindowOp,
 };
 use rmpv::Value;
 use std::collections::HashSet;
@@ -487,25 +488,64 @@ impl EditHost {
             // queues (already past this pass's `take_loop_ops`) actually starts.
             self.editor.picker_query_changes.push((0, String::new()));
         }
-        // `nx.statusline.setup{}`: the latest layout wins (a re-setup replaces the
-        // active one). While a layout is set it takes precedence over `'statusline'`
-        // for every window — see `EditHost::render_statusline`.
+        // `nx.statusline.setup{}` / `reset()`: set the global or a window-local
+        // status line (the latest for each target wins). A global / window-local
+        // segment layout takes precedence over `'statusline'`; a window `Format`
+        // override opts that window back to the `%`-format even under a global
+        // layout — see `EditHost::resolve_window_layout`. After any change, recompute
+        // the custom-segment set, clear the stale cache, and force a full per-window
+        // re-render on the next settle.
+        let mut statusline_changed = false;
         for req in self.lua.take_statusline_setups() {
-            self.statusline_layout = Some(nxvim_core::statusline::SegmentLayout {
-                left: req.left,
-                right: req.right,
-            });
+            let segments = |left, right| nxvim_core::statusline::SegmentLayout { left, right };
+            match (req.target, req.kind) {
+                (StatuslineTarget::Global, StatuslineKind::Segments { left, right }) => {
+                    self.statusline_layout = Some(segments(left, right));
+                }
+                // A global `Format` / `Inherit` clears the global layout (back to
+                // the `%`-format for every inheriting window).
+                (StatuslineTarget::Global, _) => self.statusline_layout = None,
+                (StatuslineTarget::Window(w), StatuslineKind::Segments { left, right }) => {
+                    self.statusline_window.insert(
+                        WindowId(w),
+                        WindowStatusline::Segments(segments(left, right)),
+                    );
+                }
+                (StatuslineTarget::Window(w), StatuslineKind::Format) => {
+                    self.statusline_window
+                        .insert(WindowId(w), WindowStatusline::Format);
+                }
+                (StatuslineTarget::Window(w), StatuslineKind::Inherit) => {
+                    self.statusline_window.remove(&WindowId(w));
+                }
+            }
+            statusline_changed = true;
+        }
+        if statusline_changed {
+            self.recompute_statusline_custom();
+            self.statusline_cache.clear();
+            // Force a full per-window render on the next settle.
+            self.statusline_layout_key = None;
+        }
+        // Custom-segment invalidations (`nx.statusline.invalidate`, and the autocmd
+        // callbacks a declared `events` list installs): fold into the pending set,
+        // re-rendered per window once the input settles.
+        for name in self.lua.take_statusline_invalidates() {
+            if self.statusline_custom.contains(&name) {
+                self.statusline_pending.insert(name);
+            }
         }
         // Custom-segment cell publishes (`nx._statusline_publish`): fold each into
-        // the per-name cache the redraw path reads. Re-rendered only on a segment's
-        // invalidation, so this is empty on a built-ins-only config.
+        // the per-`(win, name)` cache the redraw path reads. Produced only while
+        // `refresh_statusline_segments` re-renders, so this is empty on the common
+        // path.
         for req in self.lua.take_statusline_publishes() {
             let cells = req
                 .cells
                 .into_iter()
                 .map(|(text, group)| nxvim_core::statusline::StatusSegment { text, group })
                 .collect();
-            self.statusline_cache.insert(req.name, cells);
+            self.statusline_cache.insert((req.win, req.name), cells);
         }
         // `nx.complete.setup{}`: apply the native completion-engine config. Key
         // notation is parsed here (core stays parser-aware only via `parse_keys`);
@@ -1996,6 +2036,116 @@ impl EditHost {
         if !term_ops.is_empty() {
             self.dispatch_terminal_ops(term_ops);
         }
+        // The `nx.statusline` segment registry: re-render any invalidated custom
+        // segments — and, when the window layout changed, all of them — per window,
+        // now that the topology has settled. Last, so it sees the final windows.
+        self.refresh_statusline_segments();
+    }
+
+    /// Re-render the custom `nx.statusline` segments whose cache is stale and fold
+    /// the results into the per-`(window, name)` cache the redraw path reads. The
+    /// settle point for the segment registry: runs once per [`Self::run_pending`],
+    /// after the window/buffer topology has converged, so each segment renders
+    /// against the final per-window `{ buf, win, focused }` contexts.
+    ///
+    /// A segment is re-rendered when it was invalidated (`nx.statusline.invalidate`
+    /// or a declared autocmd event) or when the window layout changed — a split /
+    /// close, a focus move, or a window swapping its buffer — which would otherwise
+    /// leave a window with no (or a stale `focused` / `buf`) cell. Cache entries for
+    /// closed windows are pruned. A cheap no-op when no layout is active or nothing
+    /// changed (the common path): only an id/buffer-vector compare, no Lua.
+    fn refresh_statusline_segments(&mut self) {
+        // No segment layout active anywhere (global or window-local): discard any
+        // stray invalidations and stop (the `%`-format path owns the status line).
+        if !self.statusline_active() {
+            self.lua.take_statusline_invalidates();
+            self.statusline_pending.clear();
+            return;
+        }
+        // Fold in invalidations queued since the last drain (including any the final
+        // `emit_lifecycle_events` above fired into the autocmd dispatch).
+        for name in self.lua.take_statusline_invalidates() {
+            if self.statusline_custom.contains(&name) {
+                self.statusline_pending.insert(name);
+            }
+        }
+
+        // The current window layout: `(window id, buffer id)` per window plus the
+        // focused window. A change re-renders every custom segment (so per-window
+        // `focused` / `buf` stays correct), prunes the cache and window-local
+        // overrides to live windows, and rebuilds the custom set (a closed window's
+        // local layout may have been the only reference to a segment).
+        let wins = self.editor.window_ids();
+        let key: Vec<(u64, u64)> = wins
+            .iter()
+            .map(|&w| (w.0, self.editor.window_buffer(w).map(|b| b.0).unwrap_or(0)))
+            .collect();
+        let focus = self.editor.current_window_id().0;
+        if self.statusline_layout_key.as_ref() != Some(&(key.clone(), focus)) {
+            let live: std::collections::HashSet<u64> = wins.iter().map(|w| w.0).collect();
+            self.statusline_window.retain(|w, _| live.contains(&w.0));
+            self.statusline_cache.retain(|(w, _), _| live.contains(w));
+            self.recompute_statusline_custom();
+            self.statusline_layout_key = Some((key, focus));
+        }
+
+        if self.statusline_pending.is_empty() {
+            return;
+        }
+        // Refresh the window mirror so the Lua re-render reads the settled layout
+        // (`nx.win.list()` / `nx.win.buf()` / `nx.win.current()`), then render each
+        // dirty segment for every window. The publishes land in `statusline_publishes`.
+        self.push_buf_mirror();
+        for name in std::mem::take(&mut self.statusline_pending) {
+            if let Err(e) = self.lua.run_statusline_rerender(&name) {
+                self.editor
+                    .echo(format!("E5108: Error rendering statusline segment: {e}"));
+            }
+        }
+        for req in self.lua.take_statusline_publishes() {
+            let cells = req
+                .cells
+                .into_iter()
+                .map(|(text, group)| nxvim_core::statusline::StatusSegment { text, group })
+                .collect();
+            self.statusline_cache.insert((req.win, req.name), cells);
+        }
+    }
+
+    /// Whether any `nx.statusline` segment layout is active — the global layout or
+    /// at least one window-local [`Segments`](WindowStatusline::Segments) override.
+    /// A window-only `Format` override doesn't count (it shows the `%`-format).
+    fn statusline_active(&self) -> bool {
+        self.statusline_layout.is_some()
+            || self
+                .statusline_window
+                .values()
+                .any(|w| matches!(w, WindowStatusline::Segments(_)))
+    }
+
+    /// Rebuild [`statusline_custom`](EditHost::statusline_custom) — the custom
+    /// (non-built-in) segment names referenced by the global layout and every
+    /// window-local one — and mark them all pending so the next settle re-renders
+    /// them. Called whenever the active layouts change.
+    fn recompute_statusline_custom(&mut self) {
+        let mut custom: Vec<String> = Vec::new();
+        let mut collect = |layout: &nxvim_core::statusline::SegmentLayout| {
+            for name in layout.left.iter().chain(layout.right.iter()) {
+                if !nxvim_core::statusline::is_builtin_segment(name) && !custom.contains(name) {
+                    custom.push(name.clone());
+                }
+            }
+        };
+        if let Some(layout) = &self.statusline_layout {
+            collect(layout);
+        }
+        for win in self.statusline_window.values() {
+            if let WindowStatusline::Segments(layout) = win {
+                collect(layout);
+            }
+        }
+        self.statusline_pending.extend(custom.iter().cloned());
+        self.statusline_custom = custom;
     }
 }
 

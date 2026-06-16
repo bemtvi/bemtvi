@@ -109,7 +109,18 @@ impl EditHost {
         let global_status = match &view.global_statusline {
             Some(ctx) => {
                 let width = self.ui.map_or(0, |(w, _)| w);
-                self.render_statusline(ctx, width, &view.mode_label, &statusline_fmt, &mut styles)
+                // The global bar shows the focused window's facts, so it resolves
+                // (and reads the segment cache for) that window.
+                let fw = view.focused().id.0;
+                self.render_statusline(
+                    fw,
+                    self.resolve_window_layout(fw),
+                    ctx,
+                    width,
+                    &view.mode_label,
+                    &statusline_fmt,
+                    &mut styles,
+                )
             }
             None => Value::Nil,
         };
@@ -138,7 +149,11 @@ impl EditHost {
         let tabline_segments = if tabline_fmt.is_empty() || view.tabline.is_empty() {
             Value::Nil
         } else {
+            // The tabline always uses the `'tabline'` `%`-format, never a segment
+            // layout (`None`) — segment layouts are a status-line surface only.
             self.render_statusline(
+                view.focused().id.0,
+                None,
                 &view.focused().status_ctx,
                 w,
                 &view.mode_label,
@@ -458,7 +473,15 @@ impl EditHost {
             0
         };
         let width = win.rect.width.saturating_sub(2 * inset);
-        self.render_statusline(&win.status_ctx, width, mode_label, statusline_fmt, styles)
+        self.render_statusline(
+            win.id.0,
+            self.resolve_window_layout(win.id.0),
+            &win.status_ctx,
+            width,
+            mode_label,
+            statusline_fmt,
+            styles,
+        )
     }
 
     /// Run the `%`-format engine over one [`StatuslineCtx`] across `width` cells and
@@ -468,24 +491,43 @@ impl EditHost {
     /// and width. `statusline_fmt` empty ⇒ the built-in default look (rendered through
     /// the same engine). Each segment's highlight group resolves to a style-palette
     /// id, `Nil` when it has none / the colorscheme leaves it undefined.
+    /// Resolve the effective `nx.statusline` segment layout for a window: its
+    /// window-local override ([`WindowStatusline`](crate::WindowStatusline)) when
+    /// set — `Segments` shows that layout, `Format` opts back to the `%`-format
+    /// (returns `None`) — otherwise the global layout. `None` ⇒ the window uses the
+    /// `'statusline'` `%`-format. The `setlocal 'statusline'` analogue.
+    fn resolve_window_layout(&self, win_id: u64) -> Option<&nxvim_core::statusline::SegmentLayout> {
+        match self.statusline_window.get(&nxvim_core::WindowId(win_id)) {
+            Some(crate::WindowStatusline::Segments(layout)) => Some(layout),
+            Some(crate::WindowStatusline::Format) => None,
+            None => self.statusline_layout.as_ref(),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)] // status-line render facts; bundling them
+                                         // (window, layout, ctx, width, format, styles) would just hide the data flow.
     fn render_statusline(
         &self,
+        win_id: u64,
+        layout: Option<&nxvim_core::statusline::SegmentLayout>,
         ctx: &nxvim_core::statusline::StatuslineCtx,
         width: usize,
         mode_label: &str,
         statusline_fmt: &str,
         styles: &mut StyleTable,
     ) -> Value {
-        // The `nx.statusline.setup{}` segment layout, when active, takes precedence
-        // over the `'statusline'` `%`-format. Built-in segments resolve here from
-        // `ctx` (with diagnostics filled in); custom segments come from the cache
-        // the Lua publishes populate — no per-frame Lua (ADR 0002 rule 4).
-        if let Some(spec) = &self.statusline_layout {
+        // A resolved segment layout (the window's override or the global one) takes
+        // precedence over the `'statusline'` `%`-format. Built-in segments resolve
+        // here from `ctx` (with diagnostics filled in); custom segments come from the
+        // per-`(window, name)` cache the Lua re-renders populate — keyed by `win_id`
+        // so each window shows its own cell — no per-frame Lua (ADR 0002 rule 4).
+        // The tabline caller passes `None` (it never uses a segment layout).
+        if let Some(spec) = layout {
             let mut seg_ctx = ctx.clone();
             seg_ctx.diag_counts =
                 self.statusline_diag_counts(nxvim_core::BufferId(ctx.bufnr as u64));
             let cache = &self.statusline_cache;
-            let custom = |name: &str| cache.get(name).cloned();
+            let custom = |name: &str| cache.get(&(win_id, name.to_string())).cloned();
             let segments = statusline::compose_segments(spec, &seg_ctx, mode_label, width, &custom);
             return self.project_status_segments(&segments, styles);
         }

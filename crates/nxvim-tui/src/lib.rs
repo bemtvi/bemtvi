@@ -17,6 +17,7 @@
 //! encodes key events. This module keeps only the event loop and transport.
 
 mod anim;
+mod images;
 mod keys;
 mod render;
 
@@ -199,6 +200,11 @@ where
     )
     .await
     .ok();
+
+    // The image renderer for `'imagepreview'`: detect the terminal's graphics
+    // protocol now (it queries over stdio), *before* the `EventStream` below starts
+    // reading input, so the two don't race for the terminal's replies.
+    let mut image_store = images::ImageStore::new();
 
     let mut view = View::default();
     let mut anim: Option<Animation> = None;
@@ -440,7 +446,7 @@ where
                                     doc_scroll.saturating_sub(STEP)
                                 };
                                 terminal
-                                    .draw(|frame| render(frame, &view, anim.as_ref(), doc_scroll))?;
+                                    .draw(|frame| render(frame, &view, anim.as_ref(), doc_scroll, Some(&mut image_store)))?;
                             }
                         } else if over_pmenu {
                             if let Some(pmenu) = view.pmenu.as_ref() {
@@ -498,7 +504,7 @@ where
                             doc_scroll = 0;
                         }
                         anim = arm_animation(&view, anim.take());
-                        terminal.draw(|frame| render(frame, &view, anim.as_ref(), doc_scroll))?;
+                        terminal.draw(|frame| render(frame, &view, anim.as_ref(), doc_scroll, Some(&mut image_store)))?;
                         // Match the cursor shape to the mode (a thin bar in insert
                         // mode). Emitted only on change so it doesn't flicker.
                         let want = cursor_style(&view);
@@ -519,7 +525,7 @@ where
                 if anim.as_ref().is_some_and(|a| a.start.elapsed() >= a.duration) {
                     anim = None; // settle: render the destination view below
                 }
-                terminal.draw(|frame| render(frame, &view, anim.as_ref(), doc_scroll))?;
+                terminal.draw(|frame| render(frame, &view, anim.as_ref(), doc_scroll, Some(&mut image_store)))?;
             },
             // `timeoutlen` idle flush: a keystroke armed the timer and nothing
             // followed within `TIMEOUT_LEN`, so nudge the server to resolve any key

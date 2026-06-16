@@ -11,6 +11,7 @@ use rmpv::Value;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::anim::{arm_animation, lerp, Animation};
+use crate::images::ImageStore;
 use nxvim_view::{
     DiagSign, DiagSpan, DiagVirt, HlSpan, IncSearchSpans, InlayHint, MenuData, MenuPreview,
     PanelData, PmenuData, RegionTabline, SearchSpans, Separator, StatusSegment, TabData, View,
@@ -93,7 +94,7 @@ pub fn paint_with_cursor(
     use ratatui::Terminal;
     let mut terminal = Terminal::new(TestBackend::new(width, height)).expect("test terminal");
     terminal
-        .draw(|frame| render(frame, view, None, 0))
+        .draw(|frame| render(frame, view, None, 0, None))
         .expect("draw");
     let cursor = terminal.get_cursor_position().ok().map(|p| (p.x, p.y));
     (terminal.backend().buffer().clone(), cursor)
@@ -113,7 +114,7 @@ pub fn paint_doc_scrolled(
     use ratatui::Terminal;
     let mut terminal = Terminal::new(TestBackend::new(width, height)).expect("test terminal");
     terminal
-        .draw(|frame| render(frame, view, None, doc_scroll))
+        .draw(|frame| render(frame, view, None, doc_scroll, None))
         .expect("draw");
     terminal.backend().buffer().clone()
 }
@@ -171,7 +172,7 @@ impl ScrollHarness {
         use ratatui::Terminal;
         let mut terminal = Terminal::new(TestBackend::new(width, height)).expect("test terminal");
         terminal
-            .draw(|frame| render(frame, &self.view, self.anim.as_ref(), 0))
+            .draw(|frame| render(frame, &self.view, self.anim.as_ref(), 0, None))
             .expect("draw");
         terminal.backend().buffer().clone()
     }
@@ -183,7 +184,13 @@ impl ScrollHarness {
 /// minus the global bottom panel and command line; with one window it spans that
 /// whole area, so the output matches the pre-windows single-window frame exactly.
 /// When `anim` is present it animates the **focused** window's slide.
-pub(crate) fn render(frame: &mut Frame, view: &View, anim: Option<&Animation>, doc_scroll: u16) {
+pub(crate) fn render(
+    frame: &mut Frame,
+    view: &View,
+    anim: Option<&Animation>,
+    doc_scroll: u16,
+    mut images: Option<&mut ImageStore>,
+) {
     // The panel docks below all windows, claiming `height + 1` rows (content plus
     // its title bar); `0` when none is open. The command line is the last row.
     // Each window draws its own status line at the bottom of its rect, so there
@@ -224,7 +231,7 @@ pub(crate) fn render(frame: &mut Frame, view: &View, anim: Option<&Animation>, d
         // Only the focused window animates a scroll slide.
         let win_anim = if win.focused { anim } else { None };
         let (text_inner, cursor_row, cursor_shift) =
-            render_window(frame, area, win, view, win_anim);
+            render_window(frame, area, win, view, win_anim, images.as_deref_mut());
         if win.focused {
             focused_inner = Some((text_inner, cursor_row, cursor_shift));
         }
@@ -250,7 +257,8 @@ pub(crate) fn render(frame: &mut Frame, view: &View, anim: Option<&Animation>, d
             }
             None => outer,
         };
-        let (text_inner, cursor_row, cursor_shift) = render_window(frame, inner, win, view, None);
+        let (text_inner, cursor_row, cursor_shift) =
+            render_window(frame, inner, win, view, None, images.as_deref_mut());
         if win.focused {
             focused_inner = Some((text_inner, cursor_row, cursor_shift));
         }
@@ -593,6 +601,7 @@ fn render_window(
     win: &WindowView,
     view: &View,
     anim: Option<&Animation>,
+    images: Option<&mut ImageStore>,
 ) -> (Rect, u16, u16) {
     // The status line is the window's bottom row (when this window shows one, per
     // `'laststatus'`); the text body is the rest. With no per-window status row the
@@ -603,6 +612,25 @@ fn render_window(
     } else {
         (area, None)
     };
+
+    // An image-preview buffer (`'imagepreview'`): paint the picture across the whole
+    // text body and skip the gutter / text machinery entirely. Only the live client
+    // has an `ImageStore` (graphics need a real terminal); the headless render / test
+    // paths pass `None`, leaving the body blank. The buffer is empty, so there is no
+    // meaningful cursor — return the body rect and row 0.
+    if let Some(image) = &win.image {
+        if let Some(normal) = view.normal.map(rt) {
+            frame.render_widget(Block::default().style(normal), text_area);
+        }
+        if let Some(store) = images {
+            store.render(frame, text_area, &image.path);
+        }
+        if let Some(status_area) = status_area {
+            render_status(frame, status_area, &win.status, view);
+        }
+        return (text_area, 0, 0);
+    }
+
     let height = text_area.height as usize;
 
     // Empty fallbacks for the overlays a slide band does not carry (diagnostics,

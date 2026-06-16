@@ -15,6 +15,9 @@ tokio.workspace = true
 futures.workspace = true
 crossterm.workspace = true
 ratatui.workspace = true
+# In-terminal image rendering for `'imagepreview'` (see `images.rs`).
+ratatui-image.workspace = true
+image.workspace = true
 unicode-width.workspace = true
 nxvim-rpc.workspace = true
 nxvim-view.workspace = true

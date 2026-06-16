@@ -75,6 +75,20 @@ nucleo-matcher = "=0.3.1"
 encoding_rs = "=0.8.35"
 crossterm = { version = "=0.29.0", features = ["event-stream"] }
 ratatui = "=0.30.1"
+# In-terminal image rendering for the TUI client's `'imagepreview'` (Phase 2): a
+# ratatui widget over Kitty/Sixel/iTerm2 graphics protocols, with a unicode
+# halfblocks fallback. `chafa` (the higher-quality halfblocks encoder) is left OFF
+# — its default `chafa-dyn`/`chafa-static` features drag in a C lib via pkg-config,
+# and the graphics protocols (the good path) are pure Rust and unaffected; so we
+# disable defaults and re-add only `image-defaults` + `crossterm`. Needs ratatui
+# >=0.30.1. `image` is the decoder (a direct dep so the client builds the
+# `DynamicImage` the picker turns into a protocol); pinned to share one compiled
+# copy with ratatui-image's `^0.25.6`.
+ratatui-image = { version = "=11.0.4", default-features = false, features = [
+    "image-defaults",
+    "crossterm",
+] }
+image = "=0.25.10"
 # Native GUI client stack (`nxvim-gui`). winit owns the window + input event loop,
 # wgpu the GPU surface, and glyphon the text rendering (it re-exports cosmic-text,
 # so the GUI reaches `FontSystem`/`Buffer`/`Attrs`/… through `glyphon::`). glyphon

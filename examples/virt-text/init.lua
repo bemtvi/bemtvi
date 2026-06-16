@@ -17,6 +17,8 @@
 --   move around (hjkl, w, G)        the cursor steps OVER the virtual rows, never onto them
 --   G  (jump to last line)          the view scrolls; the cursor stays visible even though
 --                                   the virt_lines block ate extra screen rows (Phase 5 scroll math)
+--   V  on the eol-note line         a `virt_text_hide` note vanishes while the line is selected;
+--                                   <Esc> brings it back (the sibling note without the flag stays)
 --   :set number                     gutter numbers skip the virtual rows (they have no buffer line)
 
 --------------------------------------------------------------------------------
@@ -43,6 +45,13 @@ local function decorate(buf)
   vim.api.nvim_buf_set_extmark(buf, ns, 2, 0, {
     virt_text = { { "  ← end-of-line note", "VtEol" } },
     virt_text_pos = "eol",
+  })
+  -- eol + virt_text_hide: this note disappears while the line is visually selected
+  -- (try `V` on row 3), then returns on <Esc>. The plain note above always stays.
+  vim.api.nvim_buf_set_extmark(buf, ns, 2, 0, {
+    virt_text = { { "  (hides under selection)", "VtEol" } },
+    virt_text_pos = "eol",
+    virt_text_hide = true,
   })
 
   -- inline: spliced into the line, pushing the real text (and the cursor) right.

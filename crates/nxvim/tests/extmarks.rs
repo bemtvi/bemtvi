@@ -730,3 +730,100 @@ async fn scroll_accounts_for_virt_lines_to_keep_the_cursor_visible() {
         "line 1 scrolled off the top — the scroll accounted for the virtual rows below it"
     );
 }
+
+// ----- Phase 6: priority ordering + virt_text_hide --------------------------
+
+/// Every chunk text across row 0's `virt_text` placements, in wire (draw) order.
+fn vt_texts(vt: &[(u64, u64, Vec<String>)]) -> Vec<String> {
+    vt.iter().flat_map(|(_, _, c)| c.clone()).collect()
+}
+
+/// Phase 6: two `virt_text` marks anchored at the same column emit in **priority**
+/// order — the `(start, priority, id)` sort makes priority the tie-break at a shared
+/// anchor, so a higher-priority mark stacks after a lower one regardless of creation
+/// order / id. The high-priority mark is created first (smaller id), so only priority
+/// (not id) can yield the asserted order.
+#[tokio::test]
+async fn virt_text_marks_emit_in_priority_order() {
+    let (rpc, mut incoming) = start().await;
+    feed(&rpc, "ihello<Esc>");
+    exec_lua(
+        &rpc,
+        r#"
+        local ns = vim.api.nvim_create_namespace('prio')
+        vim.api.nvim_buf_set_extmark(0, ns, 0, 0, {
+          virt_text = {{'HIGH', 'Comment'}}, virt_text_pos = 'eol', priority = 200,
+        })
+        vim.api.nvim_buf_set_extmark(0, ns, 0, 0, {
+          virt_text = {{'LOW', 'Comment'}}, virt_text_pos = 'eol', priority = 10,
+        })
+        "#,
+    )
+    .await;
+
+    let vt = wait_for_virt_text(&rpc, &mut incoming, |vt| {
+        vt.iter().filter(|(pos, _, _)| *pos == 0).count() == 2
+    })
+    .await;
+    assert_eq!(
+        vt_texts(&vt),
+        vec!["LOW".to_string(), "HIGH".to_string()],
+        "the lower-priority mark is emitted first; priority — not id / creation order — drives it"
+    );
+}
+
+/// Phase 6: `virt_text_hide` hides a mark's virtual text while the line's background
+/// text is covered by the visual selection, and shows it again once the selection is
+/// gone; a sibling mark without the flag stays visible throughout.
+#[tokio::test]
+async fn virt_text_hide_drops_under_a_visual_selection() {
+    let (rpc, mut incoming) = start().await;
+    feed(&rpc, "ihello<Esc>");
+    exec_lua(
+        &rpc,
+        r#"
+        local ns = vim.api.nvim_create_namespace('hide')
+        vim.api.nvim_buf_set_extmark(0, ns, 0, 0, {
+          virt_text = {{'HIDES', 'Comment'}}, virt_text_pos = 'eol', virt_text_hide = true,
+        })
+        vim.api.nvim_buf_set_extmark(0, ns, 0, 0, {
+          virt_text = {{'STAYS', 'Comment'}}, virt_text_pos = 'eol',
+        })
+        "#,
+    )
+    .await;
+
+    // Normal mode (line not selected): both placements show.
+    let vt = wait_for_virt_text(&rpc, &mut incoming, |vt| {
+        let t = vt_texts(vt);
+        t.contains(&"HIDES".to_string()) && t.contains(&"STAYS".to_string())
+    })
+    .await;
+    assert!(
+        vt_texts(&vt).contains(&"HIDES".to_string()),
+        "the hide mark shows in normal mode"
+    );
+
+    // Select the line (visual-line mode): the hide mark drops, the plain one stays.
+    feed(&rpc, "V");
+    let vt = wait_for_virt_text(&rpc, &mut incoming, |vt| {
+        let t = vt_texts(vt);
+        !t.contains(&"HIDES".to_string()) && t.contains(&"STAYS".to_string())
+    })
+    .await;
+    assert!(
+        !vt_texts(&vt).contains(&"HIDES".to_string()),
+        "virt_text_hide drops the text while the line is selected"
+    );
+    assert!(
+        vt_texts(&vt).contains(&"STAYS".to_string()),
+        "a mark without virt_text_hide stays visible under the selection"
+    );
+
+    // Leave visual mode: the hidden text comes back.
+    feed(&rpc, "<Esc>");
+    wait_for_virt_text(&rpc, &mut incoming, |vt| {
+        vt_texts(vt).contains(&"HIDES".to_string())
+    })
+    .await;
+}

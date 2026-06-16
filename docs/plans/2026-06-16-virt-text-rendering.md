@@ -181,19 +181,33 @@ tests per project convention).
     (`ScrollAnim` is buffer-line-based; virtual rows simply don't slide and appear at
     the settled frame); `virt_lines_leftcol`; GUI/web paint.
 
-- **Phase 6 — Polish + parity.** `hl_mode` `combine`/`blend` (deferred from Phase
-  4 — merge the chunk highlight with the cells under an overlay; today all render
-  `replace`); `virt_text_hide` (deferred from Phase 4 — hide when the line is
-  covered); **GUI + web client paint parity** for all `virt_text` positions (the
-  wire data already reaches them; only `nxvim-gui` / web render code is pending —
-  see the client-coverage note up top); priority ordering of multiple virt_text
-  marks on one row; `virt_text_repeat_linebreak` (no-op without wrap, documented);
-  wasm edit-host parity (cfg-gate as needed).
+- **Phase 6 — Polish + parity. In progress.**
+  - ✅ **`virt_text_hide`** (deferred from Phase 4) — honored **server-side** in
+    `virt_text_for`: the focused window's per-row `selection` is threaded in, and a
+    mark with `virt_text_hide` is omitted on any row the visual selection covers
+    (matching neovim's "hide when the background text is selected"). Observable in the
+    `virt_text` wire payload, so it's black-box testable
+    (`virt_text_hide_drops_under_a_visual_selection`).
+  - ✅ **Priority ordering** of multiple `virt_text` marks on one row — the
+    `(start, priority, id)` sort already makes priority the tie-break at a shared
+    anchor; locked with `virt_text_marks_emit_in_priority_order` (high-priority mark
+    created first, so only priority — not id — can produce the asserted order).
+  - ⏳ `hl_mode` `combine`/`blend` (deferred from Phase 4 — merge the chunk highlight
+    with the cells under an overlay; today all render `replace`). **Client-render-only**
+    — the `hl_mode` code already rides the wire, so this is purely `nxvim-tui` /
+    `nxvim-gui` / web paint and is **not** observable through the redraw harness (only
+    visually). Grouped with the paint-parity batch below.
+  - ⏳ **GUI + web client paint parity** for all `virt_text` positions **and**
+    `virt_lines` (the wire data already reaches them; only `nxvim-gui` / web render
+    code is pending — see the client-coverage note up top). Not agent-verifiable.
+  - ⏳ virtual rows on the scroll-animation band; `virt_lines_leftcol`;
+    `virt_text_repeat_linebreak` (no-op without wrap, documented); wasm edit-host
+    parity (cfg-gate as needed).
   - **`examples/virt-text/` added** (`init.lua` + `sample.txt`) covering every
-    `virt_text` position **and** `virt_lines` (above / below). ⚠️ Written but **not yet
-    verified end-to-end** — the build/run was blocked by an unavailable environment;
-    run `NXVIM_CONFIG=examples/virt-text cargo run -p nxvim -- examples/virt-text/sample.txt`
-    to confirm before considering the repo-convention box ticked.
+    `virt_text` position, `virt_lines` (above / below), and a `virt_text_hide` mark.
+    Its code paths are covered by the black-box tests; the example itself hasn't been
+    launched interactively (the TUI isn't agent-verifiable). Eyeball it with
+    `NXVIM_CONFIG=examples/virt-text cargo run -p nxvim -- examples/virt-text/sample.txt`.
 
 ## Risks / open questions
 

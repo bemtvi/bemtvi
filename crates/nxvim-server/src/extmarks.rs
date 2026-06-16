@@ -103,7 +103,14 @@ impl EditHost {
     /// `0`=replace / `1`=combine / `2`=blend. Each chunk's `style_id` indexes the
     /// per-frame `styles` palette when its `hl_group` resolves (`Nil` otherwise, so
     /// the client paints in normal colors). Marks on a line are emitted in
-    /// `(start byte, priority, id)` order so stacked virtual text is stable.
+    /// `(start byte, priority, id)` order so stacked virtual text is stable — for two
+    /// marks at the same anchor that makes `priority` the tie-break, so a
+    /// higher-priority mark draws later (to the right for concatenated eol text).
+    ///
+    /// `selection` is the focused window's per-row visual-selection spans (aligned
+    /// with `numbers`); a mark with `virt_text_hide` set is **omitted** on any row
+    /// the selection covers, matching neovim's "hide the virtual text when the
+    /// background text is selected".
     ///
     /// Read live from the buffer's [`ExtmarkStore`](nxvim_core::ExtmarkStore), like
     /// the hl spans.
@@ -111,6 +118,7 @@ impl EditHost {
         &self,
         buffer: BufferId,
         numbers: &[Option<usize>],
+        selection: &[Option<(usize, usize)>],
         styles: &mut StyleTable,
     ) -> Value {
         let nil_rows = || Value::Array(numbers.iter().map(|_| Value::Nil).collect());
@@ -139,7 +147,8 @@ impl EditHost {
         let tabstop = buf.options.effective_tabstop();
         let rows = numbers
             .iter()
-            .map(|num| {
+            .enumerate()
+            .map(|(row, num)| {
                 let Some(n) = num else {
                     return Value::Array(Vec::new());
                 };
@@ -147,6 +156,9 @@ impl EditHost {
                 let Some(marks) = by_line.get(&line_idx) else {
                     return Value::Array(Vec::new());
                 };
+                // `virt_text_hide`: when this row's background text is covered by the
+                // visual selection, a mark that opted into hiding draws nothing.
+                let row_selected = selection.get(row).copied().flatten().is_some();
                 let mut marks = marks.clone();
                 marks.sort_by_key(|m| (m.start, m.priority, m.id));
                 // Inline placements need the line text + its start byte to map the
@@ -163,10 +175,14 @@ impl EditHost {
                 };
                 let placements: Vec<Value> = marks
                     .iter()
-                    .map(|m| {
+                    .filter_map(|m| {
                         // Every mark in `marks` has `decor` (the bucket only kept
                         // marks whose decor carries virt_text).
                         let decor = m.decor.as_deref().expect("virt_text mark has decor");
+                        // Hide this mark on a selected row when it opted in.
+                        if decor.virt_text_hide && row_selected {
+                            return None;
+                        }
                         let (pos, col) = match decor.virt_text_pos {
                             VirtTextPos::Eol => (POS_EOL, 0),
                             VirtTextPos::Inline => (POS_INLINE, anchor_col(m)),
@@ -175,13 +191,13 @@ impl EditHost {
                             // A fixed window column, independent of the mark anchor.
                             VirtTextPos::WinCol(n) => (POS_WIN_COL, n as u64),
                         };
-                        self.virt_placement_value(
+                        Some(self.virt_placement_value(
                             pos,
                             col,
                             hl_mode_code(decor.hl_mode),
                             &decor.virt_text,
                             styles,
-                        )
+                        ))
                     })
                     .collect();
                 Value::Array(placements)

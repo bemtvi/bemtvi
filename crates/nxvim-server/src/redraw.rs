@@ -312,7 +312,7 @@ impl EditHost {
         // server-side extmark store frame loop); the browser emits an empty array so
         // the redraw map keeps a stable shape.
         #[cfg(feature = "native")]
-        let virt_text = self.virt_text_for(win.buffer, &win.numbers, styles);
+        let virt_text = self.virt_text_for(win.buffer, &win.numbers, &win.selection, styles);
         #[cfg(not(feature = "native"))]
         let virt_text = Value::Array(Vec::new());
         // Extmark `virt_lines` (whole virtual rows). Core already interleaved them

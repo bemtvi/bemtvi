@@ -180,8 +180,14 @@ pub struct WindowView {
 }
 
 /// An image-preview window's payload (mirrors `nxvim_core::view::ImageView`): the
-/// filesystem path of the image to render. The client reads and decodes it locally
-/// (a local TUI shares the filesystem) and caches the decoded result.
+/// filesystem path of the image to render. The client reads and decodes it,
+/// caching the decoded result.
+///
+/// **Where the bytes live** depends on [`remote`](ImageData::remote): an *embedded*
+/// (local-disk) session shares the filesystem, so the client opens `path` directly;
+/// a *daemon* (`:connect`) session keeps the bytes on the remote host, so the client
+/// must fetch them out-of-band over the editor RPC (`nxvim_image_read`) — `path` is a
+/// reference into the daemon's filesystem the client can't open itself.
 #[derive(Clone)]
 pub struct ImageData {
     pub path: String,
@@ -190,6 +196,12 @@ pub struct ImageData {
     /// (rather than showing a stale image). `0` from an older server that omits them.
     pub size: u64,
     pub mtime_ms: u64,
+    /// Whether the image's bytes live on a **remote daemon** rather than the client's
+    /// local disk. `true` for a daemon (`:connect`) session: the client fetches the
+    /// bytes over the editor RPC (`nxvim_image_read [path]`) instead of opening `path`
+    /// locally. `false` (the default, and from an older server that omits the key) for
+    /// an embedded session whose client shares the filesystem.
+    pub remote: bool,
 }
 
 /// Which screen region a window/separator belongs to (mirrors
@@ -798,6 +810,9 @@ fn parse_window(m: &[(Value, Value)], styles: &[Style]) -> WindowView {
                 path: map_str(im, "path"),
                 size: map_u64(im, "size"),
                 mtime_ms: map_u64(im, "mtime_ms"),
+                remote: map_get(im, "remote")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false),
             }),
             _ => None,
         },

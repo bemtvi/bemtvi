@@ -93,6 +93,52 @@ async fn set_ex_command_enables_imagepreview() {
 }
 
 #[tokio::test]
+async fn local_session_marks_not_remote_and_reads_bytes_over_the_rpc() {
+    // An embedded (local-disk) session shares the filesystem, so the marker says the
+    // bytes are *not* remote — the client decodes `path` directly. `nxvim_image_read`
+    // still works (it reads local disk), so a client can route through it uniformly.
+    let (rpc, mut incoming) = start().await;
+    let path = write_temp("imglocal", "png", "PNGPLACEHOLDER\n");
+
+    exec_lua(&rpc, "nx.o.imagepreview = true").await;
+    command(&rpc, &format!("edit {path}")).await;
+
+    let frame = wait_redraw(&mut incoming, |m| {
+        matches!(window0_field(m, "image"), Some(Value::Map(_)))
+    })
+    .await;
+    let Some(Value::Map(img)) = window0_field(&frame, "image") else {
+        panic!("the redraw window carries an image marker");
+    };
+    assert_eq!(
+        map_get(img, "remote").and_then(Value::as_bool),
+        Some(false),
+        "a local session's image preview is not remote (the client opens the path)"
+    );
+
+    // The RPC reads the file off the editor tick and replies with the raw bytes.
+    let reply = rpc
+        .request("nxvim_image_read", vec![Value::from(path.as_str())])
+        .await
+        .expect("nxvim_image_read responds");
+    assert_eq!(
+        reply,
+        Value::Binary(b"PNGPLACEHOLDER\n".to_vec()),
+        "nxvim_image_read returns the file's raw bytes"
+    );
+
+    // A bad path fails loud (the client shows its `[image: …]` placeholder) — never a
+    // silent empty image.
+    let err = rpc
+        .request("nxvim_image_read", vec![Value::from("/no/such/img.png")])
+        .await;
+    assert!(
+        err.is_err(),
+        "nxvim_image_read fails loud on an unreadable path (got {err:?})"
+    );
+}
+
+#[tokio::test]
 async fn image_file_opens_as_text_when_disabled() {
     let (rpc, mut incoming) = start().await;
     let path = write_temp("imgtext", "png", "PNGPLACEHOLDER\n");

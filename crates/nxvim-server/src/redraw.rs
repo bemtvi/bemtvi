@@ -389,6 +389,13 @@ impl EditHost {
                         // re-decodes when the file changed on disk.
                         (Value::from("size"), Value::from(img.size)),
                         (Value::from("mtime_ms"), Value::from(img.mtime_ms)),
+                        // Whether the bytes live on a remote daemon. In a daemon
+                        // (`:connect`) session the editor — and so this path — is
+                        // local, but the file is on the daemon's disk, which the
+                        // client can't open: it must fetch the bytes over the editor
+                        // RPC (`nxvim_image_read`) instead. An embedded session shares
+                        // the filesystem, so the client decodes `path` directly.
+                        (Value::from("remote"), Value::from(self.fx.has_remote_fs())),
                     ]),
                     None => Value::Nil,
                 },

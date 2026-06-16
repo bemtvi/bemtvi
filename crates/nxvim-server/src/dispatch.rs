@@ -34,6 +34,20 @@ impl EditHost {
         self.editor.set_now_ms(self.mouse_stamp_ms());
         match message {
             Incoming::Request { id, method, params } => {
+                // `nxvim_image_read` is answered off-tick (a daemon round-trip for a
+                // remote image preview's bytes), so it bypasses the synchronous
+                // `dispatch`: the read runs on a spawned task that `respond`s the msgid
+                // directly. No editor state changes, so no feedkeys drain / repaint.
+                #[cfg(feature = "native")]
+                if method == "nxvim_image_read" {
+                    match params.first().and_then(Value::as_str) {
+                        Some(path) => self.fx.image_read(id, path.to_string()),
+                        None => self
+                            .fx
+                            .respond(id, Err(Value::from("nxvim_image_read: missing path"))),
+                    }
+                    return;
+                }
                 match self.dispatch(&method, &params) {
                     Ok(value) => self.fx.respond(id, Ok(value)),
                     Err(err) => self.fx.respond(id, Err(Value::from(err))),

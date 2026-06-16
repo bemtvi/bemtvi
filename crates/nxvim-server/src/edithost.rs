@@ -97,6 +97,19 @@ pub trait HostEffects {
     /// file). A no-op without a daemon fs.
     fn fs_unwatch(&mut self, path: String);
 
+    /// Read an image preview's bytes for a *native* client that can't reach them on
+    /// its own disk — a daemon (`:connect`) session, where the file lives on the
+    /// remote host while the editor (and so the marker's `path`) runs local. Reads
+    /// `path` through the off-tick fs (the daemon) when one is wired, else local disk,
+    /// then *responds* to request `id` with the raw bytes (`Value::Binary`) or a loud
+    /// error (a missing path / directory / read failure → the client paints its
+    /// `[image: …]` placeholder). Fire-and-forget: the read runs off-tick and answers
+    /// the msgid directly, so a slow remote fetch never freezes the editor tick.
+    /// Native-only — the wasm Worker fetches preview bytes through its own JS seam
+    /// (`image_read` → daemon/OPFS), never this RPC.
+    #[cfg(feature = "native")]
+    fn image_read(&mut self, id: u64, path: String);
+
     /// Whether a daemon (off-tick) filesystem is wired. Gates the editor tick's remote
     /// vs. local branches — the remote watch arming in `sync_buffer_watches` and the
     /// off-tick open/save drains.
@@ -326,6 +339,32 @@ impl HostEffects for NativeEffects {
         self.host_fs_async.is_some()
     }
 
+    fn image_read(&mut self, id: u64, path: String) {
+        // Answer the request off-tick: clone the cloneable RPC handle so the spawned
+        // task can `respond` by msgid once the read resolves, without holding the
+        // editor tick. A daemon session reads over the wire (`host_fs_async`); a local
+        // session reads its own disk (the native client could open the path itself,
+        // but routing through the server keeps a single code path and one decode seam).
+        let rpc = self.rpc.clone();
+        match self.host_fs_async.clone() {
+            Some(fs) => {
+                tokio::spawn(async move {
+                    let reply = image_bytes(&path, fs.read(path.clone()).await);
+                    rpc.respond(id, reply);
+                });
+            }
+            None => {
+                tokio::spawn(async move {
+                    let reply = tokio::fs::read(&path)
+                        .await
+                        .map(Value::Binary)
+                        .map_err(|e| Value::from(format!("nxvim_image_read: {path}: {e}")));
+                    rpc.respond(id, reply);
+                });
+            }
+        }
+    }
+
     fn lsp_ensure(&mut self, key: ServerKey, spawn: ServerSpawn) {
         self.lsp.ensure_server(key, spawn);
     }
@@ -347,5 +386,25 @@ impl HostEffects for NativeEffects {
             // there's nothing to report to.
             let _ = tx.send((lang, result));
         });
+    }
+}
+
+/// Project a daemon [`FsRead`] (the off-tick read result for an `nxvim_image_read`)
+/// onto the request reply: a file's bytes become the `Value::Binary` answer; a
+/// missing path, a directory, or a read error become a loud error string the client
+/// shows as its `[image: …]` placeholder. (A preview only ever points at a file, so
+/// `New`/`Dir` here mean the file vanished or the path is wrong — never a silent
+/// empty image.)
+#[cfg(feature = "native")]
+fn image_bytes(path: &str, result: io::Result<FsRead>) -> Result<Value, Value> {
+    match result {
+        Ok(FsRead::File(bytes)) => Ok(Value::Binary(bytes)),
+        Ok(FsRead::New) => Err(Value::from(format!(
+            "nxvim_image_read: {path}: no such file"
+        ))),
+        Ok(FsRead::Dir { .. }) => Err(Value::from(format!(
+            "nxvim_image_read: {path}: is a directory"
+        ))),
+        Err(e) => Err(Value::from(format!("nxvim_image_read: {path}: {e}"))),
     }
 }

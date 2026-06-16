@@ -27,7 +27,10 @@ use std::time::Duration;
 use nxvim_core::{DirEntry, FileStat, HostFs};
 use nxvim_rpc::{Incoming, Rpc};
 use nxvim_server::{RemoteHostFs, ServerInit};
-use nxvim_test_harness::{attach, buf_lines, exec_lua, spawn};
+use nxvim_test_harness::{
+    attach, buf_lines, command, exec_lua, map_get, spawn, wait_redraw, window0_field,
+};
+use rmpv::Value;
 use tokio::sync::mpsc::UnboundedReceiver;
 
 /// An in-memory [`HostFs`] for the **daemon** side: path → bytes. Unlike a generic
@@ -179,5 +182,51 @@ async fn missing_path_opens_a_new_file_buffer() {
         buf_lines(&rpc, 0).await,
         vec![""],
         "a new-file buffer is empty, not an error or stale content"
+    );
+}
+
+/// In a daemon session an image preview's bytes live on the remote host, so the
+/// redraw marks the marker `remote = true` and the native client fetches the bytes
+/// over `nxvim_image_read` — content from a `/virtual/...` path the edit-host's local
+/// disk can't read, so it can only have crossed the daemon wire. (The editor — and so
+/// the marker's `path` — runs local; only the bytes are remote.)
+#[tokio::test]
+async fn image_preview_is_remote_and_bytes_fetch_over_the_wire() {
+    let fake = DaemonFs::with("/virtual/note.txt", "plain\n");
+    fake.files
+        .lock()
+        .unwrap()
+        .insert(PathBuf::from("/virtual/pic.png"), b"PNGBYTES\n".to_vec());
+    // Open a plain buffer at startup, enable previews, then edit the remote image.
+    let (rpc, mut incoming) = spawn_with_daemon_fs(fake, "/virtual/note.txt").await;
+    exec_lua(&rpc, "nx.o.imagepreview = true").await;
+    command(&rpc, "edit /virtual/pic.png").await;
+
+    let frame = wait_redraw(&mut incoming, |m| {
+        matches!(window0_field(m, "image"), Some(Value::Map(_)))
+    })
+    .await;
+    let Some(Value::Map(img)) = window0_field(&frame, "image") else {
+        panic!("the redraw window carries an image marker");
+    };
+    assert_eq!(
+        map_get(img, "path").and_then(Value::as_str),
+        Some("/virtual/pic.png"),
+        "the marker carries the remote image path"
+    );
+    assert_eq!(
+        map_get(img, "remote").and_then(Value::as_bool),
+        Some(true),
+        "a daemon session marks the image preview remote"
+    );
+
+    let reply = rpc
+        .request("nxvim_image_read", vec![Value::from("/virtual/pic.png")])
+        .await
+        .expect("nxvim_image_read responds");
+    assert_eq!(
+        reply,
+        Value::Binary(b"PNGBYTES\n".to_vec()),
+        "nxvim_image_read returns the bytes the daemon served over the wire"
     );
 }

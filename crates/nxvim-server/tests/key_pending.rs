@@ -13,7 +13,7 @@
 
 use nxvim_rpc::{Incoming, Rpc};
 use nxvim_server::ServerInit;
-use nxvim_test_harness::{exec_lua, feed, start_attached};
+use nxvim_test_harness::{barrier, exec_lua, feed, start_attached};
 use rmpv::Value;
 use tokio::sync::mpsc::UnboundedReceiver;
 
@@ -206,6 +206,22 @@ async fn native_default_continuations_carry_descriptions() {
         events(&rpc).await,
         "n|g|D/Go to declaration/map,d/Go to definition/map,r/Find references/map"
     );
+}
+
+/// A withheld prefix inside a **grabbing widget** lists *that widget's* keys
+/// (source C), not the editing buffer's — the oracle computes continuations from the
+/// active widget bucket. With a panel open, its built-in `gg` (a two-key `panel`
+/// map) withholds on `g` and the event reports `mode = "panel"` with the panel's
+/// continuation and its description.
+#[tokio::test]
+async fn widget_prefix_lists_the_active_widgets_keys() {
+    let (rpc, _incoming) = start().await;
+    exec_lua(&rpc, RECORDER).await;
+    // Open a panel (its `gg` -> first is a two-key default map in the `panel` bucket).
+    exec_lua(&rpc, "vim.panel.open('P', { 'aaa', 'bbb', 'ccc' })").await;
+    barrier(&rpc).await;
+    feed(&rpc, "g"); // withholds the panel's `gg` prefix
+    assert_eq!(events(&rpc).await, "panel|g|g/First line/map");
 }
 
 /// With no `nx.on_key_pending` listener registered the editor still maps + fires

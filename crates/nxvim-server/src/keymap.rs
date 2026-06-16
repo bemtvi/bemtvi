@@ -79,6 +79,22 @@ impl MatchScope {
             MatchScope::Widget(_) => None,
         }
     }
+
+    /// The readable mode code reported to the [`KeyPending`] event (which-key) — the
+    /// editor mode's short code for an editing scope, or the widget's keymap mode
+    /// name for a widget scope, so a which-key consumer can tell it is showing a
+    /// picker / select / panel / explorer key table. The widget arm is the inverse of
+    /// [`mode_buckets`] / [`widget_bucket`] and must stay in sync with them.
+    pub fn mode_code(self) -> &'static str {
+        match self {
+            MatchScope::Editing(mode) => mode.short_code(),
+            MatchScope::Widget('P') => "picker",
+            MatchScope::Widget('S') => "select",
+            MatchScope::Widget('L') => "panel",
+            MatchScope::Widget('E') => "explorer",
+            MatchScope::Widget(_) => "",
+        }
+    }
 }
 
 /// The keymap bucket char a grabbing-widget [`KeyContext`] routes through, or `None`
@@ -509,22 +525,25 @@ impl Keymaps {
         self.pending.is_empty()
     }
 
-    /// The live pending key-context for `mode` (the **`KeyPending`** oracle), or
+    /// The live pending key-context for `scope` (the **`KeyPending`** oracle), or
     /// `None` when nothing is withheld — the withheld prefix plus its continuations
     /// from the current buffer's mapped-prefix trie. A `None` (empty `pending`) tells
     /// the caller there is no active prefix, which it emits as a *cleared* event so a
     /// which-key popup closes. Computed against the current trie, so it already
     /// reflects buffer-local maps and the precedence ladder the matcher matches on.
-    pub fn pending_context(&self, mode: Mode) -> Option<KeyPending> {
+    /// `scope` selects the bucket so a grabbing widget's prefix lists *its* keys
+    /// (source C) — a multi-key `picker`/`panel`/… map shows under that widget — while
+    /// an editing scope lists the per-mode keys as before.
+    pub fn pending_context(&self, scope: MatchScope) -> Option<KeyPending> {
         if self.pending.is_empty() {
             return None;
         }
         let continuations = self
             .tries
-            .get(&mode_key(mode))?
+            .get(&scope.bucket())?
             .continuations(&self.pending)?;
         Some(KeyPending {
-            mode: mode.short_code().to_string(),
+            mode: scope.mode_code().to_string(),
             keys: self.pending.iter().copied().map(key_to_notation).collect(),
             continuations,
         })

@@ -1700,13 +1700,20 @@ impl EditHost {
         if !self.lua.has_key_pending_listeners() {
             return;
         }
-        let ctx = self.keymaps.pending_context(self.editor.mode);
+        // The scope a grabbing widget owns input in (its keymap bucket), else the
+        // buffer's editing mode — so a withheld widget prefix lists *that widget's*
+        // keys (source C), mirroring how `feed_matcher` picks the match scope.
+        let scope = match crate::keymap::widget_bucket(self.editor.key_context()) {
+            Some(bucket) => crate::keymap::MatchScope::Widget(bucket),
+            None => crate::keymap::MatchScope::Editing(self.editor.mode),
+        };
+        let ctx = self.keymaps.pending_context(scope);
         if ctx == self.last_key_pending {
             return;
         }
         self.last_key_pending = ctx.clone();
         // A cleared context (empty `pending`) is pushed as `keys = ""` with no
-        // continuations, in the mode it cleared in — a which-key popup reads that as
+        // continuations, in the scope it cleared in — a which-key popup reads that as
         // "close". A live context carries its prefix + continuations.
         let (mode, keys, conts) = match &ctx {
             Some(kp) => {
@@ -1717,7 +1724,7 @@ impl EditHost {
                     .collect();
                 (kp.mode.as_str(), kp.keys.as_str(), conts)
             }
-            None => (self.editor.mode.short_code(), "", Vec::new()),
+            None => (scope.mode_code(), "", Vec::new()),
         };
         if let Err(e) = self.lua.run_key_pending(mode, keys, &conts) {
             self.editor

@@ -1783,6 +1783,13 @@ where
     // place (this is what initializes a completion plugin's engine, its sources, etc.).
     host.source_plugins();
 
+    // The startup file arg was opened (as text) at editor construction, before the
+    // config above ran — so a config that turned on `'imagepreview'` couldn't affect
+    // that first open. Reconcile it now: if the startup buffer is an image and
+    // previews are on, reload it as a preview, matching what `:e` would do. (Runs
+    // before the lifecycle seed below, so the events fire over the final buffer.)
+    host.editor.reconcile_image_preview();
+
     // Startup seed: the initial buffer and the config's autocmds both exist now,
     // so fire the first buffer's lifecycle events (`BufReadPost`→`FileType`→
     // `BufEnter` for a file arg, `BufEnter` alone for the bare `[No Name]`).

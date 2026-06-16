@@ -8,7 +8,8 @@
 use nxvim_rpc::{Incoming, Rpc};
 use nxvim_server::ServerInit;
 use nxvim_test_harness::{
-    command, exec_lua, lines, map_get, start_attached, wait_redraw, window0_field, write_temp,
+    attach, command, exec_lua, lines, map_get, spawn, start_attached, temp_dir, wait_redraw,
+    window0_field, write_temp,
 };
 use rmpv::Value;
 use tokio::sync::mpsc::UnboundedReceiver;
@@ -72,5 +73,46 @@ async fn image_file_opens_as_text_when_disabled() {
     assert!(
         matches!(img, None | Some(Value::Nil)),
         "no image marker when imagepreview is off (got {img:?})"
+    );
+}
+
+#[tokio::test]
+async fn cli_file_arg_previews_after_config_enables_it() {
+    // The reported flow: `NXVIM_CONFIG=… nxvim photo.png`. The file arg is opened at
+    // editor construction — *before* the config runs — so previews are still off at
+    // that first open. A config that turns them on must still reconcile that buffer
+    // into a preview (otherwise it shows the raw bytes until a manual `:e %`).
+    let dir = temp_dir("imgcli");
+    std::fs::write(dir.join("init.lua"), "nx.o.imagepreview = true\n").expect("write init.lua");
+    let img = dir.join("pic.png");
+    std::fs::write(&img, "PNGPLACEHOLDER\n").expect("write image");
+    let img_path = img.to_string_lossy().into_owned();
+
+    let (rpc, mut incoming) = spawn(ServerInit {
+        file: Some(img_path.clone()),
+        config_dir: Some(dir.clone()),
+        runtimepath: vec![dir],
+        ..Default::default()
+    });
+    attach(&rpc, 80, 24).await;
+
+    // Reconciled to a preview after the config enabled it: the buffer is empty (bytes
+    // not loaded as text) and the redraw carries the image marker for the file arg.
+    assert_eq!(
+        lines(&rpc).await,
+        vec![String::new()],
+        "the startup file arg was reconciled to an image preview"
+    );
+    let frame = wait_redraw(&mut incoming, |m| {
+        matches!(window0_field(m, "image"), Some(Value::Map(_)))
+    })
+    .await;
+    let Some(Value::Map(im)) = window0_field(&frame, "image") else {
+        panic!("the startup redraw carries an image marker");
+    };
+    assert_eq!(
+        map_get(im, "path").and_then(Value::as_str),
+        Some(img_path.as_str()),
+        "the marker carries the file-arg path"
     );
 }

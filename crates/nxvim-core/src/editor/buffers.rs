@@ -871,6 +871,22 @@ impl Editor {
         self.options.autoread
     }
 
+    /// Reload the current buffer as an image preview when `'imagepreview'` got
+    /// turned on *after* it was already opened as text — the startup file-arg case.
+    /// The CLI file is opened at [`Editor`](crate::Editor) construction, before the
+    /// user's config runs, so a config that sets `nx.o.imagepreview` can't affect
+    /// that first open; the server calls this once after sourcing config to bring it
+    /// in line with what `:e %` would now do. A no-op unless previews are on, the
+    /// buffer is a known image extension ([`crate::editor::is_image_path`]), and it
+    /// isn't already a preview.
+    pub fn reconcile_image_preview(&mut self) {
+        let b = self.buffer();
+        if self.options.imagepreview && !b.image && super::is_image_path(b.path.as_deref()) {
+            let id = self.cur_buffer();
+            self.reload_buffer(id);
+        }
+    }
+
     /// Enqueue an off-tick re-fetch of buffer `id`'s own file into itself — the daemon
     /// reload the remote watch leg drives (the off-tick analogue of
     /// [`Editor::reload_buffer`], which reads the *local* disk synchronously). The

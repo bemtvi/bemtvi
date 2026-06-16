@@ -184,10 +184,14 @@ is the `nx.complete` `menu_generation()` gating, re-keyed per window.
    N consecutive failures (neovim's `CB_MAX_ERROR = 3` analog) — matching the
    no-silent-stubs convention. Phase 4.
 
-8. **Async providers are fine.** `on_range` may `nx.spawn`/`nx.lsp` and call
-   `publish` from the callback; the gen token makes a late response safe to fold or
-   drop. The publish queue + gen-gate already handle out-of-order arrival; no extra
-   machinery. Phase 4 adds the test.
+8. **Async providers are fine.** `on_range` may kick off async work
+   (`nx.run(...):next(…)` for a one-shot, `nx.lsp`, a `nx.run_stream` +
+   `nx.await_each` loop) and call `publish` from the continuation; the gen token makes
+   a late response safe to fold or drop. The publish queue is drained every
+   `run_pending` round (in `apply_lua_effects`, not only on the dispatch round), and
+   the gen-gate handles out-of-order arrival — so a publish from a later tick already
+   works with no extra machinery. (`nx.spawn` was retired in the promise-only async
+   move; providers use the promise/async-iterator surface.) Phase 4 adds the test.
 
 ## Phases
 
@@ -239,7 +243,39 @@ Original plan for this phase:
   the dispatch, and per-window coalescing. (Publishes are queued but not yet
   applied.)
 
-### Phase 3 — The publish path → render (end-to-end)
+### Phase 3 — The publish path → render (end-to-end) ✅ DONE (2026-06-16)
+
+> Landed: `publish(marks)` (in `prelude/decor.lua`) now splits the normalized marks
+> into parallel arrays and calls the new `nx._decor_publish(ns, gen, win, buf, rows,
+> cols, end_rows, end_cols, hls, priorities)` funnel (`install.rs`), which queues a
+> [`DecorPublish`] (`ops.rs`) on `Shared.decor_publishes` (drained by
+> `take_decor_publishes`, `runtime.rs`). The server drains it in `apply_lua_effects`
+> (so a sync *or* a later async publish both land) → `EditHost::apply_decor_publish`
+> (`effects.rs`): drop if `publish.gen != editor.decor_generation(win)`, else
+> `apply_extmark_op(Clear{ ns, whole })` + one `Set` per mark (ids restart at 1,
+> `priority` defaults to `DEFAULT_PRIORITY`). Marks fold into the existing extmark
+> projection and paint next redraw, merged at priority order with treesitter/semantic
+> spans. **One Phase-1 gap fixed in passing:** the viewport key now carries the
+> buffer `changedtick` (`editor/decor.rs`), so an on-screen edit that leaves `top`/`bot`
+> unchanged (typing a bracket) still re-dispatches — without it a fresh bracket stayed
+> uncoloured until the next scroll. **Startup paint fixed:** `nvim_ui_attach` /
+> `nvim_ui_try_resize` now drive `run_pending` after the resize — the resize assigns the
+> first window rect (so a provider's viewport is only then known), and without the drain
+> the providers weren't dispatched until the first keystroke, so a fresh session opened
+> uncoloured until you pressed a key. **v1 hl-only made loud:** `normalize_mark` rejects
+> a mark with no `hl` (Decision 6) and defaults a same-line `end_col` to `end_row =
+> row` (the spec's rainbow shape). Flagship `examples/rainbow/` (init + bracket-dense
+> sample) verified end-to-end. Tested black-box in `nxvim-server/tests/decor.rs`:
+> a fresh session colours on the **first frame with no keypress** (the startup path,
+> file opened at boot — times out without the attach drain); rainbow `hl` spans land
+> on the right cells; an on-screen edit re-colours without scrolling; scrolling colours
+> newly-revealed lines; a hand-issued stale-gen publish paints nothing while the
+> live-gen one does; the real example colours its sample.
+> Builds + tests clean on `native` and `--no-default-features`; `fmt` / `clippy -D
+> warnings` clean.
+
+Original plan for this phase:
+
 - Server drains `take_decor_publishes()` in `run_pending` (after the provide pass,
   same fixpoint round): drop if `pub.gen != editor.decor_gen(pub.win)`; else
   `apply_extmark_op(Clear{ buf, ns, whole })` then one `Set` per mark
@@ -254,8 +290,9 @@ Original plan for this phase:
   nothing.
 
 ### Phase 4 — Async, robustness, polish, wasm parity
-- Async provider test (publish from an `nx.spawn`/`nx.lsp` callback; gen gates a
-  late response). Time-debounce a scroll gesture (Decision 2) — **reuse
+- Async provider test (publish from an `nx.run(...):next(…)` / `nx.lsp` continuation —
+  the promise-only async surface, `nx.spawn` is gone; gen gates a late response).
+  Time-debounce a scroll gesture (Decision 2) — **reuse
   `nx.utils.debounce`** (landed upstream 2026-06-16, `prelude/utils.lua`) rather than
   hand-rolling the cancel-prior-timer dance over `nx.timer`; the per-window
   coalescing in Phase 1 already collapses changes between two drains, so this only

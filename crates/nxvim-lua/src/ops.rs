@@ -1033,6 +1033,38 @@ pub struct PickerPush {
     pub preview: Option<PreviewPush>,
 }
 
+/// One mark a `nx.decor` provider published — extmark-shaped, in **buffer**
+/// (not viewport-relative) 0-based `(row, col)` coordinates. `end_row`/`end_col`
+/// bound a range mark (both absent ⇒ a point mark, which renders nothing in v1);
+/// `hl` is the highlight group v1 paints (the Lua side rejects a mark that carries
+/// no `hl`, since nothing else is plumbed to render yet); `priority` overrides the
+/// default extmark priority when set. Carried in batch by [`DecorPublish`].
+#[derive(Clone, Debug)]
+pub struct DecorMark {
+    pub row: i64,
+    pub col: i64,
+    pub end_row: Option<i64>,
+    pub end_col: Option<i64>,
+    pub hl: Option<String>,
+    pub priority: Option<u32>,
+}
+
+/// A batch of marks a `nx.decor` provider published for one window's viewport
+/// (`nx._decor_publish`), stamped with the viewport `gen`eration so the server can
+/// drop it if the window scrolled past since the dispatch (the stale-drop, Decision
+/// 4). `ns` is the provider's own namespace — a republish clears it wholesale and
+/// re-sets `marks` (Decision 3); `win` is gen-checked and `buf` is where the marks
+/// land in the extmark layer. Queued in [`crate::runtime::Shared::decor_publishes`].
+/// Phase 3 of `nx.decor`.
+#[derive(Clone, Debug)]
+pub struct DecorPublish {
+    pub ns: u32,
+    pub gen: u64,
+    pub win: u64,
+    pub buf: u64,
+    pub marks: Vec<DecorMark>,
+}
+
 /// A `vim.fn.confirm(msg, choices, …)` request: open the command line as a
 /// single-key button dialog showing `label` (the message plus the rendered
 /// buttons, already formatted by the Lua wrapper) and fire callback `cb_id` (a

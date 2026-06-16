@@ -68,6 +68,12 @@ impl EditHost {
                 let h = uint(params.get(1), 24);
                 self.ui = Some((w, h));
                 self.editor.resize(w, h);
+                // The resize assigns the window its first rect, so a `nx.decor`
+                // provider's viewport is only now known. Drive `run_pending` to
+                // dispatch it (and any other off-tick work the size change queued)
+                // before `handle` paints the first frame — otherwise the marks
+                // wouldn't appear until the first keystroke.
+                self.run_pending();
                 Ok(Value::Nil)
             }
             "nvim_ui_try_resize" => {
@@ -75,6 +81,9 @@ impl EditHost {
                 let h = uint(params.get(1), 24);
                 self.ui = Some((w, h));
                 self.editor.resize(w, h);
+                // A resize moves every window's visible range; redispatch decor
+                // providers (and drain any queued work) before the repaint.
+                self.run_pending();
                 Ok(Value::Nil)
             }
             "nvim_input" => {

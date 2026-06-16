@@ -16,11 +16,12 @@ use crate::convert::{json_to_lua, lua_int, lua_to_rmpv};
 use crate::host::seed_package_path;
 use crate::install::{install_runtime_api, install_vim, PANEL_ON_SELECT};
 use crate::ops::{
-    BufOp, CallbackArgs, CompletePush, CompleteSetupReq, ConfirmReq, DiagnosticData, DockOp,
-    ExtmarkOp, FeedKeysOp, GlobalOptionOp, HlSet, InlayHintMirrorData, LoopOp, LspClientData,
-    LspOp, PanelOp, PickerOpenReq, PickerPush, QfSetOp, RawKeymap, RawRhs, RegisterSetOp,
-    SemanticTokenData, SnippetAddReq, SnippetSetupReq, StatuslinePublishReq, StatuslineSetupReq,
-    TabOp, TerminalOpenReq, TsOp, UiFloatReq, UiInputReq, UiSelectReq, WindowOp,
+    BufOp, CallbackArgs, CompletePush, CompleteSetupReq, ConfirmReq, DecorPublish, DiagnosticData,
+    DockOp, ExtmarkOp, FeedKeysOp, GlobalOptionOp, HlSet, InlayHintMirrorData, LoopOp,
+    LspClientData, LspOp, PanelOp, PickerOpenReq, PickerPush, QfSetOp, RawKeymap, RawRhs,
+    RegisterSetOp, SemanticTokenData, SnippetAddReq, SnippetSetupReq, StatuslinePublishReq,
+    StatuslineSetupReq, TabOp, TerminalOpenReq, TsOp, UiFloatReq, UiInputReq, UiSelectReq,
+    WindowOp,
 };
 
 /// `skip_serializing_if` predicate: drop a `false` flag from the serialized
@@ -504,6 +505,11 @@ pub(crate) struct Shared {
     /// drained by the server into `Editor::apply_select_action` — the rebindable
     /// `nx.ui.select` keys (next / prev / first / last / confirm / cancel).
     pub(crate) select_actions: Vec<String>,
+    /// Marks a `nx.decor` provider published for a window's viewport
+    /// (`nx._decor_publish`), drained by the server (generation-gated) into the
+    /// provider's namespace in the extmark layer. Empty for a no-provider config.
+    /// Phase 3 of `nx.decor`.
+    pub(crate) decor_publishes: Vec<DecorPublish>,
     /// Whether any `nx.decor` provider has been registered (`nx._decor_register`).
     /// The gate the server checks before dispatching a viewport-change signal: while
     /// no provider is set it skips the whole off-tick decor path (never slices the
@@ -957,6 +963,12 @@ impl LuaRuntime {
         /// Take the completion generations whose async sources have all finished
         /// since the last drain, for the server to close a confirmed-empty popup.
         take_complete_finishes -> Vec<u64> = complete_finishes
+    }
+
+    take_queue! {
+        /// Take the marks `nx.decor` providers published since the last drain, for
+        /// the server to apply (generation-gated) into each provider's namespace.
+        take_decor_publishes -> Vec<DecorPublish> = decor_publishes
     }
 
     take_queue! {

@@ -87,17 +87,38 @@ end
 -- Normalize one published mark into the canonical form the extmark layer takes
 -- (Phase 3 lowers it): `row`/`col` may be positional (`{ row, col, ... }`) or named
 -- (`{ row = R, col = C }`). A mark without numeric row/col fails loud (no silent skip).
+-- v1 renders `hl` only (the spec's hl-only rainbow example); `virt_text`/`sign`/
+-- `conceal` are not plumbed yet, so a mark with no `hl` can render nothing — rather
+-- than silently no-op (CLAUDE.md: no silent stubs) that mark fails loud here, routing
+-- through the provider-error path (Decision 6).
 local function normalize_mark(m, name)
   local row = m[1] or m.row
   local col = m[2] or m.col
   if type(row) ~= "number" or type(col) ~= "number" then
     error("nx.decor provider '" .. name .. "': each mark needs a numeric row and col", 0)
   end
+  if type(m.hl) ~= "string" then
+    error(
+      "nx.decor provider '" .. name .. "': each mark needs an `hl` group (v1 renders hl only)",
+      0
+    )
+  end
+  -- A decoration range needs both end coordinates to render (the extmark layer skips
+  -- a point mark). The flagship shape gives only `end_col` for a same-line span — the
+  -- spec's rainbow example does — so default the missing end coordinate to the start:
+  -- `end_col` alone ⇒ the range `[col, end_col)` on `row`; `end_row` alone ⇒ `[col, col)`
+  -- across rows. A mark with neither stays a point mark (accepted, renders nothing).
+  local end_row, end_col = m.end_row, m.end_col
+  if end_col ~= nil and end_row == nil then
+    end_row = row
+  elseif end_row ~= nil and end_col == nil then
+    end_col = col
+  end
   return {
     row = row,
     col = col,
-    end_row = m.end_row,
-    end_col = m.end_col,
+    end_row = end_row,
+    end_col = end_col,
     hl = m.hl,
     priority = m.priority,
   }
@@ -106,9 +127,10 @@ end
 -- nx._decor_dispatch(ctx): the server calls this off-tick, once per visible-range
 -- change, with ctx = { win, buf, top, bot, lines, filetype, gen }. Runs each matching
 -- provider's on_range(ctx, publish), isolating a throwing provider (surfaced, never
--- wedges the dispatch). `publish(marks)` normalizes the marks and (Phase 2) records
--- the latest set for inspection; Phase 3 lowers them into the provider's namespace,
--- gen-gated, so a publish from a stale viewport is dropped.
+-- wedges the dispatch). `publish(marks)` normalizes the marks and lowers them into the
+-- provider's namespace via `nx._decor_publish` (carrying `ctx.gen`, so the server drops
+-- a publish from a viewport the user already scrolled past). It also records the latest
+-- set on `nx._decor.last` for inspection / tests.
 function nx._decor_dispatch(ctx)
   for _, p in ipairs(nx._decor.providers) do
     if decor_matches(p, ctx) then
@@ -117,11 +139,24 @@ function nx._decor_dispatch(ctx)
         if type(marks) ~= "table" then
           error("nx.decor provider '" .. p.name .. "': publish expects a list of marks", 0)
         end
+        -- Normalize into the extmark-shaped form, then split into the parallel arrays
+        -- the funnel takes (one bridge crossing per publish, not one per mark). The
+        -- optional fields ride sentinels the Rust side reads back: -1 ⇒ unset for
+        -- end_row/end_col/priority, "" ⇒ no hl.
         local out = {}
+        local rows, cols, end_rows, end_cols, hls, prios = {}, {}, {}, {}, {}, {}
         for i = 1, #marks do
-          out[i] = normalize_mark(marks[i], p.name)
+          local m = normalize_mark(marks[i], p.name)
+          out[i] = m
+          rows[i] = m.row
+          cols[i] = m.col
+          end_rows[i] = m.end_row or -1
+          end_cols[i] = m.end_col or -1
+          hls[i] = m.hl or ""
+          prios[i] = m.priority or -1
         end
         nx._decor.last = { name = p.name, gen = gen, marks = out }
+        nx._decor_publish(p.ns, gen, ctx.win, ctx.buf, rows, cols, end_rows, end_cols, hls, prios)
       end
       local ok, err = pcall(p.on_range, ctx, publish)
       if not ok then

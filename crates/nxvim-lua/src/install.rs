@@ -19,9 +19,9 @@ use crate::convert::{
 };
 use crate::host::{create_dir_all_mode, get_runtime_file, glob_paths, parse_mode, stdpath};
 use crate::ops::{
-    BufOp, CompletePush, CompleteSetupReq, ConfirmReq, DockOp, ExtmarkOp, FeedKeysOp,
-    GlobalOptionOp, HlSet, LoopOp, LspOp, OptionValue, PanelOp, PickerOpenReq, PickerPush,
-    PreviewPush, QfItem, QfSetOp, RegisterSetOp, SnippetAddReq, SnippetSetupReq,
+    BufOp, CompletePush, CompleteSetupReq, ConfirmReq, DecorMark, DecorPublish, DockOp, ExtmarkOp,
+    FeedKeysOp, GlobalOptionOp, HlSet, LoopOp, LspOp, OptionValue, PanelOp, PickerOpenReq,
+    PickerPush, PreviewPush, QfItem, QfSetOp, RegisterSetOp, SnippetAddReq, SnippetSetupReq,
     StatuslinePublishReq, StatuslineSetupReq, TabOp, TerminalOpenReq, TsOp, UiFloatReq, UiInputReq,
     UiSelectReq, WindowOp,
 };
@@ -1655,6 +1655,57 @@ pub(crate) fn install_runtime_api(
             sh.borrow_mut().key_pending_active = true;
             Ok(())
         })?,
+    )?;
+
+    // `nx._decor_publish(ns, gen, win, buf, rows, cols, end_rows, end_cols, hls,
+    // priorities)`: queue the marks a provider published for one window's viewport
+    // ([`DecorPublish`]) — parallel arrays in **buffer** 0-based coordinates, stamped
+    // with the viewport `gen`. Sentinels in the optional arrays mark an unset field:
+    // `end_row`/`end_col`/`priority` of `-1` ⇒ absent, `hl` of `""` ⇒ none. The server
+    // gen-gates the batch (drops it if the window scrolled past since the dispatch),
+    // then clears the provider's `ns` on `buf` and re-sets these marks into the extmark
+    // layer (a republish replaces the prior viewport's marks wholesale). Phase 3 of
+    // `nx.decor`.
+    type DecorPublishArgs = (
+        u32,
+        u64,
+        u64,
+        u64,
+        Vec<i64>,
+        Vec<i64>,
+        Vec<i64>,
+        Vec<i64>,
+        Vec<String>,
+        Vec<i64>,
+    );
+    let sh = shared.clone();
+    nx.set(
+        "_decor_publish",
+        lua.create_function(
+            move |_,
+                  (ns, gen, win, buf, rows, cols, end_rows, end_cols, hls, priorities): DecorPublishArgs| {
+                let marks = rows
+                    .iter()
+                    .enumerate()
+                    .map(|(i, &row)| DecorMark {
+                        row,
+                        col: cols.get(i).copied().unwrap_or(0),
+                        end_row: end_rows.get(i).copied().filter(|&r| r >= 0),
+                        end_col: end_cols.get(i).copied().filter(|&c| c >= 0),
+                        hl: hls.get(i).filter(|h| !h.is_empty()).cloned(),
+                        priority: priorities.get(i).copied().filter(|&p| p >= 0).map(|p| p as u32),
+                    })
+                    .collect();
+                sh.borrow_mut().decor_publishes.push(DecorPublish {
+                    ns,
+                    gen,
+                    win,
+                    buf,
+                    marks,
+                });
+                Ok(())
+            },
+        )?,
     )?;
 
     // `nx._confirm(label, accelerators, default, cb_id)`: queue a `vim.fn.confirm`

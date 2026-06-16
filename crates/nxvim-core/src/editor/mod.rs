@@ -952,10 +952,13 @@ pub struct Editor {
     pending_scroll: Option<PendingScroll>,
 
     /// `nx.decor` viewport-changed signal (`editor/decor.rs`). Last-seen
-    /// `(buffer, top, bot)` per visible window — recomputed when input settles; a
-    /// diff bumps `decor_gen[win]` and queues a [`decor::DecorViewport`] in
-    /// `decor_dirty` for the server to dispatch to matching providers off-tick.
-    decor_viewports: HashMap<WindowId, (BufferId, usize, usize)>,
+    /// `(buffer, top, bot, changedtick)` per visible window — recomputed when input
+    /// settles; a diff bumps `decor_gen[win]` and queues a [`decor::DecorViewport`] in
+    /// `decor_dirty` for the server to dispatch to matching providers off-tick. The
+    /// `changedtick` is in the key so an edit *within* the visible range (typing a
+    /// bracket on screen — no scroll, same `top`/`bot`) still re-dispatches; a
+    /// provider's snapshot would otherwise go stale until the next scroll.
+    decor_viewports: HashMap<WindowId, (BufferId, usize, usize, u64)>,
     /// Per-window viewport generation, bumped on every visible-range change; a
     /// decor publish carries the generation it was computed for and is dropped at
     /// apply time unless it still matches (the viewport hasn't moved since).

@@ -13,9 +13,9 @@ use nxvim_core::{
     QfAction, QfEntry, QfWhich, TabId, UndoEntry, UndoTreeView, WindowConfigSpec, WindowId,
 };
 use nxvim_lua::{
-    BoMirror, BufBytesEdit, BufMirror, BufOp, CallbackArgs, DockOp, ExtmarkMirror, ExtmarkOp,
-    FloatMirror, GoMirror, HlDefMirror, HlSet, JumpMirror, LoopOp, OptionValue, PanelOp, QfItem,
-    QfMirror, TabMirror, TabOp, TsOp, WindowMirror, WindowOp,
+    BoMirror, BufBytesEdit, BufMirror, BufOp, CallbackArgs, DecorPublish, DockOp, ExtmarkMirror,
+    ExtmarkOp, FloatMirror, GoMirror, HlDefMirror, HlSet, JumpMirror, LoopOp, OptionValue, PanelOp,
+    QfItem, QfMirror, TabMirror, TabOp, TsOp, WindowMirror, WindowOp,
 };
 use rmpv::Value;
 use std::collections::HashSet;
@@ -288,6 +288,13 @@ impl EditHost {
         // `nx._extmarks` mirror.
         for op in self.lua.take_extmark_ops() {
             self.apply_extmark_op(op);
+        }
+        // nx.decor publishes: marks a viewport provider produced for a window's
+        // visible range (Phase 3). Generation-gated and lowered into the provider's
+        // namespace in the extmark layer (drained here so an async provider that
+        // publishes from a later off-tick round still lands).
+        for publish in self.lua.take_decor_publishes() {
+            self.apply_decor_publish(publish);
         }
         // Window mutations from the `vim.api.nvim_win_*` family (Phase 5): applied
         // to the live editor after the chunk. Their `WinNew`/`WinEnter`/… autocmds
@@ -1653,6 +1660,40 @@ impl EditHost {
                 .echo(format!("E5108: Error in nx.on_key_pending handler: {e}"));
         }
         self.apply_lua_effects();
+    }
+
+    /// Lower one [`DecorPublish`] into the extmark layer (Phase 3 of `nx.decor`).
+    /// First the **stale-drop**: if the window's viewport generation has moved on
+    /// since this batch was dispatched (a newer scroll superseded it), painting it
+    /// would show marks for a range the user already left, so it is dropped before
+    /// any mutation (Decision 4). Otherwise the provider's namespace is cleared on the
+    /// buffer and the fresh batch set into it — a republish replaces the prior
+    /// viewport's marks wholesale (Decision 3). Ids restart at `1` each publish (the
+    /// namespace is empty after the clear); a mark without a `priority` takes the
+    /// default extmark priority, so it paints over treesitter/semantic spans.
+    fn apply_decor_publish(&mut self, publish: DecorPublish) {
+        if publish.gen != self.editor.decor_generation(WindowId(publish.win)) {
+            return;
+        }
+        self.apply_extmark_op(ExtmarkOp::Clear {
+            bufnr: publish.buf,
+            ns: publish.ns,
+            line_start: 0,
+            line_end: -1,
+        });
+        for (i, mark) in publish.marks.into_iter().enumerate() {
+            self.apply_extmark_op(ExtmarkOp::Set {
+                bufnr: publish.buf,
+                ns: publish.ns,
+                id: i as u64 + 1,
+                row: mark.row,
+                col: mark.col,
+                end_row: mark.end_row,
+                end_col: mark.end_col,
+                hl_group: mark.hl,
+                priority: mark.priority.unwrap_or(nxvim_core::DEFAULT_PRIORITY),
+            });
+        }
     }
 
     /// The settle contract for an off-tick event arm: drive every queued effect to

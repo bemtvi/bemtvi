@@ -52,11 +52,13 @@ impl Editor {
             };
             let top = self.window_top(win);
             let height = self.window_content_size(win).map_or(0, |(_, h)| h);
-            let last_line = self
-                .buffer_of(buf)
-                .map_or(0, |b| b.line_count().saturating_sub(1));
+            let (last_line, tick) = self.buffer_of(buf).map_or((0, 0), |b| {
+                (b.line_count().saturating_sub(1), b.changedtick)
+            });
             let bot = top.saturating_add(height.saturating_sub(1)).min(last_line);
-            let key = (buf, top, bot);
+            // `changedtick` is in the key so an on-screen edit that leaves top/bot
+            // unchanged (typing within the viewport) still re-dispatches the provider.
+            let key = (buf, top, bot, tick);
             if self.decor_viewports.get(&win) == Some(&key) {
                 continue;
             }

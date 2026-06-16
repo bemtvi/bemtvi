@@ -107,6 +107,62 @@ async fn a_throwing_timer_callback_does_not_wedge_the_loop() {
     assert_eq!(lua_bool(&rpc, "return _G.ok").await, Some(true));
 }
 
+// ----- nx.utils.debounce (trailing-edge debounce over nx.timer) --------------------
+
+#[tokio::test]
+async fn debounce_collapses_a_burst_to_one_trailing_call() {
+    let (rpc, _incoming) = start().await;
+    exec_lua(
+        &rpc,
+        "_G.n = 0\n\
+         _G.last = nil\n\
+         _G.d = nx.utils.debounce(function(x) _G.n = _G.n + 1; _G.last = x end, 40)\n\
+         _G.d('a'); _G.d('b'); _G.d('c')",
+    )
+    .await;
+    // Immediate: nothing ran inline — the burst is still pending.
+    assert_eq!(lua_u64(&rpc, "return _G.n").await, Some(0));
+    // Past the delay: exactly one trailing call, with the MOST RECENT arguments.
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    assert_eq!(lua_u64(&rpc, "return _G.n").await, Some(1));
+    assert_eq!(exec_lua(&rpc, "return _G.last").await.as_str(), Some("c"));
+}
+
+#[tokio::test]
+async fn debounce_cancel_drops_the_pending_call() {
+    let (rpc, _incoming) = start().await;
+    exec_lua(
+        &rpc,
+        "_G.n = 0\n\
+         _G.d = nx.utils.debounce(function() _G.n = _G.n + 1 end, 40)\n\
+         _G.d(); _G.d:cancel()",
+    )
+    .await;
+    // The pending call was cancelled — it never fires.
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    assert_eq!(lua_u64(&rpc, "return _G.n").await, Some(0));
+}
+
+#[tokio::test]
+async fn debounce_flush_runs_the_pending_call_now() {
+    let (rpc, _incoming) = start().await;
+    // A long delay so only :flush() can make it fire promptly.
+    exec_lua(
+        &rpc,
+        "_G.n = 0\n\
+         _G.last = nil\n\
+         _G.d = nx.utils.debounce(function(x) _G.n = _G.n + 1; _G.last = x end, 5000)\n\
+         _G.d('z'); _G.d:flush()",
+    )
+    .await;
+    // flush is synchronous: the call already ran, with its captured arguments.
+    assert_eq!(lua_u64(&rpc, "return _G.n").await, Some(1));
+    assert_eq!(exec_lua(&rpc, "return _G.last").await.as_str(), Some("z"));
+    // And flushing consumed the pending timer — no second, delayed fire.
+    tokio::time::sleep(Duration::from_millis(120)).await;
+    assert_eq!(lua_u64(&rpc, "return _G.n").await, Some(1));
+}
+
 // ----- Phase 3: async vim.system ---------------------------------------------
 
 // ----- Phase 4: robustness (leaks, schedule_wrap) ----------------------------

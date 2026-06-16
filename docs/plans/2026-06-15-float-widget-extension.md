@@ -158,9 +158,10 @@ shape, after working it through:
   `handle_picker_key`; the `<C-r>` register case). `KeyPending` must fire from the
   union of these, not the matcher alone, to match real which-key coverage.
 
-A general **`nx.debounce(fn, ms)`** helper (trailing-edge, with `:cancel()` /
-`:flush()`) lands alongside this — the first of the generally-useful helpers the
-`nx.*` surface exposes to plugin authors, not a which-key private.
+A general **`nx.utils.debounce(fn, ms)`** helper (trailing-edge, with `:cancel()`
+/ `:flush()`) lands alongside this in the new **`nx.utils`** namespace — the home
+for generally-useful helpers the `nx.*` surface exposes to plugin authors, not a
+which-key private.
 
 ## Testing (black-box, per the no-unit-test rule)
 

@@ -343,6 +343,9 @@ const PRELUDE_MODULES: &[(&str, &str)] = &[
     // nx.promise / nx.async — Promises/A+ over the microtask (nx.schedule) and
     // timer (nx.timer) primitives installed just above.
     ("nxvim:prelude/promise", include_str!("prelude/promise.lua")),
+    // nx.utils: the general helper namespace (nx.utils.debounce, …) — may build on
+    // the timer and promise surfaces loaded just above.
+    ("nxvim:prelude/utils", include_str!("prelude/utils.lua")),
     // nx.picker: the fuzzy finder (sources + open) over the float-list widget.
     ("nxvim:prelude/picker", include_str!("prelude/picker.lua")),
     // nx.complete: the native completion engine (Phase 4-A, buffer source).

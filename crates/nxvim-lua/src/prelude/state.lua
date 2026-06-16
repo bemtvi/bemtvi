@@ -251,6 +251,28 @@ nx._o_store = nx._o_store
     loadplugins = true,
   }
 
+-- A write of an option nxvim doesn't model (any scope) lands in the read/write
+-- catch-all `nx._o_store` — kept rather than rejected, so a neovim config or
+-- colorscheme that sets an option nxvim hasn't implemented (termguicolors,
+-- background, signcolumn, …) still loads instead of aborting at that line. But
+-- warn (once per name) so a genuine typo — `vim.o.numbr = true` — is *visible*
+-- rather than silently swallowed (and silently read back). `:set` rejects the same
+-- name outright with E518; `nx.o`/`vim.o`/`nx.opt`/`nx.go` are the lenient compat
+-- surface, so they warn-and-store instead of failing.
+local warned_unknown_opt = {}
+local function warn_unknown_opt(name)
+  if warned_unknown_opt[name] then
+    return
+  end
+  warned_unknown_opt[name] = true
+  nx.notify(
+    "nxvim: unknown option '"
+      .. tostring(name)
+      .. "' — stored but not applied (a typo, or an option nxvim doesn't model)",
+    nx.log.levels.WARN
+  )
+end
+
 local function o_get(k)
   if O_WIN[k] then
     return vim.wo[k]
@@ -286,6 +308,7 @@ local function o_set(k, v)
     nx._go_mirror[canon] = v
     return
   end
+  warn_unknown_opt(k)
   nx._o_store[k] = v
 end
 
@@ -685,6 +708,7 @@ local function go_set(k, v)
     nx._go_mirror[canon] = v
     return
   end
+  warn_unknown_opt(k)
   nx._o_store[k] = v
 end
 nx.go = setmetatable({}, {

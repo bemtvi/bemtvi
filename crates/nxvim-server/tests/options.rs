@@ -148,6 +148,43 @@ async fn guifont_defaults_empty() {
 }
 
 #[tokio::test]
+async fn unknown_vim_o_option_warns_but_stores() {
+    let (rpc, mut incoming) = start().await;
+
+    // First, a KNOWN option through `vim.o` must NOT warn (clean session, empty
+    // message before any unknown write).
+    exec_lua(&rpc, "vim.o.hlsearch = false").await;
+    rpc.request("nvim_get_mode", vec![]).await.expect("barrier");
+    let frame = drain_to_latest_redraw(&mut incoming, |_| true).expect("a redraw arrived");
+    assert!(
+        !message(&frame).to_lowercase().contains("unknown option"),
+        "a known vim.o option must not warn, got {:?}",
+        message(&frame)
+    );
+
+    // An option nxvim doesn't model (a typo, or an unmodeled real neovim option) is
+    // KEPT — compat: a config setting it still loads — but surfaces a warning naming
+    // it, so it isn't silently swallowed (unlike `:set`, which rejects it outright).
+    exec_lua(&rpc, "vim.o.nonexistentopt = true").await;
+    let frame = drain_to_latest_redraw(&mut incoming, |m| message(m).contains("nonexistentopt"))
+        .expect("the unknown-option warning surfaced");
+    let msg = message(&frame);
+    assert!(
+        msg.contains("nonexistentopt") && msg.to_lowercase().contains("unknown option"),
+        "an unmodeled vim.o option must warn naming it, got {msg:?}"
+    );
+
+    // …and it is still stored (reads back), so the compat catch-all is preserved.
+    assert_eq!(
+        exec_lua(&rpc, "return vim.o.nonexistentopt")
+            .await
+            .as_bool(),
+        Some(true),
+        "the unknown option is kept (compat), not rejected"
+    );
+}
+
+#[tokio::test]
 async fn autoread_defaults_on_and_round_trips_through_vim_o() {
     let (rpc, _incoming) = start().await;
 

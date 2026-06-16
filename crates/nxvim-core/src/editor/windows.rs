@@ -1114,7 +1114,11 @@ impl Editor {
     /// the same state the `:set statusline=…` / `:set guifont=…` ex path writes —
     /// the two routes share one home. (The `:set` path additionally *validates*
     /// `regexsyntax`; a raw `vim.o` write of a bad value reads back as `pcre`.)
-    pub fn set_global_option_str(&mut self, name: &str, value: &str) {
+    ///
+    /// Returns whether `name` was a wired string global, so the `:set` path can fail
+    /// loud (E518) on an unhandled name instead of silently no-op'ing; the Lua bridge
+    /// ignores the result (it forwards only the canonical wired set).
+    pub fn set_global_option_str(&mut self, name: &str, value: &str) -> bool {
         match name {
             "statusline" => self.options.statusline = value.to_string(),
             "tabline" => self.options.tabline = value.to_string(),
@@ -1129,8 +1133,9 @@ impl Editor {
             "makeprg" => self.options.makeprg = value.to_string(),
             "grepprg" => self.options.grepprg = value.to_string(),
             "grepformat" => self.options.grepformat = value.to_string(),
-            _ => {}
+            _ => return false,
         }
+        true
     }
 
     /// The editor's global options, for the server to mirror to Lua (`vim.o`).

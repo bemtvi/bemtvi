@@ -342,8 +342,11 @@ impl EditHost {
                 // forwards the search booleans and `showtabline`).
                 OptionValue::Number(n) => self.editor.set_global_option_num(&op.name, n),
                 // `statusline` (the one wired string global) — same home the
-                // `:set statusline=…` ex path writes.
-                OptionValue::String(s) => self.editor.set_global_option_str(&op.name, &s),
+                // `:set statusline=…` ex path writes. The Lua bridge forwards only
+                // canonical names, so ignore the handled? result the `:set` path uses.
+                OptionValue::String(s) => {
+                    let _ = self.editor.set_global_option_str(&op.name, &s);
+                }
             }
         }
         // Treesitter bridges from `vim.treesitter.*`: the per-buffer start/stop

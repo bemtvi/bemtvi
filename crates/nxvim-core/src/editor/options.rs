@@ -89,7 +89,14 @@ impl Editor {
             "scrollanim" => &mut self.options.scrollanim,
             "expandtab" => &mut self.buffer_mut().options.expandtab,
             "bomb" => &mut self.buffer_mut().options.bomb,
-            _ => return,
+            // A name `resolve_set` accepted as a boolean but no arm above handles is a
+            // wiring gap (an option in the `canonical` registry never wired to its
+            // slot — the bug `:set imagepreview` was). Fail loud rather than silently
+            // no-op, so the next such gap surfaces the moment it's `:set`.
+            _ => {
+                self.echo(format!("E518: Unknown option: {name}"));
+                return;
+            }
         };
         match op {
             SetOp::On => *slot = true,
@@ -131,7 +138,12 @@ impl Editor {
                     "tabstop" => 1,
                     "shiftwidth" | "sidescroll" | "sidescrolloff" => 0,
                     "softtabstop" => -1,
-                    _ => return,
+                    // A wiring gap (see `apply_set_bool`): a numeric option `resolve_set`
+                    // accepted but no arm handles. Fail loud, never a silent no-op.
+                    _ => {
+                        self.echo(format!("E518: Unknown option: {name}"));
+                        return;
+                    }
                 };
                 if v < min {
                     self.echo(format!("E487: Argument must be positive: {name}={v}"));
@@ -166,7 +178,11 @@ impl Editor {
                             "tabstop" => opts.tabstop as i64,
                             "shiftwidth" => opts.shiftwidth as i64,
                             "softtabstop" => opts.softtabstop as i64,
-                            _ => return,
+                            // A wiring gap (see `apply_set_bool`): fail loud, not silent.
+                            _ => {
+                                self.echo(format!("E518: Unknown option: {name}"));
+                                return;
+                            }
                         }
                     }
                 };
@@ -288,14 +304,23 @@ impl Editor {
         // which would leave the quickfix parser with no pattern — E378).
         if name == "errorformat" {
             match op {
-                StrOp::Set(value) => self.set_global_option_str("errorformat", &value),
+                StrOp::Set(value) => {
+                    self.set_global_option_str("errorformat", &value);
+                }
                 StrOp::Reset => self.options.errorformat = crate::options::DFLT_EFM.to_string(),
                 StrOp::Query => self.echo(format!("errorformat={}", self.options.errorformat)),
             }
             return;
         }
+        // A wiring gap (see `apply_set_bool`): a string option `resolve_set` accepted
+        // but no arm / the global setter handles. Fail loud, never a silent no-op.
+        let unknown = |ed: &mut Self| ed.echo(format!("E518: Unknown option: {name}"));
         match op {
-            StrOp::Set(value) => self.set_global_option_str(name, &value),
+            StrOp::Set(value) => {
+                if !self.set_global_option_str(name, &value) {
+                    unknown(self);
+                }
+            }
             // Most string options reset to the empty string; the `:make`/`:grep`
             // programs and the grep parser reset to their compiled-in defaults (an
             // empty value would make `:make` spawn nothing / leave the parser with
@@ -307,7 +332,9 @@ impl Editor {
                     "grepformat" => crate::options::DFLT_GREPFORMAT,
                     _ => "",
                 };
-                self.set_global_option_str(name, value);
+                if !self.set_global_option_str(name, value) {
+                    unknown(self);
+                }
             }
             StrOp::Query => {
                 let value = match name {
@@ -321,7 +348,10 @@ impl Editor {
                     "makeprg" => self.options.makeprg.clone(),
                     "grepprg" => self.options.grepprg.clone(),
                     "grepformat" => self.options.grepformat.clone(),
-                    _ => return,
+                    _ => {
+                        unknown(self);
+                        return;
+                    }
                 };
                 self.echo(format!("{name}={value}"));
             }

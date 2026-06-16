@@ -152,6 +152,10 @@
     const workerUrl = new URL("./worker.mjs", import.meta.url);
     const daemonUri = new URLSearchParams(location.search).get("daemon");
     if (daemonUri) workerUrl.searchParams.set("daemon", daemonUri);
+    // Daemon mode steers image-preview byte fetches (see `fetchImageBytes`): a daemon path's
+    // bytes live over the wire (worker-routed), an OPFS/picker path is read UI-side. True from
+    // boot when `?daemon=` is set; a runtime `:connect` flips it on the `connected` message.
+    let daemonMode = !!daemonUri;
     const worker = new Worker(workerUrl, { type: "module" });
     // Surface a worker that fails to *load* (a module-eval / import error). Without this a
     // broken worker is silent — the `ready` promise just never resolves and the editor
@@ -381,8 +385,18 @@
       // A runtime `:connect nxvim://…` finished dialing — flash the outcome (the fs/watch seam
       // is now on the wire on success; on failure the editor stays on serverless OPFS).
       if (msg.type === "connected") {
-        if (msg.ok) flashStatus("connected to daemon", "#98c379");
+        if (msg.ok) { daemonMode = true; flashStatus("connected to daemon", "#98c379"); }
         else flashStatus("connect failed: " + (msg.error || "unknown"), "#e06c75");
+        return;
+      }
+      // Reply to an out-of-band image-preview byte fetch routed through the Worker (a daemon
+      // path). Hand the bytes (or error) to the awaiting `fetchImageBytes` promise.
+      if (msg.type === "image_read_result") {
+        const r = imageReadWaiters.get(msg.reqId);
+        if (r) {
+          imageReadWaiters.delete(msg.reqId);
+          r(msg.ok ? { ok: true, bytes: msg.bytes } : { ok: false, error: msg.error || "read failed" });
+        }
         return;
       }
       if (msg.type === "fatal") {
@@ -590,6 +604,155 @@
       a.strip = strip;
     }
 
+    // ============================================================================
+    // Image previews (`'imagepreview'`). A preview window carries an `image` marker
+    // ({ path, size, mtime_ms }) instead of text — the editor core never reads the
+    // bytes (the never-freeze invariant), so the UI fetches them out-of-band and
+    // paints an <img>. Bytes are cached as blob object-URLs keyed by path+version,
+    // so a redraw doesn't refetch; a changed-on-disk file (new size/mtime) refetches.
+    // ============================================================================
+    const imageCache = new Map();    // path -> { version, url, error }
+    const imageFetching = new Set();  // paths with an in-flight fetch (dedupe)
+    const imageReadWaiters = new Map(); // reqId -> resolve, for worker-routed (daemon) reads
+    let imageReadSeq = 0;
+    let shownImagePaths = new Set();  // paths painted this frame, for GC of the rest
+    let imgRenderPending = false;
+
+    const imageVersion = (im) => `${im.size || 0}:${im.mtime_ms || 0}`;
+
+    // The Blob content-type from the path's extension, so a blob: URL renders as an
+    // image. tga/qoi/pnm decode natively in the TUI/GUI (the `image` crate) but no
+    // browser shows them in an <img> — they fall to the `onerror` placeholder.
+    function imageMime(path) {
+      const ext = (String(path).split(".").pop() || "").toLowerCase();
+      return ({
+        png: "image/png", jpg: "image/jpeg", jpeg: "image/jpeg", gif: "image/gif",
+        bmp: "image/bmp", webp: "image/webp", tif: "image/tiff", tiff: "image/tiff",
+        ico: "image/x-icon", svg: "image/svg+xml", avif: "image/avif",
+      })[ext] || "application/octet-stream";
+    }
+
+    // Read `path` bytes from OPFS directly on the UI thread (OPFS is reachable from
+    // both contexts). Avoids a Worker round-trip — which would lag, since after a
+    // `:e image.png` the serverless Worker parks (blocking) until the next input.
+    async function opfsReadBytesUI(path) {
+      try {
+        const parts = String(path).split("/").filter((s) => s.length && s !== ".");
+        if (!parts.length) return { ok: false, error: "not a file" };
+        let dir = await navigator.storage.getDirectory();
+        for (const p of parts.slice(0, -1)) dir = await dir.getDirectoryHandle(p, { create: false });
+        const fh = await dir.getFileHandle(parts[parts.length - 1], { create: false });
+        const file = await fh.getFile();
+        return { ok: true, bytes: new Uint8Array(await file.arrayBuffer()) };
+      } catch (e) {
+        return { ok: false, error: String(e?.message || e) };
+      }
+    }
+
+    // Ask the Worker for a daemon path's bytes (only the Worker holds the wire).
+    function workerImageRead(path) {
+      return new Promise((resolve) => {
+        const reqId = ++imageReadSeq;
+        imageReadWaiters.set(reqId, resolve);
+        worker.postMessage({ type: "image_read", reqId, path });
+      });
+    }
+
+    // Fetch an image path's bytes by route: a picker-bound real file (UI holds the
+    // handle), else a daemon path (Worker-routed), else OPFS (UI-read).
+    async function fetchImageBytes(path) {
+      const handle = fsHandles.get(path);
+      if (handle) {
+        const res = await realFsRead(handle);
+        return res.kind === 0 && res.bytes
+          ? { ok: true, bytes: res.bytes }
+          : { ok: false, error: res.text || "read failed" };
+      }
+      if (daemonMode) return await workerImageRead(path);
+      return await opfsReadBytesUI(path);
+    }
+
+    // Return the ready cache entry for `im`'s current version (a fetched blob URL or
+    // an error), kicking an async fetch when missing/stale. A completed fetch
+    // schedules a re-render so the freshly-decoded picture appears.
+    function ensureImage(im) {
+      const v = imageVersion(im);
+      const cur = imageCache.get(im.path);
+      if (cur && cur.version === v) return cur;
+      if (!imageFetching.has(im.path)) {
+        imageFetching.add(im.path);
+        fetchImageBytes(im.path).then((res) => {
+          imageFetching.delete(im.path);
+          const old = imageCache.get(im.path);
+          if (old && old.url) URL.revokeObjectURL(old.url);
+          if (res.ok) {
+            const url = URL.createObjectURL(new Blob([res.bytes], { type: imageMime(im.path) }));
+            imageCache.set(im.path, { version: v, url, error: null });
+          } else {
+            imageCache.set(im.path, { version: v, url: null, error: res.error || "cannot read" });
+          }
+          scheduleImageRender();
+        });
+      }
+      return cur || null; // a stale entry still paints (the old picture) until the refetch lands
+    }
+
+    // Coalesce a re-render after a fetch completes (mirrors `tsRefresh`).
+    function scheduleImageRender() {
+      if (imgRenderPending) return;
+      imgRenderPending = true;
+      requestAnimationFrame(() => { imgRenderPending = false; if (view) render(); });
+    }
+
+    // Free blob URLs for previews not shown this frame (a closed/switched-away image).
+    function gcImages() {
+      for (const [path, entry] of imageCache) {
+        if (shownImagePaths.has(path) || imageFetching.has(path)) continue;
+        if (entry.url) URL.revokeObjectURL(entry.url);
+        imageCache.delete(path);
+      }
+    }
+
+    // Paint a preview image into `box` over its `bodyRows`-tall text body: an <img>
+    // fit to the body (aspect-preserving, centered) and — crucially — never upscaled
+    // past its natural size (max-width/height cap to the body; the default render
+    // size is natural), matching the TUI/GUI `Resize::Fit`. A decode/read failure or
+    // a browser-unsupported format paints a visible placeholder (fail loud).
+    function renderImage(box, im, wCells, bodyRows) {
+      shownImagePaths.add(im.path);
+      const wrap = document.createElement("div");
+      wrap.style.cssText =
+        "position:absolute;left:0;top:0;display:flex;align-items:center;justify-content:center;overflow:hidden;";
+      wrap.style.width = wCells * cw + "px";
+      wrap.style.height = bodyRows * ch + "px";
+      const entry = ensureImage(im);
+      if (entry && entry.url) {
+        const img = document.createElement("img");
+        img.style.cssText = "max-width:100%;max-height:100%;";
+        img.draggable = false;
+        img.src = entry.url;
+        img.onerror = () => {
+          // A blob that can't be decoded as an image (corrupt, or a format no browser
+          // shows — tga/qoi/pnm). Drop the URL so the next render shows the placeholder
+          // instead of re-attempting (and re-erroring on) the same broken <img>.
+          const e = imageCache.get(im.path);
+          if (e) {
+            if (e.url) URL.revokeObjectURL(e.url);
+            e.url = null;
+            e.error = "unsupported or corrupt image";
+          }
+          scheduleImageRender();
+        };
+        wrap.appendChild(img);
+      } else if (entry && entry.error) {
+        const msg = document.createElement("div");
+        msg.style.cssText = "color:#e06c75;font:inherit;padding:0 4px;text-align:center;";
+        msg.textContent = `[image: cannot read ${im.path}: ${entry.error}]`;
+        wrap.appendChild(msg);
+      } // else: fetch in flight → blank until it lands (then a re-render paints it)
+      box.appendChild(wrap);
+    }
+
     function render() {
       if (!view) return;
       // A terminal projects its vt100 colors into `styles` + per-window `highlights`,
@@ -600,6 +763,7 @@
       const termWin = (view.windows || []).some((w) => w.term_colors ?? w.terminal);
       serverStyled = (view.styles?.length ?? 0) > 0 && !termWin;
       gridEl.innerHTML = "";
+      shownImagePaths = new Set(); // reset; `renderImage` records each preview shown this frame
       if (serverStyled) applyChrome();
       const hasTabline = serverStyled
         ? (view.tabline_segments?.length || view.tabline.length)
@@ -629,6 +793,7 @@
       // like the menu, so it renders regardless of `serverStyled`.
       if (view.float) renderContentFloat(view.float, tablineRows);
       renderCommand(cmdRow);
+      gcImages(); // free blob URLs for previews no longer shown
     }
 
     function winRect(w) {
@@ -702,6 +867,20 @@
       box.className = "win";
       place(box, o.x + rect.x, o.y + rect.y, rect.width, rect.height);
       gridEl.appendChild(box);
+
+      // An image-preview buffer (`'imagepreview'`): paint the picture over the text
+      // body and skip the text rows (the buffer is empty — `w.lines` doesn't size
+      // the body, so derive the body height from the window rect and status row).
+      if (w.image) {
+        const hasStatus = w.status_visible !== false;
+        const bodyRows = Math.max(0, rect.height - (hasStatus ? 1 : 0));
+        renderImage(box, w.image, rect.width, bodyRows);
+        if (hasStatus) {
+          if (serverStyled) renderStatusSegments(box, w.status || [], bodyRows, rect.width, w.focused);
+          else renderStatus(box, w, bodyRows);
+        }
+        return;
+      }
 
       const textRows = w.lines.length;
       const statusRows = Math.max(0, rect.height - textRows);

@@ -987,6 +987,18 @@ impl Editor {
     /// (off-tick never fails here — the fetch's errors surface later in `apply_open`).
     fn load_new_buffer(&mut self, path: &Path) -> Option<BufferId> {
         if self.host_fs_offtick {
+            // Image preview over off-tick fs (`'imagepreview'`): mark the buffer as an
+            // inert image preview bound to `path` and enqueue **no** wire fetch — the
+            // editor never reads an image's bytes (never-freeze), and the client fetches
+            // and decodes them out-of-band from the path the redraw carries. (Locally the
+            // sync `read_buffer` path does the same via `Buffer::from_image_file`; off-tick
+            // has no synchronous stat, so the disk version is left 0 — the client keys its
+            // cache on the path.)
+            if self.options.imagepreview && super::is_image_path(Some(path)) {
+                let mut buf = Buffer::named(path.to_path_buf());
+                buf.image = true;
+                return Some(self.add_buffer(buf));
+            }
             let id = self.add_buffer(Buffer::named(path.to_path_buf()));
             self.enqueue_open(id, path.to_path_buf());
             Some(id)

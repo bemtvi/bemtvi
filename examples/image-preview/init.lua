@@ -24,6 +24,13 @@
 -- The picture is fit to the window (aspect-preserving, centered) and re-decoded
 -- when the file changes on disk, same as the TUI.
 --
+-- The web client (the wasm edit-host) renders it too: it fetches the bytes
+-- out-of-band (the editor core never reads them — the redraw carries only the
+-- path) and paints an <img>, fit to the window body and centered. Open an image
+-- you've stored in its OPFS sandbox (e.g. `:e /sample.png`) with the option on.
+-- Browsers can't show tga/qoi/pnm, so those fall back to a visible placeholder
+-- there (the TUI/GUI render them via the `image` crate).
+--
 -- TRY IT:
 --   :e sample.png         open the image (this dir's sample) — preview appears
 --   :e some-other.jpg     any image file works

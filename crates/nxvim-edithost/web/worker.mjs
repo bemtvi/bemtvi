@@ -1251,6 +1251,26 @@ onmessage = async (ev) => {
     eh_clipboard_push(h, String(msg.text ?? ""));
     return;
   }
+  // Out-of-band image-preview byte fetch (`'imagepreview'`): the editor core never reads an
+  // image buffer's bytes (it stays an inert preview — the never-freeze invariant), so the UI
+  // fetches them here to paint the `<img>`. The UI reads OPFS and picker-bound real files
+  // itself (those are UI-reachable); it only routes here for a *daemon* path, whose bytes live
+  // over the wire. Reply with the raw bytes (transferable, zero-copy) or an error.
+  if (msg.type === "image_read") {
+    const res = daemon ? await daemonRead(String(msg.path)) : await opfsRead(String(msg.path));
+    const ok = res.kind === 0 && !!res.bytes;
+    postMessage(
+      {
+        type: "image_read_result",
+        reqId: msg.reqId,
+        ok,
+        bytes: ok ? res.bytes : null,
+        error: ok ? "" : res.text || "not a readable file",
+      },
+      ok ? [res.bytes.buffer] : [],
+    );
+    return;
+  }
   // postMessage fallback (5c). `:e`/`:w` fulfill against OPFS before the frame posts, so
   // the resolved frame reflects the open/save (the SAB loop does the same inline).
   switch (msg.type) {

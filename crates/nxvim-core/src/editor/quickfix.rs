@@ -583,6 +583,46 @@ impl Editor {
         self.qf_jump_to_index(which, pos as usize);
     }
 
+    /// `:cnfile`/`:cpfile` (and `:l*` twins) — jump to the first error in the next
+    /// file forward / the last error in the previous file backward, stepping
+    /// `count` files. Files are identified by an entry's resolved target (its
+    /// filename, or its buffer number for a bufnr-only entry); entries with neither
+    /// (plain output lines) are skipped. `E553` past either end.
+    pub(crate) fn ex_qf_step_file(&mut self, which: QfWhich, forward: bool, count: usize) {
+        // `keys` is owned, so no borrow of `self` is held across the jump below.
+        let keys: Vec<Option<String>> = self.qf_cur(which).items.iter().map(qf_file_key).collect();
+        if !keys.iter().any(Option::is_some) {
+            self.echo("E42: No Errors".to_string());
+            return;
+        }
+        let len = keys.len() as isize;
+        let step: isize = if forward { 1 } else { -1 };
+        let mut pos = self.qf_cur(which).idx as isize - 1; // 0-based current (-1 if unset)
+        let mut prev_key = (pos >= 0).then(|| keys[pos as usize].clone()).flatten();
+        let mut remaining = count.max(1);
+        loop {
+            pos += step;
+            if pos < 0 || pos >= len {
+                self.echo("E553: No more items".to_string());
+                return;
+            }
+            let Some(key) = &keys[pos as usize] else {
+                continue; // a fileless (invalid) line — not part of any file group
+            };
+            if Some(key) != prev_key.as_ref() {
+                // Crossed into a new file. Going forward `pos` is its first entry;
+                // going backward it is the new file's *last* entry — exactly vim's
+                // "last error in the previous file".
+                remaining -= 1;
+                prev_key = Some(key.clone());
+                if remaining == 0 {
+                    self.qf_jump_to_index(which, pos as usize);
+                    return;
+                }
+            }
+        }
+    }
+
     /// `:cfirst`/`:clast` (and `:l*` twins) — jump to the first / last valid entry.
     pub(crate) fn ex_qf_first(&mut self, which: QfWhich) {
         match self.qf_cur(which).items.iter().position(|e| e.valid) {
@@ -891,6 +931,15 @@ impl Editor {
 /// in `:vimgrep` file arguments is deferred (Phase 4); such an argument fails loud.
 fn is_glob(arg: &str) -> bool {
     arg.contains('*') || arg.contains('?') || arg.contains('[')
+}
+
+/// A stable per-file identity for an entry, used by `:cnfile`/`:cpfile` to group
+/// entries by file: its `filename`, or `\0buf<n>` for a buffer-number-only entry.
+/// `None` for a fileless (plain-output / invalid) line, which belongs to no file.
+fn qf_file_key(e: &QfEntry) -> Option<String> {
+    e.filename
+        .clone()
+        .or_else(|| (e.bufnr > 0).then(|| format!("\0buf{}", e.bufnr)))
 }
 
 /// Render one quickfix entry as a `:copen` line: `file|lnum col N| message`

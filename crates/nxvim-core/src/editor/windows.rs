@@ -1670,6 +1670,10 @@ impl Editor {
         if !self.windows.windows.contains_key(&id) {
             return false;
         }
+        // If `id` owns a location list shown in a loclist window, that loclist
+        // window must close with it (vim's behavior — a `:lopen` window belongs to
+        // its owner). Captured here, discarded on the success path below.
+        let orphan_loclist = self.windows.get(id).loclist_bufnr;
         // The last tiled window can't be closed — a float never substitutes for it
         // (the tiled layout must always have a normal window to fill). But the
         // editor also can't be left showing only floats, so vim closes the floats
@@ -1737,7 +1741,31 @@ impl Editor {
             self.relayout();
             self.ensure_visible();
         }
+        if let Some(buf) = orphan_loclist {
+            self.discard_loclist_display(buf);
+        }
         true
+    }
+
+    /// Close the location-list window showing `buf` (an orphaned loclist display
+    /// buffer whose owner window just closed) and drop the now-unshown scratch
+    /// buffer. The display window carries no `loclist_bufnr` of its own, so the
+    /// inner [`Editor::remove_window`] won't recurse back here.
+    fn discard_loclist_display(&mut self, buf: BufferId) {
+        if let Some(w) = self
+            .window_ids()
+            .into_iter()
+            .find(|&w| self.windows.get(w).buffer == buf)
+        {
+            self.remove_window(w);
+        }
+        // Delete the scratch buffer only once nothing shows it (closing the last
+        // window is refused, in which case it stays visible and must keep its buffer).
+        if self.buffers.map.contains_key(&buf)
+            && !self.windows.all_windows().any(|win| win.buffer == buf)
+        {
+            self.delete_buffer(buf, true);
+        }
     }
 
     /// `<C-w>o` / `:only` — drop every other tiled window *and every float*

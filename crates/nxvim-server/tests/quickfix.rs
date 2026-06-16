@@ -757,3 +757,80 @@ async fn diagnostic_setloclist_fills_a_navigable_loclist() {
     );
     assert_eq!(cursor(&rpc).await.0, 3, ":ll jumped to the diagnostic line");
 }
+
+#[tokio::test]
+async fn cnfile_and_cpfile_step_by_file() {
+    let (rpc, mut incoming) = start().await;
+    let a = write_temp("nf_a", "txt", "1\n2\n3\n4\n5\n");
+    let b = write_temp("nf_b", "txt", "1\n2\n3\n4\n5\n6\n7\n");
+    // Two entries in file A, two in file B (in list order).
+    exec_lua(
+        &rpc,
+        &format!(
+            r#"vim.fn.setqflist({{
+                 {{ filename = "{a}", lnum = 2, text = "a1" }},
+                 {{ filename = "{a}", lnum = 4, text = "a2" }},
+                 {{ filename = "{b}", lnum = 3, text = "b1" }},
+                 {{ filename = "{b}", lnum = 6, text = "b2" }},
+               }}, " ")"#
+        ),
+    )
+    .await;
+    message_after(&rpc, &mut incoming, ":cfirst<CR>").await; // file A, line 2
+    assert_eq!(buf_name(&rpc).await, a);
+    // :cnfile jumps to the *first* error in the next file (B, line 3).
+    message_after(&rpc, &mut incoming, ":cnfile<CR>").await;
+    assert_eq!(buf_name(&rpc).await, b, ":cnfile crossed to the next file");
+    assert_eq!(cursor(&rpc).await.0, 3, ":cnfile landed on B's first error");
+    // :cpfile jumps back to the *last* error in the previous file (A, line 4).
+    message_after(&rpc, &mut incoming, ":cpfile<CR>").await;
+    assert_eq!(
+        buf_name(&rpc).await,
+        a,
+        ":cpfile crossed back to the previous file"
+    );
+    assert_eq!(cursor(&rpc).await.0, 4, ":cpfile landed on A's last error");
+    // Past the last file → E553.
+    message_after(&rpc, &mut incoming, ":cnfile<CR>").await; // to B
+    let msg = message_after(&rpc, &mut incoming, ":cnfile<CR>").await; // past the end
+    assert!(
+        msg.contains("E553"),
+        "past the last file should be E553, got {msg:?}"
+    );
+}
+
+#[tokio::test]
+async fn closing_a_loclist_owner_closes_its_loclist_window() {
+    let (rpc, mut incoming) = start().await;
+    // A second code window first, so closing the owner doesn't hit the last-window
+    // guard (which would force the loclist window to stay).
+    message_after(&rpc, &mut incoming, ":split<CR>").await;
+    let after_split = win_count(&rpc).await; // 2 code windows
+    let owner = exec_lua(
+        &rpc,
+        r#"local w = vim.api.nvim_get_current_win()
+           vim.fn.setloclist(w, { { filename = "a.rs", lnum = 1, text = "x" } })
+           return w"#,
+    )
+    .await
+    .as_u64()
+    .expect("owner window id");
+    message_after(&rpc, &mut incoming, ":lopen<CR>").await;
+    assert_eq!(
+        win_count(&rpc).await,
+        after_split + 1,
+        ":lopen added the loclist window"
+    );
+    // Close the owner; its loclist window must close with it.
+    rpc.request(
+        "nvim_win_close",
+        vec![Value::from(owner), Value::from(true)],
+    )
+    .await
+    .expect("nvim_win_close");
+    assert_eq!(
+        win_count(&rpc).await,
+        after_split - 1,
+        "closing the owner closed both it and its loclist window"
+    );
+}

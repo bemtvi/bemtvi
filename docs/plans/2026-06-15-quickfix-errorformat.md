@@ -268,9 +268,19 @@ no external process (runs everywhere).
 > new black-box tests in `tests/quickfix.rs` (window-scoped set/getloclist,
 > `:colder`/`:cnewer` + `E380`, the `'r'` action, `:lvimgrep`, the read-only loclist
 > window + `<CR>` jump, `:lmake` loclist-scoping, and `nx.diagnostic.setloclist`
-> navigability), plus a runnable `examples/quickfix/`. **Deferred (unchanged from
-> Phase 2/3):** `:vimgrep` file globbing, `:cnfile`/`:cpfile`, and the out-of-scope
-> items below.
+> navigability), plus a runnable `examples/quickfix/`.
+>
+> **Follow-ups since (also Phase 4):** `%`/`#` (current/alternate file) expansion in
+> the `:vimgrep`/`:lvimgrep` and `:cfile`-family file arguments (the shared
+> `expand_file_arg`); `:cnfile`/`:cpfile` (+ `:l*`) step-by-file navigation
+> (`Editor::ex_qf_step_file`, grouping entries by a filename/bufnr key); and
+> closing a loclist owner window now also closes its loclist window and drops the
+> orphaned display buffer (`Editor::discard_loclist_display`, hooked in
+> `remove_window`). **Deferred:** `:vimgrep` file *globbing* (`**/*.rs`, fails loud),
+> `:cexpr`/`:cgetexpr`/`:caddexpr` (intentionally not added — nxvim's `:echo`-grade
+> expression evaluator can't evaluate the `system()`/variable expressions that make
+> `:cexpr` useful, and the Lua `setqflist({lines=…})` path already covers it more
+> capably), and the out-of-scope items below.
 
 **Goal:** window-local location lists, the 10-deep history stack, and the
 dogfoodable Lua surface (`[[dogfood-the-nx-plugin-api]]`).

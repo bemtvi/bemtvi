@@ -563,6 +563,12 @@ impl Editor {
             }
             "cfir" | "cfirst" | "cr" | "crewind" => self.ex_qf_first(QfWhich::Quickfix),
             "cla" | "clast" => self.ex_qf_last(QfWhich::Quickfix),
+            "cnf" | "cnfi" | "cnfil" | "cnfile" => {
+                self.ex_qf_step_file(QfWhich::Quickfix, true, parse_count_arg(args))
+            }
+            "cpf" | "cpfi" | "cpfil" | "cpfile" => {
+                self.ex_qf_step_file(QfWhich::Quickfix, false, parse_count_arg(args))
+            }
             "col" | "cold" | "colde" | "colder" => {
                 self.ex_qf_history(QfWhich::Quickfix, false, parse_count_arg(args))
             }
@@ -600,6 +606,14 @@ impl Editor {
             "lla" | "llast" => {
                 let which = self.loclist_which();
                 self.ex_qf_last(which);
+            }
+            "lnf" | "lnfi" | "lnfil" | "lnfile" => {
+                let which = self.loclist_which();
+                self.ex_qf_step_file(which, true, parse_count_arg(args));
+            }
+            "lpf" | "lpfi" | "lpfil" | "lpfile" => {
+                let which = self.loclist_which();
+                self.ex_qf_step_file(which, false, parse_count_arg(args));
             }
             "lol" | "lold" | "lolde" | "lolder" => {
                 let which = self.loclist_which();

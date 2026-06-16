@@ -59,6 +59,23 @@ async fn star_register_aliases_plus() {
 }
 
 #[tokio::test]
+async fn clipboard_paste_with_empty_provider_reports_instead_of_silently_failing() {
+    // The provider is present but holds nothing — exactly a browser that hasn't
+    // granted clipboard-read yet, so the web mirror was never pushed (Firefox on a
+    // fresh load). `"+p` must say so (vim's E353) rather than silently no-op.
+    let (rpc, mut incoming, _clip) = start_with_clipboard().await;
+    feed(&rpc, "ialpha<Esc>");
+    let map = latest_after(&rpc, &mut incoming, "\"+p").await;
+    assert!(
+        view_str(&map, "message").contains("E353"),
+        "expected a loud empty-register message, got: {:?}",
+        view_str(&map, "message")
+    );
+    // Nothing was pasted — the buffer is untouched.
+    assert_eq!(lines(&rpc).await, vec!["alpha"]);
+}
+
+#[tokio::test]
 async fn clipboard_paste_without_a_provider_errors_loudly() {
     // The default server has no clipboard provider (Disabled).
     let (rpc, mut incoming) = start(None).await;

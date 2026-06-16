@@ -67,6 +67,31 @@ async function waitReady(page) {
   await page.evaluate(() => window.__nxvim.ready);
 }
 
+// Fire a real `paste` gesture (Cmd/Ctrl+V, Edit▸Paste, middle-click all surface as this):
+// a ClipboardEvent on the grid carrying `text` in its clipboardData, exactly as the browser
+// delivers an OS paste. No `clipboardRefresh()` priming — the gesture itself carries the data.
+async function pasteGesture(page, text) {
+  await page.evaluate((t) => {
+    const dt = new DataTransfer();
+    dt.setData("text/plain", t);
+    // Dispatch on the editable input proxy (#kbd) — the real paste target in every browser.
+    document.getElementById("kbd").dispatchEvent(
+      new ClipboardEvent("paste", { clipboardData: dt, bubbles: true, cancelable: true }),
+    );
+  }, text);
+}
+
+// Poll the joined buffer text until it contains `want` (the paste feed is fire-and-forget).
+async function linesContain(page, want, tries = 50) {
+  let last = "";
+  for (let i = 0; i < tries; i++) {
+    last = await page.evaluate(() => window.__nxvim.lines());
+    if (typeof last === "string" && last.includes(want)) return last;
+    await sleep(20);
+  }
+  return last;
+}
+
 try {
   for (let i = 0; i < 50; i++) {
     try { await fetch(`${ORIGIN}/web/index.html`); break; } catch { await sleep(100); }
@@ -129,6 +154,40 @@ try {
     'paste: linewise external copy `"+p` lands on its own line below the cursor',
     pastedLine === "anchor\nEXTERNAL-LINE",
     `lines=${JSON.stringify(pastedLine)}`,
+  );
+
+  // ── Paste gesture in Normal mode → `"+p`, no refresh dance ───────────────────────────────
+  // The whole point of the friendly path: a plain Cmd/Ctrl+V (here, the paste event) drops the
+  // clipboard text straight in, with NO clipboardRefresh()/click-out-and-back to wake it.
+  await page.evaluate(() => window.__nxvim.feed("ggdG<Esc>")); // empty buffer, Normal mode
+  await pasteGesture(page, "GESTURE-NORMAL");
+  const gNormal = await linesContain(page, "GESTURE-NORMAL");
+  check(
+    "paste gesture: Cmd/Ctrl+V in Normal mode drops the clipboard text in (no refresh dance)",
+    gNormal.includes("GESTURE-NORMAL"),
+    `lines=${JSON.stringify(gNormal)}`,
+  );
+
+  // ── Paste gesture in Insert mode → typed in literally at the cursor ───────────────────────
+  await page.evaluate(() => window.__nxvim.feed("ggdGi")); // empty buffer, Insert mode
+  await pasteGesture(page, "GESTURE-INSERT");
+  const gInsert = await linesContain(page, "GESTURE-INSERT");
+  await page.evaluate(() => window.__nxvim.feed("<Esc>"));
+  check(
+    "paste gesture: Cmd/Ctrl+V in Insert mode types the clipboard text at the cursor",
+    gInsert.includes("GESTURE-INSERT"),
+    `lines=${JSON.stringify(gInsert)}`,
+  );
+
+  // ── Multi-line paste gesture in Insert mode folds CRLF/LF to real line breaks ─────────────
+  await page.evaluate(() => window.__nxvim.feed("ggdGi"));
+  await pasteGesture(page, "line-a\r\nline-b\nline-c");
+  const gMulti = await linesContain(page, "line-c");
+  await page.evaluate(() => window.__nxvim.feed("<Esc>"));
+  check(
+    "paste gesture: multi-line text splits into lines (CRLF folds to one break)",
+    gMulti === "line-a\nline-b\nline-c",
+    `lines=${JSON.stringify(gMulti)}`,
   );
 
   await browser.close();

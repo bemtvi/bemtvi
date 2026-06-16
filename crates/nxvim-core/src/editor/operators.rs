@@ -721,7 +721,17 @@ impl Editor {
         }
         let (text, linewise) = match self.register_text(reg) {
             Some((text, kind)) if !text.is_empty() => (text, kind == RegKind::Line),
-            _ => return,
+            // An explicitly-named but empty/unreadable register reports loudly (vim's
+            // E353, as `:put` does) instead of a silent no-op — notably `"+p` when the
+            // clipboard couldn't be read yet (e.g. a browser that hasn't granted
+            // clipboard access on a fresh load). A bare `p` with nothing yanked stays a
+            // quiet no-op, matching vim's unnamed-register feel.
+            _ => {
+                if let Some(name) = reg {
+                    self.echo(format!("E353: Nothing in register {name}"));
+                }
+                return;
+            }
         };
         self.paste_text(&text, linewise, count, after);
     }

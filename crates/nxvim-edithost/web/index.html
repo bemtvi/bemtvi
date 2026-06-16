@@ -66,10 +66,19 @@
   /* A tiny boot/transport indicator, hidden shortly after the first frame. */
   #status { position: fixed; right: 6px; bottom: 4px; font-size: 11px; opacity: .4;
             color: #5c6370; pointer-events: none; z-index: 5; }
+  /* Off-screen input proxy. The grid is a non-editable <div>, and Firefox only fires
+     `paste`/`copy`/`cut` on an *editable* focused element — so the real keyboard + clipboard
+     target is this hidden, always-focused textarea (the xterm.js "helper textarea" pattern).
+     Kept 1px (not display:none, which can't take focus) and out of the way (z-index/opacity/
+     pointer-events) so it never shows or steals the mouse. */
+  #kbd { position: fixed; top: 0; left: 0; width: 1px; height: 1px; padding: 0; margin: 0;
+         border: 0; outline: none; resize: none; opacity: 0; z-index: -1;
+         overflow: hidden; pointer-events: none; }
 </style>
 </head>
 <body>
   <div id="grid" tabindex="0"></div>
+  <textarea id="kbd" tabindex="-1" autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false" aria-hidden="true"></textarea>
   <div id="status">booting…</div>
 
   <script type="module">
@@ -86,6 +95,12 @@
 
     const FONT_PX = 15, LINE = 1.4;
     const gridEl = document.getElementById("grid");
+    // The hidden editable element that actually owns keyboard + clipboard focus (see #kbd CSS).
+    // Focus it — never the grid — so Firefox delivers `paste` events and every browser routes
+    // keydown here. A non-`grid` focus target is invisible to the user: the renderer draws its
+    // own cursor from the view, not from browser focus.
+    const kbdEl = document.getElementById("kbd");
+    const focusInput = () => kbdEl.focus();
     const statusEl = document.getElementById("status");
 
     let view = null;          // the latest redraw frame (the server's View map)
@@ -271,6 +286,41 @@
       catch { /* permission denied / not focused / empty — keep the existing mirror */ }
       finally { clipboardRefreshing = false; }
     }
+    // Encode a raw clipboard string as one key-notation feed (the JS twin of
+    // nxvim-view's `encode_paste`): escape the chars special to the notation parser so
+    // the text inserts verbatim — `<`→`<lt>`, tab→`<Tab>`, newline→`<CR>` (CRLF folds to
+    // one). Used to type a paste into Insert/cmdline/terminal mode in a single feed.
+    function encodePaste(text) {
+      let out = "";
+      for (let i = 0; i < text.length; i++) {
+        const c = text[i];
+        if (c === "<") out += "<lt>";
+        else if (c === "\t") out += "<Tab>";
+        else if (c === "\n") out += "<CR>";
+        else if (c === "\r") { out += "<CR>"; if (text[i + 1] === "\n") i++; }
+        else out += c;
+      }
+      return out;
+    }
+    // Modes where a paste is "typed in" (insert literally) rather than dropped via the
+    // `"+` register paste (`"+p`) that Normal/Visual want.
+    const PASTE_INSERTS = new Set(["INSERT", "REPLACE", "COMMAND", "TERMINAL"]);
+    // Handle the OS paste gesture — Cmd/Ctrl+V, the Edit▸Paste menu, or middle-click.
+    // The browser hands us the clipboard text synchronously in the event, with NO
+    // permission chip (the gesture itself is the grant), so this is the friendly path:
+    // it Just Works on load with no click-out-and-back dance to coax `readText()`. We
+    // refresh the `"+`/`"*` mirror (ordered ahead of the feed, so a later manual `"+p`
+    // is fresh too), then apply the paste in the current mode: typed-in for
+    // Insert/cmdline/terminal, `"+p` for Normal/Visual (which also replaces a selection).
+    function onPaste(e) {
+      const text = e.clipboardData?.getData("text/plain");
+      if (!text) return;
+      e.preventDefault();
+      clipboardPushOp(text);
+      const mode = latest.frame?.mode_label ?? "";
+      if (PASTE_INSERTS.has(mode)) feedOp(encodePaste(text));
+      else feedOp('"+p');
+    }
 
     let statusHideTimer = null;
     // Briefly show a transient message in the corner indicator (picker errors, etc.).
@@ -389,7 +439,7 @@
       statusEl.textContent = `nxvim wasm edit-host — ${cols}×${editorRows + 1} — ${useSAB ? "SAB+timers" : "postMessage"}`;
       clearTimeout(statusHideTimer);
       statusHideTimer = setTimeout(() => { statusEl.style.display = "none"; }, 1500);
-      gridEl.focus();
+      focusInput();
       readyResolve();
     }
 
@@ -1478,7 +1528,7 @@
       } catch (e) { return { ok: false, error: String(e?.message || e) }; }
     }
 
-    gridEl.addEventListener("keydown", (e) => {
+    kbdEl.addEventListener("keydown", (e) => {
       if (e.key === "F5" || e.key === "F12") return;
       if (e.metaKey && !e.ctrlKey) return; // leave browser Cmd-shortcuts alone
       const n = keyToNotation(e);
@@ -1580,7 +1630,7 @@
     }
 
     gridEl.addEventListener("mousedown", (e) => {
-      gridEl.focus();
+      focusInput();
       const button = BTN[e.button];
       if (!button) return;
       e.preventDefault();
@@ -1661,7 +1711,13 @@
     // Refresh the `"+`/`"*` read mirror whenever the editor (re)gains focus — switching back
     // from another app/tab is the moment an external copy needs to become visible to `"+p`.
     window.addEventListener("focus", refreshClipboard);
-    gridEl.addEventListener("focus", refreshClipboard);
+    kbdEl.addEventListener("focus", refreshClipboard);
+    // The OS paste gesture (Cmd/Ctrl+V, Edit▸Paste, middle-click) lands on the editable input
+    // proxy (a plain <div> never gets `paste` in Firefox) — the direct, no-permission-chip path
+    // to paste, so the user never has to coax the clipboard awake. Re-focus afterwards in case
+    // the gesture (e.g. the Edit menu) moved focus away, and clear any text the browser slipped
+    // into the textarea before `onPaste`'s preventDefault could fire.
+    kbdEl.addEventListener("paste", (e) => { onPaste(e); kbdEl.value = ""; focusInput(); });
 
     // ============================================================================
     // Boot: measure, create the highlighter, then let the Worker's "ready" attach.

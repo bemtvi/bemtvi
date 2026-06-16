@@ -1,6 +1,6 @@
 # Native-client-over-daemon image fetching for the preview
 
-**Status:** Phase 1 in progress.
+**Status:** Complete (all four phases landed).
 
 ## Problem
 

@@ -31,6 +31,13 @@
 -- Browsers can't show tga/qoi/pnm, so those fall back to a visible placeholder
 -- there (the TUI/GUI render them via the `image` crate).
 --
+-- OVER A DAEMON (`:connect` / `--connect-daemon`): the editor runs local but the
+-- files live on the remote host, so the native TUI/GUI can't open `sample.png` off
+-- their own disk. They fetch the bytes out-of-band over the editor RPC, exactly like
+-- the web client — the redraw marker flags the preview `remote` and the client
+-- requests `nxvim_image_read`. So previewing a *remote* image works the same way,
+-- with no config change; a brief "[image: loading …]" shows until the bytes arrive.
+--
 -- TRY IT:
 --   :e sample.png         open the image (this dir's sample) — preview appears
 --   :e some-other.jpg     any image file works

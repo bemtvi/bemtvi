@@ -388,10 +388,14 @@ pub struct WindowView {
 }
 
 /// An image-preview window's payload ([`WindowView::image`]): just the filesystem
-/// path of the image to render. The client reads and decodes it locally (a local
-/// TUI shares the filesystem); remote/daemon byte transport is a later phase. Kept
-/// as a struct (not a bare `String`) so the cache key can grow `size`/`mtime`
-/// fields without re-threading the wire.
+/// path of the image to render — a *reference*, never the bytes (never-freeze). The
+/// client reads and decodes it; in an embedded session it shares the filesystem and
+/// opens `path` directly, while in a daemon (`:connect`) session the file lives on
+/// the remote host, so the client fetches the bytes out-of-band over the editor RPC
+/// (`nxvim_image_read`). The server stamps that `remote` bit onto the redraw marker,
+/// not here — core knows nothing of the daemon. Kept as a struct (not a bare
+/// `String`) so the cache key can grow `size`/`mtime` fields without re-threading the
+/// wire.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ImageView {
     /// The image file's path (the buffer's path).

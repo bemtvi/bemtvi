@@ -166,8 +166,8 @@ function nx.tbl.count(t)
 end
 vim.tbl_count = nx.tbl.count
 
--- nx.tbl.deep_equal(a, b) [alias vim.deep_equal]: structural equality. Used by vim.treesitter.query to spot
--- specific directives (e.g. `#set! injection.combined`).
+-- nx.tbl.deep_equal(a, b) [alias vim.deep_equal]: structural equality (recurses
+-- into tables, comparing keys and values). A general config/plugin helper.
 function nx.tbl.deep_equal(a, b)
   if a == b then
     return true
@@ -201,8 +201,8 @@ end
 vim.npcall = nx.npcall
 
 -- nx.nonnil(...) [alias vim.nonnil]: the first non-nil argument, or nil (verbatim from neovim's
--- vim/_core/shared.lua; the replacement for the deprecated vim.F.if_nil).
--- vim.treesitter.tree_for_range uses it to default `opts.ignore_injections`.
+-- vim/_core/shared.lua; the replacement for the deprecated vim.F.if_nil). A general
+-- helper for defaulting an optional value.
 function nx.nonnil(...)
   local nargs = select("#", ...)
   for i = 1, nargs do

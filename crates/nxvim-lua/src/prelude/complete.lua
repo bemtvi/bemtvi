@@ -3,14 +3,14 @@
 -- docs/plans/2026-06-15-nx-complete-completion-engine.md). Unlike the picker, the
 -- buffer is the query: the popup floats over the text while typing flows on to
 -- the document, and the server (Rust) owns trigger, ranking, navigation, and the
--- accept-edit. This phase ships only the native `buffer` word-scan source, which
--- runs entirely in core — no Lua per keystroke (ADR 0002 rule 4).
+-- accept-edit. The native `buffer` word-scan source runs entirely in core — no Lua
+-- per keystroke (ADR 0002 rule 4); the `lsp` source is server-native; `snippets` is
+-- a built-in; and plugin sources register via `nx.complete.source{}`.
 --
--- `nx.complete.setup{}` is the whole surface for now: it validates the configured
--- sources, resolves the options, and hands them to the server via
--- `nx._complete_setup`. Plugin sources (`nx.complete.source{}`), the `lsp` /
--- `snippets` built-ins, and the docs preview land in later sub-phases — calling
--- the unimplemented surface fails loud rather than silently no-opping.
+-- `nx.complete.setup{}` validates the configured sources, resolves the options, and
+-- hands them to the server via `nx._complete_setup`. `nx.complete.source{}` registers
+-- an async plugin source and `nx.complete.trigger()` opens the popup manually; an
+-- unknown source name fails loud rather than silently no-opping.
 
 nx.complete = nx.complete or {}
 -- Registered async sources (`nx.complete.source{}`), keyed by name. Each is a
@@ -56,10 +56,11 @@ end
 
 -- nx.complete.setup { sources = { { "buffer", min_chars = 3 } }, auto = true,
 --   keys = { next = "<C-n>", prev = "<C-p>", confirm = "<C-y>", abort = "<C-e>" } }
--- Enables the engine. `sources` is a list of `{ name, opts... }` entries; only
--- `"buffer"` is recognized this phase. `min_chars` (from the buffer source, or
--- the top level) gates the prefix length before the popup opens. `auto` (default
--- true) completes as you type. `keys` overrides any of the four control actions.
+-- Enables the engine. `sources` is a list of `{ name, opts... }` entries — a
+-- built-in (`buffer` / `lsp` / `snippets`) or a registered plugin source.
+-- `min_chars` (from a source, or the top level) gates the prefix length before the
+-- popup opens. `auto` (default true) completes as you type. `keys` overrides any of
+-- the four control actions.
 function nx.complete.setup(opts)
   opts = opts or {}
   if type(opts) ~= "table" then

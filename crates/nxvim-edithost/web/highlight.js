@@ -1,8 +1,9 @@
 // In-browser tree-sitter syntax highlighting for the nxvim edit-host.
 //
-// The editor core (nxvim-core, compiled to WebAssembly) has no treesitter — that
-// lives in nxvim-server, which this serverless build omits. So highlighting is a
-// pure front-end layer, exactly the way the page already owns rendering: it parses
+// The wasm edit-host has no in-process tree-sitter parser — the native engine
+// (nxvim-ts) is gated off this build (only its synchronous indenter is reimplemented
+// in JS, web/ts-indent.js). So highlighting is a pure front-end layer, exactly the way
+// the page already owns rendering: it parses
 // the focused buffer's text with web-tree-sitter (the official WASM build of the
 // tree-sitter runtime), runs the language's `highlights.scm`, and hands the renderer
 // per-line capture spans to paint.

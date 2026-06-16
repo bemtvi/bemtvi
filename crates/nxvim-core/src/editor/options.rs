@@ -198,8 +198,8 @@ impl Editor {
     /// share one home. `&` resets to the default (empty); `?` echoes the value.
     fn apply_set_str(&mut self, name: &str, op: StrOp) {
         // `filetype` is buffer-local and special: it drives the per-buffer
-        // treesitter language override (the same seam as `vim.treesitter.start`/
-        // `stop`), not a global string slot. This is the no-Lua way to force a
+        // treesitter language override (the same seam as `nx.bo.filetype`), not a
+        // global string slot. This is the no-Lua way to force a
         // language onto a buffer the extension table misses — e.g. on the web
         // build, where there is no Lua at all.
         if name == "filetype" {

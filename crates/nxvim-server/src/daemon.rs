@@ -203,8 +203,9 @@ const LSP_STDOUT: &str = "lsp_stdout"; // daemon → edit-host: [id, bytes]
 const LSP_STDERR: &str = "lsp_stderr"; // daemon → edit-host: [id, bytes]
 const LSP_EXITED: &str = "lsp_exited"; // daemon → edit-host: [id, code?, signal?]
 
-// The Lua-filesystem leg (`luafs`): a request/response per project-facing `vim.uv.fs_*`
-// / `vim.fn` fs call, run to completion on the daemon. Like the sys leg it is a blocking
+// The Lua-filesystem leg (`luafs`): a request/response per project-facing `vim.fn` fs
+// call (the synchronous `readblob`/`glob`/`filereadable`/… builtins), carried as a
+// libuv-shaped fs op on the wire, run to completion on the daemon. Like the sys leg it is a blocking
 // bridge — the edit-host's Lua thread parks on the reply (the calls are synchronous) —
 // but it carries the whole fs surface under one method, demuxed by an op tag in the
 // request. The whole `["op", args…]` request maps to `["ok", payload] | ["err", msg]`.
@@ -2365,7 +2366,7 @@ pub struct DaemonClient {
     pub blocking_system: RemoteBlockingSystem,
     /// The streaming-pipe LSP seam (`lsp_*`).
     pub lsp_transport: RemoteLspTransport,
-    /// The blocking-bridge `luafs` seam (project-facing `vim.uv.fs_*` / `vim.fn` fs).
+    /// The blocking-bridge `luafs` seam (the project-facing `vim.fn` fs surface).
     pub lua_fs: RemoteLuaFs,
 }
 

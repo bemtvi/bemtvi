@@ -43,7 +43,7 @@ type Pending = Arc<Mutex<HashMap<u64, oneshot::Sender<std::result::Result<Value,
 /// `await`s. Small on purpose: it is the *backpressure window*, the amount of
 /// high-volume data allowed in flight ahead of the consumer. Too large defeats the
 /// point (a flood buffers without bound, so a `^C` keeps draining for seconds); too
-/// small thrashes. ~16 PTY chunks ≈ 128 KiB is enough to keep the wire busy while
+/// small thrashes. ~4 PTY chunks ≈ 32 KiB is enough to keep the wire busy while
 /// keeping the post-cancel drain sub-second.
 const STREAM_CAP: usize = 4;
 

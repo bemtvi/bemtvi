@@ -677,7 +677,8 @@ impl EditHost {
 
     /// Build the `:LspInfo` report: the current buffer's server/encoding/sync/
     /// version/diagnostics, then every running server and every attached buffer.
-    /// Phase-1 observability while there is no on-screen LSP feature yet.
+    /// The textual companion to the on-screen LSP features (diagnostics, hover,
+    /// completion, …) — for inspecting server/attach state.
     pub(crate) fn lsp_info_lines(&self) -> Vec<String> {
         let mut lines = Vec::new();
         let current = self.editor.current_buffer_id();

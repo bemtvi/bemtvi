@@ -17,11 +17,13 @@
 //!
 //! **Scope (Phase 3b).** This seam backs the one-shot `vim.system` / `jobstart` /
 //! `:!` path only — the single spawn site whose shape (run-to-completion, pid then
-//! exit as events) already matches this contract. The clipboard shell-outs (a
-//! synchronous `Clipboard` provider) and the LSP servers (long-lived, bidirectional
-//! raw-pipe transport in `nxvim-lsp`) keep their own spawning for now; folding them
-//! in is a later slice whose shape is matched to the daemon wire protocol rather
-//! than guessed ahead of it (the same discipline that scoped the `HostFs` seam).
+//! exit as events) matches this contract. LSP servers are long-lived bidirectional
+//! raw pipes, a different shape, so they ride their own dedicated daemon leg
+//! ([`RemoteLspTransport`](crate::RemoteLspTransport) over the `lsp_*` wire in
+//! [`daemon`](crate::daemon)) rather than this one. The clipboard shell-outs (a
+//! synchronous `Clipboard` provider) still keep their own spawning — folding them in
+//! is a later slice whose shape is matched to the daemon wire protocol rather than
+//! guessed ahead of it (the same discipline that scoped the `HostFs` seam).
 
 use std::future::Future;
 use std::pin::Pin;

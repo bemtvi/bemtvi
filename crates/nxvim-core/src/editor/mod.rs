@@ -1041,8 +1041,9 @@ pub struct Editor {
     /// The language each buffer was last `open`ed in the engine with, so a query
     /// knows whether to re-`open` (first sync, or the path's language changed) vs
     /// apply incremental `edit` deltas. Dropped when the buffer is deleted. A
-    /// `String` (not `&'static str`) because a `vim.treesitter.start` override can
-    /// name any runtime language, not just one of the built-in extension table's.
+    /// `String` (not `&'static str`) because a `nx.bo.filetype` / `:set filetype`
+    /// override can name any runtime language, not just one of the built-in
+    /// extension table's.
     syntax_opened: HashMap<BufferId, String>,
     /// Languages whose grammar was *installed but failed to load*, already echoed
     /// once. Dedups the failure message so opening many files of a broken-grammar
@@ -1059,8 +1060,8 @@ pub struct Editor {
     /// enabled (the default, when a language resolves). `Some(false)`: highlighting
     /// off even though the filetype/language still resolves — so `filetype = rust`
     /// with `ts_highlight = false` keeps LSP/indent on rust while treesitter stays
-    /// dark. Written by `nx.bo.ts_highlight` / `:set ts_highlight` / the
-    /// `nx.treesitter` (and aliased `vim.treesitter`) `start`/`stop` verbs.
+    /// dark. Written by `nx.bo.ts_highlight` / `:set ts_highlight` (and the
+    /// [`Editor::ts_start`] / [`Editor::ts_stop`] helpers).
     ts_enabled: HashMap<BufferId, bool>,
     /// The host clipboard backing the `"+` / `"*` registers, or `None` in a
     /// bare-core test (or a front end whose platform backend failed to start).

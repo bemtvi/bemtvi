@@ -240,8 +240,8 @@ pub struct ServerInit {
     /// so it rides [`ServerInit`] onto the server's own thread, where it is rebuilt into
     /// the shared `Arc<dyn LspTransport>` the [`LspManager`] holds.
     pub lsp_transport: Option<Box<dyn nxvim_lsp::LspTransport + Send>>,
-    /// The backend the **project-facing** Lua filesystem surface (`vim.uv.fs_*`,
-    /// `vim.fn.readblob`/`glob`/`filereadable`/`executable`/…) runs through. `None`
+    /// The backend the **project-facing** Lua filesystem surface (the `vim.fn` fs
+    /// builtins: `readblob`/`glob`/`filereadable`/`executable`/…) runs through. `None`
     /// (the default) hits the local disk via the persistent
     /// [`StdLuaFs`](nxvim_lua::StdLuaFs); the edit-host split injects a daemon-backed
     /// [`RemoteLuaFs`] here so a plugin reads the *remote* project (file previews,
@@ -682,8 +682,9 @@ pub struct EditHost {
     /// file a new identity) re-arms — so the watch follows the file across atomic
     /// replaces. Each watch's loop id is [`INTERNAL_WATCH_BASE`]` + buffer.0`, which
     /// the [`LoopEvent::FsEvent`] arm uses to route a change back to `checktime` for
-    /// that buffer (vs. running a Lua `vim.uv.fs_event` callback). Local sessions
-    /// only — a daemon session uses [`EditHost::remote_watches`] instead.
+    /// that buffer (the native file-watch machinery is the sole `FsEvent` producer —
+    /// there is no Lua fs-event surface). Local sessions only — a daemon session uses
+    /// [`EditHost::remote_watches`] instead.
     buf_watches: HashMap<BufferId, (PathBuf, Option<FileStat>)>,
     /// The paths watched on the **daemon** (`HostWatch` leg) in a daemon session — the
     /// remote analogue of [`EditHost::buf_watches`]. [`EditHost::sync_buffer_watches`] arms a
@@ -1033,8 +1034,8 @@ impl EditHost {
         due.sort_by_key(|t| t.due_ms);
         let mut fired_any = false;
         for timer in due {
-            // Skip a timer a prior callback in this pass stopped (`:stop` / `vim.uv`
-            // close); re-arm a repeat or drop a one-shot *before* running the callback.
+            // Skip a timer a prior callback in this pass stopped (via its `nx.timer` /
+            // `vim.defer_fn` handle); re-arm a repeat or drop a one-shot *before* running the callback.
             let Some(idx) = self.wasm_timers.iter().position(|t| t.id == timer.id) else {
                 continue;
             };
@@ -1075,8 +1076,8 @@ impl EditHost {
         });
     }
 
-    /// Cancel the Worker-side timer armed under `id` (a `:stop` / `vim.uv` close, or a
-    /// `defer_fn` handle's stop) — the wasm branch of
+    /// Cancel the Worker-side timer armed under `id` (an `nx.timer` handle's stop, or a
+    /// `vim.defer_fn` handle's stop) — the wasm branch of
     /// [`LoopOp::TimerStop`](nxvim_lua::LoopOp::TimerStop). A no-op if it already fired.
     pub(crate) fn stop_wasm_timer(&mut self, id: u64) {
         self.wasm_timers.retain(|t| t.id != id);
@@ -1346,7 +1347,7 @@ impl EditHost {
 }
 
 /// Base for the loop ids of the server's **internal** per-buffer file watches, set
-/// far above any Lua-allocated `vim.uv.fs_event` callback id so a [`LoopEvent::FsEvent`]
+/// far above any Lua-allocated callback id so a [`LoopEvent::FsEvent`]
 /// can be classified by `id >= INTERNAL_WATCH_BASE` alone. Buffer `b`'s watch id is
 /// `INTERNAL_WATCH_BASE + b.0`, so the change routes straight back to the buffer with
 /// no side table. (Lua callback ids are monotonic from 1 and never approach `1 << 48`.)
@@ -1618,7 +1619,7 @@ where
         let sys: Rc<dyn nxvim_lua::BlockingSystem> = sys;
         lua.set_blocking_system(sys);
     }
-    // The project-facing Lua filesystem surface (`vim.uv.fs_*` / `vim.fn` fs builtins)
+    // The project-facing Lua filesystem surface (the `vim.fn` fs builtins)
     // runs through this seam — the local disk by default, or an injected daemon bridge
     // so a plugin sees the *remote* project. Rebuilt here, on the server thread, into the
     // Lua runtime's `Rc<dyn LuaFs>` (the same `Send`-dropping two-step). `None` leaves the

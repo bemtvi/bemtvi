@@ -302,7 +302,7 @@ pub struct WindowView {
     /// File name for this window's status line (`"[No Name]"` when unset).
     pub file_name: String,
     /// The buffer's **effective** treesitter filetype/language — the override
-    /// (`:set filetype=…`, `vim.treesitter.start`) when set, otherwise the
+    /// (`:set filetype=…` / `nx.bo.filetype`) when set, otherwise the
     /// extension-derived language, otherwise empty. The server highlights
     /// in-process so it ignores this, but the serverless web build picks its
     /// front-end grammar from it (preferring it over the file extension), which

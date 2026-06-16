@@ -35,8 +35,8 @@ pub(crate) const PANEL_ON_SELECT: &str = "nxvim_panel_on_select";
 
 /// `vim.regex(pat)` userdata: a vim pattern compiled by the real vim regexp engine
 /// ([`nxvim_regex`]). Its `:match_str(text)` returns the match's `(start, end)`
-/// byte offsets or `nil` — the shape neovim's regex object exposes, consumed by
-/// `vim.treesitter.query`'s `#match?`. The reported span honours `\zs`/`\ze`.
+/// byte offsets or `nil` — the shape neovim's regex object exposes. The reported
+/// span honours `\zs`/`\ze`.
 struct LuaRegex {
     re: nxvim_regex::VimRegex,
 }
@@ -2038,9 +2038,8 @@ pub(crate) fn install_runtime_api(
     )?;
 
     // `vim.regex(pat)`: compile a vim pattern into a regex object exposing
-    // `:match_str(text)` -> (start, end) byte offsets or nil. Backs `query.lua`'s
-    // `#match?` predicate (it compiles each `\v`-prefixed pattern through here).
-    // Same vim-magic dialect as `vim.fn.substitute`; an invalid pattern raises.
+    // `:match_str(text)` -> (start, end) byte offsets or nil. Same vim-magic
+    // dialect as `vim.fn.substitute`; an invalid pattern raises.
     vim.set(
         "regex",
         lua.create_function(|_, pat: String| {
@@ -2053,10 +2052,11 @@ pub(crate) fn install_runtime_api(
     // `nx._system(cmd, cwd, env, text)`: spawn `cmd` (an argv list — no shell),
     // block until it exits, and return `{ code, stdout, stderr, pid }`. The pure-Lua
     // `vim.system` wrapper layers neovim's object shape (`:wait()` / `on_exit`)
-    // over it. It is synchronous because the Lua VM has no event loop yet (see
-    // `vim.schedule`): an `lsp/<server>.lua` `root_dir` that shells out — e.g.
-    // rust_analyzer's `cargo metadata` / `rustc --print sysroot` — runs to
-    // completion inline on the input tick. Unlike neovim, a spawn failure (a
+    // over it. This is the blocking form (the async `on_exit` form rides the
+    // off-tick `nx._system_async` event-loop path instead): it shells out inline
+    // because the caller needs the value *now* — an `lsp/<server>.lua` `root_dir`
+    // that runs e.g. rust_analyzer's `cargo metadata` / `rustc --print sysroot`
+    // resolves to completion on the input tick. Unlike neovim, a spawn failure (a
     // missing tool) degrades to `code = -1` with the message on `stderr` instead
     // of raising, so it can never break `vim.lsp.enable` on a machine that lacks
     // the toolchain. stdout/stderr are returned as Lua byte strings (so non-UTF-8

@@ -952,7 +952,7 @@ pub unsafe extern "C" fn eh_save_len(h: *mut WasmEditHost, seq: f64) -> usize {
 /// `[{ "is_dir": bool, "name": str }, …]` → the file-explorer listing), any other a read
 /// error (`contents` is the message). A file's bytes cross as a pointer+length (not a C
 /// string) so non-UTF-8 / invalid-UTF-8 content reaches Rust intact and is decoded through
-/// the shared encoding seam ([`crate::encoding::decode_to_rope`]) exactly like the native
+/// the shared encoding seam ([`nxvim_core::encoding::decode_to_rope`]) exactly like the native
 /// and daemon read paths — the browser no longer `TextDecoder`s (and thus mangles) the
 /// bytes in JS first. `contents` carries only the dir JSON (`kind == 2`) and the error
 /// message; it is empty for a file/new read. Drives the real lifecycle and repaints — see

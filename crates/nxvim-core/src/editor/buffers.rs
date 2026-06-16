@@ -212,10 +212,9 @@ impl Editor {
     }
 
     /// Drain buffer `id`'s **Lua-treesitter** edit journal — the byte-delta stream
-    /// the server forwards to the `vim.treesitter` platform parser as
-    /// `nvim_buf_attach` `on_bytes` (so the Lua `LanguageTree` reparses
-    /// incrementally instead of re-reading the whole snapshot). Parallel to
-    /// [`Editor::take_lsp_edits_of`]; `None` if no such buffer is open.
+    /// the server projects into neovim's `on_bytes` tuples for the Lua side (so it
+    /// can reparse incrementally instead of re-reading the whole snapshot).
+    /// Parallel to [`Editor::take_lsp_edits_of`]; `None` if no such buffer is open.
     pub fn take_lua_ts_edits_of(&mut self, id: BufferId) -> Option<EditBatch> {
         self.buffers
             .map
@@ -859,8 +858,8 @@ impl Editor {
 
     /// `:checktime` for a single buffer — the entry point the **watcher** uses (the
     /// server's per-buffer file watch fires this on a change). Enqueues the reconcile
-    /// like `:checktime`; a no-op for an unknown buffer or in a daemon session (the
-    /// remote stat is the `HostWatch` slice, not yet wired).
+    /// like `:checktime`; a no-op for an unknown buffer or in a daemon session (where
+    /// the remote stat arrives via the `HostWatch` server-push leg instead).
     pub fn checktime_buffer(&mut self, id: BufferId) {
         if self.host_fs_offtick || !self.buffers.map.contains_key(&id) {
             return;

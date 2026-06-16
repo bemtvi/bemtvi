@@ -39,7 +39,7 @@ pub struct Options {
     /// The `'statusline'` format string (neovim's `%`-format mini-language).
     /// Empty means the built-in default look; a non-empty value is parsed and
     /// rendered by the statusline engine. Global-only for now (no per-window
-    /// override). The one wired string-valued global option.
+    /// override).
     pub statusline: String,
     /// The `'tabline'` format string (the same `%`-format mini-language the
     /// statusline uses, plus the `%T`/`%X` tab click-region items). Empty means

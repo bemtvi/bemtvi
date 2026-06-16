@@ -54,11 +54,11 @@ pub struct Grammar {
 }
 
 /// Just the parser half of a grammar: the `Language` and the dynamic library it
-/// lives in, with **no** query files required. The `vim.treesitter` Lua platform
-/// stands on this — a plugin creates a parser or compiles its own query without
-/// the editor's `highlights.scm`/`indents.scm`, which only the [`Grammar`]
-/// highlighter needs. The library is held so the language's code outlives every
-/// tree and node derived from it (see the Lua binding's lifetime model).
+/// lives in, with **no** query files required — a bare parser load for a caller
+/// that wants to create a parser or compile its own query without the editor's
+/// `highlights.scm`/`indents.scm`, which only the [`Grammar`] highlighter needs.
+/// The library is held so the language's code outlives every tree and node
+/// derived from it.
 pub struct LoadedLanguage {
     // Field order matters: `language` drops before `_lib`.
     pub language: Language,
@@ -177,7 +177,7 @@ fn open_language(
     // (traversal / absolute path) and load an arbitrary shared object. Reject
     // anything that isn't a plain grammar identifier before touching the
     // filesystem. Callers only ever *should* pass names from the fixed filetype
-    // table (or a plugin's `get_parser(lang)`), but must not assume that.
+    // table, but must not assume that.
     if !is_valid_language(lang) {
         return Err(LoadError::Failed(anyhow!("invalid language name '{lang}'")));
     }

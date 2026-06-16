@@ -107,17 +107,16 @@ pub struct Buffer {
     /// `resync` for the LSP journal (whole-rope replacement: undo/redo/reload).
     lsp_resync: bool,
     /// A **third** independent edit journal drained by
-    /// [`Buffer::take_lua_ts_edits`], feeding the Lua `vim.treesitter` platform's
-    /// `nvim_buf_attach` `on_bytes` channel (the second, plugin-facing parser a
-    /// `get_parser` call builds — distinct from the native highlight engine, which
-    /// drains [`Buffer::take_edits`]). Kept separate for the same reason `lsp_edits`
-    /// is: the consumers drain at different moments (the native engine on the sync
-    /// editor path, the Lua parser on the async server side before any Lua runs), so
-    /// one destructive journal would let whichever drains first starve the other and
-    /// silently corrupt the Lua-side incremental tree.
+    /// [`Buffer::take_lua_ts_edits`], which the server projects into neovim's
+    /// `on_bytes` byte-delta tuples for the Lua side (distinct from the native
+    /// highlight engine, which drains [`Buffer::take_edits`]). Kept separate for the
+    /// same reason `lsp_edits` is: the consumers drain at different moments (the
+    /// native engine on the sync editor path, this one on the async server side
+    /// before any Lua runs), so one destructive journal would let whichever drains
+    /// first starve the other.
     lua_ts_edits: Vec<BufferEdit>,
     /// `resync` for the Lua-treesitter journal (whole-rope replacement → the Lua
-    /// `LanguageTree` must fully reparse via `on_reload`, not edit its trees).
+    /// side must fully reparse via a reload, not replay deltas onto its trees).
     lua_ts_resync: bool,
     /// A **fourth** edit journal, drained by [`Buffer::take_jump_edits`], feeding
     /// the editor's per-window jumplist line-adjustment: a `<C-o>` target on a line
@@ -587,11 +586,11 @@ impl Buffer {
         }
     }
 
-    /// Drain the **Lua-treesitter** edit journal — the independent `on_bytes`
-    /// stream feeding the `vim.treesitter` platform parser (parallel to
-    /// [`Buffer::take_edits`] / [`Buffer::take_lsp_edits`]). A `resync` batch means
-    /// the Lua `LanguageTree` should fully reparse (`on_reload`) rather than edit
-    /// its trees with now-meaningless deltas.
+    /// Drain the **Lua-treesitter** edit journal — the independent byte-delta
+    /// stream the server projects into `on_bytes` tuples for the Lua side (parallel
+    /// to [`Buffer::take_edits`] / [`Buffer::take_lsp_edits`]). A `resync` batch
+    /// means the Lua side should fully reparse rather than replay now-meaningless
+    /// deltas.
     pub fn take_lua_ts_edits(&mut self) -> EditBatch {
         EditBatch {
             edits: std::mem::take(&mut self.lua_ts_edits),

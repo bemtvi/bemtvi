@@ -274,8 +274,8 @@ pub enum LspOp {
     },
 }
 
-/// A request to the async runtime (the "event loop"), queued by the `vim.schedule`
-/// / `vim.defer_fn` / `vim.uv` timer / `vim.system` family and drained by the
+/// A request to the async runtime (the "event loop"), queued by the `nx.schedule`
+/// / `nx.timer` / `vim.system` (`nx.run`) family and drained by the
 /// server in `apply_lua_effects`. Each op carries a `cb_id` into `nx._cb_fns`
 /// (the deferred-callback registry); the server either services it directly
 /// ([`LoopOp::Schedule`], same-convergence deferral) or forwards it to the
@@ -286,7 +286,7 @@ pub enum LoopOp {
     /// `vim.schedule(fn)` — run callback `id` once, at the end of the current
     /// convergence (no wall-clock wait, no actor; serviced inside `run_pending`).
     Schedule { id: u64 },
-    /// `vim.defer_fn` / `vim.uv` timer `:start` — arm a timer that fires callback
+    /// `nx.timer` (`vim.defer_fn`) handle `:start` — arm a timer that fires callback
     /// `id` after `delay_ms`, then every `repeat_ms` while `repeat_ms > 0` (a
     /// one-shot when `repeat_ms == 0`). Forwarded to the event-loop actor.
     TimerStart {
@@ -294,15 +294,14 @@ pub enum LoopOp {
         delay_ms: u64,
         repeat_ms: u64,
     },
-    /// `vim.uv` timer `:stop`/`:close` (or a `defer_fn` handle's `:stop`) — cancel
-    /// the timer armed under `id`. A no-op if it already fired or was never armed.
+    /// A `nx.timer` (`vim.defer_fn`) handle's `:stop` — cancel the timer armed
+    /// under `id`. A no-op if it already fired or was never armed.
     TimerStop { id: u64 },
     /// `vim.system(cmd, opts, on_exit)` with an `on_exit` — spawn `cmd` in the
     /// actor (off the server thread) and run callback `id` with the result when it
     /// exits. The pid is returned synchronously by the bridge; only the *wait* is
-    /// async. `stdin` is fed to the child's standard input then closed (empty for
-    /// `vim.system`, which takes no stdin; non-empty for a `uv.spawn` pipe written
-    /// by a plugin's job runner).
+    /// async. `stdin` is fed to the child's standard input then closed (empty when
+    /// the caller passes no `opts.stdin`; non-empty when `vim.system` is given one).
     Spawn {
         id: u64,
         cmd: Vec<String>,
@@ -652,7 +651,7 @@ pub enum TabOp {
 /// payload typed here (rather than passing `mlua::Value`s) lets the actor — which
 /// produced the bytes off-thread — stay free of any Lua types.
 pub enum CallbackArgs {
-    /// No arguments (`vim.schedule`, `vim.defer_fn`, `vim.uv` timers).
+    /// No arguments (`vim.schedule`, `vim.defer_fn` / `nx.timer` timers).
     None,
     /// An async `vim.system` exit: the result table its `on_exit` is called with.
     Process {

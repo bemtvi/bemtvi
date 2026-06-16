@@ -1,5 +1,5 @@
 -- nxvim Lua prelude — runtime services.
--- The nx._notimpl loud-failure funnel, the deferred-callback registry (nx.schedule / _cb_fns / proc pids), and nx.notify / nx.inspect (with vim.* aliases). (vim.treesitter is wired later, in prelude/treesitter.lua.)
+-- The nx._notimpl loud-failure funnel, the deferred-callback registry (nx.schedule / _cb_fns / proc pids), and nx.notify / nx.inspect (with vim.* aliases).
 -- Loaded as one of the sequential prelude chunks by `LuaRuntime::new`
 -- (see runtime.rs); the pure-Lua half of `nx.*` (with vim.* aliases) layered on the Rust bridge.
 

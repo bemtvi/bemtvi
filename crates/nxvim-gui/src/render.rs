@@ -403,10 +403,6 @@ impl Renderer {
             .collect()
     }
 
-    /// Paint one frame from `view`. When `scroll` is set, the focused window's
-    /// text slides at the interpolated offset (smooth scrolling). Returns `Err`
-    /// only on an unrecoverable surface error; a transient `Lost`/`Outdated`
-    /// reconfigures and skips.
     /// Hand a remote preview's fetched bytes (an `nxvim_image_read` reply, routed from
     /// the IO thread) to the image store, so the next paint decodes them. The caller
     /// requests a repaint afterward.
@@ -425,6 +421,10 @@ impl Renderer {
         self.image_store.clear();
     }
 
+    /// Paint one frame from `view`. When `scroll` is set, the focused window's
+    /// text slides at the interpolated offset (smooth scrolling). Returns `Err`
+    /// only on an unrecoverable surface error; a transient `Lost`/`Outdated`
+    /// reconfigures and skips.
     pub fn render(
         &mut self,
         view: &View,

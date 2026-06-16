@@ -331,11 +331,11 @@ async fn unknown_extmark_option_errors() {
     );
 }
 
-/// Virtual text (and the rest of the decoration family) is ACCEPTED and STORED —
-/// a documented approximation: the mark is created (so the plugin's render path
-/// doesn't break) and the payload is returned by a details read, but it isn't
-/// painted yet. This is what lets a fuzzy-finder plugin's result counter / preview
-/// overlays run instead of erroring.
+/// A `virt_text` extmark is accepted, stored, and round-trips: the mark is
+/// created and its payload comes back from a details read. This guards the
+/// store + `details` mirror in isolation; the redraw-projection / painting of
+/// each `virt_text_pos` (eol, inline, overlay, right_align, win_col) is covered
+/// by the dedicated tests below.
 #[tokio::test]
 async fn virtual_text_is_accepted_and_stored() {
     let (rpc, _rx) = start().await;

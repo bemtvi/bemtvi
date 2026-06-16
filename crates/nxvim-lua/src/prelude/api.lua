@@ -6,12 +6,12 @@
 -- read/define (nx.hl), namespaces (nx.ns), and the extmark decoration layer. The
 -- matching vim.api.nvim_* / vim.fn.* names are aliased onto each native.
 --
--- The MUTATING entity surface — nvim_buf_set_lines/set_text/set_name, the window /
--- tab / float create-and-modify API (nvim_open_win, nvim_win_set_*,
--- nvim_set_current_*), nvim_create_buf / nvim_buf_delete, nvim_feedkeys, and the
--- nvim_buf_attach change channel — is intentionally absent: nxvim's config API is
--- autocmds, diagnostics, keymaps, and options/settings; the entity *mutation*
--- surface is not part of it.
+-- The buffer-TEXT / lifecycle mutation surface — nvim_buf_set_lines/set_text/set_name,
+-- nvim_create_buf / nvim_buf_delete, and the nvim_buf_attach change channel — is
+-- intentionally absent: nxvim's config API is autocmds, diagnostics, keymaps, and
+-- options/settings, not direct buffer-content mutation. (The window / tab / float
+-- create-and-modify API — nvim_open_win, nvim_win_set_*, nvim_set_current_* — does
+-- land, queued through the nx._open_win / nx._win_* Rust bridges; see below.)
 --
 -- Reads the mirror state / resolvers from prelude/state.lua (loaded just before
 -- this chunk).
@@ -280,8 +280,7 @@ end
 
 -- nvim_buf_get_offset: byte offset of the start of (0-based) line `index`, i.e.
 -- the sum of every preceding line's bytes plus its newline. `index == line_count`
--- yields the buffer's total byte length. Backs vim.treesitter._range.add_bytes
--- for buffer-sourced node ranges.
+-- yields the buffer's total byte length.
 function nx.buf.offset(bufnr, index)
   local buf = nx._bufs[nx._resolve_bufnr(bufnr)]
   if not buf or not buf.lines then
@@ -297,8 +296,7 @@ end
 
 -- nvim_buf_get_text: the text in the (0-based, end-exclusive) byte range
 -- [start_row,start_col)..[end_row,end_col), returned as a list of lines (the span
--- split on newlines). Columns are byte indices into their line. vim.treesitter
--- uses this to extract node text from a buffer.
+-- split on newlines). Columns are byte indices into their line.
 function nx.buf.text(bufnr, start_row, start_col, end_row, end_col, _opts)
   local buf = nx._bufs[nx._resolve_bufnr(bufnr)]
   if not buf or not buf.lines then
@@ -370,14 +368,14 @@ local EXTMARK_OPT_OK = {
   priority = true,
 }
 -- Decoration options nxvim ACCEPTS and STORES (so nvim_buf_get_extmarks(…,
--- {details=true}) returns them) but does NOT yet render — virtual text, virtual
--- lines, signs, conceal, and the line/gravity flags. A documented approximation
--- (the matchadd / winblend pattern): a plugin that decorates with virtual text
--- (a right-aligned result counter, a preview overlay, gutter signs) loads
--- and runs; the supplementary glyphs just aren't painted yet. Rejecting them loud
--- (the v1 behavior) would instead break the plugin's render path. The core
--- extmark store still tracks the mark's POSITION (for get_extmarks), only the
--- decoration payload is unrendered.
+-- {details=true}) returns them), forwarded to the server as the `decoration` payload.
+-- `virt_text` / `virt_lines` (with their `virt_text_pos` / `hl_mode` / `win_col`
+-- modifiers) RENDER end to end; the rest — signs, conceal, the line-highlight groups,
+-- and the gravity flags — are accepted and stored but NOT yet painted. A documented
+-- approximation (the matchadd / winblend pattern): a plugin that decorates with, say,
+-- gutter signs loads and runs; those supplementary glyphs just aren't painted yet.
+-- Rejecting them loud would instead break the plugin's render path. The core extmark
+-- store still tracks the mark's POSITION (for get_extmarks) regardless.
 local EXTMARK_OPT_DECORATION = {
   virt_text = true,
   virt_text_pos = true,

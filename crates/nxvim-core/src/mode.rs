@@ -1,7 +1,7 @@
 /// The editor's current input mode.
 ///
-/// Mirrors vim's modes. The set is deliberately small for now and will grow
-/// (operator-pending, terminal, select, etc.) as the editor matures.
+/// Mirrors vim's modes. The set is deliberately small and grows
+/// (operator-pending, select, etc.) as the editor matures.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mode {
     Normal,
@@ -30,9 +30,9 @@ pub enum Mode {
 /// `Editing` context uses the per-mode trie with the command-grammar disambiguation
 /// oracle and the literal-argument bypass; a widget context uses that widget's
 /// dedicated bucket (`vim.keymap.set('picker', …)`) with neither (a widget has no
-/// core command grammar). Until a widget is converted to the keymap engine it stays
-/// `Editing` and its keys are grabbed in core as before. Phase 1 adds `Picker`; the
-/// other grabbing widgets (select / panel / explorer / cmdline) follow.
+/// core command grammar). Each grabbing widget — picker, select, panel, explorer —
+/// has its own context variant below; the cmdline routes through the `'c'` mode
+/// bucket instead.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum KeyContext {
     /// The buffer — the normal/insert/visual/… per-mode trie applies.

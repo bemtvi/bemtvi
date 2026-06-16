@@ -1,6 +1,6 @@
 //! Host primitives the Lua bridge stands on: filesystem / process / `$PATH` /
 //! glob helpers and the standard-path math. Pure Rust (no `mlua` types), called
-//! from [`crate::install`] to back `vim.fn.*` / `vim.uv.*` and from
+//! from [`crate::install`] to back the `vim.fn.*` builtins and from
 //! [`crate::runtime`] to seed `package.path`.
 
 use std::path::PathBuf;

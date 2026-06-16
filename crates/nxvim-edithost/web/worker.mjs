@@ -52,7 +52,7 @@ const eh_remote_file_changed = M.cwrap("eh_remote_file_changed", null, ["number"
 const eh_set_daemon_connected = M.cwrap("eh_set_daemon_connected", null, ["number", "number"]);
 const eh_take_proc_requests = M.cwrap("eh_take_proc_requests", "number", ["number"]);
 const eh_proc_spawned = M.cwrap("eh_proc_spawned", null, ["number", "number", "number"]);
-// Streaming stdout (`nx.spawn`'s `on_stdout`): the daemon pushes `proc_stdout` batches; the
+// Streaming stdout (`nx.run_stream`'s batches): the daemon pushes `proc_stdout` batches; the
 // lines ride as a JSON string array (newline-stripped) into the Lua callback.
 const eh_proc_stdout = M.cwrap("eh_proc_stdout", null, ["number", "number", "string"]);
 const eh_proc_exited = M.cwrap("eh_proc_exited", null, ["number", "number", "number", "number", "number", "number", "number"]);
@@ -406,8 +406,9 @@ async function opfsWrite(path, bytes) {
 // unchanged — `has_remote_fs()` is already true, so `:e`/`:w` defer the same way; only the
 // transport that answers `eh_take_fs_requests` differs. This is the browser twin of the
 // native `connect_quic` fs leg (Phase 3d/3e): editing stays in the Worker, only fs crosses
-// the wire. The other five legs (proc/watch/lsp/sys_run/luafs) are later slices on this
-// same `RpcClient`. Config + shada stay LOCAL (OPFS) even in daemon mode — the thesis.
+// the wire. The watch (Phase 6c), async-proc (6d), and terminal (Phase 7) legs ride this
+// same `RpcClient` too; lsp/sys_run/luafs are later slices. Config + shada stay LOCAL
+// (OPFS) even in daemon mode — the thesis.
 //
 // `daemonUri` rides the Worker's own URL (`?daemon=…`), so the Worker self-configures with
 // no boot-message race. In daemon mode fs NEVER silently falls back to OPFS: a dial failure
@@ -693,7 +694,7 @@ function applyDaemonNotifications() {
       any = true;
     } else if (method === "proc_stdout") {
       // params = [id, lines(array of str)] — a streaming child's stdout batch
-      // (`nx.spawn`'s `on_stdout`). Hand the lines to the Lua callback as JSON.
+      // (`nx.run_stream`). Hand the lines to the Lua callback as JSON.
       const id = params[0];
       const lines = Array.isArray(params[1]) ? params[1].map(String) : [];
       eh_proc_stdout(h, Number(id), JSON.stringify(lines));
@@ -761,7 +762,7 @@ async function drainProcRequests() {
   for (const s of reqs.spawn) {
     liveProcs.add(s.id);
     // The 6th param is the stream flag (the daemon's `decode_spawn` reads it):
-    // a streaming spawn (`nx.spawn`'s `on_stdout`) gets `proc_stdout` batches back.
+    // a streaming spawn (`nx.run_stream`) gets `proc_stdout` batches back.
     await daemon.notify("proc_spawn", [
       s.id, s.argv, s.cwd ?? null, s.env, new Uint8Array(s.stdin), s.stream === true,
     ]);

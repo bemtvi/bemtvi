@@ -1,28 +1,31 @@
 //! The Lua-visible **filesystem** seam — the fs analogue of the [`BlockingSystem`]
 //! shell-out seam (`system.rs`).
 //!
-//! Plugins read the *project* through `vim.uv.fs_*` and a handful of `vim.fn`
-//! builtins (`readfile`, `glob`, `filereadable`, `executable`, …). Those bind
-//! *directly* to `std::fs` today, which is correct for a local session but wrong in
-//! the edit-host / daemon split (`docs/plans/2026-06-09-edit-host-and-browser-lua.md`
-//! → *The full split*): there the editor + Lua VM run **locally** while the project
-//! files live on the remote **daemon**, so a `root_dir` detector or a file
-//! previewer touching the disk directly would see the *wrong* machine.
+//! Plugins read the *project* through a handful of `vim.fn` builtins (`readblob`,
+//! `glob`, `filereadable`, `executable`, `getftime`, `isdirectory`, …) and the
+//! `nx._readdir` primitive. Those bind *directly* to `std::fs` today, which is
+//! correct for a local session but wrong in the edit-host / daemon split
+//! (`docs/plans/2026-06-09-edit-host-and-browser-lua.md` → *The full split*): there
+//! the editor + Lua VM run **locally** while the project files live on the remote
+//! **daemon**, so a `root_dir` detector or a file previewer touching the disk
+//! directly would see the *wrong* machine.
 //!
 //! This module is the synchronous seam those project-facing fs calls route through.
 //! The default ([`StdLuaFs`]) is today's `std::fs` logic factored verbatim, so a bare
 //! local session is byte-for-byte unchanged. A daemon session injects a *blocking
 //! bridge* (`RemoteLuaFs`, in `nxvim-server`'s daemon wire) that runs each operation
 //! on the remote and parks the editor thread on the reply — the fs analogue of the
-//! `vim.system` blocking bridge. The seam is **synchronous** because `vim.uv.fs_stat`
-//! and friends return their value inline on the Lua tick.
+//! `vim.system` blocking bridge. The seam is **synchronous** because a `vim.fn` fs
+//! builtin returns its value inline on the Lua tick. (The [`LuaFs`] trait still
+//! models the full libuv-shaped fs operation set so the daemon wire can serve it;
+//! the live Lua surface only exercises `stat`/`scandir`/`read_file`/`realpath`/`which`.)
 //!
 //! # The split-brain routing rule (decided up front, per the plan)
 //!
-//! **Routes through this seam** (project-facing — must reach the daemon): the whole
-//! `vim.uv.fs_*` surface; `vim.fn` `readfile`/`readblob`/`readdir`/`glob`/
-//! `filereadable`/`isdirectory`/`getfsize`/`getftime`/`resolve`/`executable`/
-//! `exepath`; and the `nx._readdir` primitive `vim.fs.find` walks the project with.
+//! **Routes through this seam** (project-facing — must reach the daemon): the `vim.fn`
+//! fs builtins `readblob`/`glob`/`filereadable`/`isdirectory`/`getftime`/`resolve`/
+//! `executable`/`exepath`; and the `nx._readdir` primitive `vim.fs.find` walks the
+//! project with.
 //!
 //! **Stays local** (config / plugin / VM state — never routed): raw Lua `io.*` /
 //! `os.*`, `require` / `package.path`, `nvim_get_runtime_file` (runtimepath = local
@@ -167,7 +170,7 @@ pub trait LuaFs {
     /// locally over this `Vec`).
     fn scandir(&self, path: &str) -> io::Result<Vec<LuaDirEntry>>;
     /// Create `path` with permission `mode`; `recursive` creates parents too (the
-    /// `vim.fn.mkdir(_, "p")` form), else a single level (`vim.uv.fs_mkdir`).
+    /// `vim.fn.mkdir(_, "p")` form), else a single level.
     fn mkdir(&self, path: &str, mode: u32, recursive: bool) -> io::Result<()>;
     fn rmdir(&self, path: &str) -> io::Result<()>;
     fn unlink(&self, path: &str) -> io::Result<()>;

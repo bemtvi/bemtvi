@@ -7,16 +7,17 @@
 -- re-enters Lua only when the viewport actually moves, which is why expensive,
 -- on-screen-only decorations (rainbow parens, indent guides, inline blame) fit here.
 --
--- Phase 2 (this file): the provider registry + the off-tick dispatch + the `ctx`
--- snapshot. The server drains the per-window "viewport changed" signal (core
+-- This file: the provider registry + the off-tick dispatch + the `ctx` snapshot.
+-- The server drains the per-window "viewport changed" signal (core
 -- `editor/decor.rs`), builds `ctx`, and calls `nx._decor_dispatch(ctx)`; each matching
--- provider's `on_range(ctx, publish)` runs. `publish` normalizes + records the marks;
--- lowering them into the extmark layer so they RENDER (gen-gated) is Phase 3.
+-- provider's `on_range(ctx, publish)` runs. `publish` normalizes the marks and lowers
+-- them into the provider's extmark namespace via `nx._decor_publish`, so they RENDER
+-- (gen-gated — a publish from a viewport the user already scrolled past is dropped).
 
 nx.decor = nx.decor or {}
 
--- nx._decor holds the registered providers (and, in Phase 2, the last published marks
--- for inspection / tests). Each provider: { name, bufs, on_range, ns }.
+-- nx._decor holds the registered providers (and the last published marks, on
+-- `nx._decor.last`, for inspection / tests). Each provider: { name, bufs, on_range, ns }.
 nx._decor = nx._decor or { providers = {} }
 
 -- nx.decor.provider { name, bufs?, on_range }: register a viewport decoration
@@ -54,8 +55,7 @@ function nx.decor.provider(spec)
     bufs = spec.bufs,
     debounce = spec.debounce,
     on_range = spec.on_range,
-    -- One namespace per provider: a republish clears it and re-sets, wholesale
-    -- (Phase 3). Allocated now (cheap, Lua-side) so the dispatch path is ready.
+    -- One namespace per provider: a republish clears it and re-sets, wholesale.
     ns = nx.ns.create("nx.decor:" .. spec.name),
   }
   -- Re-registering a name replaces the provider (idempotent setup) rather than
@@ -142,8 +142,8 @@ local function decor_matches(p, ctx)
   return true
 end
 
--- Normalize one published mark into the canonical form the extmark layer takes
--- (Phase 3 lowers it): `row`/`col` may be positional (`{ row, col, ... }`) or named
+-- Normalize one published mark into the canonical form the extmark layer takes:
+-- `row`/`col` may be positional (`{ row, col, ... }`) or named
 -- (`{ row = R, col = C }`). A mark without numeric row/col fails loud (no silent skip).
 -- v1 renders `hl` only (the spec's hl-only rainbow example); `virt_text`/`sign`/
 -- `conceal` are not plumbed yet, so a mark with no `hl` can render nothing — rather
@@ -240,7 +240,7 @@ local function run_provider(p, ctx)
 end
 
 -- nx._decor_dispatch(ctx): the server calls this off-tick, once per visible-range
--- change, with ctx = { win, buf, top, bot, lines, filetype, gen }. Runs each matching,
+-- change, with ctx = { win, buf, top, bot, lines, filetype, buftype, gen }. Runs each matching,
 -- non-disabled provider's `on_range` (via `run_provider`). A provider with a `debounce`
 -- coalesces a fast continuous scroll into one run: each viewport change (re-)arms a
 -- per-window trailing debounce, so `on_range` fires once the window stops moving for

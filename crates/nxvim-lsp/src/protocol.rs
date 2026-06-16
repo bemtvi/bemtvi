@@ -15,9 +15,9 @@ use lsp_types::{
 };
 
 /// Identifies one language server instance: a `(name, workspace-root)` pair.
-/// `name` is the user-chosen LSP config name (`vim.lsp.config('<name>', …)` /
-/// `vim.lsp.enable('<name>')`), arbitrary rather than a fixed filetype. nxvim runs
-/// at most one child per key and routes a buffer to its server by it.
+/// `name` is the user-chosen LSP config name (the `nx.lsp` control surface in the
+/// lua crate), arbitrary rather than a fixed filetype. nxvim runs at most one child
+/// per key and routes a buffer to its server by it.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct ServerKey {
     pub name: String,

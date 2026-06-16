@@ -357,7 +357,7 @@ impl EditHost {
 
     /// Reconcile the server's internal per-buffer file watches against the live
     /// buffers — the watch leg's local auto-trigger. For every file-backed buffer
-    /// it arms one native watch (reusing the `vim.uv.fs_event` machinery: a
+    /// it arms one native watch (reusing the native fs-watch machinery: a
     /// [`LoopCommand::FsEventStart`] on the file's path) keyed on `(path, disk-stat)`;
     /// a buffer whose key changed (a reload/save re-stamped its disk snapshot, so the
     /// file may be a fresh inode after an atomic replace) is **re-armed** on the same

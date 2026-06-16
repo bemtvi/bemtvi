@@ -1,6 +1,6 @@
 //! The `'statusline'` `%`-format engine — pure, synchronous, and Lua-free, so it
-//! lives in core where every front end shares it (and the `tabline` will later
-//! reuse it verbatim).
+//! lives in core where every front end shares it (and the `tabline` reuses it
+//! verbatim).
 //!
 //! The `%`-format mini-language splits cleanly along nxvim's purity boundary, so
 //! rendering is three pure passes plus an injected escape hatch for expressions:

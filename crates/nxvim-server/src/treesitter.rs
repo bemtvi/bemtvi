@@ -33,8 +33,8 @@ pub(crate) struct SyntaxState {
     /// `(changedtick, first_line, last_line, language)` the cached spans were
     /// computed for, or `None` before the first fetch. The language is part of
     /// the key so a filetype change that leaves the text untouched (`:set
-    /// filetype=…`, `vim.treesitter.start/stop`) still invalidates the memo and
-    /// re-queries the engine — those don't bump `changedtick`.
+    /// filetype=…`, `nx.bo.filetype` / `nx.bo.ts_highlight`) still invalidates the
+    /// memo and re-queries the engine — those don't bump `changedtick`.
     key: Option<(u64, usize, usize, Option<String>)>,
     /// Latest spans from the engine, keyed by absolute buffer line.
     spans: HashMap<usize, Vec<ByteSpan>>,

@@ -11,8 +11,8 @@
 //   request       [0, msgid, method, params]   (edit-host → daemon; we send these)
 //   response      [1, msgid, error, result]    (daemon → edit-host; resolves a request)
 //   notification  [2, method, params]          (either direction, fire-and-forget)
-// Request *responses* are routed by msgid; the daemon's *pushes* (proc/lsp/fs_changed) are
-// notifications surfaced via `onNotify` (unused by this slice's fs leg, ready for the next).
+// Request *responses* are routed by msgid; the daemon's *pushes* (proc/terminal/fs_changed)
+// are notifications surfaced via `onNotify`, which the Worker handles in `onDaemonNotify`.
 import { encode, decodeMultiStream } from "./vendor/msgpack/index.mjs";
 
 /** A live msgpack-RPC client over one WebTransport bidi stream. */

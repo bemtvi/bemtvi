@@ -2,9 +2,9 @@
 //!
 //! `nxvim-core` reaches the filesystem only through [`HostFs`] — never `std::fs`
 //! directly — so the *same* editing core can run against the local disk
-//! ([`StdHostFs`], the default) or, eventually, a remote daemon over the wire
-//! (the edit-host / daemon split — see
-//! `docs/plans/2026-06-09-edit-host-and-browser-lua.md`, Phase 1). The trait is
+//! ([`StdHostFs`], the default) or a remote daemon over the wire (the edit-host /
+//! daemon split — see `docs/plans/2026-06-09-edit-host-and-browser-lua.md`). The
+//! trait is
 //! deliberately **synchronous**: it is called on the editing path's terms (at
 //! buffer open / save, not per-keystroke), and any async waiting belongs *above*
 //! core — in the server, which can populate a buffer off-tick and hand it down.

@@ -2206,14 +2206,6 @@ fn render_menu(
     })
 }
 
-/// Draw the completion docs sidebar (Phase 4-D) as its own fully-bordered float at
-/// `docs`'s text-area-relative **content** geometry: the documentation lines (dimmed,
-/// like a hover) inside a box. A sibling of the completion popup, not a column within
-/// it; the server already positioned it beside the popup and clamped it on screen.
-/// `docs.col` names the inner content **column** (the same convention as the
-/// completion popup's one-cell-left-shifted content anchor), so the bordered box is
-/// drawn one cell left of it — the left border then lands flush against the popup's
-/// right border. `docs.row` is the box's top row as-is.
 /// Render the list-less content float (`nx.ui.float`; LSP hover / signature help):
 /// a bordered box of plain content lines at the server-placed geometry (same
 /// text-area-relative convention as the docs sidebar). No selection, no scrolling —
@@ -2256,6 +2248,14 @@ fn render_content_float(frame: &mut Frame, text_area: Rect, float: &nxvim_view::
     frame.render_widget(Paragraph::new(Text::from(lines)), inner);
 }
 
+/// Draw the completion docs sidebar (Phase 4-D) as its own fully-bordered float at
+/// `docs`'s text-area-relative **content** geometry: the documentation lines (dimmed,
+/// like a hover) inside a box. A sibling of the completion popup, not a column within
+/// it; the server already positioned it beside the popup and clamped it on screen.
+/// `docs.col` names the inner content **column** (the same convention as the
+/// completion popup's one-cell-left-shifted content anchor), so the bordered box is
+/// drawn one cell left of it — the left border then lands flush against the popup's
+/// right border. `docs.row` is the box's top row as-is.
 fn render_menu_docs(frame: &mut Frame, text_area: Rect, docs: &nxvim_view::MenuDocs) {
     let x = text_area.x.saturating_add(docs.col).saturating_sub(1);
     let y = text_area.y.saturating_add(docs.row);

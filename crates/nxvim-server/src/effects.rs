@@ -329,8 +329,8 @@ impl EditHost {
             self.editor
                 .echo("E: language servers (vim.lsp) are not available in the browser build yet");
         }
-        // Async-runtime requests from `vim.schedule` / `vim.defer_fn` / `vim.uv`
-        // timers / async `vim.system`: a `Schedule` is serviced directly (queued
+        // Async-runtime requests from `vim.schedule` / `vim.defer_fn` / `nx.run` /
+        // `nx.timer` / async `vim.system`: a `Schedule` is serviced directly (queued
         // for the trailing `run_pending` drain); everything else is forwarded to
         // the background event-loop actor, whose completions arrive on the
         // `loop_events` `select!` arm.
@@ -389,12 +389,14 @@ impl EditHost {
                 }
             }
         }
-        // Treesitter bridges from `vim.treesitter.*`: the per-buffer start/stop
-        // toggle (ADR 0001, #1) and the query-resolution push (#4). Each ends by
-        // dropping the affected highlight memo(s) so the next redraw re-queries the
-        // engine — the change isn't reflected in any buffer's changedtick.
-        // Native only — the in-process treesitter engine isn't built for wasm (the
-        // browser highlights JS-side in `nxvim-edithost`); a `vim.treesitter.*` op fails loud.
+        // Treesitter bridges from `nx.treesitter`: the query-override push
+        // (`nx.treesitter.set_query`). Highlight on/off and the language are
+        // declarative buffer state now (`nx.bo.ts_highlight` / `nx.bo.filetype`),
+        // not ops. Applying an override drops every buffer's highlight memo so the
+        // next redraw re-queries the engine — the change isn't reflected in any
+        // buffer's changedtick. Native only — the in-process treesitter engine
+        // isn't built for wasm (the browser highlights JS-side in `nxvim-edithost`);
+        // a treesitter op fails loud there.
         #[cfg(feature = "native")]
         for op in self.lua.take_ts_ops() {
             match op {
@@ -1214,9 +1216,9 @@ impl EditHost {
         let mut changed: Vec<(u64, u64, usize, usize)> = Vec::new();
         // Buffers whose text changed since the last mirror, paired with whether they
         // were `known` last push, so the byte-delta drain below (the `nvim_buf_attach`
-        // `on_bytes` channel for the `vim.treesitter` parser) can fire for the ones a
-        // plugin could be attached to and discard a first-seen buffer's pre-attach
-        // deltas. Carries the changedtick to stamp the `on_bytes` callback with.
+        // `on_bytes` channel) can fire for the ones a plugin could be attached to and
+        // discard a first-seen buffer's pre-attach deltas. Carries the changedtick to
+        // stamp the `on_bytes` callback with.
         let mut fresh_ids: Vec<(BufferId, bool, u64)> = Vec::new();
         for id in self.editor.buffer_ids() {
             let tick = self
@@ -1307,13 +1309,12 @@ impl EditHost {
         self.buf_mirror_ticks.retain(|id, _| live.contains(id));
         self.buf_mirror_lines.retain(|id, _| live.contains(id));
 
-        // Drain each changed buffer's Lua-treesitter byte-delta journal and project
-        // it into neovim's `on_bytes` tuple for the `vim.treesitter` parser to edit
-        // its trees with (fired below, once the mirrors are consistent). A `resync`
-        // batch (undo/redo/`:e`) can't be replayed as deltas — signal a reload so the
-        // Lua `LanguageTree` fully reparses instead. A first-seen (`!known`) buffer's
-        // pre-attach deltas are discarded: no parser is attached yet, and its tree
-        // (built later, on the first `get_parser`) starts from a full parse anyway.
+        // Drain each changed buffer's byte-delta journal and project it into neovim's
+        // `on_bytes` tuple for the `nvim_buf_attach` `on_bytes` callbacks (fired below,
+        // once the mirrors are consistent). A `resync` batch (undo/redo/`:e`) can't be
+        // replayed as deltas — signal a reload (the `on_reload` callback) so an
+        // attached consumer re-reads the buffer whole instead. A first-seen (`!known`)
+        // buffer's pre-attach deltas are discarded: no callback is attached yet.
         let mut byte_edits: Vec<BufBytesEdit> = Vec::new();
         let mut byte_reloads: Vec<u64> = Vec::new();
         for (id, known, tick) in fresh_ids {
@@ -1530,9 +1531,9 @@ impl EditHost {
         self.push_undotree_mirror();
         self.push_qflist_mirror();
         // Now that every mirror is consistent, fire the `nvim_buf_attach` callbacks.
-        // `on_bytes` (and `on_reload`) go first — they edit the `vim.treesitter`
-        // parser's trees so the next `:parse()` reparses incrementally — then
-        // `on_lines`, whose callbacks read the refreshed buffer via
+        // `on_bytes` (and `on_reload`) go first — they carry the precise byte deltas a
+        // consumer applies before the coarser line event — then `on_lines`, whose
+        // callbacks read the refreshed buffer via
         // `nvim_buf_get_lines` and schedule follow-up work (a fuzzy-finder plugin
         // re-runs its finder), drained by the enclosing `run_pending` fixpoint.
         if !byte_reloads.is_empty() {
@@ -1599,8 +1600,9 @@ impl EditHost {
             // `vim.schedule` needs no event loop — the id queues for the trailing
             // `run_pending` drain — so it works in every build.
             LoopOp::Schedule { id } => self.scheduled.push_back(id),
-            // Timers / processes / fs-watches ride the tokio event loop. Native only
-            // for now; the Worker-side timer wheel is slice 5d.
+            // Timers / processes ride the tokio event loop. Native only for now; the
+            // Worker-side timer wheel is slice 5d. (The internal per-buffer file watch
+            // is armed directly from lifecycle, not via a `LoopOp`.)
             #[cfg(feature = "native")]
             LoopOp::TimerStart {
                 id,
@@ -1660,7 +1662,7 @@ impl EditHost {
                     self.fx.proc_spawn(id, cmd, cwd, env, stdin, stream);
                 } else {
                     self.editor.echo(
-                        "E: jobs/processes (vim.system / jobstart / vim.uv.spawn) require a \
+                        "E: jobs/processes (vim.system / jobstart) require a \
                          daemon — :connect to one",
                     );
                 }

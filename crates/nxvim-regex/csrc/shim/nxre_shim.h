@@ -66,8 +66,8 @@ void nxre_set_interrupt(bool value);
 /// valid until the next engine call.
 const char *nxre_take_last_error(void);
 
-/// 'regexpengine' (0 = automatic, 1 = backtracking, 2 = NFA) and
-/// 'ignorecase'-independent engine options.
+/// Sets 'regexpengine' (0 = automatic, 1 = backtracking, 2 = NFA), the engine
+/// the next vim_regcomp() compiles with.
 void nxre_set_regexpengine(int64_t engine);
 
 /// Builds a proftime_T deadline `ms` milliseconds from now, for

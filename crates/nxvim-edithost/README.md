@@ -22,9 +22,10 @@ prints) makes `:e` / `:w` / `:e <dir>` operate on the **daemon's** filesystem ov
 **WebTransport (HTTP/3 / QUIC)** connection instead of OPFS — the browser twin of the native
 daemon fs leg, editing still entirely in the Worker (only fs crosses the wire). The off-tick
 seam is identical; only the transport differs (OPFS ↔ the `web/rpc.mjs` msgpack-RPC client
-over a bidi stream). Config + shada stay **local** (OPFS) even in daemon mode. The other
-daemon legs (processes / LSP / watch / `sys_run` / `luafs`) over WebTransport are later
-slices — so a daemon session still fails `system()` loud for now.
+over a bidi stream). Config + shada stay **local** (OPFS) even in daemon mode. The daemon
+fs, watch, async-process (`vim.system` / `jobstart`), and terminal (`:terminal`) legs over
+WebTransport have landed; LSP and `luafs` over the wire are later slices — so a daemon
+session still fails LSP loud for now.
 
 The serverless capability map (the default; daemon mode adds remote files + the legs above):
 
@@ -47,15 +48,20 @@ The serverless capability map (the default; daemon mode adds remote files + the 
   still boots. **One self-contained file only** — `require` of further modules / plugins
   won't resolve, since the browser build's runtimepath is empty and OPFS reads are async
   (Lua's `require` is synchronous). Multi-file/plugin configs are a later step.
-- ❌ Processes — `vim.fn.system` / `nx._system` fail loud with a named "not available in
-  the browser build yet" (`WasmBlockingSystem`); the async spawn path (`LoopOp::Spawn`)
-  likewise echoes loud. The Phase 6 daemon over WebTransport will re-enable them (the fs
-  leg landed in 6b; the process/LSP/watch legs are later slices).
-- ❌ LSP and **native** treesitter — gated off the build (slice 5a); `:TSInstall` echoes
-  a loud "not available in the browser build yet". Syntax **highlighting** is still
-  present: done JS-side in the UI thread via web-tree-sitter (`web/highlight.js` + the
-  `web/vendor/` grammars) — the Worker ships the focused buffer's text with each frame
-  and the page parses + colors it.
+- ⚠️ Processes — the *synchronous* `vim.fn.system` / `nx._system` always fail loud with a
+  named "not available in the browser build yet" (`WasmBlockingSystem`), since there is no
+  blocking shell-out seam in the browser. The *async* spawn path (`vim.system` / `jobstart`)
+  fails loud when **serverless**, but in **daemon mode** it runs over WebTransport (Phase 6d):
+  the spawn crosses to the daemon, whose `proc_spawned` / `proc_exited` pushes land back in
+  the tick. `:terminal` likewise runs against a connected daemon (Phase 7).
+- ⚠️ **Syntax highlighting + tree-sitter** — highlighting is done JS-side in the UI thread
+  via web-tree-sitter (`web/highlight.js` + the `web/vendor/` grammars), the Worker shipping
+  the focused buffer's text with each frame and the page parsing + coloring it; **tree-sitter
+  indentation** routes synchronously through the `eh_js_ts_*` bridge to the Worker's indenter
+  (`web/ts-indent.js`). `:TSInstall <lang>` works: it fetches a prebuilt grammar `.wasm` +
+  queries (offline bundle / OPFS cache / jsDelivr), registers it with the JS highlighter, and
+  caches it in OPFS. **Native** treesitter (the in-process `nxvim-ts` parser) is gated off the
+  build; **LSP** is unavailable and fails loud (a later daemon slice would re-enable it).
 
 ## Interop
 

@@ -59,7 +59,7 @@ impl Editor {
     /// engine's `&mut` never collides with the buffer borrow it reads text from.
     fn sync_syntax_engine(&mut self, buf: BufferId) {
         // The language the engine highlights this buffer as, or `None` when there
-        // is nothing to parse (no grammar for the path, or `vim.treesitter.stop`).
+        // is nothing to parse (no grammar for the path, or `ts_highlight` off).
         let Some(language) = self.ts_language_for(buf) else {
             return;
         };
@@ -205,16 +205,16 @@ impl Editor {
     }
 
     /// Force highlighting for `buf` as `lang` — set the filetype **and** enable.
-    /// The verb behind `nx.treesitter.start` (and its `vim.treesitter.start`
-    /// alias): a buffer the extension table misses, or one previously stopped,
-    /// gets painted as `lang`.
+    /// A buffer the extension table misses, or one previously stopped, gets
+    /// painted as `lang`. (Treesitter is otherwise controlled declaratively
+    /// through the `nx.bo.filetype` / `nx.bo.ts_highlight` buffer options.)
     pub fn ts_start(&mut self, buf: BufferId, lang: String) {
         self.set_filetype(buf, &lang);
         self.set_ts_highlight(buf, true);
     }
 
-    /// Stop highlighting `buf` (the verb behind `nx.treesitter.stop`) — disable
-    /// the enable noun, keeping the filetype so LSP/indent still see the language.
+    /// Stop highlighting `buf` — disable the enable noun, keeping the filetype so
+    /// LSP/indent still see the language.
     pub fn ts_stop(&mut self, buf: BufferId) {
         self.set_ts_highlight(buf, false);
     }

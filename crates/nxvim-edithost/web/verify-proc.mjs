@@ -97,9 +97,9 @@ try {
   await page.evaluate(() => window.__nxvim.ready);
   check("Worker booted + dialed the daemon (window.__nxvim.ready resolved)", true);
 
-  // The async spawn is driven through the real `nx._system_async` funnel (the same one any
-  // public `nx.spawn` / `vim.system` wrapper calls — that public surface is a separate,
-  // still-"proposed" nx.* primitive per ADR 0002; the native proc leg is funnel-only too).
+  // The async spawn is driven through the real `nx._system_async` funnel (the same one the
+  // public `nx.run` / `vim.system` wrappers call — `nx.run` builds the argv and registers a
+  // callback id, then hands off to this funnel; the native proc leg is funnel-only too).
   // A callback id is registered in `nx._cb_fns`, exactly as the wrapper would, so this
   // exercises the genuine spawn → wire → exit → on_exit path, not a mock.
 

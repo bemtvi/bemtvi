@@ -2,18 +2,21 @@
 //!
 //! A thin RPC client that owns no editor state. It attaches to the server,
 //! sends keystrokes as vim key-notation (`nvim_input`), and renders the
-//! server's [`View`](nxvim view map) using **ratatui-native widgets, one per
+//! server's [`View`](nxvim_view::View) using **ratatui-native widgets, one per
 //! region**: the text area, the status line, and the command line are laid out
 //! with a ratatui `Layout` and drawn as separate widgets. There is no neovim UI
 //! protocol and no custom cell renderer.
 //!
-//! The client owns the screen layout: it reserves two rows (status + command)
-//! and tells the server only how tall the *text area* is, so scrolling stays
-//! correct. Input and redraw are multiplexed with `tokio::select!`.
+//! The client owns the screen layout: it reserves one row for the global command
+//! line (each window draws its own status line inside its rect) and tells the
+//! server only how tall the *windows area* is, so scrolling stays correct. Input
+//! and redraw are multiplexed with `tokio::select!`.
 //!
-//! The work is split across submodules: [`view`] mirrors the server's view and
-//! parses each `redraw`, [`parse`] holds the msgpack accessors, [`anim`] is the
-//! scroll-animation state machine, [`render`] paints the frame, and [`keys`]
+//! The semantic-view decode/input layer is frontend-neutral and lives in the
+//! [`nxvim_view`] crate (it mirrors the server's view, parses each `redraw`, and
+//! holds the msgpack accessors). The TUI-specific work is split across submodules:
+//! [`anim`] is the scroll-animation state machine, [`render`] paints the frame,
+//! [`images`] renders `'imagepreview'` pictures via ratatui-image, and [`keys`]
 //! encodes key events. This module keeps only the event loop and transport.
 
 mod anim;

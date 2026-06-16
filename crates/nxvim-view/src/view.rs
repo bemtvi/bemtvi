@@ -371,7 +371,9 @@ pub struct PmenuData {
 /// choice labels, the highlighted index, and the overlay's anchor and content
 /// size in **text-area cells** (the client adds the gutter and text-area origin,
 /// then draws a bordered box) — the same convention as [`PmenuData`], but the
-/// rows are plain labels (no kind / detail) and there is no doc preview yet.
+/// rows are plain labels (no kind / detail). A picker may also carry a side
+/// [`preview`](Self::preview) pane and a completion popup a [`docs`](Self::docs)
+/// sidebar.
 #[derive(Clone)]
 pub struct MenuData {
     pub items: Vec<String>,
@@ -473,7 +475,8 @@ pub struct MenuPreview {
     pub loc: Option<(u16, u16)>,
     /// Per-line native tree-sitter highlight spans (Phase 3b) — same shape as a
     /// window's text highlights (`[start_col, end_col, group, style_id]`), so a
-    /// client reuses its span renderer. Empty (plain text) until 3b lands.
+    /// client reuses its span renderer. Empty inner vecs for unhighlighted lines
+    /// (and for a preview the server couldn't highlight, e.g. an unknown filetype).
     pub highlights: Vec<Vec<HlSpan>>,
 }
 
@@ -840,8 +843,8 @@ fn parse_tabline(value: Option<&Value>) -> Vec<TabData> {
 }
 
 /// Parse the `region_tablines` map (`{ main, left, right, top, bottom }`, each a
-/// `{ tabs, current }`). Absent on an older server ⇒ all-empty (no per-region
-/// tablines drawn).
+/// `{ tabs, current, title }`). Absent on an older server ⇒ all-empty (no
+/// per-region tablines drawn).
 fn parse_region_tablines(value: Option<&Value>) -> RegionTablines {
     let Some(Value::Map(m)) = value else {
         return RegionTablines::default();

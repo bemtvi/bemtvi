@@ -253,8 +253,8 @@ pub struct BoMirror {
 }
 
 /// One buffer change projected into neovim's `nvim_buf_attach` `on_bytes`
-/// argument tuple, fired through [`LuaRuntime::fire_buf_bytes`] so the
-/// `vim.treesitter` parser edits its trees and reparses incrementally. The
+/// argument tuple, fired through [`LuaRuntime::fire_buf_bytes`] so an attached
+/// `on_bytes` callback can edit its state and reparse incrementally. The
 /// row/col fields are *relative* deltas exactly as neovim's `on_bytes` reports
 /// them (see the server's `on_bytes_edit`, which builds these); the runtime
 /// forwards them verbatim to the prelude's `nx._buf_bytes_changed`.
@@ -412,9 +412,9 @@ pub(crate) struct Shared {
     /// Server-start requests from `vim.lsp.start` (driven by `vim.lsp.enable`),
     /// drained by the server into its `LspManager` after the chunk.
     pub(crate) lsp_ops: Vec<LspOp>,
-    /// Async-runtime requests from `vim.schedule` / `vim.defer_fn` / `vim.uv`
-    /// timers / async `vim.system`, drained by the server into its scheduled-work
-    /// queue and event-loop actor after the chunk.
+    /// Async-runtime requests from `nx.schedule` / `nx.timer` (`vim.schedule` /
+    /// `vim.defer_fn`) / async `vim.system` (`nx.run`), drained by the server into
+    /// its scheduled-work queue and event-loop actor after the chunk.
     pub(crate) loop_ops: Vec<LoopOp>,
     /// Buffer-local option writes (`vim.bo`), drained by the server into the live
     /// editor after the chunk. (Buffer text/lifecycle mutation is not part of the API.)
@@ -562,21 +562,23 @@ pub(crate) struct Shared {
     /// returns the child's output inline, not on a later tick. `!Send`, like the rest
     /// of [`Shared`], which lives only on the server's single thread.
     pub(crate) blocking_system: Option<Rc<dyn crate::BlockingSystem>>,
-    /// The backend the **project-facing** Lua filesystem surface (`vim.uv.fs_*`,
-    /// `vim.fn.readfile`/`glob`/`filereadable`/…) runs through. `None` (the default)
+    /// The backend the **project-facing** Lua filesystem surface (the `vim.fn`
+    /// fs builtins `readblob`/`glob`/`filereadable`/`executable`/… and `nx._readdir`)
+    /// runs through. `None` (the default)
     /// resolves to a persistent local [`StdLuaFs`](crate::StdLuaFs) via
     /// [`resolve_lua_fs`]; a daemon session injects a blocking bridge
     /// ([`set_lua_fs`](LuaRuntime::set_lua_fs)) so those calls hit the *remote* project
     /// where the files live. Held here (not a `LoopOp`) because the calls are
     /// synchronous — they return their value inline on the Lua tick. `!Send`, like the
-    /// rest of [`Shared`]. The first resolve installs the default so fd state (an
-    /// `fs_open` handle read back by `fs_read`) persists across calls.
+    /// rest of [`Shared`]. The first resolve installs the default and caches it, so a
+    /// single [`StdLuaFs`](crate::StdLuaFs) instance (and its open-fd table) persists
+    /// across calls.
     pub(crate) lua_fs: Option<Rc<dyn crate::LuaFs>>,
 }
 
 /// Resolve the active [`LuaFs`](crate::LuaFs): the injected daemon bridge, or a
 /// persistent local [`StdLuaFs`](crate::StdLuaFs) lazily installed on first use (so the
-/// open-fd table outlives a single call). Project-facing `vim.uv`/`vim.fn` fs closures
+/// open-fd table outlives a single call). The project-facing `vim.fn` fs closures
 /// call this, mirroring how `nx._system` resolves `blocking_system`.
 pub(crate) fn resolve_lua_fs(shared: &Rc<RefCell<Shared>>) -> Rc<dyn crate::LuaFs> {
     let mut sh = shared.borrow_mut();
@@ -679,8 +681,8 @@ impl LuaRuntime {
     /// Inject the backend the **project-facing** Lua filesystem surface runs through —
     /// the daemon's blocking fs bridge. Without this the default persistent local
     /// [`StdLuaFs`](crate::StdLuaFs) is used (a bare/local session is unchanged). The
-    /// server calls this once at startup when a daemon is present, so `vim.uv.fs_*` /
-    /// `vim.fn.readfile` / root detection see the *remote* project, not the local disk.
+    /// server calls this once at startup when a daemon is present, so the `vim.fn`
+    /// fs builtins / root detection see the *remote* project, not the local disk.
     pub fn set_lua_fs(&self, fs: Rc<dyn crate::LuaFs>) {
         self.shared.borrow_mut().lua_fs = Some(fs);
     }
@@ -886,8 +888,8 @@ impl LuaRuntime {
     }
 
     take_queue! {
-        /// Take the async-runtime requests queued by `vim.schedule` / `vim.defer_fn` /
-        /// `vim.uv` timers / `vim.system` since the last drain, for the server to
+        /// Take the async-runtime requests queued by `nx.schedule` / `nx.timer` /
+        /// `vim.system` (`nx.run`) since the last drain, for the server to
         /// service directly (`Schedule`) or forward to the event-loop actor.
         take_loop_ops -> Vec<LoopOp> = loop_ops
     }
@@ -1579,12 +1581,12 @@ impl LuaRuntime {
     }
 
     /// Fire the `nvim_buf_attach` `on_bytes` callbacks for a batch of byte-level
-    /// edits (the `vim.treesitter` parser's incremental-reparse channel). Each edit
-    /// carries its bufnr/changedtick and neovim's relative `on_bytes` tuple; the
-    /// prelude's `nx._buf_bytes_changed` dispatches it to that buffer's attached
-    /// callbacks (the vendored `LanguageTree:_on_bytes` among them, which edits its
-    /// trees). Edits are forwarded in order — tree-sitter requires every edit
-    /// between two parses, in sequence, or the incremental tree corrupts.
+    /// edits. Each edit carries its bufnr/changedtick and neovim's relative
+    /// `on_bytes` tuple; the prelude's `nx._buf_bytes_changed` dispatches it to that
+    /// buffer's attached callbacks. Edits are forwarded in order, in sequence — a
+    /// consumer that reparses incrementally requires every edit between two parses.
+    /// (Treesitter highlighting is now driven by the native engine, not through this
+    /// Lua channel, so the buf-attach plumbing here has no in-crate consumer.)
     pub fn fire_buf_bytes(&self, edits: &[BufBytesEdit]) -> mlua::Result<()> {
         let nx = self.nx()?;
         let fire: mlua::Function = nx.get("_buf_bytes_changed")?;

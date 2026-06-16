@@ -665,6 +665,12 @@ fn segment_value(text: &str, style: Value) -> Value {
 /// neither a mode name nor an encoding label ever contains `%` — since they are not
 /// `%`-items (neovim has no encoding item; it's conventionally `%{&fenc}`). `enc`
 /// carries the buffer's `'fileencoding'`, with a `[bom]` suffix when `'bomb'` is set.
+///
+/// The `%<` before `%f` is the truncation point (vim's `%<%f` idiom): when the line
+/// is too narrow, the *path* is the thing that shrinks (keeping its tail), so the
+/// right-aligned encoding + position stay visible. Without it the cut would default
+/// to the `%=` marker, and a long path would overflow the prefix and drop the whole
+/// right-aligned section — hiding the encoding behind a `>`.
 fn default_statusline(mode_label: &str, fileencoding: &str, bomb: bool) -> String {
     let enc = if bomb {
         format!("{fileencoding}[bom]")
@@ -672,7 +678,7 @@ fn default_statusline(mode_label: &str, fileencoding: &str, bomb: bool) -> Strin
         fileencoding.to_string()
     };
     format!(
-        " {}  %f%m%={}  %l,%c ",
+        " {}  %<%f%m%={}  %l,%c ",
         mode_label.replace('%', "%%"),
         enc.replace('%', "%%"),
     )

@@ -205,6 +205,18 @@ function nx._fcs_choice()
   return nx._v_mirror.fcs_choice or ""
 end
 
+-- Fire `DirChanged` after a `:cd` / `:chdir` changed the working directory (the
+-- server calls this through `LuaRuntime::fire_dir_changed`). Set `v:event` to
+-- neovim's `{ cwd, scope, changed_window }` payload before firing — a handler
+-- reading `vim.v.event.cwd` (project / session plugins) sees it — and pass the
+-- same table as `args.data`. The autocmd pattern matches `scope` ("global" for
+-- `:cd`); `<afile>` (`args.file`) is the new directory.
+function nx._fire_dir_changed(scope, cwd)
+  local event = { cwd = cwd, scope = scope, changed_window = false }
+  nx._v_mirror.event = event
+  nx._fire("DirChanged", scope, nil, cwd, event)
+end
+
 -- nx.autocmd.exec(event, opts) [alias nvim_exec_autocmds]: fire `event` (or a
 -- list of events) manually. `opts.pattern` (string or list) is matched as in
 -- registration; `opts.buffer` supplies the buffer context (defaulting to the

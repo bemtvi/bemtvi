@@ -28,6 +28,7 @@
 )]
 
 // The synchronous-tick modules — wasm-eligible (the Phase 5 edit-host subset).
+mod cwd;
 mod edithost;
 mod effects;
 mod excmd;
@@ -666,6 +667,13 @@ pub struct EditHost {
     /// [`terminal_freeze`]: EditHost::terminal_freeze
     /// [`terminal_highlights`]: EditHost::terminal_highlights
     terminal_frozen: HashMap<BufferId, Vec<terminal::RowStyles>>,
+    /// The three-scope working-directory model behind `:cd` / `:tcd` / `:lcd` (the
+    /// global dir, plus per-window and per-tab local dirs). The process cwd
+    /// (`std::env::current_dir`, what `vim.fn.getcwd` reads) is kept equal to the
+    /// *current window's* effective dir — `:cd`-family commands mutate both this and
+    /// the cwd, and a window/tab focus change re-applies the effective dir to the
+    /// cwd ([`EditHost::fix_current_dir`]). Seeded from the startup cwd.
+    dirs: cwd::DirState,
     /// The wasm build's timer wheel (slice 5d): pending `vim.defer_fn` / `nx.timer`
     /// timers, fired by the Worker when their [`due_ms`](WasmTimer::due_ms) passes on the
     /// JS clock — the serverless analogue of the tokio timers the native build arms via
@@ -777,6 +785,7 @@ impl EditHost {
             reload_posts: HashSet::new(),
             terminals: HashMap::new(),
             terminal_frozen: HashMap::new(),
+            dirs: cwd::DirState::new(std::env::current_dir().unwrap_or_default()),
             #[cfg(not(feature = "native"))]
             wasm_timers: Vec::new(),
             #[cfg(not(feature = "native"))]

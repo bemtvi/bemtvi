@@ -241,6 +241,8 @@ impl EditHost {
             // The window is already gone, so its buffer is unknown — fire with no
             // buffer context (a buffer-local autocmd can't be bound to it anyway).
             self.fire_window("WinClosed", *w, None);
+            // Drop its window-local dir (`:lcd`) so a reused window id can't inherit it.
+            self.dirs.forget_window(*w);
         }
         self.known_windows = wins;
 
@@ -293,8 +295,18 @@ impl EditHost {
         }
         for t in &closed_tabs {
             self.fire_tab("TabClosed", *t);
+            // Drop its tab-local dir (`:tcd`) so a reused tab id can't inherit it.
+            self.dirs.forget_tab(*t);
         }
         self.known_tabs = tabs;
+
+        // ----- working directory: follow the current window (vim's fix_current_dir) -----
+        // A window/tab focus change can make a different scope's local dir effective
+        // (`:lcd`/`:tcd` are per-window/-tab), so re-apply the current window's
+        // effective dir to the process cwd. Cheap no-op when nothing local is in play.
+        if win_changed || tab_changed {
+            self.fix_current_dir();
+        }
 
         // ----- buffer deletion cleanup -----
         // A deleted buffer's Lua-side buffer-local commands / keymaps must not
@@ -312,6 +324,35 @@ impl EditHost {
         // Keep the native per-buffer file watches in step with the live buffer set
         // (arm new file-backed buffers, disarm closed ones, re-arm on a reload/save).
         self.sync_buffer_watches();
+    }
+
+    /// Re-apply the current window's effective directory to the process cwd after a
+    /// window / tab focus change (vim's `fix_current_dir`). With `:lcd` / `:tcd` in
+    /// play the effective dir differs per window / tab, so a switch must `chdir` so
+    /// `vim.fn.getcwd` and relative paths track the focused window. `DirChanged` fires
+    /// (scope = the source of the now-effective dir) only when the cwd actually moves,
+    /// so a switch between windows that share a dir costs nothing. A vanished target
+    /// (its directory was removed under us) leaves the cwd untouched rather than
+    /// erroring on a passive switch.
+    fn fix_current_dir(&mut self) {
+        let win = self.editor.current_window_id();
+        let tab = self.editor.current_tab_id();
+        let (scope, want) = self.dirs.effective(win, tab);
+        let want = want.to_path_buf();
+        if std::env::current_dir().ok().as_deref() == Some(want.as_path()) {
+            return; // already there — nothing to chdir or announce
+        }
+        if std::env::set_current_dir(&want).is_err() {
+            return;
+        }
+        let cwd = std::env::current_dir().unwrap_or(want);
+        if let Err(e) = self
+            .lua
+            .fire_dir_changed(scope.pattern(), &cwd.display().to_string())
+        {
+            self.editor
+                .echo(format!("E5108: Error in DirChanged autocmd: {e}"));
+        }
     }
 
     /// Reconcile the server's internal per-buffer file watches against the live

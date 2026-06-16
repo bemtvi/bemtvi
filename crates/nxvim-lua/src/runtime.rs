@@ -1408,6 +1408,17 @@ impl LuaRuntime {
         fire.call((event, pattern, buf, file, data))
     }
 
+    /// Fire `DirChanged` after a `:cd` / `:chdir` changed the working directory.
+    /// Delegates to the prelude's `nx._fire_dir_changed`, which sets `v:event`
+    /// (`{ cwd, scope, changed_window }` — neovim's payload, read as
+    /// `vim.v.event.cwd` by project / session plugins) before firing, and passes the
+    /// same table as `args.data`. `scope` is the autocmd pattern (`"global"` for
+    /// `:cd`); `cwd` is the new directory, carried as `<afile>` (`args.file`).
+    pub fn fire_dir_changed(&self, scope: &str, cwd: &str) -> mlua::Result<()> {
+        let f: mlua::Function = self.nx()?.get("_fire_dir_changed")?;
+        f.call((scope, cwd))
+    }
+
     /// Fire `FileChangedShell` for a buffer whose file changed on disk, setting
     /// `v:fcs_reason` to `reason` and resetting `v:fcs_choice` to `""` first (neovim's
     /// `buf_check_timestamp` contract). Returns whether any handler ran — `true` means

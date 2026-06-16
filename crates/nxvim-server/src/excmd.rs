@@ -2,6 +2,7 @@
 //! commands the core didn't recognize (LSP commands, user commands, colorscheme),
 //! and runtime-file lookup.
 
+use crate::cwd::CdScope;
 #[cfg(feature = "native")]
 use crate::lsp::LspReqKind;
 use crate::EditHost;
@@ -42,6 +43,24 @@ impl EditHost {
             // `:so[urce] {file}` — run a script file (`.lua` executes through the
             // runtime; vimscript is fail-loud, not a silent skip).
             "so" | "sou" | "sour" | "sourc" | "source" => self.ex_source(args.trim()),
+            // `:cd[!]` / `:chdir[!] [dir]` — change the **global** working directory.
+            // `:tcd` / `:lcd` are the tab- and window-local variants (vim's scope
+            // override order: window > tab > global). No argument goes to `$HOME`
+            // (Unix `:cd`), `-` returns to that scope's previous directory, and
+            // `~`/`~/…` expands to home; a relative path resolves against the current
+            // cwd. The process cwd tracks the current window's effective dir (what
+            // `vim.fn.getcwd` reads), so these mutate it directly.
+            _ if matches!(base, "cd" | "chd" | "chdi" | "chdir") => {
+                self.ex_chdir(CdScope::Global, args.trim())
+            }
+            _ if matches!(base, "tc" | "tcd" | "tch" | "tchd" | "tchdi" | "tchdir") => {
+                self.ex_chdir(CdScope::Tabpage, args.trim())
+            }
+            _ if matches!(base, "lc" | "lcd" | "lch" | "lchd" | "lchdi" | "lchdir") => {
+                self.ex_chdir(CdScope::Window, args.trim())
+            }
+            // `:pw[d]` — print the working directory on the message line.
+            _ if matches!(base, "pw" | "pwd") => self.ex_pwd(),
             // Phase-1 LSP observability: dump server/document state into the panel.
             #[cfg(feature = "native")]
             "LspInfo" => {
@@ -187,6 +206,67 @@ impl EditHost {
             _ => self
                 .editor
                 .echo(format!("E492: Not an editor command: {name}")),
+        }
+    }
+
+    /// `:cd` (global) / `:tcd` (tab-local) / `:lcd` (window-local) `[dir]` — change
+    /// the working directory at `scope`. The process cwd tracks the current window's
+    /// effective dir — `vim.fn.getcwd` reads it and every relative path resolves
+    /// against it — so this mutates it directly and records the new dir at `scope` in
+    /// [`DirState`]. No argument goes to `$HOME` (Unix `:cd` semantics), `-` returns
+    /// to that scope's previous directory (E186 if there is none yet), and `~` / `~/…`
+    /// expands to home; anything else resolves relative to the current cwd. On
+    /// success `DirChanged` fires with the scope's pattern. A failure (missing /
+    /// inaccessible directory) is reported, not swallowed.
+    fn ex_chdir(&mut self, scope: CdScope, arg: &str) {
+        let win = self.editor.current_window_id();
+        let tab = self.editor.current_tab_id();
+        let target = match arg {
+            "" => match home_dir() {
+                Some(h) => h,
+                None => {
+                    self.editor
+                        .echo("E5000: Cannot determine home directory ($HOME unset)");
+                    return;
+                }
+            },
+            "-" => match self.dirs.prev(scope, win, tab) {
+                Some(p) => p.to_path_buf(),
+                None => {
+                    self.editor.echo("E186: No previous directory");
+                    return;
+                }
+            },
+            _ => expand_cd_arg(arg),
+        };
+        if let Err(e) = std::env::set_current_dir(&target) {
+            self.editor.echo(format!(
+                "E344: Can't change directory to \"{}\": {e}",
+                target.display()
+            ));
+            return;
+        }
+        // Re-read the cwd so the stored / announced dir is the canonical absolute
+        // path (relative `:cd ../x` and symlinked targets resolve here).
+        let cwd = std::env::current_dir().unwrap_or(target);
+        self.dirs.set(scope, win, tab, cwd.clone());
+        // Announce the change so `DirChanged` handlers (project / session plugins) run.
+        if let Err(e) = self
+            .lua
+            .fire_dir_changed(scope.pattern(), &cwd.display().to_string())
+        {
+            self.editor
+                .echo(format!("E5108: Error in DirChanged autocmd: {e}"));
+        }
+        self.apply_lua_effects();
+    }
+
+    /// `:pwd` — print the working directory (the current window's effective dir, i.e.
+    /// the process cwd) on the message line.
+    fn ex_pwd(&mut self) {
+        match std::env::current_dir() {
+            Ok(p) => self.editor.echo(p.display().to_string()),
+            Err(e) => self.editor.echo(format!("E187: Unknown directory: {e}")),
         }
     }
 
@@ -500,4 +580,26 @@ fn is_doautocmd(base: &str) -> bool {
 /// user-command *definition* command. The minimal form is `com`.
 fn is_command_def(base: &str) -> bool {
     matches!(base, "com" | "comm" | "comma" | "comman" | "command")
+}
+
+/// The user's home directory from `$HOME` (the Unix `:cd` target / `~` base),
+/// or `None` when it is unset.
+fn home_dir() -> Option<PathBuf> {
+    std::env::var_os("HOME").map(PathBuf::from)
+}
+
+/// Expand a `:cd` path argument: a leading `~` / `~/` resolves against `$HOME`,
+/// anything else is taken verbatim (a relative path resolves against the current
+/// cwd inside `set_current_dir`, so no canonicalization is needed here).
+fn expand_cd_arg(arg: &str) -> PathBuf {
+    if arg == "~" {
+        if let Some(home) = home_dir() {
+            return home;
+        }
+    } else if let Some(rest) = arg.strip_prefix("~/") {
+        if let Some(home) = home_dir() {
+            return home.join(rest);
+        }
+    }
+    PathBuf::from(arg)
 }

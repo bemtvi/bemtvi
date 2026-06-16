@@ -1564,6 +1564,20 @@ pub(crate) fn install_runtime_api(
         })?,
     )?;
 
+    // `nx._decor_register()`: a `nx.decor.provider` was registered — flip the live
+    // gate so the server starts dispatching viewport-change signals to providers.
+    // While it stays unset the server skips the whole off-tick decor path (never even
+    // slices the visible lines), so the common no-provider config pays nothing on
+    // scroll. Phase 2 of `nx.decor`.
+    let sh = shared.clone();
+    nx.set(
+        "_decor_register",
+        lua.create_function(move |_, ()| {
+            sh.borrow_mut().decor_active = true;
+            Ok(())
+        })?,
+    )?;
+
     // `nx._confirm(label, accelerators, default, cb_id)`: queue a `vim.fn.confirm`
     // button dialog ([`ConfirmReq`]). The server opens the command line as a
     // single-key confirm prompt showing `label`; a keypress matching one of

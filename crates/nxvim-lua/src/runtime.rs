@@ -355,6 +355,9 @@ const PRELUDE_MODULES: &[(&str, &str)] = &[
     ),
     // nx.snippet: the native snippet engine (tabstop session + snippets source).
     ("nxvim:prelude/snippet", include_str!("prelude/snippet.lua")),
+    // nx.decor: viewport-scoped decoration providers (the registry + off-tick
+    // dispatch; needs nx.ns from api and nx.notify from runtime, both above).
+    ("nxvim:prelude/decor", include_str!("prelude/decor.lua")),
     (
         "nxvim:prelude/diagnostic",
         include_str!("prelude/diagnostic.lua"),
@@ -473,6 +476,11 @@ pub(crate) struct Shared {
     /// into `Editor::menu_finish` so a query that matched nothing clears the now
     /// stale results (one that matched swaps them via `picker_pushes` instead).
     pub(crate) picker_finishes: Vec<u64>,
+    /// Whether any `nx.decor` provider has been registered (`nx._decor_register`).
+    /// The gate the server checks before dispatching a viewport-change signal: while
+    /// no provider is set it skips the whole off-tick decor path (never slices the
+    /// visible lines, never re-enters Lua). Phase 2 of `nx.decor`.
+    pub(crate) decor_active: bool,
     /// `vim.fn.confirm` button-dialog requests, drained by the server into the
     /// editor's command line (`Editor::open_confirm`) after the chunk.
     pub(crate) confirms: Vec<ConfirmReq>,
@@ -1031,6 +1039,50 @@ impl LuaRuntime {
         t.set("row", lua_int(row as i64))?;
         t.set("col", lua_int(col as i64))?;
         run.call::<()>((lua_int(gen as i64), t))
+    }
+
+    /// Whether any `nx.decor` provider is registered — the gate the server checks
+    /// before dispatching a viewport-change signal off-tick. Cheap (a `bool` read),
+    /// so the common no-provider config never slices visible lines or re-enters Lua
+    /// on scroll. Phase 2 of `nx.decor`.
+    pub fn has_decor_providers(&self) -> bool {
+        self.shared.borrow().decor_active
+    }
+
+    /// Dispatch the registered `nx.decor` providers for a window whose visible range
+    /// changed (`nx._decor_dispatch`). The server stamps the viewport `generation` in
+    /// core and passes a snapshot — `win`/`buf` handles, the 0-based inclusive
+    /// `top`/`bot` rows, the buffer `filetype` (for the provider's `bufs` filter), and
+    /// `lines` (exactly the visible slice) — never live editor state. Each matching
+    /// provider's `on_range(ctx, publish)` runs; the marks it publishes carry
+    /// `ctx.gen` so a viewport the user scrolled past is dropped at apply time
+    /// (Phase 3). Phase 2.
+    #[allow(clippy::too_many_arguments)]
+    pub fn run_decor_dispatch(
+        &self,
+        win: u64,
+        buf: u64,
+        top: usize,
+        bot: usize,
+        generation: u64,
+        filetype: &str,
+        lines: &[String],
+    ) -> mlua::Result<()> {
+        let nx = self.nx()?;
+        let run: mlua::Function = nx.get("_decor_dispatch")?;
+        let ctx = self.lua.create_table()?;
+        ctx.set("win", lua_int(win as i64))?;
+        ctx.set("buf", lua_int(buf as i64))?;
+        ctx.set("top", lua_int(top as i64))?;
+        ctx.set("bot", lua_int(bot as i64))?;
+        ctx.set("gen", lua_int(generation as i64))?;
+        ctx.set("filetype", self.lua.create_string(filetype)?)?;
+        let arr = self.lua.create_table()?;
+        for (i, line) in lines.iter().enumerate() {
+            arr.set(i + 1, self.lua.create_string(line)?)?;
+        }
+        ctx.set("lines", arr)?;
+        run.call::<()>(ctx)
     }
 
     /// Ask the plugin source that produced resolve-handle `id` to resolve its lazy

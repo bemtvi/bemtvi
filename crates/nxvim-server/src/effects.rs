@@ -9,8 +9,8 @@ use crate::lsp::CODE_ACTION_PANEL_TITLE;
 use crate::EditHost;
 use nxvim_core::highlight::HlDef;
 use nxvim_core::{
-    parse_color, BorderStyle, BufferId, FloatAnchor, FloatConfig, FloatRelative, QfAction, QfEntry,
-    QfWhich, TabId, UndoEntry, UndoTreeView, WindowConfigSpec, WindowId,
+    parse_color, BorderStyle, BufferId, DecorViewport, FloatAnchor, FloatConfig, FloatRelative,
+    QfAction, QfEntry, QfWhich, TabId, UndoEntry, UndoTreeView, WindowConfigSpec, WindowId,
 };
 use nxvim_lua::{
     BoMirror, BufBytesEdit, BufMirror, BufOp, CallbackArgs, DockOp, ExtmarkMirror, ExtmarkOp,
@@ -1545,6 +1545,42 @@ impl EditHost {
         }
     }
 
+    /// Dispatch the registered `nx.decor` providers for one window whose visible
+    /// range changed. Builds the `ctx` snapshot the provider sees — the visible line
+    /// slice (read directly from the rope, not the whole buffer) and the buffer
+    /// filetype (for the provider's `bufs` filter) — then hands it to Lua with the
+    /// viewport `generation` core stamped, so a publish the provider produces can be
+    /// gen-gated at apply time (Phase 3). A throwing provider is isolated Lua-side and
+    /// surfaced as `E5108` here. Phase 2 of `nx.decor`.
+    fn dispatch_decor(&mut self, vp: DecorViewport) {
+        let (lines, bot) = {
+            let Some(buf) = self.editor.buffer_of(vp.buf) else {
+                return;
+            };
+            // Re-clamp `bot` to the live buffer: the snapshot was taken when the dirty
+            // entry was queued; an edit since could have shortened the buffer.
+            let bot = vp.bot.min(buf.line_count().saturating_sub(1));
+            let mut lines = Vec::with_capacity(bot.saturating_sub(vp.top) + 1);
+            for row in vp.top..=bot {
+                lines.push(buf.line(row));
+            }
+            (lines, bot)
+        };
+        let filetype = self.editor.buffer_filetype(vp.buf).unwrap_or_default();
+        if let Err(e) = self.lua.run_decor_dispatch(
+            vp.win.0,
+            vp.buf.0,
+            vp.top,
+            bot,
+            vp.generation,
+            &filetype,
+            &lines,
+        ) {
+            self.editor
+                .echo(format!("E5108: Error in nx.decor provider: {e}"));
+        }
+    }
+
     /// The settle contract for an off-tick event arm: drive every queued effect to
     /// convergence (`run_pending`, which also drains `self.scheduled`) and repaint
     /// once. `dirty` forces a repaint even when no Lua callback ran (e.g. an LSP
@@ -1727,6 +1763,21 @@ impl EditHost {
                 // The built-in `snippets` source is feature-agnostic (core engine).
                 self.complete_snippet_dispatch(gen);
                 self.apply_lua_effects();
+            }
+            // nx.decor: a window whose visible range changed (scroll / resize / edit
+            // reflow) — core stamped a viewport generation per window; dispatch the
+            // registered providers off the frame here. Drain the signal unconditionally
+            // so it can't accumulate, but only build the snapshot + re-enter Lua when a
+            // provider is registered (the common no-provider config pays nothing). A
+            // publish the provider produces carries its `generation`, gated at apply
+            // time (Phase 3); the generation already moved on for any window scrolled
+            // again since, so a stale publish is dropped.
+            let decor_dirty = self.editor.take_decor_dirty();
+            if self.lua.has_decor_providers() {
+                for vp in decor_dirty {
+                    self.dispatch_decor(vp);
+                    self.apply_lua_effects();
+                }
             }
             // Float-list widget results: a confirmed (`Some(key)`) or cancelled
             // (`None`) outcome fires the waiting consumer off the same tick, inside

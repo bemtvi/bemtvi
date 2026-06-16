@@ -205,7 +205,23 @@ is the `nx.complete` `menu_generation()` gating, re-keyed per window.
 - No Lua, no render yet → no end-to-end test in this phase; its behavior is asserted
   through Phases 2–3. (A focused internal check can ride along in Phase 2's test.)
 
-### Phase 2 — Lua surface + registry + off-tick dispatch (no render)
+### Phase 2 — Lua surface + registry + off-tick dispatch (no render) ✅ DONE (2026-06-16)
+
+> Landed: `prelude/decor.lua` (`nx.decor.provider{ name, bufs, on_range }` +
+> `nx._decor_dispatch` + mark normalization + the Phase-2 `publish` that records the
+> latest marks Lua-side); the `nx._decor_register` gate bridge (`install.rs`) +
+> `Shared.decor_active`; `LuaRuntime::{has_decor_providers, run_decor_dispatch}`
+> (`runtime.rs`); and the server dispatch in `EditHost::run_pending` / `dispatch_decor`
+> (`effects.rs`) — drains `take_decor_dirty()`, builds the `ctx` slice from the rope,
+> and dispatches matching providers off-tick. Gated on `has_decor_providers()` so a
+> no-provider config never slices lines or re-enters Lua on scroll. Tested black-box
+> in `nxvim-server/tests/decor.rs` (provider dispatched with the visible slice; `top`
+> tracks scroll; `bufs.filetype` skips non-matching buffers; publish normalization).
+> Builds clean on `native` and `--no-default-features`; `fmt` / `clippy -D warnings`
+> clean. `ctx` is `{ win, buf, top, bot, lines, filetype, gen }`.
+
+Original plan for this phase:
+
 - `crates/nxvim-lua/src/prelude/decor.lua` (new): `nx.decor.provider{ name, bufs,
   on_range }` validates + registers into `nx._decor.providers` (each gets a
   namespace + a `publish` closure factory). Wire it into the prelude loader.

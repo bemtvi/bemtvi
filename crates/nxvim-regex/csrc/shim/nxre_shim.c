@@ -33,6 +33,14 @@
 #include "nvim/vim_defs.h"
 #include "shim/nxre_shim.h"
 
+// QueryPerformanceCounter for monotonic_ns() on MSVC (no POSIX clock_gettime).
+// Included last and lean so it doesn't perturb the vendored headers above.
+#ifdef _MSC_VER
+#define WIN32_LEAN_AND_MEAN
+#define NOMINMAX
+#include <windows.h>
+#endif
+
 // ----------------------------------------------------------------------------
 // memory: allocate-or-abort, mirroring upstream xmalloc semantics
 
@@ -245,9 +253,21 @@ void fast_breakcheck(void)
 
 static uint64_t monotonic_ns(void)
 {
+#ifdef _MSC_VER
+  // MSVC has no POSIX clock_gettime; QueryPerformanceCounter is the monotonic
+  // high-resolution source. Scale ticks→ns via the (split) quotient/remainder
+  // so the multiply can't overflow before the divide.
+  LARGE_INTEGER freq, ctr;
+  QueryPerformanceFrequency(&freq);
+  QueryPerformanceCounter(&ctr);
+  uint64_t f = (uint64_t)freq.QuadPart;
+  uint64_t c = (uint64_t)ctr.QuadPart;
+  return (c / f) * 1000000000ull + (c % f) * 1000000000ull / f;
+#else
   struct timespec ts;
   clock_gettime(CLOCK_MONOTONIC, &ts);
   return (uint64_t)ts.tv_sec * 1000000000u + (uint64_t)ts.tv_nsec;
+#endif
 }
 
 uint64_t nxre_profile_setlimit(int64_t ms)

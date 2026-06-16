@@ -20,16 +20,17 @@ site="${1:-$here/_site}"
 }
 
 # The page's relative imports require web/ and dist/ as siblings (index.html loads
-# ./worker.mjs; worker.mjs loads ../dist/eh.mjs and statically imports ./rpc.mjs). Copy
-# only the runtime files — not the dev tooling, the Playwright verifiers, or
-# package.json. serve.mjs *is* runtime here: it's the turnkey static server that sets the
-# cross-origin-isolation headers (below).
+# ./worker.mjs; worker.mjs loads ../dist/eh.mjs, statically imports ./rpc.mjs, and
+# *dynamically* imports ./ts-indent.js — the optional tree-sitter indenter; highlight.js
+# pulls in ./grammars.js + ./ts-sanitize.js). Copy every runtime file these reach — not
+# the dev tooling, the Playwright verifiers, or package.json. serve.mjs *is* runtime here:
+# it's the turnkey static server that sets the cross-origin-isolation headers (below).
 rm -rf "$site"
 mkdir -p "$site/web" "$site/dist"
 cp "$here/dist/eh.mjs" "$here/dist/eh.wasm" "$site/dist/"
 cp "$here/web/index.html" "$here/web/worker.mjs" "$here/web/rpc.mjs" \
    "$here/web/highlight.js" "$here/web/grammars.js" "$here/web/ts-sanitize.js" \
-   "$here/web/serve.mjs" "$site/web/"
+   "$here/web/ts-indent.js" "$here/web/serve.mjs" "$site/web/"
 [ -d "$here/web/vendor" ] && cp -r "$here/web/vendor" "$site/web/vendor"
 
 # Cross-origin-isolation headers for `_headers`-format hosts (Netlify / Cloudflare

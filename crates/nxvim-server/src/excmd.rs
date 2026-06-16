@@ -325,6 +325,23 @@ impl EditHost {
         self.apply_lua_effects();
     }
 
+    /// The languages a `:TSInstall` / `:TSUpdate` targets: its explicit whitespace-
+    /// separated arguments, or — as a convenience when called with none — the current
+    /// buffer's resolved filetype, so a bare `:TSInstall` installs the grammar for the
+    /// file you're editing. `buffer_filetype` already maps the extension to the language
+    /// name (`foo.rs` → `rust`) and honours a `:set ft=` override, so it's the right
+    /// default. Empty when neither yields a name (no args and an unknown/absent extension).
+    fn ts_install_langs(&self, args: &str) -> Vec<String> {
+        let explicit: Vec<String> = args.split_whitespace().map(str::to_string).collect();
+        if !explicit.is_empty() {
+            return explicit;
+        }
+        self.editor
+            .buffer_filetype(self.editor.current_buffer_id())
+            .into_iter()
+            .collect()
+    }
+
     /// `:TSInstall <lang>…` — fetch + compile each named grammar into the data dir
     /// off the editor thread. The work (network + a C compile) can take seconds, so
     /// each language runs on a `spawn_blocking` worker; its result returns on the
@@ -333,10 +350,11 @@ impl EditHost {
     /// browser build's `:TSInstall` arm calls the wasm `ts_install` below instead.
     #[cfg(feature = "native")]
     fn ts_install(&mut self, args: &str) {
-        let langs: Vec<String> = args.split_whitespace().map(str::to_string).collect();
+        let langs = self.ts_install_langs(args);
         if langs.is_empty() {
-            self.editor
-                .echo("TSInstall: usage: :TSInstall <language> [<language>…]");
+            self.editor.echo(
+                "TSInstall: usage: :TSInstall <language>… (or open a file to install its language)",
+            );
             return;
         }
         self.editor
@@ -356,10 +374,11 @@ impl EditHost {
     /// is involved — the browser loads a `.wasm` grammar, not a native `.so`.
     #[cfg(not(feature = "native"))]
     fn ts_install(&mut self, args: &str) {
-        let langs: Vec<String> = args.split_whitespace().map(str::to_string).collect();
+        let langs = self.ts_install_langs(args);
         if langs.is_empty() {
-            self.editor
-                .echo("TSInstall: usage: :TSInstall <language> [<language>…]");
+            self.editor.echo(
+                "TSInstall: usage: :TSInstall <language>… (or open a file to install its language)",
+            );
             return;
         }
         self.editor

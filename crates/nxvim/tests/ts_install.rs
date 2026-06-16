@@ -353,6 +353,44 @@ async fn ts_install_handles_a_version_tag_revision() {
     assert!(data_dir.join("parser/rust.so").exists());
 }
 
+#[tokio::test]
+async fn bare_ts_install_uses_current_buffer_language() {
+    let _guard = test_lock().lock().await;
+    let (data_dir, _mirror) = fixture("barebuf");
+    // A `.rs` buffer resolves to the `rust` filetype, so a bare `:TSInstall` (no args)
+    // installs *that* language — the convenience for "grab the grammar for the file I'm
+    // editing" instead of having to retype its name.
+    let file = write_temp("tsinstall_bare", "rs", "fn main() {}\n");
+    let (rpc, mut incoming) = start(Some(file)).await;
+
+    feed(&rpc, ":TSInstall<CR>");
+    let msg = wait_for_message(&rpc, &mut incoming, "TSInstall: installed").await;
+    assert!(
+        msg.contains("rust"),
+        "bare :TSInstall didn't resolve the current buffer's language: {msg:?}"
+    );
+    assert!(
+        data_dir.join("parser").join("rust.so").exists(),
+        "bare :TSInstall did not compile the current buffer's grammar"
+    );
+}
+
+#[tokio::test]
+async fn bare_ts_install_without_a_filetype_shows_usage() {
+    let _guard = test_lock().lock().await;
+    let (_data_dir, _mirror) = fixture("bareempty");
+    // An unnamed buffer has no extension → no filetype, so a bare `:TSInstall` has nothing
+    // to resolve. It must surface the usage hint, not silently no-op.
+    let (rpc, mut incoming) = start(None).await;
+
+    feed(&rpc, ":TSInstall<CR>");
+    let msg = wait_for_message(&rpc, &mut incoming, "open a file to install").await;
+    assert!(
+        msg.contains("usage"),
+        "expected the usage hint, got: {msg:?}"
+    );
+}
+
 /// The real thing: no mirror, hit GitHub + the pinned nvim-treesitter ref live,
 /// and prove the production URLs + `parsers.lua` format actually resolve and
 /// compile. `#[ignore]`d so the normal suite stays offline/deterministic; run it

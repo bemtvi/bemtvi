@@ -38,7 +38,7 @@ use nxvim_view::{
 };
 use winit::window::Window;
 
-use crate::images::{ImageDraw, ImageStore};
+use crate::images::{ImageDraw, ImageStatus, ImageStore};
 use crate::GuiConfig;
 
 /// Fallback colors when no colorscheme resolved a style — a light grey on a
@@ -207,7 +207,11 @@ impl Renderer {
     /// Build the renderer for `window`, rendering with `config`'s font family and
     /// size. Blocks on wgpu's async adapter/device requests via `pollster` (we are
     /// on the synchronous winit setup path).
-    pub fn new(window: Arc<Window>, cfg: &GuiConfig) -> anyhow::Result<Self> {
+    pub fn new(
+        window: Arc<Window>,
+        cfg: &GuiConfig,
+        fetch_tx: tokio::sync::mpsc::UnboundedSender<crate::ImageFetch>,
+    ) -> anyhow::Result<Self> {
         let size = window.inner_size();
         let scale = window.scale_factor() as f32;
 
@@ -272,7 +276,7 @@ impl Renderer {
         let (cell_w, cell_h) = measure_cell(&mut font_system, family, font_size, line_height);
 
         let rects = RectPipeline::new(&device, format);
-        let image_store = ImageStore::new(&device, format, max_dim);
+        let image_store = ImageStore::new(&device, format, max_dim, fetch_tx);
 
         Ok(Self {
             surface,
@@ -403,6 +407,24 @@ impl Renderer {
     /// text slides at the interpolated offset (smooth scrolling). Returns `Err`
     /// only on an unrecoverable surface error; a transient `Lost`/`Outdated`
     /// reconfigures and skips.
+    /// Hand a remote preview's fetched bytes (an `nxvim_image_read` reply, routed from
+    /// the IO thread) to the image store, so the next paint decodes them. The caller
+    /// requests a repaint afterward.
+    pub fn deliver_image(
+        &mut self,
+        path: String,
+        version: (u64, u64),
+        result: Result<Vec<u8>, String>,
+    ) {
+        self.image_store.deliver(path, version, result);
+    }
+
+    /// Drop all cached image state (GPU textures + fetched remote bytes) — used on a
+    /// `:connect` swap, where the new session's paths are unrelated to the old's.
+    pub fn clear_images(&mut self) {
+        self.image_store.clear();
+    }
+
     pub fn render(
         &mut self,
         view: &View,
@@ -797,15 +819,24 @@ impl Renderer {
                 wcols as f32 * self.cell_w,
                 text_rows as f32 * self.cell_h,
             );
-            if self.image_store.failed(image) {
-                let msg = format!("[image: cannot read {}]", image.path);
-                let fg = style_fg(&view.normal).unwrap_or(DEFAULT_FG);
-                self.push_plain(items, &msg, (px, py), fg, self.full_bounds());
-            } else {
-                image_draws.push(ImageDraw {
+            match self.image_store.status(image) {
+                ImageStatus::Ready => image_draws.push(ImageDraw {
                     area,
                     image: image.clone(),
-                });
+                }),
+                // No texture to blit: a remote fetch still in flight reads as
+                // "loading"; anything else (a decode failure, an errored fetch) is a
+                // hard "cannot read". Either way paint a one-line text placeholder.
+                status => {
+                    let msg = match status {
+                        ImageStatus::Loading => {
+                            format!("[image: loading {}]", image.path)
+                        }
+                        _ => format!("[image: cannot read {}]", image.path),
+                    };
+                    let fg = style_fg(&view.normal).unwrap_or(DEFAULT_FG);
+                    self.push_plain(items, &msg, (px, py), fg, self.full_bounds());
+                }
             }
             if win.status_visible && (oy + wrows) as usize > 0 {
                 let srow = oy + wrows.saturating_sub(1);

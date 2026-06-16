@@ -148,10 +148,28 @@ impl GuiConfig {
     }
 }
 
+/// A request to fetch a remote (daemon-session) image preview's bytes over the editor
+/// RPC. The image store (render thread) emits one when it sees a `remote` preview it
+/// can't read off local disk; the IO thread fulfils it with `nxvim_image_read` and
+/// posts the bytes back as [`UserEvent::ImageBytes`].
+pub(crate) struct ImageFetch {
+    pub path: String,
+    /// The preview's on-disk version `(size, mtime_ms)`, echoed back so a stale reply
+    /// for a superseded version is dropped rather than replacing newer bytes.
+    pub version: (u64, u64),
+}
+
 /// Events the IO thread injects into the winit event loop.
 pub enum UserEvent {
     /// A decoded `redraw`: replace the view and repaint.
     Redraw(Box<View>),
+    /// An `nxvim_image_read` reply: a remote preview's fetched bytes (or a read error),
+    /// to hand to the image store and repaint. Carries the version the fetch was for.
+    ImageBytes {
+        path: String,
+        version: (u64, u64),
+        result: Result<Vec<u8>, String>,
+    },
     /// A `:connect` brought up a new (daemon or local) session: swap the App's live
     /// RPC handle to it, mark whether it is remote, and re-attach the UI.
     Connected {
@@ -193,6 +211,10 @@ pub fn run(initial: Session, config: GuiConfig, open_dir: Option<PathBuf>) -> Re
     // `:connect <target>` from the App requests a switch to a daemon (or local) session.
     let (reconnect_tx, mut reconnect_rx) =
         tokio::sync::mpsc::unbounded_channel::<remote::ConnectTarget>();
+    // The image store (render thread) requests remote preview bytes here; the IO thread
+    // fulfils each over `nxvim_image_read` on the *current* session and posts the bytes
+    // back as `UserEvent::ImageBytes`.
+    let (fetch_tx, mut fetch_rx) = tokio::sync::mpsc::unbounded_channel::<ImageFetch>();
     let initial_remote = initial.remote;
 
     let io = std::thread::spawn(move || {
@@ -278,6 +300,33 @@ pub fn run(initial: Session, config: GuiConfig, open_dir: Option<PathBuf>) -> Re
                             Some(Err(err)) => report_connect_error(&rpc, &err),
                             None => {} // unreachable: `built_tx` is held above
                         },
+                        // The render thread needs a remote preview's bytes. Fetch them
+                        // over `nxvim_image_read` on the *current* session (a spawned
+                        // task, so a slow daemon read doesn't stall redraws) and post the
+                        // reply back to the UI thread, which hands it to the image store.
+                        // `None` (App, the only sender, is gone) just falls through —
+                        // teardown is handled by the other arms.
+                        fetch = fetch_rx.recv() => if let Some(ImageFetch { path, version }) = fetch {
+                            let rpc = rpc.clone();
+                            let proxy = proxy.clone();
+                            tokio::spawn(async move {
+                                let result = match rpc
+                                    .request("nxvim_image_read", vec![Value::from(path.as_str())])
+                                    .await
+                                {
+                                    Ok(Value::Binary(bytes)) => Ok(bytes),
+                                    Ok(other) => {
+                                        Err(format!("nxvim_image_read: unexpected reply {other:?}"))
+                                    }
+                                    Err(e) => Err(e.to_string()),
+                                };
+                                let _ = proxy.send_event(UserEvent::ImageBytes {
+                                    path,
+                                    version,
+                                    result,
+                                });
+                            });
+                        },
                         // The UI exited: stop, so dropping the runtime below closes the
                         // connection and the server winds down.
                         _ = io_shutdown.notified() => break 'session,
@@ -318,7 +367,14 @@ pub fn run(initial: Session, config: GuiConfig, open_dir: Option<PathBuf>) -> Re
             return Err(anyhow::anyhow!("client IO thread exited before connecting"));
         }
     };
-    let mut app = App::new(rpc, config, open_dir, initial_remote, reconnect_tx);
+    let mut app = App::new(
+        rpc,
+        config,
+        open_dir,
+        initial_remote,
+        reconnect_tx,
+        fetch_tx,
+    );
     event_loop.run_app(&mut app)?;
 
     // The UI is done: stop the IO thread and wait for it, so the streams are dropped
@@ -522,6 +578,10 @@ struct App {
     /// thread builds the new session and feeds the swapped handle back as
     /// [`UserEvent::Connected`] (see [`run`]).
     reconnect: tokio::sync::mpsc::UnboundedSender<remote::ConnectTarget>,
+    /// Handed to the renderer's image store so it can request remote preview bytes over
+    /// the editor RPC (a daemon session's image files aren't on local disk). The IO
+    /// thread drains it and posts replies back as [`UserEvent::ImageBytes`].
+    fetch_tx: tokio::sync::mpsc::UnboundedSender<ImageFetch>,
 }
 
 impl App {
@@ -531,6 +591,7 @@ impl App {
         open_dir: Option<PathBuf>,
         remote: bool,
         reconnect: tokio::sync::mpsc::UnboundedSender<remote::ConnectTarget>,
+        fetch_tx: tokio::sync::mpsc::UnboundedSender<ImageFetch>,
     ) -> Self {
         Self {
             rpc,
@@ -554,6 +615,7 @@ impl App {
             open_dir,
             remote,
             reconnect,
+            fetch_tx,
         }
     }
 
@@ -1109,7 +1171,7 @@ impl ApplicationHandler<UserEvent> for App {
                 return;
             }
         };
-        match Renderer::new(window.clone(), &self.config) {
+        match Renderer::new(window.clone(), &self.config, self.fetch_tx.clone()) {
             Ok(r) => self.renderer = Some(r),
             Err(e) => {
                 eprintln!("nxvim-gui: failed to init renderer: {e}");
@@ -1150,6 +1212,20 @@ impl ApplicationHandler<UserEvent> for App {
                     w.request_redraw();
                 }
             }
+            // A remote preview's bytes arrived (or the read failed): hand them to the
+            // image store and repaint, so the picture replaces its loading placeholder.
+            UserEvent::ImageBytes {
+                path,
+                version,
+                result,
+            } => {
+                if let Some(r) = self.renderer.as_mut() {
+                    r.deliver_image(path, version, result);
+                    if let Some(w) = self.window.as_ref() {
+                        w.request_redraw();
+                    }
+                }
+            }
             // A `:connect` brought up a new server: swap to its RPC handle (dropping the
             // old one — the App's last clone, which lets the old connection wind down),
             // update remote-ness, and re-attach the UI. Clearing `reported` forces
@@ -1160,6 +1236,12 @@ impl ApplicationHandler<UserEvent> for App {
                 self.remote = remote;
                 self.view = View::default();
                 self.scroll = None;
+                // The new session's files are unrelated to the old one's paths; drop
+                // the cached textures and any fetched remote bytes so a stale image
+                // can't bleed across the swap.
+                if let Some(r) = self.renderer.as_mut() {
+                    r.clear_images();
+                }
                 self.reported = (0, 0);
                 self.report_size(true);
                 self.apply_guifont();

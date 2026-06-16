@@ -1677,6 +1677,18 @@ pub(crate) fn install_runtime_api(
             Ok(())
         })?,
     )?;
+    // `nx._cmdline_action(name)`: a `cmdline`-bucket (`'c'`) keymap fired the named
+    // action (cancel / submit / backspace / delete / cursor motion / history /
+    // insert_register) on the open command line; the server applies it via
+    // `Editor::apply_cmdline_action`. The command-line sibling of `nx._picker_action`.
+    let sh = shared.clone();
+    nx.set(
+        "_cmdline_action",
+        lua.create_function(move |_, name: String| {
+            sh.borrow_mut().cmdline_actions.push(name);
+            Ok(())
+        })?,
+    )?;
 
     // `nx._decor_register()`: a `nx.decor.provider` was registered — flip the live
     // gate so the server starts dispatching viewport-change signals to providers.

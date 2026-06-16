@@ -102,8 +102,14 @@ impl EditHost {
             }
             return;
         }
-        // Editing context: the literal-argument raw read, then the per-mode matcher.
-        if self.editor.awaiting_literal_arg() && self.keymaps.pending_empty() {
+        // Editing context: a raw-read key bypasses the matcher straight to the
+        // editor — the literal-argument read (`r{char}`, `f{char}`, `"{reg}`) and the
+        // command line's two fixed-grammar sub-states (a `confirm` dialog answer, the
+        // `<C-r>{register}` name). Neither participates in mapping, so neither routes
+        // through a keymap bucket.
+        if (self.editor.awaiting_literal_arg() || self.editor.cmdline_reads_raw())
+            && self.keymaps.pending_empty()
+        {
             self.editor.input(key);
             self.emit_lifecycle_events();
             return;
@@ -244,6 +250,7 @@ impl EditHost {
         let _ = self.lua.take_select_actions();
         let _ = self.lua.take_panel_actions();
         let _ = self.lua.take_explorer_actions();
+        let _ = self.lua.take_cmdline_actions();
     }
 
     pub(crate) fn fire_mapping_inner(&mut self, rhs: MappingRhs) {

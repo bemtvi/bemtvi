@@ -471,3 +471,183 @@ async fn explorer_editing_map_does_not_leak() {
         "the normal-mode j map never fired inside the explorer"
     );
 }
+
+// ===== Phase 4: the command line (the 'cmdline' alias over the 'c' bucket) ====
+
+/// The default `submit` (`<CR>`) runs the line and `cancel` (`<Esc>`) abandons it,
+/// both now through the keymap engine.
+#[tokio::test]
+async fn cmdline_default_submit_and_cancel() {
+    let dir = temp_dir("widget_keys_cmdline_submit");
+    let (rpc, _incoming) = start(&dir, "").await;
+
+    feed(&rpc, ":lua _G.ran = true<CR>"); // submit runs it
+    barrier(&rpc).await;
+    assert_eq!(
+        exec_lua(&rpc, "return _G.ran").await.as_bool(),
+        Some(true),
+        "submit ran the command line"
+    );
+
+    feed(&rpc, ":lua _G.ran2 = true<Esc>"); // cancel abandons it
+    barrier(&rpc).await;
+    assert!(
+        exec_lua(&rpc, "return _G.ran2").await.is_nil(),
+        "cancel abandoned the line without running it"
+    );
+}
+
+/// `history_prev` (`<C-p>`) recalls the previous ex command, then `submit` runs it —
+/// both default `cmdline` maps.
+#[tokio::test]
+async fn cmdline_history_prev_recalls() {
+    let dir = temp_dir("widget_keys_cmdline_history");
+    let (rpc, _incoming) = start(&dir, "").await;
+
+    feed(&rpc, ":lua _G.h = 7<CR>"); // remembered in ex history
+    barrier(&rpc).await;
+    exec_lua(&rpc, "_G.h = nil").await;
+
+    feed(&rpc, ":"); // open a fresh ex line
+    feed(&rpc, "<C-p>"); // history_prev recalls "lua _G.h = 7"
+    feed(&rpc, "<CR>"); // submit runs the recalled line
+    barrier(&rpc).await;
+    assert_eq!(
+        exec_lua(&rpc, "return _G.h").await.as_i64(),
+        Some(7),
+        "history_prev recalled the command and submit ran it"
+    );
+}
+
+/// `to_start` (`<Home>`) moves the command cursor and a typed character inserts
+/// there — the cursor-motion map plus the residual text fallthrough.
+#[tokio::test]
+async fn cmdline_to_start_then_insert() {
+    let dir = temp_dir("widget_keys_cmdline_home");
+    let (rpc, _incoming) = start(&dir, "").await;
+
+    // Type the command missing its leading `l`, jump to the start, insert it.
+    feed(&rpc, ":ua _G.p = 9");
+    feed(&rpc, "<Home>"); // to_start
+    feed(&rpc, "l"); // inserts at the start -> "lua _G.p = 9"
+    feed(&rpc, "<CR>");
+    barrier(&rpc).await;
+    assert_eq!(
+        exec_lua(&rpc, "return _G.p").await.as_i64(),
+        Some(9),
+        "to_start moved the cursor and the inserted char landed at the front"
+    );
+}
+
+/// `backspace` (`<BS>`) deletes the char before the cursor — a default `cmdline` map.
+#[tokio::test]
+async fn cmdline_backspace_deletes() {
+    let dir = temp_dir("widget_keys_cmdline_bs");
+    let (rpc, _incoming) = start(&dir, "").await;
+
+    feed(&rpc, ":lua _G.b = 1XX"); // two stray chars
+    feed(&rpc, "<BS><BS>"); // delete both -> "lua _G.b = 1"
+    feed(&rpc, "<CR>");
+    barrier(&rpc).await;
+    assert_eq!(
+        exec_lua(&rpc, "return _G.b").await.as_i64(),
+        Some(1),
+        "backspace deleted the stray chars before submit"
+    );
+}
+
+/// `<C-r>{register}` still inserts the register's text into the command line: `<C-r>`
+/// is a `cmdline` map (arms the read) and the register name after it is read raw.
+#[tokio::test]
+async fn cmdline_insert_register_raw_read() {
+    let dir = temp_dir("widget_keys_cmdline_creg");
+    let (rpc, _incoming) = start(&dir, "").await;
+
+    // Put WORD into register a (yank the inner word), then pull it into a command.
+    feed(&rpc, "iWORD<Esc>");
+    feed(&rpc, "\"ayiw");
+    feed(&rpc, ":lua _G.reg = '");
+    feed(&rpc, "<C-r>a"); // arms via the map, then reads 'a' raw -> inserts WORD
+    feed(&rpc, "'<CR>");
+    barrier(&rpc).await;
+    assert_eq!(
+        exec_lua(&rpc, "return _G.reg").await.as_str(),
+        Some("WORD"),
+        "<C-r>a inserted register a's contents into the command line"
+    );
+}
+
+/// A user `nx.keymap.set('cmdline', …)` rebinds a cmdline action to a new key:
+/// `<C-j>` submits the line.
+#[tokio::test]
+async fn cmdline_user_rebind() {
+    let dir = temp_dir("widget_keys_cmdline_rebind");
+    let (rpc, _incoming) = start(
+        &dir,
+        "nx.keymap.set('cmdline', '<C-j>', nx.cmdline.actions.submit)",
+    )
+    .await;
+
+    feed(&rpc, ":lua _G.rb = 1");
+    feed(&rpc, "<C-j>"); // rebound submit
+    barrier(&rpc).await;
+    assert_eq!(
+        exec_lua(&rpc, "return _G.rb").await.as_i64(),
+        Some(1),
+        "the rebound <C-j> submitted the command line"
+    );
+}
+
+/// Binding a default cmdline key to an empty function disables it: `<CR>` no longer
+/// submits, so the line never runs (it stays open until cancelled).
+#[tokio::test]
+async fn cmdline_empty_map_disables_submit() {
+    let dir = temp_dir("widget_keys_cmdline_disable");
+    let (rpc, _incoming) = start(&dir, "nx.keymap.set('cmdline', '<CR>', function() end)").await;
+
+    feed(&rpc, ":lua _G.d = 1");
+    feed(&rpc, "<CR>"); // disabled: does nothing, the line is not run
+    barrier(&rpc).await;
+    assert_eq!(
+        exec_lua(&rpc, "return vim.fn.getcmdtype()").await.as_str(),
+        Some(":"),
+        "the command line is still open (disabled <CR> did not submit)"
+    );
+    assert!(
+        exec_lua(&rpc, "return _G.d").await.is_nil(),
+        "the disabled <CR> never ran the command"
+    );
+    feed(&rpc, "<Esc>"); // clean up
+}
+
+/// A normal-mode `<C-p>` map does NOT leak into the command line: `<C-p>` recalls
+/// history (the cmdline map), and the normal-mode map never fires.
+#[tokio::test]
+async fn cmdline_editing_map_does_not_leak() {
+    let dir = temp_dir("widget_keys_cmdline_noleak");
+    let (rpc, _incoming) = start(
+        &dir,
+        "_G.leaked = false\n\
+         nx.keymap.set('n', '<C-p>', function() _G.leaked = true end)",
+    )
+    .await;
+
+    feed(&rpc, ":lua _G.n = 5<CR>"); // remembered
+    barrier(&rpc).await;
+    exec_lua(&rpc, "_G.n = nil").await;
+
+    feed(&rpc, ":");
+    feed(&rpc, "<C-p>"); // cmdline history_prev, NOT the normal-mode map
+    feed(&rpc, "<CR>");
+    barrier(&rpc).await;
+    assert_eq!(
+        exec_lua(&rpc, "return _G.n").await.as_i64(),
+        Some(5),
+        "the cmdline's own <C-p> recalled history"
+    );
+    assert_eq!(
+        exec_lua(&rpc, "return _G.leaked").await.as_bool(),
+        Some(false),
+        "the normal-mode <C-p> map never fired in the command line"
+    );
+}

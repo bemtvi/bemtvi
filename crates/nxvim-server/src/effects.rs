@@ -222,6 +222,13 @@ impl EditHost {
                 self.editor.echo(format!("E5108: {e}"));
             }
         }
+        // Cmdline actions a `cmdline`-bucket keymap fired (`nx._cmdline_action`):
+        // apply each to the open command line. Unknown names fail loud.
+        for action in self.lua.take_cmdline_actions() {
+            if let Err(e) = self.editor.apply_cmdline_action(&action) {
+                self.editor.echo(format!("E5108: {e}"));
+            }
+        }
         // Panel requests from `vim.panel.*` drive the core's panel state.
         for op in self.lua.take_panel_ops() {
             match op {

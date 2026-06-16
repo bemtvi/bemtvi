@@ -515,6 +515,60 @@ for _, m in ipairs({
   nx.keymap.set("explorer", m[1], nx.explorer.actions[m[2]], { default = true, desc = m[3] })
 end
 
+-- ----- rebindable command-line keys -----------------------------------------
+-- The command line (`:` ex, `/`,`?` search, `vim.ui.input` prompt) is driven
+-- through the keymap engine, NOT a hardcoded grab. It reuses the command-mode `c`
+-- bucket (`mode = "cmdline"` is the readable alias), so every control key is
+-- configurable with `nx.keymap.set("cmdline", "<key>", nx.cmdline.actions.<name>)`
+-- (or the muscle-memory `nx.keymap.set("c", …)`). Each action fires through the
+-- engine (nx._cmdline_action -> Editor::apply_cmdline_action). Typed TEXT is the
+-- residual fallthrough — an unmapped printable inserts into the line — so the hot
+-- path stays core-direct; only the control keys round-trip Lua. The `<C-r>{reg}`
+-- register name and a `vim.fn.confirm` answer are fixed grammars read raw, NOT
+-- keymaps (so they are not listed here).
+nx.cmdline = nx.cmdline or {}
+nx.cmdline.actions = nx.cmdline.actions or {}
+for _, name in ipairs({
+  "cancel",
+  "submit",
+  "backspace",
+  "delete",
+  "left",
+  "right",
+  "to_start",
+  "to_end",
+  "history_prev",
+  "history_next",
+  "insert_register",
+}) do
+  nx.cmdline.actions[name] = function()
+    nx._cmdline_action(name)
+  end
+end
+
+-- The default command-line bindings — `default = true`, so a user override wins
+-- and an empty-function map disables a key. These mirror the keys handle_command
+-- used to hardcode.
+for _, m in ipairs({
+  { "<Esc>", "cancel", "Cancel" },
+  { "<CR>", "submit", "Run the command line" },
+  { "<BS>", "backspace", "Delete char before cursor" },
+  { "<Del>", "delete", "Delete char under cursor" },
+  { "<Left>", "left", "Cursor left" },
+  { "<Right>", "right", "Cursor right" },
+  { "<Home>", "to_start", "Cursor to start" },
+  { "<End>", "to_end", "Cursor to end" },
+  { "<C-b>", "to_start", "Cursor to start" },
+  { "<C-e>", "to_end", "Cursor to end" },
+  { "<Up>", "history_prev", "Older history entry" },
+  { "<C-p>", "history_prev", "Older history entry" },
+  { "<Down>", "history_next", "Newer history entry" },
+  { "<C-n>", "history_next", "Newer history entry" },
+  { "<C-r>", "insert_register", "Insert register" },
+}) do
+  nx.keymap.set("cmdline", m[1], nx.cmdline.actions[m[2]], { default = true, desc = m[3] })
+end
+
 -- ----- the pending-key event (which-key / showcmd) -------------------------
 -- nx.on_key_pending(fn): subscribe to the engine-computed pending-key signal. The
 -- server fires it whenever the *pending key-context changes* — a mapped prefix

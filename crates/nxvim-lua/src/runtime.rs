@@ -525,6 +525,11 @@ pub(crate) struct Shared {
     /// `Editor::apply_explorer_action` — the rebindable file-explorer keys (open /
     /// up / next / prev / first / last / half + page scroll).
     pub(crate) explorer_actions: Vec<String>,
+    /// Named `cmdline` actions a `cmdline`-bucket (`'c'`) keymap fired
+    /// (`nx._cmdline_action`), drained by the server into `Editor::apply_cmdline_action`
+    /// — the rebindable command-line keys (cancel / submit / backspace / delete /
+    /// cursor motion / history / `<C-r>` register arm).
+    pub(crate) cmdline_actions: Vec<String>,
     /// Marks a `nx.decor` provider published for a window's viewport
     /// (`nx._decor_publish`), drained by the server (generation-gated) into the
     /// provider's namespace in the extmark layer. Empty for a no-provider config.
@@ -1064,6 +1069,12 @@ impl LuaRuntime {
         /// Take the named explorer actions fired since the last drain, for the server
         /// to apply to the file explorer via `Editor::apply_explorer_action`.
         take_explorer_actions -> Vec<String> = explorer_actions
+    }
+
+    take_queue! {
+        /// Take the named cmdline actions fired since the last drain, for the server
+        /// to apply to the open command line via `Editor::apply_cmdline_action`.
+        take_cmdline_actions -> Vec<String> = cmdline_actions
     }
 
     take_queue! {

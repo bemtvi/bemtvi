@@ -1,10 +1,11 @@
 # Configurable widget keys — every action rebindable, no hardcoded widget grammar
 
-**Status:** **proposed (2026-06-16).** Make every interactive widget's keys
-rebindable through the *real* keymap engine — no bespoke per-widget config table,
-no hardcoded `match key.code` grammar a user can't override. The fuzzy picker
-(`nx.picker`) is the named offender and the Phase 1 reference; the same mechanism
-then converts the other grabbing widgets one phase at a time.
+**Status:** **complete (2026-06-16) — all four phases landed.** Made every
+interactive widget's keys rebindable through the *real* keymap engine — no bespoke
+per-widget config table, no hardcoded `match key.code` grammar a user can't override.
+The fuzzy picker (`nx.picker`) was the named offender and the Phase 1 reference; the
+same mechanism then converted the select list (Phase 2), the panel + explorer
+(Phase 3), and the command line (Phase 4). See each phase's ✅ note below.
 
 ## Why
 
@@ -151,12 +152,29 @@ explorer coverage (default nav + confirm/open, `gg` two-key jump, user rebind, p
 rebound key, the explorer `:` fall-through, no editing-map leak); all existing `editing::panel`
 / `editing::explorer` / `daemon_explorer` / `quickfix` suites pass unchanged.
 
-### Phase 4 — the command line (`"cmdline"`, the existing `'c'` bucket)
+### Phase 4 — the command line (`"cmdline"`, the existing `'c'` bucket)  ✅ LANDED (2026-06-16)
 
-Convert `handle_command`'s history / cursor / `<C-r>` register keys to `cmdline`
-default maps + actions, over the bucket `Mode::Command` already selects. The confirm
-dialog (`handle_confirm`) and `:s///c` single-key answers come with it or stay as a
-documented non-goal (their grammar is a fixed prompt alphabet, not a keymap).
+Converted `handle_command`'s control keys to `cmdline` default maps + `Editor::apply_cmdline_action`
+(cancel / submit / backspace / delete / left / right / to_start / to_end / history_prev /
+history_next / insert_register), dispatched via `nx.cmdline.actions` → `nx._cmdline_action` →
+`Shared.cmdline_actions`, drained in `apply_lua_effects`. Unlike the other widgets this is **not** a
+new bucket or a `KeyContext`: the command line already runs in `Mode::Command`, whose `mode_key`
+is `'c'`, so `mode = "cmdline"` is just the readable alias (`mode_buckets("cmdline") == ['c']`) and
+the keys route through the existing editing matcher. Typed **text** stays the residual core
+fallthrough (`handle_command` → `cmdline_insert`), so the hot path never round-trips Lua; only the
+control keys do. The two **fixed-grammar sub-states** — a `vim.fn.confirm` dialog answer and the
+`<C-r>{register}` name — are read **raw**, ahead of the matcher, via the new `Editor::cmdline_reads_raw()`
+gate folded into `feed_matcher`'s existing literal-arg bypass (so neither routes through a keymap, per
+the non-goals). `cancel_cmdline` is now `pub(crate)` and the dock-navigation path calls it directly
+instead of feeding a synthetic `<Esc>` (which is a map now). `:s///c` answers were already a separate
+substitute-confirm path, untouched. Tests: `tests/widget_keys.rs` gains 8 cmdline tests (submit/cancel,
+history recall, to_start + insert, backspace, `<C-r>` raw register read, user rebind, `<CR>`-disable,
+no normal-map leak); all existing `editing::search` / `ex_substitute` / `registers` / `global_cmd` /
+`ui_prompt` / `dock` / `keymaps` / `excmd` suites pass unchanged; full nxvim-server suite green.
+
+With this the configurable-widget-keys feature is complete: every grabbing widget (picker, select,
+panel, explorer, command line) is driven by the real keymap engine — no hardcoded `match key.code`
+grammar a user can't override.
 
 ## Non-goals
 

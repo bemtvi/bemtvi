@@ -747,6 +747,10 @@ fn mode_buckets(code: &str) -> &'static [char] {
         "select" => &['S'],
         "panel" => &['L'],
         "explorer" => &['E'],
+        // The command line reuses the existing command-mode bucket (`mode_key(Mode::
+        // Command) == 'c'`); `cmdline` is just the readable alias for it, so its
+        // default maps and a user `set('c', …)` compile into the same trie.
+        "cmdline" => &['c'],
         "" => &['n', 'v', 'V', 'm'],
         _ => &[],
     }

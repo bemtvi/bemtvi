@@ -1347,7 +1347,10 @@ impl Editor {
         match self.mode {
             Mode::Insert | Mode::Replace => self.handle_insert(Key::new(KeyCode::Esc)),
             Mode::Visual | Mode::VisualLine => self.handle_normal(Key::new(KeyCode::Esc)),
-            Mode::Command => self.handle_command(Key::new(KeyCode::Esc)),
+            // The `<Esc>` cancel is a `cmdline` keymap now, not a `handle_command`
+            // arm, so close the line directly (this path never goes through the
+            // matcher).
+            Mode::Command => self.cancel_cmdline(),
             Mode::Terminal => self.leave_terminal_mode(),
             _ => {}
         }

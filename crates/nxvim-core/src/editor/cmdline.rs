@@ -63,16 +63,123 @@ impl Editor {
         }
     }
 
+    /// Apply a named `cmdline` action, dispatched by a `cmdline`-bucket keymap (the
+    /// `c`-bucket default maps in `prelude/keymap.lua`, or a user override) while the
+    /// command line is open. The rebindable control keys: `cancel` abandons the line,
+    /// `submit` runs it, `backspace`/`delete` edit around the cursor, `left`/`right`/
+    /// `to_start`/`to_end` move the command cursor, `history_prev`/`history_next`
+    /// recall, and `insert_register` arms `<C-r>` (the following register-name key is
+    /// then read raw — a fixed-grammar literal arg, not a keymap). Typed text is the
+    /// residual fallthrough ([`handle_command`](Self::handle_command)), not an action,
+    /// so the hot path — typing a command — stays core-direct. An unknown name fails
+    /// loud per the no-silent-stub rule.
+    pub fn apply_cmdline_action(&mut self, action: &str) -> Result<(), String> {
+        // `cancel` / `submit` change the mode (closing the line), so they return
+        // before the trailing incsearch refresh.
+        match action {
+            "cancel" => {
+                self.cancel_cmdline();
+                return Ok(());
+            }
+            "submit" => {
+                self.submit_cmdline();
+                return Ok(());
+            }
+            // Backspacing an empty command line exits, like cancel — but a scripted
+            // `vim.ui.input` prompt stays open when backspaced past its start (only
+            // `cancel` ends an input), so a user who clears the line can keep typing.
+            // The ex/search lines keep vim's empty-exit.
+            "backspace" if self.cmdline.is_empty() => {
+                if !matches!(self.cmdline_kind, CmdlineKind::Prompt) {
+                    self.cancel_cmdline();
+                }
+                return Ok(());
+            }
+            _ => {}
+        }
+        match action {
+            "backspace" => self.cmdline_backspace(),
+            "delete" => self.cmdline_delete(),
+            "left" => self.cmdline_cursor_left(),
+            "right" => self.cmdline_cursor_right(),
+            "to_start" => self.cmdline_col = 0,
+            "to_end" => self.cmdline_col = self.cmdline.len(),
+            "history_prev" => self.cmdline_history_prev(),
+            "history_next" => self.cmdline_history_next(),
+            // `<C-r>` arms register insertion: the next key is read raw (the matcher
+            // bypasses it via `cmdline_reads_raw`) and names the register — handled
+            // in `handle_command`.
+            "insert_register" => self.awaiting_register = true,
+            other => return Err(format!("unknown cmdline action {other:?}")),
+        }
+        // The command line still has focus: refresh the live incsearch preview
+        // for the just-edited search pattern (a no-op for an ex command line).
+        if let CmdlineKind::Search(dir) = self.cmdline_kind {
+            self.update_incsearch_preview(dir);
+        }
+        Ok(())
+    }
+
+    /// Run the open command line (`submit`): an ex command, a search, or hand a
+    /// scripted prompt's typed text to its waiting callback, then restore the line's
+    /// origin mode. A confirm dialog never reaches here — it is resolved by
+    /// [`handle_confirm`](Self::handle_confirm) on the raw-read path.
+    fn submit_cmdline(&mut self) {
+        let text = std::mem::take(&mut self.cmdline);
+        self.cmdline_col = 0;
+        let kind = self.cmdline_kind;
+        self.mode = self.cmdline_return_mode;
+        match kind {
+            CmdlineKind::Ex => {
+                self.remember_ex(&text);
+                self.execute_ex(&text);
+            }
+            CmdlineKind::Search(dir) => {
+                // Commit from the saved origin, not the incsearch preview hop, so the
+                // count search lands deterministically (and identically to the
+                // no-incsearch path).
+                self.cursor = self.search_origin;
+                self.submit_search(&text, dir);
+            }
+            CmdlineKind::Prompt => {
+                // Hand the typed line to the waiting `vim.ui.input` callback (the
+                // server drains `prompt_results` and fires it).
+                self.cmdline_prompt.clear();
+                self.prompt_results.push(Some(text));
+            }
+            CmdlineKind::Confirm => {}
+        }
+    }
+
+    /// Whether the command line consumes the next key **raw**, ahead of the keymap
+    /// matcher — its two fixed-grammar sub-states: a `vim.fn.confirm` dialog (every
+    /// key is a fixed prompt-alphabet answer, resolved by [`handle_confirm`]) and the
+    /// `<C-r>{register}` read (the key after `<C-r>` names a register, a literal arg
+    /// like `"{reg}`). The server's `feed_matcher` checks this so neither sub-state
+    /// routes through the `cmdline` keymap bucket; everything reaches
+    /// [`handle_command`](Self::handle_command).
+    ///
+    /// [`handle_confirm`]: Self::handle_confirm
+    pub fn cmdline_reads_raw(&self) -> bool {
+        self.mode == Mode::Command
+            && (self.awaiting_register || matches!(self.cmdline_kind, CmdlineKind::Confirm))
+    }
+
+    /// The command line's residual key handling — the keys that are **not** `cmdline`
+    /// maps. Reached from [`Editor::input`] for an unmapped key (a typed character),
+    /// and on the raw-read path ([`cmdline_reads_raw`](Self::cmdline_reads_raw)) for a
+    /// confirm answer or a `<C-r>{register}` name. Every nameable control key is a
+    /// `cmdline` keymap ([`apply_cmdline_action`](Self::apply_cmdline_action)); an
+    /// unmapped/disabled control key is inert here.
     pub(crate) fn handle_command(&mut self, key: Key) {
-        // A `vim.fn.confirm` dialog resolves on a single keypress, not a typed
-        // line, so it owns the key ahead of the line-editing path below.
+        // A `vim.fn.confirm` dialog resolves on a single keypress, not a typed line.
         if matches!(self.cmdline_kind, CmdlineKind::Confirm) {
             self.handle_confirm(key);
             return;
         }
-        // `<C-r>{register}`: the keystroke after `<C-r>` names the register whose
-        // text is inserted at the command cursor. A non-register key cancels,
-        // inserting nothing (vim).
+        // `<C-r>{register}`: the keystroke after `<C-r>` (the `insert_register`
+        // action) names the register whose text is inserted at the command cursor. A
+        // non-register key cancels, inserting nothing (vim).
         if self.awaiting_register {
             self.awaiting_register = false;
             if key.ctrl && key.code == KeyCode::Char('w') {
@@ -88,86 +195,24 @@ impl Editor {
             }
             return;
         }
-        match key.code {
-            KeyCode::Esc => {
-                self.cancel_cmdline();
-                return;
-            }
-            KeyCode::Enter => {
-                let text = std::mem::take(&mut self.cmdline);
-                self.cmdline_col = 0;
-                let kind = self.cmdline_kind;
-                self.mode = self.cmdline_return_mode;
-                match kind {
-                    CmdlineKind::Ex => {
-                        self.remember_ex(&text);
-                        self.execute_ex(&text);
-                    }
-                    CmdlineKind::Search(dir) => {
-                        // Commit from the saved origin, not the incsearch preview
-                        // hop, so the count search lands deterministically (and
-                        // identically to the no-incsearch path).
-                        self.cursor = self.search_origin;
-                        self.submit_search(&text, dir);
-                    }
-                    CmdlineKind::Prompt => {
-                        // Hand the typed line to the waiting `vim.ui.input` callback
-                        // (the server drains `prompt_results` and fires it).
-                        self.cmdline_prompt.clear();
-                        self.prompt_results.push(Some(text));
-                    }
-                    // A confirm dialog is resolved by `handle_confirm` (routed at
-                    // the top of this fn), so it never reaches the line-submit path.
-                    CmdlineKind::Confirm => {}
+        // The residual text fallthrough: an unmapped printable key inserts into the
+        // command line (the hot path stays core-direct, never round-tripping Lua).
+        if let KeyCode::Char(c) = key.code {
+            if !key.ctrl {
+                self.cmdline_insert(c);
+                if let CmdlineKind::Search(dir) = self.cmdline_kind {
+                    self.update_incsearch_preview(dir);
                 }
-                return;
             }
-            // Backspacing an empty command line exits, like Esc. With text, it
-            // deletes the char before the cursor (a no-op at the very start).
-            // Exception: a scripted `vim.ui.input` prompt stays open when
-            // backspaced past its start (only `<Esc>` cancels an input) — so a
-            // user who clears the line can keep typing rather than losing the
-            // prompt. The ex/search command lines keep vim's empty-exit.
-            KeyCode::Backspace if self.cmdline.is_empty() => {
-                if !matches!(self.cmdline_kind, CmdlineKind::Prompt) {
-                    self.cancel_cmdline();
-                }
-                return;
-            }
-            KeyCode::Backspace => self.cmdline_backspace(),
-            // `<Del>` removes the char *under* the cursor.
-            KeyCode::Delete => self.cmdline_delete(),
-            // Within-line cursor motion: arrows by a char, Home/End (and the
-            // vim-cmdline `<C-b>`/`<C-e>`) to the ends.
-            KeyCode::Left => self.cmdline_cursor_left(),
-            KeyCode::Right => self.cmdline_cursor_right(),
-            KeyCode::Home => self.cmdline_col = 0,
-            KeyCode::End => self.cmdline_col = self.cmdline.len(),
-            KeyCode::Char('b') if key.ctrl => self.cmdline_col = 0,
-            KeyCode::Char('e') if key.ctrl => self.cmdline_col = self.cmdline.len(),
-            // Command-history recall (`<Up>`/`<C-p>` older, `<Down>`/`<C-n>`
-            // newer), over whichever history the open prompt's kind selects.
-            KeyCode::Up => self.cmdline_history_prev(),
-            KeyCode::Down => self.cmdline_history_next(),
-            KeyCode::Char('p') if key.ctrl => self.cmdline_history_prev(),
-            KeyCode::Char('n') if key.ctrl => self.cmdline_history_next(),
-            // `<C-r>` arms register insertion: the next key (handled at the top of
-            // this fn) names the register to pull into the command line.
-            KeyCode::Char('r') if key.ctrl => self.awaiting_register = true,
-            KeyCode::Char(c) if !key.ctrl => self.cmdline_insert(c),
-            _ => {}
-        }
-        // The command line still has focus: refresh the live incsearch preview
-        // for the just-edited search pattern (a no-op for an ex command line).
-        if let CmdlineKind::Search(dir) = self.cmdline_kind {
-            self.update_incsearch_preview(dir);
         }
     }
 
     /// Abandon the open command line and return to normal mode. For a search
     /// prompt this also rewinds the cursor to where the search began, undoing any
-    /// incsearch preview hop (vim's `<Esc>`-cancels-search behavior).
-    fn cancel_cmdline(&mut self) {
+    /// incsearch preview hop (vim's `<Esc>`-cancels-search behavior). `pub(crate)`
+    /// so the dock-navigation path can close the line directly (the `cancel` action
+    /// is the keymap-driven entry).
+    pub(crate) fn cancel_cmdline(&mut self) {
         if matches!(self.cmdline_kind, CmdlineKind::Search(_)) {
             self.cursor = self.search_origin;
             self.clamp_cursor();

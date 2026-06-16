@@ -958,6 +958,16 @@ pub struct Editor {
     /// Windows whose viewport changed since the last drain (latest-wins per window),
     /// drained by the server in `run_pending`.
     decor_dirty: Vec<decor::DecorViewport>,
+    /// Extmark namespaces that hold **ephemeral, derived** marks — viewport
+    /// decoration-provider publishes (`nx.decor`), republished off-tick on every
+    /// viewport/edit change. They are *not* document history, so undo/redo must not
+    /// swap them out with the rest of the extmark store: [`Editor::restore_snapshot`]
+    /// carries the live marks for these namespaces across a restore. Without that,
+    /// undoing to a state captured before a provider first ran (notably the root undo
+    /// node, snapshotted at buffer load) would wipe the live marks for one frame until
+    /// the re-dispatch republishes them — a visible flash. Populated when a decor
+    /// publish first targets a namespace (`mark_extmark_namespace_ephemeral`).
+    ephemeral_extmark_ns: HashSet<u32>,
 
     /// Undo/redo history for cursor *placement* in [`Mode::MultiCursor`]: each
     /// entry snapshots the placed-cursor set (primary + secondaries) before a
@@ -1312,6 +1322,7 @@ impl Editor {
             decor_viewports: HashMap::new(),
             decor_gen: HashMap::new(),
             decor_dirty: Vec::new(),
+            ephemeral_extmark_ns: HashSet::new(),
             placement_undo: Vec::new(),
             placement_redo: Vec::new(),
             cursor_registers: Vec::new(),

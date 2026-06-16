@@ -392,7 +392,22 @@ impl Editor {
 
     /// Restore the current buffer to `snap` (the state numbered `seq`): swap in the
     /// text, cursor, extmarks and marks, and recompute `modified`.
-    fn restore_snapshot(&mut self, snap: Snapshot, seq: u64) {
+    fn restore_snapshot(&mut self, mut snap: Snapshot, seq: u64) {
+        // Decoration-provider marks (`nx.decor`) are ephemeral viewport state —
+        // republished off-tick on every viewport/edit change — not document history, so
+        // undo must not swap them out. Move the LIVE marks for each ephemeral namespace
+        // into the snapshot store we're about to install (below), *before* `mark_resync`
+        // clears the live store. Without this, undoing to a state captured before a
+        // provider first ran — notably the root node, snapshotted at buffer load — wipes
+        // the live marks for one frame until the re-dispatch republishes them: a visible
+        // flash that the user only sees on the first undo back to that root state.
+        let ephemeral = self.ephemeral_extmark_namespaces();
+        if !ephemeral.is_empty() {
+            let live = &mut self.buffer_mut().extmarks;
+            for ns in ephemeral {
+                live.move_namespace_into(ns, &mut snap.extmarks);
+            }
+        }
         let ob = self.cur_mut();
         ob.buffer.text = snap.text;
         // We're back on a previously-seen state: it's clean only if it's the one

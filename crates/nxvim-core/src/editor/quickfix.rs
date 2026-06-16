@@ -415,6 +415,23 @@ impl Editor {
             .is_some()
     }
 
+    /// Buffer `buf`'s **buftype** — vim's buffer-kind noun, as the string the
+    /// `buftype` option reports. nxvim models the kinds it actually distinguishes:
+    /// `"quickfix"` for a quickfix **or** location-list display buffer (both report
+    /// `quickfix` in vim), `"terminal"` for a terminal buffer, and `""` for an ordinary
+    /// file / scratch buffer. This is what `nx.decor`'s `bufs.buftype` filter keys off
+    /// (so a provider can target — or avoid — the quickfix window). Other vim buftypes
+    /// (`help`, `nofile`, `prompt`, …) aren't modelled yet, so they read as `""`.
+    pub fn buffer_buftype(&self, buf: BufferId) -> &'static str {
+        if self.qf_context_of_buffer(buf).is_some() {
+            "quickfix"
+        } else if self.buffer_of(buf).is_some_and(|b| b.terminal) {
+            "terminal"
+        } else {
+            ""
+        }
+    }
+
     /// Which list a display buffer projects: the quickfix list if it is
     /// [`Editor::qf_bufnr`], else the location list of the window that owns it
     /// (the unique window whose `loclist_bufnr` is `buf`). `None` for an ordinary

@@ -174,6 +174,23 @@ impl ExtmarkStore {
         self.by_ns.clear();
     }
 
+    /// Move namespace `ns`'s marks out of `self` and into `dst`, replacing whatever
+    /// `dst` held for `ns` (dropping `dst`'s slot when `self` has none). Used to carry
+    /// **ephemeral** marks (viewport decoration-provider publishes) across an undo
+    /// restore that swaps the whole store: the live marks are moved into the snapshot
+    /// store about to be installed, so undo never wipes them. See
+    /// [`crate::editor::Editor::restore_snapshot`].
+    pub fn move_namespace_into(&mut self, ns: u32, dst: &mut ExtmarkStore) {
+        match self.by_ns.remove(&ns) {
+            Some(slot) => {
+                dst.by_ns.insert(ns, slot);
+            }
+            None => {
+                dst.by_ns.remove(&ns);
+            }
+        }
+    }
+
     /// Every mark across all namespaces (order across namespaces is unspecified;
     /// id-ascending within each). For redraw projection, which priority-sorts.
     pub fn iter_all(&self) -> impl Iterator<Item = &Extmark> {

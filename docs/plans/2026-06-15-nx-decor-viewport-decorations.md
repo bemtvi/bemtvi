@@ -289,7 +289,72 @@ Original plan for this phase:
   replaced; assert a hand-raced stale publish (gen bumped mid-flight) paints
   nothing.
 
-### Phase 4 — Async, robustness, polish, wasm parity
+### Phase 4 — Async, robustness, polish, wasm parity ✅ DONE (2026-06-16)
+
+> Landed, all in `prelude/decor.lua` + tests (no core/server changes needed — the loop
+> was already complete after Phase 3):
+> - **Async provider** — the `publish` closure + the gen-gate already handled a late
+>   publish (Decision 8); Phase 4 adds the proof: a provider that publishes from an
+>   `nx.promise.delay(…):next(…)` continuation renders, the late response folded by the
+>   live gen. Test `an_async_provider_publishes_from_a_promise_continuation`.
+> - **Scroll-gesture debounce** — opt-in `debounce = <ms>` on `nx.decor.provider`; a
+>   per-window trailing `nx.utils.debounce` re-armed on each viewport change, so a fast
+>   continuous scroll fires `on_range` once after it settles (Decision 2). Default off
+>   (rainbow stays instant). Test `a_debounced_provider_coalesces_a_burst_to_one_run`
+>   (a synchronous burst arms once, fires once — deterministic, no wall-clock race).
+> - **Provider errors → loud + disable-after-N** (Decision 7) — a throwing `on_range` is
+>   reported `E5108`-style via `nx.notify` and, after `MAX_DECOR_ERRORS = 3` consecutive
+>   failures (neovim's `CB_MAX_ERROR` analog), the provider is disabled (skipped until
+>   re-registered, which rebuilds the provider table). A clean run resets the counter.
+>   Test `a_provider_is_disabled_after_three_consecutive_errors`.
+> - **`bufs` per-buffer + buftype opt-in** — `bufs.buf = id | { id, … }` scopes a
+>   provider to specific buffer(s); `bufs.buftype = { "quickfix", "" , … }` scopes by
+>   buffer *kind*. AND-combined with `bufs.filetype`. nxvim models the buftypes it
+>   distinguishes via the new core accessor `Editor::buffer_buftype` (`quickfix.rs`):
+>   `"quickfix"` (quickfix **or** location-list display buffer), `"terminal"`, and `""`
+>   (ordinary file/scratch); the dispatch passes `ctx.buftype` alongside `ctx.filetype`.
+>   Tests `a_buffer_scoped_provider_runs_only_for_its_buffer` (real buf id, input-driven)
+>   and `buftype_scopes_a_provider_to_buffer_kind` (runs in `:copen`'s quickfix window,
+>   not an ordinary buffer). Other vim buftypes (`help`/`nofile`/`prompt`) read as `""`
+>   until modelled.
+> - **Undo no longer flashes the decorations** — decor marks are *ephemeral* viewport
+>   state (republished off-tick), not document history, but the undo tree snapshotted the
+>   whole extmark store, including the decor namespace. The **root** undo node is captured
+>   at buffer load, *before* any provider runs, so undoing back to it restored an empty
+>   decor namespace — wiping the live marks for one frame until the re-dispatch
+>   republished them (the user-visible flash, seen on the first undo back to that state).
+>   Fix: a namespace a decor publish targets is registered ephemeral
+>   (`Editor::mark_extmark_namespace_ephemeral`), and `Editor::restore_snapshot`
+>   (`undo.rs`) **carries the live marks for those namespaces across the restore**
+>   (`ExtmarkStore::move_namespace_into`) instead of swapping in the snapshot's. Test
+>   `custom_highlights_survive_undo_without_flashing` (a publish-once provider turns the
+>   flash into a permanent loss, so the guard is deterministic — it fails without the fix).
+> - **Off-tick viewport changes re-detect** — `recompute_decor_dirty` is now driven from
+>   `run_pending` (gated on a registered provider), not only the `Editor::input` tail. A
+>   viewport change made *off* the input tick — a `:e` run via a queued command-line action
+>   (the widget-keys cmdline path), a buffer switch from a Lua callback — wouldn't otherwise
+>   re-run the input-tail detector, so the file opened uncoloured until the next keystroke.
+>   **Worth keeping in mind as widget-keys grows more queued actions:** any new path that
+>   mutates the buffer/viewport off the input tick is already covered by this chokepoint —
+>   it does *not* need to call `recompute_decor_dirty` itself. (Caught when the rebase onto
+>   the widget-keys cmdline work turned 9 render tests red.)
+> - **wasm / serverless parity** — viewport detection is core (`editor/decor.rs`) and the
+>   dispatch/publish lives in the shared `EditHost::run_pending` fixpoint with **no
+>   `native` gate**, so the serverless tick drives the identical loop (only the transport
+>   differs). Confirmed: `cargo build`/`clippy` clean on both `native` and
+>   `--no-default-features`; the black-box suite exercises the same shared path.
+> - **Docs + second example** — `examples/decor-todo/` (a debounced TODO/FIXME/HACK/XXX/
+>   NOTE keyword highlighter — hl-only, so it renders fully), verified end-to-end by
+>   `the_todo_example_colours_its_keywords_end_to_end`. **indent-guides stays pending**,
+>   not stubbed: it needs `virt_text` rendering (Decision 6, an extmark-layer follow-up),
+>   so it is documented as pending rather than shipped broken — it works with no
+>   `nx.decor` change once that layer grows `virt_text`.
+>
+> Builds + the 16-test `decor.rs` suite clean on `native` and `--no-default-features`
+> (undo + quickfix + multicursor suites still green); `fmt` / `clippy -D warnings` clean.
+
+Original plan for this phase:
+
 - Async provider test (publish from an `nx.run(...):next(…)` / `nx.lsp` continuation —
   the promise-only async surface, `nx.spawn` is gone; gen gates a late response).
   Time-debounce a scroll gesture (Decision 2) — **reuse

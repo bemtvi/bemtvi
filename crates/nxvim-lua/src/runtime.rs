@@ -1225,8 +1225,8 @@ impl LuaRuntime {
     /// Dispatch the registered `nx.decor` providers for a window whose visible range
     /// changed (`nx._decor_dispatch`). The server stamps the viewport `generation` in
     /// core and passes a snapshot — `win`/`buf` handles, the 0-based inclusive
-    /// `top`/`bot` rows, the buffer `filetype` (for the provider's `bufs` filter), and
-    /// `lines` (exactly the visible slice) — never live editor state. Each matching
+    /// `top`/`bot` rows, the buffer `filetype` and `buftype` (for the provider's `bufs`
+    /// filter), and `lines` (exactly the visible slice) — never live editor state. Each matching
     /// provider's `on_range(ctx, publish)` runs; the marks it publishes carry
     /// `ctx.gen` so a viewport the user scrolled past is dropped at apply time
     /// (Phase 3). Phase 2.
@@ -1239,6 +1239,7 @@ impl LuaRuntime {
         bot: usize,
         generation: u64,
         filetype: &str,
+        buftype: &str,
         lines: &[String],
     ) -> mlua::Result<()> {
         let nx = self.nx()?;
@@ -1250,6 +1251,7 @@ impl LuaRuntime {
         ctx.set("bot", lua_int(bot as i64))?;
         ctx.set("gen", lua_int(generation as i64))?;
         ctx.set("filetype", self.lua.create_string(filetype)?)?;
+        ctx.set("buftype", self.lua.create_string(buftype)?)?;
         let arr = self.lua.create_table()?;
         for (i, line) in lines.iter().enumerate() {
             arr.set(i + 1, self.lua.create_string(line)?)?;

@@ -483,3 +483,341 @@ async fn a_stale_publish_paints_nothing() {
         row_spans(&after_live, 0)
     );
 }
+
+// ===== Phase 4: async, debounce, robustness, per-buffer ======================
+
+/// A `lua`-scoped provider that publishes from a **promise continuation** rather than
+/// inline: `nx.promise.delay` fulfils on a later tick, and the publish lands then. The
+/// generation token makes the late response safe to fold (no scroll superseded it), and
+/// the publish queue is drained every `run_pending` round — so a publish off a later
+/// tick already works with no extra machinery (Decision 8).
+const ASYNC_INIT: &str = r##"
+nx.hl.define(0, "AsyncMark", { fg = "#ff00ff" })
+nx.decor.provider {
+  name = "async",
+  bufs = { filetype = { "lua" } },
+  on_range = function(ctx, publish)
+    nx.promise.delay(5):next(function()
+      publish({ { ctx.top, 0, end_col = 1, hl = "AsyncMark" } })
+    end)
+  end,
+}
+"##;
+
+#[tokio::test]
+async fn an_async_provider_publishes_from_a_promise_continuation() {
+    let dir = temp_dir("decor_async");
+    let (rpc, mut incoming) = start(&dir, ASYNC_INIT).await;
+    let path = dir.join("a.lua");
+    std::fs::write(&path, "return x\n").expect("write a.lua");
+
+    feed(&rpc, &format!(":e {}<CR>", path.display()));
+    // The mark is published from a delayed promise, off a tick after the dispatch; the
+    // gen token keeps it valid and it folds into a later frame.
+    let map = wait_redraw(&mut incoming, |m| row_has_group(m, 0, "AsyncMark")).await;
+    assert_eq!(
+        group_at(&map, 0, 0).as_deref(),
+        Some("AsyncMark"),
+        "an async provider's continuation publish renders: {:?}",
+        row_spans(&map, 0)
+    );
+}
+
+#[tokio::test]
+async fn a_debounced_provider_coalesces_a_burst_to_one_run() {
+    // `debounce = ms` collapses a fast continuous scroll into one provider run
+    // (Decision 2): each viewport change re-arms a per-window trailing debounce, so a
+    // burst fires `on_range` exactly once after the window stops moving. Driven by a
+    // synchronous burst of dispatches in one Lua chunk — the timer can't fire mid-chunk
+    // (single-threaded, off-tick), so the coalescing is deterministic, not wall-clock
+    // racing. Scoped to a filetype no real buffer has, so only the burst dispatches it.
+    let dir = temp_dir("decor_debounce");
+    let init = r#"
+_G.runs = 0
+nx.decor.provider {
+  name = "deb",
+  bufs = { filetype = { "debft" } },
+  debounce = 20,
+  on_range = function(_ctx, publish)
+    _G.runs = _G.runs + 1
+    publish({ { 0, 0, end_col = 1, hl = "Comment" } })
+  end,
+}
+"#;
+    let (rpc, _incoming) = start(&dir, init).await;
+    let burst = r#"
+for i = 1, 6 do
+  nx._decor_dispatch({ win = 0, buf = 0, top = 0, bot = 0, lines = { "x" }, filetype = "debft", gen = 100 + i })
+end
+return _G.runs
+"#;
+    let during = lua_u64(&rpc, burst).await;
+    assert_eq!(
+        during,
+        Some(0),
+        "the burst arms the debounce but fires nothing during it"
+    );
+    // After the quiet period the trailing edge fires exactly once for the whole burst.
+    let mut runs = None;
+    for _ in 0..200 {
+        runs = lua_u64(&rpc, "return _G.runs").await;
+        if runs == Some(1) {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    assert_eq!(
+        runs,
+        Some(1),
+        "the debounced provider runs once for the coalesced burst"
+    );
+}
+
+#[tokio::test]
+async fn a_provider_is_disabled_after_three_consecutive_errors() {
+    // Decision 7: a throwing `on_range` is surfaced loud (E5108-style) and, after three
+    // consecutive failures (neovim's CB_MAX_ERROR analog), the provider is disabled —
+    // skipped rather than spamming the message line every scroll. Driven by a
+    // synchronous burst of six dispatches; a provider that always throws runs exactly
+    // three times before the gate stops dispatching it.
+    let dir = temp_dir("decor_disable");
+    let init = r#"
+_G.attempts = 0
+_G.msgs = {}
+nx.notify = function(m, _l) _G.msgs[#_G.msgs + 1] = m end
+nx.decor.provider {
+  name = "boom",
+  bufs = { filetype = { "boomft" } },
+  on_range = function(_ctx, _publish)
+    _G.attempts = _G.attempts + 1
+    error("kaboom")
+  end,
+}
+"#;
+    let (rpc, _incoming) = start(&dir, init).await;
+    let burst = r#"
+for i = 1, 6 do
+  nx._decor_dispatch({ win = 0, buf = 0, top = 0, bot = 0, lines = {}, filetype = "boomft", gen = i })
+end
+return _G.attempts
+"#;
+    let attempts = lua_u64(&rpc, burst).await;
+    assert_eq!(
+        attempts,
+        Some(3),
+        "the provider stops being dispatched after three consecutive errors"
+    );
+    let saw_e5108 = exec_lua(
+        &rpc,
+        "for _, m in ipairs(_G.msgs) do if m:match('E5108') then return true end end return false",
+    )
+    .await;
+    assert_eq!(
+        saw_e5108.as_bool(),
+        Some(true),
+        "the error is surfaced E5108-style (loud), not swallowed"
+    );
+    let saw_disabled = exec_lua(
+        &rpc,
+        "for _, m in ipairs(_G.msgs) do if m:match('disabled') then return true end end return false",
+    )
+    .await;
+    assert_eq!(
+        saw_disabled.as_bool(),
+        Some(true),
+        "the disable is announced loud"
+    );
+}
+
+#[tokio::test]
+async fn a_buffer_scoped_provider_runs_only_for_its_buffer() {
+    // `bufs.buf` per-buffer opt-in: a provider scoped to a buffer id runs only there,
+    // matched against the real `ctx.buf`. Open a real `lua` buffer, register one
+    // provider scoped to it and one scoped to a buffer that does not exist, then drive a
+    // real viewport change (an on-screen edit bumps the changedtick) — only the matching
+    // provider runs.
+    let dir = temp_dir("decor_perbuf");
+    let (rpc, _incoming) = start(&dir, "").await;
+    let path = dir.join("p.lua");
+    std::fs::write(&path, "return x\n").expect("write p.lua");
+    feed(&rpc, &format!(":e {}<CR>", path.display()));
+    let buf = lua_u64(&rpc, "return nx.buf.current()").await.unwrap();
+
+    let reg = format!(
+        r#"
+_G.hit = nil
+_G.miss = false
+nx.decor.provider {{
+  name = "scoped",
+  bufs = {{ buf = {buf} }},
+  on_range = function(ctx, publish)
+    _G.hit = ctx.buf
+    publish({{ {{ ctx.top, 0, end_col = 1, hl = "Comment" }} }})
+  end,
+}}
+nx.decor.provider {{
+  name = "elsewhere",
+  bufs = {{ buf = {other} }},
+  on_range = function(_ctx, _publish)
+    _G.miss = true
+  end,
+}}
+"#,
+        other = buf + 1000
+    );
+    exec_lua(&rpc, &reg).await;
+    // An on-screen edit re-dispatches the visible window's providers (changedtick moves).
+    feed(&rpc, "ax<Esc>");
+
+    let hit = lua_u64(&rpc, "return _G.hit").await;
+    assert_eq!(
+        hit,
+        Some(buf),
+        "the buffer-scoped provider runs for its buffer, seeing the real buf id"
+    );
+    assert_eq!(
+        exec_lua(&rpc, "return _G.miss").await.as_bool(),
+        Some(false),
+        "a provider scoped to another buffer never runs here"
+    );
+}
+
+#[tokio::test]
+async fn the_todo_example_colours_its_keywords_end_to_end() {
+    // The second example (`examples/decor-todo/`), verified end-to-end: a debounced
+    // provider that highlights TODO/FIXME/HACK/XXX/NOTE by kind. Load the real init.lua,
+    // open its sample, and assert distinct keyword groups land — the example actually
+    // works (the debounce only delays the run; the marks still paint).
+    let init = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../examples/decor-todo/init.lua"
+    ))
+    .expect("read example init.lua");
+    let sample = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../examples/decor-todo/sample.lua"
+    );
+    let dir = temp_dir("decor_todo_example");
+    let (rpc, mut incoming) = start(&dir, &init).await;
+
+    feed(&rpc, &format!(":e {sample}<CR>"));
+    // The debounced run fires after the quiet period; wait for the frame carrying the
+    // keyword groups.
+    let map = wait_redraw(&mut incoming, |m| {
+        (0..24).any(|r| row_has_group(m, r, "TodoKeyword"))
+    })
+    .await;
+    let groups: std::collections::HashSet<String> = (0..24)
+        .flat_map(|r| row_spans(&map, r))
+        .map(|(_, _, g)| g)
+        .filter(|g| g.ends_with("Keyword"))
+        .collect();
+    assert!(
+        groups.contains("TodoKeyword") && groups.contains("FixmeKeyword"),
+        "the example colours its keywords across kinds: {groups:?}"
+    );
+}
+
+#[tokio::test]
+async fn custom_highlights_survive_undo_without_flashing() {
+    // Decor marks are ephemeral viewport state, not document history, so undo must not
+    // swap them out. The undo ROOT snapshot is captured at buffer load — before any
+    // provider runs — so undoing back to it wiped the marks until the off-tick
+    // re-dispatch republished them: a flash the user sees on the first undo back to that
+    // state. A provider that publishes ONCE and never republishes turns that flash into
+    // a *permanent* loss, making the fix deterministically observable: with the
+    // carry-live-marks-across-undo fix the mark is still painted after the undo; without
+    // it the root restore drops it and nothing republishes.
+    let dir = temp_dir("decor_undo");
+    let init = r##"
+_G.published = false
+nx.hl.define(0, "OnceMark", { fg = "#ff00ff" })
+nx.decor.provider {
+  name = "once",
+  bufs = { filetype = { "lua" } },   -- so the startup empty buffer doesn't consume the publish
+  on_range = function(_ctx, publish)
+    if not _G.published then
+      _G.published = true
+      publish({ { 0, 0, end_col = 1, hl = "OnceMark" } })
+    end
+    -- later dispatches publish nothing: the mark stands (Decision 3)
+  end,
+}
+"##;
+    let (rpc, mut incoming) = start(&dir, init).await;
+    let path = dir.join("u.lua");
+    std::fs::write(&path, "abc\n").expect("write u.lua");
+    feed(&rpc, &format!(":e {}<CR>", path.display()));
+    let opened = wait_redraw(&mut incoming, |m| row_has_group(m, 0, "OnceMark")).await;
+    assert!(
+        row_has_group(&opened, 0, "OnceMark"),
+        "the once-published mark renders on open"
+    );
+
+    // Append '!' (an undoable edit), then undo across it — the pre-edit state is the
+    // root node (captured before the provider published), so this is the flash case.
+    feed(&rpc, "A!<Esc>");
+    feed(&rpc, "u");
+    let after = wait_redraw(&mut incoming, |m| window0_field(m, "lines").is_some()).await;
+    let after = drain_to_latest_redraw(&mut incoming, |_| true).unwrap_or(after);
+    assert!(
+        row_has_group(&after, 0, "OnceMark"),
+        "the decor mark survives undo back to the root (no flash): {:?}",
+        row_spans(&after, 0)
+    );
+}
+
+/// Two providers, each scoped to a distinct `buftype`: one to ordinary buffers (`""`),
+/// one to the quickfix window (`"quickfix"`). Each records the `ctx.buftype` it saw.
+const BUFTYPE_INIT: &str = r#"
+_G.normal_bt = nil
+_G.qf_bt = nil
+nx.decor.provider {
+  name = "normal-only",
+  bufs = { buftype = { "" } },
+  on_range = function(ctx, _publish) _G.normal_bt = ctx.buftype end,
+}
+nx.decor.provider {
+  name = "qf-only",
+  bufs = { buftype = { "quickfix" } },
+  on_range = function(ctx, _publish) _G.qf_bt = ctx.buftype end,
+}
+"#;
+
+#[tokio::test]
+async fn buftype_scopes_a_provider_to_buffer_kind() {
+    // `bufs.buftype` scopes a provider to a buffer kind. nxvim models the kinds it
+    // distinguishes: `""` (ordinary file/scratch) and `"quickfix"` (the quickfix /
+    // location-list display buffer). A provider scoped to one kind runs only there.
+    let dir = temp_dir("decor_buftype");
+    let (rpc, _incoming) = start(&dir, BUFTYPE_INIT).await;
+    let path = dir.join("n.lua");
+    std::fs::write(&path, "return x\n").expect("write n.lua");
+    feed(&rpc, &format!(":e {}<CR>", path.display()));
+
+    // The ordinary file is buftype "" → only the normal-scoped provider runs.
+    assert_eq!(
+        exec_lua(&rpc, "return _G.normal_bt").await.as_str(),
+        Some(""),
+        "an ordinary buffer is buftype \"\""
+    );
+    assert!(
+        exec_lua(&rpc, "return _G.qf_bt").await.is_nil(),
+        "a quickfix-scoped provider does not run on an ordinary buffer"
+    );
+
+    // Populate the quickfix list and open it → its display buffer is buftype "quickfix",
+    // so opening the window dispatches the quickfix-scoped provider there.
+    exec_lua(
+        &rpc,
+        r#"vim.fn.setqflist({}, " ", { lines = { "a.c:1:boom" }, efm = "%f:%l:%m" })"#,
+    )
+    .await;
+    feed(&rpc, ":copen<CR>");
+    let qf_bt = exec_lua(&rpc, "return _G.qf_bt").await;
+    assert_eq!(
+        qf_bt.as_str(),
+        Some("quickfix"),
+        "the quickfix window's buffer is buftype \"quickfix\": {qf_bt:?}"
+    );
+}

@@ -38,12 +38,16 @@ impl Editor {
     /// Detect every visible (tiled) window whose `(buffer, top, bot)` changed since
     /// the last call, bump that window's viewport generation, and queue a
     /// [`DecorViewport`] for the server to dispatch. Called when input settles
-    /// (tail of [`Editor::input`]) and after a resize — *not* from the redraw
-    /// projection, so the Lua provider never runs during a frame.
+    /// (tail of [`Editor::input`]), after a resize, and once more by the server right
+    /// before it drains the dirty list in `run_pending` — so a viewport change driven
+    /// *off* the input tick (a `:e` run from a queued command-line action, a buffer
+    /// switch from a Lua callback) is still detected, rather than waiting for the next
+    /// keystroke. *Not* from the redraw projection, so the Lua provider never runs
+    /// during a frame.
     ///
     /// Latest-wins per window: a window already pending in `decor_dirty` is replaced
     /// (held `<C-e>` between two drains collapses to one provider run — Decision 2).
-    pub(crate) fn recompute_decor_dirty(&mut self) {
+    pub fn recompute_decor_dirty(&mut self) {
         let mut seen: HashSet<WindowId> = HashSet::new();
         for win in self.window_ids() {
             seen.insert(win);
@@ -94,5 +98,20 @@ impl Editor {
     /// closed window, which no live publish can match.
     pub fn decor_generation(&self, win: WindowId) -> u64 {
         self.decor_gen.get(&win).copied().unwrap_or(0)
+    }
+
+    /// Record that extmark namespace `ns` holds **ephemeral** decoration-provider
+    /// marks (republished off-tick on every viewport/edit change), so undo/redo carry
+    /// the live marks across a snapshot restore rather than swapping them out — see
+    /// [`Editor::restore_snapshot`] and the `ephemeral_extmark_ns` field. Idempotent;
+    /// the server calls it when a `nx.decor` publish first targets a namespace.
+    pub fn mark_extmark_namespace_ephemeral(&mut self, ns: u32) {
+        self.ephemeral_extmark_ns.insert(ns);
+    }
+
+    /// The set of registered ephemeral namespaces (decoration-provider publishes),
+    /// for the undo restore to carry their live marks across a snapshot swap.
+    pub(crate) fn ephemeral_extmark_namespaces(&self) -> Vec<u32> {
+        self.ephemeral_extmark_ns.iter().copied().collect()
     }
 }

@@ -1671,6 +1671,7 @@ impl EditHost {
             (lines, bot)
         };
         let filetype = self.editor.buffer_filetype(vp.buf).unwrap_or_default();
+        let buftype = self.editor.buffer_buftype(vp.buf);
         if let Err(e) = self.lua.run_decor_dispatch(
             vp.win.0,
             vp.buf.0,
@@ -1678,6 +1679,7 @@ impl EditHost {
             bot,
             vp.generation,
             &filetype,
+            buftype,
             &lines,
         ) {
             self.editor
@@ -1737,6 +1739,10 @@ impl EditHost {
         if publish.gen != self.editor.decor_generation(WindowId(publish.win)) {
             return;
         }
+        // Mark the provider's namespace ephemeral so undo/redo carry its live marks
+        // across a snapshot restore rather than swapping them out (otherwise undoing to
+        // a pre-provider state — the root node — flashes the decorations). Idempotent.
+        self.editor.mark_extmark_namespace_ephemeral(publish.ns);
         self.apply_extmark_op(ExtmarkOp::Clear {
             bufnr: publish.buf,
             ns: publish.ns,
@@ -1949,12 +1955,29 @@ impl EditHost {
             // publish the provider produces carries its `generation`, gated at apply
             // time (Phase 3); the generation already moved on for any window scrolled
             // again since, so a stale publish is dropped.
-            let decor_dirty = self.editor.take_decor_dirty();
             if self.lua.has_decor_providers() {
-                for vp in decor_dirty {
+                // Recompute the viewport-changed signal here, not only at the
+                // `Editor::input` tail: a viewport change driven *off* the input tick —
+                // a `:e` that ran via a queued command-line action, a buffer switch from
+                // a Lua callback, a relayout — wouldn't otherwise re-run the input-tail
+                // detector, so its dispatch would wait for the next keystroke (the file
+                // would open uncoloured until you pressed a key). This chokepoint makes
+                // the dirty list reflect the current viewport at drain time, whatever
+                // moved it. Idempotent: a stable viewport queues nothing.
+                //
+                // NOTE: this is the single re-detection point — a *new* queued action
+                // (widget-keys actions, scheduled callbacks, any future off-input-tick
+                // buffer/viewport mutation) is already covered here and must NOT call
+                // `recompute_decor_dirty` itself.
+                self.editor.recompute_decor_dirty();
+                for vp in self.editor.take_decor_dirty() {
                     self.dispatch_decor(vp);
                     self.apply_lua_effects();
                 }
+            } else {
+                // No provider: drain the signal so it can't accumulate, but never build
+                // the snapshot or re-enter Lua (the common config pays nothing).
+                self.editor.take_decor_dirty();
             }
             // nx.on_key_pending: the matcher's withheld prefix settled this batch —
             // push the pending-key signal (which-key / showcmd) iff it *changed* since

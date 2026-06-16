@@ -15,12 +15,21 @@ use nxvim_view::{notation, Key};
 pub fn encode_key(ev: KeyEvent) -> Option<String> {
     let ctrl = ev.modifiers.contains(KeyModifiers::CONTROL);
     let alt = ev.modifiers.contains(KeyModifiers::ALT);
+    let mut shift = ev.modifiers.contains(KeyModifiers::SHIFT);
     let key = match ev.code {
         KeyCode::Char(c) => Key::Char(c),
         KeyCode::Esc => Key::Esc,
         KeyCode::Enter => Key::Enter,
         KeyCode::Backspace => Key::Backspace,
         KeyCode::Tab => Key::Tab,
+        // crossterm reports Shift+Tab as the dedicated `BackTab` code — usually
+        // *without* the SHIFT modifier — so fold it back into Tab + shift here, so
+        // it reaches the server as `<S-Tab>` (the cmdline wildmenu / snippet tabstop
+        // backward key). Without this it hit the catch-all and was silently dropped.
+        KeyCode::BackTab => {
+            shift = true;
+            Key::Tab
+        }
         KeyCode::Delete => Key::Delete,
         KeyCode::Left => Key::Left,
         KeyCode::Right => Key::Right,
@@ -32,5 +41,5 @@ pub fn encode_key(ev: KeyEvent) -> Option<String> {
         KeyCode::PageDown => Key::PageDown,
         _ => return None,
     };
-    Some(notation(ctrl, alt, key))
+    Some(notation(ctrl, alt, shift, key))
 }

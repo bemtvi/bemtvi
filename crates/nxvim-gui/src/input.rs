@@ -14,13 +14,19 @@ use winit::keyboard::{Key, ModifiersState, NamedKey};
 /// key with no editor meaning (bare modifiers, dead/unidentified keys).
 ///
 /// Shift is already folded into the `Character` payload winit reports (`A` for
-/// Shift+a), so it is *not* forwarded as a separate modifier — only `ctrl`/`alt`
-/// are, matching `notation`'s prefix model. A control combo still arrives as the
-/// base character (`Ctrl+w` → `Character("w")` + `control_key()`), which yields
-/// `<C-w>`.
+/// Shift+a), so for a printable key it adds no separate modifier — `notation` only
+/// notates shift for **named** keys (`<S-Tab>`), where winit *does* report it as a
+/// modifier (Shift+Tab arrives as `Tab` + `shift_key()`, not a folded character).
+/// A control combo still arrives as the base character (`Ctrl+w` → `Character("w")`
+/// + `control_key()`), which yields `<C-w>`.
 pub fn encode_key(logical: &Key, mods: ModifiersState) -> Option<String> {
     let key = translate(logical)?;
-    Some(notation(mods.control_key(), mods.alt_key(), key))
+    Some(notation(
+        mods.control_key(),
+        mods.alt_key(),
+        mods.shift_key(),
+        key,
+    ))
 }
 
 /// Whether `logical` + `mods` is a "paste from system clipboard" gesture: Cmd+V

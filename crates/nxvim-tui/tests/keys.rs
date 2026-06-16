@@ -102,6 +102,27 @@ fn unmapped_keys_return_none() {
 }
 
 #[test]
+fn shift_tab_is_back_tab_notation() {
+    // crossterm reports Shift+Tab as the dedicated `BackTab` code (no SHIFT
+    // modifier on most terminals); it must reach the server as `<S-Tab>`, the
+    // notation the cmdline wildmenu / snippet tabstop nav bind. Previously it hit
+    // the catch-all and was dropped, so Shift+Tab did nothing.
+    assert_eq!(
+        note(KeyCode::BackTab, KeyModifiers::NONE).as_deref(),
+        Some("<S-Tab>")
+    );
+    // Some terminals (kitty/CSI-u protocols) instead send Tab + SHIFT — same key.
+    assert_eq!(
+        note(KeyCode::BackTab, KeyModifiers::SHIFT).as_deref(),
+        Some("<S-Tab>")
+    );
+    assert_eq!(
+        note(KeyCode::Tab, KeyModifiers::SHIFT).as_deref(),
+        Some("<S-Tab>")
+    );
+}
+
+#[test]
 fn combined_ctrl_alt_prefixes_both() {
     assert_eq!(
         note(

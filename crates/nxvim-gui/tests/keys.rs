@@ -53,6 +53,18 @@ fn special_keys_use_angle_notation() {
 }
 
 #[test]
+fn shift_tab_is_s_tab_notation() {
+    // winit reports Shift+Tab as `Tab` with the SHIFT modifier (it doesn't fold a
+    // named key the way it folds a character). Shift must be notated for named keys
+    // so it reaches the server as `<S-Tab>` (the cmdline wildmenu / snippet tabstop
+    // backward key); previously the GUI dropped the modifier and sent a plain `<Tab>`.
+    assert_eq!(
+        note(Key::Named(NamedKey::Tab), ModifiersState::SHIFT).as_deref(),
+        Some("<S-Tab>")
+    );
+}
+
+#[test]
 fn ctrl_and_alt_get_prefixed() {
     assert_eq!(
         note(ch("w"), ModifiersState::CONTROL).as_deref(),

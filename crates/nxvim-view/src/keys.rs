@@ -27,12 +27,17 @@ pub enum Key {
     PageDown,
 }
 
-/// Translate a neutral key press (with its `ctrl`/`alt` modifiers) into vim
+/// Translate a neutral key press (with its `ctrl`/`alt`/`shift` modifiers) into vim
 /// key-notation. A bare character is sent literally — except `<`, which becomes
 /// `<lt>` so it can't open a `<...>` form; with a modifier the character is
 /// wrapped (`<C-x>`, `<A-x>`, `<C-A-x>`). Named keys are always wrapped, carrying
 /// the same modifier prefix.
-pub fn notation(ctrl: bool, alt: bool, key: Key) -> String {
+///
+/// `shift` is notated **only for named keys** (`<S-Tab>`): on a printable character
+/// the platform layout has already folded shift into the character itself (`A` for
+/// Shift+a), so it adds no `S-` there. This mirrors core's `key_to_notation`, and is
+/// what lets Shift+Tab reach the server as `<S-Tab>` rather than a bare `<Tab>`.
+pub fn notation(ctrl: bool, alt: bool, shift: bool, key: Key) -> String {
     let mut prefix = String::new();
     if ctrl {
         prefix.push_str("C-");
@@ -40,7 +45,13 @@ pub fn notation(ctrl: bool, alt: bool, key: Key) -> String {
     if alt {
         prefix.push_str("A-");
     }
-    let wrap = |name: &str| format!("<{prefix}{name}>");
+    // The named-key prefix additionally carries `S-`; the character arms ignore it.
+    let named_prefix = if shift {
+        format!("{prefix}S-")
+    } else {
+        prefix.clone()
+    };
+    let wrap = |name: &str| format!("<{named_prefix}{name}>");
 
     match key {
         Key::Char(c) => {

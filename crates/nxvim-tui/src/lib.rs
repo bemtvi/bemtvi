@@ -201,10 +201,19 @@ where
     .await
     .ok();
 
+    // Remote (daemon-session) image previews: the file lives on the daemon, so the
+    // store fetches its bytes over `nxvim_image_read` instead of reading local disk.
+    // `img_fetch_*` carries a request out of the (synchronous) paint into the loop,
+    // which issues the RPC on a spawned task; `img_bytes_*` carries the reply back.
+    let (img_fetch_tx, mut img_fetch_rx) =
+        tokio::sync::mpsc::unbounded_channel::<images::ImageFetch>();
+    let (img_bytes_tx, mut img_bytes_rx) =
+        tokio::sync::mpsc::unbounded_channel::<(String, (u64, u64), Result<Vec<u8>, String>)>();
+
     // The image renderer for `'imagepreview'`: detect the terminal's graphics
     // protocol now (it queries over stdio), *before* the `EventStream` below starts
     // reading input, so the two don't race for the terminal's replies.
-    let mut image_store = images::ImageStore::new();
+    let mut image_store = images::ImageStore::new(img_fetch_tx);
 
     let mut view = View::default();
     let mut anim: Option<Animation> = None;
@@ -553,6 +562,31 @@ where
                         ],
                     );
                 }
+            },
+            // A remote preview needs its bytes: fetch them over `nxvim_image_read` on a
+            // spawned task (so a slow daemon read never stalls input/redraws) and send
+            // the reply back on `img_bytes_*`. `None` (the store dropped) just falls
+            // through. The closure-side paint can only enqueue, not await, hence this.
+            fetch = img_fetch_rx.recv() => if let Some(images::ImageFetch { path, version }) = fetch {
+                let rpc = rpc.clone();
+                let tx = img_bytes_tx.clone();
+                tokio::spawn(async move {
+                    let result = match rpc
+                        .request("nxvim_image_read", vec![Value::from(path.as_str())])
+                        .await
+                    {
+                        Ok(Value::Binary(bytes)) => Ok(bytes),
+                        Ok(other) => Err(format!("nxvim_image_read: unexpected reply {other:?}")),
+                        Err(e) => Err(e.to_string()),
+                    };
+                    let _ = tx.send((path, version, result));
+                });
+            },
+            // A remote preview's bytes arrived (or the read failed): hand them to the
+            // store and repaint, so the picture replaces its loading placeholder.
+            bytes = img_bytes_rx.recv() => if let Some((path, version, result)) = bytes {
+                image_store.deliver(path, version, result);
+                terminal.draw(|frame| render(frame, &view, anim.as_ref(), doc_scroll, Some(&mut image_store)))?;
             },
         }
     }

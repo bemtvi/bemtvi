@@ -506,29 +506,112 @@ impl Editor {
             "bf" | "bfirst" | "br" | "brewind" => self.ex_bfirst(),
             "bl" | "blast" => self.ex_blast(),
             "bd" | "bdel" | "bdelete" | "bw" | "bwipe" | "bwipeout" => self.ex_bdelete(args, bang),
-            // Quickfix ingest from a buffer (Phase 1). `:cbuffer` replaces the list,
-            // `:caddbuffer` appends; the `:cget*` variants are identical here (the
-            // window-open / jump-to-first coupling lands with the quickfix window in
-            // Phase 2). The optional argument is a buffer number; default current.
+            // Quickfix / location-list ingest from a buffer. `:cbuffer` replaces the
+            // list, `:caddbuffer` appends; the `:cget*` variants are identical here.
+            // Every `:c*` has its `:l*` twin acting on the focused window's location
+            // list. The optional argument is a buffer number; default current.
             "cb" | "cbu" | "cbuf" | "cbuff" | "cbuffe" | "cbuffer" | "cgetb" | "cgetbu"
             | "cgetbuf" | "cgetbuff" | "cgetbuffe" | "cgetbuffer" => {
-                self.ex_cbuffer(args, QfAction::New)
+                self.ex_cbuffer(QfWhich::Quickfix, args, QfAction::New)
             }
             "cad" | "cadd" | "caddb" | "caddbu" | "caddbuf" | "caddbuff" | "caddbuffe"
-            | "caddbuffer" => self.ex_cbuffer(args, QfAction::Add),
-            // Quickfix window + navigation (Phase 2).
-            "cope" | "copen" => self.ex_copen(args),
-            "ccl" | "cclo" | "cclos" | "cclose" => self.ex_cclose(),
-            "cw" | "cwin" | "cwindow" => self.ex_cwindow(args),
-            "cc" => self.ex_cc(parse_opt_count_arg(args)),
-            "cn" | "cne" | "cnex" | "cnext" => self.ex_cstep(true, parse_count_arg(args)),
-            "cp" | "cpr" | "cprev" | "cprevious" | "cN" | "cNext" => {
-                self.ex_cstep(false, parse_count_arg(args))
+            | "caddbuffer" => self.ex_cbuffer(QfWhich::Quickfix, args, QfAction::Add),
+            "lb" | "lbu" | "lbuf" | "lbuff" | "lbuffe" | "lbuffer" | "lgetb" | "lgetbu"
+            | "lgetbuf" | "lgetbuff" | "lgetbuffe" | "lgetbuffer" => {
+                let which = self.loclist_which();
+                self.ex_cbuffer(which, args, QfAction::New)
             }
-            "cfir" | "cfirst" | "cr" | "crewind" => self.ex_cfirst(),
-            "cla" | "clast" => self.ex_clast(),
+            "lad" | "ladd" | "laddb" | "laddbu" | "laddbuf" | "laddbuff" | "laddbuffe"
+            | "laddbuffer" => {
+                let which = self.loclist_which();
+                self.ex_cbuffer(which, args, QfAction::Add)
+            }
+            // `:cfile`/`:cgetfile`/`:caddfile {file}` (+ `:l*`): read a file off disk
+            // and parse it against `'errorformat'`. `:cfile` opens + jumps to the
+            // first error, `:cgetfile` only fills, `:caddfile` appends silently.
+            "cf" | "cfi" | "cfil" | "cfile" => {
+                self.ex_cfile(QfWhich::Quickfix, args, QfAction::New, true, true)
+            }
+            "cgetf" | "cgetfi" | "cgetfil" | "cgetfile" => {
+                self.ex_cfile(QfWhich::Quickfix, args, QfAction::New, false, false)
+            }
+            "caddf" | "caddfi" | "caddfil" | "caddfile" => {
+                self.ex_cfile(QfWhich::Quickfix, args, QfAction::Add, false, false)
+            }
+            "lf" | "lfi" | "lfil" | "lfile" => {
+                let which = self.loclist_which();
+                self.ex_cfile(which, args, QfAction::New, true, true)
+            }
+            "lgetf" | "lgetfi" | "lgetfil" | "lgetfile" => {
+                let which = self.loclist_which();
+                self.ex_cfile(which, args, QfAction::New, false, false)
+            }
+            "laddf" | "laddfi" | "laddfil" | "laddfile" => {
+                let which = self.loclist_which();
+                self.ex_cfile(which, args, QfAction::Add, false, false)
+            }
+            // Quickfix window + navigation (and the location-list twins).
+            "cope" | "copen" => self.ex_qf_open(QfWhich::Quickfix, args),
+            "ccl" | "cclo" | "cclos" | "cclose" => self.ex_qf_close(QfWhich::Quickfix),
+            "cw" | "cwin" | "cwindow" => self.ex_qf_window(QfWhich::Quickfix, args),
+            "cc" => self.ex_qf_cc(QfWhich::Quickfix, parse_opt_count_arg(args)),
+            "cn" | "cne" | "cnex" | "cnext" => {
+                self.ex_qf_step(QfWhich::Quickfix, true, parse_count_arg(args))
+            }
+            "cp" | "cpr" | "cprev" | "cprevious" | "cN" | "cNext" => {
+                self.ex_qf_step(QfWhich::Quickfix, false, parse_count_arg(args))
+            }
+            "cfir" | "cfirst" | "cr" | "crewind" => self.ex_qf_first(QfWhich::Quickfix),
+            "cla" | "clast" => self.ex_qf_last(QfWhich::Quickfix),
+            "col" | "cold" | "colde" | "colder" => {
+                self.ex_qf_history(QfWhich::Quickfix, false, parse_count_arg(args))
+            }
+            "cnew" | "cnewe" | "cnewer" => {
+                self.ex_qf_history(QfWhich::Quickfix, true, parse_count_arg(args))
+            }
+            "lop" | "lope" | "lopen" => {
+                let which = self.loclist_which();
+                self.ex_qf_open(which, args);
+            }
+            "lcl" | "lclo" | "lclos" | "lclose" => {
+                let which = self.loclist_which();
+                self.ex_qf_close(which);
+            }
+            "lw" | "lwin" | "lwindow" => {
+                let which = self.loclist_which();
+                self.ex_qf_window(which, args);
+            }
+            "ll" => {
+                let which = self.loclist_which();
+                self.ex_qf_cc(which, parse_opt_count_arg(args));
+            }
+            "lne" | "lnex" | "lnext" => {
+                let which = self.loclist_which();
+                self.ex_qf_step(which, true, parse_count_arg(args));
+            }
+            "lp" | "lpr" | "lprev" | "lprevious" | "lN" | "lNext" => {
+                let which = self.loclist_which();
+                self.ex_qf_step(which, false, parse_count_arg(args));
+            }
+            "lfir" | "lfirst" | "lr" | "lrewind" => {
+                let which = self.loclist_which();
+                self.ex_qf_first(which);
+            }
+            "lla" | "llast" => {
+                let which = self.loclist_which();
+                self.ex_qf_last(which);
+            }
+            "lol" | "lold" | "lolde" | "lolder" => {
+                let which = self.loclist_which();
+                self.ex_qf_history(which, false, parse_count_arg(args));
+            }
+            "lnew" | "lnewe" | "lnewer" => {
+                let which = self.loclist_which();
+                self.ex_qf_history(which, true, parse_count_arg(args));
+            }
             // `:vimgrep[!] /{pat}/[gj] {file}…` (no external process — searches with
-            // the active `'regexsyntax'` engine). `:vimgrepadd` appends to the list.
+            // the active `'regexsyntax'` engine). `:vimgrepadd` appends; `:lvimgrep`
+            // populates the focused window's location list.
             "vim" | "vimg" | "vimgr" | "vimgre" | "vimgrep" | "vimgrepa" | "vimgrepad"
             | "vimgrepadd" => {
                 let action = if name.starts_with("vimgrepa") {
@@ -536,7 +619,17 @@ impl Editor {
                 } else {
                     QfAction::New
                 };
-                self.ex_vimgrep(args, action);
+                self.ex_vimgrep(QfWhich::Quickfix, args, action);
+            }
+            "lvim" | "lvimg" | "lvimgr" | "lvimgre" | "lvimgrep" | "lvimgrepa" | "lvimgrepad"
+            | "lvimgrepadd" => {
+                let action = if name.starts_with("lvimgrepa") {
+                    QfAction::Add
+                } else {
+                    QfAction::New
+                };
+                let which = self.loclist_which();
+                self.ex_vimgrep(which, args, action);
             }
             "lua" => self.lua_queue.push(args.to_string()),
             "sleep" | "sl" => match parse_sleep(args) {

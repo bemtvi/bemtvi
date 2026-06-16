@@ -492,6 +492,11 @@ pub struct QfSetOp {
     /// After populating, jump to the first valid entry (`:cfirst`). Set by a
     /// no-bang `:make`/`:grep`; always `false` for plain `setqflist`.
     pub goto_first: bool,
+    /// Target a window's **location list** instead of the global quickfix list:
+    /// `Some(window_id)` for `setloclist`/`:lmake`/`:lgrep`, `None` (the common
+    /// case) for the quickfix list. `Some(0)` means "the current window at drain
+    /// time" (vim's `winnr` 0).
+    pub loclist_win: Option<u64>,
 }
 
 /// A treesitter bridge request queued by `vim.treesitter.start` / `stop`, the

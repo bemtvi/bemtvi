@@ -10,7 +10,7 @@ use crate::EditHost;
 use nxvim_core::highlight::HlDef;
 use nxvim_core::{
     parse_color, BorderStyle, BufferId, FloatAnchor, FloatConfig, FloatRelative, QfAction, QfEntry,
-    TabId, UndoEntry, UndoTreeView, WindowConfigSpec, WindowId,
+    QfWhich, TabId, UndoEntry, UndoTreeView, WindowConfigSpec, WindowId,
 };
 use nxvim_lua::{
     BoMirror, BufBytesEdit, BufMirror, BufOp, CallbackArgs, DockOp, ExtmarkMirror, ExtmarkOp,
@@ -42,6 +42,33 @@ fn qf_entry_from_item(it: QfItem) -> QfEntry {
         typ: it.typ.bytes().next().unwrap_or(0),
         valid: it.valid,
     }
+}
+
+/// Project a core [`QfList`]'s entries into the [`QfMirror`] rows the Lua side
+/// reads (`nx._qflist` / `nx._loclist[win]`).
+fn qf_mirror_items(list: &nxvim_core::QfList) -> Vec<QfMirror> {
+    list.items
+        .iter()
+        .map(|e| QfMirror {
+            filename: e.filename.clone().unwrap_or_default(),
+            bufnr: e.bufnr,
+            module: e.module.clone(),
+            lnum: e.lnum as i64,
+            end_lnum: e.end_lnum as i64,
+            col: e.col as i64,
+            end_col: e.end_col as i64,
+            vcol: e.vcol,
+            nr: e.nr,
+            pattern: e.pattern.clone(),
+            text: e.text.clone(),
+            typ: if e.typ == 0 {
+                String::new()
+            } else {
+                (e.typ as char).to_string()
+            },
+            valid: e.valid,
+        })
+        .collect()
 }
 
 fn byte_of(buf: &nxvim_core::Buffer, row: i64, col: i64) -> usize {
@@ -317,30 +344,50 @@ impl EditHost {
                 'r' => QfAction::Replace,
                 _ => QfAction::New,
             };
+            // Quickfix list (`loclist_win == None`) vs a window's location list. A
+            // `Some(0)` targets the current window (vim's `winnr` 0); any other id is
+            // a window handle. Drop the op on a stale window id rather than silently
+            // writing the quickfix list.
+            let which = match op.loclist_win {
+                None => Some(QfWhich::Quickfix),
+                Some(0) => Some(QfWhich::Location(self.editor.current_window_id())),
+                Some(id) => {
+                    let win = WindowId(id);
+                    if self.editor.window_ids().contains(&win) {
+                        Some(QfWhich::Location(win))
+                    } else {
+                        self.editor
+                            .echo(format!("E957: Invalid window number {id}"));
+                        None
+                    }
+                }
+            };
+            let Some(which) = which else { continue };
             let mut ok = true;
             if let Some(items) = op.items {
                 let entries = items.into_iter().map(qf_entry_from_item).collect();
-                self.editor.qf_set_items(entries, action, op.title);
+                self.editor.qf_set_items(which, entries, action, op.title);
             } else if let Some(lines) = op.lines {
                 let efm = op
                     .efm
                     .unwrap_or_else(|| self.editor.global_options().errorformat);
                 if let Err(e) = self
                     .editor
-                    .qf_set_from_lines(&lines, &efm, action, op.title)
+                    .qf_set_from_lines(which, &lines, &efm, action, op.title)
                 {
                     self.editor.echo(e);
                     ok = false;
                 }
             } else {
                 // Neither items nor lines: an explicit clear.
-                self.editor.qf_set_items(Vec::new(), action, op.title);
+                self.editor
+                    .qf_set_items(which, Vec::new(), action, op.title);
             }
             // The `:make`/`:grep` post-populate behavior: open the window iff there
             // are entries, then jump to the first valid one. Skipped when the parse
             // failed (the list is unchanged).
             if ok && (op.open || op.goto_first) {
-                self.editor.qf_post_populate(op.open, op.goto_first);
+                self.editor.qf_post_populate(which, op.open, op.goto_first);
             }
         }
         // `vim.ui.input` prompts (Phase 8): open the editor's command line as a
@@ -1304,36 +1351,25 @@ impl EditHost {
         }
     }
 
-    /// Refresh the `nx._qflist` mirror that `vim.fn.getqflist()` reads from the
-    /// editor's current quickfix list. Cheap (a handful of short strings each), so
-    /// it isn't gated on a dirty flag — pushed alongside the other per-tick mirrors.
+    /// Refresh the `nx._qflist` mirror (`vim.fn.getqflist()`) from the editor's
+    /// current quickfix list, plus the per-window `nx._loclist` mirror
+    /// (`vim.fn.getloclist(win)`) from every window that has a location list. Cheap
+    /// (a handful of short strings each), so it isn't gated on a dirty flag —
+    /// pushed alongside the other per-tick mirrors.
     pub(crate) fn push_qflist_mirror(&mut self) {
         let list = self.editor.qf_list();
-        let items: Vec<QfMirror> = list
-            .items
-            .iter()
-            .map(|e| QfMirror {
-                filename: e.filename.clone().unwrap_or_default(),
-                bufnr: e.bufnr,
-                module: e.module.clone(),
-                lnum: e.lnum as i64,
-                end_lnum: e.end_lnum as i64,
-                col: e.col as i64,
-                end_col: e.end_col as i64,
-                vcol: e.vcol,
-                nr: e.nr,
-                pattern: e.pattern.clone(),
-                text: e.text.clone(),
-                typ: if e.typ == 0 {
-                    String::new()
-                } else {
-                    (e.typ as char).to_string()
-                },
-                valid: e.valid,
-            })
-            .collect();
+        let items = qf_mirror_items(list);
         let title = list.title.clone();
         let _ = self.lua.set_qflist_mirror(&items, &title);
+        // Rebuild the per-window location-list mirror from scratch so a window that
+        // lost (or never had) a loclist drops out.
+        let _ = self.lua.clear_loclist_mirror();
+        for win in self.editor.window_ids() {
+            if let Some(ll) = self.editor.loclist(win) {
+                let items = qf_mirror_items(ll);
+                let _ = self.lua.set_loclist_mirror(win.0, &items, &ll.title);
+            }
+        }
     }
 
     /// Route one [`LoopOp`]: enqueue a `Schedule` for the `run_pending` drain, or

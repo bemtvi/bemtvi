@@ -1615,40 +1615,43 @@ pub(crate) fn install_runtime_api(
     let sh = shared.clone();
     nx.set(
         "_set_qflist",
-        lua.create_function(move |_, (items, lines, efm, action, title): QfSetArgs| {
-            let items = match items {
-                Some(tbl) => {
-                    let mut out = Vec::with_capacity(tbl.raw_len());
-                    for pair in tbl.sequence_values::<mlua::Table>() {
-                        out.push(qf_item_from_table(&pair?)?);
+        lua.create_function(
+            move |_, (items, lines, efm, action, title, loclist_win): QfSetArgs| {
+                let items = match items {
+                    Some(tbl) => {
+                        let mut out = Vec::with_capacity(tbl.raw_len());
+                        for pair in tbl.sequence_values::<mlua::Table>() {
+                            out.push(qf_item_from_table(&pair?)?);
+                        }
+                        Some(out)
                     }
-                    Some(out)
-                }
-                None => None,
-            };
-            let lines = match lines {
-                Some(tbl) => {
-                    let mut out = Vec::with_capacity(tbl.raw_len());
-                    for s in tbl.sequence_values::<String>() {
-                        out.push(s?);
+                    None => None,
+                };
+                let lines = match lines {
+                    Some(tbl) => {
+                        let mut out = Vec::with_capacity(tbl.raw_len());
+                        for s in tbl.sequence_values::<String>() {
+                            out.push(s?);
+                        }
+                        Some(out)
                     }
-                    Some(out)
-                }
-                None => None,
-            };
-            // Default action is `' '` (new list); a non-empty arg's first char.
-            let action = action.and_then(|a| a.chars().next()).unwrap_or(' ');
-            sh.borrow_mut().qf_ops.push(QfSetOp {
-                items,
-                lines,
-                efm,
-                action,
-                title,
-                open: false,
-                goto_first: false,
-            });
-            Ok(())
-        })?,
+                    None => None,
+                };
+                // Default action is `' '` (new list); a non-empty arg's first char.
+                let action = action.and_then(|a| a.chars().next()).unwrap_or(' ');
+                sh.borrow_mut().qf_ops.push(QfSetOp {
+                    items,
+                    lines,
+                    efm,
+                    action,
+                    title,
+                    open: false,
+                    goto_first: false,
+                    loclist_win,
+                });
+                Ok(())
+            },
+        )?,
     )?;
 
     // `nx._qf_populate(lines, efm, title, open, jump)`: the `:make`/`:grep`
@@ -1661,7 +1664,15 @@ pub(crate) fn install_runtime_api(
     nx.set(
         "_qf_populate",
         lua.create_function(
-            move |_, (lines, efm, title, open, jump): (Vec<String>, String, String, bool, bool)| {
+            move |_,
+                  (lines, efm, title, open, jump, loclist_win): (
+                Vec<String>,
+                String,
+                String,
+                bool,
+                bool,
+                Option<u64>,
+            )| {
                 sh.borrow_mut().qf_ops.push(QfSetOp {
                     items: None,
                     lines: Some(lines),
@@ -1670,6 +1681,7 @@ pub(crate) fn install_runtime_api(
                     title: Some(title),
                     open,
                     goto_first: jump,
+                    loclist_win,
                 });
                 Ok(())
             },
@@ -1876,13 +1888,17 @@ fn store_panel_callback(lua: &Lua, cb: Option<mlua::Function>) -> mlua::Result<(
 }
 
 /// The positional arguments `nx._set_qflist` receives: `(items, lines, efm,
-/// action, title)`, where `items`/`lines` are Lua arrays and the rest strings.
+/// action, title, loclist_win)`, where `items`/`lines` are Lua arrays, the next
+/// three are strings, and `loclist_win` is the location-list target window
+/// (`nil`/absent for the quickfix list, `0` for the current window — see
+/// [`QfSetOp::loclist_win`]).
 type QfSetArgs = (
     Option<mlua::Table>,
     Option<mlua::Table>,
     Option<String>,
     Option<String>,
     Option<String>,
+    Option<u64>,
 );
 
 /// Convert one `setqflist` entry dict into a [`QfItem`]. Absent keys take their

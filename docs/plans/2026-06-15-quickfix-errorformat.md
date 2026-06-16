@@ -1,6 +1,6 @@
 # Quickfix & errorformat — implementation plan
 
-> **Status: Phases 1–3 complete.**
+> **Status: Phases 1–4 complete — the feature is done.**
 > nxvim parses `errorformat` (a faithful port of vim's `quickfix.c`) into a
 > structured quickfix list, populated via `setqflist` (structured items or
 > raw-lines-plus-efm) and `:cbuffer`/`:cgetbuffer`/`:caddbuffer`, read back via
@@ -8,12 +8,14 @@
 > (`:copen`/`:cclose`/`:cwindow`) with `<CR>`/`:cc`/`:cnext`/`:cprev`/`:cfirst`/
 > `:clast` navigation honoring `'switchbuf'` (Phase 2); runs `:make`/`:grep` (async,
 > via the job machinery) and the in-process `:vimgrep`, parsing their output into the
-> list and jumping to the first error (Phase 3). Phase 4 (the location list + list
-> stack + `:cfile` + `nx.qf`) is still to do. This
-> plan builds the whole feature: a structured error list populated from command
-> output (`:make`, `:grep`) or ingested text (`:cfile`/`:cbuffer`/`:cexpr`), parsed
-> against a faithfully-ported vim `errorformat`, browsed in a quickfix window, and
-> exposed as a dogfoodable `nx.qf` Lua surface.
+> list and jumping to the first error (Phase 3); and now keeps a 10-deep list-history
+> **stack** (`:colder`/`:cnewer`), per-window **location lists** with every `:l*` twin,
+> `:cfile`/`:cgetfile`/`:caddfile` ingest, and a dogfoodable `nx.qf` Lua surface with
+> `setloclist`/`getloclist` (and `nx.diagnostic.setloclist` wired onto a real loclist)
+> (Phase 4). This plan built the whole feature: a structured error list populated from
+> command output (`:make`, `:grep`) or ingested text (`:cfile`/`:cbuffer`/`:cexpr`),
+> parsed against a faithfully-ported vim `errorformat`, browsed in a quickfix window,
+> and exposed as a dogfoodable `nx.qf` Lua surface.
 
 ## Why this document exists
 
@@ -242,7 +244,33 @@ no external process (runs everywhere).
 
 ---
 
-## Phase 4 — Location list + list stack + `nx.qf` API ⬜
+## Phase 4 — Location list + list stack + `nx.qf` API ✅
+
+> **Done.** The single `Editor::quickfix` list became a `QfStack` (vim's up-to-10
+> list history; `:colder`/`:cnewer` walk it via `Editor::ex_qf_history`, `E380`/`E381`
+> at the ends), and `setqflist`'s `' '`/`'a'`/`'r'` actions gained their real divergent
+> meaning (push-new / append / replace-current). **Location lists** are per-window:
+> each [`Window`] carries an optional `loclist: QfStack` + `loclist_bufnr` (its display
+> buffer). The whole window/navigation/populate surface was parameterized by a new
+> `QfWhich { Quickfix, Location(WindowId) }` so every `:c*` shares one implementation
+> with its `:l*` twin (`ex_qf_open`/`close`/`window`/`cc`/`step`/`first`/`last`/
+> `history`); `:lopen` mints a per-window display buffer whose owner is found by the
+> unique window holding that `loclist_bufnr`, and `<CR>`/`:ll` jump back into that owner
+> (`qf_focus_target_window`). `:lvimgrep`/`:lgrep`/`:lmake` reuse the Phase 3 producers
+> with a loclist target threaded through `QfSetOp::loclist_win` (`Some(0)` = current
+> window at drain time). `:cfile`/`:cgetfile`/`:caddfile` (+ `:l*`) read a file off the
+> host fs and parse it (`Editor::ex_cfile`). Location lists are **strictly per-window**
+> (a split inherits a *clone*, not vim's shared-by-reference list — a documented
+> divergence). The Lua surface: `nx.setloclist`/`nx.getloclist` (+ `vim.fn` aliases) over
+> a per-window `nx._loclist` mirror, the canonical `nx.qf` namespace, and
+> `nx.diagnostic.setloclist`/`setqflist`/`toqflist` rebuilt to fill a real, navigable
+> loclist (bufnr-addressed entries now resolve their file at jump time). Covered by 7
+> new black-box tests in `tests/quickfix.rs` (window-scoped set/getloclist,
+> `:colder`/`:cnewer` + `E380`, the `'r'` action, `:lvimgrep`, the read-only loclist
+> window + `<CR>` jump, `:lmake` loclist-scoping, and `nx.diagnostic.setloclist`
+> navigability), plus a runnable `examples/quickfix/`. **Deferred (unchanged from
+> Phase 2/3):** `:vimgrep` file globbing, `:cnfile`/`:cpfile`, and the out-of-scope
+> items below.
 
 **Goal:** window-local location lists, the 10-deep history stack, and the
 dogfoodable Lua surface (`[[dogfood-the-nx-plugin-api]]`).

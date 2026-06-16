@@ -35,8 +35,9 @@ pub use editor::{
     CompleteKeys, Cursor, Editor, FileChangeAction, FileChangeReason, FileChangelist,
     FileMarkEntry, FloatAnchor, FloatConfig, FloatRelative, GlobalMarkEntry, JumpPos, MenuExtent,
     MenuItem, MenuPlacement, NumberedMark, PendingOpen, PendingQuitAll, PendingSave, PersistState,
-    PreviewScroll, PreviewTarget, PromptPos, QfAction, QfEntry, QfList, RegisterEntry,
-    ShadaRequest, TabId, TerminalOp, UndoEntry, UndoTreeView, WindowConfigSpec, WindowId,
+    PreviewScroll, PreviewTarget, PromptPos, QfAction, QfEntry, QfList, QfStack, QfWhich,
+    RegisterEntry, ShadaRequest, TabId, TerminalOp, UndoEntry, UndoTreeView, WindowConfigSpec,
+    WindowId,
 };
 pub use encoding::Encoding;
 pub use extmark::{

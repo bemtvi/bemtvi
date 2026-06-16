@@ -127,8 +127,67 @@ function nx.diagnostic.goto_prev(opts)
   nx._diagnostic_goto(false, opts.severity)
 end
 
-function nx.diagnostic.setloclist(_opts)
-  nx._diagnostic_setloclist()
+-- Severity (1=ERROR…4=HINT) → quickfix type char, matching neovim's
+-- `vim.diagnostic.toqflist`.
+local SEVERITY_TYPE = { "E", "W", "I", "N" }
+
+-- nx.diagnostic.toqflist(diagnostics): convert a list of diagnostic tables (the
+-- shape `nx.diagnostic.get` returns) into quickfix/location-list items. Mirrors
+-- neovim's `vim.diagnostic.toqflist`: 0-based diagnostic positions become 1-based
+-- list columns, the message becomes the entry text, and severity maps to the type
+-- char. The buffer name is resolved into `filename` so the entry is jumpable.
+function nx.diagnostic.toqflist(diagnostics)
+  local items = {}
+  for _, d in ipairs(diagnostics or {}) do
+    local fname = nil
+    if d.bufnr then
+      local ok, name = pcall(vim.api.nvim_buf_get_name, d.bufnr)
+      if ok and name ~= "" then
+        fname = name
+      end
+    end
+    items[#items + 1] = {
+      bufnr = d.bufnr,
+      filename = fname,
+      lnum = (d.lnum or 0) + 1,
+      end_lnum = d.end_lnum and (d.end_lnum + 1) or 0,
+      col = (d.col or 0) + 1,
+      end_col = d.end_col and (d.end_col + 1) or 0,
+      text = d.message or "",
+      type = SEVERITY_TYPE[d.severity] or "E",
+    }
+  end
+  return items
+end
+
+-- nx.diagnostic.setqflist([opts]): replace the quickfix list with every buffer's
+-- diagnostics and (unless `opts.open == false`) open the quickfix window. `opts`:
+-- `severity` filter, `title`, `open`.
+function nx.diagnostic.setqflist(opts)
+  opts = opts or {}
+  local diags = nx.diagnostic.get(nil, { severity = opts.severity })
+  local items = nx.diagnostic.toqflist(diags)
+  nx.setqflist({}, " ", { title = opts.title or "Diagnostics", items = items })
+  if opts.open ~= false then
+    vim.cmd("copen")
+  end
+end
+
+-- nx.diagnostic.setloclist([opts]): populate the current window's location list
+-- with the current buffer's diagnostics (a real, navigable loclist now that one
+-- exists) and open it. `opts`: `bufnr` (default current), `severity`, `title`,
+-- `open`.
+function nx.diagnostic.setloclist(opts)
+  opts = opts or {}
+  -- Capture the owner window explicitly so the list lands on this window even
+  -- though the `:lopen` below moves focus into the (new) loclist window.
+  local win = nx.win.current()
+  local diags = nx.diagnostic.get(opts.bufnr or 0, { severity = opts.severity })
+  local items = nx.diagnostic.toqflist(diags)
+  nx.setloclist(win, {}, " ", { title = opts.title or "Diagnostics", items = items })
+  if opts.open ~= false then
+    vim.cmd("lopen")
+  end
 end
 
 -- nx.diagnostic.open_float([opts]): open a float listing the cursor line's

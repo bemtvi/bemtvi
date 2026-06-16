@@ -242,6 +242,20 @@ pub(crate) struct Window {
     /// lands you in the same mode you left. `None` for the common Normal case; any
     /// focus-in consumes it, so it can never go stale.
     pub(crate) resume: Option<ResumeState>,
+    /// This window's **location list** stack — the per-window analogue of the global
+    /// quickfix list, populated by the `:l*` commands (`:lvimgrep`/`:lgrep`/
+    /// `setloclist`/…). `None` until the window first gets a loclist. Unlike vim,
+    /// which shares one loclist by reference among windows split off each other,
+    /// nxvim's loclists are strictly per-window: a split inherits a *clone* of its
+    /// parent's (a documented divergence — see [`Editor::split`]), so the two then
+    /// diverge independently. See [`crate::editor::quickfix`].
+    pub(crate) loclist: Option<crate::editor::quickfix::QfStack>,
+    /// The display buffer for this window's location-list window (`:lopen`), created
+    /// lazily on first open — the per-window twin of [`Editor::qf_bufnr`]. A loclist
+    /// *display* window shows this buffer; the window holding it here is the loclist
+    /// *owner* (`<CR>`/`:ll` jump into this window). Never inherited on split (each
+    /// `:lopen` mints its own), so a display buffer maps back to exactly one owner.
+    pub(crate) loclist_bufnr: Option<BufferId>,
 }
 
 /// A node in the window layout tree: either a single window (`Leaf`) or a
@@ -320,6 +334,8 @@ impl WindowTree {
                 jumps: Vec::new(),
                 jump_idx: 0,
                 resume: None,
+                loclist: None,
+                loclist_bufnr: None,
             },
         );
         WindowTree {
@@ -347,6 +363,13 @@ impl WindowTree {
         self.windows
             .get_mut(&id)
             .expect("current window id is always valid")
+    }
+
+    /// Fallible [`get_mut`](Self::get_mut) for an id that may not be open — the
+    /// mutable twin of [`try_get`](Self::try_get) (e.g. populating a location list
+    /// on a window identified by a possibly-stale handle).
+    pub(crate) fn try_get_mut(&mut self, id: WindowId) -> Option<&mut Window> {
+        self.windows.get_mut(&id)
     }
 
     /// The focused window.
@@ -1301,6 +1324,8 @@ impl Editor {
                 jumps: Vec::new(),
                 jump_idx: 0,
                 resume: None,
+                loclist: None,
+                loclist_bufnr: None,
             },
         );
         self.windows.floats.push(id);
@@ -1531,6 +1556,11 @@ impl Editor {
         // (vim copies the jumplist to the new window).
         let jumps = self.windows.get(cur).jumps.clone();
         let jump_idx = self.windows.get(cur).jump_idx;
+        // The split inherits a *clone* of the parent's location list (nxvim's
+        // per-window, non-shared model — vim shares it by reference). It does not
+        // inherit the loclist *display* buffer: a fresh `:lopen` mints its own, so
+        // every loclist display buffer maps back to exactly one owner window.
+        let loclist = self.windows.get(cur).loclist.clone();
         let new_id = self.alloc_window_id();
         self.windows.windows.insert(
             new_id,
@@ -1546,6 +1576,8 @@ impl Editor {
                 jumps,
                 jump_idx,
                 resume: None,
+                loclist,
+                loclist_bufnr: None,
             },
         );
         split_leaf(&mut self.windows.root, cur, dir, new_id);
@@ -1579,6 +1611,8 @@ impl Editor {
                 jumps: Vec::new(),
                 jump_idx: 0,
                 resume: None,
+                loclist: None,
+                loclist_bufnr: None,
             },
         );
         // Wrap the entire tiled layout: [existing, new] stacked vertically, the new

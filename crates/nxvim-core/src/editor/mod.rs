@@ -85,7 +85,7 @@ pub(crate) use self::jumps::JumpEntry;
 pub use self::windows::{BorderStyle, FloatAnchor, FloatConfig, FloatRelative, WindowConfigSpec};
 pub(crate) use self::windows::{PendingScroll, TabLabel, WindowLayout, WindowTree};
 // Search vocabulary shared by the command line, the parser, and the View.
-pub use self::quickfix::{QfAction, QfEntry, QfList};
+pub use self::quickfix::{QfAction, QfEntry, QfList, QfStack, QfWhich};
 pub(crate) use self::search::{SearchDir, SearchOffset};
 pub(crate) use self::syntax::fill_indent;
 
@@ -825,10 +825,11 @@ pub struct Editor {
     pub should_quit: bool,
     /// Editor options set via `:set` (number column, …).
     pub options: Options,
-    /// The quickfix list: errors parsed from command output / ingested text via
-    /// `'errorformat'`. One global list for now; the location-list twin and the
-    /// list stack land in Phase 4. See [`quickfix`](crate::editor::quickfix).
-    quickfix: QfList,
+    /// The global quickfix **list stack**: errors parsed from command output /
+    /// ingested text via `'errorformat'`, kept as vim's up-to-10-deep history that
+    /// `:colder`/`:cnewer` walk. The per-window location lists live on each
+    /// [`crate::editor::windows::Window`]. See [`quickfix`](crate::editor::quickfix).
+    qf: QfStack,
     /// The display buffer for the quickfix window (`:copen`), created lazily on
     /// first open and kept thereafter so its window/cursor persist. The buffer is
     /// an ordinary scratch buffer whose id is remembered here; that id is what
@@ -1268,7 +1269,7 @@ impl Editor {
             complete_accept_request: None,
             should_quit: false,
             options: Options::default(),
-            quickfix: QfList::default(),
+            qf: QfStack::default(),
             qf_bufnr: None,
             qf_prev_win: None,
             highlights: Highlights::new(),
@@ -1468,7 +1469,9 @@ impl Editor {
             && self.pending.is_clean()
             && key.code == KeyCode::Enter
         {
-            self.qf_jump_to_index(self.cursor.line);
+            if let Some(which) = self.qf_context_of_buffer(self.current_buffer_id()) {
+                self.qf_jump_to_index(which, self.cursor.line);
+            }
             return;
         }
 

@@ -208,6 +208,18 @@ function nx._set_qflist_mirror(items, title)
   nx._qflist_title = title or ""
 end
 
+-- Per-window location-list mirror, the location-list twin of `nx._qflist`:
+-- `nx._loclist[winid] = { items = {…}, title = "…" }` for every window that has a
+-- location list. The server replaces the whole table each tick (so a window that
+-- lost its loclist drops out). Backs vim.fn.getloclist.
+nx._loclist = nx._loclist or {}
+function nx._set_loclist_mirror(win, items, title)
+  nx._loclist[win] = { items = items or {}, title = title or "" }
+end
+function nx._clear_loclist_mirror()
+  nx._loclist = {}
+end
+
 -- Arbitrary (Lua-only) global options plugins set via vim.o; the wired options
 -- live in their scope (vim.wo / vim.bo / nx._go_mirror) instead. Seeded with
 -- the few defaults colorschemes read (termguicolors / background / *blend).

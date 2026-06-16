@@ -1153,10 +1153,11 @@ impl LuaRuntime {
         title: &str,
         open: bool,
         jump: bool,
+        loclist_win: Option<u64>,
     ) -> mlua::Result<()> {
         let nx = self.nx()?;
         let run: mlua::Function = nx.get("_qf_make")?;
-        run.call::<()>((cmd, efm, title, open, jump))
+        run.call::<()>((cmd, efm, title, open, jump, loclist_win))
     }
 
     /// Record the OS pid of an async `vim.system` child (keyed by its callback
@@ -1682,6 +1683,45 @@ impl LuaRuntime {
         }
         let set: mlua::Function = nx.get("_set_qflist_mirror")?;
         set.call((arr, title))
+    }
+
+    /// Reset the per-window location-list mirror (`nx._loclist`) so a window that
+    /// lost its loclist drops out; call before re-pushing the live ones with
+    /// [`Self::set_loclist_mirror`].
+    pub fn clear_loclist_mirror(&self) -> mlua::Result<()> {
+        let clear: mlua::Function = self.nx()?.get("_clear_loclist_mirror")?;
+        clear.call(())
+    }
+
+    /// Refresh window `win`'s slot in the `nx._loclist` mirror — the location-list
+    /// twin of [`Self::set_qflist_mirror`], read by `vim.fn.getloclist(win)`.
+    pub fn set_loclist_mirror(
+        &self,
+        win: u64,
+        items: &[QfMirror],
+        title: &str,
+    ) -> mlua::Result<()> {
+        let nx = self.nx()?;
+        let arr = self.lua.create_table()?;
+        for (i, it) in items.iter().enumerate() {
+            let e = self.lua.create_table()?;
+            e.set("filename", it.filename.as_str())?;
+            e.set("bufnr", it.bufnr)?;
+            e.set("module", it.module.as_str())?;
+            e.set("lnum", it.lnum)?;
+            e.set("end_lnum", it.end_lnum)?;
+            e.set("col", it.col)?;
+            e.set("end_col", it.end_col)?;
+            e.set("vcol", it.vcol)?;
+            e.set("nr", it.nr)?;
+            e.set("pattern", it.pattern.as_str())?;
+            e.set("text", it.text.as_str())?;
+            e.set("type", it.typ.as_str())?;
+            e.set("valid", it.valid)?;
+            arr.set(i + 1, e)?;
+        }
+        let set: mlua::Function = nx.get("_set_loclist_mirror")?;
+        set.call((win, arr, title))
     }
 
     /// Refresh the Rust→Lua `vim.v` mirror with the editor-sourced predefined

@@ -400,23 +400,22 @@ function nx.fname.modify(fname, mods)
 end
 vim.fn.fnamemodify = nx.fname.modify
 
--- nx.getqflist([what]) [alias vim.fn.getqflist]: the quickfix list. With no
--- argument (or a non-table), returns the array of entry dicts (a shallow copy of
--- the `nx._qflist` mirror the server pushes). With a `what` dict, returns a dict
--- carrying only the requested keys (`title` / `items` / `size`) — the subset of
--- vim's introspection surface Phase 1 needs.
-function nx.getqflist(what)
+-- Read one list mirror (`nx._qflist` for the quickfix list, or
+-- `nx._loclist[winid]` for a window's location list) into the dict/array shape
+-- getqflist/getloclist return. `mirror` is the entry array; `title` its title.
+local function nx_read_list(mirror, title, what)
+  mirror = mirror or {}
   if type(what) == "table" then
     local r = {}
     if what.title ~= nil then
-      r.title = nx._qflist_title
+      r.title = title or ""
     end
     if what.size ~= nil then
-      r.size = #nx._qflist
+      r.size = #mirror
     end
     if what.items ~= nil then
       local items = {}
-      for i, e in ipairs(nx._qflist) do
+      for i, e in ipairs(mirror) do
         items[i] = e
       end
       r.items = items
@@ -424,20 +423,24 @@ function nx.getqflist(what)
     return r
   end
   local out = {}
-  for i, e in ipairs(nx._qflist) do
+  for i, e in ipairs(mirror) do
     out[i] = e
   end
   return out
 end
+
+-- nx.getqflist([what]) [alias vim.fn.getqflist]: the quickfix list. With no
+-- argument (or a non-table), returns the array of entry dicts (a shallow copy of
+-- the `nx._qflist` mirror the server pushes). With a `what` dict, returns a dict
+-- carrying only the requested keys (`title` / `items` / `size`).
+function nx.getqflist(what)
+  return nx_read_list(nx._qflist, nx._qflist_title, what)
+end
 vim.fn.getqflist = nx.getqflist
 
--- nx.setqflist(list, action, what) [alias vim.fn.setqflist]: populate the
--- quickfix list. `list` is an array of entry dicts; `action` is " " (new / the
--- default), "a" (append), or "r" (replace current). `what` may instead carry
--- `lines` (raw output parsed against `efm`), `items`, `title`, or `efm`. The work
--- happens server-side (a queued op), so the parsed result is visible to
--- getqflist() only after the server drains the op — read it on a later tick.
-function nx.setqflist(list, action, what)
+-- Normalize the public `(list, action, what)` setqflist/setloclist tail into the
+-- positional `(items, lines, efm, action, title)` nx._set_qflist expects.
+local function nx_setlist_args(list, action, what)
   action = action or " "
   local title, efm, items, lines = nil, nil, nil, nil
   if type(what) == "table" then
@@ -456,20 +459,89 @@ function nx.setqflist(list, action, what)
   if title ~= nil and type(title) ~= "string" then
     title = tostring(title)
   end
-  nx._set_qflist(items, lines, efm, action, title)
+  return items, lines, efm, action, title
+end
+
+-- nx.setqflist(list, action, what) [alias vim.fn.setqflist]: populate the
+-- quickfix list. `list` is an array of entry dicts; `action` is " " (new / the
+-- default), "a" (append), or "r" (replace current). `what` may instead carry
+-- `lines` (raw output parsed against `efm`), `items`, `title`, or `efm`. The work
+-- happens server-side (a queued op), so the parsed result is visible to
+-- getqflist() only after the server drains the op — read it on a later tick.
+function nx.setqflist(list, action, what)
+  local items, lines, efm, act, title = nx_setlist_args(list, action, what)
+  nx._set_qflist(items, lines, efm, act, title, nil)
   return 0
 end
 vim.fn.setqflist = nx.setqflist
 
--- nx._qf_make(cmd, efm, title, open, jump): the async :make / :grep producer
--- (dispatched from the server, which already expanded 'makeprg'/'grepprg' and
--- merged stderr into stdout via the shell). Spawn `cmd` through the same job
--- machinery as nx.spawn / vim.system; on exit, split its combined output into
--- lines and hand them to nx._qf_populate, which parses them against `efm` into the
--- quickfix list and then opens the window / jumps to the first error per
+-- nx.getloclist(winnr[, what]) [alias vim.fn.getloclist]: the location list of
+-- window `winnr` (0 = current window; otherwise an nxvim window id, NOT vim's
+-- 1-based window number). Same return shape as getqflist; an empty list when the
+-- window has none.
+function nx.getloclist(winnr, what)
+  local win = winnr
+  if win == nil or win == 0 then
+    win = nx.win.current()
+  end
+  local entry = nx._loclist[win]
+  if entry == nil then
+    return nx_read_list({}, "", what)
+  end
+  return nx_read_list(entry.items, entry.title, what)
+end
+vim.fn.getloclist = nx.getloclist
+
+-- nx.setloclist(winnr, list, action, what) [alias vim.fn.setloclist]: populate the
+-- location list of window `winnr` (0 = current window; otherwise an nxvim window
+-- id). Same `list`/`action`/`what` semantics as setqflist, only scoped to a
+-- window. Queued server-side like setqflist.
+function nx.setloclist(winnr, list, action, what)
+  local items, lines, efm, act, title = nx_setlist_args(list, action, what)
+  -- 0 / nil ride through as 0 ("current window at drain time"); the server resolves
+  -- it. A non-zero winnr is taken as a window id.
+  nx._set_qflist(items, lines, efm, act, title, winnr or 0)
+  return 0
+end
+vim.fn.setloclist = nx.setloclist
+
+-- nx.qf: the canonical quickfix / location-list surface (ADR 0002). The
+-- `vim.fn.*` names above are muscle-memory aliases that delegate here. The window
+-- and navigation commands are thin wrappers over the `:c*` / `:l*` ex-commands.
+nx.qf = nx.qf or {}
+nx.qf.setqflist = nx.setqflist
+nx.qf.getqflist = nx.getqflist
+nx.qf.setloclist = nx.setloclist
+nx.qf.getloclist = nx.getloclist
+function nx.qf.open(height)
+  vim.cmd(height and ("copen " .. height) or "copen")
+end
+function nx.qf.close()
+  vim.cmd("cclose")
+end
+function nx.qf.next()
+  vim.cmd("cnext")
+end
+function nx.qf.prev()
+  vim.cmd("cprev")
+end
+function nx.qf.older(count)
+  vim.cmd(count and ("colder " .. count) or "colder")
+end
+function nx.qf.newer(count)
+  vim.cmd(count and ("cnewer " .. count) or "cnewer")
+end
+
+-- nx._qf_make(cmd, efm, title, open, jump, loclist_win): the async :make / :grep
+-- producer (dispatched from the server, which already expanded
+-- 'makeprg'/'grepprg' and merged stderr into stdout via the shell). Spawn `cmd`
+-- through the same job machinery as nx.spawn / vim.system; on exit, split its
+-- combined output into lines and hand them to nx._qf_populate, which parses them
+-- against `efm` into the quickfix list (or `loclist_win`'s location list — see
+-- nx._set_qflist) and then opens the window / jumps to the first error per
 -- `open`/`jump`. On a build with no local process spawn (the serverless web build)
 -- the underlying spawn op fails loud, exactly like vim.system.
-function nx._qf_make(cmd, efm, title, open, jump)
+function nx._qf_make(cmd, efm, title, open, jump, loclist_win)
   local id = nx._next_cb_id()
   nx._cb_fns[id] = function(result)
     local out = (result.stdout or "") .. (result.stderr or "")
@@ -479,7 +551,7 @@ function nx._qf_make(cmd, efm, title, open, jump)
     if lines[#lines] == "" then
       lines[#lines] = nil
     end
-    nx._qf_populate(lines, efm, title, open, jump)
+    nx._qf_populate(lines, efm, title, open, jump, loclist_win)
   end
   nx._system_async(id, { "sh", "-c", cmd }, nil, nil, nil)
 end

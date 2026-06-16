@@ -38,8 +38,12 @@ impl EditHost {
             // output, parse it against `'errorformat'` / `'grepformat'`, open the
             // quickfix window if there are errors, and jump to the first one (a `!`
             // suppresses the jump). Async, via the job machinery (`nx._qf_make`).
-            _ if matches!(base, "mak" | "make") => self.ex_make(args, bang, false),
-            _ if matches!(base, "gr" | "gre" | "grep") => self.ex_make(args, bang, true),
+            _ if matches!(base, "mak" | "make") => self.ex_make(args, bang, false, false),
+            _ if matches!(base, "gr" | "gre" | "grep") => self.ex_make(args, bang, true, false),
+            // The location-list twins (`:lmake[!]` / `:lgrep[!]`): identical, but the
+            // parsed output populates the focused window's location list.
+            _ if matches!(base, "lmak" | "lmake") => self.ex_make(args, bang, false, true),
+            _ if matches!(base, "lgr" | "lgre" | "lgrep") => self.ex_make(args, bang, true, true),
             // `:so[urce] {file}` — run a script file (`.lua` executes through the
             // runtime; vimscript is fail-loud, not a silent skip).
             "so" | "sou" | "sour" | "sourc" | "source" => self.ex_source(args.trim()),
@@ -278,7 +282,7 @@ impl EditHost {
     /// the output in its original interleaving. Without a `!`, the cursor jumps to
     /// the first valid entry. The actual spawn is async (`nx._qf_make`); on a build
     /// with no local process spawn (the serverless web build) it fails loud.
-    fn ex_make(&mut self, args: &str, bang: bool, is_grep: bool) {
+    fn ex_make(&mut self, args: &str, bang: bool, is_grep: bool, is_loclist: bool) {
         let opts = self.editor.global_options();
         let (prg, efm) = if is_grep {
             (&opts.grepprg, &opts.grepformat)
@@ -298,13 +302,22 @@ impl EditHost {
         } else {
             format!("{prg} {args}")
         };
-        let title = format!(":{} {args}", if is_grep { "grep" } else { "make" });
+        let verb = match (is_loclist, is_grep) {
+            (false, false) => "make",
+            (false, true) => "grep",
+            (true, false) => "lmake",
+            (true, true) => "lgrep",
+        };
+        let title = format!(":{verb} {args}");
         // Merge stderr into stdout in the child so the parser sees one ordered
         // stream (the make/gcc `Entering directory` lines and errors interleave).
         let cmd = format!("{expanded} 2>&1");
+        // `Some(0)` targets the current window's location list at drain time; `None`
+        // the global quickfix list.
+        let loclist_win = is_loclist.then_some(0u64);
         if let Err(e) = self
             .lua
-            .run_qf_make(&cmd, efm, title.trim_end(), true, !bang)
+            .run_qf_make(&cmd, efm, title.trim_end(), true, !bang, loclist_win)
         {
             self.editor
                 .echo(format!("E5108: Error starting :make: {e}"));

@@ -27,9 +27,10 @@ pub enum QfAction {
     New,
     /// Append the new items to the current list (vim's `'a'`).
     Add,
-    /// Replace the current list's items in place (vim's `'r'`). With the single
-    /// list of Phase 1 this is identical to [`QfAction::New`]; it diverges once the
-    /// list stack lands (Phase 4).
+    /// Replace the current list's items in place (vim's `'r'`). At the
+    /// single-[`QfList`] level this swaps items like [`QfAction::New`]; the two
+    /// diverge at the [`QfStack`] level, where `New` pushes a *new* list and
+    /// `Replace` mutates the current one.
     Replace,
 }
 
@@ -84,8 +85,8 @@ impl QfList {
     fn apply(&mut self, items: Vec<QfEntry>, action: QfAction, title: Option<String>) {
         match action {
             QfAction::Add => self.items.extend(items),
-            // `New` and `Replace` both swap the whole item vector while there is a
-            // single list; they diverge only once the list stack exists (Phase 4).
+            // At this single-list level `New` and `Replace` both swap the whole item
+            // vector; the push-new-vs-mutate-current divergence lives in [`QfStack`].
             QfAction::New | QfAction::Replace => self.items = items,
         }
         if let Some(title) = title {
@@ -99,27 +100,215 @@ impl QfList {
     }
 }
 
-impl Editor {
-    /// The current quickfix list (read-only) — the projection source for the
-    /// `nx._qflist` Lua mirror and, later, the `:copen` window.
-    pub fn qf_list(&self) -> &QfList {
-        &self.quickfix
+/// The most lists vim (and nxvim) keep in a quickfix/location-list stack; older
+/// lists past this are dropped as new ones are pushed. (vim's `LISTCOUNT`.)
+pub const QF_MAXLISTS: usize = 10;
+
+/// A quickfix or location-list **stack**: the history of up to [`QF_MAXLISTS`]
+/// lists `:colder`/`:cnewer` (`:lolder`/`:lnewer`) walk, with `cur` pointing at the
+/// "current" one every other command reads and writes. vim keeps this so a fresh
+/// `:make`/`:grep`/`:vimgrep`/`:cexpr` (action `' '`) pushes a new list without
+/// losing the previous results.
+#[derive(Debug, Clone, Default)]
+pub struct QfStack {
+    /// The lists, oldest first; `lists.last()` is the newest.
+    pub lists: Vec<QfList>,
+    /// 0-based index of the current list (only meaningful when `!lists.is_empty()`).
+    pub cur: usize,
+}
+
+impl QfStack {
+    /// The current list, if the stack is non-empty.
+    pub fn current(&self) -> Option<&QfList> {
+        self.lists.get(self.cur)
     }
 
-    /// Set the list from already-structured `items` (vim's
-    /// `setqflist(list)` non-parsing form).
-    pub fn qf_set_items(&mut self, items: Vec<QfEntry>, action: QfAction, title: Option<String>) {
-        self.quickfix.apply(items, action, title);
-        self.qf_refresh_window();
+    /// The current list mutably, if the stack is non-empty.
+    pub fn current_mut(&mut self) -> Option<&mut QfList> {
+        self.lists.get_mut(self.cur)
+    }
+
+    /// Apply `items` under `action`, mirroring vim's stack semantics:
+    /// - `New` (`' '`): push a brand-new current list. Any lists *newer* than the
+    ///   current one (you walked back with `:colder` then produced fresh results)
+    ///   are discarded first, and the oldest is dropped once the stack would exceed
+    ///   [`QF_MAXLISTS`].
+    /// - `Add` (`'a'`) / `Replace` (`'r'`): modify the current list in place,
+    ///   creating a first list if the stack is empty.
+    fn apply(&mut self, items: Vec<QfEntry>, action: QfAction, title: Option<String>) {
+        match action {
+            QfAction::New => {
+                if !self.lists.is_empty() {
+                    self.lists.truncate(self.cur + 1);
+                }
+                let mut list = QfList::default();
+                list.apply(items, QfAction::New, title);
+                self.lists.push(list);
+                if self.lists.len() > QF_MAXLISTS {
+                    self.lists.remove(0);
+                }
+                self.cur = self.lists.len() - 1;
+            }
+            QfAction::Add | QfAction::Replace => {
+                if self.lists.is_empty() {
+                    let mut list = QfList::default();
+                    list.apply(items, action, title);
+                    self.lists.push(list);
+                    self.cur = 0;
+                } else {
+                    self.lists[self.cur].apply(items, action, title);
+                }
+            }
+        }
+    }
+
+    /// `:colder`/`:lolder` — step `count` lists toward the oldest. Returns whether
+    /// the pointer actually moved (`false` already at the bottom → vim's `E380`).
+    fn older(&mut self, count: usize) -> bool {
+        let target = self.cur.saturating_sub(count.max(1));
+        let moved = target != self.cur;
+        self.cur = target;
+        moved
+    }
+
+    /// `:cnewer`/`:lnewer` — step `count` lists toward the newest. Returns whether
+    /// the pointer moved (`false` already at the top → vim's `E381`).
+    fn newer(&mut self, count: usize) -> bool {
+        if self.lists.is_empty() {
+            return false;
+        }
+        let target = (self.cur + count.max(1)).min(self.lists.len() - 1);
+        let moved = target != self.cur;
+        self.cur = target;
+        moved
+    }
+}
+
+/// Which list a quickfix command targets: the single global quickfix list, or the
+/// per-window **location list** owned by a specific window. Every `:c*`/`:l*` pair
+/// shares one implementation parameterized by this — `:copen` is
+/// `ex_qf_open(Quickfix, …)`, `:lopen` is `ex_qf_open(Location(win), …)`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QfWhich {
+    /// The global quickfix list (`:copen`, `:make`, `setqflist`, …).
+    Quickfix,
+    /// The location list owned by the given window (`:lopen`, `:lgrep`,
+    /// `setloclist`, …).
+    Location(WindowId),
+}
+
+impl QfWhich {
+    /// vim's user-facing name for this list, used in `E776`/`E42`-style messages.
+    fn label(self) -> &'static str {
+        match self {
+            QfWhich::Quickfix => "quickfix",
+            QfWhich::Location(_) => "location",
+        }
+    }
+}
+
+/// A never-populated list returned by [`Editor::qf_list`] when the quickfix stack
+/// is empty, so callers (the mirror push) can read `.items`/`.title` uniformly.
+fn empty_qflist() -> &'static QfList {
+    static EMPTY: std::sync::OnceLock<QfList> = std::sync::OnceLock::new();
+    EMPTY.get_or_init(QfList::default)
+}
+
+impl Editor {
+    // ---- list-stack accessors (the quickfix / per-window location list) ----
+
+    /// Read-only access to a list stack. The quickfix stack always exists; a
+    /// location-list stack exists only once its owner window has been given one
+    /// (`None` otherwise, and `None` for a stale window id).
+    fn qf_stack(&self, which: QfWhich) -> Option<&QfStack> {
+        match which {
+            QfWhich::Quickfix => Some(&self.qf),
+            QfWhich::Location(w) => self.windows.try_get(w).and_then(|win| win.loclist.as_ref()),
+        }
+    }
+
+    /// The current list of `which`, or a shared empty list when the stack is
+    /// absent/empty — so readers (rendering, the mirror push) need no `Option`.
+    fn qf_cur(&self, which: QfWhich) -> &QfList {
+        self.qf_stack(which)
+            .and_then(QfStack::current)
+            .unwrap_or_else(|| empty_qflist())
+    }
+
+    /// The current list of `which`, mutably, if the stack exists and is non-empty.
+    fn qf_cur_mut(&mut self, which: QfWhich) -> Option<&mut QfList> {
+        match which {
+            QfWhich::Quickfix => self.qf.current_mut(),
+            QfWhich::Location(w) => self
+                .windows
+                .try_get_mut(w)
+                .and_then(|win| win.loclist.as_mut())
+                .and_then(QfStack::current_mut),
+        }
+    }
+
+    /// Mutable list stack, **creating** an empty location-list stack on the owner
+    /// window when needed (so `setloclist` / `:lvimgrep` on a fresh window has
+    /// somewhere to write). `None` only for a stale location-window id.
+    fn qf_stack_ensure(&mut self, which: QfWhich) -> Option<&mut QfStack> {
+        match which {
+            QfWhich::Quickfix => Some(&mut self.qf),
+            QfWhich::Location(w) => self
+                .windows
+                .try_get_mut(w)
+                .map(|win| win.loclist.get_or_insert_with(QfStack::default)),
+        }
+    }
+
+    /// The current quickfix list (read-only) — the projection source for the
+    /// `nx._qflist` Lua mirror.
+    pub fn qf_list(&self) -> &QfList {
+        self.qf_cur(QfWhich::Quickfix)
+    }
+
+    /// The current location list of `win`, if it has one — the per-window mirror
+    /// source for `getloclist()`.
+    pub fn loclist(&self, win: WindowId) -> Option<&QfList> {
+        self.qf_stack(QfWhich::Location(win))
+            .and_then(QfStack::current)
+    }
+
+    /// The location-list context the `:l*` commands act on from the focused window:
+    /// if focus is in a location-list *display* window, that display's owner (so
+    /// `:lnext` from inside the loclist window steps the loclist it shows);
+    /// otherwise the focused window itself.
+    pub(crate) fn loclist_which(&self) -> QfWhich {
+        match self.qf_context_of_buffer(self.current_buffer_id()) {
+            Some(w @ QfWhich::Location(_)) => w,
+            _ => QfWhich::Location(self.current_window_id()),
+        }
+    }
+
+    // ---- populating a list ----
+
+    /// Set a list from already-structured `items` (vim's `setqflist(list)` /
+    /// `setloclist(win, list)` non-parsing form).
+    pub fn qf_set_items(
+        &mut self,
+        which: QfWhich,
+        items: Vec<QfEntry>,
+        action: QfAction,
+        title: Option<String>,
+    ) {
+        if let Some(stack) = self.qf_stack_ensure(which) {
+            stack.apply(items, action, title);
+        }
+        self.qf_refresh_window(which);
     }
 
     /// Parse `lines` against `efm` and set the list (vim's
-    /// `setqflist([], a, {lines, efm})` and the `:cexpr` family). Returns the
-    /// number of entries added, or an `E37x` error string for an invalid
+    /// `setqflist([], a, {lines, efm})` and the `:cexpr`/`:cfile` family). Returns
+    /// the number of entries added, or an `E37x` error string for an invalid
     /// `'errorformat'`. Behind `vim-regex`; without it, parsing fails loud.
     #[cfg(feature = "vim-regex")]
     pub fn qf_set_from_lines(
         &mut self,
+        which: QfWhich,
         lines: &[String],
         efm: &str,
         action: QfAction,
@@ -128,14 +317,17 @@ impl Editor {
         let format = Errorformat::compile(efm)?;
         let items = format.parse(lines);
         let n = items.len();
-        self.quickfix.apply(items, action, title);
-        self.qf_refresh_window();
+        if let Some(stack) = self.qf_stack_ensure(which) {
+            stack.apply(items, action, title);
+        }
+        self.qf_refresh_window(which);
         Ok(n)
     }
 
     #[cfg(not(feature = "vim-regex"))]
     pub fn qf_set_from_lines(
         &mut self,
+        _which: QfWhich,
         _lines: &[String],
         _efm: &str,
         _action: QfAction,
@@ -145,10 +337,8 @@ impl Editor {
     }
 
     /// Populate the list from buffer `bufnr`'s lines parsed against the editor's
-    /// `'errorformat'` (`:cbuffer` / `:cgetbuffer`). The window-open / jump-to-first
-    /// coupling vim's `:cbuffer` adds lands with the quickfix window (Phase 2);
-    /// here it only fills the list.
-    pub fn qf_from_buffer(&mut self, bufnr: BufferId, action: QfAction) {
+    /// `'errorformat'` (`:cbuffer`/`:lbuffer` and friends).
+    pub fn qf_from_buffer(&mut self, which: QfWhich, bufnr: BufferId, action: QfAction) {
         let Some(ob) = self.buffers.map.get(&bufnr) else {
             self.echo(format!("E92: Buffer {} not found", bufnr.0));
             return;
@@ -156,15 +346,15 @@ impl Editor {
         let lines = ob.buffer.lines();
         let efm = self.options.errorformat.clone();
         let title = format!(":cbuffer {}", bufnr.0);
-        match self.qf_set_from_lines(&lines, &efm, action, Some(title)) {
-            Ok(n) => self.echo(format!("(quickfix) {n} entries")),
+        match self.qf_set_from_lines(which, &lines, &efm, action, Some(title)) {
+            Ok(n) => self.echo(format!("({}) {n} entries", which.label())),
             Err(e) => self.echo(e),
         }
     }
 
-    /// `:cbuffer`/`:cgetbuffer`/`:caddbuffer [bufnr]` — populate the list from a
-    /// buffer (current if no argument).
-    pub(crate) fn ex_cbuffer(&mut self, args: &str, action: QfAction) {
+    /// `:cbuffer`/`:cgetbuffer`/`:caddbuffer [bufnr]` (and the `:l*` twins) —
+    /// populate `which` from a buffer (current if no argument).
+    pub(crate) fn ex_cbuffer(&mut self, which: QfWhich, args: &str, action: QfAction) {
         let bufnr = if args.trim().is_empty() {
             self.current_buffer_id()
         } else {
@@ -173,43 +363,116 @@ impl Editor {
                 None => return, // resolve_buffer already echoed the error
             }
         };
-        self.qf_from_buffer(bufnr, action);
-    }
-}
-
-// ---------------------------------------------------------------------------
-// The quickfix window + navigation (Phase 2).
-
-impl Editor {
-    /// True when the focused buffer is the quickfix display buffer — its keys are
-    /// read-only (routed through [`Editor::handle_quickfix`]).
-    pub(crate) fn is_quickfix_buffer(&self) -> bool {
-        self.qf_bufnr.is_some() && self.qf_bufnr == Some(self.current_buffer_id())
+        self.qf_from_buffer(which, bufnr, action);
     }
 
-    /// The window currently showing the quickfix list, if any.
-    fn qf_window_id(&self) -> Option<WindowId> {
-        let qf = self.qf_bufnr?;
-        self.window_ids()
-            .into_iter()
-            .find(|&w| self.windows.get(w).buffer == qf)
-    }
-
-    /// (Re)render the quickfix display buffer from the current list. No-op until
-    /// the buffer exists (the window has been opened at least once).
-    pub(crate) fn qf_refresh_window(&mut self) {
-        let Some(buf) = self.qf_bufnr else { return };
-        if !self.buffers.map.contains_key(&buf) {
-            self.qf_bufnr = None;
+    /// `:cfile`/`:cgetfile`/`:caddfile {file}` (and the `:l*` twins) — read `file`
+    /// off the host fs (or a loaded buffer's live contents), parse it against the
+    /// editor's `'errorformat'`, and populate `which`. `open`/`jump` mirror the
+    /// `:make` post-populate behavior: `:cfile` opens + jumps, `:cgetfile` only
+    /// fills, `:caddfile` appends without jumping.
+    pub(crate) fn ex_cfile(
+        &mut self,
+        which: QfWhich,
+        args: &str,
+        action: QfAction,
+        open: bool,
+        jump: bool,
+    ) {
+        let file = args.trim();
+        if file.is_empty() {
+            self.echo("E471: Argument required".to_string());
             return;
         }
-        let text = self.qf_render_text();
-        self.load_str_into(buf, Some("[Quickfix List]".to_string()), &text);
+        let Some(lines) = self.vimgrep_file_lines(Path::new(file)) else {
+            return; // vimgrep_file_lines already echoed E484
+        };
+        let efm = self.options.errorformat.clone();
+        let title = format!(":cfile {file}");
+        match self.qf_set_from_lines(which, &lines, &efm, action, Some(title)) {
+            Ok(n) => {
+                self.echo(format!("({}) {n} entries", which.label()));
+                if open || jump {
+                    self.qf_post_populate(which, open, jump);
+                }
+            }
+            Err(e) => self.echo(e),
+        }
     }
 
-    /// The quickfix buffer's text: one `file|lnum col N| message` line per entry.
-    fn qf_render_text(&self) -> String {
-        self.quickfix
+    // ---- the display window + navigation ----
+
+    /// True when the focused buffer is a quickfix **or** location-list display
+    /// buffer — both are read-only (the `modifiable()` chokepoint consults this,
+    /// and `input()` routes a special `<CR>`).
+    pub(crate) fn is_quickfix_buffer(&self) -> bool {
+        self.qf_context_of_buffer(self.current_buffer_id())
+            .is_some()
+    }
+
+    /// Which list a display buffer projects: the quickfix list if it is
+    /// [`Editor::qf_bufnr`], else the location list of the window that owns it
+    /// (the unique window whose `loclist_bufnr` is `buf`). `None` for an ordinary
+    /// buffer.
+    pub(crate) fn qf_context_of_buffer(&self, buf: BufferId) -> Option<QfWhich> {
+        if self.qf_bufnr == Some(buf) {
+            return Some(QfWhich::Quickfix);
+        }
+        self.window_ids()
+            .into_iter()
+            .find(|&w| self.windows.get(w).loclist_bufnr == Some(buf))
+            .map(QfWhich::Location)
+    }
+
+    /// The display buffer backing `which`'s window, if one has been created.
+    fn qf_display_bufnr(&self, which: QfWhich) -> Option<BufferId> {
+        match which {
+            QfWhich::Quickfix => self.qf_bufnr,
+            QfWhich::Location(w) => self.windows.try_get(w).and_then(|win| win.loclist_bufnr),
+        }
+    }
+
+    /// Record `buf` as `which`'s display buffer (or clear it with `None`).
+    fn qf_set_display_bufnr(&mut self, which: QfWhich, buf: Option<BufferId>) {
+        match which {
+            QfWhich::Quickfix => self.qf_bufnr = buf,
+            QfWhich::Location(w) => {
+                if let Some(win) = self.windows.try_get_mut(w) {
+                    win.loclist_bufnr = buf;
+                }
+            }
+        }
+    }
+
+    /// The window currently showing `which`'s display buffer, if any.
+    fn qf_window_id(&self, which: QfWhich) -> Option<WindowId> {
+        let disp = self.qf_display_bufnr(which)?;
+        self.window_ids()
+            .into_iter()
+            .find(|&w| self.windows.get(w).buffer == disp)
+    }
+
+    /// (Re)render `which`'s display buffer from its current list. No-op until the
+    /// buffer exists (the window has been opened at least once).
+    pub(crate) fn qf_refresh_window(&mut self, which: QfWhich) {
+        let Some(buf) = self.qf_display_bufnr(which) else {
+            return;
+        };
+        if !self.buffers.map.contains_key(&buf) {
+            self.qf_set_display_bufnr(which, None);
+            return;
+        }
+        let text = self.qf_render_text(which);
+        let name = match which {
+            QfWhich::Quickfix => "[Quickfix List]",
+            QfWhich::Location(_) => "[Location List]",
+        };
+        self.load_str_into(buf, Some(name.to_string()), &text);
+    }
+
+    /// `which`'s display text: one `file|lnum col N| message` line per entry.
+    fn qf_render_text(&self, which: QfWhich) -> String {
+        self.qf_cur(which)
             .items
             .iter()
             .map(qf_render_line)
@@ -217,21 +480,21 @@ impl Editor {
             .join("\n")
     }
 
-    /// `:copen [height]` — open (or focus) the quickfix window: a full-width split
-    /// at the bottom of the screen (vim's `botright`), `height` rows tall (`10` by
-    /// default, vim's default; clamped to the available rows). The display buffer
-    /// is created on first use.
-    pub(crate) fn ex_copen(&mut self, args: &str) {
-        let needs_buf = match self.qf_bufnr {
+    /// `:copen`/`:lopen [height]` — open (or focus) `which`'s window: a full-width
+    /// split at the bottom (vim's `botright`), `height` rows (`10` by default). The
+    /// display buffer is created on first use. For a location list the owner window
+    /// is `which`'s window, so `<CR>`/`:ll` jump back into it.
+    pub(crate) fn ex_qf_open(&mut self, which: QfWhich, args: &str) {
+        let needs_buf = match self.qf_display_bufnr(which) {
             Some(id) => !self.buffers.map.contains_key(&id),
             None => true,
         };
         if needs_buf {
             let id = self.add_buffer(Buffer::empty());
-            self.qf_bufnr = Some(id);
+            self.qf_set_display_bufnr(which, Some(id));
         }
-        self.qf_refresh_window();
-        if let Some(w) = self.qf_window_id() {
+        self.qf_refresh_window(which);
+        if let Some(w) = self.qf_window_id(which) {
             self.set_current_window(w);
             return;
         }
@@ -242,14 +505,18 @@ impl Editor {
             .filter(|&h| h > 0)
             .unwrap_or(10);
         self.qf_prev_win = Some(self.windows.current);
-        let qf = self.qf_bufnr.expect("qf buffer created above");
-        self.open_bottom_window(qf, height);
+        let disp = self
+            .qf_display_bufnr(which)
+            .expect("display buffer created above");
+        self.open_bottom_window(disp, height);
     }
 
-    /// `:cclose` — close the quickfix window if open (leaving focus on a code
-    /// window).
-    pub(crate) fn ex_cclose(&mut self) {
-        let Some(w) = self.qf_window_id() else { return };
+    /// `:cclose`/`:lclose` — close `which`'s window if open (leaving focus on a
+    /// code window).
+    pub(crate) fn ex_qf_close(&mut self, which: QfWhich) {
+        let Some(w) = self.qf_window_id(which) else {
+            return;
+        };
         let prev = self.windows.current;
         if self.windows.current != w {
             self.set_current_window(w);
@@ -260,114 +527,175 @@ impl Editor {
         }
     }
 
-    /// `:cwindow` — open the quickfix window iff the list is non-empty, else close
-    /// it.
-    pub(crate) fn ex_cwindow(&mut self, args: &str) {
-        if self.quickfix.items.is_empty() {
-            self.ex_cclose();
+    /// `:cwindow`/`:lwindow` — open `which`'s window iff its list is non-empty,
+    /// else close it.
+    pub(crate) fn ex_qf_window(&mut self, which: QfWhich, args: &str) {
+        if self.qf_cur(which).items.is_empty() {
+            self.ex_qf_close(which);
         } else {
-            self.ex_copen(args);
+            self.ex_qf_open(which, args);
         }
     }
 
-    /// `:cc [nr]` — jump to entry `nr` (1-based; current when omitted).
-    pub(crate) fn ex_cc(&mut self, nr: Option<usize>) {
-        if self.quickfix.items.is_empty() {
+    /// `:cc`/`:ll [nr]` — jump to entry `nr` (1-based; current when omitted).
+    pub(crate) fn ex_qf_cc(&mut self, which: QfWhich, nr: Option<usize>) {
+        let list = self.qf_cur(which);
+        if list.items.is_empty() {
             self.echo("E42: No Errors".to_string());
             return;
         }
+        let last = list.items.len() - 1;
         let idx = match nr {
             Some(n) => n.saturating_sub(1),
-            None => self.quickfix.idx.saturating_sub(1),
+            None => list.idx.saturating_sub(1),
         };
-        self.qf_jump_to_index(idx.min(self.quickfix.items.len() - 1));
+        self.qf_jump_to_index(which, idx.min(last));
     }
 
-    /// `:cnext` / `:cprev` — step `count` *valid* entries forward / backward and
-    /// jump there. `E553` past either end.
-    pub(crate) fn ex_cstep(&mut self, forward: bool, count: usize) {
-        if !self.quickfix.items.iter().any(|e| e.valid) {
+    /// `:cnext`/`:cprev` (and `:l*` twins) — step `count` *valid* entries forward /
+    /// backward and jump there. `E553` past either end.
+    pub(crate) fn ex_qf_step(&mut self, which: QfWhich, forward: bool, count: usize) {
+        let list = self.qf_cur(which);
+        if !list.items.iter().any(|e| e.valid) {
             self.echo("E42: No Errors".to_string());
             return;
         }
-        let len = self.quickfix.items.len() as isize;
+        let len = list.items.len() as isize;
         let step: isize = if forward { 1 } else { -1 };
-        let mut pos = self.quickfix.idx as isize - 1; // 0-based current (-1 if unset)
+        let mut pos = list.idx as isize - 1; // 0-based current (-1 if unset)
         let mut remaining = count.max(1);
+        let valid: Vec<bool> = list.items.iter().map(|e| e.valid).collect();
         while remaining > 0 {
             pos += step;
             if pos < 0 || pos >= len {
                 self.echo("E553: No more items".to_string());
                 return;
             }
-            if self.quickfix.items[pos as usize].valid {
+            if valid[pos as usize] {
                 remaining -= 1;
             }
         }
-        self.qf_jump_to_index(pos as usize);
+        self.qf_jump_to_index(which, pos as usize);
     }
 
-    /// `:cfirst` / `:clast` — jump to the first / last valid entry.
-    pub(crate) fn ex_cfirst(&mut self) {
-        match self.quickfix.items.iter().position(|e| e.valid) {
-            Some(i) => self.qf_jump_to_index(i),
+    /// `:cfirst`/`:clast` (and `:l*` twins) — jump to the first / last valid entry.
+    pub(crate) fn ex_qf_first(&mut self, which: QfWhich) {
+        match self.qf_cur(which).items.iter().position(|e| e.valid) {
+            Some(i) => self.qf_jump_to_index(which, i),
             None => self.echo("E42: No Errors".to_string()),
         }
     }
 
-    pub(crate) fn ex_clast(&mut self) {
-        match self.quickfix.items.iter().rposition(|e| e.valid) {
-            Some(i) => self.qf_jump_to_index(i),
+    pub(crate) fn ex_qf_last(&mut self, which: QfWhich) {
+        match self.qf_cur(which).items.iter().rposition(|e| e.valid) {
+            Some(i) => self.qf_jump_to_index(which, i),
             None => self.echo("E42: No Errors".to_string()),
         }
     }
 
-    /// The post-populate step `:make`/`:grep` add after filling the list: open the
-    /// quickfix window iff there are entries (`open`, vim's `:cwindow`), then jump to
-    /// the first valid entry (`jump`, suppressed by a `!`). A clean run (no valid
-    /// entries) opens nothing and jumps nowhere — just the count echo the producer
-    /// already emitted.
-    pub fn qf_post_populate(&mut self, open: bool, jump: bool) {
+    /// `:colder`/`:cnewer` (and `:lolder`/`:lnewer`) — walk `which`'s list stack
+    /// `count` steps toward older / newer, then re-render the window and echo the
+    /// new position. `E380`/`E381` at the ends; `E380` too when the stack is empty.
+    pub(crate) fn ex_qf_history(&mut self, which: QfWhich, newer: bool, count: usize) {
+        let Some(stack) = self.qf_stack_ensure(which) else {
+            self.echo("E776: No location list".to_string());
+            return;
+        };
+        if stack.lists.is_empty() {
+            self.echo("E380: At bottom of quickfix stack".to_string());
+            return;
+        }
+        let moved = if newer {
+            stack.newer(count)
+        } else {
+            stack.older(count)
+        };
+        if !moved {
+            self.echo(if newer {
+                "E381: At top of quickfix stack".to_string()
+            } else {
+                "E380: At bottom of quickfix stack".to_string()
+            });
+            return;
+        }
+        let (cur, len, n, title) = {
+            let s = self.qf_stack(which).expect("stack present");
+            let list = s.current().expect("non-empty");
+            (
+                s.cur + 1,
+                s.lists.len(),
+                list.items.len(),
+                list.title.clone(),
+            )
+        };
+        self.qf_refresh_window(which);
+        let label = which.label();
+        self.echo(format!("{title} ({label} list {cur} of {len}); {n} items"));
+    }
+
+    /// The post-populate step `:make`/`:grep`/`:cfile` add after filling a list:
+    /// open the window iff there are entries (`open`, vim's `:cwindow`), then jump
+    /// to the first valid entry (`jump`, suppressed by a `!`). A clean run opens
+    /// nothing and jumps nowhere.
+    pub fn qf_post_populate(&mut self, which: QfWhich, open: bool, jump: bool) {
         if open {
-            self.ex_cwindow("");
+            self.ex_qf_window(which, "");
         }
-        if jump && self.quickfix.items.iter().any(|e| e.valid) {
-            self.ex_cfirst();
+        if jump && self.qf_cur(which).items.iter().any(|e| e.valid) {
+            self.ex_qf_first(which);
         }
     }
 
-    /// Jump to entry `idx` (0-based): mark it current, focus a code window per
-    /// `'switchbuf'`, and land the cursor at the entry's `file:line:col`.
-    pub(crate) fn qf_jump_to_index(&mut self, idx: usize) {
-        let Some(entry) = self.quickfix.items.get(idx).cloned() else {
+    /// Jump to entry `idx` (0-based) of `which`: mark it current, focus a code
+    /// window per `'switchbuf'`, and land the cursor at the entry's
+    /// `file:line:col`.
+    pub(crate) fn qf_jump_to_index(&mut self, which: QfWhich, idx: usize) {
+        let Some(entry) = self.qf_cur(which).items.get(idx).cloned() else {
             self.echo("E42: No Errors".to_string());
             return;
         };
-        self.quickfix.idx = idx + 1;
-        let Some(filename) = entry.filename.clone() else {
-            // A non-error line (no file): echo its text, like vim's E42-free no-op.
+        if let Some(list) = self.qf_cur_mut(which) {
+            list.idx = idx + 1;
+        }
+        // Resolve the target file: the entry's `filename`, or — for a buffer-number
+        // -addressed entry (e.g. `setqflist`/diagnostics that carry only `bufnr`) —
+        // that buffer's path. vim jumps to either.
+        let target = entry.filename.clone().or_else(|| {
+            (entry.bufnr > 0)
+                .then(|| self.buffers.map.get(&BufferId(entry.bufnr as u64)))
+                .flatten()
+                .and_then(|ob| ob.buffer.path.as_ref())
+                .map(|p| p.to_string_lossy().into_owned())
+        });
+        let Some(filename) = target else {
+            // A non-error line (no file/buffer): echo its text, like vim's E42-free
+            // no-op.
             self.echo(entry.text.clone());
             return;
         };
-        self.qf_focus_target_window();
+        self.qf_focus_target_window(which);
         let line0 = entry.lnum.saturating_sub(1);
         let col0 = entry.col.saturating_sub(1);
         self.jump_to(Path::new(&filename), line0, col0);
     }
 
-    /// Move focus to the window a quickfix jump should land in, honoring
-    /// `'switchbuf'`. From the quickfix window, step to the source code window
-    /// (the one `:copen` was invoked from, else any non-quickfix window, else a
-    /// fresh split). Then a `split`/`vsplit` switchbuf value opens a new window for
-    /// the jump. (`newtab`/`usetab` are not yet acted on.)
-    fn qf_focus_target_window(&mut self) {
+    /// Move focus to the window a jump should land in, honoring `'switchbuf'`. From
+    /// the display window, step to the code window: for the quickfix list the one
+    /// `:copen` was invoked from (else any non-display window), for a location list
+    /// its **owner** window (the loclist belongs to it). Then a `split`/`vsplit`
+    /// `'switchbuf'` value opens a new window for the jump. (`newtab`/`usetab` are
+    /// not yet acted on.)
+    fn qf_focus_target_window(&mut self, which: QfWhich) {
         if self.is_quickfix_buffer() {
-            let qf_win = self.qf_window_id();
+            let disp_win = self.qf_window_id(which);
             let live = self.window_ids();
-            let target = self
-                .qf_prev_win
-                .filter(|w| live.contains(w) && Some(*w) != qf_win)
-                .or_else(|| live.into_iter().find(|w| Some(*w) != qf_win));
+            let preferred = match which {
+                QfWhich::Quickfix => self.qf_prev_win,
+                QfWhich::Location(owner) => Some(owner),
+            };
+            let target = preferred
+                .filter(|w| live.contains(w) && Some(*w) != disp_win)
+                .or_else(|| live.into_iter().find(|w| Some(*w) != disp_win));
             match target {
                 Some(w) => self.set_current_window(w),
                 None => self.split(SplitDir::Horizontal),
@@ -394,7 +722,7 @@ impl Editor {
     /// external process is involved, so this works on every build (including the
     /// web edit-host). File globbing is not yet supported: a path with a glob
     /// metacharacter fails loud rather than silently matching nothing.
-    pub(crate) fn ex_vimgrep(&mut self, args: &str, action: QfAction) {
+    pub(crate) fn ex_vimgrep(&mut self, which: QfWhich, args: &str, action: QfAction) {
         let Some((pattern, every, jump, files)) = self.parse_vimgrep_args(args) else {
             return;
         };
@@ -442,14 +770,15 @@ impl Editor {
         }
         let n = entries.len();
         let title = format!(":vimgrep {}", args.trim());
-        self.qf_set_items(entries, action, Some(title));
+        self.qf_set_items(which, entries, action, Some(title));
         if n == 0 {
             self.echo(format!("E480: No match: {pattern}"));
             return;
         }
-        self.echo(format!("(quickfix) {n} matches"));
+        self.echo(format!("({}) {n} matches", which.label()));
         if jump {
-            self.qf_jump_to_index(self.quickfix.idx.saturating_sub(1));
+            let idx = self.qf_cur(which).idx.saturating_sub(1);
+            self.qf_jump_to_index(which, idx);
         }
     }
 

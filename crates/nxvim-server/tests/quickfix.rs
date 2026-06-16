@@ -525,3 +525,219 @@ async fn grep_uses_grepprg_and_grepformat() {
     assert_eq!(first_entry(&rpc).await, format!("1|{src}|2|0|found"));
     assert_eq!(cursor(&rpc).await.0, 2, ":grep jumped to the match");
 }
+
+// --- Phase 4: list stack, location lists, nx.qf / diagnostics ---------------
+
+/// Poll the current window's location list until it holds at least `want`
+/// entries, returning the final count (an async `:lmake`/`:lgrep` fills it off
+/// the run loop).
+async fn poll_loclist_count(rpc: &Rpc, want: i64) -> i64 {
+    for _ in 0..200 {
+        let n = exec_lua(rpc, "return #vim.fn.getloclist(0)")
+            .await
+            .as_i64()
+            .unwrap_or(0);
+        if n >= want {
+            return n;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    exec_lua(rpc, "return #vim.fn.getloclist(0)")
+        .await
+        .as_i64()
+        .unwrap_or(0)
+}
+
+#[tokio::test]
+async fn setloclist_getloclist_round_trip_is_window_scoped() {
+    let (rpc, mut incoming) = start().await;
+    // Two windows hold independent location lists. The split is a real ex-command
+    // between chunks (so the two window ids actually differ — `vim.cmd` is deferred
+    // within a chunk); explicit window ids make each `setloclist` window-scoped.
+    exec_lua(
+        &rpc,
+        r#"_G.qf_a = vim.api.nvim_get_current_win()
+           vim.fn.setloclist(_G.qf_a, { { filename = "a.rs", lnum = 1, text = "A" } })"#,
+    )
+    .await;
+    message_after(&rpc, &mut incoming, ":vsplit<CR>").await;
+    exec_lua(
+        &rpc,
+        r#"_G.qf_b = vim.api.nvim_get_current_win()
+           vim.fn.setloclist(_G.qf_b, {
+             { filename = "b.rs", lnum = 2, text = "B1" },
+             { filename = "b.rs", lnum = 3, text = "B2" },
+           })"#,
+    )
+    .await;
+    let got = exec_lua(
+        &rpc,
+        r#"local la, lb = vim.fn.getloclist(_G.qf_a), vim.fn.getloclist(_G.qf_b)
+           return string.format("%d|%d|%s|%s|%s", _G.qf_a ~= _G.qf_b and 1 or 0, #la, #lb, la[1].text, lb[1].text)"#,
+    )
+    .await;
+    assert_eq!(got.as_str(), Some("1|1|2|A|B1"));
+}
+
+#[tokio::test]
+async fn colder_and_cnewer_walk_the_quickfix_stack() {
+    let (rpc, mut incoming) = start().await;
+    // Two fresh `setqflist(_, " ")` calls push two lists onto the stack.
+    exec_lua(
+        &rpc,
+        r#"vim.fn.setqflist({ { filename = "a", lnum = 1, text = "list1" } }, " ")
+           vim.fn.setqflist({ { filename = "b", lnum = 2, text = "list2" } }, " ")"#,
+    )
+    .await;
+    // The current list is the newest (list2); :colder restores the previous one.
+    let cur = exec_lua(&rpc, "return vim.fn.getqflist()[1].text").await;
+    assert_eq!(cur.as_str(), Some("list2"));
+    message_after(&rpc, &mut incoming, ":colder<CR>").await;
+    let older = exec_lua(&rpc, "return vim.fn.getqflist()[1].text").await;
+    assert_eq!(
+        older.as_str(),
+        Some("list1"),
+        ":colder restored the older list"
+    );
+    message_after(&rpc, &mut incoming, ":cnewer<CR>").await;
+    let newer = exec_lua(&rpc, "return vim.fn.getqflist()[1].text").await;
+    assert_eq!(
+        newer.as_str(),
+        Some("list2"),
+        ":cnewer returned to the newer list"
+    );
+    // Stepping past the bottom of the stack reports E380.
+    message_after(&rpc, &mut incoming, ":colder<CR>").await;
+    let msg = message_after(&rpc, &mut incoming, ":colder<CR>").await;
+    assert!(
+        msg.contains("E380"),
+        "past the bottom should be E380, got {msg:?}"
+    );
+}
+
+#[tokio::test]
+async fn setqflist_replace_action_swaps_the_current_list() {
+    let (rpc, _incoming) = start().await;
+    // `" "` makes the list, `"r"` replaces its items in place (no new stack entry).
+    let got = set_then_read(
+        &rpc,
+        r#"vim.fn.setqflist({ { filename = "a", lnum = 1, text = "before" } }, " ")
+           vim.fn.setqflist({ { filename = "b", lnum = 2, text = "after" } }, "r")"#,
+        r#"local q = vim.fn.getqflist()
+           return string.format("%d|%s", #q, q[1].text)"#,
+    )
+    .await;
+    assert_eq!(got, "1|after");
+}
+
+#[tokio::test]
+async fn lvimgrep_populates_the_window_loclist() {
+    let (rpc, mut incoming) = start().await;
+    let path = write_temp("lvg", "txt", "alpha\nbeta TODO\ngamma\nTODO again\n");
+    message_after(&rpc, &mut incoming, &format!(":lvimgrep /TODO/ {path}<CR>")).await;
+    // The matches land in the *location* list (not the quickfix list), and the
+    // cursor jumps to the first match.
+    let got = exec_lua(
+        &rpc,
+        r#"local l, q = vim.fn.getloclist(0), vim.fn.getqflist()
+           return string.format("%d|%d|%s", #l, #q, l[1] and l[1].text or "")"#,
+    )
+    .await;
+    assert_eq!(got.as_str(), Some("2|0|beta TODO"));
+    assert_eq!(buf_name(&rpc).await, path, "jumped into the searched file");
+    assert_eq!(cursor(&rpc).await, (2, 5), "landed on the first match");
+}
+
+#[tokio::test]
+async fn lopen_shows_the_loclist_and_enter_jumps() {
+    let (rpc, mut incoming) = start().await;
+    let path = write_temp("ll_jump", "txt", "one\ntwo\nthree\nfour\n");
+    exec_lua(
+        &rpc,
+        &format!(
+            r#"vim.fn.setloclist(0, {{ {{ filename = "{path}", lnum = 3, col = 1, text = "here" }} }})"#
+        ),
+    )
+    .await;
+    let before = win_count(&rpc).await;
+    message_after(&rpc, &mut incoming, ":lopen<CR>").await;
+    assert_eq!(win_count(&rpc).await, before + 1, ":lopen adds a window");
+    // The display buffer is read-only, like the quickfix window.
+    let edit_msg = message_after(&rpc, &mut incoming, "dd").await;
+    assert!(
+        edit_msg.contains("E21"),
+        "loclist window is nomodifiable, got {edit_msg:?}"
+    );
+    // <CR> on the entry jumps into the owner window's file at line 3.
+    message_after(&rpc, &mut incoming, "<CR>").await;
+    assert_eq!(buf_name(&rpc).await, path, "landed in the entry's file");
+    assert_eq!(cursor(&rpc).await.0, 3, "landed on the entry's line");
+}
+
+#[tokio::test]
+async fn lmake_populates_the_loclist_not_the_quickfix_list() {
+    let (rpc, mut incoming) = start().await;
+    let src = write_temp("lmk", "c", "l1\nl2\nl3\nl4\n");
+    exec_lua(
+        &rpc,
+        &format!(
+            r#"vim.o.errorformat = "%f:%l:%c:%m"
+               vim.o.makeprg = [[printf '{src}:2:3:oops\n']]"#
+        ),
+    )
+    .await;
+    message_after(&rpc, &mut incoming, ":lmake<CR>").await;
+    assert_eq!(
+        poll_loclist_count(&rpc, 1).await,
+        1,
+        ":lmake filled the loclist"
+    );
+    // The quickfix list stays empty — :lmake is loclist-scoped.
+    let q = exec_lua(&rpc, "return #vim.fn.getqflist()").await;
+    assert_eq!(
+        q.as_i64(),
+        Some(0),
+        ":lmake must not touch the quickfix list"
+    );
+    assert_eq!(
+        buf_name(&rpc).await,
+        src,
+        ":lmake jumped into the error's file"
+    );
+    assert_eq!(cursor(&rpc).await, (2, 2), "landed on the first error");
+}
+
+#[tokio::test]
+async fn diagnostic_setloclist_fills_a_navigable_loclist() {
+    let (rpc, mut incoming) = start().await;
+    let path = write_temp("diag_ll", "txt", "aa\nbb\ncc\ndd\n");
+    // Open the file (so the buffer has a name to resolve), inject diagnostics for
+    // it, then turn them into a location list via the diagnostics surface.
+    message_after(&rpc, &mut incoming, &format!(":e {path}<CR>")).await;
+    exec_lua(
+        &rpc,
+        r#"local b = vim.api.nvim_get_current_buf()
+           nx._set_diagnostics(b, {
+             { lnum = 2, col = 0, message = "boom", severity = 1 },
+           })
+           nx.diagnostic.setloclist({ open = false })"#,
+    )
+    .await;
+    // 0-based diagnostic line 2 becomes 1-based loclist line 3.
+    let got = exec_lua(
+        &rpc,
+        r#"local l = vim.fn.getloclist(0)
+           return string.format("%d|%d|%s|%s", #l, l[1] and l[1].lnum or 0, l[1] and l[1].type or "", l[1] and l[1].text or "")"#,
+    )
+    .await;
+    assert_eq!(got.as_str(), Some("1|3|E|boom"));
+    // It is navigable: :ll jumps to the diagnostic's line (the entry is addressed
+    // by buffer number, resolved to the file at jump time).
+    message_after(&rpc, &mut incoming, ":ll<CR>").await;
+    assert_eq!(
+        buf_name(&rpc).await,
+        path,
+        ":ll stayed in the diagnostic's file"
+    );
+    assert_eq!(cursor(&rpc).await.0, 3, ":ll jumped to the diagnostic line");
+}

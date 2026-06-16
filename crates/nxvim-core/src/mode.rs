@@ -42,6 +42,14 @@ pub enum KeyContext {
     /// A promptless selectable list (`nx.ui.select`) grabs input; its `select`
     /// bucket applies. No query — every key is a map (an unmapped key is inert).
     Select,
+    /// The bottom message / quickfix / location panel grabs input; its `panel`
+    /// bucket applies. No query — every key is a map (an unmapped key is inert).
+    Panel,
+    /// A directory-listing buffer (the file explorer) owns normal-mode input; its
+    /// `explorer` bucket applies. The one residual non-map key is `:`/`/`/`?`, which
+    /// falls through to the command line; every other unmapped key is inert (the
+    /// listing can't be edited).
+    Explorer,
 }
 
 impl Mode {

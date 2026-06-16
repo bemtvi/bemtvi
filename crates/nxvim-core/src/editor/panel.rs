@@ -2,7 +2,6 @@
 //! navigation, and selection.
 
 use super::*;
-use crate::input::{Key, KeyCode};
 use crate::unicode;
 use crate::view::PanelView;
 use std::path::PathBuf;
@@ -80,7 +79,6 @@ impl Editor {
             cursor,
             top: 0,
             height: PANEL_HEIGHT,
-            gpending: false,
             wants_select,
             targets: Vec::new(),
         });
@@ -226,13 +224,12 @@ impl Editor {
         let Some(panel) = self.last_panel.clone() else {
             return false;
         };
-        // Re-clamp to the current content and reset the transient `gg` prefix, in
-        // case the snapshot was taken mid-keystroke.
+        // Re-clamp to the current content, in case the snapshot was taken
+        // mid-keystroke.
         let last = panel.lines.len().saturating_sub(1);
         self.panel = Some(Panel {
             cursor: panel.cursor.min(last),
             top: panel.top.min(last),
-            gpending: false,
             ..panel
         });
         // Reopening reclaims the panel's rows from the windows area.
@@ -314,82 +311,71 @@ impl Editor {
         })
     }
 
-    /// Handle one key while the panel is focused: `q`/`Q`/`<Esc>` close it,
-    /// `<CR>` selects the current line (when the panel opted into select events),
-    /// and the usual vertical motions (`j`/`k`/`gg`/`G`/`<C-d>`/`<C-u>`, arrows,
-    /// `Home`/`End`) move the panel cursor, scrolling the panel to keep it
-    /// visible. Everything else is ignored — the buffer is untouched while the
-    /// panel has focus.
-    pub(crate) fn handle_panel(&mut self, key: Key) {
+    /// Apply a named `panel` action, dispatched by a `panel`-bucket keymap (the
+    /// default maps in `prelude/keymap.lua`, or a user override) while the bottom
+    /// panel is focused. The rebindable operations: `next`/`prev` move the panel
+    /// cursor by one, `first`/`last` jump to the ends, `half_down`/`half_up` scroll
+    /// a half page, `confirm` resolves the current line (jump to a location-list
+    /// target, else a select event on a select-enabled panel), and `close` dismisses
+    /// the panel. After a cursor move the panel scrolls to keep the cursor visible.
+    /// An unknown name fails loud per the no-silent-stub rule. The panel has no text
+    /// fallthrough — an unmapped key is inert (handled in [`Editor::input`]).
+    pub fn apply_panel_action(&mut self, action: &str) -> Result<(), String> {
         self.message.clear();
 
-        // Close keys drop the panel and refocus the text window.
-        if key.code == KeyCode::Esc || matches!(key.as_char(), Some('q') | Some('Q')) {
-            self.close_panel();
-            return;
-        }
-
-        if key.code == KeyCode::Enter {
-            // A navigable location-list line jumps to its target and closes the
-            // panel behind the jump. Owned here (the core already has `jump_to`)
-            // so the targets travel with the `:panelopen` snapshot and a reopened
-            // list still navigates.
-            if let Some(Some((path, line, col))) = self
-                .panel
-                .as_ref()
-                .and_then(|p| p.targets.get(p.cursor).cloned())
-            {
+        match action {
+            "close" => {
                 self.close_panel();
-                self.jump_to(&path, line, col);
-                return;
+                return Ok(());
             }
-            // Otherwise `<CR>` selects the current line: record it for the server
-            // to dispatch to the scripting `on_select` handler. Only for
-            // select-enabled panels, so a stale handler can't fire on a built-in
-            // `:messages` viewer.
-            if let Some(p) = &self.panel {
-                if p.wants_select {
-                    if let Some(line) = p.lines.get(p.cursor) {
-                        self.panel_selects.push((p.cursor, line.clone()));
+            "confirm" => {
+                // A navigable location-list line jumps to its target and closes the
+                // panel behind the jump. Owned here (the core already has `jump_to`)
+                // so the targets travel with the `:panelopen` snapshot and a reopened
+                // list still navigates.
+                if let Some(Some((path, line, col))) = self
+                    .panel
+                    .as_ref()
+                    .and_then(|p| p.targets.get(p.cursor).cloned())
+                {
+                    self.close_panel();
+                    self.jump_to(&path, line, col);
+                    return Ok(());
+                }
+                // Otherwise `confirm` selects the current line: record it for the
+                // server to dispatch to the scripting `on_select` handler. Only for
+                // select-enabled panels, so a stale handler can't fire on a built-in
+                // `:messages` viewer.
+                if let Some(p) = &self.panel {
+                    if p.wants_select {
+                        if let Some(line) = p.lines.get(p.cursor) {
+                            self.panel_selects.push((p.cursor, line.clone()));
+                        }
                     }
                 }
+                return Ok(());
             }
-            return;
+            _ => {}
         }
 
         let ph = self.panel_content_height().max(1);
         let half = (ph / 2).max(1);
         let Some(panel) = self.panel.as_mut() else {
-            return;
+            return Ok(());
         };
         let last = panel.lines.len().saturating_sub(1);
-
-        // `gg` is two keys; the first `g` arms `gpending`.
-        if panel.gpending {
-            panel.gpending = false;
-            if key.as_char() == Some('g') {
-                panel.cursor = 0;
-            }
-        } else if key.as_char() == Some('g') {
-            panel.gpending = true;
-        } else {
-            match (key.code, key.as_char()) {
-                (KeyCode::Down, _) | (_, Some('j')) => panel.cursor = (panel.cursor + 1).min(last),
-                (KeyCode::Up, _) | (_, Some('k')) => panel.cursor = panel.cursor.saturating_sub(1),
-                (_, Some('G')) => panel.cursor = last,
-                (KeyCode::Char('d'), _) if key.ctrl => {
-                    panel.cursor = (panel.cursor + half).min(last)
-                }
-                (KeyCode::Char('u'), _) if key.ctrl => {
-                    panel.cursor = panel.cursor.saturating_sub(half)
-                }
-                (KeyCode::Home, _) => panel.cursor = 0,
-                (KeyCode::End, _) => panel.cursor = last,
-                _ => {}
-            }
+        match action {
+            "next" => panel.cursor = (panel.cursor + 1).min(last),
+            "prev" => panel.cursor = panel.cursor.saturating_sub(1),
+            "first" => panel.cursor = 0,
+            "last" => panel.cursor = last,
+            "half_down" => panel.cursor = (panel.cursor + half).min(last),
+            "half_up" => panel.cursor = panel.cursor.saturating_sub(half),
+            other => return Err(format!("unknown panel action {other:?}")),
         }
 
         // Scroll the panel so the cursor line stays within the visible window.
         self.scroll_panel_into_view();
+        Ok(())
     }
 }

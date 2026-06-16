@@ -90,6 +90,8 @@ pub fn widget_bucket(ctx: KeyContext) -> Option<char> {
         KeyContext::Editing => None,
         KeyContext::Picker => Some('P'),
         KeyContext::Select => Some('S'),
+        KeyContext::Panel => Some('L'),
+        KeyContext::Explorer => Some('E'),
     }
 }
 
@@ -740,9 +742,11 @@ fn mode_buckets(code: &str) -> &'static [char] {
         // ('picker', …)` lands here, and the matcher selects it via a `Widget` scope
         // while that widget grabs input (see [`widget_bucket`]). Distinct from every
         // editor-mode bucket above so widget maps never leak into editing and vice
-        // versa. Phase 1 adds `picker`; select / panel / explorer follow.
+        // versa. picker / select / panel / explorer; cmdline reuses the `c` bucket.
         "picker" => &['P'],
         "select" => &['S'],
+        "panel" => &['L'],
+        "explorer" => &['E'],
         "" => &['n', 'v', 'V', 'm'],
         _ => &[],
     }

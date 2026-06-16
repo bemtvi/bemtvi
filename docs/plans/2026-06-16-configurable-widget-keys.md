@@ -132,10 +132,24 @@ handles. `handle_menu` / `handle_select_key` and the `Menu::gpending` field are 
 Tests: `tests/widget_keys.rs` (default nav+confirm, `gg` jump, user rebind, no
 editing-map leak); all 8 existing `ui_select.rs` tests pass unchanged.
 
-### Phase 3 — the panel (`'L'`) and explorer (`'E'`)
+### Phase 3 — the panel (`'L'`) and explorer (`'E'`)  ✅ LANDED (2026-06-16)
 
-`handle_panel` and `handle_explorer` → `panel` / `explorer` default maps + actions.
-The explorer's `:`/`/`/`?` fall-through-to-cmdline stays the unmapped-key behavior.
+Converted `handle_panel` → `Editor::apply_panel_action` (next / prev / first / last /
+half_down / half_up / confirm / close) and `handle_explorer` → `Editor::apply_explorer_action`
+(open / up / next / prev / first / last / half + page scroll), each dispatched via the new
+`nx.panel.actions` / `nx.explorer.actions` tables → `nx._panel_action` / `nx._explorer_action`
+→ `Shared.{panel,explorer}_actions`, drained in `apply_lua_effects`. `KeyContext::{Panel,
+Explorer}` + the `'L'`/`'E'` buckets (`mode_buckets`, `widget_bucket`); `key_context()` now
+reports them by reading the existing grab state (panel first, then the menus, then a
+normal-mode explorer buffer), so the server's generic `feed_matcher` routes their keys with no
+new plumbing. Default maps ship `default = true` in `prelude/keymap.lua` (`gg` is a two-key map
+in both). The panel has no text fallthrough (an unmapped key is inert); the explorer's residual
+`handle_explorer_text` keeps **only** `:`/`/`/`?` falling through to the command line, every
+other unmapped key inert. The `Panel::gpending` field and the `explorer_gpending` editor field
+(the old hand-rolled two-key `gg`) are gone. Tests: `tests/widget_keys.rs` gains panel +
+explorer coverage (default nav + confirm/open, `gg` two-key jump, user rebind, panel close via a
+rebound key, the explorer `:` fall-through, no editing-map leak); all existing `editing::panel`
+/ `editing::explorer` / `daemon_explorer` / `quickfix` suites pass unchanged.
 
 ### Phase 4 — the command line (`"cmdline"`, the existing `'c'` bucket)
 

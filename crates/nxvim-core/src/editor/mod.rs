@@ -523,8 +523,6 @@ struct Panel {
     /// Requested content height; [`Editor::panel_rows`] clamps it so the text
     /// window always keeps at least one row.
     height: usize,
-    /// `gg` is two keys; the first `g` arms this.
-    gpending: bool,
     /// Whether `<CR>` on a line emits a select event (drained into the scripting
     /// `on_select` callback / RPC notification). Built-in viewer panels opt out,
     /// so a stale handler never fires on them.
@@ -864,12 +862,6 @@ pub struct Editor {
     /// pending operator, and the [`Stage`] of the in-progress sequence. Decided
     /// by the pure [`parse_step`]; reset on every completed command.
     pending: PendingCommand,
-    /// The half-typed `gg` prefix while a directory-listing buffer (the file
-    /// explorer) is focused: the first `g` arms it so the second completes the
-    /// jump-to-top, without delegating a bare `g` to the normal-mode grammar
-    /// (where it could start an editing `g`-command). See
-    /// [`Editor::handle_explorer`].
-    explorer_gpending: bool,
     /// The last find-char motion as `(kind, target)`, replayed by `;` (same
     /// direction) and `,` (opposite). Cross-command memory, not pending state, so
     /// it lives outside [`PendingCommand`] and survives `reset_pending`.
@@ -1299,7 +1291,6 @@ impl Editor {
             eol_request: false,
             registers: Registers::default(),
             pending: PendingCommand::default(),
-            explorer_gpending: false,
             last_find: None,
             redo_recording: Vec::new(),
             last_change: Vec::new(),
@@ -1457,9 +1448,11 @@ impl Editor {
         }
 
         // A focused panel grabs every key (navigation + close), bypassing the
-        // buffer's mode handling and the `curswant`/scroll bookkeeping below.
+        // buffer's mode handling and the `curswant`/scroll bookkeeping below. Its
+        // nameable keys route through the `panel` keymap bucket (the matcher fires
+        // them as `apply_panel_action` ahead of this), so only an *unmapped* key
+        // reaches here — and the panel has no text input, so it is inert.
         if self.panel.is_some() {
-            self.handle_panel(key);
             return;
         }
 
@@ -1483,13 +1476,14 @@ impl Editor {
         }
 
         // A directory-listing buffer (the file explorer) owns its keys in normal
-        // mode: navigation, `<CR>` to open the entry, `-` to go up. Editing keys
-        // are inert so the listing can't be corrupted; `:`/`/`/`?` fall through to
-        // open the command line. Once mid-sequence (`g` of `gg`) or in another
-        // mode the explorer keeps handling until it returns to a clean normal
-        // boundary. See [`Editor::handle_explorer`].
+        // mode: navigation, `<CR>` to open the entry, `-` to go up. Its nameable
+        // keys route through the `explorer` keymap bucket (the matcher fires them as
+        // `apply_explorer_action` ahead of this), so only an *unmapped* key reaches
+        // here. Editing keys are inert so the listing can't be corrupted; only
+        // `:`/`/`/`?` fall through to open the command line. See
+        // [`Editor::handle_explorer_text`].
         if self.mode == Mode::Normal && self.is_explorer_buffer() {
-            self.handle_explorer(key);
+            self.handle_explorer_text(key);
             return;
         }
 

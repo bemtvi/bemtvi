@@ -417,6 +417,104 @@ function nx._panel_select_buffer(line)
   end
 end
 
+-- ----- rebindable panel keys ------------------------------------------------
+-- The bottom message / quickfix / location panel is driven through the keymap
+-- engine, NOT a hardcoded grab: the server selects the `panel` bucket while the
+-- panel owns input, so navigation / confirm / close are configurable with
+-- `nx.keymap.set('panel', '<key>', nx.panel.actions.<name>)`. Each action fires
+-- through the engine (nx._panel_action -> Editor::apply_panel_action). A panel has
+-- NO query, so there is no text fallthrough — an unmapped key is inert.
+nx.panel = nx.panel or {}
+nx.panel.actions = nx.panel.actions or {}
+for _, name in ipairs({
+  "next",
+  "prev",
+  "first",
+  "last",
+  "half_down",
+  "half_up",
+  "confirm",
+  "close",
+}) do
+  nx.panel.actions[name] = function()
+    nx._panel_action(name)
+  end
+end
+
+-- The default panel bindings — `default = true` so a user `nx.keymap.set('panel',
+-- …)` wins, and an empty-function map disables a key. `gg` is a two-key default map.
+-- These mirror the vim-style keys the panel used to hardcode.
+for _, m in ipairs({
+  { "j", "next", "Next line" },
+  { "<Down>", "next", "Next line" },
+  { "k", "prev", "Previous line" },
+  { "<Up>", "prev", "Previous line" },
+  { "gg", "first", "First line" },
+  { "<Home>", "first", "First line" },
+  { "G", "last", "Last line" },
+  { "<End>", "last", "Last line" },
+  { "<C-d>", "half_down", "Half-page down" },
+  { "<C-u>", "half_up", "Half-page up" },
+  { "<CR>", "confirm", "Select / jump" },
+  { "q", "close", "Close" },
+  { "Q", "close", "Close" },
+  { "<Esc>", "close", "Close" },
+}) do
+  nx.keymap.set("panel", m[1], nx.panel.actions[m[2]], { default = true, desc = m[3] })
+end
+
+-- ----- rebindable explorer keys ---------------------------------------------
+-- The file-explorer (directory-listing) buffer is driven through the keymap
+-- engine, NOT a hardcoded grab: the server selects the `explorer` bucket while a
+-- listing is focused in normal mode, so navigation / open / up are configurable
+-- with `nx.keymap.set('explorer', '<key>', nx.explorer.actions.<name>)`. Each
+-- action fires through the engine (nx._explorer_action ->
+-- Editor::apply_explorer_action). The listing's ONE residual non-map key is
+-- `:`/`/`/`?` (it falls through to the command line); every other unmapped key is
+-- inert, so the listing can't be corrupted.
+nx.explorer = nx.explorer or {}
+nx.explorer.actions = nx.explorer.actions or {}
+for _, name in ipairs({
+  "open",
+  "up",
+  "next",
+  "prev",
+  "first",
+  "last",
+  "half_down",
+  "half_up",
+  "page_down",
+  "page_up",
+}) do
+  nx.explorer.actions[name] = function()
+    nx._explorer_action(name)
+  end
+end
+
+-- The default explorer bindings — `default = true`, so a user override wins and an
+-- empty-function map disables a key. `gg` is a two-key default map. These mirror
+-- the keys the explorer used to hardcode.
+for _, m in ipairs({
+  { "<CR>", "open", "Open entry" },
+  { "-", "up", "Parent directory" },
+  { "j", "next", "Next entry" },
+  { "<Down>", "next", "Next entry" },
+  { "k", "prev", "Previous entry" },
+  { "<Up>", "prev", "Previous entry" },
+  { "gg", "first", "First entry" },
+  { "<Home>", "first", "First entry" },
+  { "G", "last", "Last entry" },
+  { "<End>", "last", "Last entry" },
+  { "<C-d>", "half_down", "Half-page down" },
+  { "<C-u>", "half_up", "Half-page up" },
+  { "<C-f>", "page_down", "Page down" },
+  { "<PageDown>", "page_down", "Page down" },
+  { "<C-b>", "page_up", "Page up" },
+  { "<PageUp>", "page_up", "Page up" },
+}) do
+  nx.keymap.set("explorer", m[1], nx.explorer.actions[m[2]], { default = true, desc = m[3] })
+end
+
 -- ----- the pending-key event (which-key / showcmd) -------------------------
 -- nx.on_key_pending(fn): subscribe to the engine-computed pending-key signal. The
 -- server fires it whenever the *pending key-context changes* — a mapped prefix

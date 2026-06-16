@@ -1654,6 +1654,29 @@ pub(crate) fn install_runtime_api(
             Ok(())
         })?,
     )?;
+    // `nx._panel_action(name)`: a `panel`-bucket keymap fired the named action (next /
+    // prev / first / last / half scroll / confirm / close) on the open message /
+    // quickfix panel; the server applies it via `Editor::apply_panel_action`. A
+    // panel sibling of `nx._picker_action`.
+    let sh = shared.clone();
+    nx.set(
+        "_panel_action",
+        lua.create_function(move |_, name: String| {
+            sh.borrow_mut().panel_actions.push(name);
+            Ok(())
+        })?,
+    )?;
+    // `nx._explorer_action(name)`: an `explorer`-bucket keymap fired the named action
+    // (open / up / next / prev / first / last / half + page scroll) on the file
+    // explorer listing; the server applies it via `Editor::apply_explorer_action`.
+    let sh = shared.clone();
+    nx.set(
+        "_explorer_action",
+        lua.create_function(move |_, name: String| {
+            sh.borrow_mut().explorer_actions.push(name);
+            Ok(())
+        })?,
+    )?;
 
     // `nx._decor_register()`: a `nx.decor.provider` was registered — flip the live
     // gate so the server starts dispatching viewport-change signals to providers.

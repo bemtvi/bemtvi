@@ -159,8 +159,9 @@ pub struct Buffer {
     pub changelistidx: usize,
     /// When `Some(dir)`, this buffer is a **directory listing** — nxvim's
     /// in-window file explorer (vim's netrw), not an editable text file. `dir` is
-    /// the canonical absolute path being listed; the editor routes `<CR>`/`-` to
-    /// [`crate::editor::Editor::handle_explorer`] (open the entry / go up) and
+    /// the canonical absolute path being listed; the editor routes its keys through
+    /// the `explorer` keymap bucket to
+    /// [`crate::editor::Editor::apply_explorer_action`] (open the entry / go up) and
     /// otherwise keeps the listing inert. Built by [`Buffer::from_dir`]; `None`
     /// for every ordinary file/scratch buffer.
     pub dir: Option<PathBuf>,

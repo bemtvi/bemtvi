@@ -515,6 +515,16 @@ pub(crate) struct Shared {
     /// drained by the server into `Editor::apply_select_action` — the rebindable
     /// `nx.ui.select` keys (next / prev / first / last / confirm / cancel).
     pub(crate) select_actions: Vec<String>,
+    /// Named `panel` actions a `panel`-bucket keymap fired (`nx._panel_action`),
+    /// drained by the server into `Editor::apply_panel_action` — the rebindable
+    /// message / quickfix panel keys (next / prev / first / last / half scroll /
+    /// confirm / close).
+    pub(crate) panel_actions: Vec<String>,
+    /// Named `explorer` actions an `explorer`-bucket keymap fired
+    /// (`nx._explorer_action`), drained by the server into
+    /// `Editor::apply_explorer_action` — the rebindable file-explorer keys (open /
+    /// up / next / prev / first / last / half + page scroll).
+    pub(crate) explorer_actions: Vec<String>,
     /// Marks a `nx.decor` provider published for a window's viewport
     /// (`nx._decor_publish`), drained by the server (generation-gated) into the
     /// provider's namespace in the extmark layer. Empty for a no-provider config.
@@ -1042,6 +1052,18 @@ impl LuaRuntime {
         /// Take the named select actions fired since the last drain, for the server
         /// to apply to the open `nx.ui.select` list via `Editor::apply_select_action`.
         take_select_actions -> Vec<String> = select_actions
+    }
+
+    take_queue! {
+        /// Take the named panel actions fired since the last drain, for the server to
+        /// apply to the open panel via `Editor::apply_panel_action`.
+        take_panel_actions -> Vec<String> = panel_actions
+    }
+
+    take_queue! {
+        /// Take the named explorer actions fired since the last drain, for the server
+        /// to apply to the file explorer via `Editor::apply_explorer_action`.
+        take_explorer_actions -> Vec<String> = explorer_actions
     }
 
     take_queue! {

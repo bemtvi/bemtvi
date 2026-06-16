@@ -208,6 +208,20 @@ impl EditHost {
                 self.editor.echo(format!("E5108: {e}"));
             }
         }
+        // Panel actions a `panel`-bucket keymap fired (`nx._panel_action`): apply each
+        // to the open message / quickfix panel. Unknown names fail loud.
+        for action in self.lua.take_panel_actions() {
+            if let Err(e) = self.editor.apply_panel_action(&action) {
+                self.editor.echo(format!("E5108: {e}"));
+            }
+        }
+        // Explorer actions an `explorer`-bucket keymap fired (`nx._explorer_action`):
+        // apply each to the file-explorer listing. Unknown names fail loud.
+        for action in self.lua.take_explorer_actions() {
+            if let Err(e) = self.editor.apply_explorer_action(&action) {
+                self.editor.echo(format!("E5108: {e}"));
+            }
+        }
         // Panel requests from `vim.panel.*` drive the core's panel state.
         for op in self.lua.take_panel_ops() {
             match op {

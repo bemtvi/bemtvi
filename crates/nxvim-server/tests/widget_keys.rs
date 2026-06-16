@@ -11,7 +11,7 @@
 
 use nxvim_rpc::{Incoming, Rpc};
 use nxvim_server::ServerInit;
-use nxvim_test_harness::{attach, barrier, exec_lua, feed, lines, spawn, temp_dir};
+use nxvim_test_harness::{attach, barrier, cursor, exec_lua, feed, lines, spawn, temp_dir};
 use tokio::sync::mpsc::UnboundedReceiver;
 
 async fn start(dir: &std::path::Path, init_lua: &str) -> (Rpc, UnboundedReceiver<Incoming>) {
@@ -249,5 +249,225 @@ async fn select_editing_map_does_not_leak() {
         exec_lua(&rpc, "return _G.leaked").await.as_bool(),
         Some(false),
         "the normal-mode j map never fired inside the select list"
+    );
+}
+
+// ===== Phase 3a: the message / quickfix panel (the 'panel' bucket) ============
+
+/// Open a three-line `vim.panel` whose `on_select` records the confirmed line in
+/// `_G.panel_sel`; a barrier settles the open.
+async fn open_panel(rpc: &Rpc, extra: &str) {
+    exec_lua(
+        rpc,
+        &format!(
+            "{extra}\n\
+             _G.panel_sel = nil\n\
+             vim.panel.open('P', {{ 'aaa', 'bbb', 'ccc' }}, function(line)\n\
+               _G.panel_sel = line\n\
+             end)"
+        ),
+    )
+    .await;
+    barrier(rpc).await;
+}
+
+async fn panel_sel(rpc: &Rpc) -> Option<String> {
+    exec_lua(rpc, "return _G.panel_sel")
+        .await
+        .as_str()
+        .map(str::to_string)
+}
+
+async fn panel_is_open(rpc: &Rpc) -> bool {
+    rpc.request("nxvim_panel_is_open", vec![])
+        .await
+        .expect("panel_is_open")
+        .as_bool()
+        .unwrap_or(false)
+}
+
+/// The default panel keys still navigate + confirm through the keymap engine:
+/// `j` moves down one (aaa -> bbb), `<CR>` confirms.
+#[tokio::test]
+async fn panel_default_keys_navigate_and_confirm() {
+    let dir = temp_dir("widget_keys_panel_default");
+    let (rpc, _incoming) = start(&dir, "").await;
+    open_panel(&rpc, "").await;
+
+    feed(&rpc, "j");
+    feed(&rpc, "<CR>");
+    barrier(&rpc).await;
+    assert_eq!(panel_sel(&rpc).await.as_deref(), Some("bbb"));
+}
+
+/// `gg` is a two-key `panel` default map: from the last line it jumps to the first.
+#[tokio::test]
+async fn panel_gg_jumps_to_first() {
+    let dir = temp_dir("widget_keys_panel_gg");
+    let (rpc, _incoming) = start(&dir, "").await;
+    open_panel(&rpc, "").await;
+
+    feed(&rpc, "G"); // last (ccc)
+    feed(&rpc, "gg"); // back to first (aaa)
+    feed(&rpc, "<CR>");
+    barrier(&rpc).await;
+    assert_eq!(panel_sel(&rpc).await.as_deref(), Some("aaa"));
+}
+
+/// A user `nx.keymap.set('panel', …)` rebinds a panel action to a new key: `<C-j>`
+/// jumps to the last line even though it is not a default panel key.
+#[tokio::test]
+async fn panel_user_rebind() {
+    let dir = temp_dir("widget_keys_panel_rebind");
+    let (rpc, _incoming) = start(&dir, "").await;
+    open_panel(
+        &rpc,
+        "nx.keymap.set('panel', '<C-j>', nx.panel.actions.last)",
+    )
+    .await;
+
+    feed(&rpc, "<C-j>"); // rebound: jump to last (ccc)
+    feed(&rpc, "<CR>");
+    barrier(&rpc).await;
+    assert_eq!(panel_sel(&rpc).await.as_deref(), Some("ccc"));
+}
+
+/// The `close` action dismisses the panel — driven through a rebound key to prove
+/// the keymap path, not just the default `q`.
+#[tokio::test]
+async fn panel_close_via_rebound_key() {
+    let dir = temp_dir("widget_keys_panel_close");
+    let (rpc, _incoming) = start(&dir, "").await;
+    open_panel(
+        &rpc,
+        "nx.keymap.set('panel', '<C-x>', nx.panel.actions.close)",
+    )
+    .await;
+    assert!(panel_is_open(&rpc).await, "panel opened");
+
+    feed(&rpc, "<C-x>");
+    barrier(&rpc).await;
+    assert!(
+        !panel_is_open(&rpc).await,
+        "rebound close dismissed the panel"
+    );
+}
+
+/// An editing-mode `j` map does NOT leak into the panel: `j` still moves the panel
+/// cursor (the panel map), and the normal-mode map never fires.
+#[tokio::test]
+async fn panel_editing_map_does_not_leak() {
+    let dir = temp_dir("widget_keys_panel_noleak");
+    let (rpc, _incoming) = start(&dir, "").await;
+    open_panel(
+        &rpc,
+        "_G.leaked = false\n\
+         nx.keymap.set('n', 'j', function() _G.leaked = true end)",
+    )
+    .await;
+
+    feed(&rpc, "j"); // panel's next, NOT the normal-mode map
+    feed(&rpc, "<CR>");
+    barrier(&rpc).await;
+    assert_eq!(panel_sel(&rpc).await.as_deref(), Some("bbb"));
+    assert_eq!(
+        exec_lua(&rpc, "return _G.leaked").await.as_bool(),
+        Some(false),
+        "the normal-mode j map never fired inside the panel"
+    );
+}
+
+// ===== Phase 3b: the file explorer (the 'explorer' bucket) ====================
+
+/// A temp directory with two files and one sub-directory, opened as the explorer in
+/// a fresh server. The listing is `../`, `sub/`, `alpha.txt`, `beta.txt` (up entry,
+/// then directories, then files). The config/init dir is separate so `init.lua`
+/// never pollutes the listing.
+async fn open_explorer(init_lua: &str) -> (Rpc, UnboundedReceiver<Incoming>) {
+    let cfg = temp_dir("widget_keys_explorer_cfg");
+    let content = temp_dir("widget_keys_explorer_dir");
+    std::fs::write(content.join("alpha.txt"), "alpha-body\n").expect("write alpha");
+    std::fs::write(content.join("beta.txt"), "beta-body\n").expect("write beta");
+    std::fs::create_dir(content.join("sub")).expect("mkdir sub");
+    let (rpc, incoming) = start(&cfg, init_lua).await;
+    feed(&rpc, &format!(":e {}<CR>", content.display()));
+    barrier(&rpc).await;
+    assert_eq!(
+        lines(&rpc).await,
+        vec!["../", "sub/", "alpha.txt", "beta.txt"],
+        "explorer listed the fixture directory"
+    );
+    (rpc, incoming)
+}
+
+/// The default explorer keys still navigate + open through the keymap engine: `jj`
+/// moves to `alpha.txt` (row 2) and `<CR>` opens it.
+#[tokio::test]
+async fn explorer_default_keys_navigate_and_open() {
+    let (rpc, _incoming) = open_explorer("").await;
+    feed(&rpc, "jj<CR>");
+    barrier(&rpc).await;
+    assert_eq!(lines(&rpc).await, vec!["alpha-body"]);
+}
+
+/// `gg` is a two-key `explorer` default map: from the last row it jumps to the
+/// first (the `../` up entry).
+#[tokio::test]
+async fn explorer_gg_jumps_to_first() {
+    let (rpc, _incoming) = open_explorer("").await;
+    feed(&rpc, "G"); // last row (beta.txt; 1-based line 4)
+    assert_eq!(cursor(&rpc).await.0, 4, "G moved to the last entry");
+    feed(&rpc, "gg"); // back to the first row (../; 1-based line 1)
+    assert_eq!(cursor(&rpc).await.0, 1, "gg jumped to the first entry");
+}
+
+/// A user `nx.keymap.set('explorer', …)` rebinds an explorer action to a new key:
+/// `<C-j>` jumps to the last entry even though it is not a default explorer key.
+#[tokio::test]
+async fn explorer_user_rebind() {
+    let (rpc, _incoming) =
+        open_explorer("nx.keymap.set('explorer', '<C-j>', nx.explorer.actions.last)").await;
+    feed(&rpc, "<C-j>");
+    assert_eq!(
+        cursor(&rpc).await.0,
+        4,
+        "rebound key jumped to the last entry"
+    );
+}
+
+/// `:` falls through to the command line — the explorer's one residual non-map key.
+/// A `:lua` command run from the listing proves the command line opened.
+#[tokio::test]
+async fn explorer_colon_falls_through_to_cmdline() {
+    let (rpc, _incoming) = open_explorer("").await;
+    feed(&rpc, ":lua _G.from_cmdline = true<CR>");
+    barrier(&rpc).await;
+    assert_eq!(
+        exec_lua(&rpc, "return _G.from_cmdline").await.as_bool(),
+        Some(true),
+        ": opened the command line from the explorer listing"
+    );
+}
+
+/// An editing-mode `j` map does NOT leak into the explorer: `j` still moves the
+/// listing selection (the explorer map), and the normal-mode map never fires.
+#[tokio::test]
+async fn explorer_editing_map_does_not_leak() {
+    let (rpc, _incoming) = open_explorer(
+        "_G.leaked = false\n\
+         nx.keymap.set('n', 'j', function() _G.leaked = true end)",
+    )
+    .await;
+
+    feed(&rpc, "j"); // explorer's next, NOT the normal-mode map
+    assert_eq!(
+        cursor(&rpc).await.0,
+        2,
+        "explorer's own j moved the selection"
+    );
+    assert_eq!(
+        exec_lua(&rpc, "return _G.leaked").await.as_bool(),
+        Some(false),
+        "the normal-mode j map never fired inside the explorer"
     );
 }

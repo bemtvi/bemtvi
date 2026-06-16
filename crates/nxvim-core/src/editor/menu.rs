@@ -606,11 +606,10 @@ impl Editor {
     }
 
     /// Whether the open menu **grabs all input** (`Select` / `Picker`) — the
-    /// signal the input dispatch uses to route every key to [`handle_menu`]. A
-    /// `Complete` menu does not: it floats over the text while typing flows on to
-    /// the document, so the dispatch lets the key through to `handle_insert`.
-    ///
-    /// [`handle_menu`]: Editor::handle_menu
+    /// signal [`key_context`](Self::key_context) reads to route every key through
+    /// the menu's own keymap bucket. A `Complete` menu does not: it floats over the
+    /// text while typing flows on to the document, so the dispatch lets the key
+    /// through to `handle_insert`.
     pub(crate) fn menu_grabs_input(&self) -> bool {
         self.menu
             .as_ref()
@@ -790,17 +789,26 @@ impl Editor {
         self.menu.as_mut().filter(|m| m.kind == MenuKind::Complete)
     }
 
-    /// Which key context owns input — [`KeyContext::Picker`] while a prompted picker
-    /// grabs input, [`KeyContext::Select`] while a promptless `nx.ui.select` list
-    /// does (each routes keys through its own keymap bucket), otherwise
-    /// [`KeyContext::Editing`] (the buffer, or a non-grabbing completion menu whose
-    /// typing flows on to the document).
+    /// Which key context owns input — the grabbing widget that routes keys through
+    /// its own keymap bucket, otherwise [`KeyContext::Editing`] (the buffer, or a
+    /// non-grabbing completion menu whose typing flows on to the document). The
+    /// priority mirrors [`Editor::input`]'s grab order: a focused [`Panel`] first,
+    /// then a grabbing menu ([`Picker`](KeyContext::Picker) /
+    /// [`Select`](KeyContext::Select)), then a directory-listing
+    /// [`Explorer`](KeyContext::Explorer) in normal mode.
     pub fn key_context(&self) -> KeyContext {
-        match self.menu_kind() {
-            Some(MenuKind::Picker) => KeyContext::Picker,
-            Some(MenuKind::Select) => KeyContext::Select,
-            _ => KeyContext::Editing,
+        if self.panel.is_some() {
+            return KeyContext::Panel;
         }
+        match self.menu_kind() {
+            Some(MenuKind::Picker) => return KeyContext::Picker,
+            Some(MenuKind::Select) => return KeyContext::Select,
+            _ => {}
+        }
+        if self.mode == Mode::Normal && self.is_explorer_buffer() {
+            return KeyContext::Explorer;
+        }
+        KeyContext::Editing
     }
 
     /// Apply a named `select` action, dispatched by a `select`-bucket keymap (the

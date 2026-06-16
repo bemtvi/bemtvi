@@ -401,7 +401,7 @@ async fn the_file_preview_pane_is_syntax_highlighted() {
         &rpc,
         &format!(
             "nx.picker.source{{ name='prev', preview='file', \
-               items=function(_,push,done) push{{ text='f', path='{file}' }}; done() end }}; \
+               items=function(ctx) ctx.push{{ text='f', path='{file}' }} end }}; \
              nx.picker.open('prev')"
         ),
     )

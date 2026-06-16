@@ -3,8 +3,8 @@
 -- The home for broadly-useful utilities that aren't data helpers (those are
 -- nx.tbl / nx.list / nx.str / nx.iter in prelude/stdlib.lua) and aren't a feature
 -- API — control-flow / timing glue plugin authors reach for. nxvim-native (no
--- vim.* twin). Loaded after prelude/ui.lua (nx.timer) and prelude/promise.lua, so
--- a util may build on timers AND the promise/async surface.
+-- vim.* twin). Loaded after prelude/runtime.lua (nx.timer / nx.schedule) and
+-- prelude/promise.lua, so a util may build on timers AND the promise/async surface.
 local vim = vim
 nx = nx or {}
 nx.utils = nx.utils or {}

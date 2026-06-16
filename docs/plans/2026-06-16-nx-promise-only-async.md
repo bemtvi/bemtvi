@@ -11,8 +11,8 @@
 one-shot async on `nx`** — every "do a thing, get a result later" API returns a
 promise ([the promise system](../../crates/nxvim-lua/src/prelude/promise.lua)).
 Streaming becomes an **async-iterator**, not a single promise. Event subscriptions
-(`nx.autocmd`, `nx.on_key`, keymap rhs) and the microtask primitive (`nx.schedule`)
-**stay** — they fire repeatedly / underpin promises, so a promise is the wrong shape.
+(`nx.autocmd`, keymap rhs) and the microtask primitive (`nx.schedule`) **stay** —
+they fire repeatedly / underpin promises, so a promise is the wrong shape.
 
 This first cut covers the **process** surface, which is the only callback-shaped
 one-shot async with real call sites today.

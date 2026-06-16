@@ -55,8 +55,9 @@ internally; the API makes them the documented contract:
    `nx.promise.delay`) you `nx.await` inside `nx.async`, or — for multi-value
    streaming — an async-iterator (`nx.run_stream` + `nx.await_each`); `nx` is
    promise-only (no callback-shaped async). Event subscriptions (`nx.autocmd`,
-   `nx.on_key`) stay handler-based — they fire repeatedly, so a promise is the
-   wrong shape. (See [the promise-only migration](../plans/2026-06-16-nx-promise-only-async.md).)
+   keymap rhs) and emit sinks (a picker source's `ctx.push`, a `nx.decor` provider's
+   `publish`) stay handler-based — they fire repeatedly, so a promise is the wrong
+   shape. (See [the promise-only migration](../plans/2026-06-16-nx-promise-only-async.md).)
 4. **No frame-time Lua.** Plugins publish decorations / segments / items
    whenever they like; the server folds them into the next frame. A plugin
    cannot make redraw slow. (ADR 0001's bridge pattern, generalized into *the*

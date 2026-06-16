@@ -1048,9 +1048,11 @@ impl LuaRuntime {
 
     /// Run the configured `nx.complete` **async** sources for generation `gen`
     /// against the snapshot `ctx` (`nx._complete_run`). The Lua wrapper debounces
-    /// each source, invokes its `complete(ctx, push, done)`, and reaps a superseded
-    /// run; the `push`es land back as [`CompletePush`](crate::ops::CompletePush)es and
-    /// the reduced `done()` as a `complete_finishes` entry — both generation-stamped.
+    /// each source, invokes its `complete(ctx)` (the source emits via `ctx.push` and
+    /// signals completion by returning / resolving its promise), and reaps a
+    /// superseded run; the `push`es land back as
+    /// [`CompletePush`](crate::ops::CompletePush)es and the reduced completion as a
+    /// `complete_finishes` entry — both generation-stamped.
     /// The `ctx` snapshot (`{ prefix, buf, row, col }`) is passed as primitives (the
     /// server unpacks `CompleteCtx`, which `nxvim-lua` cannot see), never live editor
     /// state. `row` / `col` are 0-based, matching the core cursor; an LSP source

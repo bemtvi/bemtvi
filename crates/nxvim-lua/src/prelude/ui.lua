@@ -13,7 +13,9 @@
 --                   spells this blocking vim.fn.confirm, which the nx model omits).
 --                   PROMISE-ONLY: nx.ui.confirm(message, opts) -> a promise of bool.
 --   nx.ui.float   — the list-less content float (the widget's sibling, also the LSP
---                   hover surface). Fire-and-forget — no result, no callback.
+--                   hover surface). Fire-and-forget by default (no result); with
+--                   `persist = true` it returns a resource HANDLE (:update/:close/
+--                   :is_open), not an async result — so it stays non-promise.
 -- `nx` async is promise-only (ADR 0002 / docs/plans/2026-06-16-nx-promise-only-async.md):
 -- a one-shot async API returns a promise, never a callback. The callback shape lives
 -- on the `vim.ui.*` muscle-memory aliases (the bounded compat layer), which adapt the
@@ -220,8 +222,8 @@ end
 --   relative = "cursor" (default, anchors at the cursor) | "editor" (centered)
 --   persist  = when truthy, the float survives keystrokes (it is not dismissed by
 --              the next key) and nx.ui.float returns a HANDLE with :update(contents,
---              opts) / :close() / :is_open(). This is the surface an observer plugin
---              (e.g. which-key, driving it from nx.on_key) renders through.
+--              opts) / :close() / :is_open(). This is the surface a key-observer
+--              plugin (e.g. which-key) renders through, refreshing it as keys arrive.
 -- Without `persist` it is fire-and-forget: the server owns the float, its
 -- geometry, and its dismissal (the next key closes it); returns nil. Empty
 -- contents open nothing. LSP hover and signature help use the non-persistent form.

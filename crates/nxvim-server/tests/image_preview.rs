@@ -67,6 +67,32 @@ async fn image_file_previews_when_enabled() {
 }
 
 #[tokio::test]
+async fn set_ex_command_enables_imagepreview() {
+    // `:set imagepreview` must enable it just like `nx.o.imagepreview = true` does
+    // (it was missing from `apply_set_bool`'s slot match, so the `:set` path silently
+    // no-op'd and an image still opened as text — the bug this guards).
+    let (rpc, mut incoming) = start().await;
+    let path = write_temp("imgset", "png", "PNGPLACEHOLDER\n");
+
+    command(&rpc, "set imagepreview").await;
+    command(&rpc, &format!("edit {path}")).await;
+
+    assert_eq!(
+        lines(&rpc).await,
+        vec![String::new()],
+        "`:set imagepreview` makes an image open as an inert preview, not text"
+    );
+    let frame = wait_redraw(&mut incoming, |m| {
+        matches!(window0_field(m, "image"), Some(Value::Map(_)))
+    })
+    .await;
+    assert!(
+        matches!(window0_field(&frame, "image"), Some(Value::Map(_))),
+        "the redraw carries the image marker after `:set imagepreview`"
+    );
+}
+
+#[tokio::test]
 async fn image_file_opens_as_text_when_disabled() {
     let (rpc, mut incoming) = start().await;
     let path = write_temp("imgtext", "png", "PNGPLACEHOLDER\n");

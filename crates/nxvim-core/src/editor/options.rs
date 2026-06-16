@@ -85,6 +85,7 @@ impl Editor {
             "hlsearch" => &mut self.options.hlsearch,
             "incsearch" => &mut self.options.incsearch,
             "autoread" => &mut self.options.autoread,
+            "imagepreview" => &mut self.options.imagepreview,
             "scrollanim" => &mut self.options.scrollanim,
             "expandtab" => &mut self.buffer_mut().options.expandtab,
             "bomb" => &mut self.buffer_mut().options.bomb,

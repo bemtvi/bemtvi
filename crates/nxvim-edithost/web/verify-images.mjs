@@ -97,7 +97,29 @@ try {
     `frame=${JSON.stringify(offFrame)}`,
   );
 
-  // Turn the option on (the canonical nx.* surface), then re-open.
+  // ── 1b. `:set imagepreview` (the ex-command path the user reaches) enables it ─────────
+  // Regression guard: this arm was missing from `apply_set_bool`, so `:set imagepreview`
+  // silently no-op'd and an image still opened as text. Seed + open a fresh file after it.
+  await page.evaluate(async () => {
+    const root = await navigator.storage.getDirectory();
+    const png = Uint8Array.from(atob("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg=="), (c) => c.charCodeAt(0));
+    const fh = await root.getFileHandle("viaset.png", { create: true });
+    const w = await fh.createWritable(); await w.write(png); await w.close();
+  });
+  await page.evaluate(() => window.__nxvim.feed(":set imagepreview<CR>"));
+  await page.evaluate(() => window.__nxvim.feed(":e /viaset.png<CR>"));
+  const viaSet = await until(
+    page,
+    () => { const w = (window.__nxvim.frame()?.windows || []).find((x) => x.focused); return w && w.image ? { path: w.image.path } : null; },
+    (v) => v != null,
+  );
+  check(
+    "`:set imagepreview` enables previews (the ex-command path), not just nx.o",
+    viaSet != null && /viaset\.png$/.test(viaSet.path),
+    `viaSet=${JSON.stringify(viaSet)}`,
+  );
+
+  // Keep the option on via the canonical nx.* surface for the remaining checks.
   await page.evaluate(() => window.__nxvim.execLua("nx.o.imagepreview = true"));
 
   // ── 2. Option ON: opening the PNG carries the marker AND an empty buffer ──────────────
@@ -148,6 +170,33 @@ try {
     "fail loud: a non-decodable image paints a visible [image: …] placeholder",
     placeholder.hasMarker && placeholder.placeholder,
     `state=${JSON.stringify(placeholder)}`,
+  );
+
+  // ── 5. The reported scenario: `imagepreview` set in /init.lua, then open an image ────
+  // Both halves had to be fixed for this to work: `bootWithConfig` decoding the config's raw
+  // OPFS bytes, and the off-tick open honoring the option. Seed the config, reload so it's
+  // sourced at boot (no addInitScript race), then open a fresh image.
+  await page.evaluate(async () => {
+    const root = await navigator.storage.getDirectory();
+    let fh = await root.getFileHandle("init.lua", { create: true });
+    let w = await fh.createWritable(); await w.write(new TextEncoder().encode("nx.o.imagepreview = true\n")); await w.close();
+    const png = Uint8Array.from(atob("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg=="), (c) => c.charCodeAt(0));
+    fh = await root.getFileHandle("viaconfig.png", { create: true });
+    w = await fh.createWritable(); await w.write(png); await w.close();
+  });
+  await page.reload();
+  await page.waitForFunction(() => window.__nxvim !== undefined, null, { timeout: 15000 });
+  await page.evaluate(() => window.__nxvim.ready);
+  await page.evaluate(() => window.__nxvim.feed(":e /viaconfig.png<CR>"));
+  const viaConfig = await until(
+    page,
+    () => { const w = (window.__nxvim.frame()?.windows || []).find((x) => x.focused); return w && w.image ? { path: w.image.path } : null; },
+    (v) => v != null,
+  );
+  check(
+    "config: `nx.o.imagepreview` in /init.lua enables previews after boot (the reported scenario)",
+    viaConfig != null && /viaconfig\.png$/.test(viaConfig.path),
+    `viaConfig=${JSON.stringify(viaConfig)}`,
   );
 
   await browser.close();

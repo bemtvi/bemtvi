@@ -133,9 +133,12 @@ if (h === 0) {
 // A broken config is surfaced (non-fatal) — the editor still finishes booting.
 async function bootWithConfig() {
   try {
-    const cfg = await opfsRead("/init.lua"); // kind 0 = file, 1 = absent, 2 = dir, 3 = error
-    if (cfg.kind === 0 && cfg.text.length) {
-      const err = readStr(eh_source_lua(h, cfg.text));
+    const cfg = await opfsRead("/init.lua"); // kind 0 = file (raw `bytes`), 1 = absent, 2 = dir, 3 = error
+    // A file read returns RAW bytes (`opfsRead` keeps them undecoded for the binary-safe
+    // encoding seam); init.lua is UTF-8 source, so decode it here before sourcing.
+    const cfgText = cfg.kind === 0 && cfg.bytes ? utf8(cfg.bytes) : "";
+    if (cfgText.length) {
+      const err = readStr(eh_source_lua(h, cfgText));
       if (err) postMessage({ type: "config_error", error: err });
     }
   } catch (e) {
@@ -146,9 +149,10 @@ async function bootWithConfig() {
   // the startup lifecycle — so a restored `` `" `` / registers / history are live for the
   // first frame, matching native's load ordering.
   try {
-    const sh = await opfsRead(SHADA_PATH); // kind 0 = present, 1 = none yet
-    if (sh.kind === 0 && sh.text.length) {
-      const err = readStr(eh_load_shada(h, sh.text));
+    const sh = await opfsRead(SHADA_PATH); // kind 0 = present (raw `bytes`), 1 = none yet
+    const shText = sh.kind === 0 && sh.bytes ? utf8(sh.bytes) : ""; // shada is UTF-8 JSON; decode the raw bytes
+    if (shText.length) {
+      const err = readStr(eh_load_shada(h, shText));
       if (err) postMessage({ type: "config_error", error: err });
       else shadaBaseline = readStr(eh_export_shada(h, 0)); // seed baseline so the first checkpoint is a no-op
     }
@@ -164,8 +168,9 @@ async function bootWithConfig() {
       const res = await fetch(new URL("vendor/manifest.json", import.meta.url));
       if (res.ok) for (const l of (await res.json()).languages || []) avail.add(l);
     } catch { /* highlighter assets not built — plain rendering, empty bundle */ }
-    const cache = await opfsRead("/.nxvim/treesitter/manifest.json"); // kind 0 = present
-    if (cache.kind === 0 && cache.text.length) for (const l of JSON.parse(cache.text)) avail.add(l);
+    const cache = await opfsRead("/.nxvim/treesitter/manifest.json"); // kind 0 = present (raw `bytes`)
+    const cacheText = cache.kind === 0 && cache.bytes ? utf8(cache.bytes) : ""; // UTF-8 JSON; decode raw bytes
+    if (cacheText.length) for (const l of JSON.parse(cacheText)) avail.add(l);
     eh_ts_seed_installed(h, JSON.stringify([...avail]));
   } catch (e) {
     postMessage({ type: "config_error", error: "treesitter seed: " + e });

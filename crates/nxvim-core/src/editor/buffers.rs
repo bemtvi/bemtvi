@@ -497,6 +497,28 @@ impl Editor {
     /// the bytes off the editor tick and loads them into `buffer` via
     /// [`Editor::load_str_into`] — the read analogue of [`Editor::enqueue_save`].
     pub(crate) fn enqueue_open(&mut self, buffer: BufferId, path: PathBuf) {
+        // Image preview over off-tick fs (`'imagepreview'`): when previews are on and
+        // `path` is an image, do **not** fetch the bytes — the editor never reads an
+        // image (never-freeze). Mark the target buffer as an inert preview bound to the
+        // path; the client fetches and decodes the bytes out-of-band from the path the
+        // redraw carries. Centralized here because every off-tick open/reload funnels
+        // through `enqueue_open` (`:edit`, the open kernel, `:e!`/watch reloads), so the
+        // policy can't drift between them. (The local sync path mirrors this via
+        // `read_buffer` → `Buffer::from_image_file`. Off-tick has no synchronous stat, so
+        // the disk version is left unset — the client keys its cache on the path.)
+        if self.options.imagepreview && super::is_image_path(Some(&path)) {
+            if let Some(ob) = self.buffers.map.get_mut(&buffer) {
+                let len = ob.buffer.len_bytes();
+                if len > 0 {
+                    ob.buffer.remove(0..len);
+                    ob.buffer.normalize();
+                }
+                ob.buffer.image = true;
+                ob.buffer.set_path(Some(path));
+                ob.buffer.modified = false;
+            }
+            return;
+        }
         self.pending_opens.push(PendingOpen { buffer, path });
     }
 
@@ -987,18 +1009,9 @@ impl Editor {
     /// (off-tick never fails here — the fetch's errors surface later in `apply_open`).
     fn load_new_buffer(&mut self, path: &Path) -> Option<BufferId> {
         if self.host_fs_offtick {
-            // Image preview over off-tick fs (`'imagepreview'`): mark the buffer as an
-            // inert image preview bound to `path` and enqueue **no** wire fetch — the
-            // editor never reads an image's bytes (never-freeze), and the client fetches
-            // and decodes them out-of-band from the path the redraw carries. (Locally the
-            // sync `read_buffer` path does the same via `Buffer::from_image_file`; off-tick
-            // has no synchronous stat, so the disk version is left 0 — the client keys its
-            // cache on the path.)
-            if self.options.imagepreview && super::is_image_path(Some(path)) {
-                let mut buf = Buffer::named(path.to_path_buf());
-                buf.image = true;
-                return Some(self.add_buffer(buf));
-            }
+            // Off-tick: create the empty named buffer and enqueue the fetch. (When the
+            // path is an image preview, `enqueue_open` marks the buffer inert and skips
+            // the fetch — the centralized policy for every off-tick open path.)
             let id = self.add_buffer(Buffer::named(path.to_path_buf()));
             self.enqueue_open(id, path.to_path_buf());
             Some(id)

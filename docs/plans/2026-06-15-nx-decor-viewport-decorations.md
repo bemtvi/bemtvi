@@ -255,11 +255,15 @@ Original plan for this phase:
 
 ### Phase 4 — Async, robustness, polish, wasm parity
 - Async provider test (publish from an `nx.spawn`/`nx.lsp` callback; gen gates a
-  late response). Time-debounce a scroll gesture (Decision 2) via `nx.timer`.
-  Provider-error → `E5108` loud + disable-after-N (Decision 7). `bufs` `buftype` /
-  per-buffer opt-in. Verify the **wasm / serverless** `EditHost` tick drives the
-  same loop (viewport detection is core; `run_pending` is shared — confirm both
-  `native` and `--no-default-features` build + behave). Docs + a second example
+  late response). Time-debounce a scroll gesture (Decision 2) — **reuse
+  `nx.utils.debounce`** (landed upstream 2026-06-16, `prelude/utils.lua`) rather than
+  hand-rolling the cancel-prior-timer dance over `nx.timer`; the per-window
+  coalescing in Phase 1 already collapses changes between two drains, so this only
+  needs to add a trailing delay before the provider re-runs on a fast continuous
+  scroll. Provider-error → `E5108` loud + disable-after-N (Decision 7). `bufs`
+  `buftype` / per-buffer opt-in. Verify the **wasm / serverless** `EditHost` tick
+  drives the same loop (viewport detection is core; `run_pending` is shared — confirm
+  both `native` and `--no-default-features` build + behave). Docs + a second example
   (indent-guides, gated on the extmark virt_text follow-up — shipped only if that
   lands; otherwise documented as pending, not stubbed).
 

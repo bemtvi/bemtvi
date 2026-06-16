@@ -546,6 +546,7 @@ name = "nxvim-lua"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "encoding_rs",
  "mlua",
  "nxvim-regex",
  "nxvim-ts",

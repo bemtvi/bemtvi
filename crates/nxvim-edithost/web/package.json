@@ -15,7 +15,8 @@
     "verify-treesitter": "node verify-treesitter.mjs",
     "verify-clipboard": "node verify-clipboard.mjs",
     "verify-proc": "node verify-proc.mjs",
-    "verify-terminal": "node verify-terminal.mjs"
+    "verify-terminal": "node verify-terminal.mjs",
+    "verify-luafile": "node verify-luafile.mjs"
   },
   "devDependencies": {
     "@msgpack/msgpack": "3.1.3",

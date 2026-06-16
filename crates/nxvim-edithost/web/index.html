@@ -1596,6 +1596,13 @@
       if (cmd === "wo") return true;
       return unnamed && (cmd === "w" || cmd === "wr" || cmd === "wri" || cmd === "writ" || cmd === "write");
     }
+    // Whether `<CR>` should pop the *Lua-source* picker: a bare `:luafile`/`:source`/`:luao`
+    // (no path argument — the browser has no path the user could type, the picker supplies it).
+    // The browser twin of `:luafile <file>`: pick a real local `.lua` and run it through the
+    // live effects path, so the `examples/*/init.lua` configs can be loaded without a server.
+    function luaDialogNeeded(cmd) {
+      return cmd === "luafile" || cmd === "luao" || cmd === "source" || cmd === "so";
+    }
     function focusedView() {
       const f = latest.frame;
       if (!f) return null;
@@ -1622,6 +1629,7 @@
       const cmd = (f.cmdline || "").trim();
       const verb = openDialogVerb(cmd);
       if (verb) { startOpenPicker(verb); return true; }
+      if (luaDialogNeeded(cmd)) { startLuaPicker(); return true; }
       const fw = focusedView();
       if (saveDialogNeeded(cmd, fw ? fw.unnamed : true)) { startSavePicker(fw); return true; }
       return false;
@@ -1682,6 +1690,38 @@
         bindOp(path);
         runExCommand(`w ${path}`);
       }).catch((e) => { if (e?.name !== "AbortError") flashStatus("save failed: " + (e?.message || e), "#e06c75"); });
+    }
+
+    // Pop the open picker for a `.lua` file, then run it through the live effects path
+    // (`execLuaOp`), exactly as a `:lua` chunk from the keystroke tick would — the browser
+    // twin of `:luafile <file>`. Unlike `startOpenPicker`, the file is *executed*, not opened
+    // into a buffer, and the handle is not bound (no buffer references it). This is how the
+    // `examples/*/init.lua` configs are loaded without a server; a single self-contained file
+    // (its `require`s of further modules won't resolve — the browser runtimepath is empty),
+    // and it runs *after* boot, so autocmds it registers fire only on subsequent events, not
+    // retroactively for the already-open buffer.
+    function startLuaPicker() {
+      feedOp("<Esc>"); // clear the half-typed `:luafile` command line, even on cancel
+      if (!fsApiAvailable) { pickerUnavailable("source"); return; }
+      const opts = {
+        multiple: false,
+        types: [{ description: "Lua", accept: { "text/x-lua": [".lua"] } }],
+      };
+      self.showOpenFilePicker(opts).then(async ([handle]) => {
+        const res = await realFsRead(handle); // { kind: 0, bytes } | { kind: 3, text }
+        if (res.kind !== 0 || !res.bytes) {
+          flashStatus(`source ${handle.name}: ${res.text || "read failed"}`, "#e06c75");
+          return;
+        }
+        const code = new TextDecoder().decode(res.bytes); // Lua source is UTF-8
+        // execLuaOp resolves with { frame, lines, result }; result is "ok:…" / "err:…".
+        const rendered = (await execLuaOp(code))?.result;
+        if (typeof rendered === "string" && rendered.startsWith("err:")) {
+          flashStatus(`source ${handle.name}: ${rendered.slice(4)}`, "#e06c75");
+        } else {
+          flashStatus(`sourced ${handle.name}`, "#98c379");
+        }
+      }).catch((e) => { if (e?.name !== "AbortError") flashStatus("source failed: " + (e?.message || e), "#e06c75"); });
     }
 
     // Read a bound file's real bytes for the Worker (off-tick `:e`): { kind, bytes } where

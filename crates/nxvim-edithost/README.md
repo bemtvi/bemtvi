@@ -146,6 +146,8 @@ node verify-ui.mjs           # headless-browser proof of the renderer/mouse/sele
 node verify-config.mjs       # headless-browser proof of single-file init.lua sourcing from OPFS
 node verify-daemon.mjs       # headless-browser proof of :e/:w/:e<dir> over WebTransport to a real --daemon
 node verify-connect.mjs      # headless-browser proof of runtime `:connect nxvim://…` (no ?daemon= param)
+node verify-fs.mjs           # headless-browser proof of the real local-FS picker (:eo/:wo/bare :w)
+node verify-luafile.mjs      # headless-browser proof of the Lua-source picker (:luafile/:source)
 
 # daemon mode by hand: start a daemon, then either open the page with its connect URI…
 #   cargo run -p nxvim -- --daemon --listen 127.0.0.1:8765   # prints nxvim://…?cert=…
@@ -157,6 +159,16 @@ node verify-connect.mjs      # headless-browser proof of runtime `:connect nxvim
 /init.lua` from inside the editor, or write it via the File System API) — on the next
 load the Worker sources it at startup. Options / keymaps / autocmds / user commands /
 highlights apply; `require` of further modules / plugins does not (empty runtimepath).
+
+**Trying a config without a reload:** `:luafile` (aliases `:source` / `:luao`) pops the
+native file picker for a real local `.lua` file and runs it through the live effects path
+— the browser twin of vim's `:luafile <file>`. This is the quick way to try the
+repo's `examples/*/init.lua` configs: `:luafile`, pick the example's `init.lua`, and (if
+it ships a sample) `:eo` its sample file. Because it runs *after* boot, autocmds the
+config registers fire on subsequent events, not retroactively for the already-open
+buffer; same single-file `require` caveat as the OPFS `init.lua`. Needs a
+File-System-Access-capable browser (Chrome/Edge); the picker must be triggered by the
+`<CR>` keystroke (a user gesture).
 
 `build.sh` also copies the web-tree-sitter highlighter assets into `web/vendor/`
 (generating them once in the local `treesitter/` tooling dir, which owns the pinned

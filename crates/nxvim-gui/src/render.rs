@@ -38,6 +38,7 @@ use nxvim_view::{
 };
 use winit::window::Window;
 
+use crate::images::{ImageDraw, ImageStore};
 use crate::GuiConfig;
 
 /// Fallback colors when no colorscheme resolved a style — a light grey on a
@@ -166,6 +167,11 @@ pub struct Renderer {
 
     rects: RectPipeline,
 
+    /// The image renderer for `'imagepreview'` windows: a textured-quad pipeline
+    /// and a path-keyed GPU texture cache. The GUI shares the local filesystem
+    /// (like the TUI), so it decodes the `image` marker's file itself.
+    image_store: ImageStore,
+
     /// Shaped-text cache, keyed by line *content* (text + per-span colors), not
     /// screen position — so an unchanged line is shaped once and reused across
     /// frames. Without it, every redraw reshaped every visible row from scratch
@@ -266,6 +272,7 @@ impl Renderer {
         let (cell_w, cell_h) = measure_cell(&mut font_system, family, font_size, line_height);
 
         let rects = RectPipeline::new(&device, format);
+        let image_store = ImageStore::new(&device, format, max_dim);
 
         Ok(Self {
             surface,
@@ -280,6 +287,7 @@ impl Renderer {
             viewport,
             _cache: cache,
             rects,
+            image_store,
             font_name,
             cache: HashMap::new(),
             gen: 0,
@@ -437,6 +445,17 @@ impl Renderer {
         let mut items: Vec<TextItem> = Vec::new();
         let mut overlay_quads: Vec<Quad> = Vec::new();
         let mut overlay_items: Vec<TextItem> = Vec::new();
+        let mut image_draws: Vec<ImageDraw> = Vec::new();
+        // Decode/upload every preview image *before* building the frame, so
+        // `build_window` knows decode failures the same frame and paints the
+        // `[image: …]` placeholder for them (a one-frame lag could otherwise never
+        // repaint — redraws are event-driven). Disjoint field borrows.
+        let live: Vec<&nxvim_view::ImageData> = view
+            .windows
+            .iter()
+            .filter_map(|w| w.image.as_ref())
+            .collect();
+        self.image_store.ensure(&self.device, &self.queue, &live);
         self.build_frame(
             view,
             scroll,
@@ -445,7 +464,12 @@ impl Renderer {
             &mut items,
             &mut overlay_quads,
             &mut overlay_items,
+            &mut image_draws,
         );
+        // Build this frame's textured quads from the decoded cache.
+        let (sw, sh) = (self.config.width as f32, self.config.height as f32);
+        self.image_store
+            .build_quads(&self.device, &self.queue, &image_draws, sw, sh);
         // Drop buffers for lines that scrolled/changed off-screen this frame (both
         // layers were built above, so both have marked the entries they use).
         let gen = self.gen;
@@ -516,6 +540,9 @@ impl Renderer {
             // Base layer first, then the overlay layer on top: each layer's quads
             // then its text, so an overlay background occludes the base text under it.
             self.rects.draw_base(&mut pass);
+            // Preview images sit on the base layer, over the window background and
+            // under floats/popups (the overlay layer, drawn below).
+            self.image_store.draw(&mut pass);
             self.text_renderer
                 .render(&self.atlas, &self.viewport, &mut pass)
                 .map_err(|e| anyhow::anyhow!("glyphon render: {e:?}"))?;
@@ -549,6 +576,7 @@ impl Renderer {
         items: &mut Vec<TextItem>,
         overlay_quads: &mut Vec<Quad>,
         overlay_items: &mut Vec<TextItem>,
+        image_draws: &mut Vec<ImageDraw>,
     ) {
         let (cols, total_rows) = self.grid_size();
         let cmd_row = total_rows.saturating_sub(1);
@@ -644,7 +672,7 @@ impl Renderer {
                 None => (main_x, mid_y, main_w, mid_h),
             };
             let win_scroll = if win.focused { scroll } else { None };
-            self.build_window(view, win, win_scroll, rect, quads, items);
+            self.build_window(view, win, win_scroll, rect, quads, items, image_draws);
         }
 
         // Separators between splits — thin grey lines, each offset by its region's
@@ -700,6 +728,7 @@ impl Renderer {
                 region_origin(win.region),
                 overlay_quads,
                 overlay_items,
+                image_draws,
             );
         }
 
@@ -740,6 +769,7 @@ impl Renderer {
     /// Paint one window: gutter numbers, text rows (syntax-colored), the visual
     /// selection and search highlights, its status bar, and — if focused — the
     /// cursor.
+    #[allow(clippy::too_many_arguments)]
     fn build_window(
         &mut self,
         view: &View,
@@ -748,10 +778,41 @@ impl Renderer {
         rect: (u16, u16, u16, u16),
         quads: &mut Vec<Quad>,
         items: &mut Vec<TextItem>,
+        image_draws: &mut Vec<ImageDraw>,
     ) {
         // `rect` is the window's content rect in absolute screen cells, already
         // offset by the windows-area origin (and inset past a float's border).
         let (ox, oy, wcols, wrows) = rect;
+
+        // An image-preview buffer (`'imagepreview'`): blit the picture over the
+        // whole text body and skip the gutter / text machinery entirely (the buffer
+        // is empty — there's no meaningful cursor). The store decodes/uploads the
+        // file from the marker's path; a decode failure paints a text placeholder.
+        if let Some(image) = &win.image {
+            let text_rows = wrows.saturating_sub(u16::from(win.status_visible));
+            let (px, py) = self.cell_px(ox, oy);
+            let area = (
+                px,
+                py,
+                wcols as f32 * self.cell_w,
+                text_rows as f32 * self.cell_h,
+            );
+            if self.image_store.failed(image) {
+                let msg = format!("[image: cannot read {}]", image.path);
+                let fg = style_fg(&view.normal).unwrap_or(DEFAULT_FG);
+                self.push_plain(items, &msg, (px, py), fg, self.full_bounds());
+            } else {
+                image_draws.push(ImageDraw {
+                    area,
+                    image: image.clone(),
+                });
+            }
+            if win.status_visible && (oy + wrows) as usize > 0 {
+                let srow = oy + wrows.saturating_sub(1);
+                self.build_status_row(&win.status, (ox, srow), wcols, view, quads, items);
+            }
+            return;
+        }
         // Left columns: a 2-cell diagnostic sign column (vim's `signcolumn`, when
         // this buffer has diagnostics and signs are on), then the number gutter,
         // then the text — so the text origin shifts past both. Cursor, pmenu, and
@@ -1539,6 +1600,7 @@ impl Renderer {
         origin: (u16, u16),
         quads: &mut Vec<Quad>,
         items: &mut Vec<TextItem>,
+        image_draws: &mut Vec<ImageDraw>,
     ) {
         let Some(r) = win.rect else {
             return; // a float always carries a rect
@@ -1575,7 +1637,7 @@ impl Renderer {
             }
             None => (ox, oy, r.width, r.height),
         };
-        self.build_window(view, win, None, inner, quads, items);
+        self.build_window(view, win, None, inner, quads, items, image_draws);
     }
 
     /// Paint the insert-mode completion popup over the focused window's text area:

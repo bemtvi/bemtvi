@@ -15,6 +15,15 @@
 -- supports none. So for a real picture (not a blocky approximation), run this in a
 -- graphics-capable terminal — e.g. Kitty, WezTerm, Ghostty, or iTerm2.
 --
+-- The GUI client (`nxvim-gui`) renders the picture as a true GPU texture — always
+-- crisp, no terminal protocol involved:
+--
+--     NXVIM_CONFIG=examples/image-preview \
+--       cargo run -p nxvim-gui -- examples/image-preview/sample.png
+--
+-- The picture is fit to the window (aspect-preserving, centered) and re-decoded
+-- when the file changes on disk, same as the TUI.
+--
 -- TRY IT:
 --   :e sample.png         open the image (this dir's sample) — preview appears
 --   :e some-other.jpg     any image file works

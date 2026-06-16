@@ -32,6 +32,7 @@
 //!   also binds the buffer to it). (`:wo` mirrors the `…o` open family and, unlike
 //!   `:wn`, collides with no real ex-command — vim's `:wn` is `:wnext`.)
 
+mod images;
 mod input;
 mod mouse;
 pub mod remote;

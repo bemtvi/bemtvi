@@ -2659,6 +2659,7 @@ dependencies = [
  "anyhow",
  "arboard",
  "glyphon",
+ "image",
  "nxvim-rpc",
  "nxvim-server",
  "nxvim-view",

@@ -24,6 +24,10 @@ glyphon.workspace = true
 pollster.workspace = true
 nxvim-rpc.workspace = true
 nxvim-view.workspace = true
+# Decoder for `'imagepreview'` windows: the GUI shares the local filesystem (like
+# the TUI), so it decodes the image itself and uploads it as a wgpu texture (see
+# src/images.rs). No ratatui-image here — the GUI paints pixels directly.
+image.workspace = true
 # The workspace dep is `default-features = false`, so re-enable `native`
 # explicitly — the gui's main.rs uses native-gated server items
 # (default_runtime/default_shada/ClipboardProvider). Without this the crate only

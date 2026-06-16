@@ -21,8 +21,9 @@ use crate::host::{create_dir_all_mode, get_runtime_file, glob_paths, parse_mode,
 use crate::ops::{
     BufOp, CompletePush, CompleteSetupReq, ConfirmReq, DockOp, ExtmarkOp, FeedKeysOp,
     GlobalOptionOp, HlSet, LoopOp, LspOp, OptionValue, PanelOp, PickerOpenReq, PickerPush,
-    PreviewPush, QfItem, QfSetOp, RegisterSetOp, SnippetAddReq, SnippetSetupReq, TabOp,
-    TerminalOpenReq, TsOp, UiFloatReq, UiInputReq, UiSelectReq, WindowOp,
+    PreviewPush, QfItem, QfSetOp, RegisterSetOp, SnippetAddReq, SnippetSetupReq,
+    StatuslinePublishReq, StatuslineSetupReq, TabOp, TerminalOpenReq, TsOp, UiFloatReq, UiInputReq,
+    UiSelectReq, WindowOp,
 };
 use crate::runtime::{resolve_lua_fs, Shared};
 use crate::vimregex;
@@ -429,7 +430,7 @@ pub(crate) fn install_vim(lua: &Lua, shared: &Rc<RefCell<Shared>>) -> mlua::Resu
     // event-loop actor and **stream** its stdout — each newline-delimited batch
     // fires the persistent stdout callback `nx._run_stdout(id, lines)`, and the
     // exit fires the one-shot `nx._run_cb(id, false, {code,stdout="",stderr})`.
-    // Backs `nx.spawn`'s `on_stdout`/`on_exit` (the picker's streaming sources).
+    // Backs `nx.run_stream`'s streamed stdout/`on_exit` (the picker's streaming sources).
     // No stdin (a search/list job feeds none).
     let sh = shared.clone();
     nx.set(
@@ -1461,6 +1462,44 @@ pub(crate) fn install_runtime_api(
             sh.borrow_mut().complete_resolve_dones.push((id, doc));
             Ok(())
         })?,
+    )?;
+
+    // `nx._statusline_setup(left, right)`: queue a `nx.statusline.setup{}` layout
+    // ([`StatuslineSetupReq`]) — the ordered segment names for each half. The Lua
+    // wrapper validated every name against the built-ins / registered segments.
+    let sh = shared.clone();
+    nx.set(
+        "_statusline_setup",
+        lua.create_function(move |_, (left, right): (Vec<String>, Vec<String>)| {
+            sh.borrow_mut()
+                .statusline_setups
+                .push(StatuslineSetupReq { left, right });
+            Ok(())
+        })?,
+    )?;
+    // `nx._statusline_publish(name, texts, groups)`: queue a custom segment's
+    // resolved cells ([`StatuslinePublishReq`]) — parallel `texts` / `groups`
+    // arrays (an empty group ⇒ the base `StatusLine` highlight). The server caches
+    // them by `name` and paints them until the next invalidation.
+    let sh = shared.clone();
+    nx.set(
+        "_statusline_publish",
+        lua.create_function(
+            move |_, (name, texts, groups): (String, Vec<String>, Vec<String>)| {
+                let cells = texts
+                    .into_iter()
+                    .enumerate()
+                    .map(|(i, text)| {
+                        let group = groups.get(i).filter(|g| !g.is_empty()).cloned();
+                        (text, group)
+                    })
+                    .collect();
+                sh.borrow_mut()
+                    .statusline_publishes
+                    .push(StatuslinePublishReq { name, cells });
+                Ok(())
+            },
+        )?,
     )?;
 
     // `nx._snippet_setup(next, prev)`: queue the tabstop-jump key configuration

@@ -3,7 +3,7 @@
 -- float with a prompt that grabs input; the server owns the prompt, the Rust
 -- fuzzy matcher, navigation, and the generation token, so Lua only ever sees
 -- "open", "run the source for this query" and "confirm". Sources are thin Lua
--- drivers: they stream candidates in via `push`, and handle `confirm(item)`.
+-- drivers: they stream candidates in via `ctx.push`, and handle `confirm(item)`.
 --
 -- The full item tables stay Lua-side (`nx._picker.active.items`); only a display
 -- label + an integer key cross the bridge, exactly like nx.ui.select — so an
@@ -24,10 +24,14 @@ nx._picker = nx._picker or nil
 -- the more specific wins. `0` disables the debounce (re-run on every keystroke).
 nx.picker.debounce = nx.picker.debounce or 250
 
--- nx.picker.source { name, items = function(ctx, push, done), dynamic, confirm }:
--- register a source. `items` streams candidates: it calls `push(item)` per
--- result (an item is a table with a `text` display field, plus any data the
--- `confirm` needs) and `done()` when finished. `dynamic = true` re-runs `items`
+-- nx.picker.source { name, items = function(ctx), dynamic, confirm }: register a
+-- source. `items` streams candidates: it calls `ctx.push(item)` per result (an
+-- item is a table with a `text` display field, plus any data the `confirm` needs)
+-- and signals completion by *returning* — a synchronous source just returns when
+-- its loop ends, an asynchronous one is wrapped in `nx.async` and returns the
+-- promise (the engine awaits it; nx is promise-only, so there is no `done`
+-- callback). A streaming source consumes a `nx.run_stream` with `nx.await_each`,
+-- and reaps its job on close via `ctx.on_cancel`. `dynamic = true` re-runs `items`
 -- on every prompt edit (live grep — the matcher is bypassed); the default is a
 -- static source matched locally in Rust as you type. `confirm(item)` acts on the
 -- chosen item. Optional `width` / `height` fix the box size — a cell count
@@ -256,13 +260,22 @@ function nx._picker_run(gen, query)
         nx._picker_finish(gen)
       end
     end
+    -- The source emits through `ctx.push` (the sink) and signals completion by
+    -- *returning* (a promise from nx.async, or nothing for a synchronous source) —
+    -- nx is promise-only, so there is no `done` callback passed in.
+    ctx.push = push
 
-    -- Isolate a throwing source so it can't wedge the picker — surface and settle.
-    local ok, err = pcall(p.source.items, ctx, push, done)
-    if not ok then
-      nx.notify("nx.picker: source '" .. p.source.name .. "' error: " .. tostring(err), "error")
-      done()
-    end
+    -- Drive the source's completion. nx.promise.try unifies a synchronous source
+    -- (returns nil ⇒ already done) and an async one (returns a promise that settles
+    -- when its coroutine finishes), AND folds a synchronous throw into the same
+    -- rejection path: notify on either (`:catch`), then `done()` exactly once
+    -- whichever way it goes (`:finally`) — never a wedged picker.
+    nx.promise
+      .try(p.source.items, ctx)
+      :catch(function(err)
+        nx.notify("nx.picker: source '" .. p.source.name .. "' error: " .. tostring(err), "error")
+      end)
+      :finally(done)
   end
 
   local delay = p.debounce_ms or 0
@@ -313,32 +326,28 @@ end
 -- ----- built-in sources ------------------------------------------------------
 -- Shipped defaults exercising the three source shapes; a config can register more.
 
--- files: a static source — `rg --files` streamed in, fuzzy-matched locally.
+-- files: a static source — `rg --files` streamed in, fuzzy-matched locally. An
+-- nx.async source: iterate the run_stream's batches with nx.await_each, pushing
+-- each path; returning ends the run. The stream is reaped on close via on_cancel.
 nx.picker.source({
   name = "files",
   preview = "file", -- the preview pane shows the file's head
-  items = function(ctx, push, done)
-    local handle = nx.spawn({
-      cmd = "rg",
-      args = { "--files", "--color=never" },
-      cwd = ctx.cwd,
-      on_stdout = function(lines)
-        for _, l in ipairs(lines) do
-          if l ~= "" then
-            push({ text = l, path = l })
-          end
-        end
-      end,
-      on_exit = function()
-        done()
-      end,
-    })
+  items = nx.async(function(ctx)
+    local stream =
+      nx.run_stream({ cmd = "rg", args = { "--files", "--color=never" }, cwd = ctx.cwd })
     -- Reap the `rg` job when the picker closes, so a confirmed/cancelled picker
     -- doesn't leave a process streaming paths into the void.
     ctx.on_cancel(function()
-      handle:kill()
+      stream:kill()
     end)
-  end,
+    for batch in nx.await_each(stream) do
+      for _, l in ipairs(batch) do
+        if l ~= "" then
+          ctx.push({ text = l, path = l })
+        end
+      end
+    end
+  end),
   confirm = function(item)
     nx.picker.edit(item)
   end,
@@ -350,53 +359,51 @@ nx.picker.source({
   name = "live_grep",
   dynamic = true,
   preview = "location", -- scroll the pane to the match and range-highlight it
-  items = function(ctx, push, done)
+  items = nx.async(function(ctx)
     if ctx.query == "" then
-      return done()
+      return
     end
-    local handle = nx.spawn({
+    local stream = nx.run_stream({
       cmd = "rg",
       args = { "--vimgrep", "--color=never", "--", ctx.query },
       cwd = ctx.cwd,
-      on_stdout = function(lines)
-        for _, l in ipairs(lines) do
-          -- file:line:col:text
-          local file, lnum, col = l:match("^(.-):(%d+):(%d+):")
-          if file then
-            push({ text = l, path = file, row = tonumber(lnum), col = tonumber(col) })
-          end
-        end
-      end,
-      on_exit = function()
-        done()
-      end,
     })
     ctx.on_cancel(function()
-      handle:kill()
+      stream:kill()
     end)
-  end,
+    for batch in nx.await_each(stream) do
+      for _, l in ipairs(batch) do
+        -- file:line:col:text
+        local file, lnum, col = l:match("^(.-):(%d+):(%d+):")
+        if file then
+          ctx.push({ text = l, path = file, row = tonumber(lnum), col = tonumber(col) })
+        end
+      end
+    end
+  end),
   confirm = function(item)
     nx.picker.edit(item)
   end,
 })
 
--- buffers: a static, in-memory source — every open buffer, no process spawn.
--- Names come from the authoritative buffer mirror (`nx._bufs`); `nx.buf.name`
--- short-circuits the *current* buffer to a separately-tracked field that can lag,
--- so reading the mirror lists every named buffer including the focused one.
+-- buffers: a static, in-memory source — every open buffer, no process spawn. A
+-- plain synchronous source: it pushes in a loop and returns (no promise needed —
+-- returning nil settles the run). Names come from the authoritative buffer mirror
+-- (`nx._bufs`); `nx.buf.name` short-circuits the *current* buffer to a separately-
+-- tracked field that can lag, so reading the mirror lists every named buffer
+-- including the focused one.
 nx.picker.source({
   name = "buffers",
   preview = "file", -- preview the buffer's backing file (named buffers only)
-  items = function(_ctx, push, done)
+  items = function(ctx)
     local bufs = nx._bufs or {}
     for _, b in ipairs(nx.buf.list()) do
       local entry = bufs[b]
       local name = (entry and entry.name) or nx.buf.name(b)
       if name and name ~= "" then
-        push({ text = name, bufnr = b, path = name })
+        ctx.push({ text = name, bufnr = b, path = name })
       end
     end
-    done()
   end,
   confirm = function(item)
     vim.cmd("buffer " .. item.bufnr)

@@ -476,6 +476,20 @@ impl EditHost {
         statusline_fmt: &str,
         styles: &mut StyleTable,
     ) -> Value {
+        // The `nx.statusline.setup{}` segment layout, when active, takes precedence
+        // over the `'statusline'` `%`-format. Built-in segments resolve here from
+        // `ctx` (with diagnostics filled in); custom segments come from the cache
+        // the Lua publishes populate — no per-frame Lua (ADR 0002 rule 4).
+        if let Some(spec) = &self.statusline_layout {
+            let mut seg_ctx = ctx.clone();
+            seg_ctx.diag_counts =
+                self.statusline_diag_counts(nxvim_core::BufferId(ctx.bufnr as u64));
+            let cache = &self.statusline_cache;
+            let custom = |name: &str| cache.get(name).cloned();
+            let segments = statusline::compose_segments(spec, &seg_ctx, mode_label, width, &custom);
+            return self.project_status_segments(&segments, styles);
+        }
+
         let default;
         let fmt = if statusline_fmt.is_empty() {
             default = default_statusline(mode_label, &ctx.fileencoding, ctx.bomb);
@@ -494,7 +508,19 @@ impl EditHost {
         let mut eval = |_kind: ExprKind, raw: &str| self.eval_statusline_expr(raw, ctx);
         let pieces = statusline::expand(&items, ctx, &mut eval);
         let segments = statusline::layout(&pieces, width);
+        self.project_status_segments(&segments, styles)
+    }
 
+    /// Project resolved [`StatusSegment`](nxvim_core::statusline::StatusSegment)s
+    /// into the `status` array clients paint: `{ text, style }` per run, the
+    /// highlight group resolved to a style-palette id (`Nil` when it has none /
+    /// the colorscheme leaves it undefined). Shared by the `%`-format and the
+    /// `nx.statusline` segment paths.
+    fn project_status_segments(
+        &self,
+        segments: &[nxvim_core::statusline::StatusSegment],
+        styles: &mut StyleTable,
+    ) -> Value {
         Value::Array(
             segments
                 .iter()
@@ -509,6 +535,18 @@ impl EditHost {
                 })
                 .collect(),
         )
+    }
+
+    /// Diagnostic counts `[error, warn, info, hint]` for the `diagnostics`
+    /// statusline segment. Native delegates to the LSP store; the wasm edit-host
+    /// has no language servers, so it is always zero there.
+    #[cfg(feature = "native")]
+    fn statusline_diag_counts(&self, buffer: nxvim_core::BufferId) -> [usize; 4] {
+        self.diag_counts_for(buffer)
+    }
+    #[cfg(not(feature = "native"))]
+    fn statusline_diag_counts(&self, _buffer: nxvim_core::BufferId) -> [usize; 4] {
+        [0; 4]
     }
 
     /// Evaluate one `%{}`/`%!` statusline expression against the window's

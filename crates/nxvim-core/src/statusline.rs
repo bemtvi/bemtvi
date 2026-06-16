@@ -150,6 +150,11 @@ pub struct StatuslineCtx {
     pub top_line: usize,
     /// Number of visible text rows in the window (`%P`).
     pub text_height: usize,
+    /// Diagnostic counts for the window's buffer, by severity
+    /// `[error, warn, info, hint]`. Read by the `diagnostics` built-in
+    /// [segment](compose_segments); zero on builds without an LSP (the browser
+    /// edit-host) and on the `%`-format path (which has no `%`-letter for them).
+    pub diag_counts: [usize; 4],
 }
 
 /// The output of [`expand`]: resolved text carrying its active highlight group,
@@ -769,6 +774,161 @@ fn coalesce(chars: Vec<Cell>) -> Vec<StatusSegment> {
     segments
 }
 
+// ---------------------------------------------------------------------------
+// Segment composition — the `nx.statusline` (lualine-shaped) surface.
+//
+// The `%`-format engine above is one way to drive the status line. The other is
+// a declarative list of named *segments* (`nx.statusline.setup{ left=…, right=…
+// }`). A segment resolves to a list of [`StatusSegment`] cells; built-in
+// segments resolve here in core from the [`StatuslineCtx`] every frame (pure,
+// cheap, per-window), while custom Lua segments are resolved by the server and
+// passed in through the `custom` lookup (re-run only on their declared events,
+// never per frame — see docs/specs/2026-06-11-native-plugin-api.md §2).
+//
+// Both paths converge on the same [`layout`] → [`StatusSegment`] output, so the
+// server projection and every client paint are shared verbatim.
+// ---------------------------------------------------------------------------
+
+/// The declarative segment layout from `nx.statusline.setup{}`: ordered segment
+/// *names* for the left and right halves (`%=` sits between them).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SegmentLayout {
+    pub left: Vec<String>,
+    pub right: Vec<String>,
+}
+
+/// Resolve one **built-in** segment to its cells from the [`StatuslineCtx`].
+///
+/// Returns `Some(cells)` for a known built-in — including `Some(vec![])` when a
+/// known segment has nothing to show right now (e.g. `filetype` with no
+/// filetype set), so it simply contributes nothing — and `None` when `name` is
+/// not a built-in at all (the caller then falls through to a custom segment, and
+/// errors loudly if it is unknown everywhere).
+pub fn builtin_segment(
+    name: &str,
+    ctx: &StatuslineCtx,
+    mode_label: &str,
+) -> Option<Vec<StatusSegment>> {
+    let one = |text: String, group: Option<&str>| {
+        if text.is_empty() {
+            Vec::new()
+        } else {
+            vec![StatusSegment {
+                text,
+                group: group.map(str::to_string),
+            }]
+        }
+    };
+    Some(match name {
+        "mode" => one(mode_label.to_string(), Some("StatusLineMode")),
+        "filename" => one(
+            if ctx.file_tail.is_empty() {
+                "[No Name]".to_string()
+            } else {
+                ctx.file_tail.clone()
+            },
+            None,
+        ),
+        "filepath" => one(
+            if ctx.file_rel.is_empty() {
+                "[No Name]".to_string()
+            } else {
+                ctx.file_rel.clone()
+            },
+            None,
+        ),
+        "filetype" => one(ctx.filetype.clone(), None),
+        "encoding" => one(ctx.fileencoding.clone(), None),
+        "location" => one(format!("{}:{}", ctx.line, ctx.col), None),
+        "modified" => one(modified_flag(ctx, "[+]", "[-]"), Some("StatusLineModified")),
+        "readonly" => one(if ctx.readonly { "[RO]" } else { "" }.to_string(), None),
+        "diagnostics" => diagnostics_cells(ctx),
+        _ => return None,
+    })
+}
+
+/// The `diagnostics` built-in: one cell per non-zero severity, in
+/// error→warn→info→hint order, each in its `Diagnostic{Error,Warn,Info,Hint}`
+/// highlight group. Empty when the buffer is clean.
+fn diagnostics_cells(ctx: &StatuslineCtx) -> Vec<StatusSegment> {
+    const SEV: [(&str, &str); 4] = [
+        ("E", "DiagnosticError"),
+        ("W", "DiagnosticWarn"),
+        ("I", "DiagnosticInfo"),
+        ("H", "DiagnosticHint"),
+    ];
+    let mut cells = Vec::new();
+    for (i, (sigil, group)) in SEV.iter().enumerate() {
+        let n = ctx.diag_counts[i];
+        if n > 0 {
+            let sep = if cells.is_empty() { "" } else { " " };
+            cells.push(StatusSegment {
+                text: format!("{sep}{sigil}{n}"),
+                group: Some((*group).to_string()),
+            });
+        }
+    }
+    cells
+}
+
+/// Compose a `nx.statusline` [`SegmentLayout`] into the final [`StatusSegment`]s
+/// for a status line `width` cells wide.
+///
+/// Each name resolves built-in first ([`builtin_segment`]), else through
+/// `custom` (the server's cache of Lua-published segment cells). A name found in
+/// neither renders a visible `E:<name>` cell — loud, never a silent blank, per
+/// the no-stub rule. Non-empty segments on the same side are separated by a
+/// single space, and a `%=`-style [`Piece::Align`] sits between the two halves,
+/// so the existing [`layout`] handles fill and truncation.
+pub fn compose_segments(
+    spec: &SegmentLayout,
+    ctx: &StatuslineCtx,
+    mode_label: &str,
+    width: usize,
+    custom: &dyn Fn(&str) -> Option<Vec<StatusSegment>>,
+) -> Vec<StatusSegment> {
+    let mut pieces: Vec<Piece> = Vec::new();
+    push_side(&spec.left, ctx, mode_label, custom, &mut pieces);
+    pieces.push(Piece::Align);
+    push_side(&spec.right, ctx, mode_label, custom, &mut pieces);
+    layout(&pieces, width)
+}
+
+/// Append one side's resolved segments to `pieces`, space-separated, skipping
+/// the empties so they leave no stray separator.
+fn push_side(
+    names: &[String],
+    ctx: &StatuslineCtx,
+    mode_label: &str,
+    custom: &dyn Fn(&str) -> Option<Vec<StatusSegment>>,
+    pieces: &mut Vec<Piece>,
+) {
+    let mut wrote = false;
+    for name in names {
+        let cells = builtin_segment(name, ctx, mode_label)
+            .or_else(|| custom(name))
+            .unwrap_or_else(|| {
+                vec![StatusSegment {
+                    text: format!("E:{name}"),
+                    group: Some("ErrorMsg".to_string()),
+                }]
+            });
+        if cells.iter().all(|c| c.text.is_empty()) {
+            continue;
+        }
+        // A single space between adjacent non-empty segments (and a leading one,
+        // so the bar doesn't butt against the edge).
+        push_text(pieces, " ".to_string(), None);
+        for cell in cells {
+            push_text(pieces, cell.text, cell.group);
+        }
+        wrote = true;
+    }
+    if wrote {
+        push_text(pieces, " ".to_string(), None);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     //! Every expected value here is **ground truth captured from real neovim**,
@@ -802,6 +962,7 @@ mod tests {
             virtcol: 3,
             top_line: 1,
             text_height: 5,
+            diag_counts: [0; 4],
         }
     }
 

@@ -276,6 +276,166 @@ async fn statusline_unknown_option_errors_loudly() {
     assert!(text.contains("shiftwidth"), "names the option: {text:?}");
 }
 
+// ----- `nx.statusline` — the declarative segment registry (lualine shape) -----
+//
+// A `nx.statusline.setup{}` layout composes named segments into the same `status`
+// array the `%`-format path projects. Built-ins resolve natively each frame;
+// custom segments publish their cells on (re)render and the server caches them.
+
+#[tokio::test]
+async fn nx_statusline_builtins_compose() {
+    let (rpc, mut incoming) = start(None).await;
+    // Built-in segments resolve from the window's status context: `mode` on the
+    // left, `filename`, and `location` pushed to the right past the `%=` fill.
+    exec_lua(
+        &rpc,
+        r#"nx.statusline.setup{ left = { "mode", "filename" }, right = { "location" } }"#,
+    )
+    .await;
+    let map = redraw_after(&rpc, &mut incoming, "<Esc>").await;
+    let text = status_text(&map);
+    assert!(text.contains("NORMAL"), "mode segment: {text:?}");
+    assert!(text.contains("[No Name]"), "filename segment: {text:?}");
+    assert!(
+        text.trim_end().ends_with("1:1"),
+        "location pushed right: {text:?}"
+    );
+}
+
+#[tokio::test]
+async fn nx_statusline_layout_overrides_statusline_format() {
+    let (rpc, mut incoming) = start(None).await;
+    // While a segment layout is active it takes precedence over `'statusline'`.
+    feed(&rpc, ":set statusline=ZZZ<CR>");
+    exec_lua(
+        &rpc,
+        r#"nx.statusline.setup{ left = { "filename" }, right = {} }"#,
+    )
+    .await;
+    let map = redraw_after(&rpc, &mut incoming, "<Esc>").await;
+    let text = status_text(&map);
+    assert!(!text.contains("ZZZ"), "the format is overridden: {text:?}");
+    assert!(text.contains("[No Name]"), "segments render: {text:?}");
+}
+
+#[tokio::test]
+async fn nx_statusline_custom_segment_renders_published_cells() {
+    let (rpc, mut incoming) = start(None).await;
+    // A custom segment's returned cells reach the bar, each carrying its `hl`
+    // resolved to a style-palette id.
+    exec_lua(
+        &rpc,
+        r#"
+        vim.api.nvim_set_hl(0, 'StatusGit', { fg = '#ff8800' })
+        nx.statusline.segment{
+          name = 'git',
+          render = function() return { { text = ' main', hl = 'StatusGit' } } end,
+        }
+        nx.statusline.setup{ left = { 'git' }, right = {} }
+        "#,
+    )
+    .await;
+    let map = redraw_after(&rpc, &mut incoming, "<Esc>").await;
+    let segs = status_segments(&map);
+    let git = segs
+        .iter()
+        .find(|(t, _)| t.contains("main"))
+        .unwrap_or_else(|| panic!("git segment present: {segs:?}"));
+    assert!(
+        git.1.is_some(),
+        "the custom cell carries its StatusGit style: {segs:?}"
+    );
+}
+
+#[tokio::test]
+async fn nx_statusline_invalidate_repaints_segment() {
+    let (rpc, mut incoming) = start(None).await;
+    // The async pattern: a segment reads cached data; `invalidate` re-runs its
+    // render so the new value reaches the next paint.
+    exec_lua(
+        &rpc,
+        r#"
+        _G.branch = 'one'
+        nx.statusline.segment{ name = 'git', render = function() return { { text = _G.branch } } end }
+        nx.statusline.setup{ left = { 'git' }, right = {} }
+        "#,
+    )
+    .await;
+    let map = redraw_after(&rpc, &mut incoming, "<Esc>").await;
+    assert!(
+        status_text(&map).contains("one"),
+        "initial render: {:?}",
+        status_text(&map)
+    );
+
+    exec_lua(
+        &rpc,
+        r#"_G.branch = 'two'; nx.statusline.invalidate('git')"#,
+    )
+    .await;
+    let map = redraw_after(&rpc, &mut incoming, "<Esc>").await;
+    let text = status_text(&map);
+    assert!(text.contains("two"), "invalidate re-rendered: {text:?}");
+    assert!(!text.contains("one"), "the stale value is gone: {text:?}");
+}
+
+#[tokio::test]
+async fn nx_statusline_event_rerenders_on_declared_event() {
+    // A segment declaring `events = { 'BufEnter' }` is re-rendered whenever that
+    // autocmd fires — no explicit invalidate needed. We switch to a second buffer
+    // to fire BufEnter (`:enew` reuses the empty one, so its id never changes).
+    let dir = temp_dir("nx_stl_evt");
+    let a = dir.join("a.txt");
+    let b = dir.join("b.txt");
+    std::fs::write(&a, "a\n").expect("write a");
+    std::fs::write(&b, "b\n").expect("write b");
+    let (rpc, mut incoming) = start(Some(a.to_str().unwrap().to_string())).await;
+    exec_lua(
+        &rpc,
+        r#"
+        _G.renders = 0
+        nx.statusline.segment{
+          name = 'counter', events = { 'BufEnter' },
+          render = function() _G.renders = _G.renders + 1; return { { text = 'r' .. _G.renders } } end,
+        }
+        nx.statusline.setup{ left = { 'counter' }, right = {} }
+        "#,
+    )
+    .await;
+    let map = redraw_after(&rpc, &mut incoming, "<Esc>").await;
+    assert!(
+        status_text(&map).contains("r1"),
+        "rendered once at setup: {:?}",
+        status_text(&map)
+    );
+
+    // Editing b.txt enters a different buffer → BufEnter → the counter re-renders.
+    let map = redraw_after(&rpc, &mut incoming, &format!(":edit {}<CR>", b.display())).await;
+    let text = status_text(&map);
+    assert!(
+        text.contains("r2"),
+        "BufEnter re-rendered the segment: {text:?}"
+    );
+}
+
+#[tokio::test]
+async fn nx_statusline_unknown_segment_errors_loudly() {
+    let (rpc, _incoming) = start(None).await;
+    // An unknown segment name is a hard error at setup (no silent blank) — the
+    // same no-stub rule the completion source list enforces.
+    let res = exec_lua(
+        &rpc,
+        r#"
+        local ok, err = pcall(function() nx.statusline.setup{ left = { 'nonesuch' } } end)
+        return ok and 'no-error' or tostring(err)
+        "#,
+    )
+    .await;
+    let s = res.as_str().unwrap_or("");
+    assert!(s.contains("unknown segment"), "loud error: {s:?}");
+    assert!(s.contains("nonesuch"), "names the segment: {s:?}");
+}
+
 // ----- laststatus (per-window status visibility + global status, Phase 6) -----
 //
 // `'laststatus'` decides where status lines go: `0` never, `1` only with ≥2
@@ -670,5 +830,33 @@ async fn statusline_example_config_runs() {
     assert!(
         !text.contains("[bom]"),
         "no bom tag when 'bomb' is off: {text:?}"
+    );
+}
+
+/// The shipped `examples/nx-statusline/` config sources cleanly and drives the
+/// segment registry: built-ins (mode / filename / location) compose onto the bar,
+/// and the explicit-invalidate custom `moves` segment renders its initial value.
+/// (No git repo in the temp dir, so the async `git` segment stays empty — fine.)
+#[tokio::test]
+async fn nx_statusline_example_config_runs() {
+    let dir = temp_dir("nx-statusline-ex");
+    let init = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../examples/nx-statusline/init.lua"
+    ))
+    .expect("read example init.lua");
+    let (rpc, mut incoming) = start_with_config(&dir, &init).await;
+
+    let msg = startup_message(&rpc, &mut incoming).await;
+    assert!(!msg.contains("Error"), "example left an error: {msg:?}");
+
+    let map = redraw_after(&rpc, &mut incoming, "<Esc>").await;
+    let text = status_text(&map);
+    assert!(text.contains("NORMAL"), "mode built-in: {text:?}");
+    assert!(text.contains("[No Name]"), "filename built-in: {text:?}");
+    assert!(text.contains("moves:"), "custom moves segment: {text:?}");
+    assert!(
+        text.trim_end().ends_with("1:1"),
+        "location on right: {text:?}"
     );
 }

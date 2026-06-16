@@ -19,8 +19,8 @@ use crate::ops::{
     BufOp, CallbackArgs, CompletePush, CompleteSetupReq, ConfirmReq, DiagnosticData, DockOp,
     ExtmarkOp, FeedKeysOp, GlobalOptionOp, HlSet, InlayHintMirrorData, LoopOp, LspClientData,
     LspOp, PanelOp, PickerOpenReq, PickerPush, QfSetOp, RawKeymap, RawRhs, RegisterSetOp,
-    SemanticTokenData, SnippetAddReq, SnippetSetupReq, TabOp, TerminalOpenReq, TsOp, UiFloatReq,
-    UiInputReq, UiSelectReq, WindowOp,
+    SemanticTokenData, SnippetAddReq, SnippetSetupReq, StatuslinePublishReq, StatuslineSetupReq,
+    TabOp, TerminalOpenReq, TsOp, UiFloatReq, UiInputReq, UiSelectReq, WindowOp,
 };
 
 /// `skip_serializing_if` predicate: drop a `false` flag from the serialized
@@ -343,6 +343,9 @@ const PRELUDE_MODULES: &[(&str, &str)] = &[
     // nx.promise / nx.async — Promises/A+ over the microtask (nx.schedule) and
     // timer (nx.timer) primitives installed just above.
     ("nxvim:prelude/promise", include_str!("prelude/promise.lua")),
+    // nx.run / nx.run_stream / nx.await_each: promise-only process API (replaces the
+    // callback-shaped nx.spawn). After promise.lua (builds on nx.promise/async).
+    ("nxvim:prelude/process", include_str!("prelude/process.lua")),
     // nx.utils: the general helper namespace (nx.utils.debounce, …) — may build on
     // the timer and promise surfaces loaded just above.
     ("nxvim:prelude/utils", include_str!("prelude/utils.lua")),
@@ -355,6 +358,12 @@ const PRELUDE_MODULES: &[(&str, &str)] = &[
     ),
     // nx.snippet: the native snippet engine (tabstop session + snippets source).
     ("nxvim:prelude/snippet", include_str!("prelude/snippet.lua")),
+    // nx.statusline: the declarative segment registry (lualine shape). Loads after
+    // autocmd (it registers invalidation autocmds) and picker/complete.
+    (
+        "nxvim:prelude/statusline",
+        include_str!("prelude/statusline.lua"),
+    ),
     // nx.decor: viewport-scoped decoration providers (the registry + off-tick
     // dispatch; needs nx.ns from api and nx.notify from runtime, both above).
     ("nxvim:prelude/decor", include_str!("prelude/decor.lua")),
@@ -459,6 +468,12 @@ pub(crate) struct Shared {
     /// selected row; the source's `resolve` callback responded, and this carries the
     /// docs back to the server's resolve cache for the sidebar. Phase 4-E.
     pub(crate) complete_resolve_dones: Vec<(u64, String)>,
+    /// `nx.statusline.setup{}` segment layouts, drained by the server into its
+    /// active `SegmentLayout` (which takes precedence over `'statusline'`).
+    pub(crate) statusline_setups: Vec<StatuslineSetupReq>,
+    /// Published custom-segment cells (`nx._statusline_publish`), drained by the
+    /// server into its per-name statusline-segment cell cache.
+    pub(crate) statusline_publishes: Vec<StatuslinePublishReq>,
     /// `nx.snippet.setup{}` jump-key configurations, drained by the server into
     /// `Editor::set_snippet_keys`.
     pub(crate) snippet_setups: Vec<SnippetSetupReq>,
@@ -932,6 +947,18 @@ impl LuaRuntime {
     }
 
     take_queue! {
+        /// Take the `nx.statusline.setup{}` segment layouts queued since the last
+        /// drain, for the server to install as the active status line.
+        take_statusline_setups -> Vec<StatuslineSetupReq> = statusline_setups
+    }
+
+    take_queue! {
+        /// Take the custom statusline-segment cell publishes queued since the last
+        /// drain, for the server to fold into its per-name segment cache.
+        take_statusline_publishes -> Vec<StatuslinePublishReq> = statusline_publishes
+    }
+
+    take_queue! {
         /// Take the `nx.snippet.setup{}` jump-key configs queued since the last drain.
         take_snippet_setups -> Vec<SnippetSetupReq> = snippet_setups
     }
@@ -1178,7 +1205,7 @@ impl LuaRuntime {
     /// and appended the `2>&1` stderr merge) and, on exit, parse its combined output
     /// against `efm` into the quickfix list, then open the window / jump to the first
     /// error per `open` / `jump`. The spawn rides the same job machinery as
-    /// `nx.spawn`; the caller drains the resulting effects.
+    /// `nx.run`/`nx.run_stream`; the caller drains the resulting effects.
     pub fn run_qf_make(
         &self,
         cmd: &str,

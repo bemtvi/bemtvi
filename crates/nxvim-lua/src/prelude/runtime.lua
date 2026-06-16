@@ -117,56 +117,19 @@ function nx._set_proc_pid(id, pid)
   nx._proc_pids[id] = pid
 end
 
--- Streaming-stdout registry for nx.spawn handles. Unlike nx._cb_fns (one-shot),
--- an on_stdout fires repeatedly — once per newline-delimited batch the child
--- emits — so its function persists here, keyed by the spawn's callback id, and is
--- dropped only when the child exits (the exit dispatcher clears it). The server
--- calls nx._run_stdout(id, lines) per ProcessStdout event; a nil entry (no
--- on_stdout, or already exited) is a silent no-op.
+-- Streaming-stdout registry for streaming-child handles (`nx.run_stream`, defined
+-- in prelude/process.lua). Unlike nx._cb_fns (one-shot), an on_stdout fires
+-- repeatedly — once per newline-delimited batch the child emits — so its function
+-- persists here, keyed by the spawn's callback id, and is dropped only when the
+-- child exits (the exit dispatcher clears it). The server calls
+-- nx._run_stdout(id, lines) per ProcessStdout event; a nil entry (no handler, or
+-- already exited) is a silent no-op.
 nx._stdout_fns = nx._stdout_fns or {}
 function nx._run_stdout(id, lines)
   local fn = nx._stdout_fns[id]
   if fn then
     return fn(lines)
   end
-end
-
--- nx.spawn { cmd, args, cwd, env, on_stdout, on_exit }: spawn a child and STREAM
--- its stdout. Each newline-delimited batch fires `on_stdout(lines)` (a list of
--- strings) as it arrives; `on_exit(result)` fires once when the child exits
--- (`result = { code, stdout = "", stderr }` — stdout already streamed). Returns a
--- handle with `:kill()`. The streaming twin of `vim.system` (which delivers stdout
--- once, on exit). `cmd` is a string or argv list; `args` is appended.
-function nx.spawn(opts)
-  local cmd = opts.cmd
-  if type(cmd) == "string" then
-    cmd = { cmd }
-  end
-  local argv = {}
-  for _, c in ipairs(cmd) do
-    argv[#argv + 1] = c
-  end
-  for _, a in ipairs(opts.args or {}) do
-    argv[#argv + 1] = a
-  end
-  local id = nx._next_cb_id()
-  if opts.on_stdout then
-    nx._stdout_fns[id] = opts.on_stdout
-  end
-  -- One-shot exit dispatcher: clear the persistent on_stdout, then fire on_exit.
-  nx._cb_fns[id] = function(result)
-    nx._stdout_fns[id] = nil
-    if opts.on_exit then
-      opts.on_exit(result)
-    end
-  end
-  nx._spawn_stream(id, argv, opts.cwd, opts.env)
-  return {
-    _id = id,
-    kill = function()
-      nx._system_kill(id)
-    end,
-  }
 end
 
 function nx.notify(msg, _level, _opts)

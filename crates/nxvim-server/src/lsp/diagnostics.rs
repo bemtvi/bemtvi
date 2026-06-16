@@ -44,6 +44,22 @@ impl EditHost {
     /// `styles` palette when the matching `DiagnosticUnderline*` group resolves
     /// through the registry (`Nil` otherwise, so the client falls back to a
     /// built-in severity color).
+    /// Diagnostic counts for `buffer` by severity `[error, warn, info, hint]`,
+    /// for the `diagnostics` statusline segment. Zero across the board when the
+    /// buffer has no language server / no diagnostics.
+    pub(crate) fn diag_counts_for(&self, buffer: nxvim_core::BufferId) -> [usize; 4] {
+        let mut counts = [0usize; 4];
+        if let Some((diags, _)) = self.diagnostics_of(buffer) {
+            for d in diags {
+                let sev = super::severity_code(d.severity); // 1=error … 4=hint
+                if (1..=4).contains(&sev) {
+                    counts[(sev - 1) as usize] += 1;
+                }
+            }
+        }
+        counts
+    }
+
     pub(crate) fn diagnostics_for(
         &self,
         buffer: nxvim_core::BufferId,

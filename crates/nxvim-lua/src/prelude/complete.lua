@@ -14,7 +14,7 @@
 
 nx.complete = nx.complete or {}
 -- Registered async sources (`nx.complete.source{}`), keyed by name. Each is a
--- `{ name, complete = function(ctx, push, done), debounce }` spec; `setup{}`
+-- `{ name, complete = function(ctx) -> promise?, debounce }` spec; `setup{}`
 -- selects which become active.
 nx.complete._sources = nx.complete._sources or {}
 
@@ -203,11 +203,13 @@ function nx.complete.trigger()
   nx._complete_trigger()
 end
 
--- nx.complete.source { name, complete = function(ctx, push, done)[, debounce] }:
--- register an **async** completion source. `complete` streams candidates for the
--- prefix in `ctx` ({ prefix, buf, row, col }): it calls `push(item)` per result —
--- a string (used as both the menu label and the inserted text) or a table
--- { text = <label>, insert = <applied on accept> } — and `done()` when finished.
+-- nx.complete.source { name, complete = function(ctx)[, debounce] }: register an
+-- **async** completion source. `complete` streams candidates for the prefix in
+-- `ctx` ({ prefix, buf, row, col }): it calls `ctx.push(item)` per result — a
+-- string (used as both the menu label and the inserted text) or a table
+-- { text = <label>, insert = <applied on accept> } — and signals completion by
+-- *returning* (an `nx.async` source returns its promise; a synchronous one just
+-- returns — nx is promise-only, so there is no `done` callback).
 -- The source runs off the input path (debounced by `debounce` ms, default
 -- `nx.complete.debounce`), and its results are generation-gated: a reply for a
 -- prefix the user has typed past is dropped. Register a `ctx.on_cancel(fn)` reaper
@@ -217,10 +219,10 @@ end
 -- `trigger = { chars = { ":" } }` (optional) gates the source: the engine wakes it
 -- only when the completion prefix leads with one of those chars (the emoji shape),
 -- folding the char into the prefix so the source matches `:smi` and accept replaces
--- from the `:`. `resolve = function(item, respond)` (optional) supplies docs lazily:
--- push an item with no `doc`, and when the user selects it the engine calls
--- `resolve(item, respond)`; `respond(item)` (or `respond(doc_string)`) fills the
--- docs sidebar. Use it when computing docs up front for every candidate is wasteful.
+-- from the `:`. `resolve = function(item)` (optional) supplies docs lazily: push an
+-- item with no `doc`, and when the user selects it the engine calls `resolve(item)`,
+-- which returns a PROMISE of the docs — a doc string, or an item whose `.doc` is
+-- used. Use it when computing docs up front for every candidate is wasteful.
 function nx.complete.source(spec)
   if type(spec) ~= "table" or type(spec.name) ~= "string" then
     error("nx.complete.source: requires a { name = <string>, complete = <fn> } table", 2)
@@ -305,9 +307,10 @@ end
 -- nx._complete_run(gen, ctx): dispatch the active async sources whose trigger gate
 -- the prefix satisfies, under `gen`. Called by the server once per trigger that has
 -- an async source. Each source is debounced (a new prefix cancels the in-flight run
--- and any pending timer); its `push`es land via `nx._complete_push`, and when ALL
--- dispatched sources for this gen have called `done()`, a single
--- `nx._complete_finish(gen)` lets the server close a confirmed-empty popup.
+-- and any pending timer); its `ctx.push`es land via `nx._complete_push`, and when
+-- ALL dispatched sources for this gen have settled (their returned promise resolves,
+-- or they returned synchronously), a single `nx._complete_finish(gen)` lets the
+-- server close a confirmed-empty popup.
 function nx._complete_run(gen, ctx)
   local c = nx._complete
   if not c or #c.sources == 0 then
@@ -401,20 +404,23 @@ function nx._complete_run(gen, ctx)
           flush()
         end
       end
-      local done_called = false
-      local function done()
-        if done_called then
-          return
-        end
-        done_called = true
-        flush()
-        finish_one()
-      end
-      local ok, err = pcall(source.complete, run_ctx, push, done)
-      if not ok then
-        nx.notify("nx.complete: source '" .. source.name .. "' error: " .. tostring(err), "error")
-        done()
-      end
+      -- The source emits through `run_ctx.push` (the sink) and signals completion
+      -- by *returning* — a promise (nx.async) or nothing (synchronous). nx is
+      -- promise-only, so there is no `done` callback passed in.
+      run_ctx.push = push
+      -- `finish_one` is owed exactly once per dispatched source. nx.promise.try
+      -- folds a synchronous throw and an async rejection into one chain: notify on
+      -- either (`:catch`), then settle exactly once whichever way it goes
+      -- (`:finally`).
+      nx.promise
+        .try(source.complete, run_ctx)
+        :catch(function(err)
+          nx.notify("nx.complete: source '" .. source.name .. "' error: " .. tostring(err), "error")
+        end)
+        :finally(function()
+          flush()
+          finish_one()
+        end)
     end
 
     local delay = source.debounce
@@ -432,9 +438,9 @@ end
 -- nx._complete_resolve(id): the server asks the plugin source that produced
 -- resolve-handle `id` to fetch its lazy docs (the selected row carried a `resolve`
 -- callback but no inline `doc`). Look the `(resolve, item)` up, invoke
--- `resolve(item, respond)`, and route `respond`'s docs back to the server via
--- `nx._complete_resolve_done(id, doc)`. `respond` accepts the resolved item (its
--- `.doc` is used) or a bare doc string. A no-op for an unknown / stale id (the run
+-- `resolve(item)` — which returns a PROMISE of the docs (a doc string, or an item
+-- whose `.doc` is used) — and route the resolved docs back to the server via
+-- `nx._complete_resolve_done(id, doc)`. A no-op for an unknown / stale id (the run
 -- that produced it was superseded). Phase 4-E.
 function nx._complete_resolve(id)
   local c = nx._complete
@@ -442,12 +448,7 @@ function nx._complete_resolve(id)
   if not entry then
     return
   end
-  local responded = false
-  local function respond(resolved)
-    if responded then
-      return
-    end
-    responded = true
+  local function deliver(resolved)
     local doc
     if type(resolved) == "table" then
       doc = resolved.doc
@@ -456,10 +457,13 @@ function nx._complete_resolve(id)
     end
     nx._complete_resolve_done(id, doc or "")
   end
-  local ok, err = pcall(entry.resolve, entry.item, respond)
-  if not ok then
+  -- `deliver` is the success action (not a finally), so a throw inside it must NOT
+  -- re-trigger the rejection path — `:next(deliver, on_err)` attaches the error
+  -- handler to the source promise, not to deliver's result. nx.promise.try folds a
+  -- synchronous throw from `resolve` into that same rejection path.
+  nx.promise.try(entry.resolve, entry.item):next(deliver, function(err)
     nx.notify("nx.complete: resolve error: " .. tostring(err), "error")
     -- Stamp it resolved-but-docless so the server never re-fires for this row.
     nx._complete_resolve_done(id, "")
-  end
+  end)
 end

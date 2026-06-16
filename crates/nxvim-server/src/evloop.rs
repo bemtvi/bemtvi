@@ -54,7 +54,7 @@ pub enum LoopCommand {
         cwd: Option<String>,
         env: Vec<(String, String)>,
         stdin: Vec<u8>,
-        /// Stream stdout incrementally (`nx.spawn`'s `on_stdout`) rather than
+        /// Stream stdout incrementally (`nx.run_stream`'s streamed stdout) rather than
         /// delivering it whole with the exit (`vim.system`). See [`ProcSpec`].
         stream: bool,
     },

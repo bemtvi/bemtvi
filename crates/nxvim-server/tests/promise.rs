@@ -335,3 +335,50 @@ async fn the_promise_example_config_runs_end_to_end() {
         Some(15)
     );
 }
+
+// ----- nx.promise.try (fold a sync throw + async result into one chain) -------
+
+#[tokio::test]
+async fn try_runs_fn_and_resolves_with_its_value() {
+    let (rpc, _incoming) = start().await;
+    // A plain return value flows through like nx.promise.resolve(value).
+    exec_lua(
+        &rpc,
+        "_G.got = nil\n\
+         nx.promise.try(function(a, b) return a + b end, 2, 3):next(function(v) _G.got = v end)",
+    )
+    .await;
+    assert_eq!(lua_u64(&rpc, "return _G.got").await, Some(5));
+}
+
+#[tokio::test]
+async fn try_turns_a_synchronous_throw_into_a_rejection() {
+    let (rpc, _incoming) = start().await;
+    // A function that errors SYNCHRONOUSLY (before returning) rejects the promise —
+    // caught by the same :catch that an async rejection would land in.
+    exec_lua(
+        &rpc,
+        "_G.err = nil\n\
+         nx.promise.try(function() error('boom') end):catch(function(e) _G.err = tostring(e) end)",
+    )
+    .await;
+    assert_eq!(
+        lua_bool(&rpc, "return _G.err ~= nil and _G.err:find('boom') ~= nil").await,
+        Some(true),
+        "a sync throw is caught as a rejection"
+    );
+}
+
+#[tokio::test]
+async fn try_adopts_a_returned_promise() {
+    let (rpc, _incoming) = start().await;
+    // When fn returns a promise, try adopts it (waits on it) rather than fulfilling
+    // with the promise object — so one chain handles sync-throw and async alike.
+    exec_lua(
+        &rpc,
+        "_G.got = nil\n\
+         nx.promise.try(function() return nx.promise.resolve(99) end):next(function(v) _G.got = v end)",
+    )
+    .await;
+    assert_eq!(lua_u64(&rpc, "return _G.got").await, Some(99));
+}

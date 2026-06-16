@@ -18,7 +18,9 @@
 --   <CR>            confirm — runs the source's action on the highlighted item
 --   <Esc>           cancel
 --
--- Sources are thin: they STREAM candidates via `push`, and handle `confirm(item)`.
+-- Sources are thin: they STREAM candidates via `ctx.push`, signal completion by
+-- returning (an `nx.async` source returns its promise; nx is promise-only — no
+-- `done` callback), and handle `confirm(item)`.
 -- The built-in `files` / `live_grep` / `buffers` ship with nxvim; this config maps
 -- them and registers one custom source to show the shape.
 
@@ -69,7 +71,7 @@ nx.picker.source({
   width = "50vw", -- half the editor width …
   height = "40vh", -- … and 40% of its height
   prompt_pos = "bottom", -- input box UNDER the results
-  items = function(ctx, push, done)
+  items = function(ctx)
     for _, c in ipairs({
       "crimson",
       "cornflower",
@@ -80,9 +82,8 @@ nx.picker.source({
       "midnight",
       "mauve",
     }) do
-      push({ text = c })
+      ctx.push({ text = c })
     end
-    done()
   end,
   confirm = function(item)
     nx.notify("you picked " .. item.text)
@@ -105,12 +106,11 @@ end)
 nx.picker.source({
   name = "echo",
   dynamic = true,
-  items = function(ctx, push, done)
+  items = function(ctx)
     if ctx.query ~= "" then
-      push({ text = "search: " .. ctx.query, q = ctx.query })
-      push({ text = "again:  " .. ctx.query, q = ctx.query })
+      ctx.push({ text = "search: " .. ctx.query, q = ctx.query })
+      ctx.push({ text = "again:  " .. ctx.query, q = ctx.query })
     end
-    done()
   end,
   confirm = function(item)
     nx.notify("confirmed query: " .. (item.q or ""))
@@ -139,11 +139,10 @@ local here = debug.getinfo(1, "S").source:sub(2):match("(.*)[/\\]") or "."
 nx.picker.source({
   name = "preview",
   preview = "file", -- the pane on the right shows the highlighted file's head
-  items = function(_ctx, push, done)
+  items = function(ctx)
     for _, name in ipairs({ "sample.txt", "notes.txt", "init.lua" }) do
-      push({ text = name, path = here .. "/" .. name })
+      ctx.push({ text = name, path = here .. "/" .. name })
     end
-    done()
   end,
   confirm = function(item)
     vim.cmd("edit " .. item.path)

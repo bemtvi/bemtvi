@@ -535,7 +535,7 @@ end
 -- nx._qf_make(cmd, efm, title, open, jump, loclist_win): the async :make / :grep
 -- producer (dispatched from the server, which already expanded
 -- 'makeprg'/'grepprg' and merged stderr into stdout via the shell). Spawn `cmd`
--- through the same job machinery as nx.spawn / vim.system; on exit, split its
+-- through the same job machinery as nx.run / vim.system; on exit, split its
 -- combined output into lines and hand them to nx._qf_populate, which parses them
 -- against `efm` into the quickfix list (or `loclist_win`'s location list — see
 -- nx._set_qflist) and then opens the window / jumps to the first error per

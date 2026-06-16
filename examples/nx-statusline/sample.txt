@@ -1,0 +1,24 @@
+nx.statusline — declarative segment registry (the lualine shape)
+================================================================
+
+The bar below is built from named SEGMENTS, not a %-format string:
+
+    nx.statusline.setup {
+      left  = { "mode", "git", "filename", "modified" },
+      right = { "moves", "diagnostics", "filetype", "location" },
+    }
+
+Things to try:
+
+  * Move the cursor up and down — the "moves:N" segment on the right bumps
+    every time CursorMoved fires (an explicit nx.statusline.invalidate).
+
+  * :cd into / out of a git repo — the "git" segment re-runs `git branch`
+    off the editor thread and shows the current branch when there is one.
+
+  * Switch buffers (:e another file) — the git segment re-renders on BufEnter.
+
+Built-in segments (mode / filename / filetype / location / diagnostics / …)
+resolve natively every frame; custom segments only re-run their render() when
+invalidated. See examples/statusline/ for the other surface — the %-format
+'statusline' option.

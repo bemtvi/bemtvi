@@ -83,7 +83,7 @@ behavior and colorschemes.**
      `vim.notify` (→ `nx.notify`), `vim.schedule` (run at settle),
      `vim.defer_fn` (→ `nx.timer`), `vim.ui.input` / `vim.ui.select`
      (→ `nx.ui.*`), and `vim.system` in its **callback form only**
-     (→ `nx.spawn`; the blocking `:wait()` fails loud).
+     (→ `nx.run` / `nx.run_stream`; promise-shaped, never blocking).
    - **Treesitter highlight toggle:** `vim.treesitter.start(buf, lang?)` /
      `vim.treesitter.stop(buf)` — the sole carve-out from "no `vim.treesitter`
      surface." Admitted only because they desugar 1:1 onto declarative buffer
@@ -152,7 +152,7 @@ vendored Lua — the engine seam is kept, the command skin is replaced by a noun
   vim-shaped config surface beyond the aliases. The prelude beyond those is
   donor code for the `nx` build-out: refactored under `nx.*` where it serves
   nxvim's objectives, deleted where it doesn't.
-- **Plugin asynchrony lives in `nx`** (`nx.spawn` / `nx.timer` / `nx.fs` /
+- **Plugin asynchrony lives in `nx`** (`nx.run` / `nx.timer` / `nx.fs` /
   `nx.ui.input`, callback-based). Nothing in the plugin API can block the
   editor, which also keeps the PUC Lua 5.1 backend (no yield across `pcall`)
   fully supported by construction.

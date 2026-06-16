@@ -461,9 +461,29 @@ impl EditHost {
             // Kick the source's initial run (generation 0, empty query) through the
             // same `picker_query_changes` channel a dynamic query edit uses, rather
             // than running it inline here: the settle fixpoint drains that channel
-            // and re-runs `apply_lua_effects` after, so the `nx.spawn` the source
+            // and re-runs `apply_lua_effects` after, so the `nx.run_stream` the source
             // queues (already past this pass's `take_loop_ops`) actually starts.
             self.editor.picker_query_changes.push((0, String::new()));
+        }
+        // `nx.statusline.setup{}`: the latest layout wins (a re-setup replaces the
+        // active one). While a layout is set it takes precedence over `'statusline'`
+        // for every window — see `EditHost::render_statusline`.
+        for req in self.lua.take_statusline_setups() {
+            self.statusline_layout = Some(nxvim_core::statusline::SegmentLayout {
+                left: req.left,
+                right: req.right,
+            });
+        }
+        // Custom-segment cell publishes (`nx._statusline_publish`): fold each into
+        // the per-name cache the redraw path reads. Re-rendered only on a segment's
+        // invalidation, so this is empty on a built-ins-only config.
+        for req in self.lua.take_statusline_publishes() {
+            let cells = req
+                .cells
+                .into_iter()
+                .map(|(text, group)| nxvim_core::statusline::StatusSegment { text, group })
+                .collect();
+            self.statusline_cache.insert(req.name, cells);
         }
         // `nx.complete.setup{}`: apply the native completion-engine config. Key
         // notation is parsed here (core stays parser-aware only via `parse_keys`);
@@ -1492,12 +1512,12 @@ impl EditHost {
                 }
             }
             LoopEvent::ProcessStdout { id, lines } => {
-                // A streaming child (`nx.spawn` with an `on_stdout`) emitted a batch
-                // of stdout lines: fire the persistent stdout callback, then drain
-                // whatever it queued (a picker source's `push` of new candidates).
+                // A streaming child (`nx.run_stream`) emitted a batch of stdout
+                // lines: fire the persistent stdout handler, then drain whatever it
+                // queued (a picker source's `ctx.push` of new candidates).
                 if let Err(e) = self.lua.run_process_stdout(id, lines) {
                     self.editor
-                        .echo(format!("E5108: Error in nx.spawn on_stdout: {e}"));
+                        .echo(format!("E5108: Error in nx.run_stream handler: {e}"));
                 }
                 self.apply_lua_effects();
             }

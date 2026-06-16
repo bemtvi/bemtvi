@@ -76,11 +76,10 @@ fn menu_items(menu: &[(Value, Value)]) -> Vec<String> {
 const STATIC_SRC: &str = r#"
 nx.picker.source {
   name = "fruits",
-  items = function(ctx, push, done)
+  items = function(ctx)
     for _, t in ipairs({ "apple", "apricot", "banana", "cherry" }) do
-      push { text = t, fruit = t }
+      ctx.push { text = t, fruit = t }
     end
-    done()
   end,
   confirm = function(item) _G.picked = item.fruit end,
 }
@@ -168,12 +167,11 @@ nx.picker.source {
   name = "echo",
   dynamic = true,
   debounce = 0,                              -- run immediately (test the re-run, not the debounce)
-  items = function(ctx, push, done)
+  items = function(ctx)
     if ctx.query ~= "" then
-      push { text = ctx.query .. "-1", q = ctx.query }
-      push { text = ctx.query .. "-2", q = ctx.query }
+      ctx.push { text = ctx.query .. "-1", q = ctx.query }
+      ctx.push { text = ctx.query .. "-2", q = ctx.query }
     end
-    done()
   end,
   confirm = function(item) _G.picked = item.q end,
 }
@@ -211,12 +209,11 @@ nx.picker.source {
   name = "counted",
   dynamic = true,
   debounce = 60,
-  items = function(ctx, push, done)
+  items = function(ctx)
     if ctx.query ~= "" then
       _G.runs = (_G.runs or 0) + 1
-      push { text = ctx.query }
+      ctx.push { text = ctx.query }
     end
-    done()
   end,
   confirm = function(item) end,
 }
@@ -265,9 +262,8 @@ nx.picker.source {
   name = "echo",
   dynamic = true,
   debounce = 100000,                         -- would never fire within the test
-  items = function(ctx, push, done)
-    if ctx.query ~= "" then push { text = ctx.query } end
-    done()
+  items = function(ctx)
+    if ctx.query ~= "" then ctx.push { text = ctx.query } end
   end,
   confirm = function(item) end,
 }
@@ -311,9 +307,8 @@ async fn scrolling_past_the_window_tracks_the_selection() {
     let src = r#"
 nx.picker.source {
   name = "many",
-  items = function(ctx, push, done)
-    for i = 1, 50 do push { text = string.format("row-%02d", i), n = i } end
-    done()
+  items = function(ctx)
+    for i = 1, 50 do ctx.push { text = string.format("row-%02d", i), n = i } end
   end,
   confirm = function(item) _G.picked = item.n end,
 }
@@ -356,9 +351,8 @@ async fn scales_to_100k_candidates_and_windows_the_projection() {
     let src = r#"
 nx.picker.source {
   name = "huge",
-  items = function(ctx, push, done)
-    for i = 1, 100000 do push { text = "item-" .. i, n = i } end
-    done()
+  items = function(ctx)
+    for i = 1, 100000 do ctx.push { text = "item-" .. i, n = i } end
   end,
   confirm = function(item) _G.picked = item.n end,
 }
@@ -424,13 +418,16 @@ nx.picker.source {
   name = "deferred",
   dynamic = true,
   debounce = 0,
-  items = function(ctx, push, done)
-    -- Only "hit" yields a result; defer both the push and done() so the in-flight
-    -- window is observable.
-    nx.timer(function()
-      if ctx.query == "hit" then push { text = "FOUND:" .. ctx.query } end
-      done()
-    end, 60)
+  items = function(ctx)
+    -- Only "hit" yields a result; defer both the ctx.push and completion so the
+    -- in-flight window is observable — the source returns a promise that resolves
+    -- (= done) when the timer fires.
+    return nx.promise.new(function(resolve)
+      nx.timer(function()
+        if ctx.query == "hit" then ctx.push { text = "FOUND:" .. ctx.query } end
+        resolve()
+      end, 60)
+    end)
   end,
   confirm = function(item) end,
 }
@@ -493,25 +490,20 @@ nx.picker.source {
 
 #[tokio::test]
 async fn streaming_source_appears_as_rows_arrive() {
-    // A source that streams via `nx.spawn` (the incremental on_stdout path):
+    // A source that streams via `nx.run_stream` (the async-iterator path):
     // `printf` (coreutils) emits three lines, which arrive as picker rows. Proves
-    // the streaming primitive end-to-end, not just the synchronous push path.
+    // the streaming primitive end-to-end, not just the synchronous ctx.push path.
     let dir = temp_dir("picker_stream");
     let src = r#"
 nx.picker.source {
   name = "stream",
-  items = function(ctx, push, done)
-    nx.spawn {
-      cmd = "printf",
-      args = { "one\ntwo\nthree\n" },
-      on_stdout = function(lines)
-        for _, l in ipairs(lines) do
-          if l ~= "" then push { text = l } end
-        end
-      end,
-      on_exit = function() done() end,
-    }
-  end,
+  items = nx.async(function(ctx)
+    for batch in nx.await_each(nx.run_stream { cmd = "printf", args = { "one\ntwo\nthree\n" } }) do
+      for _, l in ipairs(batch) do
+        if l ~= "" then ctx.push { text = l } end
+      end
+    end
+  end),
   confirm = function(item) _G.picked = item.text end,
 }
 "#;
@@ -548,23 +540,25 @@ nx.picker.source {
 
 #[tokio::test]
 async fn a_stale_generation_push_is_dropped() {
-    // A dynamic source whose push is *deferred* (a timer) carries the generation
+    // A dynamic source whose ctx.push is *deferred* (a timer) carries the generation
     // of the query that scheduled it. Typing past that query (bumping the
-    // generation) must drop the late push so a superseded query's rows never show.
+    // generation) must drop the late ctx.push so a superseded query's rows never show.
     let dir = temp_dir("picker_stale");
     let src = r#"
 nx.picker.source {
   name = "deferred",
   dynamic = true,
   debounce = 0,                              -- isolate the generation gate from the debounce
-  items = function(ctx, push, done)
-    if ctx.query == "" then return done() end
+  items = function(ctx)
+    if ctx.query == "" then return end
     -- Push one row for this query, but only after a delay — by which time a
     -- faster typist may have moved the generation on.
-    nx.timer(function()
-      push { text = "row:" .. ctx.query }
-      done()
-    end, 40)
+    return nx.promise.new(function(resolve)
+      nx.timer(function()
+        ctx.push { text = "row:" .. ctx.query }
+        resolve()
+      end, 40)
+    end)
   end,
   confirm = function(item) _G.picked = item.text end,
 }
@@ -573,7 +567,7 @@ nx.picker.source {
     exec_lua(&rpc, "nx.picker.open('deferred')").await;
     poll_menu(&rpc, &mut incoming).await.expect("menu opens");
 
-    // Type "a" then immediately "b": the gen-1 ("a") deferred push must be dropped;
+    // Type "a" then immediately "b": the gen-1 ("a") deferred ctx.push must be dropped;
     // only the gen-2 ("ab") row may appear.
     feed(&rpc, "a");
     feed(&rpc, "b");
@@ -595,26 +589,28 @@ nx.picker.source {
 
 #[tokio::test]
 async fn a_closed_pickers_late_push_never_leaks_into_the_next() {
-    // A source whose push is deferred (a timer) and which forgets to register
+    // A source whose ctx.push is deferred (a timer) and which forgets to register
     // `ctx.on_cancel` keeps "streaming" after its picker closes. Because every
-    // picker opens at generation 0, that orphaned push (gen 0) must NOT land in
+    // picker opens at generation 0, that orphaned ctx.push (gen 0) must NOT land in
     // the next picker (also gen 0) — the identity guard drops it.
     let dir = temp_dir("picker_leak");
     let src = r#"
 _G.runs = 0
 nx.picker.source {
   name = "leak",
-  items = function(ctx, push, done)
+  items = function(ctx)
     _G.runs = _G.runs + 1
     local tag = "run" .. _G.runs            -- distinguishes each picker's run
-    nx.timer(function() push { text = tag }; done() end, 40)
+    return nx.promise.new(function(resolve)
+      nx.timer(function() ctx.push { text = tag }; resolve() end, 40)
+    end)
   end,
   confirm = function(item) end,
 }
 "#;
     let (rpc, mut incoming) = start(&dir, src).await;
 
-    // Picker A: open, then immediately cancel — its deferred "run1" push is still
+    // Picker A: open, then immediately cancel — its deferred "run1" ctx.push is still
     // pending and its job was never reaped (no on_cancel).
     exec_lua(&rpc, "nx.picker.open('leak')").await;
     poll_menu(&rpc, &mut incoming)
@@ -638,7 +634,7 @@ nx.picker.source {
     let items = menu_items(&menu);
     assert!(
         !items.iter().any(|i| i == "run1"),
-        "the closed picker A's late push must not leak into picker B, got {items:?}"
+        "the closed picker A's late ctx.push must not leak into picker B, got {items:?}"
     );
     assert_eq!(items, vec!["run2"], "picker B shows only its own run's row");
 }
@@ -712,9 +708,8 @@ async fn the_separator_row_is_reserved_between_prompt_and_list() {
     let src = r#"
 nx.picker.source {
   name = "many",
-  items = function(ctx, push, done)
-    for i = 1, 50 do push { text = string.format("row-%02d", i) } end
-    done()
+  items = function(ctx)
+    for i = 1, 50 do ctx.push { text = string.format("row-%02d", i) } end
   end,
   confirm = function(item) end,
 }
@@ -931,10 +926,9 @@ async fn file_preview_shows_selected_file_and_swaps_on_move() {
 nx.picker.source {{
   name = "files_test",
   preview = "file",
-  items = function(ctx, push, done)
-    push {{ text = "a.txt", path = "{a}" }}
-    push {{ text = "b.txt", path = "{b}" }}
-    done()
+  items = function(ctx)
+    ctx.push {{ text = "a.txt", path = "{a}" }}
+    ctx.push {{ text = "b.txt", path = "{b}" }}
   end,
   confirm = function(item) _G.picked = item.path end,
 }}
@@ -977,9 +971,8 @@ async fn location_preview_windows_to_the_match_and_marks_it() {
 nx.picker.source {{
   name = "loc_test",
   preview = "location",
-  items = function(ctx, push, done)
-    push {{ text = "big:5", path = "{big}", row = 5, col = 2 }}
-    done()
+  items = function(ctx)
+    ctx.push {{ text = "big:5", path = "{big}", row = 5, col = 2 }}
   end,
   confirm = function(item) _G.picked = item.path end,
 }}
@@ -1012,9 +1005,8 @@ async fn preview_scrolls_with_ctrl_dufb() {
 nx.picker.source {{
   name = "scroll_test",
   preview = "file",
-  items = function(ctx, push, done)
-    push {{ text = "tall.txt", path = "{tall}" }}
-    done()
+  items = function(ctx)
+    ctx.push {{ text = "tall.txt", path = "{tall}" }}
   end,
 }}
 "#,
@@ -1095,10 +1087,9 @@ async fn preview_scroll_resets_when_the_selection_moves() {
 nx.picker.source {{
   name = "reset_test",
   preview = "file",
-  items = function(ctx, push, done)
-    push {{ text = "one.txt", path = "{one}" }}
-    push {{ text = "two.txt", path = "{two}" }}
-    done()
+  items = function(ctx)
+    ctx.push {{ text = "one.txt", path = "{one}" }}
+    ctx.push {{ text = "two.txt", path = "{two}" }}
   end,
 }}
 "#,
@@ -1144,7 +1135,7 @@ async fn preview_reserves_a_column_so_the_list_keeps_the_rest() {
 nx.picker.source {{
   name = "geom",
   preview = "file",
-  items = function(ctx, push, done) push {{ text = "a", path = "{a}" }}; done() end,
+  items = function(ctx) ctx.push {{ text = "a", path = "{a}" }} end,
 }}
 "#,
         a = a.display(),
@@ -1185,7 +1176,7 @@ async fn unreadable_preview_path_shows_a_visible_placeholder() {
 nx.picker.source {{
   name = "missing",
   preview = "file",
-  items = function(ctx, push, done) push {{ text = "gone", path = "{p}" }}; done() end,
+  items = function(ctx) ctx.push {{ text = "gone", path = "{p}" }} end,
 }}
 "#,
         p = missing.display(),
@@ -1215,7 +1206,7 @@ async fn confirm_on_a_file_preview_picker_still_fires() {
 nx.picker.source {{
   name = "fc",
   preview = "file",
-  items = function(ctx, push, done) push {{ text = "a", path = "{a}" }}; done() end,
+  items = function(ctx) ctx.push {{ text = "a", path = "{a}" }} end,
   confirm = function(item) _G.picked = item.path end,
 }}
 "#,

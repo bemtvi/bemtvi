@@ -216,7 +216,7 @@ const LUAFS: &str = "luafs";
 enum DaemonEvent {
     /// The child is running (or failed to spawn — `None` pid).
     Spawned(Option<u32>),
-    /// A streaming child emitted a batch of stdout lines (`nx.spawn`'s `on_stdout`).
+    /// A streaming child emitted a batch of stdout lines (`nx.run_stream`'s streamed stdout).
     Stdout(Vec<String>),
     /// The child exited (`code = -1` on spawn failure or a kill).
     Exited {

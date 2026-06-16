@@ -110,7 +110,7 @@ pub trait HostEffects {
     /// on [`Self::has_remote_proc`], so it is only reached when a daemon is connected.
     /// Native-only build routes processes through the event-loop actor's `loop_command`
     /// instead, so this method is wasm-only.
-    /// `stream` requests incremental stdout (`nx.spawn`'s `on_stdout`): the daemon emits
+    /// `stream` requests incremental stdout (`nx.run_stream`'s streamed stdout): the daemon emits
     /// each batch inbound via [`EditHost::proc_stdout`](crate::EditHost::proc_stdout) before
     /// the single `proc_exited`. `false` is the one-shot `vim.system` (stdout with the exit).
     #[cfg(not(feature = "native"))]

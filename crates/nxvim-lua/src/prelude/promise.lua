@@ -1,11 +1,13 @@
 -- nxvim Lua prelude — nx.promise, a Promises/A+ surface shaped like the browser's.
 --
--- Now that the editor's APIs are callback-shaped (nx.ui.select, vim.system,
--- timers, fs, LSP), nested callbacks pile up fast. `nx.promise` is the cure: the
--- exact same object model the browser exposes — `nx.promise.new(executor)`,
--- `:next`/`:catch`/`:finally`, and the `nx.promise.all/all_settled/race/any/
--- resolve/reject` combinators — plus `nx.async`/`nx.await` coroutine sugar so a
--- chain of awaits reads like straight-line code.
+-- `nx` async is PROMISE-ONLY (ADR 0002): a one-shot async API returns a promise
+-- (nx.run, nx.fs, …) and streaming is an async-iterator over them (nx.run_stream +
+-- nx.await_each). `nx.promise` is the foundation: the exact object model the
+-- browser exposes — `nx.promise.new(executor)`, `:next`/`:catch`/`:finally`, and
+-- the `nx.promise.all/all_settled/race/any/resolve/reject/try` combinators — plus
+-- `nx.async`/`nx.await` coroutine sugar so a chain of awaits reads like
+-- straight-line code. (`nx.promise.try` folds a function that may throw
+-- SYNCHRONOUSLY or reject ASYNCHRONOUSLY into one chain — see its definition.)
 --
 -- This is pure Lua layered on the existing async runtime: a promise's reactions
 -- run as MICROTASKS via `nx.schedule` (prelude/runtime.lua) — deferred to the end
@@ -263,6 +265,22 @@ function M.reject(reason)
   local p = new_pending()
   settle(p, REJECTED, reason)
   return p
+end
+
+-- nx.promise.try(fn, ...): run `fn(...)` INSIDE a promise — a synchronous throw
+-- becomes a rejection, and a returned promise (or plain value) is adopted. So a
+-- function that may fail either way (sync error before it returns, or async
+-- rejection of what it returns) folds into ONE chain: no `pcall` + branch at the
+-- call site, just `nx.promise.try(fn, ...):next(...):catch(...)`. Mirrors the
+-- browser's `Promise.try`.
+function M.try(fn, ...)
+  local args = { ... }
+  local argc = select("#", ...)
+  return M.new(function(resolve)
+    -- A throw in `fn` propagates out of this executor, which M.new turns into a
+    -- rejection; a returned promise is adopted by `resolve` (the resolution proc).
+    resolve(fn(table.unpack(args, 1, argc)))
+  end)
 end
 
 -- Count a 1..n list (combinators take array-like tables of promises/values).

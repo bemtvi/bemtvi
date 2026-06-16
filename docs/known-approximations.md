@@ -69,7 +69,7 @@ are no longer listed here — only the edges that still diverge are.
   `new_check` / `new_fs_event` / `spawn` / `new_pipe`, the plugin event-loop
   primitives) and the synchronous `fs_*` / scalar primitives (`fs_realpath`,
   `cwd`, `os_homedir`, `os_uname`, `hrtime`, `now`) are gone. Async lives in the
-  `nx` API (`nx.spawn` / `nx.timer` / `nx.fs`); the synchronous host info the
+  `nx` API (`nx.run` / `nx.timer` / `nx.fs`); the synchronous host info the
   LSP-config paths need is read through `vim.fn` (`executable` / `exepath` /
   `glob` / `filereadable` / `resolve` / …) instead.
 - **Broad options surface.** `:set` honors the search/number booleans plus the
@@ -112,6 +112,22 @@ are no longer listed here — only the edges that still diverge are.
   via a pumped coroutine (`nx._pump`), but only *pumped* entry points (`:lua`
   chunk, keymap, user command) can prompt — Lua sourced at startup or off a bare
   callback has no coroutine to yield from. See `examples/sync-prompts/`.
+- **`nx.statusline` segment registry — v1 deferrals.** The lualine-shaped surface
+  is built (`nx.statusline.setup`/`segment`/`invalidate`; built-ins composed in
+  `nxvim_core::statusline::compose_segments`, custom segments published from Lua
+  and cached server-side; see
+  `docs/plans/2026-06-15-nx-statusline-segments.md`). What it does **not** do yet:
+  (1) **no per-window active/inactive differentiation** — built-ins render
+  per-window, but custom segments share one cache keyed by segment name (the
+  focused-window value); `ctx.focused` is passed but always `true`. (2) The custom
+  segment `ctx` carries `{ buf, win, focused }` but **no `width`** (the server
+  doesn't mirror the per-window statusline width to Lua). (3) **Layout is global**,
+  not `setlocal`-per-window, and there is no per-region mix of the segment layout
+  with the `'statusline'` format (the layout wins wholesale while set). (4) No
+  mouse-click segment regions (shared with the deferred tabline `%@…@` work).
+  (5) `git` / `lsp_progress` are *plugin* segments (custom-segment examples), not
+  built-ins. The built-in set is `mode` / `filename` / `filepath` / `filetype` /
+  `encoding` / `location` / `modified` / `readonly` / `diagnostics`.
 
 ## Cross-cutting root causes
 

@@ -449,7 +449,7 @@ impl HostEffects for WasmEffects {
         // spawn for the Worker to forward over WebTransport (`eh_take_proc_requests` →
         // `proc_spawn`). The child's pid/exit return via `eh_proc_spawned` / `eh_proc_exited`
         // — the wasm twin of the daemon's `proc_spawned`/`proc_exited` pushes. A streaming
-        // spawn (`nx.spawn`'s `on_stdout`, e.g. a picker source) also streams stdout back
+        // spawn (`nx.run_stream`'s streamed stdout, e.g. a picker source) also streams stdout back
         // inbound via `eh_proc_stdout`. Only reached when a daemon is connected (the tick
         // gates on `has_remote_proc`).
         self.sink
@@ -1145,7 +1145,7 @@ pub unsafe extern "C" fn eh_proc_spawned(h: *mut WasmEditHost, id: f64, pid: f64
     }
 }
 
-/// Land a daemon `proc_stdout` push: a streaming child (`nx.spawn`'s `on_stdout`, e.g. a
+/// Land a daemon `proc_stdout` push: a streaming child (`nx.run_stream`'s streamed stdout, e.g. a
 /// picker source) emitted a batch of stdout lines. `lines_json` is a JSON array of strings
 /// (the lines, newline-stripped); fires the persistent `on_stdout` under `id`, then settles
 /// + repaints so streamed rows appear as they arrive. See [`EditHost::proc_stdout`].

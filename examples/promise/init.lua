@@ -5,11 +5,13 @@
 --     NXVIM_CONFIG=examples/promise \
 --       cargo run -p nxvim -- examples/promise/sample.txt
 --
--- nxvim's APIs are callback-shaped (nx.ui.select, timers, vim.system, fs, LSP).
--- Nest a few and you get the pyramid of doom. `nx.promise` is the cure: the exact
--- browser object model — nx.promise.new / :next / :catch / :finally and the
--- all / all_settled / race / any / resolve / reject combinators — plus
--- nx.async/nx.await coroutine sugar so a chain of awaits reads top-to-bottom.
+-- nx async is PROMISE-ONLY: a one-shot async API returns a promise (nx.run, fs)
+-- and streaming is an async-iterator over them (nx.run_stream + nx.await_each).
+-- `nx.promise` is the foundation — the exact browser object model: nx.promise.new
+-- / :next / :catch / :finally and the all / all_settled / race / any / resolve /
+-- reject / try combinators — plus nx.async/nx.await coroutine sugar so a chain of
+-- awaits reads top-to-bottom. (The remaining callback APIs — nx.ui.select, LSP —
+-- are being migrated to promises on the same principle.)
 --
 -- Everything below runs at startup with NO keypresses. Watch the message line
 -- (`:messages` for the full history); each demo also records into `_G.promise_demo`,

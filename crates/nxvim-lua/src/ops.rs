@@ -309,7 +309,7 @@ pub enum LoopOp {
         cwd: Option<String>,
         env: Vec<(String, String)>,
         stdin: Vec<u8>,
-        /// Stream the child's stdout as it arrives (`nx.spawn`'s `on_stdout`):
+        /// Stream the child's stdout as it arrives (`nx.run_stream`'s streamed stdout):
         /// each newline-delimited batch fires the persistent stdout callback under
         /// `id`, and the final exit carries empty stdout (already delivered). When
         /// `false` (`vim.system`) the child runs to completion and the whole stdout
@@ -886,6 +886,32 @@ pub struct PickerOpenReq {
     /// before. The kind itself (file vs location) is implicit in whether the
     /// pushes carry a `loc`.
     pub preview: bool,
+}
+
+/// A `nx.statusline.setup{}` request: the ordered segment *names* for the left
+/// and right halves of the status line (the lualine-shaped surface). The Lua
+/// wrapper (`prelude/statusline.lua`) validates each name against the built-ins
+/// and the registered custom segments first. Queued in
+/// [`crate::runtime::Shared::statusline_setups`]; the server stores it as the
+/// active `SegmentLayout`, which takes precedence over the `'statusline'`
+/// format while set.
+#[derive(Clone, Debug)]
+pub struct StatuslineSetupReq {
+    pub left: Vec<String>,
+    pub right: Vec<String>,
+}
+
+/// A custom statusline segment's resolved cells, published from Lua
+/// (`nx._statusline_publish`) when the segment is (re)rendered — at `setup{}`,
+/// on `nx.statusline.invalidate(name)`, or on one of its declared autocmd
+/// events. `cells` is `(text, group)` per cell, an empty `group` meaning the
+/// base `StatusLine` highlight. Queued in
+/// [`crate::runtime::Shared::statusline_publishes`]; the server caches it by
+/// `name` and reads it during redraw (no per-frame Lua — ADR 0002 rule 4).
+#[derive(Clone, Debug)]
+pub struct StatuslinePublishReq {
+    pub name: String,
+    pub cells: Vec<(String, Option<String>)>,
 }
 
 /// A `nx.complete.setup{}` configuration request for the native completion engine

@@ -829,6 +829,9 @@ fn window_status_ctx(inp: StatusCtxInputs) -> StatuslineCtx {
         virtcol: inp.cursor_screen_col + 1,
         top_line: inp.top + 1,
         text_height: inp.text_height,
+        // Diagnostics are LSP-sourced and live in the server; core defaults to
+        // zero and the server fills the counts in on the segment-render path.
+        diag_counts: [0; 4],
     }
 }
 

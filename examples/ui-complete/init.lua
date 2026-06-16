@@ -33,12 +33,13 @@
 vim.g.mapleader = "\\"
 
 --------------------------------------------------------------------------------
--- A plugin ASYNC source (Phase 4-B). `complete(ctx, push, done)` runs off the
--- input path: it receives the live prefix in `ctx.prefix`, streams matching
--- candidates via `push` (a string, or `{ text = label, insert = applied-text }`),
--- and calls `done()` when finished. Here it offers a small fixed keyword set — but
--- the same shape drives an LSP/HTTP/`nx.spawn` source: register a `ctx.on_cancel`
--- reaper and the engine kills the in-flight job when you type past the prefix.
+-- A plugin ASYNC source (Phase 4-B). `complete(ctx)` runs off the input path: it
+-- receives the live prefix in `ctx.prefix`, streams matching candidates via
+-- `ctx.push` (a string, or `{ text = label, insert = applied-text }`), and signals
+-- completion by RETURNING — synchronously here, or a promise for a real async
+-- source. The same shape drives an LSP/HTTP/`nx.run_stream` source wrapped in
+-- `nx.async`: register a `ctx.on_cancel` reaper (e.g. `stream:kill()`) and the
+-- engine kills the in-flight job when you type past the prefix.
 --------------------------------------------------------------------------------
 local KEYWORDS = {
   "function",
@@ -53,23 +54,22 @@ nx.complete.source {
   -- Trailing delay (ms) before this source runs after a keystroke; coalesces a
   -- fast typist's keystrokes into one query. `0` would run on every key.
   debounce = 80,
-  complete = function(ctx, push, done)
+  complete = function(ctx)
     for _, kw in ipairs(KEYWORDS) do
       -- Only offer keywords that actually extend the prefix — a faithful source
       -- reacts to its input rather than dumping a canned list. No inline `doc`, so
       -- docs are fetched lazily via `resolve` below — only for the row you land on.
       if kw ~= ctx.prefix and kw:sub(1, #ctx.prefix) == ctx.prefix then
-        push { text = kw, insert = kw }
+        ctx.push { text = kw, insert = kw }
       end
     end
-    done()
   end,
-  -- `resolve(item, respond)` (Phase 4-E): supply the docs sidebar LAZILY. The engine
-  -- calls this only when you SELECT a row that had no inline `doc` — so a costly
-  -- lookup (here just a string) runs once per landed-on row, not for every candidate.
-  -- `respond` takes the resolved item (its `.doc`) or a bare doc string.
-  resolve = function(item, respond)
-    respond { doc = "keyword: " .. item.text .. "\n(" .. #item.text .. " chars)" }
+  -- `resolve(item)` (Phase 4-E): supply the docs sidebar LAZILY. The engine calls
+  -- this only when you SELECT a row that had no inline `doc` — so a costly lookup
+  -- (here just a string) runs once per landed-on row, not for every candidate. It
+  -- returns a PROMISE of the docs (a doc string, or an item whose `.doc` is used).
+  resolve = function(item)
+    return nx.promise.resolve { doc = "keyword: " .. item.text .. "\n(" .. #item.text .. " chars)" }
   end,
 }
 
@@ -92,13 +92,12 @@ nx.complete.source {
   name = "emoji",
   debounce = 0,
   trigger = { chars = { ":" } },
-  complete = function(ctx, push, done)
+  complete = function(ctx)
     for _, e in ipairs(EMOJI) do
       if e[1]:sub(1, #ctx.prefix) == ctx.prefix then
-        push { text = e[1], insert = e[2], doc = e[1] .. "  →  " .. e[2] }
+        ctx.push { text = e[1], insert = e[2], doc = e[1] .. "  →  " .. e[2] }
       end
     end
-    done()
   end,
 }
 

@@ -394,9 +394,8 @@ async fn a_mapped_trigger_key_opens_the_popup() {
 const ECHO_INIT: &str = "\
 nx.complete.source {\n\
   name = 'echo', debounce = 0,\n\
-  complete = function(ctx, push, done)\n\
-    if ctx.prefix ~= '' then push(ctx.prefix .. '_async') end\n\
-    done()\n\
+  complete = function(ctx)\n\
+    if ctx.prefix ~= '' then ctx.push(ctx.prefix .. '_async') end\n\
   end,\n\
 }\n\
 nx.complete.setup { sources = { { 'buffer', min_chars = 2 }, { 'echo' } } }";
@@ -437,9 +436,8 @@ async fn async_only_source_drives_the_popup_and_reacts_to_the_prefix() {
     let init = "\
 nx.complete.source {\n\
   name = 'echo', debounce = 0,\n\
-  complete = function(ctx, push, done)\n\
-    if ctx.prefix ~= '' then push(ctx.prefix .. '_async') end\n\
-    done()\n\
+  complete = function(ctx)\n\
+    if ctx.prefix ~= '' then ctx.push(ctx.prefix .. '_async') end\n\
   end,\n\
 }\n\
 nx.complete.setup { sources = { { 'echo' } }, min_chars = 2 }";
@@ -469,7 +467,7 @@ async fn async_source_with_no_matches_closes_the_confirmed_empty_popup() {
     let init = "\
 nx.complete.source {\n\
   name = 'silent', debounce = 0,\n\
-  complete = function(_ctx, _push, done) done() end,\n\
+  complete = function(_ctx) end,\n\
 }\n\
 nx.complete.setup { sources = { { 'silent' } }, min_chars = 2 }";
     let (rpc, mut incoming) = start(&dir, init).await;
@@ -510,8 +508,10 @@ async fn a_stale_in_flight_async_push_is_dropped_by_generation() {
 _G.deferred = {}\n\
 nx.complete.source {\n\
   name = 'deferred', debounce = 0,\n\
-  complete = function(ctx, push, done)\n\
-    table.insert(_G.deferred, function() push(ctx.prefix .. '_X'); done() end)\n\
+  complete = function(ctx)\n\
+    return nx.promise.new(function(resolve)\n\
+      table.insert(_G.deferred, function() ctx.push(ctx.prefix .. '_X'); resolve() end)\n\
+    end)\n\
   end,\n\
 }\n\
 nx.complete.setup { sources = { { 'deferred' } }, min_chars = 2 }";
@@ -547,11 +547,10 @@ const EMOJI_INIT: &str = "\
 nx.complete.source {\n\
   name = 'emoji', debounce = 0,\n\
   trigger = { chars = { ':' } },\n\
-  complete = function(ctx, push, done)\n\
+  complete = function(ctx)\n\
     if (':smile:'):find(ctx.prefix, 1, true) == 1 then\n\
-      push { text = ':smile:', insert = 'SMILE', doc = 'A smiley face' }\n\
+      ctx.push { text = ':smile:', insert = 'SMILE', doc = 'A smiley face' }\n\
     end\n\
-    done()\n\
   end,\n\
 }\n\
 nx.complete.setup { sources = { { 'buffer', min_chars = 2 }, { 'emoji' } } }";
@@ -656,12 +655,11 @@ async fn a_plugin_source_resolve_callback_fills_the_sidebar_lazily() {
     let init = "\
 nx.complete.source {\n\
   name = 'lazy', debounce = 0,\n\
-  complete = function(ctx, push, done)\n\
-    if ctx.prefix ~= '' then push { text = ctx.prefix .. '_lazy', insert = 'LAZY' } end\n\
-    done()\n\
+  complete = function(ctx)\n\
+    if ctx.prefix ~= '' then ctx.push { text = ctx.prefix .. '_lazy', insert = 'LAZY' } end\n\
   end,\n\
-  resolve = function(item, respond)\n\
-    respond { doc = 'resolved docs for ' .. item.text }\n\
+  resolve = function(item)\n\
+    return nx.promise.resolve { doc = 'resolved docs for ' .. item.text }\n\
   end,\n\
 }\n\
 nx.complete.setup { sources = { { 'lazy' } }, min_chars = 2 }";

@@ -1041,11 +1041,17 @@ screen," and that is exactly the shape of these tests.
   [ADR 0002](decisions/0002-native-plugin-system.md). Suggested build order is
   in the spec (picker → completion → statusline/snippets/tree). **Landed so far:**
   the fuzzy **picker** (`nx.picker`), the **completion engine** (`nx.complete`,
-  buffer + lsp + snippets sources), and the **snippet engine** (`nx.snippet` — LSP
+  buffer + lsp + snippets sources), the **snippet engine** (`nx.snippet` — LSP
   snippet-syntax parsing, the tabstop session with `<Tab>`/`<S-Tab>` navigation and
   mirrored placeholders; see
-  [the snippet plan](plans/2026-06-15-nx-snippet-engine.md)). Still ahead: statusline
-  segments, tree docks, `nx.decor`, and the manifest loader / package manager.
+  [the snippet plan](plans/2026-06-15-nx-snippet-engine.md)), and the **statusline
+  segment registry** (`nx.statusline` — the lualine-shaped surface: built-in
+  segments resolved natively each frame plus custom `nx.statusline.segment{}`
+  providers re-rendered only on declared events / `invalidate`, composed through the
+  shared `%`-format [`layout`](../crates/nxvim-core/src/statusline.rs) so clients
+  paint it unchanged; see
+  [the segment plan](plans/2026-06-15-nx-statusline-segments.md)). Still ahead: tree
+  docks, `nx.decor`, and the manifest loader / package manager.
 - **Treesitter control.** `:TSInstall` / `:TSUpdate` / `:TSInstallInfo` have
   **landed**: the native arm fetches + compiles each grammar into the data dir
   off the editor thread (`nxvim_ts::install`, with a pinned checksum-verified Zig
@@ -1152,7 +1158,7 @@ screen," and that is exactly the shape of these tests.
   — `vim.uv` / `vim.loop`, both the **handle** primitives
   (`new_timer`/`new_check`/`new_fs_event`/`spawn`) and the synchronous `fs_*` /
   scalars — is **not** part of the `nx` model and is absent entirely.
-  Async primitives are the `nx` API's job (`nx.spawn` / `nx.timer` / `nx.fs`) —
+  Async primitives are the `nx` API's job (`nx.run` / `nx.timer` / `nx.fs`) —
   the existing timer/process machinery is the donor for those
   ([ADR 0002](decisions/0002-native-plugin-system.md)).
 - The `vim.*` glue, kept only as far as colorschemes need

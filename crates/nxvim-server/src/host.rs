@@ -50,7 +50,7 @@ pub struct ProcSpec {
     pub stdin: Vec<u8>,
     /// Stream stdout incrementally: emit newline-delimited batches as
     /// [`ProcEvents::stdout`] as they arrive (the picker's streaming sources via
-    /// `nx.spawn`'s `on_stdout`), and report empty stdout with the exit. When
+    /// `nx.run_stream`'s streamed stdout), and report empty stdout with the exit. When
     /// `false` the child runs to completion and its whole stdout is captured into
     /// the single [`ProcEvents::exited`] — the original `vim.system` behavior.
     pub stream: bool,

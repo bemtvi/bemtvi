@@ -15,7 +15,7 @@
 > `nx.treesitter` (highlight control as the `nx.bo.filetype` / `nx.bo.ts_highlight`
 > two nouns, and `nx.treesitter.set_query`). The UI-orchestration registries below
 > (`nx.complete` / `picker` / `statusline` / `snippet` / `tree`) and the async
-> primitives (`nx.spawn` / `timer` / `fs` / `ui`) remain proposed.
+> primitives (`nx.run` / `nx.run_stream` / `timer` / `fs` / `ui`) remain proposed.
 
 ## Why not neovim's plugin model
 
@@ -51,16 +51,20 @@ internally; the API makes them the documented contract:
    (`apply_lua_effects → run_pending → redraw`). Async writers guard with a
    changedtick: `nx.buf.edit{tick = t, ...}` fails loud if stale.
 3. **Nothing blocks, ever.** No wait-pumps, no blocking reads, no uv handles.
-   Anything that waits takes a callback (`nx.ui.input`, `nx.spawn`,
-   `nx.fs.*`, `nx.timer`). This also keeps the PUC Lua 5.1 backend (no yield
-   across `pcall`) fully supported by construction.
+   Anything that waits returns a **promise** (`nx.run`, `nx.fs.*`, `nx.timer`'s
+   `nx.promise.delay`) you `nx.await` inside `nx.async`, or — for multi-value
+   streaming — an async-iterator (`nx.run_stream` + `nx.await_each`); `nx` is
+   promise-only (no callback-shaped async). Event subscriptions (`nx.autocmd`,
+   `nx.on_key`) stay handler-based — they fire repeatedly, so a promise is the
+   wrong shape. (See [the promise-only migration](../plans/2026-06-16-nx-promise-only-async.md).)
 4. **No frame-time Lua.** Plugins publish decorations / segments / items
    whenever they like; the server folds them into the next frame. A plugin
    cannot make redraw slow. (ADR 0001's bridge pattern, generalized into *the*
    extension contract.)
 5. **Registrations are data.** Providers register with a name + schema and get
-   called with a context + a `respond` continuation carrying a generation
-   token; stale responses are dropped by the engine.
+   called with a context carrying a generation token; they emit through the
+   context's sink (`ctx.push`) and signal completion by returning (a promise, or
+   nothing for a synchronous provider). Stale responses are dropped by the engine.
 
 Because Lua influences the editor only through the same queues RPC clients
 use, every `nx.*` registration gets an RPC twin in principle
@@ -73,7 +77,7 @@ same surface, later. The in-process Lua host is v1.
 | --- | --- | --- |
 | `nx.buf` / `nx.win` / `nx.cursor` | snapshot reads, queued edits, `on_change` byte-delta subscription | mirrors + effect queues + the edit journal |
 | `nx.on(event, opts, fn)` | structured event subscriptions | the lifecycle/autocmd diff |
-| `nx.spawn` / `nx.timer` / `nx.fs.*` | async process / timer / fs, callback-based | evloop actor + HostFs seams |
+| `nx.run` / `nx.run_stream` / `nx.timer` / `nx.fs.*` | async process (promise / async-iterator) / timer / fs | evloop actor + HostFs seams |
 | `nx.hl.set(ns, buf, marks)` | batch-published decorations (known up front) | the extmark layer + priorities |
 | `nx.decor.provider` | viewport-scoped decoration publisher — lazy, recomputed on scroll, off the frame | the decoration-provider drive (`decor_on_win`), debounced off `redraw`; folds into the extmark layer |
 | `nx.keymap` / `nx.command` / `nx.cmd` | maps, user commands, ex dispatch | existing |
@@ -109,7 +113,7 @@ return {
 ```
 
 `init.lua` declares the set; the built-in manager syncs it over the async
-runtime (real `git clone` via `nx.spawn`):
+runtime (real `git clone` via `nx.run`):
 
 ```lua
 nx.plugins {
@@ -202,12 +206,13 @@ nx.statusline.segment {
   end,
 }
 
--- async data: recompute, then invalidate yourself
-nx.spawn { cmd = "git", args = { "branch", "--show-current" },
-  on_exit = function(res)
-    cached_branch[cwd] = res.stdout:gsub("%s+$", "")
-    nx.statusline.invalidate("git")
-  end }
+-- async data: recompute, then invalidate yourself (nx.run is a promise — await it)
+local refresh = nx.async(function()
+  local res = nx.await(nx.run { cmd = "git", args = { "branch", "--show-current" } })
+  cached_branch[cwd] = res.stdout:gsub("%s+$", "")
+  nx.statusline.invalidate("git")
+end)
+refresh()
 ```
 
 ### 3. Fuzzy finding (the fuzzy-finder shape) — native picker + sources
@@ -221,16 +226,15 @@ changed" (dynamic sources) and "confirmed".
 ```lua
 nx.keymap.set("n", "<leader>ff", function() nx.picker.open("files") end)
 
--- a static, streaming source:
+-- a static, streaming source: an nx.async iterator over nx.run_stream's batches.
+-- The source emits via ctx.push and completes by returning (no `done` callback).
 nx.picker.source {
   name = "files",
-  items = function(ctx, push, done)              -- results stream in as found
-    nx.spawn { cmd = "rg", args = { "--files" }, cwd = ctx.cwd,
-      on_stdout = function(lines)
-        for _, l in ipairs(lines) do push { text = l, path = l } end
-      end,
-      on_exit = done }
-  end,
+  items = nx.async(function(ctx)               -- results stream in as found
+    for batch in nx.await_each(nx.run_stream { cmd = "rg", args = { "--files" }, cwd = ctx.cwd }) do
+      for _, l in ipairs(batch) do ctx.push { text = l, path = l } end
+    end
+  end),
   preview = "file",                              -- declarative: server previews item.path
                                                  -- (rope + native treesitter, zero Lua)
   confirm = function(item) nx.cmd("edit " .. nx.fnameescape(item.path)) end,
@@ -240,15 +244,14 @@ nx.picker.source {
 nx.picker.source {
   name = "live_grep",
   dynamic = true,
-  items = function(ctx, push, done)
-    if ctx.query == "" then return done() end
-    local p = nx.spawn { cmd = "rg", args = { "--vimgrep", "--", ctx.query },
-      on_stdout = function(lines)
-        for _, l in ipairs(lines) do push(parse_vimgrep(l)) end
-      end,
-      on_exit = done }
-    ctx.on_cancel(function() p:kill() end)       -- superseded queries are reaped
-  end,
+  items = nx.async(function(ctx)
+    if ctx.query == "" then return end
+    local stream = nx.run_stream { cmd = "rg", args = { "--vimgrep", "--", ctx.query } }
+    ctx.on_cancel(function() stream:kill() end)  -- superseded queries are reaped
+    for batch in nx.await_each(stream) do
+      for _, l in ipairs(batch) do ctx.push(parse_vimgrep(l)) end
+    end
+  end),
   preview = "location",
   confirm = function(item)
     nx.cmd("edit " .. nx.fnameescape(item.path))
@@ -377,7 +380,7 @@ nx.decor.provider {
 Marks are the **same shape as `nx.hl.set`** — decorations are one data type
 whether static or viewport-driven:
 `{ row, col, end_row?, end_col?, hl?, virt_text?, virt_lines?, sign?, conceal?, priority? }`.
-Async is fine: an indent-guide or blame provider can `nx.spawn`/`nx.lsp`
+Async is fine: an indent-guide or blame provider can `nx.run`/`nx.lsp`
 inside `on_range` and call `publish` from the callback — the generation token
 makes a late response safe to fold or safe to drop. A provider that errors is
 reported loud (`E5108`) and disabled after repeated failures, matching the
@@ -451,7 +454,7 @@ serves nxvim's objectives is refactored into `nx.treesitter` / `nx.lsp` (the
 highlight toggle becomes buffer state, above), and the rest is deleted. The neovim runtime-model surfaces — wait-pumps, public uv
 handles, frame-time decoration providers, the `vim.fn` long tail,
 prompt-buffer emulation — exist on neither side of the API: plugins and config
-get `nx.spawn` / `nx.timer` / `nx.fs` / `nx.ui.*` and the off-frame
+get `nx.run` / `nx.timer` / `nx.fs` / `nx.ui.*` and the off-frame
 `nx.decor` instead.
 
 The native subsystems the surfaces above expose — LSP, treesitter, extmarks,
@@ -466,7 +469,11 @@ engines this API is a thin contract over.
 2. **Picker** — highest daily-driver value; exercises spawn / streaming /
    cancellation / floats / preview end to end.
 3. **Completion engine** — LSP + buffer + snippets sources built-in.
-4. **Statusline segments**, **snippet engine** (shared with 3), **tree docks**.
+4. **Statusline segments** *(landed — `nx.statusline`, the lualine-shaped
+   registry: built-ins resolved natively, custom segments re-rendered on declared
+   events / `invalidate`; see
+   [the plan](../plans/2026-06-15-nx-statusline-segments.md))*, **snippet engine**
+   *(landed, shared with 3)*, **tree docks**.
 5. **`nx.decor`** — the decoration-provider drive already exists; the new
    piece is the debounced viewport-changed signal off the scroll/resize path
    (not `redraw`) and the generation-keyed publish into the extmark layer.

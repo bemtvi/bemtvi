@@ -506,6 +506,15 @@ pub struct EditHost {
     /// body to expand.
     snippet_complete: Vec<snippet::SnippetEntry>,
 
+    /// The active `nx.statusline.setup{}` layout (ordered segment names per side).
+    /// `Some` takes precedence over the `'statusline'` `%`-format for every window;
+    /// `None` ⇒ the format path. Set by draining `statusline_setups`.
+    statusline_layout: Option<nxvim_core::statusline::SegmentLayout>,
+    /// Per-name cache of custom statusline-segment cells published from Lua
+    /// (`nx._statusline_publish`). Read during redraw and updated only when a
+    /// segment is invalidated — never per frame (ADR 0002 rule 4).
+    statusline_cache: std::collections::HashMap<String, Vec<nxvim_core::statusline::StatusSegment>>,
+
     /// The buffer that was current the last time lifecycle events were emitted;
     /// `None` until the startup seed. A change here means a `BufEnter` (fired on
     /// every entry).
@@ -753,6 +762,8 @@ impl EditHost {
             complete_snippets_active: false,
             complete_snippets_priority: 0,
             snippet_complete: Vec::new(),
+            statusline_layout: None,
+            statusline_cache: std::collections::HashMap::new(),
             last_buffer_id: None,
             announced: HashSet::new(),
             known_buffers: Vec::new(),
@@ -1214,7 +1225,7 @@ impl EditHost {
     pub fn proc_stdout(&mut self, id: u64, lines: Vec<String>) {
         if let Err(e) = self.lua.run_process_stdout(id, lines) {
             self.editor
-                .echo(format!("E5108: Error in nx.spawn on_stdout: {e}"));
+                .echo(format!("E5108: Error in nx.run_stream handler: {e}"));
         }
         self.apply_lua_effects();
         self.settle_events(true);

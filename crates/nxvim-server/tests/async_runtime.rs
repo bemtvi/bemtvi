@@ -165,6 +165,94 @@ async fn debounce_flush_runs_the_pending_call_now() {
 
 // ----- Phase 3: async vim.system ---------------------------------------------
 
+// ----- nx.run / nx.run_stream (promise-only process API) ---------------------
+
+#[tokio::test]
+async fn nx_run_resolves_with_exit_result() {
+    let (rpc, _incoming) = start().await;
+    // nx.run is a promise of { code, stdout, stderr }: it does NOT resolve inline
+    // (the child runs off-tick), then settles with the collected output.
+    exec_lua(
+        &rpc,
+        "_G.res = nil\n\
+         nx.run({ cmd = 'sh', args = { '-c', 'echo hello' } }):next(function(r) _G.res = r end)",
+    )
+    .await;
+    // Barrier #1: still pending (no inline resolution).
+    assert_eq!(lua_bool(&rpc, "return _G.res == nil").await, Some(true));
+    // Past the run: resolved with stdout + a zero exit code.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(
+        exec_lua(&rpc, "return _G.res.stdout").await.as_str(),
+        Some("hello\n")
+    );
+    assert_eq!(lua_u64(&rpc, "return _G.res.code").await, Some(0));
+}
+
+#[tokio::test]
+async fn nx_run_reports_spawn_failure_as_code_minus_one() {
+    let (rpc, _incoming) = start().await;
+    // A missing binary surfaces as code = -1 with empty output — it RESOLVES
+    // (vim.system semantics), never rejects, so a `:catch` isn't needed for a
+    // non-zero exit.
+    exec_lua(
+        &rpc,
+        "_G.code = nil\n\
+         nx.run({ cmd = 'definitely-not-a-real-binary-xyz' }):next(function(r) _G.code = r.code end)",
+    )
+    .await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(lua_bool(&rpc, "return _G.code == -1").await, Some(true));
+}
+
+#[tokio::test]
+async fn nx_run_stream_iterates_batches_via_await_each() {
+    let (rpc, _incoming) = start().await;
+    // nx.run_stream + nx.await_each inside nx.async: the for-loop sees every
+    // streamed line, then ends (the stream's :next resolves nil at exit) so the
+    // async function completes.
+    exec_lua(
+        &rpc,
+        "_G.lines = {}\n\
+         _G.done = false\n\
+         nx.async(function()\n\
+           for batch in nx.await_each(nx.run_stream({ cmd = 'sh', args = { '-c', 'echo a; echo b; echo c' } })) do\n\
+             for _, l in ipairs(batch) do _G.lines[#_G.lines + 1] = l end\n\
+           end\n\
+           _G.done = true\n\
+         end)()",
+    )
+    .await;
+    tokio::time::sleep(Duration::from_millis(250)).await;
+    // The collected lines, sorted to be order-independent of stdout batching.
+    let joined = exec_lua(
+        &rpc,
+        "local t = {}; for _, l in ipairs(_G.lines) do if l ~= '' then t[#t+1] = l end end; table.sort(t); return table.concat(t, ',')",
+    )
+    .await;
+    assert_eq!(joined.as_str(), Some("a,b,c"));
+    assert_eq!(
+        lua_bool(&rpc, "return _G.done").await,
+        Some(true),
+        "the async iterator terminated at end-of-stream"
+    );
+}
+
+#[tokio::test]
+async fn nx_spawn_is_removed() {
+    let (rpc, _incoming) = start().await;
+    // The callback-shaped nx.spawn is gone — nx is promise-only.
+    assert_eq!(lua_bool(&rpc, "return nx.spawn == nil").await, Some(true));
+    assert_eq!(
+        lua_bool(&rpc, "return type(nx.run) == 'function'").await,
+        Some(true)
+    );
+    assert_eq!(
+        lua_bool(&rpc, "return type(nx.run_stream) == 'function'").await,
+        Some(true)
+    );
+}
+
 // ----- Phase 4: robustness (leaks, schedule_wrap) ----------------------------
 
 #[tokio::test]

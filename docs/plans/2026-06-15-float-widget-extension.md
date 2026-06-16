@@ -123,16 +123,48 @@ help / diagnostics are unaffected.
 
 ### Phase 4 — `examples/which-key/`  *(dogfood + end-to-end verify)*
 
-- A native `nx.*` plugin: `on_key` rebuilds the pending prefix against a trie
-  built from `nx.keymap.get`; after `timeoutlen` (`nx.timer`) it opens the
-  persistent, bottom-anchored, highlighted float listing continuations; updates
-  on each further key; closes on completion / `<Esc>` / mode change.
+- A native `nx.*` plugin driven by the **`KeyPending` event** (below), not a key
+  observer: each event carries `{ mode, keys, continuations }`; the plugin
+  debounces with `nx.debounce` (its show-delay policy) and renders the
+  persistent, bottom-anchored, highlighted float; an empty payload (prefix
+  resolved / cleared) closes it.
 - Ship a runnable `examples/which-key/` config + sample, verified end-to-end
   (the example-config convention).
+
+## The pending-key event (the oracle) — design decisions (2026-06-15)
+
+which-key needs to know the *pending key context*, which the keymap matcher
+already tracks (`Keymaps::pending` + the per-mode trie) but didn't expose. The
+shape, after working it through:
+
+- **Push, not pull.** A `KeyPending` event fires whenever the pending key-context
+  **changes** (a prefix grows, or clears), carrying `{ mode, keys,
+  continuations }` where each continuation is `{ key, desc, kind = map|group }`.
+  No standalone `nx.keymap.pending()` query for now (YAGNI — add later if a
+  statusline/showcmd wants on-demand reads).
+- **Fires immediately; the plugin debounces.** The engine pushes on every
+  pending-change with no built-in delay — show-delay is UI policy, kept in Lua
+  via `nx.debounce`. This also dissolves the "close on timeout" problem: the
+  idle-flush clearing the prefix just emits an empty `KeyPending`, so the popup
+  closes with no re-polling.
+- **`nx.on_key` is removed.** The per-keystroke Lua observer had zero consumers,
+  wasn't in the ADR 0002 whitelist, and contradicted rule 4 (*no per-keystroke
+  Lua*). Its only legitimate solo use (keystroke-cast overlays) is re-addable
+  later as a narrow `KeyPressed` event if ever needed. which-key + showcmd-class
+  needs are served better by `KeyPending` (engine-computed, no reconstruction).
+- **Source order.** A — mapped prefixes (the matcher trie, `desc` stashed on the
+  trie `Node`). B — built-in command grammar (operator-pending, `g`/`z`,
+  registers, marks). C — active-widget key tables (the picker prompt's
+  `handle_picker_key`; the `<C-r>` register case). `KeyPending` must fire from the
+  union of these, not the matcher alone, to match real which-key coverage.
+
+A general **`nx.debounce(fn, ms)`** helper (trailing-edge, with `:cancel()` /
+`:flush()`) lands alongside this — the first of the generally-useful helpers the
+`nx.*` surface exposes to plugin authors, not a which-key private.
 
 ## Testing (black-box, per the no-unit-test rule)
 
 Drive keys against the running server and assert on the `redraw` `float`
-sub-map (lines, geometry, border, title, and — Phase 3 — highlight spans) and on
-the float's persistence across an `nvim_input` barrier. No `#[test]` units in
-the crates.
+sub-map (lines, geometry, border, title, and — Phase 3 — highlight spans), on
+the float's persistence across an `nvim_input` barrier, and on the `KeyPending`
+notification payload (prefix + continuations). No `#[test]` units in the crates.

@@ -1,5 +1,5 @@
-//! Behavior tests for assorted `vim.*` surface: the keystroke observer
-//! (`vim.on_key`), the keymap readers (`nvim_get_keymap` / `nvim_buf_get_keymap`
+//! Behavior tests for assorted `vim.*` surface: the keymap readers
+//! (`nvim_get_keymap` / `nvim_buf_get_keymap`
 //! / `vim.fn.maparg`), the typeahead pair (`nvim_replace_termcodes` +
 //! `nvim_feedkeys`), scratch buffers (`nvim_create_buf`), and the
 //! predefined-variable / global-option tables (`vim.v` / `vim.go`).
@@ -361,47 +361,6 @@ async fn buf_get_keymap_separates_buffer_local_from_global() {
 // ===================== nvim_create_buf =====================================
 
 // ============== nvim_replace_termcodes + nvim_feedkeys =====================
-
-// ===================== vim.on_key ==========================================
-
-#[tokio::test]
-async fn on_key_observes_every_keystroke() {
-    let dir = temp_dir("on_key");
-    let init = r#"
-        _G.keys = {}
-        vim.on_key(function(_raw, key)
-          _G.keys[#_G.keys + 1] = key
-        end)
-    "#;
-    let (rpc, _incoming) = start_with_config(&dir, init).await;
-
-    feed(&rpc, "jk");
-    assert_eq!(
-        as_str(&exec_lua(&rpc, "return table.concat(_G.keys, ',')").await),
-        "j,k"
-    );
-
-    // vim.on_key(nil) clears observers — later keys are no longer recorded.
-    exec_lua(&rpc, "vim.on_key(nil)").await;
-    feed(&rpc, "l");
-    assert_eq!(
-        as_str(&exec_lua(&rpc, "return table.concat(_G.keys, ',')").await),
-        "j,k"
-    );
-}
-
-#[tokio::test]
-async fn on_key_reports_special_keys_in_notation() {
-    let dir = temp_dir("on_key_sp");
-    let init = r#"
-        _G.last = nil
-        vim.on_key(function(_raw, key) _G.last = key end)
-    "#;
-    let (rpc, _incoming) = start_with_config(&dir, init).await;
-
-    feed(&rpc, "<Esc>");
-    assert_eq!(as_str(&exec_lua(&rpc, "return _G.last").await), "<Esc>");
-}
 
 // ========================= popup render surface ============================
 // The APIs a floating popup UI drives to *render* itself: highlight reads

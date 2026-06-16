@@ -960,28 +960,6 @@ impl LuaRuntime {
         take_feedkeys -> Vec<FeedKeysOp> = feedkeys
     }
 
-    /// Whether any `vim.on_key` observer is registered — the cheap guard the
-    /// server checks per key before paying for [`Self::run_on_key`]. `false` on
-    /// any error (a malformed VM simply has no observers).
-    pub fn has_on_key(&self) -> bool {
-        self.read_has_on_key().unwrap_or(false)
-    }
-
-    fn read_has_on_key(&self) -> mlua::Result<bool> {
-        let f: mlua::Function = self.nx()?.get("_has_on_key")?;
-        f.call::<bool>(())
-    }
-
-    /// Fire every `vim.on_key` observer with `key` (vim key-notation), passed as
-    /// both the `(key, typed)` arguments neovim's on_key callback receives. A
-    /// throwing observer is detached (matching neovim) inside `nx._run_on_key`;
-    /// any other error is returned for the server to surface.
-    pub fn run_on_key(&self, key: &str) -> mlua::Result<()> {
-        let run: mlua::Function = self.nx()?.get("_run_on_key")?;
-        let k = mlua::Value::String(self.lua.create_string(key)?);
-        run.call::<()>((k.clone(), k))
-    }
-
     /// Deliver a `vim.ui.input` result to its callback `id`: the typed line
     /// (`Some`) on `<CR>`, or `nil` (`None`) on cancel. Runs `nx._run_cb(id,
     /// false, text)` — a one-shot, so the callback registry entry is dropped after

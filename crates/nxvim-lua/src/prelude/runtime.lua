@@ -169,54 +169,6 @@ function nx.spawn(opts)
   }
 end
 
--- ----- vim.on_key: the keystroke observer ------------------------------------
--- Plugins (popup helpers, debugging tools) register a function to watch every key the
--- server processes. The registry lives Lua-side keyed by namespace id; the server
--- checks nx._has_on_key once per key (cheap) and, when there are observers, calls
--- nx._run_on_key(key, typed) for each. nxvim passes the key's vim notation for
--- both arguments (it has no separate terminal-byte form).
-nx._on_key_fns = nx._on_key_fns or {}
-nx._on_key_seq = nx._on_key_seq or 0
-
--- nx.on_key [alias vim.on_key] (fn[, ns_id[, opts]]): register `fn` as a keystroke
--- observer and return its namespace id. `nx.on_key(nil, ns)` removes that observer;
--- `nx.on_key(nil)` clears them all. Re-registering an existing ns replaces it.
-function nx.on_key(fn, ns_id, _opts)
-  if fn == nil then
-    if ns_id == nil then
-      nx._on_key_fns = {}
-      return 0
-    end
-    nx._on_key_fns[ns_id] = nil
-    return ns_id
-  end
-  if ns_id == nil then
-    nx._on_key_seq = nx._on_key_seq + 1
-    ns_id = nx._on_key_seq
-  end
-  nx._on_key_fns[ns_id] = fn
-  return ns_id
-end
-vim.on_key = nx.on_key
-
--- Whether any observer is registered (the server's per-key fast-path guard).
-function nx._has_on_key()
-  return next(nx._on_key_fns) ~= nil
-end
-
--- Run every observer with (key, typed). A throwing observer is DETACHED (matching
--- neovim, which removes an on_key callback that errors) and the error reported,
--- so one bad observer can't break input handling or silence the others.
-function nx._run_on_key(key, typed)
-  for ns, fn in pairs(nx._on_key_fns) do
-    local ok, err = pcall(fn, key, typed)
-    if not ok then
-      nx._on_key_fns[ns] = nil
-      vim.notify("nxvim: on_key callback errored and was removed: " .. tostring(err))
-    end
-  end
-end
-
 function nx.notify(msg, _level, _opts)
   if type(msg) == "table" then
     msg = table.concat(msg, "\n")

@@ -5,7 +5,7 @@
 use crate::keymap::BuiltinAction;
 use crate::keymap::{MappingRhs, Step};
 use crate::EditHost;
-use nxvim_core::{key_to_notation, parse_keys, Key};
+use nxvim_core::{parse_keys, Key};
 
 impl EditHost {
     pub(crate) fn input(&mut self, keys: &str) {
@@ -23,10 +23,8 @@ impl EditHost {
         self.drain_feedkeys();
     }
 
-    /// Route one input key through the completion popup / mapping engine. Every key
-    /// processed here is also reported to the `vim.on_key` observers.
+    /// Route one input key through the completion popup / mapping engine.
     pub(crate) fn process_key(&mut self, key: Key) {
-        self.notify_on_key(key);
         // The `nx.complete` engine's popup (incl. the built-in `lsp` source, Phase
         // 4-C) is **non-grabbing** and handled in core: while it is open,
         // `editor.input` (below, via the matcher) intercepts only its control keys
@@ -42,21 +40,6 @@ impl EditHost {
         // B2/B3); the `command_status` oracle keeps core's `g`-motions (`gg`/`dgg`/…)
         // intact under the `g`-prefix collision.
         self.feed_matcher(key);
-    }
-
-    /// Report `key` (as vim notation) to every `vim.on_key` observer. Guarded by
-    /// the cheap `has_on_key` check so a session with no observer pays nothing.
-    /// An observer's queued effects drain immediately (an `on_key` that echoes /
-    /// `vim.cmd`s shouldn't strand its work until the next chunk).
-    pub(crate) fn notify_on_key(&mut self, key: Key) {
-        if !self.lua.has_on_key() {
-            return;
-        }
-        if let Err(e) = self.lua.run_on_key(&key_to_notation(key)) {
-            self.editor
-                .echo(format!("E5108: Error in on_key callback: {e}"));
-        }
-        self.apply_lua_effects();
     }
 
     /// Process the `nvim_feedkeys` typeahead to exhaustion: each queued key is fed
@@ -82,8 +65,6 @@ impl EditHost {
                 break;
             }
             budget -= 1;
-            // A fed key, like a typed one, is observed.
-            self.notify_on_key(key);
             if remap {
                 self.feed_matcher(key);
             } else {

@@ -15,6 +15,14 @@ fn main() {
         // The vendored sources are upstream code compiled outside their home
         // build system; their warnings are not ours to fix.
         .warnings(false);
+
+    // MSVC lacks the POSIX `ssize_t` the vendored sources expect. Force-include
+    // a portability header (via /FI) rather than patching the vendored tree, so
+    // csrc/nvim stays byte-for-byte upstream across re-vendoring.
+    if build.get_compiler().is_like_msvc() {
+        build.flag("/FInxre_compat.h");
+    }
+
     build.compile("nxvim_regex_c");
 
     println!("cargo:rerun-if-changed=csrc");

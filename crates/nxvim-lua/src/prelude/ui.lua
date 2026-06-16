@@ -157,18 +157,10 @@ function nx.ui.confirm(message, opts, on_choice)
 end
 
 -- ----- nx.ui.float -----------------------------------------------------------
--- nx.ui.float(contents, opts): open the list-less content float — the sibling of
--- the selectable-list widget (docs/specs/2026-06-14-nx-ui-float-widget.md, "What
--- stays out of this widget") — rendering plain content with no list / selection.
--- `contents` is a string (split on newlines) or a list of line strings. `opts`:
---   border   = "none"|"single"|"rounded"|"double"|"solid"  (default "rounded")
---   title    = a string drawn on the top border (optional)
---   relative = "cursor" (default, anchors at the cursor) | "editor" (centered)
--- The server owns the float, its geometry, and its dismissal (the next key closes
--- it). Fire-and-forget: empty contents open nothing. This is the surface LSP hover
--- and signature help render through natively.
-function nx.ui.float(contents, opts)
-  opts = opts or {}
+-- Normalize `contents` (a string split on newlines, or a list of line strings)
+-- into a line list, dropping a single trailing empty line so a markdown body
+-- ending in "\n" doesn't render a blank last row. Errors loud on a bad type.
+local function float_lines(contents)
   local lines
   if type(contents) == "string" then
     lines = vim.split(contents, "\n", { plain = true })
@@ -180,13 +172,68 @@ function nx.ui.float(contents, opts)
   else
     error("nx.ui.float: contents must be a string or a list of strings", 2)
   end
-  -- Drop a single trailing empty line (a string ending in "\n" splits to one), so
-  -- markdown bodies don't render a blank last row.
   if #lines > 1 and lines[#lines] == "" then
     lines[#lines] = nil
   end
+  return lines
+end
+
+-- The persistent-float handle returned by `nx.ui.float{ persist = true }`. It
+-- owns a server-side content float by id: `:update` replaces its content in place
+-- (same id), `:close` dismisses it, `:is_open` reports whether this handle still
+-- owns the open float. `nx._float_open_id` tracks which persistent float the
+-- server last opened, so a stale handle (its float replaced by a newer persistent
+-- one) reports `is_open() == false` without a server round-trip.
+nx._float_open_id = nx._float_open_id or nil
+nx._next_float_id = nx._next_float_id or 0
+local float_handle = {}
+float_handle.__index = float_handle
+function float_handle:update(contents, opts)
+  opts = opts or {}
+  local lines = float_lines(contents)
+  if #lines == 0 then
+    return self:close()
+  end
+  nx._float_open_id = self._id
+  nx._ui_float(self._id, lines, opts.title, opts.border or "rounded", opts.relative == "editor")
+end
+function float_handle:close()
+  if nx._float_open_id == self._id then
+    nx._float_open_id = nil
+  end
+  nx._ui_float_close(self._id)
+end
+function float_handle:is_open()
+  return nx._float_open_id == self._id
+end
+
+-- nx.ui.float(contents, opts): open the list-less content float — the sibling of
+-- the selectable-list widget (docs/specs/2026-06-14-nx-ui-float-widget.md, "What
+-- stays out of this widget") — rendering plain content with no list / selection.
+-- `contents` is a string (split on newlines) or a list of line strings. `opts`:
+--   border   = "none"|"single"|"rounded"|"double"|"solid"  (default "rounded")
+--   title    = a string drawn on the top border (optional)
+--   relative = "cursor" (default, anchors at the cursor) | "editor" (centered)
+--   persist  = when truthy, the float survives keystrokes (it is not dismissed by
+--              the next key) and nx.ui.float returns a HANDLE with :update(contents,
+--              opts) / :close() / :is_open(). This is the surface an observer plugin
+--              (e.g. which-key, driving it from nx.on_key) renders through.
+-- Without `persist` it is fire-and-forget: the server owns the float, its
+-- geometry, and its dismissal (the next key closes it); returns nil. Empty
+-- contents open nothing. LSP hover and signature help use the non-persistent form.
+function nx.ui.float(contents, opts)
+  opts = opts or {}
+  local lines = float_lines(contents)
   if #lines == 0 then
     return
   end
-  nx._ui_float(lines, opts.title, opts.border or "rounded", opts.relative == "editor")
+  if opts.persist then
+    nx._next_float_id = nx._next_float_id + 1
+    local handle = setmetatable({ _id = nx._next_float_id }, float_handle)
+    nx._float_open_id = handle._id
+    nx._ui_float(handle._id, lines, opts.title, opts.border or "rounded", opts.relative == "editor")
+    return handle
+  end
+  -- Transient (id 0): dismissed by the next key, no handle.
+  nx._ui_float(0, lines, opts.title, opts.border or "rounded", opts.relative == "editor")
 end

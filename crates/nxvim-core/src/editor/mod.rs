@@ -1423,12 +1423,17 @@ impl Editor {
 
     /// Feed a single key into the editor.
     pub fn input(&mut self, key: Key) {
-        // A content float (hover / signature help / `nx.ui.float`) is a transient
-        // popup that never grabs input: the next key dismisses it, then is handled
-        // normally below (vim closes a hover float on the next motion). It opens
-        // off-tick on an LSP reply or synchronously from a mapping *after* this
-        // clear, so the float that just opened survives until the following key.
-        self.content_float = None;
+        // A *transient* content float (hover / signature help / a plain
+        // `nx.ui.float`) never grabs input: the next key dismisses it, then is
+        // handled normally below (vim closes a hover float on the next motion). It
+        // opens off-tick on an LSP reply or synchronously from a mapping *after*
+        // this clear, so the float that just opened survives until the following
+        // key. A *persistent* float (`nx.ui.float{ persist = true }`, e.g. a
+        // which-key popup observing keys via `nx.on_key`) is left alone — it lives
+        // until its handle closes it or a replacement, not until the next key.
+        if matches!(&self.content_float, Some(f) if !f.persistent) {
+            self.content_float = None;
+        }
 
         // A focused panel grabs every key (navigation + close), bypassing the
         // buffer's mode handling and the `curswant`/scroll bookkeeping below.

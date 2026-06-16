@@ -124,6 +124,77 @@ async fn the_next_key_dismisses_the_float() {
 }
 
 #[tokio::test]
+async fn a_persistent_float_survives_keystrokes() {
+    let dir = temp_dir("ui_float_persist");
+    let (rpc, mut incoming) = start(&dir, "").await;
+
+    // persist = true returns a handle and the float is NOT dismissed by the next
+    // key (the which-key shape: it observes keys via nx.on_key while staying open).
+    exec_lua(
+        &rpc,
+        "_G.wk = nx.ui.float({ 'pending: f g h' }, { persist = true })",
+    )
+    .await;
+    poll_float(&rpc, &mut incoming, |f| matches!(f, Value::Map(_)))
+        .await
+        .expect("the persistent float opens");
+
+    // Several keys go by; the float stays.
+    feed(&rpc, "jjk");
+    let map = poll_float(&rpc, &mut incoming, |f| matches!(f, Value::Map(_)))
+        .await
+        .expect("the persistent float is still open after keys");
+    assert_eq!(float_lines(&float_of(&map)), vec!["pending: f g h"]);
+    assert_eq!(
+        exec_lua(&rpc, "return _G.wk:is_open()").await,
+        Value::Boolean(true)
+    );
+}
+
+#[tokio::test]
+async fn update_replaces_the_persistent_float_in_place() {
+    let dir = temp_dir("ui_float_update");
+    let (rpc, mut incoming) = start(&dir, "").await;
+
+    exec_lua(&rpc, "_G.wk = nx.ui.float({ 'first' }, { persist = true })").await;
+    poll_float(&rpc, &mut incoming, |f| matches!(f, Value::Map(_)))
+        .await
+        .expect("the float opens");
+
+    // :update swaps the content under the same handle id.
+    exec_lua(&rpc, "_G.wk:update({ 'second', 'third' })").await;
+    let map = poll_float(&rpc, &mut incoming, |f| match f {
+        Value::Map(m) => {
+            matches!(map_get(m, "height").and_then(Value::as_u64), Some(2))
+        }
+        _ => false,
+    })
+    .await
+    .expect("the updated float surface");
+    assert_eq!(float_lines(&float_of(&map)), vec!["second", "third"]);
+}
+
+#[tokio::test]
+async fn close_dismisses_the_persistent_float() {
+    let dir = temp_dir("ui_float_close");
+    let (rpc, mut incoming) = start(&dir, "").await;
+
+    exec_lua(&rpc, "_G.wk = nx.ui.float({ 'open' }, { persist = true })").await;
+    poll_float(&rpc, &mut incoming, |f| matches!(f, Value::Map(_)))
+        .await
+        .expect("the float opens");
+
+    // The handle closes it explicitly; is_open() flips false and the surface clears.
+    assert_eq!(
+        exec_lua(&rpc, "_G.wk:close(); return _G.wk:is_open()").await,
+        Value::Boolean(false)
+    );
+    poll_float(&rpc, &mut incoming, |f| matches!(f, Value::Nil))
+        .await
+        .expect("the float is gone after :close()");
+}
+
+#[tokio::test]
 async fn editor_placement_centers_the_float() {
     let dir = temp_dir("ui_float_editor");
     let (rpc, mut incoming) = start(&dir, "").await;

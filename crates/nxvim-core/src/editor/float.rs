@@ -24,19 +24,56 @@ pub(crate) struct ContentFloat {
     pub title: Option<String>,
     pub border: BorderStyle,
     pub placement: MenuPlacement,
+    /// `true` for a **persistent** float (a `persist`-flagged `nx.ui.float`): it
+    /// survives keystrokes and is closed only explicitly (`close_content_float_id`)
+    /// or when replaced. `false` for the transient default (hover / signature /
+    /// diagnostic / a plain `nx.ui.float`): the next key dismisses it.
+    pub persistent: bool,
+    /// The handle id a persistent float is keyed by, so `:update`/`:close` from
+    /// Lua target the right float and a *stale* handle's close no-ops. `0` for a
+    /// transient float (which has no handle).
+    pub id: u64,
 }
 
 impl Editor {
-    /// Open a content float rendering `lines` (hover markup, a signature, or an
-    /// `nx.ui.float` caller's content). An empty `lines` opens nothing (and clears
-    /// any open float) — there is no empty popup. Replaces any float already open.
-    /// Non-grabbing: the next key dismisses it.
+    /// Open a **transient** content float rendering `lines` (hover markup, a
+    /// signature, or a non-`persist` `nx.ui.float` caller's content). An empty
+    /// `lines` opens nothing (and clears any open float) — there is no empty popup.
+    /// Replaces any float already open. Non-grabbing: the next key dismisses it.
     pub fn open_content_float(
         &mut self,
         lines: Vec<String>,
         title: Option<String>,
         border: BorderStyle,
         placement: MenuPlacement,
+    ) {
+        self.set_content_float(lines, title, border, placement, 0, false);
+    }
+
+    /// Open a **persistent** content float (`nx.ui.float{ persist = true }`),
+    /// keyed by handle `id`. Unlike the transient form it survives keystrokes —
+    /// `input()` leaves it untouched — until `close_content_float_id(id)` or a
+    /// replacement. An `:update` from the same handle re-enters here with the same
+    /// `id`, replacing the content in place. An empty `lines` closes it.
+    pub fn open_persistent_float(
+        &mut self,
+        lines: Vec<String>,
+        title: Option<String>,
+        border: BorderStyle,
+        placement: MenuPlacement,
+        id: u64,
+    ) {
+        self.set_content_float(lines, title, border, placement, id, true);
+    }
+
+    fn set_content_float(
+        &mut self,
+        lines: Vec<String>,
+        title: Option<String>,
+        border: BorderStyle,
+        placement: MenuPlacement,
+        id: u64,
+        persistent: bool,
     ) {
         if lines.is_empty() {
             self.content_float = None;
@@ -47,6 +84,8 @@ impl Editor {
             title,
             border,
             placement,
+            persistent,
+            id,
         });
     }
 
@@ -54,6 +93,18 @@ impl Editor {
     /// a caller can decide whether a repaint is owed).
     pub fn close_content_float(&mut self) -> bool {
         self.content_float.take().is_some()
+    }
+
+    /// Close the open content float **only if** it is the persistent float keyed by
+    /// `id`. A handle whose float was already replaced (a newer persistent float, a
+    /// transient hover) no-ops here rather than closing whatever happens to be open.
+    /// Returns whether anything closed.
+    pub fn close_content_float_id(&mut self, id: u64) -> bool {
+        if matches!(&self.content_float, Some(f) if f.persistent && f.id == id) {
+            self.content_float = None;
+            return true;
+        }
+        false
     }
 
     /// The renderable projection of the open content float, or `None`.

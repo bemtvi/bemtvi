@@ -1246,17 +1246,27 @@ pub(crate) fn install_runtime_api(
         )?,
     )?;
 
-    // `nx._ui_float(lines, title, border, editor)`: queue a `nx.ui.float` request
-    // ([`UiFloatReq`]). The server opens the list-less content float rendering
-    // `lines` with the given border / placement. Fire-and-forget — a content float
-    // has no selection or confirm and is dismissed by the next key, so no callback
-    // crosses the bridge.
+    // `nx._ui_float(id, lines, title, border, editor)`: queue a `nx.ui.float`
+    // open/update request ([`UiFloatReq`]). The server opens the list-less content
+    // float rendering `lines` with the given border / placement. `id == 0` is the
+    // transient default (no callback, dismissed by the next key); a non-zero `id`
+    // is a persistent handle's float (survives keystrokes; an `:update` re-queues
+    // with the same id), closed via `_ui_float_close`.
     let sh = shared.clone();
     nx.set(
         "_ui_float",
         lua.create_function(
-            move |_, (lines, title, border, editor): (Vec<String>, Option<String>, String, bool)| {
+            move |_,
+                  (id, lines, title, border, editor): (
+                u64,
+                Vec<String>,
+                Option<String>,
+                String,
+                bool,
+            )| {
                 sh.borrow_mut().ui_floats.push(UiFloatReq {
+                    id,
+                    close: false,
                     lines,
                     title,
                     border,
@@ -1265,6 +1275,26 @@ pub(crate) fn install_runtime_api(
                 Ok(())
             },
         )?,
+    )?;
+
+    // `nx._ui_float_close(id)`: queue a close for the persistent content float
+    // keyed by handle `id`. Ordered in the same `ui_floats` queue as opens, so an
+    // open-then-close within one chunk is honoured. A close for a float already
+    // replaced no-ops server-side (`close_content_float_id`).
+    let sh = shared.clone();
+    nx.set(
+        "_ui_float_close",
+        lua.create_function(move |_, id: u64| {
+            sh.borrow_mut().ui_floats.push(UiFloatReq {
+                id,
+                close: true,
+                lines: Vec::new(),
+                title: None,
+                border: String::new(),
+                editor: false,
+            });
+            Ok(())
+        })?,
     )?;
 
     // `nx._picker_open(dynamic)`: queue a `nx.picker.open` request

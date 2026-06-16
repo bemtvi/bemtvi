@@ -408,11 +408,16 @@ impl EditHost {
                 .open_menu(req.items, nxvim_core::MenuPlacement::Cursor, 0);
             self.pending_ui_select = Some(req.cb_id);
         }
-        // `nx.ui.float`: open the list-less content float. Fire-and-forget (no
-        // callback) and dismissed by the next key; the last queued wins. The border
-        // keyword is parsed loud here (no silent fallback) — an unknown one echoes
-        // and skips the float.
+        // `nx.ui.float`: open / update / close the list-less content float. A
+        // transient float (`id == 0`) is fire-and-forget and dismissed by the next
+        // key; a persistent one (`id != 0`) survives keystrokes until its handle
+        // closes it. The last queued op wins. The border keyword is parsed loud
+        // here (no silent fallback) — an unknown one echoes and skips the float.
         for req in self.lua.take_ui_floats() {
+            if req.close {
+                self.editor.close_content_float_id(req.id);
+                continue;
+            }
             let Some(border) = nxvim_core::BorderStyle::from_keyword(&req.border) else {
                 self.editor
                     .echo(format!("nx.ui.float: unknown border '{}'", req.border));
@@ -423,8 +428,13 @@ impl EditHost {
             } else {
                 nxvim_core::MenuPlacement::Cursor
             };
-            self.editor
-                .open_content_float(req.lines, req.title, border, placement);
+            if req.id == 0 {
+                self.editor
+                    .open_content_float(req.lines, req.title, border, placement);
+            } else {
+                self.editor
+                    .open_persistent_float(req.lines, req.title, border, placement, req.id);
+            }
         }
         // `nx.picker.open`: open the centered fuzzy-finder widget and kick the
         // source's initial run (generation 0, empty query). The source streams

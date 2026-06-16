@@ -822,16 +822,32 @@ pub struct UiSelectReq {
     pub cb_id: u64,
 }
 
-/// A `nx.ui.float(contents, opts)` request: open the list-less **content float**
-/// rendering `lines` (the sibling of the selectable-list widget — hover /
-/// signature help / arbitrary plugin content). Fire-and-forget: it carries no
-/// callback (a content float has no selection or confirm) and is dismissed by the
-/// next key. Queued in [`crate::runtime::Shared::ui_floats`], drained by the
-/// server into [`Editor::open_content_float`](nxvim_core::Editor::open_content_float).
+/// A `nx.ui.float(contents, opts)` request: open (or update / close) the
+/// list-less **content float** rendering `lines` (the sibling of the
+/// selectable-list widget — hover / signature help / arbitrary plugin content).
+///
+/// Two lifetimes share this one queue, ordered so an open-then-close within a
+/// single chunk is honoured:
+/// - **Transient** (`id == 0`): fire-and-forget, dismissed by the next key — the
+///   hover / signature / plain-`nx.ui.float` shape.
+/// - **Persistent** (`id != 0`): a `persist`-flagged float keyed by a Lua handle
+///   id; it survives keystrokes and is closed only by an explicit `close` op (or a
+///   replacement). An `:update` is just another open with the same `id`.
+///
+/// Queued in [`crate::runtime::Shared::ui_floats`], drained by the server into
+/// [`Editor::open_content_float`](nxvim_core::Editor::open_content_float) /
+/// [`open_persistent_float`](nxvim_core::Editor::open_persistent_float) /
+/// [`close_content_float_id`](nxvim_core::Editor::close_content_float_id).
 #[derive(Clone, Debug)]
 pub struct UiFloatReq {
-    /// The content lines to render, in order (non-empty: the Lua wrapper resolves
-    /// empty content to a no-op without queuing).
+    /// The handle id for a persistent float, or `0` for a transient one. A `close`
+    /// op targets the float with this id.
+    pub id: u64,
+    /// `true` to **close** the persistent float keyed by `id` (the other fields are
+    /// ignored); `false` to open / update.
+    pub close: bool,
+    /// The content lines to render, in order (non-empty for an open: the Lua
+    /// wrapper resolves empty content to a no-op / close without queuing an open).
     pub lines: Vec<String>,
     /// The title drawn on the top border (`opts.title`), or `None` when untitled.
     pub title: Option<String>,

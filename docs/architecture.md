@@ -86,6 +86,11 @@ subsystems:
 | `nxvim-lua`     | `lua/`                                                | Embedded Lua runtime (vendored PUC Lua 5.4, the single backend) and the `vim.*` standard library. |
 | `nxvim-tui`     | `tui/`                                                | The terminal UI **client**. A thin RPC client; owns no editor state. |
 | `nxvim-ts`      | `tree_sitter/`                                       | The **in-process treesitter engine**: an ordinary library that loads installable grammars and parses incrementally, implementing `nxvim-core`'s `SyntaxEngine` trait. Heavy C deps (`tree-sitter`, `libloading`) live here only. |
+| `nxvim-lsp`     | `lsp/`                                                | The native **LSP client**: protocol, transport, manager — nxvim's own stdio spawning, driving the in-core editing features. `nxvim-server/src/lsp/` is the editing-loop glue on top. |
+| `nxvim-regex`   | `regexp.c`, `regexp_nfa.c`                            | The **vendored vim regexp engine** compiled as C, shared by search and `:s` (engine-global mutex). |
+| `nxvim-view`    | (UI layer)                                           | Frontend-neutral decode/input layer (`View`, `Style`, `Key`, `notation`, paste encoding) shared by the native clients. |
+| `nxvim-gui`     | (a GUI frontend)                                     | The native GUI **client** on winit + wgpu + glyphon; the GUI sibling of `nxvim-tui`, consuming the same `View`. |
+| `nxvim-edithost`| —                                                    | The fully client-side **WebAssembly** build of the whole editor (core + Lua + server tick) in a Web Worker; excluded from the Cargo workspace. See [*The web build*](#the-web-build--a-fully-client-side-webassembly-editor). |
 | `nxvim`         | the `nvim` entry point                               | Wires an embedded server + the TUI client together over RPC. |
 
 Dependency direction is strictly one-way:
@@ -1040,18 +1045,29 @@ screen," and that is exactly the shape of these tests.
   [the native plugin API](specs/2026-06-11-native-plugin-api.md); decision:
   [ADR 0002](decisions/0002-native-plugin-system.md). Suggested build order is
   in the spec (picker → completion → statusline/snippets/tree). **Landed so far:**
-  the fuzzy **picker** (`nx.picker`), the **completion engine** (`nx.complete`,
-  buffer + lsp + snippets sources), the **snippet engine** (`nx.snippet` — LSP
-  snippet-syntax parsing, the tabstop session with `<Tab>`/`<S-Tab>` navigation and
-  mirrored placeholders; see
-  [the snippet plan](plans/2026-06-15-nx-snippet-engine.md)), and the **statusline
+  the fuzzy **picker** (`nx.picker`, with a preview pane), the **completion
+  engine** (`nx.complete`, buffer + lsp + snippets sources), the **snippet
+  engine** (`nx.snippet` — LSP snippet-syntax parsing, the tabstop session with
+  `<Tab>`/`<S-Tab>` navigation and mirrored placeholders; see
+  [the snippet plan](plans/2026-06-15-nx-snippet-engine.md)), the **statusline
   segment registry** (`nx.statusline` — the lualine-shaped surface: built-in
   segments resolved natively each frame plus custom `nx.statusline.segment{}`
   providers re-rendered only on declared events / `invalidate`, composed through the
   shared `%`-format [`layout`](../crates/nxvim-core/src/statusline.rs) so clients
   paint it unchanged; see
-  [the segment plan](plans/2026-06-15-nx-statusline-segments.md)). Still ahead: tree
-  docks, `nx.decor`, and the manifest loader / package manager.
+  [the segment plan](plans/2026-06-15-nx-statusline-segments.md)), **viewport
+  decorations** (`nx.decor` — off-tick providers woken once per visible-range
+  change that publish generation-gated extmarks, now including **virtual text**;
+  see [the decor plan](plans/2026-06-15-nx-decor-viewport-decorations.md)), the
+  **floating-widget UI layer** (`nx.ui.input`/`select`/`confirm`/`float`,
+  promise-based; see
+  [the content-float plan](plans/2026-06-15-nx-ui-float-content-float.md)), and
+  the **tree docks** (`nx.dock` — VSCode-style permanent edge panels with
+  per-region tablines; see
+  [the docked-panels plan](plans/2026-06-14-permanent-docked-panels.md)). Every
+  widget's keys are rebindable through the real keymap engine
+  ([configurable widget keys](plans/2026-06-16-configurable-widget-keys.md)).
+  Still ahead: the manifest loader / built-in package manager.
 - **Treesitter control.** `:TSInstall` / `:TSUpdate` / `:TSInstallInfo` have
   **landed**: the native arm fetches + compiles each grammar into the data dir
   off the editor thread (`nxvim_ts::install`, with a pinned checksum-verified Zig

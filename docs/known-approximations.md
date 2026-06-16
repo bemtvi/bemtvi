@@ -129,11 +129,13 @@ are no longer listed here — only the edges that still diverge are.
   global one, `setup{win=…, format=true}` opts a window back to the `'statusline'`
   `%`-format even under a global segment layout (the per-region mix), and
   `nx.statusline.reset(win)` drops the override (`EditHost::resolve_window_layout`).
-  What it does **not** do yet: (1) The custom segment `ctx` carries
-  `{ buf, win, focused }` but **no `width`** (the server doesn't mirror the
-  per-window statusline width to Lua). (2) No mouse-click segment regions (shared
-  with the deferred tabline `%@…@` work). (3) `git` / `lsp_progress` are *plugin*
-  segments (custom-segment examples), not built-ins. The built-in set is `mode` /
+  Mouse-click segment regions have **landed**: a segment can carry an
+  `on_click` handler, lowered to the `%@func@…%X` statusline syntax (with `%nT`
+  tabline labels and `laststatus=3`), so clicks dispatch back to Lua. What it
+  does **not** do yet: (1) The custom segment `ctx` carries `{ buf, win,
+  focused }` but **no `width`** (the server doesn't mirror the per-window
+  statusline width to Lua). (2) `git` / `lsp_progress` are *plugin* segments
+  (custom-segment examples), not built-ins. The built-in set is `mode` /
   `filename` / `filepath` / `filetype` / `encoding` / `location` / `modified` /
   `readonly` / `diagnostics`.
 

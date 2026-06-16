@@ -137,6 +137,23 @@ treesitter syntax highlighting, and LSP** — are not part of a client-only buil
   tokens, and inlay hints are wired.
 - **Mouse support** — click, drag-select, multi-click, wheel scroll, divider
   drag, `'mousemodel'` menus, and middle-click paste, in both clients.
+- **The `nx.*` native plugin surfaces** — the server-owned extensibility API is
+  built: a completion engine (`nx.complete`, with buffer / LSP / snippet
+  sources), a fuzzy picker (`nx.picker`, with a preview pane), a snippet engine
+  (`nx.snippet`, LSP snippet syntax + tabstop navigation), composable statusline
+  segments (`nx.statusline`, lualine-shaped, per-window), viewport decorations
+  (`nx.decor`, off-tick providers driving extmarks / virtual text), and the
+  floating-widget UI layer (`nx.ui.input`/`select`/`confirm`/`float`,
+  promise-based). Every widget's keys are rebindable through the real keymap
+  engine. See [`examples/`](examples).
+- **In-buffer terminals** — a PTY-backed terminal buffer (`:terminal`) with a
+  vt100 emulation layer, end-to-end backpressure for runaway output, and
+  scrollback, in both native clients and the web build.
+- **Quickfix & docks** — a quickfix list with `errorformat` parsing, and
+  VSCode-style permanent edge docks (`nx.dock`) with per-region tablines.
+- **Image previews** — opening an image buffer renders the picture inline:
+  ratatui-image in the terminal, a wgpu textured quad in the GUI, and an
+  out-of-band `<img>` in the web build (`nx.o.imagepreview`).
 
 ---
 
@@ -203,9 +220,10 @@ full whitelist is in
 
 ### Runnable examples
 
-The [`examples/`](examples) directory has ~30 self-contained, end-to-end-verified
+The [`examples/`](examples) directory has ~40 self-contained, end-to-end-verified
 configs — one per feature (treesitter, LSP, floats, registers, tabs, mouse,
-statusline, …). Each is a config dir you point nxvim at:
+statusline, completion, picker, snippets, decor, docks, quickfix, image
+previews, …). Each is a config dir you point nxvim at:
 
 ```sh
 NXVIM_CONFIG=examples/treesitter cargo run -p nxvim -- examples/treesitter/sample.rs
@@ -226,8 +244,10 @@ The short version:
 | `nxvim-core`     | The editor model — buffers, modes, motions, operators, ex-commands, undo, and the renderable `View`. **Pure & synchronous.** |
 | `nxvim-server`   | The headless server — owns the core + Lua, hosts the `nvim_*` API, runs the async main loop. |
 | `nxvim-rpc`      | Async msgpack-RPC transport (nxvim's own protocol).                         |
-| `nxvim-lua`      | Embedded PUC Lua 5.4 runtime and the `vim.*` standard library.               |
+| `nxvim-lua`      | Embedded PUC Lua 5.4 runtime, the `nx.*` API prelude, and the `vim.*` glue.  |
 | `nxvim-ts`       | The in-process treesitter engine (loads grammars, parses incrementally).    |
+| `nxvim-lsp`      | The native LSP client (protocol, transport, manager) — nxvim's own stdio spawning. |
+| `nxvim-regex`    | The vendored vim regexp engine (`regexp.c` as C), shared by search and `:s`. |
 | `nxvim-tui`      | The terminal UI client (ratatui + crossterm). Owns no editor state.         |
 | `nxvim-gui`      | Native GUI client (winit + wgpu + glyphon).                                 |
 | `nxvim-edithost` | Fully client-side WebAssembly build of the whole editor (core + Lua + server tick, in a Web Worker; no server). Excluded from the workspace. |
@@ -313,12 +333,13 @@ highlights:
 
 ### Not yet implemented (roadmap)
 
-- **The `nx` API** — the `nx.*` config surface, the provider-based plugin API,
-  and its server-owned surfaces (completion engine, fuzzy picker, statusline
-  segments, snippet engine, tree docks) plus the built-in package manager:
-  designed ([spec](docs/specs/2026-06-11-native-plugin-api.md)), not yet
-  built. Until it lands, config rides the prelude's interim vim-shaped
-  helpers, which are refactored into `nx` where useful and deleted where not.
+- **The built-in package manager.** The `nx.*` API itself has largely **landed**
+  — the config surface plus its server-owned plugin surfaces (the `nx.complete`
+  completion engine, the `nx.picker` fuzzy finder, `nx.statusline` segments, the
+  `nx.snippet` engine, `nx.decor` viewport decorations, and the `nx.dock` tree
+  docks) are built and have runnable examples. What's still ahead on the plugin
+  axis is the **manifest loader / built-in package manager**: until it lands,
+  plugins are dropped onto the runtimepath under `pack/*/start/*` by hand.
 - **Folds and macros** — not built.
 - **Line wrapping** (`wrap`) and most **window-local options** (`cursorline`, …)
   beyond `number`/`relativenumber` and the horizontal-scroll options.
@@ -326,13 +347,9 @@ highlights:
   number-gutter and horizontal-scroll window options, and the buffer-local
   indentation options — but the bulk of vim's hundreds of options are missing
   (writes to unsupported options are recorded but inert).
-- **The `:map`-family ex-commands** — keymaps are set via `vim.keymap.set` /
-  `nvim_set_keymap` instead (intentionally postponed).
-- **Per-buffer user commands** — `nvim_buf_create_user_command` currently
-  registers globally (the buffer argument is ignored).
-- **Async primitives under `nx`** — `nx.spawn`/`nx.timer`/`nx.fs` will expose
-  the existing timer/process machinery; the interim `vim.uv` timer surface
-  does not grow (it is not part of the colorscheme glue).
+- **The `>>` / `<<` shift operators and the `:map`-family ex-commands.** Indent
+  is reindented via `=` (`==`, `=motion`, `gg=G`); keymaps are set via
+  `vim.keymap.set` / `nvim_set_keymap`. Both are intentionally postponed.
 - **LSP & treesitter edges** — semantic tokens and inlay hints are real but
   approximate (one group per cell, whole-document only, no range requests);
   Lua-driven treesitter indent (`indentexpr`) is deferred. Each approximation is

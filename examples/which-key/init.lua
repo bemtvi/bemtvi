@@ -11,6 +11,13 @@
 -- typing into a group (`f`) and the popup REFRESHES to that group's keys;
 -- complete a mapping, break the sequence, or wait out the timeout and it closes.
 --
+-- The built-in command grammar feeds the SAME popup: pause after `z` for the
+-- viewport commands (zt/zz/zb…), after `<C-w>` for the window commands, after `g`
+-- for the go-to motions merged with the LSP `g` maps, and mid-`f` or after a lone
+-- `d` for an "awaiting input" hint card. Once the leader timeout commits `g` to the
+-- built-in grammar, the LSP `g` maps can no longer fire — they stay listed but
+-- marked `(×)` (`available == false`) so they don't vanish before you've read them.
+--
 -- This is a real which-key built from TWO nx APIs and nothing else — no blocking
 -- key reads, no key interception:
 --
@@ -20,9 +27,17 @@
 --                             — every time the withheld prefix changes (grows /
 --                             descends / clears). It is fire-on-change, not
 --                             per-keystroke (ADR 0002 rule 4: no per-key Lua). The
---                             built-in grammar (`f` find-char, `r` replace, marks)
---                             arrives with no `continuations` and a `label` instead
---                             (source B) — so pausing mid-`f` shows "Find character".
+--                             built-in grammar arrives over the SAME event (source
+--                             B): the OPEN states (`f` find-char, `r` replace, marks,
+--                             operator-pending `d`/`c`/`y`) have no key list, so they
+--                             carry a `label` — pausing mid-`f` shows "Find
+--                             character". The FINITE built-in prefixes (`z` →
+--                             zt/zz/zb…, `g` → gg/gt/g;…, `<C-w>` → the window
+--                             commands) carry enumerated `continuations`, rendered
+--                             just like the leader menu. For `g` the engine MERGES
+--                             the built-in motions with any maps that share the `g`
+--                             prefix (the LSP `gd`/`gD`/`gr` defaults), so one popup
+--                             shows both.
 --   * nx.ui.float(.., {persist=true})   a persistent content float; the returned
 --                             handle's :update() repaints it in place and :close()
 --                             dismisses it. The popup survives keystrokes so it can
@@ -93,6 +108,13 @@ local function lines_for(ctx)
     else
       label = c.desc ~= "" and c.desc or ""
     end
+    -- `available == false` is a continuation kept visible but no longer firable —
+    -- a mapped `g` key (gd/gD/gr) surfaced after the leader timeout committed `g`
+    -- to the built-in grammar. nx.ui.float has no inline highlight yet (so no real
+    -- graying), so cue it with a trailing marker. See the plan doc's Phase 4 note.
+    if c.available == false then
+      label = label .. "  (×)"
+    end
     rows[#rows + 1] = string.format(" %s%s   %s ", c.key, pad, label)
   end
   return rows
@@ -104,7 +126,14 @@ local popup -- the open float handle, or nil
 -- means many oracle events in a burst collapse to one render of the LAST one.
 local open = nx.utils.debounce(function(ctx)
   local lines = lines_for(ctx)
-  local title = " " .. ctx.keys .. " "
+  -- Title the popup `keys — label` so the prefix isn't cryptic: a bare `d` reads as
+  -- "d — Delete", `g` as "g — Go". Source-A leader prefixes have no label, so they
+  -- title with just the keys (" <Space> ").
+  local title = " " .. ctx.keys
+  if ctx.label and ctx.label ~= "" then
+    title = title .. " — " .. ctx.label
+  end
+  title = title .. " "
   if popup and popup:is_open() then
     popup:update(lines, { title = title, relative = "bottom" })
   else

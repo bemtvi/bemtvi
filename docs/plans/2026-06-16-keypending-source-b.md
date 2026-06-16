@@ -1,8 +1,12 @@
 # KeyPending Source B — the built-in command grammar as which-key hints
 
-**Status:** Phase 1 COMPLETE (2026-06-16) — mechanism + all `Stage` labels +
-find-char, tested end to end (key_pending + which_key suites, full workspace green).
-Phase 2 (enumerated built-in continuations) not started.
+**Status:** Phases 1–3 COMPLETE (2026-06-16). Phase 1 — mechanism + all `Stage`
+labels + find-char. Phase 2 — enumerated `g`/`z`/`<C-w>`/`<C-w><C-w>` continuations
++ the A+B merge for shared prefixes (`g` + the LSP defaults) + the `available` flag
+for timed-out maps. Phase 3 — the remaining built-in states (operator-pending
+motions, text objects, registers, marks) + descriptive `keys — label` titles. Tested
+end to end (key_pending + which_key suites, full workspace green). Phase 4 (inline
+float highlighting for a "pretty" which-key) is the only open item.
 **Depends on:** the `nx.on_key_pending` oracle (sources A + C landed); see
 `crates/nxvim-server/src/keymap.rs` (`KeyPending`/`Continuation`/`pending_context`)
 and `effects.rs::emit_key_pending`.
@@ -75,9 +79,113 @@ A↔B transitions fire correctly and the cleared event still closes the popup.
    (`r`); A→B transition (a leader map's `f`-group times out → find-char hint).
    `which_key.rs` — the label card renders.
 
-## Phase 2 (later) — enumerated built-in continuations
+## Phase 2 (DONE 2026-06-16) — enumerated built-in continuations
 
-Give the finite-set prefixes (`g` → `gg`/`ge`/`g_`/…, `z` → `zz`/`zt`/`zb`/…,
-`<C-w>` → window commands) real discrete `continuations` with descriptions, like
-sources A/C. Also consider pure operator-pending (`d`/`c`/`y` awaiting a motion)
-as an "Awaiting motion" hint.
+Give the finite-set prefixes real discrete `continuations` with descriptions, like
+sources A/C; surface operator-pending as an "Awaiting motion" hint.
+
+1. **nxvim-core** (`command.rs`): `CommandPending` gains `continuations:
+   Vec<CommandContinuation>` (`{ key, desc, group }`). `command_pending` is now a
+   pure `pending_hint(&PendingCommand)`; the finite stages get curated lists built
+   beside the grammar that resolves them (`z_continuations` ↔ `view_command`,
+   `window_continuations` ↔ `window_command`, `window_layer_continuations`, and the
+   `g`-prefix arm → `g_continuations` with `` g` ``/`g'` as groups). Only the
+   *intentional* commands are listed — the accidental `parse_command` fall-throughs
+   (`gu`, `gp`) are not advertised. Operator-pending (`Stage::Start` with an
+   operator) now returns the "Awaiting motion" label.
+
+2. **The A+B merge.** `g` is *always* a withheld source-A prefix (the LSP
+   `gd`/`gD`/`gr` native defaults), so the built-in `g`-motions would be invisible
+   under the Phase-1 "A *or* B" precedence. New pure `command_pending_after(mode,
+   keys)` folds a key run hypothetically and returns the hint for the carried
+   prefix — but **only** when the whole run is a single uninterrupted built-in
+   prefix (it bails on any mid-run `Complete`, so a `<Space>g` leader group never
+   mis-merges `g`-motions). `effects.rs::emit_key_pending` merges those built-in
+   continuations into the withheld source-A context (deduped — a user map on the
+   same key wins — and re-sorted by key). `z`/`<C-w>` have no native-default map, so
+   they reach the editor and the existing source-B path carries their list directly.
+
+3. **Tests/example/docs:** `key_pending.rs` (+ z/`<C-w>`/`<C-w><C-w>`/operator-
+   pending/g-merge/user-map-wins) and `which_key.rs` (the `z` grid renders); the
+   example's header documents the built-in prefixes; `native_default` test rewritten
+   for the merged `g`.
+
+### Not enumerated (deliberate)
+
+`<C-w><C-w>` lists only the directional layer-crosses (`h`/`j`/`k`/`l` cross,
+`H`/`J`/`K`/`L` move) — the cross-then-window combos (`<C-w><C-w>v`, …) work but
+would bury the layer ops, so the card stays focused. (Operator-pending, text
+objects, registers, and marks were enumerated in Phase 3; only find-char and replace
+— which take *any* character — stay label-only.)
+
+### Timed-out maps stay visible (the `available` flag)
+
+`g` is *always* a withheld source-A prefix, so pressing it shows the merged list
+(maps + built-ins). After the leader **timeout**, the idle flush commits `g` to the
+built-in grammar (faithful to neovim's timeout model) — and from then on `gd`/`gD`/
+`gr` can no longer fire (typing `d` runs the built-in operator). The Phase-2 source-B
+event would *drop* them, so they vanished too fast to read. Fix: each continuation
+now carries `available: bool` (`keymap::Continuation` / the Lua payload). In the
+post-timeout source-B `g`-state the server keeps the trie's `g`-maps in the list via
+`Keymaps::continuations_at`, flagged `available = false` (deduped against the
+available built-ins). which-key keeps them visible. Tested:
+`timed_out_g_maps_stay_listed_as_unavailable`.
+
+## Phase 3 (DONE 2026-06-16) — the remaining built-in states + descriptive labels
+
+Two things made the popup cryptic: open-set states showed only a bare label (`d` →
+"Awaiting motion"), and the prefix key itself was unlabelled. Phase 3 fixes both.
+
+1. **Descriptive labels.** `label` now names the command in human terms — operators
+   `d`/`c`/`y`/`=` → Delete/Change/Yank/Indent (`operator_name`), `g` → "Go", `z` →
+   "Scroll / fold", `<C-w>` → "Window". The example titles the popup `keys — label`
+   (" d — Delete "), so no bare key.
+
+2. **Enumerate the rest.** The states that *looked* open are actually finite:
+   - **Operator-pending** (`d`/`c`/`y`/`=`): `operator_motion_continuations(op)` — the
+     operator-range alphabet (word/line/linewise/goto/char motions complete the
+     range; find / text-object / `g` / mark / search are groups that arm a further
+     stage; the doubled operator is "current line(s)"). Static, beside the grammar.
+   - **Text objects** (`i`/`a`): `text_object_continuations()` — the
+     `ObjectKind::from_key` alphabet (word, the bracket pairs, quotes, paragraph,
+     sentence). Static. (`t`/tag is *not* listed — `from_key` doesn't implement it.)
+   - **Registers** (`"`): `Editor::register_continuations` — the registers that
+     actually hold text (`Registers::entries()`), keyed to a one-line content
+     preview (`preview_text`). Not the bare a–z alphabet. Once a register is
+     *selected* (`"a`, grammar back at `Start` with the register armed), the hint
+     does *not* close — it shows label "Use register" (the name is in `keys`) and the
+     actions that consume it (`register_action_continuations`: `p`/`P`/`x` complete,
+     `d`/`c`/`y` are groups awaiting a motion).
+   - **Marks** (`` ` ``/`'`/`m`): `Editor::set_mark_continuations` — the marks
+     actually set, not the 52-letter alphabet. Every row leads with the position
+     (`{line}:{col}`); a read-only automatic mark (`'`/`.`/`^`/…) shows its *meaning*
+     (`special_mark_name`: "previous position", "last insert") rather than its line —
+     otherwise a `'` mark on a comment read as a mystery snippet — while a named mark
+     shows a line preview and a global `A`–`Z` shows its file.
+
+   The dynamic states (registers, marks) read live editor state, so `command_pending`
+   (not the pure `pending_hint`) enriches them; `CommandContinuation.desc` became
+   `String` for the previews. Only find-char (`f`/`t`/`F`/`T`) and replace (`r`) stay
+   label-only — they take *any* character.
+
+   Tested: `key_pending` (operator motions / label, text objects, register contents,
+   set marks) + `which_key` (`d — Delete` titles and lists motions). The operator
+   motion list overflows the popup on 80×24 — the example is single-column; a
+   columned/paged layout is a `nx.ui.float` capability question, see Phase 4.
+
+## Phase 4 (TODO) — inline float highlighting for a "pretty" which-key
+
+`nx.ui.float` content is plain `Vec<String>` lines rendered single-style (only the
+selectable-list `Menu` has per-row highlight). So the which-key example can only
+*text-cue* an unavailable row (a trailing `(×)`), not truly **gray** it — and more
+broadly a which-key can't colour keys vs. descriptions, group `+prefix` labels, etc.
+
+**The capability to add:** per-line (ideally per-segment) highlight groups on content
+floats, so a float caller can attach a highlight-group to a line/span. This threads
+`ContentFloat` (core) → `ContentFloatView` (view) → `ContentFloatData`
+(nxvim-view) → the three renderers (TUI `render_content_float`, GUI
+`build_content_float`, web `renderContentFloat`), each mapping the group → a real
+style (a renderer that ignores the field degrades gracefully to plain text). Once it
+lands, which-key dims `available == false` rows with a `Comment`/dim group (drop the
+`(×)` cue) and can style the whole popup — the "pretty which-key" the maps were kept
+visible for.

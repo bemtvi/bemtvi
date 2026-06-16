@@ -43,6 +43,9 @@ local function lines_for(ctx)
     else
       label = c.desc ~= "" and c.desc or ""
     end
+    if c.available == false then
+      label = label .. "  (×)"
+    end
     rows[#rows + 1] = string.format(" %s%s   %s ", c.key, pad, label)
   end
   return rows
@@ -52,7 +55,11 @@ local popup
 
 local open = nx.utils.debounce(function(ctx)
   local lines = lines_for(ctx)
-  local title = " " .. ctx.keys .. " "
+  local title = " " .. ctx.keys
+  if ctx.label and ctx.label ~= "" then
+    title = title .. " — " .. ctx.label
+  end
+  title = title .. " "
   if popup and popup:is_open() then
     popup:update(lines, { title = title, relative = "bottom" })
   else
@@ -271,9 +278,10 @@ async fn find_char_renders_a_label_hint_card() {
         .expect("the find-char hint card opens on f");
 
     assert_eq!(float_lines(&float), vec![" Find character ".to_string()]);
+    // The label now also titles the card, so the prefix isn't cryptic.
     assert_eq!(
         map_get(&float, "title").and_then(Value::as_str),
-        Some(" f ")
+        Some(" f — Find character ")
     );
 
     // Typing the target char completes the motion and closes the card.
@@ -281,4 +289,90 @@ async fn find_char_renders_a_label_hint_card() {
     poll_float(&rpc, &mut incoming, |f| matches!(f, Value::Nil))
         .await
         .expect("the hint card closes once the find completes");
+}
+
+/// Source B Phase 2: pressing `z` (a *finite* built-in prefix, no map withholds it)
+/// renders the enumerated viewport commands as a real key GRID — not a single label
+/// card — exactly like a mapped-prefix menu. Proof the example's `lines_for` grid
+/// path drives built-in continuations too, so `z`/`g`/`<C-w>` get a key list.
+#[tokio::test]
+async fn z_prefix_renders_the_builtin_command_grid() {
+    let (rpc, _dir, mut incoming) = start(WHICH_KEY).await;
+
+    feed(&rpc, "z");
+    let float = poll_float(&rpc, &mut incoming, |f| matches!(f, Value::Map(_)))
+        .await
+        .expect("the z-prefix grid opens");
+
+    assert_eq!(
+        map_get(&float, "title").and_then(Value::as_str),
+        Some(" z — Scroll / fold ")
+    );
+    let lines = float_lines(&float);
+    // Six view commands, one row each (zt/zz/zb + z<CR>/z./z-), rendered as a grid.
+    assert_eq!(lines.len(), 6, "one row per view command: {lines:?}");
+    let joined = lines.join("\n");
+    assert!(joined.contains("Scroll line to center"), "zz row: {joined}");
+    assert!(joined.contains("Scroll line to top"), "zt row: {joined}");
+    assert!(
+        joined.contains("<CR>") && joined.contains("Top, first non-blank"),
+        "z<CR> row: {joined}"
+    );
+}
+
+/// Source B Phase 3: pressing an operator (`d`) titles the popup `d — Delete` (no
+/// cryptic bare key) and renders the operator-range motions as a grid — so the popup
+/// *tells* you `d` is delete and lists what it can act on.
+#[tokio::test]
+async fn operator_titles_with_its_name_and_lists_motions() {
+    let (rpc, _dir, mut incoming) = start(WHICH_KEY).await;
+
+    feed(&rpc, "d");
+    let float = poll_float(&rpc, &mut incoming, |f| matches!(f, Value::Map(_)))
+        .await
+        .expect("the operator-pending popup opens on d");
+
+    assert_eq!(
+        map_get(&float, "title").and_then(Value::as_str),
+        Some(" d — Delete ")
+    );
+    // The motion list is long (it overflows the popup height on 80×24 — the example
+    // is single-column), so assert on rows in the visible window (sorted by key).
+    let joined = float_lines(&float).join("\n");
+    assert!(
+        joined.contains("to end of line"),
+        "$ motion listed: {joined}"
+    );
+    assert!(joined.contains("current line(s)"), "dd listed: {joined}");
+    assert!(
+        joined.contains("to first non-blank"),
+        "^ motion listed: {joined}"
+    );
+}
+
+/// Source B Phase 3: selecting a register (`"a`) keeps the popup open, titled
+/// `"a — Use register` so you know a register is armed, and lists the actions that
+/// consume it (paste / the operators) — instead of silently closing.
+#[tokio::test]
+async fn selected_register_shows_armed_actions() {
+    let (rpc, _dir, mut incoming) = start(WHICH_KEY).await;
+
+    feed(&rpc, "\"a");
+    let float = poll_float(&rpc, &mut incoming, |f| matches!(f, Value::Map(_)))
+        .await
+        .expect("the register-armed popup opens on \"a");
+
+    assert_eq!(
+        map_get(&float, "title").and_then(Value::as_str),
+        Some(" \"a — Use register ")
+    );
+    let joined = float_lines(&float).join("\n");
+    assert!(
+        joined.contains("paste after"),
+        "paste action listed: {joined}"
+    );
+    assert!(
+        joined.contains("+delete"),
+        "delete operator group: {joined}"
+    );
 }

@@ -212,6 +212,12 @@ pub struct Continuation {
     pub desc: Option<String>,
     /// Whether this key completes a mapping or only leads deeper into the trie.
     pub kind: ContinuationKind,
+    /// Whether this continuation is still reachable in the current state. `true` for
+    /// every live continuation; `false` only for a **stale** mapped continuation kept
+    /// visible for legibility — a `g`-prefix map (`gd`/`gD`/`gr`) surfaced *after* the
+    /// leader timeout committed `g` to the built-in grammar, so the map can no longer
+    /// fire. which-key dims / cues these rather than dropping them mid-popup.
+    pub available: bool,
 }
 
 /// Whether a [`Continuation`] completes a mapping or only extends toward one.
@@ -349,6 +355,7 @@ impl Trie {
                     key: key_to_notation(*k),
                     desc,
                     kind,
+                    available: true,
                 }
             })
             .collect();
@@ -557,6 +564,19 @@ impl Keymaps {
             // Sources A/C enumerate continuations; the label is the source-B channel.
             label: None,
         })
+    }
+
+    /// The trie continuations of an *explicit* key path in `scope`, independent of the
+    /// live `pending` — for surfacing mapped continuations the matcher is no longer
+    /// withholding. The server uses this to keep a `g`-prefix's maps (`gd`/`gD`/`gr`)
+    /// visible *after* the leader timeout released `g` into the built-in grammar: the
+    /// caller flags them [`available = false`](Continuation::available), since they can
+    /// no longer fire from this state. Empty when `keys` is not a live prefix here.
+    pub fn continuations_at(&self, scope: MatchScope, keys: &[Key]) -> Vec<Continuation> {
+        self.tries
+            .get(&scope.bucket())
+            .and_then(|t| t.continuations(keys))
+            .unwrap_or_default()
     }
 
     /// Feed one input key in `scope` and return the steps it produced. The server

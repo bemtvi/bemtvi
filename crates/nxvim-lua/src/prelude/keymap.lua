@@ -579,7 +579,17 @@ end
 -- where `keys` is the withheld prefix in vim notation ("" when the context cleared,
 -- which a which-key popup treats as "close") and each continuation is one key that
 -- extends the prefix — `kind = "map"` completes a mapping (carrying its `desc`),
--- `kind = "group"` only leads on to longer mappings.
+-- `kind = "group"` only leads on to longer mappings. The finite built-in prefixes
+-- (`g` -> gg/gt/.., `z` -> zt/zz/.., `<C-w>` -> window commands) enumerate
+-- continuations too, merged under one prefix with any maps that share it (`g` + the
+-- LSP gd/gD/gr).
+--
+-- `available` (boolean) is `true` for every reachable continuation. It is `false`
+-- only for a continuation kept visible but no longer firable: a mapped `g`-prefix
+-- (gd/gD/gr) surfaced AFTER the leader timeout committed `g` to the built-in grammar
+-- -- the maps need a faster sequence to fire, so which-key shows them dimmed / cued
+-- rather than dropping them mid-popup. (A future per-line float highlight will let a
+-- which-key gray these properly; see docs/plans/2026-06-16-keypending-source-b.md.)
 --
 -- `ctx.label` (a string, or nil) is the **source B** channel: the built-in command
 -- grammar's open pending states — `f`/`t`/`F`/`T` find-char, `r` replace, `i`/`a`
@@ -590,8 +600,9 @@ end
 --
 -- This is the render-time oracle a native which-key plugin debounces
 -- (nx.utils.debounce) and draws as a persistent nx.ui.float. Continuations come from
--- the mapped-prefix trie (user + native-default maps, sources A/C); the built-in
--- grammar is surfaced via `label` (source B).
+-- the mapped-prefix trie (user + native-default maps, sources A/C) AND the built-in
+-- command grammar's finite prefixes (source B); the open built-in states are
+-- surfaced via `label` instead.
 nx._on_key_pending = nx._on_key_pending or {}
 
 function nx.on_key_pending(fn)

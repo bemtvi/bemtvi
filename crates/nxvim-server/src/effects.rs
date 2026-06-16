@@ -9,8 +9,9 @@ use crate::lsp::CODE_ACTION_PANEL_TITLE;
 use crate::{EditHost, WindowStatusline};
 use nxvim_core::highlight::HlDef;
 use nxvim_core::{
-    parse_color, BorderStyle, BufferId, DecorViewport, FloatAnchor, FloatConfig, FloatRelative,
-    QfAction, QfEntry, QfWhich, TabId, UndoEntry, UndoTreeView, WindowConfigSpec, WindowId,
+    command_pending_after, parse_color, parse_keys, BorderStyle, BufferId, CommandContinuation,
+    DecorViewport, FloatAnchor, FloatConfig, FloatRelative, QfAction, QfEntry, QfWhich, TabId,
+    UndoEntry, UndoTreeView, WindowConfigSpec, WindowId,
 };
 use nxvim_lua::{
     BoMirror, BufBytesEdit, BufMirror, BufOp, CallbackArgs, DecorPublish, DockOp, ExtmarkMirror,
@@ -25,6 +26,46 @@ use std::collections::HashSet;
 /// the buffer (row into `[0, line_count]`, col into the line's byte length) the
 /// way neovim tolerates out-of-range extmark positions. `col` is a byte offset
 /// within the line, matching the rest of nxvim's column model.
+/// Lower a core built-in [`CommandContinuation`] into the [`KeyPending`](crate::keymap::KeyPending)
+/// wire continuation a which-key renders, mapping `group` to the matching
+/// [`ContinuationKind`](crate::keymap::ContinuationKind). The `desc` is always present
+/// for a built-in (every enumerated key is documented).
+fn builtin_to_continuation(c: &CommandContinuation) -> crate::keymap::Continuation {
+    crate::keymap::Continuation {
+        key: c.key.clone(),
+        desc: Some(c.desc.to_string()),
+        kind: if c.group {
+            crate::keymap::ContinuationKind::Group
+        } else {
+            crate::keymap::ContinuationKind::Map
+        },
+        // A built-in continuation is always reachable in the state that surfaced it.
+        available: true,
+    }
+}
+
+/// Merge built-in continuations into a withheld mapped-prefix context, then re-sort
+/// by key so the payload stays deterministic (the source-A list was already sorted;
+/// the union must be too). A built-in key the user has *also* mapped is dropped — the
+/// mapped entry wins, since that is what actually fires — so e.g. a user `gd` keeps
+/// its own `desc` rather than gaining a duplicate built-in row.
+fn merge_builtin_continuations(
+    kp: &mut crate::keymap::KeyPending,
+    builtin: &[CommandContinuation],
+) {
+    let have: HashSet<String> = kp.continuations.iter().map(|c| c.key.clone()).collect();
+    let mut added: Vec<crate::keymap::Continuation> = builtin
+        .iter()
+        .filter(|c| !have.contains(&c.key))
+        .map(builtin_to_continuation)
+        .collect();
+    if added.is_empty() {
+        return;
+    }
+    kp.continuations.append(&mut added);
+    kp.continuations.sort_by(|a, b| a.key.cmp(&b.key));
+}
+
 /// Convert a Lua-side [`QfItem`] (from `setqflist`) into a core [`QfEntry`]. The
 /// type char is the first byte of the (possibly empty) `type` string.
 fn qf_entry_from_item(it: QfItem) -> QfEntry {
@@ -1814,23 +1855,62 @@ impl EditHost {
             Some(bucket) => crate::keymap::MatchScope::Widget(bucket),
             None => crate::keymap::MatchScope::Editing(self.editor.mode),
         };
-        // Source A/C: the matcher's withheld mapped prefix. When it withholds
-        // nothing, fall back to **source B** — the built-in command grammar's pending
-        // state (`f` find-char, marks, …), which has reached the editor and left it
-        // mid-command. The two are mutually exclusive (a withheld prefix hasn't run
-        // yet), so this is a clean `or`. Source B carries a `label` and no
-        // continuations; an empty continuation set on the open built-in leaves is what
-        // a which-key renders as a hint card rather than a key list.
-        let ctx = self.keymaps.pending_context(scope).or_else(|| {
-            self.editor
-                .command_pending()
-                .map(|cp| crate::keymap::KeyPending {
-                    mode: scope.mode_code().to_string(),
-                    keys: cp.keys,
-                    continuations: Vec::new(),
-                    label: Some(cp.label.to_string()),
-                })
-        });
+        // Source A/C: the matcher's withheld mapped prefix. Then **source B** — the
+        // built-in command grammar — joins it (editing scopes only; a widget has no
+        // core grammar). When the matcher withholds nothing, source B *is* the context
+        // (`f` find-char, `z`, `<C-w>`, operator-pending — reached the editor and left
+        // it mid-command). When it withholds a mapped prefix that is *also* a built-in
+        // prefix — `g`, withheld by the LSP `gd`/`gD`/`gr` defaults — the built-in's
+        // enumerated continuations (`gg`/`gt`/…) are merged into the withheld context,
+        // since the matcher can't see them: the key never reached the grammar. Open
+        // built-in leaves carry a `label` and no continuations (a hint card); the
+        // finite prefixes (`g`/`z`/`<C-w>`) carry an enumerated list (Phase 2).
+        let mut ctx = self.keymaps.pending_context(scope);
+        if let crate::keymap::MatchScope::Editing(mode) = scope {
+            match &mut ctx {
+                // Withheld mapped prefix live: merge in any built-in continuations the
+                // same key run would lead to (folded hypothetically — the key has not
+                // reached the editor). A leader like `<Space>` folds to a complete
+                // motion, so `command_pending_after` returns `None` and nothing merges.
+                Some(kp) => {
+                    if let Some(cp) = command_pending_after(mode, &parse_keys(&kp.keys)) {
+                        merge_builtin_continuations(kp, &cp.continuations);
+                    }
+                }
+                // Nothing withheld: source B is the whole context. The built-in
+                // continuations are available; any mapped continuation that *shares*
+                // this prefix (the LSP `g` defaults under a `g` that just timed out into
+                // the built-in grammar) is surfaced too, flagged unavailable — kept
+                // visible so the popup doesn't drop rows the user couldn't read yet.
+                None => {
+                    if let Some(cp) = self.editor.command_pending() {
+                        let mut continuations: Vec<crate::keymap::Continuation> = cp
+                            .continuations
+                            .iter()
+                            .map(builtin_to_continuation)
+                            .collect();
+                        let have: HashSet<String> =
+                            continuations.iter().map(|c| c.key.clone()).collect();
+                        for mut stale in self.keymaps.continuations_at(scope, &parse_keys(&cp.keys))
+                        {
+                            if !have.contains(&stale.key) {
+                                stale.available = false;
+                                continuations.push(stale);
+                            }
+                        }
+                        // Match the source-A contract: continuations sorted by key so
+                        // the event payload is deterministic.
+                        continuations.sort_by(|a, b| a.key.cmp(&b.key));
+                        ctx = Some(crate::keymap::KeyPending {
+                            mode: scope.mode_code().to_string(),
+                            keys: cp.keys,
+                            continuations,
+                            label: Some(cp.label.to_string()),
+                        });
+                    }
+                }
+            }
+        }
         if ctx == self.last_key_pending {
             return;
         }
@@ -1841,10 +1921,17 @@ impl EditHost {
         // either continuations (A/C) or a label (B).
         let (mode, keys, conts, label) = match &ctx {
             Some(kp) => {
-                let conts: Vec<(&str, Option<&str>, &str)> = kp
+                let conts: Vec<(&str, Option<&str>, &str, bool)> = kp
                     .continuations
                     .iter()
-                    .map(|c| (c.key.as_str(), c.desc.as_deref(), c.kind.as_str()))
+                    .map(|c| {
+                        (
+                            c.key.as_str(),
+                            c.desc.as_deref(),
+                            c.kind.as_str(),
+                            c.available,
+                        )
+                    })
                     .collect();
                 (
                     kp.mode.as_str(),

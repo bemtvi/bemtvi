@@ -465,6 +465,35 @@ pub struct CommandPending {
     /// The command keys typed so far, in vim notation (`"df"`, `"2d3f"`, `` "`" ``,
     /// `"<C-w>"`) — the showcmd-style prefix a which-key draws as the popup title.
     pub keys: String,
+    /// The discrete keys that complete this stage, when it has a *finite* set — the
+    /// **enumerated** built-in prefixes (`g` → `gg`/`gt`/…, `z` → `zz`/`zt`/…,
+    /// `<C-w>` → the window commands). Empty for the open-set leaves (find-char,
+    /// replace, marks, registers, operator-pending), which show only the
+    /// [`label`](Self::label). A which-key renders these like a mapped-prefix
+    /// continuation list (source A); the server merges them into a withheld mapped
+    /// prefix that shares the same built-in key (e.g. `g`, withheld by the LSP
+    /// `gd`/`gD`/`gr` defaults). Maintained beside the grammar that resolves them
+    /// ([`window_command`] / [`view_command`] / the `g`-prefix arm).
+    pub continuations: Vec<CommandContinuation>,
+}
+
+/// One enumerated continuation of a finite built-in prefix, for the
+/// [`CommandPending`] hint — the built-in counterpart of a mapped-prefix
+/// continuation. The `desc` is editorial (a which-key label), but every `key`
+/// listed resolves to a real command in [`parse_step`]; the two are kept in
+/// lockstep by living next to the grammar arm that consumes the key.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CommandContinuation {
+    /// The continuation key in vim notation (`"g"`, `"<CR>"`, `"<C-w>"`).
+    pub key: String,
+    /// A human-readable hint for what the key does (`"Go to first line"`). Owned
+    /// because the dynamic states (registers, marks) build it from live editor state
+    /// (a register content preview, a mark's position), not a `'static` literal.
+    pub desc: String,
+    /// Whether the key only leads *deeper* (a further pending stage — `` g` `` opens
+    /// a mark-jump) rather than completing a command. which-key renders a group as a
+    /// `+prefix`, mirroring the server's `ContinuationKind::Group` for mapped prefixes.
+    pub group: bool,
 }
 
 /// The accumulated, not-yet-complete normal/visual command — one value in place
@@ -620,6 +649,260 @@ fn classify_motion(key: Key) -> Option<Motion> {
         (_, Some(',')) => Motion::FindRepeat { reverse: true },
         _ => return None,
     })
+}
+
+/// The human meaning of a read-only *automatic* mark (the punctuation marks vim
+/// maintains), for the mark-jump hint — so a `'` row reads "previous position", not
+/// the (often unrelated-looking) line it happens to sit on. `None` for a settable
+/// named mark (`a`–`z`/`A`–`Z`), whose line preview *is* the useful context. Mirrors
+/// the special set in [`marks`](super::marks) (`'` is the fold target of `` ` ``).
+fn special_mark_name(name: char) -> Option<&'static str> {
+    Some(match name {
+        '"' => "last cursor position",
+        '\'' | '`' => "previous position",
+        '.' => "last change",
+        '^' => "last insert",
+        '[' => "change/yank start",
+        ']' => "change/yank end",
+        '<' => "visual start",
+        '>' => "visual end",
+        _ => return None,
+    })
+}
+
+/// A compact one-line preview of stored text (a register's contents, a mark's
+/// line) for a which-key continuation `desc`: the first line, control chars
+/// stripped, trimmed, truncated to a readable width with an ellipsis. A multi-line
+/// value gets a trailing `⏎` so a linewise register reads as more than its first
+/// line.
+fn preview_text(text: &str) -> String {
+    const MAX: usize = 40;
+    let multiline = text.contains('\n');
+    let first = text.lines().next().unwrap_or("");
+    let cleaned: String = first
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect();
+    let cleaned = cleaned.trim();
+    let mut out: String = cleaned.chars().take(MAX).collect();
+    if cleaned.chars().count() > MAX {
+        out.push('…');
+    } else if multiline {
+        out.push('⏎');
+    }
+    out
+}
+
+/// Build a continuation list from `(key-notation, desc)` pairs that all *complete*
+/// a command (`group = false`). The shared spelling for the finite built-in
+/// prefixes' hints; the `g`-prefix mixes in a couple of groups by hand.
+fn conts(entries: &[(&'static str, &'static str)]) -> Vec<CommandContinuation> {
+    entries
+        .iter()
+        .map(|&(key, desc)| CommandContinuation {
+            key: key.to_string(),
+            desc: desc.to_string(),
+            group: false,
+        })
+        .collect()
+}
+
+/// The enumerated continuations of a lone `z` — the [`view_command`] alphabet, in
+/// vim notation. Kept beside `view_command` so a new `z`-command appears in both.
+fn z_continuations() -> Vec<CommandContinuation> {
+    conts(&[
+        ("t", "Scroll line to top"),
+        ("z", "Scroll line to center"),
+        ("b", "Scroll line to bottom"),
+        ("<CR>", "Top, first non-blank"),
+        (".", "Center, first non-blank"),
+        ("-", "Bottom, first non-blank"),
+    ])
+}
+
+/// The enumerated continuations of a lone `g` — the intentional `g`-commands the
+/// `g`-prefix arm of [`parse_step`] resolves. `` g` ``/`g'` only *arm* a further
+/// mark-jump stage, so they are groups; the rest complete. (The accidental
+/// fall-throughs a stray key takes through [`parse_command`] are not advertised.)
+fn g_continuations() -> Vec<CommandContinuation> {
+    let mut out = conts(&[
+        ("g", "Go to first line"),
+        ("t", "Next tab"),
+        ("T", "Previous tab"),
+        (";", "Older change position"),
+        (",", "Newer change position"),
+        ("*", "Search word forward (partial)"),
+        ("#", "Search word backward (partial)"),
+    ]);
+    out.push(CommandContinuation {
+        key: "`".to_string(),
+        desc: "Jump to mark (no jumplist)".to_string(),
+        group: true,
+    });
+    out.push(CommandContinuation {
+        key: "'".to_string(),
+        desc: "Jump to mark line (no jumplist)".to_string(),
+        group: true,
+    });
+    out
+}
+
+/// The enumerated continuations of a lone `<C-w>` — the [`window_command`] alphabet.
+/// A second `<C-w>` opens the dock layer-switch prefix, so it is the one group.
+fn window_continuations() -> Vec<CommandContinuation> {
+    let mut out = conts(&[
+        ("s", "Split horizontal"),
+        ("v", "Split vertical"),
+        ("w", "Focus next window"),
+        ("W", "Focus previous window"),
+        ("h", "Focus left"),
+        ("j", "Focus down"),
+        ("k", "Focus up"),
+        ("l", "Focus right"),
+        ("H", "Move window left"),
+        ("J", "Move window down"),
+        ("K", "Move window up"),
+        ("L", "Move window right"),
+        ("c", "Close window"),
+        ("o", "Only window"),
+        ("q", "Quit window"),
+        ("T", "Move to new tab"),
+        ("=", "Equalize sizes"),
+        ("+", "Taller"),
+        ("-", "Shorter"),
+        (">", "Wider"),
+        ("<", "Narrower"),
+        ("_", "Max height"),
+        ("|", "Max width"),
+    ]);
+    out.push(CommandContinuation {
+        key: "<C-w>".to_string(),
+        desc: "Dock layer".to_string(),
+        group: true,
+    });
+    out
+}
+
+/// The enumerated continuations of `<C-w><C-w>` — the dock layer-cross directions.
+/// The lowercase keys cross focus to / from a dock; the capitals move the buffer to
+/// that layer. (Every *other* window key also works here — it crosses then runs the
+/// [`window_command`] — but enumerating the whole window alphabet again would bury
+/// the layer ops, so the card lists only the directional crosses.)
+fn window_layer_continuations() -> Vec<CommandContinuation> {
+    conts(&[
+        ("h", "Cross to left dock"),
+        ("j", "Cross to bottom dock"),
+        ("k", "Cross to top dock"),
+        ("l", "Cross to right dock"),
+        ("H", "Move buffer to left dock"),
+        ("J", "Move buffer to bottom dock"),
+        ("K", "Move buffer to top dock"),
+        ("L", "Move buffer to right dock"),
+    ])
+}
+
+/// The human name of an operator (`d`/`c`/`y`/`=`), for the operator-pending hint's
+/// label (`d` → "Delete"). The grammar's operator alphabet — kept beside the
+/// operator dispatch in [`parse_command`] (`'d' | 'c' | 'y' | '='`).
+fn operator_name(op: char) -> &'static str {
+    match op {
+        'd' => "Delete",
+        'c' => "Change",
+        'y' => "Yank",
+        '=' => "Indent",
+        _ => "Operator",
+    }
+}
+
+/// The operator-range alphabet an operator (`d`/`c`/`y`/`=`) awaits — the motions
+/// and object-introducers [`parse_step`] accepts after an operator. The plain
+/// motions complete the range; the find / text-object / mark / `g` keys are groups
+/// that arm a further stage. `op` is the pending operator, so its doubled form
+/// (`dd`/`cc`/`yy`/`==`) lists as "current line(s)". Curated for legibility — the
+/// common motions, not every alias — mirroring how which-key shows operator-pending.
+fn operator_motion_continuations(op: char) -> Vec<CommandContinuation> {
+    let mut out = conts(&[
+        ("w", "to next word"),
+        ("W", "to next WORD"),
+        ("b", "back a word"),
+        ("e", "to word end"),
+        ("j", "line down (linewise)"),
+        ("k", "line up (linewise)"),
+        ("$", "to end of line"),
+        ("0", "to line start"),
+        ("^", "to first non-blank"),
+        ("h", "left"),
+        ("l", "right"),
+        ("G", "to end of file"),
+    ]);
+    // The doubled operator acts on whole line(s) (`dd`/`cc`/`yy`/`==`).
+    out.push(CommandContinuation {
+        key: op.to_string(),
+        desc: "current line(s)".to_string(),
+        group: false,
+    });
+    // Groups: keys that arm a further stage rather than completing the range.
+    for (key, desc) in [
+        ("f", "find char →"),
+        ("t", "till char →"),
+        ("F", "find char back →"),
+        ("T", "till char back →"),
+        ("i", "inner object →"),
+        ("a", "around object →"),
+        ("g", "g-motion →"),
+        ("`", "to mark →"),
+        ("'", "to mark line →"),
+        ("/", "search forward →"),
+        ("?", "search backward →"),
+    ] {
+        out.push(CommandContinuation {
+            key: key.to_string(),
+            desc: desc.to_string(),
+            group: true,
+        });
+    }
+    out
+}
+
+/// The actions that *consume* a selected register (`"a` → these), for the
+/// register-armed hint. The register modifies the next yank / delete / paste: `p`/`P`
+/// and `x` complete immediately; the operators `d`/`c`/`y` are groups that still need
+/// a motion (they descend into operator-pending). Mirrors how the register rides
+/// through count/operator accumulation in [`PendingCommand`].
+fn register_action_continuations() -> Vec<CommandContinuation> {
+    let mut out = conts(&[
+        ("p", "paste after"),
+        ("P", "paste before"),
+        ("x", "delete char into"),
+    ]);
+    for (key, desc) in [("y", "yank →"), ("d", "delete →"), ("c", "change →")] {
+        out.push(CommandContinuation {
+            key: key.to_string(),
+            desc: desc.to_string(),
+            group: true,
+        });
+    }
+    out
+}
+
+/// The enumerated text objects an `i`/`a` introducer awaits — the
+/// [`ObjectKind::from_key`] alphabet. Kept beside it so a new object appears in both.
+fn text_object_continuations() -> Vec<CommandContinuation> {
+    conts(&[
+        ("w", "word"),
+        ("W", "WORD"),
+        ("p", "paragraph"),
+        ("s", "sentence"),
+        ("(", "() parentheses"),
+        ("{", "{} braces"),
+        ("[", "[] brackets"),
+        ("<", "<> angle brackets"),
+        ("\"", "double quotes"),
+        ("'", "single quotes"),
+        ("`", "backticks"),
+        ("b", "() block"),
+        ("B", "{} block"),
+    ])
 }
 
 /// THE normal/visual grammar — the single source of truth shared by the editor's
@@ -1065,69 +1348,225 @@ pub fn command_status(mode: Mode, keys: &[Key]) -> CommandStatus {
     }
 }
 
+/// The pending [`CommandPending`] hint a key run *would* leave the grammar in,
+/// folded hypothetically from a clean boundary — the same fold as
+/// [`command_status`], but it returns the hint for the carried prefix instead of a
+/// coarse class. `None` when the run ends on a command boundary (nothing pending)
+/// or breaks the grammar (cancel/reset/abort).
+///
+/// The server uses this to merge built-in continuations into a prefix the matcher
+/// has **withheld** but not yet released to the editor: `g` is withheld by the LSP
+/// `gd`/`gD`/`gr` native defaults, so the editor's own pending is still `Start`,
+/// yet `g` should still surface `gg`/`gt`/… A withheld leader like `<Space>` folds
+/// to a *complete* motion (space → `l`), so this returns `None` and never spuriously
+/// merges a built-in into a mapped-only prefix.
+pub fn command_pending_after(mode: Mode, keys: &[Key]) -> Option<CommandPending> {
+    let mut pending = PendingCommand::default();
+    for &key in keys {
+        match parse_step(mode, &pending, key) {
+            ParseStep::Prefix(p) => pending = p,
+            // A *completed* command mid-run means these keys are not a single built-in
+            // prefix — the matcher withheld them only because they prefix a *mapping*
+            // (e.g. a `<Space>g` leader group, where `<Space>` is a complete motion as
+            // a built-in). Merging the trailing `g`'s continuations there would be
+            // wrong, so bail. A clean lone built-in prefix (`g`, `2g`, `<C-w>`) never
+            // completes before the end and is the only thing that yields a hint here.
+            ParseStep::Complete(_)
+            | ParseStep::Cancel
+            | ParseStep::Reset
+            | ParseStep::AbortObject => return None,
+        }
+    }
+    pending_hint(&pending)
+}
+
+/// Project a [`PendingCommand`] into the which-key / showcmd hint — the pure core of
+/// [`Editor::command_pending`] and [`command_pending_after`]. `None` at a clean
+/// boundary with no operator armed (nothing to hint). The finite built-in prefixes
+/// (`g`/`z`/`<C-w>`/`<C-w><C-w>`), operator-pending (the motion alphabet), and the
+/// text-object introducer carry an enumerated `continuations` list. The **dynamic**
+/// states (registers, marks) return an empty list here — they are enriched from live
+/// editor state in [`Editor::command_pending`] — and the truly-any-character leaves
+/// (find-char, replace) carry only a `label`.
+fn pending_hint(p: &PendingCommand) -> Option<CommandPending> {
+    // A clean boundary with nothing armed (no operator, no register) has nothing to
+    // hint. `Stage::Start` *with* an operator is operator-pending, and *with* a
+    // selected register (no operator yet) is the register-armed action menu — both
+    // below.
+    if p.stage == Stage::Start && p.operator.is_none() && p.register.is_none() {
+        return None;
+    }
+    // `label` names the command in human terms (`d` → "Delete"), so a which-key
+    // titles `keys — label` instead of a cryptic key. `continuations` enumerate the
+    // next keys for the finite states; the register / mark states return an *empty*
+    // list here and are enriched from live editor state in `Editor::command_pending`
+    // (this pure projection has no editor to read them from). Find-char / replace
+    // take *any* character, so they stay label-only.
+    let (trigger, label, continuations): (String, &'static str, Vec<CommandContinuation>) = match p
+        .stage
+    {
+        // `Stage::Start` carries one of two armed states (the clean case returned
+        // above): an operator (`d`/`c`/`y`/`=`) awaiting its motion, or a selected
+        // register (`"a`) awaiting the yank / delete / paste that will use it. The
+        // armed key (operator / register) is emitted by the keys builder, so the
+        // trigger is empty.
+        Stage::Start => match p.operator {
+            Some(op) => (
+                String::new(),
+                operator_name(op),
+                operator_motion_continuations(op),
+            ),
+            // A register is selected (operator None, else the arm above): show the
+            // register-consuming actions. The `"a` in `keys` says *which* register.
+            None => (
+                String::new(),
+                "Use register",
+                register_action_continuations(),
+            ),
+        },
+        Stage::FindPending(k) => {
+            let label = match k {
+                FindKind::Find => "Find character",
+                FindKind::Till => "Till character",
+                FindKind::FindBack => "Find character backward",
+                FindKind::TillBack => "Till character backward",
+            };
+            (k.as_char().to_string(), label, Vec::new())
+        }
+        Stage::ReplacePending => ("r".to_string(), "Replace character", Vec::new()),
+        Stage::TextObjectPending(c) => (c.to_string(), "Text object", text_object_continuations()),
+        Stage::GPending => ("g".to_string(), "Go", g_continuations()),
+        Stage::ZPending => ("z".to_string(), "Scroll / fold", z_continuations()),
+        Stage::RegisterPending => ("\"".to_string(), "Register", Vec::new()),
+        Stage::MarkSetPending => ("m".to_string(), "Set mark", Vec::new()),
+        Stage::MarkJumpPending(kind, set_jump) => {
+            let base = match kind {
+                MarkJumpKind::Exact => "`",
+                MarkJumpKind::Line => "'",
+            };
+            // The jumplist-skipping spellings are `g`/`g'`; plain `` ` ``/`'` set it.
+            let keys = if set_jump {
+                base.to_string()
+            } else {
+                format!("g{base}")
+            };
+            (keys, "Jump to mark", Vec::new())
+        }
+        Stage::WindowPending => ("<C-w>".to_string(), "Window", window_continuations()),
+        Stage::WindowLayerPending => (
+            "<C-w><C-w>".to_string(),
+            "Dock layer",
+            window_layer_continuations(),
+        ),
+    };
+    let mut keys = String::new();
+    if let Some(r) = p.register {
+        keys.push('"');
+        keys.push(r);
+    }
+    if let Some(n) = p.op_count {
+        keys.push_str(&n.to_string());
+    }
+    if let Some(op) = p.operator {
+        keys.push(op);
+    }
+    if let Some(n) = p.count {
+        keys.push_str(&n.to_string());
+    }
+    keys.push_str(&trigger);
+    Some(CommandPending {
+        label,
+        keys,
+        continuations,
+    })
+}
+
 impl Editor {
     /// The built-in command grammar's current pending state for the
     /// `nx.on_key_pending` (which-key / showcmd) signal — **source B** of the
     /// oracle. `Some` whenever a key has armed an argument stage (`f`/`t`/`F`/`T`,
-    /// `r`, `i`/`a`, `z`, `g`, marks, registers, `<C-w>`) and the grammar is waiting
-    /// for the next key; `None` at a clean boundary ([`Stage::Start`]), where there
-    /// is nothing to hint. The keymap matcher's withheld mapped prefix (sources A/C)
-    /// takes precedence and the server only consults this when no mapped prefix is
-    /// live — the two are mutually exclusive, since a withheld prefix has not yet
-    /// reached the grammar. The returned `keys` mirror vim's showcmd: register, the
+    /// `r`, `i`/`a`, `z`, `g`, marks, registers, `<C-w>`) *or* an operator (`d`/`c`/
+    /// `y`/`=`) is awaiting its motion; `None` at a truly clean boundary, where there
+    /// is nothing to hint. The finite prefixes (`g`/`z`/`<C-w>`/`<C-w><C-w>`) carry
+    /// an enumerated `continuations` list; operator-pending lists the motion alphabet
+    /// and the register / mark states list what is *actually* stored (enriched here
+    /// from live editor state — the pure [`pending_hint`] can't read it). Only the
+    /// truly-any-character leaves (find-char, replace) stay label-only. The keymap
+    /// matcher's withheld mapped prefix (sources A/C) takes precedence; the server
+    /// consults this directly only when no mapped prefix is live, and otherwise
+    /// *merges* this state's continuations into the withheld one via
+    /// [`command_pending_after`] (so `g`, withheld by the LSP defaults, still shows the
+    /// built-in `gg`/`gt`/…). The returned `keys` mirror vim's showcmd: register, the
     /// pre-operator count, the operator, the post-operator count, then the stage's
     /// trigger key.
     pub fn command_pending(&self) -> Option<CommandPending> {
-        let p = &self.pending;
-        let (trigger, label): (String, &'static str) = match p.stage {
-            Stage::Start => return None,
-            Stage::FindPending(k) => {
-                let label = match k {
-                    FindKind::Find => "Find character",
-                    FindKind::Till => "Till character",
-                    FindKind::FindBack => "Find character backward",
-                    FindKind::TillBack => "Till character backward",
-                };
-                (k.as_char().to_string(), label)
+        let mut hint = pending_hint(&self.pending)?;
+        // Enrich the dynamic states with live editor contents the pure projection
+        // can't see: the registers that actually hold text, and the marks actually
+        // set. `m` (set-mark) lists the *existing* marks for reference.
+        match self.pending.stage {
+            Stage::RegisterPending => hint.continuations = self.register_continuations(),
+            Stage::MarkJumpPending(..) | Stage::MarkSetPending => {
+                hint.continuations = self.set_mark_continuations()
             }
-            Stage::ReplacePending => ("r".to_string(), "Replace character"),
-            Stage::TextObjectPending(c) => (c.to_string(), "Text object"),
-            Stage::GPending => ("g".to_string(), "g commands"),
-            Stage::ZPending => ("z".to_string(), "z — scroll / fold"),
-            Stage::RegisterPending => ("\"".to_string(), "Register"),
-            Stage::MarkSetPending => ("m".to_string(), "Set mark"),
-            Stage::MarkJumpPending(kind, set_jump) => {
-                let base = match kind {
-                    MarkJumpKind::Exact => "`",
-                    MarkJumpKind::Line => "'",
-                };
-                // The jumplist-skipping spellings are `g`/`g'`; plain `` ` ``/`'` set it.
-                let keys = if set_jump {
-                    base.to_string()
-                } else {
-                    format!("g{base}")
-                };
-                (keys, "Jump to mark")
-            }
-            Stage::WindowPending => ("<C-w>".to_string(), "Window command"),
-            Stage::WindowLayerPending => ("<C-w><C-w>".to_string(), "Dock layer"),
-        };
-        let mut keys = String::new();
-        if let Some(r) = p.register {
-            keys.push('"');
-            keys.push(r);
+            _ => {}
         }
-        if let Some(n) = p.op_count {
-            keys.push_str(&n.to_string());
+        Some(hint)
+    }
+
+    /// The registers that currently hold text, as which-key continuations: the
+    /// register name keys a short one-line preview of its contents (source for the
+    /// `"`-pending hint). Empty when nothing has been yanked / deleted yet, so the
+    /// hint falls back to its `Register` label.
+    fn register_continuations(&self) -> Vec<CommandContinuation> {
+        self.registers
+            .entries()
+            .into_iter()
+            .map(|(name, text, _kind)| CommandContinuation {
+                key: name.to_string(),
+                desc: preview_text(text),
+                group: false,
+            })
+            .collect()
+    }
+
+    /// The marks that are currently set, as which-key continuations. Every row leads
+    /// with the mark's **position** (`{line}:{col}`) so it reads as a place, never a
+    /// stray line of text. A read-only automatic mark (`'`/`` ` ``/`.`/`^`/…) shows
+    /// its *meaning* ("previous position", "last insert") rather than its line —
+    /// otherwise a `'` mark on a comment line looked like a mystery snippet. A named
+    /// mark (`a`–`z`) shows a short preview of its line; a global `A`–`Z` shows the
+    /// file it points into. Source for the `` ` ``/`'`/`m` hints; empty when nothing
+    /// is set, so the hint falls back to its label.
+    fn set_mark_continuations(&self) -> Vec<CommandContinuation> {
+        let mut out = Vec::new();
+        // Buffer-local marks (named `a`–`z` and the read-only specials), keyed on the
+        // current buffer.
+        for (&name, &(line, col)) in &self.buffer().marks {
+            let pos = format!("{}:{}", line + 1, col);
+            let context = match special_mark_name(name) {
+                Some(meaning) => meaning.to_string(),
+                None => preview_text(self.buffer().line(line.min(self.last_line())).trim()),
+            };
+            out.push(CommandContinuation {
+                key: name.to_string(),
+                desc: format!("{pos}  {context}"),
+                group: false,
+            });
         }
-        if let Some(op) = p.operator {
-            keys.push(op);
+        // Global file marks (`A`–`Z`): position plus the file / buffer they point at.
+        for (&name, &(buf, cur)) in &self.global_marks {
+            let detail = self
+                .buffer_name(buf)
+                .filter(|n| !n.is_empty())
+                .unwrap_or_else(|| "[No Name]".to_string());
+            out.push(CommandContinuation {
+                key: name.to_string(),
+                desc: format!("{}:{}  {}", cur.line + 1, cur.col, detail),
+                group: false,
+            });
         }
-        if let Some(n) = p.count {
-            keys.push_str(&n.to_string());
-        }
-        keys.push_str(&trigger);
-        Some(CommandPending { label, keys })
+        out
     }
 
     /// Drive one key through the normal/visual grammar. A thin loop: the pure

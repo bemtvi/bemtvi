@@ -1205,7 +1205,7 @@ impl LuaRuntime {
         &self,
         mode: &str,
         keys: &str,
-        continuations: &[(&str, Option<&str>, &str)],
+        continuations: &[(&str, Option<&str>, &str, bool)],
         label: Option<&str>,
     ) -> mlua::Result<()> {
         let nx = self.nx()?;
@@ -1219,7 +1219,7 @@ impl LuaRuntime {
             None => ctx.set("label", mlua::Value::Nil)?,
         }
         let arr = self.lua.create_table()?;
-        for (i, (key, desc, kind)) in continuations.iter().enumerate() {
+        for (i, (key, desc, kind, available)) in continuations.iter().enumerate() {
             let cont = self.lua.create_table()?;
             cont.set("key", self.lua.create_string(key)?)?;
             match desc {
@@ -1227,6 +1227,11 @@ impl LuaRuntime {
                 None => cont.set("desc", mlua::Value::Nil)?,
             }
             cont.set("kind", self.lua.create_string(kind)?)?;
+            // `available = false` marks a continuation that is no longer reachable in
+            // this state — a mapped `g`-prefix continuation surfaced *after* the leader
+            // timeout committed `g` to the built-in grammar (the maps need a faster
+            // sequence to fire). which-key keeps it visible but dimmed / cued.
+            cont.set("available", *available)?;
             arr.set(i + 1, cont)?;
         }
         ctx.set("continuations", arr)?;

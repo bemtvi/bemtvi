@@ -61,7 +61,9 @@ mod windows;
 
 // The command grammar + its normal/visual executor. The parse↔execute contract
 // types stay private to `command`; only the shared vocabulary is re-exported.
-pub use self::command::{command_status, CommandPending, CommandStatus};
+pub use self::command::{
+    command_pending_after, command_status, CommandContinuation, CommandPending, CommandStatus,
+};
 pub(crate) use self::command::{
     DockChord, FindKind, Motion, MotionKind, MotionResult, MoveAxis, ObjectKind, PendingCommand,
     Stage,

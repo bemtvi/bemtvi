@@ -188,12 +188,21 @@ function nx.complete.setup(opts)
     snippets_priority
   )
 
-  -- `keys.trigger` (a string or list) installs an insert-mode mapping that opens
+  -- `keys.trigger` (a string or list) installs the insert-mode mapping(s) that open
   -- the popup on demand — the keypress half of "trigger by keypress / Lua API".
-  -- Handy with `auto = false` (manual-only completion). The Lua API is
-  -- `nx.complete.trigger()` (below); mapping it yourself works too.
-  for _, lhs in ipairs(key_list(keys.trigger, "trigger")) do
-    nx.keymap.set("i", lhs, nx.complete.trigger, { desc = "nx.complete: open completion" })
+  -- Unset, it defaults to `<C-Space>` / `<C-x><C-o>`, installed as overridable
+  -- `default` maps (so a user `vim.keymap.set` for those keys still wins); pass an
+  -- empty list to disable it entirely. The Lua API is `nx.complete.trigger()` (below);
+  -- mapping it yourself works too. (These are ordinary Lua maps — the trigger is no
+  -- longer a Rust native default.)
+  local trigger_default = keys.trigger == nil
+  local trigger_keys = trigger_default and { "<C-Space>", "<C-x><C-o>" }
+    or key_list(keys.trigger, "trigger")
+  for _, lhs in ipairs(trigger_keys) do
+    nx.keymap.set("i", lhs, nx.complete.trigger, {
+      default = trigger_default,
+      desc = "nx.complete: open completion",
+    })
   end
 end
 

@@ -204,6 +204,65 @@ async fn enable_starts_a_server_and_hover_works() {
     std::env::remove_var("NXVIM_LSP_CMD");
 }
 
+/// The built-in LSP keymaps are installed **buffer-local on `LspAttach`** by
+/// `prelude/lsp.lua` (they are no longer Rust native defaults). Pressing the `K`
+/// *key* — not calling `nx.lsp.hover()` — opens the hover float, proving the map was
+/// installed when the mock attached and fires the verb. (Before any attach there is
+/// no `K` map, so this only works once the server is bound.)
+#[tokio::test]
+async fn lsp_keymaps_install_on_attach_and_fire() {
+    let _guard = serial_lock().lock().await;
+    let dir = temp_dir("lsp_cfg_keymaps");
+    arm_mock(
+        &dir,
+        r#"{ "hover": { "contents": { "kind": "markdown",
+             "value": "`foo`: a scripted hover symbol" } } }"#,
+    );
+    let (rpc, mut incoming) = open_rust(&dir).await;
+
+    exec_lua(
+        &rpc,
+        r#"
+        nx.lsp.config("mock", { cmd = { "placeholder" }, filetypes = { "rust" } })
+        nx.lsp.enable("mock")
+        "#,
+    )
+    .await;
+
+    // Wait for the server to bind the buffer, so the `LspAttach`-installed `K` map
+    // exists before we press it (pressing an unmapped `K` would do nothing useful).
+    assert!(
+        await_lua_eq(&rpc, "#nx.lsp.clients({ bufnr = 0 })", "1").await,
+        "the mock server should have attached to the buffer"
+    );
+
+    // Press the *key*. It must fire `nx.lsp.hover()` via the buffer-local map and
+    // land the hover float; retry to absorb the async reply latency.
+    let mut last = Vec::new();
+    let mut got = None;
+    for _ in 0..200 {
+        feed(&rpc, "K");
+        if let Some(lines) = poll_float_lines(&rpc, &mut incoming).await {
+            if lines.iter().any(|l| l.contains("scripted hover")) {
+                got = Some(lines);
+                break;
+            }
+            if !lines.is_empty() {
+                last = lines;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    let lines =
+        got.unwrap_or_else(|| panic!("the `K` key never opened a hover float; last: {last:?}"));
+    assert!(
+        lines.iter().any(|l| l.contains("foo")),
+        "the K-key hover float should carry the markup, got {lines:?}"
+    );
+
+    std::env::remove_var("NXVIM_LSP_CMD");
+}
+
 /// The `"*"` base layer is inherited by every server: with `filetypes` declared only
 /// under `"*"` (and the named config carrying just `cmd`), the resolved config still
 /// matches the `rust` buffer and starts — proving the `"*"` ⊕ named composition.

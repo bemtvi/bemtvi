@@ -284,6 +284,35 @@ function nx.lsp._on_filetype(bufnr, ft)
   end
 end
 
+-- The built-in LSP keymaps. They are installed *buffer-local* when a server first
+-- attaches to a buffer (and removed when the last one detaches), not as global Rust
+-- native defaults — so a buffer no server serves keeps `gd`/`K`/… as their core
+-- meanings (`gd` stays the `g`-motion grammar, never a dead "no client" map), and a
+-- which-key never lists them without a server. `default = true` puts each at the
+-- overridable rung, so a user's own map for the same key wins. The RHS reads
+-- `nx.lsp.*` at call time (defined later in this file), so the builder is a function.
+local function lsp_default_keymaps()
+  return {
+    { "n", "gd", nx.lsp.definition, "Go to definition" },
+    { "n", "gD", nx.lsp.declaration, "Go to declaration" },
+    { "n", "gr", nx.lsp.references, "Find references" },
+    { "n", "K", nx.lsp.hover, "Hover documentation" },
+    { "i", "<C-k>", nx.lsp.signature_help, "Signature help" },
+  }
+end
+
+local function install_lsp_keymaps(buf)
+  for _, m in ipairs(lsp_default_keymaps()) do
+    nx.keymap.set(m[1], m[2], m[3], { buffer = buf, default = true, desc = m[4] })
+  end
+end
+
+local function remove_lsp_keymaps(buf)
+  for _, m in ipairs(lsp_default_keymaps()) do
+    nx.keymap.del(m[1], m[2], { buffer = buf })
+  end
+end
+
 -- Install the single shared FileType / LspAttach / LspDetach autocmds that drive
 -- every enabled config (idempotent — `enable` may be called many times).
 local function ensure_dispatcher()
@@ -311,8 +340,15 @@ local function ensure_dispatcher()
         return
       end
       local buf = args.buf
-      nx.lsp._attached[buf] = nx.lsp._attached[buf] or {}
+      local attached = nx.lsp._attached[buf]
+      -- The first server to serve this buffer installs the built-in keymaps; later
+      -- clients on the same buffer reuse them (idempotent — install once).
+      local first = not attached or next(attached) == nil
+      nx.lsp._attached[buf] = attached or {}
       nx.lsp._attached[buf][id] = true
+      if first then
+        install_lsp_keymaps(buf)
+      end
       local cfg = resolve(client.name)
       if type(cfg.on_attach) == "function" then
         cfg.on_attach(client, buf)
@@ -327,6 +363,11 @@ local function ensure_dispatcher()
       local set = nx.lsp._attached[args.buf]
       if id and set then
         set[id] = nil
+        -- The last server left this buffer: drop the built-in keymaps so they don't
+        -- linger (and fire "no client") on a buffer no server serves any more.
+        if next(set) == nil then
+          remove_lsp_keymaps(args.buf)
+        end
       end
     end,
   })

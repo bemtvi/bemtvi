@@ -14,9 +14,10 @@
 //! next key either extends the prefix, completes a mapping, or breaks it — in
 //! which case the buffered keys are **replayed** to the editor and the current key
 //! re-processed. This generalization subsumes the LSP branch's old hand-rolled
-//! `lsp_pending_g` recognizer: `gd`/`gD`/`gr` are now ordinary native-default maps
-//! in the trie, and the [`command_status`] oracle releases a withheld `g`-run the
-//! moment it completes a core motion, so `gg` stays whole. The one divergence from
+//! `lsp_pending_g` recognizer: a `g`-prefixed map (`gd`/`gD`/`gr` — installed by the
+//! LSP plugin on attach, or any user map) is an ordinary entry in the trie, and the
+//! [`command_status`] oracle releases a withheld `g`-run the moment it completes a
+//! core motion, so `gg` stays whole. The one divergence from
 //! neovim: a trailing live-prefix with no following key has no wall-clock
 //! `timeoutlen` to resolve it on; instead the client sends a synthetic idle flush
 //! ([`Keymaps::flush`], the `nxvim_input_flush` RPC) after `timeoutlen` of no
@@ -109,31 +110,8 @@ pub fn widget_bucket(ctx: KeyContext) -> Option<char> {
     }
 }
 
-#[cfg(feature = "native")]
-use crate::lsp::LspReqKind;
-
-/// A built-in editor action a default mapping fires natively, rather than by
-/// running Lua or feeding keys (design D7 — the LSP backport's variant). It is the
-/// only RHS the server *acts on directly*: the four normal-mode LSP keys
-/// (`gd`/`gD`/`gr`/`K`) and the insert-mode completion triggers
-/// (`<C-Space>`/`<C-x><C-o>`/`<C-k>`) all resolve to a [`LspReqKind`] the server
-/// issues via `request_lsp`. No key-feeding, so the `<cmd>` / remap caveats never
-/// apply to these. LSP-only today, so the whole machinery is native (the browser
-/// build has no language servers yet — slice 5a / Phase 6).
-#[cfg(feature = "native")]
-#[derive(Clone, Copy, Debug)]
-pub enum BuiltinAction {
-    /// Issue an LSP request of this kind.
-    Lsp(LspReqKind),
-    /// Open (or refresh) the `nx.complete` engine popup — the `<C-Space>` /
-    /// `<C-x><C-o>` manual trigger, now engine-driven (and including the built-in
-    /// `lsp` source). A no-op until `nx.complete.setup{}` enables the engine.
-    CompleteTrigger,
-}
-
 /// What a matched mapping does when it fires (design D7). The fire dispatch is a
-/// `match` over this enum, so the LSP backport adds its native action as one more
-/// variant + one more arm — not an engine change.
+/// `match` over this enum.
 #[derive(Clone, Debug)]
 pub enum MappingRhs {
     /// A Lua function RHS, keyed by id in `nx._keymap_fns`; the server runs it
@@ -144,12 +122,6 @@ pub enum MappingRhs {
     /// re-fed *through the matcher* so its keys can themselves trigger mappings
     /// (see [`Keymaps::fire`], bounded by the `remap_budget`).
     Keys(Vec<Key>, bool),
-    /// A built-in editor action (the LSP keys) the server runs natively. Carried
-    /// only by the [`native defaults`](Keymaps::set_native_defaults), never by a
-    /// user map (the Lua registry has no way to produce one), so it always sits at
-    /// the lowest precedence rung and a user `vim.keymap.set` shadows it.
-    #[cfg(feature = "native")]
-    Native(BuiltinAction),
 }
 
 /// A compiled mapping at a trie node: its RHS plus the option flags that change
@@ -170,16 +142,16 @@ pub struct Mapping {
     /// RHS is affected — a string RHS ignores it (nxvim has no expression evaluator).
     pub expr: bool,
     /// The `desc` opt, surfaced to the [`KeyPending`] event (which-key / showcmd) as
-    /// a continuation's label. `None` for a map with no description and for the
-    /// native defaults. Unused by matching.
+    /// a continuation's label. `None` for a map with no description. Unused by
+    /// matching.
     pub desc: Option<String>,
 }
 
 /// A snapshot of the live pending key-context the **`KeyPending`** event carries to
 /// Lua (which-key / showcmd): the mode it was computed in, the withheld prefix in
 /// vim notation, and the immediate continuations that extend it. Built by
-/// [`Keymaps::pending_context`] from the mapped-prefix trie — source A (user and
-/// native-default maps). The built-in command grammar (`g`/`z`/operator-pending)
+/// [`Keymaps::pending_context`] from the mapped-prefix trie — source A (user maps,
+/// plus the LSP plugin's on-attach maps). The built-in command grammar (`g`/`z`/operator-pending)
 /// and active-widget key tables (sources B/C of the design) are a later extension;
 /// this is the engine signal that unblocks a mapped-prefix (leader-key) which-key.
 #[derive(Clone, Debug, PartialEq)]
@@ -236,26 +208,6 @@ impl ContinuationKind {
             ContinuationKind::Group => "group",
         }
     }
-}
-
-/// A built-in default mapping the server installs at startup (design D6/B2): the
-/// LSP keys, given as the raw map-mode code (`"n"`, `"i"`, …), the LHS notation,
-/// and the native action they fire. Compiled into every buffer's tries at the
-/// lowest precedence so a user `vim.keymap.set` for the same `(mode, lhs)` wins.
-#[cfg(feature = "native")]
-#[derive(Clone, Copy)]
-pub struct NativeDefault {
-    /// The declared map-mode code, expanded through [`mode_buckets`] like a user
-    /// map's mode (so a future `""` default would fan out the same way).
-    pub mode: &'static str,
-    /// The LHS notation, run through `parse_keys` into the trie path.
-    pub lhs: &'static str,
-    /// What fires when the LHS matches.
-    pub action: BuiltinAction,
-    /// A friendly description, surfaced to the [`KeyPending`] event (which-key /
-    /// showcmd) as the continuation's label — so a built-in default reads as nicely
-    /// as a user map. Never empty for a shipped default.
-    pub desc: &'static str,
 }
 
 /// A unit of work [`Keymaps::feed`] hands back for the server to apply, in order.
@@ -407,12 +359,6 @@ pub struct Keymaps {
     /// Keys withheld as a live prefix, awaiting the key that extends, completes,
     /// or breaks them. Persists across batches (no auto-flush — design D4).
     pending: Vec<Key>,
-    /// The built-in default mappings (the LSP keys) installed once at startup,
-    /// inserted into every buffer's tries *before* the snapshot so any user (or
-    /// Lua-default) map at the same LHS overwrites them — the lowest rung of the
-    /// precedence ladder (design D6/B2). Native only (LSP-only today).
-    #[cfg(feature = "native")]
-    native_defaults: Vec<NativeDefault>,
     /// Remaining recursive-`remap` re-feeds for the current keystroke (vim's
     /// `maxmapdepth`). Reset at the top of every [`feed`](Keymaps::feed) and
     /// decremented on each remap expansion, so a self-referential map (`a`→`a`,
@@ -442,17 +388,6 @@ impl Keymaps {
         self.built_buffer = None;
     }
 
-    /// Install the built-in default mappings (the LSP keys) once at startup. They
-    /// are kept separately from the registry snapshot and inserted at the lowest
-    /// precedence on every [`build_for`](Self::build_for), so a user
-    /// `vim.keymap.set` for the same `(mode, lhs)` shadows them (design D6/B2).
-    /// Marks the tries stale so the next match rebuilds with the defaults in place.
-    #[cfg(feature = "native")]
-    pub fn set_native_defaults(&mut self, defaults: Vec<NativeDefault>) {
-        self.native_defaults = defaults;
-        self.built_buffer = None;
-    }
-
     /// Whether the cached tries need a (re)build for `buffer` — true after a
     /// version bump (which clears [`built_buffer`](Self::built_buffer)) or when the
     /// current buffer differs from the one the tries were built for.
@@ -470,30 +405,6 @@ impl Keymaps {
     pub fn build_for(&mut self, buffer: u64) {
         self.built_buffer = Some(buffer);
         self.tries.clear();
-        // Built-in defaults go in first, at the bottom of the precedence ladder:
-        // every snapshot entry below (all user maps, plus any Lua-registered
-        // default) is inserted afterward and overwrites at the same LHS path (D6).
-        // Native only — the defaults are the LSP keys (slice 5a).
-        #[cfg(feature = "native")]
-        for d in &self.native_defaults {
-            let lhs = parse_keys(d.lhs);
-            if lhs.is_empty() {
-                continue;
-            }
-            let mapping = Mapping {
-                rhs: MappingRhs::Native(d.action),
-                nowait: false,
-                silent: false,
-                expr: false,
-                desc: (!d.desc.is_empty()).then(|| d.desc.to_string()),
-            };
-            for &bucket in mode_buckets(d.mode) {
-                self.tries
-                    .entry(bucket)
-                    .or_default()
-                    .insert(&lhs, mapping.clone());
-            }
-        }
         for entry in &self.snapshot {
             // Skip buffer-local maps that belong to a different buffer.
             if matches!(entry.buffer, Some(b) if b != buffer) {

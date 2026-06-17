@@ -22,27 +22,38 @@ vim.g.which_key_delay = 0
 nx.hl.define(0, "WhichKey", { fg = "#7dcfff" })
 nx.hl.define(0, "WhichKeyGroup", { fg = "#bb9af7", bold = true })
 nx.hl.define(0, "WhichKeyDesc", { fg = "#c0caf5" })
-nx.hl.define(0, "WhichKeyDim", { fg = "#565f89", italic = true })
 
 nx.keymap.set("n", "<leader>w", function() end, { desc = "write" })
 nx.keymap.set("n", "<leader>q", function() end, { desc = "quit" })
 nx.keymap.set("n", "<leader>ff", function() end, { desc = "find file" })
 nx.keymap.set("n", "<leader>fg", function() end, { desc = "live grep" })
 
+-- `g`-prefixed maps (the shape the LSP keys take once `prelude/lsp.lua` installs
+-- them on attach — no longer native defaults), so the `g` popup has a mapped row
+-- that goes unavailable after the timeout.
+nx.keymap.set("n", "gd", function() end, { desc = "Go to definition" })
+nx.keymap.set("n", "gD", function() end, { desc = "Go to declaration" })
+nx.keymap.set("n", "gr", function() end, { desc = "Find references" })
+
 local DELAY = vim.g.which_key_delay or 200
 
 local function lines_for(ctx)
-  if #ctx.continuations == 0 then
+  local conts = {}
+  for _, c in ipairs(ctx.continuations) do
+    if c.available ~= false then
+      conts[#conts + 1] = c
+    end
+  end
+  if #conts == 0 then
     return { { { string.format(" %s ", ctx.label or "…"), "WhichKeyDesc" } } }
   end
   local keyw = 1
-  for _, c in ipairs(ctx.continuations) do
+  for _, c in ipairs(conts) do
     keyw = math.max(keyw, vim.fn.strdisplaywidth(c.key))
   end
   local rows = {}
-  for _, c in ipairs(ctx.continuations) do
+  for _, c in ipairs(conts) do
     local pad = string.rep(" ", keyw - vim.fn.strdisplaywidth(c.key))
-    local dim = c.available == false
     local label, label_hl
     if c.kind == "group" then
       label = "+" .. (c.desc ~= "" and c.desc or "more")
@@ -53,9 +64,9 @@ local function lines_for(ctx)
     end
     rows[#rows + 1] = {
       { " ", nil },
-      { c.key, dim and "WhichKeyDim" or "WhichKey" },
+      { c.key, "WhichKey" },
       { pad .. "   ", nil },
-      { label, dim and "WhichKeyDim" or label_hl },
+      { label, label_hl },
       { " ", nil },
     }
   end
@@ -313,92 +324,65 @@ async fn rows_colour_keys_groups_and_descriptions() {
     );
 }
 
-/// Phase 4 — a continuation kept visible but no longer firable (a `g`-map after the
-/// leader timeout commits `g` to the built-in grammar) is DIMMED with the
-/// `WhichKeyDim` group, rather than cued with a trailing `(×)`. The example no
-/// longer appends any marker text — the colour carries the meaning.
+/// A continuation no longer firable (a `g`-map after the leader timeout commits `g`
+/// to the built-in grammar, flagged `available == false` by the oracle) is DROPPED
+/// from the popup — the example only ever lists keys you can actually press. Before
+/// the timeout the `gd` "Go to definition" default is shown (it can still fire);
+/// after it, the row is gone while the built-in `g` motions remain.
 #[tokio::test]
-async fn timed_out_g_map_row_is_dimmed_not_text_cued() {
+async fn timed_out_g_map_row_is_dropped() {
     let (rpc, _dir, mut incoming) = start(WHICH_KEY).await;
 
-    feed(&rpc, "g"); // withheld `g`: LSP gd/gD/gr maps + built-in motions
-    drain_to_latest_redraw_open(&rpc, &mut incoming).await;
-    // The idle flush commits `g` to the built-in grammar; the maps stay listed but
-    // unavailable (the which-key keeps them visible, now dimmed). After `g`, the
-    // continuation key is `d` (relative to the prefix), so locate the map by its
-    // description. Poll until the dimmed frame lands — the flush → debounced repaint
-    // settles a tick after the available frame.
+    // Whether the open float lists a "Go to definition" row.
+    let lists_go_to_def = |map: &[(Value, Value)]| -> bool {
+        let Some(Value::Map(float)) = map_get(map, "float") else {
+            return false;
+        };
+        float_rows(float)
+            .iter()
+            .any(|r| row_chunks(r).iter().any(|(t, _)| t == "Go to definition"))
+    };
+
+    feed(&rpc, "g"); // withheld `g`: the `gd`/`gD`/`gr` LSP defaults + built-in motions
+                     // Pre-timeout the `gd` default is still firable, so the popup lists it.
+    let before = drain_to_latest_redraw_open(&rpc, &mut incoming).await;
+    assert!(
+        lists_go_to_def(&before),
+        "the gd default is listed while `g` is still a withheld mapped prefix"
+    );
+
+    // The idle flush commits `g` to the built-in grammar; `gd`/`gD`/`gr` go
+    // `available == false`, and the example drops them. Poll until the open float no
+    // longer lists "Go to definition" — the flush → debounced repaint settles a tick
+    // after the available frame.
     rpc.request("nxvim_input_flush", vec![])
         .await
         .expect("input flush");
 
-    // The fg of the "Go to definition" label chunk, when the float is open — or None.
-    let go_to_def_fg = |map: &[(Value, Value)]| -> Option<u64> {
-        let Some(Value::Map(float)) = map_get(map, "float") else {
-            return None;
-        };
-        let Some(Value::Array(styles)) = map_get(float, "styles").or(map_get(map, "styles")) else {
-            return None;
-        };
-        let id = float_rows(float)
-            .iter()
-            .map(|r| row_chunks(r))
-            .find(|cs| cs.iter().any(|(t, _)| t == "Go to definition"))?
-            .iter()
-            .find(|(t, _)| t == "Go to definition")
-            .and_then(|(_, id)| *id)?;
-        styles
-            .get(id as usize)?
-            .as_map()
-            .and_then(|m| map_get(m, "fg"))
-            .and_then(Value::as_u64)
-    };
-
-    let mut dimmed = None;
+    let mut dropped = None;
     for _ in 0..60 {
         nxvim_test_harness::barrier(&rpc).await;
-        if let Some(map) =
-            drain_to_latest_redraw(&mut incoming, |m| go_to_def_fg(m) == Some(0x565f89))
-        {
-            dimmed = Some(map);
+        if let Some(map) = drain_to_latest_redraw(&mut incoming, |m| {
+            matches!(map_get(m, "float"), Some(Value::Map(_))) && !lists_go_to_def(m)
+        }) {
+            dropped = Some(map);
             break;
         }
         tokio::time::sleep(std::time::Duration::from_millis(5)).await;
     }
-    let map = dimmed.expect("the gd map row dims to WhichKeyDim after the timeout");
+    let map = dropped.expect("the gd row drops out once the timeout commits `g` to built-ins");
     let float = match map_get(&map, "float") {
         Some(Value::Map(f)) => f.clone(),
         other => panic!("expected an open float, got {other:?}"),
     };
-    let styles = match map_get(&map, "styles") {
-        Some(Value::Array(a)) => a.clone(),
-        other => panic!("expected styles palette, got {other:?}"),
-    };
-    let dim_id = float_rows(&float)
-        .iter()
-        .map(|r| row_chunks(r))
-        .find(|cs| cs.iter().any(|(t, _)| t == "Go to definition"))
-        .and_then(|cs| {
-            cs.iter()
-                .find(|(t, _)| t == "Go to definition")
-                .and_then(|(_, id)| *id)
-        })
-        .expect("the dimmed label is styled");
-    let dim = styles[dim_id as usize].as_map().expect("dim style map");
-    assert_eq!(
-        map_get(dim, "fg").and_then(Value::as_u64),
-        Some(0x565f89),
-        "the unavailable map is dimmed"
-    );
-    assert_eq!(
-        map_get(dim, "italic").and_then(Value::as_bool),
-        Some(true),
-        "WhichKeyDim is italic"
-    );
     let joined: String = float_lines(&float).join("\n");
     assert!(
-        !joined.contains("(×)"),
-        "no text cue — the dim colour carries it: {joined}"
+        !joined.contains("Go to definition") && !joined.contains("Go to declaration"),
+        "the unavailable LSP go-to defaults are dropped, not dimmed: {joined}"
+    );
+    assert!(
+        !float_lines(&float).is_empty(),
+        "the popup stays open on the built-in `g` motions: {joined}"
     );
 }
 

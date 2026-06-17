@@ -138,6 +138,40 @@ async fn buffer_completion_opens_then_accepts_without_touching_the_buffer_until_
     );
 }
 
+/// The completion trigger is a Lua keymap installed by `nx.complete.setup` (it is no
+/// longer a Rust native default). With `auto = false`, typing never opens the popup —
+/// only the default `<C-Space>` trigger key does. Pressing it opens the menu, proving
+/// the moved keymap fires `nx.complete.trigger()`.
+#[tokio::test]
+async fn trigger_key_opens_the_popup() {
+    let dir = temp_dir("complete_trigger_key");
+    let (rpc, mut incoming) = start(
+        &dir,
+        "nx.complete.setup { sources = { { 'buffer' } }, auto = false }",
+    )
+    .await;
+
+    // Seed a word on line 1, then type a matching prefix on line 2. With `auto =
+    // false` the popup stays shut as we type.
+    feed(&rpc, "ihello<CR>he");
+    assert!(
+        poll_no_menu(&rpc, &mut incoming).await,
+        "auto = false: typing must not open the popup"
+    );
+
+    // The default trigger key opens it — proving the `nx.complete.setup`-installed
+    // `<C-Space>` map fires `nx.complete.trigger()`.
+    feed(&rpc, "<C-Space>");
+    let menu = menu_of(
+        &poll_menu(&rpc, &mut incoming)
+            .await
+            .expect("the trigger key opens the popup"),
+    );
+    assert_eq!(menu_items(&menu), vec!["hello"]);
+    // The trigger key did not type into the document.
+    assert_eq!(lines(&rpc).await, vec!["hello", "he"]);
+}
+
 #[tokio::test]
 async fn abort_closes_the_popup_and_keeps_the_typed_prefix() {
     let dir = temp_dir("complete_abort");

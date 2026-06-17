@@ -1166,16 +1166,21 @@ async fn typing_a_full_mapped_prefix_fires_the_map_not_the_builtin() {
     );
 }
 
-// ----- LSP go-to keys ride the keymap system (gd / gD / gr) ------------------
+// ----- g-prefix maps coexist with core g-motions (gd / gD / gr) --------------
+//
+// The LSP go-to keys (`gd`/`gD`/`gr`/`K`) are no longer Rust native defaults — the
+// LSP plugin installs them buffer-local on `LspAttach` (see `prelude/lsp.lua`). What
+// these tests still pin is the *keymap-grammar* behavior any `g`-prefixed map
+// exercises, LSP or not: a user `g`-map fires, and seating it in the trie doesn't
+// break core's `gg`/operator motions. A `g`-prefix map (the shape the LSP keys take
+// once installed) stands in for that here without needing a live server.
 
-/// The built-in LSP go-to keys `gd`/`gD`/`gr` are **native default mappings**
-/// (like `K` and the completion triggers), not a bespoke recognizer — so a user
-/// `vim.keymap.set` for the same `(mode, lhs)` shadows them (the user > default
-/// rung). This closes the old B4 gap, where the in-batch `lsp_g_prefix` claimed
-/// `g`+`d`/`D`/`r` ahead of the matcher and made them un-overridable.
+/// A user `g`-prefixed map fires on its own keys and isn't swallowed by the built-in
+/// `g` grammar — the matcher owns the `g` prefix and dispatches `gd`/`gD`/`gr` to the
+/// mapped RHS.
 #[tokio::test]
-async fn lsp_goto_keys_are_overridable() {
-    let dir = temp_dir("keymap_lsp_goto_override");
+async fn g_prefix_user_maps_fire() {
+    let dir = temp_dir("keymap_g_prefix_fire");
     let (rpc, mut incoming) = start_with_config(
         &dir,
         "vim.keymap.set('n', 'gd', function() print('MY_DEF') end)\n\
@@ -1198,41 +1203,20 @@ async fn lsp_goto_keys_are_overridable() {
     );
 }
 
-/// With no override, `gd` fires the built-in LSP default: it is *consumed* by the
-/// mapping (the `d` is never typed into the buffer, no motion runs) and, with no
-/// language server attached in the test harness, surfaces the "No language server
-/// attached" notice. Proves the key reaches `request_lsp` through the matcher.
-#[tokio::test]
-async fn unmapped_lsp_goto_fires_the_default() {
-    let dir = temp_dir("keymap_lsp_goto_default");
-    let (rpc, mut incoming) = start_with_config(&dir, "").await;
-
-    feed(&rpc, "ihello world<Esc>0");
-    assert_eq!(lines(&rpc).await, vec!["hello world"]);
-
-    let redraw = redraw_after(&rpc, &mut incoming, "gd").await;
-    assert_eq!(
-        message(&redraw),
-        "No language server attached",
-        "gd fired the LSP default rather than being typed/treated as a motion"
-    );
-    assert_eq!(
-        lines(&rpc).await,
-        vec!["hello world"],
-        "the buffer is untouched — gd was consumed by the mapping"
-    );
-    assert_eq!(cursor(&rpc).await, (1, 0), "the cursor did not move");
-}
-
-/// Seating `gd`/`gD`/`gr` in the trie must not break core's `g`-motions: with the
-/// LSP defaults installed, `gg` (go-to-top) still fires **instantly** on the
+/// Seating `g`-prefixed maps in the trie must not break core's `g`-motions: with
+/// `gd`/`gD`/`gr` mapped, `gg` (go-to-top) still fires **instantly** on the
 /// keystroke — the `command_status` oracle releases the second `g` as a built-in
-/// under the `g`-prefix collision, with no idle flush or following key. (This is
-/// the exact case the old B4 decision feared; the oracle resolves it.)
+/// under the `g`-prefix collision, with no idle flush or following key.
 #[tokio::test]
-async fn core_gg_is_instant_under_the_lsp_goto_defaults() {
-    let dir = temp_dir("keymap_lsp_gg");
-    let (rpc, _incoming) = start_with_config(&dir, "").await;
+async fn core_gg_is_instant_under_g_prefix_maps() {
+    let dir = temp_dir("keymap_g_prefix_gg");
+    let (rpc, _incoming) = start_with_config(
+        &dir,
+        "vim.keymap.set('n', 'gd', function() end)\n\
+         vim.keymap.set('n', 'gD', function() end)\n\
+         vim.keymap.set('n', 'gr', function() end)\n",
+    )
+    .await;
 
     feed(&rpc, "iline1<CR>line2<CR>line3<Esc>");
     assert_eq!(cursor(&rpc).await.0, 3, "cursor starts on the last line");
@@ -1241,26 +1225,29 @@ async fn core_gg_is_instant_under_the_lsp_goto_defaults() {
     assert_eq!(
         cursor(&rpc).await.0,
         1,
-        "gg jumped to the top instantly despite the gd/gD/gr defaults"
+        "gg jumped to the top instantly despite the gd/gD/gr maps"
     );
 }
 
-/// The `gg`-then-operator sequences the old native-default attempt broke
-/// (`ggdG`, `dgg`) stay correct under the LSP defaults: the oracle releases the
-/// built-in `gg` whole, so the operator that follows binds to it, not to `gd`.
+/// The `gg`-then-operator sequences (`ggdG`, `dgg`) stay correct under `g`-prefix
+/// maps: the oracle releases the built-in `gg` whole, so the operator that follows
+/// binds to it, not to `gd`.
 #[tokio::test]
-async fn gg_operator_sequences_survive_the_lsp_goto_defaults() {
-    let dir = temp_dir("keymap_lsp_gg_op");
+async fn gg_operator_sequences_survive_g_prefix_maps() {
+    let g_maps = "vim.keymap.set('n', 'gd', function() end)\n\
+                  vim.keymap.set('n', 'gD', function() end)\n\
+                  vim.keymap.set('n', 'gr', function() end)\n";
 
     // `ggdG`: to the top, then delete to the bottom — empties the buffer.
-    let (rpc, _incoming) = start_with_config(&dir, "").await;
+    let dir = temp_dir("keymap_g_prefix_gg_op");
+    let (rpc, _incoming) = start_with_config(&dir, g_maps).await;
     feed(&rpc, "iline1<CR>line2<CR>line3<Esc>");
     feed(&rpc, "ggdG");
     assert_eq!(lines(&rpc).await, vec![""], "ggdG deleted every line");
 
     // `dgg`: delete from the last line up to the top — also empties it.
-    let dir2 = temp_dir("keymap_lsp_dgg");
-    let (rpc2, _i2) = start_with_config(&dir2, "").await;
+    let dir2 = temp_dir("keymap_g_prefix_dgg");
+    let (rpc2, _i2) = start_with_config(&dir2, g_maps).await;
     feed(&rpc2, "iline1<CR>line2<CR>line3<Esc>");
     feed(&rpc2, "dgg");
     assert_eq!(lines(&rpc2).await, vec![""], "dgg deleted to the top");

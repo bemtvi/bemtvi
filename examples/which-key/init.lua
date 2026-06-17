@@ -15,8 +15,9 @@
 -- viewport commands (zt/zz/zb…), after `<C-w>` for the window commands, after `g`
 -- for the go-to motions merged with the LSP `g` maps, and mid-`f` or after a lone
 -- `d` for an "awaiting input" hint card. Once the leader timeout commits `g` to the
--- built-in grammar, the LSP `g` maps can no longer fire — they stay listed but
--- marked `(×)` (`available == false`) so they don't vanish before you've read them.
+-- built-in grammar, the LSP `g` maps can no longer fire — the oracle still lists
+-- them with `available == false`, and this plugin DROPS those rows so the popup only
+-- ever shows keys you can actually press.
 --
 -- This is a real which-key built from TWO nx APIs and nothing else — no blocking
 -- key reads, no key interception:
@@ -52,15 +53,14 @@
 vim.g.mapleader = " "
 
 -- which-key's own highlight groups, so the popup is PRETTY — keys, group labels,
--- descriptions, and dimmed (unavailable) rows each in their own colour. Defined
--- explicitly (not borrowed from the colorscheme) so the demo looks right with no
--- theme loaded; a real config would link these to its scheme. Phase 4 of the
--- source-B plan gave `nx.ui.float` per-segment highlighting (a line can be a list
--- of `{ text, hl_group }` chunks), which is what makes this colouring possible.
+-- and descriptions each in their own colour. Defined explicitly (not borrowed from
+-- the colorscheme) so the demo looks right with no theme loaded; a real config
+-- would link these to its scheme. Phase 4 of the source-B plan gave `nx.ui.float`
+-- per-segment highlighting (a line can be a list of `{ text, hl_group }` chunks),
+-- which is what makes this colouring possible.
 nx.hl.define(0, "WhichKey", { fg = "#7dcfff" }) -- the key itself (cyan)
 nx.hl.define(0, "WhichKeyGroup", { fg = "#bb9af7", bold = true }) -- a +prefix group
 nx.hl.define(0, "WhichKeyDesc", { fg = "#c0caf5" }) -- a mapping's description
-nx.hl.define(0, "WhichKeyDim", { fg = "#565f89", italic = true }) -- a dimmed row
 
 -- A small leader menu. `ff`/`fg` and `gs`/`gc` are two-key sequences, so `f` and
 -- `g` show up as GROUPS (`kind = "group"`) that lead deeper; the single-key maps
@@ -105,21 +105,31 @@ local DELAY = vim.g.which_key_delay or 200
 -- hint card ("Find character"), which is how typing `f` and pausing now shows a
 -- popup rather than silently waiting for the target char.
 local function lines_for(ctx)
-  if #ctx.continuations == 0 then
+  -- Keep only continuations that can still fire. A continuation with
+  -- `available == false` is a mapped key (e.g. the LSP `gd`/`gD`/`gr` defaults)
+  -- the oracle still reports after the leader timeout committed its prefix to the
+  -- built-in grammar — pressing it now does nothing, so we drop it rather than
+  -- show a dead row.
+  local conts = {}
+  for _, c in ipairs(ctx.continuations) do
+    if c.available ~= false then
+      conts[#conts + 1] = c
+    end
+  end
+  -- An open continuation set (source B: `f` find-char, `r` replace, marks, …) has
+  -- no discrete keys and arrives with a `ctx.label` instead; a context whose only
+  -- continuations were unavailable drops to empty here too. Either way, render the
+  -- label as a single hint card ("Find character").
+  if #conts == 0 then
     return { { { string.format(" %s ", ctx.label or "…"), "WhichKeyDesc" } } }
   end
   local keyw = 1
-  for _, c in ipairs(ctx.continuations) do
+  for _, c in ipairs(conts) do
     keyw = math.max(keyw, vim.fn.strdisplaywidth(c.key))
   end
   local rows = {}
-  for _, c in ipairs(ctx.continuations) do
+  for _, c in ipairs(conts) do
     local pad = string.rep(" ", keyw - vim.fn.strdisplaywidth(c.key))
-    -- `available == false` is a continuation kept visible but no longer firable —
-    -- a mapped `g` key (gd/gD/gr) surfaced after the leader timeout committed `g`
-    -- to the built-in grammar. Phase 4 lets us DIM the whole row (its own group)
-    -- instead of cueing it with a trailing `(×)` marker.
-    local dim = c.available == false
     local label, label_hl
     if c.kind == "group" then
       label = "+" .. (c.desc ~= "" and c.desc or "more")
@@ -130,9 +140,9 @@ local function lines_for(ctx)
     end
     rows[#rows + 1] = {
       { " ", nil },
-      { c.key, dim and "WhichKeyDim" or "WhichKey" },
+      { c.key, "WhichKey" },
       { pad .. "   ", nil },
-      { label, dim and "WhichKeyDim" or label_hl },
+      { label, label_hl },
       { " ", nil },
     }
   end

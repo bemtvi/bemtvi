@@ -1,8 +1,6 @@
 //! Keystroke handling: the per-key input loop, the keymap matcher drive, the
 //! completion-popup key routing, and mapping (RHS) execution.
 
-#[cfg(feature = "native")]
-use crate::keymap::BuiltinAction;
 use crate::keymap::{MappingRhs, MatchScope, Step};
 use crate::EditHost;
 use nxvim_core::{parse_keys, Key};
@@ -34,11 +32,12 @@ impl EditHost {
         //
         // The mapping layer interposes here, ahead of `editor.input`: each key is
         // run through the withhold/replay matcher, which hands back the steps to
-        // apply (raw editor keys and/or a fired mapping). The built-in LSP keys —
-        // the `gd`/`gD`/`gr` go-to trio, `K` hover, and the insert-mode completion
-        // triggers — all ride it as overridable native default mappings (design
-        // B2/B3); the `command_status` oracle keeps core's `g`-motions (`gg`/`dgg`/…)
-        // intact under the `g`-prefix collision.
+        // apply (raw editor keys and/or a fired mapping). The LSP keys (`gd`/`gD`/`gr`
+        // go-to, `K` hover, `<C-k>` signature) and the completion triggers are
+        // ordinary Lua maps now — installed by `prelude/lsp.lua` on attach and by
+        // `nx.complete.setup` — so they ride the matcher like any user map; the
+        // `command_status` oracle keeps core's `g`-motions (`gg`/`dgg`/…) intact under
+        // the `g`-prefix collision.
         self.feed_matcher(key);
     }
 
@@ -276,21 +275,6 @@ impl EditHost {
                     self.editor.input(key);
                     self.emit_lifecycle_events();
                 }
-            }
-            // A built-in default (the LSP keys) runs natively — no key-feeding, so
-            // the `<cmd>`/remap caveats never touch it (design B3). `request_lsp`
-            // and `LspReqKind` already exist on this branch; the matcher only ever
-            // hands us a `Native` RHS for the four normal-mode LSP defaults and the
-            // insert-mode completion triggers installed at startup. The whole
-            // `Native` rung is native-only (LSP), so on the browser build the
-            // `MappingRhs` match has no such arm to cover.
-            #[cfg(feature = "native")]
-            MappingRhs::Native(BuiltinAction::Lsp(kind)) => self.request_lsp(kind),
-            // The `<C-Space>` / `<C-x><C-o>` manual completion trigger: open the
-            // engine popup (which dispatches the `lsp` source via the settle loop).
-            #[cfg(feature = "native")]
-            MappingRhs::Native(BuiltinAction::CompleteTrigger) => {
-                self.editor.complete_manual_trigger()
             }
         }
     }

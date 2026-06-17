@@ -1363,9 +1363,9 @@ pub fn command_status(mode: Mode, keys: &[Key]) -> CommandStatus {
 /// or breaks the grammar (cancel/reset/abort).
 ///
 /// The server uses this to merge built-in continuations into a prefix the matcher
-/// has **withheld** but not yet released to the editor: `g` is withheld by the LSP
-/// `gd`/`gD`/`gr` native defaults, so the editor's own pending is still `Start`,
-/// yet `g` should still surface `gg`/`gt`/… A withheld leader like `<Space>` folds
+/// has **withheld** but not yet released to the editor: `g` is withheld by a
+/// `g`-prefixed map (e.g. the LSP `gd`/`gD`/`gr` maps), so the editor's own pending
+/// is still `Start`, yet `g` should still surface `gg`/`gt`/… A withheld leader like `<Space>` folds
 /// to a *complete* motion (space → `l`), so this returns `None` and never spuriously
 /// merges a built-in into a mapped-only prefix.
 pub fn command_pending_after(mode: Mode, keys: &[Key]) -> Option<CommandPending> {

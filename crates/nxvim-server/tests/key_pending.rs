@@ -52,6 +52,14 @@ const RECORDER_B: &str = "_G.kp = {}\n\
        table.insert(_G.kp, ctx.mode .. '|' .. ctx.keys .. '|' .. (ctx.label or ''))\n\
      end)\n";
 
+/// Three `g`-prefixed user maps with which-key-style descriptions — the shape the
+/// LSP keys take once `prelude/lsp.lua` installs them on `LspAttach` (they are no
+/// longer native defaults). Used to exercise the `g`-prefix merge / timeout behavior
+/// without a live server.
+const G_MAPS: &str = "nx.keymap.set('n', 'gd', function() end, { desc = 'Go to definition' })\n\
+     nx.keymap.set('n', 'gD', function() end, { desc = 'Go to declaration' })\n\
+     nx.keymap.set('n', 'gr', function() end, { desc = 'Find references' })\n";
+
 /// `;;`-joined record of every `nx.on_key_pending` event so far.
 async fn events(rpc: &Rpc) -> String {
     exec_lua(rpc, "return table.concat(_G.kp, ';;')")
@@ -214,18 +222,17 @@ async fn map_without_desc_has_empty_desc() {
     assert_eq!(events(&rpc).await, "n|<Space>|w//map");
 }
 
-/// The built-in **native default** maps carry friendly descriptions too: typing `g`
-/// withholds it (a prefix of the LSP `gd`/`gD`/`gr` defaults) and the pending event
-/// lists those continuations with their shipped `desc`, exactly like a user map.
-/// **Phase 2:** `g` is *also* a built-in command prefix, so the editor's own
-/// `gg`/`gt`/`gT`/`g;`/`g,`/`g*`/`g#` (and the `` g` ``/`g'` mark-jump groups) are
-/// merged in — the matcher can't see them (the key never reached the grammar) — and
-/// the union is re-sorted by key notation. So which-key shows the LSP keys *and* the
-/// built-in motions under one `g`.
+/// A `g`-prefixed map carries its `desc` into the pending event: typing `g`
+/// withholds it (a prefix of the `gd`/`gD`/`gr` maps) and the event lists those
+/// continuations with their descriptions. **Phase 2:** `g` is *also* a built-in
+/// command prefix, so the editor's own `gg`/`gt`/`gT`/`g;`/`g,`/`g*`/`g#` (and the
+/// `` g` ``/`g'` mark-jump groups) are merged in — the matcher can't see them (the
+/// key never reached the grammar) — and the union is re-sorted by key notation. So
+/// which-key shows the mapped `g` keys *and* the built-in motions under one `g`.
 #[tokio::test]
-async fn g_prefix_merges_builtin_motions_with_native_defaults() {
+async fn g_prefix_merges_builtin_motions_with_user_maps() {
     let (rpc, _incoming) = start().await;
-    exec_lua(&rpc, RECORDER).await;
+    exec_lua(&rpc, &format!("{RECORDER}{G_MAPS}")).await;
     feed(&rpc, "g");
     assert_eq!(
         events(&rpc).await,
@@ -247,16 +254,16 @@ async fn g_prefix_merges_builtin_motions_with_native_defaults() {
     );
 }
 
-/// After the leader timeout commits `g` to the built-in grammar, the LSP `g` maps
-/// (`gd`/`gD`/`gr`) can no longer fire — but they stay *listed*, flagged
-/// `available = false`, so a which-key keeps them visible (dimmed/cued) instead of
-/// dropping them too fast to read. The built-in motions remain `available = true`.
-/// Frame 1 (withheld `g`) lists everything available; the idle flush replays `g`
-/// into `GPending` and Frame 2 re-flags the maps unavailable.
+/// After the leader timeout commits `g` to the built-in grammar, the `g`-prefixed
+/// maps (`gd`/`gD`/`gr`) can no longer fire — but they stay *listed*, flagged
+/// `available = false`, so a which-key can keep them visible (or drop them) by
+/// choice rather than having them vanish too fast to read. The built-in motions
+/// remain `available = true`. Frame 1 (withheld `g`) lists everything available; the
+/// idle flush replays `g` into `GPending` and Frame 2 re-flags the maps unavailable.
 #[tokio::test]
 async fn timed_out_g_maps_stay_listed_as_unavailable() {
     let (rpc, _incoming) = start().await;
-    exec_lua(&rpc, RECORDER_AVAIL).await;
+    exec_lua(&rpc, &format!("{RECORDER_AVAIL}{G_MAPS}")).await;
 
     feed(&rpc, "g"); // Frame 1: withheld `g` — maps + built-ins, all available
     let frame1 = events(&rpc).await;

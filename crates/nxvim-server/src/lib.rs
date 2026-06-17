@@ -132,8 +132,6 @@ use edithost::NativeEffects;
 #[cfg(feature = "native")]
 use evloop::{EventLoop, LoopCommand, LoopEvent};
 use keymap::Keymaps;
-#[cfg(feature = "native")]
-use keymap::{BuiltinAction, NativeDefault};
 use lsp::{
     DiagnosticConfig, InlayResolveTarget, LspComplete, LspDocState, LspReqKind, PendingLspReq,
     ServerRuntime,
@@ -1840,59 +1838,11 @@ where
     host.shada = init.shada;
     host.mouse_clock = init.mouse_clock;
 
-    // Install the built-in LSP keymaps as overridable defaults (design B2/B3),
-    // so a user `vim.keymap.set` for the same `(mode, lhs)` shadows them via the
-    // user > default precedence rung. *All* the LSP keys ride the matcher now,
-    // including the `g`-prefixed go-to trio (`gd`/`gD`/`gr`): the matcher can own
-    // the `g` prefix without breaking core's `gg`/`ge`/`dgg`/… motions because the
-    // `command_status` oracle (merged from main) releases a withheld `g`-run to the
-    // editor the moment it completes a built-in, so `gg` fires whole instead of
-    // being folded into `gd`. This retires the bespoke `lsp_pending_g` recognizer
-    // (and, earlier, `lsp_pending_ctrl_x` — `<C-x><C-o>` is just a two-key map).
-    host.keymaps.set_native_defaults(vec![
-        NativeDefault {
-            mode: "n",
-            lhs: "gd",
-            action: BuiltinAction::Lsp(LspReqKind::Definition),
-            desc: "Go to definition",
-        },
-        NativeDefault {
-            mode: "n",
-            lhs: "gD",
-            action: BuiltinAction::Lsp(LspReqKind::Declaration),
-            desc: "Go to declaration",
-        },
-        NativeDefault {
-            mode: "n",
-            lhs: "gr",
-            action: BuiltinAction::Lsp(LspReqKind::References),
-            desc: "Find references",
-        },
-        NativeDefault {
-            mode: "n",
-            lhs: "K",
-            action: BuiltinAction::Lsp(LspReqKind::Hover),
-            desc: "Hover documentation",
-        },
-        NativeDefault {
-            mode: "i",
-            lhs: "<C-Space>",
-            action: BuiltinAction::CompleteTrigger,
-            desc: "Trigger completion",
-        },
-        NativeDefault {
-            mode: "i",
-            lhs: "<C-x><C-o>",
-            action: BuiltinAction::CompleteTrigger,
-            desc: "Trigger completion (omni)",
-        },
-        NativeDefault {
-            mode: "i",
-            lhs: "<C-k>",
-            action: BuiltinAction::Lsp(LspReqKind::SignatureHelp),
-            desc: "Signature help",
-        },
-    ]);
+    // No built-in keymap defaults are installed natively any more: the LSP keys
+    // (`gd`/`gD`/`gr`/`K`/`<C-k>`) are installed buffer-local by `prelude/lsp.lua` on
+    // `LspAttach`, and the completion triggers (`<C-Space>`/`<C-x><C-o>`) by
+    // `nx.complete.setup` — both as ordinary overridable Lua maps. The native-action
+    // keymap rung (`BuiltinAction`/`NativeDefault`) was retired with them.
 
     // Seed the current-buffer snapshot before sourcing config, so a buffer-local
     // map declared with `buffer = 0` (or `nvim_create_autocmd`'s `buffer = 0`)

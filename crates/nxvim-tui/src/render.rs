@@ -2366,11 +2366,26 @@ fn render_menu(
         render_preview(frame, preview_area, pv, &palette);
     }
 
-    // The completion docs sidebar (Phase 4-D): a separate bordered float beside the
-    // popup rendering the selected `lsp` row's documentation. The server placed it
-    // (right of the box, flipping left for room) and clamped it to the viewport.
+    // The docs sidebar: a separate bordered float beside the popup — the selected
+    // `lsp` row's documentation for an insert-completion popup (Phase 4-D), or the
+    // highlighted command's synopsis + help for the cmdline wildmenu (Phase 3). Its
+    // geometry is text-area-absolute. For an ordinary menu `text_area` IS the window
+    // text inner, so it renders directly; the cmdline wildmenu is drawn growing up
+    // from `cmd_area` (`area` is its box), so rebase onto the box's rendered position
+    // — a base whose origin maps text-area row `menu.row` back to the box's top frame
+    // row, columns staying in the gutter-free command-line space.
     if let Some(docs) = &menu.docs {
-        render_menu_docs(frame, text_area, docs);
+        let base = if menu.cmdline {
+            Rect {
+                x: text_area.x,
+                y: area.y.saturating_sub(menu.row),
+                width: text_area.width,
+                height: text_area.y.saturating_add(text_area.height),
+            }
+        } else {
+            text_area
+        };
+        render_menu_docs(frame, base, docs);
     }
 
     // The terminal caret sits in the prompt (in the list column), past the `> `

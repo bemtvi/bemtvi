@@ -101,7 +101,41 @@ impl Editor {
     /// before `<Tab>` never opens the menu (on-demand activation).
     pub(crate) fn cmdline_complete_refresh(&mut self) {
         if self.cmdline_menu_open() {
+            // A real edit commits any previewed selection: the line is now the user's
+            // own text again, so drop the revert snapshot before re-ranking.
+            self.cmdline_complete_saved = None;
             self.cmdline_complete_trigger();
+        }
+    }
+
+    /// Preview the highlighted wildmenu row in the command line: rewrite the
+    /// command-name token `[anchor .. cmdline_col)` to the selected command (saving
+    /// the user's typed line once, so `<Esc>` can restore it) **without** closing the
+    /// menu or executing. Called after each wildmenu navigation so what `<CR>` will
+    /// run is always what the line shows. A no-op while the popup is noselect (nothing
+    /// highlighted yet).
+    pub(crate) fn cmdline_complete_preview(&mut self) {
+        let Some((anchor, insert)) = self.cmdline_complete_selected() else {
+            return;
+        };
+        // Snapshot the pre-preview line on the first rewrite only — cycling through
+        // rows must keep restoring to the *originally typed* text, not the last row.
+        if self.cmdline_complete_saved.is_none() {
+            self.cmdline_complete_saved = Some((self.cmdline.clone(), self.cmdline_col));
+        }
+        self.cmdline
+            .replace_range(anchor..self.cmdline_col, &insert);
+        self.cmdline_col = anchor + insert.len();
+    }
+
+    /// Restore the command line to what the user typed before the wildmenu previewed
+    /// a selection (the `<Esc>`-dismisses-wildmenu path). A no-op when no preview was
+    /// applied (a noselect popup, or no cmdline menu) — `<Esc>` then just closes the
+    /// popup, leaving the typed line untouched.
+    pub(crate) fn cmdline_complete_revert(&mut self) {
+        if let Some((line, col)) = self.cmdline_complete_saved.take() {
+            self.cmdline = line;
+            self.cmdline_col = col;
         }
     }
 

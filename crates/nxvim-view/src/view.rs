@@ -459,11 +459,14 @@ pub struct MenuData {
     /// `preview` kind. `None` for a `select` / preview-less picker — then the box is
     /// the list alone, exactly as before.
     pub preview: Option<MenuPreview>,
-    /// The completion **docs sidebar** (Phase 4-D), present when a `Cursor`-placed
-    /// completion popup's selected `lsp` row carries documentation. A *separate*
-    /// bordered float beside the popup (right, flipping left for room), not a column
-    /// within the box like [`preview`](Self::preview). `None` for a `select` / picker
-    /// or a row with no docs — the popup then stands alone.
+    /// The **docs sidebar**, present when the highlighted row carries documentation:
+    /// a `Cursor`-placed completion popup's selected `lsp` row (Phase 4-D), or the
+    /// cmdline wildmenu's selected command synopsis + help (cmdline-completion Phase
+    /// 3). A *separate* bordered float beside the box (right, flipping left for room),
+    /// not a column within it like [`preview`](Self::preview). For a cmdline wildmenu
+    /// the float's geometry is rebased onto the box (which is `cmd_area`-anchored, not
+    /// window-relative); see the client render. `None` for a `select` / picker or a
+    /// row with no docs — the box then stands alone.
     pub docs: Option<MenuDocs>,
 }
 
@@ -491,17 +494,18 @@ pub struct ContentFloatData {
     pub title: Option<String>,
 }
 
-/// The completion docs sidebar mirrored from the redraw (Phase 4-D): the selected
-/// item's documentation lines and the float's absolute geometry (text-area-relative
-/// content coordinates, same convention as [`MenuData::row`]/`col`). Rendered as its
-/// own bordered box beside the completion popup. See [`MenuData::docs`].
+/// The docs sidebar mirrored from the redraw: the highlighted item's documentation
+/// lines and the float's absolute geometry (text-area-relative content coordinates,
+/// same convention as [`MenuData::row`]/`col`). Rendered as its own bordered box
+/// beside the completion popup (Phase 4-D) or the cmdline wildmenu (cmdline-completion
+/// Phase 3). See [`MenuData::docs`].
 #[derive(Clone)]
 pub struct MenuDocs {
-    /// The documentation lines (`detail` heading, then the body) — already windowed
-    /// to `height`. Plain text, like a hover.
+    /// The documentation lines (a `detail` / synopsis heading, then the body) —
+    /// already windowed to `height`. Plain text, like a hover.
     pub lines: Vec<String>,
     /// The float's content top-left, **text-area-relative** (the server placed it
-    /// beside the popup and clamped it to the viewport).
+    /// beside the box and clamped it to the viewport).
     pub row: u16,
     pub col: u16,
     /// The float's content width / height in cells (the client adds its border).

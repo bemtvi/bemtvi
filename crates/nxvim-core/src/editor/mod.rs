@@ -809,6 +809,13 @@ pub struct Editor {
     /// in one round-trip and rebuilding the menu via [`Editor::open_cmdline_menu`].
     /// `None` when idle. See [`cmdcomplete`](crate::editor::cmdcomplete).
     pub cmdline_complete_request: Option<cmdcomplete::CmdlineCompleteReq>,
+    /// The command line as the user typed it **before** the wildmenu rewrote it to a
+    /// highlighted candidate (`(line, cursor)`): navigating the wildmenu previews the
+    /// selected command in the line (so `<CR>` runs what is shown), and `<Esc>`
+    /// restores this snapshot. `None` until a selection first rewrites the line, and
+    /// cleared once the menu closes or a real edit commits the preview. See
+    /// [`cmdcomplete`](crate::editor::cmdcomplete).
+    cmdline_complete_saved: Option<(String, usize)>,
     pub should_quit: bool,
     /// Editor options set via `:set` (number column, …).
     pub options: Options,
@@ -1310,6 +1317,7 @@ impl Editor {
             complete_gen: 0,
             complete_accept_request: None,
             cmdcomplete: cmdcomplete::CmdlineCompleteConfig::default(),
+            cmdline_complete_saved: None,
             cmdline_complete_request: None,
             should_quit: false,
             options: Options::default(),

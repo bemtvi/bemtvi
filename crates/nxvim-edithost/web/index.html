@@ -1550,6 +1550,27 @@
         }
         gridEl.appendChild(pre);
       }
+
+      // The docs sidebar (cmdline-completion Phase 3 / insert-completion docs): a
+      // separate bordered float beside the box with the highlighted row's docs. The
+      // server placed it (right of the box, flipping left for room) and bottom-aligned
+      // it; geometry is text-area-absolute (the same `rect`-relative convention the box
+      // uses), so it renders directly — the wildmenu is text-area-placed here, not
+      // grown from a `cmd_area` like the cell-grid clients.
+      if (menu.docs) {
+        const d = menu.docs;
+        const docBox = document.createElement("div");
+        docBox.className = "pmenu-doc";
+        place(docBox, rect.x + d.col, tablineRows + rect.y + d.row, d.width, d.height);
+        for (const l of d.lines) {
+          const rowEl = document.createElement("div");
+          rowEl.className = "row";
+          rowEl.style.width = d.width * cw + "px";
+          rowEl.textContent = String(l ?? "").slice(0, d.width).padEnd(d.width);
+          docBox.appendChild(rowEl);
+        }
+        gridEl.appendChild(docBox);
+      }
     }
 
     // A synthesized status line (the wasm build emits no %-format statusline segments

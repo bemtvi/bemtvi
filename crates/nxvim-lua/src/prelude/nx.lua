@@ -115,40 +115,42 @@ end
 -- Dock ex-commands — thin wrappers over the Rust-backed `nx.dock.*` surface
 -- (installed before the prelude), dogfooding the nx API. `:DockOpen {side} [size]`
 -- opens/focuses a permanent edge panel; `:DockClose`/`:DockFocus {side}` address it.
+-- Each carries a `desc`, so it appears in the `:`-completion wildmenu with helpful
+-- docs (the user-command merge surfaces `desc` exactly like a built-in's synopsis).
 nx.command("DockOpen", function(o)
   local side = o.fargs[1]
   if not side then
     return nx.notify("usage: :DockOpen {left|right|top|bottom} [size]", 4)
   end
   nx.dock.open({ side = side, size = tonumber(o.fargs[2]) })
-end)
+end, { desc = "Open or focus an edge dock — :DockOpen {left|right|top|bottom} [size]." })
 nx.command("DockClose", function(o)
   if o.fargs[1] then
     nx.dock.close(o.fargs[1])
   end
-end)
+end, { desc = "Close the dock on {side}, discarding its window and content." })
 nx.command("DockFocus", function(o)
   if o.fargs[1] then
     nx.dock.focus(o.fargs[1])
   end
-end)
+end, { desc = "Move focus to the dock on {side}." })
 -- `:DockToggle`/`:DockHide`/`:DockShow {side}` — collapse a dock from view (keeping
 -- its content) and bring it back, distinct from `:DockClose` (which drops it).
 nx.command("DockToggle", function(o)
   if o.fargs[1] then
     nx.dock.toggle(o.fargs[1])
   end
-end)
+end, { desc = "Toggle the dock on {side} — hide it if shown, show it if hidden." })
 nx.command("DockHide", function(o)
   if o.fargs[1] then
     nx.dock.hide(o.fargs[1])
   end
-end)
+end, { desc = "Hide the dock on {side} from view, keeping its content for :DockShow." })
 nx.command("DockShow", function(o)
   if o.fargs[1] then
     nx.dock.show(o.fargs[1])
   end
-end)
+end, { desc = "Re-show a dock on {side} that was hidden with :DockHide." })
 
 -- (`nx.notify` / `nx.schedule` — the callback-shaped async — are authored as
 -- `nx.*` in prelude/runtime.lua, with `vim.*` aliased onto them there.)

@@ -2175,15 +2175,25 @@ impl Renderer {
             }
         }
 
-        // The completion docs sidebar (Phase 4-D): a separate fully-bordered float
-        // beside the popup with the selected `lsp` row's documentation (dimmed, like a
-        // hover). The server placed it (right of the box, flipping left for room). Its
-        // `col` is the inner content column (same convention as the one-cell-left-
-        // shifted list anchor), so the box is drawn one cell left of it — the left
-        // border then lands flush against the popup's right border. `row` is the box top.
+        // The docs sidebar: a separate fully-bordered float beside the popup — the
+        // selected `lsp` row's documentation for an insert-completion popup (Phase
+        // 4-D), or the highlighted command's synopsis + help for the cmdline wildmenu
+        // (Phase 3), dimmed like a hover. The server placed it (right of the box,
+        // flipping left for room); `col` is the inner content column, so the box is
+        // drawn one cell left of it (its left border lands flush against the popup's
+        // right border). For an ordinary menu `row`/`col` are window-text-area
+        // absolute (`wy`/`text_x0` base); the cmdline wildmenu is drawn growing up
+        // from `cmd_row` (box top `by`, gutter-free `origin.0` columns), so rebase the
+        // float onto the box: its frame top is `by + (docs.row − menu.row)`.
         if let Some(docs) = &menu.docs {
-            let dbx = (text_x0 + docs.col).saturating_sub(1);
-            let dby = wy + docs.row;
+            let (dbx, dby) = if menu.cmdline {
+                (
+                    (origin.0 + docs.col).saturating_sub(1),
+                    (by + docs.row).saturating_sub(menu.row),
+                )
+            } else {
+                ((text_x0 + docs.col).saturating_sub(1), wy + docs.row)
+            };
             self.fill_box(
                 quads,
                 (dbx, dby, docs.width + 2, docs.height + 2),

@@ -646,6 +646,10 @@ impl Editor {
     pub(crate) fn close_cmdline_menu(&mut self) {
         if self.menu_kind() == Some(MenuKind::Cmdline) {
             self.menu = None;
+            // The revert snapshot only outlives the menu via an explicit `<Esc>`
+            // revert (which takes it before closing); any other close — accept,
+            // execute, no-match — drops it.
+            self.cmdline_complete_saved = None;
         }
     }
 
@@ -663,12 +667,31 @@ impl Editor {
         if let Some(m) = self.cmdline_menu_mut() {
             m.select_next();
         }
+        self.cmdline_complete_preview();
     }
 
     pub(crate) fn cmdline_complete_prev(&mut self) {
         if let Some(m) = self.cmdline_menu_mut() {
             m.select_prev();
         }
+        self.cmdline_complete_preview();
+    }
+
+    /// The actively-highlighted command-line completion's `(anchor, insert_text)`
+    /// **without** closing the menu — the peek twin of
+    /// [`cmdline_complete_take_accept`](Self::cmdline_complete_take_accept), used to
+    /// preview the selection in the command line as the user cycles. `None` when no
+    /// cmdline menu is open or nothing is selected yet (the noselect popup).
+    pub(crate) fn cmdline_complete_selected(&self) -> Option<(usize, String)> {
+        let m = self.menu.as_ref().filter(|m| m.kind == MenuKind::Cmdline)?;
+        if !m.selected_active {
+            return None;
+        }
+        let row = m.all_items.get(m.item_at(m.cursor))?;
+        Some((
+            m.anchor,
+            row.insert.clone().unwrap_or_else(|| row.label.clone()),
+        ))
     }
 
     /// The actively-selected command-line completion's `(anchor, insert_text)`,

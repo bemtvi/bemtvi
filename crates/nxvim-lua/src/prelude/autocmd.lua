@@ -16,19 +16,29 @@ nx.user_command = nx.user_command or {}
 -- reads them when it must (e.g. dispatching a user command typed as `:Foo`).
 
 nx._user_commands = nx._user_commands or {}
+-- nx._user_command_desc[name] = desc: the optional one-line `desc` passed to
+-- create(), kept parallel to the body registry (so the dispatch path stays a plain
+-- name -> body lookup). Surfaced by get() and the command-line completion catalog.
+nx._user_command_desc = nx._user_command_desc or {}
 -- nx._buf_user_commands[bufnr][name] = command: the buffer-local command
 -- registry (the analogue of the buffer-scoped `nx._keymaps` entries). A
 -- buffer-local command shadows a global one of the same name and is invisible
 -- from any other buffer — see nx._resolve_user_command.
 nx._buf_user_commands = nx._buf_user_commands or {}
+-- nx._buf_user_command_desc[bufnr][name] = desc: the buffer-local twin of
+-- nx._user_command_desc.
+nx._buf_user_command_desc = nx._buf_user_command_desc or {}
 nx._autocmds = nx._autocmds or {}
 nx._augroups = nx._augroups or {}
 local augroup_seq, autocmd_seq = 0, 0
 
 -- nx.user_command.create(name, command, opts) [alias nvim_create_user_command]:
 -- register a global `:Name`. `command` is a function or an ex-command string.
-function nx.user_command.create(name, command, _opts)
+-- `opts.desc` (a one-line summary) is stored alongside the body — get() surfaces it
+-- and the command-line completion catalog shows it as the command's docs.
+function nx.user_command.create(name, command, opts)
   nx._user_commands[name] = command
+  nx._user_command_desc[name] = type(opts) == "table" and opts.desc or nil
 end
 
 -- nx.user_command.buf_create(buffer, name, command, opts) [alias
@@ -37,7 +47,7 @@ end
 -- command of the same name there — everywhere else it's unknown. Lives in its own
 -- per-bufnr table so the global registry stays clean; nx._resolve_user_command
 -- consults both at dispatch.
-function nx.user_command.buf_create(buffer, name, command, _opts)
+function nx.user_command.buf_create(buffer, name, command, opts)
   if buffer == nil or buffer == 0 then
     buffer = nx._cur_buf and nx._cur_buf.bufnr or 0
   end
@@ -47,6 +57,12 @@ function nx.user_command.buf_create(buffer, name, command, _opts)
     nx._buf_user_commands[buffer] = cmds
   end
   cmds[name] = command
+  local descs = nx._buf_user_command_desc[buffer]
+  if not descs then
+    descs = {}
+    nx._buf_user_command_desc[buffer] = descs
+  end
+  descs[name] = type(opts) == "table" and opts.desc or nil
 end
 
 -- Resolve a typed `:Name` to its command definition for buffer `bufnr` (0 =
@@ -72,6 +88,7 @@ end
 -- keymap.lua, where the trie source / fn table are owned.
 function nx._cleanup_buffer(bufnr)
   nx._buf_user_commands[bufnr] = nil
+  nx._buf_user_command_desc[bufnr] = nil
   nx._purge_buf_keymaps(bufnr)
 end
 
@@ -811,10 +828,13 @@ api.nvim_clear_autocmds = nx.autocmd.clear
 -- defaults for the rest — enough for a command picker to list and run
 -- them. `nx.user_command.get` returns the globals; `nx.user_command.buf_get(buf)`
 -- returns the buffer-local commands for `buf` (0 = current), matching neovim's split.
-local function command_record(name, def)
+local function command_record(name, def, desc)
   return {
     name = name,
     definition = type(def) == "string" and def or "",
+    -- The one-line summary passed to create() (`""` when none) — neovim omits this
+    -- from nvim_get_commands, but the command-line completion catalog wants it.
+    desc = desc or "",
     nargs = "*",
     bang = false,
     bar = false,
@@ -823,21 +843,22 @@ local function command_record(name, def)
     range = nil,
   }
 end
-local function commands_map(registry)
+local function commands_map(registry, descs)
   local out = {}
+  descs = descs or {}
   for name, def in pairs(registry or {}) do
-    out[name] = command_record(name, def)
+    out[name] = command_record(name, def, descs[name])
   end
   return out
 end
 function nx.user_command.get(_opts)
-  return commands_map(nx._user_commands)
+  return commands_map(nx._user_commands, nx._user_command_desc)
 end
 function nx.user_command.buf_get(buf, _opts)
   if buf == nil or buf == 0 then
     buf = nx._cur_buf and nx._cur_buf.bufnr or 0
   end
-  return commands_map((nx._buf_user_commands or {})[buf])
+  return commands_map((nx._buf_user_commands or {})[buf], (nx._buf_user_command_desc or {})[buf])
 end
 api.nvim_get_commands = nx.user_command.get
 api.nvim_buf_get_commands = nx.user_command.buf_get

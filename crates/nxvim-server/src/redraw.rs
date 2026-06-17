@@ -1427,6 +1427,13 @@ impl EditHost {
         // area (frame-bottom, no number gutter) instead of the window's text inner.
         if matches!(m.placement, MenuPlacement::Cmdline) {
             map.push((Value::from("cmdline"), Value::from(true)));
+            // Its docs sidebar (Phase 3): the highlighted command's synopsis + help,
+            // a float beside the box. Feature-agnostic (the catalog candidates carry
+            // their docs inline — `selected_doc`), so unlike the insert-completion
+            // docs sidebar below this is NOT native-gated.
+            if let Some(docs) = self.project_cmdline_docs(m, row, col, width, height, text_width) {
+                map.push((Value::from("docs"), docs));
+            }
         }
         // The prompt query: present (even when empty) for a picker, absent for a
         // promptless `nx.ui.select`. Its presence tells the client to draw a prompt row,
@@ -1549,6 +1556,81 @@ impl EditHost {
         Some(Value::Map(vec![
             (Value::from("lines"), display_lines_value(shown)),
             (Value::from("row"), Value::from(row as u64)),
+            (Value::from("col"), Value::from(docs_col as u64)),
+            (Value::from("width"), Value::from(docs_w as u64)),
+            (Value::from("height"), Value::from(docs_h as u64)),
+        ]))
+    }
+
+    /// The command-line wildmenu's **docs sidebar** (Phase 3): the highlighted
+    /// command's synopsis + description, a bordered float beside the menu box. The
+    /// catalog candidates carry their docs **inline** ([`MenuView::selected_doc`]),
+    /// so — unlike [`project_complete_docs`](Self::project_complete_docs), fed by the
+    /// native LSP item cache — this needs no language server and renders on the wasm
+    /// edit-host too (hence no `#[cfg(feature = "native")]`).
+    ///
+    /// `(row, col, width, height)` is the wildmenu box (text-area cells). The float
+    /// sits to the **right** of the box (`col + width + 2`), flipping to its left when
+    /// the right edge overruns the viewport, and **bottom-aligns** to the box so it
+    /// abuts the command line alongside it: its bottom border lands on the box's
+    /// content bottom (`row + height`), placing its top at `row + height − docs_h − 1`.
+    /// `None` unless the menu opted into docs, a row is actively selected, and that
+    /// row carries doc text.
+    fn project_cmdline_docs(
+        &self,
+        m: &MenuView,
+        row: usize,
+        col: usize,
+        width: usize,
+        height: usize,
+        text_width: usize,
+    ) -> Option<Value> {
+        if !m.docs {
+            return None;
+        }
+        // `selected_doc` is `Some` only when a row is actively selected (the popup is
+        // noselect until the user navigates) and that catalog row carries a `doc`.
+        let lines: Vec<String> = m
+            .selected_doc
+            .as_deref()?
+            .lines()
+            .map(str::to_string)
+            .skip_while(|l| l.trim().is_empty())
+            .collect();
+        if lines.is_empty() {
+            return None;
+        }
+        /// Cap the docs float's content width (a long line is windowed, not hard-cut).
+        const MAX_DOCS_W: usize = 60;
+        /// Cap its height so a long help text can't tower over the wildmenu.
+        const MAX_DOCS_H: usize = 12;
+        let content_w = lines
+            .iter()
+            .map(|l| l.chars().count())
+            .max()
+            .unwrap_or(1)
+            .clamp(1, MAX_DOCS_W);
+        // Right of the box, flipping left when the right edge has no room — the same
+        // placement the insert-completion docs sidebar uses (`< text_width` keeps a
+        // one-column margin past the float's right border).
+        let right_start = col + width + 2;
+        let (docs_col, docs_w) = if right_start + content_w < text_width {
+            (right_start, content_w)
+        } else {
+            let w = content_w.min(col.saturating_sub(3)).max(1);
+            (col.saturating_sub(2 + w), w)
+        };
+        // Bottom-align to the box: cap the height to the rows above the box's content
+        // bottom (`row + height`), reserving one for the float's own bottom border.
+        let docs_h = lines
+            .len()
+            .min(MAX_DOCS_H)
+            .min((row + height).saturating_sub(1).max(1));
+        let docs_row = (row + height).saturating_sub(docs_h + 1);
+        let shown = &lines[..docs_h.min(lines.len())];
+        Some(Value::Map(vec![
+            (Value::from("lines"), display_lines_value(shown)),
+            (Value::from("row"), Value::from(docs_row as u64)),
             (Value::from("col"), Value::from(docs_col as u64)),
             (Value::from("width"), Value::from(docs_w as u64)),
             (Value::from("height"), Value::from(docs_h as u64)),

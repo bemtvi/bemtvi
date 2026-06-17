@@ -1,97 +1,166 @@
 -- nx.cmdline_complete: command-line completion — the unified float-list widget's
 -- **fifth orchestration** (docs/specs/2026-06-14-nx-ui-float-widget.md;
 -- docs/plans/2026-06-16-cmdline-completion.md). Pressing `<Tab>` on an ex command
--- line (`:`) offers a fuzzy list of matching command names (with a params/help
--- preview pane in a later phase). The candidate set is **policy** owned here — the
--- curated command catalog, merged with `nx.user_command.get()` (Phase 4) — so core
--- stays out of "what commands exist": it extracts the token, fuzzy-ranks + renders
--- the menu, and applies the accept.
+-- line (`:`) offers a fuzzy list of matching command names with a synopsis/help
+-- preview pane. The candidate set is **policy** owned here — the curated built-in
+-- catalog merged with `nx.user_command.get()`, so a plugin command appears exactly
+-- as a built-in does — and core stays out of "what commands exist": it extracts the
+-- token, fuzzy-ranks + renders the menu, and applies the accept.
 --
--- This phase ships command NAMES only. Argument completion (`:e <file>`, `:set
--- <opt>`, …) is a later, pure-Lua extension — the source already receives the whole
--- line + cursor.
+-- Phase 1 shipped command NAMES; Phase 3 added the docs pane (each entry carries a
+-- synopsis + one-line description); Phase 4 folded in the user-command merge.
+-- Argument completion (`:e <file>`, `:set <opt>`, …) is a later, pure-Lua extension
+-- — the source already receives the whole line + cursor.
 
 nx.cmdline_complete = nx.cmdline_complete or {}
 
--- The curated built-in ex-command catalog: the canonical name of each command core
--- fuzzy-ranks against the typed prefix. (Abbreviations match implicitly — fuzzy
--- ranking favours the prefix, so `:e` leads with `edit`.) Synopsis / help text (the
--- docs pane) and the `nx.user_command.get()` merge land in later phases.
+-- The curated built-in ex-command catalog: `{ name, synopsis, description }` per
+-- command. Core fuzzy-ranks the typed prefix against `name` (abbreviations match
+-- implicitly — fuzzy ranking favours the prefix, so `:e` leads with `edit`); the
+-- docs pane shows `synopsis` + `description` for the highlighted row. The registered
+-- user commands (`nx.user_command.get()`) are appended in `_cmdline_complete_run`.
+--
+-- MAINTENANCE: this list is curated by hand, so it must be kept in sync with the two
+-- dispatch tables — core ex-commands in `editor/ex.rs` and the server-level commands
+-- (`:Lsp*`, `:TS*`, `:cd`, `:grep`, `:make`, `:source`, `:colorscheme`, `:autocmd`,
+-- `:command`, …) in `nxvim-server/src/excmd.rs`. When you add a user-facing ex-command
+-- there, add it here too. The `catalog_commands_are_recognized` test guards the
+-- forward direction (every entry below is a real command); the reverse — a new
+-- command missing from this list — is not auto-detected, hence this note. A few rarely
+-- typed quickfix-population variants (`:cgetfile`, `:caddfile`, `:cnfile`, `:cpfile`
+-- and their `l`-twins) are intentionally omitted.
+--
+-- Argument notation follows vim help and is kept **consistent between the synopsis
+-- and the description**: `{arg}` is required, `[arg]` is optional — a given command
+-- spells its argument the same way in both.
 local BUILTIN = {
-  "write",
-  "quit",
-  "wq",
-  "xit",
-  "quitall",
-  "wall",
-  "wqall",
-  "edit",
-  "enew",
-  "split",
-  "vsplit",
-  "new",
-  "vnew",
-  "close",
-  "hide",
-  "only",
-  "terminal",
-  "tabnew",
-  "tabclose",
-  "tabonly",
-  "tabmove",
-  "tabnext",
-  "tabprevious",
-  "tabfirst",
-  "tablast",
-  "drop",
-  "resize",
-  "vertical",
-  "checktime",
-  "buffers",
-  "buffer",
-  "bnext",
-  "bprevious",
-  "bfirst",
-  "blast",
-  "bdelete",
-  "copen",
-  "cclose",
-  "cwindow",
-  "cnext",
-  "cprevious",
-  "cfirst",
-  "clast",
-  "colder",
-  "cnewer",
-  "lopen",
-  "lclose",
-  "lwindow",
-  "lnext",
-  "lprevious",
-  "lua",
-  "sleep",
-  "messages",
-  "echo",
-  "echomsg",
-  "echoerr",
-  "registers",
-  "marks",
-  "jumps",
-  "changes",
-  "set",
-  "setlocal",
-  "setfiletype",
-  "undo",
-  "redo",
-  "nohlsearch",
-  "substitute",
-  "global",
-  "vglobal",
-  "delete",
-  "print",
-  "put",
-  "highlight",
-  "helptags",
+  { "write", ":write [file]", "Write the buffer to its file (or to [file])." },
+  { "quit", ":quit", "Close the current window; quit when it is the last." },
+  { "wq", ":wq [file]", "Write the buffer (to [file]), then close the window." },
+  { "xit", ":xit [file]", "Write the buffer if changed (to [file]), then close it." },
+  { "quitall", ":quitall", "Quit nxvim, failing if any buffer has unsaved changes." },
+  { "wall", ":wall", "Write every changed buffer." },
+  { "wqall", ":wqall", "Write every changed buffer, then quit." },
+  { "edit", ":edit [file]", "Edit [file], or reload the current buffer from disk." },
+  { "enew", ":enew", "Open a new, empty, unnamed buffer in this window." },
+  { "split", ":split [file]", "Split the window horizontally; optionally edit [file]." },
+  { "vsplit", ":vsplit [file]", "Split the window vertically; optionally edit [file]." },
+  { "new", ":new", "Horizontally split and edit a new empty buffer." },
+  { "vnew", ":vnew", "Vertically split and edit a new empty buffer." },
+  { "close", ":close", "Close the current window (keep the buffer loaded)." },
+  { "hide", ":hide", "Close the current window without unloading the buffer." },
+  { "only", ":only", "Close every window except the current one." },
+  { "terminal", ":terminal [cmd]", "Open a terminal buffer running [cmd] (or the shell)." },
+  { "tabnew", ":tabnew [file]", "Open a new tab page; optionally edit [file]." },
+  { "tabclose", ":tabclose", "Close the current tab page." },
+  { "tabonly", ":tabonly", "Close every tab page except the current one." },
+  { "tabmove", ":tabmove [n]", "Move the current tab page to position [n]." },
+  { "tabnext", ":tabnext [n]", "Go to the next tab page (or tab [n])." },
+  { "tabprevious", ":tabprevious", "Go to the previous tab page." },
+  { "tabfirst", ":tabfirst", "Go to the first tab page." },
+  { "tablast", ":tablast", "Go to the last tab page." },
+  { "drop", ":drop {file}", "Edit {file}, reusing a window that already shows it." },
+  { "resize", ":resize [n]", "Set the current window's height to [n] rows." },
+  { "vertical", ":vertical {cmd}", "Run {cmd} with a vertical split where it splits." },
+  { "checktime", ":checktime", "Reload buffers changed on disk outside nxvim." },
+  { "buffers", ":buffers", "List the loaded buffers (alias :ls)." },
+  { "panels", ":panels", "List the named panels (the surfaces hidden from :ls)." },
+  { "buffer", ":buffer {n}", "Edit buffer {n} (or by name) in this window." },
+  { "bnext", ":bnext", "Go to the next buffer in the buffer list." },
+  { "bprevious", ":bprevious", "Go to the previous buffer in the buffer list." },
+  { "bfirst", ":bfirst", "Go to the first buffer in the buffer list." },
+  { "blast", ":blast", "Go to the last buffer in the buffer list." },
+  { "bdelete", ":bdelete [n]", "Unload buffer [n] and remove it from the list." },
+  { "copen", ":copen", "Open the quickfix window." },
+  { "cclose", ":cclose", "Close the quickfix window." },
+  { "cwindow", ":cwindow", "Open the quickfix window only if it has entries." },
+  { "cnext", ":cnext", "Jump to the next quickfix entry." },
+  { "cprevious", ":cprevious", "Jump to the previous quickfix entry." },
+  { "cfirst", ":cfirst", "Jump to the first quickfix entry." },
+  { "clast", ":clast", "Jump to the last quickfix entry." },
+  { "colder", ":colder", "Go to an older quickfix list." },
+  { "cnewer", ":cnewer", "Go to a newer quickfix list." },
+  { "lopen", ":lopen", "Open the location-list window." },
+  { "lclose", ":lclose", "Close the location-list window." },
+  { "lwindow", ":lwindow", "Open the location-list window only if it has entries." },
+  { "lnext", ":lnext", "Jump to the next location-list entry." },
+  { "lprevious", ":lprevious", "Jump to the previous location-list entry." },
+  { "lfirst", ":lfirst", "Jump to the first location-list entry." },
+  { "llast", ":llast", "Jump to the last location-list entry." },
+  { "lolder", ":lolder", "Go to an older location list." },
+  { "lnewer", ":lnewer", "Go to a newer location list." },
+  { "lua", ":lua {chunk}", "Execute {chunk} as Lua in the nx.* runtime." },
+  { "sleep", ":sleep [n]", "Pause for [n] seconds (or milliseconds with `m`)." },
+  { "messages", ":messages", "Show recorded messages." },
+  { "echo", ":echo {expr}", "Evaluate and display {expr}." },
+  { "echomsg", ":echomsg {expr}", "Display {expr} and record it in :messages." },
+  { "echoerr", ":echoerr {expr}", "Display {expr} as an error and record it." },
+  { "registers", ":registers", "Display the contents of the registers." },
+  { "marks", ":marks", "List the marks and their positions." },
+  { "jumps", ":jumps", "List the jump list." },
+  { "changes", ":changes", "List the change list." },
+  { "set", ":set {option}", "Set {option} for all buffers and windows." },
+  { "setlocal", ":setlocal {option}", "Set {option} for the current buffer/window only." },
+  { "setfiletype", ":setfiletype {ft}", "Set 'filetype' to {ft} unless already set." },
+  { "undo", ":undo [n]", "Undo changes (or jump to undo state [n])." },
+  { "redo", ":redo", "Redo a change that was undone." },
+  { "nohlsearch", ":nohlsearch", "Stop highlighting the last search match." },
+  { "substitute", ":substitute/{pat}/{sub}/", "Replace matches of {pat} with {sub} on a range." },
+  { "global", ":global/{pat}/{cmd}", "Run {cmd} on every line matching {pat}." },
+  { "vglobal", ":vglobal/{pat}/{cmd}", "Run {cmd} on every line NOT matching {pat}." },
+  { "delete", ":delete [x]", "Delete lines in the range (into register [x])." },
+  { "print", ":print", "Print the lines in the range." },
+  { "put", ":put [x]", "Insert the contents of register [x] after the line." },
+  { "highlight", ":highlight {group}", "Define or show highlight group {group}." },
+  { "helptags", ":helptags {dir}", "Generate the help tags file for {dir}." },
+  -- Working directory / sourcing / colours (server-level commands — `excmd.rs`).
+  { "cd", ":cd [dir]", "Change the global working directory to [dir] (or $HOME)." },
+  { "tcd", ":tcd [dir]", "Change the tab-local working directory to [dir]." },
+  { "lcd", ":lcd [dir]", "Change the window-local working directory to [dir]." },
+  { "pwd", ":pwd", "Print the current working directory." },
+  { "source", ":source {file}", "Execute the Lua commands in {file}." },
+  { "colorscheme", ":colorscheme [name]", "Load colour scheme [name] (or show the current one)." },
+  -- Build / search into the quickfix or location list.
+  { "make", ":make [args]", "Run 'makeprg' and load the errors into the quickfix list." },
+  { "lmake", ":lmake [args]", "Like :make, but load into the location list." },
+  { "grep", ":grep {args}", "Run 'grepprg' and load the matches into the quickfix list." },
+  { "lgrep", ":lgrep {args}", "Like :grep, but load into the location list." },
+  { "vimgrep", ":vimgrep /{pat}/ {file}", "Search files for {pat} into the quickfix list." },
+  { "lvimgrep", ":lvimgrep /{pat}/ {file}", "Like :vimgrep, but load into the location list." },
+  { "cc", ":cc [nr]", "Jump to quickfix error [nr] (or the current one)." },
+  { "ll", ":ll [nr]", "Jump to location-list entry [nr] (or the current one)." },
+  { "cfile", ":cfile [file]", "Read errors from [file] into the quickfix list." },
+  { "lfile", ":lfile [file]", "Read errors from [file] into the location list." },
+  { "cbuffer", ":cbuffer", "Read errors from the current buffer into the quickfix list." },
+  { "lbuffer", ":lbuffer", "Read errors from the current buffer into the location list." },
+  -- Autocommands / user commands / command modifiers.
+  { "autocmd", ":autocmd {event} {pat} {cmd}", "Define an autocommand." },
+  { "augroup", ":augroup {name}", "Define or switch to autocommand group {name}." },
+  { "doautocmd", ":doautocmd {event}", "Fire the autocommands for {event}." },
+  { "command", ":command {name} {repl}", "Define a user command :{name}." },
+  { "silent", ":silent {cmd}", "Run {cmd}, suppressing its messages." },
+  { "tab", ":tab {cmd}", "Run {cmd} so a window it opens becomes a new tab page." },
+  -- LSP (the `:Lsp*` verbs).
+  { "LspInfo", ":LspInfo", "Show the LSP clients attached to the buffer." },
+  { "LspHover", ":LspHover", "Show hover information for the symbol under the cursor." },
+  { "LspDefinition", ":LspDefinition", "Jump to the definition of the symbol under the cursor." },
+  {
+    "LspDeclaration",
+    ":LspDeclaration",
+    "Jump to the declaration of the symbol under the cursor.",
+  },
+  { "LspTypeDefinition", ":LspTypeDefinition", "Jump to the type definition of the symbol." },
+  { "LspImplementation", ":LspImplementation", "Jump to the implementation of the symbol." },
+  { "LspReferences", ":LspReferences", "List references to the symbol under the cursor." },
+  { "LspSignatureHelp", ":LspSignatureHelp", "Show signature help for the call under the cursor." },
+  { "LspRename", ":LspRename [name]", "Rename the symbol under the cursor to [name]." },
+  { "LspCodeAction", ":LspCodeAction", "Choose a code action for the cursor position." },
+  { "LspFormat", ":LspFormat", "Format the current buffer with the language server." },
+  { "LspDiagnostics", ":LspDiagnostics", "List the buffer's diagnostics in the location list." },
+  -- Tree-sitter parser management.
+  { "TSInstall", ":TSInstall {lang}", "Install the tree-sitter parser for {lang}." },
+  { "TSUpdate", ":TSUpdate [lang]", "Update installed tree-sitter parsers (all, or [lang])." },
+  { "TSInstallInfo", ":TSInstallInfo", "List installed / available tree-sitter parsers." },
 }
 
 -- nx.cmdline_complete.setup{ docs = true }: enable the engine. `docs` toggles the
@@ -109,17 +178,55 @@ function nx.cmdline_complete.setup(opts)
   nx._cmdline_complete_setup(docs == true)
 end
 
+-- Append the registered user commands (`nx.user_command.create`) to `out` so a
+-- plugin command appears in the wildmenu exactly as a built-in does — the unified
+-- payoff. Both the global registry and the current buffer's buffer-local commands
+-- are merged (a buffer-local shadows a global of the same name, matching dispatch);
+-- `seen` dedups so a buffer-local doesn't list twice and a plugin can't double a
+-- built-in. The command's `desc` (when given) becomes its docs, headed by a `:Name`
+-- synopsis; a command with no `desc` shows the synopsis alone.
+local function append_user_commands(out, seen)
+  local function add(commands)
+    for name, record in pairs(commands) do
+      if not seen[name] then
+        seen[name] = true
+        local desc = record.desc
+        local doc = ":" .. name
+        if desc and desc ~= "" then
+          doc = doc .. "\n\n" .. desc
+        end
+        out[#out + 1] = { label = name, insert = name, doc = doc }
+      end
+    end
+  end
+  -- Buffer-local first so it wins the `seen` dedup over a same-named global.
+  add(nx.user_command.buf_get(0))
+  add(nx.user_command.get())
+end
+
 -- nx._cmdline_complete_run(line, col): the candidate source the server calls
 -- synchronously per `<Tab>` (and each edit while the wildmenu is open). It returns
 -- the candidate list — a `{ {label, insert[, doc]}, ... }` array — and core
 -- fuzzy-ranks it against the command-name token it extracted (core only calls this
--- when the cursor is within the command name, never in its arguments). This phase
--- returns the whole command catalog (names); `line` / `col` drive argument
--- completion in a later phase (`_line` / `_col` are unused until then).
+-- when the cursor is within the command name, never in its arguments). The candidate
+-- set is the curated built-in catalog plus the registered user commands; `line` /
+-- `col` drive argument completion in a later phase (`_line` / `_col` unused until
+-- then).
 function nx._cmdline_complete_run(_line, _col)
   local out = {}
-  for _, name in ipairs(BUILTIN) do
-    out[#out + 1] = { label = name, insert = name }
+  local seen = {}
+  for _, cmd in ipairs(BUILTIN) do
+    local name, synopsis, description = cmd[1], cmd[2], cmd[3]
+    seen[name] = true
+    out[#out + 1] = {
+      label = name,
+      insert = name,
+      -- The docs pane (Phase 3): the synopsis heads the float, the description
+      -- follows a blank line. Core skips a leading blank, so a command with no
+      -- description still renders cleanly.
+      doc = synopsis .. "\n\n" .. description,
+    }
   end
+  append_user_commands(out, seen)
   return out
 end

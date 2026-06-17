@@ -108,8 +108,11 @@ impl Editor {
                 return Ok(());
             }
             // With the completion popup open, `<Esc>` closes it first — a second
-            // `<Esc>` then cancels the line (vim's wildmenu dismissal).
+            // `<Esc>` then cancels the line (vim's wildmenu dismissal). If the wildmenu
+            // had previewed a selection into the line, restore the user's typed text
+            // before closing (so dismissing the menu un-does the preview).
             "cancel" if self.cmdline_menu_open() => {
+                self.cmdline_complete_revert();
                 self.close_cmdline_menu();
                 return Ok(());
             }

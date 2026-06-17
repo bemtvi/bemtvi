@@ -22,7 +22,8 @@
 --   :tab<Tab>          narrow to the tab-* family
 --   keep typing        the open list narrows LIVE against what you type
 --                      (`:e<Tab>` then `d` → just `edit`)
---   <Tab> / <C-n> / <Down>   cycle the highlight forward
+--   <Tab> / <C-n> / <Down>   cycle the highlight forward — a docs float showing the
+--                            highlighted command's synopsis + help floats beside it
 --   <S-Tab> / <C-p> / <Up>   cycle the highlight backward
 --   <CR>               accept the highlighted command (rewriting the token) and
 --                      RUN it; with nothing highlighted, run the typed line as-is
@@ -38,12 +39,22 @@
 --   <Tab>              highlight `enew`
 --   <CR>               accept + run :enew → a new empty buffer replaces this one
 --
--- Names only for now. The docs/params preview pane (Phase 3) and argument
--- completion (`:e <file>`, `:set <opt>`, … — a later, pure-Lua extension; the
--- source already receives the whole line + cursor) are not in this phase.
+-- THE UNIFIED PAYOFF — a plugin command appears like a built-in:
+--   :Greet<Tab>        the `:Greet` command registered below shows in the list, and
+--                      its `desc` is the docs float text — no extra wiring
+--
+-- Command NAMES + docs (built-ins and user commands). Argument completion (`:e
+-- <file>`, `:set <opt>`, … — a later, pure-Lua extension; the source already
+-- receives the whole line + cursor) is not in this phase.
 
 -- Enable the engine. A bare `setup {}` turns command-line completion on; the
 -- engine is OFF until this call, so an editor with no `setup` behaves exactly as
--- before. (`docs = true` is the default — it arms the Phase 3 preview pane, inert
--- until that phase lands.)
+-- before. (`docs = true` is the default — the synopsis/help float beside the
+-- highlighted row; pass `docs = false` for a names-only wildmenu.)
 nx.cmdline_complete.setup {}
+
+-- A plugin command with a `desc`: it joins the wildmenu catalog automatically (via
+-- nx.user_command.get()), ranked and previewed exactly like a built-in.
+nx.user_command.create("Greet", function()
+  nx.notify("Hello from a plugin command!")
+end, { desc = "Print a friendly greeting" })

@@ -349,6 +349,21 @@ impl EditHost {
         self.sync_buffer_watches();
     }
 
+    /// Fire the startup `VimEnter` autocmd — the "editor has finished starting"
+    /// hook — then drain its effects. Run once, right after `v:vim_did_enter` is
+    /// set: `init.lua` and the package `plugin/` scripts have all run, so a handler
+    /// (e.g. the package manager's first-run recommended-plugins prompt) sees a
+    /// fully started editor. A registry with no `VimEnter` handler is a cheap no-op.
+    /// Errors surface on the message line rather than aborting startup.
+    pub(crate) fn fire_vim_enter(&mut self) {
+        if let Err(e) = self.lua.exec("nx.autocmd.exec('VimEnter', {})") {
+            self.editor
+                .echo(format!("E5117: Error executing VimEnter autocommands: {e}"));
+        }
+        self.apply_lua_effects();
+        self.run_pending();
+    }
+
     /// Re-apply the current window's effective directory to the process cwd after a
     /// window / tab focus change (vim's `fix_current_dir`). With `:lcd` / `:tcd` in
     /// play the effective dir differs per window / tab, so a switch must `chdir` so

@@ -18,7 +18,7 @@ use std::time::Duration;
 
 use nxvim_rpc::{Incoming, Rpc};
 use nxvim_server::ServerInit;
-use nxvim_test_harness::{exec_lua, lua_bool, start_attached, temp_dir};
+use nxvim_test_harness::{attach, exec_lua, feed, lua_bool, spawn, start_attached, temp_dir};
 use tokio::sync::mpsc::UnboundedReceiver;
 
 async fn start() -> (Rpc, UnboundedReceiver<Incoming>) {
@@ -431,5 +431,163 @@ async fn git_runs_noninteractive_with_terminal_prompt_disabled() {
         logged.lines().any(|l| l == "0"),
         "git must be spawned with GIT_TERMINAL_PROMPT=0 so it never prompts on the \
          terminal (recorded values: {logged:?})"
+    );
+}
+
+// ----- first-run recommended-set bootstrap -----------------------------------
+
+// Point the manager's install root + config dir at temp dirs (hermetic).
+async fn setup_root_and_config(rpc: &Rpc, tag: &str) -> (std::path::PathBuf, std::path::PathBuf) {
+    let base = temp_dir(tag);
+    let root = base.join("data");
+    let cfg = base.join("config");
+    exec_lua(
+        rpc,
+        &format!(
+            "nx.plugins.setup({{ root = \"{}\", config = \"{}\" }})",
+            q(&root),
+            q(&cfg)
+        ),
+    )
+    .await;
+    (root, cfg)
+}
+
+// On a fresh setup the first-run flow offers the recommended set; accepting it
+// writes the set to the user's config (a separate plugins.lua that init.lua
+// requires) and installs+loads it now.
+#[tokio::test]
+async fn first_run_offers_recommended_and_persists_on_yes() {
+    let (rpc, _i) = start().await;
+    let src = temp_dir("plug_reco_src");
+    let repo = make_repo(&src, "zeta");
+    let (root, cfg) = setup_root_and_config(&rpc, "plug_reco").await;
+
+    exec_lua(
+        &rpc,
+        &format!(
+            "nx.plugins.recommend({{ {{ \"file://{repo}\", name = \"zeta\" }} }})\n\
+             nx.plugins.bootstrap()",
+            repo = q(&repo)
+        ),
+    )
+    .await;
+
+    // The confirm appears (after the async marker check); accept it.
+    assert!(
+        poll_true(&rpc, "return nx.plugins._prompting == true").await,
+        "the recommended-set confirm should appear on a fresh setup"
+    );
+    feed(&rpc, "y");
+
+    // The set installs + loads, and is persisted to the user's config.
+    assert!(
+        poll_true(&rpc, "return nx.plugins._loaded.zeta == true").await,
+        "accepting installs and loads the recommended set"
+    );
+    let pluginslua = std::fs::read_to_string(cfg.join("lua").join("plugins.lua")).unwrap();
+    assert!(
+        pluginslua.contains("zeta"),
+        "the set is written to lua/plugins.lua (got: {pluginslua:?})"
+    );
+    let initlua = std::fs::read_to_string(cfg.join("init.lua")).unwrap();
+    assert!(
+        initlua.contains("require(\"plugins\")"),
+        "init.lua is pointed at the managed plugins.lua (got: {initlua:?})"
+    );
+    // The "asked already" marker now exists, so a second run never re-prompts.
+    assert!(root.join(".recommended-prompted").exists());
+    exec_lua(&rpc, "nx.plugins._order = {}; nx.plugins.bootstrap()").await;
+    tokio::time::sleep(Duration::from_millis(120)).await;
+    assert_ne!(
+        lua_bool(&rpc, "return nx.plugins._prompting == true").await,
+        Some(true),
+        "an already-answered setup must not prompt again"
+    );
+}
+
+// Declining the offer records the marker (so it never asks again) and writes
+// nothing to the user's config.
+#[tokio::test]
+async fn first_run_decline_writes_nothing_but_marks_asked() {
+    let (rpc, _i) = start().await;
+    let src = temp_dir("plug_decline_src");
+    let repo = make_repo(&src, "eta");
+    let (root, cfg) = setup_root_and_config(&rpc, "plug_decline").await;
+
+    exec_lua(
+        &rpc,
+        &format!(
+            "nx.plugins.recommend({{ {{ \"file://{repo}\", name = \"eta\" }} }})\n\
+             nx.plugins.bootstrap()",
+            repo = q(&repo)
+        ),
+    )
+    .await;
+    assert!(poll_true(&rpc, "return nx.plugins._prompting == true").await);
+    feed(&rpc, "n");
+
+    // Marker written (asked once), but no config and nothing installed.
+    for _ in 0..200 {
+        if root.join(".recommended-prompted").exists() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(
+        root.join(".recommended-prompted").exists(),
+        "asked-once marker is recorded"
+    );
+    assert!(
+        !cfg.join("lua").join("plugins.lua").exists(),
+        "declining writes no config"
+    );
+    assert_ne!(
+        lua_bool(&rpc, "return nx.plugins._loaded.eta == true").await,
+        Some(true),
+        "declining installs nothing"
+    );
+}
+
+// VimEnter (fired by the server at the end of startup) drives the first-run prompt
+// for a brand-new user whose init.lua only registers a recommended set.
+#[tokio::test]
+async fn vim_enter_triggers_the_first_run_prompt() {
+    let src = temp_dir("plug_vimenter_src");
+    let repo = make_repo(&src, "theta");
+    let base = temp_dir("plug_vimenter");
+    let root = base.join("data");
+    let cfg = base.join("config");
+    std::fs::create_dir_all(&cfg).unwrap();
+    // A config that only sets paths and registers a recommended set — no plugins of
+    // the user's own, so the bootstrap should offer the set at VimEnter.
+    std::fs::write(
+        cfg.join("init.lua"),
+        format!(
+            "nx.plugins.setup({{ root = \"{root}\", config = \"{cfg}\" }})\n\
+             nx.plugins.recommend({{ {{ \"file://{repo}\", name = \"theta\" }} }})\n",
+            root = q(&root),
+            cfg = q(&cfg),
+            repo = q(&repo)
+        ),
+    )
+    .unwrap();
+    let init = ServerInit {
+        config_dir: Some(cfg.clone()),
+        runtimepath: vec![cfg.clone()],
+        ..Default::default()
+    };
+    let (rpc, _incoming) = spawn(init);
+    attach(&rpc, 80, 24).await;
+
+    // No exec_lua trigger: VimEnter alone must surface the prompt.
+    assert!(
+        poll_true(&rpc, "return nx.plugins._prompting == true").await,
+        "VimEnter should drive the first-run recommended-set prompt"
+    );
+    feed(&rpc, "y");
+    assert!(
+        poll_true(&rpc, "return nx.plugins._loaded.theta == true").await,
+        "accepting the VimEnter prompt installs the set"
     );
 }

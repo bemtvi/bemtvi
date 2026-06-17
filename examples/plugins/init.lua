@@ -6,13 +6,14 @@
 -- runtime, never blocking the editor) and loads each one — eagerly at startup or
 -- lazily on a trigger.
 --
--- IMPORTANT: nxvim is its OWN editor, not a neovim build. Plugins are written
--- against the `nx.*` API (see the spec's worked examples — picker/complete/
--- statusline/snippet sources, decoration providers, tree views). nxvim does NOT
--- run neovim plugins: the *only* neovim surface it supports is **colorschemes**
--- (neovim `nvim_set_hl` colorschemes run unmodified). So the specs below are
--- nxvim-native plugins (or a neovim colorscheme) — a neovim plugin like telescope
--- or which-key would clone fine but error on load against nxvim's API.
+-- IMPORTANT: nxvim is its OWN editor, not a neovim build, and claims no neovim
+-- compatibility. Plugins are written against the `nx.*` API (see the spec's worked
+-- examples — picker/complete/statusline/snippet sources, decoration providers, tree
+-- views). A neovim plugin like telescope or which-key would clone fine but error on
+-- load against nxvim's API. So the specs below are nxvim-native plugins, plus a
+-- **colorscheme** — colorschemes are nxvim's own pure-Lua modules that fill the
+-- highlight registry through the highlight API (`vim.cmd.colorscheme` / the
+-- `nvim_set_hl` alias), so a catppuccin-style colorscheme repo loads as-is.
 --
 -- Try it:
 --   NXVIM_CONFIG=examples/plugins cargo run -p nxvim
@@ -27,7 +28,7 @@
 -- nx.plugins.setup({ root = vim.fn.stdpath("data") .. "/plugins" })
 
 nx.plugins({
-  -- A neovim COLORSCHEME — the one neovim surface nxvim runs unmodified. Loaded
+  -- A COLORSCHEME (a pure-Lua module that fills the highlight registry). Loaded
   -- eagerly; `config` runs once it is on the runtimepath, so `colorscheme`
   -- resolves the freshly-installed colors/.
   {
@@ -78,3 +79,21 @@ nx.plugins({
   -- { name = "nxtree", dir = "/path/to/nxvim/examples/nxtree",
   --   config = function() require("nxtree").setup({}) end },
 })
+
+-- ----- First-run recommended set (for a distribution / starter config) --------
+--
+-- Register a curated set with nx.plugins.recommend{}. On a FRESH setup — the user
+-- has declared no plugins of their own and hasn't been asked before — nxvim offers
+-- to install it at startup (VimEnter), and on "yes" writes it to the user's config
+-- (a managed lua/plugins.lua that init.lua requires) and installs it. It asks at
+-- most once, ever.
+--
+-- Because the set is serialized back to the user's config, a recommended spec's
+-- `config`/`init` must be a STRING of Lua (not a function) — everything else is a
+-- normal spec:
+--
+-- nx.plugins.recommend({
+--   { "catppuccin/nvim", name = "catppuccin",
+--     config = [[ vim.cmd("colorscheme catppuccin") ]] },
+--   { "author/nx-files", keys = { "<leader>ff" } },
+-- })

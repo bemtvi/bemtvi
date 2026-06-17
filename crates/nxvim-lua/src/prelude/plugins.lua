@@ -64,6 +64,16 @@ local function root()
   return M._opts.root
 end
 
+-- The user's config directory — where the first-run setup writes the managed
+-- `lua/plugins.lua` and points `init.lua` at it. Overridable via setup{} (a test
+-- points it at a temp dir; a user could relocate it).
+local function config_dir()
+  if not M._opts.config then
+    M._opts.config = vim.fn.stdpath("config")
+  end
+  return M._opts.config
+end
+
 -- ----- spec normalization ----------------------------------------------------
 
 -- Forward declarations — these helpers are defined further down but referenced by
@@ -80,6 +90,21 @@ end
 -- `git@host:owner/repo`), as opposed to the "owner/repo" GitHub shorthand.
 local function is_full_url(s)
   return s:match("^%a[%w+.-]*://") ~= nil or s:match("^[^/]+@[^/]+:") ~= nil
+end
+
+-- A hook (config/init) may be given as a function OR as a STRING of Lua source.
+-- The string form exists so the recommended set can be written back out to
+-- `plugins.lua` (a function can't be serialized); here we compile it to a function
+-- so the live manager only ever deals with functions. Fails loud on bad source.
+local function as_fn(v, what)
+  if type(v) == "string" then
+    local f, err = loadstring(v, "@nx.plugins/" .. what)
+    if not f then
+      error("nx.plugins: invalid " .. what .. " source: " .. tostring(err), 0)
+    end
+    return f
+  end
+  return v
 end
 
 -- Normalize one declared spec (a string shorthand or a table) into the internal
@@ -135,8 +160,8 @@ local function normalize(spec)
     dir = spec.dir, -- local-dev marker (nil for a managed clone)
     _dir = spec.dir or (root() .. "/" .. name),
     enabled = spec.enabled,
-    config = spec.config,
-    init = spec.init,
+    config = as_fn(spec.config, "config"),
+    init = as_fn(spec.init, "init"),
     lazy = lazy,
     _triggers = triggers,
     _deps = deps,
@@ -569,6 +594,166 @@ function M.clean()
   end)()
 end
 
+-- ----- recommended set + first-run bootstrap ---------------------------------
+
+-- The curated default set offered on a fresh install. EMPTY by default — nxvim (or
+-- a distribution) fills it via `nx.plugins.recommend{...}`; with nothing here the
+-- first-run prompt simply never appears. Specs are DATA + string-form hooks only
+-- (see recommend()), so the set can be written back out to the user's config.
+M._recommended = M._recommended or {}
+
+-- Register the recommended set (replacing any prior). A recommended spec may carry
+-- every normal field EXCEPT a `config`/`init` *function* — those must be a STRING
+-- of Lua source, because the set is serialized into the user's `plugins.lua` and a
+-- function cannot be written out. Fails loud on a function hook rather than
+-- silently dropping it.
+function M.recommend(specs)
+  for _, s in ipairs(specs) do
+    if type(s) == "table" then
+      for _, k in ipairs({ "config", "init" }) do
+        if s[k] ~= nil and type(s[k]) ~= "string" then
+          error(
+            "nx.plugins.recommend: a recommended spec's '"
+              .. k
+              .. "' must be a STRING of Lua (it gets written to plugins.lua), not a "
+              .. type(s[k]),
+            0
+          )
+        end
+      end
+    end
+  end
+  M._recommended = specs
+  return specs
+end
+
+-- Quote a string as a Lua literal (handles quotes / backslashes / newlines).
+local function qstr(s)
+  return string.format("%q", s)
+end
+
+-- Serialize a list of source strings as a Lua list literal: { "a", "b" }.
+local function qlist(list)
+  local parts = {}
+  for _, v in ipairs(list) do
+    parts[#parts + 1] = qstr(v)
+  end
+  return "{ " .. table.concat(parts, ", ") .. " }"
+end
+
+-- Serialize ONE raw recommended spec back to a Lua table literal for plugins.lua.
+-- Forward-declared so it can recurse into `dependencies`.
+local serialize_spec
+serialize_spec = function(s)
+  if type(s) == "string" then
+    return "{ " .. qstr(s) .. " }"
+  end
+  local fields = {}
+  local src = s.src or s.url or s[1]
+  if src then
+    fields[#fields + 1] = qstr(src)
+  end
+  for _, k in ipairs({ "name", "branch", "tag", "version", "commit", "dir" }) do
+    if s[k] ~= nil then
+      fields[#fields + 1] = k .. " = " .. qstr(s[k])
+    end
+  end
+  for _, k in ipairs({ "cmd", "event", "ft", "keys" }) do
+    if s[k] ~= nil then
+      fields[#fields + 1] = k .. " = " .. qlist(type(s[k]) == "table" and s[k] or { s[k] })
+    end
+  end
+  local deps = s.dependencies or s.deps
+  if deps then
+    local parts = {}
+    for _, d in ipairs(deps) do
+      parts[#parts + 1] = serialize_spec(d)
+    end
+    fields[#fields + 1] = "dependencies = { " .. table.concat(parts, ", ") .. " }"
+  end
+  if s.enabled ~= nil and type(s.enabled) ~= "function" then
+    fields[#fields + 1] = "enabled = " .. tostring(s.enabled)
+  end
+  -- Hooks are strings here (recommend() enforced it); emit as real functions.
+  for _, k in ipairs({ "config", "init" }) do
+    if s[k] ~= nil then
+      fields[#fields + 1] = k .. " = function() " .. s[k] .. " end"
+    end
+  end
+  return "{ " .. table.concat(fields, ", ") .. " }"
+end
+
+-- The full `plugins.lua` text for the recommended set.
+local function serialize_recommended()
+  local lines = {
+    "-- nxvim recommended plugins, added by first-run setup.",
+    "-- This file is yours now: edit it to add, remove, or configure plugins.",
+    "nx.plugins({",
+  }
+  for _, s in ipairs(M._recommended) do
+    lines[#lines + 1] = "  " .. serialize_spec(s) .. ","
+  end
+  lines[#lines + 1] = "})"
+  return table.concat(lines, "\n") .. "\n"
+end
+
+-- Write the recommended set to `<config>/lua/plugins.lua` and make `init.lua`
+-- `require("plugins")` (creating it if absent, appending if it doesn't already).
+-- Leaves any hand-written init.lua otherwise untouched. Returns a promise.
+function M._persist_recommended()
+  return nx.async(function()
+    local cfg = config_dir()
+    nx.await(nx.fs.mkdir(cfg .. "/lua", { recursive = true }))
+    nx.await(nx.fs.write(cfg .. "/lua/plugins.lua", serialize_recommended()))
+    local init = cfg .. "/init.lua"
+    local existing = ""
+    if nx.await(nx.fs.exists(init)) then
+      existing = nx.await(nx.fs.read_text(init))
+    end
+    if not existing:find("require%(%s*['\"]plugins['\"]%s*%)") then
+      local lead = (existing ~= "" and existing:sub(-1) ~= "\n") and "\n" or ""
+      nx.await(nx.fs.append(init, lead .. 'require("plugins")\n'))
+    end
+  end)()
+end
+
+-- The marker recording that we've already offered the recommended set, so we ask
+-- AT MOST ONCE ever — kept under the manager's own root (overridable, hermetic).
+local function prompted_marker()
+  return root() .. "/.recommended-prompted"
+end
+
+-- First-run flow: on a fresh setup (the user has declared no plugins of their own,
+-- a recommended set exists, and we have not asked before), prompt to install the
+-- recommended set; on yes, write it to the user's config and install it now.
+-- Returns a promise. Wired to `VimEnter` below, and callable directly. Re-entrant-
+-- safe (`_prompting` guard) and asks only once (the marker, written either answer).
+function M.bootstrap()
+  return nx.async(function()
+    if M._prompting or #M._order > 0 or #M._recommended == 0 then
+      return
+    end
+    if nx.await(nx.fs.exists(prompted_marker())) then
+      return
+    end
+    M._prompting = true
+    local n = #M._recommended
+    local yes = nx.await(
+      nx.ui.confirm("Install the " .. n .. " recommended plugins? They'll be saved to your config.")
+    )
+    -- Record that we asked (whatever the answer) so we never nag again.
+    nx.await(nx.fs.mkdir(root(), { recursive = true }))
+    nx.await(nx.fs.write(prompted_marker(), "1\n"))
+    M._prompting = false
+    if not yes then
+      return
+    end
+    nx.await(M._persist_recommended())
+    M.add(M._recommended)
+    nx.await(M.sync())
+  end)()
+end
+
 -- ----- introspection ----------------------------------------------------------
 
 -- A synchronous snapshot of the declared set (declaration order): each
@@ -645,5 +830,12 @@ nx.command("PluginList", function()
     nx.notify(table.concat(lines, "\n"), 2)
   end)
 end, { desc = "List declared plugins and their install/load state (nx.plugins.status)." })
+
+-- First-run offer: once the editor has finished starting (VimEnter, fired by the
+-- server after init.lua + plugin scripts), run the bootstrap — it self-gates to a
+-- truly fresh setup with a recommended set and only ever asks once.
+nx.on("VimEnter", {}, function()
+  M.bootstrap()
+end)
 
 return nx.plugins

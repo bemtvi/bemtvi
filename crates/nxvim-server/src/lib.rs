@@ -889,6 +889,7 @@ impl EditHost {
         self.emit_lifecycle_events();
         self.run_pending();
         let _ = self.lua.set_vim_did_enter(true);
+        self.fire_vim_enter();
     }
 
     /// Source the user's single-file `init.lua` (read from OPFS by the Worker) through
@@ -1939,6 +1940,8 @@ where
     // The startup VimEnter point has passed: `v:vim_did_enter` is now 1, so a
     // plugin that gates "the editor has finished starting" reads it as true.
     let _ = host.lua.set_vim_did_enter(true);
+    // Fire the VimEnter autocmd (the package manager's first-run prompt hooks it).
+    host.fire_vim_enter();
 
     // The run loop is a thin translator over the `host` (the standalone `EditHost`): each
     // arm receives one event off a transport and hands the whole batch to an inbound-seam

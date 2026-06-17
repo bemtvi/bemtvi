@@ -472,8 +472,12 @@ engines this API is a thin contract over.
    `:PluginInstall` / `:PluginUpdate` / `:PluginClean` / `:PluginList`. A loaded
    plugin is put on the live runtimepath via the `nx._add_rtp` bridge — so its
    modules `require` and its `colors/`/`queries/`/`lsp/` resolve without a
-   restart — then its `plugin/` scripts source and its `config` runs. See
-   `crates/nxvim-lua/src/prelude/plugins.lua` and `examples/plugins/`.)*
+   restart — then its `plugin/` scripts source and its `config` runs. `config`/
+   `init` accept a plain or async function. A built-in **first-run** flow
+   (`nx.plugins.recommend{…}` + the `VimEnter` autocmd) offers a curated set on a
+   fresh setup and, on accept, writes it to a managed `lua/plugins.lua` the user's
+   `init.lua` requires. See `crates/nxvim-lua/src/prelude/plugins.lua` and
+   `examples/plugins/`.)*
 2. **Picker** — highest daily-driver value; exercises spawn / streaming /
    cancellation / floats / preview end to end.
 3. **Completion engine** — LSP + buffer + snippets sources built-in.

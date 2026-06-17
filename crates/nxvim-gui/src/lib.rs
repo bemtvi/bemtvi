@@ -41,8 +41,7 @@ mod session;
 
 pub use input::{encode_key, is_paste};
 pub use mouse::{
-    button_name, cell_at, drain_notches, horizontal_action, mouse_modifier, panel_close_button,
-    panel_content_rect, vertical_action, within,
+    button_name, cell_at, drain_notches, horizontal_action, mouse_modifier, vertical_action, within,
 };
 pub use session::{parse_connect_uri, spawn_session, spawn_stdio_daemon_session, Session};
 // The pure inline-inlay-hint geometry (the shift math) and the segment splice, so
@@ -796,40 +795,11 @@ impl App {
         let Some(r) = self.renderer.as_ref() else {
             return;
         };
-        let (cols, total_rows) = r.grid_size();
+        let (cols, _) = r.grid_size();
         self.mouse_down = true;
         self.last_drag_cell = Some((col, row));
 
-        // 1. The bottom panel (`:messages`/`:ls`) swallows every click while open:
-        // its `[X]` (or `q`) closes it, a content row selects that entry, and the
-        // already-selected entry activates (`<CR>`) — the TUI's select-then-confirm.
-        if let Some(panel) = self.view.panel.as_ref() {
-            if let Some((brow, bcols)) = mouse::panel_close_button(cols, total_rows, panel.height) {
-                if row == brow && bcols.contains(&col) {
-                    self.rpc.notify("nvim_input", vec![Value::from("q")]);
-                    return;
-                }
-            }
-            if let Some((cx, cy, cw, ch)) =
-                mouse::panel_content_rect(cols, total_rows, panel.height)
-            {
-                if mouse::within(col, row, cx, cy, cw, ch) {
-                    let prow = row - cy; // row within the content area
-                    if (prow as usize) < panel.lines.len() {
-                        let sel_end = panel.cursor_row + panel.cursor_span.max(1);
-                        if prow >= panel.cursor_row && prow < sel_end {
-                            self.rpc.notify("nvim_input", vec![Value::from("<CR>")]);
-                        } else {
-                            self.rpc
-                                .notify("nxvim_panel_click", vec![Value::from(prow as u64)]);
-                        }
-                    }
-                }
-            }
-            return;
-        }
-
-        // 2. The completion popup: a click on a row selects it, and clicking the
+        // 1. The completion popup: a click on a row selects it, and clicking the
         // already-selected row accepts it (<C-n> then <C-y>). A click off the popup
         // is swallowed (no text-area fallthrough), matching the TUI.
         if let Some(hit) = render::pmenu_hit(&self.view, cols) {
@@ -951,14 +921,14 @@ impl App {
         let Some((col, row)) = self.pointer_cell() else {
             return;
         };
-        let (cols, total_rows) = r.grid_size();
+        let (cols, _) = r.grid_size();
 
         // Cap the per-event repeat so a flung trackpad can't flood the server.
         const MAX_STEPS: i32 = 10;
         if let Some(action) = mouse::vertical_action(vnotch) {
             let down = vnotch < 0;
             let steps = vnotch.unsigned_abs().min(MAX_STEPS as u32);
-            if !self.wheel_vertical_overlay(col, row, cols, total_rows, down, steps) {
+            if !self.wheel_vertical_overlay(col, row, cols, down, steps) {
                 for _ in 0..steps {
                     self.send_mouse("wheel", action, col, row);
                 }
@@ -982,7 +952,6 @@ impl App {
         col: u16,
         row: u16,
         cols: u16,
-        total_rows: u16,
         down: bool,
         steps: u32,
     ) -> bool {
@@ -1026,21 +995,6 @@ impl App {
                     }
                 }
                 return true;
-            }
-        }
-        // The bottom panel: the server owns its (word-wrapped) cursor, so feed the
-        // navigation keys it already handles.
-        if let Some(panel) = self.view.panel.as_ref() {
-            if let Some((cx, cy, cw, ch)) =
-                mouse::panel_content_rect(cols, total_rows, panel.height)
-            {
-                if mouse::within(col, row, cx, cy, cw, ch) {
-                    let key = if down { "<Down>" } else { "<Up>" };
-                    for _ in 0..steps {
-                        self.rpc.notify("nvim_input", vec![Value::from(key)]);
-                    }
-                    return true;
-                }
             }
         }
         false

@@ -51,9 +51,6 @@
   .seccur { background: #d7dae0; color: #1e2127; }
   .cur-mc { background: var(--accent); color: #1e2127; font-weight: 700; }
   .cmdline { position: absolute; left: 0; height: var(--ch); line-height: var(--ch); color: var(--fg); }
-  .panel { position: absolute; left: 0; background: #21252b; }
-  .panel-title { background: #2c313a; color: var(--accent); }
-  .panel-cur { background: var(--sel); }
   .diag-underline { text-decoration: underline wavy; text-decoration-thickness: 1px; text-underline-offset: 2px; }
   .inlay { color: #5c6370; font-style: italic; }
   .pmenu { position: absolute; background: #21252b; border: 1px solid #3e4451; z-index: 10; white-space: pre; }
@@ -820,7 +817,6 @@
         const g = dockGeo(tablineRows);
         renderGlobalStatus(g.midY + g.midH);
       }
-      if (view.panel) renderPanel(view.panel, cmdRow);
       if (serverStyled && view.pmenu) renderPmenu(view.pmenu, tablineRows);
       // The nx.ui.select menu is server-agnostic (it works in the pure-wasm
       // build too), so it renders regardless of `serverStyled`.
@@ -838,7 +834,7 @@
     // The permanent dock band geometry for this frame (cells). Each open dock
     // reserves its content extent plus one separator cell toward the main area; the
     // frame stacks as [top dock][tabline][left|main|right][global status][bottom
-    // dock][panel][cmd]. With no dock open every band is 0 and the main area is the
+    // dock][cmd]. With no dock open every band is 0 and the main area is the
     // whole windows area (so a dock-free frame is unchanged).
     function dockGeo(tablineRows) {
       const res = (n) => (n > 0 ? n + 1 : 0);
@@ -846,11 +842,10 @@
       const dt = view.dock_top || 0, db = view.dock_bottom || 0;
       const topBand = res(dt), bottomBand = res(db), leftBand = res(dl), rightBand = res(dr);
       const globalStatusRows = serverStyled && view.global_status?.length ? 1 : 0;
-      const panelRows = view.panel ? view.panel.height + 1 : 0;
       const midY = topBand + tablineRows;
       const midH = Math.max(
         1,
-        editorRows - topBand - tablineRows - globalStatusRows - bottomBand - panelRows
+        editorRows - topBand - tablineRows - globalStatusRows - bottomBand
       );
       return { dl, dr, dt, db, topBand, bottomBand, leftBand, rightBand, midY, midH, globalStatusRows };
     }
@@ -1014,7 +1009,7 @@
       }
 
       const leftcol = w.leftcol || 0;
-      const isFocused = w.focused && !view.command_mode && !view.panel;
+      const isFocused = w.focused && !view.command_mode;
       const cursorCol = w.cursor_screen_col;
       const cursorRow = w.cursor_row;
       const sel = w.selection[row] || null;
@@ -1055,7 +1050,7 @@
         if ((sel && inSpan(sel, c)) || secSel.some((s) => inSpan(s, c))) cls = "sel";
         if (secCols.has(c)) cls = "seccur";
         if (isFocused && row === cursorRow && c === cursorCol) cls = cursorClass();
-        else if (!w.focused && row === cursorRow && c === cursorCol && !view.command_mode && !view.panel) cls = "cur-hollow";
+        else if (!w.focused && row === cursorRow && c === cursorCol && !view.command_mode) cls = "cur-hollow";
         // Cursor / selection / search own their colors via their CSS class; an
         // overlay virt_text bg (cells[c].bg) only shows on a plain cell.
         const owned = COLOR_OWNED.has(cls);
@@ -1071,7 +1066,7 @@
       }
       if (isFocused && row === cursorRow && cursorCol >= cells.length) {
         out += `<span class="${cursorClass()}"> </span>`;
-      } else if (!w.focused && row === cursorRow && cursorCol >= cells.length && !view.command_mode && !view.panel) {
+      } else if (!w.focused && row === cursorRow && cursorCol >= cells.length && !view.command_mode) {
         out += `<span class="cur-hollow"> </span>`;
       }
       // Extmark end-of-line virtual text: a one-cell gap, then each placement's
@@ -1241,7 +1236,7 @@
       }
       emitHints(Infinity);
 
-      const isFocused = w.focused && !view.command_mode && !view.panel;
+      const isFocused = w.focused && !view.command_mode;
       const cursorRow = w.cursor_row;
       let inlayShift = 0;
       for (const [hcol, text] of hints) {
@@ -1269,7 +1264,7 @@
           cls = "inlay";
         }
         if (isFocused && cursorRow === row && painted === cursorPainted) cls = cursorClass();
-        else if (!w.focused && cursorRow === row && painted === cursorPainted && !view.command_mode && !view.panel) cls = "cur-hollow";
+        else if (!w.focused && cursorRow === row && painted === cursorPainted && !view.command_mode) cls = "cur-hollow";
         const style = (a < 0) ? cell.base : (COLOR_OWNED.has(cls) ? "" : cell.base);
         if (cls !== runCls || style !== runStyle) { flush(); runCls = cls; runStyle = style; }
         run += cell.ch;
@@ -1278,7 +1273,7 @@
       flush();
       if (isFocused && cursorRow === row && cursorPainted >= painted) {
         out += `<span class="${cursorClass()}"> </span>`;
-      } else if (!w.focused && cursorRow === row && cursorPainted >= painted && !view.command_mode && !view.panel) {
+      } else if (!w.focused && cursorRow === row && cursorPainted >= painted && !view.command_mode) {
         out += `<span class="cur-hollow"> </span>`;
       }
       const virt = w.diagnostics_virt?.[row];
@@ -1640,24 +1635,6 @@
         if (!dockTl(region, g)) continue;
         const rt = regionTabs(region);
         renderTabCells(rt.tabs, rt.current, x, y, width, rt.title || "");
-      }
-    }
-    function renderPanel(panel, cmdRow) {
-      const borderRow = cmdRow - (panel.height + 1);
-      const titleEl = document.createElement("div");
-      titleEl.className = "row panel-title";
-      titleEl.style.top = borderRow * ch + "px";
-      titleEl.style.width = cols * cw + "px";
-      titleEl.textContent = `─ ${panel.title} ` + "─".repeat(Math.max(0, cols - panel.title.length - 6)) + "[X]─";
-      gridEl.appendChild(titleEl);
-      const curEnd = panel.cursor_row + Math.max(1, panel.cursor_span);
-      for (let r = 0; r < panel.height; r++) {
-        const rowEl = document.createElement("div");
-        rowEl.className = "row" + (r >= panel.cursor_row && r < curEnd ? " panel-cur" : "");
-        rowEl.style.top = (borderRow + 1 + r) * ch + "px";
-        rowEl.style.width = cols * cw + "px";
-        rowEl.textContent = panel.lines[r] ?? "";
-        gridEl.appendChild(rowEl);
       }
     }
     function renderCommand(cmdRow) {

@@ -33,7 +33,7 @@ use glyphon::{
     TextArea, TextAtlas, TextBounds, TextRenderer, Viewport,
 };
 use nxvim_view::{
-    Geometry, InlayHint, PanelData, ResizeCursor, StatusSegment, Style, TabData, View, VirtChunk,
+    Geometry, InlayHint, ResizeCursor, StatusSegment, Style, TabData, View, VirtChunk,
     VirtPlacement, WindowRegion, WindowView,
 };
 use winit::window::Window;
@@ -367,7 +367,6 @@ impl Renderer {
             cols,
             rows: total_rows.saturating_sub(1),
             tabline_rows: u16::from(!view.tabline.is_empty()),
-            panel_rows: view.panel.as_ref().map_or(0, |p| p.height + 1),
             global_status_rows: u16::from(!view.global_status.is_empty()),
         };
         nxvim_view::resize_handle_at(view, geo, row, col)
@@ -615,17 +614,16 @@ impl Renderer {
         let (cols, total_rows) = self.grid_size();
         let cmd_row = total_rows.saturating_sub(1);
 
-        // Chrome rows the windows area gives up: the tabline at the top (≥2 tabs),
-        // the global status line and the panel at the bottom. The server already
-        // sized the window rects to fit what's left.
+        // Chrome rows the windows area gives up: the tabline at the top (≥2 tabs)
+        // and the global status line at the bottom. The server already sized the
+        // window rects to fit what's left.
         let tabline_rows = u16::from(!view.tabline.is_empty());
         let global_status_rows = u16::from(!view.global_status.is_empty());
-        let panel_rows = view.panel.as_ref().map_or(0, |p| p.height + 1);
 
         // The permanent dock bands. Each open dock reserves its content extent plus
         // one separator cell toward the main area; the frame stacks as `[top dock]
-        // [tabline][left|main|right][global status][bottom dock][panel][cmd]`. With
-        // no dock open every band is 0 and this collapses to the pre-dock layout.
+        // [tabline][left|main|right][global status][bottom dock][cmd]`. With no dock
+        // open every band is 0 and this collapses to the pre-dock layout.
         let res = |n: u16| if n > 0 { n + 1 } else { 0 };
         let (dl, dr, dt, db) = (
             view.dock_left,
@@ -640,7 +638,6 @@ impl Renderer {
             .saturating_sub(tabline_rows)
             .saturating_sub(global_status_rows)
             .saturating_sub(bottom_band)
-            .saturating_sub(panel_rows)
             .max(1);
         let main_x = left_band;
         let main_w = cols
@@ -770,13 +767,6 @@ impl Renderer {
         if global_status_rows > 0 {
             let row = mid_y + mid_h;
             self.build_status_row(&view.global_status, (0, row), cols, view, quads, items);
-        }
-
-        // The bottom panel (`:messages`, `:ls`), claiming its rows above the
-        // command line.
-        if let Some(panel) = &view.panel {
-            let top = cmd_row.saturating_sub(panel_rows);
-            self.build_panel(panel, top, cols, view, quads, items);
         }
 
         // The insert-mode completion popup, anchored over the focused window (in its
@@ -1347,12 +1337,7 @@ impl Renderer {
         // cursor while any is active (it reappears in that widget). While sliding it
         // tracks the interpolated cursor line so it moves with the text.
         let picker_open = view.menu.as_ref().is_some_and(|m| m.query.is_some());
-        if win.focused
-            && view.panel.is_none()
-            && !view.command_mode
-            && !picker_open
-            && text_rows > 0
-        {
+        if win.focused && !view.command_mode && !picker_open && text_rows > 0 {
             // The cursor shifts right by the inlay hints spliced in at or before its
             // column (a hint exactly at the cursor sits before the cursor glyph), so
             // it tracks the splice. Mid-slide that's the band's hints on the cursor's
@@ -1756,65 +1741,6 @@ impl Renderer {
             let full = self.full_bounds();
             self.push_plain(items, text, pos, fg, full);
             col = col.saturating_add(w);
-        }
-    }
-
-    /// Paint the bottom panel (`:messages`, `:ls`): an opaque background, a
-    /// `─ Title ───[X]─` top bar, then the content rows with the selected (cursor)
-    /// entry reverse-highlighted across the full width. The GUI port of the TUI's
-    /// `render_panel`; the focused cursor sits here, so the window cursor is
-    /// suppressed (see `build_window`).
-    fn build_panel(
-        &mut self,
-        panel: &PanelData,
-        top: u16,
-        cols: u16,
-        view: &View,
-        quads: &mut Vec<Quad>,
-        items: &mut Vec<TextItem>,
-    ) {
-        let bg = style_bg(&view.normal).unwrap_or(DEFAULT_BG);
-        let fg = style_fg(&view.normal).unwrap_or(DEFAULT_FG);
-        let border = lighten(bg, 0x30);
-        // Opaque fill behind the whole panel (title bar + content rows).
-        let (px, py) = self.cell_px(0, top);
-        quads.push(Quad {
-            x: px,
-            y: py,
-            w: self.cell_w * cols as f32,
-            h: self.cell_h * (panel.height + 1) as f32,
-            color: color_to_rgba(srgb_to_color(bg)),
-        });
-        // A thin top rule marks the panel's border edge.
-        quads.push(Quad {
-            x: px,
-            y: py,
-            w: self.cell_w * cols as f32,
-            h: (self.cell_h * 0.10).max(1.0),
-            color: color_to_rgba(srgb_to_color(border)),
-        });
-        // Title on the bar, and the click-to-close `[X]` at the right.
-        let full = self.full_bounds();
-        let title = format!(" {} ", panel.title);
-        self.push_plain(items, &title, self.cell_px(0, top), fg, full);
-        let close = "[X]";
-        let cx = cols.saturating_sub(close.chars().count() as u16);
-        self.push_plain(items, close, self.cell_px(cx, top), fg, full);
-
-        // Content rows; the selected (possibly word-wrapped) entry is highlighted
-        // across its whole span so a wrapped entry still reads as one focused line.
-        let content_top = top + 1;
-        let cursor_end = panel.cursor_row.saturating_add(panel.cursor_span.max(1));
-        for r in 0..panel.height {
-            let row = content_top + r;
-            let selected = r >= panel.cursor_row && r < cursor_end;
-            if selected {
-                self.fill_row(quads, row, cols, fg);
-            }
-            if let Some(text) = panel.lines.get(r as usize) {
-                let tfg = if selected { bg } else { fg };
-                self.push_plain(items, text, self.cell_px(0, row), tfg, full);
-            }
         }
     }
 

@@ -31,7 +31,6 @@ pub struct Geometry {
     pub cols: u16,
     pub rows: u16,
     pub tabline_rows: u16,
-    pub panel_rows: u16,
     pub global_status_rows: u16,
 }
 
@@ -59,7 +58,7 @@ pub fn resize_handle_at(view: &View, geo: Geometry, row: u16, col: u16) -> Optio
 /// The middle band (left dock | main | right docks) vertical span `(top, height)`
 /// — the rows the left/right dock edges run down, mirroring `region_geoms`.
 fn middle_band(view: &View, geo: Geometry) -> (u16, u16) {
-    let chrome = geo.tabline_rows + geo.panel_rows + geo.global_status_rows;
+    let chrome = geo.tabline_rows + geo.global_status_rows;
     let mid_y = reserved(view.dock_top) + geo.tabline_rows;
     let mid_h = geo
         .rows

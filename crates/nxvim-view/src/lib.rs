@@ -7,8 +7,8 @@
 //! terminal client (`nxvim-tui`) and a native GUI client share them rather than
 //! re-implementing the wire decode and input encoding:
 //!
-//! - [`View`] and its sub-models ([`WindowView`], [`Separator`], [`PanelData`],
-//!   [`PmenuData`], [`TabData`], [`ScrollData`]) plus the redraw decoder
+//! - [`View`] and its sub-models ([`WindowView`], [`Separator`], [`PmenuData`],
+//!   [`TabData`], [`ScrollData`]) plus the redraw decoder
 //!   ([`View::from_redraw`] / [`View::update`]).
 //! - A neutral [`Style`] / [`Border`] each client converts to its own toolkit.
 //! - Input encoding: the [`Key`] enum, [`notation`], and [`encode_paste`].
@@ -27,7 +27,6 @@ pub use parse::{
 };
 pub use style::{Border, Style};
 pub use view::{
-    ContentFloatData, ImageData, MenuData, MenuDocs, MenuPreview, PanelData, PmenuData,
-    RegionTabline, RegionTablines, ScrollData, Separator, TabData, View, WinRect, WindowRegion,
-    WindowView,
+    ContentFloatData, ImageData, MenuData, MenuDocs, MenuPreview, PmenuData, RegionTabline,
+    RegionTablines, ScrollData, Separator, TabData, View, WinRect, WindowRegion, WindowView,
 };

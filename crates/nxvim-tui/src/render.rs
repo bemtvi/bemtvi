@@ -14,8 +14,8 @@ use crate::anim::{arm_animation, lerp, Animation};
 use crate::images::ImageStore;
 use nxvim_view::{
     DiagSign, DiagSpan, DiagVirt, HlSpan, IncSearchSpans, InlayHint, MenuData, MenuPreview,
-    PanelData, PmenuData, RegionTabline, SearchSpans, Separator, StatusSegment, TabData, View,
-    VirtChunk, VirtPlacement, WindowRegion, WindowView,
+    PmenuData, RegionTabline, SearchSpans, Separator, StatusSegment, TabData, View, VirtChunk,
+    VirtPlacement, WindowRegion, WindowView,
 };
 
 /// Convert a neutral [`nxvim_view::Style`] into the ratatui [`Style`] the renderer
@@ -176,9 +176,9 @@ impl ScrollHarness {
 
 /// Lay the frame out and paint it: each window at its rect (gutter + text body +
 /// its own status line), the split separators between them, then the global
-/// command line, completion popup, and panel. The windows area is the frame
-/// minus the global bottom panel and command line; with one window it spans that
-/// whole area, so the output matches the pre-windows single-window frame exactly.
+/// command line and completion popup. The windows area is the frame minus the
+/// command line; with one window it spans that whole area, so the output matches
+/// the pre-windows single-window frame exactly.
 /// When `anim` is present it animates the **focused** window's slide.
 pub(crate) fn render(
     frame: &mut Frame,
@@ -187,11 +187,8 @@ pub(crate) fn render(
     doc_scroll: u16,
     mut images: Option<&mut ImageStore>,
 ) {
-    // The panel docks below all windows, claiming `height + 1` rows (content plus
-    // its title bar); `0` when none is open. The command line is the last row.
-    // Each window draws its own status line at the bottom of its rect, so there
-    // is no longer a global status row here.
-    let panel_rows = view.panel.as_ref().map_or(0, |p| p.height + 1);
+    // The command line is the last row. Each window draws its own status line at the
+    // bottom of its rect, so there is no longer a global status row here.
     // The tabline claims one row at the very top when ≥2 tabs are open (matching
     // the server's windows-area shrink); `0` otherwise, so single-tab frames are
     // unchanged.
@@ -202,14 +199,8 @@ pub(crate) fn render(
     // The permanent dock bands. Each open dock reserves its content extent plus one
     // separator cell toward the main area; all are `0` (and the layout collapses to
     // the pre-dock form) when no dock is open.
-    let dock = DockLayout::new(
-        frame.area(),
-        view,
-        tabline_rows,
-        global_status_rows,
-        panel_rows,
-    );
-    let (tabline_area, panel_area, cmd_area) = (dock.tabline, dock.panel, dock.cmd);
+    let dock = DockLayout::new(frame.area(), view, tabline_rows, global_status_rows);
+    let (tabline_area, cmd_area) = (dock.tabline, dock.cmd);
     let global_status_area = dock.global_status;
 
     if tabline_rows > 0 {
@@ -292,17 +283,6 @@ pub(crate) fn render(
         render_content_float(frame, inner, float, &view.styles);
     }
 
-    // A focused panel owns the cursor: draw it on the panel's current line and
-    // skip the text/command cursor entirely.
-    if let Some(panel) = &view.panel {
-        let content = render_panel(frame, panel_area, panel);
-        frame.set_cursor_position((
-            content.x,
-            content.y + panel.cursor_row.min(content.height.saturating_sub(1)),
-        ));
-        return;
-    }
-
     // An open picker owns the cursor: draw it in the prompt, not the text window
     // behind the float.
     if let Some(pos) = menu_cursor {
@@ -362,10 +342,10 @@ pub(crate) fn render(
 /// The absolute screen rectangles for each render region this frame: the main
 /// area, the four permanent docks, and the chrome rows. The whole frame stacks
 /// vertically as `[top dock][tabline][left|main|right][global status][bottom
-/// dock][panel][cmd]`; each open dock reserves its content extent plus one
-/// separator cell toward the main area. With no dock open every band is `0` and
-/// the layout collapses to the pre-dock `[tabline][main][global status][panel]
-/// [cmd]` form, so a dock-free frame is unchanged.
+/// dock][cmd]`; each open dock reserves its content extent plus one separator
+/// cell toward the main area. With no dock open every band is `0` and the layout
+/// collapses to the pre-dock `[tabline][main][global status][cmd]` form, so a
+/// dock-free frame is unchanged.
 struct DockLayout {
     main: Rect,
     left: Rect,
@@ -374,7 +354,6 @@ struct DockLayout {
     bottom: Rect,
     tabline: Rect,
     global_status: Rect,
-    panel: Rect,
     cmd: Rect,
     /// The `[left|main|right]` band, for full-height left/right dock borders.
     mid: Rect,
@@ -392,13 +371,7 @@ struct DockLayout {
 }
 
 impl DockLayout {
-    fn new(
-        area: Rect,
-        view: &View,
-        tabline_rows: u16,
-        global_status_rows: u16,
-        panel_rows: u16,
-    ) -> Self {
+    fn new(area: Rect, view: &View, tabline_rows: u16, global_status_rows: u16) -> Self {
         // A dock reserves `content + 1` cells (the `+1` its separator), `0` closed.
         let res = |n: u16| if n > 0 { n + 1 } else { 0 };
         let (dl, dr, dt, db) = (
@@ -412,13 +385,12 @@ impl DockLayout {
             Constraint::Length(tabline_rows),       // tabline
             Constraint::Min(1),                     // mid: left | main | right
             Constraint::Length(global_status_rows), // global status (laststatus=3)
-            Constraint::Length(res(db)),            // bottom dock (above the panel)
-            Constraint::Length(panel_rows),         // read-only panel
+            Constraint::Length(res(db)),            // bottom dock
             Constraint::Length(1),                  // command line
         ])
         .split(area);
-        let (top_band, tabline, mid, global_status, bottom_band, panel, cmd) =
-            (v[0], v[1], v[2], v[3], v[4], v[5], v[6]);
+        let (top_band, tabline, mid, global_status, bottom_band, cmd) =
+            (v[0], v[1], v[2], v[3], v[4], v[5]);
         let h = Layout::horizontal([
             Constraint::Length(res(dl)), // left dock
             Constraint::Min(1),          // main
@@ -467,7 +439,6 @@ impl DockLayout {
             bottom,
             tabline,
             global_status,
-            panel,
             cmd,
             mid,
             tl_left,
@@ -2114,47 +2085,6 @@ fn cmdline_prompt_width(view: &View) -> u16 {
     cmdline_prompt_str(view).chars().count() as u16
 }
 
-/// Render the bottom panel: a `─ Title ───────[X]─` top-border bar, then the
-/// content rows with the focused (cursor) line highlighted across the full
-/// width. The `[X]` at the right of the bar is the click-to-close button (see
-/// [`close_button`]). Returns the inner content [`Rect`] so the caller can
-/// place the editing cursor on the panel's current line.
-fn render_panel(frame: &mut Frame, area: Rect, panel: &PanelData) -> Rect {
-    let block = Block::new()
-        .borders(Borders::TOP)
-        .title_top(Line::from(format!(" {} ", panel.title)).left_aligned())
-        .title_top(Line::from("[X]").right_aligned());
-    let inner = block.inner(area);
-    frame.render_widget(block, area);
-
-    let width = inner.width as usize;
-    // The selected entry may span several rows when it word-wrapped; highlight the
-    // whole span so a wrapped entry still reads as one focused line.
-    let cursor_end = panel.cursor_row.saturating_add(panel.cursor_span.max(1));
-    let rows: Vec<Line> = (0..inner.height)
-        .map(|row| {
-            let text = panel
-                .lines
-                .get(row as usize)
-                .map(String::as_str)
-                .unwrap_or("");
-            if row >= panel.cursor_row && row < cursor_end {
-                // Fill the cursor line to the full width so the highlight reads
-                // as a selected row, not just selected text.
-                let filled = format!("{text:<width$}");
-                Line::from(Span::styled(
-                    filled,
-                    Style::default().add_modifier(Modifier::REVERSED),
-                ))
-            } else {
-                Line::from(text.to_string())
-            }
-        })
-        .collect();
-    frame.render_widget(Paragraph::new(Text::from(rows)), inner);
-    inner
-}
-
 /// Draw the completion popup as a bordered overlay over the text area: a box
 /// anchored at `(pmenu.col, pmenu.row)` in `text_area` cells — so its left edge
 /// lines up under the completion word, past the number gutter — with each item on
@@ -2664,13 +2594,11 @@ fn text_inner_rect(width: u16, height: u16, view: &View) -> Rect {
     };
     let tabline_rows = u16::from(!view.tabline.is_empty());
     let global_status_rows = u16::from(!view.global_status.is_empty());
-    let panel_rows = view.panel.as_ref().map_or(0, |p| p.height + 1);
     let dock = DockLayout::new(
         Rect::new(0, 0, width, height),
         view,
         tabline_rows,
         global_status_rows,
-        panel_rows,
     );
     // A focused float's content sits inside its border; the popup anchors there.
     // The focused window may live in a dock, so offset by its region's origin.
@@ -2817,7 +2745,7 @@ fn render_pmenu_doc(
 /// or `None` when no preview is drawn. `max_scroll` is the largest `doc_scroll`
 /// that still reveals new content. The event loop uses it to hit-test the mouse
 /// wheel and clamp the scroll; a test uses it to find the box. Mirrors the layout
-/// in [`render`] (same reason as [`close_button`]).
+/// in [`render`], so the hit-test lands on exactly the painted cells.
 #[doc(hidden)]
 pub fn pmenu_doc_geometry(
     width: u16,
@@ -2862,43 +2790,4 @@ fn pmenu_row(label: &str, detail: &str, width: usize) -> String {
     } else {
         format!("{label:<width$}")
     }
-}
-
-/// Screen position of the panel's `[X]` close button on a `width`x`height`
-/// terminal showing a panel of content height `panel_height`: its top-border
-/// row and the 3-cell column range the `[X]` occupies. `None` when the terminal
-/// has no room to lay the panel out. Pure (no rendering) so the event loop's
-/// click hit-test and a test can share one definition.
-///
-/// Layout mirrors [`render`]: from the bottom up, one command row, then the
-/// panel's `panel_height + 1` rows (the panel sits below the status line) — so
-/// the border row is `height - 1 - (panel_height + 1)`.
-///
-/// `#[doc(hidden)] pub` so a Tier-1 test can pin this geometry against the
-/// painted `[X]`; not part of the client's runtime API.
-#[doc(hidden)]
-pub fn close_button(
-    width: u16,
-    height: u16,
-    panel_height: u16,
-) -> Option<(u16, std::ops::Range<u16>)> {
-    let row = height.checked_sub(panel_height + 2)?;
-    let start = width.checked_sub(3)?;
-    Some((row, start..width))
-}
-
-/// Screen rect of the panel's content area — the rows below its top-border bar —
-/// on a `width`×`height` terminal showing a panel of content height
-/// `panel_height`: `(x, y, width, height)` in cells, or `None` when there's no
-/// room. The content sits one row below the border ([`close_button`]'s row), so
-/// `y = border_row + 1`. Pure (no rendering), so the event loop can hit-test the
-/// mouse against the same rows [`render_panel`] draws.
-#[doc(hidden)]
-pub fn panel_content_rect(
-    width: u16,
-    height: u16,
-    panel_height: u16,
-) -> Option<(u16, u16, u16, u16)> {
-    let border_row = height.checked_sub(panel_height + 2)?;
-    Some((0, border_row + 1, width, panel_height))
 }

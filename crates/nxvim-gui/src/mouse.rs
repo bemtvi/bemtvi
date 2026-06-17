@@ -51,8 +51,8 @@ pub fn mouse_modifier(mods: ModifiersState) -> String {
 }
 
 /// Whether `(col, row)` falls inside the `w`×`h` rect anchored at `(x, y)` — the
-/// hit-test shared by the completion popup, its doc preview, and the panel.
-/// Mirrors the TUI's `within`.
+/// hit-test shared by the completion popup and its doc preview. Mirrors the TUI's
+/// `within`.
 pub fn within(col: u16, row: u16, x: u16, y: u16, w: u16, h: u16) -> bool {
     col >= x && col < x + w && row >= y && row < y + h
 }
@@ -101,34 +101,4 @@ pub fn horizontal_action(notches: i32) -> Option<&'static str> {
         -1 => Some("right"),
         _ => None,
     }
-}
-
-/// Screen cell of the panel's `[X]` close button on a `cols`×`total_rows` grid
-/// showing a panel of content height `panel_height`: its top-border row and the
-/// 3-cell column range the `[X]` occupies. `None` when the grid has no room.
-/// Mirrors the GUI renderer's `build_panel` layout (and the TUI's `close_button`):
-/// the panel claims `panel_height + 1` rows above the one command row, so the
-/// border row is `total_rows - 1 - (panel_height + 1)` and the `[X]` is the last
-/// three columns. Pure, so the click hit-test and a test share one definition.
-pub fn panel_close_button(
-    cols: u16,
-    total_rows: u16,
-    panel_height: u16,
-) -> Option<(u16, std::ops::Range<u16>)> {
-    let row = total_rows.checked_sub(panel_height + 2)?;
-    let start = cols.checked_sub(3)?;
-    Some((row, start..cols))
-}
-
-/// Screen rect of the panel's content area — the rows below its top-border bar —
-/// as `(x, y, width, height)` in cells, or `None` when there's no room. The
-/// content sits one row below the border ([`panel_close_button`]'s row). Mirrors
-/// `build_panel`; pure, so the wheel/click hit-test matches the painted rows.
-pub fn panel_content_rect(
-    cols: u16,
-    total_rows: u16,
-    panel_height: u16,
-) -> Option<(u16, u16, u16, u16)> {
-    let border_row = total_rows.checked_sub(panel_height + 2)?;
-    Some((0, border_row + 1, cols, panel_height))
 }

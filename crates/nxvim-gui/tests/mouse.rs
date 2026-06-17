@@ -1,13 +1,12 @@
 //! Tier 1: the pure mouse helpers the GUI client feeds winit pointer events
-//! through — pixel→cell conversion, the `nvim_input_mouse` modifier string, the
-//! wheel-notch accumulator and direction, and the panel overlay hit-rects.
-//! Black-box, no window, no GPU — the mouse analogue of the `keys` test. The
-//! winit→RPC wiring itself lives in the event loop and isn't unit-testable
-//! without a window; these cover the math it depends on.
+//! through — pixel→cell conversion, the `nvim_input_mouse` modifier string, and
+//! the wheel-notch accumulator and direction. Black-box, no window, no GPU — the
+//! mouse analogue of the `keys` test. The winit→RPC wiring itself lives in the
+//! event loop and isn't unit-testable without a window; these cover the math it
+//! depends on.
 
 use nxvim_gui::{
-    button_name, cell_at, drain_notches, horizontal_action, mouse_modifier, panel_close_button,
-    panel_content_rect, vertical_action, within,
+    button_name, cell_at, drain_notches, horizontal_action, mouse_modifier, vertical_action, within,
 };
 use winit::event::MouseButton;
 use winit::keyboard::ModifiersState;
@@ -88,19 +87,4 @@ fn wheel_direction_follows_winit_sign_convention() {
     assert_eq!(horizontal_action(1), Some("left"));
     assert_eq!(horizontal_action(-1), Some("right"));
     assert_eq!(horizontal_action(0), None);
-}
-
-#[test]
-fn panel_overlay_rects_sit_above_the_command_row() {
-    // A 80×24 grid with a 5-row-content panel: the panel claims height+1 = 6 rows
-    // above the one command row, so its border row is 24 - 1 - 6 = 17.
-    let (brow, bcols) = panel_close_button(80, 24, 5).unwrap();
-    assert_eq!(brow, 17);
-    assert_eq!(bcols, 77..80); // the `[X]` is the last three columns
-
-    // Content sits one row below the border, 5 rows tall, full width.
-    assert_eq!(panel_content_rect(80, 24, 5), Some((0, 18, 80, 5)));
-    // No room (a tiny grid) → None rather than a wrapped rect.
-    assert_eq!(panel_close_button(2, 3, 5), None);
-    assert_eq!(panel_content_rect(80, 3, 5), None);
 }

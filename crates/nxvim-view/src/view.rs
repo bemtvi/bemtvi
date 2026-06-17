@@ -355,9 +355,6 @@ pub struct View {
     /// non-empty the renderer docks it on one row just above the command line and
     /// no window paints its own status row. Global — one per editor.
     pub global_status: Vec<StatusSegment>,
-    /// The bottom panel (`:messages`, `:ls`), or `None` when none is open. When
-    /// present it has input focus: the editing cursor is drawn inside it. Global.
-    pub panel: Option<PanelData>,
     /// The insert-mode completion popup, or `None` when none is open. Drawn last,
     /// over the focused window's text area. Global.
     pub pmenu: Option<PmenuData>,
@@ -550,19 +547,6 @@ pub struct RegionTablines {
     pub bottom: RegionTabline,
 }
 
-/// The bottom panel mirrored from the server's redraw: a title, the visible
-/// content slice, the cursor row within it, and the content height to lay out.
-#[derive(Clone)]
-pub struct PanelData {
-    pub title: String,
-    pub lines: Vec<String>,
-    pub cursor_row: u16,
-    /// Display rows the selected (possibly wrapped) entry spans; the whole span
-    /// is drawn as the focused line. Defaults to 1 (an unwrapped entry).
-    pub cursor_span: u16,
-    pub height: u16,
-}
-
 impl View {
     pub fn update(&mut self, params: &[Value]) {
         let Some(Value::Map(map)) = params.first() else {
@@ -617,20 +601,6 @@ impl View {
         self.tabline_segments = parse_status(map_get(map, "tabline_segments"), &self.styles);
         self.current_tab = map_u64(map, "current_tab") as usize;
         self.region_tablines = parse_region_tablines(map_get(map, "region_tablines"));
-        self.panel = match map_get(map, "panel") {
-            Some(Value::Map(p)) => Some(PanelData {
-                title: map_str(p, "title"),
-                lines: map_str_array(p, "lines"),
-                cursor_row: map_u16(p, "cursor_row"),
-                // Older redraws (and the panel test fixtures) omit the span; an
-                // unwrapped entry occupies exactly one row.
-                cursor_span: map_get(p, "cursor_span")
-                    .and_then(Value::as_u64)
-                    .map_or(1, |n| n as u16),
-                height: map_u16(p, "height"),
-            }),
-            _ => None,
-        };
         self.pmenu = match map_get(map, "pmenu") {
             Some(Value::Map(p)) => Some(PmenuData {
                 items: parse_pmenu_items(map_get(p, "items")),

@@ -11,7 +11,6 @@ fn geo() -> Geometry {
         cols: 80,
         rows: 23,
         tabline_rows: 0,
-        panel_rows: 0,
         global_status_rows: 0,
     }
 }

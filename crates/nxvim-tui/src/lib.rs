@@ -26,8 +26,8 @@ mod render;
 
 pub use keys::encode_key;
 pub use render::{
-    close_button, cursor_style, paint, paint_doc_scrolled, paint_with_cursor, panel_content_rect,
-    pmenu_doc_geometry, pmenu_geometry, ScrollHarness,
+    cursor_style, paint, paint_doc_scrolled, paint_with_cursor, pmenu_doc_geometry, pmenu_geometry,
+    ScrollHarness,
 };
 
 use anyhow::Result;
@@ -289,41 +289,7 @@ where
                     // never injects a `q` into the buffer.
                     MouseEventKind::Down(MouseButton::Left) => {
                         let size = terminal.size().unwrap_or_default();
-                        if let Some(panel) = view.panel.as_ref() {
-                            let close = close_button(size.width, size.height, panel.height);
-                            let on_close = close
-                                .as_ref()
-                                .is_some_and(|(row, cols)| m.row == *row && cols.contains(&m.column));
-                            if on_close {
-                                // The `[X]` on the border bar closes the panel.
-                                rpc.notify("nvim_input", vec![Value::from("q")]);
-                            } else if let Some((cx, cy, cw, ch)) =
-                                panel_content_rect(size.width, size.height, panel.height)
-                            {
-                                // A click on a content row selects that entry; a
-                                // click on the already-selected entry activates it
-                                // (`<CR>`) — the panel's select-then-confirm, like
-                                // the completion popup. Blank rows past the content
-                                // are ignored.
-                                if within(m.column, m.row, cx, cy, cw, ch) {
-                                    let row = (m.row - cy) as usize;
-                                    if row < panel.lines.len() {
-                                        let sel_end =
-                                            panel.cursor_row + panel.cursor_span.max(1);
-                                        let on_selected = (m.row - cy) >= panel.cursor_row
-                                            && (m.row - cy) < sel_end;
-                                        if on_selected {
-                                            rpc.notify("nvim_input", vec![Value::from("<CR>")]);
-                                        } else {
-                                            rpc.notify(
-                                                "nxvim_panel_click",
-                                                vec![Value::from(row as u64)],
-                                            );
-                                        }
-                                    }
-                                }
-                            }
-                        } else if let Some((px, py, pw, ph, start)) =
+                        if let Some((px, py, pw, ph, start)) =
                             pmenu_geometry(size.width, size.height, &view)
                         {
                             // A click on a completion row chooses that item: the
@@ -457,13 +423,6 @@ where
                             && pmenu_geometry(size.width, size.height, &view).is_some_and(
                                 |(px, py, pw, ph, _)| within(m.column, m.row, px, py, pw, ph),
                             );
-                        let over_panel = vertical
-                            && view.panel.as_ref().is_some_and(|panel| {
-                                panel_content_rect(size.width, size.height, panel.height)
-                                    .is_some_and(|(cx, cy, cw, ch)| {
-                                        within(m.column, m.row, cx, cy, cw, ch)
-                                    })
-                            });
                         if over_doc {
                             if let Some((.., max_scroll)) = doc {
                                 const STEP: u16 = 3;
@@ -490,11 +449,6 @@ where
                                     );
                                 }
                             }
-                        } else if over_panel {
-                            // The server owns the panel's (logical, word-wrapped)
-                            // cursor, so this just feeds the keys it already handles.
-                            let key = if down { "<Down>" } else { "<Up>" };
-                            rpc.notify("nvim_input", vec![Value::from(key)]);
                         } else {
                             let action = match m.kind {
                                 MouseEventKind::ScrollDown => "down",

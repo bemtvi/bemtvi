@@ -95,9 +95,17 @@ end
 
 -- ----- mutation --------------------------------------------------------------
 
--- nx.fs.mkdir(path[, { recursive = false }]) -> promise (resolves nil).
+-- nx.fs.mkdir(path[, { recursive = false, mode = 0o755 }]) -> promise (resolves
+-- nil). `mode` is the Unix permission bits applied to every directory created
+-- (defaults to 0o755 in Rust when omitted; ignored off Unix) — pass it to keep a
+-- private data/state dir from being created world-readable.
 function nx.fs.mkdir(path, opts)
-  return run_fs({ op = "mkdir", path = path, recursive = opts and opts.recursive or false })
+  return run_fs({
+    op = "mkdir",
+    path = path,
+    recursive = opts and opts.recursive or false,
+    mode = opts and opts.mode or nil,
+  })
 end
 
 -- nx.fs.rename(from, to) -> promise (resolves nil).

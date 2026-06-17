@@ -53,6 +53,13 @@ pub fn fs_job_from_value(v: &Value) -> Result<FsJob, String> {
             .ok_or_else(|| format!("luafs_op: op '{op}' missing string field '{key}'"))
     };
     let bool_field = |key: &str| get(key).and_then(Value::as_bool).unwrap_or(false);
+    // Unix permission bits for `mkdir`; default 0o755 when absent (older peers).
+    let u32_field = |key: &str, default: u32| {
+        get(key)
+            .and_then(Value::as_u64)
+            .map(|n| n as u32)
+            .unwrap_or(default)
+    };
     let bytes_field = |key: &str| -> Result<Vec<u8>, String> {
         get(key)
             .map(value_to_bytes)
@@ -93,6 +100,7 @@ pub fn fs_job_from_value(v: &Value) -> Result<FsJob, String> {
         "mkdir" => FsJob::Mkdir {
             path: str_field("path")?,
             recursive: bool_field("recursive"),
+            mode: u32_field("mode", 0o755),
         },
         "rename" => FsJob::Rename {
             from: str_field("from")?,
@@ -155,10 +163,15 @@ pub fn fs_job_to_value(job: &FsJob) -> Value {
             ("path", path.as_str().into()),
             ("data", Value::Binary(data.clone())),
         ]),
-        FsJob::Mkdir { path, recursive } => m(vec![
+        FsJob::Mkdir {
+            path,
+            recursive,
+            mode,
+        } => m(vec![
             ("op", "mkdir".into()),
             ("path", path.as_str().into()),
             ("recursive", Value::from(*recursive)),
+            ("mode", Value::from(*mode)),
         ]),
         FsJob::Rename { from, to } => m(vec![
             ("op", "rename".into()),

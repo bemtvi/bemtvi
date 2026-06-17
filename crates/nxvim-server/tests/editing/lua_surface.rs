@@ -316,29 +316,6 @@ async fn ex_command_without_bang_refuses_to_clobber() {
     );
 }
 
-#[cfg(unix)]
-#[tokio::test]
-async fn mkdir_honors_the_permissions_argument() {
-    // `vim.fn.mkdir(path, "p", "0700")` must create a private directory, not one
-    // with umask-default (world-readable) perms. init.lua runs at startup, so by
-    // the time the server is up the directory exists with the requested mode.
-    use std::os::unix::fs::PermissionsExt;
-    let dir = temp_dir("mkdir");
-    let target = dir.join("private").join("nested");
-    let init = format!(
-        "vim.fn.mkdir('{}', 'p', '0700')\n",
-        target.to_string_lossy()
-    );
-    let (_rpc, _incoming) = start_with_config(&dir, &init).await;
-
-    let meta = std::fs::metadata(&target).expect("mkdir should have created the directory");
-    assert_eq!(
-        meta.permissions().mode() & 0o777,
-        0o700,
-        "mkdir should apply the prot argument, not the umask default"
-    );
-}
-
 #[tokio::test]
 async fn recursive_user_command_does_not_wedge_the_server() {
     // A user command whose callback re-invokes itself feeds run_pending's

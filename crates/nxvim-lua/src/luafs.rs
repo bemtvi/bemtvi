@@ -608,8 +608,12 @@ pub fn run_fs_job(fs: &dyn LuaFs, job: &FsJob) -> Result<FsValue, FsError> {
         FsJob::Append { path, data } => write_whole(fs, path, data, true)
             .map(|()| FsValue::Nil)
             .map_err(fs_error),
-        FsJob::Mkdir { path, recursive } => fs
-            .mkdir(path, 0o755, *recursive)
+        FsJob::Mkdir {
+            path,
+            recursive,
+            mode,
+        } => fs
+            .mkdir(path, *mode, *recursive)
             .map(|()| FsValue::Nil)
             .map_err(fs_error),
         FsJob::Rename { from, to } => fs.rename(from, to).map(|()| FsValue::Nil).map_err(fs_error),

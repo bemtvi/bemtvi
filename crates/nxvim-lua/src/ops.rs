@@ -353,9 +353,14 @@ pub enum FsJob {
     Write { path: String, data: Vec<u8> },
     /// `nx.fs.append(path, data)` — append `data` to the file (create if absent).
     Append { path: String, data: Vec<u8> },
-    /// `nx.fs.mkdir(path, { recursive })` — create the directory (and parents when
-    /// `recursive`).
-    Mkdir { path: String, recursive: bool },
+    /// `nx.fs.mkdir(path, { recursive, mode })` — create the directory (and parents
+    /// when `recursive`). `mode` is the Unix permission bits applied to every
+    /// directory created (default `0o755`; ignored off Unix).
+    Mkdir {
+        path: String,
+        recursive: bool,
+        mode: u32,
+    },
     /// `nx.fs.rename(from, to)` — move / rename.
     Rename { from: String, to: String },
     /// `nx.fs.remove(path, { recursive })` — unlink a file, or remove a directory

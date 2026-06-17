@@ -1374,10 +1374,15 @@ fn fs_job_to_json(id: u64, job: &nxvim_lua::FsJob) -> serde_json::Value {
             put("path", path.clone().into());
             put("data", serde_json::json!(data));
         }
-        FsJob::Mkdir { path, recursive } => {
+        FsJob::Mkdir {
+            path,
+            recursive,
+            mode,
+        } => {
             put("op", "mkdir".into());
             put("path", path.clone().into());
             put("recursive", (*recursive).into());
+            put("mode", (*mode).into());
         }
         FsJob::Rename { from, to } => {
             put("op", "rename".into());

@@ -17,7 +17,7 @@ use crate::convert::{
     color_field, color_to_u32, env_pairs, flag_field, json_to_lua, lua_i64, lua_to_json,
     opt_table_to_json, stringify,
 };
-use crate::host::{create_dir_all_mode, get_runtime_file, parse_mode, stdpath};
+use crate::host::{get_runtime_file, stdpath};
 use crate::ops::{
     BufOp, CompletePush, CompleteSetupReq, ConfirmReq, DecorMark, DecorPublish, DockOp, ExtmarkOp,
     FeedKeysOp, FsJob, GlobalOptionOp, HlSet, LayerOp, LoopOp, LspOp, OptionValue, PanelOp,
@@ -637,23 +637,6 @@ pub(crate) fn install_vim(lua: &Lua, shared: &Rc<RefCell<Shared>>) -> mlua::Resu
     func.set(
         "stdpath",
         lua.create_function(|_, what: String| Ok(stdpath(&what)))?,
-    )?;
-    func.set(
-        "mkdir",
-        lua.create_function(
-            |_, (path, _flags, prot): (String, Option<String>, Option<mlua::Value>)| {
-                // `mkdir(path, "p" [, prot])` — create parents; return 1 on
-                // success, 0 on failure (Vimscript's truthy/falsey convention).
-                // `prot` is the permission mask (neovim's third arg): an octal
-                // string like "0700" or a numeric mode. Honoring it means a
-                // private data/state dir isn't silently created world-readable.
-                Ok(if create_dir_all_mode(&path, parse_mode(prot)) {
-                    1i64
-                } else {
-                    0
-                })
-            },
-        )?,
     )?;
     func.set(
         "has",
@@ -2232,6 +2215,9 @@ fn fs_job_from_table(job: &Table) -> mlua::Result<FsJob> {
     };
     let recursive =
         || -> mlua::Result<bool> { Ok(job.get::<Option<bool>>("recursive")?.unwrap_or(false)) };
+    // `mode` is the Unix permission bits for `mkdir`; default 0o755 (matching
+    // neovim's `mkdir` default) when the caller omits it.
+    let mode = || -> mlua::Result<u32> { Ok(job.get::<Option<u32>>("mode")?.unwrap_or(0o755)) };
     Ok(match op.as_str() {
         "stat" => FsJob::Stat {
             path: job.get("path")?,
@@ -2265,6 +2251,7 @@ fn fs_job_from_table(job: &Table) -> mlua::Result<FsJob> {
         "mkdir" => FsJob::Mkdir {
             path: job.get("path")?,
             recursive: recursive()?,
+            mode: mode()?,
         },
         "rename" => FsJob::Rename {
             from: job.get("from")?,

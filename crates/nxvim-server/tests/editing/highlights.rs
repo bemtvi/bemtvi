@@ -353,6 +353,11 @@ fn write_compiler_fixture(dir: &std::path::Path) {
     let module = dir.join("lua").join("compilescheme");
     std::fs::create_dir_all(&module).expect("create module dir");
     let compile_path = dir.join("cache");
+    // The compile step writes bytecode into this dir with `io.open(..., "wb")`,
+    // which won't create parents; the real plugin would `nx.fs.mkdir` it (async,
+    // off-tick) but the synchronous compile-on-load path can't await, so the
+    // harness creates the cache dir up front (it isn't what this test exercises).
+    std::fs::create_dir_all(&compile_path).expect("create cache dir");
     std::fs::write(
         module.join("init.lua"),
         format!(
@@ -387,7 +392,6 @@ fn write_compiler_fixture(dir: &std::path::Path) {
                  lines[#lines + 1] = string.format('h(0, \"%s\", %s)', group, inspect(color))\n\
                end\n\
                lines[#lines + 1] = 'end, true)'\n\
-               vim.fn.mkdir(M.options.compile_path, 'p')\n\
                local f = assert(loadstring(table.concat(lines, '\\n')), 'compile failed')\n\
                local file = assert(io.open(M.options.compile_path .. sep .. flavour, 'wb'))\n\
                file:write(f())\n\

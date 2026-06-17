@@ -247,6 +247,38 @@ async fn mkdir_recursive_creates_parents() {
     let _ = fs::remove_dir_all(&dir);
 }
 
+#[cfg(unix)]
+#[tokio::test]
+async fn mkdir_honors_the_mode_option() {
+    // `nx.fs.mkdir(path, { recursive = true, mode = 0o700 })` must create a private
+    // directory, not one with umask-default (world-readable) perms — the security
+    // property the removed blocking `vim.fn.mkdir(path, "p", "0700")` used to carry.
+    use std::os::unix::fs::PermissionsExt;
+    let (rpc, _incoming) = start().await;
+    let dir = temp_dir("fs_mkdir_mode");
+    let nested = dir.join("private/nested");
+
+    exec_lua(
+        &rpc,
+        &format!(
+            "_G.done = false\n\
+             nx.async(function()\n\
+               nx.await(nx.fs.mkdir(\"{d}\", {{ recursive = true, mode = 448 }}))\n\
+               _G.done = true\n\
+             end)()",
+            d = q(&nested)
+        ),
+    )
+    .await;
+    poll_done(&rpc).await;
+    let mode = fs::metadata(&nested).unwrap().permissions().mode() & 0o777;
+    assert_eq!(
+        mode, 0o700,
+        "mkdir should apply the mode option (448 == 0o700)"
+    );
+    let _ = fs::remove_dir_all(&dir);
+}
+
 #[tokio::test]
 async fn rename_moves_a_file() {
     let (rpc, _incoming) = start().await;

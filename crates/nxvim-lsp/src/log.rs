@@ -62,6 +62,18 @@ pub(crate) struct LspLog {
 }
 
 impl LspLog {
+    /// A silent log — no sink, threshold `Off`, so every [`log`](Self::log) is a
+    /// no-op and [`enabled`](Self::enabled) is always `false`. The browser sync
+    /// client (Phase 6e) uses this: the wasm build has no real filesystem for a log
+    /// file, and a server's stderr is surfaced to the editor's messages, not here.
+    #[cfg_attr(feature = "native", allow(dead_code))]
+    pub(crate) fn disabled() -> LspLog {
+        LspLog {
+            threshold: LogLevel::Off,
+            sink: None,
+        }
+    }
+
     /// Open the log per the environment and write the `[START]` banner. Returns a
     /// silent log (no file) when the level is `off` or the file can't be opened.
     pub(crate) fn from_env() -> LspLog {

@@ -9,13 +9,20 @@
 //! `codeAction.codeActionLiteralSupport`, without which a server returns legacy
 //! `Command[]` and "apply the edit" becomes impossible.
 
+#[cfg(feature = "native")]
 use std::future::ready;
+#[cfg(feature = "native")]
 use std::ops::ControlFlow;
+#[cfg(feature = "native")]
 use std::sync::Arc;
 
+#[cfg(feature = "native")]
 use async_lsp::router::Router;
+#[cfg(feature = "native")]
 use async_lsp::{MainLoop, ServerSocket};
+#[cfg(feature = "native")]
 use lsp_types::notification::{LogMessage, PublishDiagnostics, ShowMessage};
+#[cfg(feature = "native")]
 use lsp_types::request::{InlayHintRefreshRequest, SemanticTokensRefresh, WorkspaceConfiguration};
 use lsp_types::{
     ClientCapabilities, CodeActionCapabilityResolveSupport, CodeActionClientCapabilities,
@@ -31,15 +38,19 @@ use lsp_types::{
     TextDocumentSyncKind, TokenFormat, WorkspaceClientCapabilities,
     WorkspaceEditClientCapabilities,
 };
+#[cfg(feature = "native")]
 use tokio::sync::mpsc::UnboundedSender;
 
 use crate::log::{LogLevel, LspLog};
-use crate::protocol::{
-    LspEvent, PositionEncoding, ProviderCaps, RefreshKind, SemanticLegend, ServerKey,
-};
+// Pure helpers (always compiled) return these; the async router/handshake items
+// (gated below) use `LspEvent`/`RefreshKind`/`ServerKey`.
+#[cfg(feature = "native")]
+use crate::protocol::{LspEvent, RefreshKind, ServerKey};
+use crate::protocol::{PositionEncoding, ProviderCaps, SemanticLegend};
 
 /// State shared by the client `MainLoop`'s notification handlers: which server
 /// this loop belongs to, the channel to forward distilled events on, and the log.
+#[cfg(feature = "native")]
 pub(crate) struct ClientState {
     key: ServerKey,
     event_tx: UnboundedSender<LspEvent>,
@@ -56,6 +67,7 @@ pub(crate) struct ClientState {
 /// so the concurrency/catch-unwind middleware a server needs is unnecessary
 /// here. Unhandled server→client requests get a method-not-found response, which
 /// language servers tolerate.
+#[cfg(feature = "native")]
 pub(crate) fn new_client(
     key: ServerKey,
     event_tx: UnboundedSender<LspEvent>,
@@ -146,7 +158,7 @@ pub(crate) fn new_client(
 /// whole settings when the section is empty, `null` when the path is unset or no
 /// settings were configured). The pull-model analogue of the `didChangeConfiguration`
 /// push — neovim resolves each item the same way against `config.settings`.
-fn configuration_reply(
+pub(crate) fn configuration_reply(
     settings: Option<&serde_json::Value>,
     params: &ConfigurationParams,
 ) -> Vec<serde_json::Value> {
@@ -550,6 +562,7 @@ pub(crate) fn sync_kind_of(caps: &ServerCapabilities) -> TextDocumentSyncKind {
 /// config's `on_exit(code, signal, client)` hook (Phase 3). `code` is the normal
 /// exit code; `signal` is the terminating signal (unix only — always `None`
 /// elsewhere). `None`/`None` when the status couldn't be collected.
+#[cfg(feature = "native")]
 pub(crate) fn exit_code_signal(
     status: Option<std::process::ExitStatus>,
 ) -> (Option<i32>, Option<i32>) {

@@ -14,19 +14,18 @@ use lsp_types::{
     CodeActionContext, CodeActionParams, CompletionItem, CompletionParams,
     DidChangeTextDocumentParams, DidCloseTextDocumentParams, DidOpenTextDocumentParams,
     DidSaveTextDocumentParams, DocumentFormattingParams, FormattingOptions, GotoDefinitionParams,
-    HoverParams, InlayHint, InlayHintKind, InlayHintLabel, InlayHintParams, Position,
-    ReferenceContext, ReferenceParams, RenameParams, SemanticTokensDeltaParams,
-    SemanticTokensFullDeltaResult, SemanticTokensParams, SemanticTokensResult, SignatureHelpParams,
-    TextDocumentIdentifier, TextDocumentItem, TextDocumentPositionParams, Url,
-    VersionedTextDocumentIdentifier,
+    HoverParams, InlayHint, InlayHintParams, Position, ReferenceContext, ReferenceParams,
+    RenameParams, SemanticTokensDeltaParams, SemanticTokensFullDeltaResult, SemanticTokensParams,
+    SemanticTokensResult, SignatureHelpParams, TextDocumentIdentifier, TextDocumentItem,
+    TextDocumentPositionParams, Url, VersionedTextDocumentIdentifier,
 };
 
 use crate::convert::{
-    code_actions, completion_reply, documentation_lines, goto_locations, hover_reply,
-    normalize_workspace_edit, signature_help_reply,
+    code_actions, completion_reply, documentation_lines, goto_locations, hover_reply, inlay_hint,
+    inlay_label_core, normalize_workspace_edit, pad_label, signature_help_reply,
 };
 use crate::log::{LogLevel, LspLog};
-use crate::protocol::{InlayHintData, LspNotify, LspReply, LspRequest, SemanticTokensData};
+use crate::protocol::{LspNotify, LspReply, LspRequest, SemanticTokensData};
 
 /// Translate an [`LspNotify`] into the corresponding `async-lsp` notification.
 /// Send errors are ignored: a dead socket is detected by the main loop ending.
@@ -73,6 +72,25 @@ pub(crate) fn apply_notify(socket: &mut ServerSocket, note: LspNotify, log: &Lsp
     };
 }
 
+/// Unwrap a transport result, logging a failure and degrading it to `None` so the
+/// pure [`crate::convert`] distiller (shared verbatim with the synchronous wasm
+/// client) sees the uniform "nothing found" case rather than a hang. `what` names
+/// the feature for the log line.
+fn unwrap_logged<T>(
+    result: Result<Option<T>, async_lsp::Error>,
+    log: &LspLog,
+    name: &str,
+    what: &str,
+) -> Option<T> {
+    match result {
+        Ok(value) => value,
+        Err(e) => {
+            log.log(LogLevel::Warn, name, &format!("{what} failed: {e}"));
+            None
+        }
+    }
+}
+
 /// Issue one language-feature [`LspRequest`] on the socket and await its reply,
 /// normalizing every goto-family / references response to a flat [`LspReply`].
 /// A transport error (a server that died mid-request, an unsupported method) is
@@ -88,26 +106,38 @@ pub(crate) async fn issue_request(
         log.log(LogLevel::Debug, name, &describe_request(&req));
     }
     match req {
-        LspRequest::Definition { uri, position } => LspReply::Locations(goto_locations(
-            sock.definition(goto_params(uri, position)).await,
-            log,
-            name,
-        )),
-        LspRequest::Declaration { uri, position } => LspReply::Locations(goto_locations(
-            sock.declaration(goto_params(uri, position)).await,
-            log,
-            name,
-        )),
-        LspRequest::TypeDefinition { uri, position } => LspReply::Locations(goto_locations(
-            sock.type_definition(goto_params(uri, position)).await,
-            log,
-            name,
-        )),
-        LspRequest::Implementation { uri, position } => LspReply::Locations(goto_locations(
-            sock.implementation(goto_params(uri, position)).await,
-            log,
-            name,
-        )),
+        LspRequest::Definition { uri, position } => {
+            LspReply::Locations(goto_locations(unwrap_logged(
+                sock.definition(goto_params(uri, position)).await,
+                log,
+                name,
+                "definition",
+            )))
+        }
+        LspRequest::Declaration { uri, position } => {
+            LspReply::Locations(goto_locations(unwrap_logged(
+                sock.declaration(goto_params(uri, position)).await,
+                log,
+                name,
+                "declaration",
+            )))
+        }
+        LspRequest::TypeDefinition { uri, position } => {
+            LspReply::Locations(goto_locations(unwrap_logged(
+                sock.type_definition(goto_params(uri, position)).await,
+                log,
+                name,
+                "typeDefinition",
+            )))
+        }
+        LspRequest::Implementation { uri, position } => {
+            LspReply::Locations(goto_locations(unwrap_logged(
+                sock.implementation(goto_params(uri, position)).await,
+                log,
+                name,
+                "implementation",
+            )))
+        }
         LspRequest::References {
             uri,
             position,
@@ -135,7 +165,7 @@ pub(crate) async fn issue_request(
                 text_document_position_params: text_document_position(uri, position),
                 work_done_progress_params: Default::default(),
             };
-            hover_reply(sock.hover(params).await, log, name)
+            hover_reply(unwrap_logged(sock.hover(params).await, log, name, "hover"))
         }
         LspRequest::SignatureHelp { uri, position } => {
             let params = SignatureHelpParams {
@@ -143,7 +173,12 @@ pub(crate) async fn issue_request(
                 text_document_position_params: text_document_position(uri, position),
                 work_done_progress_params: Default::default(),
             };
-            signature_help_reply(sock.signature_help(params).await, log, name)
+            signature_help_reply(unwrap_logged(
+                sock.signature_help(params).await,
+                log,
+                name,
+                "signatureHelp",
+            ))
         }
         LspRequest::Completion { uri, position } => {
             let params = CompletionParams {
@@ -152,7 +187,12 @@ pub(crate) async fn issue_request(
                 partial_result_params: Default::default(),
                 context: None,
             };
-            completion_reply(sock.completion(params).await, log, name)
+            completion_reply(unwrap_logged(
+                sock.completion(params).await,
+                log,
+                name,
+                "completion",
+            ))
         }
         LspRequest::Formatting {
             uri,
@@ -629,60 +669,6 @@ fn empty_semantic_tokens() -> SemanticTokensData {
         result_id: None,
         tokens: Vec::new(),
     }
-}
-
-/// Distill one protocol [`InlayHint`] to the editor's [`InlayHintData`]: its
-/// anchor, the rendered label (the string form, or label parts joined to their
-/// `value`s — the interactive per-part `location`/`tooltip` are dropped for
-/// Phase 1), with `padding_left`/`padding_right` folded into a leading/trailing
-/// space, and the kind as a small int (`1`=type, `2`=parameter, `0`=unset).
-fn inlay_hint(hint: &InlayHint) -> InlayHintData {
-    let core = inlay_label_core(hint);
-    let kind = match hint.kind {
-        Some(InlayHintKind::TYPE) => 1,
-        Some(InlayHintKind::PARAMETER) => 2,
-        _ => 0,
-    };
-    // A hint with no usable label that the server marked resolvable (`data`) is
-    // *lazy*: round-trip it verbatim so the editor can fill the label on demand
-    // via `inlayHint/resolve` (Phase 2). An eager hint (label already present)
-    // carries no resolve data — nothing to fetch.
-    let resolve_data = if core.is_empty() && hint.data.is_some() {
-        serde_json::to_value(hint).ok()
-    } else {
-        None
-    };
-    InlayHintData {
-        line: hint.position.line,
-        character: hint.position.character,
-        label: pad_label(&core, hint),
-        kind,
-        resolve_data,
-    }
-}
-
-/// The unpadded label string of an inlay hint: a `String` label verbatim, or the
-/// label parts joined to their `value`s (the interactive per-part
-/// `location`/`tooltip` are dropped — recorded as an approximation). Empty ⇒ a
-/// lazy hint whose label arrives only via `inlayHint/resolve`.
-fn inlay_label_core(hint: &InlayHint) -> String {
-    match &hint.label {
-        InlayHintLabel::String(s) => s.clone(),
-        InlayHintLabel::LabelParts(parts) => parts.iter().map(|p| p.value.as_str()).collect(),
-    }
-}
-
-/// Fold the hint's `padding_left`/`padding_right` into a leading/trailing space
-/// around its `core` label — the inline form the editor paints between glyphs.
-fn pad_label(core: &str, hint: &InlayHint) -> String {
-    let pad_l = hint.padding_left.unwrap_or(false);
-    let pad_r = hint.padding_right.unwrap_or(false);
-    format!(
-        "{}{}{}",
-        if pad_l { " " } else { "" },
-        core,
-        if pad_r { " " } else { "" },
-    )
 }
 
 /// A one-line summary of an outgoing request for the DEBUG log.

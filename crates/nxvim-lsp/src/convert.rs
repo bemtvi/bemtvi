@@ -11,12 +11,14 @@
 use lsp_types::{
     AnnotatedTextEdit, CodeActionOrCommand, CodeActionResponse, CompletionItem, CompletionItemKind,
     CompletionResponse, CompletionTextEdit, DocumentChangeOperation, DocumentChanges,
-    Documentation, GotoDefinitionResponse, Hover, HoverContents, Location, MarkedString, OneOf,
-    ParameterLabel, SignatureHelp, TextDocumentEdit, TextEdit, Url, WorkspaceEdit,
+    Documentation, GotoDefinitionResponse, Hover, HoverContents, InlayHint, InlayHintKind,
+    InlayHintLabel, Location, MarkedString, OneOf, ParameterLabel, SignatureHelp, TextDocumentEdit,
+    TextEdit, Url, WorkspaceEdit,
 };
 
-use crate::log::{LogLevel, LspLog};
-use crate::protocol::{CodeActionData, CompletionItemData, LspReply, WorkspaceEditData};
+use crate::protocol::{
+    CodeActionData, CompletionItemData, InlayHintData, LspReply, WorkspaceEditData,
+};
 
 /// Distill a `textDocument/codeAction` response (a mixed `(Command | CodeAction)[]`)
 /// into the editor-facing list: a `CodeAction`'s `title` + normalized eager
@@ -97,21 +99,15 @@ fn text_document_edit(edit: TextDocumentEdit) -> (Url, Vec<TextEdit>) {
 /// Distill a `textDocument/completion` reply into [`LspReply::Completion`],
 /// normalizing the two response shapes — a bare `CompletionItem[]` (always
 /// complete) and a `CompletionList` (which carries its own `isIncomplete`) — to
-/// one. `None`/an error degrades to an empty, complete list, so the editor
-/// uniformly sees "no candidates" rather than a hang.
-pub(crate) fn completion_reply(
-    result: Result<Option<CompletionResponse>, async_lsp::Error>,
-    log: &LspLog,
-    name: &str,
-) -> LspReply {
-    let (is_incomplete, items) = match result {
-        Ok(Some(CompletionResponse::Array(items))) => (false, items),
-        Ok(Some(CompletionResponse::List(list))) => (list.is_incomplete, list.items),
-        Ok(None) => (false, Vec::new()),
-        Err(e) => {
-            log.log(LogLevel::Warn, name, &format!("completion failed: {e}"));
-            (false, Vec::new())
-        }
+/// one. `None` degrades to an empty, complete list, so the editor uniformly sees
+/// "no candidates" rather than a hang. The caller unwraps the transport result
+/// (logging a failure as `None`) — see the module note — so this is a pure
+/// transform shared by the async (native) and sync (wasm) dispatch paths.
+pub(crate) fn completion_reply(resp: Option<CompletionResponse>) -> LspReply {
+    let (is_incomplete, items) = match resp {
+        Some(CompletionResponse::Array(items)) => (false, items),
+        Some(CompletionResponse::List(list)) => (list.is_incomplete, list.items),
+        None => (false, Vec::new()),
     };
     LspReply::Completion {
         is_incomplete,
@@ -181,20 +177,13 @@ fn kind_code(kind: Option<CompletionItemKind>) -> u8 {
 /// Distill a `textDocument/hover` reply into plain display lines: extract the
 /// markup's text (a `MarkedString`, an array of them joined by blank lines, or a
 /// `MarkupContent` value), split into lines, and drop trailing blank lines so the
-/// panel isn't padded. `None`/an error degrades to an empty list ("no
-/// information"), so the editor never hangs waiting on a feature a server lacks.
-pub(crate) fn hover_reply(
-    result: Result<Option<Hover>, async_lsp::Error>,
-    log: &LspLog,
-    name: &str,
-) -> LspReply {
-    let hover = match result {
-        Ok(Some(hover)) => hover,
-        Ok(None) => return LspReply::Hover(Vec::new()),
-        Err(e) => {
-            log.log(LogLevel::Warn, name, &format!("hover failed: {e}"));
-            return LspReply::Hover(Vec::new());
-        }
+/// panel isn't padded. `None` degrades to an empty list ("no information"), so the
+/// editor never hangs waiting on a feature a server lacks. The caller unwraps the
+/// transport result (logging a failure as `None`).
+pub(crate) fn hover_reply(hover: Option<Hover>) -> LspReply {
+    let hover = match hover {
+        Some(hover) => hover,
+        None => return LspReply::Hover(Vec::new()),
     };
     let text = match hover.contents {
         HoverContents::Scalar(ms) => marked_string_text(ms),
@@ -234,24 +223,17 @@ fn marked_string_text(ms: MarkedString) -> String {
 /// Distill a `textDocument/signatureHelp` reply into the active signature's label
 /// and active parameter text. The active signature is `activeSignature` (default
 /// the first); the active parameter is the signature's own `activeParameter` when
-/// present, else the top-level one. `None`/an error/no signatures degrades to a
-/// "no signature help" (both fields `None`).
-pub(crate) fn signature_help_reply(
-    result: Result<Option<SignatureHelp>, async_lsp::Error>,
-    log: &LspLog,
-    name: &str,
-) -> LspReply {
+/// present, else the top-level one. `None`/no signatures degrades to a "no
+/// signature help" (both fields `None`). The caller unwraps the transport result
+/// (logging a failure as `None`).
+pub(crate) fn signature_help_reply(help: Option<SignatureHelp>) -> LspReply {
     let none = LspReply::SignatureHelp {
         signature: None,
         active_parameter: None,
     };
-    let help = match result {
-        Ok(Some(help)) => help,
-        Ok(None) => return none,
-        Err(e) => {
-            log.log(LogLevel::Warn, name, &format!("signatureHelp failed: {e}"));
-            return none;
-        }
+    let help = match help {
+        Some(help) => help,
+        None => return none,
     };
     let active = help.active_signature.unwrap_or(0) as usize;
     let Some(sig) = help
@@ -302,27 +284,74 @@ fn parameter_text(label: &ParameterLabel, signature: &str) -> String {
 
 /// Flatten a goto-family reply (definition/declaration/typeDefinition/
 /// implementation all share `GotoDefinitionResponse`) into a list of target
-/// locations, collapsing the `LocationLink` shape to its selection target. A
-/// transport error degrades to an empty list (logged).
-pub(crate) fn goto_locations(
-    result: Result<Option<GotoDefinitionResponse>, async_lsp::Error>,
-    log: &LspLog,
-    name: &str,
-) -> Vec<Location> {
-    match result {
-        Ok(None) => Vec::new(),
-        Ok(Some(GotoDefinitionResponse::Scalar(loc))) => vec![loc],
-        Ok(Some(GotoDefinitionResponse::Array(locs))) => locs,
-        Ok(Some(GotoDefinitionResponse::Link(links))) => links
+/// locations, collapsing the `LocationLink` shape to its selection target. The
+/// caller unwraps the transport result (logging a failure as `None`).
+pub(crate) fn goto_locations(resp: Option<GotoDefinitionResponse>) -> Vec<Location> {
+    match resp {
+        None => Vec::new(),
+        Some(GotoDefinitionResponse::Scalar(loc)) => vec![loc],
+        Some(GotoDefinitionResponse::Array(locs)) => locs,
+        Some(GotoDefinitionResponse::Link(links)) => links
             .into_iter()
             .map(|l| Location {
                 uri: l.target_uri,
                 range: l.target_selection_range,
             })
             .collect(),
-        Err(e) => {
-            log.log(LogLevel::Warn, name, &format!("goto request failed: {e}"));
-            Vec::new()
-        }
     }
+}
+
+/// Distill one protocol [`InlayHint`] to the editor's [`InlayHintData`]: its
+/// anchor, the rendered label (the string form, or label parts joined to their
+/// `value`s — the interactive per-part `location`/`tooltip` are dropped for
+/// Phase 1), with `padding_left`/`padding_right` folded into a leading/trailing
+/// space, and the kind as a small int (`1`=type, `2`=parameter, `0`=unset). Shared
+/// by the async (native) and sync (wasm) dispatch paths.
+pub(crate) fn inlay_hint(hint: &InlayHint) -> InlayHintData {
+    let core = inlay_label_core(hint);
+    let kind = match hint.kind {
+        Some(InlayHintKind::TYPE) => 1,
+        Some(InlayHintKind::PARAMETER) => 2,
+        _ => 0,
+    };
+    // A hint with no usable label that the server marked resolvable (`data`) is
+    // *lazy*: round-trip it verbatim so the editor can fill the label on demand
+    // via `inlayHint/resolve` (Phase 2). An eager hint (label already present)
+    // carries no resolve data — nothing to fetch.
+    let resolve_data = if core.is_empty() && hint.data.is_some() {
+        serde_json::to_value(hint).ok()
+    } else {
+        None
+    };
+    InlayHintData {
+        line: hint.position.line,
+        character: hint.position.character,
+        label: pad_label(&core, hint),
+        kind,
+        resolve_data,
+    }
+}
+
+/// The unpadded label string of an inlay hint: a `String` label verbatim, or the
+/// label parts joined to their `value`s (the interactive per-part
+/// `location`/`tooltip` are dropped — recorded as an approximation). Empty ⇒ a
+/// lazy hint whose label arrives only via `inlayHint/resolve`.
+pub(crate) fn inlay_label_core(hint: &InlayHint) -> String {
+    match &hint.label {
+        InlayHintLabel::String(s) => s.clone(),
+        InlayHintLabel::LabelParts(parts) => parts.iter().map(|p| p.value.as_str()).collect(),
+    }
+}
+
+/// Fold the hint's `padding_left`/`padding_right` into a leading/trailing space
+/// around its `core` label — the inline form the editor paints between glyphs.
+pub(crate) fn pad_label(core: &str, hint: &InlayHint) -> String {
+    let pad_l = hint.padding_left.unwrap_or(false);
+    let pad_r = hint.padding_right.unwrap_or(false);
+    format!(
+        "{}{}{}",
+        if pad_l { " " } else { "" },
+        core,
+        if pad_r { " " } else { "" },
+    )
 }

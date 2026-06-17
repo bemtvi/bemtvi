@@ -121,7 +121,7 @@ So the keystroke path is sync-and-local in both worlds; only the I/O dependency
 | 3 | Native edit-host / daemon split + the `HostProc` seam | 1 | ✅ (3a–3r; QUIC listener done — only path-space / `luafs` cache / per-class stream split remain as noted follow-ups) |
 | 4 | wasm edit-host: compile (gate `nxvim-ts`, emscripten build) + extract sync `EditHost` (OD#6 (a)) | 1 | ✅ (compile de-risked; `EditHost` extraction 4a–4e done) |
 | 5 | wasm edit-host: Worker + input/timer loop + JS interop | 4 | ✅ (5a feature seam · 5b wasm `HostEffects`/cdylib · 5c Worker/`postMessage` redraw/`window.__nxvim` · 5d SAB input/timer park · 5e COOP/COEP serving docs + demo deletion — all done) |
-| 6 | Browser fs/process: daemon over WebTransport (or serverless OPFS) | 3, 5 | 🚧 (6a serverless OPFS fs + explorer done; 6b the **WebTransport daemon fs leg** — browser `:e`/`:w`/`:e <dir>` over a real `--daemon --listen` — done; 6c the **watch leg** — daemon→browser `fs_changed` pushes autoreload / `FileChangedShell` over WebTransport — done; 6d the **proc leg** — async `vim.system`/`jobstart` over WebTransport, daemon→browser `proc_spawned`/`proc_exited` pushes — done; the daemon lsp/sys_run/luafs legs over WebTransport remain) |
+| 6 | Browser fs/process: daemon over WebTransport (or serverless OPFS) | 3, 5 | 🚧 (6a serverless OPFS fs + explorer done; 6b the **WebTransport daemon fs leg** — browser `:e`/`:w`/`:e <dir>` over a real `--daemon --listen` — done; 6c the **watch leg** — daemon→browser `fs_changed` pushes autoreload / `FileChangedShell` over WebTransport — done; 6d the **proc leg** — async `vim.system`/`jobstart` over WebTransport, daemon→browser `proc_spawned`/`proc_exited` pushes — done; the **luafs legs** (`nx.fs` off-tick `luafs_op` + streaming `luafs_watch` — landed under `docs/plans/2026-06-16-nx-fs-off-tick-daemon-leg.md`) and the **terminal leg** (`term_*` PTY, Phase 7) also landed browser-side since; the daemon **lsp** + **sys_run** legs over WebTransport remain — **6e the LSP leg** is the headline remaining browser work, below) |
 
 Phase 1 is independent and small. Phase 3 is the
 native latency payoff. Phases 4–5 are the browser payoff. Phase 6 unifies them on
@@ -2346,6 +2346,24 @@ funnel this leg carries (a shared native+browser slice, per ADR 0002); the per-`
 a **connection-drop sweep** that fails every in-flight child's `on_exit` with `code -1` (the native
 `RemoteHostProc` clears its `Inflight` on EOF; the browser leaves a dropped daemon's children
 dangling for now); and an **event-driven push wakeup** to replace the async-park cap.
+
+### Current state of the browser daemon legs (2026-06-17)
+
+Since 6d, two more legs landed browser-side under their **own** plans (they extend
+this Worker / `RpcClient`, so they belong on this map even though they were sliced
+elsewhere): the **luafs legs** — `nx.fs`'s off-tick `luafs_op` and the streaming
+`luafs_watch`/`luafs_unwatch` (`docs/plans/2026-06-16-nx-fs-off-tick-daemon-leg.md`,
+project memory `nx-fs-must-route-to-daemon-in-browser`) — and the **terminal leg**,
+the web `:terminal` PTY over `term_open`/`term_write`/`term_resize`/`term_kill` +
+`term_data`/`term_exit` pushes (Phase 7). So the browser Worker now consumes **fs,
+watch, proc, luafs (op + watch), and terminal**; the daemon (`run_daemon_io`) serves
+**every** leg already (`fs_*`/`proc_*`/`term_*`/`sys_run`/`lsp_*`/`luafs*`), and the
+**native** edit-host consumes all of them over QUIC (`RemoteHostFs`/`RemoteHostProc`/
+`RemoteBlockingSystem`/`RemoteLspTransport`/`RemoteLuaFs`). The only legs the **browser**
+still lacks are **LSP** and **sys_run** — and LSP is the substantial one (it is not a
+pure Worker-forwarding slice like the others, because the LSP *client* itself —
+`nxvim-lsp` on tokio + `async-lsp` — was native-gated and had to be brought to wasm).
+**Phase 6e** below is that LSP leg.
 
 ### The WebTransport/QUIC daemon path (the remaining Phase 6 work)
 

@@ -2680,6 +2680,7 @@ dependencies = [
  "async-lsp",
  "futures",
  "lsp-types",
+ "serde",
  "serde_json",
  "tokio",
  "tokio-util",

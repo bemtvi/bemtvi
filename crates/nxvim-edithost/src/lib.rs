@@ -36,6 +36,7 @@ use nxvim_core::{
     BufferEdit, BufferId, Clipboard, DirEntry, Editor, IndentParams, NumberedMark, OpenOutcome,
     PendingSave, PersistState, Span, SyntaxEngine,
 };
+use nxvim_lsp::{LspEvent, LspNotify, LspRequest, ReqToken, ServerKey, ServerSpawn, SyncLspClient, WireOp};
 use nxvim_lua::{BlockingSystem, LuaRuntime, SystemOutput, SystemSpec};
 use nxvim_server::{EditHost, HostEffects};
 use rmpv::Value;
@@ -209,6 +210,16 @@ struct Sink {
     /// through the OS clipboard. Written by [`WasmClipboard`] (the editor owns it).
     clipboard_get: Option<String>,
     clipboard_writes: Vec<String>,
+    /// Raw LSP [`WireOp`]s the [`SyncLspClient`] produced this convergence (the LSP leg —
+    /// Phase 6e): `Spawn` / `Stdin` / `Kill`, moved here by [`WasmEffects::flush_lsp_wire`]
+    /// after every client interaction (an outbound `ensure`/`notify`/`request` *or* an
+    /// inbound `feed_stdout` — a handshake completion / config pull can emit ops at any
+    /// point). Drained by [`eh_take_lsp_requests`] for the Worker to forward over
+    /// WebTransport (`lsp_spawn` / `lsp_stdin` / `lsp_kill`); the daemon's `lsp_stdout` /
+    /// `lsp_stderr` / `lsp_exited` pushes land back via [`eh_lsp_stdout`] / [`eh_lsp_stderr`]
+    /// / [`eh_lsp_exited`]. Daemon-only (the editor gates `vim.lsp.start` on a connected
+    /// daemon via [`has_remote_lsp`](HostEffects::has_remote_lsp); serverless fails it loud).
+    lsp_ops: Vec<WireOp>,
 }
 
 /// The `"+` / `"*` clipboard provider for the browser build — the wasm twin of
@@ -394,6 +405,30 @@ impl SyntaxEngine for WasmSyntax {
 /// (LSP, native treesitter, watch) stay unreachable on this build (see each method).
 struct WasmEffects {
     sink: Rc<RefCell<Sink>>,
+    /// The synchronous LSP client (Phase 6e) — the wasm twin of `nxvim-server`'s async
+    /// `LspManager`. Drives N language servers over the daemon's raw `lsp_*` wire: the
+    /// editor's [`lsp_ensure`](HostEffects::lsp_ensure) / [`lsp_notify`](HostEffects::lsp_notify)
+    /// / [`lsp_request`](HostEffects::lsp_request) feed it, its outbound [`WireOp`]s drain to
+    /// the [`Sink`] for the Worker to forward, and the daemon's `lsp_stdout` / `lsp_exited`
+    /// pushes feed back in via [`lsp_stdout`](HostEffects::lsp_stdout) /
+    /// [`lsp_exited`](HostEffects::lsp_exited). Lives here (not the `Sink`) because only the
+    /// editor thread touches it — the FFI reaches it through the [`EditHost`] → effects path,
+    /// never directly.
+    lsp: SyncLspClient,
+}
+
+impl WasmEffects {
+    /// Move the LSP client's freshly-produced wire ops into the [`Sink`] for the Worker to
+    /// forward to the daemon. Called after *every* client interaction — an outbound
+    /// `ensure`/`notify`/`request` enqueues a `Spawn`/`Stdin`, and an inbound `feed_stdout`
+    /// can too (the `initialize` reply flushes the queued `initialized` + `didOpen`, a
+    /// `workspace/configuration` pull replies inline) — so the drain can't wait for the tick.
+    fn flush_lsp_wire(&mut self) {
+        let ops = self.lsp.take_wire_ops();
+        if !ops.is_empty() {
+            self.sink.borrow_mut().lsp_ops.extend(ops);
+        }
+    }
 }
 
 impl HostEffects for WasmEffects {
@@ -562,6 +597,67 @@ impl HostEffects for WasmEffects {
         // `eh_ts_install_complete`. Fire-and-forget — the editor tick doesn't block on it.
         self.sink.borrow_mut().ts_requests.push(lang);
     }
+
+    fn lsp_ensure(&mut self, key: ServerKey, spawn: ServerSpawn) {
+        // `vim.lsp.start` on a FileType: start the server in the sync client (idempotent;
+        // mints a wire id, enqueues the `Spawn` + the `initialize` request). The resulting
+        // wire ops drain to the Sink for the Worker to forward (`lsp_spawn` + `lsp_stdin`).
+        // Only reached with a daemon connected (the editor gates on `has_remote_lsp`).
+        self.lsp.ensure_server(key, spawn);
+        self.flush_lsp_wire();
+    }
+
+    fn lsp_notify(&mut self, key: ServerKey, note: LspNotify) {
+        // A document-sync notification (`didOpen`/`didChange`/`didSave`/`didClose`): the
+        // client serializes it (buffering until the server is `Ready`) and the framed bytes
+        // drain to the Sink as an `lsp_stdin` for the Worker to forward.
+        self.lsp.notify(key, note);
+        self.flush_lsp_wire();
+    }
+
+    fn lsp_request(&mut self, key: ServerKey, token: ReqToken, req: LspRequest) {
+        // A language-feature request (hover/definition/completion/…): the client correlates
+        // it by `token`; its reply returns later inbound as an `LspEvent::Reply` once the
+        // daemon's `lsp_stdout` lands. The framed request bytes drain to the Sink.
+        self.lsp.request(key, token, req);
+        self.flush_lsp_wire();
+    }
+
+    fn lsp_stdout(&mut self, id: u64, bytes: Vec<u8>) {
+        // A daemon `lsp_stdout` push: feed the server (wire `id`)'s byte buffer and process
+        // every complete JSON-RPC frame. This can complete a handshake or answer a pull,
+        // emitting fresh wire ops — so flush after (the Worker drains again post-call).
+        self.lsp.feed_stdout(id, &bytes);
+        self.flush_lsp_wire();
+    }
+
+    fn lsp_stderr(&mut self, id: u64, bytes: Vec<u8>) {
+        // Diagnostic only — the browser has no LSP log file, so the client drops it (no
+        // wire ops, no flush).
+        self.lsp.feed_stderr(id, &bytes);
+    }
+
+    fn lsp_exited(&mut self, id: u64, code: Option<i32>, signal: Option<i32>) {
+        // The server (wire `id`) exited / its pipe closed: the client surfaces an
+        // `LspEvent::ServerExited` (drained via `lsp_take_events`) and forgets it; the editor
+        // re-`ensure`s on the next FileType. No new wire ops normally, but flush for symmetry.
+        self.lsp.exited(id, code, signal);
+        self.flush_lsp_wire();
+    }
+
+    fn lsp_take_events(&mut self) -> Vec<LspEvent> {
+        // Drain the distilled events the client produced (replies, diagnostics, refreshes,
+        // exits) for `EditHost::drain_lsp_events` to fan into `on_lsp_event`.
+        self.lsp.take_events()
+    }
+
+    fn has_remote_lsp(&self) -> bool {
+        // Language servers run on the daemon (the browser has no process host), so an LSP is
+        // only possible against a connected daemon — the same gate the proc leg uses. The
+        // Worker flips `daemon_connected` on `:connect` / `?daemon=`; when false the editor
+        // fails `vim.lsp.start` loud rather than enqueuing a spawn no transport can fulfil.
+        self.sink.borrow().daemon_connected
+    }
 }
 
 /// The FFI handle: the real [`EditHost`] plus a clone of the [`Sink`] its
@@ -654,7 +750,10 @@ pub extern "C" fn eh_new() -> *mut WasmEditHost {
     // No processes in the serverless browser build — make `nx._system` fail loud with a
     // named message rather than emscripten's cryptic spawn errno (StdBlockingSystem).
     lua.set_blocking_system(Rc::new(WasmBlockingSystem));
-    let fx = Box::new(WasmEffects { sink: sink.clone() });
+    let fx = Box::new(WasmEffects {
+        sink: sink.clone(),
+        lsp: SyncLspClient::new(),
+    });
     let mut editor = Editor::new();
     // Wire the `"+` / `"*` registers to the browser clipboard via the Sink (the wasm twin of
     // the native `SystemClipboard`). Without a provider the editor errors loud on `"+`.
@@ -1524,6 +1623,117 @@ pub unsafe extern "C" fn eh_terminal_exit(h: *mut WasmEditHost, buf: f64, code: 
         handle
             .host
             .terminal_exit(BufferId(buf.max(0.0) as u64), code as i32);
+    }
+}
+
+// ============================================================================
+// Off-tick daemon LSP leg (Phase 6e). The browser has no process host, so language
+// servers run on the daemon: the editor's `vim.lsp.start` / document-sync / feature
+// requests feed the in-Worker `SyncLspClient`, whose raw JSON-RPC the Worker forwards
+// over WebTransport (`lsp_spawn`/`lsp_stdin`/`lsp_kill`), and the daemon's
+// `lsp_stdout`/`lsp_stderr`/`lsp_exited` pushes feed back here. The browser twin of the
+// native run loop's `lsp_events` arm — the daemon side (`serve_one_lsp`) is unchanged.
+// ============================================================================
+
+/// Drain the LSP wire ops the editor's `SyncLspClient` produced since the last call, as
+/// JSON the Worker forwards to the daemon:
+/// `{"spawn":[{"id":N,"program":"…","args":["…"],"cwd":"…"}],
+///   "stdin":[{"id":N,"bytes":[byte,…]}],"kill":[N]}`. The queue is emptied (each op is
+/// dispatched exactly once). The Worker sends every `spawn` first, then `stdin`, then
+/// `kill` — preserving the client's "spawn precedes its first `stdin`" ordering (the
+/// daemon must `lsp_spawn` before the `initialize` `lsp_stdin` that follows) without an
+/// interleaved ordered array. `bytes` is the framed JSON-RPC chunk as a byte array (the
+/// Worker re-encodes it to a msgpack `bin`, like the proc leg's `stdin`). Caller frees
+/// with [`eh_free_string`].
+///
+/// # Safety
+/// `h` must come from [`eh_new`] and not yet be freed.
+#[no_mangle]
+pub unsafe extern "C" fn eh_take_lsp_requests(h: *mut WasmEditHost) -> *mut c_char {
+    let Some(handle) = h.as_mut() else {
+        return into_owned_cstr(r#"{"spawn":[],"stdin":[],"kill":[]}"#.into());
+    };
+    let ops = std::mem::take(&mut handle.sink.borrow_mut().lsp_ops);
+    let mut spawn = Vec::new();
+    let mut stdin = Vec::new();
+    let mut kill = Vec::new();
+    for op in ops {
+        match op {
+            WireOp::Spawn {
+                id,
+                program,
+                args,
+                cwd,
+            } => spawn.push(
+                serde_json::json!({ "id": id, "program": program, "args": args, "cwd": cwd }),
+            ),
+            WireOp::Stdin { id, bytes } => {
+                stdin.push(serde_json::json!({ "id": id, "bytes": bytes }))
+            }
+            WireOp::Kill { id } => kill.push(id),
+        }
+    }
+    into_owned_cstr(serde_json::json!({ "spawn": spawn, "stdin": stdin, "kill": kill }).to_string())
+}
+
+/// Land a daemon `lsp_stdout` push: feed the server (wire `id`)'s byte buffer into the
+/// `SyncLspClient`, which parses every complete `Content-Length`-framed JSON-RPC frame
+/// (completing a handshake, answering a `workspace/configuration` pull, landing a feature
+/// reply / diagnostics), then drains its events into `on_lsp_event` and repaints. The
+/// outbound JSON-RPC any of that issues is left in the Sink for the Worker to drain (via
+/// [`eh_take_lsp_requests`]) after this call. The bytes are passed as pointer+length (not a
+/// C string): LSP framing is UTF-8 but a payload may legitimately carry embedded NULs that a
+/// C string would truncate. `id` is a `double` (a small wire counter). See
+/// [`EditHost::lsp_stdout`].
+///
+/// # Safety
+/// `h` must come from [`eh_new`] and not yet be freed; `data` must point to `len` readable
+/// bytes (or be null when `len` is 0).
+#[no_mangle]
+pub unsafe extern "C" fn eh_lsp_stdout(h: *mut WasmEditHost, id: f64, data: *const u8, len: usize) {
+    let Some(handle) = h.as_mut() else { return };
+    let bytes = if data.is_null() || len == 0 {
+        Vec::new()
+    } else {
+        std::slice::from_raw_parts(data, len).to_vec()
+    };
+    handle.host.lsp_stdout(id.max(0.0) as u64, bytes);
+}
+
+/// Land a daemon `lsp_stderr` push (the server's diagnostic output): fed to the
+/// `SyncLspClient`, which drops it — the browser has no LSP log file. Kept so the Worker has
+/// a sink to call rather than silently discarding the wire method. Bytes cross as
+/// pointer+length (server stderr is arbitrary bytes). `id` is a `double`. See
+/// [`EditHost::lsp_stderr`].
+///
+/// # Safety
+/// `h` must come from [`eh_new`] and not yet be freed; `data` must point to `len` readable
+/// bytes (or be null when `len` is 0).
+#[no_mangle]
+pub unsafe extern "C" fn eh_lsp_stderr(h: *mut WasmEditHost, id: f64, data: *const u8, len: usize) {
+    let Some(handle) = h.as_mut() else { return };
+    let bytes = if data.is_null() || len == 0 {
+        Vec::new()
+    } else {
+        std::slice::from_raw_parts(data, len).to_vec()
+    };
+    handle.host.lsp_stderr(id.max(0.0) as u64, bytes);
+}
+
+/// Land a daemon `lsp_exited` push: the server (wire `id`) exited or its pipe closed. The
+/// `SyncLspClient` surfaces an `LspEvent::ServerExited` (the editor tells the user and
+/// re-`ensure`s on the next FileType), then settles + repaints. `code` / `signal` are
+/// `double`s; a negative value means "not collected" (a kill, a dropped link), per the
+/// proc-leg convention. See [`EditHost::lsp_exited`].
+///
+/// # Safety
+/// `h` must come from [`eh_new`] and not yet be freed.
+#[no_mangle]
+pub unsafe extern "C" fn eh_lsp_exited(h: *mut WasmEditHost, id: f64, code: f64, signal: f64) {
+    if let Some(handle) = h.as_mut() {
+        handle
+            .host
+            .lsp_exited(id.max(0.0) as u64, code as i32, signal as i32);
     }
 }
 

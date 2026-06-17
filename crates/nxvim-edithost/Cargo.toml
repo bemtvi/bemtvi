@@ -35,6 +35,12 @@ nxvim-server = { path = "../nxvim-server", default-features = false }
 # unifies them rather than building a conflicting second copy.
 nxvim-core = { path = "../nxvim-core", features = ["vim-regex", "serde"] }
 nxvim-lua = { path = "../nxvim-lua" }
+# The LSP leg (Phase 6e): the synchronous `SyncLspClient` + its `WireOp` queue, plus
+# the protocol types (`ServerKey`/`ServerSpawn`/`LspNotify`/`LspRequest`/`ReqToken`/
+# `LspEvent`) the wasm `HostEffects` LSP methods name. `default-features = false` drops
+# the async manager/transport tree (tokio + async-lsp, neither emscripten-capable),
+# matching nxvim-server's wasm tree so cargo unifies to one no-native nxvim-lsp copy.
+nxvim-lsp = { path = "../nxvim-lsp", default-features = false }
 # Name the `rmpv::Value` the `HostEffects::notify` redraw frames arrive as. Pinned to
 # the workspace version so the type matches nxvim-server's.
 rmpv = "=1.3.1"

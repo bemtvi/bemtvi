@@ -121,7 +121,7 @@ So the keystroke path is sync-and-local in both worlds; only the I/O dependency
 | 3 | Native edit-host / daemon split + the `HostProc` seam | 1 | ✅ (3a–3r; QUIC listener done — only path-space / `luafs` cache / per-class stream split remain as noted follow-ups) |
 | 4 | wasm edit-host: compile (gate `nxvim-ts`, emscripten build) + extract sync `EditHost` (OD#6 (a)) | 1 | ✅ (compile de-risked; `EditHost` extraction 4a–4e done) |
 | 5 | wasm edit-host: Worker + input/timer loop + JS interop | 4 | ✅ (5a feature seam · 5b wasm `HostEffects`/cdylib · 5c Worker/`postMessage` redraw/`window.__nxvim` · 5d SAB input/timer park · 5e COOP/COEP serving docs + demo deletion — all done) |
-| 6 | Browser fs/process: daemon over WebTransport (or serverless OPFS) | 3, 5 | 🚧 (6a serverless OPFS fs + explorer done; 6b the **WebTransport daemon fs leg** — browser `:e`/`:w`/`:e <dir>` over a real `--daemon --listen` — done; 6c the **watch leg** — daemon→browser `fs_changed` pushes autoreload / `FileChangedShell` over WebTransport — done; 6d the **proc leg** — async `vim.system`/`jobstart` over WebTransport, daemon→browser `proc_spawned`/`proc_exited` pushes — done; the **luafs legs** (`nx.fs` off-tick `luafs_op` + streaming `luafs_watch` — landed under `docs/plans/2026-06-16-nx-fs-off-tick-daemon-leg.md`) and the **terminal leg** (`term_*` PTY, Phase 7) also landed browser-side since; the daemon **lsp** + **sys_run** legs over WebTransport remain — **6e the LSP leg** is the headline remaining browser work, below) |
+| 6 | Browser fs/process: daemon over WebTransport (or serverless OPFS) | 3, 5 | 🚧 (6a serverless OPFS fs + explorer done; 6b the **WebTransport daemon fs leg** — browser `:e`/`:w`/`:e <dir>` over a real `--daemon --listen` — done; 6c the **watch leg** — daemon→browser `fs_changed` pushes autoreload / `FileChangedShell` over WebTransport — done; 6d the **proc leg** — async `vim.system`/`jobstart` over WebTransport, daemon→browser `proc_spawned`/`proc_exited` pushes — done; the **luafs legs** (`nx.fs` off-tick `luafs_op` + streaming `luafs_watch` — landed under `docs/plans/2026-06-16-nx-fs-off-tick-daemon-leg.md`) and the **terminal leg** (`term_*` PTY, Phase 7) also landed browser-side since; **6e the LSP leg** is now **done** (browser `vim.lsp.start`/diagnostics/hover over a real `--daemon --listen` via the in-Worker `SyncLspClient` ↔ the daemon's `lsp_spawn`/`lsp_stdin`/`lsp_kill` wire — Stages A–F below); the daemon **sys_run** (blocking `nx._system`) leg over WebTransport is the remaining browser leg) |
 
 Phase 1 is independent and small. Phase 3 is the
 native latency payoff. Phases 4–5 are the browser payoff. Phase 6 unifies them on
@@ -2364,6 +2364,41 @@ still lacks are **LSP** and **sys_run** — and LSP is the substantial one (it i
 pure Worker-forwarding slice like the others, because the LSP *client* itself —
 `nxvim-lsp` on tokio + `async-lsp` — was native-gated and had to be brought to wasm).
 **Phase 6e** below is that LSP leg.
+
+> **Phase 6e — DONE (2026-06-17).** The browser edit-host runs language servers on a
+> real `nxvim --daemon --listen` over WebTransport, verified end-to-end
+> (`web/verify-lsp.mjs`): server-pushed diagnostics (`didOpen` → `publishDiagnostics`
+> land in `nx.diagnostic.get()`) and a hover request/reply (`nx.lsp.hover()` opens the
+> content float with the server's markup), both against the scripted mock
+> (`nxvim --__lsp-mock`) the daemon spawns. The slices:
+> - **Stage A** — the synchronous `SyncLspClient` (`nxvim-lsp/src/sync_client.rs`):
+>   `nxvim-lsp` feature-gated (`native` default) so the async manager/transport tree
+>   drops on wasm; the protocol/convert/caps transforms stay always-on and are shared
+>   verbatim with the async path. (commit 27ae327)
+> - **Stage B** — server integration: the `lsp/` consumer de-gated for wasm, the
+>   `HostEffects` LSP seam (always-on `lsp_ensure`/`lsp_notify`/`lsp_request`; wasm-only
+>   `lsp_stdout`/`lsp_stderr`/`lsp_exited`/`lsp_take_events`/`has_remote_lsp`), and the
+>   `EditHost` wasm inbound (`lsp_stdout` feed → `drain_lsp_events` → `on_lsp_event`).
+>   (commit 2efb06e)
+> - **Stage C** — the `nxvim-edithost` cdylib: `WasmEffects` holds the `SyncLspClient`
+>   and implements the seam (each call flushes the client's `WireOp`s into the `Sink`;
+>   inbound feeds the client and drains events); FFI `eh_take_lsp_requests` /
+>   `eh_lsp_stdout` / `eh_lsp_stderr` / `eh_lsp_exited`.
+> - **Stage D** — the daemon `lsp_*` leg was **already shipped** for the native
+>   `RemoteLspTransport` (`serve_one_lsp` in `daemon.rs`); the wasm client speaks the
+>   identical wire, so no daemon work was needed.
+> - **Stage E** — `web/worker.mjs`: forward `lsp_spawn`/`lsp_stdin`/`lsp_kill`
+>   (`drainLspRequests`), land `lsp_stdout`/`lsp_stderr`/`lsp_exited` pushes
+>   (`applyDaemonNotifications` + `callLspStdout`/`callLspStderr`), `liveLsp` gating the
+>   async park so the reader stays live for server pushes.
+> - **Stage F** — `web/verify-lsp.mjs` (above). It surfaced and fixed a real bug: the
+>   `sync_lsp()` call in `redraw()` was `#[cfg(feature = "native")]`-gated (stale from
+>   when wasm had no LSP), so on wasm the pending `didOpen` after a server's
+>   `Initialized` never fired — diagnostics never flowed. Un-gating it (it runs on both
+>   builds now) is what makes server pushes work.
+>
+> The remaining browser leg is **sys_run** (blocking `nx._system` over the wire), per
+> the residual note in Open Decision #5.
 
 ### The WebTransport/QUIC daemon path (the remaining Phase 6 work)
 

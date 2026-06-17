@@ -82,6 +82,15 @@ const eh_take_terminal_requests = M.cwrap("eh_take_terminal_requests", "number",
 const eh_terminal_data = M.cwrap("eh_terminal_data", null, ["number", "number", "number", "number"]);
 const eh_terminal_flush = M.cwrap("eh_terminal_flush", null, ["number"]);
 const eh_terminal_exit = M.cwrap("eh_terminal_exit", null, ["number", "number", "number"]);
+// LSP leg (Phase 6e): the editor's `SyncLspClient` enqueues raw `lsp_spawn`/`lsp_stdin`/
+// `lsp_kill` ops off-tick (only with a daemon connected — language servers run on the daemon,
+// the same wire the native `RemoteLspTransport` uses); the Worker forwards each and lands the
+// daemon's `lsp_stdout`/`lsp_stderr`/`lsp_exited` pushes back into the client. `eh_lsp_stdout` /
+// `eh_lsp_stderr` take the server's output as pointer+length (JSON-RPC framing may carry NULs).
+const eh_take_lsp_requests = M.cwrap("eh_take_lsp_requests", "number", ["number"]);
+const eh_lsp_stdout = M.cwrap("eh_lsp_stdout", null, ["number", "number", "number", "number"]);
+const eh_lsp_stderr = M.cwrap("eh_lsp_stderr", null, ["number", "number", "number", "number"]);
+const eh_lsp_exited = M.cwrap("eh_lsp_exited", null, ["number", "number", "number", "number"]);
 // Treesitter `:TSInstall` leg: the editor enqueues each install off-tick; the Worker
 // forwards it to the UI thread (web-tree-sitter lives there), which fetches/caches/registers
 // the grammar and lands the outcome back via `eh_ts_install_complete`. `eh_ts_seed_installed`
@@ -763,6 +772,7 @@ async function runtimeConnect(uri) {
   eh_set_daemon_connected(h, 0);
   armedWatches.clear();
   liveProcs.clear();
+  liveLsp.clear();
   daemonError = null;
   daemonUri = uri;
   await connectDaemon();
@@ -836,6 +846,7 @@ const armedWatches = new Set(); // paths currently watched on the daemon (gates 
 const liveProcs = new Set(); // spawn ids in flight on the daemon (also gates the async park)
 const liveTerms = new Set(); // terminal buffer ids open on the daemon (also gates the async park)
 const liveFsWatches = new Set(); // nx.fs.watch stream ids armed on the daemon (also gates the async park)
+const liveLsp = new Set(); // LSP server wire ids spawned on the daemon (also gates the async park)
 const daemonNotifications = []; // [method, params] pushes received but not yet applied
 let daemonWaker = null; // resolve() to wake the async park the instant a push arrives
 let sabCtrl = null; // the SAB control array (set by runLoopSAB) so a push can wake the futex park
@@ -1028,6 +1039,25 @@ function applyDaemonNotifications() {
       eh_fs_watch_err(h, Number(id), String(params[1] ?? "watch error"));
       liveFsWatches.delete(id);
       any = true;
+    } else if (method === "lsp_stdout") {
+      // params = [id, bytes(bin)] — a framed JSON-RPC chunk from the server (wire id). Feed it
+      // into the SyncLspClient, which parses complete frames and emits events + outbound ops.
+      callLspStdout(Number(params[0]), toU8(params[1]));
+      any = true;
+    } else if (method === "lsp_stderr") {
+      // params = [id, bytes(bin)] — the server's diagnostic output. The client drops it (no
+      // browser log file), but feed it so the wire method has a sink rather than being ignored.
+      callLspStderr(Number(params[0]), toU8(params[1]));
+    } else if (method === "lsp_exited") {
+      // params = [id, code?, signal?] — the server exited / its pipe closed. A nil code/signal
+      // means "not collected" (passed as -1, the proc-leg convention); the client surfaces a
+      // ServerExited and forgets it (the editor re-ensures on the next FileType).
+      const id = params[0];
+      const code = params[1];
+      const signal = params[2];
+      eh_lsp_exited(h, Number(id), code == null ? -1 : Number(code), signal == null ? -1 : Number(signal));
+      liveLsp.delete(id);
+      any = true;
     } else {
       postMessage({ type: "config_error", error: `unhandled daemon push: ${method}` });
     }
@@ -1071,6 +1101,27 @@ function callProcExited(id, code, stdout, stderr) {
   eh_proc_exited(h, id, code, oPtr, stdout.length, ePtr, stderr.length);
   if (oPtr) M._free(oPtr);
   if (ePtr) M._free(ePtr);
+}
+
+// Feed a `lsp_stdout` push's bytes into the SyncLspClient. The bytes are copied into wasm
+// memory (LSP framing is UTF-8 but a payload may carry NULs — it can't ride the cwrap
+// "string" marshalling) and `eh_lsp_stdout` parses every complete frame; free after the call.
+// The feed can complete a handshake / answer a config pull, leaving fresh wire ops the run
+// loop drains with `drainLspRequests` right after applying pushes.
+function callLspStdout(id, bytes) {
+  const ptr = bytes.length ? M._malloc(bytes.length) : 0;
+  if (ptr) M.HEAPU8.set(bytes, ptr);
+  eh_lsp_stdout(h, id, ptr, bytes.length);
+  if (ptr) M._free(ptr);
+}
+
+// Feed a `lsp_stderr` push's bytes (the server's diagnostic output) into the SyncLspClient,
+// which drops them (no browser log file). Bytes copied into wasm memory like `callLspStdout`.
+function callLspStderr(id, bytes) {
+  const ptr = bytes.length ? M._malloc(bytes.length) : 0;
+  if (ptr) M.HEAPU8.set(bytes, ptr);
+  eh_lsp_stderr(h, id, ptr, bytes.length);
+  if (ptr) M._free(ptr);
 }
 
 // Forward the async process spawns/kills the tick enqueued to the daemon (`proc_spawn` /
@@ -1213,6 +1264,31 @@ async function drainTerminalRequests() {
   }
 }
 
+// Forward the LSP wire ops the SyncLspClient enqueued to the daemon (`lsp_spawn` / `lsp_stdin` /
+// `lsp_kill` — the LSP leg, Phase 6e). The daemon runs the real language server (`serve_one_lsp`,
+// the same wire the native `RemoteLspTransport` uses) and answers with `lsp_stdout`/`lsp_stderr`/
+// `lsp_exited` pushes (`onDaemonNotify`). Only reached in a daemon session — the editor gates
+// `vim.lsp.start` on a connected daemon (`has_remote_lsp`), so a serverless session fails it loud
+// in the core and never enqueues. `spawn` is forwarded before `stdin` so the daemon processes
+// `lsp_spawn` before the `initialize` `lsp_stdin` that follows on the same ordered stream;
+// `liveLsp` gates the async park so the reader keeps running to receive the server's pushes.
+async function drainLspRequests() {
+  const reqs = JSON.parse(readStr(eh_take_lsp_requests(h)));
+  if (reqs.spawn.length === 0 && reqs.stdin.length === 0 && reqs.kill.length === 0) return;
+  if (!daemon) return; // defensive: the tick shouldn't enqueue an LSP op without a daemon
+  for (const s of reqs.spawn) {
+    liveLsp.add(s.id);
+    await daemon.notify("lsp_spawn", [s.id, s.program, s.args, s.cwd]);
+  }
+  for (const i of reqs.stdin) {
+    await daemon.notify("lsp_stdin", [i.id, new Uint8Array(i.bytes)]);
+  }
+  for (const id of reqs.kill) {
+    liveLsp.delete(id);
+    await daemon.notify("lsp_kill", [id]);
+  }
+}
+
 // Forward the watch arm/disarm requests the editor enqueued to the daemon (`fs_watch` /
 // `fs_unwatch`). Serverless OPFS has no change source, so a watch is dropped — not a silent
 // stub: the tab is the sole writer, there is genuinely nothing external to watch.
@@ -1259,6 +1335,7 @@ async function pump5cDaemon() {
   await drainProcRequests();
   await drainFsWatchRequests();
   await drainTerminalRequests();
+  await drainLspRequests();
   postMessage(redrawMsg());
 }
 
@@ -1505,6 +1582,9 @@ async function runLoopSAB(ctrl, data) {
     // Forward any `:terminal` PTY ops the tick enqueued to the daemon (its `term_data`/
     // `term_exit` pushes return on `onDaemonNotify`).
     await drainTerminalRequests();
+    // Forward any LSP wire ops the tick (or a just-applied `lsp_stdout`) enqueued to the daemon
+    // (its `lsp_stdout`/`lsp_stderr`/`lsp_exited` pushes return on `onDaemonNotify`).
+    await drainLspRequests();
     // Forward any `:TSInstall` the tick enqueued to the UI thread (fire-and-forget).
     drainTsRequests();
     // Forward any `"+`/`"*` yanks/deletes to the UI thread to write to navigator.clipboard.
@@ -1564,7 +1644,11 @@ async function runLoopSAB(ctrl, data) {
     let timeout = deadline < 0 ? undefined : Math.max(0, deadline - nowMs());
     const daemonPushing =
       daemon &&
-      (armedWatches.size > 0 || liveProcs.size > 0 || liveTerms.size > 0 || liveFsWatches.size > 0);
+      (armedWatches.size > 0 ||
+        liveProcs.size > 0 ||
+        liveTerms.size > 0 ||
+        liveFsWatches.size > 0 ||
+        liveLsp.size > 0);
     if (daemonPushing || indenterBusy()) {
       // Don't *block* — a thread frozen in `Atomics.wait` can't run the event loop, so any
       // pending promise stalls. Cases that need it live: a daemon session expecting pushes
@@ -1703,6 +1787,7 @@ onmessage = async (ev) => {
       await drainFsWatchRequests();
       await drainProcRequests();
       await drainTerminalRequests();
+      await drainLspRequests();
       drainTsRequests();
       drainClipboardWrites();
       postFrame(msg.id);
@@ -1718,6 +1803,7 @@ onmessage = async (ev) => {
       await drainFsWatchRequests();
       await drainProcRequests();
       await drainTerminalRequests();
+      await drainLspRequests();
       drainTsRequests();
       drainClipboardWrites();
       postFrame(msg.id);
@@ -1731,6 +1817,7 @@ onmessage = async (ev) => {
       await drainFsWatchRequests();
       await drainProcRequests();
       await drainTerminalRequests();
+      await drainLspRequests();
       drainTsRequests();
       drainClipboardWrites();
       postFrame(msg.id, result);

@@ -48,8 +48,11 @@ impl EditHost {
         // the next budget's progress (and re-arm until it converges).
         #[cfg(feature = "native")]
         self.arm_parse_resume_if_pending();
-        // Drive LSP document sync for the current buffer (non-blocking).
-        #[cfg(feature = "native")]
+        // Drive LSP document sync for the current buffer (non-blocking) — on BOTH builds:
+        // native runs the server locally / over the daemon, wasm over the daemon's `lsp_*`
+        // wire (Phase 6e). This is what sends the pending `didOpen` after a server's
+        // `Initialized` (which the consumer defers to "the next sync"), so diagnostics and
+        // `didChange` flow without waiting for an explicit request path to sync first.
         self.sync_lsp();
 
         // Resolve every highlight span and chrome region to a concrete style here

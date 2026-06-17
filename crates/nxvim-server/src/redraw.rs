@@ -290,12 +290,32 @@ impl EditHost {
         statusline_fmt: &str,
         styles: &mut StyleTable,
     ) -> Value {
+        // The text body arrives as one self-describing `RenderRow` per screen row
+        // (`win.rows`) — the single source of truth core projects from. The wire
+        // still carries the parallel per-row arrays clients decode, so unbundle
+        // them once here; every projection below keys on these exactly as it did
+        // when they were `WindowView` fields, so the bytes are unchanged.
+        let lines: Vec<String> = win.rows.iter().map(|r| r.text.clone()).collect();
+        let numbers: Vec<Option<usize>> = win.rows.iter().map(|r| r.number()).collect();
+        let selection: Vec<Option<(usize, usize)>> = win.rows.iter().map(|r| r.selection).collect();
+        let secondary_selection: Vec<Vec<(usize, usize)>> = win
+            .rows
+            .iter()
+            .map(|r| r.secondary_selection.clone())
+            .collect();
+        let search: Vec<Vec<(usize, usize)>> = win.rows.iter().map(|r| r.search.clone()).collect();
+        let incsearch: Vec<Option<(usize, usize)>> = win.rows.iter().map(|r| r.incsearch).collect();
+        let virt_lines = win
+            .rows
+            .iter()
+            .map(|r| r.virt_line.clone())
+            .collect::<Vec<_>>();
         // Syntax highlights (treesitter) and the LSP overlays (diagnostics / signs /
         // inlay hints) are native-only projections; the browser build emits empty
         // arrays for them so the redraw map keeps a stable shape (JS-side highlighting
         // paints from the buffer text instead).
         #[cfg(feature = "native")]
-        let highlights = self.highlights_for(win.buffer, &win.numbers, styles);
+        let highlights = self.highlights_for(win.buffer, &numbers, styles);
         // The browser build highlights code JS-side and leaves these empty — *except*
         // a terminal, whose per-cell colors live only in the wasm-side vt100 grid and
         // can't be recovered from the buffer text. Project those (and intern their
@@ -303,7 +323,7 @@ impl EditHost {
         // non-terminal window, so a code buffer keeps its empty array + JS highlighting.
         #[cfg(not(feature = "native"))]
         let highlights = self
-            .terminal_highlights(win.buffer, &win.numbers, styles)
+            .terminal_highlights(win.buffer, &numbers, styles)
             .unwrap_or_else(|| Value::Array(Vec::new()));
         // Display columns of the `^X` / `<xx>` substitutions, for the wasm renderer
         // to colour as `SpecialKey`; the native client paints them from `highlights`,
@@ -311,25 +331,26 @@ impl EditHost {
         #[cfg(feature = "native")]
         let special_key = Value::Array(Vec::new());
         #[cfg(not(feature = "native"))]
-        let special_key = special_key_spans(&win.lines, win.tabstop);
+        let special_key = special_key_spans(&lines, win.tabstop);
         let status = self.status_value(win, mode_label, statusline_fmt, styles);
         // Extmark virtual text. The extmark store lives in core (shared with the wasm
         // edit-host, which runs the same `nx.buf.set_extmark` Lua and the same `nx.decor`
         // publish loop), so this projects on **both** builds — unlike the treesitter /
         // LSP overlays above, which are genuinely native-only. The wire shape is the
         // same on either build; only the transport differs.
-        let virt_text = self.virt_text_for(win.buffer, &win.numbers, &win.selection, styles);
+        let virt_text = self.virt_text_for(win.buffer, &numbers, &selection, styles);
         // Extmark `virt_lines` (whole virtual rows). Core already interleaved them into
-        // the window's rows (`win.virt_lines`, aligned with `lines`); the server only
-        // resolves each chunk's `hl_group` to a frame style id. Shared like `virt_text`.
-        let virt_lines = self.virt_lines_value(&win.virt_lines, styles);
+        // the window's rows (the `RowKind::VirtLine` rows, unbundled into `virt_lines`
+        // above); the server only resolves each chunk's `hl_group` to a frame style id.
+        // Shared like `virt_text`.
+        let virt_lines = self.virt_lines_value(&virt_lines, styles);
         #[cfg(feature = "native")]
         let (diagnostics, diagnostics_virt, diagnostics_signs, sign_column, inlay_hints) = (
-            self.diagnostics_for(win.buffer, &win.numbers, styles),
-            self.diagnostics_virt_text_for(win.buffer, &win.numbers, styles),
-            self.diagnostics_signs_for(win.buffer, &win.numbers, styles),
+            self.diagnostics_for(win.buffer, &numbers, styles),
+            self.diagnostics_virt_text_for(win.buffer, &numbers, styles),
+            self.diagnostics_signs_for(win.buffer, &numbers, styles),
             self.diagnostics_sign_column(win.buffer),
-            self.inlay_hints_for(win.buffer, &win.numbers, styles),
+            self.inlay_hints_for(win.buffer, &numbers, styles),
         );
         #[cfg(not(feature = "native"))]
         let (diagnostics, diagnostics_virt, diagnostics_signs, sign_column, inlay_hints) = (
@@ -347,7 +368,7 @@ impl EditHost {
             (Value::from("rect"), rect_value(&win.rect)),
             (Value::from("region"), Value::from(region_str(win.region))),
             (Value::from("focused"), Value::from(win.focused)),
-            (Value::from("lines"), display_lines_value(&win.lines)),
+            (Value::from("lines"), display_lines_value(&lines)),
             (
                 Value::from("cursor_row"),
                 Value::from(win.cursor_row as u64),
@@ -437,14 +458,14 @@ impl EditHost {
                 Value::from("cursor_line"),
                 Value::from(win.cursor_line as u64),
             ),
-            (Value::from("selection"), spans_value(&win.selection)),
+            (Value::from("selection"), spans_value(&selection)),
             (
                 Value::from("secondary_selection"),
-                multi_spans_value(&win.secondary_selection),
+                multi_spans_value(&secondary_selection),
             ),
-            (Value::from("search"), multi_spans_value(&win.search)),
-            (Value::from("incsearch"), spans_value(&win.incsearch)),
-            (Value::from("numbers"), numbers_value(&win.numbers)),
+            (Value::from("search"), multi_spans_value(&search)),
+            (Value::from("incsearch"), spans_value(&incsearch)),
+            (Value::from("numbers"), numbers_value(&numbers)),
             (Value::from("number"), Value::from(win.number)),
             (
                 Value::from("relativenumber"),
@@ -1118,7 +1139,7 @@ impl EditHost {
         let editor = &self.editor;
         const MAX_H: usize = 10;
         let focused = view.focused();
-        let text_height = focused.lines.len();
+        let text_height = focused.rows.len();
         // A picker carries a prompt line plus a separator row between it and the list;
         // `nx.ui.select` carries neither. Both count toward the box height (`chrome`),
         // the prompt's text toward the width.
@@ -1452,7 +1473,7 @@ impl EditHost {
         /// Cap the height — a huge docstring shouldn't fill the whole screen.
         const MAX_H: usize = 20;
         let focused = view.focused();
-        let text_height = focused.lines.len();
+        let text_height = focused.rows.len();
         // Hug the content (title included), capped. A bordered float spends one cell
         // on each side, so the fit tests below reserve 2 rows/cols of chrome.
         let content_w = cf

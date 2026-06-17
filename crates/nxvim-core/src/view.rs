@@ -63,6 +63,73 @@ pub struct ScrollAnim {
     pub incsearch: Vec<Option<(usize, usize)>>,
 }
 
+/// What a single screen row of a window's text body *is*. A buffer line expands
+/// into one or more screen rows (its interleaved `virt_lines`, then its text
+/// row); rows past the end of the buffer are `~` fillers. Tagging the kind keeps
+/// the scroll path from having to know about any one feature — a new row variety
+/// (folds, diff filler, wrapped continuation) is just another arm here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RowKind {
+    /// A real buffer line; carries its 0-based buffer-line index.
+    Line(usize),
+    /// A virtual line (extmark `virt_lines`) interleaved above/below its anchor
+    /// buffer line; its chunk run lives in [`RenderRow::virt_line`].
+    VirtLine,
+    /// Filler past the end of the buffer — vim's `~`.
+    Filler,
+}
+
+/// One screen row of a window's text body: the single projection primitive both
+/// the settled frame and the scroll band are built from. The row carries its own
+/// text **and every overlay the client paints on it** (selection, search,
+/// incsearch, virtual-line content), so projecting a window — settled or
+/// mid-slide — is just "lay out these rows", with no per-feature special-casing
+/// in the scroll path. Per-row column spans are screen columns, matching
+/// [`WindowView`]'s arrays.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RenderRow {
+    /// What this row is (real line / virtual line / filler).
+    pub kind: RowKind,
+    /// Text to paint: the buffer line for [`RowKind::Line`], `""` for a virtual
+    /// line, `"~"` for a filler.
+    pub text: String,
+    /// The extmark `virt_lines` chunk run when [`kind`](RenderRow::kind) is
+    /// [`RowKind::VirtLine`], else `None`. `virt_line.is_some()` is exactly what
+    /// distinguishes a virtual row from a `~` filler (both carry no number).
+    pub virt_line: Option<Vec<VirtChunk>>,
+    /// The primary visual selection's half-open screen-column span on this row,
+    /// or `None`. `end` may exceed the text width to mark a selected newline or to
+    /// fill a linewise selection to the window edge.
+    pub selection: Option<(usize, usize)>,
+    /// Every **secondary** multi-cursor's selection span on this row (the
+    /// primary's is in [`selection`](RenderRow::selection)); empty off a secondary
+    /// selection or outside visual mode.
+    pub secondary_selection: Vec<(usize, usize)>,
+    /// Every `hlsearch`/`Search` match's span on this row; empty when none.
+    pub search: Vec<(usize, usize)>,
+    /// The live `incsearch` preview match on this row, or `None`.
+    pub incsearch: Option<(usize, usize)>,
+}
+
+impl RenderRow {
+    /// 1-based buffer line number for the number column — `Some` only for a real
+    /// [`RowKind::Line`] row (virtual / filler rows show no number).
+    pub fn number(&self) -> Option<usize> {
+        match self.kind {
+            RowKind::Line(i) => Some(i + 1),
+            RowKind::VirtLine | RowKind::Filler => None,
+        }
+    }
+
+    /// 0-based buffer line index when this row renders a real buffer line.
+    pub fn line(&self) -> Option<usize> {
+        match self.kind {
+            RowKind::Line(i) => Some(i),
+            RowKind::VirtLine | RowKind::Filler => None,
+        }
+    }
+}
+
 /// The renderable form of the bottom [`Panel`](crate::editor): a title, the
 /// visible slice of its content, the cursor's row within that slice, and the
 /// content height the client lays the panel out to. `None` in [`View::panel`]
@@ -272,10 +339,14 @@ pub struct WindowView {
     pub buffer: BufferId,
     /// Whether this window holds focus (the terminal cursor is drawn here).
     pub focused: bool,
-    /// Visible text rows (the window's text body — `rect.height - 1` rows, the
-    /// last row being its status line). Rows past the buffer are the literal
-    /// `"~"`, as in vim.
-    pub lines: Vec<String>,
+    /// The window's text body as a flat list of screen rows ([`RenderRow`]) — one
+    /// per visible row (`rect.height - 1` rows, the last row being its status
+    /// line). Each row carries its text plus every overlay painted on it
+    /// (selection, search, virtual-line content); a buffer line expands into its
+    /// interleaved `virt_lines` rows then its text row, and rows past the buffer
+    /// are `~` fillers. This is the single source of truth the server projects the
+    /// per-row wire arrays from, and the same shape the scroll band slides.
+    pub rows: Vec<RenderRow>,
     /// Cursor row relative to the top of this window's text body.
     pub cursor_row: usize,
     /// First visible screen column (horizontal scroll offset) under `nowrap`. `0`
@@ -318,34 +389,9 @@ pub struct WindowView {
     pub modified: bool,
     /// 1-based cursor line, for this window's status-line ruler.
     pub cursor_line: usize,
-    /// Per visible row (aligned with `lines`), the half-open screen-column span
-    /// `[start, end)` to paint as the visual-mode selection, or `None`. `end` may
-    /// exceed the row's text width to mark a selected newline (one extra cell) or
-    /// to fill a linewise selection to the window's text edge.
-    pub selection: Vec<Option<(usize, usize)>>,
-    /// Per visible row, the half-open screen-column spans of every **secondary**
-    /// multi-cursor's visual selection (the primary's lives in [`selection`]).
-    /// Painted with the same `Visual` style; empty inner vecs for rows no
-    /// secondary selection touches, and empty everywhere outside a visual mode.
-    /// Mirrors the shape of [`search`] so a row can carry several disjoint
-    /// selections (one cursor per).
-    ///
-    /// [`selection`]: WindowView::selection
-    /// [`search`]: WindowView::search
-    pub secondary_selection: Vec<Vec<(usize, usize)>>,
-    /// Per visible row, the half-open screen-column spans of every search match
-    /// (`Search`/`hlsearch`). Empty inner vecs for rows with no match.
-    pub search: Vec<Vec<(usize, usize)>>,
-    /// Per visible row, the single match the live `incsearch` preview rests on,
-    /// or `None`.
-    pub incsearch: Vec<Option<(usize, usize)>>,
     /// Present only on a redraw caused by a scroll command that moved this
     /// window's viewport; carries the data a client needs to animate the slide.
     pub scroll: Option<ScrollAnim>,
-    /// 1-based buffer line number per visible row (aligned with `lines`), or
-    /// `None` for `~` filler rows. The client formats the number column from
-    /// these.
-    pub numbers: Vec<Option<usize>>,
     /// `:set number` — show the absolute line number.
     pub number: bool,
     /// `:set relativenumber` — show numbers relative to the cursor line.
@@ -388,14 +434,6 @@ pub struct WindowView {
     /// text body. `None` for an ordinary text / terminal / directory buffer. See
     /// [`ImageView`].
     pub image: Option<ImageView>,
-    /// Per visible row (aligned with [`lines`](WindowView::lines)), the extmark
-    /// `virt_lines` content when that row is a **virtual line** (a whole extra
-    /// screen row interleaved above / below its buffer line), else `None`. A virtual
-    /// row also has `numbers[i] == None` and an empty [`lines`](WindowView::lines)
-    /// entry — but unlike a `~` filler past end-of-buffer, it carries chunks here, so
-    /// the client paints those chunks (no gutter number, no cursor) instead of `~`.
-    /// The server resolves each chunk's `hl_group` to a frame style id for the wire.
-    pub virt_lines: Vec<Option<Vec<VirtChunk>>>,
 }
 
 /// An image-preview window's payload ([`WindowView::image`]): just the filesystem
@@ -653,38 +691,14 @@ fn window_view(ed: &Editor, w: &WindowLayout) -> WindowView {
     // inactive; clamp it for the rendered ruler / cursor row.
     let cur_line = w.cursor.line.min(line_count.saturating_sub(1));
 
-    // The screen-row layout: each visible buffer line expands into its
-    // `virt_lines_above` rows, the text row, then its `virt_lines_below` rows
-    // (`window_rows`). With no `virt_lines` this is the old one-row-per-line band.
-    // Every other per-row array is built buffer-line-indexed and then *scattered*
-    // onto these screen rows via `numbers` (virtual / filler rows take the default),
-    // so they stay aligned with the interleaved `lines`.
-    let RowLayout {
-        lines,
-        numbers,
-        virt: virt_lines,
-    } = window_rows(buf, top, height, line_count);
-    // The selection and incsearch preview belong to the focused window only.
-    let selection = if w.focused {
-        let by_line = selection_spans(ed, buf, width, line_count, top, height);
-        scatter_rows(&numbers, top, &by_line, None)
-    } else {
-        vec![None; numbers.len()]
-    };
-    // Per-cursor visual selections of the secondary multi-cursors (focused only).
-    let secondary_selection = if w.focused {
-        let by_line = secondary_selection_spans(ed, buf, width, line_count, top, height);
-        scatter_rows(&numbers, top, &by_line, Vec::new())
-    } else {
-        vec![Vec::new(); numbers.len()]
-    };
-    let (search, incsearch) = {
-        let (s, i) = ed.search_highlights_in(buf, w.cursor, w.focused, top, height);
-        (
-            scatter_rows(&numbers, top, &s, Vec::new()),
-            scatter_rows(&numbers, top, &i, None),
-        )
-    };
+    // The single screen-row layout both the settled frame and the scroll band are
+    // built from (`render_rows`): each visible buffer line expands into its
+    // interleaved `virt_lines` rows then its text row, padded with `~` fillers past
+    // end-of-buffer, and every per-row overlay (selection, secondary selection,
+    // search, incsearch) rides on the row it belongs to. With no `virt_lines` this
+    // is one row per buffer line. There is no separate per-array scatter step — the
+    // overlays are written straight onto the rows they fall on.
+    let rows = render_rows(ed, buf, top, height, line_count, w.focused, width, w.cursor);
 
     let scroll = if w.focused {
         ed.pending_scroll().and_then(|ps| {
@@ -791,7 +805,7 @@ fn window_view(ed: &Editor, w: &WindowLayout) -> WindowView {
                 let line = buf.byte_to_line(byte);
                 // The cursor's *screen* row in the interleaved layout (skips it when
                 // off-screen) — not `line - top`, which ignores virtual rows.
-                let row = screen_row_of(&numbers, line)?;
+                let row = screen_row_of(&rows, line)?;
                 let col = byte - buf.line_start(line);
                 let s = buf.line(line);
                 let screen_col = unicode::virtcol(&s, col, buf.options.effective_tabstop());
@@ -856,12 +870,11 @@ fn window_view(ed: &Editor, w: &WindowLayout) -> WindowView {
         region: w.region,
         buffer: w.buffer,
         focused: w.focused,
-        lines,
         // The cursor's *screen* row: where its buffer line lands in the interleaved
         // layout (past any `virt_lines` above it). A stashed cursor of an unfocused
         // window can sit outside the visible band (the buffer shrank, or it never
         // scrolled to it) — clamp it to the nearest edge for the rendered ruler.
-        cursor_row: screen_row_of(&numbers, cur_line).unwrap_or_else(|| {
+        cursor_row: screen_row_of(&rows, cur_line).unwrap_or_else(|| {
             if cur_line < top {
                 0
             } else {
@@ -878,12 +891,8 @@ fn window_view(ed: &Editor, w: &WindowLayout) -> WindowView {
         unnamed: buf.path.is_none(),
         modified: buf.modified,
         cursor_line: cur_line + 1,
-        selection,
-        secondary_selection,
-        search,
-        incsearch,
+        rows,
         scroll,
-        numbers,
         number: w.options.number,
         relativenumber: w.options.relativenumber,
         number_width,
@@ -894,7 +903,6 @@ fn window_view(ed: &Editor, w: &WindowLayout) -> WindowView {
         status_ctx,
         status_visible,
         image,
-        virt_lines,
     }
 }
 
@@ -981,105 +989,128 @@ fn window_lines(buf: &Buffer, base: usize, count: usize, line_count: usize) -> V
     lines
 }
 
-/// The interleaved screen-row layout of a window's text body (the parallel
-/// `lines` / `numbers` / `virt` arrays, each `height` long).
-struct RowLayout {
-    lines: Vec<String>,
-    numbers: Vec<Option<usize>>,
-    virt: Vec<Option<Vec<VirtChunk>>>,
-}
-
-/// Lay out `height` screen rows starting at buffer line `top`, **expanding** each
+/// Lay out `height` screen rows starting at buffer line `base`, **expanding** each
 /// buffer line that carries extmark `virt_lines` into extra rows: its
 /// `virt_lines_above` rows, then its text row, then its `virt_lines_below` rows.
 /// With no `virt_lines` this is one screen row per buffer line, `~`-padded past
-/// end-of-buffer — identical to [`window_lines`] / [`window_numbers`] combined.
+/// end-of-buffer. The returned rows carry only their *structure* (kind / text /
+/// virtual-line content); the focused-window overlays are layered on by
+/// [`render_rows`].
 ///
-/// A virtual row gets `numbers[i] == None` (so every server per-row projection,
-/// which keys on `numbers`, skips it like a `~` filler) and `lines[i] == ""`, and
-/// carries its chunk run in `virt[i]`. `virt[i].is_some()` is exactly what lets a
-/// client tell a virtual row from a `~` filler (both have a `None` number).
-fn window_rows(buf: &Buffer, top: usize, height: usize, line_count: usize) -> RowLayout {
+/// A virtual row is [`RowKind::VirtLine`] with an empty `text` and its chunk run
+/// in `virt_line`; a `~` filler is [`RowKind::Filler`]. Both report `number() ==
+/// None`, but `virt_line.is_some()` distinguishes them — exactly the bit a client
+/// uses to paint chunks rather than `~`.
+fn row_skeleton(buf: &Buffer, base: usize, height: usize, line_count: usize) -> Vec<RenderRow> {
     let virt_by_line = buf.virt_lines_by_line();
-    let mut lines = Vec::with_capacity(height);
-    let mut numbers = Vec::with_capacity(height);
-    let mut virt: Vec<Option<Vec<VirtChunk>>> = Vec::with_capacity(height);
-    let push_virt = |lines: &mut Vec<String>,
-                     numbers: &mut Vec<Option<usize>>,
-                     virt: &mut Vec<Option<Vec<VirtChunk>>>,
-                     row: &[VirtChunk]| {
-        lines.push(String::new());
-        numbers.push(None);
-        virt.push(Some(row.to_vec()));
+    let mut rows = Vec::with_capacity(height);
+    let push_virt = |rows: &mut Vec<RenderRow>, chunks: &[VirtChunk]| {
+        rows.push(RenderRow {
+            kind: RowKind::VirtLine,
+            text: String::new(),
+            virt_line: Some(chunks.to_vec()),
+            selection: None,
+            secondary_selection: Vec::new(),
+            search: Vec::new(),
+            incsearch: None,
+        });
     };
-    let mut buf_line = top;
-    while lines.len() < height {
+    let mut buf_line = base;
+    while rows.len() < height {
         if buf_line >= line_count {
             // `~` filler past the end of the buffer (no number, no virtual content).
-            lines.push("~".to_string());
-            numbers.push(None);
-            virt.push(None);
+            rows.push(RenderRow {
+                kind: RowKind::Filler,
+                text: "~".to_string(),
+                virt_line: None,
+                selection: None,
+                secondary_selection: Vec::new(),
+                search: Vec::new(),
+                incsearch: None,
+            });
             continue;
         }
-        let rows = virt_by_line.get(&buf_line);
-        if let Some(rows) = rows {
-            for vl in &rows.above {
-                if lines.len() >= height {
+        let virt = virt_by_line.get(&buf_line);
+        if let Some(v) = virt {
+            for vl in &v.above {
+                if rows.len() >= height {
                     break;
                 }
-                push_virt(&mut lines, &mut numbers, &mut virt, vl);
+                push_virt(&mut rows, vl);
             }
         }
-        if lines.len() >= height {
+        if rows.len() >= height {
             break;
         }
-        lines.push(buf.line(buf_line));
-        numbers.push(Some(buf_line + 1));
-        virt.push(None);
-        if let Some(rows) = rows {
-            for vl in &rows.below {
-                if lines.len() >= height {
+        rows.push(RenderRow {
+            kind: RowKind::Line(buf_line),
+            text: buf.line(buf_line),
+            virt_line: None,
+            selection: None,
+            secondary_selection: Vec::new(),
+            search: Vec::new(),
+            incsearch: None,
+        });
+        if let Some(v) = virt {
+            for vl in &v.below {
+                if rows.len() >= height {
                     break;
                 }
-                push_virt(&mut lines, &mut numbers, &mut virt, vl);
+                push_virt(&mut rows, vl);
             }
         }
         buf_line += 1;
     }
-    RowLayout {
-        lines,
-        numbers,
-        virt,
+    rows
+}
+
+/// Build the full [`RenderRow`] layout for a window's text body: the structural
+/// [`row_skeleton`] with the focused window's per-row overlays (primary +
+/// secondary visual selections, `hlsearch`, the live `incsearch` preview) written
+/// straight onto the rows they fall on. An unfocused window carries no overlays.
+///
+/// The overlay arrays are computed one-per-buffer-line over `[base, base+height)`
+/// (a safe over-provision — at most `height` buffer lines are visible) and indexed
+/// by each [`RowKind::Line`] row's buffer line, which is how a virtual / `~` row
+/// ends up with the defaults. This is the single place the settled frame and the
+/// scroll band both build their rows from.
+#[allow(clippy::too_many_arguments)]
+fn render_rows(
+    ed: &Editor,
+    buf: &Buffer,
+    base: usize,
+    height: usize,
+    line_count: usize,
+    focused: bool,
+    width: usize,
+    cursor: Cursor,
+) -> Vec<RenderRow> {
+    let mut rows = row_skeleton(buf, base, height, line_count);
+    if !focused {
+        return rows;
     }
+    let selection = selection_spans(ed, buf, width, line_count, base, height);
+    let secondary = secondary_selection_spans(ed, buf, width, line_count, base, height);
+    let (search, incsearch) = ed.search_highlights_in(buf, cursor, focused, base, height);
+    for row in &mut rows {
+        let Some(line) = row.line() else { continue };
+        let k = line - base;
+        row.selection = selection.get(k).copied().flatten();
+        if let Some(spans) = secondary.get(k) {
+            row.secondary_selection = spans.clone();
+        }
+        if let Some(spans) = search.get(k) {
+            row.search = spans.clone();
+        }
+        row.incsearch = incsearch.get(k).copied().flatten();
+    }
+    rows
 }
 
-/// Screen row (index into the interleaved [`RowLayout::numbers`]) showing buffer
-/// line `line` (0-based), or `None` when it isn't on screen.
-fn screen_row_of(numbers: &[Option<usize>], line: usize) -> Option<usize> {
-    numbers.iter().position(|n| *n == Some(line + 1))
-}
-
-/// Scatter a buffer-line-indexed array (`by_line[0]` = buffer line `top`) onto the
-/// interleaved screen rows described by `numbers`, filling every virtual / `~`
-/// filler row (and any row whose buffer line falls past `by_line`) with `default`.
-/// This re-aligns the per-row arrays computed one-per-buffer-line (selection,
-/// search, …) with the expanded layout.
-fn scatter_rows<T: Clone>(
-    numbers: &[Option<usize>],
-    top: usize,
-    by_line: &[T],
-    default: T,
-) -> Vec<T> {
-    numbers
-        .iter()
-        .map(|num| match num {
-            Some(n) => by_line
-                .get((n - 1) - top)
-                .cloned()
-                .unwrap_or_else(|| default.clone()),
-            None => default.clone(),
-        })
-        .collect()
+/// Screen row (index into a [`RenderRow`] layout) showing buffer line `line`
+/// (0-based), or `None` when it isn't on screen.
+fn screen_row_of(rows: &[RenderRow], line: usize) -> Option<usize> {
+    rows.iter().position(|r| r.line() == Some(line))
 }
 
 /// Compute, for each of the `count` rows starting at buffer line `base`, the

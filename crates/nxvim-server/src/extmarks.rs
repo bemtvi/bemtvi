@@ -248,7 +248,7 @@ impl EditHost {
 
     /// Build the per-row `virt_lines` payload from the view's interleaved layout:
     /// for each visible screen row, the chunk run `[[text, style_id], …]` when that
-    /// row is a **virtual line** (the core view set `win.virt_lines[row]`), else
+    /// row is a **virtual line** (a `RowKind::VirtLine` in the core layout), else
     /// `Nil`. Unlike `virt_text_for`, the *placement* (which rows are virtual, and in
     /// what order) is already decided in core — this only resolves the chunk styles.
     pub(crate) fn virt_lines_value(

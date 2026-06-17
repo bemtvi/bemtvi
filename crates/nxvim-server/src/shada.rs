@@ -20,13 +20,23 @@
 //! crash-safety neovim lacks.
 //!
 //! **Why this doesn't accumulate files.** The merge is *carry-forward compaction*:
-//! after merging the dead siblings into memory, the store **flushes that merged
-//! snapshot into its own file** (so the absorbed data is durable here) and then
-//! **deletes the siblings it absorbed**. So the only files that survive a startup
-//! are this instance's plus any currently-*live* (locked) ones — file count is
-//! bounded by concurrent instances, not by total launches, and startup cost is
-//! O(live instances), not O(history). A normal single-editor user always has
-//! exactly one file.
+//! a startup merges the dead siblings into memory, and the **clean-exit flush**
+//! then folds that data into this instance's own file and **deletes the siblings it
+//! absorbed** — so the only files left behind are this instance's plus any
+//! currently-*live* (locked) ones. File count is bounded by concurrent instances,
+//! not by total launches, and startup cost is O(live instances), not O(history); a
+//! normal single-editor user always ends with exactly one file.
+//!
+//! **Why the delete waits for exit (not load).** Compaction deletes at the clean
+//! exit, not at load. Deleting an absorbed sibling at load would hide its
+//! already-written data from any instance that launches while we still hold our own
+//! file's lock — for our entire session, breaking neovim's "you see another
+//! instance's data once it has written" contract. Deferring the delete keeps the
+//! absorbed sibling readable on disk until our exit flush has durably folded its
+//! data into our file, shrinking the data-hidden window from the whole session to
+//! the teardown instant. It stays crash-safe by ordering: a crash before that final
+//! commit leaves the siblings intact (re-absorbed next launch); a crash after it but
+//! mid-delete leaves redundant copies (likewise harmless).
 //!
 //! Phase 1 persists **registers**; Phase 2 the global file marks `A`–`Z`; Phase 3
 //! the per-file marks (`a`–`z`, specials, the `"` last-cursor) and search/ex
@@ -56,16 +66,22 @@ const HISTORY_CAP: usize = 10_000;
 const SCHEMA_VERSION: u32 = 1;
 
 /// The persistence seam the server drives. `load` is called once before the first
-/// frame (it merges + compacts and returns the snapshot to import); `flush` writes
-/// the current snapshot back. Both run off the editor hot loop (startup / exit), so
+/// frame (it merges readable siblings and returns the snapshot to import); `flush`
+/// writes the current snapshot back, and the clean-exit flush also compacts (deletes
+/// the absorbed siblings). Both run off the editor hot loop (startup / exit), so
 /// a synchronous trait is fine on every platform — native file I/O and an OPFS sync
 /// access handle (in a Worker) are both synchronous.
 pub trait ShadaStore {
-    /// Open this instance's store, recency-merge every readable sibling store,
-    /// compact (absorb + delete) the dead ones, and return the merged snapshot.
+    /// Open this instance's store and recency-merge every readable sibling store
+    /// into the returned snapshot. The absorbed siblings are *recorded* for
+    /// compaction but **not** deleted here — see [`flush`](ShadaStore::flush)'s
+    /// `compact` flag for why the delete waits for a clean exit.
     fn load(&mut self) -> std::io::Result<PersistState>;
-    /// Persist `state` into this instance's store.
-    fn flush(&mut self, state: &PersistState) -> std::io::Result<()>;
+    /// Persist `state` into this instance's store. When `compact` is set (only the
+    /// clean-exit flush), the siblings absorbed at [`load`](ShadaStore::load) are
+    /// deleted *after* this snapshot commits durably — folding their data into our
+    /// file and bounding the file count, without hiding their data mid-session.
+    fn flush(&mut self, state: &PersistState, compact: bool) -> std::io::Result<()>;
     /// Re-read this instance's own store plus every readable sibling and return the
     /// merged snapshot, **without** minting a file, shifting the numbered marks, or
     /// compacting (the load-only steps). This is the `:rshada` read: it picks up any
@@ -186,6 +202,10 @@ pub struct RedbFileStore {
     /// data is read through the live `db` handle, never re-opened — redb's exclusive
     /// lock forbids a second open of our own file).
     path: Option<PathBuf>,
+    /// The sibling stores absorbed at [`load`](RedbFileStore::load), pending deletion
+    /// by the compacting [`flush`](RedbFileStore::flush) on clean exit. Empty between
+    /// launches with no dead siblings, and drained once compacted.
+    absorbed: Vec<PathBuf>,
 }
 
 impl RedbFileStore {
@@ -196,6 +216,7 @@ impl RedbFileStore {
             dir: dir.into(),
             db: None,
             path: None,
+            absorbed: Vec::new(),
         }
     }
 }
@@ -208,8 +229,15 @@ impl ShadaStore for RedbFileStore {
 
         // Open every sibling we can (a live instance holds the lock → `open` fails →
         // skip it, its data simply not visible yet — neovim's contract). Keep the
-        // handles alive so we can read them, and the paths so we can delete the dead
-        // ones once our merged snapshot is durable.
+        // handles alive so we can read them, and the paths so the *clean-exit* flush
+        // can delete the dead ones once our merged snapshot is durable.
+        //
+        // We deliberately do NOT delete (compact) here. Deleting an absorbed sibling
+        // at load would hide its already-written data from any instance that launches
+        // while we hold our own file's lock — for our whole session, breaking
+        // neovim's "you see another instance's data once it has written" contract.
+        // Deferring the delete to the exit flush (see `flush(.., compact = true)`)
+        // shrinks that data-hidden window to the teardown instant.
         let mut siblings: Vec<Database> = Vec::new();
         let mut absorbed: Vec<PathBuf> = Vec::new();
         if let Ok(read_dir) = std::fs::read_dir(&self.dir) {
@@ -234,20 +262,18 @@ impl ShadaStore for RedbFileStore {
             shift_numbered_marks(std::mem::take(&mut merged.numbered), merged.exit.1.take());
         let state = build_state(merged, numbered_marks);
 
-        // Make the absorbed data durable in *our* file before deleting the
-        // siblings. A crash before this commit leaves the siblings intact (the next
-        // instance re-absorbs them); a crash after the commit but before the deletes
-        // leaves redundant copies (likewise harmless). Either way: no data loss.
-        write_state(&db, &state)?;
-        // Release the sibling handles before unlinking their files (some platforms
-        // refuse to delete a still-open file).
+        // Release the sibling handles: we keep no claim on them between now and the
+        // exit-time compaction (deletion is by recorded path), and another instance
+        // must stay free to open them while we run. The absorbed data is durable in
+        // *their* files until our exit flush folds it into ours, so there is no
+        // window where it lives nowhere. (No carry-forward write at load: the data
+        // stays in the siblings, and our own snapshot is written by the first
+        // checkpoint / the exit flush.)
         drop(siblings);
-        for path in absorbed {
-            let _ = std::fs::remove_file(path);
-        }
 
         self.path = Some(my_path);
         self.db = Some(db);
+        self.absorbed = absorbed;
         Ok(state)
     }
 
@@ -284,12 +310,24 @@ impl ShadaStore for RedbFileStore {
         Ok(build_state(merged, numbered_marks))
     }
 
-    fn flush(&mut self, state: &PersistState) -> std::io::Result<()> {
+    fn flush(&mut self, state: &PersistState, compact: bool) -> std::io::Result<()> {
         let db = self
             .db
             .as_ref()
             .ok_or_else(|| std::io::Error::other("shada flush before load"))?;
-        write_state(db, state)
+        write_state(db, state)?;
+        // Compaction (only on a clean exit): our snapshot — which folds in everything
+        // absorbed at load — is now durable, so the absorbed siblings are safe to
+        // delete. A crash before this commit leaves them intact (re-absorbed next
+        // launch); a crash after it but mid-delete leaves redundant copies (likewise
+        // harmless). Per-file errors are ignored — a sibling another live instance
+        // still holds open (Windows) must not fail the flush.
+        if compact {
+            for path in std::mem::take(&mut self.absorbed) {
+                let _ = std::fs::remove_file(path);
+            }
+        }
+        Ok(())
     }
 }
 

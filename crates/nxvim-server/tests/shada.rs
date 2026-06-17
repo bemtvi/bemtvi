@@ -50,7 +50,7 @@ impl ShadaStore for ProbeStore {
     fn load(&mut self) -> std::io::Result<PersistState> {
         Ok(PersistState::default())
     }
-    fn flush(&mut self, state: &PersistState) -> std::io::Result<()> {
+    fn flush(&mut self, state: &PersistState, _compact: bool) -> std::io::Result<()> {
         self.flushes.lock().unwrap().push(state.clone());
         Ok(())
     }
@@ -137,6 +137,41 @@ async fn stores_compact_instead_of_accumulating() {
         let (rpc, _incoming) = start_attached(init_with_store(&dir, None), 80, 25).await;
         feed(&rpc, "\"ap\"bp");
         assert_eq!(lines(&rpc).await, vec!["", "alpha", "beta"]);
+    }
+}
+
+#[tokio::test]
+async fn an_absorbed_sibling_stays_visible_while_the_absorber_is_live() {
+    // Compaction is deferred to a clean exit, not done at load. While instance B is
+    // live it holds its own file's lock, so the data it merged from a dead sibling A
+    // must remain readable *on disk* (in A's not-yet-deleted file) — otherwise a
+    // freshly launched C, which skips B's locked file, would lose A's data for the
+    // whole of B's session. This is neovim's "you see another instance's data once
+    // it has written" contract: deleting A at B's load would break it.
+    let dir = temp_dir("shada_absorb_visibility");
+    let file_a = write_temp("shada_absorb_a", "txt", "from A\n");
+    let file_c = write_temp("shada_absorb_c", "txt", "ccc\n");
+
+    // A: yank a line into register `x`, then exit cleanly — leaves one readable store.
+    {
+        let (rpc_a, inc_a) = start_attached(init_with_store(&dir, Some(file_a)), 80, 25).await;
+        feed(&rpc_a, "\"xyy");
+        assert_eq!(lines(&rpc_a).await, vec!["from A"]);
+        feed(&rpc_a, ":qa!<CR>");
+        await_server_exit(inc_a).await;
+    }
+
+    // B: launches and merges A's store at load, then stays live (no exit), holding
+    // its own file's lock for the rest of the test.
+    let (_rpc_b, _inc_b) = start_attached(init_with_store(&dir, None), 80, 25).await;
+
+    // C: a brand-new instance launched while B is still live. B's file is locked
+    // (skipped), so the only way C can see register `x` is if A's file still exists —
+    // which it must, because B deferred A's deletion to its (never-reached) exit.
+    {
+        let (rpc_c, _inc_c) = start_attached(init_with_store(&dir, Some(file_c)), 80, 25).await;
+        feed(&rpc_c, "\"xp");
+        assert_eq!(lines(&rpc_c).await, vec!["ccc", "from A"]);
     }
 }
 

@@ -1541,7 +1541,10 @@ impl EditHost {
         let mut snap = self.editor.export_persist();
         snap.exit_cursor = None;
         if let Some(store) = self.shada.as_mut() {
-            if let Err(e) = store.flush(&snap) {
+            // A live checkpoint never compacts: deleting an absorbed sibling while we
+            // hold our lock would hide its data from a concurrent launcher. Only the
+            // clean-exit flush compacts.
+            if let Err(e) = store.flush(&snap, false) {
                 eprintln!("shada: checkpoint flush failed: {e}");
             }
         }
@@ -1554,7 +1557,9 @@ impl EditHost {
     pub(crate) fn shada_flush_final(&mut self) {
         let snap = self.editor.export_persist();
         if let Some(store) = self.shada.as_mut() {
-            if let Err(e) = store.flush(&snap) {
+            // The clean exit: compact (delete the siblings absorbed at load) *after*
+            // this final snapshot — which folds in their data — is durable.
+            if let Err(e) = store.flush(&snap, true) {
                 eprintln!("shada: final flush failed: {e}");
             }
         }
@@ -1586,7 +1591,8 @@ impl EditHost {
         }
         let mut snap = self.editor.export_persist();
         snap.exit_cursor = None;
-        let result = self.shada.as_mut().unwrap().flush(&snap);
+        // `:wshada` is not an exit — don't compact (we're still live and locked).
+        let result = self.shada.as_mut().unwrap().flush(&snap, false);
         if let Err(e) = result {
             self.editor.echo(format!("E: shada write failed: {e}"));
         }

@@ -61,7 +61,7 @@ and `vim.g` globals.
 > store sits behind a **`ShadaStore` seam** the platform injects (native redb-over-file;
 > browser redb-over-**OPFS** via redb's `StorageBackend` — *same engine, different
 > bytes*), so it is never hardcoded into the server loop; and (2) the per-instance
-> files **compact** (carry-forward + delete) on every load, so file count is
+> files **compact** (merge at load, carry-forward + delete at the clean exit), so file count is
 > bounded by *concurrent* instances, not total launches. SQLite was considered and
 > rejected: it would need a wasm OPFS-VFS in the browser *and* a C dependency on
 > native, whereas redb spans both in pure Rust.
@@ -114,16 +114,29 @@ engine, one design, two byte-backends — which is why the store sits behind a
 
 **Carry-forward compaction (why files don't accumulate).** Minting a new file per
 launch *without* cleanup would leave an ever-growing pile and an O(launches)
-startup. So `load` doesn't just merge — it **compacts**: after merging the dead
-siblings into memory it (1) **flushes the merged snapshot into its own file** so
-the absorbed data is durable here, then (2) **deletes the siblings it absorbed**.
-The only files surviving a load are this instance's plus any currently-*live*
-(locked) ones, so file count is bounded by *concurrent* instances and startup is
-O(live instances), not O(history) — a normal single-editor user always has exactly
-one file. It is crash-safe by ordering: a crash before the flush-commit leaves the
-siblings (re-absorbed next launch); a crash after the commit but before the deletes
-leaves redundant copies (likewise harmless). Compaction is payload-agnostic — it
-deletes whole absorbed files — so it never changes as the schema grows.
+startup. So the store **compacts**: `load` merges the dead siblings into memory
+(seeding the session), and the **clean-exit flush** then (1) writes the final
+snapshot — which folds in everything absorbed — into this instance's own file, and
+(2) **deletes the siblings it absorbed**. The only files surviving are this
+instance's plus any currently-*live* (locked) ones, so file count is bounded by
+*concurrent* instances and startup is O(live instances), not O(history) — a normal
+single-editor user always ends with exactly one file. It is crash-safe by ordering:
+a crash before the final commit leaves the siblings (re-absorbed next launch); a
+crash after it but mid-delete leaves redundant copies (likewise harmless).
+Compaction is payload-agnostic — it deletes whole absorbed files — so it never
+changes as the schema grows.
+
+**Why the delete waits for exit, not load.** Deleting an absorbed sibling at `load`
+hides its already-written data from any instance launched while we still hold our
+own file's lock — for our *entire session* (our file is skipped as locked; the
+sibling is gone). That breaks neovim's "you see another instance's data once it has
+written" contract. Deferring the delete to the clean-exit flush keeps the absorbed
+sibling readable on disk until our snapshot has durably folded its data in,
+shrinking the data-hidden window from the whole session to the teardown instant.
+`load` therefore *records* the absorbed paths and deletes nothing; the
+`flush(state, compact = true)` of the exit path deletes them after its commit.
+(A live checkpoint and `:wshada` flush with `compact = false` — they must not delete
+while we're live and locked.)
 
 ### Why this is feasible now (de-risking facts)
 
@@ -252,11 +265,13 @@ over a file); a wasm impl over an OPFS `StorageBackend` lands in Phase 6.
 ```
 stdpath("state")/shada/
 ├── 4711.1749.0.redb      ← this instance (locked while live)
-├── 4699.1736.0.redb      ← a cleanly-exited instance  ┐ absorbed + deleted on
-└── 4702.1740.0.redb      ← a crashed instance          ┘ the next instance's load
+├── 4699.1736.0.redb      ← a cleanly-exited instance  ┐ merged in at the next
+└── 4702.1740.0.redb      ← a crashed instance          ┘ instance's load, deleted
+                                                          at *its* clean exit
 ```
-(`<pid>.<nanos>.<seq>`; only the live instance's file persists across a load —
-the rest are merged in and removed by carry-forward compaction.)
+(`<pid>.<nanos>.<seq>`; only the live instance's file persists across a load — the
+rest are merged in at load and deleted by carry-forward compaction at the absorbing
+instance's clean exit, so they stay readable to concurrent launchers until then.)
 
 **Tables** (one redb file, msgpack-encoded values via `rmp-serde`):
 
@@ -280,19 +295,22 @@ intact (vim's own behavior: `'0` tracks *clean* exits).
 
 **Lifecycle**, driven from the server through the `ShadaStore` seam:
 
-1. **`load` (startup) — merge + compact.** Mint `<pid>.<nanos>.<seq>.redb`,
-   `Database::create` it (acquire the lock). Glob sibling `*.redb`; for each, *try*
-   `Database::open` — skip the ones that fail (a live instance holds the lock),
-   record the ones that succeed (dead → absorbable). Recency-merge every absorbed
-   sibling into one `PersistState`:
+1. **`load` (startup) — merge, record (don't yet delete).** Mint
+   `<pid>.<nanos>.<seq>.redb`, `Database::create` it (acquire the lock). Glob sibling
+   `*.redb`; for each, *try* `Database::open` — skip the ones that fail (a live
+   instance holds the lock), record the ones that succeed (dead → absorbable).
+   Recency-merge every absorbed sibling into one `PersistState`:
    - registers / marks: group by key, **newest `ts` wins**;
    - history: union all entries, dedup by text keeping newest `ts`, sort, **cap**
      to the `shada`-history limit (default 10 000, neovim's `'1000`-ish but
      configurable later).
-   Then **flush the merged snapshot into my own file** (so the absorbed data is
-   durable here) and **delete the absorbed siblings**. Return the merged
-   `PersistState`; the server hands it to `editor.import_persist(..)` **before the
-   first frame**, the same pre-first-frame slot `init.lua` already uses.
+   **Record** the absorbed sibling paths for the exit-time compaction, but **delete
+   nothing here** (deleting now would hide their data from a concurrent launcher for
+   our whole session — see *Why the delete waits for exit* above). No carry-forward
+   write either: the data stays durable in the siblings until our snapshot folds it
+   in. Return the merged `PersistState`; the server hands it to
+   `editor.import_persist(..)` **before the first frame**, the same pre-first-frame
+   slot `init.lua` already uses.
 2. **Run (debounced checkpoint).** Every handled message re-arms a one-shot ~150 ms
    timer through the `HostEffects` timer seam; when it fires (the run loop's
    `loop_events` arm) the server calls `editor.export_persist()` and hands the value
@@ -306,10 +324,12 @@ intact (vim's own behavior: `'0` tracks *clean* exits).
    `HostEffects` fs-spawn — a native redb commit is fast and the wasm OPFS flush is
    synchronous in a Worker, so neither needs a background task; only the **arming**
    rides `HostEffects`, which is what lets the wasm Worker debounce on its own timer.)*
-3. **Exit (final flush).** When the server loop ends — `should_quit` **or** client
-   disconnect — a last `export_persist` (including `meta.exit_cursor` for `'0`)
-   flushes through the store, then the `Database` is dropped (releases the lock).
-   My file remains a clean checkpoint the next instance will absorb.
+3. **Exit (final flush) — compact.** When the server loop ends — `should_quit`
+   **or** client disconnect — a last `export_persist` (including `meta.exit_cursor`
+   for `'0`) flushes through the store with `compact = true`: after that snapshot
+   commits durably the store **deletes the siblings absorbed at load**, then the
+   `Database` is dropped (releases the lock). My file remains a clean checkpoint the
+   next instance will absorb.
 
 ### Where the store lives under each topology
 

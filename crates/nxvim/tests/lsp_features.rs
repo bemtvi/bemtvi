@@ -14,8 +14,8 @@ use std::time::Duration;
 use nxvim_rpc::{Incoming, Rpc};
 use nxvim_server::ServerInit;
 use nxvim_test_harness::{
-    attach, cursor, drain_to_latest_redraw, exec_lua, feed, lines, map_get, serial_lock, spawn,
-    temp_dir,
+    attach, barrier, cursor, drain_to_latest_redraw, exec_lua, feed, lines, map_get, serial_lock,
+    spawn, temp_dir, window0_field,
 };
 use rmpv::Value;
 use tokio::sync::mpsc::UnboundedReceiver;
@@ -545,4 +545,80 @@ async fn code_action_lists_then_applies_the_chosen_action() {
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
     assert!(applied, "confirming the code action should apply its edit");
+}
+
+/// Per-row underline-span count from a redraw's focused-window `diagnostics`
+/// array. Empty when the key is absent.
+fn diag_span_counts(map: &[(Value, Value)]) -> Vec<usize> {
+    window0_field(map, "diagnostics")
+        .and_then(Value::as_array)
+        .map(|rows| {
+            rows.iter()
+                .map(|r| r.as_array().map_or(0, Vec::len))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// The server-pushed set and `vim.diagnostic.set` paint TOGETHER on one buffer:
+/// `diagnostics_merged` is additive, not either/or. The mock reports an error on
+/// line 0; the client adds one on line 1; both rows must carry an underline span.
+#[tokio::test]
+async fn lsp_and_client_set_diagnostics_coexist_on_one_buffer() {
+    let _guard = serial_lock().lock().await;
+    let dir = temp_dir("lsp_features");
+    arm_mock(
+        &dir,
+        r#"{
+            "diagnostics": [
+                { "range": { "start": { "line": 0, "character": 0 },
+                             "end":   { "line": 0, "character": 4 } },
+                  "severity": 1, "message": "server says no" }
+            ]
+        }"#,
+    );
+    let (rpc, mut incoming) = open_with_server(&dir, "aaaa bbbb\ncccc dddd\n").await;
+
+    // Wait for the server's publishDiagnostics to land (row 0 gets a span).
+    let mut got_lsp = false;
+    for _ in 0..200 {
+        barrier(&rpc).await;
+        if let Some(map) = drain_to_latest_redraw(&mut incoming, |_| true) {
+            if diag_span_counts(&map).first().copied().unwrap_or(0) > 0 {
+                got_lsp = true;
+                break;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert!(got_lsp, "the server's diagnostic should paint on row 0");
+
+    // Add a client-set diagnostic on row 1, no server involved.
+    exec_lua(
+        &rpc,
+        r#"vim.diagnostic.set(7, 0, {
+          { lnum = 1, col = 0, end_lnum = 1, end_col = 4, severity = 2, message = "client says no" },
+        })"#,
+    )
+    .await;
+
+    // Both rows now carry a span — the two sources coexist.
+    let mut both = false;
+    for _ in 0..80 {
+        barrier(&rpc).await;
+        if let Some(map) = drain_to_latest_redraw(&mut incoming, |_| true) {
+            let counts = diag_span_counts(&map);
+            if counts.first().copied().unwrap_or(0) > 0 && counts.get(1).copied().unwrap_or(0) > 0 {
+                both = true;
+                break;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert!(
+        both,
+        "LSP (row 0) and client-set (row 1) diagnostics must paint together"
+    );
+
+    std::env::remove_var("NXVIM_LSP_CMD");
 }

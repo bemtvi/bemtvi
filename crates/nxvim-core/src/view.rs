@@ -737,7 +737,7 @@ fn window_view(ed: &Editor, w: &WindowLayout) -> WindowView {
         None
     };
 
-    let file_name = if buf.terminal {
+    let file_name = if buf.is_terminal() {
         // A terminal buffer shows the child's window title (OSC) as its name, seeded
         // from the command until the child sets one.
         buf.terminal_title
@@ -786,7 +786,7 @@ fn window_view(ed: &Editor, w: &WindowLayout) -> WindowView {
 
     // An image-preview buffer carries no text to paint; hand the client the path
     // so it renders the picture over this window's body instead of `lines`.
-    let image = buf.image.then(|| {
+    let image = buf.is_image().then(|| {
         let path = buf
             .path
             .as_ref()

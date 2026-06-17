@@ -14,7 +14,7 @@
 //! `docs/plans/2026-06-14-terminal-in-buffer.md`.
 
 use super::*;
-use crate::buffer::Buffer;
+use crate::buffer::{Buffer, BufferKind};
 use crate::input::{Key, KeyCode};
 use crate::mode::Mode;
 
@@ -76,7 +76,7 @@ impl Editor {
         let (rows, cols) = self.current_text_area();
 
         let mut buffer = Buffer::empty();
-        buffer.terminal = true;
+        buffer.kind = BufferKind::Terminal;
         // Seed the display name from the spawned command (the child replaces it with
         // its OSC window title once it sets one).
         buffer.terminal_title = Some(if argv.is_empty() {
@@ -121,7 +121,7 @@ impl Editor {
         self.buffers
             .map
             .get(&id)
-            .is_some_and(|ob| ob.buffer.terminal)
+            .is_some_and(|ob| ob.buffer.is_terminal())
     }
 
     /// Buffer `id`'s terminal window title (the child's OSC title), or `None` if it
@@ -130,7 +130,7 @@ impl Editor {
         self.buffers
             .map
             .get(&id)
-            .filter(|ob| ob.buffer.terminal)
+            .filter(|ob| ob.buffer.is_terminal())
             .and_then(|ob| ob.buffer.terminal_title.clone())
     }
 
@@ -262,7 +262,7 @@ impl Editor {
         // The child is gone: clear the terminal flag so the buffer becomes an ordinary
         // (editable) scratch buffer holding the final output — keystrokes no longer
         // forward, and the read-only edit guard lifts.
-        ob.buffer.terminal = false;
+        ob.buffer.kind = BufferKind::Ordinary;
         if is_current && self.mode == Mode::Terminal {
             self.mode = Mode::Normal;
             self.terminal_pending_backslash = false;

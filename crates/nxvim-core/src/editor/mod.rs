@@ -1269,7 +1269,7 @@ impl Editor {
         // A startup directory opens straight into a listing buffer (above) rather than
         // through `enter_dir`, so mark it `nxdir` here too — its `FileType nxdir`
         // autocmd is what installs the explorer's buffer-local `<CR>`/`-` maps.
-        if editor.buffer().dir.is_some() {
+        if editor.buffer().dir().is_some() {
             let buf = editor.cur_buffer();
             editor.set_filetype(buf, "nxdir");
         }
@@ -1577,7 +1577,7 @@ impl Editor {
         // reads as ordinary text for scrolling / yanking, but the insert-entering
         // commands return to the job instead of editing the read-only mirror.
         if self.mode == Mode::Normal
-            && self.buffer().terminal
+            && self.buffer().is_terminal()
             && self.pending.is_clean()
             && !key.ctrl
             && !key.alt

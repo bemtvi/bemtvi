@@ -445,7 +445,7 @@ impl Editor {
     pub fn buffer_buftype(&self, buf: BufferId) -> &'static str {
         if self.qf_context_of_buffer(buf).is_some() {
             "quickfix"
-        } else if self.buffer_of(buf).is_some_and(|b| b.terminal) {
+        } else if self.buffer_of(buf).is_some_and(|b| b.is_terminal()) {
             "terminal"
         } else {
             ""

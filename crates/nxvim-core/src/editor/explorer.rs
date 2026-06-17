@@ -22,7 +22,7 @@ impl Editor {
     /// matcher routes normal-mode keys through the `explorer` keymap bucket
     /// ([`Editor::apply_explorer_action`]) rather than the editing state machine.
     pub(crate) fn is_explorer_buffer(&self) -> bool {
-        self.buffer().dir.is_some()
+        self.buffer().dir().is_some()
     }
 
     /// Open `path` (a directory) as the file explorer. Reuses the current window
@@ -59,7 +59,7 @@ impl Editor {
         // reused (and reset to the top), matching the file open-or-switch path.
         let fs = self.host_fs.clone();
         let canon = fs.canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
-        if self.buffer().dir.as_deref() != Some(canon.as_path()) {
+        if self.buffer().dir() != Some(canon.as_path()) {
             if let Some(id) = self.find_buffer_by_path(&canon) {
                 self.switch_buffer(id);
                 self.explorer_goto(0);
@@ -124,7 +124,7 @@ impl Editor {
     /// (listed in place), open a file in a new buffer, or go up on `../`. A no-op
     /// on a blank/garbled line.
     fn explorer_open_entry(&mut self) {
-        let Some(dir) = self.buffer().dir.clone() else {
+        let Some(dir) = self.buffer().dir().map(|p| p.to_path_buf()) else {
             return;
         };
         let line = self.buffer().line(self.cursor.line);
@@ -155,7 +155,7 @@ impl Editor {
     /// `-` (and `<CR>` on `../`) — list the parent directory. At the filesystem
     /// root there is no parent, so the explorer stays put (as netrw does).
     fn explorer_up(&mut self) {
-        let Some(dir) = self.buffer().dir.clone() else {
+        let Some(dir) = self.buffer().dir().map(|p| p.to_path_buf()) else {
             return;
         };
         if let Some(parent) = dir.parent() {

@@ -61,6 +61,53 @@ impl EditBatch {
 // refuse to clobber an outside edit (vim's `b_mtime` / `b_orig_size` pair). The
 // stat itself is taken through the injected [`HostFs`], not `std::fs`.
 
+/// What **kind** of buffer this is — the single identity marker that replaces the
+/// former grab-bag of parallel `Option`/`bool` fields (`dir` / `view` / `terminal` /
+/// `image`). Every kind other than [`Ordinary`](BufferKind::Ordinary) is a
+/// **non-ordinary** buffer whose content is owned by something other than the user
+/// (the filesystem, a plugin, a PTY child, an image file) and is therefore read-only
+/// at the edit chokepoints — see [`Buffer::read_only`], which is now simply "the kind
+/// isn't `Ordinary`."
+///
+/// Each non-ordinary kind is an ordinary `nomodifiable` buffer-in-a-window: normal-mode
+/// motions / search / `:` flow through unchanged and edits are refused with `E21`; only
+/// its one or two activation keys are special, installed as buffer-local maps off its
+/// filetype (the vim ftplugin model). The quickfix / location-list display buffers are
+/// *also* read-only but are **not** a `BufferKind` — they live in an `Editor`-side
+/// registry (`qf_bufnr` / `Window.loclist_bufnr`), so `modifiable()` checks them
+/// separately. (Auxiliary per-kind state that mutates independently of identity —
+/// a terminal's `terminal_title`, an image preview's `image_gen` — stays in its own
+/// `Buffer` field rather than riding the enum payload.)
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum BufferKind {
+    /// An ordinary, editable file / scratch buffer. The common case.
+    #[default]
+    Ordinary,
+    /// A **directory listing** — nxvim's in-window file explorer (vim's netrw). The
+    /// payload is the canonical absolute path being listed. Built by
+    /// [`Buffer::from_dir`]; its activation keys (`<CR>` open / `-` parent →
+    /// [`crate::editor::Editor::apply_explorer_action`]) are buffer-local maps on its
+    /// `nxdir` filetype.
+    Directory(PathBuf),
+    /// A **plugin-owned view** (`nx.view`) — a plugin-controlled content surface (the
+    /// file-tree / list-widget generalization of the bottom panel). The payload is the
+    /// Lua-allocated view handle id its `set_lines` / `mount` / `on_select` address it
+    /// by; its `<CR>` → [`crate::editor::Editor::apply_view_action`] `on_select` is a
+    /// buffer-local map installed at view creation.
+    View(u64),
+    /// A **terminal job** buffer — its lines mirror a live PTY child's screen and
+    /// scrollback, pushed in by [`crate::editor::Editor::terminal_update`]. Non-file
+    /// (a `:w` refuses, no disk backing); in [`crate::mode::Mode::Terminal`] keystrokes
+    /// forward to the child, in Normal mode it reads as read-only text for scroll / yank.
+    /// The display title rides the separate [`Buffer::terminal_title`] field.
+    Terminal,
+    /// An **image opened for preview** (`'imagepreview'`): bound to an image file whose
+    /// bytes are deliberately *not* read into the rope — the client renders the picture
+    /// ([`crate::view::WindowView::image`]) and the rope stays the empty `"\n"`. The
+    /// off-tick reload counter rides the separate [`Buffer::image_gen`] field.
+    Image,
+}
+
 /// A text buffer.
 ///
 /// Indices are **byte offsets** into the underlying UTF-8 (ropey 2.0's native
@@ -156,47 +203,21 @@ pub struct Buffer {
     /// `changelist.len()` means "at the newest change / not navigating"; a new
     /// change resets it there.
     pub changelistidx: usize,
-    /// When `Some(dir)`, this buffer is a **directory listing** — nxvim's
-    /// in-window file explorer (vim's netrw), not an editable text file. `dir` is
-    /// the canonical absolute path being listed. It is an ordinary `nomodifiable`
-    /// buffer (this marker makes [`Buffer::read_only`] true, refusing edits at the
-    /// chokepoints); its activation keys (`<CR>` open / `-` parent →
-    /// [`crate::editor::Editor::apply_explorer_action`]) are buffer-local maps on its
-    /// `nxdir` filetype. Built by [`Buffer::from_dir`]; `None` for every ordinary
-    /// file/scratch buffer.
-    pub dir: Option<PathBuf>,
-    /// `Some(view_id)` when this buffer backs a **plugin-owned view** (`nx.view`) —
-    /// a read-only, plugin-controlled content surface (the file-tree / list widget
-    /// generalization of the bottom panel), not an editable text file. It is an
-    /// ordinary `nomodifiable` buffer (this marker makes [`Buffer::read_only`] true);
-    /// its `<CR>` → [`crate::editor::Editor::apply_view_action`] `on_select` is a
-    /// buffer-local map installed at view creation. The id is the Lua-allocated handle
-    /// id the view's `set_lines` / `mount` / `on_select` address it by. `None` for
-    /// every ordinary file/scratch/directory buffer.
-    pub view: Option<u64>,
-    /// When `true`, this buffer hosts a **terminal job** — its lines mirror a live
-    /// PTY child's screen (and scrollback), pushed in by the server's terminal
-    /// engine via [`crate::editor::Editor::terminal_update`], not editable text.
-    /// It is non-file (a `:w` refuses, `modified` never sets, no disk backing); in
-    /// [`crate::mode::Mode::Terminal`] keystrokes are forwarded to the child, and in
-    /// Normal mode the buffer reads as ordinary read-only text for scroll / yank.
-    /// The PTY itself lives server-side keyed by this buffer's `BufferId`. `false`
-    /// for every ordinary file / scratch / directory buffer.
-    pub terminal: bool,
+    /// What **kind** of buffer this is — the single identity marker (replacing the
+    /// former `dir` / `view` / `terminal` / `image` grab-bag). [`BufferKind::Ordinary`]
+    /// for every editable file/scratch buffer; a non-ordinary variant carries the
+    /// explorer dir path / view id and makes [`Buffer::read_only`] true. See
+    /// [`BufferKind`] for the per-kind details.
+    pub kind: BufferKind,
     /// A terminal-job buffer's display name — the child's window title (the OSC
     /// `\e]0;…`/`\e]2;…` sequence a shell or program sets, e.g. `user@host: ~/dir` or
     /// `vim README.md`), surfaced as the buffer name in the statusline. Seeded from the
     /// spawned command at [`crate::editor::Editor::open_terminal`] and updated as the
     /// child changes it. `None` for every non-terminal buffer.
     pub terminal_title: Option<String>,
-    /// When `true`, this buffer is an **image opened for preview** (`'imagepreview'`):
-    /// it is bound to an image file but its bytes are deliberately *not* read into
-    /// the rope — the client renders the picture instead (see
-    /// [`Buffer::from_image_file`] and [`crate::view::WindowView::image`]). The rope
-    /// stays the empty `"\n"`, so the buffer reads as empty/inert. `false` for every
-    /// ordinary file / scratch / directory / terminal buffer.
-    pub image: bool,
-    /// A monotonic version for an **off-tick image preview** ([`Buffer::image`] with
+    /// A monotonic version for an **off-tick image preview** (a [`BufferKind::Image`]
+    /// whose bytes are *not* read into the rope — the client renders the picture, see
+    /// [`Buffer::from_image_file`] and [`crate::view::WindowView::image`]) with
     /// no [`disk`](Buffer::disk) stat — the daemon/WASM open path, which can't stat
     /// synchronously). Bumped each time the buffer is (re)marked an image preview
     /// (`enqueue_open`), it's projected as the [`crate::view::ImageView`]'s version so
@@ -239,11 +260,8 @@ impl Buffer {
             changelistidx: 0,
             extmarks: crate::extmark::ExtmarkStore::default(),
             marks: HashMap::new(),
-            dir: None,
-            view: None,
-            terminal: false,
+            kind: BufferKind::Ordinary,
             terminal_title: None,
-            image: false,
             image_gen: 0,
             disk: None,
         }
@@ -270,17 +288,44 @@ impl Buffer {
         self.path = path;
     }
 
-    /// Whether this buffer is **read-only** by virtue of its kind — a directory
-    /// listing (`dir`), a plugin-owned [`view`](Buffer::view), a live terminal
-    /// mirror (`terminal`), or an image preview (`image`). Each is a non-ordinary
-    /// buffer whose content is owned by something other than the user (the
-    /// filesystem, a plugin, a PTY child, an image file), so the edit chokepoints
+    /// Whether this buffer is **read-only** by virtue of its [`kind`](Buffer::kind) —
+    /// i.e. any kind other than [`BufferKind::Ordinary`] (a directory listing, a
+    /// plugin-owned view, a live terminal mirror, or an image preview). Each is a
+    /// non-ordinary buffer whose content is owned by something other than the user
+    /// (the filesystem, a plugin, a PTY child, an image file), so the edit chokepoints
     /// refuse mutations with `E21` via [`crate::editor::Editor::modifiable`]. The
-    /// quickfix/loclist display buffers are *also* read-only but aren't a `Buffer`
-    /// marker (they live in an `Editor`-side registry), so `modifiable()` checks
-    /// them separately.
+    /// quickfix/loclist display buffers are *also* read-only but aren't a `BufferKind`
+    /// (they live in an `Editor`-side registry), so `modifiable()` checks them
+    /// separately.
     pub fn read_only(&self) -> bool {
-        self.dir.is_some() || self.view.is_some() || self.terminal || self.image
+        !matches!(self.kind, BufferKind::Ordinary)
+    }
+
+    /// The canonical directory path when this is a [`BufferKind::Directory`] explorer
+    /// listing, else `None`.
+    pub fn dir(&self) -> Option<&Path> {
+        match &self.kind {
+            BufferKind::Directory(p) => Some(p),
+            _ => None,
+        }
+    }
+
+    /// The view handle id when this is a [`BufferKind::View`] plugin view, else `None`.
+    pub fn view_id(&self) -> Option<u64> {
+        match self.kind {
+            BufferKind::View(id) => Some(id),
+            _ => None,
+        }
+    }
+
+    /// Whether this is a [`BufferKind::Terminal`] job buffer.
+    pub fn is_terminal(&self) -> bool {
+        matches!(self.kind, BufferKind::Terminal)
+    }
+
+    /// Whether this is a [`BufferKind::Image`] preview buffer.
+    pub fn is_image(&self) -> bool {
+        matches!(self.kind, BufferKind::Image)
     }
 
     /// Mark the buffer as matching its backing store: clear `modified` and pin the
@@ -343,11 +388,8 @@ impl Buffer {
             changelistidx: 0,
             extmarks: crate::extmark::ExtmarkStore::default(),
             marks: HashMap::new(),
-            dir: None,
-            view: None,
-            terminal: false,
+            kind: BufferKind::Ordinary,
             terminal_title: None,
-            image: false,
             image_gen: 0,
         })
     }
@@ -362,7 +404,7 @@ impl Buffer {
     pub fn from_image_file(path: impl AsRef<Path>, fs: &dyn HostFs) -> Result<Self> {
         let path = path.as_ref();
         Ok(Buffer {
-            image: true,
+            kind: BufferKind::Image,
             disk: fs.stat(path),
             ..Buffer::named(path)
         })
@@ -414,9 +456,7 @@ impl Buffer {
         Buffer {
             text: Rope::from_str(&text),
             path: Some(dir.clone()),
-            dir: Some(dir),
-            view: None,
-            terminal: false,
+            kind: BufferKind::Directory(dir),
             terminal_title: None,
             modified: false,
             options: crate::options::BufferOptions::default(),
@@ -433,7 +473,6 @@ impl Buffer {
             changelistidx: 0,
             extmarks: crate::extmark::ExtmarkStore::default(),
             marks: HashMap::new(),
-            image: false,
             image_gen: 0,
             // A directory listing is never written back to disk, so it needs no
             // change tracking.

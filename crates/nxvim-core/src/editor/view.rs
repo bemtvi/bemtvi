@@ -19,7 +19,7 @@
 //! docs/plans/2026-06-16-unify-special-buffer-kinds.md.
 
 use super::*;
-use crate::buffer::Buffer;
+use crate::buffer::{Buffer, BufferKind};
 use ropey::Rope;
 
 /// One live `nx.view` surface, tracked in [`Editor::views`] by its Lua handle id.
@@ -50,7 +50,7 @@ impl Editor {
             return;
         }
         let mut buf = Buffer::empty();
-        buf.view = Some(id);
+        buf.kind = BufferKind::View(id);
         let buf_id = self.add_buffer(buf);
         // A view's filetype drives treesitter / decoration *and* names the widget for
         // its `FileType` autocmd; default it to `nxview` (the widget identity) when the
@@ -222,7 +222,7 @@ impl Editor {
         self.message.clear();
         match action {
             "confirm" => {
-                if let Some(id) = self.buffer().view {
+                if let Some(id) = self.buffer().view_id() {
                     self.view_selects.push((id, self.cursor.line));
                 }
                 Ok(())

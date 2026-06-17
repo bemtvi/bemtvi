@@ -1,6 +1,7 @@
 # Unify the special-buffer-kind grab-bag
 
-Status: **Phases 1 & 2 landed** — 2026-06-16. A refactor to consolidate nxvim's
+Status: **Phases 1 & 2 landed** — 2026-06-16; **`BufferKind` enum landed** — 2026-06-17
+(see [Identity](#identity-the-bufferkind-enum--done-2026-06-17)). A refactor to consolidate nxvim's
 accreted "non-ordinary buffer" mechanisms before more is built on them (the `nx.view`
 work exposed how out of hand this has gotten). No new user-facing feature — a
 consistency / correctness cleanup that also closes a real read-only hole. Phase 1
@@ -213,14 +214,43 @@ Net: three `input()` branches, two `KeyContext` variants, two buckets, two
 `handle_*_text`, and the nav action sets all **deleted**; explorer/view/quickfix become
 one shape — a `nomodifiable` buffer with buffer-local activation maps.
 
-## Identity: keep the markers; no enum unless it earns its keep
+## Identity: the `BufferKind` enum — **DONE** (2026-06-17)
 
-Deliberately **not** introducing a `BufferKind` enum as part of this — that would be
-reinventing identity storage the user explicitly warned against. The existing markers
-(`Buffer.dir`/`view`/`terminal`/`image` + the quickfix registry) stay; `read_only()`
-and `buffer_buftype()` read them. If, after Phases 1–2, the handful of `match`-able
-call sites makes an enum clearly pay for itself, fold the four `Buffer` fields into one
-then — as a trailing, optional, purely-mechanical tidy, not a goal.
+Phase 3, the trailing tidy this section reserved: the four parallel `Buffer` marker
+fields (`dir: Option<PathBuf>` / `view: Option<u64>` / `terminal: bool` / `image: bool`)
+are **folded into one `BufferKind` enum** (`buffer.rs`):
+
+```rust
+pub enum BufferKind { Ordinary, Directory(PathBuf), View(u64), Terminal, Image }
+```
+
+- `Buffer.kind: BufferKind` replaces the four fields; `BufferKind::Ordinary` is the
+  default (the common editable buffer). The two *auxiliary* per-kind fields that mutate
+  independently of identity — `terminal_title` (OSC title, changes as the child sets it)
+  and `image_gen` (off-tick reload counter) — **stay as their own `Buffer` fields**, not
+  enum payload, since they carry data orthogonal to the kind marker.
+- `read_only()` collapses to `!matches!(self.kind, BufferKind::Ordinary)` — every
+  non-ordinary kind is read-only, exactly the property Phase 1 established.
+- Thin accessors keep the call sites readable and the diff mechanical: `dir() ->
+  Option<&Path>`, `view_id() -> Option<u64>`, `is_terminal()`, `is_image()`. The
+  handful of write sites set `buf.kind = BufferKind::…` (explorer/view/terminal/image
+  constructors + `open_terminal`/`exit`/`reconcile_image_preview`).
+- `buffer_buftype()` still reads the quickfix registry separately (the qf/loclist
+  display buffer is **not** a `BufferKind` — it lives in the `Editor`-side
+  `qf_bufnr`/`Window.loclist_bufnr` registry, as Phase 1 noted), then matches the kind
+  for `"terminal"`.
+
+No behavioral change — purely the identity-storage consolidation. Whole workspace green
+(default + `--no-default-features`), clippy clean; no test changes needed (the black-box
+suites exercise the kinds through RPC, not the `Buffer` fields).
+
+### Original note (for reference)
+
+Originally deferred: *"Deliberately not introducing a `BufferKind` enum as part of this…
+If, after Phases 1–2, the handful of `match`-able call sites makes an enum clearly pay
+for itself, fold the four `Buffer` fields into one then — as a trailing, optional,
+purely-mechanical tidy, not a goal."* After Phases 1–2 it did pay for itself (`read_only`
+and the constructors all wanted the discriminant), so it landed.
 
 ## Later / separate — the bottom panel
 

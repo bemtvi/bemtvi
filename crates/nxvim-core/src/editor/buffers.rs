@@ -2,7 +2,7 @@
 //! (`:buffers`/`:b`/`:bnext`/`:bdelete`/…).
 
 use super::*;
-use crate::buffer::{Buffer, DiskChange, EditBatch};
+use crate::buffer::{Buffer, BufferKind, DiskChange, EditBatch};
 use crate::host::FileStat;
 use crate::mode::Mode;
 use std::path::Path;
@@ -512,7 +512,7 @@ impl Editor {
                     ob.buffer.remove(0..len);
                     ob.buffer.normalize();
                 }
-                ob.buffer.image = true;
+                ob.buffer.kind = BufferKind::Image;
                 ob.buffer.set_path(Some(path));
                 ob.buffer.modified = false;
                 // Bump the preview version so the client re-fetches/re-decodes: off-tick
@@ -910,7 +910,7 @@ impl Editor {
     /// isn't already a preview.
     pub fn reconcile_image_preview(&mut self) {
         let b = self.buffer();
-        if self.options.imagepreview && !b.image && super::is_image_path(b.path.as_deref()) {
+        if self.options.imagepreview && !b.is_image() && super::is_image_path(b.path.as_deref()) {
             let id = self.cur_buffer();
             self.reload_buffer(id);
         }

@@ -51,6 +51,17 @@
 
 vim.g.mapleader = " "
 
+-- which-key's own highlight groups, so the popup is PRETTY — keys, group labels,
+-- descriptions, and dimmed (unavailable) rows each in their own colour. Defined
+-- explicitly (not borrowed from the colorscheme) so the demo looks right with no
+-- theme loaded; a real config would link these to its scheme. Phase 4 of the
+-- source-B plan gave `nx.ui.float` per-segment highlighting (a line can be a list
+-- of `{ text, hl_group }` chunks), which is what makes this colouring possible.
+nx.hl.define(0, "WhichKey", { fg = "#7dcfff" }) -- the key itself (cyan)
+nx.hl.define(0, "WhichKeyGroup", { fg = "#bb9af7", bold = true }) -- a +prefix group
+nx.hl.define(0, "WhichKeyDesc", { fg = "#c0caf5" }) -- a mapping's description
+nx.hl.define(0, "WhichKeyDim", { fg = "#565f89", italic = true }) -- a dimmed row
+
 -- A small leader menu. `ff`/`fg` and `gs`/`gc` are two-key sequences, so `f` and
 -- `g` show up as GROUPS (`kind = "group"`) that lead deeper; the single-key maps
 -- complete immediately (`kind = "map"`, carrying their `desc`).
@@ -81,10 +92,12 @@ local DELAY = vim.g.which_key_delay or 200
 -- The plugin: render one pending context into the float.
 -- ---------------------------------------------------------------------------
 
--- Lay the continuations out as an aligned `key  label` grid. Groups get a `+`
--- so a path that only leads deeper reads differently from one that fires. The
--- key column is padded to the widest *display width* (not byte length), so wide
--- or multibyte keys still line up.
+-- Lay the continuations out as an aligned `key  label` grid. Each row is a list
+-- of `{ text, hl_group }` CHUNKS (the Phase 4 styled-float form), so the key, the
+-- separator, and the description each get their own colour. Groups get a `+` and a
+-- distinct group colour, so a path that only leads deeper reads differently from
+-- one that fires. The key column is padded to the widest *display width* (not byte
+-- length), so wide or multibyte keys still line up.
 --
 -- Source B (the built-in grammar: `f` find-char, `r` replace, marks, …) has NO
 -- discrete keys to list — its continuation set is open — so it arrives with an
@@ -93,7 +106,7 @@ local DELAY = vim.g.which_key_delay or 200
 -- popup rather than silently waiting for the target char.
 local function lines_for(ctx)
   if #ctx.continuations == 0 then
-    return { string.format(" %s ", ctx.label or "…") }
+    return { { { string.format(" %s ", ctx.label or "…"), "WhichKeyDesc" } } }
   end
   local keyw = 1
   for _, c in ipairs(ctx.continuations) do
@@ -102,20 +115,26 @@ local function lines_for(ctx)
   local rows = {}
   for _, c in ipairs(ctx.continuations) do
     local pad = string.rep(" ", keyw - vim.fn.strdisplaywidth(c.key))
-    local label
-    if c.kind == "group" then
-      label = "+" .. (c.desc ~= "" and c.desc or "more")
-    else
-      label = c.desc ~= "" and c.desc or ""
-    end
     -- `available == false` is a continuation kept visible but no longer firable —
     -- a mapped `g` key (gd/gD/gr) surfaced after the leader timeout committed `g`
-    -- to the built-in grammar. nx.ui.float has no inline highlight yet (so no real
-    -- graying), so cue it with a trailing marker. See the plan doc's Phase 4 note.
-    if c.available == false then
-      label = label .. "  (×)"
+    -- to the built-in grammar. Phase 4 lets us DIM the whole row (its own group)
+    -- instead of cueing it with a trailing `(×)` marker.
+    local dim = c.available == false
+    local label, label_hl
+    if c.kind == "group" then
+      label = "+" .. (c.desc ~= "" and c.desc or "more")
+      label_hl = "WhichKeyGroup"
+    else
+      label = c.desc ~= "" and c.desc or ""
+      label_hl = "WhichKeyDesc"
     end
-    rows[#rows + 1] = string.format(" %s%s   %s ", c.key, pad, label)
+    rows[#rows + 1] = {
+      { " ", nil },
+      { c.key, dim and "WhichKeyDim" or "WhichKey" },
+      { pad .. "   ", nil },
+      { label, dim and "WhichKeyDim" or label_hl },
+      { " ", nil },
+    }
   end
   return rows
 end

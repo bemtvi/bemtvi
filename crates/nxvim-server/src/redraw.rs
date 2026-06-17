@@ -196,7 +196,7 @@ impl EditHost {
         // `Nil` when none is open. A non-grabbing transient overlay — its geometry
         // is computed here from the cursor (or centered over the editor).
         let float = match &view.content_float {
-            Some(cf) => self.project_content_float(cf, &view, text_width),
+            Some(cf) => self.project_content_float(cf, &view, text_width, &mut styles),
             None => Value::Nil,
         };
 
@@ -1440,7 +1440,12 @@ impl EditHost {
         cf: &ContentFloatView,
         view: &nxvim_core::View,
         text_width: usize,
+        styles: &mut StyleTable,
     ) -> Value {
+        /// Display width of one chunked line: the sum of its chunks' char counts.
+        fn line_width(line: &[nxvim_core::VirtChunk]) -> usize {
+            line.iter().map(|c| c.text.chars().count()).sum()
+        }
         /// Cap the float width — long markup wraps off-screen otherwise; the body is
         /// windowed, not a hard limit.
         const MAX_W: usize = 80;
@@ -1453,7 +1458,7 @@ impl EditHost {
         let content_w = cf
             .lines
             .iter()
-            .map(|l| l.chars().count())
+            .map(|l| line_width(l))
             .max()
             .unwrap_or(1)
             .max(cf.title.as_ref().map_or(0, |t| t.chars().count() + 2))
@@ -1508,8 +1513,18 @@ impl EditHost {
             }
         };
         let shown = &cf.lines[..height.min(cf.lines.len())];
+        // Each line ships as a chunk run `[[text, style_id], …]` (the `virt_lines`
+        // wire form), so a styled caller (which-key) can colour keys vs.
+        // descriptions and dim unavailable rows. A plain caller is one unstyled
+        // chunk per line, which resolves to a `Nil` style id (normal colors).
+        let lines = Value::Array(
+            shown
+                .iter()
+                .map(|line| self.virt_chunks_value(line, styles))
+                .collect(),
+        );
         Value::Map(vec![
-            (Value::from("lines"), display_lines_value(shown)),
+            (Value::from("lines"), lines),
             (Value::from("row"), Value::from(row as u64)),
             (Value::from("col"), Value::from(col as u64)),
             (Value::from("width"), Value::from(width as u64)),

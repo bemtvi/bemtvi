@@ -56,15 +56,42 @@ fn float_of(map: &[(Value, Value)]) -> Vec<(Value, Value)> {
     }
 }
 
-/// The float's content lines.
+/// The float's content lines as plain text. Each wire line is a chunk run
+/// `[[text, style_id], …]` (the `virt_lines` form), so concatenate the chunk texts
+/// to recover the rendered text.
 fn float_lines(float: &[(Value, Value)]) -> Vec<String> {
     match map_get(float, "lines") {
-        Some(Value::Array(a)) => a
-            .iter()
-            .map(|l| l.as_str().unwrap_or("").to_string())
-            .collect(),
+        Some(Value::Array(rows)) => rows.iter().map(line_text).collect(),
         other => panic!("expected lines array, got {other:?}"),
     }
+}
+
+/// The concatenated text of one wire line (a chunk run `[[text, style_id], …]`).
+fn line_text(row: &Value) -> String {
+    row.as_array()
+        .map(|chunks| {
+            chunks
+                .iter()
+                .filter_map(|c| c.as_array()?.first()?.as_str().map(str::to_string))
+                .collect::<String>()
+        })
+        .unwrap_or_default()
+}
+
+/// One wire line's chunks as `(text, style_id)` pairs — the styled form a
+/// "pretty" float (which-key) ships, so a test can assert per-segment highlight.
+fn line_chunks(row: &Value) -> Vec<(String, Option<u64>)> {
+    row.as_array()
+        .map(|chunks| {
+            chunks
+                .iter()
+                .filter_map(|c| {
+                    let c = c.as_array()?;
+                    Some((c.first()?.as_str()?.to_string(), c.get(1)?.as_u64()))
+                })
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 #[tokio::test]
@@ -104,6 +131,64 @@ async fn string_contents_split_on_newlines() {
         .await
         .expect("a float redraw surface");
     assert_eq!(float_lines(&float_of(&map)), vec!["one", "two"]);
+}
+
+/// A styled float (the Phase 4 capability): a line may be a chunk list
+/// `{ {text, hl_group?}, … }`, so a "pretty" caller (which-key) colours its
+/// segments. The wire ships each line as `[[text, style_id], …]`, the style id
+/// resolving against the redraw's `styles` palette — proof per-segment highlight
+/// threads core → view → wire.
+#[tokio::test]
+async fn styled_chunk_lines_carry_per_segment_highlights() {
+    let dir = temp_dir("ui_float_styled");
+    let (rpc, mut incoming) = start(&dir, "").await;
+
+    // Define two distinct groups so the ids resolve regardless of colorscheme.
+    exec_lua(
+        &rpc,
+        "nx.hl.define(0, 'FloatKey', { fg = '#7dcfff', bold = true })\n\
+         nx.hl.define(0, 'FloatDesc', { fg = '#565f89' })\n\
+         nx.ui.float({ { { 'w', 'FloatKey' }, { '  write', 'FloatDesc' } } }, { border = 'none' })",
+    )
+    .await;
+
+    let map = poll_float(&rpc, &mut incoming, |f| matches!(f, Value::Map(_)))
+        .await
+        .expect("a float redraw surface");
+    let float = float_of(&map);
+
+    // The plain text recovers verbatim from the chunk run.
+    assert_eq!(float_lines(&float), vec!["w  write"]);
+
+    // The row carries two chunks with DISTINCT, non-nil style ids.
+    let rows = match map_get(&float, "lines") {
+        Some(Value::Array(a)) => a.clone(),
+        other => panic!("expected lines array, got {other:?}"),
+    };
+    let chunks = line_chunks(&rows[0]);
+    assert_eq!(chunks.len(), 2, "two styled chunks: {chunks:?}");
+    assert_eq!(chunks[0].0, "w");
+    assert_eq!(chunks[1].0, "  write");
+    let key_id = chunks[0].1.expect("key chunk has a style id");
+    let desc_id = chunks[1].1.expect("desc chunk has a style id");
+    assert_ne!(key_id, desc_id, "key and description are styled distinctly");
+
+    // The key id resolves to the cyan + bold style we defined.
+    let styles = match map_get(&map, "styles") {
+        Some(Value::Array(a)) => a.clone(),
+        other => panic!("expected styles palette, got {other:?}"),
+    };
+    let key_style = styles[key_id as usize].as_map().expect("style is a map");
+    assert_eq!(
+        map_get(key_style, "fg").and_then(Value::as_u64),
+        Some(0x7dcfff),
+        "key chunk resolved to FloatKey's fg"
+    );
+    assert_eq!(
+        map_get(key_style, "bold").and_then(Value::as_bool),
+        Some(true),
+        "key chunk is bold"
+    );
 }
 
 #[tokio::test]

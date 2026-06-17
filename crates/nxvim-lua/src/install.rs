@@ -1512,11 +1512,19 @@ pub(crate) fn install_runtime_api(
             move |_,
                   (id, lines, title, border, relative): (
                 u64,
-                Vec<String>,
+                Vec<Table>,
                 Option<String>,
                 String,
                 String,
             )| {
+                // Each `lines` entry is a chunk list (`{ {text, hl}, … }`) — the Lua
+                // wrapper normalized plain-string lines to a single unstyled chunk —
+                // so a styled `nx.ui.float` caller (which-key) crosses the same path
+                // as extmark virt_text.
+                let lines = lines
+                    .iter()
+                    .map(virt_chunks_from_table)
+                    .collect::<mlua::Result<Vec<_>>>()?;
                 sh.borrow_mut().ui_floats.push(UiFloatReq {
                     id,
                     close: false,

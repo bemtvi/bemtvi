@@ -1387,7 +1387,26 @@
         const rowEl = document.createElement("div");
         rowEl.className = "row";
         rowEl.style.width = float.width * cw + "px";
-        rowEl.textContent = String(lines[i] ?? "").slice(0, float.width).padEnd(float.width);
+        // Each line is a chunk run `[[text, style_id], …]`: paint each chunk in its
+        // palette style (a styled which-key colours keys vs. descriptions and dims
+        // unavailable rows), clip to the box width, and pad the rest so the popup
+        // background fills the row. A plain caller's single un-styled chunk has a
+        // null id and renders in the default popup color.
+        let used = 0;
+        for (const [text, id] of (lines[i] || [])) {
+          if (used >= float.width) break;
+          const shown = String(text ?? "").slice(0, float.width - used);
+          if (!shown) continue;
+          used += shown.length;
+          const span = document.createElement("span");
+          const css = id != null ? styleToCss(paletteStyle(id)) : "";
+          if (css) span.style.cssText = css;
+          span.textContent = shown;
+          rowEl.appendChild(span);
+        }
+        if (used < float.width) {
+          rowEl.appendChild(document.createTextNode(" ".repeat(float.width - used)));
+        }
         box.appendChild(rowEl);
       }
       gridEl.appendChild(box);

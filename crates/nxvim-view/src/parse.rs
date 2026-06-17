@@ -384,6 +384,39 @@ pub(crate) fn parse_virt_lines(value: Option<&Value>) -> Vec<Option<Vec<VirtChun
         .unwrap_or_default()
 }
 
+/// Parse the content float's `lines` key: an array of chunk runs `[[text,
+/// style_id], …]` (the same per-row form as [`parse_virt_lines`], but every row is
+/// real content — no `Nil` filler rows). Each line is a styled run; a plain caller
+/// is one chunk with a `Nil` style id. Malformed chunks are dropped.
+pub(crate) fn parse_float_lines(value: Option<&Value>) -> Vec<Vec<VirtChunk>> {
+    value
+        .and_then(Value::as_array)
+        .map(|rows| {
+            rows.iter()
+                .map(|row| {
+                    row.as_array()
+                        .map(|chunks| {
+                            chunks
+                                .iter()
+                                .filter_map(|c| {
+                                    let c = c.as_array()?;
+                                    if c.len() != 2 {
+                                        return None;
+                                    }
+                                    Some((
+                                        c[0].as_str()?.to_string(),
+                                        c[1].as_u64().map(|id| id as usize),
+                                    ))
+                                })
+                                .collect()
+                        })
+                        .unwrap_or_default()
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 /// Parse the `inlay_hints` redraw key into per-row inline hints: each row is an
 /// array of `[col, text, style_id]` (empty for rows with none). Malformed entries
 /// are dropped. Same per-row-list shape as [`parse_diagnostics`], but each entry

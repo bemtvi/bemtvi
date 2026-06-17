@@ -229,7 +229,7 @@ impl EditHost {
     /// `hl_group` interned into the per-frame `styles` palette (`Nil` when absent or
     /// unresolved, so the client paints in normal colors). Shared by `virt_text` and
     /// `virt_lines`.
-    fn virt_chunks_value(&self, chunks: &[VirtChunk], styles: &mut StyleTable) -> Value {
+    pub(crate) fn virt_chunks_value(&self, chunks: &[VirtChunk], styles: &mut StyleTable) -> Value {
         let chunks: Vec<Value> = chunks
             .iter()
             .map(|c| {

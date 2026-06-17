@@ -293,7 +293,7 @@ pub(crate) fn render(
     // The list-less content float (`nx.ui.float`; LSP hover / signature help)
     // floats over the focused window's text area, on top, with no input focus.
     if let (Some(float), Some((inner, _, _))) = (&view.content_float, focused_inner) {
-        render_content_float(frame, inner, float);
+        render_content_float(frame, inner, float, &view.styles);
     }
 
     // A focused panel owns the cursor: draw it on the panel's current line and
@@ -2388,7 +2388,12 @@ fn render_menu(
 /// text-area-relative convention as the docs sidebar). No selection, no scrolling —
 /// the server already windowed the lines to `height`. A `None` border draws the
 /// content with no box.
-fn render_content_float(frame: &mut Frame, text_area: Rect, float: &nxvim_view::ContentFloatData) {
+fn render_content_float(
+    frame: &mut Frame,
+    text_area: Rect,
+    float: &nxvim_view::ContentFloatData,
+    styles: &[nxvim_view::Style],
+) {
     let bordered = float.border.is_some();
     let chrome = if bordered { 2 } else { 0 };
     let x = text_area.x.saturating_add(float.col);
@@ -2420,9 +2425,42 @@ fn render_content_float(frame: &mut Frame, text_area: Rect, float: &nxvim_view::
         .lines
         .iter()
         .take(inner.height as usize)
-        .map(|l| Line::from(Span::raw(pmenu_row(l, "", w))))
+        .map(|l| content_float_line(l, w, styles))
         .collect();
     frame.render_widget(Paragraph::new(Text::from(lines)), inner);
+}
+
+/// Build one content-float row from its chunk run: each chunk's text painted in
+/// its resolved style (the palette entry the server interned, else normal colors),
+/// truncated to the box width and padded out to it so the popup background fills
+/// the row. A plain caller's single un-styled chunk renders as plain text.
+fn content_float_line(
+    chunks: &[nxvim_view::VirtChunk],
+    width: usize,
+    styles: &[nxvim_view::Style],
+) -> Line<'static> {
+    let mut spans: Vec<Span> = Vec::new();
+    let mut painted = 0usize;
+    for (text, id) in chunks {
+        if painted >= width {
+            break;
+        }
+        let shown = truncate_to_width(text, width - painted);
+        if shown.is_empty() {
+            continue;
+        }
+        painted += str_width(&shown);
+        let style = id
+            .and_then(|i| styles.get(i))
+            .copied()
+            .map(rt)
+            .unwrap_or_default();
+        spans.push(Span::styled(shown, style));
+    }
+    if painted < width {
+        spans.push(Span::raw(" ".repeat(width - painted)));
+    }
+    Line::from(spans)
 }
 
 /// Draw the completion docs sidebar (Phase 4-D) as its own fully-bordered float at

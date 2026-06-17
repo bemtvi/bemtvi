@@ -98,8 +98,10 @@ pub struct PanelView {
 #[derive(Debug, Clone, PartialEq)]
 pub struct ContentFloatView {
     /// The content lines to render, in order (non-empty — an empty float never
-    /// opens). The server windows them to the available height.
-    pub lines: Vec<String>,
+    /// opens), each a run of styled [`VirtChunk`](crate::extmark::VirtChunk)s (a
+    /// plain caller is one unstyled chunk per line). The server windows them to the
+    /// available height and resolves each chunk's `hl_group` to a wire style id.
+    pub lines: Vec<Vec<crate::extmark::VirtChunk>>,
     /// An optional title drawn on the top border (`None` when untitled).
     pub title: Option<String>,
     /// The border style the client draws around the content.

@@ -15,9 +15,14 @@ use tokio::sync::mpsc::UnboundedReceiver;
 /// The which-key glue from `examples/which-key/init.lua`, verbatim in spirit but
 /// with a 0ms debounce (`which_key_delay`) so the popup opens on the next event
 /// loop tick instead of after the 200ms human pause.
-const WHICH_KEY: &str = r#"
+const WHICH_KEY: &str = r##"
 vim.g.mapleader = " "
 vim.g.which_key_delay = 0
+
+nx.hl.define(0, "WhichKey", { fg = "#7dcfff" })
+nx.hl.define(0, "WhichKeyGroup", { fg = "#bb9af7", bold = true })
+nx.hl.define(0, "WhichKeyDesc", { fg = "#c0caf5" })
+nx.hl.define(0, "WhichKeyDim", { fg = "#565f89", italic = true })
 
 nx.keymap.set("n", "<leader>w", function() end, { desc = "write" })
 nx.keymap.set("n", "<leader>q", function() end, { desc = "quit" })
@@ -28,7 +33,7 @@ local DELAY = vim.g.which_key_delay or 200
 
 local function lines_for(ctx)
   if #ctx.continuations == 0 then
-    return { string.format(" %s ", ctx.label or "…") }
+    return { { { string.format(" %s ", ctx.label or "…"), "WhichKeyDesc" } } }
   end
   local keyw = 1
   for _, c in ipairs(ctx.continuations) do
@@ -37,16 +42,22 @@ local function lines_for(ctx)
   local rows = {}
   for _, c in ipairs(ctx.continuations) do
     local pad = string.rep(" ", keyw - vim.fn.strdisplaywidth(c.key))
-    local label
+    local dim = c.available == false
+    local label, label_hl
     if c.kind == "group" then
       label = "+" .. (c.desc ~= "" and c.desc or "more")
+      label_hl = "WhichKeyGroup"
     else
       label = c.desc ~= "" and c.desc or ""
+      label_hl = "WhichKeyDesc"
     end
-    if c.available == false then
-      label = label .. "  (×)"
-    end
-    rows[#rows + 1] = string.format(" %s%s   %s ", c.key, pad, label)
+    rows[#rows + 1] = {
+      { " ", nil },
+      { c.key, dim and "WhichKeyDim" or "WhichKey" },
+      { pad .. "   ", nil },
+      { label, dim and "WhichKeyDim" or label_hl },
+      { " ", nil },
+    }
   end
   return rows
 end
@@ -75,7 +86,7 @@ nx.on_key_pending(function(ctx)
   end
   open(ctx)
 end)
-"#;
+"##;
 
 async fn start(init_lua: &str) -> (Rpc, std::path::PathBuf, UnboundedReceiver<Incoming>) {
     let dir = temp_dir("which_key");
@@ -113,14 +124,57 @@ async fn poll_float(
     None
 }
 
+/// Poll for the latest redraw whose `float` is an open map, returning the WHOLE
+/// redraw map (so a test can read the `styles` palette the float's style ids index,
+/// not just the float sub-map `poll_float` returns).
+async fn drain_to_latest_redraw_open(
+    rpc: &Rpc,
+    incoming: &mut UnboundedReceiver<Incoming>,
+) -> Vec<(Value, Value)> {
+    for _ in 0..60 {
+        nxvim_test_harness::barrier(rpc).await;
+        if let Some(map) = drain_to_latest_redraw(incoming, |m| {
+            matches!(map_get(m, "float"), Some(Value::Map(_)))
+        }) {
+            return map;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    panic!("no redraw with an open float arrived");
+}
+
 fn float_lines(float: &[(Value, Value)]) -> Vec<String> {
+    float_rows(float)
+        .iter()
+        .map(|row| {
+            row.iter()
+                .filter_map(|c| c.as_array()?.first()?.as_str().map(str::to_string))
+                .collect()
+        })
+        .collect()
+}
+
+/// The float's raw wire rows — each a chunk run `[[text, style_id], …]` (the
+/// `virt_lines` form a styled which-key ships). Lets a test read per-segment
+/// highlight, not just the flattened text [`float_lines`] returns.
+fn float_rows(float: &[(Value, Value)]) -> Vec<Vec<Value>> {
     match map_get(float, "lines") {
-        Some(Value::Array(a)) => a
+        Some(Value::Array(rows)) => rows
             .iter()
-            .map(|l| l.as_str().unwrap_or("").to_string())
+            .map(|row| row.as_array().cloned().unwrap_or_default())
             .collect(),
         other => panic!("expected lines array, got {other:?}"),
     }
+}
+
+/// The `(text, style_id)` pairs of one wire row.
+fn row_chunks(row: &[Value]) -> Vec<(String, Option<u64>)> {
+    row.iter()
+        .filter_map(|c| {
+            let c = c.as_array()?;
+            Some((c.first()?.as_str()?.to_string(), c.get(1)?.as_u64()))
+        })
+        .collect()
 }
 
 /// The shipped `examples/which-key` config sources cleanly and renders for real:
@@ -203,6 +257,149 @@ async fn leader_opens_the_popup_with_continuations() {
     );
     assert!(row >= 14, "bottom-anchored, not centered (row was {row})");
     assert!(col >= 40, "right-anchored, not centered (col was {col})");
+}
+
+/// Phase 4 — the "pretty" popup: each row is a styled chunk run, so the key, the
+/// `+`group label, and a plain description carry DISTINCT highlight groups (which
+/// resolve to the colours `lines_for` defines). Proof per-segment highlighting
+/// threads all the way from the example's chunk lines to the redraw wire.
+#[tokio::test]
+async fn rows_colour_keys_groups_and_descriptions() {
+    let (rpc, _dir, mut incoming) = start(WHICH_KEY).await;
+
+    feed(&rpc, "<Space>");
+    let map = drain_to_latest_redraw_open(&rpc, &mut incoming).await;
+    let float = match map_get(&map, "float") {
+        Some(Value::Map(f)) => f.clone(),
+        other => panic!("expected an open float, got {other:?}"),
+    };
+    let styles = match map_get(&map, "styles") {
+        Some(Value::Array(a)) => a.clone(),
+        other => panic!("expected styles palette, got {other:?}"),
+    };
+    let fg = |id: u64| {
+        styles[id as usize]
+            .as_map()
+            .and_then(|m| map_get(m, "fg"))
+            .and_then(Value::as_u64)
+    };
+
+    let rows = float_rows(&float);
+    // Rows are sorted f, q, w. The `f` row is a GROUP (+more); `w` is a plain map.
+    let f_row = row_chunks(&rows[0]);
+    let w_row = row_chunks(&rows[2]);
+
+    // The key chunk and the description chunk are separate, distinctly-styled spans.
+    let f_key = f_row.iter().find(|(t, _)| t == "f").expect("f key chunk");
+    let f_label = f_row
+        .iter()
+        .find(|(t, _)| t == "+more")
+        .expect("+more group chunk");
+    let w_key = w_row.iter().find(|(t, _)| t == "w").expect("w key chunk");
+    let w_label = w_row
+        .iter()
+        .find(|(t, _)| t == "write")
+        .expect("write desc chunk");
+
+    // Keys are WhichKey (cyan #7dcfff); a group label is WhichKeyGroup (#bb9af7);
+    // a plain description is WhichKeyDesc (#c0caf5) — three distinct colours.
+    assert_eq!(fg(f_key.1.expect("f key styled")), Some(0x7dcfff));
+    assert_eq!(fg(w_key.1.expect("w key styled")), Some(0x7dcfff));
+    assert_eq!(fg(f_label.1.expect("group styled")), Some(0xbb9af7));
+    assert_eq!(fg(w_label.1.expect("desc styled")), Some(0xc0caf5));
+    assert_ne!(
+        f_label.1, w_label.1,
+        "a +group label and a plain description are coloured differently"
+    );
+}
+
+/// Phase 4 — a continuation kept visible but no longer firable (a `g`-map after the
+/// leader timeout commits `g` to the built-in grammar) is DIMMED with the
+/// `WhichKeyDim` group, rather than cued with a trailing `(×)`. The example no
+/// longer appends any marker text — the colour carries the meaning.
+#[tokio::test]
+async fn timed_out_g_map_row_is_dimmed_not_text_cued() {
+    let (rpc, _dir, mut incoming) = start(WHICH_KEY).await;
+
+    feed(&rpc, "g"); // withheld `g`: LSP gd/gD/gr maps + built-in motions
+    drain_to_latest_redraw_open(&rpc, &mut incoming).await;
+    // The idle flush commits `g` to the built-in grammar; the maps stay listed but
+    // unavailable (the which-key keeps them visible, now dimmed). After `g`, the
+    // continuation key is `d` (relative to the prefix), so locate the map by its
+    // description. Poll until the dimmed frame lands — the flush → debounced repaint
+    // settles a tick after the available frame.
+    rpc.request("nxvim_input_flush", vec![])
+        .await
+        .expect("input flush");
+
+    // The fg of the "Go to definition" label chunk, when the float is open — or None.
+    let go_to_def_fg = |map: &[(Value, Value)]| -> Option<u64> {
+        let Some(Value::Map(float)) = map_get(map, "float") else {
+            return None;
+        };
+        let Some(Value::Array(styles)) = map_get(float, "styles").or(map_get(map, "styles")) else {
+            return None;
+        };
+        let id = float_rows(float)
+            .iter()
+            .map(|r| row_chunks(r))
+            .find(|cs| cs.iter().any(|(t, _)| t == "Go to definition"))?
+            .iter()
+            .find(|(t, _)| t == "Go to definition")
+            .and_then(|(_, id)| *id)?;
+        styles
+            .get(id as usize)?
+            .as_map()
+            .and_then(|m| map_get(m, "fg"))
+            .and_then(Value::as_u64)
+    };
+
+    let mut dimmed = None;
+    for _ in 0..60 {
+        nxvim_test_harness::barrier(&rpc).await;
+        if let Some(map) =
+            drain_to_latest_redraw(&mut incoming, |m| go_to_def_fg(m) == Some(0x565f89))
+        {
+            dimmed = Some(map);
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    let map = dimmed.expect("the gd map row dims to WhichKeyDim after the timeout");
+    let float = match map_get(&map, "float") {
+        Some(Value::Map(f)) => f.clone(),
+        other => panic!("expected an open float, got {other:?}"),
+    };
+    let styles = match map_get(&map, "styles") {
+        Some(Value::Array(a)) => a.clone(),
+        other => panic!("expected styles palette, got {other:?}"),
+    };
+    let dim_id = float_rows(&float)
+        .iter()
+        .map(|r| row_chunks(r))
+        .find(|cs| cs.iter().any(|(t, _)| t == "Go to definition"))
+        .and_then(|cs| {
+            cs.iter()
+                .find(|(t, _)| t == "Go to definition")
+                .and_then(|(_, id)| *id)
+        })
+        .expect("the dimmed label is styled");
+    let dim = styles[dim_id as usize].as_map().expect("dim style map");
+    assert_eq!(
+        map_get(dim, "fg").and_then(Value::as_u64),
+        Some(0x565f89),
+        "the unavailable map is dimmed"
+    );
+    assert_eq!(
+        map_get(dim, "italic").and_then(Value::as_bool),
+        Some(true),
+        "WhichKeyDim is italic"
+    );
+    let joined: String = float_lines(&float).join("\n");
+    assert!(
+        !joined.contains("(×)"),
+        "no text cue — the dim colour carries it: {joined}"
+    );
 }
 
 /// Descending into a group repaints the SAME popup to that group's keys — the

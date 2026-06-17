@@ -2247,12 +2247,39 @@ impl Renderer {
         } else {
             (bx, by)
         };
+        let w = float.width as usize;
         for (i, line) in float.lines.iter().enumerate() {
             if i as u16 >= float.height {
                 break;
             }
-            let text = pmenu_row(line, "", float.width as usize);
-            self.push_plain(items, &text, self.cell_px(cx, cy + i as u16), fg, full);
+            // Each chunk paints its text in its resolved style (fg + bold/italic),
+            // falling back to the popup's normal fg; a plain caller's single
+            // un-styled chunk is just normal text. Pad the row to the box width so
+            // the popup background fills it (matching the TUI's `pmenu_row`).
+            let mut segs: Vec<Seg> = Vec::new();
+            let mut chars = 0usize;
+            for (text, id) in line {
+                if chars >= w {
+                    break;
+                }
+                let shown: String = text.chars().take(w - chars).collect();
+                if shown.is_empty() {
+                    continue;
+                }
+                chars += shown.chars().count();
+                let st = id.and_then(|id| view.styles.get(id));
+                segs.push(Seg {
+                    fg: st.and_then(|s| s.fg).unwrap_or(fg),
+                    bg: st.and_then(|s| s.bg),
+                    bold: st.is_some_and(|s| s.bold),
+                    italic: st.is_some_and(|s| s.italic),
+                    text: shown,
+                });
+            }
+            if chars < w {
+                segs.push(Seg::plain(" ".repeat(w - chars), fg));
+            }
+            self.push_text(items, &segs, self.cell_px(cx, cy + i as u16), fg, full);
         }
     }
 

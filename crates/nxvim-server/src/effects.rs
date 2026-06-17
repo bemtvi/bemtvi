@@ -620,13 +620,24 @@ impl EditHost {
                     continue;
                 }
             };
-            if req.id == 0 {
-                self.editor
-                    .open_content_float(req.lines, req.title, border, placement);
-            } else {
-                self.editor
-                    .open_persistent_float(req.lines, req.title, border, placement, req.id);
-            }
+            // Lower each chunk line (`VirtChunkData`) into core's `VirtChunk`, the
+            // same chunk type `virt_lines` / `virt_text` use, so the float renders
+            // styled spans. A plain caller's single unstyled chunk resolves to
+            // normal colors. `id == 0` is transient, non-zero a persistent handle.
+            let lines: Vec<Vec<nxvim_core::VirtChunk>> = req
+                .lines
+                .into_iter()
+                .map(|line| {
+                    line.into_iter()
+                        .map(|c| nxvim_core::VirtChunk {
+                            text: c.text,
+                            hl_group: c.hl_group,
+                        })
+                        .collect()
+                })
+                .collect();
+            self.editor
+                .open_styled_float(lines, req.title, border, placement, req.id);
         }
         // `nx.picker.open`: open the centered fuzzy-finder widget and kick the
         // source's initial run (generation 0, empty query). The source streams

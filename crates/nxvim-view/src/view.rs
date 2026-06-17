@@ -10,10 +10,10 @@ use rmpv::Value;
 use crate::parse::{
     chrome_style, map_get, map_str, map_str_array, map_u16, map_u64, parse_border,
     parse_cursor_list, parse_diagnostics, parse_diagnostics_signs, parse_diagnostics_virt,
-    parse_highlights, parse_inlay_hints, parse_multi_spans, parse_numbers, parse_pair,
-    parse_pmenu_items, parse_spans, parse_status, parse_styles, parse_virt_lines, parse_virt_text,
-    DiagSign, DiagSpan, DiagVirt, HlSpan, IncSearchSpans, InlayHint, PmenuItem, SearchSpans,
-    StatusSegment, VirtChunk, VirtPlacement,
+    parse_float_lines, parse_highlights, parse_inlay_hints, parse_multi_spans, parse_numbers,
+    parse_pair, parse_pmenu_items, parse_spans, parse_status, parse_styles, parse_virt_lines,
+    parse_virt_text, DiagSign, DiagSpan, DiagVirt, HlSpan, IncSearchSpans, InlayHint, PmenuItem,
+    SearchSpans, StatusSegment, VirtChunk, VirtPlacement,
 };
 use crate::style::{Border, Style};
 
@@ -440,8 +440,11 @@ pub struct MenuData {
 /// own bordered box, like [`MenuDocs`] but standalone. See [`View::content_float`].
 #[derive(Clone)]
 pub struct ContentFloatData {
-    /// The content lines (already windowed to `height`). Plain text, like a hover.
-    pub lines: Vec<String>,
+    /// The content lines (already windowed to `height`), each a run of styled
+    /// [`VirtChunk`]s (`(text, style_id)`, the `virt_lines` wire form): a plain
+    /// caller is one un-styled chunk per line, while a styled caller (which-key)
+    /// colours keys vs. descriptions. `style_id` indexes [`View::styles`].
+    pub lines: Vec<Vec<VirtChunk>>,
     /// The float's content top-left, **text-area-relative**.
     pub row: u16,
     pub col: u16,
@@ -671,7 +674,7 @@ impl View {
         };
         self.content_float = match map_get(map, "float") {
             Some(Value::Map(f)) => Some(ContentFloatData {
-                lines: map_str_array(f, "lines"),
+                lines: parse_float_lines(map_get(f, "lines")),
                 row: map_u16(f, "row"),
                 col: map_u16(f, "col"),
                 width: map_u16(f, "width"),

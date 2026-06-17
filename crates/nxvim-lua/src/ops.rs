@@ -1038,7 +1038,11 @@ pub struct UiFloatReq {
     pub close: bool,
     /// The content lines to render, in order (non-empty for an open: the Lua
     /// wrapper resolves empty content to a no-op / close without queuing an open).
-    pub lines: Vec<String>,
+    /// Each line is a run of [`VirtChunkData`] chunks (`{ {text, hl}, … }`) — a
+    /// plain-string line is normalized Lua-side to one unstyled chunk, while a
+    /// styled caller (which-key) builds runs so the server can colour keys vs.
+    /// descriptions and dim unavailable rows.
+    pub lines: Vec<Vec<VirtChunkData>>,
     /// The title drawn on the top border (`opts.title`), or `None` when untitled.
     pub title: Option<String>,
     /// The border keyword (`opts.border`, defaulted to `"rounded"` by the wrapper):

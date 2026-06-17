@@ -201,22 +201,82 @@ function nx.ui.confirm(message, opts, on_choice)
 end
 
 -- ----- nx.ui.float -----------------------------------------------------------
--- Normalize `contents` (a string split on newlines, or a list of line strings)
--- into a line list, dropping a single trailing empty line so a markdown body
--- ending in "\n" doesn't render a blank last row. Errors loud on a bad type.
+-- The "chunk" form a styled line is built from: `{ text, hl_group? }`, exactly
+-- neovim's virt_text / nvim_echo chunk (a string + an optional highlight group).
+-- A line is a LIST of these chunks, so one row can colour the key one group and
+-- its description another. A plain string row is normalized to a single un-grouped
+-- chunk, so a renderer that ignores styling still shows the text.
+--
+-- Detect a chunk list (`{ {text, hl}, … }`) vs. a plain row: a chunk list's first
+-- element is itself a table whose [1] is a string. An empty table is treated as a
+-- (blank) chunk list — it renders nothing either way.
+local function is_chunk_list(l)
+  if type(l) ~= "table" then
+    return false
+  end
+  if l[1] == nil then
+    return true
+  end
+  return type(l[1]) == "table"
+end
+
+-- Normalize one chunk list into `{ {text, hl}, … }` with string text and a string
+-- (or nil) group, erroring loud on a malformed chunk — the server parses the same
+-- shape as extmark virt_text.
+local function normalize_chunks(l)
+  local chunks = {}
+  for i, c in ipairs(l) do
+    if type(c) ~= "table" or type(c[1]) ~= "string" then
+      error("nx.ui.float: a styled line must be a list of { text, hl_group? } chunks", 3)
+    end
+    if c[2] ~= nil and type(c[2]) ~= "string" then
+      error("nx.ui.float: a chunk's hl_group must be a string", 3)
+    end
+    chunks[i] = { c[1], c[2] }
+  end
+  return chunks
+end
+
+-- The concatenated plain text of a normalized chunk line (for the trailing-blank
+-- drop below).
+local function chunk_text(chunks)
+  local parts = {}
+  for i, c in ipairs(chunks) do
+    parts[i] = c[1]
+  end
+  return table.concat(parts)
+end
+
+-- Normalize `contents` into a list of chunk LINES (each `{ {text, hl}, … }`),
+-- dropping a single trailing empty line so a markdown body ending in "\n" doesn't
+-- render a blank last row. Accepts:
+--   * a string                  → split on newlines, each a single plain chunk
+--   * a list of strings         → each a single plain chunk
+--   * a list of chunk lists     → styled rows, passed through (key/desc colours)
+--   * a mix of the two row forms
+-- Errors loud on a bad type.
 local function float_lines(contents)
   local lines
   if type(contents) == "string" then
-    lines = vim.split(contents, "\n", { plain = true })
+    lines = {}
+    for i, s in ipairs(vim.split(contents, "\n", { plain = true })) do
+      lines[i] = { { s } }
+    end
   elseif type(contents) == "table" then
     lines = {}
     for i, l in ipairs(contents) do
-      lines[i] = tostring(l)
+      if type(l) == "string" then
+        lines[i] = { { l } }
+      elseif is_chunk_list(l) then
+        lines[i] = normalize_chunks(l)
+      else
+        lines[i] = { { tostring(l) } }
+      end
     end
   else
-    error("nx.ui.float: contents must be a string or a list of strings", 2)
+    error("nx.ui.float: contents must be a string or a list of strings/chunk lines", 2)
   end
-  if #lines > 1 and lines[#lines] == "" then
+  if #lines > 1 and chunk_text(lines[#lines]) == "" then
     lines[#lines] = nil
   end
   return lines
@@ -253,8 +313,13 @@ end
 
 -- nx.ui.float(contents, opts): open the list-less content float — the sibling of
 -- the selectable-list widget (docs/specs/2026-06-14-nx-ui-float-widget.md, "What
--- stays out of this widget") — rendering plain content with no list / selection.
--- `contents` is a string (split on newlines) or a list of line strings. `opts`:
+-- stays out of this widget") — rendering content with no list / selection.
+-- `contents` is a string (split on newlines), a list of line strings, or — for a
+-- styled float (the "pretty" which-key) — a list where a row may be a CHUNK LIST
+-- `{ {text, hl_group?}, … }` (neovim's virt_text shape): each chunk paints its
+-- text in `hl_group`, so a row can colour its key one group and its description
+-- another, or dim a whole row with a `Comment`/dim group. Plain and chunk rows mix
+-- freely; a plain row is just one un-grouped chunk. `opts`:
 --   border   = "none"|"single"|"rounded"|"double"|"solid"  (default "rounded")
 --   title    = a string drawn on the top border (optional)
 --   relative = "cursor" (default, anchors at the cursor) | "editor" (centered) |

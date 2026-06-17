@@ -1,12 +1,14 @@
 # KeyPending Source B — the built-in command grammar as which-key hints
 
-**Status:** Phases 1–3 COMPLETE (2026-06-16). Phase 1 — mechanism + all `Stage`
+**Status:** Phases 1–4 COMPLETE (2026-06-16). Phase 1 — mechanism + all `Stage`
 labels + find-char. Phase 2 — enumerated `g`/`z`/`<C-w>`/`<C-w><C-w>` continuations
 + the A+B merge for shared prefixes (`g` + the LSP defaults) + the `available` flag
 for timed-out maps. Phase 3 — the remaining built-in states (operator-pending
-motions, text objects, registers, marks) + descriptive `keys — label` titles. Tested
-end to end (key_pending + which_key suites, full workspace green). Phase 4 (inline
-float highlighting for a "pretty" which-key) is the only open item.
+motions, text objects, registers, marks) + descriptive `keys — label` titles.
+Phase 4 — per-segment inline float highlighting: `nx.ui.float` content lines may now
+be chunk runs (`{ {text, hl_group}, … }`), so the which-key example colours keys vs.
+group labels vs. descriptions and DIMS timed-out maps (no more `(×)` cue). Tested end
+to end (key_pending + which_key + ui_float suites, full workspace green).
 **Depends on:** the `nx.on_key_pending` oracle (sources A + C landed); see
 `crates/nxvim-server/src/keymap.rs` (`KeyPending`/`Continuation`/`pending_context`)
 and `effects.rs::emit_key_pending`.
@@ -173,19 +175,34 @@ Two things made the popup cryptic: open-set states showed only a bare label (`d`
    motion list overflows the popup on 80×24 — the example is single-column; a
    columned/paged layout is a `nx.ui.float` capability question, see Phase 4.
 
-## Phase 4 (TODO) — inline float highlighting for a "pretty" which-key
+## Phase 4 (DONE 2026-06-16) — inline float highlighting for a "pretty" which-key
 
-`nx.ui.float` content is plain `Vec<String>` lines rendered single-style (only the
-selectable-list `Menu` has per-row highlight). So the which-key example can only
+`nx.ui.float` content was plain `Vec<String>` lines rendered single-style (only the
+selectable-list `Menu` had per-row highlight). So the which-key example could only
 *text-cue* an unavailable row (a trailing `(×)`), not truly **gray** it — and more
-broadly a which-key can't colour keys vs. descriptions, group `+prefix` labels, etc.
+broadly a which-key couldn't colour keys vs. descriptions, group `+prefix` labels.
 
-**The capability to add:** per-line (ideally per-segment) highlight groups on content
-floats, so a float caller can attach a highlight-group to a line/span. This threads
-`ContentFloat` (core) → `ContentFloatView` (view) → `ContentFloatData`
-(nxvim-view) → the three renderers (TUI `render_content_float`, GUI
-`build_content_float`, web `renderContentFloat`), each mapping the group → a real
-style (a renderer that ignores the field degrades gracefully to plain text). Once it
-lands, which-key dims `available == false` rows with a `Comment`/dim group (drop the
-`(×)` cue) and can style the whole popup — the "pretty which-key" the maps were kept
-visible for.
+**What landed — per-SEGMENT highlighting, reusing the `virt_lines` machinery.** A
+content-float line is now a **chunk run** (`Vec<Vec<VirtChunk>>`), the same shape
+`virt_text`/`virt_lines` already use, rather than a bare `String`. Each chunk is
+`{ text, hl_group? }`; the server resolves `hl_group` → a per-frame style id and
+ships `[[text, style_id], …]` (the existing `virt_chunks_value` + `StyleTable`), so a
+renderer that already paints `virt_lines` style ids needs almost no new code.
+
+Threaded: `nx.ui.float` (Lua `float_lines` normalizes a string row, a chunk-list row,
+or a mix) → `_ui_float` (`Vec<Vec<VirtChunkData>>`, parsed by the existing
+`virt_chunks_from_table`) → `UiFloatReq` → `effects.rs` lowers to `VirtChunk` →
+`Editor::open_styled_float` → `ContentFloat`/`ContentFloatView`
+(`Vec<Vec<VirtChunk>>`) → `project_content_float` (geometry from summed chunk widths;
+emits chunk runs) → `ContentFloatData` + `parse_float_lines` (nxvim-view) → the three
+renderers (TUI `content_float_line` via `rt`/the palette, GUI `Seg` runs, web per-
+chunk `<span>` + `styleToCss`). A plain caller (LSP hover/signature via
+`open_content_float(Vec<String>)`) becomes one un-styled chunk per line → `Nil` style
+id → normal colors, so nothing regressed.
+
+The which-key example now defines `WhichKey`/`WhichKeyGroup`/`WhichKeyDesc`/
+`WhichKeyDim` groups and emits chunked rows: keys cyan, `+prefix` groups purple-bold,
+descriptions light, and timed-out `available == false` maps **dimmed** (the `(×)`
+text cue is gone — the colour carries it). Tested: `ui_float`
+(`styled_chunk_lines_carry_per_segment_highlights`) and `which_key`
+(`rows_colour_keys_groups_and_descriptions`, `timed_out_g_map_row_is_dimmed_not_text_cued`).

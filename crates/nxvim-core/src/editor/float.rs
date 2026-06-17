@@ -13,14 +13,32 @@
 use super::menu::MenuPlacement;
 use super::windows::BorderStyle;
 use super::Editor;
+use crate::extmark::VirtChunk;
 use crate::view::ContentFloatView;
 
-/// An open content float: the lines to render, an optional title drawn on the top
-/// border, the border style, and whether it anchors at the cursor or centers over
-/// the editor. No selection or query state — it is display-only.
+/// Wrap plain text lines (the LSP hover / signature surface, and any caller with
+/// no styling to express) into the chunked content-float form: one unstyled
+/// [`VirtChunk`] per line. A styled caller (`nx.ui.float` with chunk lines —
+/// which-key) builds its own runs instead.
+pub(crate) fn plain_float_lines(lines: Vec<String>) -> Vec<Vec<VirtChunk>> {
+    lines
+        .into_iter()
+        .map(|text| {
+            vec![VirtChunk {
+                text,
+                hl_group: None,
+            }]
+        })
+        .collect()
+}
+
+/// An open content float: the lines to render (each a run of styled
+/// [`VirtChunk`]s, like `virt_lines`), an optional title drawn on the top border,
+/// the border style, and whether it anchors at the cursor or centers over the
+/// editor. No selection or query state — it is display-only.
 #[derive(Clone, Debug)]
 pub(crate) struct ContentFloat {
-    pub lines: Vec<String>,
+    pub lines: Vec<Vec<VirtChunk>>,
     pub title: Option<String>,
     pub border: BorderStyle,
     pub placement: MenuPlacement,
@@ -36,10 +54,11 @@ pub(crate) struct ContentFloat {
 }
 
 impl Editor {
-    /// Open a **transient** content float rendering `lines` (hover markup, a
-    /// signature, or a non-`persist` `nx.ui.float` caller's content). An empty
-    /// `lines` opens nothing (and clears any open float) — there is no empty popup.
-    /// Replaces any float already open. Non-grabbing: the next key dismisses it.
+    /// Open a **transient** content float from plain text `lines` (the LSP hover /
+    /// signature surface). An empty `lines` opens nothing (and clears any open
+    /// float) — there is no empty popup. Replaces any float already open.
+    /// Non-grabbing: the next key dismisses it. Styled callers go through
+    /// [`Editor::open_styled_float`].
     pub fn open_content_float(
         &mut self,
         lines: Vec<String>,
@@ -47,28 +66,30 @@ impl Editor {
         border: BorderStyle,
         placement: MenuPlacement,
     ) {
-        self.set_content_float(lines, title, border, placement, 0, false);
+        self.set_content_float(plain_float_lines(lines), title, border, placement, 0, false);
     }
 
-    /// Open a **persistent** content float (`nx.ui.float{ persist = true }`),
-    /// keyed by handle `id`. Unlike the transient form it survives keystrokes —
-    /// `input()` leaves it untouched — until `close_content_float_id(id)` or a
-    /// replacement. An `:update` from the same handle re-enters here with the same
-    /// `id`, replacing the content in place. An empty `lines` closes it.
-    pub fn open_persistent_float(
+    /// Open a content float from chunked `lines` (`nx.ui.float`) — each line a run
+    /// of styled [`VirtChunk`]s, so a caller (which-key) can colour keys vs.
+    /// descriptions and dim unavailable rows. `id == 0` is the transient default
+    /// (dismissed by the next key); a non-zero `id` is a **persistent** float (a
+    /// `persist`-flagged handle) — it survives keystrokes until
+    /// `close_content_float_id(id)` or a replacement, and an `:update` from the same
+    /// handle re-enters here with the same `id`. An empty `lines` closes it.
+    pub fn open_styled_float(
         &mut self,
-        lines: Vec<String>,
+        lines: Vec<Vec<VirtChunk>>,
         title: Option<String>,
         border: BorderStyle,
         placement: MenuPlacement,
         id: u64,
     ) {
-        self.set_content_float(lines, title, border, placement, id, true);
+        self.set_content_float(lines, title, border, placement, id, id != 0);
     }
 
     fn set_content_float(
         &mut self,
-        lines: Vec<String>,
+        lines: Vec<Vec<VirtChunk>>,
         title: Option<String>,
         border: BorderStyle,
         placement: MenuPlacement,

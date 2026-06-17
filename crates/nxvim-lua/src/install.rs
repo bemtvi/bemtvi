@@ -19,12 +19,12 @@ use crate::convert::{
 };
 use crate::host::{get_runtime_file, stdpath};
 use crate::ops::{
-    BufOp, CompletePush, CompleteSetupReq, ConfirmReq, DecorMark, DecorPublish, DockOp, ExtmarkOp,
-    FeedKeysOp, FsJob, GlobalOptionOp, HlSet, LayerOp, LoopOp, LspOp, OptionValue, PanelOp,
-    PickerOpenReq, PickerPush, PreviewPush, QfItem, QfSetOp, RegisterSetOp, SnippetAddReq,
-    SnippetSetupReq, StatuslineKind, StatuslinePublishReq, StatuslineSetupReq, StatuslineTarget,
-    TabOp, TerminalOpenReq, TsOp, UiFloatReq, UiInputReq, UiSelectReq, ViewOp, VirtChunkData,
-    VirtDecorData, WindowOp,
+    BufOp, CompletePush, CompleteSetupReq, ConfirmReq, DecorMark, DecorPublish, DiagnosticData,
+    DockOp, ExtmarkOp, FeedKeysOp, FsJob, GlobalOptionOp, HlSet, LayerOp, LoopOp, LspOp,
+    OptionValue, PanelOp, PickerOpenReq, PickerPush, PreviewPush, QfItem, QfSetOp, RegisterSetOp,
+    SnippetAddReq, SnippetSetupReq, StatuslineKind, StatuslinePublishReq, StatuslineSetupReq,
+    StatuslineTarget, TabOp, TerminalOpenReq, TsOp, UiFloatReq, UiInputReq, UiSelectReq, ViewOp,
+    VirtChunkData, VirtDecorData, WindowOp,
 };
 use crate::runtime::Shared;
 use crate::vimregex;
@@ -1259,6 +1259,39 @@ pub(crate) fn install_runtime_api(
                 Ok(())
             },
         )?,
+    )?;
+
+    // `nx._set_client_diagnostics(bufnr, list)`: queue [`LspOp::SetClientDiagnostics`]
+    // — replace `bufnr`'s server-side render store with the prelude-flattened
+    // client-set diagnostics (every namespace merged into one list). The prelude
+    // normalizes each entry to the `{lnum,col,end_lnum,end_col,severity,message,
+    // source}` shape before pushing, so the fields are always present; positions
+    // are native byte columns. An empty `list` clears the buffer's store.
+    let sh = shared.clone();
+    nx.set(
+        "_set_client_diagnostics",
+        lua.create_function(move |_, (bufnr, list): (u64, Vec<Table>)| {
+            let diags = list
+                .into_iter()
+                .map(|d| {
+                    let lnum: i64 = d.get("lnum")?;
+                    let col: i64 = d.get("col")?;
+                    Ok(DiagnosticData {
+                        lnum,
+                        col,
+                        end_lnum: d.get("end_lnum").unwrap_or(lnum),
+                        end_col: d.get("end_col").unwrap_or(col),
+                        severity: d.get("severity").unwrap_or(1),
+                        message: d.get("message").unwrap_or_default(),
+                        source: d.get("source").ok(),
+                    })
+                })
+                .collect::<mlua::Result<Vec<_>>>()?;
+            sh.borrow_mut()
+                .lsp_ops
+                .push(LspOp::SetClientDiagnostics { bufnr, diags });
+            Ok(())
+        })?,
     )?;
 
     // `nx._lsp_client_request(client_id, method, params, cb_id)`: queue a generic

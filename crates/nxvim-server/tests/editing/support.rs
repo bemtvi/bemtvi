@@ -365,6 +365,61 @@ pub fn view_secondary_selection(view: &[(Value, Value)]) -> Vec<Vec<(u64, u64)>>
         .unwrap_or_default()
 }
 
+/// Per visible row, the diagnostic underline spans as `(start_col, end_col,
+/// severity)` (the `style_id` is dropped). Empty inner vecs for rows with none.
+pub fn view_diag_spans(view: &[(Value, Value)]) -> Vec<Vec<(u64, u64, u64)>> {
+    view_get(view, "diagnostics")
+        .and_then(Value::as_array)
+        .map(|a| {
+            a.iter()
+                .map(|row| {
+                    row.as_array()
+                        .map(|spans| {
+                            spans
+                                .iter()
+                                .filter_map(|v| {
+                                    let s = v.as_array()?;
+                                    Some((
+                                        s.first()?.as_u64()?,
+                                        s.get(1)?.as_u64()?,
+                                        s.get(2)?.as_u64()?,
+                                    ))
+                                })
+                                .collect()
+                        })
+                        .unwrap_or_default()
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Per visible row, the gutter sign as `(glyph, severity)`, or `None` when the
+/// row carries none. Shared shape for `diagnostics_signs` / `diagnostics_virt`.
+fn view_diag_pairs(view: &[(Value, Value)], key: &str) -> Vec<Option<(String, u64)>> {
+    view_get(view, key)
+        .and_then(Value::as_array)
+        .map(|a| {
+            a.iter()
+                .map(|row| {
+                    let s = row.as_array()?;
+                    Some((s.first()?.as_str()?.to_string(), s.get(1)?.as_u64()?))
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Per visible row, the diagnostic gutter sign `(glyph, severity)` or `None`.
+pub fn view_diag_signs(view: &[(Value, Value)]) -> Vec<Option<(String, u64)>> {
+    view_diag_pairs(view, "diagnostics_signs")
+}
+
+/// Per visible row, the inline diagnostic virtual text `(text, severity)` or `None`.
+pub fn view_diag_virt(view: &[(Value, Value)]) -> Vec<Option<(String, u64)>> {
+    view_diag_pairs(view, "diagnostics_virt")
+}
+
 pub fn view_str(view: &[(Value, Value)], key: &str) -> String {
     view_get(view, key)
         .and_then(Value::as_str)

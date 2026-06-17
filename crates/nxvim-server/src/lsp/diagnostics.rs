@@ -33,6 +33,35 @@ impl EditHost {
         Some((&state.diagnostics, encoding))
     }
 
+    /// Every diagnostic to project for `buffer`, each paired with the position
+    /// encoding its `character` columns are authored in. Two sources are merged:
+    /// the LSP server's published set (at the server's *negotiated* encoding) and
+    /// the client-set (`vim.diagnostic.set`) set, which has no server and so is
+    /// already in nxvim's native bytes — tagged [`PositionEncoding::Utf8`] so the
+    /// shared byte-column conversion ([`EditHost::diag_row_span`]) is the identity.
+    /// Unlike [`EditHost::diagnostics_of`] this also yields client-set diagnostics
+    /// for a buffer with *no attached server*, so the render surfaces aren't gated
+    /// on an LSP. Empty when the buffer has neither source.
+    pub(crate) fn diagnostics_merged(
+        &self,
+        buffer: nxvim_core::BufferId,
+    ) -> Vec<(&Diagnostic, PositionEncoding)> {
+        let mut out = Vec::new();
+        if let Some((diags, encoding)) = self.diagnostics_of(buffer) {
+            out.extend(diags.iter().map(|d| (d, encoding)));
+        }
+        if let Some(diags) = self.client_diagnostics.get(&buffer) {
+            out.extend(diags.iter().map(|d| (d, PositionEncoding::Utf8)));
+        }
+        out
+    }
+
+    /// [`EditHost::diagnostics_merged`] for the current buffer — the merged set the
+    /// cursor-anchored surfaces (under-cursor message, `goto`, float, loclist) read.
+    pub(crate) fn current_diagnostics_merged(&self) -> Vec<(&Diagnostic, PositionEncoding)> {
+        self.diagnostics_merged(self.editor.current_buffer_id())
+    }
+
     /// Build the per-row `diagnostics` redraw payload from a row→buffer-line
     /// mapping (`numbers`, 1-based, `None` for filler): each visible row's
     /// diagnostic underline spans as `[start_col, end_col, severity, style_id]`
@@ -49,12 +78,10 @@ impl EditHost {
     /// buffer has no language server / no diagnostics.
     pub(crate) fn diag_counts_for(&self, buffer: nxvim_core::BufferId) -> [usize; 4] {
         let mut counts = [0usize; 4];
-        if let Some((diags, _)) = self.diagnostics_of(buffer) {
-            for d in diags {
-                let sev = super::severity_code(d.severity); // 1=error … 4=hint
-                if (1..=4).contains(&sev) {
-                    counts[(sev - 1) as usize] += 1;
-                }
+        for (d, _) in self.diagnostics_merged(buffer) {
+            let sev = super::severity_code(d.severity); // 1=error … 4=hint
+            if (1..=4).contains(&sev) {
+                counts[(sev - 1) as usize] += 1;
             }
         }
         counts
@@ -68,17 +95,15 @@ impl EditHost {
     ) -> Value {
         // `vim.diagnostic.config({ underline = false })` hides the squiggles; the
         // message line and the location list (other surfaces) are unaffected.
-        let diags_encoding = if self.diag_config.underline {
-            self.diagnostics_of(buffer)
-        } else {
-            None
-        };
-        let buf = self.editor.buffer_of(buffer);
-        let Some((diags, encoding)) = diags_encoding else {
+        if !self.diag_config.underline {
             // One empty entry per row so the client's `diagnostics[row]` index
             // stays aligned with `highlights`/`numbers`.
             return Value::Array(segs.iter().map(|_| Value::Array(Vec::new())).collect());
-        };
+        }
+        let buf = self.editor.buffer_of(buffer);
+        // The LSP-pushed and client-set sets merged; each diagnostic carries the
+        // encoding its columns are in (the client-set ones are native UTF-8).
+        let diags = self.diagnostics_merged(buffer);
         // Tab width is the rendered window's buffer's `tabstop` (it may differ
         // from the current buffer's), so the underline columns line up with the
         // text the client paints for that window.
@@ -97,9 +122,9 @@ impl EditHost {
                 };
                 let spans = diags
                     .iter()
-                    .filter_map(|d| {
+                    .filter_map(|(d, encoding)| {
                         let (start_byte, end_byte) =
-                            self.diag_row_span(d, encoding, line_idx, &text)?;
+                            self.diag_row_span(d, *encoding, line_idx, &text)?;
                         let start_col = unicode::virtcol(&text, start_byte, tabstop);
                         let mut end_col = unicode::virtcol(&text, end_byte, tabstop);
                         // A zero-width range (e.g. an empty span at end-of-line)
@@ -146,16 +171,14 @@ impl EditHost {
         segs: &[crate::redraw::RowSeg],
         styles: &mut StyleTable,
     ) -> Value {
-        let diags = if self.diag_config.virtual_text {
-            self.diagnostics_of(buffer).map(|(d, _)| d)
-        } else {
-            None
-        };
-        let Some(diags) = diags else {
+        if !self.diag_config.virtual_text {
             // One `Nil` per row so the client's `diagnostics_virt[row]` index
             // stays aligned with `numbers`/`diagnostics`.
             return Value::Array(segs.iter().map(|_| Value::Nil).collect());
-        };
+        }
+        // Merged LSP + client-set; the inline message positions by line only, so
+        // the per-diagnostic encoding isn't needed here.
+        let diags = self.diagnostics_merged(buffer);
         let rows = segs
             .iter()
             .map(|seg| {
@@ -173,8 +196,9 @@ impl EditHost {
                 // line's one inline slot (ties broken by leftmost column).
                 let best = diags
                     .iter()
-                    .filter(|d| d.range.start.line == line)
-                    .min_by_key(|d| (severity_code(d.severity), d.range.start.character));
+                    .filter(|(d, _)| d.range.start.line == line)
+                    .min_by_key(|(d, _)| (severity_code(d.severity), d.range.start.character))
+                    .map(|(d, _)| d);
                 let Some(d) = best else {
                     return Value::Nil;
                 };
@@ -212,16 +236,13 @@ impl EditHost {
         segs: &[crate::redraw::RowSeg],
         styles: &mut StyleTable,
     ) -> Value {
-        let diags = if self.diag_config.signs {
-            self.diagnostics_of(buffer).map(|(d, _)| d)
-        } else {
-            None
-        };
-        let Some(diags) = diags else {
+        if !self.diag_config.signs {
             // One `Nil` per row so the client's `diagnostics_signs[row]` index
             // stays aligned with `numbers`/`diagnostics`.
             return Value::Array(segs.iter().map(|_| Value::Nil).collect());
-        };
+        }
+        // Merged LSP + client-set; the gutter sign positions by line only.
+        let diags = self.diagnostics_merged(buffer);
         let rows = segs
             .iter()
             .map(|seg| {
@@ -238,8 +259,9 @@ impl EditHost {
                 // line's sign cell (ties broken by leftmost column).
                 let best = diags
                     .iter()
-                    .filter(|d| d.range.start.line == line)
-                    .min_by_key(|d| (severity_code(d.severity), d.range.start.character));
+                    .filter(|(d, _)| d.range.start.line == line)
+                    .min_by_key(|(d, _)| (severity_code(d.severity), d.range.start.character))
+                    .map(|(d, _)| d);
                 let Some(d) = best else {
                     return Value::Nil;
                 };
@@ -285,13 +307,12 @@ impl EditHost {
         // The busiest visible line's sign count (0 or 1 today). A sign shows on a
         // visible numbered row when a diagnostic starts on that buffer line.
         let max_signs: u16 = if self.diag_config.signs {
-            self.diagnostics_of(buffer).map_or(0, |(diags, _)| {
-                let has = numbers.iter().flatten().any(|n| {
-                    let line = (*n - 1) as u32;
-                    diags.iter().any(|d| d.range.start.line == line)
-                });
-                u16::from(has)
-            })
+            let diags = self.diagnostics_merged(buffer);
+            let has = numbers.iter().flatten().any(|n| {
+                let line = (*n - 1) as u32;
+                diags.iter().any(|(d, _)| d.range.start.line == line)
+            });
+            u16::from(has)
         } else {
             0
         };
@@ -315,18 +336,17 @@ impl EditHost {
     /// `:messages` history stays clean). `None` when the cursor is on no
     /// diagnostic. Newlines are flattened so it fits one line.
     pub(crate) fn diagnostic_under_cursor(&self) -> Option<String> {
-        let (diags, encoding) = self.current_diagnostics()?;
         let (row, col) = (self.editor.cursor.line, self.editor.cursor.col);
         let line = self.editor.buffer().line(row);
-        diags
-            .iter()
-            .filter(|d| {
-                self.diag_row_span(d, encoding, row, &line)
+        self.current_diagnostics_merged()
+            .into_iter()
+            .filter(|(d, encoding)| {
+                self.diag_row_span(d, *encoding, row, &line)
                     // Cover the resting cell of a zero-width range too.
                     .is_some_and(|(s, e)| col >= s && col < e.max(s + 1))
             })
-            .min_by_key(|d| severity_code(d.severity))
-            .map(|d| first_line(&d.message))
+            .min_by_key(|(d, _)| severity_code(d.severity))
+            .map(|(d, _)| first_line(&d.message))
     }
 
     /// The `[start, end)` **byte** span a diagnostic occupies on buffer row
@@ -369,17 +389,16 @@ impl EditHost {
     /// `vim.diagnostic.setloclist`. `None` when there are no diagnostics, or the
     /// buffer has no file path to navigate to.
     pub(crate) fn diagnostics_location_list(&self) -> Option<Vec<(PathBuf, usize, usize, String)>> {
-        let (diags, encoding) = self.current_diagnostics()?;
-        if diags.is_empty() {
+        let mut items = self.current_diagnostics_merged();
+        if items.is_empty() {
             return None;
         }
         // A navigable list needs a file to jump into; a no-path buffer can't have one.
         let path = self.editor.buffer().path.clone()?;
-        let mut items: Vec<&Diagnostic> = diags.iter().collect();
-        items.sort_by_key(|d| (d.range.start.line, d.range.start.character));
+        items.sort_by_key(|(d, _)| (d.range.start.line, d.range.start.character));
         let entries = items
             .into_iter()
-            .map(|d| {
+            .map(|(d, encoding)| {
                 let row = d.range.start.line as usize;
                 let character = d.range.start.character as usize;
                 let line = self.editor.buffer().line(row);
@@ -407,18 +426,17 @@ impl EditHost {
         // scope), matching the virt-text / sign surfaces. Collected and sorted
         // before any `&mut self` use so the borrow is released for `open_panel`.
         let row = self.editor.cursor.line as u32;
-        let lines = match self.current_diagnostics() {
-            Some((diags, _)) => {
-                let mut items: Vec<&Diagnostic> =
-                    diags.iter().filter(|d| d.range.start.line == row).collect();
-                items.sort_by_key(|d| (severity_code(d.severity), d.range.start.character));
-                items
-                    .iter()
-                    .flat_map(|d| diagnostic_float_lines(d))
-                    .collect::<Vec<_>>()
-            }
-            None => Vec::new(),
-        };
+        let mut items: Vec<&Diagnostic> = self
+            .current_diagnostics_merged()
+            .into_iter()
+            .filter(|(d, _)| d.range.start.line == row)
+            .map(|(d, _)| d)
+            .collect();
+        items.sort_by_key(|d| (severity_code(d.severity), d.range.start.character));
+        let lines = items
+            .iter()
+            .flat_map(|d| diagnostic_float_lines(d))
+            .collect::<Vec<_>>();
         if lines.is_empty() {
             self.editor.echo("No diagnostics under cursor");
             return;
@@ -433,15 +451,13 @@ impl EditHost {
     /// conversion the underline path uses, then `jump_to`s the *current* file so
     /// the move snaps to a valid resting cell (no file open — same buffer).
     pub(crate) fn diagnostic_goto(&mut self, forward: bool, severity: Option<u8>) {
-        let Some((diags, encoding)) = self.current_diagnostics() else {
-            return;
-        };
         // Resolve every (matching) diagnostic to a 0-based (line, byte col) and
         // sort by position, so "next/previous from the cursor" is a list walk.
-        let mut positions: Vec<(usize, usize)> = diags
-            .iter()
-            .filter(|d| severity.map_or(true, |s| severity_code(d.severity) == s))
-            .map(|d| {
+        let mut positions: Vec<(usize, usize)> = self
+            .current_diagnostics_merged()
+            .into_iter()
+            .filter(|(d, _)| severity.map_or(true, |s| severity_code(d.severity) == s))
+            .map(|(d, encoding)| {
                 let row = d.range.start.line as usize;
                 let line = self.editor.buffer().line(row);
                 (

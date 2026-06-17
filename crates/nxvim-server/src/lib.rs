@@ -464,6 +464,14 @@ pub struct EditHost {
     /// The `vim.diagnostic.config` keys with a backing surface — the underline
     /// spans and the inline virtual text — toggled by `vim.diagnostic.config`.
     diag_config: DiagnosticConfig,
+    /// Client-set diagnostics (`vim.diagnostic.set`) per buffer, flattened across
+    /// the Lua-side namespaces the prelude tracks (the server doesn't), pushed via
+    /// [`LspOp::SetClientDiagnostics`](nxvim_lua::LspOp). These have **no attached
+    /// server**, so their columns are nxvim's native UTF-8 bytes — the renderer
+    /// projects them at [`PositionEncoding::Utf8`] regardless of any LSP server's
+    /// negotiated encoding, then merges them with the server-pushed set. Kept apart
+    /// from `lsp_states[buf].diagnostics` so the two sources never overwrite.
+    client_diagnostics: HashMap<BufferId, Vec<nxvim_lsp::lsp_types::Diagnostic>>,
     /// The editor-wide semantic-tokens gate (Phase 3), toggled by
     /// `vim.lsp.semantic_tokens.enable`. Default on; `false` hides the semantic
     /// paint everywhere and stops the refresh requests (the per-buffer
@@ -762,6 +770,7 @@ impl EditHost {
             complete_resolve_inflight: None,
             lsp_code_actions: Vec::new(),
             diag_config: DiagnosticConfig::default(),
+            client_diagnostics: HashMap::new(),
             semantic_tokens_enabled: true,
             snippet_store: HashMap::new(),
             complete_snippets_active: false,

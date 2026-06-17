@@ -35,10 +35,38 @@ end
 -- Kept apart from the LSP-pushed mirror above so a plugin that manages its own
 -- diagnostics (a plugin's view, in its own scratch buffer + namespace)
 -- never collides with a file buffer's LSP diagnostics. `get` merges both.
--- INCOMPLETE: these are stored and read back by `get`, but not yet rendered —
--- nxvim's underline / virtual-text / sign surfaces are driven from the server's
--- LSP store, which Lua-set diagnostics don't reach. set→get→reset round-trips.
+-- These DO render: every `set`/`reset` flattens the buffer's namespaces and
+-- pushes them across to the server's render store (`nx._set_client_diagnostics`),
+-- so the underline / virtual-text / sign surfaces paint them next to the LSP set.
 nx._diagnostics_ns = nx._diagnostics_ns or {}
+
+-- Flatten `bufnr`'s client-set diagnostics across every namespace into one list
+-- and push it to the server's render store (replace semantics — an empty list
+-- clears the buffer). Each entry is normalized to the {lnum,col,end_lnum,end_col,
+-- severity,message,source} shape the Rust bridge reads; `col`/`end_col` are native
+-- byte columns. Called after any `set`/`reset` so the painted set tracks the table.
+local function diag_sync_client(bufnr)
+  local flat = {}
+  local byns = nx._diagnostics_ns[bufnr]
+  if byns then
+    for _, list in pairs(byns) do
+      for _, d in ipairs(list) do
+        local lnum = d.lnum or 0
+        local col = d.col or 0
+        flat[#flat + 1] = {
+          lnum = lnum,
+          col = col,
+          end_lnum = d.end_lnum or lnum,
+          end_col = d.end_col or col,
+          severity = d.severity or nx.diagnostic.severity.ERROR,
+          message = d.message or "",
+          source = d.source,
+        }
+      end
+    end
+  end
+  nx._set_client_diagnostics(bufnr, flat)
+end
 
 local function diag_current_bufnr()
   return nx._cur_buf and nx._cur_buf.bufnr or 0
@@ -266,6 +294,7 @@ function nx.diagnostic.set(namespace, bufnr, diagnostics, _opts)
     nx._diagnostics_ns[bufnr] = byns
   end
   byns[namespace] = diagnostics or {}
+  diag_sync_client(bufnr)
 end
 
 -- nx.diagnostic.reset([namespace, [bufnr]]): clear client-set diagnostics. With
@@ -274,7 +303,15 @@ end
 -- float closes — it used to crash because the function was missing.
 function nx.diagnostic.reset(namespace, bufnr)
   if namespace == nil then
+    -- Collect the affected buffers before wiping so each can be re-synced empty.
+    local bufs = {}
+    for b in pairs(nx._diagnostics_ns) do
+      bufs[#bufs + 1] = b
+    end
     nx._diagnostics_ns = {}
+    for _, b in ipairs(bufs) do
+      diag_sync_client(b)
+    end
     return
   end
   if bufnr ~= nil then
@@ -285,10 +322,12 @@ function nx.diagnostic.reset(namespace, bufnr)
     if byns then
       byns[namespace] = nil
     end
+    diag_sync_client(bufnr)
     return
   end
-  for _, byns in pairs(nx._diagnostics_ns) do
+  for b, byns in pairs(nx._diagnostics_ns) do
     byns[namespace] = nil
+    diag_sync_client(b)
   end
 end
 

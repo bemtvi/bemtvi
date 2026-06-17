@@ -469,6 +469,43 @@ pub(crate) fn severity_code(severity: Option<DiagnosticSeverity>) -> u8 {
     }
 }
 
+/// The inverse of [`severity_code`]: a 1=ERROR…4=HINT code back to the LSP
+/// [`DiagnosticSeverity`]. An out-of-range code falls back to ERROR, matching
+/// `severity_code`'s own default for an unspecified severity.
+pub(crate) fn severity_from_code(code: u8) -> DiagnosticSeverity {
+    match code {
+        2 => DiagnosticSeverity::WARNING,
+        3 => DiagnosticSeverity::INFORMATION,
+        4 => DiagnosticSeverity::HINT,
+        _ => DiagnosticSeverity::ERROR,
+    }
+}
+
+/// Build an LSP [`Diagnostic`] from the plain [`DiagnosticData`] a plugin set via
+/// `vim.diagnostic.set` (the inverse of [`diagnostic_mirror_data`]). Positions are
+/// nxvim's native byte columns — there is no server to negotiate an encoding with,
+/// so the renderer reads them back at [`PositionEncoding::Utf8`]. Only the fields
+/// nxvim's surfaces consume (range / severity / message / source) are carried; the
+/// rest default.
+pub(crate) fn client_diagnostic(d: &DiagnosticData) -> Diagnostic {
+    Diagnostic {
+        range: Range {
+            start: Position {
+                line: d.lnum.max(0) as u32,
+                character: d.col.max(0) as u32,
+            },
+            end: Position {
+                line: d.end_lnum.max(0) as u32,
+                character: d.end_col.max(0) as u32,
+            },
+        },
+        severity: Some(severity_from_code(d.severity)),
+        message: d.message.clone(),
+        source: d.source.clone(),
+        ..Default::default()
+    }
+}
+
 /// Translate the LSP crate's [`ProviderCaps`] into the Lua-runtime
 /// [`LspServerCapabilities`], the boundary that keeps `nxvim-lua` free of the LSP
 /// crate. The two have the same per-feature fields; this is the one place they

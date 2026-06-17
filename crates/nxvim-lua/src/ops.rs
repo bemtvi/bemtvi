@@ -327,6 +327,21 @@ pub enum LspOp {
         /// `true` to enable (project + request), `false` to disable (clear + hide).
         enabled: bool,
     },
+    /// `vim.diagnostic.set(namespace, bufnr, diagnostics)` / `reset` — replace the
+    /// server-side render store for `bufnr` with a buffer's flattened client-set
+    /// diagnostics (every namespace), so the underline / sign / virtual-text
+    /// surfaces paint them alongside the LSP-pushed set. The prelude resolves the
+    /// per-namespace `nx._diagnostics_ns` table down to one flat list per buffer
+    /// (replace semantics) before pushing — the server doesn't track namespaces.
+    /// `diags` carry **native byte columns** (no LSP server to negotiate an
+    /// encoding with), unlike the server-pushed set; the renderer projects them
+    /// as UTF-8. Empty `diags` clears the buffer's store.
+    SetClientDiagnostics {
+        /// The target buffer (already resolved from `0` → current in Lua).
+        bufnr: u64,
+        /// The buffer's client-set diagnostics, flattened across every namespace.
+        diags: Vec<DiagnosticData>,
+    },
     /// `nx.lsp.workspace_symbol(query)` — request `workspace/symbol` for `query`
     /// (the fuzzy text typed at the prompt). Unlike the cursor-anchored verbs it
     /// carries a query, not a position; the matching symbols open in `nx.picker`.

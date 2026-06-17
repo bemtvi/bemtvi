@@ -958,6 +958,69 @@ async fn scroll_band_carries_diagnostic_arrays() {
 }
 
 #[tokio::test]
+async fn client_set_diagnostics_paint_without_a_server() {
+    // `vim.diagnostic.set` — a pure-Lua plugin's own diagnostics, with no LSP
+    // server attached — must reach the three render surfaces (underline span,
+    // gutter sign, inline virtual text), not just the `vim.diagnostic.get`
+    // read-back. The `col`/`end_col` are native byte columns (encoding-free).
+    let path = write_temp("clientdiag", "txt", "hello world\nsecond line\n");
+    let (rpc, mut incoming) = start(Some(path)).await;
+    let _ = lines(&rpc).await; // barrier
+
+    exec_lua(
+        &rpc,
+        r#"
+        vim.diagnostic.config({ underline = true, virtual_text = true, signs = true })
+        vim.diagnostic.set(1, 0, {
+          { lnum = 0, col = 0, end_lnum = 0, end_col = 5, severity = 1, message = "boom" },
+        })
+        "#,
+    )
+    .await;
+
+    let view = redraw_after(&rpc, &mut incoming, "<Esc>").await;
+
+    // Underline: row 0 carries one [0,5) span at severity 1 (error).
+    let diags = view_diag_spans(&view);
+    assert_eq!(
+        diags.first().cloned().unwrap_or_default(),
+        vec![(0, 5, 1)],
+        "client-set underline paints on row 0: {diags:?}"
+    );
+    // Gutter sign: row 0 carries the error glyph.
+    let signs = view_diag_signs(&view);
+    assert_eq!(
+        signs.first().cloned().flatten(),
+        Some(("E".to_string(), 1)),
+        "client-set sign paints on row 0: {signs:?}"
+    );
+    // Inline virtual text: row 0 carries the message at severity 1.
+    let virt = view_diag_virt(&view);
+    assert!(
+        virt.first()
+            .cloned()
+            .flatten()
+            .is_some_and(|(t, sev)| t.contains("boom") && sev == 1),
+        "client-set virtual text paints on row 0: {virt:?}"
+    );
+
+    // `vim.diagnostic.reset` must unpaint them again (the reverse sync clears the
+    // server's render store), not just empty the Lua read-back.
+    exec_lua(&rpc, "vim.diagnostic.reset(1, 0)").await;
+    let view = redraw_after(&rpc, &mut incoming, "<Esc>").await;
+    assert!(
+        view_diag_spans(&view).iter().all(Vec::is_empty),
+        "reset clears the underline: {:?}",
+        view_diag_spans(&view)
+    );
+    assert!(
+        view_diag_signs(&view).iter().all(Option::is_none),
+        "reset clears the sign: {:?}",
+        view_diag_signs(&view)
+    );
+}
+
+#[tokio::test]
 async fn scroll_band_carries_search_highlights() {
     // hlsearch matches must ride the scroll band, not vanish until the slide
     // settles: the band's `search` spans cover its rows so the client paints them

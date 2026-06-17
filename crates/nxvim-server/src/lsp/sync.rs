@@ -76,6 +76,19 @@ impl EditHost {
                 self.lsp_dirty = true;
                 return;
             }
+            LspOp::SetClientDiagnostics { bufnr, diags } => {
+                let buffer = BufferId(bufnr);
+                if diags.is_empty() {
+                    // An empty set (a cleared namespace, or every namespace reset)
+                    // drops the buffer's entry so it stops projecting entirely.
+                    self.client_diagnostics.remove(&buffer);
+                } else {
+                    self.client_diagnostics
+                        .insert(buffer, diags.iter().map(client_diagnostic).collect());
+                }
+                self.lsp_dirty = true;
+                return;
+            }
             LspOp::ClientRequest {
                 client_id,
                 method,

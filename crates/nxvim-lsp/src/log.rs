@@ -19,6 +19,11 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Severity ordering: a message at `level` is logged when `level >= threshold`.
 /// `Off` is the maximum, so a threshold of `Off` silences everything.
+///
+/// The wasm sync client only ever logs at `Warn` (and constructs `Off` via
+/// [`LspLog::disabled`]); the finer levels are produced by the native manager's
+/// `window/*Message` routing, so they read as dead there.
+#[cfg_attr(not(feature = "native"), allow(dead_code))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) enum LogLevel {
     Trace,
@@ -30,6 +35,7 @@ pub(crate) enum LogLevel {
 }
 
 impl LogLevel {
+    #[cfg_attr(not(feature = "native"), allow(dead_code))]
     fn parse(s: &str) -> Option<LogLevel> {
         match s.trim().to_ascii_lowercase().as_str() {
             "trace" => Some(LogLevel::Trace),
@@ -76,6 +82,8 @@ impl LspLog {
 
     /// Open the log per the environment and write the `[START]` banner. Returns a
     /// silent log (no file) when the level is `off` or the file can't be opened.
+    /// Native only — the wasm build has no filesystem and uses [`Self::disabled`].
+    #[cfg_attr(not(feature = "native"), allow(dead_code))]
     pub(crate) fn from_env() -> LspLog {
         let threshold = std::env::var("NXVIM_LSP_LOG_LEVEL")
             .ok()
@@ -111,7 +119,9 @@ impl LspLog {
     }
 
     /// Whether a message at `level` would be written — lets a caller skip building
-    /// an expensive message string when it would be dropped.
+    /// an expensive message string when it would be dropped. Only the native
+    /// manager guards log calls this way; the sync client always logs unconditionally.
+    #[cfg_attr(not(feature = "native"), allow(dead_code))]
     pub(crate) fn enabled(&self, level: LogLevel) -> bool {
         self.sink.is_some() && level >= self.threshold
     }
@@ -133,6 +143,7 @@ impl LspLog {
 }
 
 /// The log file path: `$NXVIM_LSP_LOG_FILE`, else `<state-dir>/lsp.log`.
+#[cfg_attr(not(feature = "native"), allow(dead_code))]
 fn log_path() -> PathBuf {
     if let Some(path) = std::env::var_os("NXVIM_LSP_LOG_FILE") {
         return PathBuf::from(path);
@@ -143,6 +154,7 @@ fn log_path() -> PathBuf {
 /// nxvim's per-user state directory: `$XDG_STATE_HOME/nxvim`, else
 /// `$HOME/.local/state/nxvim` (and `%LOCALAPPDATA%\nxvim` on Windows). Mirrors
 /// `nxvim_ts::data_dir`, but for *state* (logs) rather than data (grammars).
+#[cfg_attr(not(feature = "native"), allow(dead_code))]
 fn state_dir() -> PathBuf {
     if let Some(dir) = std::env::var_os("XDG_STATE_HOME") {
         return PathBuf::from(dir).join("nxvim");

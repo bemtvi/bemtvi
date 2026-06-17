@@ -190,7 +190,8 @@ fn config_section(settings: &serde_json::Value, section: &str) -> serde_json::Va
 }
 
 /// Map an LSP `window/*Message` severity to a log level (`LOG`, the most verbose,
-/// becomes `Debug`).
+/// becomes `Debug`). Only the native client's `window/*Message` router calls it.
+#[cfg_attr(not(feature = "native"), allow(dead_code))]
 fn level_of(typ: MessageType) -> LogLevel {
     match typ {
         MessageType::ERROR => LogLevel::Error,

@@ -36,9 +36,10 @@ use std::collections::HashMap;
 
 use lsp_types::{
     CodeAction, CodeActionResponse, CompletionItem, CompletionResponse, ConfigurationParams,
-    GotoDefinitionResponse, Hover, InitializeParams, InitializeResult, InlayHint, Location,
-    PublishDiagnosticsParams, SemanticTokensFullDeltaResult, SemanticTokensResult,
-    ShowMessageParams, SignatureHelp, TextEdit, Url, WorkspaceEdit,
+    DocumentSymbolResponse, GotoDefinitionResponse, Hover, InitializeParams, InitializeResult,
+    InlayHint, Location, PublishDiagnosticsParams, SemanticTokensFullDeltaResult,
+    SemanticTokensResult, ShowMessageParams, SignatureHelp, TextEdit, Url, WorkspaceEdit,
+    WorkspaceSymbolResponse,
 };
 use serde_json::{json, Value};
 
@@ -47,8 +48,9 @@ use crate::client::{
     semantic_tokens_delta, sync_kind_of,
 };
 use crate::convert::{
-    code_actions, completion_reply, documentation_lines, goto_locations, hover_reply, inlay_hint,
-    inlay_label_core, normalize_workspace_edit, pad_label, signature_help_reply,
+    code_actions, completion_reply, document_symbols, documentation_lines, goto_locations,
+    hover_reply, inlay_hint, inlay_label_core, normalize_workspace_edit, pad_label,
+    signature_help_reply, workspace_symbols,
 };
 use crate::log::LspLog;
 use crate::protocol::{
@@ -104,12 +106,17 @@ enum Pending {
 
 /// Which [`LspRequest`] a [`Pending::Feature`] was, so its response is decoded into
 /// the right typed result and distilled by the matching [`crate::convert`] helper.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 enum ReqKind {
     Definition,
     Declaration,
     TypeDefinition,
     Implementation,
+    /// Carries the requesting document's `uri` — the nested `DocumentSymbol` reply
+    /// form has no location of its own, so the distiller needs it (mirrors the
+    /// native `document_symbols(&uri, …)`).
+    DocumentSymbol(Url),
+    WorkspaceSymbol,
     References,
     Hover,
     SignatureHelp,
@@ -565,6 +572,13 @@ fn distill(kind: ReqKind, result: Result<Value, String>) -> LspReply {
         | ReqKind::Implementation => {
             LspReply::Locations(goto_locations(decode::<GotoDefinitionResponse>(result)))
         }
+        ReqKind::DocumentSymbol(uri) => LspReply::Symbols(document_symbols(
+            &uri,
+            decode::<DocumentSymbolResponse>(result),
+        )),
+        ReqKind::WorkspaceSymbol => {
+            LspReply::Symbols(workspace_symbols(decode::<WorkspaceSymbolResponse>(result)))
+        }
         ReqKind::References => {
             LspReply::Locations(decode::<Vec<Location>>(result).unwrap_or_default())
         }
@@ -721,6 +735,16 @@ fn request_wire(req: LspRequest) -> (String, Value, ReqKind) {
             "textDocument/implementation".into(),
             pos_params(&uri, &position),
             ReqKind::Implementation,
+        ),
+        LspRequest::DocumentSymbol { uri } => (
+            "textDocument/documentSymbol".into(),
+            json!({"textDocument": {"uri": uri.clone()}}),
+            ReqKind::DocumentSymbol(uri),
+        ),
+        LspRequest::WorkspaceSymbol { query } => (
+            "workspace/symbol".into(),
+            json!({"query": query}),
+            ReqKind::WorkspaceSymbol,
         ),
         LspRequest::References {
             uri,

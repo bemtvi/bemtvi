@@ -121,7 +121,7 @@ So the keystroke path is sync-and-local in both worlds; only the I/O dependency
 | 3 | Native edit-host / daemon split + the `HostProc` seam | 1 | ✅ (3a–3r; QUIC listener done — only path-space / `luafs` cache / per-class stream split remain as noted follow-ups) |
 | 4 | wasm edit-host: compile (gate `nxvim-ts`, emscripten build) + extract sync `EditHost` (OD#6 (a)) | 1 | ✅ (compile de-risked; `EditHost` extraction 4a–4e done) |
 | 5 | wasm edit-host: Worker + input/timer loop + JS interop | 4 | ✅ (5a feature seam · 5b wasm `HostEffects`/cdylib · 5c Worker/`postMessage` redraw/`window.__nxvim` · 5d SAB input/timer park · 5e COOP/COEP serving docs + demo deletion — all done) |
-| 6 | Browser fs/process: daemon over WebTransport (or serverless OPFS) | 3, 5 | 🚧 (6a serverless OPFS fs + explorer done; 6b the **WebTransport daemon fs leg** — browser `:e`/`:w`/`:e <dir>` over a real `--daemon --listen` — done; 6c the **watch leg** — daemon→browser `fs_changed` pushes autoreload / `FileChangedShell` over WebTransport — done; 6d the **proc leg** — async `vim.system`/`jobstart` over WebTransport, daemon→browser `proc_spawned`/`proc_exited` pushes — done; the **luafs legs** (`nx.fs` off-tick `luafs_op` + streaming `luafs_watch` — landed under `docs/plans/2026-06-16-nx-fs-off-tick-daemon-leg.md`) and the **terminal leg** (`term_*` PTY, Phase 7) also landed browser-side since; **6e the LSP leg** is now **done** (browser `vim.lsp.start`/diagnostics/hover over a real `--daemon --listen` via the in-Worker `SyncLspClient` ↔ the daemon's `lsp_spawn`/`lsp_stdin`/`lsp_kill` wire — Stages A–F below); the daemon **sys_run** (blocking `nx._system`) leg over WebTransport is the remaining browser leg) |
+| 6 | Browser fs/process: daemon over WebTransport (or serverless OPFS) | 3, 5 | ✅ (6a serverless OPFS fs + explorer done; 6b the **WebTransport daemon fs leg** — browser `:e`/`:w`/`:e <dir>` over a real `--daemon --listen` — done; 6c the **watch leg** — daemon→browser `fs_changed` pushes autoreload / `FileChangedShell` over WebTransport — done; 6d the **proc leg** — async `vim.system`/`jobstart` over WebTransport, daemon→browser `proc_spawned`/`proc_exited` pushes — done; the **luafs legs** (`nx.fs` off-tick `luafs_op` + streaming `luafs_watch` — landed under `docs/plans/2026-06-16-nx-fs-off-tick-daemon-leg.md`) and the **terminal leg** (`term_*` PTY, Phase 7) also landed browser-side since; **6e the LSP leg** is **done** (browser `vim.lsp.start`/diagnostics/hover over a real `--daemon --listen` via the in-Worker `SyncLspClient` ↔ the daemon's `lsp_spawn`/`lsp_stdin`/`lsp_kill` wire — Stages A–F below); the **sys_run** leg is MOOT — the blocking `nx._system` vertical was **removed** entirely under "no blocking IO at all" (commit `474813f`, [[no-blocking-io-fs-async-only]]), so there is no browser sys_run leg to build. Browser edit-host fs/process/LSP/terminal are feature-complete.) |
 
 Phase 1 is independent and small. Phase 3 is the
 native latency payoff. Phases 4–5 are the browser payoff. Phase 6 unifies them on
@@ -877,7 +877,14 @@ quit test). Regression-clean — full `cargo test --workspace` green (1019+ test
 `daemon_save` suite now 6), fmt + clippy `-D warnings` clean; local binaries leave off-tick
 mode off and `:wall` / `:wqa` write synchronously, unchanged.
 
-### Phase 3n — the blocking `vim.system` shell-out over the wire (`sys_run`, the blocking bridge) — ✅ DONE (2026-06-10)
+### Phase 3n — the blocking `vim.system` shell-out over the wire (`sys_run`, the blocking bridge) — ✅ DONE (2026-06-10), then **REMOVED (2026-06-17, commit `474813f`)**
+
+> **This whole leg was later deleted** under "no blocking IO at all"
+> ([[no-blocking-io-fs-async-only]]): the `BlockingSystem` trait, `nx._system`, the
+> `Std`/`Wasm`/`RemoteBlockingSystem` impls, and the `sys_run` daemon wire are gone. It had
+> zero production callers — `vim.system`/`nx.run`/`:make` ride the async
+> `nx._system_async` path, and `vim.fn.system` as a sync function was never wired. The
+> section below is kept for history; the blocking bridge it describes no longer exists.
 
 The *fourth* spawn site the original three-site list missed (called out under Phase 3c's
 *Still to do*), and the first wire leg whose shape is **neither** off-tick fetch (the fs

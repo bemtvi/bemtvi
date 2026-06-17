@@ -1,8 +1,28 @@
 # `nx.fs` off-tick + the daemon `luafs` leg over WebTransport
 
-Status: **Phases 1–3b done (2026-06-16/17); only Phase 3c (the optional `vim.fn` /
-`nx._readdir` async-parity tail) remains.** `nx.fs` now works in every world — native,
-native daemon, browser+daemon, and serverless browser (OPFS) — including the streaming
+> **SUPERSEDED in part (2026-06-17, commit `474813f`) — see
+> [[no-blocking-io-fs-async-only]] / the edit-host plan.** The "no blocking IO at all"
+> consolidation changed two things this doc describes as current:
+> - **Phase 3c is MOOT, not "remaining".** The synchronous `vim.fn` fs builtins
+>   (`filereadable`/`isdirectory`/`getftime`/`executable`/`exepath`/`resolve`/`readblob`/
+>   `glob`) and `nx._readdir` were **removed outright**, not given async parity — there is
+>   no point keeping `vim.fn.*` sugar that can't behave like neovim's synchronous version.
+>   `nx.fs` (async) is the sole fs API; `nx.lsp.enable`'s `find_root` walks it directly.
+> - **The low-level per-op `luafs` leg + `RemoteLuaFs` are GONE.** They only existed to
+>   back those sync builtins. Native-daemon `nx.fs` now uses the **`luafs_op`** leg (whole
+>   `FsJob`, one round-trip, decomposed daemon-side) — the same leg + codec the wasm
+>   edit-host uses. The event-loop actor holds `evloop::FsBackend` (`Local(StdLuaFs)` |
+>   `Remote(RemoteFsJobs)`); nothing parks the editor thread. So where this doc says
+>   "`RemoteLuaFs`", "the `luafs` leg", or "`vim.fn` fs builtins stay synchronous", read
+>   the consolidated `luafs_op`-only design instead.
+>
+> The Phase 1/2/3a/3b mechanics below (the off-tick seam, `FsJob`/`FsValue` codec,
+> `luafs_op`, OPFS, `luafs_watch`) are still accurate.
+
+Status: **Phases 1–3b done (2026-06-16/17); Phase 3c (the `vim.fn` / `nx._readdir`
+async-parity tail) is moot — those sync builtins were removed, not made async (see the
+banner above).** `nx.fs` now works in every world — native, native daemon,
+browser+daemon, and serverless browser (OPFS) — including the streaming
 `nx.fs.watch` over the daemon. Makes `nx.fs` (and the `LuaFs` seam under it)
 **truly async** and, on the browser edit-host, **routes its ops to the remote
 daemon** instead of the local in-browser MEMFS. This is the
@@ -89,6 +109,11 @@ return `Arc`, `ServerInit::lua_fs: Option<Box<dyn LuaFs + Send + Sync>>` (today 
 calling it inline — `Arc` derefs exactly like `Rc`, so they are untouched. **`vim.fn`
 fs builtins stay synchronous** (they're a bounded compat surface, not the async
 `nx.fs` API); only `nx.fs` goes off-tick.
+>
+> **(Superseded — see top banner.)** The `vim.fn` fs builtins did NOT stay — they were
+> removed (no blocking IO), so `Shared::lua_fs`/`set_lua_fs`/`resolve_lua_fs` and the
+> `ServerInit::lua_fs` injection are gone too. The actor now holds an `evloop::FsBackend`
+> (local `StdLuaFs` or a daemon `RemoteFsJobs`), not a shared `Arc<dyn LuaFs>`.
 
 ### Native path (Phase 1)
 
@@ -250,9 +275,11 @@ unchanged; only the timing moves from "resolved-already" to "resolved next tick"
     path rejects the stream loud; `:stop()` ends the iteration. (Debug note: the test
     spawns `target/debug/nxvim` — a daemon-side server change needs `cargo build -p
     nxvim`, not just the lib, or the spawned daemon is stale and drops the new method.)
-- **Phase 3c — the long tail (follow-up).** Optionally route the `vim.fn` fs builtins and
-  `nx._readdir` through the async path for browser parity (or leave them sync, documented
-  — the Risks call).
+- **Phase 3c — MOOT (resolved 2026-06-17, not as written).** Rather than route the
+  `vim.fn` fs builtins / `nx._readdir` through the async path *or* leave them sync, they
+  were **removed entirely** ("no blocking IO at all" — see the top banner and
+  [[no-blocking-io-fs-async-only]]). `nx.fs` is the only fs API; the one in-tree consumer,
+  `nx.lsp.enable`'s `find_root`, became async on `nx.fs.readdir`.
 
 ## Risks / decisions to confirm
 

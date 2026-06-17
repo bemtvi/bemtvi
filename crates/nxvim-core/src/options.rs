@@ -209,6 +209,88 @@ impl Default for Options {
     }
 }
 
+/// neovim's `'signcolumn'` policy: whether the sign column shows and how wide it
+/// may grow. The width is counted in sign *columns* (each 2 display cells); see
+/// [`SignColumn::floor_cells`] for the part core reserves and the server's
+/// `sign_width_for` for the rendered width (which expands `Auto` to fit signs).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SignColumn {
+    /// `no` — never show a sign column.
+    No,
+    /// `auto` / `auto:min-max` — show between `min` and `max` sign columns when a
+    /// visible line has a sign, and collapse to nothing when none do.
+    Auto { min: u16, max: u16 },
+    /// `yes` / `yes:n` / `yes:min-max` — always reserve at least `min` columns,
+    /// widening to `max` to fit the busiest visible line's signs.
+    Yes { min: u16, max: u16 },
+}
+
+impl SignColumn {
+    /// Parse a `'signcolumn'` value (`no`, `auto`, `auto:1-3`, `yes`, `yes:2`,
+    /// `yes:1-3`). Returns `None` for `number` (deferred) and any malformed value,
+    /// so `:set` / `vim.o` can report `E474` instead of silently accepting junk.
+    pub fn parse(s: &str) -> Option<Self> {
+        let range = |spec: &str| -> Option<(u16, u16)> {
+            // `n` → n-n; `min-max` → that range. Both bounded to neovim's 1..=9.
+            let (min, max) = match spec.split_once('-') {
+                Some((a, b)) => (a.parse::<u16>().ok()?, b.parse::<u16>().ok()?),
+                None => {
+                    let n = spec.parse::<u16>().ok()?;
+                    (n, n)
+                }
+            };
+            ((1..=9).contains(&min) && min <= max && max <= 9).then_some((min, max))
+        };
+        match s {
+            "no" => Some(SignColumn::No),
+            "auto" => Some(SignColumn::Auto { min: 1, max: 1 }),
+            "yes" => Some(SignColumn::Yes { min: 1, max: 1 }),
+            _ => {
+                if let Some(spec) = s.strip_prefix("auto:") {
+                    let (min, max) = range(spec)?;
+                    Some(SignColumn::Auto { min, max })
+                } else if let Some(spec) = s.strip_prefix("yes:") {
+                    let (min, max) = range(spec)?;
+                    Some(SignColumn::Yes { min, max })
+                } else {
+                    None
+                }
+            }
+        }
+    }
+
+    /// The number of display cells core must always reserve for this policy,
+    /// regardless of how many signs exist (core is sign-agnostic). `Yes` reserves
+    /// its minimum; `No`/`Auto` reserve nothing (an `Auto` column only appears when
+    /// the server sees a sign, which core can't know — see the plan's seam note).
+    pub fn floor_cells(self) -> usize {
+        match self {
+            SignColumn::Yes { min, .. } => min as usize * 2,
+            SignColumn::No | SignColumn::Auto { .. } => 0,
+        }
+    }
+}
+
+impl std::fmt::Display for SignColumn {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Round-trips through `parse`; `n-n` collapses to `n` like neovim echoes it.
+        let span = |min: u16, max: u16| {
+            if min == max {
+                format!("{min}")
+            } else {
+                format!("{min}-{max}")
+            }
+        };
+        match self {
+            SignColumn::No => f.write_str("no"),
+            SignColumn::Auto { min: 1, max: 1 } => f.write_str("auto"),
+            SignColumn::Yes { min: 1, max: 1 } => f.write_str("yes"),
+            SignColumn::Auto { min, max } => write!(f, "auto:{}", span(*min, *max)),
+            SignColumn::Yes { min, max } => write!(f, "yes:{}", span(*min, *max)),
+        }
+    }
+}
+
 /// Window-local options, the rust-native analogue of neovim's per-window scope.
 /// Unlike [`Options`] (one global copy on the editor), a [`WindowOptions`] lives
 /// on each window, so two windows onto the *same* buffer can show different
@@ -221,6 +303,13 @@ pub struct WindowOptions {
     /// [`WindowOptions::number`] this gives vim's "hybrid" gutter: the absolute
     /// number on the cursor line, relative numbers elsewhere.
     pub relativenumber: bool,
+    /// Minimum width of the number gutter (vim's `numberwidth`). The gutter is at
+    /// least this wide, growing to fit the largest line number plus a trailing
+    /// space. Only consulted when `number`/`relativenumber` is on.
+    pub numberwidth: usize,
+    /// The sign-column policy (vim's `signcolumn`): whether the diagnostics sign
+    /// column shows and how wide it may grow.
+    pub signcolumn: SignColumn,
     /// Minimum number of columns to scroll horizontally when the cursor moves off
     /// a `nowrap` window's edge (vim's `sidescroll`). `0` recenters the cursor;
     /// `1` (the default) scrolls just enough to keep it at the edge.
@@ -244,6 +333,9 @@ impl Default for WindowOptions {
         WindowOptions {
             number: true,
             relativenumber: true,
+            // neovim's `numberwidth` default (4) and `signcolumn=auto`.
+            numberwidth: 4,
+            signcolumn: SignColumn::Auto { min: 1, max: 1 },
             // neovim's horizontal-scroll defaults: scroll a minimal step, no margin.
             sidescroll: 1,
             sidescrolloff: 0,
@@ -601,6 +693,8 @@ fn canonical(name: &str) -> Option<(&'static str, OptKind)> {
         "number" | "nu" => Some(("number", Bool)),
         "relativenumber" | "rnu" => Some(("relativenumber", Bool)),
         "wrap" => Some(("wrap", Bool)),
+        "numberwidth" | "nuw" => Some(("numberwidth", Num)),
+        "signcolumn" | "scl" => Some(("signcolumn", Str)),
         "ignorecase" | "ic" => Some(("ignorecase", Bool)),
         "smartcase" | "scs" => Some(("smartcase", Bool)),
         "wrapscan" | "ws" => Some(("wrapscan", Bool)),

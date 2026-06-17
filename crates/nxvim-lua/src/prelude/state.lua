@@ -86,7 +86,16 @@ vim.b = nx.b
 
 -- Window- and buffer-local options vim.o forwards to vim.wo / vim.bo. Keyed by
 -- both the full name and its abbreviation (the delegate canonicalizes again).
-local O_WIN = { number = true, nu = true, relativenumber = true, rnu = true }
+local O_WIN = {
+  number = true,
+  nu = true,
+  relativenumber = true,
+  rnu = true,
+  numberwidth = true,
+  nuw = true,
+  signcolumn = true,
+  scl = true,
+}
 local O_BUF = {
   tabstop = true,
   ts = true,
@@ -883,8 +892,17 @@ local WIN_OPT_CANON = {
   nu = "number",
   relativenumber = "relativenumber",
   rnu = "relativenumber",
+  numberwidth = "numberwidth",
+  nuw = "numberwidth",
+  signcolumn = "signcolumn",
+  scl = "signcolumn",
 }
-local WIN_OPT_DEFAULT = { number = true, relativenumber = true }
+local WIN_OPT_DEFAULT = {
+  number = true,
+  relativenumber = true,
+  numberwidth = 4,
+  signcolumn = "auto",
+}
 -- Exposed for this file's nvim_{get,set}_option_value, which classify a name
 -- as window-scoped before routing it through nx.wo.
 nx._win_opt_canon = WIN_OPT_CANON

@@ -136,7 +136,7 @@ impl Editor {
                     return;
                 }
                 let min = match name {
-                    "tabstop" => 1,
+                    "tabstop" | "numberwidth" => 1,
                     "shiftwidth" | "sidescroll" | "sidescrolloff" => 0,
                     "softtabstop" => -1,
                     // A wiring gap (see `apply_set_bool`): a numeric option `resolve_set`
@@ -153,6 +153,7 @@ impl Editor {
                 match name {
                     "sidescroll" => self.windows.cur_mut().options.sidescroll = v as usize,
                     "sidescrolloff" => self.windows.cur_mut().options.sidescrolloff = v as usize,
+                    "numberwidth" => self.windows.cur_mut().options.numberwidth = v as usize,
                     _ => {
                         let opts = &mut self.buffer_mut().options;
                         match name {
@@ -168,6 +169,7 @@ impl Editor {
                 let v: i64 = match name {
                     "sidescroll" => self.windows.cur().options.sidescroll as i64,
                     "sidescrolloff" => self.windows.cur().options.sidescrolloff as i64,
+                    "numberwidth" => self.windows.cur().options.numberwidth as i64,
                     "showtabline" => self.options.showtabline as i64,
                     "laststatus" => self.options.laststatus as i64,
                     "mousetime" => self.options.mousetime as i64,
@@ -218,6 +220,29 @@ impl Editor {
                 StrOp::Query => {
                     let ft = self.buffer_filetype(buf).unwrap_or_default();
                     self.echo(format!("filetype={ft}"));
+                }
+            }
+            return;
+        }
+        // `signcolumn` is the (first) window-local enumerated string: `no`,
+        // `auto`/`auto:min-max`, `yes`/`yes:n`/`yes:min-max`. A bad value (or the
+        // not-yet-supported `number`) fails loud (E474) rather than silently
+        // mis-setting the gutter. `&` resets to the `auto` default.
+        if name == "signcolumn" {
+            match op {
+                StrOp::Set(value) => match crate::options::SignColumn::parse(&value) {
+                    Some(scl) => self.windows.cur_mut().options.signcolumn = scl,
+                    None => {
+                        self.echo(format!("E474: Invalid argument: signcolumn={value}"));
+                    }
+                },
+                StrOp::Reset => {
+                    self.windows.cur_mut().options.signcolumn =
+                        crate::options::SignColumn::Auto { min: 1, max: 1 }
+                }
+                StrOp::Query => {
+                    let scl = self.windows.cur().options.signcolumn;
+                    self.echo(format!("signcolumn={scl}"));
                 }
             }
             return;
@@ -367,6 +392,6 @@ impl Editor {
         if !opts.number && !opts.relativenumber {
             return 0;
         }
-        (digit_count(line_count) + 1).max(4)
+        (digit_count(line_count) + 1).max(opts.numberwidth.max(1))
     }
 }

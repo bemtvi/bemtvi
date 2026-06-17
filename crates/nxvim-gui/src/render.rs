@@ -60,10 +60,6 @@ const DIAG_HINT: u32 = 0x80_80_80;
 pub const DEFAULT_INLAY: u32 = 0x80_80_80;
 /// Line height as a multiple of the font size.
 const LINE_SPACING: f32 = 1.30;
-/// The diagnostic sign column's width in cells (vim's `signcolumn`), reserved at
-/// the window's far left when [`WindowView::sign_column`] is set — left of the
-/// number gutter. Mirrors the TUI's `SIGN_WIDTH`.
-const SIGN_WIDTH: u16 = 2;
 /// The multi-cursor accent (a warm amber): the active (primary) cursor's color in
 /// MultiCursor placement mode, and the secondary cursors' underline tint in
 /// insert/replace mode, so every multi-cursor decoration reads as one family.
@@ -865,7 +861,7 @@ impl Renderer {
         // this buffer has diagnostics and signs are on), then the number gutter,
         // then the text — so the text origin shifts past both. Cursor, pmenu, and
         // mouse hit-test all derive from the same `text_x0` (see `pmenu_hit`).
-        let sign_w = if win.sign_column { SIGN_WIDTH } else { 0 };
+        let sign_w = win.sign_width;
         let gutter = if win.number || win.relativenumber {
             win.number_width
         } else {
@@ -1903,7 +1899,7 @@ impl Renderer {
             wx += 1;
             wy += 1;
         }
-        let sign_w = if win.sign_column { SIGN_WIDTH } else { 0 };
+        let sign_w = win.sign_width;
         let gutter = if win.number || win.relativenumber {
             win.number_width
         } else {
@@ -2006,7 +2002,7 @@ impl Renderer {
             wx += 1;
             wy += 1;
         }
-        let sign_w = if win.sign_column { SIGN_WIDTH } else { 0 };
+        let sign_w = win.sign_width;
         let gutter = if win.number || win.relativenumber {
             win.number_width
         } else {
@@ -2256,7 +2252,7 @@ impl Renderer {
             wx += 1;
             wy += 1;
         }
-        let sign_w = if win.sign_column { SIGN_WIDTH } else { 0 };
+        let sign_w = win.sign_width;
         let gutter = if win.number || win.relativenumber {
             win.number_width
         } else {
@@ -2900,7 +2896,7 @@ pub(crate) fn pmenu_hit(view: &View, cols: u16) -> Option<PmenuHit> {
         wx += 1;
         wy += 1;
     }
-    let sign_w = if win.sign_column { SIGN_WIDTH } else { 0 };
+    let sign_w = win.sign_width;
     let gutter = if win.number || win.relativenumber {
         win.number_width
     } else {

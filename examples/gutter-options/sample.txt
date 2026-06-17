@@ -1,0 +1,20 @@
+gutter options demo
+====================
+
+Look left: the number column is 8 cells wide (numberwidth = 8), and a
+2-column sign space (signcolumn = yes:2) sits to its left, reserved even
+with no language server attached.
+
+Press <leader>n to cycle the number-column minimum width (4 / 6 / 8).
+Press <leader>s to cycle the sign column (no / auto / yes / yes:2 / auto:1-3).
+
+These are window-local. Open a vertical split with <C-w>v, then run
+    :setlocal nuw=4 scl=no
+in the new window and watch only that side change.
+
+10
+100
+1000
+10000
+(scroll down: the gutter grows past numberwidth once the line numbers need
+more digits than the configured minimum.)

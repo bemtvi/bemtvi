@@ -1115,11 +1115,14 @@ impl EditHost {
             }
             WindowOp::SetOption { win, name, value } => {
                 let id = resolve_win(self, win);
-                // The window options nxvim honors (number / relativenumber) are
-                // booleans; a numeric value for one of them is meaningless, so it
-                // is ignored rather than silently coerced.
-                if let OptionValue::Bool(b) = value {
-                    self.editor.set_window_option_bool(id, &name, b);
+                // Window-local options span all three kinds: booleans
+                // (number / relativenumber), numbers (numberwidth), and strings
+                // (signcolumn). Route each to the matching typed setter; a kind that
+                // doesn't fit the named option is ignored rather than coerced.
+                match value {
+                    OptionValue::Bool(b) => self.editor.set_window_option_bool(id, &name, b),
+                    OptionValue::Number(n) => self.editor.set_window_option_num(id, &name, n),
+                    OptionValue::String(s) => self.editor.set_window_option_str(id, &name, &s),
                 }
             }
             WindowOp::Close { win, force } => {
@@ -1473,6 +1476,8 @@ impl EditHost {
                     height: ch as u64,
                     number: opts.number,
                     relativenumber: opts.relativenumber,
+                    numberwidth: opts.numberwidth as u64,
+                    signcolumn: opts.signcolumn.to_string(),
                     // `winsaveview()` reports `topline` 1-based; `top` is 0-based.
                     topline: (top + 1) as u64,
                     leftcol: leftcol as u64,

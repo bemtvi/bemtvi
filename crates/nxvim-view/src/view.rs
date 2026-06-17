@@ -151,10 +151,11 @@ pub struct WindowView {
     /// Per visible row, the gutter diagnostic sign painted in the reserved sign
     /// column (`Some((glyph, severity, style_id))`), or `None` for a blank cell.
     pub diagnostics_signs: Vec<Option<DiagSign>>,
-    /// Whether this window reserves a 2-cell sign column left of the number gutter
-    /// (vim's `signcolumn=auto`: true once the buffer has a diagnostic and signs
-    /// are on). False keeps the old gutter layout.
-    pub sign_column: bool,
+    /// Width in cells of the sign column reserved left of the number gutter (vim's
+    /// `signcolumn`). `0` keeps the old gutter layout; otherwise it is a multiple of
+    /// 2 (each sign column is 2 cells). The server resolves the `signcolumn` policy
+    /// against the signs present, so the client just reserves this many cells.
+    pub sign_width: u16,
     /// Per visible row, the inline LSP inlay hints `(col, text, style_id)` in
     /// screen columns, sorted left to right. The renderer inserts each hint's text
     /// at its column, shifting the real glyphs (and the cursor) right. Empty inner
@@ -818,9 +819,7 @@ fn parse_window(m: &[(Value, Value)], styles: &[Style]) -> WindowView {
         virt_text: parse_virt_text(map_get(m, "virt_text")),
         virt_lines: parse_virt_lines(map_get(m, "virt_lines")),
         diagnostics_signs: parse_diagnostics_signs(map_get(m, "diagnostics_signs")),
-        sign_column: map_get(m, "sign_column")
-            .and_then(Value::as_bool)
-            .unwrap_or(false),
+        sign_width: map_u16(m, "sign_width"),
         inlay_hints: parse_inlay_hints(map_get(m, "inlay_hints")),
         scroll,
         numbers: parse_numbers(map_get(m, "numbers")),

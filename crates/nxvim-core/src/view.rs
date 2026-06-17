@@ -402,6 +402,11 @@ pub struct WindowView {
     pub relativenumber: bool,
     /// Width in cells of the number column (`0` when both options are off).
     pub number_width: usize,
+    /// This window's `'signcolumn'` policy. Carried so the server (which owns the
+    /// diagnostics that fill the column) can resolve it to a rendered sign width;
+    /// core itself only consults its [`floor`](crate::SignColumn::floor_cells) for
+    /// text-width math.
+    pub signcolumn: crate::options::SignColumn,
     /// This window's buffer `tabstop`: the width the client must expand a `\t`
     /// to, so its tab rendering matches the server's [`cursor_screen_col`] (which
     /// is computed with this same value). A client that hard-codes a different
@@ -943,6 +948,7 @@ fn window_view(ed: &Editor, w: &WindowLayout) -> WindowView {
         number: w.options.number,
         relativenumber: w.options.relativenumber,
         number_width,
+        signcolumn: w.options.signcolumn,
         tabstop: buf.options.effective_tabstop(),
         floating: w.floating,
         border: w.border,

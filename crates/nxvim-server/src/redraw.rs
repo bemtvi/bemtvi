@@ -343,19 +343,22 @@ impl EditHost {
         // Shared like `virt_text`.
         let virt_lines = self.virt_lines_value(&virt_lines, styles);
         #[cfg(feature = "native")]
-        let (diagnostics, diagnostics_virt, diagnostics_signs, sign_column, inlay_hints) = (
+        let (diagnostics, diagnostics_virt, diagnostics_signs, sign_width, inlay_hints) = (
             self.diagnostics_for(win.buffer, &numbers, styles),
             self.diagnostics_virt_text_for(win.buffer, &numbers, styles),
             self.diagnostics_signs_for(win.buffer, &numbers, styles),
-            self.diagnostics_sign_column(win.buffer),
+            self.sign_width_for(win.buffer, &numbers, win.signcolumn),
             self.inlay_hints_for(win.buffer, &numbers, styles),
         );
+        // The browser build has no diagnostics, so signs never appear; the sign
+        // width still honors a fixed `yes` policy (its `floor`) so the layout matches
+        // what core reserved.
         #[cfg(not(feature = "native"))]
-        let (diagnostics, diagnostics_virt, diagnostics_signs, sign_column, inlay_hints) = (
+        let (diagnostics, diagnostics_virt, diagnostics_signs, sign_width, inlay_hints) = (
             Value::Array(Vec::new()),
             Value::Array(Vec::new()),
             Value::Array(Vec::new()),
-            false,
+            win.signcolumn.floor_cells() as u16,
             Value::Array(Vec::new()),
         );
         let scroll = match &win.scroll {
@@ -481,7 +484,7 @@ impl EditHost {
             (Value::from("virt_text"), virt_text),
             (Value::from("virt_lines"), virt_lines),
             (Value::from("diagnostics_signs"), diagnostics_signs),
-            (Value::from("sign_column"), Value::from(sign_column)),
+            (Value::from("sign_width"), Value::from(sign_width as u64)),
             (Value::from("inlay_hints"), inlay_hints),
             (Value::from("status"), status),
             // Whether this window paints its own status row (per `'laststatus'`).

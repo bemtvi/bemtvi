@@ -58,6 +58,12 @@ pub struct WindowMirror {
     pub height: u64,
     pub number: bool,
     pub relativenumber: bool,
+    /// `numberwidth` — the minimum number-gutter width (so `vim.wo`/`vim.o` read it
+    /// back).
+    pub numberwidth: u64,
+    /// `signcolumn` in its string form (`no`/`auto`/`auto:1-3`/`yes`/`yes:2`),
+    /// for `vim.wo`/`vim.o` read-back.
+    pub signcolumn: String,
     /// First visible buffer line, 1-based (neovim's `winsaveview().topline`).
     pub topline: u64,
     /// First visible screen column (`winsaveview().leftcol`).

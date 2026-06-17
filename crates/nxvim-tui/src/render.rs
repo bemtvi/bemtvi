@@ -18,10 +18,6 @@ use nxvim_view::{
     VirtChunk, VirtPlacement, WindowRegion, WindowView,
 };
 
-/// Width in cells of the diagnostic sign column when reserved (vim's fixed
-/// 2-cell `signcolumn`, independent of the number gutter's width).
-const SIGN_WIDTH: u16 = 2;
-
 /// Convert a neutral [`nxvim_view::Style`] into the ratatui [`Style`] the renderer
 /// paints. `fg`/`bg` become truecolor, `sp` the underline color, and each flag its
 /// modifier. ratatui has no undercurl modifier, so `undercurl` aliases to
@@ -813,11 +809,11 @@ fn render_window(
         frame.render_widget(Block::default().style(normal), text_area);
     }
 
-    // Reserve a 2-cell diagnostic sign column at the far left (vim's signcolumn,
-    // left of the number gutter) when this window's buffer has diagnostics and
-    // signs are on. Its glyphs are painted below, once the style palette is built.
-    let (sign_area, gutter_area) = if win.sign_column {
-        let cols = Layout::horizontal([Constraint::Length(SIGN_WIDTH), Constraint::Min(0)])
+    // Reserve the diagnostic sign column at the far left (vim's signcolumn, left of
+    // the number gutter). Its width comes from the server's resolved `signcolumn`
+    // policy (`0` = no column); glyphs are painted below, once the palette is built.
+    let (sign_area, gutter_area) = if win.sign_width > 0 {
+        let cols = Layout::horizontal([Constraint::Length(win.sign_width), Constraint::Min(0)])
             .split(text_area);
         (Some(cols[0]), cols[1])
     } else {
@@ -2691,8 +2687,9 @@ fn text_inner_rect(width: u16, height: u16, view: &View) -> Rect {
     };
     // Reserve the sign column first (left of the number gutter), mirroring
     // `render_window`, so the popup anchors past both gutters.
-    let gutter_area = if win.sign_column {
-        Layout::horizontal([Constraint::Length(SIGN_WIDTH), Constraint::Min(0)]).split(text_area)[1]
+    let gutter_area = if win.sign_width > 0 {
+        Layout::horizontal([Constraint::Length(win.sign_width), Constraint::Min(0)])
+            .split(text_area)[1]
     } else {
         text_area
     };

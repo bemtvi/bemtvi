@@ -1114,6 +1114,9 @@ pub(crate) fn install_runtime_api(
                 mlua::Value::Boolean(b) => Some(OptionValue::Bool(b)),
                 mlua::Value::Integer(n) => Some(OptionValue::Number(lua_i64(n))),
                 mlua::Value::Number(n) => Some(OptionValue::Number(n as i64)),
+                mlua::Value::String(s) => {
+                    s.to_str().ok().map(|s| OptionValue::String(s.to_string()))
+                }
                 _ => None,
             };
             if let Some(value) = value {

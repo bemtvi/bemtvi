@@ -249,14 +249,51 @@ impl EditHost {
         Value::Array(rows)
     }
 
-    /// Whether this window reserves a gutter sign column: `signs` is enabled and
-    /// the window's buffer currently has at least one diagnostic. Matches vim's
-    /// `signcolumn=auto` — a clean buffer (or `signs = false`) keeps its old layout.
-    pub(crate) fn diagnostics_sign_column(&self, buffer: nxvim_core::BufferId) -> bool {
-        self.diag_config.signs
-            && self
-                .diagnostics_of(buffer)
-                .is_some_and(|(d, _)| !d.is_empty())
+    /// The rendered sign-column width in cells for a window, resolving its
+    /// `'signcolumn'` policy against the signs actually present. Each sign column is
+    /// 2 cells (vim). A diagnostic places at most one sign per line today, so the
+    /// busiest visible line has 0 or 1 sign; the policy then decides the width:
+    /// `no` → 0; `auto`/`auto:min-max` → 0 when no visible line has a sign, else
+    /// `clamp(signs, min, max)` columns; `yes`/`yes:min-max` → `clamp(signs, min,
+    /// max)` columns (so at least `min`, even on a clean buffer). When more sign
+    /// sources arrive this widens automatically. Gated on `diag_config.signs`: with
+    /// signs off, no diagnostic places a sign, so the busiest line has 0.
+    pub(crate) fn sign_width_for(
+        &self,
+        buffer: nxvim_core::BufferId,
+        numbers: &[Option<usize>],
+        signcolumn: nxvim_core::SignColumn,
+    ) -> u16 {
+        use nxvim_core::SignColumn;
+        if matches!(signcolumn, SignColumn::No) {
+            return 0;
+        }
+        // The busiest visible line's sign count (0 or 1 today). A sign shows on a
+        // visible numbered row when a diagnostic starts on that buffer line.
+        let max_signs: u16 = if self.diag_config.signs {
+            self.diagnostics_of(buffer).map_or(0, |(diags, _)| {
+                let has = numbers.iter().flatten().any(|n| {
+                    let line = (*n - 1) as u32;
+                    diags.iter().any(|d| d.range.start.line == line)
+                });
+                u16::from(has)
+            })
+        } else {
+            0
+        };
+        let cols = match signcolumn {
+            SignColumn::No => 0,
+            SignColumn::Auto { min, max } => {
+                if max_signs == 0 {
+                    0
+                } else {
+                    max_signs.clamp(min, max)
+                }
+            }
+            // `clamp` lower-bounds at `min`, so `yes` always reserves its minimum.
+            SignColumn::Yes { min, max } => max_signs.clamp(min, max),
+        };
+        cols * 2
     }
 
     /// The message of the highest-severity diagnostic whose range covers the

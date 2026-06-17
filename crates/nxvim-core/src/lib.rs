@@ -49,7 +49,7 @@ pub use highlight::{parse_color, Highlights, HlDef, Rgb, Style};
 pub use host::{DirEntry, FileStat, HostFs, StdHostFs};
 pub use input::{key_to_notation, parse_keys, Key, KeyCode, MouseAction, MouseButton, MouseEvent};
 pub use mode::{KeyContext, Mode};
-pub use options::{BufferOptions, Options, WindowOptions};
+pub use options::{BufferOptions, Options, SignColumn, WindowOptions};
 pub use snippet::{parse_snippet, ParsedSnippet, SnippetError, TabStop};
 pub use syntax::{IndentParams, OpenOutcome, Span, SyntaxEngine};
 pub use view::{ContentFloatView, MenuView, PanelView, TabView, View, ViewRect, WindowView};

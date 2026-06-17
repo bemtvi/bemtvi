@@ -40,6 +40,7 @@ impl Editor {
         rect_width
             .saturating_sub(2 * inset)
             .saturating_sub(number_width)
+            .saturating_sub(options.signcolumn.floor_cells())
     }
 
     /// The last real line index (`line_count - 1`, saturating). The rope's phantom

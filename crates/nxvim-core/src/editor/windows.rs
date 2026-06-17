@@ -1039,6 +1039,35 @@ impl Editor {
         }
     }
 
+    /// Set a numeric window-local option on window `id` (`vim.wo` /
+    /// `nvim_win_set_option`), the numeric analogue of
+    /// [`Editor::set_window_option_bool`]. Recognizes `numberwidth` (clamped to a
+    /// `1` minimum, like the `:set` path); a no-op for any other name or unknown id.
+    pub fn set_window_option_num(&mut self, id: WindowId, name: &str, value: i64) {
+        let Some(t) = self.tree_of_window_mut(id) else {
+            return;
+        };
+        let w = t.get_mut(id);
+        if name == "numberwidth" {
+            w.options.numberwidth = value.max(1) as usize;
+        }
+    }
+
+    /// Set a string window-local option on window `id` (`vim.wo` /
+    /// `nvim_win_set_option`), the string analogue of
+    /// [`Editor::set_window_option_bool`]. Recognizes `signcolumn` (an invalid value
+    /// is ignored, matching the no-op-on-bad-input contract of the other bridge
+    /// setters); a no-op for any other name or unknown id.
+    pub fn set_window_option_str(&mut self, id: WindowId, name: &str, value: &str) {
+        if name == "signcolumn" {
+            if let Some(scl) = crate::options::SignColumn::parse(value) {
+                if let Some(t) = self.tree_of_window_mut(id) {
+                    t.get_mut(id).options.signcolumn = scl;
+                }
+            }
+        }
+    }
+
     /// Set a boolean global option from outside the editor (the Lua `vim.o`
     /// bridge), the global analogue of [`Editor::set_window_option_bool`]. The
     /// wired global options are all the search booleans; an unknown name is a
@@ -1198,14 +1227,15 @@ impl Editor {
         })
     }
 
-    /// Window `id`'s text offset — the number-gutter width, the columns before the
-    /// first text cell. `None` for an unknown id. Feeds the server's screen-column
-    /// math for `vim.fn.screencol`.
+    /// Window `id`'s text offset — the gutter columns before the first text cell
+    /// (the number gutter plus the sign-column floor core can know about). `None`
+    /// for an unknown id. Feeds the server's screen-column math for
+    /// `vim.fn.screencol`.
     pub fn window_textoff(&self, id: WindowId) -> Option<usize> {
         let (_, t) = self.tree_of_window(id)?;
         let w = t.get(id);
         let lines = self.buffers.get(w.buffer).buffer.line_count();
-        Some(self.number_width_for(w.options, lines))
+        Some(self.number_width_for(w.options, lines) + w.options.signcolumn.floor_cells())
     }
 
     /// Scroll window `id` so its first visible line is `top` (0-based), clamped to

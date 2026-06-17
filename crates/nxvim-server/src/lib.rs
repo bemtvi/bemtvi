@@ -62,7 +62,9 @@ mod evloop;
 mod host;
 #[cfg(feature = "native")]
 mod inbound;
-#[cfg(feature = "native")]
+// The LSP consumer subtree is synchronous and tick-driven — shared by the native
+// build (events from the async `LspManager`) and the wasm build (events from the
+// `SyncLspClient`); only the outbound seam + inbound delivery differ by `cfg`.
 mod lsp;
 #[cfg(feature = "native")]
 mod quic;
@@ -132,7 +134,6 @@ use evloop::{EventLoop, LoopCommand, LoopEvent};
 use keymap::Keymaps;
 #[cfg(feature = "native")]
 use keymap::{BuiltinAction, NativeDefault};
-#[cfg(feature = "native")]
 use lsp::{
     DiagnosticConfig, InlayResolveTarget, LspComplete, LspDocState, LspReqKind, PendingLspReq,
     ServerRuntime,
@@ -142,7 +143,8 @@ use nxvim_core::{
     WindowId,
 };
 #[cfg(feature = "native")]
-use nxvim_lsp::{CodeActionData, LspManager, ServerKey};
+use nxvim_lsp::LspManager;
+use nxvim_lsp::{CodeActionData, ServerKey};
 use nxvim_lua::LuaRuntime;
 #[cfg(feature = "native")]
 use nxvim_rpc::{connect, Incoming};
@@ -416,95 +418,77 @@ pub struct EditHost {
     /// Languages whose *on-disk* treesitter queries have already been resolved
     /// Per-buffer LSP document-sync state, keyed by buffer id (the `syntax_states`
     /// analogue).
-    #[cfg(feature = "native")]
     lsp_states: HashMap<BufferId, LspDocState>,
     /// Negotiated runtime state (encoding, sync kind) per started server, learned
     /// from each `initialize` reply.
-    #[cfg(feature = "native")]
     lsp_servers: HashMap<ServerKey, ServerRuntime>,
     /// Server keys already handed to `ensure_server`, so a server is requested
     /// once rather than on every redraw (a lazy-start guard).
-    #[cfg(feature = "native")]
     lsp_ensured: HashSet<ServerKey>,
     /// The next LSP client id to assign. Each `(name, root)` server gets one,
     /// stable across respawns (reused when its runtime is replaced), and it is
     /// the handle `LspAttach`'s `data.client_id` carries to Lua (Slice 3).
-    #[cfg(feature = "native")]
     next_lsp_client_id: u64,
     /// Set when an LSP event changed something the client should see (e.g. a fresh
     /// `Initialized` that should trigger a `didOpen`). Coalesced per loop turn so a
     /// burst of replies costs one repaint.
-    #[cfg(feature = "native")]
     lsp_dirty: bool,
     /// Monotonic generation counter stamped onto each language-feature request,
     /// so a reply whose generation is behind the latest of its kind is dropped
     /// (Decision 3 — the go-to analogue of the syntax `tick`).
-    #[cfg(feature = "native")]
     lsp_req_gen: u64,
     /// The in-flight language-feature request per kind (definition, references,
     /// …), used to match a reply to its intent and drop stale ones.
-    #[cfg(feature = "native")]
     lsp_requests: HashMap<LspReqKind, PendingLspReq>,
     /// In-flight `inlayHint/resolve`s, keyed by the `cb_id` their token carries.
     /// Unlike the single-slot `lsp_requests`, many lazy hints can resolve at once,
     /// so each gets a distinct `cb_id` (from `inlay_resolve_seq`) and routes back
     /// by it — the [`InlayResolveTarget`] records which placeholder span to fill.
-    #[cfg(feature = "native")]
     inlay_resolves: HashMap<u64, InlayResolveTarget>,
     /// Monotonic source of `cb_id`s for `inlay_resolves` (never reused, so a stale
     /// reply for a superseded resolve finds no target and is dropped).
-    #[cfg(feature = "native")]
     inlay_resolve_seq: u64,
     /// Whether the engine's built-in `lsp` completion source is configured
     /// (`nx.complete.setup{ sources = { { "lsp" } } }`). When set, an engine trigger
     /// issues `textDocument/completion` and streams the reply into the unified menu;
     /// accepting an LSP row delegates back here to apply its `textEdit`. Phase 4-C —
     /// the bespoke pmenu it replaces is gone.
-    #[cfg(feature = "native")]
     complete_lsp_active: bool,
     /// Merge priority of the `lsp` source (rows rank above lower-priority sources).
-    #[cfg(feature = "native")]
     complete_lsp_priority: i32,
     /// The current LSP completion's raw items + word anchor, indexed by the
     /// `MenuItem.key` the engine carries, so a delegated accept can apply the chosen
     /// item's `textEdit` / `additionalTextEdits`. `None` when no LSP completion is in
     /// view. Phase 4-C.
-    #[cfg(feature = "native")]
     lsp_complete: Option<LspComplete>,
     /// The `lsp_complete.items` index of the completion row a `completionItem/resolve`
     /// is currently in flight for (the docs sidebar's lazy-docs fetch, Phase 4-D), so a
     /// reply updates the right item and the trigger doesn't re-issue while it is
     /// pending. `None` when no resolve is outstanding. Reset whenever a fresh completion
     /// list lands ([`EditHost::on_completion_reply`]). Phase 4-D.
-    #[cfg(feature = "native")]
     lsp_complete_resolve_key: Option<usize>,
     /// Resolved lazy docs for **plugin** completion rows (`nx.complete.source`'s
     /// `resolve` callback), keyed by the row's resolve handle. An entry (even `""` ⇒
     /// resolved-but-docless) means the docs are in hand and the sidebar renders them
     /// without re-asking. Cleared each fresh completion run (the handles die with the
     /// old menu). Native-only, like the LSP docs cache. Phase 4-E.
-    #[cfg(feature = "native")]
     complete_resolve_docs: std::collections::HashMap<u64, String>,
     /// The resolve handle a plugin-row `resolve` is currently in flight for, so the
     /// per-key trigger doesn't re-issue while it's pending. `None` when none is
     /// outstanding; cleared when the reply lands or a fresh run resets the cache.
     /// Phase 4-E.
-    #[cfg(feature = "native")]
     complete_resolve_inflight: Option<u64>,
     /// The code actions currently listed in the `:LspCodeAction` panel (Phase 6),
     /// indexed by panel select. A `<CR>` on row `i` applies `lsp_code_actions[i]`'s
     /// edit; cleared on apply. Empty when no code-action panel is active.
-    #[cfg(feature = "native")]
     lsp_code_actions: Vec<CodeActionData>,
     /// The `vim.diagnostic.config` keys with a backing surface — the underline
     /// spans and the inline virtual text — toggled by `vim.diagnostic.config`.
-    #[cfg(feature = "native")]
     diag_config: DiagnosticConfig,
     /// The editor-wide semantic-tokens gate (Phase 3), toggled by
     /// `vim.lsp.semantic_tokens.enable`. Default on; `false` hides the semantic
     /// paint everywhere and stops the refresh requests (the per-buffer
     /// `LspDocState::semantic_enabled` is the narrower override).
-    #[cfg(feature = "native")]
     semantic_tokens_enabled: bool,
     /// Registered snippets per filetype (`nx.snippet.add`), feeding the `snippets`
     /// completion source. String bodies only in this phase. Feature-agnostic (the
@@ -775,41 +759,23 @@ impl EditHost {
             ui: None,
             #[cfg(feature = "native")]
             syntax_states: HashMap::new(),
-            #[cfg(feature = "native")]
             lsp_states: HashMap::new(),
-            #[cfg(feature = "native")]
             lsp_servers: HashMap::new(),
-            #[cfg(feature = "native")]
             lsp_ensured: HashSet::new(),
-            #[cfg(feature = "native")]
             next_lsp_client_id: 1,
-            #[cfg(feature = "native")]
             lsp_dirty: false,
-            #[cfg(feature = "native")]
             lsp_req_gen: 0,
-            #[cfg(feature = "native")]
             lsp_requests: HashMap::new(),
-            #[cfg(feature = "native")]
             inlay_resolves: HashMap::new(),
-            #[cfg(feature = "native")]
             inlay_resolve_seq: 0,
-            #[cfg(feature = "native")]
             complete_lsp_active: false,
-            #[cfg(feature = "native")]
             complete_lsp_priority: 0,
-            #[cfg(feature = "native")]
             lsp_complete: None,
-            #[cfg(feature = "native")]
             lsp_complete_resolve_key: None,
-            #[cfg(feature = "native")]
             complete_resolve_docs: std::collections::HashMap::new(),
-            #[cfg(feature = "native")]
             complete_resolve_inflight: None,
-            #[cfg(feature = "native")]
             lsp_code_actions: Vec::new(),
-            #[cfg(feature = "native")]
             diag_config: DiagnosticConfig::default(),
-            #[cfg(feature = "native")]
             semantic_tokens_enabled: true,
             snippet_store: HashMap::new(),
             complete_snippets_active: false,
@@ -1343,6 +1309,48 @@ impl EditHost {
         }
         self.apply_lua_effects();
         self.settle_events(true);
+    }
+
+    /// Feed one `lsp_stdout` push (the LSP leg's daemon→edit-host direction) into the
+    /// [`SyncLspClient`](nxvim_lsp::SyncLspClient), then drain the events it produced —
+    /// the wasm twin of the native run loop's `lsp_events` arm ([`on_lsp_events`]). The
+    /// feed may complete a handshake or land a reply, which `on_lsp_event` turns into a
+    /// `didOpen` / hover float / diagnostics; the outbound JSON-RPC those issue is flushed
+    /// to the daemon by the host (drained by the Worker after this call). The Worker calls
+    /// this from `RpcClient.onNotify`.
+    ///
+    /// [`on_lsp_events`]: EditHost::on_lsp_events
+    pub fn lsp_stdout(&mut self, id: u64, bytes: Vec<u8>) {
+        self.fx.lsp_stdout(id, bytes);
+        self.drain_lsp_events();
+    }
+
+    /// Feed one `lsp_stderr` push — dropped (diagnostic only; the browser has no LSP log
+    /// file, and the native manager only logs a server's stderr). No event, so no settle.
+    pub fn lsp_stderr(&mut self, id: u64, bytes: Vec<u8>) {
+        self.fx.lsp_stderr(id, bytes);
+    }
+
+    /// Land an `lsp_exited` push: the server (wire `id`) exited or its pipe closed. The
+    /// `SyncLspClient` surfaces an `LspEvent::ServerExited`, drained here so the editor
+    /// tells the user (it re-`ensure`s on the next `FileType`). A negative `code`/`signal`
+    /// means "not collected" (a kill, a dropped link), per the proc-leg convention.
+    pub fn lsp_exited(&mut self, id: u64, code: i32, signal: i32) {
+        let code = (code >= 0).then_some(code);
+        let signal = (signal >= 0).then_some(signal);
+        self.fx.lsp_exited(id, code, signal);
+        self.drain_lsp_events();
+    }
+
+    /// Drain the `SyncLspClient`'s distilled events into `on_lsp_event` and settle — the
+    /// wasm analogue of the native [`on_lsp_events`](EditHost::on_lsp_events), which drains
+    /// the `lsp_events` channel. Coalesces a burst into one repaint via `lsp_dirty`.
+    fn drain_lsp_events(&mut self) {
+        for event in self.fx.lsp_take_events() {
+            self.on_lsp_event(event);
+        }
+        let dirty = std::mem::take(&mut self.lsp_dirty);
+        self.settle_events(dirty);
     }
 
     /// Land a streaming `nx.fs.watch` change batch (the daemon `luafs_change` push) — the wasm

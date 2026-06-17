@@ -195,6 +195,16 @@ impl EditHost {
                 abs.parent().map(Path::to_path_buf).unwrap_or(abs)
             });
         let key = ServerKey { name, root };
+        // A serverless browser session (no daemon) has no process host to run a
+        // language server on, so fail *loud* rather than silently no-op (Phase 6e).
+        // Native always has a process host; with a daemon the wasm build runs the
+        // server there over the `lsp_*` wire.
+        #[cfg(not(feature = "native"))]
+        if !self.fx.has_remote_lsp() {
+            self.editor
+                .echo("E: language servers require a daemon — :connect to one to use LSP");
+            return;
+        }
         // Spawn command: `$NXVIM_LSP_CMD` overrides the whole argv (the mock hook,
         // the LSP analogue of `NXVIM_TS_WORKER`), else the config's `cmd`. An
         // empty command can't start a server. The resolved config's

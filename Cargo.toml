@@ -43,7 +43,10 @@ nxvim-lua = { path = "crates/nxvim-lua" }
 nxvim-tui = { path = "crates/nxvim-tui" }
 nxvim-gui = { path = "crates/nxvim-gui" }
 nxvim-ts = { path = "crates/nxvim-ts" }
-nxvim-lsp = { path = "crates/nxvim-lsp" }
+# `default-features = false` so the wasm build (`nxvim-server --no-default-features`)
+# drops nxvim-lsp's `native` (tokio + async-lsp); native consumers turn it back on
+# via `nxvim-server`'s `native` feature → `nxvim-lsp/native` (feature unification).
+nxvim-lsp = { path = "crates/nxvim-lsp", default-features = false }
 nxvim-view = { path = "crates/nxvim-view" }
 nxvim-regex = { path = "crates/nxvim-regex" }
 # Test-only harness (a single Lua backend, PUC lua54, baked in via mlua).

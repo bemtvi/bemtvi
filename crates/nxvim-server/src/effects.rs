@@ -416,16 +416,13 @@ impl EditHost {
         }
         // Server-start requests from `vim.lsp.start` (the `vim.lsp.enable` FileType
         // dispatcher) bind a buffer to its language server and ensure it is spawned.
-        // Native only — a serverless browser build has no language servers (Phase 6);
-        // a config that tries fails *loud* rather than silently dropping the request.
-        #[cfg(feature = "native")]
+        // The consumer (`apply_lsp_op`) is shared: native runs servers through the
+        // async `LspManager`, wasm through the `SyncLspClient` over the daemon wire
+        // (Phase 6e). A serverless browser session (no daemon) has no process host, so
+        // `apply_lsp_op`'s server-start path fails *loud* there rather than silently
+        // dropping the request — see its `has_remote_lsp` guard.
         for op in self.lua.take_lsp_ops() {
             self.apply_lsp_op(op);
-        }
-        #[cfg(not(feature = "native"))]
-        if !self.lua.take_lsp_ops().is_empty() {
-            self.editor
-                .echo("E: language servers (vim.lsp) are not available in the browser build yet");
         }
         // Async-runtime requests from `vim.schedule` / `vim.defer_fn` / `nx.run` /
         // `nx.timer` / async `vim.system`: a `Schedule` is serviced directly (queued

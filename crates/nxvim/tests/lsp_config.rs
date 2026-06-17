@@ -65,10 +65,23 @@ async fn poll_float_lines(
         return None;
     };
     match map_get(float, "lines") {
+        // Each wire line is a chunk run `[[text, style_id], …]` (the `virt_lines`
+        // form, since the inline-float-highlighting change); an LSP hover/signature
+        // is one un-styled chunk per line, so concatenate the chunk texts to recover
+        // the plain line. (Mirrors the same helper in `lsp_float.rs`.)
         Some(Value::Array(lines)) => Some(
             lines
                 .iter()
-                .map(|l| l.as_str().unwrap_or("").to_string())
+                .map(|row| {
+                    row.as_array()
+                        .map(|chunks| {
+                            chunks
+                                .iter()
+                                .filter_map(|c| c.as_array()?.first()?.as_str())
+                                .collect::<String>()
+                        })
+                        .unwrap_or_default()
+                })
                 .collect(),
         ),
         _ => Some(Vec::new()),

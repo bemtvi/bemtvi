@@ -39,8 +39,13 @@ use crate::daemon::{FsRead, HostFsAsync};
 use crate::evloop::{EventLoop, LoopCommand};
 #[cfg(feature = "native")]
 use crate::save::SaveDone;
+// The LSP seam data types are always on (the seam is shared); `LspManager` (the
+// async client) and `LspEvent` are native-only.
+#[cfg(not(feature = "native"))]
+use nxvim_lsp::LspEvent;
 #[cfg(feature = "native")]
-use nxvim_lsp::{LspManager, LspNotify, LspRequest, ReqToken, ServerKey, ServerSpawn};
+use nxvim_lsp::LspManager;
+use nxvim_lsp::{LspNotify, LspRequest, ReqToken, ServerKey, ServerSpawn};
 #[cfg(feature = "native")]
 use nxvim_rpc::Rpc;
 #[cfg(feature = "native")]
@@ -214,21 +219,48 @@ pub trait HostEffects {
 
     /// LSP — ensure `key`'s language server is running (idempotent), spawning it via
     /// `spawn` on first use. Fire-and-forget; the server's notifications and reply
-    /// stream return *inbound* on the run loop's `lsp_events` arm, not here. Native-only
-    /// for now — a serverless browser build has no language servers (that's Phase 6).
-    #[cfg(feature = "native")]
+    /// stream return *inbound* — on the native run loop's `lsp_events` arm, or (wasm)
+    /// via [`lsp_take_events`](Self::lsp_take_events). Native runs a local/daemon child
+    /// through the `LspManager`; wasm drives the `SyncLspClient` over the daemon wire.
     fn lsp_ensure(&mut self, key: ServerKey, spawn: ServerSpawn);
 
     /// LSP — fire-and-forget a document-sync notification (`didOpen` / `didChange` /
     /// `didSave` / `didClose`) at `key`'s server. Dropped if no such server is running.
-    #[cfg(feature = "native")]
     fn lsp_notify(&mut self, key: ServerKey, note: LspNotify);
 
     /// LSP — fire a language-feature request at `key`'s server; its reply returns later
     /// *inbound* as an `LspEvent::Reply` carrying `token` (the editor never awaits the
     /// round-trip). Dropped if no such server is running.
-    #[cfg(feature = "native")]
     fn lsp_request(&mut self, key: ServerKey, token: ReqToken, req: LspRequest);
+
+    /// LSP (wasm) — feed one `lsp_stdout` push from the daemon into the `SyncLspClient`,
+    /// which parses its framed JSON-RPC. Native delivers stdout through the manager's
+    /// `async-lsp` loop instead, so this is wasm-only.
+    #[cfg(not(feature = "native"))]
+    fn lsp_stdout(&mut self, id: u64, bytes: Vec<u8>);
+
+    /// LSP (wasm) — feed one `lsp_stderr` push (diagnostic only; dropped, as the browser
+    /// has no LSP log file). Wasm-only.
+    #[cfg(not(feature = "native"))]
+    fn lsp_stderr(&mut self, id: u64, bytes: Vec<u8>);
+
+    /// LSP (wasm) — the server (wire `id`) exited or its pipe closed; the `SyncLspClient`
+    /// surfaces an `LspEvent::ServerExited`. `code`/`signal` are `None` when not collected
+    /// (negative on the wire). Wasm-only.
+    #[cfg(not(feature = "native"))]
+    fn lsp_exited(&mut self, id: u64, code: Option<i32>, signal: Option<i32>);
+
+    /// LSP (wasm) — drain the distilled [`LspEvent`]s the `SyncLspClient` produced (the
+    /// browser analogue of the native run loop's `lsp_events` channel), fed to
+    /// `on_lsp_event`. Wasm-only.
+    #[cfg(not(feature = "native"))]
+    fn lsp_take_events(&mut self) -> Vec<LspEvent>;
+
+    /// LSP (wasm) — whether a daemon is connected to run language servers on. A
+    /// serverless browser session has none, so `vim.lsp.start` fails *loud* rather than
+    /// silently doing nothing. Wasm-only (native always has a process host).
+    #[cfg(not(feature = "native"))]
+    fn has_remote_lsp(&self) -> bool;
 
     /// `:TSInstall` — fetch + compile `lang`'s treesitter grammar into the data dir off
     /// the editor thread (network + a C compile, seconds long). Fire-and-forget; the

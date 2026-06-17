@@ -32,7 +32,10 @@ native = [
     "dep:serde",
     "dep:notify",
     "dep:nxvim-rpc",
-    "dep:nxvim-lsp",
+    # nxvim-lsp is a non-optional dep (its wasm-safe data + sync client are used by
+    # the always-on lsp/ consumer subtree); the `native` feature turns on its async
+    # surface (the tokio + async-lsp manager/transport) for the desktop build.
+    "nxvim-lsp/native",
     "dep:nxvim-ts",
     "dep:portable-pty",
 ]
@@ -73,7 +76,7 @@ portable-pty = { workspace = true, optional = true }
 nxvim-core = { workspace = true, features = ["vim-regex"] }
 nxvim-rpc = { workspace = true, optional = true }
 nxvim-lua.workspace = true
-nxvim-lsp = { workspace = true, optional = true }
+nxvim-lsp.workspace = true
 # In-process treesitter: the server constructs the engine and installs it on the
 # editor, which owns and queries it synchronously (no worker process). Native only
 # — it shells out to a C compiler at `:TSInstall` and `dlopen`s the grammar, neither

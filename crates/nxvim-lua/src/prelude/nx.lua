@@ -46,15 +46,31 @@ end
 -- `nx.dock.opt(side).<name> = <value>` or inline in `nx.dock.open{...}`; read back
 -- through the same proxy. `nx._dock_opts` is a write-through cache keyed by side,
 -- and `nx.dock._set_opt` (Rust) queues the change to the core. Known options:
--- `showtabline` (0/1/2), `size`, `title`, `winhighlight`, `autohide` (collapse the
--- dock when focus leaves it).
+-- `showtabline` (0/1/2), `laststatus` (0/1/2/3 — the per-dock statusline override),
+-- `size`, `title`, `winhighlight`, `autohide` (collapse the dock when focus leaves).
 nx._dock_opts = nx._dock_opts or {}
-local DOCK_OPT_DEFAULT =
-  { showtabline = nil, size = 0, title = "", winhighlight = "", autohide = false }
+local DOCK_OPT_DEFAULT = {
+  showtabline = nil,
+  laststatus = nil,
+  size = 0,
+  title = "",
+  winhighlight = "",
+  autohide = false,
+}
+-- Recognized names (a set, since `showtabline`/`laststatus` default to nil and so
+-- can't be detected via `DOCK_OPT_DEFAULT[name] == nil`).
+local DOCK_OPT_KNOWN = {
+  showtabline = true,
+  laststatus = true,
+  size = true,
+  title = true,
+  winhighlight = true,
+  autohide = true,
+}
 
 -- Apply one dock option: write-through the cache, then queue it to the core.
 local function dock_set_opt(side, name, value)
-  if DOCK_OPT_DEFAULT[name] == nil and name ~= "showtabline" then
+  if not DOCK_OPT_KNOWN[name] then
     return nx.notify("nx.dock.opt: unknown option '" .. tostring(name) .. "'", 4)
   end
   nx._dock_opts[side] = nx._dock_opts[side] or {}
@@ -89,7 +105,7 @@ nx.dock.open = function(o)
     nx._dock_opts[o.side] = nx._dock_opts[o.side] or {}
     nx._dock_opts[o.side].size = o.size
   end
-  for _, name in ipairs({ "showtabline", "title", "winhighlight", "autohide" }) do
+  for _, name in ipairs({ "showtabline", "laststatus", "title", "winhighlight", "autohide" }) do
     if o[name] ~= nil then
       dock_set_opt(o.side, name, o[name])
     end

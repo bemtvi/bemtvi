@@ -80,6 +80,7 @@ impl Editor {
             "number" => &mut self.windows.cur_mut().options.number,
             "relativenumber" => &mut self.windows.cur_mut().options.relativenumber,
             "wrap" => &mut self.windows.cur_mut().options.wrap,
+            "breakindent" => &mut self.windows.cur_mut().options.breakindent,
             "ignorecase" => &mut self.options.ignorecase,
             "smartcase" => &mut self.options.smartcase,
             "wrapscan" => &mut self.options.wrapscan,
@@ -339,6 +340,31 @@ impl Editor {
             }
             return;
         }
+        // `showbreak` / `breakindentopt` are window-local (like `wrap`), so they live
+        // on the focused window's options rather than a global string slot.
+        // `:set sbr=↪` sets the marker; `:set briopt=sbr` aligns it within the indent.
+        if name == "showbreak" {
+            match op {
+                StrOp::Set(value) => self.windows.cur_mut().options.showbreak = value,
+                StrOp::Reset => self.windows.cur_mut().options.showbreak.clear(),
+                StrOp::Query => {
+                    let v = self.windows.cur().options.showbreak.clone();
+                    self.echo(format!("showbreak={v}"));
+                }
+            }
+            return;
+        }
+        if name == "breakindentopt" {
+            match op {
+                StrOp::Set(value) => self.windows.cur_mut().options.breakindentopt = value,
+                StrOp::Reset => self.windows.cur_mut().options.breakindentopt.clear(),
+                StrOp::Query => {
+                    let v = self.windows.cur().options.breakindentopt.clone();
+                    self.echo(format!("breakindentopt={v}"));
+                }
+            }
+            return;
+        }
         // A wiring gap (see `apply_set_bool`): a string option `resolve_set` accepted
         // but no arm / the global setter handles. Fail loud, never a silent no-op.
         let unknown = |ed: &mut Self| ed.echo(format!("E518: Unknown option: {name}"));
@@ -389,7 +415,7 @@ impl Editor {
     /// buffer with `line_count` lines: `0` when both number options are off, else
     /// at least 4 cells, widening to fit the largest line number plus one trailing
     /// space. Sized per window so each gutter fits its own buffer and options.
-    pub(crate) fn number_width_for(&self, opts: WindowOptions, line_count: usize) -> usize {
+    pub(crate) fn number_width_for(&self, opts: &WindowOptions, line_count: usize) -> usize {
         if !opts.number && !opts.relativenumber {
             return 0;
         }

@@ -659,6 +659,305 @@ async fn gj_crosses_lines_and_falls_back_to_j_without_wrap() {
 }
 
 #[tokio::test]
+async fn overlays_clip_and_rebase_to_the_wrap_segment() {
+    // The proof of the segment-aware projection fix: a per-row overlay computed in
+    // full-line columns (here an inline `virt_text` extmark) is clipped to the wrap
+    // segment its anchor falls in and rebased to that row's local columns — so on a
+    // wrapped line it lands on the right continuation row, at the right column, not
+    // drifted by the segment offset. Uses an extmark (hermetic — no LSP/treesitter).
+    let (rpc, mut incoming) = start(None).await;
+    feed(
+        &rpc,
+        ":set nonumber<CR>:set norelativenumber<CR>:set wrap<CR>",
+    );
+    feed(&rpc, "i");
+    feed(&rpc, &"a".repeat(200)); // one line, wraps to 80 + 80 + 40
+    feed(&rpc, "<Esc>");
+    // Inline virt_text anchored at column 100 — inside the SECOND display row's
+    // segment [80, 160), so at row-local column 20 on row 1.
+    exec_lua(
+        &rpc,
+        r#"local ns = vim.api.nvim_create_namespace("vt")
+           vim.api.nvim_buf_set_extmark(0, ns, 0, 100, {
+               virt_text = { { "HINT", "Comment" } },
+               virt_text_pos = "inline",
+           })"#,
+    )
+    .await;
+    let map = redraw_after(&rpc, &mut incoming, "<Esc>").await;
+
+    // Per row, the inline virt_text anchor columns ([pos, col, hl_mode, chunks];
+    // pos 1 = inline).
+    let cols = |row: usize| -> Vec<u64> {
+        view_get(&map, "virt_text")
+            .and_then(Value::as_array)
+            .and_then(|rows| rows.get(row))
+            .and_then(Value::as_array)
+            .map(|places| {
+                places
+                    .iter()
+                    .filter_map(|p| {
+                        let p = p.as_array()?;
+                        (p[0].as_u64()? == 1).then(|| p[1].as_u64())?
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    assert!(
+        cols(0).is_empty(),
+        "the anchor is not on the first display row"
+    );
+    assert_eq!(
+        cols(1),
+        vec![20],
+        "inline virt_text lands on the continuation row, rebased to column 20"
+    );
+}
+
+#[tokio::test]
+async fn showbreak_prefixes_continuation_rows_and_reduces_wrap_width() {
+    // `:set showbreak=>>` draws a marker at the start of every soft-wrap continuation
+    // row; the marker consumes leading cells, so a continuation wraps into
+    // `width - marker_width` text cells. The first display row has no marker. The
+    // cursor lands past the marker on a continuation row.
+    let (rpc, mut incoming) = start(None).await;
+    feed(
+        &rpc,
+        ":set nonumber<CR>:set norelativenumber<CR>:set wrap<CR>",
+    );
+    feed(&rpc, ":set showbreak=>><CR>");
+    feed(&rpc, "i");
+    feed(&rpc, &"a".repeat(200)); // wraps to 80, then 78 + 78 + ... at width-2
+    let map = redraw_after(&rpc, &mut incoming, "<Esc>").await;
+
+    let lines = view_lines(&map);
+    assert_eq!(
+        lines[0].chars().count(),
+        80,
+        "first row: full width, no marker"
+    );
+    assert!(
+        !lines[0].starts_with(">>"),
+        "the first row carries no marker"
+    );
+    assert!(
+        lines[1].starts_with(">>"),
+        "continuation row starts with the marker"
+    );
+    assert_eq!(
+        lines[1].chars().count(),
+        80,
+        "marker (2) + 78 text cells fills the row"
+    );
+    assert_eq!(
+        &lines[1][2..],
+        &"a".repeat(78),
+        "the marker precedes the wrapped text"
+    );
+
+    // gj from the first row's start lands on the second display row, just past the
+    // marker (screen column 2), still on the same buffer line.
+    feed(&rpc, "gg0");
+    let map = redraw_after(&rpc, &mut incoming, "gj").await;
+    assert_eq!(
+        view_u64(&map, "cursor_row"),
+        1,
+        "cursor on the second display row"
+    );
+    assert_eq!(
+        view_u64(&map, "cursor_screen_col"),
+        2,
+        "cursor sits past the 2-cell marker"
+    );
+}
+
+#[tokio::test]
+async fn showbreak_and_breakindent_order_and_briopt_sbr() {
+    // With both `breakindent` and `showbreak`, vim's default draws the breakindent
+    // first and the marker right before the wrapped text (`    >>text`), so the text
+    // sits one marker-width past the indent. `:set breakindentopt=sbr` draws the
+    // marker first and absorbs its width into the indent, so the text aligns exactly
+    // under the line's indent (`>>  text`).
+    let (rpc, mut incoming) = start(None).await;
+    feed(
+        &rpc,
+        ":set nonumber<CR>:set norelativenumber<CR>:set wrap<CR>",
+    );
+    feed(&rpc, ":set breakindent<CR>:set showbreak=>><CR>");
+    feed(&rpc, "i");
+    feed(&rpc, "    "); // 4-space indent
+    feed(&rpc, &"a".repeat(200));
+    let map = redraw_after(&rpc, &mut incoming, "<Esc>").await;
+
+    // Default order: 4 indent spaces, then the marker, then text (text at column 6).
+    let lines = view_lines(&map);
+    assert_eq!(
+        &lines[1][..6],
+        "    >>",
+        "indent then marker, before the text"
+    );
+    assert_eq!(
+        &lines[1][6..],
+        &"a".repeat(74),
+        "text wraps into width - 6 cells"
+    );
+
+    // `breakindentopt=sbr`: marker first, indent reduced by its width — text aligns
+    // under the line's own indent (column 4).
+    let map = redraw_after(&rpc, &mut incoming, ":set breakindentopt=sbr<CR>").await;
+    let lines = view_lines(&map);
+    assert_eq!(
+        &lines[1][..4],
+        ">>  ",
+        "marker then reduced indent, text at column 4"
+    );
+    assert_eq!(
+        &lines[1][4..],
+        &"a".repeat(76),
+        "text wraps into width - 4 cells"
+    );
+}
+
+#[tokio::test]
+async fn breakindent_indents_continuation_rows_to_match_the_line() {
+    // `:set breakindent` indents continuation rows to match the wrapped line's own
+    // leading whitespace, so the wrapped text reads as a hanging block.
+    let (rpc, mut incoming) = start(None).await;
+    feed(
+        &rpc,
+        ":set nonumber<CR>:set norelativenumber<CR>:set wrap<CR>",
+    );
+    feed(&rpc, ":set breakindent<CR>");
+    feed(&rpc, "i");
+    feed(&rpc, "    "); // 4-space indent
+    feed(&rpc, &"a".repeat(200));
+    let map = redraw_after(&rpc, &mut incoming, "<Esc>").await;
+
+    let lines = view_lines(&map);
+    // First row: 4 indent + 76 a's = 80. Continuation rows: 4 spaces of breakindent
+    // then 76 a's (wrapped into width - 4 cells).
+    assert_eq!(lines[0].chars().count(), 80);
+    assert!(
+        lines[1].starts_with("    "),
+        "continuation indented 4 cells"
+    );
+    assert_eq!(&lines[1][..4], "    ");
+    assert_eq!(
+        &lines[1][4..],
+        &"a".repeat(76),
+        "wrapped text aligns under the line's indent"
+    );
+}
+
+#[tokio::test]
+async fn wrap_continuation_rows_are_flagged_for_a_blank_gutter() {
+    // A wrapped line's number shows on its first display row only; the client blanks
+    // the gutter on the continuation rows. The server marks them with a per-row
+    // `continuation` flag (the wire signal), while `numbers` still repeats the line
+    // number on every row (so highlights / diagnostics keep their row→line mapping
+    // and a continuation stays distinct from a `~` filler).
+    let (rpc, mut incoming) = start(None).await;
+    feed(&rpc, ":set nonumber<CR>:set norelativenumber<CR>");
+    feed(&rpc, "ishort<CR>");
+    feed(&rpc, &"a".repeat(200)); // a line that wraps to 80 + 80 + 40
+    let map = redraw_after(&rpc, &mut incoming, "<Esc>:set wrap<CR>").await;
+
+    let cont = view_continuation(&map);
+    let nums = view_numbers(&map);
+    // Row 0: "short" (line 1, first row). Rows 1..=3: line 2's first + two
+    // continuations. The first row of each line is not a continuation; the wrap
+    // rows are.
+    assert!(!cont[0], "line 1's only row is not a continuation");
+    assert!(!cont[1], "line 2's first display row is not a continuation");
+    assert!(cont[2], "line 2's second display row is a continuation");
+    assert!(cont[3], "line 2's third display row is a continuation");
+    // `numbers` still carries the line number on every row of line 2 (1-based 2).
+    assert_eq!(nums[1], Some(2));
+    assert_eq!(
+        nums[2],
+        Some(2),
+        "continuation keeps its line number on the wire"
+    );
+    assert_eq!(nums[3], Some(2));
+    // Past the buffer: `~` filler rows are neither numbered nor continuations.
+    let last = cont.len() - 1;
+    assert!(!cont[last], "a `~` filler is not a continuation");
+    assert_eq!(nums[last], None, "a `~` filler carries no number");
+}
+
+#[tokio::test]
+async fn g0_g_caret_g_dollar_move_within_the_display_row() {
+    // `g0`/`g^`/`g$` are the within-row siblings of `gj`/`gk`: they move to the
+    // first column / first non-blank / last column of the cursor's *display* row,
+    // bounded by its soft-wrap segment rather than the whole buffer line.
+    let (rpc, _incoming) = start(None).await; // bound to keep the RPC alive
+    feed(
+        &rpc,
+        ":set nonumber<CR>:set norelativenumber<CR>:set wrap<CR>",
+    );
+    feed(&rpc, "i");
+    // "  " + 198 'a's: wraps to [0,80) [80,160) [160,200). The second segment is
+    // all 'a's; the first has two leading blanks.
+    feed(&rpc, &format!("{}{}", "  ", "a".repeat(198)));
+    feed(&rpc, "<Esc>");
+    let _ = lines(&rpc).await;
+
+    // Land mid-second-segment, then snap to its edges.
+    feed(&rpc, "gg0gj10l"); // second display row (col 80) + 10 → col 90
+    assert_eq!(cursor(&rpc).await, (1, 90), "precondition: mid second row");
+    feed(&rpc, "g0");
+    assert_eq!(cursor(&rpc).await, (1, 80), "g0 → first column of the row");
+    feed(&rpc, "g$");
+    assert_eq!(cursor(&rpc).await, (1, 159), "g$ → last column of the row");
+
+    // On the first display row, g^ skips the two leading blanks; g0 does not.
+    feed(&rpc, "gg5l"); // first display row
+    feed(&rpc, "g0");
+    assert_eq!(cursor(&rpc).await, (1, 0), "g0 → column 0 (with blanks)");
+    feed(&rpc, "g^");
+    assert_eq!(
+        cursor(&rpc).await,
+        (1, 2),
+        "g^ → first non-blank of the row"
+    );
+
+    // With `nowrap`, g0/g$/g^ collapse to plain 0/$/^ over the whole line.
+    feed(&rpc, ":set nowrap<CR>gg");
+    feed(&rpc, "g$");
+    assert_eq!(cursor(&rpc).await, (1, 199), "nowrap g$ == $ (line end)");
+    feed(&rpc, "g0");
+    assert_eq!(cursor(&rpc).await, (1, 0), "nowrap g0 == 0");
+}
+
+#[tokio::test]
+async fn scroll_band_carries_diagnostic_arrays() {
+    // Diagnostic underlines and signs ride the scroll band now (they were settle-only):
+    // `project_band` mirrors `window_value`, so the band carries a per-row
+    // `diagnostics` and `diagnostics_signs` array aligned with its rows. Without a
+    // language server the spans are empty, but the arrays must be present and
+    // row-aligned so the client paints them frame by frame as they slide.
+    let body: String = (1..=100).map(|i| format!("line {i}\n")).collect();
+    let path = write_temp("scrolldiag", "txt", &body);
+    let (rpc, mut incoming) = start(Some(path)).await;
+    let _ = lines(&rpc).await; // barrier
+    let map = scroll_after(&rpc, &mut incoming, "<C-d>").await;
+
+    let band_len = scroll_lines_len(&map);
+    assert!(band_len > 0, "the band over-scans at least the viewport");
+    assert_eq!(
+        scroll_array_len(&map, "diagnostics"),
+        Some(band_len),
+        "diagnostic underlines ride the band, aligned with its rows"
+    );
+    assert_eq!(
+        scroll_array_len(&map, "diagnostics_signs"),
+        Some(band_len),
+        "diagnostic signs ride the band, aligned with its rows"
+    );
+}
+
+#[tokio::test]
 async fn scroll_band_carries_search_highlights() {
     // hlsearch matches must ride the scroll band, not vanish until the slide
     // settles: the band's `search` spans cover its rows so the client paints them

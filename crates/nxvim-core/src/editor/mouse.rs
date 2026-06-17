@@ -1275,7 +1275,7 @@ impl Editor {
         };
         let buf = &self.buffers.get(buf_id).buffer;
         let line_count = buf.line_count();
-        let text_w = content_w.saturating_sub(self.number_width_for(opts, line_count));
+        let text_w = content_w.saturating_sub(self.number_width_for(&opts, line_count));
         let ts = buf.options.effective_tabstop();
         let widest = (top..(top + text_h).min(line_count))
             .map(|l| {
@@ -1297,7 +1297,7 @@ impl Editor {
         if tw == 0 {
             return;
         }
-        let opts = self.windows.cur().options;
+        let opts = self.windows.cur().options.clone();
         let so = opts.sidescrolloff.min(tw.saturating_sub(1) / 2);
         let lo = self.leftcol + so;
         let hi = (self.leftcol + tw).saturating_sub(so + 1);
@@ -1417,7 +1417,7 @@ impl Editor {
         let line_count = buf.line_count();
         // A cell below the last line lands on the last line (vim's behavior).
         let line = (top + rel_y).min(line_count.saturating_sub(1));
-        let gutter = self.number_width_for(opts, line_count);
+        let gutter = self.number_width_for(&opts, line_count);
         let col = if rel_x < gutter {
             // The number column: place the cursor at the line's start.
             0

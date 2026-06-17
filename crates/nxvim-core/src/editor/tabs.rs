@@ -322,7 +322,7 @@ impl Editor {
     /// matching vim's "a split made into a tab page".
     pub(crate) fn tab_split(&mut self) {
         let buf = self.current_buffer_id();
-        let options = self.windows.cur().options;
+        let options = self.windows.cur().options.clone();
         let (cursor, top, leftcol) = (self.cursor, self.top, self.leftcol);
         self.new_tab(buf, options);
         self.cursor = cursor;
@@ -553,7 +553,7 @@ impl Editor {
         // removed from this tab.
         let cur = self.windows.current;
         let buf = self.windows.get(cur).buffer;
-        let options = self.windows.get(cur).options;
+        let options = self.windows.get(cur).options.clone();
         let (cursor, top, leftcol) = (self.cursor, self.top, self.leftcol);
         // Remove it here; a survivor takes focus and the live view becomes theirs.
         self.remove_window(cur);

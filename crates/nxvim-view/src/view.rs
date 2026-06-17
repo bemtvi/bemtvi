@@ -8,7 +8,7 @@ use std::time::Duration;
 use rmpv::Value;
 
 use crate::parse::{
-    chrome_style, map_get, map_str, map_str_array, map_u16, map_u64, parse_border,
+    chrome_style, map_get, map_str, map_str_array, map_u16, map_u64, parse_bools, parse_border,
     parse_cursor_list, parse_diagnostics, parse_diagnostics_signs, parse_diagnostics_virt,
     parse_float_lines, parse_highlights, parse_inlay_hints, parse_multi_spans, parse_numbers,
     parse_pair, parse_pmenu_items, parse_spans, parse_status, parse_styles, parse_virt_lines,
@@ -47,6 +47,10 @@ pub struct ScrollData {
     /// the cursor on the growing side aren't selected yet.
     pub sel_extends_down: Option<bool>,
     pub numbers: Vec<Option<usize>>,
+    /// Per band row, `true` on a soft-wrap continuation row — the band sibling of
+    /// [`WindowView::continuation`], so the gutter blanks the wrapped rows while the
+    /// slide animates exactly as it does when settled.
+    pub continuation: Vec<bool>,
     /// `hlsearch` match spans for the band (aligned with `lines`), so the search
     /// highlight slides with the text rather than vanishing until the slide
     /// settles. Empty inner vec for rows with no match.
@@ -73,6 +77,14 @@ pub struct ScrollData {
     pub virt_lines: Vec<Option<Vec<VirtChunk>>>,
     /// Inline diagnostic virtual text per band row, so it slides with the line.
     pub diagnostics_virt: Vec<Option<DiagVirt>>,
+    /// Diagnostic underline spans per band row (aligned with `lines`), so the
+    /// squiggles slide with the text instead of blanking out for the slide. Same
+    /// shape as the per-window `diagnostics`.
+    pub diagnostics: Vec<Vec<DiagSpan>>,
+    /// Diagnostic sign-column glyph per band row (`Some` on a row with a sign), so
+    /// the signs slide with the text. Same shape as the per-window
+    /// `diagnostics_signs`.
+    pub diagnostics_signs: Vec<Option<DiagSign>>,
     /// The style palette captured with this gesture. Snapshotted (not read live
     /// from [`View::styles`]) because a delayed highlight redraw arriving
     /// mid-slide replaces the live palette, which would leave the band's frozen
@@ -176,7 +188,17 @@ pub struct WindowView {
     /// A scroll gesture for this window, when its viewport just moved.
     pub scroll: Option<ScrollData>,
     /// Per visible row, the 1-based buffer line number (`None` for `~` fillers).
+    /// A soft-wrap continuation row keeps its line's number here (so it stays the
+    /// row→line mapping for highlights / diagnostics, and stays distinct from a
+    /// `~` filler whose number is `None`); the renderer blanks the *gutter* on it
+    /// using the parallel [`continuation`](WindowView::continuation) flag instead.
     pub numbers: Vec<Option<usize>>,
+    /// Per visible row, `true` on a soft-wrap continuation row (a buffer line's
+    /// 2nd+ display row). The renderer shows the line number on the line's first
+    /// row only — a continuation's gutter is blank, matching vim. Empty / all-false
+    /// from an older server that omits the key (every wrapped row then shows its
+    /// number, the prior behavior).
+    pub continuation: Vec<bool>,
     pub number: bool,
     pub relativenumber: bool,
     pub number_width: u16,
@@ -744,10 +766,13 @@ fn parse_window(m: &[(Value, Value)], styles: &[Style]) -> WindowView {
             search: parse_multi_spans(map_get(s, "search")),
             incsearch: parse_spans(map_get(s, "incsearch")),
             numbers: parse_numbers(map_get(s, "numbers")),
+            continuation: parse_bools(map_get(s, "continuation")),
             highlights: parse_highlights(map_get(s, "highlights")),
             inlay_hints: parse_inlay_hints(map_get(s, "inlay_hints")),
             virt_text: parse_virt_text(map_get(s, "virt_text")),
             virt_lines: parse_virt_lines(map_get(s, "virt_lines")),
+            diagnostics: parse_diagnostics(map_get(s, "diagnostics")),
+            diagnostics_signs: parse_diagnostics_signs(map_get(s, "diagnostics_signs")),
             diagnostics_virt: parse_diagnostics_virt(map_get(s, "diagnostics_virt")),
             // The band's ids index this redraw's palette — snapshot it now, since
             // a later redraw will replace the live `styles`.
@@ -793,6 +818,7 @@ fn parse_window(m: &[(Value, Value)], styles: &[Style]) -> WindowView {
         inlay_hints: parse_inlay_hints(map_get(m, "inlay_hints")),
         scroll,
         numbers: parse_numbers(map_get(m, "numbers")),
+        continuation: parse_bools(map_get(m, "continuation")),
         number: map_get(m, "number")
             .and_then(Value::as_bool)
             .unwrap_or(false),

@@ -490,9 +490,10 @@ impl Editor {
     }
 
     /// `nx.dock.opt(side).<name> = <number>` — set a numeric dock option by side
-    /// keyword: `showtabline` (0/1/2, the per-dock override) or `size` (the dock's
-    /// reserved width/height, kept in `dock_sizes`). An unknown side or option is
-    /// reported, never silently ignored.
+    /// keyword: `showtabline` (0/1/2, the per-dock tabline override), `laststatus`
+    /// (0/1/2/3, the per-dock statusline override), or `size` (the dock's reserved
+    /// width/height, kept in `dock_sizes`). An unknown side or option is reported,
+    /// never silently ignored.
     pub fn set_dock_option_num(&mut self, side: &str, name: &str, value: i64) {
         let Some(s) = DockSide::from_keyword(side) else {
             self.echo(format!("E474: Invalid dock side: {side}"));
@@ -500,6 +501,7 @@ impl Editor {
         };
         match name {
             "showtabline" => self.dock_options[s.idx()].showtabline = Some(value.clamp(0, 2) as u8),
+            "laststatus" => self.dock_options[s.idx()].laststatus = Some(value.clamp(0, 3) as u8),
             "size" => self.dock_sizes[s.idx()] = value.max(1) as usize,
             "autohide" => self.dock_options[s.idx()].auto_hide = value != 0,
             other => return self.echo(format!("E474: unknown dock option: {other}")),

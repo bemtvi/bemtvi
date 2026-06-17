@@ -261,6 +261,9 @@ pub(crate) enum Motion {
     Up,                           // k, <Up>
     DisplayDown,                  // gj — down one *display* row (soft-wrap aware)
     DisplayUp,                    // gk — up one display row
+    DisplayLineStart,             // g0 — first column of the *display* row
+    DisplayFirstNonBlank,         // g^ — first non-blank of the display row
+    DisplayLineEnd,               // g$ — last column of the display row
     GotoLine,                     // G  (count = target line, default last)
     GotoTop,                      // gg (count = target line, default first)
     Word,                         // w / W
@@ -1069,6 +1072,12 @@ fn parse_step(mode: Mode, pending: &PendingCommand, key: Key) -> ParseStep {
             // line they step continuation rows; with `nowrap` they are plain `j`/`k`.
             Some('j') => return Complete(ResolvedCommand::Motion(Motion::DisplayDown)),
             Some('k') => return Complete(ResolvedCommand::Motion(Motion::DisplayUp)),
+            // `g0` / `g^` / `g$` are the within-row siblings of `gj`/`gk`: they move
+            // to the first column / first non-blank / last column of the cursor's
+            // *display* row. With `nowrap` they collapse to plain `0`/`^`/`$`.
+            Some('0') => return Complete(ResolvedCommand::Motion(Motion::DisplayLineStart)),
+            Some('^') => return Complete(ResolvedCommand::Motion(Motion::DisplayFirstNonBlank)),
+            Some('$') => return Complete(ResolvedCommand::Motion(Motion::DisplayLineEnd)),
             Some('t') => {
                 return Complete(ResolvedCommand::Normal(NormalCmd::TabNext(pending.count)))
             }

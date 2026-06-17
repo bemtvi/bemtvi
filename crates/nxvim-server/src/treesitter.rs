@@ -117,13 +117,15 @@ impl EditHost {
     pub(crate) fn highlights_for(
         &self,
         buffer: BufferId,
-        numbers: &[Option<usize>],
+        segs: &[crate::redraw::RowSeg],
         styles: &mut StyleTable,
     ) -> Value {
         // A terminal buffer's "syntax" is its vt100 grid colors, not treesitter:
         // project the per-cell fg/bg/attrs into the same span shape and skip the
-        // tree query entirely (the buffer has no grammar anyway).
-        if let Some(term) = self.terminal_highlights(buffer, numbers, styles) {
+        // tree query entirely (the buffer has no grammar anyway). Terminals never
+        // wrap, so the segment clip is the identity — pass the row→line mapping.
+        let numbers: Vec<Option<usize>> = segs.iter().map(|s| s.line).collect();
+        if let Some(term) = self.terminal_highlights(buffer, &numbers, styles) {
             return term;
         }
         // Spans for this window's buffer (absent until its first refresh, or for
@@ -131,10 +133,10 @@ impl EditHost {
         // `SyntaxState`, each slicing its own rows.
         let spans_by_line = self.syntax_states.get(&buffer).map(|state| &state.spans);
         let buf = self.editor.buffer_of(buffer);
-        let rows = numbers
+        let rows = segs
             .iter()
-            .map(|num| {
-                let Some(n) = num else {
+            .map(|seg| {
+                let Some(n) = seg.line else {
                     return Value::Array(Vec::new());
                 };
                 let line_idx = n - 1;
@@ -177,19 +179,21 @@ impl EditHost {
                     let mut vc = unicode::LineVirtcol::new(&text, tab);
                     let row = spans
                         .iter()
-                        .map(|s| {
-                            let start = vc.at(s.start);
-                            let end = vc.at(s.end);
+                        .filter_map(|s| {
+                            // Clip each full-line span to this row's wrap segment and
+                            // rebase to row-local columns (so a wrapped continuation
+                            // row paints only its slice, at the right column).
+                            let (start, end) = seg.clip(vc.at(s.start), vc.at(s.end))?;
                             let style_id = match self.editor.highlights.resolve_capture(&s.group) {
                                 Some(style) => Value::from(styles.intern(style) as u64),
                                 None => Value::Nil,
                             };
-                            Value::Array(vec![
+                            Some(Value::Array(vec![
                                 Value::from(start as u64),
                                 Value::from(end as u64),
                                 Value::from(s.group.as_str()),
                                 style_id,
-                            ])
+                            ]))
                         })
                         .collect();
                     return Value::Array(row);
@@ -228,9 +232,9 @@ impl EditHost {
                 let mut vc = unicode::LineVirtcol::new(&text, tab);
                 let row = crate::extmarks::merge_intervals(&intervals)
                     .into_iter()
-                    .map(|(sb, eb, group, capture)| {
-                        let start = vc.at(sb);
-                        let end = vc.at(eb);
+                    .filter_map(|(sb, eb, group, capture)| {
+                        // Clip the merged span to this row's wrap segment, rebased.
+                        let (start, end) = seg.clip(vc.at(sb), vc.at(eb))?;
                         let resolved = if capture {
                             self.editor.highlights.resolve_capture(group)
                         } else {
@@ -240,12 +244,12 @@ impl EditHost {
                             Some(style) => Value::from(styles.intern(style) as u64),
                             None => Value::Nil,
                         };
-                        Value::Array(vec![
+                        Some(Value::Array(vec![
                             Value::from(start as u64),
                             Value::from(end as u64),
                             Value::from(group),
                             style_id,
-                        ])
+                        ]))
                     })
                     .collect();
                 Value::Array(row)

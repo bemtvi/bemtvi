@@ -195,6 +195,17 @@ pub fn scroll_numbers(map: &[(Value, Value)]) -> Vec<Option<u64>> {
         .unwrap_or_default()
 }
 
+/// Length of a named per-row array on the scroll band (e.g. `diagnostics`,
+/// `diagnostics_signs`), or `None` when the band omits the key. Lets a test assert
+/// an overlay rides the band and stays aligned with its rows.
+pub fn scroll_array_len(map: &[(Value, Value)], key: &str) -> Option<usize> {
+    let s = scroll(map).expect("scroll present");
+    s.iter()
+        .find(|(k, _)| k.as_str() == Some(key))
+        .and_then(|(_, v)| v.as_array())
+        .map(|a| a.len())
+}
+
 /// Number of entries in `scroll.lines`.
 pub fn scroll_lines_len(map: &[(Value, Value)]) -> usize {
     let s = scroll(map).expect("scroll present");
@@ -289,6 +300,24 @@ pub fn view_lines(view: &[(Value, Value)]) -> Vec<String> {
                 .filter_map(|v| v.as_str().map(str::to_string))
                 .collect()
         })
+        .unwrap_or_default()
+}
+
+/// The focused window's per-row `numbers` array as `Option<u64>` (None = `~`
+/// filler / virtual row). Unlike [`numbers`], this resolves through the window.
+pub fn view_numbers(view: &[(Value, Value)]) -> Vec<Option<u64>> {
+    view_get(view, "numbers")
+        .and_then(Value::as_array)
+        .map(|a| a.iter().map(Value::as_u64).collect())
+        .unwrap_or_default()
+}
+
+/// Per visible row, the soft-wrap `continuation` flag (`true` on a buffer line's
+/// 2nd+ display row) the client reads to blank the number gutter.
+pub fn view_continuation(view: &[(Value, Value)]) -> Vec<bool> {
+    view_get(view, "continuation")
+        .and_then(Value::as_array)
+        .map(|a| a.iter().map(|v| v.as_bool().unwrap_or(false)).collect())
         .unwrap_or_default()
 }
 

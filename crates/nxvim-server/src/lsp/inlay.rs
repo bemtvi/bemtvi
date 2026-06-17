@@ -265,7 +265,7 @@ impl EditHost {
     pub(crate) fn inlay_hints_for(
         &self,
         buffer: BufferId,
-        numbers: &[Option<usize>],
+        segs: &[crate::redraw::RowSeg],
         styles: &mut StyleTable,
     ) -> Value {
         let enabled = self
@@ -276,7 +276,7 @@ impl EditHost {
         let Some(state) = state else {
             // One empty entry per row so the client's `inlay_hints[row]` index stays
             // aligned with `numbers`/`highlights`.
-            return Value::Array(numbers.iter().map(|_| Value::Array(Vec::new())).collect());
+            return Value::Array(segs.iter().map(|_| Value::Array(Vec::new())).collect());
         };
         let buf = self.editor.buffer_of(buffer);
         let tabstop = buf
@@ -286,10 +286,10 @@ impl EditHost {
             Some(style) => Value::from(styles.intern(style) as u64),
             None => Value::Nil,
         };
-        let rows = numbers
+        let rows = segs
             .iter()
-            .map(|num| {
-                let Some(n) = num else {
+            .map(|seg| {
+                let Some(n) = seg.line else {
                     return Value::Array(Vec::new());
                 };
                 let line_idx = n - 1;
@@ -304,13 +304,17 @@ impl EditHost {
                     // Skip an unresolved lazy placeholder (empty `text`): it has no
                     // label to paint yet — its `inlayHint/resolve` will fill it.
                     .filter(|s| !s.text.is_empty())
-                    .map(|s| {
+                    // Place the hint on the wrap segment that holds its anchor column,
+                    // rebased to row-local columns (so it rides the right continuation
+                    // row); a hint outside this row's segment is skipped.
+                    .filter_map(|s| {
                         let col = unicode::virtcol(&text, s.byte_col.min(text.len()), tabstop);
-                        Value::Array(vec![
+                        let col = seg.clip_col(col)?;
+                        Some(Value::Array(vec![
                             Value::from(col as u64),
                             Value::from(s.text.clone()),
                             style_id.clone(),
-                        ])
+                        ]))
                     })
                     .collect();
                 Value::Array(hints)

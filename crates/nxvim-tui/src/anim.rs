@@ -6,8 +6,8 @@
 use std::time::{Duration, Instant};
 
 use nxvim_view::{
-    DiagVirt, HlSpan, IncSearchSpans, InlayHint, ScrollData, SearchSpans, Style, View, VirtChunk,
-    VirtPlacement,
+    DiagSign, DiagSpan, DiagVirt, HlSpan, IncSearchSpans, InlayHint, ScrollData, SearchSpans,
+    Style, View, VirtChunk, VirtPlacement,
 };
 
 /// An in-flight scroll animation, driven by the client's local clock. The band is
@@ -30,6 +30,10 @@ pub(crate) struct Animation {
     /// up, `None` when none is sliding. Drives the selection edge clip in `render`.
     pub(crate) sel_extends_down: Option<bool>,
     pub(crate) numbers: Vec<Option<usize>>,
+    /// Per band row, `true` on a soft-wrap continuation row, so the gutter blanks
+    /// the wrapped rows while the slide animates (the band sibling of the per-window
+    /// `continuation`).
+    pub(crate) continuation: Vec<bool>,
     pub(crate) highlights: Vec<Vec<HlSpan>>,
     /// `hlsearch` / `incsearch` match spans for the band (aligned with `lines`), so
     /// the search highlight slides with the text instead of vanishing until the
@@ -47,6 +51,10 @@ pub(crate) struct Animation {
     pub(crate) virt_lines: Vec<Option<Vec<VirtChunk>>>,
     /// Inline diagnostic virtual text per band row, sliding with the line.
     pub(crate) diagnostics_virt: Vec<Option<DiagVirt>>,
+    /// Diagnostic underline spans / sign-column glyphs per band row, so the
+    /// squiggles and signs slide with the text instead of blanking for the slide.
+    pub(crate) diagnostics: Vec<Vec<DiagSpan>>,
+    pub(crate) diagnostics_signs: Vec<Option<DiagSign>>,
     /// Palette snapshot the band's style ids index into (see [`ScrollData`]).
     pub(crate) styles: Vec<Style>,
 }
@@ -65,6 +73,7 @@ impl Animation {
             secondary_selection: s.secondary_selection.clone(),
             sel_extends_down: s.sel_extends_down,
             numbers: s.numbers.clone(),
+            continuation: s.continuation.clone(),
             highlights: s.highlights.clone(),
             search: s.search.clone(),
             incsearch: s.incsearch.clone(),
@@ -72,6 +81,8 @@ impl Animation {
             virt_text: s.virt_text.clone(),
             virt_lines: s.virt_lines.clone(),
             diagnostics_virt: s.diagnostics_virt.clone(),
+            diagnostics: s.diagnostics.clone(),
+            diagnostics_signs: s.diagnostics_signs.clone(),
             styles: s.styles.clone(),
         }
     }

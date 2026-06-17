@@ -117,11 +117,11 @@ impl EditHost {
     pub(crate) fn virt_text_for(
         &self,
         buffer: BufferId,
-        numbers: &[Option<usize>],
+        segs: &[crate::redraw::RowSeg],
         selection: &[Option<(usize, usize)>],
         styles: &mut StyleTable,
     ) -> Value {
-        let nil_rows = || Value::Array(numbers.iter().map(|_| Value::Nil).collect());
+        let nil_rows = || Value::Array(segs.iter().map(|_| Value::Nil).collect());
         let Some(buf) = self.editor.buffer_of(buffer) else {
             return nil_rows();
         };
@@ -142,14 +142,14 @@ impl EditHost {
                 .push(m);
         }
         if by_line.is_empty() {
-            return Value::Array(numbers.iter().map(|_| Value::Array(Vec::new())).collect());
+            return Value::Array(segs.iter().map(|_| Value::Array(Vec::new())).collect());
         }
         let tabstop = buf.options.effective_tabstop();
-        let rows = numbers
+        let rows = segs
             .iter()
             .enumerate()
-            .map(|(row, num)| {
-                let Some(n) = num else {
+            .map(|(row, seg)| {
+                let Some(n) = seg.line else {
                     return Value::Array(Vec::new());
                 };
                 let line_idx = n - 1;
@@ -183,13 +183,28 @@ impl EditHost {
                         if decor.virt_text_hide && row_selected {
                             return None;
                         }
+                        // Place each position on the right soft-wrap segment, rebased
+                        // to row-local columns: inline/overlay ride the row holding
+                        // their anchor column; eol / right_align sit after the line's
+                        // text, so on its last display row; a fixed win_col shows on
+                        // the line's first row. A position that misses this row's
+                        // segment is skipped (`None`).
                         let (pos, col) = match decor.virt_text_pos {
-                            VirtTextPos::Eol => (POS_EOL, 0),
-                            VirtTextPos::Inline => (POS_INLINE, anchor_col(m)),
-                            VirtTextPos::Overlay => (POS_OVERLAY, anchor_col(m)),
-                            VirtTextPos::RightAlign => (POS_RIGHT_ALIGN, 0),
-                            // A fixed window column, independent of the mark anchor.
-                            VirtTextPos::WinCol(n) => (POS_WIN_COL, n as u64),
+                            VirtTextPos::Eol => seg.is_last().then_some((POS_EOL, 0))?,
+                            VirtTextPos::Inline => {
+                                (POS_INLINE, seg.clip_col(anchor_col(m) as usize)? as u64)
+                            }
+                            VirtTextPos::Overlay => {
+                                (POS_OVERLAY, seg.clip_col(anchor_col(m) as usize)? as u64)
+                            }
+                            VirtTextPos::RightAlign => {
+                                seg.is_last().then_some((POS_RIGHT_ALIGN, 0))?
+                            }
+                            // A fixed window column, independent of the mark anchor;
+                            // show it once, on the line's first display row.
+                            VirtTextPos::WinCol(n) => {
+                                seg.is_first().then_some((POS_WIN_COL, n as u64))?
+                            }
                         };
                         Some(self.virt_placement_value(
                             pos,

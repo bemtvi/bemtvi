@@ -101,6 +101,21 @@ fn region_win_height(map: &[(Value, Value)], region: &str) -> Option<u64> {
     })
 }
 
+/// Whether the first window painted in `region` (`main`/`dock_left`/…) draws its
+/// own status row (`status_visible`), or `None` when the region has no window.
+fn region_status_visible(map: &[(Value, Value)], region: &str) -> Option<bool> {
+    let Some(Value::Array(wins)) = map_get(map, "windows") else {
+        return None;
+    };
+    wins.iter().find_map(|w| {
+        let Value::Map(m) = w else { return None };
+        if map_get(m, "region").and_then(Value::as_str) != Some(region) {
+            return None;
+        }
+        map_get(m, "status_visible").and_then(Value::as_bool)
+    })
+}
+
 /// One region's sub-map inside the redraw `region_tablines` (key `main`/`left`/
 /// `right`/`top`/`bottom`).
 fn region_tabline<'a>(map: &'a [(Value, Value)], region: &str) -> Option<&'a [(Value, Value)]> {
@@ -784,6 +799,58 @@ async fn per_dock_showtabline_zero_hides_even_with_two_tabs() {
         region_tab_count(&rd, "left"),
         0,
         "override 0 hides the strip"
+    );
+}
+
+#[tokio::test]
+async fn per_dock_laststatus_hides_the_dock_statusline() {
+    let (rpc, mut incoming) = start().await;
+    // Default laststatus=2: both the main area and the dock draw their own status row.
+    exec_lua(&rpc, "nx.dock.open{ side = 'left', size = 20 }").await;
+    let rd = wait_redraw(&mut incoming, |m| band(m, "dock_left") > 0).await;
+    assert_eq!(
+        region_status_visible(&rd, "dock_left"),
+        Some(true),
+        "the dock shows its statusline by default"
+    );
+    assert_eq!(
+        region_status_visible(&rd, "main"),
+        Some(true),
+        "main shows its statusline"
+    );
+
+    // Per-dock laststatus=0 hides this dock's statusline only.
+    exec_lua(&rpc, "nx.dock.opt('left').laststatus = 0").await;
+    let rd = wait_redraw(&mut incoming, |m| {
+        region_status_visible(m, "dock_left") == Some(false)
+    })
+    .await;
+    assert_eq!(
+        region_status_visible(&rd, "dock_left"),
+        Some(false),
+        "override 0 hides the dock's statusline"
+    );
+    assert_eq!(
+        region_status_visible(&rd, "main"),
+        Some(true),
+        "main keeps its statusline — the override is per-dock"
+    );
+}
+
+#[tokio::test]
+async fn per_dock_laststatus_accepts_the_inline_open_form() {
+    let (rpc, mut incoming) = start().await;
+    // The option also rides `nx.dock.open{...}` inline, like showtabline/title.
+    exec_lua(
+        &rpc,
+        "nx.dock.open{ side = 'bottom', size = 8, laststatus = 0 }",
+    )
+    .await;
+    let rd = wait_redraw(&mut incoming, |m| band(m, "dock_bottom") > 0).await;
+    assert_eq!(
+        region_status_visible(&rd, "dock_bottom"),
+        Some(false),
+        "inline laststatus=0 opens the dock with no statusline"
     );
 }
 

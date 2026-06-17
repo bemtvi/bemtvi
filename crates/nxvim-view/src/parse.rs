@@ -546,6 +546,16 @@ pub(crate) fn parse_numbers(value: Option<&Value>) -> Vec<Option<usize>> {
         .unwrap_or_default()
 }
 
+/// Parse a per-row boolean flag array (e.g. the soft-wrap `continuation` signal).
+/// A missing array (older server) or a non-bool entry yields `false`, so the
+/// renderer falls back to the prior behavior (every wrapped row shows its number).
+pub(crate) fn parse_bools(value: Option<&Value>) -> Vec<bool> {
+    value
+        .and_then(Value::as_array)
+        .map(|a| a.iter().map(|v| v.as_bool().unwrap_or(false)).collect())
+        .unwrap_or_default()
+}
+
 /// Parse the per-window `cursors` array — secondary multi-cursor positions, each
 /// a `[row, screen_col]` pair — into `(row, col)` tuples. Empty (no extra
 /// cursors) or absent (an older server) both yield an empty vec.

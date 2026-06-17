@@ -33,8 +33,8 @@ use glyphon::{
     TextArea, TextAtlas, TextBounds, TextRenderer, Viewport,
 };
 use nxvim_view::{
-    Geometry, InlayHint, ResizeCursor, StatusSegment, Style, TabData, View, VirtChunk,
-    VirtPlacement, WindowRegion, WindowView,
+    DiagSign, DiagSpan, Geometry, InlayHint, ResizeCursor, StatusSegment, Style, TabData, View,
+    VirtChunk, VirtPlacement, WindowRegion, WindowView,
 };
 use winit::window::Window;
 
@@ -137,6 +137,10 @@ pub struct ScrollFrame<'a> {
     /// pure scroll (cursor unmoved) where the full extent just slides.
     pub sel_clip: Option<bool>,
     pub numbers: &'a [Option<usize>],
+    /// Per-row soft-wrap continuation flags for the band, so the gutter blanks the
+    /// wrapped rows while the slide animates (sibling of the per-window
+    /// `continuation`).
+    pub continuation: &'a [bool],
     pub highlights: &'a [Vec<nxvim_view::HlSpan>],
     /// Per-row `hlsearch` match spans for the band (aligned with `lines`), so the
     /// search highlight slides with the text instead of vanishing until the slide
@@ -153,6 +157,10 @@ pub struct ScrollFrame<'a> {
     /// Per-row extmark `virt_lines` content (`Some(chunks)` for a virtual row),
     /// interleaved into the band so virtual rows slide with the text.
     pub virt_lines: &'a [Option<Vec<VirtChunk>>],
+    /// Per-row diagnostic underline spans / sign-column glyphs for the band, so the
+    /// squiggles and signs slide with the text instead of blanking for the slide.
+    pub diagnostics: &'a [Vec<DiagSpan>],
+    pub diagnostics_signs: &'a [Option<DiagSign>],
     pub styles: &'a [Style],
 }
 
@@ -982,7 +990,9 @@ impl Renderer {
                         );
                     }
                     let display = expand_tabs(raw, win.tabstop.max(1) as usize);
-                    if gutter > 0 {
+                    // Blank the number on a soft-wrap continuation row (vim shows it
+                    // on the line's first row only); `numbers` still carries the line.
+                    if gutter > 0 && !s.continuation.get(k).copied().unwrap_or(false) {
                         if let Some(Some(n)) = s.numbers.get(k) {
                             let pos = (gutter_x0 as f32 * self.cell_w, y);
                             self.push_gutter(items, (*n, current_line), win, view, pos, clip);
@@ -1004,6 +1014,43 @@ impl Renderer {
                     };
                     let x = text_run_origin(text_x0, win.leftcol) as f32 * self.cell_w;
                     self.push_text(items, &segments, (x, y), fg, clip);
+
+                    // Diagnostic sign + underlines ride the band too, at the row's
+                    // sub-pixel offset, so they slide with the text instead of
+                    // blanking out for the slide (the settled path paints the same).
+                    if sign_w > 0 {
+                        if let Some(Some((glyph, severity, id))) = s.diagnostics_signs.get(k) {
+                            let color = id
+                                .and_then(|id| s.styles.get(id))
+                                .and_then(|st| st.fg)
+                                .unwrap_or_else(|| severity_color(*severity));
+                            let text = pad_to_width(glyph, sign_w as usize);
+                            self.push_plain(
+                                items,
+                                &text,
+                                (ox as f32 * self.cell_w, y),
+                                color,
+                                clip,
+                            );
+                        }
+                    }
+                    if let Some(diags) = s.diagnostics.get(k) {
+                        for (ds, de, severity, id) in diags {
+                            let color = id
+                                .and_then(|id| s.styles.get(id))
+                                .and_then(|st| st.sp.or(st.fg))
+                                .unwrap_or_else(|| severity_color(*severity));
+                            self.push_underline_at(
+                                quads,
+                                text_x0,
+                                y,
+                                (*ds, *de),
+                                win.leftcol,
+                                inlay,
+                                color,
+                            );
+                        }
+                    }
                 }
             }
             // Settled: paint the live viewport with selection/search overlays.
@@ -1122,7 +1169,9 @@ impl Renderer {
 
                     // Gutter number for this row, honoring number/relativenumber
                     // and the cursor-line highlight.
-                    if gutter > 0 {
+                    // Blank the number on a soft-wrap continuation row (vim shows it
+                    // on the line's first row only); `numbers` still carries the line.
+                    if gutter > 0 && !win.continuation.get(i).copied().unwrap_or(false) {
                         if let Some(Some(n)) = win.numbers.get(i) {
                             let pos = self.cell_px(gutter_x0, row as u16);
                             self.push_gutter(
@@ -2395,16 +2444,33 @@ impl Renderer {
         inlay: &[InlayHint],
         color: u32,
     ) {
+        let (_, py) = self.cell_px(0, row as u16);
+        self.push_underline_at(quads, base, py, span, leftcol, inlay, color);
+    }
+
+    /// [`push_underline`] at an explicit pixel `y` (the scroll band's interpolated
+    /// row origin) rather than a whole cell row, so the squiggle slides with the
+    /// band's sub-pixel offset.
+    #[allow(clippy::too_many_arguments)]
+    fn push_underline_at(
+        &self,
+        quads: &mut Vec<Quad>,
+        base: u16,
+        py: f32,
+        span: (u16, u16),
+        leftcol: u16,
+        inlay: &[InlayHint],
+        color: u32,
+    ) {
         let (s, e) = span;
         let start = base + s.saturating_sub(leftcol) + inlay_shift(inlay, leftcol, s, true);
         let end = base + e.saturating_sub(leftcol) + inlay_shift(inlay, leftcol, e, false);
         if end <= start {
             return;
         }
-        let (px, py) = self.cell_px(start, row as u16);
         let h = (self.cell_h * 0.08).max(1.0);
         quads.push(Quad {
-            x: px,
+            x: start as f32 * self.cell_w,
             y: py + self.cell_h - h,
             w: self.cell_w * (end - start) as f32,
             h,

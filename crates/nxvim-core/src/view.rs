@@ -110,6 +110,17 @@ pub struct RenderRow {
     pub search: Vec<(usize, usize)>,
     /// The live `incsearch` preview match on this row, or `None`.
     pub incsearch: Option<(usize, usize)>,
+    /// Exclusive end column of this row's soft-wrap segment in **full-line**
+    /// screen-column space (`usize::MAX` for an unwrapped row or a wrapped line's
+    /// last segment). With `start_col` (in [`kind`](RenderRow::kind)) this bounds the
+    /// segment a per-row server overlay projection (treesitter / diagnostics / inlay /
+    /// extmark virt_text) clips its full-line spans to before rebasing them to
+    /// row-local columns.
+    pub seg_end_col: usize,
+    /// The `'breakindent'`/`'showbreak'` prefix width baked onto this row's text
+    /// (`0` on a first/only row and under `nowrap`). A projection adds it when
+    /// rebasing a clipped span, so overlays line up past the prefix.
+    pub indent: usize,
 }
 
 impl RenderRow {
@@ -131,6 +142,32 @@ impl RenderRow {
             RowKind::Line { line, .. } => Some(line),
             RowKind::VirtLine | RowKind::Filler => None,
         }
+    }
+
+    /// The full-line screen column this row's text begins at — its wrap segment's
+    /// `start_col` (`0` for a first/only row, a virtual line, or a filler).
+    pub fn start_col(&self) -> usize {
+        match self.kind {
+            RowKind::Line { start_col, .. } => start_col,
+            RowKind::VirtLine | RowKind::Filler => 0,
+        }
+    }
+
+    /// Whether this row is the **last** display row of its buffer line (the only row
+    /// under `nowrap`/no-wrap-needed). Its segment runs to end-of-line, so end-of-line
+    /// overlays (eol virt_text, the diagnostic message) belong here.
+    pub fn is_last_segment(&self) -> bool {
+        self.seg_end_col == usize::MAX
+    }
+
+    /// Whether this is a soft-wrap *continuation* row — a second-or-later display
+    /// row of a buffer line (`start_col > 0`). The number column carries the line's
+    /// number on every row of the line (so [`number`](RenderRow::number) keeps the
+    /// row→line mapping intact for highlights / diagnostics), but the client blanks
+    /// the gutter on continuations, matching vim: the number shows on the line's
+    /// first row only.
+    pub fn is_continuation(&self) -> bool {
+        matches!(self.kind, RowKind::Line { start_col, .. } if start_col > 0)
     }
 }
 
@@ -642,7 +679,7 @@ fn window_view(ed: &Editor, w: &WindowLayout) -> WindowView {
         .buffer_of(w.buffer)
         .expect("a live window's buffer is always open");
     let line_count = buf.line_count();
-    let number_width = ed.number_width_for(w.options, line_count);
+    let number_width = ed.number_width_for(&w.options, line_count);
     // A bordered float spends one cell on each side on its border, so its content
     // (gutter + text + status) lives in the rect inset by one cell. Tiled windows
     // and borderless floats use the whole rect. The client draws the border on the
@@ -654,9 +691,10 @@ fn window_view(ed: &Editor, w: &WindowLayout) -> WindowView {
     };
     let content_height = w.rect.height.saturating_sub(2 * inset);
     let content_width = w.rect.width.saturating_sub(2 * inset);
-    // Whether this window draws its own status row (per `'laststatus'`); when it
-    // does not, the freed row becomes text, so the window shows one more line.
-    let status_visible = ed.window_statusline_visible(w.floating);
+    // Whether this window draws its own status row (per `'laststatus'`, with any
+    // per-dock override for the window's region); when it does not, the freed row
+    // becomes text, so the window shows one more line.
+    let status_visible = ed.window_statusline_visible(w.region, w.floating);
     // The content's own rows minus its status line (when shown); selections fill
     // to the text width (the area past the number gutter).
     let height = content_height
@@ -676,9 +714,16 @@ fn window_view(ed: &Editor, w: &WindowLayout) -> WindowView {
     // is one row per buffer line. There is no separate per-array scatter step — the
     // overlays are written straight onto the rows they fall on.
     let wrap = w.options.wrap;
+    // `'breakindent'` / `'showbreak'` / `'breakindentopt'` only take effect with
+    // `wrap`; all default off. Bundled so the wrap helpers thread one value.
+    let wp = unicode::WrapPrefix {
+        breakindent: w.options.breakindent,
+        showbreak: w.options.showbreak.as_str(),
+        sbr: w.options.breakindent_sbr(),
+    };
     let tabstop = buf.options.effective_tabstop();
     let rows = render_rows(
-        ed, buf, top, height, line_count, w.focused, width, wrap, tabstop, w.cursor, ed.cursor,
+        ed, buf, top, height, line_count, w.focused, width, wrap, tabstop, wp, w.cursor, ed.cursor,
     );
 
     let scroll = if w.focused {
@@ -690,8 +735,9 @@ fn window_view(ed: &Editor, w: &WindowLayout) -> WindowView {
             // just more rows in the band, counted by `screen_rows_between`.
             let base_line = ps.from_top.min(ps.to_top);
             let max_top = ps.from_top.max(ps.to_top);
-            let lead =
-                screen_rows_between(buf, base_line, max_top, line_count, wrap, width, tabstop);
+            let lead = screen_rows_between(
+                buf, base_line, max_top, line_count, wrap, width, tabstop, wp,
+            );
             let band_height = lead + height;
             // The selection rides the band at the *maximal* extent the slide touches:
             // anchor → whichever scroll endpoint is furthest from the anchor. Projecting
@@ -727,6 +773,7 @@ fn window_view(ed: &Editor, w: &WindowLayout) -> WindowView {
                 width,
                 wrap,
                 tabstop,
+                wp,
                 w.cursor,
                 sel_head,
             );
@@ -739,9 +786,10 @@ fn window_view(ed: &Editor, w: &WindowLayout) -> WindowView {
                     wrap,
                     width,
                     tabstop,
+                    wp,
                 ),
                 to_row: screen_rows_between(
-                    buf, base_line, ps.to_top, line_count, wrap, width, tabstop,
+                    buf, base_line, ps.to_top, line_count, wrap, width, tabstop, wp,
                 ),
                 from_cursor_row: cursor_band_row(
                     buf,
@@ -751,6 +799,7 @@ fn window_view(ed: &Editor, w: &WindowLayout) -> WindowView {
                     wrap,
                     width,
                     tabstop,
+                    wp,
                 ),
                 to_cursor_row: cursor_band_row(
                     buf,
@@ -760,6 +809,7 @@ fn window_view(ed: &Editor, w: &WindowLayout) -> WindowView {
                     wrap,
                     width,
                     tabstop,
+                    wp,
                 ),
                 duration_ms: ps.duration_ms,
                 rows: band_rows,
@@ -792,22 +842,30 @@ fn window_view(ed: &Editor, w: &WindowLayout) -> WindowView {
     // index) and the screen column that segment starts at — both `0` under `nowrap`.
     // The cursor's screen column is then *row-local* (measured from its segment), so
     // it lands on the right wrapped row at the right column.
-    let (cursor_extra_rows, cursor_seg_col) = if wrap && width > 0 {
+    // `cursor_seg_col` is the cursor's wrap segment start (subtracted to make the
+    // column row-local); `cursor_prefix` is that row's `'breakindent'`/`'showbreak'`
+    // prefix width (added back, since the prefix is baked onto the row text), so the
+    // cursor lands past the indent on a continuation row. Both `0` on the first row.
+    let (cursor_extra_rows, cursor_seg_col, cursor_prefix) = if wrap && width > 0 {
         let line = buf.line(cur_line);
-        let segs = unicode::wrap_segments(&line, tabstop, width);
+        let indent = unicode::cont_indent(&line, tabstop, width, wp);
+        let segs = unicode::wrap_segments_indented(&line, tabstop, width, indent);
         let idx = segs
             .iter()
             .rposition(|s| w.cursor.col >= s.start_byte)
             .unwrap_or(0);
-        (idx, segs[idx].start_col)
+        // The prefix sits on continuation rows only (segment index > 0).
+        let prefix = if idx > 0 { indent } else { 0 };
+        (idx, segs[idx].start_col, prefix)
     } else {
-        (0, 0)
+        (0, 0, 0)
     };
     let (cursor_screen_col, cursor_width) = {
         let line = buf.line(cur_line);
         let tab = buf.options.effective_tabstop();
         (
-            unicode::virtcol(&line, w.cursor.col, tab).saturating_sub(cursor_seg_col),
+            unicode::virtcol(&line, w.cursor.col, tab).saturating_sub(cursor_seg_col)
+                + cursor_prefix,
             unicode::cursor_cell_width(&line, w.cursor.col, tab),
         )
     };
@@ -987,11 +1045,20 @@ fn window_status_ctx(inp: StatusCtxInputs) -> StatuslineCtx {
 /// The number of display (text) rows buffer `line` occupies: `1` under `nowrap`
 /// (or for a line that fits), else its soft-wrap segment count. The free-function
 /// mirror of [`Editor::line_text_rows`](crate::Editor), for the band geometry.
-fn line_text_rows_of(buf: &Buffer, line: usize, wrap: bool, width: usize, tabstop: usize) -> usize {
+fn line_text_rows_of(
+    buf: &Buffer,
+    line: usize,
+    wrap: bool,
+    width: usize,
+    tabstop: usize,
+    wp: unicode::WrapPrefix,
+) -> usize {
     if !wrap || width == 0 {
         return 1;
     }
-    unicode::wrap_segments(&buf.line_cow(line), tabstop, width).len()
+    let text = buf.line_cow(line);
+    let indent = unicode::cont_indent(&text, tabstop, width, wp);
+    unicode::wrap_segments_indented(&text, tabstop, width, indent).len()
 }
 
 /// The number of **screen rows** the buffer lines `[base, target)` occupy: each
@@ -1000,6 +1067,7 @@ fn line_text_rows_of(buf: &Buffer, line: usize, wrap: bool, width: usize, tabsto
 /// buffer-line viewport top to its screen-row offset within a band anchored at
 /// `base` — the bridge from the buffer-line scroll *gesture* to the screen-row
 /// band. (`target >= base`.)
+#[allow(clippy::too_many_arguments)]
 fn screen_rows_between(
     buf: &Buffer,
     base: usize,
@@ -1008,12 +1076,13 @@ fn screen_rows_between(
     wrap: bool,
     width: usize,
     tabstop: usize,
+    wp: unicode::WrapPrefix,
 ) -> usize {
     let virt = buf.virt_lines_by_line();
     (base..target)
         .map(|line| {
             if line < line_count {
-                line_text_rows_of(buf, line, wrap, width, tabstop)
+                line_text_rows_of(buf, line, wrap, width, tabstop, wp)
                     + virt.get(&line).map_or(0, |r| r.above.len() + r.below.len())
             } else {
                 1
@@ -1036,12 +1105,13 @@ fn cursor_band_row(
     wrap: bool,
     width: usize,
     tabstop: usize,
+    wp: unicode::WrapPrefix,
 ) -> usize {
     let above = buf
         .virt_lines_by_line()
         .get(&cursor_line)
         .map_or(0, |r| r.above.len());
-    screen_rows_between(buf, base, cursor_line, line_count, wrap, width, tabstop) + above
+    screen_rows_between(buf, base, cursor_line, line_count, wrap, width, tabstop, wp) + above
 }
 
 /// Lay out `height` screen rows starting at buffer line `base`, **expanding** each
@@ -1061,6 +1131,7 @@ fn cursor_band_row(
 /// laid out across several [`RowKind::Line`] rows — one per [`unicode::wrap_segments`]
 /// segment, each carrying its byte slice and `start_col`. `tabstop` drives the
 /// cell-accurate break.
+#[allow(clippy::too_many_arguments)]
 fn row_skeleton(
     buf: &Buffer,
     base: usize,
@@ -1069,6 +1140,7 @@ fn row_skeleton(
     wrap: bool,
     width: usize,
     tabstop: usize,
+    wp: unicode::WrapPrefix,
 ) -> Vec<RenderRow> {
     let virt_by_line = buf.virt_lines_by_line();
     let mut rows = Vec::with_capacity(height);
@@ -1081,6 +1153,8 @@ fn row_skeleton(
             secondary_selection: Vec::new(),
             search: Vec::new(),
             incsearch: None,
+            seg_end_col: usize::MAX,
+            indent: 0,
         });
     };
     let mut buf_line = base;
@@ -1095,6 +1169,8 @@ fn row_skeleton(
                 secondary_selection: Vec::new(),
                 search: Vec::new(),
                 incsearch: None,
+                seg_end_col: usize::MAX,
+                indent: 0,
             });
             continue;
         }
@@ -1112,21 +1188,39 @@ fn row_skeleton(
         // begins at (`start_col`), which `render_rows` uses to clip overlays.
         let text = buf.line(buf_line);
         if wrap {
-            for seg in unicode::wrap_segments(&text, tabstop, width) {
+            // The `'breakindent'` / `'showbreak'` prefix on this line's continuation
+            // rows; segments wrap into `width - prefix` cells (the first row keeps the
+            // full width). The prefix is baked onto the continuation row text here, so
+            // the client paints it as leading text — `render_rows` shifts this line's
+            // overlays right by the prefix width to keep them aligned.
+            let (prefix, indent) = unicode::break_prefix(&text, tabstop, width, wp);
+            let segs = unicode::wrap_segments_indented(&text, tabstop, width, indent);
+            for (i, seg) in segs.iter().enumerate() {
                 if rows.len() >= height {
                     break;
                 }
+                let body = &text[seg.start_byte..seg.end_byte];
+                let row_text = if seg.start_col == 0 {
+                    body.to_string()
+                } else {
+                    format!("{prefix}{body}")
+                };
+                // The segment's end column (where the next segment begins) bounds the
+                // overlay clip; the last segment runs to end-of-line (`MAX`). The baked
+                // prefix is the rebase offset on continuation rows only.
                 rows.push(RenderRow {
                     kind: RowKind::Line {
                         line: buf_line,
                         start_col: seg.start_col,
                     },
-                    text: text[seg.start_byte..seg.end_byte].to_string(),
+                    text: row_text,
                     virt_line: None,
                     selection: None,
                     secondary_selection: Vec::new(),
                     search: Vec::new(),
                     incsearch: None,
+                    seg_end_col: segs.get(i + 1).map_or(usize::MAX, |s| s.start_col),
+                    indent: if seg.start_col == 0 { 0 } else { indent },
                 });
             }
         } else if rows.len() < height {
@@ -1141,6 +1235,8 @@ fn row_skeleton(
                 secondary_selection: Vec::new(),
                 search: Vec::new(),
                 incsearch: None,
+                seg_end_col: usize::MAX,
+                indent: 0,
             });
         }
         if rows.len() >= height {
@@ -1185,10 +1281,11 @@ fn render_rows(
     width: usize,
     wrap: bool,
     tabstop: usize,
+    wp: unicode::WrapPrefix,
     cursor: Cursor,
     sel_head: Cursor,
 ) -> Vec<RenderRow> {
-    let mut rows = row_skeleton(buf, base, height, line_count, wrap, width, tabstop);
+    let mut rows = row_skeleton(buf, base, height, line_count, wrap, width, tabstop, wp);
     if !focused {
         return rows;
     }
@@ -1196,40 +1293,45 @@ fn render_rows(
     let secondary = secondary_selection_spans(ed, buf, width, line_count, base, height);
     let (search, incsearch) = ed.search_highlights_in(buf, cursor, focused, base, height);
     // Clip a full-line screen-column span to the row's wrap segment `[start_col,
-    // start_col + bound)` and rebase to row-local columns; `None` if it misses the
-    // segment. Under `nowrap` the segment is the whole line (`start_col == 0`,
-    // unbounded), so this is the identity — the spans pass through unchanged.
-    let clip = |span: (usize, usize), start_col: usize| -> Option<(usize, usize)> {
-        let bound = if wrap {
-            start_col.saturating_add(width)
-        } else {
-            usize::MAX
-        };
+    // seg_end_col)` and rebase to row-local columns (adding the baked-prefix
+    // `indent`); `None` if it misses the segment. This is the same clip the server's
+    // per-row overlay projections use (see `RowSeg::clip`), so selection/search and
+    // treesitter/diagnostics line up on a wrapped row. Under `nowrap` /
+    // first-or-only row (`start_col == 0`, `seg_end_col == MAX`, `indent == 0`) it is
+    // the identity — spans pass through unchanged.
+    let clip = |span: (usize, usize), start_col: usize, end_col: usize, indent: usize| {
         let lo = span.0.max(start_col);
-        let hi = span.1.min(bound);
-        (lo < hi).then(|| (lo - start_col, hi - start_col))
+        let hi = span.1.min(end_col);
+        (lo < hi).then(|| (lo - start_col + indent, hi - start_col + indent))
     };
     for row in &mut rows {
-        let RowKind::Line { line, start_col } = row.kind else {
+        let Some(line) = row.line() else {
             continue;
         };
+        let (start_col, end_col, indent) = (row.start_col(), row.seg_end_col, row.indent);
         let k = line - base;
         row.selection = selection
             .get(k)
             .copied()
             .flatten()
-            .and_then(|s| clip(s, start_col));
+            .and_then(|s| clip(s, start_col, end_col, indent));
         if let Some(spans) = secondary.get(k) {
-            row.secondary_selection = spans.iter().filter_map(|s| clip(*s, start_col)).collect();
+            row.secondary_selection = spans
+                .iter()
+                .filter_map(|s| clip(*s, start_col, end_col, indent))
+                .collect();
         }
         if let Some(spans) = search.get(k) {
-            row.search = spans.iter().filter_map(|s| clip(*s, start_col)).collect();
+            row.search = spans
+                .iter()
+                .filter_map(|s| clip(*s, start_col, end_col, indent))
+                .collect();
         }
         row.incsearch = incsearch
             .get(k)
             .copied()
             .flatten()
-            .and_then(|s| clip(s, start_col));
+            .and_then(|s| clip(s, start_col, end_col, indent));
     }
     rows
 }

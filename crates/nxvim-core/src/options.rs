@@ -295,7 +295,10 @@ impl std::fmt::Display for SignColumn {
 /// Unlike [`Options`] (one global copy on the editor), a [`WindowOptions`] lives
 /// on each window, so two windows onto the *same* buffer can show different
 /// line-number gutters. A split inherits these from the window it splits off.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+// Not `Copy`: `showbreak` is a `String`. `WindowOptions` is cloned (cheaply — one
+// short string) where a window's options are snapshotted; it is mutated in place on
+// the live window otherwise.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WindowOptions {
     /// Show the absolute line number in the number column.
     pub number: bool,
@@ -323,6 +326,40 @@ pub struct WindowOptions {
     /// horizontally. `false` (nxvim's historical `nowrap`) keeps one screen row per
     /// line and pans with `leftcol`. When on, `leftcol` is forced to 0.
     pub wrap: bool,
+    /// `'breakindent'`: indent each soft-wrap continuation row to match the start of
+    /// the wrapped line, so the wrapped text reads as a hanging block under the
+    /// line's own indent rather than starting at the window's left edge. Only takes
+    /// effect with [`wrap`] on. The indent (plus any [`showbreak`]) consumes leading
+    /// cells of the continuation row, reducing the text width it wraps into.
+    pub breakindent: bool,
+    /// `'showbreak'`: a string drawn at the start of every soft-wrap continuation row
+    /// (e.g. `"↪ "`), before any [`breakindent`] padding. Empty by default (no
+    /// marker). Only takes effect with [`wrap`] on.
+    pub showbreak: String,
+    /// `'breakindentopt'`: comma-separated tweaks to [`breakindent`]. nxvim honors the
+    /// `sbr` flag (draw [`showbreak`] *within* the indent so the wrapped text still
+    /// aligns under the line's indent, instead of vim's default additive prefix);
+    /// other vim flags (`min:`, `shift:`, `list:`, `vcol`) are accepted but ignored.
+    /// Empty by default.
+    pub breakindentopt: String,
+}
+
+impl WindowOptions {
+    /// Whether `'breakindentopt'` contains the `sbr` flag — draw `'showbreak'` within
+    /// the breakindent rather than added on top (see [`WindowOptions::breakindentopt`]).
+    pub fn breakindent_sbr(&self) -> bool {
+        self.breakindentopt.split(',').any(|f| f.trim() == "sbr")
+    }
+
+    /// The soft-wrap continuation-prefix config bundled for the wrap helpers (borrows
+    /// `showbreak`). One place builds it from the window-local options.
+    pub fn wrap_prefix(&self) -> crate::unicode::WrapPrefix<'_> {
+        crate::unicode::WrapPrefix {
+            breakindent: self.breakindent,
+            showbreak: self.showbreak.as_str(),
+            sbr: self.breakindent_sbr(),
+        }
+    }
 }
 
 impl Default for WindowOptions {
@@ -342,6 +379,11 @@ impl Default for WindowOptions {
             // nxvim has historically been `nowrap`-only; wrap is opt-in (`:set wrap`)
             // so the existing horizontal-scroll behavior is the default.
             wrap: false,
+            // Wrap polish, all off / empty by default (continuation rows start at the
+            // left edge with no marker, matching vim's out-of-the-box look).
+            breakindent: false,
+            showbreak: String::new(),
+            breakindentopt: String::new(),
         }
     }
 }
@@ -359,6 +401,12 @@ pub struct DockOptions {
     /// (`0` never, `1` only with >1 tab, `2` always). Lets, e.g., an explorer dock
     /// always show its tabline while other regions follow the global default.
     pub showtabline: Option<u8>,
+    /// Per-dock `'laststatus'` override: `None` follows the global
+    /// [`Options::laststatus`]; `Some(n)` forces this dock's per-window status row
+    /// (`0`/`3` never, `1` only with >1 window in the dock, `2` always). Lets, e.g.,
+    /// a terminal or explorer dock hide its statusline while other regions keep
+    /// theirs.
+    pub laststatus: Option<u8>,
     /// A fixed label shown at the start of this dock's tabline strip, independent
     /// of the buffer names (e.g. `EXPLORER`, `TERMINAL`). Empty ⇒ no title; a
     /// non-empty title also makes the strip appear even with a single tab (unless
@@ -708,6 +756,11 @@ fn canonical(name: &str) -> Option<(&'static str, OptKind)> {
         "wrap" => Some(("wrap", Bool)),
         "numberwidth" | "nuw" => Some(("numberwidth", Num)),
         "signcolumn" | "scl" => Some(("signcolumn", Str)),
+        // Window-local wrap polish: indent continuation rows (a plain bool slot) and
+        // the continuation marker string (handled specially in `apply_set_str`).
+        "breakindent" | "bri" => Some(("breakindent", Bool)),
+        "showbreak" | "sbr" => Some(("showbreak", Str)),
+        "breakindentopt" | "briopt" => Some(("breakindentopt", Str)),
         "ignorecase" | "ic" => Some(("ignorecase", Bool)),
         "smartcase" | "scs" => Some(("smartcase", Bool)),
         "wrapscan" | "ws" => Some(("wrapscan", Bool)),

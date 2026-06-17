@@ -63,7 +63,7 @@ impl EditHost {
     pub(crate) fn diagnostics_for(
         &self,
         buffer: nxvim_core::BufferId,
-        numbers: &[Option<usize>],
+        segs: &[crate::redraw::RowSeg],
         styles: &mut StyleTable,
     ) -> Value {
         // `vim.diagnostic.config({ underline = false })` hides the squiggles; the
@@ -77,7 +77,7 @@ impl EditHost {
         let Some((diags, encoding)) = diags_encoding else {
             // One empty entry per row so the client's `diagnostics[row]` index
             // stays aligned with `highlights`/`numbers`.
-            return Value::Array(numbers.iter().map(|_| Value::Array(Vec::new())).collect());
+            return Value::Array(segs.iter().map(|_| Value::Array(Vec::new())).collect());
         };
         // Tab width is the rendered window's buffer's `tabstop` (it may differ
         // from the current buffer's), so the underline columns line up with the
@@ -85,10 +85,10 @@ impl EditHost {
         let tabstop = buf
             .map(|b| b.options.effective_tabstop())
             .unwrap_or(unicode::TABSTOP);
-        let rows = numbers
+        let rows = segs
             .iter()
-            .map(|num| {
-                let Some(n) = num else {
+            .map(|seg| {
+                let Some(n) = seg.line else {
                     return Value::Array(Vec::new());
                 };
                 let line_idx = n - 1;
@@ -107,6 +107,9 @@ impl EditHost {
                         if end_col <= start_col {
                             end_col = start_col + 1;
                         }
+                        // Clip the underline to this row's wrap segment, rebased to
+                        // row-local columns (so it lands on the right continuation row).
+                        let (start_col, end_col) = seg.clip(start_col, end_col)?;
                         let severity = severity_code(d.severity);
                         let style_id =
                             match self.editor.highlights.resolve(severity_group(severity)) {
@@ -140,7 +143,7 @@ impl EditHost {
     pub(crate) fn diagnostics_virt_text_for(
         &self,
         buffer: nxvim_core::BufferId,
-        numbers: &[Option<usize>],
+        segs: &[crate::redraw::RowSeg],
         styles: &mut StyleTable,
     ) -> Value {
         let diags = if self.diag_config.virtual_text {
@@ -151,14 +154,20 @@ impl EditHost {
         let Some(diags) = diags else {
             // One `Nil` per row so the client's `diagnostics_virt[row]` index
             // stays aligned with `numbers`/`diagnostics`.
-            return Value::Array(numbers.iter().map(|_| Value::Nil).collect());
+            return Value::Array(segs.iter().map(|_| Value::Nil).collect());
         };
-        let rows = numbers
+        let rows = segs
             .iter()
-            .map(|num| {
-                let Some(n) = num else {
+            .map(|seg| {
+                let Some(n) = seg.line else {
                     return Value::Nil;
                 };
+                // The eol message sits after the line's text — on a wrapped line that
+                // is the last display row only, so it isn't repeated on every
+                // continuation row.
+                if !seg.is_last() {
+                    return Value::Nil;
+                }
                 let line = (n - 1) as u32;
                 // The most severe diagnostic that *starts* on this row wins the
                 // line's one inline slot (ties broken by leftmost column).
@@ -200,7 +209,7 @@ impl EditHost {
     pub(crate) fn diagnostics_signs_for(
         &self,
         buffer: nxvim_core::BufferId,
-        numbers: &[Option<usize>],
+        segs: &[crate::redraw::RowSeg],
         styles: &mut StyleTable,
     ) -> Value {
         let diags = if self.diag_config.signs {
@@ -211,14 +220,19 @@ impl EditHost {
         let Some(diags) = diags else {
             // One `Nil` per row so the client's `diagnostics_signs[row]` index
             // stays aligned with `numbers`/`diagnostics`.
-            return Value::Array(numbers.iter().map(|_| Value::Nil).collect());
+            return Value::Array(segs.iter().map(|_| Value::Nil).collect());
         };
-        let rows = numbers
+        let rows = segs
             .iter()
-            .map(|num| {
-                let Some(n) = num else {
+            .map(|seg| {
+                let Some(n) = seg.line else {
                     return Value::Nil;
                 };
+                // The gutter sign sits on the line's first display row only (like the
+                // number), not repeated down its wrapped continuation rows.
+                if !seg.is_first() {
+                    return Value::Nil;
+                }
                 let line = (n - 1) as u32;
                 // The most severe diagnostic that *starts* on this row wins the
                 // line's sign cell (ties broken by leftmost column).

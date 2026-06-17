@@ -58,8 +58,8 @@ use std::time::{Duration, Instant};
 use anyhow::Result;
 use nxvim_rpc::{connect, Incoming, Rpc};
 use nxvim_view::{
-    encode_paste, HlSpan, InlayHint, ResizeCursor, ScrollData, Style, View, VirtChunk,
-    VirtPlacement,
+    encode_paste, DiagSign, DiagSpan, HlSpan, InlayHint, ResizeCursor, ScrollData, Style, View,
+    VirtChunk, VirtPlacement,
 };
 use rmpv::Value;
 use winit::application::ApplicationHandler;
@@ -426,6 +426,9 @@ struct ScrollAnim {
     /// [`ScrollData::sel_extends_down`]); drives the selection edge clip.
     sel_extends_down: Option<bool>,
     numbers: Vec<Option<usize>>,
+    /// Per band row, `true` on a soft-wrap continuation row, so the gutter blanks
+    /// the wrapped rows while the slide animates.
+    continuation: Vec<bool>,
     highlights: Vec<Vec<HlSpan>>,
     /// `hlsearch` / `incsearch` match spans for the band, so the search highlight
     /// slides with the text instead of vanishing until the slide settles.
@@ -438,6 +441,10 @@ struct ScrollAnim {
     /// Extmark `virt_lines` content per band row, so the interleaved virtual rows
     /// slide with the text instead of only appearing once the slide settles.
     virt_lines: Vec<Option<Vec<VirtChunk>>>,
+    /// Diagnostic underline spans / sign-column glyphs per band row, so the
+    /// squiggles and signs slide with the text instead of blanking for the slide.
+    diagnostics: Vec<Vec<DiagSpan>>,
+    diagnostics_signs: Vec<Option<DiagSign>>,
     styles: Vec<Style>,
 }
 
@@ -455,12 +462,15 @@ impl ScrollAnim {
             secondary_selection: s.secondary_selection.clone(),
             sel_extends_down: s.sel_extends_down,
             numbers: s.numbers.clone(),
+            continuation: s.continuation.clone(),
             highlights: s.highlights.clone(),
             search: s.search.clone(),
             incsearch: s.incsearch.clone(),
             inlay_hints: s.inlay_hints.clone(),
             virt_text: s.virt_text.clone(),
             virt_lines: s.virt_lines.clone(),
+            diagnostics: s.diagnostics.clone(),
+            diagnostics_signs: s.diagnostics_signs.clone(),
             styles: s.styles.clone(),
         }
     }
@@ -490,12 +500,15 @@ impl ScrollAnim {
             // the scroll direction, so it grows *and* shrinks smoothly either way.
             sel_clip: self.sel_extends_down,
             numbers: &self.numbers,
+            continuation: &self.continuation,
             highlights: &self.highlights,
             search: &self.search,
             incsearch: &self.incsearch,
             inlay_hints: &self.inlay_hints,
             virt_text: &self.virt_text,
             virt_lines: &self.virt_lines,
+            diagnostics: &self.diagnostics,
+            diagnostics_signs: &self.diagnostics_signs,
             styles: &self.styles,
         }
     }

@@ -17,7 +17,10 @@ impl Editor {
         // is not subtracted again here.
         let w = self.windows.cur();
         let inset = matches!(&w.float, Some(cfg) if cfg.border != BorderStyle::None) as usize;
-        let status = usize::from(self.window_statusline_visible(w.float.is_some()));
+        // The focused window lives in the focused layer, so its statusline gate uses
+        // that layer's region (which carries any per-dock `'laststatus'` override).
+        let status =
+            usize::from(self.window_statusline_visible(self.focused_region(), w.float.is_some()));
         w.rect
             .height
             .saturating_sub(2 * inset)
@@ -33,10 +36,10 @@ impl Editor {
     pub(crate) fn text_width(&self) -> usize {
         let w = self.windows.cur();
         let inset = matches!(&w.float, Some(cfg) if cfg.border != BorderStyle::None) as usize;
-        let options = w.options;
+        let options = w.options.clone();
         let rect_width = w.rect.width;
         let line_count = self.buffer().line_count();
-        let number_width = self.number_width_for(options, line_count);
+        let number_width = self.number_width_for(&options, line_count);
         rect_width
             .saturating_sub(2 * inset)
             .saturating_sub(number_width)
@@ -353,7 +356,7 @@ impl Editor {
     /// segment count. The text-row analogue of a line's `virt_lines` count, so the
     /// viewport math counts wrapped lines as the several screen rows they fill.
     pub(crate) fn line_text_rows(&self, line: usize) -> usize {
-        let opts = self.windows.cur().options;
+        let opts = self.windows.cur().options.clone();
         if !opts.wrap {
             return 1;
         }
@@ -363,13 +366,15 @@ impl Editor {
             return 1;
         }
         let text = buf.line_cow(line);
-        unicode::wrap_segments(&text, buf.options.effective_tabstop(), width).len()
+        let tab = buf.options.effective_tabstop();
+        let indent = unicode::cont_indent(&text, tab, width, opts.wrap_prefix());
+        unicode::wrap_segments_indented(&text, tab, width, indent).len()
     }
 
     /// Which soft-wrap segment the cursor's column falls in (its display-row offset
     /// within its buffer line): `0` under `nowrap` or on the first segment.
     pub(crate) fn cursor_wrap_seg(&self) -> usize {
-        let opts = self.windows.cur().options;
+        let opts = self.windows.cur().options.clone();
         if !opts.wrap {
             return 0;
         }
@@ -379,7 +384,9 @@ impl Editor {
         }
         let buf = self.buffer();
         let text = buf.line_cow(self.cursor.line);
-        let segs = unicode::wrap_segments(&text, buf.options.effective_tabstop(), width);
+        let tab = buf.options.effective_tabstop();
+        let indent = unicode::cont_indent(&text, tab, width, opts.wrap_prefix());
+        let segs = unicode::wrap_segments_indented(&text, tab, width, indent);
         segs.iter()
             .rposition(|s| self.cursor.col >= s.start_byte)
             .unwrap_or(0)
@@ -450,7 +457,7 @@ impl Editor {
         if tw == 0 {
             return;
         }
-        let opts = self.windows.cur().options;
+        let opts = self.windows.cur().options.clone();
         // The margin can't claim more than half the window, or the left and right
         // bounds would cross.
         let so = opts.sidescrolloff.min(tw.saturating_sub(1) / 2);

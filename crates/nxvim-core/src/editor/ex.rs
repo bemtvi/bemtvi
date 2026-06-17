@@ -1756,7 +1756,7 @@ impl Editor {
     /// new tab never reuses (and clobbers) the current tab's buffer the way an
     /// in-place `:edit` of a throwaway buffer would.
     fn ex_tabnew(&mut self, args: &str) {
-        let options = self.windows.cur().options;
+        let options = self.windows.cur().options.clone();
         let file = args.trim();
         let buf = if file.is_empty() {
             self.add_buffer(Buffer::empty())

@@ -296,6 +296,8 @@ impl EditHost {
         let RowArrays {
             lines,
             numbers,
+            segments,
+            continuation,
             selection,
             secondary_selection,
             search,
@@ -307,7 +309,7 @@ impl EditHost {
         // arrays for them so the redraw map keeps a stable shape (JS-side highlighting
         // paints from the buffer text instead).
         #[cfg(feature = "native")]
-        let highlights = self.highlights_for(win.buffer, &numbers, styles);
+        let highlights = self.highlights_for(win.buffer, &segments, styles);
         // The browser build highlights code JS-side and leaves these empty — *except*
         // a terminal, whose per-cell colors live only in the wasm-side vt100 grid and
         // can't be recovered from the buffer text. Project those (and intern their
@@ -330,7 +332,7 @@ impl EditHost {
         // publish loop), so this projects on **both** builds — unlike the treesitter /
         // LSP overlays above, which are genuinely native-only. The wire shape is the
         // same on either build; only the transport differs.
-        let virt_text = self.virt_text_for(win.buffer, &numbers, &selection, styles);
+        let virt_text = self.virt_text_for(win.buffer, &segments, &selection, styles);
         // Extmark `virt_lines` (whole virtual rows). Core already interleaved them into
         // the window's rows (the `RowKind::VirtLine` rows, unbundled into `virt_lines`
         // above); the server only resolves each chunk's `hl_group` to a frame style id.
@@ -338,11 +340,11 @@ impl EditHost {
         let virt_lines = self.virt_lines_value(&virt_lines, styles);
         #[cfg(feature = "native")]
         let (diagnostics, diagnostics_virt, diagnostics_signs, sign_width, inlay_hints) = (
-            self.diagnostics_for(win.buffer, &numbers, styles),
-            self.diagnostics_virt_text_for(win.buffer, &numbers, styles),
-            self.diagnostics_signs_for(win.buffer, &numbers, styles),
+            self.diagnostics_for(win.buffer, &segments, styles),
+            self.diagnostics_virt_text_for(win.buffer, &segments, styles),
+            self.diagnostics_signs_for(win.buffer, &segments, styles),
             self.sign_width_for(win.buffer, &numbers, win.signcolumn),
-            self.inlay_hints_for(win.buffer, &numbers, styles),
+            self.inlay_hints_for(win.buffer, &segments, styles),
         );
         // The browser build has no diagnostics, so signs never appear; the sign
         // width still honors a fixed `yes` policy (its `floor`) so the layout matches
@@ -461,6 +463,7 @@ impl EditHost {
             (Value::from("search"), multi_spans_value(&search)),
             (Value::from("incsearch"), spans_value(&incsearch)),
             (Value::from("numbers"), numbers_value(&numbers)),
+            (Value::from("continuation"), bools_value(&continuation)),
             (Value::from("number"), Value::from(win.number)),
             (
                 Value::from("relativenumber"),
@@ -791,6 +794,8 @@ impl EditHost {
         let RowArrays {
             lines,
             numbers,
+            segments,
+            continuation,
             selection,
             secondary_selection,
             search,
@@ -798,22 +803,28 @@ impl EditHost {
             virt_lines,
         } = unbundle_rows(&s.rows);
         // Native-only overlays (see `window_value`); the browser band carries empty
-        // highlight/inlay/diagnostic arrays.
+        // highlight/inlay/diagnostic arrays. Diagnostic underlines and signs ride the
+        // band too (keyed on the per-row wrap `segments`, the same as the settled
+        // window), so they slide with the text instead of blanking out for the slide.
         #[cfg(feature = "native")]
-        let (highlights, inlay_hints, diagnostics_virt) = (
-            self.highlights_for(buffer, &numbers, styles),
-            self.inlay_hints_for(buffer, &numbers, styles),
-            self.diagnostics_virt_text_for(buffer, &numbers, styles),
+        let (highlights, inlay_hints, diagnostics_virt, diagnostics, diagnostics_signs) = (
+            self.highlights_for(buffer, &segments, styles),
+            self.inlay_hints_for(buffer, &segments, styles),
+            self.diagnostics_virt_text_for(buffer, &segments, styles),
+            self.diagnostics_for(buffer, &segments, styles),
+            self.diagnostics_signs_for(buffer, &segments, styles),
         );
         #[cfg(not(feature = "native"))]
-        let (highlights, inlay_hints, diagnostics_virt) = (
+        let (highlights, inlay_hints, diagnostics_virt, diagnostics, diagnostics_signs) = (
+            Value::Array(Vec::new()),
+            Value::Array(Vec::new()),
             Value::Array(Vec::new()),
             Value::Array(Vec::new()),
             Value::Array(Vec::new()),
         );
         // Extmark `virt_text` + `virt_lines` ride the band (pure projections, like
         // `window_value`), so they slide with the text instead of flashing on settle.
-        let virt_text = self.virt_text_for(buffer, &numbers, &selection, styles);
+        let virt_text = self.virt_text_for(buffer, &segments, &selection, styles);
         let virt_lines = self.virt_lines_value(&virt_lines, styles);
         Value::Map(vec![
             (Value::from("from_row"), Value::from(s.from_row as u64)),
@@ -842,11 +853,14 @@ impl EditHost {
             (Value::from("search"), multi_spans_value(&search)),
             (Value::from("incsearch"), spans_value(&incsearch)),
             (Value::from("numbers"), numbers_value(&numbers)),
+            (Value::from("continuation"), bools_value(&continuation)),
             (Value::from("highlights"), highlights),
             (Value::from("inlay_hints"), inlay_hints),
             (Value::from("virt_text"), virt_text),
             (Value::from("virt_lines"), virt_lines),
             (Value::from("diagnostics_virt"), diagnostics_virt),
+            (Value::from("diagnostics"), diagnostics),
+            (Value::from("diagnostics_signs"), diagnostics_signs),
         ])
     }
 
@@ -1055,9 +1069,68 @@ fn rect_value(rect: &ViewRect) -> Value {
 /// self-describing [`RenderRow`] layout. Shared by the settled window
 /// (`window_value`) and the scroll band (`project_band`) — the band is just a
 /// taller row set, so projecting it is identical work.
+/// One visible row's soft-wrap **segment**, for the per-row server overlay
+/// projections (treesitter highlights, diagnostics, inlay hints, extmark
+/// `virt_text`). They compute spans in **full-line** screen-column space, then
+/// [`clip`](RowSeg::clip) them to this segment and rebase to row-local columns — so
+/// on a soft-wrapped (and `'breakindent'`/`'showbreak'`-indented) line each row only
+/// paints the slice of the line it actually shows, at the right column. Built from
+/// the core [`RenderRow`] layout, which already decided the wrap.
+#[derive(Clone, Copy)]
+pub(crate) struct RowSeg {
+    /// 1-based buffer line this row shows (`None` for a `~` filler / virtual row, so
+    /// the projection emits nothing).
+    pub line: Option<usize>,
+    /// Segment start column in full-line screen-column space.
+    pub start: usize,
+    /// Exclusive segment end column (`usize::MAX` for the last/only segment, which
+    /// runs to end-of-line).
+    pub end: usize,
+    /// Row-local prefix width (`'breakindent'`/`'showbreak'`) added when rebasing.
+    pub indent: usize,
+}
+
+impl RowSeg {
+    /// Clip a full-line screen-column span `[a, b)` to this segment and rebase to
+    /// row-local columns (adding the baked-prefix `indent`); `None` if it misses.
+    pub(crate) fn clip(&self, a: usize, b: usize) -> Option<(usize, usize)> {
+        let lo = a.max(self.start);
+        let hi = b.min(self.end);
+        (lo < hi).then(|| (lo - self.start + self.indent, hi - self.start + self.indent))
+    }
+
+    /// Clip a single full-line screen column (an inlay-hint / inline-`virt_text`
+    /// anchor) to this segment, rebased; `None` if it falls outside.
+    pub(crate) fn clip_col(&self, c: usize) -> Option<usize> {
+        (c >= self.start && c < self.end).then(|| c - self.start + self.indent)
+    }
+
+    /// Whether this is the **last** display row of its line (runs to end-of-line), so
+    /// end-of-line decorations (eol `virt_text`, the diagnostic message) belong here.
+    pub(crate) fn is_last(&self) -> bool {
+        self.end == usize::MAX
+    }
+
+    /// Whether this is the **first** display row of its line, so the gutter sign
+    /// (like the number) shows here and not on continuation rows.
+    pub(crate) fn is_first(&self) -> bool {
+        self.start == 0
+    }
+}
+
 struct RowArrays {
     lines: Vec<String>,
     numbers: Vec<Option<usize>>,
+    /// Per-row wrap segments for the overlay projections (see [`RowSeg`]).
+    segments: Vec<RowSeg>,
+    /// Per row: `true` on a soft-wrap continuation row (a line's 2nd+ display row).
+    /// `numbers` still carries the line number on these rows — it stays the row→line
+    /// mapping for highlights / diagnostics — so this is the separate signal the
+    /// client uses to blank the number column on continuations (vim shows the number
+    /// on a wrapped line's first row only). It also disambiguates a continuation
+    /// (real text, blank gutter) from a `~` filler, which both carry no displayed
+    /// number.
+    continuation: Vec<bool>,
     selection: Vec<Option<(usize, usize)>>,
     secondary_selection: Vec<Vec<(usize, usize)>>,
     search: Vec<Vec<(usize, usize)>>,
@@ -1072,6 +1145,16 @@ fn unbundle_rows(rows: &[RenderRow]) -> RowArrays {
     RowArrays {
         lines: rows.iter().map(|r| r.text.clone()).collect(),
         numbers: rows.iter().map(|r| r.number()).collect(),
+        segments: rows
+            .iter()
+            .map(|r| RowSeg {
+                line: r.number(),
+                start: r.start_col(),
+                end: r.seg_end_col,
+                indent: r.indent,
+            })
+            .collect(),
+        continuation: rows.iter().map(|r| r.is_continuation()).collect(),
         selection: rows.iter().map(|r| r.selection).collect(),
         secondary_selection: rows.iter().map(|r| r.secondary_selection.clone()).collect(),
         search: rows.iter().map(|r| r.search.clone()).collect(),
@@ -1861,6 +1944,12 @@ fn multi_spans_value(rows: &[Vec<(usize, usize)>]) -> Value {
             })
             .collect(),
     )
+}
+
+/// Encode a per-row boolean flag array for the redraw map (e.g. the soft-wrap
+/// `continuation` signal the client reads to blank the number gutter).
+fn bools_value(flags: &[bool]) -> Value {
+    Value::Array(flags.iter().map(|&b| Value::from(b)).collect())
 }
 
 /// Encode per-row 1-based line numbers as an array (`Nil` for `~` filler rows)

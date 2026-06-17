@@ -605,13 +605,6 @@ fn render_window(
 
     let height = text_area.height as usize;
 
-    // Empty fallbacks for the overlays a slide band does not carry (diagnostic
-    // underlines and signs settle-only — a brief blank during the ~150ms slide, no
-    // jump). Everything else — including secondary selections, `virt_lines`, and
-    // diagnostic virtual text — now rides the screen-row band.
-    let empty_diag: Vec<Vec<DiagSpan>> = Vec::new();
-    let empty_signs: Vec<Option<DiagSign>> = Vec::new();
-
     // Owned slide-band snapshots, populated only while animating (a `skip/take`
     // window of the band by screen-row offset). The static path — the overwhelmingly
     // common case — borrows straight from `win` instead of deep-cloning the whole
@@ -621,10 +614,16 @@ fn render_window(
     let anim_secondary_sel: SearchSpans;
     let anim_hl: Vec<Vec<HlSpan>>;
     let anim_numbers: Vec<Option<usize>>;
+    let anim_continuation: Vec<bool>;
     let anim_inlay: Vec<Vec<InlayHint>>;
     let anim_virt_text: Vec<Vec<VirtPlacement>>;
     let anim_virt_lines: Vec<Option<Vec<VirtChunk>>>;
     let anim_diag_virt: Vec<Option<DiagVirt>>;
+    // Diagnostic underlines and signs ride the screen-row band now, sliced like the
+    // other overlays, so the squiggles and signs slide with the text instead of
+    // blanking out for the ~150ms slide.
+    let anim_diag: Vec<Vec<DiagSpan>>;
+    let anim_signs: Vec<Option<DiagSign>>;
     let anim_search: SearchSpans;
     let anim_incsearch: IncSearchSpans;
     let frame_lines: &[String];
@@ -639,7 +638,14 @@ fn render_window(
     // band too, now that it is screen-row based and interleaves the virtual rows.
     let frame_virt_lines: &[Option<Vec<VirtChunk>>];
     let frame_diag_virt: &[Option<DiagVirt>];
+    // Diagnostic underlines / signs ride the band (sliced into the snapshots above),
+    // assigned in the same match as the other frame fields.
+    let frame_diag: &[Vec<DiagSpan>];
+    let frame_signs: &[Option<DiagSign>];
     let frame_numbers: &[Option<usize>];
+    // Soft-wrap continuation flags, sliced like `numbers`, so the gutter blanks the
+    // wrapped rows whether the viewport is settled or mid-slide.
+    let frame_continuation: &[bool];
     // Search spans ride the slide band (the static viewport uses the win's), so
     // `hlsearch`/`incsearch` keep highlighting the moving text instead of blinking
     // off until the slide settles. Assigned inside the match below (where the band
@@ -705,6 +711,13 @@ fn render_window(
                 .cloned()
                 .collect();
             anim_numbers = a.numbers.iter().skip(off).take(height).copied().collect();
+            anim_continuation = a
+                .continuation
+                .iter()
+                .skip(off)
+                .take(height)
+                .copied()
+                .collect();
             anim_hl = a
                 .highlights
                 .iter()
@@ -734,6 +747,20 @@ fn render_window(
                 .take(height)
                 .cloned()
                 .collect();
+            anim_diag = a
+                .diagnostics
+                .iter()
+                .skip(off)
+                .take(height)
+                .cloned()
+                .collect();
+            anim_signs = a
+                .diagnostics_signs
+                .iter()
+                .skip(off)
+                .take(height)
+                .cloned()
+                .collect();
             // Search matches ride the slide too, sliced to the visible window like
             // the highlights, so `hlsearch` stays lit on the moving text.
             anim_search = a.search.iter().skip(off).take(height).cloned().collect();
@@ -742,11 +769,14 @@ fn render_window(
             frame_sel = &anim_sel;
             frame_secondary_sel = &anim_secondary_sel;
             frame_numbers = &anim_numbers;
+            frame_continuation = &anim_continuation;
             frame_hl = &anim_hl;
             frame_inlay = &anim_inlay;
             frame_virt_text = &anim_virt_text;
             frame_virt_lines = &anim_virt_lines;
             frame_diag_virt = &anim_diag_virt;
+            frame_diag = &anim_diag;
+            frame_signs = &anim_signs;
             frame_search = &anim_search;
             frame_incsearch = &anim_incsearch;
             // The cursor's row within the viewport and its buffer line (for relative
@@ -760,11 +790,14 @@ fn render_window(
             frame_sel = &win.selection;
             frame_secondary_sel = &win.secondary_selection;
             frame_numbers = &win.numbers;
+            frame_continuation = &win.continuation;
             frame_hl = &win.highlights;
             frame_inlay = &win.inlay_hints;
             frame_virt_text = &win.virt_text;
             frame_virt_lines = &win.virt_lines;
             frame_diag_virt = &win.diagnostics_virt;
+            frame_diag = &win.diagnostics;
+            frame_signs = &win.diagnostics_signs;
             frame_search = &win.search;
             frame_incsearch = &win.incsearch;
             cursor_row = win.cursor_row;
@@ -795,7 +828,15 @@ fn render_window(
     let text_inner = if win.number_width > 0 {
         let cols = Layout::horizontal([Constraint::Length(win.number_width), Constraint::Min(0)])
             .split(gutter_area);
-        render_gutter(frame, cols[0], frame_numbers, current_line, win, view);
+        render_gutter(
+            frame,
+            cols[0],
+            frame_numbers,
+            frame_continuation,
+            current_line,
+            win,
+            view,
+        );
         cols[1]
     } else {
         gutter_area
@@ -820,21 +861,11 @@ fn render_window(
         incsearch: view.incsearch_style.map(rt),
         end_of_buffer: view.end_of_buffer.map(rt),
     };
-    // Diagnostic underlines are painted on the settled viewport only (a brief
-    // blank during the slide; `frame_secondary_sel`, `frame_virt_lines`, and
-    // `frame_diag_virt` already ride the band, assigned in the interpolation match).
-    let frame_diag: &[Vec<DiagSpan>] = match anim {
-        Some(_) => &empty_diag,
-        None => &win.diagnostics,
-    };
-    // Signs, like diagnostic underlines, are painted on the settled viewport only — a slide
-    // band carries none (the reserved column stays blank while animating, so the
-    // text below it doesn't jump). Painted now that the palette resolves style ids.
+    // Diagnostic signs ride the band (`frame_signs`, sliced in the interpolation
+    // match) just like the underlines and the other overlays, so they slide with the
+    // text instead of blanking out for the slide. Painted now that the palette
+    // resolves style ids.
     if let Some(sign_area) = sign_area {
-        let frame_signs: &[Option<DiagSign>] = match anim {
-            Some(_) => &empty_signs,
-            None => &win.diagnostics_signs,
-        };
         render_sign_column(frame, sign_area, frame_signs, &palette);
     }
     render_text(
@@ -995,11 +1026,14 @@ fn render_separators(frame: &mut Frame, dock: &DockLayout, separators: &[Separat
 /// hybrid — absolute on the cursor line, relative elsewhere — when both are on.
 /// The cursor line uses the theme's `CursorLineNr`, other rows its `LineNr`;
 /// with no colorscheme loaded they fall back to un-dimmed / dimmed (vim's look
-/// out of the box). `~` filler rows get a blank gutter.
+/// out of the box). `~` filler rows and soft-wrap continuation rows
+/// (`continuation[i]`) get a blank gutter — a wrapped line's number shows on its
+/// first display row only.
 fn render_gutter(
     frame: &mut Frame,
     area: Rect,
     numbers: &[Option<usize>],
+    continuation: &[bool],
     current_line: usize,
     win: &WindowView,
     view: &View,
@@ -1008,9 +1042,17 @@ fn render_gutter(
     let text = Text::from(
         numbers
             .iter()
-            .map(|num| {
+            .enumerate()
+            .map(|(row, num)| {
                 let is_current = *num == Some(current_line);
-                let cell = gutter_cell(*num, current_line, win.number, win.relativenumber, width);
+                // Blank the number on a soft-wrap continuation row (vim shows it on
+                // the line's first row only); `numbers` still carries the line there.
+                let shown = if continuation.get(row).copied().unwrap_or(false) {
+                    None
+                } else {
+                    *num
+                };
+                let cell = gutter_cell(shown, current_line, win.number, win.relativenumber, width);
                 let style = if is_current {
                     view.cursor_line_nr.map(rt).unwrap_or_default()
                 } else {

@@ -566,6 +566,9 @@
       return Object.assign({}, w, {
         lines: s.lines,
         numbers: s.numbers,
+        // Soft-wrap continuation flags ride the band, so the gutter blanks the
+        // wrapped rows while the slide animates (else `w.continuation` would leak in).
+        continuation: s.continuation || [],
         selection: s.selection,
         search: blanks,
         incsearch: Array.from({ length: n }, () => null),
@@ -580,7 +583,10 @@
         // too (the strip renders them like the settled path). Diagnostic virtual text
         // slides as well.
         virt_lines: s.virt_lines || [],
-        diagnostics: [], diagnostics_virt: s.diagnostics_virt || [], diagnostics_signs: [], inlay_hints: s.inlay_hints || [],
+        // Diagnostic underlines, signs, and virtual text all ride the screen-row band
+        // now, so squiggles and signs slide with the text instead of blanking for the
+        // slide (over a daemon these arrive populated; the client build leaves empty).
+        diagnostics: s.diagnostics || [], diagnostics_virt: s.diagnostics_virt || [], diagnostics_signs: s.diagnostics_signs || [], inlay_hints: s.inlay_hints || [],
         cursor_row: Math.round(s.to_cursor_row),
       });
     }
@@ -1298,7 +1304,9 @@
         }
       }
       if (width <= 0) return html;
-      const n = w.numbers[row];
+      // Blank the number on a soft-wrap continuation row (vim shows it on the line's
+      // first row only); `numbers` still carries the line there.
+      const n = w.continuation?.[row] ? null : w.numbers[row];
       const cur = w.cursor_line;
       let cell, cls = "gutter";
       if (n === null || n === undefined) cell = " ".repeat(width);

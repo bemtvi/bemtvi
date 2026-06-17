@@ -117,6 +117,106 @@ pub struct WrapSeg {
 /// documented v1 limitation. Leading indentation, the common case, sits on the
 /// first segment and is unaffected.)
 pub fn wrap_segments(line: &str, tabstop: usize, width: usize) -> Vec<WrapSeg> {
+    wrap_segments_indented(line, tabstop, width, 0)
+}
+
+/// A window's soft-wrap continuation-prefix config — `'breakindent'`,
+/// `'showbreak'`, and the `'breakindentopt'` `sbr` flag — bundled so the wrap
+/// helpers thread one `Copy` value. Borrows the showbreak string.
+#[derive(Clone, Copy, Default)]
+pub struct WrapPrefix<'a> {
+    /// `'breakindent'`: indent continuation rows to the wrapped line's own indent.
+    pub breakindent: bool,
+    /// `'showbreak'`: the marker drawn at the start of each continuation row.
+    pub showbreak: &'a str,
+    /// `'breakindentopt'` contains `sbr`: draw `'showbreak'` *within* the breakindent
+    /// (subtract its width from the indent) so the wrapped text still aligns under the
+    /// line's indent. Default (`false`) is vim's additive prefix: breakindent then the
+    /// marker, so the text sits one marker-width past the indent.
+    pub sbr: bool,
+}
+
+/// The `'breakindent'`/`'showbreak'` continuation prefix for `line`: the string drawn
+/// at the start of every soft-wrap continuation row, and its display width in cells.
+/// Matches vim's draw order (`drawline.c`): by default the breakindent (the line's
+/// own indent) is laid down first and `'showbreak'` follows right before the wrapped
+/// text — so the text sits `showbreak`-width past the indent. With `'breakindentopt'`
+/// `sbr` the marker is drawn first and the breakindent is reduced by its width, so the
+/// text aligns exactly under the indent. The total width is clamped to `width - 1` so
+/// a continuation row always keeps at least one text cell. Returns `("", 0)` when
+/// neither option applies (the common case), so callers add no prefix.
+pub fn break_prefix(line: &str, tabstop: usize, width: usize, wp: WrapPrefix) -> (String, usize) {
+    if width == 0 || (!wp.breakindent && wp.showbreak.is_empty()) {
+        return (String::new(), 0);
+    }
+    let sbr_w = display_width(wp.showbreak);
+    let indent = if wp.breakindent {
+        // Display width of the line's leading whitespace (the breakindent amount).
+        let fnb = line.len() - line.trim_start_matches([' ', '\t']).len();
+        virtcol(line, fnb, tabstop)
+    } else {
+        0
+    };
+    // vim's `bri`: the breakindent amount, reduced by the marker width under `sbr`.
+    let bri = if wp.sbr {
+        indent.saturating_sub(sbr_w)
+    } else {
+        indent
+    };
+    let total = (bri + sbr_w).min(width.saturating_sub(1));
+    if total == 0 {
+        return (String::new(), 0);
+    }
+    // The marker fitted to at most `total` cells (truncated if it alone overflows),
+    // and the breakindent spaces filling the rest.
+    let marker = truncate_to_width(wp.showbreak, tabstop, total);
+    let marker_w = display_width(&marker);
+    let spaces = " ".repeat(total - marker_w);
+    // Draw order (see the doc / `drawline.c`): `sbr` → marker then indent; default →
+    // indent then marker (the marker sits right before the wrapped text).
+    let prefix = if wp.sbr {
+        format!("{marker}{spaces}")
+    } else {
+        format!("{spaces}{marker}")
+    };
+    (prefix, total)
+}
+
+/// `s` truncated to at most `width` display cells, on a grapheme boundary.
+fn truncate_to_width(s: &str, tabstop: usize, width: usize) -> String {
+    let mut out = String::new();
+    let mut w = 0;
+    for g in s.graphemes(true) {
+        let gw = grapheme_width(g, w, tabstop);
+        if w + gw > width {
+            break;
+        }
+        out.push_str(g);
+        w += gw;
+    }
+    out
+}
+
+/// The continuation-indent width [`wrap_segments_indented`] takes — the prefix cells
+/// reserved on each continuation row (see [`break_prefix`]).
+pub fn cont_indent(line: &str, tabstop: usize, width: usize, wp: WrapPrefix) -> usize {
+    break_prefix(line, tabstop, width, wp).1
+}
+
+/// [`wrap_segments`] with a `'breakindent'` / `'showbreak'` **continuation indent**:
+/// `cont_indent` leading cells of every continuation row are reserved for the
+/// indent / marker prefix, so a continuation segment wraps into `width -
+/// cont_indent` text cells rather than the full `width`. The first segment keeps the
+/// full `width` (its row has no prefix). `cont_indent` is clamped so a continuation
+/// row always keeps at least one text cell. `start_col` stays the segment's column
+/// in the original line grid (the prefix is not part of it — the caller bakes the
+/// prefix onto the row text and shifts overlays by `cont_indent` separately).
+pub fn wrap_segments_indented(
+    line: &str,
+    tabstop: usize,
+    width: usize,
+    cont_indent: usize,
+) -> Vec<WrapSeg> {
     if width == 0 {
         return vec![WrapSeg {
             start_byte: 0,
@@ -124,6 +224,8 @@ pub fn wrap_segments(line: &str, tabstop: usize, width: usize) -> Vec<WrapSeg> {
             start_col: 0,
         }];
     }
+    // Keep ≥ 1 text cell per continuation row even with a wide prefix.
+    let cont_indent = cont_indent.min(width.saturating_sub(1));
     let mut segs = Vec::new();
     let mut seg_start_byte = 0;
     let mut seg_start_col = 0;
@@ -131,9 +233,16 @@ pub fn wrap_segments(line: &str, tabstop: usize, width: usize) -> Vec<WrapSeg> {
     let mut byte = 0;
     for g in line.graphemes(true) {
         let w = grapheme_width(g, col, tabstop);
+        // The current row's usable width: full for the first segment, reduced by the
+        // continuation indent for every later one.
+        let avail = if seg_start_byte == 0 {
+            width
+        } else {
+            width - cont_indent
+        };
         // Break *before* a grapheme that would overflow the current row, but never
         // emit an empty row (so an over-wide grapheme still occupies its own row).
-        if col + w > seg_start_col + width && byte > seg_start_byte {
+        if col + w > seg_start_col + avail && byte > seg_start_byte {
             segs.push(WrapSeg {
                 start_byte: seg_start_byte,
                 end_byte: byte,

@@ -11,6 +11,15 @@ enum CharClass {
     Punct,
 }
 
+/// Which column of a *display* row `g0`/`g^`/`g$` target — the within-row
+/// analogues of `0`/`^`/`$`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DisplayCol {
+    Start,
+    FirstNonBlank,
+    End,
+}
+
 fn char_class(c: char) -> CharClass {
     if c == ' ' || c == '\t' || c == '\n' || c == '\r' {
         CharClass::Blank
@@ -198,6 +207,9 @@ impl Editor {
             }
             Motion::DisplayDown => self.display_motion(true, count),
             Motion::DisplayUp => self.display_motion(false, count),
+            Motion::DisplayLineStart => self.display_line_motion(DisplayCol::Start),
+            Motion::DisplayFirstNonBlank => self.display_line_motion(DisplayCol::FirstNonBlank),
+            Motion::DisplayLineEnd => self.display_line_motion(DisplayCol::End),
             Motion::GotoLine => {
                 let l = raw.map(|n| n - 1).unwrap_or(last_line).min(last_line);
                 MotionResult::linewise(self.buffer().line_start(l), MoveAxis::LineAnchor)
@@ -292,13 +304,21 @@ impl Editor {
             return MotionResult::linewise(self.buffer().line_start(l), MoveAxis::VerticalKeep);
         }
         let tab = self.tabstop();
+        let opts = self.windows.cur().options.clone();
+        let wp = opts.wrap_prefix();
         let buf = self.buffer();
-        let seg_count = |line: usize| unicode::wrap_segments(&buf.line_cow(line), tab, width).len();
+        // Segment a line with the window's `'breakindent'`/`'showbreak'` continuation
+        // indent, so gj/gk step the same display rows the window renders.
+        let segs_of = |text: &str| {
+            let indent = unicode::cont_indent(text, tab, width, wp);
+            unicode::wrap_segments_indented(text, tab, width, indent)
+        };
+        let seg_count = |line: usize| segs_of(&buf.line_cow(line)).len();
 
         // The cursor's current display column: its screen column minus the start
         // column of the wrap segment it sits in.
         let text0 = buf.line_cow(self.cursor.line);
-        let segs0 = unicode::wrap_segments(&text0, tab, width);
+        let segs0 = segs_of(&text0);
         let cur_full = unicode::virtcol(&text0, self.cursor.col, tab);
         let cur_seg = segs0
             .iter()
@@ -336,12 +356,62 @@ impl Editor {
         // Land at the target row's start column + the wanted display column, clamped
         // to the row's own extent so it doesn't spill into the next row's content.
         let text = buf.line_cow(line);
-        let segs = unicode::wrap_segments(&text, tab, width);
+        let segs = segs_of(&text);
         let start_col = segs.get(seg).map_or(0, |s| s.start_col);
         let next_start = segs.get(seg + 1).map_or(usize::MAX, |s| s.start_col);
         let screen_col = (start_col + want).min(next_start.saturating_sub(1).max(start_col));
         let byte = unicode::floor_grapheme(&text, unicode::byte_at_virtcol(&text, screen_col, tab));
         MotionResult::horizontal(buf.line_start(line) + byte, MotionKind::Inclusive)
+    }
+
+    /// Resolve `g0` / `g^` / `g$`: move within the cursor's current *display* row to
+    /// its first column / first non-blank / last column — the within-row siblings of
+    /// `gj`/`gk`. Under `nowrap` (or a zero-width area) these are exactly `0` / `^` /
+    /// `$`; when wrapping, the bounds are the cursor's own soft-wrap segment rather
+    /// than the whole buffer line.
+    fn display_line_motion(&self, kind: DisplayCol) -> MotionResult {
+        let width = self.text_width();
+        let wrap = self.windows.cur().options.wrap;
+        let line = self.cursor.line;
+        let buf = self.buffer();
+
+        // The display row's byte span within the line: the whole line under `nowrap`,
+        // else the soft-wrap segment the cursor sits in.
+        let text = buf.line_cow(line);
+        let (start_byte, end_byte) = if !wrap || width == 0 {
+            (0, text.len())
+        } else {
+            let tab = self.tabstop();
+            let opts = self.windows.cur().options.clone();
+            let indent = unicode::cont_indent(&text, tab, width, opts.wrap_prefix());
+            let segs = unicode::wrap_segments_indented(&text, tab, width, indent);
+            let seg = segs
+                .iter()
+                .rposition(|s| self.cursor.col >= s.start_byte)
+                .unwrap_or(0);
+            (segs[seg].start_byte, segs[seg].end_byte)
+        };
+        let base = buf.line_start(line);
+        match kind {
+            DisplayCol::Start => MotionResult::exclusive(base + start_byte),
+            DisplayCol::FirstNonBlank => {
+                // First non-blank byte within the segment; an all-blank segment lands
+                // on its start (vim's `g^` falls back to the first column).
+                let seg = &text[start_byte..end_byte];
+                let off = seg.find(|c: char| c != ' ' && c != '\t').unwrap_or(0);
+                MotionResult::exclusive(base + start_byte + off)
+            }
+            DisplayCol::End => {
+                // Last grapheme of the display row (inclusive, like `$`), never before
+                // the row's own start for an empty segment.
+                let last = unicode::prev_grapheme(&text, end_byte).max(start_byte);
+                MotionResult {
+                    target: base + last,
+                    kind: MotionKind::Inclusive,
+                    axis: MoveAxis::EndOfLine,
+                }
+            }
+        }
     }
 
     fn word_forward(&self, mut idx: usize) -> usize {

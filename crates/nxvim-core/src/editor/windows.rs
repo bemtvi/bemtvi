@@ -1019,7 +1019,8 @@ impl Editor {
     /// Window `id`'s window-local options (the number gutter), or `None` for an
     /// unknown id. The server snapshots these into the `vim.wo` mirror.
     pub fn window_options(&self, id: WindowId) -> Option<WindowOptions> {
-        self.tree_of_window(id).map(|(_, t)| t.get(id).options)
+        self.tree_of_window(id)
+            .map(|(_, t)| t.get(id).options.clone())
     }
 
     /// Set a boolean window-local option on window `id` (`vim.wo` /
@@ -1235,7 +1236,7 @@ impl Editor {
         let (_, t) = self.tree_of_window(id)?;
         let w = t.get(id);
         let lines = self.buffers.get(w.buffer).buffer.line_count();
-        Some(self.number_width_for(w.options, lines) + w.options.signcolumn.floor_cells())
+        Some(self.number_width_for(&w.options, lines) + w.options.signcolumn.floor_cells())
     }
 
     /// Scroll window `id` so its first visible line is `top` (0-based), clamped to
@@ -1288,10 +1289,11 @@ impl Editor {
     /// row when one is shown. Mirrors the [`crate::view::window_view`] /
     /// [`Editor::text_height`] content math so the API agrees with what is drawn.
     pub fn window_content_size(&self, id: WindowId) -> Option<(usize, usize)> {
-        let (_, t) = self.tree_of_window(id)?;
+        let (layer, t) = self.tree_of_window(id)?;
         let w = t.get(id);
         let inset = matches!(&w.float, Some(cfg) if cfg.border != BorderStyle::None) as usize;
-        let status = usize::from(self.window_statusline_visible(w.float.is_some()));
+        let status =
+            usize::from(self.window_statusline_visible(region_of_layer(layer), w.float.is_some()));
         let width = w.rect.width.saturating_sub(2 * inset);
         let height = w
             .rect
@@ -1359,7 +1361,7 @@ impl Editor {
         // This matches how floats read in neovim; a caller that wants numbers in a
         // floating editor re-enables them with `nvim_win_set_option(win, "number")`.
         // The horizontal-scroll settings still come from the focused window.
-        let mut options = self.windows.get(self.windows.current).options;
+        let mut options = self.windows.get(self.windows.current).options.clone();
         options.number = false;
         options.relativenumber = false;
         let id = self.alloc_window_id();
@@ -1555,7 +1557,7 @@ impl Editor {
                     },
                     rect: w.rect,
                     focused,
-                    options: w.options,
+                    options: w.options.clone(),
                     floating,
                     border,
                     title,
@@ -1605,7 +1607,7 @@ impl Editor {
         }
         let buffer = self.windows.get(cur).buffer;
         // A split inherits the source window's window-local options, as vim does.
-        let options = self.windows.get(cur).options;
+        let options = self.windows.get(cur).options.clone();
         // …and a copy of its jump list, so `<C-o>` history carries into the split
         // (vim copies the jumplist to the new window).
         let jumps = self.windows.get(cur).jumps.clone();
@@ -1649,7 +1651,7 @@ impl Editor {
     /// width below everything, regardless of any vertical splits. Backs `:copen`.
     /// Returns the new window's id.
     pub(crate) fn open_bottom_window(&mut self, buf: BufferId, height: usize) -> WindowId {
-        let options = self.windows.get(self.windows.current).options;
+        let options = self.windows.get(self.windows.current).options.clone();
         let new_id = self.alloc_window_id();
         self.windows.windows.insert(
             new_id,
@@ -2237,7 +2239,7 @@ impl Editor {
     /// the view projection ([`crate::view`]) and the scroll math
     /// ([`Editor::text_height`]) consult so the reserved text row, the cursor
     /// scrolling, and the client's paint never disagree.
-    pub(crate) fn window_statusline_visible(&self, floating: bool) -> bool {
+    pub(crate) fn window_statusline_visible(&self, region: WindowRegion, floating: bool) -> bool {
         if floating {
             // A float carries no status line by default, matching neovim: its
             // `last_status` only walks the tiled frame tree, so a float's
@@ -2245,11 +2247,28 @@ impl Editor {
             // per-window opt-in could grow here later; nxvim has none yet.)
             return false;
         }
-        match self.options.laststatus {
+        // The dock's `'laststatus'` override (if set) wins for its windows, else the
+        // global value decides — the per-region sibling of `tabline_visible_for`.
+        let layer = layer_of_region(region);
+        let laststatus = match layer {
+            Layer::Dock(s) => self.dock_options[s.idx()]
+                .laststatus
+                .unwrap_or(self.options.laststatus),
+            Layer::Main => self.options.laststatus,
+        };
+        match laststatus {
             0 | 3 => false,
-            1 => self.windows.tiled_count() > 1,
+            // `1`: only with ≥2 tiled windows *in this region's own layer* (a dock
+            // counts its own tree, not the main area's).
+            1 => self.layer_tree(layer).is_some_and(|t| t.tiled_count() > 1),
             _ => true,
         }
+    }
+
+    /// The [`WindowRegion`] of the focused window's layer — the region a focused-only
+    /// caller (the scroll/cursor math) passes to [`window_statusline_visible`].
+    pub(crate) fn focused_region(&self) -> WindowRegion {
+        region_of_layer(self.focused_layer)
     }
 
     /// Whether the single **global** status line is shown — only at
@@ -2418,6 +2437,19 @@ fn region_of_layer(layer: Layer) -> WindowRegion {
         Layer::Dock(DockSide::Right) => WindowRegion::DockRight,
         Layer::Dock(DockSide::Top) => WindowRegion::DockTop,
         Layer::Dock(DockSide::Bottom) => WindowRegion::DockBottom,
+    }
+}
+
+/// The [`Layer`] a [`WindowRegion`] belongs to — the inverse of
+/// [`region_of_layer`], so a projection that carries a region can look up the
+/// region's dock-scoped options.
+fn layer_of_region(region: WindowRegion) -> Layer {
+    match region {
+        WindowRegion::Main => Layer::Main,
+        WindowRegion::DockLeft => Layer::Dock(DockSide::Left),
+        WindowRegion::DockRight => Layer::Dock(DockSide::Right),
+        WindowRegion::DockTop => Layer::Dock(DockSide::Top),
+        WindowRegion::DockBottom => Layer::Dock(DockSide::Bottom),
     }
 }
 

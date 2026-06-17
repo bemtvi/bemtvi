@@ -152,6 +152,33 @@ pub trait HostEffects {
     #[cfg(not(feature = "native"))]
     fn has_remote_proc(&self) -> bool;
 
+    /// Off-tick `nx.fs` op (`nx._fs_op`) over the daemon `luafs_op` leg — the wasm twin of the
+    /// native `loop_command(LoopCommand::Fs)`. Fire-and-forget: the op runs `run_fs_job` on the
+    /// daemon and its typed result returns *inbound* via
+    /// [`EditHost::fs_op_result`](crate::EditHost::fs_op_result), not here. The editor tick gates
+    /// this on a connected daemon ([`Self::has_remote_proc`]); a serverless OPFS session has no
+    /// `luafs_op` host and fails the op loud in the tick (the OPFS-fs route is a later phase).
+    /// Native-only builds run `nx.fs` ops on the event-loop actor via `loop_command`, so this
+    /// method is wasm-only. `job` is the typed op descriptor; the wasm impl forwards it to the
+    /// Worker, which sends one `luafs_op` request and lands the reply back through `fs_op_result`.
+    #[cfg(not(feature = "native"))]
+    fn fs_op(&mut self, id: u64, job: nxvim_lua::FsJob);
+
+    /// Arm a streaming `nx.fs.watch` over the daemon `luafs_watch` leg (Phase 3b) — the wasm twin
+    /// of the native `loop_command(LoopCommand::FsEventStart)`. Fire-and-forget: change batches
+    /// return *inbound* via [`EditHost::fs_watch_event`](crate::EditHost::fs_watch_event) and a
+    /// terminal error via [`fs_watch_error`](crate::EditHost::fs_watch_error), keyed by the stream
+    /// `id`. Daemon-only — serverless OPFS has no change source, so the editor tick fails the
+    /// watch *loud* (gated on [`Self::has_remote_proc`]) rather than arm a dead watch. Wasm-only
+    /// (native rides the event-loop actor's `notify` watcher through `loop_command`).
+    #[cfg(not(feature = "native"))]
+    fn fs_watch_stream(&mut self, id: u64, path: String, recursive: bool);
+
+    /// Disarm the streaming `nx.fs.watch` armed under `id` (`:stop()`) — the wasm twin of
+    /// `loop_command(LoopCommand::FsEventStop)`. A no-op if it was never armed. Wasm-only.
+    #[cfg(not(feature = "native"))]
+    fn fs_unwatch_stream(&mut self, id: u64);
+
     /// Open a daemon-side PTY for terminal buffer `buf` (the web `:terminal` — Phase 7),
     /// running `argv` (empty ⇒ the daemon's default shell) in `cwd`, sized `rows`×`cols`.
     /// The wasm twin of the native `terminal_command(TermCommand::Open)`: the browser owns

@@ -13,26 +13,30 @@
 --     local ok, err = pcall(nx.await, nx.fs.remove(p))  -- err.code == "ENOENT" / …
 --   end)()
 --
--- The bridge runs each op synchronously through the LuaFs seam, so in a daemon
--- session it blocks briefly on the wire exactly like the vim.fn fs builtins; the
--- promise shape is what consumers (the file tree) depend on regardless.
+-- The bridge runs each op OFF the editor tick: nx._fs_op queues a LoopOp::Fs and
+-- returns immediately, so the promise stays pending and SETTLES ON A LATER TICK (the
+-- event-loop actor runs the op on its blocking pool natively; the daemon luafs leg
+-- runs it on the browser). This is non-blocking on native and the only way to reach
+-- the daemon on wasm. The promise shape is unchanged — only the timing moved from
+-- "resolved-already" to "resolved next tick".
 
 nx.fs = nx.fs or {}
 
--- Run a `nx._fs_*` bridge (which returns `value, err`) and settle a promise on it:
--- reject with the `{ code, message }` table when `err` is non-nil, else resolve
--- with the value. The op itself runs synchronously inside the executor; the
--- reaction fires as a microtask, so `nx.await` / `:next` see it on the same tick.
-local function settle(bridge, ...)
-  local n = select("#", ...)
-  local args = { ... }
+-- Queue an off-tick fs op described by `job` ({ op = "<name>", … }) and return a
+-- pending promise. A callback id is registered in nx._cb_fns; the server fires
+-- nx._run_cb(id, false, err, value) when the op settles — `err` the { code, message }
+-- table (then `value` is nil) on failure, else `err` nil with the resolved value.
+local function run_fs(job)
   return nx.promise.new(function(resolve, reject)
-    local value, err = bridge(table.unpack(args, 1, n))
-    if err ~= nil then
-      reject(err)
-    else
-      resolve(value)
+    local id = nx._next_cb_id()
+    nx._cb_fns[id] = function(err, value)
+      if err ~= nil then
+        reject(err)
+      else
+        resolve(value)
+      end
     end
+    nx._fs_op(job, id)
   end)
 end
 
@@ -40,21 +44,20 @@ end
 
 -- nx.fs.stat(path)  -> promise of { type, size, mtime, atime, mode }  (follows links)
 function nx.fs.stat(path)
-  return settle(nx._fs_stat, path)
+  return run_fs({ op = "stat", path = path })
 end
 
 -- nx.fs.lstat(path) -> like stat but does NOT follow a symlink (type may be "link").
 function nx.fs.lstat(path)
-  return settle(nx._fs_lstat, path)
+  return run_fs({ op = "lstat", path = path })
 end
 
 -- nx.fs.exists(path) -> promise of a boolean. The one op that never rejects: a
 -- missing path (or any error) resolves `false`. Existence of the entry itself, so
--- a dangling symlink is `true`.
+-- a dangling symlink is `true`. (The `exists` job resolves a bool rather than
+-- rejecting, so no reject-to-false mapping is needed in the wrapper.)
 function nx.fs.exists(path)
-  return nx.promise.new(function(resolve)
-    resolve(nx._fs_exists(path))
-  end)
+  return run_fs({ op = "exists", path = path })
 end
 
 -- ----- listing ---------------------------------------------------------------
@@ -63,60 +66,60 @@ end
 -- the entries directly under `path` (no "."/".."), each with its dirent kind in the
 -- SAME call (no per-entry stat). `type` is lstat-flavoured (a symlink reports "link").
 function nx.fs.readdir(path)
-  return settle(nx._fs_readdir, path)
+  return run_fs({ op = "readdir", path = path })
 end
 
 -- ----- reading / writing -----------------------------------------------------
 
 -- nx.fs.read(path) -> promise of the file's RAW bytes (a Lua byte-string).
 function nx.fs.read(path)
-  return settle(nx._fs_read, path)
+  return run_fs({ op = "read", path = path })
 end
 
 -- nx.fs.read_text(path[, { encoding = "utf-8" }]) -> promise of decoded text.
 -- Decodes through the encoding seam and REJECTS (EILSEQ) on invalid input — never
 -- lossy replacement text. Use nx.fs.read for raw bytes.
 function nx.fs.read_text(path, opts)
-  return settle(nx._fs_read_text, path, opts and opts.encoding)
+  return run_fs({ op = "read_text", path = path, encoding = opts and opts.encoding })
 end
 
 -- nx.fs.write(path, data) -> promise (resolves nil). Truncates / creates.
 function nx.fs.write(path, data)
-  return settle(nx._fs_write, path, data)
+  return run_fs({ op = "write", path = path, data = data })
 end
 
 -- nx.fs.append(path, data) -> promise (resolves nil). Creates if absent.
 function nx.fs.append(path, data)
-  return settle(nx._fs_append, path, data)
+  return run_fs({ op = "append", path = path, data = data })
 end
 
 -- ----- mutation --------------------------------------------------------------
 
 -- nx.fs.mkdir(path[, { recursive = false }]) -> promise (resolves nil).
 function nx.fs.mkdir(path, opts)
-  return settle(nx._fs_mkdir, path, opts and opts.recursive or false)
+  return run_fs({ op = "mkdir", path = path, recursive = opts and opts.recursive or false })
 end
 
 -- nx.fs.rename(from, to) -> promise (resolves nil).
 function nx.fs.rename(from, to)
-  return settle(nx._fs_rename, from, to)
+  return run_fs({ op = "rename", from = from, to = to })
 end
 
 -- nx.fs.remove(path[, { recursive = false }]) -> promise (resolves nil). A file is
 -- unlinked; a directory needs `recursive` unless already empty.
 function nx.fs.remove(path, opts)
-  return settle(nx._fs_remove, path, opts and opts.recursive or false)
+  return run_fs({ op = "remove", path = path, recursive = opts and opts.recursive or false })
 end
 
 -- nx.fs.copy(src, dst[, { recursive = false }]) -> promise (resolves nil). A file
 -- copies (overwriting); a directory needs `recursive`.
 function nx.fs.copy(src, dst, opts)
-  return settle(nx._fs_copy, src, dst, opts and opts.recursive or false)
+  return run_fs({ op = "copy", src = src, dst = dst, recursive = opts and opts.recursive or false })
 end
 
 -- nx.fs.realpath(path) -> promise of the canonical absolute path (symlinks resolved).
 function nx.fs.realpath(path)
-  return settle(nx._fs_realpath, path)
+  return run_fs({ op = "realpath", path = path })
 end
 
 -- ----- watch (continuous → async-iterator) -----------------------------------

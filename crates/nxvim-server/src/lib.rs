@@ -249,10 +249,12 @@ pub struct ServerInit {
     /// (`docs/plans/2026-06-09-edit-host-and-browser-lua.md` → *The full split*,
     /// *Lua-visible filesystem semantics*). Like [`blocking_system`](Self::blocking_system)
     /// it is a synchronous blocking bridge: each call parks the editor thread on the
-    /// daemon reply, its wire's RPC tasks on their own thread. `Send` (boxed) so it rides
-    /// [`ServerInit`] onto the server thread, where it is rebuilt into the Lua runtime's
-    /// `Rc<dyn LuaFs>`.
-    pub lua_fs: Option<Box<dyn nxvim_lua::LuaFs + Send>>,
+    /// daemon reply, its wire's RPC tasks on their own thread. `Send + Sync` (boxed)
+    /// so it rides [`ServerInit`] onto the server thread, where it is rebuilt into the
+    /// shared `Arc<dyn LuaFs + Send + Sync>` BOTH the Lua runtime's synchronous callers
+    /// and the event-loop actor (off-tick `nx.fs.*`) hold — the actor needs `Sync` to
+    /// run ops against the same handle off-thread.
+    pub lua_fs: Option<Box<dyn nxvim_lua::LuaFs + Send + Sync>>,
 }
 
 /// How the server provides the `"+` / `"*` clipboard registers.
@@ -1314,6 +1316,67 @@ impl EditHost {
         self.settle_events(true);
     }
 
+    /// Land the typed result of an off-tick `nx.fs` op (the `luafs_op` leg's reply) — the
+    /// wasm entry the Worker calls when the daemon answers the op enqueued under `id` (a
+    /// `nx._cb_fns` promise). `reply` is the `["ok", <fs-value>] | ["err", code, message]`
+    /// envelope re-encoded to msgpack bytes by the Worker; this decodes it (via
+    /// [`nxvim_lua::fs_result_from_value`]) into the `Result<FsValue, FsError>` the promise
+    /// resolves / rejects with, runs the callback, drains the effects it queues, then settles
+    /// and repaints — the wasm twin of the native `on_loop_event`'s `LoopEvent::FsResult` arm.
+    /// A malformed reply decodes to a loud `EWIRE` `FsError`, never a silent success. The
+    /// callback may itself queue further async (a chained `nx.fs`, an off-tick `:edit`), so
+    /// `settle_events` drives the convergence, exactly as [`Self::proc_exited`] does.
+    pub fn fs_op_result(&mut self, id: u64, reply: Vec<u8>) {
+        let result = match rmpv::decode::read_value(&mut &reply[..]) {
+            Ok(value) => nxvim_lua::fs_result_from_value(&value),
+            Err(e) => Err(nxvim_lua::FsError {
+                code: "EWIRE".to_string(),
+                message: format!("nx.fs: malformed luafs_op reply: {e}"),
+            }),
+        };
+        if let Err(e) =
+            self.lua
+                .run_callback(id, false, nxvim_lua::CallbackArgs::FsResult { result })
+        {
+            self.editor
+                .echo(format!("E5108: Error in nx.fs handler: {e}"));
+        }
+        self.apply_lua_effects();
+        self.settle_events(true);
+    }
+
+    /// Land a streaming `nx.fs.watch` change batch (the daemon `luafs_change` push) — the wasm
+    /// entry the Worker calls when the daemon reports a coalesced change for the watch armed under
+    /// `id`. `kind` is the change class (`"create"`/`"modify"`/`"remove"`/`"rename"`) and `paths`
+    /// the affected absolute paths; fires the stream's pump (`nx._run_fs_watch`), drains the
+    /// effects, and settles + repaints — the wasm twin of the native `on_loop_event`'s
+    /// `LoopEvent::FsEvent` (no-error) arm.
+    pub fn fs_watch_event(&mut self, id: u64, kind: String, paths: Vec<String>) {
+        let paths = paths.into_iter().map(std::path::PathBuf::from).collect();
+        if let Err(e) = self.lua.run_fs_watch_event(id, None, Some(&kind), paths) {
+            self.editor
+                .echo(format!("E5108: Error in nx.fs.watch handler: {e}"));
+        }
+        self.apply_lua_effects();
+        self.settle_events(true);
+    }
+
+    /// Land a streaming `nx.fs.watch` terminal error (the daemon `luafs_watch_err` push) — the
+    /// arm failed (bad path / watch limit) or the backend errored. Rejects the stream's pull
+    /// (ending the iteration loud, never a dead watch), drains the effects, and settles. The wasm
+    /// twin of the native `LoopEvent::FsEvent` (error) arm.
+    pub fn fs_watch_error(&mut self, id: u64, message: String) {
+        if let Err(e) = self
+            .lua
+            .run_fs_watch_event(id, Some(message), None, Vec::new())
+        {
+            self.editor
+                .echo(format!("E5108: Error in nx.fs.watch handler: {e}"));
+        }
+        self.apply_lua_effects();
+        self.settle_events(true);
+    }
+
     /// Seed the set of available treesitter grammars at boot — the offline bundle
     /// plus whatever the previous session installed into OPFS, both discovered by the
     /// Worker (it owns the manifests). Backs `:TSInstallInfo`; idempotent. No echo /
@@ -1670,16 +1733,19 @@ where
         let sys: Rc<dyn nxvim_lua::BlockingSystem> = sys;
         lua.set_blocking_system(sys);
     }
-    // The project-facing Lua filesystem surface (the `vim.fn` fs builtins)
-    // runs through this seam — the local disk by default, or an injected daemon bridge
-    // so a plugin sees the *remote* project. Rebuilt here, on the server thread, into the
-    // Lua runtime's `Rc<dyn LuaFs>` (the same `Send`-dropping two-step). `None` leaves the
-    // default persistent local `StdLuaFs` in place — a bare/local session is unchanged.
-    if let Some(fs) = init.lua_fs {
-        let fs: Rc<dyn nxvim_lua::LuaFs + Send> = Rc::from(fs);
-        let fs: Rc<dyn nxvim_lua::LuaFs> = fs;
-        lua.set_lua_fs(fs);
-    }
+    // The Lua filesystem surface runs through this seam — the local disk by default,
+    // or an injected daemon bridge so a plugin sees the *remote* project. ONE
+    // `Arc<dyn LuaFs + Send + Sync>` is shared between the synchronous editor-thread
+    // callers (the `vim.fn` fs builtins, via the Lua runtime) and the event-loop actor
+    // (which runs `nx.fs.*` ops off the tick). Built here, on the server thread:
+    // either the injected daemon bridge or the default persistent local `StdLuaFs` (a
+    // bare/local session is unchanged). The `Arc + Send + Sync` lets the same handle
+    // cross to the actor's blocking pool; the inline callers deref it exactly as before.
+    let lua_fs: Arc<dyn nxvim_lua::LuaFs + Send + Sync> = match init.lua_fs {
+        Some(fs) => Arc::from(fs),
+        None => Arc::new(nxvim_lua::StdLuaFs::new()),
+    };
+    lua.set_lua_fs(lua_fs.clone());
     // Language servers are spawned through this transport — real local children by
     // default, or an injected daemon-backed tunnel. Rebuilt here, on the server thread,
     // into the shared `Arc<dyn LspTransport>` the manager holds (`ServerInit` carried it
@@ -1706,7 +1772,7 @@ where
         }
         None => Arc::new(StdHostProc),
     };
-    let (evloop, mut loop_events) = EventLoop::new(host_proc);
+    let (evloop, mut loop_events) = EventLoop::new(host_proc, lua_fs);
     // The terminal actor: owns the local PTYs `:terminal` spawns, streaming their
     // output back on `term_events`. Lazily started on the first open (the `EventLoop`
     // pattern), so a session with no terminal spawns nothing.
@@ -1976,6 +2042,7 @@ where
     let (sys_tx, sys_rx) = unbounded_channel();
     let (lsp_tx, lsp_rx) = unbounded_channel();
     let (luafs_tx, luafs_rx) = unbounded_channel();
+    let (luafs_watch_tx, luafs_watch_rx) = unbounded_channel();
 
     let legs = [
         tokio::spawn(daemon::serve_fs_daemon_on(
@@ -1995,6 +2062,10 @@ where
             rpc.clone(),
             luafs_rx,
             Box::new(StdLuaFs::new()),
+        )),
+        tokio::spawn(daemon::serve_luafs_watch_daemon_on(
+            rpc.clone(),
+            luafs_watch_rx,
         )),
     ];
 
@@ -2016,8 +2087,14 @@ where
                 Some(&sys_tx)
             } else if method.starts_with("lsp_") {
                 Some(&lsp_tx)
-            } else if method == "luafs" {
+            } else if method == "luafs" || method == "luafs_op" {
+                // Both the low-level `vim.fn` fs leg (`luafs`) and the high-level `nx.fs`
+                // off-tick leg (`luafs_op`, the wasm route) share the one `StdLuaFs` leg.
                 Some(&luafs_tx)
+            } else if method == "luafs_watch" || method == "luafs_unwatch" {
+                // The streaming `nx.fs.watch` leg (Phase 3b) — its own recursive watcher,
+                // distinct from the buffer-reconcile `fs_watch` poll above.
+                Some(&luafs_watch_tx)
             } else {
                 None // unknown method: drop (the peer is the same build)
             }
@@ -2031,7 +2108,15 @@ where
 
     // The edit-host hung up: drop the senders so each leg sees EOF and winds down,
     // then wait for them so child reaping completes before we return.
-    drop((fs_tx, proc_tx, term_tx, sys_tx, lsp_tx, luafs_tx));
+    drop((
+        fs_tx,
+        proc_tx,
+        term_tx,
+        sys_tx,
+        lsp_tx,
+        luafs_tx,
+        luafs_watch_tx,
+    ));
     for leg in legs {
         let _ = leg.await;
     }

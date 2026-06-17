@@ -557,3 +557,173 @@ fn is_executable_file(p: &std::path::Path) -> bool {
 fn is_executable_file(p: &std::path::Path) -> bool {
     p.is_file()
 }
+
+// ===== the off-tick op executor =============================================
+// `nx.fs.*` ops run off the editor tick: the `nx._fs_op` bridge queues an [`FsJob`]
+// and the event-loop actor (native) / daemon leg (wasm) runs it here, against the
+// active [`LuaFs`]. This is the synchronous heart of the op — it returns the typed
+// [`FsValue`] / [`FsError`] the runtime marshals into the resolved / rejected Lua
+// value once, regardless of where it ran. (The previous inline `nx._fs_*` bridges in
+// install.rs are gone; this is their semantics, lifted off the tick.)
+
+use crate::ops::{FsError, FsJob, FsValue};
+
+/// Run one [`FsJob`] through `fs`, returning the typed success value or the
+/// `{ code, message }` error. Pure and synchronous — safe to call from a blocking
+/// pool thread (the native actor's `spawn_blocking`) or the daemon. `read_text`
+/// transcodes through `encoding_rs`, failing loud (EILSEQ) on invalid bytes — never
+/// lossy replacement text.
+pub fn run_fs_job(fs: &dyn LuaFs, job: &FsJob) -> Result<FsValue, FsError> {
+    match job {
+        FsJob::Stat { path } => fs.stat(path).map(FsValue::Stat).map_err(fs_error),
+        FsJob::Lstat { path } => fs.lstat(path).map(FsValue::Stat).map_err(fs_error),
+        // Existence of the entry itself (`lstat` — a dangling symlink still "exists").
+        // Never errors, per the promise-always `exists` contract.
+        FsJob::Exists { path } => Ok(FsValue::Bool(fs.lstat(path).is_ok())),
+        FsJob::Readdir { path } => fs.scandir(path).map(FsValue::Dir).map_err(fs_error),
+        FsJob::Read { path } => fs.read_file(path).map(FsValue::Bytes).map_err(fs_error),
+        FsJob::ReadText { path, encoding } => {
+            let bytes = fs.read_file(path).map_err(fs_error)?;
+            // Decode through the encoding seam (default UTF-8). A label we don't know
+            // or bytes that don't decode are HARD errors — `read_text` never returns
+            // lossy replacement-char text (use `nx.fs.read` for raw bytes).
+            let Some(enc) = encoding_rs::Encoding::for_label(encoding.as_bytes()) else {
+                return Err(FsError {
+                    code: "EINVAL".into(),
+                    message: format!("unknown encoding '{encoding}'"),
+                });
+            };
+            let (text, _, had_errors) = enc.decode(&bytes);
+            if had_errors {
+                return Err(FsError {
+                    code: "EILSEQ".into(),
+                    message: format!("invalid {encoding} byte sequence in '{path}'"),
+                });
+            }
+            Ok(FsValue::Text(text.into_owned()))
+        }
+        FsJob::Write { path, data } => write_whole(fs, path, data, false)
+            .map(|()| FsValue::Nil)
+            .map_err(fs_error),
+        FsJob::Append { path, data } => write_whole(fs, path, data, true)
+            .map(|()| FsValue::Nil)
+            .map_err(fs_error),
+        FsJob::Mkdir { path, recursive } => fs
+            .mkdir(path, 0o755, *recursive)
+            .map(|()| FsValue::Nil)
+            .map_err(fs_error),
+        FsJob::Rename { from, to } => fs.rename(from, to).map(|()| FsValue::Nil).map_err(fs_error),
+        FsJob::Remove { path, recursive } => remove_path(fs, path, *recursive)
+            .map(|()| FsValue::Nil)
+            .map_err(fs_error),
+        FsJob::Copy {
+            src,
+            dst,
+            recursive,
+        } => copy_path(fs, src, dst, *recursive)
+            .map(|()| FsValue::Nil)
+            .map_err(fs_error),
+        FsJob::Realpath { path } => fs.realpath(path).map(FsValue::Text).map_err(fs_error),
+    }
+}
+
+/// Shape an [`io::Error`] into the `{ code, message }` an `nx.fs` reject carries.
+fn fs_error(e: io::Error) -> FsError {
+    FsError {
+        code: errno_code(&e),
+        message: e.to_string(),
+    }
+}
+
+/// A libuv/errno-style code hint for a fs error (`nx.fs` rejections carry it as
+/// `err.code`). Prefers the stable [`io::ErrorKind`] mapping; for the kinds std
+/// still has no stable variant (`ENOTEMPTY`/`ENOTDIR`/`EISDIR`) it reads the raw OS
+/// errno where recognized, and surfaces the number (`E<n>`) rather than guess a name.
+fn errno_code(e: &io::Error) -> String {
+    use io::ErrorKind as K;
+    let named = match e.kind() {
+        K::NotFound => "ENOENT",
+        K::PermissionDenied => "EACCES",
+        K::AlreadyExists => "EEXIST",
+        K::InvalidInput => "EINVAL",
+        K::InvalidData => "EILSEQ",
+        _ => "",
+    };
+    if !named.is_empty() {
+        return named.to_string();
+    }
+    match e.raw_os_error() {
+        Some(20) => "ENOTDIR".to_string(),
+        Some(21) => "EISDIR".to_string(),
+        Some(28) => "ENOSPC".to_string(),
+        Some(39 | 66) => "ENOTEMPTY".to_string(), // linux 39, macos 66
+        Some(n) => format!("E{n}"),
+        None => "EIO".to_string(),
+    }
+}
+
+/// Write `data` to `path` as one whole file (truncate, or append when `append`),
+/// through the fd-based [`LuaFs`] seam. Closes the fd even on a write error, and
+/// loops on short writes so a partial-write seam can never silently truncate.
+fn write_whole(fs: &dyn LuaFs, path: &str, data: &[u8], append: bool) -> io::Result<()> {
+    let flags = if append { "a" } else { "w" };
+    let fd = fs.open(path, flags, 0o644)?;
+    let res = (|| {
+        let mut off = 0usize;
+        while off < data.len() {
+            let n = fs.write(fd, &data[off..], None)?;
+            if n == 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::WriteZero,
+                    "write made no progress",
+                ));
+            }
+            off += n;
+        }
+        Ok(())
+    })();
+    let _ = fs.close(fd);
+    res
+}
+
+/// Remove `path`: a file via `unlink`, a directory via `rmdir` (emptying it first
+/// when `recursive`). Uses `lstat`, so a symlink to a directory is unlinked, not
+/// walked into.
+fn remove_path(fs: &dyn LuaFs, path: &str, recursive: bool) -> io::Result<()> {
+    let st = fs.lstat(path)?;
+    if st.kind == FileKind::Dir {
+        if recursive {
+            for e in fs.scandir(path)? {
+                let child = std::path::Path::new(path).join(&e.name);
+                remove_path(fs, &child.to_string_lossy(), true)?;
+            }
+        }
+        fs.rmdir(path)
+    } else {
+        fs.unlink(path)
+    }
+}
+
+/// Copy `src` to `dst`: a file via `copyfile` (overwriting), or a directory tree
+/// when `recursive`. A directory `src` without `recursive` is an error, not a silent
+/// skip.
+fn copy_path(fs: &dyn LuaFs, src: &str, dst: &str, recursive: bool) -> io::Result<()> {
+    let st = fs.lstat(src)?;
+    if st.kind == FileKind::Dir {
+        if !recursive {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("'{src}' is a directory (pass {{ recursive = true }})"),
+            ));
+        }
+        fs.mkdir(dst, 0o755, true)?;
+        for e in fs.scandir(src)? {
+            let cs = std::path::Path::new(src).join(&e.name);
+            let cd = std::path::Path::new(dst).join(&e.name);
+            copy_path(fs, &cs.to_string_lossy(), &cd.to_string_lossy(), true)?;
+        }
+        Ok(())
+    } else {
+        fs.copyfile(src, dst, false)
+    }
+}

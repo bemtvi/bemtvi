@@ -1,15 +1,18 @@
 //! Behavior tests for `nx.fs` — the promise-always filesystem API
-//! (docs/plans/2026-06-16-nx-fs-api.md, Phase 1: one-shot ops). Black-box per the
+//! (docs/plans/2026-06-16-nx-fs-api.md + the off-tick plan). Black-box per the
 //! project conventions: a real server over RPC, driven with `nvim_exec_lua`,
 //! asserting on observable Lua state (and the real filesystem).
 //!
-//! Each op resolves/rejects a promise; reactions run as microtasks
-//! (`nx.schedule`), so they settle within the convergence the server runs after
-//! each `nvim_exec_lua`. The pattern (mirroring promise.rs): run an `nx.async`
-//! chain in one chunk that writes its outcome to a `_G` global, then read that
-//! global back in a second chunk — by which point every microtask has flushed.
+//! `nx.fs` ops now settle OFF the editor tick: `nx._fs_op` queues the op for the
+//! event-loop actor, which runs it on its blocking pool and reports the result back
+//! on a LATER tick (the only way to reach the daemon on wasm, and non-blocking on
+//! native). So unlike a microtask-only chain, the global an `nx.async` chain sets
+//! only appears after the loop processes the result — exactly like the `nx.run`
+//! process tests in `async_runtime.rs`. Each test queues its chain, then POLLS the
+//! observable (a `_G` global, or the real filesystem) until the off-tick op settles.
 
 use std::fs;
+use std::time::Duration;
 
 use nxvim_rpc::{Incoming, Rpc};
 use nxvim_server::ServerInit;
@@ -23,6 +26,33 @@ async fn start() -> (Rpc, UnboundedReceiver<Incoming>) {
 /// Read a `return`-style chunk as an owned `String` (`None` if not a string).
 async fn lua_string(rpc: &Rpc, code: &str) -> Option<String> {
     exec_lua(rpc, code).await.as_str().map(str::to_owned)
+}
+
+/// Poll a `return`-style chunk until it yields a non-nil value (~3s), then return it.
+/// An off-tick `nx.fs` op settles on a later tick, so the global its chain sets is
+/// nil until the loop processes the actor's result; this gives that wall-clock room.
+async fn poll_settled(rpc: &Rpc, code: &str) -> rmpv::Value {
+    for _ in 0..150 {
+        let v = exec_lua(rpc, code).await;
+        if !matches!(v, rmpv::Value::Nil) {
+            return v;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    exec_lua(rpc, code).await
+}
+
+/// Poll until the predicate `done` reports the chain finished (~3s). For the
+/// disk-mutating ops whose only observable is the real filesystem, the chain sets
+/// `_G.done = true` after its final `await`; this waits for that across-tick settle
+/// before the test asserts on the disk.
+async fn poll_done(rpc: &Rpc) {
+    for _ in 0..150 {
+        if lua_bool(rpc, "return _G.done").await == Some(true) {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
 }
 
 /// Lua-escape a path for embedding in a double-quoted string literal.
@@ -58,7 +88,7 @@ async fn readdir_returns_entries_with_kind() {
     )
     .await;
     assert_eq!(
-        lua_string(&rpc, "return _G.out").await.as_deref(),
+        poll_settled(&rpc, "return _G.out").await.as_str(),
         Some("a.txt:file,sub:directory")
     );
     let _ = fs::remove_dir_all(&dir);
@@ -86,7 +116,7 @@ async fn write_then_read_round_trips() {
     )
     .await;
     assert_eq!(
-        lua_string(&rpc, "return _G.txt").await.as_deref(),
+        poll_settled(&rpc, "return _G.txt").await.as_str(),
         Some("hello world")
     );
     // And it actually hit the disk.
@@ -115,7 +145,7 @@ async fn read_text_rejects_invalid_utf8() {
     )
     .await;
     assert_eq!(
-        lua_string(&rpc, "return _G.code").await.as_deref(),
+        poll_settled(&rpc, "return _G.code").await.as_str(),
         Some("EILSEQ")
     );
     // Raw read of the same bytes succeeds (3 bytes).
@@ -128,7 +158,7 @@ async fn read_text_rejects_invalid_utf8() {
         ),
     )
     .await;
-    assert_eq!(lua_u64(&rpc, "return _G.len").await, Some(3));
+    assert_eq!(poll_settled(&rpc, "return _G.len").await.as_u64(), Some(3));
     let _ = fs::remove_dir_all(&dir);
 }
 
@@ -152,8 +182,10 @@ async fn stat_reports_type_and_size() {
         ),
     )
     .await;
+    // `_G.kind`/`_G.size` are set together at the end of the chain; poll the kind for
+    // the off-tick settle, then the size is already present.
     assert_eq!(
-        lua_string(&rpc, "return _G.kind").await.as_deref(),
+        poll_settled(&rpc, "return _G.kind").await.as_str(),
         Some("file")
     );
     assert_eq!(lua_u64(&rpc, "return _G.size").await, Some(5));
@@ -179,8 +211,14 @@ async fn exists_resolves_bool_never_rejects() {
         ),
     )
     .await;
+    // `_G.b` (the missing-path probe) is awaited last; once it has settled to its
+    // boolean both globals are present. `exists` never rejects — a missing path
+    // resolves `false`, not an error.
+    assert_eq!(
+        poll_settled(&rpc, "return _G.b").await.as_bool(),
+        Some(false)
+    );
     assert_eq!(lua_bool(&rpc, "return _G.a").await, Some(true));
-    assert_eq!(lua_bool(&rpc, "return _G.b").await, Some(false));
     let _ = fs::remove_dir_all(&dir);
 }
 
@@ -195,11 +233,16 @@ async fn mkdir_recursive_creates_parents() {
     exec_lua(
         &rpc,
         &format!(
-            "nx.async(function() nx.await(nx.fs.mkdir(\"{d}\", {{ recursive = true }})) end)()",
+            "_G.done = false\n\
+             nx.async(function()\n\
+               nx.await(nx.fs.mkdir(\"{d}\", {{ recursive = true }}))\n\
+               _G.done = true\n\
+             end)()",
             d = q(&nested)
         ),
     )
     .await;
+    poll_done(&rpc).await;
     assert!(nested.is_dir());
     let _ = fs::remove_dir_all(&dir);
 }
@@ -215,12 +258,17 @@ async fn rename_moves_a_file() {
     exec_lua(
         &rpc,
         &format!(
-            "nx.async(function() nx.await(nx.fs.rename(\"{a}\", \"{b}\")) end)()",
+            "_G.done = false\n\
+             nx.async(function()\n\
+               nx.await(nx.fs.rename(\"{a}\", \"{b}\"))\n\
+               _G.done = true\n\
+             end)()",
             a = q(&from),
             b = q(&to)
         ),
     )
     .await;
+    poll_done(&rpc).await;
     assert!(!from.exists() && to.exists());
     let _ = fs::remove_dir_all(&dir);
 }
@@ -236,11 +284,16 @@ async fn remove_recursive_deletes_a_tree() {
     exec_lua(
         &rpc,
         &format!(
-            "nx.async(function() nx.await(nx.fs.remove(\"{d}\", {{ recursive = true }})) end)()",
+            "_G.done = false\n\
+             nx.async(function()\n\
+               nx.await(nx.fs.remove(\"{d}\", {{ recursive = true }}))\n\
+               _G.done = true\n\
+             end)()",
             d = q(&tree)
         ),
     )
     .await;
+    poll_done(&rpc).await;
     assert!(!tree.exists());
     let _ = fs::remove_dir_all(&dir);
 }
@@ -256,12 +309,17 @@ async fn copy_duplicates_a_file() {
     exec_lua(
         &rpc,
         &format!(
-            "nx.async(function() nx.await(nx.fs.copy(\"{a}\", \"{b}\")) end)()",
+            "_G.done = false\n\
+             nx.async(function()\n\
+               nx.await(nx.fs.copy(\"{a}\", \"{b}\"))\n\
+               _G.done = true\n\
+             end)()",
             a = q(&src),
             b = q(&dst)
         ),
     )
     .await;
+    poll_done(&rpc).await;
     assert_eq!(fs::read_to_string(&dst).unwrap(), "payload");
     assert!(src.exists()); // copy, not move
     let _ = fs::remove_dir_all(&dir);
@@ -289,8 +347,52 @@ async fn missing_path_rejects_with_enoent() {
     )
     .await;
     assert_eq!(
-        lua_string(&rpc, "return _G.code").await.as_deref(),
+        poll_settled(&rpc, "return _G.code").await.as_str(),
         Some("ENOENT")
+    );
+    let _ = fs::remove_dir_all(&dir);
+}
+
+// ----- off-tick settle --------------------------------------------------------
+
+#[tokio::test]
+async fn op_settles_on_a_later_tick_than_a_same_tick_schedule() {
+    let (rpc, _incoming) = start().await;
+    let dir = temp_dir("fs_offtick");
+    fs::write(dir.join("f"), b"x").unwrap();
+
+    // Prove the op is OFF-TICK by observable ordering alone (no promise internals):
+    // race it against a `vim.schedule`, which runs at the END of THIS tick's
+    // convergence. An `nx.fs` reaction can only run once the event loop delivers the
+    // actor's result on a LATER tick, so "sched" is recorded before "fs" —
+    // deterministically (it is causal, not wall-clock; the input handler can't yield to
+    // the loop's `FsResult` arm until it has returned, after `run_pending`). An INLINE
+    // op would resolve in-chunk and queue its `:next` reaction before `vim.schedule`,
+    // recording "fs" first — so this still discriminates inline from off-tick. The
+    // mirror of `async_runtime.rs`'s `schedule_runs_after_direct_work_not_inline`.
+    exec_lua(
+        &rpc,
+        &format!(
+            "_G.order = {{}}\n\
+             nx.fs.stat(\"{f}\"):next(function() _G.order[#_G.order + 1] = 'fs' end)\n\
+             vim.schedule(function() _G.order[#_G.order + 1] = 'sched' end)",
+            f = q(&dir.join("f"))
+        ),
+    )
+    .await;
+    // Wait for both reactions to have fired (the fs one needs the off-tick result).
+    for _ in 0..150 {
+        if lua_u64(&rpc, "return #_G.order").await == Some(2) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(
+        lua_string(&rpc, "return table.concat(_G.order, ',')")
+            .await
+            .as_deref(),
+        Some("sched,fs"),
+        "the same-tick vim.schedule must run before the off-tick nx.fs reaction"
     );
     let _ = fs::remove_dir_all(&dir);
 }

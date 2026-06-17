@@ -211,6 +211,28 @@ const LSP_EXITED: &str = "lsp_exited"; // daemon → edit-host: [id, code?, sign
 // request. The whole `["op", args…]` request maps to `["ok", payload] | ["err", msg]`.
 const LUAFS: &str = "luafs";
 
+// The Lua-`nx.fs` off-tick op leg (`luafs_op`): a request/response per **high-level**
+// `nx.fs.*` op (`readdir` / `read_text` / `write` / `copy{recursive}` / …), the wasm
+// edit-host's route to a remote daemon over WebTransport (Phase 2 of the off-tick plan).
+// Unlike the low-level `luafs` leg (one wire op per `LuaFs` call), this carries a whole
+// [`FsJob`](nxvim_lua::FsJob) and runs it through [`run_fs_job`](nxvim_lua::run_fs_job) on
+// the daemon — so a compound op (a recursive copy / remove) decomposes into local syscalls
+// daemon-side rather than a round-trip per step. Served on the same leg as `luafs` (it
+// shares the `StdLuaFs`); the request is a map (`{ op, path, … }`), the reply the
+// `["ok", <fs-value>] | ["err", code, message]` envelope `nxvim_lua::fswire` encodes.
+const LUAFS_OP: &str = "luafs_op";
+
+// The Lua-`nx.fs.watch` streaming leg (`luafs_watch`): the wasm route for the streaming watch
+// (Phase 3b of the off-tick plan). DISTINCT from the buffer-reconcile `fs_watch` leg (a coarse
+// single-path stat-poll keyed by path): this is a recursive, change-classified watch keyed by a
+// stream `id`, reusing the native event-loop actor's coalescing watcher
+// ([`start_fs_watch_coalesced`](crate::evloop::start_fs_watch_coalesced)). The edit-host arms /
+// disarms by notification; the daemon pushes change batches / a terminal error back.
+const LUAFS_WATCH: &str = "luafs_watch"; // edit-host → daemon: [id, path, recursive]
+const LUAFS_UNWATCH: &str = "luafs_unwatch"; // edit-host → daemon: [id]
+const LUAFS_CHANGE: &str = "luafs_change"; // daemon → edit-host: [id, kind, [path, …]]
+const LUAFS_WATCH_ERR: &str = "luafs_watch_err"; // daemon → edit-host: [id, message]
+
 /// What the daemon reports back about one child, demuxed off the wire and handed to
 /// the [`RemoteHostProc::run`] future waiting on that spawn's `id`. Mirrors the two
 /// [`ProcEvents`] reports the future then re-emits to the editor.
@@ -434,9 +456,12 @@ pub async fn serve_proc_daemon_on(
                         Value::Binary(stderr),
                     ],
                 ),
-                // The daemon only spawns processes — it arms no timers and no
-                // filesystem watches — so no other variant can reach here.
-                LoopEvent::Timer { .. } | LoopEvent::FsEvent { .. } => {}
+                // The daemon only spawns processes — it arms no timers, no filesystem
+                // watches, and no `nx.fs` ops (the luafs leg has its own handler) — so
+                // no other variant can reach here.
+                LoopEvent::Timer { .. }
+                | LoopEvent::FsEvent { .. }
+                | LoopEvent::FsResult { .. } => {}
             }
         }
     });
@@ -2285,6 +2310,28 @@ fn luafs_ok(payload: Value) -> Value {
     Value::Array(vec![Value::from("ok"), payload])
 }
 
+/// Run one high-level `nx.fs` op (the `luafs_op` leg): decode the request map into an
+/// [`FsJob`](nxvim_lua::FsJob), run it through [`run_fs_job`](nxvim_lua::run_fs_job) against
+/// the daemon's `fs`, and shape the `["ok", <fs-value>] | ["err", code, message]` reply.
+/// A request that doesn't decode is an `["err", "EWIRE", …]` reply (fail loud — never a
+/// silent empty result). Compound ops (recursive copy/remove) decompose into local syscalls
+/// inside `run_fs_job`, so this is one wire round-trip regardless of the op's fan-out.
+fn serve_fs_op(fs: &dyn LuaFs, params: &[Value]) -> Value {
+    let Some(req) = params.first() else {
+        return nxvim_lua::fs_result_to_value(&Err(nxvim_lua::FsError {
+            code: "EWIRE".to_string(),
+            message: "luafs_op: request has no job".to_string(),
+        }));
+    };
+    match nxvim_lua::fs_job_from_value(req) {
+        Ok(job) => nxvim_lua::fs_result_to_value(&nxvim_lua::run_fs_job(fs, &job)),
+        Err(message) => nxvim_lua::fs_result_to_value(&Err(nxvim_lua::FsError {
+            code: "EWIRE".to_string(),
+            message,
+        })),
+    }
+}
+
 /// Run the daemon end of the *Lua-filesystem* wire over `reader`/`writer`, serving
 /// `luafs` requests through `fs` (the daemon's real backend —
 /// [`StdLuaFs`](nxvim_lua::StdLuaFs) in the binary, a virtual fs in tests). Each op is
@@ -2305,7 +2352,11 @@ where
 }
 
 /// The Lua-visible-fs leg's connection-agnostic core (see [`serve_proc_daemon_on`] for
-/// the `*_on` split). Serves the `luafs` request over a shared [`Rpc`] + its demuxed stream.
+/// the `*_on` split). Serves the low-level `luafs` request (one `LuaFs` op) **and** the
+/// high-level `luafs_op` request (a whole [`FsJob`](nxvim_lua::FsJob) run through
+/// [`run_fs_job`](nxvim_lua::run_fs_job) — the wasm `nx.fs` leg, Phase 2) over the shared
+/// [`Rpc`] + its demuxed stream. Both share the one `StdLuaFs`, and both offload to the
+/// blocking pool so a slow fs call can't stall the reader.
 pub async fn serve_luafs_daemon_on(
     rpc: Rpc,
     mut incoming: UnboundedReceiver<Incoming>,
@@ -2327,8 +2378,101 @@ pub async fn serve_luafs_daemon_on(
                         };
                     rpc.respond(id, reply);
                 });
+            } else if method == LUAFS_OP {
+                let fs = fs.clone();
+                let rpc = rpc.clone();
+                tokio::spawn(async move {
+                    let reply =
+                        match tokio::task::spawn_blocking(move || serve_fs_op(&*fs, &params)).await
+                        {
+                            Ok(v) => Ok(v),
+                            Err(e) => Err(Value::from(format!("luafs_op: join error: {e}"))),
+                        };
+                    rpc.respond(id, reply);
+                });
             } else {
                 rpc.respond(id, Err(Value::from(format!("unknown method: {method}"))));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The `nx.fs.watch` streaming leg's connection-agnostic core. Arms a recursive,
+/// change-classified watch per stream `id` (reusing the event-loop actor's coalescing watcher,
+/// [`start_fs_watch_coalesced`](crate::evloop::start_fs_watch_coalesced) — the same 10 ms-coalesced
+/// `notify` backend the native `nx.fs.watch` rides) and pushes each batch back as `luafs_change
+/// [id, kind, paths]` / a terminal `luafs_watch_err [id, message]`. The edit-host arms / disarms
+/// by notification (`luafs_watch` / `luafs_unwatch`); there is no reply, so a stray request is
+/// answered with an error. Watchers are kept alive in a per-`id` map (dropping one stops its
+/// backend thread); the leg ends when the edit-host hangs up.
+pub async fn serve_luafs_watch_daemon_on(
+    rpc: Rpc,
+    mut incoming: UnboundedReceiver<Incoming>,
+) -> anyhow::Result<()> {
+    // The coalescing watcher emits `LoopEvent::FsEvent` (the native actor's shape); we forward
+    // each into RPC pushes. One shared channel for all watches — `id` tags every event.
+    let (ev_tx, mut ev_rx) = unbounded_channel::<LoopEvent>();
+    let mut watchers: HashMap<u64, notify::RecommendedWatcher> = HashMap::new();
+    loop {
+        tokio::select! {
+            msg = incoming.recv() => {
+                let Some(msg) = msg else { break }; // the edit-host hung up
+                match msg {
+                    Incoming::Notification { method, params } => match method.as_str() {
+                        LUAFS_WATCH => {
+                            let id = params.first().and_then(Value::as_u64).unwrap_or(0);
+                            let path = params.get(1).and_then(Value::as_str).unwrap_or("").to_string();
+                            let recursive = params.get(2).and_then(Value::as_bool).unwrap_or(false);
+                            match crate::evloop::start_fs_watch_coalesced(
+                                id, &path, recursive, ev_tx.clone(),
+                            ) {
+                                Ok(w) => { watchers.insert(id, w); }
+                                // Arm failure (bad path / watch limit) is terminal for this
+                                // stream — push it loud, exactly as the native arm rejects.
+                                Err(e) => rpc.notify(
+                                    LUAFS_WATCH_ERR,
+                                    vec![Value::from(id), Value::from(e.to_string())],
+                                ),
+                            }
+                        }
+                        // Dropping the watcher stops its backend thread (and the coalescing task).
+                        LUAFS_UNWATCH => {
+                            let id = params.first().and_then(Value::as_u64).unwrap_or(0);
+                            watchers.remove(&id);
+                        }
+                        _ => {}
+                    },
+                    // The leg speaks only notifications; a request is a protocol error.
+                    Incoming::Request { id, .. } => rpc.respond(
+                        id,
+                        Err(Value::from("luafs_watch leg takes notifications, not requests")),
+                    ),
+                }
+            }
+            Some(ev) = ev_rx.recv() => {
+                if let LoopEvent::FsEvent { id, error, kind, paths } = ev {
+                    match error {
+                        Some(msg) => rpc.notify(
+                            LUAFS_WATCH_ERR,
+                            vec![Value::from(id), Value::from(msg)],
+                        ),
+                        None => {
+                            let plist = paths
+                                .into_iter()
+                                .map(|p| Value::from(p.to_string_lossy().into_owned()))
+                                .collect();
+                            rpc.notify(
+                                LUAFS_CHANGE,
+                                vec![
+                                    Value::from(id),
+                                    Value::from(kind.unwrap_or("modify")),
+                                    Value::Array(plist),
+                                ],
+                            );
+                        }
+                    }
+                }
             }
         }
     }

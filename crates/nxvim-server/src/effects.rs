@@ -1755,6 +1755,12 @@ impl EditHost {
             }),
             #[cfg(feature = "native")]
             LoopOp::FsUnwatch { id } => self.fx.loop_command(LoopCommand::FsEventStop { id }),
+            // An off-tick `nx.fs` op rides the actor's blocking pool against its
+            // `LuaFs` clone (local syscalls, or a `RemoteLuaFs` wire round-trip in a
+            // daemon session — now off the editor tick instead of inline). The typed
+            // result returns on the `loop_events` arm as a `FsResult`.
+            #[cfg(feature = "native")]
+            LoopOp::Fs { id, job } => self.fx.loop_command(LoopCommand::Fs { id, job }),
             // The browser build has no tokio event loop; timers ride the Worker-side
             // wheel instead (slice 5d) — `vim.defer_fn` / `nx.timer` arm and fire there.
             #[cfg(not(feature = "native"))]
@@ -1797,31 +1803,52 @@ impl EditHost {
                     self.fx.proc_kill(id);
                 }
             }
-            // The browser build has no native filesystem watcher (and OPFS has no
-            // change-notification at all), and forwarding the watch over the daemon
-            // wire is not wired yet. Fail the watch *loud* — reject its stream's first
-            // pull via the error arg — rather than arm a watch that silently never
-            // fires. (`nx.fs.watch` over a daemon transport is a tracked follow-up.)
+            // `nx.fs.watch` streams over the daemon `luafs_watch` leg (Phase 3b) when a daemon is
+            // connected — its recursive `notify` watcher pushes change batches back inbound on
+            // `EditHost::fs_watch_event`. Serverless OPFS has NO change source (the tab is the sole
+            // writer, and OPFS has no change-notification API), so there it fails the watch *loud*
+            // — reject the stream's first pull — rather than arm a watch that silently never fires.
             #[cfg(not(feature = "native"))]
-            LoopOp::FsWatch { id, .. } => {
-                if let Err(e) = self.lua.run_fs_watch_event(
-                    id,
-                    Some(
-                        "nx.fs.watch is not supported in this session \
-                         (no native filesystem watcher)"
-                            .to_string(),
-                    ),
-                    None,
-                    Vec::new(),
-                ) {
-                    self.editor
-                        .echo(format!("E5108: Error in nx.fs.watch handler: {e}"));
+            LoopOp::FsWatch {
+                id,
+                path,
+                recursive,
+            } => {
+                if self.fx.has_remote_proc() {
+                    self.fx.fs_watch_stream(id, path, recursive);
+                } else {
+                    if let Err(e) = self.lua.run_fs_watch_event(
+                        id,
+                        Some(
+                            "nx.fs.watch requires a daemon in this session \
+                             (serverless OPFS has no filesystem change source)"
+                                .to_string(),
+                        ),
+                        None,
+                        Vec::new(),
+                    ) {
+                        self.editor
+                            .echo(format!("E5108: Error in nx.fs.watch handler: {e}"));
+                    }
+                    self.apply_lua_effects();
                 }
-                self.apply_lua_effects();
             }
-            // Nothing was armed, so a stop is a no-op (mirrors wasm `Kill`).
+            // Disarm the daemon watch (a no-op serverless, where nothing was armed).
             #[cfg(not(feature = "native"))]
-            LoopOp::FsUnwatch { .. } => {}
+            LoopOp::FsUnwatch { id } => {
+                if self.fx.has_remote_proc() {
+                    self.fx.fs_unwatch_stream(id);
+                }
+            }
+            // The browser build has no event-loop actor; an off-tick `nx.fs` op is always
+            // enqueued for the Worker to fulfill off-tick (its typed result returns inbound
+            // on `EditHost::fs_op_result`). The Worker routes it to the daemon `luafs_op` leg
+            // over WebTransport when connected (Phase 2), else to OPFS (Phase 3, serverless)
+            // — the same daemon-or-OPFS split the off-tick `:e`/`:w` seam already uses. There
+            // is always *some* fs on wasm (OPFS is the serverless fallback), so this never
+            // needs the proc leg's "no host" loud reject, and never silently hits MEMFS.
+            #[cfg(not(feature = "native"))]
+            LoopOp::Fs { id, job } => self.fx.fs_op(id, job),
         }
     }
 
@@ -1915,6 +1942,19 @@ impl EditHost {
                 } else {
                     self.editor.checktime_buffer(buf);
                 }
+            }
+            LoopEvent::FsResult { id, result } => {
+                // An off-tick `nx.fs` op settled: resolve / reject its promise on this
+                // thread (the typed result is marshalled to Lua in `run_callback`),
+                // then drain whatever the reaction queued — the process-event shape.
+                if let Err(e) = self
+                    .lua
+                    .run_callback(id, false, CallbackArgs::FsResult { result })
+                {
+                    self.editor
+                        .echo(format!("E5108: Error in nx.fs handler: {e}"));
+                }
+                self.apply_lua_effects();
             }
         }
     }

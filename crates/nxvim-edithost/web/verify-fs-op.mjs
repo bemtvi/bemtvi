@@ -1,0 +1,182 @@
+// Playwright verifier for the browser edit-host's `nx.fs` leg (Phase 2 of the off-tick plan)
+// against a REAL `nxvim --daemon --listen` over WebTransport. A browser `nx.fs.*` op has no
+// local synchronous filesystem to run — the op crosses the wire to the daemon as one `luafs_op`
+// request, runs there through `run_fs_job`, and its typed result returns and resolves the op's
+// promise in the tick. The browser twin of the native off-tick `nx.fs` actor leg.
+//
+// Faithfulness (not a no-op, and NOT the in-browser MEMFS — the whole point):
+//   (1) read_text returns the content of a file that exists ONLY on the daemon's disk (Node
+//       wrote it to the daemon's temp tree — a path the browser origin can't otherwise touch);
+//   (2) readdir lists entries that exist only on the daemon's disk;
+//   (3) write creates a file ON THE DAEMON — Node reads it back from the daemon's tree, proving
+//       the op truly mutated the remote fs, not a browser-local shadow;
+//   (4) a missing path REJECTS with err.code == "ENOENT" (the error envelope round-trips).
+//
+// Prereqs: ./build.sh (dist/eh.mjs + eh.wasm + vendor/msgpack), `cargo build -p nxvim`
+// (target/debug/nxvim), and a Chromium for Playwright. Run:  node verify-fs-op.mjs
+import { chromium } from "playwright";
+import { spawn } from "node:child_process";
+import { fileURLToPath } from "node:url";
+import { setTimeout as sleep } from "node:timers/promises";
+import { globSync, mkdtempSync, readFileSync, writeFileSync, mkdirSync, existsSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+
+const here = fileURLToPath(new URL(".", import.meta.url));
+const PORT = 8142;
+const NXVIM = process.env.NXVIM_BIN || `${here}../../../target/debug/nxvim`;
+
+function chromiumPath() {
+  if (process.env.PW_CHROMIUM) return process.env.PW_CHROMIUM;
+  const home = process.env.HOME || "";
+  const found = globSync(`${home}/.cache/ms-playwright/chromium-*/chrome-linux/chrome`).sort();
+  return found.length ? found[found.length - 1] : undefined;
+}
+
+let failures = 0;
+function check(label, ok, detail) {
+  console.log(`${ok ? "PASS" : "FAIL"}  ${label}`);
+  if (!ok) {
+    if (detail !== undefined) console.log(`        ${detail}`);
+    failures++;
+  }
+}
+
+// Poll the page until `pred(value)` holds (or timeout), returning the last value.
+async function until(page, fn, pred, ms = 8000) {
+  const start = Date.now();
+  for (;;) {
+    const v = await page.evaluate(fn);
+    if (pred(v)) return v;
+    if (Date.now() - start > ms) return v;
+    await sleep(40);
+  }
+}
+const luaResult = (page, code) =>
+  page.evaluate((c) => window.__nxvim.execLua(c).then((r) => r.result), code);
+
+// ── The daemon's working tree (real disk; the browser reads/writes it OVER THE WIRE) ─────────
+const root = mkdtempSync(join(tmpdir(), "nxvim-fsop-"));
+const readFile = join(root, "hello.txt");
+writeFileSync(readFile, "HELLO-FROM-DAEMON-DISK\nsecond line\n");
+const listDir = join(root, "listing");
+mkdirSync(listDir);
+writeFileSync(join(listDir, "alpha.txt"), "a");
+writeFileSync(join(listDir, "beta.txt"), "b");
+mkdirSync(join(listDir, "subdir"));
+const writeTarget = join(root, "written-by-browser.txt");
+const missing = join(root, "does-not-exist.txt");
+
+// ── Spawn the real daemon; parse its connect URI from stdout ──────────────────────────────
+const daemon = spawn(NXVIM, ["--daemon", "--listen", "127.0.0.1:0"], { stdio: ["ignore", "pipe", "pipe"] });
+let uri = null;
+let daemonOut = "";
+daemon.stdout.on("data", (d) => {
+  daemonOut += d.toString();
+  const m = daemonOut.match(/nxvim:\/\/[^'\s]+/);
+  if (m) uri = m[0];
+});
+daemon.stderr.on("data", (d) => process.stderr.write(`  [daemon] ${d}`));
+
+const srv = spawn(process.execPath, [`${here}serve.mjs`, String(PORT)], { stdio: "inherit" });
+const cleanup = () => { try { daemon.kill(); } catch {} try { srv.kill(); } catch {} };
+process.on("exit", cleanup);
+
+let browser;
+try {
+  for (let i = 0; i < 100 && !uri; i++) await sleep(50);
+  if (!uri) throw new Error(`daemon never printed a connect URI; stdout=${JSON.stringify(daemonOut)}`);
+  console.log("daemon listening:", uri.replace(/\/[0-9a-f]{64}\?/, "/<token>?"));
+
+  for (let i = 0; i < 50; i++) {
+    try { await fetch(`http://localhost:${PORT}/web/`); break; } catch { await sleep(100); }
+  }
+
+  browser = await chromium.launch({ executablePath: chromiumPath() });
+  const page = await browser.newPage();
+  page.on("console", (m) => { if (m.type() === "error") console.log("  [page error]", m.text()); });
+  page.on("pageerror", (e) => console.log("  [pageerror]", e.message));
+
+  const pageUrl = `http://localhost:${PORT}/web/?daemon=${encodeURIComponent(uri)}`;
+  await page.goto(pageUrl);
+
+  const isolated = await page.evaluate(() => self.crossOriginIsolated);
+  check("page is cross-origin isolated (SAB transport active)", isolated === true, `isolated=${isolated}`);
+
+  await page.waitForFunction(() => window.__nxvim !== undefined, null, { timeout: 15000 });
+  await page.evaluate(() => window.__nxvim.ready);
+  check("Worker booted + dialed the daemon (window.__nxvim.ready resolved)", true);
+
+  // ── 1. read_text: a file that exists ONLY on the daemon's disk round-trips over the wire ──
+  await luaResult(page, `_G.__text, _G.__terr = nil, nil
+     nx.fs.read_text("${readFile}"):next(
+       function(t) _G.__text = t end,
+       function(e) _G.__terr = e.message end)
+     return 1`);
+  const text = await until(page,
+    () => window.__nxvim.execLua("return _G.__text or ''").then((r) => r.result),
+    (v) => /HELLO-FROM-DAEMON-DISK/.test(String(v)));
+  check("nx.fs.read_text returns the daemon file's content (over WebTransport, not MEMFS)",
+    /HELLO-FROM-DAEMON-DISK/.test(String(text)) && /second line/.test(String(text)),
+    `text=${JSON.stringify(text)}`);
+
+  // ── 2. readdir: entries that exist only on the daemon's disk, with their dirent kinds ──────
+  await luaResult(page, `_G.__names, _G.__rderr = nil, nil
+     nx.fs.readdir("${listDir}"):next(function(entries)
+       local out = {}
+       for _, e in ipairs(entries) do out[#out+1] = e.name .. ":" .. e.type end
+       table.sort(out)
+       _G.__names = table.concat(out, ",")
+     end, function(e) _G.__rderr = e.message end)
+     return 1`);
+  const names = await until(page,
+    () => window.__nxvim.execLua("return _G.__names or ''").then((r) => r.result),
+    (v) => /alpha\.txt/.test(String(v)));
+  check("nx.fs.readdir lists the daemon dir's entries with kinds (file/directory)",
+    /alpha\.txt:file/.test(String(names)) &&
+    /beta\.txt:file/.test(String(names)) &&
+    /subdir:directory/.test(String(names)),
+    `names=${JSON.stringify(names)}`);
+
+  // ── 3. write: the op truly mutates the DAEMON's disk — Node reads the file back ────────────
+  await luaResult(page, `_G.__wrote, _G.__werr = nil, nil
+     nx.fs.write("${writeTarget}", "WROTE-FROM-BROWSER"):next(
+       function() _G.__wrote = true end,
+       function(e) _G.__werr = e.message end)
+     return 1`);
+  await until(page,
+    () => window.__nxvim.execLua("return _G.__wrote and 1 or (_G.__werr or 0)").then((r) => r.result),
+    (v) => /1$/.test(String(v)) || /[A-Za-z]/.test(String(v)));
+  let onDisk = "";
+  for (let i = 0; i < 50; i++) {
+    if (existsSync(writeTarget)) { onDisk = readFileSync(writeTarget, "utf8"); if (onDisk.includes("WROTE-FROM-BROWSER")) break; }
+    await sleep(40);
+  }
+  check("nx.fs.write created the file ON THE DAEMON (Node reads it back from the daemon's tree)",
+    onDisk.includes("WROTE-FROM-BROWSER"), `onDisk=${JSON.stringify(onDisk)}`);
+
+  // ── 4. a missing path REJECTS with err.code == "ENOENT" (the error envelope round-trips) ───
+  await luaResult(page, `_G.__code = nil
+     nx.fs.read_text("${missing}"):next(
+       function(_) _G.__code = "RESOLVED?!" end,
+       function(e) _G.__code = e.code end)
+     return 1`);
+  const code = await until(page,
+    () => window.__nxvim.execLua("return tostring(_G.__code)").then((r) => r.result),
+    (v) => !/^nil$/.test(String(v)));
+  check("nx.fs read of a missing daemon path rejects with err.code == ENOENT",
+    /ENOENT/.test(String(code)), `code=${JSON.stringify(code)}`);
+
+  await browser.close();
+} catch (e) {
+  console.error("verify-fs-op error:", e);
+  failures++;
+} finally {
+  try { if (browser) await browser.close(); } catch {}
+  cleanup();
+}
+
+console.log(failures === 0
+  ? "\nALL PASS — browser nx.fs runs on a real nxvim --daemon over WebTransport (read_text, readdir, write-to-daemon, ENOENT)"
+  : `\n${failures} FAILED`);
+process.exit(failures === 0 ? 0 : 1);

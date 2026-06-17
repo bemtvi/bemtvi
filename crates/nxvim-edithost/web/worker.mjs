@@ -15,6 +15,10 @@
 //     this mode (no run loop to wake them); input still works.
 import createModule from "../dist/eh.mjs";
 import { dialDaemon } from "./rpc.mjs";
+// The `nx.fs` reply is re-encoded to msgpack bytes (faithful binary for a `read` result)
+// before crossing into Rust, which decodes it through the shared `fswire` codec — so JS
+// stays a near-dumb pipe (no per-variant format knowledge). Same vendored lib as rpc.mjs.
+import { encode } from "./vendor/msgpack/index.mjs";
 
 const M = await createModule();
 
@@ -56,6 +60,19 @@ const eh_proc_spawned = M.cwrap("eh_proc_spawned", null, ["number", "number", "n
 // lines ride as a JSON string array (newline-stripped) into the Lua callback.
 const eh_proc_stdout = M.cwrap("eh_proc_stdout", null, ["number", "number", "string"]);
 const eh_proc_exited = M.cwrap("eh_proc_exited", null, ["number", "number", "number", "number", "number", "number", "number"]);
+// Remote `nx.fs` leg (Phase 2 of the off-tick plan): the editor enqueues each high-level
+// `nx.fs.*` op off-tick (only with a daemon connected); the Worker forwards each as one
+// `luafs_op` request over WebTransport and lands the reply via `eh_fs_op_result`. The reply
+// rides as pointer+length (re-encoded msgpack — a `read` result is raw bytes Rust decodes).
+const eh_take_fs_op_requests = M.cwrap("eh_take_fs_op_requests", "number", ["number"]);
+const eh_fs_op_result = M.cwrap("eh_fs_op_result", null, ["number", "number", "number", "number"]);
+// Streaming `nx.fs.watch` over the daemon (Phase 3b): the editor arms/disarms a recursive watch
+// off-tick (only with a daemon — serverless has no change source); the Worker forwards each over
+// WebTransport (`luafs_watch`/`luafs_unwatch`) and lands the daemon's `luafs_change`/`luafs_watch_err`
+// pushes back into the tick. `eh_fs_watch_change` takes the changed paths as a JSON string array.
+const eh_take_fs_watch_requests = M.cwrap("eh_take_fs_watch_requests", "number", ["number"]);
+const eh_fs_watch_change = M.cwrap("eh_fs_watch_change", null, ["number", "number", "string", "string"]);
+const eh_fs_watch_err = M.cwrap("eh_fs_watch_err", null, ["number", "number", "string"]);
 // Terminal leg (the web `:terminal` — Phase 7): the editor enqueues PTY ops off-tick (only
 // with a daemon connected); the Worker forwards each to the daemon and lands its
 // `term_data`/`term_exit` pushes back into the tick. `eh_terminal_data` takes the child's
@@ -398,6 +415,297 @@ async function opfsWrite(path, bytes) {
 }
 
 // =============================================================================
+// Serverless `nx.fs` over OPFS (Phase 3 of the off-tick plan). The JS twin of the daemon's
+// `run_fs_job`: when no daemon is connected, a high-level `nx.fs.*` op runs against OPFS here
+// (the same sandbox `:e`/`:w` use), producing the `["ok", <fs-value>] | ["err", code, message]`
+// envelope the `fswire` codec decodes in Rust. OPFS has no synchronous path-based fs (handle
+// acquisition is async), so this can't reuse `run_fs_job` — the op set is reimplemented in JS.
+// OPFS divergences from POSIX, documented rather than faked: no symlinks (so `lstat` == `stat`,
+// never a "link" kind), no `mode`/`ino`/`uid`/`gid`/`nlink`/`dev` (reported 0), and `mtime` is
+// best-effort (a file's `lastModified`; a directory has none, reported nil). `realpath` just
+// canonicalizes the path string (OPFS has no symlinks to resolve). Errors map DOMException names
+// to libuv-style errno codes (`errCode`), so a reject's `err.code` matches the daemon path's.
+// =============================================================================
+
+// The tagged-array fs-value forms `fswire::fs_value_from_value` decodes (kept in lock-step with
+// the Rust encoder). Bytes ride as a `Uint8Array` (re-encoded to msgpack `bin` by `landFsOpResult`).
+const fsNil = () => ["nil"];
+const fsBool = (b) => ["bool", !!b];
+const fsBytes = (u8) => ["bytes", u8];
+const fsText = (s) => ["text", String(s)];
+const fsStat = (arr) => ["stat", arr];
+const fsDir = (rows) => ["dir", rows];
+
+// Join an editor-style path with a child component (paths are absolute-looking; OPFS strips the
+// leading `/`). Used by recursive copy.
+const joinPath = (a, b) => `${String(a).replace(/\/+$/, "")}/${b}`;
+
+// Map a thrown error to a libuv-style errno code for the reject envelope. Our helpers throw
+// `Error`s carrying an explicit `.code` for the semantic cases (EISDIR / ENOTEMPTY / EILSEQ / …);
+// a raw OPFS `DOMException` is mapped by name. Anything unrecognized is `EIO` (never silent).
+function errCode(e) {
+  if (e && e.code) return e.code;
+  switch (e && e.name) {
+    case "NotFoundError": return "ENOENT";
+    case "TypeMismatchError": return "ENOTDIR";
+    case "InvalidModificationError": return "ENOTEMPTY";
+    case "NoModificationAllowedError": return "EACCES";
+    case "QuotaExceededError": return "ENOSPC";
+    default: return "EIO";
+  }
+}
+
+// An error carrying an explicit errno code (for the cases OPFS doesn't signal by DOMException name).
+function fsErr(code, message) {
+  const e = new Error(message);
+  e.code = code;
+  return e;
+}
+
+// Resolve a path's parent directory handle + final component name. `create` makes the parents.
+// An empty path (the OPFS root) has no parent — it's a directory, so a file op on it is EISDIR.
+async function opfsParent(path, create) {
+  const parts = splitPath(path);
+  if (parts.length === 0) throw fsErr("EISDIR", `'${path}' is a directory`);
+  const dir = await opfsDir(parts.slice(0, -1), !!create); // missing parent → NotFoundError → ENOENT
+  return { dir, name: parts[parts.length - 1] };
+}
+
+// Resolve a path to its file OR directory handle (the OPFS root is a directory). ENOENT if absent.
+async function opfsResolveHandle(path) {
+  const parts = splitPath(path);
+  if (parts.length === 0) return await navigator.storage.getDirectory();
+  const dir = await opfsDir(parts.slice(0, -1), false);
+  const name = parts[parts.length - 1];
+  try {
+    return await dir.getFileHandle(name, { create: false });
+  } catch (e) {
+    if (e.name !== "NotFoundError" && e.name !== "TypeMismatchError") throw e;
+  }
+  return await dir.getDirectoryHandle(name, { create: false }); // missing → NotFoundError → ENOENT
+}
+
+// Build the positional stat array `fswire::decode_stat` reads: kind string, then size/mode and
+// the `(secs, nsecs)` mtime/atime (nil secs = unknown), then the unix `st_*` extras (0 on OPFS).
+function statArr(kind, size, mtimeMs) {
+  let secs = null;
+  let nsecs = 0;
+  if (mtimeMs >= 0) {
+    secs = Math.floor(mtimeMs / 1000);
+    nsecs = Math.floor((mtimeMs % 1000) * 1e6);
+  }
+  // atime mirrors mtime (OPFS exposes only lastModified).
+  return [kind, size, 0, secs, nsecs, secs, nsecs, 0, 0, 0, 0, 0];
+}
+
+async function opfsStat(path) {
+  const parts = splitPath(path);
+  if (parts.length === 0) return statArr("directory", 0, -1); // the root
+  const dir = await opfsDir(parts.slice(0, -1), false); // missing parent → ENOENT
+  const name = parts[parts.length - 1];
+  try {
+    const fh = await dir.getFileHandle(name, { create: false });
+    const file = await fh.getFile();
+    return statArr("file", file.size, file.lastModified);
+  } catch (e) {
+    if (e.name !== "NotFoundError" && e.name !== "TypeMismatchError") throw e;
+    // Not a file — try a directory (a real ENOENT rethrows from here).
+    await dir.getDirectoryHandle(name, { create: false });
+    return statArr("directory", 0, -1);
+  }
+}
+
+// Read a file's raw bytes. A directory is EISDIR, a missing entry ENOENT (mapped from the OPFS
+// DOMExceptions, which don't distinguish the two on `getFileHandle`).
+async function opfsReadBytes(path) {
+  const { dir, name } = await opfsParent(path);
+  let fh;
+  try {
+    fh = await dir.getFileHandle(name, { create: false });
+  } catch (e) {
+    if (e.name === "TypeMismatchError") throw fsErr("EISDIR", `'${path}' is a directory`);
+    if (e.name === "NotFoundError") throw fsErr("ENOENT", `no such file '${path}'`);
+    throw e;
+  }
+  const ah = await fh.createSyncAccessHandle();
+  try {
+    const buf = new Uint8Array(ah.getSize());
+    ah.read(buf, { at: 0 });
+    return buf;
+  } finally {
+    ah.close();
+  }
+}
+
+// Decode a file's bytes through `encoding` (default UTF-8), failing loud like the daemon's
+// `run_fs_job`: an unknown label is EINVAL, invalid bytes EILSEQ (TextDecoder `fatal`) — never
+// lossy replacement text (use `nx.fs.read` for raw bytes).
+async function opfsReadText(path, encoding) {
+  const bytes = await opfsReadBytes(path);
+  const label = encoding || "utf-8";
+  let dec;
+  try {
+    dec = new TextDecoder(label, { fatal: true });
+  } catch {
+    throw fsErr("EINVAL", `unknown encoding '${label}'`);
+  }
+  try {
+    return dec.decode(bytes);
+  } catch {
+    throw fsErr("EILSEQ", `invalid ${label} byte sequence in '${path}'`);
+  }
+}
+
+// Write (truncate) or append `data` (a Uint8Array) to a file, creating parent dirs.
+async function opfsWriteBytes(path, data, append) {
+  const { dir, name } = await opfsParent(path, true);
+  const fh = await dir.getFileHandle(name, { create: true });
+  const ah = await fh.createSyncAccessHandle();
+  try {
+    if (append) {
+      ah.write(data, { at: ah.getSize() });
+    } else {
+      ah.truncate(0);
+      ah.write(data, { at: 0 });
+    }
+    ah.flush();
+  } finally {
+    ah.close();
+  }
+}
+
+// readdir → the `[[kind, name], …]` rows `fswire` decodes (kind is the libuv string).
+async function opfsReaddir(path) {
+  const parts = splitPath(path);
+  const dh = parts.length === 0
+    ? await navigator.storage.getDirectory()
+    : await opfsDir(parts, false); // a file component → TypeMismatchError → ENOTDIR; missing → ENOENT
+  const rows = [];
+  for await (const [name, handle] of dh.entries()) {
+    rows.push([handle.kind === "directory" ? "directory" : "file", name]);
+  }
+  return rows;
+}
+
+// mkdir: recursive creates all parents (idempotent, like `mkdir -p`); non-recursive requires the
+// parent to exist (else ENOENT) and the target to be absent (else EEXIST — OPFS itself is
+// idempotent, so we check first to surface the POSIX error).
+async function opfsMkdir(path, recursive) {
+  const parts = splitPath(path);
+  if (parts.length === 0) throw fsErr("EEXIST", "'/' exists");
+  if (recursive) {
+    await opfsDir(parts, true);
+    return;
+  }
+  const parent = await opfsDir(parts.slice(0, -1), false); // missing parent → ENOENT
+  const name = parts[parts.length - 1];
+  let exists = false;
+  try {
+    await parent.getDirectoryHandle(name, { create: false });
+    exists = true;
+  } catch {
+    try {
+      await parent.getFileHandle(name, { create: false });
+      exists = true;
+    } catch {
+      // genuinely absent
+    }
+  }
+  if (exists) throw fsErr("EEXIST", `'${path}' exists`);
+  await parent.getDirectoryHandle(name, { create: true });
+}
+
+// rename via FileSystemHandle.move (Chromium); falls back to copy+remove for a file where move
+// is unavailable. The destination's parent dirs are created.
+async function opfsRename(from, to) {
+  const handle = await opfsResolveHandle(from); // missing → ENOENT
+  const { dir: toDir, name: toName } = await opfsParent(to, true);
+  if (typeof handle.move === "function") {
+    await handle.move(toDir, toName);
+    return;
+  }
+  if (handle.kind === "file") {
+    await opfsWriteBytes(to, await opfsReadBytes(from), false);
+    const { dir, name } = await opfsParent(from);
+    await dir.removeEntry(name);
+    return;
+  }
+  throw fsErr("ENOSYS", "rename of a directory needs FileSystemHandle.move (unavailable here)");
+}
+
+// remove: a file is unlinked, a directory removed (emptied first when recursive — else a
+// non-empty dir is ENOTEMPTY, mapped from OPFS's InvalidModificationError).
+async function opfsRemove(path, recursive) {
+  const { dir, name } = await opfsParent(path); // root → EISDIR (can't remove the root)
+  await dir.removeEntry(name, { recursive: !!recursive }); // missing → ENOENT
+}
+
+// copy: a file via read+write (overwriting); a directory tree when recursive (else EINVAL, like
+// the daemon's `copy_path`).
+async function opfsCopy(src, dst, recursive) {
+  const st = await opfsStat(src); // missing → ENOENT
+  if (st[0] === "directory") {
+    if (!recursive) throw fsErr("EINVAL", `'${src}' is a directory (pass { recursive = true })`);
+    await opfsMkdir(dst, true);
+    for (const [, name] of await opfsReaddir(src)) {
+      await opfsCopy(joinPath(src, name), joinPath(dst, name), true);
+    }
+    return;
+  }
+  await opfsWriteBytes(dst, await opfsReadBytes(src), false);
+}
+
+// Run one high-level `nx.fs` op against OPFS, returning the `["ok"|"err", …]` reply envelope.
+// The serverless twin of the daemon's `serve_fs_op` → `run_fs_job`.
+async function opfsFsOp(req) {
+  try {
+    switch (req.op) {
+      // OPFS has no symlinks, so lstat is stat (never a "link" kind).
+      case "stat":
+      case "lstat":
+        return ["ok", fsStat(await opfsStat(req.path))];
+      case "exists":
+        try {
+          await opfsStat(req.path);
+          return ["ok", fsBool(true)];
+        } catch {
+          return ["ok", fsBool(false)]; // the one op that never rejects
+        }
+      case "readdir":
+        return ["ok", fsDir(await opfsReaddir(req.path))];
+      case "read":
+        return ["ok", fsBytes(await opfsReadBytes(req.path))];
+      case "read_text":
+        return ["ok", fsText(await opfsReadText(req.path, req.encoding))];
+      case "write":
+        await opfsWriteBytes(req.path, req.data || new Uint8Array(0), false);
+        return ["ok", fsNil()];
+      case "append":
+        await opfsWriteBytes(req.path, req.data || new Uint8Array(0), true);
+        return ["ok", fsNil()];
+      case "mkdir":
+        await opfsMkdir(req.path, !!req.recursive);
+        return ["ok", fsNil()];
+      case "rename":
+        await opfsRename(req.from, req.to);
+        return ["ok", fsNil()];
+      case "remove":
+        await opfsRemove(req.path, !!req.recursive);
+        return ["ok", fsNil()];
+      case "copy":
+        await opfsCopy(req.src, req.dst, !!req.recursive);
+        return ["ok", fsNil()];
+      case "realpath":
+        return ["ok", fsText("/" + splitPath(req.path).join("/"))];
+      default:
+        return ["err", "EINVAL", `unknown nx.fs op '${req.op}'`];
+    }
+  } catch (e) {
+    return ["err", errCode(e), String(e && e.message ? e.message : e)];
+  }
+}
+
+// =============================================================================
 // Off-tick daemon filesystem (Phase 6b) — the WebTransport/QUIC remote.
 //
 // When the page is opened with `?daemon=nxvim://HOST:PORT/TOKEN?cert=HASH`, the same
@@ -527,6 +835,7 @@ async function daemonWrite(path, bytes) {
 const armedWatches = new Set(); // paths currently watched on the daemon (gates the async park)
 const liveProcs = new Set(); // spawn ids in flight on the daemon (also gates the async park)
 const liveTerms = new Set(); // terminal buffer ids open on the daemon (also gates the async park)
+const liveFsWatches = new Set(); // nx.fs.watch stream ids armed on the daemon (also gates the async park)
 const daemonNotifications = []; // [method, params] pushes received but not yet applied
 let daemonWaker = null; // resolve() to wake the async park the instant a push arrives
 let sabCtrl = null; // the SAB control array (set by runLoopSAB) so a push can wake the futex park
@@ -706,6 +1015,19 @@ function applyDaemonNotifications() {
       callProcExited(Number(id), Number(code), toU8(params[2]), toU8(params[3]));
       liveProcs.delete(id);
       any = true;
+    } else if (method === "luafs_change") {
+      // params = [id, kind, [path, …]] — a coalesced nx.fs.watch change batch (Phase 3b).
+      const id = params[0];
+      const kind = String(params[1] ?? "modify");
+      const paths = Array.isArray(params[2]) ? params[2].map(String) : [];
+      eh_fs_watch_change(h, Number(id), kind, JSON.stringify(paths));
+      any = true;
+    } else if (method === "luafs_watch_err") {
+      // params = [id, message] — the watch failed (bad path / limit) or its backend errored.
+      const id = params[0];
+      eh_fs_watch_err(h, Number(id), String(params[1] ?? "watch error"));
+      liveFsWatches.delete(id);
+      any = true;
     } else {
       postMessage({ type: "config_error", error: `unhandled daemon push: ${method}` });
     }
@@ -768,6 +1090,85 @@ async function drainProcRequests() {
     ]);
   }
   for (const id of reqs.kill) await daemon.notify("proc_kill", [id]);
+}
+
+// Forward the off-tick `nx.fs` ops the tick enqueued, routed to the daemon when connected (the
+// `luafs_op` leg — Phase 2) else to OPFS (Phase 3, serverless) — the same daemon-or-OPFS split
+// `fulfillFsRequests` uses for `:e`/`:w`. Each op produces the `["ok", <fs-value>] | ["err",
+// code, message]` envelope, which `landFsOpResult` re-encodes to msgpack and lands via
+// `eh_fs_op_result` (resolving the op's promise). Drained sequentially within the tick (we're
+// not parked, so the awaits resolve), looping until dry — landing a result can fire a chained
+// `nx.fs` in the promise continuation. Returns whether any op was handled (so the caller
+// repaints / marks shada dirty).
+async function drainFsOpRequests() {
+  let didWork = false;
+  for (;;) {
+    const ops = JSON.parse(readStr(eh_take_fs_op_requests(h)));
+    if (ops.length === 0) return didWork;
+    didWork = true;
+    for (const op of ops) {
+      const id = op.id;
+      // The request map mirrors the JSON object the editor emitted (minus the JS-only `id`);
+      // `data` (write/append) becomes a byte buffer so it crosses as msgpack `bin` (daemon) /
+      // is written verbatim (OPFS).
+      const req = { ...op };
+      delete req.id;
+      if (Array.isArray(req.data)) req.data = new Uint8Array(req.data);
+      let reply;
+      try {
+        reply = daemonUri ? await daemonFsOp(req) : await opfsFsOp(req);
+      } catch (e) {
+        reply = ["err", "EIO", String(e && e.message ? e.message : e)];
+      }
+      landFsOpResult(id, reply);
+    }
+  }
+}
+
+// Run one `nx.fs` op against the daemon (the `luafs_op` leg). In daemon mode fs NEVER silently
+// falls back to OPFS (the thesis) — a dropped link returns a loud error, exactly as `daemonRead`.
+async function daemonFsOp(req) {
+  if (!daemon) return ["err", "ENOTCONN", daemonError || "daemon not connected"];
+  try {
+    return await daemon.request("luafs_op", [req]);
+  } catch (e) {
+    return ["err", "EIO", String(e && e.message ? e.message : e)];
+  }
+}
+
+// Forward the streaming `nx.fs.watch` arms/disarms the tick enqueued to the daemon (the
+// `luafs_watch` leg — Phase 3b). The daemon answers with `luafs_change`/`luafs_watch_err` pushes
+// (`onDaemonNotify`). Only reached in a daemon session — the tick gates the watch on a connected
+// daemon (`has_remote_proc`), so a serverless `nx.fs.watch` fails loud in the core and never
+// enqueues. `liveFsWatches` gates the async park so the reader keeps running to receive pushes.
+async function drainFsWatchRequests() {
+  const reqs = JSON.parse(readStr(eh_take_fs_watch_requests(h)));
+  if (reqs.arm.length === 0 && reqs.disarm.length === 0) return;
+  if (!daemon) return; // defensive: the tick shouldn't enqueue a watch without a daemon
+  for (const w of reqs.arm) {
+    liveFsWatches.add(w.id);
+    await daemon.notify("luafs_watch", [w.id, w.path, w.recursive === true]);
+  }
+  for (const id of reqs.disarm) {
+    liveFsWatches.delete(id);
+    await daemon.notify("luafs_unwatch", [id]);
+  }
+}
+
+// Land one `nx.fs` op reply into the tick: re-encode the daemon's `["ok"|"err", …]` envelope to
+// msgpack bytes (a `read` result's raw bytes survive the round-trip as `bin`) and hand them to
+// `eh_fs_op_result`, which decodes them through the shared `fswire` codec and resolves/rejects
+// the op's promise. The bytes are copied into a malloc'd buffer for the synchronous call, then
+// freed — no `await` between `HEAPU8.set` and the call, so growth can't detach the heap.
+function landFsOpResult(id, reply) {
+  const bytes = encode(reply);
+  const ptr = bytes.length ? M._malloc(bytes.length) : 0;
+  if (ptr) M.HEAPU8.set(bytes, ptr);
+  try {
+    eh_fs_op_result(h, id, ptr, bytes.length);
+  } finally {
+    if (ptr) M._free(ptr);
+  }
 }
 
 // Forward the terminal ops the tick enqueued to the daemon (`term_open` / `term_write` /
@@ -854,7 +1255,9 @@ function drainClipboardWrites() {
 async function pump5cDaemon() {
   applyDaemonNotifications();
   await fulfillFsRequests();
+  await drainFsOpRequests();
   await drainProcRequests();
+  await drainFsWatchRequests();
   await drainTerminalRequests();
   postMessage(redrawMsg());
 }
@@ -1086,9 +1489,16 @@ async function runLoopSAB(ctrl, data) {
     // resolve; the completions land the buffer/save back into the tick before we post the ack,
     // so the UI sees the opened/saved frame when its `feed` promise resolves.
     const fsWork = await fulfillFsRequests();
+    // Forward any off-tick `nx.fs` ops the tick enqueued to the daemon (the `luafs_op` leg).
+    // Request/response within this pass (we're not parked), so each reply lands before the
+    // repaint below — the op's promise resolves and the UI sees its effect.
+    const fsOpWork = await drainFsOpRequests();
     // Forward any watches the tick armed/disarmed (file-backed buffers opened/closed) to the
     // daemon, so it begins/stops pushing `fs_changed` for them.
     await drainWatchRequests();
+    // Forward any streaming `nx.fs.watch` arms/disarms the tick enqueued to the daemon (its
+    // `luafs_change`/`luafs_watch_err` pushes return on `onDaemonNotify`).
+    await drainFsWatchRequests();
     // Forward any async `vim.system` / `jobstart` the tick enqueued to the daemon (its
     // `proc_spawned`/`proc_exited` pushes return on `onDaemonNotify`).
     await drainProcRequests();
@@ -1099,13 +1509,13 @@ async function runLoopSAB(ctrl, data) {
     drainTsRequests();
     // Forward any `"+`/`"*` yanks/deletes to the UI thread to write to navigator.clipboard.
     drainClipboardWrites();
-    if (fired || acks.length || fsWork || notified || tsLanded || termFlushed) {
+    if (fired || acks.length || fsWork || fsOpWork || notified || tsLanded || termFlushed) {
       postMessage(redrawMsg({ acks, results }));
     }
     // Persistence (shada): any input this pass arms the debounced checkpoint; a requested
     // flush (tab hidden) writes immediately with the exit cursor. The checkpoint write is
     // async (OPFS) — awaiting it here is fine (the thread isn't parked yet).
-    if (acks.length || results.length || fsWork) {
+    if (acks.length || results.length || fsWork || fsOpWork) {
       shadaDirty = true;
       shadaDueMs = nowMs() + SHADA_DEBOUNCE_MS;
     }
@@ -1153,7 +1563,8 @@ async function runLoopSAB(ctrl, data) {
     if (shadaDirty) deadline = deadline < 0 ? shadaDueMs : Math.min(deadline, shadaDueMs);
     let timeout = deadline < 0 ? undefined : Math.max(0, deadline - nowMs());
     const daemonPushing =
-      daemon && (armedWatches.size > 0 || liveProcs.size > 0 || liveTerms.size > 0);
+      daemon &&
+      (armedWatches.size > 0 || liveProcs.size > 0 || liveTerms.size > 0 || liveFsWatches.size > 0);
     if (daemonPushing || indenterBusy()) {
       // Don't *block* — a thread frozen in `Atomics.wait` can't run the event loop, so any
       // pending promise stalls. Cases that need it live: a daemon session expecting pushes
@@ -1287,7 +1698,9 @@ onmessage = async (ev) => {
     case "feed":
       eh_input(h, String(msg.notation));
       await fulfillFsRequests();
+      await drainFsOpRequests();
       await drainWatchRequests();
+      await drainFsWatchRequests();
       await drainProcRequests();
       await drainTerminalRequests();
       drainTsRequests();
@@ -1300,7 +1713,9 @@ onmessage = async (ev) => {
       eh_set_clock(h, nowMs());
       eh_input_mouse(h, String(msg.button), String(msg.action), String(msg.modifier), msg.row | 0, msg.col | 0);
       await fulfillFsRequests();
+      await drainFsOpRequests();
       await drainWatchRequests();
+      await drainFsWatchRequests();
       await drainProcRequests();
       await drainTerminalRequests();
       drainTsRequests();
@@ -1311,7 +1726,9 @@ onmessage = async (ev) => {
     case "exec_lua": {
       const result = readStr(eh_exec_lua(h, String(msg.code)));
       await fulfillFsRequests();
+      await drainFsOpRequests();
       await drainWatchRequests();
+      await drainFsWatchRequests();
       await drainProcRequests();
       await drainTerminalRequests();
       drainTsRequests();

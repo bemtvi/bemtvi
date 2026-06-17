@@ -25,6 +25,7 @@
 //! - [`luafs`] — the project-facing Lua filesystem seam ([`LuaFs`]).
 
 mod convert;
+mod fswire;
 mod host;
 mod install;
 mod luafs;
@@ -33,13 +34,14 @@ mod runtime;
 mod system;
 mod vimregex;
 
-pub use luafs::{FileKind, LuaDirEntry, LuaFs, LuaStat, StdLuaFs};
+pub use fswire::{fs_job_from_value, fs_result_from_value, fs_result_to_value};
+pub use luafs::{run_fs_job, FileKind, LuaDirEntry, LuaFs, LuaStat, StdLuaFs};
 pub use ops::{
     BufOp, CallbackArgs, ConfirmReq, DecorMark, DecorPublish, DiagnosticData, DockOp, ExtmarkOp,
-    FeedKeysOp, GlobalOptionOp, HlSet, InlayHintMirrorData, LayerOp, LoopOp, LspClientData, LspOp,
-    LspServerCapabilities, OptionValue, PanelOp, QfItem, QfSetOp, RawKeymap, RawRhs, RegisterSetOp,
-    SemanticTokenData, StatuslineKind, StatuslineTarget, TabOp, TerminalOpenReq, TsOp, UiInputReq,
-    ViewOp, VirtChunkData, VirtDecorData, WindowOp,
+    FeedKeysOp, FsError, FsJob, FsValue, GlobalOptionOp, HlSet, InlayHintMirrorData, LayerOp,
+    LoopOp, LspClientData, LspOp, LspServerCapabilities, OptionValue, PanelOp, QfItem, QfSetOp,
+    RawKeymap, RawRhs, RegisterSetOp, SemanticTokenData, StatuslineKind, StatuslineTarget, TabOp,
+    TerminalOpenReq, TsOp, UiInputReq, ViewOp, VirtChunkData, VirtDecorData, WindowOp,
 };
 pub use runtime::{
     BoMirror, BufBytesEdit, BufMirror, ExtmarkMirror, FloatMirror, GoMirror, HlDefMirror,

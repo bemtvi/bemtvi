@@ -8,17 +8,19 @@
 use std::cell::RefCell;
 use std::path::PathBuf;
 use std::rc::Rc;
+use std::sync::Arc;
 
 use mlua::{Lua, LuaOptions, LuaSerdeExt, StdLib, Table};
 use serde::Serialize;
 
 use crate::convert::{json_to_lua, lua_int, lua_to_rmpv};
 use crate::host::seed_package_path;
+use crate::install::fs_stat_table;
 use crate::install::{install_runtime_api, install_vim, PANEL_ON_SELECT};
 use crate::ops::{
     BufOp, CallbackArgs, CompletePush, CompleteSetupReq, ConfirmReq, DecorPublish, DiagnosticData,
-    DockOp, ExtmarkOp, FeedKeysOp, GlobalOptionOp, HlSet, InlayHintMirrorData, LayerOp, LoopOp,
-    LspClientData, LspOp, PanelOp, PickerOpenReq, PickerPush, QfSetOp, RawKeymap, RawRhs,
+    DockOp, ExtmarkOp, FeedKeysOp, FsValue, GlobalOptionOp, HlSet, InlayHintMirrorData, LayerOp,
+    LoopOp, LspClientData, LspOp, PanelOp, PickerOpenReq, PickerPush, QfSetOp, RawKeymap, RawRhs,
     RegisterSetOp, SemanticTokenData, SnippetAddReq, SnippetSetupReq, StatuslinePublishReq,
     StatuslineSetupReq, TabOp, TerminalOpenReq, TsOp, UiFloatReq, UiInputReq, UiSelectReq, ViewOp,
     WindowOp,
@@ -605,18 +607,50 @@ pub(crate) struct Shared {
     /// rest of [`Shared`]. The first resolve installs the default and caches it, so a
     /// single [`StdLuaFs`](crate::StdLuaFs) instance (and its open-fd table) persists
     /// across calls.
-    pub(crate) lua_fs: Option<Rc<dyn crate::LuaFs>>,
+    ///
+    /// `Arc<dyn LuaFs + Send + Sync>` (not `Rc`) because the same handle is also held
+    /// by the event-loop actor, which runs `nx.fs` ops off the editor thread (the
+    /// off-tick plan); the synchronous editor-thread callers here deref the `Arc`
+    /// exactly as they did the `Rc`. Both backends qualify — `StdLuaFs` guards its fd
+    /// table with a `Mutex`, `RemoteLuaFs` is a channel sender.
+    pub(crate) lua_fs: Option<Arc<dyn crate::LuaFs + Send + Sync>>,
 }
 
 /// Resolve the active [`LuaFs`](crate::LuaFs): the injected daemon bridge, or a
 /// persistent local [`StdLuaFs`](crate::StdLuaFs) lazily installed on first use (so the
 /// open-fd table outlives a single call). The project-facing `vim.fn` fs closures
 /// call this, mirroring how `nx._system` resolves `blocking_system`.
-pub(crate) fn resolve_lua_fs(shared: &Rc<RefCell<Shared>>) -> Rc<dyn crate::LuaFs> {
+pub(crate) fn resolve_lua_fs(shared: &Rc<RefCell<Shared>>) -> Arc<dyn crate::LuaFs + Send + Sync> {
     let mut sh = shared.borrow_mut();
     sh.lua_fs
-        .get_or_insert_with(|| Rc::new(crate::StdLuaFs::new()))
+        .get_or_insert_with(|| Arc::new(crate::StdLuaFs::new()))
         .clone()
+}
+
+/// Marshal a settled [`FsValue`] (the success payload of an off-tick `nx.fs` op)
+/// into the Lua value the promise resolves with. The per-op shape that used to live
+/// in the inline `nx._fs_*` bridges now lives here, run once on the result whether it
+/// came from the native actor or the wasm daemon leg. `Bytes` (raw `nx.fs.read`) and
+/// `Text` (decoded `read_text` / `realpath`) both become a Lua string; `Dir` becomes
+/// the `{ { name=, type= }, … }` list a single `scandir` round-trip produced.
+fn fs_value_to_lua(lua: &Lua, value: FsValue) -> mlua::Result<mlua::Value> {
+    Ok(match value {
+        FsValue::Nil => mlua::Value::Nil,
+        FsValue::Bool(b) => mlua::Value::Boolean(b),
+        FsValue::Bytes(b) => mlua::Value::String(lua.create_string(b)?),
+        FsValue::Text(t) => mlua::Value::String(lua.create_string(t)?),
+        FsValue::Stat(st) => mlua::Value::Table(fs_stat_table(lua, &st)?),
+        FsValue::Dir(entries) => {
+            let list = lua.create_table()?;
+            for e in entries {
+                let t = lua.create_table()?;
+                t.set("name", e.name)?;
+                t.set("type", e.kind.as_str())?;
+                list.push(t)?;
+            }
+            mlua::Value::Table(list)
+        }
+    })
 }
 
 /// An embedded Lua VM with nxvim's `vim` global installed.
@@ -715,7 +749,7 @@ impl LuaRuntime {
     /// [`StdLuaFs`](crate::StdLuaFs) is used (a bare/local session is unchanged). The
     /// server calls this once at startup when a daemon is present, so the `vim.fn`
     /// fs builtins / root detection see the *remote* project, not the local disk.
-    pub fn set_lua_fs(&self, fs: Rc<dyn crate::LuaFs>) {
+    pub fn set_lua_fs(&self, fs: Arc<dyn crate::LuaFs + Send + Sync>) {
         self.shared.borrow_mut().lua_fs = Some(fs);
     }
 
@@ -1443,6 +1477,25 @@ impl LuaRuntime {
                 };
                 let result = json_to_lua(&self.lua, &result)?;
                 run.call::<()>((id, keep, err, result))
+            }
+            CallbackArgs::FsResult { result } => {
+                // `nx.fs.*` settle: fire `nx._run_cb(id, false, err, value)`. On reject
+                // `err` is the `{ code, message }` table (value nil); on resolve `err`
+                // is nil and `value` the marshalled Lua value. The typed-result → Lua
+                // conversion happens here once, so it is identical for the native actor
+                // and the wasm daemon leg.
+                match result {
+                    Ok(value) => {
+                        let value = fs_value_to_lua(&self.lua, value)?;
+                        run.call::<()>((id, keep, mlua::Value::Nil, value))
+                    }
+                    Err(e) => {
+                        let err = self.lua.create_table()?;
+                        err.set("code", e.code)?;
+                        err.set("message", e.message)?;
+                        run.call::<()>((id, keep, mlua::Value::Table(err), mlua::Value::Nil))
+                    }
+                }
             }
         }
     }

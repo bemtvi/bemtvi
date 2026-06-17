@@ -3,6 +3,8 @@
 //! are the wire between [`crate::LuaRuntime`] and the server, kept free of any
 //! `mlua` / transport types so the server can pattern-match on them directly.
 
+use crate::luafs::{LuaDirEntry, LuaStat};
+
 /// A highlight-group definition produced by `nvim_set_hl(ns, name, opts)`, in
 /// the wire-ish form the server translates into `nxvim_core`'s `HlDef`. Colors
 /// are kept as the strings the opts table carried (`"#rrggbb"` / `"NONE"` /
@@ -327,6 +329,76 @@ pub enum LspOp {
     },
 }
 
+/// One surfaced `nx.fs` filesystem operation, as plain data — the op descriptor the
+/// `nx._fs_op` bridge queues off-tick (carried by [`LoopOp::Fs`] natively, the wasm
+/// `HostEffects::fs_op` path on the browser). One variant per op the `nx.fs.*`
+/// surface exposes; the actual work runs through the [`LuaFs`](crate::LuaFs) seam in
+/// [`run_fs_job`](crate::run_fs_job), so it is identical for a local `StdLuaFs` and a
+/// remote daemon bridge. `data` rides as owned bytes (the Lua byte-string the caller
+/// passed); `Read`/`Write` carry no encoding (raw bytes), `ReadText` carries the
+/// charset label to decode at marshal time.
+#[derive(Clone, Debug)]
+pub enum FsJob {
+    /// `nx.fs.stat(path)` — metadata, following symlinks.
+    Stat { path: String },
+    /// `nx.fs.lstat(path)` — metadata, NOT following the final symlink.
+    Lstat { path: String },
+    /// `nx.fs.exists(path)` — existence of the entry itself (never rejects).
+    Exists { path: String },
+    /// `nx.fs.readdir(path)` — the directory's entries, each with its dirent kind.
+    Readdir { path: String },
+    /// `nx.fs.read(path)` — the file's raw bytes.
+    Read { path: String },
+    /// `nx.fs.read_text(path, { encoding })` — the file decoded through `encoding`
+    /// (default `utf-8`), failing loud (EILSEQ) on invalid bytes.
+    ReadText { path: String, encoding: String },
+    /// `nx.fs.write(path, data)` — write `data` as the whole file (truncate / create).
+    Write { path: String, data: Vec<u8> },
+    /// `nx.fs.append(path, data)` — append `data` to the file (create if absent).
+    Append { path: String, data: Vec<u8> },
+    /// `nx.fs.mkdir(path, { recursive })` — create the directory (and parents when
+    /// `recursive`).
+    Mkdir { path: String, recursive: bool },
+    /// `nx.fs.rename(from, to)` — move / rename.
+    Rename { from: String, to: String },
+    /// `nx.fs.remove(path, { recursive })` — unlink a file, or remove a directory
+    /// (emptying it first when `recursive`).
+    Remove { path: String, recursive: bool },
+    /// `nx.fs.copy(src, dst, { recursive })` — copy a file, or a tree when `recursive`.
+    Copy {
+        src: String,
+        dst: String,
+        recursive: bool,
+    },
+    /// `nx.fs.realpath(path)` — the canonical absolute path (symlinks resolved).
+    Realpath { path: String },
+}
+
+/// The typed value an [`FsJob`] resolves with — the union of every `nx.fs` op's
+/// success payload. Marshalled into the Lua value the promise resolves with by
+/// [`LuaRuntime::run_callback`](crate::LuaRuntime), so the per-op conversion happens
+/// once regardless of native/wasm origin. `Bytes` is `nx.fs.read`'s raw byte-string;
+/// `Text` is `read_text`/`realpath`'s decoded string; `Nil` is a unit-result op
+/// (write/mkdir/…); `Bool` is `exists`.
+#[derive(Clone, Debug)]
+pub enum FsValue {
+    Nil,
+    Bool(bool),
+    Bytes(Vec<u8>),
+    Text(String),
+    Stat(LuaStat),
+    Dir(Vec<LuaDirEntry>),
+}
+
+/// The error an [`FsJob`] rejects with — the `{ code, message }` table the `nx.fs`
+/// promise rejects with. `code` is a libuv/errno-style hint (`ENOENT`/`EACCES`/…)
+/// the caller can branch on; `message` is the human string.
+#[derive(Clone, Debug)]
+pub struct FsError {
+    pub code: String,
+    pub message: String,
+}
+
 /// A request to the async runtime (the "event loop"), queued by the `nx.schedule`
 /// / `nx.timer` / `vim.system` (`nx.run`) family and drained by the
 /// server in `apply_lua_effects`. Each op carries a `cb_id` into `nx._cb_fns`
@@ -387,6 +459,14 @@ pub enum LoopOp {
     /// A `nx.fs.watch` stream's `:stop()` — cancel the watch armed under `id`. A
     /// no-op if it was never armed.
     FsUnwatch { id: u64 },
+    /// An `nx.fs.*` one-shot op (`nx._fs_op`) — run `job` off the editor tick and
+    /// resolve / reject the promise registered under `id` when it settles. Native:
+    /// forwarded to the event-loop actor ([`LoopCommand::Fs`](../../nxvim_server),
+    /// run on `spawn_blocking` against its [`LuaFs`](crate::LuaFs) clone); the result
+    /// returns inbound as [`LoopEvent::FsResult`](../../nxvim_server) → a
+    /// [`CallbackArgs::FsResult`]. Wasm: forwarded to the daemon `luafs` leg over
+    /// WebTransport (the wasm `fs_op` seam — Phase 2 of the off-tick plan).
+    Fs { id: u64, job: FsJob },
 }
 
 /// A buffer-local *option* write queued by the Lua side, drained by the server in
@@ -735,6 +815,17 @@ pub enum CallbackArgs {
         err: Option<String>,
         /// The server's JSON result on success; `Null` when `err` is set.
         result: serde_json::Value,
+    },
+    /// The settled result of an off-tick [`FsJob`] (`nx.fs.*`): the callback is run
+    /// as `nx._run_cb(id, false, err, value)` — `err` the `{ code, message }` table
+    /// (with `value` nil) on a reject, or `err` nil with `value` the resolved Lua
+    /// value. The marshalling (typed [`FsValue`] / [`FsError`] → Lua) happens once in
+    /// [`run_callback`](crate::LuaRuntime::run_callback), so it is identical whether
+    /// the op ran on the native actor or the wasm daemon leg.
+    FsResult {
+        /// The op's outcome: `Ok` resolves the promise with the marshalled value,
+        /// `Err` rejects it with the `{ code, message }` table.
+        result: Result<FsValue, FsError>,
     },
 }
 

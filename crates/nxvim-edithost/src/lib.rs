@@ -142,6 +142,25 @@ struct Sink {
     /// [`proc_spawns`](Sink::proc_spawns), drained by [`eh_take_proc_requests`] for the
     /// Worker to forward (`proc_kill [id]`).
     proc_kills: Vec<u64>,
+    /// Off-tick `nx.fs` ops the editor enqueued this convergence (the `luafs_op` leg —
+    /// Phase 2): `(cb_id, job)` per `nx.fs.*` call, recorded by [`fs_op`](HostEffects::fs_op).
+    /// Drained by [`eh_take_fs_op_requests`]; the Worker routes each to the daemon `luafs_op`
+    /// leg over WebTransport when connected, else to OPFS (Phase 3a, serverless), and lands the
+    /// typed result via [`eh_fs_op_result`]. Always enqueued on wasm (there is always *some* fs —
+    /// OPFS is the serverless fallback), unlike the daemon-only proc leg.
+    fs_ops: Vec<(u64, nxvim_lua::FsJob)>,
+    /// Streaming `nx.fs.watch` arms the editor enqueued this convergence (the `luafs_watch` leg —
+    /// Phase 3b): `(stream_id, path, recursive)` per `nx.fs.watch`, recorded by
+    /// [`fs_watch_stream`](HostEffects::fs_watch_stream). Drained by [`eh_take_fs_watch_requests`]
+    /// for the Worker to forward over WebTransport (`luafs_watch [id, path, recursive]`); change
+    /// batches return via [`eh_fs_watch_change`] / errors via [`eh_fs_watch_err`]. Daemon-only
+    /// (the tick gates the watch on a connected daemon; serverless fails it loud — no change source).
+    fs_watch_arms: Vec<(u64, String, bool)>,
+    /// Streaming-watch `:stop()`s the editor enqueued (the disarm twin of
+    /// [`fs_watch_arms`](Sink::fs_watch_arms)), recorded by
+    /// [`fs_unwatch_stream`](HostEffects::fs_unwatch_stream); drained by
+    /// [`eh_take_fs_watch_requests`] (`luafs_unwatch [id]`).
+    fs_watch_disarms: Vec<u64>,
     /// Terminal PTYs the editor newly asked to **open** this convergence (the web `:terminal`
     /// — Phase 7): `(buf, argv, cwd, rows, cols)` per `:terminal`, recorded by
     /// [`term_open`](HostEffects::term_open). Drained by [`eh_take_terminal_requests`] for the
@@ -469,6 +488,31 @@ impl HostEffects for WasmEffects {
         // no process host. The Worker flips this on `:connect` / `?daemon=` (`eh_set_daemon_connected`);
         // when false the tick fails the spawn loud instead of enqueuing it.
         self.sink.borrow().daemon_connected
+    }
+
+    fn fs_op(&mut self, id: u64, job: nxvim_lua::FsJob) {
+        // An off-tick `nx.fs` op against the daemon (Phase 2): record the (cb_id, job) for
+        // the Worker to forward over WebTransport (`eh_take_fs_op_requests` → one `luafs_op`
+        // request). The daemon runs `run_fs_job` and its typed result returns via
+        // `eh_fs_op_result`. Only reached when a daemon is connected (the tick gates `nx.fs`
+        // on `has_remote_proc`, like the proc leg); serverless `nx.fs` fails loud in the core.
+        self.sink.borrow_mut().fs_ops.push((id, job));
+    }
+
+    fn fs_watch_stream(&mut self, id: u64, path: String, recursive: bool) {
+        // A streaming `nx.fs.watch` against the daemon (Phase 3b): record the arm for the Worker
+        // to forward (`eh_take_fs_watch_requests` → `luafs_watch [id, path, recursive]`). Change
+        // batches return via `eh_fs_watch_change`, a terminal error via `eh_fs_watch_err`. Only
+        // reached with a daemon connected (the tick gates the watch on `has_remote_proc`).
+        self.sink
+            .borrow_mut()
+            .fs_watch_arms
+            .push((id, path, recursive));
+    }
+
+    fn fs_unwatch_stream(&mut self, id: u64) {
+        // `:stop()` on a daemon watch: record the disarm for the Worker to forward (`luafs_unwatch`).
+        self.sink.borrow_mut().fs_watch_disarms.push(id);
     }
 
     fn term_open(
@@ -1195,6 +1239,199 @@ pub unsafe extern "C" fn eh_proc_exited(
         .proc_exited(id.max(0.0) as u64, code as i32, stdout, stderr);
 }
 
+// ============================================================================
+// Off-tick daemon `nx.fs` leg (Phase 2 of the off-tick plan). The async `nx.fs.*` path: the
+// editor enqueues a high-level op off the keystroke tick (it can't run a synchronous fs in the
+// browser), the Worker forwards it as one `luafs_op` request over WebTransport to a connected
+// daemon, which runs `run_fs_job` and replies; the typed result lands back here and resolves the
+// op's promise. The browser twin of the native event-loop actor's `nx.fs` routing. Only reached
+// with a daemon connected (serverless `nx.fs` fails loud in the core — see effects.rs).
+// ============================================================================
+
+/// Lower an [`FsJob`](nxvim_lua::FsJob) into the JSON object the Worker forwards as a
+/// `luafs_op` request map: `{ id, op, … }`. The op name + field names match the daemon's
+/// `nxvim_lua::fs_job_from_value` decoder. `data` (write/append) rides as a JSON byte array
+/// (the Worker converts it to a byte buffer so it crosses as msgpack `bin`), exactly as the
+/// proc leg's `stdin` does.
+fn fs_job_to_json(id: u64, job: &nxvim_lua::FsJob) -> serde_json::Value {
+    use nxvim_lua::FsJob;
+    let mut o = serde_json::Map::new();
+    o.insert("id".into(), serde_json::json!(id));
+    let mut put = |k: &str, v: serde_json::Value| {
+        o.insert(k.into(), v);
+    };
+    match job {
+        FsJob::Stat { path } => {
+            put("op", "stat".into());
+            put("path", path.clone().into());
+        }
+        FsJob::Lstat { path } => {
+            put("op", "lstat".into());
+            put("path", path.clone().into());
+        }
+        FsJob::Exists { path } => {
+            put("op", "exists".into());
+            put("path", path.clone().into());
+        }
+        FsJob::Readdir { path } => {
+            put("op", "readdir".into());
+            put("path", path.clone().into());
+        }
+        FsJob::Read { path } => {
+            put("op", "read".into());
+            put("path", path.clone().into());
+        }
+        FsJob::ReadText { path, encoding } => {
+            put("op", "read_text".into());
+            put("path", path.clone().into());
+            put("encoding", encoding.clone().into());
+        }
+        FsJob::Write { path, data } => {
+            put("op", "write".into());
+            put("path", path.clone().into());
+            put("data", serde_json::json!(data));
+        }
+        FsJob::Append { path, data } => {
+            put("op", "append".into());
+            put("path", path.clone().into());
+            put("data", serde_json::json!(data));
+        }
+        FsJob::Mkdir { path, recursive } => {
+            put("op", "mkdir".into());
+            put("path", path.clone().into());
+            put("recursive", (*recursive).into());
+        }
+        FsJob::Rename { from, to } => {
+            put("op", "rename".into());
+            put("from", from.clone().into());
+            put("to", to.clone().into());
+        }
+        FsJob::Remove { path, recursive } => {
+            put("op", "remove".into());
+            put("path", path.clone().into());
+            put("recursive", (*recursive).into());
+        }
+        FsJob::Copy {
+            src,
+            dst,
+            recursive,
+        } => {
+            put("op", "copy".into());
+            put("src", src.clone().into());
+            put("dst", dst.clone().into());
+            put("recursive", (*recursive).into());
+        }
+        FsJob::Realpath { path } => {
+            put("op", "realpath".into());
+            put("path", path.clone().into());
+        }
+    }
+    serde_json::Value::Object(o)
+}
+
+/// Drain the off-tick `nx.fs` ops the editor enqueued since the last call, as a JSON array of
+/// `luafs_op` request objects (`[{ id, op, path, … }, …]`), emptying the queue so each is
+/// forwarded exactly once. The Worker sends one `luafs_op` request per object and lands the
+/// reply via [`eh_fs_op_result`]. Caller frees with [`eh_free_string`].
+///
+/// # Safety
+/// `h` must come from [`eh_new`] and not yet be freed.
+#[no_mangle]
+pub unsafe extern "C" fn eh_take_fs_op_requests(h: *mut WasmEditHost) -> *mut c_char {
+    let Some(handle) = h.as_mut() else {
+        return into_owned_cstr("[]".into());
+    };
+    let ops: Vec<serde_json::Value> = std::mem::take(&mut handle.sink.borrow_mut().fs_ops)
+        .iter()
+        .map(|(id, job)| fs_job_to_json(*id, job))
+        .collect();
+    into_owned_cstr(serde_json::Value::Array(ops).to_string())
+}
+
+/// Land the typed result of an off-tick `nx.fs` op (the `luafs_op` leg's reply): resolve /
+/// reject the promise enqueued under `id` with the op's outcome, then settle + repaint. `reply`
+/// is the `["ok", <fs-value>] | ["err", code, message]` envelope re-encoded to **msgpack bytes**
+/// by the Worker (passed as pointer+length, not a C string, because a `read` result carries raw
+/// file bytes — NULs / invalid UTF-8 — that a C string would mangle); Rust decodes it through the
+/// shared `nxvim_lua::fswire` codec. `id` is a `double` (a small counter). See
+/// [`EditHost::fs_op_result`].
+///
+/// # Safety
+/// `h` must come from [`eh_new`] and not yet be freed; `data` must point to `len` readable bytes
+/// (or be null when `len` is 0).
+#[no_mangle]
+pub unsafe extern "C" fn eh_fs_op_result(
+    h: *mut WasmEditHost,
+    id: f64,
+    data: *const u8,
+    len: usize,
+) {
+    let Some(handle) = h.as_mut() else { return };
+    let reply = if data.is_null() || len == 0 {
+        Vec::new()
+    } else {
+        std::slice::from_raw_parts(data, len).to_vec()
+    };
+    handle.host.fs_op_result(id.max(0.0) as u64, reply);
+}
+
+/// Drain the streaming `nx.fs.watch` arm/disarm requests the editor enqueued since the last call,
+/// as JSON `{"arm":[{"id":N,"path":"…","recursive":bool}],"disarm":[N]}` — the `luafs_watch` leg's
+/// outbound half. The Worker forwards each arm as `luafs_watch [id, path, recursive]` and each
+/// disarm as `luafs_unwatch [id]` over WebTransport; the daemon's change batches return via
+/// [`eh_fs_watch_change`] / a terminal error via [`eh_fs_watch_err`]. Caller frees with
+/// [`eh_free_string`].
+///
+/// # Safety
+/// `h` must come from [`eh_new`] and not yet be freed.
+#[no_mangle]
+pub unsafe extern "C" fn eh_take_fs_watch_requests(h: *mut WasmEditHost) -> *mut c_char {
+    let Some(handle) = h.as_mut() else {
+        return into_owned_cstr(r#"{"arm":[],"disarm":[]}"#.into());
+    };
+    let mut sink = handle.sink.borrow_mut();
+    let arm: Vec<serde_json::Value> = std::mem::take(&mut sink.fs_watch_arms)
+        .into_iter()
+        .map(|(id, path, recursive)| serde_json::json!({ "id": id, "path": path, "recursive": recursive }))
+        .collect();
+    let disarm: Vec<u64> = std::mem::take(&mut sink.fs_watch_disarms);
+    into_owned_cstr(serde_json::json!({ "arm": arm, "disarm": disarm }).to_string())
+}
+
+/// Land a streaming `nx.fs.watch` change batch (the daemon `luafs_change` push): fire the stream
+/// `id`'s pump with the coalesced change `kind` and its `paths` (a JSON string array), then settle
+/// + repaint. `id` is a `double` (a small stream counter). See [`EditHost::fs_watch_event`].
+///
+/// # Safety
+/// `h` must come from [`eh_new`] and not yet be freed; `kind` / `paths_json` valid C strings.
+#[no_mangle]
+pub unsafe extern "C" fn eh_fs_watch_change(
+    h: *mut WasmEditHost,
+    id: f64,
+    kind: *const c_char,
+    paths_json: *const c_char,
+) {
+    let Some(handle) = h.as_mut() else { return };
+    let paths: Vec<String> = serde_json::from_str(as_str(paths_json)).unwrap_or_default();
+    handle
+        .host
+        .fs_watch_event(id.max(0.0) as u64, as_str(kind).to_string(), paths);
+}
+
+/// Land a streaming `nx.fs.watch` terminal error (the daemon `luafs_watch_err` push): reject the
+/// stream `id`'s pull with `message` (ending the iteration loud), then settle. See
+/// [`EditHost::fs_watch_error`].
+///
+/// # Safety
+/// `h` must come from [`eh_new`] and not yet be freed; `message` a valid C string.
+#[no_mangle]
+pub unsafe extern "C" fn eh_fs_watch_err(h: *mut WasmEditHost, id: f64, message: *const c_char) {
+    let Some(handle) = h.as_mut() else { return };
+    handle
+        .host
+        .fs_watch_error(id.max(0.0) as u64, as_str(message).to_string());
+}
+
 /// Drain the terminal ops the editor enqueued since the last call (the web `:terminal` —
 /// Phase 7), as JSON the Worker forwards to the daemon:
 /// `{"open":[{"buf":N,"argv":["…"],"cwd":"…"|null,"rows":R,"cols":C}],
@@ -1208,7 +1445,9 @@ pub unsafe extern "C" fn eh_proc_exited(
 #[no_mangle]
 pub unsafe extern "C" fn eh_take_terminal_requests(h: *mut WasmEditHost) -> *mut c_char {
     let Some(handle) = h.as_mut() else {
-        return into_owned_cstr(r#"{"open":[],"write":[],"resize":[],"kill":[],"interrupt":[]}"#.into());
+        return into_owned_cstr(
+            r#"{"open":[],"write":[],"resize":[],"kill":[],"interrupt":[]}"#.into(),
+        );
     };
     let mut sink = handle.sink.borrow_mut();
     let open: Vec<serde_json::Value> = std::mem::take(&mut sink.term_opens)

@@ -1,10 +1,30 @@
 # nxtree — a dockable, extensible file explorer (pure-Lua plugin)
 
-Status: **native phases 1–2 landed** — 2026-06-16. `nx.open` / `nx.layer` (Phase 1)
-and `nx.view` (Phase 2) are implemented and tested (`crates/nxvim-server/tests/nx_view.rs`,
-`examples/nxview/`); together with the landed `nx.fs` dependency they unblock the
-Lua plugin (phases 3–5, still planned). Phase 2 ships dock + split mounts; a `float`
-mount fails loud as not-yet-implemented.
+Status: **complete** — native phases 1–2 (2026-06-16) and the pure-Lua plugin
+phases 3–5 (2026-06-17). `nx.open` / `nx.layer` (Phase 1) and `nx.view` (Phase 2)
+are implemented and tested (`crates/nxvim-server/tests/nx_view.rs`,
+`examples/nxview/`); Phase 2 ships dock + split mounts (a `float` mount fails loud as
+not-yet-implemented). The explorer itself ships as a pure-Lua plugin under
+`examples/nxtree/` (`lua/nxtree/{init,model,render,icons,actions,search}.lua` + a
+`git_signs` decorator add-on), built entirely on `nx.view` + `nx.fs` + `nx.open` +
+`nx.dock` + extmarks — no buffer-mutation API. Verified end-to-end in
+`crates/nxvim-server/tests/nxtree.rs` (sorted lazy render, `<CR>` expand/collapse,
+open-in-main, inert editing, refresh, and the shipped example loads + mounts).
+
+What landed vs. the original phase sketch:
+- **Phase 3 (MVP)** — lazy `nx.fs.readdir`-on-expand, dirs-first/alpha sort,
+  flatten-to-visible, render with indent **guides** (`│ ├ └`) + icons + per-kind
+  highlights, `<CR>` toggle / open-in-`main`, `<leader>e` / `:NxTree` toggle. Done.
+- **Phase 4 (actions / icons / search / extensibility)** — `a`/`r`/`d`/`x`+`p`/`y`/`R`
+  + `H` (hidden) / `q` (close) buffer-local maps; seeded icon registry with
+  `register_icons`; `/` filter (single-shot `nx.ui.input`, not a live char loop —
+  robust on the nomodifiable buffer; substring, not fuzzy); `register_decorator` /
+  `register_action`; the `git_signs` add-on. Done.
+- **Phase 5 (polish)** — `nx.fs.watch` auto-refresh (recursive, best-effort: a build
+  with no native watcher rejects the first pull and degrades to manual `R`); hidden
+  toggle (`H`). **Deferred:** `:NxTreeFindFile` reveal-current — needs a *view cursor
+  setter* (`nx.view` v1 only reads the cursor), so reveal can expand the path but not
+  move the cursor; left out rather than shipped half-working.
 
 A real file tree, built as a **pure-Lua plugin on `nx.*`** per the dogfooding
 directive ([ADR 0002](../decisions/0002-native-plugin-system.md)). A small set of

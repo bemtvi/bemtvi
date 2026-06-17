@@ -159,6 +159,35 @@ async fn view_create_and_set_lines_controls_the_buffer() {
     assert_eq!(joined.as_str(), Some("alpha|beta|gamma"));
 }
 
+/// A view is plugin-owned content with no disk backing, so `:set_lines` must leave it
+/// UNMODIFIED — the wholesale rope rewrite (`mark_resync`) sets the modified flag, and
+/// `set_view_lines` must clear it. Otherwise every view (file tree, symbol list, …)
+/// reads as `[+]` and blocks `:qa` with E37, as if it wanted saving.
+#[tokio::test]
+async fn view_set_lines_does_not_mark_modified() {
+    let (rpc, _incoming) = start().await;
+    exec_lua(
+        &rpc,
+        r#"vw = nx.view.create{}
+           vw:set_lines{ "alpha", "beta", "gamma" }"#,
+    )
+    .await;
+    let modified = exec_lua(&rpc, r#"return vim.bo[vw:bufnr()].modified"#).await;
+    assert_eq!(
+        modified.as_bool(),
+        Some(false),
+        "a view buffer must never read as modified"
+    );
+    // A second set_lines (a re-render) must not flip it either.
+    exec_lua(&rpc, r#"vw:set_lines{ "one", "two" }"#).await;
+    let modified = exec_lua(&rpc, r#"return vim.bo[vw:bufnr()].modified"#).await;
+    assert_eq!(
+        modified.as_bool(),
+        Some(false),
+        "re-render must stay unmodified"
+    );
+}
+
 /// A view mounted in a left dock renders there: the dock band is reserved, a
 /// `dock_left` window is painted, and it shows the view's content.
 #[tokio::test]

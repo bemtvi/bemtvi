@@ -116,6 +116,12 @@ impl Editor {
         ob.buffer.mark_resync();
         ob.undo = UndoTree::new(&ob.buffer);
         ob.saved_seq = Some(ob.undo.cur_seq());
+        // The content is plugin-derived and has no disk backing, so the view is never
+        // "modified" relative to a backing store — but `mark_resync` (the wholesale-
+        // rewrite bookkeeping) sets the flag. Clear it, exactly as the terminal mirror
+        // does after its own rewrite, so a view never shows `[+]` or blocks `:qa` with
+        // E37 ("no write since last change"), as if it wanted saving.
+        ob.buffer.modified = false;
         if is_current {
             self.cursor.line = self.cursor.line.min(self.last_line());
             self.cursor.col = 0;

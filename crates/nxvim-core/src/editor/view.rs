@@ -5,16 +5,21 @@
 //! `view: Some(id)`) shown in any window, whose lines a plugin replaces wholesale
 //! and whose `<CR>` dispatches to a Lua `on_select` callback.
 //!
-//! Like the directory listing ([`explorer`](super::explorer)), a view buffer is
-//! inert to the editing grammar: [`Editor::input`] routes its normal-mode keys
-//! through the `view` keymap bucket ([`Editor::apply_view_action`]) instead of the
-//! state machine, so navigation works but text-mutating keys can't corrupt the
-//! plugin-owned content. Decoration (icons / indent guides / signs) rides the
-//! ordinary extmark layer (`nvim_buf_set_extmark`), so it needs nothing here.
+//! Like the directory listing ([`explorer`](super::explorer)) and the quickfix
+//! window, a view is an **ordinary `nomodifiable` buffer in a window** (vim's model):
+//! normal-mode keys — motions, search, `:` — flow through the grammar unchanged, and
+//! text-mutating keys are refused at the [`modifiable`](Editor::modifiable)
+//! chokepoints (the buffer carries `view: Some(id)`, so [`Buffer::read_only`] is
+//! true), so the plugin-owned content can't be corrupted. Its one special key —
+//! `<CR>` → [`apply_view_action`](Editor::apply_view_action)`("confirm")` → the Lua
+//! `on_select` — is an ordinary **buffer-local default keymap** installed at view
+//! creation (`nx._install_view_keymaps`), not a special `input()` branch. Decoration
+//! (icons / indent guides / signs) rides the ordinary extmark layer
+//! (`nvim_buf_set_extmark`), so it needs nothing here. See
+//! docs/plans/2026-06-16-unify-special-buffer-kinds.md.
 
 use super::*;
 use crate::buffer::Buffer;
-use crate::input::Key;
 use ropey::Rope;
 
 /// One live `nx.view` surface, tracked in [`Editor::views`] by its Lua handle id.
@@ -34,14 +39,6 @@ pub(crate) enum ViewMount {
 }
 
 impl Editor {
-    /// Whether the current buffer is a plugin-owned `nx.view` surface. When true,
-    /// [`Editor::key_context`] reports [`KeyContext::View`] so the matcher routes
-    /// normal-mode keys through the `view` keymap bucket
-    /// ([`Editor::apply_view_action`]) rather than the editing state machine.
-    pub(crate) fn is_view_buffer(&self) -> bool {
-        self.buffer().view.is_some()
-    }
-
     /// `nx.view.create{ name, filetype }` — register view `id` and mint its backing
     /// read-only buffer (marked `view: Some(id)`, with `filetype` applied for
     /// treesitter / decoration). Idempotent: a second create on a live id is a
@@ -55,9 +52,17 @@ impl Editor {
         let mut buf = Buffer::empty();
         buf.view = Some(id);
         let buf_id = self.add_buffer(buf);
-        if !filetype.is_empty() {
-            self.set_filetype(buf_id, &filetype);
-        }
+        // A view's filetype drives treesitter / decoration *and* names the widget for
+        // its `FileType` autocmd; default it to `nxview` (the widget identity) when the
+        // plugin gives none, so `:set ft?` and user `FileType` autocmds see something.
+        // (The view's `<CR>` → `on_select` map is installed server-side at create, not
+        // off the filetype — see the prelude's `nx._install_view_keymaps`.)
+        let filetype = if filetype.is_empty() {
+            "nxview"
+        } else {
+            &filetype
+        };
+        self.set_filetype(buf_id, filetype);
         self.views.insert(
             id,
             ViewState {
@@ -206,56 +211,23 @@ impl Editor {
         }
     }
 
-    /// Apply a named `view` action, dispatched by a `view`-bucket keymap (the
-    /// default maps in `prelude/keymap.lua`, or a user override) while a `nx.view`
-    /// buffer is focused in normal mode. The vertical motions
-    /// (`next`/`prev`/`first`/`last`/`half_down`/`half_up`/`page_down`/`page_up`)
-    /// move the cursor; `confirm` records a `<CR>` select on the cursor line for the
-    /// server to deliver to the view's Lua `on_select`. An unknown name fails loud
-    /// per the no-silent-stub rule. The residual non-map key is `:`/`/`/`?` (handled
-    /// in [`Editor::handle_view_text`]); every other editing key is inert.
+    /// Apply a named `view` action, dispatched by a view buffer-local keymap (the
+    /// default `<CR>` map installed at view creation by `nx._install_view_keymaps`, or
+    /// a plugin override) while a `nx.view` buffer is focused. `confirm` records a
+    /// `<CR>` select on the cursor line for the server to deliver to the view's Lua
+    /// `on_select`. An unknown name fails loud per the no-silent-stub rule. Navigation
+    /// (`j`/`k`/`gg`/`G`…) is ordinary normal-mode motion on the `nomodifiable` view
+    /// now, so `confirm` is the only action here.
     pub fn apply_view_action(&mut self, action: &str) -> Result<(), String> {
         self.message.clear();
-
-        if action == "confirm" {
-            if let Some(id) = self.buffer().view {
-                self.view_selects.push((id, self.cursor.line));
+        match action {
+            "confirm" => {
+                if let Some(id) = self.buffer().view {
+                    self.view_selects.push((id, self.cursor.line));
+                }
+                Ok(())
             }
-            return Ok(());
-        }
-
-        let last = self.last_line();
-        let half = (self.text_height() / 2).max(1);
-        let page = self.text_height().saturating_sub(2).max(1);
-        let cur = self.cursor.line;
-        let line = match action {
-            "next" => (cur + 1).min(last),
-            "prev" => cur.saturating_sub(1),
-            "first" => 0,
-            "last" => last,
-            "half_down" => (cur + half).min(last),
-            "half_up" => cur.saturating_sub(half),
-            "page_down" => (cur + page).min(last),
-            "page_up" => cur.saturating_sub(page),
-            other => return Err(format!("unknown view action {other:?}")),
-        };
-        self.cursor.line = line;
-        self.cursor.col = 0;
-        self.desired_col = 0;
-        self.desired_eol = false;
-        self.ensure_visible();
-        Ok(())
-    }
-
-    /// A view buffer's text fallthrough: the residual non-map key. Only `:`/`/`/`?`
-    /// do anything — they open the command line / search through normal handling
-    /// (each only switches mode, so the content stays intact). Every other key is
-    /// inert: a view is effectively `nomodifiable`. Mirrors
-    /// [`Editor::handle_explorer_text`].
-    pub(crate) fn handle_view_text(&mut self, key: Key) {
-        if matches!(key.as_char(), Some(':') | Some('/') | Some('?')) && !key.ctrl {
-            self.message.clear();
-            self.handle_normal(key);
+            other => Err(format!("unknown view action {other:?}")),
         }
     }
 }

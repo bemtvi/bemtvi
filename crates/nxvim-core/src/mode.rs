@@ -30,9 +30,10 @@ pub enum Mode {
 /// `Editing` context uses the per-mode trie with the command-grammar disambiguation
 /// oracle and the literal-argument bypass; a widget context uses that widget's
 /// dedicated bucket (`vim.keymap.set('picker', …)`) with neither (a widget has no
-/// core command grammar). Each grabbing widget — picker, select, panel, explorer —
-/// has its own context variant below; the cmdline routes through the `'c'` mode
-/// bucket instead.
+/// core command grammar). Each grabbing widget — picker, select, panel — has its own
+/// context variant below; the cmdline routes through the `'c'` mode bucket instead.
+/// The explorer / `nx.view` / quickfix buffers are *not* widgets (they are ordinary
+/// `nomodifiable` buffers with buffer-local activation maps), so they stay `Editing`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum KeyContext {
     /// The buffer — the normal/insert/visual/… per-mode trie applies.
@@ -45,16 +46,6 @@ pub enum KeyContext {
     /// The bottom message / quickfix / location panel grabs input; its `panel`
     /// bucket applies. No query — every key is a map (an unmapped key is inert).
     Panel,
-    /// A directory-listing buffer (the file explorer) owns normal-mode input; its
-    /// `explorer` bucket applies. The one residual non-map key is `:`/`/`/`?`, which
-    /// falls through to the command line; every other unmapped key is inert (the
-    /// listing can't be edited).
-    Explorer,
-    /// A plugin-owned `nx.view` buffer owns normal-mode input; its `view` bucket
-    /// applies. Like [`Explorer`](KeyContext::Explorer): `:`/`/`/`?` fall through to
-    /// the command line, every other unmapped key is inert, and `<CR>` dispatches to
-    /// the view's Lua `on_select`.
-    View,
 }
 
 impl Mode {

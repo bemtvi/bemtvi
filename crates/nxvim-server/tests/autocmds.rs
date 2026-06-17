@@ -176,19 +176,20 @@ async fn get_autocmds_reflects_clear_and_del() {
          _G.keep = vim.api.nvim_create_autocmd('User', { callback = function() end })\n",
     )
     .await;
-    // Scope the query to the two events this test created: the cleared `FileType`
-    // autocmds are gone and only the kept `User` one remains. (Filtering by event
-    // also skips nxvim's built-in autocmds — e.g. vim.treesitter's query-cache
-    // reset on `OptionSet` — which an unfiltered `{}` would now include, exactly
-    // as neovim's own built-ins do.)
+    // Scope the queries to this test's own group / event: group `G` is empty after
+    // the clear (its `FileType` autocmd gone), and the kept `User` autocmd remains.
+    // (An unfiltered or by-event `FileType` query would now also include nxvim's
+    // built-in ftplugin autocmds — `FileType nxdir`/`qf` install the explorer /
+    // quickfix buffer-local maps — exactly as neovim's own built-ins do.)
     let msg = lua_message(
         &rpc,
         &mut incoming,
-        "local a = vim.api.nvim_get_autocmds({ event = { 'FileType', 'User' } }) \
-         print(#a .. ':' .. a[1].event)",
+        "local g = vim.api.nvim_get_autocmds({ group = 'G' }) \
+         local u = vim.api.nvim_get_autocmds({ event = 'User' }) \
+         print(#g .. ':' .. #u .. ':' .. u[1].event)",
     )
     .await;
-    assert_eq!(msg, "1:User");
+    assert_eq!(msg, "0:1:User");
 }
 
 #[tokio::test]

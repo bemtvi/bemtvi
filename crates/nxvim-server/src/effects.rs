@@ -296,18 +296,27 @@ impl EditHost {
                 self.editor.echo(format!("E5108: {e}"));
             }
         }
-        // Explorer actions an `explorer`-bucket keymap fired (`nx._explorer_action`):
-        // apply each to the file-explorer listing. Unknown names fail loud.
+        // Explorer actions a `FileType nxdir` buffer-local keymap fired
+        // (`nx._explorer_action`): apply each to the file-explorer listing (`<CR>`
+        // open / `-` up). Unknown names fail loud.
         for action in self.lua.take_explorer_actions() {
             if let Err(e) = self.editor.apply_explorer_action(&action) {
                 self.editor.echo(format!("E5108: {e}"));
             }
         }
-        // View actions a `view`-bucket keymap fired (`nx._view_action`): apply each
-        // to the focused `nx.view` buffer (navigate / `<CR>` confirm). Unknown names
-        // fail loud.
+        // View actions a view buffer-local keymap fired (`nx._view_action`): apply
+        // each to the focused `nx.view` buffer (`<CR>` confirm). Unknown names fail
+        // loud.
         for action in self.lua.take_view_actions() {
             if let Err(e) = self.editor.apply_view_action(&action) {
+                self.editor.echo(format!("E5108: {e}"));
+            }
+        }
+        // Quickfix actions a `FileType qf` buffer-local keymap fired
+        // (`nx._qf_action`): apply each to the focused quickfix / loclist display
+        // (`<CR>` jump). Unknown names fail loud.
+        for action in self.lua.take_qf_actions() {
+            if let Err(e) = self.editor.apply_qf_action(&action) {
                 self.editor.echo(format!("E5108: {e}"));
             }
         }
@@ -367,7 +376,16 @@ impl EditHost {
         for op in self.lua.take_view_ops() {
             match op {
                 ViewOp::Create { id, name, filetype } => {
-                    self.editor.create_view(id, name, filetype)
+                    self.editor.create_view(id, name, filetype);
+                    // Install the view's buffer-local `<CR>` → on_select map now, off
+                    // the synchronously-known backing bufnr (the view is read-only and
+                    // may never be the current buffer for a `FileType` event, so it
+                    // installs at create rather than via a FileType autocmd).
+                    if let Some(buf) = self.editor.view_buffer(id) {
+                        if let Err(e) = self.lua.install_view_keymaps(buf.0) {
+                            self.editor.echo(format!("E5108: {e}"));
+                        }
+                    }
                 }
                 ViewOp::SetLines { id, lines } => self.editor.set_view_lines(id, lines),
                 ViewOp::MountDock { id, side, size } => {

@@ -1266,6 +1266,13 @@ impl Editor {
             }
         };
         editor.host_fs = fs;
+        // A startup directory opens straight into a listing buffer (above) rather than
+        // through `enter_dir`, so mark it `nxdir` here too — its `FileType nxdir`
+        // autocmd is what installs the explorer's buffer-local `<CR>`/`-` maps.
+        if editor.buffer().dir.is_some() {
+            let buf = editor.cur_buffer();
+            editor.set_filetype(buf, "nxdir");
+        }
         editor
     }
 
@@ -1535,43 +1542,15 @@ impl Editor {
             return;
         }
 
-        // A directory-listing buffer (the file explorer) owns its keys in normal
-        // mode: navigation, `<CR>` to open the entry, `-` to go up. Its nameable
-        // keys route through the `explorer` keymap bucket (the matcher fires them as
-        // `apply_explorer_action` ahead of this), so only an *unmapped* key reaches
-        // here. Editing keys are inert so the listing can't be corrupted; only
-        // `:`/`/`/`?` fall through to open the command line. See
-        // [`Editor::handle_explorer_text`].
-        if self.mode == Mode::Normal && self.is_explorer_buffer() {
-            self.handle_explorer_text(key);
-            return;
-        }
-
-        // A plugin-owned `nx.view` buffer owns its keys in normal mode the same way:
-        // its nameable keys route through the `view` keymap bucket (fired as
-        // `apply_view_action` ahead of this), so only an *unmapped* key reaches here.
-        // Editing keys are inert so the plugin's content can't be corrupted; only
-        // `:`/`/`/`?` fall through. See [`Editor::handle_view_text`].
-        if self.mode == Mode::Normal && self.is_view_buffer() {
-            self.handle_view_text(key);
-            return;
-        }
-
-        // The quickfix window is an ordinary window onto a `nomodifiable` buffer
+        // The explorer (directory listing), `nx.view` surfaces, and the quickfix /
+        // loclist display are all **ordinary `nomodifiable` buffers in a window**
         // (vim's model): every normal-mode key — motions, search, `<C-w>…`, `:` —
-        // flows through unchanged, and edits are refused with `E21` at the
-        // `modifiable()` chokepoints. The one special key is `<CR>`, which jumps to
-        // the entry on the cursor's line (vim's buffer-local quickfix mapping).
-        if self.mode == Mode::Normal
-            && self.is_quickfix_buffer()
-            && self.pending.is_clean()
-            && key.code == KeyCode::Enter
-        {
-            if let Some(which) = self.qf_context_of_buffer(self.current_buffer_id()) {
-                self.qf_jump_to_index(which, self.cursor.line);
-            }
-            return;
-        }
+        // flows through unchanged here, and edits are refused with `E21` at the
+        // `modifiable()` chokepoints. Their one or two special keys (`<CR>` to open /
+        // confirm / jump, `-` to go up) are ordinary **buffer-local default keymaps**
+        // installed by a `FileType` autocmd (the `nxdir` / `qf` / `nxview` ftplugin
+        // model), overridable the standard way — not special-cased in this loop. See
+        // docs/plans/2026-06-16-unify-special-buffer-kinds.md.
 
         // The mode-independent `<C-w><C-w>` dock-navigation chord, ahead of the
         // per-mode routing below so it reaches the docks from *any* mode — insert,

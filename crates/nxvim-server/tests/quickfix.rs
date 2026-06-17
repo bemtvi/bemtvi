@@ -247,6 +247,38 @@ async fn enter_in_qf_window_jumps_to_the_entry() {
     assert_eq!(cursor(&rpc).await.0, 2, "landed on the entry's line");
 }
 
+/// Post-unification, the quickfix `<CR>` is an ordinary buffer-local default map (a
+/// `FileType qf` autocmd), so it is **rebindable** for the first time: a user can map
+/// `<CR>` to something else, or bind the jump to another key, with an ordinary
+/// buffer-local map. Here `o` is bound to the jump action and jumps like `<CR>`.
+#[tokio::test]
+async fn quickfix_enter_is_rebindable() {
+    let (rpc, mut incoming) = start().await;
+    exec_lua(
+        &rpc,
+        "nx.autocmd.create('FileType', { pattern = 'qf', callback = function(a)\n\
+           nx.keymap.set('n', 'o', nx.qf.actions.jump, { buffer = a.buf })\n\
+         end })",
+    )
+    .await;
+    let path = write_temp("qf_rebind", "txt", "one\ntwo\nthree\n");
+    exec_lua(
+        &rpc,
+        &format!(
+            r#"vim.fn.setqflist({{ {{ filename = "{path}", lnum = 3, col = 1, text = "x" }} }}, " ")"#
+        ),
+    )
+    .await;
+    message_after(&rpc, &mut incoming, ":copen<CR>").await;
+    message_after(&rpc, &mut incoming, "o").await; // the rebound jump key
+    assert_eq!(
+        buf_name(&rpc).await,
+        path,
+        "the rebound `o` jumped to the file"
+    );
+    assert_eq!(cursor(&rpc).await.0, 3, "landed on the entry's line");
+}
+
 #[tokio::test]
 async fn cc_and_cnext_navigate_entries() {
     let (rpc, mut incoming) = start().await;

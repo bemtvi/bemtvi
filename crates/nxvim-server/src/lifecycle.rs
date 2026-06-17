@@ -69,6 +69,7 @@ impl EditHost {
         self.editor
             .load_bytes_into(buffer, Some(path.clone()), bytes);
         self.announced.remove(&buffer);
+        self.fired_filetype.remove(&buffer);
         let ft = filetype_of(Some(Path::new(&path))).unwrap_or("");
         let _ = self.lua.set_buf_snapshot(buffer.0, &path, ft);
         self.push_buf_mirror();
@@ -93,6 +94,7 @@ impl EditHost {
         self.editor
             .load_dir_into(buffer, PathBuf::from(&dir), entries);
         self.announced.remove(&buffer);
+        self.fired_filetype.remove(&buffer);
         let _ = self.lua.set_buf_snapshot(buffer.0, &dir, "");
         self.push_buf_mirror();
         self.emit_lifecycle_events();
@@ -135,6 +137,13 @@ impl EditHost {
         let wins = self.editor.window_ids();
 
         let unannounced = !self.announced.contains(&buf);
+        // FileType fires on the buffer's first announce *and* whenever its filetype
+        // changes (neovim's `:setfiletype` behavior) — including an in-place buffer
+        // reuse across kinds (throwaway → `nxdir` listing, file → directory), which
+        // keeps the same id and so stays "announced". Tracked separately from
+        // `announced` (which gates the once-only `BufReadPost`).
+        let cur_ft = self.editor.buffer_filetype(buf);
+        let ft_changed = self.fired_filetype.get(&buf) != Some(&cur_ft);
         let entered = self.last_buffer_id != Some(buf);
         // A transition *into* insert (or replace — neovim fires InsertEnter for
         // both), measured against the last diff so staying in insert won't re-fire.
@@ -196,6 +205,7 @@ impl EditHost {
         let tab_changed = self.last_tab_id != Some(cur_tab);
 
         if !unannounced
+            && !ft_changed
             && !entered
             && !entered_insert
             && new_wins.is_empty()
@@ -249,17 +259,29 @@ impl EditHost {
         let name = self.editor.buffer_name(buf).unwrap_or_default();
         let file_backed = !name.is_empty();
 
-        // Fire-once per buffer, file-backed only: BufReadPost then FileType.
+        // Fire-once per buffer (gated by `announced`): BufReadPost — file-backed
+        // only, a `[No Name]`/scratch buffer was never read.
         if unannounced {
             self.announced.insert(buf);
             if file_backed {
                 self.fire_lifecycle("BufReadPost", &name, buf, &name);
-                // FileType's pattern is the filetype derived from the path; skip
-                // it entirely when nothing is detected (matching neovim).
-                if let Some(ft) = filetype_of(self.editor.buffer().path.as_deref()) {
-                    self.fire_lifecycle("FileType", ft, buf, &name);
-                }
             }
+        }
+
+        // FileType, on first set and on every filetype *change* (see `ft_changed`).
+        // The pattern is the buffer's filetype — an explicit one (`:set ft`,
+        // `nx.bo.filetype`, or a core-created special buffer's `set_filetype`: the
+        // explorer's `nxdir`, the quickfix display's `qf`, a view's `nxview`/content
+        // ft) wins; otherwise the path's extension decides. `None` (an extension-less
+        // `[No Name]`) skips firing, matching neovim. It fires for non-file-backed
+        // buffers too, so a core-created special buffer's `FileType <ft>` autocmd
+        // installs its buffer-local maps (the unified special-buffer model — see
+        // docs/plans/2026-06-16-unify-special-buffer-kinds.md).
+        if ft_changed {
+            if let Some(ft) = &cur_ft {
+                self.fire_lifecycle("FileType", ft, buf, &name);
+            }
+            self.fired_filetype.insert(buf, cur_ft);
         }
 
         // Fire-every on entry: BufEnter, for both file-backed and [No Name].
@@ -318,6 +340,7 @@ impl EditHost {
                     .echo(format!("E5108: Error cleaning up buffer {}: {e}", b.0));
             }
             self.announced.remove(b);
+            self.fired_filetype.remove(b);
         }
         self.known_buffers = live_bufs;
 

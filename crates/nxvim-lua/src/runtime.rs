@@ -549,10 +549,14 @@ pub(crate) struct Shared {
     /// `Editor::apply_explorer_action` — the rebindable file-explorer keys (open /
     /// up / next / prev / first / last / half + page scroll).
     pub(crate) explorer_actions: Vec<String>,
-    /// Named `view` actions a `view`-bucket keymap fired (`nx._view_action`),
-    /// drained by the server into `Editor::apply_view_action` — the rebindable
-    /// `nx.view` keys (next / prev / first / last / half + page scroll / confirm).
+    /// Named `view` actions a view buffer-local keymap fired (`nx._view_action`),
+    /// drained by the server into `Editor::apply_view_action` — the `nx.view`
+    /// activation key (`confirm`).
     pub(crate) view_actions: Vec<String>,
+    /// Named `qf` actions a `FileType qf` buffer-local keymap fired
+    /// (`nx._qf_action`), drained by the server into `Editor::apply_qf_action` — the
+    /// quickfix / loclist activation key (`jump`).
+    pub(crate) qf_actions: Vec<String>,
     /// Named `cmdline` actions a `cmdline`-bucket (`'c'`) keymap fired
     /// (`nx._cmdline_action`), drained by the server into `Editor::apply_cmdline_action`
     /// — the rebindable command-line keys (cancel / submit / backspace / delete /
@@ -1120,9 +1124,16 @@ impl LuaRuntime {
     }
 
     take_queue! {
-        /// Take the named `view` actions a `view`-bucket keymap fired, for the server
-        /// to apply to the focused `nx.view` via `Editor::apply_view_action`.
+        /// Take the named `view` actions a view buffer-local keymap fired, for the
+        /// server to apply to the focused `nx.view` via `Editor::apply_view_action`.
         take_view_actions -> Vec<String> = view_actions
+    }
+
+    take_queue! {
+        /// Take the named `qf` actions a `FileType qf` buffer-local keymap fired, for
+        /// the server to apply to the focused quickfix display via
+        /// `Editor::apply_qf_action`.
+        take_qf_actions -> Vec<String> = qf_actions
     }
 
     take_queue! {
@@ -1545,6 +1556,19 @@ impl LuaRuntime {
         if let Some(f) = cb {
             f.call::<()>((line.to_string(), index as i64 + 1))?;
         }
+        Ok(())
+    }
+
+    /// Install view buffer `bufnr`'s buffer-local default activation map (`<CR>` →
+    /// `on_select`) by calling the prelude `nx._install_view_keymaps`. The server
+    /// calls this right after [`Editor::create_view`](nxvim_core::Editor) mints the
+    /// backing buffer — the bufnr is known synchronously in core, so the map exists
+    /// before the user can reach the view (no dependence on the next-tick mirror or on
+    /// the view ever becoming the current buffer for a `FileType` event).
+    pub fn install_view_keymaps(&self, bufnr: u64) -> mlua::Result<()> {
+        let nx = self.nx()?;
+        let f: mlua::Function = nx.get("_install_view_keymaps")?;
+        f.call::<()>(bufnr)?;
         Ok(())
     }
 

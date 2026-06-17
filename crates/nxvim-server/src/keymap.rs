@@ -83,7 +83,7 @@ impl MatchScope {
     /// The readable mode code reported to the [`KeyPending`] event (which-key) — the
     /// editor mode's short code for an editing scope, or the widget's keymap mode
     /// name for a widget scope, so a which-key consumer can tell it is showing a
-    /// picker / select / panel / explorer key table. The widget arm is the inverse of
+    /// picker / select / panel key table. The widget arm is the inverse of
     /// [`mode_buckets`] / [`widget_bucket`] and must stay in sync with them.
     pub fn mode_code(self) -> &'static str {
         match self {
@@ -91,8 +91,6 @@ impl MatchScope {
             MatchScope::Widget('P') => "picker",
             MatchScope::Widget('S') => "select",
             MatchScope::Widget('L') => "panel",
-            MatchScope::Widget('E') => "explorer",
-            MatchScope::Widget('W') => "view",
             MatchScope::Widget(_) => "",
         }
     }
@@ -108,8 +106,6 @@ pub fn widget_bucket(ctx: KeyContext) -> Option<char> {
         KeyContext::Picker => Some('P'),
         KeyContext::Select => Some('S'),
         KeyContext::Panel => Some('L'),
-        KeyContext::Explorer => Some('E'),
-        KeyContext::View => Some('W'),
     }
 }
 
@@ -797,12 +793,12 @@ fn mode_buckets(code: &str) -> &'static [char] {
         // ('picker', …)` lands here, and the matcher selects it via a `Widget` scope
         // while that widget grabs input (see [`widget_bucket`]). Distinct from every
         // editor-mode bucket above so widget maps never leak into editing and vice
-        // versa. picker / select / panel / explorer; cmdline reuses the `c` bucket.
+        // versa. picker / select / panel; cmdline reuses the `c` bucket. (The
+        // explorer / `nx.view` / quickfix buffers are ordinary buffers with
+        // buffer-local maps, not widget buckets — see the unify-special-buffers plan.)
         "picker" => &['P'],
         "select" => &['S'],
         "panel" => &['L'],
-        "explorer" => &['E'],
-        "view" => &['W'],
         // The command line reuses the existing command-mode bucket (`mode_key(Mode::
         // Command) == 'c'`); `cmdline` is just the readable alias for it, so its
         // default maps and a user `set('c', …)` compile into the same trie.

@@ -463,106 +463,63 @@ for _, m in ipairs({
   nx.keymap.set("panel", m[1], nx.panel.actions[m[2]], { default = true, desc = m[3] })
 end
 
--- ----- rebindable explorer keys ---------------------------------------------
--- The file-explorer (directory-listing) buffer is driven through the keymap
--- engine, NOT a hardcoded grab: the server selects the `explorer` bucket while a
--- listing is focused in normal mode, so navigation / open / up are configurable
--- with `nx.keymap.set('explorer', '<key>', nx.explorer.actions.<name>)`. Each
--- action fires through the engine (nx._explorer_action ->
--- Editor::apply_explorer_action). The listing's ONE residual non-map key is
--- `:`/`/`/`?` (it falls through to the command line); every other unmapped key is
--- inert, so the listing can't be corrupted.
+-- ----- the explorer / quickfix activation maps (vim's ftplugin model) -------
+-- The file-explorer listing (`filetype=nxdir`) and the quickfix / loclist display
+-- (`filetype=qf`) are ordinary `nomodifiable` buffers in a window: `j`/`k`/`gg`/`G`/
+-- `/`/`:`/`<C-w>` are plain normal-mode motions on them (edits refused at the
+-- `modifiable()` chokepoints). Only their *activation* keys are special, and those
+-- are ordinary BUFFER-LOCAL default keymaps installed by a `FileType` autocmd — vim's
+-- ftplugin model — overridable the standard way with
+-- `nx.keymap.set('n', lhs, rhs, { buffer = 0 })` (or per-buffer in your own FileType
+-- autocmd). Each action fires the existing native bridge (nx._explorer_action /
+-- nx._qf_action -> Editor::apply_*_action). (`nx.view`'s `<CR>` is installed the same
+-- way, but at create time — see prelude/view.lua.) See
+-- docs/plans/2026-06-16-unify-special-buffer-kinds.md.
 nx.explorer = nx.explorer or {}
 nx.explorer.actions = nx.explorer.actions or {}
-for _, name in ipairs({
-  "open",
-  "up",
-  "next",
-  "prev",
-  "first",
-  "last",
-  "half_down",
-  "half_up",
-  "page_down",
-  "page_up",
-}) do
+for _, name in ipairs({ "open", "up" }) do
   nx.explorer.actions[name] = function()
     nx._explorer_action(name)
   end
 end
 
--- The default explorer bindings — `default = true`, so a user override wins and an
--- empty-function map disables a key. `gg` is a two-key default map. These mirror
--- the keys the explorer used to hardcode.
-for _, m in ipairs({
-  { "<CR>", "open", "Open entry" },
-  { "-", "up", "Parent directory" },
-  { "j", "next", "Next entry" },
-  { "<Down>", "next", "Next entry" },
-  { "k", "prev", "Previous entry" },
-  { "<Up>", "prev", "Previous entry" },
-  { "gg", "first", "First entry" },
-  { "<Home>", "first", "First entry" },
-  { "G", "last", "Last entry" },
-  { "<End>", "last", "Last entry" },
-  { "<C-d>", "half_down", "Half-page down" },
-  { "<C-u>", "half_up", "Half-page up" },
-  { "<C-f>", "page_down", "Page down" },
-  { "<PageDown>", "page_down", "Page down" },
-  { "<C-b>", "page_up", "Page up" },
-  { "<PageUp>", "page_up", "Page up" },
-}) do
-  nx.keymap.set("explorer", m[1], nx.explorer.actions[m[2]], { default = true, desc = m[3] })
+nx.qf = nx.qf or {}
+nx.qf.actions = nx.qf.actions or {}
+nx.qf.actions.jump = function()
+  nx._qf_action("jump")
 end
 
--- ----- rebindable nx.view keys ----------------------------------------------
--- A plugin-owned `nx.view` buffer (the dockable file-tree / list surface) is
--- driven through the keymap engine, exactly like the explorer: the server selects
--- the `view` bucket while a view is focused in normal mode, so navigation and
--- `<CR>` are configurable with `nx.keymap.set('view', '<key>', nx.view.actions
--- .<name>)`. Each action fires through the engine (nx._view_action ->
--- Editor::apply_view_action); `confirm` records the cursor line for the view's
--- `on_select`. `:`/`/`/`?` fall through to the command line; every other unmapped
--- key is inert, so the plugin's content can't be edited.
-nx.view = nx.view or {}
-nx.view.actions = nx.view.actions or {}
-for _, name in ipairs({
-  "confirm",
-  "next",
-  "prev",
-  "first",
-  "last",
-  "half_down",
-  "half_up",
-  "page_down",
-  "page_up",
-}) do
-  nx.view.actions[name] = function()
-    nx._view_action(name)
-  end
-end
+-- `default = true` so a user/plugin map on the same key wins; `buffer = args.buf`
+-- scopes each map to the just-typed special buffer only.
+nx.autocmd.create("FileType", {
+  pattern = "nxdir",
+  callback = function(args)
+    nx.keymap.set(
+      "n",
+      "<CR>",
+      nx.explorer.actions.open,
+      { buffer = args.buf, default = true, desc = "Open entry" }
+    )
+    nx.keymap.set(
+      "n",
+      "-",
+      nx.explorer.actions.up,
+      { buffer = args.buf, default = true, desc = "Parent directory" }
+    )
+  end,
+})
 
--- The default view bindings — `default = true`, so a user override wins and an
--- empty-function map disables a key.
-for _, m in ipairs({
-  { "<CR>", "confirm", "Select entry" },
-  { "j", "next", "Next entry" },
-  { "<Down>", "next", "Next entry" },
-  { "k", "prev", "Previous entry" },
-  { "<Up>", "prev", "Previous entry" },
-  { "gg", "first", "First entry" },
-  { "<Home>", "first", "First entry" },
-  { "G", "last", "Last entry" },
-  { "<End>", "last", "Last entry" },
-  { "<C-d>", "half_down", "Half-page down" },
-  { "<C-u>", "half_up", "Half-page up" },
-  { "<C-f>", "page_down", "Page down" },
-  { "<PageDown>", "page_down", "Page down" },
-  { "<C-b>", "page_up", "Page up" },
-  { "<PageUp>", "page_up", "Page up" },
-}) do
-  nx.keymap.set("view", m[1], nx.view.actions[m[2]], { default = true, desc = m[3] })
-end
+nx.autocmd.create("FileType", {
+  pattern = "qf",
+  callback = function(args)
+    nx.keymap.set(
+      "n",
+      "<CR>",
+      nx.qf.actions.jump,
+      { buffer = args.buf, default = true, desc = "Jump to entry" }
+    )
+  end,
+})
 
 -- ----- rebindable command-line keys -----------------------------------------
 -- The command line (`:` ex, `/`,`?` search, `vim.ui.input` prompt) is driven

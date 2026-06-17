@@ -2102,9 +2102,11 @@ pub(crate) fn install_runtime_api(
             Ok(())
         })?,
     )?;
-    // `nx._explorer_action(name)`: an `explorer`-bucket keymap fired the named action
-    // (open / up / next / prev / first / last / half + page scroll) on the file
-    // explorer listing; the server applies it via `Editor::apply_explorer_action`.
+    // `nx._explorer_action(name)`: a `FileType nxdir` buffer-local keymap fired the
+    // named action (`open` / `up`) on the file-explorer listing; the server applies
+    // it via `Editor::apply_explorer_action`. (Navigation is ordinary normal-mode
+    // motion now — the listing is a `nomodifiable` buffer — so only the activation
+    // keys cross.)
     let sh = shared.clone();
     nx.set(
         "_explorer_action",
@@ -2113,14 +2115,26 @@ pub(crate) fn install_runtime_api(
             Ok(())
         })?,
     )?;
-    // `nx._view_action(name)`: a `view`-bucket keymap fired the named action
-    // (next / prev / first / last / half + page scroll / confirm) on the focused
-    // `nx.view` buffer; the server applies it via `Editor::apply_view_action`.
+    // `nx._view_action(name)`: a view buffer-local keymap fired the named action
+    // (`confirm`) on the focused `nx.view` buffer; the server applies it via
+    // `Editor::apply_view_action`. (Navigation is ordinary normal-mode motion now.)
     let sh = shared.clone();
     nx.set(
         "_view_action",
         lua.create_function(move |_, name: String| {
             sh.borrow_mut().view_actions.push(name);
+            Ok(())
+        })?,
+    )?;
+    // `nx._qf_action(name)`: a `FileType qf` buffer-local keymap fired the named
+    // action (`jump`) on the focused quickfix / location-list display buffer; the
+    // server applies it via `Editor::apply_qf_action`. This carries vim's
+    // buffer-local quickfix `<CR>` (formerly a hard-coded `input()` branch).
+    let sh = shared.clone();
+    nx.set(
+        "_qf_action",
+        lua.create_function(move |_, name: String| {
+            sh.borrow_mut().qf_actions.push(name);
             Ok(())
         })?,
     )?;

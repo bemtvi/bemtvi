@@ -2,14 +2,18 @@
 //!
 //! Opening a directory (`nxvim .`, `:e somedir`, `<CR>` on a listed sub-directory)
 //! builds a read-only [`Buffer`] whose lines are the directory's entries (see
-//! [`Buffer::from_dir`]). Such a buffer carries `dir: Some(path)`, which makes
-//! [`Editor::input`] route its normal-mode keys here instead of through the
-//! editing grammar: the listing navigates and opens entries but can never be
-//! edited, so it stays a faithful picture of the filesystem.
+//! [`Buffer::from_dir`]). Such a buffer carries `dir: Some(path)`, so
+//! [`Buffer::read_only`] is true and edits are refused at the
+//! [`modifiable`](Editor::modifiable) chokepoints — the listing stays a faithful
+//! picture of the filesystem. It is otherwise an **ordinary buffer in a window**
+//! (vim's netrw model): `j`/`k`/`gg`/`G`/`/`/`:` are ordinary normal-mode motions,
+//! and its two activation keys — `<CR>` (open) and `-` (parent), via
+//! [`apply_explorer_action`](Editor::apply_explorer_action) — are **buffer-local
+//! default keymaps** installed by the `FileType nxdir` autocmd, not a special
+//! `input()` branch. See docs/plans/2026-06-16-unify-special-buffer-kinds.md.
 
 use super::*;
 use crate::buffer::Buffer;
-use crate::input::Key;
 use std::path::Path;
 
 impl Editor {
@@ -43,6 +47,10 @@ impl Editor {
                 self.switch_buffer(id);
                 id
             };
+            // Mark it `nxdir` now (before the off-tick fill) so the `FileType nxdir`
+            // autocmd fires while the buffer is current — `load_dir_into` re-sets it
+            // when the entries land, but by then the buffer is already announced.
+            self.set_filetype(buf, "nxdir");
             self.enqueue_open(buf, path.to_path_buf());
             return;
         }
@@ -76,60 +84,34 @@ impl Editor {
                     let id = self.add_buffer(buf);
                     self.switch_buffer(id);
                 }
+                // `filetype=nxdir` so the `FileType nxdir` autocmd installs the
+                // explorer's buffer-local `<CR>`/`-` maps (the unified model).
+                self.set_filetype(self.cur_buffer(), "nxdir");
                 self.explorer_goto(0);
             }
             Err(e) => self.echo(e.to_string()),
         }
     }
 
-    /// Apply a named `explorer` action, dispatched by an `explorer`-bucket keymap
-    /// (the default maps in `prelude/keymap.lua`, or a user override) while a
-    /// directory-listing buffer is focused in normal mode. `open` opens the entry
+    /// Apply a named `explorer` action, dispatched by a `FileType nxdir` buffer-local
+    /// keymap (the default `<CR>`/`-` maps in `prelude/keymap.lua`, or a user
+    /// override) while a directory-listing buffer is focused. `open` opens the entry
     /// under the cursor — a file is edited, a sub-directory is listed in place — and
-    /// `up` goes to the parent. The vertical motions (`next`/`prev`/`first`/`last`/
-    /// `half_down`/`half_up`/`page_down`/`page_up`) move the selection. An unknown
-    /// name fails loud per the no-silent-stub rule. The listing's residual non-map
-    /// key is `:`/`/`/`?` (handled in [`Editor::handle_explorer_text`]); every other
-    /// editing key is inert, so the listing can't be corrupted.
+    /// `up` goes to the parent. An unknown name fails loud per the no-silent-stub
+    /// rule. Navigation (`j`/`k`/`gg`/`G`/`<C-d>`…) is ordinary normal-mode motion on
+    /// the `nomodifiable` listing now, so only the activation keys are actions here.
     pub fn apply_explorer_action(&mut self, action: &str) -> Result<(), String> {
         self.message.clear();
-
-        let last = self.last_line();
-        let half = (self.text_height() / 2).max(1);
-        let page = self.text_height().saturating_sub(2).max(1);
-        let cur = self.cursor.line;
-
         match action {
             "open" => self.explorer_open_entry(),
             "up" => self.explorer_up(),
-            "next" => self.explorer_goto((cur + 1).min(last)),
-            "prev" => self.explorer_goto(cur.saturating_sub(1)),
-            "first" => self.explorer_goto(0),
-            "last" => self.explorer_goto(last),
-            "half_down" => self.explorer_goto((cur + half).min(last)),
-            "half_up" => self.explorer_goto(cur.saturating_sub(half)),
-            "page_down" => self.explorer_goto((cur + page).min(last)),
-            "page_up" => self.explorer_goto(cur.saturating_sub(page)),
             other => return Err(format!("unknown explorer action {other:?}")),
         }
         Ok(())
     }
 
-    /// The explorer's text fallthrough: the residual non-map key on a listing. Only
-    /// `:`/`/`/`?` do anything — they open the command line / search through normal
-    /// handling (each is a single key that only switches mode, so the listing stays
-    /// intact and `:q` / `:e file` / `/pattern` behave exactly as in any buffer).
-    /// Every other key is inert: the listing is effectively `nomodifiable`, so it
-    /// can't be corrupted.
-    pub(crate) fn handle_explorer_text(&mut self, key: Key) {
-        if matches!(key.as_char(), Some(':') | Some('/') | Some('?')) && !key.ctrl {
-            self.message.clear();
-            self.handle_normal(key);
-        }
-    }
-
     /// Move the listing selection to `line` (clamped), resting at column 0 and
-    /// scrolling it into view. The explorer's one cursor primitive.
+    /// scrolling it into view. Used when (re)opening a listing to land on the top.
     fn explorer_goto(&mut self, line: usize) {
         self.cursor.line = line.min(self.last_line());
         self.cursor.col = 0;

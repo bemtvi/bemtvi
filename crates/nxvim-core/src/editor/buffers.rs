@@ -607,6 +607,9 @@ impl Editor {
         ob.undo = UndoTree::new(&ob.buffer);
         ob.saved_seq = Some(ob.undo.cur_seq());
         ob.buffer.mark_resync();
+        // The listing is `filetype=nxdir` (the explorer widget identity), so its
+        // `FileType nxdir` autocmd installs the buffer-local `<CR>`/`-` maps.
+        self.set_filetype(buffer, "nxdir");
         if is_current {
             self.cursor = Cursor::default();
             self.top = 0;

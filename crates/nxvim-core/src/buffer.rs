@@ -158,20 +158,21 @@ pub struct Buffer {
     pub changelistidx: usize,
     /// When `Some(dir)`, this buffer is a **directory listing** — nxvim's
     /// in-window file explorer (vim's netrw), not an editable text file. `dir` is
-    /// the canonical absolute path being listed; the editor routes its keys through
-    /// the `explorer` keymap bucket to
-    /// [`crate::editor::Editor::apply_explorer_action`] (open the entry / go up) and
-    /// otherwise keeps the listing inert. Built by [`Buffer::from_dir`]; `None`
-    /// for every ordinary file/scratch buffer.
+    /// the canonical absolute path being listed. It is an ordinary `nomodifiable`
+    /// buffer (this marker makes [`Buffer::read_only`] true, refusing edits at the
+    /// chokepoints); its activation keys (`<CR>` open / `-` parent →
+    /// [`crate::editor::Editor::apply_explorer_action`]) are buffer-local maps on its
+    /// `nxdir` filetype. Built by [`Buffer::from_dir`]; `None` for every ordinary
+    /// file/scratch buffer.
     pub dir: Option<PathBuf>,
     /// `Some(view_id)` when this buffer backs a **plugin-owned view** (`nx.view`) —
     /// a read-only, plugin-controlled content surface (the file-tree / list widget
-    /// generalization of the bottom panel), not an editable text file. The editor
-    /// routes its normal-mode keys through the `view` keymap bucket to
-    /// [`crate::editor::Editor::apply_view_action`] (navigate / `<CR>` select) and
-    /// otherwise keeps the content inert. The id is the Lua-allocated handle id the
-    /// view's `set_lines` / `mount` / `on_select` address it by. `None` for every
-    /// ordinary file/scratch/directory buffer.
+    /// generalization of the bottom panel), not an editable text file. It is an
+    /// ordinary `nomodifiable` buffer (this marker makes [`Buffer::read_only`] true);
+    /// its `<CR>` → [`crate::editor::Editor::apply_view_action`] `on_select` is a
+    /// buffer-local map installed at view creation. The id is the Lua-allocated handle
+    /// id the view's `set_lines` / `mount` / `on_select` address it by. `None` for
+    /// every ordinary file/scratch/directory buffer.
     pub view: Option<u64>,
     /// When `true`, this buffer hosts a **terminal job** — its lines mirror a live
     /// PTY child's screen (and scrollback), pushed in by the server's terminal

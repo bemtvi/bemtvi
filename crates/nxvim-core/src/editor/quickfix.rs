@@ -415,6 +415,26 @@ impl Editor {
             .is_some()
     }
 
+    /// Apply a named `qf` action, dispatched by a `FileType qf` buffer-local keymap
+    /// (the default `<CR>` map in `prelude/keymap.lua`, or a user override) while a
+    /// quickfix / location-list display buffer is focused. `jump` jumps to the entry
+    /// on the cursor's line — vim's buffer-local quickfix `<CR>` mapping, now an
+    /// ordinary (overridable) buffer-local map rather than a hard-coded `input()`
+    /// branch. An unknown name fails loud per the no-silent-stub rule. The display
+    /// buffer is otherwise an ordinary `nomodifiable` window (motions / search / `:`
+    /// flow through, edits refused at the `modifiable()` chokepoints).
+    pub fn apply_qf_action(&mut self, action: &str) -> Result<(), String> {
+        match action {
+            "jump" => {
+                if let Some(which) = self.qf_context_of_buffer(self.current_buffer_id()) {
+                    self.qf_jump_to_index(which, self.cursor.line);
+                }
+                Ok(())
+            }
+            other => Err(format!("unknown quickfix action {other:?}")),
+        }
+    }
+
     /// Buffer `buf`'s **buftype** — vim's buffer-kind noun, as the string the
     /// `buftype` option reports. nxvim models the kinds it actually distinguishes:
     /// `"quickfix"` for a quickfix **or** location-list display buffer (both report
@@ -516,6 +536,11 @@ impl Editor {
         };
         if needs_buf {
             let id = self.add_buffer(Buffer::empty());
+            // vim's quickfix/loclist display buffer is `filetype=qf`. Setting it
+            // makes its `FileType qf` autocmd fire (installing the buffer-local
+            // `<CR>` jump map — the unified special-buffer model) and `:set ft?`
+            // report `qf`, exactly as in vim.
+            self.set_filetype(id, "qf");
             self.qf_set_display_bufnr(which, Some(id));
         }
         self.qf_refresh_window(which);

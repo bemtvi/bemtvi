@@ -556,9 +556,17 @@ pub struct EditHost {
     /// `None` until the startup seed. A change here means a `BufEnter` (fired on
     /// every entry).
     last_buffer_id: Option<BufferId>,
-    /// Buffers that have already had their fire-once events (`BufReadPost` /
-    /// `FileType`) emitted, so re-entering them doesn't re-announce.
+    /// Buffers that have already had their fire-once `BufReadPost` emitted, so
+    /// re-entering them doesn't re-announce.
     announced: HashSet<BufferId>,
+    /// The `FileType` pattern last fired for each buffer (`None` = none fired yet).
+    /// `FileType` is tracked separately from [`announced`](Self::announced) because,
+    /// unlike `BufReadPost`, it re-fires whenever a buffer's filetype *changes*
+    /// (neovim's `:setfiletype` behavior) — in particular when a window reuses one
+    /// buffer in place across kinds (a throwaway `[No Name]` → an `nxdir` listing, a
+    /// file → a directory), which keeps the same buffer id and so stays "announced".
+    /// That re-fire is what installs the explorer / quickfix buffer-local maps.
+    fired_filetype: HashMap<BufferId, Option<String>>,
     /// Every buffer id present at the last lifecycle diff. Ids gone since (a
     /// `:bdelete` / `nvim_buf_delete`) have their Lua-side buffer-local state
     /// (commands, keymaps) purged so a reused bufnr can't inherit it.
@@ -813,6 +821,7 @@ impl EditHost {
             statusline_layout_key: None,
             last_buffer_id: None,
             announced: HashSet::new(),
+            fired_filetype: HashMap::new(),
             known_buffers: Vec::new(),
             last_mode: Mode::Normal,
             last_window_id: None,
@@ -1140,6 +1149,7 @@ impl EditHost {
         self.editor
             .load_bytes_into(buffer, Some(path.clone()), bytes);
         self.announced.remove(&buffer);
+        self.fired_filetype.remove(&buffer);
         let ft = filetype_of(Some(Path::new(&path))).unwrap_or("");
         let _ = self.lua.set_buf_snapshot(buffer.0, &path, ft);
         self.push_buf_mirror();
@@ -1185,6 +1195,7 @@ impl EditHost {
         self.editor
             .load_dir_into(buffer, PathBuf::from(&dir), entries);
         self.announced.remove(&buffer);
+        self.fired_filetype.remove(&buffer);
         let _ = self.lua.set_buf_snapshot(buffer.0, &dir, "");
         self.push_buf_mirror();
         self.emit_lifecycle_events();

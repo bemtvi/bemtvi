@@ -377,7 +377,10 @@ async fn panel_editing_map_does_not_leak() {
     );
 }
 
-// ===== Phase 3b: the file explorer (the 'explorer' bucket) ====================
+// ===== the file explorer (an ordinary nomodifiable buffer + buffer-local maps) =
+// Post-unification (docs/plans/2026-06-16-unify-special-buffer-kinds.md): the
+// listing is `filetype=nxdir`, navigation is plain normal-mode motion, and `<CR>`
+// open / `-` parent are buffer-local default maps from the `FileType nxdir` autocmd.
 
 /// A temp directory with two files and one sub-directory, opened as the explorer in
 /// a fresh server. The listing is `../`, `sub/`, `alpha.txt`, `beta.txt` (up entry,
@@ -400,8 +403,8 @@ async fn open_explorer(init_lua: &str) -> (Rpc, UnboundedReceiver<Incoming>) {
     (rpc, incoming)
 }
 
-/// The default explorer keys still navigate + open through the keymap engine: `jj`
-/// moves to `alpha.txt` (row 2) and `<CR>` opens it.
+/// `jj` (ordinary normal motion) moves to `alpha.txt` (row 3) and the buffer-local
+/// `<CR>` default map (from the `FileType nxdir` autocmd) opens it.
 #[tokio::test]
 async fn explorer_default_keys_navigate_and_open() {
     let (rpc, _incoming) = open_explorer("").await;
@@ -410,8 +413,8 @@ async fn explorer_default_keys_navigate_and_open() {
     assert_eq!(lines(&rpc).await, vec!["alpha-body"]);
 }
 
-/// `gg` is a two-key `explorer` default map: from the last row it jumps to the
-/// first (the `../` up entry).
+/// `gg`/`G` are ordinary normal-mode motions on the listing now (not explorer-bucket
+/// maps): `G` goes to the last row, `gg` back to the first (`../`).
 #[tokio::test]
 async fn explorer_gg_jumps_to_first() {
     let (rpc, _incoming) = open_explorer("").await;
@@ -421,17 +424,23 @@ async fn explorer_gg_jumps_to_first() {
     assert_eq!(cursor(&rpc).await.0, 1, "gg jumped to the first entry");
 }
 
-/// A user `nx.keymap.set('explorer', …)` rebinds an explorer action to a new key:
-/// `<C-j>` jumps to the last entry even though it is not a default explorer key.
+/// The new model: rebind / extend the explorer with an ordinary **buffer-local**
+/// map in a `FileType nxdir` autocmd (vim's ftplugin model), not a widget bucket.
+/// Here `<C-j>` is bound to `open`, so `jj<C-j>` opens `alpha.txt` like `<CR>` would.
 #[tokio::test]
 async fn explorer_user_rebind() {
-    let (rpc, _incoming) =
-        open_explorer("nx.keymap.set('explorer', '<C-j>', nx.explorer.actions.last)").await;
-    feed(&rpc, "<C-j>");
+    let (rpc, _incoming) = open_explorer(
+        "nx.autocmd.create('FileType', { pattern = 'nxdir', callback = function(a)\n\
+         \x20 nx.keymap.set('n', '<C-j>', nx.explorer.actions.open, { buffer = a.buf })\n\
+         end })",
+    )
+    .await;
+    feed(&rpc, "jj<C-j>");
+    barrier(&rpc).await;
     assert_eq!(
-        cursor(&rpc).await.0,
-        4,
-        "rebound key jumped to the last entry"
+        lines(&rpc).await,
+        vec!["alpha-body"],
+        "the buffer-local rebind opened the entry"
     );
 }
 
@@ -449,26 +458,29 @@ async fn explorer_colon_falls_through_to_cmdline() {
     );
 }
 
-/// An editing-mode `j` map does NOT leak into the explorer: `j` still moves the
-/// listing selection (the explorer map), and the normal-mode map never fires.
+/// The explorer is now an ordinary `nomodifiable` buffer (not a grabbing widget), so
+/// `j`/`k` are plain normal-mode motions on it **and** an ordinary global normal-mode
+/// map applies on it — the inverse of the old widget-bucket isolation.
 #[tokio::test]
-async fn explorer_editing_map_does_not_leak() {
+async fn explorer_is_an_ordinary_buffer() {
     let (rpc, _incoming) = open_explorer(
-        "_G.leaked = false\n\
-         nx.keymap.set('n', 'j', function() _G.leaked = true end)",
+        "_G.fired = false\n\
+         nx.keymap.set('n', 'X', function() _G.fired = true end)",
     )
     .await;
 
-    feed(&rpc, "j"); // explorer's next, NOT the normal-mode map
+    feed(&rpc, "jj"); // ordinary motions move down the listing
     assert_eq!(
         cursor(&rpc).await.0,
-        2,
-        "explorer's own j moved the selection"
+        3,
+        "j is a normal motion on the listing (row 3 = alpha.txt)"
     );
+    feed(&rpc, "X");
+    barrier(&rpc).await;
     assert_eq!(
-        exec_lua(&rpc, "return _G.leaked").await.as_bool(),
-        Some(false),
-        "the normal-mode j map never fired inside the explorer"
+        exec_lua(&rpc, "return _G.fired").await.as_bool(),
+        Some(true),
+        "a global normal-mode map applies on the ordinary explorer buffer"
     );
 }
 

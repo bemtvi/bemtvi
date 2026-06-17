@@ -12,12 +12,41 @@
 -- the `on_select` callback — lives in the handle. The backing buffer number and the
 -- view's cursor line arrive each tick via the `nx._view_buf` / `nx._view_line`
 -- mirror, so `:set_decor` / `:bufnr` / `:line` read live editor state with no
--- round-trip. The `view` keymap bucket (default maps in prelude/keymap.lua) drives
--- navigation + `confirm`; `confirm` lands here through `nx._view_select`.
+-- round-trip. Navigation is plain normal-mode motion on the nomodifiable view
+-- buffer; the one special key, `<CR>` → `confirm`, is a buffer-local default map
+-- installed at create (`nx._install_view_keymaps`) and lands here through
+-- `nx._view_select`.
 
 nx.view = nx.view or {}
 nx._views = nx._views or {} -- id -> handle
 nx._view_next_id = nx._view_next_id or 0
+
+-- The view's one activation action: `<CR>` → confirm → the handle's `on_select`. It
+-- fires the native bridge (nx._view_action -> Editor::apply_view_action). Navigation
+-- is plain normal-mode motion on the nomodifiable view buffer, so this is the only
+-- view action.
+nx.view.actions = nx.view.actions or {}
+nx.view.actions.confirm = function()
+  nx._view_action("confirm")
+end
+
+-- nx._install_view_keymaps(buf) — install the view's buffer-local default activation
+-- map. Called by the server right after the view's backing buffer is created (the
+-- bufnr is known synchronously in core, ahead of the next-tick `nx._view_buf`
+-- mirror), so the `<CR>` → `on_select` map exists immediately. `default = true` lets a
+-- plugin override `<CR>` with its own `{ buffer = buf }` map. A view is an ordinary
+-- `nomodifiable` buffer otherwise, so this is its only special key. (The explorer /
+-- quickfix install their maps off a `FileType` autocmd instead — see
+-- prelude/keymap.lua — but a view's filetype is content-semantic and it may never be
+-- the current buffer when `FileType` would fire, so it installs at create time.)
+function nx._install_view_keymaps(buf)
+  nx.keymap.set(
+    "n",
+    "<CR>",
+    nx.view.actions.confirm,
+    { buffer = buf, default = true, desc = "Select entry" }
+  )
+end
 
 local View = {}
 View.__index = View

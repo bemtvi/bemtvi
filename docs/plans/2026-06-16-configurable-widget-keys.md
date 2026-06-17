@@ -7,6 +7,16 @@ The fuzzy picker (`nx.picker`) was the named offender and the Phase 1 reference;
 same mechanism then converted the select list (Phase 2), the panel + explorer
 (Phase 3), and the command line (Phase 4). See each phase's ✅ note below.
 
+> **Superseded for the explorer (and the later `nx.view`):** the unify-special-buffer
+> work (`docs/plans/2026-06-16-unify-special-buffer-kinds.md`, Phase 2) moved the
+> **file explorer** *off* its `'E'` widget bucket. It is not a grabbing widget — it is
+> an ordinary `nomodifiable` buffer in a window — so its keys are now ordinary
+> **buffer-local default maps** installed by a `FileType nxdir` autocmd (and `nx.view`
+> by `FileType nxview` / a create-time install, quickfix `<CR>` by `FileType qf`),
+> rebound the standard `nx.keymap.set('n', lhs, rhs, { buffer = … })` way. The `'E'`
+> (and the never-shipped `'W'`) buckets were removed. The genuinely-grabbing widgets
+> below — **picker / select / panel** (`'P'`/`'S'`/`'L'`) — keep their buckets.
+
 ## Why
 
 The keymap engine (`crates/nxvim-server/src/keymap.rs`) already lets a user rebind
@@ -39,7 +49,7 @@ addressed by a readable mode-code string in Lua:
 | `"picker"`    | `'P'`  | prompted fuzzy picker          |
 | `"select"`    | `'S'`  | promptless `nx.ui.select` list |
 | `"panel"`     | `'L'`  | message / quickfix panel       |
-| `"explorer"`  | `'E'`  | file-explorer listing          |
+| ~~`"explorer"`~~ | ~~`'E'`~~ | file-explorer listing — **removed**; now buffer-local maps (see the superseded note above) |
 
 (Editing buckets stay `n`/`i`/`c`/`v`/`V`/`m`; the new chars don't collide.) The
 command line (`"cmdline"`) already *has* a `Mode::Command` + `'c'` bucket, so it is a

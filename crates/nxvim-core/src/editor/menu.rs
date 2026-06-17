@@ -939,8 +939,9 @@ impl Editor {
     /// non-grabbing completion menu whose typing flows on to the document). The
     /// priority mirrors [`Editor::input`]'s grab order: a focused [`Panel`] first,
     /// then a grabbing menu ([`Picker`](KeyContext::Picker) /
-    /// [`Select`](KeyContext::Select)), then a directory-listing
-    /// [`Explorer`](KeyContext::Explorer) in normal mode.
+    /// [`Select`](KeyContext::Select)). The explorer / `nx.view` / quickfix buffers
+    /// are *not* widgets — they are ordinary `nomodifiable` buffers whose special
+    /// keys are buffer-local maps, so they stay in [`KeyContext::Editing`].
     pub fn key_context(&self) -> KeyContext {
         if self.panel.is_some() {
             return KeyContext::Panel;
@@ -949,12 +950,6 @@ impl Editor {
             Some(MenuKind::Picker) => return KeyContext::Picker,
             Some(MenuKind::Select) => return KeyContext::Select,
             _ => {}
-        }
-        if self.mode == Mode::Normal && self.is_explorer_buffer() {
-            return KeyContext::Explorer;
-        }
-        if self.mode == Mode::Normal && self.is_view_buffer() {
-            return KeyContext::View;
         }
         KeyContext::Editing
     }

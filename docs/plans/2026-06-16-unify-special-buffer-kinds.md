@@ -1,12 +1,12 @@
 # Unify the special-buffer-kind grab-bag
 
-Status: **Phase 1 landed** — 2026-06-16. A refactor to consolidate nxvim's accreted
-"non-ordinary buffer" mechanisms before more is built on them (the `nx.view` work
-exposed how out of hand this has gotten). No new user-facing feature — this is a
+Status: **Phases 1 & 2 landed** — 2026-06-16. A refactor to consolidate nxvim's
+accreted "non-ordinary buffer" mechanisms before more is built on them (the `nx.view`
+work exposed how out of hand this has gotten). No new user-facing feature — a
 consistency / correctness cleanup that also closes a real read-only hole. Phase 1
-(one read-only mechanism + the regression net) is implemented and tested
-(`crates/nxvim-server/tests/readonly.rs`); Phase 2 (the big deletion) is still
-planned.
+(one read-only mechanism + the regression net) and Phase 2 (converge explorer + view
++ quickfix on buffer-local maps; delete the bespoke routing) are both implemented and
+tested. The bottom panel remains a separate later effort (see below).
 
 ## Problem
 
@@ -103,7 +103,46 @@ This *is* ingredient 1, applied uniformly. No new abstraction.
 Ships independently; fixes the bug. After this, the explorer/view input-routing
 inertness is **redundant** — which sets up Phase 2.
 
-## Phase 2 — converge explorer + view + quickfix on buffer-local maps (the big deletion)
+## Phase 2 — converge explorer + view + quickfix on buffer-local maps (the big deletion) — **DONE**
+
+Landed 2026-06-16. With read-only enforced at the chokepoints (Phase 1), the bespoke
+routing had nothing left to do. The three special-buffer branches were deleted from
+`input()` and normal keys now flow; the activation keys are **buffer-local default
+keymaps** (vim's ftplugin model). What shipped, versus the original sketch below:
+
+- ✅ **Deleted from `input()`** (`mod.rs`): the explorer early-return, the view
+  early-return, and the hard-coded quickfix `<CR>` — all three. `input()` has **no**
+  special-buffer branch now.
+- ✅ **Activation keys are buffer-local default maps.** The explorer (`filetype=nxdir`)
+  and quickfix (`filetype=qf`) install theirs from a prelude **`FileType` autocmd**
+  (the vim model the user chose); the qf bridge `nx._qf_action("jump")` +
+  `Editor::apply_qf_action` is the one new bridge. `nx.view` installs its `<CR>` →
+  `confirm` map **at create time** (`nx._install_view_keymaps`, called server-side
+  right after `create_view`) rather than off a `FileType` autocmd — a view's filetype
+  is *content-semantic* (drives treesitter, e.g. `markdown`) so it can't double as the
+  widget tag, and a view is created off-screen and may never be the current buffer when
+  `FileType` would fire. This is the plan's sanctioned per-kind fallback.
+- ✅ **FileType now fires for core-created buffers and on filetype *change*.**
+  `emit_lifecycle_events` fires `FileType` from `Editor::buffer_filetype` (not just the
+  path extension), for non-file-backed buffers too, and re-fires whenever a buffer's
+  filetype changes — tracked by a new `fired_filetype` map separate from `announced`.
+  The change-refire is essential: `:e dir` reuses a throwaway buffer **in place** (same
+  id, already announced), and only the ft change (`""` → `nxdir`) re-fires `FileType`
+  to install the maps.
+- ✅ **Deleted the dead apparatus:** `KeyContext::Explorer`/`View` + their `key_context`
+  branches; the `'E'`/`'W'` buckets in `widget_bucket`/`mode_buckets`/`mode_code`;
+  `handle_explorer_text`/`handle_view_text`; `is_view_buffer`; and the **nav arms** of
+  `apply_explorer_action`/`apply_view_action` (kept `open`/`up`, `confirm`). Navigation
+  is ordinary normal-mode motion on the `nomodifiable` buffers now.
+- ✅ **Tests:** `widget_keys.rs` explorer tests rewritten for the new model (buffer-local
+  rebind via a `FileType nxdir` autocmd; global maps now apply on the ordinary explorer
+  buffer; `j`/`k`/`gg`/`G` are normal motions); `quickfix.rs` gains
+  `quickfix_enter_is_rebindable` (the new capability); `nx_view.rs` / `daemon_explorer.rs`
+  pass unchanged; one `autocmds.rs` introspection test rescoped now that built-in
+  `FileType` autocmds exist. Whole workspace green (default + `--no-default-features`),
+  clippy clean.
+
+### Original sketch (for reference)
 
 With read-only enforced at the chokepoints (Phase 1), the bespoke routing has nothing
 left to do. Delete every special-buffer branch from `input()` and let normal keys flow;

@@ -169,6 +169,14 @@ where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
     let mut terminal = ratatui::init();
+    // Clear the screen once on entry (neovim emits `ESC[H ESC[J` here). ratatui
+    // renders by diffing against its *own* previous buffer, which assumes the
+    // alternate screen is blank when we arrive — true in most terminals, but not
+    // guaranteed when nxvim runs *inside* another terminal emulator (e.g. our own
+    // `:term`, or tmux) that doesn't blank the alt screen on entry. Without this,
+    // cells the first frame leaves blank are never painted, so stale content shows
+    // through as "render leftover". The explicit clear makes the baseline real.
+    let _ = terminal.clear();
     // Capture mouse events so the panel's `[X]` is clickable.
     let mouse = MouseCapture::enable(std::io::stdout());
     // Restore the user's cursor shape on the way out — the loop switches it to a
@@ -266,6 +274,13 @@ where
                         "nvim_ui_try_resize",
                         vec![Value::from(w as u64), Value::from(text_height(h) as u64)],
                     );
+                    // A resize moves the chrome (the gutter width, the status row, the
+                    // command line all shift), so cells that held chrome at the old size
+                    // may be blank at the new one. ratatui resets its diff baseline on
+                    // resize but emits no screen clear, so — on a host that doesn't clear
+                    // its grid on resize — those old cells would linger. Clear so the next
+                    // frame repaints over a known-blank screen (neovim clears here too).
+                    let _ = terminal.clear();
                 }
                 Some(Ok(Event::Mouse(m))) => match m.kind {
                     // A left-click on the focused panel's `[X]` closes it — the

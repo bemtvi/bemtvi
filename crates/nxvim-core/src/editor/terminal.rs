@@ -200,10 +200,15 @@ impl Editor {
         if is_current {
             let line = cursor_row.min(self.buffer().line_count().saturating_sub(1));
             let line_text = self.buffer().line(line);
-            // vt100 reports a screen column; for the common ASCII case it maps to a
-            // byte column. Clamp into the line so a wide-char / trailing-cell cursor
-            // never lands past the text. (Wide-char column fidelity is deferred.)
-            let col = cursor_col.min(line_text.len());
+            // vt100 reports a *screen* column (display cells); the editor stores cursor
+            // columns as *byte* offsets (the renderer re-projects byte→screen). Convert
+            // here, or a multi-byte/wide glyph before the cursor — e.g. the `│` box-
+            // drawing char a TUI's input box is framed with (3 bytes, 1 cell) — would
+            // land the byte cursor mid-glyph and draw it cells too far left. Past the
+            // last cell of the live line `byte_at_virtcol` returns `line_text.len()`,
+            // keeping the next-write cursor just past end-of-line.
+            let tab = self.buffer().options.effective_tabstop();
+            let col = crate::unicode::byte_at_virtcol(&line_text, cursor_col, tab);
             // Stash the child's cursor so re-entering terminal mode (`i`/`a`) can snap
             // back to it. Move the *live* cursor only while in terminal-job mode — in
             // terminal-normal mode the user is navigating, so the child's output must

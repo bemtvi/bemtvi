@@ -167,6 +167,48 @@ async fn cursor_sits_after_the_last_typed_char() {
     );
 }
 
+/// The child reports its cursor as a *screen* column (vt100 counts display cells),
+/// but the editor stores cursor columns as *byte* offsets and the renderer projects
+/// that back to a screen column. A line with a multi-byte, single-cell glyph before
+/// the cursor — like the `│` box-drawing char (3 UTF-8 bytes, 1 cell) that TUI apps
+/// (Claude Code, fzf, …) border their input box with — exposes the gap: storing the
+/// screen column straight into the byte field lands the cursor *inside* the `│`, and
+/// the renderer then re-projects byte→screen and draws the cursor too far LEFT.
+/// Typing `│hi` into `cat` (which echoes it) must leave the cursor after the `i`:
+/// byte column 5 (`│`=3 bytes + h + i) and screen column 3 (`│`=1 cell + h + i).
+#[tokio::test]
+async fn cursor_column_accounts_for_multibyte_chars_before_it() {
+    let _guard = serial_lock().lock().await;
+    let (rpc, mut incoming) = start().await;
+
+    command(&rpc, "terminal cat").await;
+    feed(&rpc, "│hi");
+    let ls = wait_lines(&rpc, "cat to echo '│hi'", |ls| has_line(ls, "│hi")).await;
+    let row = ls.iter().position(|l| l.trim_end() == "│hi").unwrap();
+
+    // Byte column: `│` is 3 UTF-8 bytes, so after `│hi` the byte column is 5, not the
+    // vt100 screen column 3 — the root cause is conflating the two.
+    let (cline, ccol) = cursor(&rpc).await;
+    assert_eq!(cline, row + 1, "cursor on the typed line");
+    assert_eq!(
+        ccol, 5,
+        "cursor byte column is after '│hi' (│=3 bytes + h + i = 5), \
+         not the vt100 screen column 3"
+    );
+
+    // Screen column (where the cursor is actually drawn): `│` is 1 cell, so the cursor
+    // sits at screen column 3 — not 1 (drawn 2 cells too far left under the bug).
+    for _ in 0..200 {
+        if let Some(map) = drain_to_latest_redraw(&mut incoming, |_| true) {
+            if window0_field(&map, "cursor_screen_col").and_then(Value::as_u64) == Some(3) {
+                return;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    panic!("terminal cursor was not drawn at screen column 3 (after '│hi')");
+}
+
 /// `<C-4>` is how macOS / xterm deliver Ctrl-\ (crossterm decodes byte 0x1c as
 /// Ctrl+'4'), so `<C-4><C-n>` must also leave terminal mode.
 #[tokio::test]

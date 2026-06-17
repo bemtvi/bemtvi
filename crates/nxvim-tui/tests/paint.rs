@@ -3,7 +3,7 @@
 //! input here — this pins the *client's painting contract*, not server logic.
 
 use crossterm::cursor::SetCursorStyle;
-use nxvim_tui::{cursor_style, paint, ScrollHarness};
+use nxvim_tui::{cursor_style, paint, paint_with_cursor, ScrollHarness};
 use nxvim_view::View;
 use ratatui::buffer::Buffer;
 use ratatui::style::{Color, Modifier};
@@ -522,6 +522,34 @@ fn filler_rows_have_a_blank_gutter() {
     assert_eq!(row_text(&buf, 0).trim_end(), "1   only");
     // The `~` row's gutter is all blanks; the tilde sits in the text column.
     assert_eq!(row_text(&buf, 1).trim_end(), "    ~");
+}
+
+#[test]
+fn cursor_lands_on_its_character_with_the_number_gutter_on() {
+    // Repro for a reported cursor offset: with the number gutter on (the server
+    // default), the cursor must be placed at gutter_width + cursor_screen_col — the
+    // same cell the character is painted on — not shifted back over the gutter.
+    let v = view(vec![
+        ("lines", lines(&["hello", "world"])),
+        ("numbers", numbers(&[Some(1), Some(2)])),
+        ("number", Value::from(true)),
+        ("relativenumber", Value::from(true)),
+        ("number_width", Value::from(4u64)),
+        ("cursor_line", Value::from(1u64)),
+        ("cursor_row", Value::from(0u64)),
+        ("cursor_screen_col", Value::from(2u64)),
+    ]);
+    let (buf, cursor) = paint_with_cursor(&v, 20, 5);
+    // Text starts past the 4-cell gutter: "hello" at cols 4..9.
+    assert_eq!(row_text(&buf, 0).trim_end(), "1   hello");
+    // The character under the cursor (screen col 2 = 'l') is painted at col 4+2 = 6.
+    assert_eq!(buf.cell((6, 0)).unwrap().symbol(), "l");
+    // The cursor must sit ON that cell, not shifted left over the gutter.
+    assert_eq!(
+        cursor,
+        Some((6, 0)),
+        "cursor on its character, gutter accounted for"
+    );
 }
 
 #[test]

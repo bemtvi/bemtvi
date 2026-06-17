@@ -381,6 +381,16 @@ pub(crate) fn install_vim(lua: &Lua, shared: &Rc<RefCell<Shared>>) -> mlua::Resu
     )?;
     let sh = shared.clone();
     view.set(
+        "_set_cursor",
+        lua.create_function(move |_, (id, line): (u64, u64)| {
+            sh.borrow_mut()
+                .view_ops
+                .push(ViewOp::SetCursor { id, line });
+            Ok(())
+        })?,
+    )?;
+    let sh = shared.clone();
+    view.set(
         "_mount_dock",
         lua.create_function(move |_, (id, side, size): (u64, String, Option<u64>)| {
             sh.borrow_mut()

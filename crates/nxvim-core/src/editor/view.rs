@@ -194,6 +194,26 @@ impl Editor {
         }
     }
 
+    /// `v:set_cursor(line)` — focus the window showing view `id` (like `:focus`) and
+    /// move its cursor to 1-based `line`, clamped to the view's line count (column 0,
+    /// like every view cursor). The reveal / find-file primitive — the one sanctioned
+    /// cursor *write* for a view, whose cursor is otherwise plain normal-mode motion. A
+    /// no-op for an unknown / unmounted id (nothing to focus or position).
+    pub fn set_view_cursor(&mut self, id: u64, line1: usize) {
+        if self.views.get(&id).and_then(|v| v.mount.as_ref()).is_none() {
+            return;
+        }
+        self.focus_view(id);
+        // `focus_view` made the view's window current, so `self.cursor` / `last_line`
+        // now address the view buffer.
+        self.cursor.line = line1.saturating_sub(1).min(self.last_line());
+        self.cursor.col = 0;
+        self.desired_col = 0;
+        self.desired_eol = false;
+        self.clamp_cursor();
+        self.ensure_visible();
+    }
+
     /// `v:unmount()` — remove view `id` from view (close its dock, or its split
     /// window), leaving the backing buffer alive so a later `mount` reshows it. A
     /// no-op for an unknown / already-unmounted id.

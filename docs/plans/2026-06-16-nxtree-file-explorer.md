@@ -22,9 +22,13 @@ What landed vs. the original phase sketch:
   `register_action`; the `git_signs` add-on. Done.
 - **Phase 5 (polish)** — `nx.fs.watch` auto-refresh (recursive, best-effort: a build
   with no native watcher rejects the first pull and degrades to manual `R`); hidden
-  toggle (`H`). **Deferred:** `:NxTreeFindFile` reveal-current — needs a *view cursor
-  setter* (`nx.view` v1 only reads the cursor), so reveal can expand the path but not
-  move the cursor; left out rather than shipped half-working.
+  toggle (`H`); `:NxTreeFindFile` reveal-current. Reveal needed a native addition —
+  `nx.view`'s **cursor setter** (`v:set_cursor(line)` → `Editor::set_view_cursor`,
+  the one sanctioned cursor write for a view, since v1 only *read* the cursor) — now
+  landed and tested (`nx_view.rs::view_set_cursor_focuses_and_positions`); the plugin
+  `reveal(path)` expands the directories along the path (lazy-loading collapsed dirs),
+  lands the cursor on the target node, and focuses the sidebar
+  (`nxtree.rs::find_file_reveals_a_nested_file`).
 
 A real file tree, built as a **pure-Lua plugin on `nx.*`** per the dogfooding
 directive ([ADR 0002](../decisions/0002-native-plugin-system.md)). A small set of

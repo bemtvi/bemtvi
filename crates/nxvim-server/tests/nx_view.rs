@@ -271,6 +271,37 @@ async fn view_set_decor_lays_extmarks() {
     );
 }
 
+/// `:set_cursor(line)` focuses the view and lands the cursor on the 1-based `line`,
+/// clamped to the content — the reveal / find-file primitive a docked tree uses.
+#[tokio::test]
+async fn view_set_cursor_focuses_and_positions() {
+    let (rpc, _incoming) = start().await;
+    feed_sync(&rpc, "imain<Esc>").await; // focus starts in the main area
+    exec_lua(
+        &rpc,
+        r#"vw = nx.view.create{}
+           vw:set_lines{ "one", "two", "three" }
+           vw:mount{ dock = "left", size = 20 }"#,
+    )
+    .await;
+    // Focus may be anywhere after mount; set_cursor must cross into the view.
+    exec_lua(&rpc, "nx.layer.main()").await;
+    exec_lua(&rpc, "vw:set_cursor(2)").await;
+    assert_eq!(
+        cursor(&rpc).await,
+        (2, 0),
+        "cursor landed on line 2, view focused"
+    );
+
+    // Out-of-range clamps to the last line, never panics or overshoots.
+    exec_lua(&rpc, "vw:set_cursor(99)").await;
+    assert_eq!(
+        cursor(&rpc).await.0,
+        3,
+        "an over-range line clamped to the last"
+    );
+}
+
 /// `<CR>` on a focused view fires `:on_select(line, userdata)` with the 1-based
 /// cursor line and that line's userdata entry.
 #[tokio::test]

@@ -160,6 +160,14 @@ function View:cursor()
   return self:line(), 0
 end
 
+-- :set_cursor(line) — focus the view and move its cursor to 1-based `line` (clamped
+-- to the content; column 0). The reveal / find-file primitive — the one sanctioned
+-- cursor write; ordinary navigation is plain normal-mode motion.
+function View:set_cursor(line)
+  nx.view._set_cursor(self.id, line)
+  return self
+end
+
 -- :redraw() — request a repaint. The editor already repaints at the end of every
 -- input batch / drained chunk, so this is a no-op kept for API completeness (and so
 -- a plugin can express intent at the call site).

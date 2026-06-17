@@ -98,6 +98,9 @@ pub enum ViewOp {
     },
     /// `v:set_lines(lines)` — replace view `id`'s content wholesale.
     SetLines { id: u64, lines: Vec<String> },
+    /// `v:set_cursor(line)` — focus view `id` and move its cursor to 1-based `line`
+    /// (the reveal / find-file primitive).
+    SetCursor { id: u64, line: u64 },
     /// `v:mount{ dock = side, size? }` — show view `id` in the dock on `side` and
     /// focus it. `size` is columns (left/right) or rows (top/bottom); `None` ⇒ the
     /// side's default.

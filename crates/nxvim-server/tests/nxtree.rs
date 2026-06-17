@@ -293,6 +293,48 @@ async fn refresh_surfaces_a_new_file() {
     );
 }
 
+// ===== reveal (:NxTreeFindFile) ==============================================
+
+/// `reveal(path)` expands the directories along a path — lazily loading a collapsed
+/// dir — moves the cursor onto the target node, and focuses the sidebar.
+#[tokio::test]
+async fn find_file_reveals_a_nested_file() {
+    let (rpc, _incoming) = start().await;
+    let root = sample_tree("nxtree_reveal");
+    open_tree(&rpc, &root).await;
+    wait_line_count(&rpc, 4).await; // `zebra` is collapsed — inner.txt not shown
+
+    // Reveal the file nested inside the collapsed `zebra` dir.
+    let target = root.join("zebra/inner.txt");
+    exec_lua(
+        &rpc,
+        &format!(r#"require("nxtree").reveal("{}")"#, q(&target)),
+    )
+    .await;
+
+    // The dir expands (5 lines) and the cursor lands on inner.txt, focused in the tree.
+    let ls = wait_line_count(&rpc, 5).await;
+    let want = index_of(&ls, "inner.txt"); // 0-based view line
+    assert!(
+        has(&ls, "inner.txt"),
+        "the nested file is now revealed: {ls:?}"
+    );
+
+    let mut row = 0;
+    for _ in 0..150 {
+        row = cursor(&rpc).await.0;
+        if row == want + 1 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(
+        row,
+        want + 1,
+        "the cursor landed on the revealed file's line (focused in the tree)"
+    );
+}
+
 // ===== shipped example =======================================================
 
 /// The shipped `examples/nxtree/init.lua` loads end-to-end: it requires the plugin

@@ -21,6 +21,7 @@
 --   y                     yank the absolute path to the " and + registers
 --   /                     filter by name (Esc clears the filter)
 --   H                     toggle hidden (dot)files     R  refresh     q  close
+--   :NxTreeFindFile        reveal the file in the current window (expands to it)
 --
 -- The leader is space here; set it before anything maps <leader>.
 vim.g.mapleader = " "

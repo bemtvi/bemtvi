@@ -362,6 +362,7 @@ impl EditHost {
                     }
                 }
                 ViewOp::SetLines { id, lines } => self.editor.set_view_lines(id, lines),
+                ViewOp::SetCursor { id, line } => self.editor.set_view_cursor(id, line as usize),
                 ViewOp::MountDock { id, side, size } => {
                     self.editor
                         .mount_view_dock(id, &side, size.map(|s| s as usize))

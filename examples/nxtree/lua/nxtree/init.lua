@@ -191,6 +191,79 @@ function M.refresh()
   end
 end
 
+-- reveal(path) — open the tree (building it if needed), expand the directories along
+-- `path` (default: the current buffer's file), move the cursor onto its node, and
+-- focus the sidebar. Backs `:NxTreeFindFile`. A no-op for a path outside the root.
+function M.reveal(path)
+  if tree == nil then
+    build()
+  end
+  run(function()
+    local target = path
+    if not target or target == "" then
+      target = vim.fn.expand("%:p")
+    end
+    if not target or target == "" then
+      return nx.notify("nxtree: no file to reveal", 3)
+    end
+
+    -- `target` must live under the root; derive the path segments below it.
+    local base = tree.root.path
+    if base:sub(-1) ~= "/" then
+      base = base .. "/"
+    end
+    if target:sub(1, #base) ~= base then
+      return nx.notify("nxtree: " .. target .. " is outside the tree root", 3)
+    end
+    local segments = {}
+    for seg in target:sub(#base + 1):gmatch("[^/]+") do
+      segments[#segments + 1] = seg
+    end
+    if #segments == 0 then
+      return
+    end
+
+    -- Clear any active filter, then walk from the root, expanding each directory on
+    -- the path (lazy-loading as needed) and descending to the target node.
+    tree.filter = nil
+    if not tree.root.loaded then
+      model.load(tree, tree.root)
+    end
+    tree.root.expanded = true
+    local node = tree.root
+    for i, seg in ipairs(segments) do
+      local child
+      for _, c in ipairs(node.children) do
+        if c.name == seg then
+          child = c
+          break
+        end
+      end
+      if not child then
+        node = nil
+        break
+      end
+      -- Expand every directory *above* the target (not the target itself).
+      if i < #segments and child.type == "directory" then
+        model.expand(tree, child)
+      end
+      node = child
+    end
+
+    render()
+    if not node then
+      return nx.notify("nxtree: " .. target .. " not found under the root", 3)
+    end
+    -- Find the target's line in the freshly-rendered flattened view and land on it.
+    for i, n in ipairs(tree.flat) do
+      if n == node then
+        tree.view:set_cursor(i)
+        return
+      end
+    end
+  end)
+end
+
 -- The view's backing buffer number (or nil before the tree is built / mounted). An
 -- introspection handle for decorator add-ons and tests.
 function M.bufnr()
@@ -232,7 +305,8 @@ end
 
 -- ----- setup -----------------------------------------------------------------
 
--- setup(opts) — wire `:NxTree` / `:NxTreeRefresh` and the toggle keymap.
+-- setup(opts) — wire `:NxTree` / `:NxTreeRefresh` / `:NxTreeFindFile` and the toggle
+-- keymap.
 --   opts.root         tree root path (default: the editor's cwd at first open)
 --   opts.width        sidebar columns (default 30)
 --   opts.hidden       show dotfiles (default false)
@@ -260,6 +334,9 @@ function M.setup(opts)
   nx.command("NxTreeRefresh", function()
     M.refresh()
   end, { desc = "Re-scan the nxtree file explorer" })
+  nx.command("NxTreeFindFile", function()
+    M.reveal()
+  end, { desc = "Reveal the current file in the nxtree explorer" })
 
   local key = opts.keymap
   if key == nil then

@@ -141,6 +141,7 @@ fn splice_preserves_the_weight_and_slant_of_the_run_it_splits() {
     let base = vec![Seg {
         text: "keyword".into(),
         fg: 0xaa_bb_cc,
+        bg: None,
         bold: true,
         italic: true,
     }];

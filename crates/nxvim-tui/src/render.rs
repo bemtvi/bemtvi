@@ -644,7 +644,6 @@ fn render_window(
     let empty_search: SearchSpans = Vec::new();
     let empty_diag: Vec<Vec<DiagSpan>> = Vec::new();
     let empty_virt: Vec<Option<DiagVirt>> = Vec::new();
-    let empty_virt_text: Vec<Vec<VirtPlacement>> = Vec::new();
     let empty_virt_lines: Vec<Option<Vec<VirtChunk>>> = Vec::new();
     let empty_signs: Vec<Option<DiagSign>> = Vec::new();
 
@@ -657,12 +656,16 @@ fn render_window(
     let anim_hl: Vec<Vec<HlSpan>>;
     let anim_numbers: Vec<Option<usize>>;
     let anim_inlay: Vec<Vec<InlayHint>>;
+    let anim_virt_text: Vec<Vec<VirtPlacement>>;
     let anim_search: SearchSpans;
     let anim_incsearch: IncSearchSpans;
     let frame_lines: &[String];
     let frame_sel: &[Option<(u16, u16)>];
     let frame_hl: &[Vec<HlSpan>];
     let frame_inlay: &[Vec<InlayHint>];
+    // Extmark virt_text rides the slide band (sliced like `frame_inlay`), so the
+    // placements slide with the line instead of flashing out and back on settle.
+    let frame_virt_text: &[Vec<VirtPlacement>];
     let frame_numbers: &[Option<usize>];
     // Search spans ride the slide band (the static viewport uses the win's), so
     // `hlsearch`/`incsearch` keep highlighting the moving text instead of blinking
@@ -728,6 +731,7 @@ fn render_window(
                 .take(height)
                 .cloned()
                 .collect();
+            anim_virt_text = a.virt_text.iter().skip(off).take(height).cloned().collect();
             // Search matches ride the slide too, sliced to the visible window like
             // the highlights, so `hlsearch` stays lit on the moving text.
             anim_search = a.search.iter().skip(off).take(height).cloned().collect();
@@ -737,6 +741,7 @@ fn render_window(
             frame_numbers = &anim_numbers;
             frame_hl = &anim_hl;
             frame_inlay = &anim_inlay;
+            frame_virt_text = &anim_virt_text;
             frame_search = &anim_search;
             frame_incsearch = &anim_incsearch;
             cursor_row = cur.saturating_sub(top) as u16;
@@ -748,6 +753,7 @@ fn render_window(
             frame_numbers = &win.numbers;
             frame_hl = &win.highlights;
             frame_inlay = &win.inlay_hints;
+            frame_virt_text = &win.virt_text;
             frame_search = &win.search;
             frame_incsearch = &win.incsearch;
             cursor_row = win.cursor_row;
@@ -816,11 +822,6 @@ fn render_window(
     let frame_virt: &[Option<DiagVirt>] = match anim {
         Some(_) => &empty_virt,
         None => &win.diagnostics_virt,
-    };
-    // Extmark virtual text, like diagnostics, paints on the settled viewport only.
-    let frame_virt_text: &[Vec<VirtPlacement>] = match anim {
-        Some(_) => &empty_virt_text,
-        None => &win.virt_text,
     };
     // Extmark `virt_lines` (whole virtual rows). The slide band is buffer-line-based
     // and doesn't interleave virtual rows, so none ride the animation; the settled
@@ -1309,6 +1310,18 @@ fn highlight_line(
             vi += 1;
         }
         while oi < overlays.len() && (overlays[oi].col as usize) <= col {
+            // The cell the overlay starts on, for the `hl_mode` combine/blend merge
+            // (replace ignores it). Resolved from the same walk the real glyphs use.
+            let under = cell_style(
+                overlays[oi].col as usize,
+                sel,
+                secondary_sel,
+                search,
+                incsearch,
+                hl,
+                diag,
+                theme,
+            );
             overlay_end = overlay_end.max(emit_overlay(
                 overlays[oi],
                 &mut spans,
@@ -1318,6 +1331,7 @@ fn highlight_line(
                 leftcol,
                 max_width,
                 inserted,
+                under,
                 theme,
             ));
             oi += 1;
@@ -1408,7 +1422,17 @@ fn highlight_line(
                 spans.push(Span::raw(" ".repeat(target - painted)));
                 painted = target;
             }
-            painted += push_virt_chunks(&mut spans, &p.chunks, painted, max_width, theme);
+            // Past end-of-text there's no cell underneath, so `hl_mode` is moot — the
+            // chunk paints in its own style (replace).
+            painted += push_virt_chunks(
+                &mut spans,
+                &p.chunks,
+                painted,
+                max_width,
+                theme,
+                Style::default(),
+                0,
+            );
         }
     }
 
@@ -1426,7 +1450,17 @@ fn highlight_line(
             }
             spans.push(Span::raw(" "));
             painted += 1;
-            painted += push_virt_chunks(&mut spans, &placement.chunks, painted, max_width, theme);
+            // eol text paints in the empty space past the line — nothing underneath, so
+            // replace (its own style) regardless of `hl_mode`.
+            painted += push_virt_chunks(
+                &mut spans,
+                &placement.chunks,
+                painted,
+                max_width,
+                theme,
+                Style::default(),
+                0,
+            );
         }
     }
 
@@ -1516,16 +1550,57 @@ const VIRT_POS_WIN_COL: u8 = 4;
 
 /// The style for one extmark virtual-text chunk: the colorscheme palette entry the
 /// server resolved its `hl_group` to, or the window's normal foreground when the
-/// chunk carried no group (or it didn't resolve).
-///
-/// This is the `hl_mode = 'replace'` rendering (the default): the chunk paints in
-/// its own resolved style. The `combine` / `blend` modes — merging the chunk's
-/// highlight with the cells underneath an overlay — are a later refinement; today
-/// every mode renders as `replace`.
+/// chunk carried no group (or it didn't resolve). This is the chunk's *own* style,
+/// before any `hl_mode` merge with the cell underneath (see [`apply_hl_mode`]).
 fn virt_chunk_style(id: Option<usize>, theme: &LineTheme) -> Style {
     id.and_then(|i| theme.palette.get(i))
         .copied()
         .unwrap_or_default()
+}
+
+/// The `hl_mode` wire codes (mirror the server's [`nxvim_core::HlMode`]):
+/// `0`=replace (the default), `1`=combine, `2`=blend.
+const HL_MODE_COMBINE: u8 = 1;
+const HL_MODE_BLEND: u8 = 2;
+
+/// Resolve a virtual-text chunk's final style given its `hl_mode` and the style of
+/// the cell it paints **over**. Only `overlay` / `win_col` placements sit over real
+/// cells — `eol` / `inline` / `right_align` have nothing underneath, so they always
+/// pass `under == Style::default()` and render as `replace`.
+///
+/// - `replace` (the default): the chunk's own style, ignoring the cell beneath it.
+/// - `combine`: the chunk's *set* attributes layered over the underlying cell, so
+///   where the chunk leaves a color/attr unset the cell's shows through
+///   (`Style::patch`, the same merge the cell-style walk uses).
+/// - `blend`: like `combine`, but a truecolor fg/bg present on *both* sides is
+///   averaged channel-wise (a non-truecolor or one-sided color falls back to the
+///   `combine` pick). A coarse approximation of neovim's alpha blend — exact pixel
+///   blending isn't expressible in a terminal cell — but it reads as a tint of the
+///   text underneath rather than an opaque replace.
+fn apply_hl_mode(chunk: Style, under: Style, mode: u8) -> Style {
+    match mode {
+        HL_MODE_COMBINE => under.patch(chunk),
+        HL_MODE_BLEND => {
+            let mut out = under.patch(chunk);
+            out.fg = blend_color(under.fg, chunk.fg);
+            out.bg = blend_color(under.bg, chunk.bg);
+            out
+        }
+        _ => chunk,
+    }
+}
+
+/// Average two cell colors channel-wise when **both** are truecolor; otherwise keep
+/// the chunk's color when set, else the underlying one. Used by [`apply_hl_mode`]'s
+/// `blend` path.
+fn blend_color(under: Option<Color>, chunk: Option<Color>) -> Option<Color> {
+    match (under, chunk) {
+        (Some(Color::Rgb(r1, g1, b1)), Some(Color::Rgb(r2, g2, b2))) => {
+            let mix = |a: u8, b: u8| ((a as u16 + b as u16) / 2) as u8;
+            Some(Color::Rgb(mix(r1, r2), mix(g1, g2), mix(b1, b2)))
+        }
+        (under, chunk) => chunk.or(under),
+    }
 }
 
 /// Total display width of `s` in screen cells (wide chars by their width).
@@ -1574,12 +1649,19 @@ fn emit_inlay_hint(
 /// palette id (the window's normal color when the chunk carried no group, or it
 /// didn't resolve). Returns the total display width added. Shared by the eol,
 /// overlay, win_col, and right_align render paths.
+///
+/// `under`/`mode` carry the `hl_mode` merge (see [`apply_hl_mode`]): the overlay /
+/// win_col paths pass the style of the cell beneath the placement so `combine` /
+/// `blend` can tint the underlying color; eol / right_align pass
+/// `Style::default()` + replace, since nothing sits underneath them.
 fn push_virt_chunks(
     spans: &mut Vec<Span<'static>>,
     chunks: &[(String, Option<usize>)],
     painted: usize,
     max_width: usize,
     theme: &LineTheme,
+    under: Style,
+    mode: u8,
 ) -> usize {
     let mut added = 0usize;
     for (text, id) in chunks {
@@ -1592,7 +1674,8 @@ fn push_virt_chunks(
             break;
         }
         added += str_width(&shown);
-        spans.push(Span::styled(shown, virt_chunk_style(*id, theme)));
+        let style = apply_hl_mode(virt_chunk_style(*id, theme), under, mode);
+        spans.push(Span::styled(shown, style));
     }
     added
 }
@@ -1603,6 +1686,12 @@ fn push_virt_chunks(
 /// suppresses the real glyphs it covers (overlay replaces, it does not shift). A
 /// placement scrolled off the left (`col < leftcol`) paints nothing and suppresses
 /// nothing.
+///
+/// `under` is the style of the cell the overlay starts on (the caller resolves it
+/// from the same cell-style walk the real glyphs use), so the placement's `hl_mode`
+/// can `combine`/`blend` the chunk with the text it covers — see [`apply_hl_mode`].
+/// Computed at the start column and applied to the whole placement (a short overlay
+/// usually sits over a uniform run; per-cell merge is deferred, like wide-char).
 #[allow(clippy::too_many_arguments)]
 fn emit_overlay(
     placement: &VirtPlacement,
@@ -1613,6 +1702,7 @@ fn emit_overlay(
     leftcol: usize,
     max_width: usize,
     inserted: usize,
+    under: Style,
     theme: &LineTheme,
 ) -> usize {
     if (placement.col as usize) < leftcol {
@@ -1622,7 +1712,15 @@ fn emit_overlay(
         spans.push(Span::styled(std::mem::take(run), *run_style));
     }
     let painted = col.saturating_sub(leftcol) + inserted;
-    col + push_virt_chunks(spans, &placement.chunks, painted, max_width, theme)
+    col + push_virt_chunks(
+        spans,
+        &placement.chunks,
+        painted,
+        max_width,
+        theme,
+        under,
+        placement.hl_mode,
+    )
 }
 
 /// Splice one inline `virt_text` placement into the row's span stream at its anchor

@@ -1,14 +1,19 @@
 # Virtual text rendering (extmark `virt_text` + `virt_lines`)
 
-Status: **in progress** — Phases 1–5 **done** 2026-06-16; Phase 6 (polish + GUI/web
-paint parity) next.
+Status: **in progress** — Phases 1–5 **done** 2026-06-16; Phase 6 mostly done
+2026-06-16 (GUI/web paint parity, `hl_mode`, wasm parity landed; `virt_lines_leftcol`
+and scroll-band virtual rows remain as documented refinements).
 
 **Client coverage note:** rendering is implemented in the **TUI** (`nxvim-tui`,
-the agent-verifiable reference client) for every phase. The **GUI** (`nxvim-gui`)
-and **web** clients parse the new `virt_text` wire field (via `nxvim-view`) but do
-not paint it yet — that render parity is batched into Phase 6, not done per-phase
-(the GUI/web output isn't agent-verifiable). This is a tracked gap, not a silent
-skip: the data reaches those clients; only their paint code is pending.
+the agent-verifiable reference client) for every phase. As of Phase 6 the **GUI**
+(`nxvim-gui`) and **web** (`nxvim-edithost`) clients also paint `virt_text` and
+`virt_lines`, **including chunk backgrounds** (a chunk whose hl group sets a `bg`
+reads as a filled badge, not dark-on-dark) — see Phase 6 for the exact per-client
+coverage (the GUI paints the chunk `bg` as a quad behind the glyph; the web's
+JS-highlight `renderLine` path paints every position — inline rides DOM flow). The GUI output is not agent-verifiable
+(window not screencapturable); the web is verifiable via the edithost Playwright
+harness but that wasn't run in-session. Build + clippy are clean on every touched
+crate; the visual output of the GUI/web paint is **not** yet eyeballed.
 
 ## Problem
 
@@ -192,17 +197,67 @@ tests per project convention).
     `(start, priority, id)` sort already makes priority the tie-break at a shared
     anchor; locked with `virt_text_marks_emit_in_priority_order` (high-priority mark
     created first, so only priority — not id — can produce the asserted order).
-  - ⏳ `hl_mode` `combine`/`blend` (deferred from Phase 4 — merge the chunk highlight
-    with the cells under an overlay; today all render `replace`). **Client-render-only**
-    — the `hl_mode` code already rides the wire, so this is purely `nxvim-tui` /
-    `nxvim-gui` / web paint and is **not** observable through the redraw harness (only
-    visually). Grouped with the paint-parity batch below.
-  - ⏳ **GUI + web client paint parity** for all `virt_text` positions **and**
-    `virt_lines` (the wire data already reaches them; only `nxvim-gui` / web render
-    code is pending — see the client-coverage note up top). Not agent-verifiable.
-  - ⏳ virtual rows on the scroll-animation band; `virt_lines_leftcol`;
-    `virt_text_repeat_linebreak` (no-op without wrap, documented); wasm edit-host
-    parity (cfg-gate as needed).
+  - ✅ **`hl_mode` `combine`/`blend`** (deferred from Phase 4). **Client-render-only**
+    — the `hl_mode` code already rode the wire, so this is purely client paint and is
+    **not** observable through the redraw harness (only visually). Applies to overlay /
+    win_col placements (the only ones with cells underneath; eol / inline / right_align /
+    virt_lines have nothing under them, so they always render `replace`). Coverage:
+    **TUI** full (fg + bg via `apply_hl_mode` = `Style::patch` for combine, channel
+    average for blend; resolved at the overlay's start column); **GUI** the chunk's
+    own fg+bg paint (bg via a quad behind the glyph, `push_seg_backgrounds`), and the
+    `hl_mode` *merge* applies to the foreground (`virt_overlay_fg`); the bg is painted
+    as `replace` (the `combine`/`blend` bg blend is deferred — the GUI has no per-cell
+    underlying bg to merge with); **web** fg + chunk bg, with `blend` averaging hex fg
+    (`blendHex`). Documented at `apply_hl_mode` / `virt_overlay_fg` / `blendHex`.
+  - ✅ **GUI + web client paint parity** for `virt_text` positions and `virt_lines`.
+    **GUI** (`nxvim-gui/render.rs`): eol, inline, overlay, win_col, right_align, and
+    `virt_lines` rows all paint — inline/overlay via segment transforms (`apply_row_virt`
+    + `splice_insertions`, merged with the inlay splice), eol/right_align as positioned
+    text items, the cursor shift extended by `virt_inline_shift`. **web**
+    (`nxvim-edithost/web/index.html`): `virt_lines` rows, eol, inline, overlay/win_col
+    (in-place cell overwrite), and right_align all paint on the JS-highlight `renderLine`
+    path. Inline rides DOM flow — emitting the chunk span before its anchor cell shifts
+    the following glyphs / cursor / selection right with no painted-column math (unlike
+    the TUI/GUI grid). **Two follow-up fixes** after the first landing: (1) chunk
+    backgrounds (a `bg`-carrying group rendered dark-on-dark — fixed by painting the bg);
+    (2) the un-gate interned virt styles into the global palette, which flipped the web's
+    `serverStyled` heuristic (`styles.length > 0`) on and routed code buffers to the
+    no-virt `renderLineServer` path (and dropped JS highlighting) — fixed by keying
+    `serverStyled` off real per-window highlight *spans*, not palette size. Build + clippy
+    clean; web JS syntax-checked. Not agent-verified visually.
+  - ✅ **wasm edit-host parity** — `virt_text` / `virt_lines` are no longer
+    `#[cfg(feature = "native")]`-gated in `redraw.rs`; the projections are pure
+    (core extmark store + `StyleTable`), so the wasm/serverless build emits the same
+    wire. Builds clean on `native` and `--no-default-features`.
+  - ⏳ **`virt_lines_leftcol`** (start a virtual line over the gutter rather than the
+    text body) — accepted + stored Lua-side, but painting it needs a per-virtual-row
+    flag threaded through the core row layout (`Buffer::virt_lines_by_line` /
+    `window_rows` / `WindowView.virt_lines`) and the wire, then honored in all three
+    clients. Until then virtual lines start at the text body's left edge. Documented in
+    `api.lua`'s `EXTMARK_OPT_DECORATION` note.
+  - ✅ **`virt_text_repeat_linebreak`** — a no-op **by design**: it only repeats the
+    virt text at a soft-wrap boundary, and nxvim has no `'wrap'` option, so there's no
+    wrap point. Accepted + stored Lua-side; documented as a deliberate no-op in `api.lua`.
+  - ✅ **`virt_text` placements on the scroll-animation band** — eol / inline / overlay /
+    win_col / right_align text now rides the slide instead of flashing out and back when
+    it settles. Projected in `project_band` keyed on `s.numbers` (like highlights / inlay,
+    un-gated so wasm carries it), threaded through `ScrollData` / the TUI `Animation` / the
+    GUI `ScrollAnim`. TUI slices it into the band like `inlay_hints` (full fidelity); web
+    `bandWindow` passes it to `renderLine` (full); GUI band splices inline/overlay into the
+    sliding segments (eol / right_align / chunk-bg are skipped mid-slide — a brief transient
+    on the ~150ms animation, since the band paints at fractional `y` where the cell-row bg/
+    eol helpers don't apply).
+  - ✅ **`virt_lines` whole-rows + smooth scrolling — instant-scroll fallback.** The band
+    is buffer-line-based (`ScrollAnim` is one row per buffer line, no interleaved virtual
+    rows), so a slide can't place virtual rows without detaching them from their anchor
+    line mid-slide (they flashed out and back). Rather than animate them wrong, core now
+    **suppresses the scroll gesture when the slide's buffer-line range contains any
+    `virt_lines`** (`view.rs`, gated on `Buffer::virt_lines_by_line().range(..)`), so that
+    scroll snaps instantly to the settled frame — where the view's interleaved layout
+    renders the virtual rows correctly. No flash, no detachment; the cost is that a scroll
+    *through* a virt_lines region isn't smooth-animated. A scroll with only `virt_text`
+    (or none) keeps its smooth slide. The full smooth-over-virtual-rows animation (the band
+    rebuilt in screen-row units with the offset math reworked) remains a larger follow-up.
   - **`examples/virt-text/` added** (`init.lua` + `sample.txt`) covering every
     `virt_text` position, `virt_lines` (above / below), and a `virt_text_hide` mark.
     Its code paths are covered by the black-box tests; the example itself hasn't been

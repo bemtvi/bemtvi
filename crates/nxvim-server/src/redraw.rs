@@ -313,21 +313,16 @@ impl EditHost {
         #[cfg(not(feature = "native"))]
         let special_key = special_key_spans(&win.lines, win.tabstop);
         let status = self.status_value(win, mode_label, statusline_fmt, styles);
-        // Extmark virtual text is a native-only projection (the wasm edit-host has no
-        // server-side extmark store frame loop); the browser emits an empty array so
-        // the redraw map keeps a stable shape.
-        #[cfg(feature = "native")]
+        // Extmark virtual text. The extmark store lives in core (shared with the wasm
+        // edit-host, which runs the same `nx.buf.set_extmark` Lua and the same `nx.decor`
+        // publish loop), so this projects on **both** builds — unlike the treesitter /
+        // LSP overlays above, which are genuinely native-only. The wire shape is the
+        // same on either build; only the transport differs.
         let virt_text = self.virt_text_for(win.buffer, &win.numbers, &win.selection, styles);
-        #[cfg(not(feature = "native"))]
-        let virt_text = Value::Array(Vec::new());
-        // Extmark `virt_lines` (whole virtual rows). Core already interleaved them
-        // into the window's rows (`win.virt_lines`, aligned with `lines`); the server
-        // only resolves each chunk's `hl_group` to a frame style id. Native-only, like
-        // the other extmark projections; the wasm edit-host emits an empty array.
-        #[cfg(feature = "native")]
+        // Extmark `virt_lines` (whole virtual rows). Core already interleaved them into
+        // the window's rows (`win.virt_lines`, aligned with `lines`); the server only
+        // resolves each chunk's `hl_group` to a frame style id. Shared like `virt_text`.
         let virt_lines = self.virt_lines_value(&win.virt_lines, styles);
-        #[cfg(not(feature = "native"))]
-        let virt_lines = Value::Array(Vec::new());
         #[cfg(feature = "native")]
         let (diagnostics, diagnostics_virt, diagnostics_signs, sign_column, inlay_hints) = (
             self.diagnostics_for(win.buffer, &win.numbers, styles),
@@ -785,6 +780,14 @@ impl EditHost {
         let inlay_hints = self.inlay_hints_for(buffer, &s.numbers, styles);
         #[cfg(not(feature = "native"))]
         let inlay_hints = Value::Array(Vec::new());
+        // Extmark `virt_text` placements ride the band too (keyed on `s.numbers` like
+        // highlights), so eol / inline / overlay / win_col / right_align text slides
+        // with the line instead of flashing out and back when the slide settles. Pure
+        // projection (un-gated, like `window_value`), so the wasm band carries it too.
+        // (`virt_lines` whole-rows are *not* on the band: it is buffer-line-based and
+        // doesn't model the interleaved virtual rows — those still appear only at the
+        // settled frame. Carrying them needs the band rebuilt in screen-row units.)
+        let virt_text = self.virt_text_for(buffer, &s.numbers, &s.selection, styles);
         Value::Map(vec![
             (Value::from("from_top"), Value::from(s.from_top as u64)),
             (Value::from("to_top"), Value::from(s.to_top as u64)),
@@ -808,6 +811,7 @@ impl EditHost {
             (Value::from("numbers"), numbers_value(&s.numbers)),
             (Value::from("highlights"), highlights),
             (Value::from("inlay_hints"), inlay_hints),
+            (Value::from("virt_text"), virt_text),
         ])
     }
 

@@ -58,7 +58,9 @@ use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use nxvim_rpc::{connect, Incoming, Rpc};
-use nxvim_view::{encode_paste, HlSpan, InlayHint, ResizeCursor, ScrollData, Style, View};
+use nxvim_view::{
+    encode_paste, HlSpan, InlayHint, ResizeCursor, ScrollData, Style, View, VirtPlacement,
+};
 use rmpv::Value;
 use winit::application::ApplicationHandler;
 use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
@@ -427,6 +429,9 @@ struct ScrollAnim {
     search: Vec<Vec<(u16, u16)>>,
     incsearch: Vec<Option<(u16, u16)>>,
     inlay_hints: Vec<Vec<InlayHint>>,
+    /// Extmark `virt_text` placements for the band, so they slide with the line
+    /// instead of flashing out and back when the slide settles.
+    virt_text: Vec<Vec<VirtPlacement>>,
     styles: Vec<Style>,
 }
 
@@ -448,6 +453,7 @@ impl ScrollAnim {
             search: s.search.clone(),
             incsearch: s.incsearch.clone(),
             inlay_hints: s.inlay_hints.clone(),
+            virt_text: s.virt_text.clone(),
             styles: s.styles.clone(),
         }
     }
@@ -481,6 +487,7 @@ impl ScrollAnim {
             search: &self.search,
             incsearch: &self.incsearch,
             inlay_hints: &self.inlay_hints,
+            virt_text: &self.virt_text,
             styles: &self.styles,
         }
     }

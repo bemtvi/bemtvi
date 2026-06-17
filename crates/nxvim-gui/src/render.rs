@@ -33,8 +33,8 @@ use glyphon::{
     TextArea, TextAtlas, TextBounds, TextRenderer, Viewport,
 };
 use nxvim_view::{
-    Geometry, InlayHint, PanelData, ResizeCursor, StatusSegment, Style, TabData, View,
-    WindowRegion, WindowView,
+    Geometry, InlayHint, PanelData, ResizeCursor, StatusSegment, Style, TabData, View, VirtChunk,
+    VirtPlacement, WindowRegion, WindowView,
 };
 use winit::window::Window;
 
@@ -85,16 +85,24 @@ struct CacheEntry {
 pub struct Seg {
     pub text: String,
     pub fg: u32,
+    /// An explicit background, painted as a quad behind the glyph (the shaper only
+    /// draws foregrounds). `None` for ordinary text — the window's normal background
+    /// already covers it. Set for extmark `virt_text` chunks whose highlight group
+    /// carries a `bg` (e.g. a colored inline label), so they read as a filled badge
+    /// rather than dark-on-dark. Not part of the shaped-buffer cache key (the shaped
+    /// glyphs are bg-independent); see [`Renderer::push_seg_backgrounds`].
+    pub bg: Option<u32>,
     pub bold: bool,
     pub italic: bool,
 }
 
 impl Seg {
-    /// A plain run with no weight/slant — gutter numbers, status text, etc.
+    /// A plain run with no weight/slant / background — gutter numbers, status text, etc.
     pub fn plain(text: String, fg: u32) -> Self {
         Self {
             text,
             fg,
+            bg: None,
             bold: false,
             italic: false,
         }
@@ -141,6 +149,9 @@ pub struct ScrollFrame<'a> {
     /// Inline inlay hints for the band (aligned with `lines`), so they slide with
     /// the text instead of vanishing until the slide settles.
     pub inlay_hints: &'a [Vec<InlayHint>],
+    /// Extmark `virt_text` placements for the band (aligned with `lines`), so they
+    /// slide with the line instead of flashing out and back when the slide settles.
+    pub virt_text: &'a [Vec<VirtPlacement>],
     pub styles: &'a [Style],
 }
 
@@ -953,11 +964,19 @@ impl Renderer {
                         }
                     }
                     let hl = s.highlights.get(k).map(Vec::as_slice).unwrap_or(&[]);
+                    let vtext = s.virt_text.get(k).map(Vec::as_slice).unwrap_or(&[]);
                     let mut segments =
                         row_segments(&display, hl, s.styles, fg, slide_bg, win.leftcol);
-                    // Splice the band row's inlay hints in, like the settled path, so
-                    // they slide with the text instead of vanishing during the slide.
-                    segments = splice_inlay(segments, inlay, win.leftcol, s.styles);
+                    // Splice the band row's inlay hints and inline/overlay virt_text in,
+                    // like the settled path, so they slide with the text instead of
+                    // flashing out and back when the slide settles. (eol / right_align /
+                    // chunk backgrounds aren't painted mid-slide — a brief transient on
+                    // the ~150ms animation; they settle into place when it ends.)
+                    segments = if vtext.is_empty() {
+                        splice_inlay(segments, inlay, win.leftcol, s.styles)
+                    } else {
+                        apply_row_virt(segments, inlay, vtext, win.leftcol, s.styles, fg)
+                    };
                     let x = text_run_origin(text_x0, win.leftcol) as f32 * self.cell_w;
                     self.push_text(items, &segments, (x, y), fg, clip);
                 }
@@ -981,6 +1000,30 @@ impl Renderer {
                 let normal_bg = style_bg(&view.normal).unwrap_or(DEFAULT_BG);
                 for (i, raw) in win.lines.iter().enumerate() {
                     let row = oy as usize + i;
+
+                    // A `virt_lines` virtual row: a whole extra screen line of extmark
+                    // chunk text, interleaved by core (it has `numbers[i] == None`, so no
+                    // gutter number, and an empty `lines[i]`). Paint the chunks from the
+                    // text origin (no selection / search / cursor / diagnostics) and skip
+                    // the rest of the row. `virt_lines_leftcol` (start over the gutter) is
+                    // a later refinement — today virtual rows begin at the text body.
+                    if let Some(Some(chunks)) = win.virt_lines.get(i) {
+                        let segs: Vec<Seg> = chunks
+                            .iter()
+                            .map(|(t, id)| virt_chunk_seg(t, *id, &view.styles, fg))
+                            .collect();
+                        let pos = self.cell_px(text_x0, row as u16);
+                        self.push_seg_backgrounds(
+                            quads,
+                            &segs,
+                            text_x0,
+                            row,
+                            (ox + wcols) as f32 * self.cell_w,
+                        );
+                        self.push_text(items, &segs, pos, fg, text_clip);
+                        continue;
+                    }
+
                     // Tab-expand so a char index equals a screen column (ASCII
                     // path); the highlight spans on the wire are screen-column based.
                     let display = expand_tabs(raw, win.tabstop.max(1) as usize);
@@ -1075,9 +1118,17 @@ impl Renderer {
                     // glyph) go under the text; underline/strikethrough rules go over
                     // it. Both walk the same highlight spans (see the methods).
                     self.push_reverse_fills(quads, win, view, text_x0, row, hl, inlay);
+                    let vtext = win.virt_text.get(i).map(Vec::as_slice).unwrap_or(&[]);
                     let mut segments =
                         row_segments(&display, hl, &view.styles, fg, normal_bg, win.leftcol);
-                    segments = splice_inlay(segments, inlay, win.leftcol, &view.styles);
+                    // Inline + overlay extmark `virt_text` transform the base segments
+                    // (shift / overwrite); inlay hints splice in too. The common no-virt
+                    // row keeps the cheaper inlay-only splice (tested path, untouched).
+                    segments = if vtext.is_empty() {
+                        splice_inlay(segments, inlay, win.leftcol, &view.styles)
+                    } else {
+                        apply_row_virt(segments, inlay, vtext, win.leftcol, &view.styles, fg)
+                    };
                     // The run begins at the first *visible* column (`row_segments`
                     // already dropped the off-screen-left ones), so it starts at the
                     // text origin — not `leftcol` cells back over the gutter. Clip it
@@ -1085,6 +1136,18 @@ impl Renderer {
                     // off at the edge instead of bleeding into the next split.
                     let pos = self.cell_px(text_run_origin(text_x0, win.leftcol), row as u16);
                     self.push_text(items, &segments, pos, fg, text_clip);
+                    // Background quads for any virt_text chunk (inline / overlay) whose
+                    // group set a `bg` — the shaper only draws fgs, and all quads render
+                    // under all glyphs, so this paints the badge behind the chunk.
+                    if !vtext.is_empty() {
+                        self.push_seg_backgrounds(
+                            quads,
+                            &segments,
+                            text_run_origin(text_x0, win.leftcol),
+                            row,
+                            (ox + wcols) as f32 * self.cell_w,
+                        );
+                    }
                     self.push_attr_rules(quads, win, view, text_x0, row, hl, inlay);
 
                     // LSP diagnostic underlines, painted last so they survive over
@@ -1137,6 +1200,95 @@ impl Renderer {
                                 );
                             }
                         }
+
+                        // Extmark end-of-line / right-aligned `virt_text`. The painted
+                        // width past which they sit includes the inlay hints **and** the
+                        // inline `virt_text` spliced into the row (the same shifts the
+                        // cursor takes). eol chunks paint after a one-cell gap; a
+                        // right_align run flushes to the window's right edge, clamped to
+                        // never overlap the painted text.
+                        if !vtext.is_empty() {
+                            let right_px = (ox + wcols) as f32 * self.cell_w;
+                            let inlay_inserted = inlay_shift(inlay, win.leftcol, u16::MAX, true);
+                            let virt_inserted = virt_inline_shift(vtext, win.leftcol, u16::MAX);
+                            let painted =
+                                (display.chars().count().saturating_sub(win.leftcol as usize)
+                                    + inlay_inserted as usize
+                                    + virt_inserted as usize)
+                                    as u16;
+                            // eol: one gap, then each placement's chunks in order.
+                            let mut x = text_x0 + painted + 1;
+                            for p in vtext.iter().filter(|p| p.pos == VIRT_POS_EOL) {
+                                for (t, id) in &p.chunks {
+                                    let limit = (ox + wcols).saturating_sub(x);
+                                    if limit == 0 {
+                                        break;
+                                    }
+                                    let shown: String = t.chars().take(limit as usize).collect();
+                                    if shown.is_empty() {
+                                        break;
+                                    }
+                                    let seg = virt_chunk_seg(&shown, *id, &view.styles, fg);
+                                    self.push_seg_backgrounds(
+                                        quads,
+                                        std::slice::from_ref(&seg),
+                                        x,
+                                        row,
+                                        right_px,
+                                    );
+                                    self.push_text(
+                                        items,
+                                        &[seg],
+                                        self.cell_px(x, row as u16),
+                                        fg,
+                                        full,
+                                    );
+                                    x += shown.chars().count() as u16;
+                                }
+                            }
+                            // right_align: stacked chunks flushed to the right edge.
+                            let ra: Vec<&VirtChunk> = vtext
+                                .iter()
+                                .filter(|p| p.pos == VIRT_POS_RIGHT_ALIGN)
+                                .flat_map(|p| p.chunks.iter())
+                                .collect();
+                            if !ra.is_empty() {
+                                let total: u16 =
+                                    ra.iter().map(|(t, _)| t.chars().count() as u16).sum();
+                                // Start no earlier than the painted text (left-justify +
+                                // truncate if the row is already full), no later than the
+                                // right edge.
+                                let mut rx = (ox + wcols)
+                                    .saturating_sub(total)
+                                    .max(text_x0 + painted + 1);
+                                for (t, id) in ra {
+                                    let limit = (ox + wcols).saturating_sub(rx);
+                                    if limit == 0 {
+                                        break;
+                                    }
+                                    let shown: String = t.chars().take(limit as usize).collect();
+                                    if shown.is_empty() {
+                                        break;
+                                    }
+                                    let seg = virt_chunk_seg(&shown, *id, &view.styles, fg);
+                                    self.push_seg_backgrounds(
+                                        quads,
+                                        std::slice::from_ref(&seg),
+                                        rx,
+                                        row,
+                                        right_px,
+                                    );
+                                    self.push_text(
+                                        items,
+                                        &[seg],
+                                        self.cell_px(rx, row as u16),
+                                        fg,
+                                        full,
+                                    );
+                                    rx += shown.chars().count() as u16;
+                                }
+                            }
+                        }
                     }
                 }
 
@@ -1177,7 +1329,15 @@ impl Renderer {
                         .get(win.cursor_row as usize)
                         .map(Vec::as_slice)
                         .unwrap_or(&[]);
+                    // Inline `virt_text` spliced at or before the cursor pushes it right
+                    // too — the GUI analogue of the TUI's `virt_cursor_shift`.
+                    let row_vtext = win
+                        .virt_text
+                        .get(win.cursor_row as usize)
+                        .map(Vec::as_slice)
+                        .unwrap_or(&[]);
                     inlay_shift(row_inlay, win.leftcol, win.cursor_screen_col, true)
+                        + virt_inline_shift(row_vtext, win.leftcol, win.cursor_screen_col)
                 }
                 Some(s) => {
                     let idx = (s.cursor.round() as usize).saturating_sub(s.base_line);
@@ -2430,6 +2590,42 @@ impl Renderer {
         });
     }
 
+    /// Paint background quads behind any [`Seg`] carrying an explicit `bg` (extmark
+    /// `virt_text` chunks whose highlight group sets one). `segments` are laid out
+    /// contiguously from screen column `start_col`, so each bg run covers its own
+    /// cells; the quad's right edge is clamped to `right_px` (the window's content
+    /// edge) so a chunk near the edge doesn't bleed into the next split. Quads render
+    /// under the glyphs, so the chunk reads as a filled badge rather than dark-on-dark.
+    fn push_seg_backgrounds(
+        &self,
+        quads: &mut Vec<Quad>,
+        segments: &[Seg],
+        start_col: u16,
+        row: usize,
+        right_px: f32,
+    ) {
+        let mut col = start_col;
+        for seg in segments {
+            let w = seg.text.chars().count() as u16;
+            if let Some(bg) = seg.bg {
+                if w > 0 {
+                    let (px, py) = self.cell_px(col, row as u16);
+                    let right = (px + self.cell_w * w as f32).min(right_px);
+                    if right > px {
+                        quads.push(Quad {
+                            x: px,
+                            y: py,
+                            w: right - px,
+                            h: self.cell_h,
+                            color: color_to_rgba(srgb_to_color(bg)),
+                        });
+                    }
+                }
+            }
+            col += w;
+        }
+    }
+
     /// Pixel origin of cell `(col, row)`.
     fn cell_px(&self, col: u16, row: u16) -> (f32, f32) {
         (col as f32 * self.cell_w, row as f32 * self.cell_h)
@@ -2796,6 +2992,7 @@ pub fn row_segments(
                 segments.push(Seg {
                     text,
                     fg: color,
+                    bg: None,
                     bold: st.bold,
                     italic: st.italic,
                 });
@@ -2807,6 +3004,7 @@ pub fn row_segments(
                 segments.push(Seg {
                     text,
                     fg: color,
+                    bg: None,
                     bold: false,
                     italic,
                 });
@@ -2895,6 +3093,7 @@ pub fn splice_inlay(
                     out.push(Seg {
                         text: seg_chars[start..k].iter().collect(),
                         fg: seg.fg,
+                        bg: seg.bg,
                         bold: seg.bold,
                         italic: seg.italic,
                     });
@@ -2907,6 +3106,7 @@ pub fn splice_inlay(
             out.push(Seg {
                 text: seg_chars[start..].iter().collect(),
                 fg: seg.fg,
+                bg: seg.bg,
                 bold: seg.bold,
                 italic: seg.italic,
             });
@@ -2942,6 +3142,231 @@ fn push_hint_segs(
             .unwrap_or(DEFAULT_INLAY);
         out.push(Seg::plain(text.clone(), color));
     }
+}
+
+/// Placement `pos` tags on the `virt_text` wire (mirror the server's `VirtTextPos`
+/// and the TUI's `VIRT_POS_*`): 0=eol, 1=inline, 2=overlay, 3=right_align,
+/// 4=win_col.
+const VIRT_POS_EOL: u8 = 0;
+const VIRT_POS_INLINE: u8 = 1;
+const VIRT_POS_OVERLAY: u8 = 2;
+const VIRT_POS_RIGHT_ALIGN: u8 = 3;
+const VIRT_POS_WIN_COL: u8 = 4;
+
+/// Resolve a virtual-text chunk to a GUI [`Seg`]: the colorscheme palette entry the
+/// server interned for its `hl_group` (foreground + bold/italic), else the window's
+/// normal `fg`. The GUI paints glyph **foregrounds** (backgrounds are quads), so a
+/// chunk's background and the `hl_mode` background merge aren't modelled — only the
+/// foreground (deferred bg fidelity, like wide-char).
+fn virt_chunk_seg(text: &str, id: Option<usize>, styles: &[Style], fg: u32) -> Seg {
+    match id.and_then(|i| styles.get(i)) {
+        Some(st) => {
+            // `reverse` swaps fg/bg (matching the base text path); otherwise the
+            // group's own fg/bg. A `bg` is painted as a quad behind the chunk.
+            let (f, b) = if st.reverse {
+                (st.bg, st.fg)
+            } else {
+                (st.fg, st.bg)
+            };
+            Seg {
+                text: text.to_string(),
+                fg: f.unwrap_or(fg),
+                bg: b,
+                bold: st.bold,
+                italic: st.italic,
+            }
+        }
+        None => Seg::plain(text.to_string(), fg),
+    }
+}
+
+/// The foreground for an overlay/win_col chunk over a cell whose glyph foreground is
+/// `under_fg`, per `hl_mode`: `replace` (0) and `combine` (1) keep the chunk's own
+/// fg (it is the set attribute); `blend` (2) averages the two channel-wise — a
+/// coarse terminal-cell analogue of neovim's alpha blend (exact pixel blending isn't
+/// expressible per glyph). Mirrors the TUI's [`apply_hl_mode`] at fg fidelity.
+fn virt_overlay_fg(chunk_fg: u32, under_fg: u32, mode: u8) -> u32 {
+    if mode == 2 {
+        let mix = |sh: u32| {
+            let a = (chunk_fg >> sh) & 0xff;
+            let b = (under_fg >> sh) & 0xff;
+            (a + b) / 2
+        };
+        (mix(16) << 16) | (mix(8) << 8) | mix(0)
+    } else {
+        chunk_fg
+    }
+}
+
+/// The combined cell width of the inline `virt_text` placements on a row at or
+/// before screen column `col` (with placements scrolled off the left excluded) —
+/// how far the inline splice pushes a glyph/cursor at `col` to the right. The
+/// `virt_text` analogue of [`inlay_shift`]; the cursor adds both.
+fn virt_inline_shift(vtext: &[VirtPlacement], leftcol: u16, col: u16) -> u16 {
+    vtext
+        .iter()
+        .filter(|p| p.pos == VIRT_POS_INLINE && p.col >= leftcol && p.col <= col)
+        .flat_map(|p| p.chunks.iter())
+        .map(|(t, _)| t.chars().count() as u16)
+        .sum()
+}
+
+/// Splice a column-anchored insertion list into a row's colored `base` segments,
+/// pushing later text right — the generalization of [`splice_inlay`] that carries
+/// both inlay hints and inline `virt_text`. Each insertion is already-styled
+/// segments at an **original screen column**; `base` covers `[leftcol, n)`
+/// contiguously, so we walk it and, before the glyph at an insertion's column,
+/// flush the pending run and emit the insertion. Insertions must be sorted ascending
+/// by column (ties keep list order — the caller orders inlay before inline virt at a
+/// shared column, matching the TUI's walk); those at or past end-of-text are appended.
+fn splice_insertions(base: Vec<Seg>, insertions: &[(u16, Vec<Seg>)], leftcol: u16) -> Vec<Seg> {
+    if insertions.is_empty() {
+        return base;
+    }
+    let mut out: Vec<Seg> = Vec::with_capacity(base.len() + insertions.len() * 2);
+    let mut col = leftcol as usize;
+    let mut ii = 0usize;
+    let emit_at = |out: &mut Vec<Seg>, ii: &mut usize, c: usize| {
+        while *ii < insertions.len() && (insertions[*ii].0 as usize) <= c {
+            out.extend(insertions[*ii].1.iter().cloned());
+            *ii += 1;
+        }
+    };
+    for seg in base {
+        let seg_chars: Vec<char> = seg.text.chars().collect();
+        let mut start = 0usize;
+        for k in 0..seg_chars.len() {
+            let c = col + k;
+            if ii < insertions.len() && (insertions[ii].0 as usize) <= c {
+                if k > start {
+                    out.push(Seg {
+                        text: seg_chars[start..k].iter().collect(),
+                        fg: seg.fg,
+                        bg: seg.bg,
+                        bold: seg.bold,
+                        italic: seg.italic,
+                    });
+                }
+                emit_at(&mut out, &mut ii, c);
+                start = k;
+            }
+        }
+        if start < seg_chars.len() {
+            out.push(Seg {
+                text: seg_chars[start..].iter().collect(),
+                fg: seg.fg,
+                bg: seg.bg,
+                bold: seg.bold,
+                italic: seg.italic,
+            });
+        }
+        col += seg_chars.len();
+    }
+    // Insertions anchored at or past end-of-text.
+    while ii < insertions.len() {
+        out.extend(insertions[ii].1.iter().cloned());
+        ii += 1;
+    }
+    out
+}
+
+/// Build a row's final segments by overwriting the cells covered by `overlay` /
+/// `win_col` `virt_text` (no shift — they replace the glyphs they cover, honoring
+/// `hl_mode` at fg fidelity) and splicing in the inline insertions — LSP inlay hints
+/// **and** inline `virt_text` — which push later glyphs right. The GUI analogue of
+/// the TUI's single-walk `highlight_line`. Used only when a row actually carries
+/// `virt_text`; the common (no-virt) row keeps the cheaper [`splice_inlay`] path.
+fn apply_row_virt(
+    base: Vec<Seg>,
+    inlay: &[InlayHint],
+    vtext: &[VirtPlacement],
+    leftcol: u16,
+    styles: &[Style],
+    fg: u32,
+) -> Vec<Seg> {
+    // Expand `base` to a per-cell grid (its first cell is at absolute column
+    // `leftcol`), so overlay/win_col can overwrite individual columns. Each cell
+    // carries `(char, fg, bg, bold, italic)` so an overlay's background rides through.
+    let mut cells: Vec<(char, u32, Option<u32>, bool, bool)> = Vec::new();
+    for seg in &base {
+        for ch in seg.text.chars() {
+            cells.push((ch, seg.fg, seg.bg, seg.bold, seg.italic));
+        }
+    }
+    for p in vtext
+        .iter()
+        .filter(|p| p.pos == VIRT_POS_OVERLAY || p.pos == VIRT_POS_WIN_COL)
+    {
+        let mut abs = p.col as usize; // absolute screen column the overlay starts on
+        for (text, id) in &p.chunks {
+            let seg = virt_chunk_seg(text, *id, styles, fg);
+            for ch in text.chars() {
+                if abs < leftcol as usize {
+                    abs += 1; // scrolled off the left edge
+                    continue;
+                }
+                let k = abs - leftcol as usize;
+                let under_fg = cells.get(k).map(|c| c.1).unwrap_or(fg);
+                let ofg = virt_overlay_fg(seg.fg, under_fg, p.hl_mode);
+                let cell = (ch, ofg, seg.bg, seg.bold, seg.italic);
+                if k < cells.len() {
+                    cells[k] = cell;
+                } else {
+                    // Past end-of-text (a fixed-column guide on a short line): pad with
+                    // blanks up to the column, then place the glyph.
+                    while cells.len() < k {
+                        cells.push((' ', fg, None, false, false));
+                    }
+                    cells.push(cell);
+                }
+                abs += 1;
+            }
+        }
+    }
+    // Recompress the grid into coalesced runs of identical style.
+    let mut segs: Vec<Seg> = Vec::new();
+    for (ch, f, bg, b, it) in cells {
+        match segs.last_mut() {
+            Some(last) if last.fg == f && last.bg == bg && last.bold == b && last.italic == it => {
+                last.text.push(ch)
+            }
+            _ => segs.push(Seg {
+                text: ch.to_string(),
+                fg: f,
+                bg,
+                bold: b,
+                italic: it,
+            }),
+        }
+    }
+    // Inline insertions: inlay hints (their resolved `LspInlayHint` fg, else
+    // `DEFAULT_INLAY`) and inline `virt_text` chunks, keyed on original column.
+    // A stable sort keeps inlay before inline virt at a shared column (the order the
+    // TUI's walk emits them).
+    let mut insertions: Vec<(u16, Vec<Seg>)> = Vec::new();
+    for (hcol, text, id) in inlay {
+        if *hcol < leftcol {
+            continue; // scrolled off the left edge
+        }
+        let color = id
+            .and_then(|i| styles.get(i))
+            .and_then(|s| s.fg)
+            .unwrap_or(DEFAULT_INLAY);
+        insertions.push((*hcol, vec![Seg::plain(text.clone(), color)]));
+    }
+    for p in vtext.iter().filter(|p| p.pos == VIRT_POS_INLINE) {
+        if p.col < leftcol {
+            continue;
+        }
+        let chunk_segs: Vec<Seg> = p
+            .chunks
+            .iter()
+            .map(|(t, id)| virt_chunk_seg(t, *id, styles, fg))
+            .collect();
+        insertions.push((p.col, chunk_segs));
+    }
+    insertions.sort_by_key(|(c, _)| *c);
+    splice_insertions(segs, &insertions, leftcol)
 }
 
 /// Content hash for the shaped-buffer cache: the segments' text + colors and the

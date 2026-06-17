@@ -53,6 +53,12 @@ pub struct ScrollData {
     /// with the text rather than vanishing until the slide settles. Like the
     /// per-window `inlay_hints`, each entry is `[col, text, style_id]`.
     pub inlay_hints: Vec<Vec<InlayHint>>,
+    /// Extmark `virt_text` placements for the band (aligned with `lines`), so eol /
+    /// inline / overlay / win_col / right_align text slides with the line instead of
+    /// flashing out and back when the slide settles. Same shape as the per-window
+    /// `virt_text`. (`virt_lines` whole-rows are not on the band — it is buffer-line
+    /// based and doesn't carry the interleaved virtual rows.)
+    pub virt_text: Vec<Vec<VirtPlacement>>,
     /// The style palette captured with this gesture. Snapshotted (not read live
     /// from [`View::styles`]) because a delayed highlight redraw arriving
     /// mid-slide replaces the live palette, which would leave the band's frozen
@@ -752,6 +758,7 @@ fn parse_window(m: &[(Value, Value)], styles: &[Style]) -> WindowView {
             numbers: parse_numbers(map_get(s, "numbers")),
             highlights: parse_highlights(map_get(s, "highlights")),
             inlay_hints: parse_inlay_hints(map_get(s, "inlay_hints")),
+            virt_text: parse_virt_text(map_get(s, "virt_text")),
             // The band's ids index this redraw's palette — snapshot it now, since
             // a later redraw will replace the live `styles`.
             styles: styles.to_vec(),

@@ -685,9 +685,25 @@ fn window_view(ed: &Editor, w: &WindowLayout) -> WindowView {
     };
 
     let scroll = if w.focused {
-        ed.pending_scroll().map(|ps| {
+        ed.pending_scroll().and_then(|ps| {
             let base_line = ps.from_top.min(ps.to_top);
             let count = ps.from_top.abs_diff(ps.to_top) + height;
+            // `virt_lines` (whole extra screen rows) make the band's screen-row geometry
+            // non-linear: the buffer-line-based slide can't place them without detaching
+            // them from their anchor line mid-slide. When the slide's range contains any,
+            // fall back to an **instant** scroll (no gesture → the client paints the
+            // settled frame, where the view's interleaved layout renders the virtual rows
+            // correctly) rather than animate them wrong. `virt_text` placements sit on
+            // existing lines, so they still ride the band (the common case keeps its
+            // smooth slide; only a virt_lines-containing range snaps).
+            if buf
+                .virt_lines_by_line()
+                .range(base_line..base_line.saturating_add(count))
+                .next()
+                .is_some()
+            {
+                return None;
+            }
             // The band carries the selection over the *maximal* extent the slide
             // touches: anchor → whichever scroll endpoint is furthest from the
             // anchor. Computing it at the live (destination) cursor would carry the
@@ -718,7 +734,7 @@ fn window_view(ed: &Editor, w: &WindowLayout) -> WindowView {
             // duration of the animation and snapping back when it settles.
             let (band_search, band_incsearch) =
                 ed.search_highlights_in(buf, w.cursor, w.focused, base_line, count);
-            ScrollAnim {
+            Some(ScrollAnim {
                 from_top: ps.from_top,
                 to_top: ps.to_top,
                 from_cursor: ps.from_cursor,
@@ -731,7 +747,7 @@ fn window_view(ed: &Editor, w: &WindowLayout) -> WindowView {
                 numbers: window_numbers(base_line, count, line_count),
                 search: band_search,
                 incsearch: band_incsearch,
-            }
+            })
         })
     } else {
         None

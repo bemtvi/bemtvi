@@ -369,13 +369,22 @@ local EXTMARK_OPT_OK = {
 }
 -- Decoration options nxvim ACCEPTS and STORES (so nvim_buf_get_extmarks(…,
 -- {details=true}) returns them), forwarded to the server as the `decoration` payload.
--- `virt_text` / `virt_lines` (with their `virt_text_pos` / `hl_mode` / `win_col`
--- modifiers) RENDER end to end; the rest — signs, conceal, the line-highlight groups,
--- and the gravity flags — are accepted and stored but NOT yet painted. A documented
--- approximation (the matchadd / winblend pattern): a plugin that decorates with, say,
--- gutter signs loads and runs; those supplementary glyphs just aren't painted yet.
--- Rejecting them loud would instead break the plugin's render path. The core extmark
--- store still tracks the mark's POSITION (for get_extmarks) regardless.
+-- `virt_text` / `virt_lines` (with their `virt_text_pos` / `hl_mode` / `win_col` /
+-- `virt_lines_above` / `virt_text_hide` modifiers) RENDER end to end across the TUI,
+-- GUI, and web clients; the rest are accepted and stored but NOT yet painted. Two of
+-- those are deliberate, not just unfinished:
+--   * `virt_text_repeat_linebreak` is a no-op BY DESIGN — it only repeats the virt
+--     text at a soft-wrap boundary, and nxvim has no soft-wrap ('wrap' isn't a
+--     modelled option), so there is no wrap point to repeat at.
+--   * `virt_lines_leftcol` (start a virtual line over the gutter rather than the text
+--     body) is a pending refinement: it needs a per-virtual-row flag threaded through
+--     the core row layout and the wire; until then virtual lines start at the text body.
+-- The remainder — signs, conceal, the line-highlight groups, and the gravity flags —
+-- are likewise accepted and stored but unpainted. A documented approximation (the
+-- matchadd / winblend pattern): a plugin that decorates with, say, gutter signs loads
+-- and runs; those supplementary glyphs just aren't painted yet. Rejecting them loud
+-- would instead break the plugin's render path. The core extmark store still tracks
+-- the mark's POSITION (for get_extmarks) regardless.
 local EXTMARK_OPT_DECORATION = {
   virt_text = true,
   virt_text_pos = true,

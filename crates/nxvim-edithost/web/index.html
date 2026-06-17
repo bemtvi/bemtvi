@@ -568,6 +568,10 @@
         secondary_selection: blanks,
         secondary_cursors: [],
         highlights: s.highlights || [],
+        // Extmark virt_text placements ride the band (keyed to the band rows), so they
+        // slide with the line instead of flashing out and back when the slide settles.
+        // (virt_lines whole-rows are not on the band — see project_band.)
+        virt_text: s.virt_text || [],
         diagnostics: [], diagnostics_virt: [], diagnostics_signs: [], inlay_hints: [],
         cursor_row: Math.round(s.to_cursor) - s.base_line,
       });
@@ -594,7 +598,7 @@
         } else {
           const bufLine = band.numbers[i];
           const lineSpans = winSpans && bufLine != null ? winSpans[bufLine - 1] : null;
-          rowEl.innerHTML = renderLine(band, i, gutterW, lineSpans);
+          rowEl.innerHTML = renderLine(band, i, gutterW, lineSpans, rect);
         }
         strip.appendChild(rowEl);
       }
@@ -761,7 +765,18 @@
       // a terminal window paints from the palette per-window below. So discount
       // terminal-only style contributions when deciding the global mode.
       const termWin = (view.windows || []).some((w) => w.term_colors ?? w.terminal);
-      serverStyled = (view.styles?.length ?? 0) > 0 && !termWin;
+      // The server is doing the per-line styling (a `:connect` daemon's colorscheme)
+      // only when it ships per-window highlight SPANS. `virt_text` / `virt_lines` also
+      // intern palette styles into `view.styles`, but on the pure-wasm build the code
+      // is still JS-highlighted and chrome JS-synthesized — so keying this off
+      // `styles.length` wrongly flipped the server-styled path on the moment a virt
+      // mark interned a style, routing code buffers to `renderLineServer` (no virt_text,
+      // no JS highlighting). Key off real highlight spans so a virt-decorated buffer
+      // stays on the `renderLine` path (which paints virt_text).
+      const serverHl = (view.windows || []).some(
+        (w) => (w.highlights || []).some((spans) => spans && spans.length)
+      );
+      serverStyled = serverHl && !termWin;
       gridEl.innerHTML = "";
       shownImagePaths = new Set(); // reset; `renderImage` records each preview shown this frame
       if (serverStyled) applyChrome();
@@ -895,6 +910,17 @@
           rowEl.className = "row";
           rowEl.style.top = r * ch + "px";
           rowEl.style.width = rect.width * cw + "px";
+          // A `virt_lines` virtual row (a whole extra screen line of extmark chunk
+          // text core interleaved here): blank gutter (its `numbers[r]` is null) + the
+          // chunk run, no cursor / selection. `virt_lines_leftcol` (start over the
+          // gutter) is a later refinement — today virtual rows begin at the text body.
+          const vlines = w.virt_lines && w.virt_lines[r];
+          if (Array.isArray(vlines)) {
+            const g = (gutterW > 0 || w.sign_column) ? renderGutterCell(w, r, gutterW) : "";
+            rowEl.innerHTML = g + virtChunksHtml(vlines);
+            box.appendChild(rowEl);
+            continue;
+          }
           if (serverStyled || (w.term_colors ?? w.terminal)) {
             // Terminal: its vt100 colors arrive as server palette spans (`w.highlights`
             // + `view.styles`), so paint via the palette path even when the global mode
@@ -905,7 +931,7 @@
           } else {
             const bufLine = w.numbers[r];
             const lineSpans = winSpans && bufLine != null ? winSpans[bufLine - 1] : null;
-            rowEl.innerHTML = renderLine(w, r, gutterW, lineSpans);
+            rowEl.innerHTML = renderLine(w, r, gutterW, lineSpans, rect);
           }
           box.appendChild(rowEl);
         }
@@ -919,7 +945,7 @@
       }
     }
 
-    function renderLine(w, row, gutterW, lineSpans) {
+    function renderLine(w, row, gutterW, lineSpans, rect) {
       const line = w.lines[row] ?? "";
       const isFiller = w.numbers[row] === null;
       let html = "";
@@ -942,6 +968,30 @@
         u16 += cp.length;
       }
 
+      // Extmark `virt_text` overlay / win_col: overwrite the glyphs at the
+      // placement's columns in place (no shift, so the column model the cursor /
+      // selection walk below relies on is preserved), honoring `hl_mode` at fg
+      // fidelity (replace/combine keep the chunk colour; blend tints with the cell
+      // underneath). Inline placements (pos 1, which shift the row) are emitted in the
+      // walk below — the DOM flows, so emitting the chunk span before its anchor cell
+      // pushes the following glyphs, cursor, and selection right with no column math.
+      const vtext = (w.virt_text && w.virt_text[row]) || [];
+      const inlineVirt = vtext.filter((p) => p[0] === 1);
+      for (const [pos, col, mode, chunks] of vtext) {
+        if (pos !== 2 && pos !== 4) continue;
+        let a = col;
+        for (const [text, id] of chunks) {
+          const cc = virtChunkColor(id);
+          const cb = virtChunkBg(id);
+          for (const cp of text) {
+            const color = mode === 2 ? blendHex(cells[a] ? cells[a].color : null, cc) : cc;
+            if (a < cells.length) cells[a] = { ch: cp, color, bg: cb };
+            else { while (cells.length < a) cells.push({ ch: " ", color: null }); cells.push({ ch: cp, color, bg: cb }); }
+            a++;
+          }
+        }
+      }
+
       const leftcol = w.leftcol || 0;
       const isFocused = w.focused && !view.command_mode && !view.panel;
       const cursorCol = w.cursor_screen_col;
@@ -961,15 +1011,23 @@
       const special = w.special_key?.[row] || [];
       const SPECIAL_KEY = "#d787ff";
 
-      let run = "", runCls = "", runColor = "", out = "";
+      let run = "", runCls = "", runColor = "", runBg = "", out = "";
       const flush = () => {
         if (!run) return;
-        const style = runColor ? ` style="color:${runColor}"` : "";
+        const style = (runColor || runBg)
+          ? ` style="${runColor ? `color:${runColor};` : ""}${runBg ? `background:${runBg};` : ""}"`
+          : "";
         out += `<span class="${runCls}"${style}>${escapeHtml(run)}</span>`;
         run = "";
       };
       for (let c = 0; c < cells.length; c++) {
         if (c < leftcol) continue;
+        // Inline virt_text anchored at this column: flush the pending run and emit the
+        // chunks before the glyph; DOM flow shifts the cell (and everything after,
+        // including the cursor / selection) right by the inserted width.
+        for (const p of inlineVirt) {
+          if (p[1] === c) { flush(); out += virtChunksHtml(p[3]); }
+        }
         let cls = "";
         if (search.some((s) => inSpan(s, c))) cls = "search";
         if (inc && inSpan(inc, c)) cls = "incsearch";
@@ -977,15 +1035,40 @@
         if (secCols.has(c)) cls = "seccur";
         if (isFocused && row === cursorRow && c === cursorCol) cls = cursorClass();
         else if (!w.focused && row === cursorRow && c === cursorCol && !view.command_mode && !view.panel) cls = "cur-hollow";
-        const color = COLOR_OWNED.has(cls) ? "" : (special.some((s) => inSpan(s, c)) ? SPECIAL_KEY : (cells[c].color || ""));
-        if (cls !== runCls || color !== runColor) { flush(); runCls = cls; runColor = color; }
+        // Cursor / selection / search own their colors via their CSS class; an
+        // overlay virt_text bg (cells[c].bg) only shows on a plain cell.
+        const owned = COLOR_OWNED.has(cls);
+        const color = owned ? "" : (special.some((s) => inSpan(s, c)) ? SPECIAL_KEY : (cells[c].color || ""));
+        const bg = owned ? "" : (cells[c].bg || "");
+        if (cls !== runCls || color !== runColor || bg !== runBg) { flush(); runCls = cls; runColor = color; runBg = bg; }
         run += cells[c].ch;
       }
       flush();
+      // Inline virt_text anchored at or past end-of-text (col beyond the last cell).
+      for (const p of inlineVirt) {
+        if (p[1] >= cells.length) out += virtChunksHtml(p[3]);
+      }
       if (isFocused && row === cursorRow && cursorCol >= cells.length) {
         out += `<span class="${cursorClass()}"> </span>`;
       } else if (!w.focused && row === cursorRow && cursorCol >= cells.length && !view.command_mode && !view.panel) {
         out += `<span class="cur-hollow"> </span>`;
+      }
+      // Extmark end-of-line virtual text: a one-cell gap, then each placement's
+      // chunks in order, painted in the empty space past the line.
+      for (const [pos, col, mode, chunks] of vtext) {
+        if (pos === 0) out += `<span> </span>` + virtChunksHtml(chunks);
+      }
+      // Right-aligned virtual text: flush the stacked chunks to the text area's
+      // right edge, clamped to never overlap the painted text. Padding ignores any
+      // inline-virt shift (not painted on this path yet) — an approximation.
+      const ra = vtext.filter((p) => p[0] === 3).flatMap((p) => p[3]);
+      if (ra.length && rect) {
+        const textW = Math.max(0, rect.width - gutterW - (w.sign_column ? 2 : 0));
+        const total = ra.reduce((s, [t]) => s + [...t].length, 0);
+        const paintedVisible = Math.max(0, cells.length - leftcol);
+        const start = Math.max(paintedVisible + 1, textW - total);
+        const pad = Math.max(0, start - paintedVisible);
+        out += `<span>${" ".repeat(pad)}</span>` + virtChunksHtml(ra);
       }
       return html + out;
     }
@@ -995,6 +1078,43 @@
       if (view.mode === "INSERT") return "cur-bar";
       if (view.mode === "REPLACE" || view.pending_replace) return "cur-underline";
       return "cur-block";
+    }
+
+    // ---- extmark virtual text (`virt_text` / `virt_lines`) ----
+    // A chunk's wire shape is `[text, style_id]`; the placement is `[pos, col,
+    // hl_mode, chunks]` (pos 0=eol, 1=inline, 2=overlay, 3=right_align, 4=win_col).
+    // The fg-only colour the server interned for a chunk's hl_group (palette index),
+    // else "" (normal). Used by overlay/win_col (which set a cell's `color`).
+    function virtChunkColor(id) {
+      const s = id != null ? paletteStyle(id) : null;
+      return s ? (cssColor(s.fg) || "") : "";
+    }
+    // The fg-only background a chunk's hl_group sets (for overlay/win_col cells, which
+    // share the line's fg-only cell model). eol/right_align/virt_lines instead go
+    // through virtChunksHtml → styleToCss, which already emits `background`.
+    function virtChunkBg(id) {
+      const s = id != null ? paletteStyle(id) : null;
+      return s ? (cssColor(s.bg) || "") : "";
+    }
+    // A chunk run as styled spans (full style: fg + bold/italic) — for eol /
+    // right_align / virt_lines, which paint past the text where there are no cells.
+    function virtChunksHtml(chunks) {
+      let out = "";
+      for (const [text, id] of chunks) {
+        const css = id != null ? styleToCss(paletteStyle(id)) : "";
+        out += `<span${css ? ` style="${css}"` : ""}>${escapeHtml(text)}</span>`;
+      }
+      return out;
+    }
+    // Average two `#rrggbb` colours channel-wise (the `hl_mode = blend` overlay
+    // tint); a non-hex on either side falls back to the chunk colour. Mirrors the
+    // TUI's `blend_color` at fg fidelity.
+    function blendHex(under, chunk) {
+      const hex = (s) => (typeof s === "string" && /^#[0-9a-f]{6}$/i.test(s)) ? parseInt(s.slice(1), 16) : null;
+      const a = hex(under), b = hex(chunk);
+      if (a == null || b == null) return chunk;
+      const mix = (sh) => ((((a >> sh) & 0xff) + ((b >> sh) & 0xff)) >> 1);
+      return "#" + (((mix(16) << 16) | (mix(8) << 8) | mix(0)) >>> 0).toString(16).padStart(6, "0");
     }
 
     // ---- server-styled (palette) paint helpers — dormant on the wasm build ----

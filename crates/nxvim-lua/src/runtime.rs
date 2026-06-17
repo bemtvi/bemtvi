@@ -796,6 +796,27 @@ impl LuaRuntime {
         set.call((bufnr, list))
     }
 
+    /// Hand a server-resolved LSP location list to `nx.lsp._show_locations`, which
+    /// opens `nx.picker` with the built-in "location" preview (design principle 4:
+    /// goto-with-many-hits / references / symbols dogfood the picker, not a bespoke
+    /// loclist). Each item is `(text, path, 1-based row, 1-based col)`; the picker's
+    /// `confirm` jumps via `nx.picker.edit`. The caller drains the queued picker-open
+    /// effect (`apply_lua_effects`), exactly as `fire_lsp_attach` does for `on_attach`.
+    pub fn show_lsp_locations(&self, items: &[(String, String, u32, u32)]) -> mlua::Result<()> {
+        let lsp: Table = self.nx()?.get("lsp")?;
+        let show: mlua::Function = lsp.get("_show_locations")?;
+        let list = self.lua.create_table()?;
+        for (i, (text, path, row, col)) in items.iter().enumerate() {
+            let t = self.lua.create_table()?;
+            t.set("text", text.clone())?;
+            t.set("path", path.clone())?;
+            t.set("row", *row)?;
+            t.set("col", *col)?;
+            list.set(i + 1, t)?;
+        }
+        show.call(list)
+    }
+
     /// Mirror one LSP client into `nx.lsp._clients[id]` (the Rust→Lua client
     /// registry) so `get_client_by_id` — and the `LspAttach` `on_attach` it feeds
     /// — can read `client.server_capabilities`. Pushed once per server when it

@@ -209,6 +209,13 @@ pub fn run(script_path: &str) {
             }
             "textDocument/implementation" => reply_scripted(&stdout, id, &script, "implementation"),
             "textDocument/references" => reply_scripted(&stdout, id, &script, "references"),
+            // Symbols: the scripted `DocumentSymbol[]`/`SymbolInformation[]` for the
+            // document, and the `SymbolInformation[]`/`WorkspaceSymbol[]` matching a
+            // `workspace/symbol` query. Absent ⇒ `null` (no symbols).
+            "textDocument/documentSymbol" => {
+                reply_scripted(&stdout, id, &script, "document_symbols")
+            }
+            "workspace/symbol" => reply_scripted(&stdout, id, &script, "workspace_symbols"),
             "textDocument/hover" => reply_scripted(&stdout, id, &script, "hover"),
             "textDocument/signatureHelp" => reply_scripted(&stdout, id, &script, "signature_help"),
             "textDocument/formatting" => reply_scripted(&stdout, id, &script, "formatting"),
@@ -331,6 +338,8 @@ fn initialize_result(script: &Value) -> Value {
         "documentFormattingProvider": true,
         "renameProvider": true,
         "codeActionProvider": true,
+        "documentSymbolProvider": true,
+        "workspaceSymbolProvider": true,
     });
     // Advertise the semantic-tokens provider only when the script supplies a
     // legend (so a test without `semantic_tokens` exercises a server that doesn't

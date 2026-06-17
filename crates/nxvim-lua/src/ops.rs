@@ -324,6 +324,13 @@ pub enum LspOp {
         /// `true` to enable (project + request), `false` to disable (clear + hide).
         enabled: bool,
     },
+    /// `nx.lsp.workspace_symbol(query)` — request `workspace/symbol` for `query`
+    /// (the fuzzy text typed at the prompt). Unlike the cursor-anchored verbs it
+    /// carries a query, not a position; the matching symbols open in `nx.picker`.
+    WorkspaceSymbol {
+        /// The symbol search query (may be empty — some servers return everything).
+        query: String,
+    },
 }
 
 /// One surfaced `nx.fs` filesystem operation, as plain data — the op descriptor the

@@ -13,16 +13,18 @@ use async_lsp::{LanguageServer, ServerSocket};
 use lsp_types::{
     CodeActionContext, CodeActionParams, CompletionItem, CompletionParams,
     DidChangeTextDocumentParams, DidCloseTextDocumentParams, DidOpenTextDocumentParams,
-    DidSaveTextDocumentParams, DocumentFormattingParams, FormattingOptions, GotoDefinitionParams,
-    HoverParams, InlayHint, InlayHintParams, Position, ReferenceContext, ReferenceParams,
-    RenameParams, SemanticTokensDeltaParams, SemanticTokensFullDeltaResult, SemanticTokensParams,
-    SemanticTokensResult, SignatureHelpParams, TextDocumentIdentifier, TextDocumentItem,
-    TextDocumentPositionParams, Url, VersionedTextDocumentIdentifier,
+    DidSaveTextDocumentParams, DocumentFormattingParams, DocumentSymbolParams, FormattingOptions,
+    GotoDefinitionParams, HoverParams, InlayHint, InlayHintParams, PartialResultParams, Position,
+    ReferenceContext, ReferenceParams, RenameParams, SemanticTokensDeltaParams,
+    SemanticTokensFullDeltaResult, SemanticTokensParams, SemanticTokensResult, SignatureHelpParams,
+    TextDocumentIdentifier, TextDocumentItem, TextDocumentPositionParams, Url,
+    VersionedTextDocumentIdentifier, WorkspaceSymbolParams,
 };
 
 use crate::convert::{
-    code_actions, completion_reply, documentation_lines, goto_locations, hover_reply, inlay_hint,
-    inlay_label_core, normalize_workspace_edit, pad_label, signature_help_reply,
+    code_actions, completion_reply, document_symbols, documentation_lines, goto_locations,
+    hover_reply, inlay_hint, inlay_label_core, normalize_workspace_edit, pad_label,
+    signature_help_reply, workspace_symbols,
 };
 use crate::log::{LogLevel, LspLog};
 use crate::protocol::{LspNotify, LspReply, LspRequest, SemanticTokensData};
@@ -137,6 +139,38 @@ pub(crate) async fn issue_request(
                 name,
                 "implementation",
             )))
+        }
+        LspRequest::DocumentSymbol { uri } => {
+            let params = DocumentSymbolParams {
+                text_document: TextDocumentIdentifier { uri: uri.clone() },
+                work_done_progress_params: Default::default(),
+                partial_result_params: Default::default(),
+            };
+            match sock.document_symbol(params).await {
+                Ok(resp) => LspReply::Symbols(document_symbols(&uri, resp)),
+                Err(e) => {
+                    log.log(LogLevel::Warn, name, &format!("documentSymbol failed: {e}"));
+                    LspReply::Symbols(Vec::new())
+                }
+            }
+        }
+        LspRequest::WorkspaceSymbol { query } => {
+            let params = WorkspaceSymbolParams {
+                query,
+                work_done_progress_params: Default::default(),
+                partial_result_params: PartialResultParams::default(),
+            };
+            match sock.symbol(params).await {
+                Ok(resp) => LspReply::Symbols(workspace_symbols(resp)),
+                Err(e) => {
+                    log.log(
+                        LogLevel::Warn,
+                        name,
+                        &format!("workspace/symbol failed: {e}"),
+                    );
+                    LspReply::Symbols(Vec::new())
+                }
+            }
         }
         LspRequest::References {
             uri,
@@ -706,6 +740,8 @@ fn describe_request(req: &LspRequest) -> String {
                 item.get("label").and_then(|l| l.as_str()).unwrap_or("?")
             )
         }
+        LspRequest::DocumentSymbol { .. } => return "→ documentSymbol".to_string(),
+        LspRequest::WorkspaceSymbol { query } => return format!("→ workspace/symbol '{query}'"),
         LspRequest::SemanticTokensFull { .. } => return "→ semanticTokens/full".to_string(),
         LspRequest::SemanticTokensDelta {
             previous_result_id, ..

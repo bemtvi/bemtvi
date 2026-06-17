@@ -11,13 +11,14 @@
 use lsp_types::{
     AnnotatedTextEdit, CodeActionOrCommand, CodeActionResponse, CompletionItem, CompletionItemKind,
     CompletionResponse, CompletionTextEdit, DocumentChangeOperation, DocumentChanges,
-    Documentation, GotoDefinitionResponse, Hover, HoverContents, InlayHint, InlayHintKind,
-    InlayHintLabel, Location, MarkedString, OneOf, ParameterLabel, SignatureHelp, TextDocumentEdit,
-    TextEdit, Url, WorkspaceEdit,
+    DocumentSymbol, DocumentSymbolResponse, Documentation, GotoDefinitionResponse, Hover,
+    HoverContents, InlayHint, InlayHintKind, InlayHintLabel, Location, MarkedString, OneOf,
+    ParameterLabel, SignatureHelp, SymbolInformation, SymbolKind, TextDocumentEdit, TextEdit, Url,
+    WorkspaceEdit, WorkspaceSymbolResponse,
 };
 
 use crate::protocol::{
-    CodeActionData, CompletionItemData, InlayHintData, LspReply, WorkspaceEditData,
+    CodeActionData, CompletionItemData, InlayHintData, LspReply, SymbolData, WorkspaceEditData,
 };
 
 /// Distill a `textDocument/codeAction` response (a mixed `(Command | CodeAction)[]`)
@@ -298,6 +299,118 @@ pub(crate) fn goto_locations(resp: Option<GotoDefinitionResponse>) -> Vec<Locati
                 range: l.target_selection_range,
             })
             .collect(),
+    }
+}
+
+/// A human-readable label for a `SymbolKind` (the picker row's `[kind]` tag).
+fn symbol_kind_name(kind: SymbolKind) -> &'static str {
+    match kind {
+        SymbolKind::FILE => "File",
+        SymbolKind::MODULE => "Module",
+        SymbolKind::NAMESPACE => "Namespace",
+        SymbolKind::PACKAGE => "Package",
+        SymbolKind::CLASS => "Class",
+        SymbolKind::METHOD => "Method",
+        SymbolKind::PROPERTY => "Property",
+        SymbolKind::FIELD => "Field",
+        SymbolKind::CONSTRUCTOR => "Constructor",
+        SymbolKind::ENUM => "Enum",
+        SymbolKind::INTERFACE => "Interface",
+        SymbolKind::FUNCTION => "Function",
+        SymbolKind::VARIABLE => "Variable",
+        SymbolKind::CONSTANT => "Constant",
+        SymbolKind::STRING => "String",
+        SymbolKind::NUMBER => "Number",
+        SymbolKind::BOOLEAN => "Boolean",
+        SymbolKind::ARRAY => "Array",
+        SymbolKind::OBJECT => "Object",
+        SymbolKind::KEY => "Key",
+        SymbolKind::NULL => "Null",
+        SymbolKind::ENUM_MEMBER => "EnumMember",
+        SymbolKind::STRUCT => "Struct",
+        SymbolKind::EVENT => "Event",
+        SymbolKind::OPERATOR => "Operator",
+        SymbolKind::TYPE_PARAMETER => "TypeParameter",
+        _ => "Symbol",
+    }
+}
+
+/// Flatten a `textDocument/documentSymbol` reply into a name/kind/location list.
+/// The flat `SymbolInformation` form carries its own `location`; the nested
+/// `DocumentSymbol` tree has none (it is implicitly this document), so `doc_uri`
+/// supplies it and the tree is walked depth-first (children included).
+pub(crate) fn document_symbols(
+    doc_uri: &Url,
+    resp: Option<DocumentSymbolResponse>,
+) -> Vec<SymbolData> {
+    match resp {
+        None => Vec::new(),
+        Some(DocumentSymbolResponse::Flat(infos)) => {
+            infos.into_iter().map(symbol_information_data).collect()
+        }
+        Some(DocumentSymbolResponse::Nested(syms)) => {
+            let mut out = Vec::new();
+            for sym in &syms {
+                push_nested_symbol(doc_uri, sym, &mut out);
+            }
+            out
+        }
+    }
+}
+
+/// Depth-first walk of a nested `DocumentSymbol`, appending it and its children.
+fn push_nested_symbol(doc_uri: &Url, sym: &DocumentSymbol, out: &mut Vec<SymbolData>) {
+    out.push(SymbolData {
+        name: sym.name.clone(),
+        kind: symbol_kind_name(sym.kind).to_string(),
+        location: Location {
+            uri: doc_uri.clone(),
+            range: sym.selection_range,
+        },
+    });
+    if let Some(children) = &sym.children {
+        for child in children {
+            push_nested_symbol(doc_uri, child, out);
+        }
+    }
+}
+
+/// Flatten a `workspace/symbol` reply into the same name/kind/location list. The
+/// flat `SymbolInformation` form maps directly; the newer `WorkspaceSymbol` form
+/// may carry a resolve-only location (`uri` without a range), which collapses to
+/// the file start.
+pub(crate) fn workspace_symbols(resp: Option<WorkspaceSymbolResponse>) -> Vec<SymbolData> {
+    match resp {
+        None => Vec::new(),
+        Some(WorkspaceSymbolResponse::Flat(infos)) => {
+            infos.into_iter().map(symbol_information_data).collect()
+        }
+        Some(WorkspaceSymbolResponse::Nested(syms)) => syms
+            .into_iter()
+            .map(|sym| {
+                let location = match sym.location {
+                    OneOf::Left(loc) => loc,
+                    OneOf::Right(workspace_location) => Location {
+                        uri: workspace_location.uri,
+                        range: lsp_types::Range::default(),
+                    },
+                };
+                SymbolData {
+                    name: sym.name,
+                    kind: symbol_kind_name(sym.kind).to_string(),
+                    location,
+                }
+            })
+            .collect(),
+    }
+}
+
+/// Map a flat `SymbolInformation` to [`SymbolData`] (its `location` is explicit).
+fn symbol_information_data(info: SymbolInformation) -> SymbolData {
+    SymbolData {
+        name: info.name,
+        kind: symbol_kind_name(info.kind).to_string(),
+        location: info.location,
     }
 }
 

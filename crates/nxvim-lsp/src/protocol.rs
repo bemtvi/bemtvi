@@ -164,6 +164,19 @@ pub enum LspRequest {
         uri: Url,
         position: Position,
     },
+    /// `textDocument/documentSymbol` — the symbols defined in one document. The
+    /// reply ([`LspReply::Symbols`]) is flattened to a name/kind/location list the
+    /// editor opens in `nx.picker`. Position-less (whole document); the `uri` is the
+    /// requesting buffer.
+    DocumentSymbol {
+        uri: Url,
+    },
+    /// `workspace/symbol` — symbols across the workspace matching `query` (the
+    /// fuzzy text the user typed at the prompt). The reply is the same flattened
+    /// [`LspReply::Symbols`] list.
+    WorkspaceSymbol {
+        query: String,
+    },
     References {
         uri: Url,
         position: Position,
@@ -299,6 +312,10 @@ pub enum LspReply {
     /// Target locations for a goto-family request or `references` (every
     /// `Location`/`Location[]`/`LocationLink[]` shape normalized to one list).
     Locations(Vec<Location>),
+    /// Symbols from `textDocument/documentSymbol` or `workspace/symbol` — the
+    /// nested `DocumentSymbol` tree and the flat `SymbolInformation`/`WorkspaceSymbol`
+    /// shapes all flattened to a name/kind/location list (empty ⇒ none found).
+    Symbols(Vec<SymbolData>),
     /// Hover contents as plain display lines (empty ⇒ the server had nothing).
     Hover(Vec<String>),
     /// The active signature's label and, when known, its active parameter's text.
@@ -399,6 +416,18 @@ pub enum SemanticTokensData {
 /// unopened-file case is scoped out). Ranges stay in the negotiated encoding for
 /// the editor to convert, like the goto/completion normalizations.
 pub type WorkspaceEditData = Vec<(Url, Vec<TextEdit>)>;
+
+/// One symbol distilled for the editor (`textDocument/documentSymbol` /
+/// `workspace/symbol`): its `name`, a human-readable `kind` label
+/// (`"Function"`, `"Struct"`, …), and the `location` to jump to. The nested
+/// `DocumentSymbol` tree is flattened depth-first into a list of these; the flat
+/// `SymbolInformation` / `WorkspaceSymbol` shapes map one-to-one.
+#[derive(Clone, Debug)]
+pub struct SymbolData {
+    pub name: String,
+    pub kind: String,
+    pub location: Location,
+}
 
 /// One code action distilled for the editor: its `title` for the panel list, its
 /// eager `edit` (a normalized [`WorkspaceEditData`]) when the server returned one,

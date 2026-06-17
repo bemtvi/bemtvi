@@ -1380,6 +1380,20 @@ pub(crate) fn install_runtime_api(
         })?,
     )?;
 
+    // `nx._lsp_workspace_symbol(query)`: queue [`LspOp::WorkspaceSymbol`] —
+    // `nx.lsp.workspace_symbol(query)` requests `workspace/symbol` for the fuzzy
+    // query and opens the matching symbols in `nx.picker`.
+    let sh = shared.clone();
+    nx.set(
+        "_lsp_workspace_symbol",
+        lua.create_function(move |_, query: String| {
+            sh.borrow_mut()
+                .lsp_ops
+                .push(LspOp::WorkspaceSymbol { query });
+            Ok(())
+        })?,
+    )?;
+
     // `nx._ui_input(prompt, default, cb_id)`: queue a `vim.ui.input` prompt
     // ([`UiInputReq`]). The server opens the editor's command line labelled
     // `prompt` (prefilled with `default`) and fires `nx._cb_fns[cb_id]` with the

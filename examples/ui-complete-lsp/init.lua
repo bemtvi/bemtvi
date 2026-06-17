@@ -48,11 +48,22 @@ nx.lsp.config("lua_ls", {
   root_markers = { ".luarc.json", ".luarc.jsonc", ".git" },
   on_attach = function(_client, bufnr)
     local function map(lhs, fn) nx.keymap.set("n", lhs, fn, { buffer = bufnr }) end
+    -- Go-to / references / symbols all open in nx.picker (with the "location"
+    -- preview) when there's more than one hit; a single definition jumps straight.
     map("gd", nx.lsp.definition)
     map("gr", nx.lsp.references)
+    map("gO", nx.lsp.document_symbol) -- this file's symbols, in the picker
+    map("<leader>ws", nx.lsp.workspace_symbol) -- prompt → workspace/symbol picker
     map("K", nx.lsp.hover)
     map("<leader>rn", nx.lsp.rename)
     map("<leader>ca", nx.lsp.code_action)
+    -- Inlay hints are off by default — turn them on for this buffer (the engine
+    -- requests them and paints the type/parameter annotations inline).
+    nx.lsp.inlay_hint.enable(true, { bufnr = bufnr })
+    -- Toggle them with <leader>ih.
+    map("<leader>ih", function()
+      nx.lsp.inlay_hint.enable(not nx.lsp.inlay_hint.is_enabled({ bufnr = bufnr }), { bufnr = bufnr })
+    end)
   end,
 })
 nx.lsp.enable("lua_ls")

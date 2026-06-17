@@ -42,6 +42,10 @@ impl EditHost {
                 self.request_lsp_code_action();
                 return;
             }
+            LspOp::WorkspaceSymbol { query } => {
+                self.request_lsp_workspace_symbol(&query);
+                return;
+            }
             LspOp::DiagnosticGoto { forward, severity } => {
                 self.diagnostic_goto(forward, severity);
                 return;

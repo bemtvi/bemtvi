@@ -190,6 +190,8 @@ pub(crate) enum LspReqKind {
     SemanticTokens,
     InlayHints,
     ResolveInlayHint,
+    DocumentSymbol,
+    WorkspaceSymbol,
 }
 
 impl LspReqKind {
@@ -211,6 +213,8 @@ impl LspReqKind {
             LspReqKind::SemanticTokens => 13,
             LspReqKind::InlayHints => 14,
             LspReqKind::ResolveInlayHint => 15,
+            LspReqKind::DocumentSymbol => 16,
+            LspReqKind::WorkspaceSymbol => 17,
         }
     }
 
@@ -232,14 +236,19 @@ impl LspReqKind {
             13 => LspReqKind::SemanticTokens,
             14 => LspReqKind::InlayHints,
             15 => LspReqKind::ResolveInlayHint,
+            16 => LspReqKind::DocumentSymbol,
+            17 => LspReqKind::WorkspaceSymbol,
             _ => return None,
         })
     }
 
-    /// Whether results always go to a panel location list (references) rather
-    /// than jumping a lone result directly (the goto family).
+    /// Whether results always go to the picker location list (references, symbols)
+    /// rather than jumping a lone result directly (the goto family).
     pub(crate) fn is_list(self) -> bool {
-        matches!(self, LspReqKind::References)
+        matches!(
+            self,
+            LspReqKind::References | LspReqKind::DocumentSymbol | LspReqKind::WorkspaceSymbol
+        )
     }
 
     /// The message shown when the server returns no result. The location-list
@@ -272,14 +281,8 @@ impl LspReqKind {
             // Resolving a lazy hint is a silent background fill; an empty reply
             // just drops the placeholder, never a message.
             LspReqKind::ResolveInlayHint => "No inlay hint",
-        }
-    }
-
-    /// The panel title for a multi-result location list.
-    pub(crate) fn panel_title(self) -> &'static str {
-        match self {
-            LspReqKind::References => "LSP references",
-            _ => "LSP locations",
+            LspReqKind::DocumentSymbol => "No document symbols",
+            LspReqKind::WorkspaceSymbol => "No workspace symbols",
         }
     }
 }

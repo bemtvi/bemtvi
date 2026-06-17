@@ -1,6 +1,6 @@
 # `nx.lsp` — the native LSP control surface
 
-**Status:** **Phase A landed (2026-06-16); Phases B–C pending.** Re-introduces
+**Status:** **Phases A–C landed (A 2026-06-16; B + C 2026-06-17).** Re-introduces
 nxvim's LSP *control surface* in the `nx.*` namespace, after the nx break
 ([`e9bb90c`](#background)) deleted the old `vim.lsp` Lua clone. The LSP
 **engine** is untouched and carries forward whole: the
@@ -250,14 +250,26 @@ Riding the [native plugin API](2026-06-11-native-plugin-api.md) build order
   dangling). Covered by `crates/nxvim/tests/lsp_config.rs` (merge precedence,
   enable→FileType→Start, a verb's reply on its surface, `"*"` inheritance,
   `on_attach` + `clients`, no-client request fails loud).
-- **Phase B — the nouns.** `nx.bo.lsp_semantic_tokens` / `nx.o.lsp_semantic_tokens`
-  / `nx.bo.lsp_inlay_hints` in `options.rs`, wired to the toggle ops; the verbs
-  survive only as the option writes.
-- **Phase C — engine integration.** Re-route locations into `nx.picker` and add
-  the `"lsp"` source to `nx.complete`, as those engines land (steps 2–3) — no
-  `nx.lsp` API change for the existing verbs, only the result surface moves. This
-  is also where `document_symbol` / `workspace_symbol` land (the new
-  `LspReqKind` + `LspRequest` pair), since symbols want the picker.
+- **Phase B — the nouns. _(done 2026-06-17.)_** The semantic-token / inlay-hint
+  surface landed as the neovim-shaped function tables `nx.lsp.semantic_tokens`
+  (`start`/`stop`/`enable`/`force_refresh`/`get_at_pos`) and `nx.lsp.inlay_hint`
+  (`enable`/`is_enabled`/`get`), with `vim.lsp.*` aliases — driving the existing
+  toggle ops and the now-defined read mirrors (`nx._set_semantic_tokens` /
+  `nx._set_inlay_hints`, which `nxvim-server` hard-calls each reply; they were
+  dangling before, so the mirror push silently errored). The buffer-option *nouns*
+  (`nx.bo.lsp_semantic_tokens`, …) remain available as optional sugar over the same
+  ops. Covered by `crates/nxvim/tests/lsp_features.rs` (enable→request→reply→mirror
+  round-trips; off-by-default inlay hints; `get_at_pos`).
+- **Phase C — engine integration. _(done 2026-06-17.)_** Goto-with-many-hits,
+  `references`, and document/workspace symbols re-routed into `nx.picker` (the
+  built-in `"location"` preview), confirm jumps via `nx.picker.edit`; a single goto
+  hit still jumps straight. `document_symbol` / `workspace_symbol` landed as the new
+  `LspReqKind::DocumentSymbol`/`WorkspaceSymbol` + `LspRequest` pair + the
+  `LspReply::Symbols(Vec<SymbolData>)` reply (the nested `DocumentSymbol` tree and
+  the flat `SymbolInformation`/`WorkspaceSymbol` shapes all flattened to
+  name/kind/location). The `"lsp"` `nx.complete` source landed earlier (Phase 4-C
+  of the completion plan). Covered by `lsp_features.rs` (references / document /
+  workspace symbol pickers; single-definition jump).
 
 ## Testing (black-box, per the no-unit-test rule)
 

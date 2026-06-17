@@ -464,6 +464,27 @@ function nx.lsp.code_action()
   nx._lsp_buf_code_action()
 end
 
+-- nx.lsp.document_symbol(): the symbols defined in the current document, opened in
+-- nx.picker (kind 16 mirrors LspReqKind::DocumentSymbol::as_u16).
+function nx.lsp.document_symbol()
+  nx._lsp_buf(16)
+end
+
+-- nx.lsp.workspace_symbol(query): symbols across the workspace matching `query`,
+-- opened in nx.picker. With no query, prompt for one via nx.ui.input (non-blocking)
+-- — an empty/cancelled prompt does nothing.
+function nx.lsp.workspace_symbol(query)
+  if type(query) == "string" then
+    nx._lsp_workspace_symbol(query)
+    return
+  end
+  nx.ui.input({ prompt = "Workspace symbol: " }):next(function(q)
+    if type(q) == "string" and q ~= "" then
+      nx._lsp_workspace_symbol(q)
+    end
+  end)
+end
+
 -- nx.lsp.rename(new_name): rename the symbol under the cursor. With a name, request
 -- it straight away; with none (the bare `nx.keymap.set("n", "<leader>rn",
 -- nx.lsp.rename)` case), prompt for it via `nx.ui.input` (non-blocking promise),
@@ -595,6 +616,156 @@ function nx.lsp._run_on_exit(id, code, signal)
   end
 end
 
+-- ----- semantic tokens & inlay hints — buffer state, read mirrors ------------
+-- Direct application of the treesitter precedent (design §"buffer nouns"): the
+-- projection lives entirely in the engine (lsp/semantic.rs, lsp/inlay.rs) — these
+-- surfaces only (1) flip the per-buffer/editor toggle ops the engine reads and
+-- (2) expose the decoded read mirrors the server pushes each reply, so a plugin
+-- can answer "what token / hint is here?" synchronously without a round-trip.
+
+-- The read mirrors, keyed by bufnr. The server hard-calls these once per
+-- `semanticTokens`/`inlayHint` reply (runtime.rs set_semantic_tokens /
+-- set_inlay_hints) — they were dangling before this surface, so the push silently
+-- errored and the getters had nothing to read.
+nx._semantic_tokens = nx._semantic_tokens or {}
+function nx._set_semantic_tokens(bufnr, list)
+  nx._semantic_tokens[bufnr or 0] = list or {}
+end
+nx._inlay_hints = nx._inlay_hints or {}
+function nx._set_inlay_hints(bufnr, list)
+  nx._inlay_hints[bufnr or 0] = list or {}
+end
+
+-- Per-buffer enabled intent, so `is_enabled` / a noun read answers without a
+-- server round-trip. Semantic tokens default on (the engine paints once a server
+-- with the capability attaches); inlay hints default off (opt-in, like neovim).
+nx.lsp._semantic_on = nx.lsp._semantic_on or {}
+nx.lsp._inlay_on = nx.lsp._inlay_on or {}
+
+-- nx.lsp.semantic_tokens.* — the per-buffer projection (start/stop), the
+-- editor-wide gate (enable), a manual refresh, and the synchronous read getter.
+nx.lsp.semantic_tokens = nx.lsp.semantic_tokens or {}
+
+-- start/stop the per-buffer semantic-token paint (neovim's start/stop verbs).
+function nx.lsp.semantic_tokens.start(bufnr)
+  bufnr = cur_bufnr(bufnr)
+  nx.lsp._semantic_on[bufnr] = true
+  nx._lsp_semantic_enable(bufnr, true)
+end
+function nx.lsp.semantic_tokens.stop(bufnr)
+  bufnr = cur_bufnr(bufnr)
+  nx.lsp._semantic_on[bufnr] = false
+  nx._lsp_semantic_enable(bufnr, false)
+end
+
+-- nxvim's editor-wide gate (default on) — neovim has only the per-buffer verbs.
+-- Off ⇒ no semantic paint anywhere; flipping back on re-requests every buffer.
+function nx.lsp.semantic_tokens.enable(enabled)
+  if enabled == nil then
+    enabled = true
+  end
+  nx._lsp_semantic_config(enabled and true or false)
+end
+
+-- Drop the cached result_id and re-request the whole token set (neovim's
+-- force_refresh) — the one operation with no readable state to model as a noun.
+function nx.lsp.semantic_tokens.force_refresh(bufnr)
+  nx._lsp_semantic_refresh(cur_bufnr(bufnr))
+end
+
+-- get_at_pos(bufnr, row, col): the decoded tokens covering the 0-based (row, col)
+-- (neovim's `vim.lsp.semantic_tokens.get_at_pos`). `col` is a 0-based byte column;
+-- a token covers `[start_col, end_col)`. Returns a list (possibly empty).
+function nx.lsp.semantic_tokens.get_at_pos(bufnr, row, col)
+  local toks = nx._semantic_tokens[cur_bufnr(bufnr)] or {}
+  local out = {}
+  for _, t in ipairs(toks) do
+    if t.line == row and col >= t.start_col and col < t.end_col then
+      out[#out + 1] = t
+    end
+  end
+  return out
+end
+
+-- nx.lsp.inlay_hint.* — the per-buffer inline hints (off by default), the
+-- synchronous read getter, and the enabled-state probe.
+nx.lsp.inlay_hint = nx.lsp.inlay_hint or {}
+
+-- enable(enable?, filter?): flip the per-buffer inlay-hint paint. `enable`
+-- defaults to true; `filter.bufnr` (0/nil = current) targets the buffer
+-- (neovim's modern `vim.lsp.inlay_hint.enable(enable, { bufnr })`).
+function nx.lsp.inlay_hint.enable(enable, filter)
+  if enable == nil then
+    enable = true
+  end
+  local bufnr = cur_bufnr(filter and filter.bufnr)
+  enable = enable and true or false
+  nx.lsp._inlay_on[bufnr] = enable
+  nx._lsp_inlay_hint_enable(bufnr, enable)
+end
+
+-- is_enabled(filter?): whether inlay hints are on for the buffer.
+function nx.lsp.inlay_hint.is_enabled(filter)
+  local bufnr = cur_bufnr(filter and filter.bufnr)
+  return nx.lsp._inlay_on[bufnr] == true
+end
+
+-- get(filter?): the decoded inlay hints in a buffer (`filter.bufnr`, 0/nil =
+-- current), each `{ bufnr, client_id, inlay_hint = <decoded entry> }` to match
+-- neovim's shape. `filter.range` ({ start_line, end_line }, 0-based inclusive)
+-- narrows by line. Reads the mirror — no request is issued.
+function nx.lsp.inlay_hint.get(filter)
+  filter = filter or {}
+  local bufnr = cur_bufnr(filter.bufnr)
+  local range = filter.range
+  local out = {}
+  for _, h in ipairs(nx._inlay_hints[bufnr] or {}) do
+    if not range or (h.line >= range.start_line and h.line <= range.end_line) then
+      out[#out + 1] = { bufnr = bufnr, client_id = h.client_id, inlay_hint = h }
+    end
+  end
+  return out
+end
+
+-- ----- locations → nx.picker (design principle 4: dogfood the shared engine) --
+-- A goto-family reply with >1 hit, `references`, and document/workspace symbols
+-- all resolve to a location list the server hands here. Rather than a server-owned
+-- loclist, the result flows into nx.picker with the built-in "location" preview
+-- (scroll + range-highlight the match), confirm jumps via nx.picker.edit. A single
+-- goto hit never reaches here — the server jumps straight to it.
+nx.lsp._location_items = nx.lsp._location_items or {}
+
+-- Register the shared `lsp_locations` source once (lazily, so picker.lua's load
+-- order relative to this chunk doesn't matter). Its `items` replays the list the
+-- server last stashed; `confirm` opens the chosen location.
+local function ensure_location_source()
+  if nx.lsp._location_source then
+    return
+  end
+  nx.lsp._location_source = true
+  nx.picker.source({
+    name = "lsp_locations",
+    preview = "location",
+    items = function(ctx)
+      for _, it in ipairs(nx.lsp._location_items) do
+        ctx.push(it)
+      end
+    end,
+    confirm = function(item)
+      nx.picker.edit(item)
+    end,
+  })
+end
+
+-- nx.lsp._show_locations(items): open the picker over a server-resolved location
+-- list. Each item is `{ text, path, row (1-based), col (1-based) }`. Called by the
+-- server (runtime.rs `show_lsp_locations`) when a reply carries more than one hit.
+function nx.lsp._show_locations(items)
+  nx.lsp._location_items = items or {}
+  ensure_location_source()
+  nx.picker.open("lsp_locations")
+end
+
 -- ----- vim.* muscle-memory aliases (ADR 0002 §4 whitelist) -------------------
 -- The bounded neovim-shaped surface, routed onto the nx verbs above. `vim.lsp.buf`
 -- is the `.buf`-namespaced spelling muscle memory reaches for; `vim.lsp.config`
@@ -624,9 +795,17 @@ end
 vim.lsp.buf.rename = function(name, _opts)
   return nx.lsp.rename(name)
 end
+vim.lsp.buf.document_symbol = nx.lsp.document_symbol
+vim.lsp.buf.workspace_symbol = function(query)
+  return nx.lsp.workspace_symbol(query)
+end
 vim.lsp.get_clients = function(filter)
   return nx.lsp.clients(filter)
 end
 vim.lsp.get_client_by_id = function(id)
   return nx.lsp._clients[id]
 end
+-- Semantic tokens & inlay hints keep neovim's table shape (start/stop/get_at_pos,
+-- enable/is_enabled/get) — the same tables, so a config written either way agrees.
+vim.lsp.semantic_tokens = nx.lsp.semantic_tokens
+vim.lsp.inlay_hint = nx.lsp.inlay_hint

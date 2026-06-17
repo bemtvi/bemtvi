@@ -57,7 +57,7 @@ pub use convert::normalize_workspace_edit;
 pub use protocol::{
     CodeActionData, CompletionItemData, InlayHintData, LspEvent, LspNotify, LspReply, LspRequest,
     PositionEncoding, ProviderCaps, RefreshKind, ReqToken, SemanticLegend, SemanticTokensData,
-    ServerCaps, ServerKey, ServerSpawn, WorkspaceEditData,
+    ServerCaps, ServerKey, ServerSpawn, SymbolData, WorkspaceEditData,
 };
 pub use serde_json;
 

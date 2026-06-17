@@ -6,7 +6,9 @@ use std::path::Path;
 
 use nxvim_lsp::lsp_types::{Location, Range, Url};
 use nxvim_lsp::serde_json;
-use nxvim_lsp::{LspNotify, LspReply, LspRequest, PositionEncoding, ReqToken, ServerKey};
+use nxvim_lsp::{
+    LspNotify, LspReply, LspRequest, PositionEncoding, ReqToken, ServerKey, SymbolData,
+};
 use nxvim_lua::CallbackArgs;
 
 use super::*;
@@ -45,6 +47,12 @@ impl EditHost {
             LspReqKind::Hover => LspRequest::Hover { uri, position },
             LspReqKind::SignatureHelp => LspRequest::SignatureHelp { uri, position },
             LspReqKind::Completion => LspRequest::Completion { uri, position },
+            // Document symbols are whole-document (position-less), but ride the
+            // cursor-tick request path like the goto family.
+            LspReqKind::DocumentSymbol => LspRequest::DocumentSymbol { uri },
+            // Workspace symbols carry a query, not the cursor — issued by
+            // `request_lsp_workspace_symbol` below, never here.
+            LspReqKind::WorkspaceSymbol => return,
             // Formatting/rename/codeAction(+resolve) and completion-resolve don't
             // share the uniform {uri, position} shape and have their own issue
             // functions below (resolve is fired from the menu, not the cursor).
@@ -160,6 +168,25 @@ impl EditHost {
                 uri,
                 tab_size: self.editor.tabstop() as u32,
                 insert_spaces: self.editor.buffer().options.expandtab,
+            },
+        );
+    }
+
+    /// `nx.lsp.workspace_symbol(query)` — request `workspace/symbol` for `query`.
+    /// Unlike the cursor-anchored requests it carries the user's fuzzy query, not a
+    /// position; on reply the matching symbols open in the picker (`apply_lsp_symbols`).
+    pub(crate) fn request_lsp_workspace_symbol(&mut self, query: &str) {
+        self.sync_lsp();
+        let Some((key, _uri, _encoding)) = self.current_lsp_target() else {
+            self.editor.echo("No language server attached");
+            return;
+        };
+        let token = self.register_lsp_request(LspReqKind::WorkspaceSymbol);
+        self.fx.lsp_request(
+            key,
+            token,
+            LspRequest::WorkspaceSymbol {
+                query: query.to_string(),
             },
         );
     }
@@ -281,6 +308,16 @@ impl EditHost {
                     return;
                 }
                 self.apply_lsp_locations(kind, locations);
+                self.lsp_dirty = true;
+            }
+            LspReply::Symbols(symbols) => {
+                // A symbol list is browsed, not anchored to the cursor — drop it
+                // only on a buffer switch (the request's buffer is gone), not on a
+                // mere cursor move within it.
+                if buffer_changed {
+                    return;
+                }
+                self.apply_lsp_symbols(kind, symbols);
                 self.lsp_dirty = true;
             }
             LspReply::Hover(lines) => {
@@ -454,6 +491,41 @@ impl EditHost {
         }
     }
 
+    /// Open `nx.picker` over a document/workspace symbol reply — each row is
+    /// `name  [Kind]  path:line`, jumping to the symbol's location on confirm. Like
+    /// the location picker this dogfreeds the shared engine; the symbol's `name` and
+    /// `kind` make the rows readable (a bare `path:line` would not).
+    pub(crate) fn apply_lsp_symbols(&mut self, kind: LspReqKind, symbols: Vec<SymbolData>) {
+        if symbols.is_empty() {
+            self.editor.echo(kind.empty_message());
+            return;
+        }
+        let encoding = self
+            .current_lsp_target()
+            .map_or(PositionEncoding::Utf8, |(_, _, e)| e);
+        let mut items: Vec<(String, String, u32, u32)> = Vec::with_capacity(symbols.len());
+        for sym in &symbols {
+            let Some(path) = uri_to_path(&sym.location.uri) else {
+                continue;
+            };
+            let row = sym.location.range.start.line as usize;
+            let character = sym.location.range.start.character as usize;
+            let byte = self.location_byte_col(&path, row, character, encoding);
+            let display = path.to_string_lossy().into_owned();
+            let text = format!("{}  [{}]  {display}:{}", sym.name, sym.kind, row + 1);
+            items.push((text, display, (row + 1) as u32, (byte + 1) as u32));
+        }
+        if items.is_empty() {
+            self.editor.echo(kind.empty_message());
+            return;
+        }
+        if let Err(e) = self.lua.show_lsp_locations(&items) {
+            self.editor
+                .echo(format!("E5108: Error opening LSP symbol picker: {e}"));
+        }
+        self.apply_lua_effects();
+    }
+
     /// Jump the cursor to one LSP [`Location`]. Opens/switches to the target on
     /// its line first, then refines the column once the line text is loaded (the
     /// char→byte conversion needs the target line, which may live in a file just
@@ -474,16 +546,21 @@ impl EditHost {
         }
     }
 
-    /// Open a navigable panel listing `locations` (`path:line:col` per row), with
-    /// a per-row jump target attached so `<CR>` navigates — the same panel
-    /// machinery the `:LspDiagnostics` list uses.
+    /// Open `nx.picker` over `locations` (one `path:line:col` row each), with the
+    /// built-in "location" preview (scroll + range-highlight the match) and a
+    /// confirm that jumps — design principle 4: goto-with-many-hits / references /
+    /// symbols dogfood the shared picker rather than a bespoke loclist. The picker
+    /// open is a Lua effect, so this drains it (`apply_lua_effects`) like
+    /// `fire_lsp_attach` does for an `on_attach` body.
     pub(crate) fn open_locations_panel(
         &mut self,
         kind: LspReqKind,
         locations: &[Location],
         encoding: PositionEncoding,
     ) {
-        let mut entries: Vec<(PathBuf, usize, usize, String)> = Vec::with_capacity(locations.len());
+        // Picker items: `(text, path, 1-based row, 1-based col)` — `nx.picker.edit`
+        // reads the 1-based row/col, and the "location" preview needs the path.
+        let mut items: Vec<(String, String, u32, u32)> = Vec::with_capacity(locations.len());
         for loc in locations {
             let Some(path) = uri_to_path(&loc.uri) else {
                 continue;
@@ -491,15 +568,19 @@ impl EditHost {
             let row = loc.range.start.line as usize;
             let character = loc.range.start.character as usize;
             let byte = self.location_byte_col(&path, row, character, encoding);
-            // The qf line renders `file|lnum col N|`; the message text is left empty
-            // (a reference list has no per-entry message beyond its location).
-            entries.push((path, row, byte, String::new()));
+            let display = path.to_string_lossy().into_owned();
+            let text = format!("{display}:{}:{}", row + 1, byte + 1);
+            items.push((text, display, (row + 1) as u32, (byte + 1) as u32));
         }
-        if entries.is_empty() {
+        if items.is_empty() {
             self.editor.echo(kind.empty_message());
             return;
         }
-        self.editor.open_location_list(entries, kind.panel_title());
+        if let Err(e) = self.lua.show_lsp_locations(&items) {
+            self.editor
+                .echo(format!("E5108: Error opening LSP location picker: {e}"));
+        }
+        self.apply_lua_effects();
     }
 
     /// Best-effort LSP char→byte column for a target location: exact when the

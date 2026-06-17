@@ -387,9 +387,7 @@ fn write_compiler_fixture(dir: &std::path::Path) {
                  lines[#lines + 1] = string.format('h(0, \"%s\", %s)', group, inspect(color))\n\
                end\n\
                lines[#lines + 1] = 'end, true)'\n\
-               if vim.fn.isdirectory(M.options.compile_path) == 0 then\n\
-                 vim.fn.mkdir(M.options.compile_path, 'p')\n\
-               end\n\
+               vim.fn.mkdir(M.options.compile_path, 'p')\n\
                local f = assert(loadstring(table.concat(lines, '\\n')), 'compile failed')\n\
                local file = assert(io.open(M.options.compile_path .. sep .. flavour, 'wb'))\n\
                file:write(f())\n\

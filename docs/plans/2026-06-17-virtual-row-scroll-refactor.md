@@ -1,6 +1,11 @@
 # Virtual-row scroll refactor (+ word-wrap)
 
-**Status:** planned · **Date:** 2026-06-17
+**Status:** done (all 3 phases landed 2026-06-17) · **Date:** 2026-06-17
+
+> Landed in three commits: `refactor(view): fold window rows into one RenderRow
+> projection primitive` (Phase 1), `feat(scroll): rebuild the smooth-scroll band
+> on screen rows` (Phase 2), `feat(wrap): soft word-wrap on the row model`
+> (Phase 3). 1506 tests green, clippy clean, wasm builds, web scroll verified.
 
 Refactor smooth scrolling off its buffer-line coordinate model onto a single
 screen-row ("virtual row") projection, then build word-wrap on top to prove the

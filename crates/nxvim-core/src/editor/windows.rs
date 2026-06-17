@@ -1034,6 +1034,7 @@ impl Editor {
         match name {
             "number" => w.options.number = value,
             "relativenumber" => w.options.relativenumber = value,
+            "wrap" => w.options.wrap = value,
             _ => {}
         }
     }

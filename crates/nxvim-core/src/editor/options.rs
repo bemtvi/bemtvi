@@ -79,6 +79,7 @@ impl Editor {
         let slot = match name {
             "number" => &mut self.windows.cur_mut().options.number,
             "relativenumber" => &mut self.windows.cur_mut().options.relativenumber,
+            "wrap" => &mut self.windows.cur_mut().options.wrap,
             "ignorecase" => &mut self.options.ignorecase,
             "smartcase" => &mut self.options.smartcase,
             "wrapscan" => &mut self.options.wrapscan,

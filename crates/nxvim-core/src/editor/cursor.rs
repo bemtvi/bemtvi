@@ -347,11 +347,48 @@ impl Editor {
         self.ensure_visible_horizontal();
     }
 
+    /// The number of display (text) rows buffer `line` occupies in the focused
+    /// window: `1` under `nowrap` (or for a line that fits), else its soft-wrap
+    /// segment count. The text-row analogue of a line's `virt_lines` count, so the
+    /// viewport math counts wrapped lines as the several screen rows they fill.
+    pub(crate) fn line_text_rows(&self, line: usize) -> usize {
+        let opts = self.windows.cur().options;
+        if !opts.wrap {
+            return 1;
+        }
+        let width = self.text_width();
+        let buf = self.buffer();
+        if width == 0 || line >= buf.line_count() {
+            return 1;
+        }
+        let text = buf.line_cow(line);
+        unicode::wrap_segments(&text, buf.options.effective_tabstop(), width).len()
+    }
+
+    /// Which soft-wrap segment the cursor's column falls in (its display-row offset
+    /// within its buffer line): `0` under `nowrap` or on the first segment.
+    pub(crate) fn cursor_wrap_seg(&self) -> usize {
+        let opts = self.windows.cur().options;
+        if !opts.wrap {
+            return 0;
+        }
+        let width = self.text_width();
+        if width == 0 {
+            return 0;
+        }
+        let buf = self.buffer();
+        let text = buf.line_cow(self.cursor.line);
+        let segs = unicode::wrap_segments(&text, buf.options.effective_tabstop(), width);
+        segs.iter()
+            .rposition(|s| self.cursor.col >= s.start_byte)
+            .unwrap_or(0)
+    }
+
     /// The cursor's text row within the focused window's text body, counting the
-    /// `virt_lines` rows of every buffer line from `top` up to the cursor (and the
-    /// cursor line's own `virt_lines_above`). Equals `cursor.line - top` when no
-    /// virtual lines are in play. Saturates past the bottom (the caller compares it
-    /// against the text height to decide whether to scroll).
+    /// `virt_lines` and soft-wrap rows of every buffer line from `top` up to the
+    /// cursor (and the cursor line's own `virt_lines_above` + wrap segment). Equals
+    /// `cursor.line - top` with no virtual lines or wrapping. Saturates past the
+    /// bottom (the caller compares it against the text height to decide to scroll).
     pub(crate) fn cursor_screen_row(&self) -> usize {
         if self.cursor.line < self.top {
             return 0;
@@ -360,31 +397,32 @@ impl Editor {
         let virt = buf.virt_lines_by_line();
         let mut rows = 0;
         for line in self.top..self.cursor.line {
-            rows += virt
-                .get(&line)
-                .map_or(1, |r| 1 + r.above.len() + r.below.len());
+            rows += self.line_text_rows(line)
+                + virt.get(&line).map_or(0, |r| r.above.len() + r.below.len());
         }
-        // The cursor's own row sits *after* its `virt_lines_above`.
-        rows + virt.get(&self.cursor.line).map_or(0, |r| r.above.len())
+        // The cursor's own row sits *after* its `virt_lines_above` and the wrap
+        // segments of its line above the cursor's segment.
+        rows + virt.get(&self.cursor.line).map_or(0, |r| r.above.len()) + self.cursor_wrap_seg()
     }
 
-    /// The largest `top` (≤ `target`) such that buffer line `target`'s text row and
-    /// every line above it down to `top` — each counted with its `virt_lines` rows —
-    /// fit within `th` screen rows, i.e. `target` lands on the bottom text row. The
-    /// `virt_lines_below` of `target` may spill past the bottom (its text stays
-    /// visible). Used to scroll down just enough to reveal a cursor below the fold.
+    /// The largest `top` (≤ `target`) such that buffer line `target`'s cursor row
+    /// and every line above it down to `top` — each counted with its `virt_lines`
+    /// and soft-wrap rows — fit within `th` screen rows, i.e. the cursor lands on
+    /// the bottom text row. The `virt_lines_below` of `target` (and any wrap
+    /// segments below the cursor's) may spill past the bottom. Used to scroll down
+    /// just enough to reveal a cursor below the fold.
     fn scroll_top_for_bottom(&self, target: usize, th: usize) -> usize {
         let buf = self.buffer();
         let virt = buf.virt_lines_by_line();
-        // The target line itself spends its `virt_lines_above` + text row at the
-        // bottom of the window; its `virt_lines_below` are allowed to overflow.
-        let mut rows = 1 + virt.get(&target).map_or(0, |r| r.above.len());
+        // The target line spends its `virt_lines_above` + the wrap segments up to and
+        // including the cursor's at the bottom of the window; deeper segments and its
+        // `virt_lines_below` overflow.
+        let mut rows = virt.get(&target).map_or(0, |r| r.above.len()) + self.cursor_wrap_seg() + 1;
         let mut top = target;
         while top > 0 {
             let prev = top - 1;
-            let p = virt
-                .get(&prev)
-                .map_or(1, |r| 1 + r.above.len() + r.below.len());
+            let p = self.line_text_rows(prev)
+                + virt.get(&prev).map_or(0, |r| r.above.len() + r.below.len());
             if rows + p > th {
                 break;
             }
@@ -401,6 +439,12 @@ impl Editor {
     /// `sidescrolloff` (the margin kept between the cursor and the edge). A no-op
     /// for a degenerate (zero-width) text area.
     fn ensure_visible_horizontal(&mut self) {
+        // Soft-wrap lays long lines across rows instead of panning, so there is no
+        // horizontal scroll: keep `leftcol` pinned at the left edge.
+        if self.windows.cur().options.wrap {
+            self.leftcol = 0;
+            return;
+        }
         let tw = self.text_width();
         if tw == 0 {
             return;

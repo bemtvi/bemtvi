@@ -240,6 +240,8 @@ async fn g_prefix_merges_builtin_motions_with_native_defaults() {
          `/Jump to mark (no jumplist)/group,\
          d/Go to definition/map,\
          g/Go to first line/map,\
+         j/Down one display line/map,\
+         k/Up one display line/map,\
          r/Find references/map,\
          t/Next tab/map"
     );

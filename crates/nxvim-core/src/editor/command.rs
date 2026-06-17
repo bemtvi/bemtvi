@@ -259,6 +259,8 @@ pub(crate) enum Motion {
     LineEnd,                      // $, <End>
     Down,                         // j, <Down>
     Up,                           // k, <Up>
+    DisplayDown,                  // gj — down one *display* row (soft-wrap aware)
+    DisplayUp,                    // gk — up one display row
     GotoLine,                     // G  (count = target line, default last)
     GotoTop,                      // gg (count = target line, default first)
     Word,                         // w / W
@@ -727,6 +729,8 @@ fn z_continuations() -> Vec<CommandContinuation> {
 fn g_continuations() -> Vec<CommandContinuation> {
     let mut out = conts(&[
         ("g", "Go to first line"),
+        ("j", "Down one display line"),
+        ("k", "Up one display line"),
         ("t", "Next tab"),
         ("T", "Previous tab"),
         (";", "Older change position"),
@@ -1061,6 +1065,10 @@ fn parse_step(mode: Mode, pending: &PendingCommand, key: Key) -> ParseStep {
     if gpending {
         match key.as_char() {
             Some('g') => return Complete(ResolvedCommand::Motion(Motion::GotoTop)),
+            // `gj` / `gk` move by *display* line (soft-wrap aware): within a wrapped
+            // line they step continuation rows; with `nowrap` they are plain `j`/`k`.
+            Some('j') => return Complete(ResolvedCommand::Motion(Motion::DisplayDown)),
+            Some('k') => return Complete(ResolvedCommand::Motion(Motion::DisplayUp)),
             Some('t') => {
                 return Complete(ResolvedCommand::Normal(NormalCmd::TabNext(pending.count)))
             }

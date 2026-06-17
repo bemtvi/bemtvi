@@ -196,6 +196,8 @@ impl Editor {
                 let l = line.saturating_sub(count);
                 MotionResult::linewise(self.buffer().line_start(l), MoveAxis::VerticalKeep)
             }
+            Motion::DisplayDown => self.display_motion(true, count),
+            Motion::DisplayUp => self.display_motion(false, count),
             Motion::GotoLine => {
                 let l = raw.map(|n| n - 1).unwrap_or(last_line).min(last_line);
                 MotionResult::linewise(self.buffer().line_start(l), MoveAxis::LineAnchor)
@@ -269,6 +271,77 @@ impl Editor {
                 self.preserve_desired = true;
             }
         }
+    }
+
+    /// Resolve `gj` / `gk`: move `count` *display* rows down / up, keeping the
+    /// cursor's column within the display row (vim's `curswant` in screen cells).
+    /// Under `nowrap` (or a zero-width area) this is plain `j` / `k`. When wrapping,
+    /// the soft-wrap continuation rows of a buffer line are stepped before crossing
+    /// to the next / previous buffer line, so the cursor walks the screen one row at
+    /// a time rather than one buffer line at a time.
+    fn display_motion(&self, down: bool, count: usize) -> MotionResult {
+        let width = self.text_width();
+        let wrap = self.windows.cur().options.wrap;
+        if !wrap || width == 0 {
+            // No wrapping: `gj` / `gk` are exactly `j` / `k`.
+            let l = if down {
+                (self.cursor.line + count).min(self.last_line())
+            } else {
+                self.cursor.line.saturating_sub(count)
+            };
+            return MotionResult::linewise(self.buffer().line_start(l), MoveAxis::VerticalKeep);
+        }
+        let tab = self.tabstop();
+        let buf = self.buffer();
+        let seg_count = |line: usize| unicode::wrap_segments(&buf.line_cow(line), tab, width).len();
+
+        // The cursor's current display column: its screen column minus the start
+        // column of the wrap segment it sits in.
+        let text0 = buf.line_cow(self.cursor.line);
+        let segs0 = unicode::wrap_segments(&text0, tab, width);
+        let cur_full = unicode::virtcol(&text0, self.cursor.col, tab);
+        let cur_seg = segs0
+            .iter()
+            .rposition(|s| self.cursor.col >= s.start_byte)
+            .unwrap_or(0);
+        let want = cur_full - segs0[cur_seg].start_col;
+
+        // Walk `count` display rows: step wrap segments within a line, then cross to
+        // the next / previous buffer line's first / last segment.
+        let mut line = self.cursor.line;
+        let mut seg = cur_seg;
+        let mut nseg = segs0.len();
+        for _ in 0..count {
+            if down {
+                if seg + 1 < nseg {
+                    seg += 1;
+                } else if line < self.last_line() {
+                    line += 1;
+                    nseg = seg_count(line);
+                    seg = 0;
+                } else {
+                    break;
+                }
+            } else if seg > 0 {
+                seg -= 1;
+            } else if line > 0 {
+                line -= 1;
+                nseg = seg_count(line);
+                seg = nseg - 1;
+            } else {
+                break;
+            }
+        }
+
+        // Land at the target row's start column + the wanted display column, clamped
+        // to the row's own extent so it doesn't spill into the next row's content.
+        let text = buf.line_cow(line);
+        let segs = unicode::wrap_segments(&text, tab, width);
+        let start_col = segs.get(seg).map_or(0, |s| s.start_col);
+        let next_start = segs.get(seg + 1).map_or(usize::MAX, |s| s.start_col);
+        let screen_col = (start_col + want).min(next_start.saturating_sub(1).max(start_col));
+        let byte = unicode::floor_grapheme(&text, unicode::byte_at_virtcol(&text, screen_col, tab));
+        MotionResult::horizontal(buf.line_start(line) + byte, MotionKind::Inclusive)
     }
 
     fn word_forward(&self, mut idx: usize) -> usize {

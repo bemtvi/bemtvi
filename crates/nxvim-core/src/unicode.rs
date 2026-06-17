@@ -95,6 +95,64 @@ pub fn cursor_cell_width(line: &str, byte: usize, tabstop: usize) -> usize {
     }
 }
 
+/// One soft-wrap display segment of a line: the byte range it covers and the
+/// screen column where it begins within the (continuous) line. The first segment
+/// always starts at byte 0 / column 0.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WrapSeg {
+    pub start_byte: usize,
+    pub end_byte: usize,
+    pub start_col: usize,
+}
+
+/// Split `line` into soft-wrap display segments for a `width`-cell text area: each
+/// holds at most `width` screen cells, broken on grapheme boundaries with tab- and
+/// wide-char-aware widths (vim wraps on display columns). With `width == 0` or a
+/// line that fits in `width` cells, a single segment spans the whole line.
+///
+/// A grapheme wider than `width` (a wide char in a 1-cell window) still gets its
+/// own segment rather than an empty one. (Tabs inside a *continuation* segment use
+/// the original column grid for the break math; a client re-expanding the raw
+/// segment text from screen column 0 may drift on tab-heavy wrapped lines — a
+/// documented v1 limitation. Leading indentation, the common case, sits on the
+/// first segment and is unaffected.)
+pub fn wrap_segments(line: &str, tabstop: usize, width: usize) -> Vec<WrapSeg> {
+    if width == 0 {
+        return vec![WrapSeg {
+            start_byte: 0,
+            end_byte: line.len(),
+            start_col: 0,
+        }];
+    }
+    let mut segs = Vec::new();
+    let mut seg_start_byte = 0;
+    let mut seg_start_col = 0;
+    let mut col = 0;
+    let mut byte = 0;
+    for g in line.graphemes(true) {
+        let w = grapheme_width(g, col, tabstop);
+        // Break *before* a grapheme that would overflow the current row, but never
+        // emit an empty row (so an over-wide grapheme still occupies its own row).
+        if col + w > seg_start_col + width && byte > seg_start_byte {
+            segs.push(WrapSeg {
+                start_byte: seg_start_byte,
+                end_byte: byte,
+                start_col: seg_start_col,
+            });
+            seg_start_byte = byte;
+            seg_start_col = col;
+        }
+        col += w;
+        byte += g.len();
+    }
+    segs.push(WrapSeg {
+        start_byte: seg_start_byte,
+        end_byte: line.len(),
+        start_col: seg_start_col,
+    });
+    segs
+}
+
 /// A byte-offset → virtual-column mapper for a single line that answers a
 /// **non-decreasing** sequence of queries by walking the line's graphemes at
 /// most once across all of them — amortized O(1) per query, versus

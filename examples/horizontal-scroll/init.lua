@@ -5,9 +5,9 @@
 --     NXVIM_CONFIG=examples/horizontal-scroll \
 --       cargo run -p nxvim -- examples/horizontal-scroll/sample.txt
 --
--- nxvim does not wrap long lines (yet — that's a follow-up): a line wider than
--- the window is shown clipped, and the viewport scrolls SIDEWAYS to keep the
--- cursor on screen — vim's `nowrap` behaviour, tracked per window as `leftcol`.
+-- This is the `nowrap` half of the pair (see `examples/word-wrap/` for `:set
+-- wrap`): a line wider than the window is shown clipped, and the viewport scrolls
+-- SIDEWAYS to keep the cursor on screen — vim's `nowrap`, tracked as `leftcol`.
 -- Move the cursor right along a long line and watch the text slide left under a
 -- FIXED number gutter; move back and it slides home. Two window-local options
 -- tune it, exactly as in vim:

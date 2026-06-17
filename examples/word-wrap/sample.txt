@@ -1,0 +1,9 @@
+word wrap demo — the lines below are far wider than any terminal window
+
+This is a single very long line, written as one paragraph with no newlines in the middle, so that with `:set wrap` it folds onto as many continuation rows as it needs while staying one buffer line — press j or k and the cursor moves over the whole paragraph as one line, while gj and gk step one display row at a time within it.
+
+short line
+
+Another long one: the quick brown fox jumps over the lazy dog, and then keeps right on jumping over every other sleepy animal in the yard until the sentence is comfortably wider than the screen and has to wrap around two or three times depending on how wide you have made the window today.
+
+last short line

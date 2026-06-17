@@ -229,6 +229,11 @@ pub struct WindowOptions {
     /// edge while horizontally scrolling (vim's `sidescrolloff`). `0` by default —
     /// the cursor may sit on the very edge.
     pub sidescrolloff: usize,
+    /// Soft-wrap long lines: a buffer line wider than the text area is laid out
+    /// across several screen rows (continuation rows) rather than scrolled
+    /// horizontally. `false` (nxvim's historical `nowrap`) keeps one screen row per
+    /// line and pans with `leftcol`. When on, `leftcol` is forced to 0.
+    pub wrap: bool,
 }
 
 impl Default for WindowOptions {
@@ -242,6 +247,9 @@ impl Default for WindowOptions {
             // neovim's horizontal-scroll defaults: scroll a minimal step, no margin.
             sidescroll: 1,
             sidescrolloff: 0,
+            // nxvim has historically been `nowrap`-only; wrap is opt-in (`:set wrap`)
+            // so the existing horizontal-scroll behavior is the default.
+            wrap: false,
         }
     }
 }
@@ -592,6 +600,7 @@ fn canonical(name: &str) -> Option<(&'static str, OptKind)> {
     match name {
         "number" | "nu" => Some(("number", Bool)),
         "relativenumber" | "rnu" => Some(("relativenumber", Bool)),
+        "wrap" => Some(("wrap", Bool)),
         "ignorecase" | "ic" => Some(("ignorecase", Bool)),
         "smartcase" | "scs" => Some(("smartcase", Bool)),
         "wrapscan" | "ws" => Some(("wrapscan", Bool)),

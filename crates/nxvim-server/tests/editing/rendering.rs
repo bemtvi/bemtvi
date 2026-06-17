@@ -23,9 +23,9 @@ async fn screen_column_expands_tabs_to_the_next_tabstop() {
     assert_eq!(view_u64(&view, "cursor_screen_col"), 4);
 }
 
-/// With `nowrap` (nxvim's only text-window mode today), a cursor driven past the
-/// window's text width scrolls the viewport horizontally (`leftcol`) to keep the
-/// cursor on screen, and scrolls all the way back at column 0 — vim's `w_leftcol`.
+/// With `nowrap` (the default; `:set wrap` opts into soft-wrap), a cursor driven
+/// past the window's text width scrolls the viewport horizontally (`leftcol`) to
+/// keep the cursor on screen, and scrolls back at column 0 — vim's `w_leftcol`.
 #[tokio::test]
 async fn nowrap_scrolls_horizontally_to_keep_cursor_visible() {
     let (rpc, mut incoming) = start(None).await;
@@ -109,6 +109,27 @@ async fn horizontal_scroll_example_config_runs() {
     // The example's `vim.cmd("set sidescrolloff=8")` reached the core.
     let map = redraw_after(&rpc, &mut incoming, ":set siso?<CR>").await;
     assert_eq!(view_str(&map, "message"), "sidescrolloff=8");
+}
+
+/// The shipped `examples/word-wrap/` config sources cleanly and actually
+/// configures the editor (not just "loads"): its `:set wrap` takes effect,
+/// observable through `:set wrap?`.
+#[tokio::test]
+async fn word_wrap_example_config_runs() {
+    let dir = temp_dir("wrap-ex");
+    let init = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../examples/word-wrap/init.lua"
+    ))
+    .expect("read example init.lua");
+    let (rpc, mut incoming) = start_with_config(&dir, &init).await;
+
+    let msg = startup_message(&rpc, &mut incoming).await;
+    assert!(!msg.contains("Error"), "example left an error: {msg:?}");
+
+    // The example's `vim.cmd("set wrap")` reached the core.
+    let map = redraw_after(&rpc, &mut incoming, ":set wrap?<CR>").await;
+    assert_eq!(view_str(&map, "message"), "wrap");
 }
 
 #[tokio::test]
@@ -510,6 +531,130 @@ async fn virt_lines_scroll_animates_and_interleaves_the_virtual_row() {
         scroll_lines_len(&map),
         37,
         "the band over-scans the virtual row"
+    );
+}
+
+#[tokio::test]
+async fn set_wrap_lays_a_long_line_across_display_rows() {
+    // `:set wrap` lays a line wider than the text area across several display rows
+    // instead of panning horizontally — the row model emits one `RowKind::Line` row
+    // per soft-wrap segment, and the cursor lands on the wrapped row + row-local col.
+    let (rpc, mut incoming) = start(None).await;
+    // Full 80-cell text area (drop the number/relative-number gutter).
+    feed(&rpc, ":set nonumber<CR>:set norelativenumber<CR>");
+    feed(&rpc, "i");
+    feed(&rpc, &"a".repeat(200)); // 200 columns
+    let map = redraw_after(&rpc, &mut incoming, "<Esc>:set wrap<CR>").await;
+
+    let lines = view_lines(&map);
+    assert_eq!(lines[0].chars().count(), 80, "row 0 is the first 80 cells");
+    assert_eq!(lines[1].chars().count(), 80, "row 1 is the next 80 cells");
+    assert_eq!(
+        lines[2],
+        "a".repeat(40),
+        "row 2 holds the 40-cell remainder"
+    );
+    // The cursor (last 'a', byte 199) sits on the third display row at row-local
+    // column 39 (199 - 160), with no horizontal scroll.
+    assert_eq!(
+        view_u64(&map, "cursor_row"),
+        2,
+        "cursor on the third display row"
+    );
+    assert_eq!(
+        view_u64(&map, "cursor_screen_col"),
+        39,
+        "row-local cursor column"
+    );
+    assert_eq!(view_u64(&map, "leftcol"), 0, "wrap pins leftcol at 0");
+}
+
+#[tokio::test]
+async fn wrapped_content_scrolls_and_rides_the_band() {
+    // The proof of the row-model refactor: word-wrap needs *no* scroll-path changes.
+    // The band is screen-row based, so a wrapped buffer scrolls and animates with the
+    // wrap rows interleaved — a buffer line occupies several consecutive band rows.
+    let body: String = (1..=60)
+        .map(|i| format!("{i}{}\n", "x".repeat(200)))
+        .collect();
+    let path = write_temp("wrapscroll", "txt", &body);
+    let (rpc, mut incoming) = start(Some(path)).await;
+    feed(
+        &rpc,
+        ":set nonumber<CR>:set norelativenumber<CR>:set wrap<CR>",
+    );
+    let _ = lines(&rpc).await; // barrier
+
+    let map = scroll_after(&rpc, &mut incoming, "<C-d>").await;
+    assert!(
+        scroll(&map).is_some(),
+        "wrapped content still animates — no virt_lines-style snap"
+    );
+    // A wrapped line occupies several band rows, so its 1-based number repeats
+    // consecutively in the band's `numbers` (the wrap rows ride the band).
+    let numbers = scroll_numbers(&map);
+    assert!(
+        numbers.windows(2).any(|w| w[0].is_some() && w[0] == w[1]),
+        "a wrapped line spans consecutive band rows: {numbers:?}"
+    );
+}
+
+#[tokio::test]
+async fn gj_gk_step_display_rows_within_a_wrapped_line() {
+    // `gj`/`gk` move by *display* row, so within a soft-wrapped line they step its
+    // continuation rows (the cursor stays on the same buffer line, its column
+    // advancing by the row width) rather than jumping a whole buffer line like j/k.
+    // `incoming` is bound (not dropped) to keep the RPC connection alive, though
+    // these cursor-only assertions never read a redraw off it.
+    let (rpc, _incoming) = start(None).await;
+    feed(
+        &rpc,
+        ":set nonumber<CR>:set norelativenumber<CR>:set wrap<CR>",
+    );
+    feed(&rpc, "i");
+    feed(&rpc, &"a".repeat(200)); // one buffer line, wraps to 80 + 80 + 40
+    feed(&rpc, "<Esc>gg0"); // line 1, column 0 (first display row)
+    let _ = lines(&rpc).await;
+
+    feed(&rpc, "gj");
+    assert_eq!(
+        cursor(&rpc).await,
+        (1, 80),
+        "gj → second display row, same buffer line"
+    );
+    feed(&rpc, "gj");
+    assert_eq!(cursor(&rpc).await, (1, 160), "gj → third display row");
+    feed(&rpc, "gk");
+    assert_eq!(cursor(&rpc).await, (1, 80), "gk → back up one display row");
+}
+
+#[tokio::test]
+async fn gj_crosses_lines_and_falls_back_to_j_without_wrap() {
+    let body = format!("{}\nsecond\n", "a".repeat(200));
+    let path = write_temp("gjcross", "txt", &body);
+    let (rpc, _incoming) = start(Some(path)).await; // bound to keep the RPC alive
+    feed(
+        &rpc,
+        ":set nonumber<CR>:set norelativenumber<CR>:set wrap<CR>",
+    );
+    let _ = lines(&rpc).await;
+
+    // From the last display row of line 1, gj crosses to the next buffer line.
+    feed(&rpc, "gg0gjgj"); // line 1, third display row (col 160)
+    feed(&rpc, "gj");
+    assert_eq!(
+        cursor(&rpc).await,
+        (2, 0),
+        "gj from the last display row crosses to the next line"
+    );
+
+    // With `nowrap`, gj is plain j: one buffer line.
+    feed(&rpc, ":set nowrap<CR>gg0");
+    feed(&rpc, "gj");
+    assert_eq!(
+        cursor(&rpc).await,
+        (2, 0),
+        "nowrap: gj == j (one buffer line down)"
     );
 }
 

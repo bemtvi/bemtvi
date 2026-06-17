@@ -66,8 +66,13 @@ pub struct ScrollAnim {
 /// (folds, diff filler, wrapped continuation) is just another arm here.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RowKind {
-    /// A real buffer line; carries its 0-based buffer-line index.
-    Line(usize),
+    /// A display row of a real buffer line. `line` is the 0-based buffer line;
+    /// `start_col` is the screen column where this row's text begins within the
+    /// line — `0` for the first/only row, and `> 0` for a soft-wrap continuation
+    /// row (`'wrap'`). A line that fits (or `nowrap`) has a single row at
+    /// `start_col 0`. Overlays on this row are clipped to its `[start_col, …)`
+    /// segment and rebased to row-local screen columns.
+    Line { line: usize, start_col: usize },
     /// A virtual line (extmark `virt_lines`) interleaved above/below its anchor
     /// buffer line; its chunk run lives in [`RenderRow::virt_line`].
     VirtLine,
@@ -108,11 +113,14 @@ pub struct RenderRow {
 }
 
 impl RenderRow {
-    /// 1-based buffer line number for the number column — `Some` only for a real
-    /// [`RowKind::Line`] row (virtual / filler rows show no number).
+    /// 1-based buffer line number for the number column — `Some` for a real
+    /// [`RowKind::Line`] row (virtual / filler rows show no number). A soft-wrap
+    /// continuation row repeats its line's number (a v1 cosmetic: vim blanks the
+    /// gutter on continuations, but repeating it keeps the wire identical — a
+    /// continuation is an ordinary numbered text row to every client).
     pub fn number(&self) -> Option<usize> {
         match self.kind {
-            RowKind::Line(i) => Some(i + 1),
+            RowKind::Line { line, .. } => Some(line + 1),
             RowKind::VirtLine | RowKind::Filler => None,
         }
     }
@@ -120,7 +128,7 @@ impl RenderRow {
     /// 0-based buffer line index when this row renders a real buffer line.
     pub fn line(&self) -> Option<usize> {
         match self.kind {
-            RowKind::Line(i) => Some(i),
+            RowKind::Line { line, .. } => Some(line),
             RowKind::VirtLine | RowKind::Filler => None,
         }
     }
@@ -694,8 +702,10 @@ fn window_view(ed: &Editor, w: &WindowLayout) -> WindowView {
     // search, incsearch) rides on the row it belongs to. With no `virt_lines` this
     // is one row per buffer line. There is no separate per-array scatter step — the
     // overlays are written straight onto the rows they fall on.
+    let wrap = w.options.wrap;
+    let tabstop = buf.options.effective_tabstop();
     let rows = render_rows(
-        ed, buf, top, height, line_count, w.focused, width, w.cursor, ed.cursor,
+        ed, buf, top, height, line_count, w.focused, width, wrap, tabstop, w.cursor, ed.cursor,
     );
 
     let scroll = if w.focused {
@@ -707,7 +717,8 @@ fn window_view(ed: &Editor, w: &WindowLayout) -> WindowView {
             // just more rows in the band, counted by `screen_rows_between`.
             let base_line = ps.from_top.min(ps.to_top);
             let max_top = ps.from_top.max(ps.to_top);
-            let lead = screen_rows_between(buf, base_line, max_top, line_count);
+            let lead =
+                screen_rows_between(buf, base_line, max_top, line_count, wrap, width, tabstop);
             let band_height = lead + height;
             // The selection rides the band at the *maximal* extent the slide touches:
             // anchor → whichever scroll endpoint is furthest from the anchor. Projecting
@@ -741,14 +752,42 @@ fn window_view(ed: &Editor, w: &WindowLayout) -> WindowView {
                 line_count,
                 true,
                 width,
+                wrap,
+                tabstop,
                 w.cursor,
                 sel_head,
             );
             ScrollAnim {
-                from_row: screen_rows_between(buf, base_line, ps.from_top, line_count),
-                to_row: screen_rows_between(buf, base_line, ps.to_top, line_count),
-                from_cursor_row: cursor_band_row(buf, base_line, ps.from_cursor, line_count),
-                to_cursor_row: cursor_band_row(buf, base_line, ps.to_cursor, line_count),
+                from_row: screen_rows_between(
+                    buf,
+                    base_line,
+                    ps.from_top,
+                    line_count,
+                    wrap,
+                    width,
+                    tabstop,
+                ),
+                to_row: screen_rows_between(
+                    buf, base_line, ps.to_top, line_count, wrap, width, tabstop,
+                ),
+                from_cursor_row: cursor_band_row(
+                    buf,
+                    base_line,
+                    ps.from_cursor,
+                    line_count,
+                    wrap,
+                    width,
+                    tabstop,
+                ),
+                to_cursor_row: cursor_band_row(
+                    buf,
+                    base_line,
+                    ps.to_cursor,
+                    line_count,
+                    wrap,
+                    width,
+                    tabstop,
+                ),
                 duration_ms: ps.duration_ms,
                 rows: band_rows,
                 sel_extends_down,
@@ -776,11 +815,26 @@ fn window_view(ed: &Editor, w: &WindowLayout) -> WindowView {
     // extension-derived language. Drives `%y` and the web build's grammar choice.
     let filetype = ed.ts_language_for(w.buffer).unwrap_or_default();
 
+    // The cursor's display row offset within its buffer line (its soft-wrap segment
+    // index) and the screen column that segment starts at — both `0` under `nowrap`.
+    // The cursor's screen column is then *row-local* (measured from its segment), so
+    // it lands on the right wrapped row at the right column.
+    let (cursor_extra_rows, cursor_seg_col) = if wrap && width > 0 {
+        let line = buf.line(cur_line);
+        let segs = unicode::wrap_segments(&line, tabstop, width);
+        let idx = segs
+            .iter()
+            .rposition(|s| w.cursor.col >= s.start_byte)
+            .unwrap_or(0);
+        (idx, segs[idx].start_col)
+    } else {
+        (0, 0)
+    };
     let (cursor_screen_col, cursor_width) = {
         let line = buf.line(cur_line);
         let tab = buf.options.effective_tabstop();
         (
-            unicode::virtcol(&line, w.cursor.col, tab),
+            unicode::virtcol(&line, w.cursor.col, tab).saturating_sub(cursor_seg_col),
             unicode::cursor_cell_width(&line, w.cursor.col, tab),
         )
     };
@@ -863,13 +917,17 @@ fn window_view(ed: &Editor, w: &WindowLayout) -> WindowView {
         // layout (past any `virt_lines` above it). A stashed cursor of an unfocused
         // window can sit outside the visible band (the buffer shrank, or it never
         // scrolled to it) — clamp it to the nearest edge for the rendered ruler.
-        cursor_row: screen_row_of(&rows, cur_line).unwrap_or_else(|| {
-            if cur_line < top {
-                0
-            } else {
-                height.saturating_sub(1)
-            }
-        }),
+        // The cursor's line lands at its first display row; `cursor_extra_rows` then
+        // steps down to the wrapped row the cursor's column is on (0 under nowrap).
+        cursor_row: screen_row_of(&rows, cur_line)
+            .map(|r| r + cursor_extra_rows)
+            .unwrap_or_else(|| {
+                if cur_line < top {
+                    0
+                } else {
+                    height.saturating_sub(1)
+                }
+            }),
         leftcol: w.leftcol,
         cursor_col: w.cursor.col,
         cursor_screen_col,
@@ -952,18 +1010,37 @@ fn window_status_ctx(inp: StatusCtxInputs) -> StatuslineCtx {
     }
 }
 
+/// The number of display (text) rows buffer `line` occupies: `1` under `nowrap`
+/// (or for a line that fits), else its soft-wrap segment count. The free-function
+/// mirror of [`Editor::line_text_rows`](crate::Editor), for the band geometry.
+fn line_text_rows_of(buf: &Buffer, line: usize, wrap: bool, width: usize, tabstop: usize) -> usize {
+    if !wrap || width == 0 {
+        return 1;
+    }
+    unicode::wrap_segments(&buf.line_cow(line), tabstop, width).len()
+}
+
 /// The number of **screen rows** the buffer lines `[base, target)` occupy: each
-/// line is one text row plus its `virt_lines` above/below (and past end-of-buffer
-/// each `~` filler is one row). This maps a buffer-line viewport top to its
-/// screen-row offset within a band anchored at `base` — the bridge from the
-/// buffer-line scroll *gesture* to the screen-row band. (`target >= base`.)
-fn screen_rows_between(buf: &Buffer, base: usize, target: usize, line_count: usize) -> usize {
+/// line's text rows (its soft-wrap segment count) plus its `virt_lines`
+/// above/below (and past end-of-buffer each `~` filler is one row). This maps a
+/// buffer-line viewport top to its screen-row offset within a band anchored at
+/// `base` — the bridge from the buffer-line scroll *gesture* to the screen-row
+/// band. (`target >= base`.)
+fn screen_rows_between(
+    buf: &Buffer,
+    base: usize,
+    target: usize,
+    line_count: usize,
+    wrap: bool,
+    width: usize,
+    tabstop: usize,
+) -> usize {
     let virt = buf.virt_lines_by_line();
     (base..target)
         .map(|line| {
             if line < line_count {
-                virt.get(&line)
-                    .map_or(1, |r| 1 + r.above.len() + r.below.len())
+                line_text_rows_of(buf, line, wrap, width, tabstop)
+                    + virt.get(&line).map_or(0, |r| r.above.len() + r.below.len())
             } else {
                 1
             }
@@ -973,14 +1050,24 @@ fn screen_rows_between(buf: &Buffer, base: usize, target: usize, line_count: usi
 
 /// The cursor line's screen-row offset within a band anchored at `base`: the
 /// screen rows of `[base, cursor_line)` plus the cursor line's own `virt_lines`
-/// *above* (the cursor sits on the text row, after any virtual rows above it).
-/// Mirrors [`Editor::cursor_screen_row`](crate::Editor) for the band frame.
-fn cursor_band_row(buf: &Buffer, base: usize, cursor_line: usize, line_count: usize) -> usize {
+/// *above*. Mirrors [`Editor::cursor_screen_row`](crate::Editor) for the band at
+/// buffer-line granularity (the gesture carries lines, not the cursor's wrap
+/// segment, so a wrapped cursor lands on its line's first display row).
+#[allow(clippy::too_many_arguments)]
+fn cursor_band_row(
+    buf: &Buffer,
+    base: usize,
+    cursor_line: usize,
+    line_count: usize,
+    wrap: bool,
+    width: usize,
+    tabstop: usize,
+) -> usize {
     let above = buf
         .virt_lines_by_line()
         .get(&cursor_line)
         .map_or(0, |r| r.above.len());
-    screen_rows_between(buf, base, cursor_line, line_count) + above
+    screen_rows_between(buf, base, cursor_line, line_count, wrap, width, tabstop) + above
 }
 
 /// Lay out `height` screen rows starting at buffer line `base`, **expanding** each
@@ -995,7 +1082,20 @@ fn cursor_band_row(buf: &Buffer, base: usize, cursor_line: usize, line_count: us
 /// in `virt_line`; a `~` filler is [`RowKind::Filler`]. Both report `number() ==
 /// None`, but `virt_line.is_some()` distinguishes them — exactly the bit a client
 /// uses to paint chunks rather than `~`.
-fn row_skeleton(buf: &Buffer, base: usize, height: usize, line_count: usize) -> Vec<RenderRow> {
+///
+/// When `wrap` is on (and `width > 0`), a buffer line wider than `width` cells is
+/// laid out across several [`RowKind::Line`] rows — one per [`unicode::wrap_segments`]
+/// segment, each carrying its byte slice and `start_col`. `tabstop` drives the
+/// cell-accurate break.
+fn row_skeleton(
+    buf: &Buffer,
+    base: usize,
+    height: usize,
+    line_count: usize,
+    wrap: bool,
+    width: usize,
+    tabstop: usize,
+) -> Vec<RenderRow> {
     let virt_by_line = buf.virt_lines_by_line();
     let mut rows = Vec::with_capacity(height);
     let push_virt = |rows: &mut Vec<RenderRow>, chunks: &[VirtChunk]| {
@@ -1033,18 +1133,45 @@ fn row_skeleton(buf: &Buffer, base: usize, height: usize, line_count: usize) -> 
                 push_virt(&mut rows, vl);
             }
         }
+        // The buffer line's display rows: a single row at `nowrap`, else one per
+        // soft-wrap segment. Each carries its byte slice and the screen column it
+        // begins at (`start_col`), which `render_rows` uses to clip overlays.
+        let text = buf.line(buf_line);
+        if wrap {
+            for seg in unicode::wrap_segments(&text, tabstop, width) {
+                if rows.len() >= height {
+                    break;
+                }
+                rows.push(RenderRow {
+                    kind: RowKind::Line {
+                        line: buf_line,
+                        start_col: seg.start_col,
+                    },
+                    text: text[seg.start_byte..seg.end_byte].to_string(),
+                    virt_line: None,
+                    selection: None,
+                    secondary_selection: Vec::new(),
+                    search: Vec::new(),
+                    incsearch: None,
+                });
+            }
+        } else if rows.len() < height {
+            rows.push(RenderRow {
+                kind: RowKind::Line {
+                    line: buf_line,
+                    start_col: 0,
+                },
+                text,
+                virt_line: None,
+                selection: None,
+                secondary_selection: Vec::new(),
+                search: Vec::new(),
+                incsearch: None,
+            });
+        }
         if rows.len() >= height {
             break;
         }
-        rows.push(RenderRow {
-            kind: RowKind::Line(buf_line),
-            text: buf.line(buf_line),
-            virt_line: None,
-            selection: None,
-            secondary_selection: Vec::new(),
-            search: Vec::new(),
-            incsearch: None,
-        });
         if let Some(v) = virt {
             for vl in &v.below {
                 if rows.len() >= height {
@@ -1055,6 +1182,7 @@ fn row_skeleton(buf: &Buffer, base: usize, height: usize, line_count: usize) -> 
         }
         buf_line += 1;
     }
+    rows.truncate(height);
     rows
 }
 
@@ -1081,27 +1209,53 @@ fn render_rows(
     line_count: usize,
     focused: bool,
     width: usize,
+    wrap: bool,
+    tabstop: usize,
     cursor: Cursor,
     sel_head: Cursor,
 ) -> Vec<RenderRow> {
-    let mut rows = row_skeleton(buf, base, height, line_count);
+    let mut rows = row_skeleton(buf, base, height, line_count, wrap, width, tabstop);
     if !focused {
         return rows;
     }
     let selection = selection_spans_with_head(ed, buf, width, line_count, base, height, sel_head);
     let secondary = secondary_selection_spans(ed, buf, width, line_count, base, height);
     let (search, incsearch) = ed.search_highlights_in(buf, cursor, focused, base, height);
+    // Clip a full-line screen-column span to the row's wrap segment `[start_col,
+    // start_col + bound)` and rebase to row-local columns; `None` if it misses the
+    // segment. Under `nowrap` the segment is the whole line (`start_col == 0`,
+    // unbounded), so this is the identity — the spans pass through unchanged.
+    let clip = |span: (usize, usize), start_col: usize| -> Option<(usize, usize)> {
+        let bound = if wrap {
+            start_col.saturating_add(width)
+        } else {
+            usize::MAX
+        };
+        let lo = span.0.max(start_col);
+        let hi = span.1.min(bound);
+        (lo < hi).then(|| (lo - start_col, hi - start_col))
+    };
     for row in &mut rows {
-        let Some(line) = row.line() else { continue };
+        let RowKind::Line { line, start_col } = row.kind else {
+            continue;
+        };
         let k = line - base;
-        row.selection = selection.get(k).copied().flatten();
+        row.selection = selection
+            .get(k)
+            .copied()
+            .flatten()
+            .and_then(|s| clip(s, start_col));
         if let Some(spans) = secondary.get(k) {
-            row.secondary_selection = spans.clone();
+            row.secondary_selection = spans.iter().filter_map(|s| clip(*s, start_col)).collect();
         }
         if let Some(spans) = search.get(k) {
-            row.search = spans.clone();
+            row.search = spans.iter().filter_map(|s| clip(*s, start_col)).collect();
         }
-        row.incsearch = incsearch.get(k).copied().flatten();
+        row.incsearch = incsearch
+            .get(k)
+            .copied()
+            .flatten()
+            .and_then(|s| clip(s, start_col));
     }
     rows
 }

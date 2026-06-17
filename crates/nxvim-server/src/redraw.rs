@@ -271,6 +271,16 @@ impl EditHost {
             ),
             (Value::from("menu"), menu),
             (Value::from("float"), float),
+            // Whether the client must highlight *code* itself (JS-side treesitter) and
+            // treat any per-window `highlights` spans as an overlay rather than the full
+            // styling. True only on the browser (wasm) build, where the editor runs
+            // locally and ships only extmark / semantic / terminal spans — so the client
+            // must NOT flip into server-styled mode when those spans appear. The native
+            // builds bake every highlight source into `highlights`, so it is false there.
+            (
+                Value::from("js_highlight"),
+                Value::from(cfg!(not(feature = "native"))),
+            ),
         ];
 
         self.fx.notify("redraw", vec![Value::Map(map)]);
@@ -310,15 +320,16 @@ impl EditHost {
         // paints from the buffer text instead).
         #[cfg(feature = "native")]
         let highlights = self.highlights_for(win.buffer, &segments, styles);
-        // The browser build highlights code JS-side and leaves these empty — *except*
-        // a terminal, whose per-cell colors live only in the wasm-side vt100 grid and
-        // can't be recovered from the buffer text. Project those (and intern their
-        // styles into the shared palette); `terminal_highlights` returns `None` for a
-        // non-terminal window, so a code buffer keeps its empty array + JS highlighting.
+        // The browser build highlights *code* JS-side, so it skips the treesitter
+        // spans — but extmark highlights (the `nx.decor` / `nx.buf.set_extmark` layer)
+        // and LSP semantic tokens are genuinely server-sourced and can't be
+        // reproduced JS-side, so it still projects those (plus a terminal's vt100
+        // colors) as an *overlay* the renderer paints on top of its JS colors. A code
+        // buffer with no extmarks/semantic tokens gets empty rows + pure JS
+        // highlighting; the `js_highlight` frame flag (below) keeps these overlay
+        // spans from flipping the client into full server-styled mode.
         #[cfg(not(feature = "native"))]
-        let highlights = self
-            .terminal_highlights(win.buffer, &numbers, styles)
-            .unwrap_or_else(|| Value::Array(Vec::new()));
+        let highlights = self.overlay_highlights_for(win.buffer, &segments, styles);
         // Display columns of the `^X` / `<xx>` substitutions, for the wasm renderer
         // to colour as `SpecialKey`; the native client paints them from `highlights`,
         // so it gets an empty array (keeping the redraw map shape stable).

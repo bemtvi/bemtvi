@@ -105,6 +105,11 @@
 
     let view = null;          // the latest redraw frame (the server's View map)
     let bufferText = "";      // the focused buffer's full text, for the highlighter
+    // The full text of each *visible* buffer, keyed by file name, so a window that
+    // isn't focused (e.g. the code window beneath an open `:messages` / panel split)
+    // still gets highlighted — the Worker only ships the focused buffer's text, so we
+    // remember the others here and pruned to what's on screen (see `setFrame`).
+    const textByFile = new Map();
     let ts = null;            // tree-sitter highlighter (loaded lazily by language)
     let cw = 9, ch = 21;
     let cols = 80, editorRows = 24; // editorRows = grid rows minus the command row
@@ -468,7 +473,16 @@
       frame.mode = frame.mode_label;
       for (const w of frame.windows || []) w.secondary_cursors = w.cursors || [];
       view = frame;
-      if (lines != null) bufferText = lines;
+      if (lines != null) {
+        bufferText = lines;
+        // Remember the (just-shipped) focused buffer's text by file name, so a later
+        // frame where it's NOT focused can still highlight it from here.
+        const fw = (frame.windows || []).find((w) => w.focused);
+        if (fw && !fw.terminal) textByFile.set(fw.file_name, lines);
+      }
+      // Keep the cache bounded to what's on screen: drop any file no window shows.
+      const visible = new Set((frame.windows || []).map((w) => w.file_name));
+      for (const k of textByFile.keys()) if (!visible.has(k)) textByFile.delete(k);
       applyView();
     }
 
@@ -484,20 +498,21 @@
       requestAnimationFrame(() => { tsPending = false; if (view) render(); });
     }
 
-    // Syntax-highlight context for this frame: the focused buffer's per-line capture
-    // spans, plus the file it belongs to. Returns null when there's nothing to
-    // highlight (runtime not ready, unsupported file, or grammar still loading). The
-    // buffer text comes from the Worker (the focused buffer's full contents), not a
-    // synchronous editor call. Other windows showing the SAME file reuse this.
-    function highlightContext() {
+    // Per-line tree-sitter capture spans for one window's buffer, or null when there's
+    // nothing to highlight (runtime not ready, terminal, unsupported file, grammar still
+    // loading, or no cached text). Each visible window is highlighted from its OWN text —
+    // the focused window's full contents arrive from the Worker (`bufferText`); other
+    // visible windows (e.g. a code buffer beneath an open `:messages` panel) read the
+    // text remembered in `textByFile`, so they keep their highlighting while unfocused.
+    function spansForWindow(w) {
       if (!ts || !ts.isReady()) return null;
-      const fw = view.windows.find((w) => w.focused) || view.windows[0];
-      if (!fw) return null;
+      if (w.terminal || w.term_colors) return null;
       const lang =
-        ts.langForFiletype(fw.filetype) || (fw.unnamed ? null : ts.langForName(fw.file_name));
+        ts.langForFiletype(w.filetype) || (w.unnamed ? null : ts.langForName(w.file_name));
       if (!lang) return null;
-      const spans = ts.spansForBuffer(lang, bufferText);
-      return spans ? { file: fw.file_name, spans } : null;
+      const text = w.focused ? bufferText : textByFile.get(w.file_name);
+      if (text == null) return null;
+      return ts.spansForBuffer(lang, text);
     }
 
     // ============================================================================
@@ -803,7 +818,12 @@
       const serverHl = (view.windows || []).some(
         (w) => (w.highlights || []).some((spans) => spans && spans.length)
       );
-      serverStyled = serverHl && !termWin;
+      // `js_highlight` (the wasm build) means the editor runs locally and ships only
+      // *overlay* highlight spans (extmark / `nx.decor` / semantic / terminal) — NOT a
+      // full server colorscheme — so those spans must not flip the whole renderer into
+      // server-styled mode (which would disable JS treesitter highlighting + JS chrome).
+      // `renderLine` paints them as an overlay on top of its JS colors instead.
+      serverStyled = serverHl && !termWin && !view.js_highlight;
       gridEl.innerHTML = "";
       shownImagePaths = new Set(); // reset; `renderImage` records each preview shown this frame
       if (serverStyled) applyChrome();
@@ -812,16 +832,18 @@
         : view.tabline.length;
       const tablineRows = hasTabline ? 1 : 0;
       const cmdRow = editorRows; // command line sits just past the editor area
-      const hl = serverStyled ? null : highlightContext();
+      // Whether JS tree-sitter highlighting is active this frame; each window resolves
+      // its own spans via `spansForWindow` (so an unfocused code window keeps its colors).
+      const jsHl = !serverStyled;
 
       if (tablineRows) {
         if (serverStyled && view.tabline_segments?.length) renderTablineSegments(0);
         else renderTabline(0);
       }
       renderDockTablines(tablineRows);
-      for (const w of view.windows) if (!w.floating) renderWindow(w, tablineRows, hl);
+      for (const w of view.windows) if (!w.floating) renderWindow(w, tablineRows, jsHl);
       renderSeparators(tablineRows);
-      for (const w of view.windows) if (w.floating) renderFloat(w, tablineRows, hl);
+      for (const w of view.windows) if (w.floating) renderFloat(w, tablineRows, jsHl);
       if (serverStyled && view.global_status?.length) {
         const g = dockGeo(tablineRows);
         renderGlobalStatus(g.midY + g.midH);
@@ -900,7 +922,7 @@
       if (hCells != null) el.style.height = hCells * ch + "px";
     }
 
-    function renderWindow(w, tablineRows, hl) {
+    function renderWindow(w, tablineRows, jsHl) {
       const rect = winRect(w);
       const o = regionOrigin(w.region, tablineRows);
       const box = document.createElement("div");
@@ -925,7 +947,7 @@
       const textRows = w.lines.length;
       const statusRows = Math.max(0, rect.height - textRows);
       const gutterW = w.number_width || 0;
-      const winSpans = hl && w.file_name === hl.file ? hl.spans : null;
+      const winSpans = jsHl ? spansForWindow(w) : null;
 
       if (scrollAnim && w.focused) {
         renderScrollBand(box, w, rect, winSpans);
@@ -1035,13 +1057,28 @@
       // resolves the group.
       const special = w.special_key?.[row] || [];
       const SPECIAL_KEY = "#d787ff";
+      // Server-sourced highlight overlay (extmark / `nx.decor` / LSP semantic tokens),
+      // per screen row in display columns. The wasm build can't reproduce these JS-side,
+      // so the server ships them (see `overlay_highlights_for`) and we paint them over the
+      // JS treesitter colors here, at full style (fg/bg/bold/italic via the palette) so a
+      // `nx.decor` mark looks the same as on native. Wins over the JS color, loses to the
+      // control-char `SpecialKey` substitution (which isn't real content).
+      const srvHl = w.highlights?.[row] || [];
+      const srvCssAt = (c) => {
+        for (const [s, e, group, id] of srvHl) {
+          if (c >= s && c < e) {
+            if (id != null) return styleToCss(paletteStyle(id));
+            const fg = colorFor(group);
+            return fg ? `color:${fg};` : "";
+          }
+        }
+        return null;
+      };
 
-      let run = "", runCls = "", runColor = "", runBg = "", out = "";
+      let run = "", runCls = "", runCss = "", out = "";
       const flush = () => {
         if (!run) return;
-        const style = (runColor || runBg)
-          ? ` style="${runColor ? `color:${runColor};` : ""}${runBg ? `background:${runBg};` : ""}"`
-          : "";
+        const style = runCss ? ` style="${runCss}"` : "";
         out += `<span class="${runCls}"${style}>${escapeHtml(run)}</span>`;
         run = "";
       };
@@ -1060,12 +1097,20 @@
         if (secCols.has(c)) cls = "seccur";
         if (isFocused && row === cursorRow && c === cursorCol) cls = cursorClass();
         else if (!w.focused && row === cursorRow && c === cursorCol && !view.command_mode) cls = "cur-hollow";
-        // Cursor / selection / search own their colors via their CSS class; an
-        // overlay virt_text bg (cells[c].bg) only shows on a plain cell.
+        // Cursor / selection / search own their colors via their CSS class; the
+        // server overlay, control-char colour, and virt_text bg only show on a plain cell.
         const owned = COLOR_OWNED.has(cls);
-        const color = owned ? "" : (special.some((s) => inSpan(s, c)) ? SPECIAL_KEY : (cells[c].color || ""));
-        const bg = owned ? "" : (cells[c].bg || "");
-        if (cls !== runCls || color !== runColor || bg !== runBg) { flush(); runCls = cls; runColor = color; runBg = bg; }
+        let css = "";
+        if (!owned) {
+          if (special.some((s) => inSpan(s, c))) {
+            css = `color:${SPECIAL_KEY};` + (cells[c].bg ? `background:${cells[c].bg};` : "");
+          } else {
+            const sv = srvHl.length ? srvCssAt(c) : null;
+            if (sv != null) css = sv;
+            else css = (cells[c].color ? `color:${cells[c].color};` : "") + (cells[c].bg ? `background:${cells[c].bg};` : "");
+          }
+        }
+        if (cls !== runCls || css !== runCss) { flush(); runCls = cls; runCss = css; }
         run += cells[c].ch;
       }
       flush();
@@ -1642,8 +1687,8 @@
       if (g.dl > 0) sepLine(g.dl, g.midY, 1, g.midH, "┃", true);
       if (g.dr > 0) sepLine(cols - g.dr - 1, g.midY, 1, g.midH, "┃", true);
     }
-    function renderFloat(w, tablineRows, hl) {
-      renderWindow(w, tablineRows, hl);
+    function renderFloat(w, tablineRows, jsHl) {
+      renderWindow(w, tablineRows, jsHl);
     }
     // Paint tabline cells (` ▸{count}{label}{+} `, the active cell marked) for a
     // `{ tabs, current }` at cell (x, y) spanning `width` cells, preceded by an

@@ -91,6 +91,89 @@ impl EditHost {
             .collect();
         out
     }
+
+    /// The browser (`not(feature = "native")`) twin of
+    /// [`highlights_for`](crate::EditHost::highlights_for): the per-row highlight
+    /// spans the wasm renderer paints as an *overlay* on top of its JS-side
+    /// treesitter colors. The native projection bakes treesitter spans, semantic
+    /// tokens, extmarks and control-char `SpecialKey` into one merged span list;
+    /// the wasm build has no server-side treesitter (it highlights code JS-side) and
+    /// substitutes control chars JS-side (`special_key`), so this projects only the
+    /// genuinely server-sourced overlays — extmark highlights (the `nx.decor` /
+    /// `nx.buf.set_extmark` layer) and LSP semantic tokens — which the JS side can't
+    /// reproduce on its own.
+    ///
+    /// Returns the same `[[start, end, group, style_id], …]`-per-row shape as
+    /// `highlights_for`, in display columns clipped/rebased to each row's wrap
+    /// segment, so the renderer overlays them exactly like the native client paints
+    /// them. A terminal window short-circuits to its vt100 palette spans (as
+    /// `highlights_for` does), so a `:terminal` keeps its colors here too.
+    #[cfg(not(feature = "native"))]
+    pub(crate) fn overlay_highlights_for(
+        &self,
+        buffer: BufferId,
+        segs: &[crate::redraw::RowSeg],
+        styles: &mut StyleTable,
+    ) -> Value {
+        let numbers: Vec<Option<usize>> = segs.iter().map(|s| s.line).collect();
+        if let Some(term) = self.terminal_highlights(buffer, &numbers, styles) {
+            return term;
+        }
+        let Some(b) = self.editor.buffer_of(buffer) else {
+            return Value::Array(segs.iter().map(|_| Value::Array(Vec::new())).collect());
+        };
+        let rows = segs
+            .iter()
+            .map(|seg| {
+                let Some(n) = seg.line else {
+                    return Value::Array(Vec::new());
+                };
+                let line_idx = n - 1;
+                let text = b.line_cow(line_idx);
+                let tab = b.options.effective_tabstop();
+
+                // Semantic tokens sit above extmarks' base order, matching the native
+                // layering (semantic at SEMANTIC_HL_PRIORITY, extmarks at their own
+                // priority); no treesitter spans exist on this build, so base order is 0.
+                let sem = self.semantic_intervals(buffer, line_idx, 0);
+                let mut intervals = sem;
+                intervals.extend(self.extmark_intervals(
+                    buffer,
+                    line_idx,
+                    b.line_start(line_idx),
+                    text.len(),
+                    intervals.len() as u32,
+                ));
+                if intervals.is_empty() {
+                    return Value::Array(Vec::new());
+                }
+                let mut vc = unicode::LineVirtcol::new(&text, tab);
+                let row = merge_intervals(&intervals)
+                    .into_iter()
+                    .filter_map(|(sb, eb, group, capture)| {
+                        let (start, end) = seg.clip(vc.at(sb), vc.at(eb))?;
+                        let resolved = if capture {
+                            self.editor.highlights.resolve_capture(group)
+                        } else {
+                            self.editor.highlights.resolve(group)
+                        };
+                        let style_id = match resolved {
+                            Some(style) => Value::from(styles.intern(style) as u64),
+                            None => Value::Nil,
+                        };
+                        Some(Value::Array(vec![
+                            Value::from(start as u64),
+                            Value::from(end as u64),
+                            Value::from(group),
+                            style_id,
+                        ]))
+                    })
+                    .collect();
+                Value::Array(row)
+            })
+            .collect();
+        Value::Array(rows)
+    }
 }
 
 impl EditHost {

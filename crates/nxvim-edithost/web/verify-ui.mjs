@@ -320,12 +320,88 @@ try {
   check("nx.complete: <C-y> accepts, replacing the whole ':sm' from the trigger char",
     /SMILE/.test(completedLine) && !/smile/.test(completedLine), JSON.stringify(completedLine));
 
+  // ---- 12. cmdline wildmenu: float geometry + order + back-cycle ----
+  // Three layout bugs hit the web client and not the cell-grid (GUI/TUI) ones, and the
+  // textContent-only checks above couldn't catch them: the rows collapsed to the box
+  // top (a CSS specificity clash made `.pmenu .row` absolute), the float hovered a
+  // status line above the command line instead of kissing it, and the list wasn't
+  // reversed so the best match sat farthest from the input. We also drive REAL typed
+  // keys here (through the key encoder, not the `feed` hook) so Shift+Tab exercises the
+  // encoding path — it was dropping the Shift and sending a plain forward `<Tab>`.
+  const wildSnap = () => page.evaluate(() => {
+    const box = document.querySelector("#grid .pmenu");
+    const cmd = document.querySelector(".cmdline");
+    if (!box) return null;
+    const rows = [...box.querySelectorAll(".row")].map((r) => ({
+      text: r.textContent.replace(/\s+$/, ""),
+      top: Math.round(r.getBoundingClientRect().top),
+    }));
+    return {
+      selected: window.__nxvim.frame().menu?.selected,
+      boxBottom: Math.round(box.getBoundingClientRect().bottom),
+      cmdTop: cmd ? Math.round(cmd.getBoundingClientRect().top) : null,
+      rows,
+    };
+  });
+  await page.evaluate(() => window.__nxvim.execLua("nx.cmdline_complete.setup {}"));
+  await page.evaluate(() => { window.__nxvim.feed("<Esc>"); document.getElementById("kbd").focus(); });
+  await page.keyboard.type(":tab");
+  await page.keyboard.press("Tab"); // open the wildmenu + highlight the top fuzzy match
+  // The command catalog resolves through an async Lua source; poll for the full list.
+  let wild = null;
+  for (let i = 0; i < 40; i++) {
+    wild = await wildSnap();
+    if (wild && wild.rows.length >= 3 && wild.rows.some((r) => r.text === "tabnew")) break;
+    await sleep(50);
+  }
+  const { ch } = await page.evaluate(() => window.__nxvim.cellMetrics());
+
+  // Rows fill the float: each on its own line, one cell-height apart, none overlapping
+  // (the collapse bug stacked every row at the same `top`).
+  const tops = (wild?.rows || []).map((r) => r.top);
+  const stacked = tops.length >= 3
+    && new Set(tops).size === tops.length
+    && tops.every((t, i) => i === 0 || Math.abs(t - tops[i - 1] - ch) <= 1);
+  check("cmdline wildmenu: rows stack down the float (not collapsed to the top)",
+    !!wild && stacked, JSON.stringify(tops));
+
+  // Reversed: the best fuzzy match (`tabnew`, the server's row 0) sits at the BOTTOM
+  // nearest the command line; the worst (`tab`) at the top.
+  const topRow = wild?.rows[0]?.text;
+  const bottomRow = wild?.rows.at(-1)?.text;
+  check("cmdline wildmenu: list is reversed (best match at the bottom, nearest input)",
+    topRow === "tab" && bottomRow === "tabnew", JSON.stringify({ topRow, bottomRow }));
+
+  // Kisses the command line: the box's bottom edge meets the command-line row (within a
+  // border width) instead of floating a status line above it.
+  check("cmdline wildmenu: the float bottom kisses the command line",
+    !!wild && wild.cmdTop != null && Math.abs(wild.boxBottom - wild.cmdTop) <= 3,
+    JSON.stringify({ boxBottom: wild?.boxBottom, cmdTop: wild?.cmdTop }));
+
+  // Shift+Tab cycles BACKWARD: the first <Tab> selected row 0, so a real Shift+Tab — a
+  // special key the encoder must tag `<S-Tab>`, not a bare `<Tab>` — wraps to the last.
+  const selBefore = wild?.selected;
+  await page.keyboard.down("Shift");
+  await page.keyboard.press("Tab");
+  await page.keyboard.up("Shift");
+  let wild2 = null;
+  for (let i = 0; i < 30; i++) {
+    wild2 = await wildSnap();
+    if (wild2 && wild2.selected !== selBefore) break;
+    await sleep(50);
+  }
+  check("cmdline wildmenu: Shift+Tab cycles the selection backward (S-Tab encoded, not Tab)",
+    selBefore === 0 && wild2?.selected === (wild?.rows.length ?? 0) - 1,
+    JSON.stringify({ selBefore, after: wild2?.selected, total: wild?.rows.length }));
+  await page.keyboard.press("Escape");
+  await page.keyboard.press("Escape"); // close the wildmenu + command line
+
   await browser.close();
 } finally {
   cleanup();
 }
 
 console.log(failures === 0
-  ? "\nALL PASS — DOM renderer + mouse + selection/cursor + layout + highlighting verified in a real browser"
+  ? "\nALL PASS — DOM renderer + mouse + selection/cursor + layout + highlighting + wildmenu verified in a real browser"
   : `\n${failures} FAILED`);
 process.exit(failures === 0 ? 0 : 1);

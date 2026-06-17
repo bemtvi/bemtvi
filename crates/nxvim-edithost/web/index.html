@@ -54,12 +54,15 @@
   .diag-underline { text-decoration: underline wavy; text-decoration-thickness: 1px; text-underline-offset: 2px; }
   .inlay { color: #5c6370; font-style: italic; }
   .pmenu { position: absolute; background: #21252b; border: 1px solid #3e4451; z-index: 10; white-space: pre; }
-  .pmenu .row { position: static; height: var(--ch); line-height: var(--ch); }
+  /* `#grid`-scoped so these beat `#grid .row` (line above), whose `position:absolute`
+     would otherwise win on ID specificity and collapse every popup row to the box top
+     (`top:auto`) — leaving the items overlaid instead of stacked down the float. */
+  #grid .pmenu .row { position: static; height: var(--ch); line-height: var(--ch); }
   .pmenu-sel { background: var(--sel); color: #e6e6e6; }
   .pmenu-match { color: #e5c07b; font-weight: bold; }
   .pmenu-prompt { color: #abb2bf; }
   .pmenu-doc { position: absolute; background: #21252b; border: 1px solid #3e4451; z-index: 10; white-space: pre; color: var(--status-fg); }
-  .pmenu-doc .row { position: static; height: var(--ch); line-height: var(--ch); }
+  #grid .pmenu-doc .row { position: static; height: var(--ch); line-height: var(--ch); }
   /* A tiny boot/transport indicator, hidden shortly after the first frame. */
   #status { position: fixed; right: 6px; bottom: 4px; font-size: 11px; opacity: .4;
             color: #5c6370; pointer-events: none; z-index: 5; }
@@ -826,7 +829,7 @@
       if (serverStyled && view.pmenu) renderPmenu(view.pmenu, tablineRows);
       // The nx.ui.select menu is server-agnostic (it works in the pure-wasm
       // build too), so it renders regardless of `serverStyled`.
-      if (view.menu) renderMenu(view.menu, tablineRows);
+      if (view.menu) renderMenu(view.menu, tablineRows, cmdRow);
       // The nx.ui.float content float (LSP hover / signature help) — server-agnostic
       // like the menu, so it renders regardless of `serverStyled`.
       if (view.float) renderContentFloat(view.float, tablineRows);
@@ -1439,11 +1442,10 @@
     // The nx.ui.select menu: a bordered float-list under the cursor, reusing the
     // popup's look. Items are plain labels (no kind/detail/doc), and the
     // highlighted row gets the selection style.
-    function renderMenu(menu, tablineRows) {
+    function renderMenu(menu, tablineRows, cmdRow) {
       const fw = view.windows.find((w) => w.focused) || view.windows[0];
       const rect = fw ? winRect(fw) : { x: 0, y: 0 };
       const x = rect.x + menu.col;
-      const y = tablineRows + rect.y + menu.row;
       // A picker carries a prompt query (even when empty); a nx.ui.select does not.
       const hasPrompt = menu.query !== null && menu.query !== undefined;
       const promptRows = hasPrompt ? 1 : 0;
@@ -1455,6 +1457,15 @@
       // Render the FULL box height (`menu.height` is the fixed picker size), padding
       // empty rows past the item count so the box doesn't shrink to its content.
       const listRows = Math.max(1, menu.height - promptRows);
+      const boxRows = listRows + promptRows;
+      // The cmdline wildmenu floats *above* the command line: anchor its BOTTOM to the
+      // command-line row so it kisses the input — covering the status line in between,
+      // exactly as the cell-grid clients grow it up from `cmd_area`. Every other menu
+      // sits where the server placed it (text-area row `menu.row`). `cmdShift` is the
+      // resulting vertical offset, reused below so the docs sidebar tracks the box.
+      const serverY = tablineRows + rect.y + menu.row;
+      const y = menu.cmdline ? Math.max(tablineRows, cmdRow - boxRows) : serverY;
+      const cmdShift = y - serverY;
       // A noselect completion popup (`selected_active === false`) highlights no row
       // and scrolls from the top.
       const selActive = menu.selected_active !== false;
@@ -1466,7 +1477,7 @@
       // below the cursor (the web border is a 1px rule, so unlike the cell-grid
       // clients no left-shift is needed — content already sits at `menu.col`).
       if (menu.border_top === false) box.style.borderTopWidth = "0";
-      place(box, x, y, menu.width, listRows + promptRows);
+      place(box, x, y, menu.width, boxRows);
       if (hasPrompt) {
         const text = ("> " + menu.query).slice(0, listW).padEnd(listW);
         const promptEl = document.createElement("div");
@@ -1476,6 +1487,7 @@
         promptEl.textContent = text;
         box.appendChild(promptEl);
       }
+      const listEls = [];
       for (let i = 0; i < listRows; i++) {
         const idx = start + i;
         const label = String(menu.items[idx] ?? "");
@@ -1503,8 +1515,13 @@
           const pad = listW - chars.length;
           if (pad > 0) rowEl.appendChild(document.createTextNode(" ".repeat(pad)));
         }
-        box.appendChild(rowEl);
+        listEls.push(rowEl);
       }
+      // The cmdline wildmenu floats above its input, so flip the list to keep the best
+      // match (row 0) at the BOTTOM, nearest the command cursor — the mirror of a
+      // below-cursor completion popup (matches the cell-grid clients).
+      if (menu.cmdline) listEls.reverse();
+      for (const el of listEls) box.appendChild(el);
       gridEl.appendChild(box);
 
       // The preview column: a separate panel to the right of the list, with a header
@@ -1561,7 +1578,7 @@
         const d = menu.docs;
         const docBox = document.createElement("div");
         docBox.className = "pmenu-doc";
-        place(docBox, rect.x + d.col, tablineRows + rect.y + d.row, d.width, d.height);
+        place(docBox, rect.x + d.col, tablineRows + rect.y + d.row + cmdShift, d.width, d.height);
         for (const l of d.lines) {
           const rowEl = document.createElement("div");
           rowEl.className = "row";
@@ -1710,10 +1727,6 @@
       Home: "Home", End: "End", PageUp: "PageUp", PageDown: "PageDown",
     };
     function keyToNotation(e) {
-      const mods = [];
-      if (e.ctrlKey) mods.push("C");
-      if (e.altKey) mods.push("A");
-      if (e.metaKey) mods.push("D");
       let base = SPECIAL[e.key];
       const isSpecial = !!base;
       if (!base) {
@@ -1727,6 +1740,15 @@
         else if (e.key.length === 1) base = e.key === "<" ? "lt" : e.key;
         else return null; // bare modifier / unhandled key
       }
+      const mods = [];
+      if (e.ctrlKey) mods.push("C");
+      // Shift is a standalone modifier only for *special* keys (`<S-Tab>`, `<S-Up>`);
+      // for printable keys it's already folded into the character (Shift+a → "A"), and
+      // a Ctrl/Alt+letter combo carries it via the capitalized base above — so without
+      // this, Shift+Tab collapsed to a plain `<Tab>` and never sent the back-cycle.
+      if (e.shiftKey && isSpecial) mods.push("S");
+      if (e.altKey) mods.push("A");
+      if (e.metaKey) mods.push("D");
       if (mods.length === 0) {
         if (isSpecial || base === "Space" || base === "lt") return `<${base}>`;
         return base;

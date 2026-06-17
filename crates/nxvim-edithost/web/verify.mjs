@@ -170,20 +170,17 @@ try {
     `got ${JSON.stringify(reloaded)}`,
   );
 
-  // 10. Per "no silent stubs": a process shell-out has no serverless analogue and must
-  //     fail *loud*, not fake success. `nx._system` is nxvim's blocking shell-out primitive
-  //     (what `vim.fn.system` / a config's `root_dir` probe ride); the browser build's
-  //     WasmBlockingSystem degrades it to a clear, named failure (code = -1, message on
-  //     stderr) instead of trying — and failing cryptically — to spawn under emscripten.
-  const sysOut = await page.evaluate(() =>
-    window.__nxvim.execLua(
-      "local r = nx._system({'echo','hi'}); return r.code .. '|' .. r.stderr",
-    ).then((r) => r.result),
+  // 10. "No blocking IO at all": the blocking shell-out primitive `nx._system` (and the
+  //     whole BlockingSystem vertical it rode) was removed project-wide — processes are
+  //     async-only now (`vim.system` / `nx.run`, which need a daemon and fail loud without
+  //     one). Assert the blocking primitive is genuinely absent (nil), not stubbed.
+  const sysAbsent = await page.evaluate(() =>
+    window.__nxvim.execLua("return tostring(nx._system)").then((r) => r.result),
   );
   check(
-    "opfs: a system() call fails loud (no processes in the serverless build)",
-    /-1\|/.test(String(sysOut)) && /not\s+available in the browser build/i.test(String(sysOut)),
-    `nx._system → ${JSON.stringify(sysOut)}`,
+    "no-blocking: the blocking nx._system primitive is gone (processes are async-only)",
+    /nil/.test(String(sysAbsent)),
+    `nx._system → ${JSON.stringify(sysAbsent)}`,
   );
 
   // 11. Phase 6 (OPFS file explorer) — `:e <dir>` lists a real OPFS directory (netrw),

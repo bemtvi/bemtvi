@@ -104,32 +104,40 @@ local function cursor_word()
 end
 
 -- Upward `root_markers` search from the buffer's file, walking the project tree
--- through the fs seam (`nx._readdir`, remote under a daemon / OPFS under wasm — so
--- this works on every front end). Returns the first ancestor directory that holds
--- one of `markers`, or nil (the server then falls back to the file's directory).
+-- through the async `nx.fs` seam (local on native-bare, the daemon's `luafs_op` over
+-- the wire otherwise — so this works on every front end with NO editor-thread block).
+-- Returns a promise of the first ancestor directory that holds one of `markers`, or
+-- nil (the server then falls back to the file's directory). Each `nx.fs.readdir` that
+-- rejects (an unreadable / non-directory ancestor) is treated as "no markers here" and
+-- the walk continues upward.
 local function find_root(bufnr, markers)
-  local file = nx.buf.name(bufnr)
-  if type(file) ~= "string" or file == "" then
-    return nil
-  end
-  local dir = dirname(file)
-  while dir and dir ~= "" do
-    local present = {}
-    for _, name in ipairs(nx._readdir(dir) or {}) do
-      present[name] = true
+  return nx.async(function()
+    local file = nx.buf.name(bufnr)
+    if type(file) ~= "string" or file == "" then
+      return nil
     end
-    for _, m in ipairs(markers) do
-      if present[m] then
-        return dir
+    local dir = dirname(file)
+    while dir and dir ~= "" do
+      local present = {}
+      local entries = nx.await(nx.fs.readdir(dir):catch(function()
+        return {}
+      end))
+      for _, e in ipairs(entries) do
+        present[e.name] = true
       end
+      for _, m in ipairs(markers) do
+        if present[m] then
+          return dir
+        end
+      end
+      local parent = dirname(dir)
+      if parent == dir then
+        break
+      end
+      dir = parent
     end
-    local parent = dirname(dir)
-    if parent == dir then
-      break
-    end
-    dir = parent
-  end
-  return nil
+    return nil
+  end)
 end
 
 -- ----- config registry -------------------------------------------------------
@@ -260,7 +268,9 @@ local function start_for(name, cfg, bufnr, ft)
   elseif type(rd) == "string" then
     start_resolved(name, cfg, bufnr, ft, rd)
   elseif cfg.root_markers then
-    start_resolved(name, cfg, bufnr, ft, find_root(bufnr, cfg.root_markers))
+    find_root(bufnr, cfg.root_markers):next(function(root)
+      start_resolved(name, cfg, bufnr, ft, root)
+    end)
   else
     start_resolved(name, cfg, bufnr, ft, nil)
   end

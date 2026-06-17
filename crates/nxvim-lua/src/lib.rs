@@ -21,7 +21,6 @@
 //! - [`install`] — installing the `vim.*` Rust bridge into a fresh VM.
 //! - [`convert`] — the Lua↔`rmpv`/`serde_json` value bridges and opts readers.
 //! - [`host`] — filesystem / process / glob / standard-path host primitives.
-//! - [`system`] — the blocking `nx._system` shell-out seam ([`BlockingSystem`]).
 //! - [`luafs`] — the project-facing Lua filesystem seam ([`LuaFs`]).
 
 mod convert;
@@ -31,10 +30,9 @@ mod install;
 mod luafs;
 mod ops;
 mod runtime;
-mod system;
 mod vimregex;
 
-pub use fswire::{fs_job_from_value, fs_result_from_value, fs_result_to_value};
+pub use fswire::{fs_job_from_value, fs_job_to_value, fs_result_from_value, fs_result_to_value};
 pub use luafs::{run_fs_job, FileKind, LuaDirEntry, LuaFs, LuaStat, StdLuaFs};
 pub use ops::{
     BufOp, CallbackArgs, ConfirmReq, DecorMark, DecorPublish, DiagnosticData, DockOp, ExtmarkOp,
@@ -47,4 +45,3 @@ pub use runtime::{
     BoMirror, BufBytesEdit, BufMirror, ExtmarkMirror, FloatMirror, GoMirror, HlDefMirror,
     JumpMirror, LuaRuntime, QfMirror, TabMirror, WindowMirror,
 };
-pub use system::{BlockingSystem, StdBlockingSystem, SystemOutput, SystemSpec};

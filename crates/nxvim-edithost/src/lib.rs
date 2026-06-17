@@ -37,7 +37,7 @@ use nxvim_core::{
     PendingSave, PersistState, Span, SyntaxEngine,
 };
 use nxvim_lsp::{LspEvent, LspNotify, LspRequest, ReqToken, ServerKey, ServerSpawn, SyncLspClient, WireOp};
-use nxvim_lua::{BlockingSystem, LuaRuntime, SystemOutput, SystemSpec};
+use nxvim_lua::LuaRuntime;
 use nxvim_server::{EditHost, HostEffects};
 use rmpv::Value;
 
@@ -63,24 +63,6 @@ extern "C" {
     fn eh_js_ts_reload(lang: *const c_char);
 }
 
-/// The blocking shell-out seam (`nx._system`, behind `vim.fn.system` / a config's
-/// `root_dir` probe) on the serverless browser build: there is no process to run — a
-/// later Phase 6 daemon slice would carry one over the wire — so every call fails *loud*
-/// with a named message. Without this, [`LuaRuntime`]'s default `StdBlockingSystem` would
-/// reach `std::process::Command`, which on emscripten degrades to a cryptic
-/// "failed to spawn" errno; per *no silent stubs / fail loud with the name of what's
-/// missing*, the browser build says plainly that processes aren't available. The seam's
-/// contract is to *return a degraded [`SystemOutput`]*, never raise (callers rely on a
-/// value), so `code = -1` + the message on stderr is the loud form here.
-struct WasmBlockingSystem;
-
-impl BlockingSystem for WasmBlockingSystem {
-    fn run(&self, _spec: SystemSpec) -> SystemOutput {
-        SystemOutput::failed(
-            "processes (vim.fn.system / vim.system) are not available in the browser build yet",
-        )
-    }
-}
 
 /// The outbound effects the wasm edit-host captures for the UI to drain. The
 /// [`WasmEffects`] writes here; the FFI layer reads it back out (the redraw via
@@ -747,9 +729,6 @@ pub extern "C" fn eh_new() -> *mut WasmEditHost {
         Ok(lua) => lua,
         Err(_) => return std::ptr::null_mut(),
     };
-    // No processes in the serverless browser build — make `nx._system` fail loud with a
-    // named message rather than emscripten's cryptic spawn errno (StdBlockingSystem).
-    lua.set_blocking_system(Rc::new(WasmBlockingSystem));
     let fx = Box::new(WasmEffects {
         sink: sink.clone(),
         lsp: SyncLspClient::new(),

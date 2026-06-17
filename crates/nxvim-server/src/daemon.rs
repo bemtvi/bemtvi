@@ -82,29 +82,10 @@
 //! `FileChangedShell` round-trip; a reload re-fetches over `fs_read`) — the remote
 //! analogue of the local per-buffer file watch.
 //!
-//! ## The blocking-system leg (`sys_run` — a blocking bridge)
-//!
-//! The *synchronous* `vim.system(...):wait()` (an LSP `root_dir` shelling out to `cargo
-//! metadata`) must run **where the project files are** — the daemon — but unlike the
-//! async `vim.system` (which rides the process leg above off-tick) the caller needs the
-//! result *inline* on the Lua tick: it has no value to hand back later. So this leg is a
-//! **blocking bridge** — request/response on the wire, but the edit-host parks its Lua
-//! thread on the reply, with the wire's RPC tasks on their *own* OS thread so the parked
-//! thread can't starve the reader carrying that reply (Open Decision #5's residual note):
-//!
-//! | direction | method | reply |
-//! | --- | --- | --- |
-//! | edit-host → daemon | `sys_run [argv, cwd?, env]` | `[code, stdout, stderr, pid?]`, or an RPC error |
-//!
-//! [`RemoteBlockingSystem`] (the edit-host side, a [`BlockingSystem`]) owns that dedicated
-//! link thread; `serve_sys_daemon` runs each request through the *same*
-//! [`StdBlockingSystem`](nxvim_lua::StdBlockingSystem) the local editor uses, on a
-//! blocking-pool thread, so a process behaves identically run here or across the wire.
-//!
 //! ## The LSP leg (`lsp_*` — long-lived bidirectional pipes)
 //!
 //! A language server is neither run-to-completion (the `proc_*` leg) nor
-//! request/response (`fs_*`/`sys_run`): it is a *long-lived child whose stdio is a raw
+//! request/response (`fs_*`): it is a *long-lived child whose stdio is a raw
 //! bidirectional pipe*, JSON-RPC flowing both ways for the server's whole life and
 //! stdout consumed incrementally. So this leg streams the pipe itself — raw stdin/stdout/
 //! stderr chunks correlated by a per-spawn `id`:
@@ -145,7 +126,7 @@ use tokio::sync::oneshot;
 
 use nxvim_core::{DirEntry, FileStat, HostFs};
 use nxvim_lsp::{LspChannel, LspProcess, LspTransport, ServerSpawn};
-use nxvim_lua::{BlockingSystem, FileKind, LuaDirEntry, LuaFs, LuaStat, SystemOutput, SystemSpec};
+use nxvim_lua::LuaFs;
 use nxvim_rpc::{connect, Incoming, Rpc};
 
 use crate::evloop::LoopEvent;
@@ -185,14 +166,8 @@ const TERM_KILL: &str = "term_kill";
 const TERM_DATA: &str = "term_data";
 const TERM_EXIT: &str = "term_exit";
 
-// The blocking-system leg (`sys_run`): a request/response shell-out that runs to
-// completion on the daemon. Distinct from the process leg above — that one is
-// event-routed (the async `vim.system` / `jobstart`), this one blocks the edit-host's
-// Lua thread on the reply (the synchronous `vim.system(...):wait()`).
-const SYS_RUN: &str = "sys_run";
-
 // The LSP leg: a *long-lived bidirectional pipe* per language server. Unlike every
-// other leg (run-to-completion `proc_*`, request/response `fs_*`/`sys_run`), a
+// other leg (run-to-completion `proc_*`, request/response `fs_*`), a
 // language server's stdio stays open for its whole life, with JSON-RPC flowing both
 // ways and stdout consumed incrementally — so the wire streams raw stdin/stdout/stderr
 // chunks correlated by a per-spawn `id`, never a single buffered result.
@@ -203,23 +178,15 @@ const LSP_STDOUT: &str = "lsp_stdout"; // daemon → edit-host: [id, bytes]
 const LSP_STDERR: &str = "lsp_stderr"; // daemon → edit-host: [id, bytes]
 const LSP_EXITED: &str = "lsp_exited"; // daemon → edit-host: [id, code?, signal?]
 
-// The Lua-filesystem leg (`luafs`): a request/response per project-facing `vim.fn` fs
-// call (the synchronous `readblob`/`glob`/`filereadable`/… builtins), carried as a
-// libuv-shaped fs op on the wire, run to completion on the daemon. Like the sys leg it is a blocking
-// bridge — the edit-host's Lua thread parks on the reply (the calls are synchronous) —
-// but it carries the whole fs surface under one method, demuxed by an op tag in the
-// request. The whole `["op", args…]` request maps to `["ok", payload] | ["err", msg]`.
-const LUAFS: &str = "luafs";
-
 // The Lua-`nx.fs` off-tick op leg (`luafs_op`): a request/response per **high-level**
-// `nx.fs.*` op (`readdir` / `read_text` / `write` / `copy{recursive}` / …), the wasm
-// edit-host's route to a remote daemon over WebTransport (Phase 2 of the off-tick plan).
-// Unlike the low-level `luafs` leg (one wire op per `LuaFs` call), this carries a whole
-// [`FsJob`](nxvim_lua::FsJob) and runs it through [`run_fs_job`](nxvim_lua::run_fs_job) on
-// the daemon — so a compound op (a recursive copy / remove) decomposes into local syscalls
-// daemon-side rather than a round-trip per step. Served on the same leg as `luafs` (it
-// shares the `StdLuaFs`); the request is a map (`{ op, path, … }`), the reply the
-// `["ok", <fs-value>] | ["err", code, message]` envelope `nxvim_lua::fswire` encodes.
+// `nx.fs.*` op (`readdir` / `read_text` / `write` / `copy{recursive}` / …) — the ONE fs
+// path both the native-daemon edit-host (via [`RemoteFsJobs`]) and the wasm edit-host (over
+// WebTransport) use. It carries a whole [`FsJob`](nxvim_lua::FsJob) and runs it through
+// [`run_fs_job`](nxvim_lua::run_fs_job) on the daemon — so a compound op (a recursive copy /
+// remove) decomposes into local syscalls daemon-side rather than a round-trip per step. The
+// request is a map (`{ op, path, … }`), the reply the `["ok", <fs-value>] | ["err", code,
+// message]` envelope `nxvim_lua::fswire` encodes. (The retired low-level per-`LuaFs`-op
+// `luafs` leg, which backed the removed synchronous `vim.fn` fs builtins, is gone.)
 const LUAFS_OP: &str = "luafs_op";
 
 // The Lua-`nx.fs.watch` streaming leg (`luafs_watch`): the wasm route for the streaming watch
@@ -1202,264 +1169,6 @@ fn classify(fs: &dyn HostFs, path: &Path) -> io::Result<FsRead> {
     }
 }
 
-// ===== the blocking-system leg (`sys_run`) ==================================
-//
-// `vim.system(...):wait()` (the *synchronous* form) shells out **on the edit-host's
-// Lua thread** and needs its result inline — an LSP `root_dir` running `cargo
-// metadata` must run *where the project files are* (the daemon), but the caller can't
-// go off-tick the way a buffer open does (it has no value to hand back later). So this
-// leg is a **blocking bridge**: the edit-host parks its Lua thread on the reply, and —
-// crucially — the wire's RPC tasks live on their *own* OS thread + runtime, so the
-// parked thread can never starve the reader carrying its reply (the deadlock trap the
-// plan's Open Decision #5 residual note calls out). The wire itself is a plain
-// request/response, like the fs read:
-//
-// | direction | method | reply |
-// | --- | --- | --- |
-// | edit-host → daemon | `sys_run [argv, cwd?, env]` | `[code, stdout, stderr, pid?]`, or an RPC error |
-//
-// `serve_sys_daemon` runs each request through the *same* [`StdBlockingSystem`] the
-// local editor uses today (on a blocking pool thread, so a long shell-out can't stall
-// the reader), so a process behaves identically whether it ran here or across the wire.
-
-/// A [`BlockingSystem`] that runs the synchronous `vim.system(...):wait()` shell-out on
-/// a remote daemon instead of locally — the edit-host side of the `sys_run` leg.
-///
-/// The blocking bridge: [`run`](BlockingSystem::run) hands the spec to a **dedicated
-/// link thread** (which owns the wire and its own current-thread runtime) over a plain
-/// `std` channel, then parks the calling (Lua) thread on the reply. Parking with a
-/// `std` channel — not a tokio primitive — is deliberate: `nx._system` runs *inside*
-/// the server's tokio runtime, where a tokio `blocking_recv` would panic; a `std` recv
-/// just parks the OS thread, and the link thread (a different thread entirely) is free
-/// to drive the wire that delivers the reply.
-///
-/// `Send` (it holds only a `std::sync::mpsc::Sender`) so it rides
-/// [`ServerInit`](crate::ServerInit) onto the server thread, where it is rebuilt into
-/// the editor's `Rc<dyn BlockingSystem>`.
-pub struct RemoteBlockingSystem {
-    /// Into the link thread: a spec to run plus the one-shot reply channel the caller
-    /// parks on. A **tokio** sender (not `std`) so the job-server can `await` it on the
-    /// shared link runtime — the same channel feeds the dedicated-thread single-leg
-    /// [`connect`](Self::connect) and the multiplexed [`connect_daemon`].
-    req_tx: UnboundedSender<SysJob>,
-}
-
-/// One blocking shell-out queued onto the link thread: the spec, and the `std` channel
-/// the parked editor thread waits on for its [`SystemOutput`]. The reply stays `std`
-/// (not tokio) because the editor thread parks on it from *inside* the server runtime,
-/// where a tokio recv would panic — a plain OS-thread park is what's wanted.
-type SysJob = (SystemSpec, std::sync::mpsc::Sender<SystemOutput>);
-
-/// The sys leg's job server: pull each queued shell-out off `req_rx` and drive its
-/// `sys_run` request to completion over `rpc`, delivering the result to the parked
-/// caller. Runs on whichever runtime drives it — the single-leg [`RemoteBlockingSystem::
-/// connect`]'s dedicated thread, or the shared [`connect_daemon`] link thread — so the
-/// editor thread (parked on the `std` reply) is never the one polling the reply.
-async fn run_sys_jobs(rpc: Rpc, mut req_rx: UnboundedReceiver<SysJob>) {
-    while let Some((spec, reply_tx)) = req_rx.recv().await {
-        let out = match rpc.request(SYS_RUN, encode_sys_run(&spec)).await {
-            Ok(v) => decode_sys_output(v),
-            // A transport failure (daemon gone) degrades loudly to a `code = -1` result,
-            // never a panic — `vim.system` callers rely on a value.
-            Err(e) => SystemOutput::failed(format!("vim.system: daemon error: {e}")),
-        };
-        // The receiver is gone only if the caller was itself dropped mid-call; nothing
-        // to deliver to, so discard.
-        let _ = reply_tx.send(out);
-    }
-}
-
-impl RemoteBlockingSystem {
-    /// Connect to a daemon over `reader`/`writer`, spawning the dedicated link thread.
-    /// That thread builds its **own** current-thread runtime, opens the RPC link there,
-    /// and serves jobs one at a time (a blocking shell-out is serial by nature — the
-    /// edit-host is parked until it returns), driving each `sys_run` request to
-    /// completion on its runtime so the parked editor thread isn't the one that has to
-    /// poll the reply. (The multiplexed [`connect_daemon`] runs [`run_sys_jobs`] as a
-    /// task on the *shared* link runtime instead of owning a thread here.)
-    pub fn connect<R, W>(reader: R, writer: W) -> RemoteBlockingSystem
-    where
-        R: AsyncRead + Unpin + Send + 'static,
-        W: AsyncWrite + Unpin + Send + 'static,
-    {
-        let (req_tx, req_rx) = unbounded_channel::<SysJob>();
-        std::thread::spawn(move || {
-            let rt = match tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-            {
-                Ok(rt) => rt,
-                // A runtime we can't build means the link is dead on arrival; the
-                // `req_rx` is dropped, so every `run` sees the channel closed and
-                // degrades loudly rather than hanging.
-                Err(_) => return,
-            };
-            rt.block_on(async move {
-                let (rpc, mut incoming) = connect(reader, writer);
-                // Drain the incoming stream so the connection isn't torn down (dropping
-                // the receiver would). The sys leg has no daemon→edit-host pushes, so
-                // this only ever observes EOF — but the receiver must stay alive and
-                // consumed for the link to live.
-                tokio::spawn(async move { while incoming.recv().await.is_some() {} });
-                run_sys_jobs(rpc, req_rx).await;
-            });
-        });
-        RemoteBlockingSystem { req_tx }
-    }
-}
-
-impl BlockingSystem for RemoteBlockingSystem {
-    fn run(&self, spec: SystemSpec) -> SystemOutput {
-        let (reply_tx, reply_rx) = std::sync::mpsc::channel();
-        if self.req_tx.send((spec, reply_tx)).is_err() {
-            return SystemOutput::failed("vim.system: daemon link is gone");
-        }
-        // Park the editor thread until the link thread delivers the daemon's reply. This
-        // is the blocking bridge: `nx._system` is synchronous (the LSP `root_dir`
-        // caller needs the value inline), so the tick blocks here, the same as a local
-        // spawn blocks on `wait`. A `std` recv parks the OS thread without caring that
-        // it sits inside the server's tokio runtime; the link's reader is on its own
-        // thread, free to read the reply that unblocks us.
-        reply_rx
-            .recv()
-            .unwrap_or_else(|_| SystemOutput::failed("vim.system: daemon link dropped the request"))
-    }
-}
-
-/// `sys_run` request params: `[argv, cwd?, env]`, with `env` an array of `[k, v]`
-/// pairs. The inverse of [`decode_sys_run`].
-fn encode_sys_run(spec: &SystemSpec) -> Vec<Value> {
-    let cmd = Value::Array(spec.cmd.iter().map(|s| Value::from(s.clone())).collect());
-    let cwd = spec.cwd.clone().map_or(Value::Nil, Value::from);
-    let env = Value::Array(
-        spec.env
-            .iter()
-            .map(|(k, v)| Value::Array(vec![Value::from(k.clone()), Value::from(v.clone())]))
-            .collect(),
-    );
-    vec![cmd, cwd, env]
-}
-
-/// `sys_run` request params → a [`SystemSpec`]. Tolerant of a malformed frame (a peer
-/// is the same build): a missing argv yields an empty `cmd`, which the backend reports
-/// as the "non-empty list" degrade.
-fn decode_sys_run(params: &[Value]) -> SystemSpec {
-    let cmd = params
-        .first()
-        .and_then(Value::as_array)
-        .map(|a| {
-            a.iter()
-                .filter_map(|v| v.as_str().map(str::to_string))
-                .collect()
-        })
-        .unwrap_or_default();
-    let cwd = params.get(1).and_then(Value::as_str).map(str::to_string);
-    let env = params
-        .get(2)
-        .and_then(Value::as_array)
-        .map(|a| {
-            a.iter()
-                .filter_map(|p| {
-                    let p = p.as_array()?;
-                    Some((
-                        p.first()?.as_str()?.to_string(),
-                        p.get(1)?.as_str()?.to_string(),
-                    ))
-                })
-                .collect()
-        })
-        .unwrap_or_default();
-    SystemSpec { cmd, cwd, env }
-}
-
-/// `[code, stdout, stderr, pid?]` reply → a [`SystemOutput`]. The inverse of
-/// [`encode_sys_output`]; a malformed reply degrades loudly (`code = -1`).
-fn decode_sys_output(v: Value) -> SystemOutput {
-    let Value::Array(a) = v else {
-        return SystemOutput::failed("sys_run: malformed reply");
-    };
-    let code = a.first().and_then(Value::as_i64).unwrap_or(-1) as i32;
-    let stdout = a.get(1).map(value_bytes).unwrap_or_default();
-    let stderr = a.get(2).map(value_bytes).unwrap_or_default();
-    let pid = a.get(3).and_then(Value::as_u64).map(|p| p as u32);
-    SystemOutput {
-        code,
-        stdout,
-        stderr,
-        pid,
-    }
-}
-
-/// Raw bytes out of a wire value — `Binary` (the encoding we send) or, defensively, a
-/// `String`. Anything else is empty.
-fn value_bytes(v: &Value) -> Vec<u8> {
-    match v {
-        Value::Binary(b) => b.clone(),
-        Value::String(s) => s.as_bytes().to_vec(),
-        _ => Vec::new(),
-    }
-}
-
-/// `[code, stdout, stderr, pid?]` reply for a [`SystemOutput`]. `stdout`/`stderr` ride
-/// as binary so non-UTF-8 output survives.
-fn encode_sys_output(out: &SystemOutput) -> Value {
-    Value::Array(vec![
-        Value::from(out.code),
-        Value::Binary(out.stdout.clone()),
-        Value::Binary(out.stderr.clone()),
-        out.pid.map_or(Value::Nil, Value::from),
-    ])
-}
-
-/// Run the daemon end of the *blocking-system* wire over `reader`/`writer`, serving
-/// `sys_run` requests through `sys` (the daemon's real backend —
-/// [`StdBlockingSystem`](nxvim_lua::StdBlockingSystem) in the binary, a fake in tests).
-/// Each run is offloaded to a blocking-pool thread so a long shell-out can't stall the
-/// reader (the edit-host can have at most one blocking run in flight — it's parked —
-/// but the offload keeps `incoming` responsive regardless). Returns when the connection
-/// closes.
-pub async fn serve_sys_daemon<R, W>(
-    reader: R,
-    writer: W,
-    sys: Box<dyn BlockingSystem + Send + Sync>,
-) -> anyhow::Result<()>
-where
-    R: AsyncRead + Unpin + Send + 'static,
-    W: AsyncWrite + Unpin + Send + 'static,
-{
-    let (rpc, incoming) = connect(reader, writer);
-    serve_sys_daemon_on(rpc, incoming, sys).await
-}
-
-/// The blocking-system leg's connection-agnostic core (see [`serve_proc_daemon_on`]
-/// for the `*_on` split). Serves `sys_run` over a shared [`Rpc`] + its demuxed stream.
-pub async fn serve_sys_daemon_on(
-    rpc: Rpc,
-    mut incoming: UnboundedReceiver<Incoming>,
-    sys: Box<dyn BlockingSystem + Send + Sync>,
-) -> anyhow::Result<()> {
-    let sys: Arc<dyn BlockingSystem + Send + Sync> = Arc::from(sys);
-    while let Some(msg) = incoming.recv().await {
-        if let Incoming::Request { id, method, params } = msg {
-            if method == SYS_RUN {
-                let sys = sys.clone();
-                let rpc = rpc.clone();
-                tokio::spawn(async move {
-                    let spec = decode_sys_run(&params);
-                    let reply = match tokio::task::spawn_blocking(move || sys.run(spec)).await {
-                        Ok(out) => Ok(encode_sys_output(&out)),
-                        Err(e) => Err(Value::from(format!("sys_run: join error: {e}"))),
-                    };
-                    rpc.respond(id, reply);
-                });
-            } else {
-                rpc.respond(id, Err(Value::from(format!("unknown method: {method}"))));
-            }
-        }
-    }
-    Ok(())
-}
-
 // ===== the LSP leg (long-lived bidirectional pipes) ===========================
 
 /// Per-server routing on the edit-host side, keyed by the per-spawn `id`: where the
@@ -1918,58 +1627,67 @@ fn decode_lsp_exited(params: &[Value]) -> Option<(u64, Option<i32>, Option<i32>)
     Some((id, code, signal))
 }
 
-// ----- the Lua-filesystem leg (`luafs`) -------------------------------------------
+// ----- the Lua-filesystem leg (`luafs_op`) ----------------------------------------
 //
-// `RemoteLuaFs` (the edit-host side, a [`LuaFs`]) is the fs analogue of
-// [`RemoteBlockingSystem`]: a dedicated link thread owns the wire and its own
-// current-thread runtime, each call hands its `["op", args…]` request to that thread
-// over a `std` channel and **parks the Lua thread** on the reply. `serve_luafs_daemon`
-// runs each op through the daemon's real [`StdLuaFs`](nxvim_lua::StdLuaFs) on a blocking
-// pool thread, so the daemon — not the edit-host — owns the open-fd table the `i64`
-// tokens index, and a plugin reads the *remote* project byte-for-byte.
+// `RemoteFsJobs` (the edit-host side) is how a **native-daemon** session runs async
+// `nx.fs`: the event-loop actor hands a whole [`FsJob`](nxvim_lua::FsJob) here, it
+// crosses in ONE `luafs_op` request, and the daemon runs it through
+// [`run_fs_job`](nxvim_lua::run_fs_job) against its [`StdLuaFs`](nxvim_lua::StdLuaFs)
+// (decomposing any compound op daemon-side, so a recursive copy is one round-trip, not a
+// chatter of per-op calls). The wasm edit-host forwards the identical `luafs_op` request
+// over WebTransport — one leg, one shape. Unlike the retired per-op `RemoteLuaFs` bridge
+// this parks no thread: the actor `await`s the reply on the shared link runtime.
 
-/// One queued fs request on the link thread: the `["op", args…]` params and the `std`
-/// channel the parked editor thread waits on for the reply (`Ok` value or a transport
-/// error string). The reply stays `std` for the same reason as [`SysJob`] — the editor
-/// thread parks on it from inside the server runtime.
-type LuaFsJob = (Vec<Value>, std::sync::mpsc::Sender<Result<Value, String>>);
+/// One queued fs job on the link thread: the whole [`FsJob`](nxvim_lua::FsJob) and the
+/// tokio oneshot the awaiting actor parks on for the typed result. Async (a tokio channel),
+/// because the caller is the event-loop actor's task, not a synchronous editor-thread call.
+type FsJobReq = (
+    nxvim_lua::FsJob,
+    tokio::sync::oneshot::Sender<Result<nxvim_lua::FsValue, nxvim_lua::FsError>>,
+);
 
-/// The luafs leg's job server: pull each queued `["op", args…]` request off `req_rx`,
-/// drive it to completion over `rpc`, and deliver the raw reply (or a transport-error
-/// string) to the parked caller. Runs on whichever runtime drives it — the single-leg
-/// dedicated thread or the shared [`connect_daemon`] link runtime (mirrors
-/// [`run_sys_jobs`]).
-async fn run_luafs_jobs(rpc: Rpc, mut req_rx: UnboundedReceiver<LuaFsJob>) {
-    while let Some((params, reply_tx)) = req_rx.recv().await {
-        let reply = rpc.request(LUAFS, params).await.map_err(|e| e.to_string());
-        let _ = reply_tx.send(reply);
+/// The `luafs_op` leg's job server: pull each whole [`FsJob`](nxvim_lua::FsJob) off
+/// `req_rx`, send it as one `luafs_op` request over `rpc`, decode the reply through the
+/// shared [`fswire`](nxvim_lua) codec, and deliver the typed result to the awaiting actor.
+async fn run_fs_jobs(rpc: Rpc, mut req_rx: UnboundedReceiver<FsJobReq>) {
+    while let Some((job, reply_tx)) = req_rx.recv().await {
+        let result = match rpc
+            .request(LUAFS_OP, vec![nxvim_lua::fs_job_to_value(&job)])
+            .await
+        {
+            Ok(v) => nxvim_lua::fs_result_from_value(&v),
+            // A transport failure (daemon gone) rejects the promise loud — never a panic.
+            Err(e) => Err(nxvim_lua::FsError {
+                code: "EIO".to_string(),
+                message: format!("nx.fs: daemon error: {e}"),
+            }),
+        };
+        let _ = reply_tx.send(result);
     }
 }
 
-/// A [`LuaFs`] that runs the project-facing Lua fs surface on a remote daemon instead of
-/// locally — the edit-host side of the `luafs` leg. The blocking bridge mirrors
-/// [`RemoteBlockingSystem`]: synchronous calls park the editor thread on the daemon
-/// reply, with the wire's RPC tasks on their own thread so the park can't deadlock.
-///
-/// `Send` (it holds only a tokio [`UnboundedSender`]) so it rides
-/// [`ServerInit`](crate::ServerInit) onto the server thread, where it is rebuilt into the
-/// editor's `Rc<dyn LuaFs>`.
-pub struct RemoteLuaFs {
-    req_tx: UnboundedSender<LuaFsJob>,
+/// The edit-host side of the `luafs_op` leg for a **native-daemon** session — the actor
+/// sends a whole [`FsJob`](nxvim_lua::FsJob) here and `await`s its typed result. Holds a
+/// tokio sender to the shared link runtime's [`run_fs_jobs`]; `Clone` so each `nx.fs` op
+/// can be driven concurrently, `Send + Sync` so it rides [`ServerInit`](crate::ServerInit)
+/// onto the server thread.
+#[derive(Clone)]
+pub struct RemoteFsJobs {
+    req_tx: UnboundedSender<FsJobReq>,
 }
 
-impl RemoteLuaFs {
-    /// Connect to a daemon over `reader`/`writer`, spawning the dedicated link thread
-    /// (its own current-thread runtime + the RPC link). Calls are serial by nature (the
-    /// edit-host parks until each returns), so the thread serves one job at a time,
-    /// driving each `luafs` request to completion on its runtime. (The multiplexed
-    /// [`connect_daemon`] runs [`run_luafs_jobs`] on the *shared* link runtime instead.)
-    pub fn connect<R, W>(reader: R, writer: W) -> RemoteLuaFs
+impl RemoteFsJobs {
+    /// Connect to a daemon over `reader`/`writer` as a standalone leg, spawning a
+    /// dedicated link thread (its own current-thread runtime + the RPC link) that runs
+    /// [`run_fs_jobs`]. The multiplexed [`connect_daemon`] builds a `RemoteFsJobs`
+    /// directly instead (sharing one link across all legs); this single-leg form is for
+    /// driving the `luafs_op` leg in isolation (tests).
+    pub fn connect<R, W>(reader: R, writer: W) -> RemoteFsJobs
     where
         R: AsyncRead + Unpin + Send + 'static,
         W: AsyncWrite + Unpin + Send + 'static,
     {
-        let (req_tx, req_rx) = unbounded_channel::<LuaFsJob>();
+        let (req_tx, req_rx) = unbounded_channel::<FsJobReq>();
         std::thread::spawn(move || {
             let rt = match tokio::runtime::Builder::new_current_thread()
                 .enable_all()
@@ -1977,337 +1695,41 @@ impl RemoteLuaFs {
             {
                 Ok(rt) => rt,
                 // A runtime we can't build means the link is dead on arrival; `req_rx`
-                // drops, so every `call` sees the channel closed and degrades loudly.
+                // drops, so every `run` sees the channel closed and rejects loudly.
                 Err(_) => return,
             };
             rt.block_on(async move {
                 let (rpc, mut incoming) = connect(reader, writer);
-                // The luafs leg has no daemon→edit-host pushes; drain so the connection
+                // The luafs_op leg has no daemon→edit-host pushes; drain so the connection
                 // isn't torn down (dropping the receiver would).
                 tokio::spawn(async move { while incoming.recv().await.is_some() {} });
-                run_luafs_jobs(rpc, req_rx).await;
+                run_fs_jobs(rpc, req_rx).await;
             });
         });
-        RemoteLuaFs { req_tx }
+        RemoteFsJobs { req_tx }
     }
 
-    /// Send `params` (an `["op", args…]` request) to the link thread and park on the
-    /// reply, decoding the daemon's `["ok", payload] | ["err", msg]` envelope back into an
-    /// `io::Result`. A dropped link / transport failure degrades to a loud `io::Error`.
-    fn call(&self, params: Vec<Value>) -> io::Result<Value> {
-        let (reply_tx, reply_rx) = std::sync::mpsc::channel();
-        if self.req_tx.send((params, reply_tx)).is_err() {
-            return Err(io::Error::other("luafs: daemon link is gone"));
+    /// Send `job` to the daemon over `luafs_op` and `await` the typed result. Off the
+    /// editor tick (the caller is the actor's async task), so this is a tokio await, not a
+    /// thread park; a dropped link rejects loud.
+    pub async fn run(
+        &self,
+        job: nxvim_lua::FsJob,
+    ) -> Result<nxvim_lua::FsValue, nxvim_lua::FsError> {
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        if self.req_tx.send((job, reply_tx)).is_err() {
+            return Err(nxvim_lua::FsError {
+                code: "ENOTCONN".to_string(),
+                message: "nx.fs: daemon link is gone".to_string(),
+            });
         }
-        match reply_rx.recv() {
-            Ok(Ok(v)) => decode_luafs_reply(v),
-            Ok(Err(e)) => Err(io::Error::other(format!("luafs: daemon error: {e}"))),
-            Err(_) => Err(io::Error::other("luafs: daemon link dropped the request")),
-        }
-    }
-}
-
-impl LuaFs for RemoteLuaFs {
-    fn open(&self, path: &str, flags: &str, mode: u32) -> io::Result<i64> {
-        self.call(vec![
-            Value::from("open"),
-            Value::from(path.to_string()),
-            Value::from(flags.to_string()),
-            Value::from(mode as u64),
-        ])
-        .map(|v| v.as_i64().unwrap_or(-1))
-    }
-
-    fn close(&self, fd: i64) -> io::Result<()> {
-        self.call(vec![Value::from("close"), Value::from(fd)])
-            .map(|_| ())
-    }
-
-    fn read(&self, fd: i64, size: usize, offset: Option<i64>) -> io::Result<Vec<u8>> {
-        self.call(vec![
-            Value::from("read"),
-            Value::from(fd),
-            Value::from(size as u64),
-            offset.map_or(Value::Nil, Value::from),
-        ])
-        .map(|v| value_bytes(&v))
-    }
-
-    fn write(&self, fd: i64, data: &[u8], offset: Option<i64>) -> io::Result<usize> {
-        self.call(vec![
-            Value::from("write"),
-            Value::from(fd),
-            Value::Binary(data.to_vec()),
-            offset.map_or(Value::Nil, Value::from),
-        ])
-        .map(|v| v.as_u64().unwrap_or(0) as usize)
-    }
-
-    fn fstat(&self, fd: i64) -> io::Result<LuaStat> {
-        self.call(vec![Value::from("fstat"), Value::from(fd)])
-            .and_then(|v| decode_lua_stat(&v))
-    }
-
-    fn stat(&self, path: &str) -> io::Result<LuaStat> {
-        self.call(vec![Value::from("stat"), Value::from(path.to_string())])
-            .and_then(|v| decode_lua_stat(&v))
-    }
-
-    fn lstat(&self, path: &str) -> io::Result<LuaStat> {
-        self.call(vec![Value::from("lstat"), Value::from(path.to_string())])
-            .and_then(|v| decode_lua_stat(&v))
-    }
-
-    fn scandir(&self, path: &str) -> io::Result<Vec<LuaDirEntry>> {
-        self.call(vec![Value::from("scandir"), Value::from(path.to_string())])
-            .map(|v| decode_lua_entries(&v))
-    }
-
-    fn mkdir(&self, path: &str, mode: u32, recursive: bool) -> io::Result<()> {
-        self.call(vec![
-            Value::from("mkdir"),
-            Value::from(path.to_string()),
-            Value::from(mode as u64),
-            Value::from(recursive),
-        ])
-        .map(|_| ())
-    }
-
-    fn rmdir(&self, path: &str) -> io::Result<()> {
-        self.call(vec![Value::from("rmdir"), Value::from(path.to_string())])
-            .map(|_| ())
-    }
-
-    fn unlink(&self, path: &str) -> io::Result<()> {
-        self.call(vec![Value::from("unlink"), Value::from(path.to_string())])
-            .map(|_| ())
-    }
-
-    fn rename(&self, from: &str, to: &str) -> io::Result<()> {
-        self.call(vec![
-            Value::from("rename"),
-            Value::from(from.to_string()),
-            Value::from(to.to_string()),
-        ])
-        .map(|_| ())
-    }
-
-    fn copyfile(&self, src: &str, dest: &str, excl: bool) -> io::Result<()> {
-        self.call(vec![
-            Value::from("copyfile"),
-            Value::from(src.to_string()),
-            Value::from(dest.to_string()),
-            Value::from(excl),
-        ])
-        .map(|_| ())
-    }
-
-    fn utime(&self, path: &str, atime: f64, mtime: f64) -> io::Result<()> {
-        self.call(vec![
-            Value::from("utime"),
-            Value::from(path.to_string()),
-            Value::F64(atime),
-            Value::F64(mtime),
-        ])
-        .map(|_| ())
-    }
-
-    fn access(&self, path: &str, modes: &str) -> bool {
-        // Never errors (libuv semantics); a transport failure degrades to `false`.
-        self.call(vec![
-            Value::from("access"),
-            Value::from(path.to_string()),
-            Value::from(modes.to_string()),
-        ])
-        .ok()
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false)
-    }
-
-    fn realpath(&self, path: &str) -> io::Result<String> {
-        self.call(vec![Value::from("realpath"), Value::from(path.to_string())])
-            .and_then(|v| {
-                v.as_str()
-                    .map(str::to_string)
-                    .ok_or_else(|| io::Error::other("luafs: malformed realpath reply"))
+        reply_rx.await.unwrap_or_else(|_| {
+            Err(nxvim_lua::FsError {
+                code: "EIO".to_string(),
+                message: "nx.fs: daemon link dropped the request".to_string(),
             })
-    }
-
-    fn read_file(&self, path: &str) -> io::Result<Vec<u8>> {
-        self.call(vec![
-            Value::from("read_file"),
-            Value::from(path.to_string()),
-        ])
-        .map(|v| value_bytes(&v))
-    }
-
-    fn which(&self, name: &str) -> Option<String> {
-        // Never errors; a miss (or transport failure) is `None`.
-        self.call(vec![Value::from("which"), Value::from(name.to_string())])
-            .ok()
-            .and_then(|v| v.as_str().map(str::to_string))
-    }
-}
-
-/// Decode the daemon's `["ok", payload] | ["err", msg]` envelope into an `io::Result`.
-fn decode_luafs_reply(v: Value) -> io::Result<Value> {
-    let Value::Array(a) = &v else {
-        return Err(io::Error::other("luafs: malformed reply"));
-    };
-    match a.first().and_then(Value::as_str) {
-        Some("ok") => Ok(a.get(1).cloned().unwrap_or(Value::Nil)),
-        Some("err") => Err(io::Error::other(
-            a.get(1)
-                .and_then(Value::as_str)
-                .unwrap_or("luafs error")
-                .to_string(),
-        )),
-        _ => Err(io::Error::other("luafs: malformed reply tag")),
-    }
-}
-
-/// `LuaStat` → its flat wire array: `[kind, size, mode, mtime_sec, mtime_nsec,
-/// atime_sec, atime_nsec, ino, uid, gid, nlink, dev]`. A `None` time has a `Nil` sec.
-fn encode_lua_stat(st: &LuaStat) -> Value {
-    let time = |t: Option<(i64, u32)>| match t {
-        Some((sec, nsec)) => (Value::from(sec), Value::from(nsec as u64)),
-        None => (Value::Nil, Value::from(0u64)),
-    };
-    let (mts, mtn) = time(st.mtime);
-    let (ats, atn) = time(st.atime);
-    Value::Array(vec![
-        Value::from(st.kind.as_str()),
-        Value::from(st.size),
-        Value::from(st.mode as u64),
-        mts,
-        mtn,
-        ats,
-        atn,
-        Value::from(st.ino),
-        Value::from(st.uid as u64),
-        Value::from(st.gid as u64),
-        Value::from(st.nlink),
-        Value::from(st.dev),
-    ])
-}
-
-/// The inverse of [`encode_stat`]; a malformed array is a loud error.
-fn decode_lua_stat(v: &Value) -> io::Result<LuaStat> {
-    let a = v
-        .as_array()
-        .ok_or_else(|| io::Error::other("luafs: malformed stat reply"))?;
-    let kind = FileKind::from_wire(a.first().and_then(Value::as_str).unwrap_or("file"));
-    let u64_at = |i: usize| a.get(i).and_then(Value::as_u64).unwrap_or(0);
-    let time = |s: usize, n: usize| {
-        a.get(s)
-            .and_then(Value::as_i64)
-            .map(|sec| (sec, a.get(n).and_then(Value::as_u64).unwrap_or(0) as u32))
-    };
-    Ok(LuaStat {
-        kind,
-        size: u64_at(1),
-        mode: u64_at(2) as u32,
-        mtime: time(3, 4),
-        atime: time(5, 6),
-        ino: u64_at(7),
-        uid: u64_at(8) as u32,
-        gid: u64_at(9) as u32,
-        nlink: u64_at(10),
-        dev: u64_at(11),
-    })
-}
-
-/// Directory entries → an array of `[name, kind]` pairs.
-fn encode_lua_entries(entries: &[LuaDirEntry]) -> Value {
-    Value::Array(
-        entries
-            .iter()
-            .map(|e| {
-                Value::Array(vec![
-                    Value::from(e.name.clone()),
-                    Value::from(e.kind.as_str()),
-                ])
-            })
-            .collect(),
-    )
-}
-
-/// The inverse of [`encode_dir_entries`]; a malformed entry is skipped.
-fn decode_lua_entries(v: &Value) -> Vec<LuaDirEntry> {
-    v.as_array()
-        .map(|a| {
-            a.iter()
-                .filter_map(|e| {
-                    let e = e.as_array()?;
-                    Some(LuaDirEntry {
-                        name: e.first()?.as_str()?.to_string(),
-                        kind: FileKind::from_wire(
-                            e.get(1).and_then(Value::as_str).unwrap_or("file"),
-                        ),
-                    })
-                })
-                .collect()
         })
-        .unwrap_or_default()
-}
-
-/// Run one `["op", args…]` request through `fs` and shape the `["ok", payload] |
-/// ["err", msg]` envelope. The op set is the whole [`LuaFs`] surface; `access`/`which`
-/// never error, so they always report `ok`.
-fn serve_luafs_op(fs: &dyn LuaFs, params: &[Value]) -> Value {
-    let op = params.first().and_then(Value::as_str).unwrap_or("");
-    let s = |i: usize| {
-        params
-            .get(i)
-            .and_then(Value::as_str)
-            .unwrap_or("")
-            .to_string()
-    };
-    let i64_at = |i: usize| params.get(i).and_then(Value::as_i64).unwrap_or(0);
-    let u32_at = |i: usize| params.get(i).and_then(Value::as_u64).unwrap_or(0) as u32;
-    let opt_off = |i: usize| params.get(i).and_then(Value::as_i64);
-    let bool_at = |i: usize| params.get(i).and_then(Value::as_bool).unwrap_or(false);
-    let f64_at = |i: usize| params.get(i).and_then(Value::as_f64).unwrap_or(0.0);
-
-    // `access` / `which` are infallible (libuv semantics) — report them directly.
-    match op {
-        "access" => return luafs_ok(Value::from(fs.access(&s(1), &s(2)))),
-        "which" => return luafs_ok(fs.which(&s(1)).map_or(Value::Nil, Value::from)),
-        _ => {}
     }
-
-    let result: io::Result<Value> = match op {
-        "open" => fs.open(&s(1), &s(2), u32_at(3)).map(Value::from),
-        "close" => fs.close(i64_at(1)).map(|_| Value::Nil),
-        "read" => fs
-            .read(i64_at(1), u32_at(2) as usize, opt_off(3))
-            .map(Value::Binary),
-        "write" => fs
-            .write(i64_at(1), &value_bytes(&params[2]), opt_off(3))
-            .map(|n| Value::from(n as u64)),
-        "fstat" => fs.fstat(i64_at(1)).map(|st| encode_lua_stat(&st)),
-        "stat" => fs.stat(&s(1)).map(|st| encode_lua_stat(&st)),
-        "lstat" => fs.lstat(&s(1)).map(|st| encode_lua_stat(&st)),
-        "scandir" => fs.scandir(&s(1)).map(|e| encode_lua_entries(&e)),
-        "mkdir" => fs.mkdir(&s(1), u32_at(2), bool_at(3)).map(|_| Value::Nil),
-        "rmdir" => fs.rmdir(&s(1)).map(|_| Value::Nil),
-        "unlink" => fs.unlink(&s(1)).map(|_| Value::Nil),
-        "rename" => fs.rename(&s(1), &s(2)).map(|_| Value::Nil),
-        "copyfile" => fs.copyfile(&s(1), &s(2), bool_at(3)).map(|_| Value::Nil),
-        "utime" => fs.utime(&s(1), f64_at(2), f64_at(3)).map(|_| Value::Nil),
-        "realpath" => fs.realpath(&s(1)).map(Value::from),
-        "read_file" => fs.read_file(&s(1)).map(Value::Binary),
-        other => Err(io::Error::other(format!("luafs: unknown op '{other}'"))),
-    };
-    match result {
-        Ok(payload) => luafs_ok(payload),
-        Err(e) => Value::Array(vec![Value::from("err"), Value::from(e.to_string())]),
-    }
-}
-
-/// Wrap a payload in the success envelope.
-fn luafs_ok(payload: Value) -> Value {
-    Value::Array(vec![Value::from("ok"), payload])
 }
 
 /// Run one high-level `nx.fs` op (the `luafs_op` leg): decode the request map into an
@@ -2365,20 +1787,7 @@ pub async fn serve_luafs_daemon_on(
     let fs: Arc<dyn LuaFs + Send + Sync> = Arc::from(fs);
     while let Some(msg) = incoming.recv().await {
         if let Incoming::Request { id, method, params } = msg {
-            if method == LUAFS {
-                let fs = fs.clone();
-                let rpc = rpc.clone();
-                tokio::spawn(async move {
-                    let reply =
-                        match tokio::task::spawn_blocking(move || serve_luafs_op(&*fs, &params))
-                            .await
-                        {
-                            Ok(v) => Ok(v),
-                            Err(e) => Err(Value::from(format!("luafs: join error: {e}"))),
-                        };
-                    rpc.respond(id, reply);
-                });
-            } else if method == LUAFS_OP {
+            if method == LUAFS_OP {
                 let fs = fs.clone();
                 let rpc = rpc.clone();
                 tokio::spawn(async move {
@@ -2486,19 +1895,19 @@ pub async fn serve_luafs_watch_daemon_on(
 // Each `Remote*::connect` above opens its own connection — fine for the per-leg tests,
 // where each leg gets a private duplex, but the real edit-host talks to *one* daemon
 // over *one* transport. `connect_daemon` is the symmetric counterpart of the daemon's
-// `run_daemon_io` multiplexer: it `connect`s once and hands back all five seams sharing
+// `run_daemon_io` multiplexer: it `connect`s once and hands back all four seams sharing
 // that single link, so one `ServerInit` populates `host_fs_async` / `host_proc` /
-// `blocking_system` / `lsp_transport` / `lua_fs` from a single `--daemon` child.
+// `lsp_transport` / `fs_jobs` from a single `--daemon` child.
 //
 // Two properties make this a clean router, not a rework (both verified in the code):
 // the daemon→edit-host *notifications* split into disjoint method namespaces
 // (`proc_spawned`/`proc_exited`, `fs_changed`, `lsp_stdout`/`lsp_stderr`/`lsp_exited`),
-// and request *responses* (`fs_read`/`fs_write`/`sys_run`/`luafs`) are msgid-routed
+// and request *responses* (`fs_read`/`fs_write`/`luafs_op`) are msgid-routed
 // *inside* [`Rpc`] and never surface as an [`Incoming`] — so one demux over the shared
 // `incoming` covers every leg, and concurrent writes from all legs serialize through
 // `Rpc`'s single out-channel.
 
-/// The five edit-host seams of one daemon connection, all sharing a single link (see
+/// The four edit-host seams of one daemon connection, all sharing a single link (see
 /// [`connect_daemon`]). Each field drops straight into the matching
 /// [`ServerInit`](crate::ServerInit) slot.
 pub struct DaemonClient {
@@ -2506,15 +1915,14 @@ pub struct DaemonClient {
     pub host_fs: RemoteHostFs,
     /// The event-routed process seam (the async `vim.system` / `jobstart` / `:!`).
     pub host_proc: RemoteHostProc,
-    /// The blocking-bridge `sys_run` seam (synchronous `vim.system(...):wait()`).
-    pub blocking_system: RemoteBlockingSystem,
     /// The streaming-pipe LSP seam (`lsp_*`).
     pub lsp_transport: RemoteLspTransport,
-    /// The blocking-bridge `luafs` seam (the project-facing `vim.fn` fs surface).
-    pub lua_fs: RemoteLuaFs,
+    /// The async `nx.fs` seam (`luafs_op`) — whole-job, decomposed daemon-side. The
+    /// event-loop actor `await`s it off the editor tick (no thread park).
+    pub fs_jobs: RemoteFsJobs,
 }
 
-/// Connect to a single daemon over `reader`/`writer` and return all five edit-host
+/// Connect to a single daemon over `reader`/`writer` and return all four edit-host
 /// seams sharing that one link — the edit-host-side multiplexer (the symmetric twin of
 /// the daemon's [`run_daemon_io`](crate::run_daemon_io)). The transport is any
 /// [`AsyncRead`]/[`AsyncWrite`] pair: the real `--daemon` binary's stdio (how
@@ -2522,17 +1930,15 @@ pub struct DaemonClient {
 /// listener.
 ///
 /// **Why a dedicated link thread.** The connection runs on its *own* OS thread + a
-/// current-thread runtime — not the server runtime — because the two blocking bridges
-/// (`sys_run`, `luafs`) park the editor/Lua thread on a `std` reply channel, and that
-/// parked thread *is* the server runtime; the wire must be driven elsewhere or the park
-/// would starve the reader carrying its own reply (the deadlock trap from Open
-/// Decision #5). On this one shared thread we run both blocking-bridge job servers
-/// ([`run_sys_jobs`] / [`run_luafs_jobs`]) and the single [`run_client_demux`] that fans
-/// every daemon→edit-host notification to the right leg — collapsing what used to be a
-/// separate link thread per bridge plus a demux task per async leg onto one connection.
-/// The async legs (`host_fs`/`host_proc`/`lsp_transport`) hold clones of the shared
-/// [`Rpc`] and issue their requests/notifications from the server runtime; the actual
-/// wire I/O always happens here.
+/// current-thread runtime — not the server runtime — so the wire I/O is driven off the
+/// server's thread. On this one shared thread we run the [`run_fs_jobs`] job server (the
+/// `nx.fs` `luafs_op` leg) and the single [`run_client_demux`] that fans every
+/// daemon→edit-host notification to the right leg. Every seam
+/// (`host_fs`/`host_proc`/`lsp_transport`/`fs_jobs`) holds a clone of the shared [`Rpc`]
+/// (or a channel to a job server on this thread) and issues its requests from the server
+/// runtime; the actual wire I/O always happens here. No leg parks the editor thread —
+/// `nx.fs` is `await`ed off the tick by the event-loop actor, the async legs are
+/// fire-and-forget request/response.
 pub fn connect_daemon<R, W>(reader: R, writer: W) -> DaemonClient
 where
     R: AsyncRead + Unpin + Send + 'static,
@@ -2565,14 +1971,13 @@ where
         .expect("connect_daemon: the link thread could not build a tokio runtime")
 }
 
-/// Build the five edit-host seams over an already-connected `(rpc, incoming)` pair,
-/// hand the [`DaemonClient`] out on `client_tx`, then drive the link — the two
-/// blocking-bridge job servers ([`run_sys_jobs`] / [`run_luafs_jobs`]) plus the single
-/// [`run_client_demux`] — until the daemon hangs up. This is the transport-agnostic
-/// heart of [`connect_daemon`]; the QUIC connector ([`crate::quic::connect_quic`]) calls
-/// it with the halves of a QUIC bidi stream, the link thread keeping the endpoint +
-/// connection alive in scope. Must run on the dedicated link thread's runtime (the
-/// blocking bridges park the editor thread on a `std` reply channel — see
+/// Build the four edit-host seams over an already-connected `(rpc, incoming)` pair,
+/// hand the [`DaemonClient`] out on `client_tx`, then drive the link — the [`run_fs_jobs`]
+/// job server (the `nx.fs` `luafs_op` leg) plus the single [`run_client_demux`] — until the
+/// daemon hangs up. This is the transport-agnostic heart of [`connect_daemon`]; the QUIC
+/// connector ([`crate::quic::connect_quic`]) calls it with the halves of a QUIC bidi stream,
+/// the link thread keeping the endpoint + connection alive in scope. Runs on the dedicated
+/// link thread's runtime (so the wire is driven off the server's thread — see
 /// [`connect_daemon`]).
 pub(crate) async fn serve_daemon_link(
     rpc: Rpc,
@@ -2584,10 +1989,9 @@ pub(crate) async fn serve_daemon_link(
     let lsp_inflight: LspInflightMap = Arc::new(Mutex::new(HashMap::new()));
     let (watch_tx, watch_rx) = unbounded_channel::<WatchEvent>();
 
-    // Blocking-bridge legs: the job channels their seams send onto and their job
-    // servers (below) pull from.
-    let (sys_tx, sys_rx) = unbounded_channel::<SysJob>();
-    let (luafs_tx, luafs_rx) = unbounded_channel::<LuaFsJob>();
+    // The `nx.fs` (`luafs_op`) leg: the job channel its seam sends whole `FsJob`s onto and
+    // its job server (below) pulls from.
+    let (fs_jobs_tx, fs_jobs_rx) = unbounded_channel::<FsJobReq>();
 
     let client = DaemonClient {
         host_fs: RemoteHostFs {
@@ -2599,13 +2003,12 @@ pub(crate) async fn serve_daemon_link(
             inflight: proc_inflight.clone(),
             next_id: AtomicU64::new(1),
         },
-        blocking_system: RemoteBlockingSystem { req_tx: sys_tx },
         lsp_transport: RemoteLspTransport {
             rpc: rpc.clone(),
             inflight: lsp_inflight.clone(),
             next_id: AtomicU64::new(1),
         },
-        lua_fs: RemoteLuaFs { req_tx: luafs_tx },
+        fs_jobs: RemoteFsJobs { req_tx: fs_jobs_tx },
     };
     // Hand the seams out before serving; if the caller already dropped, there's
     // nothing to drive.
@@ -2613,11 +2016,9 @@ pub(crate) async fn serve_daemon_link(
         return;
     }
 
-    // The two blocking bridges ride this shared runtime as tasks (each was its
-    // own thread+runtime in the single-leg `connect`); the demux is the main
-    // future. All three share the one `incoming`/`Rpc`.
-    tokio::spawn(run_sys_jobs(rpc.clone(), sys_rx));
-    tokio::spawn(run_luafs_jobs(rpc.clone(), luafs_rx));
+    // The `nx.fs` job server rides this shared runtime as a task; the demux is the main
+    // future. Both share the one `incoming`/`Rpc`.
+    tokio::spawn(run_fs_jobs(rpc.clone(), fs_jobs_rx));
     run_client_demux(incoming, proc_inflight, lsp_inflight, watch_tx).await;
 }
 

@@ -10,9 +10,11 @@
 //!   `Result<FsValue, FsError>` it marshals into the resolved / rejected Lua value
 //!   ([`fs_result_from_value`]).
 //!
-//! The native (and native-daemon) path never touches this — it runs [`FsJob`]s on the
-//! event-loop actor against an `Arc<dyn LuaFs>` directly. So the encode (daemon) and
-//! decode (edit-host) ends live here, *together*, to stay in lock-step.
+//! Native-**bare** never touches this — it runs [`FsJob`]s on the event-loop actor
+//! against a local `StdLuaFs` directly. Native-**daemon** and **wasm** both encode the
+//! job here ([`fs_job_to_value`]) and send it over the same `luafs_op` leg, and both
+//! decode the reply here ([`fs_result_from_value`]) — so all the encode/decode ends live
+//! together, in lock-step.
 //!
 //! The codec works on [`rmpv::Value`] only (no `mlua` / transport types) so it is shared
 //! across the native daemon and the wasm edit-host without dragging either's machinery in.
@@ -110,6 +112,79 @@ pub fn fs_job_from_value(v: &Value) -> Result<FsJob, String> {
         },
         other => return Err(format!("luafs_op: unknown op '{other}'")),
     })
+}
+
+/// Encode an [`FsJob`] into its request map — the inverse of [`fs_job_from_value`], the
+/// edit-host side. The native-daemon event-loop actor uses this to send a whole job over
+/// the `luafs_op` leg in one round-trip (the daemon runs [`run_fs_job`](crate::run_fs_job)
+/// and decomposes any compound op there); the wasm Worker builds the identical map shape
+/// in JS. Bytes ride as msgpack `bin` so `write`/`append` payloads cross intact.
+pub fn fs_job_to_value(job: &FsJob) -> Value {
+    fn m(pairs: Vec<(&str, Value)>) -> Value {
+        Value::Map(
+            pairs
+                .into_iter()
+                .map(|(k, v)| (Value::from(k), v))
+                .collect(),
+        )
+    }
+    match job {
+        FsJob::Stat { path } => m(vec![("op", "stat".into()), ("path", path.as_str().into())]),
+        FsJob::Lstat { path } => m(vec![("op", "lstat".into()), ("path", path.as_str().into())]),
+        FsJob::Exists { path } => m(vec![
+            ("op", "exists".into()),
+            ("path", path.as_str().into()),
+        ]),
+        FsJob::Readdir { path } => m(vec![
+            ("op", "readdir".into()),
+            ("path", path.as_str().into()),
+        ]),
+        FsJob::Read { path } => m(vec![("op", "read".into()), ("path", path.as_str().into())]),
+        FsJob::ReadText { path, encoding } => m(vec![
+            ("op", "read_text".into()),
+            ("path", path.as_str().into()),
+            ("encoding", encoding.as_str().into()),
+        ]),
+        FsJob::Write { path, data } => m(vec![
+            ("op", "write".into()),
+            ("path", path.as_str().into()),
+            ("data", Value::Binary(data.clone())),
+        ]),
+        FsJob::Append { path, data } => m(vec![
+            ("op", "append".into()),
+            ("path", path.as_str().into()),
+            ("data", Value::Binary(data.clone())),
+        ]),
+        FsJob::Mkdir { path, recursive } => m(vec![
+            ("op", "mkdir".into()),
+            ("path", path.as_str().into()),
+            ("recursive", Value::from(*recursive)),
+        ]),
+        FsJob::Rename { from, to } => m(vec![
+            ("op", "rename".into()),
+            ("from", from.as_str().into()),
+            ("to", to.as_str().into()),
+        ]),
+        FsJob::Remove { path, recursive } => m(vec![
+            ("op", "remove".into()),
+            ("path", path.as_str().into()),
+            ("recursive", Value::from(*recursive)),
+        ]),
+        FsJob::Copy {
+            src,
+            dst,
+            recursive,
+        } => m(vec![
+            ("op", "copy".into()),
+            ("src", src.as_str().into()),
+            ("dst", dst.as_str().into()),
+            ("recursive", Value::from(*recursive)),
+        ]),
+        FsJob::Realpath { path } => m(vec![
+            ("op", "realpath".into()),
+            ("path", path.as_str().into()),
+        ]),
+    }
 }
 
 /// Encode an op's outcome into the `["ok", <fs-value>] | ["err", code, message]` reply

@@ -215,17 +215,16 @@ fn nxvim_bin_name() -> &'static str {
 /// split, whose fs/process/watch/LSP/Lua-fs all route to the daemon.
 fn server_init(file: Option<String>, client: Option<DaemonClient>) -> ServerInit {
     let (config_dir, runtimepath) = nxvim_server::default_runtime();
-    let (host_fs, host_proc, host_fs_async, blocking_system, lsp_transport, lua_fs) = match client {
-        None => (None, None, None, None, None, None),
+    let (host_fs, host_proc, host_fs_async, lsp_transport, fs_jobs) = match client {
+        None => (None, None, None, None, None),
         Some(c) => (
             // A daemon session leaves the synchronous `host_fs` unused — every fs read
             // goes through the async daemon seam below — so it stays `None`.
             None,
             Some(Box::new(c.host_proc) as _),
             Some(Box::new(c.host_fs) as _),
-            Some(Box::new(c.blocking_system) as _),
             Some(Box::new(c.lsp_transport) as _),
-            Some(Box::new(c.lua_fs) as _),
+            Some(c.fs_jobs),
         ),
     };
     ServerInit {
@@ -240,9 +239,8 @@ fn server_init(file: Option<String>, client: Option<DaemonClient>) -> ServerInit
         host_fs,
         host_proc,
         host_fs_async,
-        blocking_system,
         lsp_transport,
-        lua_fs,
+        fs_jobs,
     }
 }
 

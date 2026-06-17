@@ -17,7 +17,7 @@ use crate::convert::{
     color_field, color_to_u32, env_pairs, flag_field, json_to_lua, lua_i64, lua_to_json,
     opt_table_to_json, stringify,
 };
-use crate::host::{create_dir_all_mode, get_runtime_file, glob_paths, parse_mode, stdpath};
+use crate::host::{create_dir_all_mode, get_runtime_file, parse_mode, stdpath};
 use crate::ops::{
     BufOp, CompletePush, CompleteSetupReq, ConfirmReq, DecorMark, DecorPublish, DockOp, ExtmarkOp,
     FeedKeysOp, FsJob, GlobalOptionOp, HlSet, LayerOp, LoopOp, LspOp, OptionValue, PanelOp,
@@ -26,9 +26,8 @@ use crate::ops::{
     TabOp, TerminalOpenReq, TsOp, UiFloatReq, UiInputReq, UiSelectReq, ViewOp, VirtChunkData,
     VirtDecorData, WindowOp,
 };
-use crate::runtime::{resolve_lua_fs, Shared};
+use crate::runtime::Shared;
 use crate::vimregex;
-use crate::BlockingSystem;
 
 /// `vim.regex(pat)` userdata: a vim pattern compiled by the real vim regexp engine
 /// ([`nxvim_regex`]). Its `:match_str(text)` returns the match's `(start, end)`
@@ -639,31 +638,6 @@ pub(crate) fn install_vim(lua: &Lua, shared: &Rc<RefCell<Shared>>) -> mlua::Resu
         "stdpath",
         lua.create_function(|_, what: String| Ok(stdpath(&what)))?,
     )?;
-    // `vim.fn.getftime(path)`: the file's mtime in whole seconds, or -1. Routed
-    // through the fs seam so it sees the *remote* project in a daemon session.
-    let sh = shared.clone();
-    func.set(
-        "getftime",
-        lua.create_function(move |_, path: String| {
-            Ok(resolve_lua_fs(&sh)
-                .stat(&path)
-                .ok()
-                .and_then(|st| st.mtime)
-                .map(|(sec, _)| sec)
-                .unwrap_or(-1))
-        })?,
-    )?;
-    let sh = shared.clone();
-    func.set(
-        "isdirectory",
-        lua.create_function(move |_, path: String| {
-            let is_dir = matches!(
-                resolve_lua_fs(&sh).stat(&path),
-                Ok(st) if st.kind == crate::FileKind::Dir
-            );
-            Ok(i64::from(is_dir))
-        })?,
-    )?;
     func.set(
         "mkdir",
         lua.create_function(
@@ -776,22 +750,6 @@ pub(crate) fn install_runtime_api(
     nx.set(
         "_read_file",
         lua.create_function(|_, path: String| Ok(std::fs::read_to_string(&path).ok()))?,
-    )?;
-
-    // `nx._readdir(path)`: the entry names directly under `path` (no `.`/`..`),
-    // or an empty list if it can't be read. Backs `vim.fs.find`/predicate markers,
-    // which walk the *project* tree, so it routes through the fs seam (remote in a
-    // daemon session).
-    let sh = shared.clone();
-    nx.set(
-        "_readdir",
-        lua.create_function(move |lua, path: String| {
-            let names: Vec<String> = resolve_lua_fs(&sh)
-                .scandir(&path)
-                .map(|entries| entries.into_iter().map(|e| e.name).collect())
-                .unwrap_or_default();
-            lua.create_sequence_from(names)
-        })?,
     )?;
 
     // ===== nx.fs (one-shot ops) ===========================================
@@ -2224,64 +2182,6 @@ pub(crate) fn install_runtime_api(
         })?,
     )?;
 
-    // `nx._system(cmd, cwd, env, text)`: spawn `cmd` (an argv list — no shell),
-    // block until it exits, and return `{ code, stdout, stderr, pid }`. The pure-Lua
-    // `vim.system` wrapper layers neovim's object shape (`:wait()` / `on_exit`)
-    // over it. This is the blocking form (the async `on_exit` form rides the
-    // off-tick `nx._system_async` event-loop path instead): it shells out inline
-    // because the caller needs the value *now* — an `lsp/<server>.lua` `root_dir`
-    // that runs e.g. rust_analyzer's `cargo metadata` / `rustc --print sysroot`
-    // resolves to completion on the input tick. Unlike neovim, a spawn failure (a
-    // missing tool) degrades to `code = -1` with the message on `stderr` instead
-    // of raising, so it can never break `vim.lsp.enable` on a machine that lacks
-    // the toolchain. stdout/stderr are returned as Lua byte strings (so non-UTF-8
-    // output survives), independent of the `text` flag, which is accepted and
-    // ignored.
-    //
-    // The actual spawn goes through the injected [`BlockingSystem`] seam
-    // (`Shared::blocking_system`): the default [`StdBlockingSystem`] spawns locally
-    // (today's behavior), while a daemon session injects a blocking bridge so the
-    // shell-out runs on the remote where the project files are (edit-host split,
-    // Phase 3, Open Decision #5's residual blocking-bridge note). The bridge parks
-    // this thread on the daemon's reply — the same as the local spawn blocks on its
-    // `wait` — so the call stays synchronous either way.
-    let sh = shared.clone();
-    nx.set(
-        "_system",
-        lua.create_function(
-            move |lua,
-                  (cmd, cwd, env, _text): (
-                Vec<String>,
-                Option<String>,
-                Option<Table>,
-                Option<bool>,
-            )| {
-                let spec = crate::SystemSpec {
-                    cmd,
-                    cwd,
-                    env: crate::convert::env_pairs(env)?,
-                };
-                // Take the injected backend out of `Shared` (cloning the `Rc`) and drop
-                // the borrow *before* running — the run blocks the thread (locally on
-                // `wait`, remotely on the daemon reply), and we must not hold a `RefCell`
-                // borrow across it.
-                let backend = sh.borrow().blocking_system.clone();
-                let out = match backend {
-                    Some(backend) => backend.run(spec),
-                    None => crate::StdBlockingSystem.run(spec),
-                };
-                let result = lua.create_table()?;
-                if let Some(pid) = out.pid {
-                    result.set("pid", pid)?;
-                }
-                result.set("code", out.code)?;
-                result.set("stdout", lua.create_string(&out.stdout)?)?;
-                result.set("stderr", lua.create_string(&out.stderr)?)?;
-                Ok(result)
-            },
-        )?,
-    )?;
-
     // `nx._json_decode(str)`: parse a JSON document into the equivalent Lua value
     // (objects -> string-keyed tables, arrays -> sequences, `null` -> nil). Backs
     // `vim.json.decode`; raises on malformed input, matching neovim. The config
@@ -2305,81 +2205,11 @@ pub(crate) fn install_runtime_api(
         })?,
     )?;
 
-    // ----- additional vim.fn (filesystem / process / PATH) --------------------
-    // `vim.fn.executable(name)`: 1 if `name` is an executable on $PATH (or an
-    // executable file path), else 0. Configs use it to prefer a project-local
-    // `node_modules/.bin/<server>` over the global one.
-    let sh = shared.clone();
-    func.set(
-        "executable",
-        lua.create_function(move |_, name: String| {
-            Ok(i64::from(resolve_lua_fs(&sh).which(&name).is_some()))
-        })?,
-    )?;
-    // `vim.fn.exepath(name)`: the resolved path to `name` on $PATH, or "".
-    let sh = shared.clone();
-    func.set(
-        "exepath",
-        lua.create_function(move |_, name: String| {
-            Ok(resolve_lua_fs(&sh).which(&name).unwrap_or_default())
-        })?,
-    )?;
+    // ----- additional vim.fn (process / PATH) ---------------------------------
     // `vim.fn.getpid()`: this (editor) process's id.
     func.set(
         "getpid",
         lua.create_function(|_, ()| Ok(std::process::id() as i64))?,
-    )?;
-    // `vim.fn.resolve(path)`: `path` with symlinks resolved, or unchanged if it
-    // can't be canonicalized.
-    let sh = shared.clone();
-    func.set(
-        "resolve",
-        lua.create_function(move |_, path: String| {
-            Ok(resolve_lua_fs(&sh).realpath(&path).unwrap_or(path))
-        })?,
-    )?;
-    // `vim.fn.filereadable(path)`: 1 if `path` is a regular file, else 0.
-    let sh = shared.clone();
-    func.set(
-        "filereadable",
-        lua.create_function(move |_, path: String| {
-            let is_file = matches!(
-                resolve_lua_fs(&sh).stat(&path),
-                Ok(st) if st.kind == crate::FileKind::File
-            );
-            Ok(i64::from(is_file))
-        })?,
-    )?;
-    // `vim.fn.readblob(path)`: the file's raw bytes as a string; errors if
-    // unreadable (callers `pcall` it).
-    let sh = shared.clone();
-    func.set(
-        "readblob",
-        lua.create_function(move |lua, path: String| {
-            lua.create_string(
-                resolve_lua_fs(&sh)
-                    .read_file(&path)
-                    .map_err(mlua::Error::external)?,
-            )
-        })?,
-    )?;
-    // `vim.fn.glob(pattern[, nosuf, list])`: existing paths matching a shell-style
-    // glob (`*`/`?` wildcards, per path component). Returns a list when `list` is
-    // truthy (the form `lspconfig.util.root_pattern` uses), else the default
-    // newline-joined string. `nosuf` is accepted and ignored.
-    let sh = shared.clone();
-    func.set(
-        "glob",
-        lua.create_function(
-            move |lua, (pattern, _nosuf, list): (String, Option<bool>, Option<bool>)| {
-                let paths = glob_paths(&pattern, resolve_lua_fs(&sh).as_ref());
-                if list.unwrap_or(false) {
-                    Ok(mlua::Value::Table(lua.create_sequence_from(paths)?))
-                } else {
-                    Ok(mlua::Value::String(lua.create_string(paths.join("\n"))?))
-                }
-            },
-        )?,
     )?;
 
     Ok(())

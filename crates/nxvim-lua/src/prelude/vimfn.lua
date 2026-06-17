@@ -296,12 +296,11 @@ function nx.expand(expr, nosuf, list)
     end
     return word
   end
-  -- Wildcard expansion → glob.
-  if expr:find("[*?]") then
-    return fn.glob(expand_path(expr), nosuf, list)
-  end
-  -- A plain string: home / env expansion, returned verbatim (vim's behavior for a
-  -- path with no wildcards).
+  -- Home / env expansion, returned verbatim. Wildcard (`*`/`?`) globbing is NOT
+  -- supported here: globbing touches the filesystem, and nxvim has no synchronous fs
+  -- (all fs is async via `nx.fs`, ADR 0002 rule 3 — nothing blocks the editor tick).
+  -- A pattern with wildcards therefore comes back unexpanded; use `nx.fs` (async) to
+  -- walk a directory instead.
   return expand_path(expr)
 end
 vim.fn.expand = nx.expand

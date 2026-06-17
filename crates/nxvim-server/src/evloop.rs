@@ -76,10 +76,10 @@ pub enum LoopCommand {
     /// Cancel the filesystem watch armed under `id` (a no-op if it was never
     /// armed).
     FsEventStop { id: u64 },
-    /// Run an off-tick `nx.fs` op (`nx._fs_op`) on the actor's blocking pool against
-    /// its [`LuaFs`] clone, and send the typed result back as [`LoopEvent::FsResult`]
-    /// for callback `id`. Off the editor tick, so a large/slow remote `readdir` (a
-    /// daemon session's `RemoteLuaFs` wire round-trip) never janks the editor.
+    /// Run an off-tick `nx.fs` op (`nx._fs_op`) through the actor's [`FsBackend`] — local
+    /// disk on the blocking pool, or the daemon's `luafs_op` leg — and send the typed
+    /// result back as [`LoopEvent::FsResult`] for callback `id`. Off the editor tick, so a
+    /// large/slow op (a daemon round-trip, a recursive copy) never janks the editor.
     Fs { id: u64, job: FsJob },
 }
 
@@ -139,6 +139,19 @@ pub enum LoopEvent {
     },
 }
 
+/// Where the actor runs off-tick `nx.fs` ops. One path per session topology — never
+/// a per-op `LuaFs` round-trip over the wire (the retired `RemoteLuaFs`):
+/// - [`Local`](FsBackend::Local) — native-bare: [`run_fs_job`] against a local
+///   [`StdLuaFs`](nxvim_lua::StdLuaFs) on the blocking pool (a quick syscall).
+/// - [`Remote`](FsBackend::Remote) — native-daemon: the whole [`FsJob`] crosses in one
+///   `luafs_op` request via [`RemoteFsJobs`](crate::daemon::RemoteFsJobs), decomposed
+///   daemon-side. The same leg the wasm edit-host uses; an `await`, not a thread park.
+#[derive(Clone)]
+pub enum FsBackend {
+    Local(Arc<dyn LuaFs + Send + Sync>),
+    Remote(crate::daemon::RemoteFsJobs),
+}
+
 /// Handle the server holds to drive the event loop. Cheap to construct; the actor
 /// task is spawned lazily on the first [`EventLoop::send`], so a session that
 /// never uses a timer or `vim.system` spawns nothing (the
@@ -151,13 +164,11 @@ pub struct EventLoop {
     /// [`StdHostProc`](crate::host::StdHostProc) by default, or an injected
     /// daemon-backed [`HostProc`]. Cloned into the actor when it starts.
     host_proc: Arc<dyn HostProc>,
-    /// The seam off-tick `nx.fs` ops run through — the local [`StdLuaFs`] by default,
-    /// or an injected daemon-backed `RemoteLuaFs`. Handed in at construction (the same
-    /// handle the Lua runtime's synchronous callers hold), cloned into the actor when
-    /// it starts and again per op for the `spawn_blocking` worker. Preserves the lazy
-    /// start — a session that never touches `nx.fs` (or a timer / process) spawns
+    /// Where off-tick `nx.fs` ops run — local disk on the blocking pool, or the daemon's
+    /// `luafs_op` leg (see [`FsBackend`]). Cloned into the actor when it starts. Preserves
+    /// the lazy start — a session that never touches `nx.fs` (or a timer / process) spawns
     /// nothing.
-    lua_fs: Arc<dyn LuaFs + Send + Sync>,
+    fs: FsBackend,
     started: bool,
 }
 
@@ -167,7 +178,7 @@ impl EventLoop {
     /// `lua_fs`. No task is spawned until the first [`EventLoop::send`].
     pub fn new(
         host_proc: Arc<dyn HostProc>,
-        lua_fs: Arc<dyn LuaFs + Send + Sync>,
+        fs: FsBackend,
     ) -> (EventLoop, UnboundedReceiver<LoopEvent>) {
         let (cmd_tx, cmd_rx) = unbounded_channel();
         let (event_tx, event_rx) = unbounded_channel();
@@ -175,7 +186,7 @@ impl EventLoop {
             cmd_tx,
             start: Some((cmd_rx, event_tx)),
             host_proc,
-            lua_fs,
+            fs,
             started: false,
         };
         (evloop, event_rx)
@@ -191,7 +202,7 @@ impl EventLoop {
                 cmd_rx,
                 event_tx,
                 self.host_proc.clone(),
-                self.lua_fs.clone(),
+                self.fs.clone(),
             ));
             self.started = true;
         }
@@ -214,7 +225,7 @@ async fn run_evloop(
     mut cmd_rx: UnboundedReceiver<LoopCommand>,
     event_tx: UnboundedSender<LoopEvent>,
     host_proc: Arc<dyn HostProc>,
-    lua_fs: Arc<dyn LuaFs + Send + Sync>,
+    fs: FsBackend,
 ) {
     // Live timer tasks and the per-process kill channels, keyed by callback id.
     let mut timers: HashMap<u64, JoinHandle<()>> = HashMap::new();
@@ -327,26 +338,40 @@ async fn run_evloop(
                 fs_watchers.remove(&id); // dropping the watcher stops it
             }
             LoopCommand::Fs { id, job } => {
-                // Run the op on the blocking pool (a `RemoteLuaFs` parks on a wire
-                // reply; a `StdLuaFs` is a quick syscall — neither belongs on the
-                // actor's async task), then send the typed result back for the server
-                // to settle the promise on its one thread. Spawned so concurrent ops
-                // don't serialize behind one another.
-                let fs = lua_fs.clone();
+                // Run the op off the actor's async task and send the typed result back for
+                // the server to settle the promise on its one thread. Spawned so concurrent
+                // ops don't serialize behind one another. Two paths (see [`FsBackend`]):
+                // local disk runs `run_fs_job` on the blocking pool (a quick syscall);
+                // native-daemon sends the whole job over `luafs_op` and `await`s the reply
+                // (no thread park — it's a tokio request on the link).
                 let event_tx = event_tx.clone();
-                tokio::spawn(async move {
-                    let result = tokio::task::spawn_blocking(move || run_fs_job(fs.as_ref(), &job))
-                        .await
-                        .unwrap_or_else(|e| {
-                            // The blocking task panicked (a `LuaFs` impl should never
-                            // panic, but never silently swallow it): reject loud.
-                            Err(FsError {
-                                code: "EIO".to_string(),
-                                message: format!("nx.fs op task failed: {e}"),
+                match &fs {
+                    FsBackend::Local(lua_fs) => {
+                        let lua_fs = lua_fs.clone();
+                        tokio::spawn(async move {
+                            let result = tokio::task::spawn_blocking(move || {
+                                run_fs_job(lua_fs.as_ref(), &job)
                             })
+                            .await
+                            .unwrap_or_else(|e| {
+                                // The blocking task panicked (a `LuaFs` impl should
+                                // never panic, but never silently swallow it).
+                                Err(FsError {
+                                    code: "EIO".to_string(),
+                                    message: format!("nx.fs op task failed: {e}"),
+                                })
+                            });
+                            let _ = event_tx.send(LoopEvent::FsResult { id, result });
                         });
-                    let _ = event_tx.send(LoopEvent::FsResult { id, result });
-                });
+                    }
+                    FsBackend::Remote(remote) => {
+                        let remote = remote.clone();
+                        tokio::spawn(async move {
+                            let result = remote.run(job).await;
+                            let _ = event_tx.send(LoopEvent::FsResult { id, result });
+                        });
+                    }
+                }
             }
         }
         // Forget kill channels whose process tasks have closed them (the child

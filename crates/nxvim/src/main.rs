@@ -153,16 +153,13 @@ fn main() -> Result<()> {
         // The local binary opens the startup file synchronously through the disk;
         // the async (daemon) fs is injected here by the edit-host split.
         host_fs_async: None,
-        // the local binary spawns blocking `vim.system` shell-outs locally; a daemon
-        // blocking bridge is injected here by the edit-host split.
-        blocking_system: None,
         // The local binary spawns language servers as real local children (the
         // default); a daemon-backed LSP transport is injected here by the edit-host
         // split.
         lsp_transport: None,
-        // The local binary reads the project fs directly; a daemon-backed Lua fs
-        // bridge is injected here by the edit-host split.
-        lua_fs: None,
+        // The local binary runs `nx.fs` against the local disk (the actor's `StdLuaFs`);
+        // a daemon-backed `luafs_op` seam is injected here by the edit-host split.
+        fs_jobs: None,
     };
     let server_thread = std::thread::spawn(move || {
         // Test-only fault injection (debug builds only): force a server-thread
@@ -360,9 +357,8 @@ where
                 host_fs: None,
                 host_proc: Some(Box::new(client.host_proc)),
                 host_fs_async: Some(Box::new(client.host_fs)),
-                blocking_system: Some(Box::new(client.blocking_system)),
                 lsp_transport: Some(Box::new(client.lsp_transport)),
-                lua_fs: Some(Box::new(client.lua_fs)),
+                fs_jobs: Some(client.fs_jobs),
             };
             // `_guard` (the stdio child, or `()` for QUIC) lives until the editor quits.
             run_server(server_end, init).await

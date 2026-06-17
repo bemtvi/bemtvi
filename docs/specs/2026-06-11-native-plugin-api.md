@@ -466,7 +466,14 @@ engines this API is a thin contract over.
 
 1. **`nx` core** (buf/win/options/event/spawn/fs/timer/keymap/command/ui.input
    + `nx.lsp` setup — contracts over existing machinery; `init.lua` targets it
-   from day one) and the manifest loader + package manager.
+   from day one) and the manifest loader + package manager. *(package manager
+   landed — `nx.plugins`: declarative specs, async `git` install/update over
+   `nx.run`, eager + lazy (`cmd`/`event`/`ft`/`keys`) loading, `:PluginSync` /
+   `:PluginInstall` / `:PluginUpdate` / `:PluginClean` / `:PluginList`. A loaded
+   plugin is put on the live runtimepath via the `nx._add_rtp` bridge — so its
+   modules `require` and its `colors/`/`queries/`/`lsp/` resolve without a
+   restart — then its `plugin/` scripts source and its `config` runs. See
+   `crates/nxvim-lua/src/prelude/plugins.lua` and `examples/plugins/`.)*
 2. **Picker** — highest daily-driver value; exercises spawn / streaming /
    cancellation / floats / preview end to end.
 3. **Completion engine** — LSP + buffer + snippets sources built-in.

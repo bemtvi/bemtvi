@@ -439,6 +439,11 @@ const PRELUDE_MODULES: &[(&str, &str)] = &[
     // async). The variable/option/dispatch/keymap nouns are authored as `nx.*`
     // directly in the chunks above, each aliasing `vim.*` onto itself.
     ("nxvim:prelude/nx", include_str!("prelude/nx.lua")),
+    // The package manager (`nx.plugins`) — declarative install + lazy/eager load
+    // over `git` (`nx.run`) and `nx.fs`. Loads AFTER nx.lua: it builds on
+    // `nx.command` / `nx.on` (defined there) plus nx.run / nx.fs / nx.promise /
+    // nx.keymap / nx.notify (all above), and the `nx._add_rtp` Rust bridge.
+    ("nxvim:prelude/plugins", include_str!("prelude/plugins.lua")),
 ];
 
 /// Side effects produced by running Lua, drained by the server.
@@ -653,7 +658,14 @@ pub struct LuaRuntime {
     /// The directories Lua searches: their `lua/` feeds `package.path` (so
     /// `require` resolves plugin modules), and their roots hold `colors/`,
     /// `after/`, … for later phases. nxvim's analogue of neovim's runtimepath.
-    runtimepath: Vec<PathBuf>,
+    ///
+    /// Shared + mutable (`Rc<RefCell<…>>`) because the package manager
+    /// (`nx.plugins`) adds a freshly-installed plugin's directory to it *at
+    /// runtime* (`nx._add_rtp`), and the `nvim_get_runtime_file` closure reads the
+    /// live list so the new plugin's `colors/` / `queries/` / `lsp/` resolve
+    /// without a restart. The Rc is cloned into those FFI closures in
+    /// [`install_runtime_api`].
+    runtimepath: Rc<RefCell<Vec<PathBuf>>>,
 }
 
 /// Generate a `take_*` accessor that drains one [`Shared`] queue with
@@ -691,9 +703,10 @@ impl LuaRuntime {
         // caching itself via `loadstring` + `string.dump`) keeps working.
         lua.load("loadstring = loadstring or load").exec()?;
         let shared = Rc::new(RefCell::new(Shared::default()));
+        let runtimepath = Rc::new(RefCell::new(runtimepath));
         install_vim(&lua, &shared)?;
         install_runtime_api(&lua, &shared, &runtimepath)?;
-        seed_package_path(&lua, &runtimepath)?;
+        seed_package_path(&lua, &runtimepath.borrow())?;
         // The pure-Lua half of `vim.*` + the `nx.*` namespace, layered over the Rust
         // bridge above. Split across focused modules but loaded in source order —
         // each is its own chunk (its own `local` scope), so the order is what one big
@@ -720,9 +733,11 @@ impl LuaRuntime {
     }
 
     /// The runtimepath this VM searches (read by the colorscheme/`require`
-    /// machinery to locate `colors/<name>.lua` and friends).
-    pub fn runtimepath(&self) -> &[PathBuf] {
-        &self.runtimepath
+    /// machinery to locate `colors/<name>.lua` and friends). A snapshot clone —
+    /// the live list is shared+mutable (`nx._add_rtp` appends to it), so callers
+    /// that iterate get a stable view for the duration of their borrow.
+    pub fn runtimepath(&self) -> Vec<PathBuf> {
+        self.runtimepath.borrow().clone()
     }
 
     /// Run a Lua chunk. Errors are returned for the server to surface.

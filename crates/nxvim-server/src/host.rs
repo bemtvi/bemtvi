@@ -189,6 +189,32 @@ async fn run_local_process(spec: ProcSpec, mut kill_rx: oneshot::Receiver<()>, e
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
+    // Detach the child from the editor's controlling terminal by putting it in its
+    // own session (setsid). A session with no controlling terminal makes any
+    // `/dev/tty` access fail, so an interactive tool — git/ssh prompting for a
+    // password, a CLI drawing a progress bar — can never read or write the
+    // terminal nxvim's TUI is painting. Without this, such a tool scribbles its
+    // prompt over the screen and blocks on a tty read that never arrives; with it,
+    // the tool errors instead, and that error rides the stderr pipe we capture and
+    // surface through the editor's own UI. stdin stays null/closed and stdout/stderr
+    // stay piped, so all of the child's I/O still flows through channels we own.
+    #[cfg(unix)]
+    {
+        // SAFETY: `pre_exec` runs in the forked child before `execvp`, where only
+        // async-signal-safe calls are permitted — `setsid(2)` is one. A freshly
+        // forked child is never a process-group leader, so the call succeeds; we
+        // ignore the result defensively either way (a failure leaves the child
+        // attached, no worse than before).
+        unsafe {
+            command.pre_exec(|| {
+                extern "C" {
+                    fn setsid() -> i32;
+                }
+                setsid();
+                Ok(())
+            });
+        }
+    }
     if let Some(dir) = cwd {
         command.current_dir(dir);
     }

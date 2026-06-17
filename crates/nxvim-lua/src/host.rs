@@ -2,7 +2,7 @@
 //! runtimepath and the standard-path math. Pure Rust (no `mlua` types), called from
 //! [`crate::install`] and [`crate::runtime`] (to seed `package.path`).
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// Full paths of the files matching `name` across `runtimepath`, the engine of
 /// `nvim_get_runtime_file`. `name` is a runtimepath-relative path whose final
@@ -63,15 +63,32 @@ pub(crate) fn seed_package_path(lua: &mlua::Lua, runtimepath: &[PathBuf]) -> mlu
     }
     let mut patterns: Vec<String> = Vec::with_capacity(runtimepath.len() * 2);
     for rt in runtimepath {
-        let lua_dir = rt.join("lua");
-        patterns.push(lua_dir.join("?.lua").to_string_lossy().into_owned());
-        patterns.push(
-            lua_dir
-                .join("?")
-                .join("init.lua")
-                .to_string_lossy()
-                .into_owned(),
-        );
+        package_patterns_for(rt, &mut patterns);
+    }
+    prepend_package_path(lua, patterns)
+}
+
+/// The two `require` patterns a single runtimepath entry contributes —
+/// `<dir>/lua/?.lua` and `<dir>/lua/?/init.lua` — pushed onto `out`. Shared by the
+/// startup seed and the runtime [`seed_one_package_path`] so both spell the layout
+/// identically.
+fn package_patterns_for(dir: &Path, out: &mut Vec<String>) {
+    let lua_dir = dir.join("lua");
+    out.push(lua_dir.join("?.lua").to_string_lossy().into_owned());
+    out.push(
+        lua_dir
+            .join("?")
+            .join("init.lua")
+            .to_string_lossy()
+            .into_owned(),
+    );
+}
+
+/// Prepend `patterns` to Lua's `package.path`, keeping the existing value as a
+/// suffix. Empty `patterns` is a no-op.
+fn prepend_package_path(lua: &mlua::Lua, patterns: Vec<String>) -> mlua::Result<()> {
+    if patterns.is_empty() {
+        return Ok(());
     }
     let package: mlua::Table = lua.globals().get("package")?;
     let existing: String = package.get("path").unwrap_or_default();
@@ -82,6 +99,16 @@ pub(crate) fn seed_package_path(lua: &mlua::Lua, runtimepath: &[PathBuf]) -> mlu
     };
     package.set("path", combined)?;
     Ok(())
+}
+
+/// Prepend one directory's `lua/` patterns to `package.path`, so its modules are
+/// `require`-able. The runtime sibling of [`seed_package_path`] (which seeds the
+/// whole runtimepath at startup): the package manager calls this — via the
+/// `nx._add_rtp` bridge — when it installs a plugin mid-session.
+pub(crate) fn seed_one_package_path(lua: &mlua::Lua, dir: &Path) -> mlua::Result<()> {
+    let mut patterns = Vec::with_capacity(2);
+    package_patterns_for(dir, &mut patterns);
+    prepend_package_path(lua, patterns)
 }
 
 /// Resolve a `vim.fn.stdpath(what)` directory under an `nxvim` subdir, the way

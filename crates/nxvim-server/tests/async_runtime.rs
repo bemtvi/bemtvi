@@ -189,6 +189,35 @@ async fn nx_run_resolves_with_exit_result() {
     assert_eq!(lua_u64(&rpc, "return _G.res.code").await, Some(0));
 }
 
+// A spawned child must not share the editor's controlling terminal: an
+// interactive tool (git/ssh asking for a password) would otherwise open /dev/tty
+// directly — bypassing the stdout/stderr pipes — and scribble its prompt over the
+// TUI while blocking on a read that never comes. The spawn seam puts every child
+// in its own session (setsid), which has no controlling terminal, so a session
+// leader's session id equals its own pid. We assert the child reports itself
+// DETACHED.
+#[cfg(unix)]
+#[tokio::test]
+async fn spawned_child_is_detached_from_the_controlling_terminal() {
+    let (rpc, _incoming) = start().await;
+    exec_lua(
+        &rpc,
+        "_G.sess = nil\n\
+         nx.run({ cmd = 'sh', args = { '-c',\n\
+           'sid=$(ps -o sid= -p $$ | tr -dc 0-9); [ \"$sid\" = \"$$\" ] && echo DETACHED || echo ATTACHED' }\n\
+         }):next(function(r) _G.sess = r.stdout end)",
+    )
+    .await;
+    tokio::time::sleep(Duration::from_millis(250)).await;
+    assert_eq!(
+        exec_lua(&rpc, "return _G.sess and _G.sess:gsub('%s+$', '')")
+            .await
+            .as_str(),
+        Some("DETACHED"),
+        "a spawned child must run in its own session (no controlling terminal)"
+    );
+}
+
 #[tokio::test]
 async fn nx_run_reports_spawn_failure_as_code_minus_one() {
     let (rpc, _incoming) = start().await;

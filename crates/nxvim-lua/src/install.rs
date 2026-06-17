@@ -772,7 +772,7 @@ type LspStartArgs = (
 pub(crate) fn install_runtime_api(
     lua: &Lua,
     shared: &Rc<RefCell<Shared>>,
-    runtimepath: &[PathBuf],
+    runtimepath: &Rc<RefCell<Vec<PathBuf>>>,
 ) -> mlua::Result<()> {
     let vim: Table = lua.globals().get("vim")?;
     let func: Table = vim.get("fn")?;
@@ -782,13 +782,38 @@ pub(crate) fn install_runtime_api(
     // prelude): full paths of files matching `name` (a runtimepath-relative path,
     // the final component optionally globbed with `*`) across the runtimepath.
     // `all=false` returns the first match only. The `lsp/<server>.lua`
-    // config-discovery primitive.
-    let rtp = runtimepath.to_vec();
+    // config-discovery primitive. Reads the LIVE runtimepath (cloned `Rc`) so a
+    // plugin the package manager installed mid-session contributes its `lsp/` /
+    // `queries/` / `colors/` immediately.
+    let rtp = runtimepath.clone();
     let runtime_file = lua.create_function(move |lua, (name, all): (String, Option<bool>)| {
-        let hits = get_runtime_file(&rtp, &name, all.unwrap_or(false));
+        let hits = get_runtime_file(&rtp.borrow(), &name, all.unwrap_or(false));
         lua.create_sequence_from(hits)
     })?;
     nx.set("runtime_file", runtime_file)?;
+
+    // `nx._add_rtp(dir)`: append `dir` to the live runtimepath and prepend its
+    // `lua/` patterns to `package.path`, so the directory's modules are
+    // `require`-able and its `colors/` / `queries/` / `lsp/` resolve through
+    // `nvim_get_runtime_file` — all without a restart. The package manager
+    // (`nx.plugins`) calls this the instant a plugin is on disk, before it sources
+    // the plugin's `plugin/` scripts or runs its `config`. Idempotent: a dir
+    // already on the path is a no-op (no duplicate `package.path` entries).
+    let rtp_add = runtimepath.clone();
+    nx.set(
+        "_add_rtp",
+        lua.create_function(move |lua, dir: String| {
+            let path = PathBuf::from(&dir);
+            let mut paths = rtp_add.borrow_mut();
+            if paths.contains(&path) {
+                return Ok(false);
+            }
+            paths.push(path.clone());
+            drop(paths);
+            crate::host::seed_one_package_path(lua, &path)?;
+            Ok(true)
+        })?,
+    )?;
 
     // `vim.fn.getcwd()`: the process working directory (the root fallback and the
     // base for relative->absolute path math in `vim.fs`/`fnamemodify`).

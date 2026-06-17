@@ -479,7 +479,7 @@ impl Editor {
         }
         let bands = self.dock_bands();
         let main_tabline = self.tabline_rows();
-        let chrome = main_tabline + self.panel_rows() + self.global_statusline_rows();
+        let chrome = main_tabline + self.global_statusline_rows();
         let mid_y = bands.reserved_top() + main_tabline;
         let mid_h = self
             .height
@@ -494,7 +494,7 @@ impl Editor {
         let bands = self.dock_bands();
         let main_tabline = self.tabline_rows();
         let gstatus = self.global_statusline_rows();
-        let chrome = main_tabline + self.panel_rows() + gstatus;
+        let chrome = main_tabline + gstatus;
         // The middle band (left dock | main | right docks): its top row, height, and
         // the main tree's width — what's left after the docks and the global chrome.
         let mid_y = bands.reserved_top() + main_tabline;
@@ -669,7 +669,7 @@ impl Editor {
         let bands = self.dock_bands();
         let main_tabline = self.tabline_rows();
         let gstatus = self.global_statusline_rows();
-        let chrome = main_tabline + self.panel_rows() + gstatus;
+        let chrome = main_tabline + gstatus;
         // The middle band (left dock | main | right dock): its top row and height.
         let mid_y = bands.reserved_top() + main_tabline;
         let mid_h = self

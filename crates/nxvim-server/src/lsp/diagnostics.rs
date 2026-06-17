@@ -349,31 +349,36 @@ impl EditHost {
     /// `severity  line:col  message` row per diagnostic (sorted by position) and
     /// a parallel [`PanelTarget`] list to attach as the panel's jump targets.
     /// `None` when the buffer has no diagnostics.
-    pub(crate) fn diagnostics_location_list(&self) -> Option<(Vec<String>, Vec<PanelTarget>)> {
+    /// The current buffer's diagnostics as **location-list entries**
+    /// `(path, line, col, text)` (0-based line/col), sorted by position — fed to
+    /// [`nxvim_core::Editor::open_location_list`] by `:LspDiagnostics` /
+    /// `vim.diagnostic.setloclist`. `None` when there are no diagnostics, or the
+    /// buffer has no file path to navigate to.
+    pub(crate) fn diagnostics_location_list(&self) -> Option<Vec<(PathBuf, usize, usize, String)>> {
         let (diags, encoding) = self.current_diagnostics()?;
         if diags.is_empty() {
             return None;
         }
-        let path = self.editor.buffer().path.clone();
+        // A navigable list needs a file to jump into; a no-path buffer can't have one.
+        let path = self.editor.buffer().path.clone()?;
         let mut items: Vec<&Diagnostic> = diags.iter().collect();
         items.sort_by_key(|d| (d.range.start.line, d.range.start.character));
-        let mut lines = Vec::with_capacity(items.len());
-        let mut targets = Vec::with_capacity(items.len());
-        for d in items {
-            let row = d.range.start.line as usize;
-            let character = d.range.start.character as usize;
-            lines.push(format!(
-                "{}  {}:{}  {}",
-                severity_short(severity_code(d.severity)),
-                row + 1,
-                character + 1,
-                first_line(&d.message),
-            ));
-            let line = self.editor.buffer().line(row);
-            let byte = byte_col(encoding, &line, character);
-            targets.push(path.clone().map(|p| (p, row, byte)));
-        }
-        Some((lines, targets))
+        let entries = items
+            .into_iter()
+            .map(|d| {
+                let row = d.range.start.line as usize;
+                let character = d.range.start.character as usize;
+                let line = self.editor.buffer().line(row);
+                let byte = byte_col(encoding, &line, character);
+                let text = format!(
+                    "{}: {}",
+                    severity_short(severity_code(d.severity)),
+                    first_line(&d.message),
+                );
+                (path.clone(), row, byte, text)
+            })
+            .collect();
+        Some(entries)
     }
 
     /// `vim.diagnostic.open_float()`: open a float (the bottom panel, the same
@@ -404,7 +409,7 @@ impl EditHost {
             self.editor.echo("No diagnostics under cursor");
             return;
         }
-        self.editor.open_panel("Diagnostics", lines, false, 0);
+        self.editor.open_scratch_listing("[Diagnostics]", lines, 0);
     }
 
     /// `vim.diagnostic.goto_next`/`goto_prev`: move the cursor to the next

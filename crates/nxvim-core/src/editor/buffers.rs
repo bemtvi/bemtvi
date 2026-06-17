@@ -7,6 +7,10 @@ use crate::host::FileStat;
 use crate::mode::Mode;
 use std::path::Path;
 
+/// Default height (rows) of a bottom-window scratch listing (`:messages`,
+/// `:registers`, …) — matches `:copen`'s default and the old bottom panel.
+pub(crate) const LISTING_HEIGHT: usize = 10;
+
 /// A buffer write the editor **deferred** off the keystroke tick — the daemon /
 /// edit-host save path (`docs/plans/2026-06-09-edit-host-and-browser-lua.md` →
 /// Phase 3e). In a daemon session core does *not* write through the synchronous
@@ -239,6 +243,10 @@ impl Editor {
             .map
             .iter()
             .filter(|(_, ob)| ob.layer == layer)
+            // Panel display buffers (`[Messages]`, `[Buffers]`, …) are surfaces, not
+            // documents: they never appear in `:ls` or in `:bnext`/`:bprev`/… navigation
+            // (which all funnel through here). `:lspanels` lists them instead.
+            .filter(|(id, _)| !self.is_panel_buffer(**id))
             .map(|(id, _)| *id)
             .collect()
     }
@@ -563,6 +571,25 @@ impl Editor {
         }
     }
 
+    /// Open a built-in read-only **scratch listing** (`:messages`, `:registers`,
+    /// `:LspInfo`, …) as a focus-locked bottom **panel** named `name` (see
+    /// [`Editor::open_named_panel`]). The listing is an ordinary `nomodifiable` buffer
+    /// navigated like any other (motions / search flow through); `q` / `<Esc>` dismiss it
+    /// via the `FileType nxlisting` autocmd's buffer-local map. `cursor` is the initially
+    /// selected line (0-based, clamped). The named registry buffer is reused, so re-running
+    /// the command replaces the content in place.
+    pub fn open_scratch_listing(&mut self, name: &str, lines: Vec<String>, cursor: usize) {
+        self.open_named_panel(name, lines, cursor, "nxlisting", LISTING_HEIGHT);
+    }
+
+    /// `:ls` / `:buffers` — open the buffer list as the `[Buffers]` panel whose `<CR>`
+    /// switches to the buffer on the cursor line. Tagged `filetype=nxbuffers`, so the
+    /// `FileType nxbuffers` autocmd's buffer-local `<CR>` map (a prelude default) lives only
+    /// on this panel and never bleeds onto the plain text listings.
+    pub fn open_buffer_listing(&mut self, lines: Vec<String>, cursor: usize) {
+        self.open_named_panel("[Buffers]", lines, cursor, "nxbuffers", LISTING_HEIGHT);
+    }
+
     /// Load raw file `bytes` into `buffer` as a freshly-read replica named `name` — the
     /// byte-level counterpart to [`Editor::load_str_into`] used by every *off-tick* read
     /// (daemon / wasm initial open and `:edit`). Decodes through the shared
@@ -627,6 +654,15 @@ impl Editor {
     /// edit journal — switching a buffer must never make it look edited.
     pub(crate) fn switch_buffer(&mut self, id: BufferId) {
         if id == self.cur_buffer() || !self.buffers.map.contains_key(&id) {
+            return;
+        }
+        // A panel buffer only ever shows inside the panel overlay — never as a regular main
+        // buffer. Targeting one from *outside* the panel window (`:b [Messages]`, a stray
+        // switch) opens it AS a panel instead. The in-panel-window swap is allowed through:
+        // it backs both `open_panel`'s own reuse and `:lspanels` navigation (showing the
+        // picked panel's last content), so panels always open as panels.
+        if self.is_panel_buffer(id) && self.panel_window() != Some(self.windows.current) {
+            self.open_panel(id, LISTING_HEIGHT);
             return;
         }
         // Stash the outgoing position with its buffer; it becomes the alternate.
@@ -1230,9 +1266,10 @@ impl Editor {
         // switch back, so nothing to do here.
     }
 
-    /// `:ls` / `:buffers` — list the open buffers into the bottom panel, one per
-    /// row (id-sorted), with vim's flag columns: `%` current / `#` alternate,
-    /// `a` active / `h` hidden, `+` modified.
+    /// `:ls` / `:buffers` — list the open buffers into a read-only `nxbuffers`
+    /// listing, one per row (id-sorted), with vim's flag columns: `%` current /
+    /// `#` alternate, `a` active / `h` hidden, `+` modified. `<CR>` switches to the
+    /// buffer on the cursor line (a buffer-local map from the `FileType` autocmd).
     pub(crate) fn ex_buffers(&mut self) {
         let current = self.cur_buffer();
         let alternate = self.alternate;
@@ -1276,26 +1313,41 @@ impl Editor {
                 id.0
             ));
         }
-        self.open_panel("Buffers", lines, false, current_row);
-        // Wire `<CR>` to jump to the picked buffer, using the same scripting
-        // `on_select` mechanism a plugin would: a prelude helper parses the
-        // buffer number off the selected line and switches to it. Queued as Lua
-        // (like `:lua`); the server runs it after the panel is open, so it sets
-        // the handler on this very panel.
-        self.lua_queue
-            .push("vim.panel.on_select(nx._panel_select_buffer)".to_string());
+        // A read-only `nxbuffers` listing; its `FileType` autocmd installs the
+        // buffer-local `<CR>` that parses the leading buffer number off the cursor
+        // line and switches to it (the vim ftplugin model, replacing the old panel
+        // `on_select` wiring).
+        self.open_buffer_listing(lines, current_row);
     }
 
-    /// `:messages` — show the message history in the bottom panel, opened
-    /// scrolled to the end with the newest line selected.
+    /// `:lspanels` / `:panels` — list the named panels (the surfaces hidden from `:ls`) in
+    /// a `[Panels]` panel. Each row is `<bufnr> <name>`; `<CR>` (the `nxpanels` ftplugin's
+    /// buffer-local map → `:b <n>`) re-opens the picked panel **in place**, showing its last
+    /// content (a swap within the panel window, not a regenerating command). The `[Panels]`
+    /// surface omits itself from the list.
+    pub(crate) fn ex_lspanels(&mut self) {
+        let mut lines: Vec<String> = self
+            .panel_buffers
+            .iter()
+            .filter(|(name, _)| name != "[Panels]")
+            .map(|(name, buf)| format!("{:>3} {name}", buf.0))
+            .collect();
+        if lines.is_empty() {
+            lines.push("(no panels yet)".to_string());
+        }
+        self.open_named_panel("[Panels]", lines, 0, "nxpanels", LISTING_HEIGHT);
+    }
+
+    /// `:messages` — show the message history in a read-only scratch listing,
+    /// opened scrolled to the end with the newest line selected.
     pub(crate) fn ex_messages(&mut self) {
         let lines = self.messages.clone();
         let last = lines.len().saturating_sub(1);
-        self.open_panel("Messages", lines, false, last);
+        self.open_scratch_listing("[Messages]", lines, last);
     }
 
-    /// `:registers` / `:reg` / `:display` — list the non-empty registers in the
-    /// bottom panel, mirroring vim's `Type Name Content` layout (a `c`/`l` type
+    /// `:registers` / `:reg` / `:display` — list the non-empty registers in a
+    /// read-only scratch listing, mirroring vim's `Type Name Content` layout (a `c`/`l` type
     /// column, `^J` for embedded newlines). An argument filters to the named
     /// registers (`:reg ab0`). The read-only specials `"%` / `"/` / `":` are
     /// projected from live editor state.
@@ -1328,7 +1380,7 @@ impl Editor {
                 }
             }
         }
-        self.open_panel("Registers", lines, false, 0);
+        self.open_scratch_listing("[Registers]", lines, 0);
     }
 
     /// Resolve a `:buffer` / `:bdelete` argument to a buffer id: empty = current,
@@ -1464,6 +1516,7 @@ impl Editor {
             None
         };
         self.buffers.map.remove(&target);
+        self.panel_buffers.retain(|(_, b)| *b != target);
         self.syntax_close(target);
         if self.alternate == Some(target) {
             self.alternate = None;

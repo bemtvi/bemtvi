@@ -98,10 +98,6 @@ pub use self::quickfix::{QfAction, QfEntry, QfList, QfStack, QfWhich};
 pub(crate) use self::search::{SearchDir, SearchOffset};
 pub(crate) use self::syntax::fill_indent;
 
-/// Default content height of the bottom panel, in rows (vim's quickfix
-/// default). The projection clamps it down so the text window keeps a row.
-const PANEL_HEIGHT: usize = 10;
-
 /// Cap on the retained `:messages` history. Older entries are dropped once the
 /// log exceeds this, so a long session can't grow it without bound (vim likewise
 /// caps `:messages`).
@@ -509,40 +505,6 @@ pub(crate) enum Layer {
     Dock(DockSide),
 }
 
-/// A bottom-docked, read-only, navigable panel — nxvim's home for multi-line
-/// output like `:messages` and `:ls`. It is **not** a vim window (there is
-/// still exactly one text window); it is a transient overlay that grabs focus
-/// while open and is dismissed with `q`/`Q`/`<Esc>` (or a click on its `[X]`).
-///
-/// While a panel is open, [`Editor::input`] routes every key here instead of to
-/// the buffer, so the usual vertical motions (`j`/`k`/`gg`/`G`/`<C-d>`/`<C-u>`)
-/// scroll the panel rather than the text.
-#[derive(Clone)]
-struct Panel {
-    /// Label shown in the title bar (e.g. `Messages`, `Buffers`).
-    title: String,
-    /// The full content; the visible slice is `lines[top..top + height]`.
-    lines: Vec<String>,
-    /// Cursor line within `lines`.
-    cursor: usize,
-    /// First visible line of `lines` (vertical scroll within the panel).
-    top: usize,
-    /// Requested content height; [`Editor::panel_rows`] clamps it so the text
-    /// window always keeps at least one row.
-    height: usize,
-    /// Whether `<CR>` on a line emits a select event (drained into the scripting
-    /// `on_select` callback / RPC notification). Built-in viewer panels opt out,
-    /// so a stale handler never fires on them.
-    wants_select: bool,
-    /// Per-line jump target `(path, line, col)` for a **navigable** panel (a
-    /// location list, e.g. LSP references): `<CR>` on a line with a target jumps
-    /// there via [`Editor::jump_to`] instead of firing a select event. Indexed in
-    /// lockstep with `lines`; a missing/`None` entry leaves that line
-    /// non-navigable. Empty for an ordinary panel. Because it lives in the panel,
-    /// it travels with the `:panelopen` snapshot — so a reopened list still jumps.
-    targets: Vec<Option<(PathBuf, usize, usize)>>,
-}
-
 /// A just-committed visual-mode change, captured by [`Editor::visual_operate`]
 /// for dot-repeat. `keys` is the synthesized **size-faithful** reselect-and-
 /// operate stream (`v`/`V` + motions + operator) — replaying it from any cursor
@@ -710,7 +672,7 @@ pub struct Editor {
     cmdline_prompt: String,
     /// Resolved `vim.ui.input` prompts awaiting delivery to their Lua callback:
     /// `Some(text)` on `<CR>`, `None` on `<Esc>`/cancel. The server drains this
-    /// each tick (like [`Editor::panel_selects`]) and fires the registered
+    /// each tick (like [`Editor::view_selects`]) and fires the registered
     /// callback. nxvim-native; not a neovim concept.
     pub prompt_results: Vec<Option<String>>,
     /// For an open [`CmdlineKind::Confirm`]: the lowercase accelerator key of each
@@ -777,16 +739,6 @@ pub struct Editor {
     pub message: String,
     /// History of every message shown, the backing store for `:messages`.
     pub messages: Vec<String>,
-    /// The bottom panel, when open (`:messages`, `:ls`). Grabs input focus.
-    panel: Option<Panel>,
-    /// The most recently shown panel, retained after it closes (or is replaced)
-    /// so `:panelopen` can bring it back with its content and selection intact —
-    /// e.g. reopening an LSP references list. `None` until a panel has been shown.
-    last_panel: Option<Panel>,
-    /// `<CR>` selections made in a select-enabled panel: each is `(0-based line
-    /// index, line text)`. Drained by the server to fire the `on_select`
-    /// scripting callback and the `nxvim_panel_select` RPC notification.
-    pub panel_selects: Vec<(usize, String)>,
     /// Live `nx.view` surfaces, keyed by the Lua-allocated view handle id. The
     /// value records the backing [`BufferId`] (the read-only, plugin-owned content
     /// buffer carrying `view: Some(id)`) and how the view is currently mounted, so
@@ -797,7 +749,7 @@ pub struct Editor {
     /// `<CR>` selections made on a focused `nx.view` buffer: each is `(view id,
     /// 0-based cursor line)`. Drained by the server to fire the view's Lua
     /// `on_select(line, userdata)` callback. The view analogue of
-    /// [`Editor::panel_selects`].
+    /// [`Editor::prompt_results`].
     pub view_selects: Vec<(u64, usize)>,
     /// The floating selectable-list widget, when open (`nx.ui.select`; the shared
     /// picker / completion surface). Grabs input focus like the panel, but floats
@@ -871,6 +823,26 @@ pub struct Editor {
     /// marks it read-only (`is_quickfix_buffer`) and re-rendered on list change. A
     /// window shows the quickfix list iff its buffer is this id.
     qf_bufnr: Option<BufferId>,
+    /// The **named-panel registry**: each distinct panel name (`[Messages]`,
+    /// `[Registers]`, `[Buffers]`, `[Marks]`, … and any `nx.panel.open{ name }`) → the one
+    /// `nomodifiable` display buffer reused for it. Insertion-ordered for a stable
+    /// `:lspanels` listing. Naming makes panels **unique**: re-running a command replaces
+    /// its named buffer's content ([`Editor::open_named_panel`]); navigating back to one
+    /// via `:lspanels` shows that buffer's last content. These buffers are **panel-only** —
+    /// [`Editor::is_panel_buffer`] excludes them from `:ls` / buffer navigation, and
+    /// [`Editor::switch_buffer`] reroutes any attempt to show one in a normal window into
+    /// opening it as a panel, so a panel never appears as a regular main buffer.
+    panel_buffers: Vec<(String, BufferId)>,
+    /// The open **panel**: a transient, focus-locked bottom overlay over an ordinary
+    /// `nomodifiable` buffer (the successor to the bespoke bottom panel). `Some` while a
+    /// panel is up — `messages`/`registers`/`ls`/… and scripted `nx.panel.open` all mount
+    /// through [`Editor::open_panel`]. Its presence pins focus to `window` (the
+    /// [`focus_window`](Editor::focus_window) guard refuses to leave it — vim's `<C-w>`
+    /// nav is inert) until an explicit close ([`Editor::close_panel`]), which restores the
+    /// layout and refocuses `prev_window`. Unlike the old panel this carries no content or
+    /// navigation state: the buffer *is* the content, motions navigate, and any activation
+    /// key (`<CR>`, `q`) is an ordinary buffer-local map installed by a `FileType` autocmd.
+    panel: Option<panel::PanelState>,
     /// The window focused just before `:copen`, used as the default jump target so
     /// `<CR>` in the quickfix window lands in the code window the list was opened
     /// from (vim's behavior with an empty `'switchbuf'`). Re-validated on use.
@@ -1114,7 +1086,7 @@ pub struct Editor {
     host_fs_offtick: bool,
     /// Writes deferred this tick under off-tick mode, drained by the server with
     /// [`Editor::take_pending_saves`] (the save analogue of [`Editor::prompt_results`]
-    /// / [`Editor::panel_selects`]). Always empty when off-tick mode is off.
+    /// / [`Editor::view_selects`]). Always empty when off-tick mode is off.
     pending_saves: Vec<PendingSave>,
     /// Monotonic id for the next [`PendingSave`], so the server can correlate acks and
     /// keep a buffer's overlapping writes ordered.
@@ -1326,9 +1298,6 @@ impl Editor {
             search_origin: Cursor::default(),
             message: String::new(),
             messages: Vec::new(),
-            panel: None,
-            last_panel: None,
-            panel_selects: Vec::new(),
             views: HashMap::new(),
             view_selects: Vec::new(),
             menu: None,
@@ -1346,6 +1315,8 @@ impl Editor {
             options: Options::default(),
             qf: QfStack::default(),
             qf_bufnr: None,
+            panel_buffers: Vec::new(),
+            panel: None,
             qf_prev_win: None,
             highlights: Highlights::new(),
             width: 80,
@@ -1512,15 +1483,6 @@ impl Editor {
         // until its handle closes it or a replacement, not until the next key.
         if matches!(&self.content_float, Some(f) if !f.persistent) {
             self.content_float = None;
-        }
-
-        // A focused panel grabs every key (navigation + close), bypassing the
-        // buffer's mode handling and the `curswant`/scroll bookkeeping below. Its
-        // nameable keys route through the `panel` keymap bucket (the matcher fires
-        // them as `apply_panel_action` ahead of this), so only an *unmapped* key
-        // reaches here — and the panel has no text input, so it is inert.
-        if self.panel.is_some() {
-            return;
         }
 
         // A focused menu (`nx.ui.select` / the picker) grabs every key the same

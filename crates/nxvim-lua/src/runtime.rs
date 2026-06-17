@@ -16,7 +16,7 @@ use serde::Serialize;
 use crate::convert::{json_to_lua, lua_int, lua_to_rmpv};
 use crate::host::seed_package_path;
 use crate::install::fs_stat_table;
-use crate::install::{install_runtime_api, install_vim, PANEL_ON_SELECT};
+use crate::install::{install_runtime_api, install_vim};
 use crate::ops::{
     BufOp, CallbackArgs, CompletePush, CompleteSetupReq, ConfirmReq, DecorPublish, DiagnosticData,
     DockOp, ExtmarkOp, FeedKeysOp, FsValue, GlobalOptionOp, HlSet, InlayHintMirrorData, LayerOp,
@@ -423,8 +423,6 @@ pub(crate) struct Shared {
     /// Highlight-group definitions from `nvim_set_hl`, applied to the core
     /// registry after the chunk drains (so the core stays the sole mutator).
     pub(crate) highlights: Vec<HlSet>,
-    /// Panel requests from `vim.panel.*`, applied to the core after the chunk.
-    pub(crate) panel_ops: Vec<PanelOp>,
     /// Dock requests from `nx.dock.*`, applied to the core after the chunk.
     pub(crate) dock_ops: Vec<DockOp>,
     /// Layer crosses from `nx.open` / `nx.layer.*`, applied to the core after the
@@ -433,6 +431,8 @@ pub(crate) struct Shared {
     /// `nx.view` content / mount / lifecycle requests, applied to the core after the
     /// chunk.
     pub(crate) view_ops: Vec<ViewOp>,
+    /// `nx.panel` open / close requests, applied to the core after the chunk.
+    pub(crate) panel_ops: Vec<PanelOp>,
     /// Terminal-open requests from `nx.terminal.open`, applied to the core
     /// (`Editor::open_terminal`) after the chunk.
     pub(crate) terminal_ops: Vec<TerminalOpenReq>,
@@ -547,11 +547,6 @@ pub(crate) struct Shared {
     /// drained by the server into `Editor::apply_select_action` — the rebindable
     /// `nx.ui.select` keys (next / prev / first / last / confirm / cancel).
     pub(crate) select_actions: Vec<String>,
-    /// Named `panel` actions a `panel`-bucket keymap fired (`nx._panel_action`),
-    /// drained by the server into `Editor::apply_panel_action` — the rebindable
-    /// message / quickfix panel keys (next / prev / first / last / half scroll /
-    /// confirm / close).
-    pub(crate) panel_actions: Vec<String>,
     /// Named `explorer` actions an `explorer`-bucket keymap fired
     /// (`nx._explorer_action`), drained by the server into
     /// `Editor::apply_explorer_action` — the rebindable file-explorer keys (open /
@@ -936,12 +931,6 @@ impl LuaRuntime {
     }
 
     take_queue! {
-        /// Take the panel requests queued by `vim.panel.*` since the last drain, for
-        /// the server to apply to the core (which owns the panel state).
-        take_panel_ops -> Vec<PanelOp> = panel_ops
-    }
-
-    take_queue! {
         /// Take the dock requests queued by `nx.dock.*` since the last drain, for the
         /// server to apply to the core (which owns the dock state).
         take_dock_ops -> Vec<DockOp> = dock_ops
@@ -957,6 +946,12 @@ impl LuaRuntime {
         /// Take the `nx.view` requests queued since the last drain, for the server to
         /// apply to the core's view registry.
         take_view_ops -> Vec<ViewOp> = view_ops
+    }
+
+    take_queue! {
+        /// Take the `nx.panel` open / close requests queued since the last drain, for the
+        /// server to apply to the core's panel.
+        take_panel_ops -> Vec<PanelOp> = panel_ops
     }
 
     take_queue! {
@@ -1149,12 +1144,6 @@ impl LuaRuntime {
         /// Take the named select actions fired since the last drain, for the server
         /// to apply to the open `nx.ui.select` list via `Editor::apply_select_action`.
         take_select_actions -> Vec<String> = select_actions
-    }
-
-    take_queue! {
-        /// Take the named panel actions fired since the last drain, for the server to
-        /// apply to the open panel via `Editor::apply_panel_action`.
-        take_panel_actions -> Vec<String> = panel_actions
     }
 
     take_queue! {
@@ -1604,18 +1593,6 @@ impl LuaRuntime {
         let nx = self.nx()?;
         let set: mlua::Function = nx.get("_set_proc_pid")?;
         set.call((id, pid))
-    }
-
-    /// Fire the panel's `on_select` callback for the line at `index` (0-based,
-    /// passed to Lua 1-based) with text `line`. A no-op when no callback is
-    /// registered. Errors (a throwing handler) are returned for the server to
-    /// surface. Called when the user hits `<CR>` on a select-enabled panel.
-    pub fn run_panel_select(&self, index: usize, line: &str) -> mlua::Result<()> {
-        let cb: Option<mlua::Function> = self.lua.named_registry_value(PANEL_ON_SELECT)?;
-        if let Some(f) = cb {
-            f.call::<()>((line.to_string(), index as i64 + 1))?;
-        }
-        Ok(())
     }
 
     /// Install view buffer `bufnr`'s buffer-local default activation map (`<CR>` →

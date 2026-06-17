@@ -80,7 +80,7 @@ impl Editor {
         self.ensure_visible();
     }
 
-    /// `:changes` — list the current buffer's change list into the bottom panel,
+    /// `:changes` — list the current buffer's change list into a read-only scratch listing,
     /// mirroring vim's `change line  col text` table. Entries run oldest-first; the
     /// `change` column is the count of `g;` (above the marker) / `g,` (below) presses
     /// to reach that row, and `>` marks the current position.
@@ -107,6 +107,6 @@ impl Editor {
         if idx >= entries.len() {
             lines.push(">".to_string());
         }
-        self.open_panel("Changes", lines, false, 0);
+        self.open_scratch_listing("[Changes]", lines, 0);
     }
 }

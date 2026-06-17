@@ -496,6 +496,7 @@ impl Editor {
             // (autoread) or warns (W11/W12/E211) on an external change.
             "checkt" | "checkti" | "checktim" | "checktime" => self.checktime(args),
             "ls" | "buffers" | "files" => self.ex_buffers(),
+            "lspanels" | "panels" => self.ex_lspanels(),
             "b" | "bu" | "buf" | "buffer" => {
                 if let Some(id) = self.resolve_buffer(args) {
                     self.switch_buffer(id);
@@ -662,11 +663,6 @@ impl Editor {
             "marks" => self.ex_marks(args),
             "ju" | "jum" | "jump" | "jumps" => self.ex_jumps(args),
             "changes" => self.ex_changes(args),
-            "panelopen" | "panelo" => {
-                if !self.reopen_last_panel() {
-                    self.echo("No panel to reopen");
-                }
-            }
             // `:setlocal`/`:setl` shares the handler: buffer-local options
             // (tabstop/shiftwidth/expandtab) live on the current buffer, which is
             // exactly what `:set` already targets for them.

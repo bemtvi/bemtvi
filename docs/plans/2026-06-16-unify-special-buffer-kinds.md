@@ -252,15 +252,17 @@ for itself, fold the four `Buffer` fields into one then — as a trailing, optio
 purely-mechanical tidy, not a goal."* After Phases 1–2 it did pay for itself (`read_only`
 and the constructors all wanted the discriminant), so it landed.
 
-## Later / separate — the bottom panel
+## Later / separate — the bottom panel — **DONE** (2026-06-17)
 
-The panel is a grabbing overlay with its own `PanelView` chrome, word-wrap
-(`panel.rs:16`), and title strip — not a buffer-in-a-window. The quickfix model *does*
-extend to it (a `nomodifiable` buffer in the bottom dock, `<CR>` special-cased,
-selection via the existing `jump_to` / `on_select`), retiring the whole `Panel` /
-`PanelView` / `'L'`-bucket stack. But it carries real UX-parity work (wrap, the
-open-on-last-line semantics, the hidden-dock chip rendering in `redraw.rs:267`), so it
-is **its own plan** — `docs/plans/<date>-panel-as-view.md` — not a tail of this one.
+Landed as its own plan: **[2026-06-17-panel-as-loclist-and-scratch.md](2026-06-17-panel-as-loclist-and-scratch.md)**.
+The panel was a grabbing overlay with its own `PanelView` chrome, word-wrap, and title
+strip — not a buffer-in-a-window. Rather than reproduce it as one bespoke "panel buffer",
+it was **dissolved into the two general mechanisms** the editor already had: read-only
+scratch buffers (a new `'modifiable'` option) for the text listings (`:messages` / `:ls`
+/ `:registers` / `:marks` / `:jumps` / `:changes` / LSP info), and real **location lists**
+for the navigable LSP reference / diagnostic lists. Code actions moved to `nx.ui.select`.
+The whole `Panel` / `PanelView` / `'L'`-bucket / `vim.panel.*` / `nxvim_panel_*` stack is
+**deleted**; word-wrap was dropped (a buffer-wide gap to implement once, for all buffers).
 
 ## Out of scope
 

@@ -443,55 +443,8 @@ pub async fn latest_after(
     drain_latest(rpc, incoming).await
 }
 
-/// The `panel` sub-map from a redraw, or `None` when no panel is open.
-pub fn panel(map: &[(Value, Value)]) -> Option<&Vec<(Value, Value)>> {
-    match field(map, "panel") {
-        Some(Value::Map(m)) => Some(m),
-        _ => None,
-    }
-}
-
-/// The panel's content lines (empty when no panel is open).
-pub fn panel_lines(map: &[(Value, Value)]) -> Vec<String> {
-    panel(map)
-        .and_then(|m| {
-            m.iter()
-                .find(|(k, _)| k.as_str() == Some("lines"))
-                .and_then(|(_, v)| v.as_array())
-        })
-        .map(|a| {
-            a.iter()
-                .filter_map(|v| v.as_str().map(String::from))
-                .collect()
-        })
-        .unwrap_or_default()
-}
-
-/// A field of the panel sub-map by key, as a u64 (`cursor_row`, `height`).
-pub fn panel_u64(map: &[(Value, Value)], key: &str) -> u64 {
-    panel(map)
-        .and_then(|m| {
-            m.iter()
-                .find(|(k, _)| k.as_str() == Some(key))
-                .and_then(|(_, v)| v.as_u64())
-        })
-        .unwrap_or(0)
-}
-
-/// The panel's title (empty when no panel is open).
-pub fn panel_title(map: &[(Value, Value)]) -> String {
-    panel(map)
-        .and_then(|m| {
-            m.iter()
-                .find(|(k, _)| k.as_str() == Some("title"))
-                .and_then(|(_, v)| v.as_str())
-        })
-        .unwrap_or("")
-        .to_string()
-}
-
-/// Barrier, then return the params of the most recent `want` notification (e.g.
-/// `nxvim_panel_select`) buffered on the connection, or `None` if none arrived.
+/// Barrier, then return the params of the most recent `want` notification
+/// buffered on the connection, or `None` if none arrived.
 pub async fn drain_notify(
     rpc: &Rpc,
     incoming: &mut UnboundedReceiver<Incoming>,

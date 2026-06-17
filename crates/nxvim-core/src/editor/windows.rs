@@ -1693,6 +1693,14 @@ impl Editor {
     /// instead (the editor can't be left showing only floats); with none open it
     /// refuses (vim's `E444`). The quit-when-last semantics belong to `:q`.
     pub(crate) fn close_window(&mut self) {
+        // Closing the panel window (`:q` / `:close` / `<C-w>c` / `<C-w>q` all land here)
+        // is a panel dismissal: route to `close_panel` so it clears the focus lock,
+        // collapses the overlay, and restores focus — a bare `remove_window` would leave
+        // `Editor::panel` dangling at a closed window id.
+        if self.panel_window() == Some(self.windows.current) {
+            self.close_panel();
+            return;
+        }
         let cur = self.windows.current;
         if !self.remove_window(cur) {
             self.echo("E444: Cannot close last window");
@@ -2045,6 +2053,15 @@ impl Editor {
         if id == self.windows.current || !self.windows.windows.contains_key(&id) {
             return;
         }
+        // The panel's hard focus lock: while a panel is open, focus is pinned to its
+        // window. Every focus change funnels through here (`<C-w>w`/`W` cycle, `<C-w>hjkl`
+        // directional, `set_current_window` / `nvim_set_current_win`, mouse focus), so this
+        // one guard makes them all inert. Opening is unaffected (the panel field is still
+        // `None` when `open_bottom_window` focuses the new window); `close_panel` clears the
+        // field before restoring focus, so dismissal is permitted.
+        if self.panel_window().is_some_and(|w| w != id) {
+            return;
+        }
         // Stash the outgoing window's secondary multi-cursors before reading its
         // primary position — finalizing placement (see `stash_secondary_cursors`)
         // may snap the primary onto a placed cursor.
@@ -2274,7 +2291,7 @@ impl Editor {
         } else {
             (0, 0)
         };
-        let chrome = self.tabline_rows() + self.panel_rows() + self.global_statusline_rows();
+        let chrome = self.tabline_rows() + self.global_statusline_rows();
         // The middle band (left dock | main | right docks) height, and the main
         // tree's width — what's left after the docks and the global chrome.
         let mid_h = self
@@ -2375,7 +2392,7 @@ impl Editor {
         }
         // Vertical: top + bottom reservations plus the global chrome must leave ≥1
         // row for main.
-        let chrome = self.tabline_rows() + self.panel_rows() + self.global_statusline_rows();
+        let chrome = self.tabline_rows() + self.global_statusline_rows();
         let (mut top, mut bottom) = (raw(DockSide::Top), raw(DockSide::Bottom));
         while reserved(top) + reserved(bottom) + chrome >= self.height && (top > 0 || bottom > 0) {
             if bottom >= top {

@@ -4,8 +4,6 @@
 
 #[cfg(feature = "native")]
 use crate::evloop::{LoopCommand, LoopEvent};
-#[cfg(feature = "native")]
-use crate::lsp::CODE_ACTION_PANEL_TITLE;
 use crate::{EditHost, WindowStatusline};
 use nxvim_core::highlight::HlDef;
 use nxvim_core::{
@@ -289,13 +287,6 @@ impl EditHost {
                 self.editor.echo(format!("E5108: {e}"));
             }
         }
-        // Panel actions a `panel`-bucket keymap fired (`nx._panel_action`): apply each
-        // to the open message / quickfix panel. Unknown names fail loud.
-        for action in self.lua.take_panel_actions() {
-            if let Err(e) = self.editor.apply_panel_action(&action) {
-                self.editor.echo(format!("E5108: {e}"));
-            }
-        }
         // Explorer actions a `FileType nxdir` buffer-local keymap fired
         // (`nx._explorer_action`): apply each to the file-explorer listing (`<CR>`
         // open / `-` up). Unknown names fail loud.
@@ -325,23 +316,6 @@ impl EditHost {
         for action in self.lua.take_cmdline_actions() {
             if let Err(e) = self.editor.apply_cmdline_action(&action) {
                 self.editor.echo(format!("E5108: {e}"));
-            }
-        }
-        // Panel requests from `vim.panel.*` drive the core's panel state.
-        for op in self.lua.take_panel_ops() {
-            match op {
-                PanelOp::Open {
-                    title,
-                    lines,
-                    wants_select,
-                    cursor,
-                } => {
-                    self.editor.open_panel(title, lines, wants_select, cursor);
-                }
-                PanelOp::SetLines(lines) => self.editor.set_panel_lines(lines),
-                PanelOp::OnSelect(wants) => self.editor.set_panel_on_select(wants),
-                PanelOp::SetCursor(line) => self.editor.set_panel_cursor(line),
-                PanelOp::Close => self.editor.close_panel(),
             }
         }
         // Dock requests from `nx.dock.*` drive the core's dock (edge-panel) state.
@@ -396,6 +370,23 @@ impl EditHost {
                 ViewOp::Unmount { id } => self.editor.unmount_view(id),
                 ViewOp::Focus { id } => self.editor.focus_view(id),
                 ViewOp::Destroy { id } => self.editor.destroy_view(id),
+            }
+        }
+        // `nx.panel` open / close — mount a scripted panel (a `nomodifiable` buffer in a
+        // focus-locked bottom overlay) or dismiss the open one. Behavior inside it rides
+        // the buffer's `FileType` ftplugin, so nothing else crosses the bridge.
+        for op in self.lua.take_panel_ops() {
+            match op {
+                PanelOp::Open {
+                    name,
+                    lines,
+                    filetype,
+                    height,
+                } => {
+                    self.editor
+                        .open_script_panel(name, lines, filetype, height.map(|h| h as usize))
+                }
+                PanelOp::Close => self.editor.close_panel(),
             }
         }
         // Layer crosses from `nx.open` / `nx.layer.*` drive the core's layer machine
@@ -2261,36 +2252,6 @@ impl EditHost {
             for cmd in std::mem::take(&mut self.editor.deferred_commands) {
                 self.resolve_command(&cmd);
             }
-            // `<CR>` selections on a select-enabled panel: notify RPC clients and
-            // fire the Lua `on_select` callback. The callback may itself queue
-            // commands / lua / panel ops, so this is inside the fixpoint loop.
-            for (index, line) in std::mem::take(&mut self.editor.panel_selects) {
-                // The `:LspCodeAction` list (Phase 6) is a select-enabled panel:
-                // a `<CR>` on row `index` applies that action's edit, keyed to the
-                // currently-open code-action panel by title so a select on some
-                // *other* select panel can't misroute here. (Native only — the
-                // browser build has no code actions.)
-                #[cfg(feature = "native")]
-                if self.editor.panel_title() == Some(CODE_ACTION_PANEL_TITLE) {
-                    self.apply_code_action(index);
-                    continue;
-                }
-                // Navigable LSP location lists (diagnostics, references) jump in
-                // the core itself when their target line is selected, so they
-                // never reach here — only scripted/RPC select panels do.
-                self.fx.notify(
-                    "nxvim_panel_select",
-                    vec![Value::Map(vec![
-                        (Value::from("index"), Value::from(index as u64 + 1)),
-                        (Value::from("line"), Value::from(line.as_str())),
-                    ])],
-                );
-                if let Err(e) = self.lua.run_panel_select(index, &line) {
-                    self.editor
-                        .echo(format!("E5108: Error in panel on_select: {e}"));
-                }
-                self.apply_lua_effects();
-            }
             // `<CR>` selections on a focused `nx.view` buffer: fire the view's Lua
             // `on_select(line, userdata)` handler. The callback may itself queue lua /
             // view ops (a file tree expanding a node, opening a file), so this is
@@ -2434,6 +2395,17 @@ impl EditHost {
             // picker); a `nx.ui.select` routes to its pending callback. One widget
             // is open at a time, so the two are mutually exclusive.
             for result in std::mem::take(&mut self.editor.menu_results) {
+                // The LSP code-action chooser is a native select menu: confirming a
+                // row applies that action (neovim's `vim.ui.select` model), cancel is
+                // a no-op. Checked first so it can't be misrouted to a Lua callback.
+                #[cfg(feature = "native")]
+                if std::mem::take(&mut self.pending_code_action) {
+                    if let Some(idx) = result {
+                        self.apply_code_action(idx);
+                    }
+                    self.apply_lua_effects();
+                    continue;
+                }
                 if let Some(id) = self.pending_ui_select.take() {
                     if let Err(e) = self.lua.run_ui_select(id, result) {
                         self.editor
@@ -2463,7 +2435,6 @@ impl EditHost {
             }
             if self.editor.lua_queue.is_empty()
                 && self.editor.deferred_commands.is_empty()
-                && self.editor.panel_selects.is_empty()
                 && self.editor.view_selects.is_empty()
                 && self.editor.prompt_results.is_empty()
                 && self.editor.menu_results.is_empty()
@@ -2480,7 +2451,6 @@ impl EditHost {
                 // forever. The editor stays responsive to the next message.
                 self.editor.lua_queue.clear();
                 self.editor.deferred_commands.clear();
-                self.editor.panel_selects.clear();
                 self.editor.view_selects.clear();
                 self.editor.prompt_results.clear();
                 self.editor.menu_results.clear();

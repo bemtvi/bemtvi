@@ -114,35 +114,35 @@ async fn paste_from_the_filename_register() {
 
 #[tokio::test]
 async fn registers_command_lists_populated_registers() {
-    let (rpc, mut incoming) = start(None).await;
+    let (rpc, _incoming) = start(None).await;
     feed(&rpc, "ialpha<Esc>");
     feed(&rpc, "\"ayy");
-    let map = latest_after(&rpc, &mut incoming, ":registers<CR>").await;
+    // `:registers` opens a read-only scratch listing in the focused bottom window.
+    feed(&rpc, ":registers<CR>");
 
-    assert_eq!(panel_title(&map), "Registers");
-    let lines = panel_lines(&map);
-    assert_eq!(lines.first().map(String::as_str), Some("Type Name Content"));
+    let shown = lines(&rpc).await;
+    assert_eq!(shown.first().map(String::as_str), Some("Type Name Content"));
     // The linewise yank into `a` shows the `l` type and a trailing `^J`.
     assert!(
-        lines
+        shown
             .iter()
             .any(|l| l.contains("\"a") && l.contains("alpha^J")),
-        "registers were: {lines:?}"
+        "registers were: {shown:?}"
     );
 }
 
 #[tokio::test]
 async fn registers_command_filters_by_argument() {
-    let (rpc, mut incoming) = start(None).await;
+    let (rpc, _incoming) = start(None).await;
     feed(&rpc, "ialpha<Esc>");
     feed(&rpc, "\"ayy\"byy");
-    let map = latest_after(&rpc, &mut incoming, ":reg a<CR>").await;
+    feed(&rpc, ":reg a<CR>");
 
-    let lines = panel_lines(&map);
-    assert!(lines.iter().any(|l| l.contains("\"a")), "want a: {lines:?}");
+    let shown = lines(&rpc).await;
+    assert!(shown.iter().any(|l| l.contains("\"a")), "want a: {shown:?}");
     assert!(
-        !lines.iter().any(|l| l.contains("\"b")),
-        "b should be filtered out: {lines:?}"
+        !shown.iter().any(|l| l.contains("\"b")),
+        "b should be filtered out: {shown:?}"
     );
 }
 

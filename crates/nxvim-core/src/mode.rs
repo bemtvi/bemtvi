@@ -30,9 +30,10 @@ pub enum Mode {
 /// `Editing` context uses the per-mode trie with the command-grammar disambiguation
 /// oracle and the literal-argument bypass; a widget context uses that widget's
 /// dedicated bucket (`vim.keymap.set('picker', …)`) with neither (a widget has no
-/// core command grammar). Each grabbing widget — picker, select, panel — has its own
+/// core command grammar). Each grabbing widget — picker, select — has its own
 /// context variant below; the cmdline routes through the `'c'` mode bucket instead.
-/// The explorer / `nx.view` / quickfix buffers are *not* widgets (they are ordinary
+/// The explorer / `nx.view` / quickfix buffers, and the read-only scratch / loclist
+/// listings (`:messages` / `:ls` / `:marks` / …), are *not* widgets (they are ordinary
 /// `nomodifiable` buffers with buffer-local activation maps), so they stay `Editing`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum KeyContext {
@@ -43,9 +44,6 @@ pub enum KeyContext {
     /// A promptless selectable list (`nx.ui.select`) grabs input; its `select`
     /// bucket applies. No query — every key is a map (an unmapped key is inert).
     Select,
-    /// The bottom message / quickfix / location panel grabs input; its `panel`
-    /// bucket applies. No query — every key is a map (an unmapped key is inert).
-    Panel,
 }
 
 impl Mode {

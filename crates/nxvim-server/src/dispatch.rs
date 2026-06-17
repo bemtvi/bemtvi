@@ -132,6 +132,12 @@ impl EditHost {
                 self.input_flush();
                 Ok(Value::Nil)
             }
+            "nxvim_panel_is_open" => {
+                // Whether a focus-locked bottom panel (`:messages` / `:ls` / a scripted
+                // `nx.panel.open`) is currently up. Read-only — clients use it for chrome,
+                // tests as the open/closed oracle.
+                Ok(Value::from(self.editor.panel_is_open()))
+            }
             "nvim_command" => {
                 let cmd = text(params.first());
                 self.run_command(&cmd);
@@ -455,52 +461,6 @@ impl EditHost {
                 // [channel_id, metadata]; metadata kept minimal for now.
                 Ok(Value::Array(vec![Value::from(1u64), Value::Map(vec![])]))
             }
-            // ----- the bottom message panel (nxvim-native) -----------------
-            "nxvim_panel_open" => {
-                // (title, lines, want_select?, cursor?): open (or replace) and
-                // focus the panel. `want_select` (default false) makes `<CR>`
-                // emit an `nxvim_panel_select` notification for the client to act
-                // on. `cursor` (default 0) is the initially selected line
-                // (0-based); the panel scrolls to keep it visible.
-                let title = text(params.first());
-                let lines = str_array(params.get(1));
-                let want_select = flag(params.get(2), false);
-                let cursor = params.get(3).and_then(Value::as_u64).unwrap_or(0) as usize;
-                self.editor.open_panel(title, lines, want_select, cursor);
-                Ok(Value::Nil)
-            }
-            "nxvim_panel_set_lines" => {
-                // (lines): replace the open panel's content (no-op if none open).
-                let lines = str_array(params.first());
-                self.editor.set_panel_lines(lines);
-                Ok(Value::Nil)
-            }
-            "nxvim_panel_set_select" => {
-                // (bool): toggle `<CR>` select events on the open panel.
-                let want = flag(params.first(), false);
-                self.editor.set_panel_on_select(want);
-                Ok(Value::Nil)
-            }
-            "nxvim_panel_set_cursor" => {
-                // (line): move the open panel's selection (0-based) and scroll it
-                // into view (no-op if none open).
-                let line = params.first().and_then(Value::as_u64).unwrap_or(0) as usize;
-                self.editor.set_panel_cursor(line);
-                Ok(Value::Nil)
-            }
-            "nxvim_panel_close" => {
-                self.editor.close_panel();
-                Ok(Value::Nil)
-            }
-            "nxvim_panel_is_open" => Ok(Value::from(self.editor.panel_is_open())),
-            "nxvim_panel_click" => {
-                // (row): move the panel selection to the logical entry at visible
-                // display `row` — the mouse-click counterpart to j/k. The client
-                // sends <CR> itself to activate an already-selected row.
-                let row = params.first().and_then(Value::as_u64).unwrap_or(0) as usize;
-                self.editor.set_panel_cursor_by_row(row);
-                Ok(Value::Nil)
-            }
             // ----- the unified completion popup (mouse routing) -------------
             "nxvim_complete_select" => {
                 // (index): highlight a visible completion item by absolute index
@@ -765,16 +725,4 @@ fn parse_title(v: Option<&Value>) -> Option<String> {
         _ => return None,
     };
     (!title.is_empty()).then_some(title)
-}
-
-/// Read an RPC array-of-strings argument (the panel methods' `lines`). Non-array
-/// values and non-string elements are dropped, yielding an empty list.
-fn str_array(v: Option<&Value>) -> Vec<String> {
-    v.and_then(Value::as_array)
-        .map(|a| {
-            a.iter()
-                .filter_map(|s| s.as_str().map(String::from))
-                .collect()
-        })
-        .unwrap_or_default()
 }

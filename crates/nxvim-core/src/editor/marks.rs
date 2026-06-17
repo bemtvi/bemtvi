@@ -230,7 +230,7 @@ impl Editor {
         self.ensure_visible();
     }
 
-    /// `:marks [names]` — list the set marks into the bottom panel, mirroring vim's
+    /// `:marks [names]` — list the set marks into a read-only scratch listing, mirroring vim's
     /// `mark line col file/text` table. Order: the automatic specials, then the
     /// buffer-local `a`–`z`, then the global `A`–`Z`. An argument filters to the
     /// named marks (`:marks aB`). A buffer-local row shows its line's text; a global
@@ -288,7 +288,7 @@ impl Editor {
                 ));
             }
         }
-        self.open_panel("Marks", lines, false, 0);
+        self.open_scratch_listing("[Marks]", lines, 0);
     }
 }
 

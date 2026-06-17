@@ -152,7 +152,10 @@ impl Editor {
         // chokepoints, not the input router, so without it a `:d` would corrupt the
         // content even for a kind whose interactive keys are routed away. These
         // windows otherwise behave normally (motions, search, `<C-w>`, `:` all work).
-        !self.buffer().read_only() && !self.is_quickfix_buffer()
+        // The `'modifiable'` option is the third gate: an *ordinary* buffer the user (or
+        // a built-in read-only scratch listing — `:messages`, `:registers`, …) flipped
+        // `nomodifiable`, vim's plain per-buffer edit lock.
+        !self.buffer().read_only() && !self.is_quickfix_buffer() && self.buffer().options.modifiable
     }
 
     /// Echo vim's `E21` when an edit is refused on a read-only (live terminal) buffer.

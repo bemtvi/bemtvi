@@ -1,0 +1,15 @@
+Press <leader>p to open the fruit panel below.
+
+Inside the panel:
+  j / k    move the cursor (ordinary motions)
+  <CR>     choose the line under the cursor, then dismiss
+  q / <Esc>  dismiss without choosing
+
+The panel grabs focus while open — <C-w>w can't leave it.
+
+The built-in listings use the same overlay. Try:
+  :messages
+  :ls
+  :registers
+  :marks
+…and dismiss each with q.

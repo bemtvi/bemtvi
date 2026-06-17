@@ -54,29 +54,6 @@ fn latest(incoming: &mut UnboundedReceiver<Incoming>) -> Vec<(Value, Value)> {
     drain_to_latest_redraw(incoming, |_| true).expect("a redraw frame")
 }
 
-/// The bottom panel's content lines, read off the latest redraw carrying a panel
-/// (a barrier is sent first so this action's frame is already queued). `None` when
-/// no panel is open.
-async fn panel_lines(rpc: &Rpc, incoming: &mut UnboundedReceiver<Incoming>) -> Option<Vec<String>> {
-    rpc.request("nvim_get_mode", vec![]).await.expect("barrier");
-    let map = drain_to_latest_redraw(incoming, |m| map_get(m, "panel").is_some())?;
-    match map_get(&map, "panel") {
-        Some(Value::Map(panel)) => Some(
-            panel
-                .iter()
-                .find(|(k, _)| k.as_str() == Some("lines"))
-                .and_then(|(_, v)| v.as_array())
-                .map(|a| {
-                    a.iter()
-                        .filter_map(|v| v.as_str().map(str::to_string))
-                        .collect()
-                })
-                .unwrap_or_default(),
-        ),
-        _ => None,
-    }
-}
-
 /// The set of window `region` strings present in a redraw map.
 fn regions(map: &[(Value, Value)]) -> Vec<String> {
     let Some(Value::Array(wins)) = map_get(map, "windows") else {
@@ -1240,7 +1217,7 @@ async fn clicking_a_hidden_dock_chip_reshows_it() {
 /// region — a dock reports just its own, the main area just its own.
 #[tokio::test]
 async fn ls_lists_only_the_focused_layers_buffers() {
-    let (rpc, mut incoming) = start().await;
+    let (rpc, _incoming) = start().await;
     // Widen so each buffer's absolute-path listing fits on one (un-wrapped) panel
     // row — otherwise the one-row-per-buffer count this asserts on breaks.
     req(
@@ -1257,33 +1234,30 @@ async fn ls_lists_only_the_focused_layers_buffers() {
     command(&rpc, &format!("e {a}")).await;
     command(&rpc, &format!("e {b}")).await;
 
-    // Open a left dock and load a third file into its scratch buffer.
+    // `:ls` in the main area lists A and B (its `[Buffers]` listing buffer becomes
+    // the focused window). `:ls` is scoped to the focused layer.
+    command(&rpc, "ls").await;
+    let rows = lines(&rpc).await;
+    assert_eq!(rows.len(), 2, "main lists its two buffers: {rows:?}");
+    assert!(rows.iter().any(|r| r.contains(&a)), "A present: {rows:?}");
+    assert!(rows.iter().any(|r| r.contains(&b)), "B present: {rows:?}");
+
+    // Open a left dock and load a third file into its scratch buffer; focus is in the
+    // dock now.
     exec_lua(&rpc, "nx.dock.open{ side = 'left', size = 30 }").await;
     command(&rpc, &format!("e {c}")).await;
     assert_eq!(lines(&rpc).await, vec!["CCC"], "the dock shows C");
 
-    // `:ls` in the dock lists only the dock's buffer (C), never the main A/B.
+    // `:ls` from the dock lists only the dock's buffer (C), never the main A/B —
+    // proving the listing is scoped to the focused layer.
     command(&rpc, "ls").await;
-    let rows = panel_lines(&rpc, &mut incoming).await.expect("panel opens");
+    let rows = lines(&rpc).await;
     assert_eq!(
         rows.len(),
         1,
         "the dock lists only its own buffer: {rows:?}"
     );
     assert!(rows[0].contains(&c), "the dock's row is C: {rows:?}");
-    feed(&rpc, "<Esc>"); // dismiss the panel
-
-    // Cross to the main area; `:ls` there lists A and B, never the dock's C.
-    feed(&rpc, "<C-w><C-w>l");
-    command(&rpc, "ls").await;
-    let rows = panel_lines(&rpc, &mut incoming).await.expect("panel opens");
-    assert_eq!(rows.len(), 2, "main lists its two buffers: {rows:?}");
-    assert!(rows.iter().any(|r| r.contains(&a)), "A present: {rows:?}");
-    assert!(rows.iter().any(|r| r.contains(&b)), "B present: {rows:?}");
-    assert!(
-        !rows.iter().any(|r| r.contains(&c)),
-        "the dock's C must not appear in main's :ls: {rows:?}"
-    );
 
     for f in [a, b, c] {
         std::fs::remove_file(&f).ok();

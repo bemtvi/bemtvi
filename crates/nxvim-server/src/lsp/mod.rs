@@ -35,13 +35,6 @@ mod request;
 mod semantic;
 mod sync;
 
-/// One per-line jump target for a navigable LSP panel (diagnostics, references,
-/// …), handed to [`nxvim_core::Editor::set_panel_targets`]: `Some((path, 0-based
-/// line, 0-based **byte** column))` — the LSP character already converted through
-/// the negotiated encoding — or `None` for a non-navigable line. Indexed in
-/// lockstep with the panel's lines, and retained in the `:panelopen` snapshot.
-pub(crate) type PanelTarget = Option<(PathBuf, usize, usize)>;
-
 /// Per-buffer LSP document-sync bookkeeping, mirroring `SyntaxState`. One per
 /// open buffer that mapped to a configured server, keyed by [`BufferId`] in
 /// [`EditHost::lsp_states`].
@@ -337,11 +330,6 @@ pub(crate) fn encoding_label(encoding: PositionEncoding) -> &'static str {
         PositionEncoding::Utf32 => "utf-32",
     }
 }
-
-/// The panel title for the `:LspCodeAction` list. The server recognizes a panel
-/// select by this title to route it to [`EditHost::apply_code_action`] instead of
-/// the generic scripting `on_select` path.
-pub(crate) const CODE_ACTION_PANEL_TITLE: &str = "LSP code actions";
 
 /// Convert an LSP [`Range`] (in `encoding`) to an absolute byte range in
 /// `buffer`, resolving each endpoint against its line — the buffer-addressed form

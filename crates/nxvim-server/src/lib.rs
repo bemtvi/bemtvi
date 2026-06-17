@@ -632,6 +632,13 @@ pub struct EditHost {
     /// this is set, and to `pending_ui_select` (`run_ui_select`) otherwise — only
     /// one float-list widget is open at a time, so the two are mutually exclusive.
     picker_active: bool,
+    /// Whether the open select menu is the LSP **code-action** chooser (`:LspCodeAction`
+    /// / `vim.lsp.buf.code_action`). Set when `show_code_actions` opens the menu; taken
+    /// when it confirms / cancels, routing the chosen index to `apply_code_action`
+    /// (neovim's `vim.ui.select` model — the successor to the retired code-action panel).
+    /// Mutually exclusive with `pending_ui_select` / `picker_active`: one widget at a time.
+    #[cfg(feature = "native")]
+    pending_code_action: bool,
     /// The picker preview pane's read cache (Phase 3): the file last read for the
     /// preview, so moving the selection within the results — or simply re-projecting
     /// every frame — re-reads only when the selected row's target *path* changes.
@@ -806,6 +813,8 @@ impl EditHost {
             hl_mirror_gen: None,
             pending_ui_input: None,
             pending_ui_select: None,
+            #[cfg(feature = "native")]
+            pending_code_action: false,
             picker_active: false,
             preview_cache: redraw::PreviewCache::default(),
             preview_scroll: 0,

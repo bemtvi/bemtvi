@@ -65,20 +65,17 @@ impl EditHost {
             }
             // `:pw[d]` — print the working directory on the message line.
             _ if matches!(base, "pw" | "pwd") => self.ex_pwd(),
-            // Phase-1 LSP observability: dump server/document state into the panel.
+            // Phase-1 LSP observability: dump server/document state into a listing.
             #[cfg(feature = "native")]
             "LspInfo" => {
                 let lines = self.lsp_info_lines();
-                self.editor.open_panel("LSP info", lines, false, 0);
+                self.editor.open_scratch_listing("[LSP info]", lines, 0);
             }
             // Phase-2: list the current buffer's diagnostics as a navigable
             // location list; `<CR>` on a row jumps to it (handled in the core).
             #[cfg(feature = "native")]
             "LspDiagnostics" => match self.diagnostics_location_list() {
-                Some((lines, targets)) => {
-                    self.editor.open_panel("LSP diagnostics", lines, false, 0);
-                    self.editor.set_panel_targets(targets);
-                }
+                Some(entries) => self.editor.open_location_list(entries, "LSP diagnostics"),
                 None => self.editor.echo("No diagnostics"),
             },
             // Phase-3: go-to / references as ex-commands (the keymap-free path;
@@ -168,7 +165,8 @@ impl EditHost {
                 Ok(out) if out.is_empty() => {}
                 Ok(out) if out.contains('\n') => {
                     let lines = out.lines().map(str::to_string).collect();
-                    self.editor.open_panel("User commands", lines, false, 0);
+                    self.editor
+                        .open_scratch_listing("[User commands]", lines, 0);
                 }
                 Ok(out) => self.editor.echo(out),
                 Err(e) => self.editor.echo(format!("E5108: Error in :command: {e}")),
@@ -407,7 +405,8 @@ impl EditHost {
                 lines.push(lang.clone());
             }
         }
-        self.editor.open_panel("TSInstall info", lines, false, 0);
+        self.editor
+            .open_scratch_listing("[TSInstall info]", lines, 0);
     }
 
     /// `:TSInstallInfo` — open a panel listing every parser installed across the
@@ -436,7 +435,8 @@ impl EditHost {
                 lines.push(format!("{:<14} {}", "", p.root.display()));
             }
         }
-        self.editor.open_panel("TSInstall info", lines, false, 0);
+        self.editor
+            .open_scratch_listing("[TSInstall info]", lines, 0);
     }
 
     /// Apply a finished `:TSInstall` job: on success, reload the grammar so every
@@ -556,15 +556,15 @@ impl EditHost {
     }
 
     /// Surface the text a `nx._ex_*` autocmd driver returned: empty is nothing,
-    /// a multi-line listing opens a panel (like `:LspInfo`), and a single line is
-    /// echoed (a message or an `E…` error).
+    /// a multi-line listing opens a read-only scratch buffer (like `:LspInfo`), and a
+    /// single line is echoed (a message or an `E…` error).
     fn surface_autocmd_output(&mut self, title: &str, out: &str) {
         if out.is_empty() {
             return;
         }
         if out.contains('\n') {
             let lines = out.lines().map(str::to_string).collect();
-            self.editor.open_panel(title, lines, false, 0);
+            self.editor.open_scratch_listing(title, lines, 0);
         } else {
             self.editor.echo(out);
         }

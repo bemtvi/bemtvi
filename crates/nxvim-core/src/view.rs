@@ -134,32 +134,6 @@ impl RenderRow {
     }
 }
 
-/// The renderable form of the bottom [`Panel`](crate::editor): a title, the
-/// visible slice of its content, the cursor's row within that slice, and the
-/// content height the client lays the panel out to. `None` in [`View::panel`]
-/// when no panel is open.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PanelView {
-    /// Label shown in the panel's title bar (e.g. `Messages`, `Buffers`).
-    pub title: String,
-    /// The visible content rows (already scrolled and **word-wrapped** to the
-    /// panel width); never longer than `height`. The client pads shorter content
-    /// with blank rows. A long logical entry occupies several consecutive rows.
-    pub lines: Vec<String>,
-    /// First display row (within the visible slice) of the selected logical
-    /// entry. The client places the editing cursor here.
-    pub cursor_row: usize,
-    /// Number of consecutive display rows the selected entry occupies in the
-    /// visible slice (≥ 1 — more than one when the entry wrapped). The client
-    /// highlights `cursor_row .. cursor_row + cursor_span` as the focused line, so
-    /// the whole wrapped entry reads as selected.
-    pub cursor_span: usize,
-    /// Content height in rows (excludes the title row). The client lays the
-    /// whole panel out as `height + 1` rows; the editor sized it so the text
-    /// window keeps at least one row.
-    pub height: usize,
-}
-
 /// The renderable form of the list-less **content float** (`nx.ui.float`; the LSP
 /// hover / signature-help surface) — the sibling of [`MenuView`] with no list and
 /// no selection, just content lines, an optional title, a border, and where it
@@ -559,11 +533,6 @@ pub struct View {
     pub cmdline_cursor: usize,
     /// Transient status message (shown on the command line when not typing one).
     pub message: String,
-    /// The bottom panel (`:messages`, `:ls`), or `None` when none is open. When
-    /// present it has input focus, so the client draws the editing cursor inside
-    /// the panel rather than the text window. Global — one per editor, below all
-    /// windows.
-    pub panel: Option<PanelView>,
     /// The floating selectable-list widget (`nx.ui.select`; later the picker),
     /// or `None` when none is open. When present it has input focus and floats
     /// over the focused window's text area; the server projects its geometry.
@@ -627,7 +596,6 @@ impl View {
             } else {
                 ed.message.clone()
             },
-            panel: ed.panel_view(),
             menu: ed.menu_view(),
             content_float: ed.content_float_view(),
             global_statusline,

@@ -11,7 +11,7 @@ use nxvim_core::view::{
     MenuView, RegionTabline, RegionTablines, RenderRow, ScrollAnim, Separator, TabView, ViewRect,
     WindowRegion, WindowView,
 };
-use nxvim_core::{BorderStyle, ContentFloatView, MenuPlacement, PanelView, VirtChunk};
+use nxvim_core::{BorderStyle, ContentFloatView, MenuPlacement, VirtChunk};
 use rmpv::Value;
 use std::collections::HashMap;
 
@@ -183,11 +183,6 @@ impl EditHost {
         // this is always `Nil`. Kept as a key for client wire compatibility.
         let _ = text_width;
         let pmenu = Value::Nil;
-        // The bottom panel (`:messages`, `:ls`), `Nil` when none is open.
-        let panel = match &view.panel {
-            Some(p) => project_panel(p),
-            None => Value::Nil,
-        };
         // The floating selectable-list menu (`nx.ui.select`; later the picker),
         // `Nil` when none is open. Geometry is computed here from the focused
         // window, the same way the completion popup is placed.
@@ -254,7 +249,6 @@ impl EditHost {
             ),
             (Value::from("styles"), styles_value),
             (Value::from("chrome"), chrome),
-            (Value::from("panel"), panel),
             (Value::from("pmenu"), pmenu),
             (Value::from("dock_left"), Value::from(view.dock_left as u64)),
             (
@@ -1148,25 +1142,6 @@ fn special_key_spans(lines: &[String], tabstop: usize) -> Value {
             })
             .collect(),
     )
-}
-
-/// Project the bottom panel (`:messages`, `:ls`) into its redraw sub-map. Panel
-/// rows go through [`display_lines_value`] so an unprintable control byte in a
-/// message — a C1 control from the latin1 fallback, an embedded C0 control —
-/// shows as its `^X` / `<xx>` token rather than a font tofu box, exactly as the
-/// window text does. The panel paints plain text (no per-cell span overlay), so
-/// the substitution needs no accompanying column math.
-fn project_panel(p: &PanelView) -> Value {
-    Value::Map(vec![
-        (Value::from("title"), Value::from(p.title.as_str())),
-        (Value::from("lines"), display_lines_value(&p.lines)),
-        (Value::from("cursor_row"), Value::from(p.cursor_row as u64)),
-        (
-            Value::from("cursor_span"),
-            Value::from(p.cursor_span as u64),
-        ),
-        (Value::from("height"), Value::from(p.height as u64)),
-    ])
 }
 
 /// Project the floating selectable-list [`MenuView`] into its redraw sub-map,

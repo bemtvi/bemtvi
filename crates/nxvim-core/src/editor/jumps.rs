@@ -217,7 +217,7 @@ impl Editor {
         Some((entries, win.jump_idx))
     }
 
-    /// `:jumps` — list the focused window's jumplist into the bottom panel,
+    /// `:jumps` — list the focused window's jumplist into a read-only scratch listing,
     /// mirroring vim's `jump line  col file/text` table. Entries run oldest-first;
     /// the `jump` column is the count of `<C-o>` (above the marker) or `<C-i>`
     /// (below) presses to reach that row, and `>` marks the current position. A row
@@ -257,7 +257,7 @@ impl Editor {
         if idx >= entries.len() {
             lines.push(">".to_string());
         }
-        self.open_panel("Jumps", lines, false, 0);
+        self.open_scratch_listing("[Jumps]", lines, 0);
     }
 }
 

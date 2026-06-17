@@ -439,6 +439,16 @@ pub struct BufferOptions {
     /// Whether to prepend a byte-order mark when writing (`'bomb'`). Set on read
     /// when a BOM was detected, and honored on write. Default `false`.
     pub bomb: bool,
+    /// Whether the buffer's text may be changed (`'modifiable'`). Default `true`.
+    /// When `false`, edits are refused with `E21` at the same chokepoints as a
+    /// read-only [`crate::BufferKind`] (via [`crate::Editor::modifiable`]) — vim's
+    /// `nomodifiable`. nxvim uses it for its built-in read-only **scratch listings**
+    /// (`:messages`, `:registers`, `:LspInfo`, …): an ordinary buffer in a bottom
+    /// window whose content is editor-generated, navigated like any buffer but not
+    /// edited. Distinct from the `BufferKind` markers (which also gate read-only):
+    /// those mark *what a buffer is*, this is a plain per-buffer toggle on an
+    /// otherwise-ordinary buffer, settable with `:setlocal [no]modifiable`.
+    pub modifiable: bool,
 }
 
 impl Default for BufferOptions {
@@ -457,6 +467,9 @@ impl Default for BufferOptions {
             // overrides both per buffer.
             fileencoding: Encoding::UTF8,
             bomb: false,
+            // An ordinary buffer is editable; the read-only scratch listings flip
+            // this to false at creation.
+            modifiable: true,
         }
     }
 }
@@ -724,6 +737,8 @@ fn canonical(name: &str) -> Option<(&'static str, OptKind)> {
         "fileencodings" | "fencs" => Some(("fileencodings", Str)),
         // Buffer-local: whether to write a BOM (a plain bool slot).
         "bomb" => Some(("bomb", Bool)),
+        // Buffer-local: whether the buffer may be edited (a plain bool slot).
+        "modifiable" | "ma" => Some(("modifiable", Bool)),
         "scrollanim" | "sca" => Some(("scrollanim", Bool)),
         "scrollanimduration" | "scad" => Some(("scrollanimduration", Num)),
         "scrollback" | "scbk" => Some(("scrollback", Num)),

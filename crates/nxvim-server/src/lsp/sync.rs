@@ -48,10 +48,7 @@ impl EditHost {
             }
             LspOp::DiagnosticSetloclist => {
                 match self.diagnostics_location_list() {
-                    Some((lines, targets)) => {
-                        self.editor.open_panel("LSP diagnostics", lines, false, 0);
-                        self.editor.set_panel_targets(targets);
-                    }
+                    Some(entries) => self.editor.open_location_list(entries, "LSP diagnostics"),
                     None => self.editor.echo("No diagnostics"),
                 }
                 return;

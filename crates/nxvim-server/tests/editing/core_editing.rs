@@ -868,12 +868,12 @@ async fn echo_integer_division_truncates_like_vim() {
 #[tokio::test]
 async fn echo_is_transient_but_echomsg_is_recorded() {
     // `:echo` shows on the message line without joining `:messages`; `:echomsg`
-    // records. The history panel must hold the echomsg line, not the echo one.
-    let (rpc, mut incoming) = start(None).await;
+    // records. The `:messages` listing must hold the echomsg line, not the echo one.
+    let (rpc, _incoming) = start(None).await;
     feed(&rpc, ":echo \"transient-line\"<CR>");
     feed(&rpc, ":echomsg \"kept-line\"<CR>");
-    let map = latest_after(&rpc, &mut incoming, ":messages<CR>").await;
-    let history = panel_lines(&map);
+    feed(&rpc, ":messages<CR>");
+    let history = lines(&rpc).await;
     assert!(
         history.contains(&"kept-line".to_string()),
         ":echomsg is recorded; history was {history:?}"

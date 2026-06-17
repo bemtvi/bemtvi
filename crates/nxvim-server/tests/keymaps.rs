@@ -96,21 +96,6 @@ fn message(map: &[(Value, Value)]) -> String {
         .to_string()
 }
 
-/// The open panel's lines from a redraw map (`:messages` / `:ls` content); empty
-/// when no panel is open.
-fn panel_lines(map: &[(Value, Value)]) -> Vec<String> {
-    match field(map, "panel") {
-        Some(Value::Map(p)) => match field(p, "lines") {
-            Some(Value::Array(a)) => a
-                .iter()
-                .filter_map(|v| v.as_str().map(str::to_string))
-                .collect(),
-            _ => Vec::new(),
-        },
-        _ => Vec::new(),
-    }
-}
-
 /// A function-RHS map fires on its sequence, and the keys it consumed do **not**
 /// also reach the editor (the `<Space>` and `x` would otherwise move/delete).
 #[tokio::test]
@@ -885,9 +870,10 @@ async fn silent_map_hides_its_message_but_keeps_the_history() {
         "the silent map did not change the command line"
     );
 
-    // But the output was still logged: :messages lists both lines.
-    let msgs = redraw_after(&rpc, &mut incoming, ":messages<CR>").await;
-    let history = panel_lines(&msgs);
+    // But the output was still logged: :messages lists both lines (in its read-only
+    // scratch buffer, now the focused window).
+    feed(&rpc, ":messages<CR>");
+    let history = lines(&rpc).await;
     assert!(
         history.iter().any(|l| l.contains("QUIET")),
         "the silent map's output is still in :messages: {history:?}"

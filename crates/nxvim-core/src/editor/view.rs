@@ -1,16 +1,16 @@
 //! **Plugin-owned views** (`nx.view`) — a read-only, plugin-controlled content
-//! surface that can be mounted in a dock or a split. The generalization of the
-//! bottom [`Panel`](super::Panel) off its bottom-edge assumption: where the panel
-//! is a single bottom strip, a view is an ordinary [`Buffer`] (carrying
-//! `view: Some(id)`) shown in any window, whose lines a plugin replaces wholesale
-//! and whose `<CR>` dispatches to a Lua `on_select` callback.
+//! surface that can be mounted in a dock or a split: an ordinary [`Buffer`] (whose
+//! [`kind`](Buffer::kind) is [`BufferKind::View`](crate::BufferKind::View)) shown in
+//! any window, whose lines a plugin replaces wholesale and whose `<CR>` dispatches to
+//! a Lua `on_select` callback.
 //!
 //! Like the directory listing ([`explorer`](super::explorer)) and the quickfix
 //! window, a view is an **ordinary `nomodifiable` buffer in a window** (vim's model):
 //! normal-mode keys — motions, search, `:` — flow through the grammar unchanged, and
 //! text-mutating keys are refused at the [`modifiable`](Editor::modifiable)
-//! chokepoints (the buffer carries `view: Some(id)`, so [`Buffer::read_only`] is
-//! true), so the plugin-owned content can't be corrupted. Its one special key —
+//! chokepoints (the buffer's kind is [`BufferKind::View`](crate::BufferKind::View), so
+//! [`Buffer::read_only`] is true), so the plugin-owned content can't be corrupted. Its
+//! one special key —
 //! `<CR>` → [`apply_view_action`](Editor::apply_view_action)`("confirm")` → the Lua
 //! `on_select` — is an ordinary **buffer-local default keymap** installed at view
 //! creation (`nx._install_view_keymaps`), not a special `input()` branch. Decoration

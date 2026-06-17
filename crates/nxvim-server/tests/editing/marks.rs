@@ -239,14 +239,14 @@ async fn global_mark_into_a_closed_buffer_errors_loudly() {
 
 #[tokio::test]
 async fn marks_command_lists_set_marks() {
-    let (rpc, mut incoming) = start(None).await;
+    let (rpc, _incoming) = start(None).await;
     feed(&rpc, "ialpha<Esc>obeta<Esc>");
     // A buffer-local `a` and a global `B`.
     feed(&rpc, "ggj0lma");
     feed(&rpc, "mB");
-    let map = latest_after(&rpc, &mut incoming, ":marks<CR>").await;
-    assert_eq!(panel_title(&map), "Marks");
-    let rows = panel_lines(&map);
+    // `:marks` opens a read-only scratch listing (the focused bottom window).
+    feed(&rpc, ":marks<CR>");
+    let rows = lines(&rpc).await;
     // A header plus one row per set mark; the names `a` and `B` both appear.
     assert!(
         rows.iter()

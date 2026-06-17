@@ -30,9 +30,6 @@ use crate::runtime::{resolve_lua_fs, Shared};
 use crate::vimregex;
 use crate::BlockingSystem;
 
-/// Lua registry key under which the panel's `on_select` callback is stored.
-pub(crate) const PANEL_ON_SELECT: &str = "nxvim_panel_on_select";
-
 /// `vim.regex(pat)` userdata: a vim pattern compiled by the real vim regexp engine
 /// ([`nxvim_regex`]). Its `:match_str(text)` returns the match's `(start, end)`
 /// byte offsets or `nil` — the shape neovim's regex object exposes. The reported
@@ -219,81 +216,6 @@ pub(crate) fn install_vim(lua: &Lua, shared: &Rc<RefCell<Shared>>) -> mlua::Resu
     nx_hl.set("define", set_hl)?;
     nx.set("hl", nx_hl)?;
     vim.set("api", api)?;
-
-    // `vim.panel`: nxvim's scriptable handle on the bottom message panel
-    // (`:messages` / `:ls`'s home). Each call queues a [`PanelOp`] the server
-    // drains into the core after the chunk runs — same "Lua queues, core
-    // mutates" flow as `vim.cmd` / `nvim_set_hl`.
-    let panel = lua.create_table()?;
-    // `open(title, lines[, on_select[, cursor]])`: `on_select` is a
-    // `function(line, index)` called when the user hits `<CR>` on a line (index
-    // is 1-based). It is stored in the Lua registry; passing it enables select
-    // events for this panel. `cursor` is the initially selected line (1-based,
-    // matching the `on_select` index); it defaults to the first line.
-    let sh = shared.clone();
-    panel.set(
-        "open",
-        lua.create_function(
-            move |lua,
-                  (title, lines, on_select, cursor): (
-                String,
-                Option<Vec<String>>,
-                Option<mlua::Function>,
-                Option<usize>,
-            )| {
-                store_panel_callback(lua, on_select.clone())?;
-                sh.borrow_mut().panel_ops.push(PanelOp::Open {
-                    title,
-                    lines: lines.unwrap_or_default(),
-                    wants_select: on_select.is_some(),
-                    cursor: cursor.map(|c| c.saturating_sub(1)).unwrap_or(0),
-                });
-                Ok(())
-            },
-        )?,
-    )?;
-    let sh = shared.clone();
-    panel.set(
-        "set_lines",
-        lua.create_function(move |_, lines: Vec<String>| {
-            sh.borrow_mut().panel_ops.push(PanelOp::SetLines(lines));
-            Ok(())
-        })?,
-    )?;
-    // `on_select(fn|nil)`: set or clear the open panel's `<CR>` handler.
-    let sh = shared.clone();
-    panel.set(
-        "on_select",
-        lua.create_function(move |lua, on_select: Option<mlua::Function>| {
-            store_panel_callback(lua, on_select.clone())?;
-            sh.borrow_mut()
-                .panel_ops
-                .push(PanelOp::OnSelect(on_select.is_some()));
-            Ok(())
-        })?,
-    )?;
-    // `set_cursor(line)`: move the open panel's selection (1-based, matching the
-    // `on_select` index) and scroll it into view.
-    let sh = shared.clone();
-    panel.set(
-        "set_cursor",
-        lua.create_function(move |_, line: usize| {
-            sh.borrow_mut()
-                .panel_ops
-                .push(PanelOp::SetCursor(line.saturating_sub(1)));
-            Ok(())
-        })?,
-    )?;
-    let sh = shared.clone();
-    panel.set(
-        "close",
-        lua.create_function(move |lua, ()| {
-            store_panel_callback(lua, None)?; // drop the handler with the panel
-            sh.borrow_mut().panel_ops.push(PanelOp::Close);
-            Ok(())
-        })?,
-    )?;
-    vim.set("panel", panel)?;
 
     // `nx.dock`: nxvim's permanent edge panels (VSCode-style side/bottom docks).
     // Each call queues a [`DockOp`] the server drains into the core after the
@@ -546,6 +468,59 @@ pub(crate) fn install_vim(lua: &Lua, shared: &Rc<RefCell<Shared>>) -> mlua::Resu
         })?,
     )?;
     nx.set("terminal", terminal)?;
+
+    // `nx.panel`: the transient, focus-locked bottom overlay over an ordinary
+    // `nomodifiable` buffer (the successor to the retired bespoke panel). The surface is
+    // deliberately tiny — `open{ name?, lines, filetype?, height? }` and `close()` —
+    // because all interaction rides ordinary buffer mechanisms: motions navigate, and
+    // selection / dismissal are buffer-local maps a `FileType` autocmd installs (the
+    // `:ls` / `qf` model). `name` (default `[Panel]`) makes the panel unique — re-opening
+    // the same name replaces its content, and it shows under `:lspanels`. `filetype`
+    // defaults to `nxpanel` (whose ftplugin maps `q`/`<Esc>` to close); a plugin passing
+    // its own filetype wires its own keys. Same "Lua queues, core mutates" flow as
+    // `nx.view` / `nx.terminal`.
+    let panel = lua.create_table()?;
+    let sh = shared.clone();
+    panel.set(
+        "open",
+        lua.create_function(move |_, opts: mlua::Table| {
+            let lines: Vec<String> = match opts.get::<mlua::Value>("lines")? {
+                mlua::Value::Table(t) => {
+                    t.sequence_values::<String>().collect::<mlua::Result<_>>()?
+                }
+                mlua::Value::Nil => {
+                    return Err(mlua::Error::runtime(
+                        "nx.panel.open: `lines` (a list of strings) is required",
+                    ))
+                }
+                other => {
+                    return Err(mlua::Error::runtime(format!(
+                        "nx.panel.open: `lines` must be a list of strings, got {}",
+                        other.type_name()
+                    )))
+                }
+            };
+            let name: Option<String> = opts.get("name")?;
+            let filetype: Option<String> = opts.get("filetype")?;
+            let height: Option<u64> = opts.get("height")?;
+            sh.borrow_mut().panel_ops.push(PanelOp::Open {
+                name,
+                lines,
+                filetype,
+                height,
+            });
+            Ok(())
+        })?,
+    )?;
+    let sh = shared.clone();
+    panel.set(
+        "close",
+        lua.create_function(move |_, ()| {
+            sh.borrow_mut().panel_ops.push(PanelOp::Close);
+            Ok(())
+        })?,
+    )?;
+    nx.set("panel", panel)?;
 
     // ----- the async runtime bridge (the "event loop") -----------------------
     // Lua queues a [`LoopOp`] carrying a callback id; the server drains it in
@@ -1939,18 +1914,6 @@ pub(crate) fn install_runtime_api(
             Ok(())
         })?,
     )?;
-    // `nx._panel_action(name)`: a `panel`-bucket keymap fired the named action (next /
-    // prev / first / last / half scroll / confirm / close) on the open message /
-    // quickfix panel; the server applies it via `Editor::apply_panel_action`. A
-    // panel sibling of `nx._picker_action`.
-    let sh = shared.clone();
-    nx.set(
-        "_panel_action",
-        lua.create_function(move |_, name: String| {
-            sh.borrow_mut().panel_actions.push(name);
-            Ok(())
-        })?,
-    )?;
     // `nx._explorer_action(name)`: a `FileType nxdir` buffer-local keymap fired the
     // named action (`open` / `up`) on the file-explorer listing; the server applies
     // it via `Editor::apply_explorer_action`. (Navigation is ordinary normal-mode
@@ -2514,16 +2477,6 @@ pub(crate) fn fs_stat_table(lua: &Lua, st: &crate::LuaStat) -> mlua::Result<Tabl
         t.set("atime", s as f64 + f64::from(n) / 1e9)?;
     }
     Ok(t)
-}
-
-/// Store (or clear) the panel's `on_select` callback in the Lua registry. `None`
-/// stores `nil`, so [`crate::LuaRuntime::run_panel_select`] reads it back as "no
-/// handler" — keeping a closed/replaced panel from firing a stale callback.
-fn store_panel_callback(lua: &Lua, cb: Option<mlua::Function>) -> mlua::Result<()> {
-    match cb {
-        Some(f) => lua.set_named_registry_value(PANEL_ON_SELECT, f),
-        None => lua.set_named_registry_value(PANEL_ON_SELECT, mlua::Value::Nil),
-    }
 }
 
 /// The positional arguments `nx._set_qflist` receives: `(items, lines, efm,

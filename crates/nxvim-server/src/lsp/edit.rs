@@ -176,10 +176,10 @@ impl EditHost {
         }
     }
 
-    /// List a code-action reply's titles in a select-enabled panel and stash the
-    /// actions so a `<CR>` select applies the chosen one (the `panel_selects`
-    /// path, keyed by select index — see the design's code-action note). An empty
-    /// reply shows a brief message instead of an empty panel.
+    /// Offer a code-action reply's titles in the **select menu** (neovim's
+    /// `vim.ui.select` model) and stash the actions so confirming applies the chosen
+    /// one (`pending_code_action`, keyed by the chosen index). An empty reply shows a
+    /// brief message instead of an empty menu.
     pub(crate) fn show_code_actions(&mut self, actions: Vec<CodeActionData>) {
         if actions.is_empty() {
             self.editor.echo(LspReqKind::CodeAction.empty_message());
@@ -188,18 +188,24 @@ impl EditHost {
         let lines: Vec<String> = actions.iter().map(|a| a.title.clone()).collect();
         self.lsp_code_actions = actions;
         self.editor
-            .open_panel(CODE_ACTION_PANEL_TITLE, lines, true, 0);
+            .open_menu(lines, nxvim_core::MenuPlacement::Cursor, 0);
+        // The select-menu → `apply_code_action` routing is native-only (the field and its
+        // consumer in `effects.rs` are `#[cfg(feature = "native")]`), so the flag it sets
+        // is too — keeps the wasm edit-host build (`--no-default-features`) compiling.
+        #[cfg(feature = "native")]
+        {
+            self.pending_code_action = true;
+        }
     }
 
     /// Apply the code action selected (by index) in the code-action panel: apply
     /// its eager `edit` now, else resolve a lazy action's edit
     /// (`codeAction/resolve`) and apply when the reply lands, else (a bare
-    /// command) a brief message. Clears the stashed actions and closes the panel
-    /// either way.
+    /// command) a brief message. Clears the stashed actions either way; the select
+    /// menu has already closed itself on confirm.
     pub(crate) fn apply_code_action(&mut self, index: usize) {
         let action = self.lsp_code_actions.get(index).cloned();
         self.lsp_code_actions.clear();
-        self.editor.close_panel();
         let Some(action) = action else {
             return;
         };

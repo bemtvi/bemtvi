@@ -253,6 +253,16 @@ pub async fn mode(rpc: &Rpc) -> String {
     }
 }
 
+/// Whether a focus-locked bottom panel (`:messages` / `:ls` / `nx.panel.open`) is
+/// currently open — the open/closed oracle for panel tests (`nxvim_panel_is_open`).
+pub async fn panel_is_open(rpc: &Rpc) -> bool {
+    rpc.request("nxvim_panel_is_open", vec![])
+        .await
+        .expect("nxvim_panel_is_open")
+        .as_bool()
+        .unwrap_or(false)
+}
+
 /// A round-trip request whose only purpose is to act as a barrier: once it
 /// resolves, every message sent before it (input, the redraw it triggered) has
 /// been processed and queued. Uses `nvim_get_mode` (cheap, side-effect-free).

@@ -405,64 +405,6 @@ function nx.keymap.arg(name, mode, _abbr, dict)
 end
 vim.fn.maparg = nx.keymap.arg
 
--- The `:ls` panel's <CR> handler: jump to the buffer whose number leads the
--- selected listing line (`"  2 %a "name" line 1"`), then dismiss the list. The
--- core installs this via `vim.panel.on_select` when `:ls` opens its panel, so
--- the buffer list rides the same scripting select path a plugin would use.
-function nx._panel_select_buffer(line)
-  local n = tonumber(line:match("^%s*(%d+)"))
-  if n then
-    vim.panel.close()
-    vim.cmd("buffer " .. n)
-  end
-end
-
--- ----- rebindable panel keys ------------------------------------------------
--- The bottom message / quickfix / location panel is driven through the keymap
--- engine, NOT a hardcoded grab: the server selects the `panel` bucket while the
--- panel owns input, so navigation / confirm / close are configurable with
--- `nx.keymap.set('panel', '<key>', nx.panel.actions.<name>)`. Each action fires
--- through the engine (nx._panel_action -> Editor::apply_panel_action). A panel has
--- NO query, so there is no text fallthrough — an unmapped key is inert.
-nx.panel = nx.panel or {}
-nx.panel.actions = nx.panel.actions or {}
-for _, name in ipairs({
-  "next",
-  "prev",
-  "first",
-  "last",
-  "half_down",
-  "half_up",
-  "confirm",
-  "close",
-}) do
-  nx.panel.actions[name] = function()
-    nx._panel_action(name)
-  end
-end
-
--- The default panel bindings — `default = true` so a user `nx.keymap.set('panel',
--- …)` wins, and an empty-function map disables a key. `gg` is a two-key default map.
--- These mirror the vim-style keys the panel used to hardcode.
-for _, m in ipairs({
-  { "j", "next", "Next line" },
-  { "<Down>", "next", "Next line" },
-  { "k", "prev", "Previous line" },
-  { "<Up>", "prev", "Previous line" },
-  { "gg", "first", "First line" },
-  { "<Home>", "first", "First line" },
-  { "G", "last", "Last line" },
-  { "<End>", "last", "Last line" },
-  { "<C-d>", "half_down", "Half-page down" },
-  { "<C-u>", "half_up", "Half-page up" },
-  { "<CR>", "confirm", "Select / jump" },
-  { "q", "close", "Close" },
-  { "Q", "close", "Close" },
-  { "<Esc>", "close", "Close" },
-}) do
-  nx.keymap.set("panel", m[1], nx.panel.actions[m[2]], { default = true, desc = m[3] })
-end
-
 -- ----- the explorer / quickfix activation maps (vim's ftplugin model) -------
 -- The file-explorer listing (`filetype=nxdir`) and the quickfix / loclist display
 -- (`filetype=qf`) are ordinary `nomodifiable` buffers in a window: `j`/`k`/`gg`/`G`/
@@ -518,6 +460,83 @@ nx.autocmd.create("FileType", {
       nx.qf.actions.jump,
       { buffer = args.buf, default = true, desc = "Jump to entry" }
     )
+  end,
+})
+
+-- `:ls`/`:buffers` opens a `nxbuffers` panel whose rows begin with the buffer number
+-- (`{:>3}` column). `<CR>` parses that number off the cursor line, dismisses the panel,
+-- and switches to that buffer — the buffer-list analogue of quickfix's `<CR>`, the vim
+-- ftplugin model (ordinary buffer-local map), not a bespoke panel `on_select`. The switch
+-- is `nx.schedule`d so it runs *after* the panel close has restored focus to the main
+-- window (closing is a queued panel op; the switch must land in that window, not the
+-- about-to-be-removed panel one).
+nx.buffers = nx.buffers or {}
+nx.buffers.actions = nx.buffers.actions or {}
+nx.buffers.actions.open = function()
+  local n = tostring(nx.current_line()):match("^%s*(%d+)")
+  if n then
+    nx.panel.close()
+    nx.schedule(function()
+      vim.cmd("buffer " .. n)
+    end)
+  end
+end
+
+nx.autocmd.create("FileType", {
+  pattern = "nxbuffers",
+  callback = function(args)
+    nx.keymap.set(
+      "n",
+      "<CR>",
+      nx.buffers.actions.open,
+      { buffer = args.buf, default = true, desc = "Open buffer" }
+    )
+  end,
+})
+
+-- `:lspanels` opens a `nxpanels` panel listing the named panels (rows begin with the panel
+-- buffer's number). `<CR>` parses that number and `:b`-switches to it — but the current
+-- window IS the panel window, so `switch_buffer` swaps it *in place*, showing that panel's
+-- last content (no close, no regenerating command). Contrast `nxbuffers`, which targets a
+-- document and so closes the panel and lands the switch in the main window.
+nx.panels = nx.panels or {}
+nx.panels.actions = nx.panels.actions or {}
+nx.panels.actions.open = function()
+  local n = tostring(nx.current_line()):match("^%s*(%d+)")
+  if n then
+    vim.cmd("buffer " .. n)
+  end
+end
+
+nx.autocmd.create("FileType", {
+  pattern = "nxpanels",
+  callback = function(args)
+    nx.keymap.set(
+      "n",
+      "<CR>",
+      nx.panels.actions.open,
+      { buffer = args.buf, default = true, desc = "Open panel" }
+    )
+  end,
+})
+
+-- Every panel listing (the built-in text listings `nxlisting`, the buffer list
+-- `nxbuffers`, the panel list `nxpanels`, and scripted `nx.panel.open` panels defaulting to
+-- `nxpanel`) dismisses on `q` / `<Esc>` — the focus-locked overlay's "you're done here, go
+-- back" key. An ordinary buffer-local default map, so motions / `<CR>` / a plugin's own
+-- keys coexist and a user map wins. A scripted panel with its *own* filetype opts out and
+-- wires its own dismiss.
+nx.autocmd.create("FileType", {
+  pattern = { "nxlisting", "nxbuffers", "nxpanels", "nxpanel" },
+  callback = function(args)
+    for _, key in ipairs({ "q", "<Esc>" }) do
+      nx.keymap.set(
+        "n",
+        key,
+        nx.panel.close,
+        { buffer = args.buf, default = true, desc = "Close panel" }
+      )
+    end
   end,
 })
 

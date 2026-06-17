@@ -244,10 +244,8 @@ impl EditHost {
         let _ = self.lua.take_highlights();
         let _ = self.lua.take_commands();
         let _ = self.lua.take_output();
-        let _ = self.lua.take_panel_ops();
         let _ = self.lua.take_picker_actions();
         let _ = self.lua.take_select_actions();
-        let _ = self.lua.take_panel_actions();
         let _ = self.lua.take_explorer_actions();
         let _ = self.lua.take_cmdline_actions();
     }

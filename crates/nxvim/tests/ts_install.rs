@@ -19,8 +19,8 @@ use std::time::Duration;
 use nxvim_rpc::{Incoming, Rpc};
 use nxvim_server::ServerInit;
 use nxvim_test_harness::{
-    cursor, drain_to_latest_redraw, exec_lua, feed, lines, map_get, message, mode,
-    serial_lock as test_lock, start_attached, window0_field, write_temp,
+    cursor, drain_to_latest_redraw, exec_lua, feed, lines, message, mode, serial_lock as test_lock,
+    start_attached, window0_field, write_temp,
 };
 use rmpv::Value;
 use tokio::sync::mpsc::UnboundedReceiver;
@@ -209,41 +209,6 @@ async fn wait_for_message(
     panic!("timed out waiting for message containing {needle:?}");
 }
 
-/// The current panel's lines (the `:TSInstallInfo` window), or empty.
-fn panel_lines(map: &[(Value, Value)]) -> Vec<String> {
-    let Some(Value::Map(panel)) = map_get(map, "panel") else {
-        return Vec::new();
-    };
-    panel
-        .iter()
-        .find(|(k, _)| k.as_str() == Some("lines"))
-        .and_then(|(_, v)| v.as_array())
-        .map(|a| {
-            a.iter()
-                .filter_map(|v| v.as_str().map(String::from))
-                .collect()
-        })
-        .unwrap_or_default()
-}
-
-/// Drive the loop until a panel frame whose lines contain `needle` shows up.
-async fn wait_for_panel(
-    rpc: &Rpc,
-    incoming: &mut UnboundedReceiver<Incoming>,
-    needle: &str,
-) -> Vec<String> {
-    for _ in 0..50 {
-        let _ = mode(rpc).await;
-        if let Some(map) = drain_to_latest_redraw(incoming, |m| {
-            panel_lines(m).iter().any(|l| l.contains(needle))
-        }) {
-            return panel_lines(&map);
-        }
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-    panic!("timed out waiting for a panel line containing {needle:?}");
-}
-
 /// Total treesitter highlight spans across all rows in a redraw frame
 /// (`windows[0].highlights` is one array per row, each a list of spans).
 fn total_highlight_spans(map: &[(Value, Value)]) -> usize {
@@ -301,13 +266,14 @@ async fn ts_install_compiles_grammar_and_enables_indent() {
     );
     let _ = cursor(&rpc).await;
 
-    // `:TSInstallInfo` lists the parser we just installed, with its queries.
+    // `:TSInstallInfo` lists the parser we just installed (in a read-only scratch
+    // buffer, now the focused window), with its queries.
     feed(&rpc, ":TSInstallInfo<CR>");
-    let info = wait_for_panel(&rpc, &mut incoming, "rust").await;
+    let info = lines(&rpc).await;
     let joined = info.join("\n");
     assert!(
         joined.contains("rust") && joined.contains("indents"),
-        "TSInstallInfo panel missing rust/indents: {info:?}"
+        "TSInstallInfo listing missing rust/indents: {info:?}"
     );
 }
 

@@ -134,29 +134,29 @@ async fn a_count_jumps_several_entries_at_once() {
 }
 
 #[tokio::test]
-async fn jumps_command_lists_the_jumplist_in_a_panel() {
-    let (rpc, mut incoming) = start(None).await;
+async fn jumps_command_lists_the_jumplist_in_a_listing() {
+    let (rpc, _incoming) = start(None).await;
     ten_lines(&rpc).await;
     feed(&rpc, "gg"); // records 10
     feed(&rpc, "5G"); // records 1
-    let map = latest_after(&rpc, &mut incoming, ":jumps<CR>").await;
+                      // `:jumps` opens a read-only scratch listing (the focused bottom window).
+    feed(&rpc, ":jumps<CR>");
 
-    assert_eq!(panel_title(&map), "Jumps");
-    let lines = panel_lines(&map);
+    let shown = lines(&rpc).await;
     assert_eq!(
-        lines.first().map(String::as_str),
+        shown.first().map(String::as_str),
         Some(" jump line  col file/text")
     );
     // Both jumped-from lines (10 and 1) appear, showing their line text.
-    let joined = lines.join("\n");
+    let joined = shown.join("\n");
     assert!(
         joined.contains(" 10 ") && joined.contains("10"),
-        "jumps panel was: {lines:?}"
+        "jumps listing was: {shown:?}"
     );
     // The pointer sits at the present: a trailing `>` marks it.
     assert!(
-        lines.iter().any(|l| l.trim() == ">"),
-        "expected a trailing `>` marker, got: {lines:?}"
+        shown.iter().any(|l| l.trim() == ">"),
+        "expected a trailing `>` marker, got: {shown:?}"
     );
 }
 

@@ -28,33 +28,6 @@ pub struct HlSet {
     pub link: Option<String>,
 }
 
-/// A request to the bottom message panel, queued by the `vim.panel.*` functions
-/// and drained by the server into the core (which owns the panel state). nxvim's
-/// own surface — the panel is not a neovim concept.
-#[derive(Clone, Debug)]
-pub enum PanelOp {
-    /// `vim.panel.open(title, lines[, on_select[, cursor]])` — open (or replace)
-    /// and focus the panel. `wants_select` is set when an `on_select` callback
-    /// was given, enabling `<CR>` select events. `cursor` is the initially
-    /// selected line (0-based; the panel scrolls to keep it visible).
-    Open {
-        title: String,
-        lines: Vec<String>,
-        wants_select: bool,
-        cursor: usize,
-    },
-    /// `vim.panel.set_lines(lines)` — replace the open panel's content.
-    SetLines(Vec<String>),
-    /// `vim.panel.on_select(fn|nil)` — enable/disable `<CR>` select events on the
-    /// open panel (the callback itself lives in the Lua registry).
-    OnSelect(bool),
-    /// `vim.panel.set_cursor(line)` — move the open panel's selection to the
-    /// given line (0-based) and scroll it into view.
-    SetCursor(usize),
-    /// `vim.panel.close()` — close the panel.
-    Close,
-}
-
 /// A request to a permanent **dock** (the VSCode-style edge panels), queued by
 /// the `nx.dock.*` functions and drained by the server into the core (which owns
 /// the dock state). nxvim's own surface — docks are not a neovim concept. `side`
@@ -142,6 +115,30 @@ pub enum ViewOp {
     Focus { id: u64 },
     /// `v:close()` — unmount view `id` and drop its backing buffer + registry entry.
     Destroy { id: u64 },
+}
+
+/// A request to the transient bottom **panel** (`nx.panel`), queued by the `nx.panel.*`
+/// bridges and drained by the server into the core (which owns the panel window + its
+/// backing buffer). The panel is a focus-locked overlay over an ordinary `nomodifiable`
+/// buffer; the Lua surface is deliberately tiny — open with content, close — because all
+/// interaction (navigation = motions, selection / dismissal = buffer-local maps installed
+/// by a `FileType` autocmd) rides the ordinary buffer mechanisms, not a bespoke API.
+#[derive(Clone, Debug)]
+pub enum PanelOp {
+    /// `nx.panel.open{ name?, lines, filetype?, height? }` — mount `lines` as the named
+    /// panel (default name `[Panel]`). The server forwards this to
+    /// [`Editor::open_script_panel`](nxvim_core::Editor); naming makes the panel unique
+    /// (re-open replaces its content), and behavior is wired by a `FileType` autocmd on
+    /// `filetype` (default `nxpanel`).
+    Open {
+        name: Option<String>,
+        lines: Vec<String>,
+        filetype: Option<String>,
+        height: Option<u64>,
+    },
+    /// `nx.panel.close()` — dismiss the open panel
+    /// ([`Editor::close_panel`](nxvim_core::Editor)).
+    Close,
 }
 
 /// A request to open a terminal job, queued by `nx.terminal.open{...}` and

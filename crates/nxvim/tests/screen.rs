@@ -453,21 +453,25 @@ async fn editor_keeps_processing_when_the_ui_never_drains_redraws() {
 }
 
 #[tokio::test]
-async fn messages_command_renders_a_panel_at_the_bottom() {
+async fn messages_command_renders_a_scratch_window_at_the_bottom() {
     let (rpc, mut incoming) = start(None).await;
-    // Build one history line, then open the messages panel.
+    // Build one history line, then open the messages listing.
     feed(&rpc, ":lua print('hello panel')<CR>");
     feed(&rpc, ":messages<CR>");
     let buf = screen(&rpc, &mut incoming).await;
 
-    // Panel content height is 10, so it claims 11 rows (title + content). The
-    // panel sits below the status line, above the single command row, so its
-    // title bar lands at row ROWS-1-11 = 12.
-    let bar = row_text(&buf, ROWS - 12);
-    assert!(bar.contains("Messages"), "title bar: {bar:?}");
-    assert!(bar.contains("[X]"), "close button: {bar:?}");
-    // The first content row (just below the bar) shows the history line.
-    assert_eq!(row_text(&buf, ROWS - 11).trim_end(), "hello panel");
+    // `:messages` now opens a read-only scratch buffer in a bottom split (not the old
+    // grabbing panel): its history line renders in the window body, and a statusline
+    // names the listing `[Messages]`.
+    let rows: Vec<String> = (0..ROWS).map(|r| row_text(&buf, r)).collect();
+    assert!(
+        rows.iter().any(|r| r.contains("hello panel")),
+        "expected the history line on screen; rows: {rows:?}"
+    );
+    assert!(
+        rows.iter().any(|r| r.contains("Messages")),
+        "expected a statusline naming the listing; rows: {rows:?}"
+    );
 }
 
 // ----- floating windows (phase 2: painting the overlay) ---------------------

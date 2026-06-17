@@ -40,21 +40,21 @@ async fn g_semicolon_and_comma_walk_the_change_list() {
 
 #[tokio::test]
 async fn changes_on_one_line_coalesce_into_a_single_entry() {
-    let (rpc, mut incoming) = ten_line_file().await;
+    let (rpc, _incoming) = ten_line_file().await;
     // A whole typed word is many keystroke-edits, all on line 3 — one entry.
     feed(&rpc, "3GA hello<Esc>");
     feed(&rpc, "7GA x<Esc>");
-    let map = latest_after(&rpc, &mut incoming, ":changes<CR>").await;
-    assert_eq!(panel_title(&map), "Changes");
-    let lines = panel_lines(&map);
+    // `:changes` opens a read-only scratch listing (the focused bottom window).
+    feed(&rpc, ":changes<CR>");
+    let shown = lines(&rpc).await;
     // header + two coalesced entries + the trailing `>` present marker.
     assert_eq!(
-        lines.len(),
+        shown.len(),
         4,
-        "expected exactly two change entries, got: {lines:?}"
+        "expected exactly two change entries, got: {shown:?}"
     );
     assert_eq!(
-        lines.first().map(String::as_str),
+        shown.first().map(String::as_str),
         Some(" change line  col text")
     );
 }
@@ -77,16 +77,16 @@ async fn the_change_list_survives_undo() {
 
 #[tokio::test]
 async fn a_change_entry_follows_lines_inserted_above_it() {
-    let (rpc, mut incoming) = ten_line_file().await;
+    let (rpc, _incoming) = ten_line_file().await;
     feed(&rpc, "7GA?<Esc>"); // change on line 7
                              // Insert three lines at the very top; the line-7 change entry must
                              // ride down to line 10 with its text.
     feed(&rpc, "ggOa<CR>b<CR>c<Esc>");
-    let map = latest_after(&rpc, &mut incoming, ":changes<CR>").await;
-    let lines = panel_lines(&map);
+    feed(&rpc, ":changes<CR>");
+    let shown = lines(&rpc).await;
     assert!(
-        lines.iter().any(|l| l.contains(" 10 ") && l.contains("7?")),
-        "the line-7 change should have shifted to line 10: {lines:?}"
+        shown.iter().any(|l| l.contains(" 10 ") && l.contains("7?")),
+        "the line-7 change should have shifted to line 10: {shown:?}"
     );
 }
 

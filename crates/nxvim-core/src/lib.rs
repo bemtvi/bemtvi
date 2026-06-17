@@ -52,4 +52,4 @@ pub use mode::{KeyContext, Mode};
 pub use options::{BufferOptions, Options, SignColumn, WindowOptions};
 pub use snippet::{parse_snippet, ParsedSnippet, SnippetError, TabStop};
 pub use syntax::{IndentParams, OpenOutcome, Span, SyntaxEngine};
-pub use view::{ContentFloatView, MenuView, PanelView, TabView, View, ViewRect, WindowView};
+pub use view::{ContentFloatView, MenuView, TabView, View, ViewRect, WindowView};

@@ -18,7 +18,7 @@
 
 use super::*;
 use crate::buffer::Buffer;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// How a populate request combines with the existing list.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -299,6 +299,34 @@ impl Editor {
             stack.apply(items, action, title);
         }
         self.qf_refresh_window(which);
+    }
+
+    /// Open the current window's **location list** from `entries` and show it
+    /// (`:lopen`) — the navigable successor to the retired panel's
+    /// `open_panel` + `set_panel_targets` for LSP reference / diagnostic lists.
+    /// Each entry is `(path, line, col, text)` with **0-based** line/col (the form the
+    /// old panel targets used); the loclist stores vim's 1-based columns. The list is
+    /// pushed as a *new* list on the window's stack (recover a prior `:lgrep` with
+    /// `:lolder`), and `<CR>` on a row jumps via the buffer-local `qf` map.
+    pub fn open_location_list(
+        &mut self,
+        entries: Vec<(PathBuf, usize, usize, String)>,
+        title: &str,
+    ) {
+        let which = QfWhich::Location(self.windows.current);
+        let items = entries
+            .into_iter()
+            .map(|(path, line, col, text)| QfEntry {
+                filename: Some(path.display().to_string()),
+                lnum: line + 1,
+                col: col + 1,
+                text,
+                valid: true,
+                ..Default::default()
+            })
+            .collect();
+        self.qf_set_items(which, items, QfAction::New, Some(title.to_string()));
+        self.ex_qf_open(which, "");
     }
 
     /// Parse `lines` against `efm` and set the list (vim's

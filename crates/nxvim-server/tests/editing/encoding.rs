@@ -464,25 +464,12 @@ async fn c0_only_line_keys_the_special_key_overlay_at_the_token_width() {
     );
 }
 
-#[tokio::test]
-async fn messages_panel_substitutes_control_chars() {
-    // The `:messages` panel runs its rows through the same display projection as
-    // the window text, so a control char in a recorded message shows as its
-    // `^X` / `<xx>` token rather than a font tofu box. `:echomsg "a\eb"` records a
-    // line with an embedded ESC (0x1b) — caret notation `^[`.
-    let (rpc, mut incoming) = start(None).await;
-    feed(&rpc, ":echomsg \"a\\eb\"<CR>");
-    let map = latest_after(&rpc, &mut incoming, ":messages<CR>").await;
-    let history = panel_lines(&map);
-    assert!(
-        history.iter().any(|l| l == "a^[b"),
-        "the ESC must render as the ^[ caret token in :messages; history was {history:?}"
-    );
-    assert!(
-        !history.iter().any(|l| l.contains('\u{1b}')),
-        "no raw ESC byte may reach the rendered panel; history was {history:?}"
-    );
-}
+// (Retired: `:messages` used to be a bespoke panel that ran its rows through a
+// dedicated projection; control-char substitution there had its own test. It is now an
+// ordinary read-only scratch buffer, so its control chars render through the *window*
+// display projection like any buffer's — covered by the SpecialKey overlay test above
+// (`special_key_spans`) and the general display tests. The panel-specific test had no
+// remaining distinct behavior to cover.)
 
 // ===== multibyte / CJK encodings =============================================
 //

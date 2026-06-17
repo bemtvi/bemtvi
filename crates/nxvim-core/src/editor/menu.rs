@@ -1,9 +1,8 @@
 //! The unified floating selectable-list widget — `nx.ui.select` (a promptless
 //! choice menu) and `nx.picker` (a fuzzy finder with a prompt) both render through
-//! it (see `docs/specs/2026-06-14-nx-ui-float-widget.md`). Like the bottom
-//! [`Panel`] it grabs every keystroke while open, but it floats over the text —
-//! anchored under the cursor or centered over the editor — and resolves to a
-//! single choice.
+//! it (see `docs/specs/2026-06-14-nx-ui-float-widget.md`). It grabs every keystroke
+//! while open, floating over the text — anchored under the cursor or centered over
+//! the editor — and resolves to a single choice.
 //!
 //! Two orthogonal capabilities make it one shape instead of three:
 //!
@@ -21,8 +20,6 @@
 //!
 //! The core keeps only the logical state; the server projects the float's screen
 //! geometry from [`Editor::menu_view`] and orchestrates the (async) source.
-//!
-//! [`Panel`]: super::Panel
 
 use std::ops::Range;
 
@@ -936,16 +933,13 @@ impl Editor {
 
     /// Which key context owns input — the grabbing widget that routes keys through
     /// its own keymap bucket, otherwise [`KeyContext::Editing`] (the buffer, or a
-    /// non-grabbing completion menu whose typing flows on to the document). The
-    /// priority mirrors [`Editor::input`]'s grab order: a focused [`Panel`] first,
-    /// then a grabbing menu ([`Picker`](KeyContext::Picker) /
-    /// [`Select`](KeyContext::Select)). The explorer / `nx.view` / quickfix buffers
-    /// are *not* widgets — they are ordinary `nomodifiable` buffers whose special
-    /// keys are buffer-local maps, so they stay in [`KeyContext::Editing`].
+    /// non-grabbing completion menu whose typing flows on to the document). A
+    /// grabbing menu ([`Picker`](KeyContext::Picker) / [`Select`](KeyContext::Select))
+    /// takes the context. The explorer / `nx.view` / quickfix buffers, and the
+    /// read-only scratch / loclist listings, are *not* widgets — they are ordinary
+    /// `nomodifiable` buffers whose special keys are buffer-local maps, so they stay
+    /// in [`KeyContext::Editing`].
     pub fn key_context(&self) -> KeyContext {
-        if self.panel.is_some() {
-            return KeyContext::Panel;
-        }
         match self.menu_kind() {
             Some(MenuKind::Picker) => return KeyContext::Picker,
             Some(MenuKind::Select) => return KeyContext::Select,

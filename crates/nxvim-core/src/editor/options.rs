@@ -90,6 +90,7 @@ impl Editor {
             "scrollanim" => &mut self.options.scrollanim,
             "expandtab" => &mut self.buffer_mut().options.expandtab,
             "bomb" => &mut self.buffer_mut().options.bomb,
+            "modifiable" => &mut self.buffer_mut().options.modifiable,
             // A name `resolve_set` accepted as a boolean but no arm above handles is a
             // wiring gap (an option in the `canonical` registry never wired to its
             // slot — the bug `:set imagepreview` was). Fail loud rather than silently

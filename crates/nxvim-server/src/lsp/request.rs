@@ -483,8 +483,7 @@ impl EditHost {
         locations: &[Location],
         encoding: PositionEncoding,
     ) {
-        let mut lines = Vec::with_capacity(locations.len());
-        let mut targets: Vec<PanelTarget> = Vec::with_capacity(locations.len());
+        let mut entries: Vec<(PathBuf, usize, usize, String)> = Vec::with_capacity(locations.len());
         for loc in locations {
             let Some(path) = uri_to_path(&loc.uri) else {
                 continue;
@@ -492,15 +491,15 @@ impl EditHost {
             let row = loc.range.start.line as usize;
             let character = loc.range.start.character as usize;
             let byte = self.location_byte_col(&path, row, character, encoding);
-            lines.push(format!("{}:{}:{}", path.display(), row + 1, byte + 1));
-            targets.push(Some((path, row, byte)));
+            // The qf line renders `file|lnum col N|`; the message text is left empty
+            // (a reference list has no per-entry message beyond its location).
+            entries.push((path, row, byte, String::new()));
         }
-        if targets.is_empty() {
+        if entries.is_empty() {
             self.editor.echo(kind.empty_message());
             return;
         }
-        self.editor.open_panel(kind.panel_title(), lines, false, 0);
-        self.editor.set_panel_targets(targets);
+        self.editor.open_location_list(entries, kind.panel_title());
     }
 
     /// Best-effort LSP char→byte column for a target location: exact when the

@@ -91,7 +91,6 @@ impl MatchScope {
             MatchScope::Editing(mode) => mode.short_code(),
             MatchScope::Widget('P') => "picker",
             MatchScope::Widget('S') => "select",
-            MatchScope::Widget('L') => "panel",
             MatchScope::Widget(_) => "",
         }
     }
@@ -106,7 +105,6 @@ pub fn widget_bucket(ctx: KeyContext) -> Option<char> {
         KeyContext::Editing => None,
         KeyContext::Picker => Some('P'),
         KeyContext::Select => Some('S'),
-        KeyContext::Panel => Some('L'),
     }
 }
 
@@ -704,12 +702,12 @@ fn mode_buckets(code: &str) -> &'static [char] {
         // ('picker', …)` lands here, and the matcher selects it via a `Widget` scope
         // while that widget grabs input (see [`widget_bucket`]). Distinct from every
         // editor-mode bucket above so widget maps never leak into editing and vice
-        // versa. picker / select / panel; cmdline reuses the `c` bucket. (The
-        // explorer / `nx.view` / quickfix buffers are ordinary buffers with
-        // buffer-local maps, not widget buckets — see the unify-special-buffers plan.)
+        // versa. picker / select; cmdline reuses the `c` bucket. (The explorer /
+        // `nx.view` / quickfix buffers, and the read-only scratch / loclist listings,
+        // are ordinary buffers with buffer-local maps, not widget buckets — see the
+        // unify-special-buffers plan.)
         "picker" => &['P'],
         "select" => &['S'],
-        "panel" => &['L'],
         // The command line reuses the existing command-mode bucket (`mode_key(Mode::
         // Command) == 'c'`); `cmdline` is just the readable alias for it, so its
         // default maps and a user `set('c', …)` compile into the same trie.

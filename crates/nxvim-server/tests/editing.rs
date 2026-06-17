@@ -35,6 +35,8 @@ mod global_cmd;
 mod highlights;
 #[path = "editing/jumplist.rs"]
 mod jumplist;
+#[path = "editing/listings.rs"]
+mod listings;
 #[path = "editing/lua_surface.rs"]
 mod lua_surface;
 #[path = "editing/marks.rs"]
@@ -43,8 +45,6 @@ mod marks;
 mod multicursor;
 #[path = "editing/numbers.rs"]
 mod numbers;
-#[path = "editing/panel.rs"]
-mod panel;
 #[path = "editing/registers.rs"]
 mod registers;
 #[path = "editing/rendering.rs"]

@@ -845,12 +845,11 @@ fn a_zero_duration_scroll_gesture_does_not_arm_an_animation() {
     // (NaN/inf progress → a one-frame glitch). `arm_animation` must skip it and
     // leave the static destination viewport the redraw already carries.
     let scroll = Value::Map(vec![
-        (Value::from("from_top"), Value::from(0u64)),
-        (Value::from("to_top"), Value::from(3u64)),
-        (Value::from("from_cursor"), Value::from(0u64)),
-        (Value::from("to_cursor"), Value::from(3u64)),
+        (Value::from("from_row"), Value::from(0u64)),
+        (Value::from("to_row"), Value::from(3u64)),
+        (Value::from("from_cursor_row"), Value::from(0u64)),
+        (Value::from("to_cursor_row"), Value::from(3u64)),
         (Value::from("duration_ms"), Value::from(0u64)),
-        (Value::from("base_line"), Value::from(0u64)),
         (
             Value::from("lines"),
             lines(&["l0", "l1", "l2", "l3", "l4", "l5"]),
@@ -892,12 +891,11 @@ fn the_visual_selection_grows_with_the_slide_instead_of_flashing_to_full_extent(
         Value::Nil,
     ]);
     let scroll = Value::Map(vec![
-        (Value::from("from_top"), Value::from(0u64)),
-        (Value::from("to_top"), Value::from(3u64)),
-        (Value::from("from_cursor"), Value::from(1u64)),
-        (Value::from("to_cursor"), Value::from(4u64)),
+        (Value::from("from_row"), Value::from(0u64)),
+        (Value::from("to_row"), Value::from(3u64)),
+        (Value::from("from_cursor_row"), Value::from(1u64)),
+        (Value::from("to_cursor_row"), Value::from(4u64)),
         (Value::from("duration_ms"), Value::from(10_000u64)), // long: paint at t≈0
-        (Value::from("base_line"), Value::from(0u64)),
         (Value::from("sel_extends_down"), Value::from(true)), // anchor above
         (
             Value::from("lines"),
@@ -953,12 +951,11 @@ fn shrinking_the_visual_selection_tracks_the_cursor_instead_of_vanishing() {
         Value::Nil,
     ]);
     let scroll = Value::Map(vec![
-        (Value::from("from_top"), Value::from(4u64)),
-        (Value::from("to_top"), Value::from(0u64)),
-        (Value::from("from_cursor"), Value::from(5u64)),
-        (Value::from("to_cursor"), Value::from(1u64)),
+        (Value::from("from_row"), Value::from(4u64)),
+        (Value::from("to_row"), Value::from(0u64)),
+        (Value::from("from_cursor_row"), Value::from(5u64)),
+        (Value::from("to_cursor_row"), Value::from(1u64)),
         (Value::from("duration_ms"), Value::from(10_000u64)), // long: paint at t≈0
-        (Value::from("base_line"), Value::from(0u64)),
         (Value::from("sel_extends_down"), Value::from(true)), // anchor above, still
         (
             Value::from("lines"),
@@ -1011,12 +1008,11 @@ fn search_matches_keep_highlighting_while_the_view_slides() {
             .collect(),
     );
     let scroll = Value::Map(vec![
-        (Value::from("from_top"), Value::from(0u64)),
-        (Value::from("to_top"), Value::from(3u64)),
-        (Value::from("from_cursor"), Value::from(0u64)),
-        (Value::from("to_cursor"), Value::from(3u64)),
+        (Value::from("from_row"), Value::from(0u64)),
+        (Value::from("to_row"), Value::from(3u64)),
+        (Value::from("from_cursor_row"), Value::from(0u64)),
+        (Value::from("to_cursor_row"), Value::from(3u64)),
         (Value::from("duration_ms"), Value::from(10_000u64)), // long: paint at t≈0
-        (Value::from("base_line"), Value::from(0u64)),
         (
             Value::from("lines"),
             lines(&["l0", "l1", "l2", "l3", "l4", "l5", "l6", "l7"]),

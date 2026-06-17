@@ -17,20 +17,29 @@ use crate::parse::{
 };
 use crate::style::{Border, Style};
 
-/// The scroll gesture mirrored from the server's redraw, ready to animate.
-/// Line/cursor positions are kept as `f32` for interpolation; `lines`/`selection`
-/// are the band covering the slide, anchored at `base_line`. A client that
-/// animates scrolling (the TUI) drives this; one that doesn't can ignore it.
+/// The scroll gesture mirrored from the server's redraw, ready to animate. The
+/// band is **screen-row based**: `lines` and the parallel overlay arrays are the
+/// over-scanned screen rows the slide reveals (one entry per row), and the slide
+/// is expressed as screen-row offsets *into the band* (`from_row`/`to_row`), kept
+/// as `f32` for interpolation. The client interpolates the offset and slices
+/// `rows[off .. off + height]` per frame. A client that animates scrolling drives
+/// this; one that doesn't can ignore it. Because the band is screen rows,
+/// interleaved `virt_lines` slide correctly (they are just more rows).
 #[derive(Clone)]
 pub struct ScrollData {
-    pub from_top: f32,
-    pub to_top: f32,
-    pub from_cursor: f32,
-    pub to_cursor: f32,
+    /// Screen-row offset of the viewport's top row into the band at slide start /
+    /// end (`rows[0]` is the topmost line's first screen row).
+    pub from_row: f32,
+    pub to_row: f32,
+    /// Screen-row offset of the cursor's row into the band at slide start / end.
+    pub from_cursor_row: f32,
+    pub to_cursor_row: f32,
     pub duration: Duration,
-    pub base_line: usize,
     pub lines: Vec<String>,
     pub selection: Vec<Option<(u16, u16)>>,
+    /// Per band row, the secondary multi-cursors' selection spans (the primary's
+    /// is in `selection`), so multi-cursor selections slide with the text.
+    pub secondary_selection: SearchSpans,
     /// Orientation of the visual selection sliding with the band: `Some(true)` the
     /// anchor is at/above the cursor (selection extends downward), `Some(false)`
     /// upward, `None` when no visual selection is sliding. The client clips the
@@ -56,9 +65,14 @@ pub struct ScrollData {
     /// Extmark `virt_text` placements for the band (aligned with `lines`), so eol /
     /// inline / overlay / win_col / right_align text slides with the line instead of
     /// flashing out and back when the slide settles. Same shape as the per-window
-    /// `virt_text`. (`virt_lines` whole-rows are not on the band — it is buffer-line
-    /// based and doesn't carry the interleaved virtual rows.)
+    /// `virt_text`.
     pub virt_text: Vec<Vec<VirtPlacement>>,
+    /// Extmark `virt_lines` content per band row (`Some(chunks)` for a virtual
+    /// row, else `None`) — the interleaved whole virtual rows now ride the band, so
+    /// they slide with the text instead of only appearing once the slide settles.
+    pub virt_lines: Vec<Option<Vec<VirtChunk>>>,
+    /// Inline diagnostic virtual text per band row, so it slides with the line.
+    pub diagnostics_virt: Vec<Option<DiagVirt>>,
     /// The style palette captured with this gesture. Snapshotted (not read live
     /// from [`View::styles`]) because a delayed highlight redraw arriving
     /// mid-slide replaces the live palette, which would leave the band's frozen
@@ -747,14 +761,14 @@ fn parse_window(m: &[(Value, Value)], styles: &[Style]) -> WindowView {
     let region = WindowRegion::from_wire(&map_str(m, "region"));
     let scroll = match map_get(m, "scroll") {
         Some(Value::Map(s)) => Some(ScrollData {
-            from_top: map_u64(s, "from_top") as f32,
-            to_top: map_u64(s, "to_top") as f32,
-            from_cursor: map_u64(s, "from_cursor") as f32,
-            to_cursor: map_u64(s, "to_cursor") as f32,
+            from_row: map_u64(s, "from_row") as f32,
+            to_row: map_u64(s, "to_row") as f32,
+            from_cursor_row: map_u64(s, "from_cursor_row") as f32,
+            to_cursor_row: map_u64(s, "to_cursor_row") as f32,
             duration: Duration::from_millis(map_u64(s, "duration_ms")),
-            base_line: map_u64(s, "base_line") as usize,
             lines: map_str_array(s, "lines"),
             selection: parse_spans(map_get(s, "selection")),
+            secondary_selection: parse_multi_spans(map_get(s, "secondary_selection")),
             sel_extends_down: map_get(s, "sel_extends_down").and_then(Value::as_bool),
             search: parse_multi_spans(map_get(s, "search")),
             incsearch: parse_spans(map_get(s, "incsearch")),
@@ -762,6 +776,8 @@ fn parse_window(m: &[(Value, Value)], styles: &[Style]) -> WindowView {
             highlights: parse_highlights(map_get(s, "highlights")),
             inlay_hints: parse_inlay_hints(map_get(s, "inlay_hints")),
             virt_text: parse_virt_text(map_get(s, "virt_text")),
+            virt_lines: parse_virt_lines(map_get(s, "virt_lines")),
+            diagnostics_virt: parse_diagnostics_virt(map_get(s, "diagnostics_virt")),
             // The band's ids index this redraw's palette — snapshot it now, since
             // a later redraw will replace the live `styles`.
             styles: styles.to_vec(),

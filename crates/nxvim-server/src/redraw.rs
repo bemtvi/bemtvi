@@ -8,10 +8,10 @@ use nxvim_core::highlight::Style;
 use nxvim_core::statusline::{self, ExprKind};
 use nxvim_core::unicode;
 use nxvim_core::view::{
-    MenuView, RegionTabline, RegionTablines, ScrollAnim, Separator, TabView, ViewRect,
+    MenuView, RegionTabline, RegionTablines, RenderRow, ScrollAnim, Separator, TabView, ViewRect,
     WindowRegion, WindowView,
 };
-use nxvim_core::{BorderStyle, ContentFloatView, MenuPlacement, PanelView};
+use nxvim_core::{BorderStyle, ContentFloatView, MenuPlacement, PanelView, VirtChunk};
 use rmpv::Value;
 use std::collections::HashMap;
 
@@ -294,22 +294,17 @@ impl EditHost {
         // (`win.rows`) — the single source of truth core projects from. The wire
         // still carries the parallel per-row arrays clients decode, so unbundle
         // them once here; every projection below keys on these exactly as it did
-        // when they were `WindowView` fields, so the bytes are unchanged.
-        let lines: Vec<String> = win.rows.iter().map(|r| r.text.clone()).collect();
-        let numbers: Vec<Option<usize>> = win.rows.iter().map(|r| r.number()).collect();
-        let selection: Vec<Option<(usize, usize)>> = win.rows.iter().map(|r| r.selection).collect();
-        let secondary_selection: Vec<Vec<(usize, usize)>> = win
-            .rows
-            .iter()
-            .map(|r| r.secondary_selection.clone())
-            .collect();
-        let search: Vec<Vec<(usize, usize)>> = win.rows.iter().map(|r| r.search.clone()).collect();
-        let incsearch: Vec<Option<(usize, usize)>> = win.rows.iter().map(|r| r.incsearch).collect();
-        let virt_lines = win
-            .rows
-            .iter()
-            .map(|r| r.virt_line.clone())
-            .collect::<Vec<_>>();
+        // when they were `WindowView` fields, so the bytes are unchanged. The scroll
+        // band reuses the same unbundling over its (taller) row set.
+        let RowArrays {
+            lines,
+            numbers,
+            selection,
+            secondary_selection,
+            search,
+            incsearch,
+            virt_lines,
+        } = unbundle_rows(&win.rows);
         // Syntax highlights (treesitter) and the LSP overlays (diagnostics / signs /
         // inlay hints) are native-only projections; the browser build emits empty
         // arrays for them so the redraw map keeps a stable shape (JS-side highlighting
@@ -781,58 +776,77 @@ impl EditHost {
     }
 
     /// Project a scroll-animation band into the `scroll` sub-map a client animates
-    /// the slide from. Mirrors the main map's lines/selection/numbers/highlights
-    /// projection over the (taller) animation window.
+    /// the slide from. The band is now **screen-row based** and projected exactly
+    /// like a window: the same `unbundle_rows` + overlay projection over `s.rows`
+    /// (a taller `RenderRow` set), so it carries everything a window does —
+    /// including the interleaved `virt_lines` rows, secondary selections, and
+    /// diagnostic virtual text that the old buffer-line band could not. The slide
+    /// is expressed as the screen-row offsets `from_row`/`to_row` into the band.
     pub(crate) fn project_band(
         &self,
         buffer: nxvim_core::BufferId,
         s: &ScrollAnim,
         styles: &mut StyleTable,
     ) -> Value {
+        let RowArrays {
+            lines,
+            numbers,
+            selection,
+            secondary_selection,
+            search,
+            incsearch,
+            virt_lines,
+        } = unbundle_rows(&s.rows);
         // Native-only overlays (see `window_value`); the browser band carries empty
-        // highlight/inlay arrays.
+        // highlight/inlay/diagnostic arrays.
         #[cfg(feature = "native")]
-        let highlights = self.highlights_for(buffer, &s.numbers, styles);
+        let (highlights, inlay_hints, diagnostics_virt) = (
+            self.highlights_for(buffer, &numbers, styles),
+            self.inlay_hints_for(buffer, &numbers, styles),
+            self.diagnostics_virt_text_for(buffer, &numbers, styles),
+        );
         #[cfg(not(feature = "native"))]
-        let highlights = Value::Array(Vec::new());
-        // Inlay hints ride the band too (keyed on `s.numbers` like highlights), so
-        // they slide with the text instead of vanishing until the slide settles.
-        #[cfg(feature = "native")]
-        let inlay_hints = self.inlay_hints_for(buffer, &s.numbers, styles);
-        #[cfg(not(feature = "native"))]
-        let inlay_hints = Value::Array(Vec::new());
-        // Extmark `virt_text` placements ride the band too (keyed on `s.numbers` like
-        // highlights), so eol / inline / overlay / win_col / right_align text slides
-        // with the line instead of flashing out and back when the slide settles. Pure
-        // projection (un-gated, like `window_value`), so the wasm band carries it too.
-        // (`virt_lines` whole-rows are *not* on the band: it is buffer-line-based and
-        // doesn't model the interleaved virtual rows — those still appear only at the
-        // settled frame. Carrying them needs the band rebuilt in screen-row units.)
-        let virt_text = self.virt_text_for(buffer, &s.numbers, &s.selection, styles);
+        let (highlights, inlay_hints, diagnostics_virt) = (
+            Value::Array(Vec::new()),
+            Value::Array(Vec::new()),
+            Value::Array(Vec::new()),
+        );
+        // Extmark `virt_text` + `virt_lines` ride the band (pure projections, like
+        // `window_value`), so they slide with the text instead of flashing on settle.
+        let virt_text = self.virt_text_for(buffer, &numbers, &selection, styles);
+        let virt_lines = self.virt_lines_value(&virt_lines, styles);
         Value::Map(vec![
-            (Value::from("from_top"), Value::from(s.from_top as u64)),
-            (Value::from("to_top"), Value::from(s.to_top as u64)),
+            (Value::from("from_row"), Value::from(s.from_row as u64)),
+            (Value::from("to_row"), Value::from(s.to_row as u64)),
             (
-                Value::from("from_cursor"),
-                Value::from(s.from_cursor as u64),
+                Value::from("from_cursor_row"),
+                Value::from(s.from_cursor_row as u64),
             ),
-            (Value::from("to_cursor"), Value::from(s.to_cursor as u64)),
+            (
+                Value::from("to_cursor_row"),
+                Value::from(s.to_cursor_row as u64),
+            ),
             (Value::from("duration_ms"), Value::from(s.duration_ms)),
-            (Value::from("base_line"), Value::from(s.base_line as u64)),
-            (Value::from("lines"), display_lines_value(&s.lines)),
-            (Value::from("selection"), spans_value(&s.selection)),
+            (Value::from("lines"), display_lines_value(&lines)),
+            (Value::from("selection"), spans_value(&selection)),
+            (
+                Value::from("secondary_selection"),
+                multi_spans_value(&secondary_selection),
+            ),
             (
                 Value::from("sel_extends_down"),
                 s.sel_extends_down.map_or(Value::Nil, Value::from),
             ),
             // hlsearch / incsearch matches for the band, so the highlight rides the
             // slide rather than vanishing until it settles (mirrors `window_value`).
-            (Value::from("search"), multi_spans_value(&s.search)),
-            (Value::from("incsearch"), spans_value(&s.incsearch)),
-            (Value::from("numbers"), numbers_value(&s.numbers)),
+            (Value::from("search"), multi_spans_value(&search)),
+            (Value::from("incsearch"), spans_value(&incsearch)),
+            (Value::from("numbers"), numbers_value(&numbers)),
             (Value::from("highlights"), highlights),
             (Value::from("inlay_hints"), inlay_hints),
             (Value::from("virt_text"), virt_text),
+            (Value::from("virt_lines"), virt_lines),
+            (Value::from("diagnostics_virt"), diagnostics_virt),
         ])
     }
 
@@ -1035,6 +1049,35 @@ fn rect_value(rect: &ViewRect) -> Value {
         (Value::from("width"), Value::from(rect.width as u64)),
         (Value::from("height"), Value::from(rect.height as u64)),
     ])
+}
+
+/// The parallel per-row wire arrays a client decodes, unbundled from core's
+/// self-describing [`RenderRow`] layout. Shared by the settled window
+/// (`window_value`) and the scroll band (`project_band`) — the band is just a
+/// taller row set, so projecting it is identical work.
+struct RowArrays {
+    lines: Vec<String>,
+    numbers: Vec<Option<usize>>,
+    selection: Vec<Option<(usize, usize)>>,
+    secondary_selection: Vec<Vec<(usize, usize)>>,
+    search: Vec<Vec<(usize, usize)>>,
+    incsearch: Vec<Option<(usize, usize)>>,
+    virt_lines: Vec<Option<Vec<VirtChunk>>>,
+}
+
+/// Unbundle a [`RenderRow`] slice into the parallel per-row arrays the wire
+/// carries (one entry per screen row, in order). The native highlight / inlay /
+/// diagnostic projections then key on `numbers` exactly as before.
+fn unbundle_rows(rows: &[RenderRow]) -> RowArrays {
+    RowArrays {
+        lines: rows.iter().map(|r| r.text.clone()).collect(),
+        numbers: rows.iter().map(|r| r.number()).collect(),
+        selection: rows.iter().map(|r| r.selection).collect(),
+        secondary_selection: rows.iter().map(|r| r.secondary_selection.clone()).collect(),
+        search: rows.iter().map(|r| r.search.clone()).collect(),
+        incsearch: rows.iter().map(|r| r.incsearch).collect(),
+        virt_lines: rows.iter().map(|r| r.virt_line.clone()).collect(),
+    }
 }
 
 /// Encode a slice of text rows as a msgpack array of strings — verbatim, the raw

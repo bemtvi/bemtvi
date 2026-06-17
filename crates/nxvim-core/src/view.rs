@@ -19,48 +19,44 @@ use crate::mode::Mode;
 use crate::statusline::StatuslineCtx;
 use crate::unicode;
 
-/// A scroll gesture for the client to animate. Self-contained: it carries its
-/// own band of rendered lines (`lines`) and selection spans covering every row
-/// visible during the slide, anchored at `base_line`. The client interpolates
-/// `from`→`to` against its local clock and slices `lines` per frame; the main
-/// `View` fields stay the *destination* viewport for clients that don't animate.
+/// A scroll gesture for the client to animate. Self-contained and **screen-row
+/// based**: it carries an over-scanned band of [`RenderRow`]s — every screen row
+/// the slide reveals, each with its own text and overlays — and the slide is
+/// expressed as screen-row offsets *into that band*. The client interpolates
+/// `from_row`→`to_row` against its local clock and slices `rows[off .. off +
+/// height]` per frame; the main `View` fields stay the *destination* viewport for
+/// clients that don't animate.
+///
+/// Because the band is screen rows (not buffer lines), interleaved `virt_lines`
+/// and (later) wrapped continuation rows slide correctly — they are simply more
+/// rows in the band, and the offset advances one screen row at a time regardless
+/// of how many screen rows a buffer line expands into.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ScrollAnim {
-    pub from_top: usize,
-    pub to_top: usize,
-    pub from_cursor: usize,
-    pub to_cursor: usize,
+    /// Screen-row offset into `rows` of the viewport's top row at slide start /
+    /// end. `rows[0]` is the topmost viewport line's first screen row, so these
+    /// are `0` and the slide's screen-row distance (in either order).
+    pub from_row: usize,
+    pub to_row: usize,
+    /// Screen-row offset into `rows` of the cursor's row at slide start / end, so
+    /// the cursor (and the relative-number gutter) tracks the moving text.
+    pub from_cursor_row: usize,
+    pub to_cursor_row: usize,
     pub duration_ms: u64,
-    /// Buffer-line index of `lines[0]` (= `min(from_top, to_top)`).
-    pub base_line: usize,
-    /// `|to_top - from_top| + height` rows starting at `base_line`, "~"-padded
-    /// past end of buffer.
-    pub lines: Vec<String>,
-    /// Selection spans aligned with `lines` (same length), covering the
-    /// **maximal** extent the slide touches (anchor → the scroll endpoint
-    /// furthest from the anchor), so the client can grow *and* shrink the
-    /// highlight to the interpolated cursor. See [`sel_extends_down`].
-    ///
-    /// [`sel_extends_down`]: ScrollAnim::sel_extends_down
-    pub selection: Vec<Option<(usize, usize)>>,
+    /// The over-scanned screen-row layout the slide reveals — the same
+    /// [`RenderRow`] the settled frame uses, just taller. Carries each row's text,
+    /// `virt_lines` content, and every overlay (selection / secondary selection /
+    /// search / incsearch), so the band is projected exactly like a window.
+    pub rows: Vec<RenderRow>,
     /// Orientation of the visual selection sliding with the band, used by the
     /// client to clip the highlight's moving edge to the interpolated cursor:
     /// `Some(true)` when the anchor is at/above the cursor (selection extends
     /// downward, so rows below the cursor aren't selected yet), `Some(false)`
-    /// when it extends upward, `None` when no visual selection is sliding.
+    /// when it extends upward, `None` when no visual selection is sliding. The
+    /// band's `selection` already covers the **maximal** extent the slide touches
+    /// (anchor → the scroll endpoint furthest from the anchor), so the client can
+    /// grow *and* shrink the highlight to the interpolated cursor.
     pub sel_extends_down: Option<bool>,
-    /// 1-based buffer line number per row (aligned with `lines`), `None` for
-    /// `~` filler rows, so the number column slides with the text during the
-    /// animation.
-    pub numbers: Vec<Option<usize>>,
-    /// Per band row (aligned with `lines`), the half-open screen-column spans of
-    /// every `hlsearch` match — so the search highlight rides the slide instead of
-    /// vanishing until it settles. Empty inner vec for rows with no match.
-    pub search: Vec<Vec<(usize, usize)>>,
-    /// Per band row, the live `incsearch` preview match, or `None` — carried for
-    /// the same reason as [`search`](ScrollAnim::search) (a scroll while the search
-    /// prompt is open).
-    pub incsearch: Vec<Option<(usize, usize)>>,
 }
 
 /// What a single screen row of a window's text body *is*. A buffer line expands
@@ -698,38 +694,28 @@ fn window_view(ed: &Editor, w: &WindowLayout) -> WindowView {
     // search, incsearch) rides on the row it belongs to. With no `virt_lines` this
     // is one row per buffer line. There is no separate per-array scatter step — the
     // overlays are written straight onto the rows they fall on.
-    let rows = render_rows(ed, buf, top, height, line_count, w.focused, width, w.cursor);
+    let rows = render_rows(
+        ed, buf, top, height, line_count, w.focused, width, w.cursor, ed.cursor,
+    );
 
     let scroll = if w.focused {
-        ed.pending_scroll().and_then(|ps| {
+        ed.pending_scroll().map(|ps| {
+            // The band is anchored at the slide's topmost viewport line and spans, in
+            // **screen rows**, from there down past the lower viewport plus a window
+            // height — so whichever endpoint the slide rests at, `height` real rows are
+            // under the offset. `virt_lines` no longer force an instant snap: they are
+            // just more rows in the band, counted by `screen_rows_between`.
             let base_line = ps.from_top.min(ps.to_top);
-            let count = ps.from_top.abs_diff(ps.to_top) + height;
-            // `virt_lines` (whole extra screen rows) make the band's screen-row geometry
-            // non-linear: the buffer-line-based slide can't place them without detaching
-            // them from their anchor line mid-slide. When the slide's range contains any,
-            // fall back to an **instant** scroll (no gesture → the client paints the
-            // settled frame, where the view's interleaved layout renders the virtual rows
-            // correctly) rather than animate them wrong. `virt_text` placements sit on
-            // existing lines, so they still ride the band (the common case keeps its
-            // smooth slide; only a virt_lines-containing range snaps).
-            if buf
-                .virt_lines_by_line()
-                .range(base_line..base_line.saturating_add(count))
-                .next()
-                .is_some()
-            {
-                return None;
-            }
-            // The band carries the selection over the *maximal* extent the slide
-            // touches: anchor → whichever scroll endpoint is furthest from the
-            // anchor. Computing it at the live (destination) cursor would carry the
-            // *small* end when the selection is shrinking, so the rows the cursor is
-            // still sweeping back across wouldn't be in the band and would flash.
-            // The client reveals/hides them per the interpolated cursor (see
-            // `sel_extends_down`). (A selection whose anchor sits *between* the two
-            // scroll endpoints — the cursor crossing the anchor mid-slide — only
-            // gets the far side's rows; the near side is a rare, minor under-show.)
-            let (selection, sel_extends_down) = if ed.mode.is_visual() {
+            let max_top = ps.from_top.max(ps.to_top);
+            let lead = screen_rows_between(buf, base_line, max_top, line_count);
+            let band_height = lead + height;
+            // The selection rides the band at the *maximal* extent the slide touches:
+            // anchor → whichever scroll endpoint is furthest from the anchor. Projecting
+            // the destination cursor's extent would carry the *small* end while
+            // shrinking, so the rows the cursor sweeps back across would flash instead of
+            // sliding; the client reveals/hides them per the interpolated cursor (see
+            // `sel_extends_down`). `sel_head` feeds that extent into `render_rows`.
+            let (sel_head, sel_extends_down) = if ed.mode.is_visual() {
                 let anchor_line = ed.visual_anchor().line;
                 let far_line =
                     if anchor_line.abs_diff(ps.from_cursor) >= anchor_line.abs_diff(ps.to_cursor) {
@@ -739,31 +725,34 @@ fn window_view(ed: &Editor, w: &WindowLayout) -> WindowView {
                     };
                 let mut head = ed.cursor;
                 head.line = far_line;
-                let spans =
-                    selection_spans_with_head(ed, buf, width, line_count, base_line, count, head);
-                (spans, Some(anchor_line <= far_line))
+                (head, Some(anchor_line <= far_line))
             } else {
-                (vec![None; count], None)
+                (ed.cursor, None)
             };
-            // The hlsearch / incsearch matches over the *band's* rows, so the
-            // highlight slides with the text instead of disappearing for the
-            // duration of the animation and snapping back when it settles.
-            let (band_search, band_incsearch) =
-                ed.search_highlights_in(buf, w.cursor, w.focused, base_line, count);
-            Some(ScrollAnim {
-                from_top: ps.from_top,
-                to_top: ps.to_top,
-                from_cursor: ps.from_cursor,
-                to_cursor: ps.to_cursor,
-                duration_ms: ps.duration_ms,
+            // The band is projected exactly like a window — one `render_rows` over the
+            // taller screen-row range — so it carries every overlay the settled frame
+            // does (selection, secondary selections, search, incsearch, and the
+            // interleaved `virt_lines` rows), keyed on the same rows.
+            let band_rows = render_rows(
+                ed,
+                buf,
                 base_line,
-                lines: window_lines(buf, base_line, count, line_count),
-                selection,
+                band_height,
+                line_count,
+                true,
+                width,
+                w.cursor,
+                sel_head,
+            );
+            ScrollAnim {
+                from_row: screen_rows_between(buf, base_line, ps.from_top, line_count),
+                to_row: screen_rows_between(buf, base_line, ps.to_top, line_count),
+                from_cursor_row: cursor_band_row(buf, base_line, ps.from_cursor, line_count),
+                to_cursor_row: cursor_band_row(buf, base_line, ps.to_cursor, line_count),
+                duration_ms: ps.duration_ms,
+                rows: band_rows,
                 sel_extends_down,
-                numbers: window_numbers(base_line, count, line_count),
-                search: band_search,
-                incsearch: band_incsearch,
-            })
+            }
         })
     } else {
         None
@@ -963,30 +952,35 @@ fn window_status_ctx(inp: StatusCtxInputs) -> StatuslineCtx {
     }
 }
 
-/// 1-based buffer line number for each of the `count` rows starting at buffer
-/// line `base`, `None` for rows past the end of the buffer (the `~` fillers).
-fn window_numbers(base: usize, count: usize, line_count: usize) -> Vec<Option<usize>> {
-    (0..count)
-        .map(|row| {
-            let idx = base + row;
-            (idx < line_count).then_some(idx + 1)
+/// The number of **screen rows** the buffer lines `[base, target)` occupy: each
+/// line is one text row plus its `virt_lines` above/below (and past end-of-buffer
+/// each `~` filler is one row). This maps a buffer-line viewport top to its
+/// screen-row offset within a band anchored at `base` — the bridge from the
+/// buffer-line scroll *gesture* to the screen-row band. (`target >= base`.)
+fn screen_rows_between(buf: &Buffer, base: usize, target: usize, line_count: usize) -> usize {
+    let virt = buf.virt_lines_by_line();
+    (base..target)
+        .map(|line| {
+            if line < line_count {
+                virt.get(&line)
+                    .map_or(1, |r| 1 + r.above.len() + r.below.len())
+            } else {
+                1
+            }
         })
-        .collect()
+        .sum()
 }
 
-/// Build `count` rendered rows starting at buffer line `base`, padding rows past
-/// the end of the buffer with `"~"` (as vim shows below the last line).
-fn window_lines(buf: &Buffer, base: usize, count: usize, line_count: usize) -> Vec<String> {
-    let mut lines = Vec::with_capacity(count);
-    for row in 0..count {
-        let idx = base + row;
-        if idx < line_count {
-            lines.push(buf.line(idx));
-        } else {
-            lines.push("~".to_string());
-        }
-    }
-    lines
+/// The cursor line's screen-row offset within a band anchored at `base`: the
+/// screen rows of `[base, cursor_line)` plus the cursor line's own `virt_lines`
+/// *above* (the cursor sits on the text row, after any virtual rows above it).
+/// Mirrors [`Editor::cursor_screen_row`](crate::Editor) for the band frame.
+fn cursor_band_row(buf: &Buffer, base: usize, cursor_line: usize, line_count: usize) -> usize {
+    let above = buf
+        .virt_lines_by_line()
+        .get(&cursor_line)
+        .map_or(0, |r| r.above.len());
+    screen_rows_between(buf, base, cursor_line, line_count) + above
 }
 
 /// Lay out `height` screen rows starting at buffer line `base`, **expanding** each
@@ -1074,6 +1068,10 @@ fn row_skeleton(buf: &Buffer, base: usize, height: usize, line_count: usize) -> 
 /// by each [`RowKind::Line`] row's buffer line, which is how a virtual / `~` row
 /// ends up with the defaults. This is the single place the settled frame and the
 /// scroll band both build their rows from.
+///
+/// `cursor` drives the `incsearch` window; `sel_head` is the visual selection's
+/// head — the live cursor for the settled frame, or the slide's furthest extent
+/// for the scroll band (so it carries the maximal selection it touches).
 #[allow(clippy::too_many_arguments)]
 fn render_rows(
     ed: &Editor,
@@ -1084,12 +1082,13 @@ fn render_rows(
     focused: bool,
     width: usize,
     cursor: Cursor,
+    sel_head: Cursor,
 ) -> Vec<RenderRow> {
     let mut rows = row_skeleton(buf, base, height, line_count);
     if !focused {
         return rows;
     }
-    let selection = selection_spans(ed, buf, width, line_count, base, height);
+    let selection = selection_spans_with_head(ed, buf, width, line_count, base, height, sel_head);
     let secondary = secondary_selection_spans(ed, buf, width, line_count, base, height);
     let (search, incsearch) = ed.search_highlights_in(buf, cursor, focused, base, height);
     for row in &mut rows {
@@ -1115,22 +1114,11 @@ fn screen_row_of(rows: &[RenderRow], line: usize) -> Option<usize> {
 
 /// Compute, for each of the `count` rows starting at buffer line `base`, the
 /// half-open screen-column span to highlight as the visual selection (or
-/// `None`). Returns all-`None` outside visual modes. Called for the focused
-/// window only, so the editor's live `mode`/`cursor`/anchor describe `buf`.
-fn selection_spans(
-    ed: &Editor,
-    buf: &Buffer,
-    width: usize,
-    line_count: usize,
-    base: usize,
-    count: usize,
-) -> Vec<Option<(usize, usize)>> {
-    selection_spans_with_head(ed, buf, width, line_count, base, count, ed.cursor)
-}
-
-/// [`selection_spans`] with an explicit selection `head` instead of the live
-/// cursor — so the scroll band can project the selection at the slide's furthest
-/// extent (rather than the destination cursor) and let the client clip it back to
+/// `None`) for an explicit selection `head`. Returns all-`None` outside visual
+/// modes. Called for the focused window only, so the editor's live `mode` /
+/// anchor describe `buf`. The settled frame passes the live cursor as `head`; the
+/// scroll band passes the slide's furthest extent (so it carries the maximal
+/// selection it touches) and lets the client clip it back to
 /// the interpolated cursor.
 fn selection_spans_with_head(
     ed: &Editor,

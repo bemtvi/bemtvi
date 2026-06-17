@@ -457,15 +457,60 @@ async fn ctrl_d_emits_half_page_scroll() {
 
     let map = scroll_after(&rpc, &mut incoming, "<C-d>").await;
 
-    // Viewport height 24 → half page = 12.
+    // Viewport height 24 → half page = 12. (The buffer-line names are derived from
+    // the screen-row band; with no virt_lines they equal the buffer-line offsets.)
     assert_eq!(scroll_u64(&map, "from_top"), 0);
     assert_eq!(scroll_u64(&map, "to_top"), 12);
     assert_eq!(scroll_u64(&map, "from_cursor"), 0);
     assert_eq!(scroll_u64(&map, "to_cursor"), 12);
-    assert_eq!(scroll_u64(&map, "base_line"), 0);
     assert_eq!(scroll_u64(&map, "duration_ms"), 96); // 12 * 8, within [80,160]
-                                                     // Window = |to-from| + height = 12 + 24.
+                                                     // Band screen rows = |to-from| + height = 12 + 24.
     assert_eq!(scroll_lines_len(&map), 36);
+}
+
+#[tokio::test]
+async fn virt_lines_scroll_animates_and_interleaves_the_virtual_row() {
+    // A scroll whose range contains a `virt_lines` extmark used to fall back to an
+    // instant snap (no gesture) — the band was buffer-line based and couldn't place
+    // the extra screen rows. The band is now screen-row based, so the virtual rows
+    // ride the slide: the redraw carries a gesture, and the band interleaves the
+    // virtual row (a `None`-numbered band row, making the band one row taller).
+    let path = write_n_lines("vlscroll", 100);
+    let (rpc, mut incoming) = start(Some(path)).await;
+
+    // A whole virtual row below line 4 (index 3), inside the half-page <C-d> range.
+    exec_lua(
+        &rpc,
+        r#"local ns = vim.api.nvim_create_namespace("vl")
+           vim.api.nvim_buf_set_extmark(0, ns, 3, 0, {
+               virt_lines = { { { "-- virtual --", "Comment" } } },
+           })"#,
+    )
+    .await;
+    let _ = lines(&rpc).await; // barrier: flush the decor redraw
+
+    let map = scroll_after(&rpc, &mut incoming, "<C-d>").await;
+
+    // Previously this snapped (scroll == None); now it animates.
+    assert!(
+        scroll(&map).is_some(),
+        "a virt_lines-containing scroll now animates instead of snapping"
+    );
+    // The band interleaves the virtual row: line 4 (index 3) sits at band row 3, its
+    // `virt_lines`-below virtual row at band row 4 (a `None` number), then line 5.
+    let numbers = scroll_numbers(&map);
+    assert_eq!(numbers[3], Some(4), "line 4 is band row 3");
+    assert_eq!(
+        numbers[4], None,
+        "the interleaved virtual row carries no number"
+    );
+    assert_eq!(numbers[5], Some(5), "line 5 follows the virtual row");
+    // The extra screen row makes the band one taller than the plain |12| + 24 = 36.
+    assert_eq!(
+        scroll_lines_len(&map),
+        37,
+        "the band over-scans the virtual row"
+    );
 }
 
 #[tokio::test]
@@ -971,7 +1016,6 @@ async fn ctrl_u_mid_buffer_scrolls_up() {
     assert_eq!(scroll_u64(&map, "to_top"), 10);
     assert_eq!(scroll_u64(&map, "from_cursor"), 22);
     assert_eq!(scroll_u64(&map, "to_cursor"), 10);
-    assert_eq!(scroll_u64(&map, "base_line"), 10); // min(from, to)
     assert_eq!(scroll_u64(&map, "duration_ms"), 96); // 12 * 8
     assert_eq!(scroll_lines_len(&map), 36); // |22 - 10| + 24
 }
@@ -1046,7 +1090,6 @@ async fn count_motion_emits_scroll() {
     assert_eq!(scroll_u64(&map, "to_top"), 7);
     assert_eq!(scroll_u64(&map, "from_cursor"), 0);
     assert_eq!(scroll_u64(&map, "to_cursor"), 30);
-    assert_eq!(scroll_u64(&map, "base_line"), 0);
     assert_eq!(scroll_u64(&map, "duration_ms"), 80); // 7*8=56, clamped up to 80
     assert_eq!(scroll_lines_len(&map), 31); // |7 - 0| + 24
 }
@@ -1064,7 +1107,6 @@ async fn g_to_last_line_emits_capped_scroll() {
     assert_eq!(scroll_u64(&map, "to_top"), 76);
     assert_eq!(scroll_u64(&map, "from_cursor"), 51); // 99 - 48 (cap)
     assert_eq!(scroll_u64(&map, "to_cursor"), 99);
-    assert_eq!(scroll_u64(&map, "base_line"), 28);
     assert_eq!(scroll_u64(&map, "duration_ms"), 160); // 48*8=384, clamped to 160
     assert_eq!(scroll_lines_len(&map), 72); // 48 + 24
 }
@@ -1081,7 +1123,6 @@ async fn gg_back_to_top_emits_capped_scroll() {
     assert_eq!(scroll_u64(&map, "to_top"), 0);
     assert_eq!(scroll_u64(&map, "from_cursor"), 48);
     assert_eq!(scroll_u64(&map, "to_cursor"), 0);
-    assert_eq!(scroll_u64(&map, "base_line"), 0);
     assert_eq!(scroll_u64(&map, "duration_ms"), 160);
     assert_eq!(scroll_lines_len(&map), 72);
 }

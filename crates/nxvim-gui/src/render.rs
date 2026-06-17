@@ -121,21 +121,23 @@ struct TextItem {
 }
 
 /// An interpolated scroll-slide frame for the focused window, supplied by the
-/// client clock each animation frame. `top`/`cursor` are fractional 0-based line
-/// indices (the smoothness comes from *not* rounding them); the band
-/// (`lines`/`numbers`/`highlights`, palette `styles`) starts at `base_line`, so
-/// band entry `k` is buffer line `base_line + k`, drawn at sub-pixel
-/// `y = (base_line + k - top) * cell_h`.
+/// client clock each animation frame. The band is **screen-row based**:
+/// `lines`/the overlay arrays are the over-scanned screen rows, and `row_off` is
+/// the viewport top's fractional screen-row offset into them (the smoothness comes
+/// from *not* rounding it). Band entry `k` is drawn at sub-pixel
+/// `y = (k - row_off) * cell_h`, so an interleaved `virt_lines` row simply slides
+/// like any other. `cursor_row` is the cursor's fractional band-row offset.
 pub struct ScrollFrame<'a> {
-    pub top: f32,
-    pub cursor: f32,
-    pub base_line: usize,
+    pub row_off: f32,
+    pub cursor_row: f32,
     pub lines: &'a [String],
     /// Per-row visual-selection spans for the band (aligned with `lines`), so the
     /// selection slides with the text. `None` rows carry no selection.
     pub selection: &'a [Option<(u16, u16)>],
-    /// How to clip the selection's moving edge to the interpolated `cursor` as the
-    /// slide grows: `Some(true)` extending down, `Some(false)` up, `None` for a
+    /// Per-row secondary multi-cursor selection spans, so they slide too.
+    pub secondary_selection: &'a [Vec<(u16, u16)>],
+    /// How to clip the selection's moving edge to the interpolated `cursor_row` as
+    /// the slide grows: `Some(true)` extending down, `Some(false)` up, `None` for a
     /// pure scroll (cursor unmoved) where the full extent just slides.
     pub sel_clip: Option<bool>,
     pub numbers: &'a [Option<usize>],
@@ -152,6 +154,9 @@ pub struct ScrollFrame<'a> {
     /// Extmark `virt_text` placements for the band (aligned with `lines`), so they
     /// slide with the line instead of flashing out and back when the slide settles.
     pub virt_text: &'a [Vec<VirtPlacement>],
+    /// Per-row extmark `virt_lines` content (`Some(chunks)` for a virtual row),
+    /// interleaved into the band so virtual rows slide with the text.
+    pub virt_lines: &'a [Option<Vec<VirtChunk>>],
     pub styles: &'a [Style],
 }
 
@@ -884,33 +889,67 @@ impl Renderer {
                 let sel_bg = style_bg(&view.visual).unwrap_or(0x33_47_5b);
                 let search_bg = style_bg(&view.search_style).unwrap_or(0x6a_5a_1a);
                 let inc_bg = style_bg(&view.incsearch_style).unwrap_or(0x8a_6d_1a);
-                // The cursor line tracks the interpolated slide, so relative numbers
-                // stay in step with the moving text; the selection's moving edge is
-                // clipped to the same line (see `sel_clip`).
-                let cur_line0 = s.cursor.round() as usize; // 0-based interpolated cursor
-                let current_line = cur_line0 + 1;
+                // The cursor's band row tracks the interpolated slide, so relative
+                // numbers stay in step with the moving text and the selection's
+                // moving edge clips to it (see `sel_clip`). `numbers` at that band
+                // row gives the cursor's 1-based buffer line.
+                let cur_row0 = s.cursor_row.round() as usize; // band-row of the cursor
+                let current_line = s.numbers.get(cur_row0).copied().flatten().unwrap_or(1);
                 for (k, raw) in s.lines.iter().enumerate() {
-                    let row = (s.base_line + k) as f32 - s.top;
+                    // Screen-row band: row `k` sits `k - row_off` rows below the
+                    // viewport top, drawn sub-pixel. Interleaved `virt_lines` rows are
+                    // just more band rows, so they slide with everything else.
+                    let row = k as f32 - s.row_off;
                     if row <= -1.0 || row >= text_rows as f32 {
                         continue; // fully outside the text area
                     }
                     let y = (oy as f32 + row) * self.cell_h;
+                    // A `virt_lines` virtual row rides the band now: paint its chunk
+                    // text at the sub-pixel offset and skip the rest of the row (no
+                    // gutter/selection/search). Chunk backgrounds settle in when the
+                    // slide ends, like other mid-slide virtual text.
+                    if let Some(Some(chunks)) = s.virt_lines.get(k) {
+                        let segs: Vec<Seg> = chunks
+                            .iter()
+                            .map(|(t, id)| virt_chunk_seg(t, *id, s.styles, fg))
+                            .collect();
+                        let x = text_run_origin(text_x0, win.leftcol) as f32 * self.cell_w;
+                        self.push_text(items, &segs, (x, y), fg, clip);
+                        continue;
+                    }
                     let inlay = s.inlay_hints.get(k).map(Vec::as_slice).unwrap_or(&[]);
                     // Visual selection rides the slide. Its moving edge grows with the
                     // scroll: rows the interpolated cursor hasn't reached yet are not
                     // highlighted (the band carries the destination extent), so the
                     // selection extends together with the slide instead of flashing to
                     // full extent on frame 0. A pure scroll (`sel_clip == None`) slides
-                    // the whole extent. The quad clamps to the text area vertically
+                    // the whole extent. The clip is in band-row space (`k` vs the
+                    // cursor's band row). The quad clamps to the text area vertically
                     // (quads aren't scissored) so a partial row cuts off at the edge.
                     if let Some(Some(span)) = s.selection.get(k) {
-                        let line0 = s.base_line + k; // 0-based buffer line of this row
                         let hidden = match s.sel_clip {
-                            Some(true) => line0 > cur_line0,
-                            Some(false) => line0 < cur_line0,
+                            Some(true) => k > cur_row0,
+                            Some(false) => k < cur_row0,
                             None => false,
                         };
                         if !hidden {
+                            self.push_span_quad_at(
+                                quads,
+                                text_x0,
+                                y,
+                                *span,
+                                win.leftcol,
+                                inlay,
+                                sel_bg,
+                                clip.top as f32,
+                                clip.bottom as f32,
+                            );
+                        }
+                    }
+                    // Secondary multi-cursor selections ride the slide too, painted
+                    // with the same `Visual` background as the primary.
+                    if let Some(spans) = s.secondary_selection.get(k) {
+                        for span in spans {
                             self.push_span_quad_at(
                                 quads,
                                 text_x0,
@@ -1340,7 +1379,7 @@ impl Renderer {
                         + virt_inline_shift(row_vtext, win.leftcol, win.cursor_screen_col)
                 }
                 Some(s) => {
-                    let idx = (s.cursor.round() as usize).saturating_sub(s.base_line);
+                    let idx = s.cursor_row.round() as usize; // cursor's band-row index
                     let row_inlay = s.inlay_hints.get(idx).map(Vec::as_slice).unwrap_or(&[]);
                     inlay_shift(row_inlay, win.leftcol, win.cursor_screen_col, true)
                 }
@@ -1355,7 +1394,9 @@ impl Renderer {
             let last_row = text_rows.saturating_sub(1);
             let py = match scroll {
                 Some(s) => {
-                    let r = (s.cursor - s.top).clamp(0.0, last_row as f32);
+                    // The cursor's screen row within the viewport: its band row minus
+                    // the interpolated viewport-top offset.
+                    let r = (s.cursor_row - s.row_off).clamp(0.0, last_row as f32);
                     (oy as f32 + r) * self.cell_h
                 }
                 None => (oy + win.cursor_row.min(last_row)) as f32 * self.cell_h,

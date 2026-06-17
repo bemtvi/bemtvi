@@ -525,15 +525,19 @@
     function repaintsDestination(w) {
       if (!w || !scrollAnim) return false;
       const a = scrollAnim;
-      return w.numbers?.[0] === Math.round(a.to_top) + 1
-        && w.cursor_line === Math.round(a.to_cursor) + 1;
+      // The band is screen-row based: the destination viewport top / cursor buffer
+      // lines are the band's `numbers` at its settle offsets (`to_row` /
+      // `to_cursor_row`), which are 1-based like the window's.
+      const nums = a.band.numbers;
+      return w.numbers?.[0] === nums[Math.round(a.to_row)]
+        && w.cursor_line === nums[Math.round(a.to_cursor_row)];
     }
     function armScroll(w, s) {
       cancelScroll();
       scrollAnim = {
-        from_top: s.from_top, to_top: s.to_top,
-        from_cursor: s.from_cursor, to_cursor: s.to_cursor,
-        duration: s.duration_ms, base_line: s.base_line,
+        from_row: s.from_row, to_row: s.to_row,
+        from_cursor_row: s.from_cursor_row, to_cursor_row: s.to_cursor_row,
+        duration: s.duration_ms,
         band: bandWindow(w, s), start: performance.now(), strip: null,
       };
       render();
@@ -553,8 +557,11 @@
       render();
     }
     function stripOffset(a, e) {
-      const topF = a.from_top + (a.to_top - a.from_top) * e;
-      return (a.base_line - topF) * ch;
+      // The slide is a fractional screen-row offset into the band; band `rows[0]` is
+      // the anchor (offset 0), so translate the strip up by that many rows. Sub-pixel
+      // (`* ch` on a fractional offset) gives the web its smooth scroll.
+      const rowOff = a.from_row + (a.to_row - a.from_row) * e;
+      return -rowOff * ch;
     }
     function bandWindow(w, s) {
       const n = s.lines.length;
@@ -565,15 +572,19 @@
         selection: s.selection,
         search: blanks,
         incsearch: Array.from({ length: n }, () => null),
-        secondary_selection: blanks,
+        // Secondary multi-cursor selections ride the screen-row band now.
+        secondary_selection: s.secondary_selection || blanks,
         secondary_cursors: [],
         highlights: s.highlights || [],
         // Extmark virt_text placements ride the band (keyed to the band rows), so they
         // slide with the line instead of flashing out and back when the slide settles.
-        // (virt_lines whole-rows are not on the band — see project_band.)
         virt_text: s.virt_text || [],
-        diagnostics: [], diagnostics_virt: [], diagnostics_signs: [], inlay_hints: [],
-        cursor_row: Math.round(s.to_cursor) - s.base_line,
+        // The band is screen-row based, so interleaved `virt_lines` whole-rows ride it
+        // too (the strip renders them like the settled path). Diagnostic virtual text
+        // slides as well.
+        virt_lines: s.virt_lines || [],
+        diagnostics: [], diagnostics_virt: s.diagnostics_virt || [], diagnostics_signs: [], inlay_hints: s.inlay_hints || [],
+        cursor_row: Math.round(s.to_cursor_row),
       });
     }
     function cancelScroll() {
@@ -593,6 +604,16 @@
         rowEl.className = "row";
         rowEl.style.top = i * ch + "px";
         rowEl.style.width = rect.width * cw + "px";
+        // A `virt_lines` virtual row rides the band now (the band is screen-row
+        // based): blank gutter (its `numbers[i]` is null) + the chunk run, mirroring
+        // the settled path so the virtual rows slide with the text.
+        const vlines = band.virt_lines && band.virt_lines[i];
+        if (Array.isArray(vlines)) {
+          const g = (gutterW > 0 || band.sign_column) ? renderGutterCell(band, i, gutterW) : "";
+          rowEl.innerHTML = g + virtChunksHtml(vlines);
+          strip.appendChild(rowEl);
+          continue;
+        }
         if (serverStyled) {
           rowEl.innerHTML = renderLineServer(band, i, gutterW, rect);
         } else {

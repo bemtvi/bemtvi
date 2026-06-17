@@ -147,12 +147,52 @@ pub fn scroll(map: &[(Value, Value)]) -> Option<&Vec<(Value, Value)>> {
 }
 
 /// Read a u64 field out of the `scroll` sub-map.
+///
+/// The band is now **screen-row based** (its endpoints are `from_row`/`to_row`/
+/// `from_cursor_row`/`to_cursor_row` offsets into the band). The legacy
+/// buffer-line names (`from_top`/`to_top`/`from_cursor`/`to_cursor`) are derived
+/// here from those screen-row offsets via the band's `numbers` (each band row's
+/// 1-based buffer line), so existing tests keep asserting absolute 0-based buffer
+/// lines without caring how the band is laid out. (For a buffer with no
+/// `virt_lines` the screen-row offset equals the buffer-line offset, so the
+/// derived value matches the old wire exactly.)
 pub fn scroll_u64(map: &[(Value, Value)], key: &str) -> u64 {
+    let row_key = match key {
+        "from_top" => Some("from_row"),
+        "to_top" => Some("to_row"),
+        "from_cursor" => Some("from_cursor_row"),
+        "to_cursor" => Some("to_cursor_row"),
+        _ => None,
+    };
+    let s = scroll(map).expect("scroll present");
+    let raw = |k: &str| {
+        s.iter()
+            .find(|(kk, _)| kk.as_str() == Some(k))
+            .and_then(|(_, v)| v.as_u64())
+    };
+    let Some(rk) = row_key else {
+        return raw(key).unwrap_or_else(|| panic!("scroll.{key} missing"));
+    };
+    let row = raw(rk).unwrap_or_else(|| panic!("scroll.{rk} missing")) as usize;
+    let numbers = scroll_numbers(map);
+    numbers
+        .get(row)
+        .copied()
+        .flatten()
+        .unwrap_or_else(|| panic!("scroll band row {row} (for {key}) has no buffer line"))
+        - 1
+}
+
+/// The band's per-row 1-based buffer line numbers (`scroll.numbers`), `None` for
+/// virtual / `~` filler rows. Lets a test map a band screen-row offset back to a
+/// buffer line.
+pub fn scroll_numbers(map: &[(Value, Value)]) -> Vec<Option<u64>> {
     let s = scroll(map).expect("scroll present");
     s.iter()
-        .find(|(k, _)| k.as_str() == Some(key))
-        .and_then(|(_, v)| v.as_u64())
-        .unwrap_or_else(|| panic!("scroll.{key} missing"))
+        .find(|(k, _)| k.as_str() == Some("numbers"))
+        .and_then(|(_, v)| v.as_array())
+        .map(|a| a.iter().map(Value::as_u64).collect())
+        .unwrap_or_default()
 }
 
 /// Number of entries in `scroll.lines`.

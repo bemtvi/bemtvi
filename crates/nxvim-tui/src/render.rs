@@ -638,34 +638,40 @@ fn render_window(
 
     let height = text_area.height as usize;
 
-    // Empty fallbacks for the overlays a slide band does not carry (diagnostics,
-    // signs, secondary selections). Search *is* carried (see `anim_search` below),
-    // so `hlsearch` keeps highlighting while the view slides.
-    let empty_search: SearchSpans = Vec::new();
+    // Empty fallbacks for the overlays a slide band does not carry (diagnostic
+    // underlines and signs settle-only — a brief blank during the ~150ms slide, no
+    // jump). Everything else — including secondary selections, `virt_lines`, and
+    // diagnostic virtual text — now rides the screen-row band.
     let empty_diag: Vec<Vec<DiagSpan>> = Vec::new();
-    let empty_virt: Vec<Option<DiagVirt>> = Vec::new();
-    let empty_virt_lines: Vec<Option<Vec<VirtChunk>>> = Vec::new();
     let empty_signs: Vec<Option<DiagSign>> = Vec::new();
 
     // Owned slide-band snapshots, populated only while animating (a `skip/take`
-    // window of the full buffer). The static path — the overwhelmingly common
-    // case — borrows straight from `win` instead of deep-cloning the whole
+    // window of the band by screen-row offset). The static path — the overwhelmingly
+    // common case — borrows straight from `win` instead of deep-cloning the whole
     // viewport (lines, per-cell highlights, selection, numbers) every repaint.
     let anim_lines: Vec<String>;
     let anim_sel: Vec<Option<(u16, u16)>>;
+    let anim_secondary_sel: SearchSpans;
     let anim_hl: Vec<Vec<HlSpan>>;
     let anim_numbers: Vec<Option<usize>>;
     let anim_inlay: Vec<Vec<InlayHint>>;
     let anim_virt_text: Vec<Vec<VirtPlacement>>;
+    let anim_virt_lines: Vec<Option<Vec<VirtChunk>>>;
+    let anim_diag_virt: Vec<Option<DiagVirt>>;
     let anim_search: SearchSpans;
     let anim_incsearch: IncSearchSpans;
     let frame_lines: &[String];
     let frame_sel: &[Option<(u16, u16)>];
+    let frame_secondary_sel: &SearchSpans;
     let frame_hl: &[Vec<HlSpan>];
     let frame_inlay: &[Vec<InlayHint>];
     // Extmark virt_text rides the slide band (sliced like `frame_inlay`), so the
     // placements slide with the line instead of flashing out and back on settle.
     let frame_virt_text: &[Vec<VirtPlacement>];
+    // Extmark `virt_lines` (whole virtual rows) and diagnostic virtual text ride the
+    // band too, now that it is screen-row based and interleaves the virtual rows.
+    let frame_virt_lines: &[Option<Vec<VirtChunk>>];
+    let frame_diag_virt: &[Option<DiagVirt>];
     let frame_numbers: &[Option<usize>];
     // Search spans ride the slide band (the static viewport uses the win's), so
     // `hlsearch`/`incsearch` keep highlighting the moving text instead of blinking
@@ -689,9 +695,12 @@ fn render_window(
                 (a.start.elapsed().as_secs_f32() / a.duration.as_secs_f32()).clamp(0.0, 1.0)
             };
             let t = 1.0 - (1.0 - raw).powi(3); // ease-out cubic
-            let top = lerp(a.from_top, a.to_top, t).round() as usize;
-            let cur = lerp(a.from_cursor, a.to_cursor, t).round() as usize;
-            let off = top.saturating_sub(a.base_line);
+                                               // The slide is a screen-row offset into the band: `off` is the viewport
+                                               // top's band-row index, `cur_row` the cursor's. The band already
+                                               // interleaves any `virt_lines`, so advancing whole screen rows slides
+                                               // them correctly. `off` is a slice index (band `rows[0]` is the anchor).
+            let off = lerp(a.from_row, a.to_row, t).round() as usize;
+            let cur_row = lerp(a.from_cursor_row, a.to_cursor_row, t).round() as usize;
             anim_lines = a.lines.iter().skip(off).take(height).cloned().collect();
             // Grow/shrink the selection's moving edge in step with the slide. The
             // band carries the selection over the *maximal* extent the slide
@@ -701,14 +710,19 @@ fn render_window(
             // 0. The clip side follows the *selection orientation*, not the scroll
             // direction: anchor above ⇒ extends down ⇒ hide rows past the cursor
             // below; anchor below ⇒ extends up ⇒ hide above. `None` when no visual
-            // selection is sliding (the band is all-empty anyway).
+            // selection is sliding (the band is all-empty anyway). The comparison is
+            // in band-row space now: row `off + j` versus the cursor's band row.
             anim_sel = {
                 let mut sel: Vec<Option<(u16, u16)>> =
                     a.selection.iter().skip(off).take(height).copied().collect();
                 if let Some(down) = a.sel_extends_down {
                     for (j, span) in sel.iter_mut().enumerate() {
-                        let line = top + j; // 0-based buffer line of this visible row
-                        let past = if down { line > cur } else { line < cur };
+                        let band_row = off + j; // band-row index of this visible row
+                        let past = if down {
+                            band_row > cur_row
+                        } else {
+                            band_row < cur_row
+                        };
                         if past {
                             *span = None;
                         }
@@ -716,6 +730,13 @@ fn render_window(
                 }
                 sel
             };
+            anim_secondary_sel = a
+                .secondary_selection
+                .iter()
+                .skip(off)
+                .take(height)
+                .cloned()
+                .collect();
             anim_numbers = a.numbers.iter().skip(off).take(height).copied().collect();
             anim_hl = a
                 .highlights
@@ -732,28 +753,51 @@ fn render_window(
                 .cloned()
                 .collect();
             anim_virt_text = a.virt_text.iter().skip(off).take(height).cloned().collect();
+            anim_virt_lines = a
+                .virt_lines
+                .iter()
+                .skip(off)
+                .take(height)
+                .cloned()
+                .collect();
+            anim_diag_virt = a
+                .diagnostics_virt
+                .iter()
+                .skip(off)
+                .take(height)
+                .cloned()
+                .collect();
             // Search matches ride the slide too, sliced to the visible window like
             // the highlights, so `hlsearch` stays lit on the moving text.
             anim_search = a.search.iter().skip(off).take(height).cloned().collect();
             anim_incsearch = a.incsearch.iter().skip(off).take(height).copied().collect();
             frame_lines = &anim_lines;
             frame_sel = &anim_sel;
+            frame_secondary_sel = &anim_secondary_sel;
             frame_numbers = &anim_numbers;
             frame_hl = &anim_hl;
             frame_inlay = &anim_inlay;
             frame_virt_text = &anim_virt_text;
+            frame_virt_lines = &anim_virt_lines;
+            frame_diag_virt = &anim_diag_virt;
             frame_search = &anim_search;
             frame_incsearch = &anim_incsearch;
-            cursor_row = cur.saturating_sub(top) as u16;
-            current_line = cur + 1;
+            // The cursor's row within the viewport and its buffer line (for relative
+            // numbers) come from the band: `cur_row - off` rows down, and the band's
+            // `numbers` at the cursor row gives the 1-based buffer line.
+            cursor_row = cur_row.saturating_sub(off) as u16;
+            current_line = a.numbers.get(cur_row).copied().flatten().unwrap_or(1);
         }
         None => {
             frame_lines = &win.lines;
             frame_sel = &win.selection;
+            frame_secondary_sel = &win.secondary_selection;
             frame_numbers = &win.numbers;
             frame_hl = &win.highlights;
             frame_inlay = &win.inlay_hints;
             frame_virt_text = &win.virt_text;
+            frame_virt_lines = &win.virt_lines;
+            frame_diag_virt = &win.diagnostics_virt;
             frame_search = &win.search;
             frame_incsearch = &win.incsearch;
             cursor_row = win.cursor_row;
@@ -809,28 +853,14 @@ fn render_window(
         incsearch: view.incsearch_style.map(rt),
         end_of_buffer: view.end_of_buffer.map(rt),
     };
-    // Secondary multi-cursor selections paint on the settled viewport only.
-    let frame_secondary_sel: &SearchSpans = match anim {
-        Some(_) => &empty_search,
-        None => &win.secondary_selection,
-    };
-    // Diagnostics, like search, are painted on the settled viewport only.
+    // Diagnostic underlines are painted on the settled viewport only (a brief
+    // blank during the slide; `frame_secondary_sel`, `frame_virt_lines`, and
+    // `frame_diag_virt` already ride the band, assigned in the interpolation match).
     let frame_diag: &[Vec<DiagSpan>] = match anim {
         Some(_) => &empty_diag,
         None => &win.diagnostics,
     };
-    let frame_virt: &[Option<DiagVirt>] = match anim {
-        Some(_) => &empty_virt,
-        None => &win.diagnostics_virt,
-    };
-    // Extmark `virt_lines` (whole virtual rows). The slide band is buffer-line-based
-    // and doesn't interleave virtual rows, so none ride the animation; the settled
-    // frame uses the view's interleaved layout.
-    let frame_virt_lines: &[Option<Vec<VirtChunk>>] = match anim {
-        Some(_) => &empty_virt_lines,
-        None => &win.virt_lines,
-    };
-    // Signs, like diagnostics, are painted on the settled viewport only — a slide
+    // Signs, like diagnostic underlines, are painted on the settled viewport only — a slide
     // band carries none (the reserved column stays blank while animating, so the
     // text below it doesn't jump). Painted now that the palette resolves style ids.
     if let Some(sign_area) = sign_area {
@@ -850,7 +880,7 @@ fn render_window(
         frame_incsearch,
         frame_hl,
         frame_diag,
-        frame_virt,
+        frame_diag_virt,
         frame_virt_text,
         frame_virt_lines,
         frame_inlay,

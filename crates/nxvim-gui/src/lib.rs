@@ -59,7 +59,8 @@ use std::time::{Duration, Instant};
 use anyhow::Result;
 use nxvim_rpc::{connect, Incoming, Rpc};
 use nxvim_view::{
-    encode_paste, HlSpan, InlayHint, ResizeCursor, ScrollData, Style, View, VirtPlacement,
+    encode_paste, HlSpan, InlayHint, ResizeCursor, ScrollData, Style, View, VirtChunk,
+    VirtPlacement,
 };
 use rmpv::Value;
 use winit::application::ApplicationHandler;
@@ -406,19 +407,22 @@ fn report_connect_error(rpc: &Rpc, err: &anyhow::Error) {
 }
 
 /// An in-flight scroll slide, driven by the client clock. Mirrors the TUI's
-/// `Animation`, but the GUI keeps `top`/`cursor` fractional (no rounding) for
-/// sub-pixel smoothness. The band (`lines`/`numbers`/`highlights`, palette
-/// `styles`) is the server's gesture snapshot, anchored at `base_line`.
+/// `Animation`, but the GUI keeps the offset fractional (no rounding) for
+/// sub-pixel smoothness. The band is **screen-row based**: `lines`/the overlay
+/// arrays are the over-scanned screen rows the slide reveals, and the slide is a
+/// screen-row offset (`from_row` → `to_row`) into them, so interleaved
+/// `virt_lines` slide with the text instead of snapping.
 struct ScrollAnim {
-    from_top: f32,
-    to_top: f32,
-    from_cursor: f32,
-    to_cursor: f32,
+    from_row: f32,
+    to_row: f32,
+    from_cursor_row: f32,
+    to_cursor_row: f32,
     start: Instant,
     duration: Duration,
-    base_line: usize,
     lines: Vec<String>,
     selection: Vec<Option<(u16, u16)>>,
+    /// Per band row, the secondary multi-cursors' selection spans, so they slide too.
+    secondary_selection: Vec<Vec<(u16, u16)>>,
     /// Orientation of the sliding visual selection (see
     /// [`ScrollData::sel_extends_down`]); drives the selection edge clip.
     sel_extends_down: Option<bool>,
@@ -432,21 +436,24 @@ struct ScrollAnim {
     /// Extmark `virt_text` placements for the band, so they slide with the line
     /// instead of flashing out and back when the slide settles.
     virt_text: Vec<Vec<VirtPlacement>>,
+    /// Extmark `virt_lines` content per band row, so the interleaved virtual rows
+    /// slide with the text instead of only appearing once the slide settles.
+    virt_lines: Vec<Option<Vec<VirtChunk>>>,
     styles: Vec<Style>,
 }
 
 impl ScrollAnim {
     fn new(s: &ScrollData) -> Self {
         Self {
-            from_top: s.from_top,
-            to_top: s.to_top,
-            from_cursor: s.from_cursor,
-            to_cursor: s.to_cursor,
+            from_row: s.from_row,
+            to_row: s.to_row,
+            from_cursor_row: s.from_cursor_row,
+            to_cursor_row: s.to_cursor_row,
             start: Instant::now(),
             duration: s.duration,
-            base_line: s.base_line,
             lines: s.lines.clone(),
             selection: s.selection.clone(),
+            secondary_selection: s.secondary_selection.clone(),
             sel_extends_down: s.sel_extends_down,
             numbers: s.numbers.clone(),
             highlights: s.highlights.clone(),
@@ -454,6 +461,7 @@ impl ScrollAnim {
             incsearch: s.incsearch.clone(),
             inlay_hints: s.inlay_hints.clone(),
             virt_text: s.virt_text.clone(),
+            virt_lines: s.virt_lines.clone(),
             styles: s.styles.clone(),
         }
     }
@@ -473,11 +481,11 @@ impl ScrollAnim {
         let t = 1.0 - (1.0 - raw).powi(3);
         let lerp = |a: f32, b: f32| a + (b - a) * t;
         ScrollFrame {
-            top: lerp(self.from_top, self.to_top),
-            cursor: lerp(self.from_cursor, self.to_cursor),
-            base_line: self.base_line,
+            row_off: lerp(self.from_row, self.to_row),
+            cursor_row: lerp(self.from_cursor_row, self.to_cursor_row),
             lines: &self.lines,
             selection: &self.selection,
+            secondary_selection: &self.secondary_selection,
             // The selection's moving edge tracks the interpolated cursor; the clip
             // side follows the selection's orientation (anchor above ⇒ down), not
             // the scroll direction, so it grows *and* shrinks smoothly either way.
@@ -488,6 +496,7 @@ impl ScrollAnim {
             incsearch: &self.incsearch,
             inlay_hints: &self.inlay_hints,
             virt_text: &self.virt_text,
+            virt_lines: &self.virt_lines,
             styles: &self.styles,
         }
     }
@@ -512,12 +521,22 @@ fn arm_scroll(view: &View, current: Option<ScrollAnim>) -> Option<ScrollAnim> {
 /// Whether `view` merely repaints the destination `anim` is sliding toward (same
 /// first visible line and cursor line), so a delayed redraw must not abort it.
 fn repaints_destination(view: &View, anim: &ScrollAnim) -> bool {
-    let dest_top = anim.to_top as usize + 1; // first visible line, 1-based
-    let dest_cursor = anim.to_cursor as usize + 1; // cursor line, 1-based
+    // The destination viewport top / cursor buffer lines are read off the band at
+    // its settle offsets: `numbers` carries each band row's 1-based buffer line.
+    let dest_top = anim
+        .numbers
+        .get(anim.to_row.round() as usize)
+        .copied()
+        .flatten();
+    let dest_cursor = anim
+        .numbers
+        .get(anim.to_cursor_row.round() as usize)
+        .copied()
+        .flatten();
     let Some(win) = view.focused() else {
         return false;
     };
-    win.numbers.first().copied().flatten() == Some(dest_top) && win.cursor_line == dest_cursor
+    win.numbers.first().copied().flatten() == dest_top && Some(win.cursor_line) == dest_cursor
 }
 
 /// The winit application: holds the window, the renderer, and the latest view.

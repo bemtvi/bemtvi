@@ -1,17 +1,17 @@
-# Running the catppuccin colorscheme plugin
+# The colorscheme runtime (worked example: catppuccin)
 
 **Status:** plan / not started · **Date:** 2026-06-01
 
-Goal: take the real [catppuccin/nvim](https://github.com/catppuccin/nvim) Lua
-plugin, unmodified, load it inside nxvim, and have it actually recolor the
-editor — text (treesitter groups), the line-number gutter, the visual
-selection, and the status/command lines — with catppuccin's palette.
-
-This is the first *real* Lua plugin nxvim will run, and catppuccin is a good
+Goal: stand up nxvim's colorscheme runtime — a colorscheme is a pure-Lua module
+that fills the highlight registry — and have it actually recolor the editor:
+text (treesitter groups), the line-number gutter, the visual selection, and the
+status/command lines. The worked example here is the pure-Lua
+[catppuccin](https://github.com/catppuccin/catppuccin) colorscheme, a good
 forcing function: it is pure-Lua (no Vimscript), it is a colorscheme (so the
 payoff is visible and testable on screen), and it exercises a broad slice of the
-`vim.*` API — `require` over a runtimepath, `vim.api.nvim_set_hl`, user
-commands, autocmds, `vim.fn.stdpath`, options, and a Lua→file compile step.
+colorscheme-facing Lua surface — `require` over a runtimepath, the `nvim_set_hl`
+highlight helper, user commands, autocmds, `stdpath`, options, and a Lua→file
+compile step.
 
 ---
 
@@ -122,8 +122,8 @@ script.
   - A pack/plugin dir for installed plugins (e.g. `<config>/pack/*/start/*` or a
     flat `<config>/plugins/*`), each plugin contributing its `lua/` to the
     module search path and its root to the runtimepath (so `colors/*.lua` is
-    findable). Mirror neovim's layout closely enough that a real catppuccin
-    checkout is drop-in.
+    findable). Use a conventional pack/runtimepath layout so a pure-Lua
+    colorscheme checkout is drop-in.
   - Allow `$NXVIM_RUNTIMEPATH` (a list) so tests can point at a fixture/checkout
     without touching the user's home.
 - In `nxvim-lua`: on `LuaRuntime::new`, seed `package.path` from the runtimepath
@@ -480,8 +480,8 @@ client to render 24-bit color, gutter, selection, and status with the theme.
 
 ### Phase 6 — Wire-up, defaults, and docs ✅ DONE (2026-06-01)
 
-**Landed:** the **real, unmodified catppuccin** now loads end to end. Driving the
-actual plugin surfaced (and fixed) three gaps the fixtures had hidden: the VM now
+**Landed:** a **full pure-Lua colorscheme (catppuccin)** now loads end to end.
+Driving the actual colorscheme surfaced (and fixed) three gaps the fixtures had hidden: the VM now
 loads the full safe stdlib **plus `debug`** (catppuccin's `debug.getinfo` locates
 its own install dir — done via mlua's `unsafe_new_with`, matching neovim's
 trusted-config model); the prelude ships a pure-Lua **LuaJIT-compatible `bit`

@@ -13,7 +13,7 @@ still hold; only the separate worker process is replaced.
 Add **syntax highlighting** to nxvim. nxvim is **treesitter-native only** — there
 is no regex/`syntax.vim` highlighter and there never will be. Highlighting is
 driven entirely by [tree-sitter](https://tree-sitter.github.io) grammars and
-their `highlights.scm` queries, exactly as neovim's built-in treesitter does.
+their `highlights.scm` queries.
 
 Two decisions shape the whole design (both chosen deliberately):
 
@@ -23,12 +23,12 @@ Two decisions shape the whole design (both chosen deliberately):
    supervises. If it dies — even by segfault — the editor keeps running, and the
    process is respawned. **Highlighting can never crash, stall, or even slow the
    editor.**
-2. **Installable grammars, not bundled.** Like nvim-treesitter, grammars are
+2. **Installable grammars, not bundled.** Grammars are
    **installed at runtime** into a data directory as compiled parser libraries
    plus `.scm` query files, and loaded dynamically by filetype. nxvim ships
-   **zero** grammars linked into the binary. The on-disk layout is deliberately
-   **nvim-treesitter-compatible**, so an existing nvim-treesitter `parser/` +
-   `queries/` tree is drop-in usable.
+   **zero** grammars linked into the binary. The on-disk layout follows
+   tree-sitter's standard `parser/` + `queries/` convention, so any standard
+   tree-sitter grammar + query set is drop-in usable.
 
 **In scope (this feature):** the syntax process and its supervision/respawn; the
 dynamic grammar loader; **incremental parsing** — a shadow buffer + persistent
@@ -164,7 +164,7 @@ worker except to hand it text and receive spans, both asynchronously.
 
 ---
 
-## Grammar installation model (nvim-treesitter-compatible)
+## Grammar installation model (standard tree-sitter layout)
 
 ### Data directory
 
@@ -174,8 +174,8 @@ Resolved once at startup, overridable by `$NXVIM_DATA_DIR` (essential for tests)
 - macOS: same XDG rule (kept simple; not `~/Library/Application Support`)
 - Windows: `%LOCALAPPDATA%\nxvim`
 
-No new dependency — a tiny env-based resolver. Layout (identical to neovim's
-`runtimepath` parser/query convention):
+No new dependency — a tiny env-based resolver. Layout (tree-sitter's standard
+`parser/`/`queries/` convention):
 
 ```
 <data>/
@@ -190,11 +190,11 @@ No new dependency — a tiny env-based resolver. Layout (identical to neovim's
       highlights.scm
 ```
 
-Because this matches nvim-treesitter exactly, a user can **copy or symlink their
-existing `~/.local/share/nvim/.../parser/*.so` and the queries** and get
+Because this is the standard tree-sitter layout, a user can **drop any
+tree-sitter `parser/*.so` and the matching queries** into the data dir and get
 highlighting immediately — that is the v1 install story until `:TSInstall` lands.
-The compiled-parser ABI is the standard tree-sitter one, so the same `.so` files
-load.
+The compiled-parser ABI is the standard tree-sitter one, so any conformant `.so`
+files load.
 
 ### Loading (in the worker, via `libloading`)
 

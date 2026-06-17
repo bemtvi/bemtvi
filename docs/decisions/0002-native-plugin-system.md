@@ -1,7 +1,7 @@
-# 0002 — A native plugin system; neovim compatibility is editing behavior + colorschemes
+# 0002 — A native plugin system over `nx.*`
 
-**Status:** accepted (2026-06-11). Records the boundary of nxvim's neovim
-compatibility and the shape of its extensibility. Companion design:
+**Status:** accepted (2026-06-11). Records the boundary of nxvim's `vim.*`
+muscle-memory aliases and the shape of its extensibility. Companion design:
 [the native plugin API (`nx.*`)](../specs/2026-06-11-native-plugin-api.md).
 Bounds the scope of [ADR 0001](0001-native-engines-vendored-lua-apis.md) (see
 *Relationship to ADR 0001* below).
@@ -31,8 +31,8 @@ design.
 
 ## Decision
 
-**nxvim has its own plugin system. neovim compatibility is bounded to editing
-behavior and colorschemes.**
+**nxvim has its own plugin system. The only `vim.*` surface is a closed
+whitelist of muscle-memory aliases over `nx.*`.**
 
 1. **Extensibility is the native provider API (`nx.*`).** The server owns
    every UI surface and the frame — the completion engine, the fuzzy picker,
@@ -44,14 +44,14 @@ behavior and colorschemes.**
    RPC clients use, every registry has an RPC twin in principle —
    out-of-process providers in any language are the same surface. Design:
    [the native plugin API](../specs/2026-06-11-native-plugin-api.md).
-2. **The neovim plugin surface that ships is colorschemes, via a bounded
-   glue.** A colorscheme is pure data (`nvim_set_hl` tables) and therefore
-   crosses the runtime-model boundary intact — the real, unmodified catppuccin
-   runs. The glue that runs it is a bounded `vim.*` shim (`nvim_set_hl`,
-   `vim.g`, option reads, the small helpers colorschemes actually touch),
-   present for sourcing a colorscheme. It is glue, not an API: nothing else is
-   written against it, and there is no goal of hosting any other neovim
-   plugin.
+2. **Colorschemes are nxvim's own, loaded as Lua data.** A colorscheme is pure
+   data — a table of highlight-group definitions registered through the `nx`
+   highlight API (its `nvim_set_hl` alias). Because it never touches the runtime
+   model, it crosses the snapshot/effect boundary intact: sourcing one is just
+   running Lua that fills the highlight registry. The few `vim.*` names a
+   colorscheme reaches for (`nvim_set_hl`, `vim.g`, option reads) are part of
+   the muscle-memory whitelist below, not a separate surface. There is no goal
+   of hosting third-party neovim plugins of any other kind.
 3. **Every editor API lives in the `nx.*` namespace — a clean break.** Config
    files are `nx` scripts: `init.lua` is written against the same `nx.*`
    surface plugins use (options, keymaps, events, user commands, LSP setup
@@ -96,12 +96,12 @@ behavior and colorschemes.**
      `vim.treesitter.get_parser` / `query.*` / `highlighter.*` and the rest of
      the namespace are **not** admitted (they fail loud) — only the toggle.
 
-   Together these cover the declarative portion of a typical neovim config —
-   options, globals, keymaps, autocmds, user commands, highlights, filetypes,
-   notify — so an `init.lua` ports by deleting its plugin-manager block, not
-   by rewriting every line (`vim.g.mapleader`, `vim.o.number = true`, a
-   `vim.keymap.set` block, an `nvim_create_autocmd` block, and
-   `vim.cmd.colorscheme` all work unmodified). They are aliases, not an API:
+   Together these cover the declarative basics — options, globals, keymaps,
+   autocmds, user commands, highlights, filetypes, notify — so config can be
+   written in familiar muscle-memory spellings (`vim.g.mapleader`,
+   `vim.o.number = true`, a `vim.keymap.set` block, an `nvim_create_autocmd`
+   block, `vim.cmd.colorscheme`) without learning a new vocabulary first.
+   They are aliases, not an API:
    the same objects as `nx`, with `nx` semantics (snapshot reads, queued
    effects, settle-point callbacks), and the list grows only by deliberate
    decision — `vim.fn`, `vim.uv` / `vim.loop`, `vim.wait`, and the rest of
@@ -158,8 +158,8 @@ vendored Lua — the engine seam is kept, the command skin is replaced by a noun
   (point 5), so the editor's own features dogfood the API. Rust gets the seam;
   Lua gets the feature. Suggested order in the spec: picker → completion →
   statusline / snippets / tree.
-- **The lasting `vim.*` is exactly two things: the colorscheme glue and the
-  muscle-memory alias whitelist.** No `vim.uv`, no `vim.fn` long tail, no
+- **The lasting `vim.*` is exactly one thing: the muscle-memory alias
+  whitelist.** No `vim.uv`, no `vim.fn` long tail, no
   vim-shaped config surface beyond the aliases. The prelude beyond those is
   donor code for the `nx` build-out: refactored under `nx.*` where it serves
   nxvim's objectives, deleted where it doesn't.

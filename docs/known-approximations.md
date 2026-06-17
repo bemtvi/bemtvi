@@ -82,7 +82,7 @@ are no longer listed here — only the edges that still diverge are.
   indent width until the `>>`/`<<` operators land. The rest of vim's hundreds of
   options are still missing, as are **folds** and **macros**.
 - **Legacy Vimscript (`eval.c`).** Deliberately **not** on the roadmap (guiding
-  principle 2). `vim.fn.*` is a hand-written compatibility shim, not an
+  principle 2). `vim.fn.*` is a hand-written set of helper aliases, not an
   interpreter — unimplemented `vim.fn.*` entries are loud gaps, not a TODO to
   build an evaluator.
 - **`:TSInstall` approximations.** The command fetches/compiles grammars

@@ -8,12 +8,12 @@ nxvim is a headless, asynchronous editor **server** with thin UI **clients**
 talking over nxvim's own msgpack-RPC. The editor logic lives in one place; the
 terminal UI and the GPU GUI are just two clients of the same protocol.
 It speaks vim at the keyboard: keystrokes, modes, ex-commands, and options
-track [neovim](https://neovim.io)'s observable behavior. Everything else is
-nxvim's own: configuration and plugins target nxvim's `nx.*` Lua API
+track [vim/neovim](https://neovim.io)'s observable editing behavior. Everything
+else is nxvim's own: configuration and plugins target nxvim's `nx.*` Lua API
 ([design](docs/specs/2026-06-11-native-plugin-api.md)), where the server owns
-every UI surface and plugins provide data and behavior — and a bounded
-compatibility glue runs **real neovim colorschemes unmodified**, the one
-neovim plugin surface nxvim ships.
+every UI surface and plugins provide data and behavior. Colorschemes are
+nxvim's own too — pure-Lua modules that fill the highlight registry through the
+`nx` highlight API.
 
 > **Status: early but substantial.** Day-to-day modal editing, splits, tabs,
 > floating windows, treesitter highlighting, a real Lua config runtime, and LSP
@@ -127,10 +127,8 @@ treesitter syntax highlighting, and LSP** — are not part of a client-only buil
 - **A real Lua config runtime** — vendored PUC Lua 5.4 running *inside*
   the server: a config dir + runtimepath, `require`/`init.lua`, keymaps, user
   commands, autocmds, an async event loop (timers, process spawn, scheduling),
-  and the compatibility glue that runs **real, unmodified neovim
-  colorschemes** — e.g.
-  [catppuccin](https://github.com/catppuccin/nvim) — the one neovim plugin
-  surface nxvim ships (see [Intentional deviations](#intentional-deviations-these-will-not-change)).
+  and a **colorscheme runtime** — a colorscheme is a pure-Lua module that fills
+  the highlight registry (see [Intentional deviations](#intentional-deviations-these-will-not-change)).
 - **LSP & diagnostics** — servers are configured and started from user Lua
   config; completion, hover, go-to, references,
   rename, diagnostics (underline / virtual text / signs / float), semantic
@@ -209,14 +207,15 @@ vim.cmd.colorscheme("catppuccin")
 ```
 
 The editor's own config API is the `nx.*` namespace
-([design](docs/specs/2026-06-11-native-plugin-api.md)), and `vim.*` appears in
-two bounded places: a closed whitelist of **muscle-memory aliases** (`vim.g`,
+([design](docs/specs/2026-06-11-native-plugin-api.md)). The only `vim.*` is a
+closed whitelist of **muscle-memory aliases** (`vim.g`,
 `vim.o`/`vim.opt`, `vim.cmd`, `vim.keymap.set`, autocmds, `vim.notify`, and
-friends — 1:1 over `nx`, so the declarative lines of an existing neovim config
-like `vim.g.mapleader = " "` and `vim.o.number = true` work unmodified; the
+friends — 1:1 over `nx`, so config can be written in familiar spellings like
+`vim.g.mapleader = " "` and `vim.o.number = true`; the
 full whitelist is in
-[ADR 0002](docs/decisions/0002-native-plugin-system.md)) and the
-**colorscheme glue** that runs neovim colorschemes unmodified.
+[ADR 0002](docs/decisions/0002-native-plugin-system.md)). A colorscheme reaches
+for a handful of those aliases (notably the `nvim_set_hl` highlight helper) and
+nothing more.
 
 ### Runnable examples
 
@@ -284,7 +283,7 @@ cargo clippy --all-targets -- -D warnings            # lint
 
 ## Notable deviations & missing features
 
-nxvim aims for **observable** neovim compatibility, but it is a fresh
+nxvim tracks vim/neovim's **observable editing behavior**, but it is a fresh
 rust-native implementation, not a port — so some things differ by design and many
 things simply aren't built yet. The canonical, always-current list of gaps lives
 in **[docs/known-approximations.md](docs/known-approximations.md)** (and, more
@@ -293,24 +292,23 @@ highlights:
 
 ### Intentional deviations (these will not change)
 
-- **A native plugin system — colorschemes are the only neovim plugin surface.**
+- **A native plugin system — `nx.*` is the only API.**
   nxvim does not host neovim plugins: they are imperative programs written
   against neovim's runtime model (blocking reads, libuv as a public API,
   frame-time render hooks), which nxvim's snapshot + effect-queue,
-  client-server design deliberately is not. A bounded `vim.*` glue runs Lua
-  **colorschemes** (pure `nvim_set_hl` data, e.g. catppuccin) unmodified;
-  configuration and everything else target nxvim's own `nx.*` API, with a
+  client-server design deliberately is not. Colorschemes are nxvim's own — Lua
+  modules that fill the highlight registry through the `nx` highlight API.
+  Configuration and everything else target nxvim's own `nx.*` API, with a
   closed whitelist of muscle-memory aliases (`vim.g`, `vim.o`/`vim.opt`,
   `vim.cmd`, `vim.keymap.set`, autocmds / user commands / `nvim_set_hl`,
   `vim.notify`, the `vim.tbl_*`-style helpers, … — canonical list in
   [ADR 0002](docs/decisions/0002-native-plugin-system.md))
-  mapping 1:1 onto `nx` so the declarative portion of an existing neovim
-  config works unmodified —
+  mapping 1:1 onto `nx` so config can be written in familiar spellings —
   see [the design](docs/specs/2026-06-11-native-plugin-api.md) and
   [ADR 0002](docs/decisions/0002-native-plugin-system.md).
 - **No Vimscript.** Legacy Vimscript (`.vim` files, the
   `eval.c` language) is an explicit non-goal. `vim.fn.*` is a hand-written
-  compatibility shim, not an interpreter. Colorschemes must be Lua.
+  set of helper aliases, not an interpreter. Colorschemes must be Lua.
 - **Not a neovim UI host.** There is no `ext_linegrid` / grid protocol, and
   attaching external neovim GUIs is not a goal. Clients receive a semantic `View`
   and lay out their own widgets. The RPC method names look like `nvim_*` but are
@@ -370,8 +368,8 @@ I started this project on a whim just to test the limits of current day vibe-cod
 I wanted to see how far I could go, I didn't expect the answer to turn out to be
 as far as I wanted. I got so excited I decided to speed run it for enough features
 to use it as my daily driver. I love neovim and I use(d?) it as my daily driver, so
-nxvim keeps what I actually wanted from it — vim's editing language, Lua config, and
-my colorscheme — and goes its own way on everything else, including a plugin system
+nxvim keeps what I actually wanted from it — vim's editing language and Lua config —
+and goes its own way on everything else, including a plugin system
 designed for its own architecture. Just for the fun of it, I also
 decided to implement a major feature that has been in the community wishlist for a 
 long time, multiple cursors (see a previous section). That turned out to be much cooler

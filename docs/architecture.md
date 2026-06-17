@@ -9,8 +9,9 @@ extensibility live in the `nx.*` Lua namespace
 ([the `nx` API](specs/2026-06-11-native-plugin-api.md);
 [ADR 0002](decisions/0002-native-plugin-system.md)) — and the `vim.*` that
 remains is small and closed: a whitelist of muscle-memory aliases over `nx`
-(`vim.g`, `vim.o`, …) and the **colorscheme** shim, which runs real neovim
-colorschemes unmodified.
+(`vim.g`, `vim.o`, …, plus the highlight-registration helpers a colorscheme
+touches), so config and colorschemes can be written in familiar terms. They are
+aliases, not a separate API.
 
 A pristine copy of neovim is vendored at [`vendor/neovim`](../vendor/neovim) (a
 shallow git submodule) and used purely as a behavioral and source-layout
@@ -27,7 +28,7 @@ reference. nxvim does not link against or embed any neovim code.
    *UI/client* wire-compatibility — there is no `ext_linegrid` protocol and
    external neovim GUIs are not a target. The client↔server protocol is nxvim's
    own.
-2. **A native plugin system; colorschemes are the only neovim plugin surface.**
+2. **A native plugin system; `nx.*` is the only API.**
    Extensibility is nxvim's own provider-based plugin API
    ([the `nx` design](specs/2026-06-11-native-plugin-api.md),
    [ADR 0002](decisions/0002-native-plugin-system.md)): the server owns every
@@ -37,17 +38,17 @@ reference. nxvim does not link against or embed any neovim code.
    `vim.cmd`, `vim.keymap.set`, autocmd / user-command / highlight
    registration, `vim.notify`, the pure `vim.tbl_*`-style helpers, … — the
    canonical list is [ADR 0002](decisions/0002-native-plugin-system.md))
-   maps 1:1 onto the same `nx` objects, so the declarative
-   portion of an existing neovim config runs unmodified — aliases, not an API;
+   maps 1:1 onto the same `nx` objects, so config can be written in familiar
+   muscle-memory terms — aliases, not an API;
    beyond them there is no `vim.*` API. nxvim does not host neovim plugins —
    they are
    imperative programs written
    against neovim's runtime model (synchronous re-entrant state, blocking
    reads, libuv as a public API, frame-time render hooks), which this
-   snapshot + effect-queue, client-server design deliberately is not. The one
-   neovim surface nxvim provides is the **colorscheme glue** — a bounded
-   `vim.*` shim for sourcing colorschemes (pure `nvim_set_hl` data), so e.g.
-   catppuccin runs unmodified. Supporting legacy Vimscript
+   snapshot + effect-queue, client-server design deliberately is not.
+   Colorschemes are nxvim's own: a colorscheme is Lua that registers highlight
+   groups through the `nx` highlight API (and its `vim.*` aliases), nothing
+   more. Supporting legacy Vimscript
    (`.vim` plugins, the `eval.c` language) is likewise an explicit non-goal.
 3. **Dogfood the plugin API: first-party features are `nx` plugins.**
    Everything that *can* reasonably be built as an `nx.*` Lua plugin *is* built
@@ -748,26 +749,23 @@ surface is provided as a bundled **Lua prelude**
 `vim.notify`, `vim.log`, user commands, and autocmds; FS/env-touching helpers
 (`vim.fn.stdpath`/`getftime`/`mkdir`, …) are Rust-backed. `:colorscheme <name>`
 sources `colors/<name>.lua` off the runtimepath and fires the `ColorScheme`
-autocmd. This is enough to run the **real, unmodified
-[catppuccin](https://github.com/catppuccin/nvim)** colorscheme: dropped onto the
-runtimepath, its `setup()` compiles the highlight table to Lua bytecode under
-`stdpath("cache")` and `load()` populates the highlight registry via
-`nvim_set_hl` — the same mechanics as under neovim. See the
-[README](../README.md#configuration) to set it up.
+autocmd. A colorscheme is just Lua: its `setup()` compiles a highlight table
+(typically cached as Lua bytecode under `stdpath("cache")`), and `load()`
+populates the highlight registry via the `nx` highlight API (its `nvim_set_hl`
+alias). See the [README](../README.md#configuration) to set one up.
 
 The editor's scripting namespace is its own: config files and plugins target
 the `nx.*` API ([ADR 0002](decisions/0002-native-plugin-system.md);
 [the `nx` design](specs/2026-06-11-native-plugin-api.md)). The lasting `vim.*`
-is exactly two things: the **colorscheme glue** — `nvim_set_hl`, plus the
-small helpers colorschemes actually touch — bounded to sourcing unmodified
-neovim colorschemes, and a closed whitelist of **muscle-memory aliases** —
+is exactly one thing: a closed whitelist of **muscle-memory aliases** —
 variables / options / env (`vim.g`, `vim.o`/`vim.opt`, scoped variants),
 `vim.cmd` / `vim.keymap.set`, the declarative registrations (autocmds, user
-commands, `nvim_set_hl`, `vim.filetype.add`), the pure helpers (`vim.tbl_*`,
+commands, the `nvim_set_hl` highlight helper colorschemes use, `vim.filetype.add`),
+the pure helpers (`vim.tbl_*`,
 `vim.split`, `vim.inspect`, …), and the callback-shaped async (`vim.notify`,
 `vim.schedule`/`vim.defer_fn`, `vim.ui.*`, callback-form `vim.system`) —
-mapping 1:1 onto the `nx` equivalents so the
-declarative portion of an existing neovim config runs unmodified (the
+mapping 1:1 onto the `nx` equivalents so config can be written in familiar
+muscle-memory terms (the
 canonical list: [ADR 0002](decisions/0002-native-plugin-system.md)). The
 prelude's
 broader vim-shaped surface is donor code
@@ -792,9 +790,9 @@ and their `highlights.scm` queries, parsed **in-process**:
   one frame of stale highlights rather than a hang). It also drives treesitter
   *indentation* and *injections*, both of which need a synchronously-queryable tree.
 - **Installable grammars.** Grammars are not bundled; they load dynamically by
-  filetype from a data directory laid out exactly like neovim's
-  (`<data>/parser/<lang>.so`, `<data>/queries/<lang>/highlights.scm`), so an
-  existing nvim-treesitter tree is drop-in usable.
+  filetype from a data directory using tree-sitter's standard on-disk layout
+  (`<data>/parser/<lang>.so`, `<data>/queries/<lang>/highlights.scm`), so any
+  standard tree-sitter grammar + query set is drop-in usable.
 - **Incremental parsing.** The engine keeps a shadow buffer and a persistent
   parse tree per buffer; it applies only **edit deltas** (`InputEdit`) drained
   from the `Buffer` edit journal in `nxvim-core` (`changedtick` + `BufferEdit`s),
@@ -818,8 +816,8 @@ and
 The native engine above *is* nxvim's treesitter. There is no Lua parser/AST
 platform: per [ADR 0002](decisions/0002-native-plugin-system.md) the vendored
 neovim `vim.treesitter` Lua (the `LanguageTree` / `get_parser` / `TSNode`
-machinery and the Rust primitives that backed it) was **deleted** — it served
-only neovim-plugin compat, a non-goal. What remains is a small **control**
+machinery and the Rust primitives that backed it) was **deleted** — it existed
+only to host third-party neovim plugins, a non-goal. What remains is a small **control**
 surface over the engine, `nx.treesitter`:
 
 - **Highlight control is declarative buffer state** (the two-noun model):
@@ -1098,14 +1096,14 @@ screen," and that is exactly the shape of these tests.
 - **The `nx.*` config surface** — `init.lua` targets nxvim's own API
   ([ADR 0002](decisions/0002-native-plugin-system.md)); the prelude's current
   vim-shaped spelling is donor code, refactored under `nx` where it serves
-  nxvim's objectives and deleted where it doesn't, with the colorscheme glue
-  as the only lasting `vim.*`. What the runtime already does: the runtimepath,
+  nxvim's objectives and deleted where it doesn't, with the muscle-memory
+  aliases as the only lasting `vim.*`. What the runtime already does: the runtimepath,
   `require`, `init.lua`,
   `nvim_set_hl`, `:colorscheme`, and `vim.keymap.set`/`vim.api.nvim_set_keymap`
   (a per-mode withhold/replay matcher in `nxvim-server/src/keymap.rs`; multi-key
   built-ins fire instantly even under a colliding user prefix, via the shared
   command grammar `nxvim_core::command_status` the matcher consults) are in place
-  — enough to run the real catppuccin colorscheme unmodified (see [*Lua*](#lua)).
+  — enough to load a full colorscheme end to end (see [*Lua*](#lua)).
   The **LSP and diagnostics surface** is moving the same way. The vendored
   nvim-lspconfig corpus (~400 `lsp/<server>.lua` configs) and the `vim.lsp` /
   `vim.diagnostic` Lua compat layer (`prelude/lsp.lua`) — together with their

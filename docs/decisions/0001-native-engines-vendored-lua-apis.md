@@ -6,7 +6,8 @@ results project through the extmark layer — the bridge pattern). The
 vendored-API half does not: nxvim's scripting surface is its own `nx.*`
 namespace — there is no `vim.treesitter` / `vim.lsp` surface; that machinery
 is refactored into the `nx` API where useful and deleted where not, and the
-only `vim.*` Lua is the colorscheme glue. Kept as the dated record of the
+only `vim.*` Lua is a closed whitelist of muscle-memory aliases over `nx.*`.
+Kept as the dated record of the
 engine/API split and the bridge pattern. *(Original status: accepted
 2026-06-08.)* Records a cross-cutting boundary that several
 feature designs already assume but none states in one place: who owns the

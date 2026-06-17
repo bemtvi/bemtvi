@@ -4,8 +4,8 @@
 > nxvim's plugin system — the extensibility half of
 > [ADR 0002](../decisions/0002-native-plugin-system.md): the server owns every
 > UI surface and the frame, plugins are async, declarative *providers*, and
-> the only neovim plugin surface nxvim ships is colorschemes
-> (`nvim_set_hl` data).
+> the only `vim.*` surface nxvim ships is a closed whitelist of muscle-memory
+> aliases over `nx.*`.
 >
 > **Landed (2026-06-12,
 > [foundation plan](../plans/2026-06-12-nx-foundation-and-treesitter.md)):** the
@@ -92,8 +92,7 @@ same surface, later. The in-process Lua host is v1.
 The same `nx.*` namespace is the **config** API: `init.lua` is written against
 it (`nx.o`/`nx.opt` for options, `nx.keymap`, `nx.on`, `nx.command`, `nx.lsp`
 for server setup, `nx.treesitter` for tree scripting). The only `vim.*` Lua is
-the colorscheme glue and a closed set of muscle-memory aliases (see *The
-compatibility boundary* below).
+a closed set of muscle-memory aliases (see *The `vim.*` boundary* below).
 
 ### Plugins, manifests, and activation (why there is no plugin-manager plugin)
 
@@ -421,17 +420,17 @@ writes** (see the whitelist below): `vim.treesitter.start(buf, lang?)` sets
 admission test precisely because there *is* a 1:1 declarative target to desugar
 onto — the noun is what makes the alias admissible.
 
-## The compatibility boundary
+## The `vim.*` boundary
 
 Per [ADR 0002](../decisions/0002-native-plugin-system.md) the break is clean:
-**every editor API lives in `nx.*`**, config included. The only `vim.*` Lua
-is the **colorscheme glue** — a bounded shim (`nvim_set_hl`, `vim.g`, option
-reads, the small helpers colorschemes actually touch) present for sourcing a
-colorscheme, so real neovim colorschemes (e.g. catppuccin) run unmodified.
+**every editor API lives in `nx.*`**, config included. The only `vim.*` Lua is
+a **closed whitelist of muscle-memory aliases** mapping 1:1 onto the `nx.*`
+equivalents, so config can be written in familiar spellings. Colorschemes are
+nxvim's own: a colorscheme is Lua that fills the highlight registry through the
+`nx` highlight API (its `nvim_set_hl` alias), which is part of that whitelist —
+not a separate surface.
 
-One carve-out, for muscle memory: a **closed whitelist of `vim.*` aliases**
-maps 1:1 onto the `nx.*` equivalents, so the declarative portion of an
-existing neovim config works unmodified. The admission test: frequent in real
+The admission test for an alias: frequent in real
 configs, declarative or callback-shaped (never blocking, never frame-time),
 1:1 onto an `nx` primitive. The set (the canonical list lives in
 [ADR 0002](../decisions/0002-native-plugin-system.md)): variables / options /

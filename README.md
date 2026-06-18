@@ -334,30 +334,25 @@ highlights:
 ### Intentional deviations (these will not change)
 
 - **A native plugin system — `nx.*` is the only API.**
-  nxvim does not host neovim plugins: they are imperative programs written
-  against neovim's runtime model (blocking reads, libuv as a public API,
-  frame-time render hooks), which nxvim's snapshot + effect-queue,
-  client-server design deliberately is not. Colorschemes are nxvim's own — Lua
-  modules that fill the highlight registry through the `nx` highlight API.
-  Configuration and everything else target nxvim's own `nx.*` API, with a
-  closed whitelist of muscle-memory aliases (`vim.g`, `vim.o`/`vim.opt`,
+  Configuration and plugins target nxvim's own `nx.*` API, built around its
+  snapshot + effect-queue, client-server design. Colorschemes are nxvim's
+  own — Lua modules that fill the highlight registry through the `nx` highlight
+  API. A closed whitelist of muscle-memory aliases (`vim.g`, `vim.o`/`vim.opt`,
   `vim.cmd`, `vim.keymap.set`, autocmds / user commands / `nvim_set_hl`,
   `vim.notify`, the `vim.tbl_*`-style helpers, … — canonical list in
   [ADR 0002](docs/decisions/0002-native-plugin-system.md))
-  mapping 1:1 onto `nx` so config can be written in familiar spellings —
+  maps 1:1 onto `nx` so config can be written in familiar spellings —
   see [the design](docs/specs/2026-06-11-native-plugin-api.md) and
   [ADR 0002](docs/decisions/0002-native-plugin-system.md).
 - **No Vimscript.** Legacy Vimscript (`.vim` files, the
   `eval.c` language) is an explicit non-goal. `vim.fn.*` is a hand-written
   set of helper aliases, not an interpreter. Colorschemes must be Lua.
-- **Not a neovim UI host.** There is no `ext_linegrid` / grid protocol, and
-  attaching external neovim GUIs is not a goal. Clients receive a semantic `View`
-  and lay out their own widgets. The RPC method names look like `nvim_*` but are
-  nxvim's own protocol, not a compatibility surface.
-- **Rope-backed, byte-indexed buffers** with a strict trailing-newline invariant
-  (closer to vim's own byte-column model), and a **branching undo tree of
-  full-rope snapshots** instead of neovim's diff-based `undo.c` — same branching
-  semantics, different storage.
+- **Clients render a semantic `View`.** There is no `ext_linegrid` / grid
+  protocol; clients receive a semantic `View` and lay out their own widgets. The
+  RPC method names look like `nvim_*` but are nxvim's own protocol.
+- **Rope-backed, byte-indexed buffers** with a strict trailing-newline
+  invariant, and a **branching undo tree of full-rope snapshots** — cheap to
+  snapshot, with full branching semantics.
 - **Treesitter-only highlighting.** There is no regex / `syntax.vim`
   highlighter — all highlighting comes from treesitter grammars.
 - **No visual-block mode** (`<C-v>`). Charwise and linewise visual modes are

@@ -1251,4 +1251,198 @@ impl Editor {
             })
             .collect()
     }
+
+    /// Resolve an open menu's on-screen box against the cursor-screen `metrics` —
+    /// the placement math (the cursor popup's four-tier above/below flip, the
+    /// centered-or-aligned editor box, the command-line wildmenu), the scroll
+    /// window, and the visible rows. The single geometry shared by the server's
+    /// [`MenuView`] projection (`redraw.rs::project_menu`) and the mouse hit-test,
+    /// so a click lands on the row the user sees. The server fills the content
+    /// (labels' styling, the preview pane, the docs sidebar) around the returned
+    /// box; the box, `start`, and rows come from here.
+    pub fn menu_geom(&self, m: &MenuView, metrics: MenuMetrics) -> MenuGeom {
+        const MAX_H: usize = 10;
+        let MenuMetrics {
+            cursor_row,
+            cursor_screen_col,
+            leftcol,
+            text_width,
+            text_height,
+        } = metrics;
+        // A picker carries a prompt line plus a separator row between it and the
+        // list; `nx.ui.select` carries neither. Both count toward the box height
+        // (`chrome`), the prompt's text toward the width.
+        let prompt_rows = usize::from(m.query.is_some());
+        let chrome = prompt_rows * 2;
+        let query_w = m.query.as_ref().map_or(0, |q| q.chars().count() + 1);
+
+        // The box rect, the scroll offset of the first visible row, the windowed
+        // rows themselves, and the highlighted row rebased into that window — only
+        // the visible slice is materialized, so a 100k-item picker costs the same
+        // per frame as a 10-item one.
+        let (row, col, width, height, start, rows, selected) = match m.placement {
+            MenuPlacement::Cursor => {
+                // `select` is small — project the whole list (no scrolling subtlety)
+                // and let the client place the cursor; keeps the four-tier flip exact.
+                let rows = self.menu_rows(0, m.total);
+                let count = (rows.len() + prompt_rows).min(MAX_H);
+                let content_w = rows
+                    .iter()
+                    .map(|(l, _)| l.chars().count())
+                    .max()
+                    .unwrap_or(1)
+                    .max(query_w)
+                    .max(1);
+                // Anchor under the start of the word being completed (the caret
+                // minus the typed prefix's display width), not under the caret —
+                // so the list lines up with the text it will replace. `anchor_offset`
+                // is `0` for a `select`, leaving it cursor-anchored as before. This
+                // is the logical content anchor (the word start); each client offsets
+                // the box left by its own left-border width so the *content* lands
+                // here (a full cell in the TUI / GUI, ~nothing for the web's 1px rule).
+                let anchor_col = cursor_screen_col
+                    .saturating_sub(leftcol)
+                    .saturating_sub(m.anchor_offset);
+                let max_w = text_width.saturating_sub(anchor_col).max(1);
+                let width = content_w.min(max_w);
+                // The vertical border chrome: 2 (top + bottom) normally, 1 for the
+                // top-borderless completion popup. Drives both the fit test and the
+                // above-placement origin.
+                let vchrome = if m.completion { 1 } else { 2 };
+                // Below if the bordered box fits, else above, else clamp to whichever
+                // side has more room (the popup's four-tier fallback).
+                let below = text_height.saturating_sub(cursor_row + 1);
+                let above = cursor_row;
+                let (row, height) = if count + vchrome <= below {
+                    (cursor_row + 1, count)
+                } else if count + vchrome <= above {
+                    (cursor_row - (count + vchrome), count)
+                } else if below >= above {
+                    (
+                        cursor_row + 1,
+                        below.saturating_sub(vchrome).clamp(1, count),
+                    )
+                } else {
+                    let h = above.saturating_sub(vchrome).clamp(1, count);
+                    (cursor_row.saturating_sub(h + vchrome), h)
+                };
+                (row, anchor_col, width, height, 0, rows, m.selected)
+            }
+            // `Bottom` is a content-float-only placement; a menu never requests it, so
+            // it falls in with the centered `Editor` box here.
+            MenuPlacement::Editor | MenuPlacement::Bottom => {
+                // A picker is a FIXED box — never content-hugging (that looks ragged).
+                // Resolve the configured extent against the viewport, default ~80% × 60%.
+                const DEFAULT_W: f32 = 0.8;
+                const DEFAULT_H: f32 = 0.6;
+                let max_w = text_width.saturating_sub(2).max(1);
+                let max_h = text_height.saturating_sub(2).max(1);
+                let width = m
+                    .width
+                    .map_or((text_width as f32 * DEFAULT_W).round() as usize, |e| {
+                        e.resolve(text_width)
+                    })
+                    .clamp(1, max_w);
+                let height = m
+                    .height
+                    .map_or((text_height as f32 * DEFAULT_H).round() as usize, |e| {
+                        e.resolve(text_height)
+                    })
+                    .clamp(chrome + 1, max_h);
+                // Align the box within the text area, inset by the margin. The
+                // default (`align == None`) is `Center` — the historical centered
+                // picker placement. The `+2` accounts for the box's own border, so
+                // the *outer* box (border included) is what gets aligned.
+                let align = m.align.unwrap_or(Align::Center);
+                let (col, row) = place_aligned(
+                    (0, 0, text_width, text_height),
+                    width + 2,
+                    height + 2,
+                    align,
+                    m.margin,
+                );
+                // Scroll the window so the selected row stays visible, clamped to the end,
+                // and send `selected` rebased into that window (the client renders the
+                // window directly). Only `list_rows` rows are cloned, never all `total`.
+                // `chrome` reserves the prompt + separator rows.
+                let list_rows = height.saturating_sub(chrome).max(1);
+                let mut start = if m.selected >= list_rows {
+                    m.selected + 1 - list_rows
+                } else {
+                    0
+                };
+                start = start.min(m.total.saturating_sub(list_rows));
+                let rows = self.menu_rows(start, list_rows);
+                (row, col, width, height, start, rows, m.selected - start)
+            }
+            MenuPlacement::Cmdline => {
+                // The `nx.cmdline_complete` wildmenu: a bordered list floating just
+                // above the command line (the bottom of the text area). The whole
+                // (small) list is projected — like `select`, no scroll subtlety.
+                // `anchor_offset` is the display width of the line before the token
+                // (0 for the leading command name), so the box left-aligns under it.
+                let rows = self.menu_rows(0, m.total);
+                let count = rows.len().min(MAX_H);
+                let content_w = rows
+                    .iter()
+                    .map(|(l, _)| l.chars().count())
+                    .max()
+                    .unwrap_or(1)
+                    .max(1);
+                let col = m.anchor_offset.min(text_width.saturating_sub(1));
+                let max_w = text_width.saturating_sub(col).max(1);
+                let width = content_w.min(max_w);
+                // A full bordered box (2 rows of chrome) sitting on the last text rows,
+                // so its bottom border abuts the command line below.
+                const VCHROME: usize = 2;
+                let height = count.min(text_height.saturating_sub(VCHROME).max(1));
+                let row = text_height.saturating_sub(height + VCHROME);
+                (row, col, width, height, 0, rows, m.selected)
+            }
+        };
+        MenuGeom {
+            row,
+            col,
+            width,
+            height,
+            selected,
+            start,
+            rows,
+        }
+    }
+}
+
+/// The cursor-screen metrics a menu's box is placed against — read from the
+/// focused window's projection ([`WindowView`](crate::view::WindowView)) at redraw,
+/// or recomputed in core for mouse hit-testing. `text_width` / `text_height` are
+/// the focused window's text-area size (its width minus the number gutter, and its
+/// visible row count); the cursor fields are window-relative (the cursor popup
+/// anchors under the caret). `Editor` / `Cmdline` placements ignore the cursor
+/// fields (centered / command-line-anchored), but every caller supplies them.
+#[derive(Debug, Clone, Copy)]
+pub struct MenuMetrics {
+    pub cursor_row: usize,
+    pub cursor_screen_col: usize,
+    pub leftcol: usize,
+    pub text_width: usize,
+    pub text_height: usize,
+}
+
+/// An open menu's resolved on-screen box, in the focused window's text-area cells
+/// (the command-line area for [`MenuPlacement::Cmdline`]). The geometry both the
+/// server projection and the mouse hit-test consume. `rows` is the visible slice
+/// `[start, start + rows.len())`; `selected` is the highlighted row rebased into
+/// that window (add `start` for the absolute view index).
+#[derive(Debug, Clone)]
+pub struct MenuGeom {
+    pub row: usize,
+    pub col: usize,
+    pub width: usize,
+    pub height: usize,
+    /// Highlighted row, window-relative (add `start` for the absolute view index).
+    pub selected: usize,
+    /// Scroll offset of the first visible row (`0` for the whole-list placements).
+    pub start: usize,
+    /// The visible rows `[start, start + rows.len())`: label + matched-char spans.
+    pub rows: Vec<(String, Vec<Range<usize>>)>,
 }

@@ -74,7 +74,9 @@ pub(crate) use self::command::{
 };
 pub use self::complete::{CompleteConfig, CompleteCtx, CompleteKeys};
 pub use self::decor::DecorViewport;
-pub use self::menu::{Extent, MenuItem, MenuPlacement, PreviewScroll, PreviewTarget, PromptPos};
+pub use self::menu::{
+    Extent, MenuGeom, MenuItem, MenuMetrics, MenuPlacement, PreviewScroll, PreviewTarget, PromptPos,
+};
 pub use self::mouse::{ClickSurface, StatuslineClick};
 pub(crate) use self::multicursor::PlacementSnapshot;
 // The off-tick save / open requests (the daemon / edit-host fs path, Phase 3e/3f).

@@ -1257,142 +1257,32 @@ impl EditHost {
         text_width: usize,
         styles: &mut StyleTable,
     ) -> Value {
-        let editor = &self.editor;
-        const MAX_H: usize = 10;
         let focused = view.focused();
         let text_height = focused.rows.len();
-        // A picker carries a prompt line plus a separator row between it and the list;
-        // `nx.ui.select` carries neither. Both count toward the box height (`chrome`),
-        // the prompt's text toward the width.
-        let prompt_rows = usize::from(m.query.is_some());
-        let chrome = prompt_rows * 2;
-        let query_w = m.query.as_ref().map_or(0, |q| q.chars().count() + 1);
-
-        // The box height (content rows), the scroll offset of the first visible row,
-        // and the windowed rows themselves — only the visible slice is materialized, so
-        // a 100k-item picker costs the same per frame as a 10-item one.
-        let (row, col, width, height, rows, selected) = match m.placement {
-            MenuPlacement::Cursor => {
-                // `select` is small — project the whole list (no scrolling subtlety) and
-                // let the client place the cursor; keeps the four-tier flip exact.
-                let rows = editor.menu_rows(0, m.total);
-                let count = (rows.len() + prompt_rows).min(MAX_H);
-                let content_w = rows
-                    .iter()
-                    .map(|(l, _)| l.chars().count())
-                    .max()
-                    .unwrap_or(1)
-                    .max(query_w)
-                    .max(1);
-                let cursor_row = focused.cursor_row;
-                // Anchor under the start of the word being completed (the caret
-                // minus the typed prefix's display width), not under the caret —
-                // so the list lines up with the text it will replace. `anchor_offset`
-                // is `0` for a `select`, leaving it cursor-anchored as before. This
-                // is the logical content anchor (the word start); each client offsets
-                // the box left by its own left-border width so the *content* lands
-                // here (a full cell in the TUI / GUI, ~nothing for the web's 1px rule).
-                let anchor_col = focused
-                    .cursor_screen_col
-                    .saturating_sub(focused.leftcol)
-                    .saturating_sub(m.anchor_offset);
-                let max_w = text_width.saturating_sub(anchor_col).max(1);
-                let width = content_w.min(max_w);
-                // The vertical border chrome: 2 (top + bottom) normally, 1 for the
-                // top-borderless completion popup. Drives both the fit test and the
-                // above-placement origin.
-                let vchrome = if m.completion { 1 } else { 2 };
-                // Below if the bordered box fits, else above, else clamp to whichever
-                // side has more room (the popup's four-tier fallback).
-                let below = text_height.saturating_sub(cursor_row + 1);
-                let above = cursor_row;
-                let (row, height) = if count + vchrome <= below {
-                    (cursor_row + 1, count)
-                } else if count + vchrome <= above {
-                    (cursor_row - (count + vchrome), count)
-                } else if below >= above {
-                    (
-                        cursor_row + 1,
-                        below.saturating_sub(vchrome).clamp(1, count),
-                    )
-                } else {
-                    let h = above.saturating_sub(vchrome).clamp(1, count);
-                    (cursor_row.saturating_sub(h + vchrome), h)
-                };
-                (row, anchor_col, width, height, rows, m.selected)
-            }
-            // `Bottom` is a content-float-only placement; a menu never requests it, so
-            // it falls in with the centered `Editor` box here.
-            MenuPlacement::Editor | MenuPlacement::Bottom => {
-                // A picker is a FIXED box — never content-hugging (that looks ragged).
-                // Resolve the configured extent against the viewport, default ~80% × 60%.
-                const DEFAULT_W: f32 = 0.8;
-                const DEFAULT_H: f32 = 0.6;
-                let max_w = text_width.saturating_sub(2).max(1);
-                let max_h = text_height.saturating_sub(2).max(1);
-                let width = m
-                    .width
-                    .map_or((text_width as f32 * DEFAULT_W).round() as usize, |e| {
-                        e.resolve(text_width)
-                    })
-                    .clamp(1, max_w);
-                let height = m
-                    .height
-                    .map_or((text_height as f32 * DEFAULT_H).round() as usize, |e| {
-                        e.resolve(text_height)
-                    })
-                    .clamp(chrome + 1, max_h);
-                // Align the box within the text area, inset by the margin. The
-                // default (`align == None`) is `Center` — the historical centered
-                // picker placement. The `+2` accounts for the box's own border, so
-                // the *outer* box (border included) is what gets aligned.
-                let align = m.align.unwrap_or(nxvim_core::Align::Center);
-                let (col, row) = nxvim_core::place_aligned(
-                    (0, 0, text_width, text_height),
-                    width + 2,
-                    height + 2,
-                    align,
-                    m.margin,
-                );
-                // Scroll the window so the selected row stays visible, clamped to the end,
-                // and send `selected` rebased into that window (the client renders the
-                // window directly). Only `list_rows` rows are cloned, never all `total`.
-                // `chrome` reserves the prompt + separator rows.
-                let list_rows = height.saturating_sub(chrome).max(1);
-                let mut start = if m.selected >= list_rows {
-                    m.selected + 1 - list_rows
-                } else {
-                    0
-                };
-                start = start.min(m.total.saturating_sub(list_rows));
-                let rows = editor.menu_rows(start, list_rows);
-                (row, col, width, height, rows, m.selected - start)
-            }
-            MenuPlacement::Cmdline => {
-                // The `nx.cmdline_complete` wildmenu: a bordered list floating just
-                // above the command line (the bottom of the text area). The whole
-                // (small) list is projected — like `select`, no scroll subtlety.
-                // `anchor_offset` is the display width of the line before the token
-                // (0 for the leading command name), so the box left-aligns under it.
-                let rows = editor.menu_rows(0, m.total);
-                let count = rows.len().min(MAX_H);
-                let content_w = rows
-                    .iter()
-                    .map(|(l, _)| l.chars().count())
-                    .max()
-                    .unwrap_or(1)
-                    .max(1);
-                let col = m.anchor_offset.min(text_width.saturating_sub(1));
-                let max_w = text_width.saturating_sub(col).max(1);
-                let width = content_w.min(max_w);
-                // A full bordered box (2 rows of chrome) sitting on the last text rows,
-                // so its bottom border abuts the command line below.
-                const VCHROME: usize = 2;
-                let height = count.min(text_height.saturating_sub(VCHROME).max(1));
-                let row = text_height.saturating_sub(height + VCHROME);
-                (row, col, width, height, rows, m.selected)
-            }
-        };
+        // The box rect, the scroll offset, and the windowed rows — the placement
+        // math lives in core (`Editor::menu_geom`), shared with the mouse hit-test so
+        // a click lands on the row painted here. The metrics are the focused window's
+        // cursor-screen position + text-area size; the server fills the content
+        // (styling, preview, docs) around the box.
+        let geom = self.editor.menu_geom(
+            m,
+            nxvim_core::MenuMetrics {
+                cursor_row: focused.cursor_row,
+                cursor_screen_col: focused.cursor_screen_col,
+                leftcol: focused.leftcol,
+                text_width,
+                text_height,
+            },
+        );
+        let nxvim_core::MenuGeom {
+            row,
+            col,
+            width,
+            height,
+            rows,
+            selected,
+            ..
+        } = geom;
 
         // The preview pane (Phase 3): a column on the right of an editor-placement
         // picker rendering the selected row's file. `None` for a `select` / preview-less

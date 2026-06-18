@@ -16,7 +16,7 @@
 use nxvim_rpc::{Incoming, Rpc};
 use nxvim_server::ServerInit;
 use nxvim_test_harness::{
-    attach, drain_to_latest_redraw, exec_lua, feed, lines, map_get, spawn, temp_dir,
+    attach, drain_to_latest_redraw, exec_lua, feed, feed_mouse, lines, map_get, spawn, temp_dir,
 };
 use rmpv::Value;
 use tokio::sync::mpsc::UnboundedReceiver;
@@ -334,6 +334,18 @@ fn menu_col(menu: &[(Value, Value)]) -> u64 {
     map_get(menu, "col")
         .and_then(Value::as_u64)
         .expect("menu has a col")
+}
+
+fn menu_row(menu: &[(Value, Value)]) -> u64 {
+    map_get(menu, "row")
+        .and_then(Value::as_u64)
+        .expect("menu has a row")
+}
+
+/// Whether the popup has an **active** highlight (a row chosen), not the noselect
+/// state a fresh popup opens in.
+fn menu_active(menu: &[(Value, Value)]) -> bool {
+    matches!(map_get(menu, "selected_active"), Some(Value::Boolean(true)))
 }
 
 #[tokio::test]
@@ -729,4 +741,90 @@ async fn a_resolve_function_must_be_a_function() {
             .contains("resolve must be a function"),
         "a non-function resolve must fail loud, got {err:?}"
     );
+}
+
+// ── Mouse: the popup is a non-grabbing overlay the client forwards raw cells for;
+//    the core hit-tests the click/wheel back to a row (Phase 1). ──────────────
+
+#[tokio::test]
+async fn clicking_a_completion_row_selects_it_then_accepts_on_a_second_click() {
+    let dir = temp_dir("complete_mouse_click");
+    let (rpc, mut incoming) = start(&dir, BUFFER_INIT).await;
+    // Drop the number gutter so the menu's text-area columns are global cells (the
+    // client offsets by the gutter; core's hit-test does the same — exercised here by
+    // making it zero so the clicked column is unambiguous).
+    nxvim_test_harness::command(&rpc, "set nonumber norelativenumber").await;
+
+    // Two earlier words match the typed prefix `he`, so the popup has two rows.
+    feed(&rpc, "ihello hero he");
+    let menu = menu_of(&poll_menu(&rpc, &mut incoming).await.expect("popup opens"));
+    let items = menu_items(&menu);
+    assert_eq!(items.len(), 2, "two candidates match `he`, got {items:?}");
+    assert!(!menu_active(&menu), "a fresh popup opens noselect");
+    // The borderless top means the first list row sits on the box's top row.
+    let col = menu_col(&menu) as usize;
+    let row0 = menu_row(&menu) as usize;
+
+    // Click the second row: it highlights (like navigating to it with <C-n>), the
+    // document is untouched, and nothing is accepted yet.
+    feed_mouse(&rpc, "left", "press", row0 + 1, col);
+    let menu = menu_of(
+        &poll_menu(&rpc, &mut incoming)
+            .await
+            .expect("redraw after click"),
+    );
+    assert!(menu_active(&menu), "the click activates the highlight");
+    assert_eq!(
+        menu_selected(&menu),
+        1,
+        "the clicked (second) row is highlighted"
+    );
+    assert_eq!(
+        lines(&rpc).await,
+        vec!["hello hero he"],
+        "highlighting a row does not edit the document"
+    );
+
+    // Click the already-highlighted row again: it accepts (replacing the `he` prefix
+    // with that row's word), like pressing <C-y>.
+    feed_mouse(&rpc, "left", "press", row0 + 1, col);
+    assert_eq!(lines(&rpc).await, vec![format!("hello hero {}", items[1])]);
+    assert!(
+        poll_no_menu(&rpc, &mut incoming).await,
+        "the popup closes on accept"
+    );
+}
+
+#[tokio::test]
+async fn wheeling_over_the_completion_popup_moves_the_highlight_without_wrapping() {
+    let dir = temp_dir("complete_mouse_wheel");
+    let (rpc, mut incoming) = start(&dir, BUFFER_INIT).await;
+    nxvim_test_harness::command(&rpc, "set nonumber norelativenumber").await;
+
+    feed(&rpc, "ihello hero he");
+    let menu = menu_of(&poll_menu(&rpc, &mut incoming).await.expect("popup opens"));
+    assert_eq!(menu_items(&menu).len(), 2);
+    let col = menu_col(&menu) as usize;
+    let row0 = menu_row(&menu) as usize;
+
+    // A wheel-down notch over the popup highlights the first row (from noselect)…
+    feed_mouse(&rpc, "wheel", "down", row0, col);
+    let menu = menu_of(&poll_menu(&rpc, &mut incoming).await.expect("redraw"));
+    assert!(menu_active(&menu), "the wheel activates the highlight");
+    assert_eq!(menu_selected(&menu), 0);
+
+    // …another moves it down one…
+    feed_mouse(&rpc, "wheel", "down", row0 + 1, col);
+    let menu = menu_of(&poll_menu(&rpc, &mut incoming).await.expect("redraw"));
+    assert_eq!(menu_selected(&menu), 1);
+
+    // …and a third stays on the last row (a wheel is a scrollbar, not <C-n>'s wrap).
+    feed_mouse(&rpc, "wheel", "down", row0 + 1, col);
+    let menu = menu_of(&poll_menu(&rpc, &mut incoming).await.expect("redraw"));
+    assert_eq!(menu_selected(&menu), 1);
+
+    // A wheel-up notch walks it back toward the top.
+    feed_mouse(&rpc, "wheel", "up", row0, col);
+    let menu = menu_of(&poll_menu(&rpc, &mut incoming).await.expect("redraw"));
+    assert_eq!(menu_selected(&menu), 0);
 }

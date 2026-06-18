@@ -1326,7 +1326,14 @@ impl Editor {
                     let h = above.saturating_sub(vchrome).clamp(1, count);
                     (cursor_row.saturating_sub(h + vchrome), h)
                 };
-                (row, anchor_col, width, height, 0, rows, m.selected)
+                // The whole list is sent; the visible window scrolls to keep the
+                // selection in view (the same offset the client computes), so the
+                // mouse hit-test maps a click to the right absolute row.
+                let start = menu_start(
+                    m.selected_active.then_some(m.selected),
+                    height.saturating_sub(chrome),
+                );
+                (row, anchor_col, width, height, start, rows, m.selected)
             }
             // `Bottom` is a content-float-only placement; a menu never requests it, so
             // it falls in with the centered `Editor` box here.
@@ -1397,7 +1404,8 @@ impl Editor {
                 const VCHROME: usize = 2;
                 let height = count.min(text_height.saturating_sub(VCHROME).max(1));
                 let row = text_height.saturating_sub(height + VCHROME);
-                (row, col, width, height, 0, rows, m.selected)
+                let start = menu_start(m.selected_active.then_some(m.selected), height);
+                (row, col, width, height, start, rows, m.selected)
             }
         };
         MenuGeom {
@@ -1409,6 +1417,18 @@ impl Editor {
             start,
             rows,
         }
+    }
+}
+
+/// The scroll offset of the first visible list row so the `selected` row stays in
+/// view within a `list_rows`-tall window: `0` until the selection passes the last
+/// visible row, then enough to pull it to the bottom. The same windowing every
+/// client renders (`pmenu_start`), shared so the mouse hit-test maps a click to the
+/// row the user sees. `None` selection (a noselect popup) scrolls from the top.
+fn menu_start(selected: Option<usize>, list_rows: usize) -> usize {
+    match selected {
+        Some(s) if s >= list_rows => s + 1 - list_rows,
+        _ => 0,
     }
 }
 

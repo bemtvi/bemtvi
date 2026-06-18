@@ -228,10 +228,6 @@ where
 
     let mut view = View::default();
     let mut anim: Option<Animation> = None;
-    // Client-side scroll offset for the completion doc preview (a pure UI gesture —
-    // the server owns no notion of the box's pixel height). Reset to 0 whenever the
-    // previewed docs change (a new selection, or the menu closing).
-    let mut doc_scroll: u16 = 0;
     let mut term_events = EventStream::new();
     // The cursor shape last sent to the terminal, so we re-emit the escape only
     // when the mode actually changes the shape rather than on every redraw.
@@ -283,56 +279,27 @@ where
                     let _ = terminal.clear();
                 }
                 Some(Ok(Event::Mouse(m))) => match m.kind {
-                    // A left-click on the focused panel's `[X]` closes it — the
-                    // same effect as pressing `q`, which the focused panel maps
-                    // to close. Guarded on a panel being open so a stray click
-                    // never injects a `q` into the buffer.
+                    // A left-press: forward the global cell to the server. The core
+                    // owns the hit-test back to a window + buffer position (focus
+                    // follows the click, the cursor lands there) or an overlay — the
+                    // completion popup, a picker — under the pointer. `grid` is 0;
+                    // nxvim is single-grid.
                     MouseEventKind::Down(MouseButton::Left) => {
                         let size = terminal.size().unwrap_or_default();
-                        if let Some((px, py, pw, ph, start)) =
-                            pmenu_geometry(size.width, size.height, &view)
-                        {
-                            // A click on a completion row chooses that item: the
-                            // first click on a row selects it (highlight + docs),
-                            // and clicking the already-selected row accepts it —
-                            // the same select-then-confirm as <C-n> then <C-y>.
-                            if within(m.column, m.row, px, py, pw, ph) {
-                                if let Some(pmenu) = view.pmenu.as_ref() {
-                                    let idx = start + (m.row - py) as usize;
-                                    if idx < pmenu.items.len() {
-                                        if pmenu.selected == Some(idx) {
-                                            rpc.notify("nxvim_complete_accept", vec![]);
-                                        } else {
-                                            rpc.notify(
-                                                "nxvim_complete_select",
-                                                vec![Value::from(idx as u64)],
-                                            );
-                                        }
-                                    }
-                                }
-                            }
-                        } else {
-                            // No client-owned overlay (panel / completion popup) is
-                            // open, so this is a text-area click: forward the global
-                            // cell to the server, which owns the hit-test back to a
-                            // window + buffer position (focus-follows-click + cursor
-                            // placement). `grid` is 0 — nxvim is single-grid.
-                            rpc.notify(
-                                "nx_input_mouse",
-                                vec![
-                                    Value::from("left"),
-                                    Value::from("press"),
-                                    Value::from(mouse_modifier(m.modifiers)),
-                                    Value::from(0u64),
-                                    Value::from(m.row as u64),
-                                    Value::from(m.column as u64),
-                                ],
-                            );
-                            // Arm edge auto-scroll if the press already landed in the
-                            // edge band (a press-and-hold there scrolls without a drag).
-                            autoscroll = in_scroll_zone(m.row, size.height)
-                                .then_some((m.row, m.column));
-                        }
+                        rpc.notify(
+                            "nx_input_mouse",
+                            vec![
+                                Value::from("left"),
+                                Value::from("press"),
+                                Value::from(mouse_modifier(m.modifiers)),
+                                Value::from(0u64),
+                                Value::from(m.row as u64),
+                                Value::from(m.column as u64),
+                            ],
+                        );
+                        // Arm edge auto-scroll if the press already landed in the edge
+                        // band (a press-and-hold there scrolls without a drag).
+                        autoscroll = in_scroll_zone(m.row, size.height).then_some((m.row, m.column));
                     }
                     // Drag and release of the left button drive a text-area
                     // selection: the server extends Visual from the press anchor on
@@ -394,80 +361,30 @@ where
                             ],
                         );
                     }
-                    // The mouse wheel. A client-owned overlay claims a *vertical*
-                    // notch when the pointer is over it: the completion doc preview
-                    // scrolls its docs client-side (the box height is the client's to
-                    // know), three lines per notch, clamped so it can't overscroll;
-                    // the popup list moves its selection one item per notch (server
-                    // state, non-wrapping like a scrollbar); the message panel moves
-                    // its cursor one entry. Anything else — every horizontal notch,
-                    // and any notch not over an overlay — is a text-area scroll
-                    // forwarded to the server, which owns the hit-test back to the
-                    // window under the pointer (grid 0 — nxvim is single-grid).
+                    // The mouse wheel: forward every notch to the server, which owns
+                    // the hit-test back to the window — or the overlay (the completion
+                    // popup) — under the pointer (grid 0 — nxvim is single-grid).
                     MouseEventKind::ScrollDown
                     | MouseEventKind::ScrollUp
                     | MouseEventKind::ScrollLeft
                     | MouseEventKind::ScrollRight => {
-                        let size = terminal.size().unwrap_or_default();
-                        let vertical = matches!(
-                            m.kind,
-                            MouseEventKind::ScrollDown | MouseEventKind::ScrollUp
+                        let action = match m.kind {
+                            MouseEventKind::ScrollDown => "down",
+                            MouseEventKind::ScrollUp => "up",
+                            MouseEventKind::ScrollRight => "right",
+                            _ => "left",
+                        };
+                        rpc.notify(
+                            "nx_input_mouse",
+                            vec![
+                                Value::from("wheel"),
+                                Value::from(action),
+                                Value::from(mouse_modifier(m.modifiers)),
+                                Value::from(0u64),
+                                Value::from(m.row as u64),
+                                Value::from(m.column as u64),
+                            ],
                         );
-                        let down = m.kind == MouseEventKind::ScrollDown;
-                        let doc = pmenu_doc_geometry(size.width, size.height, &view);
-                        let over_doc = vertical
-                            && doc.is_some_and(|(bx, by, bw, bh, _)| {
-                                within(m.column, m.row, bx, by, bw, bh)
-                            });
-                        let over_pmenu = vertical
-                            && pmenu_geometry(size.width, size.height, &view).is_some_and(
-                                |(px, py, pw, ph, _)| within(m.column, m.row, px, py, pw, ph),
-                            );
-                        if over_doc {
-                            if let Some((.., max_scroll)) = doc {
-                                const STEP: u16 = 3;
-                                doc_scroll = if down {
-                                    (doc_scroll + STEP).min(max_scroll)
-                                } else {
-                                    doc_scroll.saturating_sub(STEP)
-                                };
-                                terminal
-                                    .draw(|frame| render(frame, &view, anim.as_ref(), doc_scroll, Some(&mut image_store)))?;
-                            }
-                        } else if over_pmenu {
-                            if let Some(pmenu) = view.pmenu.as_ref() {
-                                let n = pmenu.items.len();
-                                if n > 0 {
-                                    let next = match pmenu.selected {
-                                        Some(i) if down => (i + 1).min(n - 1),
-                                        Some(i) => i.saturating_sub(1),
-                                        None => 0,
-                                    };
-                                    rpc.notify(
-                                        "nxvim_complete_select",
-                                        vec![Value::from(next as u64)],
-                                    );
-                                }
-                            }
-                        } else {
-                            let action = match m.kind {
-                                MouseEventKind::ScrollDown => "down",
-                                MouseEventKind::ScrollUp => "up",
-                                MouseEventKind::ScrollRight => "right",
-                                _ => "left",
-                            };
-                            rpc.notify(
-                                "nx_input_mouse",
-                                vec![
-                                    Value::from("wheel"),
-                                    Value::from(action),
-                                    Value::from(mouse_modifier(m.modifiers)),
-                                    Value::from(0u64),
-                                    Value::from(m.row as u64),
-                                    Value::from(m.column as u64),
-                                ],
-                            );
-                        }
                     }
                     _ => {}
                 },
@@ -477,15 +394,9 @@ where
             message = incoming.recv() => match message {
                 Some(Incoming::Notification { method, params }) => match method.as_str() {
                     "redraw" => {
-                        let prev_doc = view.pmenu.as_ref().map(|p| p.doc.clone());
                         view.update(&params);
-                        // The previewed docs changed (new selection / menu gone):
-                        // start the new doc from the top.
-                        if view.pmenu.as_ref().map(|p| &p.doc) != prev_doc.as_ref() {
-                            doc_scroll = 0;
-                        }
                         anim = arm_animation(&view, anim.take());
-                        terminal.draw(|frame| render(frame, &view, anim.as_ref(), doc_scroll, Some(&mut image_store)))?;
+                        terminal.draw(|frame| render(frame, &view, anim.as_ref(), 0, Some(&mut image_store)))?;
                         // Match the cursor shape to the mode (a thin bar in insert
                         // mode). Emitted only on change so it doesn't flicker.
                         let want = cursor_style(&view);
@@ -506,7 +417,7 @@ where
                 if anim.as_ref().is_some_and(|a| a.start.elapsed() >= a.duration) {
                     anim = None; // settle: render the destination view below
                 }
-                terminal.draw(|frame| render(frame, &view, anim.as_ref(), doc_scroll, Some(&mut image_store)))?;
+                terminal.draw(|frame| render(frame, &view, anim.as_ref(), 0, Some(&mut image_store)))?;
             },
             // `timeoutlen` idle flush: a keystroke armed the timer and nothing
             // followed within `TIMEOUT_LEN`, so nudge the server to resolve any key
@@ -558,7 +469,7 @@ where
             // store and repaint, so the picture replaces its loading placeholder.
             bytes = img_bytes_rx.recv() => if let Some((path, version, result)) = bytes {
                 image_store.deliver(path, version, result);
-                terminal.draw(|frame| render(frame, &view, anim.as_ref(), doc_scroll, Some(&mut image_store)))?;
+                terminal.draw(|frame| render(frame, &view, anim.as_ref(), 0, Some(&mut image_store)))?;
             },
         }
     }
@@ -569,12 +480,6 @@ where
 /// Text-area height = terminal height minus the chrome rows we render ourselves.
 fn text_height(terminal_height: u16) -> u16 {
     terminal_height.saturating_sub(CHROME_ROWS).max(1)
-}
-
-/// Whether `(col, row)` falls inside the `w`×`h` rect anchored at `(x, y)` —
-/// the mouse hit-test shared by the completion popup and its doc preview box.
-fn within(col: u16, row: u16, x: u16, y: u16, w: u16, h: u16) -> bool {
-    col >= x && col < x + w && row >= y && row < y + h
 }
 
 /// The `nx_input_mouse` modifier string for a crossterm mouse event's

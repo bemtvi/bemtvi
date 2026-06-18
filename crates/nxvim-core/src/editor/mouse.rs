@@ -113,6 +113,34 @@ pub(crate) enum MouseTarget {
     GlobalStatusLine { col: usize },
 }
 
+/// Where a global screen cell landed on an open menu overlay (the completion popup
+/// today; pickers / selects reuse it in a later phase). `None` from
+/// [`Editor::menu_hit`] means the cell is off the menu entirely.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MenuHit {
+    /// A selectable list row, as the absolute index into the menu view.
+    Item(usize),
+    /// On the box but not a selectable row — a border, the prompt / separator, or a
+    /// blank filler past the list end. Consumed (so it doesn't fall through to the
+    /// text beneath), but selects nothing.
+    Chrome,
+}
+
+/// The open menu's resolved screen rectangle (global cells) and the sub-rect its
+/// selectable rows occupy — the inverse of the box [`Editor::menu_geom`] projects,
+/// plus the focused window's screen origin and the client border convention, so a
+/// click maps to the row painted there. Window-anchored placements only.
+struct MenuScreen {
+    /// Outer box `(x, y, w, h)`, including borders.
+    box_rect: (usize, usize, usize, usize),
+    /// List content `(x, y, w, rows)` — where selectable rows are drawn.
+    list: (usize, usize, usize, usize),
+    /// Scroll offset of the first visible list row.
+    start: usize,
+    /// Total rows in the menu view (bounds the absolute index).
+    total: usize,
+}
+
 /// Which `%`-format-rendered chrome row a [`StatuslineClick`] landed on — it tells
 /// the server which format to re-run and at what width when resolving the click's
 /// column to a [`ClickAction`](crate::statusline::ClickAction).
@@ -171,6 +199,23 @@ impl Editor {
             }
             (MouseButton::Left, MouseAction::Drag | MouseAction::Release)
                 if self.mode == Mode::MultiCursor => {}
+            // A left-press or wheel on the open insert-mode completion popup drives
+            // it — highlight a row, accept the already-highlighted row, or scroll the
+            // highlight — instead of falling through to the text beneath. The popup
+            // doesn't grab input (keys keep editing the document), so the mouse is the
+            // one surface that acts on it directly; pickers / selects (which *do* grab
+            // input) are wired in their own phase. Guarded on the cell landing on the
+            // popup, so a click elsewhere still reaches the text.
+            (MouseButton::Left, MouseAction::Press)
+                if self.completion_active() && self.menu_hit(ev.row, ev.col).is_some() =>
+            {
+                self.mouse_complete_press(ev.row, ev.col)
+            }
+            (MouseButton::Wheel, MouseAction::WheelUp | MouseAction::WheelDown)
+                if self.completion_active() && self.menu_hit(ev.row, ev.col).is_some() =>
+            {
+                self.mouse_complete_wheel(ev.action == MouseAction::WheelDown)
+            }
             // A press on any region's shown tabline switches that region to the
             // clicked tab (vim's tabline click, generalized per region — main and
             // each open dock each have their own). Resolved before the text-press
@@ -1120,6 +1165,129 @@ impl Editor {
         self.set_cursor_char(anchor);
         self.visual_anchor = self.cursor;
         self.set_cursor_char(cursor);
+    }
+
+    /// A left-press on the open completion popup: clicking the already-highlighted
+    /// row accepts it (like `<C-y>`); clicking any other row highlights it (like
+    /// navigating to it with `<C-n>`/`<C-p>`). A press on the box border / a blank
+    /// filler is consumed but selects nothing. Never starts a text drag underneath.
+    fn mouse_complete_press(&mut self, row: usize, col: usize) {
+        self.mouse_select = None;
+        let Some(MenuHit::Item(idx)) = self.menu_hit(row, col) else {
+            return;
+        };
+        let selected = self
+            .menu_view()
+            .and_then(|m| m.selected_active.then_some(m.selected));
+        if selected == Some(idx) {
+            self.complete_accept();
+        } else {
+            self.complete_select_index(idx);
+        }
+    }
+
+    /// A wheel notch over the completion popup moves the highlight one row,
+    /// non-wrapping (like dragging a scrollbar — it stops at the ends, unlike
+    /// `<C-n>`'s wrap). A noselect popup highlights the first row.
+    fn mouse_complete_wheel(&mut self, down: bool) {
+        let Some(m) = self.menu_view() else {
+            return;
+        };
+        let n = m.total;
+        if n == 0 {
+            return;
+        }
+        let next = match m.selected_active.then_some(m.selected) {
+            Some(i) if down => (i + 1).min(n - 1),
+            Some(i) => i.saturating_sub(1),
+            None => 0,
+        };
+        self.complete_select_index(next);
+    }
+
+    /// Resolve a **global** screen cell to a spot on the open menu overlay: a
+    /// selectable list row (the absolute view index), some other part of the box
+    /// ([`MenuHit::Chrome`] — a border / prompt / filler), or `None` when the cell
+    /// is off the menu. Window-anchored placements only (the cmdline wildmenu has
+    /// its own frame, wired later); `None` when no menu is open.
+    fn menu_hit(&self, row: usize, col: usize) -> Option<MenuHit> {
+        let s = self.menu_screen()?;
+        let (bx, by, bw, bh) = s.box_rect;
+        if !((bx..bx + bw).contains(&col) && (by..by + bh).contains(&row)) {
+            return None;
+        }
+        let (lx, ly, lw, lrows) = s.list;
+        if (lx..lx + lw).contains(&col) && (ly..ly + lrows).contains(&row) {
+            let idx = s.start + (row - ly);
+            if idx < s.total {
+                return Some(MenuHit::Item(idx));
+            }
+        }
+        Some(MenuHit::Chrome)
+    }
+
+    /// The open menu's screen rectangle (global cells) and its selectable-row
+    /// sub-rect — the inverse of the box [`menu_geom`](Self::menu_geom) projects,
+    /// offset by the focused window's screen origin and adjusted for the client
+    /// border convention, so a click lands on the row painted there. `None` for the
+    /// command-line wildmenu (its own frame) or when no menu is open.
+    fn menu_screen(&self) -> Option<MenuScreen> {
+        let m = self.menu_view()?;
+        if matches!(m.placement, MenuPlacement::Cmdline) {
+            return None;
+        }
+        let (metrics, win, gutter) = self.menu_anchor()?;
+        let geom = self.menu_geom(&m, metrics);
+        let (wx, wy) = self.window_screen_pos(win)?;
+        // The text inner origin: the window's screen top-left, past its number gutter.
+        let inner_x = wx + gutter;
+        let inner_y = wy;
+        // Border convention, mirroring every client: a full border for select /
+        // picker; the completion popup omits its top border and shifts one cell left
+        // so its left border doesn't cover the word it completes.
+        let border_top = !m.completion;
+        let left_shift = usize::from(!border_top);
+        let vborder = if border_top { 2 } else { 1 };
+        let top_border = usize::from(border_top);
+        let box_x = (inner_x + geom.col).saturating_sub(left_shift);
+        let box_y = inner_y + geom.row;
+        let box_w = geom.width + 2;
+        let box_h = geom.height + vborder;
+        // The selectable rows sit inside the left border, below the top border and —
+        // for a picker — its prompt + separator chrome (prompt on top by default, on
+        // the bottom when asked). The completion popup has neither prompt nor preview,
+        // so the list fills the inner box; the preview-pane split is wired with the
+        // picker.
+        let prompt_rows = usize::from(m.query.is_some());
+        let chrome = prompt_rows * 2;
+        let prompt_top = prompt_rows > 0 && m.prompt_pos == PromptPos::Top;
+        let list_x = inner_x + geom.col;
+        let list_y = box_y + top_border + if prompt_top { chrome } else { 0 };
+        let list_rows = geom.height.saturating_sub(chrome);
+        Some(MenuScreen {
+            box_rect: (box_x, box_y, box_w, box_h),
+            list: (list_x, list_y, geom.width, list_rows),
+            start: geom.start,
+            total: m.total,
+        })
+    }
+
+    /// The focused window's cursor-screen metrics + screen origin for placing the
+    /// open menu's box, recomputed from the same projection the redraw uses so the
+    /// hit-test inverts exactly what was painted. Returns the metrics, the focused
+    /// window, and its number-gutter width. Only called while a menu is open, so the
+    /// projection build (bounded by the viewport, not the buffer) is paid rarely.
+    fn menu_anchor(&self) -> Option<(MenuMetrics, WindowId, usize)> {
+        let view = crate::view::View::from_editor(self);
+        let f = view.focused();
+        let metrics = MenuMetrics {
+            cursor_row: f.cursor_row,
+            cursor_screen_col: f.cursor_screen_col,
+            leftcol: f.leftcol,
+            text_width: f.rect.width.saturating_sub(f.number_width),
+            text_height: f.rows.len(),
+        };
+        Some((metrics, f.id, f.number_width))
     }
 
     /// Scroll wheel: scroll the window **under the pointer** by `'mousescroll'`

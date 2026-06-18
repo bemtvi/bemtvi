@@ -59,22 +59,40 @@ keeping the content projection (labels, match spans, preview, docs) server-side.
 **Verification: existing `redraw` + `picker.rs` + completion tests stay green** —
 this phase changes no observable output.
 
-## Phase 1 — Completion popup + docs
+## Phase 1 — Completion popup ✅ (committed)
 
-- Add a `MenuHit` resolution in core (a `MouseTarget::Menu`-style arm or a
-  dedicated pre-check in `Editor::mouse`, run **before** the text hit-test since
-  menus float above windows). Maps a global cell to `{ list row index | prompt |
-  preview | docs | border/outside }` using `menu_geom` + the text-area origin.
-- Completion popup gestures: click a row → `complete_select_index`; click the
-  already-selected row, or a double-click on any row → `complete_accept`; wheel
-  over the list → move selection one row (non-wrapping, scrollbar-like).
-- Docs sidebar: clicks inert; wheel over it scrolls — move the TUI's client-local
-  `doc_scroll` into core menu state (a `docs_scroll` offset projected to clients).
-- **Delete** the TUI `pmenu_geometry` / `pmenu_doc_geometry` click + wheel handling
-  and the bespoke RPC calls; forward raw cells like text. Keep the
-  `nxvim_complete_select`/`_accept` RPCs only if still used elsewhere, else drop.
-- Tests in `tests/mouse.rs`: click-to-select, click-selected-to-accept,
-  double-click-accept, wheel-cycles-selection, using `feed_mouse`/`TestClock`.
+- Added core menu hit-testing: `Editor::menu_hit(row, col) -> Option<MenuHit>`
+  (`Item(idx)` / `Chrome`) + `menu_screen()` (box rect + list sub-rect in global
+  cells, via `menu_geom` + the focused window's screen origin + the client border
+  convention) + `menu_anchor()` (recomputes the cursor-screen metrics from the same
+  projection the redraw uses). Dispatched in `Editor::mouse` **before** the text
+  hit-test, gated on `completion_active()`.
+- `menu_geom` now returns an authoritative `start` (scroll offset) for **all**
+  placements via a shared `menu_start` helper, so core and clients agree on the
+  visible window.
+- Completion gestures: click a row → `complete_select_index`; click the already
+  selected row → `complete_accept`; wheel over the popup → move the highlight one
+  row, non-wrapping. Click on the box border / a filler is consumed, no-op.
+- **Deleted** the TUI's dead `pmenu_geometry`/`pmenu_doc_geometry` click + wheel
+  handling (it keyed off `view.pmenu`, which the server retired to always-`Nil`) and
+  the unused `within` helper + `doc_scroll` plumbing; the left-press / wheel now
+  forward raw cells, so the core handles the popup.
+- Tests: `complete.rs::clicking_a_completion_row_selects_it_then_accepts_on_a_second_click`,
+  `…::wheeling_over_the_completion_popup_moves_the_highlight_without_wrapping`
+  (`feed_mouse`, `:set nonumber` for predictable coords).
+
+### Deferred from Phase 1 (folded into later phases)
+
+- **Docs-sidebar scroll**: the completion docs sidebar (via the unified `menu`)
+  currently has *no* working scroll on any client (the old `doc_scroll` only fed the
+  retired `pmenu` render path), and its float geometry is server-derived from LSP
+  content (not core-computable without bringing the docs text into core). Mouse-
+  scrolling docs is a marginal nice-to-have; revisit only if wanted.
+- **GUI + web dead-`pmenu` cleanup and bespoke-RPC removal**: the GUI (and the web
+  client) carry the same dead `view.pmenu` mouse branches, which already fall
+  through to raw-cell forwarding — so completion mouse works there via core *now*.
+  Their cosmetic cleanup + dropping `nxvim_complete_select`/`_accept` belongs to the
+  Phase 4 cross-client pass (where each client is verified end-to-end).
 
 ## Phase 2 — Picker + select
 
@@ -101,6 +119,10 @@ this phase changes no observable output.
   loaded end-to-end by a test.
 - Web verify via the edithost Playwright harness (`crates/nxvim-edithost/web`);
   GUI eyeballed by the user (GUI windows aren't agent-screencapturable).
+- **Remove the dead `view.pmenu` mouse handling from the GUI (`nxvim-gui`) and web
+  (`nxvim-edithost`) clients** (parallel to the TUI cleanup in Phase 1) and **drop
+  the now-unused `nxvim_complete_select`/`nxvim_complete_accept` RPCs** once every
+  client is confirmed to forward raw cells.
 - Update `docs/architecture.md` mouse section + the relevant `nx.*` API docs.
 
 ## Testing

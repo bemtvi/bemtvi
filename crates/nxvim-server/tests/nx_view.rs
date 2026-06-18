@@ -646,6 +646,74 @@ async fn component_async_setup_is_awaited_before_render() {
     );
 }
 
+/// `ctx.computed` is fine-grained: it re-evaluates only when a reactive value it actually
+/// read has changed. A write to an UNRELATED reactive field re-renders (coarse) but the
+/// computed returns its cached value (no getter call); a write to a field it READ forces a
+/// recompute. We count getter calls in a global to prove both.
+#[tokio::test]
+async fn component_computed_caches_until_its_dependency_changes() {
+    let (rpc, _incoming) = start().await;
+    exec_lua(
+        &rpc,
+        r#"_G.calls = 0
+           local C = nx.view.component({
+             setup = function(ctx)
+               local s = ctx.reactive({ nums = { 1, 2, 3 }, noise = 0 })
+               _G.s = s
+               _G.sum = ctx.computed(function()
+                 _G.calls = _G.calls + 1
+                 local t = 0
+                 for _, n in ipairs(s.nums) do t = t + n end
+                 return t
+               end)
+               return s
+             end,
+             render = function()
+               return { lines = { "sum=" .. tostring(_G.sum()) } }
+             end,
+           })
+           C.mount({ float = { width = 20, height = 3, grab = true } })"#,
+    )
+    .await;
+
+    // Wait out the lifecycle: first render computes the sum once.
+    let mut ready = false;
+    for _ in 0..100 {
+        if lines(&rpc).await == vec!["sum=6"] {
+            ready = true;
+            break;
+        }
+        rpc.request("nvim_get_mode", vec![]).await.expect("barrier");
+    }
+    assert!(ready, "first render showed the computed sum");
+    assert_eq!(
+        lua_u64(&rpc, "return _G.calls").await,
+        Some(1),
+        "the getter ran once for the first render"
+    );
+
+    // Write an unrelated field: the component re-renders, but the computed is NOT a
+    // function of `noise`, so it stays cached — no getter call.
+    exec_lua(&rpc, "_G.s.noise = 99").await;
+    rpc.request("nvim_get_mode", vec![]).await.expect("barrier");
+    assert_eq!(lines(&rpc).await, vec!["sum=6"], "sum unchanged");
+    assert_eq!(
+        lua_u64(&rpc, "return _G.calls").await,
+        Some(1),
+        "an unrelated write must NOT recompute the computed"
+    );
+
+    // Write a field the getter read: the computed invalidates and recomputes.
+    exec_lua(&rpc, "_G.s.nums[1] = 10").await;
+    rpc.request("nvim_get_mode", vec![]).await.expect("barrier");
+    assert_eq!(lines(&rpc).await, vec!["sum=15"], "sum reflects the change");
+    assert_eq!(
+        lua_u64(&rpc, "return _G.calls").await,
+        Some(2),
+        "a dependency write recomputes the computed exactly once"
+    );
+}
+
 /// `:unmount` removes the view from view but keeps it alive; a later `:mount`
 /// reshows the same content.
 #[tokio::test]

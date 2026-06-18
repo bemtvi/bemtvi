@@ -257,14 +257,82 @@ end
 -- `ctx.keymap_set` / `ctx.bufnr()` are valid immediately (no `nx.schedule` tick-dance), and it
 -- batches state writes into one re-render per tick (no manual `render()` calls). It is the
 -- nx.view analogue of a Vue single-file component: `setup` = `<script setup>`, `render` =
--- the template, the reactive state = `ref`/`reactive`.
+-- the template, `ctx.reactive` = `reactive`, `ctx.computed` = `computed`.
+
+-- ----- reactive runtime: dependency tracking shared by reactive + computed --------------
+--
+-- A small Vue-3-shaped reactivity core. Reading a key inside a `computed` getter RECORDS a
+-- dependency (key -> the computeds that read it); writing that key INVALIDATES exactly those
+-- computeds (and, transitively, the computeds that read them). So a `computed` recomputes
+-- only when one of ITS inputs changed — a `render` that reads it gets the cached value
+-- otherwise. The component's `render` is deliberately NOT an effect: a write re-runs the
+-- whole render (coarse, cheap for a line list), and the render reads computeds from cache.
+
+local active_computed = nil -- the computed currently (re)evaluating, for dependency capture
+local target_deps = setmetatable({}, { __mode = "k" }) -- raw table -> key -> { [computed]=true }
+local LEN_KEY = {} -- sentinel dependency key standing for a table's length / iteration
+
+-- Record that `active_computed` (if any) read `target[key]`.
+local function track(target, key)
+  local c = active_computed
+  if not c then
+    return
+  end
+  local keys = target_deps[target]
+  if not keys then
+    keys = {}
+    target_deps[target] = keys
+  end
+  local dep = keys[key]
+  if not dep then
+    dep = setmetatable({}, { __mode = "k" })
+    keys[key] = dep
+  end
+  if not dep[c] then
+    dep[c] = true
+    c.deps[#c.deps + 1] = dep -- remembered so the next recompute can drop stale deps
+  end
+end
+
+-- Mark a computed (and everything that read it) stale; recompute is lazy, on next read.
+local function invalidate(c)
+  if c.dirty then
+    return
+  end
+  c.dirty = true
+  local subs = {}
+  for sub in pairs(c.subs) do
+    subs[#subs + 1] = sub
+  end
+  for _, sub in ipairs(subs) do
+    invalidate(sub)
+  end
+end
+
+-- A write to `target[key]` happened: invalidate the computeds that depend on it.
+local function trigger(target, key)
+  local keys = target_deps[target]
+  if not keys then
+    return
+  end
+  local dep = keys[key]
+  if not dep then
+    return
+  end
+  local cs = {}
+  for c in pairs(dep) do
+    cs[#cs + 1] = c
+  end
+  for _, c in ipairs(cs) do
+    invalidate(c)
+  end
+end
 
 -- A deep reactive proxy: reading a nested table returns a nested proxy (lazily, cached),
--- and writing ANY key at ANY depth calls `on_change` — coarse-grained (no per-key dep
--- tracking: a write re-runs the whole `render`, which is cheap for a line list and keeps
--- the model tiny). Iterate a reactive table with `ipairs` / `#` (both honour the
--- metamethods on PUC 5.4); `pairs` does NOT (5.4 dropped `__pairs`), so a render that
--- needs unordered iteration should key off an array it builds in `setup`.
+-- reads `track` dependencies (for any enclosing computed) and writes `trigger` the dependent
+-- computeds AND call `on_change` (the component's coarse re-render). Iterate a reactive table
+-- with `ipairs` / `#` (both honour the metamethods on PUC 5.4); `pairs` does NOT (5.4 dropped
+-- `__pairs`), so a render that needs unordered iteration should key off an array.
 local function make_reactive(root, on_change)
   local cache = setmetatable({}, { __mode = "k" }) -- raw table -> its proxy
   local function wrap(t)
@@ -276,13 +344,19 @@ local function make_reactive(root, on_change)
     end
     local p = setmetatable({}, {
       __index = function(_, k)
+        track(t, k)
         return wrap(t[k])
       end,
       __newindex = function(_, k, v)
         t[k] = v
+        trigger(t, k)
+        if type(k) == "number" then
+          trigger(t, LEN_KEY) -- a numeric write may change length / iteration
+        end
         on_change()
       end,
       __len = function()
+        track(t, LEN_KEY)
         return #t
       end,
     })
@@ -290,6 +364,53 @@ local function make_reactive(root, on_change)
     return p
   end
   return wrap(root)
+end
+
+-- make_computed(getter) -> a cached derived value. Call it (`c()`, or read `c.value`) to get
+-- the value; it re-evaluates `getter` only when a reactive key it read last time has since
+-- changed, otherwise returns the memoized value. Reading a computed inside another computed
+-- chains the dependency, so derived-of-derived stays correct. `getter` must be pure (read
+-- reactive state, return a value — no writes).
+local function make_computed(getter)
+  local c = {
+    dirty = true,
+    value = nil,
+    deps = {}, -- dependency sets this computed is currently registered in (for cleanup)
+    subs = setmetatable({}, { __mode = "k" }), -- computeds that read THIS one
+  }
+  local function get()
+    if c.dirty then
+      for _, dep in ipairs(c.deps) do
+        dep[c] = nil -- drop stale dependencies before re-tracking
+      end
+      c.deps = {}
+      local prev = active_computed
+      active_computed = c
+      local ok, val = pcall(getter)
+      active_computed = prev
+      if not ok then
+        error(val, 0)
+      end
+      c.value = val
+      c.dirty = false
+    end
+    -- If read while another computed is evaluating, that computed depends on this one.
+    if active_computed and active_computed ~= c and not c.subs[active_computed] then
+      c.subs[active_computed] = true
+      active_computed.deps[#active_computed.deps + 1] = c.subs
+    end
+    return c.value
+  end
+  return setmetatable({}, {
+    __call = function()
+      return get()
+    end,
+    __index = function(_, k)
+      if k == "value" then
+        return get()
+      end
+    end,
+  })
 end
 
 -- nx.view.component(def) -> { mount(opts) }. `def.render` is required; `def.setup` is
@@ -375,6 +496,13 @@ function nx.view.component(def)
       props = opts.props or {},
       reactive = function(tbl)
         return make_reactive(tbl or {}, schedule_render)
+      end,
+      -- ctx.computed(getter) -> a cached derived value, read as `c()` (or `c.value`). It
+      -- re-evaluates only when a reactive value it read has changed, so an expensive
+      -- derivation (sort / filter / format) in `render` runs once per real input change,
+      -- not once per re-render. `getter` must be pure.
+      computed = function(getter)
+        return make_computed(getter)
       end,
       line = function()
         return v:line()

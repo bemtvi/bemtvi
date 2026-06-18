@@ -32,6 +32,18 @@ local Checklist = nx.view.component({
     -- The dialog's only mutable state. Writing `it.checked = …` below re-renders.
     local state = ctx.reactive({ items = props.items })
 
+    -- Derived state: the count of ticked items. Recomputed only when an item's `checked`
+    -- changes (not on cursor movement), and cached otherwise.
+    local selected = ctx.computed(function()
+      local n = 0
+      for _, it in ipairs(state.items) do
+        if it.checked then
+          n = n + 1
+        end
+      end
+      return n
+    end)
+
     local function move(delta)
       local n = #state.items
       ctx.set_cursor((ctx.line() - 1 + delta) % n + 1) -- wrap within the item rows
@@ -74,13 +86,15 @@ local Checklist = nx.view.component({
       props.on_done(nil) -- nil = cancelled
     end, { desc = "Cancel" })
 
-    return state
+    -- Setup returns the bindings the template reads — the reactive items and the derived
+    -- count (Vue's setup-returns-the-template-scope shape).
+    return { items = state.items, selected = selected }
   end,
 
-  -- Pure: state in, screen out. Re-run for you on every reactive change.
-  render = function(state)
+  -- Pure: bindings in, screen out. Re-run for you on every reactive change.
+  render = function(view)
     local lines, decor = {}, {}
-    for i, it in ipairs(state.items) do
+    for i, it in ipairs(view.items) do
       lines[i] = (it.checked and "☑  " or "☐  ") .. it.label
       if it.checked then
         decor[#decor + 1] =
@@ -88,7 +102,10 @@ local Checklist = nx.view.component({
       end
     end
     lines[#lines + 1] = ""
-    local hint = "<Tab> move  <Space> toggle  <CR> ok  <Esc> cancel"
+    local hint = string.format(
+      "%d selected  •  <Tab> move  <Space> toggle  <CR> ok  <Esc> cancel",
+      view.selected() -- the computed; cached unless an item's checked state changed
+    )
     lines[#lines + 1] = hint
     decor[#decor + 1] = {
       line = #lines - 1,

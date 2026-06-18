@@ -828,3 +828,39 @@ async fn wheeling_over_the_completion_popup_moves_the_highlight_without_wrapping
     let menu = menu_of(&poll_menu(&rpc, &mut incoming).await.expect("redraw"));
     assert_eq!(menu_selected(&menu), 0);
 }
+
+#[tokio::test]
+async fn example_mouse_widgets_config_loads_and_completion_is_clickable() {
+    // The shipped examples/mouse-widgets config must load (mouse=a + the four widget
+    // setups) and its completion popup must be mouse-clickable end-to-end.
+    let example = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../examples/mouse-widgets")
+        .canonicalize()
+        .expect("examples/mouse-widgets dir");
+    let init = ServerInit {
+        config_dir: Some(example.clone()),
+        runtimepath: vec![example],
+        ..Default::default()
+    };
+    let (rpc, mut incoming) = spawn(init);
+    attach(&rpc, 80, 24).await;
+    nxvim_test_harness::command(&rpc, "set nonumber norelativenumber").await;
+
+    // Seed a word, then type a matching prefix — the example's `nx.complete` (buffer
+    // source) opens a popup; `mouse=a` from the config lets the click land.
+    feed(&rpc, "ifunction fun");
+    let menu = menu_of(
+        &poll_menu(&rpc, &mut incoming)
+            .await
+            .expect("the example opens a popup"),
+    );
+    assert_eq!(menu_items(&menu), vec!["function"]);
+    let col = menu_col(&menu) as usize;
+    let row0 = menu_row(&menu) as usize;
+
+    // Click the row to select it, then click it again to accept — the prefix `fun`
+    // is replaced by `function`, proving the example's widget is core-mouse-driven.
+    feed_mouse(&rpc, "left", "press", row0, col);
+    feed_mouse(&rpc, "left", "press", row0, col);
+    assert_eq!(lines(&rpc).await, vec!["function function"]);
+}

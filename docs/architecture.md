@@ -710,6 +710,20 @@ window but simpler: a transient overlay that grabs input focus while open.
   middle-click paste, and tabline clicks), forwarded by both clients as
   `nx_input_mouse` with the server owning the hit-test.
 
+The same core hit-test also drives the **floating list overlays** — the insert
+completion popup, the fuzzy picker, the promptless `nx.ui.select`, and the
+command-line wildmenu. Their box geometry lives in one place,
+`Editor::menu_geom` (`editor/menu.rs`, shared with the server's `redraw` menu
+projection), and `Editor::menu_hit` inverts it: it offsets the box by the focused
+window's screen origin (or, for the wildmenu, the command-line frame) and the
+client border convention to map a clicked global cell back to the list row painted
+there. A click highlights a row, a click on the already-highlighted row
+accepts/confirms it (a click off a picker box cancels it), and the wheel moves the
+highlight or scrolls a picker preview — so every front end (TUI, GUI, web) gets
+overlay mouse for free by forwarding the same raw `nx_input_mouse` cell, with no
+client-side geometry. (Command-line-mode mouse needs `c` in `'mouse'`; the default
+`nvi` omits it.)
+
 The redraw carries the panel as a `panel` map (`title`, `lines`, `cursor_row`,
 `height`), `Nil` when none is open; the client draws the editing cursor inside
 the panel while it has focus.
@@ -901,14 +915,16 @@ winit's `about_to_wait` (where the TUI animates at whole-row granularity, the GP
 client interpolates `top` without rounding). Input reaches parity too:
 vim-notation keys, system-clipboard paste, native open/save dialogs, and **mouse**
 — left click / drag-select / release, wheel scroll, right-click
-(`'mousemodel'`), middle-click paste, and the pmenu / panel overlay gestures, sent
-as the same `nx_input_mouse` the TUI uses (the server owns the hit-test). Still
+(`'mousemodel'`), middle-click paste, and the floating-overlay gestures (the
+completion popup, picker, `select`, wildmenu, and panel), sent as the same
+`nx_input_mouse` the TUI uses (the server owns the hit-test, so the GUI forwards a
+raw cell and carries no overlay geometry of its own). Still
 deferred: wide-char column fidelity (a char index stands in for a screen column),
 and undercurl is drawn as a plain underline.
 Because the GUI can't be black-box
 tested over RPC the way the TUI's paint is (it needs a GPU), only the pure,
 frontend-specific translation layers have Tier-1 tests — the winit→notation input
-(`crates/nxvim-gui/tests/keys.rs`), the pointer/overlay math
+(`crates/nxvim-gui/tests/keys.rs`), the pointer math
 (`crates/nxvim-gui/tests/mouse.rs`), and the `:connect` target / `nxvim://` URI / SSH
 askpass parsing (`crates/nxvim-gui/tests/remote.rs`); the rendered frame, and the live
 `:connect` session swap, are validated by running it.

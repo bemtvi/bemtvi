@@ -930,6 +930,15 @@ impl EditHost {
             Ok(mut ev) => {
                 ev.stamp_ms = self.clock_ms;
                 self.editor.mouse(ev);
+                // Drain the effects the gesture can queue, exactly as the native
+                // dispatch path does: a picker / select confirm or cancel
+                // (`menu_results`), a completion accept's delegated edit
+                // (`complete_accept_request`), a status-line `%@…%X` handler, and any
+                // callback those fire (which may feed keys). Without this a click that
+                // confirms a widget would queue the choice but never run its handler.
+                self.run_pending();
+                self.dispatch_statusline_clicks();
+                self.drain_feedkeys();
             }
             Err(err) => self.editor.message = err,
         }

@@ -130,17 +130,26 @@ this phase changes no observable output.
   omits it — correct vim behavior); the test and the Phase 4 example set `mouse=a`.
 - Tests: `cmdline_complete.rs` (click-selects-then-accepts-into-line, wheel-cycles).
 
-## Phase 4 — Example, docs, cross-client verify
+## Phase 4 — Example, docs, cross-client cleanup + verify ✅ (committed)
 
-- `examples/mouse-widgets/` config + sample (following `examples/window-geometry/`),
-  loaded end-to-end by a test.
-- Web verify via the edithost Playwright harness (`crates/nxvim-edithost/web`);
-  GUI eyeballed by the user (GUI windows aren't agent-screencapturable).
-- **Remove the dead `view.pmenu` mouse handling from the GUI (`nxvim-gui`) and web
-  (`nxvim-edithost`) clients** (parallel to the TUI cleanup in Phase 1) and **drop
-  the now-unused `nxvim_complete_select`/`nxvim_complete_accept` RPCs** once every
-  client is confirmed to forward raw cells.
-- Update `docs/architecture.md` mouse section + the relevant `nx.*` API docs.
+- **4a — dead-code cleanup** (`24266b4`): removed the GUI's dead `view.pmenu` mouse
+  handling (`render::pmenu_hit`/`PmenuHit`, the `doc_scroll` field, `mouse::within`)
+  — it forwards raw cells now — and dropped the unused
+  `nxvim_complete_select`/`nxvim_complete_accept` dispatch arms. The web client
+  already forwarded raw cells, so it needed no change.
+- **4b — example**: `examples/mouse-widgets/` (init.lua + sample.txt) wires all four
+  overlays with `mouse=a`; `complete.rs::example_mouse_widgets_config_loads_and_completion_is_clickable`
+  drives a click-to-accept end-to-end through the shipped config.
+- **4c — docs**: `docs/architecture.md` mouse section gained the floating-overlay
+  hit-test paragraph (menu_geom ↔ menu_hit) and the GUI mouse list was de-stale'd.
+- **4d — web verify**: added a completion-popup mouse-click check to
+  `crates/nxvim-edithost/web/verify-ui.mjs`; **all checks pass in a real browser**.
+  This surfaced a real bug: the wasm `EditHost::mouse` tick did `editor.mouse` +
+  `redraw` but skipped the `run_pending` settle the native dispatch runs — so a
+  mouse confirm/accept queued but never ran its handler. Fixed `EditHost::mouse` to
+  run `run_pending` + `dispatch_statusline_clicks` + `drain_feedkeys`, matching the
+  native path (benefits every wasm mouse-driven widget, not just completion).
+- GUI eyeballed by the user (GUI windows aren't agent-screencapturable).
 
 ## Testing
 

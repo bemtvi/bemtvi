@@ -329,6 +329,32 @@ try {
   check("nx.complete: <C-y> accepts, replacing the whole ':sm' from the trigger char",
     /SMILE/.test(completedLine) && !/smile/.test(completedLine), JSON.stringify(completedLine));
 
+  // ---- 11b. nx.complete MOUSE: a click on a popup row accepts it (overlay mouse) ----
+  // The popup is non-grabbing and the browser forwards a raw screen cell; core
+  // hit-tests it back to the row (no client-side geometry). A leading space anchors
+  // the box off column 0, then clicking the row highlights it and a second click
+  // accepts it — the same select-then-accept as <C-n> then <C-y>, by pointer.
+  await page.evaluate(() => window.__nxvim.feed("<Esc>o :sm"));
+  await sleep(120);
+  const cmenu = await page.evaluate(() => {
+    const m = window.__nxvim.frame().menu;
+    return m ? { row: m.row, col: m.col, items: (m.items || []).length } : null;
+  });
+  check("nx.complete mouse: a one-row popup is open under the caret",
+    cmenu && cmenu.items === 1, JSON.stringify(cmenu));
+  // Completion omits its top border, so the first list row is on the box's top row;
+  // nonumber makes the text-area column a global cell (clamped off col 0).
+  const clickCol = Math.max(cmenu.col, 1);
+  await page.evaluate(([r, c]) => window.__nxvim.mouse("left", "press", "", r, c), [cmenu.row, clickCol]);
+  await sleep(60);
+  const afterFirst = await page.evaluate(() => window.__nxvim.frame().menu?.selected_active);
+  check("nx.complete mouse: the first click highlights the row", afterFirst === true, JSON.stringify({ afterFirst }));
+  await page.evaluate(([r, c]) => window.__nxvim.mouse("left", "press", "", r, c), [cmenu.row, clickCol]);
+  await sleep(100);
+  const clickedLine = String(await luaResult("return nx.current_line()"));
+  check("nx.complete mouse: a second click on the row accepts it (line gets the insert text)",
+    /SMILE/.test(clickedLine), JSON.stringify(clickedLine));
+
   // ---- 12. cmdline wildmenu: float geometry + order + back-cycle ----
   // Three layout bugs hit the web client and not the cell-grid (GUI/TUI) ones, and the
   // textContent-only checks above couldn't catch them: the rows collapsed to the box

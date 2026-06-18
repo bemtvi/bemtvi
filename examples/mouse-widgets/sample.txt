@@ -1,0 +1,14 @@
+Overlay mouse playground — every floating widget is pointer-driven.
+
+Insert-mode completion: put the caret after a prefix and keep typing. These
+long words seed the buffer source, so a popup floats under the caret:
+
+    function functional functor
+    component components composition
+    iterator iteration iterable
+
+Try it: enter insert mode, type `fun`, and a popup offers the words above.
+Click a row to highlight it, click it again to accept — the prefix is replaced.
+
+Command line: press `:` then `e<Tab>` for the wildmenu; click a candidate.
+Picker: type `\f`. Chooser: type `\s`. (Leader is `\`.)

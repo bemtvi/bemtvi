@@ -189,6 +189,12 @@ impl Editor {
         // `load_str_into` edits the rope directly, so flipping `nomodifiable` after
         // is safe — it refuses only a (never-arriving) user edit of the popup.
         self.buffers.get_mut(buf).buffer.options.modifiable = false;
+        // LSP hover / signature content *is* markdown (the servers send
+        // `MarkupContent { kind = "markdown" }`), so type the scratch buffer as
+        // `markdown` by default — it then gets tree-sitter highlighting for free
+        // (ts highlighting defaults on; `ts_language_for` resolves the grammar),
+        // the same trick neovim's `stylize_markdown` relies on.
+        self.set_filetype(buf, "markdown");
 
         let cfg = FloatConfig {
             relative: FloatRelative::Cursor,

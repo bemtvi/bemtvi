@@ -80,6 +80,13 @@ fn window_lines(win: &[(Value, Value)]) -> Vec<String> {
     }
 }
 
+/// A float window's `filetype` from the redraw (the buffer's effective ts type).
+fn window_filetype(win: &[(Value, Value)]) -> &str {
+    map_get(win, "filetype")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+}
+
 /// A float window's outer rect `(x, y, width, height)` from the redraw.
 fn window_rect(win: &[(Value, Value)]) -> (usize, usize, usize, usize) {
     let rect = match map_get(win, "rect") {
@@ -131,6 +138,13 @@ async fn hover_reply_opens_a_float_window() {
         window_lines(&win).iter().any(|l| l.contains("foo")),
         "hover float window should carry the markup, got {:?}",
         window_lines(&win)
+    );
+    // LSP doc content is markdown, so the scratch buffer is typed `markdown` by
+    // default (free tree-sitter highlighting).
+    assert_eq!(
+        window_filetype(&win),
+        "markdown",
+        "the hover doc-float buffer defaults to the markdown filetype"
     );
 
     std::env::remove_var("NXVIM_LSP_CMD");
@@ -268,6 +282,11 @@ async fn signature_help_reply_opens_a_float_window() {
         window_lines(&win).iter().any(|l| l.contains("[a: i32]")),
         "signature float window should mark the active parameter, got {:?}",
         window_lines(&win)
+    );
+    assert_eq!(
+        window_filetype(&win),
+        "markdown",
+        "the signature doc-float buffer defaults to the markdown filetype"
     );
 
     std::env::remove_var("NXVIM_LSP_CMD");

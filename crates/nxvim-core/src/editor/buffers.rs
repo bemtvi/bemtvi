@@ -255,7 +255,7 @@ impl Editor {
             // Panel display buffers (`[Messages]`, `[Buffers]`, …) are surfaces, not
             // documents: they never appear in `:ls` or in `:bnext`/`:bprev`/… navigation
             // (which all funnel through here). `:lspanels` lists them instead.
-            .filter(|(id, _)| !self.is_panel_buffer(**id))
+            .filter(|(id, _)| !self.is_panel_buffer(**id) && !self.is_doc_float_buffer(**id))
             .map(|(id, _)| *id)
             .collect()
     }
@@ -1534,6 +1534,7 @@ impl Editor {
         };
         self.buffers.map.remove(&target);
         self.panel_buffers.retain(|(_, b)| *b != target);
+        self.doc_float_buffers.retain(|(_, b)| *b != target);
         self.syntax_close(target);
         if self.alternate == Some(target) {
             self.alternate = None;

@@ -52,44 +52,43 @@ async fn open_rust(dir: &Path) -> (Rpc, UnboundedReceiver<Incoming>) {
     (rpc, incoming)
 }
 
-/// The content float's lines on the latest redraw carrying a `float` map, or `None`.
+/// The hover doc-float *window*'s rendered lines on the latest redraw, or `None`.
+/// Hover is a real float window now (`windows[]` with `floating == true`, so it can
+/// scroll), not the content-float `float` surface — this finds that window and
+/// returns its plain-text rows. (Mirrors the helpers in `lsp_float.rs`.)
 async fn poll_float_lines(
     rpc: &Rpc,
     incoming: &mut UnboundedReceiver<Incoming>,
 ) -> Option<Vec<String>> {
     nxvim_test_harness::barrier(rpc).await;
-    let map = drain_to_latest_redraw(incoming, |m| {
-        matches!(map_get(m, "float"), Some(Value::Map(_)))
-    })?;
-    let Some(Value::Map(float)) = map_get(&map, "float") else {
-        return None;
-    };
-    match map_get(float, "lines") {
-        // Each wire line is a chunk run `[[text, style_id], …]` (the `virt_lines`
-        // form, since the inline-float-highlighting change); an LSP hover/signature
-        // is one un-styled chunk per line, so concatenate the chunk texts to recover
-        // the plain line. (Mirrors the same helper in `lsp_float.rs`.)
-        Some(Value::Array(lines)) => Some(
-            lines
-                .iter()
-                .map(|row| {
-                    row.as_array()
-                        .map(|chunks| {
-                            chunks
-                                .iter()
-                                .filter_map(|c| c.as_array()?.first()?.as_str())
-                                .collect::<String>()
-                        })
-                        .unwrap_or_default()
-                })
-                .collect(),
-        ),
-        _ => Some(Vec::new()),
+    let map = drain_to_latest_redraw(incoming, |m| floating_window(m).is_some())?;
+    Some(window_lines(&floating_window(&map)?))
+}
+
+/// The first floating *window* (`windows[]` with `floating == true`) in a redraw —
+/// the hover doc float — or `None`. The main editor window is `floating == false`.
+fn floating_window(map: &[(Value, Value)]) -> Option<Vec<(Value, Value)>> {
+    let windows = map_get(map, "windows")?.as_array()?;
+    windows
+        .iter()
+        .filter_map(Value::as_map)
+        .find(|w| map_get(w, "floating").and_then(Value::as_bool) == Some(true))
+        .cloned()
+}
+
+/// A float window's rendered text rows (the redraw `lines` array — plain strings).
+fn window_lines(win: &[(Value, Value)]) -> Vec<String> {
+    match map_get(win, "lines") {
+        Some(Value::Array(rows)) => rows
+            .iter()
+            .map(|r| r.as_str().unwrap_or_default().to_string())
+            .collect(),
+        _ => Vec::new(),
     }
 }
 
-/// Retry the `trigger` Lua until the content float carries a line containing `want`
-/// (the server start + async reply take a moment). Panics after the window.
+/// Retry the `trigger` Lua until the hover float window carries a line containing
+/// `want` (the server start + async reply take a moment). Panics after the window.
 async fn await_float(
     rpc: &Rpc,
     incoming: &mut UnboundedReceiver<Incoming>,
@@ -109,7 +108,7 @@ async fn await_float(
         }
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
-    panic!("the content float never contained {want:?}; last float lines: {last:?}");
+    panic!("the hover float window never contained {want:?}; last float lines: {last:?}");
 }
 
 /// Poll `expr` (a Lua expression, `return`-ed) until it equals `want` or the window
@@ -172,7 +171,7 @@ async fn config_accumulates_with_deep_merge_and_list_replace() {
 
 /// The full declarative path: `config` + `enable` on a matching filetype starts the
 /// server (engine-side FileType → Start dispatch) and a language verb's reply lands
-/// on its surface — `nx.lsp.hover()` opening the content float.
+/// on its surface — `nx.lsp.hover()` opening the hover float window.
 #[tokio::test]
 async fn enable_starts_a_server_and_hover_works() {
     let _guard = serial_lock().lock().await;

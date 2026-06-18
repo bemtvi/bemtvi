@@ -1,19 +1,29 @@
-//! The list-less **content float** — `nx.ui.float` and the LSP hover / signature
-//! help surface. The sibling of the floating selectable-list [`Menu`](super::menu)
-//! on the shared float placement layer
-//! ([the float-widget spec](../../../../docs/specs/2026-06-14-nx-ui-float-widget.md),
-//! "What stays out of this widget"): it renders plain content **lines** with no
-//! list and no selection, so it is much simpler than the menu — no filtering, no
-//! prompt, no confirm. It **never grabs input**: a content float is a transient
-//! popup dismissed by the next key ([`Editor::input`]), the way vim closes a hover
-//! float on the next motion. The server projects its geometry
-//! (`project_content_float`); core only owns the content and where it wants to
-//! float (cursor vs editor).
+//! Two list-less floating surfaces, both transient (dismissed by the next key in
+//! [`Editor::input`], the way vim closes a hover float on the next motion) and both
+//! never grabbing input:
+//!
+//! - The **content float** — `nx.ui.float` (and the which-key surface). The sibling
+//!   of the floating selectable-list [`Menu`](super::menu) on the shared float
+//!   placement layer
+//!   ([the float-widget spec](../../../../docs/specs/2026-06-14-nx-ui-float-widget.md),
+//!   "What stays out of this widget"): it renders styled content **lines** with no
+//!   list and no selection — no filtering, prompt, or confirm. It lives *outside*
+//!   the window tree; the server projects its geometry (`project_content_float`),
+//!   and core owns only the content and where it floats (cursor vs editor).
+//!
+//! - The **doc float** ([`Editor::open_doc_float`]) — the LSP hover / signature-help
+//!   surface. A *real*, non-focusable float **window** backed by a reused scratch
+//!   buffer, so (unlike the content float) it inherits mouse hit-testing, **wheel
+//!   scroll**, and the normal window render path for free — the neovim model, where
+//!   a hover is just a float over a scratch buffer. A mouse wheel scrolls it; the
+//!   next *key* dismisses it.
 
-use super::menu::MenuPlacement;
-use super::windows::BorderStyle;
-use super::Editor;
+use super::menu::{Extent, MenuPlacement};
+use super::windows::{BorderStyle, FloatAnchor, FloatConfig, FloatRelative};
+use super::{BufferId, Editor, WindowId};
+use crate::buffer::Buffer;
 use crate::extmark::VirtChunk;
+use crate::unicode::display_width;
 use crate::view::ContentFloatView;
 
 /// Wrap plain text lines (the LSP hover / signature surface, and any caller with
@@ -136,5 +146,120 @@ impl Editor {
             border: f.border,
             placement: f.placement,
         })
+    }
+
+    /// Open a **doc float** for surface `name`: a read-only, non-focusable floating
+    /// *window*, backed by a reused scratch buffer, carrying plain text `lines` (the
+    /// LSP hover / signature-help surface). Unlike the borderless, styled
+    /// [content float](Editor::open_content_float) — an overlay outside the window
+    /// tree — this is a *real* float window, so it inherits mouse hit-testing,
+    /// **wheel scroll**, and the normal window render path for free (the neovim
+    /// model: a hover is a float over a scratch buffer). Like the content float it
+    /// is **transient**: the next key dismisses it ([`Editor::input`]); a mouse
+    /// wheel, which never flows through `input`, scrolls it instead.
+    ///
+    /// `name` keys both the reused scratch buffer and the open-window slot, so
+    /// re-opening the same surface replaces it in place. An empty `lines` opens
+    /// nothing (and leaves any existing float for that surface alone — there is no
+    /// empty popup; the caller echoes a message instead).
+    pub fn open_doc_float(&mut self, name: &str, lines: Vec<String>) {
+        if lines.is_empty() {
+            return;
+        }
+        // Replace any window already open for this surface (a previous hover that
+        // hasn't been dismissed by a key yet).
+        self.close_doc_float(name);
+
+        // Size the float to its content: width = the widest line, height = the line
+        // count, each clamped so a long hover stays a popup (it scrolls past the
+        // cap rather than filling the screen). Absolute cells — the float is
+        // re-opened from scratch on the next reply, not reflowed.
+        const MAX_W: usize = 80;
+        const MAX_H: usize = 20;
+        let width = lines
+            .iter()
+            .map(|l| display_width(l))
+            .max()
+            .unwrap_or(1)
+            .clamp(1, MAX_W) as u16;
+        let height = lines.len().clamp(1, MAX_H) as u16;
+
+        let buf = self.doc_float_buffer(name);
+        self.load_str_into(buf, Some(name.to_string()), &lines.join("\n"));
+        // `load_str_into` edits the rope directly, so flipping `nomodifiable` after
+        // is safe — it refuses only a (never-arriving) user edit of the popup.
+        self.buffers.get_mut(buf).buffer.options.modifiable = false;
+
+        let cfg = FloatConfig {
+            relative: FloatRelative::Cursor,
+            anchor: FloatAnchor::NW,
+            // Drop below the cursor's own line. `place_float` clamps the box fully
+            // on-screen, so a hover near the bottom is pulled up and stays visible.
+            row: 1,
+            col: 0,
+            width: Extent::Cells(width),
+            height: Extent::Cells(height),
+            focusable: false,
+            border: BorderStyle::Rounded,
+            ..FloatConfig::default()
+        };
+        // `enter = false`: focus stays in the editing window; the float is a passive
+        // popup — scrolled by the wheel, never focused, never joining `<C-w>` nav.
+        let win = self.open_float_window(buf, cfg, false);
+        self.doc_float_wins.push((name.to_string(), win));
+    }
+
+    /// The reused scratch buffer for doc-float surface `name`, minting (and
+    /// registering) it on first use — the doc-float twin of
+    /// [`Editor::named_panel_buffer`]. The same `name` always returns the same
+    /// buffer, so re-opening replaces its content in place rather than leaking a
+    /// buffer per hover.
+    fn doc_float_buffer(&mut self, name: &str) -> BufferId {
+        if let Some(b) = self
+            .doc_float_buffers
+            .iter()
+            .find(|(n, _)| n == name)
+            .map(|(_, b)| *b)
+        {
+            if self.buffers.map.contains_key(&b) {
+                return b;
+            }
+            // A stale registry entry (its buffer was deleted) — drop it, re-mint.
+            self.doc_float_buffers.retain(|(n, _)| n != name);
+        }
+        let id = self.add_buffer(Buffer::empty());
+        self.doc_float_buffers.push((name.to_string(), id));
+        id
+    }
+
+    /// Close the doc-float window for surface `name` if open; the scratch buffer is
+    /// kept for reuse. Returns whether a window actually closed.
+    pub fn close_doc_float(&mut self, name: &str) -> bool {
+        if let Some(pos) = self.doc_float_wins.iter().position(|(n, _)| n == name) {
+            let (_, win) = self.doc_float_wins.remove(pos);
+            return self.close_window_by_id(win, false);
+        }
+        false
+    }
+
+    /// Dismiss every open doc float — the next-key transient close (the float-window
+    /// analogue of clearing [`content_float`](Editor::content_float)). Scratch
+    /// buffers are retained for reuse. Returns whether anything closed.
+    pub(crate) fn close_all_doc_floats(&mut self) -> bool {
+        if self.doc_float_wins.is_empty() {
+            return false;
+        }
+        let wins: Vec<WindowId> = self.doc_float_wins.drain(..).map(|(_, w)| w).collect();
+        for win in wins {
+            self.close_window_by_id(win, false);
+        }
+        true
+    }
+
+    /// Whether `id` is a reused doc-float scratch buffer. Such buffers are surfaces,
+    /// not documents: excluded from `:ls` / buffer navigation the way panel buffers
+    /// are (see [`Editor::is_panel_buffer`]).
+    pub(crate) fn is_doc_float_buffer(&self, id: BufferId) -> bool {
+        self.doc_float_buffers.iter().any(|(_, b)| *b == id)
     }
 }

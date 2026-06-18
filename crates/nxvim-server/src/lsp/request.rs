@@ -429,20 +429,16 @@ impl EditHost {
         self.apply_lua_effects();
     }
 
-    /// Render a hover reply in the cursor-anchored **content float**
-    /// (`nx.ui.float`'s sibling surface — the float-widget spec's list-less content
-    /// float). An empty reply shows a brief message instead of an empty float.
+    /// Render a hover reply in the cursor-anchored **doc float** — a real,
+    /// non-focusable float window over a scratch buffer ([`Editor::open_doc_float`]),
+    /// so the (potentially long) markup scrolls with the mouse wheel and keyboard.
+    /// An empty reply shows a brief message instead of an empty float.
     pub(crate) fn show_hover(&mut self, lines: Vec<String>) {
         if lines.is_empty() {
             self.editor.echo(LspReqKind::Hover.empty_message());
             return;
         }
-        self.editor.open_content_float(
-            lines,
-            None,
-            nxvim_core::BorderStyle::Rounded,
-            nxvim_core::MenuPlacement::Cursor,
-        );
+        self.editor.open_doc_float("[Hover]", lines);
     }
 
     /// Render a signature-help reply in the content float: the active signature's

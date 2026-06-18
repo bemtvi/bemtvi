@@ -1,6 +1,9 @@
-//! Behavior tests for LSP **hover** and **signature help** rendering through the
-//! content float (`nx.ui.float`'s sibling surface). Phase nx.ui.float reroutes
-//! these from their old panel / echo placeholders into the cursor-anchored float.
+//! Behavior tests for LSP **hover** and **signature help** floats.
+//!
+//! Hover renders through a **doc float** — a real, non-focusable float *window*
+//! over a scratch buffer ([`Editor::open_doc_float`]), so it scrolls with the mouse
+//! wheel; it appears in the redraw as a `windows[]` entry with `floating == true`.
+//! Signature help still rides the content-float `float` surface.
 //!
 //! Wired exactly like `lsp_complete.rs`: the scripted mock language server
 //! (`nxvim --__lsp-mock`, `nxvim_lsp::mock`) answers `textDocument/hover` and
@@ -13,7 +16,8 @@ use std::path::Path;
 use nxvim_rpc::{Incoming, Rpc};
 use nxvim_server::ServerInit;
 use nxvim_test_harness::{
-    attach, drain_to_latest_redraw, exec_lua, feed, map_get, serial_lock, spawn, temp_dir,
+    attach, drain_to_latest_redraw, exec_lua, feed, feed_mouse, map_get, serial_lock, spawn,
+    temp_dir,
 };
 use rmpv::Value;
 use tokio::sync::mpsc::UnboundedReceiver;
@@ -113,8 +117,61 @@ async fn await_float(
     panic!("the content float never contained {want:?}; last float lines: {last:?}");
 }
 
+/// The first floating *window* (`windows[]` with `floating == true`) in a redraw —
+/// the hover doc float — or `None`. The main editor window is `floating == false`.
+fn floating_window(map: &[(Value, Value)]) -> Option<Vec<(Value, Value)>> {
+    let windows = map_get(map, "windows")?.as_array()?;
+    windows
+        .iter()
+        .filter_map(Value::as_map)
+        .find(|w| map_get(w, "floating").and_then(Value::as_bool) == Some(true))
+        .cloned()
+}
+
+/// A float window's rendered text rows (the redraw `lines` array — plain strings).
+fn window_lines(win: &[(Value, Value)]) -> Vec<String> {
+    match map_get(win, "lines") {
+        Some(Value::Array(rows)) => rows
+            .iter()
+            .map(|r| r.as_str().unwrap_or_default().to_string())
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// A float window's outer rect `(x, y, width, height)` from the redraw.
+fn window_rect(win: &[(Value, Value)]) -> (usize, usize, usize, usize) {
+    let rect = match map_get(win, "rect") {
+        Some(Value::Map(m)) => m.clone(),
+        other => panic!("expected a window rect, got {other:?}"),
+    };
+    let n = |k| map_get(&rect, k).and_then(Value::as_u64).unwrap_or(0) as usize;
+    (n("x"), n("y"), n("width"), n("height"))
+}
+
+/// Retry `nx.lsp.hover()` until a floating doc-float *window* appears with some line
+/// containing `want` (the async reply takes a moment to land); returns its rows.
+async fn await_hover_window(
+    rpc: &Rpc,
+    incoming: &mut UnboundedReceiver<Incoming>,
+    want: &str,
+) -> Vec<(Value, Value)> {
+    for _ in 0..200 {
+        exec_lua(rpc, "nx.lsp.hover()").await;
+        nxvim_test_harness::barrier(rpc).await;
+        if let Some(map) = drain_to_latest_redraw(incoming, |m| floating_window(m).is_some()) {
+            let win = floating_window(&map).expect("a floating window");
+            if window_lines(&win).iter().any(|l| l.contains(want)) {
+                return win;
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+    panic!("the hover float window never contained {want:?}");
+}
+
 #[tokio::test]
-async fn hover_reply_opens_the_content_float() {
+async fn hover_reply_opens_a_float_window() {
     let _guard = serial_lock().lock().await;
     let dir = temp_dir("lsp_float_hover");
     arm_mock(
@@ -124,10 +181,69 @@ async fn hover_reply_opens_the_content_float() {
     );
     let (rpc, mut incoming) = start(&dir).await;
 
-    let lines = await_float(&rpc, &mut incoming, "nx.lsp.hover()", "scripted hover").await;
+    // The hover is a real float WINDOW now (so it can scroll), not the content-float
+    // `float` surface — assert it appears in `windows[]` carrying the markup.
+    let win = await_hover_window(&rpc, &mut incoming, "scripted hover").await;
     assert!(
-        lines.iter().any(|l| l.contains("foo")),
-        "hover float should carry the markup, got {lines:?}"
+        window_lines(&win).iter().any(|l| l.contains("foo")),
+        "hover float window should carry the markup, got {:?}",
+        window_lines(&win)
+    );
+
+    std::env::remove_var("NXVIM_LSP_CMD");
+}
+
+#[tokio::test]
+async fn hover_window_scrolls_with_the_wheel_and_a_key_dismisses_it() {
+    let _guard = serial_lock().lock().await;
+    let dir = temp_dir("lsp_float_hover_scroll");
+    // A tall hover (more lines than the float's 20-row cap) so there is content to
+    // scroll past — the whole reason a doc float is a window, not a content overlay.
+    let body = (0..30)
+        .map(|i| format!("hover line {i:02}"))
+        .collect::<Vec<_>>()
+        .join("\\n");
+    arm_mock(
+        &dir,
+        &format!(r#"{{ "hover": {{ "contents": {{ "kind": "markdown", "value": "{body}" }} }} }}"#),
+    );
+    let (rpc, mut incoming) = start(&dir).await;
+
+    // Open it and confirm the top of the content shows first.
+    let win = await_hover_window(&rpc, &mut incoming, "hover line 00").await;
+    assert_eq!(
+        window_lines(&win).first().map(String::as_str),
+        Some("hover line 00"),
+        "the float opens at the top of the content"
+    );
+    let (x, y, _, _) = window_rect(&win);
+
+    // A wheel-down notch over the float scrolls its content — the wheel flows
+    // through the mouse path, NOT `input`, so it does not dismiss the popup.
+    for _ in 0..3 {
+        feed_mouse(&rpc, "wheel", "down", y + 1, x + 1);
+    }
+    nxvim_test_harness::barrier(&rpc).await;
+    let scrolled = drain_to_latest_redraw(&mut incoming, |m| {
+        floating_window(m)
+            .map(|w| window_lines(&w).first() != Some(&"hover line 00".to_string()))
+            .unwrap_or(false)
+    })
+    .and_then(|m| floating_window(&m))
+    .expect("the wheel scrolled the hover float (still open)");
+    let top = window_lines(&scrolled);
+    assert_ne!(
+        top.first().map(String::as_str),
+        Some("hover line 00"),
+        "wheel-down scrolled the content; top is no longer line 00 ({top:?})"
+    );
+
+    // The next KEY dismisses it (transient), like a content float.
+    feed(&rpc, "j");
+    nxvim_test_harness::barrier(&rpc).await;
+    assert!(
+        drain_to_latest_redraw(&mut incoming, |m| floating_window(m).is_none()).is_some(),
+        "a key dismissed the hover float window"
     );
 
     std::env::remove_var("NXVIM_LSP_CMD");

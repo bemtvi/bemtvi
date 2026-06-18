@@ -770,6 +770,18 @@ pub struct Editor {
     /// dismissed by the next key (see [`Editor::input`]). The sibling of [`menu`]
     /// on the shared float placement layer. See [`float`](crate::editor::float).
     content_float: Option<float::ContentFloat>,
+    /// Reused scratch buffers backing the **doc floats** (the LSP hover /
+    /// signature-help *windows*), keyed by surface name so re-opening a surface
+    /// replaces its content in place. Like [`Editor::panel_buffers`] these are
+    /// surfaces, not documents — [`Editor::is_doc_float_buffer`] keeps them out of
+    /// `:ls` / buffer navigation. See [`float`](crate::editor::float).
+    doc_float_buffers: Vec<(String, BufferId)>,
+    /// The doc-float **windows** currently open, keyed by surface name: a real,
+    /// non-focusable float window per surface (so it inherits mouse hit-testing and
+    /// **wheel scroll** for free). Transient like [`content_float`] — the next key
+    /// dismisses it in [`Editor::input`] — but a mouse wheel never reaches `input`,
+    /// so it scrolls the popup instead of closing it.
+    doc_float_wins: Vec<(String, WindowId)>,
     /// Picker query edits awaiting a (dynamic) source re-run: each `(generation,
     /// query)`. A *static* source never appends here — the local fuzzy matcher
     /// handles its query edits in core. Drained by the server, which stamps the
@@ -1345,6 +1357,8 @@ impl Editor {
             qf: QfStack::default(),
             qf_bufnr: None,
             panel_buffers: Vec::new(),
+            doc_float_buffers: Vec::new(),
+            doc_float_wins: Vec::new(),
             panel: None,
             view_float_lock: Vec::new(),
             qf_prev_win: None,
@@ -1515,6 +1529,11 @@ impl Editor {
         if matches!(&self.content_float, Some(f) if !f.persistent) {
             self.content_float = None;
         }
+        // A doc float (the hover / signature-help *window*) is dismissed the same
+        // way on the next key. Unlike the content float it is a real float window,
+        // so a mouse wheel — which never flows through `input` — scrolls it instead
+        // of closing it (the whole point of backing it with a window).
+        self.close_all_doc_floats();
 
         // A focused menu (`nx.ui.select` / the picker) grabs every key the same
         // way — navigation + confirm / cancel — floating over the text. A

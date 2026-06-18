@@ -12,6 +12,7 @@ use std::path::PathBuf;
 use std::rc::Rc;
 
 use mlua::{Lua, Table, UserData, UserDataMethods, Variadic};
+use unicode_width::UnicodeWidthStr;
 
 use crate::convert::{
     color_field, color_to_u32, env_pairs, flag_field, json_to_lua, lua_i64, lua_to_json,
@@ -194,6 +195,16 @@ pub(crate) fn install_vim(lua: &Lua, shared: &Rc<RefCell<Shared>>) -> mlua::Resu
         Ok(())
     })?;
     nx.set("echo", echo)?;
+    // `nx._strwidth(s)` (exposed by the prelude as `nx.str.width`): the display
+    // width of `s` in terminal cells — wide (CJK / emoji) graphemes count as two,
+    // combining marks as zero — via the same `unicode-width` table the core
+    // renderer measures with (`nxvim_core::unicode::display_width`), so Lua layout
+    // code and the rendered frame agree. Like that helper it does *not* expand
+    // tabs; align/layout helpers feed it tab-free line content.
+    nx.set(
+        "_strwidth",
+        lua.create_function(|_, s: String| Ok(UnicodeWidthStr::width(s.as_str())))?,
+    )?;
     // `nvim_set_hl(ns, name, opts)`: capture the group definition for the server
     // to fold into the core registry, keyed by namespace. `ns == 0` is the global
     // table a colorscheme populates; a non-zero `ns` is kept in its own table so

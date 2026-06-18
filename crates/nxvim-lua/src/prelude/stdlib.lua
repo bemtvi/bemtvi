@@ -731,23 +731,46 @@ function nx.keytrans(s)
 end
 vim.fn.keytrans = nx.keytrans
 
--- nx.strwidth(text): the display cells `text` occupies (wide chars count as
--- two). Unlike strdisplaywidth it does not expand tabs — it measures the raw
--- string — matching neovim's API. Shares the char-width table above.
-function nx.strwidth(text)
-  text = tostring(text or "")
-  local w, i = 0, 1
-  while i <= #text do
-    local cp, len = utf8_decode(text, i)
-    if len == 0 then
-      break
-    end
-    w = w + char_width(cp)
-    i = i + len
-  end
-  return w
+-- nx.str.width(s) [alias nx.strwidth / vim.api.nvim_strwidth]: the display width
+-- of `s` in terminal cells, computed natively by the `nx._strwidth` Rust helper
+-- (the same `unicode-width` table the renderer measures with — so this and the
+-- drawn frame always agree). Wide (CJK / emoji) graphemes count as two, combining
+-- marks as zero; tabs are NOT expanded (reach for nx.str.displaywidth when you
+-- need tab expansion). This is the measure the nx.align.* helpers below size lines
+-- against. The `nx.strwidth` / `nvim_strwidth` names are kept as neovim-compat
+-- aliases onto the same native helper (they previously ran a coarser pure-Lua
+-- heuristic that mis-sized combining marks as one cell).
+assert(nx._strwidth, "nx.str.width: native nx._strwidth helper is missing")
+nx.str.width = nx._strwidth
+nx.strwidth = nx._strwidth
+vim.api.nvim_strwidth = nx._strwidth
+
+-- nx.align.{left,center,right}(line, width): pad a single line with spaces so it
+-- spans `width` display cells. `left` keeps the text at the start (pad on the
+-- right), `right` pushes it to the end (pad on the left), and `center` splits the
+-- padding, sending any odd leftover cell to the right. A line already at or wider
+-- than `width` is returned unchanged — these only add spaces, never truncate.
+-- Width is measured with nx.str.width, so wide glyphs pad correctly.
+nx.align = nx.align or {}
+function nx.align.left(line, width)
+  line = tostring(line or "")
+  local pad = (width or 0) - nx.str.width(line)
+  return pad > 0 and line .. string.rep(" ", pad) or line
 end
-vim.api.nvim_strwidth = nx.strwidth
+function nx.align.right(line, width)
+  line = tostring(line or "")
+  local pad = (width or 0) - nx.str.width(line)
+  return pad > 0 and string.rep(" ", pad) .. line or line
+end
+function nx.align.center(line, width)
+  line = tostring(line or "")
+  local pad = (width or 0) - nx.str.width(line)
+  if pad <= 0 then
+    return line
+  end
+  local left = math.floor(pad / 2)
+  return string.rep(" ", left) .. line .. string.rep(" ", pad - left)
+end
 
 -- nx.tbl.spairs(t) [alias vim.spairs]: pairs() in sorted-key order. Neovim's stable-iteration helper —
 -- a custom `'tabline'`/`str_join` uses it so output order is deterministic.

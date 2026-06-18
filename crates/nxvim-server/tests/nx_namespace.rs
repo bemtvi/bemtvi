@@ -416,3 +416,101 @@ async fn nx_exec_captures_autocmd_listing_and_nvim_alias_agrees() {
         "the nvim_exec alias captures the same listing"
     );
 }
+
+#[tokio::test]
+async fn nx_str_width_measures_cells_natively() {
+    let (rpc, _incoming) = start().await;
+    // ASCII is one cell per char.
+    assert_eq!(
+        exec_lua(&rpc, "return nx.str.width('hello')")
+            .await
+            .as_i64(),
+        Some(5)
+    );
+    // Wide (CJK) graphemes count as two cells each — the native unicode-width
+    // measure, not a byte/char count (which would report 3 / 9).
+    assert_eq!(
+        exec_lua(&rpc, "return nx.str.width('日本語')")
+            .await
+            .as_i64(),
+        Some(6),
+        "wide CJK graphemes count as two cells (not bytes or chars)"
+    );
+    // A zero-width combining mark adds nothing: 'e' + combining acute.
+    assert_eq!(
+        exec_lua(&rpc, "return nx.str.width('e\\u{0301}')")
+            .await
+            .as_i64(),
+        Some(1),
+        "a combining mark contributes zero cells"
+    );
+
+    // The neovim-compat aliases (nx.strwidth / nvim_strwidth) now route to the
+    // same native helper — they used to run a coarser pure-Lua heuristic that
+    // sized this combining mark as a second cell (returning 2).
+    for expr in [
+        "return nx.strwidth('e\\u{0301}')",
+        "return vim.api.nvim_strwidth('e\\u{0301}')",
+    ] {
+        assert_eq!(
+            exec_lua(&rpc, expr).await.as_i64(),
+            Some(1),
+            "nx.strwidth / nvim_strwidth share the native measure: {expr}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn nx_align_pads_lines_to_width() {
+    let (rpc, _incoming) = start().await;
+    // left: text at the start, padding on the right.
+    assert_eq!(
+        exec_lua(&rpc, "return nx.align.left('hi', 6)")
+            .await
+            .as_str(),
+        Some("hi    ")
+    );
+    // right: padding on the left, text at the end.
+    assert_eq!(
+        exec_lua(&rpc, "return nx.align.right('hi', 6)")
+            .await
+            .as_str(),
+        Some("    hi")
+    );
+    // center: padding split, odd leftover cell goes to the right (4 slack → 2/2).
+    assert_eq!(
+        exec_lua(&rpc, "return nx.align.center('hi', 6)")
+            .await
+            .as_str(),
+        Some("  hi  ")
+    );
+    // center with an odd slack (5) sends the extra cell right: 2 left, 3 right.
+    assert_eq!(
+        exec_lua(&rpc, "return nx.align.center('hi', 7)")
+            .await
+            .as_str(),
+        Some("  hi   ")
+    );
+}
+
+#[tokio::test]
+async fn nx_align_never_truncates_and_sizes_wide_glyphs() {
+    let (rpc, _incoming) = start().await;
+    // A line already at or beyond the target width is returned unchanged.
+    assert_eq!(
+        exec_lua(&rpc, "return nx.align.center('toolong', 3)")
+            .await
+            .as_str(),
+        Some("toolong"),
+        "align never truncates — it only ever adds spaces"
+    );
+    // Padding is sized by display cells: '日' is two cells, so width 6 leaves 4
+    // slack, centered 2/2 — a byte/char measure would mis-pad.
+    assert_eq!(
+        exec_lua(&rpc, "return nx.align.center('日', 6)")
+            .await
+            .as_str(),
+        Some("  日  "),
+        "wide glyphs are padded by cell width, not byte length"
+    );
+}

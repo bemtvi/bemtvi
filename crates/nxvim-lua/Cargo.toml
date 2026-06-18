@@ -24,6 +24,10 @@ nxvim-regex.workspace = true
 rmpv.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+# Cell-width table backing `nx.str.width` (the native display-width helper) — the
+# same `unicode-width` crate `nxvim_core::unicode::display_width` measures with,
+# so Lua layout code and the core renderer agree. Pure Rust, wasm-safe.
+unicode-width.workspace = true
 
 # The treesitter crate (the native highlight `Engine` + grammar/data-dir helpers
 # nxvim-lua references). There is no Lua parser binding anymore — `nx.treesitter`

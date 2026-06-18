@@ -114,12 +114,21 @@ this phase changes no observable output.
 - Tests: `picker.rs` (click-select-then-confirm, click-off-cancels, list-wheel,
   preview-wheel) and `ui_select.rs` (click-select-then-confirm).
 
-## Phase 3 — Cmdline wildmenu
+## Phase 3 — Cmdline wildmenu ✅ (committed)
 
-- Click a candidate → select + accept it into the command line
-  (`cmdline_complete` select/accept path); wheel → cycle candidates.
-- `mouse_enabled()` already gates Command mode on `'mouse'` containing `c`; confirm
-  and add a `c`-mode test.
+- `menu_screen` gained the **Cmdline frame**: the box anchors to the command-line
+  area (global x = the token column, bottom abutting the command-line row at
+  `self.height`) and grows **upward** with a top border and no bottom one — vs every
+  other menu, which anchors to the focused window's text inner and grows down.
+- Non-grabbing like the completion popup (new dispatch arms gated on
+  `cmdline_complete_active()` + `menu_hit().is_some()`): a left-press highlights a
+  candidate (and previews it on the line via `cmdline_complete_select_index` →
+  `cmdline_complete_preview`), clicking the highlighted one accepts it into the line
+  (`cmdline_complete_accept`), a wheel cycles the highlight. Off the box the press
+  falls through.
+- Command-mode mouse is gated on `'mouse'` containing `c` (the default `"nvi"`
+  omits it — correct vim behavior); the test and the Phase 4 example set `mouse=a`.
+- Tests: `cmdline_complete.rs` (click-selects-then-accepts-into-line, wheel-cycles).
 
 ## Phase 4 — Example, docs, cross-client verify
 

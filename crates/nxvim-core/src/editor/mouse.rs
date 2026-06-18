@@ -236,6 +236,21 @@ impl Editor {
             {
                 self.mouse_menu_wheel(ev.action == MouseAction::WheelDown, ev.row, ev.col)
             }
+            // The command-line wildmenu (`nx.cmdline_complete`) is non-grabbing like the
+            // completion popup: a left-press on a candidate highlights it (and previews
+            // it on the command line), clicking the highlighted one accepts it into the
+            // line, and a wheel cycles the highlight. Guarded on the cell landing on the
+            // box, so a press elsewhere still reaches the line / text.
+            (MouseButton::Left, MouseAction::Press)
+                if self.cmdline_complete_active() && self.menu_hit(ev.row, ev.col).is_some() =>
+            {
+                self.mouse_cmdline_press(ev.row, ev.col)
+            }
+            (MouseButton::Wheel, MouseAction::WheelUp | MouseAction::WheelDown)
+                if self.cmdline_complete_active() && self.menu_hit(ev.row, ev.col).is_some() =>
+            {
+                self.mouse_cmdline_wheel(ev.action == MouseAction::WheelDown)
+            }
             // A press on any region's shown tabline switches that region to the
             // clicked tab (vim's tabline click, generalized per region — main and
             // each open dock each have their own). Resolved before the text-press
@@ -1261,6 +1276,44 @@ impl Editor {
         }
     }
 
+    /// A left-press on the command-line wildmenu: clicking the highlighted candidate
+    /// accepts it into the command line (like `<CR>` on it); clicking any other
+    /// candidate highlights it (and previews it on the line). A press on the box
+    /// border / a filler is consumed but selects nothing.
+    fn mouse_cmdline_press(&mut self, row: usize, col: usize) {
+        self.mouse_select = None;
+        let Some(MenuHit::Item(idx)) = self.menu_hit(row, col) else {
+            return;
+        };
+        if self
+            .menu_view()
+            .and_then(|m| m.selected_active.then_some(m.selected))
+            == Some(idx)
+        {
+            self.cmdline_complete_accept();
+        } else {
+            self.cmdline_complete_select_index(idx);
+        }
+    }
+
+    /// A wheel notch over the wildmenu moves the highlight one row, non-wrapping (like
+    /// a scrollbar). A noselect wildmenu highlights the first row.
+    fn mouse_cmdline_wheel(&mut self, down: bool) {
+        let Some(m) = self.menu_view() else {
+            return;
+        };
+        let n = m.total;
+        if n == 0 {
+            return;
+        }
+        let next = match m.selected_active.then_some(m.selected) {
+            Some(i) if down => (i + 1).min(n - 1),
+            Some(i) => i.saturating_sub(1),
+            None => 0,
+        };
+        self.cmdline_complete_select_index(next);
+    }
+
     /// Resolve a **global** screen cell to a spot on the open menu overlay: a
     /// selectable list row (the absolute view index), some other part of the box
     /// ([`MenuHit::Chrome`] — a border / prompt / filler), or `None` when the cell
@@ -1294,27 +1347,34 @@ impl Editor {
     /// command-line wildmenu (its own frame) or when no menu is open.
     fn menu_screen(&self) -> Option<MenuScreen> {
         let m = self.menu_view()?;
-        if matches!(m.placement, MenuPlacement::Cmdline) {
-            return None;
-        }
         let (metrics, win, gutter) = self.menu_anchor()?;
         let geom = self.menu_geom(&m, metrics);
-        let (wx, wy) = self.window_screen_pos(win)?;
-        // The text inner origin: the window's screen top-left, past its number gutter.
-        let inner_x = wx + gutter;
-        let inner_y = wy;
-        // Border convention, mirroring every client: a full border for select /
-        // picker; the completion popup omits its top border and shifts one cell left
-        // so its left border doesn't cover the word it completes. `geom.col` is the
-        // *content* anchor for `Cursor` placement (offset back over the left border by
-        // `left_shift`) but the *outer box* left for `Editor` placement; either way the
-        // outer box left is `geom.col - left_shift` and the content sits one cell in.
-        let border_top = !m.completion;
-        let left_shift = usize::from(!border_top);
-        let vborder = if border_top { 2 } else { 1 };
-        let top_border = usize::from(border_top);
-        let box_x = (inner_x + geom.col).saturating_sub(left_shift);
-        let box_y = inner_y + geom.row;
+        // The box's outer top-left + border layout, in global cells. Two frames: the
+        // command-line wildmenu anchors to the command-line area (global x, the row
+        // just below the windows area) and grows *upward* with a top border and no
+        // bottom one; every other menu anchors to the focused window's text inner and
+        // grows downward.
+        let (box_x, box_y, top_border, vborder) = if matches!(m.placement, MenuPlacement::Cmdline) {
+            // `self.height` is the windows-area height, so the command-line row is at
+            // that global row and the box's bottom border abuts it; the token column is
+            // a global column (the command line spans the full width from x = 0).
+            let vborder = 1; // top border only
+            let box_y = self.height.checked_sub(geom.height + vborder)?;
+            (geom.col, box_y, 1, vborder)
+        } else {
+            let (wx, wy) = self.window_screen_pos(win)?;
+            let inner_x = wx + gutter; // text inner: past the number gutter
+                                       // A full border for select / picker; the completion popup omits its top
+                                       // border and shifts one cell left so its left border doesn't cover the word
+                                       // it completes. `geom.col` is the content anchor for `Cursor` placement and
+                                       // the outer-box left for `Editor`; either way the outer box left is
+                                       // `geom.col - left_shift` and the content sits one cell in.
+            let border_top = !m.completion;
+            let left_shift = usize::from(!border_top);
+            let vborder = if border_top { 2 } else { 1 };
+            let box_x = (inner_x + geom.col).saturating_sub(left_shift);
+            (box_x, wy + geom.row, usize::from(border_top), vborder)
+        };
         let box_w = geom.width + 2;
         let box_h = geom.height + vborder;
         // The content rect (inside the borders): the list + prompt + preview live here.

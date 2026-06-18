@@ -618,3 +618,102 @@ async fn catalog_commands_are_recognized() {
         );
     }
 }
+
+// ---- Phase 3: mouse on the wildmenu (command-mode 'c' in 'mouse') ------------------
+
+/// Command-mode mouse needs `'c'` in `'mouse'` (the default `"nvi"` omits it). The
+/// wildmenu floats just above the command line — at the windows-area bottom, which in
+/// the headless harness is the attached row count — so candidate `r` sits that many
+/// rows up, and its content is one cell past the box's left border.
+const ATTACH_ROWS: usize = 24;
+
+fn menu_field_u64(map: &[(Value, Value)], key: &str) -> usize {
+    let menu = match map_get(map, "menu") {
+        Some(Value::Map(m)) => m,
+        other => panic!("expected a menu map, got {other:?}"),
+    };
+    map_get(menu, key)
+        .and_then(Value::as_u64)
+        .unwrap_or_else(|| panic!("menu has a {key}")) as usize
+}
+
+#[tokio::test]
+async fn clicking_a_wildmenu_candidate_selects_then_accepts_into_the_line() {
+    let dir = temp_dir("cmdcomplete_mouse_click");
+    let (rpc, mut incoming) = start(&dir, INIT).await;
+    nxvim_test_harness::command(&rpc, "set mouse=a nonumber norelativenumber").await;
+
+    feed(&rpc, ":e<Tab>");
+    let map = poll_menu(&rpc, &mut incoming)
+        .await
+        .expect("wildmenu opens");
+    let items = menu_items(&map);
+    let height = menu_field_u64(&map, "height");
+    let col = menu_field_u64(&map, "col");
+    let want = 2usize; // "echo", a visible candidate
+    assert!(
+        want < height,
+        "candidate {want} must be visible (height {height})"
+    );
+    let click_row = ATTACH_ROWS - height + want;
+    let click_col = col + 1;
+
+    // Click the candidate: it highlights and previews on the command line; the menu
+    // stays open (a wildmenu candidate isn't accepted on the first click).
+    nxvim_test_harness::feed_mouse(&rpc, "left", "press", click_row, click_col);
+    let map = poll_menu(&rpc, &mut incoming)
+        .await
+        .expect("redraw after click");
+    let (sel, active) = menu_selection(&map);
+    assert!(
+        active && sel as usize == want,
+        "the clicked candidate is highlighted (got {sel}, active {active})"
+    );
+    assert_eq!(
+        cmdline_text(&map).as_deref(),
+        Some(items[want].as_str()),
+        "the line previews the highlighted candidate"
+    );
+
+    // Click the highlighted candidate again: it accepts into the line (like <CR> on
+    // it) and the menu closes — the command stands, ready to run or edit further.
+    nxvim_test_harness::feed_mouse(&rpc, "left", "press", click_row, click_col);
+    let map = poll_no_menu(&rpc, &mut incoming)
+        .await
+        .expect("the menu closes on accept");
+    assert_eq!(
+        cmdline_text(&map).as_deref(),
+        Some(items[want].as_str()),
+        "the accepted command stands on the command line"
+    );
+    assert!(
+        command_mode(&map),
+        "still editing the command line after accept"
+    );
+}
+
+#[tokio::test]
+async fn wheeling_over_the_wildmenu_cycles_candidates() {
+    let dir = temp_dir("cmdcomplete_mouse_wheel");
+    let (rpc, mut incoming) = start(&dir, INIT).await;
+    nxvim_test_harness::command(&rpc, "set mouse=a nonumber norelativenumber").await;
+
+    feed(&rpc, ":e<Tab>");
+    let map = poll_menu(&rpc, &mut incoming)
+        .await
+        .expect("wildmenu opens");
+    let height = menu_field_u64(&map, "height");
+    let col = menu_field_u64(&map, "col");
+    // A cell on the top visible row of the box.
+    let (r, c) = (ATTACH_ROWS - height, col + 1);
+
+    // A wheel-down notch highlights the first candidate (from noselect)…
+    nxvim_test_harness::feed_mouse(&rpc, "wheel", "down", r, c);
+    let map = wait_redraw(&mut incoming, |m| menu_sel_is(m, 0, true)).await;
+    assert_eq!(menu_selection(&map), (0, true));
+
+    // …and another moves it down one, non-wrapping.
+    nxvim_test_harness::feed_mouse(&rpc, "wheel", "down", r, c);
+    let map = wait_redraw(&mut incoming, |m| menu_sel_is(m, 1, true)).await;
+    assert_eq!(menu_selection(&map), (1, true));
+}

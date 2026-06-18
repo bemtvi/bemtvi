@@ -695,6 +695,27 @@ impl Editor {
         self.cmdline_complete_preview();
     }
 
+    /// Highlight wildmenu row `idx` directly (a mouse click on it) and preview it in
+    /// the command line — the mouse twin of
+    /// [`cmdline_complete_next`](Self::cmdline_complete_next). A no-op unless a cmdline
+    /// menu is open.
+    pub(crate) fn cmdline_complete_select_index(&mut self, idx: usize) {
+        if let Some(m) = self.cmdline_menu_mut() {
+            let len = m.view_len();
+            if len > 0 {
+                m.selected_active = true;
+                m.cursor = idx.min(len - 1);
+            }
+        }
+        self.cmdline_complete_preview();
+    }
+
+    /// Whether the open menu is the command-line wildmenu (`nx.cmdline_complete`),
+    /// the one the mouse drives in command mode.
+    pub(crate) fn cmdline_complete_active(&self) -> bool {
+        self.menu_kind() == Some(MenuKind::Cmdline)
+    }
+
     /// The actively-highlighted command-line completion's `(anchor, insert_text)`
     /// **without** closing the menu — the peek twin of
     /// [`cmdline_complete_take_accept`](Self::cmdline_complete_take_accept), used to

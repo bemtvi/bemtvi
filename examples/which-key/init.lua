@@ -19,8 +19,11 @@
 -- them with `available == false`, and this plugin DROPS those rows so the popup only
 -- ever shows keys you can actually press.
 --
--- This is a real which-key built from TWO nx APIs and nothing else — no blocking
--- key reads, no key interception:
+-- This is a real which-key built as an `nx.component` over the pending-key ORACLE — no
+-- blocking key reads, no key interception. The component (reactive state + a pure render +
+-- lifecycle) is the SAME model the checklist dialog uses; the only difference is the
+-- SURFACE: which-key renders on the non-focus "float" backend (it must never take focus or
+-- bind keys), the checklist on the focus-taking "view". The two nx signals it reads:
 --
 --   * nx.on_key_pending(fn)   the engine's pending-prefix ORACLE. The server
 --                             watches the mapped-prefix trie and pushes a context
@@ -39,10 +42,11 @@
 --                             the built-in motions with any maps that share the `g`
 --                             prefix (the LSP `gd`/`gD`/`gr` defaults), so one popup
 --                             shows both.
---   * nx.ui.float(.., {persist=true})   a persistent content float; the returned
---                             handle's :update() repaints it in place and :close()
---                             dismisses it. The popup survives keystrokes so it can
---                             track the sequence as you type.
+--   * nx.component{ surface="float" }   the component renders onto a persistent
+--                             nx.ui.float under the hood (a non-focus content float that
+--                             survives keystrokes). The component owns the open/refresh/
+--                             close — an empty `render` hides it — so the plugin never
+--                             touches the float handle directly.
 --   * nx.utils.debounce(fn, ms)         coalesce the oracle's bursts so a fast,
 --                             deliberate sequence (`<Space>w` typed quickly) never
 --                             flashes the popup — it only appears when you PAUSE.
@@ -149,45 +153,51 @@ local function lines_for(ctx)
   return rows
 end
 
-local popup -- the open float handle, or nil
+-- The plugin is a FLOAT-backed nx.component: the pending context is reactive state, a pure
+-- `render` maps it to the popup's rows, and an EMPTY render hides the popup — so the popup's
+-- whole show/refresh/hide lifecycle is declarative. The same component model the checklist
+-- dialog uses, but on the "float" surface — which takes NO focus and binds NO keys (which-key
+-- must never interrupt the sequence you're typing), instead of the focus-taking "view".
+nx.component({
+  surface = "float",
+  setup = function(ctx)
+    -- The one piece of state: the current pending context (or nil when there's none).
+    local state = ctx.reactive({ pending = nil })
 
--- Debounced opener: builds the grid and opens/repaints the float. Debouncing
--- means many oracle events in a burst collapse to one render of the LAST one.
-local open = nx.utils.debounce(function(ctx)
-  local lines = lines_for(ctx)
-  -- Title the popup `keys — label` so the prefix isn't cryptic: a bare `d` reads as
-  -- "d — Delete", `g` as "g — Go". Source-A leader prefixes have no label, so they
-  -- title with just the keys (" <Space> ").
-  local title = " " .. ctx.keys
-  if ctx.label and ctx.label ~= "" then
-    title = title .. " — " .. ctx.label
-  end
-  title = title .. " "
-  if popup and popup:is_open() then
-    popup:update(lines, { title = title, relative = "bottom" })
-  else
-    popup = nx.ui.float(lines, {
-      persist = true,
-      title = title,
-      border = "rounded",
-      relative = "bottom",
-    })
-  end
-end, DELAY)
+    -- Debounce the SHOW so a fast, deliberate sequence (`<Space>w` typed quickly) never
+    -- flashes the popup — it only appears when you PAUSE. The HIDE is immediate (below), so
+    -- the popup never lingers after you've answered.
+    local show = nx.utils.debounce(function(c)
+      state.pending = c
+    end, DELAY)
 
-nx.on_key_pending(function(ctx)
-  -- Cleared context (prefix completed, broke, or timed out): drop any pending
-  -- open and close the popup at once — no debounce on the way down, so it never
-  -- lingers after you've answered. A live source-B state (find-char, …) has empty
-  -- continuations but a non-empty `keys`/`label`, so gate on `keys` alone — an
-  -- empty continuation list is NOT "close" anymore.
-  if ctx.keys == "" then
-    open:cancel()
-    if popup then
-      popup:close()
-      popup = nil
+    nx.on_key_pending(function(c)
+      -- Cleared context (prefix completed, broke, or timed out): cancel the pending show
+      -- and hide at once. A live source-B state (find-char, …) has empty continuations but
+      -- a non-empty `keys`/`label`, so gate on `keys` alone.
+      if c.keys == "" then
+        show:cancel()
+        state.pending = nil
+      else
+        show(c)
+      end
+    end)
+
+    return state
+  end,
+
+  -- Pure: the pending context in, the popup's rows out. `nil` → an empty render → hidden.
+  render = function(state)
+    local c = state.pending
+    if not c then
+      return { lines = {} }
     end
-    return
-  end
-  open(ctx)
-end)
+    -- Title the popup `keys — label` so the prefix isn't cryptic: a bare `d` reads as
+    -- "d — Delete". Source-A leader prefixes have no label, so they title with the keys.
+    local title = " " .. c.keys
+    if c.label and c.label ~= "" then
+      title = title .. " — " .. c.label
+    end
+    return { lines = lines_for(c), title = title .. " " }
+  end,
+}).mount({ relative = "bottom", border = "rounded" })

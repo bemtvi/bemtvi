@@ -346,3 +346,54 @@ async fn unknown_border_is_rejected_loud() {
         "expected a loud border error, got message {message:?}"
     );
 }
+
+/// The `nx.component` "float" backend: the Vue-shaped component model rendered onto a
+/// non-focus content float (the which-key surface). A reactive write re-renders into the
+/// float in place; an EMPTY render hides it. Proves the component model is surface-agnostic
+/// — the same setup/render/reactive core drives a float, not just a focus-taking view.
+#[tokio::test]
+async fn float_backed_component_renders_and_hides_with_reactive_state() {
+    let dir = temp_dir("float_component");
+    let (rpc, mut incoming) = start(
+        &dir,
+        r#"
+        nx.component({
+          surface = "float",
+          setup = function(ctx)
+            _G.s = ctx.reactive({ rows = { "alpha" } })
+            return _G.s
+          end,
+          render = function(s)
+            return { lines = s.rows, title = " demo " }
+          end,
+        }).mount({ relative = "editor" })
+        "#,
+    )
+    .await;
+
+    // The first render opens the float with the initial content.
+    let map = poll_float(&rpc, &mut incoming, |f| matches!(f, Value::Map(_)))
+        .await
+        .expect("the float-backed component opened a float");
+    assert_eq!(float_lines(&float_of(&map)), vec!["alpha"]);
+
+    // A reactive write re-renders → the float updates in place (two lines now).
+    exec_lua(&rpc, "_G.s.rows = { 'beta', 'gamma' }").await;
+    let map = poll_float(
+        &rpc,
+        &mut incoming,
+        |f| matches!(f, Value::Map(m) if map_get(m, "height").and_then(Value::as_u64) == Some(2)),
+    )
+    .await
+    .expect("the float updated to two lines");
+    assert_eq!(float_lines(&float_of(&map)), vec!["beta", "gamma"]);
+
+    // An empty render hides the float entirely.
+    exec_lua(&rpc, "_G.s.rows = {}").await;
+    assert!(
+        poll_float(&rpc, &mut incoming, |f| matches!(f, Value::Nil))
+            .await
+            .is_some(),
+        "an empty render closed the float"
+    );
+}

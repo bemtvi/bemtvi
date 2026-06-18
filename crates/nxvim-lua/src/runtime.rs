@@ -363,6 +363,14 @@ const PRELUDE_MODULES: &[(&str, &str)] = &[
     // is fire-and-forget). The deferral primitives nx.schedule / nx.timer live in
     // runtime.lua; this module is the UI surface only.
     ("nxvim:prelude/ui", include_str!("prelude/ui.lua")),
+    // nx.component / nx.view.component: the Vue-shaped component model (reactive state +
+    // computed + pure render + lifecycle) with pluggable backends — the "view" backend
+    // (focus-taking nx.view buffer) and the "float" backend (non-focus nx.ui.float). Loads
+    // after view + ui so both surfaces it dispatches to exist; uses promise/async (above).
+    (
+        "nxvim:prelude/component",
+        include_str!("prelude/component.lua"),
+    ),
     // nx.run / nx.run_stream / nx.await_each: promise-only process API (replaces the
     // callback-shaped nx.spawn). After promise.lua (builds on nx.promise/async).
     ("nxvim:prelude/process", include_str!("prelude/process.lua")),

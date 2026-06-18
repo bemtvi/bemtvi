@@ -460,8 +460,13 @@ impl EditHost {
                 } else {
                     report.queries.join(", ")
                 };
+                let inherited = if report.inherited.is_empty() {
+                    String::new()
+                } else {
+                    format!(" +inherited[{}]", report.inherited.join(", "))
+                };
                 self.editor.echo(format!(
-                    "TSInstall: installed {} @ {short} [{}] (queries: {queries})",
+                    "TSInstall: installed {} @ {short} [{}] (queries: {queries}{inherited})",
                     report.lang, report.compiler
                 ));
             }

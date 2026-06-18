@@ -135,4 +135,16 @@ pub trait SyntaxEngine {
         name: &str,
         text: Option<String>,
     ) -> Result<(), String>;
+
+    /// The engine's **base** `(lang, name)` query — the on-disk text it would
+    /// compile with no override. The server reads this to compose an
+    /// `after/queries` / runtimepath overlay (base ⧺ extensions) before handing the
+    /// merged string back via [`set_query_overlay`](Self::set_query_overlay).
+    /// `Ok(None)` when there is no base file (an engine that has none, or a
+    /// language with no bundled query — e.g. a config-only `injections.scm`). The
+    /// default returns `Ok(None)` for engines with no on-disk base (the wasm
+    /// JS-side highlighter).
+    fn base_query(&self, _lang: &str, _name: &str) -> Result<Option<String>, String> {
+        Ok(None)
+    }
 }

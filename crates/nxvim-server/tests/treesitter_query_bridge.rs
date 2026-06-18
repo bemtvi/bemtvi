@@ -1,0 +1,126 @@
+//! The query-resolution bridge, buffer-open half: a runtimepath `after/queries`
+//! overlay with a `;; extends` modeline must *add* its captures to the language's
+//! base highlight query (not replace it), and those captures must reach the paint.
+//!
+//! On first highlight of a buffer, the server resolves the language's runtimepath
+//! queries (`queries/<lang>/*.scm` + `after/queries/<lang>/*.scm`) onto the
+//! engine's bundled base and installs the merge. This test drops an overlay that
+//! captures a node the base query does not name, opens a file, and asserts the
+//! custom capture shows up in the redraw `highlights` payload — proving the overlay
+//! both merged and painted.
+//!
+//! `#[ignore]`d, not hermetic: it installs a real grammar into a temp data dir,
+//! which needs network + a C compiler — the same opt-in posture as the other
+//! treesitter / PTY e2e tests. Run with:
+//!
+//! ```sh
+//! cargo test -p nxvim-server --test treesitter_query_bridge -- --ignored --nocapture
+//! ```
+
+use nxvim_server::ServerInit;
+use nxvim_test_harness::*;
+use rmpv::Value;
+
+/// True if any row of the `highlights` payload paints a span whose capture group is
+/// `group`.
+fn payload_has_group(map: &[(Value, Value)], group: &str) -> bool {
+    window0_field(map, "highlights")
+        .and_then(Value::as_array)
+        .is_some_and(|rows| {
+            rows.iter().filter_map(Value::as_array).any(|cols| {
+                cols.iter()
+                    .filter_map(Value::as_array)
+                    .any(|span| span.get(2).and_then(Value::as_str) == Some(group))
+            })
+        })
+}
+
+#[tokio::test]
+#[ignore = "needs network + a C compiler to install a real grammar; opt-in like the other ts e2e tests"]
+async fn after_queries_extends_adds_capture_to_paint() {
+    // The server resolves grammars from `NXVIM_DATA_DIR` (process-global); serialize
+    // against other tests that touch process-wide state.
+    let _guard = serial_lock().lock().await;
+
+    let data = temp_dir("ts_bridge_data");
+    nxvim_ts::install::install(&data, "json")
+        .expect("install json grammar (network + C compiler required)");
+    std::env::set_var("NXVIM_DATA_DIR", &data);
+
+    // A runtimepath dir carrying an `after/queries` overlay that captures JSON
+    // numbers as a group the base query never emits.
+    let rtp = temp_dir("ts_bridge_rtp");
+    let qdir = rtp.join("after/queries/json");
+    std::fs::create_dir_all(&qdir).unwrap();
+    std::fs::write(
+        qdir.join("highlights.scm"),
+        ";; extends\n(number) @catppuccin.test\n",
+    )
+    .unwrap();
+
+    let file = write_temp("ts_bridge", "json", "{\"a\": 123}\n");
+    let (_rpc, mut incoming) = start_attached(
+        ServerInit {
+            file: Some(file),
+            runtimepath: vec![rtp],
+            ..Default::default()
+        },
+        80,
+        24,
+    )
+    .await;
+
+    // The custom capture from the `;; extends` overlay must reach the paint.
+    let map = wait_redraw(&mut incoming, |m| payload_has_group(m, "catppuccin.test")).await;
+    assert!(
+        payload_has_group(&map, "catppuccin.test"),
+        "the `;; extends` overlay capture should paint"
+    );
+
+    std::env::remove_var("NXVIM_DATA_DIR");
+}
+
+#[tokio::test]
+#[ignore = "needs network + a C compiler to install real grammars; opt-in like the other ts e2e tests"]
+async fn inherits_pulls_runtimepath_query_of_inherited_lang() {
+    // The javascript grammar's bundled `injections.scm` is just `; inherits: ecma,jsx`
+    // — the real query lives in `ecma`. A config `queries/ecma/injections.scm` must
+    // therefore reach a `.js` buffer *through* `; inherits:` resolution. This injects
+    // `json` into JS string contents (a node base ecma never injects), so a json
+    // `@number` inside the string proves the inherited overlay resolved and painted.
+    let _guard = serial_lock().lock().await;
+
+    let data = temp_dir("ts_inherits_data");
+    nxvim_ts::install::install(&data, "javascript").expect("install javascript");
+    nxvim_ts::install::install(&data, "json").expect("install json");
+    std::env::set_var("NXVIM_DATA_DIR", &data);
+
+    let rtp = temp_dir("ts_inherits_rtp");
+    let qdir = rtp.join("queries/ecma");
+    std::fs::create_dir_all(&qdir).unwrap();
+    std::fs::write(
+        qdir.join("injections.scm"),
+        "((string_fragment) @injection.content (#set! injection.language \"json\"))\n",
+    )
+    .unwrap();
+
+    let file = write_temp("ts_inherits", "js", "const x = \"42\";\n");
+    let (_rpc, mut incoming) = start_attached(
+        ServerInit {
+            file: Some(file),
+            runtimepath: vec![rtp],
+            ..Default::default()
+        },
+        80,
+        24,
+    )
+    .await;
+
+    let map = wait_redraw(&mut incoming, |m| payload_has_group(m, "number")).await;
+    assert!(
+        payload_has_group(&map, "number"),
+        "a `queries/ecma/injections.scm` overlay should reach a js buffer via `; inherits:`"
+    );
+
+    std::env::remove_var("NXVIM_DATA_DIR");
+}

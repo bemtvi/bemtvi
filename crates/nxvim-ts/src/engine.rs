@@ -1066,6 +1066,12 @@ impl SyntaxEngine for Engine {
     ) -> Result<(), String> {
         Engine::set_query_overlay(self, lang, name, text)
     }
+
+    fn base_query(&self, lang: &str, name: &str) -> Result<Option<String>, String> {
+        // The base the engine would compile with no override: the on-disk file,
+        // the same source `set_query_overlay` compares a resolved overlay against.
+        self.read_disk_query(lang, name)
+    }
 }
 
 /// One capture source the painter merges: a compiled `query` run over `tree`. Both

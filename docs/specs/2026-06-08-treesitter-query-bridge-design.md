@@ -1,30 +1,45 @@
-# Treesitter query bridge — Lua resolves, Rust executes — design
+# Treesitter query bridge — resolve on the server, execute in the engine — design
 
-**Status:** accepted; **implemented.** Both triggers are built: the
-`vim.treesitter.query.set` path (the prelude seam, the `TsOp::SetQuery` effect,
-the `_resolved_query_string` resolver, `Engine::set_query`, and the engine's data
-dir on the Lua runtimepath) and the **buffer-open trigger** for a *pure on-disk*
-`after/queries` / `;extends` overlay with no `query.set` call
-(`Server::resolve_ts_queries_for` → `Editor::set_resolved_ts_query` →
-`Engine::set_query_overlay`, which installs the resolved merge only when it
-differs from the engine's base disk file). This bridge closes the gap recorded in
-[known-approximations.md](../known-approximations.md): a customized highlight or
-indent query does not change what the native engine paints. It is the fourth
-worked instance of ADR 0001's bridge pattern, one level deeper than the others —
-the vendored Lua owns query *resolution*, the native engine owns query
-*execution*.
+**Status:** accepted; **implemented — but not as this document first proposed.**
+The original plan (below) routed query *resolution* through the vendored neovim
+`query.lua` (`query.get` + a `_resolved_query_string` wrapper). The `nx.*`
+migration ([ADR 0002](../decisions/0002-native-plugin-system.md)) **deleted** that
+vendored Lua, so the resolver is now a small **Rust resolver on the server**, not a
+Lua one. The historical "Lua resolves" sections are kept below for rationale, but
+the as-built shape is:
 
-> **Implementation note — getting the resolved *string*.** `query.get(lang, name)`
-> returns a *compiled* `Query` and keeps no source text, and it is memoized. The
-> bridge needs the merged *string* the engine compiles, so the prelude adds
-> `vim.treesitter._resolved_query_string(lang, name)`: it transiently wraps
-> `query.parse` (which `get` calls by table lookup), clears the `get` memo for the
-> key to force a fresh resolve, captures the string `get` hands `parse`, then
-> restores. This reuses *all* of upstream's merge logic with no query-merge code
-> duplicated and **no edit to the vendored file** — the same "wrap from the
-> prelude" discipline as the snapshot seams. A loud guard fires if the seam ever
-> stops capturing a query that was explicitly `set` (e.g. a re-vendor changes how
-> `get` reaches `parse`), so the contract can't break silently.
+> **As built.** The engine query seam (`Engine::set_query` / `set_query_overlay`,
+> the `(lang, name)` override map consulted by `Grammar::load`) is exactly as
+> designed and unchanged. What differs is *who resolves*:
+> - `Engine::base_query(lang, name)` exposes the on-disk base text.
+> - `EditHost::resolve_runtimepath_queries(lang)`
+>   ([`treesitter.rs`](../../crates/nxvim-server/src/treesitter.rs)) runs once per
+>   language at its buffer's first highlight (guarded by `resolved_ts_langs`). For
+>   each engine query (`highlights` / `indents` / `injections`) it gathers, via
+>   `collect_query_parts`, the engine base + every runtimepath
+>   `queries/<lang>/<name>.scm` and `after/queries/<lang>/<name>.scm`, and —
+>   following `; inherits: a,b` modelines (`parse_inherits`) — the same for each
+>   inherited language first, then installs the concatenation through
+>   `Editor::set_resolved_ts_query` → `Engine::set_query_overlay` (a no-op when the
+>   result equals the base).
+> - Resolution is **additive concatenation**, not a faithful reimplementation of
+>   `query.lua`'s precedence. `;; extends` / `; inherits:` are valid query comments,
+>   so they concatenate harmlessly; this covers the overlay and inherits cases real
+>   configs ship (e.g. a config `queries/ecma/injections.scm` reaching `javascript`,
+>   whose bundled `injections.scm` is just `; inherits: ecma,jsx`). The
+>   `vim.treesitter.query.set` in-memory path is **not** wired (no `nx`-public query
+>   setter; the native `nx._nx_set_ts_query` raw-replace exists but is unused).
+> `:TSInstall` follows the same `; inherits:` modelines and fetches the inherited
+> query sets to disk (`javascript` → `ecma`,`jsx`), so the resolver has them to merge
+> and base js/ts highlighting carries the `ecma` patterns. See
+> [known-approximations.md](../known-approximations.md) for the remaining edge —
+> injected *child* grammars load their queries raw (no inherits) until that child
+> language is opened as a buffer.
+
+> **Historical implementation note — getting the resolved *string* (obsolete).**
+> The plan below assumed `query.get(lang, name)` (vendored Lua) and a
+> `_resolved_query_string` wrapper to capture the merged string. That vendored file
+> no longer exists; the Rust resolver above reads the files directly instead.
 
 ## Problem
 

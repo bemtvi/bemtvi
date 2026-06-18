@@ -51,6 +51,10 @@ pub struct InstallReport {
     pub parser: PathBuf,
     /// Query file basenames copied into `<data>/queries/<lang>/` (e.g. `indents`).
     pub queries: Vec<String>,
+    /// Inherited languages whose query sets were also fetched (query-only, no
+    /// parser) by following `; inherits:` modelines — e.g. `["ecma", "jsx"]` for
+    /// `javascript`. Empty for a self-contained grammar.
+    pub inherited: Vec<String>,
     /// Human description of the compiler used (`$NXVIM_CC`, `cc`, `zig (fetched)`…).
     pub compiler: String,
 }
@@ -115,8 +119,8 @@ pub fn install(data_dir: &Path, lang: &str) -> Result<InstallReport> {
     let out = parser_dir.join(format!("{lang}.so"));
     compile(&cc, &src_dir, &parser_c, &out)?;
 
-    // 3. Copy queries matched to this revision.
-    let queries = install_queries(data_dir, lang)?;
+    // 3. Copy queries matched to this revision (plus inherited query sets).
+    let (queries, inherited) = install_queries(data_dir, lang)?;
 
     // Best-effort cleanup of the unpacked source; the parser is self-contained.
     let _ = std::fs::remove_dir_all(&build_dir);
@@ -126,6 +130,7 @@ pub fn install(data_dir: &Path, lang: &str) -> Result<InstallReport> {
         revision: entry.revision,
         parser: out,
         queries,
+        inherited,
         compiler: compiler_desc,
     })
 }
@@ -197,25 +202,89 @@ fn extract_quoted(line: &str, key: &str) -> Option<String> {
     Some(rest[..end].to_string())
 }
 
-/// Copy the standard queries for `lang` from the pinned nvim-treesitter ref into
-/// `<data>/queries/<lang>/`, skipping any the ref doesn't ship. Returns the
-/// basenames written.
-fn install_queries(data_dir: &Path, lang: &str) -> Result<Vec<String>> {
+/// Copy the standard queries for `lang` into `<data>/queries/<lang>/` and, following
+/// `; inherits:` modelines, the query sets of every inherited language (e.g.
+/// `javascript` → `ecma`,`jsx`). The native engine reads one file per language and
+/// the query bridge ([`crate::engine::Engine::set_query_overlay`]) merges the inherit
+/// chain at runtime, so the inherited files must be on disk too — without them, base
+/// highlighting of an inherits-based grammar is missing the parent's patterns.
+/// Inherited languages are fetched **query-only** (no parser is built; `ecma` ships
+/// none). Returns `(basenames written for lang, inherited languages fetched)`.
+fn install_queries(data_dir: &Path, lang: &str) -> Result<(Vec<String>, Vec<String>)> {
+    let mut visited = std::collections::HashSet::from([lang.to_string()]);
+    let (primary, mut pending) = fetch_query_set(data_dir, lang)?;
+    let mut inherited = Vec::new();
+    while let Some(l) = pending.pop() {
+        if !visited.insert(l.clone()) {
+            continue; // already fetched via another inherit edge
+        }
+        let (written, more) = fetch_query_set(data_dir, &l)?;
+        if !written.is_empty() {
+            inherited.push(l.clone()); // only report a lang we actually got queries for
+        }
+        pending.extend(more);
+    }
+    inherited.sort();
+    Ok((primary, inherited))
+}
+
+/// Fetch one language's standard query files from the pinned nvim-treesitter ref into
+/// `<data>/queries/<lang>/`, skipping any the ref doesn't ship. Returns the basenames
+/// written and the languages named in any `; inherits:` modeline across them.
+fn fetch_query_set(data_dir: &Path, lang: &str) -> Result<(Vec<String>, Vec<String>)> {
     let dir = data_dir.join("queries").join(lang);
     std::fs::create_dir_all(&dir).with_context(|| format!("create {}", dir.display()))?;
     let mut written = Vec::new();
+    let mut inherits = Vec::new();
     for name in QUERY_FILES {
         let url = format!(
             "https://raw.githubusercontent.com/nvim-treesitter/nvim-treesitter/{}/runtime/queries/{lang}/{name}.scm",
             nvim_ts_ref()
         );
         if let Some(bytes) = fetch_opt(&url)? {
-            std::fs::write(dir.join(format!("{name}.scm")), bytes)
+            if let Ok(text) = std::str::from_utf8(&bytes) {
+                for l in parse_inherits_modeline(text) {
+                    if !inherits.contains(&l) {
+                        inherits.push(l);
+                    }
+                }
+            }
+            std::fs::write(dir.join(format!("{name}.scm")), &bytes)
                 .with_context(|| format!("write {name}.scm"))?;
             written.push((*name).to_string());
         }
     }
-    Ok(written)
+    Ok((written, inherits))
+}
+
+/// Languages from a query file's leading `; inherits: a,b` modeline(s). Mirrors the
+/// server-side resolver's `parse_inherits` so the install fetches exactly the set the
+/// bridge merges. Only the leading comment block is scanned (the modeline is
+/// conventionally the first line).
+fn parse_inherits_modeline(text: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        if !line.starts_with(';') {
+            break; // past the leading comment block
+        }
+        if let Some(rest) = line
+            .trim_start_matches(';')
+            .trim()
+            .strip_prefix("inherits:")
+        {
+            out.extend(
+                rest.split(',')
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(String::from),
+            );
+        }
+    }
+    out
 }
 
 /// Compile `parser.c` (+ a sibling `scanner.{c,cc,cpp,cxx}` if present) at `src`

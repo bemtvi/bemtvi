@@ -21,6 +21,34 @@ use nxvim_core::{unicode, BufferId};
 use rmpv::Value;
 use std::collections::HashMap;
 
+/// Language names from a query file's `; inherits: a,b,c` modeline(s) — the
+/// languages whose same-named query this one builds on. Only the leading comment
+/// block is scanned (the modeline is conventionally the first line); scanning stops
+/// at the first non-comment line, so a stray `inherits:` deeper in the file is
+/// ignored. Returns them in declared order; empty when there is no modeline.
+fn parse_inherits(text: &str) -> Vec<String> {
+    let mut langs = Vec::new();
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        if !line.starts_with(';') {
+            break; // past the leading comment block — modelines live only there
+        }
+        let body = line.trim_start_matches(';').trim();
+        if let Some(rest) = body.strip_prefix("inherits:") {
+            langs.extend(
+                rest.split(',')
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(String::from),
+            );
+        }
+    }
+    langs
+}
+
 /// A cached highlight span in buffer coordinates: a byte range within a line.
 #[derive(Clone)]
 pub(crate) struct ByteSpan {
@@ -57,6 +85,13 @@ impl EditHost {
         self.reap_closed_buffers();
 
         let buffer = self.editor.current_buffer_id();
+        // Buffer-open half of the query bridge: resolve this language's runtimepath
+        // queries (`queries/` + `after/queries`, `;; extends`) onto the engine once,
+        // before its first highlight. Guarded per-language, so it's a cheap no-op on
+        // every later frame.
+        if let Some(lang) = self.editor.ts_language_for(buffer) {
+            self.resolve_runtimepath_queries(&lang);
+        }
         let line_count = self.editor.buffer().line_count();
         // Highlight a one-screen overscan above and below the viewport, so the
         // lines a scroll reveals are already cached and colored — no white flash
@@ -96,6 +131,95 @@ impl EditHost {
         let state = self.syntax_states.entry(buffer).or_default();
         state.key = Some(key);
         state.spans = by_line;
+    }
+
+    /// Resolve a language's runtimepath treesitter queries once and push them to
+    /// the engine — the buffer-open half of the query-resolution bridge (ADR 0001,
+    /// bridge #4). For each engine query (`highlights` / `indents` / `injections`),
+    /// [`collect_query_parts`](Self::collect_query_parts) gathers the engine's
+    /// bundled base, every runtimepath `queries/<lang>/<name>.scm` and
+    /// `after/queries/<lang>/<name>.scm`, **and** — following `; inherits:`
+    /// modelines — the same for each inherited language, then installs the
+    /// concatenation via
+    /// [`set_resolved_ts_query`](nxvim_core::Editor::set_resolved_ts_query) (which
+    /// keeps it only when it differs from the base — a no-op for an uncustomized
+    /// language).
+    ///
+    /// This is what lets a config `queries/ecma/injections.scm` reach `javascript`
+    /// (whose bundled `injections.scm` is just `; inherits: ecma,jsx`), and what
+    /// merges `after/queries` `;; extends` overlays. Modeline comments (`;; extends`
+    /// / `; inherits:`) are valid query comments, so they concatenate harmlessly.
+    /// The full neovim precedence (exact replace-vs-extend ordering across the
+    /// runtimepath) is approximated by pure additive concatenation — enough for the
+    /// overlay and inherits cases configs actually ship. Guarded by
+    /// `resolved_ts_langs` so resolution runs at most once per language, not per
+    /// frame.
+    fn resolve_runtimepath_queries(&mut self, lang: &str) {
+        if !self.resolved_ts_langs.insert(lang.to_string()) {
+            return; // already resolved this language
+        }
+        let rtp = self.lua.runtimepath().to_vec();
+        let mut applied = false;
+        for name in ["highlights", "indents", "injections"] {
+            let mut visited = std::collections::HashSet::new();
+            let parts = self.collect_query_parts(lang, name, &rtp, &mut visited);
+            if parts.is_empty() {
+                continue;
+            }
+            let merged = parts.join("\n");
+            // Skip the install when the resolved text is just the engine's own base
+            // (no inherits/overlay added anything) — the engine would no-op anyway,
+            // but this also keeps the memo intact for the common uncustomized case.
+            if self.editor.ts_base_query(lang, name).as_deref() == Some(merged.as_str()) {
+                continue;
+            }
+            self.editor.set_resolved_ts_query(lang, name, Some(merged));
+            applied = true;
+        }
+        // A new overlay changes what the engine paints / which layers it injects, so
+        // drop the highlight memo: open buffers of this language re-query next frame.
+        if applied {
+            self.syntax_states.clear();
+        }
+    }
+
+    /// Gather the query texts for `(lang, name)` in merge order — the engine's
+    /// bundled base, then this language's runtimepath `queries/` and
+    /// `after/queries/` files — and, for every `; inherits: a,b` modeline found in
+    /// any of them, the same gathered for each inherited language **first** (so a
+    /// language's own patterns override what it inherits). `visited` guards the
+    /// inherit graph against cycles. Empty when nothing exists for the language.
+    fn collect_query_parts(
+        &self,
+        lang: &str,
+        name: &str,
+        rtp: &[std::path::PathBuf],
+        visited: &mut std::collections::HashSet<String>,
+    ) -> Vec<String> {
+        if !visited.insert(lang.to_string()) {
+            return Vec::new(); // already pulled in via another inherit edge
+        }
+        // This language's own texts: bundled base, then runtimepath `queries/` and
+        // `after/queries/` (each in runtimepath order).
+        let mut own: Vec<String> = Vec::new();
+        if let Some(base) = self.editor.ts_base_query(lang, name) {
+            own.push(base);
+        }
+        for sub in ["queries", "after/queries"] {
+            for dir in rtp {
+                let path = dir.join(sub).join(lang).join(format!("{name}.scm"));
+                if let Ok(text) = std::fs::read_to_string(&path) {
+                    own.push(text);
+                }
+            }
+        }
+        // Inherited languages (from any `; inherits:` modeline) contribute first.
+        let mut parts: Vec<String> = Vec::new();
+        for inherited in own.iter().flat_map(|t| parse_inherits(t)) {
+            parts.extend(self.collect_query_parts(&inherited, name, rtp, visited));
+        }
+        parts.extend(own);
+        parts
     }
 
     /// Drop the highlight memo of every buffer the editor no longer has open

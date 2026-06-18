@@ -259,6 +259,18 @@ impl Editor {
         }
     }
 
+    /// The engine's **base** `(lang, name)` query text — what it compiles with no
+    /// override. The server reads this to compose a runtimepath `queries/` /
+    /// `after/queries` overlay (base ⧺ extensions) before pushing the merged string
+    /// through [`Self::set_resolved_ts_query`]. `None` with no engine or no base
+    /// file (a config-only query such as an `injections.scm` for a language whose
+    /// bundled grammar ships none).
+    pub fn ts_base_query(&self, lang: &str, name: &str) -> Option<String> {
+        self.syntax
+            .as_ref()
+            .and_then(|engine| engine.base_query(lang, name).ok().flatten())
+    }
+
     /// Highlight spans for the line range `[first, last)` of buffer `buf`,
     /// synced to the buffer's current content. Empty when there is no engine or
     /// no grammar for the buffer.

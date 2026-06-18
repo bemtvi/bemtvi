@@ -63,6 +63,17 @@ are no longer listed here — only the edges that still diverge are.
   (2) **Lua-driven indent** (`indentexpr=v:lua…` / `indent.lua`) is unwired — it
   wants the live buffer mid-keystroke, which fights the snapshot bridge, so the
   Rust indent stays. `query.get` returns nil for a missing on-disk query file.
+- **Treesitter query resolution — additive, host-only.** The query bridge
+  ([design](specs/2026-06-08-treesitter-query-bridge-design.md)) merges a language's
+  bundled base with runtimepath `queries/` + `after/queries/` and the `; inherits:`
+  chain — and `:TSInstall` fetches the inherited query sets too (`javascript` →
+  `ecma`,`jsx`), so base js/ts highlighting carries the `ecma` patterns. Two edges
+  remain: (1) the merge is **additive concatenation**, not neovim's full
+  replace-vs-extend precedence; (2) it resolves only the **buffer's own** language —
+  an **injected child** grammar still loads its query off disk raw, so an
+  `; inherits:`-based child (e.g. `javascript` injected into markdown) paints only
+  its own non-inherited captures until that child language is itself opened as a
+  buffer (which installs its resolved overlay).
 - **No `vim.uv` / `vim.loop`.** neovim exposes libuv as a public Lua API; nxvim
   does not — the `vim.uv` / `vim.loop` table does not exist, so a plugin reaching
   for it hits a loud nil index. Both the libuv **handle** surface (`new_timer` /

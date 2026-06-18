@@ -394,7 +394,12 @@ pub struct EditHost {
     /// slim span cache the redraw projects.
     #[cfg(feature = "native")]
     syntax_states: HashMap<BufferId, SyntaxState>,
-    /// Languages whose *on-disk* treesitter queries have already been resolved
+    /// Languages whose runtimepath treesitter queries (`queries/<lang>/*.scm` +
+    /// `after/queries/<lang>/*.scm`, `;; extends`) have already been resolved and
+    /// pushed to the engine — the query-bridge's push-once guard, so resolution
+    /// runs at most once per language rather than every frame.
+    #[cfg(feature = "native")]
+    resolved_ts_langs: HashSet<String>,
     /// Per-buffer LSP document-sync state, keyed by buffer id (the `syntax_states`
     /// analogue).
     lsp_states: HashMap<BufferId, LspDocState>,
@@ -753,6 +758,8 @@ impl EditHost {
             ui: None,
             #[cfg(feature = "native")]
             syntax_states: HashMap::new(),
+            #[cfg(feature = "native")]
+            resolved_ts_langs: HashSet::new(),
             lsp_states: HashMap::new(),
             lsp_servers: HashMap::new(),
             lsp_ensured: HashSet::new(),

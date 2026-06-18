@@ -397,6 +397,62 @@ async fn ts_install_rust_over_the_real_network() {
 }
 
 #[tokio::test]
+async fn ts_install_fetches_inherited_query_sets() {
+    let _guard = test_lock().lock().await;
+    // A grammar whose `highlights.scm` opens with `; inherits: base` must drag the
+    // inherited language's query files onto disk too — the native engine reads one
+    // file per language and the query bridge merges the inherit chain at runtime, so
+    // without this base highlighting of an inherits-based grammar (js → ecma) is
+    // missing the parent's patterns. We reuse the rust grammar source but mirror a
+    // `rust/highlights.scm` that inherits a synthetic `base`, and serve `base`'s query.
+    let root = std::env::temp_dir().join("nxvim-tsinstall-inherits");
+    let _ = std::fs::remove_dir_all(&root);
+    let data_dir = root.join("data");
+    let mirror = root.join("mirror");
+    std::fs::create_dir_all(&data_dir).unwrap();
+    let nt = mirror
+        .join("raw.githubusercontent.com/nvim-treesitter/nvim-treesitter")
+        .join(REF);
+    write_under(
+        &nt.join("lua/nvim-treesitter/parsers.lua"),
+        parsers_lua(REV).as_bytes(),
+    );
+    write_under(
+        &nt.join("runtime/queries/rust/highlights.scm"),
+        b"; inherits: base\n(identifier) @variable\n",
+    );
+    write_under(
+        &nt.join("runtime/queries/base/highlights.scm"),
+        b"(line_comment) @comment\n",
+    );
+    build_source_tarball(
+        &mirror
+            .join("github.com/tree-sitter/tree-sitter-rust/archive")
+            .join(format!("{REV}.tar.gz")),
+        &format!("tree-sitter-rust-{REV}"),
+    );
+    std::env::set_var("NXVIM_DATA_DIR", &data_dir);
+    std::env::set_var("NXVIM_TS_MIRROR", &mirror);
+    std::env::set_var("NXVIM_TS_REF", REF);
+    std::env::set_var(
+        "NXVIM_CC",
+        std::env::var("CC").unwrap_or_else(|_| "cc".into()),
+    );
+
+    let (rpc, mut incoming) = start(None).await;
+    feed(&rpc, ":TSInstall rust<CR>");
+    let msg = wait_for_message(&rpc, &mut incoming, "TSInstall: installed").await;
+    assert!(
+        msg.contains("+inherited[base]"),
+        "install should report the inherited fetch: {msg:?}"
+    );
+    assert!(
+        data_dir.join("queries/base/highlights.scm").exists(),
+        "inherited `base` query files were not fetched to disk"
+    );
+}
+
+#[tokio::test]
 async fn ts_install_unknown_language_fails_loud() {
     let _guard = test_lock().lock().await;
     let _ = fixture("unknown");

@@ -397,3 +397,57 @@ async fn float_backed_component_renders_and_hides_with_reactive_state() {
         "an empty render closed the float"
     );
 }
+
+/// Two float-backed components can't share the single content-float slot: the first to
+/// display owns it, and a second one trying to display FAILS LOUD (a notify) instead of
+/// silently clobbering the first. Guards the no-silent-clobber rule for the float surface.
+#[tokio::test]
+async fn a_second_float_component_fails_loud_instead_of_clobbering() {
+    let dir = temp_dir("float_component_collide");
+    let (rpc, mut incoming) = start(
+        &dir,
+        r#"
+        local function comp(text)
+          return nx.component({
+            surface = "float",
+            setup = function(ctx) return ctx.reactive({ t = text }) end,
+            render = function(s) return { lines = { s.t }, relative = "editor" } end,
+          })
+        end
+        comp("first"):mount({})
+        comp("second"):mount({})
+        "#,
+    )
+    .await;
+
+    // The first component opened the float; the second must NOT replace its content.
+    let map = poll_float(&rpc, &mut incoming, |f| matches!(f, Value::Map(_)))
+        .await
+        .expect("the first float component opened a float");
+    assert_eq!(
+        float_lines(&float_of(&map)),
+        vec!["first"],
+        "the first owns the slot; the second did not clobber it"
+    );
+
+    // The collision was reported loudly (the message rides a redraw).
+    let mut reported = false;
+    for _ in 0..40 {
+        nxvim_test_harness::barrier(&rpc).await;
+        if drain_to_latest_redraw(&mut incoming, |m| {
+            map_get(m, "message")
+                .and_then(Value::as_str)
+                .is_some_and(|s| s.contains("already displaying"))
+        })
+        .is_some()
+        {
+            reported = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    assert!(
+        reported,
+        "the second float component reported the collision"
+    );
+}

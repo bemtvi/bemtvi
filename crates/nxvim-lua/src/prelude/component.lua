@@ -26,6 +26,7 @@
 --               hides the float. Reach it with `nx.component{ surface = "float", … }`.
 -- A third party can pass `def.backend` (a `function(opts) -> adapter`) to render anywhere.
 
+local vim = vim
 nx = nx or {}
 
 -- ----- reactive runtime: dependency tracking shared by reactive + computed --------------
@@ -224,6 +225,22 @@ local function view_backend(opts)
         bufnr = function()
           return v:bufnr()
         end,
+        -- ctx.bo — the view buffer's local options, the same `vim.bo[buf]` table scoped to
+        -- this view (e.g. `ctx.bo.commentstring = "# %s"`, `ctx.bo.swapfile = false`). Valid
+        -- in `setup` and handlers (the buffer exists by then). Window-local options (`wo`:
+        -- cursorline / wrap / …) need a view→window handle nxvim doesn't expose yet.
+        bo = setmetatable({}, {
+          __index = function(_, k)
+            local b = v:bufnr()
+            return b and vim.bo[b][k] or nil
+          end,
+          __newindex = function(_, k, val)
+            local b = v:bufnr()
+            if b then
+              vim.bo[b][k] = val
+            end
+          end,
+        }),
         -- A thin wrapper over nx.keymap.set(mode, lhs, rhs, opts) — same signature — that
         -- defaults `buffer` to this view and `nowait` on; any field the caller passes wins.
         keymap_set = function(mode, lhs, rhs, user_opts)
@@ -238,6 +255,14 @@ local function view_backend(opts)
   }
 end
 
+-- nx.ui.float is a SINGLE editor-wide content-float slot (the core holds one
+-- `content_float`), so two float components displaying at once would clobber each other.
+-- Track which live float component currently owns that slot so a second one fails LOUD
+-- (CLAUDE.md: no silent clobber) rather than silently stealing it. Ownership is held only
+-- while DISPLAYING — a hidden (empty-render) component releases it, so floats that are never
+-- visible at the same time coexist fine.
+local content_float_owner = nil
+
 -- The "float" backend: a non-focus nx.ui.float content float. `render` ->
 -- { lines, title?, relative?, border? }. An empty render hides the float (and a later
 -- non-empty one re-opens it), so a component can show/hide by what it returns — which is
@@ -249,42 +274,58 @@ local function float_backend(opts)
     relative = opts.relative or "cursor",
     title = opts.title,
   }
-  return {
-    ready = function()
-      return true -- no backing buffer to wait on
-    end,
-    apply = function(out)
-      local lines = type(out) == "table" and (out.lines or out) or nil
-      if type(lines) ~= "table" or #lines == 0 then
-        if handle and handle:is_open() then
-          handle:close()
-        end
-        handle = nil
-        return
+  local adapter = {} -- identity token for content-float ownership
+  adapter.ready = function()
+    return true -- no backing buffer to wait on
+  end
+  adapter.apply = function(out)
+    local lines = type(out) == "table" and (out.lines or out) or nil
+    if type(lines) ~= "table" or #lines == 0 then
+      -- Hidden: release the slot so another float component may use it.
+      if content_float_owner == adapter then
+        content_float_owner = nil
       end
-      local fopts = {
-        title = (type(out) == "table" and out.title) or base.title,
-        relative = (type(out) == "table" and out.relative) or base.relative,
-        border = (type(out) == "table" and out.border) or base.border,
-      }
       if handle and handle:is_open() then
-        handle:update(lines, fopts)
-      else
-        handle = nx.ui.float(lines, {
-          persist = true,
-          title = fopts.title,
-          relative = fopts.relative,
-          border = fopts.border,
-        })
-      end
-    end,
-    close = function()
-      if handle then
         handle:close()
-        handle = nil
       end
-    end,
-  }
+      handle = nil
+      return
+    end
+    local fopts = {
+      title = (type(out) == "table" and out.title) or base.title,
+      relative = (type(out) == "table" and out.relative) or base.relative,
+      border = (type(out) == "table" and out.border) or base.border,
+    }
+    if handle and handle:is_open() then
+      handle:update(lines, fopts) -- already ours
+    else
+      -- Claiming the single content-float slot: refuse loudly if another live float
+      -- component is already displaying, rather than silently clobbering its float.
+      if content_float_owner ~= nil and content_float_owner ~= adapter then
+        return nx.notify(
+          "nx.component: a float component is already displaying; only one content float can be open at a time",
+          4
+        )
+      end
+      content_float_owner = adapter
+      handle = nx.ui.float(lines, {
+        persist = true,
+        title = fopts.title,
+        relative = fopts.relative,
+        border = fopts.border,
+      })
+    end
+  end
+  adapter.close = function()
+    if content_float_owner == adapter then
+      content_float_owner = nil
+    end
+    if handle then
+      handle:close()
+      handle = nil
+    end
+  end
+  return adapter
 end
 
 local BACKENDS = { view = view_backend, float = float_backend }

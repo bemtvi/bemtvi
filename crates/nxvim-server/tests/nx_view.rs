@@ -714,6 +714,98 @@ async fn component_computed_caches_until_its_dependency_changes() {
     );
 }
 
+/// Grabbing modal floats STACK: a second grab float mounted over a first nests on top
+/// (focus pinned to the innermost), and closing it pops focus back down to the modal below
+/// — and finally to the original window — rather than jumping straight out.
+#[tokio::test]
+async fn grabbing_view_floats_stack_and_focus_pops() {
+    let (rpc, _incoming) = start().await;
+    feed_sync(&rpc, "imain<Esc>").await;
+
+    exec_lua(
+        &rpc,
+        r#"v1 = nx.view.create{}; v1:set_lines{ "modal-1" }
+           v1:mount{ float = { width = 20, height = 4, grab = true } }"#,
+    )
+    .await;
+    assert_eq!(lines(&rpc).await, vec!["modal-1"], "focus on modal 1");
+
+    exec_lua(
+        &rpc,
+        r#"v2 = nx.view.create{}; v2:set_lines{ "modal-2" }
+           v2:mount{ float = { width = 20, height = 4, grab = true } }"#,
+    )
+    .await;
+    assert_eq!(
+        lines(&rpc).await,
+        vec!["modal-2"],
+        "modal 2 stacked on top and took focus"
+    );
+
+    // Focus is pinned to the TOP modal — `<C-w>w` can't reach modal 1 underneath it.
+    feed_sync(&rpc, "<C-w>w").await;
+    assert_eq!(
+        lines(&rpc).await,
+        vec!["modal-2"],
+        "the top modal holds the lock"
+    );
+
+    // Closing the top modal pops focus back to modal 1, which is STILL locked.
+    exec_lua(&rpc, "v2:unmount()").await;
+    assert_eq!(
+        lines(&rpc).await,
+        vec!["modal-1"],
+        "focus popped down to modal 1"
+    );
+    feed_sync(&rpc, "<C-w>w").await;
+    assert_eq!(
+        lines(&rpc).await,
+        vec!["modal-1"],
+        "modal 1 is locked again now it's on top"
+    );
+
+    // Closing the last modal returns focus to the original window.
+    exec_lua(&rpc, "v1:unmount()").await;
+    assert_eq!(
+        lines(&rpc).await,
+        vec!["main"],
+        "focus returned to the original window"
+    );
+}
+
+/// A view component can set buffer-local options on its backing buffer via `ctx.bo`
+/// (the `vim.bo[buf]` table scoped to the view), valid in `setup`.
+#[tokio::test]
+async fn view_component_sets_buffer_options_via_ctx_bo() {
+    let (rpc, _incoming) = start().await;
+    exec_lua(
+        &rpc,
+        r#"nx.component({
+             setup = function(ctx)
+               ctx.bo.shiftwidth = 8
+               _G.vbuf = ctx.bufnr()
+               return ctx.reactive({})
+             end,
+             render = function()
+               return { lines = { "x" } }
+             end,
+           }).mount({ float = { width = 12, height = 3, grab = true } })"#,
+    )
+    .await;
+
+    // Wait out the lifecycle (buffer ready -> setup runs ctx.bo), then read the option back.
+    let mut ok = false;
+    for _ in 0..100 {
+        let sw = exec_lua(&rpc, "return _G.vbuf and vim.bo[_G.vbuf].shiftwidth or nil").await;
+        if sw.as_u64() == Some(8) {
+            ok = true;
+            break;
+        }
+        rpc.request("nvim_get_mode", vec![]).await.expect("barrier");
+    }
+    assert!(ok, "ctx.bo set the view buffer's shiftwidth to 8");
+}
+
 /// `:unmount` removes the view from view but keeps it alive; a later `:mount`
 /// reshows the same content.
 #[tokio::test]

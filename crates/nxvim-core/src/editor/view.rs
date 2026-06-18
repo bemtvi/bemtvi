@@ -195,12 +195,17 @@ impl Editor {
         };
         self.unmount_view(id);
         let prev = self.windows.current;
-        // `open_float_window(enter = true)` focuses the float *before* we arm the lock, so
-        // its own focus move is permitted (the panel opens the same way).
-        let win = self.open_float_window(buf, config, true);
+        // Create the float UNFOCUSED first. For a grab modal we then push it onto the lock
+        // STACK *before* focusing it: the focus guard pins focus to the topmost modal, so a
+        // new modal must already be the top for the guard to permit focusing it — otherwise
+        // an outer modal already on the stack would refuse the move (and the float would open
+        // behind it). Non-grab floats just focus normally (no lock to satisfy).
+        let win = self.open_float_window(buf, config, false);
         if grab {
-            self.view_float_lock = Some(win);
+            self.view_float_lock.push(win);
         }
+        self.set_current_window(win);
+        self.ensure_visible();
         if let Some(v) = self.views.get_mut(&id) {
             v.mount = Some(ViewMount::Float { win, prev, grab });
         }
@@ -264,17 +269,19 @@ impl Editor {
                 self.close_window_by_id(win, true);
             }
             Some(ViewMount::Float { win, prev, grab }) => {
-                // Release the focus lock *before* closing / refocusing, exactly as
-                // `close_panel` does — otherwise the guard would refuse the restore.
-                if grab && self.view_float_lock == Some(win) {
-                    self.view_float_lock = None;
+                // Pop this modal off the focus-lock stack *before* closing / refocusing,
+                // exactly as `close_panel` clears its lock first — otherwise the guard would
+                // refuse the restore. `retain` (not `pop`) tolerates an out-of-order close.
+                if grab {
+                    self.view_float_lock.retain(|w| *w != win);
                 }
                 if self.windows.try_get(win).is_some() {
                     self.close_window_by_id(win, true);
                 }
-                // A grabbing float is modal: return to where it sprang from. A non-grab
-                // float leaves focus wherever `remove_window` landed it (the user may have
-                // moved on), matching its non-locking nature.
+                // A grabbing float is modal: return to where it sprang from — which is the
+                // modal *below* it in the stack (each modal's `prev` is whatever was focused
+                // when it opened), so focus pops down the stack. A non-grab float leaves
+                // focus wherever `remove_window` landed it, matching its non-locking nature.
                 if grab && self.windows.try_get(prev).is_some() {
                     self.set_current_window(prev);
                 }

@@ -97,6 +97,8 @@ local O_WIN = {
   nuw = true,
   signcolumn = true,
   scl = true,
+  fillchars = true,
+  fcs = true,
 }
 local O_BUF = {
   tabstop = true,
@@ -906,6 +908,8 @@ local WIN_OPT_CANON = {
   nuw = "numberwidth",
   signcolumn = "signcolumn",
   scl = "signcolumn",
+  fillchars = "fillchars",
+  fcs = "fillchars",
 }
 local WIN_OPT_DEFAULT = {
   number = true,
@@ -913,6 +917,7 @@ local WIN_OPT_DEFAULT = {
   cursorline = false,
   numberwidth = 4,
   signcolumn = "auto",
+  fillchars = "",
 }
 -- Exposed for this file's nvim_{get,set}_option_value, which classify a name
 -- as window-scoped before routing it through nx.wo.

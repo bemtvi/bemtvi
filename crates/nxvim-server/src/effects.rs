@@ -1504,6 +1504,7 @@ impl EditHost {
                     cursorline: opts.cursorline,
                     numberwidth: opts.numberwidth as u64,
                     signcolumn: opts.signcolumn.to_string(),
+                    fillchars: opts.fillchars.clone(),
                     // `winsaveview()` reports `topline` 1-based; `top` is 0-based.
                     topline: (top + 1) as u64,
                     leftcol: leftcol as u64,

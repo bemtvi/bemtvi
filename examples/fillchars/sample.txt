@@ -1,0 +1,5 @@
+fillchars demo — a deliberately short buffer.
+
+Only these few lines hold text; everything below is end-of-buffer fill.
+With this config the fill is blank — no `~`. Run :TildeBack to see the
+vim-default `~` markers return, then :TildeHide to blank them again.

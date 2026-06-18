@@ -726,8 +726,11 @@ fn window_view(ed: &Editor, w: &WindowLayout) -> WindowView {
         sbr: w.options.breakindent_sbr(),
     };
     let tabstop = buf.options.effective_tabstop();
+    // The end-of-buffer filler char (`'fillchars'`' `eob`; vim's `~` by default).
+    let eob = w.options.fillchars_eob();
     let rows = render_rows(
-        ed, buf, top, height, line_count, w.focused, width, wrap, tabstop, wp, w.cursor, ed.cursor,
+        ed, buf, top, height, line_count, w.focused, width, wrap, tabstop, wp, eob, w.cursor,
+        ed.cursor,
     );
 
     let scroll = if w.focused {
@@ -778,6 +781,7 @@ fn window_view(ed: &Editor, w: &WindowLayout) -> WindowView {
                 wrap,
                 tabstop,
                 wp,
+                eob,
                 w.cursor,
                 sel_head,
             );
@@ -1146,6 +1150,7 @@ fn row_skeleton(
     width: usize,
     tabstop: usize,
     wp: unicode::WrapPrefix,
+    eob: char,
 ) -> Vec<RenderRow> {
     let virt_by_line = buf.virt_lines_by_line();
     let mut rows = Vec::with_capacity(height);
@@ -1166,9 +1171,11 @@ fn row_skeleton(
     while rows.len() < height {
         if buf_line >= line_count {
             // `~` filler past the end of the buffer (no number, no virtual content).
+            // The marker char is `'fillchars'`' `eob` key (vim's `~` by default;
+            // `eob:\ ` blanks it).
             rows.push(RenderRow {
                 kind: RowKind::Filler,
-                text: "~".to_string(),
+                text: eob.to_string(),
                 virt_line: None,
                 selection: None,
                 secondary_selection: Vec::new(),
@@ -1287,10 +1294,11 @@ fn render_rows(
     wrap: bool,
     tabstop: usize,
     wp: unicode::WrapPrefix,
+    eob: char,
     cursor: Cursor,
     sel_head: Cursor,
 ) -> Vec<RenderRow> {
-    let mut rows = row_skeleton(buf, base, height, line_count, wrap, width, tabstop, wp);
+    let mut rows = row_skeleton(buf, base, height, line_count, wrap, width, tabstop, wp, eob);
     if !focused {
         return rows;
     }

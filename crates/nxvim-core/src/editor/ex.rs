@@ -242,6 +242,27 @@ fn apply_file_mods(fname: &str, mods: &[char]) -> String {
     fname
 }
 
+/// Trim an ex-command argument string: drop all leading ASCII whitespace, and
+/// drop trailing ASCII whitespace *unless the last whitespace char is escaped by
+/// an odd number of preceding backslashes* (a `\ `-protected trailing space, which
+/// vim keeps for the arg parser to unescape — e.g. `:set fillchars=eob:\ `). For an
+/// argument with no escaped trailing space this is exactly `str::trim`.
+fn trim_ex_args(s: &str) -> &str {
+    let s = s.trim_start();
+    let trimmed = s.trim_end();
+    // `trim_end` may have eaten a backslash-escaped space; give back the single
+    // whitespace char if the backslash run just before it is odd (so the last
+    // backslash escapes the space rather than being a literal `\\`).
+    if trimmed.len() < s.len() {
+        let backslashes = trimmed.bytes().rev().take_while(|&b| b == b'\\').count();
+        if backslashes % 2 == 1 {
+            // Keep one trailing whitespace char (the escaped one).
+            return &s[..trimmed.len() + 1];
+        }
+    }
+    trimmed
+}
+
 /// Split an ex-command into `(name, bang, args)`.
 fn split_ex(cmd: &str) -> (&str, bool, &str) {
     let bytes = cmd.as_bytes();
@@ -255,7 +276,11 @@ fn split_ex(cmd: &str) -> (&str, bool, &str) {
         bang = true;
         i += 1;
     }
-    let args = cmd[i..].trim();
+    // Leading whitespace is always insignificant; trailing whitespace is dropped
+    // too, *except* a final whitespace run that is backslash-escaped (`:set
+    // fillchars=eob:\ `, `:w file\ name`) — vim keeps that, and the per-command
+    // arg parsers unescape it. Stripping it here would leave a dangling backslash.
+    let args = trim_ex_args(&cmd[i..]);
     (name, bang, args)
 }
 
@@ -386,7 +411,10 @@ impl Editor {
     }
 
     pub(crate) fn execute_ex(&mut self, raw: &str) {
-        let cmd = raw.trim();
+        // Escape-aware trim: a backslash-escaped trailing space (`:set
+        // fillchars=eob:\ `) must survive to the per-command arg parser, so a plain
+        // `raw.trim()` here (which would eat it, leaving a dangling `\`) is wrong.
+        let cmd = trim_ex_args(raw);
         if cmd.is_empty() {
             return;
         }

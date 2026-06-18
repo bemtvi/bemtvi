@@ -1668,3 +1668,95 @@ async fn sleep_blocks_the_editor_for_the_requested_duration() {
         begin.elapsed()
     );
 }
+
+/// `'fillchars'` `eob` is the char drawn on screen rows past the end of the buffer
+/// (vim's `~`). By default those filler rows show `~`; setting `eob` to a space
+/// (`:set fillchars=eob:\ `) blanks them — the marker the user asked to hide.
+#[tokio::test]
+async fn fillchars_eob_blanks_the_end_of_buffer_tilde() {
+    let (rpc, mut incoming) = start(None).await;
+    feed(&rpc, "ihello<Esc>");
+    let _ = lines(&rpc).await; // barrier so the redraw is buffered
+    let view = latest_view(&mut incoming).expect("a redraw view");
+    // One short buffer line; every screen row past it is a `~` filler by default.
+    let rows = view_lines(&view);
+    assert!(
+        rows.iter().any(|r| r == "~"),
+        "default fillchars draws `~` end-of-buffer markers, got {rows:?}"
+    );
+
+    // `:set fillchars=eob:\ ` (an escaped space) replaces the filler char with a
+    // space: no more `~`, and the filler rows render blank instead.
+    let view = redraw_after(&rpc, &mut incoming, ":set fillchars=eob:\\ <CR>").await;
+    let rows = view_lines(&view);
+    assert!(
+        !rows.iter().any(|r| r == "~"),
+        "fillchars eob:<space> removes the `~` markers, got {rows:?}"
+    );
+    assert!(
+        rows.iter().any(|r| r == " "),
+        "blanked filler rows render as a single space, got {rows:?}"
+    );
+}
+
+/// A different `eob` char (not just a blank) is honored too, and a bad `'fillchars'`
+/// value fails loud (E474) rather than silently sticking the window on junk.
+#[tokio::test]
+async fn fillchars_eob_custom_char_and_invalid_value() {
+    let (rpc, mut incoming) = start(None).await;
+    feed(&rpc, "ihi<Esc>");
+
+    let view = redraw_after(&rpc, &mut incoming, ":set fillchars=eob:%<CR>").await;
+    let rows = view_lines(&view);
+    assert!(
+        rows.iter().any(|r| r == "%") && !rows.iter().any(|r| r == "~"),
+        "fillchars eob:% draws `%` fillers, not `~`, got {rows:?}"
+    );
+
+    // An unknown key is rejected loudly; the window keeps its prior value (`%`).
+    let view = redraw_after(&rpc, &mut incoming, ":set fillchars=bogus:x<CR>").await;
+    assert_eq!(message(&view), "E474: Invalid argument: fillchars=bogus:x");
+    let rows = view_lines(&view);
+    assert!(
+        rows.iter().any(|r| r == "%"),
+        "a rejected fillchars value leaves the prior `%` filler intact, got {rows:?}"
+    );
+}
+
+/// The shipped `examples/fillchars/` config loads cleanly and drives its surfaces:
+/// on open it blanks the `~` end-of-buffer markers (`vim.wo.fillchars = "eob: "`),
+/// and its `:TildeBack` / `:TildeHide` user commands flip them. Proves the example
+/// is runnable and that the window-local `'fillchars'` honors `eob` from Lua.
+#[tokio::test]
+async fn examples_fillchars_config_loads_and_drives_the_markers() {
+    let example =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/fillchars/init.lua");
+    let init = std::fs::read_to_string(&example).expect("read examples/fillchars/init.lua");
+    let dir = temp_dir("examples_fillchars");
+    let (rpc, mut incoming) = start_with_config(&dir, &init).await;
+    feed(&rpc, "ihello<Esc>");
+
+    // The config set `fillchars=eob:<space>`, so the filler rows are blank, not `~`.
+    let view = redraw_after(&rpc, &mut incoming, "").await;
+    assert!(
+        !view_lines(&view).iter().any(|r| r == "~"),
+        "the example config blanks the `~` markers on open, got {:?}",
+        view_lines(&view)
+    );
+
+    // :TildeBack restores vim's default `~`.
+    let view = redraw_after(&rpc, &mut incoming, ":TildeBack<CR>").await;
+    assert!(
+        view_lines(&view).iter().any(|r| r == "~"),
+        ":TildeBack brings the `~` markers back, got {:?}",
+        view_lines(&view)
+    );
+
+    // :TildeHide blanks them again.
+    let view = redraw_after(&rpc, &mut incoming, ":TildeHide<CR>").await;
+    assert!(
+        !view_lines(&view).iter().any(|r| r == "~"),
+        ":TildeHide blanks the markers again, got {:?}",
+        view_lines(&view)
+    );
+}

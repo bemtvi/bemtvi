@@ -74,6 +74,7 @@ async fn every_known_option_is_wired_not_silent() {
         "grepprg",
         "grepformat",
         "filetype",
+        "fillchars",
     ];
     for name in names {
         let msg = set_message(&rpc, &mut incoming, &format!("{name}?")).await;
@@ -146,6 +147,29 @@ async fn guifont_defaults_empty() {
     rpc.request("nvim_get_mode", vec![]).await.expect("barrier");
     let frame = drain_to_latest_redraw(&mut incoming, |_| true).expect("a redraw arrived");
     assert_eq!(field_str(&frame, "guifont"), "");
+}
+
+#[tokio::test]
+async fn fillchars_round_trips_through_set_and_vim_wo() {
+    let (rpc, mut incoming) = start().await;
+
+    // Defaults empty (vim's default look, `eob:~`), both via `:set …?` and `vim.wo`.
+    let msg = set_message(&rpc, &mut incoming, "fillchars?").await;
+    assert_eq!(msg, "fillchars=");
+    assert_eq!(
+        exec_lua(&rpc, "return vim.wo.fillchars").await.as_str(),
+        Some("")
+    );
+
+    // `vim.wo.fillchars = 'eob: '` (the window-local Lua form) reaches the core and
+    // reads back through both the `:set …?` echo and `vim.wo`.
+    exec_lua(&rpc, "vim.wo.fillchars = 'eob: '").await;
+    let msg = set_message(&rpc, &mut incoming, "fillchars?").await;
+    assert_eq!(msg, "fillchars=eob: ");
+    assert_eq!(
+        exec_lua(&rpc, "return vim.wo.fillchars").await.as_str(),
+        Some("eob: ")
+    );
 }
 
 #[tokio::test]

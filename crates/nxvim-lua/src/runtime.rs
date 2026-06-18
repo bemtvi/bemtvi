@@ -66,6 +66,9 @@ pub struct WindowMirror {
     /// `signcolumn` in its string form (`no`/`auto`/`auto:1-3`/`yes`/`yes:2`),
     /// for `vim.wo`/`vim.o` read-back.
     pub signcolumn: String,
+    /// `'fillchars'` as the raw `key:char` list string (empty ⇒ vim's default
+    /// look), for `vim.wo`/`vim.o` read-back.
+    pub fillchars: String,
     /// First visible buffer line, 1-based (neovim's `winsaveview().topline`).
     pub topline: u64,
     /// First visible screen column (`winsaveview().leftcol`).

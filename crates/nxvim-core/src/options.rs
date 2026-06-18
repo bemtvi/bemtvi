@@ -347,6 +347,13 @@ pub struct WindowOptions {
     /// other vim flags (`min:`, `shift:`, `list:`, `vcol`) are accepted but ignored.
     /// Empty by default.
     pub breakindentopt: String,
+    /// `'fillchars'`: a comma-separated `key:char` list choosing the characters
+    /// drawn in structural spots (vim's `fillchars`). nxvim honors only the `eob`
+    /// key today — the filler char drawn on screen rows past the end of the buffer
+    /// (vim's `~`); the other keys (`vert`, `fold`, `diff`, …) are validated so a
+    /// vim config's `fillchars` sets cleanly, but have no rendering effect yet.
+    /// Empty by default, which means `eob:~` (see [`WindowOptions::fillchars_eob`]).
+    pub fillchars: String,
 }
 
 impl WindowOptions {
@@ -365,6 +372,70 @@ impl WindowOptions {
             sbr: self.breakindent_sbr(),
         }
     }
+
+    /// The `eob` filler char from this window's [`'fillchars'`](WindowOptions::fillchars):
+    /// the character drawn on screen rows past the end of the buffer. Defaults to
+    /// `~` (vim's default, and what an empty `fillchars` means). Setting `eob` to a
+    /// space (`:set fillchars=eob:\ `) blanks the markers. The stored value is always
+    /// pre-validated by [`parse_fillchars`] at set time, so this never sees junk.
+    pub fn fillchars_eob(&self) -> char {
+        parse_fillchars(&self.fillchars).unwrap_or(DEFAULT_EOB)
+    }
+}
+
+/// The default `'fillchars'` `eob` character — vim's end-of-buffer filler `~`.
+pub const DEFAULT_EOB: char = '~';
+
+/// The recognized `'fillchars'` keys (vim's `fillchars` table). nxvim honors only
+/// `eob` today (see [`WindowOptions::fillchars`]); the rest are validated so a vim
+/// config sets cleanly, but have no rendering effect yet.
+const FILLCHARS_KEYS: &[&str] = &[
+    "eob",
+    "vert",
+    "fold",
+    "foldopen",
+    "foldclose",
+    "foldsep",
+    "diff",
+    "msgsep",
+    "horiz",
+    "horizup",
+    "horizdown",
+    "vertleft",
+    "vertright",
+    "verthoriz",
+    "stl",
+    "stlnc",
+];
+
+/// Parse a `'fillchars'` value, returning the `eob` filler char ([`DEFAULT_EOB`]
+/// when the value omits an `eob:` entry), or `None` if any entry is malformed or
+/// names an unknown key — the caller reports `E474`. Every entry must be
+/// `key:char` where `key` is a [recognized key](FILLCHARS_KEYS) and `char` is
+/// exactly one character; only `eob` changes the result, the rest are validated
+/// and ignored. An empty value parses to [`DEFAULT_EOB`] (vim's default look).
+pub fn parse_fillchars(s: &str) -> Option<char> {
+    let mut eob = DEFAULT_EOB;
+    // Entries are split on `,` only — never trimmed: a fill *value* is allowed to be
+    // a space (`eob:\ ` blanks the markers), and trimming would eat it. (vim's
+    // `:set` tokenizer already stripped the surrounding whitespace; spaces inside
+    // the value reach here only when escaped, and are meaningful.)
+    for entry in s.split(',').filter(|e| !e.is_empty()) {
+        let (key, val) = entry.split_once(':')?;
+        if !FILLCHARS_KEYS.contains(&key) {
+            return None;
+        }
+        let mut chars = val.chars();
+        let c = chars.next()?;
+        if chars.next().is_some() {
+            // A fillchars value is exactly one display char (vim's rule).
+            return None;
+        }
+        if key == "eob" {
+            eob = c;
+        }
+    }
+    Some(eob)
 }
 
 impl Default for WindowOptions {
@@ -391,6 +462,8 @@ impl Default for WindowOptions {
             breakindent: false,
             showbreak: String::new(),
             breakindentopt: String::new(),
+            // Empty fillchars: the end-of-buffer filler is vim's default `~`.
+            fillchars: String::new(),
         }
     }
 }
@@ -769,6 +842,7 @@ fn canonical(name: &str) -> Option<(&'static str, OptKind)> {
         "breakindent" | "bri" => Some(("breakindent", Bool)),
         "showbreak" | "sbr" => Some(("showbreak", Str)),
         "breakindentopt" | "briopt" => Some(("breakindentopt", Str)),
+        "fillchars" | "fcs" => Some(("fillchars", Str)),
         "ignorecase" | "ic" => Some(("ignorecase", Bool)),
         "smartcase" | "scs" => Some(("smartcase", Bool)),
         "wrapscan" | "ws" => Some(("wrapscan", Bool)),

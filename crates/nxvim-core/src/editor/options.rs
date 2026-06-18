@@ -382,6 +382,28 @@ impl Editor {
             }
             return;
         }
+        // `fillchars` is window-local (like `showbreak`): the `key:char` list
+        // choosing structural fill characters. nxvim honors only `eob` (the
+        // end-of-buffer `~` filler) today, but the whole value is validated so a
+        // bad entry fails loud (E474) rather than silently sticking the window on a
+        // junk value. `&` resets to the default look (empty ⇒ `eob:~`).
+        if name == "fillchars" {
+            match op {
+                StrOp::Set(value) => {
+                    if crate::options::parse_fillchars(&value).is_none() {
+                        self.echo(format!("E474: Invalid argument: fillchars={value}"));
+                        return;
+                    }
+                    self.windows.cur_mut().options.fillchars = value;
+                }
+                StrOp::Reset => self.windows.cur_mut().options.fillchars.clear(),
+                StrOp::Query => {
+                    let v = self.windows.cur().options.fillchars.clone();
+                    self.echo(format!("fillchars={v}"));
+                }
+            }
+            return;
+        }
         // A wiring gap (see `apply_set_bool`): a string option `resolve_set` accepted
         // but no arm / the global setter handles. Fail loud, never a silent no-op.
         let unknown = |ed: &mut Self| ed.echo(format!("E518: Unknown option: {name}"));

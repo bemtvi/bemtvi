@@ -1057,16 +1057,22 @@ impl Editor {
 
     /// Set a string window-local option on window `id` (`vim.wo` /
     /// `nvim_win_set_option`), the string analogue of
-    /// [`Editor::set_window_option_bool`]. Recognizes `signcolumn` (an invalid value
-    /// is ignored, matching the no-op-on-bad-input contract of the other bridge
-    /// setters); a no-op for any other name or unknown id.
+    /// [`Editor::set_window_option_bool`]. Recognizes `signcolumn` and `fillchars`
+    /// (an invalid value is ignored, matching the no-op-on-bad-input contract of the
+    /// other bridge setters); a no-op for any other name or unknown id.
     pub fn set_window_option_str(&mut self, id: WindowId, name: &str, value: &str) {
+        let Some(t) = self.tree_of_window_mut(id) else {
+            return;
+        };
+        let opts = &mut t.get_mut(id).options;
+        // An invalid value is ignored, matching the no-op-on-bad-input contract of
+        // the other bridge setters (`:set` is the loud-error path).
         if name == "signcolumn" {
             if let Some(scl) = crate::options::SignColumn::parse(value) {
-                if let Some(t) = self.tree_of_window_mut(id) {
-                    t.get_mut(id).options.signcolumn = scl;
-                }
+                opts.signcolumn = scl;
             }
+        } else if name == "fillchars" && crate::options::parse_fillchars(value).is_some() {
+            opts.fillchars = value.to_string();
         }
     }
 

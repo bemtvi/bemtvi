@@ -1597,20 +1597,26 @@ impl LuaRuntime {
     }
 
     /// Refresh the `nx.view` Rust→Lua mirror: `nx._view_buf[id]` (the backing
-    /// buffer number, the extmark / read target) and `nx._view_line[id]` (the view
-    /// window's 1-based cursor line) for every live view. Pushed each tick before
-    /// Lua runs (like the buffer mirror), so a view's `:set_decor` / `:line()` read
-    /// against the current state without a server round-trip.
-    pub fn set_view_mirror(&self, views: &[(u64, u64, u64)]) -> mlua::Result<()> {
+    /// buffer number, the extmark / read target), `nx._view_line[id]` (the view
+    /// window's 1-based cursor line), and `nx._view_win[id]` (the window showing the
+    /// view, the `ctx.wo` target; absent when unmounted) for every live view. Pushed
+    /// each tick before Lua runs (like the buffer mirror), so a view's `:set_decor` /
+    /// `:line()` / `:winid()` read against the current state without a server round-trip.
+    pub fn set_view_mirror(&self, views: &[(u64, u64, u64, u64)]) -> mlua::Result<()> {
         let nx = self.nx()?;
         let bufs = self.lua.create_table()?;
         let lines = self.lua.create_table()?;
-        for &(id, buf, line) in views {
+        let wins = self.lua.create_table()?;
+        for &(id, buf, line, win) in views {
             bufs.set(id, buf)?;
             lines.set(id, line)?;
+            if win != 0 {
+                wins.set(id, win)?; // unmounted views (win == 0) stay absent → winid() is nil
+            }
         }
         nx.set("_view_buf", bufs)?;
         nx.set("_view_line", lines)?;
+        nx.set("_view_win", wins)?;
         Ok(())
     }
 

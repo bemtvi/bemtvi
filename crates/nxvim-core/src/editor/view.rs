@@ -87,12 +87,25 @@ impl Editor {
         self.views.get(&id).map(|v| v.buf)
     }
 
+    /// The window currently showing view `id` (the `nx._view_win` mirror, the `ctx.wo`
+    /// target), or `None` if unmounted. Resolved from the mount: a split/float stores its
+    /// window directly; a dock view is its dock layer's focused window. The id is validated
+    /// against the live window set so a stale split window reports `None`.
+    pub fn view_window(&self, id: u64) -> Option<WindowId> {
+        let win = match self.views.get(&id)?.mount.as_ref()? {
+            ViewMount::Float { win, .. } | ViewMount::Split(win) => *win,
+            ViewMount::Dock(side) => self.layer_tree(Layer::Dock(*side))?.current,
+        };
+        self.window(win).map(|_| win)
+    }
+
     /// The `nx.view` Rust→Lua mirror snapshot: `(view id, backing buffer number,
-    /// 1-based cursor line)` per live view, for `nx._view_buf` / `nx._view_line`.
-    /// The line is the current cursor's when the view is the focused buffer (so
-    /// `v:line()` reads it during an action), else `1` — a parked dock view's window
-    /// cursor isn't on the live `self.cursor`, and reads only happen while focused.
-    pub fn view_mirror(&self) -> Vec<(u64, u64, u64)> {
+    /// 1-based cursor line, window id)` per live view, for `nx._view_buf` /
+    /// `nx._view_line` / `nx._view_win`. The line is the current cursor's when the view is
+    /// the focused buffer (so `v:line()` reads it during an action), else `1` — a parked
+    /// dock view's window cursor isn't on the live `self.cursor`, and reads only happen
+    /// while focused. The window is `0` when the view is unmounted.
+    pub fn view_mirror(&self) -> Vec<(u64, u64, u64, u64)> {
         self.views
             .iter()
             .map(|(&id, v)| {
@@ -101,7 +114,8 @@ impl Editor {
                 } else {
                     1
                 };
-                (id, v.buf.0, line1)
+                let win = self.view_window(id).map(|w| w.0).unwrap_or(0);
+                (id, v.buf.0, line1, win)
             })
             .collect()
     }

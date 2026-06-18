@@ -806,6 +806,39 @@ async fn view_component_sets_buffer_options_via_ctx_bo() {
     assert!(ok, "ctx.bo set the view buffer's shiftwidth to 8");
 }
 
+/// A view component can set window-local options on the window showing it via `ctx.wo`
+/// (the `vim.wo[win]` table scoped to the view's window, resolved through the view→window
+/// mirror). A float defaults `number` off, so reading it back on proves the set landed.
+#[tokio::test]
+async fn view_component_sets_window_options_via_ctx_wo() {
+    let (rpc, _incoming) = start().await;
+    exec_lua(
+        &rpc,
+        r#"nx.component({
+             setup = function(ctx)
+               ctx.wo.number = true
+               _G.vwin = ctx.winid()
+               return ctx.reactive({})
+             end,
+             render = function()
+               return { lines = { "x" } }
+             end,
+           }).mount({ float = { width = 12, height = 3, grab = true } })"#,
+    )
+    .await;
+
+    let mut ok = false;
+    for _ in 0..100 {
+        let n = exec_lua(&rpc, "return _G.vwin and vim.wo[_G.vwin].number or nil").await;
+        if n.as_bool() == Some(true) {
+            ok = true;
+            break;
+        }
+        rpc.request("nvim_get_mode", vec![]).await.expect("barrier");
+    }
+    assert!(ok, "ctx.wo turned on number for the view's window");
+}
+
 /// `:unmount` removes the view from view but keeps it alive; a later `:mount`
 /// reshows the same content.
 #[tokio::test]

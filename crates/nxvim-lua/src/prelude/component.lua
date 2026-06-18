@@ -225,10 +225,13 @@ local function view_backend(opts)
         bufnr = function()
           return v:bufnr()
         end,
-        -- ctx.bo — the view buffer's local options, the same `vim.bo[buf]` table scoped to
-        -- this view (e.g. `ctx.bo.commentstring = "# %s"`, `ctx.bo.swapfile = false`). Valid
-        -- in `setup` and handlers (the buffer exists by then). Window-local options (`wo`:
-        -- cursorline / wrap / …) need a view→window handle nxvim doesn't expose yet.
+        winid = function()
+          return v:winid()
+        end,
+        -- ctx.bo / ctx.wo — the view's buffer-local and window-local options, the same
+        -- `vim.bo[buf]` / `vim.wo[win]` tables scoped to this view (e.g.
+        -- `ctx.bo.commentstring = "# %s"`, `ctx.wo.cursorline = true`, `ctx.wo.wrap =
+        -- false`). Valid in `setup` and handlers (the buffer + window exist by then).
         bo = setmetatable({}, {
           __index = function(_, k)
             local b = v:bufnr()
@@ -238,6 +241,18 @@ local function view_backend(opts)
             local b = v:bufnr()
             if b then
               vim.bo[b][k] = val
+            end
+          end,
+        }),
+        wo = setmetatable({}, {
+          __index = function(_, k)
+            local w = v:winid()
+            return w and vim.wo[w][k] or nil
+          end,
+          __newindex = function(_, k, val)
+            local w = v:winid()
+            if w then
+              vim.wo[w][k] = val
             end
           end,
         }),

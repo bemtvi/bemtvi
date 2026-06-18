@@ -96,6 +96,12 @@ function View:bufnr()
   return nx._view_buf and nx._view_buf[self.id]
 end
 
+-- :winid() — the window currently showing the view (from the mirror), or nil while the
+-- view is unmounted. The target for window-local options (`vim.wo[winid]`).
+function View:winid()
+  return nx._view_win and nx._view_win[self.id]
+end
+
 -- :set_decor(ns, marks) — replace namespace `ns`'s decoration on the view buffer
 -- with `marks`. Each mark is `{ line, col, <extmark opts> }` (0-based `line`/`col`,
 -- then any `nvim_buf_set_extmark` opt: `hl_group`, `end_col`, `virt_text`,

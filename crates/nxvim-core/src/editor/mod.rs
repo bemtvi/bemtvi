@@ -31,6 +31,7 @@ mod changelist;
 mod cmdcomplete;
 mod cmdline;
 mod command;
+mod comment;
 mod complete;
 mod cursor;
 mod decor;
@@ -1077,6 +1078,15 @@ pub struct Editor {
     /// dark. Written by `nx.bo.ts_highlight` / `:set ts_highlight` (and the
     /// [`Editor::ts_start`] / [`Editor::ts_stop`] helpers).
     ts_enabled: HashMap<BufferId, bool>,
+    /// Per-buffer **`'commentstring'`** override — the comment template the
+    /// `gc`/`gcc` operator wraps lines with (vim's `<left> %s <right>` form, e.g.
+    /// `"// %s"` or `"/* %s */"`). Absent: the buffer falls back to its filetype's
+    /// built-in template ([`comment::commentstring_for_language`]), so `gc` works
+    /// out of the box on a known language. Stored beside [`Editor::ts_filetype`]
+    /// (a per-buffer string, not a `Copy` [`BufferOptions`] slot) and written by
+    /// `:set commentstring=…` / `nx.bo.commentstring`. Resolved with
+    /// [`Editor::effective_commentstring`].
+    commentstrings: HashMap<BufferId, String>,
     /// The host clipboard backing the `"+` / `"*` registers, or `None` in a
     /// bare-core test (or a front end whose platform backend failed to start).
     /// Injected by the server via [`Editor::set_clipboard`]; when absent,
@@ -1379,6 +1389,7 @@ impl Editor {
             syntax_opened: HashMap::new(),
             syntax_failed: HashSet::new(),
             ts_filetype: HashMap::new(),
+            commentstrings: HashMap::new(),
             ts_enabled: HashMap::new(),
             clipboard: None,
             host_fs: Rc::new(StdHostFs),

@@ -1143,7 +1143,9 @@ screen," and that is exactly the shape of these tests.
   `:setlocal` / `vim.wo` / `nvim_win_{get,set}_option`) and the window-local
   horizontal-scroll options `sidescroll` / `sidescrolloff` (via `:set`), and the
   **buffer-local** indentation options `tabstop` / `shiftwidth` / `softtabstop` /
-  `expandtab` (also via `:setlocal` / `vim.bo`); scoped
+  `expandtab` and `commentstring` — the comment template the `gc`/`gcc` operator
+  reads, set per buffer or defaulted from the filetype for the ~20 most common
+  languages (all also via `:setlocal` / `vim.bo`); scoped
   `nvim_{set,get}_option_value` routes to the right scope. The bulk of vim's
   options are still missing.
   Named/numbered/special **registers** (`:registers`, `setreg`/`getreg`, the

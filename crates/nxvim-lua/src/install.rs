@@ -936,8 +936,9 @@ pub(crate) fn install_runtime_api(
     // the server to apply to the live editor's buffer (Phase 6). The prelude
     // (`vim.bo` / `nvim_set_option_value`) has canonicalized `name` and updated
     // its option mirror (write-through); a number value rides as `Number`, a
-    // boolean as `Bool`, and the one string buffer option (`regexsyntax`) as
-    // `String`. Other Lua types are ignored (the option set is typed:
+    // boolean as `Bool`, and the string buffer options (`regexsyntax` /
+    // `fileencoding` / `filetype` / `commentstring`) as `String`. Other Lua types
+    // are ignored (the option set is typed:
     // tabstop/shiftwidth are numbers, expandtab a boolean).
     let sh = shared.clone();
     nx.set(

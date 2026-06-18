@@ -1397,6 +1397,7 @@ impl EditHost {
                     modified: b.modified,
                     filetype: self.editor.buffer_filetype(id).unwrap_or_default(),
                     ts_highlight: self.editor.ts_highlight_enabled(id),
+                    commentstring: self.editor.effective_commentstring(id),
                 });
                 if !b.extmarks.is_empty() {
                     let marks = b

@@ -245,6 +245,7 @@ async fn g_prefix_merges_builtin_motions_with_user_maps() {
          D/Go to declaration/map,\
          T/Previous tab/map,\
          `/Jump to mark (no jumplist)/group,\
+         c/Toggle comment/map,\
          d/Go to definition/map,\
          g/Go to first line/map,\
          j/Down one display line/map,\

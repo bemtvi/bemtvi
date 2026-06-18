@@ -85,12 +85,15 @@ are no longer listed here — only the edges that still diverge are.
   `glob` / `filereadable` / `resolve` / …) instead.
 - **Broad options surface.** `:set` honors the search/number booleans plus the
   buffer-local indentation options `tabstop` / `shiftwidth` / `softtabstop` /
-  `expandtab` (also via `:setlocal`, `vim.bo`, and `nvim_{set,get}_option_value`).
+  `expandtab` and `commentstring` (also via `:setlocal`, `vim.bo`, and
+  `nvim_{set,get}_option_value`).
   nxvim breaks with vim's defaults here: `tabstop` defaults to **4**, with
   `shiftwidth=0` ("follow tabstop") and `softtabstop=-1` ("follow shiftwidth") so
   the one `tabstop` knob drives the whole indent width. `tabstop`, `softtabstop`,
   and `expandtab` drive rendering and `<Tab>`; `shiftwidth` only feeds the LSP
-  indent width until the `>>`/`<<` operators land. The rest of vim's hundreds of
+  indent width until the `>>`/`<<` operators land. `commentstring` backs the
+  `gc`/`gcc` comment operator and defaults from the filetype (the ~20 most common
+  languages) when unset. The rest of vim's hundreds of
   options are still missing, as are **folds** and **macros**.
 - **Legacy Vimscript (`eval.c`).** Deliberately **not** on the roadmap (guiding
   principle 2). `vim.fn.*` is a hand-written set of helper aliases, not an
@@ -159,7 +162,7 @@ clears at once. (Run the `grep` above for the current, exact call-site list.)
 |---|---|
 | LSP helpers not window-arg-aware (always use the current window) | `make_position_params(window)` is now window-aware (reads the passed window's buffer + cursor), and `open_floating_preview` returns real float handles (a `relative="cursor"` float over a scratch buffer, auto-closing on cursor move). **Remaining:** the completion-doc preview box is still a single bespoke box with no separate preview-window handle / `completeopt` matrix (the completion menu is server-owned chrome, not a window). Note: splits, floats, and tab pages themselves are implemented — see architecture.md *Windows*. |
 | No multi-buffer name/disk registry | `make_text_document_params` (non-current bufnr → empty URI), `locations_to_items` & `apply_workspace_edit` for unopened files |
-| Core honors only the indentation buffer-local options | `vim.bo` / `nvim_set_option_value` writes other than `filetype` / `tabstop` / `shiftwidth` / `expandtab` are recorded but inert |
+| Core honors a fixed set of buffer-local options | `vim.bo` / `nvim_set_option_value` writes other than `filetype` / `tabstop` / `shiftwidth` / `softtabstop` / `expandtab` / `commentstring` / `regexsyntax` / `fileencoding` / `bomb` are recorded but inert |
 | Diagnostic-display surfaces are approximations, not gaps — all four ship. `underline`, `virtual_text` (inline end-of-line message), `signs` (gutter glyph), and the on-demand float (`vim.diagnostic.open_float`) are implemented — see `docs/plans/2026-06-08-diagnostic-display-surfaces.md`. | `vim.diagnostic.config` keys other than `underline` / `virtual_text` / `signs` (`virtual_lines`, `severity_sort`, and the `config.float` pre-style defaults). `open_float` ignores its `opts` (scope/severity filters, `format`/`header`/`prefix`/`border`) — the default cursor-line scope shows, in the bottom panel (plain lines, like hover) not a cursor-anchored bordered popup. The `virtual_text` table honors `prefix` and the `signs` table its `text` glyph map; their `format` / `severity` filters and sign `priority`/`culhl` are not applied, the line's most-severe diagnostic wins the one inline slot / sign cell, and the sign column is client-side only (a fixed 2 cells not subtracted from `nxvim-core`'s text width, so a full-width line under `nowrap` can clip its last two cells). |
 
 ## Relationship to the LSP completion plan

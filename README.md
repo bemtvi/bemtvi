@@ -175,7 +175,8 @@ If you know vim, your muscle memory transfers. Concretely, what's wired today:
   brackets (`i( a(`, `i{ a{`, `i[ a[`, `i< a<`, plus `ib`/`ab` and `iB`/`aB`),
   paragraph (`ip ap`), and sentence (`is as`).
 - **Operators** — `d c y`, paste (`p P`), reindent (`=`, `==`, `=motion`,
-  `gg=G`), replace (`r`), case-toggle (`~`), join (`J`), and the line shortcuts
+  `gg=G`), comment toggle (`gc`/`gcc`, with a per-filetype `commentstring`),
+  replace (`r`), case-toggle (`~`), join (`J`), and the line shortcuts
   (`x X D C s`). Counts and dot-repeat (`.`) work throughout.
 - **Visual modes** — charwise (`v`) and linewise (`V`), `o`/`O` to swap ends,
   operators and text objects over a selection. (Blockwise `<C-v>` is a
@@ -387,8 +388,8 @@ highlights:
   the rest (`cursorline`, `colorcolumn`, …) are not.
 - **A broad options surface.** `:set` honors the search booleans, the
   number-gutter and horizontal-scroll window options, and the buffer-local
-  indentation options — but the bulk of vim's hundreds of options are missing
-  (writes to unsupported options are recorded but inert).
+  indentation options plus `commentstring` — but the bulk of vim's hundreds of
+  options are missing (writes to unsupported options are recorded but inert).
 - **The `>>` / `<<` shift operators, the `gu`/`gU`/`g~` case operators, and the
   `:map`-family ex-commands.** Indent is reindented via `=` (`==`, `=motion`,
   `gg=G`); case is toggled via `~`; keymaps are set via `vim.keymap.set` /

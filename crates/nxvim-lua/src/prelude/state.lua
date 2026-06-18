@@ -769,6 +769,11 @@ local BUF_OPT_CANON = {
   fileencoding = "fileencoding",
   fenc = "fileencoding",
   bomb = "bomb",
+  -- The comment template `gc`/`gcc` wrap lines with. Reads return the *effective*
+  -- value (the buffer override, else the filetype default); a write sets the
+  -- per-buffer override (empty falls back to the filetype default).
+  commentstring = "commentstring",
+  cms = "commentstring",
 }
 -- Core defaults, the safety net when the mirror hasn't been pushed for a buffer.
 -- Match nxvim's core: tabstop 4, with shiftwidth/softtabstop following it via
@@ -783,6 +788,7 @@ local BUF_OPT_DEFAULT = {
   regexsyntax = "pcre",
   fileencoding = "utf-8",
   bomb = false,
+  commentstring = "",
 }
 
 local function bo_get(bufnr, opt)

@@ -319,6 +319,7 @@ impl Editor {
         self.syntax_opened.remove(&id);
         self.ts_filetype.remove(&id);
         self.ts_enabled.remove(&id);
+        self.commentstrings.remove(&id);
     }
 
     /// Target indent **width in columns** for `line` of the current buffer, the

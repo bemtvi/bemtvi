@@ -226,6 +226,22 @@ impl Editor {
             }
             return;
         }
+        // `commentstring` is buffer-local: the comment template `gc`/`gcc` wrap
+        // lines with. Stored as a per-buffer override (empty clears it, falling
+        // back to the filetype default); `?` echoes the *effective* value (override
+        // or filetype default), `&` clears the override.
+        if name == "commentstring" {
+            let buf = self.current_buffer_id();
+            match op {
+                StrOp::Set(value) => self.set_commentstring(buf, &value),
+                StrOp::Reset => self.set_commentstring(buf, ""),
+                StrOp::Query => {
+                    let cs = self.effective_commentstring(buf);
+                    self.echo(format!("commentstring={cs}"));
+                }
+            }
+            return;
+        }
         // `signcolumn` is the (first) window-local enumerated string: `no`,
         // `auto`/`auto:min-max`, `yes`/`yes:n`/`yes:min-max`. A bad value (or the
         // not-yet-supported `number`) fails loud (E474) rather than silently

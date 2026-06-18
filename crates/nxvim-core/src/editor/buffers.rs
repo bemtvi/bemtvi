@@ -180,6 +180,15 @@ impl Editor {
             }
             return;
         }
+        // `commentstring` is the comment-operator template, stored as a per-buffer
+        // override beside the filetype (not a `BufferOptions` slot). Empty clears
+        // it, falling back to the filetype default.
+        if name == "commentstring" {
+            if self.buffers.map.contains_key(&id) {
+                self.set_commentstring(id, value);
+            }
+            return;
+        }
         let Some(ob) = self.buffers.map.get_mut(&id) else {
             return;
         };

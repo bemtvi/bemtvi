@@ -404,6 +404,7 @@ nouns the engine reads:
 | --- | --- | --- |
 | `filetype` | from the path's extension | *which* language (`filetype` → lang) |
 | `ts_highlight` | on when a language resolves | *whether* the native engine highlights |
+| `commentstring` | the filetype's built-in template (`// %s`, `# %s`, …) | how the `gc`/`gcc` comment operator wraps lines |
 
 Two nouns, not one, because "off" is orthogonal to "which": a giant `.rs`
 buffer can keep `filetype = "rust"` (so LSP, indent, and comments still key off

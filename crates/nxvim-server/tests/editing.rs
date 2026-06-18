@@ -19,6 +19,8 @@ mod support;
 mod changelist;
 #[path = "editing/clipboard.rs"]
 mod clipboard;
+#[path = "editing/commenting.rs"]
+mod commenting;
 #[path = "editing/core_editing.rs"]
 mod core_editing;
 #[path = "editing/dot_repeat.rs"]

@@ -1,7 +1,7 @@
 //! Operators (`d`/`c`/`y`/`>`/…) and the editing primitives they drive
 //! (delete/yank/paste/join/replace/case).
 
-use super::command::{is_clipboard_register, is_readonly_register};
+use super::command::{is_clipboard_register, is_readonly_register, COMMENT_OP};
 use super::*;
 use crate::clipboard::Clipboard;
 use crate::mode::Mode;
@@ -111,6 +111,14 @@ impl Editor {
                 let last = self.buffer().byte_to_line(hi.saturating_sub(1));
                 self.reindent_lines(first, last);
             }
+            // `gc{motion}` / `gcc` / `gcip`: toggle line comments over whichever
+            // lines the range touches (always linewise, even from a charwise
+            // motion / text object, like `=`).
+            COMMENT_OP => {
+                let first = self.buffer().byte_to_line(lo);
+                let last = self.buffer().byte_to_line(hi.saturating_sub(1));
+                self.toggle_comment_lines(first, last);
+            }
             _ => {}
         }
     }
@@ -183,6 +191,16 @@ impl Editor {
             let first = self.buffer().byte_to_line(lo);
             let last = self.buffer().byte_to_line(hi.saturating_sub(1));
             self.reindent_lines(first, last);
+            self.mode = Mode::Normal;
+            self.reset_pending();
+            return;
+        }
+        // Visual `gc` toggles comments on the selected lines — like `=`, no yank /
+        // register, its own undo step inside `toggle_comment_lines`.
+        if op == COMMENT_OP {
+            let first = self.buffer().byte_to_line(lo);
+            let last = self.buffer().byte_to_line(hi.saturating_sub(1));
+            self.toggle_comment_lines(first, last);
             self.mode = Mode::Normal;
             self.reset_pending();
             return;

@@ -257,6 +257,10 @@ pub struct BoMirror {
     /// Whether treesitter highlighting is enabled for the buffer (the
     /// `ts_highlight` noun); mirrored so `nx.bo.ts_highlight` reads the core flag.
     pub ts_highlight: bool,
+    /// The buffer's *effective* `'commentstring'` — its explicit override, or the
+    /// filetype's built-in default when none — mirrored so `nx.bo.commentstring`
+    /// reads what `gc`/`gcc` actually wrap lines with.
+    pub commentstring: String,
 }
 
 /// One buffer change projected into neovim's `nvim_buf_attach` `on_bytes`

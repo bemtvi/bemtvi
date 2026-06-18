@@ -13,6 +13,16 @@ use super::*;
 use crate::input::{Key, KeyCode};
 use crate::mode::Mode;
 
+/// The internal operator char for `gc`/`gcc` (toggle line comment). Operators are
+/// represented by a single `char` in [`PendingCommand::operator`]; the comment
+/// operator's mnemonic is the two-key `gc`, so it needs a sentinel that can never
+/// collide with a real keystroke. A private-use code point is never produced by
+/// [`Key::as_char`] from actual input, so it is safe to compare against. The `gcc`
+/// doubling (the second `c`) and visual `gc` are handled explicitly in
+/// [`parse_step`]; everything else (motions, text objects, counts) flows through
+/// the generic operator machinery keyed on this char.
+pub(crate) const COMMENT_OP: char = '\u{E000}';
+
 /// A `<C-w>` window command: the second key after the `<C-w>` prefix, resolved by
 /// [`parse_step`] and applied in [`Editor::execute`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -736,6 +746,7 @@ fn g_continuations() -> Vec<CommandContinuation> {
         ("k", "Up one display line"),
         ("t", "Next tab"),
         ("T", "Previous tab"),
+        ("c", "Toggle comment"),
         (";", "Older change position"),
         (",", "Newer change position"),
         ("*", "Search word forward (partial)"),
@@ -1068,6 +1079,20 @@ fn parse_step(mode: Mode, pending: &PendingCommand, key: Key) -> ParseStep {
     if gpending {
         match key.as_char() {
             Some('g') => return Complete(ResolvedCommand::Motion(Motion::GotoTop)),
+            // `gc` is the comment operator. In visual mode it toggles the selection
+            // immediately; in normal mode it arms the operator (a motion / text
+            // object follows, or a second `c` doubles it to the current line(s)).
+            Some('c') => {
+                if mode.is_visual() {
+                    return Complete(ResolvedCommand::VisualOperate(COMMENT_OP));
+                }
+                let mut next = pending.clone();
+                next.operator = Some(COMMENT_OP);
+                next.op_count = pending.count;
+                next.count = None;
+                next.stage = Stage::Start;
+                return Prefix(next);
+            }
             // `gj` / `gk` move by *display* line (soft-wrap aware): within a wrapped
             // line they step continuation rows; with `nowrap` they are plain `j`/`k`.
             Some('j') => return Complete(ResolvedCommand::Motion(Motion::DisplayDown)),
@@ -1176,6 +1201,9 @@ fn parse_command(mode: Mode, pending: &PendingCommand, key: Key, gpending: bool)
     if let Some(op) = pending.operator {
         return match key.as_char() {
             Some(c) if c == op => Complete(RC::DoubledOperator(op)),
+            // `gcc`: the comment operator doubles on a second `c` (its mnemonic
+            // key), not on its internal sentinel char.
+            Some('c') if op == COMMENT_OP => Complete(RC::DoubledOperator(op)),
             Some('/') => Complete(RC::OperatorSearch {
                 op,
                 dir: SearchDir::Forward,

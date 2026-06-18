@@ -1,6 +1,6 @@
 # Plan: route LSP doc surfaces through real float windows (mouse + scroll for free)
 
-Status: in progress (2026-06-18)
+Status: all three phases implemented (2026-06-18)
 
 ## Motivation
 
@@ -89,18 +89,31 @@ closes it.
 Rewire `lsp/request.rs::show_signature_help` to the same `open_doc_float` path
 (its own surface name / scratch buffer). Own commit.
 
-### Phase 3 — completion docs scroll + mouse (bespoke, REVISED)
+### Phase 3 — completion docs scroll + mouse (bespoke, REVISED — confirmed)
 
-Keep docs server-projected beside the menu, but make it interactive like the
-list:
+The user confirmed the bespoke route at the phase-2→3 boundary. Docs stays
+server-projected beside the menu, made interactive like the list:
 
-- add a docs **scroll-offset** state on the completion/menu state;
-- add a `MenuHit::Docs` region computed alongside the menu box geometry;
-- route wheel-over-docs to scroll the docs offset (mirror
-  `mouse_complete_wheel`); `project_complete_docs` windows from the offset.
+- **scroll offset** is core-owned (`Editor::complete_docs_scroll`), reset to 0 on
+  any completion selection change (`complete_select_next`/`prev`/`index`).
+- the docs box is **content-sized and server-placed** — the content (LSP cache /
+  `resolve` / a plugin's inline doc) is server-owned, so core can't recompute the
+  geometry the way it does the menu box (`menu_geom`). Instead the server stashes
+  the docs float's **global box** into core each redraw
+  (`Editor::stash_complete_docs_hit` ← `CompleteDocsHit{x,y,w,h,total,view_h}`),
+  computed in `project_menu` from the focused window origin + gutter. The stash is
+  gated on a live completion menu (`complete_docs_hit_at`) so a stale box can't
+  fire after the popup closes.
+- the completion mouse dispatch guards now also fire over the docs box; a
+  wheel-over-docs calls `scroll_complete_docs` (non-wrapping, clamped to
+  `total − view_h`) instead of moving the highlight; `project_complete_docs`
+  windows the lines from `complete_docs_scroll`. A click on the docs box is
+  swallowed (no text leak) but selects nothing.
 
-Confirm this revision with the user at the phase-2→3 boundary before building it
-(it reverses the "make it a window" idea from the original chat).
+Native-gated, like the existing docs sidebar. Verified by
+`wheeling_over_the_completion_docs_sidebar_scrolls_it` (complete.rs): a tall
+inline doc, wheel-down advances the visible top by N lines, the highlight is
+unchanged, wheel-up returns to the top.
 
 ## Out of scope
 

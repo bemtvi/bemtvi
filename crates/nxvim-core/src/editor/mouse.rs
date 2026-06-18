@@ -146,6 +146,26 @@ struct MenuScreen {
     total: usize,
 }
 
+/// The completion **docs sidebar**'s on-screen box (global cells) plus the selected
+/// row's total doc-line count and the visible height — stashed by the server each
+/// redraw ([`Editor::stash_complete_docs_hit`]) so the core can hit-test a wheel
+/// over the docs float and bound its scroll. Unlike the menu box (recomputed from
+/// [`Editor::menu_geom`]) the docs geometry is *content-derived* and the content is
+/// server-owned (the LSP item cache / `resolve` / a plugin's inline doc), so it
+/// can't be recomputed here — the server feeds it back.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CompleteDocsHit {
+    /// Outer box `(x, y, w, h)` in global screen cells (border included).
+    pub x: usize,
+    pub y: usize,
+    pub w: usize,
+    pub h: usize,
+    /// Total lines in the selected row's docs (the scroll's upper bound).
+    pub total: usize,
+    /// Visible doc rows (the windowed height); the scroll max is `total - view_h`.
+    pub view_h: usize,
+}
+
 /// Which `%`-format-rendered chrome row a [`StatuslineClick`] landed on — it tells
 /// the server which format to re-run and at what width when resolving the click's
 /// column to a [`ClickAction`](crate::statusline::ClickAction).
@@ -212,14 +232,18 @@ impl Editor {
             // input) are wired in their own phase. Guarded on the cell landing on the
             // popup, so a click elsewhere still reaches the text.
             (MouseButton::Left, MouseAction::Press)
-                if self.completion_active() && self.menu_hit(ev.row, ev.col).is_some() =>
+                if self.completion_active()
+                    && (self.menu_hit(ev.row, ev.col).is_some()
+                        || self.complete_docs_hit_at(ev.row, ev.col)) =>
             {
                 self.mouse_complete_press(ev.row, ev.col)
             }
             (MouseButton::Wheel, MouseAction::WheelUp | MouseAction::WheelDown)
-                if self.completion_active() && self.menu_hit(ev.row, ev.col).is_some() =>
+                if self.completion_active()
+                    && (self.menu_hit(ev.row, ev.col).is_some()
+                        || self.complete_docs_hit_at(ev.row, ev.col)) =>
             {
-                self.mouse_complete_wheel(ev.action == MouseAction::WheelDown)
+                self.mouse_complete_wheel(ev.action == MouseAction::WheelDown, ev.row, ev.col)
             }
             // A picker / `select` grabs the mouse modally while open (like it grabs the
             // keyboard): a left-press highlights or confirms a row — or cancels a
@@ -1221,10 +1245,57 @@ impl Editor {
         }
     }
 
+    /// Stash the completion **docs sidebar**'s on-screen box (server-computed each
+    /// redraw, `None` when no sidebar shows) so a later wheel can hit-test it. Clamps
+    /// the scroll offset to the new content (a shorter doc can't stay scrolled past
+    /// its end). The geometry is server-fed because the docs content — and so its
+    /// size — is server-owned (LSP cache / `resolve` / a plugin's inline doc).
+    pub fn stash_complete_docs_hit(&mut self, hit: Option<CompleteDocsHit>) {
+        self.complete_docs_hit = hit;
+        let max = hit.map_or(0, |h| h.total.saturating_sub(h.view_h));
+        self.complete_docs_scroll = self.complete_docs_scroll.min(max);
+    }
+
+    /// The completion docs sidebar's first-visible-line offset — the server windows
+    /// the doc lines from here when projecting the sidebar.
+    pub fn complete_docs_scroll(&self) -> usize {
+        self.complete_docs_scroll
+    }
+
+    /// Whether `(row, col)` lands on the stashed completion **docs sidebar** box.
+    /// Gated on a live completion menu so a stale stash (the menu closed since the
+    /// last redraw) can never fire.
+    fn complete_docs_hit_at(&self, row: usize, col: usize) -> bool {
+        self.completion_active()
+            && self
+                .complete_docs_hit
+                .is_some_and(|h| (h.x..h.x + h.w).contains(&col) && (h.y..h.y + h.h).contains(&row))
+    }
+
+    /// Scroll the completion docs sidebar one line, non-wrapping (a wheel is a
+    /// scrollbar, not a wrap), bounded by the stashed content height. The server
+    /// windows the doc lines from [`Editor::complete_docs_scroll`] on the next redraw.
+    fn scroll_complete_docs(&mut self, down: bool) {
+        let max = self
+            .complete_docs_hit
+            .map_or(0, |h| h.total.saturating_sub(h.view_h));
+        self.complete_docs_scroll = if down {
+            (self.complete_docs_scroll + 1).min(max)
+        } else {
+            self.complete_docs_scroll.saturating_sub(1)
+        };
+    }
+
     /// A wheel notch over the completion popup moves the highlight one row,
     /// non-wrapping (like dragging a scrollbar — it stops at the ends, unlike
-    /// `<C-n>`'s wrap). A noselect popup highlights the first row.
-    fn mouse_complete_wheel(&mut self, down: bool) {
+    /// `<C-n>`'s wrap). A noselect popup highlights the first row. Over the **docs
+    /// sidebar** beside the popup it scrolls the docs instead, leaving the highlight
+    /// (and so the selected row) untouched.
+    fn mouse_complete_wheel(&mut self, down: bool, row: usize, col: usize) {
+        if self.complete_docs_hit_at(row, col) {
+            self.scroll_complete_docs(down);
+            return;
+        }
         let Some(m) = self.menu_view() else {
             return;
         };

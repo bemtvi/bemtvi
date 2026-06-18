@@ -77,7 +77,7 @@ pub use self::decor::DecorViewport;
 pub use self::menu::{
     Extent, MenuGeom, MenuItem, MenuMetrics, MenuPlacement, PreviewScroll, PreviewTarget, PromptPos,
 };
-pub use self::mouse::{ClickSurface, StatuslineClick};
+pub use self::mouse::{ClickSurface, CompleteDocsHit, StatuslineClick};
 pub(crate) use self::multicursor::PlacementSnapshot;
 // The off-tick save / open requests (the daemon / edit-host fs path, Phase 3e/3f).
 pub use self::buffers::{
@@ -782,6 +782,14 @@ pub struct Editor {
     /// dismisses it in [`Editor::input`] — but a mouse wheel never reaches `input`,
     /// so it scrolls the popup instead of closing it.
     doc_float_wins: Vec<(String, WindowId)>,
+    /// The completion **docs sidebar**'s scroll offset (first visible doc line) and
+    /// the server-stashed on-screen box for hit-testing a wheel over it. The docs
+    /// content is server-owned (LSP cache / `resolve` / a plugin's inline doc), so
+    /// the server feeds the box geometry back each redraw
+    /// ([`Editor::stash_complete_docs_hit`]); the offset is core-owned and reset to 0
+    /// whenever the completion selection changes. See [`mouse`](crate::editor::mouse).
+    complete_docs_scroll: usize,
+    complete_docs_hit: Option<mouse::CompleteDocsHit>,
     /// Picker query edits awaiting a (dynamic) source re-run: each `(generation,
     /// query)`. A *static* source never appends here — the local fuzzy matcher
     /// handles its query edits in core. Drained by the server, which stamps the
@@ -1359,6 +1367,8 @@ impl Editor {
             panel_buffers: Vec::new(),
             doc_float_buffers: Vec::new(),
             doc_float_wins: Vec::new(),
+            complete_docs_scroll: 0,
+            complete_docs_hit: None,
             panel: None,
             view_float_lock: Vec::new(),
             qf_prev_win: None,

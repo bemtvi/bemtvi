@@ -1241,6 +1241,19 @@ fn special_key_spans(lines: &[String], tabstop: usize) -> Value {
     )
 }
 
+/// The completion docs sidebar's resolved geometry (text-area content cells) plus
+/// the selected row's total doc-line count — returned by
+/// [`EditHost::project_complete_docs`] so [`EditHost::project_menu`] can convert it
+/// to a global box and stash it in core for the wheel hit-test.
+#[cfg(feature = "native")]
+struct CompleteDocsMeta {
+    row: usize,
+    col: usize,
+    w: usize,
+    h: usize,
+    total: usize,
+}
+
 /// Project the floating selectable-list [`MenuView`] into its redraw sub-map,
 /// computing the bordered box's anchor and content size in **text-area cells**
 /// (the client adds the gutter + text-area origin, then draws the border) — the
@@ -1379,10 +1392,29 @@ impl EditHost {
         // edit-host has no language servers). Absent ⇒ the client draws no sidebar.
         #[cfg(feature = "native")]
         if matches!(m.placement, MenuPlacement::Cursor) {
-            if let Some(docs) =
+            if let Some((docs, meta)) =
                 self.project_complete_docs(m, row, col, width, text_width, text_height)
             {
                 map.push((Value::from("docs"), docs));
+                // Stash the docs float's box in GLOBAL cells so a wheel over it scrolls
+                // the docs. The placement math is the server's (the content is too), so
+                // core can't recompute it — it's fed back here for the hit-test. The
+                // docs content sits at `(inner_x + col, win_y + row)`; the bordered
+                // outer box is one cell out on every side.
+                let inner_x = focused.rect.x + focused.number_width;
+                let gx = (inner_x + meta.col).saturating_sub(1);
+                let gy = (focused.rect.y + meta.row).saturating_sub(1);
+                self.editor
+                    .stash_complete_docs_hit(Some(nxvim_core::CompleteDocsHit {
+                        x: gx,
+                        y: gy,
+                        w: meta.w + 2,
+                        h: meta.h + 2,
+                        total: meta.total,
+                        view_h: meta.h,
+                    }));
+            } else {
+                self.editor.stash_complete_docs_hit(None);
             }
         }
         Value::Map(map)
@@ -1406,7 +1438,7 @@ impl EditHost {
         width: usize,
         text_width: usize,
         text_height: usize,
-    ) -> Option<Value> {
+    ) -> Option<(Value, CompleteDocsMeta)> {
         if !m.docs {
             return None;
         }
@@ -1461,19 +1493,34 @@ impl EditHost {
             (col.saturating_sub(2 + w), w)
         };
         // Clamp the height to the rows available below the float's top (a full border
-        // costs 2), then window the lines to it.
-        let docs_h = lines
-            .len()
+        // costs 2).
+        let total = lines.len();
+        let docs_h = total
             .min(MAX_DOCS_H)
             .min(text_height.saturating_sub(row).saturating_sub(2).max(1));
-        let shown = &lines[..docs_h.min(lines.len())];
-        Some(Value::Map(vec![
+        // Window the lines from the core-owned scroll offset — a wheel over the
+        // sidebar advances it (`Editor::scroll_complete_docs`). Clamp so a short tail
+        // can't scroll past the end (the offset is also reset to 0 on a selection
+        // change, so a new row's docs start at the top).
+        let scroll = self.editor.complete_docs_scroll().min(total - docs_h);
+        let shown = &lines[scroll..(scroll + docs_h).min(total)];
+        let value = Value::Map(vec![
             (Value::from("lines"), display_lines_value(shown)),
             (Value::from("row"), Value::from(row as u64)),
             (Value::from("col"), Value::from(docs_col as u64)),
             (Value::from("width"), Value::from(docs_w as u64)),
             (Value::from("height"), Value::from(docs_h as u64)),
-        ]))
+        ]);
+        Some((
+            value,
+            CompleteDocsMeta {
+                row,
+                col: docs_col,
+                w: docs_w,
+                h: docs_h,
+                total,
+            },
+        ))
     }
 
     /// The command-line wildmenu's **docs sidebar** (Phase 3): the highlighted

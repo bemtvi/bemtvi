@@ -938,12 +938,15 @@ impl Editor {
     pub(crate) fn complete_select_next(&mut self) {
         if let Some(m) = self.completion_menu_mut() {
             m.select_next();
+            // A new row's docs start at the top.
+            self.complete_docs_scroll = 0;
         }
     }
 
     pub(crate) fn complete_select_prev(&mut self) {
         if let Some(m) = self.completion_menu_mut() {
             m.select_prev();
+            self.complete_docs_scroll = 0;
         }
     }
 
@@ -956,6 +959,9 @@ impl Editor {
             if len > 0 {
                 m.selected_active = true;
                 m.cursor = idx.min(len - 1);
+                // A new row's docs start at the top (the mouse hover/click + wheel-list
+                // path lands here too, so scrolling the LIST resets the docs sidebar).
+                self.complete_docs_scroll = 0;
             }
         }
     }

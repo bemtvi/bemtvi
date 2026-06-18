@@ -803,6 +803,115 @@ async fn wheeling_over_the_completion_popup_moves_the_highlight_without_wrapping
     assert_eq!(menu_selected(&menu), 0);
 }
 
+/// The docs sidebar `(row, col, lines)` of the latest redraw whose `menu.docs`
+/// sub-map's lines satisfy `want` — `row`/`col` are its text-area content cells
+/// (global cells once the gutter is off).
+async fn poll_docs_box(
+    rpc: &Rpc,
+    incoming: &mut UnboundedReceiver<Incoming>,
+    want: impl Fn(&[String]) -> bool,
+) -> Option<(usize, usize, Vec<String>)> {
+    let docs_lines = |docs: &[(Value, Value)]| -> Vec<String> {
+        match map_get(docs, "lines") {
+            Some(Value::Array(ls)) => ls
+                .iter()
+                .map(|l| l.as_str().unwrap_or("").to_string())
+                .collect(),
+            _ => Vec::new(),
+        }
+    };
+    for _ in 0..60 {
+        nxvim_test_harness::barrier(rpc).await;
+        if let Some(map) = drain_to_latest_redraw(incoming, |m| match map_get(m, "menu") {
+            Some(Value::Map(menu)) => match map_get(menu, "docs") {
+                Some(Value::Map(docs)) => want(&docs_lines(docs)),
+                _ => false,
+            },
+            _ => false,
+        }) {
+            let Some(Value::Map(menu)) = map_get(&map, "menu") else {
+                continue;
+            };
+            let Some(Value::Map(docs)) = map_get(menu, "docs") else {
+                continue;
+            };
+            let row = map_get(docs, "row").and_then(Value::as_u64)? as usize;
+            let col = map_get(docs, "col").and_then(Value::as_u64)? as usize;
+            return Some((row, col, docs_lines(docs)));
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    None
+}
+
+#[tokio::test]
+async fn wheeling_over_the_completion_docs_sidebar_scrolls_it() {
+    let dir = temp_dir("complete_docs_scroll");
+    // One row carrying a TALL inline doc (more lines than the sidebar's 12-row cap),
+    // so the docs float has content to scroll.
+    let init = "\
+nx.complete.source {\n\
+  name = 'docs', debounce = 0,\n\
+  complete = function(ctx)\n\
+    local d = {}\n\
+    for i = 1, 30 do d[i] = string.format('doc line %02d', i) end\n\
+    ctx.push { text = 'alpha', doc = table.concat(d, '\\n') }\n\
+  end,\n\
+}\n\
+nx.complete.setup { sources = { { 'docs' } } }";
+    let (rpc, mut incoming) = start(&dir, init).await;
+    // Drop the gutter so the docs sidebar's text-area cells are global screen cells.
+    nxvim_test_harness::command(&rpc, "set nonumber norelativenumber").await;
+
+    feed(&rpc, "ial");
+    let _ = poll_menu(&rpc, &mut incoming).await.expect("popup opens");
+    // Select row 0 so the docs sidebar shows (it renders only for an active row).
+    feed(&rpc, "<C-n>");
+    let (row, col, top) = poll_docs_box(&rpc, &mut incoming, |ls| {
+        ls.first().map(String::as_str) == Some("doc line 01")
+    })
+    .await
+    .expect("docs sidebar opens at the top");
+    assert_eq!(top.first().map(String::as_str), Some("doc line 01"));
+
+    // Three wheel-down notches over the docs float scroll it down three lines — the
+    // wheel acts on the docs, NOT the highlight (which stays on row 0).
+    for _ in 0..3 {
+        feed_mouse(&rpc, "wheel", "down", row + 1, col + 1);
+    }
+    let (_, _, scrolled) = poll_docs_box(&rpc, &mut incoming, |ls| {
+        ls.first().map(String::as_str) != Some("doc line 01")
+    })
+    .await
+    .expect("the wheel scrolled the docs sidebar");
+    assert_eq!(
+        scrolled.first().map(String::as_str),
+        Some("doc line 04"),
+        "three wheel-down notches advanced the docs by three lines: {scrolled:?}"
+    );
+    let menu = menu_of(
+        &poll_menu(&rpc, &mut incoming)
+            .await
+            .expect("menu still open"),
+    );
+    assert_eq!(
+        menu_selected(&menu),
+        0,
+        "wheeling the docs did not move the popup highlight"
+    );
+
+    // Wheeling back up returns to the top, non-wrapping (stops at line 01).
+    for _ in 0..5 {
+        feed_mouse(&rpc, "wheel", "up", row + 1, col + 1);
+    }
+    let (_, _, back) = poll_docs_box(&rpc, &mut incoming, |ls| {
+        ls.first().map(String::as_str) == Some("doc line 01")
+    })
+    .await
+    .expect("the docs scrolled back to the top");
+    assert_eq!(back.first().map(String::as_str), Some("doc line 01"));
+}
+
 #[tokio::test]
 async fn example_mouse_widgets_config_loads_and_completion_is_clickable() {
     // The shipped examples/mouse-widgets config must load (mouse=a + the four widget

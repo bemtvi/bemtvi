@@ -41,7 +41,7 @@ mod session;
 
 pub use input::{encode_key, is_paste};
 pub use mouse::{
-    button_name, cell_at, drain_notches, horizontal_action, mouse_modifier, vertical_action, within,
+    button_name, cell_at, drain_notches, horizontal_action, mouse_modifier, vertical_action,
 };
 pub use session::{parse_connect_uri, spawn_session, spawn_stdio_daemon_session, Session};
 // The pure inline-inlay-hint geometry (the shift math) and the segment splice, so
@@ -585,10 +585,6 @@ struct App {
     /// pixel-precise trackpad still scrolls one whole line at a time (see
     /// [`mouse::drain_notches`]).
     wheel_accum: (f32, f32),
-    /// Client-side scroll offset for the completion doc preview (a pure UI gesture
-    /// — the server owns no notion of the box's pixel height). Reset to 0 whenever
-    /// the previewed docs change (a new selection, or the menu closing).
-    doc_scroll: u16,
     /// Last `(cols, windows_rows)` reported to the server, to suppress
     /// no-op resize notifications.
     reported: (u16, u16),
@@ -645,7 +641,6 @@ impl App {
             autoscroll: None,
             autoscroll_deadline: None,
             wheel_accum: (0.0, 0.0),
-            doc_scroll: 0,
             reported: (0, 0),
             flush_deadline: None,
             config,
@@ -796,44 +791,20 @@ impl App {
         );
     }
 
-    /// Left button pressed. A client-owned overlay claims the click when the
-    /// pointer is over it — the panel's `[X]` / content (close, select, activate)
-    /// or a completion row (select / accept) — exactly like the TUI; otherwise it
-    /// is a text-area press the server turns into focus-follows-click + a Visual
-    /// anchor. Arms drag tracking either way (a stray drag the server no-ops).
+    /// Left button pressed: forward the global cell to the server, which owns the
+    /// hit-test back to a window + buffer position (focus-follows-click + a Visual
+    /// anchor) or an overlay (the completion popup, a picker, …) under the pointer.
+    /// Arms drag tracking either way (a stray drag the server no-ops).
     fn mouse_left_press(&mut self) {
         let Some((col, row)) = self.pointer_cell() else {
             return;
         };
-        let Some(r) = self.renderer.as_ref() else {
+        if self.renderer.is_none() {
             return;
-        };
-        let (cols, _) = r.grid_size();
+        }
         self.mouse_down = true;
         self.last_drag_cell = Some((col, row));
 
-        // 1. The completion popup: a click on a row selects it, and clicking the
-        // already-selected row accepts it (<C-n> then <C-y>). A click off the popup
-        // is swallowed (no text-area fallthrough), matching the TUI.
-        if let Some(hit) = render::pmenu_hit(&self.view, cols) {
-            let (ix, iy, iw, ih) = hit.item;
-            if mouse::within(col, row, ix, iy, iw, ih) {
-                if let Some(pmenu) = self.view.pmenu.as_ref() {
-                    let idx = hit.start + (row - iy) as usize;
-                    if idx < pmenu.items.len() {
-                        if pmenu.selected == Some(idx) {
-                            self.rpc.notify("nxvim_complete_accept", vec![]);
-                        } else {
-                            self.rpc
-                                .notify("nxvim_complete_select", vec![Value::from(idx as u64)]);
-                        }
-                    }
-                }
-            }
-            return;
-        }
-
-        // 3. No overlay: a text-area press, forwarded to the server (single-grid).
         self.send_mouse("left", "press", col, row);
         // A press-and-hold already in the edge band auto-scrolls without a drag.
         self.arm_autoscroll((col, row));
@@ -934,83 +905,23 @@ impl App {
         let Some((col, row)) = self.pointer_cell() else {
             return;
         };
-        let (cols, _) = r.grid_size();
 
-        // Cap the per-event repeat so a flung trackpad can't flood the server.
+        // Cap the per-event repeat so a flung trackpad can't flood the server. Every
+        // notch is forwarded to the server, which hit-tests it to the window — or the
+        // overlay (the completion popup, a picker) — under the pointer.
         const MAX_STEPS: i32 = 10;
         if let Some(action) = mouse::vertical_action(vnotch) {
-            let down = vnotch < 0;
             let steps = vnotch.unsigned_abs().min(MAX_STEPS as u32);
-            if !self.wheel_vertical_overlay(col, row, cols, down, steps) {
-                for _ in 0..steps {
-                    self.send_mouse("wheel", action, col, row);
-                }
+            for _ in 0..steps {
+                self.send_mouse("wheel", action, col, row);
             }
         }
-        // Horizontal notches never hit an overlay — always a text-area scroll.
         if let Some(action) = mouse::horizontal_action(hnotch) {
             let steps = hnotch.unsigned_abs().min(MAX_STEPS as u32);
             for _ in 0..steps {
                 self.send_mouse("wheel", action, col, row);
             }
         }
-    }
-
-    /// Route `steps` vertical wheel notches to whichever overlay the pointer is
-    /// over — the completion doc preview (client-side scroll), the popup list
-    /// (move the selection), or the message panel (move its cursor). Returns
-    /// `true` when an overlay claimed them; `false` to fall through to a text scroll.
-    fn wheel_vertical_overlay(
-        &mut self,
-        col: u16,
-        row: u16,
-        cols: u16,
-        down: bool,
-        steps: u32,
-    ) -> bool {
-        // The completion popup's doc preview and item list.
-        if let Some(hit) = render::pmenu_hit(&self.view, cols) {
-            if let Some((dx, dy, dw, dh, max_scroll)) = hit.doc {
-                if mouse::within(col, row, dx, dy, dw, dh) {
-                    const STEP: u16 = 3;
-                    for _ in 0..steps {
-                        self.doc_scroll = if down {
-                            (self.doc_scroll + STEP).min(max_scroll)
-                        } else {
-                            self.doc_scroll.saturating_sub(STEP)
-                        };
-                    }
-                    if let Some(w) = self.window.as_ref() {
-                        w.request_redraw();
-                    }
-                    return true;
-                }
-            }
-            let (ix, iy, iw, ih) = hit.item;
-            if mouse::within(col, row, ix, iy, iw, ih) {
-                if let Some(pmenu) = self.view.pmenu.as_ref() {
-                    let n = pmenu.items.len();
-                    if n > 0 {
-                        // Move the selection one item per notch, non-wrapping (like a
-                        // scrollbar); an unselected list lands on the first item.
-                        let mut sel = pmenu.selected;
-                        for _ in 0..steps {
-                            sel = Some(match sel {
-                                Some(i) if down => (i + 1).min(n - 1),
-                                Some(i) => i.saturating_sub(1),
-                                None => 0,
-                            });
-                        }
-                        if let Some(idx) = sel {
-                            self.rpc
-                                .notify("nxvim_complete_select", vec![Value::from(idx as u64)]);
-                        }
-                    }
-                }
-                return true;
-            }
-        }
-        false
     }
 }
 
@@ -1187,13 +1098,7 @@ impl ApplicationHandler<UserEvent> for App {
     fn user_event(&mut self, event_loop: &ActiveEventLoop, event: UserEvent) {
         match event {
             UserEvent::Redraw(view) => {
-                // The previewed completion docs changing (a new selection, or the
-                // menu closing) resets the client-side doc scroll to the top.
-                let prev_doc = self.view.pmenu.as_ref().map(|p| p.doc.clone());
                 self.view = *view;
-                if self.view.pmenu.as_ref().map(|p| &p.doc) != prev_doc.as_ref() {
-                    self.doc_scroll = 0;
-                }
                 // A changed `guifont` re-shapes the renderer (and re-reports the
                 // grid) before this frame paints.
                 if self.view.guifont != self.applied_guifont {
@@ -1388,9 +1293,8 @@ impl ApplicationHandler<UserEvent> for App {
                     self.scroll = None;
                 }
                 let frame = self.scroll.as_ref().map(ScrollAnim::frame);
-                let doc_scroll = self.doc_scroll;
                 if let Some(r) = self.renderer.as_mut() {
-                    if let Err(e) = r.render(&self.view, frame.as_ref(), doc_scroll) {
+                    if let Err(e) = r.render(&self.view, frame.as_ref(), 0) {
                         eprintln!("nxvim-gui: render error: {e}");
                     }
                 }

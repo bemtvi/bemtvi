@@ -50,13 +50,6 @@ pub fn mouse_modifier(mods: ModifiersState) -> String {
     s
 }
 
-/// Whether `(col, row)` falls inside the `w`×`h` rect anchored at `(x, y)` — the
-/// hit-test shared by the completion popup and its doc preview. Mirrors the TUI's
-/// `within`.
-pub fn within(col: u16, row: u16, x: u16, y: u16, w: u16, h: u16) -> bool {
-    col >= x && col < x + w && row >= y && row < y + h
-}
-
 /// The cell `(col, row)` a physical-pixel position falls in, for cell size
 /// `(cell_w, cell_h)` in physical pixels. A negative coordinate (the pointer left
 /// the window to the top/left) clamps to `0`. Pure so the conversion is testable

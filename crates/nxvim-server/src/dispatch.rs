@@ -469,22 +469,6 @@ impl EditHost {
                 // [channel_id, metadata]; metadata kept minimal for now.
                 Ok(Value::Array(vec![Value::from(1u64), Value::Map(vec![])]))
             }
-            // ----- the unified completion popup (mouse routing) -------------
-            "nxvim_complete_select" => {
-                // (index): highlight a visible completion item by absolute index
-                // (clamped) — the mouse click / wheel counterpart to <C-n>/<C-p>.
-                let idx = params.first().and_then(Value::as_u64).unwrap_or(0) as usize;
-                self.editor.complete_select_index(idx);
-                Ok(Value::Nil)
-            }
-            "nxvim_complete_accept" => {
-                // Accept the highlighted item — a click on the selected row, the
-                // <C-y> equivalent. A delegated (`lsp`) accept is applied by
-                // `run_pending`'s settle, exactly as the keyboard accept path is.
-                self.editor.complete_accept();
-                self.run_pending();
-                Ok(Value::Nil)
-            }
             other => Err(format!("Unknown method: {other}")),
         }
     }

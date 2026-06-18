@@ -6,7 +6,7 @@
 //! depends on.
 
 use nxvim_gui::{
-    button_name, cell_at, drain_notches, horizontal_action, mouse_modifier, vertical_action, within,
+    button_name, cell_at, drain_notches, horizontal_action, mouse_modifier, vertical_action,
 };
 use winit::event::MouseButton;
 use winit::keyboard::ModifiersState;
@@ -48,16 +48,6 @@ fn pixel_position_maps_to_the_cell_it_falls_in() {
     assert_eq!(cell_at(20.0, 35.0, 8.0, 16.0), (2, 2));
     // A negative coordinate (pointer left the window top/left) clamps to 0.
     assert_eq!(cell_at(-5.0, -5.0, 8.0, 16.0), (0, 0));
-}
-
-#[test]
-fn within_is_half_open_on_each_axis() {
-    // [x, x+w) × [y, y+h): the top-left corner is inside, the bottom-right isn't.
-    assert!(within(2, 3, 2, 3, 4, 2));
-    assert!(within(5, 4, 2, 3, 4, 2)); // x=5 is the last column (2+4-1)
-    assert!(!within(6, 3, 2, 3, 4, 2)); // x=6 == x+w is outside
-    assert!(!within(2, 5, 2, 3, 4, 2)); // y=5 == y+h is outside
-    assert!(!within(1, 3, 2, 3, 4, 2)); // left of the rect
 }
 
 #[test]

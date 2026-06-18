@@ -45,9 +45,19 @@ try {
   await page.evaluate(() => window.__nxvim.ready);
 
   // ---- 1. Renderer is the DOM renderer, not a <pre> ----
-  const noPre = await page.evaluate(() => document.querySelector("#grid pre") === null);
-  const hasRows = await page.evaluate(() => document.querySelectorAll("#grid .row").length > 0);
-  check("renderer: paints .row cells (DOM renderer, not a <pre>)", noPre && hasRows);
+  // The first frame paints on the redraw that follows `ready`, so poll briefly rather
+  // than read the DOM the instant the Worker reports ready (which races the paint).
+  let firstPaint = { noPre: false, hasRows: false };
+  for (let i = 0; i < 60; i++) {
+    firstPaint = await page.evaluate(() => ({
+      noPre: document.querySelector("#grid pre") === null,
+      hasRows: document.querySelectorAll("#grid .row").length > 0,
+    }));
+    if (firstPaint.noPre && firstPaint.hasRows) break;
+    await sleep(50);
+  }
+  check("renderer: paints .row cells (DOM renderer, not a <pre>)",
+    firstPaint.noPre && firstPaint.hasRows, JSON.stringify(firstPaint));
 
   // ---- 2. Command line sits BELOW the status line (bug #1) ----
   // Put text in, then read the y of the focused window's status line vs the command
@@ -294,11 +304,10 @@ try {
   await page.evaluate(() => window.__nxvim.execLua(
     "nx.complete.source {\n" +
     "  name = 'emoji', debounce = 0, trigger = { chars = { ':' } },\n" +
-    "  complete = function(ctx, push, done)\n" +
+    "  complete = function(ctx)\n" +
     "    for _, e in ipairs({ { ':smile:', 'SMILE' }, { ':rocket:', 'ROCKET' } }) do\n" +
-    "      if e[1]:sub(1, #ctx.prefix) == ctx.prefix then push { text = e[1], insert = e[2] } end\n" +
+    "      if e[1]:sub(1, #ctx.prefix) == ctx.prefix then ctx.push { text = e[1], insert = e[2] } end\n" +
     "    end\n" +
-    "    done()\n" +
     "  end }\n" +
     "nx.complete.setup { sources = { { 'buffer', min_chars = 2 }, { 'emoji' } } }"));
   // Fresh line, then a trigger-char prefix. `Esc` first to leave any prior mode.

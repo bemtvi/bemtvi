@@ -230,8 +230,11 @@ local function view_backend(opts)
         end,
         -- ctx.bo / ctx.wo — the view's buffer-local and window-local options, the same
         -- `vim.bo[buf]` / `vim.wo[win]` tables scoped to this view (e.g.
-        -- `ctx.bo.commentstring = "# %s"`, `ctx.wo.cursorline = true`, `ctx.wo.wrap =
-        -- false`). Valid in `setup` and handlers (the buffer + window exist by then).
+        -- `ctx.bo.shiftwidth = 2`, `ctx.bo.expandtab = true`; `ctx.wo.number = true`,
+        -- `ctx.wo.wrap = false`). Use the option's real scope — display options like
+        -- `number` / `wrap` are window-local (`wo`), content options like `shiftwidth` /
+        -- `expandtab` are buffer-local (`bo`). Valid in `setup` and handlers (the buffer +
+        -- window exist by then).
         bo = setmetatable({}, {
           __index = function(_, k)
             local b = v:bufnr()

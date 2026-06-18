@@ -1,0 +1,17 @@
+unified window geometry — viewport-relative size · alignment · margin
+
+One vocabulary, four surfaces:
+
+  • floats / nx.view   — width/height as cells or "50vw"/"30vh"/"50%",
+                         align = "top-right"/"center"/…, margin = a gap
+  • pickers            — same align + margin (no longer centered-only)
+  • the bottom panel   — fractional height + a margin from the edges
+
+Press the leader maps below (leader is the space bar):
+
+  <leader>gf   a 40vw × 40vh float, top-right, 2-cell margin
+  <leader>gc   a 60vw × 50vh float, centered
+  <leader>gp   a "colours" picker, bottom-left, 3-cell margin
+  <leader>gn   a 30vh bottom panel with a 1-cell edge gap
+
+Resize your terminal while a fractional float is open: it reflows.

@@ -230,11 +230,16 @@ fn undo_entry_value(e: &UndoEntry) -> Value {
     Value::Map(map)
 }
 
-/// Build a core [`FloatConfig`] from the validated string/number fields the float bridges
+/// Build a core [`FloatConfig`] from the validated string fields the float bridges
 /// carry (`WindowOp::OpenFloat`, `ViewOp::MountFloat`). The prelude already validated the
 /// enumerated strings against the supported set, so any unexpected value here is a bug —
 /// returned as `Err(msg)` for the caller to echo loudly rather than silently mispositioning.
 /// `cur_win` is the parent for `relative == "win"` when the caller passed `win == 0`.
+///
+/// `width`/`height` are size specs (cells or a `vw`/`vh`/`%` fraction); an empty /
+/// unparseable spec is an error (floats require a size). `align` is the high-level
+/// alignment keyword (`None` / empty ⇒ the low-level `anchor`/`row`/`col` form);
+/// `margin` is the `[top, right, bottom, left]` edge inset for an aligned float.
 #[allow(clippy::too_many_arguments)]
 fn build_float_config(
     relative: &str,
@@ -243,8 +248,10 @@ fn build_float_config(
     anchor: &str,
     row: i64,
     col: i64,
-    width: u64,
-    height: u64,
+    width: &str,
+    height: &str,
+    align: Option<&str>,
+    margin: [u64; 4],
     zindex: u32,
     focusable: bool,
     border: &str,
@@ -260,13 +267,18 @@ fn build_float_config(
         FloatAnchor::from_keyword(anchor).ok_or_else(|| format!("invalid 'anchor': '{anchor}'"))?;
     let border =
         BorderStyle::from_keyword(border).ok_or_else(|| format!("invalid 'border': '{border}'"))?;
+    let width = parse_extent(width).ok_or_else(|| format!("invalid 'width': '{width}'"))?;
+    let height = parse_extent(height).ok_or_else(|| format!("invalid 'height': '{height}'"))?;
+    let align = parse_align(align)?;
     Ok(FloatConfig {
         relative,
         anchor,
         row: row as isize,
         col: col as isize,
-        width: (width as usize).max(1),
-        height: (height as usize).max(1),
+        width,
+        height,
+        align,
+        margin: build_margin(margin),
         zindex,
         focusable,
         border,
@@ -274,11 +286,40 @@ fn build_float_config(
     })
 }
 
+/// Build a core [`Margin`] from the `[top, right, bottom, left]` cell counts the
+/// wire carries.
+pub(crate) fn build_margin(m: [u64; 4]) -> nxvim_core::Margin {
+    nxvim_core::Margin {
+        top: m[0] as usize,
+        right: m[1] as usize,
+        bottom: m[2] as usize,
+        left: m[3] as usize,
+    }
+}
+
+/// Parse the high-level alignment keyword into an `Option<Align>`: `None` / `""`
+/// ⇒ `None` (the low-level anchor/offset form), a known word ⇒ `Some(_)`, an
+/// unknown word ⇒ a loud `Err` (the prelude validated it, so this is a bug guard).
+pub(crate) fn parse_align(align: Option<&str>) -> Result<Option<nxvim_core::Align>, String> {
+    match align {
+        None | Some("") => Ok(None),
+        Some(word) => nxvim_core::Align::from_keyword(word)
+            .map(Some)
+            .ok_or_else(|| format!("invalid 'align': '{word}'")),
+    }
+}
+
 /// Translate a core [`FloatConfig`] into the [`FloatMirror`] the `nx._wins`
 /// mirror carries — the enums become the strings `nvim_win_get_config` returns,
 /// so nxvim-lua never sees the core's float types. The inverse of the
 /// `parse_float_config` / `WindowOp::OpenFloat` parse.
-fn float_mirror(cfg: FloatConfig) -> FloatMirror {
+///
+/// `width`/`height` are the **resolved** inner cells read off the laid-out window
+/// (the float's `Extent` is resolved against the live editor area every layout),
+/// so a fractional float reports its true on-screen size — matching neovim's
+/// integer `nvim_win_get_config` and self-healing on resize. The caller passes
+/// `window_content_size(id)`.
+fn float_mirror(cfg: FloatConfig, width: usize, height: usize) -> FloatMirror {
     let (relative, win) = match cfg.relative {
         FloatRelative::Editor => ("editor", 0),
         FloatRelative::Cursor => ("cursor", 0),
@@ -290,8 +331,9 @@ fn float_mirror(cfg: FloatConfig) -> FloatMirror {
         anchor: cfg.anchor.as_str().to_string(),
         row: cfg.row as i64,
         col: cfg.col as i64,
-        width: cfg.width as u64,
-        height: cfg.height as u64,
+        width: width as u64,
+        height: height as u64,
+        align: cfg.align.map(|a| a.as_str().to_string()),
         zindex: cfg.zindex as u64,
         focusable: cfg.focusable,
         border: cfg.border.as_str().to_string(),
@@ -421,6 +463,8 @@ impl EditHost {
                     col,
                     width,
                     height,
+                    align,
+                    margin,
                     zindex,
                     focusable,
                     border,
@@ -429,8 +473,20 @@ impl EditHost {
                 } => {
                     let cur_win = self.editor.current_window_id();
                     match build_float_config(
-                        &relative, win, cur_win, &anchor, row, col, width, height, zindex,
-                        focusable, &border, title,
+                        &relative,
+                        win,
+                        cur_win,
+                        &anchor,
+                        row,
+                        col,
+                        &width,
+                        &height,
+                        align.as_deref(),
+                        margin,
+                        zindex,
+                        focusable,
+                        &border,
+                        title,
                     ) {
                         Ok(config) => self.editor.mount_view_float(id, config, grab),
                         Err(e) => self.editor.echo(format!("nx.view:mount{{ float }}: {e}")),
@@ -451,9 +507,28 @@ impl EditHost {
                     lines,
                     filetype,
                     height,
+                    margin,
                 } => {
-                    self.editor
-                        .open_script_panel(name, lines, filetype, height.map(|h| h as usize))
+                    // An empty / absent height ⇒ `None` (the default listing height);
+                    // a present-but-unparseable spec is a loud echo, then default.
+                    let height = match height.as_deref() {
+                        None | Some("") => None,
+                        Some(spec) => match parse_extent(spec) {
+                            Some(e) => Some(e),
+                            None => {
+                                self.editor
+                                    .echo(format!("nx.panel.open: invalid 'height': '{spec}'"));
+                                None
+                            }
+                        },
+                    };
+                    self.editor.open_script_panel(
+                        name,
+                        lines,
+                        filetype,
+                        height,
+                        build_margin(margin),
+                    )
                 }
                 PanelOp::Close => self.editor.close_panel(),
             }
@@ -704,12 +779,23 @@ impl EditHost {
         // routed to the picker by `picker_active` (a picker and a `ui.select` are
         // the same widget, mutually exclusive).
         for req in self.lua.take_picker_opens() {
+            // A bad alignment word is a loud echo, then the picker opens centered
+            // rather than not at all (the prelude validates, so this is a guard).
+            let align = match parse_align(Some(req.align.as_str())) {
+                Ok(a) => a,
+                Err(e) => {
+                    self.editor.echo(format!("nx.picker.open: {e}"));
+                    None
+                }
+            };
             self.editor.open_picker(
                 nxvim_core::MenuPlacement::Editor,
                 req.dynamic,
                 req.preview,
-                parse_menu_extent(&req.width),
-                parse_menu_extent(&req.height),
+                parse_extent(&req.width),
+                parse_extent(&req.height),
+                align,
+                build_margin(req.margin),
                 if req.prompt_bottom {
                     nxvim_core::PromptPos::Bottom
                 } else {
@@ -1215,6 +1301,8 @@ impl EditHost {
                 col,
                 width,
                 height,
+                align,
+                margin,
                 zindex,
                 focusable,
                 border,
@@ -1227,8 +1315,20 @@ impl EditHost {
                 };
                 let cur_win = self.editor.current_window_id();
                 let config = match build_float_config(
-                    &relative, win, cur_win, &anchor, row, col, width, height, zindex, focusable,
-                    &border, title,
+                    &relative,
+                    win,
+                    cur_win,
+                    &anchor,
+                    row,
+                    col,
+                    &width,
+                    &height,
+                    align.as_deref(),
+                    margin,
+                    zindex,
+                    focusable,
+                    &border,
+                    title,
                 ) {
                     Ok(c) => c,
                     Err(e) => {
@@ -1247,6 +1347,8 @@ impl EditHost {
                 col,
                 width,
                 height,
+                align,
+                margin,
                 zindex,
                 focusable,
                 border,
@@ -1294,10 +1396,50 @@ impl EditHost {
                         }
                     }
                 }
+                // A size key present but unparseable is a loud error rather than a
+                // silent no-op (an absent key stays `None` ⇒ unchanged).
+                if let Some(spec_str) = width.as_deref() {
+                    match parse_extent(spec_str) {
+                        Some(e) => spec.width = Some(e),
+                        None => {
+                            self.editor.echo(format!(
+                                "nvim_win_set_config: invalid 'width': '{spec_str}'"
+                            ));
+                            return;
+                        }
+                    }
+                }
+                if let Some(spec_str) = height.as_deref() {
+                    match parse_extent(spec_str) {
+                        Some(e) => spec.height = Some(e),
+                        None => {
+                            self.editor.echo(format!(
+                                "nvim_win_set_config: invalid 'height': '{spec_str}'"
+                            ));
+                            return;
+                        }
+                    }
+                }
+                // `align`: absent ⇒ unchanged; `""` ⇒ clear to anchor/offset form;
+                // a word ⇒ set it (a bad word is a loud error).
+                if let Some(word) = align.as_deref() {
+                    if word.is_empty() {
+                        spec.align = Some(None);
+                    } else {
+                        match nxvim_core::Align::from_keyword(word) {
+                            Some(a) => spec.align = Some(Some(a)),
+                            None => {
+                                self.editor.echo(format!(
+                                    "nvim_win_set_config: invalid 'align': '{word}'"
+                                ));
+                                return;
+                            }
+                        }
+                    }
+                }
+                spec.margin = margin.map(build_margin);
                 spec.row = row.map(|v| v as isize);
                 spec.col = col.map(|v| v as isize);
-                spec.width = width.map(|v| v as usize);
-                spec.height = height.map(|v| v as usize);
                 spec.zindex = zindex;
                 spec.focusable = focusable;
                 spec.title = title.map(Some);
@@ -1508,7 +1650,10 @@ impl EditHost {
                     // `winsaveview()` reports `topline` 1-based; `top` is 0-based.
                     topline: (top + 1) as u64,
                     leftcol: leftcol as u64,
-                    float: self.editor.window_float_config(id).map(float_mirror),
+                    float: self
+                        .editor
+                        .window_float_config(id)
+                        .map(|cfg| float_mirror(cfg, cw, ch)),
                     jumps: jumps
                         .into_iter()
                         .map(|(bufnr, line, col)| JumpMirror {
@@ -2668,11 +2813,14 @@ fn hl_def(hl: &HlSet) -> HlDef {
     }
 }
 
-/// Parse a `nx.picker` size spec into a [`MenuExtent`](nxvim_core::MenuExtent), or
-/// `None` (use the picker default) for an empty / unparseable spec. A bare integer
-/// is a cell count (`"100"`); a `vw` / `vh` / `%` suffix is a CSS-style viewport
-/// fraction (`"80vw"` → 80% of the viewport dimension), clamped to a sane range.
-fn parse_menu_extent(spec: &str) -> Option<nxvim_core::MenuExtent> {
+/// Parse a size spec into an [`Extent`](nxvim_core::Extent), or `None` for an
+/// empty / unparseable spec (the caller chooses what `None` means — the picker
+/// default, or a loud error for a float that requires a size). The single size
+/// parser shared by every surface (pickers, floats, `nx.view`, the panel). A bare
+/// integer is a cell count (`"100"`); a `vw` / `vh` / `%` suffix is a CSS-style
+/// viewport fraction (`"80vw"` → 80% of the reference dimension), clamped to a sane
+/// range so a fat-fingered `"500%"` can't paint off-screen.
+pub(crate) fn parse_extent(spec: &str) -> Option<nxvim_core::Extent> {
     let spec = spec.trim();
     if spec.is_empty() {
         return None;
@@ -2686,7 +2834,7 @@ fn parse_menu_extent(spec: &str) -> Option<nxvim_core::MenuExtent> {
             .trim()
             .parse::<f32>()
             .ok()
-            .map(|n| nxvim_core::MenuExtent::Frac((n / 100.0).clamp(0.1, 1.0)));
+            .map(|n| nxvim_core::Extent::Frac((n / 100.0).clamp(0.1, 1.0)));
     }
-    spec.parse::<u16>().ok().map(nxvim_core::MenuExtent::Cells)
+    spec.parse::<u16>().ok().map(nxvim_core::Extent::Cells)
 }

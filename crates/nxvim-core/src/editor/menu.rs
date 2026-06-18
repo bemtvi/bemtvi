@@ -76,23 +76,27 @@ pub enum PromptPos {
     Bottom,
 }
 
-/// A picker box dimension: a fixed size, never content-derived (a content-hugging
-/// picker looks ragged). Resolved against the editor viewport at projection time.
-/// `Cells` is an absolute column/row count; `Frac` is a fraction `(0, 1]` of the
-/// relevant viewport dimension — the CSS `vw`/`vh` analogue (`"80vw"` → `0.8`).
+/// One axis of a window's size — the shared geometry primitive used by every
+/// surface (picker / select menus, floats, `nx.view`, the panel). A fixed size,
+/// never content-derived (a content-hugging picker looks ragged). Resolved against
+/// the relevant reference dimension (the editor viewport, almost always) at
+/// projection / layout time, so a fractional size **reflows on resize**. `Cells`
+/// is an absolute column/row count; `Frac` is a fraction `(0, 1]` of the reference
+/// dimension — the CSS `vw`/`vh` analogue (`"80vw"` → `0.8`).
 #[derive(Clone, Copy, Debug, PartialEq)]
-pub enum MenuExtent {
+pub enum Extent {
     Cells(u16),
     Frac(f32),
 }
 
-impl MenuExtent {
-    /// Resolve to a concrete cell count against a `viewport` dimension (columns or
-    /// rows). A fraction rounds to the nearest cell, floored at 1.
-    pub fn resolve(self, viewport: usize) -> usize {
+impl Extent {
+    /// Resolve to a concrete cell count against a `reference` dimension (the
+    /// viewport columns or rows). A fraction rounds to the nearest cell, floored
+    /// at 1.
+    pub fn resolve(self, reference: usize) -> usize {
         match self {
-            MenuExtent::Cells(c) => c as usize,
-            MenuExtent::Frac(f) => ((viewport as f32) * f).round().max(1.0) as usize,
+            Extent::Cells(c) => c as usize,
+            Extent::Frac(f) => ((reference as f32) * f).round().max(1.0) as usize,
         }
     }
 }
@@ -323,9 +327,13 @@ pub(crate) struct Menu {
     /// push from a superseded source run is dropped.
     generation: u64,
     /// The picker box's fixed width / height (`Editor` placement only); `None`
-    /// falls back to the picker default. Never content-derived. See [`MenuExtent`].
-    width: Option<MenuExtent>,
-    height: Option<MenuExtent>,
+    /// falls back to the picker default. Never content-derived. See [`Extent`].
+    width: Option<Extent>,
+    height: Option<Extent>,
+    /// Where an `Editor`-placement picker aligns within the editor area, inset by
+    /// `margin`. `None` ⇒ centered (the historical placement). See [`Align`].
+    align: Option<Align>,
+    margin: Margin,
     /// The generation the currently-displayed `all_items` belong to. A dynamic
     /// query edit bumps `generation` but does **not** clear the list — the old
     /// results stay until the new search's first result (or completion) arrives;
@@ -528,6 +536,8 @@ impl Editor {
             items_gen: 0,
             width: None,
             height: None,
+            align: None,
+            margin: Margin::default(),
         };
         menu.refilter();
         self.menu = Some(menu);
@@ -536,16 +546,20 @@ impl Editor {
     /// Open a fuzzy picker (`nx.picker`): a centered float with a prompt that grabs
     /// input. Starts empty — the source streams candidates in via
     /// [`Editor::menu_push`]. `dynamic` selects forward-the-query (live grep) over
-    /// local fuzzy matching. `width` / `height` fix the box size ([`MenuExtent`],
-    /// `None` ⇒ the picker default) — never content-derived. The server invokes the
-    /// source's initial run after opening (query `""`, generation `0`).
+    /// local fuzzy matching. `width` / `height` fix the box size ([`Extent`],
+    /// `None` ⇒ the picker default) — never content-derived. `align` / `margin`
+    /// place the box within the editor area (`None` align ⇒ centered). The server
+    /// invokes the source's initial run after opening (query `""`, generation `0`).
+    #[allow(clippy::too_many_arguments)]
     pub fn open_picker(
         &mut self,
         placement: MenuPlacement,
         dynamic: bool,
         preview: bool,
-        width: Option<MenuExtent>,
-        height: Option<MenuExtent>,
+        width: Option<Extent>,
+        height: Option<Extent>,
+        align: Option<Align>,
+        margin: Margin,
         prompt_pos: PromptPos,
     ) {
         self.menu = Some(Menu {
@@ -569,6 +583,8 @@ impl Editor {
             items_gen: 0,
             width,
             height,
+            align,
+            margin,
         });
     }
 
@@ -637,6 +653,8 @@ impl Editor {
             items_gen: 0,
             width: None,
             height: None,
+            align: None,
+            margin: Margin::default(),
         });
     }
 
@@ -879,6 +897,8 @@ impl Editor {
             items_gen: gen,
             width: None,
             height: None,
+            align: None,
+            margin: Margin::default(),
         });
     }
 
@@ -1170,6 +1190,8 @@ impl Editor {
                 preview_scroll: m.preview_scroll,
                 width: m.width,
                 height: m.height,
+                align: m.align,
+                margin: m.margin,
                 anchor_offset: m.anchor_width,
                 completion: m.kind == MenuKind::Complete,
                 selected_active: m.selected_active,

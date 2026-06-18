@@ -252,6 +252,9 @@ function nx.win.config(win)
     focusable = f.focusable,
     border = f.border,
   }
+  if f.align then
+    cfg.align = f.align
+  end
   if f.win then
     cfg.win = f.win
   end

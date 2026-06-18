@@ -450,6 +450,126 @@ async fn view_mounts_in_a_float() {
     );
 }
 
+/// A view float sized with viewport fractions (`"50vw"`/`"50vh"`) and placed by the
+/// high-level `align` resolves the same way a picker does — and because the `Extent`
+/// is resolved against the live editor area **every layout**, it reflows on resize.
+/// `nvim_win_get_config` reports the resolved inner cells (not the raw spec) and the
+/// alignment word.
+#[tokio::test]
+async fn view_float_frac_size_aligns_and_reflows_on_resize() {
+    let (rpc, _incoming) = start().await; // 80 x 24
+    feed_sync(&rpc, "imain<Esc>").await;
+    exec_lua(
+        &rpc,
+        r#"vw = nx.view.create{}
+           vw:set_lines{ "x" }
+           vw:mount{ float = { width = '50vw', height = '50vh', align = 'center' } }"#,
+    )
+    .await;
+
+    // The float is focused (win 0). Its reported size is resolved cells; ~50% of 80.
+    let w0 = lua_u64(&rpc, "return vim.api.nvim_win_get_config(0).width")
+        .await
+        .expect("a resolved width");
+    let align = exec_lua(&rpc, "return vim.api.nvim_win_get_config(0).align").await;
+    assert_eq!(align.as_str(), Some("center"), "the align word round-trips");
+    assert!(
+        (34..=42).contains(&w0),
+        "50vw of an 80-col screen ≈ 40 resolved cells, got {w0}"
+    );
+
+    // Grow the UI: the fractional float re-resolves against the larger viewport.
+    rpc.request(
+        "nx_ui_try_resize",
+        vec![Value::from(120u64), Value::from(40u64)],
+    )
+    .await
+    .expect("resize");
+    rpc.request("nvim_get_mode", vec![]).await.expect("barrier");
+    let w1 = lua_u64(&rpc, "return vim.api.nvim_win_get_config(0).width")
+        .await
+        .expect("a resolved width after resize");
+    assert!(
+        w1 > w0 + 10,
+        "50vw reflows on resize (got {w0} -> {w1}, expected ~60)"
+    );
+}
+
+/// The shipped `examples/window-geometry` config loads and its `<leader>gf` map
+/// opens a real, aligned, fractionally-sized float — proving the unified geometry
+/// works end-to-end through the demo config a user would copy.
+#[tokio::test]
+async fn example_window_geometry_config_opens_an_aligned_float() {
+    let example = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../examples/window-geometry")
+        .canonicalize()
+        .expect("example dir");
+    let init = ServerInit {
+        config_dir: Some(example.clone()),
+        runtimepath: vec![example],
+        ..Default::default()
+    };
+    let (rpc, _incoming) = start_attached(init, 80, 24).await;
+    feed_sync(&rpc, "imain<Esc>").await;
+    assert_eq!(win_count(&rpc).await, 1);
+
+    // `<leader>gf` (leader = space) opens the top-right 40vw × 40vh float.
+    feed_sync(&rpc, " gf").await;
+    assert_eq!(win_count(&rpc).await, 2, "the demo float opened a window");
+    let align = exec_lua(&rpc, "return vim.api.nvim_win_get_config(0).align").await;
+    assert_eq!(
+        align.as_str(),
+        Some("top-right"),
+        "the demo float is aligned top-right"
+    );
+    let w = lua_u64(&rpc, "return vim.api.nvim_win_get_config(0).width")
+        .await
+        .expect("resolved width");
+    assert!((28..=36).contains(&w), "40vw of 80 cols ≈ 32, got {w}");
+}
+
+/// A cell-sized `nvim_open_win` float round-trips its width/height **exactly**
+/// through `nvim_win_get_config` (an integer stays `Extent::Cells(n)`, resolved back
+/// to `n`) — the neovim-compat guarantee the unified geometry must not break.
+#[tokio::test]
+async fn nvim_open_win_cell_size_round_trips_exactly() {
+    let (rpc, _incoming) = start().await;
+    feed_sync(&rpc, "imain<Esc>").await;
+    let config = Value::Map(vec![
+        (Value::from("relative"), Value::from("editor")),
+        (Value::from("row"), Value::from(2u64)),
+        (Value::from("col"), Value::from(3u64)),
+        (Value::from("width"), Value::from(40u64)),
+        (Value::from("height"), Value::from(10u64)),
+    ]);
+    let win = rpc
+        .request(
+            "nvim_open_win",
+            vec![Value::from(0u64), Value::from(true), config],
+        )
+        .await
+        .expect("open_win");
+    let win = win.as_u64().expect("a window handle");
+
+    let got = rpc
+        .request("nvim_win_get_config", vec![Value::from(win)])
+        .await
+        .expect("get_config");
+    let Value::Map(m) = got else {
+        panic!("expected a config map, got {got:?}")
+    };
+    assert_eq!(
+        map_get(&m, "width").and_then(Value::as_u64),
+        Some(40),
+        "an integer width round-trips exactly"
+    );
+    assert_eq!(
+        map_get(&m, "height").and_then(Value::as_u64),
+        Some(10),
+        "an integer height round-trips exactly"
+    );
+}
+
 /// A **grabbing** float view (`grab = true`, the default) hard-locks focus exactly
 /// like the panel: `<C-w>w` / `<C-w>j` can't leave it.
 #[tokio::test]

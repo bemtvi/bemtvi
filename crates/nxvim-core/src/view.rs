@@ -237,11 +237,17 @@ pub struct MenuView {
     /// `None` on every frame that doesn't carry the gesture. Always `None` for a
     /// preview-less picker / `nx.ui.select`.
     pub preview_scroll: Option<crate::editor::PreviewScroll>,
-    /// The picker box's fixed width / height ([`MenuExtent`](crate::editor::MenuExtent),
+    /// The picker box's fixed width / height ([`Extent`](crate::editor::Extent),
     /// `None` ⇒ the picker default), resolved against the viewport by the server at
     /// projection time. Both `None` for a content-anchored `nx.ui.select`.
-    pub width: Option<crate::editor::MenuExtent>,
-    pub height: Option<crate::editor::MenuExtent>,
+    pub width: Option<crate::editor::Extent>,
+    pub height: Option<crate::editor::Extent>,
+    /// Where the box aligns within the editor area ([`Align`](crate::editor::Align)),
+    /// inset by [`margin`](Self::margin). `None` ⇒ centered (the historical picker
+    /// placement). Only honored for `Editor`-placement menus.
+    pub align: Option<crate::editor::Align>,
+    /// Edge inset (cells) for an aligned picker box; ignored when `align` is `None`.
+    pub margin: crate::editor::Margin,
     /// Screen columns to shift a `Cursor`-placed completion popup **left** of the
     /// cursor, so the list anchors under the start of the word being completed
     /// rather than under the caret — the display width of the typed prefix. `0`

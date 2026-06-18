@@ -30,6 +30,12 @@ pub(crate) struct PanelState {
     /// The window that was focused when the panel opened, refocused on close so the
     /// panel feels transient (open → interact → dismiss → back where you were).
     pub prev_window: WindowId,
+    /// A gap (cells) from the editor edges, so a scripted panel needn't kiss the
+    /// border. The panel is a tiled bottom window with no native inset concept, so
+    /// [`Editor::relayout`] applies this as a one-off shrink of the panel window's
+    /// rect after layout. `top` is unused (the panel's top edge is its height).
+    /// `Margin::default()` (no gap) for the built-in listings.
+    pub margin: Margin,
 }
 
 impl Editor {
@@ -56,6 +62,7 @@ impl Editor {
         self.panel = Some(PanelState {
             window,
             prev_window,
+            margin: Margin::default(),
         });
     }
 
@@ -123,20 +130,39 @@ impl Editor {
     /// `FileType` autocmd maps `q`/`<Esc>` to dismiss; a plugin passing its own filetype
     /// wires its own keys) drives any behavior. Behavior is attached the same way every
     /// listing does it — a `FileType` autocmd over an ordinary buffer, never a callback.
+    /// `height` is an [`Extent`] (rows or a `vh`/`%` fraction of the editor height,
+    /// resolved here); `margin` is a gap from the editor edges (the panel stays
+    /// bottom-anchored but needn't kiss the border). `None` height ⇒ the default
+    /// listing height.
     pub fn open_script_panel(
         &mut self,
         name: Option<String>,
         lines: Vec<String>,
         filetype: Option<String>,
-        height: Option<usize>,
+        height: Option<Extent>,
+        margin: Margin,
     ) {
+        // Resolve a fractional height against the editor screen height (`vh`), like
+        // a fractional float resolves against the viewport. The bottom panel then
+        // reflows proportionally on resize, as every tiled window does.
+        let height = height
+            .map(|e| e.resolve(self.height))
+            .unwrap_or(super::buffers::LISTING_HEIGHT)
+            .max(1);
         self.open_named_panel(
             name.as_deref().unwrap_or("[Panel]"),
             lines,
             0,
             filetype.as_deref().unwrap_or("nxpanel"),
-            height.unwrap_or(super::buffers::LISTING_HEIGHT),
+            height,
         );
+        // Record the requested gap and re-lay so the inset (applied at the end of
+        // `relayout`) takes effect on this first frame.
+        if let Some(p) = self.panel.as_mut() {
+            p.margin = margin;
+        }
+        self.relayout();
+        self.ensure_visible();
     }
 
     /// Dismiss the open panel (a no-op if none): collapse its overlay, restoring the

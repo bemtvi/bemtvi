@@ -1341,8 +1341,18 @@ impl EditHost {
                         e.resolve(text_height)
                     })
                     .clamp(chrome + 1, max_h);
-                let row = text_height.saturating_sub(height + 2) / 2;
-                let col = text_width.saturating_sub(width + 2) / 2;
+                // Align the box within the text area, inset by the margin. The
+                // default (`align == None`) is `Center` — the historical centered
+                // picker placement. The `+2` accounts for the box's own border, so
+                // the *outer* box (border included) is what gets aligned.
+                let align = m.align.unwrap_or(nxvim_core::Align::Center);
+                let (col, row) = nxvim_core::place_aligned(
+                    (0, 0, text_width, text_height),
+                    width + 2,
+                    height + 2,
+                    align,
+                    m.margin,
+                );
                 // Scroll the window so the selected row stays visible, clamped to the end,
                 // and send `selected` rebased into that window (the client renders the
                 // window directly). Only `list_rows` rows are cloned, never all `total`.

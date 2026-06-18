@@ -112,6 +112,24 @@ nx.dock.open = function(o)
   end
 end
 
+-- Wrap `nx.panel.open` (the Rust bridge) so its geometry rides the shared
+-- `nx._geom` vocabulary like every other surface: `height` accepts cells or a
+-- viewport fraction ("30vh" / "50%"), and `margin` accepts a number / {v,h} /
+-- {t,r,b,l} / {top=, …} — all normalized to the wire shape the bridge expects
+-- (a height string, a `[top, right, bottom, left]` margin array). The panel stays
+-- bottom-anchored; `margin` is a gap from the screen edges (top is ignored).
+local _panel_open_raw = nx.panel.open
+nx.panel.open = function(opts)
+  opts = opts or {}
+  local o = {}
+  for k, v in pairs(opts) do
+    o[k] = v
+  end
+  o.height = nx._geom.size(opts.height)
+  o.margin = nx._geom.margin(opts.margin)
+  return _panel_open_raw(o)
+end
+
 -- Dock ex-commands — thin wrappers over the Rust-backed `nx.dock.*` surface
 -- (installed before the prelude), dogfooding the nx API. `:DockOpen {side} [size]`
 -- opens/focuses a permanent edge panel; `:DockClose`/`:DockFocus {side}` address it.

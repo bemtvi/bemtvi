@@ -81,6 +81,125 @@ impl FloatAnchor {
     }
 }
 
+/// Where a box sits inside its reference bounds — the high-level **alignment**
+/// shared by every surface (floats, `nx.view`, pickers, the panel). A 9-grid:
+/// pick a vertical band (top / middle / bottom) and a horizontal band (left /
+/// center / right). This is sugar over the low-level [`FloatAnchor`] + `row`/`col`
+/// offset — `place_aligned` turns `(align, margin)` into the box's top-left — so a
+/// surface exposes one word (`"top-right"`) instead of an anchor-plus-offset.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Align {
+    TopLeft,
+    Top,
+    TopRight,
+    Left,
+    Center,
+    Right,
+    BottomLeft,
+    Bottom,
+    BottomRight,
+}
+
+impl Align {
+    /// The hyphenated keyword for this alignment — the inverse of
+    /// [`Self::from_keyword`], the single source of truth shared by the RPC and
+    /// Lua-effect parsers.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Align::TopLeft => "top-left",
+            Align::Top => "top",
+            Align::TopRight => "top-right",
+            Align::Left => "left",
+            Align::Center => "center",
+            Align::Right => "right",
+            Align::BottomLeft => "bottom-left",
+            Align::Bottom => "bottom",
+            Align::BottomRight => "bottom-right",
+        }
+    }
+
+    /// Parse an alignment keyword — the inverse of [`Self::as_str`]. `None` for an
+    /// unrecognized word; each caller reports its own context-specific error (per
+    /// the no-silent-fallback rule). `"centre"` is accepted as a spelling alias.
+    pub fn from_keyword(s: &str) -> Option<Self> {
+        Some(match s {
+            "top-left" => Align::TopLeft,
+            "top" => Align::Top,
+            "top-right" => Align::TopRight,
+            "left" => Align::Left,
+            "center" | "centre" => Align::Center,
+            "right" => Align::Right,
+            "bottom-left" => Align::BottomLeft,
+            "bottom" => Align::Bottom,
+            "bottom-right" => Align::BottomRight,
+            _ => return None,
+        })
+    }
+
+    /// The vertical band: `0` = top, `1` = middle, `2` = bottom.
+    fn vband(self) -> u8 {
+        match self {
+            Align::TopLeft | Align::Top | Align::TopRight => 0,
+            Align::Left | Align::Center | Align::Right => 1,
+            Align::BottomLeft | Align::Bottom | Align::BottomRight => 2,
+        }
+    }
+
+    /// The horizontal band: `0` = left, `1` = center, `2` = right.
+    fn hband(self) -> u8 {
+        match self {
+            Align::TopLeft | Align::Left | Align::BottomLeft => 0,
+            Align::Top | Align::Center | Align::Bottom => 1,
+            Align::TopRight | Align::Right | Align::BottomRight => 2,
+        }
+    }
+}
+
+/// An inset, in cells, from each edge of the reference bounds — so an aligned box
+/// can sit in a corner *without touching the screen edge* (`margin = 2` on a
+/// `"top-right"` float leaves a two-cell gap above and to the right). The relevant
+/// edges depend on the alignment: a `top-right` box honors `top` + `right`, a
+/// centered box ignores all four (the centering math already balances it).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Margin {
+    pub top: usize,
+    pub right: usize,
+    pub bottom: usize,
+    pub left: usize,
+}
+
+/// The top-left cell of a `w`×`h` box placed by `align` inside the bounds
+/// `(x, y, width, height)`, inset by `margin`. The single placement routine shared
+/// by [`place_float`] (the float layer) and the server's picker/menu projection
+/// (which works in plain ints, not the crate-private [`Rect`]), so every surface
+/// aligns identically. Left/top bands anchor to the low edge plus the margin;
+/// right/bottom bands anchor to the high edge minus the box minus the margin; the
+/// center band splits the leftover evenly (margin-independent). The result is
+/// clamped so the box stays within the bounds.
+pub fn place_aligned(
+    bounds: (usize, usize, usize, usize),
+    w: usize,
+    h: usize,
+    align: Align,
+    margin: Margin,
+) -> (usize, usize) {
+    let (bx, by, bw, bh) = bounds;
+    let pos = |band: u8, lo: usize, span: usize, size: usize, near: usize, far: usize| -> usize {
+        let p = match band {
+            0 => lo as isize + near as isize,
+            2 => (lo + span) as isize - size as isize - far as isize,
+            _ => lo as isize + (span as isize - size as isize) / 2,
+        };
+        // Clamp the box fully inside the bounds (a box larger than the span pins to
+        // the low edge rather than spilling off-screen).
+        let hi = (lo + span).saturating_sub(size).max(lo) as isize;
+        p.clamp(lo as isize, hi).max(0) as usize
+    };
+    let x = pos(align.hband(), bx, bw, w, margin.left, margin.right);
+    let y = pos(align.vband(), by, bh, h, margin.top, margin.bottom);
+    (x, y)
+}
+
 /// A float's border style (`nvim_open_win`'s `border`). The *width* of the border
 /// (one cell on each side when present) is part of the geometry — a bordered
 /// float's inner text area is `width - 2 × height - 2` — so it is carried from
@@ -136,14 +255,30 @@ impl BorderStyle {
 /// Not `Copy`: `title` owns a `String`. Read it through `Window::float`'s
 /// `Option<FloatConfig>` by reference (or `.clone()` where an owned value is
 /// needed) — see [`Editor::window_float_config`].
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// `width`/`height` are [`Extent`]s (cells *or* a viewport fraction), resolved
+/// against the editor area in [`place_float`] **every layout**, so a fractional
+/// float reflows on resize. `align` is the high-level placement: `Some` ⇒ the box
+/// is positioned by [`place_aligned`] (`anchor`/`row`/`col` ignored), `None` ⇒ the
+/// low-level `nvim_open_win` `anchor` + `row`/`col` offset from the `relative`
+/// origin. `margin` insets an aligned box from the edges.
+///
+/// Not `Eq` (an [`Extent::Frac`] holds an `f32`); compared by `PartialEq` only —
+/// the same shape as [`crate::view::MenuView`].
+#[derive(Debug, Clone, PartialEq)]
 pub struct FloatConfig {
     pub relative: FloatRelative,
     pub anchor: FloatAnchor,
     pub row: isize,
     pub col: isize,
-    pub width: usize,
-    pub height: usize,
+    pub width: Extent,
+    pub height: Extent,
+    /// High-level alignment within the `relative` bounds; `Some` supersedes
+    /// `anchor`/`row`/`col`. The unified geometry surface sets this from the
+    /// `align` keyword; `nvim_open_win`'s anchor/offset form leaves it `None`.
+    pub align: Option<Align>,
+    /// Edge inset (cells) for an aligned box; ignored when `align` is `None`.
+    pub margin: Margin,
     /// Stacking order; higher floats paint over lower ones. Neovim's default is
     /// 50. Ties break by window id (creation order).
     pub zindex: u32,
@@ -164,8 +299,10 @@ impl Default for FloatConfig {
             anchor: FloatAnchor::NW,
             row: 0,
             col: 0,
-            width: 1,
-            height: 1,
+            width: Extent::Cells(1),
+            height: Extent::Cells(1),
+            align: None,
+            margin: Margin::default(),
             zindex: 50,
             focusable: true,
             border: BorderStyle::None,
@@ -191,8 +328,12 @@ pub struct WindowConfigSpec {
     pub anchor: Option<FloatAnchor>,
     pub row: Option<isize>,
     pub col: Option<isize>,
-    pub width: Option<usize>,
-    pub height: Option<usize>,
+    pub width: Option<Extent>,
+    pub height: Option<Extent>,
+    /// High-level alignment update: `Some(Some(a))` sets it, `Some(None)` clears
+    /// it back to the `anchor`/`row`/`col` form, `None` leaves it unchanged.
+    pub align: Option<Option<Align>>,
+    pub margin: Option<Margin>,
     pub zindex: Option<u32>,
     pub focusable: Option<bool>,
     pub border: Option<BorderStyle>,
@@ -509,31 +650,56 @@ impl WindowTree {
 /// `cfg.width`/`cfg.height` are the **inner content** area (neovim's
 /// `nvim_open_win` semantics); the border, when present, is drawn *outside* it, so
 /// the outer box this rect describes is the content plus one border cell per side.
-/// `nvim_win_get_config` keeps reporting the inner dimensions (they are what
-/// `FloatConfig` stores) — only the placement grows by the border here. A float
-/// larger than `bounds` pins to the top-left rather than shrinking.
+/// They are [`Extent`]s resolved against `bounds` (the editor area, the "viewport")
+/// **here, every layout** — so a fractional float reflows on resize. Resolving
+/// against `bounds` rather than `origin` is deliberate: `origin` is zero-size for
+/// `relative = cursor`, which would collapse every fractional cursor float to one
+/// cell.
+///
+/// Placement has two modes. When `cfg.align` is `Some`, the box is positioned by
+/// [`place_aligned`] within `bounds`, inset by `cfg.margin` (the high-level unified
+/// geometry; `anchor`/`row`/`col` are ignored). Otherwise the low-level
+/// `nvim_open_win` form: apply the `row`/`col` offset from the origin's top-left,
+/// shift so the `anchor` corner lands there (an `E` anchor subtracts the width, an
+/// `S` anchor the height), then clamp on-screen.
+///
+/// `nvim_win_get_config` reports the resolved inner cells off the laid-out rect
+/// (see `float_mirror` / `win_config_value`), not the raw `Extent`. A float larger
+/// than `bounds` pins to the top-left rather than shrinking.
 fn place_float(origin: Rect, bounds: Rect, cfg: &FloatConfig) -> Rect {
     let border = if cfg.border != BorderStyle::None {
         2
     } else {
         0
     };
-    let w = cfg.width.max(1) + border;
-    let h = cfg.height.max(1) + border;
-    let mut x = origin.x as isize + cfg.col;
-    let mut y = origin.y as isize + cfg.row;
-    if matches!(cfg.anchor, FloatAnchor::NE | FloatAnchor::SE) {
-        x -= w as isize;
-    }
-    if matches!(cfg.anchor, FloatAnchor::SW | FloatAnchor::SE) {
-        y -= h as isize;
-    }
-    let lo_x = bounds.x as isize;
-    let lo_y = bounds.y as isize;
-    let hi_x = ((bounds.x + bounds.width).saturating_sub(w) as isize).max(lo_x);
-    let hi_y = ((bounds.y + bounds.height).saturating_sub(h) as isize).max(lo_y);
-    let x = x.clamp(lo_x, hi_x).max(0) as usize;
-    let y = y.clamp(lo_y, hi_y).max(0) as usize;
+    let w = cfg.width.resolve(bounds.width).max(1) + border;
+    let h = cfg.height.resolve(bounds.height).max(1) + border;
+    let (x, y) = if let Some(align) = cfg.align {
+        place_aligned(
+            (bounds.x, bounds.y, bounds.width, bounds.height),
+            w,
+            h,
+            align,
+            cfg.margin,
+        )
+    } else {
+        let mut x = origin.x as isize + cfg.col;
+        let mut y = origin.y as isize + cfg.row;
+        if matches!(cfg.anchor, FloatAnchor::NE | FloatAnchor::SE) {
+            x -= w as isize;
+        }
+        if matches!(cfg.anchor, FloatAnchor::SW | FloatAnchor::SE) {
+            y -= h as isize;
+        }
+        let lo_x = bounds.x as isize;
+        let lo_y = bounds.y as isize;
+        let hi_x = ((bounds.x + bounds.width).saturating_sub(w) as isize).max(lo_x);
+        let hi_y = ((bounds.y + bounds.height).saturating_sub(h) as isize).max(lo_y);
+        (
+            x.clamp(lo_x, hi_x).max(0) as usize,
+            y.clamp(lo_y, hi_y).max(0) as usize,
+        )
+    };
     Rect {
         x,
         y,
@@ -1449,8 +1615,8 @@ impl Editor {
             None => {
                 let (_, _, w, h) = self.window_rect(id).unwrap_or((0, 0, 1, 1));
                 FloatConfig {
-                    width: w.max(1),
-                    height: h.max(1),
+                    width: Extent::Cells(w.max(1).min(u16::MAX as usize) as u16),
+                    height: Extent::Cells(h.max(1).min(u16::MAX as usize) as u16),
                     ..FloatConfig::default()
                 }
             }
@@ -1468,10 +1634,16 @@ impl Editor {
             cfg.col = v;
         }
         if let Some(v) = spec.width {
-            cfg.width = v.max(1);
+            cfg.width = v;
         }
         if let Some(v) = spec.height {
-            cfg.height = v.max(1);
+            cfg.height = v;
+        }
+        if let Some(v) = spec.align {
+            cfg.align = v;
+        }
+        if let Some(v) = spec.margin {
+            cfg.margin = v;
         }
         if let Some(v) = spec.zindex {
             cfg.zindex = v;
@@ -2388,6 +2560,31 @@ impl Editor {
             if let Some(t) = self.layer_tree_mut(layer) {
                 t.layout(rect, off);
             }
+        }
+        self.apply_panel_margin();
+    }
+
+    /// Shrink the open panel's window rect by its requested `margin` (a gap from the
+    /// editor edges). The panel is an ordinary tiled bottom window — the layout has
+    /// no inset concept — so this is a one-off post-layout adjustment of just that
+    /// one window's rect; the vacated cells fall through to whatever is beneath,
+    /// reading as a floating strip with a gap. `top` is ignored (the panel's top
+    /// edge is set by its height, not an inset). A no-op when no panel is open or
+    /// the margin is zero (the built-in listings).
+    fn apply_panel_margin(&mut self) {
+        let Some(p) = self.panel else { return };
+        let m = p.margin;
+        if m.left == 0 && m.right == 0 && m.bottom == 0 {
+            return;
+        }
+        if let Some(w) = self.windows.windows.get_mut(&p.window) {
+            let r = w.rect;
+            w.rect = Rect {
+                x: r.x + m.left,
+                y: r.y,
+                width: r.width.saturating_sub(m.left + m.right).max(1),
+                height: r.height.saturating_sub(m.bottom).max(1),
+            };
         }
     }
 

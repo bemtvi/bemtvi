@@ -141,6 +141,47 @@ async fn nx_panel_open_mounts_a_scripted_panel_with_buffer_local_keys() {
     );
 }
 
+#[tokio::test]
+async fn nx_panel_open_honors_fractional_height_and_margin() {
+    // The unified geometry reaches the bottom panel: `height` accepts a viewport
+    // fraction ("40vh"), and `margin` insets the panel from the screen edges so it
+    // needn't kiss the border. The panel stays bottom-anchored.
+    let (rpc, _incoming) = start(None).await; // 80 x 25
+
+    // 40vh of a 25-row screen ≈ 10 rows (the reported content height drops the
+    // panel's own status row).
+    exec_lua(
+        &rpc,
+        r#"nx.panel.open{ lines = { "a", "b" }, height = "40vh" }"#,
+    )
+    .await;
+    assert!(panel_is_open(&rpc).await, "a frac-height panel opens");
+    let h = lua_u64(&rpc, "return vim.api.nvim_win_get_height(0)")
+        .await
+        .expect("panel height");
+    assert!((7..=11).contains(&h), "40vh of 25 rows ≈ 10, got {h}");
+    let w_full = lua_u64(&rpc, "return vim.api.nvim_win_get_width(0)")
+        .await
+        .expect("panel width");
+    exec_lua(&rpc, "nx.panel.close()").await;
+
+    // A margin insets the panel from the left/right edges → narrower than full width.
+    // A scalar margin's horizontal gap is 2x the value (cells are ~2x taller than
+    // wide), so margin = 4 leaves an 8-cell gap on each side (16 cells total).
+    exec_lua(
+        &rpc,
+        r#"nx.panel.open{ lines = { "a", "b" }, height = "40vh", margin = 4 }"#,
+    )
+    .await;
+    let w_margin = lua_u64(&rpc, "return vim.api.nvim_win_get_width(0)")
+        .await
+        .expect("margined panel width");
+    assert!(
+        w_full.saturating_sub(w_margin) >= 14,
+        "a scalar margin insets the panel width by 2N per side (full={w_full}, margined={w_margin})"
+    );
+}
+
 // ----- named panels: hidden from :ls, listed by :lspanels --------------------
 
 #[tokio::test]

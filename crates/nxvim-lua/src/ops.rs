@@ -125,8 +125,15 @@ pub enum ViewOp {
         anchor: String,
         row: i64,
         col: i64,
-        width: u64,
-        height: u64,
+        /// Size spec — cells (`"40"`) or a viewport fraction (`"50vw"` / `"30vh"` /
+        /// `"50%"`); parsed server-side into an [`Extent`](nxvim_core::Extent).
+        width: String,
+        height: String,
+        /// High-level alignment keyword (`"top-right"` / `"center"` / …) or `None`
+        /// for the low-level `anchor`/`row`/`col` form. Validated by the prelude.
+        align: Option<String>,
+        /// Edge inset `[top, right, bottom, left]` in cells for an aligned float.
+        margin: [u64; 4],
         zindex: u32,
         focusable: bool,
         border: String,
@@ -158,7 +165,14 @@ pub enum PanelOp {
         name: Option<String>,
         lines: Vec<String>,
         filetype: Option<String>,
-        height: Option<u64>,
+        /// Height spec — rows (`"12"`) or a viewport fraction (`"30vh"` / `"30%"`);
+        /// parsed server-side into an [`Extent`](nxvim_core::Extent) and resolved
+        /// against the editor height. `None` ⇒ the default listing height.
+        height: Option<String>,
+        /// Edge inset `[top, right, bottom, left]` in cells — a gap from the screen
+        /// edges so the bottom panel needn't kiss the border. `top` is ignored (the
+        /// panel is bottom-anchored; its top edge is set by the height).
+        margin: [u64; 4],
     },
     /// `nx.panel.close()` — dismiss the open panel
     /// ([`Editor::close_panel`](nxvim_core::Editor)).
@@ -798,8 +812,15 @@ pub enum WindowOp {
         anchor: String,
         row: i64,
         col: i64,
-        width: u64,
-        height: u64,
+        /// Size spec — cells (`"40"`) or a viewport fraction (`"50vw"` / `"30vh"` /
+        /// `"50%"`); parsed server-side into an [`Extent`](nxvim_core::Extent).
+        width: String,
+        height: String,
+        /// High-level alignment keyword (`"top-right"` / `"center"` / …) or `None`
+        /// for the low-level `anchor`/`row`/`col` form. Validated by the prelude.
+        align: Option<String>,
+        /// Edge inset `[top, right, bottom, left]` in cells for an aligned float.
+        margin: [u64; 4],
         zindex: u32,
         focusable: bool,
         border: String,
@@ -818,8 +839,14 @@ pub enum WindowOp {
         anchor: Option<String>,
         row: Option<i64>,
         col: Option<i64>,
-        width: Option<u64>,
-        height: Option<u64>,
+        /// Size spec — cells or a viewport fraction; `None` leaves it unchanged.
+        width: Option<String>,
+        height: Option<String>,
+        /// Alignment update: `None` = unchanged, `Some("")` = clear back to the
+        /// `anchor`/`row`/`col` form, `Some(word)` = set the alignment.
+        align: Option<String>,
+        /// Edge inset `[top, right, bottom, left]`; `None` leaves it unchanged.
+        margin: Option<[u64; 4]>,
         zindex: Option<u32>,
         focusable: Option<bool>,
         border: Option<String>,
@@ -1121,6 +1148,12 @@ pub struct PickerOpenReq {
     /// `"60vh"` / `"50%"`), or empty for the picker default. Never content-derived.
     pub width: String,
     pub height: String,
+    /// High-level alignment keyword (`"top-right"` / `"center"` / …), or empty to
+    /// center the box (the historical placement). Parsed server-side into an
+    /// [`Align`](nxvim_core::Align).
+    pub align: String,
+    /// Edge inset `[top, right, bottom, left]` in cells for an aligned picker box.
+    pub margin: [u64; 4],
     /// Whether the prompt sits **below** the results list (the telescope-style
     /// layout) rather than above it (the default). The Lua wrapper resolves the
     /// `prompt_pos = "top" | "bottom"` option down to this flag.

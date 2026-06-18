@@ -59,6 +59,33 @@ impl UserData for LuaRegex {
 /// [`VirtChunkData`]. `hl_group` may be a string or absent; a list-of-groups
 /// (neovim's stacked form) is rejected loud rather than silently dropped, matching
 /// the `hl_group` handling in `nvim_buf_set_extmark`.
+/// Read the `margin` field of a geometry config table into the `[top, right,
+/// bottom, left]` cells the wire carries. The prelude's `nx._geom` normalizer
+/// always emits margin as a 4-element array (a number / `{v,h}` / `{t,r,b,l}` /
+/// `{top=,…}` are all expanded there), so an absent or malformed value is treated
+/// as no margin.
+/// The argument tuple of the `nx._picker_open` bridge: `(dynamic, width, height,
+/// align, margin, prompt_bottom, preview)` — width/height/align are raw specs the
+/// server parses, `margin` is a `[top, right, bottom, left]` array. Aliased to keep
+/// clippy's complex-type lint quiet on the closure signature.
+type PickerOpenArgs = (
+    bool,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<Vec<u64>>,
+    Option<bool>,
+    Option<bool>,
+);
+
+fn read_margin(cfg: &Table) -> mlua::Result<[u64; 4]> {
+    let m: Option<Vec<u64>> = cfg.get("margin")?;
+    Ok(match m {
+        Some(v) if v.len() == 4 => [v[0], v[1], v[2], v[3]],
+        _ => [0; 4],
+    })
+}
+
 fn virt_chunk_from_table(t: &Table) -> mlua::Result<VirtChunkData> {
     let text: String = t.get(1)?;
     let hl_group = match t.get::<mlua::Value>(2)? {
@@ -422,6 +449,8 @@ pub(crate) fn install_vim(lua: &Lua, shared: &Rc<RefCell<Shared>>) -> mlua::Resu
                 col: cfg.get("col")?,
                 width: cfg.get("width")?,
                 height: cfg.get("height")?,
+                align: cfg.get::<Option<String>>("align")?,
+                margin: read_margin(&cfg)?,
                 zindex: cfg.get("zindex")?,
                 focusable: cfg.get("focusable")?,
                 border: cfg.get("border")?,
@@ -533,12 +562,14 @@ pub(crate) fn install_vim(lua: &Lua, shared: &Rc<RefCell<Shared>>) -> mlua::Resu
             };
             let name: Option<String> = opts.get("name")?;
             let filetype: Option<String> = opts.get("filetype")?;
-            let height: Option<u64> = opts.get("height")?;
+            let height: Option<String> = opts.get("height")?;
+            let margin = read_margin(&opts)?;
             sh.borrow_mut().panel_ops.push(PanelOp::Open {
                 name,
                 lines,
                 filetype,
                 height,
+                margin,
             });
             Ok(())
         })?,
@@ -1116,6 +1147,8 @@ pub(crate) fn install_runtime_api(
                 col: cfg.get("col")?,
                 width: cfg.get("width")?,
                 height: cfg.get("height")?,
+                align: cfg.get::<Option<String>>("align")?,
+                margin: read_margin(&cfg)?,
                 zindex: cfg.get("zindex")?,
                 focusable: cfg.get("focusable")?,
                 border: cfg.get("border")?,
@@ -1146,6 +1179,7 @@ pub(crate) fn install_runtime_api(
     nx.set(
         "_win_set_config",
         lua.create_function(move |_, (win, cfg): (u64, Table)| {
+            let margin: Option<Vec<u64>> = cfg.get("margin")?;
             sh.borrow_mut().window_ops.push(WindowOp::SetConfig {
                 win,
                 relative: cfg.get::<Option<String>>("relative")?,
@@ -1153,8 +1187,12 @@ pub(crate) fn install_runtime_api(
                 anchor: cfg.get::<Option<String>>("anchor")?,
                 row: cfg.get::<Option<i64>>("row")?,
                 col: cfg.get::<Option<i64>>("col")?,
-                width: cfg.get::<Option<u64>>("width")?,
-                height: cfg.get::<Option<u64>>("height")?,
+                width: cfg.get::<Option<String>>("width")?,
+                height: cfg.get::<Option<String>>("height")?,
+                align: cfg.get::<Option<String>>("align")?,
+                margin: margin
+                    .filter(|m| m.len() == 4)
+                    .map(|m| [m[0], m[1], m[2], m[3]]),
                 zindex: cfg.get::<Option<u32>>("zindex")?,
                 focusable: cfg.get::<Option<bool>>("focusable")?,
                 border: cfg.get::<Option<String>>("border")?,
@@ -1564,25 +1602,22 @@ pub(crate) fn install_runtime_api(
     let sh = shared.clone();
     nx.set(
         "_picker_open",
-        lua.create_function(
-            move |_,
-                  (dynamic, width, height, prompt_bottom, preview): (
-                bool,
-                Option<String>,
-                Option<String>,
-                Option<bool>,
-                Option<bool>,
-            )| {
-                sh.borrow_mut().picker_opens.push(PickerOpenReq {
-                    dynamic,
-                    width: width.unwrap_or_default(),
-                    height: height.unwrap_or_default(),
-                    prompt_bottom: prompt_bottom.unwrap_or(false),
-                    preview: preview.unwrap_or(false),
-                });
-                Ok(())
-            },
-        )?,
+        lua.create_function(move |_, args: PickerOpenArgs| {
+            let (dynamic, width, height, align, margin, prompt_bottom, preview) = args;
+            sh.borrow_mut().picker_opens.push(PickerOpenReq {
+                dynamic,
+                width: width.unwrap_or_default(),
+                height: height.unwrap_or_default(),
+                align: align.unwrap_or_default(),
+                margin: margin
+                    .filter(|m| m.len() == 4)
+                    .map(|m| [m[0], m[1], m[2], m[3]])
+                    .unwrap_or([0; 4]),
+                prompt_bottom: prompt_bottom.unwrap_or(false),
+                preview: preview.unwrap_or(false),
+            });
+            Ok(())
+        })?,
     )?;
 
     // `nx._complete_setup(auto, min_chars, next, prev, confirm, abort, has_async)`:

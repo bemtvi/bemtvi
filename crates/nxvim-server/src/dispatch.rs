@@ -1,10 +1,11 @@
 //! The `nvim_*` / `nxvim_*` RPC surface: the request/notification handler and
 //! the method dispatch table that defines the API clients call.
 
+use crate::effects::{build_margin, parse_align, parse_extent};
 use crate::redraw::{lines_value, style_value};
 use crate::EditHost;
 use nxvim_core::{
-    BorderStyle, BufferId, FloatAnchor, FloatConfig, FloatRelative, MouseEvent, TabId,
+    BorderStyle, BufferId, Extent, FloatAnchor, FloatConfig, FloatRelative, MouseEvent, TabId,
     WindowConfigSpec, WindowId,
 };
 use nxvim_rpc::Incoming;
@@ -527,11 +528,20 @@ impl EditHost {
         let anchor_kw = get("anchor").and_then(Value::as_str).unwrap_or("NW");
         let anchor = FloatAnchor::from_keyword(anchor_kw)
             .ok_or_else(|| format!("nvim_open_win: invalid 'anchor': '{anchor_kw}'"))?;
-        let width = uint(get("width"), 0);
-        let height = uint(get("height"), 0);
-        if width == 0 || height == 0 {
+        // Size: an integer is a cell count (the neovim form, round-tripped exactly),
+        // a string is a `vw`/`vh`/`%` spec. Required and positive, as neovim.
+        let width = value_extent(get("width")).ok_or_else(|| {
+            "nvim_open_win: 'width' must be a positive number or a size spec".to_string()
+        })?;
+        let height = value_extent(get("height")).ok_or_else(|| {
+            "nvim_open_win: 'height' must be a positive number or a size spec".to_string()
+        })?;
+        if matches!(width, Extent::Cells(0)) || matches!(height, Extent::Cells(0)) {
             return Err("nvim_open_win: 'width' and 'height' must be positive".to_string());
         }
+        let align = parse_align(get("align").and_then(Value::as_str))
+            .map_err(|e| format!("nvim_open_win: {e}"))?;
+        let margin = build_margin(value_margin(get("margin")));
         let border = match get("border") {
             None => BorderStyle::None,
             // A non-string `border` (neovim's per-edge glyph array) is not rendered
@@ -550,6 +560,8 @@ impl EditHost {
             col: get("col").and_then(as_int).unwrap_or(0),
             width,
             height,
+            align,
+            margin,
             zindex: get("zindex")
                 .and_then(Value::as_u64)
                 .map(|z| z as u32)
@@ -603,8 +615,17 @@ impl EditHost {
         }
         spec.row = get("row").and_then(as_int);
         spec.col = get("col").and_then(as_int);
-        spec.width = get("width").and_then(Value::as_u64).map(|n| n as usize);
-        spec.height = get("height").and_then(Value::as_u64).map(|n| n as usize);
+        spec.width = value_extent(get("width"));
+        spec.height = value_extent(get("height"));
+        // `align`: a non-empty word sets it, `""` clears back to the anchor/offset
+        // form, an absent key leaves it unchanged; a bad word errors loudly.
+        if let Some(word) = get("align").and_then(Value::as_str) {
+            spec.align =
+                Some(parse_align(Some(word)).map_err(|e| format!("nvim_win_set_config: {e}"))?);
+        }
+        if get("margin").is_some() {
+            spec.margin = Some(build_margin(value_margin(get("margin"))));
+        }
         spec.zindex = get("zindex").and_then(Value::as_u64).map(|z| z as u32);
         spec.focusable = get("focusable").and_then(Value::as_bool);
         // A present `title` key sets (or, with an empty value, clears) the title;
@@ -625,17 +646,25 @@ impl EditHost {
             FloatRelative::Win(_) => "win",
             FloatRelative::Cursor => "cursor",
         };
+        // Report the **resolved** inner cells read off the laid-out window, not the
+        // raw `Extent` — so a fractional float reports its true on-screen size and
+        // a cell-sized float round-trips exactly (`nvim_open_win{width=40}` →
+        // `nvim_win_get_config().width == 40`), matching neovim's integer config.
+        let (w, h) = self.editor.window_content_size(win).unwrap_or((0, 0));
         let mut entries = vec![
             (Value::from("relative"), Value::from(relative)),
             (Value::from("anchor"), Value::from(cfg.anchor.as_str())),
             (Value::from("row"), Value::from(cfg.row as i64)),
             (Value::from("col"), Value::from(cfg.col as i64)),
-            (Value::from("width"), Value::from(cfg.width as u64)),
-            (Value::from("height"), Value::from(cfg.height as u64)),
+            (Value::from("width"), Value::from(w as u64)),
+            (Value::from("height"), Value::from(h as u64)),
             (Value::from("zindex"), Value::from(cfg.zindex as u64)),
             (Value::from("focusable"), Value::from(cfg.focusable)),
             (Value::from("border"), Value::from(cfg.border.as_str())),
         ];
+        if let Some(align) = cfg.align {
+            entries.push((Value::from("align"), Value::from(align.as_str())));
+        }
         if let FloatRelative::Win(id) = cfg.relative {
             entries.push((Value::from("win"), Value::from(id.0)));
         }
@@ -688,6 +717,44 @@ fn uint(v: Option<&Value>, default: usize) -> usize {
     v.and_then(Value::as_u64)
         .map(|n| n as usize)
         .unwrap_or(default)
+}
+
+/// An `nvim_open_win` / `nvim_win_set_config` size value → [`Extent`]: an integer
+/// is a cell count (round-tripped exactly), a string is a `vw`/`vh`/`%`/cells
+/// spec. `None` for an absent or unparseable value.
+fn value_extent(v: Option<&Value>) -> Option<Extent> {
+    match v? {
+        Value::String(_) => parse_extent(v?.as_str()?),
+        other => u16::try_from(other.as_u64()?).ok().map(Extent::Cells),
+    }
+}
+
+/// An `nvim_open_win` margin value → `[top, right, bottom, left]` cells. A number
+/// is the vertical margin and the horizontal sides get twice as many cells (terminal
+/// cells are ~2x taller than wide, so a single value reads as an even gap — mirrors
+/// `nx._geom.margin`); a 2-array is the literal `[vertical, horizontal]`; a 4-array is
+/// the literal `[top, right, bottom, left]`. Anything else ⇒ no margin.
+fn value_margin(v: Option<&Value>) -> [u64; 4] {
+    match v {
+        Some(Value::Array(a)) => match a.as_slice() {
+            [vert, horiz] => {
+                let (vt, hz) = (vert.as_u64().unwrap_or(0), horiz.as_u64().unwrap_or(0));
+                [vt, hz, vt, hz]
+            }
+            [t, r, b, l] => [
+                t.as_u64().unwrap_or(0),
+                r.as_u64().unwrap_or(0),
+                b.as_u64().unwrap_or(0),
+                l.as_u64().unwrap_or(0),
+            ],
+            _ => [0; 4],
+        },
+        Some(other) => {
+            let n = other.as_u64().unwrap_or(0);
+            [n, n * 2, n, n * 2]
+        }
+        None => [0; 4],
+    }
 }
 
 /// Read a signed integer RPC value, accepting a float (neovim's `nvim_open_win`

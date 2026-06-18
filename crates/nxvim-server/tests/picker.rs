@@ -827,6 +827,78 @@ async fn picker_size_is_configurable_in_cells_and_viewport_fractions() {
 }
 
 #[tokio::test]
+async fn picker_align_and_margin_place_the_box_in_a_corner_with_a_gap() {
+    // The unified geometry: a picker is no longer centered-only — `align` (a 9-grid
+    // word) places the box and `margin` insets it from the edges, so it can sit in a
+    // corner without kissing the border. `row`/`col` in the menu map are the OUTER
+    // box top-left (border included); the projection aligns within the (0,0)-origin
+    // text area.
+    let dir = temp_dir("picker_align");
+    let (rpc, mut incoming) = start(&dir, STATIC_SRC).await;
+
+    let pos = |menu: &[(Value, Value)]| {
+        (
+            map_get(menu, "row").and_then(Value::as_u64).unwrap(),
+            map_get(menu, "col").and_then(Value::as_u64).unwrap(),
+        )
+    };
+
+    // top-left, no margin: the box hugs the origin.
+    exec_lua(
+        &rpc,
+        "nx.picker.open('fruits', { width = 20, height = 6, align = 'top-left' })",
+    )
+    .await;
+    let menu = menu_of(&poll_menu(&rpc, &mut incoming).await.expect("top-left"));
+    assert_eq!(
+        pos(&menu),
+        (0, 0),
+        "top-left with no margin hugs the origin"
+    );
+    feed(&rpc, "<Esc>");
+    poll_menu(&rpc, &mut incoming).await;
+
+    // top-left, margin 4: a single value is the vertical gap; the horizontal gap is
+    // 2x (cells are ~2x taller than wide), so the box sits at row 4, col 8.
+    exec_lua(
+        &rpc,
+        "nx.picker.open('fruits', { width = 20, height = 6, align = 'top-left', margin = 4 })",
+    )
+    .await;
+    let menu = menu_of(
+        &poll_menu(&rpc, &mut incoming)
+            .await
+            .expect("top-left margin"),
+    );
+    assert_eq!(
+        pos(&menu),
+        (4, 8),
+        "a scalar margin insets vertically by N and horizontally by 2N"
+    );
+    feed(&rpc, "<Esc>");
+    poll_menu(&rpc, &mut incoming).await;
+
+    // bottom-right, margin {vertical=2, horizontal=5}: pinned to the bottom-right.
+    // The box's right edge sits 5 cells from the screen's right; its bottom 2 from
+    // the bottom — so both row and col are large (the box left/top is far from 0).
+    exec_lua(
+        &rpc,
+        "nx.picker.open('fruits', { width = 20, height = 6, align = 'bottom-right', margin = { 2, 5 } })",
+    )
+    .await;
+    let menu = menu_of(&poll_menu(&rpc, &mut incoming).await.expect("bottom-right"));
+    let (r, c) = pos(&menu);
+    let (w, _h) = menu_size(&menu);
+    // col + outer-width + right-margin == text width. With width 20 (+2 border) and a
+    // 5-col right gap on an ~80-col screen, the box's left edge is well past center.
+    assert!(
+        c >= 45,
+        "bottom-right pins the box to the right (col={c}, w={w})"
+    );
+    assert!(r >= 8, "bottom-right pins the box to the bottom (row={r})");
+}
+
+#[tokio::test]
 async fn example_config_loads_and_opens_a_picker() {
     // The shipped `examples/ui-picker` config must load and wire its leader maps.
     let example = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))

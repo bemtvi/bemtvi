@@ -74,9 +74,7 @@ pub(crate) use self::command::{
 };
 pub use self::complete::{CompleteConfig, CompleteCtx, CompleteKeys};
 pub use self::decor::DecorViewport;
-pub use self::menu::{
-    MenuExtent, MenuItem, MenuPlacement, PreviewScroll, PreviewTarget, PromptPos,
-};
+pub use self::menu::{Extent, MenuItem, MenuPlacement, PreviewScroll, PreviewTarget, PromptPos};
 pub use self::mouse::{ClickSurface, StatuslineClick};
 pub(crate) use self::multicursor::PlacementSnapshot;
 // The off-tick save / open requests (the daemon / edit-host fs path, Phase 3e/3f).
@@ -92,7 +90,10 @@ pub use self::undo::{UndoEntry, UndoTreeView};
 // The window layout subsystem (tree types + layout algebra + window methods).
 pub(crate) use self::jumps::JumpEntry;
 pub(crate) use self::view::ViewState;
-pub use self::windows::{BorderStyle, FloatAnchor, FloatConfig, FloatRelative, WindowConfigSpec};
+pub use self::windows::{
+    place_aligned, Align, BorderStyle, FloatAnchor, FloatConfig, FloatRelative, Margin,
+    WindowConfigSpec,
+};
 pub(crate) use self::windows::{PendingScroll, TabLabel, WindowLayout, WindowTree};
 // Search vocabulary shared by the command line, the parser, and the View.
 pub use self::quickfix::{QfAction, QfEntry, QfList, QfStack, QfWhich};

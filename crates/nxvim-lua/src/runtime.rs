@@ -114,6 +114,10 @@ pub struct FloatMirror {
     pub col: i64,
     pub width: u64,
     pub height: u64,
+    /// The high-level alignment word (`"top-right"` / `"center"` / …) when the float
+    /// is aligned, omitted for the low-level `anchor`/`row`/`col` form.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub align: Option<String>,
     pub zindex: u64,
     pub focusable: bool,
     /// `"none"` / `"single"` / `"rounded"` / `"double"` / `"solid"`.
@@ -358,6 +362,13 @@ const PRELUDE_MODULES: &[(&str, &str)] = &[
     // The Rust↔Lua mirror state, shared resolvers, context lock, and the scalar
     // surfaces (variables / options / registers) the entity API reads.
     ("nxvim:prelude/state", include_str!("prelude/state.lua")),
+    // The shared window-geometry normalizer (`nx._geom`): one place that validates
+    // size specs / alignment words / margin and emits the wire shape every surface
+    // (floats, `nx.view`, pickers, the panel) sends. Loaded before its consumers.
+    (
+        "nxvim:prelude/geometry",
+        include_str!("prelude/geometry.lua"),
+    ),
     // The namespace / highlight / extmark surface (`nx.ns` / `nx.hl` / the extmark
     // decoration layer) and the two current-handle getters the option/variable
     // scopes read. Reads the mirror state / resolvers from state.lua above.

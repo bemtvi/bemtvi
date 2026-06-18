@@ -137,10 +137,17 @@ local FLOAT_BORDER =
 -- split of the main editor area; `opts.float = { … }` mounts it in a floating window.
 -- Mounting focuses the view.
 --
--- The float table takes `width` / `height` (inner size; required), `relative`
--- ("editor"|"win"|"cursor", default "editor"), `anchor` ("NW"|"NE"|"SW"|"SE", default
--- "NW"), `row` / `col` (offset, default 0), `border` (default "rounded"), `title`,
--- `zindex`, `focusable`, and `grab`. `grab` (default true) hard-locks focus to the float
+-- The float table takes `width` / `height` (inner size; required) — cells (a
+-- number) or a viewport fraction ("50vw" / "30vh" / "50%"), which reflows on
+-- resize — `relative` ("editor"|"win"|"cursor", default "editor"), and either the
+-- high-level `align` ("top-left"|"top"|"top-right"|"left"|"center"|"right"|
+-- "bottom-left"|"bottom"|"bottom-right") + `margin` (a gap from the edges: a number
+-- — the vertical gap, the horizontal sides getting 2x to look even since cells are
+-- ~2x taller than wide — or an explicit {vertical, horizontal} / {top, right,
+-- bottom, left} / {top=, …}), or the
+-- low-level `anchor` ("NW"|"NE"|"SW"|"SE", default "NW") + `row` / `col` (offset,
+-- default 0). Plus `border` (default "rounded"), `title`, `zindex`, `focusable`, and
+-- `grab`. `grab` (default true) hard-locks focus to the float
 -- like the bottom panel — `<C-w>` can't leave it and unmount restores the prior window —
 -- which is what a modal dialog (a checkbox list, a confirm) wants; pass `grab = false` for
 -- a non-modal floating panel that focus can leave.
@@ -165,23 +172,35 @@ function View:mount(opts)
     if not FLOAT_BORDER[border] then
       return nx.notify("nx.view:mount{ float }: invalid border '" .. tostring(border) .. "'", 4)
     end
-    if type(f.width) ~= "number" or type(f.height) ~= "number" then
+    if f.width == nil or f.height == nil then
       return nx.notify("nx.view:mount{ float }: width and height are required", 4)
     end
-    nx.view._mount_float(self.id, {
-      relative = relative,
-      win = f.win or 0,
-      anchor = anchor,
-      row = f.row or 0,
-      col = f.col or 0,
-      width = f.width,
-      height = f.height,
-      zindex = f.zindex or 50,
-      focusable = f.focusable ~= false,
-      border = border,
-      title = f.title,
-      grab = f.grab ~= false,
-    })
+    -- `width`/`height` accept cells or a viewport fraction ("50vw" / "30vh" /
+    -- "50%"); `align` is the high-level placement word (default the low-level
+    -- anchor/offset form); `margin` insets an aligned float from the edges. The
+    -- shared `nx._geom` normalizer validates and emits the wire shape.
+    local ok, cfg = pcall(function()
+      return {
+        relative = relative,
+        win = f.win or 0,
+        anchor = anchor,
+        row = f.row or 0,
+        col = f.col or 0,
+        width = nx._geom.size(f.width),
+        height = nx._geom.size(f.height),
+        align = nx._geom.align(f.align),
+        margin = nx._geom.margin(f.margin),
+        zindex = f.zindex or 50,
+        focusable = f.focusable ~= false,
+        border = border,
+        title = f.title,
+        grab = f.grab ~= false,
+      }
+    end)
+    if not ok then
+      return nx.notify("nx.view:mount{ float }: " .. tostring(cfg), 4)
+    end
+    nx.view._mount_float(self.id, cfg)
   else
     nx.notify("nx.view:mount: pass one of { dock = … } / { split = … } / { float = … }", 4)
   end

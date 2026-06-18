@@ -93,8 +93,12 @@ end
 -- chosen item. Optional `width` / `height` fix the box size — a cell count
 -- (number) or a CSS-style viewport fraction string ("80vw" / "60vh" / "50%");
 -- omitted ⇒ the default (~80vw x 60vh). The picker is never content-sized.
--- Optional `prompt_pos` = "top" (default) or "bottom" places the input above or
--- below the results list.
+-- Optional `align` ("top-left"…"center"…"bottom-right", default centered) +
+-- `margin` (a gap from the editor edges: a number — the vertical gap, horizontal
+-- sides 2x to look even — or {vertical, horizontal} / {top, right, bottom, left} /
+-- {top=, …}) place the box like a float. Optional
+-- `prompt_pos` = "top" (default) or "bottom" places the input above or below the
+-- results list.
 --
 -- For a `dynamic` source (which spawns per query), `debounce` (ms) sets the
 -- trailing delay before a query edit re-runs the source — so a fast typist spawns
@@ -120,19 +124,6 @@ function nx.picker.source(spec)
   nx.picker._sources[spec.name] = spec
 end
 
--- Normalize a size value for the bridge: a number is a cell count, a string is a
--- raw spec ("80vw" / "60vh" / "50%" — a CSS-style viewport fraction), nil falls
--- back to the picker default. Returns a string (or nil).
-local function size_str(v)
-  if v == nil then
-    return nil
-  elseif type(v) == "number" then
-    return tostring(v)
-  else
-    return tostring(v)
-  end
-end
-
 -- nx.picker.open(name[, opts]): open the picker for the registered source `name`.
 -- `opts.width` / `opts.height` set a FIXED box size — a cell count (e.g. 100) or a
 -- CSS-style viewport fraction string ("80vw" / "60vh" / "50%") — overriding the
@@ -154,8 +145,13 @@ function nx.picker.open(name, opts)
     error('nx.picker.open: preview must be "file" or "location"', 2)
   end
   nx._picker = { source = source, items = {}, gen = 0, on_cancel = nil, preview = preview }
-  local width = size_str(opts.width ~= nil and opts.width or source.width)
-  local height = size_str(opts.height ~= nil and opts.height or source.height)
+  local width = nx._geom.size(opts.width ~= nil and opts.width or source.width)
+  local height = nx._geom.size(opts.height ~= nil and opts.height or source.height)
+  -- Placement: `align` (a 9-grid word, default centered) + `margin` (a gap from the
+  -- editor edges), each per-open overriding per-source. The picker box used to be
+  -- centered-only; now it can sit in any corner with a margin, like a float.
+  local align = nx._geom.align(opts.align ~= nil and opts.align or source.align)
+  local margin = nx._geom.margin(opts.margin ~= nil and opts.margin or source.margin)
   -- Resolve the debounce: per-open overrides per-source overrides the global
   -- default. `0` is a valid (truthy) value — disable — so test for `nil`, not `or`.
   local debounce = opts.debounce
@@ -174,8 +170,16 @@ function nx.picker.open(name, opts)
     prompt_pos = source.prompt_pos
   end
   local prompt_bottom = prompt_pos == "bottom"
-  -- The server opens the centered widget and kicks the initial run (gen 0, "").
-  nx._picker_open(source.dynamic == true, width, height, prompt_bottom, preview ~= nil)
+  -- The server opens the aligned widget and kicks the initial run (gen 0, "").
+  nx._picker_open(
+    source.dynamic == true,
+    width,
+    height,
+    align,
+    margin,
+    prompt_bottom,
+    preview ~= nil
+  )
 end
 
 -- Cap on streamed results past which the job is reaped — a *safety* bound against

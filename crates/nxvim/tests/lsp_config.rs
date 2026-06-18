@@ -295,6 +295,46 @@ async fn wildcard_base_filetypes_are_inherited() {
     std::env::remove_var("NXVIM_LSP_CMD");
 }
 
+/// A config with `root_markers` (no explicit `root_dir`) drives the async upward
+/// `find_root` walk through the `nx.fs` seam, then starts the server. This is the
+/// path the `ui-complete-lsp` example takes — and the one that regressed when
+/// `find_root` returned the `nx.async` *wrapper* instead of calling it for a promise
+/// (`:next` on a function → "attempt to index a function value"). The `.git` marker
+/// in the temp dir resolves the root upward from `a.rs`.
+#[tokio::test]
+async fn root_markers_resolve_and_start_the_server() {
+    let _guard = serial_lock().lock().await;
+    let dir = temp_dir("lsp_cfg_rootmarkers");
+    arm_mock(
+        &dir,
+        r#"{ "hover": { "contents": { "kind": "markdown", "value": "rooted hover" } } }"#,
+    );
+    // A `.git` marker so the upward `root_markers` search resolves a root.
+    std::fs::create_dir_all(dir.join(".git")).expect("create .git marker");
+    let (rpc, mut incoming) = open_rust(&dir).await;
+
+    exec_lua(
+        &rpc,
+        r#"
+        nx.lsp.config("mock", {
+          cmd = { "placeholder" },
+          filetypes = { "rust" },
+          root_markers = { ".git" },
+        })
+        nx.lsp.enable("mock")
+        "#,
+    )
+    .await;
+
+    let lines = await_float(&rpc, &mut incoming, "nx.lsp.hover()", "rooted hover").await;
+    assert!(
+        lines.iter().any(|l| l.contains("rooted hover")),
+        "the server should have started via the root_markers path, got {lines:?}"
+    );
+
+    std::env::remove_var("NXVIM_LSP_CMD");
+}
+
 /// `on_attach(client, bufnr)` runs once the server binds the buffer (via the engine's
 /// `LspAttach`), and `nx.lsp.clients({ bufnr })` then lists the attached client with
 /// its resolved name and capabilities.

@@ -106,39 +106,39 @@ end
 -- Upward `root_markers` search from the buffer's file, walking the project tree
 -- through the async `nx.fs` seam (local on native-bare, the daemon's `luafs_op` over
 -- the wire otherwise — so this works on every front end with NO editor-thread block).
--- Returns a promise of the first ancestor directory that holds one of `markers`, or
--- nil (the server then falls back to the file's directory). Each `nx.fs.readdir` that
+-- `nx.async` makes this an async *function* (the Lua analogue of a JS `async
+-- function`): calling `find_root(bufnr, markers)` runs the body as a coroutine and
+-- returns a PROMISE of the first ancestor directory holding one of `markers`, or nil
+-- (the server then falls back to the file's directory). Each `nx.fs.readdir` that
 -- rejects (an unreadable / non-directory ancestor) is treated as "no markers here" and
--- the walk continues upward.
-local function find_root(bufnr, markers)
-  return nx.async(function()
-    local file = nx.buf.name(bufnr)
-    if type(file) ~= "string" or file == "" then
-      return nil
-    end
-    local dir = dirname(file)
-    while dir and dir ~= "" do
-      local present = {}
-      local entries = nx.await(nx.fs.readdir(dir):catch(function()
-        return {}
-      end))
-      for _, e in ipairs(entries) do
-        present[e.name] = true
-      end
-      for _, m in ipairs(markers) do
-        if present[m] then
-          return dir
-        end
-      end
-      local parent = dirname(dir)
-      if parent == dir then
-        break
-      end
-      dir = parent
-    end
+-- the walk continues upward. The caller invokes it normally and `:next`s the result.
+local find_root = nx.async(function(bufnr, markers)
+  local file = nx.buf.name(bufnr)
+  if type(file) ~= "string" or file == "" then
     return nil
-  end)
-end
+  end
+  local dir = dirname(file)
+  while dir and dir ~= "" do
+    local present = {}
+    local entries = nx.await(nx.fs.readdir(dir):catch(function()
+      return {}
+    end))
+    for _, e in ipairs(entries) do
+      present[e.name] = true
+    end
+    for _, m in ipairs(markers) do
+      if present[m] then
+        return dir
+      end
+    end
+    local parent = dirname(dir)
+    if parent == dir then
+      break
+    end
+    dir = parent
+  end
+  return nil
+end)
 
 -- ----- config registry -------------------------------------------------------
 

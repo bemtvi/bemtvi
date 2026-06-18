@@ -444,6 +444,14 @@ const PRELUDE_MODULES: &[(&str, &str)] = &[
     // `nx.command` / `nx.on` (defined there) plus nx.run / nx.fs / nx.promise /
     // nx.keymap / nx.notify (all above), and the `nx._add_rtp` Rust bridge.
     ("nxvim:prelude/plugins", include_str!("prelude/plugins.lua")),
+    // The package manager's UI (`nx.plugins.ui` / `:Plugins`) — the lazy-style
+    // dashboard and the first-run welcome checklist. Loads AFTER plugins.lua (it reads
+    // the manager state and subscribes via `M.on_change`) and after component.lua /
+    // view.lua / api.lua (nx.view.component / nx.hl), all above.
+    (
+        "nxvim:prelude/plugins_ui",
+        include_str!("prelude/plugins_ui.lua"),
+    ),
 ];
 
 /// Side effects produced by running Lua, drained by the server.

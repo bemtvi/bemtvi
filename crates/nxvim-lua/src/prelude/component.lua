@@ -195,6 +195,24 @@ local function view_backend(opts)
   else
     v:mount({ float = opts.float or { width = 50, height = 12, grab = true } })
   end
+
+  -- Blank the end-of-buffer `~` fillers in the component's window. A component
+  -- surface (file tree / dashboard / dialog) is plugin-owned content, not an editable
+  -- file, so the empty rows below it should read as blank rather than show a text
+  -- buffer's tildes. Window-local (`fillchars` `eob:` → a space); set once the window
+  -- exists — its winid arrives a tick after mount via the `nx._view_win` mirror, so
+  -- wait for it across ticks. Best-effort (`:catch`): a dock/split surface could close
+  -- before its window settles. Opt out with `opts.eob = true`.
+  if not opts.eob then
+    nx.wait_for(function()
+      return v:winid()
+    end)
+      :next(function(win)
+        vim.wo[win].fillchars = "eob: "
+      end)
+      :catch(function() end)
+  end
+
   return {
     -- The backing buffer number arrives a tick after create/mount (the nx._view_buf mirror).
     ready = function()
@@ -450,14 +468,7 @@ function nx.component(def)
     -- The whole lifecycle, as one linear async flow: wait for the surface to be ready, run
     -- setup (awaiting it if async), then the first render. Subsequent renders are reactive.
     nx.async(function()
-      local tries = 0
-      while not backend.ready() do
-        if tries > 200 then
-          error("the component surface never became ready")
-        end
-        tries = tries + 1
-        nx.await(nx.promise.delay(0))
-      end
+      nx.await(nx.wait_for(backend.ready, { message = "the component surface never became ready" }))
       -- `nx.promise.resolve` makes this uniform whether `setup` returns a plain value or a
       -- promise; and because we're inside an `nx.async` coroutine, a `setup` that calls
       -- `nx.await(...)` directly suspends here too. Either async style works.

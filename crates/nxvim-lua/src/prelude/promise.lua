@@ -388,6 +388,54 @@ function M.delay(ms, value)
   end)
 end
 
+-- nx.wait_for(predicate[, opts]) -> promise: poll `predicate` BETWEEN ticks until it
+-- returns a truthy value, then fulfil with that value. The await-able form of the
+-- bounded "spin until a cross-tick condition holds" loop that recurs across the
+-- codebase — a freshly-mounted window's id, a server-repopulated mirror, a view
+-- buffer that exists next tick. It yields the tick (nx.on_next_tick) between checks, so
+-- those mirrors actually refresh, instead of spinning within one convergence the way
+-- a bare nx.schedule re-arm does. `predicate` is checked once immediately, then once
+-- per following tick.
+--
+--   opts.tries     max checks before giving up (default 200 — a few seconds of ticks)
+--   opts.interval  ms between checks (default: the next tick); set for slower polling
+--   opts.message   the rejection message used on timeout
+--
+-- REJECTS (so an `nx.await` fails loud and a chain can `:catch`) if the condition
+-- never holds within `tries`, or if `predicate` throws. RESOLVES with the predicate's
+-- truthy value, so `:next(function(win) … end)` receives it directly. A best-effort
+-- caller should `:catch` the timeout.
+function M.wait_for(predicate, opts)
+  opts = opts or {}
+  local tries = opts.tries or 200
+  local interval = opts.interval
+  return M.new(function(resolve, reject)
+    local n = 0
+    local function step()
+      local ok, val = pcall(predicate)
+      if not ok then
+        return reject({ message = "nx.wait_for: predicate errored: " .. tostring(val) })
+      end
+      if val then
+        return resolve(val)
+      end
+      n = n + 1
+      if n >= tries then
+        return reject({
+          message = opts.message or ("nx.wait_for: condition not met after " .. tries .. " ticks"),
+        })
+      end
+      if interval then
+        nx.timer(step, interval)
+      else
+        nx.on_next_tick(step)
+      end
+    end
+    step() -- check immediately (tick 0), then poll the next ticks
+  end)
+end
+nx.wait_for = M.wait_for
+
 -- nx.promise.wrap(fn): lift a single-callback async function into a
 -- promise-returning one. The wrapped function appends a resolver as the LAST
 -- argument and resolves with whatever that callback receives (its single arg, or

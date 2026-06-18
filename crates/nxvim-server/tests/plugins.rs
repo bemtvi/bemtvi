@@ -18,7 +18,9 @@ use std::time::Duration;
 
 use nxvim_rpc::{Incoming, Rpc};
 use nxvim_server::ServerInit;
-use nxvim_test_harness::{attach, exec_lua, feed, lua_bool, spawn, start_attached, temp_dir};
+use nxvim_test_harness::{
+    attach, exec_lua, feed, lines, lua_bool, spawn, start_attached, temp_dir,
+};
 use tokio::sync::mpsc::UnboundedReceiver;
 
 async fn start() -> (Rpc, UnboundedReceiver<Incoming>) {
@@ -98,6 +100,21 @@ async fn poll_true(rpc: &Rpc, code: &str) -> bool {
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
     false
+}
+
+/// Feed `key` repeatedly (~3s) until `code` returns true. The welcome / manager
+/// views mount + bind their buffer-local maps over a couple of ticks, so an early
+/// keypress lands on the no-op default map; re-feeding until the observable settles
+/// is race-free (an extra keypress after the view closes is harmless).
+async fn feed_until(rpc: &Rpc, key: &str, code: &str) -> bool {
+    for _ in 0..150 {
+        feed(rpc, key);
+        if lua_bool(rpc, code).await == Some(true) {
+            return true;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    lua_bool(rpc, code).await == Some(true)
 }
 
 /// Declare the manager's install root (a temp dir) so the test never touches the
@@ -453,9 +470,9 @@ async fn setup_root_and_config(rpc: &Rpc, tag: &str) -> (std::path::PathBuf, std
     (root, cfg)
 }
 
-// On a fresh setup the first-run flow offers the recommended set; accepting it
-// writes the set to the user's config (a separate plugins.lua that init.lua
-// requires) and installs+loads it now.
+// On a fresh setup the first-run flow opens the WELCOME checklist; confirming it
+// (items pre-ticked) writes the chosen set to the user's config (a separate
+// plugins.lua that init.lua requires) and installs+loads it now.
 #[tokio::test]
 async fn first_run_offers_recommended_and_persists_on_yes() {
     let (rpc, _i) = start().await;
@@ -473,17 +490,21 @@ async fn first_run_offers_recommended_and_persists_on_yes() {
     )
     .await;
 
-    // The confirm appears (after the async marker check); accept it.
+    // The welcome checklist view appears (after the async marker check) and grabs
+    // focus — the current buffer becomes the welcome view.
     assert!(
         poll_true(&rpc, "return nx.plugins._prompting == true").await,
-        "the recommended-set confirm should appear on a fresh setup"
+        "the recommended-set welcome should appear on a fresh setup"
     );
-    feed(&rpc, "y");
-
-    // The set installs + loads, and is persisted to the user's config.
     assert!(
-        poll_true(&rpc, "return nx.plugins._loaded.zeta == true").await,
-        "accepting installs and loads the recommended set"
+        poll_true(&rpc, "return vim.bo.filetype == 'nxpluginswelcome'").await,
+        "the welcome checklist view should be focused"
+    );
+
+    // <CR> confirms the pre-ticked set → install + load + persist.
+    assert!(
+        feed_until(&rpc, "<CR>", "return nx.plugins._loaded.zeta == true").await,
+        "confirming the welcome installs and loads the recommended set"
     );
     let pluginslua = std::fs::read_to_string(cfg.join("lua").join("plugins.lua")).unwrap();
     assert!(
@@ -506,7 +527,7 @@ async fn first_run_offers_recommended_and_persists_on_yes() {
     );
 }
 
-// Declining the offer records the marker (so it never asks again) and writes
+// Skipping the welcome (Esc) records the marker (so it never asks again) and writes
 // nothing to the user's config.
 #[tokio::test]
 async fn first_run_decline_writes_nothing_but_marks_asked() {
@@ -525,7 +546,17 @@ async fn first_run_decline_writes_nothing_but_marks_asked() {
     )
     .await;
     assert!(poll_true(&rpc, "return nx.plugins._prompting == true").await);
-    feed(&rpc, "n");
+    // Wait for the welcome to be up, then <Esc> to skip — the view closes.
+    assert!(poll_true(&rpc, "return vim.bo.filetype == 'nxpluginswelcome'").await);
+    assert!(
+        feed_until(
+            &rpc,
+            "<Esc>",
+            "return vim.bo.filetype ~= 'nxpluginswelcome'"
+        )
+        .await,
+        "Esc should skip and close the welcome view"
+    );
 
     // Marker written (asked once), but no config and nothing installed.
     for _ in 0..200 {
@@ -580,14 +611,180 @@ async fn vim_enter_triggers_the_first_run_prompt() {
     let (rpc, _incoming) = spawn(init);
     attach(&rpc, 80, 24).await;
 
-    // No exec_lua trigger: VimEnter alone must surface the prompt.
+    // No exec_lua trigger: VimEnter alone must surface the welcome view.
     assert!(
         poll_true(&rpc, "return nx.plugins._prompting == true").await,
-        "VimEnter should drive the first-run recommended-set prompt"
+        "VimEnter should drive the first-run recommended-set welcome"
     );
-    feed(&rpc, "y");
+    assert!(poll_true(&rpc, "return vim.bo.filetype == 'nxpluginswelcome'").await);
     assert!(
-        poll_true(&rpc, "return nx.plugins._loaded.theta == true").await,
-        "accepting the VimEnter prompt installs the set"
+        feed_until(&rpc, "<CR>", "return nx.plugins._loaded.theta == true").await,
+        "confirming the VimEnter welcome installs the set"
+    );
+}
+
+// ----- partial selection: unticking excludes a plugin ------------------------
+
+// The headline of the welcome checklist: the user can untick the plugins they don't
+// want. With two recommended, unticking the second installs + persists only the first.
+#[tokio::test]
+async fn welcome_untick_excludes_a_plugin() {
+    let (rpc, _i) = start().await;
+    let src = temp_dir("plug_untick_src");
+    let repo1 = make_repo(&src, "uno");
+    let repo2 = make_repo(&src, "dos");
+    let (_root, cfg) = setup_root_and_config(&rpc, "plug_untick").await;
+
+    exec_lua(
+        &rpc,
+        &format!(
+            "nx.plugins.recommend({{ {{ \"file://{r1}\", name = \"uno\" }},\n\
+               {{ \"file://{r2}\", name = \"dos\" }} }})\n\
+             nx.plugins.bootstrap()",
+            r1 = q(&repo1),
+            r2 = q(&repo2)
+        ),
+    )
+    .await;
+
+    // Welcome up and rendered with both items pre-ticked. Rendered content ⇒ the
+    // component's setup ran and its buffer-local maps are bound.
+    assert!(poll_true(&rpc, "return vim.bo.filetype == 'nxpluginswelcome'").await);
+    let mut rendered = false;
+    for _ in 0..200 {
+        let ls = lines(&rpc).await;
+        if ls.len() >= 6 && ls.iter().filter(|l| l.contains('☑')).count() == 2 {
+            rendered = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(rendered, "welcome should render both items pre-ticked");
+
+    // Jump to the second item (line 6 = 4 header lines + item #2) with the builtin
+    // `6G` motion (not remapped), then untick it with <Space>.
+    feed(&rpc, "6G");
+    feed(&rpc, "<Space>");
+    let mut unticked = false;
+    for _ in 0..100 {
+        let ls = lines(&rpc).await;
+        if ls.get(5).map(|l| l.contains('☐')).unwrap_or(false) {
+            unticked = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(unticked, "<Space> should untick the second item");
+
+    // Confirm: only the still-ticked `uno` installs + persists; `dos` is excluded.
+    assert!(
+        feed_until(&rpc, "<CR>", "return nx.plugins._loaded.uno == true").await,
+        "confirming installs the ticked plugin"
+    );
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    assert_ne!(
+        lua_bool(&rpc, "return nx.plugins._loaded.dos == true").await,
+        Some(true),
+        "the unticked plugin must not be installed"
+    );
+    let pluginslua = std::fs::read_to_string(cfg.join("lua").join("plugins.lua")).unwrap();
+    assert!(
+        pluginslua.contains("uno") && !pluginslua.contains("dos"),
+        "only the ticked plugin is written to plugins.lua (got: {pluginslua:?})"
+    );
+}
+
+// ----- the manager UI: live task state + the dashboard view ------------------
+
+// The manager UI renders LIVE per-plugin progress from `M._tasks` and re-renders via
+// `M.on_change`. Install records a `done` task with the result word the UI shows, and
+// the change watchers fire — the two hooks the dashboard is built on.
+#[tokio::test]
+async fn install_records_task_state_and_fires_on_change() {
+    let (rpc, _i) = start().await;
+    let src = temp_dir("plug_tasks_src");
+    let repo = make_repo(&src, "tau");
+    let _root = setup_root(&rpc, "plug_tasks").await;
+
+    exec_lua(
+        &rpc,
+        "_G.changes = 0\n\
+         nx.plugins.on_change(function() _G.changes = _G.changes + 1 end)",
+    )
+    .await;
+    exec_lua(
+        &rpc,
+        &format!(
+            "nx.plugins {{ {{ \"file://{repo}\", name = \"tau\" }} }}\n\
+             nx.plugins.install():catch(function(e) _G.err = tostring(e and e.message or e) end)",
+            repo = q(&repo)
+        ),
+    )
+    .await;
+
+    assert!(
+        poll_true(
+            &rpc,
+            "local t = nx.plugins._tasks.tau\n\
+             return t ~= nil and t.state == 'done' and t.msg == 'installed'"
+        )
+        .await,
+        "install should record a done task for the plugin; err={:?}",
+        exec_lua(&rpc, "return _G.err").await
+    );
+    assert!(
+        poll_true(&rpc, "return _G.changes > 0").await,
+        "on_change watchers should fire during install"
+    );
+}
+
+// `:Plugins` opens the lazy-style dashboard — a focused view listing the declared
+// plugins and the action-key hints.
+#[tokio::test]
+async fn plugins_command_opens_the_manager_dashboard() {
+    let (rpc, _i) = start().await;
+    let src = temp_dir("plug_ui_src");
+    let repo = make_repo(&src, "vista");
+    setup_root(&rpc, "plug_ui").await;
+
+    // A local `dir` plugin loads eagerly with no clone, so it shows up at once.
+    exec_lua(
+        &rpc,
+        &format!(
+            "nx.plugins {{ {{ name = \"vista\", dir = \"{dir}\" }} }}",
+            dir = q(&repo)
+        ),
+    )
+    .await;
+    assert_eq!(
+        lua_bool(&rpc, "return nx.user_command.get().Plugins ~= nil").await,
+        Some(true),
+        ":Plugins command should be registered"
+    );
+    exec_lua(&rpc, "vim.cmd('Plugins')").await;
+
+    assert!(
+        poll_true(&rpc, "return vim.bo.filetype == 'nxplugins'").await,
+        ":Plugins should open the manager dashboard"
+    );
+    let mut ok = false;
+    for _ in 0..200 {
+        let body = lines(&rpc).await.join("\n");
+        if body.contains("vista") && body.contains("I install") {
+            ok = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(
+        ok,
+        "the dashboard should list the plugin and the action-key hints"
+    );
+
+    // The component blanks the end-of-buffer `~` fillers in its window (the dashboard
+    // is plugin-owned content, not an editable file). `eob:<space>` → no tildes.
+    assert!(
+        poll_true(&rpc, "return vim.wo.fillchars == 'eob: '").await,
+        "the component window should hide the end-of-buffer fill characters"
     );
 }

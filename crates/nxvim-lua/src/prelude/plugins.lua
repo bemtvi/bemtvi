@@ -23,6 +23,44 @@ M._specs = M._specs or {} -- name -> normalized spec
 M._order = M._order or {} -- declaration order (names), for deterministic sync
 M._loaded = M._loaded or {} -- name -> true once fully loaded (config ran)
 M._loading = M._loading or {} -- name -> true while a load is in flight (cycle guard)
+
+-- Per-plugin operation state, so a UI can render LIVE progress (a spinner while a
+-- clone/pull runs, a ✓/✗ when it finishes). `name -> { op = "install"|"update",
+-- state = "running"|"done"|"error", msg = <human text> }`. The git verbs below set
+-- entries here; the manager UI (prelude/plugins_ui.lua) reads them and subscribes via
+-- `M.on_change`. Survives a re-source (`or {}`) so an open UI keeps its history.
+M._tasks = M._tasks or {}
+M._watchers = M._watchers or {} -- on_change callbacks, fired on any state transition
+
+-- Fire every change watcher (a load completing, a task transitioning). Wrapped in
+-- pcall so one bad observer can't break the manager. The UI uses this to re-render.
+local function notify_change()
+  for _, fn in ipairs(M._watchers) do
+    pcall(fn)
+  end
+end
+
+-- M.on_change(fn) — subscribe to manager state changes (task transitions, plugin
+-- loads). Returns an unsubscribe function. The manager UI re-renders on each call.
+function M.on_change(fn)
+  M._watchers[#M._watchers + 1] = fn
+  return function()
+    for i, f in ipairs(M._watchers) do
+      if f == fn then
+        table.remove(M._watchers, i)
+        return
+      end
+    end
+  end
+end
+
+-- Record an operation's state for `name` and notify watchers. `state == "done"`
+-- finalizes with a result word (the spinner stops); "error" keeps the captured
+-- message so the UI can show why.
+local function set_task(name, op, state, msg)
+  M._tasks[name] = { op = op, state = state, msg = msg }
+  notify_change()
+end
 M._opts = M._opts
   or {
     -- Where clones land. One dir per plugin under here; the manager owns this
@@ -296,6 +334,7 @@ function M.load(name)
     end
     M._loaded[name] = true
     M._loading[name] = false
+    notify_change() -- a UI watching load state repaints this plugin as loaded
     return true
   end)()
 end
@@ -468,6 +507,7 @@ function M._install(name)
     if nx.await(nx.fs.exists(spec._dir)) then
       return "exists"
     end
+    set_task(name, "install", "running", "cloning")
     nx.await(nx.fs.mkdir(root(), { recursive = true }))
     local args = { "clone", "--filter=blob:none" }
     local ref = spec.branch or spec.tag
@@ -485,17 +525,20 @@ function M._install(name)
     args[#args + 1] = spec._dir
     local res = nx.await(git(args))
     if res.code ~= 0 then
+      set_task(name, "install", "error", res.stderr)
       error("nx.plugins: git clone failed for " .. name .. ": " .. res.stderr, 0)
     end
     if spec.commit then
       local co = nx.await(git({ "checkout", "--detach", spec.commit }, spec._dir))
       if co.code ~= 0 then
+        set_task(name, "install", "error", co.stderr)
         error(
           "nx.plugins: git checkout " .. spec.commit .. " failed for " .. name .. ": " .. co.stderr,
           0
         )
       end
     end
+    set_task(name, "install", "done", "installed")
     return "installed"
   end)()
 end
@@ -514,10 +557,16 @@ function M._update(name)
     if not nx.await(nx.fs.exists(spec._dir)) then
       return "missing"
     end
+    set_task(name, "update", "running", "pulling")
     local res = nx.await(git({ "pull", "--ff-only" }, spec._dir))
     if res.code ~= 0 then
+      set_task(name, "update", "error", res.stderr)
       error("nx.plugins: git pull failed for " .. name .. ": " .. res.stderr, 0)
     end
+    -- "Already up to date." means no movement; show the calmer word so the UI does
+    -- not imply a change that did not happen.
+    local moved = not res.stdout:find("up to date", 1, true)
+    set_task(name, "update", "done", moved and "updated" or "up to date")
     return "updated"
   end)()
 end
@@ -683,28 +732,29 @@ serialize_spec = function(s)
   return "{ " .. table.concat(fields, ", ") .. " }"
 end
 
--- The full `plugins.lua` text for the recommended set.
-local function serialize_recommended()
+-- The full `plugins.lua` text for `specs` (the chosen subset of the recommended set).
+local function serialize_recommended(specs)
   local lines = {
     "-- nxvim recommended plugins, added by first-run setup.",
     "-- This file is yours now: edit it to add, remove, or configure plugins.",
     "nx.plugins({",
   }
-  for _, s in ipairs(M._recommended) do
+  for _, s in ipairs(specs) do
     lines[#lines + 1] = "  " .. serialize_spec(s) .. ","
   end
   lines[#lines + 1] = "})"
   return table.concat(lines, "\n") .. "\n"
 end
 
--- Write the recommended set to `<config>/lua/plugins.lua` and make `init.lua`
+-- Write `specs` (the chosen subset) to `<config>/lua/plugins.lua` and make `init.lua`
 -- `require("plugins")` (creating it if absent, appending if it doesn't already).
 -- Leaves any hand-written init.lua otherwise untouched. Returns a promise.
-function M._persist_recommended()
+function M._persist_recommended(specs)
+  specs = specs or M._recommended
   return nx.async(function()
     local cfg = config_dir()
     nx.await(nx.fs.mkdir(cfg .. "/lua", { recursive = true }))
-    nx.await(nx.fs.write(cfg .. "/lua/plugins.lua", serialize_recommended()))
+    nx.await(nx.fs.write(cfg .. "/lua/plugins.lua", serialize_recommended(specs)))
     local init = cfg .. "/init.lua"
     local existing = ""
     if nx.await(nx.fs.exists(init)) then
@@ -724,10 +774,13 @@ local function prompted_marker()
 end
 
 -- First-run flow: on a fresh setup (the user has declared no plugins of their own,
--- a recommended set exists, and we have not asked before), prompt to install the
--- recommended set; on yes, write it to the user's config and install it now.
--- Returns a promise. Wired to `VimEnter` below, and callable directly. Re-entrant-
--- safe (`_prompting` guard) and asks only once (the marker, written either answer).
+-- a recommended set exists, and we have not asked before), open the WELCOME view — a
+-- floating checklist (prelude/plugins_ui.lua → `M.ui.welcome`) explaining that nxvim
+-- ships minimal and offering the recommended set pre-ticked, each item untickable.
+-- The chosen subset is written to the user's config and installed; an empty / skipped
+-- choice does nothing. Returns a promise. Wired to `VimEnter` below, and callable
+-- directly. Re-entrant-safe (`_prompting` guard) and asks only once (the marker,
+-- written before showing the view so a cancel still never nags again).
 function M.bootstrap()
   return nx.async(function()
     if M._prompting or #M._order > 0 or #M._recommended == 0 then
@@ -737,19 +790,28 @@ function M.bootstrap()
       return
     end
     M._prompting = true
-    local n = #M._recommended
-    local yes = nx.await(
-      nx.ui.confirm("Install the " .. n .. " recommended plugins? They'll be saved to your config.")
-    )
-    -- Record that we asked (whatever the answer) so we never nag again.
+    -- Record that we asked BEFORE showing the view, so we never nag again whatever
+    -- the user does with it (chooses, skips, or just quits).
     nx.await(nx.fs.mkdir(root(), { recursive = true }))
     nx.await(nx.fs.write(prompted_marker(), "1\n"))
+
+    -- The welcome checklist resolves to the list of chosen raw specs ({} on skip).
+    -- (Fallback to a plain confirm if the UI module somehow isn't present — e.g. a
+    -- headless build that stubbed it out — so first-run still works.)
+    local chosen
+    if M.ui and M.ui.welcome then
+      chosen = nx.await(M.ui.welcome(M._recommended))
+    else
+      local yes =
+        nx.await(nx.ui.confirm("Install the " .. #M._recommended .. " recommended plugins?"))
+      chosen = yes and M._recommended or {}
+    end
     M._prompting = false
-    if not yes then
+    if not chosen or #chosen == 0 then
       return
     end
-    nx.await(M._persist_recommended())
-    M.add(M._recommended)
+    nx.await(M._persist_recommended(chosen))
+    M.add(chosen)
     nx.await(M.sync())
   end)()
 end

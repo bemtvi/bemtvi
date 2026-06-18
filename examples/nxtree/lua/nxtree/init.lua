@@ -87,16 +87,14 @@ local function on_select(_line, node)
 end
 
 -- Run `fn` once the view's backing buffer exists (its bufnr arrives a tick after the
--- create/mount ops drain). Polls per-tick until then — cheap and race-free.
+-- create/mount ops drain). `nx.wait_for` polls between ticks until then — cheap and
+-- race-free; best-effort `:catch` in case the tree is torn down first.
 local function when_buf(fn)
-  local function attempt()
-    if tree.view:bufnr() then
-      fn()
-    else
-      nx.schedule(attempt)
-    end
-  end
-  nx.schedule(attempt)
+  nx.wait_for(function()
+    return tree.view:bufnr()
+  end)
+    :next(fn)
+    :catch(function() end)
 end
 
 -- Auto-refresh: watch the root recursively and re-scan on change. Best-effort —

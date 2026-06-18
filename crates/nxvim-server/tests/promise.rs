@@ -342,3 +342,78 @@ async fn try_adopts_a_returned_promise() {
     .await;
     assert_eq!(lua_u64(&rpc, "return _G.got").await, Some(99));
 }
+
+// ----- nx.on_next_tick / nx.wait_for: cross-tick deferral --------------------
+
+// nx.on_next_tick defers to a LATER tick — not inline, not the same convergence.
+#[tokio::test]
+async fn on_next_tick_defers_to_a_later_tick() {
+    let (rpc, _incoming) = start().await;
+    // Arming it does NOT run it inline: `inline` captured right after is still false.
+    exec_lua(
+        &rpc,
+        "_G.ran = false\n\
+         nx.on_next_tick(function() _G.ran = true end)\n\
+         _G.inline = _G.ran",
+    )
+    .await;
+    assert_eq!(
+        lua_bool(&rpc, "return _G.inline").await,
+        Some(false),
+        "on_next_tick must not run its fn inline"
+    );
+    // It fires on a later loop turn (within a short wall-clock window).
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(
+        lua_bool(&rpc, "return _G.ran").await,
+        Some(true),
+        "on_next_tick fn should have run on a later tick"
+    );
+}
+
+// nx.wait_for polls a predicate across ticks and fulfils with its truthy value.
+#[tokio::test]
+async fn wait_for_polls_across_ticks_and_resolves_with_the_value() {
+    let (rpc, _incoming) = start().await;
+    exec_lua(
+        &rpc,
+        "_G.n = 0\n\
+         _G.got = nil\n\
+         nx.wait_for(function()\n\
+           _G.n = _G.n + 1\n\
+           if _G.n >= 3 then return 'ready' end\n\
+         end):next(function(v) _G.got = v end)",
+    )
+    .await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(
+        lua_string(&rpc, "return _G.got").await,
+        Some("ready".to_string()),
+        "wait_for resolves with the predicate's truthy value once it holds"
+    );
+    assert_eq!(
+        lua_bool(&rpc, "return _G.n >= 3").await,
+        Some(true),
+        "the predicate is polled across several ticks"
+    );
+}
+
+// nx.wait_for rejects (with the given message) when the condition never holds within
+// the bounded `tries`.
+#[tokio::test]
+async fn wait_for_rejects_after_bounded_tries() {
+    let (rpc, _incoming) = start().await;
+    exec_lua(
+        &rpc,
+        "_G.err = nil\n\
+         nx.wait_for(function() return false end, { tries = 3, message = 'nope' })\n\
+           :catch(function(e) _G.err = tostring(e and e.message or e) end)",
+    )
+    .await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(
+        lua_string(&rpc, "return _G.err").await,
+        Some("nope".to_string()),
+        "an exhausted wait_for rejects with the configured message"
+    );
+}

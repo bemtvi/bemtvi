@@ -17,8 +17,11 @@
 --
 -- Try it:
 --   NXVIM_CONFIG=examples/plugins cargo run -p nxvim
+--   :Plugins        -- the lazy-style dashboard: every plugin grouped by load state,
+--                      LIVE clone/pull progress, and the action keys —
+--                      I install · U update · S sync · X clean · <CR> details · q quit
 --   :PluginSync     -- clone everything declared below (needs network + git)
---   :PluginList     -- show install / load state
+--   :PluginList     -- show install / load state (text dump)
 --   :PluginUpdate   -- fast-forward the unpinned ones
 --   :PluginClean    -- remove clones no spec declares
 --
@@ -32,7 +35,7 @@ nx.plugins({
   -- eagerly; `config` runs once it is on the runtimepath, so `colorscheme`
   -- resolves the freshly-installed colors/.
   {
-    "catppuccin/nvim",
+    "davidrios/catppuccin-nxvim",
     name = "catppuccin",
     config = function()
       vim.cmd("colorscheme catppuccin")
@@ -83,10 +86,12 @@ nx.plugins({
 -- ----- First-run recommended set (for a distribution / starter config) --------
 --
 -- Register a curated set with nx.plugins.recommend{}. On a FRESH setup — the user
--- has declared no plugins of their own and hasn't been asked before — nxvim offers
--- to install it at startup (VimEnter), and on "yes" writes it to the user's config
--- (a managed lua/plugins.lua that init.lua requires) and installs it. It asks at
--- most once, ever.
+-- has declared no plugins of their own and hasn't been asked before — nxvim opens a
+-- WELCOME checklist at startup (VimEnter): nxvim ships minimal, and the recommended
+-- set is presented pre-ticked so the user can untick anything they don't want
+-- (<Space> toggle · a all · <CR> install · <Esc> skip). The chosen subset is written
+-- to the user's config (a managed lua/plugins.lua that init.lua requires) and
+-- installed. It asks at most once, ever.
 --
 -- Because the set is serialized back to the user's config, a recommended spec's
 -- `config`/`init` must be a STRING of Lua (not a function) — everything else is a

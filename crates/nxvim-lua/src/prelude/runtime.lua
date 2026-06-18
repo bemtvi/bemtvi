@@ -148,6 +148,18 @@ function nx.timer(fn, timeout)
 end
 vim.defer_fn = nx.timer
 
+-- nx.on_next_tick(fn): run `fn` on the NEXT event-loop tick — the turn after the
+-- current one finishes. The cross-tick sibling of nx.schedule: where nx.schedule
+-- fires at the end of THIS convergence (a same-tick microtask, so it cannot observe
+-- state that only refreshes between ticks — a freshly-mounted window's id, a mirror
+-- the server repopulates each turn), nx.on_next_tick yields the tick entirely and runs
+-- on the next one, when those mirrors have been refreshed. A zero-delay one-shot
+-- timer is exactly that. Returns the timer handle, so a caller can :stop() it before
+-- it fires. (Poll across several ticks by calling it again from within `fn`.)
+function nx.on_next_tick(fn)
+  return nx.timer(fn, 0)
+end
+
 -- pid registry for async vim.system handles. The event-loop actor reports a
 -- spawned child's OS pid back to the server, which records it here keyed by the
 -- handle's callback id; the handle's `.pid` reads through this table (nil until

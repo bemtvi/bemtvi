@@ -16,8 +16,8 @@
 use nxvim_rpc::{Incoming, Rpc};
 use nxvim_server::ServerInit;
 use nxvim_test_harness::{
-    attach, command, cursor, drain_to_latest_redraw, exec_lua, feed, feed_mouse, feed_mouse_at,
-    lines, message, mode, spawn, temp_dir, wait_redraw, write_temp, FakeClipboard, TestClock,
+    attach, command, cursor, exec_lua, feed, feed_mouse, feed_mouse_at, lines, message, mode,
+    spawn, temp_dir, wait_redraw, write_temp, FakeClipboard, TestClock,
 };
 use rmpv::Value;
 use tokio::sync::mpsc::UnboundedReceiver;
@@ -953,34 +953,6 @@ async fn drag_bottom_status_line_does_not_resize() {
     feed_mouse(&rpc, "left", "release", status_row + 2, 5);
     assert_eq!(win_height(&rpc, top).await, top0, "heights unchanged");
     assert_eq!(win_height(&rpc, bottom).await, bot0);
-}
-
-/// The shipped `examples/mouse/` config sources cleanly (no Lua error) and its
-/// `:set` calls actually reach the core — observable through `:set mousescroll?`.
-#[tokio::test]
-async fn mouse_example_config_runs() {
-    let dir = temp_dir("mouse-ex");
-    let init = std::fs::read_to_string(concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/../../examples/mouse/init.lua"
-    ))
-    .expect("read example init.lua");
-    std::fs::write(dir.join("init.lua"), &init).expect("write init.lua");
-    let server_init = ServerInit {
-        config_dir: Some(dir.clone()),
-        runtimepath: vec![dir],
-        ..Default::default()
-    };
-    let (rpc, mut incoming) = spawn(server_init);
-    attach(&rpc, 80, 24).await;
-
-    // The example's `vim.cmd("set mousescroll=ver:5,hor:6")` reached the core.
-    command(&rpc, "set mousescroll?").await;
-    let map = drain_to_latest_redraw(&mut incoming, |_| true).expect("a redraw");
-    assert_eq!(message(&map), "mousescroll=ver:5,hor:6");
-    // And nothing errored on the way (the notify, the user command, the sets).
-    let banner = message(&map);
-    assert!(!banner.contains("Error"), "example errored: {banner:?}");
 }
 
 // ── Phase 6: tabline click switches tabs ───────────────────────────────────

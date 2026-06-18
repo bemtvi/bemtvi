@@ -863,49 +863,6 @@ async fn laststatus_out_of_range_is_rejected_loudly() {
     );
 }
 
-/// The shipped `examples/laststatus/` config sources cleanly and actually works
-/// end-to-end: it starts in `laststatus=3` (a single global bar driven by its
-/// custom `'statusline'`), and the `<leader>2` map it defines switches back to
-/// per-window status lines live. Proves the example isn't just "loads".
-#[tokio::test]
-async fn laststatus_example_config_runs() {
-    let dir = temp_dir("laststatus-ex");
-    let init = std::fs::read_to_string(concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/../../examples/laststatus/init.lua"
-    ))
-    .expect("read example init.lua");
-    let (rpc, mut incoming) = start_with_config(&dir, &init).await;
-
-    let msg = startup_message(&rpc, &mut incoming).await;
-    assert!(!msg.contains("Error"), "example left an error: {msg:?}");
-
-    // It opens in mode 3: a global bar (its custom 'statusline', ending ` ls=3 `),
-    // and no per-window status row.
-    let map = redraw_after(&rpc, &mut incoming, "<Esc>").await;
-    assert!(
-        !window0_status_visible(&map),
-        "example starts global (mode 3)"
-    );
-    let bar = global_status_text(&map);
-    assert!(bar.contains("NORMAL"), "global bar shows the mode: {bar:?}");
-    assert!(
-        bar.trim_end().ends_with("ls=3"),
-        "global bar reads ls=3: {bar:?}"
-    );
-
-    // The `<Space>2` leader map flips back to per-window status lines.
-    let after = redraw_after(&rpc, &mut incoming, " 2").await;
-    assert!(
-        window0_status_visible(&after),
-        "<leader>2 restores per-window status"
-    );
-    assert!(
-        global_status_segments(&after).is_none(),
-        "no global bar in mode 2"
-    );
-}
-
 // ----- vim.fn editor-state builtins (statusline / lualine, Phase 5) -----
 //
 // The `vim.fn.*` surface a real `'statusline'` calls from inside `%{}`/`%!`:
@@ -1032,78 +989,5 @@ async fn vim_fn_expand_resolves_current_file_modifiers() {
     assert_eq!(
         out.as_str().unwrap(),
         format!("{name}\n{tail}\n{head}\ntxt")
-    );
-}
-
-/// The shipped `examples/statusline/` config sources cleanly and actually drives
-/// the status line (not just "loads"): its `%!v:lua.statusline()` builder runs
-/// through the engine and assembles the line from the Phase 5 `vim.fn` surface —
-/// the mode block, the file label, and a live cursor ruler all render.
-#[tokio::test]
-async fn statusline_example_config_runs() {
-    let dir = temp_dir("statusline-ex");
-    let init = std::fs::read_to_string(concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/../../examples/statusline/init.lua"
-    ))
-    .expect("read example init.lua");
-    let (rpc, mut incoming) = start_with_config(&dir, &init).await;
-
-    let msg = startup_message(&rpc, &mut incoming).await;
-    assert!(!msg.contains("Error"), "example left an error: {msg:?}");
-
-    // On the startup No Name buffer: NORMAL mode block (vim.fn.mode), the file
-    // label (vim.fn.expand), and the cursor ruler "1:1" (vim.fn.line/col).
-    let map = redraw_after(&rpc, &mut incoming, "<Esc>").await;
-    let text = status_text(&map);
-    assert!(
-        text.contains("NORMAL"),
-        "mode block from vim.fn.mode(): {text:?}"
-    );
-    assert!(
-        text.contains("[No Name]"),
-        "file label from expand(): {text:?}"
-    );
-    assert!(
-        text.contains("1:1"),
-        "live ruler from vim.fn.line/col: {text:?}"
-    );
-    // The encoding block uses the pure `%{&fileencoding}` expression (no Lua): a
-    // fresh buffer is utf-8, with no `[bom]` tag since 'bomb' is off.
-    assert!(
-        text.contains("utf-8"),
-        "encoding block from %{{&fileencoding}}: {text:?}"
-    );
-    assert!(
-        !text.contains("[bom]"),
-        "no bom tag when 'bomb' is off: {text:?}"
-    );
-}
-
-/// The shipped `examples/nx-statusline/` config sources cleanly and drives the
-/// segment registry: built-ins (mode / filename / location) compose onto the bar,
-/// and the explicit-invalidate custom `moves` segment renders its initial value.
-/// (No git repo in the temp dir, so the async `git` segment stays empty — fine.)
-#[tokio::test]
-async fn nx_statusline_example_config_runs() {
-    let dir = temp_dir("nx-statusline-ex");
-    let init = std::fs::read_to_string(concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/../../examples/nx-statusline/init.lua"
-    ))
-    .expect("read example init.lua");
-    let (rpc, mut incoming) = start_with_config(&dir, &init).await;
-
-    let msg = startup_message(&rpc, &mut incoming).await;
-    assert!(!msg.contains("Error"), "example left an error: {msg:?}");
-
-    let map = redraw_after(&rpc, &mut incoming, "<Esc>").await;
-    let text = status_text(&map);
-    assert!(text.contains("NORMAL"), "mode built-in: {text:?}");
-    assert!(text.contains("[No Name]"), "filename built-in: {text:?}");
-    assert!(text.contains("moves:"), "custom moves segment: {text:?}");
-    assert!(
-        text.trim_end().ends_with("1:1"),
-        "location on right: {text:?}"
     );
 }

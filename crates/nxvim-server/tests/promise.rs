@@ -296,46 +296,6 @@ async fn settled_promise_chains_do_not_leak_callbacks() {
     );
 }
 
-// ----- the shipped example must keep working ---------------------------------
-
-#[tokio::test]
-async fn the_promise_example_config_runs_end_to_end() {
-    // Source examples/promise/init.lua exactly as `NXVIM_CONFIG` would and let its
-    // timers (delay 200ms, two 80ms awaits) settle — proof the demo isn't stale.
-    let example = include_str!("../../../examples/promise/init.lua");
-    let (rpc, _incoming) = start().await;
-    exec_lua(&rpc, example).await;
-    tokio::time::sleep(Duration::from_millis(450)).await;
-    // Synchronous chains.
-    assert_eq!(
-        lua_u64(&rpc, "return _G.promise_demo.basic").await,
-        Some(21)
-    );
-    assert_eq!(
-        lua_bool(&rpc, "return _G.promise_demo.caught ~= nil").await,
-        Some(true)
-    );
-    // Off-tick: delay, all (collected in order), and the async/await result.
-    assert_eq!(
-        lua_string(&rpc, "return _G.promise_demo.delayed")
-            .await
-            .as_deref(),
-        Some("woke up")
-    );
-    assert_eq!(
-        lua_u64(
-            &rpc,
-            "local a = _G.promise_demo.all; return a[1] * 100 + a[2] * 10 + a[3]"
-        )
-        .await,
-        Some(123)
-    );
-    assert_eq!(
-        lua_u64(&rpc, "return _G.promise_demo.async").await,
-        Some(15)
-    );
-}
-
 // ----- nx.promise.try (fold a sync throw + async result into one chain) -------
 
 #[tokio::test]

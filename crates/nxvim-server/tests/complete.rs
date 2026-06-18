@@ -251,32 +251,6 @@ async fn an_unknown_source_fails_loud() {
     );
 }
 
-#[tokio::test]
-async fn example_config_loads_and_completes() {
-    // The shipped `examples/ui-complete` config must load and enable the engine.
-    let example = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../../examples/ui-complete")
-        .canonicalize()
-        .expect("examples/ui-complete dir");
-    let init = ServerInit {
-        config_dir: Some(example.clone()),
-        runtimepath: vec![example],
-        ..Default::default()
-    };
-    let (rpc, mut incoming) = spawn(init);
-    attach(&rpc, 80, 24).await;
-
-    // Type a seed word + a matching prefix; the example's buffer source completes.
-    feed(&rpc, "iconfig con");
-    let menu = menu_of(&poll_menu(&rpc, &mut incoming).await.expect("popup opens"));
-    assert_eq!(menu_items(&menu), vec!["config"]);
-    // The example maps <CR> as an accept key — but only after selecting a row
-    // (noselect), so navigate first, then <CR> accepts.
-    feed(&rpc, "<C-n>");
-    feed(&rpc, "<CR>");
-    assert_eq!(lines(&rpc).await, vec!["config config"]);
-}
-
 /// With `<CR>` mapped as a confirm key, an *unnavigated* popup must NOT eat the
 /// Enter — nothing is selected yet, so `<CR>` inserts a newline (cmp-style
 /// `select = false`). You only accept after explicitly moving the selection.

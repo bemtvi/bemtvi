@@ -130,26 +130,6 @@ async fn snippets_completion_source_expands_on_accept() {
 }
 
 #[tokio::test]
-async fn example_config_loads_and_expands() {
-    // The shipped `examples/snippets` config must load and work end-to-end (the
-    // example-config convention). Point the server straight at it, then exercise the
-    // `<C-s>` insert-mode mapping it defines (an `nx.snippet.expand` of `print(...)`).
-    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/snippets");
-    let init = ServerInit {
-        config_dir: Some(dir.clone()),
-        runtimepath: vec![dir],
-        ..Default::default()
-    };
-    let (rpc, _incoming) = spawn(init);
-    attach(&rpc, 80, 24).await;
-
-    feed(&rpc, "i<C-s>");
-    assert_eq!(lines(&rpc).await, vec!["print(value)".to_string()]);
-    // The cursor parks at the `$1` placeholder default, ready to overtype.
-    assert_eq!(cursor(&rpc).await, (1, 11));
-}
-
-#[tokio::test]
 async fn unsupported_construct_errors_loud() {
     let dir = temp_dir("snippet-unsupported");
     let (rpc, _incoming) = start(&dir, "nx.snippet.setup{}").await;

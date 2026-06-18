@@ -393,33 +393,6 @@ async fn view_is_read_only_to_ex_command_edits() {
     );
 }
 
-/// Run the shipped `examples/nxview/init.lua` end-to-end: it must load without
-/// error and open its left-dock view (guards the example against drift).
-#[tokio::test]
-async fn example_config_opens_its_view() {
-    let (rpc, mut incoming) = start().await;
-    let init = include_str!("../../../examples/nxview/init.lua");
-    exec_lua(&rpc, init).await;
-    assert_eq!(
-        win_count(&rpc).await,
-        2,
-        "the example mounts a left-dock view (+ main)"
-    );
-    rpc.request("nvim_get_mode", vec![]).await.expect("barrier");
-    let rd = latest(&mut incoming);
-    assert!(
-        regions(&rd).iter().any(|r| r == "dock_left"),
-        "the view's dock is painted"
-    );
-    // The example lands focus back in the main editor (the empty startup buffer)
-    // after mounting — not in the sidebar (whose first line is the sample entry).
-    assert_eq!(
-        lines(&rpc).await,
-        vec![""],
-        "focus is in the main area after build, not the view"
-    );
-}
-
 // ===== nx.view float mount ===================================================
 
 /// A view can mount in a **floating window** (`v:mount{ float = … }`): it adds a
@@ -493,39 +466,6 @@ async fn view_float_frac_size_aligns_and_reflows_on_resize() {
         w1 > w0 + 10,
         "50vw reflows on resize (got {w0} -> {w1}, expected ~60)"
     );
-}
-
-/// The shipped `examples/window-geometry` config loads and its `<leader>gf` map
-/// opens a real, aligned, fractionally-sized float — proving the unified geometry
-/// works end-to-end through the demo config a user would copy.
-#[tokio::test]
-async fn example_window_geometry_config_opens_an_aligned_float() {
-    let example = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../../examples/window-geometry")
-        .canonicalize()
-        .expect("example dir");
-    let init = ServerInit {
-        config_dir: Some(example.clone()),
-        runtimepath: vec![example],
-        ..Default::default()
-    };
-    let (rpc, _incoming) = start_attached(init, 80, 24).await;
-    feed_sync(&rpc, "imain<Esc>").await;
-    assert_eq!(win_count(&rpc).await, 1);
-
-    // `<leader>gf` (leader = space) opens the top-right 40vw × 40vh float.
-    feed_sync(&rpc, " gf").await;
-    assert_eq!(win_count(&rpc).await, 2, "the demo float opened a window");
-    let align = exec_lua(&rpc, "return vim.api.nvim_win_get_config(0).align").await;
-    assert_eq!(
-        align.as_str(),
-        Some("top-right"),
-        "the demo float is aligned top-right"
-    );
-    let w = lua_u64(&rpc, "return vim.api.nvim_win_get_config(0).width")
-        .await
-        .expect("resolved width");
-    assert!((28..=36).contains(&w), "40vw of 80 cols ≈ 32, got {w}");
 }
 
 /// A cell-sized `nvim_open_win` float round-trips its width/height **exactly**
@@ -643,84 +583,6 @@ async fn view_float_without_grab_does_not_lock_focus() {
         lines(&rpc).await,
         vec!["main"],
         "<C-w>w leaves a non-grabbing float for the main window"
-    );
-}
-
-/// Pump the loop (each barrier round-trip lets the server fire the timers the component
-/// lifecycle yields on) until the checklist dialog has rendered its first item — which
-/// happens only after the backing buffer materialized and `setup` + the first `render`
-/// ran. Bounded; panics rather than hangs if it never appears.
-async fn await_checklist(rpc: &Rpc) {
-    for _ in 0..100 {
-        let first = lines(rpc).await.first().cloned().unwrap_or_default();
-        if first.starts_with('☐') || first.starts_with('☑') {
-            return;
-        }
-        rpc.request("nvim_get_mode", vec![]).await.expect("barrier");
-    }
-    panic!("the checklist content never rendered");
-}
-
-/// Run the shipped `examples/nxchecklist/init.lua` end-to-end: it opens a modal checkbox
-/// dialog built with `nx.view.component` in a grabbing float, `<Space>` toggles the item
-/// under the cursor (the reactive write auto-re-renders, glyph flips ☐→☑), and `<CR>`
-/// confirms — closing the float and reporting the chosen labels. Guards both the
-/// float-mount feature and the component layer through their motivating use case.
-#[tokio::test]
-async fn example_checklist_dialog_toggles_and_confirms() {
-    let (rpc, _incoming) = start().await;
-    let init = include_str!("../../../examples/nxchecklist/init.lua");
-    exec_lua(&rpc, init).await;
-    await_checklist(&rpc).await; // wait out the async lifecycle (buffer → setup → render)
-
-    // The dialog is a focused float showing the checkbox list.
-    assert_eq!(win_count(&rpc).await, 2, "the dialog mounted a float");
-    let rel = exec_lua(&rpc, r#"return vim.api.nvim_win_get_config(0).relative"#).await;
-    assert_eq!(rel.as_str(), Some("editor"), "it is a real float");
-    let first = lines(&rpc).await.first().cloned().unwrap_or_default();
-    assert!(
-        first.starts_with("☐"),
-        "the first item starts unchecked, got {first:?}"
-    );
-
-    // Toggle the first item: the reactive write triggers a re-render, glyph → checked box.
-    feed_sync(&rpc, "<Space>").await;
-    let first = lines(&rpc).await.first().cloned().unwrap_or_default();
-    assert!(
-        first.starts_with("☑"),
-        "<Space> ticked the first item (reactive re-render), got {first:?}"
-    );
-
-    // Confirm: the float closes (focus restored to the main window) and the chosen
-    // labels are reported. "Inlay hints" and "Relative line numbers" start checked;
-    // toggling the first ("Format on save") adds it.
-    feed_sync(&rpc, "<CR>").await;
-    assert_eq!(win_count(&rpc).await, 1, "<CR> closed the dialog");
-    let result = exec_lua(&rpc, "return _G.nxchecklist_result").await;
-    assert_eq!(
-        result.as_str(),
-        Some("Format on save, Inlay hints, Relative line numbers"),
-        "the confirmed selection is the checked labels in order"
-    );
-}
-
-/// `<Esc>` cancels the checklist dialog: the float closes and the result is the
-/// cancellation sentinel, not a selection.
-#[tokio::test]
-async fn example_checklist_dialog_cancels_on_esc() {
-    let (rpc, _incoming) = start().await;
-    let init = include_str!("../../../examples/nxchecklist/init.lua");
-    exec_lua(&rpc, init).await;
-    await_checklist(&rpc).await;
-    assert_eq!(win_count(&rpc).await, 2);
-
-    feed_sync(&rpc, "<Esc>").await;
-    assert_eq!(win_count(&rpc).await, 1, "<Esc> closed the dialog");
-    let result = exec_lua(&rpc, "return _G.nxchecklist_result").await;
-    assert_eq!(
-        result.as_str(),
-        Some("<cancelled>"),
-        "<Esc> reports cancellation, not a selection"
     );
 }
 

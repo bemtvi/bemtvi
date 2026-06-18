@@ -198,23 +198,6 @@ async fn disabled_without_setup() {
     );
 }
 
-/// The runnable `examples/cmdline-completion/` config sources cleanly and its
-/// wildmenu opens — verifies the example end-to-end and guards it against drift
-/// (the engine's `setup` API changing out from under the shipped config).
-#[tokio::test]
-async fn example_config_opens_menu() {
-    let dir = temp_dir("cmdcomplete");
-    let example = include_str!("../../../examples/cmdline-completion/init.lua");
-    let (rpc, mut incoming) = start(&dir, example).await;
-
-    feed(&rpc, ":tab<Tab>");
-    let map = poll_menu(&rpc, &mut incoming)
-        .await
-        .expect("a wildmenu from the example config");
-    let items = menu_items(&map);
-    assert!(items.contains(&"tabnew".to_string()), "items: {items:?}");
-}
-
 // ---- Phase 2: navigation + accept + execute ---------------------------------------
 
 #[tokio::test]

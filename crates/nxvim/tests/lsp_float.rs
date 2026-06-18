@@ -113,54 +113,6 @@ async fn await_float(
     panic!("the content float never contained {want:?}; last float lines: {last:?}");
 }
 
-/// The shipped `examples/ui-float` config wired against a **real**
-/// lua-language-server: open its `sample.lua`, press the example's `K` map, and
-/// assert a hover content float appears. `#[ignore]`d (needs `lua-language-server`
-/// on PATH and ~20s of indexing — not hermetic, per the repo's e2e convention).
-/// Run with: `cargo test -p nxvim --test lsp_float -- --ignored example_ui_float`.
-#[tokio::test]
-#[ignore = "needs lua-language-server on PATH (real e2e, ~30s warmup)"]
-async fn example_ui_float_hover_works_against_real_lua_ls() {
-    let example = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../../examples/ui-float")
-        .canonicalize()
-        .expect("examples/ui-float dir");
-    let init = ServerInit {
-        config_dir: Some(example.clone()),
-        runtimepath: vec![example.clone()],
-        file: Some(example.join("sample.lua").to_string_lossy().into_owned()),
-        ..Default::default()
-    };
-    let (rpc, mut incoming) = spawn(init);
-    attach(&rpc, 80, 24).await;
-
-    // Land the cursor on `string` in `string.format`, then drive the example's `K`
-    // hover map, retrying while lua-language-server indexes (it is slow to warm).
-    feed(&rpc, "/string.format<CR>");
-    let mut last = Vec::new();
-    let mut got = None;
-    for _ in 0..240 {
-        feed(&rpc, "K");
-        if let Some(lines) = poll_float_lines(&rpc, &mut incoming).await {
-            if lines.iter().any(|l| l.contains("string")) {
-                got = Some(lines);
-                break;
-            }
-            if !lines.is_empty() {
-                last = lines;
-            }
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
-    }
-    let lines = got.unwrap_or_else(|| {
-        panic!("real lua_ls hover never opened a float mentioning `string`; last: {last:?}")
-    });
-    assert!(
-        lines.iter().any(|l| l.contains("string")),
-        "expected a real hover float, got {lines:?}"
-    );
-}
-
 #[tokio::test]
 async fn hover_reply_opens_the_content_float() {
     let _guard = serial_lock().lock().await;

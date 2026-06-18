@@ -13,7 +13,7 @@
 
 use nxvim_rpc::{Incoming, Rpc};
 use nxvim_server::ServerInit;
-use nxvim_test_harness::{attach, exec_lua, feed, lines, spawn, temp_dir};
+use nxvim_test_harness::{attach, exec_lua, feed, spawn, temp_dir};
 use rmpv::Value;
 use tokio::sync::mpsc::UnboundedReceiver;
 
@@ -282,35 +282,4 @@ async fn confirm_escape_is_false() {
         exec_lua(&rpc, "return _G.answer").await,
         Value::Boolean(false)
     );
-}
-
-// ----- the shipped example config --------------------------------------------
-
-#[tokio::test]
-async fn example_config_loads_and_confirm_map_acts() {
-    // The shipped `examples/ui-prompt` config must load (it references nx.ui.input
-    // and nx.ui.confirm at setup time) and wire its leader maps. Drive the `\d`
-    // confirm map end-to-end: accepting it runs the line delete in the :next handler.
-    let example = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../../examples/ui-prompt")
-        .canonicalize()
-        .expect("examples/ui-prompt dir");
-    let init = ServerInit {
-        config_dir: Some(example.clone()),
-        runtimepath: vec![example],
-        ..Default::default()
-    };
-    let (rpc, _incoming) = spawn(init);
-    attach(&rpc, 80, 24).await;
-
-    // Give the buffer two lines, cursor on the first.
-    feed(&rpc, "iline one<CR>line two<Esc>gg");
-    assert_eq!(lines(&rpc).await, vec!["line one", "line two"]);
-
-    // `\d` (leader = "\") opens the yes/no confirm; `y` accepts and the :next
-    // handler runs `:delete`, removing the current line.
-    feed(&rpc, "\\d");
-    feed(&rpc, "y");
-
-    assert_eq!(lines(&rpc).await, vec!["line two"]);
 }

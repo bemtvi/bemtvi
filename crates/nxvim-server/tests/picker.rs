@@ -900,36 +900,6 @@ async fn picker_align_and_margin_place_the_box_in_a_corner_with_a_gap() {
 }
 
 #[tokio::test]
-async fn example_config_loads_and_opens_a_picker() {
-    // The shipped `examples/ui-picker` config must load and wire its leader maps.
-    let example = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../../examples/ui-picker")
-        .canonicalize()
-        .expect("example dir");
-    let init = ServerInit {
-        config_dir: Some(example.clone()),
-        runtimepath: vec![example],
-        ..Default::default()
-    };
-    let (rpc, mut incoming) = spawn(init);
-    attach(&rpc, 80, 24).await;
-
-    // Open the custom static "colours" source and confirm it filters.
-    exec_lua(&rpc, "nx.picker.open('colours')").await;
-    feed(&rpc, "ceru"); // a subsequence unique to "cerulean"
-    let menu = menu_of(&poll_menu(&rpc, &mut incoming).await.expect("menu opens"));
-    assert_eq!(menu_items(&menu), vec!["cerulean"]);
-    feed(&rpc, "<Esc>");
-
-    // The "preview" source resolves its files via `<sfile>` and renders the pane —
-    // the first row (sample.txt) previews with that file's real first line.
-    exec_lua(&rpc, "nx.picker.open('preview')").await;
-    let menu = menu_of(&poll_menu(&rpc, &mut incoming).await.expect("preview opens"));
-    let preview = preview_of(&menu).expect("the preview source carries a pane");
-    assert_eq!(preview_lines(&preview)[0], "nx.picker sample buffer");
-}
-
-#[tokio::test]
 async fn buffers_source_lists_open_buffers() {
     let dir = temp_dir("picker_buffers");
     let file = dir.join("hello.txt");

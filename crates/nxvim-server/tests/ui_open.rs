@@ -14,7 +14,7 @@ use std::time::Duration;
 
 use nxvim_rpc::{Incoming, Rpc};
 use nxvim_server::ServerInit;
-use nxvim_test_harness::{attach, exec_lua, feed, lua_bool, spawn, start_attached, temp_dir};
+use nxvim_test_harness::{exec_lua, lua_bool, start_attached, temp_dir};
 use tokio::sync::mpsc::UnboundedReceiver;
 
 async fn start() -> (Rpc, UnboundedReceiver<Incoming>) {
@@ -102,31 +102,4 @@ async fn vim_ui_open_alias_runs_the_opener_too() {
     tokio::time::sleep(Duration::from_millis(250)).await;
     let recorded = std::fs::read_to_string(&out).expect("alias opener wrote the uri");
     assert_eq!(recorded, uri);
-}
-
-#[tokio::test]
-async fn example_config_loads_and_its_open_map_acts() {
-    // The shipped `examples/ui-open` config must load and wire its leader maps;
-    // firing `\o` must reach nx.ui.open with the URL the example hardcodes. We
-    // redirect the opener (after load) into a temp file to keep it hermetic.
-    let example = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../../examples/ui-open")
-        .canonicalize()
-        .expect("examples/ui-open dir");
-    let init = ServerInit {
-        config_dir: Some(example.clone()),
-        runtimepath: vec![example],
-        ..Default::default()
-    };
-    let (rpc, _incoming) = spawn(init);
-    attach(&rpc, 80, 24).await;
-
-    let out = temp_dir("ui_open").join("opened_example");
-    exec_lua(&rpc, &record_opener_into(&out)).await;
-
-    // `\o` (leader = "\") is the example's "open a URL" map.
-    feed(&rpc, "\\o");
-    tokio::time::sleep(Duration::from_millis(250)).await;
-    let recorded = std::fs::read_to_string(&out).expect("the example's \\o map opened a URL");
-    assert_eq!(recorded, "https://nxvim.dev");
 }

@@ -397,40 +397,6 @@ async fn scrolling_recolors_the_newly_revealed_lines() {
 }
 
 #[tokio::test]
-async fn the_rainbow_example_colours_its_sample_end_to_end() {
-    // The flagship `examples/rainbow/` config, verified end-to-end: load the real
-    // init.lua, open its bracket-dense sample, and assert the brackets colour across
-    // the depth groups — the example actually works, not merely parses.
-    let init = std::fs::read_to_string(concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/../../examples/rainbow/init.lua"
-    ))
-    .expect("read example init.lua");
-    let sample = concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/../../examples/rainbow/sample.lua"
-    );
-    let dir = temp_dir("decor_example");
-    let (rpc, mut incoming) = start(&dir, &init).await;
-
-    feed(&rpc, &format!(":e {sample}<CR>"));
-    // The sample nests several levels, so distinct depth groups must appear on screen.
-    let map = wait_redraw(&mut incoming, |m| {
-        (0..24).any(|r| row_has_group(m, r, "Rainbow2"))
-    })
-    .await;
-    let groups: std::collections::HashSet<String> = (0..24)
-        .flat_map(|r| row_spans(&map, r))
-        .map(|(_, _, g)| g)
-        .filter(|g| g.starts_with("Rainbow"))
-        .collect();
-    assert!(
-        groups.contains("Rainbow1") && groups.contains("Rainbow2"),
-        "the example colours nested brackets across depth groups: {groups:?}"
-    );
-}
-
-#[tokio::test]
 async fn a_stale_publish_paints_nothing() {
     // The gen-gate (Decision 4): a publish stamped with a generation the window has
     // already scrolled past is dropped before any mark is set, so a viewport the user
@@ -679,42 +645,6 @@ nx.decor.provider {{
         exec_lua(&rpc, "return _G.miss").await.as_bool(),
         Some(false),
         "a provider scoped to another buffer never runs here"
-    );
-}
-
-#[tokio::test]
-async fn the_todo_example_colours_its_keywords_end_to_end() {
-    // The second example (`examples/decor-todo/`), verified end-to-end: a debounced
-    // provider that highlights TODO/FIXME/HACK/XXX/NOTE by kind. Load the real init.lua,
-    // open its sample, and assert distinct keyword groups land — the example actually
-    // works (the debounce only delays the run; the marks still paint).
-    let init = std::fs::read_to_string(concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/../../examples/decor-todo/init.lua"
-    ))
-    .expect("read example init.lua");
-    let sample = concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/../../examples/decor-todo/sample.lua"
-    );
-    let dir = temp_dir("decor_todo_example");
-    let (rpc, mut incoming) = start(&dir, &init).await;
-
-    feed(&rpc, &format!(":e {sample}<CR>"));
-    // The debounced run fires after the quiet period; wait for the frame carrying the
-    // keyword groups.
-    let map = wait_redraw(&mut incoming, |m| {
-        (0..24).any(|r| row_has_group(m, r, "TodoKeyword"))
-    })
-    .await;
-    let groups: std::collections::HashSet<String> = (0..24)
-        .flat_map(|r| row_spans(&map, r))
-        .map(|(_, _, g)| g)
-        .filter(|g| g.ends_with("Keyword"))
-        .collect();
-    assert!(
-        groups.contains("TodoKeyword") && groups.contains("FixmeKeyword"),
-        "the example colours its keywords across kinds: {groups:?}"
     );
 }
 

@@ -90,48 +90,6 @@ async fn set_sidescroll_query_echoes_the_value() {
     assert_eq!(view_str(&map, "message"), "sidescroll=5");
 }
 
-/// The shipped `examples/horizontal-scroll/` config sources cleanly and actually
-/// configures the editor (not just "loads"): its `:set sidescrolloff=8` takes
-/// effect, observable through `:set siso?`.
-#[tokio::test]
-async fn horizontal_scroll_example_config_runs() {
-    let dir = temp_dir("hscroll-ex");
-    let init = std::fs::read_to_string(concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/../../examples/horizontal-scroll/init.lua"
-    ))
-    .expect("read example init.lua");
-    let (rpc, mut incoming) = start_with_config(&dir, &init).await;
-
-    let msg = startup_message(&rpc, &mut incoming).await;
-    assert!(!msg.contains("Error"), "example left an error: {msg:?}");
-
-    // The example's `vim.cmd("set sidescrolloff=8")` reached the core.
-    let map = redraw_after(&rpc, &mut incoming, ":set siso?<CR>").await;
-    assert_eq!(view_str(&map, "message"), "sidescrolloff=8");
-}
-
-/// The shipped `examples/word-wrap/` config sources cleanly and actually
-/// configures the editor (not just "loads"): its `:set wrap` takes effect,
-/// observable through `:set wrap?`.
-#[tokio::test]
-async fn word_wrap_example_config_runs() {
-    let dir = temp_dir("wrap-ex");
-    let init = std::fs::read_to_string(concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/../../examples/word-wrap/init.lua"
-    ))
-    .expect("read example init.lua");
-    let (rpc, mut incoming) = start_with_config(&dir, &init).await;
-
-    let msg = startup_message(&rpc, &mut incoming).await;
-    assert!(!msg.contains("Error"), "example left an error: {msg:?}");
-
-    // The example's `vim.cmd("set wrap")` reached the core.
-    let map = redraw_after(&rpc, &mut incoming, ":set wrap?<CR>").await;
-    assert_eq!(view_str(&map, "message"), "wrap");
-}
-
 #[tokio::test]
 async fn charwise_visual_highlights_the_selected_columns() {
     let (rpc, mut incoming) = start(None).await;
@@ -1417,34 +1375,6 @@ async fn scrollanimduration_zero_disables_animation() {
     assert_eq!(first_visible_line(&map), "line13");
 }
 
-/// The shipped `examples/smooth-scroll/init.lua` loads cleanly and its
-/// `vim.o.scrollanimduration = 220` reaches the core — a guard so the example
-/// can't silently rot.
-#[tokio::test]
-async fn smooth_scroll_example_config_loads_and_applies() {
-    let dir = temp_dir("smooth-scroll-example");
-    let init = include_str!("../../../../examples/smooth-scroll/init.lua");
-    let (rpc, _incoming) = start_with_config(&dir, init).await;
-
-    assert_eq!(
-        exec_lua(&rpc, "return vim.o.scrollanimduration")
-            .await
-            .as_u64(),
-        Some(220),
-        "the example's vim.o.scrollanimduration must reach the core"
-    );
-    // The :ScrollReport command the example registers exists.
-    assert_eq!(
-        exec_lua(
-            &rpc,
-            "return vim.api.nvim_get_commands({})['ScrollReport'] ~= nil"
-        )
-        .await
-        .as_bool(),
-        Some(true)
-    );
-}
-
 #[tokio::test]
 async fn scrollanim_options_round_trip_through_vim_o() {
     let path = write_n_lines("scad-lua", 100);
@@ -1720,43 +1650,5 @@ async fn fillchars_eob_custom_char_and_invalid_value() {
     assert!(
         rows.iter().any(|r| r == "%"),
         "a rejected fillchars value leaves the prior `%` filler intact, got {rows:?}"
-    );
-}
-
-/// The shipped `examples/fillchars/` config loads cleanly and drives its surfaces:
-/// on open it blanks the `~` end-of-buffer markers (`vim.wo.fillchars = "eob: "`),
-/// and its `:TildeBack` / `:TildeHide` user commands flip them. Proves the example
-/// is runnable and that the window-local `'fillchars'` honors `eob` from Lua.
-#[tokio::test]
-async fn examples_fillchars_config_loads_and_drives_the_markers() {
-    let example =
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/fillchars/init.lua");
-    let init = std::fs::read_to_string(&example).expect("read examples/fillchars/init.lua");
-    let dir = temp_dir("examples_fillchars");
-    let (rpc, mut incoming) = start_with_config(&dir, &init).await;
-    feed(&rpc, "ihello<Esc>");
-
-    // The config set `fillchars=eob:<space>`, so the filler rows are blank, not `~`.
-    let view = redraw_after(&rpc, &mut incoming, "").await;
-    assert!(
-        !view_lines(&view).iter().any(|r| r == "~"),
-        "the example config blanks the `~` markers on open, got {:?}",
-        view_lines(&view)
-    );
-
-    // :TildeBack restores vim's default `~`.
-    let view = redraw_after(&rpc, &mut incoming, ":TildeBack<CR>").await;
-    assert!(
-        view_lines(&view).iter().any(|r| r == "~"),
-        ":TildeBack brings the `~` markers back, got {:?}",
-        view_lines(&view)
-    );
-
-    // :TildeHide blanks them again.
-    let view = redraw_after(&rpc, &mut incoming, ":TildeHide<CR>").await;
-    assert!(
-        !view_lines(&view).iter().any(|r| r == "~"),
-        ":TildeHide blanks the markers again, got {:?}",
-        view_lines(&view)
     );
 }

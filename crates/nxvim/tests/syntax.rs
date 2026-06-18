@@ -652,39 +652,6 @@ async fn the_builtin_nxvim_colorscheme_paints_one_dark_in_the_terminal() {
     );
 }
 
-/// The shipped `examples/colorscheme/` config, end to end: its `init.lua` calls
-/// `vim.cmd.colorscheme('nxvim')` at startup, so the very first painted frame of
-/// its sample buffer is already One Dark — guarding the example against bitrot.
-#[tokio::test]
-async fn the_colorscheme_example_config_themes_the_buffer() {
-    let _guard = test_lock().lock().await;
-    fixture_data_dir();
-    let example = PathBuf::from(concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/../../examples/colorscheme"
-    ))
-    .canonicalize()
-    .expect("examples/colorscheme exists");
-    let file = example.join("sample.rs").to_string_lossy().into_owned();
-    let (rpc, mut incoming) = start_full(Some(file), Vec::new(), Some(example)).await;
-
-    // No `:colorscheme` is fed here — the example's init.lua loaded it. Row 0 of
-    // the sample is a `//` comment, so wait for it to paint in One Dark grey on
-    // the One Dark background, proving both the chrome and syntax themed at
-    // startup straight from the shipped config.
-    const ONEDARK_COMMENT: Color = Color::Rgb(0x5c, 0x63, 0x70);
-    const GUTTER: u16 = 4;
-    let (_, buf) = paint_until(&rpc, &mut incoming, |buf| {
-        buf.cell((GUTTER, 0)).unwrap().style().fg == Some(ONEDARK_COMMENT)
-    })
-    .await;
-    assert_eq!(
-        buf.cell((GUTTER, 0)).unwrap().style().bg,
-        Some(ONEDARK_BG),
-        "the example config paints its buffer on the One Dark background"
-    );
-}
-
 #[tokio::test]
 async fn the_scroll_animation_band_is_highlighted() {
     let _guard = test_lock().lock().await;

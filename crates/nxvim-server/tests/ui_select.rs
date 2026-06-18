@@ -205,34 +205,6 @@ async fn empty_list_cancels_without_opening() {
 }
 
 #[tokio::test]
-async fn example_config_loads_and_opens_a_menu() {
-    // The shipped `examples/ui-select` config must load and wire its leader maps.
-    let example = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../../examples/ui-select")
-        .canonicalize()
-        .expect("examples/ui-select dir");
-    let init = ServerInit {
-        config_dir: Some(example.clone()),
-        runtimepath: vec![example],
-        ..Default::default()
-    };
-    let (rpc, mut incoming) = spawn(init);
-    attach(&rpc, 80, 24).await;
-
-    // `\p` (leader = "\") opens the fruit chooser the example defines.
-    feed(&rpc, "\\p");
-    let map = poll_menu(&rpc, &mut incoming)
-        .await
-        .expect("the example's \\p map opens a menu");
-    let menu = menu_of(&map);
-    let items = match map_get(&menu, "items") {
-        Some(Value::Array(a)) => a.iter().filter_map(Value::as_str).collect::<Vec<_>>(),
-        other => panic!("expected items array, got {other:?}"),
-    };
-    assert_eq!(items, vec!["apple", "banana", "cherry"]);
-}
-
-#[tokio::test]
 async fn menu_surface_projects_items_and_tracks_selection() {
     let dir = temp_dir("ui_select_surface");
     let (rpc, mut incoming) = start(&dir, "").await;

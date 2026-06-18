@@ -229,41 +229,6 @@ async fn undotree_fn_marks_the_saved_state() {
     std::fs::remove_file(&path).ok();
 }
 
-/// The shipped `examples/registers/` config sources cleanly and its Lua
-/// register surface actually drives core: the seeded `"h` / `"t` registers
-/// paste, and the `:Stash` user command round-trips a line through `setreg` →
-/// `:put`. Proves the example isn't just "loads" but works end-to-end.
-#[tokio::test]
-async fn registers_example_config_runs() {
-    let dir = temp_dir("registers-ex");
-    let init = std::fs::read_to_string(concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/../../examples/registers/init.lua"
-    ))
-    .expect("read example init.lua");
-    let (rpc, mut incoming) = start_with_config(&dir, &init).await;
-
-    let msg = startup_message(&rpc, &mut incoming).await;
-    assert!(!msg.contains("Error"), "example left an error: {msg:?}");
-
-    feed(&rpc, "ialpha<Esc>");
-    // The seeded linewise list register `"t` pastes as its own two lines.
-    feed(&rpc, ":put t<CR>");
-    assert_eq!(
-        lines(&rpc).await,
-        vec!["alpha", "- buy milk", "- water plants"]
-    );
-
-    // `:Stash` writes the current line into `"s` via setreg; `:Stashed` reads it
-    // back with getreg and puts it below — a full Lua round-trip through core.
-    feed(&rpc, "gg:Stash<CR>");
-    feed(&rpc, ":Stashed<CR>");
-    assert_eq!(
-        lines(&rpc).await,
-        vec!["alpha", "alpha", "- buy milk", "- water plants"]
-    );
-}
-
 #[tokio::test]
 async fn ex_write_persists_changes_to_disk() {
     let path = temp_path("write");

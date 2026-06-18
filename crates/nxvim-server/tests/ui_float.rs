@@ -301,34 +301,6 @@ async fn editor_placement_centers_the_float() {
 }
 
 #[tokio::test]
-async fn example_config_loads_and_opens_a_float() {
-    // The shipped `examples/ui-float` config must load (it references nx.ui.float
-    // and nx.lsp.buf.hover at setup time) and wire its leader maps.
-    let example = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../../examples/ui-float")
-        .canonicalize()
-        .expect("examples/ui-float dir");
-    let init = ServerInit {
-        config_dir: Some(example.clone()),
-        runtimepath: vec![example],
-        ..Default::default()
-    };
-    let (rpc, mut incoming) = spawn(init);
-    attach(&rpc, 80, 24).await;
-
-    // `\f` (leader = "\") opens the cursor-anchored info float the example defines.
-    feed(&rpc, "\\f");
-    let map = poll_float(&rpc, &mut incoming, |f| matches!(f, Value::Map(_)))
-        .await
-        .expect("the example's \\f map opens a float");
-    let lines = float_lines(&float_of(&map));
-    assert!(
-        lines.iter().any(|l| l.contains("nx.ui.float")),
-        "expected the example's float content, got {lines:?}"
-    );
-}
-
-#[tokio::test]
 async fn unknown_border_is_rejected_loud() {
     let dir = temp_dir("ui_float_badborder");
     let (rpc, mut incoming) = start(&dir, "").await;

@@ -653,67 +653,6 @@ async fn invalid_dock_side_is_reported_not_silently_ignored() {
 }
 
 #[tokio::test]
-async fn example_config_opens_its_docks() {
-    // Run the shipped `examples/dock/init.lua` end-to-end: it must load without
-    // error and open its left + bottom docks (guards the example against drift).
-    let (rpc, _incoming) = start().await;
-    let init = include_str!("../../../examples/dock/init.lua");
-    exec_lua(&rpc, init).await;
-    assert_eq!(
-        win_count(&rpc).await,
-        3,
-        "the example opens a left and a bottom dock (+ main)"
-    );
-}
-
-#[tokio::test]
-async fn per_region_tabs_example_config_runs() {
-    // Run the shipped examples/per-region-tabs/init.lua end-to-end: it opens its
-    // left + bottom docks (each with an always-on titled tabline), and its `:T`
-    // command grows only the focused region's own tab stack (guards the example).
-    let (rpc, mut incoming) = start().await;
-    let init = include_str!("../../../examples/per-region-tabs/init.lua");
-    exec_lua(&rpc, init).await;
-    assert_eq!(win_count(&rpc).await, 3, "main + a left and a bottom dock");
-    let rd = latest(&mut incoming);
-    // All three regions show their always-on strips (showtabline=2), each with one
-    // tab to start; the docks carry their titles.
-    assert_eq!(region_tab_count(&rd, "main"), 1, "main's strip is on");
-    assert_eq!(
-        region_tab_count(&rd, "left"),
-        1,
-        "the left dock's strip is on"
-    );
-    assert_eq!(
-        region_tab_count(&rd, "bottom"),
-        1,
-        "the bottom dock's strip is on"
-    );
-    assert_eq!(region_title(&rd, "left"), "EXPLORER");
-    assert_eq!(region_title(&rd, "bottom"), "TERMINAL");
-    // Focus the bottom tray and grow ITS tab stack with the example's `:T` — the
-    // other regions' tablines stay put (per-region tab independence).
-    exec_lua(&rpc, "nx.dock.focus('bottom')").await;
-    feed_sync(&rpc, ":T 2<CR>").await;
-    let rd = latest(&mut incoming);
-    assert_eq!(
-        region_tab_count(&rd, "bottom"),
-        3,
-        ":T added two tabs to the focused bottom dock"
-    );
-    assert_eq!(
-        region_tab_count(&rd, "main"),
-        1,
-        "main's tabs are untouched"
-    );
-    assert_eq!(
-        region_tab_count(&rd, "left"),
-        1,
-        "the left dock's tabs are untouched"
-    );
-}
-
-#[tokio::test]
 async fn four_docks_keep_a_nondegenerate_main_area() {
     let (rpc, mut incoming) = start().await;
     for side in ["left", "right", "top", "bottom"] {

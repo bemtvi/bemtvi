@@ -33,6 +33,8 @@
   }
   #grid .row { position: absolute; left: 0; height: var(--ch); line-height: var(--ch); }
   .win { position: absolute; overflow: hidden; }
+  /* A floating window's opaque chrome box (blocks the tiled windows beneath). */
+  .float-win { background: #21252b; }
   .gutter { color: var(--gutter); }
   .gutter-cur { color: var(--gutter-cur); }
   .eob { color: var(--eob); }
@@ -53,15 +55,20 @@
   .cmdline { position: absolute; left: 0; height: var(--ch); line-height: var(--ch); color: var(--fg); }
   .diag-underline { text-decoration: underline wavy; text-decoration-thickness: 1px; text-underline-offset: 2px; }
   .inlay { color: #5c6370; font-style: italic; }
-  .pmenu { position: absolute; background: #21252b; border: 1px solid #3e4451; z-index: 10; white-space: pre; }
+  .pmenu { position: absolute; background: #21252b; z-index: 10; white-space: pre; }
+  /* The opaque chrome box behind a popup, carrying its box-drawing glyph border. */
+  .popup-chrome { position: absolute; background: #21252b; z-index: 10; white-space: pre; }
   /* `#grid`-scoped so these beat `#grid .row` (line above), whose `position:absolute`
      would otherwise win on ID specificity and collapse every popup row to the box top
      (`top:auto`) — leaving the items overlaid instead of stacked down the float. */
   #grid .pmenu .row { position: static; height: var(--ch); line-height: var(--ch); }
+  /* Box-drawing border glyphs + title for content floats (nx.ui.float). */
+  .float-border { color: #5c6370; }
+  .float-title { color: var(--fg); }
   .pmenu-sel { background: var(--sel); color: #e6e6e6; }
   .pmenu-match { color: #e5c07b; font-weight: bold; }
   .pmenu-prompt { color: #abb2bf; }
-  .pmenu-doc { position: absolute; background: #21252b; border: 1px solid #3e4451; z-index: 10; white-space: pre; color: var(--status-fg); }
+  .pmenu-doc { position: absolute; background: #21252b; z-index: 10; white-space: pre; color: var(--status-fg); }
   #grid .pmenu-doc .row { position: static; height: var(--ch); line-height: var(--ch); }
   /* A tiny boot/transport indicator, hidden shortly after the first frame. */
   #status { position: fixed; right: 6px; bottom: 4px; font-size: 11px; opacity: .4;
@@ -992,7 +999,7 @@
         if (statusRows > 0 && w.status_visible !== false) {
           renderStatusSegments(box, w.status || [], textRows, rect.width, w.focused);
         }
-      } else if (statusRows > 0) {
+      } else if (statusRows > 0 && w.status_visible !== false) {
         renderStatus(box, w, textRows);
       }
     }
@@ -1413,9 +1420,12 @@
       const rows = Math.max(1, Math.min(pmenu.height, pmenu.items.length));
       const first = Math.max(0, Math.min(pmenu.selected - rows + 1, pmenu.items.length - rows));
       const start = pmenu.selected >= rows ? first : 0;
+      // Single-line glyph border (matching the TUI's render_pmenu Borders::ALL); the
+      // item list sits one cell inside the ring.
+      const { cx, cy } = popupChrome(x, y, pmenu.width, rows);
       const box = document.createElement("div");
       box.className = "pmenu";
-      place(box, x, y, pmenu.width, rows);
+      place(box, cx, cy, pmenu.width, rows);
       for (let i = 0; i < rows; i++) {
         const idx = start + i;
         const [label, , detail] = pmenu.items[idx] || ["", 0, ""];
@@ -1432,9 +1442,12 @@
       gridEl.appendChild(box);
       if (pmenu.doc && pmenu.doc.length) {
         const docW = Math.max(...pmenu.doc.map((l) => l.length), 1);
+        // The doc preview is its own bordered box, flush against the popup's right edge
+        // (past its border ring).
+        const { cx: dcx, cy: dcy } = popupChrome(x + pmenu.width + 2, y, docW, pmenu.doc.length);
         const docBox = document.createElement("div");
         docBox.className = "pmenu-doc";
-        place(docBox, x + pmenu.width, y, docW, pmenu.doc.length);
+        place(docBox, dcx, dcy, docW, pmenu.doc.length);
         for (const l of pmenu.doc) {
           const rowEl = document.createElement("div");
           rowEl.className = "row";
@@ -1450,21 +1463,45 @@
     // hover / signature help) — the list-less sibling of the menu. Server-placed
     // geometry (text-area-relative `row`/`col`), no list / selection / scrolling
     // (the server already windowed the lines to `height`).
+    // Box-drawing glyph sets per border style, matching the TUI's `BorderType`
+    // mapping and the GUI's `draw_float_border`, so rounded corners actually look
+    // rounded on every client.
+    function floatBorderGlyphs(border) {
+      switch (border) {
+        case "rounded": return { tl: "╭", tr: "╮", bl: "╰", br: "╯", h: "─", v: "│" };
+        case "double":  return { tl: "╔", tr: "╗", bl: "╚", br: "╝", h: "═", v: "║" };
+        case "solid":   return { tl: "█", tr: "█", bl: "█", br: "█", h: "█", v: "█" };
+        default:        return { tl: "┌", tr: "┐", bl: "└", br: "┘", h: "─", v: "│" }; // single
+      }
+    }
+    function floatBorderSpan(text) {
+      const s = document.createElement("span");
+      s.className = "float-border";
+      s.textContent = text;
+      return s;
+    }
+
     function renderContentFloat(float, tablineRows) {
       const fw = view.windows.find((w) => w.focused) || view.windows[0];
       const rect = fw ? winRect(fw) : { x: 0, y: 0 };
       const x = rect.x + float.col;
       const y = tablineRows + rect.y + float.row;
+      const bordered = float.border && float.border !== "none";
+      const inner = float.width; // content cell width (border adds a ring around it)
+      // The shared chrome draws the bg + glyph border + title; the content box sits one
+      // cell inside (or at the bare rect when borderless).
+      let cx = x, cy = y;
+      if (bordered) {
+        ({ cx, cy } = popupChrome(x, y, inner, float.height, { style: float.border, title: float.title }));
+      }
       const box = document.createElement("div");
       box.className = "pmenu";
-      // Drop the 1px border rule for a borderless float (the "none" keyword).
-      if (!float.border || float.border === "none") box.style.border = "0";
-      place(box, x, y, float.width, float.height);
+      place(box, cx, cy, inner, float.height);
       const lines = float.lines || [];
       for (let i = 0; i < float.height; i++) {
         const rowEl = document.createElement("div");
         rowEl.className = "row";
-        rowEl.style.width = float.width * cw + "px";
+        rowEl.style.width = inner * cw + "px";
         // Each line is a chunk run `[[text, style_id], …]`: paint each chunk in its
         // palette style (a styled which-key colours keys vs. descriptions and dims
         // unavailable rows), clip to the box width, and pad the rest so the popup
@@ -1472,8 +1509,8 @@
         // null id and renders in the default popup color.
         let used = 0;
         for (const [text, id] of (lines[i] || [])) {
-          if (used >= float.width) break;
-          const shown = String(text ?? "").slice(0, float.width - used);
+          if (used >= inner) break;
+          const shown = String(text ?? "").slice(0, inner - used);
           if (!shown) continue;
           used += shown.length;
           const span = document.createElement("span");
@@ -1482,8 +1519,8 @@
           span.textContent = shown;
           rowEl.appendChild(span);
         }
-        if (used < float.width) {
-          rowEl.appendChild(document.createTextNode(" ".repeat(float.width - used)));
+        if (used < inner) {
+          rowEl.appendChild(document.createTextNode(" ".repeat(inner - used)));
         }
         box.appendChild(rowEl);
       }
@@ -1496,27 +1533,39 @@
     function renderMenu(menu, tablineRows, cmdRow) {
       const fw = view.windows.find((w) => w.focused) || view.windows[0];
       const rect = fw ? winRect(fw) : { x: 0, y: 0 };
-      const x = rect.x + menu.col;
       // A picker carries a prompt query (even when empty); a nx.ui.select does not.
       const hasPrompt = menu.query !== null && menu.query !== undefined;
       const promptRows = hasPrompt ? 1 : 0;
       // A preview pane (Phase 3) splits the box into a list column (left) + a 1-col
-      // separator + a preview column (right). The list keeps `width - previewW - 1`.
+      // glyph separator + a preview column (right). The list keeps `width - previewW - 1`.
       const hasPreview = menu.preview != null;
       const previewW = hasPreview ? Math.max(1, Math.min(menu.preview.width, menu.width - 2)) : 0;
       const listW = hasPreview ? Math.max(1, menu.width - previewW - 1) : menu.width;
       // Render the FULL box height (`menu.height` is the fixed picker size), padding
       // empty rows past the item count so the box doesn't shrink to its content.
       const listRows = Math.max(1, menu.height - promptRows);
-      const boxRows = listRows + promptRows;
-      // The cmdline wildmenu floats *above* the command line: anchor its BOTTOM to the
-      // command-line row so it kisses the input — covering the status line in between,
-      // exactly as the cell-grid clients grow it up from `cmd_area`. Every other menu
-      // sits where the server placed it (text-area row `menu.row`). `cmdShift` is the
-      // resulting vertical offset, reused below so the docs sidebar tracks the box.
+      const boxRows = listRows + promptRows; // inner content height (cells)
+
+      // Border edges per widget kind, mirroring the TUI's render_menu: the cmdline
+      // wildmenu drops its BOTTOM edge (it kisses the command line below), a bordered
+      // select/picker (`border_top`) keeps all four, and a completion-style popup
+      // (`border_top === false`) drops its TOP edge (flush under the cursor word) and
+      // shifts one cell left so the left rail doesn't push the list off the word.
+      const top = menu.cmdline ? true : menu.border_top !== false;
+      const bottom = !menu.cmdline;
+      const leftShift = !menu.cmdline && menu.border_top === false ? 1 : 0;
+      const outerH = boxRows + (top ? 1 : 0) + (bottom ? 1 : 0);
+      // The cmdline wildmenu floats *above* the command line: anchor its outer box so the
+      // bottom-border-less list kisses the input. Every other menu's border origin sits
+      // where the server placed it (text-area row `menu.row`). `cmdShift` tracks the
+      // resulting vertical displacement so the docs sidebar follows the box.
       const serverY = tablineRows + rect.y + menu.row;
-      const y = menu.cmdline ? Math.max(tablineRows, cmdRow - boxRows) : serverY;
-      const cmdShift = y - serverY;
+      const boxX = menu.cmdline ? rect.x + menu.col : rect.x + menu.col - leftShift;
+      const boxY = menu.cmdline ? Math.max(tablineRows, cmdRow - outerH) : serverY;
+      const cmdShift = boxY - serverY;
+      // The shared single-line glyph border around the list (+ optional preview pane);
+      // content sits one cell inside (and one down when there's a top edge).
+      const { cx, cy } = popupChrome(boxX, boxY, menu.width, boxRows, { top, bottom });
       // A noselect completion popup (`selected_active === false`) highlights no row
       // and scrolls from the top.
       const selActive = menu.selected_active !== false;
@@ -1524,11 +1573,7 @@
       const start = selActive && menu.selected >= listRows ? first : 0;
       const box = document.createElement("div");
       box.className = "pmenu";
-      // The completion popup omits its top border so it sits flush with the line
-      // below the cursor (the web border is a 1px rule, so unlike the cell-grid
-      // clients no left-shift is needed — content already sits at `menu.col`).
-      if (menu.border_top === false) box.style.borderTopWidth = "0";
-      place(box, x, y, menu.width, boxRows);
+      place(box, cx, cy, listW, boxRows);
       if (hasPrompt) {
         const text = ("> " + menu.query).slice(0, listW).padEnd(listW);
         const promptEl = document.createElement("div");
@@ -1580,10 +1625,11 @@
       // background-highlighted. Plain text in Phase 3a (no syntax colours yet).
       if (hasPreview) {
         const pv = menu.preview;
+        // A glyph `│` separator divides the list column from the preview pane.
+        appendGlyphVRule(cx + listW, cy, boxRows);
         const pre = document.createElement("div");
         pre.className = "pmenu";
-        pre.style.borderLeftWidth = "1px";
-        place(pre, x + listW + 1, y, previewW, listRows + promptRows);
+        place(pre, cx + listW + 1, cy, previewW, boxRows);
         const header = document.createElement("div");
         header.className = "row pmenu-sel";
         header.style.width = previewW * cw + "px";
@@ -1627,9 +1673,11 @@
       // grown from a `cmd_area` like the cell-grid clients.
       if (menu.docs) {
         const d = menu.docs;
+        const { cx: dcx, cy: dcy } = popupChrome(
+          rect.x + d.col, tablineRows + rect.y + d.row + cmdShift, d.width, d.height);
         const docBox = document.createElement("div");
         docBox.className = "pmenu-doc";
-        place(docBox, rect.x + d.col, tablineRows + rect.y + d.row + cmdShift, d.width, d.height);
+        place(docBox, dcx, dcy, d.width, d.height);
         for (const l of d.lines) {
           const rowEl = document.createElement("div");
           rowEl.className = "row";
@@ -1693,8 +1741,112 @@
       if (g.dl > 0) sepLine(g.dl, g.midY, 1, g.midH, "┃", true);
       if (g.dr > 0) sepLine(cols - g.dr - 1, g.midY, 1, g.midH, "┃", true);
     }
+    // Draw a box-drawing glyph border into a chrome box sized totalW×totalH cells — the
+    // single shared border path for EVERY bordered popup (completion pmenu, doc preview,
+    // picker/select, wildmenu, content + window floats), so they all look identical and
+    // match the TUI. `style` picks the glyph set (default single ┌─┐, floats pass their
+    // server style). `top`/`bottom` may be omitted for the flush look (completion popup
+    // drops its top edge, the cmdline wildmenu its bottom). An optional `title` rides the
+    // top edge, left-aligned after the corner. The middle rows carry the left+right rails
+    // with a blank span between them that the inset content box overlays.
+    function appendGlyphBorder(box, totalW, totalH, opts = {}) {
+      const { style = "single", title = null, top = true, bottom = true } = opts;
+      const G = floatBorderGlyphs(style);
+      const innerW = totalW - 2;
+      const mkRow = (r) => {
+        const row = document.createElement("div");
+        row.className = "row";
+        row.style.position = "absolute";
+        row.style.left = "0";
+        row.style.top = r * ch + "px";
+        row.style.width = totalW * cw + "px";
+        box.appendChild(row);
+        return row;
+      };
+      for (let r = 0; r < totalH; r++) {
+        if (r === 0 && top) {
+          const row = mkRow(r);
+          const titleStr = title ? ` ${title} `.slice(0, innerW) : "";
+          row.appendChild(floatBorderSpan(G.tl));
+          if (titleStr) {
+            const t = document.createElement("span");
+            t.className = "float-title";
+            t.textContent = titleStr;
+            row.appendChild(t);
+          }
+          row.appendChild(floatBorderSpan(G.h.repeat(innerW - titleStr.length) + G.tr));
+        } else if (r === totalH - 1 && bottom) {
+          mkRow(r).appendChild(floatBorderSpan(G.bl + G.h.repeat(innerW) + G.br));
+        } else {
+          // A rail row (no top/bottom corner when that edge is omitted).
+          const row = mkRow(r);
+          row.appendChild(floatBorderSpan(G.v));
+          row.appendChild(document.createTextNode(" ".repeat(innerW)));
+          row.appendChild(floatBorderSpan(G.v));
+        }
+      }
+    }
+
+    // Create the opaque chrome box (bg + glyph border) for a popup whose CONTENT is
+    // `innerW`×`innerH` cells, anchored so the border's top-left corner sits at (x, y).
+    // Returns the inner content origin (cells) so the caller positions a content box one
+    // cell inside the ring. `top`/`bottom` omit those edges (flush look). The content box
+    // it returns coords for overlays the rails' blank middle, both sharing the float bg.
+    function popupChrome(x, y, innerW, innerH, opts = {}) {
+      const { top = true, bottom = true } = opts;
+      const totalW = innerW + 2;
+      const totalH = innerH + (top ? 1 : 0) + (bottom ? 1 : 0);
+      const chrome = document.createElement("div");
+      chrome.className = "popup-chrome";
+      place(chrome, x, y, totalW, totalH);
+      appendGlyphBorder(chrome, totalW, totalH, opts);
+      gridEl.appendChild(chrome);
+      return { cx: x + 1, cy: y + (top ? 1 : 0), totalW, totalH };
+    }
+
+    // A vertical glyph separator column (`│`) `h` cells tall at (x, y) — the divider
+    // between a picker's list column and its preview pane (the TUI draws it as part of
+    // the inner block; here it's a thin chrome strip over the shared bg).
+    function appendGlyphVRule(x, y, h, style = "single") {
+      const G = floatBorderGlyphs(style);
+      const col = document.createElement("div");
+      col.className = "popup-chrome";
+      place(col, x, y, 1, h);
+      for (let i = 0; i < h; i++) {
+        const row = document.createElement("div");
+        row.className = "row";
+        row.style.position = "absolute";
+        row.style.left = "0";
+        row.style.top = i * ch + "px";
+        row.style.width = cw + "px";
+        row.appendChild(floatBorderSpan(G.v));
+        col.appendChild(row);
+      }
+      gridEl.appendChild(col);
+    }
+
+    // A floating WINDOW (a real buffer in a float, e.g. nx.view dialogs) — distinct from
+    // an nx.ui.float content float. The server sends the OUTER rect (border ring
+    // included) with `lines` already windowed to the inner height. Paint an opaque
+    // chrome box behind it (so tiled windows don't bleed through and the border style +
+    // title read), then render the buffer one cell inside the ring. The GUI's
+    // `build_float` does exactly this; the web client was dropping all three.
     function renderFloat(w, tablineRows, jsHl) {
-      renderWindow(w, tablineRows, jsHl);
+      const o = regionOrigin(w.region, tablineRows);
+      const rect = winRect(w);
+      const bordered = w.border && w.border !== "none";
+      const chrome = document.createElement("div");
+      chrome.className = "win float-win";
+      place(chrome, o.x + rect.x, o.y + rect.y, rect.width, rect.height);
+      if (bordered) appendGlyphBorder(chrome, rect.width, rect.height, { style: w.border, title: w.title });
+      gridEl.appendChild(chrome);
+      // Content inset past the border ring (or the whole rect when borderless). A
+      // shallow clone with the inner rect keeps `renderWindow` shared and makes its
+      // `statusRows = innerHeight - lines` compute to 0 (a float has no statusline).
+      const inner = bordered
+        ? { ...w, rect: { x: rect.x + 1, y: rect.y + 1, width: rect.width - 2, height: rect.height - 2 } }
+        : w;
+      renderWindow(inner, tablineRows, jsHl);
     }
     // Paint tabline cells (` ▸{count}{label}{+} `, the active cell marked) for a
     // `{ tabs, current }` at cell (x, y) spanning `width` cells, preceded by an

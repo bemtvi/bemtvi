@@ -33,8 +33,8 @@ use glyphon::{
     TextArea, TextAtlas, TextBounds, TextRenderer, Viewport,
 };
 use nxvim_view::{
-    DiagSign, DiagSpan, Geometry, InlayHint, ResizeCursor, StatusSegment, Style, TabData, View,
-    VirtChunk, VirtPlacement, WindowRegion, WindowView,
+    Border, DiagSign, DiagSpan, Geometry, InlayHint, ResizeCursor, StatusSegment, Style, TabData,
+    View, VirtChunk, VirtPlacement, WindowRegion, WindowView,
 };
 use winit::window::Window;
 
@@ -1843,15 +1843,20 @@ impl Renderer {
         });
 
         let inner = match win.border {
-            Some(_) => {
-                let border = lighten(bg, 0x30);
-                self.box_frame(quads, ox, oy, r.width, r.height, border);
-                if let Some(title) = &win.title {
-                    let fg = style_fg(&view.normal).unwrap_or(DEFAULT_FG);
-                    let t = format!(" {title} ");
-                    let full = self.full_bounds();
-                    self.push_plain(items, &t, self.cell_px(ox + 1, oy), fg, full);
-                }
+            Some(border) => {
+                let border_fg = lighten(bg, 0x30);
+                let title_fg = style_fg(&view.normal).unwrap_or(DEFAULT_FG);
+                self.draw_float_border(
+                    items,
+                    border,
+                    win.title.as_deref(),
+                    ox,
+                    oy,
+                    r.width,
+                    r.height,
+                    title_fg,
+                    border_fg,
+                );
                 (
                     ox + 1,
                     oy + 1,
@@ -1862,6 +1867,121 @@ impl Renderer {
             None => (ox, oy, r.width, r.height),
         };
         self.build_window(view, win, None, inner, quads, items, image_draws);
+    }
+
+    /// Draw a box border as box-drawing glyphs (not quad rules) — the single shared
+    /// border path for EVERY bordered popup (completion pmenu, doc preview,
+    /// picker/select, wildmenu, content + window floats), so they all look identical and
+    /// match the TUI. The border *style* reads (rounded corners actually look rounded),
+    /// and the title rides the top edge like the TUI's `title_top`. Glyph sets mirror the
+    /// TUI's `BorderType` mapping (single / rounded / double / solid). `top`/`bottom` may
+    /// be omitted for the flush look (the completion popup drops its top edge, the cmdline
+    /// wildmenu its bottom). The title is left-aligned after the top-left corner, drawn in
+    /// `title_fg` while the frame is drawn in `border_fg`.
+    #[allow(clippy::too_many_arguments)]
+    fn draw_glyph_border(
+        &mut self,
+        items: &mut Vec<TextItem>,
+        border: Border,
+        title: Option<&str>,
+        ox: u16,
+        oy: u16,
+        w: u16,
+        h: u16,
+        top: bool,
+        bottom: bool,
+        title_fg: u32,
+        border_fg: u32,
+    ) {
+        if w < 2 || h < 1 {
+            return; // no room for left + right rails
+        }
+        let (tl, tr, bl, br, horiz, vert) = match border {
+            Border::Single => ('┌', '┐', '└', '┘', '─', '│'),
+            Border::Rounded => ('╭', '╮', '╰', '╯', '─', '│'),
+            Border::Double => ('╔', '╗', '╚', '╝', '═', '║'),
+            Border::Solid => ('█', '█', '█', '█', '█', '█'),
+        };
+        let inner_w = (w - 2) as usize;
+        let full = self.full_bounds();
+        // Pure pixel-position helper that borrows the cell metrics by copy, so it
+        // doesn't hold a `&self` borrow across the `&mut self` push calls below.
+        let (cw, ch) = (self.cell_w, self.cell_h);
+        let px = |col: u16, row: u16| (col as f32 * cw, row as f32 * ch);
+
+        // Top edge: left corner, the title (left-aligned, truncated), a horizontal
+        // fill, then the right corner — title in `title_fg`, the frame in `border_fg`.
+        if top {
+            let title_s = title.map(|t| format!(" {t} ").chars().take(inner_w).collect::<String>());
+            let title_len = title_s.as_deref().map_or(0, |s| s.chars().count());
+            let fill = horiz.to_string().repeat(inner_w - title_len);
+            let mut top_segs = vec![Seg::plain(tl.to_string(), border_fg)];
+            if let Some(ts) = title_s {
+                top_segs.push(Seg::plain(ts, title_fg));
+            }
+            top_segs.push(Seg::plain(format!("{fill}{tr}"), border_fg));
+            self.push_text(items, &top_segs, px(ox, oy), border_fg, full);
+        }
+        if bottom {
+            let bottom_s = format!("{bl}{}{br}", horiz.to_string().repeat(inner_w));
+            self.push_plain(items, &bottom_s, px(ox, oy + h - 1), border_fg, full);
+        }
+        // The two side rails span the rows between whichever edges are present.
+        let vert_s = vert.to_string();
+        let rail_start = oy + u16::from(top);
+        let rail_end = oy + h - u16::from(bottom);
+        for row in rail_start..rail_end {
+            self.push_plain(items, &vert_s, px(ox, row), border_fg, full);
+            self.push_plain(items, &vert_s, px(ox + w - 1, row), border_fg, full);
+        }
+    }
+
+    /// A full glyph ring (all four edges) — the float case of [`Self::draw_glyph_border`].
+    #[allow(clippy::too_many_arguments)]
+    fn draw_float_border(
+        &mut self,
+        items: &mut Vec<TextItem>,
+        border: Border,
+        title: Option<&str>,
+        ox: u16,
+        oy: u16,
+        w: u16,
+        h: u16,
+        title_fg: u32,
+        border_fg: u32,
+    ) {
+        self.draw_glyph_border(
+            items, border, title, ox, oy, w, h, true, true, title_fg, border_fg,
+        );
+    }
+
+    /// A vertical glyph separator (`│`) `h` cells tall at `(x, y)` in `border_fg` — the
+    /// divider between a picker's list column and its preview pane.
+    fn draw_glyph_vrule(
+        &mut self,
+        items: &mut Vec<TextItem>,
+        x: u16,
+        y: u16,
+        h: u16,
+        border_fg: u32,
+    ) {
+        let full = self.full_bounds();
+        for row in y..y + h {
+            self.push_plain(items, "│", self.cell_px(x, row), border_fg, full);
+        }
+    }
+
+    /// Fill a `w`×`h`-cell rect at `(x, y)` with `bg` (no border) — the opaque backing
+    /// behind a glyph-bordered popup (the glyph border draws over it).
+    fn fill_rect(&self, quads: &mut Vec<Quad>, x: u16, y: u16, w: u16, h: u16, bg: u32) {
+        let (px, py) = self.cell_px(x, y);
+        quads.push(Quad {
+            x: px,
+            y: py,
+            w: self.cell_w * w as f32,
+            h: self.cell_h * h as f32,
+            color: color_to_rgba(srgb_to_color(bg)),
+        });
     }
 
     /// Paint the insert-mode completion popup over the focused window's text area:
@@ -1914,7 +2034,20 @@ impl Renderer {
         let by = wy + pmenu.row;
         let box_w = pmenu.width + 2;
         let box_h = pmenu.height + 2;
-        self.fill_box(quads, (bx, by, box_w, box_h), popup_bg, border);
+        self.fill_rect(quads, bx, by, box_w, box_h, popup_bg);
+        self.draw_glyph_border(
+            items,
+            Border::Single,
+            None,
+            bx,
+            by,
+            box_w,
+            box_h,
+            true,
+            true,
+            fg,
+            border,
+        );
 
         let rows = pmenu.height as usize;
         let start = pmenu_start(pmenu.selected, rows);
@@ -1955,7 +2088,20 @@ impl Renderer {
             } else {
                 bx.saturating_sub(dbw)
             };
-            self.fill_box(quads, (dx, by, dbw, dbh), popup_bg, border);
+            self.fill_rect(quads, dx, by, dbw, dbh, popup_bg);
+            self.draw_glyph_border(
+                items,
+                Border::Single,
+                None,
+                dx,
+                by,
+                dbw,
+                dbh,
+                true,
+                true,
+                fg,
+                border,
+            );
             // Client-side vertical scroll (the box height is the client's to know,
             // so the server has no notion of it): skip the scrolled-past lines,
             // clamped so the wheel can't overscroll past the last screenful.
@@ -2033,13 +2179,25 @@ impl Renderer {
                 wy + menu.row,
             )
         };
-        if menu.cmdline {
-            self.fill_box_no_bottom(quads, (bx, by, box_w, box_h), popup_bg, border);
-        } else if menu.border_top {
-            self.fill_box(quads, (bx, by, box_w, box_h), popup_bg, border);
-        } else {
-            self.fill_box_no_top(quads, (bx, by, box_w, box_h), popup_bg, border);
-        }
+        // Opaque backing + a single-line glyph border (the shared popup border path):
+        // the cmdline wildmenu drops its bottom edge (flush to the input below), a
+        // completion-style popup (`!border_top`) its top edge, a bordered select/picker
+        // keeps all four.
+        let (border_top, border_bottom) = (menu.border_top || menu.cmdline, !menu.cmdline);
+        self.fill_rect(quads, bx, by, box_w, box_h, popup_bg);
+        self.draw_glyph_border(
+            items,
+            Border::Single,
+            None,
+            bx,
+            by,
+            box_w,
+            box_h,
+            border_top,
+            border_bottom,
+            fg,
+            border,
+        );
 
         let full = self.full_bounds();
         let cx = bx + 1;
@@ -2150,15 +2308,8 @@ impl Renderer {
         if let Some(pv) = &menu.preview {
             let sep_col = cx + list_w;
             let px0 = sep_col + 1;
-            // Vertical rule down the box content height, in the border tint.
-            let (spx, spy) = self.cell_px(sep_col, content_y0);
-            quads.push(Quad {
-                x: spx + self.cell_w * 0.5,
-                y: spy,
-                w: (self.cell_w * 0.08).max(1.0),
-                h: self.cell_h * menu.height as f32,
-                color: color_to_rgba(srgb_to_color(border)),
-            });
+            // Glyph `│` separator down the box content height (the shared border tint).
+            self.draw_glyph_vrule(items, sep_col, content_y0, menu.height, border);
             // The title header: the path on a sel-tinted bar across the pane.
             self.fill_cells(quads, px0, content_y0, preview_w, sel_bg);
             let title = pmenu_row(&pv.title, "", preview_w as usize);
@@ -2214,10 +2365,19 @@ impl Renderer {
             } else {
                 ((text_x0 + docs.col).saturating_sub(1), wy + docs.row)
             };
-            self.fill_box(
-                quads,
-                (dbx, dby, docs.width + 2, docs.height + 2),
-                popup_bg,
+            let (dbw, dbh) = (docs.width + 2, docs.height + 2);
+            self.fill_rect(quads, dbx, dby, dbw, dbh, popup_bg);
+            self.draw_glyph_border(
+                items,
+                Border::Single,
+                None,
+                dbx,
+                dby,
+                dbw,
+                dbh,
+                true,
+                true,
+                fg,
                 border,
             );
             let (dcx, dcy) = (dbx + 1, dby + 1);
@@ -2271,20 +2431,31 @@ impl Renderer {
         let full = self.full_bounds();
 
         let (bx, by) = (text_x0 + float.col, wy + float.row);
-        let (cx, cy) = if float.border.is_some() {
-            self.fill_box(
-                quads,
-                (bx, by, float.width + 2, float.height + 2),
-                popup_bg,
+        let (cx, cy) = if let Some(border_style) = float.border {
+            let (bw, bh) = (float.width + 2, float.height + 2);
+            // Opaque bg behind the whole box, then a glyph border (box-drawing chars)
+            // so the border *style* reads — rounded corners look rounded — and the
+            // title rides the top edge, integrated with the line like the TUI's
+            // `title_top`. Same path as a window float (`draw_float_border`).
+            let (px, py) = self.cell_px(bx, by);
+            quads.push(Quad {
+                x: px,
+                y: py,
+                w: self.cell_w * bw as f32,
+                h: self.cell_h * bh as f32,
+                color: color_to_rgba(srgb_to_color(popup_bg)),
+            });
+            self.draw_float_border(
+                items,
+                border_style,
+                float.title.as_deref(),
+                bx,
+                by,
+                bw,
+                bh,
+                fg,
                 border,
             );
-            // Draw the title on the top border, inset one cell — same placement as a
-            // regular floating window (`build_float`). The TUI already does this; the
-            // GUI was dropping it.
-            if let Some(title) = &float.title {
-                let t = format!(" {title} ");
-                self.push_plain(items, &t, self.cell_px(bx + 1, by), fg, full);
-            }
             (bx + 1, by + 1)
         } else {
             (bx, by)
@@ -2340,124 +2511,6 @@ impl Renderer {
     /// Fill the whole of `row` (`cols` cells wide) with `color`.
     fn fill_row(&self, quads: &mut Vec<Quad>, row: u16, cols: u16, color: u32) {
         self.fill_cells(quads, 0, row, cols, color);
-    }
-
-    /// Fill a `w`×`h`-cell box at `(x, y)` (`rect`) with `bg`, then outline it with
-    /// a thin `border` frame — the opaque overlay panels (pmenu, doc preview) sit in.
-    fn fill_box(&self, quads: &mut Vec<Quad>, rect: (u16, u16, u16, u16), bg: u32, border: u32) {
-        let (x, y, w, h) = rect;
-        let (px, py) = self.cell_px(x, y);
-        quads.push(Quad {
-            x: px,
-            y: py,
-            w: self.cell_w * w as f32,
-            h: self.cell_h * h as f32,
-            color: color_to_rgba(srgb_to_color(bg)),
-        });
-        self.box_frame(quads, x, y, w, h, border);
-    }
-
-    /// Like [`fill_box`] but without the **top** edge — the completion popup's flush
-    /// look, abutting the line below the cursor. Fills the bg and draws the left /
-    /// right / bottom border edges only.
-    fn fill_box_no_top(
-        &self,
-        quads: &mut Vec<Quad>,
-        rect: (u16, u16, u16, u16),
-        bg: u32,
-        border: u32,
-    ) {
-        let (x, y, w, h) = rect;
-        let (px, py) = self.cell_px(x, y);
-        let pw = self.cell_w * w as f32;
-        let ph = self.cell_h * h as f32;
-        quads.push(Quad {
-            x: px,
-            y: py,
-            w: pw,
-            h: ph,
-            color: color_to_rgba(srgb_to_color(bg)),
-        });
-        let t = (self.cell_w * 0.12).max(1.0);
-        let c = color_to_rgba(srgb_to_color(border));
-        let edges = [
-            (px, py + ph - t, pw, t), // bottom
-            (px, py, t, ph),          // left
-            (px + pw - t, py, t, ph), // right
-        ];
-        for (x, y, w, h) in edges {
-            quads.push(Quad {
-                x,
-                y,
-                w,
-                h,
-                color: c,
-            });
-        }
-    }
-
-    /// Like [`fill_box`] but without the **bottom** edge — the command-line
-    /// wildmenu's flush look, abutting the command line it floats above. Fills the bg
-    /// and draws the top / left / right border edges only.
-    fn fill_box_no_bottom(
-        &self,
-        quads: &mut Vec<Quad>,
-        rect: (u16, u16, u16, u16),
-        bg: u32,
-        border: u32,
-    ) {
-        let (x, y, w, h) = rect;
-        let (px, py) = self.cell_px(x, y);
-        let pw = self.cell_w * w as f32;
-        let ph = self.cell_h * h as f32;
-        quads.push(Quad {
-            x: px,
-            y: py,
-            w: pw,
-            h: ph,
-            color: color_to_rgba(srgb_to_color(bg)),
-        });
-        let t = (self.cell_w * 0.12).max(1.0);
-        let c = color_to_rgba(srgb_to_color(border));
-        let edges = [
-            (px, py, pw, t),          // top
-            (px, py, t, ph),          // left
-            (px + pw - t, py, t, ph), // right
-        ];
-        for (x, y, w, h) in edges {
-            quads.push(Quad {
-                x,
-                y,
-                w,
-                h,
-                color: c,
-            });
-        }
-    }
-
-    /// Draw a thin `border` frame around a `w`×`h`-cell box at `(x, y)` (four edge
-    /// quads), leaving the interior untouched — the float / popup outline.
-    fn box_frame(&self, quads: &mut Vec<Quad>, x: u16, y: u16, w: u16, h: u16, border: u32) {
-        let (px, py) = self.cell_px(x, y);
-        let pw = self.cell_w * w as f32;
-        let ph = self.cell_h * h as f32;
-        let t = (self.cell_w * 0.12).max(1.0);
-        let c = color_to_rgba(srgb_to_color(border));
-        let edges = [
-            (px, py, pw, t),          // top
-            (px, py + ph - t, pw, t), // bottom
-            (px, py, t, ph),          // left
-            (px + pw - t, py, t, ph), // right
-        ];
-        for (x, y, w, h) in edges {
-            quads.push(Quad {
-                x,
-                y,
-                w,
-                h,
-                color: c,
-            });
-        }
     }
 
     /// Push a thin underline rule under cells `[s, e)` of `row` (a diagnostic

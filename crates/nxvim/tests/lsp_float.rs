@@ -283,10 +283,12 @@ async fn signature_help_reply_opens_a_float_window() {
         "signature float window should mark the active parameter, got {:?}",
         window_lines(&win)
     );
+    // Signature help shows a code signature, so the popup inherits the invoking
+    // buffer's filetype (the mock opened an `.rs` buffer → `rust`), not `markdown`.
     assert_eq!(
         window_filetype(&win),
-        "markdown",
-        "the signature doc-float buffer defaults to the markdown filetype"
+        "rust",
+        "the signature doc-float buffer inherits the invoking buffer's filetype"
     );
 
     std::env::remove_var("NXVIM_LSP_CMD");

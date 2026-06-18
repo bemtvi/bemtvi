@@ -438,7 +438,7 @@ impl EditHost {
             self.editor.echo(LspReqKind::Hover.empty_message());
             return;
         }
-        self.editor.open_doc_float("[Hover]", lines);
+        self.editor.open_doc_float("[Hover]", lines, "markdown");
     }
 
     /// Render a signature-help reply in the cursor-anchored **doc float** (the same
@@ -460,7 +460,15 @@ impl EditHost {
             Some(param) if !param.is_empty() => format!("{signature}    [{param}]"),
             _ => signature,
         };
-        self.editor.open_doc_float("[Signature]", vec![line]);
+        // Signature help renders a code signature in the source language, so type the
+        // popup as the buffer it was invoked from (the staleness gate above guarantees
+        // the current buffer is still that one). `""` when that buffer has no filetype.
+        let filetype = self
+            .editor
+            .buffer_filetype(self.editor.current_buffer_id())
+            .unwrap_or_default();
+        self.editor
+            .open_doc_float("[Signature]", vec![line], &filetype);
     }
 
     /// Act on a reply's target locations: a single goto result jumps the cursor;

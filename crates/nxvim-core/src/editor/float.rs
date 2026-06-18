@@ -162,7 +162,13 @@ impl Editor {
     /// re-opening the same surface replaces it in place. An empty `lines` opens
     /// nothing (and leaves any existing float for that surface alone — there is no
     /// empty popup; the caller echoes a message instead).
-    pub fn open_doc_float(&mut self, name: &str, lines: Vec<String>) {
+    ///
+    /// `filetype` types the scratch buffer (tree-sitter highlighting defaults on, so
+    /// the popup is highlighted in that language for free): `markdown` for the hover
+    /// (LSP `MarkupContent`), and the *invoking buffer's* filetype for signature help
+    /// (its content is a code signature in the source language). `""` leaves it
+    /// untyped.
+    pub fn open_doc_float(&mut self, name: &str, lines: Vec<String>, filetype: &str) {
         if lines.is_empty() {
             return;
         }
@@ -189,12 +195,11 @@ impl Editor {
         // `load_str_into` edits the rope directly, so flipping `nomodifiable` after
         // is safe — it refuses only a (never-arriving) user edit of the popup.
         self.buffers.get_mut(buf).buffer.options.modifiable = false;
-        // LSP hover / signature content *is* markdown (the servers send
-        // `MarkupContent { kind = "markdown" }`), so type the scratch buffer as
-        // `markdown` by default — it then gets tree-sitter highlighting for free
-        // (ts highlighting defaults on; `ts_language_for` resolves the grammar),
-        // the same trick neovim's `stylize_markdown` relies on.
-        self.set_filetype(buf, "markdown");
+        // Type the scratch buffer so it gets tree-sitter highlighting for free (ts
+        // highlighting defaults on; `ts_language_for` resolves the grammar) — the
+        // hover passes `markdown` (the LSP content type), signature help passes the
+        // source buffer's filetype (its content is code in that language).
+        self.set_filetype(buf, filetype);
 
         let cfg = FloatConfig {
             relative: FloatRelative::Cursor,

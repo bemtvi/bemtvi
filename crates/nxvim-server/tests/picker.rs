@@ -15,7 +15,8 @@
 use nxvim_rpc::{Incoming, Rpc};
 use nxvim_server::ServerInit;
 use nxvim_test_harness::{
-    attach, cursor, drain_to_latest_redraw, exec_lua, feed, lines, map_get, spawn, temp_dir,
+    attach, command, cursor, drain_to_latest_redraw, exec_lua, feed, feed_mouse, lines, map_get,
+    spawn, temp_dir,
 };
 use rmpv::Value;
 use tokio::sync::mpsc::UnboundedReceiver;
@@ -1292,4 +1293,164 @@ nx.picker.source {{
     // Confirm fired with the chosen item and the menu closed (preview untouched it).
     let picked = exec_lua(&rpc, "return _G.picked").await;
     assert_eq!(picked.as_str(), Some(a.display().to_string().as_str()));
+}
+
+// ── Mouse: a picker / select grabs the mouse modally while open (Phase 2). The
+//    client forwards raw cells; the core hit-tests the click/wheel back to a row. ──
+
+fn menu_u64(menu: &[(Value, Value)], key: &str) -> usize {
+    map_get(menu, key)
+        .and_then(Value::as_u64)
+        .unwrap_or_else(|| panic!("menu has a {key}")) as usize
+}
+
+/// The global screen cell of list row `r` of an open, **centered** picker, with the
+/// number gutter disabled (so the box's text-area cells are global cells). The box's
+/// outer top-left is `(row, col)`; the list sits past the top border (+1) and — when
+/// a top prompt is shown — its prompt + separator rows (+2); content is one cell past
+/// the left border.
+fn list_cell(menu: &[(Value, Value)], r: usize) -> (usize, usize) {
+    let row = menu_u64(menu, "row");
+    let col = menu_u64(menu, "col");
+    let has_prompt = map_get(menu, "query").is_some();
+    let prompt_top = map_get(menu, "prompt_pos").and_then(Value::as_str) != Some("bottom");
+    let chrome = 1 + if has_prompt && prompt_top { 2 } else { 0 };
+    (row + chrome + r, col + 1)
+}
+
+#[tokio::test]
+async fn clicking_a_picker_row_highlights_it_then_confirms_on_a_second_click() {
+    let dir = temp_dir("picker_mouse_click");
+    let (rpc, mut incoming) = start(&dir, STATIC_SRC).await;
+    command(&rpc, "set nonumber norelativenumber").await;
+
+    exec_lua(&rpc, "_G.picked = nil; nx.picker.open('fruits')").await;
+    let menu = menu_of(&poll_menu(&rpc, &mut incoming).await.expect("menu opens"));
+    assert_eq!(
+        menu_items(&menu),
+        vec!["apple", "apricot", "banana", "cherry"]
+    );
+
+    // Click the third row ("banana"): it highlights, the document is untouched, and
+    // nothing is confirmed yet.
+    let (r, c) = list_cell(&menu, 2);
+    feed_mouse(&rpc, "left", "press", r, c);
+    let menu = menu_of(
+        &poll_menu(&rpc, &mut incoming)
+            .await
+            .expect("redraw after click"),
+    );
+    assert_eq!(
+        menu_u64(&menu, "selected"),
+        2,
+        "the clicked row is highlighted"
+    );
+    assert_eq!(
+        exec_lua(&rpc, "return _G.picked").await,
+        Value::Nil,
+        "highlighting does not confirm"
+    );
+
+    // Click the highlighted row again: it confirms, running the source's confirm with
+    // that item (and closing the picker).
+    feed_mouse(&rpc, "left", "press", r, c);
+    assert_eq!(
+        exec_lua(&rpc, "return _G.picked").await.as_str(),
+        Some("banana"),
+        "clicking the highlighted row confirms it"
+    );
+    assert_eq!(
+        exec_lua(&rpc, "return nx._picker == nil").await,
+        Value::Boolean(true),
+        "the picker closes on confirm"
+    );
+}
+
+#[tokio::test]
+async fn clicking_off_a_picker_box_cancels_it() {
+    let dir = temp_dir("picker_mouse_cancel");
+    let (rpc, mut incoming) = start(&dir, STATIC_SRC).await;
+    command(&rpc, "set nonumber norelativenumber").await;
+
+    exec_lua(&rpc, "_G.picked = 'unset'; nx.picker.open('fruits')").await;
+    poll_menu(&rpc, &mut incoming).await.expect("menu opens");
+
+    // The centered box never reaches the top-left corner — a press there lands off it.
+    feed_mouse(&rpc, "left", "press", 0, 0);
+    assert_eq!(
+        exec_lua(&rpc, "return _G.picked").await.as_str(),
+        Some("unset"),
+        "a click off the box cancels without confirming"
+    );
+    assert_eq!(
+        exec_lua(&rpc, "return nx._picker == nil").await,
+        Value::Boolean(true),
+        "the picker is cleared on an off-box click"
+    );
+}
+
+#[tokio::test]
+async fn wheeling_over_a_picker_list_moves_the_highlight() {
+    let dir = temp_dir("picker_mouse_wheel");
+    let (rpc, mut incoming) = start(&dir, STATIC_SRC).await;
+    command(&rpc, "set nonumber norelativenumber").await;
+
+    exec_lua(&rpc, "nx.picker.open('fruits')").await;
+    let menu = menu_of(&poll_menu(&rpc, &mut incoming).await.expect("menu opens"));
+    assert_eq!(menu_u64(&menu, "selected"), 0, "opens on the first row");
+    let (r, c) = list_cell(&menu, 0);
+
+    // A wheel-down notch over the list moves the highlight down one row.
+    feed_mouse(&rpc, "wheel", "down", r, c);
+    let menu = menu_of(&poll_menu(&rpc, &mut incoming).await.expect("redraw"));
+    assert_eq!(menu_u64(&menu, "selected"), 1);
+
+    // A wheel-up notch moves it back.
+    feed_mouse(&rpc, "wheel", "up", r, c);
+    let menu = menu_of(&poll_menu(&rpc, &mut incoming).await.expect("redraw"));
+    assert_eq!(menu_u64(&menu, "selected"), 0);
+}
+
+#[tokio::test]
+async fn wheeling_over_the_preview_pane_scrolls_the_preview() {
+    let dir = temp_dir("picker_preview_wheel");
+    let body: String = (0..200).map(|i| format!("L{i}\n")).collect();
+    std::fs::write(dir.join("one.txt"), &body).unwrap();
+    let one = dir.join("one.txt");
+    let src = format!(
+        r#"
+nx.picker.source {{
+  name = "pv",
+  preview = "file",
+  items = function(ctx) ctx.push {{ text = "one.txt", path = "{one}" }} end,
+}}
+"#,
+        one = one.display(),
+    );
+    let (rpc, mut incoming) = start(&dir, &src).await;
+    command(&rpc, "set nonumber norelativenumber").await;
+
+    exec_lua(&rpc, "nx.picker.open('pv')").await;
+    let menu = menu_of(&poll_menu(&rpc, &mut incoming).await.expect("menu opens"));
+    let preview = preview_of(&menu).expect("preview pane");
+    let half = (preview_lines(&preview).len() as u64 / 2).max(1);
+    assert_eq!(
+        preview_first_line(&preview),
+        1,
+        "the preview starts at the top"
+    );
+
+    // A wheel notch over the right ~60% of the box (the preview pane) scrolls the
+    // preview a half page — the same gesture as <C-d>, not a list move.
+    let row = menu_u64(&menu, "row");
+    let col = menu_u64(&menu, "col");
+    let width = menu_u64(&menu, "width");
+    feed_mouse(&rpc, "wheel", "down", row + 3, col + width - 1);
+    let menu = menu_of(&poll_menu(&rpc, &mut incoming).await.expect("after wheel"));
+    let preview = preview_of(&menu).expect("preview present");
+    assert_eq!(
+        preview_first_line(&preview),
+        1 + half,
+        "the wheel over the preview scrolled it, not the list"
+    );
 }

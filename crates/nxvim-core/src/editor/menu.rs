@@ -1133,6 +1133,84 @@ impl Editor {
         Ok(())
     }
 
+    // ── Mouse helpers for the input-grabbing menus (picker / select) ────────────
+    // The core hit-tests a click/wheel on the open box back to a row (see
+    // `mouse.rs`); these are the mouse equivalents of the navigation / confirm /
+    // cancel keymap actions, dispatched by menu kind so the right `apply_*_action`
+    // runs. They are deliberately thin — the behavior lives in the action handlers.
+
+    /// Whether an **input-grabbing** menu (a picker or a promptless `nx.ui.select`)
+    /// is open — the menus the mouse drives modally (a click off the box cancels a
+    /// picker; the wheel scrolls the list). The non-grabbing completion popup is
+    /// **not** included (it has its own [`Self::completion_active`] path).
+    pub(crate) fn picker_or_select_active(&self) -> bool {
+        matches!(self.menu_kind(), Some(MenuKind::Picker | MenuKind::Select))
+    }
+
+    /// Whether an open menu is a **picker** (a fuzzy finder with a prompt), the one
+    /// a click outside the box cancels (a `select` ignores an outside click).
+    pub(crate) fn picker_active(&self) -> bool {
+        self.menu_kind() == Some(MenuKind::Picker)
+    }
+
+    /// Highlight row `idx` (clamped) of an open picker / select — the mouse
+    /// equivalent of navigating to it. A no-op without an open menu.
+    pub(crate) fn menu_cursor_to(&mut self, idx: usize) {
+        if let Some(menu) = self.menu.as_mut() {
+            let last = menu.view_len().saturating_sub(1);
+            menu.cursor = idx.min(last);
+            menu.selected_active = true;
+        }
+    }
+
+    /// Move the highlight one row, non-wrapping (a wheel notch over the list) —
+    /// routed to the open menu's own `next`/`prev` action by kind.
+    pub(crate) fn menu_step(&mut self, down: bool) {
+        let action = if down { "next" } else { "prev" };
+        match self.menu_kind() {
+            Some(MenuKind::Picker) => {
+                let _ = self.apply_picker_action(action);
+            }
+            Some(MenuKind::Select) => {
+                let _ = self.apply_select_action(action);
+            }
+            _ => {}
+        }
+    }
+
+    /// Confirm the highlighted row of an open picker / select (a click on the
+    /// already-highlighted row), routed by kind — pushes the chosen key and closes.
+    pub(crate) fn menu_confirm(&mut self) {
+        match self.menu_kind() {
+            Some(MenuKind::Picker) => {
+                let _ = self.apply_picker_action("confirm");
+            }
+            Some(MenuKind::Select) => {
+                let _ = self.apply_select_action("confirm");
+            }
+            _ => {}
+        }
+    }
+
+    /// Cancel an open picker (a click off the box) — pushes `None` and closes.
+    /// Routed only for a picker; a `select` ignores an outside click (the caller
+    /// gates on [`Self::picker_active`]).
+    pub(crate) fn menu_cancel(&mut self) {
+        let _ = self.apply_picker_action("cancel");
+    }
+
+    /// Scroll an open picker's preview pane (a wheel notch over it) by the coarsest
+    /// available gesture — a half page per notch (the preview-scroll model has no
+    /// finer step). A no-op without a preview pane.
+    pub(crate) fn menu_preview_scroll(&mut self, down: bool) {
+        let action = if down {
+            "preview_half_down"
+        } else {
+            "preview_half_up"
+        };
+        let _ = self.apply_picker_action(action);
+    }
+
     /// React to a picker query edit: a dynamic source bumps the generation and
     /// emits the new `(generation, query)` onto [`Editor::picker_query_changes`]
     /// for the server to re-run the source; a static source just re-ranks locally.

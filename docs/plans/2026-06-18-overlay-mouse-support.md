@@ -94,17 +94,25 @@ this phase changes no observable output.
   Their cosmetic cleanup + dropping `nxvim_complete_select`/`_accept` belongs to the
   Phase 4 cross-client pass (where each client is verified end-to-end).
 
-## Phase 2 — Picker + select
+## Phase 2 — Picker + select ✅ (committed)
 
-- Click a list row → select (move highlight); double-click / click the selected
-  row → confirm (`apply_picker_action("confirm")` / `apply_select_action`).
-- Wheel over the list → scroll selection (Editor placement is windowed, so this
-  scrolls the visible window via `start`).
-- Wheel over the preview pane → the existing `preview_scroll` gesture
-  (`<C-d>/<C-u>/<C-f>/<C-b>` model).
-- Click outside the box: **cancel** for a picker (push `None` to `menu_results`),
-  **no-op** for a `select`.
-- Tests in `tests/picker.rs` (reuse `poll_menu`/`menu_items`/confirm-readback).
+- `menu_screen` extended: fixed `content_x = box_x + 1` (Cursor `geom.col` is the
+  content anchor, Editor `geom.col` is the outer-box left — both resolve through the
+  same `box_x`), added the preview-pane split (the same `~60%` fraction
+  `project_preview` reserves, core-computed), and `MenuHit::Preview`.
+- A picker / `select` grabs the mouse **modally** while open (new dispatch arms
+  gated on `picker_or_select_active()`, before the chrome / text arms): a left-press
+  highlights a row (`menu_cursor_to`), clicking the already-highlighted row confirms
+  it (`menu_confirm` → `apply_*_action("confirm")`), a click off the box cancels a
+  picker (`menu_cancel`) / no-ops a `select`; the wheel moves the highlight
+  (`menu_step`) or, over the preview, scrolls it (`menu_preview_scroll`, the
+  `<C-d>`/`<C-u>` half-page gesture); drag / release are swallowed.
+- Server fix: `nx_input_mouse` now runs `run_pending()` after `editor.mouse`, like
+  the keyboard path, so a mouse-driven confirm/cancel actually drains `menu_results`
+  (and a completion accept's `complete_accept_request` — also benefits Phase 1's LSP
+  path, which the native-source tests didn't cover).
+- Tests: `picker.rs` (click-select-then-confirm, click-off-cancels, list-wheel,
+  preview-wheel) and `ui_select.rs` (click-select-then-confirm).
 
 ## Phase 3 — Cmdline wildmenu
 

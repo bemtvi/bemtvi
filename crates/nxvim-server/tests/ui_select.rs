@@ -16,7 +16,7 @@
 use nxvim_rpc::{Incoming, Rpc};
 use nxvim_server::ServerInit;
 use nxvim_test_harness::{
-    attach, drain_to_latest_redraw, exec_lua, feed, map_get, spawn, temp_dir,
+    attach, command, drain_to_latest_redraw, exec_lua, feed, feed_mouse, map_get, spawn, temp_dir,
 };
 use rmpv::Value;
 use tokio::sync::mpsc::UnboundedReceiver;
@@ -258,4 +258,61 @@ async fn menu_surface_projects_items_and_tracks_selection() {
         .expect("a menu redraw surface after move");
     let menu = menu_of(&map);
     assert_eq!(map_get(&menu, "selected").and_then(Value::as_u64), Some(1));
+}
+
+// ── Mouse: a `select` grabs the mouse modally like a picker (Phase 2). It is
+//    cursor-anchored with a full border and no prompt. ────────────────────────
+
+fn menu_u64(menu: &[(Value, Value)], key: &str) -> usize {
+    map_get(menu, key)
+        .and_then(Value::as_u64)
+        .unwrap_or_else(|| panic!("menu has a {key}")) as usize
+}
+
+#[tokio::test]
+async fn clicking_a_select_row_highlights_then_confirms() {
+    let dir = temp_dir("ui_select_mouse");
+    let (rpc, mut incoming) = start(&dir, "").await;
+    // Disable the number gutter so the box's text-area cells are global cells.
+    command(&rpc, "set nonumber norelativenumber").await;
+
+    exec_lua(
+        &rpc,
+        "_G.item = nil
+         nx.ui.select({ 'alpha', 'beta', 'gamma' }, {}):next(function(it) _G.item = it end)",
+    )
+    .await;
+    let menu = menu_of(&poll_menu(&rpc, &mut incoming).await.expect("select opens"));
+
+    // A promptless, full-bordered cursor popup: the first row sits one cell below the
+    // box top (the top border), the content one cell past the left border.
+    let row = menu_u64(&menu, "row");
+    let col = menu_u64(&menu, "col");
+    let (gamma_row, content_col) = (row + 1 + 2, col + 1);
+
+    // Click "gamma": it highlights, nothing resolves yet.
+    feed_mouse(&rpc, "left", "press", gamma_row, content_col);
+    let menu = menu_of(
+        &poll_menu(&rpc, &mut incoming)
+            .await
+            .expect("redraw after click"),
+    );
+    assert_eq!(
+        menu_u64(&menu, "selected"),
+        2,
+        "the clicked row is highlighted"
+    );
+    assert_eq!(
+        exec_lua(&rpc, "return _G.item").await,
+        Value::Nil,
+        "highlighting does not resolve the chooser"
+    );
+
+    // Click the highlighted row again: the promise resolves with that item.
+    feed_mouse(&rpc, "left", "press", gamma_row, content_col);
+    assert_eq!(
+        exec_lua(&rpc, "return _G.item").await.as_str(),
+        Some("gamma"),
+        "clicking the highlighted row confirms it"
+    );
 }

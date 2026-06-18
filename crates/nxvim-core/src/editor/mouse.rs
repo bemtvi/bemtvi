@@ -113,28 +113,33 @@ pub(crate) enum MouseTarget {
     GlobalStatusLine { col: usize },
 }
 
-/// Where a global screen cell landed on an open menu overlay (the completion popup
-/// today; pickers / selects reuse it in a later phase). `None` from
-/// [`Editor::menu_hit`] means the cell is off the menu entirely.
+/// Where a global screen cell landed on an open menu overlay (the completion popup,
+/// a picker, or a `select`). `None` from [`Editor::menu_hit`] means the cell is off
+/// the menu entirely.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum MenuHit {
     /// A selectable list row, as the absolute index into the menu view.
     Item(usize),
+    /// The picker's preview pane (a wheel notch here scrolls the preview).
+    Preview,
     /// On the box but not a selectable row — a border, the prompt / separator, or a
     /// blank filler past the list end. Consumed (so it doesn't fall through to the
     /// text beneath), but selects nothing.
     Chrome,
 }
 
-/// The open menu's resolved screen rectangle (global cells) and the sub-rect its
-/// selectable rows occupy — the inverse of the box [`Editor::menu_geom`] projects,
-/// plus the focused window's screen origin and the client border convention, so a
-/// click maps to the row painted there. Window-anchored placements only.
+/// The open menu's resolved screen rectangle (global cells) and the sub-rects its
+/// selectable rows and preview pane occupy — the inverse of the box
+/// [`Editor::menu_geom`] projects, plus the focused window's screen origin and the
+/// client border convention, so a click maps to the row painted there.
+/// Window-anchored placements only.
 struct MenuScreen {
     /// Outer box `(x, y, w, h)`, including borders.
     box_rect: (usize, usize, usize, usize),
     /// List content `(x, y, w, rows)` — where selectable rows are drawn.
     list: (usize, usize, usize, usize),
+    /// The picker's preview pane `(x, y, w, h)`, when it carries one.
+    preview: Option<(usize, usize, usize, usize)>,
     /// Scroll offset of the first visible list row.
     start: usize,
     /// Total rows in the menu view (bounds the absolute index).
@@ -215,6 +220,21 @@ impl Editor {
                 if self.completion_active() && self.menu_hit(ev.row, ev.col).is_some() =>
             {
                 self.mouse_complete_wheel(ev.action == MouseAction::WheelDown)
+            }
+            // A picker / `select` grabs the mouse modally while open (like it grabs the
+            // keyboard): a left-press highlights or confirms a row — or cancels a
+            // picker when it lands off the box — and a wheel scrolls the list or the
+            // preview. Drag / release are swallowed so a stray drag can't start a text
+            // selection through the box. These run before the chrome / text arms.
+            (MouseButton::Left, MouseAction::Press) if self.picker_or_select_active() => {
+                self.mouse_menu_press(ev.row, ev.col)
+            }
+            (MouseButton::Left, MouseAction::Drag | MouseAction::Release)
+                if self.picker_or_select_active() => {}
+            (MouseButton::Wheel, MouseAction::WheelUp | MouseAction::WheelDown)
+                if self.picker_or_select_active() =>
+            {
+                self.mouse_menu_wheel(ev.action == MouseAction::WheelDown, ev.row, ev.col)
             }
             // A press on any region's shown tabline switches that region to the
             // clicked tab (vim's tabline click, generalized per region — main and
@@ -1205,6 +1225,42 @@ impl Editor {
         self.complete_select_index(next);
     }
 
+    /// A left-press while an input-grabbing menu (picker / `select`) is open: click a
+    /// row to highlight it, click the already-highlighted row to confirm it, click
+    /// the preview / chrome to no-op, and click off the box to cancel (a picker) or
+    /// ignore (a `select`). Never starts a text drag underneath.
+    fn mouse_menu_press(&mut self, row: usize, col: usize) {
+        self.mouse_select = None;
+        match self.menu_hit(row, col) {
+            Some(MenuHit::Item(idx)) => {
+                // A picker / select always has an active highlight; clicking it again
+                // confirms (like `<CR>`), clicking another row moves it (like `<C-n>`).
+                if self.menu_view().map(|m| m.selected) == Some(idx) {
+                    self.menu_confirm();
+                } else {
+                    self.menu_cursor_to(idx);
+                }
+            }
+            Some(MenuHit::Preview | MenuHit::Chrome) => {}
+            None => {
+                if self.picker_active() {
+                    self.menu_cancel();
+                }
+            }
+        }
+    }
+
+    /// A wheel notch while a picker / `select` is open: over the preview pane it
+    /// scrolls the preview; over the list (or its chrome) it moves the highlight one
+    /// row, non-wrapping; off the box it is ignored.
+    fn mouse_menu_wheel(&mut self, down: bool, row: usize, col: usize) {
+        match self.menu_hit(row, col) {
+            Some(MenuHit::Preview) => self.menu_preview_scroll(down),
+            Some(MenuHit::Item(_) | MenuHit::Chrome) => self.menu_step(down),
+            None => {}
+        }
+    }
+
     /// Resolve a **global** screen cell to a spot on the open menu overlay: a
     /// selectable list row (the absolute view index), some other part of the box
     /// ([`MenuHit::Chrome`] — a border / prompt / filler), or `None` when the cell
@@ -1215,6 +1271,11 @@ impl Editor {
         let (bx, by, bw, bh) = s.box_rect;
         if !((bx..bx + bw).contains(&col) && (by..by + bh).contains(&row)) {
             return None;
+        }
+        if let Some((px, py, pw, ph)) = s.preview {
+            if (px..px + pw).contains(&col) && (py..py + ph).contains(&row) {
+                return Some(MenuHit::Preview);
+            }
         }
         let (lx, ly, lw, lrows) = s.list;
         if (lx..lx + lw).contains(&col) && (ly..ly + lrows).contains(&row) {
@@ -1244,7 +1305,10 @@ impl Editor {
         let inner_y = wy;
         // Border convention, mirroring every client: a full border for select /
         // picker; the completion popup omits its top border and shifts one cell left
-        // so its left border doesn't cover the word it completes.
+        // so its left border doesn't cover the word it completes. `geom.col` is the
+        // *content* anchor for `Cursor` placement (offset back over the left border by
+        // `left_shift`) but the *outer box* left for `Editor` placement; either way the
+        // outer box left is `geom.col - left_shift` and the content sits one cell in.
         let border_top = !m.completion;
         let left_shift = usize::from(!border_top);
         let vborder = if border_top { 2 } else { 1 };
@@ -1253,20 +1317,36 @@ impl Editor {
         let box_y = inner_y + geom.row;
         let box_w = geom.width + 2;
         let box_h = geom.height + vborder;
-        // The selectable rows sit inside the left border, below the top border and —
-        // for a picker — its prompt + separator chrome (prompt on top by default, on
-        // the bottom when asked). The completion popup has neither prompt nor preview,
-        // so the list fills the inner box; the preview-pane split is wired with the
-        // picker.
+        // The content rect (inside the borders): the list + prompt + preview live here.
+        let content_x = box_x + 1; // past the left border (present in every variant)
+        let content_y = box_y + top_border;
+        let content_w = geom.width;
+        let content_h = geom.height;
+        // A picker with a preview pane splits the content into a list column (left) +
+        // a 1-col separator + the preview (right `~60%`, the same fraction the server's
+        // `project_preview` reserves). No preview ⇒ the list fills the content.
+        let (list_w, preview) = if m.has_preview {
+            let preview_w = ((content_w as f32 * 0.6) as usize)
+                .min(content_w.saturating_sub(2))
+                .max(1);
+            let list_w = content_w.saturating_sub(preview_w + 1).max(1);
+            let preview_x = content_x + list_w + 1;
+            (list_w, Some((preview_x, content_y, preview_w, content_h)))
+        } else {
+            (content_w, None)
+        };
+        // The selectable rows sit below the prompt + separator chrome (a picker's
+        // prompt is on top by default, on the bottom when asked); a promptless `select`
+        // / completion popup has none, so the list fills the content height.
         let prompt_rows = usize::from(m.query.is_some());
         let chrome = prompt_rows * 2;
         let prompt_top = prompt_rows > 0 && m.prompt_pos == PromptPos::Top;
-        let list_x = inner_x + geom.col;
-        let list_y = box_y + top_border + if prompt_top { chrome } else { 0 };
-        let list_rows = geom.height.saturating_sub(chrome);
+        let list_y = content_y + if prompt_top { chrome } else { 0 };
+        let list_rows = content_h.saturating_sub(chrome);
         Some(MenuScreen {
             box_rect: (box_x, box_y, box_w, box_h),
-            list: (list_x, list_y, geom.width, list_rows),
+            list: (content_x, list_y, list_w, list_rows),
+            preview,
             start: geom.start,
             total: m.total,
         })

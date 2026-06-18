@@ -2,7 +2,7 @@
 //!
 //! Each frontend decodes its own native key events (crossterm for the TUI, winit
 //! for a GUI), maps them to the toolkit-neutral [`Key`] enum, and calls
-//! [`notation`] to get the vim key-notation string the server's `nvim_input`
+//! [`notation`] to get the vim key-notation string the server's `nx_input`
 //! expects (`"i"`, `"<Esc>"`, `"<C-w>"`, …). [`encode_paste`] is fully neutral —
 //! it turns a bracketed-paste payload into one notation string directly.
 
@@ -83,7 +83,7 @@ pub fn notation(ctrl: bool, alt: bool, shift: bool, key: Key) -> String {
 ///
 /// A terminal (or GUI) with bracketed paste delivers an entire paste as one
 /// event carrying the whole text, so the client forwards it as **one**
-/// `nvim_input` (and the server does one redraw) instead of one notification —
+/// `nx_input` (and the server does one redraw) instead of one notification —
 /// and one full redraw — per character. That per-character round-trip is what
 /// makes an unbracketed paste crawl in visibly.
 ///

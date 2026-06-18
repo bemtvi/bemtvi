@@ -1,7 +1,7 @@
 //! The terminal UI client.
 //!
 //! A thin RPC client that owns no editor state. It attaches to the server,
-//! sends keystrokes as vim key-notation (`nvim_input`), and renders the
+//! sends keystrokes as vim key-notation (`nx_input`), and renders the
 //! server's [`View`](nxvim_view::View) using **ratatui-native widgets, one per
 //! region**: the text area, the status line, and the command line are laid out
 //! with a ratatui `Layout` and drawn as separate widgets. There is no neovim UI
@@ -56,7 +56,7 @@ const CHROME_ROWS: u16 = 1;
 
 /// How long the client waits after a keystroke, with no further input, before
 /// sending the server a synthetic `nxvim_input_flush` — vim's `timeoutlen`
-/// (default 1000ms). The server has no input timer (it processes `nvim_input`
+/// (default 1000ms). The server has no input timer (it processes `nx_input`
 /// batches synchronously), so a trailing key that is a *live prefix* of a mapping
 /// stays withheld in the matcher until something flushes it. This idle flush is
 /// that something: it lets an ambiguous shorter map (`j` with `jk` mapped) or a
@@ -134,7 +134,7 @@ impl<W: Write> Drop for CursorStyleGuard<W> {
 /// RAII guard for terminal bracketed paste: turns the mode on at creation and
 /// **off on drop**, including on a panic unwind. With it on, the terminal hands
 /// a paste to the client as a single [`Event::Paste`] carrying the whole text,
-/// so the client forwards one `nvim_input` and the server does one redraw —
+/// so the client forwards one `nx_input` and the server does one redraw —
 /// instead of the per-character storm an unbracketed paste produces, which
 /// makes pasted text trickle in one char at a time. Drops cleanly on the panic
 /// path too, so a crash never leaves the terminal in bracketed-paste mode.
@@ -202,7 +202,7 @@ where
     let (rpc, mut incoming) = connect(reader, writer);
 
     rpc.request(
-        "nvim_ui_attach",
+        "nx_ui_attach",
         vec![
             Value::from(size.width as u64),
             Value::from(text_height(size.height) as u64),
@@ -254,24 +254,24 @@ where
                 Some(Ok(Event::Key(key))) => {
                     if key.kind != KeyEventKind::Release {
                         if let Some(notation) = encode_key(key) {
-                            rpc.notify("nvim_input", vec![Value::from(notation.as_str())]);
+                            rpc.notify("nx_input", vec![Value::from(notation.as_str())]);
                             flush_armed = true;
                         }
                     }
                 }
                 Some(Ok(Event::Paste(text))) => {
                     // Bracketed paste: the whole clipboard arrives as one event,
-                    // so forward it as a single `nvim_input` (one redraw) rather
+                    // so forward it as a single `nx_input` (one redraw) rather
                     // than the per-character trickle of an unbracketed paste.
                     let notation = encode_paste(&text);
                     if !notation.is_empty() {
-                        rpc.notify("nvim_input", vec![Value::from(notation.as_str())]);
+                        rpc.notify("nx_input", vec![Value::from(notation.as_str())]);
                         flush_armed = true;
                     }
                 }
                 Some(Ok(Event::Resize(w, h))) => {
                     rpc.notify(
-                        "nvim_ui_try_resize",
+                        "nx_ui_try_resize",
                         vec![Value::from(w as u64), Value::from(text_height(h) as u64)],
                     );
                     // A resize moves the chrome (the gutter width, the status row, the
@@ -318,7 +318,7 @@ where
                             // window + buffer position (focus-follows-click + cursor
                             // placement). `grid` is 0 — nxvim is single-grid.
                             rpc.notify(
-                                "nvim_input_mouse",
+                                "nx_input_mouse",
                                 vec![
                                     Value::from("left"),
                                     Value::from("press"),
@@ -341,7 +341,7 @@ where
                     // stray drag over chrome does nothing.
                     MouseEventKind::Drag(MouseButton::Left) => {
                         rpc.notify(
-                            "nvim_input_mouse",
+                            "nx_input_mouse",
                             vec![
                                 Value::from("left"),
                                 Value::from("drag"),
@@ -360,7 +360,7 @@ where
                     MouseEventKind::Up(MouseButton::Left) => {
                         autoscroll = None; // release ends the drag, so stop scrolling
                         rpc.notify(
-                            "nvim_input_mouse",
+                            "nx_input_mouse",
                             vec![
                                 Value::from("left"),
                                 Value::from("release"),
@@ -383,7 +383,7 @@ where
                             "middle"
                         };
                         rpc.notify(
-                            "nvim_input_mouse",
+                            "nx_input_mouse",
                             vec![
                                 Value::from(name),
                                 Value::from("press"),
@@ -457,7 +457,7 @@ where
                                 _ => "left",
                             };
                             rpc.notify(
-                                "nvim_input_mouse",
+                                "nx_input_mouse",
                                 vec![
                                     Value::from("wheel"),
                                     Value::from(action),
@@ -523,7 +523,7 @@ where
             _ = sleep(AUTOSCROLL_INTERVAL), if autoscroll.is_some() => {
                 if let Some((row, col)) = autoscroll {
                     rpc.notify(
-                        "nvim_input_mouse",
+                        "nx_input_mouse",
                         vec![
                             Value::from("left"),
                             Value::from("drag"),
@@ -577,7 +577,7 @@ fn within(col: u16, row: u16, x: u16, y: u16, w: u16, h: u16) -> bool {
     col >= x && col < x + w && row >= y && row < y + h
 }
 
-/// The `nvim_input_mouse` modifier string for a crossterm mouse event's
+/// The `nx_input_mouse` modifier string for a crossterm mouse event's
 /// modifiers — e.g. Shift+Ctrl → `"CS"`. The server's parser accepts the chars in
 /// any order with the `-` separator optional, so concatenation is enough. Drives
 /// shift-click (extend the selection) and the future Ctrl/Alt gestures.

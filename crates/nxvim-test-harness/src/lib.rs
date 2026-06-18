@@ -3,7 +3,7 @@
 //! Every test in the workspace drives the editor the same way a real UI client
 //! does: it starts a real [`nxvim_server`] on its own OS thread, connects over
 //! the same msgpack-RPC a front end speaks (an in-process [`tokio::io::duplex`]
-//! pipe), feeds vim key-notation through `nvim_input`, and asserts on observable
+//! pipe), feeds vim key-notation through `nx_input`, and asserts on observable
 //! results — buffer contents, the cursor, or the `redraw` notifications the
 //! server projects for clients to paint. Nothing reaches into the editor's
 //! internals.
@@ -64,7 +64,7 @@ pub fn spawn(init: ServerInit) -> (Rpc, UnboundedReceiver<Incoming>) {
 /// Attach a UI of `cols` × `rows`, so the server begins emitting `redraw`s.
 pub async fn attach(rpc: &Rpc, cols: u16, rows: u16) {
     rpc.request(
-        "nvim_ui_attach",
+        "nx_ui_attach",
         vec![
             Value::from(cols as u64),
             Value::from(rows as u64),
@@ -88,16 +88,16 @@ pub async fn start_attached(
 
 // ===== driving the editor ====================================================
 
-/// Type a string of vim key-notation (a fire-and-forget `nvim_input` notify).
+/// Type a string of vim key-notation (a fire-and-forget `nx_input` notify).
 pub fn feed(rpc: &Rpc, keys: &str) {
-    rpc.notify("nvim_input", vec![Value::from(keys)]);
+    rpc.notify("nx_input", vec![Value::from(keys)]);
 }
 
 /// A fake monotonic millisecond clock for mouse multi-click tests. Hand its
 /// [`handle`](TestClock::handle) to [`ServerInit::mouse_clock`] before spawning,
 /// keep the `TestClock`, and [`set_ms`](TestClock::set_ms) it between gestures to
 /// place them inside or outside `'mousetime'` deterministically — the server
-/// stamps each `nvim_input_mouse` from this instead of the wall clock, so
+/// stamps each `nx_input_mouse` from this instead of the wall clock, so
 /// "two clicks 100 ms apart" never depends on real timing.
 #[derive(Clone, Default)]
 pub struct TestClock(Arc<AtomicU64>);
@@ -119,14 +119,14 @@ impl TestClock {
     }
 }
 
-/// Send a mouse gesture via `nvim_input_mouse(button, action, "", 0, row, col)`
+/// Send a mouse gesture via `nx_input_mouse(button, action, "", 0, row, col)`
 /// — `row`/`col` are global, 0-based screen cells (`grid 0`), the way a real
 /// client reports them. Fire-and-forget; pair with a [`barrier`] / [`cursor`]
 /// read to observe the effect. For modifiers or to assert the RPC *rejects* a
-/// malformed call, drive `nvim_input_mouse` directly.
+/// malformed call, drive `nx_input_mouse` directly.
 pub fn feed_mouse(rpc: &Rpc, button: &str, action: &str, row: usize, col: usize) {
     rpc.notify(
-        "nvim_input_mouse",
+        "nx_input_mouse",
         vec![
             Value::from(button),
             Value::from(action),
@@ -156,9 +156,9 @@ pub fn feed_mouse_at(
     feed_mouse(rpc, button, action, row, col);
 }
 
-/// Run an ex-command via `nvim_command`.
+/// Run an ex-command via `nx_command`.
 pub async fn command(rpc: &Rpc, cmd: &str) {
-    rpc.request("nvim_command", vec![Value::from(cmd)])
+    rpc.request("nx_command", vec![Value::from(cmd)])
         .await
         .expect("command");
 }

@@ -8,7 +8,7 @@ use nxvim_core::{parse_keys, Key};
 impl EditHost {
     pub(crate) fn input(&mut self, keys: &str) {
         // Rebuild the keymap tries if the registry changed since the last batch —
-        // once per `nvim_input`, not per key, so each keystroke only walks the
+        // once per `nx_input`, not per key, so each keystroke only walks the
         // cached trie (design §6). A map a callback sets mid-batch takes effect on
         // the next batch, an accepted ordering.
         self.refresh_keymaps();

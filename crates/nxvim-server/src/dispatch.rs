@@ -53,9 +53,9 @@ impl EditHost {
                     Err(err) => self.fx.respond(id, Err(Value::from(err))),
                 }
                 // Typeahead a dispatched method queued via `nvim_feedkeys` (e.g. an
-                // `nvim_exec_lua` / `nvim_command` chunk that fed keys) is processed
+                // `nvim_exec_lua` / `nx_command` chunk that fed keys) is processed
                 // before the repaint, so the frame reflects the fed keys' effects.
-                // `nvim_input` already drained its own, so this is a no-op there.
+                // `nx_input` already drained its own, so this is a no-op there.
                 self.drain_feedkeys();
                 self.redraw();
             }
@@ -77,7 +77,7 @@ impl EditHost {
     /// Dispatch an API method. This is the (small, growing) `nvim_*` surface.
     pub(crate) fn dispatch(&mut self, method: &str, params: &[Value]) -> Result<Value, String> {
         match method {
-            "nvim_ui_attach" => {
+            "nx_ui_attach" => {
                 let w = uint(params.first(), 80);
                 let h = uint(params.get(1), 24);
                 self.ui = Some((w, h));
@@ -90,7 +90,7 @@ impl EditHost {
                 self.run_pending();
                 Ok(Value::Nil)
             }
-            "nvim_ui_try_resize" => {
+            "nx_ui_try_resize" => {
                 let w = uint(params.first(), 80);
                 let h = uint(params.get(1), 24);
                 self.ui = Some((w, h));
@@ -100,16 +100,16 @@ impl EditHost {
                 self.run_pending();
                 Ok(Value::Nil)
             }
-            "nvim_input" => {
+            "nx_input" => {
                 let keys = text(params.first());
                 self.input(&keys);
                 Ok(Value::from(keys.len() as u64))
             }
-            // `nvim_input_mouse(button, action, modifier, grid, row, col)`: a mouse
+            // `nx_input_mouse(button, action, modifier, grid, row, col)`: a mouse
             // gesture at a global screen cell. nxvim is single-grid, so `grid`
             // (param 3) is ignored and the editor hit-tests the cell itself. A
             // malformed button/action/modifier is a loud error at the boundary.
-            "nvim_input_mouse" => {
+            "nx_input_mouse" => {
                 let button = text(params.first());
                 let action = text(params.get(1));
                 let modifier = text(params.get(2));
@@ -138,7 +138,7 @@ impl EditHost {
                 // tests as the open/closed oracle.
                 Ok(Value::from(self.editor.panel_is_open()))
             }
-            "nvim_command" => {
+            "nx_command" => {
                 let cmd = text(params.first());
                 self.run_command(&cmd);
                 Ok(Value::Nil)

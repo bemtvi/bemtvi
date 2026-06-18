@@ -8,7 +8,7 @@
 //! local, bytes cross the injected fs.
 //!
 //! Black-box like the rest: a real server over the in-process RPC pipe, driven by
-//! `nvim_input` / `nvim_command`, asserting on `nvim_buf_get_lines` and on what
+//! `nx_input` / `nx_command`, asserting on `nvim_buf_get_lines` and on what
 //! the fake fs observed.
 
 use std::collections::HashMap;
@@ -118,10 +118,10 @@ async fn write_goes_back_through_the_injected_host_fs() {
 
     // Edit line 1 ("alpha" -> "alphaX"), then save. The awaited command is the
     // barrier: the write has run through the fs by the time it returns.
-    rpc.request("nvim_input", vec![Value::from("AX<Esc>")])
+    rpc.request("nx_input", vec![Value::from("AX<Esc>")])
         .await
         .expect("input");
-    rpc.request("nvim_command", vec![Value::from("w")])
+    rpc.request("nx_command", vec![Value::from("w")])
         .await
         .expect("write");
 
@@ -145,10 +145,10 @@ async fn bare_session_routes_a_later_write_through_the_injected_host_fs() {
     let (rpc, _incoming) = spawn(init);
     attach(&rpc, 80, 24).await;
 
-    rpc.request("nvim_input", vec![Value::from("ihello<Esc>")])
+    rpc.request("nx_input", vec![Value::from("ihello<Esc>")])
         .await
         .expect("input");
-    rpc.request("nvim_command", vec![Value::from("write /virtual/out.txt")])
+    rpc.request("nx_command", vec![Value::from("write /virtual/out.txt")])
         .await
         .expect("write");
 

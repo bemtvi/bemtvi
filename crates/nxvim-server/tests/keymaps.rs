@@ -49,7 +49,7 @@ async fn flush(rpc: &Rpc) {
 /// Feed `keys`, then return the `redraw` map the server emitted for that input.
 ///
 /// The server processes messages serially, writing each message's response then
-/// its `redraw`; we send `nvim_input` then a `nvim_get_mode` barrier, so once the
+/// its `redraw`; we send `nx_input` then a `nvim_get_mode` barrier, so once the
 /// barrier `.await` resolves the input's redraw is already queued. We take the
 /// *most recent* queued redraw, not the first: a frame still in flight from
 /// earlier in the test (the startup frame, or a previous call's trailing barrier
@@ -63,7 +63,7 @@ async fn redraw_after(
     keys: &str,
 ) -> Vec<(Value, Value)> {
     while incoming.try_recv().is_ok() {} // drop notifications buffered earlier
-    rpc.request("nvim_input", vec![Value::from(keys)])
+    rpc.request("nx_input", vec![Value::from(keys)])
         .await
         .expect("input");
     rpc.request("nvim_get_mode", vec![]).await.expect("barrier");

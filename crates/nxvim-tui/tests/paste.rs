@@ -1,5 +1,5 @@
 //! Tier 1: a bracketed-paste `Event::Paste(text)` is encoded as a *single* vim
-//! key-notation string so the whole paste rides one `nvim_input` (one redraw),
+//! key-notation string so the whole paste rides one `nx_input` (one redraw),
 //! instead of arriving as one keystroke per character. Black-box, no process:
 //! drives the public `encode_paste` the client uses on a paste event.
 

@@ -2,7 +2,7 @@
 //!
 //! The server receives input from clients as vim-style key notation strings
 //! (e.g. `"i"`, `"<Esc>"`, `"<C-w>"`, `"jjj"`), exactly like neovim's
-//! `nvim_input`. [`parse_keys`] turns such a string into a sequence of [`Key`]
+//! `nx_input`. [`parse_keys`] turns such a string into a sequence of [`Key`]
 //! values that the editor model consumes. The TUI client performs the inverse
 //! mapping (crossterm key events -> notation) before sending.
 
@@ -71,7 +71,7 @@ impl Key {
 }
 
 /// Which physical mouse control a [`MouseEvent`] came from — the `button`
-/// argument of neovim's `nvim_input_mouse`. `Wheel` is the scroll wheel (its
+/// argument of neovim's `nx_input_mouse`. `Wheel` is the scroll wheel (its
 /// direction lives in [`MouseAction`]); `Move` is a bare pointer move
 /// (`'mousemoveevent'`); `X1`/`X2` are the back/forward thumb buttons.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -85,7 +85,7 @@ pub enum MouseButton {
     X2,
 }
 
-/// What a mouse button did — the `action` argument of `nvim_input_mouse`. For an
+/// What a mouse button did — the `action` argument of `nx_input_mouse`. For an
 /// ordinary button this is press / drag / release; for [`MouseButton::Wheel`] it
 /// is a scroll *direction* (`WheelUp`/`Down`/`Left`/`Right`); for
 /// [`MouseButton::Move`] it is [`MouseAction::MoveTo`].
@@ -130,7 +130,7 @@ pub struct MouseEvent {
 }
 
 impl MouseEvent {
-    /// Parse the `nvim_input_mouse(button, action, modifier, row, col)` arguments
+    /// Parse the `nx_input_mouse(button, action, modifier, row, col)` arguments
     /// into a [`MouseEvent`]. An unknown `button`, or an `action` that doesn't fit
     /// the button (e.g. `"press"` on the wheel, or `"up"` on the left button), is
     /// an `Err` naming the offending value — a malformed RPC call fails loud at the
@@ -151,7 +151,7 @@ impl MouseEvent {
             "move" => MouseButton::Move,
             "x1" => MouseButton::X1,
             "x2" => MouseButton::X2,
-            other => return Err(format!("nvim_input_mouse: unknown button {other:?}")),
+            other => return Err(format!("nx_input_mouse: unknown button {other:?}")),
         };
         let action = match button {
             MouseButton::Wheel => match action {
@@ -161,7 +161,7 @@ impl MouseEvent {
                 "right" => MouseAction::WheelRight,
                 other => {
                     return Err(format!(
-                        "nvim_input_mouse: wheel action must be up/down/left/right, got {other:?}"
+                        "nx_input_mouse: wheel action must be up/down/left/right, got {other:?}"
                     ))
                 }
             },
@@ -173,7 +173,7 @@ impl MouseEvent {
                 "release" => MouseAction::Release,
                 other => {
                     return Err(format!(
-                        "nvim_input_mouse: button action must be press/drag/release, got {other:?}"
+                        "nx_input_mouse: button action must be press/drag/release, got {other:?}"
                     ))
                 }
             },
@@ -193,7 +193,7 @@ impl MouseEvent {
     }
 }
 
-/// Parse the `modifier` argument of `nvim_input_mouse` — a run of modifier chars
+/// Parse the `modifier` argument of `nx_input_mouse` — a run of modifier chars
 /// with the `-` separator optional, so `"C-S"`, `"cs"`, and `"CS"` all mean
 /// Ctrl+Shift. Returns `(ctrl, alt, shift)`. An unrecognized char is an `Err`
 /// (fail loud), matching the rest of [`MouseEvent::parse`].
@@ -205,7 +205,7 @@ fn parse_mouse_modifier(modifier: &str) -> Result<(bool, bool, bool), String> {
             'A' | 'M' | 'D' => alt = true,
             'S' => shift = true,
             '-' => {} // optional separator
-            other => return Err(format!("nvim_input_mouse: unknown modifier {other:?}")),
+            other => return Err(format!("nx_input_mouse: unknown modifier {other:?}")),
         }
     }
     Ok((ctrl, alt, shift))

@@ -1657,7 +1657,7 @@ async fn sleep_blocks_the_editor_for_the_requested_duration() {
     // The command is acknowledged promptly; the server then sleeps. The next
     // request can only be handled once the sleep finishes, so its round-trip
     // time is a reliable *lower bound* on the sleep (lower bounds never flake).
-    rpc.request("nvim_command", vec![Value::from("sleep 150m")])
+    rpc.request("nx_command", vec![Value::from("sleep 150m")])
         .await
         .expect("sleep command");
     let begin = std::time::Instant::now();

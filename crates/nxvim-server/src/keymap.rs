@@ -8,7 +8,7 @@
 //! unaware and sidesteps borrow conflicts between the matcher state and the editor.
 //!
 //! **Matching without a timer.** nxvim processes keys synchronously, in
-//! `nvim_input` batches, with no idle timer — so vim's `timeoutlen` ambiguity
+//! `nx_input` batches, with no idle timer — so vim's `timeoutlen` ambiguity
 //! ("wait T ms, then take the shorter map") can't be reproduced. Instead a key
 //! that forms a *live prefix* of some mapping is **withheld** in `pending`; the
 //! next key either extends the prefix, completes a mapping, or breaks it — in

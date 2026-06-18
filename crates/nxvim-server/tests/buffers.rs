@@ -141,7 +141,7 @@ async fn editing_a_nonexistent_file_does_not_storm_the_file_watch() {
     let (rpc, mut incoming) = start().await;
 
     // Open a real file first (arms its watch), then — the way a user does, via *typed*
-    // keystrokes (`nvim_input`), not an `nvim_command` RPC — edit a missing file.
+    // keystrokes (`nx_input`), not an `nx_command` RPC — edit a missing file.
     feed(&rpc, &format!(":e {}<CR>", name(&real)));
     let _ = lines(&rpc).await;
     feed(&rpc, &format!(":e {}<CR>", name(&missing)));
@@ -427,7 +427,7 @@ async fn ls_lists_open_buffers_with_flags() {
     // (row count, per-row flags, selected row) without saying anything about the
     // `:ls` behavior under test.
     rpc.request(
-        "nvim_ui_try_resize",
+        "nx_ui_try_resize",
         vec![Value::from(400u64), Value::from(24u64)],
     )
     .await

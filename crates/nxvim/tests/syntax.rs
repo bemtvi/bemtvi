@@ -823,7 +823,7 @@ async fn switching_buffers_shows_each_buffers_own_highlights() {
     let a_row0 = a_hl[0].clone();
 
     // Open B in a second buffer; its row 0 differs from A's.
-    rpc.request("nvim_command", vec![Value::from(format!("e {b}"))])
+    rpc.request("nx_command", vec![Value::from(format!("e {b}"))])
         .await
         .expect("edit b");
     let b_hl = wait_for_highlights(&rpc, &mut incoming, |hl| {

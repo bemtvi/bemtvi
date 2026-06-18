@@ -3,7 +3,7 @@
 //! The GUI's analogue of the TUI's `encode_key`: it maps a winit
 //! [`winit::keyboard::Key`] + the active [`ModifiersState`] onto the
 //! toolkit-neutral [`nxvim_view::Key`], then hands it to
-//! [`nxvim_view::notation`] for the `<...>` spelling the server's `nvim_input`
+//! [`nxvim_view::notation`] for the `<...>` spelling the server's `nx_input`
 //! expects. A key with no mapping (a bare modifier, a dead key) yields `None`
 //! and is dropped — the same contract the TUI follows.
 

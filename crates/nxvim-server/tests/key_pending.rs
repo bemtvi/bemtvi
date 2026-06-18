@@ -106,7 +106,7 @@ async fn prefix_growth_lists_continuations() {
 
 /// Completing the mapping clears the prefix — one trailing *cleared* event
 /// (empty keys, no continuations) so a which-key popup closes. Fed key-by-key
-/// (separate `nvim_input` batches), the way a TUI sends interactive keystrokes: a
+/// (separate `nx_input` batches), the way a TUI sends interactive keystrokes: a
 /// same-batch `<Space>w` would settle before the per-batch sample and elide the
 /// growth, which is the intended "don't flash on a fast sequence" behavior.
 #[tokio::test]

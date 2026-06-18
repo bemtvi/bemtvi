@@ -2,7 +2,7 @@
 //!
 //! These are deliberately *black box*: every test starts a real server on its
 //! own thread, connects over the same msgpack-RPC a UI uses, sends vim
-//! key-notation via `nvim_input`, and asserts on observable results — buffer
+//! key-notation via `nx_input`, and asserts on observable results — buffer
 //! contents (`nvim_buf_get_lines`), the bytes written to disk, or the rendered
 //! screen. Nothing reaches into the editor's internals. We verify *what the
 //! editor does*, not how it's built.

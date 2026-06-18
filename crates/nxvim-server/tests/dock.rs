@@ -27,7 +27,7 @@ async fn req(rpc: &Rpc, method: &str, args: Vec<Value>) -> Value {
 /// Feed `keys` and wait for the editor to settle (a `nvim_get_mode` barrier), so a
 /// following redraw drain sees this input's frame rather than a stale one.
 async fn feed_sync(rpc: &Rpc, keys: &str) {
-    rpc.request("nvim_input", vec![Value::from(keys)])
+    rpc.request("nx_input", vec![Value::from(keys)])
         .await
         .expect("input");
     rpc.request("nvim_get_mode", vec![]).await.expect("barrier");
@@ -1289,7 +1289,7 @@ async fn ls_lists_only_the_focused_layers_buffers() {
     // row — otherwise the one-row-per-buffer count this asserts on breaks.
     req(
         &rpc,
-        "nvim_ui_try_resize",
+        "nx_ui_try_resize",
         vec![Value::from(400u64), Value::from(40u64)],
     )
     .await;

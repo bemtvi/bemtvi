@@ -746,7 +746,7 @@ impl EditHost {
     /// native [`run_io`] (which then seeds `shada` / `mouse_clock` / the LSP keymap
     /// defaults and sources config) and the out-of-crate wasm cdylib (slice 5b, which
     /// calls [`boot`](Self::boot) for the serverless startup). The caller attaches a
-    /// UI — [`attach_ui`](Self::attach_ui) on wasm, the `nvim_ui_attach` RPC natively —
+    /// UI — [`attach_ui`](Self::attach_ui) on wasm, the `nx_ui_attach` RPC natively —
     /// before the first [`redraw`](Self::redraw).
     pub fn new(editor: Editor, lua: LuaRuntime, fx: Box<dyn HostEffects>) -> EditHost {
         EditHost {
@@ -844,9 +844,9 @@ impl EditHost {
 #[cfg(not(feature = "native"))]
 impl EditHost {
     /// Attach a UI of `width` × `height` cells — the wasm analogue of the
-    /// `nvim_ui_attach` RPC (the dispatch router is gated off the wasm build), so
+    /// `nx_ui_attach` RPC (the dispatch router is gated off the wasm build), so
     /// [`redraw`](Self::redraw) has dimensions to project the view into, then paints
-    /// the initial frame (as `nvim_ui_attach` triggers a repaint natively). Also the
+    /// the initial frame (as `nx_ui_attach` triggers a repaint natively). Also the
     /// resize path — a re-attach at a new size repaints.
     pub fn attach_ui(&mut self, width: usize, height: usize) {
         self.ui = Some((width, height));
@@ -919,7 +919,7 @@ impl EditHost {
     }
 
     /// Apply a mouse gesture and repaint — the wasm Worker's `eh_input_mouse` tick.
-    /// `button`/`action`/`modifier` are the `nvim_input_mouse` strings and `row`/`col`
+    /// `button`/`action`/`modifier` are the `nx_input_mouse` strings and `row`/`col`
     /// the 0-based global screen cell; core owns the hit-test, multi-click word/line
     /// selection, drag-select, and wheel scroll, exactly as the native dispatch path
     /// does. The event is stamped from the Worker's JS clock ([`set_clock`](Self::set_clock),

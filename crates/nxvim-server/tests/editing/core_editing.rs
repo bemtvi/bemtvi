@@ -208,7 +208,7 @@ async fn undotree_fn_marks_the_saved_state() {
     let path = temp_path("undotree");
     feed(&rpc, "ifoo<Esc>");
     rpc.request(
-        "nvim_command",
+        "nx_command",
         vec![Value::from(format!("w {}", path.display()).as_str())],
     )
     .await
@@ -272,7 +272,7 @@ async fn ex_write_persists_changes_to_disk() {
     let (rpc, _incoming) = start(Some(path.to_string_lossy().into_owned())).await;
     // Jump to the last line, open a new one, type, leave insert, then save.
     feed(&rpc, "Gothree<Esc>");
-    rpc.request("nvim_command", vec![Value::from("w")])
+    rpc.request("nx_command", vec![Value::from("w")])
         .await
         .expect("write");
 
@@ -320,7 +320,7 @@ async fn ex_write_refuses_to_clobber_a_file_changed_on_disk() {
 
     // ...but `:w!` forces it through, and afterwards the buffer is in sync with
     // disk again (a second `:w` no longer trips the guard).
-    rpc.request("nvim_command", vec![Value::from("w!")])
+    rpc.request("nx_command", vec![Value::from("w!")])
         .await
         .expect("forced write");
     assert_eq!(
@@ -330,7 +330,7 @@ async fn ex_write_refuses_to_clobber_a_file_changed_on_disk() {
     );
 
     feed(&rpc, "obonus<Esc>");
-    rpc.request("nvim_command", vec![Value::from("w")])
+    rpc.request("nx_command", vec![Value::from("w")])
         .await
         .expect("plain write after sync");
     assert_eq!(
@@ -635,7 +635,7 @@ async fn lua_vim_cmd_drives_the_editor() {
 
     let (rpc, _incoming) = start(None).await;
     let chunk = format!("lua vim.cmd(\"edit {}\")", path.to_string_lossy());
-    rpc.request("nvim_command", vec![Value::from(chunk.as_str())])
+    rpc.request("nx_command", vec![Value::from(chunk.as_str())])
         .await
         .expect("lua command");
 

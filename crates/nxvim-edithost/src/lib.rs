@@ -767,8 +767,8 @@ pub unsafe extern "C" fn eh_input(h: *mut WasmEditHost, notation: *const c_char)
 }
 
 /// Apply a mouse gesture through the real tick and project the resulting frame — the
-/// `nvim_input_mouse` counterpart of [`eh_input`]. `button`/`action`/`modifier` are the
-/// `nvim_input_mouse` strings (`"left"`/`"wheel"`, `"press"`/`"drag"`/`"release"`/`"up"`/
+/// `nx_input_mouse` counterpart of [`eh_input`]. `button`/`action`/`modifier` are the
+/// `nx_input_mouse` strings (`"left"`/`"wheel"`, `"press"`/`"drag"`/`"release"`/`"up"`/
 /// `"down"`, `"CS"`…) and `row`/`col` the 0-based global screen cell; core owns the
 /// hit-test (single-grid). The Worker sets the clock ([`eh_set_clock`]) before this call
 /// so multi-click timing is right.

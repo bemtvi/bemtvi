@@ -1,5 +1,5 @@
 //! Behavior tests for mouse support, driven the way a real client drives the
-//! editor: a global screen cell goes in via `nvim_input_mouse`, and we assert on
+//! editor: a global screen cell goes in via `nx_input_mouse`, and we assert on
 //! the observable result (cursor position, focused window). The editor owns the
 //! whole hit-test from cell to buffer position, so these tests exercise that
 //! reverse mapping end-to-end.
@@ -57,7 +57,7 @@ async fn start_clocked(content: &str) -> (Rpc, TestClock, UnboundedReceiver<Inco
 /// with a barrier read to observe the effect.
 fn shift_press(rpc: &Rpc, row: usize, col: usize) {
     rpc.notify(
-        "nvim_input_mouse",
+        "nx_input_mouse",
         vec![
             Value::from("left"),
             Value::from("press"),
@@ -92,14 +92,14 @@ async fn mouse_gate_disabled_ignores_click() {
     assert_eq!(cursor(&rpc).await, (1, 0), "click ignored while mouse off");
 }
 
-/// A malformed `nvim_input_mouse` call (unknown action for the button) is
+/// A malformed `nx_input_mouse` call (unknown action for the button) is
 /// rejected loudly at the boundary, never silently coerced.
 #[tokio::test]
 async fn unknown_mouse_action_errors() {
     let (rpc, _incoming) = start("hello").await;
     let bad = rpc
         .request(
-            "nvim_input_mouse",
+            "nx_input_mouse",
             vec![
                 Value::from("left"),
                 Value::from("up"), // "up" is a wheel direction, not a button action
@@ -499,7 +499,7 @@ async fn all_wins(rpc: &Rpc) -> Vec<u64> {
 /// which the modifier-less `feed_mouse` can't send.
 fn wheel_mod(rpc: &Rpc, action: &str, modifier: &str, row: usize, col: usize) {
     rpc.notify(
-        "nvim_input_mouse",
+        "nx_input_mouse",
         vec![
             Value::from("wheel"),
             Value::from(action),

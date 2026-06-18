@@ -1,7 +1,7 @@
 //! Black-box tests for `:terminal` (Phase 3 — the native PTY transport).
 //!
 //! A real server over RPC spawns a real local PTY child; the test drives it with
-//! `nvim_input` and asserts on the buffer the child's output is mirrored into. PTY
+//! `nx_input` and asserts on the buffer the child's output is mirrored into. PTY
 //! output is asynchronous (a reader thread streams it back and the server settles
 //! off-tick), so assertions poll the buffer until the expected text lands rather
 //! than reading once. Hermetic: only POSIX `cat` is spawned (present on macOS/Linux).

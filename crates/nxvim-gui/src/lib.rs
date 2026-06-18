@@ -2,7 +2,7 @@
 //!
 //! A thin RPC client that owns no editor state — the GUI sibling of `nxvim-tui`.
 //! It attaches to the server, sends keystrokes as vim key-notation
-//! (`nvim_input`), and paints the server's [`View`] (the same `redraw` model the
+//! (`nx_input`), and paints the server's [`View`] (the same `redraw` model the
 //! TUI consumes) onto a GPU surface as a monospace cell grid.
 //!
 //! **Threading.** winit owns the main thread (its event loop is not async), so
@@ -11,7 +11,7 @@
 //! forwards it to the event loop as a [`UserEvent`] via an
 //! [`winit::event_loop::EventLoopProxy`]. Input flows the other way without a
 //! runtime — [`nxvim_rpc::Rpc`] is `Clone + Send` and its `notify` is synchronous,
-//! so the winit thread fires `nvim_input` / `nvim_ui_*` directly on a cloned
+//! so the winit thread fires `nx_input` / `nvim_ui_*` directly on a cloned
 //! handle.
 //!
 //! The focused window scrolls pixel-smoothly: a redraw's scroll gesture arms a
@@ -398,7 +398,7 @@ fn report_connect_error(rpc: &Rpc, err: &anyhow::Error) {
     let line = format!(":connect failed: {err:#}").replace('\n', "; ");
     let escaped = line.replace('\'', "''");
     rpc.notify(
-        "nvim_command",
+        "nx_command",
         vec![Value::from(format!(
             "echohl ErrorMsg|echom '{escaped}'|echohl NONE"
         ))],
@@ -671,9 +671,9 @@ impl App {
         }
         self.reported = (cols, win_rows);
         let method = if attach {
-            "nvim_ui_attach"
+            "nx_ui_attach"
         } else {
-            "nvim_ui_try_resize"
+            "nx_ui_try_resize"
         };
         self.rpc.notify(
             method,
@@ -681,7 +681,7 @@ impl App {
         );
     }
 
-    /// Read the system clipboard and feed it to the server as one `nvim_input` via
+    /// Read the system clipboard and feed it to the server as one `nx_input` via
     /// [`encode_paste`] — the GUI analogue of the TUI's bracketed paste (one
     /// notify, one redraw, no per-character trickle). A missing, empty, or
     /// non-text clipboard is a silent no-op (nothing to paste).
@@ -692,7 +692,7 @@ impl App {
         let notation = encode_paste(&text);
         if !notation.is_empty() {
             self.rpc
-                .notify("nvim_input", vec![Value::from(notation.as_str())]);
+                .notify("nx_input", vec![Value::from(notation.as_str())]);
         }
     }
 
@@ -764,11 +764,11 @@ impl App {
     /// Abort the half-typed command line, then run `<verb> <path>` for a picked
     /// file (nothing further on cancel). Shared by the open and save pickers.
     fn run_picked(&self, verb: &str, picked: Option<PathBuf>) {
-        self.rpc.notify("nvim_input", vec![Value::from("<Esc>")]);
+        self.rpc.notify("nx_input", vec![Value::from("<Esc>")]);
         if let Some(path) = picked {
             let path = path.to_string_lossy();
             self.rpc
-                .notify("nvim_command", vec![Value::from(format!("{verb} {path}"))]);
+                .notify("nx_command", vec![Value::from(format!("{verb} {path}"))]);
         }
     }
 
@@ -779,12 +779,12 @@ impl App {
         Some(r.cell_at(self.cursor_px.0, self.cursor_px.1))
     }
 
-    /// Fire one `nvim_input_mouse(button, action, modifier, grid=0, row, col)` —
+    /// Fire one `nx_input_mouse(button, action, modifier, grid=0, row, col)` —
     /// a mouse gesture at a global screen cell. The server owns the hit-test back
     /// to a window + buffer position; `grid` is always 0 (nxvim is single-grid).
     fn send_mouse(&self, button: &str, action: &str, col: u16, row: u16) {
         self.rpc.notify(
-            "nvim_input_mouse",
+            "nx_input_mouse",
             vec![
                 Value::from(button),
                 Value::from(action),
@@ -1222,7 +1222,7 @@ impl ApplicationHandler<UserEvent> for App {
             // A `:connect` brought up a new server: swap to its RPC handle (dropping the
             // old one — the App's last clone, which lets the old connection wind down),
             // update remote-ness, and re-attach the UI. Clearing `reported` forces
-            // `report_size` to send a fresh `nvim_ui_attach`; resetting the view avoids
+            // `report_size` to send a fresh `nx_ui_attach`; resetting the view avoids
             // painting the old server's buffer until the new one's first redraw arrives.
             UserEvent::Connected { rpc, remote } => {
                 self.rpc = *rpc;
@@ -1252,10 +1252,10 @@ impl ApplicationHandler<UserEvent> for App {
             // modified buffer silently. Route through the server's `:qa`, which
             // quits a clean editor (it then sends `nxvim_exit`, arriving as
             // `UserEvent::Exit`) but refuses with `E37` when a buffer is unsaved,
-            // keeping the window open. `nvim_command` runs the ex-command
+            // keeping the window open. `nx_command` runs the ex-command
             // regardless of the current mode (unlike injecting `:qa<CR>` keys).
             WindowEvent::CloseRequested => {
-                self.rpc.notify("nvim_command", vec![Value::from("qa")]);
+                self.rpc.notify("nx_command", vec![Value::from("qa")]);
             }
             WindowEvent::Resized(size) => {
                 if let Some(r) = self.renderer.as_mut() {
@@ -1331,7 +1331,7 @@ impl ApplicationHandler<UserEvent> for App {
                     // ask the IO thread to bring the new session up (see
                     // `UserEvent::Connected`).
                     if let Some(target) = remote::connect_command(&self.view.cmdline) {
-                        self.rpc.notify("nvim_input", vec![Value::from("<Esc>")]);
+                        self.rpc.notify("nx_input", vec![Value::from("<Esc>")]);
                         let _ = self.reconnect.send(target);
                         return;
                     }
@@ -1375,7 +1375,7 @@ impl ApplicationHandler<UserEvent> for App {
                 };
                 if let Some(notation) = input::encode_key(&key, self.mods) {
                     self.rpc
-                        .notify("nvim_input", vec![Value::from(notation.as_str())]);
+                        .notify("nx_input", vec![Value::from(notation.as_str())]);
                     // Arm the `timeoutlen` flush; the next key re-arms it, so it
                     // measures idle-since-last-key (see `about_to_wait`).
                     self.flush_deadline = Some(Instant::now() + TIMEOUT_LEN);

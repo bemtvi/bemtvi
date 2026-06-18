@@ -58,7 +58,7 @@ async fn message_after(
     keys: &str,
 ) -> String {
     while incoming.try_recv().is_ok() {}
-    rpc.request("nvim_input", vec![Value::from(keys)])
+    rpc.request("nx_input", vec![Value::from(keys)])
         .await
         .expect("input");
     rpc.request("nvim_get_mode", vec![]).await.expect("barrier");

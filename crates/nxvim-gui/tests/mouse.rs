@@ -1,5 +1,5 @@
 //! Tier 1: the pure mouse helpers the GUI client feeds winit pointer events
-//! through — pixel→cell conversion, the `nvim_input_mouse` modifier string, and
+//! through — pixel→cell conversion, the `nx_input_mouse` modifier string, and
 //! the wheel-notch accumulator and direction. Black-box, no window, no GPU — the
 //! mouse analogue of the `keys` test. The winit→RPC wiring itself lives in the
 //! event loop and isn't unit-testable without a window; these cover the math it

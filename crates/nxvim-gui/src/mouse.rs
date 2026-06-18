@@ -4,7 +4,7 @@
 //! or position into the button/wheel events, so the [`crate::App`] event loop
 //! tracks the latest cursor pixel and the live [`ModifiersState`] and feeds them
 //! here. These helpers are the *pure* part — pixel→cell conversion math, the
-//! `nvim_input_mouse` modifier string, the overlay hit-test rectangles, and the
+//! `nx_input_mouse` modifier string, the overlay hit-test rectangles, and the
 //! wheel-notch accumulator — kept toolkit-light and unit-tested in
 //! `tests/mouse.rs`. The actual `rpc.notify` wiring lives in `lib`.
 //!
@@ -16,7 +16,7 @@
 use winit::event::MouseButton;
 use winit::keyboard::ModifiersState;
 
-/// The `nvim_input_mouse` button name for a winit button, or `None` for one the
+/// The `nx_input_mouse` button name for a winit button, or `None` for one the
 /// server has no gesture for (back/forward/other). `"left"` carries the
 /// focus-follows-click + selection machinery; `"right"` is the `'mousemodel'`
 /// branch (extend / popup-setpos); `"middle"` pastes the `"*` register. Mirrors
@@ -30,7 +30,7 @@ pub fn button_name(button: MouseButton) -> Option<&'static str> {
     }
 }
 
-/// The `nvim_input_mouse` modifier string for the live modifier state — e.g.
+/// The `nx_input_mouse` modifier string for the live modifier state — e.g.
 /// Ctrl+Shift → `"CS"`. The server's parser accepts the chars in any order with
 /// the `-` separator optional, so concatenation is enough. Mirrors the TUI's
 /// `mouse_modifier`; drives shift-click (extend the selection) and Ctrl/Alt
@@ -80,7 +80,7 @@ pub fn drain_notches(amount: f32, accum: &mut f32) -> i32 {
     whole as i32
 }
 
-/// The `nvim_input_mouse` wheel **action** for a vertical notch count: `"up"`
+/// The `nx_input_mouse` wheel **action** for a vertical notch count: `"up"`
 /// when positive, `"down"` when negative. winit's positive delta means the
 /// content moves down (revealing earlier lines), i.e. a scroll *up* — see
 /// [`MouseScrollDelta`](winit::event::MouseScrollDelta). `None` for zero.
@@ -92,7 +92,7 @@ pub fn vertical_action(notches: i32) -> Option<&'static str> {
     }
 }
 
-/// The `nvim_input_mouse` wheel **action** for a horizontal notch count: `"left"`
+/// The `nx_input_mouse` wheel **action** for a horizontal notch count: `"left"`
 /// when positive, `"right"` when negative (winit's positive-x reveals content to
 /// the left). `None` for zero.
 pub fn horizontal_action(notches: i32) -> Option<&'static str> {

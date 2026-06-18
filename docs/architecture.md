@@ -122,10 +122,10 @@ and lets every front end share identical behavior.
 
 ```
 ┌──────────────────────────┐         msgpack-RPC          ┌──────────────────────────┐
-│  Client (nxvim-tui)       │  ───── nvim_input ─────────▶ │  Server (nxvim-server)    │
-│  • crossterm input        │  ◀──── redraw events ─────── │  • nxvim-core (model)     │
-│  • paints the grid        │  ───── nvim_command ───────▶ │  • nxvim-lua (vim.*)      │
-│  • owns NO editor state   │  ◀──── responses ─────────── │  • nvim_* API surface     │
+│  Client (nxvim-tui)      │  ───── nx_input ─────────▶   │  Server (nxvim-server)   │
+│  • crossterm input       │  ◀──── redraw events ─────── │  • nxvim-core (model)    │
+│  • paints the grid       │  ───── nx_command ───────▶   │  • nxvim-lua (vim.*)     │
+│  • owns NO editor state  │  ◀──── responses ──────────  │  • nvim_* API surface    │
 └──────────────────────────┘                              └──────────────────────────┘
         main thread                                              its own thread
 ```
@@ -266,9 +266,12 @@ protocol, **not** for neovim interop. Messages are msgpack arrays:
 - Response: `[1, msgid, error, result]`
 - Notification: `[2, method, params]`
 
-The method names happen to use the familiar `nvim_*` spelling (`nvim_input`,
-`nvim_command`, `nvim_buf_get_lines`, `nvim_ui_attach`), but they are nxvim's
-own methods with nxvim's own semantics — they are not a compatibility surface.
+The client-protocol verbs — the ones a UI actually speaks (input, attach,
+resize) — are `nx_*`: `nx_input`, `nx_input_mouse`, `nx_ui_attach`,
+`nx_ui_try_resize`, `nx_command`. The editing-API methods keep the familiar
+neovim spelling (`nvim_buf_get_lines`, `nvim_open_win`, `nvim_win_set_cursor`,
+…) as muscle-memory names for config and Lua, but they are nxvim's own methods
+with nxvim's own semantics.
 
 ### View protocol (UI)
 
@@ -337,7 +340,7 @@ then draws the `separators` between splits and reserves the bottom rows for the
 global command/message line and panel. The terminal cursor is drawn only in the
 `focused` window. Because the core lays out the windows (vertical splits divide
 width), the client reports **both** dimensions of the windows area on
-`nvim_ui_attach`/`nvim_ui_try_resize`. There is still no grid, no cell encoding,
+`nx_ui_attach`/`nx_ui_try_resize`. There is still no grid, no cell encoding,
 and no `ext_linegrid`.
 
 **Floating windows are a second, on-top layer.** Each `WindowView` carries
@@ -705,7 +708,7 @@ window but simpler: a transient overlay that grabs input focus while open.
   editor's broader, server-owned mouse support (click, drag-select, multi-click,
   shift-extend, wheel scroll, divider drag, the `'mousemodel'` right-click menu,
   middle-click paste, and tabline clicks), forwarded by both clients as
-  `nvim_input_mouse` with the server owning the hit-test.
+  `nx_input_mouse` with the server owning the hit-test.
 
 The redraw carries the panel as a `panel` map (`title`, `lines`, `cursor_row`,
 `height`), `Nil` when none is open; the client draws the editing cursor inside
@@ -899,7 +902,7 @@ client interpolates `top` without rounding). Input reaches parity too:
 vim-notation keys, system-clipboard paste, native open/save dialogs, and **mouse**
 — left click / drag-select / release, wheel scroll, right-click
 (`'mousemodel'`), middle-click paste, and the pmenu / panel overlay gestures, sent
-as the same `nvim_input_mouse` the TUI uses (the server owns the hit-test). Still
+as the same `nx_input_mouse` the TUI uses (the server owns the hit-test). Still
 deferred: wide-char column fidelity (a char index stands in for a screen column),
 and undercurl is drawn as a plain underline.
 Because the GUI can't be black-box
@@ -977,7 +980,7 @@ stays thin:
 
 - **RPC / `View` integration** ([`crates/nxvim-server/tests/editing.rs`](../crates/nxvim-server/tests/editing.rs))
   start a real server, connect over real RPC, send vim key-notation via
-  `nvim_input`, and assert on observable results: buffer contents
+  `nx_input`, and assert on observable results: buffer contents
   (`nvim_buf_get_lines`), cursor, bytes written to disk, and the semantic
   `redraw` `View`. They treat the editor as a black box and exercise the whole
   stack (RPC → server → core → Lua) end to end.

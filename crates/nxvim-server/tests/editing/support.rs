@@ -56,7 +56,7 @@ pub async fn start_with_clipboard() -> (Rpc, UnboundedReceiver<Incoming>, FakeCl
 /// Feed `keys`, then return the most recent queued `redraw` satisfying `keep`.
 ///
 /// The server processes messages serially, writing each message's response and
-/// then its `redraw`. We send `nvim_input` then a `nvim_get_mode` barrier; the
+/// then its `redraw`. We send `nx_input` then a `nvim_get_mode` barrier; the
 /// wire order is input-response, input-redraw, barrier-response, barrier-redraw,
 /// and the client's reader task ferries it into `incoming` in that same order.
 /// So once the barrier `.await` resolves, the input's redraw is guaranteed
@@ -80,7 +80,7 @@ pub async fn redraw_after_matching(
     while incoming.try_recv().is_ok() {} // discard any buffered notifications from earlier in the test
 
     // request (not notify): the server responds *then* redraws, and the barrier below relies on that ordering
-    rpc.request("nvim_input", vec![Value::from(keys)])
+    rpc.request("nx_input", vec![Value::from(keys)])
         .await
         .expect("input");
     rpc.request("nvim_get_mode", vec![]).await.expect("barrier");
@@ -523,7 +523,7 @@ pub async fn latest_after(
     incoming: &mut UnboundedReceiver<Incoming>,
     keys: &str,
 ) -> Vec<(Value, Value)> {
-    rpc.notify("nvim_input", vec![Value::from(keys)]);
+    rpc.notify("nx_input", vec![Value::from(keys)]);
     drain_latest(rpc, incoming).await
 }
 

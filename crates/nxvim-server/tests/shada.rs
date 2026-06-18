@@ -3,7 +3,7 @@
 //!
 //! Black-box, per the harness convention: spawn a server against a **temp** state
 //! dir (so the real `~/.local/state` is never touched and the test stays
-//! hermetic), drive it with `nvim_input`, quit, then **respawn** a second server
+//! hermetic), drive it with `nx_input`, quit, then **respawn** a second server
 //! against the same dir and assert the first session's state was restored.
 //!
 //! Phase 1 covers registers; Phase 2 the global file marks `A`–`Z`; Phase 3 the

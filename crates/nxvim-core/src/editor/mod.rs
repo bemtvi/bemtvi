@@ -721,7 +721,7 @@ pub struct Editor {
     search_history: Vec<String>,
     /// Past `:` ex commands, oldest first, recalled with the same keys in the ex
     /// command line. Only interactively-typed lines are recorded — a programmatic
-    /// `nvim_command` runs through [`Editor::command`] and never lands here.
+    /// `nx_command` runs through [`Editor::command`] and never lands here.
     ex_history: Vec<String>,
     /// Position within the active history ([`Editor::search_history`] or
     /// [`Editor::ex_history`], per the open prompt's kind) while browsing it;
@@ -1738,7 +1738,7 @@ impl Editor {
         });
     }
 
-    /// Run an ex-command directly (the `nvim_command` API entry point).
+    /// Run an ex-command directly (the `nx_command` API entry point).
     pub fn command(&mut self, cmd: &str) {
         self.execute_ex(cmd);
         self.desired_col = self.cursor_virtcol();

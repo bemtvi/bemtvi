@@ -349,7 +349,9 @@ highlights:
   set of helper aliases, not an interpreter. Colorschemes must be Lua.
 - **Clients render a semantic `View`.** There is no `ext_linegrid` / grid
   protocol; clients receive a semantic `View` and lay out their own widgets. The
-  RPC method names look like `nvim_*` but are nxvim's own protocol.
+  client-protocol verbs are `nx_*` (`nx_input`, `nx_ui_attach`, …); the
+  editing-API methods keep neovim-faithful spellings (`nvim_buf_get_lines`, …)
+  as muscle-memory names, but the whole surface is nxvim's own protocol.
 - **Rope-backed, byte-indexed buffers** with a strict trailing-newline
   invariant, and a **branching undo tree of full-rope snapshots** — cheap to
   snapshot, with full branching semantics.

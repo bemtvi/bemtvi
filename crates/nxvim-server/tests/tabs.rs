@@ -125,7 +125,7 @@ fn temp_file(tag: &str, contents: &str) -> String {
 
 /// Feed `keys` and wait for the editor to settle (a `nvim_get_mode` barrier).
 async fn feed_sync(rpc: &Rpc, keys: &str) {
-    rpc.request("nvim_input", vec![Value::from(keys)])
+    rpc.request("nx_input", vec![Value::from(keys)])
         .await
         .expect("input");
     rpc.request("nvim_get_mode", vec![]).await.expect("barrier");

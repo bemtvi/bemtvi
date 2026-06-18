@@ -256,7 +256,7 @@ nx.decor.provider {
 async fn colours_on_startup_without_any_interaction() {
     // The real path: the file is opened at boot (the command-line arg), not via a `:e`
     // keystroke. The marks must be on the FIRST frame the client paints after attach —
-    // a fresh session shouldn't need a keypress to colour. (`nvim_ui_attach` assigns the
+    // a fresh session shouldn't need a keypress to colour. (`nx_ui_attach` assigns the
     // window its first rect, so the provider's viewport is only then known; the attach
     // arm drives `run_pending` to dispatch it before that frame.) Without the fix this
     // test times out: no interaction ever produces a coloured frame.

@@ -558,7 +558,7 @@ async fn catalog_names(rpc: &Rpc) -> Vec<String> {
 
 /// Coverage guard against catalog drift: every curated command name must be a command
 /// the editor actually recognizes (no typos, no stale entries for a removed command).
-/// Each name is run via `nvim_command` — a *request*, so a following `barrier`
+/// Each name is run via `nx_command` — a *request*, so a following `barrier`
 /// guarantees its redraw is delivered (no take-first race) — and we assert the
 /// message line is not the `E492: Not an editor command: {name}` reply. Checking the
 /// *name-specific* E492 text makes this robust against an error message persisting
@@ -605,9 +605,9 @@ async fn catalog_commands_are_recognized() {
         if SKIP.contains(&name.as_str()) {
             continue;
         }
-        rpc.request("nvim_command", vec![Value::from(name.as_str())])
+        rpc.request("nx_command", vec![Value::from(name.as_str())])
             .await
-            .expect("nvim_command");
+            .expect("nx_command");
         barrier(&rpc).await;
         let msg = drain_latest_redraw(&mut incoming)
             .map(|p| message_of(&p))

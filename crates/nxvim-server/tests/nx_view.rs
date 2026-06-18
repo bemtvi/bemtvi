@@ -420,6 +420,232 @@ async fn example_config_opens_its_view() {
     );
 }
 
+// ===== nx.view float mount ===================================================
+
+/// A view can mount in a **floating window** (`v:mount{ float = … }`): it adds a
+/// window, shows the view's content, and is an actual float (`relative = "editor"`).
+#[tokio::test]
+async fn view_mounts_in_a_float() {
+    let (rpc, _incoming) = start().await;
+    feed_sync(&rpc, "imain<Esc>").await;
+    assert_eq!(win_count(&rpc).await, 1);
+    exec_lua(
+        &rpc,
+        r#"vw = nx.view.create{}
+           vw:set_lines{ "[ ] one", "[ ] two" }
+           vw:mount{ float = { width = 30, height = 6 } }"#,
+    )
+    .await;
+    assert_eq!(win_count(&rpc).await, 2, "the float added a window");
+    assert_eq!(
+        lines(&rpc).await,
+        vec!["[ ] one", "[ ] two"],
+        "the float is focused and shows the view"
+    );
+    let rel = exec_lua(&rpc, r#"return vim.api.nvim_win_get_config(0).relative"#).await;
+    assert_eq!(
+        rel.as_str(),
+        Some("editor"),
+        "the view's window is a real float"
+    );
+}
+
+/// A **grabbing** float view (`grab = true`, the default) hard-locks focus exactly
+/// like the panel: `<C-w>w` / `<C-w>j` can't leave it.
+#[tokio::test]
+async fn view_float_grab_locks_focus() {
+    let (rpc, _incoming) = start().await;
+    feed_sync(&rpc, "imain<Esc>").await;
+    exec_lua(
+        &rpc,
+        r#"vw = nx.view.create{}
+           vw:set_lines{ "dialog" }
+           vw:mount{ float = { width = 20, height = 4, grab = true } }"#,
+    )
+    .await;
+    assert_eq!(lines(&rpc).await, vec!["dialog"], "focus is on the float");
+
+    feed_sync(&rpc, "<C-w>w").await;
+    assert_eq!(
+        lines(&rpc).await,
+        vec!["dialog"],
+        "<C-w>w must not leave a grabbing float view"
+    );
+    feed_sync(&rpc, "<C-w>j").await;
+    assert_eq!(
+        lines(&rpc).await,
+        vec!["dialog"],
+        "<C-w>j must not leave a grabbing float view"
+    );
+}
+
+/// Dismissing a grabbing float view releases the lock and restores focus to the
+/// window it sprang from (open → interact → dismiss → back where you were).
+#[tokio::test]
+async fn view_float_grab_unmount_restores_prior_focus() {
+    let (rpc, _incoming) = start().await;
+    feed_sync(&rpc, "imain<Esc>").await;
+    exec_lua(
+        &rpc,
+        r#"vw = nx.view.create{}
+           vw:set_lines{ "dialog" }
+           vw:mount{ float = { width = 20, height = 4, grab = true } }"#,
+    )
+    .await;
+    assert_eq!(win_count(&rpc).await, 2);
+
+    exec_lua(&rpc, "vw:unmount()").await;
+    assert_eq!(win_count(&rpc).await, 1, "unmount closed the float");
+    assert_eq!(
+        lines(&rpc).await,
+        vec!["main"],
+        "focus returned to the prior window"
+    );
+}
+
+/// A non-grabbing float view (`grab = false`) is an ordinary focusable float — it
+/// does NOT lock focus, so `<C-w>w` cycles back out to the main window.
+#[tokio::test]
+async fn view_float_without_grab_does_not_lock_focus() {
+    let (rpc, _incoming) = start().await;
+    feed_sync(&rpc, "imain<Esc>").await;
+    exec_lua(
+        &rpc,
+        r#"vw = nx.view.create{}
+           vw:set_lines{ "floaty" }
+           vw:mount{ float = { width = 20, height = 4, grab = false } }"#,
+    )
+    .await;
+    assert_eq!(lines(&rpc).await, vec!["floaty"], "the float is focused");
+
+    feed_sync(&rpc, "<C-w>w").await;
+    assert_eq!(
+        lines(&rpc).await,
+        vec!["main"],
+        "<C-w>w leaves a non-grabbing float for the main window"
+    );
+}
+
+/// Pump the loop (each barrier round-trip lets the server fire the timers the component
+/// lifecycle yields on) until the checklist dialog has rendered its first item — which
+/// happens only after the backing buffer materialized and `setup` + the first `render`
+/// ran. Bounded; panics rather than hangs if it never appears.
+async fn await_checklist(rpc: &Rpc) {
+    for _ in 0..100 {
+        let first = lines(rpc).await.first().cloned().unwrap_or_default();
+        if first.starts_with('☐') || first.starts_with('☑') {
+            return;
+        }
+        rpc.request("nvim_get_mode", vec![]).await.expect("barrier");
+    }
+    panic!("the checklist content never rendered");
+}
+
+/// Run the shipped `examples/nxchecklist/init.lua` end-to-end: it opens a modal checkbox
+/// dialog built with `nx.view.component` in a grabbing float, `<Space>` toggles the item
+/// under the cursor (the reactive write auto-re-renders, glyph flips ☐→☑), and `<CR>`
+/// confirms — closing the float and reporting the chosen labels. Guards both the
+/// float-mount feature and the component layer through their motivating use case.
+#[tokio::test]
+async fn example_checklist_dialog_toggles_and_confirms() {
+    let (rpc, _incoming) = start().await;
+    let init = include_str!("../../../examples/nxchecklist/init.lua");
+    exec_lua(&rpc, init).await;
+    await_checklist(&rpc).await; // wait out the async lifecycle (buffer → setup → render)
+
+    // The dialog is a focused float showing the checkbox list.
+    assert_eq!(win_count(&rpc).await, 2, "the dialog mounted a float");
+    let rel = exec_lua(&rpc, r#"return vim.api.nvim_win_get_config(0).relative"#).await;
+    assert_eq!(rel.as_str(), Some("editor"), "it is a real float");
+    let first = lines(&rpc).await.first().cloned().unwrap_or_default();
+    assert!(
+        first.starts_with("☐"),
+        "the first item starts unchecked, got {first:?}"
+    );
+
+    // Toggle the first item: the reactive write triggers a re-render, glyph → checked box.
+    feed_sync(&rpc, "<Space>").await;
+    let first = lines(&rpc).await.first().cloned().unwrap_or_default();
+    assert!(
+        first.starts_with("☑"),
+        "<Space> ticked the first item (reactive re-render), got {first:?}"
+    );
+
+    // Confirm: the float closes (focus restored to the main window) and the chosen
+    // labels are reported. "Inlay hints" and "Relative line numbers" start checked;
+    // toggling the first ("Format on save") adds it.
+    feed_sync(&rpc, "<CR>").await;
+    assert_eq!(win_count(&rpc).await, 1, "<CR> closed the dialog");
+    let result = exec_lua(&rpc, "return _G.nxchecklist_result").await;
+    assert_eq!(
+        result.as_str(),
+        Some("Format on save, Inlay hints, Relative line numbers"),
+        "the confirmed selection is the checked labels in order"
+    );
+}
+
+/// `<Esc>` cancels the checklist dialog: the float closes and the result is the
+/// cancellation sentinel, not a selection.
+#[tokio::test]
+async fn example_checklist_dialog_cancels_on_esc() {
+    let (rpc, _incoming) = start().await;
+    let init = include_str!("../../../examples/nxchecklist/init.lua");
+    exec_lua(&rpc, init).await;
+    await_checklist(&rpc).await;
+    assert_eq!(win_count(&rpc).await, 2);
+
+    feed_sync(&rpc, "<Esc>").await;
+    assert_eq!(win_count(&rpc).await, 1, "<Esc> closed the dialog");
+    let result = exec_lua(&rpc, "return _G.nxchecklist_result").await;
+    assert_eq!(
+        result.as_str(),
+        Some("<cancelled>"),
+        "<Esc> reports cancellation, not a selection"
+    );
+}
+
+/// An **async** `setup` is awaited before the first `render`: the component below
+/// suspends in setup (`nx.await(nx.promise.delay)`), and only renders the message it sets
+/// *after* the await resolves — so seeing that message on screen proves the framework
+/// awaited setup, not raced past it. This is the `nx.view.component` async contract.
+#[tokio::test]
+async fn component_async_setup_is_awaited_before_render() {
+    let (rpc, _incoming) = start().await;
+    exec_lua(
+        &rpc,
+        r#"_G.async_ran = false
+           local C = nx.view.component({
+             setup = function(ctx)
+               nx.await(nx.promise.delay(5))   -- suspend the lifecycle
+               _G.async_ran = true
+               return ctx.reactive({ msg = "loaded async" })
+             end,
+             render = function(state)
+               return { lines = { state.msg } }
+             end,
+           })
+           C.mount({ float = { width = 30, height = 3, grab = true } })"#,
+    )
+    .await;
+
+    // Pump until the awaited content lands.
+    let mut shown = false;
+    for _ in 0..100 {
+        if lines(&rpc).await == vec!["loaded async"] {
+            shown = true;
+            break;
+        }
+        rpc.request("nvim_get_mode", vec![]).await.expect("barrier");
+    }
+    assert!(shown, "render showed the message setup set after awaiting");
+    let ran = exec_lua(&rpc, "return _G.async_ran").await;
+    assert_eq!(
+        ran.as_bool(),
+        Some(true),
+        "setup's post-await body ran before render"
+    );
+}
+
 /// `:unmount` removes the view from view but keeps it alive; a later `:mount`
 /// reshows the same content.
 #[tokio::test]

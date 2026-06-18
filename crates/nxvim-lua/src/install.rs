@@ -411,6 +411,28 @@ pub(crate) fn install_vim(lua: &Lua, shared: &Rc<RefCell<Shared>>) -> mlua::Resu
     )?;
     let sh = shared.clone();
     view.set(
+        "_mount_float",
+        lua.create_function(move |_, (id, cfg): (u64, Table)| {
+            sh.borrow_mut().view_ops.push(ViewOp::MountFloat {
+                id,
+                relative: cfg.get("relative")?,
+                win: cfg.get::<Option<u64>>("win")?.unwrap_or(0),
+                anchor: cfg.get("anchor")?,
+                row: cfg.get("row")?,
+                col: cfg.get("col")?,
+                width: cfg.get("width")?,
+                height: cfg.get("height")?,
+                zindex: cfg.get("zindex")?,
+                focusable: cfg.get("focusable")?,
+                border: cfg.get("border")?,
+                title: cfg.get::<Option<String>>("title")?,
+                grab: cfg.get("grab")?,
+            });
+            Ok(())
+        })?,
+    )?;
+    let sh = shared.clone();
+    view.set(
         "_unmount",
         lua.create_function(move |_, id: u64| {
             sh.borrow_mut().view_ops.push(ViewOp::Unmount { id });

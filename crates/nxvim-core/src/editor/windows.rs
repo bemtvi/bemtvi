@@ -2055,13 +2055,14 @@ impl Editor {
         if id == self.windows.current || !self.windows.windows.contains_key(&id) {
             return;
         }
-        // The panel's hard focus lock: while a panel is open, focus is pinned to its
-        // window. Every focus change funnels through here (`<C-w>w`/`W` cycle, `<C-w>hjkl`
-        // directional, `set_current_window` / `nvim_set_current_win`, mouse focus), so this
-        // one guard makes them all inert. Opening is unaffected (the panel field is still
-        // `None` when `open_bottom_window` focuses the new window); `close_panel` clears the
-        // field before restoring focus, so dismissal is permitted.
-        if self.panel_window().is_some_and(|w| w != id) {
+        // The hard focus lock: while a focus-locked overlay is up — the bottom panel, or a
+        // grabbing `nx.view` float — focus is pinned to its window. Every focus change
+        // funnels through here (`<C-w>w`/`W` cycle, `<C-w>hjkl` directional,
+        // `set_current_window` / `nvim_set_current_win`, mouse focus), so this one guard
+        // makes them all inert. Opening is unaffected (the lock field is still `None` when
+        // the overlay's window is first focused); the dismiss path clears the field before
+        // restoring focus, so dismissal is permitted.
+        if self.focus_lock_window().is_some_and(|w| w != id) {
             return;
         }
         // Stash the outgoing window's secondary multi-cursors before reading its

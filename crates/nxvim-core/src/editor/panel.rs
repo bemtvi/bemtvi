@@ -165,4 +165,13 @@ impl Editor {
     pub(crate) fn panel_window(&self) -> Option<WindowId> {
         self.panel.map(|p| p.window)
     }
+
+    /// The window currently holding the **hard focus lock**, if any: the bottom panel, or a
+    /// grabbing `nx.view` float ([`Editor::view_float_lock`]). The single source the
+    /// [`focus_window`](Editor::focus_window) guard consults so every focus path is pinned
+    /// to one overlay window until it is dismissed. (Only one focus-locked overlay is up at
+    /// a time; a panel and a grabbing float-view don't coexist by construction.)
+    pub(crate) fn focus_lock_window(&self) -> Option<WindowId> {
+        self.panel_window().or(self.view_float_lock)
+    }
 }

@@ -118,9 +118,26 @@ function View:set_decor(ns, marks)
   return self
 end
 
--- :mount(opts) — show the view. `opts.dock = "left"|"right"|"top"|"bottom"` mounts
--- it in that dock (`opts.size` columns/rows); `opts.split = "vsplit"|"split"` mounts
--- it in a split of the main editor area. Mounting focuses the view.
+-- The float-mount config keywords, validated here so the native bridge can trust the
+-- strings (the same closed sets `nx._open_win` enforces). `relative` is what the float
+-- positions against; `anchor` is its pinned corner; `border` is the frame style.
+local FLOAT_RELATIVE = { editor = true, win = true, cursor = true }
+local FLOAT_ANCHOR = { NW = true, NE = true, SW = true, SE = true }
+local FLOAT_BORDER =
+  { none = true, single = true, double = true, rounded = true, solid = true, shadow = true }
+
+-- :mount(opts) — show the view. `opts.dock = "left"|"right"|"top"|"bottom"` mounts it in
+-- that dock (`opts.size` columns/rows); `opts.split = "vsplit"|"split"` mounts it in a
+-- split of the main editor area; `opts.float = { … }` mounts it in a floating window.
+-- Mounting focuses the view.
+--
+-- The float table takes `width` / `height` (inner size; required), `relative`
+-- ("editor"|"win"|"cursor", default "editor"), `anchor` ("NW"|"NE"|"SW"|"SE", default
+-- "NW"), `row` / `col` (offset, default 0), `border` (default "rounded"), `title`,
+-- `zindex`, `focusable`, and `grab`. `grab` (default true) hard-locks focus to the float
+-- like the bottom panel — `<C-w>` can't leave it and unmount restores the prior window —
+-- which is what a modal dialog (a checkbox list, a confirm) wants; pass `grab = false` for
+-- a non-modal floating panel that focus can leave.
 function View:mount(opts)
   opts = opts or {}
   if opts.dock then
@@ -128,9 +145,39 @@ function View:mount(opts)
   elseif opts.split then
     nx.view._mount_split(self.id, opts.split ~= "split")
   elseif opts.float then
-    nx.notify("nx.view:mount{ float } is not implemented yet (use dock/split)", 4)
+    local f = opts.float
+    local relative = f.relative or "editor"
+    local anchor = f.anchor or "NW"
+    local border = f.border or "rounded"
+    -- Fail loud on a bad enum / missing size rather than silently mispositioning.
+    if not FLOAT_RELATIVE[relative] then
+      return nx.notify("nx.view:mount{ float }: invalid relative '" .. tostring(relative) .. "'", 4)
+    end
+    if not FLOAT_ANCHOR[anchor] then
+      return nx.notify("nx.view:mount{ float }: invalid anchor '" .. tostring(anchor) .. "'", 4)
+    end
+    if not FLOAT_BORDER[border] then
+      return nx.notify("nx.view:mount{ float }: invalid border '" .. tostring(border) .. "'", 4)
+    end
+    if type(f.width) ~= "number" or type(f.height) ~= "number" then
+      return nx.notify("nx.view:mount{ float }: width and height are required", 4)
+    end
+    nx.view._mount_float(self.id, {
+      relative = relative,
+      win = f.win or 0,
+      anchor = anchor,
+      row = f.row or 0,
+      col = f.col or 0,
+      width = f.width,
+      height = f.height,
+      zindex = f.zindex or 50,
+      focusable = f.focusable ~= false,
+      border = border,
+      title = f.title,
+      grab = f.grab ~= false,
+    })
   else
-    nx.notify("nx.view:mount: pass one of { dock = … } / { split = … }", 4)
+    nx.notify("nx.view:mount: pass one of { dock = … } / { split = … } / { float = … }", 4)
   end
   return self
 end
@@ -191,4 +238,199 @@ function nx._view_select(id, line)
   end
   local ud = v._userdata and v._userdata[line]
   v._on_select(line, ud)
+end
+
+-- ===========================================================================
+-- nx.view.component — a Vue-shaped component model over the raw view handle.
+-- ===========================================================================
+--
+-- A component is `{ setup, render }`. `setup(ctx, props)` runs ONCE when the view is
+-- mounted — it owns side effects: it creates reactive state, binds keys, fetches data.
+-- `render(state)` is PURE: it maps state to what's on screen (`{ lines, decor }`), and
+-- the framework re-runs it automatically whenever the reactive state changes. **Both may
+-- be async** — write `nx.await(...)` straight inside them (the framework runs each in an
+-- `nx.async` coroutine), so a `setup` that loads from `nx.fs`, or a `render` that has to
+-- fetch to display, just reads top-to-bottom.
+--
+-- The payoff over the raw handle is that the framework owns the lifecycle the raw API
+-- leaks: it waits for the backing buffer to materialize before running `setup`, so
+-- `ctx.keymap_set` / `ctx.bufnr()` are valid immediately (no `nx.schedule` tick-dance), and it
+-- batches state writes into one re-render per tick (no manual `render()` calls). It is the
+-- nx.view analogue of a Vue single-file component: `setup` = `<script setup>`, `render` =
+-- the template, the reactive state = `ref`/`reactive`.
+
+-- A deep reactive proxy: reading a nested table returns a nested proxy (lazily, cached),
+-- and writing ANY key at ANY depth calls `on_change` — coarse-grained (no per-key dep
+-- tracking: a write re-runs the whole `render`, which is cheap for a line list and keeps
+-- the model tiny). Iterate a reactive table with `ipairs` / `#` (both honour the
+-- metamethods on PUC 5.4); `pairs` does NOT (5.4 dropped `__pairs`), so a render that
+-- needs unordered iteration should key off an array it builds in `setup`.
+local function make_reactive(root, on_change)
+  local cache = setmetatable({}, { __mode = "k" }) -- raw table -> its proxy
+  local function wrap(t)
+    if type(t) ~= "table" then
+      return t
+    end
+    if cache[t] then
+      return cache[t]
+    end
+    local p = setmetatable({}, {
+      __index = function(_, k)
+        return wrap(t[k])
+      end,
+      __newindex = function(_, k, v)
+        t[k] = v
+        on_change()
+      end,
+      __len = function()
+        return #t
+      end,
+    })
+    cache[t] = p
+    return p
+  end
+  return wrap(root)
+end
+
+-- nx.view.component(def) -> { mount(opts) }. `def.render` is required; `def.setup` is
+-- optional. `mount(opts)` instantiates: `opts.float` / `opts.dock` / `opts.split` choose
+-- the surface (default: a centered grabbing float), `opts.props` is handed to `setup`,
+-- `opts.name` / `opts.filetype` name the view. Returns the instance (with `:close()`).
+function nx.view.component(def)
+  assert(type(def) == "table", "nx.view.component: pass a { setup, render } table")
+  assert(type(def.render) == "function", "nx.view.component: a render function is required")
+
+  local M = {}
+  function M.mount(opts)
+    opts = opts or {}
+    nx.view._component_ns = nx.view._component_ns or nx.ns.create("nx.view.component")
+
+    local v = nx.view.create({ name = opts.name or "nx-component", filetype = opts.filetype })
+    if opts.dock then
+      v:mount({ dock = opts.dock, size = opts.size })
+    elseif opts.split then
+      v:mount({ split = opts.split })
+    else
+      v:mount({ float = opts.float or { width = 50, height = 12, grab = true } })
+    end
+
+    local inst = { view = v, _closed = false, _on_close = {} }
+    local state -- whatever setup returns; the render input
+    local gen = 0 -- render generation, so a slow async render can't clobber a newer one
+    local dirty = false
+    local do_render
+
+    -- Coalesce a burst of state writes into ONE render on the next microtask.
+    local function schedule_render()
+      if dirty or inst._closed then
+        return
+      end
+      dirty = true
+      nx.schedule(function()
+        dirty = false
+        do_render()
+      end)
+    end
+
+    do_render = function()
+      if inst._closed then
+        return
+      end
+      gen = gen + 1
+      local mine = gen
+      -- `render` may be sync or async; fold both into one promise chain. A stale result
+      -- (a newer render started meanwhile) is dropped.
+      nx.promise
+        .try(def.render, state, inst)
+        :next(function(out)
+          if mine ~= gen or inst._closed or type(out) ~= "table" then
+            return
+          end
+          v:set_lines(out.lines or out) -- accept { lines=, decor= } or a bare line list
+          if out.decor then
+            v:set_decor(nx.view._component_ns, out.decor)
+          end
+        end)
+        :catch(function(e)
+          nx.notify("nx.view.component: render error: " .. tostring(e), 4)
+        end)
+    end
+
+    function inst:close()
+      if self._closed then
+        return
+      end
+      self._closed = true
+      for _, fn in ipairs(self._on_close) do
+        pcall(fn)
+      end
+      v:close()
+    end
+
+    -- The context handed to `setup`: reactive state, the live cursor, buffer-local key
+    -- binding, and lifecycle. Everything here is valid immediately because the framework
+    -- only runs `setup` once the backing buffer exists.
+    local ctx = {
+      view = v,
+      props = opts.props or {},
+      reactive = function(tbl)
+        return make_reactive(tbl or {}, schedule_render)
+      end,
+      line = function()
+        return v:line()
+      end,
+      set_cursor = function(n)
+        v:set_cursor(n)
+      end,
+      bufnr = function()
+        return v:bufnr()
+      end,
+      refresh = schedule_render,
+      on_close = function(fn)
+        inst._on_close[#inst._on_close + 1] = fn
+      end,
+      close = function()
+        inst:close()
+      end,
+      -- A thin wrapper over the real `nx.keymap.set(mode, lhs, rhs, opts)` — same
+      -- signature — that defaults `buffer` to this view and `nowait` on (so a single
+      -- dialog key fires without waiting on a longer mapping). Any field the caller
+      -- passes in `opts` overrides the defaults, including `buffer` / `nowait`.
+      keymap_set = function(mode, lhs, rhs, user_opts)
+        local merged = { buffer = v:bufnr(), nowait = true }
+        for k, val in pairs(user_opts or {}) do
+          merged[k] = val
+        end
+        nx.keymap.set(mode, lhs, rhs, merged)
+      end,
+    }
+
+    -- The whole lifecycle, as one linear async flow: wait for the buffer, run setup
+    -- (awaiting it if async), then the first render. Subsequent renders are reactive.
+    nx.async(function()
+      -- The backing buffer number arrives a tick after `create`/`mount` (via the
+      -- `nx._view_buf` mirror). Yield to the loop until it's live — bounded, fail loud.
+      local tries = 0
+      while not v:bufnr() do
+        if tries > 200 then
+          error("the backing buffer never materialized")
+        end
+        tries = tries + 1
+        nx.await(nx.promise.delay(0))
+      end
+      -- `nx.promise.resolve` makes this uniform whether `setup` returns a plain value or a
+      -- promise; and because we're inside an `nx.async` coroutine, a `setup` that calls
+      -- `nx.await(...)` directly suspends here too. Either async style works.
+      if def.setup then
+        state = nx.await(nx.promise.resolve(def.setup(ctx, ctx.props)))
+      end
+      do_render()
+    end)():catch(function(e)
+      nx.notify("nx.view.component: setup error: " .. tostring(e), 4)
+    end)
+
+    return inst
+  end
+
+  return M
 end

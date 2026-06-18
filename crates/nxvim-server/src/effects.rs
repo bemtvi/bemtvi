@@ -230,6 +230,50 @@ fn undo_entry_value(e: &UndoEntry) -> Value {
     Value::Map(map)
 }
 
+/// Build a core [`FloatConfig`] from the validated string/number fields the float bridges
+/// carry (`WindowOp::OpenFloat`, `ViewOp::MountFloat`). The prelude already validated the
+/// enumerated strings against the supported set, so any unexpected value here is a bug —
+/// returned as `Err(msg)` for the caller to echo loudly rather than silently mispositioning.
+/// `cur_win` is the parent for `relative == "win"` when the caller passed `win == 0`.
+#[allow(clippy::too_many_arguments)]
+fn build_float_config(
+    relative: &str,
+    win: u64,
+    cur_win: WindowId,
+    anchor: &str,
+    row: i64,
+    col: i64,
+    width: u64,
+    height: u64,
+    zindex: u32,
+    focusable: bool,
+    border: &str,
+    title: Option<String>,
+) -> Result<FloatConfig, String> {
+    let relative = match relative {
+        "editor" => FloatRelative::Editor,
+        "cursor" => FloatRelative::Cursor,
+        "win" => FloatRelative::Win(if win == 0 { cur_win } else { WindowId(win) }),
+        other => return Err(format!("invalid 'relative': '{other}'")),
+    };
+    let anchor =
+        FloatAnchor::from_keyword(anchor).ok_or_else(|| format!("invalid 'anchor': '{anchor}'"))?;
+    let border =
+        BorderStyle::from_keyword(border).ok_or_else(|| format!("invalid 'border': '{border}'"))?;
+    Ok(FloatConfig {
+        relative,
+        anchor,
+        row: row as isize,
+        col: col as isize,
+        width: (width as usize).max(1),
+        height: (height as usize).max(1),
+        zindex,
+        focusable,
+        border,
+        title,
+    })
+}
+
 /// Translate a core [`FloatConfig`] into the [`FloatMirror`] the `nx._wins`
 /// mirror carries — the enums become the strings `nvim_win_get_config` returns,
 /// so nxvim-lua never sees the core's float types. The inverse of the
@@ -368,6 +412,30 @@ impl EditHost {
                         .mount_view_dock(id, &side, size.map(|s| s as usize))
                 }
                 ViewOp::MountSplit { id, vertical } => self.editor.mount_view_split(id, vertical),
+                ViewOp::MountFloat {
+                    id,
+                    relative,
+                    win,
+                    anchor,
+                    row,
+                    col,
+                    width,
+                    height,
+                    zindex,
+                    focusable,
+                    border,
+                    title,
+                    grab,
+                } => {
+                    let cur_win = self.editor.current_window_id();
+                    match build_float_config(
+                        &relative, win, cur_win, &anchor, row, col, width, height, zindex,
+                        focusable, &border, title,
+                    ) {
+                        Ok(config) => self.editor.mount_view_float(id, config, grab),
+                        Err(e) => self.editor.echo(format!("nx.view:mount{{ float }}: {e}")),
+                    }
+                }
                 ViewOp::Unmount { id } => self.editor.unmount_view(id),
                 ViewOp::Focus { id } => self.editor.focus_view(id),
                 ViewOp::Destroy { id } => self.editor.destroy_view(id),
@@ -1157,52 +1225,16 @@ impl EditHost {
                 } else {
                     BufferId(buf)
                 };
-                // The prelude validated the string fields, so any unexpected value
-                // here is a bug; reject loudly rather than silently mispositioning.
-                let relative = match relative.as_str() {
-                    "editor" => FloatRelative::Editor,
-                    "cursor" => FloatRelative::Cursor,
-                    "win" => {
-                        let id = if win == 0 {
-                            self.editor.current_window_id()
-                        } else {
-                            WindowId(win)
-                        };
-                        FloatRelative::Win(id)
-                    }
-                    other => {
-                        self.editor
-                            .echo(format!("nvim_open_win: invalid 'relative': '{other}'"));
+                let cur_win = self.editor.current_window_id();
+                let config = match build_float_config(
+                    &relative, win, cur_win, &anchor, row, col, width, height, zindex, focusable,
+                    &border, title,
+                ) {
+                    Ok(c) => c,
+                    Err(e) => {
+                        self.editor.echo(format!("nvim_open_win: {e}"));
                         return;
                     }
-                };
-                let anchor = match FloatAnchor::from_keyword(&anchor) {
-                    Some(a) => a,
-                    None => {
-                        self.editor
-                            .echo(format!("nvim_open_win: invalid 'anchor': '{anchor}'"));
-                        return;
-                    }
-                };
-                let border = match BorderStyle::from_keyword(&border) {
-                    Some(b) => b,
-                    None => {
-                        self.editor
-                            .echo(format!("nvim_open_win: invalid 'border': '{border}'"));
-                        return;
-                    }
-                };
-                let config = FloatConfig {
-                    relative,
-                    anchor,
-                    row: row as isize,
-                    col: col as isize,
-                    width: (width as usize).max(1),
-                    height: (height as usize).max(1),
-                    zindex,
-                    focusable,
-                    border,
-                    title,
                 };
                 self.editor.open_float_window(buffer, config, enter);
             }

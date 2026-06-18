@@ -850,6 +850,13 @@ pub struct Editor {
     /// navigation state: the buffer *is* the content, motions navigate, and any activation
     /// key (`<CR>`, `q`) is an ordinary buffer-local map installed by a `FileType` autocmd.
     panel: Option<panel::PanelState>,
+    /// The window of a **grabbing** `nx.view` float (`v:mount{ float = { grab = true } }`),
+    /// when one is mounted. Like [`Editor::panel`] it hard-locks focus — the
+    /// [`focus_window`](Editor::focus_window) guard pins focus to this window until the
+    /// view is unmounted — but it lives on a float, not a bottom split. Feeds the same
+    /// guard via [`Editor::focus_lock_window`]; the prior-focus restore is held on the
+    /// view's [`ViewMount::Float`](super::view::ViewMount) so dismissal returns there.
+    view_float_lock: Option<WindowId>,
     /// The window focused just before `:copen`, used as the default jump target so
     /// `<CR>` in the quickfix window lands in the code window the list was opened
     /// from (vim's behavior with an empty `'switchbuf'`). Re-validated on use.
@@ -1325,6 +1332,7 @@ impl Editor {
             qf_bufnr: None,
             panel_buffers: Vec::new(),
             panel: None,
+            view_float_lock: None,
             qf_prev_win: None,
             highlights: Highlights::new(),
             width: 80,

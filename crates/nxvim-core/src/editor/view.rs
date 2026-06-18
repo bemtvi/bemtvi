@@ -36,6 +36,15 @@ pub(crate) enum ViewMount {
     Dock(DockSide),
     /// In a split window of the main editor area (`v:mount{ split = … }`).
     Split(WindowId),
+    /// In a floating window (`v:mount{ float = … }`). `win` is the float; `prev` is the
+    /// window focused at mount, refocused on unmount when `grab` so a modal float feels
+    /// transient (open → interact → dismiss → back where you were). `grab` records whether
+    /// this float holds the hard focus lock ([`Editor::view_float_lock`]).
+    Float {
+        win: WindowId,
+        prev: WindowId,
+        grab: bool,
+    },
 }
 
 impl Editor {
@@ -174,6 +183,29 @@ impl Editor {
         }
     }
 
+    /// `v:mount{ float = { … } }` — show view `id` in a floating window placed by
+    /// `config`, and focus it. When `grab`, the float hard-locks focus (the
+    /// [`focus_window`](Editor::focus_window) guard pins focus to it, like the panel) until
+    /// the view is unmounted, and unmount restores the window focused at mount; a non-grab
+    /// float is an ordinary focusable float that `<C-w>` can leave. Remounting moves the
+    /// view to the fresh float. A no-op for an unknown id.
+    pub fn mount_view_float(&mut self, id: u64, config: FloatConfig, grab: bool) {
+        let Some(buf) = self.view_buffer(id) else {
+            return;
+        };
+        self.unmount_view(id);
+        let prev = self.windows.current;
+        // `open_float_window(enter = true)` focuses the float *before* we arm the lock, so
+        // its own focus move is permitted (the panel opens the same way).
+        let win = self.open_float_window(buf, config, true);
+        if grab {
+            self.view_float_lock = Some(win);
+        }
+        if let Some(v) = self.views.get_mut(&id) {
+            v.mount = Some(ViewMount::Float { win, prev, grab });
+        }
+    }
+
     /// `v:focus()` — move focus to the window showing view `id`: the dock for a
     /// dock-mounted view, the split window for a split-mounted one. A no-op for an
     /// unknown / unmounted id (or a split window the user already closed).
@@ -186,6 +218,13 @@ impl Editor {
             Some(ViewMount::Split(win)) => {
                 let win = *win;
                 self.ensure_main_layer();
+                if self.windows.try_get(win).is_some() {
+                    self.set_current_window(win);
+                }
+            }
+            Some(ViewMount::Float { win, .. }) => {
+                // A float overlays whatever is below it (no layer switch); focus it directly.
+                let win = *win;
                 if self.windows.try_get(win).is_some() {
                     self.set_current_window(win);
                 }
@@ -223,6 +262,22 @@ impl Editor {
             Some(ViewMount::Dock(s)) => self.close_dock(s),
             Some(ViewMount::Split(win)) if self.windows.try_get(win).is_some() => {
                 self.close_window_by_id(win, true);
+            }
+            Some(ViewMount::Float { win, prev, grab }) => {
+                // Release the focus lock *before* closing / refocusing, exactly as
+                // `close_panel` does — otherwise the guard would refuse the restore.
+                if grab && self.view_float_lock == Some(win) {
+                    self.view_float_lock = None;
+                }
+                if self.windows.try_get(win).is_some() {
+                    self.close_window_by_id(win, true);
+                }
+                // A grabbing float is modal: return to where it sprang from. A non-grab
+                // float leaves focus wherever `remove_window` landed it (the user may have
+                // moved on), matching its non-locking nature.
+                if grab && self.windows.try_get(prev).is_some() {
+                    self.set_current_window(prev);
+                }
             }
             _ => {}
         }

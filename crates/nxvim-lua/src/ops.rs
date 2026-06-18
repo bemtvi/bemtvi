@@ -112,6 +112,27 @@ pub enum ViewOp {
     /// `v:mount{ split = "vsplit" | "split" }` — show view `id` in a new split of the
     /// main editor area and focus it (`vertical` for `vsplit`).
     MountSplit { id: u64, vertical: bool },
+    /// `v:mount{ float = { … } }` — show view `id` in a floating window placed by the
+    /// float config and focus it. `grab` hard-locks focus to the float (the modal-dialog
+    /// case) until unmount; a non-grab float is an ordinary focusable float. The string
+    /// fields (`relative`/`anchor`/`border`) are validated by the prelude against the
+    /// supported set — the same shape as [`WindowOp::OpenFloat`], minus the explicit `buf`
+    /// (the view owns its buffer) and `enter` (a mount always focuses).
+    MountFloat {
+        id: u64,
+        relative: String,
+        win: u64,
+        anchor: String,
+        row: i64,
+        col: i64,
+        width: u64,
+        height: u64,
+        zindex: u32,
+        focusable: bool,
+        border: String,
+        title: Option<String>,
+        grab: bool,
+    },
     /// `v:unmount()` — remove view `id` from view, keeping the backing buffer alive.
     Unmount { id: u64 },
     /// `v:focus()` — move focus to the window showing view `id`.

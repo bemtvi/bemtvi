@@ -1446,7 +1446,7 @@ impl Editor {
     /// Window `id`'s viewport top (first visible 0-based buffer line): the live
     /// `self.top` for the focused window, the stashed `saved_top` otherwise. `0`
     /// for an unknown window.
-    pub(crate) fn window_top(&self, id: WindowId) -> usize {
+    pub fn window_top(&self, id: WindowId) -> usize {
         if id == self.windows.current {
             self.top
         } else {

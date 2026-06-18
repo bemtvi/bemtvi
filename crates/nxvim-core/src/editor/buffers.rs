@@ -311,6 +311,14 @@ impl Editor {
         self.buffers.map.get(&id).map(|ob| ob.buffer.line_count())
     }
 
+    /// Buffer `id`'s `changedtick` (bumped on every edit / resync), or `None` if no
+    /// such buffer is open. The server keys its per-buffer highlight memo on this so
+    /// an edit invalidates the cached spans for *that* buffer specifically — not just
+    /// the focused one.
+    pub fn changedtick_of(&self, id: BufferId) -> Option<u64> {
+        self.buffers.map.get(&id).map(|ob| ob.buffer.changedtick)
+    }
+
     /// Whether `id` is an open buffer (`nvim_buf_is_valid`). The RPC surface uses
     /// this to reject a client-supplied buffer handle before binding a window to
     /// it — binding a window to a non-existent buffer would make a later

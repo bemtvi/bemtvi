@@ -1771,6 +1771,30 @@ pub unsafe extern "C" fn eh_lines(h: *mut WasmEditHost) -> *mut c_char {
     }
 }
 
+/// JSON object `{ file_name: full_text }` for every visible, non-terminal buffer that
+/// is **not** the focused one — the background buffers the UI's JS highlighter can't
+/// otherwise see (their text never rode [`eh_lines`], so a window beneath a grabbing
+/// float renders un-highlighted until focused). `{}` when only the focused buffer is
+/// on screen. Caller frees with [`eh_free_string`].
+///
+/// # Safety
+/// `h` must come from [`eh_new`] and not yet be freed.
+#[no_mangle]
+pub unsafe extern "C" fn eh_aux_lines(h: *mut WasmEditHost) -> *mut c_char {
+    match h.as_mut() {
+        Some(handle) => {
+            let obj: serde_json::Map<String, serde_json::Value> = handle
+                .host
+                .aux_visible_lines()
+                .into_iter()
+                .map(|(name, text)| (name, serde_json::Value::String(text)))
+                .collect();
+            into_owned_cstr(serde_json::Value::Object(obj).to_string())
+        }
+        None => into_owned_cstr("{}".to_string()),
+    }
+}
+
 // ============================================================================
 // Persistence (shada) — serverless OPFS. The editor's cross-session state (registers,
 // marks, history, jumplist, …) is the pure [`PersistState`] core hands out; the Worker

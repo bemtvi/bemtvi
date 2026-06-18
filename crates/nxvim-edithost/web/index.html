@@ -444,7 +444,7 @@
         return;
       }
       if (msg.type === "redraw") {
-        setFrame(msg.frame, msg.lines);
+        setFrame(msg.frame, msg.lines, msg.aux);
         // 5c: a single id reply. 5d: batched acks + exec_lua results.
         if (msg.id !== undefined) {
           const resolve = pendingMsg.get(msg.id);
@@ -474,7 +474,7 @@
     // then paint. The server map differs from the serverless `WebEditor` view_json in
     // two key names only — `mode_label` (top-level mode) and `cursors` (the secondary
     // multi-cursors) — so bridge those rather than fork the renderer.
-    function setFrame(frame, lines) {
+    function setFrame(frame, lines, aux) {
       latest = { frame, lines: lines ?? latest.lines };
       if (!frame) { view = null; gridEl.innerHTML = ""; return; }
       frame.mode = frame.mode_label;
@@ -487,6 +487,10 @@
         const fw = (frame.windows || []).find((w) => w.focused);
         if (fw && !fw.terminal) textByFile.set(fw.file_name, lines);
       }
+      // The visible *background* buffers' text (the windows that never rode `lines`
+      // because they aren't focused — e.g. the file beneath a grabbing float). Without
+      // this they'd have no text to highlight from until focused. `null` ⇒ keep cache.
+      if (aux) for (const [name, text] of Object.entries(aux)) textByFile.set(name, text);
       // Keep the cache bounded to what's on screen: drop any file no window shows.
       const visible = new Set((frame.windows || []).map((w) => w.file_name));
       for (const k of textByFile.keys()) if (!visible.has(k)) textByFile.delete(k);

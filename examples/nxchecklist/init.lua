@@ -164,4 +164,4 @@ nx.keymap.set("n", "<leader>c", demo, { desc = "Open the checklist dialog" })
 --   end,
 
 -- Open it once at startup so the playground shows something immediately.
-demo()
+nx.schedule(demo)

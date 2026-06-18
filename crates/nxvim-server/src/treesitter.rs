@@ -17,7 +17,7 @@
 
 use crate::redraw::StyleTable;
 use crate::EditHost;
-use nxvim_core::{unicode, BufferId};
+use nxvim_core::{unicode, view::WindowView, BufferId};
 use rmpv::Value;
 use std::collections::HashMap;
 
@@ -76,15 +76,50 @@ pub(crate) struct SyntaxState {
 }
 
 impl EditHost {
-    /// Refresh the current buffer's highlight memo from the editor's engine, if
-    /// the content or viewport changed since the last fetch. Called from
+    /// Refresh the highlight memo for **every visible buffer** from the editor's
+    /// engine, if its content or viewport changed since the last fetch. Called from
     /// [`EditHost::redraw`] just before projecting, so the spans painted this frame
     /// reflect the keypress that triggered it.
-    pub(crate) fn refresh_highlights(&mut self, height: usize) {
+    ///
+    /// Every window in the frame is serviced — not only the focused one — so a
+    /// grabbing float (or any unfocused split) never leaves the buffer behind it
+    /// dark. When a buffer is shown in two windows its query range is the union of
+    /// both viewports, so one fetch serves both.
+    pub(crate) fn refresh_highlights(&mut self, windows: &[WindowView]) {
         // Forget memos for buffers the editor has since deleted.
         self.reap_closed_buffers();
 
-        let buffer = self.editor.current_buffer_id();
+        // Union the line range each visible window needs onto its buffer. Each window
+        // overscans a screen above and below its own viewport, so the lines a scroll
+        // reveals are already cached and colored — no white flash during the
+        // smooth-scroll animation (whose band spans up to ~2 screens).
+        let mut ranges: HashMap<BufferId, (usize, usize)> = HashMap::new();
+        for win in windows {
+            let Some(line_count) = self.editor.line_count_of(win.buffer) else {
+                continue;
+            };
+            let height = win.rect.height.saturating_sub(1); // minus the status row
+            let top = self.editor.window_top(win.id);
+            let first = top.saturating_sub(height).min(line_count);
+            let last = (top + 2 * height).min(line_count);
+            ranges
+                .entry(win.buffer)
+                .and_modify(|(f, l)| {
+                    *f = (*f).min(first);
+                    *l = (*l).max(last);
+                })
+                .or_insert((first, last));
+        }
+
+        for (buffer, (first, last)) in ranges {
+            self.refresh_buffer_highlights(buffer, first, last);
+        }
+    }
+
+    /// Refresh one buffer's highlight memo for the absolute line range `first..last`,
+    /// re-querying the engine only on a memo miss (its content, the range, or its
+    /// language changed since the last fetch).
+    fn refresh_buffer_highlights(&mut self, buffer: BufferId, first: usize, last: usize) {
         // Buffer-open half of the query bridge: resolve this language's runtimepath
         // queries (`queries/` + `after/queries`, `;; extends`) onto the engine once,
         // before its first highlight. Guarded per-language, so it's a cheap no-op on
@@ -92,14 +127,11 @@ impl EditHost {
         if let Some(lang) = self.editor.ts_language_for(buffer) {
             self.resolve_runtimepath_queries(&lang);
         }
-        let line_count = self.editor.buffer().line_count();
-        // Highlight a one-screen overscan above and below the viewport, so the
-        // lines a scroll reveals are already cached and colored — no white flash
-        // during the smooth-scroll animation (whose band spans up to ~2 screens).
-        let first = self.editor.top.saturating_sub(height).min(line_count);
-        let last = (self.editor.top + 2 * height).min(line_count);
+        let Some(changedtick) = self.editor.changedtick_of(buffer) else {
+            return;
+        };
         let key = (
-            self.editor.buffer().changedtick,
+            changedtick,
             first,
             last,
             self.editor.ts_language_for(buffer),

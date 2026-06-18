@@ -964,6 +964,39 @@ impl EditHost {
         self.editor.lines()
     }
 
+    /// The full text of every visible, non-terminal buffer that is **not** the
+    /// focused one, as `(file_name, text)` pairs (deduped by buffer; empty when only
+    /// the focused buffer is on screen).
+    ///
+    /// The wasm UI highlights each visible window from its own buffer's text, but
+    /// [`lines`](Self::lines) (`eh_lines`) only ships the *focused* buffer's. A
+    /// window that has never held focus — the file beneath a grabbing float opened at
+    /// startup — would otherwise have no text for the JS highlighter and render dark
+    /// until focused. This is the background half of that readout; the native build
+    /// has no analogue (it highlights every visible buffer server-side in
+    /// `refresh_highlights`).
+    pub fn aux_visible_lines(&mut self) -> Vec<(String, String)> {
+        let Some((w, h)) = self.ui else {
+            return Vec::new();
+        };
+        let view = self.editor.view(w, h);
+        let focused = view.focused().buffer;
+        let mut seen = std::collections::HashSet::new();
+        let mut out = Vec::new();
+        for win in &view.windows {
+            if win.buffer == focused || !seen.insert(win.buffer) {
+                continue;
+            }
+            if self.editor.is_terminal_buffer(win.buffer) {
+                continue;
+            }
+            if let Some(lines) = self.editor.lines_of(win.buffer) {
+                out.push((win.file_name.clone(), lines.join("\n")));
+            }
+        }
+        out
+    }
+
     /// Snapshot the cross-session (shada) state for persistence. The native server
     /// serializes this into its redb store ([`shada`]); the wasm Worker serializes it to
     /// a JSON blob in OPFS. Pure — just the editor's [`export_persist`](Editor::export_persist).

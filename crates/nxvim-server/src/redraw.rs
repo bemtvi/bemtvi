@@ -37,12 +37,13 @@ impl EditHost {
         self.sync_terminal_styles();
         let view = self.editor.view(w, h);
 
-        // Refresh the current buffer's highlights from the in-process engine for
-        // the freshly-settled viewport (same-frame, memoized per content+view).
-        // Native only — the browser highlights JS-side (`nxvim-edithost`), and LSP sync
-        // needs a language server (Phase 6).
+        // Refresh every visible buffer's highlights from the in-process engine for
+        // the freshly-settled viewports (same-frame, memoized per content+view) — not
+        // just the focused window's, so a grabbing float doesn't leave the buffer
+        // behind it dark. Native only — the browser highlights JS-side
+        // (`nxvim-edithost`), and LSP sync needs a language server (Phase 6).
         #[cfg(feature = "native")]
-        self.refresh_highlights(h);
+        self.refresh_highlights(&view.windows);
         // A large file's treesitter parse is resumed across frames; if it's still in
         // flight after this frame's `refresh_highlights`, wake again shortly to paint
         // the next budget's progress (and re-arm until it converges).

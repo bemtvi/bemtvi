@@ -34,6 +34,7 @@ const eh_tick_timers = M.cwrap("eh_tick_timers", "number", ["number", "number"])
 const eh_exec_lua = M.cwrap("eh_exec_lua", "number", ["number", "string"]);
 const eh_redraw_json = M.cwrap("eh_redraw_json", "number", ["number"]);
 const eh_lines = M.cwrap("eh_lines", "number", ["number"]);
+const eh_aux_lines = M.cwrap("eh_aux_lines", "number", ["number"]);
 const eh_free_string = M.cwrap("eh_free_string", null, ["number"]);
 // Off-tick OPFS fs (Phase 6): the editor enqueues `:e`/`:w` off-tick; the Worker drains
 // the requests, runs the async OPFS op, and lands the result back through these.
@@ -248,11 +249,31 @@ function linesForFrame(frame) {
   return readStr(eh_lines(h));
 }
 
+// The full text of every visible *background* (non-focused) buffer, as `{ file_name:
+// text }` — `eh_lines` ships only the focused buffer, so a window that never held focus
+// (the file beneath a grabbing float opened at startup) would have no text for the JS
+// highlighter and render dark. Only consulted when more than one window is on screen
+// (the single-window common case has no background buffer, so this is skipped and the
+// editor view isn't rebuilt). The readout reflects the live buffers, so a background
+// buffer changing — e.g. its content arriving from an async OPFS open *after* the float
+// grabbed focus — re-ships; an unchanged background keeps the UI's cache (`null`).
+let lastAux = "{}";
+function auxLinesForFrame(frame) {
+  if (!frame) return null;
+  const wins = frame.windows || [];
+  if (wins.length < 2) { lastAux = "{}"; return null; }
+  const json = readStr(eh_aux_lines(h));
+  if (json === lastAux) return null;
+  lastAux = json;
+  const obj = JSON.parse(json);
+  return Object.keys(obj).length ? obj : null;
+}
+
 // Build a `redraw` postMessage: the frame once (so `linesForFrame` reads the same frame
 // it ships), plus any per-site extras (`acks`/`results`/`id`/…).
 function redrawMsg(extra) {
   const frame = currentFrame();
-  return { type: "redraw", frame, lines: linesForFrame(frame), ...extra };
+  return { type: "redraw", frame, lines: linesForFrame(frame), aux: auxLinesForFrame(frame), ...extra };
 }
 
 // =============================================================================

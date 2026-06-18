@@ -215,6 +215,13 @@ impl Editor {
         if !self.mouse_enabled() {
             return;
         }
+        // A disrupting gesture (a click anywhere, or a wheel that scrolls the text)
+        // moves the cursor / scrolls the view, so it dismisses the cursor-anchored
+        // transient popups — the hover / signature **doc floats** and the completion
+        // popup — instead of letting them trail the cursor. The one exception is a
+        // wheel *on a doc float*, which scrolls the float and keeps it open. This is
+        // the mouse counterpart of the next-key dismissal in [`Editor::input`].
+        self.dismiss_cursor_popups_on_mouse(&ev);
         match (ev.button, ev.action) {
             // In multi-cursor placement mode a left-click *toggles* a cursor at the
             // clicked cell — drop one if it's bare, remove it if one is there — the
@@ -354,6 +361,45 @@ impl Editor {
             // The remaining buttons (X1/X2) and bare moves have no binding; ignore.
             _ => {}
         }
+    }
+
+    /// Dismiss the cursor-anchored transient popups — the hover / signature **doc
+    /// floats** and the completion popup — when a mouse gesture disrupts their
+    /// anchor. A click anywhere, or a wheel that scrolls the *text*, moves the cursor
+    /// / view, so the popup must close rather than trail it (the bug being fixed:
+    /// these floats followed the cursor on a mouse scroll / click-elsewhere). The one
+    /// keep-open interaction is a wheel **on a doc float**, which scrolls that float.
+    /// A click / wheel **on the completion menu or its docs sidebar** is the widget's
+    /// own interaction (its arms handle it), not a disruption, so it is left alone.
+    fn dismiss_cursor_popups_on_mouse(&mut self, ev: &MouseEvent) {
+        let is_wheel = matches!(ev.action, MouseAction::WheelUp | MouseAction::WheelDown);
+        // Drag / release continue an in-progress gesture (a text selection) the
+        // initiating press already dismissed for — don't re-dismiss on every drag.
+        if !matches!(ev.action, MouseAction::Press) && !is_wheel {
+            return;
+        }
+        // A wheel scrolling a doc float keeps it open (and scrolls only it).
+        if !(is_wheel && self.doc_float_at(ev.row, ev.col)) {
+            self.close_all_doc_floats();
+        }
+        // The completion popup closes when the gesture lands away from it — over the
+        // text, not on the popup box or its docs sidebar (those have their own
+        // wheel/click handlers and don't disrupt the cursor anchor).
+        if self.completion_active()
+            && self.menu_hit(ev.row, ev.col).is_none()
+            && !self.complete_docs_hit_at(ev.row, ev.col)
+        {
+            self.close_completion();
+        }
+    }
+
+    /// Whether `(row, col)` lands on an open hover / signature **doc float** window.
+    fn doc_float_at(&self, row: usize, col: usize) -> bool {
+        !self.doc_float_wins.is_empty()
+            && matches!(
+                self.hit_test(row, col),
+                Some(MouseTarget::Text { win, .. }) if self.doc_float_wins.iter().any(|(_, w)| *w == win)
+            )
     }
 
     /// Left-press: focus the clicked window, place the cursor, and start a

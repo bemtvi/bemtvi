@@ -803,6 +803,44 @@ async fn wheeling_over_the_completion_popup_moves_the_highlight_without_wrapping
     assert_eq!(menu_selected(&menu), 0);
 }
 
+#[tokio::test]
+async fn clicking_away_closes_the_completion_popup() {
+    let dir = temp_dir("complete_click_away");
+    let (rpc, mut incoming) = start(&dir, BUFFER_INIT).await;
+    nxvim_test_harness::command(&rpc, "set nonumber norelativenumber").await;
+
+    feed(&rpc, "ihello he");
+    let menu = menu_of(&poll_menu(&rpc, &mut incoming).await.expect("popup opens"));
+    let row0 = menu_row(&menu) as usize;
+
+    // Click away from the popup (a row below it): the cursor leaves the word, so the
+    // popup must close instead of following.
+    feed_mouse(&rpc, "left", "press", row0 + 4, 0);
+    assert!(
+        poll_no_menu(&rpc, &mut incoming).await,
+        "clicking away closes the completion popup"
+    );
+}
+
+#[tokio::test]
+async fn scrolling_the_text_closes_the_completion_popup() {
+    let dir = temp_dir("complete_scroll_away");
+    let (rpc, mut incoming) = start(&dir, BUFFER_INIT).await;
+    nxvim_test_harness::command(&rpc, "set nonumber norelativenumber").await;
+
+    feed(&rpc, "ihello he");
+    let menu = menu_of(&poll_menu(&rpc, &mut incoming).await.expect("popup opens"));
+    let row0 = menu_row(&menu) as usize;
+
+    // A wheel over the text (away from the popup) scrolls the view, so the popup
+    // must close instead of trailing the cursor.
+    feed_mouse(&rpc, "wheel", "down", row0 + 4, 0);
+    assert!(
+        poll_no_menu(&rpc, &mut incoming).await,
+        "scrolling the text closes the completion popup"
+    );
+}
+
 /// The docs sidebar `(row, col, lines)` of the latest redraw whose `menu.docs`
 /// sub-map's lines satisfy `want` — `row`/`col` are its text-area content cells
 /// (global cells once the gutter is off).

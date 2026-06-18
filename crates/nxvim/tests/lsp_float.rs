@@ -193,6 +193,56 @@ async fn hover_window_scrolls_with_the_wheel_and_a_key_dismisses_it() {
 }
 
 #[tokio::test]
+async fn scrolling_the_text_dismisses_the_hover_float() {
+    let _guard = serial_lock().lock().await;
+    let dir = temp_dir("lsp_float_hover_scroll_away");
+    arm_mock(
+        &dir,
+        r#"{ "hover": { "contents": { "kind": "markdown",
+             "value": "`foo`: a scripted hover symbol" } } }"#,
+    );
+    let (rpc, mut incoming) = start(&dir).await;
+    let win = await_doc_float_window(&rpc, &mut incoming, "nx.lsp.hover()", "scripted hover").await;
+
+    // A wheel over the TEXT (well away from the float) scrolls the view out from
+    // under the hover, so it must close — not follow the cursor.
+    let (_, fy, _, _) = window_rect(&win);
+    feed_mouse(&rpc, "wheel", "down", fy + 6, 0);
+    nxvim_test_harness::barrier(&rpc).await;
+    assert!(
+        drain_to_latest_redraw(&mut incoming, |m| floating_window(m).is_none()).is_some(),
+        "scrolling the text dismissed the hover float"
+    );
+
+    std::env::remove_var("NXVIM_LSP_CMD");
+}
+
+#[tokio::test]
+async fn clicking_elsewhere_dismisses_the_hover_float() {
+    let _guard = serial_lock().lock().await;
+    let dir = temp_dir("lsp_float_hover_click_away");
+    arm_mock(
+        &dir,
+        r#"{ "hover": { "contents": { "kind": "markdown",
+             "value": "`foo`: a scripted hover symbol" } } }"#,
+    );
+    let (rpc, mut incoming) = start(&dir).await;
+    let win = await_doc_float_window(&rpc, &mut incoming, "nx.lsp.hover()", "scripted hover").await;
+
+    // A click away from the float moves the cursor off the word, so the hover must
+    // close instead of trailing the cursor to the click.
+    let (_, fy, _, _) = window_rect(&win);
+    feed_mouse(&rpc, "left", "press", fy + 6, 0);
+    nxvim_test_harness::barrier(&rpc).await;
+    assert!(
+        drain_to_latest_redraw(&mut incoming, |m| floating_window(m).is_none()).is_some(),
+        "clicking elsewhere dismissed the hover float"
+    );
+
+    std::env::remove_var("NXVIM_LSP_CMD");
+}
+
+#[tokio::test]
 async fn signature_help_reply_opens_a_float_window() {
     let _guard = serial_lock().lock().await;
     let dir = temp_dir("lsp_float_sig");

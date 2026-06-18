@@ -441,11 +441,12 @@ impl EditHost {
         self.editor.open_doc_float("[Hover]", lines);
     }
 
-    /// Render a signature-help reply in the content float: the active signature's
-    /// label, with its active parameter appended in brackets when known (the float
-    /// renders plain lines, so the parameter can't be styled inline yet). Triggered
-    /// manually in insert mode, so it stays out of the way until asked for. Empty ⇒
-    /// a brief message.
+    /// Render a signature-help reply in the cursor-anchored **doc float** (the same
+    /// scrollable float window as the hover, [`Editor::open_doc_float`]): the active
+    /// signature's label, with its active parameter appended in brackets when known
+    /// (the float renders plain lines, so the parameter can't be styled inline yet).
+    /// Triggered manually in insert mode, so it stays out of the way until asked for.
+    /// Empty ⇒ a brief message.
     pub(crate) fn show_signature_help(
         &mut self,
         signature: Option<String>,
@@ -459,12 +460,7 @@ impl EditHost {
             Some(param) if !param.is_empty() => format!("{signature}    [{param}]"),
             _ => signature,
         };
-        self.editor.open_content_float(
-            vec![line],
-            None,
-            nxvim_core::BorderStyle::Rounded,
-            nxvim_core::MenuPlacement::Cursor,
-        );
+        self.editor.open_doc_float("[Signature]", vec![line]);
     }
 
     /// Act on a reply's target locations: a single goto result jumps the cursor;

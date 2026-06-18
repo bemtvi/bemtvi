@@ -1,9 +1,9 @@
 //! Behavior tests for LSP **hover** and **signature help** floats.
 //!
-//! Hover renders through a **doc float** — a real, non-focusable float *window*
-//! over a scratch buffer ([`Editor::open_doc_float`]), so it scrolls with the mouse
-//! wheel; it appears in the redraw as a `windows[]` entry with `floating == true`.
-//! Signature help still rides the content-float `float` surface.
+//! Both hover and signature help render through a **doc float** — a real,
+//! non-focusable float *window* over a scratch buffer ([`Editor::open_doc_float`]),
+//! so they scroll with the mouse wheel; each appears in the redraw as a `windows[]`
+//! entry with `floating == true`.
 //!
 //! Wired exactly like `lsp_complete.rs`: the scripted mock language server
 //! (`nxvim --__lsp-mock`, `nxvim_lsp::mock`) answers `textDocument/hover` and
@@ -58,65 +58,6 @@ async fn start(dir: &Path) -> (Rpc, UnboundedReceiver<Incoming>) {
     (rpc, incoming)
 }
 
-/// The content float's lines on the latest redraw carrying a `float` map, or `None`.
-async fn poll_float_lines(
-    rpc: &Rpc,
-    incoming: &mut UnboundedReceiver<Incoming>,
-) -> Option<Vec<String>> {
-    nxvim_test_harness::barrier(rpc).await;
-    let map = drain_to_latest_redraw(incoming, |m| {
-        matches!(map_get(m, "float"), Some(Value::Map(_)))
-    })?;
-    let Some(Value::Map(float)) = map_get(&map, "float") else {
-        return None;
-    };
-    match map_get(float, "lines") {
-        // Each wire line is a chunk run `[[text, style_id], …]` (the `virt_lines`
-        // form); an LSP hover/signature is one un-styled chunk per line, so
-        // concatenate the chunk texts to recover the plain line.
-        Some(Value::Array(lines)) => Some(
-            lines
-                .iter()
-                .map(|row| {
-                    row.as_array()
-                        .map(|chunks| {
-                            chunks
-                                .iter()
-                                .filter_map(|c| c.as_array()?.first()?.as_str())
-                                .collect::<String>()
-                        })
-                        .unwrap_or_default()
-                })
-                .collect(),
-        ),
-        _ => Some(Vec::new()),
-    }
-}
-
-/// Retry the `trigger` Lua until the content float appears and some line contains
-/// `want` (the async server reply takes a moment to land). Panics after the window.
-async fn await_float(
-    rpc: &Rpc,
-    incoming: &mut UnboundedReceiver<Incoming>,
-    trigger: &str,
-    want: &str,
-) -> Vec<String> {
-    let mut last = Vec::new();
-    for _ in 0..200 {
-        exec_lua(rpc, trigger).await;
-        if let Some(lines) = poll_float_lines(rpc, incoming).await {
-            if lines.iter().any(|l| l.contains(want)) {
-                return lines;
-            }
-            if !lines.is_empty() {
-                last = lines;
-            }
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
-    }
-    panic!("the content float never contained {want:?}; last float lines: {last:?}");
-}
-
 /// The first floating *window* (`windows[]` with `floating == true`) in a redraw —
 /// the hover doc float — or `None`. The main editor window is `floating == false`.
 fn floating_window(map: &[(Value, Value)]) -> Option<Vec<(Value, Value)>> {
@@ -149,15 +90,17 @@ fn window_rect(win: &[(Value, Value)]) -> (usize, usize, usize, usize) {
     (n("x"), n("y"), n("width"), n("height"))
 }
 
-/// Retry `nx.lsp.hover()` until a floating doc-float *window* appears with some line
-/// containing `want` (the async reply takes a moment to land); returns its rows.
-async fn await_hover_window(
+/// Retry the `trigger` Lua until a floating doc-float *window* (hover / signature)
+/// appears with some line containing `want` (the async reply takes a moment to
+/// land); returns its rows.
+async fn await_doc_float_window(
     rpc: &Rpc,
     incoming: &mut UnboundedReceiver<Incoming>,
+    trigger: &str,
     want: &str,
 ) -> Vec<(Value, Value)> {
     for _ in 0..200 {
-        exec_lua(rpc, "nx.lsp.hover()").await;
+        exec_lua(rpc, trigger).await;
         nxvim_test_harness::barrier(rpc).await;
         if let Some(map) = drain_to_latest_redraw(incoming, |m| floating_window(m).is_some()) {
             let win = floating_window(&map).expect("a floating window");
@@ -167,7 +110,7 @@ async fn await_hover_window(
         }
         tokio::time::sleep(std::time::Duration::from_millis(25)).await;
     }
-    panic!("the hover float window never contained {want:?}");
+    panic!("the doc-float window never contained {want:?}");
 }
 
 #[tokio::test]
@@ -183,7 +126,7 @@ async fn hover_reply_opens_a_float_window() {
 
     // The hover is a real float WINDOW now (so it can scroll), not the content-float
     // `float` surface — assert it appears in `windows[]` carrying the markup.
-    let win = await_hover_window(&rpc, &mut incoming, "scripted hover").await;
+    let win = await_doc_float_window(&rpc, &mut incoming, "nx.lsp.hover()", "scripted hover").await;
     assert!(
         window_lines(&win).iter().any(|l| l.contains("foo")),
         "hover float window should carry the markup, got {:?}",
@@ -210,7 +153,7 @@ async fn hover_window_scrolls_with_the_wheel_and_a_key_dismisses_it() {
     let (rpc, mut incoming) = start(&dir).await;
 
     // Open it and confirm the top of the content shows first.
-    let win = await_hover_window(&rpc, &mut incoming, "hover line 00").await;
+    let win = await_doc_float_window(&rpc, &mut incoming, "nx.lsp.hover()", "hover line 00").await;
     assert_eq!(
         window_lines(&win).first().map(String::as_str),
         Some("hover line 00"),
@@ -250,7 +193,7 @@ async fn hover_window_scrolls_with_the_wheel_and_a_key_dismisses_it() {
 }
 
 #[tokio::test]
-async fn signature_help_reply_opens_the_content_float() {
+async fn signature_help_reply_opens_a_float_window() {
     let _guard = serial_lock().lock().await;
     let dir = temp_dir("lsp_float_sig");
     arm_mock(
@@ -262,7 +205,8 @@ async fn signature_help_reply_opens_the_content_float() {
     );
     let (rpc, mut incoming) = start(&dir).await;
 
-    let lines = await_float(
+    // Signature help is the same scrollable doc-float WINDOW as the hover.
+    let win = await_doc_float_window(
         &rpc,
         &mut incoming,
         "nx.lsp.signature_help()",
@@ -271,8 +215,9 @@ async fn signature_help_reply_opens_the_content_float() {
     .await;
     // The active parameter is appended in brackets (the float renders plain lines).
     assert!(
-        lines.iter().any(|l| l.contains("[a: i32]")),
-        "signature float should mark the active parameter, got {lines:?}"
+        window_lines(&win).iter().any(|l| l.contains("[a: i32]")),
+        "signature float window should mark the active parameter, got {:?}",
+        window_lines(&win)
     );
 
     std::env::remove_var("NXVIM_LSP_CMD");

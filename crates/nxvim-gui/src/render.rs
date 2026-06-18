@@ -1070,8 +1070,28 @@ impl Renderer {
                 let sel_bg = style_bg(&view.visual).unwrap_or(0x33_47_5b);
                 let search_bg = style_bg(&view.search_style).unwrap_or(0x6a_5a_1a);
                 let normal_bg = style_bg(&view.normal).unwrap_or(DEFAULT_BG);
+                // `'cursorline'` tint: the colorscheme's `CursorLine` background, or a
+                // subtle lightening of the window background when it leaves it undefined,
+                // so the cursor row still reads as highlighted out of the box.
+                let cursorline_bg =
+                    style_bg(&view.cursor_line).unwrap_or_else(|| lighten(normal_bg, 0x12));
                 for (i, raw) in win.lines.iter().enumerate() {
                     let row = oy as usize + i;
+
+                    // `'cursorline'`: tint the cursor's screen row across the whole
+                    // window (sign + gutter + text). Pushed before the selection /
+                    // search quads so those win on the cells they cover; every quad
+                    // sits under the glyphs, so the gutter number and text paint on top.
+                    if win.cursorline && i == win.cursor_row as usize {
+                        let (px, py) = self.cell_px(ox, row as u16);
+                        quads.push(Quad {
+                            x: px,
+                            y: py,
+                            w: self.cell_w * wcols as f32,
+                            h: self.cell_h,
+                            color: color_to_rgba(srgb_to_color(cursorline_bg)),
+                        });
+                    }
 
                     // A `virt_lines` virtual row: a whole extra screen line of extmark
                     // chunk text, interleaved by core (it has `numbers[i] == None`, so no

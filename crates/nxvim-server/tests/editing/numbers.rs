@@ -161,3 +161,55 @@ async fn set_toggles_and_abbreviations_work() {
     let map = redraw_after(&rpc, &mut incoming, ":set invnumber<CR>").await;
     assert!(field_bool(&map, "number"), "invnumber toggled number on");
 }
+
+// ----- cursorline -----------------------------------------------------------
+
+#[tokio::test]
+async fn cursorline_is_off_by_default() {
+    let (rpc, mut incoming) = start(None).await;
+    let map = redraw_after(&rpc, &mut incoming, "<Esc>").await;
+    assert!(
+        !field_bool(&map, "cursorline"),
+        "cursorline off by default (vim's default)"
+    );
+}
+
+#[tokio::test]
+async fn set_cursorline_projects_the_flag_and_chrome_style() {
+    let (rpc, mut incoming) = start(None).await;
+
+    // `:set cursorline` flips the per-window flag the clients read to paint the
+    // cursor row; `:set nocursorline` clears it; the `cul` abbreviation works too.
+    let map = redraw_after(&rpc, &mut incoming, ":set cursorline<CR>").await;
+    assert!(field_bool(&map, "cursorline"), "set cursorline turns it on");
+
+    let map = redraw_after(&rpc, &mut incoming, ":set nocursorline<CR>").await;
+    assert!(
+        !field_bool(&map, "cursorline"),
+        "set nocursorline turns it off"
+    );
+
+    let map = redraw_after(&rpc, &mut incoming, ":set cul<CR>").await;
+    assert!(field_bool(&map, "cursorline"), "the cul abbreviation works");
+
+    // The `cul!` toggle flips it back off.
+    let map = redraw_after(&rpc, &mut incoming, ":set cul!<CR>").await;
+    assert!(!field_bool(&map, "cursorline"), "cul! toggled it off");
+}
+
+#[tokio::test]
+async fn cursorline_round_trips_through_vim_wo() {
+    let (rpc, mut incoming) = start(None).await;
+    exec_lua(&rpc, "vim.wo.cursorline = true").await;
+    let map = redraw_after(&rpc, &mut incoming, "<Esc>").await;
+    assert!(
+        field_bool(&map, "cursorline"),
+        "vim.wo.cursorline reaches the window"
+    );
+    let got = exec_lua(&rpc, "return vim.wo.cursorline").await;
+    assert_eq!(
+        got.as_bool(),
+        Some(true),
+        "vim.wo.cursorline reads back the live value"
+    );
+}

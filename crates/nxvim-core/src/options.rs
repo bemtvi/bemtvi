@@ -306,6 +306,11 @@ pub struct WindowOptions {
     /// [`WindowOptions::number`] this gives vim's "hybrid" gutter: the absolute
     /// number on the cursor line, relative numbers elsewhere.
     pub relativenumber: bool,
+    /// `'cursorline'`: highlight the screen line the cursor sits on, using the
+    /// `CursorLine` highlight group. Off by default (vim's default). The
+    /// highlight is a per-window decoration the clients paint behind the cursor
+    /// row — core only carries the flag.
+    pub cursorline: bool,
     /// Minimum width of the number gutter (vim's `numberwidth`). The gutter is at
     /// least this wide, growing to fit the largest line number plus a trailing
     /// space. Only consulted when `number`/`relativenumber` is on.
@@ -370,6 +375,8 @@ impl Default for WindowOptions {
         WindowOptions {
             number: true,
             relativenumber: true,
+            // Off by default, matching vim — `:set cursorline` opts in.
+            cursorline: false,
             // neovim's `numberwidth` default (4) and `signcolumn=auto`.
             numberwidth: 4,
             signcolumn: SignColumn::Auto { min: 1, max: 1 },
@@ -753,6 +760,7 @@ fn canonical(name: &str) -> Option<(&'static str, OptKind)> {
     match name {
         "number" | "nu" => Some(("number", Bool)),
         "relativenumber" | "rnu" => Some(("relativenumber", Bool)),
+        "cursorline" | "cul" => Some(("cursorline", Bool)),
         "wrap" => Some(("wrap", Bool)),
         "numberwidth" | "nuw" => Some(("numberwidth", Num)),
         "signcolumn" | "scl" => Some(("signcolumn", Str)),

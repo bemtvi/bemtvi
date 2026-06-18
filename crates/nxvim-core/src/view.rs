@@ -411,6 +411,10 @@ pub struct WindowView {
     pub number: bool,
     /// `:set relativenumber` — show numbers relative to the cursor line.
     pub relativenumber: bool,
+    /// `:set cursorline` — highlight the screen line the cursor sits on. The
+    /// client paints the cursor row's background with the `CursorLine` group; the
+    /// cursor's screen row is [`cursor_row`](WindowView::cursor_row).
+    pub cursorline: bool,
     /// Width in cells of the number column (`0` when both options are off).
     pub number_width: usize,
     /// This window's `'signcolumn'` policy. Carried so the server (which owns the
@@ -973,6 +977,7 @@ fn window_view(ed: &Editor, w: &WindowLayout) -> WindowView {
         scroll,
         number: w.options.number,
         relativenumber: w.options.relativenumber,
+        cursorline: w.options.cursorline,
         number_width,
         signcolumn: w.options.signcolumn,
         tabstop: buf.options.effective_tabstop(),

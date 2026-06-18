@@ -665,6 +665,73 @@ fn the_normal_background_fills_the_text_area() {
 }
 
 #[test]
+fn cursorline_tints_the_cursor_row_with_the_themed_background() {
+    // `'cursorline'` on, the cursor on the second screen row, and a `CursorLine`
+    // chrome style (palette entry 0): the whole cursor row — including cells past
+    // end-of-text — takes that background; other rows keep the plain background.
+    let v = view(vec![
+        ("lines", lines(&["alpha", "bravo"])),
+        ("cursorline", Value::from(true)),
+        ("cursor_row", Value::from(1u64)),
+        (
+            "styles",
+            Value::Array(vec![style(vec![("bg", rgb(0x2a, 0x2a, 0x3a))])]),
+        ),
+        ("chrome", chrome(vec![("cursorline", 0)])),
+    ]);
+    let buf = paint(&v, 20, 5);
+    assert_eq!(
+        bg(&buf, 10, 1),
+        Some(Color::Rgb(0x2a, 0x2a, 0x3a)),
+        "the cursor row is tinted with CursorLine, past end-of-text too"
+    );
+    assert_ne!(
+        bg(&buf, 10, 0),
+        Some(Color::Rgb(0x2a, 0x2a, 0x3a)),
+        "a non-cursor row is not tinted"
+    );
+}
+
+#[test]
+fn cursorline_off_leaves_the_cursor_row_untinted() {
+    // Same payload but `'cursorline'` off: no row takes the CursorLine background.
+    let v = view(vec![
+        ("lines", lines(&["alpha", "bravo"])),
+        ("cursorline", Value::from(false)),
+        ("cursor_row", Value::from(1u64)),
+        (
+            "styles",
+            Value::Array(vec![style(vec![("bg", rgb(0x2a, 0x2a, 0x3a))])]),
+        ),
+        ("chrome", chrome(vec![("cursorline", 0)])),
+    ]);
+    let buf = paint(&v, 20, 5);
+    assert_ne!(
+        bg(&buf, 10, 1),
+        Some(Color::Rgb(0x2a, 0x2a, 0x3a)),
+        "with cursorline off the cursor row keeps the plain background"
+    );
+}
+
+#[test]
+fn cursorline_without_a_theme_falls_back_to_a_visible_tint() {
+    // `'cursorline'` on but the colorscheme leaves `CursorLine` undefined (no
+    // chrome entry): the client still tints the cursor row with its built-in
+    // fallback (Indexed 236) so the line is visible out of the box.
+    let v = view(vec![
+        ("lines", lines(&["alpha", "bravo"])),
+        ("cursorline", Value::from(true)),
+        ("cursor_row", Value::from(1u64)),
+    ]);
+    let buf = paint(&v, 20, 5);
+    assert_eq!(
+        bg(&buf, 10, 1),
+        Some(Color::Indexed(236)),
+        "no CursorLine theme → the built-in fallback tint"
+    );
+}
+
+#[test]
 fn the_visual_style_replaces_reverse_video_when_themed() {
     let sel = Value::Array(vec![Value::Array(vec![
         Value::from(0u64),

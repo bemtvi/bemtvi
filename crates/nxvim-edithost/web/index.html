@@ -23,7 +23,7 @@
   :root {
     --bg: #1e2127; --fg: #abb2bf; --gutter: #4b5263; --gutter-cur: #e5c07b;
     --sel: #3e4451; --search: #e5c07b; --status-bg: #2c313a; --status-fg: #9da5b4;
-    --cursor: #61afef; --eob: #4b5263; --accent: #e5c07b;
+    --cursor: #61afef; --eob: #4b5263; --accent: #e5c07b; --cursorline: #2c313a;
   }
   html, body { margin: 0; height: 100%; background: var(--bg); overflow: hidden; }
   #grid {
@@ -957,6 +957,11 @@
           rowEl.className = "row";
           rowEl.style.top = r * ch + "px";
           rowEl.style.width = rect.width * cw + "px";
+          // `'cursorline'`: tint the cursor's screen row across the window width. The
+          // cell spans below paint their own bg over it where they have one (cursor,
+          // selection, search), so only the untouched cells show the tint. The cursor
+          // row is always a real text row, never a `virt_lines` / `~` filler row.
+          if (w.cursorline && r === w.cursor_row) rowEl.style.background = "var(--cursorline)";
           // A `virt_lines` virtual row (a whole extra screen line of extmark chunk
           // text core interleaved here): blank gutter (its `numbers[r]` is null) + the
           // chunk run, no cursor / selection. `virt_lines_leftcol` (start over the
@@ -1225,6 +1230,7 @@
       setVar("--status-fg", c.status_line?.fg);
       setVar("--sel", c.visual?.bg);
       setVar("--search", c.search?.bg);
+      setVar("--cursorline", c.cursorline?.bg);
     }
     function cellBaseCss(col, hlSpans, diagSpans) {
       let css = "";

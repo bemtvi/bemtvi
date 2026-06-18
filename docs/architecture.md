@@ -619,10 +619,10 @@ cell (past a dock's title prefix) to a `(layer, tab)`. (Design:
 [`docs/plans/2026-06-07-tab-pages.md`](plans/2026-06-07-tab-pages.md),
 [`docs/plans/2026-06-14-per-region-tablines.md`](plans/2026-06-14-per-region-tablines.md).)
 
-Still pending: **line wrapping** (`wrap` — the display-row projection; Phase 2 of
-the horizontal-scroll plan) and **more window-local options** (`cursorline`, …)
-beyond the number gutter and the scroll options that already ride
-`WindowOptions`. Floating windows are otherwise complete (model,
+Still pending: **more window-local options** (`colorcolumn`, …) beyond the number
+gutter, `cursorline`, soft word-wrap (`wrap`, with its `gj`/`gk` display motions),
+and the scroll options that already ride `WindowOptions`. Floating windows are
+otherwise complete (model,
 paint, dynamic config, edge semantics); the remaining float fidelity knobs
 (`style="minimal"`, `footer`, `bufpos`, `relative="mouse"`) grow as a consumer
 demands them. All four `laststatus` modes ship (`0` never, `1` only with ≥2
@@ -1095,7 +1095,7 @@ screen," and that is exactly the shape of these tests.
   `WindowTree`, the tabline, `gt`/`:tab*`/`<C-w>T`, the `Tab*` autocmds, the
   `nvim_tabpage_*` Lua surface, and `showtabline`) are all implemented — see
   [*Windows*](#windows). What remains on this axis is more window-local options
-  (`wrap`, `cursorline`, …).
+  (`colorcolumn`, …).
 - **The `nx.*` config surface** — `init.lua` targets nxvim's own API
   ([ADR 0002](decisions/0002-native-plugin-system.md)); the prelude's current
   vim-shaped spelling is donor code, refactored under `nx` where it serves
@@ -1130,17 +1130,18 @@ screen," and that is exactly the shape of these tests.
   'INCOMPLETE:'` for approximations, the `nx._notimpl` raises / runtime
   `nx._notimpl_hits` scoreboard for loud gaps) and lists the absent subsystems
   that have no call site to tag — the bulk of vim's options beyond the handful
-  nxvim honors (window-local `number`/`relativenumber` + the horizontal-scroll
-  `sidescroll`/`sidescrolloff`, the buffer-local indentation options, and global
-  `showtabline` are wired; `wrap`/`cursorline`/… are not) and richer diagnostic
+  nxvim honors (window-local `number`/`relativenumber`/`cursorline`/`wrap` + the
+  horizontal-scroll `sidescroll`/`sidescrolloff`, the buffer-local indentation
+  options, and global `showtabline` are wired; many others are not) and richer diagnostic
   surfaces. (Blocking reads — `vim.fn.input` / `vim.fn.confirm` / `vim.fn.getcharstr`
   / `vim.wait` and the coroutine pump that hosted them — are **not** part of the
   `nx` model: nothing in it blocks the editor, so
   the only prompt surface is the callback-shaped `vim.ui.input` / `vim.ui.select`.)
   Legacy Vimscript (`eval.c`) is **not** on the roadmap — see guiding principle 2.
 - A broad options surface. `:set` exists and honors the search booleans, the
-  **window-local** number-gutter options `number` / `relativenumber` (also via
-  `:setlocal` / `vim.wo` / `nvim_win_{get,set}_option`) and the window-local
+  **window-local** number-gutter options `number` / `relativenumber` and the
+  cursor-line highlight `cursorline` (also via `:setlocal` / `vim.wo` /
+  `nvim_win_{get,set}_option`) and the window-local
   horizontal-scroll options `sidescroll` / `sidescrolloff` (via `:set`), and the
   **buffer-local** indentation options `tabstop` / `shiftwidth` / `softtabstop` /
   `expandtab` and `commentstring` — the comment template the `gc`/`gcc` operator

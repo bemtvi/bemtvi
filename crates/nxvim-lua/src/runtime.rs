@@ -57,6 +57,9 @@ pub struct WindowMirror {
     pub height: u64,
     pub number: bool,
     pub relativenumber: bool,
+    /// `'cursorline'` — whether the cursor's screen line is highlighted (so
+    /// `vim.wo`/`vim.o` read it back).
+    pub cursorline: bool,
     /// `numberwidth` — the minimum number-gutter width (so `vim.wo`/`vim.o` read it
     /// back).
     pub numberwidth: u64,

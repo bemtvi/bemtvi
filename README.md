@@ -384,8 +384,8 @@ highlights:
 - **Some motions.** `%` match-pair, the paragraph/sentence motions
   (`{` `}` `(` `)`), and the screen motions (`H` `M` `L`) aren't wired yet.
 - **More window-local options.** `wrap`, `number`/`relativenumber`,
-  `numberwidth`, `signcolumn`, and the horizontal-scroll options are honored;
-  the rest (`cursorline`, `colorcolumn`, …) are not.
+  `numberwidth`, `signcolumn`, `cursorline`, and the horizontal-scroll options
+  are honored; the rest (`colorcolumn`, …) are not.
 - **A broad options surface.** `:set` honors the search booleans, the
   number-gutter and horizontal-scroll window options, and the buffer-local
   indentation options plus `commentstring` — but the bulk of vim's hundreds of

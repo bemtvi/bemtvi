@@ -201,6 +201,10 @@ pub struct WindowView {
     pub continuation: Vec<bool>,
     pub number: bool,
     pub relativenumber: bool,
+    /// `'cursorline'` — when set, the renderer paints the cursor's screen row
+    /// (`cursor_row`) with the [`View::cursor_line`] background. `false` from an
+    /// older server that omits the key.
+    pub cursorline: bool,
     pub number_width: u16,
     /// This window's buffer `tabstop`: how many cells to expand a `\t` to when
     /// painting, mirrored from the server so the text lines up with the server's
@@ -366,6 +370,10 @@ pub struct View {
     pub normal: Option<Style>,
     pub line_nr: Option<Style>,
     pub cursor_line_nr: Option<Style>,
+    /// The `CursorLine` background, painted behind the cursor's screen row when a
+    /// window has `'cursorline'` set. `None` when the colorscheme leaves it
+    /// undefined — the client then uses its own subtle fallback.
+    pub cursor_line: Option<Style>,
     pub visual: Option<Style>,
     pub search_style: Option<Style>,
     pub incsearch_style: Option<Style>,
@@ -598,6 +606,7 @@ impl View {
         self.normal = chrome("normal");
         self.line_nr = chrome("line_nr");
         self.cursor_line_nr = chrome("cursor_line_nr");
+        self.cursor_line = chrome("cursorline");
         self.visual = chrome("visual");
         self.search_style = chrome("search");
         self.incsearch_style = chrome("incsearch");
@@ -827,6 +836,9 @@ fn parse_window(m: &[(Value, Value)], styles: &[Style]) -> WindowView {
             .and_then(Value::as_bool)
             .unwrap_or(false),
         relativenumber: map_get(m, "relativenumber")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        cursorline: map_get(m, "cursorline")
             .and_then(Value::as_bool)
             .unwrap_or(false),
         number_width: map_u16(m, "number_width"),

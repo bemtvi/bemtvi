@@ -103,9 +103,10 @@ a `name?` field (default `[Panel]`). New ftplugin: `FileType nxpanels` maps `<CR
 ## Out of scope / notes
 
 - **Word-wrap** stays dropped (a buffer-wide feature; the retire-panel plan's reasoning holds).
-- **No selection highlight** (the old panel's reverse-video cursor row): there is no
-  `cursorline` option in nxvim; the cursor renders normally. A `cursorline` is a separate,
-  buffer-wide feature.
+- **No selection highlight** (the old panel's reverse-video cursor row): the panel does
+  not enable `cursorline`, so the cursor renders normally. (`cursorline` is a separate,
+  window-local option — since landed — that a panel buffer could opt into via its
+  `FileType` autocmd if a highlighted cursor row is ever wanted.)
 - **`nx.view`** (the *persistent* dockable surface) is untouched and complementary — it is
   for docked plugin content; `nx.panel` is the *transient grabbing* surface.
 - **Scripted-panel filetype churn**: `nx.panel.open` reuses one `script_panel_bufnr`

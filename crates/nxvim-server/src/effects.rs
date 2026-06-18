@@ -1501,6 +1501,7 @@ impl EditHost {
                     height: ch as u64,
                     number: opts.number,
                     relativenumber: opts.relativenumber,
+                    cursorline: opts.cursorline,
                     numberwidth: opts.numberwidth as u64,
                     signcolumn: opts.signcolumn.to_string(),
                     // `winsaveview()` reports `topline` 1-based; `top` is 0-based.

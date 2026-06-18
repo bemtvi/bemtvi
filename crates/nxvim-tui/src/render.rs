@@ -59,6 +59,17 @@ fn rgb(c: u32) -> Color {
     Color::Rgb(r, g, b)
 }
 
+/// The style painted across the cursor's screen row for `'cursorline'`. Prefers
+/// the colorscheme's `CursorLine` group; with none resolved (no theme, or a
+/// theme that leaves it undefined) it falls back to a subtle dark-gray
+/// background so the line is still visible out of the box — matching how the
+/// other chrome groups degrade to a built-in look.
+fn cursorline_style(view: &View) -> Style {
+    view.cursor_line
+        .map(rt)
+        .unwrap_or_else(|| Style::default().bg(Color::Indexed(236)))
+}
+
 /// Map a neutral float [`nxvim_view::Border`] to the ratatui [`BorderType`] used
 /// to draw it. `Solid` (neovim's space border) renders as the nearest line style.
 fn bt(b: nxvim_view::Border) -> BorderType {
@@ -811,6 +822,23 @@ fn render_window(
     // the editor background. With no theme this is skipped.
     if let Some(normal) = view.normal.map(rt) {
         frame.render_widget(Block::default().style(normal), text_area);
+    }
+
+    // `'cursorline'`: tint the cursor's screen row across the whole window width
+    // (sign column, gutter, and text). Painted right after the `Normal` background
+    // so the gutter numbers, text spans, and overlays (selection / search /
+    // diagnostics) all draw on top — only cells they don't claim show the tint.
+    // The `~` filler rows below the buffer never carry the cursor, so a short
+    // buffer's cursorline still lands on a real line.
+    if win.cursorline {
+        let row = text_area.y + cursor_row.min(text_area.height.saturating_sub(1));
+        let line_area = Rect {
+            x: text_area.x,
+            y: row,
+            width: text_area.width,
+            height: 1,
+        };
+        frame.render_widget(Block::default().style(cursorline_style(view)), line_area);
     }
 
     // Reserve the diagnostic sign column at the far left (vim's signcolumn, left of

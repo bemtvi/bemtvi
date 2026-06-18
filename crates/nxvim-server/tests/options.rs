@@ -35,6 +35,7 @@ async fn every_known_option_is_wired_not_silent() {
         // bool
         "number",
         "relativenumber",
+        "cursorline",
         "ignorecase",
         "smartcase",
         "wrapscan",

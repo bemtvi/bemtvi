@@ -480,6 +480,7 @@ impl EditHost {
                 Value::from("relativenumber"),
                 Value::from(win.relativenumber),
             ),
+            (Value::from("cursorline"), Value::from(win.cursorline)),
             (
                 Value::from("number_width"),
                 Value::from(win.number_width as u64),
@@ -887,6 +888,7 @@ impl EditHost {
             ("normal", "Normal"),
             ("line_nr", "LineNr"),
             ("cursor_line_nr", "CursorLineNr"),
+            ("cursorline", "CursorLine"),
             ("visual", "Visual"),
             ("search", "Search"),
             ("incsearch", "IncSearch"),

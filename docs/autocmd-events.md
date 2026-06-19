@@ -7,19 +7,34 @@ matched exactly, and a handler's `callback` receives the event table
 
 > **The list is the emitted set, not all of vim's events.** nxvim fires events as
 > features come to need them. A handler registered for an event that isn't emitted
-> yet (e.g. `BufWritePost`, `TextChanged`, `CursorMoved`) is accepted but simply
-> never fires — it does not error. If you need one that's missing, it's a feature
-> gap, not a config mistake.
+> yet (e.g. `WinScrolled`, `ModeChanged`, `OptionSet`) is accepted but simply never
+> fires — it does not error. If you need one that's missing, it's a feature gap, not
+> a config mistake.
+
+Patterns support shell globs: a `pattern` such as `"*.rs"` (no `/`) matches a file
+event by the path tail, one containing a `/` matches the whole path, and `"*"` (or
+an omitted pattern) matches everything. A pattern with no glob metacharacter is an
+exact compare — so a `FileType rust` autocmd never glob-matches a path.
 
 ## Buffer lifecycle
 
 | Event | When it fires | Notes |
 | --- | --- | --- |
-| `BufReadPost` | A file-backed buffer is first shown (read from disk). | Fires **once** per buffer (gated by the "announced" set). `buf` / `file` set. |
+| `BufReadPost` | A file-backed buffer is first shown after reading an existing file from disk. | Fires **once** per buffer (gated by the "announced" set). `buf` / `file` set. |
+| `BufNewFile` | A buffer is opened for a path with **no file on disk** — fires instead of `BufReadPost`. | `buf` / `file` set. |
 | `FileType` | A buffer is first announced **and** whenever its filetype changes. | `match` is the filetype (e.g. `"rust"`); `file` is the path. Where ftplugins and `vim.lsp.enable` attach. |
-| `BufEnter` | Every time a buffer becomes current (including plain switches with no read). | `buf` / `file` set. |
+| `BufEnter` / `BufLeave` | A buffer becomes / stops being the current one (including plain switches with no read). | `buf` / `file` set. |
+| `BufDelete` | Just before a buffer is deleted (`:bdelete`), while its state still exists. | `buf` / `file` set. |
 
-Ordering on opening a file is `BufReadPost` → `FileType` → `BufEnter`.
+Ordering on opening a file is `BufReadPost` (or `BufNewFile` for a new path) → `FileType` → `BufEnter`.
+
+## Writing
+
+| Event | When it fires | Notes |
+| --- | --- | --- |
+| `BufWritePre` | Before a buffer is written to disk (`:w`, `:wall`, and finalized off-tick saves). | `match` / `file` is the path; glob-matchable, e.g. a `*.rs` format-on-save hook. |
+| `BufWrite` | Same point as `BufWritePre` — the bare-name spelling. | |
+| `BufWritePost` | After a successful write. | The hook format-on-save and "reload affected tools" plugins use. |
 
 ## Window & tab
 
@@ -37,7 +52,19 @@ Ordering on opening a file is `BufReadPost` → `FileType` → `BufEnter`.
 
 | Event | When it fires |
 | --- | --- |
-| `InsertEnter` | The editor transitions into Insert (or Replace) mode. |
+| `InsertEnter` / `InsertLeave` | The editor enters / leaves Insert (or Replace) mode. |
+
+## Editing & cursor
+
+These fire at high frequency, so they are **gated on a registered handler** — when
+no autocmd listens for them they cost nothing.
+
+| Event | When it fires |
+| --- | --- |
+| `TextChanged` | The buffer's text changes in Normal mode (edit, paste, …). |
+| `TextChangedI` | The buffer's text changes in Insert mode (per keystroke). |
+| `CursorMoved` | The cursor moves in Normal mode. |
+| `CursorMovedI` | The cursor moves in Insert mode. |
 
 ## LSP
 

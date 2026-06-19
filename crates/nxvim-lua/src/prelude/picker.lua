@@ -80,17 +80,23 @@ for _, m in ipairs({
   nx.keymap.set("picker", m[1], nx.picker.actions[m[2]], { default = true, desc = m[3] })
 end
 
--- nx.picker.source { name, items = function(ctx), dynamic, confirm }: register a
--- source. `items` streams candidates: it calls `ctx.push(item)` per result (an
--- item is a table with a `text` display field, plus any data the `confirm` needs)
--- and signals completion by *returning* — a synchronous source just returns when
+-- nx.picker.source { name, items = function(ctx), dynamic, confirm, preview }:
+-- register a source. `items(ctx)` streams candidates: it calls `ctx.push(item)` per
+-- result (an item is a table with a `text` display field, plus any data `confirm` or
+-- the preview needs — e.g. `path` / `row` / `col`) and signals completion by
+-- *returning* — a synchronous source just returns when
 -- its loop ends, an asynchronous one is wrapped in `nx.async` and returns the
 -- promise (the engine awaits it; nx is promise-only, so there is no `done`
 -- callback). A streaming source consumes a `nx.run_stream` with `nx.await_each`,
 -- and reaps its job on close via `ctx.on_cancel`. `dynamic = true` re-runs `items`
--- on every prompt edit (live grep — the matcher is bypassed); the default is a
+-- on every prompt edit (live grep — the matcher is bypassed), reading the live
+-- prompt from `ctx.query` and the working directory from `ctx.cwd`; the default is a
 -- static source matched locally in Rust as you type. `confirm(item)` acts on the
--- chosen item. Optional `width` / `height` fix the box size — a cell count
+-- chosen item. Optional `preview` adds a side pane for the highlighted item:
+-- `"file"` shows the head of `item.path`, `"location"` shows `item.path` positioned
+-- at `item.row` / `item.col` (1-based). Omitted ⇒ no preview pane; per-open
+-- overridable via `nx.picker.open(name, { preview = … })`. Optional `width` /
+-- `height` fix the box size — a cell count
 -- (number) or a CSS-style viewport fraction string ("80vw" / "60vh" / "50%");
 -- omitted ⇒ the default (~80vw x 60vh). The picker is never content-sized.
 -- Optional `align` ("top-left"…"center"…"bottom-right", default centered) +
@@ -125,11 +131,15 @@ function nx.picker.source(spec)
 end
 
 -- nx.picker.open(name[, opts]): open the picker for the registered source `name`.
--- `opts.width` / `opts.height` set a FIXED box size — a cell count (e.g. 100) or a
--- CSS-style viewport fraction string ("80vw" / "60vh" / "50%") — overriding the
--- source's own `width`/`height`, which override the picker default. The picker is
--- never content-sized (a content-hugging box looks ragged). `opts.prompt_pos`
--- ("top" / "bottom") likewise overrides the source's `prompt_pos`.
+-- Each `opts` field overrides the matching field on the source (which in turn
+-- overrides the picker default):
+--   * `width` / `height` — a FIXED box size: a cell count (e.g. 100) or a CSS-style
+--     viewport fraction string ("80vw" / "60vh" / "50%"). The picker is never
+--     content-sized (a content-hugging box looks ragged).
+--   * `align` + `margin` — placement, like a float (see nx.picker.source).
+--   * `preview` — "file" / "location" / nil (no pane).
+--   * `prompt_pos` — "top" (default) / "bottom".
+--   * `debounce` — ms before a `dynamic` source re-runs on a query edit; `0` off.
 function nx.picker.open(name, opts)
   local source = nx.picker._sources[name]
   if not source then

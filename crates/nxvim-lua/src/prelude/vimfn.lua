@@ -569,23 +569,33 @@ end
 function nx.qf.newer(count)
   vim.cmd(count and ("cnewer " .. count) or "cnewer")
 end
--- Location-list counterparts to the window / navigation wrappers above: thin
--- wrappers over the `:l*` ex-commands, acting on the current window's list.
+-- The location-list counterparts of the quickfix window / navigation wrappers
+-- above — thin wrappers over the `:l*` ex-commands, acting on the CURRENT window's
+-- location list rather than the global quickfix list.
+-- nx.qf.lopen([height]) [wraps `:lopen`]: open the location-list window, optionally
+-- `height` rows tall.
 function nx.qf.lopen(height)
   vim.cmd(height and ("lopen " .. height) or "lopen")
 end
+-- nx.qf.lclose() [wraps `:lclose`]: close the location-list window.
 function nx.qf.lclose()
   vim.cmd("lclose")
 end
+-- nx.qf.lnext() [wraps `:lnext`]: jump to the next entry in the location list.
 function nx.qf.lnext()
   vim.cmd("lnext")
 end
+-- nx.qf.lprev() [wraps `:lprev`]: jump to the previous entry in the location list.
 function nx.qf.lprev()
   vim.cmd("lprev")
 end
+-- nx.qf.lolder([count]) [wraps `:lolder`]: go to an older location list in the
+-- window's stack (`count` lists back, default 1).
 function nx.qf.lolder(count)
   vim.cmd(count and ("lolder " .. count) or "lolder")
 end
+-- nx.qf.lnewer([count]) [wraps `:lnewer`]: go to a newer location list in the
+-- window's stack (`count` lists forward, default 1).
 function nx.qf.lnewer(count)
   vim.cmd(count and ("lnewer " .. count) or "lnewer")
 end

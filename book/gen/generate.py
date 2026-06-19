@@ -62,19 +62,25 @@ IMPORTS = [
     ("docs/verifying-downloads.md", "appendix/verifying-downloads.md"),
 ]
 
+# (repo-relative source doc) -> (book page relative to SRC_DIR), for resolving
+# cross-doc links to in-book pages instead of GitHub.
+IMPORT_MAP = {src: dest for src, dest in IMPORTS}
+
 LINK_RE = re.compile(r"(!?)\[([^\]]*)\]\(([^)]+)\)")
 FENCE_RE = re.compile(r"^\s*(```|~~~)")
 
 
-def rewrite_target(target, src_dir_rel):
-    """Rewrite one Markdown link target to a stable, in-book or GitHub URL.
+def resolve_target(target, src_dir_rel):
+    """Classify and resolve one Markdown link target.
 
     src_dir_rel is the source doc's directory relative to the repo root, used as
-    the base for resolving repo-relative links.
+    the base for resolving repo-relative links. Returns (kind, value, suffix):
+      ("keep", literal, "")        — external / mailto / pure anchor; emit as-is
+      ("repo", repo_rel_path, suf) — a repo-relative path (+ #anchor/?query suffix)
     """
     # External, anchors, mailto: leave untouched.
     if target.startswith(("http://", "https://", "#", "mailto:", "//")):
-        return target, False
+        return "keep", target, ""
     # Split off any #anchor / ?query suffix.
     suffix = ""
     for sep in ("#", "?"):
@@ -83,15 +89,23 @@ def rewrite_target(target, src_dir_rel):
             suffix = target[i:] + suffix
             target = target[:i]
     if target == "":
-        return "#" + suffix.lstrip("#"), False  # pure anchor
+        return "keep", "#" + suffix.lstrip("#"), ""  # pure anchor
     # Resolve relative to the source doc's directory, normalize to repo-root rel.
     repo_rel = os.path.normpath(os.path.join(src_dir_rel, target))
     repo_rel = repo_rel.replace(os.sep, "/")
-    return repo_rel + suffix, True
+    return "repo", repo_rel, suffix
 
 
-def rewrite_links(text, src_path_rel):
+def rewrite_links(text, src_path_rel, dest_rel):
+    """Rewrite a doc's links for the book.
+
+    A link to another *imported* doc becomes an in-book relative link (so the
+    page is navigable inside the book); any other repo-relative link is rewritten
+    to an absolute GitHub URL. dest_rel is this page's path relative to SRC_DIR,
+    used as the base for the in-book relative links.
+    """
     src_dir_rel = os.path.dirname(src_path_rel)
+    dest_dir = os.path.dirname(dest_rel)
     out_lines = []
     in_fence = False
     for line in text.split("\n"):
@@ -105,12 +119,16 @@ def rewrite_links(text, src_path_rel):
 
         def repl(m):
             bang, label, target = m.group(1), m.group(2), m.group(3)
-            # Leave inline-code link targets and already-absolute ones alone.
-            resolved, changed = rewrite_target(target.strip(), src_dir_rel)
-            if not changed:
-                return "%s[%s](%s)" % (bang, label, resolved)
+            kind, value, suffix = resolve_target(target.strip(), src_dir_rel)
+            if kind == "keep":
+                return "%s[%s](%s)" % (bang, label, value)
+            # In-book link when the target doc is itself imported (not an image).
+            if bang == "" and value in IMPORT_MAP:
+                rel = os.path.relpath(IMPORT_MAP[value], dest_dir or ".")
+                rel = rel.replace(os.sep, "/")
+                return "[%s](%s)" % (label, rel + suffix)
             base = GH_RAW if bang == "!" else GH_BLOB
-            return "%s[%s](%s/%s)" % (bang, label, base, resolved)
+            return "%s[%s](%s/%s)" % (bang, label, base, value + suffix)
 
         out_lines.append(LINK_RE.sub(repl, line))
     return "\n".join(out_lines)
@@ -127,7 +145,7 @@ def import_docs():
             die("curated source doc missing: %s" % src_rel)
         with open(src_abs, encoding="utf-8") as f:
             text = f.read()
-        rewritten = rewrite_links(text, src_rel)
+        rewritten = rewrite_links(text, src_rel, dest_rel)
         write(os.path.join(SRC_DIR, dest_rel), (banner % src_rel) + rewritten)
         print("  imported %-44s -> src/%s" % (src_rel, dest_rel))
 

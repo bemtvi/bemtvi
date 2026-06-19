@@ -180,6 +180,17 @@ end
 -- nx.match.* (aliases vim.fn.matchadd / matchaddpos / matchdelete / clearmatches /
 -- getmatches): the per-window match-highlight registry.
 nx.match = nx.match or {}
+-- nx.match.add(group, pattern[, priority[, id[, opts]]]) -> id [alias vim.fn.matchadd]:
+-- register a request to highlight every match of the regex `pattern` with highlight
+-- group `group` in a window. `priority` orders overlapping matches (default 10); `id`
+-- requests a specific match id (nil / -1 auto-allocates a fresh one); `opts.window`
+-- targets a window other than the current one. Returns the match id.
+--
+-- CAVEAT: the registry is faithful — ids are allocated and stored, and nx.match.get
+-- reflects them — but nxvim does NOT yet render these matches (there is no `:match` /
+-- matchadd decoration path in the core). The highlight is recorded but not painted,
+-- and the call succeeds rather than failing loud. (A previewer that uses it to tint a
+-- search term shows correct content, just un-tinted for now.)
 function nx.match.add(group, pattern, priority, id, opts)
   nx._match_seq = nx._match_seq + 1
   local mid = (id and id ~= -1) and id or nx._match_seq
@@ -187,6 +198,11 @@ function nx.match.add(group, pattern, priority, id, opts)
   store[mid] = { group = group, pattern = pattern, priority = priority or 10, id = mid }
   return mid
 end
+-- nx.match.addpos(group, pos[, priority[, id[, opts]]]) -> id [alias vim.fn.matchaddpos]:
+-- like nx.match.add, but highlights explicit positions instead of a regex. `pos` is a
+-- list whose items are a line number, `{lnum}`, or `{lnum, col, len}` (1-based). Same
+-- id / priority / opts.window handling — and the same not-yet-rendered caveat as
+-- nx.match.add.
 function nx.match.addpos(group, pos, priority, id, opts)
   nx._match_seq = nx._match_seq + 1
   local mid = (id and id ~= -1) and id or nx._match_seq
@@ -194,16 +210,24 @@ function nx.match.addpos(group, pos, priority, id, opts)
   store[mid] = { group = group, pos = pos, priority = priority or 10, id = mid }
   return mid
 end
+-- nx.match.delete(id[, win]) -> 0 | -1 [alias vim.fn.matchdelete]: remove the match
+-- with id `id` from window `win` (0/nil = current). Returns 0 if it existed, else -1.
 function nx.match.delete(id, win)
   local store = match_store(win)
   local existed = store[id] ~= nil
   store[id] = nil
   return existed and 0 or -1
 end
+-- nx.match.clear([win]) -> 0 [alias vim.fn.clearmatches]: remove every match from
+-- window `win` (0/nil = current).
 function nx.match.clear(win)
   nx._matches[(win == nil or win == 0) and (nx._cur_win or 1000) or win] = {}
   return 0
 end
+-- nx.match.get([win]) -> list [alias vim.fn.getmatches]: the registered matches of
+-- window `win` (0/nil = current), id-ascending. Each entry is
+-- `{ group, id, priority, pattern? | pos? }` — the `pattern` form from nx.match.add,
+-- the `pos` form from nx.match.addpos.
 function nx.match.get(win)
   local out = {}
   for _, m in pairs(match_store(win)) do
@@ -428,14 +452,21 @@ local function nx_read_list(mirror, title, what)
   return out
 end
 
--- nx.getqflist([what]) [alias vim.fn.getqflist]: the quickfix list. With no
--- argument (or a non-table), returns the array of entry dicts (a shallow copy of
--- the `nx._qflist` mirror the server pushes). With a `what` dict, returns a dict
--- carrying only the requested keys (`title` / `items` / `size`).
-function nx.getqflist(what)
+-- nx.qf: the canonical quickfix / location-list surface (ADR 0002). The list
+-- accessors are defined as nx.qf.* here; the bare nx.* and vim.fn.* spellings are
+-- muscle-memory aliases onto them (the vim.fn ones set inline, the bare-nx ones in
+-- one block below the definitions). The window / navigation commands further down
+-- are thin wrappers over the `:c*` / `:l*` ex-commands.
+nx.qf = nx.qf or {}
+
+-- nx.qf.getqflist([what]) -> list | dict [aliases nx.getqflist / vim.fn.getqflist]:
+-- the quickfix list. With no argument (or a non-table), returns the array of entry
+-- dicts (a shallow copy of the `nx._qflist` mirror the server pushes). With a `what`
+-- dict, returns a dict carrying only the requested keys (`title` / `items` / `size`).
+function nx.qf.getqflist(what)
   return nx_read_list(nx._qflist, nx._qflist_title, what)
 end
-vim.fn.getqflist = nx.getqflist
+vim.fn.getqflist = nx.qf.getqflist
 
 -- Normalize the public `(list, action, what)` setqflist/setloclist tail into the
 -- positional `(items, lines, efm, action, title)` nx._set_qflist expects.
@@ -461,24 +492,25 @@ local function nx_setlist_args(list, action, what)
   return items, lines, efm, action, title
 end
 
--- nx.setqflist(list, action, what) [alias vim.fn.setqflist]: populate the
--- quickfix list. `list` is an array of entry dicts; `action` is " " (new / the
--- default), "a" (append), or "r" (replace current). `what` may instead carry
--- `lines` (raw output parsed against `efm`), `items`, `title`, or `efm`. The work
--- happens server-side (a queued op), so the parsed result is visible to
--- getqflist() only after the server drains the op — read it on a later tick.
-function nx.setqflist(list, action, what)
+-- nx.qf.setqflist(list[, action[, what]]) -> 0 [aliases nx.setqflist /
+-- vim.fn.setqflist]: populate the quickfix list. `list` is an array of entry dicts;
+-- `action` is " " (new / the default), "a" (append), or "r" (replace current).
+-- `what` may instead carry `lines` (raw output parsed against `efm`), `items`,
+-- `title`, or `efm`. The work happens server-side (a queued op), so the parsed result
+-- is visible to nx.qf.getqflist() only after the server drains the op — read it on a
+-- later tick.
+function nx.qf.setqflist(list, action, what)
   local items, lines, efm, act, title = nx_setlist_args(list, action, what)
   nx._set_qflist(items, lines, efm, act, title, nil)
   return 0
 end
-vim.fn.setqflist = nx.setqflist
+vim.fn.setqflist = nx.qf.setqflist
 
--- nx.getloclist(winnr[, what]) [alias vim.fn.getloclist]: the location list of
--- window `winnr` (0 = current window; otherwise an nxvim window id, NOT vim's
--- 1-based window number). Same return shape as getqflist; an empty list when the
--- window has none.
-function nx.getloclist(winnr, what)
+-- nx.qf.getloclist(winnr[, what]) -> list | dict [aliases nx.getloclist /
+-- vim.fn.getloclist]: the location list of window `winnr` (0 = current window;
+-- otherwise an nxvim window id, NOT vim's 1-based window number). Same return shape
+-- as nx.qf.getqflist; an empty list when the window has none.
+function nx.qf.getloclist(winnr, what)
   local win = winnr
   if win == nil or win == 0 then
     win = nx.win.current()
@@ -489,44 +521,51 @@ function nx.getloclist(winnr, what)
   end
   return nx_read_list(entry.items, entry.title, what)
 end
-vim.fn.getloclist = nx.getloclist
+vim.fn.getloclist = nx.qf.getloclist
 
--- nx.setloclist(winnr, list, action, what) [alias vim.fn.setloclist]: populate the
--- location list of window `winnr` (0 = current window; otherwise an nxvim window
--- id). Same `list`/`action`/`what` semantics as setqflist, only scoped to a
--- window. Queued server-side like setqflist.
-function nx.setloclist(winnr, list, action, what)
+-- nx.qf.setloclist(winnr, list[, action[, what]]) -> 0 [aliases nx.setloclist /
+-- vim.fn.setloclist]: populate the location list of window `winnr` (0 = current
+-- window; otherwise an nxvim window id). Same `list`/`action`/`what` semantics as
+-- nx.qf.setqflist, only scoped to a window. Queued server-side like setqflist.
+function nx.qf.setloclist(winnr, list, action, what)
   local items, lines, efm, act, title = nx_setlist_args(list, action, what)
   -- 0 / nil ride through as 0 ("current window at drain time"); the server resolves
   -- it. A non-zero winnr is taken as a window id.
   nx._set_qflist(items, lines, efm, act, title, winnr or 0)
   return 0
 end
-vim.fn.setloclist = nx.setloclist
+vim.fn.setloclist = nx.qf.setloclist
 
--- nx.qf: the canonical quickfix / location-list surface (ADR 0002). The
--- `vim.fn.*` names above are muscle-memory aliases that delegate here. The window
--- and navigation commands are thin wrappers over the `:c*` / `:l*` ex-commands.
-nx.qf = nx.qf or {}
-nx.qf.setqflist = nx.setqflist
-nx.qf.getqflist = nx.getqflist
-nx.qf.setloclist = nx.setloclist
-nx.qf.getloclist = nx.getloclist
+-- Bare-nx muscle-memory aliases onto the canonical nx.qf.* list accessors (the
+-- vim.fn.* aliases were set inline above).
+nx.getqflist = nx.qf.getqflist
+nx.setqflist = nx.qf.setqflist
+nx.getloclist = nx.qf.getloclist
+nx.setloclist = nx.qf.setloclist
+-- nx.qf.open([height]) [wraps `:copen`]: open the quickfix window, optionally
+-- `height` rows tall.
 function nx.qf.open(height)
   vim.cmd(height and ("copen " .. height) or "copen")
 end
+-- nx.qf.close() [wraps `:cclose`]: close the quickfix window.
 function nx.qf.close()
   vim.cmd("cclose")
 end
+-- nx.qf.next() [wraps `:cnext`]: jump to the next entry in the quickfix list.
 function nx.qf.next()
   vim.cmd("cnext")
 end
+-- nx.qf.prev() [wraps `:cprev`]: jump to the previous entry in the quickfix list.
 function nx.qf.prev()
   vim.cmd("cprev")
 end
+-- nx.qf.older([count]) [wraps `:colder`]: go to an older quickfix list in the stack
+-- (`count` lists back, default 1).
 function nx.qf.older(count)
   vim.cmd(count and ("colder " .. count) or "colder")
 end
+-- nx.qf.newer([count]) [wraps `:cnewer`]: go to a newer quickfix list in the stack
+-- (`count` lists forward, default 1).
 function nx.qf.newer(count)
   vim.cmd(count and ("cnewer " .. count) or "cnewer")
 end

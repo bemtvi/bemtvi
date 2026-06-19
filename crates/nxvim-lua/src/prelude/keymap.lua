@@ -427,6 +427,10 @@ end
 
 nx.qf = nx.qf or {}
 nx.qf.actions = nx.qf.actions or {}
+-- nx.qf.actions.jump(): the default `<CR>` action in the quickfix window — jump to
+-- the entry on the cursor's line. Bound buffer-locally as a `default` map by the
+-- `FileType qf` autocmd, so a user `<CR>` map overrides it (the rebindable
+-- panel-action pattern; cf. nx.buffers.actions.open).
 nx.qf.actions.jump = function()
   nx._qf_action("jump")
 end
@@ -472,6 +476,13 @@ nx.autocmd.create("FileType", {
 -- about-to-be-removed panel one).
 nx.buffers = nx.buffers or {}
 nx.buffers.actions = nx.buffers.actions or {}
+-- nx.buffers.actions.open(): the default `<CR>` action inside the `:ls` / `:buffers`
+-- list panel (filetype `nxbuffers`). Reads the buffer number off the start of the
+-- cursor's row, closes the panel, and switches to that buffer — scheduled so the
+-- switch lands in the main window after the panel close restores focus. Bound
+-- buffer-locally as a `default` map (a user `<CR>` map overrides it); rebindable like
+-- the other panel actions (`nx.qf.actions.jump`, `nx.panels.actions.open`). Note this
+-- is the buffer-list panel's key action, distinct from the `nx.buf.*` buffer API.
 nx.buffers.actions.open = function()
   local n = tostring(nx.current_line()):match("^%s*(%d+)")
   if n then

@@ -19,6 +19,11 @@
 - [Getting started](guide/getting-started.md)
 - [Configuration](guide/configuration.md)
 
+# Beyond vim
+
+- [What nxvim adds](features/index.md)
+  - [Multi-cursor mode](features/multicursor.md)
+
 # Plugin Development
 
 - [Overview](plugins/overview.md)

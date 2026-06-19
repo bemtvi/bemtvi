@@ -2,10 +2,9 @@
 
 A plugin is **pure Lua over the `nx.*` API** — no Rust, no Vimscript. The server
 owns every UI surface (windows, floats, the completion menu, the statusline); a
-plugin supplies *data and behavior* and reaches the screen through `nx.*`. This is
-the prime directive: every feature that can be a plugin *is* one (see
-[ADR 0002](decisions/0002-native-plugin-system.md) and the
-[native plugin API design](specs/2026-06-11-native-plugin-api.md)).
+plugin supplies *data and behavior* and reaches the screen through `nx.*`.
+Our prime directive is every feature that can be a plugin *is* one, so we excersise
+our own APIs.
 
 If you've written a neovim plugin, the shape is familiar — a `lua/<name>/init.lua`
 module exposing `setup(opts)` — but the API you call is `nx.*`, not `vim.*`. (A
@@ -96,7 +95,10 @@ and a deeper treatment in the [API design](specs/2026-06-11-native-plugin-api.md
 - **Autocmds / events** — `nx.on(event, { pattern = … }, fn)` for editor lifecycle
   events (`BufReadPost`, `FileType`, …).
 - **Options & vars** — read/write `nx.o` (global), `nx.bo` (buffer), `nx.wo`
-  (window), and `nx.g` (globals).
+  (window), and `nx.g` (globals). Edge docks have their own scope too:
+  `nx.dock.opt(side)` (e.g. `nx.dock.opt("left").size = 32`), alongside
+  `nx.bo`/`nx.wo` — per-dock `showtabline`, `laststatus`, `size`, `title`,
+  `winhighlight`, and `autohide`.
 - **Highlights** — `nx.hl.define(ns, name, spec)`, `nx.hl.get`, `nx.hl.exists`.
   Define your groups as fallbacks (`nx.hl.exists` guard) so a colorscheme that
   already styles them wins.

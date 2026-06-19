@@ -658,6 +658,160 @@ async fn catalog_commands_are_recognized() {
     }
 }
 
+// ---- Phase 4: `:set` argument completes option names (with docs) -------------------
+
+#[tokio::test]
+async fn set_arg_completes_option_names() {
+    let dir = temp_dir("cmdcomplete");
+    let (rpc, mut incoming) = start(&dir, INIT).await;
+
+    // `:set nu` + <Tab>: the cursor is in the argument, so the source offers option
+    // names (not commands). Fuzzy `nu` ranks `number` in.
+    feed(&rpc, ":set nu<Tab>");
+    let map = poll_menu(&rpc, &mut incoming)
+        .await
+        .expect("an option menu after :set nu<Tab>");
+    let items = menu_items(&map);
+    assert!(items.contains(&"number".to_string()), "items: {items:?}");
+    // The context switched: command names are gone, only options are offered.
+    assert!(!items.contains(&"edit".to_string()), "items: {items:?}");
+}
+
+#[tokio::test]
+async fn set_arg_empty_lists_every_option() {
+    let dir = temp_dir("cmdcomplete");
+    let (rpc, mut incoming) = start(&dir, INIT).await;
+
+    // `:set ` + <Tab> with an empty argument token offers the whole option catalog.
+    feed(&rpc, ":set <Tab>");
+    let map = poll_menu(&rpc, &mut incoming)
+        .await
+        .expect("a menu of all options after :set <Tab>");
+    let items = menu_items(&map);
+    for opt in ["number", "tabstop", "ignorecase", "wrap"] {
+        assert!(items.contains(&opt.to_string()), "missing {opt}: {items:?}");
+    }
+}
+
+#[tokio::test]
+async fn setlocal_arg_completes_option_names() {
+    let dir = temp_dir("cmdcomplete");
+    let (rpc, mut incoming) = start(&dir, INIT).await;
+
+    // `:setlocal` shares the option-argument completer with `:set`.
+    feed(&rpc, ":setlocal ts<Tab>");
+    let map = poll_menu(&rpc, &mut incoming)
+        .await
+        .expect("an option menu after :setlocal ts<Tab>");
+    assert!(
+        menu_items(&map).contains(&"tabstop".to_string()),
+        "items: {:?}",
+        menu_items(&map)
+    );
+}
+
+#[tokio::test]
+async fn set_option_docs_show_scope_kind_and_help() {
+    let dir = temp_dir("cmdcomplete");
+    let (rpc, mut incoming) = start(&dir, INIT).await;
+
+    // `ignorecase` is a unique fuzzy match, so it is row 0; selecting it arms the docs
+    // float. The header names the option + abbreviation, a metadata line gives scope +
+    // kind, and the description follows.
+    feed(&rpc, ":set ignorecase<Tab>");
+    poll_menu(&rpc, &mut incoming).await.expect("menu");
+    feed(&rpc, "<Tab>");
+    let map = wait_redraw(&mut incoming, |m| menu_sel_is(m, 0, true)).await;
+    assert_eq!(menu_items(&map)[0], "ignorecase");
+
+    let docs = menu_docs(&map).expect("a docs float for the selected option");
+    assert_eq!(docs.first().map(String::as_str), Some("ignorecase (ic)"));
+    assert!(
+        docs.iter()
+            .any(|l| l.contains("global") && l.contains("boolean")),
+        "docs: {docs:?}"
+    );
+    assert!(
+        docs.iter().any(|l| l.contains("Ignore case")),
+        "docs: {docs:?}"
+    );
+}
+
+#[tokio::test]
+async fn set_arg_accept_rewrites_only_the_option_token() {
+    let dir = temp_dir("cmdcomplete");
+    let (rpc, mut incoming) = start(&dir, INIT).await;
+
+    // Selecting an option previews it in the line — replacing just the `nu` argument
+    // token, leaving the `set ` command intact (the anchor is the arg word, not col 0).
+    feed(&rpc, ":set nu<Tab>");
+    poll_menu(&rpc, &mut incoming).await.expect("menu");
+    feed(&rpc, "<Tab>");
+    let map = wait_redraw(&mut incoming, |m| menu_sel_is(m, 0, true)).await;
+    let selected = menu_items(&map)[0].clone();
+    assert_eq!(
+        cmdline_text(&map).as_deref(),
+        Some(&format!("set {selected}")[..])
+    );
+}
+
+#[tokio::test]
+async fn non_set_command_args_open_no_menu() {
+    let dir = temp_dir("cmdcomplete");
+    let (rpc, mut incoming) = start(&dir, INIT).await;
+
+    // A command with no argument completer (`:edit <file>` is not wired yet) opens
+    // nothing in its argument region — the wildmenu only covers what has a source.
+    feed(&rpc, ":edit foo<Tab>");
+    assert!(
+        poll_no_menu(&rpc, &mut incoming).await.is_some(),
+        "no menu for an un-completable argument"
+    );
+}
+
+/// Coverage guard: every option name the `:set` completer offers must be an option
+/// the editor actually accepts (`:set {name}?` must not reply `E518: Unknown option`).
+/// Since both the completer and `:set` read the same core catalog, this also proves
+/// the catalog bridge (`nx._options_catalog`) is wired.
+#[tokio::test]
+async fn completed_options_are_recognized_by_set() {
+    let dir = temp_dir("cmdcomplete");
+    let (rpc, mut incoming) = start(&dir, INIT).await;
+
+    let value = exec_lua(
+        &rpc,
+        "local out = {}\n\
+         for _, c in ipairs(nx._cmdline_complete_run('set ', 4)) do out[#out + 1] = c.label end\n\
+         return out",
+    )
+    .await;
+    let names: Vec<String> = match value {
+        Value::Array(items) => items
+            .iter()
+            .map(|v| v.as_str().expect("a string label").to_string())
+            .collect(),
+        other => panic!("expected an array of option names, got {other:?}"),
+    };
+    assert!(
+        names.len() > 40,
+        "option catalog unexpectedly small: {names:?}"
+    );
+
+    for name in &names {
+        rpc.request("nx_command", vec![Value::from(format!("set {name}?"))])
+            .await
+            .expect("nx_command");
+        barrier(&rpc).await;
+        let msg = drain_latest_redraw(&mut incoming)
+            .map(|p| message_of(&p))
+            .unwrap_or_default();
+        assert!(
+            !msg.contains("Unknown option"),
+            ":set completion offers {name}, but :set rejects it (drift?) — msg: {msg:?}"
+        );
+    }
+}
+
 // ---- Phase 3: mouse on the wildmenu (command-mode 'c' in 'mouse') ------------------
 
 /// Command-mode mouse needs `'c'` in `'mouse'` (the default `"nvi"` omits it). The

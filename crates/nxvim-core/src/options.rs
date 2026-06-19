@@ -786,10 +786,423 @@ pub enum SetCmd {
 
 /// Whether a canonical option carries a boolean, a number, or a string.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum OptKind {
+pub enum OptKind {
     Bool,
     Num,
     Str,
+}
+
+impl OptKind {
+    /// A stable lowercase tag (`"bool"` / `"number"` / `"string"`) for the catalog
+    /// API — what `:set` completion shows and what `nx._options_catalog()` exposes.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            OptKind::Bool => "bool",
+            OptKind::Num => "number",
+            OptKind::Str => "string",
+        }
+    }
+}
+
+/// Which scope an option lives in: a global editor setting, a window-local, or a
+/// buffer-local. Shown alongside the option's help in `:set` completion so the
+/// reader knows whether `:setlocal` matters.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OptScope {
+    Global,
+    Window,
+    Buffer,
+}
+
+impl OptScope {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            OptScope::Global => "global",
+            OptScope::Window => "window",
+            OptScope::Buffer => "buffer",
+        }
+    }
+}
+
+/// Static documentation for one settable option — the single source of truth for
+/// "what options exist", their abbreviations, value kinds, scopes, and one-line
+/// help. [`canonical`] resolves names/abbreviations against this table, and
+/// [`options_catalog`] hands it to `:set` command-line completion (so the option
+/// list and its docs can never drift from what `:set` actually accepts).
+#[derive(Debug, Clone, Copy)]
+pub struct OptionInfo {
+    /// The canonical spelling (e.g. `"number"`).
+    pub name: &'static str,
+    /// The standard short form (e.g. `"nu"`), or `None` when there is none.
+    pub abbrev: Option<&'static str>,
+    /// Whether the value is a boolean, a number, or a string.
+    pub kind: OptKind,
+    /// Where the option lives (global / window-local / buffer-local).
+    pub scope: OptScope,
+    /// A one-line description shown in the `:set` completion docs pane.
+    pub doc: &'static str,
+}
+
+/// The documented catalog of every settable option, grouped by scope. This is the
+/// authoritative list — [`canonical`] and `:set` completion both read it.
+static OPTIONS: &[OptionInfo] = {
+    use OptKind::{Bool, Num, Str};
+    use OptScope::{Buffer, Global, Window};
+    &[
+        // ---- Window-local --------------------------------------------------------
+        OptionInfo {
+            name: "number",
+            abbrev: Some("nu"),
+            kind: Bool,
+            scope: Window,
+            doc: "Show the absolute line number in front of each line.",
+        },
+        OptionInfo {
+            name: "relativenumber",
+            abbrev: Some("rnu"),
+            kind: Bool,
+            scope: Window,
+            doc: "Show line numbers relative to the cursor line.",
+        },
+        OptionInfo {
+            name: "cursorline",
+            abbrev: Some("cul"),
+            kind: Bool,
+            scope: Window,
+            doc: "Highlight the screen line the cursor is on.",
+        },
+        OptionInfo {
+            name: "wrap",
+            abbrev: None,
+            kind: Bool,
+            scope: Window,
+            doc: "Wrap long lines to the window width instead of scrolling off-screen.",
+        },
+        OptionInfo {
+            name: "numberwidth",
+            abbrev: Some("nuw"),
+            kind: Num,
+            scope: Window,
+            doc: "Minimum number of columns reserved for the line-number column.",
+        },
+        OptionInfo {
+            name: "signcolumn",
+            abbrev: Some("scl"),
+            kind: Str,
+            scope: Window,
+            doc: "When to draw the sign column: auto, yes, no, or number.",
+        },
+        OptionInfo {
+            name: "breakindent",
+            abbrev: Some("bri"),
+            kind: Bool,
+            scope: Window,
+            doc: "Indent wrapped lines to line up with the start of the line.",
+        },
+        OptionInfo {
+            name: "showbreak",
+            abbrev: Some("sbr"),
+            kind: Str,
+            scope: Window,
+            doc: "String shown at the start of each wrapped (continuation) line.",
+        },
+        OptionInfo {
+            name: "breakindentopt",
+            abbrev: Some("briopt"),
+            kind: Str,
+            scope: Window,
+            doc: "Tuning for 'breakindent' (e.g. shift:n, min:n, sbr).",
+        },
+        OptionInfo {
+            name: "fillchars",
+            abbrev: Some("fcs"),
+            kind: Str,
+            scope: Window,
+            doc: "Characters used to fill status lines and the end-of-buffer area.",
+        },
+        OptionInfo {
+            name: "padding",
+            abbrev: Some("pad"),
+            kind: Str,
+            scope: Window,
+            doc: "Per-window content margin, CSS shorthand (nxvim extension).",
+        },
+        OptionInfo {
+            name: "sidescroll",
+            abbrev: Some("ss"),
+            kind: Num,
+            scope: Window,
+            doc: "Minimum number of columns to scroll horizontally at a time.",
+        },
+        OptionInfo {
+            name: "sidescrolloff",
+            abbrev: Some("siso"),
+            kind: Num,
+            scope: Window,
+            doc: "Minimum columns to keep to the left and right of the cursor.",
+        },
+        // ---- Buffer-local --------------------------------------------------------
+        OptionInfo {
+            name: "tabstop",
+            abbrev: Some("ts"),
+            kind: Num,
+            scope: Buffer,
+            doc: "Number of spaces a <Tab> in the file is displayed as.",
+        },
+        OptionInfo {
+            name: "shiftwidth",
+            abbrev: Some("sw"),
+            kind: Num,
+            scope: Buffer,
+            doc: "Number of spaces used for each step of (auto)indent.",
+        },
+        OptionInfo {
+            name: "softtabstop",
+            abbrev: Some("sts"),
+            kind: Num,
+            scope: Buffer,
+            doc: "Spaces a <Tab> feels like while editing (-1 follows 'shiftwidth').",
+        },
+        OptionInfo {
+            name: "expandtab",
+            abbrev: Some("et"),
+            kind: Bool,
+            scope: Buffer,
+            doc: "Insert spaces instead of a real <Tab> character.",
+        },
+        OptionInfo {
+            name: "regexsyntax",
+            abbrev: Some("rxs"),
+            kind: Str,
+            scope: Buffer,
+            doc: "Regex engine for search/substitute: auto, vim, or rust.",
+        },
+        OptionInfo {
+            name: "fileencoding",
+            abbrev: Some("fenc"),
+            kind: Str,
+            scope: Buffer,
+            doc: "Character encoding written when the buffer is saved.",
+        },
+        OptionInfo {
+            name: "bomb",
+            abbrev: None,
+            kind: Bool,
+            scope: Buffer,
+            doc: "Write a byte-order mark (BOM) at the start of the file.",
+        },
+        OptionInfo {
+            name: "modifiable",
+            abbrev: Some("ma"),
+            kind: Bool,
+            scope: Buffer,
+            doc: "Allow the buffer's contents to be changed.",
+        },
+        OptionInfo {
+            name: "filetype",
+            abbrev: Some("ft"),
+            kind: Str,
+            scope: Buffer,
+            doc: "The buffer's filetype; drives syntax, indent, and plugins.",
+        },
+        OptionInfo {
+            name: "commentstring",
+            abbrev: Some("cms"),
+            kind: Str,
+            scope: Buffer,
+            doc: "Template for a line comment, where %s is the comment text.",
+        },
+        OptionInfo {
+            name: "ts_highlight",
+            abbrev: None,
+            kind: Bool,
+            scope: Buffer,
+            doc: "Enable tree-sitter highlighting for this buffer.",
+        },
+        // ---- Global --------------------------------------------------------------
+        OptionInfo {
+            name: "ignorecase",
+            abbrev: Some("ic"),
+            kind: Bool,
+            scope: Global,
+            doc: "Ignore case when searching.",
+        },
+        OptionInfo {
+            name: "smartcase",
+            abbrev: Some("scs"),
+            kind: Bool,
+            scope: Global,
+            doc: "Override 'ignorecase' when the search pattern has uppercase.",
+        },
+        OptionInfo {
+            name: "wrapscan",
+            abbrev: Some("ws"),
+            kind: Bool,
+            scope: Global,
+            doc: "Searches wrap around the end of the file.",
+        },
+        OptionInfo {
+            name: "hlsearch",
+            abbrev: Some("hls"),
+            kind: Bool,
+            scope: Global,
+            doc: "Highlight all matches of the last search pattern.",
+        },
+        OptionInfo {
+            name: "incsearch",
+            abbrev: Some("is"),
+            kind: Bool,
+            scope: Global,
+            doc: "Show where the search pattern matches as you type it.",
+        },
+        OptionInfo {
+            name: "autoread",
+            abbrev: Some("ar"),
+            kind: Bool,
+            scope: Global,
+            doc: "Reread a file when it changes on disk and was not modified here.",
+        },
+        OptionInfo {
+            name: "imagepreview",
+            abbrev: Some("imgp"),
+            kind: Bool,
+            scope: Global,
+            doc: "Render image files as images instead of raw bytes.",
+        },
+        OptionInfo {
+            name: "showtabline",
+            abbrev: Some("stal"),
+            kind: Num,
+            scope: Global,
+            doc: "When to show the tab line: 0 never, 1 when >1 tab, 2 always.",
+        },
+        OptionInfo {
+            name: "laststatus",
+            abbrev: Some("ls"),
+            kind: Num,
+            scope: Global,
+            doc: "When to show the status line: 0 never, 1 when >1, 2 always, 3 global.",
+        },
+        OptionInfo {
+            name: "statusline",
+            abbrev: Some("stl"),
+            kind: Str,
+            scope: Global,
+            doc: "Format string controlling the status line's contents.",
+        },
+        OptionInfo {
+            name: "tabline",
+            abbrev: Some("tal"),
+            kind: Str,
+            scope: Global,
+            doc: "Format string controlling the tab line's contents.",
+        },
+        OptionInfo {
+            name: "guifont",
+            abbrev: Some("gfn"),
+            kind: Str,
+            scope: Global,
+            doc: "Font and size used by GUI clients (e.g. \"Iosevka:h14\").",
+        },
+        OptionInfo {
+            name: "mouse",
+            abbrev: None,
+            kind: Str,
+            scope: Global,
+            doc: "Modes in which the mouse is enabled (e.g. a for all).",
+        },
+        OptionInfo {
+            name: "mousemodel",
+            abbrev: Some("mousem"),
+            kind: Str,
+            scope: Global,
+            doc: "What the mouse buttons do: popup, popup_setpos, or extend.",
+        },
+        OptionInfo {
+            name: "mousescroll",
+            abbrev: None,
+            kind: Str,
+            scope: Global,
+            doc: "Lines/columns scrolled per mouse-wheel step (ver:n,hor:n).",
+        },
+        OptionInfo {
+            name: "mousetime",
+            abbrev: Some("mouset"),
+            kind: Num,
+            scope: Global,
+            doc: "Maximum time in ms between clicks for a multi-click.",
+        },
+        OptionInfo {
+            name: "fileencodings",
+            abbrev: Some("fencs"),
+            kind: Str,
+            scope: Global,
+            doc: "Encodings tried, in order, when reading a file.",
+        },
+        OptionInfo {
+            name: "scrollanim",
+            abbrev: Some("sca"),
+            kind: Bool,
+            scope: Global,
+            doc: "Animate scrolling smoothly instead of jumping.",
+        },
+        OptionInfo {
+            name: "scrollanimduration",
+            abbrev: Some("scad"),
+            kind: Num,
+            scope: Global,
+            doc: "Duration in ms of a smooth-scroll animation.",
+        },
+        OptionInfo {
+            name: "scrollback",
+            abbrev: Some("scbk"),
+            kind: Num,
+            scope: Global,
+            doc: "Maximum number of lines kept in a terminal buffer's scrollback.",
+        },
+        OptionInfo {
+            name: "errorformat",
+            abbrev: Some("efm"),
+            kind: Str,
+            scope: Global,
+            doc: "Scanf-like patterns used to parse :make / quickfix output.",
+        },
+        OptionInfo {
+            name: "switchbuf",
+            abbrev: Some("swb"),
+            kind: Str,
+            scope: Global,
+            doc: "How to switch buffers for quickfix and jumps (useopen, split, …).",
+        },
+        OptionInfo {
+            name: "makeprg",
+            abbrev: Some("mp"),
+            kind: Str,
+            scope: Global,
+            doc: "Program run by :make.",
+        },
+        OptionInfo {
+            name: "grepprg",
+            abbrev: Some("gp"),
+            kind: Str,
+            scope: Global,
+            doc: "Program run by :grep.",
+        },
+        OptionInfo {
+            name: "grepformat",
+            abbrev: Some("gfm"),
+            kind: Str,
+            scope: Global,
+            doc: "Format of :grep output (like 'errorformat').",
+        },
+    ]
+};
+
+/// The documented option catalog — the single source of truth for what `:set`
+/// accepts. `:set` command-line completion reads this to offer option names with
+/// their docs; [`canonical`] resolves against it.
+pub fn options_catalog() -> &'static [OptionInfo] {
+    OPTIONS
 }
 
 /// Split a `:set` argument string into tokens on **unescaped** whitespace,
@@ -933,72 +1346,12 @@ pub fn resolve_set(tok: &str) -> Option<SetCmd> {
 }
 
 /// Map an option name or its standard abbreviation to its canonical spelling and
-/// kind.
+/// kind by scanning the documented [`OPTIONS`] catalog (the single source of truth,
+/// so the names `:set` accepts can never drift from the names it completes). The
+/// table has ~55 entries, so the linear scan is a microsecond per `:set` token.
 fn canonical(name: &str) -> Option<(&'static str, OptKind)> {
-    use OptKind::{Bool, Num, Str};
-    match name {
-        "number" | "nu" => Some(("number", Bool)),
-        "relativenumber" | "rnu" => Some(("relativenumber", Bool)),
-        "cursorline" | "cul" => Some(("cursorline", Bool)),
-        "wrap" => Some(("wrap", Bool)),
-        "numberwidth" | "nuw" => Some(("numberwidth", Num)),
-        "signcolumn" | "scl" => Some(("signcolumn", Str)),
-        // Window-local wrap polish: indent continuation rows (a plain bool slot) and
-        // the continuation marker string (handled specially in `apply_set_str`).
-        "breakindent" | "bri" => Some(("breakindent", Bool)),
-        "showbreak" | "sbr" => Some(("showbreak", Str)),
-        "breakindentopt" | "briopt" => Some(("breakindentopt", Str)),
-        "fillchars" | "fcs" => Some(("fillchars", Str)),
-        // nxvim's own per-window content margin (no vim equivalent); a CSS-style
-        // shorthand string handled specially in `apply_set_str`.
-        "padding" | "pad" => Some(("padding", Str)),
-        "ignorecase" | "ic" => Some(("ignorecase", Bool)),
-        "smartcase" | "scs" => Some(("smartcase", Bool)),
-        "wrapscan" | "ws" => Some(("wrapscan", Bool)),
-        "hlsearch" | "hls" => Some(("hlsearch", Bool)),
-        "incsearch" | "is" => Some(("incsearch", Bool)),
-        "autoread" | "ar" => Some(("autoread", Bool)),
-        "imagepreview" | "imgp" => Some(("imagepreview", Bool)),
-        "tabstop" | "ts" => Some(("tabstop", Num)),
-        "shiftwidth" | "sw" => Some(("shiftwidth", Num)),
-        "softtabstop" | "sts" => Some(("softtabstop", Num)),
-        "expandtab" | "et" => Some(("expandtab", Bool)),
-        "sidescroll" | "ss" => Some(("sidescroll", Num)),
-        "sidescrolloff" | "siso" => Some(("sidescrolloff", Num)),
-        "showtabline" | "stal" => Some(("showtabline", Num)),
-        "laststatus" | "ls" => Some(("laststatus", Num)),
-        "statusline" | "stl" => Some(("statusline", Str)),
-        "tabline" | "tal" => Some(("tabline", Str)),
-        "guifont" | "gfn" => Some(("guifont", Str)),
-        "mouse" => Some(("mouse", Str)),
-        "mousemodel" | "mousem" => Some(("mousemodel", Str)),
-        "mousescroll" => Some(("mousescroll", Str)),
-        "mousetime" | "mouset" => Some(("mousetime", Num)),
-        "regexsyntax" | "rxs" => Some(("regexsyntax", Str)),
-        // Buffer-local: the on-disk charset (handled specially in `apply_set_str`).
-        "fileencoding" | "fenc" => Some(("fileencoding", Str)),
-        // Global: the read-detection list (handled specially in `apply_set_str`).
-        "fileencodings" | "fencs" => Some(("fileencodings", Str)),
-        // Buffer-local: whether to write a BOM (a plain bool slot).
-        "bomb" => Some(("bomb", Bool)),
-        // Buffer-local: whether the buffer may be edited (a plain bool slot).
-        "modifiable" | "ma" => Some(("modifiable", Bool)),
-        "scrollanim" | "sca" => Some(("scrollanim", Bool)),
-        "scrollanimduration" | "scad" => Some(("scrollanimduration", Num)),
-        "scrollback" | "scbk" => Some(("scrollback", Num)),
-        "errorformat" | "efm" => Some(("errorformat", Str)),
-        "switchbuf" | "swb" => Some(("switchbuf", Str)),
-        "makeprg" | "mp" => Some(("makeprg", Str)),
-        "grepprg" | "gp" => Some(("grepprg", Str)),
-        "grepformat" | "gfm" => Some(("grepformat", Str)),
-        // Buffer-local: drives the treesitter language override rather than a
-        // global string slot (handled specially in `apply_set_str`).
-        "filetype" | "ft" => Some(("filetype", Str)),
-        "commentstring" | "cms" => Some(("commentstring", Str)),
-        // Buffer-local: whether treesitter paints this buffer — the *whether* noun,
-        // orthogonal to `filetype` (the language). Handled specially in
-        // `apply_set_bool` (the per-buffer enable map, not an `options` slot).
-        "ts_highlight" => Some(("ts_highlight", Bool)),
-        _ => None,
-    }
+    OPTIONS
+        .iter()
+        .find(|o| o.name == name || o.abbrev == Some(name))
+        .map(|o| (o.name, o.kind))
 }

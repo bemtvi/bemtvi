@@ -43,9 +43,19 @@
 --   :Greet<Tab>        the `:Greet` command registered below shows in the list, and
 --                      its `desc` is the docs float text — no extra wiring
 --
--- Command NAMES + docs (built-ins and user commands). Argument completion (`:e
--- <file>`, `:set <opt>`, … — a later, pure-Lua extension; the source already
--- receives the whole line + cursor) is not in this phase.
+-- ARGUMENT COMPLETION — option names after `:set` (with docs):
+--   :set <Tab>         float the WHOLE option catalog (every settable option)
+--   :set nu<Tab>       narrow to options matching `nu` (number, numberwidth, …)
+--   :setlocal ts<Tab>  `:setlocal` shares the option-argument completer
+--   <Tab>              highlight a row — the docs float shows the option's name +
+--                      abbreviation, its scope + kind, and a one-line description
+--   <CR>               accept the highlighted option name into the line (you then
+--                      finish it, e.g. `:set tabstop=4`)
+--
+-- The completer dispatches on the command word: `:set`/`:setlocal` arguments
+-- complete option names (sourced from core's documented catalog — the same single
+-- source of truth `:set` itself accepts, so the two can never drift); other
+-- commands' arguments have no completer yet, so the wildmenu just stays closed.
 
 -- Command-line completion is ON BY DEFAULT in the interactive editor, so this call
 -- is optional — it's here to TUNE the engine. A bare `setup {}` is the default

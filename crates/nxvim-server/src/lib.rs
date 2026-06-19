@@ -1828,6 +1828,23 @@ where
     }
     let lua =
         LuaRuntime::new(init.runtimepath).map_err(|e| anyhow::anyhow!("lua init failed: {e}"))?;
+    // Inject the documented option catalog from core (the single source of truth)
+    // into the Lua runtime, so the bundled `nx.cmdline_complete` source can offer
+    // option names with their docs after `:set`. The server is the integrator here —
+    // nxvim-lua stays decoupled from editor-core types, so the catalog crosses as
+    // plain `OptionCatalogRow` data. Done before any `init.lua` runs.
+    let option_rows: Vec<nxvim_lua::OptionCatalogRow> = nxvim_core::options::options_catalog()
+        .iter()
+        .map(|o| nxvim_lua::OptionCatalogRow {
+            name: o.name.to_string(),
+            abbrev: o.abbrev.map(str::to_string),
+            kind: o.kind.as_str().to_string(),
+            scope: o.scope.as_str().to_string(),
+            doc: o.doc.to_string(),
+        })
+        .collect();
+    lua.set_options_catalog(&option_rows)
+        .map_err(|e| anyhow::anyhow!("option catalog init failed: {e}"))?;
     // Where the event-loop actor runs off-tick `nx.fs` ops (the ONLY fs surface — there
     // are no synchronous editor-thread fs callers anymore). A bare/local session runs
     // them against a local `StdLuaFs` on the actor's blocking pool; the edit-host split

@@ -204,15 +204,9 @@ local function append_user_commands(out, seen)
   add(nx.user_command.get())
 end
 
--- nx._cmdline_complete_run(line, col): the candidate source the server calls
--- synchronously per `<Tab>` (and each edit while the wildmenu is open). It returns
--- the candidate list — a `{ {label, insert[, doc]}, ... }` array — and core
--- fuzzy-ranks it against the command-name token it extracted (core only calls this
--- when the cursor is within the command name, never in its arguments). The candidate
--- set is the curated built-in catalog plus the registered user commands; `line` /
--- `col` drive argument completion in a later phase (`_line` / `_col` unused until
--- then).
-function nx._cmdline_complete_run(_line, _col)
+-- The candidate set for the **command name** itself: the curated built-in catalog
+-- plus the registered user commands.
+local function command_candidates()
   local out = {}
   local seen = {}
   for _, cmd in ipairs(BUILTIN) do
@@ -229,4 +223,60 @@ function nx._cmdline_complete_run(_line, _col)
   end
   append_user_commands(out, seen)
   return out
+end
+
+-- The `:set`-family commands whose arguments are option names. All four share the
+-- same `ex_set` handler in core (`editor/ex.rs`); `:setfiletype` completes filetypes,
+-- not options, so it is deliberately excluded.
+local SET_COMMANDS = { set = true, se = true, setlocal = true, setl = true }
+
+-- Friendlier spellings for the docs pane's metadata line.
+local KIND_LABEL = { bool = "boolean", number = "number", string = "string" }
+local SCOPE_LABEL = { global = "global", window = "window-local", buffer = "buffer-local" }
+
+-- The candidate set for an option name (the argument of `:set` / `:setlocal`): every
+-- option from core's injected catalog (`nx._options_catalog`, the single source of
+-- truth — it can never drift from what `:set` accepts). The canonical name is the
+-- label/insert (vim completes `:set nu` to `number`; the abbreviation still matches
+-- via fuzzy ranking and is shown in the docs). The docs pane heads with the name +
+-- abbreviation, then a `scope, kind` line, then the one-line description.
+local function option_candidates()
+  local out = {}
+  for _, opt in ipairs(nx._options_catalog or {}) do
+    local header = opt.name
+    if opt.abbrev then
+      header = header .. " (" .. opt.abbrev .. ")"
+    end
+    local meta = (SCOPE_LABEL[opt.scope] or opt.scope) .. ", " .. (KIND_LABEL[opt.kind] or opt.kind)
+    out[#out + 1] = {
+      label = opt.name,
+      insert = opt.name,
+      doc = header .. "\n" .. meta .. "\n\n" .. opt.doc,
+    }
+  end
+  return out
+end
+
+-- nx._cmdline_complete_run(line, col): the candidate source the server calls
+-- synchronously per `<Tab>` (and each edit while the wildmenu is open). It returns
+-- the candidate list — a `{ {label, insert[, doc]}, ... }` array — and core
+-- fuzzy-ranks it against the token it extracted. Core completes either the leading
+-- command name or, once whitespace separates it, the current argument word; this
+-- source picks the candidate set from `line` / `col`:
+--   * still in the command name  → the command catalog (built-ins + user commands);
+--   * in a `:set` argument        → option names (with docs);
+--   * any other command's args    → nothing yet (core closes the menu).
+function nx._cmdline_complete_run(line, col)
+  -- Argument region iff a complete word is followed by whitespace before the cursor.
+  -- The command word and its trailing space are ASCII, so this byte scan of the
+  -- char-offset-truncated prefix is exact for the only structure we test.
+  local before = line:sub(1, col)
+  if before:match("%S+%s") then
+    local cmd = line:match("(%a%w*)") -- the first word — the command name
+    if cmd and SET_COMMANDS[cmd] then
+      return option_candidates()
+    end
+    return {} -- no argument completer for this command yet
+  end
+  return command_candidates()
 end

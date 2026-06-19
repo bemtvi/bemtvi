@@ -42,8 +42,9 @@ pub struct CmdlineCompleteReq {
     pub line: String,
     /// The command cursor as a char offset (for the source's context decision).
     pub col: usize,
-    /// The token being completed — the leading command name typed so far. Core
-    /// fuzzy-ranks the catalog labels against this.
+    /// The token being completed — the command name, or (once whitespace separates
+    /// it) the current argument word. Core fuzzy-ranks the catalog labels against
+    /// this.
     pub prefix: String,
     /// Byte offset in [`Editor::cmdline`] where the token starts. Accepting a row
     /// replaces `[anchor .. cmdline_col)` with the chosen command (Phase 2).
@@ -75,15 +76,17 @@ impl Editor {
     /// `<Tab>` (the `complete` cmdline action) / a content edit while the menu is
     /// open: compute the token being completed and queue a [`CmdlineCompleteReq`]
     /// for the server to resolve against the catalog. A no-op (closing any open
-    /// cmdline menu) when the engine is disabled, the line is not an ex command line,
-    /// or the cursor is past the command name (argument territory — Phase 1 offers
-    /// names only).
+    /// cmdline menu) when the engine is disabled or the line is not an ex command
+    /// line. The token is either the leading command name or — once whitespace
+    /// separates it — the current argument word (the source decides what to offer
+    /// for it from the whole `line`; `:set` arguments complete option names, other
+    /// commands' arguments return nothing yet, which closes the menu).
     pub(crate) fn cmdline_complete_trigger(&mut self) {
         if !self.cmdcomplete.enabled || !matches!(self.cmdline_kind, CmdlineKind::Ex) {
             self.close_cmdline_menu();
             return;
         }
-        let Some((anchor, anchor_width, prefix)) = self.cmdline_command_token() else {
+        let Some((anchor, anchor_width, prefix)) = self.cmdline_complete_token() else {
             self.close_cmdline_menu();
             return;
         };
@@ -156,20 +159,30 @@ impl Editor {
         true
     }
 
-    /// The leading **command-name** token of the ex command line left of the cursor,
-    /// as `(anchor_byte, anchor_display_width, prefix)`. The command name is the run
-    /// of chars from the first ASCII-alphabetic char (after an optional leading range
-    /// `'<,'>` / `%` / `1,$` …) up to the cursor. `None` when whitespace separates
-    /// the command name from the cursor — the cursor is in the command's arguments,
-    /// which Phase 1 does not complete.
-    fn cmdline_command_token(&self) -> Option<(usize, usize, String)> {
+    /// The token being completed in the ex command line left of the cursor, as
+    /// `(anchor_byte, anchor_display_width, prefix)`. Two cases:
+    ///
+    /// - **No whitespace yet** (still typing the command name): the token runs from
+    ///   the first ASCII-alphabetic char (after an optional leading range `'<,'>` /
+    ///   `%` / `1,$` …) up to the cursor. `None` when there is no command name yet.
+    /// - **Whitespace seen** (in the arguments): the token is the current argument
+    ///   word — from just after the last whitespace up to the cursor (empty when the
+    ///   cursor sits right after a space, so `:set <Tab>` offers every option). The
+    ///   source decides what to offer for it from the whole `line`.
+    ///
+    /// `anchor` is the byte offset of the token start; accepting a row replaces
+    /// `[anchor .. cmdline_col)`.
+    fn cmdline_complete_token(&self) -> Option<(usize, usize, String)> {
         let upto = &self.cmdline[..self.cmdline_col];
-        let start = upto.find(|c: char| c.is_ascii_alphabetic())?;
-        let token = &upto[start..];
-        if token.contains(char::is_whitespace) {
-            return None;
-        }
+        // An argument word: everything after the last run of whitespace. `rfind`
+        // lands on the last whitespace char; the token starts just past it.
+        let start = if let Some(ws) = upto.rfind(char::is_whitespace) {
+            ws + upto[ws..].chars().next().map_or(1, char::len_utf8)
+        } else {
+            // The command name (no whitespace yet): skip a leading range.
+            upto.find(|c: char| c.is_ascii_alphabetic())?
+        };
         let anchor_width = crate::unicode::display_width(&upto[..start]);
-        Some((start, anchor_width, token.to_string()))
+        Some((start, anchor_width, upto[start..].to_string()))
     }
 }

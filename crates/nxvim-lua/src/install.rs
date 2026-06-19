@@ -1868,6 +1868,16 @@ pub(crate) fn install_runtime_api(
             Ok(())
         })?,
     )?;
+    // `nx._options_catalog`: the documented option catalog (an array of
+    // `{ name, abbrev, kind, scope, doc }` tables). Populated by the server at
+    // startup from core's single source of truth
+    // (`nxvim_core::options::options_catalog()`) via
+    // [`crate::LuaRuntime::set_options_catalog`] — nxvim-lua stays decoupled from
+    // core, so the data is injected rather than read directly. The bundled
+    // `nx.cmdline_complete` source reads it to offer option names (with their docs)
+    // after `:set`, so the completion list can never drift from the names `:set`
+    // actually accepts. An empty table until the server populates it.
+    nx.set("_options_catalog", lua.create_table()?)?;
 
     // `nx._statusline_setup(win, kind, left, right)`: queue a `nx.statusline.setup{}`
     // / `reset()` request ([`StatuslineSetupReq`]). `win` is `nil` for the global

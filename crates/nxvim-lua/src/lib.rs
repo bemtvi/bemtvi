@@ -43,5 +43,5 @@ pub use ops::{
 };
 pub use runtime::{
     BoMirror, BufBytesEdit, BufMirror, ExtmarkMirror, FloatMirror, GoMirror, HlDefMirror,
-    JumpMirror, LuaRuntime, QfMirror, TabMirror, WindowMirror,
+    JumpMirror, LuaRuntime, OptionCatalogRow, QfMirror, TabMirror, WindowMirror,
 };

@@ -682,6 +682,24 @@ fn fs_value_to_lua(lua: &Lua, value: FsValue) -> mlua::Result<mlua::Value> {
     })
 }
 
+/// One option's documented metadata, as plain strings for
+/// [`LuaRuntime::set_options_catalog`]. The server builds these from core's
+/// `nxvim_core::options::options_catalog()` (the single source of truth) and hands
+/// them in, keeping nxvim-lua decoupled from the editor-core types.
+#[derive(Clone, Debug)]
+pub struct OptionCatalogRow {
+    /// Canonical spelling, e.g. `"number"`.
+    pub name: String,
+    /// Standard abbreviation, e.g. `Some("nu")`, or `None`.
+    pub abbrev: Option<String>,
+    /// `"bool"` / `"number"` / `"string"`.
+    pub kind: String,
+    /// `"global"` / `"window"` / `"buffer"`.
+    pub scope: String,
+    /// One-line help shown in the `:set` completion docs pane.
+    pub doc: String,
+}
+
 /// An embedded Lua VM with nxvim's `vim` global installed.
 ///
 /// `!Send` (Lua state is thread-local); it lives on the server's single thread.
@@ -1345,6 +1363,29 @@ impl LuaRuntime {
             out.push((label, insert, doc));
         }
         Ok(out)
+    }
+
+    /// Populate `nx._options_catalog` with the documented option catalog, so the
+    /// bundled `nx.cmdline_complete` source can offer option names (with docs) after
+    /// `:set`. The server calls this once at startup from core's single source of
+    /// truth (`nxvim_core::options::options_catalog()`); nxvim-lua stays decoupled
+    /// from core, so the rows arrive as plain [`OptionCatalogRow`] data rather than
+    /// core types. Each `rows` entry becomes a `{ name, abbrev, kind, scope, doc }`
+    /// Lua table.
+    pub fn set_options_catalog(&self, rows: &[OptionCatalogRow]) -> mlua::Result<()> {
+        let nx = self.nx()?;
+        let list = self.lua.create_table()?;
+        for (i, r) in rows.iter().enumerate() {
+            let row = self.lua.create_table()?;
+            row.set("name", r.name.as_str())?;
+            row.set("abbrev", r.abbrev.as_deref())?;
+            row.set("kind", r.kind.as_str())?;
+            row.set("scope", r.scope.as_str())?;
+            row.set("doc", r.doc.as_str())?;
+            list.set(i + 1, row)?;
+        }
+        nx.set("_options_catalog", list)?;
+        Ok(())
     }
 
     /// Whether any `nx.decor` provider is registered — the gate the server checks

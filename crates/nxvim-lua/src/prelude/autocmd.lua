@@ -122,11 +122,30 @@ function nx._cleanup_buffer(bufnr)
   nx._purge_buf_keymaps(bufnr)
 end
 
--- nx.augroup.create(name[, {clear=…}]) [alias nvim_create_augroup]: define (or
--- look up) an augroup. When the group already exists and `clear` is set (the
--- default), its autocmds are removed first — so re-sourcing a config that
--- recreates its groups doesn't double-register. The group id is stable across
--- recreation (callers store it and pass it as `opts.group` to nx.autocmd.create).
+-- nx.augroup.create(name, opts) -> id [alias nvim_create_augroup]: define (or look
+-- up) an autocommand group and return its numeric id. An augroup is just a named
+-- bucket for autocmds: pass the returned id as `opts.group` to nx.autocmd.create so
+-- the whole set can be cleared and re-registered as a unit.
+--
+-- Arguments:
+--   * `name` — the group name (string). Calling create again with the same name
+--     returns the SAME id; the id is stable across recreation, so it's safe to store.
+--   * `opts.clear` — when the group already exists, whether to remove its existing
+--     autocmds first. Defaults to TRUE (matching neovim). This is what makes
+--     re-sourcing your config idempotent: a config that does
+--     `nx.augroup.create("MyGroup")` on every load clears the previous run's autocmds
+--     instead of double-registering them. Pass `{ clear = false }` to keep them
+--     (the augroup-block / `:augroup` ex-command path uses this to append).
+--
+-- The idiomatic pattern — own a group, then hang autocmds off it:
+--
+-- ```lua
+-- local grp = nx.augroup.create("MyConfig")                 -- clears on re-source
+-- nx.autocmd.create("BufEnter", {
+--   group = grp,                                            -- numeric id, or "MyConfig"
+--   callback = function(ev) nx.notify("entered " .. (ev.file or "[No Name]")) end,
+-- })
+-- ```
 function nx.augroup.create(name, opts)
   opts = opts or {}
   local clear = opts.clear ~= false -- absent → clear, matching neovim's default
@@ -145,11 +164,38 @@ function nx.augroup.create(name, opts)
   return id
 end
 
--- nx.autocmd.create(event, opts) [alias nvim_create_autocmd]: register a
--- callback/command for `event`. `opts.group` (numeric id or augroup name) ties it
--- to a group so a later `clear` can drop it; `opts.buffer` makes it buffer-local
--- (only fires for that buffer; 0 resolves to the current snapshot buffer at
--- registration time).
+-- nx.autocmd.create(event, opts) -> id [alias nvim_create_autocmd]: run something
+-- whenever `event` fires. Returns the autocmd's numeric id (pass it to
+-- nx.autocmd.del to remove it). `event` is an event name (`"FileType"`,
+-- `"BufEnter"`, …) or a list of names to share one handler — see the
+-- [autocommand events](../plugins/autocmd-events.md) reference for the events
+-- nxvim emits and what each carries.
+--
+-- `opts` fields:
+--   * `callback` — a function run when the event fires; OR `command` — an
+--     ex-command string queued instead. Provide one of the two.
+--   * `pattern` — a glob (or list of globs) the event's match string is tested
+--     against (e.g. `"*.lua"`, `{ "*.c", "*.h" }`). Omitted / `"*"` matches all.
+--   * `group` — an augroup, by numeric id or by name (see nx.augroup.create). Ties
+--     this autocmd to the group so a later `clear` of that group drops it.
+--   * `buffer` — make it buffer-local: it then fires only for that buffer (and
+--     `pattern` is ignored). `0` resolves to the current buffer at registration time.
+--   * `once` — fire once, then auto-remove. `desc` — a human description.
+--
+-- The `callback` receives one table describing the event:
+--   `{ id, event, match, buf, file, data }` — `id` this autocmd's id, `event` the
+--   event name, `match` the matched pattern string, `buf` the buffer number, `file`
+--   its name, and `data` an event-specific payload (e.g. LspAttach carries
+--   `{ client_id = … }`), nil for most events.
+--
+-- ```lua
+-- nx.autocmd.create("FileType", {
+--   pattern = "markdown",
+--   callback = function(ev)
+--     nx.bo[ev.buf].textwidth = 80
+--   end,
+-- })
+-- ```
 function nx.autocmd.create(event, opts)
   opts = opts or {}
   autocmd_seq = autocmd_seq + 1

@@ -492,7 +492,6 @@ nx.promise = M
 -- boundary, so this works on nxvim's 5.4 backend), or let it propagate to the
 -- coroutine edge (the returned promise rejects, caught by `:catch` on the result)
 -- or attach `:catch` to the awaited promise itself.
-
 function nx.async(fn)
   if not is_callable(fn) then
     error("nx.async: argument must be a function", 2)

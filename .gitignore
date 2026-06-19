@@ -2,6 +2,7 @@
 **/*.rs.bk
 *.pdb
 .claude
+.playwright-mcp
 
 # LSP end-to-end suite (scripts/lsp-e2e): downloaded/hash-verified servers and the
 # node_modules the npm-based servers + eslint fixture install into. All regenerated

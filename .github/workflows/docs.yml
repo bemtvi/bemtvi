@@ -1,0 +1,72 @@
+# Build "The nxvim Book" and deploy it to GitHub Pages.
+#
+# The book is GENERATED FROM SOURCE: book/gen/generate.py imports the curated
+# docs/*.md (rewriting links) and extracts the nx.* API reference from the Lua
+# prelude, then renders src/SUMMARY.md. Generated files are git-ignored, so this
+# workflow regenerates them before every build — the prelude is the source of
+# truth and the published site cannot drift from the code.
+#
+# ONE-TIME SETUP (repo admin, in the GitHub UI): Settings -> Pages -> "Build and
+# deployment" -> Source: "GitHub Actions". No branch or gh-pages setup needed.
+
+name: docs
+
+on:
+  push:
+    branches: [main]
+    # Only rebuild when something the book is generated from changes.
+    paths:
+      - "book/**"
+      - "docs/**"
+      - "crates/nxvim-lua/src/prelude/**"
+      - ".github/workflows/docs.yml"
+  workflow_dispatch:
+
+# Permissions the deploy-pages action needs.
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# Allow one concurrent deployment; don't cancel an in-flight one mid-publish.
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+env:
+  MDBOOK_VERSION: 0.5.3
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install mdBook
+        run: |
+          url="https://github.com/rust-lang/mdBook/releases/download/v${MDBOOK_VERSION}/mdbook-v${MDBOOK_VERSION}-x86_64-unknown-linux-gnu.tar.gz"
+          curl -sSL "$url" | tar -xz --directory=/usr/local/bin
+          mdbook --version
+
+      - name: Generate book sources from the repo
+        run: python3 book/gen/generate.py
+
+      - name: Build the book
+        run: mdbook build book
+
+      - uses: actions/configure-pages@v5
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: book/book
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4

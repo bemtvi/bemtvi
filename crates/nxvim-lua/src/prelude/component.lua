@@ -368,12 +368,67 @@ local BACKENDS = { view = view_backend, float = float_backend }
 
 -- ----- nx.component: the generic core ---------------------------------------------------
 
--- nx.component(def) -> { mount(opts) }. `def.render` is required; `def.setup` optional.
--- The surface is `def.backend` (a `function(opts) -> adapter`), or `def.surface`
--- ("view" default | "float") to pick a built-in. `mount(opts)` instantiates: `opts.props`
--- is handed to `setup`, and the rest of `opts` configures the surface (view: name /
--- filetype / dock / split / float; float: title / relative / border). Returns the instance
--- (with `:close()`).
+-- nx.component(def) -> { mount(opts) } — build a reactive, Vue-shaped UI component for
+-- a plugin surface, then `:mount()` one or more instances of it. The reactive core is
+-- surface-agnostic: the same component can drive a focus-taking buffer or a passive
+-- float, chosen per `def` / `mount`.
+--
+-- `def` is a table:
+--   * `render(state, inst)` — REQUIRED and PURE. Maps the current state to what's on
+--     screen and returns the surface's output (see Surfaces). The framework re-runs it
+--     automatically whenever reactive state changes, coalesced to ONE render per tick.
+--     May be async (call `nx.await(...)` straight inside it).
+--   * `setup(ctx, props)` — OPTIONAL; runs ONCE on mount and owns every side effect —
+--     it creates reactive state, subscribes to events, binds keys, fetches data — and
+--     RETURNS the `state` value handed to `render`. Runs only after the surface is
+--     ready, so everything on `ctx` is already valid (no tick-dance). May be async.
+--   * `surface` — `"view"` (default) or `"float"`; or pass `backend`
+--     (a `function(opts) -> adapter`) to render to a custom surface.
+--
+-- The `ctx` handed to `setup` carries the reactivity and lifecycle:
+--   * `ctx.reactive(tbl)` — a deep reactive proxy; writing any key (`s.x = 1`) schedules
+--     a re-render. Iterate with `ipairs` / `#` (NOT `pairs` — PUC 5.4 has no `__pairs`).
+--   * `ctx.computed(getter)` — a cached derived value, read as `c()` or `c.value`; it
+--     re-evaluates only when a reactive input it read last time has changed.
+--   * `ctx.refresh()` — force a re-render. `ctx.props` — the `opts.props` from `mount`.
+--   * `ctx.on_close(fn)` / `ctx.close()` — register a teardown hook / close the instance.
+--   On the "view" surface `ctx` also gains: `ctx.view`, `ctx.bufnr()`, `ctx.winid()`,
+--   `ctx.line()`, `ctx.set_cursor(n)`, `ctx.bo` / `ctx.wo` (the view's buffer/window-local
+--   option tables), and `ctx.keymap_set(mode, lhs, rhs, opts)` (buffer-scoped + `nowait`
+--   by default).
+--
+-- Surfaces — what `render` returns, and how the surface behaves:
+--   * "view"  — a focus-taking, navigable `nx.view` buffer (dock / split / grabbing
+--     float): the file-tree / list / modal-dialog case. `render` returns
+--     `{ lines, decor }` (or a bare line list). `nx.view.component(def)` is the sugar.
+--   * "float" — a NON-focus `nx.ui.float` content float (the which-key surface): never
+--     steals focus, binds no keys. `render` returns `{ lines, title?, relative?, border? }`;
+--     an EMPTY render HIDES the float (a later non-empty one re-opens it), so a component
+--     shows/hides purely by what it returns. Only one float component may display at once
+--     (a second fails loud rather than clobbering the single content-float slot).
+--
+-- `mount(opts)` instantiates and returns the instance (with `:close()`). `opts.props` is
+-- passed to `setup`; the rest configures the surface — view: `name` / `filetype` / `dock`
+-- / `split` / `float` (and `eob` to keep end-of-buffer tildes); float: `title` /
+-- `relative` / `border`. Render errors and setup errors are caught and surfaced via
+-- `nx.notify` rather than crashing the editor.
+--
+-- Example — a live-updating counter in a floating view:
+--
+-- ```lua
+-- local Counter = nx.component({
+--   setup = function(ctx)
+--     local s = ctx.reactive({ n = 0 })
+--     ctx.keymap_set("n", "+", function() s.n = s.n + 1 end)  -- write -> re-render
+--     ctx.keymap_set("n", "q", ctx.close)
+--     return s
+--   end,
+--   render = function(s)
+--     return { lines = { "count: " .. s.n, "", "+ to increment · q to quit" } }
+--   end,
+-- })
+-- Counter.mount({ float = { width = 30, height = 4, grab = true } })
+-- ```
 function nx.component(def)
   assert(type(def) == "table", "nx.component: pass a { setup, render } table")
   assert(type(def.render) == "function", "nx.component: a render function is required")

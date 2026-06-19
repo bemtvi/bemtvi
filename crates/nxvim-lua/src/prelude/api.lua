@@ -33,11 +33,10 @@ nx.ns = nx.ns or {}
 -- The local alias keeps this file's many window call sites terse.
 local resolve_win = nx._resolve_win
 
--- nvim_buf_get_name(bufnr): the snapshot buffer's name when `bufnr` is 0/nil or
--- matches the snapshot, else "". Snapshot-backed (nx._cur_buf) as an interim
--- until a real per-bufnr registry exists. (A separate, core-backed
--- nvim_buf_get_name *RPC* method serves remote clients; this is the in-VM Lua
--- binding autocmd callbacks reach for.)
+-- nx.buf.name(bufnr) -> string [alias nvim_buf_get_name / vim.fn.bufname]: the full
+-- name (path) of buffer `bufnr`; `0` / nil means the current buffer. Returns "" for
+-- an unnamed or unknown buffer. Read from the buffer mirror, so it can name any open
+-- buffer — e.g. a custom 'tabline' labelling a buffer shown in another tab.
 function nx.buf.name(bufnr)
   local cur = nx._cur_buf or { bufnr = 0, name = "" }
   if bufnr == nil or bufnr == 0 or bufnr == cur.bufnr then
@@ -50,14 +49,14 @@ function nx.buf.name(bufnr)
   return (b and b.name) or ""
 end
 
--- A few more vim.api the configs touch. `nvim_get_current_buf` resolves against
--- the single-buffer snapshot (faithful: it returns the real current buffer). The
--- window/cursor/line-access *getters* read the `nx._bufs` / `nx._cur_*` mirror the
--- server refreshes before running Lua, so they return live state. (There is no
--- matching *write* surface — `nvim_buf_set_lines` and the rest of the mutation API
--- are intentionally absent, per this file's header.)
--- (`nvim_create_augroup`/`_autocmd`/`nvim_buf_get_name`/`nvim_echo` are the real,
--- behavior-carrying ones, defined elsewhere.)
+-- The buffer / window / cursor getters read the `nx._bufs` / `nx._cur_*` mirror the
+-- server refreshes before each Lua entry, so they return live state as of the start
+-- of this chunk. There is deliberately no buffer *mutation* surface here (no
+-- `nx.buf.set_lines`): plugins supply data through the higher-level surfaces, per
+-- this file's header. Throughout, a `bufnr` of `0` / nil means the current buffer.
+--
+-- nx.buf.current() -> bufnr [alias nvim_get_current_buf]: the current buffer's
+-- number (`0` if there is none).
 function nx.buf.current()
   return (nx._cur_buf or {}).bufnr or 0
 end
@@ -166,6 +165,10 @@ function nx.win.call(win, fn)
   return ret
 end
 
+-- nx.buf.call(buf, fn) -> any [alias nvim_buf_call]: run `fn` with `buf` (0/nil =
+-- current) installed as the current-buffer context, then restore the previous
+-- context and return whatever `fn` returned. Use it so buffer-relative lookups
+-- inside `fn` (name, options) resolve against `buf`. An error in `fn` propagates.
 function nx.buf.call(buf, fn)
   buf = nx._resolve_bufnr(buf)
   local saved_buf = nx._cur_buf
@@ -264,26 +267,31 @@ function nx.win.config(win)
   return cfg
 end
 
+-- nx.buf.is_loaded(bufnr) -> bool [alias nvim_buf_is_loaded]: whether `bufnr` (0/nil
+-- = current) names a buffer that is loaded into memory. Backed by the buffer mirror,
+-- which carries every loaded buffer.
 function nx.buf.is_loaded(bufnr)
   return nx._bufs[nx._resolve_bufnr(bufnr)] ~= nil
 end
 
--- nvim_buf_is_valid: whether the handle names a buffer nxvim knows about. With no
--- separate "valid but unloaded" notion in the snapshot mirror yet, this matches
--- is_loaded (every mirrored buffer is loaded).
+-- nx.buf.is_valid(bufnr) -> bool [alias nvim_buf_is_valid]: whether `bufnr` (0/nil =
+-- current) names a buffer nxvim knows about. There is no separate "valid but
+-- unloaded" state in the mirror yet, so this currently matches nx.buf.is_loaded.
 function nx.buf.is_valid(bufnr)
   return nx._bufs[nx._resolve_bufnr(bufnr)] ~= nil
 end
 
--- nvim_buf_line_count: number of lines in the buffer snapshot.
+-- nx.buf.line_count(bufnr) -> integer [alias nvim_buf_line_count]: the number of
+-- lines in `bufnr` (0/nil = current); `0` for an unknown buffer.
 function nx.buf.line_count(bufnr)
   local buf = nx._bufs[nx._resolve_bufnr(bufnr)]
   return (buf and buf.lines) and #buf.lines or 0
 end
 
--- nvim_buf_get_offset: byte offset of the start of (0-based) line `index`, i.e.
--- the sum of every preceding line's bytes plus its newline. `index == line_count`
--- yields the buffer's total byte length.
+-- nx.buf.offset(bufnr, index) -> integer [alias nvim_buf_get_offset]: the byte
+-- offset at which 0-based line `index` starts — the sum of every preceding line's
+-- bytes plus its newline. `index == line_count` gives the buffer's total byte
+-- length. Returns `-1` for an unknown buffer.
 function nx.buf.offset(bufnr, index)
   local buf = nx._bufs[nx._resolve_bufnr(bufnr)]
   if not buf or not buf.lines then
@@ -297,9 +305,11 @@ function nx.buf.offset(bufnr, index)
   return off
 end
 
--- nvim_buf_get_text: the text in the (0-based, end-exclusive) byte range
--- [start_row,start_col)..[end_row,end_col), returned as a list of lines (the span
--- split on newlines). Columns are byte indices into their line.
+-- nx.buf.text(bufnr, start_row, start_col, end_row, end_col[, opts]) -> lines [alias
+-- nvim_buf_get_text]: the text of `bufnr` spanning (start_row, start_col) up to
+-- (end_row, end_col), returned as a list of lines (the span split on newlines). Rows
+-- are 0-based; columns are 0-based byte indices into their line; the end position is
+-- exclusive. Use this for a sub-line span — use nx.buf.lines for whole lines.
 function nx.buf.text(bufnr, start_row, start_col, end_row, end_col, _opts)
   local buf = nx._bufs[nx._resolve_bufnr(bufnr)]
   if not buf or not buf.lines then
@@ -317,6 +327,12 @@ function nx.buf.text(bufnr, start_row, start_col, end_row, end_col, _opts)
   return out
 end
 
+-- nx.buf.lines(bufnr, start, end_[, strict]) -> lines [alias nvim_buf_get_lines]:
+-- the lines of `bufnr` (0/nil = current) in the 0-based, end-EXCLUSIVE range
+-- [start, end_). Negative indices count back from the end (`-1` is one past the last
+-- line), so `(0, -1)` is the whole buffer. With `strict` true an out-of-range index
+-- errors; otherwise indices clamp into range. Returns a list of strings, each
+-- without its trailing newline.
 function nx.buf.lines(bufnr, start, end_, strict)
   local buf = nx._bufs[nx._resolve_bufnr(bufnr)]
   if not buf or not buf.lines then
@@ -415,9 +431,13 @@ local EXTMARK_OPT_DECORATION = {
   invalidate = true,
 }
 
--- nvim_buf_set_extmark(buffer, ns, line, col, opts) -> id. `line`/`col` are
--- 0-based (col a byte offset). Returns the (allocated or given) mark id. Queues
--- the real mutation for the server, which converts positions to byte offsets.
+-- nx.buf.set_extmark(buffer, ns, line, col[, opts]) -> id [alias
+-- nvim_buf_set_extmark]: place (or update, via `opts.id`) an extmark in `buffer`
+-- under namespace `ns` (see nx.ns.create) at 0-based `line` / `col` (col a byte
+-- offset). `opts` carries the highlight-relevant attrs — `end_row` / `end_col` for a
+-- ranged mark, `hl_group`, `priority`, … — and an unsupported decoration key fails
+-- loud rather than being ignored. Returns the mark id. The mutation is queued for
+-- the server, but the mirror is written through, so a read later in this chunk sees it.
 function nx.buf.set_extmark(buffer, ns, line, col, opts)
   local b = nx._resolve_bufnr(buffer)
   opts = opts or {}
@@ -469,7 +489,8 @@ function nx.buf.set_extmark(buffer, ns, line, col, opts)
   return mark_id
 end
 
--- nvim_buf_del_extmark(buffer, ns, id) -> bool (whether it existed).
+-- nx.buf.del_extmark(buffer, ns, id) -> bool [alias nvim_buf_del_extmark]: remove
+-- mark `id` of namespace `ns` from `buffer`. Returns whether the mark existed.
 function nx.buf.del_extmark(buffer, ns, id)
   local b = nx._resolve_bufnr(buffer)
   local marks = nx._extmarks[b] and nx._extmarks[b][ns]
@@ -481,9 +502,10 @@ function nx.buf.del_extmark(buffer, ns, id)
   return existed
 end
 
--- nvim_buf_clear_namespace(buffer, ns, line_start, line_end): drop ns's marks in
--- the line range (`line_end == -1` ⇒ to end of buffer). `ns == -1` clears every
--- namespace, matching neovim.
+-- nx.buf.clear_namespace(buffer, ns, line_start, line_end) [alias
+-- nvim_buf_clear_namespace]: drop namespace `ns`'s extmarks in `buffer` whose line
+-- is in the 0-based range [line_start, line_end) — `line_end == -1` means to the end
+-- of the buffer. `ns == -1` clears every namespace.
 function nx.buf.clear_namespace(buffer, ns, line_start, line_end)
   local b = nx._resolve_bufnr(buffer)
   if ns == -1 then
@@ -519,10 +541,13 @@ local function extmark_pos_bound(p)
   error("nvim_buf_get_extmarks: only 0, -1, and {row, col} positions are supported", 2)
 end
 
--- nvim_buf_get_extmarks(buffer, ns, start, end_, opts) -> list of {id, row, col}
--- (or {id, row, col, details} with opts.details), in (row, col, id) order. `ns ==
--- -1` returns marks from every namespace. Reads the mirror, so it reflects marks
--- set earlier in this chunk and positions current as of chunk start.
+-- nx.buf.extmarks(buffer, ns, start, end_[, opts]) -> list [alias
+-- nvim_buf_get_extmarks]: the extmarks of namespace `ns` in `buffer` within the
+-- position range `start`..`end_` — each bound is `0` (buffer start), `-1` (buffer
+-- end), or a `{row, col}` pair. Entries come in (row, col, id) order, each `{id,
+-- row, col}` (or `{id, row, col, details}` with `opts.details`). `ns == -1` returns
+-- marks from every namespace. Reads the mirror, so it reflects marks set earlier in
+-- this chunk; positions are current as of chunk start.
 function nx.buf.extmarks(buffer, ns, start, end_, opts)
   local b = nx._resolve_bufnr(buffer)
   opts = opts or {}
@@ -887,19 +912,6 @@ function vim.api.nvim_get_hl_by_name(name, rgb)
   return out
 end
 
--- nx.redraw(opts) [alias nvim__redraw]: in neovim, force a UI repaint mid-
--- execution (flushing the screen before the current chunk returns). nxvim's server
--- repaints at the end of every input / RPC / event turn the Lua ran under (see
--- `Server::handle` / `settle_events`), so the popup a chunk just built (its float
--- window + buffer lines + extmarks, all queued and drained right after the chunk)
--- paints on that same turn without an explicit flush — this is correct by
--- construction, not a silent stub. The Lua VM runs inside the server's single
--- thread, so it cannot itself drive a synchronous mid-chunk repaint; `opts`
--- (valid/flush/cursor/…) is accepted for call-compatibility and needs no action.
-function nx.redraw(_opts) end
-
-vim.api.nvim__redraw = nx.redraw
-
 vim.api.nvim_echo = nx.echo
 
 -- nx.hl.exists(name) [alias vim.fn.hlexists]: is the highlight group `name` defined?
@@ -914,14 +926,17 @@ vim.fn.hlexists = nx.hl.exists
 
 -- ===== nvim_* deprecated aliases & small gaps ================================
 
--- nx.buf.set_option / nx.buf.get_option(buf, name[, value]) [aliases
--- nvim_buf_set_option / nvim_buf_get_option]: the pre-0.10 buffer-option
--- accessors, deprecated in favor of nx.option.set/get (nvim_set_option_value) but
--- still called pervasively (plugins set bufhidden/modifiable/filetype/buftype
--- on every scratch buffer). Route to the by-name accessor with the buffer fixed.
+-- nx.buf.set_option(buf, name, value) [alias nvim_buf_set_option]: set buffer-local
+-- option `name` to `value` on `buf` (0/nil = current). A pre-0.10 accessor kept
+-- because plugins call it pervasively (bufhidden / modifiable / filetype / buftype
+-- on scratch buffers); in new code prefer nx.option.set(name, value, { buf = buf }),
+-- which this wraps.
 function nx.buf.set_option(buf, name, value)
   nx.option.set(name, value, { buf = buf })
 end
+-- nx.buf.get_option(buf, name) -> value [alias nvim_buf_get_option]: read buffer-
+-- local option `name` from `buf` (0/nil = current) — the read counterpart of
+-- nx.buf.set_option. In new code prefer nx.option.get(name, { buf = buf }).
 function nx.buf.get_option(buf, name)
   return nx.option.get(name, { buf = buf })
 end
@@ -958,18 +973,6 @@ api.nvim_err_writeln = nx.err_writeln
 api.nvim_err_write = nx.err_write
 api.nvim_out_write = nx.out_write
 
--- nx.call_function(name, args) [alias nvim_call_function]: invoke `vim.fn[name]`
--- with the arg list — the API-namespace bridge to Vimscript builtins. A function
--- nxvim doesn't provide fails loud (the no-silent-stub rule) naming itself.
-function nx.call_function(name, args)
-  local f = vim.fn[name]
-  if type(f) ~= "function" then
-    nx._notimpl("vim.fn." .. tostring(name))
-  end
-  return f(table.unpack(args or {}))
-end
-api.nvim_call_function = nx.call_function
-
 -- nvim_win_get_position(win): the window's top-left as 0-based {row, col} screen
 -- coordinates. Exact for a float (its placement); a tiled window's screen origin
 -- isn't carried in the mirror, so it reports {0, 0} — a documented approximation
@@ -985,11 +988,11 @@ function nx.win.position(win)
 end
 api.nvim_win_get_position = nx.win.position
 
--- nx.buf.list([opts]): buffer handles the snapshot mirror knows, ascending.
--- By default every buffer across every layer (main area + all docks). Pass
--- `{ focused = true }` to list only the buffers of the **focused** layer — the
--- per-region list (`:ls` is scoped the same way), so a dock reports just its own
--- buffers and the main area just its own.
+-- nx.buf.list([opts]) -> list of bufnr [alias nvim_list_bufs, which always lists
+-- all]: the buffer handles the mirror knows, ascending. By default every buffer
+-- across every layer (main area + all docks). Pass `{ focused = true }` to list only
+-- the **focused** layer's buffers — the per-region list (`:ls` is scoped the same
+-- way), so a dock reports just its own buffers and the main area just its own.
 function nx.buf.list(opts)
   local focused_only = type(opts) == "table" and opts.focused == true
   local ids = {}

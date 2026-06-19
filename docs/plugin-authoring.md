@@ -3,7 +3,7 @@
 A plugin is **pure Lua over the `nx.*` API** — no Rust, no Vimscript. The server
 owns every UI surface (windows, floats, the completion menu, the statusline); a
 plugin supplies *data and behavior* and reaches the screen through `nx.*`.
-Our prime directive is every feature that can be a plugin *is* one, so we excersise
+Our prime directive is every feature that can be a plugin *is* one, so we exercise
 our own APIs.
 
 If you've written a neovim plugin, the shape is familiar — a `lua/<name>/init.lua`

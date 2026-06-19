@@ -5,7 +5,7 @@ Lua plugins, treesitter highlighting, and LSP, built on a fully async,
 client-server design.
 
 nxvim is a headless, asynchronous editor **server** with thin UI **clients**
-talking over nxvim's own msgpack-RPC. The editor logic lives in one place; the
+talking over msgpack-RPC. The editor logic lives in one place; the
 terminal UI and the GPU GUI are just two clients of the same protocol.
 It speaks vim at the keyboard: keystrokes, modes, ex-commands, and options
 track [vim/neovim](https://neovim.io)'s observable editing behavior. Everything
@@ -17,11 +17,13 @@ nxvim's own too — pure-Lua modules that fill the highlight registry through th
 
 > **Status: early but substantial.** Day-to-day modal editing, splits, tabs,
 > floating windows, treesitter highlighting, a real Lua config runtime, and LSP
-> all work. Good enough to be a daily driver.
+> all work, as well as a selection of optional first-party plugins.
+> Good enough to be a daily driver.
 
 Test the client-only live demo at https://nxvim-demo.netlify.app. Use the `:eo`
-command to open a local file. Use :setf LANG to activate treesitter if not auto
-detected or :TSInstall to install the highlighter for your chosen language.
+command to open a local file or `:luao` to load a local lua file as config.
+Use :setf LANG to activate treesitter if not auto detected or :TSInstall to
+install the highlighter for your chosen language.
 
 ---
 

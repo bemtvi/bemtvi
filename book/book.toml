@@ -1,0 +1,28 @@
+# mdBook configuration for "The nxvim Book".
+#
+# The book is GENERATED FROM SOURCE: run `python3 book/gen/generate.py` before
+# building to (re)create src/SUMMARY.md, the imported docs chapters, and the
+# auto-extracted nx.* API reference under src/api/. Those files are git-ignored;
+# the prelude and the committed curated chapters are the source of truth.
+#
+#   python3 book/gen/generate.py && mdbook serve book   # local preview
+
+[book]
+title = "The nxvim Book"
+authors = ["David Rios"]
+description = "Guide and nx.* API reference for nxvim, a modal vim-style editor."
+language = "en"
+src = "src"
+
+[output.html]
+git-repository-url = "https://github.com/davidrios/nxvim"
+default-theme = "navy"
+preferred-dark-theme = "navy"
+no-section-label = false
+
+[output.html.fold]
+enable = true
+level = 1
+
+[output.html.search]
+enable = true

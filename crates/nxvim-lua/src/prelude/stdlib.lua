@@ -752,16 +752,29 @@ vim.api.nvim_strwidth = nx._strwidth
 -- than `width` is returned unchanged — these only add spaces, never truncate.
 -- Width is measured with nx.str.width, so wide glyphs pad correctly.
 nx.align = nx.align or {}
+
+-- nx.align.left(line, width): pad `line` on the RIGHT with spaces so it spans
+-- `width` display cells, keeping the text flush left. A line already at or wider
+-- than `width` is returned unchanged — it only adds spaces, never truncates.
+-- Width is measured with nx.str.width, so wide (CJK / emoji) glyphs pad correctly.
 function nx.align.left(line, width)
   line = tostring(line or "")
   local pad = (width or 0) - nx.str.width(line)
   return pad > 0 and line .. string.rep(" ", pad) or line
 end
+
+-- nx.align.right(line, width): like nx.align.left, but pads on the LEFT so the
+-- text sits flush right within `width` display cells. At or over `width` → returned
+-- unchanged; cell-width aware (nx.str.width).
 function nx.align.right(line, width)
   line = tostring(line or "")
   local pad = (width or 0) - nx.str.width(line)
   return pad > 0 and string.rep(" ", pad) .. line or line
 end
+
+-- nx.align.center(line, width): like nx.align.left, but splits the padding so the
+-- text is centred within `width` display cells; an odd leftover cell goes to the
+-- right. At or over `width` → returned unchanged; cell-width aware (nx.str.width).
 function nx.align.center(line, width)
   line = tostring(line or "")
   local pad = (width or 0) - nx.str.width(line)

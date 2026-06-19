@@ -712,6 +712,10 @@ pub struct Editor {
     /// so a nested `:g` / `:v` in that command fails loud (`E147`) instead of
     /// recursing. Set around the second pass in [`Editor::ex_global`].
     in_global: bool,
+    /// Current `:normal` nesting depth — bounds a `:normal` whose keys run
+    /// another `:normal` so a runaway chain can't overflow the stack (vim caps
+    /// this too). Incremented around [`Editor::ex_normal`].
+    normal_depth: usize,
     /// Operator (`d`/`c`/`y`) waiting on a search motion: set when `d/`,`y?`, …
     /// open a search prompt, applied over the match when the search commits, and
     /// cleared on commit or `<Esc>`. `None` for a plain (movement) search.
@@ -1337,6 +1341,7 @@ impl Editor {
             last_substitute: None,
             subst_confirm: None,
             in_global: false,
+            normal_depth: 0,
             search_operator: None,
             pending_search_count: 1,
             search_history: Vec::new(),

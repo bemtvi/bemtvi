@@ -1893,6 +1893,19 @@ where
     // Seed the buffer mirror too, so `init.lua` can read buffer lines / the cursor.
     host.push_buf_mirror();
 
+    // Load the shada (persistence) store before *anything* fires the startup
+    // buffer's lifecycle events — sourcing `init.lua` settles via `run_pending`,
+    // which emits `BufReadPost`, and a `BufReadPost` handler (e.g. the built-in
+    // `restorecursor` jump to the `"` mark) must see the restored per-file marks.
+    // It recency-merges + compacts sibling stores and seeds this session's
+    // registers / marks / history / jumplist; so `init.lua` and a `VimEnter`
+    // plugin also see the restored state. A no-op when persistence is disabled
+    // (`shada: None`, the test default); a store that won't load is surfaced and
+    // dropped (the editor runs on without persistence rather than dying). The store
+    // lives on `host` from here, so the debounced checkpoint and the exit flush both
+    // reach it through the seam.
+    host.shada_load();
+
     // Source the user's `init.lua` (if any) before serving the client, exactly
     // as neovim runs config at startup: its options, mappings, and colorscheme
     // are in place by the time the first `redraw` goes out on UI attach.
@@ -1927,14 +1940,6 @@ where
     // Seed the buffer set too, so the startup buffer isn't seen as "newly gone"
     // and a never-deleted buffer never triggers a spurious cleanup.
     host.known_buffers = host.editor.buffer_ids();
-    // Load the shada (persistence) store before the first frame: it recency-merges
-    // + compacts any sibling stores and seeds this session's registers / marks /
-    // history / jumplist, so a plugin reading them at `VimEnter` sees the restored
-    // state. A no-op when persistence is disabled (`shada: None`, the test default);
-    // a store that won't load is surfaced and then dropped (the editor runs on
-    // without persistence rather than dying). The store lives on `host` from here,
-    // so the debounced checkpoint and the exit flush both reach it through the seam.
-    host.shada_load();
     host.emit_lifecycle_events();
     host.run_pending();
     // The startup VimEnter point has passed: `v:vim_did_enter` is now 1, so a

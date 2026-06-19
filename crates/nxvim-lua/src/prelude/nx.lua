@@ -170,6 +170,20 @@ nx.command("DockShow", function(o)
   end
 end, { desc = "Re-show a dock on {side} that was hidden with :DockHide." })
 
+-- Restore the cursor to its last position when a file is reopened — the editor
+-- equivalent of neovim's common `BufReadPost` recipe. Opt in with
+-- `nx.o.restorecursor = true` (`vim.o.restorecursor = true`); off by default, so
+-- the out-of-the-box behavior matches vim/neovim (open at the top unless the user
+-- asks otherwise). The `"` mark is the last-cursor position shada persists per
+-- file; ``g`"`` jumps there without touching the jumplist, and is a no-op when
+-- there is no saved position (a brand-new file, or restore left off). The mark is
+-- already seeded onto the buffer by the time `BufReadPost` fires.
+nx.on("BufReadPost", {}, function()
+  if nx.o.restorecursor then
+    nx.cmd([[normal! g`"]])
+  end
+end)
+
 -- (`nx.notify` / `nx.schedule` — the callback-shaped async — are authored as
 -- `nx.*` in prelude/runtime.lua, with `vim.*` aliased onto them there.)
 --

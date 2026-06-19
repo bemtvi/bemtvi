@@ -230,6 +230,63 @@ async fn last_cursor_mark_reopens_a_file_where_it_was_left() {
     }
 }
 
+/// With `restorecursor` enabled, reopening a file lands the cursor on the saved
+/// last-cursor position automatically — no manual `` `" `` — via the built-in
+/// `BufReadPost` autocmd (neovim's recipe, dogfooded on `:normal! g\`"`).
+#[tokio::test]
+async fn restorecursor_option_reopens_a_file_where_it_was_left() {
+    let dir = temp_dir("shada_restorecursor");
+    let cfg = temp_dir("shada_restorecursor_cfg");
+    std::fs::write(cfg.join("init.lua"), "vim.o.restorecursor = true\n").expect("init.lua");
+    let file = write_temp("shada_restorecursor", "txt", "alpha\nbeta\ngamma\ndelta\n");
+
+    let init = |file: Option<String>| ServerInit {
+        config_dir: Some(cfg.clone()),
+        runtimepath: vec![cfg.clone()],
+        ..init_with_store(&dir, file)
+    };
+
+    // Session 1: leave the cursor at line 3, col 2, then quit.
+    {
+        let (rpc, incoming) = start_attached(init(Some(file.clone())), 80, 25).await;
+        feed(&rpc, "ggjjll");
+        assert_eq!(cursor(&rpc).await, (3, 2));
+        feed(&rpc, ":qa!<CR>");
+        await_server_exit(incoming).await;
+    }
+
+    // Session 2: reopen — the cursor is already on the saved spot, no jump fed.
+    {
+        let (rpc, _incoming) = start_attached(init(Some(file)), 80, 25).await;
+        assert_eq!(cursor(&rpc).await, (3, 2));
+    }
+}
+
+/// Default (option off): a reopened file still starts at the top — restore is
+/// strictly opt-in, so existing behavior is unchanged for everyone else.
+#[tokio::test]
+async fn restorecursor_off_by_default_opens_at_top() {
+    let dir = temp_dir("shada_restorecursor_off");
+    let file = write_temp(
+        "shada_restorecursor_off",
+        "txt",
+        "alpha\nbeta\ngamma\ndelta\n",
+    );
+
+    {
+        let (rpc, incoming) =
+            start_attached(init_with_store(&dir, Some(file.clone())), 80, 25).await;
+        feed(&rpc, "ggjjll");
+        assert_eq!(cursor(&rpc).await, (3, 2));
+        feed(&rpc, ":qa!<CR>");
+        await_server_exit(incoming).await;
+    }
+    {
+        let (rpc, _incoming) = start_attached(init_with_store(&dir, Some(file)), 80, 25).await;
+        assert_eq!(cursor(&rpc).await, (1, 0));
+    }
+}
+
 #[tokio::test]
 async fn search_history_survives_a_restart() {
     let dir = temp_dir("shada_history");

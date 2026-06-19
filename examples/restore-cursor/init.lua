@@ -1,0 +1,25 @@
+-- ~~~ nxvim restore-cursor: reopen a file where you left it ~~~
+--
+-- Run it (from the repo root) against the sample file:
+--
+--     NXVIM_CONFIG=examples/restore-cursor \
+--       cargo run -p nxvim -- examples/restore-cursor/sample.txt
+--
+-- Then: move the cursor down a few lines (say `15G`), and quit with `:q`.
+-- Launch the same command again — the cursor lands back on line 15 instead of
+-- the top of the file.
+--
+-- How it works: nxvim persists a per-file last-cursor position (the `"` mark) to
+-- its shada store on exit, exactly like vim/neovim. Turning on `restorecursor`
+-- arms a built-in `BufReadPost` autocmd that jumps to that mark (``g`"``) when a
+-- file is reopened — the editor-side equivalent of neovim's well-known config
+-- recipe. It is off by default (vim/neovim open at the top unless you ask), so
+-- this one line is the whole feature:
+vim.o.restorecursor = true
+
+-- It's a plain option, so you can flip it from the command line too:
+--     :lua vim.o.restorecursor = false
+--
+-- Under the hood the jump runs through nxvim's `:normal` command. You can use
+-- that yourself for any keystroke sequence, e.g. lowercase the whole file:
+--     :%normal! guu

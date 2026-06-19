@@ -154,6 +154,50 @@ fn split_global(body: &str, delim: char) -> (String, String) {
     (pat, String::new())
 }
 
+/// Recognize `:norm[al][!]` at the start of an ex remainder, returning
+/// `(bang, literal_arg)` — or `None` when it isn't the `:normal` command. The
+/// name accepts vim's abbreviations (`norm`..`normal`); without a `!` the name
+/// must be followed by a space or end of line, so `:normalize` / `:normx` stay
+/// other commands. One separating space after the name (and optional bang) is
+/// consumed; everything after it is the literal argument, untrimmed.
+fn parse_normal_prefix(rest: &str) -> Option<(bool, &str)> {
+    // Longest first, so the full name is consumed before a shorter abbreviation.
+    let after_name = ["normal", "norma", "norm"]
+        .into_iter()
+        .find_map(|n| rest.strip_prefix(n))?;
+    let (bang, after_bang) = match after_name.strip_prefix('!') {
+        Some(b) => (true, b),
+        None => (false, after_name),
+    };
+    if !bang {
+        // The bang already separates the name from its argument; without it the
+        // name must end here or at a space (else it's a longer command name).
+        match after_bang.chars().next() {
+            None | Some(' ') => {}
+            Some(_) => return None,
+        }
+    }
+    Some((bang, after_bang.strip_prefix(' ').unwrap_or(after_bang)))
+}
+
+/// Convert a `:normal` literal argument into keys — one keystroke per character.
+/// Control bytes map to their named keys (`\r`/`\n`→Enter, `\x1b`→Esc, `\t`→Tab,
+/// `\x08`/`\x7f`→Backspace) or, for the rest of the C0 range, `<C-letter>`
+/// (`\x17`→`<C-w>`), matching vim's handling of a control byte embedded via
+/// `:execute "normal! …"`. Every other character is itself.
+fn normal_keys(arg: &str) -> Vec<Key> {
+    arg.chars()
+        .map(|c| match c {
+            '\r' | '\n' => Key::new(KeyCode::Enter),
+            '\x1b' => Key::new(KeyCode::Esc),
+            '\t' => Key::new(KeyCode::Tab),
+            '\x08' | '\x7f' => Key::new(KeyCode::Backspace),
+            c if ('\u{1}'..='\u{1a}').contains(&c) => Key::ctrl((b'a' + (c as u8 - 1)) as char),
+            c => Key::char(c),
+        })
+        .collect()
+}
+
 /// The directory part of `f` (vim's `:h` modifier): everything up to the last
 /// `/`. No slash → `.` (the current directory); a single leading `/` → `/`.
 fn fmod_head(f: &str) -> String {
@@ -449,6 +493,17 @@ impl Editor {
         }
         if let Some(after) = rest.strip_prefix('&') {
             self.repeat_substitute(range, after.trim(), false);
+            return;
+        }
+
+        // `:[range]normal[!] {commands}` runs its argument as **literal**
+        // keystrokes — `<CR>` is the four chars `<`,`C`,`R`,`>` (not Enter) and
+        // whitespace is significant — so it is recognized on the raw remainder
+        // here, ahead of `split_ex`, which trims the argument and is blind to that
+        // literal shape. `:execute "normal! …"` is how special keys are embedded,
+        // exactly as in vim.
+        if let Some((bang, body)) = parse_normal_prefix(rest) {
+            self.ex_normal(range, bang, body);
             return;
         }
 
@@ -1245,6 +1300,67 @@ impl Editor {
         self.snapshot_taken = false;
         self.buffer_mut().normalize();
         self.clamp_cursor();
+    }
+
+    /// `:[range]normal[!] {keys}` — execute `keys` as if typed in Normal mode.
+    /// `keys` is fed straight through [`Editor::input`] (the same recursive replay
+    /// path `.`/dot-repeat uses), so the whole built-in command grammar — counts,
+    /// operators, registers, insert mode — re-parses and runs synchronously.
+    ///
+    /// With a range, the keys run once per line, the cursor parked at column 0 of
+    /// each, as a single undo step — mirroring [`Editor::ex_global`]'s command pass
+    /// (a running `offset` keeps the remaining lines aligned across edits).
+    ///
+    /// NOTE on the bang: user keymaps live one layer up (the server's matcher), so
+    /// neither `:normal` nor `:normal!` expands them here — both behave as vim's
+    /// `:normal!` (built-in commands only). The flag is accepted for compatibility.
+    fn ex_normal(&mut self, range: ExRange, _bang: bool, arg: &str) {
+        let keys = normal_keys(arg);
+        if keys.is_empty() {
+            // vim's `:normal` requires an argument; an empty one is a no-op here.
+            return;
+        }
+        // Bound nesting so a `:normal` whose keys run another `:normal` (only
+        // reachable with an embedded control byte via `:execute`) can't overflow
+        // the stack.
+        const MAX_DEPTH: usize = 200;
+        if self.normal_depth >= MAX_DEPTH {
+            self.echo("E192: Recursive use of :normal too deep".to_string());
+            return;
+        }
+        self.normal_depth += 1;
+
+        if range.explicit {
+            // One undo step for the whole range run (the `:global` grouping): force
+            // a fresh snapshot, then suppress the per-command snapshots the fed
+            // keys would otherwise take.
+            self.snapshot_taken = false;
+            self.push_undo();
+            self.snapshot_taken = true;
+            let mut offset: i64 = 0;
+            for t in range.lo..=range.hi {
+                let line = t as i64 + offset;
+                if line < 0 || line > self.last_line() as i64 {
+                    continue;
+                }
+                let before = self.buffer().line_count() as i64;
+                self.cursor.line = line as usize;
+                self.cursor.col = 0;
+                for &key in &keys {
+                    self.input(key);
+                }
+                offset += self.buffer().line_count() as i64 - before;
+            }
+            self.snapshot_taken = false;
+            self.buffer_mut().normalize();
+            self.clamp_cursor();
+        } else {
+            for &key in &keys {
+                self.input(key);
+            }
+        }
+
+        self.normal_depth -= 1;
     }
 
     /// `:[range]d[elete]` — delete the range's lines (default: the current line),

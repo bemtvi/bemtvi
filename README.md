@@ -270,6 +270,25 @@ previews, …). Each is a config dir you point nxvim at:
 NXVIM_CONFIG=examples/treesitter cargo run -p nxvim -- examples/treesitter/sample.rs
 ```
 
+### Writing plugins
+
+A plugin is **pure Lua over the `nx.*` API** — a `lua/<name>/init.lua` module that
+exposes `setup(opts)` and wires keymaps, commands, autocmds, and UI through `nx.*`
+(the server owns the surfaces; the plugin supplies data and behavior). Install one
+by declaring it with the built-in manager and running `:PluginSync`:
+
+```lua
+nx.plugins({
+  { "davidrios/nxvim-keys-helper",
+    config = function() require("nxvim-keys-helper").setup({}) end },
+})
+```
+
+Plugins are testable end-to-end with the native framework — write `test/*_spec.lua`
+and run `nxvim --test-plugin .`. See the full guides:
+[**Writing nxvim plugins**](docs/plugin-authoring.md) and
+[**Testing nxvim plugins**](docs/specs/2026-06-19-lua-plugin-testing.md).
+
 ---
 
 ## How it's built

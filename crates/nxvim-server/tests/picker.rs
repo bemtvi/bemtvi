@@ -918,6 +918,49 @@ async fn buffers_source_lists_open_buffers() {
     );
 }
 
+// ===== default leader maps =================================================
+
+#[tokio::test]
+async fn default_picker_maps_open_with_the_configured_leader() {
+    // The three shipped sources are bound to `<leader>f{f,g,b}` on VimEnter — after
+    // init.lua runs, so `<leader>` expands with the config's mapleader, not the
+    // default `\`. Use the in-memory `buffers` source (no `rg`) to stay hermetic.
+    let dir = temp_dir("picker_default_maps");
+    let file = dir.join("hello.txt");
+    std::fs::write(&file, "hi\n").unwrap();
+    let (rpc, mut incoming) = start(&dir, "vim.g.mapleader = ','").await;
+
+    exec_lua(&rpc, &format!("vim.cmd('edit {}')", file.display())).await;
+    // Drive the default map by keystroke at the configured leader (`,fb`).
+    feed(&rpc, ",fb");
+
+    let menu = menu_of(&poll_menu(&rpc, &mut incoming).await.expect("menu opens"));
+    let items = menu_items(&menu);
+    assert!(
+        items.iter().any(|i| i.contains("hello.txt")),
+        "<leader>fb opened the buffers picker, got {items:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_user_map_overrides_the_default_picker_map() {
+    // The defaults are `default = true`, so a user's own `<leader>ff` wins — and the
+    // shipped `files` default (which would spawn `rg`) never fires. No mapleader set,
+    // so the leader is the default `\`.
+    let dir = temp_dir("picker_default_override");
+    let (rpc, _incoming) = start(
+        &dir,
+        "vim.keymap.set('n', '<leader>ff', function() _G.hit = 'user' end)",
+    )
+    .await;
+
+    feed(&rpc, r"\ff");
+    nxvim_test_harness::barrier(&rpc).await;
+
+    let hit = exec_lua(&rpc, "return _G.hit").await;
+    assert_eq!(hit, Value::from("user"), "the user map for <leader>ff wins");
+}
+
 // ===== Phase 3: the preview pane ============================================
 
 /// The menu's `preview` sub-map, or `None` for a preview-less picker / select.

@@ -12,13 +12,20 @@ your own is a few lines.
 
 ## Using a picker
 
-Open a registered source by name, usually from a keymap:
+The three built-in sources are bound out of the box:
+
+| Map | Source |
+| --- | --- |
+| `<leader>ff` | `files` — fuzzy file finder |
+| `<leader>fg` | `live_grep` — live grep |
+| `<leader>fb` | `buffers` — open buffers |
+
+These are overridable defaults — your own map for the same key wins, and you can
+disable one by binding it to an empty function. To open any registered source
+from your own keymap, call `nx.picker.open`:
 
 ```lua
-vim.g.mapleader = " "
-nx.keymap.set("n", "<leader>ff", function() nx.picker.open("files") end)
-nx.keymap.set("n", "<leader>fg", function() nx.picker.open("live_grep") end)
-nx.keymap.set("n", "<leader>fb", function() nx.picker.open("buffers") end)
+nx.keymap.set("n", "<leader>o", function() nx.picker.open("files") end)
 ```
 
 In the open picker (all of these are rebindable — see [Keys](#keys)):

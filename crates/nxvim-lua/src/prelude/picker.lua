@@ -479,3 +479,28 @@ nx.picker.source({
     vim.cmd("buffer " .. item.bufnr)
   end,
 })
+
+-- ----- default leader maps ---------------------------------------------------
+-- Bind the three shipped sources to `<leader>f{f,g,b}` out of the box. Registered
+-- on VimEnter (after `init.lua` runs) so `<leader>` expands with the user's
+-- `mapleader` — not the default `\` it would carry if set at prelude-load, before
+-- the config sets mapleader. `default = true` puts each at the overridable rung, so
+-- a user's own map for the same lhs wins regardless of order (bind to an empty
+-- function to disable). Hermetic: the test harness fires VimEnter too, but these
+-- only register maps — nothing spawns until a key is actually pressed.
+-- Use `nx.autocmd.create` directly, not the `nx.on` sugar: this module loads
+-- before nx.lua (where `nx.on` is defined), but autocmd.lua is already in.
+nx.autocmd.create("VimEnter", {
+  callback = function()
+    for _, m in ipairs({
+      { "<leader>ff", "files", "Find files" },
+      { "<leader>fg", "live_grep", "Live grep" },
+      { "<leader>fb", "buffers", "Find buffers" },
+    }) do
+      local source = m[2]
+      nx.keymap.set("n", m[1], function()
+        nx.picker.open(source)
+      end, { default = true, desc = m[3] })
+    end
+  end,
+})

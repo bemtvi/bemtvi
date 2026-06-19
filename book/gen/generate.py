@@ -55,6 +55,7 @@ def write(path, text):
 IMPORTS = [
     ("docs/features.md", "features/index.md"),
     ("docs/features/multicursor.md", "features/multicursor.md"),
+    ("docs/features/docks.md", "features/docks.md"),
     ("docs/architecture.md", "architecture/overview.md"),
     ("docs/plugin-authoring.md", "plugins/authoring.md"),
     ("docs/autocmd-events.md", "plugins/autocmd-events.md"),

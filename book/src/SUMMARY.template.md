@@ -23,6 +23,7 @@
 
 - [What nxvim adds](features/index.md)
   - [Multi-cursor mode](features/multicursor.md)
+  - [Permanent docks](features/docks.md)
 
 # Plugin Development
 

@@ -17,12 +17,15 @@ linked from its name; the one-liner is the elevator pitch.
 
 ## UI surfaces
 
+| Feature | What it is |
+| --- | --- |
+| [Permanent docks](features/docks.md) | VSCode-style editable edge panels (file tree, terminals, problem lists) that are global across tabs, toggle independently of windows, and carry their own tabs and options. |
+
 These are described in their design specs today; full guides are being written
 into this section.
 
 | Feature | What it is | Reference |
 | --- | --- | --- |
-| Permanent docks | VSCode-style edge panels (file tree, terminals, problem lists) that live outside the editing grid and toggle independently of windows. | [spec](plans/2026-06-14-permanent-docked-panels.md) |
 | In-buffer terminal | A real PTY rendered into an ordinary buffer, with backpressure so a runaway command can't freeze the editor. | [spec](plans/2026-06-14-terminal-in-buffer.md) |
 | Fuzzy picker | `nx.picker`: a fuzzy finder with streaming sources, live (`dynamic`) sources, and an optional file/location preview pane. | [spec](plans/2026-06-14-nx-picker-fuzzy-finder.md) |
 | Floating windows & UI widgets | First-class floats plus built-in `nx.ui` widgets (input, confirm, select, content floats) any plugin can drive. | [spec](specs/2026-06-14-nx-ui-float-widget.md) |

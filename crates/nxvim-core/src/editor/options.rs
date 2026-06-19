@@ -404,6 +404,32 @@ impl Editor {
             }
             return;
         }
+        // `padding` is window-local (nxvim's own; no vim equivalent): a CSS-style
+        // shorthand for the per-side blank margin around this window's content box.
+        // The whole value is validated so a bad token fails loud (E474) rather than
+        // silently sticking the window on junk. `&` resets to no margin. A change
+        // re-clamps the viewport (the text area grew/shrank).
+        if name == "padding" {
+            match op {
+                StrOp::Set(value) => {
+                    let Some(pad) = crate::options::parse_padding(&value) else {
+                        self.echo(format!("E474: Invalid argument: padding={value}"));
+                        return;
+                    };
+                    self.windows.cur_mut().options.padding = pad;
+                    self.ensure_visible();
+                }
+                StrOp::Reset => {
+                    self.windows.cur_mut().options.padding = crate::options::Padding::default();
+                    self.ensure_visible();
+                }
+                StrOp::Query => {
+                    let v = self.windows.cur().options.padding;
+                    self.echo(format!("padding={v}"));
+                }
+            }
+            return;
+        }
         // A wiring gap (see `apply_set_bool`): a string option `resolve_set` accepted
         // but no arm / the global setter handles. Fail loud, never a silent no-op.
         let unknown = |ed: &mut Self| ed.echo(format!("E518: Unknown option: {name}"));

@@ -55,7 +55,7 @@ impl Editor {
                 continue;
             };
             let top = self.window_top(win);
-            let height = self.window_content_size(win).map_or(0, |(_, h)| h);
+            let height = self.window_text_area(win).map_or(0, |(_, h)| h);
             let (last_line, tick) = self.buffer_of(buf).map_or((0, 0), |b| {
                 (b.line_count().saturating_sub(1), b.changedtick)
             });

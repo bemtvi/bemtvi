@@ -1,0 +1,56 @@
+-- ~~~ nxvim window-local 'padding': a blank margin around the text body ~~~
+--
+-- Run it (from the repo root) against the sample file:
+--
+--     NXVIM_CONFIG=examples/padding \
+--       cargo run -p nxvim -- examples/padding/sample.txt
+--
+-- 'padding' is nxvim's OWN window-local option — there is no vim equivalent. It
+-- leaves a per-side blank margin (in screen cells) around the window's whole
+-- content box: the number gutter, the text, and the status line all inset by it,
+-- so the window reads with breathing room from its rect edges. All-zero (no
+-- margin) by default, so a window renders flush until you opt in.
+--
+-- It is *window-local* (like 'number'/'signcolumn'): each window carries its own
+-- value, so two splits onto the same buffer can show different margins. And it is
+-- resolved server-side — the editor shrinks the text area itself, so soft-wrap,
+-- horizontal scroll, the cursor, and mouse hit-testing all already account for
+-- the margin, and every front end (TUI, GUI, web) paints the same inset.
+
+-- Give the starting window a uniform 2-cell margin on every side. `vim.wo` is the
+-- window-local scope; a bare number sets all four sides at once.
+vim.wo.padding = 2
+
+-- The value is a CSS-style shorthand when set as a string (whitespace- OR
+-- comma-separated, so it survives `:set` either way):
+--
+--     "2"        -> all four sides 2
+--     "1 2"      -> vertical (top/bottom) 1, horizontal (left/right) 2
+--     "1 2 3 4"  -> top, right, bottom, left   (CSS order)
+--
+-- e.g. a roomy left/right margin but tight top/bottom:
+--     vim.wo.padding = "1 4"
+
+--------------------------------------------------------------------------------
+-- Try it:
+--
+-- 1. The text starts two cells in from the top-left and keeps two cells of blank
+--    on every side. Resize the terminal — the margin stays put, the text reflows
+--    inside it.
+--
+-- 2. Drive it by hand on the current window with :set (CSS shorthand; use commas
+--    so the value survives `:set`'s space tokenizer):
+--      :set padding=4            -> a fat 4-cell margin all round
+--      :set padding=0,6          -> no top/bottom, 6 cells left/right
+--      :set padding=1,2,3,4      -> top 1, right 2, bottom 3, left 4
+--      :set padding?             -> echoes the canonical form, e.g. "padding=1 2 3 4"
+--      :set padding&             -> reset to no margin
+--
+-- 3. Prove it is PER WINDOW. Split the view and give each window its own margin:
+--      :vsplit
+--      :set padding=0            -> the new (right) window is flush…
+--      <C-w>h :set padding=3     -> …while the left window keeps a 3-cell margin.
+--
+-- 4. Clicks map through the margin: clicking in the text lands on the right cell,
+--    and a click out in the blank margin hits nothing (the cursor stays put).
+--------------------------------------------------------------------------------

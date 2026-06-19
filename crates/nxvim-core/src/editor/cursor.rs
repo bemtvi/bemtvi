@@ -21,9 +21,12 @@ impl Editor {
         // that layer's region (which carries any per-dock `'laststatus'` override).
         let status =
             usize::from(self.window_statusline_visible(self.focused_region(), w.float.is_some()));
+        // `'padding'` insets the whole content box (top + bottom), matching
+        // `window_view`; subtract it before the status line so the math agrees.
         w.rect
             .height
             .saturating_sub(2 * inset)
+            .saturating_sub(w.options.padding.vertical())
             .saturating_sub(status)
             .max(1)
     }
@@ -40,8 +43,11 @@ impl Editor {
         let rect_width = w.rect.width;
         let line_count = self.buffer().line_count();
         let number_width = self.number_width_for(&options, line_count);
+        // `'padding'` insets the whole content box (left + right), matching
+        // `window_view`, before the gutter is carved off.
         rect_width
             .saturating_sub(2 * inset)
+            .saturating_sub(options.padding.horizontal())
             .saturating_sub(number_width)
             .saturating_sub(options.signcolumn.floor_cells())
     }

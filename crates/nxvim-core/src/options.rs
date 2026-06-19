@@ -291,6 +291,103 @@ impl std::fmt::Display for SignColumn {
     }
 }
 
+/// A per-side blank margin (in screen cells) left around a window's content box —
+/// the gutter, text body, and status line all sit inside it, so the window reads
+/// with breathing room from its rect edges. nxvim's own option (vim has no
+/// equivalent); see [`WindowOptions::padding`]. All-zero by default (no margin),
+/// so a window with default padding renders exactly as before.
+///
+/// Sides follow CSS order where a `:set padding=` string is parsed (see
+/// [`parse_padding`]): `top right bottom left`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Padding {
+    pub top: usize,
+    pub right: usize,
+    pub bottom: usize,
+    pub left: usize,
+}
+
+impl Padding {
+    /// A uniform margin of `n` cells on every side.
+    pub fn uniform(n: usize) -> Self {
+        Padding {
+            top: n,
+            right: n,
+            bottom: n,
+            left: n,
+        }
+    }
+
+    /// Total cells consumed horizontally (left + right).
+    pub fn horizontal(&self) -> usize {
+        self.left + self.right
+    }
+
+    /// Total cells consumed vertically (top + bottom).
+    pub fn vertical(&self) -> usize {
+        self.top + self.bottom
+    }
+
+    /// Whether any side is non-zero (the common fast path skips the inset when not).
+    pub fn is_zero(&self) -> bool {
+        *self == Padding::default()
+    }
+}
+
+impl std::fmt::Display for Padding {
+    /// The canonical `:set padding?` form. Collapses to the shortest equivalent
+    /// spec: `2` when uniform, `1 2` when vertical/horizontal pairs match,
+    /// otherwise the full `top right bottom left`.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.top == self.right && self.right == self.bottom && self.bottom == self.left {
+            write!(f, "{}", self.top)
+        } else if self.top == self.bottom && self.left == self.right {
+            write!(f, "{} {}", self.top, self.right)
+        } else {
+            write!(
+                f,
+                "{} {} {} {}",
+                self.top, self.right, self.bottom, self.left
+            )
+        }
+    }
+}
+
+/// Parse a `'padding'` value into a [`Padding`], or `None` if any token is not a
+/// non-negative integer or the token count is unsupported — the caller reports
+/// `E474`. Accepts CSS-style shorthands, tokens separated by whitespace and/or
+/// commas:
+///
+/// - `"2"` → all four sides `2`
+/// - `"1 2"` → vertical (top/bottom) `1`, horizontal (left/right) `2`
+/// - `"1 2 3 4"` → `top right bottom left` (CSS order)
+///
+/// An empty value parses to the all-zero default (no margin).
+pub fn parse_padding(s: &str) -> Option<Padding> {
+    let nums: Vec<usize> = s
+        .split([' ', ',', '\t'])
+        .filter(|t| !t.is_empty())
+        .map(|t| t.parse::<usize>().ok())
+        .collect::<Option<_>>()?;
+    match nums.as_slice() {
+        [] => Some(Padding::default()),
+        &[a] => Some(Padding::uniform(a)),
+        &[v, h] => Some(Padding {
+            top: v,
+            right: h,
+            bottom: v,
+            left: h,
+        }),
+        &[top, right, bottom, left] => Some(Padding {
+            top,
+            right,
+            bottom,
+            left,
+        }),
+        _ => None,
+    }
+}
+
 /// Window-local options, the rust-native analogue of neovim's per-window scope.
 /// Unlike [`Options`] (one global copy on the editor), a [`WindowOptions`] lives
 /// on each window, so two windows onto the *same* buffer can show different
@@ -354,6 +451,13 @@ pub struct WindowOptions {
     /// vim config's `fillchars` sets cleanly, but have no rendering effect yet.
     /// Empty by default, which means `eob:~` (see [`WindowOptions::fillchars_eob`]).
     pub fillchars: String,
+    /// `'padding'` (nxvim's own; no vim equivalent): a per-side blank margin in
+    /// screen cells left around this window's content box — the number gutter, text
+    /// body, and status line all inset by it, so the window reads with breathing
+    /// room from its rect edges. All-zero by default (no margin). Set with
+    /// `:set padding=…` (CSS-style shorthand, see [`parse_padding`]) or
+    /// `vim.wo.padding`.
+    pub padding: Padding,
 }
 
 impl WindowOptions {
@@ -464,6 +568,8 @@ impl Default for WindowOptions {
             breakindentopt: String::new(),
             // Empty fillchars: the end-of-buffer filler is vim's default `~`.
             fillchars: String::new(),
+            // No margin out of the box — a default window renders flush as before.
+            padding: Padding::default(),
         }
     }
 }
@@ -843,6 +949,9 @@ fn canonical(name: &str) -> Option<(&'static str, OptKind)> {
         "showbreak" | "sbr" => Some(("showbreak", Str)),
         "breakindentopt" | "briopt" => Some(("breakindentopt", Str)),
         "fillchars" | "fcs" => Some(("fillchars", Str)),
+        // nxvim's own per-window content margin (no vim equivalent); a CSS-style
+        // shorthand string handled specially in `apply_set_str`.
+        "padding" | "pad" => Some(("padding", Str)),
         "ignorecase" | "ic" => Some(("ignorecase", Bool)),
         "smartcase" | "scs" => Some(("smartcase", Bool)),
         "wrapscan" | "ws" => Some(("wrapscan", Bool)),

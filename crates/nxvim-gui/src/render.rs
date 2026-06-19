@@ -710,6 +710,9 @@ impl Renderer {
                 Some(r) => (ox + r.x, oy + r.y, r.width, r.height),
                 None => (main_x, mid_y, main_w, mid_h),
             };
+            // `'padding'` insets the content box by a per-side margin; the server
+            // already sized this window's rows/cursor to the inset area.
+            let rect = pad_rect(rect, win.padding);
             let win_scroll = if win.focused { scroll } else { None };
             self.build_window(view, win, win_scroll, rect, quads, items, image_draws);
         }
@@ -1873,6 +1876,8 @@ impl Renderer {
             }
             None => (ox, oy, r.width, r.height),
         };
+        // `'padding'` insets the content a further per-side margin inside any border.
+        let inner = pad_rect(inner, win.padding);
         self.build_window(view, win, None, inner, quads, items, image_draws);
     }
 
@@ -2021,6 +2026,9 @@ impl Renderer {
             wx += 1;
             wy += 1;
         }
+        // `'padding'` insets the text body, so the popup anchors a margin in too.
+        wx += win.padding.left;
+        wy += win.padding.top;
         let sign_w = win.sign_width;
         let gutter = if win.number || win.relativenumber {
             win.number_width
@@ -2150,6 +2158,9 @@ impl Renderer {
             wx += 1;
             wy += 1;
         }
+        // `'padding'` insets the text body, so the popup anchors a margin in too.
+        wx += win.padding.left;
+        wy += win.padding.top;
         let sign_w = win.sign_width;
         let gutter = if win.number || win.relativenumber {
             win.number_width
@@ -2424,6 +2435,9 @@ impl Renderer {
             wx += 1;
             wy += 1;
         }
+        // `'padding'` insets the text body, so the popup anchors a margin in too.
+        wx += win.padding.left;
+        wy += win.padding.top;
         let sign_w = win.sign_width;
         let gutter = if win.number || win.relativenumber {
             win.number_width
@@ -2948,6 +2962,22 @@ fn severity_color(severity: u8) -> u32 {
 fn lighten(c: u32, d: u8) -> u32 {
     let f = |b: u8| b.saturating_add(d) as u32;
     (f((c >> 16) as u8) << 16) | (f((c >> 8) as u8) << 8) | f(c as u8)
+}
+
+/// Inset a `(x, y, w, h)` cell rect by a window's `'padding'` — a per-side blank
+/// margin — clamped so at least a 1×1 cell survives. The window content paints
+/// into the returned rect; the margin shows whatever is behind it (the editor
+/// background, or a float's box fill).
+fn pad_rect(rect: (u16, u16, u16, u16), pad: nxvim_view::Padding) -> (u16, u16, u16, u16) {
+    let (x, y, w, h) = rect;
+    let left = pad.left.min(w.saturating_sub(1));
+    let top = pad.top.min(h.saturating_sub(1));
+    (
+        x + left,
+        y + top,
+        w.saturating_sub(left + pad.right).max(1),
+        h.saturating_sub(top + pad.bottom).max(1),
+    )
 }
 
 /// First visible completion-item index for a popup `rows` tall with `selected`

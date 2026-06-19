@@ -428,6 +428,13 @@ pub struct WindowView {
     /// core itself only consults its [`floor`](crate::SignColumn::floor_cells) for
     /// text-width math.
     pub signcolumn: crate::options::SignColumn,
+    /// This window's `'padding'` — the per-side blank margin (cells) around its
+    /// content box. The server projects it on the wire; each client insets the
+    /// window's gutter/text/status/cursor by it (the same way it re-derives the
+    /// float-border inset), so the content reads with breathing room from the rect
+    /// edges. All-zero by default (no margin); the projection's `width`/`height`
+    /// already account for it.
+    pub padding: crate::options::Padding,
     /// This window's buffer `tabstop`: the width the client must expand a `\t`
     /// to, so its tab rendering matches the server's [`cursor_screen_col`] (which
     /// is computed with this same value). A client that hard-codes a different
@@ -699,8 +706,21 @@ fn window_view(ed: &Editor, w: &WindowLayout) -> WindowView {
     } else {
         0
     };
-    let content_height = w.rect.height.saturating_sub(2 * inset);
-    let content_width = w.rect.width.saturating_sub(2 * inset);
+    // `'padding'` insets the whole content box (gutter + text + status) by a
+    // per-side blank margin, inside any float border. Clients re-derive the same
+    // inset from the projected `padding`, so the two agree (mirroring how the float
+    // border inset is handled). Clamped so at least one text row/col survives.
+    let pad = w.options.padding;
+    let content_height = w
+        .rect
+        .height
+        .saturating_sub(2 * inset)
+        .saturating_sub(pad.vertical());
+    let content_width = w
+        .rect
+        .width
+        .saturating_sub(2 * inset)
+        .saturating_sub(pad.horizontal());
     // Whether this window draws its own status row (per `'laststatus'`, with any
     // per-dock override for the window's region); when it does not, the freed row
     // becomes text, so the window shows one more line.
@@ -990,6 +1010,7 @@ fn window_view(ed: &Editor, w: &WindowLayout) -> WindowView {
         cursorline: w.options.cursorline,
         number_width,
         signcolumn: w.options.signcolumn,
+        padding: pad,
         tabstop: buf.options.effective_tabstop(),
         floating: w.floating,
         border: w.border,

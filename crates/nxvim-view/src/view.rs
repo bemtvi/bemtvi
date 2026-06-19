@@ -11,9 +11,9 @@ use crate::parse::{
     chrome_style, map_get, map_str, map_str_array, map_u16, map_u64, parse_bools, parse_border,
     parse_cursor_list, parse_diagnostics, parse_diagnostics_signs, parse_diagnostics_virt,
     parse_float_lines, parse_highlights, parse_inlay_hints, parse_multi_spans, parse_numbers,
-    parse_pair, parse_pmenu_items, parse_spans, parse_status, parse_styles, parse_virt_lines,
-    parse_virt_text, DiagSign, DiagSpan, DiagVirt, HlSpan, IncSearchSpans, InlayHint, PmenuItem,
-    SearchSpans, StatusSegment, VirtChunk, VirtPlacement,
+    parse_padding, parse_pair, parse_pmenu_items, parse_spans, parse_status, parse_styles,
+    parse_virt_lines, parse_virt_text, DiagSign, DiagSpan, DiagVirt, HlSpan, IncSearchSpans,
+    InlayHint, PmenuItem, SearchSpans, StatusSegment, VirtChunk, VirtPlacement,
 };
 use crate::style::{Border, Style};
 
@@ -90,6 +90,29 @@ pub struct ScrollData {
     /// mid-slide replaces the live palette, which would leave the band's frozen
     /// style ids pointing at the wrong entries.
     pub styles: Vec<Style>,
+}
+
+/// A window's per-side blank margin (cells) mirrored from the redraw `padding`
+/// array (`[top, right, bottom, left]`, CSS order). The renderer insets the
+/// content box by it; all-zero (the default) renders flush as before.
+#[derive(Default, Clone, Copy)]
+pub struct Padding {
+    pub top: u16,
+    pub right: u16,
+    pub bottom: u16,
+    pub left: u16,
+}
+
+impl Padding {
+    /// Total cells consumed horizontally (left + right).
+    pub fn horizontal(&self) -> u16 {
+        self.left + self.right
+    }
+
+    /// Total cells consumed vertically (top + bottom).
+    pub fn vertical(&self) -> u16 {
+        self.top + self.bottom
+    }
 }
 
 /// One window's content mirrored from a redraw `windows[i]` sub-map: its screen
@@ -206,6 +229,12 @@ pub struct WindowView {
     /// older server that omits the key.
     pub cursorline: bool,
     pub number_width: u16,
+    /// This window's `'padding'` — a per-side blank margin (cells) the renderer
+    /// leaves around the content box (gutter + text + status), inside any float
+    /// border. All-zero (no margin) from a server that omits the key. The window's
+    /// projected `rows`/`cursor` already assume this inset, so the renderer only has
+    /// to shift the content origin in and shrink the box by it.
+    pub padding: Padding,
     /// This window's buffer `tabstop`: how many cells to expand a `\t` to when
     /// painting, mirrored from the server so the text lines up with the server's
     /// `cursor_screen_col` (computed with the same value). Defaults to 8.
@@ -852,6 +881,9 @@ fn parse_window(m: &[(Value, Value)], styles: &[Style]) -> WindowView {
             .and_then(Value::as_bool)
             .unwrap_or(false),
         number_width: map_u16(m, "number_width"),
+        // `'padding'` as `[top, right, bottom, left]` cells (CSS order); absent ⇒
+        // no margin (an older server, or the default).
+        padding: parse_padding(map_get(m, "padding")),
         // The server always sends a tabstop ≥ 1; treat a missing/0 value as the
         // historical default of 8 so an older server still renders sanely.
         tabstop: match map_u16(m, "tabstop") {

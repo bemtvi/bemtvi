@@ -1,0 +1,23 @@
+padding demo — breathing room around the text body
+===================================================
+
+'padding' is nxvim's own window-local option (no vim equivalent). It leaves a
+per-side blank margin, in screen cells, around a window's whole content box:
+the number gutter, the text, and the status line all sit inside the margin.
+
+It is window-local, so two splits onto the same file can use different margins.
+The margin is server-side: the editor shrinks the text area, so wrapping,
+horizontal scroll, the cursor, and mouse clicks all already account for it —
+every front end (TUI, GUI, web) renders the same inset with no special-casing.
+
+Try the steps at the bottom of init.lua. Resize the window and watch the text
+keep its margin from the edges.
+
+line 1
+line 2
+line 3
+line 4
+line 5
+line 6
+line 7
+line 8

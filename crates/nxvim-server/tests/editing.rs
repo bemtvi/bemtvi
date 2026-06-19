@@ -47,6 +47,8 @@ mod marks;
 mod multicursor;
 #[path = "editing/numbers.rs"]
 mod numbers;
+#[path = "editing/padding.rs"]
+mod padding;
 #[path = "editing/registers.rs"]
 mod registers;
 #[path = "editing/rendering.rs"]

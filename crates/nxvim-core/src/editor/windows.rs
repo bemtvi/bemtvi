@@ -1218,6 +1218,14 @@ impl Editor {
         let w = t.get_mut(id);
         if name == "numberwidth" {
             w.options.numberwidth = value.max(1) as usize;
+        } else if name == "padding" {
+            // `vim.wo.padding = 2` (a bare number) sets a uniform margin; the
+            // string forms (`"1 2"`, …) come through `set_window_option_str`. A
+            // negative value clamps to zero (no margin).
+            w.options.padding = crate::options::Padding::uniform(value.max(0) as usize);
+            // Re-clamp the viewport once the `&mut w` borrow ends — the text area
+            // grew or shrank.
+            self.ensure_visible();
         }
     }
 
@@ -1233,12 +1241,25 @@ impl Editor {
         let opts = &mut t.get_mut(id).options;
         // An invalid value is ignored, matching the no-op-on-bad-input contract of
         // the other bridge setters (`:set` is the loud-error path).
+        let mut geometry_changed = false;
         if name == "signcolumn" {
             if let Some(scl) = crate::options::SignColumn::parse(value) {
                 opts.signcolumn = scl;
             }
         } else if name == "fillchars" && crate::options::parse_fillchars(value).is_some() {
             opts.fillchars = value.to_string();
+        } else if name == "padding" {
+            // An invalid spec is ignored (the no-op-on-bad-input bridge contract;
+            // `:set padding=` is the loud-error path).
+            if let Some(pad) = crate::options::parse_padding(value) {
+                opts.padding = pad;
+                geometry_changed = true;
+            }
+        }
+        // Re-clamp the viewport once the `&mut opts` borrow ends: `padding` grew or
+        // shrank the text area.
+        if geometry_changed {
+            self.ensure_visible();
         }
     }
 
@@ -1474,6 +1495,23 @@ impl Editor {
             .saturating_sub(2 * inset)
             .saturating_sub(status);
         Some((width, height))
+    }
+
+    /// Window `id`'s **padded** text area — its [content
+    /// size](Editor::window_content_size) further inset by `'padding'` (horizontal
+    /// from the width, vertical from the height). This is the area the client paints
+    /// the gutter/text/status into and the space the hit-test, viewport-decoration,
+    /// and scroll math reason about — it matches the `width`/`height`
+    /// [`view::window_view`](crate::view) projects. `window_content_size` itself stays
+    /// padding-free, so the `nvim_win_*` size getters and a float's reported config
+    /// round-trip unchanged. `None` for an unknown window.
+    pub fn window_text_area(&self, id: WindowId) -> Option<(usize, usize)> {
+        let (w, h) = self.window_content_size(id)?;
+        let pad = self.window_options(id)?.padding;
+        Some((
+            w.saturating_sub(pad.horizontal()),
+            h.saturating_sub(pad.vertical()),
+        ))
     }
 
     /// Set window `id`'s width to `width` columns (`nvim_win_set_width`), stealing

@@ -173,6 +173,37 @@ async fn left_click_respects_tab_expansion() {
     assert_eq!(cursor(&rpc).await, (1, 2));
 }
 
+/// `'padding'` insets the text body, so a click maps through the per-side margin:
+/// the text starts `pad.top` rows down and `pad.left` cols in. A click in the
+/// margin itself hits no window and leaves the cursor put.
+#[tokio::test]
+async fn left_click_maps_through_padding() {
+    let (rpc, _incoming) = start("hello world\nsecond line\nthird").await;
+    command(&rpc, "set nonumber norelativenumber").await;
+    command(&rpc, "set padding=2").await;
+    // Text body now starts at global (row 2, col 2). The window's first line sits
+    // at row 2; clicking there lands on line 1, byte 0.
+    feed_mouse(&rpc, "left", "press", 2, 2);
+    assert_eq!(cursor(&rpc).await, (1, 0));
+    // Row 3 → line 2; col 5 → byte 3 (5 − 2 left-margin), "second line"'s 'o'.
+    feed_mouse(&rpc, "left", "press", 3, 5);
+    assert_eq!(cursor(&rpc).await, (2, 3));
+}
+
+#[tokio::test]
+async fn click_in_the_padding_margin_is_a_no_op() {
+    let (rpc, _incoming) = start("hello world\nsecond line\nthird").await;
+    command(&rpc, "set nonumber norelativenumber").await;
+    command(&rpc, "set padding=3").await;
+    // Park the cursor on a known cell inside the text body first.
+    feed_mouse(&rpc, "left", "press", 4, 4);
+    assert_eq!(cursor(&rpc).await, (2, 1));
+    // A click in the top-left margin (inside the window rect, outside the padded
+    // content box) hits no window → the cursor stays where it was.
+    feed_mouse(&rpc, "left", "press", 1, 1);
+    assert_eq!(cursor(&rpc).await, (2, 1), "margin click moves nothing");
+}
+
 /// A click in another split focuses that window (focus follows the click) and
 /// places the cursor there — the hit-test resolves the right window first.
 #[tokio::test]

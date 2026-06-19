@@ -792,7 +792,7 @@ impl Editor {
         // only when a horizontal separator sits just below it — otherwise it is the
         // bottom-most window and there is nothing beneath to resize against.
         let (win, _, rel_y) = window_at_in(tree, x, y)?;
-        let (_, text_height) = self.window_content_size(win)?;
+        let (_, text_height) = self.window_text_area(win)?;
         if rel_y == text_height {
             let below = y + 1;
             let has_window_below = tree
@@ -1193,12 +1193,15 @@ impl Editor {
         col: usize,
     ) -> Option<(usize, usize)> {
         let (abs_x, abs_y) = self.window_screen_pos(win)?;
-        let (_, _, ww, _) = self.window_rect(win)?;
-        let (_, text_height) = self.window_content_size(win)?;
+        let (text_width, text_height) = self.window_text_area(win)?;
+        // `'padding'` insets the text body from the window's top-left, so the band
+        // starts a margin in; `text_cell_to_buf` expects padded-content-relative
+        // coords, so `rel_x`/`rel_y` are measured from the padded origin too.
+        let pad = self.window_options(win)?.padding;
         // The window's text band in global screen rows: `[top_edge, bottom_edge]`.
         // `abs_y` is the window's absolute top, so this is correct in any region (a
         // dock band as much as the main area), not just below the main tabline.
-        let top_edge = abs_y;
+        let top_edge = abs_y + pad.top;
         let bottom_edge = top_edge + text_height.saturating_sub(1);
         let rel_y = if row <= top_edge {
             self.drag_scroll(false); // at/above the first line → reveal the line above
@@ -1209,7 +1212,9 @@ impl Editor {
         } else {
             row - top_edge
         };
-        let rel_x = col.saturating_sub(abs_x).min(ww.saturating_sub(1));
+        let rel_x = col
+            .saturating_sub(abs_x + pad.left)
+            .min(text_width.saturating_sub(1));
         self.text_cell_to_buf(win, rel_x, rel_y)
     }
 
@@ -1480,17 +1485,28 @@ impl Editor {
             (geom.col, box_y, 1, vborder)
         } else {
             let (wx, wy) = self.window_screen_pos(win)?;
-            let inner_x = wx + gutter; // text inner: past the number gutter
-                                       // A full border for select / picker; the completion popup omits its top
-                                       // border and shifts one cell left so its left border doesn't cover the word
-                                       // it completes. `geom.col` is the content anchor for `Cursor` placement and
-                                       // the outer-box left for `Editor`; either way the outer box left is
-                                       // `geom.col - left_shift` and the content sits one cell in.
+            // The text inner sits past this window's `'padding'` (left + top) and its
+            // number gutter, matching where the client paints the body.
+            let pad = self
+                .window_options(win)
+                .map(|o| o.padding)
+                .unwrap_or_default();
+            let inner_x = wx + pad.left + gutter; // text inner: past padding + the number gutter
+                                                  // A full border for select / picker; the completion popup omits its top
+                                                  // border and shifts one cell left so its left border doesn't cover the word
+                                                  // it completes. `geom.col` is the content anchor for `Cursor` placement and
+                                                  // the outer-box left for `Editor`; either way the outer box left is
+                                                  // `geom.col - left_shift` and the content sits one cell in.
             let border_top = !m.completion;
             let left_shift = usize::from(!border_top);
             let vborder = if border_top { 2 } else { 1 };
             let box_x = (inner_x + geom.col).saturating_sub(left_shift);
-            (box_x, wy + geom.row, usize::from(border_top), vborder)
+            (
+                box_x,
+                wy + pad.top + geom.row,
+                usize::from(border_top),
+                vborder,
+            )
         };
         let box_w = geom.width + 2;
         let box_h = geom.height + vborder;
@@ -1692,7 +1708,7 @@ impl Editor {
     fn window_max_leftcol(&self, win: WindowId) -> usize {
         let (Some((top, _)), Some((content_w, text_h)), Some(buf_id), Some(opts)) = (
             self.window_scroll(win),
-            self.window_content_size(win),
+            self.window_text_area(win),
             self.window_buffer(win),
             self.window_options(win),
         ) else {
@@ -1757,7 +1773,7 @@ impl Editor {
     /// Window `win`'s text-area height in rows (its content height minus the status
     /// line), at least 1 — the page size for a `Shift`+wheel notch.
     fn window_text_height(&self, win: WindowId) -> usize {
-        self.window_content_size(win).map_or(1, |(_, h)| h).max(1)
+        self.window_text_area(win).map_or(1, |(_, h)| h).max(1)
     }
 
     /// Window `win`'s last real buffer line (0-based), the floor `top` can scroll
@@ -1811,7 +1827,7 @@ impl Editor {
         let (layer, ox, oy) = self.region_at(row, col)?;
         let tree = self.layer_tree(layer)?;
         let (win, rel_x, rel_y) = window_at_in(tree, col - ox, row - oy)?;
-        let (_, text_height) = self.window_content_size(win)?;
+        let (_, text_height) = self.window_text_area(win)?;
         if rel_y >= text_height {
             // Below the text body: the status row (the last content line). `rel_x`
             // is the window-relative column, which is the status line's own column
@@ -1886,13 +1902,17 @@ fn window_at_in(tree: &WindowTree, x: usize, y: usize) -> Option<(WindowId, usiz
         let w = tree.get(id);
         // A bordered float spends one cell per side on its border; its content
         // is the rect inset by one. Tiled windows and borderless floats use the
-        // whole rect.
+        // whole rect. `'padding'` insets the content box a further per-side margin,
+        // so a click in the margin matches no window (returns past this probe), and
+        // the returned cell is **padded-content-relative** — the coordinate
+        // `text_cell_to_buf` / the status-row check expect.
         let inset = matches!(&w.float, Some(c) if c.border != BorderStyle::None) as usize;
+        let pad = w.options.padding;
         let r = w.rect;
-        let x0 = r.x + inset;
-        let y0 = r.y + inset;
-        let x1 = (r.x + r.width).saturating_sub(inset);
-        let y1 = (r.y + r.height).saturating_sub(inset);
+        let x0 = r.x + inset + pad.left;
+        let y0 = r.y + inset + pad.top;
+        let x1 = (r.x + r.width).saturating_sub(inset + pad.right);
+        let y1 = (r.y + r.height).saturating_sub(inset + pad.bottom);
         (x >= x0 && x < x1 && y >= y0 && y < y1).then(|| (id, x - x0, y - y0))
     };
     tree.floats

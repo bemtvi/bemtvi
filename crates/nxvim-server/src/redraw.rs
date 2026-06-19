@@ -486,6 +486,19 @@ impl EditHost {
                 Value::from("number_width"),
                 Value::from(win.number_width as u64),
             ),
+            // `'padding'` as `[top, right, bottom, left]` cells (CSS order). The
+            // client insets this window's content box by it (the same way it
+            // re-derives the float-border inset); the projection's row width/height
+            // already account for it. Omitted-as-zero by default.
+            (
+                Value::from("padding"),
+                Value::Array(vec![
+                    Value::from(win.padding.top as u64),
+                    Value::from(win.padding.right as u64),
+                    Value::from(win.padding.bottom as u64),
+                    Value::from(win.padding.left as u64),
+                ]),
+            ),
             (Value::from("tabstop"), Value::from(win.tabstop as u64)),
             (Value::from("special_key"), special_key),
             (Value::from("highlights"), highlights),
@@ -538,14 +551,18 @@ impl EditHost {
         styles: &mut StyleTable,
     ) -> Value {
         // The status line spans the window's content width — its rect inset by the
-        // float border, matching where the client paints it (and what `%=`/`%<`
-        // resolve against).
+        // float border and any `'padding'` (left + right), matching where the client
+        // paints it (and what `%=`/`%<` resolve against).
         let inset = if win.floating && win.border != BorderStyle::None {
             1
         } else {
             0
         };
-        let width = win.rect.width.saturating_sub(2 * inset);
+        let width = win
+            .rect
+            .width
+            .saturating_sub(2 * inset)
+            .saturating_sub(win.padding.horizontal());
         self.render_statusline(
             win.id.0,
             self.resolve_window_layout(win.id.0),
@@ -677,7 +694,10 @@ impl EditHost {
                     } else {
                         0
                     };
-                    win.rect.width.saturating_sub(2 * inset)
+                    win.rect
+                        .width
+                        .saturating_sub(2 * inset)
+                        .saturating_sub(win.padding.horizontal())
                 };
                 if let Some(layout) = self.resolve_window_layout(win_id) {
                     // Segment layout: a clickable cell carries an `on_click` handler,
@@ -1404,9 +1424,11 @@ impl EditHost {
                 // core can't recompute it — it's fed back here for the hit-test. The
                 // docs content sits at `(inner_x + col, win_y + row)`; the bordered
                 // outer box is one cell out on every side.
-                let inner_x = focused.rect.x + focused.number_width;
+                // The text-inner origin includes this window's `'padding'` (left +
+                // top), matching where the client paints the body.
+                let inner_x = focused.rect.x + focused.padding.left + focused.number_width;
                 let gx = (inner_x + meta.col).saturating_sub(1);
-                let gy = (focused.rect.y + meta.row).saturating_sub(1);
+                let gy = (focused.rect.y + focused.padding.top + meta.row).saturating_sub(1);
                 self.editor
                     .stash_complete_docs_hit(Some(nxvim_core::CompleteDocsHit {
                         x: gx,

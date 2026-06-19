@@ -188,6 +188,27 @@ pub(crate) fn parse_pair(value: Option<&Value>) -> Option<(u16, u16)> {
     ))
 }
 
+/// Parse the redraw `padding` field — a `[top, right, bottom, left]` array of
+/// cell counts (CSS order) — into a [`Padding`](crate::view::Padding). `Nil` /
+/// absent / malformed (not a 4-element array) ⇒ no margin, so an older server or a
+/// default window renders flush.
+pub(crate) fn parse_padding(value: Option<&Value>) -> crate::view::Padding {
+    let parse = || -> Option<crate::view::Padding> {
+        let a = value?.as_array()?;
+        if a.len() != 4 {
+            return None;
+        }
+        let cell = |i: usize| a[i].as_u64().unwrap_or(0) as u16;
+        Some(crate::view::Padding {
+            top: cell(0),
+            right: cell(1),
+            bottom: cell(2),
+            left: cell(3),
+        })
+    };
+    parse().unwrap_or_default()
+}
+
 /// Parse the per-row search-match payload: an array with one entry per visible
 /// row, each an array of `[start, end]` screen-column pairs (empty for rows with
 /// no match).

@@ -69,6 +69,10 @@ pub struct WindowMirror {
     /// `'fillchars'` as the raw `key:char` list string (empty ⇒ vim's default
     /// look), for `vim.wo`/`vim.o` read-back.
     pub fillchars: String,
+    /// `'padding'` in its canonical shorthand string (`""` ⇒ no margin; `"2"`
+    /// uniform; `"1 2"` vert/horiz; `"1 2 3 4"` top/right/bottom/left), for
+    /// `vim.wo`/`vim.o` read-back.
+    pub padding: String,
     /// First visible buffer line, 1-based (neovim's `winsaveview().topline`).
     pub topline: u64,
     /// First visible screen column (`winsaveview().leftcol`).

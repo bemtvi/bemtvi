@@ -932,6 +932,8 @@ local WIN_OPT_CANON = {
   scl = "signcolumn",
   fillchars = "fillchars",
   fcs = "fillchars",
+  padding = "padding",
+  pad = "padding",
 }
 local WIN_OPT_DEFAULT = {
   number = true,
@@ -940,6 +942,7 @@ local WIN_OPT_DEFAULT = {
   numberwidth = 4,
   signcolumn = "auto",
   fillchars = "",
+  padding = "",
 }
 -- Exposed for this file's nvim_{get,set}_option_value, which classify a name
 -- as window-scoped before routing it through nx.wo.

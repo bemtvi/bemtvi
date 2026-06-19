@@ -225,7 +225,11 @@ pub(crate) fn render(
     // cursor and the popup anchor. Tiled windows paint first; floats overlay them.
     let mut focused_inner: Option<(Rect, u16, u16)> = None;
     for win in view.windows.iter().filter(|w| !w.floating) {
-        let area = window_area(dock.content(win.region), win);
+        // `'padding'` insets the content box by a per-side margin; the server already
+        // sized this window's rows/cursor to the inset area, so the renderer just
+        // shifts the origin in and shrinks the box. The margin shows the editor
+        // background behind it.
+        let area = pad_rect(window_area(dock.content(win.region), win), win.padding);
         // Only the focused window animates a scroll slide.
         let win_anim = if win.focused { anim } else { None };
         let (text_inner, cursor_row, cursor_shift) =
@@ -255,6 +259,8 @@ pub(crate) fn render(
             }
             None => outer,
         };
+        // `'padding'` insets the content a further per-side margin inside any border.
+        let inner = pad_rect(inner, win.padding);
         let (text_inner, cursor_row, cursor_shift) =
             render_window(frame, inner, win, view, None, images.as_deref_mut());
         if win.focused {
@@ -549,6 +555,21 @@ fn window_area(wins_area: Rect, win: &WindowView) -> Rect {
             height: r.height.min(wins_area.height.saturating_sub(r.y)),
         },
         None => wins_area,
+    }
+}
+
+/// Inset `area` by a window's `'padding'` — a per-side blank margin in cells —
+/// clamped so at least a 1×1 cell survives a margin wider than the window. The
+/// content (gutter/text/status) paints into the returned rect; the cells outside
+/// it show whatever was painted behind (the editor background, or a float's box).
+fn pad_rect(area: Rect, pad: nxvim_view::Padding) -> Rect {
+    let left = pad.left.min(area.width.saturating_sub(1));
+    let top = pad.top.min(area.height.saturating_sub(1));
+    Rect {
+        x: area.x + left,
+        y: area.y + top,
+        width: area.width.saturating_sub(left + pad.right).max(1),
+        height: area.height.saturating_sub(top + pad.bottom).max(1),
     }
 }
 
@@ -2721,9 +2742,12 @@ fn text_inner_rect(width: u16, height: u16, view: &View) -> Rect {
     );
     // A focused float's content sits inside its border; the popup anchors there.
     // The focused window may live in a dock, so offset by its region's origin.
-    let area = float_inner(
-        window_area(dock.content(win.region), win),
-        win.border.map(bt),
+    let area = pad_rect(
+        float_inner(
+            window_area(dock.content(win.region), win),
+            win.border.map(bt),
+        ),
+        win.padding,
     );
     // The text body is the window rect minus its bottom status row — when this
     // window shows one (per `'laststatus'`); otherwise it claims the whole rect.

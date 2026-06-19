@@ -663,7 +663,7 @@ impl EditHost {
             }
             LspEvent::Log { message, .. } => {
                 // Record to `:messages` without disturbing the message line.
-                self.editor.messages.push(message);
+                self.editor.record_message(message, false);
             }
             LspEvent::WorkspaceRefresh { key, kind } => self.on_workspace_refresh(key, kind),
         }

@@ -817,7 +817,8 @@ impl Editor {
         match expr::eval_echo(args) {
             Ok(text) => match kind {
                 EchoKind::Transient => self.message = text,
-                EchoKind::Message | EchoKind::Error => self.echo(text),
+                EchoKind::Message => self.echo(text),
+                EchoKind::Error => self.echo_err(text),
             },
             Err(e) => self.echo(e),
         }

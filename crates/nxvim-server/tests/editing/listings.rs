@@ -35,6 +35,66 @@ async fn messages_command_opens_a_panel_with_the_history() {
     );
 }
 
+/// Whether the `:messages` panel paints `ErrorMsg` on the (only) screen row whose
+/// text contains `needle`. Scans every window's parallel `lines`/`highlights`
+/// arrays (the panel is a bottom split, not necessarily `windows[0]`), so it finds
+/// the listing row wherever it landed.
+fn messages_row_is_red(map: &[(Value, Value)], needle: &str) -> bool {
+    let windows = match map_get(map, "windows").and_then(Value::as_array) {
+        Some(w) => w,
+        None => return false,
+    };
+    for win in windows {
+        let Value::Map(win) = win else { continue };
+        let (Some(lines), Some(hls)) = (
+            map_get(win, "lines").and_then(Value::as_array),
+            map_get(win, "highlights").and_then(Value::as_array),
+        ) else {
+            continue;
+        };
+        for (i, line) in lines.iter().enumerate() {
+            if !line.as_str().is_some_and(|l| l.contains(needle)) {
+                continue;
+            }
+            let red = hls.get(i).and_then(Value::as_array).is_some_and(|spans| {
+                spans.iter().any(|s| {
+                    s.as_array().and_then(|s| s.get(2)).and_then(Value::as_str) == Some("ErrorMsg")
+                })
+            });
+            return red;
+        }
+    }
+    false
+}
+
+#[tokio::test]
+async fn messages_panel_paints_error_lines_red() {
+    let (rpc, mut incoming) = start(None).await;
+
+    // A normal message and two errors: one a real command error carrying vim's
+    // `E###:` code (classified by prefix), one an explicit `:echoerr` whose text
+    // carries no code (classified because it came through the error path).
+    feed(&rpc, ":lua print('hello normal')<CR>");
+    feed(&rpc, ":nosuchcommand<CR>"); // → E492: Not an editor command: ...
+    feed(&rpc, ":echoerr 'kaboom'<CR>");
+
+    let map = redraw_after(&rpc, &mut incoming, ":messages<CR>").await;
+    assert!(panel_is_open(&rpc).await, "`:messages` opens a panel");
+
+    assert!(
+        messages_row_is_red(&map, "E492"),
+        "the E492 command-error line should be ErrorMsg-red"
+    );
+    assert!(
+        messages_row_is_red(&map, "kaboom"),
+        "the :echoerr line should be ErrorMsg-red even without an E### code"
+    );
+    assert!(
+        !messages_row_is_red(&map, "hello normal"),
+        "an ordinary message line must NOT be painted red"
+    );
+}
+
 #[tokio::test]
 async fn a_panel_is_navigable_with_plain_motions() {
     let (rpc, _incoming) = start(None).await;

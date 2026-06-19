@@ -152,6 +152,29 @@ pub(crate) struct ResumeState {
     pub(crate) visual_anchor: Cursor,
 }
 
+/// One recorded entry in the `:messages` history: the (single-line) text plus
+/// whether it was surfaced as an *error*. The `error` flag drives the red
+/// `ErrorMsg` highlight the `:messages` panel paints on error lines — set
+/// explicitly for `:echoerr` and inferred from vim's `E###:` error-code prefix
+/// for the many command errors that flow through [`Editor::echo`].
+#[derive(Debug, Clone)]
+pub struct LoggedMessage {
+    pub text: String,
+    pub error: bool,
+}
+
+/// Whether `line` reads as a vim error message: the `E###:` error-code prefix
+/// (an `E` followed by one or more digits and a colon, e.g. `E486:`) every
+/// built-in error carries. Lets [`Editor::record_message`] flag the bulk of
+/// command errors as errors without each call site opting in.
+fn is_error_line(line: &str) -> bool {
+    let Some(rest) = line.strip_prefix('E') else {
+        return false;
+    };
+    let digits = rest.bytes().take_while(u8::is_ascii_digit).count();
+    digits > 0 && rest.as_bytes().get(digits) == Some(&b':')
+}
+
 /// Stable identifier for an open buffer. Monotonic and 1-based (buffer 1 is the
 /// first file, or the initial `[No Name]`); an id is never reused once assigned,
 /// matching vim's buffer numbers.
@@ -745,8 +768,9 @@ pub struct Editor {
     /// Transient status message (the bottom line when not in command mode).
     /// Set via [`Editor::echo`], which also appends to `messages`.
     pub message: String,
-    /// History of every message shown, the backing store for `:messages`.
-    pub messages: Vec<String>,
+    /// History of every message shown, the backing store for `:messages`. Each
+    /// entry is one line carrying its error flag (see [`LoggedMessage`]).
+    pub messages: Vec<LoggedMessage>,
     /// Live `nx.view` surfaces, keyed by the Lua-allocated view handle id. The
     /// value records the backing [`BufferId`] (the read-only, plugin-owned content
     /// buffer carrying `view: Some(id)`) and how the view is currently mounted, so
@@ -1807,14 +1831,36 @@ impl Editor {
     /// recorded separately so a multi-line echo lists cleanly in `:messages`.
     pub fn echo(&mut self, msg: impl Into<String>) {
         let msg = msg.into();
-        for line in msg.split('\n').filter(|l| !l.is_empty()) {
-            self.messages.push(line.to_string());
+        self.record_message(&msg, false);
+        self.message = msg;
+    }
+
+    /// Like [`Editor::echo`], but force every recorded line to the *error* level
+    /// (the red `ErrorMsg` highlight in `:messages`). This is the `:echoerr`
+    /// path — its text needn't carry a vim `E###:` code to count as an error.
+    pub fn echo_err(&mut self, msg: impl Into<String>) {
+        let msg = msg.into();
+        self.record_message(&msg, true);
+        self.message = msg;
+    }
+
+    /// Append `text` to the `:messages` history *only* — leaving the message
+    /// line untouched — splitting it into one [`LoggedMessage`] per non-empty
+    /// line. `force_error` flags every line as an error; otherwise each line is
+    /// classified by vim's `E###:` error-code convention ([`is_error_line`]), so
+    /// the many command errors that flow through [`Editor::echo`] light up red
+    /// without threading a flag through 100-plus call sites.
+    pub fn record_message(&mut self, text: impl AsRef<str>, force_error: bool) {
+        for line in text.as_ref().split('\n').filter(|l| !l.is_empty()) {
+            self.messages.push(LoggedMessage {
+                text: line.to_string(),
+                error: force_error || is_error_line(line),
+            });
         }
         // Bound the history so a long-running session can't grow it forever.
         if self.messages.len() > MAX_MESSAGES {
             self.messages.drain(0..self.messages.len() - MAX_MESSAGES);
         }
-        self.message = msg;
     }
 
     /// The editor's total screen size in `(columns, rows)` — the text-viewport

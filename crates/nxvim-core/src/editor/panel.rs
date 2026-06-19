@@ -165,6 +165,35 @@ impl Editor {
         self.ensure_visible();
     }
 
+    /// Paint highlight group `group` across the full width of each *current-buffer*
+    /// line whose `flags` entry is set, as range extmarks in the reserved
+    /// [`LISTING_HL_NS`](crate::extmark::LISTING_HL_NS). Built for the listing panels
+    /// (`:messages` flags its error lines `ErrorMsg`): call it right after the listing
+    /// is mounted, when its buffer is current and freshly loaded. The reload that backs
+    /// a re-open clears the namespace's old marks, so each open repaints cleanly.
+    pub(crate) fn highlight_listing_lines(&mut self, flags: &[bool], group: &str) {
+        let buf = self.current_buffer_id();
+        let Some(b) = self.buffer_of_mut(buf) else {
+            return;
+        };
+        for (line, _) in flags.iter().enumerate().filter(|(_, on)| **on) {
+            if line >= b.line_count() {
+                break;
+            }
+            let start = b.line_start(line);
+            let end = start + b.line_len(line);
+            b.extmarks.set(
+                crate::extmark::LISTING_HL_NS,
+                None,
+                start,
+                Some(end),
+                Some(group.to_string()),
+                crate::extmark::DEFAULT_PRIORITY,
+                None,
+            );
+        }
+    }
+
     /// Dismiss the open panel (a no-op if none): collapse its overlay, restoring the
     /// layout, and refocus the window the panel sprang from if it still lives. Clearing
     /// [`Editor::panel`] *first* is what lets the subsequent focus moves through the

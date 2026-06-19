@@ -45,6 +45,13 @@ pub const ANCHOR_NS: u32 = u32::MAX - 1;
 /// below [`ANCHOR_NS`], far above any plugin namespace.
 pub const SNIPPET_NS: u32 = u32::MAX - 2;
 
+/// Reserved namespace for the highlights a built-in **listing panel** paints on
+/// its own lines — e.g. `:messages` flagging each error line `ErrorMsg`. These
+/// are range extmarks carrying an `hl_group`, set on the (reused) panel buffer
+/// right after its content is loaded and cleared on the next reload, so they
+/// never collide with a plugin namespace. Sits just below [`SNIPPET_NS`].
+pub const LISTING_HL_NS: u32 = u32::MAX - 3;
+
 /// neovim's `DEFAULT_PRIO` for extmark highlights — above the treesitter
 /// highlighter's baseline ([`TS_HL_PRIORITY`]), so a plugin / semantic-token
 /// mark wins over the base syntax color by default.

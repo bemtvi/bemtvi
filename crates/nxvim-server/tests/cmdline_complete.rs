@@ -198,6 +198,62 @@ async fn disabled_without_setup() {
     );
 }
 
+#[tokio::test]
+async fn enabled_by_default_via_server_init() {
+    // The interactive binary sets `cmdline_complete_default`, which runs
+    // `nx.cmdline_complete.setup{}` before init.lua — so `:`+<Tab> completes even
+    // with an init.lua that never calls setup itself (the headless default is off,
+    // which keeps the rest of the suite hermetic).
+    let dir = temp_dir("cmdcomplete");
+    std::fs::write(dir.join("init.lua"), "-- no explicit setup").expect("write init.lua");
+    let init = ServerInit {
+        config_dir: Some(dir.to_path_buf()),
+        runtimepath: vec![dir.to_path_buf()],
+        cmdline_complete_default: true,
+        ..Default::default()
+    };
+    let (rpc, mut incoming) = spawn(init);
+    attach(&rpc, 80, 24).await;
+
+    feed(&rpc, ":e<Tab>");
+    let map = poll_menu(&rpc, &mut incoming)
+        .await
+        .expect("a completion menu after :e<Tab> with the default-on gate");
+    let items = menu_items(&map);
+    assert!(items.contains(&"edit".to_string()), "items: {items:?}");
+    assert!(items.contains(&"enew".to_string()), "items: {items:?}");
+}
+
+#[tokio::test]
+async fn config_setup_overrides_the_default_on_gate() {
+    // The gate runs `nx.cmdline_complete.setup{}` (docs on) BEFORE init.lua, so a
+    // config that re-runs setup with `docs = false` still wins (last config wins) —
+    // proving the default is a default, not a lock.
+    let dir = temp_dir("cmdcomplete");
+    std::fs::write(
+        dir.join("init.lua"),
+        "nx.cmdline_complete.setup { docs = false }",
+    )
+    .expect("write init.lua");
+    let init = ServerInit {
+        config_dir: Some(dir.to_path_buf()),
+        runtimepath: vec![dir.to_path_buf()],
+        cmdline_complete_default: true,
+        ..Default::default()
+    };
+    let (rpc, mut incoming) = spawn(init);
+    attach(&rpc, 80, 24).await;
+
+    feed(&rpc, ":ed<Tab>");
+    poll_menu(&rpc, &mut incoming).await.expect("menu");
+    feed(&rpc, "<Tab>");
+    let map = wait_redraw(&mut incoming, |m| menu_sel_is(m, 0, true)).await;
+    assert!(
+        menu_docs(&map).is_none(),
+        "the config's docs = false wins over the default-on gate's docs = true"
+    );
+}
+
 // ---- Phase 2: navigation + accept + execute ---------------------------------------
 
 #[tokio::test]

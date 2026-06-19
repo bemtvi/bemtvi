@@ -185,6 +185,9 @@ fn main() -> Result<()> {
         // The interactive binary offers nxvim's built-in default recommended set on a
         // fresh setup (the first-run welcome); a config's own recommend{} overrides it.
         offer_default_recommended: true,
+        // Command-line completion (`:`+<Tab>) is on by default in the interactive
+        // binary; a config's own `nx.cmdline_complete.setup{ ... }` still wins.
+        cmdline_complete_default: true,
     };
     let server_thread = std::thread::spawn(move || {
         // Test-only fault injection (debug builds only): force a server-thread
@@ -385,8 +388,10 @@ where
                 lsp_transport: Some(Box::new(client.lsp_transport)),
                 fs_jobs: Some(client.fs_jobs),
                 // A daemon-backed session is still the interactive editor — offer the
-                // built-in default recommended set on first run.
+                // built-in default recommended set on first run, and enable
+                // command-line completion by default (a config's setup{} still wins).
                 offer_default_recommended: true,
+                cmdline_complete_default: true,
             };
             // `_guard` (the stdio child, or `()` for QUIC) lives until the editor quits.
             run_server(server_end, init).await

@@ -92,8 +92,10 @@ fn spawn_server(plugin_dir: PathBuf) -> (Rpc, UnboundedReceiver<Incoming>) {
             host_fs_async: None,
             lsp_transport: None,
             fs_jobs: None,
-            // Hermetic: never offer the built-in recommended set / first-run welcome.
+            // Hermetic: never offer the built-in recommended set / first-run welcome,
+            // and leave command-line completion off (a plugin's own setup{} can opt in).
             offer_default_recommended: false,
+            cmdline_complete_default: false,
         };
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_io()

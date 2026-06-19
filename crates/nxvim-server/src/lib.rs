@@ -243,6 +243,13 @@ pub struct ServerInit {
     /// runs (a config's own `nx.plugins.recommend{...}` still overrides it). Mirrors
     /// how `shada` / `clipboard` keep tests hermetic while the binary opts in.
     pub offer_default_recommended: bool,
+    /// Whether to enable command-line completion (`nx.cmdline_complete` — `:`+`<Tab>`)
+    /// by default. `false` (the default) leaves the engine off, so the headless test
+    /// suites stay byte-for-byte unchanged; the interactive binary sets it `true`,
+    /// which runs `nx.cmdline_complete.setup{}` BEFORE `init.lua` so a config's own
+    /// `nx.cmdline_complete.setup{ ... }` (e.g. toggling the `docs` preview pane)
+    /// still wins. Mirrors `offer_default_recommended`.
+    pub cmdline_complete_default: bool,
 }
 
 /// How the server provides the `"+` / `"*` clipboard registers.
@@ -1925,6 +1932,14 @@ where
     // wins. The interactive binary opts in; tests leave this off and stay hermetic.
     if init.offer_default_recommended {
         let _ = host.lua.exec("nx.plugins._use_default_recommended()");
+    }
+    // Turn on command-line completion (`:`+<Tab>) by default for the interactive
+    // binary — BEFORE init.lua, so a config's own `nx.cmdline_complete.setup{ ... }`
+    // (e.g. to toggle the docs pane) still wins. Tests leave this off and stay
+    // hermetic. The queued setup drains on the next `apply_lua_effects` (init.lua's,
+    // or the first keypress's) — well before any `:`+<Tab> can be typed.
+    if init.cmdline_complete_default {
+        let _ = host.lua.exec("nx.cmdline_complete.setup{}");
     }
     // Source the user's `init.lua` (if any) before serving the client, exactly
     // as neovim runs config at startup: its options, mappings, and colorscheme

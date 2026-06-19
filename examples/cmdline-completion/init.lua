@@ -47,10 +47,11 @@
 -- <file>`, `:set <opt>`, … — a later, pure-Lua extension; the source already
 -- receives the whole line + cursor) is not in this phase.
 
--- Enable the engine. A bare `setup {}` turns command-line completion on; the
--- engine is OFF until this call, so an editor with no `setup` behaves exactly as
--- before. (`docs = true` is the default — the synopsis/help float beside the
--- highlighted row; pass `docs = false` for a names-only wildmenu.)
+-- Command-line completion is ON BY DEFAULT in the interactive editor, so this call
+-- is optional — it's here to TUNE the engine. A bare `setup {}` is the default
+-- (`docs = true` — the synopsis/help float beside the highlighted row); pass
+-- `docs = false` for a names-only wildmenu. (A config that re-runs setup wins over
+-- the default, since the last setup call applies.)
 nx.cmdline_complete.setup {}
 
 -- A plugin command with a `desc`: it joins the wildmenu catalog automatically (via

@@ -242,8 +242,10 @@ fn server_init(file: Option<String>, client: Option<DaemonClient>) -> ServerInit
         lsp_transport,
         fs_jobs,
         // The GUI is the interactive editor — offer the built-in default recommended
-        // set on a fresh setup (a config's own recommend{} still overrides it).
+        // set on a fresh setup (a config's own recommend{} still overrides it), and
+        // enable command-line completion by default (a config's setup{} still wins).
         offer_default_recommended: true,
+        cmdline_complete_default: true,
     }
 }
 

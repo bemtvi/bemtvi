@@ -95,8 +95,11 @@ impl EditHost {
     pub(crate) fn dispatch(&mut self, method: &str, params: &[Value]) -> Result<Value, String> {
         match method {
             "nx_ui_attach" => {
-                let w = uint(params.first(), 80);
-                let h = uint(params.get(1), 24);
+                // Screen dimensions are clamped at the boundary (see `geom` /
+                // `MAX_SCREEN_DIM`): a near-`usize::MAX` size would otherwise size a
+                // grid allocation / fill loop in the view and OOM the server.
+                let w = geom(params.first(), 80);
+                let h = geom(params.get(1), 24);
                 self.ui = Some((w, h));
                 self.editor.resize(w, h);
                 // The resize assigns the window its first rect, so a `nx.decor`
@@ -108,8 +111,9 @@ impl EditHost {
                 Ok(Value::Nil)
             }
             "nx_ui_try_resize" => {
-                let w = uint(params.first(), 80);
-                let h = uint(params.get(1), 24);
+                // Clamped at the boundary like `nx_ui_attach` (see `geom`).
+                let w = geom(params.first(), 80);
+                let h = geom(params.get(1), 24);
                 self.ui = Some((w, h));
                 self.editor.resize(w, h);
                 // A resize moves every window's visible range; redispatch decor
@@ -130,8 +134,10 @@ impl EditHost {
                 let button = text(params.first());
                 let action = text(params.get(1));
                 let modifier = text(params.get(2));
-                let row = uint(params.get(4), 0);
-                let col = uint(params.get(5), 0);
+                // Screen-cell coordinates: clamped at the boundary (see `geom`) so a
+                // bogus near-`usize::MAX` cell can't propagate into geometry math.
+                let row = geom(params.get(4), 0);
+                let col = geom(params.get(5), 0);
                 let mut ev = MouseEvent::parse(&button, &action, &modifier, row, col)?;
                 // Stamp the receive time from the server's clock; the editor's
                 // multi-click detection compares these deltas against `'mousetime'`.
@@ -284,12 +290,17 @@ impl EditHost {
             }
             "nvim_win_set_width" => {
                 let win = self.resolve_win(params.first());
-                self.editor.set_window_width(win, uint(params.get(1), 0));
+                // Clamped at the boundary (see `geom`): a single window's width can't
+                // exceed the (already-clamped) screen, but capping here also blocks the
+                // `height + 1`-style arithmetic in core from seeing a near-`usize::MAX`
+                // input regardless of how the layout redistributes it.
+                self.editor.set_window_width(win, geom(params.get(1), 0));
                 Ok(Value::Nil)
             }
             "nvim_win_set_height" => {
                 let win = self.resolve_win(params.first());
-                self.editor.set_window_height(win, uint(params.get(1), 0));
+                // Clamped at the boundary like `nvim_win_set_width` (see `geom`).
+                self.editor.set_window_height(win, geom(params.get(1), 0));
                 Ok(Value::Nil)
             }
             "nvim_win_close" => {
@@ -739,6 +750,37 @@ fn uint(v: Option<&Value>, default: usize) -> usize {
     v.and_then(Value::as_u64)
         .map(|n| n as usize)
         .unwrap_or(default)
+}
+
+/// A defense-in-depth ceiling for *screen-cell* dimensions and coordinates that
+/// arrive over RPC as an unbounded `usize` — the resize width/height
+/// (`nx_ui_attach` / `nx_ui_try_resize`), the per-window `nvim_win_set_width` /
+/// `_height`, and the `nx_input_mouse` row/col. Such a value flows into the core
+/// layout and then directly sizes allocations and bounds row-building loops in
+/// `nxvim-view` (e.g. `Vec::with_capacity(height)` and the `while rows.len() <
+/// height { … }` filler loop in `row_skeleton`). The core uses `saturating_*`
+/// math, but saturation does *not* shrink a near-`usize::MAX` value — `MAX - 2`
+/// is still `MAX` — so a single hostile or buggy `nx_ui_try_resize(MAX, MAX)`
+/// would still drive a `usize::MAX`-element allocation (instant OOM/abort) and an
+/// effectively infinite fill loop. Clamping the dimension at the wire boundary
+/// closes that gap.
+///
+/// `65_536` (2^16) per dimension is deliberately *enormous* relative to reality:
+/// an 8K ultrawide terminal is ~1000 columns and even a pathological
+/// multi-monitor wall is well under 10^4 cells per side, so no real client is
+/// ever clipped — only absurd/hostile values are. It mirrors the existing
+/// `u16`-cell cap already enforced on float geometry by [`value_extent`], and is
+/// small enough that `MAX_SCREEN_DIM * MAX_SCREEN_DIM == 2^32` can neither
+/// overflow a 64-bit `usize` nor approach an OOM. This is a sanity ceiling on
+/// geometry, not a silent stub: legitimate sizes round-trip untouched, and only
+/// nonsensical magnitudes are capped (never swallowed into a fake/empty value).
+const MAX_SCREEN_DIM: usize = 65_536;
+
+/// [`uint`] for a *screen-cell* dimension/coordinate, capped at [`MAX_SCREEN_DIM`].
+/// See that constant for why the boundary clamp is needed and why the ceiling can
+/// never clip a real display.
+fn geom(v: Option<&Value>, default: usize) -> usize {
+    uint(v, default).min(MAX_SCREEN_DIM)
 }
 
 /// An `nvim_open_win` / `nvim_win_set_config` size value → [`Extent`]: an integer

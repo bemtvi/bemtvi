@@ -185,15 +185,28 @@ pub fn place_aligned(
 ) -> (usize, usize) {
     let (bx, by, bw, bh) = bounds;
     let pos = |band: u8, lo: usize, span: usize, size: usize, near: usize, far: usize| -> usize {
+        // All coordinates/dimensions are non-negative, so the placement is computed
+        // entirely in saturating `usize`: `bounds`, `w`/`h`, the bands and margins
+        // all derive from wire `u64`s cast to `usize` with no clamp at the dispatch
+        // layer, so a hostile or buggy geometry can make any `lo + span` etc.
+        // overflow. `saturating_add`/`saturating_sub` change the result only in that
+        // overflow case (which would otherwise panic in debug / wrap in release);
+        // for every in-range geometry the value is identical to the prior signed
+        // (`isize`) form. A band offset that would underflow below `lo` saturates to
+        // `0`, which the trailing clamp pins back up to `lo` — the same outcome the
+        // signed `.clamp(lo, hi).max(0)` produced for a negative intermediate.
         let p = match band {
-            0 => lo as isize + near as isize,
-            2 => (lo + span) as isize - size as isize - far as isize,
-            _ => lo as isize + (span as isize - size as isize) / 2,
+            0 => lo.saturating_add(near),
+            2 => lo
+                .saturating_add(span)
+                .saturating_sub(size)
+                .saturating_sub(far),
+            _ => lo.saturating_add(span.saturating_sub(size) / 2),
         };
         // Clamp the box fully inside the bounds (a box larger than the span pins to
         // the low edge rather than spilling off-screen).
-        let hi = (lo + span).saturating_sub(size).max(lo) as isize;
-        p.clamp(lo as isize, hi).max(0) as usize
+        let hi = lo.saturating_add(span).saturating_sub(size).max(lo);
+        p.clamp(lo, hi)
     };
     let x = pos(align.hband(), bx, bw, w, margin.left, margin.right);
     let y = pos(align.vband(), by, bh, h, margin.top, margin.bottom);
@@ -683,13 +696,17 @@ fn place_float(origin: Rect, bounds: Rect, cfg: &FloatConfig) -> Rect {
             cfg.margin,
         )
     } else {
-        let mut x = origin.x as isize + cfg.col;
-        let mut y = origin.y as isize + cfg.row;
+        // `cfg.col`/`cfg.row` are wire-derived (`nvim_open_win`) and unbounded, so a
+        // hostile near-`isize::MAX` offset would overflow a raw `isize` add (panic in
+        // debug, wrap in release). Saturate: the trailing `clamp(lo, hi).max(0)` pins
+        // the result on-screen regardless, so in-range geometry is unaffected.
+        let mut x = (origin.x as isize).saturating_add(cfg.col);
+        let mut y = (origin.y as isize).saturating_add(cfg.row);
         if matches!(cfg.anchor, FloatAnchor::NE | FloatAnchor::SE) {
-            x -= w as isize;
+            x = x.saturating_sub(w as isize);
         }
         if matches!(cfg.anchor, FloatAnchor::SW | FloatAnchor::SE) {
-            y -= h as isize;
+            y = y.saturating_sub(h as isize);
         }
         let lo_x = bounds.x as isize;
         let lo_y = bounds.y as isize;

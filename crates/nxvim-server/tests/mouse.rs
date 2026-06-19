@@ -1791,3 +1791,49 @@ async fn custom_tabline_click_outside_region_is_noop() {
         "fill area switched nothing"
     );
 }
+
+/// Defense-in-depth at the wire-input boundary: a hostile near-`usize::MAX`
+/// screen dimension (`nx_ui_try_resize`) and mouse coordinate (`nx_input_mouse`)
+/// must NOT OOM/abort the server or wedge it in an effectively infinite
+/// row-fill loop. The dispatch boundary clamps screen-cell dimensions/coords to
+/// a sane ceiling (`MAX_SCREEN_DIM`), far above any real display, so an absurd
+/// value is capped rather than driving a `usize::MAX`-element grid allocation in
+/// the view. We assert survival: the server still answers a barrier with the
+/// correct buffer after the hostile requests.
+#[tokio::test]
+async fn hostile_resize_and_mouse_coords_do_not_oom_the_server() {
+    let (rpc, _incoming) = start("alpha\nbeta\ngamma").await;
+
+    // A pathological resize: width/height near the integer ceiling. Without the
+    // boundary clamp this sizes `Vec::with_capacity(height)` and a
+    // `while rows.len() < height` filler loop in the view at ~`usize::MAX`.
+    rpc.request(
+        "nx_ui_try_resize",
+        vec![Value::from(u64::MAX), Value::from(u64::MAX)],
+    )
+    .await
+    .expect("the resize request is answered, not OOM/aborted");
+
+    // A pathological mouse cell at the same magnitude (row/col params 4/5).
+    rpc.notify(
+        "nx_input_mouse",
+        vec![
+            Value::from("left"),
+            Value::from("press"),
+            Value::from(""),
+            Value::from(0u64),
+            Value::from(u64::MAX),
+            Value::from(u64::MAX),
+        ],
+    );
+
+    // The server is still alive and consistent: the buffer is intact and a
+    // barrier round-trips. (If the hostile values had propagated, the redraw
+    // following either request would have OOM'd / hung before this resolves.)
+    assert_eq!(
+        lines(&rpc).await,
+        vec!["alpha", "beta", "gamma"],
+        "server survived the hostile geometry and serves the buffer"
+    );
+    assert_eq!(mode(&rpc).await, "n");
+}

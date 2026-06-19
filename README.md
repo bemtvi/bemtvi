@@ -1,4 +1,4 @@
-# nxvim
+# nxvim - the Not eXactly Vim editor
 
 A modal, vim-style editor **100% vibe-coded** using Claude Code — modal editing,
 Lua plugins, treesitter highlighting, and LSP, built on a fully async,

@@ -93,8 +93,8 @@ local GIT_ENV = {
   GCM_INTERACTIVE = "never",
 }
 
--- The install root, resolved lazily so a test can override it via setup{} before
--- first use without depending on the host's data dir.
+-- The install root, resolved lazily so a test can override it via setup_manager{}
+-- before first use without depending on the host's data dir.
 local function root()
   if not M._opts.root then
     M._opts.root = vim.fn.stdpath("data") .. "/plugins"
@@ -103,8 +103,8 @@ local function root()
 end
 
 -- The user's config directory — where the first-run setup writes the managed
--- `lua/plugins.lua` and points `init.lua` at it. Overridable via setup{} (a test
--- points it at a temp dir; a user could relocate it).
+-- `lua/plugins.lua` and points `init.lua` at it. Overridable via setup_manager{}
+-- (a test points it at a temp dir; a user could relocate it).
 local function config_dir()
   if not M._opts.config then
     M._opts.config = vim.fn.stdpath("config")
@@ -122,6 +122,22 @@ local aslist, aslist_triggers
 -- default `name` (its directory under the install root, and its require key).
 local function basename(s)
   return (s:gsub("%.git$", ""):gsub("[/\\]+$", ""):match("[^/\\]+$"))
+end
+
+-- Expand a leading `~` / `~/` to $HOME so a spec can point `dir` at a dev checkout
+-- under the home directory (`dir = "~/work/foo"`). Only the leading tilde is
+-- touched — a mid-path `~` is a literal path component — and with no $HOME the
+-- path is returned unchanged rather than mangled.
+local function expanduser(p)
+  local home = os.getenv("HOME")
+  if not home or home == "" then
+    return p
+  elseif p == "~" then
+    return home
+  elseif p:sub(1, 2) == "~/" then
+    return home .. p:sub(2)
+  end
+  return p
 end
 
 -- True for a string that already names a transport (a full URL or scp-form
@@ -160,7 +176,11 @@ local function normalize(spec)
     error('nx.plugins: a spec needs a source ("owner/repo"/url) or a local `dir`', 0)
   end
 
-  local name = spec.name or (src and basename(src)) or basename(spec.dir)
+  -- A local-dev `dir` may use `~`/`~/` for the home directory; expand it once here
+  -- so every later step (the require key, the rtp entry) sees an absolute path.
+  local dir = spec.dir and expanduser(spec.dir) or nil
+
+  local name = spec.name or (src and basename(src)) or basename(dir)
   local url = src and (is_full_url(src) and src or M._opts.github:format(src)) or nil
 
   -- `commit`/`tag`/`version` all pin; `commit` wins. A pin is never auto-updated.
@@ -194,9 +214,9 @@ local function normalize(spec)
     commit = commit,
     tag = tag,
     -- Resolved install directory: an explicit `dir` (a local/dev checkout, never
-    -- cloned) or root()/name.
-    dir = spec.dir, -- local-dev marker (nil for a managed clone)
-    _dir = spec.dir or (root() .. "/" .. name),
+    -- cloned; `~` already expanded) or root()/name.
+    dir = dir, -- local-dev marker (nil for a managed clone)
+    _dir = dir or (root() .. "/" .. name),
     enabled = spec.enabled,
     config = as_fn(spec.config, "config"),
     init = as_fn(spec.init, "init"),
@@ -480,9 +500,12 @@ setmetatable(M, {
   end,
 })
 
--- nx.plugins.setup{ root=, github= }: override the install root (a test points it
--- at a temp dir) or the shorthand URL template. Merges onto the defaults.
-function M.setup(opts)
+-- nx.plugins.setup_manager{ root=, github= }: override the install root (a test
+-- points it at a temp dir) or the shorthand URL template. Merges onto the
+-- defaults. (Named `setup_manager`, not `setup`, so it reads distinctly from a
+-- plugin's own `require("plugin").setup{}` and never looks like the call that
+-- declares plugins — that is `nx.plugins{...}` / `nx.plugins.add`.)
+function M.setup_manager(opts)
   opts = opts or {}
   for k, v in pairs(opts) do
     M._opts[k] = v

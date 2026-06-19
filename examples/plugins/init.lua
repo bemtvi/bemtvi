@@ -26,10 +26,11 @@
 --   :PluginUpdate   -- fast-forward the unpinned ones
 --   :PluginClean    -- remove clones no spec declares
 --
--- Clones land under stdpath("data")/plugins (overridable with nx.plugins.setup).
+-- Clones land under stdpath("data")/plugins (overridable with
+-- nx.plugins.setup_manager).
 
 -- Optional: point the install root somewhere of your choosing.
--- nx.plugins.setup({ root = vim.fn.stdpath("data") .. "/plugins" })
+-- nx.plugins.setup_manager({ root = vim.fn.stdpath("data") .. "/plugins" })
 
 nx.plugins({
   -- A COLORSCHEME (a pure-Lua module that fills the highlight registry). Loaded

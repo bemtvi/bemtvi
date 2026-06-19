@@ -123,7 +123,7 @@ async fn setup_root(rpc: &Rpc, tag: &str) -> PathBuf {
     let root = temp_dir(tag).join("install");
     exec_lua(
         rpc,
-        &format!("nx.plugins.setup({{ root = \"{}\" }})", q(&root)),
+        &format!("nx.plugins.setup_manager({{ root = \"{}\" }})", q(&root)),
     )
     .await;
     root
@@ -305,6 +305,35 @@ async fn local_dir_plugin_loads_without_clone() {
     );
 }
 
+// ----- a `dir` with a leading `~` expands to $HOME ---------------------------
+
+#[tokio::test]
+async fn local_dir_expands_leading_tilde() {
+    let (rpc, _i) = start().await;
+
+    // A `dir` may name a dev checkout under the home directory with `~`. It is
+    // expanded once at declaration, so the stored install dir is absolute (no
+    // stray `~` that a later `require` / rtp insert would fail to resolve).
+    // `enabled = false` registers the spec without trying to load the (absent)
+    // checkout. The comparison runs server-side so it reads the server's $HOME.
+    let ok = lua_bool(
+        &rpc,
+        r#"
+        local home = os.getenv("HOME")
+        nx.plugins.add({ name = "tildeplug", dir = "~/dev/tildeplug", enabled = false })
+        local spec = nx.plugins._specs["tildeplug"]
+        return spec.dir == home .. "/dev/tildeplug"
+          and spec._dir == home .. "/dev/tildeplug"
+        "#,
+    )
+    .await;
+    assert_eq!(
+        ok,
+        Some(true),
+        "a `dir` of \"~/dev/tildeplug\" should expand its leading ~ to $HOME"
+    );
+}
+
 // ----- clean removes undeclared clones ---------------------------------------
 
 #[tokio::test]
@@ -428,7 +457,7 @@ async fn git_runs_noninteractive_with_terminal_prompt_disabled() {
     exec_lua(
         &rpc,
         &format!(
-            "nx.plugins.setup({{ root = \"{root}\", git = \"{git}\" }})\n\
+            "nx.plugins.setup_manager({{ root = \"{root}\", git = \"{git}\" }})\n\
              nx.plugins {{ {{ \"file:///no/such/repo\", name = \"zeta\" }} }}\n\
              nx.plugins.install():catch(function(e) _G.err = tostring(e and e.message or e) end)",
             root = q(&root),
@@ -461,7 +490,7 @@ async fn setup_root_and_config(rpc: &Rpc, tag: &str) -> (std::path::PathBuf, std
     exec_lua(
         rpc,
         &format!(
-            "nx.plugins.setup({{ root = \"{}\", config = \"{}\" }})",
+            "nx.plugins.setup_manager({{ root = \"{}\", config = \"{}\" }})",
             q(&root),
             q(&cfg)
         ),
@@ -614,7 +643,7 @@ async fn vim_enter_triggers_the_first_run_prompt() {
     std::fs::write(
         cfg.join("init.lua"),
         format!(
-            "nx.plugins.setup({{ root = \"{root}\", config = \"{cfg}\" }})\n\
+            "nx.plugins.setup_manager({{ root = \"{root}\", config = \"{cfg}\" }})\n\
              nx.plugins.recommend({{ {{ \"file://{repo}\", name = \"theta\" }} }})\n",
             root = q(&root),
             cfg = q(&cfg),
@@ -927,7 +956,7 @@ async fn built_in_default_recommended_offers_when_config_registers_none() {
     std::fs::write(
         cfg.join("init.lua"),
         format!(
-            "nx.plugins.setup({{ root = \"{root}\", config = \"{cfg}\" }})\n",
+            "nx.plugins.setup_manager({{ root = \"{root}\", config = \"{cfg}\" }})\n",
             root = q(&root),
             cfg = q(&cfg)
         ),

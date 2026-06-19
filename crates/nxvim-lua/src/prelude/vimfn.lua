@@ -530,6 +530,26 @@ end
 function nx.qf.newer(count)
   vim.cmd(count and ("cnewer " .. count) or "cnewer")
 end
+-- Location-list counterparts to the window / navigation wrappers above: thin
+-- wrappers over the `:l*` ex-commands, acting on the current window's list.
+function nx.qf.lopen(height)
+  vim.cmd(height and ("lopen " .. height) or "lopen")
+end
+function nx.qf.lclose()
+  vim.cmd("lclose")
+end
+function nx.qf.lnext()
+  vim.cmd("lnext")
+end
+function nx.qf.lprev()
+  vim.cmd("lprev")
+end
+function nx.qf.lolder(count)
+  vim.cmd(count and ("lolder " .. count) or "lolder")
+end
+function nx.qf.lnewer(count)
+  vim.cmd(count and ("lnewer " .. count) or "lnewer")
+end
 
 -- nx._qf_make(cmd, efm, title, open, jump, loclist_win): the async :make / :grep
 -- producer (dispatched from the server, which already expanded

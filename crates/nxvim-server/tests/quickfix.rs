@@ -337,6 +337,36 @@ async fn copen_then_cclose_opens_and_closes_the_window() {
     assert_eq!(win_count(&rpc).await, before, ":cclose removes it");
 }
 
+/// The `nx.qf` location-list nav wrappers (`lopen`/`lclose`/`lnext`/…) drive the
+/// `:l*` ex-commands, mirroring the quickfix wrappers but acting on the current
+/// window's location list. Here the list is built with `nx.qf.setloclist`, opened
+/// and closed entirely through the Lua surface — no `:l*` keystrokes.
+#[tokio::test]
+async fn nx_qf_loclist_wrappers_open_navigate_and_close() {
+    let (rpc, _incoming) = start().await;
+    exec_lua(
+        &rpc,
+        r#"nx.qf.setloclist(0, {
+             { filename = "a.c", lnum = 10, col = 5, text = "boom" },
+             { filename = "b.c", lnum = 3, text = "later" },
+           }, " ")"#,
+    )
+    .await;
+    let before = win_count(&rpc).await;
+    exec_lua(&rpc, "nx.qf.lopen()").await;
+    assert_eq!(
+        win_count(&rpc).await,
+        before + 1,
+        "nx.qf.lopen adds a window"
+    );
+    // The location-list window is focused; its buffer holds the rendered entries.
+    let rendered = lines(&rpc).await;
+    assert_eq!(rendered[0], "a.c|10 col 5| boom");
+    assert_eq!(rendered[1], "b.c|3| later");
+    exec_lua(&rpc, "nx.qf.lclose()").await;
+    assert_eq!(win_count(&rpc).await, before, "nx.qf.lclose removes it");
+}
+
 #[tokio::test]
 async fn quickfix_window_is_nomodifiable() {
     let (rpc, mut incoming) = start().await;

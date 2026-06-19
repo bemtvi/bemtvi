@@ -1501,3 +1501,38 @@ async fn bdelete_a_buffer_split_then_moved_to_a_dock_does_not_crash() {
         "the lingering split window was rebound, not left dangling"
     );
 }
+
+#[tokio::test]
+async fn opening_a_picker_in_a_too_small_dock_does_not_crash() {
+    // Regression: a picker focused in a dock too short to fit its prompt+separator
+    // chrome computed `height.clamp(chrome + 1, max_h)` with `max_h < chrome + 1`,
+    // and `usize::clamp` panics when `min > max` — taking the server down on the
+    // redraw that projects the box. A focused tiny dock must just yield a cramped
+    // (but valid) picker, never a crash.
+    let _g = serial_lock();
+    let (rpc, _incoming) = start().await; // 80x24
+
+    // A 2-row bottom dock — too short for the picker's 3-row minimum chrome.
+    exec_lua(&rpc, "nx.dock.open({ side = 'bottom', size = 2 })").await;
+    // A hermetic static source (no `rg` spawn).
+    exec_lua(
+        &rpc,
+        r#"nx.picker.source {
+            name = 'fruits',
+            items = function(ctx) ctx.push { text = 'apple' } end,
+            confirm = function() end,
+        }"#,
+    )
+    .await;
+    // Focus the tiny dock, then open the picker there — this drove the panic.
+    exec_lua(&rpc, "nx.dock.focus('bottom')").await;
+    exec_lua(&rpc, "nx.picker.open('fruits')").await;
+
+    // The server is still alive: a request round-trips (a panicked server thread
+    // would drop the connection and this `expect` would fire).
+    let alive = req(&rpc, "nvim_get_mode", vec![]).await;
+    assert!(matches!(alive, Value::Map(_) | Value::Array(_)));
+    // And the picker is actually open (not silently dropped).
+    let open = exec_lua(&rpc, "return nx._picker ~= nil").await;
+    assert_eq!(open, Value::Boolean(true), "the picker opened in the dock");
+}

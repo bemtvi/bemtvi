@@ -1455,12 +1455,19 @@ impl Editor {
                         e.resolve(text_width)
                     })
                     .clamp(1, max_w);
+                // The natural floor is `chrome + 1` (the prompt/separator rows plus
+                // one list row), but in a region too short to fit even that
+                // (`max_h < chrome + 1`, e.g. the picker focused in a 2-row dock) the
+                // floor would exceed the ceiling and `clamp` would panic on `min > max`.
+                // Cap the floor at `max_h` so the box just shrinks to the region; the
+                // `list_rows` `.max(1)` below still guarantees a usable row.
+                let min_h = (chrome + 1).min(max_h);
                 let height = m
                     .height
                     .map_or((text_height as f32 * DEFAULT_H).round() as usize, |e| {
                         e.resolve(text_height)
                     })
-                    .clamp(chrome + 1, max_h);
+                    .clamp(min_h, max_h);
                 // Align the box within the text area, inset by the margin. The
                 // default (`align == None`) is `Center` — the historical centered
                 // picker placement. The `+2` accounts for the box's own border, so

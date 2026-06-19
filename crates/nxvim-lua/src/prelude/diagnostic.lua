@@ -178,9 +178,11 @@ function nx.diagnostic.toqflist(diagnostics)
       bufnr = d.bufnr,
       filename = fname,
       lnum = (d.lnum or 0) + 1,
-      end_lnum = d.end_lnum and (d.end_lnum + 1) or 0,
+      -- An absent end defaults to the start (neovim's behavior); emitting a
+      -- 1-based start with a 0 end would be an invalid backwards range.
+      end_lnum = (d.end_lnum or d.lnum or 0) + 1,
       col = (d.col or 0) + 1,
-      end_col = d.end_col and (d.end_col + 1) or 0,
+      end_col = (d.end_col or d.col or 0) + 1,
       text = d.message or "",
       type = SEVERITY_TYPE[d.severity] or "E",
     }

@@ -104,14 +104,16 @@ pub struct Padding {
 }
 
 impl Padding {
-    /// Total cells consumed horizontally (left + right).
+    /// Total cells consumed horizontally (left + right). Saturating: the operands
+    /// come off the wire, so a malformed/oversized pair must not overflow-panic.
     pub fn horizontal(&self) -> u16 {
-        self.left + self.right
+        self.left.saturating_add(self.right)
     }
 
-    /// Total cells consumed vertically (top + bottom).
+    /// Total cells consumed vertically (top + bottom). Saturating for the same
+    /// wire-safety reason as [`horizontal`](Self::horizontal).
     pub fn vertical(&self) -> u16 {
-        self.top + self.bottom
+        self.top.saturating_add(self.bottom)
     }
 }
 
@@ -637,7 +639,10 @@ impl View {
             .and_then(Value::as_bool)
             .unwrap_or(false);
         self.cmdline = map_str(map, "cmdline");
-        self.cmdline_prefix = map_str(map, "cmdline_prefix").chars().next().unwrap_or(':');
+        self.cmdline_prefix = map_get(map, "cmdline_prefix")
+            .and_then(Value::as_str)
+            .and_then(|s| s.chars().next())
+            .unwrap_or(':');
         self.cmdline_prompt = map_str(map, "cmdline_prompt");
         self.cmdline_cursor = map_u64(map, "cmdline_cursor") as usize;
         self.message = map_str(map, "message");
@@ -812,7 +817,8 @@ fn parse_window(m: &[(Value, Value)], styles: &[Style]) -> WindowView {
         }),
         _ => None,
     };
-    let region = WindowRegion::from_wire(&map_str(m, "region"));
+    let region =
+        WindowRegion::from_wire(map_get(m, "region").and_then(Value::as_str).unwrap_or(""));
     let scroll = match map_get(m, "scroll") {
         Some(Value::Map(s)) => Some(ScrollData {
             from_row: map_u64(s, "from_row") as f32,
@@ -984,7 +990,9 @@ fn parse_separators(value: Option<&Value>) -> Vec<Separator> {
                 x: map_u16(s, "x"),
                 y: map_u16(s, "y"),
                 length: map_u16(s, "length"),
-                region: WindowRegion::from_wire(&map_str(s, "region")),
+                region: WindowRegion::from_wire(
+                    map_get(s, "region").and_then(Value::as_str).unwrap_or(""),
+                ),
             }),
             _ => None,
         })

@@ -866,20 +866,35 @@ fn frame(body: &Value) -> Vec<u8> {
     out
 }
 
+/// The largest `Content-Length` we will buffer for a single JSON-RPC frame
+/// (256 MiB). A trustworthy language server never frames anything near this; an
+/// announced length past it is a corrupt/hostile header, so the frame is dropped
+/// (loudly, past its body if it arrives) rather than letting `inbuf` grow without
+/// bound waiting for bytes that may never come. Generous enough for any real
+/// payload (a whole-file `didOpen`, a large `semanticTokens` set).
+const MAX_FRAME_LEN: usize = 256 * 1024 * 1024;
+
 /// Drain every complete `Content-Length`-framed JSON-RPC message from `inbuf`,
 /// leaving any trailing partial frame buffered for the next chunk. A malformed
-/// header is skipped (past its terminator) rather than stalling the stream.
+/// header is skipped (past its terminator) rather than stalling the stream, and an
+/// absurd `Content-Length` (> [`MAX_FRAME_LEN`]) drops the frame rather than
+/// buffering unboundedly.
 fn parse_frames(inbuf: &mut Vec<u8>) -> Vec<Value> {
     let mut out = Vec::new();
-    loop {
-        let Some(hdr_end) = find_subsequence(inbuf, b"\r\n\r\n") else {
-            break;
-        };
+    while let Some(hdr_end) = find_subsequence(inbuf, b"\r\n\r\n") {
         let body_start = hdr_end + 4;
         let Some(len) = parse_content_length(&inbuf[..hdr_end]) else {
             inbuf.drain(..body_start); // skip the unparseable header, keep going
             continue;
         };
+        // An over-long frame is a protocol error: never grow `inbuf` to hold it.
+        // Skip past the header now; the body (when/if it arrives) parses as a fresh
+        // frame and fails the header search, so the trailing bytes drain out rather
+        // than wedging the stream on a length we refuse to honor.
+        if len > MAX_FRAME_LEN {
+            inbuf.drain(..body_start);
+            continue;
+        }
         if inbuf.len() < body_start + len {
             break; // body not fully arrived yet
         }
@@ -893,11 +908,15 @@ fn parse_frames(inbuf: &mut Vec<u8>) -> Vec<Value> {
 }
 
 /// The `Content-Length` value from a JSON-RPC frame header block (case-insensitive
-/// field name, per the LSP base protocol).
+/// field name, per the LSP base protocol). Other header lines (`Content-Type`, or
+/// a line with no colon) are skipped — only a missing/unparseable `Content-Length`
+/// yields `None`.
 fn parse_content_length(header: &[u8]) -> Option<usize> {
     let text = std::str::from_utf8(header).ok()?;
     for line in text.split("\r\n") {
-        let (name, value) = line.split_once(':')?;
+        let Some((name, value)) = line.split_once(':') else {
+            continue; // not a `name: value` line — skip, don't abandon the scan
+        };
         if name.trim().eq_ignore_ascii_case("content-length") {
             return value.trim().parse().ok();
         }

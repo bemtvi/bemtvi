@@ -12,6 +12,13 @@ publish = false
 [dependencies]
 nxvim-core.workspace = true
 nxvim-rpc.workspace = true
-nxvim-server.workspace = true
+# The harness uses `nxvim_server::{run, ServerInit}`, both gated behind the
+# server's `native` feature. The workspace pins `nxvim-server` with
+# `default-features = false` (so the wasm edit-host can opt out), which leaves
+# `native` off when this crate is built in isolation (`cargo clippy -p
+# nxvim-test-harness`) — those imports then fail to resolve. Request `native`
+# explicitly here: a no-op for the real consumer builds (feature unification
+# already turns it on) that also lets the harness compile/lint standalone.
+nxvim-server = { workspace = true, features = ["native"] }
 rmpv.workspace = true
 tokio.workspace = true

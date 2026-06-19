@@ -933,8 +933,18 @@ function nx.autocmd.clear(opts)
       return true
     end
     if want_pats then
+      -- au.opts.pattern may itself be a list (a multi-pattern autocmd); match if
+      -- any stored pattern overlaps any requested one, like au_matches.
       local pat = au.opts.pattern
-      if not vim.tbl_contains(want_pats, pat) then
+      local pats = type(pat) == "table" and pat or { pat }
+      local hit = false
+      for _, w in ipairs(want_pats) do
+        if vim.tbl_contains(pats, w) then
+          hit = true
+          break
+        end
+      end
+      if not hit then
         return true
       end
     end

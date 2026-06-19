@@ -38,7 +38,7 @@ pub struct Geometry {
 /// for an open dock (`n > 0`), `0` when closed. Mirrors `DockBands::reserved`.
 fn reserved(n: u16) -> u16 {
     if n > 0 {
-        n + 1
+        n.saturating_add(1)
     } else {
         0
     }
@@ -58,8 +58,8 @@ pub fn resize_handle_at(view: &View, geo: Geometry, row: u16, col: u16) -> Optio
 /// The middle band (left dock | main | right docks) vertical span `(top, height)`
 /// — the rows the left/right dock edges run down, mirroring `region_geoms`.
 fn middle_band(view: &View, geo: Geometry) -> (u16, u16) {
-    let chrome = geo.tabline_rows + geo.global_status_rows;
-    let mid_y = reserved(view.dock_top) + geo.tabline_rows;
+    let chrome = geo.tabline_rows.saturating_add(geo.global_status_rows);
+    let mid_y = reserved(view.dock_top).saturating_add(geo.tabline_rows);
     let mid_h = geo
         .rows
         .saturating_sub(reserved(view.dock_top))
@@ -81,7 +81,7 @@ fn dock_edge_at(view: &View, geo: Geometry, row: u16, col: u16) -> Option<Resize
         view.dock_bottom,
     );
     let (mid_y, mid_h) = middle_band(view, geo);
-    let in_mid = row >= mid_y && row < mid_y + mid_h;
+    let in_mid = row >= mid_y && row < mid_y.saturating_add(mid_h);
     if dl > 0 && in_mid && col == dl {
         return Some(ResizeCursor::Col);
     }
@@ -104,17 +104,24 @@ fn dock_edge_at(view: &View, geo: Geometry, row: u16, col: u16) -> Option<Resize
 fn split_handle_at(view: &View, geo: Geometry, row: u16, col: u16) -> Option<ResizeCursor> {
     for sep in &view.separators {
         let (ox, oy) = region_origin(view, geo, sep.region);
+        // Separator coordinates come off the wire; saturate so a malformed/oversized
+        // value can't overflow-panic (debug) or wrap (release) in this per-hover path,
+        // matching the saturating band math in `dock_edge_at`/`region_origin`.
         if sep.vertical {
-            let sx = ox + sep.x;
-            if col == sx && row >= oy + sep.y && row < oy + sep.y + sep.length {
+            let sx = ox.saturating_add(sep.x);
+            let top = oy.saturating_add(sep.y);
+            let bottom = top.saturating_add(sep.length);
+            if col == sx && row >= top && row < bottom {
                 return Some(ResizeCursor::Col);
             }
         } else {
-            let sy = oy + sep.y;
-            let in_x = col >= ox + sep.x && col < ox + sep.x + sep.length;
+            let sy = oy.saturating_add(sep.y);
+            let left = ox.saturating_add(sep.x);
+            let right = left.saturating_add(sep.length);
+            let in_x = col >= left && col < right;
             // The separator row resizes the split; so does the status row one cell
             // above it (the status-line handle for the window directly above).
-            if in_x && (row == sy || row + 1 == sy) {
+            if in_x && (row == sy || row.saturating_add(1) == sy) {
                 return Some(ResizeCursor::Row);
             }
         }
@@ -136,7 +143,10 @@ fn region_origin(view: &View, geo: Geometry, region: WindowRegion) -> (u16, u16)
         .max(1);
     // The bottom dock's band content starts past the middle band, the global status
     // line, and its own separator cell.
-    let bottom_y = mid_y + mid_h + geo.global_status_rows + 1;
+    let bottom_y = mid_y
+        .saturating_add(mid_h)
+        .saturating_add(geo.global_status_rows)
+        .saturating_add(1);
     // A dock reserves its band's first row for its own tabline when it has more than
     // one of its own tabs and the band is tall enough to spare a row.
     let dock_tl = |region, band: u16| -> u16 {
@@ -151,9 +161,15 @@ fn region_origin(view: &View, geo: Geometry, region: WindowRegion) -> (u16, u16)
     };
     match region {
         WindowRegion::Main => (reserved_left, mid_y),
-        WindowRegion::DockLeft => (0, mid_y + dock_tl(region, mid_h)),
-        WindowRegion::DockRight => (reserved_left + main_w + 1, mid_y + dock_tl(region, mid_h)),
+        WindowRegion::DockLeft => (0, mid_y.saturating_add(dock_tl(region, mid_h))),
+        WindowRegion::DockRight => (
+            reserved_left.saturating_add(main_w).saturating_add(1),
+            mid_y.saturating_add(dock_tl(region, mid_h)),
+        ),
         WindowRegion::DockTop => (0, dock_tl(region, view.dock_top)),
-        WindowRegion::DockBottom => (0, bottom_y + dock_tl(region, view.dock_bottom)),
+        WindowRegion::DockBottom => (
+            0,
+            bottom_y.saturating_add(dock_tl(region, view.dock_bottom)),
+        ),
     }
 }

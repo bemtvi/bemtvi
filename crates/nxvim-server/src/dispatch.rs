@@ -773,7 +773,10 @@ fn value_margin(v: Option<&Value>) -> [u64; 4] {
         },
         Some(other) => {
             let n = other.as_u64().unwrap_or(0);
-            [n, n * 2, n, n * 2]
+            // Horizontal sides get twice the cells; `saturating_mul` so a bogus
+            // wire-supplied count can't overflow-panic the server in debug builds.
+            let h = n.saturating_mul(2);
+            [n, h, n, h]
         }
         None => [0; 4],
     }

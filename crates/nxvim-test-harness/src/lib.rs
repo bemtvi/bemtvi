@@ -298,21 +298,35 @@ pub async fn lua_u64(rpc: &Rpc, code: &str) -> Option<u64> {
 /// (the raw `Vec<Value>`), or `None` when none is buffered. *Params convention.*
 pub fn drain_latest_redraw(incoming: &mut UnboundedReceiver<Incoming>) -> Option<Vec<Value>> {
     let mut latest = None;
-    while let Ok(Incoming::Notification { method, params }) = incoming.try_recv() {
-        if method == "redraw" {
-            latest = Some(params);
+    loop {
+        match incoming.try_recv() {
+            Ok(Incoming::Notification { method, params }) if method == "redraw" => {
+                latest = Some(params);
+            }
+            // A non-redraw notification or a server-initiated request (FS/proc/LSP
+            // traffic, all of which interleave with `redraw`s on a busy channel):
+            // skip it but keep draining, or a later redraw left behind it would make
+            // this return a stale frame — the take-first flakiness CLAUDE.md warns of.
+            Ok(_) => continue,
+            Err(_) => return latest,
         }
     }
-    latest
 }
 
 /// Drain every queued notification and return *all* `redraw` params in arrival
 /// order. *Params convention.*
 pub fn drain_all_redraws(incoming: &mut UnboundedReceiver<Incoming>) -> Vec<Vec<Value>> {
     let mut all = Vec::new();
-    while let Ok(Incoming::Notification { method, params }) = incoming.try_recv() {
-        if method == "redraw" {
-            all.push(params);
+    loop {
+        match incoming.try_recv() {
+            Ok(Incoming::Notification { method, params }) if method == "redraw" => {
+                all.push(params);
+            }
+            // Skip non-redraw notifications / server-initiated requests but keep
+            // draining (see `drain_latest_redraw`); stopping at the first one would
+            // silently truncate the redraw history at any interleaved FS/proc frame.
+            Ok(_) => continue,
+            Err(_) => break,
         }
     }
     all

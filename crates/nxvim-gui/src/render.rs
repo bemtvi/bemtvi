@@ -1475,7 +1475,7 @@ impl Renderer {
             } else {
                 (self.cell_w * block_cells, 0.5) // block, translucent so glyphs show
             };
-            let mut c = srgb_to_color_rgba(cursor_color, alpha);
+            let c = srgb_to_color_rgba(cursor_color, alpha);
             // Replace mode → underline-ish thin block at the bottom.
             if view.is_replace() {
                 let h = self.cell_h * 0.15;
@@ -1488,7 +1488,6 @@ impl Renderer {
                 });
                 return;
             }
-            c[3] = alpha;
             quads.push(Quad {
                 x: px,
                 y: py,
@@ -1563,8 +1562,7 @@ impl Renderer {
             } else {
                 // Normal/visual → a half-transparent foreground block (the glyph
                 // shows through), the GUI analogue of reverse-video.
-                let mut c = srgb_to_color_rgba(fg, 0.5);
-                c[3] = 0.5;
+                let c = srgb_to_color_rgba(fg, 0.5);
                 quads.push(Quad {
                     x: px,
                     y: py,
@@ -1632,8 +1630,7 @@ impl Renderer {
             let col = prompt_width + view.cmdline_cursor as u16;
             let (px, py) = self.cell_px(col, cmd_row);
             let cursor_color = style_fg(&view.normal).unwrap_or(DEFAULT_FG);
-            let mut c = srgb_to_color_rgba(cursor_color, 0.5);
-            c[3] = 0.5;
+            let c = srgb_to_color_rgba(cursor_color, 0.5);
             quads.push(Quad {
                 x: px,
                 y: py,
@@ -2281,8 +2278,7 @@ impl Renderer {
             // The caret: a thin bar past the `> ` prefix at the query's cursor column.
             let caret = (2 + menu.query_cursor).min(list_w.saturating_sub(1));
             let (cpx, cpy) = self.cell_px(cx + caret, content_y0 + prompt_y);
-            let mut c = srgb_to_color_rgba(fg, 0.9);
-            c[3] = 0.9;
+            let c = srgb_to_color_rgba(fg, 0.9);
             quads.push(Quad {
                 x: cpx,
                 y: cpy,
@@ -3639,9 +3635,9 @@ fn style_bg(s: &Option<Style>) -> Option<u32> {
 fn srgb_to_color(c: u32) -> Color {
     Color::rgb((c >> 16) as u8, (c >> 8) as u8, c as u8)
 }
-fn srgb_to_color_rgba(c: u32, _alpha: f32) -> [f32; 4] {
+fn srgb_to_color_rgba(c: u32, alpha: f32) -> [f32; 4] {
     let lin = srgb_u32_to_linear(c);
-    [lin[0], lin[1], lin[2], 1.0]
+    [lin[0], lin[1], lin[2], alpha]
 }
 fn color_to_rgba(c: Color) -> [f32; 4] {
     // glyphon Color is sRGB bytes; our quad pipeline targets an sRGB surface, so

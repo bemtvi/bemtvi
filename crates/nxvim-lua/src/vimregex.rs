@@ -37,6 +37,10 @@ pub fn substitute(input: &str, pat: &str, sub: &str, flags: &str) -> Result<Stri
     let ignorecase = flags.contains('i') && !flags.contains('I');
     let re = compile(pat).map_err(|e| e.replace("vim.regex:", "vim.fn.substitute:"))?;
 
+    // Pre-collect the replacement once: it's constant across every match, so
+    // re-walking it per match would be wasted work and allocation.
+    let sub_chars: Vec<char> = sub.chars().collect();
+
     let mut out = String::new();
     let mut last = 0;
     let mut from = 0;
@@ -46,16 +50,27 @@ pub fn substitute(input: &str, pat: &str, sub: &str, flags: &str) -> Result<Stri
             Ok(None) => break,
             Err(e) => return Err(format!("vim.fn.substitute: match failed: {e}")),
         };
-        out.push_str(&input[last..m.start]);
-        expand_replacement(sub, input, &m, &mut out);
+        // The C engine reports byte offsets; with `\zs`/`\ze`/look-around a match
+        // start can precede the previous match end or land off a char boundary.
+        // Slice defensively so a pathological pattern is a loud Lua error, not a panic.
+        out.push_str(safe_slice(input, last, m.start)?);
+        expand_replacement(&sub_chars, input, &m, &mut out)?;
         last = m.end;
         if !global {
             break;
         }
         from = advance(input, m.start, m.end);
     }
-    out.push_str(&input[last..]);
+    out.push_str(safe_slice(input, last, input.len())?);
     Ok(out)
+}
+
+/// Slice `input[start..end]`, returning a named error rather than panicking if the
+/// engine handed back a backward range or a non-char-boundary offset.
+fn safe_slice(input: &str, start: usize, end: usize) -> Result<&str, String> {
+    input.get(start..end).ok_or_else(|| {
+        format!("vim.fn.substitute: match byte range {start}..{end} is invalid (not a char boundary or reversed)")
+    })
 }
 
 /// Compile a vim pattern into a [`VimRegex`], the engine behind the `vim.regex(pat)`
@@ -103,27 +118,31 @@ impl Case {
     }
 }
 
-/// Expand a vim replacement string against a match `m` over `input`, appending to
-/// `out`.
-fn expand_replacement(sub: &str, input: &str, m: &LineMatch, out: &mut String) {
+/// Expand a vim replacement (pre-split into `chars`) against a match `m` over
+/// `input`, appending to `out`. Fails loud if a submatch's byte range is invalid
+/// (the engine can report off-boundary offsets for `\zs`/`\ze`/look-around).
+fn expand_replacement(
+    chars: &[char],
+    input: &str,
+    m: &LineMatch,
+    out: &mut String,
+) -> Result<(), String> {
     // The byte range of submatch `n` (group 0 is the whole match), as a slice of
-    // the input; `None` for a group that did not participate.
-    let group = |n: usize| -> Option<&str> {
-        m.submatches
-            .get(n)
-            .copied()
-            .flatten()
-            .map(|(s, e)| &input[s..e])
+    // the input; `Ok(None)` for a group that did not participate.
+    let group = |n: usize| -> Result<Option<&str>, String> {
+        match m.submatches.get(n).copied().flatten() {
+            Some((s, e)) => safe_slice(input, s, e).map(Some),
+            None => Ok(None),
+        }
     };
 
-    let chars: Vec<char> = sub.chars().collect();
     let mut i = 0;
     let mut case = Case::default();
     while i < chars.len() {
         let c = chars[i];
         if c == '&' {
             // The whole match (magic default).
-            case.emit(group(0).unwrap_or(""), out);
+            case.emit(group(0)?.unwrap_or(""), out);
             i += 1;
         } else if c == '\\' {
             i += 1;
@@ -133,7 +152,7 @@ fn expand_replacement(sub: &str, input: &str, m: &LineMatch, out: &mut String) {
             };
             i += 1;
             match n {
-                '0'..='9' => case.emit(group(n as usize - '0' as usize).unwrap_or(""), out),
+                '0'..='9' => case.emit(group(n as usize - '0' as usize)?.unwrap_or(""), out),
                 '&' => case.emit("&", out),
                 '\\' => case.emit("\\", out),
                 // vim's replacement specials: `\r` is a newline, `\n` is a NUL.
@@ -153,4 +172,5 @@ fn expand_replacement(sub: &str, input: &str, m: &LineMatch, out: &mut String) {
             i += 1;
         }
     }
+    Ok(())
 }

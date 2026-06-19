@@ -1750,7 +1750,13 @@ pub unsafe extern "C" fn eh_exec_lua(h: *mut WasmEditHost, code: *const c_char) 
 pub unsafe extern "C" fn eh_redraw_json(h: *mut WasmEditHost) -> *mut c_char {
     let json = match h.as_ref() {
         Some(handle) => match &handle.sink.borrow().last_redraw {
-            Some(params) => value_to_json(&Value::Array(params.clone())).to_string(),
+            // Map the frame's elements straight to JSON. Don't `Value::Array(params.clone())`
+            // first — that deep-clones the whole redraw tree (every grid line / cell) on the
+            // hot per-keystroke read path just to wrap it; `value_to_json` borrows, so build
+            // the JSON array directly from the slice.
+            Some(params) => {
+                serde_json::Value::Array(params.iter().map(value_to_json).collect()).to_string()
+            }
             None => "null".to_string(),
         },
         None => "null".to_string(),

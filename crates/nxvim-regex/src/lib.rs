@@ -32,6 +32,7 @@
 //!   than vim's full charsize machinery ('vartabstop', `<xx>` display of
 //!   unprintable bytes, 'list' mode etc. are not modeled).
 
+use std::cell::Cell;
 use std::collections::HashMap;
 use std::ffi::{c_char, c_int, c_void, CStr, CString};
 use std::fmt;
@@ -245,12 +246,22 @@ pub struct BufMatch {
 
 /// A compiled vim pattern (`vim_regcomp`).
 pub struct VimRegex {
-    prog: *mut c_void,
+    /// The compiled program. Held in a `Cell` because the engine may *replace*
+    /// it mid-exec: with automatic engine selection, an NFA program that hits
+    /// `NFA_TOO_EXPENSIVE` is freed and recompiled with the backtracking engine
+    /// inside `vim_regexec`/`vim_regexec_multi`, which write the new pointer
+    /// back into the `regmatch_T`/`regmmatch_T`. We must mirror that write here
+    /// or the old (now-freed) pointer becomes a use-after-free / double-free.
+    /// All access happens under the engine lock, which serializes it.
+    prog: Cell<*mut c_void>,
     pattern: String,
 }
 
 // The compiled program is owned exclusively and only used under the engine
-// lock; the raw pointer does not alias any thread-local state.
+// lock; the raw pointer does not alias any thread-local state. The `Cell` makes
+// `VimRegex` `!Sync` (so `&VimRegex` cannot cross threads), which is correct:
+// the engine lock only serializes owned access, it does not make concurrent
+// shared mutation of the same program safe.
 unsafe impl Send for VimRegex {}
 
 impl VimRegex {
@@ -293,7 +304,7 @@ impl VimRegex {
         // isn't misattributed to the next failing call
         unsafe { nxre_take_last_error() };
         Ok(VimRegex {
-            prog,
+            prog: Cell::new(prog),
             pattern: pattern.to_string(),
         })
     }
@@ -307,7 +318,7 @@ impl VimRegex {
     /// (`\n`, `\_x` classes) — useful for choosing a search strategy.
     pub fn is_multiline(&self) -> bool {
         let _guard = engine();
-        unsafe { re_multiline(self.prog) != 0 }
+        unsafe { re_multiline(self.prog.get()) != 0 }
     }
 
     /// Matches against a single line (no line breaks), starting at byte
@@ -325,14 +336,25 @@ impl VimRegex {
 
         let guard = engine();
         set_default_context(&guard);
+        if self.prog.get().is_null() {
+            // A prior exec's NFA→BT fallback recompile failed and left the
+            // program NULL; the engine would deref it. Fail loud.
+            return Err(VimRegexError(
+                "vim regex program is invalid (engine fallback recompile previously failed)".into(),
+            ));
+        }
         let mut rm = RegmatchT {
-            regprog: self.prog,
+            regprog: self.prog.get(),
             startp: [std::ptr::null_mut(); NSUBEXP],
             endp: [std::ptr::null_mut(); NSUBEXP],
             rm_matchcol: 0,
             rm_ic: ignore_case,
         };
         let matched = unsafe { vim_regexec(&mut rm, cline.as_ptr(), col) };
+        // The engine may have freed our program and recompiled it (NFA→BT
+        // fallback); adopt the pointer it wrote back so we don't keep a
+        // dangling one. It can also be left NULL if recompilation failed.
+        self.prog.set(rm.regprog);
         if !matched {
             if let Some(err) = unsafe { nxre_take_last_error().as_ref() } {
                 let msg = unsafe { CStr::from_ptr(err) }
@@ -372,7 +394,7 @@ impl VimRegex {
 impl Drop for VimRegex {
     fn drop(&mut self) {
         let _guard = engine();
-        unsafe { vim_regfree(self.prog) };
+        unsafe { vim_regfree(self.prog.get()) };
     }
 }
 
@@ -552,17 +574,31 @@ impl VimBuffer {
             return Err(VimRegexError(format!("lnum {lnum} out of range")));
         }
         let _guard = engine();
+        if re.prog.get().is_null() {
+            // A prior exec's NFA→BT fallback recompile failed and left the
+            // program NULL; the engine would deref it. Fail loud.
+            return Err(VimRegexError(
+                "vim regex program is invalid (engine fallback recompile previously failed)".into(),
+            ));
+        }
 
         let mut rmm = RegmmatchT {
-            regprog: re.prog,
+            regprog: re.prog.get(),
             startpos: [LposT::default(); NSUBEXP],
             endpos: [LposT::default(); NSUBEXP],
             rmm_matchcol: 0,
             rmm_ic: c_int::from(ignore_case),
             rmm_maxcol: 0,
         };
-        let deadline = timeout_ms
-            .map(|ms| unsafe { nxre_profile_setlimit(i64::try_from(ms).unwrap_or(i64::MAX)) });
+        let deadline = timeout_ms.map(|ms| {
+            // The shim computes `now_ns + ms*1_000_000` in u64; a huge `ms`
+            // would overflow that multiply/add and wrap to a *tiny* deadline,
+            // causing spurious immediate timeouts. Clamp to a bound that keeps
+            // the nanosecond deadline well within u64 (~years of headroom),
+            // which for any real `'redrawtime'` value is effectively unbounded.
+            const MAX_MS: u64 = u64::MAX / 1_000_000 / 2;
+            unsafe { nxre_profile_setlimit(ms.min(MAX_MS) as i64) }
+        });
         let mut timed_out: c_int = 0;
         let ud = &*self.data as *const BufferData as *mut c_void;
         let nlines = unsafe {
@@ -582,6 +618,10 @@ impl VimBuffer {
             nxre_set_mark_provider(None, std::ptr::null_mut());
             r
         };
+        // The engine may have freed `re.prog` and recompiled it (NFA→BT
+        // fallback), writing the replacement into `rmm.regprog`; adopt it so
+        // the `VimRegex` doesn't keep a dangling (freed) pointer.
+        re.prog.set(rmm.regprog);
         if timed_out != 0 {
             return Err(VimRegexError("vim regex match timed out".into()));
         }

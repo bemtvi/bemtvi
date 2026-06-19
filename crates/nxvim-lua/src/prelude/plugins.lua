@@ -461,8 +461,16 @@ function M.add(specs)
   local list = specs
   if type(specs) == "string" then
     list = { specs }
-  elseif type(specs) == "table" and (specs.src or specs.url or specs.dir or specs.name) then
-    list = { specs } -- a single table spec, not a list
+  elseif
+    type(specs) == "table"
+    and (specs.src or specs.url or specs.dir or specs.name or type(specs[1]) == "string")
+  then
+    -- A single table spec, not a list. The canonical form carries its source at
+    -- [1] (e.g. `{ "owner/repo", cmd = "X" }`), so a string [1] marks a lone spec;
+    -- a list of specs has spec *tables* at its numeric indices instead. Without
+    -- this, a single positional spec was iterated as a list and its named fields
+    -- (cmd/config/keys/dependencies) were silently dropped.
+    list = { specs }
   end
 
   local last
@@ -590,7 +598,9 @@ function M._update(name)
     -- not imply a change that did not happen.
     local moved = not res.stdout:find("up to date", 1, true)
     set_task(name, "update", "done", moved and "updated" or "up to date")
-    return "updated"
+    -- Only report a real fast-forward as "updated"; an already-current pull must
+    -- not inflate M.update()'s "updated N plugin(s)" count.
+    return moved and "updated" or "uptodate"
   end)()
 end
 

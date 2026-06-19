@@ -234,10 +234,17 @@ where
     let mut buf: Vec<u8> = Vec::with_capacity(8192);
     let mut chunk = [0u8; 8192];
     loop {
-        // Drain every complete message currently buffered.
+        // Drain every complete message currently buffered. Track a `consumed`
+        // offset and decode from `buf[consumed..]` rather than draining after
+        // each frame: when a single read delivers many frames (a coalesced
+        // redraw burst or PTY flood), draining per-frame would memmove the whole
+        // remaining buffer left on every iteration — O(frames × bytes), i.e.
+        // quadratic. Instead we advance the offset and drain the consumed prefix
+        // exactly once below.
+        let mut consumed = 0usize;
         loop {
             let parsed = {
-                let mut cur = Cursor::new(&buf[..]);
+                let mut cur = Cursor::new(&buf[consumed..]);
                 match rmpv::decode::read_value_with_max_depth(&mut cur, MAX_DEPTH) {
                     Ok(v) => Ok(Some((v, cur.position() as usize))),
                     // A short read means the frame isn't fully buffered yet, so
@@ -252,7 +259,7 @@ where
             };
             match parsed {
                 Ok(Some((val, n))) => {
-                    buf.drain(..n);
+                    consumed += n;
                     if dispatch(val, &in_tx, &pending).is_err() {
                         return;
                     }
@@ -261,9 +268,14 @@ where
                 Err(()) => return, // malformed frame: drop the connection
             }
         }
+        // Discard the fully-decoded prefix in one shift.
+        if consumed > 0 {
+            buf.drain(..consumed);
+        }
 
         // A frame that grows past the cap without ever completing is garbage or
-        // abusively large; refuse it rather than buffer without bound.
+        // abusively large; refuse it rather than buffer without bound. `buf` now
+        // holds only the incomplete tail, so this bounds a single pending frame.
         if buf.len() > MAX_FRAME {
             return;
         }

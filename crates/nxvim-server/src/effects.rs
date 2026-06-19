@@ -1649,6 +1649,7 @@ impl EditHost {
                     number: opts.number,
                     relativenumber: opts.relativenumber,
                     cursorline: opts.cursorline,
+                    wrap: opts.wrap,
                     numberwidth: opts.numberwidth as u64,
                     signcolumn: opts.signcolumn.to_string(),
                     fillchars: opts.fillchars.clone(),

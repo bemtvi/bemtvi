@@ -59,6 +59,19 @@ fn rgb(c: u32) -> Color {
     Color::Rgb(r, g, b)
 }
 
+/// The background style for a window's content box. A float uses `NormalFloat`
+/// (falling back to `Normal`) so its body matches the bordered box the renderer
+/// paints around it; a tiled window uses `Normal`. `None` when the colorscheme
+/// (and its fallback) leaves the group undefined — the cells keep the terminal
+/// default, as before a theme is loaded.
+fn window_bg(view: &View, floating: bool) -> Option<Style> {
+    if floating {
+        view.normal_float.or(view.normal).map(rt)
+    } else {
+        view.normal.map(rt)
+    }
+}
+
 /// The style painted across the cursor's screen row for `'cursorline'`. Prefers
 /// the colorscheme's `CursorLine` group; with none resolved (no theme, or a
 /// theme that leaves it undefined) it falls back to a subtle dark-gray
@@ -227,9 +240,16 @@ pub(crate) fn render(
     for win in view.windows.iter().filter(|w| !w.floating) {
         // `'padding'` insets the content box by a per-side margin; the server already
         // sized this window's rows/cursor to the inset area, so the renderer just
-        // shifts the origin in and shrinks the box. The margin shows the editor
-        // background behind it.
-        let area = pad_rect(window_area(dock.content(win.region), win), win.padding);
+        // shifts the origin in and shrinks the box. The blank margin must share the
+        // window background — `render_window` only paints the inset content box — so
+        // paint the whole box with `Normal` first when there's a margin to fill.
+        let outer = window_area(dock.content(win.region), win);
+        if win.padding.horizontal() + win.padding.vertical() > 0 {
+            if let Some(bg) = window_bg(view, false) {
+                frame.render_widget(Block::default().style(bg), outer);
+            }
+        }
+        let area = pad_rect(outer, win.padding);
         // Only the focused window animates a scroll slide.
         let win_anim = if win.focused { anim } else { None };
         let (text_inner, cursor_row, cursor_shift) =
@@ -257,7 +277,17 @@ pub(crate) fn render(
                 frame.render_widget(block, outer);
                 inner
             }
-            None => outer,
+            None => {
+                // A borderless float has no box to fill the (post-`Clear`) cells, so
+                // paint the float background across it — otherwise a `'padding'`
+                // margin or end-of-line gap would show the terminal default. A
+                // bordered float's `float_block` already fills its inner with the
+                // same `NormalFloat` background.
+                if let Some(bg) = window_bg(view, true) {
+                    frame.render_widget(Block::default().style(bg), outer);
+                }
+                outer
+            }
         };
         // `'padding'` insets the content a further per-side margin inside any border.
         let inner = pad_rect(inner, win.padding);
@@ -656,8 +686,8 @@ fn render_window(
     // paths pass `None`, leaving the body blank. The buffer is empty, so there is no
     // meaningful cursor — return the body rect and row 0.
     if let Some(image) = &win.image {
-        if let Some(normal) = view.normal.map(rt) {
-            frame.render_widget(Block::default().style(normal), text_area);
+        if let Some(bg) = window_bg(view, win.floating) {
+            frame.render_widget(Block::default().style(bg), text_area);
         }
         if let Some(store) = images {
             store.render(frame, text_area, image);
@@ -870,12 +900,13 @@ fn render_window(
         }
     }
 
-    // Paint the text body with the theme's `Normal` background first (when a
-    // colorscheme is loaded), so every following widget's spans patch their
-    // foreground onto it and the gutter, end-of-line gaps, and `~` rows all share
-    // the editor background. With no theme this is skipped.
-    if let Some(normal) = view.normal.map(rt) {
-        frame.render_widget(Block::default().style(normal), text_area);
+    // Paint the text body with the window background first (when a colorscheme is
+    // loaded), so every following widget's spans patch their foreground onto it
+    // and the gutter, end-of-line gaps, and `~` rows all share it. A float uses
+    // `NormalFloat` so its body matches the bordered box around it; a tiled window
+    // uses `Normal`. With no theme this is skipped.
+    if let Some(bg) = window_bg(view, win.floating) {
+        frame.render_widget(Block::default().style(bg), text_area);
     }
 
     // `'cursorline'`: tint the cursor's screen row across the whole window width

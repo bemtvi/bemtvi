@@ -1652,3 +1652,37 @@ async fn fillchars_eob_custom_char_and_invalid_value() {
         "a rejected fillchars value leaves the prior `%` filler intact, got {rows:?}"
     );
 }
+
+#[tokio::test]
+async fn wo_wrap_funnel_actually_wraps_not_just_stores() {
+    // `vim.wo.wrap = true` (the `nx.wo` funnel a plugin / component uses, e.g.
+    // `ctx.wo.wrap` in the plugin-manager UI) must reach the *core* and soft-wrap
+    // the line, not merely store `true` in the Lua-side mirror. The regression: a
+    // window option missing from the wired set (`WIN_OPT_CANON`) fell through to the
+    // observable-only `nx._wo_store`, so the read-back said `true` while the display
+    // never wrapped — exactly the "loads ≠ works" trap a value-only assert misses.
+    let (rpc, mut incoming) = start(None).await;
+    feed(&rpc, ":set nonumber<CR>:set norelativenumber<CR>");
+    feed(&rpc, "i");
+    feed(&rpc, &"a".repeat(200)); // 200 columns, wider than the 80-cell text area
+    feed(&rpc, "<Esc>");
+    // Set wrap via the funnel (NOT `:set wrap`), then force a fresh redraw.
+    exec_lua(&rpc, "vim.wo.wrap = true").await;
+    let map = redraw_after(&rpc, &mut incoming, "<Esc>").await;
+
+    // The read-back reflects the core (the mirror now carries `wrap`)...
+    assert_eq!(
+        exec_lua(&rpc, "return vim.wo.wrap").await,
+        Value::Boolean(true),
+        "vim.wo.wrap reads back true"
+    );
+    // ...and, the real point, the line is laid across display rows.
+    let lines = view_lines(&map);
+    assert_eq!(
+        lines[0].chars().count(),
+        80,
+        "the long line wraps at the text-area width (was 200 — panned, unwrapped — before the fix)"
+    );
+    assert_eq!(lines[1].chars().count(), 80, "second wrap segment");
+    assert_eq!(lines[2], "a".repeat(40), "remainder on the third row");
+}

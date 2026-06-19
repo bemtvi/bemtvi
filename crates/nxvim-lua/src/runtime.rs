@@ -60,6 +60,9 @@ pub struct WindowMirror {
     /// `'cursorline'` — whether the cursor's screen line is highlighted (so
     /// `vim.wo`/`vim.o` read it back).
     pub cursorline: bool,
+    /// `'wrap'` — whether long lines soft-wrap (so `vim.wo`/`vim.o` read it back;
+    /// also what makes a programmatic `vim.wo.wrap = true` reach the core).
+    pub wrap: bool,
     /// `numberwidth` — the minimum number-gutter width (so `vim.wo`/`vim.o` read it
     /// back).
     pub numberwidth: u64,

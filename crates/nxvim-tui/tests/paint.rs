@@ -665,6 +665,87 @@ fn the_normal_background_fills_the_text_area() {
 }
 
 #[test]
+fn the_padding_margin_shares_the_normal_background() {
+    // A tiled window with a 2-cell `'padding'` margin and a themed `Normal`
+    // background: the blank margin cells around the content must carry that same
+    // background, not the terminal default — otherwise the margin reads as a hole
+    // in the editor surface.
+    let win = Value::Map(vec![
+        (Value::from("rect"), rect(0, 0, 20, 8)),
+        (Value::from("focused"), Value::from(true)),
+        (Value::from("lines"), lines(&["hi"])),
+        (Value::from("status_visible"), Value::from(false)),
+        (Value::from("cursor_line"), Value::from(1u64)),
+        // [top, right, bottom, left] — a uniform 2-cell margin.
+        (
+            Value::from("padding"),
+            Value::Array(vec![
+                Value::from(2u64),
+                Value::from(2u64),
+                Value::from(2u64),
+                Value::from(2u64),
+            ]),
+        ),
+    ]);
+    let v = view(vec![
+        ("windows", Value::Array(vec![win])),
+        (
+            "styles",
+            Value::Array(vec![style(vec![("bg", rgb(0x1e, 0x1e, 0x2e))])]),
+        ),
+        ("chrome", chrome(vec![("normal", 0)])),
+    ]);
+    let buf = paint(&v, 20, 10);
+    // The top-left corner cell sits in the blank margin (content starts at 2,2).
+    assert_eq!(
+        bg(&buf, 0, 0),
+        Some(Color::Rgb(0x1e, 0x1e, 0x2e)),
+        "the padding margin shares the Normal background, not the terminal default"
+    );
+}
+
+#[test]
+fn a_floats_body_matches_its_border_background() {
+    // A bordered float whose theme gives `NormalFloat` a distinct background: the
+    // border box already paints that bg, and the inner text body must match it
+    // (not the editor's `Normal`), so the float reads as one solid panel rather
+    // than a `Normal`-colored body inside a `NormalFloat` frame.
+    let f = Value::Map(vec![
+        (Value::from("rect"), rect(2, 1, 12, 5)),
+        (Value::from("focused"), Value::from(true)),
+        (Value::from("floating"), Value::from(true)),
+        (Value::from("border"), Value::from("single")),
+        (Value::from("lines"), lines(&["hi"])),
+        (Value::from("status_visible"), Value::from(false)),
+        (Value::from("cursor_line"), Value::from(1u64)),
+    ]);
+    let v = view(vec![
+        ("windows", Value::Array(vec![f])),
+        (
+            "styles",
+            Value::Array(vec![
+                style(vec![("bg", rgb(0x1e, 0x1e, 0x2e))]), // 0 = Normal
+                style(vec![("bg", rgb(0x30, 0x30, 0x46))]), // 1 = NormalFloat
+            ]),
+        ),
+        ("chrome", chrome(vec![("normal", 0), ("normal_float", 1)])),
+    ]);
+    let buf = paint(&v, 20, 10);
+    // The float's top-left border corner carries the NormalFloat background.
+    assert_eq!(
+        bg(&buf, 2, 1),
+        Some(Color::Rgb(0x30, 0x30, 0x46)),
+        "the border box is painted with NormalFloat"
+    );
+    // A cell inside the body must share that NormalFloat background.
+    assert_eq!(
+        bg(&buf, 5, 3),
+        Some(Color::Rgb(0x30, 0x30, 0x46)),
+        "the float body shares the border's NormalFloat background, not Normal"
+    );
+}
+
+#[test]
 fn cursorline_tints_the_cursor_row_with_the_themed_background() {
     // `'cursorline'` on, the cursor on the second screen row, and a `CursorLine`
     // chrome style (palette entry 0): the whole cursor row — including cells past

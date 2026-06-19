@@ -108,6 +108,7 @@ impl Seg {
 /// One piece of text to draw: a cache key (the shaped buffer), where to put it,
 /// and the rect to clip it to (the whole surface for static text; the window's
 /// text area for a scroll slide, so partially-scrolled lines clip at the edge).
+#[derive(Clone, Copy)]
 struct TextItem {
     key: u64,
     x: f32,
@@ -1834,6 +1835,11 @@ impl Renderer {
         };
         let ox = origin.0 + r.x;
         let oy = origin.1 + r.y;
+        // Clip every glyph an earlier (lower-z) float already queued so this float's
+        // opaque fill hides it — floats share one overlay layer that draws all
+        // backgrounds before all glyphs, so a lower float's text would otherwise
+        // bleed through this one's background (stacked floats read as "mixed").
+        Self::occlude_overlay_text(items, self.text_bounds(ox, oy, r.width, r.height));
         // Prefer the colorscheme's float chrome (`NormalFloat` bg) when defined,
         // else the historical fallback: a slightly lightened `Normal` background.
         let bg = style_bg(&view.normal_float)
@@ -2795,6 +2801,39 @@ impl Renderer {
         (col as f32 * self.cell_w, row as f32 * self.cell_h)
     }
 
+    /// Clip every glyph already queued in `items` so none of it renders inside the
+    /// opaque pixel rect `hole` — the background of a float about to be drawn on
+    /// top. Floats share one overlay layer whose pass draws *all* backgrounds and
+    /// then *all* glyphs (see [`render`](Self::render)), so without this a lower
+    /// float's text would show through a higher float's fill (stacked floats looked
+    /// "mixed" / transparent). Each covered item is replaced by the remainder
+    /// pieces of its clip rect outside `hole`, so text outside the overlap is
+    /// untouched.
+    fn occlude_overlay_text(items: &mut Vec<TextItem>, hole: TextBounds) {
+        let h = (hole.left, hole.top, hole.right, hole.bottom);
+        let mut out = Vec::with_capacity(items.len());
+        for it in items.drain(..) {
+            let a = (
+                it.bounds.left,
+                it.bounds.top,
+                it.bounds.right,
+                it.bounds.bottom,
+            );
+            for (left, top, right, bottom) in rect_subtract(a, h) {
+                out.push(TextItem {
+                    bounds: TextBounds {
+                        left,
+                        top,
+                        right,
+                        bottom,
+                    },
+                    ..it
+                });
+            }
+        }
+        *items = out;
+    }
+
     /// The whole-surface clip rect (static text never needs tighter clipping).
     fn full_bounds(&self) -> TextBounds {
         TextBounds {
@@ -2954,6 +2993,44 @@ fn severity_color(severity: u8) -> u32 {
         4 => DIAG_HINT,
         _ => DIAG_ERROR, // error (and any unexpected code)
     }
+}
+
+/// Subtract the rect `hole` from rect `a` (both `(left, top, right, bottom)` in
+/// pixels), returning the ≤4 disjoint pieces of `a` not covered by `hole` — the
+/// whole of `a` when they don't overlap, nothing when `hole` fully covers `a`.
+/// Used to clip a lower float's text so a higher float drawn over it reads as
+/// opaque (see [`Renderer::occlude_overlay_text`]). The pieces are emitted as
+/// top / bottom strips (full width) plus left / right strips (between them), so
+/// they tile `a \ hole` without gaps or overlap.
+pub fn rect_subtract(
+    a: (i32, i32, i32, i32),
+    hole: (i32, i32, i32, i32),
+) -> Vec<(i32, i32, i32, i32)> {
+    let (al, at, ar, ab) = a;
+    // Intersection of `a` and `hole`.
+    let (il, it, ir, ib) = (
+        al.max(hole.0),
+        at.max(hole.1),
+        ar.min(hole.2),
+        ab.min(hole.3),
+    );
+    if il >= ir || it >= ib {
+        return vec![a]; // disjoint (or zero-area overlap) → `a` is untouched
+    }
+    let mut out = Vec::with_capacity(4);
+    if at < it {
+        out.push((al, at, ar, it)); // strip above the hole
+    }
+    if ib < ab {
+        out.push((al, ib, ar, ab)); // strip below the hole
+    }
+    if al < il {
+        out.push((al, it, il, ib)); // strip left of the hole (hole's row band)
+    }
+    if ir < ar {
+        out.push((ir, it, ar, ib)); // strip right of the hole (hole's row band)
+    }
+    out
 }
 
 /// Lighten a packed `0xRRGGBB` color by adding `d` to each channel (saturating) —

@@ -63,6 +63,10 @@ nxvim-test-harness = { path = "crates/nxvim-test-harness" }
 # selected here so every crate that links mlua shares it; there is no backend
 # toggle to thread anymore.
 anyhow = "=1.0.102"
+# CLI argument parsing for the `nxvim` binary (the only consumer): the `derive`
+# feature gives a struct-driven parser that validates flags, errors on unknown
+# options, and auto-generates `--help`/`--version`.
+clap = { version = "=4.6.1", features = ["derive"] }
 ropey = "=2.0.0-beta.1"
 # Fuzzy matcher (nucleo-class) shared by every static-source widget consumer —
 # completion, `nx.ui.select`, and static pickers. The matcher-only sub-crate:

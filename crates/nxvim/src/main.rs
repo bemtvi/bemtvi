@@ -31,7 +31,8 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::process::Stdio;
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, Result};
+use clap::Parser;
 
 mod test_runner;
 use nxvim_server::{
@@ -39,18 +40,11 @@ use nxvim_server::{
     run_daemon_io as run_server_daemon_io, serve_quic, DaemonClient, ServerInit,
 };
 
-/// Flag that runs this binary as the **daemon** over stdin/stdout (no UI, no
-/// editor): just the fs + process + watch + LSP host the *edit-host split* drives.
-/// With [`LISTEN_FLAG`] it instead binds a WebTransport/QUIC listener (the native
-/// transport, Open Decision #2). The daemon runs only I/O — the editor stays local,
-/// the inverse of a "whole editor runs remote" topology (which nxvim does not have).
+/// The argument that runs this binary as the **daemon** (no UI, no editor): just the
+/// fs + process + watch + LSP host the *edit-host split* drives. Defined as a constant
+/// because [`daemon_command`] also passes it to the child it spawns. With `--listen` it
+/// instead binds a WebTransport/QUIC listener (the native transport, Open Decision #2).
 const DAEMON_FLAG: &str = "--daemon";
-
-/// With [`DAEMON_FLAG`], bind a QUIC listener instead of serving over stdin/stdout.
-/// An optional bind address follows (`--listen 0.0.0.0:8765`); absent, it binds
-/// [`DEFAULT_LISTEN_ADDR`]. This is the real native daemon transport — the stdio mode
-/// is the local two-process stand-in.
-const LISTEN_FLAG: &str = "--listen";
 
 /// Default daemon bind address when `--listen` is given no explicit address: loopback
 /// on a fixed port. Loopback-only is defense-in-depth (the bearer token is the actual
@@ -59,20 +53,9 @@ const DEFAULT_LISTEN_ADDR: &str = "127.0.0.1:8765";
 
 /// URI scheme the daemon prints and `--connect-daemon` accepts to reach a QUIC
 /// listener: `nxvim://HOST:PORT/TOKEN?cert=HASH` — host/port to dial, the bearer
-/// TOKEN on the path, the TOFU cert HASH in the query. Presence of such an argument
-/// selects the QUIC connect path over the default stdio-child split.
+/// TOKEN on the path, the TOFU cert HASH in the query. A positional argument with this
+/// scheme selects the QUIC connect path over the default stdio-child split.
 const CONNECT_URI_SCHEME: &str = "nxvim://";
-
-/// Flag that runs the **local** edit-host half of the split: the full editor + UI
-/// (the default role) wired to a `--daemon` child for fs/process/watch/LSP. The
-/// daemon command defaults to this binary in `--daemon` mode; override it with
-/// [`DAEMON_CMD_ENV`].
-const CONNECT_DAEMON_FLAG: &str = "--connect-daemon";
-
-/// Flag that runs the headless **plugin test runner**: boot an embedded server, run
-/// the Lua `nx.test` suite under `<dir>/test/**/*_spec.lua` (dir = the following
-/// argument, or the cwd), print a report, and exit `0`/`1`. No UI editor session.
-const TEST_PLUGIN_FLAG: &str = "--test-plugin";
 
 /// Env var naming the command to spawn as the daemon for `--connect-daemon`. Run
 /// through `sh -c`, so a full command line works verbatim — e.g.
@@ -86,10 +69,55 @@ const DAEMON_CMD_ENV: &str = "NXVIM_DAEMON_CMD";
 #[cfg(debug_assertions)]
 const LSP_MOCK_FLAG: &str = "--__lsp-mock";
 
+/// nxvim's command line. clap derives the parser, validates flags, errors on unknown
+/// options, and generates `--help`/`--version` — there is no hand-rolled scanning.
+///
+/// The roles are mutually exclusive **flags** (grouped so clap rejects two at once),
+/// and the positional [`Cli::targets`] is shared across them: the FILE to open in the
+/// default / `--connect-daemon` editor, the DIR for `--test-plugin`, and/or a
+/// `nxvim://…` connect URI. (The QUIC connect role legitimately takes both a URI and a
+/// file, so more than one positional is allowed; the URI is recognised by its scheme.)
+#[derive(Parser)]
+#[command(
+    name = "nxvim",
+    version,
+    about = "A modal, vim-style editor: a headless editor server plus a terminal UI client.",
+    long_about = "A modal, vim-style editor: a headless editor server plus a terminal UI \
+        client, both run from this one binary. With no role flag, nxvim opens the given \
+        file (or an empty buffer) in the terminal.",
+    // The three roles below are mutually exclusive; clap enforces it and documents it.
+    group = clap::ArgGroup::new("role").args(["test_plugin", "connect_daemon", "daemon"]),
+    after_help = "Environment:\n  NXVIM_DAEMON_CMD  Command the --connect-daemon role \
+        spawns as its daemon, run through `sh -c`\n                    (e.g. \"ssh host \
+        nxvim --daemon\"). Unset = this binary in --daemon mode."
+)]
+struct Cli {
+    /// File to open (DIR for --test-plugin), and/or a nxvim://… daemon connect URI
+    #[arg(value_name = "TARGET")]
+    targets: Vec<String>,
+
+    /// Run the Lua `nx.test` suite under <TARGET>/test/**/*_spec.lua and exit 0/1 (no UI; TARGET defaults to the cwd)
+    #[arg(long)]
+    test_plugin: bool,
+
+    /// Run the editor locally but route fs/process/watch/LSP to a --daemon child
+    #[arg(long)]
+    connect_daemon: bool,
+
+    /// Run the remote half: fs/process/watch/LSP host over stdin/stdout, no editor or UI
+    #[arg(long)]
+    daemon: bool,
+
+    /// With --daemon, bind a QUIC listener at [ADDR] (default 127.0.0.1:8765) instead of using stdio
+    #[arg(long, value_name = "ADDR", num_args = 0..=1, requires = "daemon")]
+    listen: Option<Option<SocketAddr>>,
+}
+
 fn main() -> Result<()> {
     // Mock language server mode (debug builds only): a hermetic, scripted LSP
     // server the test suite spawns instead of a real one. It never starts an
-    // editor; the script path follows the flag.
+    // editor; the script path follows the flag. Handled before clap so the internal
+    // flag stays off the public surface (and clap would reject the `--__`-prefixed arg).
     #[cfg(debug_assertions)]
     if std::env::args().nth(1).as_deref() == Some(LSP_MOCK_FLAG) {
         let script = std::env::args().nth(2).unwrap_or_default();
@@ -97,39 +125,46 @@ fn main() -> Result<()> {
         return Ok(());
     }
 
-    let args: Vec<String> = std::env::args().skip(1).collect();
+    // clap parses, validates, and exits with usage/version itself for `--help`/`-h`,
+    // `--version`/`-V`, unknown options, and conflicting roles.
+    let cli = Cli::parse();
+
+    // The first `nxvim://…` positional is the QUIC connect target; the first other
+    // positional is the file (or, for --test-plugin, the plugin dir).
+    let connect_uri = cli
+        .targets
+        .iter()
+        .find(|a| a.starts_with(CONNECT_URI_SCHEME))
+        .cloned();
+    let file = cli
+        .targets
+        .iter()
+        .find(|a| !a.starts_with(CONNECT_URI_SCHEME))
+        .cloned();
 
     // Plugin test runner role: no editor UI — boot an embedded server, drive the Lua
-    // `nx.test` suite, and exit with the pass/fail code. The optional argument after
-    // the flag is the plugin dir (default: the cwd).
-    if let Some(pos) = args.iter().position(|a| a == TEST_PLUGIN_FLAG) {
-        let dir = args
-            .get(pos + 1)
-            .filter(|a| !a.starts_with('-'))
+    // `nx.test` suite, and exit with the pass/fail code. The positional is the plugin
+    // dir (default: the cwd).
+    if cli.test_plugin {
+        let dir = file
             .map(PathBuf::from)
             .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
         let passed = test_runner::run_test_plugin(dir)?;
         std::process::exit(if passed { 0 } else { 1 });
     }
 
-    // A `nxvim://…` connect URI (the QUIC daemon target) is not a file; pick the file
-    // from the remaining non-flag, non-URI arguments.
-    let connect_uri = args
-        .iter()
-        .find(|a| a.starts_with(CONNECT_URI_SCHEME))
-        .cloned();
-    let file = args
-        .iter()
-        .find(|a| !a.starts_with('-') && !a.starts_with(CONNECT_URI_SCHEME))
-        .cloned();
-
     // Daemon role: the edit-host split's remote half — fs/process/watch/LSP, no editor
     // and no UI. With `--listen` it binds a QUIC listener (the real native transport);
     // otherwise it serves over this process's stdin/stdout (the local stand-in), wound
     // down by EOF on stdin.
-    if args.iter().any(|a| a == DAEMON_FLAG) {
-        if args.iter().any(|a| a == LISTEN_FLAG) {
-            return run_daemon_listen(listen_addr(&args)?);
+    if cli.daemon {
+        if let Some(addr) = cli.listen {
+            let addr = addr.unwrap_or_else(|| {
+                DEFAULT_LISTEN_ADDR
+                    .parse()
+                    .expect("DEFAULT_LISTEN_ADDR is a valid socket address")
+            });
+            return run_daemon_listen(addr);
         }
         return run_daemon();
     }
@@ -143,7 +178,7 @@ fn main() -> Result<()> {
 
     // Edit-host split, local half, over stdio: the default editor + UI, but spawning a
     // `--daemon` child and routing fs/process/watch/LSP to it over stdio pipes.
-    if args.iter().any(|a| a == CONNECT_DAEMON_FLAG) {
+    if cli.connect_daemon {
         return run_with_daemon(file);
     }
 
@@ -268,25 +303,6 @@ fn run_daemon_listen(addr: SocketAddr) -> Result<()> {
         );
         serve_quic(endpoint, info.token).await
     })
-}
-
-/// The bind address for `--daemon --listen`: the argument right after `--listen`
-/// (`--listen 0.0.0.0:8765`) or its `--listen=ADDR` form, else [`DEFAULT_LISTEN_ADDR`].
-fn listen_addr(args: &[String]) -> Result<SocketAddr> {
-    let raw = args.iter().position(|a| a == LISTEN_FLAG).and_then(|i| {
-        // The next argument, unless it's another flag (then `--listen` took no address).
-        args.get(i + 1).filter(|a| !a.starts_with('-')).cloned()
-    });
-    let raw = raw
-        .or_else(|| {
-            args.iter().find_map(|a| {
-                a.strip_prefix(&format!("{LISTEN_FLAG}="))
-                    .map(str::to_owned)
-            })
-        })
-        .unwrap_or_else(|| DEFAULT_LISTEN_ADDR.to_owned());
-    raw.parse()
-        .with_context(|| format!("invalid --listen address {raw:?}"))
 }
 
 /// Build the [`tokio::process::Command`] for the daemon child. Defaults to *this*

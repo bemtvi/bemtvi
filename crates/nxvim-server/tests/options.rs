@@ -210,6 +210,32 @@ async fn unknown_vim_o_option_warns_but_stores() {
 }
 
 #[tokio::test]
+async fn seeded_read_mostly_options_write_without_warning() {
+    // `background` / `termguicolors` are deliberately modeled as read-mostly
+    // store-backed options (seeded with neovim defaults so colorschemes can read
+    // them). Writing them is expected — every colorscheme does — so it must NOT
+    // surface the "unknown option" warning reserved for genuine typos. (Regression:
+    // catppuccin's `vim.o.termguicolors`/`vim.o.background` warned on load.)
+    let (rpc, mut incoming) = start().await;
+
+    exec_lua(&rpc, "vim.o.termguicolors = true").await;
+    exec_lua(&rpc, "vim.o.background = 'dark'").await;
+    rpc.request("nvim_get_mode", vec![]).await.expect("barrier");
+    let frame = drain_to_latest_redraw(&mut incoming, |_| true).expect("a redraw arrived");
+    assert!(
+        !message(&frame).to_lowercase().contains("unknown option"),
+        "writing a seeded read-mostly option must not warn, got {:?}",
+        message(&frame)
+    );
+
+    // …and they still round-trip (the store keeps the written value).
+    assert_eq!(
+        exec_lua(&rpc, "return vim.o.background").await.as_str(),
+        Some("dark")
+    );
+}
+
+#[tokio::test]
 async fn autoread_defaults_on_and_round_trips_through_vim_o() {
     let (rpc, _incoming) = start().await;
 

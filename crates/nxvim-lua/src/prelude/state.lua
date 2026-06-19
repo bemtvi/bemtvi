@@ -264,6 +264,20 @@ nx._o_store = nx._o_store
     loadplugins = true,
   }
 
+-- The seeded store keys are options nxvim *does* model (read-mostly: it keeps a
+-- value but the core doesn't act on it). Writing one is expected — colorschemes
+-- set `background` / `termguicolors`, plugins set `winblend` — so it must store
+-- silently, unlike a genuinely-unknown name (a typo) which warns once. Snapshot
+-- the seed keys now, before any catch-all write grows the store.
+nx._o_known = nx._o_known
+  or (function()
+    local known = {}
+    for k in pairs(nx._o_store) do
+      known[k] = true
+    end
+    return known
+  end)()
+
 -- A write of an option nxvim doesn't model (any scope) lands in the read/write
 -- catch-all `nx._o_store` — kept rather than rejected, so a neovim config or
 -- colorscheme that sets an option nxvim hasn't implemented (termguicolors,
@@ -321,7 +335,11 @@ local function o_set(k, v)
     nx._go_mirror[canon] = v
     return
   end
-  warn_unknown_opt(k)
+  -- A seeded read-mostly option (background, termguicolors, winblend, …) is
+  -- modeled — store it silently. Warn only for a name nxvim has never seen.
+  if not nx._o_known[k] then
+    warn_unknown_opt(k)
+  end
   nx._o_store[k] = v
 end
 
@@ -721,7 +739,11 @@ local function go_set(k, v)
     nx._go_mirror[canon] = v
     return
   end
-  warn_unknown_opt(k)
+  -- A seeded read-mostly option is modeled — store silently; warn only on a name
+  -- nxvim has never seen (a typo). Mirrors `o_set`.
+  if not nx._o_known[k] then
+    warn_unknown_opt(k)
+  end
   nx._o_store[k] = v
 end
 nx.go = setmetatable({}, {

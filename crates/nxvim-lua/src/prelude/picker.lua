@@ -456,18 +456,21 @@ nx.picker.source({
   end,
 })
 
--- buffers: a static, in-memory source — every open buffer, no process spawn. A
--- plain synchronous source: it pushes in a loop and returns (no promise needed —
--- returning nil settles the run). Names come from the authoritative buffer mirror
--- (`nx._bufs`); `nx.buf.name` short-circuits the *current* buffer to a separately-
--- tracked field that can lag, so reading the mirror lists every named buffer
--- including the focused one.
+-- buffers: a static, in-memory source — the focused layer's open buffers, no
+-- process spawn. A plain synchronous source: it pushes in a loop and returns (no
+-- promise needed — returning nil settles the run). Scoped to the focused layer
+-- with `{ focused = true }`, exactly like `:ls`: the main area and each dock keep
+-- disjoint buffer lists, so picking a buffer never yanks a document into a dock
+-- (or vice versa). Names come from the authoritative buffer mirror (`nx._bufs`);
+-- `nx.buf.name` short-circuits the *current* buffer to a separately-tracked field
+-- that can lag, so reading the mirror lists every named buffer including the
+-- focused one.
 nx.picker.source({
   name = "buffers",
   preview = "file", -- preview the buffer's backing file (named buffers only)
   items = function(ctx)
     local bufs = nx._bufs or {}
-    for _, b in ipairs(nx.buf.list()) do
+    for _, b in ipairs(nx.buf.list({ focused = true })) do
       local entry = bufs[b]
       local name = (entry and entry.name) or nx.buf.name(b)
       if name and name ~= "" then

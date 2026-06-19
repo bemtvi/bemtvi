@@ -918,6 +918,41 @@ async fn buffers_source_lists_open_buffers() {
     );
 }
 
+#[tokio::test]
+async fn buffers_picker_is_scoped_to_the_focused_layer() {
+    // Like `:ls`, the buffers picker lists only the focused layer's buffers — the
+    // main area and each dock keep disjoint lists. Opened in a dock, it shows the
+    // dock's buffer and not the main area's.
+    let dir = temp_dir("picker_buffers_layer");
+    let main_file = dir.join("main.txt");
+    let dock_file = dir.join("dock.txt");
+    std::fs::write(&main_file, "m\n").unwrap();
+    std::fs::write(&dock_file, "d\n").unwrap();
+    let (rpc, mut incoming) = start(&dir, "").await;
+
+    // A named buffer in the MAIN layer.
+    exec_lua(&rpc, &format!("vim.cmd('edit {}')", main_file.display())).await;
+
+    // Open a bottom dock, focus it, and open a named buffer THERE — so the dock
+    // layer owns it (a buffer's home is the layer it was last shown in).
+    exec_lua(&rpc, "nx.dock.open({ side = 'bottom', size = 12 })").await;
+    exec_lua(&rpc, "nx.dock.focus('bottom')").await;
+    exec_lua(&rpc, &format!("vim.cmd('edit {}')", dock_file.display())).await;
+
+    // The buffers picker, focused in the dock, lists the dock's buffer — not main's.
+    exec_lua(&rpc, "nx.picker.open('buffers')").await;
+    let menu = menu_of(&poll_menu(&rpc, &mut incoming).await.expect("menu opens"));
+    let items = menu_items(&menu);
+    assert!(
+        items.iter().any(|i| i.contains("dock.txt")),
+        "the focused dock layer's buffer is listed, got {items:?}"
+    );
+    assert!(
+        !items.iter().any(|i| i.contains("main.txt")),
+        "the main layer's buffer is NOT listed while focused in the dock, got {items:?}"
+    );
+}
+
 // ===== default leader maps =================================================
 
 #[tokio::test]

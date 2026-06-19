@@ -18,7 +18,7 @@ The three built-in sources are bound out of the box:
 | --- | --- |
 | `<leader>ff` | `files` — fuzzy file finder |
 | `<leader>fg` | `live_grep` — live grep |
-| `<leader>fb` | `buffers` — open buffers |
+| `<leader>fb` | `buffers` — open buffers (scoped to the focused layer, like `:ls`) |
 
 These are overridable defaults — your own map for the same key wins, and you can
 disable one by binding it to an empty function. To open any registered source

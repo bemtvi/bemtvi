@@ -1563,8 +1563,17 @@ impl Editor {
     /// register name keys a short one-line preview of its contents (source for the
     /// `"`-pending hint). Empty when nothing has been yanked / deleted yet, so the
     /// hint falls back to its `Register` label.
+    ///
+    /// The stored writable cells come first, then the readable specials — `%`
+    /// (filename), `/` (last search), `:` (last command), `.` (last insert), and
+    /// the clipboard `+` / `*` — each surfaced only while it actually resolves to
+    /// non-empty text (the `+`/`*` probe asks the clipboard provider). These are
+    /// valid paste sources you can type at the `"` prompt, so the popup lists them
+    /// alongside the stored registers; the parallel `register_mirror` (the
+    /// `getreg` projection) covers the same specials.
     fn register_continuations(&self) -> Vec<CommandContinuation> {
-        self.registers
+        let mut out: Vec<CommandContinuation> = self
+            .registers
             .entries()
             .into_iter()
             .map(|(name, text, _kind)| CommandContinuation {
@@ -1572,7 +1581,19 @@ impl Editor {
                 desc: preview_text(text),
                 group: false,
             })
-            .collect()
+            .collect();
+        for name in ['%', '/', ':', '.', '+', '*'] {
+            if let Some((text, _kind)) = self.register_text(Some(name)) {
+                if !text.is_empty() {
+                    out.push(CommandContinuation {
+                        key: name.to_string(),
+                        desc: preview_text(&text),
+                        group: false,
+                    });
+                }
+            }
+        }
+        out
     }
 
     /// The marks that are currently set, as which-key continuations. Every row leads

@@ -592,6 +592,40 @@ async fn register_pending_lists_stored_registers() {
     );
 }
 
+/// `"` also surfaces the readable read-only specials — `%` (filename), `/` (last
+/// search), `:` (last command), `.` (last insert) — alongside the stored writable
+/// cells, since each is a valid paste source you can type at the prompt. Each
+/// appears only once it actually resolves to text: a fresh buffer named `f.txt`
+/// gives `%`, a search gives `/`, an ex command gives `:`, an insert gives `.`.
+#[tokio::test]
+async fn register_pending_lists_readonly_specials() {
+    let (rpc, _incoming) = start().await;
+    exec_lua(&rpc, RECORDER).await;
+    // Name the buffer (so `%` resolves), run a search (`/`), an ex command (`:`),
+    // and leave some inserted text (`.`).
+    feed(&rpc, ":e f.txt<CR>"); // new-file buffer name → register %
+    feed(&rpc, "ihello world<Esc>0");
+    feed(&rpc, "/world<CR>"); // last search → register /
+    feed(&rpc, ":noh<CR>"); // last ex command → register :
+    feed(&rpc, "\""); // register-pending: lists stored + specials
+    let ev = events(&rpc).await;
+    let frame = ev.rsplit(";;").next().unwrap();
+    assert!(
+        frame.starts_with("n|\"|"),
+        "keys are the register prefix: {frame}"
+    );
+    assert!(frame.contains("%/f.txt/"), "filename register %: {frame}");
+    assert!(
+        frame.contains("//world/"),
+        "last-search register /: {frame}"
+    );
+    assert!(frame.contains(":/noh/"), "last-command register :: {frame}");
+    assert!(
+        frame.contains("./hello world/"),
+        "last-insert register .: {frame}"
+    );
+}
+
 /// Once a register is *selected* (`"a`), the grammar is back at a clean boundary but
 /// with the register armed — which-key keeps the popup open showing **which** register
 /// (in `keys`) and the actions that consume it (paste / delete-char complete; the

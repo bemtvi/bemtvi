@@ -233,6 +233,46 @@ async fn init_lua_colorscheme_themes_the_first_frame() {
     assert_eq!(hl_color(normal, "fg"), Some(hex("cdd6f4")));
 }
 
+#[tokio::test]
+async fn float_chrome_groups_resolve_into_the_frame_chrome() {
+    // The float highlight groups (FloatBorder / NormalFloat / FloatTitle) a
+    // colorscheme defines must reach the client as resolved chrome styles, the
+    // same way Normal does — otherwise clients fall back to a bare default and
+    // float borders stay uncolored regardless of the theme.
+    let dir = temp_dir("float_chrome");
+    std::fs::create_dir_all(dir.join("colors")).expect("create colors dir");
+    std::fs::write(
+        dir.join("colors").join("cat.lua"),
+        "vim.api.nvim_set_hl(0, 'FloatBorder', { fg = '#89b4fa', bg = '#181825' })\n\
+         vim.api.nvim_set_hl(0, 'NormalFloat', { fg = '#cdd6f4', bg = '#181825' })\n\
+         vim.api.nvim_set_hl(0, 'FloatTitle',  { fg = '#cba6f7', bg = '#181825' })\n",
+    )
+    .expect("write colorscheme");
+    let (rpc, mut incoming) = start_with_config(&dir, "vim.cmd.colorscheme('cat')\n").await;
+
+    let map = redraw_after(&rpc, &mut incoming, "").await;
+    let chrome = field(&map, "chrome").expect("chrome map");
+    let styles = field(&map, "styles")
+        .and_then(Value::as_array)
+        .expect("styles palette");
+    let style_of = |key: &str| -> &[(Value, Value)] {
+        let id = chrome_id(chrome, key).unwrap_or_else(|| panic!("{key} resolved in chrome"));
+        match &styles[id] {
+            Value::Map(m) => m.as_slice(),
+            _ => panic!("style entry is not a map"),
+        }
+    };
+    assert_eq!(
+        hl_color(style_of("float_border"), "fg"),
+        Some(hex("89b4fa"))
+    );
+    assert_eq!(
+        hl_color(style_of("normal_float"), "bg"),
+        Some(hex("181825"))
+    );
+    assert_eq!(hl_color(style_of("float_title"), "fg"), Some(hex("cba6f7")));
+}
+
 /// The `style_id` a redraw's `chrome` map assigns to region `key`, if resolved.
 fn chrome_id(chrome: &Value, key: &str) -> Option<usize> {
     match chrome {

@@ -1831,7 +1831,10 @@ impl Renderer {
         };
         let ox = origin.0 + r.x;
         let oy = origin.1 + r.y;
-        let bg = lighten(style_bg(&view.normal).unwrap_or(DEFAULT_BG), 0x10);
+        // Prefer the colorscheme's float chrome (`NormalFloat` bg) when defined,
+        // else the historical fallback: a slightly lightened `Normal` background.
+        let bg = style_bg(&view.normal_float)
+            .unwrap_or_else(|| lighten(style_bg(&view.normal).unwrap_or(DEFAULT_BG), 0x10));
         // Opaque fill over the whole float rect.
         let (px, py) = self.cell_px(ox, oy);
         quads.push(Quad {
@@ -1844,8 +1847,12 @@ impl Renderer {
 
         let inner = match win.border {
             Some(border) => {
-                let border_fg = lighten(bg, 0x30);
-                let title_fg = style_fg(&view.normal).unwrap_or(DEFAULT_FG);
+                // `FloatBorder` / `FloatTitle` foregrounds when the theme defines
+                // them; else the historical fallback derived from the float bg.
+                let border_fg = style_fg(&view.float_border).unwrap_or_else(|| lighten(bg, 0x30));
+                let title_fg = style_fg(&view.float_title)
+                    .or_else(|| style_fg(&view.normal))
+                    .unwrap_or(DEFAULT_FG);
                 self.draw_float_border(
                     items,
                     border,
@@ -2425,9 +2432,13 @@ impl Renderer {
         };
         let text_x0 = wx + sign_w + gutter;
 
-        let popup_bg = lighten(style_bg(&view.normal).unwrap_or(DEFAULT_BG), 0x14);
-        let border = lighten(popup_bg, 0x30);
+        // Prefer the colorscheme's float chrome (`NormalFloat` / `FloatBorder` /
+        // `FloatTitle`) when defined, else the historical `Normal`-derived fallback.
+        let popup_bg = style_bg(&view.normal_float)
+            .unwrap_or_else(|| lighten(style_bg(&view.normal).unwrap_or(DEFAULT_BG), 0x14));
+        let border = style_fg(&view.float_border).unwrap_or_else(|| lighten(popup_bg, 0x30));
         let fg = style_fg(&view.normal).unwrap_or(DEFAULT_FG);
+        let title_fg = style_fg(&view.float_title).unwrap_or(fg);
         let full = self.full_bounds();
 
         let (bx, by) = (text_x0 + float.col, wy + float.row);
@@ -2453,7 +2464,7 @@ impl Renderer {
                 by,
                 bw,
                 bh,
-                fg,
+                title_fg,
                 border,
             );
             (bx + 1, by + 1)

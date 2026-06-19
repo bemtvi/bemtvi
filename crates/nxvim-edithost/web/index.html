@@ -1227,6 +1227,15 @@
       return css;
     }
     function paletteStyle(id) { return id == null ? null : (view.styles[id] || null); }
+    // Resolve a chrome region (`float_border`, `normal_float`, …) to a style object,
+    // accepting either the server's palette id (server-styled path) or an already-
+    // resolved style object (JS-synthesized path). `null` when the theme leaves it
+    // undefined — float rendering then keeps its built-in CSS look.
+    function chromeStyle(key) {
+      const v = view.chrome?.[key];
+      if (v == null) return null;
+      return typeof v === "number" ? paletteStyle(v) : v;
+    }
     function chromeCss(style) { return style ? styleToCss(style) : ""; }
     function applyChrome() {
       const c = view.chrome || {};
@@ -1478,9 +1487,10 @@
         default:        return { tl: "┌", tr: "┐", bl: "└", br: "┘", h: "─", v: "│" }; // single
       }
     }
-    function floatBorderSpan(text) {
+    function floatBorderSpan(text, color) {
       const s = document.createElement("span");
       s.className = "float-border";
+      if (color) s.style.color = color;
       s.textContent = text;
       return s;
     }
@@ -1494,13 +1504,19 @@
       const inner = float.width; // content cell width (border adds a ring around it)
       // The shared chrome draws the bg + glyph border + title; the content box sits one
       // cell inside (or at the bare rect when borderless).
+      // Theme from the colorscheme's float chrome when defined; else built-in CSS.
+      const nf = chromeStyle("normal_float"), fb = chromeStyle("float_border"), ft = chromeStyle("float_title");
       let cx = x, cy = y;
       if (bordered) {
-        ({ cx, cy } = popupChrome(x, y, inner, float.height, { style: float.border, title: float.title }));
+        ({ cx, cy } = popupChrome(x, y, inner, float.height, {
+          style: float.border, title: float.title, bg: cssColor(nf?.bg),
+          borderColor: cssColor(fb?.fg), titleColor: cssColor(ft?.fg),
+        }));
       }
       const box = document.createElement("div");
       box.className = "pmenu";
       place(box, cx, cy, inner, float.height);
+      if (nf?.bg != null) box.style.background = cssColor(nf.bg);
       const lines = float.lines || [];
       for (let i = 0; i < float.height; i++) {
         const rowEl = document.createElement("div");
@@ -1754,9 +1770,11 @@
     // top edge, left-aligned after the corner. The middle rows carry the left+right rails
     // with a blank span between them that the inset content box overlays.
     function appendGlyphBorder(box, totalW, totalH, opts = {}) {
-      const { style = "single", title = null, top = true, bottom = true } = opts;
+      const { style = "single", title = null, top = true, bottom = true,
+              borderColor = null, titleColor = null } = opts;
       const G = floatBorderGlyphs(style);
       const innerW = totalW - 2;
+      const bspan = (text) => floatBorderSpan(text, borderColor);
       const mkRow = (r) => {
         const row = document.createElement("div");
         row.className = "row";
@@ -1771,22 +1789,23 @@
         if (r === 0 && top) {
           const row = mkRow(r);
           const titleStr = title ? ` ${title} `.slice(0, innerW) : "";
-          row.appendChild(floatBorderSpan(G.tl));
+          row.appendChild(bspan(G.tl));
           if (titleStr) {
             const t = document.createElement("span");
             t.className = "float-title";
+            if (titleColor) t.style.color = titleColor;
             t.textContent = titleStr;
             row.appendChild(t);
           }
-          row.appendChild(floatBorderSpan(G.h.repeat(innerW - titleStr.length) + G.tr));
+          row.appendChild(bspan(G.h.repeat(innerW - titleStr.length) + G.tr));
         } else if (r === totalH - 1 && bottom) {
-          mkRow(r).appendChild(floatBorderSpan(G.bl + G.h.repeat(innerW) + G.br));
+          mkRow(r).appendChild(bspan(G.bl + G.h.repeat(innerW) + G.br));
         } else {
           // A rail row (no top/bottom corner when that edge is omitted).
           const row = mkRow(r);
-          row.appendChild(floatBorderSpan(G.v));
+          row.appendChild(bspan(G.v));
           row.appendChild(document.createTextNode(" ".repeat(innerW)));
-          row.appendChild(floatBorderSpan(G.v));
+          row.appendChild(bspan(G.v));
         }
       }
     }
@@ -1802,6 +1821,7 @@
       const totalH = innerH + (top ? 1 : 0) + (bottom ? 1 : 0);
       const chrome = document.createElement("div");
       chrome.className = "popup-chrome";
+      if (opts.bg) chrome.style.background = opts.bg;
       place(chrome, x, y, totalW, totalH);
       appendGlyphBorder(chrome, totalW, totalH, opts);
       gridEl.appendChild(chrome);
@@ -1842,7 +1862,14 @@
       const chrome = document.createElement("div");
       chrome.className = "win float-win";
       place(chrome, o.x + rect.x, o.y + rect.y, rect.width, rect.height);
-      if (bordered) appendGlyphBorder(chrome, rect.width, rect.height, { style: w.border, title: w.title });
+      // Theme from the colorscheme's float chrome when defined (NormalFloat bg,
+      // FloatBorder / FloatTitle fg); else the built-in `.float-win` CSS look.
+      const nf = chromeStyle("normal_float"), fb = chromeStyle("float_border"), ft = chromeStyle("float_title");
+      if (nf?.bg != null) chrome.style.background = cssColor(nf.bg);
+      if (bordered) appendGlyphBorder(chrome, rect.width, rect.height, {
+        style: w.border, title: w.title,
+        borderColor: cssColor(fb?.fg), titleColor: cssColor(ft?.fg),
+      });
       gridEl.appendChild(chrome);
       // Content inset past the border ring (or the whole rect when borderless). A
       // shallow clone with the inner rect keeps `renderWindow` shared and makes its

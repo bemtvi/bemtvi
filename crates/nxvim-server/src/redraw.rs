@@ -895,6 +895,9 @@ impl EditHost {
             ("incsearch", "IncSearch"),
             ("status_line", "StatusLine"),
             ("end_of_buffer", "EndOfBuffer"),
+            ("float_border", "FloatBorder"),
+            ("normal_float", "NormalFloat"),
+            ("float_title", "FloatTitle"),
         ];
         let entries = CHROME
             .iter()

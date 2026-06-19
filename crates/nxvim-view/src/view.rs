@@ -379,6 +379,13 @@ pub struct View {
     pub incsearch_style: Option<Style>,
     pub status_line: Option<Style>,
     pub end_of_buffer: Option<Style>,
+    /// Float chrome (`FloatBorder` / `NormalFloat` / `FloatTitle`). `None` when
+    /// the colorscheme leaves the group undefined — the client then keeps its
+    /// built-in look (the terminal-default border, a `Normal`-derived bg). These
+    /// are global: every float shares one theme, not a per-window style.
+    pub float_border: Option<Style>,
+    pub normal_float: Option<Style>,
+    pub float_title: Option<Style>,
     /// The single global status line (`laststatus=3`) as rendered segments,
     /// spanning the full editor width and showing the focused window's facts.
     /// Empty for modes 0/1/2 (status lines are per-window, or hidden); when
@@ -612,6 +619,9 @@ impl View {
         self.incsearch_style = chrome("incsearch");
         self.status_line = chrome("status_line");
         self.end_of_buffer = chrome("end_of_buffer");
+        self.float_border = chrome("float_border");
+        self.normal_float = chrome("normal_float");
+        self.float_title = chrome("float_title");
         // The window list (the multi-window form), or a single window built from
         // the legacy flat top-level fields (the synthetic paint fixtures).
         self.windows = match map_get(map, "windows") {

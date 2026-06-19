@@ -33,6 +33,8 @@ local hl = nx.hl.define
 -- common extras for completeness).
 hl(0, "Normal",       { fg = p.fg, bg = p.bg })
 hl(0, "NormalFloat",  { fg = p.fg, bg = p.bg_dark })
+hl(0, "FloatBorder",  { fg = p.gutter, bg = p.bg_dark })
+hl(0, "FloatTitle",   { fg = p.fg, bg = p.bg_dark })
 hl(0, "LineNr",       { fg = p.gutter })
 hl(0, "CursorLine",   { bg = p.cursor_line })
 hl(0, "CursorLineNr", { fg = p.fg })

@@ -248,7 +248,7 @@ pub(crate) fn render(
         frame.render_widget(Clear, outer);
         let inner = match win.border {
             Some(border) => {
-                let block = float_block(bt(border), win.title.as_deref());
+                let block = float_block(bt(border), win.title.as_deref(), FloatTheme::of(view));
                 let inner = block.inner(outer);
                 frame.render_widget(block, outer);
                 inner
@@ -291,7 +291,7 @@ pub(crate) fn render(
     // The list-less content float (`nx.ui.float`; LSP hover / signature help)
     // floats over the focused window's text area, on top, with no input focus.
     if let (Some(float), Some((inner, _, _))) = (&view.content_float, focused_inner) {
-        render_content_float(frame, inner, float, &view.styles);
+        render_content_float(frame, inner, float, &view.styles, FloatTheme::of(view));
     }
 
     // An open picker owns the cursor: draw it in the prompt, not the text window
@@ -556,12 +556,45 @@ fn window_area(wins_area: Rect, win: &WindowView) -> Rect {
 /// `title` (when present) on the top border, padded with a space each side so it
 /// reads as a label rather than running into the corners. Left-aligned, matching
 /// neovim's default `title_pos = "left"`.
-fn float_block(border: BorderType, title: Option<&str>) -> Block<'static> {
+fn float_block(border: BorderType, title: Option<&str>, theme: FloatTheme) -> Block<'static> {
     let mut block = Block::new().borders(Borders::ALL).border_type(border);
+    // `NormalFloat` paints the whole box (border cells and the inner background it
+    // shows through where content doesn't reach); `FloatBorder` then recolors the
+    // border glyphs over it. Both fall back to the terminal default when unset.
+    if let Some(bg) = theme.bg {
+        block = block.style(bg);
+    }
+    if let Some(border_style) = theme.border {
+        block = block.border_style(border_style);
+    }
     if let Some(title) = title {
-        block = block.title_top(Line::from(format!(" {title} ")).left_aligned());
+        let mut line = Line::from(format!(" {title} ")).left_aligned();
+        if let Some(title_style) = theme.title {
+            line = line.style(title_style);
+        }
+        block = block.title_top(line);
     }
     block
+}
+
+/// The resolved float chrome styles (`FloatBorder` / `NormalFloat` / `FloatTitle`),
+/// each `None` when the colorscheme leaves the group undefined. Pulled once from
+/// the [`View`] and threaded to every float so they theme identically.
+#[derive(Clone, Copy, Default)]
+struct FloatTheme {
+    border: Option<Style>,
+    bg: Option<Style>,
+    title: Option<Style>,
+}
+
+impl FloatTheme {
+    fn of(view: &View) -> Self {
+        FloatTheme {
+            border: view.float_border.map(rt),
+            bg: view.normal_float.map(rt),
+            title: view.float_title.map(rt),
+        }
+    }
 }
 
 /// A float's inner content rect (past its border), or the whole `area` for a
@@ -569,7 +602,7 @@ fn float_block(border: BorderType, title: Option<&str>) -> Block<'static> {
 /// float's cursor/popup anchor lands on the cells the border left for content.
 fn float_inner(area: Rect, border: Option<BorderType>) -> Rect {
     match border {
-        Some(border) => float_block(border, None).inner(area),
+        Some(border) => float_block(border, None, FloatTheme::default()).inner(area),
         None => area,
     }
 }
@@ -2434,6 +2467,7 @@ fn render_content_float(
     text_area: Rect,
     float: &nxvim_view::ContentFloatData,
     styles: &[nxvim_view::Style],
+    theme: FloatTheme,
 ) {
     let bordered = float.border.is_some();
     let chrome = if bordered { 2 } else { 0 };
@@ -2454,7 +2488,7 @@ fn render_content_float(
     frame.render_widget(Clear, area);
     let inner = match float.border.map(bt) {
         Some(border) => {
-            let block = float_block(border, float.title.as_deref());
+            let block = float_block(border, float.title.as_deref(), theme);
             let inner = block.inner(area);
             frame.render_widget(block, area);
             inner

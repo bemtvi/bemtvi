@@ -27,7 +27,7 @@ use crate::ops::{
     StatuslineTarget, TabOp, TerminalOpenReq, TsOp, UiFloatReq, UiInputReq, UiSelectReq, ViewOp,
     VirtChunkData, VirtDecorData, WindowOp,
 };
-use crate::runtime::Shared;
+use crate::runtime::{OutputLine, Shared};
 use crate::vimregex;
 
 /// `vim.regex(pat)` userdata: a vim pattern compiled by the real vim regexp engine
@@ -191,10 +191,26 @@ pub(crate) fn install_vim(lua: &Lua, shared: &Rc<RefCell<Shared>>) -> mlua::Resu
     // `nx.echo` (alias: `nvim_echo`): push text onto the message line.
     let sh = shared.clone();
     let echo = lua.create_function(move |_, msg: String| {
-        sh.borrow_mut().output.push(msg);
+        sh.borrow_mut().output.push(OutputLine {
+            text: msg,
+            error: false,
+        });
         Ok(())
     })?;
     nx.set("echo", echo)?;
+    // `nx._echo_err(msg)`: the error sibling of `nx.echo` — backs `nx.err_write` /
+    // `nx.err_writeln` (and the `nvim_err_write*` aliases) so an error message is
+    // routed through the core's `echo_err` and painted red, rather than blending in
+    // via `print`.
+    let sh = shared.clone();
+    let echo_err = lua.create_function(move |_, msg: String| {
+        sh.borrow_mut().output.push(OutputLine {
+            text: msg,
+            error: true,
+        });
+        Ok(())
+    })?;
+    nx.set("_echo_err", echo_err)?;
     // `nx._strwidth(s)` (exposed by the prelude as `nx.str.width`): the display
     // width of `s` in terminal cells — wide (CJK / emoji) graphemes count as two,
     // combining marks as zero — via the same `unicode-width` table the core
@@ -741,7 +757,10 @@ pub(crate) fn install_vim(lua: &Lua, shared: &Rc<RefCell<Shared>>) -> mlua::Resu
         "print",
         lua.create_function(move |lua, args: Variadic<mlua::Value>| {
             let parts: Vec<String> = args.iter().map(|v| stringify(lua, v)).collect();
-            sh.borrow_mut().output.push(parts.join("\t"));
+            sh.borrow_mut().output.push(OutputLine {
+                text: parts.join("\t"),
+                error: false,
+            });
             Ok(())
         })?,
     )?;

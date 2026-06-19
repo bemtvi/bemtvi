@@ -466,13 +466,23 @@ const PRELUDE_MODULES: &[(&str, &str)] = &[
     ),
 ];
 
+/// One line of captured Lua message output plus whether it was emitted as an
+/// *error* (`nx.err_write*`) — so the server paints it red rather than routing it
+/// through the plain message path.
+pub struct OutputLine {
+    pub text: String,
+    pub error: bool,
+}
+
 /// Side effects produced by running Lua, drained by the server.
 #[derive(Default)]
 pub(crate) struct Shared {
     /// Ex-commands requested via `vim.cmd(...)`.
     pub(crate) commands: Vec<String>,
-    /// Text emitted via `print(...)` / `vim.api.nvim_echo(...)`.
-    pub(crate) output: Vec<String>,
+    /// Text emitted via `print(...)` / `vim.api.nvim_echo(...)` / the error writers
+    /// (`nx.err_write*`), each carrying whether it was an error so the server can
+    /// route it through the red `echo_err` path.
+    pub(crate) output: Vec<OutputLine>,
     /// Highlight-group definitions from `nvim_set_hl`, applied to the core
     /// registry after the chunk drains (so the core stays the sole mutator).
     pub(crate) highlights: Vec<HlSet>,
@@ -950,8 +960,8 @@ impl LuaRuntime {
     }
 
     take_queue! {
-        /// Take captured `print` output since the last drain.
-        take_output -> Vec<String> = output
+        /// Take captured `print` / error-writer output since the last drain.
+        take_output -> Vec<OutputLine> = output
     }
 
     take_queue! {

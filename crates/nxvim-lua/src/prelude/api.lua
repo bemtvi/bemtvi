@@ -940,15 +940,16 @@ end
 api.nvim_win_is_valid = nx.win.is_valid
 
 -- Message writers (aliases nvim_err_writeln / nvim_err_write / nvim_out_write).
--- nxvim funnels editor messages through `print` (the message line); error vs out
--- is not visually distinguished yet, but the text is shown rather than swallowed.
--- nvim_err_writeln/out_write append a newline; the *_write forms don't (the
--- message line is line-oriented, so both just print).
+-- Error writers route through `nx._echo_err`, which lands on the message line and
+-- in `:messages` painted red (the core `echo_err` path); `out_write` funnels
+-- through `print` like a plain message. nvim_err_writeln/out_write append a
+-- newline; the *_write forms don't (the message line is line-oriented, so both
+-- just emit the text).
 function nx.err_writeln(msg)
-  print(tostring(msg or ""))
+  nx._echo_err(tostring(msg or ""))
 end
 function nx.err_write(msg)
-  print(tostring(msg or ""))
+  nx._echo_err(tostring(msg or ""))
 end
 function nx.out_write(msg)
   print(tostring(msg or ""))

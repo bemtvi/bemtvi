@@ -492,6 +492,7 @@ impl Editor {
                 SearchDir::Backward => "search hit TOP, continuing at BOTTOM",
             });
         } else {
+            self.message_error = false;
             self.message = format!("{}{}", dir.prefix(), pattern);
         }
     }

@@ -2148,7 +2148,17 @@ fn render_command(frame: &mut Frame, area: Rect, view: &View) {
             area,
         );
     } else if !view.message.is_empty() {
-        frame.render_widget(Paragraph::new(view.message.clone()), area);
+        // An error message paints with the theme's `ErrorMsg` (red foreground when
+        // the colorscheme leaves it undefined); a normal message keeps the default.
+        let mut para = Paragraph::new(view.message.clone());
+        if view.message_error {
+            para = para.style(
+                view.error_msg
+                    .map(rt)
+                    .unwrap_or_else(|| Style::default().fg(Color::Red)),
+            );
+        }
+        frame.render_widget(para, area);
     } else if !view.hidden_docks.is_empty() {
         // The idle command row advertises collapsed (hidden) docks as `▸{label}`
         // chips — the only on-screen hint a hidden dock still exists. A click on one

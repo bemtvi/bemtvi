@@ -70,19 +70,20 @@ impl EditHost {
         // failure surfaced lazily when `refresh_highlights` first opened the
         // buffer in the engine — is read straight off the editor so it shows this
         // frame rather than waiting for the next keypress.
-        let message = if !view.message.is_empty() {
-            view.message.clone()
+        let (message, message_error) = if !view.message.is_empty() {
+            (view.message.clone(), view.message_error)
         } else if !self.editor.message.is_empty() {
-            self.editor.message.clone()
+            (self.editor.message.clone(), self.editor.message_error)
         } else {
             // The under-cursor diagnostic is LSP-sourced — empty on the browser build.
+            // It's informational on the message line, so it isn't painted as an error.
             #[cfg(feature = "native")]
             {
-                self.diagnostic_under_cursor().unwrap_or_default()
+                (self.diagnostic_under_cursor().unwrap_or_default(), false)
             }
             #[cfg(not(feature = "native"))]
             {
-                String::new()
+                (String::new(), false)
             }
         };
 
@@ -253,6 +254,7 @@ impl EditHost {
                 Value::from(view.cmdline_cursor as u64),
             ),
             (Value::from("message"), Value::from(message.as_str())),
+            (Value::from("message_error"), Value::from(message_error)),
             (Value::from("guifont"), Value::from(guifont.as_str())),
             // The current buffer's identity + edit version, so the browser Worker ships
             // the full buffer text to its JS highlighter only when the text actually
@@ -932,6 +934,7 @@ impl EditHost {
             ("search", "Search"),
             ("incsearch", "IncSearch"),
             ("status_line", "StatusLine"),
+            ("error_msg", "ErrorMsg"),
             ("end_of_buffer", "EndOfBuffer"),
             ("float_border", "FloatBorder"),
             ("normal_float", "NormalFloat"),

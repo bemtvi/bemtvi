@@ -1599,10 +1599,14 @@ impl Renderer {
             };
             (line, style_fg(&view.normal).unwrap_or(DEFAULT_FG))
         } else if !view.message.is_empty() {
-            (
-                view.message.clone(),
-                style_fg(&view.normal).unwrap_or(DEFAULT_FG),
-            )
+            // An error message paints with the theme's `ErrorMsg` foreground (a plain
+            // red when the colorscheme leaves it undefined); else the default fg.
+            let fg = if view.message_error {
+                style_fg(&view.error_msg).unwrap_or(0xff_55_55)
+            } else {
+                style_fg(&view.normal).unwrap_or(DEFAULT_FG)
+            };
+            (view.message.clone(), fg)
         } else if !view.hidden_docks.is_empty() {
             let chips = view
                 .hidden_docks

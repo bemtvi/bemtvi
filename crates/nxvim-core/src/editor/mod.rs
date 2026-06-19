@@ -768,6 +768,14 @@ pub struct Editor {
     /// Transient status message (the bottom line when not in command mode).
     /// Set via [`Editor::echo`], which also appends to `messages`.
     pub message: String,
+    /// Whether the current [`message`](Self::message) reads as an *error* — drives
+    /// the red `ErrorMsg` paint the client gives the cmdline message line. Set
+    /// alongside `message` on every non-empty assignment: forced true by
+    /// [`Editor::echo_err`] (the `:echoerr` path) and inferred from vim's `E###:`
+    /// error-code prefix ([`is_error_line`]) by [`Editor::echo`]. Stale-but-unseen
+    /// after a `message.clear()` (an empty message never renders); the next
+    /// non-empty assignment always refreshes it.
+    pub message_error: bool,
     /// History of every message shown, the backing store for `:messages`. Each
     /// entry is one line carrying its error flag (see [`LoggedMessage`]).
     pub messages: Vec<LoggedMessage>,
@@ -1374,6 +1382,7 @@ impl Editor {
             search_active: false,
             search_origin: Cursor::default(),
             message: String::new(),
+            message_error: false,
             messages: Vec::new(),
             views: HashMap::new(),
             view_selects: Vec::new(),
@@ -1832,6 +1841,9 @@ impl Editor {
     pub fn echo(&mut self, msg: impl Into<String>) {
         let msg = msg.into();
         self.record_message(&msg, false);
+        // Mirror the panel's inference: a message wearing vim's `E###:` error code
+        // lights the cmdline red without each of the 100-plus call sites opting in.
+        self.message_error = is_error_line(&msg);
         self.message = msg;
     }
 
@@ -1841,6 +1853,7 @@ impl Editor {
     pub fn echo_err(&mut self, msg: impl Into<String>) {
         let msg = msg.into();
         self.record_message(&msg, true);
+        self.message_error = true;
         self.message = msg;
     }
 

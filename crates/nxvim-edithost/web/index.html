@@ -1935,6 +1935,13 @@
         el.innerHTML = html;
       } else if (view.message) {
         el.textContent = view.message;
+        // An error message paints with the theme's `ErrorMsg` foreground; on the
+        // pure-wasm build (chrome JS-synthesized, no server colorscheme) that's
+        // absent, so fall back to a plain red.
+        if (view.message_error) {
+          const css = chromeCss(chromeStyle("error_msg"));
+          el.style.cssText += css || "color:#e06c75;";
+        }
       } else if (view.hidden_docks && view.hidden_docks.length) {
         // Idle row: collapsed (hidden) docks shown as `▸{label}` chips — the only
         // hint a hidden dock exists; a click re-shows it (core's hidden_chip_at maps
@@ -2406,6 +2413,7 @@
       mode: () => latest.frame?.mode_label ?? "",
       cmdline: () => (latest.frame?.command_mode ? promptStr(latest.frame) + latest.frame.cmdline : ""),
       message: () => latest.frame?.message ?? "",
+      messageError: () => latest.frame?.message_error === true,
     };
   </script>
 </body>

@@ -387,6 +387,9 @@ pub struct View {
     /// the terminal cursor mid-line after `<Left>`/`<Right>` edits.
     pub cmdline_cursor: usize,
     pub message: String,
+    /// Whether `message` is an error — the client paints the message line with the
+    /// theme's red `ErrorMsg` highlight rather than the default foreground.
+    pub message_error: bool,
     /// The `'guifont'` value (`"Fira Code:h14"`, neovim/neovide syntax), relayed
     /// from the server. A GUI client parses it for the font family and `:h` size;
     /// empty means the client's own default. Frontend-agnostic — the TUI ignores it.
@@ -407,6 +410,10 @@ pub struct View {
     pub search_style: Option<Style>,
     pub incsearch_style: Option<Style>,
     pub status_line: Option<Style>,
+    /// The `ErrorMsg` look — the red foreground the client paints an error message
+    /// line with (`message_error`). `None` when the colorscheme leaves it undefined,
+    /// so the client falls back to a plain red foreground.
+    pub error_msg: Option<Style>,
     pub end_of_buffer: Option<Style>,
     /// Float chrome (`FloatBorder` / `NormalFloat` / `FloatTitle`). `None` when
     /// the colorscheme leaves the group undefined — the client then keeps its
@@ -634,6 +641,7 @@ impl View {
         self.cmdline_prompt = map_str(map, "cmdline_prompt");
         self.cmdline_cursor = map_u64(map, "cmdline_cursor") as usize;
         self.message = map_str(map, "message");
+        self.message_error = map_get(map, "message_error").and_then(Value::as_bool) == Some(true);
         self.guifont = map_str(map, "guifont");
         // The style palette must land before windows (their scroll bands snapshot
         // it) and chrome (which indexes into it).
@@ -647,6 +655,7 @@ impl View {
         self.search_style = chrome("search");
         self.incsearch_style = chrome("incsearch");
         self.status_line = chrome("status_line");
+        self.error_msg = chrome("error_msg");
         self.end_of_buffer = chrome("end_of_buffer");
         self.float_border = chrome("float_border");
         self.normal_float = chrome("normal_float");

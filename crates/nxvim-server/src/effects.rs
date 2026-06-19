@@ -354,9 +354,14 @@ impl EditHost {
             self.editor.command(&cmd);
         }
         // Each captured `print` / `nvim_echo` line becomes a message: the last
-        // is shown on the message line, and every line lands in `:messages`.
+        // is shown on the message line, and every line lands in `:messages`. Error
+        // writers (`nx.err_write*`) route through `echo_err` so they paint red.
         for line in self.lua.take_output() {
-            self.editor.echo(line);
+            if line.error {
+                self.editor.echo_err(line.text);
+            } else {
+                self.editor.echo(line.text);
+            }
         }
         // Picker actions a `picker`-bucket keymap fired (`nx._picker_action`): apply
         // each to the open picker. An unknown action name fails loud (core returns

@@ -587,6 +587,9 @@ pub struct View {
     pub cmdline_cursor: usize,
     /// Transient status message (shown on the command line when not typing one).
     pub message: String,
+    /// Whether [`message`](View::message) is an error — the client paints it with
+    /// the red `ErrorMsg` highlight. Mirrors [`Editor::message_error`].
+    pub message_error: bool,
     /// The floating selectable-list widget (`nx.ui.select`; later the picker),
     /// or `None` when none is open. When present it has input focus and floats
     /// over the focused window's text area; the server projects its geometry.
@@ -650,6 +653,9 @@ impl View {
             } else {
                 ed.message.clone()
             },
+            // The terminal placeholder isn't an error; the flag only rides a real
+            // message (`message_error` is stale-but-unseen when `message` is empty).
+            message_error: !ed.message.is_empty() && ed.message_error,
             menu: ed.menu_view(),
             content_float: ed.content_float_view(),
             global_statusline,

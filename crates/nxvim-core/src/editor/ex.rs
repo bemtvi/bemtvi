@@ -816,7 +816,10 @@ impl Editor {
     fn ex_echo(&mut self, args: &str, kind: EchoKind) {
         match expr::eval_echo(args) {
             Ok(text) => match kind {
-                EchoKind::Transient => self.message = text,
+                EchoKind::Transient => {
+                    self.message_error = false;
+                    self.message = text;
+                }
                 EchoKind::Message => self.echo(text),
                 EchoKind::Error => self.echo_err(text),
             },
@@ -1504,6 +1507,7 @@ impl Editor {
                     self.ensure_visible();
                     // Set the prompt directly, not via `echo`: it's a transient
                     // question, kept off the `:messages` history (like vim).
+                    self.message_error = false;
                     self.message = format!("replace with {repl} (y/n/a/l/q/^E/^Y)?");
                     return;
                 }

@@ -96,6 +96,68 @@ async fn messages_panel_paints_error_lines_red() {
 }
 
 #[tokio::test]
+async fn err_write_paints_red_in_the_messages_panel() {
+    let (rpc, mut incoming) = start(None).await;
+
+    // `nx.err_write` / `nx.err_writeln` are the error writers (the nvim_err_write*
+    // aliases): their text carries no `E###:` code yet must light red because it
+    // came through the error path, just like `:echoerr`.
+    feed(&rpc, ":lua nx.out_write('plain out')<CR>");
+    feed(&rpc, ":lua nx.err_writeln('oops via err')<CR>");
+
+    let map = redraw_after(&rpc, &mut incoming, ":messages<CR>").await;
+    assert!(panel_is_open(&rpc).await, "`:messages` opens a panel");
+
+    assert!(
+        messages_row_is_red(&map, "oops via err"),
+        "an nx.err_writeln line should be ErrorMsg-red"
+    );
+    assert!(
+        !messages_row_is_red(&map, "plain out"),
+        "an nx.out_write line must NOT be painted red"
+    );
+}
+
+/// The redraw's `message_error` flag — whether the client paints the cmdline
+/// message line red. *Map convention.*
+fn message_is_error(map: &[(Value, Value)]) -> bool {
+    map_get(map, "message_error").and_then(Value::as_bool) == Some(true)
+}
+
+#[tokio::test]
+async fn error_messages_flag_the_cmdline_line_red() {
+    let (rpc, mut incoming) = start(None).await;
+
+    // A command error (`E###:` code), `:echoerr`, and `nx.err_write` each flag the
+    // cmdline message as an error; a plain `:echo` / `print` does not.
+    let map = redraw_after(&rpc, &mut incoming, ":nosuchcommand<CR>").await;
+    assert!(message(&map).contains("E492"), "got: {:?}", message(&map));
+    assert!(
+        message_is_error(&map),
+        "an E### command error must flag the cmdline message red"
+    );
+
+    let map = redraw_after(&rpc, &mut incoming, ":echoerr 'boom'<CR>").await;
+    assert!(
+        message_is_error(&map),
+        ":echoerr must flag the cmdline message red"
+    );
+
+    let map = redraw_after(&rpc, &mut incoming, ":lua nx.err_write('lua boom')<CR>").await;
+    assert!(
+        message_is_error(&map),
+        "nx.err_write must flag the cmdline message red"
+    );
+
+    let map = redraw_after(&rpc, &mut incoming, ":echo 'all good'<CR>").await;
+    assert_eq!(message(&map), "all good");
+    assert!(
+        !message_is_error(&map),
+        "a plain :echo must NOT flag the cmdline message red"
+    );
+}
+
+#[tokio::test]
 async fn a_panel_is_navigable_with_plain_motions() {
     let (rpc, _incoming) = start(None).await;
     for i in 0..15 {

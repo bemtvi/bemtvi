@@ -2,6 +2,8 @@
 //! redraw underline spans and the under-cursor message line, the
 //! `:LspDiagnostics` location list, and `[d`/`]d` navigation.
 
+use std::collections::HashMap;
+
 use nxvim_core::unicode;
 use nxvim_lsp::lsp_types::Diagnostic;
 use nxvim_lsp::PositionEncoding;
@@ -104,6 +106,15 @@ impl EditHost {
         // The LSP-pushed and client-set sets merged; each diagnostic carries the
         // encoding its columns are in (the client-set ones are native UTF-8).
         let diags = self.diagnostics_merged(buffer);
+        // Per-frame index built once instead of scanning the whole merged list per
+        // row: each diagnostic intersects every buffer row in `[start.line,
+        // end.line]` (exactly when `diag_row_span` returns `Some`). Single-line
+        // diagnostics — the overwhelming majority — bucket by that one line;
+        // genuinely multi-line ones (rare) stay in a small overflow list scanned
+        // per row. `candidates_for` merges the two back into the original
+        // merged-list order, so the emitted span order per row is identical to the
+        // old `diags.iter().filter_map(...)` scan.
+        let index = DiagLineIndex::build(&diags);
         // Tab width is the rendered window's buffer's `tabstop` (it may differ
         // from the current buffer's), so the underline columns line up with the
         // text the client paints for that window.
@@ -120,11 +131,12 @@ impl EditHost {
                 let Some(text) = buf.map(|b| b.line(line_idx)) else {
                     return Value::Array(Vec::new());
                 };
-                let spans = diags
-                    .iter()
-                    .filter_map(|(d, encoding)| {
+                let spans = index
+                    .candidates_for(line_idx as u32)
+                    .filter_map(|&i| {
+                        let (d, encoding) = diags[i];
                         let (start_byte, end_byte) =
-                            self.diag_row_span(d, *encoding, line_idx, &text)?;
+                            self.diag_row_span(d, encoding, line_idx, &text)?;
                         let start_col = unicode::virtcol(&text, start_byte, tabstop);
                         let mut end_col = unicode::virtcol(&text, end_byte, tabstop);
                         // A zero-width range (e.g. an empty span at end-of-line)
@@ -179,6 +191,10 @@ impl EditHost {
         // Merged LSP + client-set; the inline message positions by line only, so
         // the per-diagnostic encoding isn't needed here.
         let diags = self.diagnostics_merged(buffer);
+        // Per-frame index of the diagnostics *starting* on each line, in merged
+        // order, so `min_by_key` (which returns the first element reaching the
+        // minimum) picks the same winner as the old per-row `filter`/`min_by_key`.
+        let by_start = DiagStartIndex::build(&diags);
         let rows = segs
             .iter()
             .map(|seg| {
@@ -194,11 +210,10 @@ impl EditHost {
                 let line = (n - 1) as u32;
                 // The most severe diagnostic that *starts* on this row wins the
                 // line's one inline slot (ties broken by leftmost column).
-                let best = diags
-                    .iter()
-                    .filter(|(d, _)| d.range.start.line == line)
-                    .min_by_key(|(d, _)| (severity_code(d.severity), d.range.start.character))
-                    .map(|(d, _)| d);
+                let best = by_start
+                    .on_line(line)
+                    .map(|&i| diags[i].0)
+                    .min_by_key(|d| (severity_code(d.severity), d.range.start.character));
                 let Some(d) = best else {
                     return Value::Nil;
                 };
@@ -243,6 +258,9 @@ impl EditHost {
         }
         // Merged LSP + client-set; the gutter sign positions by line only.
         let diags = self.diagnostics_merged(buffer);
+        // Same per-frame start-line index as the virtual-text surface: same
+        // "starts on line" filter and same `min_by_key` tie-break.
+        let by_start = DiagStartIndex::build(&diags);
         let rows = segs
             .iter()
             .map(|seg| {
@@ -257,11 +275,10 @@ impl EditHost {
                 let line = (n - 1) as u32;
                 // The most severe diagnostic that *starts* on this row wins the
                 // line's sign cell (ties broken by leftmost column).
-                let best = diags
-                    .iter()
-                    .filter(|(d, _)| d.range.start.line == line)
-                    .min_by_key(|(d, _)| (severity_code(d.severity), d.range.start.character))
-                    .map(|(d, _)| d);
+                let best = by_start
+                    .on_line(line)
+                    .map(|&i| diags[i].0)
+                    .min_by_key(|d| (severity_code(d.severity), d.range.start.character));
                 let Some(d) = best else {
                     return Value::Nil;
                 };
@@ -515,6 +532,109 @@ impl EditHost {
             })
             .cloned()
             .collect()
+    }
+}
+
+/// A per-frame index from a buffer line to the merged-list positions of the
+/// diagnostics *starting* on that line — the keying both [`EditHost::diagnostics_virt_text_for`]
+/// and [`EditHost::diagnostics_signs_for`] use. Built once per call instead of
+/// re-scanning the whole merged list for every visible row. Each bucket holds the
+/// merged-list indices in their original order, so iterating a bucket and folding
+/// it with `min_by_key` (which keeps the first element reaching the minimum)
+/// reproduces the old `diags.iter().filter(...).min_by_key(...)` winner exactly.
+struct DiagStartIndex {
+    by_line: HashMap<u32, Vec<usize>>,
+}
+
+impl DiagStartIndex {
+    fn build(diags: &[(&Diagnostic, PositionEncoding)]) -> Self {
+        let mut by_line: HashMap<u32, Vec<usize>> = HashMap::new();
+        for (i, (d, _)) in diags.iter().enumerate() {
+            by_line.entry(d.range.start.line).or_default().push(i);
+        }
+        Self { by_line }
+    }
+
+    /// The merged-list indices of the diagnostics starting on `line`, in merged
+    /// order (empty when none start there).
+    fn on_line(&self, line: u32) -> std::slice::Iter<'_, usize> {
+        self.by_line.get(&line).map_or([].iter(), |v| v.iter())
+    }
+}
+
+/// A per-frame index for the underline surface ([`EditHost::diagnostics_for`]),
+/// whose selection is span *intersection* (a diagnostic paints on every buffer
+/// row in `[start.line, end.line]`), not just its start line. Single-line
+/// diagnostics — the common case — bucket by their one line; the rare genuinely
+/// multi-line ones live in a small overflow list scanned per row. Both halves
+/// store merged-list indices in original order; [`DiagLineIndex::candidates_for`]
+/// merges them back into ascending merged-list order, so the emitted span order
+/// per row is identical to the old full-list `filter_map` scan.
+struct DiagLineIndex {
+    single: HashMap<u32, Vec<usize>>,
+    multi: Vec<usize>,
+}
+
+impl DiagLineIndex {
+    fn build(diags: &[(&Diagnostic, PositionEncoding)]) -> Self {
+        let mut single: HashMap<u32, Vec<usize>> = HashMap::new();
+        let mut multi = Vec::new();
+        for (i, (d, _)) in diags.iter().enumerate() {
+            if d.range.start.line == d.range.end.line {
+                single.entry(d.range.start.line).or_default().push(i);
+            } else {
+                multi.push(i);
+            }
+        }
+        Self { single, multi }
+    }
+
+    /// The merged-list indices of the diagnostics intersecting buffer `row`, in
+    /// ascending (= original merged) order. The original scan emitted spans in
+    /// merged order, so the single-line bucket (already ordered) is merged with
+    /// the row-covering multi-line entries by a single ordered pass.
+    fn candidates_for(&self, row: u32) -> impl Iterator<Item = &usize> {
+        // Restrict to multi-line diagnostics whose inclusive line range covers
+        // `row`; `diag_row_span` still re-checks, so this is purely a prefilter.
+        // Most frames have an empty `multi`, so this collapses to the single
+        // bucket's iterator.
+        let single = self.single.get(&row).map_or([].iter(), |v| v.iter());
+        // No multi-line diagnostics: skip the merge entirely (the common path).
+        if self.multi.is_empty() {
+            return Either::Left(single);
+        }
+        // Every multi-line diagnostic is offered as a candidate for this row; the
+        // caller's `diag_row_span` does the precise inclusive-range coverage test
+        // (returning `None` for rows the range doesn't reach), exactly as the old
+        // full-list scan relied on. Both halves are ascending, so the union sorts
+        // back into the original merged order.
+        let mut merged: Vec<&usize> = single.collect();
+        merged.extend(self.multi.iter());
+        merged.sort_unstable();
+        Either::Right(merged.into_iter())
+    }
+}
+
+/// A two-arm iterator so [`DiagLineIndex::candidates_for`] can return the cheap
+/// borrowed single-bucket iterator on the common (no multi-line) path without
+/// allocating, and a merged owned iterator only when multi-line diagnostics
+/// exist.
+enum Either<L, R> {
+    Left(L),
+    Right(R),
+}
+
+impl<'a, L, R> Iterator for Either<L, R>
+where
+    L: Iterator<Item = &'a usize>,
+    R: Iterator<Item = &'a usize>,
+{
+    type Item = &'a usize;
+    fn next(&mut self) -> Option<Self::Item> {
+        match self {
+            Either::Left(l) => l.next(),
+            Either::Right(r) => r.next(),
+        }
     }
 }
 

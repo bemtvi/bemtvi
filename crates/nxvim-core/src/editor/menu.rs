@@ -1416,15 +1416,15 @@ impl Editor {
                 let vchrome = if m.completion { 1 } else { 2 };
                 // Below if the bordered box fits, else above, else clamp to whichever
                 // side has more room (the popup's four-tier fallback).
-                let below = text_height.saturating_sub(cursor_row + 1);
+                let below = text_height.saturating_sub(cursor_row.saturating_add(1));
                 let above = cursor_row;
                 let (row, height) = if count + vchrome <= below {
-                    (cursor_row + 1, count)
+                    (cursor_row.saturating_add(1), count)
                 } else if count + vchrome <= above {
                     (cursor_row - (count + vchrome), count)
                 } else if below >= above {
                     (
-                        cursor_row + 1,
+                        cursor_row.saturating_add(1),
                         below.saturating_sub(vchrome).clamp(1, count),
                     )
                 } else {
@@ -1475,8 +1475,8 @@ impl Editor {
                 let align = m.align.unwrap_or(Align::Center);
                 let (col, row) = place_aligned(
                     (0, 0, text_width, text_height),
-                    width + 2,
-                    height + 2,
+                    width.saturating_add(2),
+                    height.saturating_add(2),
                     align,
                     m.margin,
                 );

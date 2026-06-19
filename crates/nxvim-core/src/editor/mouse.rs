@@ -587,7 +587,7 @@ impl Editor {
     fn region_tabline_at(&self, row: usize, col: usize) -> Option<(Layer, usize)> {
         let (layer, x0) = self.region_geoms().into_iter().find_map(|g| {
             let (ty, x0, w) = g.tabline?;
-            (row == ty && (x0..x0 + w).contains(&col)).then_some((g.layer, x0))
+            (row == ty && (x0..x0.saturating_add(w)).contains(&col)).then_some((g.layer, x0))
         })?;
         if layer == Layer::Main && !self.global_options().tabline.is_empty() {
             return None; // a custom main tabline has no built-in click regions.
@@ -598,15 +598,15 @@ impl Editor {
         if let Layer::Dock(s) = layer {
             let title = self.dock_title(s);
             if !title.is_empty() {
-                x += crate::unicode::display_width(&format!(" {title} "));
+                x = x.saturating_add(crate::unicode::display_width(&format!(" {title} ")));
             }
         }
         for (i, label) in self.tab_labels_for(layer).into_iter().enumerate() {
             let width = tab_cell_width(&label);
-            if (x..x + width).contains(&col) {
+            if (x..x.saturating_add(width)).contains(&col) {
                 return Some((layer, i));
             }
-            x += width;
+            x = x.saturating_add(width);
         }
         None
     }
@@ -630,14 +630,14 @@ impl Editor {
         let bands = self.dock_bands();
         let main_tabline = self.tabline_rows();
         let chrome = main_tabline + self.global_statusline_rows();
-        let mid_y = bands.reserved_top() + main_tabline;
+        let mid_y = bands.reserved_top().saturating_add(main_tabline);
         let mid_h = self
             .height
             .saturating_sub(bands.reserved_top())
             .saturating_sub(bands.reserved_bottom())
             .saturating_sub(chrome)
             .max(1);
-        Some(mid_y + mid_h)
+        Some(mid_y.saturating_add(mid_h))
     }
 
     fn region_geoms(&self) -> Vec<RegionGeom> {
@@ -647,7 +647,7 @@ impl Editor {
         let chrome = main_tabline + gstatus;
         // The middle band (left dock | main | right docks): its top row, height, and
         // the main tree's width — what's left after the docks and the global chrome.
-        let mid_y = bands.reserved_top() + main_tabline;
+        let mid_y = bands.reserved_top().saturating_add(main_tabline);
         let mid_h = self
             .height
             .saturating_sub(bands.reserved_top())
@@ -661,8 +661,14 @@ impl Editor {
             .max(1);
         // The bottom dock's band content starts past its separator, below the middle
         // band and the global status line; the right dock sits past main + its sep.
-        let bottom_y = mid_y + mid_h + gstatus + 1;
-        let right_x = bands.reserved_left() + main_w + 1;
+        let bottom_y = mid_y
+            .saturating_add(mid_h)
+            .saturating_add(gstatus)
+            .saturating_add(1);
+        let right_x = bands
+            .reserved_left()
+            .saturating_add(main_w)
+            .saturating_add(1);
         self.open_layers()
             .into_iter()
             .map(|layer| {
@@ -681,7 +687,12 @@ impl Editor {
                     Layer::Main => 0,
                     dock => self.tabline_rows_for(dock),
                 };
-                let tree = (cx, cy + tlr, cw, ch.saturating_sub(tlr).max(1));
+                let tree = (
+                    cx,
+                    cy.saturating_add(tlr),
+                    cw,
+                    ch.saturating_sub(tlr).max(1),
+                );
                 // The tabline strip: main's is the global top bar (full width, at the
                 // reserved-top row); a dock's is its content's first row, shown only
                 // when the band has room for both it and ≥1 content row (the client's
@@ -739,7 +750,8 @@ impl Editor {
     fn region_at(&self, row: usize, col: usize) -> Option<(Layer, usize, usize)> {
         self.region_geoms().into_iter().find_map(|g| {
             let (x, y, w, h) = g.tree;
-            (col >= x && col < x + w && row >= y && row < y + h).then_some((g.layer, x, y))
+            (col >= x && col < x.saturating_add(w) && row >= y && row < y.saturating_add(h))
+                .then_some((g.layer, x, y))
         })
     }
 
@@ -777,12 +789,12 @@ impl Editor {
         let (x, y) = (col - ox, row - oy);
         for sep in &tree.separators {
             if sep.vertical {
-                if x == sep.x && y >= sep.y && y < sep.y + sep.length {
+                if x == sep.x && y >= sep.y && y < sep.y.saturating_add(sep.length) {
                     // The window left of the divider grows when dragged right.
                     let (win, ..) = window_at_in(tree, sep.x.checked_sub(1)?, y)?;
                     return Some((win, true));
                 }
-            } else if y == sep.y && x >= sep.x && x < sep.x + sep.length {
+            } else if y == sep.y && x >= sep.x && x < sep.x.saturating_add(sep.length) {
                 // The window above the divider grows when dragged down.
                 let (win, ..) = window_at_in(tree, x, sep.y.checked_sub(1)?)?;
                 return Some((win, false));
@@ -794,11 +806,10 @@ impl Editor {
         let (win, _, rel_y) = window_at_in(tree, x, y)?;
         let (_, text_height) = self.window_text_area(win)?;
         if rel_y == text_height {
-            let below = y + 1;
-            let has_window_below = tree
-                .separators
-                .iter()
-                .any(|s| !s.vertical && s.y == below && x >= s.x && x < s.x + s.length);
+            let below = y.saturating_add(1);
+            let has_window_below = tree.separators.iter().any(|s| {
+                !s.vertical && s.y == below && x >= s.x && x < s.x.saturating_add(s.length)
+            });
             if has_window_below {
                 return Some((win, false));
             }
@@ -821,14 +832,14 @@ impl Editor {
         let gstatus = self.global_statusline_rows();
         let chrome = main_tabline + gstatus;
         // The middle band (left dock | main | right dock): its top row and height.
-        let mid_y = bands.reserved_top() + main_tabline;
+        let mid_y = bands.reserved_top().saturating_add(main_tabline);
         let mid_h = self
             .height
             .saturating_sub(bands.reserved_top())
             .saturating_sub(bands.reserved_bottom())
             .saturating_sub(chrome)
             .max(1);
-        let in_mid = (mid_y..mid_y + mid_h).contains(&row);
+        let in_mid = (mid_y..mid_y.saturating_add(mid_h)).contains(&row);
         // Left/right dock edges are vertical separators spanning the middle band;
         // top/bottom edges are horizontal separators spanning the full width.
         if self.dock_is_open(DockSide::Left) && bands.left > 0 && in_mid && col == bands.left {
@@ -1201,8 +1212,8 @@ impl Editor {
         // The window's text band in global screen rows: `[top_edge, bottom_edge]`.
         // `abs_y` is the window's absolute top, so this is correct in any region (a
         // dock band as much as the main area), not just below the main tabline.
-        let top_edge = abs_y + pad.top;
-        let bottom_edge = top_edge + text_height.saturating_sub(1);
+        let top_edge = abs_y.saturating_add(pad.top);
+        let bottom_edge = top_edge.saturating_add(text_height.saturating_sub(1));
         let rel_y = if row <= top_edge {
             self.drag_scroll(false); // at/above the first line → reveal the line above
             0
@@ -1213,7 +1224,7 @@ impl Editor {
             row - top_edge
         };
         let rel_x = col
-            .saturating_sub(abs_x + pad.left)
+            .saturating_sub(abs_x.saturating_add(pad.left))
             .min(text_width.saturating_sub(1));
         self.text_cell_to_buf(win, rel_x, rel_y)
     }
@@ -1318,9 +1329,10 @@ impl Editor {
     /// last redraw) can never fire.
     fn complete_docs_hit_at(&self, row: usize, col: usize) -> bool {
         self.completion_active()
-            && self
-                .complete_docs_hit
-                .is_some_and(|h| (h.x..h.x + h.w).contains(&col) && (h.y..h.y + h.h).contains(&row))
+            && self.complete_docs_hit.is_some_and(|h| {
+                (h.x..h.x.saturating_add(h.w)).contains(&col)
+                    && (h.y..h.y.saturating_add(h.h)).contains(&row)
+            })
     }
 
     /// Scroll the completion docs sidebar one line, non-wrapping (a wheel is a
@@ -1444,16 +1456,22 @@ impl Editor {
     fn menu_hit(&self, row: usize, col: usize) -> Option<MenuHit> {
         let s = self.menu_screen()?;
         let (bx, by, bw, bh) = s.box_rect;
-        if !((bx..bx + bw).contains(&col) && (by..by + bh).contains(&row)) {
+        if !((bx..bx.saturating_add(bw)).contains(&col)
+            && (by..by.saturating_add(bh)).contains(&row))
+        {
             return None;
         }
         if let Some((px, py, pw, ph)) = s.preview {
-            if (px..px + pw).contains(&col) && (py..py + ph).contains(&row) {
+            if (px..px.saturating_add(pw)).contains(&col)
+                && (py..py.saturating_add(ph)).contains(&row)
+            {
                 return Some(MenuHit::Preview);
             }
         }
         let (lx, ly, lw, lrows) = s.list;
-        if (lx..lx + lw).contains(&col) && (ly..ly + lrows).contains(&row) {
+        if (lx..lx.saturating_add(lw)).contains(&col)
+            && (ly..ly.saturating_add(lrows)).contains(&row)
+        {
             let idx = s.start + (row - ly);
             if idx < s.total {
                 return Some(MenuHit::Item(idx));
@@ -1481,7 +1499,9 @@ impl Editor {
             // that global row and the box's bottom border abuts it; the token column is
             // a global column (the command line spans the full width from x = 0).
             let vborder = 1; // top border only
-            let box_y = self.height.checked_sub(geom.height + vborder)?;
+            let box_y = self
+                .height
+                .checked_sub(geom.height.saturating_add(vborder))?;
             (geom.col, box_y, 1, vborder)
         } else {
             let (wx, wy) = self.window_screen_pos(win)?;
@@ -1491,28 +1511,28 @@ impl Editor {
                 .window_options(win)
                 .map(|o| o.padding)
                 .unwrap_or_default();
-            let inner_x = wx + pad.left + gutter; // text inner: past padding + the number gutter
-                                                  // A full border for select / picker; the completion popup omits its top
-                                                  // border and shifts one cell left so its left border doesn't cover the word
-                                                  // it completes. `geom.col` is the content anchor for `Cursor` placement and
-                                                  // the outer-box left for `Editor`; either way the outer box left is
-                                                  // `geom.col - left_shift` and the content sits one cell in.
+            let inner_x = wx.saturating_add(pad.left).saturating_add(gutter); // text inner: past padding + the number gutter
+                                                                              // A full border for select / picker; the completion popup omits its top
+                                                                              // border and shifts one cell left so its left border doesn't cover the word
+                                                                              // it completes. `geom.col` is the content anchor for `Cursor` placement and
+                                                                              // the outer-box left for `Editor`; either way the outer box left is
+                                                                              // `geom.col - left_shift` and the content sits one cell in.
             let border_top = !m.completion;
             let left_shift = usize::from(!border_top);
             let vborder = if border_top { 2 } else { 1 };
-            let box_x = (inner_x + geom.col).saturating_sub(left_shift);
+            let box_x = inner_x.saturating_add(geom.col).saturating_sub(left_shift);
             (
                 box_x,
-                wy + pad.top + geom.row,
+                wy.saturating_add(pad.top).saturating_add(geom.row),
                 usize::from(border_top),
                 vborder,
             )
         };
-        let box_w = geom.width + 2;
-        let box_h = geom.height + vborder;
+        let box_w = geom.width.saturating_add(2);
+        let box_h = geom.height.saturating_add(vborder);
         // The content rect (inside the borders): the list + prompt + preview live here.
-        let content_x = box_x + 1; // past the left border (present in every variant)
-        let content_y = box_y + top_border;
+        let content_x = box_x.saturating_add(1); // past the left border (present in every variant)
+        let content_y = box_y.saturating_add(top_border);
         let content_w = geom.width;
         let content_h = geom.height;
         // A picker with a preview pane splits the content into a list column (left) +
@@ -1522,8 +1542,8 @@ impl Editor {
             let preview_w = ((content_w as f32 * 0.6) as usize)
                 .min(content_w.saturating_sub(2))
                 .max(1);
-            let list_w = content_w.saturating_sub(preview_w + 1).max(1);
-            let preview_x = content_x + list_w + 1;
+            let list_w = content_w.saturating_sub(preview_w.saturating_add(1)).max(1);
+            let preview_x = content_x.saturating_add(list_w).saturating_add(1);
             (list_w, Some((preview_x, content_y, preview_w, content_h)))
         } else {
             (content_w, None)
@@ -1534,7 +1554,7 @@ impl Editor {
         let prompt_rows = usize::from(m.query.is_some());
         let chrome = prompt_rows * 2;
         let prompt_top = prompt_rows > 0 && m.prompt_pos == PromptPos::Top;
-        let list_y = content_y + if prompt_top { chrome } else { 0 };
+        let list_y = content_y.saturating_add(if prompt_top { chrome } else { 0 });
         let list_rows = content_h.saturating_sub(chrome);
         Some(MenuScreen {
             box_rect: (box_x, box_y, box_w, box_h),
@@ -1638,7 +1658,7 @@ impl Editor {
             }
             self.scroll_from = Some((old_top, self.cursor.line));
             self.top = new_top;
-            let bottom = self.top + th.saturating_sub(1);
+            let bottom = self.top.saturating_add(th.saturating_sub(1));
             if self.cursor.line < self.top {
                 self.cursor.line = self.top;
             } else if self.cursor.line > bottom {
@@ -1663,7 +1683,7 @@ impl Editor {
             if new_top == old_top {
                 return;
             }
-            let bottom = new_top + th.saturating_sub(1);
+            let bottom = new_top.saturating_add(th.saturating_sub(1));
             w.saved_top = new_top;
             if w.saved_cursor.line < new_top {
                 w.saved_cursor.line = new_top;
@@ -1718,7 +1738,7 @@ impl Editor {
         let line_count = buf.line_count();
         let text_w = content_w.saturating_sub(self.number_width_for(&opts, line_count));
         let ts = buf.options.effective_tabstop();
-        let widest = (top..(top + text_h).min(line_count))
+        let widest = (top..top.saturating_add(text_h).min(line_count))
             .map(|l| {
                 let s = buf.line(l);
                 crate::unicode::virtcol(&s, s.len(), ts)
@@ -1740,8 +1760,11 @@ impl Editor {
         }
         let opts = self.windows.cur().options.clone();
         let so = opts.sidescrolloff.min(tw.saturating_sub(1) / 2);
-        let lo = self.leftcol + so;
-        let hi = (self.leftcol + tw).saturating_sub(so + 1);
+        let lo = self.leftcol.saturating_add(so);
+        let hi = self
+            .leftcol
+            .saturating_add(tw)
+            .saturating_sub(so.saturating_add(1));
         let vc = self.cursor_virtcol();
         let target = if vc < lo {
             lo
@@ -1857,7 +1880,7 @@ impl Editor {
         let buf = &self.buffers.get(buf_id).buffer;
         let line_count = buf.line_count();
         // A cell below the last line lands on the last line (vim's behavior).
-        let line = (top + rel_y).min(line_count.saturating_sub(1));
+        let line = top.saturating_add(rel_y).min(line_count.saturating_sub(1));
         let gutter = self.number_width_for(&opts, line_count);
         let col = if rel_x < gutter {
             // The number column: place the cursor at the line's start.
@@ -1867,7 +1890,7 @@ impl Editor {
             // mapped back to a byte offset (rounding a between-cells click to the
             // nearest grapheme). `set_window_cursor`'s clamp pulls a past-EOL
             // result onto the last char in Normal mode.
-            let screen_col = (rel_x - gutter) + leftcol;
+            let screen_col = (rel_x - gutter).saturating_add(leftcol);
             let text = buf.line(line);
             crate::unicode::byte_at_virtcol(&text, screen_col, buf.options.effective_tabstop())
         };
@@ -1885,7 +1908,7 @@ impl Editor {
             .find(|g| g.layer == layer)
             .map(|g| (g.tree.0, g.tree.1))?;
         let (wx, wy, _, _) = self.window_rect(win)?;
-        Some((ox + wx, oy + wy))
+        Some((ox.saturating_add(wx), oy.saturating_add(wy)))
     }
 }
 
@@ -1909,10 +1932,14 @@ fn window_at_in(tree: &WindowTree, x: usize, y: usize) -> Option<(WindowId, usiz
         let inset = matches!(&w.float, Some(c) if c.border != BorderStyle::None) as usize;
         let pad = w.options.padding;
         let r = w.rect;
-        let x0 = r.x + inset + pad.left;
-        let y0 = r.y + inset + pad.top;
-        let x1 = (r.x + r.width).saturating_sub(inset + pad.right);
-        let y1 = (r.y + r.height).saturating_sub(inset + pad.bottom);
+        let x0 = r.x.saturating_add(inset).saturating_add(pad.left);
+        let y0 = r.y.saturating_add(inset).saturating_add(pad.top);
+        let x1 =
+            r.x.saturating_add(r.width)
+                .saturating_sub(inset.saturating_add(pad.right));
+        let y1 =
+            r.y.saturating_add(r.height)
+                .saturating_sub(inset.saturating_add(pad.bottom));
         (x >= x0 && x < x1 && y >= y0 && y < y1).then(|| (id, x - x0, y - y0))
     };
     tree.floats

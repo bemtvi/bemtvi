@@ -979,6 +979,61 @@ async fn client_set_diagnostics_paint_without_a_server() {
 }
 
 #[tokio::test]
+async fn multiple_diagnostics_on_one_line_pick_most_severe_and_keep_span_order() {
+    // Guards the per-frame diagnostics index against the old per-row scan: when
+    // several diagnostics start on the same line, the sign / virtual-text slot
+    // must go to the most severe one (ties → leftmost column), regardless of the
+    // order they were set in — and every underline span on the row must still be
+    // emitted, in the order the merged list yields them. A lower-severity entry
+    // is set FIRST so a naive "first match wins" bucket would pick the wrong one.
+    let path = write_temp("multidiag", "txt", "hello world\nsecond line\n");
+    let (rpc, mut incoming) = start(Some(path)).await;
+    let _ = lines(&rpc).await; // barrier
+
+    exec_lua(
+        &rpc,
+        r#"
+        vim.diagnostic.config({ underline = true, virtual_text = true, signs = true })
+        vim.diagnostic.set(1, 0, {
+          -- severity 2 (warn) set first, spanning cols 6..11 ("world")
+          { lnum = 0, col = 6, end_lnum = 0, end_col = 11, severity = 2, message = "warn here" },
+          -- severity 1 (error) set second, spanning cols 0..5 ("hello")
+          { lnum = 0, col = 0, end_lnum = 0, end_col = 5, severity = 1, message = "boom" },
+        })
+        "#,
+    )
+    .await;
+
+    let view = redraw_after(&rpc, &mut incoming, "<Esc>").await;
+
+    // Underline: both spans paint on row 0, in merged (set) order — warn span
+    // first (it was set first), then the error span.
+    let diags = view_diag_spans(&view);
+    assert_eq!(
+        diags.first().cloned().unwrap_or_default(),
+        vec![(6, 11, 2), (0, 5, 1)],
+        "both diagnostics underline row 0 in merged order: {diags:?}"
+    );
+    // Sign + virtual text: the most severe (error, severity 1) wins the single
+    // slot even though the warn was set first.
+    assert_eq!(
+        view_diag_signs(&view).first().cloned().flatten(),
+        Some(("E".to_string(), 1)),
+        "the error sign wins the row's one sign slot: {:?}",
+        view_diag_signs(&view)
+    );
+    assert!(
+        view_diag_virt(&view)
+            .first()
+            .cloned()
+            .flatten()
+            .is_some_and(|(t, sev)| t.contains("boom") && sev == 1),
+        "the error message wins the row's inline slot: {:?}",
+        view_diag_virt(&view)
+    );
+}
+
+#[tokio::test]
 async fn scroll_band_carries_search_highlights() {
     // hlsearch matches must ride the scroll band, not vanish until the slide
     // settles: the band's `search` spans cover its rows so the client paints them

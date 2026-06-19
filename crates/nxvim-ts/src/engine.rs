@@ -927,9 +927,7 @@ fn build_indent_maps(query: &Query, root: &Node, rope: &Rope) -> IndentMaps {
     let mut maps = IndentMaps::default();
     let names = query.capture_names();
     let mut cursor = QueryCursor::new();
-    let provider =
-        |node: Node| std::iter::once(node_bytes(rope, node.start_byte()..node.end_byte()));
-    let mut caps = cursor.captures(query, *root, provider);
+    let mut caps = cursor.captures(query, *root, node_text_provider(rope));
     while let Some((m, idx)) = caps.next() {
         let cap = m.captures[*idx];
         let name = names[cap.index as usize];
@@ -1115,9 +1113,11 @@ fn extract_spans(
         let names = layer.query.capture_names();
         let mut cursor = QueryCursor::new();
         cursor.set_byte_range(lo..hi);
-        let provider =
-            |node: Node| std::iter::once(node_bytes(shadow, node.start_byte()..node.end_byte()));
-        let mut caps = cursor.captures(layer.query, layer.tree.root_node(), provider);
+        let mut caps = cursor.captures(
+            layer.query,
+            layer.tree.root_node(),
+            node_text_provider(shadow),
+        );
         while let Some((m, idx)) = caps.next() {
             let cap = m.captures[*idx];
             let name = names[cap.index as usize];
@@ -1148,19 +1148,55 @@ fn extract_spans(
     // capture over a broader one within the same layer.
     raw.sort_by_key(|(s, e, _, rank)| (*rank, std::cmp::Reverse(e - s), *s));
 
-    let mut out = Vec::new();
+    // Per-visible-line geometry, computed once: `(line_start, content_len)` indexed
+    // by `line - first_line`. The old code recomputed this inside the capture scan.
+    let n_lines = last_line - first_line;
+    let mut line_geom: Vec<(usize, usize)> = Vec::with_capacity(n_lines);
     for line in first_line..last_line {
         let line_start = shadow.line_to_byte_idx(line, LINE_TYPE);
         let text = shadow.line(line, LINE_TYPE).to_string();
         let content_len = text.trim_end_matches(['\n', '\r']).len();
+        line_geom.push((line_start, content_len));
+    }
+
+    // Bucket each capture into the visible lines it paints, in one forward pass over
+    // the already-sorted `raw`. The old code's per-line inner loop walked all of
+    // `raw` and tested `e <= line_start || s >= line_start + content_len` per line;
+    // here each capture instead visits only the line window it can possibly touch
+    // (the line of `s` through the line of `e-1`) and applies the *identical* guard,
+    // so a line is recorded in a bucket iff the old loop would have painted it. Lines
+    // outside the window are exactly those the old guard rejected: below it via
+    // `s >= line_start + content_len` (content ends before `s`), above it via
+    // `e <= line_start`. Because the pass is forward over sorted `raw`, every
+    // bucket's entries stay in the same relative order the old loop applied them, so
+    // the last-write-wins paint per cell is byte-for-byte unchanged.
+    let mut buckets: Vec<Vec<(usize, usize, &str)>> = vec![Vec::new(); n_lines];
+    for &(s, e, name, _) in &raw {
+        if e == 0 {
+            continue;
+        }
+        let lo_line = shadow.byte_to_line_idx(s, LINE_TYPE).max(first_line);
+        let hi_line = shadow.byte_to_line_idx(e - 1, LINE_TYPE).min(last_line - 1);
+        if lo_line > hi_line {
+            continue;
+        }
+        for line in lo_line..=hi_line {
+            let (line_start, content_len) = line_geom[line - first_line];
+            if e <= line_start || s >= line_start + content_len {
+                continue;
+            }
+            buckets[line - first_line].push((s, e, name));
+        }
+    }
+
+    let mut out = Vec::new();
+    for line in first_line..last_line {
+        let (line_start, content_len) = line_geom[line - first_line];
         if content_len == 0 {
             continue;
         }
         let mut groups: Vec<Option<&str>> = vec![None; content_len];
-        for &(s, e, name, _) in &raw {
-            if e <= line_start || s >= line_start + content_len {
-                continue;
-            }
+        for &(s, e, name) in &buckets[line - first_line] {
             let cs = s.saturating_sub(line_start).min(content_len);
             let ce = (e - line_start).min(content_len);
             if cs < ce {
@@ -1215,13 +1251,11 @@ fn collect_injection_regions(
 ) -> Vec<(String, Vec<Range<usize>>)> {
     let names = query.capture_names();
     let mut cursor = QueryCursor::new();
-    let provider =
-        |node: Node| std::iter::once(node_bytes(rope, node.start_byte()..node.end_byte()));
     let mut out: Vec<(String, Vec<Range<usize>>)> = Vec::new();
     // Combined region-sets are keyed by (language, pattern) to an index into `out`,
     // so every match of a combined pattern appends to the same set.
     let mut combined_set: HashMap<(String, usize), usize> = HashMap::new();
-    let mut matches = cursor.matches(query, tree.root_node(), provider);
+    let mut matches = cursor.matches(query, tree.root_node(), node_text_provider(rope));
     while let Some(m) = matches.next() {
         let props = query.property_settings(m.pattern_index);
         let has = |key: &str| props.iter().any(|p| &*p.key == key);
@@ -1361,6 +1395,53 @@ fn node_bytes(rope: &Rope, range: Range<usize>) -> Vec<u8> {
         b = start + chunk.len();
     }
     out
+}
+
+/// A borrowed, zero-copy view of `rope[range]` as a sequence of `&[u8]` rope
+/// chunks — the tree-sitter [`tree_sitter::TextProvider`] for `#match?` / `#eq?`
+/// predicate text. Yields each underlying rope chunk clipped to `range`, instead
+/// of materializing the node's bytes into a fresh `Vec` per predicate per node.
+///
+/// tree-sitter concatenates a multi-chunk node into its own reused internal buffer
+/// (`QueryCursor`'s `buffer1`/`buffer2`) and compares a single contiguous `&[u8]`,
+/// so the bytes the predicate sees are identical regardless of how the node is
+/// split across chunks; a single-chunk node is compared in place with no copy at
+/// all. The lifetime ties the chunks to the `rope` borrow, which outlives the
+/// cursor iteration.
+struct NodeChunks<'a> {
+    rope: &'a Rope,
+    pos: usize,
+    end: usize,
+}
+
+impl<'a> Iterator for NodeChunks<'a> {
+    type Item = &'a [u8];
+
+    fn next(&mut self) -> Option<&'a [u8]> {
+        if self.pos >= self.end {
+            return None;
+        }
+        let (chunk, start) = self.rope.chunk(self.pos);
+        if chunk.is_empty() {
+            return None;
+        }
+        let from = self.pos - start;
+        let to = (self.end - start).min(chunk.len());
+        // `chunk(pos)` returns the chunk containing `pos`, so `from < to` here
+        // whenever `pos < end` (the slice is non-empty); advance past this chunk.
+        self.pos = start + chunk.len();
+        Some(&chunk.as_bytes()[from..to])
+    }
+}
+
+/// The borrowed-chunk [`tree_sitter::TextProvider`] over `rope`: maps each node a
+/// predicate consults to its bytes as a chunk iterator, allocating nothing.
+fn node_text_provider(rope: &Rope) -> impl tree_sitter::TextProvider<&[u8]> + '_ {
+    |node: Node| NodeChunks {
+        rope,
+        pos: node.start_byte(),
+        end: node.end_byte(),
+    }
 }
 
 /// The chunk of `rope` starting at byte `byte` (for tree-sitter's read callback).

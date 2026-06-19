@@ -585,6 +585,27 @@ pub struct EditHost {
     /// Every tab id seen at the last diff, in tabline order. Ids added since fire
     /// `TabNew`; ids gone fire `TabClosed`.
     known_tabs: Vec<TabId>,
+    /// The focused window's cursor `(buffer, line, col)` at the last lifecycle diff;
+    /// `None` until the startup seed. A change *within the same buffer* fires
+    /// `CursorMoved` (Normal/Visual) or `CursorMovedI` (Insert) — a buffer switch only
+    /// re-seeds the baseline (so merely entering a buffer doesn't fire a spurious move).
+    /// Gated on a registered handler ([`au_active_events`](Self::au_active_events)), so a
+    /// motion costs nothing when nothing listens.
+    last_cursor: Option<(BufferId, usize, usize)>,
+    /// The current buffer's `(buffer, changedtick)` at the last lifecycle diff; a tick
+    /// advance *within the same buffer* fires `TextChanged` (Normal) or `TextChangedI`
+    /// (Insert). `None` until the seed. Gated like [`last_cursor`](Self::last_cursor).
+    last_text: Option<(BufferId, u64)>,
+    /// The `nx._au_version` the cached [`au_active_events`](Self::au_active_events) was
+    /// last refreshed against. Read once per input batch; the set is only re-pulled
+    /// across the bridge when this advanced (mirrors the keymap-version gate).
+    au_event_version: u64,
+    /// The distinct event names some autocmd is currently registered for, refreshed
+    /// from Lua when [`au_event_version`](Self::au_event_version) advances. The per-key
+    /// lifecycle diff consults it before computing / firing a high-frequency event
+    /// (`CursorMoved` / `TextChanged`), so the common no-handler config never re-enters
+    /// Lua on a bare cursor motion.
+    au_active_events: HashSet<String>,
     /// The user-mapping engine: per-mode tries + the withhold/replay buffer that
     /// `EditHost::input` runs every key through before `editor.input`. Rebuilt from
     /// `nx._keymaps` when its version advances (checked once per input batch).
@@ -819,6 +840,10 @@ impl EditHost {
             last_window_rects: None,
             last_tab_id: None,
             known_tabs: Vec::new(),
+            last_cursor: None,
+            last_text: None,
+            au_event_version: 0,
+            au_active_events: HashSet::new(),
             keymaps: Keymaps::default(),
             last_key_pending: None,
             scheduled: VecDeque::new(),

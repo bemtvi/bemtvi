@@ -1723,19 +1723,24 @@ impl Editor {
             );
             return;
         }
+        let buffer = self.cur_buffer();
         match self.buffer_mut().write(path, &*fs) {
             Ok((bytes, lines)) => {
                 // The current state is now what's on disk — undoing/redoing back
                 // to it should read as clean, and the saved node carries a save
                 // number for `vim.fn.undotree()`.
-                self.mark_undo_saved(self.cur_buffer());
-                let name = self
-                    .buffer()
-                    .path
+                self.mark_undo_saved(buffer);
+                let written_path = self.buffer().path.clone();
+                let name = written_path
                     .as_ref()
                     .map(|p| p.display().to_string())
                     .unwrap_or_default();
                 self.echo(format!("\"{name}\" {lines}L, {bytes}B written"));
+                // Record the write so the server fires `BufWritePre`/`BufWritePost`
+                // (a path-less buffer can't reach a successful `write`).
+                if let Some(p) = written_path {
+                    self.record_write(buffer, p);
+                }
             }
             Err(e) => self.echo(e.to_string()),
         }
@@ -2089,6 +2094,11 @@ impl Editor {
                 // The written state is now the saved node (carries a save number).
                 self.mark_undo_saved(id);
                 written += 1;
+                // Fire `BufWritePre`/`BufWritePost` for each buffer that landed
+                // (it's modified and file-backed, so it has a path).
+                if let Some(path) = self.buffers.get(id).buffer.path.clone() {
+                    self.record_write(id, path);
+                }
             }
         }
         if let Some(id) = conflict {

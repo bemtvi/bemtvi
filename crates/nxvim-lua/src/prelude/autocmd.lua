@@ -32,6 +32,36 @@ nx._autocmds = nx._autocmds or {}
 nx._augroups = nx._augroups or {}
 local augroup_seq, autocmd_seq = 0, 0
 
+-- A monotonic version bumped on every change to nx._autocmds (register / delete /
+-- clear). The server reads it once per input batch (LuaRuntime::autocmd_version)
+-- and, only when it advanced, refreshes its cached set of registered event names —
+-- the gate that lets high-frequency events (CursorMoved / TextChanged) cost nothing
+-- when no handler wants them (mirroring nx._keymaps_version). Bumped through
+-- nx._au_touch() at every mutation site below.
+nx._au_version = nx._au_version or 0
+function nx._au_touch()
+  nx._au_version = nx._au_version + 1
+end
+
+-- The distinct event names any registered autocmd listens for (an autocmd may name
+-- a single event or a list). The server caches this — refreshed only when
+-- nx._au_version advances — so its per-key lifecycle diff can skip computing /
+-- firing an event nothing is registered for.
+function nx._au_event_set()
+  local seen = {}
+  local out = {}
+  for _, au in ipairs(nx._autocmds) do
+    local evs = type(au.event) == "table" and au.event or { au.event }
+    for _, ev in ipairs(evs) do
+      if not seen[ev] then
+        seen[ev] = true
+        out[#out + 1] = ev
+      end
+    end
+  end
+  return out
+end
+
 -- nx.user_command.create(name, command, opts) [alias nvim_create_user_command]:
 -- register a global `:Name`. `command` is a function or an ex-command string.
 -- `opts.desc` (a one-line summary) is stored alongside the body — get() surfaces it
@@ -105,6 +135,7 @@ function nx.augroup.create(name, opts)
     nx._autocmds = vim.tbl_filter(function(au)
       return au.group ~= id
     end, nx._autocmds)
+    nx._au_touch()
   end
   if not id then
     augroup_seq = augroup_seq + 1
@@ -132,6 +163,7 @@ function nx.autocmd.create(event, opts)
   end
   nx._autocmds[#nx._autocmds + 1] =
     { id = autocmd_seq, event = event, opts = opts, group = group, buffer = buffer }
+  nx._au_touch()
   return autocmd_seq
 end
 
@@ -141,6 +173,7 @@ function nx.autocmd.del(id)
   nx._autocmds = vim.tbl_filter(function(au)
     return au.id ~= id
   end, nx._autocmds)
+  nx._au_touch()
 end
 
 -- Fire the registered autocmds for `event` whose pattern matches `pattern`,
@@ -159,6 +192,50 @@ end
 -- Returns whether any autocmd actually ran — the `apply_autocmds()` boolean
 -- neovim's `buf_check_timestamp` branches on (an autocmd ran → honor v:fcs_choice;
 -- none → default warning). Callers that ignore the return value are unaffected.
+-- Does a single autocmd pattern `pat` match the event's `pattern` (the file path
+-- for file events, a filetype / id / mode-code for others)? Beyond an exact match
+-- and `*`, a `pat` holding a shell glob metacharacter (`*` `?` `[`) is matched as
+-- vim's file-pattern: a glob with no `/` matches the path *tail* (`*.lua` matches
+-- any `.lua` file), one with a `/` the whole path. A metacharacter-free `pat` is
+-- only ever an exact compare (so a FileType `rust` autocmd can't glob-match a path).
+local function au_one_pattern_matches(pat, pattern)
+  if pat == "*" or pat == pattern then
+    return true
+  end
+  if pattern == nil or type(pat) ~= "string" then
+    return false
+  end
+  if not pat:find("[%*%?%[]") then
+    return false -- no glob: exact compare above is the only match
+  end
+  -- A separator-less glob matches the path tail (basename), like vim.
+  local target = pattern
+  if not pat:find("/", 1, true) then
+    target = pattern:match("[^/]*$") or pattern
+  end
+  -- Build an anchored Lua pattern: escape Lua magic (but not the glob `* ? [`),
+  -- then turn the shell wildcards into their Lua-pattern equivalents.
+  local lp = pat:gsub("[%(%)%.%%%+%-%^%$]", "%%%1"):gsub("%*", ".*"):gsub("%?", ".")
+  return target:match("^" .. lp .. "$") ~= nil
+end
+
+-- Whether the autocmd's `pat` (a string, a list, or nil = match-all) matches the
+-- fired `pattern`. Used by nx._fire below.
+local function au_pattern_matches(pat, pattern)
+  if pat == nil then
+    return true
+  end
+  if type(pat) == "table" then
+    for _, p in ipairs(pat) do
+      if au_one_pattern_matches(p, pattern) then
+        return true
+      end
+    end
+    return false
+  end
+  return au_one_pattern_matches(pat, pattern)
+end
+
 function nx._fire(event, pattern, buf, file, data)
   local any = false
   local fired -- ids of `++once` autocmds to drop after this pass (nil = none)
@@ -167,10 +244,7 @@ function nx._fire(event, pattern, buf, file, data)
     local ev_ok = ev == event or (type(ev) == "table" and vim.tbl_contains(ev, event))
     if ev_ok then
       local pat = au.opts.pattern
-      local pat_ok = pat == nil
-        or pat == "*"
-        or pat == pattern
-        or (type(pat) == "table" and vim.tbl_contains(pat, pattern))
+      local pat_ok = au_pattern_matches(pat, pattern)
       local buf_ok = au.buffer == nil or au.buffer == buf
       if pat_ok and buf_ok then
         local cb = au.opts.callback
@@ -409,6 +483,7 @@ function nx._ex_augroup(bang, args)
       nx._autocmds = vim.tbl_filter(function(au)
         return au.group ~= id
       end, nx._autocmds)
+      nx._au_touch()
       nx._augroups[args] = nil
       if nx._cur_augroup == args then
         nx._cur_augroup = nil
@@ -486,6 +561,7 @@ function nx._ex_autocmd(bang, args)
     nx._autocmds = vim.tbl_filter(function(au)
       return not au_matches(au, group, events, patterns)
     end, nx._autocmds)
+    nx._au_touch()
   end
 
   if cmd ~= "" then
@@ -818,6 +894,7 @@ function nx.autocmd.clear(opts)
     end
     return false -- drop: every given filter matched
   end, nx._autocmds)
+  nx._au_touch()
 end
 api.nvim_clear_autocmds = nx.autocmd.clear
 

@@ -2404,6 +2404,12 @@ impl EditHost {
                 reconciled = true;
                 self.reconcile_file_change(buf);
             }
+            // Buffers written this convergence (`:w` / `:wall`, or a finalized off-tick
+            // save): fire each one's `BufWritePre`/`BufWritePost`. Inside the fixpoint
+            // so a handler's queued `vim.cmd`/`:lua` drains in the same convergence, and
+            // a handler that itself writes (`vim.cmd('w')`) keeps the loop going via the
+            // `has_write_events` break check below.
+            self.drain_write_events();
             // A completion row whose accept was **delegated** (the built-in `lsp`
             // source): core recorded the chosen row's key on the keystroke; apply its
             // `textEdit` + `additionalTextEdits` here, which core can't (LSP/encoding-
@@ -2635,6 +2641,7 @@ impl EditHost {
                 && self.editor.complete_query_changes.is_empty()
                 && self.scheduled.is_empty()
                 && !self.editor.has_pending_checktime()
+                && !self.editor.has_write_events()
             {
                 break;
             }
@@ -2650,6 +2657,7 @@ impl EditHost {
                 self.editor.picker_query_changes.clear();
                 self.editor.complete_query_changes.clear();
                 self.editor.take_pending_checktime();
+                self.editor.take_write_events();
                 self.scheduled.clear();
                 self.editor
                     .echo("E132: command recursion limit exceeded".to_string());

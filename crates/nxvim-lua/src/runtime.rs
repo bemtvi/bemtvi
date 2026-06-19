@@ -1704,6 +1704,36 @@ impl LuaRuntime {
         Ok(nx.get::<Option<u64>>("_keymaps_version")?.unwrap_or(0))
     }
 
+    /// The current `nx._au_version`, bumped by every autocmd register / delete /
+    /// clear. The server reads it once per input batch and refreshes its cached set
+    /// of registered event names ([`Self::autocmd_event_set`]) only when it advanced,
+    /// so the per-key lifecycle diff gates high-frequency events (`CursorMoved` /
+    /// `TextChanged`) on a cheap local set rather than re-entering Lua. `0` on any
+    /// error (a malformed VM simply registers no autocmds).
+    pub fn autocmd_version(&self) -> u64 {
+        self.read_autocmd_version().unwrap_or(0)
+    }
+
+    fn read_autocmd_version(&self) -> mlua::Result<u64> {
+        let nx = self.nx()?;
+        Ok(nx.get::<Option<u64>>("_au_version")?.unwrap_or(0))
+    }
+
+    /// The distinct event names any registered autocmd currently listens for
+    /// (`nx._au_event_set`). The server caches this — refreshed only when
+    /// [`Self::autocmd_version`] advances — so it can skip computing / firing an event
+    /// nothing wants. An empty vec on any error (no gating ⇒ events simply never fire,
+    /// the safe degradation).
+    pub fn autocmd_event_set(&self) -> Vec<String> {
+        self.read_autocmd_event_set().unwrap_or_default()
+    }
+
+    fn read_autocmd_event_set(&self) -> mlua::Result<Vec<String>> {
+        let nx = self.nx()?;
+        let f: mlua::Function = nx.get("_au_event_set")?;
+        f.call(())
+    }
+
     /// Pull `nx._keymaps` across the bridge as a list of [`RawKeymap`]s for the
     /// server to compile into per-mode tries. A read error yields an empty
     /// snapshot (the editor keeps running with no user mappings).

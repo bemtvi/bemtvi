@@ -504,8 +504,14 @@ impl Editor {
         if !self.buffers.map.contains_key(&buffer) {
             return;
         }
-        self.buffers.get_mut(buffer).buffer.mark_written(path, stat);
+        self.buffers
+            .get_mut(buffer)
+            .buffer
+            .mark_written(path.clone(), stat);
         self.mark_undo_saved(buffer);
+        // Record the (now-acked) write so the server fires `BufWritePre`/`BufWritePost`,
+        // exactly as the synchronous `:w` path does — a daemon save fires the same events.
+        self.record_write(buffer, path);
     }
 
     /// Drain the opens the editor deferred this tick (off-tick mode — `:edit` over the
@@ -514,6 +520,42 @@ impl Editor {
     /// is off or no `:edit` ran.
     pub fn take_pending_opens(&mut self) -> Vec<PendingOpen> {
         std::mem::take(&mut self.pending_opens)
+    }
+
+    /// Record a completed write of `buffer` to `path` for the server to fire
+    /// `BufWritePre` / `BufWritePost` on (the pure core can't drive a Lua autocmd).
+    /// Called from the synchronous `:w` / `:wall` write path and from the off-tick
+    /// [`Editor::finalize_save`] ack, so a write fires the same events however it
+    /// reached disk. A path-less buffer never writes, so this is only ever called
+    /// with a real target.
+    pub(crate) fn record_write(&mut self, buffer: BufferId, path: PathBuf) {
+        self.write_events.push((buffer, path));
+    }
+
+    /// Drain the buffers written this tick (a successful `:w` / `:wall` or a finalized
+    /// off-tick save), each a `(buffer, path)` the server fires `BufWritePre` /
+    /// `BufWritePost` for. Empty (a cheap no-op) when nothing was written.
+    pub fn take_write_events(&mut self) -> Vec<(BufferId, PathBuf)> {
+        std::mem::take(&mut self.write_events)
+    }
+
+    /// Whether any write event is queued — the server's fixpoint loop checks this so a
+    /// `:w` driven from an autocmd / user command still fires its write events in the
+    /// same convergence.
+    pub fn has_write_events(&self) -> bool {
+        !self.write_events.is_empty()
+    }
+
+    /// Whether `id` is a **new file** — a file-backed buffer (it has a path) whose file
+    /// did not exist on disk when it was opened (no disk snapshot). The server fires
+    /// `BufNewFile` instead of `BufReadPost` for these, matching `vim file-that-does-not-exist`.
+    /// A scratch / `[No Name]` buffer (no path) is not a new file; nor is one read from an
+    /// existing file (it has a disk snapshot).
+    pub fn buffer_is_new_file(&self, id: BufferId) -> bool {
+        self.buffers
+            .map
+            .get(&id)
+            .is_some_and(|ob| ob.buffer.path.is_some() && ob.buffer.disk_stat().is_none())
     }
 
     /// Enqueue an off-tick fetch of `path` into `buffer` (an already-created, empty

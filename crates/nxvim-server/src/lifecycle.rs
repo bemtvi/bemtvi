@@ -147,10 +147,52 @@ impl EditHost {
         let entered = self.last_buffer_id != Some(buf);
         // A transition *into* insert (or replace — neovim fires InsertEnter for
         // both), measured against the last diff so staying in insert won't re-fire.
-        let entered_insert = mode.is_insert() && !self.last_mode.is_insert();
+        let old_mode = self.last_mode;
+        let entered_insert = mode.is_insert() && !old_mode.is_insert();
+        // The mirror edge: a transition *out of* insert fires `InsertLeave`.
+        let left_insert = !mode.is_insert() && old_mode.is_insert();
         // Track the mode every call — even the no-op fast path — so a later entry
         // is still seen after an insert→normal round trip that took the fast path.
         self.last_mode = mode;
+
+        // Cursor / text diffs (gated on a registered handler so a bare motion costs
+        // nothing when nothing listens). `CursorMoved`(I) fires when the focused
+        // window's cursor moves *within the same buffer*; `TextChanged`(I) when the
+        // current buffer's `changedtick` advances. Both are suppressed on the same
+        // diff as an insert mode-change so `a`/`o`/`<Esc>` don't fire a spurious move
+        // (the reposition is part of the transition, as in neovim). The baselines are
+        // refreshed unconditionally below — even on the fast-path return — so enabling
+        // a handler later can't fire once off a stale position.
+        let mode_edge = entered_insert || left_insert;
+        let cur_pos = (buf, self.editor.cursor.line, self.editor.cursor.col);
+        let cursor_event = if mode.is_insert() {
+            "CursorMovedI"
+        } else {
+            "CursorMoved"
+        };
+        let want_cursor = self.au_active_events.contains(cursor_event);
+        let cursor_moved = !mode_edge
+            && want_cursor
+            && self
+                .last_cursor
+                .is_some_and(|(b, l, c)| b == buf && (l, c) != (cur_pos.1, cur_pos.2));
+
+        let cur_tick = self.editor.changedtick_of(buf).unwrap_or(0);
+        let text_event = if mode.is_insert() {
+            "TextChangedI"
+        } else {
+            "TextChanged"
+        };
+        let want_text = self.au_active_events.contains(text_event);
+        let text_changed = want_text
+            && self
+                .last_text
+                .is_some_and(|(b, t)| b == buf && t != cur_tick);
+
+        // Refresh the cursor / text baselines every call (mirrors `last_mode`), so a
+        // motion that took the fast path is still the reference for the next diff.
+        self.last_cursor = Some(cur_pos);
+        self.last_text = Some((buf, cur_tick));
 
         // Window diff (Phase 5): windows added/closed since the last emit, the
         // focus change, and any rect change. Cheap vecs of ids — computed every
@@ -208,6 +250,9 @@ impl EditHost {
             && !ft_changed
             && !entered
             && !entered_insert
+            && !left_insert
+            && !cursor_moved
+            && !text_changed
             && new_wins.is_empty()
             && closed_wins.is_empty()
             && !win_changed
@@ -259,12 +304,19 @@ impl EditHost {
         let name = self.editor.buffer_name(buf).unwrap_or_default();
         let file_backed = !name.is_empty();
 
-        // Fire-once per buffer (gated by `announced`): BufReadPost — file-backed
-        // only, a `[No Name]`/scratch buffer was never read.
+        // Fire-once per buffer (gated by `announced`): file-backed only, a
+        // `[No Name]`/scratch buffer was never read. A buffer whose file does not
+        // exist on disk fires `BufNewFile` *instead of* `BufReadPost` (matching
+        // `vim file-that-does-not-exist`); an existing file fires `BufReadPost`.
         if unannounced {
             self.announced.insert(buf);
             if file_backed {
-                self.fire_lifecycle("BufReadPost", &name, buf, &name);
+                let event = if self.editor.buffer_is_new_file(buf) {
+                    "BufNewFile"
+                } else {
+                    "BufReadPost"
+                };
+                self.fire_lifecycle(event, &name, buf, &name);
             }
         }
 
@@ -284,15 +336,27 @@ impl EditHost {
             self.fired_filetype.insert(buf, cur_ft);
         }
 
-        // Fire-every on entry: BufEnter, for both file-backed and [No Name].
+        // Fire-every on entry: `BufLeave` for the buffer we're leaving, then
+        // `BufEnter` for the one we entered (both file-backed and [No Name]). vim
+        // brackets a buffer switch as `BufLeave → BufEnter`; the old buffer's name is
+        // its own, so fire it with that context before rebinding `last_buffer_id`.
         if entered {
+            if let Some(old) = self.last_buffer_id {
+                let old_name = self.editor.buffer_name(old).unwrap_or_default();
+                self.fire_lifecycle("BufLeave", &old_name, old, &old_name);
+            }
             self.last_buffer_id = Some(buf);
             self.fire_lifecycle("BufEnter", &name, buf, &name);
         }
 
-        // Mode event: InsertEnter, with the entered mode's code as the pattern.
+        // Mode events: `InsertEnter` on the transition into insert (the entered
+        // mode's code is the pattern), `InsertLeave` on the transition back out (the
+        // mode we left). A single diff never sees both edges.
         if entered_insert {
             self.fire_lifecycle("InsertEnter", mode.short_code(), buf, &name);
+        }
+        if left_insert {
+            self.fire_lifecycle("InsertLeave", old_mode.short_code(), buf, &name);
         }
 
         // ----- window enter / resized (after the buffer events) -----
@@ -322,6 +386,28 @@ impl EditHost {
         }
         self.known_tabs = tabs;
 
+        // ----- text / cursor events (finest grained, after the buffer settles) -----
+        // `TextChanged`(I) when the buffer's `changedtick` advanced, then
+        // `CursorMoved`(I) when the focused window's cursor moved — both gated on a
+        // registered handler (the `want_*` checks folded into the booleans above), so
+        // an unwatched motion never reaches here. The `I` variant fires in insert.
+        if text_changed {
+            let event = if mode.is_insert() {
+                "TextChangedI"
+            } else {
+                "TextChanged"
+            };
+            self.fire_lifecycle(event, &name, buf, &name);
+        }
+        if cursor_moved {
+            let event = if mode.is_insert() {
+                "CursorMovedI"
+            } else {
+                "CursorMoved"
+            };
+            self.fire_lifecycle(event, &name, buf, &name);
+        }
+
         // ----- working directory: follow the current window (vim's fix_current_dir) -----
         // A window/tab focus change can make a different scope's local dir effective
         // (`:lcd`/`:tcd` are per-window/-tab), so re-apply the current window's
@@ -335,6 +421,11 @@ impl EditHost {
         // outlive it (else a reused bufnr inherits them). The `announced` /
         // fire-once set is pruned in step so a reused id re-announces its events.
         for b in &closed_bufs {
+            // `BufDelete` fires *before* the buffer-local cleanup, so a buffer-local
+            // `BufDelete` autocmd on this buffer still runs. The buffer is already gone
+            // from the store, so its name is unavailable — fire with the bufnr context
+            // (a `BufDelete` handler keys off `args.buf`, like neovim's `<abuf>`).
+            self.fire_buf_delete(*b);
             if let Err(e) = self.lua.cleanup_buffer(b.0) {
                 self.editor
                     .echo(format!("E5108: Error cleaning up buffer {}: {e}", b.0));
@@ -585,6 +676,76 @@ impl EditHost {
                 .echo(format!("E5108: Error in {event} autocmd: {e}"));
         }
         self.apply_lua_effects();
+    }
+
+    /// Fire the write autocmds for `buf` (written to `path`): `BufWritePre`, its
+    /// synonym `BufWrite`, then `BufWritePost`, each with the written buffer as
+    /// context (`<afile>` = its path). Driven from [`EditHost::drain_write_events`]
+    /// after a successful `:w` / `:wall` or a finalized off-tick save, so a write
+    /// fires the same events however it reached disk. The filetype is resolved from
+    /// the *written* buffer's own path (so a `:wall` of a non-current buffer carries
+    /// the right `vim.bo.filetype`), unlike the generic [`fire_lifecycle`] which keys
+    /// off the current buffer.
+    ///
+    /// NOTE on timing: nxvim's editing core writes synchronously and Lua autocmds
+    /// fire at convergence (the server can't re-enter Lua mid-write), so `BufWritePre`
+    /// fires just *before* `BufWritePost` but *after* the bytes are on disk. A
+    /// `BufWritePre` handler cannot transform what is written — but nxvim has no
+    /// synchronous buffer-mutation Lua API either, so that is not reachable regardless;
+    /// the firing order (`Pre` → `Post`) and buffer context match neovim.
+    pub(crate) fn fire_buf_write(&mut self, buf: BufferId, path: &str) {
+        let ft = filetype_of(Some(Path::new(path))).unwrap_or("");
+        let _ = self.lua.set_buf_snapshot(buf.0, path, ft);
+        self.push_buf_mirror();
+        for event in ["BufWritePre", "BufWrite", "BufWritePost"] {
+            if let Err(e) = self.lua.fire_autocmd_buf(event, path, buf.0, path) {
+                self.editor
+                    .echo(format!("E5108: Error in {event} autocmd: {e}"));
+            }
+        }
+        self.apply_lua_effects();
+    }
+
+    /// Fire `BufDelete` for a buffer that was just removed from the store (a
+    /// `:bdelete` / `nvim_buf_delete`). The buffer is already gone, so there's no
+    /// name / snapshot to set — fire with the bufnr as context (`args.buf`, neovim's
+    /// `<abuf>`), which is what a cleanup handler keys off. Driven from
+    /// [`emit_lifecycle_events`] before the buffer-local Lua state is purged, so a
+    /// buffer-local `BufDelete` autocmd on that buffer still runs.
+    pub(crate) fn fire_buf_delete(&mut self, buf: BufferId) {
+        let pattern = buf.0.to_string();
+        self.push_buf_mirror();
+        if let Err(e) = self.lua.fire_autocmd_buf("BufDelete", &pattern, buf.0, "") {
+            self.editor
+                .echo(format!("E5108: Error in BufDelete autocmd: {e}"));
+        }
+        self.apply_lua_effects();
+    }
+
+    /// Drain the buffers written this convergence (core's [`Editor::take_write_events`])
+    /// and fire each one's `BufWritePre`/`BufWritePost` ([`fire_buf_write`]). Called
+    /// inside [`run_pending`](EditHost::run_pending)'s fixpoint so a write driven from a
+    /// keystroke, `vim.cmd('w')`, a user command, or a daemon save ack fires its events
+    /// in the same convergence — and a handler that itself queues work (`vim.cmd`) has
+    /// that work drained by the surrounding loop.
+    pub(crate) fn drain_write_events(&mut self) {
+        let writes = self.editor.take_write_events();
+        if writes.is_empty() {
+            return;
+        }
+        for (buf, path) in writes {
+            let path = path.display().to_string();
+            self.fire_buf_write(buf, &path);
+        }
+        // `fire_buf_write` points the Lua snapshot (`nx._cur_buf`) at the *written*
+        // buffer, which for a `:wall` may not be the current one — re-seed it to the
+        // editor's actual current buffer so a later `expand('%')` / `nvim_buf_get_name(0)`
+        // isn't left reading the last-written buffer.
+        let cur = self.editor.current_buffer_id();
+        let name = self.editor.buffer_name(cur).unwrap_or_default();
+        let ft = filetype_of(self.editor.buffer().path.as_deref()).unwrap_or("");
+        let _ = self.lua.set_buf_snapshot(cur.0, &name, ft);
+        self.push_buf_mirror();
     }
 
     /// Reconcile one file-backed buffer against its disk state — the server half of

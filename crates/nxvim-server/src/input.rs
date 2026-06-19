@@ -155,6 +155,23 @@ impl EditHost {
         if self.keymaps.needs_build(buffer) {
             self.keymaps.build_for(buffer);
         }
+        self.refresh_au_events();
+    }
+
+    /// Refresh the cached set of registered autocmd event names when the registry
+    /// changed since the last batch (`nx._au_version` advanced) — one integer read
+    /// across the bridge on the common path, the event-name list pulled only on a
+    /// real change. The per-key lifecycle diff consults the cache before firing a
+    /// high-frequency event (`CursorMoved` / `TextChanged`), so the common no-handler
+    /// config never re-enters Lua on a bare motion. Called from [`refresh_keymaps`]
+    /// (once per input batch), so a handler registered mid-batch takes effect next
+    /// batch — the same accepted ordering the keymap-version check already implies.
+    pub(crate) fn refresh_au_events(&mut self) {
+        let version = self.lua.autocmd_version();
+        if version != self.au_event_version {
+            self.au_event_version = version;
+            self.au_active_events = self.lua.autocmd_event_set().into_iter().collect();
+        }
     }
 
     /// Apply one matcher [`Step`]: a raw key goes to the editor (with the per-key

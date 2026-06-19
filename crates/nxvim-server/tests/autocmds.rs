@@ -603,6 +603,289 @@ async fn ex_augroup_bang_deletes_the_group_and_its_autocmds() {
 }
 
 #[tokio::test]
+async fn example_autocmd_config_loads_and_lifecycle_events_fire() {
+    // The shipped examples/autocmd config must load, and its §5 lifecycle autocmds
+    // must fire end-to-end: editing the buffer triggers TextChanged (notified onto
+    // the message line) and `:w` triggers the `*.txt` BufWritePost. The example's
+    // `init.lua` is copied into a throwaway dir alongside a throwaway `.txt` sample,
+    // so the test's `:w` never touches the shipped file (hermetic — see the harness).
+    let example = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../examples/autocmd/init.lua")
+        .canonicalize()
+        .expect("examples/autocmd/init.lua");
+    let init_lua = std::fs::read_to_string(&example).expect("read example init.lua");
+    let dir = temp_dir("au_example");
+    let sample = dir.join("sample.txt");
+    std::fs::write(&sample, "hello from the autocmd example\n").expect("write sample");
+    let (rpc, mut incoming) =
+        start_with_file_and_config(&dir, sample.to_str().unwrap(), &init_lua).await;
+
+    // A Normal-mode edit fires the example's TextChanged handler.
+    let changed = message(&redraw_after(&rpc, &mut incoming, "x").await);
+    assert_eq!(
+        changed, "buffer changed",
+        "TextChanged notify reached the line"
+    );
+
+    // Saving the `.txt` sample fires the `*.txt` BufWritePost handler.
+    let saved = message(&redraw_after(&rpc, &mut incoming, ":w<CR>").await);
+    assert_eq!(
+        saved,
+        format!("saved {}", sample.display()),
+        "the *.txt BufWritePost glob fired on save"
+    );
+}
+
+// ----- write events: BufWritePre / BufWritePost -----------------------------
+
+#[tokio::test]
+async fn writing_a_file_fires_bufwritepre_then_bufwritepost() {
+    // A successful `:w` fires BufWritePre then BufWritePost, each carrying the
+    // written file's path as `args.file` — the order is the neovim contract.
+    let dir = temp_dir("au_write");
+    let file = dir.join("note.txt");
+    std::fs::write(&file, "hello\n").expect("seed file");
+    let (rpc, mut incoming) = start_with_file_and_config(
+        &dir,
+        file.to_str().unwrap(),
+        "_G.log = {}\n\
+         vim.api.nvim_create_autocmd('BufWritePre', {\n\
+         \x20 callback = function(a) _G.log[#_G.log+1] = 'pre:' .. a.file end })\n\
+         vim.api.nvim_create_autocmd('BufWritePost', {\n\
+         \x20 callback = function(a) _G.log[#_G.log+1] = 'post:' .. a.file end })\n",
+    )
+    .await;
+    // Modify the buffer, then write it.
+    redraw_after(&rpc, &mut incoming, "ax<Esc>").await;
+    redraw_after(&rpc, &mut incoming, ":w<CR>").await;
+    let msg = lua_message(&rpc, &mut incoming, "print(table.concat(_G.log, ','))").await;
+    assert_eq!(
+        msg,
+        format!("pre:{f},post:{f}", f = file.display()),
+        "BufWritePre precedes BufWritePost, both with the file path"
+    );
+}
+
+#[tokio::test]
+async fn bufwritepost_sees_the_written_buffer_as_unmodified() {
+    // After a `:w`, the BufWritePost callback resolves the saved buffer via the
+    // snapshot and `vim.bo.modified` reads the now-cleared `[+]` flag.
+    let dir = temp_dir("au_write_clean");
+    let file = dir.join("note.txt");
+    std::fs::write(&file, "hello\n").expect("seed file");
+    let (rpc, mut incoming) = start_with_file_and_config(
+        &dir,
+        file.to_str().unwrap(),
+        "_G.seen = nil\n\
+         vim.api.nvim_create_autocmd('BufWritePost', {\n\
+         \x20 callback = function() _G.seen = vim.api.nvim_buf_get_name(0) end })\n",
+    )
+    .await;
+    redraw_after(&rpc, &mut incoming, "ax<Esc>").await;
+    redraw_after(&rpc, &mut incoming, ":w<CR>").await;
+    let msg = lua_message(&rpc, &mut incoming, "print(_G.seen)").await;
+    assert_eq!(msg, file.display().to_string());
+}
+
+#[tokio::test]
+async fn write_autocmd_with_a_glob_pattern_matches_by_extension() {
+    // A `BufWritePost *.txt` autocmd fires for a `.txt` file (the glob matches the
+    // path tail) but a `*.rs` one does not — the file-pattern matching the events
+    // need to be useful (format-on-save is `BufWritePre *.rs`).
+    let dir = temp_dir("au_write_glob");
+    let file = dir.join("note.txt");
+    std::fs::write(&file, "hello\n").expect("seed file");
+    let (rpc, mut incoming) = start_with_file_and_config(
+        &dir,
+        file.to_str().unwrap(),
+        "_G.log = {}\n\
+         vim.api.nvim_create_autocmd('BufWritePost', { pattern = '*.txt',\n\
+         \x20 callback = function() _G.log[#_G.log+1] = 'txt' end })\n\
+         vim.api.nvim_create_autocmd('BufWritePost', { pattern = '*.rs',\n\
+         \x20 callback = function() _G.log[#_G.log+1] = 'rs' end })\n",
+    )
+    .await;
+    redraw_after(&rpc, &mut incoming, "ax<Esc>").await;
+    redraw_after(&rpc, &mut incoming, ":w<CR>").await;
+    let msg = lua_message(&rpc, &mut incoming, "print(table.concat(_G.log, ','))").await;
+    assert_eq!(msg, "txt", "only the *.txt glob matches a .txt file");
+}
+
+// ----- BufNewFile vs BufReadPost --------------------------------------------
+
+#[tokio::test]
+async fn opening_a_nonexistent_file_fires_bufnewfile_not_bufreadpost() {
+    // Editing a path with no file on disk fires BufNewFile (with the path), and
+    // *not* BufReadPost — matching `vim file-that-does-not-exist`.
+    let dir = temp_dir("au_newfile");
+    let file = dir.join("brand_new.rs"); // deliberately not created
+    let (rpc, mut incoming) = start_with_file_and_config(
+        &dir,
+        file.to_str().unwrap(),
+        "_G.log = {}\n\
+         vim.api.nvim_create_autocmd('BufNewFile', {\n\
+         \x20 callback = function(a) _G.log[#_G.log+1] = 'new:' .. a.file end })\n\
+         vim.api.nvim_create_autocmd('BufReadPost', {\n\
+         \x20 callback = function() _G.log[#_G.log+1] = 'read' end })\n",
+    )
+    .await;
+    let msg = lua_message(&rpc, &mut incoming, "print(table.concat(_G.log, ','))").await;
+    assert_eq!(msg, format!("new:{}", file.display()));
+}
+
+// ----- BufLeave / BufDelete --------------------------------------------------
+
+#[tokio::test]
+async fn switching_buffers_fires_bufleave_for_the_old_buffer() {
+    // `:edit b` fires BufLeave for the buffer we leave, then BufEnter for the new
+    // one (vim's BufLeave → BufEnter bracket).
+    let dir = temp_dir("au_bufleave");
+    let a = dir.join("a.rs");
+    let b = dir.join("b.rs");
+    std::fs::write(&a, "a\n").expect("write a");
+    std::fs::write(&b, "b\n").expect("write b");
+    let (rpc, mut incoming) = start_with_file_and_config(
+        &dir,
+        a.to_str().unwrap(),
+        "_G.log = {}\n\
+         vim.api.nvim_create_autocmd('BufLeave', {\n\
+         \x20 callback = function(x) _G.log[#_G.log+1] = 'leave' .. x.buf end })\n\
+         vim.api.nvim_create_autocmd('BufEnter', {\n\
+         \x20 callback = function(x) _G.log[#_G.log+1] = 'enter' .. x.buf end })\n",
+    )
+    .await;
+    lua_message(&rpc, &mut incoming, "_G.log = {}").await; // drop startup events
+    redraw_after(&rpc, &mut incoming, &format!(":edit {}<CR>", b.display())).await;
+    let msg = lua_message(&rpc, &mut incoming, "print(table.concat(_G.log, ','))").await;
+    assert_eq!(msg, "leave1,enter2");
+}
+
+#[tokio::test]
+async fn deleting_a_buffer_fires_bufdelete_for_it() {
+    // `:bdelete` fires BufDelete, with `args.buf` the deleted buffer's number.
+    let dir = temp_dir("au_bufdelete");
+    let a = dir.join("a.rs");
+    let b = dir.join("b.rs");
+    std::fs::write(&a, "a\n").expect("write a");
+    std::fs::write(&b, "b\n").expect("write b");
+    let (rpc, mut incoming) = start_with_file_and_config(
+        &dir,
+        a.to_str().unwrap(),
+        "_G.seen = nil\n\
+         vim.api.nvim_create_autocmd('BufDelete', { callback = function(x) _G.seen = x.buf end })\n",
+    )
+    .await;
+    redraw_after(&rpc, &mut incoming, &format!(":edit {}<CR>", b.display())).await; // buffer 2
+    redraw_after(&rpc, &mut incoming, ":bdelete<CR>").await; // delete buffer 2
+    let msg = lua_message(&rpc, &mut incoming, "print(_G.seen)").await;
+    assert_eq!(msg, "2", "BufDelete fired for the deleted buffer");
+}
+
+// ----- InsertLeave -----------------------------------------------------------
+
+#[tokio::test]
+async fn leaving_insert_fires_insertleave_once_per_exit() {
+    // InsertLeave fires on the transition *out* of insert — once per `<Esc>`, the
+    // mirror of InsertEnter.
+    let dir = temp_dir("au_insertleave");
+    let (rpc, mut incoming) = start_with_config(
+        &dir,
+        "_G.n = 0\n\
+         vim.api.nvim_create_autocmd('InsertLeave', { callback = function() _G.n = _G.n + 1 end })\n",
+    )
+    .await;
+    redraw_after(&rpc, &mut incoming, "iabc<Esc>").await;
+    let after = lua_message(&rpc, &mut incoming, "print(_G.n)").await;
+    assert_eq!(after, "1", "InsertLeave fires once on <Esc>");
+    redraw_after(&rpc, &mut incoming, "o<Esc>").await;
+    let after2 = lua_message(&rpc, &mut incoming, "print(_G.n)").await;
+    assert_eq!(after2, "2", "a fresh insert via o fires InsertLeave again");
+}
+
+// ----- TextChanged / TextChangedI -------------------------------------------
+
+#[tokio::test]
+async fn editing_in_normal_fires_textchanged() {
+    // A change in Normal mode (`x` deletes a char) fires TextChanged.
+    let dir = temp_dir("au_textchanged");
+    let file = dir.join("f.txt");
+    std::fs::write(&file, "hello\n").expect("seed file");
+    let (rpc, mut incoming) = start_with_file_and_config(
+        &dir,
+        file.to_str().unwrap(),
+        "_G.n = 0\n\
+         vim.api.nvim_create_autocmd('TextChanged', { callback = function() _G.n = _G.n + 1 end })\n",
+    )
+    .await;
+    redraw_after(&rpc, &mut incoming, "x").await;
+    let after = lua_message(&rpc, &mut incoming, "print(_G.n)").await;
+    assert_eq!(after, "1", "deleting a char in Normal fires TextChanged");
+    // A pure motion does not change text — no re-fire.
+    redraw_after(&rpc, &mut incoming, "l").await;
+    let after2 = lua_message(&rpc, &mut incoming, "print(_G.n)").await;
+    assert_eq!(after2, "1", "a motion alone doesn't fire TextChanged");
+}
+
+#[tokio::test]
+async fn typing_in_insert_fires_textchangedi_per_change() {
+    // Each character typed in insert fires TextChangedI (entering insert with `i`
+    // doesn't, leaving with `<Esc>` doesn't).
+    let dir = temp_dir("au_textchangedi");
+    let (rpc, mut incoming) = start_with_config(
+        &dir,
+        "_G.n = 0\n\
+         vim.api.nvim_create_autocmd('TextChangedI', { callback = function() _G.n = _G.n + 1 end })\n",
+    )
+    .await;
+    redraw_after(&rpc, &mut incoming, "iab<Esc>").await;
+    let after = lua_message(&rpc, &mut incoming, "print(_G.n)").await;
+    assert_eq!(after, "2", "two typed chars fire TextChangedI twice");
+}
+
+// ----- CursorMoved / CursorMovedI -------------------------------------------
+
+#[tokio::test]
+async fn moving_the_cursor_fires_cursormoved() {
+    // A motion in Normal mode fires CursorMoved each time the cursor lands somewhere
+    // new; switching to the command line to read the counter doesn't move it.
+    let dir = temp_dir("au_cursormoved");
+    let file = dir.join("f.txt");
+    std::fs::write(&file, "line one\nline two\nline three\n").expect("seed file");
+    let (rpc, mut incoming) = start_with_file_and_config(
+        &dir,
+        file.to_str().unwrap(),
+        "_G.n = 0\n\
+         vim.api.nvim_create_autocmd('CursorMoved', { callback = function() _G.n = _G.n + 1 end })\n",
+    )
+    .await;
+    redraw_after(&rpc, &mut incoming, "j").await;
+    let after = lua_message(&rpc, &mut incoming, "print(_G.n)").await;
+    assert_eq!(after, "1", "moving down a line fires CursorMoved");
+    redraw_after(&rpc, &mut incoming, "j").await;
+    let after2 = lua_message(&rpc, &mut incoming, "print(_G.n)").await;
+    assert_eq!(after2, "2", "a second motion fires it again");
+}
+
+#[tokio::test]
+async fn moving_the_cursor_in_insert_fires_cursormovedi() {
+    // Moving within insert mode (`<Right>`, no text change) fires CursorMovedI;
+    // entering insert with `i` and leaving with `<Esc>` do not.
+    let dir = temp_dir("au_cursormovedi");
+    let file = dir.join("f.txt");
+    std::fs::write(&file, "hello\n").expect("seed file");
+    let (rpc, mut incoming) = start_with_file_and_config(
+        &dir,
+        file.to_str().unwrap(),
+        "_G.n = 0\n\
+         vim.api.nvim_create_autocmd('CursorMovedI', { callback = function() _G.n = _G.n + 1 end })\n",
+    )
+    .await;
+    redraw_after(&rpc, &mut incoming, "i<Right><Esc>").await;
+    let after = lua_message(&rpc, &mut incoming, "print(_G.n)").await;
+    assert_eq!(after, "1", "<Right> in insert fires CursorMovedI once");
+}
+
+#[tokio::test]
 async fn ex_autocmd_once_fires_exactly_once() {
     // `++once` self-removes after the first fire: firing the event twice runs the
     // command (a counter bump) only once.

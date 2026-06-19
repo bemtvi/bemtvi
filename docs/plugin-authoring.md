@@ -116,10 +116,10 @@ and a deeper treatment in the [API design](specs/2026-06-11-native-plugin-api.md
   `nx.picker` (fuzzy finder), `nx.complete` (completion sources), `nx.snippet`,
   `nx.statusline` (composable segments), `nx.decor` (viewport decorations /
   extmarks), `nx.dock` (edge docks), and `nx.view` (a read-only mountable content
-  surface — what a file-tree explorer is built on).
+  surface — what a plugin ui is built on).
 
 When something genuinely useful is missing, the convention is to add it to `nx.*`
-for everyone, not to inline it as a plugin private.
+for everyone, so let us know if you find anything missing.
 
 ## A worked example
 

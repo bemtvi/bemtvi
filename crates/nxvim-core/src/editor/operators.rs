@@ -631,6 +631,21 @@ impl Editor {
         self.clipboard = Some(clipboard);
     }
 
+    /// Read the host clipboard backing `"+` / `"*` — a test seam (the plugin test
+    /// framework's `t`/`nx.test.clipboard.peek`) and introspection point. `None`
+    /// with no provider installed or an empty clipboard.
+    pub fn clipboard_contents(&self) -> Option<(String, bool)> {
+        self.clipboard.as_ref().and_then(|c| c.get())
+    }
+
+    /// Write the host clipboard as if an external app set it — the test seam that
+    /// seeds `"+` / `"*` before a plugin reads them. A no-op with no provider.
+    pub fn clipboard_seed(&self, text: &str, linewise: bool) {
+        if let Some(c) = self.clipboard.as_ref() {
+            c.set(text, linewise);
+        }
+    }
+
     /// Resolve the active register's contents for a paste. Read-only specials
     /// project from live editor state — `"%` the file name, `"/` the last search
     /// pattern, `":` the last ex command — the clipboard registers `"+` / `"*`

@@ -11,6 +11,22 @@ use nxvim_core::{
 use nxvim_rpc::Incoming;
 use rmpv::Value;
 
+/// An in-memory clipboard installed only in plugin-test mode (the runner starts with
+/// no provider). Backs `"+` / `"*` so a plugin's yank/paste round-trips and the
+/// `nx.test.clipboard` seam can seed/peek it. Single-threaded (server thread), so a
+/// `RefCell` suffices — `Clipboard` requires only `Send`.
+#[derive(Default)]
+struct MemClipboard(std::cell::RefCell<Option<(String, bool)>>);
+
+impl nxvim_core::Clipboard for MemClipboard {
+    fn get(&self) -> Option<(String, bool)> {
+        self.0.borrow().clone()
+    }
+    fn set(&self, text: &str, linewise: bool) {
+        *self.0.borrow_mut() = Some((text.to_string(), linewise));
+    }
+}
+
 impl EditHost {
     /// The current time in milliseconds for stamping a mouse event. Reads the
     /// injected fake clock ([`ServerInit::mouse_clock`](crate::ServerInit)) when a
@@ -173,6 +189,21 @@ impl EditHost {
                 self.apply_lua_effects();
                 self.run_pending();
                 Ok(value)
+            }
+            "nx_enable_test_mode" => {
+                // The `--test-plugin` runner turns on plugin-test mode: install the
+                // `nx.test` framework into Lua (absent otherwise) and start mirroring
+                // the projected UI into `nx._ui`. Gated here so a normal editor session
+                // never exposes the test API nor pays the per-redraw mirror cost.
+                self.test_mode = true;
+                // Install an in-memory clipboard so `"+` / `"*` round-trip (the runner
+                // starts with ClipboardProvider::Disabled), backing the
+                // nx.test.clipboard seam.
+                self.editor.set_clipboard(Box::<MemClipboard>::default());
+                self.lua
+                    .install_test_api()
+                    .map_err(|e| format!("nx_enable_test_mode: {e}"))?;
+                Ok(Value::Boolean(true))
             }
             "nvim_get_mode" => Ok(Value::Map(vec![(
                 Value::from("mode"),

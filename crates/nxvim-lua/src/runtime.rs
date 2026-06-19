@@ -405,6 +405,11 @@ const PRELUDE_MODULES: &[(&str, &str)] = &[
     // nx.utils: the general helper namespace (nx.utils.debounce, …) — may build on
     // the timer and promise surfaces loaded just above.
     ("nxvim:prelude/utils", include_str!("prelude/utils.lua")),
+    // nx.test: the plugin test framework (describe/it/expect + an async-aware test
+    // context). Inert until a spec registers tests and the `--test-plugin` runner
+    // calls `nx.test._run()`; builds on nx.async/await/wait_for/on_next_tick (promise
+    // + runtime, above) and the nx.buf/cursor/keymap reads (api/keymap, above).
+    ("nxvim:prelude/test", include_str!("prelude/test.lua")),
     // nx.picker: the fuzzy finder (sources + open) over the float-list widget.
     ("nxvim:prelude/picker", include_str!("prelude/picker.lua")),
     // nx.complete: the native completion engine (Phase 4-A, buffer source).
@@ -513,6 +518,9 @@ pub(crate) struct Shared {
     /// editor's register file after the chunk. Reads resolve from the
     /// `nx._registers` mirror, so only the write needs an op.
     pub(crate) reg_ops: Vec<RegisterSetOp>,
+    /// Clipboard seeds from `nx.test.clipboard.seed` (plugin-test seam), drained by
+    /// the server into the editor's clipboard provider — `(text, linewise)`.
+    pub(crate) clipboard_seeds: Vec<(String, bool)>,
     /// `vim.fn.setqflist` requests, drained by the server into the editor's
     /// quickfix list after the chunk. Reads resolve from the `nx._qflist` mirror.
     pub(crate) qf_ops: Vec<QfSetOp>,
@@ -1034,6 +1042,12 @@ impl LuaRuntime {
         /// Take the register writes queued by `vim.fn.setreg` since the last drain,
         /// for the server to apply to the editor's register file.
         take_reg_ops -> Vec<RegisterSetOp> = reg_ops
+    }
+
+    take_queue! {
+        /// Take the clipboard seeds queued by `nx.test.clipboard.seed` since the last
+        /// drain, for the server to write into the editor's clipboard provider.
+        take_clipboard_seeds -> Vec<(String, bool)> = clipboard_seeds
     }
 
     take_queue! {
@@ -1753,6 +1767,45 @@ impl LuaRuntime {
     pub fn set_global_var(&self, key: &str, value: &str) -> mlua::Result<()> {
         let g: Table = self.vim()?.get("g")?;
         g.set(key, value)
+    }
+
+    /// Install the `nx.test` plugin-test framework. `prelude/test.lua` builds the
+    /// framework but exposes it only through `nx._install_test`, leaving `nx.test`
+    /// nil in a normal session; the server calls this when the `--test-plugin` runner
+    /// enables test mode, so the API exists only there.
+    pub fn install_test_api(&self) -> mlua::Result<()> {
+        let install: mlua::Function = self.nx()?.get("_install_test")?;
+        install.call(())
+    }
+
+    /// Refresh the `nx._ui` mirror the plugin test framework reads (`t:float()` /
+    /// `t:message()` / `t:cmdline()` / `t:statusline()`): the projected content
+    /// float (an `rmpv` map, or `Nil` when none is open), the message line, the
+    /// command line, and the status-line text. Pushed once per redraw. O(1) — the
+    /// float is `Nil` on the common path and the rest are short strings — so it
+    /// follows the same every-tick mirror discipline as `nx._bufs`.
+    pub fn set_ui_mirror(
+        &self,
+        float: &rmpv::Value,
+        message: &str,
+        cmdline: &str,
+        statusline: &str,
+        clipboard: Option<(&str, bool)>,
+    ) -> mlua::Result<()> {
+        let nx = self.nx()?;
+        let ui = self.lua.create_table()?;
+        ui.set("float", crate::convert::rmpv_to_lua(&self.lua, float)?)?;
+        ui.set("message", message)?;
+        ui.set("cmdline", cmdline)?;
+        ui.set("statusline", statusline)?;
+        // The clipboard contents (for `nx.test.clipboard.peek`), or nil when empty.
+        if let Some((text, linewise)) = clipboard {
+            let c = self.lua.create_table()?;
+            c.set("text", text)?;
+            c.set("linewise", linewise)?;
+            ui.set("clipboard", c)?;
+        }
+        nx.set("_ui", ui)
     }
 
     /// Current monotonic time in seconds, read back by `vim.fn.localtime()`. Shares

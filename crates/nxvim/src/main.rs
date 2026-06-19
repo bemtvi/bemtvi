@@ -28,9 +28,12 @@
 //! edit-host split (`--connect-daemon`) to keep the keystroke path local.
 
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::process::Stdio;
 
 use anyhow::{anyhow, Context, Result};
+
+mod test_runner;
 use nxvim_server::{
     bind_quic_listener, connect_daemon, connect_quic, mint_token, run as run_server,
     run_daemon_io as run_server_daemon_io, serve_quic, DaemonClient, ServerInit,
@@ -66,6 +69,11 @@ const CONNECT_URI_SCHEME: &str = "nxvim://";
 /// [`DAEMON_CMD_ENV`].
 const CONNECT_DAEMON_FLAG: &str = "--connect-daemon";
 
+/// Flag that runs the headless **plugin test runner**: boot an embedded server, run
+/// the Lua `nx.test` suite under `<dir>/test/**/*_spec.lua` (dir = the following
+/// argument, or the cwd), print a report, and exit `0`/`1`. No UI editor session.
+const TEST_PLUGIN_FLAG: &str = "--test-plugin";
+
 /// Env var naming the command to spawn as the daemon for `--connect-daemon`. Run
 /// through `sh -c`, so a full command line works verbatim — e.g.
 /// `NXVIM_DAEMON_CMD="ssh host nxvim --daemon"`. Unset = spawn this same binary
@@ -90,6 +98,20 @@ fn main() -> Result<()> {
     }
 
     let args: Vec<String> = std::env::args().skip(1).collect();
+
+    // Plugin test runner role: no editor UI — boot an embedded server, drive the Lua
+    // `nx.test` suite, and exit with the pass/fail code. The optional argument after
+    // the flag is the plugin dir (default: the cwd).
+    if let Some(pos) = args.iter().position(|a| a == TEST_PLUGIN_FLAG) {
+        let dir = args
+            .get(pos + 1)
+            .filter(|a| !a.starts_with('-'))
+            .map(PathBuf::from)
+            .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
+        let passed = test_runner::run_test_plugin(dir)?;
+        std::process::exit(if passed { 0 } else { 1 });
+    }
+
     // A `nxvim://…` connect URI (the QUIC daemon target) is not a file; pick the file
     // from the remaining non-flag, non-URI arguments.
     let connect_uri = args

@@ -826,6 +826,21 @@ pub(crate) fn install_runtime_api(
         })?,
     )?;
 
+    // `nx.now_ms()`: wall-clock milliseconds since the Unix epoch, as a Lua number
+    // (a float, so it stays width-safe on the wasm `i32` integer build). A real
+    // time read for timing / scheduling math — the plugin test runner stamps each
+    // test's duration with it, since `os.clock` measures CPU time (≈0 across an
+    // awaited tick) rather than wall time. Public: useful to any plugin author.
+    nx.set(
+        "now_ms",
+        lua.create_function(|_, ()| {
+            Ok(std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs_f64() * 1000.0)
+                .unwrap_or(0.0))
+        })?,
+    )?;
+
     // `nx._read_file(path)`: the file's contents, or nil if unreadable. Backs the
     // pure-Lua loader that sources an `lsp/<name>.lua` config (via `loadstring`),
     // sidestepping any `loadfile` sandbox question.
@@ -923,6 +938,35 @@ pub(crate) fn install_runtime_api(
                 insert,
             });
             Ok(())
+        })?,
+    )?;
+
+    // `nx._test_clipboard_seed(text, linewise)`: queue a clipboard seed for the
+    // server to write into the editor's clipboard provider (the plugin-test seam
+    // behind `nx.test.clipboard.seed`). Reachable only via the gated `nx.test`.
+    let sh = shared.clone();
+    nx.set(
+        "_test_clipboard_seed",
+        lua.create_function(move |_, (text, linewise): (String, bool)| {
+            sh.borrow_mut().clipboard_seeds.push((text, linewise));
+            Ok(())
+        })?,
+    )?;
+
+    // `nx._test_tempdir()`: create and return a fresh, unique temp directory — the
+    // plugin-test seam behind `nx.test.tempdir()`, for a suite that exercises a
+    // plugin's file I/O without colliding with other runs. Native (the test runner
+    // is native); reachable only via the gated `nx.test`.
+    nx.set(
+        "_test_tempdir",
+        lua.create_function(|_, ()| {
+            use std::sync::atomic::{AtomicU64, Ordering};
+            static SEQ: AtomicU64 = AtomicU64::new(0);
+            let n = SEQ.fetch_add(1, Ordering::Relaxed);
+            let dir = std::env::temp_dir().join(format!("nxvim-test-{}-{}", std::process::id(), n));
+            std::fs::create_dir_all(&dir)
+                .map_err(|e| mlua::Error::external(format!("nx.test.tempdir: {e}")))?;
+            Ok(dir.to_string_lossy().into_owned())
         })?,
     )?;
 

@@ -661,6 +661,12 @@ pub struct EditHost {
     /// straight to the editor (the `n` flag). `nvim_feedkeys` with the `i` flag
     /// pushes to the front; otherwise to the back.
     feed_buffer: VecDeque<(Key, bool)>,
+    /// Plugin-test mode, flipped on by the `nx_enable_test_mode` RPC the
+    /// `nxvim --test-plugin` runner sends at startup. While set, [`redraw`] mirrors the
+    /// projected UI into `nx._ui` (for `nx.test`'s `t:float()` / `t:message()` reads)
+    /// and the `nx.test` framework is installed. Off by default, so a normal editor
+    /// session neither pays the mirror cost nor exposes the test API.
+    test_mode: bool,
     /// Buffers with an off-tick write currently on the wire — at most one per buffer,
     /// so a buffer's overlapping `:w`s serialize (snapshot order = wire order) rather
     /// than racing. Cleared when the write acks.
@@ -824,6 +830,7 @@ impl EditHost {
             preview_scroll: 0,
             preview_anchor: None,
             feed_buffer: VecDeque::new(),
+            test_mode: false,
             saves_inflight: HashSet::new(),
             saves_queued: HashMap::new(),
             quit_all_gate: None,

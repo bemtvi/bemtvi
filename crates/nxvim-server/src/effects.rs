@@ -654,6 +654,11 @@ impl EditHost {
             self.editor
                 .set_register_api(op.name, op.text, op.linewise, op.append);
         }
+        // Clipboard seeds from `nx.test.clipboard.seed` (plugin-test seam): write the
+        // editor's clipboard provider as if an external app set `"+` / `"*`.
+        for (text, linewise) in self.lua.take_clipboard_seeds() {
+            self.editor.clipboard_seed(&text, linewise);
+        }
         // `setqflist` writes: structured items, or raw lines parsed against `efm`
         // (the editor's `'errorformat'` when the op omits one). A malformed efm
         // fails loud on the message line rather than silently dropping the call.

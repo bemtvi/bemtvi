@@ -199,6 +199,24 @@ impl EditHost {
             None => Value::Nil,
         };
 
+        // Mirror the projected UI into `nx._ui` for the plugin test framework
+        // (`t:float()` / `t:message()` / `t:cmdline()` / `t:statusline()`), before
+        // `map` takes ownership of `float` / `global_status`. The status text is
+        // pulled out of its chunk runs; the float is mirrored as-is (its lines carry
+        // per-frame style ids, so tests assert on text). Only under `--test-plugin`
+        // (`test_mode`), so a normal session pays nothing.
+        if self.test_mode {
+            let statusline_text = chunk_runs_text(&global_status);
+            let clipboard = self.editor.clipboard_contents();
+            let _ = self.lua.set_ui_mirror(
+                &float,
+                &message,
+                view.cmdline.as_str(),
+                &statusline_text,
+                clipboard.as_ref().map(|(t, lw)| (t.as_str(), *lw)),
+            );
+        }
+
         // Built last: every per-window/`chrome` style id above indexes into it.
         let styles_value = styles.into_value();
         let map = vec![
@@ -1023,6 +1041,41 @@ fn stringify_eval(value: &Value) -> String {
         Value::F32(n) => n.to_string(),
         _ => String::new(),
     }
+}
+
+/// Flatten a status-line / chunk-run `Value` to its visible text — used to mirror
+/// the status line into `nx._ui.statusline` for the plugin test framework. A chunk
+/// is `[text, style]`; this collects each chunk's leading text in order, recursing
+/// through the surrounding arrays/maps so it works whatever the exact nesting is.
+/// Only chunk-pair text is taken (not bare scalar fields), so labels in a map don't
+/// leak in. `Nil` (per-window status modes / no global bar) flattens to "".
+fn chunk_runs_text(value: &Value) -> String {
+    fn walk(v: &Value, out: &mut String) {
+        match v {
+            Value::Array(items) => {
+                // A chunk pair `[text, style, …]`: take the leading string, don't
+                // descend further into it.
+                if items.len() >= 2 {
+                    if let Some(Value::String(s)) = items.first() {
+                        out.push_str(s.as_str().unwrap_or_default());
+                        return;
+                    }
+                }
+                for it in items {
+                    walk(it, out);
+                }
+            }
+            Value::Map(entries) => {
+                for (_, val) in entries {
+                    walk(val, out);
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut out = String::new();
+    walk(value, &mut out);
+    out
 }
 
 /// Encode a tab page as a `{ label, modified, window_count }` map for the redraw

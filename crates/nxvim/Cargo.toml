@@ -21,6 +21,11 @@ tokio.workspace = true
 nxvim-server = { workspace = true, features = ["native"] }
 nxvim-tui.workspace = true
 nxvim-lsp.workspace = true
+# The `--test-plugin` runner drives an embedded server as an RPC client (the same
+# msgpack wire a UI uses), so the transport + value type are runtime deps, not just
+# test deps.
+nxvim-rpc.workspace = true
+rmpv.workspace = true
 
 [dev-dependencies]
 ratatui.workspace = true

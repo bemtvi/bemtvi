@@ -241,6 +241,9 @@ fn server_init(file: Option<String>, client: Option<DaemonClient>) -> ServerInit
         host_fs_async,
         lsp_transport,
         fs_jobs,
+        // The GUI is the interactive editor — offer the built-in default recommended
+        // set on a fresh setup (a config's own recommend{} still overrides it).
+        offer_default_recommended: true,
     }
 }
 

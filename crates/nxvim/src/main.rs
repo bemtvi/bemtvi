@@ -160,6 +160,9 @@ fn main() -> Result<()> {
         // The local binary runs `nx.fs` against the local disk (the actor's `StdLuaFs`);
         // a daemon-backed `luafs_op` seam is injected here by the edit-host split.
         fs_jobs: None,
+        // The interactive binary offers nxvim's built-in default recommended set on a
+        // fresh setup (the first-run welcome); a config's own recommend{} overrides it.
+        offer_default_recommended: true,
     };
     let server_thread = std::thread::spawn(move || {
         // Test-only fault injection (debug builds only): force a server-thread
@@ -359,6 +362,9 @@ where
                 host_fs_async: Some(Box::new(client.host_fs)),
                 lsp_transport: Some(Box::new(client.lsp_transport)),
                 fs_jobs: Some(client.fs_jobs),
+                // A daemon-backed session is still the interactive editor — offer the
+                // built-in default recommended set on first run.
+                offer_default_recommended: true,
             };
             // `_guard` (the stdio child, or `()` for QUIC) lives until the editor quits.
             run_server(server_end, init).await

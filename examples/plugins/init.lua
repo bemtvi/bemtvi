@@ -20,6 +20,7 @@
 --   :Plugins        -- the lazy-style dashboard: every plugin grouped by load state,
 --                      LIVE clone/pull progress, and the action keys —
 --                      I install · U update · S sync · X clean · <CR> details · q quit
+--   :PluginsWelcome -- re-open the first-run recommended-set checklist on demand
 --   :PluginSync     -- clone everything declared below (needs network + git)
 --   :PluginList     -- show install / load state (text dump)
 --   :PluginUpdate   -- fast-forward the unpinned ones
@@ -97,8 +98,10 @@ nx.plugins({
 -- `config`/`init` must be a STRING of Lua (not a function) — everything else is a
 -- normal spec:
 --
+-- `desc` is a short blurb shown next to each item in the first-run welcome checklist.
+--
 -- nx.plugins.recommend({
---   { "catppuccin/nvim", name = "catppuccin",
+--   { "catppuccin/nvim", name = "catppuccin", desc = "Soothing pastel colorscheme",
 --     config = [[ vim.cmd("colorscheme catppuccin") ]] },
---   { "author/nx-files", keys = { "<leader>ff" } },
+--   { "author/nx-files", desc = "Fuzzy file finder", keys = { "<leader>ff" } },
 -- })

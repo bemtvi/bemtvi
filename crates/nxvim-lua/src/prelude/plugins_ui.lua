@@ -60,15 +60,21 @@ end
 
 -- ----- the welcome checklist --------------------------------------------------
 
--- The lines before the first checklist item — fixed so cursor↔item math is exact.
-local WELCOME_HEADER = 4
+-- The lines before the first checklist item (the two intro lines + a blank
+-- separator) — fixed so the cursor↔item math is exact.
+local WELCOME_HEADER = 3
 
 local Welcome = nx.view.component({
   setup = function(ctx, props)
     local items = {}
     for _, raw in ipairs(props.recommended) do
-      items[#items + 1] =
-        { label = spec_label(raw), source = spec_source(raw), checked = true, spec = raw }
+      items[#items + 1] = {
+        label = spec_label(raw),
+        source = spec_source(raw),
+        desc = (type(raw) == "table" and raw.desc) or "",
+        checked = true,
+        spec = raw,
+      }
     end
     local state = ctx.reactive({ items = items })
 
@@ -142,6 +148,16 @@ local Welcome = nx.view.component({
       ctx.set_cursor(WELCOME_HEADER + 1)
     end)
 
+    -- Window-local display, set once the window exists (winid lands a tick after
+    -- mount): wrap long lines (the intro / hint run past the float width), and inset
+    -- the content from the border with `padding` for breathing room.
+    nx.wait_for(ctx.winid)
+      :next(function()
+        ctx.wo.wrap = true
+        ctx.wo.padding = "1 2"
+      end)
+      :catch(function() end)
+
     return { items = state.items }
   end,
 
@@ -155,37 +171,37 @@ local Welcome = nx.view.component({
       end
     end
 
-    add("")
-    add("  nxvim ships minimal by design — no bundled plugins.", "NxPluginsDim")
-    add("  These are recommended to get you started — untick any you don't want:", "NxPluginsDim")
+    add("nxvim ships minimal by design — no bundled plugins.", "NxPluginsDim")
+    add("These are recommended to get you started — untick any you don't want:", "NxPluginsDim")
     add("")
 
     local selected = 0
     for _, it in ipairs(view.items) do
       local box = it.checked and "☑" or "☐"
-      local text = "  " .. box .. "  " .. it.label
+      local text = box .. " " .. it.label
       lines[#lines + 1] = text
       local line = #lines - 1
       decor[#decor + 1] = {
         line = line,
-        col = 2,
+        col = 0,
         end_row = line,
-        end_col = 2 + #box,
+        end_col = #box,
         hl_group = it.checked and "NxPluginsLoaded" or "NxPluginsDim",
       }
-      if it.source ~= "" then
+      -- A short human description (falling back to the source) trails the name, dim.
+      local detail = (it.desc ~= "" and it.desc) or it.source
+      if detail ~= "" then
         decor[#decor + 1] =
-          { line = line, col = #text, virt_text = { { "   " .. it.source, "NxPluginsDim" } } }
+          { line = line, col = #text, virt_text = { { " — " .. detail, "NxPluginsDim" } } }
       end
       if it.checked then
         selected = selected + 1
       end
     end
 
-    add("")
     add(
       string.format(
-        "  %d of %d selected     <Space> toggle   a all   <CR> install   <Esc> skip",
+        "%d of %d selected · <Space> toggle · a all · <CR> install · <Esc> skip",
         selected,
         #view.items
       ),
@@ -203,7 +219,9 @@ function M.ui.welcome(recommended)
       name = "nx-plugins-welcome",
       filetype = "nxpluginswelcome",
       float = {
-        width = 70,
+        width = 74,
+        -- Exact fit: the header lines (WELCOME_HEADER) + one row per item + the hint,
+        -- plus the 2 rows the top/bottom `padding` insets.
         height = #recommended + WELCOME_HEADER + 3,
         align = "center",
         border = "rounded",
@@ -292,14 +310,39 @@ local Manager = nx.view.component({
       end)
     end
 
+    -- A freshly-cloned plugin is on the runtimepath, but its `plugin/` scripts and
+    -- (for an eager plugin) its `config` only run cleanly from a clean startup — so
+    -- after an install that actually clones something, prompt to restart. Centered,
+    -- transient popup (the next key dismisses it). `M.ui._restart_shown` records that
+    -- it fired (an introspection hook for tests).
+    local function restart_popup(n)
+      if (n or 0) < 1 then
+        return
+      end
+      M.ui._restart_shown = true
+      nx.ui.float({
+        "Installed " .. n .. " new plugin(s).",
+        "",
+        "Restart nxvim to finish loading them.",
+      }, { title = " Restart required ", relative = "editor", border = "rounded" })
+    end
+
+    -- Run a verb that may install, reporting errors and popping the restart notice
+    -- when its promise resolves a non-zero install count.
+    local function run_installing(p)
+      p:next(restart_popup):catch(function(e)
+        nx.notify(tostring(e and e.message or e), 4)
+      end)
+    end
+
     ctx.keymap_set("n", "I", function()
-      run(M.install())
+      run_installing(M.install())
     end, { desc = "Install missing" })
     ctx.keymap_set("n", "U", function()
       run(M.update())
     end, { desc = "Update plugins" })
     ctx.keymap_set("n", "S", function()
-      run(M.sync())
+      run_installing(M.sync())
     end, { desc = "Sync (install + update)" })
     ctx.keymap_set("n", "X", function()
       run(M.clean())
@@ -319,6 +362,16 @@ local Manager = nx.view.component({
     end
     ctx.keymap_set("n", "q", close, { desc = "Close" })
     ctx.keymap_set("n", "<Esc>", close, { desc = "Close" })
+
+    -- Window-local display, set once the window exists: wrap long rows (the key hint,
+    -- a row's trailing status) instead of clipping at the border, and inset the
+    -- content with `padding` for breathing room.
+    nx.wait_for(ctx.winid)
+      :next(function()
+        ctx.wo.wrap = true
+        ctx.wo.padding = "1 2"
+      end)
+      :catch(function() end)
 
     return { state = state, line_to_name = line_to_name }
   end,
@@ -364,10 +417,9 @@ local Manager = nx.view.component({
       end
     end
 
-    add("")
     add(
       string.format(
-        "  %d plugins · %d loaded · %d not loaded · %d missing",
+        "%d plugins · %d loaded · %d not loaded · %d missing",
         #plugins,
         #loaded,
         #ready,
@@ -378,26 +430,26 @@ local Manager = nx.view.component({
     add("")
 
     if #plugins == 0 then
-      add("  No plugins declared yet.", "NxPluginsDim")
+      add("No plugins declared yet.", "NxPluginsDim")
       add(
-        "  Add some with nx.plugins{ … } in your config, then press I to install.",
+        "Add some with nx.plugins{ … } in your config, then press I to install.",
         "NxPluginsDim"
       )
     end
 
-    -- Emit one detail line (8-space indent), dim.
+    -- A detail line, nested one step under its plugin row.
     local function detail(label, val)
       if val == nil or val == "" then
         return
       end
-      add("        " .. label .. ": " .. val, "NxPluginsDim")
+      add("    " .. label .. ": " .. val, "NxPluginsDim")
     end
 
     local function section(title, list, icon, icon_hl)
       if #list == 0 then
         return
       end
-      add("  " .. title .. " (" .. #list .. ")", "NxPluginsHeader")
+      add(title .. " (" .. #list .. ")", "NxPluginsHeader")
       for _, p in ipairs(list) do
         local task = tasks[p.name]
         local sym, shl = icon, icon_hl
@@ -407,11 +459,12 @@ local Manager = nx.view.component({
           sym, shl = "✗", "NxPluginsMissing"
         end
 
-        local text = "   " .. sym .. " " .. p.name
+        -- Items sit one step under their section header.
+        local text = "  " .. sym .. " " .. p.name
         local ln = add(text)
         local line = ln - 1
         decor[#decor + 1] =
-          { line = line, col = 3, end_row = line, end_col = 3 + #sym, hl_group = shl }
+          { line = line, col = 2, end_row = line, end_col = 2 + #sym, hl_group = shl }
         map[ln] = p.name
 
         -- Dim suffix: flags, then a SHORT live task word. The error word is "failed"
@@ -430,11 +483,11 @@ local Manager = nx.view.component({
           word = task.state == "error" and "failed" or task.msg
         end
         if word and word ~= "" then
-          suffix = (suffix ~= "" and (suffix .. "  ") or "") .. word
+          suffix = (suffix ~= "" and (suffix .. " · ") or "") .. word
         end
         if suffix ~= "" then
           decor[#decor + 1] =
-            { line = line, col = #text, virt_text = { { "   " .. suffix, "NxPluginsDim" } } }
+            { line = line, col = #text, virt_text = { { " — " .. suffix, "NxPluginsDim" } } }
         end
 
         if st.expanded[p.name] then
@@ -460,7 +513,7 @@ local Manager = nx.view.component({
           end
         end
       end
-      add("")
+      add("") -- a blank line of breathing room between sections
     end
 
     section("Loaded", loaded, "●", "NxPluginsLoaded")
@@ -468,7 +521,7 @@ local Manager = nx.view.component({
     section("Missing", missing, "○", "NxPluginsMissing")
 
     add(
-      "  I install   U update   S sync   X clean   r refresh   <CR> details   q quit",
+      "I install · U update · S sync · X clean · r refresh · <CR> details · q quit",
       "NxPluginsDim"
     )
     return { lines = lines, decor = decor }
@@ -500,5 +553,35 @@ end
 nx.command("Plugins", function()
   M.ui.open()
 end, { desc = "Open the nx.plugins manager UI (lazy-style dashboard)." })
+
+-- :PluginsWelcome — open the first-run welcome checklist ON DEMAND, ignoring the
+-- ask-once marker and the "no plugins declared yet" gate that `M.bootstrap` checks.
+-- Confirming runs the same accept path as first-run (persist the chosen subset to the
+-- managed `<config>/lua/plugins.lua`, declare them, and sync), so it both lets a user
+-- re-pick from the recommended set and gives a way to preview the surface. Note it
+-- OVERWRITES the managed plugins.lua with the chosen set.
+nx.command("PluginsWelcome", function()
+  if #M._recommended == 0 then
+    return nx.notify(
+      "nx.plugins: no recommended set registered — call nx.plugins.recommend{...} first",
+      3
+    )
+  end
+  M.ui
+    .welcome(M._recommended)
+    :next(function(chosen)
+      if not chosen or #chosen == 0 then
+        return
+      end
+      return nx.async(function()
+        nx.await(M._persist_recommended(chosen))
+        M.add(chosen)
+        nx.await(M.sync())
+      end)()
+    end)
+    :catch(function(err)
+      nx.notify("nx.plugins: " .. tostring(err and err.message or err), 4)
+    end)
+end, { desc = "Open the recommended-plugins welcome checklist and install the chosen set." })
 
 return M.ui

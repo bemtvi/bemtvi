@@ -607,12 +607,14 @@ function M.update()
 end
 
 -- Install the missing, then update the rest — the one-shot "make the world match
--- my declarations". Returns a promise.
+-- my declarations". Returns a promise of the count NEWLY INSTALLED (so a UI can tell
+-- whether a fresh clone landed and prompt to restart).
 function M.sync()
   return nx.async(function()
-    nx.await(M.install())
+    local installed = nx.await(M.install())
     nx.await(M.update())
     nx.notify("nx.plugins: sync complete", 2)
+    return installed
   end)()
 end
 
@@ -676,6 +678,49 @@ function M.recommend(specs)
   return specs
 end
 
+-- nxvim's BUILT-IN default recommended set — a small, nx.*-native starting point
+-- offered on a brand-new setup when the user's config registers no set of its own.
+-- It is NOT active by default: the interactive binary opts in by calling
+-- `M._use_default_recommended()` at boot (ServerInit.offer_default_recommended) before
+-- `init.lua` runs, so a config's own `recommend{...}` still overrides it and declaring
+-- any plugin skips the welcome. Tests never opt in, so it can't disrupt the headless
+-- suites. String-form hooks only (the chosen subset is serialized into plugins.lua).
+-- (A plugin spec is intentionally a mixed table — `[1]` source + named fields — which
+-- is the manager's declared format; suppress selene's mixed_table for this literal.)
+-- selene: allow(mixed_table)
+M._default_recommended = {
+  {
+    "davidrios/catppuccin-nxvim",
+    name = "catppuccin",
+    desc = "Soothing pastel colorscheme",
+    config = [[ vim.cmd("colorscheme catppuccin") ]],
+  },
+  {
+    "davidrios/nx-files",
+    desc = "Fuzzy finder for files & buffers (<leader>ff)",
+    keys = { "<leader>ff" },
+    dependencies = { "davidrios/nx-async-utils" },
+  },
+  {
+    "davidrios/nx-emoji",
+    desc = "Insert emoji by name (:Emoji)",
+    cmd = "Emoji",
+  },
+  {
+    "davidrios/nx-statusline-extras",
+    desc = "Extra statusline segments (git, diagnostics, …)",
+  },
+}
+
+-- Activate the built-in default set as the recommended set, unless one is already
+-- registered. The interactive binary calls this before sourcing `init.lua`; the test
+-- harness never does (so the headless suites keep an empty set and never offer it).
+function M._use_default_recommended()
+  if #M._recommended == 0 then
+    M.recommend(M._default_recommended)
+  end
+end
+
 -- Quote a string as a Lua literal (handles quotes / backslashes / newlines).
 local function qstr(s)
   return string.format("%q", s)
@@ -702,7 +747,7 @@ serialize_spec = function(s)
   if src then
     fields[#fields + 1] = qstr(src)
   end
-  for _, k in ipairs({ "name", "branch", "tag", "version", "commit", "dir" }) do
+  for _, k in ipairs({ "name", "desc", "branch", "tag", "version", "commit", "dir" }) do
     if s[k] ~= nil then
       fields[#fields + 1] = k .. " = " .. qstr(s[k])
     end

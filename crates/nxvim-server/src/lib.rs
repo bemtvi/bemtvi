@@ -236,6 +236,13 @@ pub struct ServerInit {
     /// (boxed) so it rides [`ServerInit`] onto the server thread, where `run_server` turns
     /// it into the actor's [`FsBackend`](crate::evloop::FsBackend).
     pub fs_jobs: Option<RemoteFsJobs>,
+    /// Whether to offer nxvim's built-in default recommended plugin set on a fresh
+    /// setup. `false` (the default) leaves the recommended set empty, so the headless
+    /// test suites never trip the first-run welcome; the interactive binary sets it
+    /// `true`, which activates `nx.plugins._default_recommended` before `init.lua`
+    /// runs (a config's own `nx.plugins.recommend{...}` still overrides it). Mirrors
+    /// how `shada` / `clipboard` keep tests hermetic while the binary opts in.
+    pub offer_default_recommended: bool,
 }
 
 /// How the server provides the `"+` / `"*` clipboard registers.
@@ -1906,6 +1913,12 @@ where
     // reach it through the seam.
     host.shada_load();
 
+    // Offer the built-in default recommended set on a fresh setup — BEFORE init.lua,
+    // so a config's own `nx.plugins.recommend{...}` (or declaring any plugin) still
+    // wins. The interactive binary opts in; tests leave this off and stay hermetic.
+    if init.offer_default_recommended {
+        let _ = host.lua.exec("nx.plugins._use_default_recommended()");
+    }
     // Source the user's `init.lua` (if any) before serving the client, exactly
     // as neovim runs config at startup: its options, mappings, and colorscheme
     // are in place by the time the first `redraw` goes out on UI attach.

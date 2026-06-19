@@ -483,7 +483,8 @@ async fn first_run_offers_recommended_and_persists_on_yes() {
     exec_lua(
         &rpc,
         &format!(
-            "nx.plugins.recommend({{ {{ \"file://{repo}\", name = \"zeta\" }} }})\n\
+            "nx.plugins.recommend({{\n\
+               {{ \"file://{repo}\", name = \"zeta\", desc = \"Zeta the plugin\" }} }})\n\
              nx.plugins.bootstrap()",
             repo = q(&repo)
         ),
@@ -500,6 +501,20 @@ async fn first_run_offers_recommended_and_persists_on_yes() {
         poll_true(&rpc, "return vim.bo.filetype == 'nxpluginswelcome'").await,
         "the welcome checklist view should be focused"
     );
+    // The welcome view wraps long lines so its intro / hint stay fully readable, and
+    // insets its content from the border via the 'padding' window option.
+    assert!(
+        poll_true(&rpc, "return vim.wo.wrap == true").await,
+        "the welcome view should enable line wrapping"
+    );
+    assert!(
+        poll_true(
+            &rpc,
+            "return vim.wo.padding ~= '' and vim.wo.padding ~= nil"
+        )
+        .await,
+        "the welcome view should set a 'padding' margin"
+    );
 
     // <CR> confirms the pre-ticked set → install + load + persist.
     assert!(
@@ -510,6 +525,10 @@ async fn first_run_offers_recommended_and_persists_on_yes() {
     assert!(
         pluginslua.contains("zeta"),
         "the set is written to lua/plugins.lua (got: {pluginslua:?})"
+    );
+    assert!(
+        pluginslua.contains("Zeta the plugin"),
+        "the spec's desc is serialized into plugins.lua (got: {pluginslua:?})"
     );
     let initlua = std::fs::read_to_string(cfg.join("init.lua")).unwrap();
     assert!(
@@ -653,7 +672,7 @@ async fn welcome_untick_excludes_a_plugin() {
     let mut rendered = false;
     for _ in 0..200 {
         let ls = lines(&rpc).await;
-        if ls.len() >= 6 && ls.iter().filter(|l| l.contains('☑')).count() == 2 {
+        if ls.iter().filter(|l| l.contains('☑')).count() == 2 {
             rendered = true;
             break;
         }
@@ -661,14 +680,14 @@ async fn welcome_untick_excludes_a_plugin() {
     }
     assert!(rendered, "welcome should render both items pre-ticked");
 
-    // Jump to the second item (line 6 = 4 header lines + item #2) with the builtin
-    // `6G` motion (not remapped), then untick it with <Space>.
-    feed(&rpc, "6G");
+    // Jump to the second item (line 5 = 2 intro lines + a blank + item #2) with the
+    // builtin `5G` motion (not remapped), then untick it with <Space>.
+    feed(&rpc, "5G");
     feed(&rpc, "<Space>");
     let mut unticked = false;
     for _ in 0..100 {
         let ls = lines(&rpc).await;
-        if ls.get(5).map(|l| l.contains('☐')).unwrap_or(false) {
+        if ls.get(4).map(|l| l.contains('☐')).unwrap_or(false) {
             unticked = true;
             break;
         }
@@ -786,5 +805,171 @@ async fn plugins_command_opens_the_manager_dashboard() {
     assert!(
         poll_true(&rpc, "return vim.wo.fillchars == 'eob: '").await,
         "the component window should hide the end-of-buffer fill characters"
+    );
+    // The dashboard wraps long rows (the key hint) instead of clipping them, and
+    // insets its content via the 'padding' window option.
+    assert!(
+        poll_true(&rpc, "return vim.wo.wrap == true").await,
+        "the dashboard should enable line wrapping"
+    );
+    assert!(
+        poll_true(
+            &rpc,
+            "return vim.wo.padding ~= '' and vim.wo.padding ~= nil"
+        )
+        .await,
+        "the dashboard should set a 'padding' margin"
+    );
+}
+
+// Installing a missing plugin from the dashboard (pressing `I`) pops the
+// restart-required notice once the clone lands — a fresh clone only loads cleanly
+// from a clean startup.
+#[tokio::test]
+async fn installing_via_the_manager_prompts_to_restart() {
+    let (rpc, _i) = start().await;
+    let src = temp_dir("plug_restart_src");
+    let repo = make_repo(&src, "rho");
+    setup_root(&rpc, "plug_restart").await;
+
+    // An eager plugin declared but not yet on disk → it shows under "Missing".
+    exec_lua(
+        &rpc,
+        &format!(
+            "nx.plugins {{ {{ \"file://{repo}\", name = \"rho\" }} }}",
+            repo = q(&repo)
+        ),
+    )
+    .await;
+    exec_lua(&rpc, "vim.cmd('Plugins')").await;
+
+    // Wait for the dashboard to render (its key hint present ⇒ setup ran, so the `I`
+    // map is bound), then press I once to install.
+    let mut ready = false;
+    for _ in 0..200 {
+        if lines(&rpc).await.join("\n").contains("I install") {
+            ready = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(ready, "the dashboard should render before we press I");
+    feed(&rpc, "I");
+
+    // The clone lands and the restart notice fires.
+    assert!(
+        poll_true(
+            &rpc,
+            "local t = nx.plugins._tasks.rho\n\
+             return t ~= nil and t.state == 'done'"
+        )
+        .await,
+        "pressing I should install the missing plugin"
+    );
+    assert!(
+        poll_true(&rpc, "return nx.plugins.ui._restart_shown == true").await,
+        "installing via the manager should prompt to restart"
+    );
+}
+
+// `:PluginsWelcome` opens the welcome checklist ON DEMAND, ignoring the first-run
+// ask-once marker (and the "no plugins declared" gate), then installs + persists the
+// chosen set — the way to re-pick the recommended set after first-run is over.
+#[tokio::test]
+async fn plugins_welcome_command_reopens_after_marker() {
+    let (rpc, _i) = start().await;
+    let src = temp_dir("plug_welcmd_src");
+    let repo = make_repo(&src, "kappa");
+    let (root, cfg) = setup_root_and_config(&rpc, "plug_welcmd").await;
+
+    // Simulate "first-run already happened": the marker exists and a set is declared.
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::write(root.join(".recommended-prompted"), b"1\n").unwrap();
+    exec_lua(
+        &rpc,
+        &format!(
+            "nx.plugins.recommend({{ {{ \"file://{repo}\", name = \"kappa\" }} }})",
+            repo = q(&repo)
+        ),
+    )
+    .await;
+
+    // The command opens the welcome despite the marker; confirm installs + persists.
+    exec_lua(&rpc, "vim.cmd('PluginsWelcome')").await;
+    assert!(
+        poll_true(&rpc, "return vim.bo.filetype == 'nxpluginswelcome'").await,
+        ":PluginsWelcome should open the checklist even after the marker exists"
+    );
+    assert!(
+        feed_until(&rpc, "<CR>", "return nx.plugins._loaded.kappa == true").await,
+        "confirming :PluginsWelcome installs the chosen set"
+    );
+    let pluginslua = std::fs::read_to_string(cfg.join("lua").join("plugins.lua")).unwrap();
+    assert!(
+        pluginslua.contains("kappa"),
+        "the chosen set is written to plugins.lua (got: {pluginslua:?})"
+    );
+}
+
+// ----- built-in default recommended set --------------------------------------
+
+// With ServerInit.offer_default_recommended set (the interactive binary), nxvim's
+// built-in default set is active on a fresh setup even when the user's config
+// registers none — so the welcome appears. The test stays hermetic: it routes the
+// install root + config at temp dirs and SKIPS (no network clone).
+#[tokio::test]
+async fn built_in_default_recommended_offers_when_config_registers_none() {
+    let base = temp_dir("plug_default");
+    let root = base.join("data");
+    let cfg = base.join("config");
+    std::fs::create_dir_all(&cfg).unwrap();
+    // The config registers NO recommended set — only hermetic paths.
+    std::fs::write(
+        cfg.join("init.lua"),
+        format!(
+            "nx.plugins.setup({{ root = \"{root}\", config = \"{cfg}\" }})\n",
+            root = q(&root),
+            cfg = q(&cfg)
+        ),
+    )
+    .unwrap();
+    let init = ServerInit {
+        config_dir: Some(cfg.clone()),
+        runtimepath: vec![cfg.clone()],
+        offer_default_recommended: true,
+        ..Default::default()
+    };
+    let (rpc, _incoming) = spawn(init);
+    attach(&rpc, 80, 24).await;
+
+    // The built-in default became the active recommended set (the config set none)...
+    assert!(
+        poll_true(&rpc, "return #nx.plugins._recommended > 0").await,
+        "the built-in default set should activate when the config registers none"
+    );
+    // ...so the first-run welcome appears.
+    assert!(
+        poll_true(&rpc, "return vim.bo.filetype == 'nxpluginswelcome'").await,
+        "a fresh setup with the default offered shows the welcome"
+    );
+    // Skip it — no clone, hermetic.
+    feed_until(
+        &rpc,
+        "<Esc>",
+        "return vim.bo.filetype ~= 'nxpluginswelcome'",
+    )
+    .await;
+}
+
+// The default is OFF unless opted in: the headless harness (ServerInit::default,
+// offer_default_recommended=false) keeps an empty recommended set, so no test ever
+// trips the first-run welcome.
+#[tokio::test]
+async fn default_recommended_is_off_unless_opted_in() {
+    let (rpc, _i) = start().await;
+    assert_eq!(
+        lua_bool(&rpc, "return #nx.plugins._recommended == 0").await,
+        Some(true),
+        "without offer_default_recommended the recommended set stays empty (tests stay hermetic)"
     );
 }

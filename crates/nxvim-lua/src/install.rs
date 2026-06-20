@@ -868,34 +868,20 @@ pub(crate) fn install_runtime_api(
         })?,
     )?;
 
-    // `nx.shada.save_layout(enable[, opts])` -> opt this session into CAPTURING the
-    // window/tab layout (the exact split tree, open files, cursors, docks) into the
-    // shada, persisted on exit and restored when the editor is launched with
+    // `nx.shada.save_layout(enable)` -> opt this session into CAPTURING the window/tab
+    // layout (the exact split tree, open files, cursors, docks) into the shada,
+    // persisted on exit and restored when the editor is launched with
     // `--restore-session`. Default OFF — a plugin turns it on once it knows the launch is
     // the namespace it wanted. Only meaningful with a namespace (the global store never
-    // persists layout). `opts` tunes how sizes are stored:
-    //   * `relative_splits` (default true)  — split sizes as proportional percentages,
-    //     so a 30/70 vsplit restores 30/70 at any terminal width (vs absolute cells).
-    //   * `relative_docks`  (default false) — a dock's size as a percentage of the
-    //     screen (so it scales) rather than a fixed cell count.
+    // persists layout). How split / dock sizes are stored (proportional vs absolute) is
+    // governed by the native `nx.o.relative_splits` / `nx.o.relative_docks` options,
+    // read off the editor at capture — so any wrapper that opts in honors them.
     {
         let sh = shared.clone();
         shada_tbl.set(
             "save_layout",
-            lua.create_function(move |_, (enable, opts): (bool, Option<mlua::Table>)| {
-                let mut sh = sh.borrow_mut();
-                sh.session_save_layout = enable;
-                if enable {
-                    let (rel_splits, rel_docks) = match &opts {
-                        Some(t) => (
-                            t.get::<Option<bool>>("relative_splits")?.unwrap_or(true),
-                            t.get::<Option<bool>>("relative_docks")?.unwrap_or(false),
-                        ),
-                        None => (true, false),
-                    };
-                    sh.session_relative_splits = rel_splits;
-                    sh.session_relative_docks = rel_docks;
-                }
+            lua.create_function(move |_, enable: bool| {
+                sh.borrow_mut().session_save_layout = enable;
                 Ok(())
             })?,
         )?;
@@ -2593,12 +2579,25 @@ pub(crate) fn install_runtime_api(
         })?,
     )?;
 
-    // `nx._json_encode(value)`: serialize a Lua value to a JSON string, using the
-    // same array-vs-object rule as [`lua_to_rmpv`]. Backs `vim.json.encode`.
+    // `nx._json_encode(value[, opts])`: serialize a Lua value to a JSON string, using
+    // the same array-vs-object rule as [`lua_to_rmpv`]. `opts.pretty` (default false)
+    // emits a 2-space-indented, multi-line document instead of the compact one-liner —
+    // for human-readable / diff-friendly files, so a plugin needn't hand-roll its own
+    // pretty printer. Backs `nx.json.encode` / `vim.json.encode`.
     nx.set(
         "_json_encode",
-        lua.create_function(|_, value: mlua::Value| {
-            serde_json::to_string(&lua_to_json(&value)?).map_err(mlua::Error::external)
+        lua.create_function(|_, (value, opts): (mlua::Value, Option<mlua::Table>)| {
+            let pretty = match &opts {
+                Some(t) => t.get::<Option<bool>>("pretty")?.unwrap_or(false),
+                None => false,
+            };
+            let json = lua_to_json(&value)?;
+            let out = if pretty {
+                serde_json::to_string_pretty(&json)
+            } else {
+                serde_json::to_string(&json)
+            };
+            out.map_err(mlua::Error::external)
         })?,
     )?;
 

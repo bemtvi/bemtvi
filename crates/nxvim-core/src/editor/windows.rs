@@ -1406,6 +1406,8 @@ impl Editor {
             "scrollanim" => self.options.scrollanim = value,
             "qfdock" => self.options.qfdock = value,
             "bdclosetab" => self.options.bdclosetab = value,
+            "relative_splits" => self.options.relative_splits = value,
+            "relative_docks" => self.options.relative_docks = value,
             _ => {}
         }
     }

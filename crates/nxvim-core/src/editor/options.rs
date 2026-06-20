@@ -93,6 +93,8 @@ impl Editor {
             "scrollanim" => &mut self.options.scrollanim,
             "qfdock" => &mut self.options.qfdock,
             "bdclosetab" => &mut self.options.bdclosetab,
+            "relative_splits" => &mut self.options.relative_splits,
+            "relative_docks" => &mut self.options.relative_docks,
             "expandtab" => &mut self.buffer_mut().options.expandtab,
             "bomb" => &mut self.buffer_mut().options.bomb,
             "modifiable" => &mut self.buffer_mut().options.modifiable,

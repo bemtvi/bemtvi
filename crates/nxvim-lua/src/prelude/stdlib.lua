@@ -112,6 +112,29 @@ function nx.str.trim(text, mask, dir)
 end
 vim.fn.trim = nx.str.trim
 
+-- ----- JSON -----------------------------------------------------------------
+
+-- `nx.json` is the public JSON codec, wrapping the native `nx._json_*` bridges
+-- (the same array-vs-object rule the msgpack path uses). `vim.json` aliases it for
+-- muscle memory + neovim-plugin compat. Exposed here so no plugin re-implements a
+-- JSON encoder of its own.
+nx.json = nx.json or {}
+
+-- nx.json.encode(value[, opts]) -> string. `opts.pretty` (default false) emits a
+-- 2-space-indented, multi-line document for human-readable / diff-friendly files;
+-- omit it for the compact one-liner.
+function nx.json.encode(value, opts)
+  return nx._json_encode(value, opts)
+end
+
+-- nx.json.decode(str) -> value. Parses a JSON document (objects -> string-keyed
+-- tables, arrays -> sequences, `null` -> nil); raises on malformed input.
+function nx.json.decode(str)
+  return nx._json_decode(str)
+end
+
+vim.json = nx.json
+
 -- ----- table / list / string helpers ----------------------------------------
 
 -- `nx.tbl.*` / `nx.list.*` are the canonical table/list helper namespaces; the

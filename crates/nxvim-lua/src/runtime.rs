@@ -358,6 +358,12 @@ pub struct GoMirror {
     /// `'bdclosetab'` — whether `:bd` of a tab's last buffer closes the tab (nxvim)
     /// rather than loading a sibling. Backs `vim.o.bdclosetab` / `nx.o.bdclosetab`.
     pub bdclosetab: bool,
+    /// `'relative_splits'` — whether a saved session stores split sizes as proportional
+    /// percentages (default true). Backs `nx.o.relative_splits`.
+    pub relative_splits: bool,
+    /// `'relative_docks'` — whether a saved session stores dock sizes as a percentage
+    /// of the screen (default false). Backs `nx.o.relative_docks`.
+    pub relative_docks: bool,
 }
 
 /// The pure-Lua `vim.*` prelude, split into focused modules under `src/prelude/`
@@ -655,15 +661,11 @@ pub(crate) struct Shared {
     /// Whether the workspace session should CAPTURE the window/tab layout into the
     /// (namespaced) shada. Default `false`; a workspace plugin flips it on via
     /// `nx.shada.save_layout(true)` once it knows this is the right namespace. The
-    /// server reads it at flush ([`LuaRuntime::session_save_layout`]).
+    /// server reads it at flush ([`LuaRuntime::session_save_layout`]). How sizes are
+    /// stored (proportional vs absolute) is the native `'relative_splits'` /
+    /// `'relative_docks'` options, read straight off the editor at capture — not
+    /// mirrored here, so layout sizing isn't coupled to this plugin opt-in.
     pub(crate) session_save_layout: bool,
-    /// Whether split sizes are captured as proportional PERCENTAGES (vs absolute cells).
-    /// Set alongside [`session_save_layout`] from the `relative_splits` option (default
-    /// true). Read by the server at flush.
-    pub(crate) session_relative_splits: bool,
-    /// Whether a dock's size is captured as a PERCENTAGE of the screen (vs absolute
-    /// cells). From the `relative_docks` option (default false). Read at flush.
-    pub(crate) session_relative_docks: bool,
     /// Whether any `nx.on_key_pending` listener has been registered
     /// (`nx._key_pending_register`). The gate the server checks before computing /
     /// pushing the pending-key signal: while no listener is set it never walks the
@@ -1423,16 +1425,6 @@ impl LuaRuntime {
     /// layout (`nx.shada.save_layout`). The server gates session capture on it.
     pub fn session_save_layout(&self) -> bool {
         self.shared.borrow().session_save_layout
-    }
-
-    /// Whether split sizes should be captured as proportional percentages (default true).
-    pub fn session_relative_splits(&self) -> bool {
-        self.shared.borrow().session_relative_splits
-    }
-
-    /// Whether dock sizes should be captured as a percentage of the screen (default false).
-    pub fn session_relative_docks(&self) -> bool {
-        self.shared.borrow().session_relative_docks
     }
 
     /// Whether any `nx.on_key_pending` listener has been registered

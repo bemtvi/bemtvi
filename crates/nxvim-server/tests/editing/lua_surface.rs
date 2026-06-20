@@ -419,3 +419,25 @@ async fn vim_tbl_get_follows_a_nested_key_path() {
     // scalar (c is 42, not a table) -> nil rather than an error.
     assert_eq!(startup_message(&rpc, &mut incoming).await, "42 nil nil");
 }
+
+#[tokio::test]
+async fn vim_json_encodes_compact_and_pretty_and_round_trips() {
+    let dir = temp_dir("json");
+    // `vim.json`/`nx.json` is the public codec: a compact encode by default, a
+    // 2-space multi-line document with `{ pretty = true }`, and a decode that
+    // round-trips — so no plugin re-implements a pretty printer of its own.
+    let (rpc, mut incoming) = start_with_config(
+        &dir,
+        "local v = { a = 1 }\n\
+         local compact = vim.json.encode(v)\n\
+         local pretty = nx.json.encode(v, { pretty = true })\n\
+         local back = vim.json.decode(pretty)\n\
+         print(compact .. ' | multiline=' .. tostring(pretty:find('\\n', 1, true) ~= nil)\n\
+           .. ' | rt=' .. tostring(back.a))\n",
+    )
+    .await;
+    assert_eq!(
+        startup_message(&rpc, &mut incoming).await,
+        "{\"a\":1} | multiline=true | rt=1"
+    );
+}

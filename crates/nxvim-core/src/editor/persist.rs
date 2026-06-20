@@ -253,14 +253,14 @@ impl Editor {
     /// and the focused window marked. Floating windows and unnamed (scratch) buffers are
     /// dropped (single-child splits collapse). Returns `None` when nothing is worth
     /// saving. Pure: reads live state, no I/O.
-    /// `relative_splits` stores split sizes as proportional percentages (default) rather
-    /// than absolute cells; `relative_docks` likewise stores a dock's size as a percentage
-    /// of the screen so it scales (off by default — docks keep their cell size).
-    pub fn export_session(
-        &self,
-        relative_splits: bool,
-        relative_docks: bool,
-    ) -> Option<SessionState> {
+    /// The native `'relative_splits'` option (default on) stores split sizes as
+    /// proportional percentages rather than absolute cells; `'relative_docks'` (default
+    /// off) likewise stores a dock's size as a percentage of the screen so it scales.
+    /// Both are read straight off [`Options`](crate::options::Options) here, so any
+    /// wrapper that opts a session into capture honors them — they are not coupled to
+    /// any one plugin.
+    pub fn export_session(&self) -> Option<SessionState> {
+        let relative_splits = self.options.relative_splits;
         let current_tab = self.current_tab_id();
         let mut tabs = Vec::new();
         let mut active_tab = 0;
@@ -279,7 +279,7 @@ impl Editor {
             }
             tabs.push(SessionTab { layout });
         }
-        let docks = self.export_docks(relative_splits, relative_docks);
+        let docks = self.export_docks();
         if tabs.is_empty() && docks.is_empty() {
             return None;
         }
@@ -293,8 +293,10 @@ impl Editor {
     /// Capture every open edge dock: its side, size (cells, plus a `size_pct` percentage
     /// when `relative_docks`), hidden state, and any file-backed content. A plugin-owned
     /// dock (unnamed buffer) records `layout = None` and reopens empty at the geometry.
-    fn export_docks(&self, relative_splits: bool, relative_docks: bool) -> Vec<SessionDock> {
+    fn export_docks(&self) -> Vec<SessionDock> {
         use super::{DockSide, Layer};
+        let relative_splits = self.options.relative_splits;
+        let relative_docks = self.options.relative_docks;
         let mut docks = Vec::new();
         for side in DockSide::ALL {
             if !self.dock_exists(side) {

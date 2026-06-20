@@ -1839,6 +1839,8 @@ impl EditHost {
             grepformat: go.grepformat.clone(),
             qfdock: go.qfdock,
             bdclosetab: go.bdclosetab,
+            relative_splits: go.relative_splits,
+            relative_docks: go.relative_docks,
         });
         // The register file, mirrored so `vim.fn.getreg` / `getregtype` read the
         // core's current registers (stored cells + the read-only specials). Small

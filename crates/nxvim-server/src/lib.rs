@@ -1729,10 +1729,7 @@ impl EditHost {
         // Capture the layout only for a namespaced launch whose plugin opted in via
         // `nx.shada.save_layout(true)` — default off, so a plain session never does.
         if self.workspace_session && self.lua.session_save_layout() {
-            snap.session = self.editor.export_session(
-                self.lua.session_relative_splits(),
-                self.lua.session_relative_docks(),
-            );
+            snap.session = self.editor.export_session();
         }
         if let Some(store) = self.shada.as_mut() {
             // A live checkpoint never compacts: deleting an absorbed sibling while we
@@ -1751,10 +1748,7 @@ impl EditHost {
     pub(crate) fn shada_flush_final(&mut self) {
         let mut snap = self.editor.export_persist();
         if self.workspace_session && self.lua.session_save_layout() {
-            snap.session = self.editor.export_session(
-                self.lua.session_relative_splits(),
-                self.lua.session_relative_docks(),
-            );
+            snap.session = self.editor.export_session();
         }
         if let Some(store) = self.shada.as_mut() {
             // The clean exit: compact (delete the siblings absorbed at load) *after*

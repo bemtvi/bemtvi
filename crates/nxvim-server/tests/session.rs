@@ -204,3 +204,38 @@ async fn session_restores_open_docks() {
         );
     }
 }
+
+#[tokio::test]
+async fn relative_docks_native_option_scales_the_dock() {
+    // `relative_docks` is a NATIVE editor option (`nx.o.relative_docks`), not a plugin
+    // setting: any wrapper that opts a session into capture honors it. With it on, a
+    // dock's size is stored as a % of the screen and re-derived against the screen the
+    // restore runs at (the editor's default 80 cols, before the UI attaches) — so a dock
+    // captured wide comes back proportionally smaller, not at its old cell count.
+    let dir = temp_dir("session_reldock_store");
+    let file_a = write_temp("session_reldock_a", "txt", "a1\na2\n");
+
+    // Session 1 at width 160: opt in, flip the native option on via `nx.o`, open an
+    // 80-col left dock (= 50% of 160). Quit so the exit flush captures it as 50%.
+    {
+        let (rpc, incoming) = start_attached(init(&dir, Some(file_a.clone()), true), 160, 25).await;
+        exec_lua(&rpc, "nx.shada.save_layout(true)").await;
+        exec_lua(&rpc, "nx.o.relative_docks = true").await;
+        exec_lua(&rpc, "nx.dock.open{ side = 'left', size = 80 }").await;
+        feed(&rpc, "<Esc>"); // settle a tick so the dock op drains + relayout runs
+        feed(&rpc, ":qa<CR>");
+        await_server_exit(incoming).await;
+    }
+
+    // Session 2 at width 160: restore re-derives 50% of the editor's 80-col default = 40
+    // cells, so the main window is 160 - 40 - 1 = ~119. Absolute cells would restore the
+    // captured 80, leaving ~79; a main width over 100 proves the dock scaled with the %.
+    {
+        let (rpc, _incoming) = start_attached(init(&dir, None, true), 160, 25).await;
+        let w = main_win_width(&rpc).await;
+        assert!(
+            w > 100,
+            "the restored dock used its captured % (main width {w}; absolute cells would be ~79)"
+        );
+    }
+}

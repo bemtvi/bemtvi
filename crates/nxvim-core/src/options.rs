@@ -169,6 +169,19 @@ pub struct Options {
     /// never closed. With it unset, `:bd` behaves the classic way. Honored by
     /// [`crate::editor::buffers`].
     pub bdclosetab: bool,
+    /// Whether a saved session stores split sizes as proportional PERCENTAGES rather
+    /// than absolute cells (`'relative_splits'`; nxvim-native, default `true`). A
+    /// 30/70 vsplit then restores 30/70 at any terminal width. Read at session
+    /// capture by [`crate::editor::persist`] — a property of the native session
+    /// persistence, not any one plugin (any wrapper that opts into capture via
+    /// `nx.shada.save_layout` honors it).
+    pub relative_splits: bool,
+    /// Whether a saved session stores a dock's size as a PERCENTAGE of the screen
+    /// rather than absolute cells (`'relative_docks'`; nxvim-native, default
+    /// `false`, so docks keep their cell size across terminal resizes). Read at
+    /// session capture by [`crate::editor::persist`]; the native counterpart of
+    /// [`Options::relative_splits`] for edge docks.
+    pub relative_docks: bool,
 }
 
 /// The default `'errorformat'` — vim's compiled-in non-Windows `DFLT_EFM`
@@ -242,6 +255,10 @@ impl Default for Options {
             qfdock: true,
             // The nxvim way: `:bd` of a tab's last buffer closes the tab.
             bdclosetab: true,
+            // A saved session scales splits with the terminal (proportional), but
+            // keeps docks at their cell size unless asked otherwise.
+            relative_splits: true,
+            relative_docks: false,
         }
     }
 }
@@ -1275,6 +1292,20 @@ static OPTIONS: &[OptionInfo] = {
             kind: Bool,
             scope: Global,
             doc: "Closing a tab's last buffer with :bd closes the tab (nxvim).",
+        },
+        OptionInfo {
+            name: "relative_splits",
+            abbrev: None,
+            kind: Bool,
+            scope: Global,
+            doc: "Save session split sizes as proportional % (scale with the terminal).",
+        },
+        OptionInfo {
+            name: "relative_docks",
+            abbrev: None,
+            kind: Bool,
+            scope: Global,
+            doc: "Save session dock sizes as % of the screen (vs absolute cells).",
         },
     ]
 };

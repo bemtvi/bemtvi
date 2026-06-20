@@ -327,10 +327,17 @@ async fn maparg_and_get_keymap_read_back_registered_maps() {
         .await,
         Value::Boolean(true)
     );
-    // nvim_get_keymap lists the global normal-mode maps (the two set above).
+    // nvim_get_keymap lists the global normal-mode maps — including the two set
+    // above (alongside any shipped default maps, e.g. the `<leader>f*` pickers).
     assert_eq!(
-        exec_lua(&rpc, "return #vim.api.nvim_get_keymap('n')").await,
-        Value::from(2u64)
+        exec_lua(
+            &rpc,
+            "local seen = {}\n\
+             for _, m in ipairs(vim.api.nvim_get_keymap('n')) do seen[m.lhs] = true end\n\
+             return seen['gh'] and seen['<F5>'] or false"
+        )
+        .await,
+        Value::Boolean(true)
     );
 }
 
@@ -343,10 +350,18 @@ async fn buf_get_keymap_separates_buffer_local_from_global() {
     "#;
     let (rpc, _incoming) = start_with_config(&dir, init).await;
 
-    // The global reader sees only the global map; the buffer reader only the local.
+    // The global reader sees the global map but not the buffer-local one; the
+    // buffer reader sees only the local. (Shipped default maps, e.g. `<leader>f*`,
+    // are global too, so assert separation by lhs rather than a global total.)
     assert_eq!(
-        exec_lua(&rpc, "return #vim.api.nvim_get_keymap('n')").await,
-        Value::from(1u64)
+        exec_lua(
+            &rpc,
+            "local seen = {}\n\
+             for _, m in ipairs(vim.api.nvim_get_keymap('n')) do seen[m.lhs] = true end\n\
+             return seen['gh'] and not seen['gl'] or false"
+        )
+        .await,
+        Value::Boolean(true)
     );
     assert_eq!(
         exec_lua(&rpc, "return #vim.api.nvim_buf_get_keymap(0, 'n')").await,

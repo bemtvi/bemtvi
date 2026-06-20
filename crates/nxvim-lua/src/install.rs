@@ -1161,6 +1161,15 @@ pub(crate) fn install_runtime_api(
             },
         )?,
     )?;
+    // `nx._buf_search(lines, pattern, opts)` — native buffer text search over the
+    // mirror lines (no `shared` ops; a pure read). The Lua wrapper `nx.buf.search`
+    // passes the mirror's line array; see crate::search.
+    nx.set(
+        "_buf_search",
+        lua.create_function(move |lua, (lines, pattern, opts): (Table, String, Table)| {
+            crate::search::buf_search(lua, lines, pattern, opts)
+        })?,
+    )?;
     let sh = shared.clone();
     nx.set(
         "_extmark_del",

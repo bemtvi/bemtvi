@@ -2799,6 +2799,7 @@ dependencies = [
  "mlua",
  "nxvim-regex",
  "nxvim-ts",
+ "regex",
  "rmpv",
  "serde",
  "serde_json",

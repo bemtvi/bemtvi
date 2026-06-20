@@ -371,6 +371,32 @@ function nx.buf.lines(bufnr, start, end_, strict)
   return out
 end
 
+-- nx.buf.search(bufnr, pattern, opts) -> match | nil: find `pattern` in `bufnr`
+-- (0/nil = current) over the buffer mirror, line by line. The native counterpart to
+-- scanning lines in Lua — it runs the match in Rust (the `regex` crate or the vim
+-- engine) so a plugin can jump straight to a section (a conflict marker, a heading).
+--
+-- opts (all optional):
+--   plain      = false           -- literal substring (ignores `engine`)
+--   engine     = "pcre" | "vim"  -- regex dialect (default "pcre")
+--   from       = { line=1, col=0 } -- start position: 1-based line, 0-based byte col
+--   backward   = false           -- search upward from `from` instead of down
+--   ignorecase = false           -- case-insensitive match
+--
+-- Returns nil when there is no match, else:
+--   { line, col, end_line, end_col, text, captures }
+-- with `line`/`end_line` 1-based, `col`/`end_col` 0-based byte offsets (end
+-- exclusive), `text` the matched substring, and `captures` the submatch strings
+-- (`\1`.., "" for a group that didn't participate). Matching is line-by-line, so a
+-- multi-line (`\n`-spanning) pattern is not supported.
+function nx.buf.search(bufnr, pattern, opts)
+  local buf = nx._bufs[nx._resolve_bufnr(bufnr)]
+  if not buf or not buf.lines then
+    return nil
+  end
+  return nx._buf_search(buf.lines, pattern, opts or {})
+end
+
 -- ===== Extmarks layer ==================================================
 -- See docs/specs/2026-06-07-extmark-decoration-layer-design.md. v1 carries the
 -- highlight-relevant attrs only; virtual text / signs / conceal are not modelled

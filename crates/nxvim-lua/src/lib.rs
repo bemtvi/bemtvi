@@ -30,6 +30,7 @@ mod install;
 mod luafs;
 mod ops;
 mod runtime;
+mod search;
 mod vimregex;
 
 pub use fswire::{fs_job_from_value, fs_job_to_value, fs_result_from_value, fs_result_to_value};

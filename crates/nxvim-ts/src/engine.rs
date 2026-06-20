@@ -16,7 +16,7 @@ use ropey::{LineType, Rope};
 use streaming_iterator::StreamingIterator;
 use tree_sitter::{InputEdit, Node, ParseOptions, Parser, Point, Query, QueryCursor, Tree};
 
-use crate::loader::{query_path, Grammar, LoadError, QueryOverrides};
+use crate::loader::{compile_query, query_path, Grammar, LoadError, QueryOverrides};
 
 const LINE_TYPE: LineType = LineType::LF_CR;
 
@@ -306,13 +306,13 @@ impl Engine {
         match name {
             "highlights" => {
                 let s = src.ok_or_else(|| format!("no highlights query on disk for '{lang}'"))?;
-                g.query = Query::new(&g.language, &s)
+                g.query = compile_query(&g.language, &s)
                     .map_err(|e| format!("compiling {lang} highlights: {e}"))?;
             }
             "indents" => {
                 g.indents = match src {
                     Some(s) => Some(
-                        Query::new(&g.language, &s)
+                        compile_query(&g.language, &s)
                             .map_err(|e| format!("compiling {lang} indents: {e}"))?,
                     ),
                     None => None,
@@ -321,7 +321,7 @@ impl Engine {
             "injections" => {
                 g.injections = match src {
                     Some(s) => Some(
-                        Query::new(&g.language, &s)
+                        compile_query(&g.language, &s)
                             .map_err(|e| format!("compiling {lang} injections: {e}"))?,
                     ),
                     None => None,

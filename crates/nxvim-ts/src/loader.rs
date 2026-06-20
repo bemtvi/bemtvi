@@ -10,6 +10,7 @@
 //! <data>/queries/<lang>/indents.scm      # optional — treesitter indentation
 //! ```
 
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
@@ -104,7 +105,7 @@ impl Grammar {
                     .map_err(LoadError::Failed)?
             }
         };
-        let query = Query::new(&language, &hl_src)
+        let query = compile_query(&language, &hl_src)
             .with_context(|| format!("compiling {lang} highlights"))
             .map_err(LoadError::Failed)?;
 
@@ -155,7 +156,7 @@ fn load_optional_query(
     };
     match src {
         Some(s) => Ok(Some(
-            Query::new(language, &s)
+            compile_query(language, &s)
                 .with_context(|| format!("compiling {lang} {name}"))
                 .map_err(LoadError::Failed)?,
         )),
@@ -252,4 +253,144 @@ fn parser_path(data_dir: &Path, lang: &str) -> Option<PathBuf> {
 
 pub(crate) fn query_path(data_dir: &Path, lang: &str, file: &str) -> PathBuf {
     data_dir.join("queries").join(lang).join(file)
+}
+
+/// Compile a query, first making its source palatable to our tree-sitter binding.
+/// The one entry point for turning `.scm` text into a [`Query`] — every loader and
+/// the engine's recompile path route through here so the neovim-compatibility
+/// rewrite below is applied uniformly.
+pub(crate) fn compile_query(
+    language: &Language,
+    src: &str,
+) -> Result<Query, tree_sitter::QueryError> {
+    Query::new(language, &sanitize_set_directives(src))
+}
+
+/// Rewrite neovim `#set!` directives whose *value* is a capture so our tree-sitter
+/// binding accepts them.
+///
+/// neovim's query runtime lets a `#set!` directive's value be a capture — e.g.
+/// vimdoc's `(#set! @string.special.url url @string.special.url)`, which tags the
+/// matched URL's own text as clickable-link metadata. The tree-sitter Rust crate's
+/// stricter `#set!` parser allows at most *one* capture per directive (the target)
+/// and rejects any further one with "Unexpected second capture name", failing the
+/// whole query. nxvim consumes the upstream nvim-treesitter queries verbatim, so it
+/// must tolerate this form rather than refuse to highlight the language.
+///
+/// We quote every capture after the first within each `#set!` directive, turning
+/// `(#set! @cap key @cap)` into `(#set! @cap key "@cap")`. The result is a valid
+/// one-capture directive carrying the same key; the (string) value is harmless,
+/// since nxvim's `#set!` consumers only read the `indent.*` / `injection.*` keys and
+/// never the URL-metadata value. Comments and string literals are skipped so a `@`
+/// or `#set!` inside them is left untouched. The common no-`#set!` source returns
+/// borrowed and unchanged.
+fn sanitize_set_directives(src: &str) -> Cow<'_, str> {
+    if !src.contains("#set!") {
+        return Cow::Borrowed(src);
+    }
+
+    let bytes = src.as_bytes();
+    // One frame per open `(`: whether it is a `#set!` directive, and how many
+    // captures have appeared directly inside it so far.
+    struct Frame {
+        is_set: bool,
+        captures: u32,
+    }
+    let mut stack: Vec<Frame> = Vec::new();
+    // Byte offsets where a `"` must be inserted to quote a surplus capture.
+    let mut inserts: Vec<usize> = Vec::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b';' => {
+                // Line comment: skip to end of line.
+                while i < bytes.len() && bytes[i] != b'\n' {
+                    i += 1;
+                }
+            }
+            b'"' => {
+                // String literal: skip to the closing quote, honouring `\` escapes.
+                i += 1;
+                while i < bytes.len() {
+                    let c = bytes[i];
+                    i += 1;
+                    if c == b'\\' {
+                        i += 1;
+                    } else if c == b'"' {
+                        break;
+                    }
+                }
+            }
+            b'(' => {
+                stack.push(Frame {
+                    is_set: false,
+                    captures: 0,
+                });
+                i += 1;
+            }
+            b')' => {
+                stack.pop();
+                i += 1;
+            }
+            b'#' => {
+                // A predicate/directive name; tag the enclosing frame if it's `#set!`.
+                let start = i;
+                i += 1;
+                while i < bytes.len() && is_predicate_name_byte(bytes[i]) {
+                    i += 1;
+                }
+                if &bytes[start..i] == b"#set!" {
+                    if let Some(top) = stack.last_mut() {
+                        top.is_set = true;
+                    }
+                }
+            }
+            b'@' => {
+                // A capture. Inside a `#set!` directive, the first is the target and
+                // is kept; quote any after it so only one capture survives.
+                let start = i;
+                i += 1;
+                while i < bytes.len() && is_capture_name_byte(bytes[i]) {
+                    i += 1;
+                }
+                if let Some(top) = stack.last_mut() {
+                    if top.is_set {
+                        top.captures += 1;
+                        if top.captures > 1 {
+                            inserts.push(start);
+                            inserts.push(i);
+                        }
+                    }
+                }
+            }
+            _ => i += 1,
+        }
+    }
+
+    if inserts.is_empty() {
+        return Cow::Borrowed(src);
+    }
+
+    // Splice a `"` at each recorded offset (already in ascending order).
+    let mut out = String::with_capacity(src.len() + inserts.len());
+    let mut prev = 0;
+    for at in inserts {
+        out.push_str(&src[prev..at]);
+        out.push('"');
+        prev = at;
+    }
+    out.push_str(&src[prev..]);
+    Cow::Owned(out)
+}
+
+/// Bytes that may appear in a predicate/directive name after the leading `#`
+/// (`set!`, `any-of?`, `eq?`, …): letters, digits, `-`, `_`, `?`, `!`.
+fn is_predicate_name_byte(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'?' | b'!')
+}
+
+/// Bytes that may appear in a capture name after the leading `@`
+/// (`string.special.url`, `_variable`, …): letters, digits, `.`, `_`, `-`.
+fn is_capture_name_byte(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-')
 }

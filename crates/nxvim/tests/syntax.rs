@@ -857,6 +857,69 @@ async fn a_broken_grammar_echoes_a_load_failure() {
     );
 }
 
+/// A neovim `#set!` directive whose *value* is a capture — e.g. vimdoc's
+/// `((url) @string.special.url (#set! @string.special.url url @string.special.url))`,
+/// which neovim uses to tag clickable-URL metadata — is valid neovim query syntax,
+/// but the tree-sitter Rust crate's predicate parser rejects a *second* capture in a
+/// `#set!` ("Unexpected second capture name"). nxvim sanitizes such directives so the
+/// grammar still compiles and highlights, instead of the whole query failing to load.
+/// Regression guard for the vimdoc `:setf vimdoc` "failed to load" report.
+#[tokio::test]
+async fn a_set_directive_with_a_capture_value_still_loads() {
+    let _guard = test_lock().lock().await;
+    fixture_data_dir(); // builds the shared rust grammar we reuse below
+    let saved = std::env::var_os("NXVIM_DATA_DIR");
+
+    // A fresh data dir carrying the (already-compiled) rust parser plus a highlights
+    // query whose only pattern uses the neovim capture-as-value `#set!` form — the
+    // exact shape that broke vimdoc.
+    let dir = std::env::temp_dir().join(format!("nxvim-ts-seturl-{}", std::process::id()));
+    std::fs::create_dir_all(dir.join("parser")).unwrap();
+    std::fs::copy(
+        fixture_data_dir().join("parser").join("rust.so"),
+        dir.join("parser").join("rust.so"),
+    )
+    .unwrap();
+    write_query(
+        &dir,
+        "rust",
+        "highlights",
+        "((identifier) @string.special.url\n  (#set! @string.special.url url @string.special.url))\n",
+    );
+    std::env::set_var("NXVIM_DATA_DIR", &dir);
+
+    let file = temp_rs("seturl", "fn main() {\n    let x = 42;\n}\n");
+    let (rpc, mut incoming) = start(Some(file)).await;
+
+    // The query must compile despite the capture-valued `#set!`: the `main`
+    // identifier on row 0 gets the `string.special.url` capture group. Before the
+    // fix the grammar fails to load and no row is ever highlighted, so this times out.
+    let hl = wait_for_highlights(&rpc, &mut incoming, |hl| {
+        hl.first()
+            .is_some_and(|row| row.iter().any(|(_, _, g)| g == "string.special.url"))
+    })
+    .await;
+
+    // And no load-failure was echoed.
+    let params = drain_latest_redraw(&mut incoming).unwrap_or_default();
+    let msg = message_of(&params);
+
+    // Restore the data dir for the sibling tests (they expect the rust fixture).
+    match saved {
+        Some(v) => std::env::set_var("NXVIM_DATA_DIR", v),
+        None => std::env::remove_var("NXVIM_DATA_DIR"),
+    }
+
+    assert!(
+        hl[0].iter().any(|(_, _, g)| g == "string.special.url"),
+        "the capture from a capture-valued `#set!` pattern should still paint"
+    );
+    assert!(
+        !msg.contains("failed to load"),
+        "a capture-valued `#set!` must not fail the query load: {msg:?}"
+    );
+}
+
 #[tokio::test]
 async fn a_missing_grammar_is_silent() {
     // The common case: no parser installed for the language. Highlighting is

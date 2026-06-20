@@ -1582,6 +1582,13 @@ impl Editor {
         self.buffers.map.remove(&target);
         self.panel_buffers.retain(|(_, b)| *b != target);
         self.doc_float_buffers.retain(|(_, b)| *b != target);
+        // Drop any `nx.view` backed by this buffer. A user `:bd` on a view buffer
+        // (e.g. a hidden help/tree view) would otherwise strand the view entry with a
+        // freed `BufferId`: `view_buffer` would still return it and `set_view_lines`
+        // would panic in `get_mut`. The mirror then clears too, so the plugin's
+        // `view:bufnr()` reads nil and it can recreate. (`destroy_view` removes the
+        // entry before calling here, so its own deletes aren't double-handled.)
+        self.views.retain(|_, v| v.buf != target);
         self.syntax_close(target);
         if self.alternate == Some(target) {
             self.alternate = None;

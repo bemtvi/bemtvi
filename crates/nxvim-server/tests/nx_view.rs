@@ -846,3 +846,29 @@ async fn view_unmount_then_remount_keeps_content() {
         "the content survived the unmount/remount"
     );
 }
+
+/// Deleting a view's backing buffer (`:bd`) must clean up the view, not leave it
+/// orphaned: a later `:set_lines` on the stale handle must be a safe no-op, and the
+/// `bufnr` mirror must clear — regression test for a panic where `set_view_lines`
+/// looked up the freed buffer id and hit `get_mut`'s `.expect`.
+#[tokio::test]
+async fn deleting_a_views_buffer_cleans_it_up_without_panicking() {
+    let (rpc, mut _incoming) = start().await;
+    exec_lua(
+        &rpc,
+        r#"vw = nx.view.create{}
+           vw:set_lines{ "one", "two" }
+           vw:mount{ split = "split" }"#,
+    )
+    .await;
+    // Delete the view's backing buffer out from under the handle (the user `:bd`).
+    feed_sync(&rpc, ":bd!<CR>").await;
+    // Writing to the now-orphaned handle must be a safe no-op, not a panic.
+    exec_lua(&rpc, r#"vw:set_lines{ "three", "four" }"#).await;
+    // The view is cleaned up: its bufnr mirror is cleared.
+    let bufnr = exec_lua(&rpc, r#"return vw:bufnr()"#).await;
+    assert!(
+        bufnr.is_nil(),
+        "view bufnr should be nil after its buffer is deleted, got {bufnr:?}"
+    );
+}

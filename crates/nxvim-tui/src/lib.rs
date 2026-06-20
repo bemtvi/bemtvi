@@ -54,16 +54,6 @@ use render::render;
 /// reserved here; the height the client reports is the windows-area height.
 const CHROME_ROWS: u16 = 1;
 
-/// How long the client waits after a keystroke, with no further input, before
-/// sending the server a synthetic `nxvim_input_flush` — vim's `timeoutlen`
-/// (default 1000ms). The server has no input timer (it processes `nx_input`
-/// batches synchronously), so a trailing key that is a *live prefix* of a mapping
-/// stays withheld in the matcher until something flushes it. This idle flush is
-/// that something: it lets an ambiguous shorter map (`j` with `jk` mapped) or a
-/// replayed prefix (the second `g` of `gg` with `gh` mapped) resolve without the
-/// user pressing another key — the timer-less divergence's blessed fix (design D4).
-const TIMEOUT_LEN: Duration = Duration::from_millis(1000);
-
 /// How often a held-at-the-edge mouse drag re-sends itself to keep the buffer
 /// auto-scrolling (≈25 lines/sec). The terminal only reports a drag on pointer
 /// motion, so without this repeat a selection dragged to the edge and held still
@@ -420,10 +410,13 @@ where
                 terminal.draw(|frame| render(frame, &view, anim.as_ref(), 0, Some(&mut image_store)))?;
             },
             // `timeoutlen` idle flush: a keystroke armed the timer and nothing
-            // followed within `TIMEOUT_LEN`, so nudge the server to resolve any key
+            // followed within `'timeoutlen'`, so nudge the server to resolve any key
             // it withheld as a live prefix (design D4). Harmless when nothing is
-            // pending. Disarmed so it fires at most once per idle gap.
-            _ = sleep(TIMEOUT_LEN), if flush_armed => {
+            // pending. Disarmed so it fires at most once per idle gap. The duration
+            // and the whole arm come from the relayed `'timeout'`/`'timeoutlen'`:
+            // under `notimeout` the branch is disabled, so a withheld mapped prefix
+            // waits forever (a which-key popup stays up) instead of being flushed.
+            _ = sleep(Duration::from_millis(view.timeoutlen)), if flush_armed && view.timeout => {
                 rpc.notify("nxvim_input_flush", vec![]);
                 flush_armed = false;
             },

@@ -576,6 +576,59 @@ async fn idle_flush_completes_a_withheld_prefix() {
     );
 }
 
+/// Under `:set notimeout`, the idle flush is a **no-op**: an ambiguous mapped
+/// prefix is held *forever* for the next key, never resolved by an idle timeout.
+/// This is what keeps a which-key popup up indefinitely after `<leader>`. Same
+/// setup as `idle_flush_completes_a_withheld_prefix`, but with `notimeout` the
+/// withheld `gg` stays pending across a flush (the server drops the flush), so
+/// go-to-top does *not* fire — until a real key arrives.
+#[tokio::test]
+async fn notimeout_holds_a_withheld_prefix_across_the_flush() {
+    let dir = temp_dir("keymap_notimeout");
+    let (rpc, mut incoming) = start_with_config(
+        &dir,
+        "vim.o.timeout = false\n\
+         vim.keymap.set('n', 'ggh', function() print('GGH') end)\n",
+    )
+    .await;
+
+    feed(&rpc, "iline1<CR>line2<CR>line3<Esc>");
+    assert_eq!(cursor(&rpc).await.0, 3, "cursor starts on the last line");
+
+    // `gg` is withheld as a live prefix of `ggh`.
+    feed(&rpc, "gg");
+    assert_eq!(
+        cursor(&rpc).await.0,
+        3,
+        "gg is withheld, go-to-top not fired"
+    );
+
+    // The idle flush must NOT resolve it under notimeout — the prefix waits forever.
+    flush(&rpc).await;
+    assert_eq!(
+        cursor(&rpc).await.0,
+        3,
+        "notimeout: the flush left gg pending; go-to-top still hasn't fired"
+    );
+
+    // A real key still disambiguates: `h` completes the `ggh` map and fires its RHS
+    // (prints GGH). The `gg` was consumed by the match (not replayed as go-to-top),
+    // so the cursor stays put and the buffer is untouched — proving the prefix was
+    // genuinely held across the flush, not silently dropped.
+    let redraw = redraw_after(&rpc, &mut incoming, "h").await;
+    assert_eq!(message(&redraw), "GGH", "the next key completed ggh");
+    assert_eq!(
+        cursor(&rpc).await.0,
+        3,
+        "ggh matched; gg never ran as a motion"
+    );
+    assert_eq!(
+        lines(&rpc).await,
+        vec!["line1", "line2", "line3"],
+        "the held prefix was a mapping match, not raw edits"
+    );
+}
+
 /// An ambiguous map (`j` is both a complete map *and* a prefix of `jk`) is held
 /// rather than fired on the keystroke, since a following `k` would take the longer
 /// map. The idle flush resolves the ambiguity in favor of the **shorter** map —

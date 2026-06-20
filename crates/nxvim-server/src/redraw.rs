@@ -94,6 +94,12 @@ impl EditHost {
         // The `'guifont'` value, relayed verbatim for a GUI client to parse and
         // apply; empty (the default) leaves the client on its own font.
         let guifont = self.editor.global_options().guifont;
+        // The `'timeout'` / `'timeoutlen'` mapping-timeout config, relayed so each
+        // client runs its own idle-flush timer to match: skip arming when `timeout`
+        // is off (`notimeout` → a withheld mapped prefix waits forever, which is how
+        // a which-key popup stays up), else fire the flush after `timeoutlen` ms.
+        let timeout = self.editor.timeout_enabled();
+        let timeoutlen = self.editor.timeoutlen_ms();
 
         // A `%{}`/`%!` statusline *or* tabline expression evaluates Lua that reads
         // live editor state through the `vim.fn.*` surface (mode/cursor/buffer/
@@ -256,6 +262,8 @@ impl EditHost {
             (Value::from("message"), Value::from(message.as_str())),
             (Value::from("message_error"), Value::from(message_error)),
             (Value::from("guifont"), Value::from(guifont.as_str())),
+            (Value::from("timeout"), Value::from(timeout)),
+            (Value::from("timeoutlen"), Value::from(timeoutlen)),
             // The current buffer's identity + edit version, so the browser Worker ships
             // the full buffer text to its JS highlighter only when the text actually
             // changed (not on cursor-only / terminal-driven redraws). `(bufnr,

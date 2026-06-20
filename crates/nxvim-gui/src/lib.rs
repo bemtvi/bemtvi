@@ -71,13 +71,6 @@ use winit::window::{CursorIcon, Window, WindowId};
 
 use render::{Renderer, ScrollFrame};
 
-/// How long the client waits after a keystroke, with no further input, before
-/// sending the server a synthetic `nxvim_input_flush` — vim's `timeoutlen`
-/// (default 1000ms). The server has no input timer, so a trailing key that is a
-/// live *prefix* of a mapping stays withheld in the matcher until something
-/// flushes it; this idle nudge is that something (mirrors the TUI's `TIMEOUT_LEN`).
-const TIMEOUT_LEN: Duration = Duration::from_millis(1000);
-
 /// How often a held-at-the-edge mouse drag re-sends itself to keep the buffer
 /// auto-scrolling (≈25 lines/sec). winit only re-reports a drag (a `CursorMoved`
 /// while the button is held) on pointer motion, so without this repeat a
@@ -774,6 +767,17 @@ impl App {
         Some(r.cell_at(self.cursor_px.0, self.cursor_px.1))
     }
 
+    /// Arm the `timeoutlen` idle flush from the relayed `'timeout'`/`'timeoutlen'`:
+    /// schedule a flush `timeoutlen` ms out, or disarm entirely under `notimeout`
+    /// (the which-key "wait forever" behavior). Called after every keystroke / paste,
+    /// so it always measures idle-since-the-last-key with the current config.
+    fn arm_flush_deadline(&mut self) {
+        self.flush_deadline = self
+            .view
+            .timeout
+            .then(|| Instant::now() + Duration::from_millis(self.view.timeoutlen));
+    }
+
     /// Fire one `nx_input_mouse(button, action, modifier, grid=0, row, col)` —
     /// a mouse gesture at a global screen cell. The server owns the hit-test back
     /// to a window + buffer position; `grid` is always 0 (nxvim is single-grid).
@@ -1215,7 +1219,7 @@ impl ApplicationHandler<UserEvent> for App {
                 // gesture's base key isn't also typed.
                 if input::is_paste(&event.logical_key, self.mods) {
                     self.paste_clipboard();
-                    self.flush_deadline = Some(Instant::now() + TIMEOUT_LEN);
+                    self.arm_flush_deadline();
                     return;
                 }
                 // `<CR>` over a dialog-triggering `:` command line pops a native
@@ -1283,7 +1287,7 @@ impl ApplicationHandler<UserEvent> for App {
                         .notify("nx_input", vec![Value::from(notation.as_str())]);
                     // Arm the `timeoutlen` flush; the next key re-arms it, so it
                     // measures idle-since-last-key (see `about_to_wait`).
-                    self.flush_deadline = Some(Instant::now() + TIMEOUT_LEN);
+                    self.arm_flush_deadline();
                 }
             }
             WindowEvent::RedrawRequested => {

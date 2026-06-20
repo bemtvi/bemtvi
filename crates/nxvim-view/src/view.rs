@@ -396,6 +396,17 @@ pub struct View {
     /// from the server. A GUI client parses it for the font family and `:h` size;
     /// empty means the client's own default. Frontend-agnostic — the TUI ignores it.
     pub guifont: String,
+    /// `'timeout'` — whether an ambiguous mapped prefix resolves on idle (the
+    /// client arms its `timeoutlen` flush timer) or waits forever for the next key
+    /// (`notimeout` → the client never arms it, so a which-key popup stays up).
+    /// Relayed each frame; an older server that omits it falls back to `true`
+    /// (vim's default). The struct's own `Default` is `false` — a safe pre-redraw
+    /// state (no flush armed until the first frame carries the real value).
+    pub timeout: bool,
+    /// `'timeoutlen'` — how long (ms) the client waits after the last key before
+    /// firing the idle flush, when [`View::timeout`] is on. Relayed each frame; an
+    /// omitted field falls back to `1000` (vim's default).
+    pub timeoutlen: u64,
     /// The per-frame style palette the server resolved from the active
     /// colorscheme; per-window `highlights`/chrome ids index into it. Global.
     pub styles: Vec<Style>,
@@ -648,6 +659,15 @@ impl View {
         self.message = map_str(map, "message");
         self.message_error = map_get(map, "message_error").and_then(Value::as_bool) == Some(true);
         self.guifont = map_str(map, "guifont");
+        // The mapping-timeout config drives the client's idle-flush timer (below).
+        // An older server omits these — fall back to vim's defaults (timeout on,
+        // 1000ms) so the flush still fires; `notimeout` (false) disarms it entirely.
+        self.timeout = map_get(map, "timeout")
+            .and_then(Value::as_bool)
+            .unwrap_or(true);
+        self.timeoutlen = map_get(map, "timeoutlen")
+            .and_then(Value::as_u64)
+            .unwrap_or(1000);
         // The style palette must land before windows (their scroll bands snapshot
         // it) and chrome (which indexes into it).
         self.styles = parse_styles(map_get(map, "styles"));

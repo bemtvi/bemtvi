@@ -771,6 +771,15 @@ pub struct EditHost {
     /// `due_ms` is computed relative to it at arm time. Wasm build only.
     #[cfg(not(feature = "native"))]
     clock_ms: u64,
+    /// When the `timeoutlen` idle flush is due (ms on the JS clock), or `None` when
+    /// nothing is withheld / `'notimeout'` is set. Armed by [`EditHost::feed`] after
+    /// a keystroke leaves an ambiguous mapped prefix; folded into
+    /// [`next_timer_deadline`](EditHost::next_timer_deadline) so the Worker's one
+    /// `Atomics.wait` also wakes to resolve it, and consumed by
+    /// [`fire_due_timers`](EditHost::fire_due_timers) — the wasm analogue of the
+    /// native clients' idle-flush timer. Wasm build only.
+    #[cfg(not(feature = "native"))]
+    flush_due_ms: Option<u64>,
     /// Names of treesitter grammars the browser host has available — the offline set
     /// bundled in `web/vendor/` plus any fetched via `:TSInstall` into OPFS. Seeded at
     /// boot ([`EditHost::seed_ts_installed`]) and extended on each completed install
@@ -877,6 +886,8 @@ impl EditHost {
             #[cfg(not(feature = "native"))]
             clock_ms: 0,
             #[cfg(not(feature = "native"))]
+            flush_due_ms: None,
+            #[cfg(not(feature = "native"))]
             ts_installed: std::collections::BTreeSet::new(),
         }
     }
@@ -962,6 +973,17 @@ impl EditHost {
     /// one turn of the native [`run`] loop's input arm.
     pub fn feed(&mut self, keys: &str) {
         self.input(keys);
+        // Arm the `timeoutlen` idle flush, the wasm analogue of the native clients'
+        // flush timer: when this keystroke left an ambiguous mapped prefix withheld
+        // and `'timeout'` is on, schedule a flush `timeoutlen` ms out so the Worker's
+        // next `Atomics.wait` (parked on `next_timer_deadline`) wakes to resolve it.
+        // The next key re-runs `feed`, re-arming or clearing it; `'notimeout'` leaves
+        // it `None` so the prefix waits forever (a which-key popup stays up).
+        self.flush_due_ms = if !self.keymaps.pending_empty() && self.editor.timeout_enabled() {
+            Some(self.clock_ms.saturating_add(self.editor.timeoutlen_ms()))
+        } else {
+            None
+        };
         self.redraw();
     }
 
@@ -1080,7 +1102,13 @@ impl EditHost {
     /// wait that wakes on a keystroke also wakes to fire the next timer (slice 5d's "one
     /// mechanism" — no busy loop, no separate timer thread).
     pub fn next_timer_deadline(&self) -> Option<u64> {
-        self.wasm_timers.iter().map(|t| t.due_ms).min()
+        // The `timeoutlen` idle flush rides the same wheel, so the one wait that wakes
+        // for a `vim.defer_fn` also wakes to resolve a withheld mapped prefix.
+        self.wasm_timers
+            .iter()
+            .map(|t| t.due_ms)
+            .chain(self.flush_due_ms)
+            .min()
     }
 
     /// Fire every timer due at `now_ms` (the Worker calls this on a wake), running each
@@ -1123,6 +1151,14 @@ impl EditHost {
                     .echo(format!("E5108: Error in timer callback: {e}"));
             }
             self.apply_lua_effects();
+            fired_any = true;
+        }
+        // The `timeoutlen` idle flush, fired off the same wheel: if its deadline has
+        // passed, resolve the withheld mapped prefix (`input_flush` is itself a no-op
+        // under `'notimeout'`, but it's never armed then). Disarm so it fires once.
+        if self.flush_due_ms.is_some_and(|due| due <= now_ms) {
+            self.flush_due_ms = None;
+            self.input_flush();
             fired_any = true;
         }
         if fired_any {

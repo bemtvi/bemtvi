@@ -5,7 +5,7 @@
 use nxvim_rpc::{Incoming, Rpc};
 use nxvim_server::ServerInit;
 use nxvim_test_harness::{
-    command, drain_to_latest_redraw, exec_lua, field_str, message, start_attached,
+    command, drain_to_latest_redraw, exec_lua, field, field_str, message, start_attached, u64_at,
 };
 use tokio::sync::mpsc::UnboundedReceiver;
 
@@ -46,6 +46,7 @@ async fn every_known_option_is_wired_not_silent() {
         "expandtab",
         "bomb",
         "scrollanim",
+        "timeout",
         "ts_highlight",
         // number
         "tabstop",
@@ -56,6 +57,7 @@ async fn every_known_option_is_wired_not_silent() {
         "showtabline",
         "laststatus",
         "mousetime",
+        "timeoutlen",
         "scrollanimduration",
         "scrollback",
         // string
@@ -147,6 +149,76 @@ async fn guifont_defaults_empty() {
     rpc.request("nvim_get_mode", vec![]).await.expect("barrier");
     let frame = drain_to_latest_redraw(&mut incoming, |_| true).expect("a redraw arrived");
     assert_eq!(field_str(&frame, "guifont"), "");
+}
+
+#[tokio::test]
+async fn timeout_and_timeoutlen_default_and_reach_the_redraw() {
+    // The mapping-timeout config is on with a 1000ms wait by default (vim's), reads
+    // back through `vim.o`, and is relayed to the client in every `redraw` so each
+    // client runs its idle-flush timer to match.
+    let (rpc, mut incoming) = start().await;
+    assert_eq!(
+        exec_lua(&rpc, "return vim.o.timeout").await.as_bool(),
+        Some(true),
+        "timeout defaults on"
+    );
+    assert_eq!(
+        exec_lua(&rpc, "return vim.o.timeoutlen").await.as_u64(),
+        Some(1000),
+        "timeoutlen defaults to 1000"
+    );
+
+    rpc.request("nvim_get_mode", vec![]).await.expect("barrier");
+    let frame = drain_to_latest_redraw(&mut incoming, |_| true).expect("a redraw arrived");
+    assert_eq!(
+        field(&frame, "timeout").and_then(rmpv::Value::as_bool),
+        Some(true),
+        "redraw relays timeout=true"
+    );
+    assert_eq!(
+        u64_at(&frame, "timeoutlen"),
+        1000,
+        "redraw relays timeoutlen"
+    );
+}
+
+#[tokio::test]
+async fn notimeout_and_timeoutlen_round_trip_and_relay() {
+    let (rpc, mut incoming) = start().await;
+
+    // `:set notimeout timeoutlen=250` reaches the core, reads back through `vim.o`,
+    // and the new values ride the next redraw (so the client disarms its flush and,
+    // were it re-enabled, would wait 250ms).
+    command(&rpc, "set notimeout timeoutlen=250").await;
+    assert_eq!(
+        exec_lua(&rpc, "return vim.o.timeout").await.as_bool(),
+        Some(false),
+        "notimeout read back through vim.o"
+    );
+    assert_eq!(
+        exec_lua(&rpc, "return vim.o.timeoutlen").await.as_u64(),
+        Some(250)
+    );
+
+    rpc.request("nvim_get_mode", vec![]).await.expect("barrier");
+    let frame = drain_to_latest_redraw(&mut incoming, |_| true).expect("a redraw arrived");
+    assert_eq!(
+        field(&frame, "timeout").and_then(rmpv::Value::as_bool),
+        Some(false),
+        "redraw relays timeout=false under notimeout"
+    );
+    assert_eq!(u64_at(&frame, "timeoutlen"), 250);
+
+    // And the `vim.o` write path sets it too (the init.lua form), reading back.
+    exec_lua(&rpc, "vim.o.timeout = true; vim.o.timeoutlen = 700").await;
+    assert_eq!(
+        exec_lua(&rpc, "return vim.o.timeout").await.as_bool(),
+        Some(true)
+    );
+    assert_eq!(
+        exec_lua(&rpc, "return vim.o.timeoutlen").await.as_u64(),
+        Some(700)
+    );
 }
 
 #[tokio::test]

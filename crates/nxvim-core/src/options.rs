@@ -73,6 +73,20 @@ pub struct Options {
     /// multi-click (`'mousetime'`). Default `500`. Honored from the multi-click
     /// phase; stored here so `:set` accepts it now.
     pub mousetime: usize,
+    /// Wait for a mapped key sequence to complete (`'timeout'`). On (vim's
+    /// default), an ambiguous mapped prefix — one that is a live prefix of a
+    /// longer mapping — is resolved after [`Options::timeoutlen`] of no further
+    /// input (the client's idle flush). Off (`:set notimeout`), such a prefix is
+    /// held **forever** until the next key disambiguates it — the behavior that
+    /// makes a which-key popup stay up indefinitely while you decide. Read by the
+    /// idle-flush path: [`crate::editor`]'s server gates the flush on it, and every
+    /// client skips arming its idle timer when it is off.
+    pub timeout: bool,
+    /// How long (ms) to wait for a mapped sequence to complete before the idle
+    /// flush resolves it (`'timeoutlen'`; default `1000`). Only consulted when
+    /// [`Options::timeout`] is on. `0` flushes as soon as input pauses. The value
+    /// is relayed to the client, which runs the actual wall-clock timer.
+    pub timeoutlen: usize,
     /// Which regex dialect `/` search and `:substitute` speak (nxvim's
     /// `'regexsyntax'`, not a standard vim option): `"pcre"` (the default) for
     /// canonical/PCRE regular expressions, or `"vim"` for vim's "magic" dialect
@@ -179,6 +193,10 @@ impl Default for Options {
             mousemodel: "popup_setpos".to_string(),
             mousescroll: "ver:3,hor:6".to_string(),
             mousetime: 500,
+            // Wait for a mapped sequence to finish (vim's default), for 1000ms —
+            // `:set notimeout` holds an ambiguous prefix forever instead.
+            timeout: true,
+            timeoutlen: 1000,
             // Canonical/PCRE regex for `/` and `:s` out of the box; opt into vim's
             // magic dialect with `:set regexsyntax=vim`.
             regexsyntax: "pcre".to_string(),
@@ -1131,6 +1149,20 @@ static OPTIONS: &[OptionInfo] = {
             kind: Num,
             scope: Global,
             doc: "Maximum time in ms between clicks for a multi-click.",
+        },
+        OptionInfo {
+            name: "timeout",
+            abbrev: Some("to"),
+            kind: Bool,
+            scope: Global,
+            doc: "Wait timeoutlen for a mapped sequence to complete (off: forever).",
+        },
+        OptionInfo {
+            name: "timeoutlen",
+            abbrev: Some("tm"),
+            kind: Num,
+            scope: Global,
+            doc: "Time in ms to wait for a mapped sequence to complete.",
         },
         OptionInfo {
             name: "fileencodings",

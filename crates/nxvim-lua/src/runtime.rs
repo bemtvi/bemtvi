@@ -335,6 +335,11 @@ pub struct GoMirror {
     pub scrollanimduration: u64,
     /// `'scrollback'` — the terminal scrollback cap in rows. Backs `vim.o.scrollback`.
     pub scrollback: u64,
+    /// `'timeout'` — whether a mapped sequence waits `timeoutlen` to resolve (on) or
+    /// is held forever for the next key (off). Backs `vim.o.timeout` / `nx.o.timeout`.
+    pub timeout: bool,
+    /// `'timeoutlen'` — the mapped-sequence wait in ms. Backs `vim.o.timeoutlen`.
+    pub timeoutlen: u64,
     /// The editor screen extent backing `vim.o.columns` / `vim.o.lines`, so a
     /// float-positioning plugin can center its windows.
     pub columns: u64,

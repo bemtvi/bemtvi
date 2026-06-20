@@ -1294,6 +1294,7 @@ impl Editor {
             "incsearch" => self.options.incsearch = value,
             "autoread" => self.options.autoread = value,
             "imagepreview" => self.options.imagepreview = value,
+            "timeout" => self.options.timeout = value,
             "scrollanim" => self.options.scrollanim = value,
             _ => {}
         }
@@ -1312,13 +1313,18 @@ impl Editor {
         // `mousetime` is an unbounded non-negative millisecond count — it doesn't
         // share `showtabline`/`laststatus`'s small-range, relayout-on-change shape,
         // so handle it before the bounded block.
-        if name == "mousetime" || name == "scrollanimduration" || name == "scrollback" {
+        if name == "mousetime"
+            || name == "timeoutlen"
+            || name == "scrollanimduration"
+            || name == "scrollback"
+        {
             if value < 0 {
                 self.echo(format!("E487: Argument must be positive: {name}={value}"));
                 return;
             }
             match name {
                 "mousetime" => self.options.mousetime = value as usize,
+                "timeoutlen" => self.options.timeoutlen = value as usize,
                 "scrollanimduration" => self.options.scrollanimduration = value as usize,
                 "scrollback" => self.options.scrollback = value as usize,
                 _ => unreachable!("guarded above"),
@@ -1383,6 +1389,20 @@ impl Editor {
     /// The editor's global options, for the server to mirror to Lua (`vim.o`).
     pub fn global_options(&self) -> Options {
         self.options.clone()
+    }
+
+    /// Whether `'timeout'` is on — a cheap bool read (no [`Options`] clone) for the
+    /// hot idle-flush path, which consults it on every flush to decide whether a
+    /// withheld mapped prefix should resolve on idle (`timeout`) or wait forever for
+    /// the next key (`notimeout`).
+    pub fn timeout_enabled(&self) -> bool {
+        self.options.timeout
+    }
+
+    /// The `'timeoutlen'` wait in ms, for the wasm host to arm its idle-flush
+    /// deadline (the native clients read the relayed value off the `redraw`).
+    pub fn timeoutlen_ms(&self) -> u64 {
+        self.options.timeoutlen as u64
     }
 
     /// Window `id`'s cursor as `(0-based line, byte col)` — the live cursor for

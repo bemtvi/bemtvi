@@ -89,6 +89,7 @@ impl Editor {
             "incsearch" => &mut self.options.incsearch,
             "autoread" => &mut self.options.autoread,
             "imagepreview" => &mut self.options.imagepreview,
+            "timeout" => &mut self.options.timeout,
             "scrollanim" => &mut self.options.scrollanim,
             "expandtab" => &mut self.buffer_mut().options.expandtab,
             "bomb" => &mut self.buffer_mut().options.bomb,
@@ -132,6 +133,7 @@ impl Editor {
                 if name == "showtabline"
                     || name == "laststatus"
                     || name == "mousetime"
+                    || name == "timeoutlen"
                     || name == "scrollanimduration"
                     || name == "scrollback"
                 {
@@ -176,6 +178,7 @@ impl Editor {
                     "showtabline" => self.options.showtabline as i64,
                     "laststatus" => self.options.laststatus as i64,
                     "mousetime" => self.options.mousetime as i64,
+                    "timeoutlen" => self.options.timeoutlen as i64,
                     "scrollanimduration" => self.options.scrollanimduration as i64,
                     "scrollback" => self.options.scrollback as i64,
                     _ => {

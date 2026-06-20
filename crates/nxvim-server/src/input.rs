@@ -125,6 +125,15 @@ impl EditHost {
     /// tries first keeps the flush consistent with a registry/buffer change since the
     /// last batch; with nothing pending the whole call is a no-op.
     pub(crate) fn input_flush(&mut self) {
+        // `:set notimeout` holds an ambiguous mapped prefix *forever* — the next key
+        // disambiguates it, never an idle timeout. So drop the idle flush entirely:
+        // the withheld prefix stays pending (a which-key popup stays up). The gate
+        // lives here, not only client-side, so any client — even one that always
+        // sends the flush — honors `notimeout`. With nothing pending this is a no-op
+        // either way; the early return just also skips the (cheap) keymap refresh.
+        if !self.editor.timeout_enabled() {
+            return;
+        }
         self.refresh_keymaps();
         // Flush in the active context's scope — a picker's withheld prefix resolves
         // in its bucket, the buffer's in its mode.

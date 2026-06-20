@@ -123,6 +123,31 @@ fn shift_tab_is_back_tab_notation() {
 }
 
 #[test]
+fn legacy_c0_control_bytes_map_to_vim_notation() {
+    // A legacy terminal (no kitty keyboard protocol — nxvim doesn't enable it)
+    // sends the C0 bytes 0x1C..=0x1F for CTRL-\, CTRL-], CTRL-^ and CTRL-_.
+    // crossterm decodes those bytes as Ctrl+'4'..'7' (see its unix parse.rs), so
+    // without remapping, <C-]> (help tag jump), <C-^> (alternate file) and the
+    // others never reach the server and the keypress does nothing.
+    assert_eq!(
+        note(KeyCode::Char('4'), KeyModifiers::CONTROL).as_deref(),
+        Some("<C-\\>")
+    );
+    assert_eq!(
+        note(KeyCode::Char('5'), KeyModifiers::CONTROL).as_deref(),
+        Some("<C-]>")
+    );
+    assert_eq!(
+        note(KeyCode::Char('6'), KeyModifiers::CONTROL).as_deref(),
+        Some("<C-^>")
+    );
+    assert_eq!(
+        note(KeyCode::Char('7'), KeyModifiers::CONTROL).as_deref(),
+        Some("<C-_>")
+    );
+}
+
+#[test]
 fn combined_ctrl_alt_prefixes_both() {
     assert_eq!(
         note(

@@ -1304,6 +1304,7 @@ impl Editor {
             "timeout" => self.options.timeout = value,
             "scrollanim" => self.options.scrollanim = value,
             "qfdock" => self.options.qfdock = value,
+            "bdclosetab" => self.options.bdclosetab = value,
             _ => {}
         }
     }

@@ -1601,25 +1601,45 @@ impl Editor {
             self.alternate = None;
         }
 
+        // `'bdclosetab'` (nxvim default): if `target` was the *only* buffer the
+        // focused tab showed and other tabs are open, close the tab page rather than
+        // loading a sibling buffer into it. "Only buffer" means every tiled window of
+        // the live tree showed `target` (a split onto another buffer keeps the tab).
+        let close_tab = was_current
+            && self.options.bdclosetab
+            && self.focused_stack().tabs.len() > 1
+            && self
+                .windows
+                .leaves()
+                .iter()
+                .all(|&id| self.windows.get(id).buffer == target);
+
         if was_current {
-            match replacement {
-                // `current` now dangles; move to the chosen same-layer replacement
-                // (no stash — the outgoing buffer is gone).
-                Some(rep) => self.enter_buffer(rep),
-                // No sibling buffer remains in this layer: open a fresh, empty one
-                // in the window rather than borrowing another layer's buffer. This
-                // also covers the never-leave-zero-buffers case.
-                None => {
-                    let id = self.add_buffer(Buffer::empty());
-                    self.set_cur_buffer(id);
-                    self.alternate = None;
-                    self.cursor = Cursor::default();
-                    self.top = 0;
-                    self.leftcol = 0;
-                    self.mode = Mode::Normal;
-                    self.reset_pending();
-                    self.scroll_from = None;
-                    self.pending_scroll = None;
+            if close_tab {
+                // Drop the tab; a surviving tab's tree becomes live and its window's
+                // buffer becomes current. The closed tree (the only windows on
+                // `target`) is gone, so the sweep below only touches other tabs/layers.
+                self.close_tab();
+            } else {
+                match replacement {
+                    // `current` now dangles; move to the chosen same-layer replacement
+                    // (no stash — the outgoing buffer is gone).
+                    Some(rep) => self.enter_buffer(rep),
+                    // No sibling buffer remains in this layer: open a fresh, empty one
+                    // in the window rather than borrowing another layer's buffer. This
+                    // also covers the never-leave-zero-buffers case.
+                    None => {
+                        let id = self.add_buffer(Buffer::empty());
+                        self.set_cur_buffer(id);
+                        self.alternate = None;
+                        self.cursor = Cursor::default();
+                        self.top = 0;
+                        self.leftcol = 0;
+                        self.mode = Mode::Normal;
+                        self.reset_pending();
+                        self.scroll_from = None;
+                        self.pending_scroll = None;
+                    }
                 }
             }
         }

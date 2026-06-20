@@ -162,6 +162,13 @@ pub struct Options {
     /// open the classic way: a bottom **split** of the current window (the
     /// vim/telescope behavior). Honored by [`crate::editor::quickfix`].
     pub qfdock: bool,
+    /// Whether `:bdelete` of a tab's *last* buffer closes the tab page (`'bdclosetab'`;
+    /// nxvim-native, default `true`). When set, deleting the only buffer a tab shows —
+    /// with other tabs open — closes that tab rather than loading a sibling buffer into
+    /// its window (vim's behavior). A tab whose windows still show *other* buffers is
+    /// never closed. With it unset, `:bd` behaves the classic way. Honored by
+    /// [`crate::editor::buffers`].
+    pub bdclosetab: bool,
 }
 
 /// The default `'errorformat'` — vim's compiled-in non-Windows `DFLT_EFM`
@@ -233,6 +240,8 @@ impl Default for Options {
             grepformat: DFLT_GREPFORMAT.to_string(),
             // The nxvim way: quickfix / loclist displays open as bottom-dock tabs.
             qfdock: true,
+            // The nxvim way: `:bd` of a tab's last buffer closes the tab.
+            bdclosetab: true,
         }
     }
 }
@@ -1259,6 +1268,13 @@ static OPTIONS: &[OptionInfo] = {
             kind: Bool,
             scope: Global,
             doc: "Open quickfix/loclist as bottom-dock tabs (nxvim) vs a split (vim).",
+        },
+        OptionInfo {
+            name: "bdclosetab",
+            abbrev: Some("bdct"),
+            kind: Bool,
+            scope: Global,
+            doc: "Closing a tab's last buffer with :bd closes the tab (nxvim).",
         },
     ]
 };

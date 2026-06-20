@@ -828,3 +828,88 @@ async fn tab_drop_focuses_an_existing_window_instead_of_opening_a_tab() {
 
     let _ = std::fs::remove_file(&file);
 }
+
+// ----- `:bdelete` of a tab's last buffer closes the tab ('bdclosetab') --------
+
+/// `:bd` on the only buffer shown in a tab — with other tabs open — closes the
+/// tab page rather than loading a "random" sibling buffer into it (nxvim's
+/// default 'bdclosetab'). The deleted buffer leaves the list; focus lands on a
+/// surviving tab showing its own buffer.
+#[tokio::test]
+async fn bdelete_of_a_tabs_only_buffer_closes_the_tab() {
+    let a = temp_file("bd_a", "aaa\n");
+    let b = temp_file("bd_b", "bbb\n");
+    let (rpc, _incoming) = start().await;
+
+    feed_sync(&rpc, &format!(":edit {a}<CR>")).await; // tab 1 shows A
+    feed_sync(&rpc, &format!(":tabedit {b}<CR>")).await; // tab 2 shows B, focused
+    assert_eq!(tab_order(&rpc).await.len(), 2, "two tabs open");
+    assert_eq!(cur_lines(&rpc).await, vec!["bbb"], "tab 2 shows B");
+
+    feed_sync(&rpc, ":bdelete<CR>").await;
+
+    assert_eq!(
+        tab_order(&rpc).await.len(),
+        1,
+        "the tab closed with its last buffer, not a sibling loaded into it"
+    );
+    assert_eq!(
+        cur_lines(&rpc).await,
+        vec!["aaa"],
+        "focus is on the surviving tab showing A"
+    );
+
+    let _ = std::fs::remove_file(&a);
+    let _ = std::fs::remove_file(&b);
+}
+
+/// `:set nobdclosetab` restores the classic vim behavior: `:bd` keeps the tab
+/// open and loads a sibling buffer into its window.
+#[tokio::test]
+async fn nobdclosetab_keeps_the_tab_and_loads_a_sibling() {
+    let a = temp_file("nbd_a", "aaa\n");
+    let b = temp_file("nbd_b", "bbb\n");
+    let (rpc, _incoming) = start().await;
+
+    feed_sync(&rpc, &format!(":edit {a}<CR>")).await; // tab 1 shows A
+    feed_sync(&rpc, &format!(":tabedit {b}<CR>")).await; // tab 2 shows B, focused
+    feed_sync(&rpc, ":set nobdclosetab<CR>").await;
+
+    feed_sync(&rpc, ":bdelete<CR>").await;
+
+    assert_eq!(
+        tab_order(&rpc).await.len(),
+        2,
+        "with 'nobdclosetab' the tab stays open"
+    );
+
+    let _ = std::fs::remove_file(&a);
+    let _ = std::fs::remove_file(&b);
+}
+
+/// A tab whose windows show *other* buffers besides the one being deleted is not
+/// closed — only the focused window moves off the deleted buffer. 'bdclosetab'
+/// closes a tab only when its every window showed the deleted buffer.
+#[tokio::test]
+async fn bdelete_does_not_close_a_tab_with_other_buffers_in_a_split() {
+    let a = temp_file("bds_a", "aaa\n");
+    let b = temp_file("bds_b", "bbb\n");
+    let (rpc, _incoming) = start().await;
+
+    feed_sync(&rpc, &format!(":edit {a}<CR>")).await; // tab 1 shows A
+    feed_sync(&rpc, &format!(":tabedit {b}<CR>")).await; // tab 2 shows B (focused)
+    feed_sync(&rpc, &format!(":split {a}<CR>")).await; // tab 2 now: A (top) / B (bottom)
+    feed_sync(&rpc, "<C-w>j").await; // focus the B window
+    assert_eq!(cur_lines(&rpc).await, vec!["bbb"], "focused on B");
+
+    feed_sync(&rpc, ":bdelete<CR>").await;
+
+    assert_eq!(
+        tab_order(&rpc).await.len(),
+        2,
+        "the tab stays open: it still shows A in the other split"
+    );
+
+    let _ = std::fs::remove_file(&a);
+    let _ = std::fs::remove_file(&b);
+}

@@ -355,6 +355,9 @@ pub struct GoMirror {
     /// `'qfdock'` — whether quickfix/location lists open as bottom-dock tabs (nxvim)
     /// vs a split (vim/telescope). Backs `vim.o.qfdock` / `nx.o.qfdock`.
     pub qfdock: bool,
+    /// `'bdclosetab'` — whether `:bd` of a tab's last buffer closes the tab (nxvim)
+    /// rather than loading a sibling. Backs `vim.o.bdclosetab` / `nx.o.bdclosetab`.
+    pub bdclosetab: bool,
 }
 
 /// The pure-Lua `vim.*` prelude, split into focused modules under `src/prelude/`

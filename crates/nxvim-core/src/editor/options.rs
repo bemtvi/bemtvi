@@ -92,6 +92,7 @@ impl Editor {
             "timeout" => &mut self.options.timeout,
             "scrollanim" => &mut self.options.scrollanim,
             "qfdock" => &mut self.options.qfdock,
+            "bdclosetab" => &mut self.options.bdclosetab,
             "expandtab" => &mut self.buffer_mut().options.expandtab,
             "bomb" => &mut self.buffer_mut().options.bomb,
             "modifiable" => &mut self.buffer_mut().options.modifiable,

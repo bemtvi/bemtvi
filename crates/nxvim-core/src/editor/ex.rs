@@ -1766,14 +1766,25 @@ impl Editor {
             self.close_window();
             return;
         }
-        // Last tiled window of *this* tab, but other tabs are open: `:q` closes the
-        // tab page (like `:tabclose`), not the editor — its buffers stay loaded, so
-        // there's nothing to lose and no modified guard, same as a non-last window.
-        if self.main_tabs.tabs.len() > 1 {
-            self.close_tab();
-            return;
+        // Last tiled window of *this* tab. What that means depends on the focused
+        // layer (`self.windows` only ever holds the focused layer's tree):
+        match self.focused_layer {
+            // A dock: `:q` is a dock dismissal, never an editor quit — the main
+            // layer's buffers are still open. Route through `close_tab`, whose
+            // last-tab guard closes the whole dock; an earlier dock tab just closes.
+            Layer::Dock(_) => self.close_tab(),
+            // Main layer: another tab open means `:q` closes the tab page (like
+            // `:tabclose`) — its buffers stay loaded, so there's nothing to lose and
+            // no modified guard, same as a non-last window. The genuine last window
+            // of the last tab is a real editor quit.
+            Layer::Main => {
+                if self.main_tabs.tabs.len() > 1 {
+                    self.close_tab();
+                } else {
+                    self.ex_quit_all(bang);
+                }
+            }
         }
-        self.ex_quit_all(bang);
     }
 
     /// `:qa` (and last-window `:q`) — quit the *editor*, but only if nothing

@@ -1750,3 +1750,35 @@ async fn opening_a_picker_in_a_too_small_dock_does_not_crash() {
     let open = exec_lua(&rpc, "return nx._picker ~= nil").await;
     assert_eq!(open, Value::Boolean(true), "the picker opened in the dock");
 }
+
+/// `:q` from a focused dock dismisses the dock — it must never quit the editor
+/// while the main layer still holds buffers. (Previously `:q` gated on the
+/// focused layer's window count, so the dock's lone window read as the "last
+/// window" and tried to quit the whole editor.)
+#[tokio::test]
+async fn quit_in_a_dock_closes_the_dock_not_the_editor() {
+    let (rpc, mut incoming) = start().await;
+    // Give the main layer a modified buffer: pre-fix, `:q` fell through to the
+    // editor-quit path, which (blocked by the unsaved main buffer) left the dock
+    // open and focus stranded in main — never closing the dock.
+    feed_sync(&rpc, "imain<Esc>").await;
+    exec_lua(&rpc, "nx.dock.open{ side = 'left', size = 20 }").await; // focuses the dock
+    assert_eq!(win_count(&rpc).await, 2, "main + dock window");
+
+    command(&rpc, "q").await;
+
+    // The editor is still alive (a real quit would drop the connection) ...
+    let alive = req(&rpc, "nvim_get_mode", vec![]).await;
+    assert!(
+        matches!(alive, Value::Map(_) | Value::Array(_)),
+        "editor still running"
+    );
+    // ... and the dock is gone, leaving only the main window.
+    assert_eq!(win_count(&rpc).await, 1, "the dock closed, main stays");
+    let rd = latest(&mut incoming);
+    let regs = regions(&rd);
+    assert!(
+        !regs.iter().any(|r| r == "dock_left"),
+        "no dock window remains: {regs:?}"
+    );
+}

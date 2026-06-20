@@ -251,9 +251,11 @@ fn.getmatches = nx.match.get
 --   * `%`, `%:<mods>`         — the current file (delegated to the base impl)
 --   * `<cword>` / `<cWORD>`   — the (WORD) under the cursor
 --   * `<cfile>`               — the path-like token under the cursor
---   * a `:<mods>` suffix on any of the cursor keywords routes through fnamemodify
+--   * `<sfile>` / `<script>`  — the path of the script being sourced (so the
+--                               `<sfile>:p:h:h` "find my own root" idiom works)
+--   * a `:<mods>` suffix on any of those keywords routes through fnamemodify
+--   * an unmodeled `<...>` keyword errors loud (no silent literal passthrough)
 --   * leading `~` / `$VAR`    — home / environment expansion
---   * a wildcard (`*`/`?`)    — glob (returns a list when `list` is truthy)
 --   * anything else           — the path with ~/$ expanded, returned verbatim
 -- This re-binds nx.expand (the base loaded earlier), keeping its `%` behavior.
 local expand_pct = nx.expand
@@ -289,10 +291,36 @@ local function cursor_word(big)
   end
   return line:sub(b, e)
 end
+-- The path of the script currently being sourced — vim's `<sfile>`/`<script>`.
+-- Walk the Lua call stack to the nearest real-file chunk: nxvim sources every
+-- config / plugin / `require`d file with a `@<path>` chunk name (lifecycle.rs /
+-- Lua's own loadfile), while the embedded prelude chunks are named
+-- `nxvim:prelude/*` (no `@`) and C frames carry `=[C]`. So the first `@`-prefixed
+-- source above this function is the user script whose code is running. Returns ""
+-- when no script is on the stack (a bare `:lua` / RPC / callback context),
+-- matching neovim's empty `<sfile>` outside a sourced file.
+local function sourced_file()
+  for lvl = 2, 40 do
+    local info = debug.getinfo(lvl, "S")
+    if not info then
+      break
+    end
+    if info.source:sub(1, 1) == "@" then
+      return info.source:sub(2)
+    end
+  end
+  return ""
+end
 local function expand_path(p)
   if p:sub(1, 1) == "~" then
     p = (os.getenv("HOME") or "") .. p:sub(2)
   end
+  -- Environment variables, both the `${VAR}` and bare `$VAR` forms vim accepts.
+  -- Braces first, so `${VAR}` isn't half-eaten by the bare pass; an unset var is
+  -- left verbatim (matching vim, and what plugins probe for).
+  p = p:gsub("%${([%w_]+)}", function(v)
+    return os.getenv(v) or ("${" .. v .. "}")
+  end)
   p = p:gsub("%$([%w_]+)", function(v)
     return os.getenv(v) or ("$" .. v)
   end)
@@ -304,16 +332,22 @@ function nx.expand(expr, nosuf, list)
   if expr == "%" or expr:match("^%%:") then
     return expand_pct(expr, nosuf, list)
   end
-  -- Cursor keywords, with an optional `:mods` filename-modifier suffix.
-  local kw, mods = expr:match("^(<c%a+>)(.*)$")
+  -- Special `<...>` keywords, with an optional `:mods` filename-modifier suffix.
+  local kw, mods = expr:match("^(<%a+>)(.*)$")
   if kw then
     local word
     if kw == "<cword>" then
       word = cursor_word(false)
     elseif kw == "<cWORD>" or kw == "<cfile>" then
       word = cursor_word(true)
+    elseif kw == "<sfile>" or kw == "<script>" then
+      word = sourced_file()
     else
-      word = ""
+      -- An angle-bracket token we don't model (e.g. `<afile>`, `<abuf>`,
+      -- `<amatch>`). Fail loud rather than passing the literal text through as a
+      -- bogus "path" — a plugin computing `<afile>:p:h` off such a string would
+      -- chase a file that never existed.
+      error("expand(): unsupported keyword '" .. kw .. "'", 2)
     end
     if mods ~= "" then
       word = fn.fnamemodify(word, mods)

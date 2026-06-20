@@ -1,0 +1,146 @@
+//! Behavior tests for `vim.fn.expand` (`nx.expand`) — specifically the `<sfile>` /
+//! `<script>` script-path keywords plugins use to locate their own install root
+//! (the `expand("<sfile>:p:h:h")` idiom), plus the fail-loud contract for `<...>`
+//! tokens nxvim doesn't model. Black-box over RPC per the project conventions: a
+//! real server sources an `init.lua` from disk (so the chunk carries an `@<path>`
+//! name, exactly like a real user config), then we read back what it computed.
+
+use nxvim_rpc::{Incoming, Rpc};
+use nxvim_server::ServerInit;
+use nxvim_test_harness::{attach, exec_lua, spawn, start_attached, temp_dir};
+use tokio::sync::mpsc::UnboundedReceiver;
+
+async fn start() -> (Rpc, UnboundedReceiver<Incoming>) {
+    start_attached(ServerInit::default(), 80, 24).await
+}
+
+/// Source `init_lua` from a throwaway config dir; return a connected client. The
+/// init file is sourced with an `@<path>` chunk name (`source_init`), which is what
+/// makes `<sfile>` resolvable — the same path a real user config takes.
+async fn start_with_init(
+    dir: &std::path::Path,
+    init_lua: &str,
+) -> (Rpc, UnboundedReceiver<Incoming>) {
+    std::fs::write(dir.join("init.lua"), init_lua).expect("write init.lua");
+    let init = ServerInit {
+        config_dir: Some(dir.to_path_buf()),
+        runtimepath: vec![dir.to_path_buf()],
+        ..Default::default()
+    };
+    let (rpc, incoming) = spawn(init);
+    attach(&rpc, 80, 24).await;
+    (rpc, incoming)
+}
+
+// `<sfile>` resolves to the path of the file being sourced, and a `:mods` suffix
+// routes through fnamemodify — so `<sfile>:p:h:h` is the script's grandparent dir,
+// the canonical "find my own install root" idiom.
+#[tokio::test]
+async fn sfile_resolves_to_the_sourced_script_and_mods_apply() {
+    let cfg = temp_dir("expand_sfile");
+    let (rpc, _incoming) = start_with_init(
+        &cfg,
+        "_G.self = vim.fn.expand('<sfile>')\n\
+         _G.root = vim.fn.expand('<sfile>:p:h:h')\n\
+         _G.scriptalias = vim.fn.expand('<script>')",
+    )
+    .await;
+
+    let got_self = exec_lua(&rpc, "return _G.self").await;
+    let got_root = exec_lua(&rpc, "return _G.root").await;
+    let got_alias = exec_lua(&rpc, "return _G.scriptalias").await;
+
+    let expected_self = cfg.join("init.lua").to_string_lossy().into_owned();
+    // <cfg>/init.lua  -> :h <cfg>  -> :h parent(<cfg>)
+    let expected_root = cfg.parent().unwrap().to_string_lossy().into_owned();
+
+    assert_eq!(
+        got_self.as_str(),
+        Some(expected_self.as_str()),
+        "expand('<sfile>') should be the sourced file's path"
+    );
+    assert_eq!(
+        got_root.as_str(),
+        Some(expected_root.as_str()),
+        "expand('<sfile>:p:h:h') should be the script root (grandparent dir)"
+    );
+    assert_eq!(
+        got_alias.as_str(),
+        Some(expected_self.as_str()),
+        "expand('<script>') should alias <sfile> for the sourced file"
+    );
+}
+
+// Outside any sourced file (a bare `:lua` / RPC call has no `@<path>` chunk on the
+// stack), `<sfile>` is the empty string — matching neovim, not a bogus path.
+#[tokio::test]
+async fn sfile_outside_a_script_is_empty() {
+    let (rpc, _incoming) = start().await;
+    let got = exec_lua(&rpc, "return vim.fn.expand('<sfile>')").await;
+    assert_eq!(
+        got.as_str(),
+        Some(""),
+        "expand('<sfile>') with no sourced file on the stack is empty"
+    );
+}
+
+// An angle-bracket keyword nxvim doesn't model fails loud, rather than silently
+// returning the literal text as a bogus "path" (the old passthrough behavior).
+#[tokio::test]
+async fn unknown_angle_token_fails_loud() {
+    let (rpc, _incoming) = start().await;
+    let got = exec_lua(
+        &rpc,
+        "local ok, e = pcall(vim.fn.expand, '<afile>:p')\n\
+         return tostring(ok) .. '|' .. tostring(e)",
+    )
+    .await;
+    let s = got.as_str().unwrap_or("");
+    assert!(
+        s.starts_with("false|"),
+        "expand('<afile>') should raise, got: {s}"
+    );
+    assert!(
+        s.contains("unsupported"),
+        "the error should name the unsupported keyword, got: {s}"
+    );
+}
+
+// Plain paths are untouched by the fail-loud rule: `~` and `$VAR` still expand and
+// the remainder passes through verbatim.
+#[tokio::test]
+async fn plain_path_still_expands_env() {
+    let (rpc, _incoming) = start().await;
+    let got = exec_lua(&rpc, "return vim.fn.expand('$HOME/x/y')").await;
+    let home = std::env::var("HOME").expect("HOME set in dev/CI env");
+    let want = format!("{home}/x/y");
+    assert_eq!(
+        got.as_str(),
+        Some(want.as_str()),
+        "a plain $VAR path must still expand, not fail loud"
+    );
+}
+
+// Both env-var spellings expand — bare `$VAR` and the `${VAR}` brace form vim also
+// accepts — including mid-string; an unset var is left verbatim in either form.
+#[tokio::test]
+async fn env_var_brace_and_bare_forms_expand() {
+    // A custom var proves it's a generic env lookup, not a HOME special-case.
+    // SAFETY: set on the test thread before the server starts; no concurrent readers.
+    unsafe { std::env::set_var("NXVIM_EXPAND_PROBE", "/zzz") };
+    let (rpc, _incoming) = start().await;
+
+    let cases = [
+        ("$NXVIM_EXPAND_PROBE/bar", "/zzz/bar"),
+        ("${NXVIM_EXPAND_PROBE}/bar", "/zzz/bar"),
+        ("pre/${NXVIM_EXPAND_PROBE}/post", "pre//zzz/post"),
+        (
+            "${NXVIM_DEFINITELY_UNSET}/bar",
+            "${NXVIM_DEFINITELY_UNSET}/bar",
+        ),
+    ];
+    for (expr, want) in cases {
+        let got = exec_lua(&rpc, &format!("return vim.fn.expand('{expr}')")).await;
+        assert_eq!(got.as_str(), Some(want), "expand('{expr}')");
+    }
+}

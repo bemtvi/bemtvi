@@ -138,6 +138,40 @@ async fn nx_layer_focus_reports_an_unknown_name() {
 
 // ===== nx.view ===============================================================
 
+/// Regression: nx.cursor.set must move a *view*-backed window's cursor to an exact
+/// column. nx.view's own cursor is line-granular (`:set_cursor` lands at col 0), and
+/// the help plugin's "<C-t> returns to the exact spot" refines it with the public
+/// setter — in the same chunk, exactly as window.show does. Asserted through
+/// nvim_win_get_cursor (the *real* cursor the user sees), not the Lua mirror.
+#[tokio::test]
+async fn nx_cursor_set_refines_a_view_window_cursor_column() {
+    let (rpc, _incoming) = start().await;
+    exec_lua(
+        &rpc,
+        r#"vw = nx.view.create{ name = "[T]", filetype = "help" }
+           vw:set_lines{ "page B line one", "page B line two" }
+           vw:mount{ split = "split" }
+           vw:set_cursor(2)"#,
+    )
+    .await;
+    // The reused-window re-show window.show runs for `<C-t>`: swap the content, refocus
+    // the already-mounted view, line-granular jump, then refine the column — all one
+    // chunk. Row 1, col 6 → the 'l' of "line".
+    exec_lua(
+        &rpc,
+        r#"vw:set_lines{ "first line here", "second line here" }
+           vw:focus()
+           vw:set_cursor(1)
+           nx.cursor.set({ 1, 6 }, vw:winid())"#,
+    )
+    .await;
+    assert_eq!(
+        cursor(&rpc).await,
+        (1, 6),
+        "nx.cursor.set refined the view window's cursor column on re-show"
+    );
+}
+
 /// `nx.view.create` + `:set_lines` produce a buffer whose lines a plugin controls
 /// (read back via `nvim_buf_get_lines` against the mirrored buffer number).
 #[tokio::test]

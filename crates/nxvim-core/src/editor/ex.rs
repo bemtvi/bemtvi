@@ -566,7 +566,7 @@ impl Editor {
                 self.goto_tab_prev(parse_opt_count_arg(args))
             }
             "tabfir" | "tabfirst" | "tabr" | "tabrewind" => self.goto_tab_next(Some(1)),
-            "tabl" | "tablast" => self.goto_tab_next(Some(self.main_tabs.tabs.len())),
+            "tabl" | "tablast" => self.goto_tab_next(Some(self.focused_stack().tabs.len())),
             "tab" => self.ex_tab(args),
             "dr" | "dro" | "drop" => {
                 if let Some(a) = self.expand_file_arg_or_echo(args) {

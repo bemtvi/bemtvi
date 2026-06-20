@@ -548,6 +548,35 @@ async fn tabnew_while_dock_focused_adds_a_dock_tab_not_a_main_tab() {
 }
 
 #[tokio::test]
+async fn tablast_targets_the_focused_docks_last_tab() {
+    let (rpc, _incoming) = start().await;
+    // Main stays at a single tab.
+    feed(&rpc, "imain-one<Esc>");
+    // Focus a dock and give it three tabs (more than main's one), so a `:tablast`
+    // that mistakenly counted main's tabs would stop short of the dock's last.
+    exec_lua(&rpc, "nx.dock.open{ side = 'left', size = 20 }").await;
+    feed(&rpc, "idock-one<Esc>");
+    exec_lua(&rpc, "vim.cmd('tabnew')").await;
+    feed(&rpc, "idock-two<Esc>");
+    exec_lua(&rpc, "vim.cmd('tabnew')").await;
+    feed(&rpc, "idock-three<Esc>");
+    // Back to the dock's first tab, then `:tablast` must reach its *third* tab —
+    // counting the focused layer's tabs, not main's.
+    feed_sync(&rpc, ":tabfirst<CR>").await;
+    assert_eq!(
+        lines(&rpc).await,
+        vec!["dock-one"],
+        ":tabfirst lands on the dock's first tab"
+    );
+    feed_sync(&rpc, ":tablast<CR>").await;
+    assert_eq!(
+        lines(&rpc).await,
+        vec!["dock-three"],
+        ":tablast reaches the focused dock's last tab, not main's"
+    );
+}
+
+#[tokio::test]
 async fn dock_and_main_tab_counts_are_independent() {
     let (rpc, mut incoming) = start().await;
     // Always-on tablines so single-tab regions still project their cell count.

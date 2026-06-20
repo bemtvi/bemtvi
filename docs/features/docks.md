@@ -93,7 +93,7 @@ nx.dock.opt("left").size = 40            -- resize live
 | `showtabline` | Per-dock override of the global option (`0` never / `1` if >1 tab / `2` always) |
 | `laststatus` | Per-dock statusline override (`0`/`1`/`2`/`3`) |
 | `autohide` | Collapse the dock the moment focus leaves it; it pops back when you cross in |
-| `winhighlight` | Reserved for theming a dock's window (not implemented yet) |
+| `winhighlight` | Per-window highlight remap (`"Normal:NormalSB,EndOfBuffer:Hidden"`) so a dock paints like a sidebar — see `examples/dock-winhighlight` |
 
 Setting an unknown option warns loudly rather than silently ignoring it.
 

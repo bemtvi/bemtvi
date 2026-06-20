@@ -1265,6 +1265,13 @@ impl Editor {
             }
         } else if name == "fillchars" && crate::options::parse_fillchars(value).is_some() {
             opts.fillchars = value.to_string();
+        } else if name == "winhighlight" {
+            // The per-window highlight remap (`'winhighlight'` / `'winhl'`). Stored
+            // raw and parsed to a `WinHl` at projection (like `fillchars`); malformed
+            // pairs are dropped there, matching this bridge's lenient contract (`:set`
+            // is the loud path). A window-local value overrides the dock's, if any —
+            // see `Editor::effective_winhighlight`.
+            opts.winhighlight = value.to_string();
         } else if name == "padding" {
             // An invalid spec is ignored (the no-op-on-bad-input bridge contract;
             // `:set padding=` is the loud-error path).

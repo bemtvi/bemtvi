@@ -1,0 +1,15 @@
+winhighlight — per-window highlight remap
+=========================================
+
+This file is open in the MAIN editor area, painted with the global `Normal`
+background. To its left is a dock styled with:
+
+    nx.dock.opt("left").winhighlight =
+      "Normal:NormalSB,EndOfBuffer:SidebarEob,LineNr:SidebarLineNr"
+
+The dock renders on the `NormalSB` background — a dimmer sidebar — while this
+window keeps the global theme. Same editor, two backgrounds; the remap is scoped
+to the dock's windows only.
+
+Cross focus into the dock with  <C-w><C-w>h  and back with  <C-w><C-w>l  to watch
+the background flip. `:DockToggle left` collapses and restores the styled sidebar.

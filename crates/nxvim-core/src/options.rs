@@ -476,6 +476,14 @@ pub struct WindowOptions {
     /// `:set padding=…` (CSS-style shorthand, see [`parse_padding`]) or
     /// `vim.wo.padding`.
     pub padding: Padding,
+    /// `'winhighlight'`: a per-window highlight-group remap (`"Normal:NormalSB,
+    /// EndOfBuffer:Hidden"`) applied while rendering this window — every group on
+    /// the left resolves to the group on its right here, leaving other windows
+    /// untouched. Stored as the raw option string (parsed to a
+    /// [`WinHl`](crate::WinHl) at projection time, like [`fillchars`] is parsed
+    /// lazily); empty by default (no remap). A window in a dock with no window-local
+    /// value of its own inherits the dock's [`DockOptions::winhighlight`].
+    pub winhighlight: String,
 }
 
 impl WindowOptions {
@@ -588,6 +596,8 @@ impl Default for WindowOptions {
             fillchars: String::new(),
             // No margin out of the box — a default window renders flush as before.
             padding: Padding::default(),
+            // No window-local highlight remap by default.
+            winhighlight: String::new(),
         }
     }
 }
@@ -621,6 +631,12 @@ pub struct DockOptions {
     /// content preserved), and re-appears on the next `nx.dock.toggle`/`focus`/`show`.
     /// Default `false` (a dock stays put when focus leaves).
     pub auto_hide: bool,
+    /// `'winhighlight'` for every window in this dock: a highlight-group remap
+    /// (`"Normal:NormalSB,EndOfBuffer:Hidden"`) so a dock can paint itself like a
+    /// VSCode sidebar without touching the global theme. Stored as the raw option
+    /// string (parsed to a [`WinHl`](crate::WinHl) at projection time); empty by
+    /// default. A window with its own [`WindowOptions::winhighlight`] overrides this.
+    pub winhighlight: String,
 }
 
 /// A buffer-local `'regexsyntax'` value: an explicit dialect for this buffer, or

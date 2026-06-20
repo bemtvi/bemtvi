@@ -51,7 +51,8 @@ nx.dock.open({ side = "bottom", size = 6 })
 --   title        a fixed strip label, shown ahead of the tab cells
 --   size         the dock's width (left/right) or height (top/bottom), settable
 --                live so you can grow/shrink a dock after opening
---   winhighlight  (not implemented yet — reserved for theming a dock's window)
+--   winhighlight  per-window highlight remap so a dock paints like a sidebar
+--                 (e.g. "Normal:NormalSB") — see examples/dock-winhighlight
 --------------------------------------------------------------------------------
 -- A titled, always-on strip for the side bar.
 nx.dock.opt("left").title = "EXPLORER"

@@ -17,7 +17,7 @@
 
 use crate::redraw::StyleTable;
 use crate::EditHost;
-use nxvim_core::{unicode, BufferId, HlMode, VirtChunk, VirtTextPos};
+use nxvim_core::{unicode, BufferId, HlMode, VirtChunk, VirtTextPos, WinHl};
 use rmpv::Value;
 
 /// Placement `pos` tags on the `virt_text` wire array (mirror the client's
@@ -112,6 +112,7 @@ impl EditHost {
     pub(crate) fn overlay_highlights_for(
         &self,
         buffer: BufferId,
+        winhl: &WinHl,
         segs: &[crate::redraw::RowSeg],
         styles: &mut StyleTable,
     ) -> Value {
@@ -153,9 +154,9 @@ impl EditHost {
                     .filter_map(|(sb, eb, group, capture)| {
                         let (start, end) = seg.clip(vc.at(sb), vc.at(eb))?;
                         let resolved = if capture {
-                            self.editor.highlights.resolve_capture(group)
+                            self.resolve_capture_winhl(winhl, group)
                         } else {
-                            self.editor.highlights.resolve(group)
+                            self.resolve_winhl(winhl, group)
                         };
                         let style_id = match resolved {
                             Some(style) => Value::from(styles.intern(style) as u64),
@@ -200,6 +201,7 @@ impl EditHost {
     pub(crate) fn virt_text_for(
         &self,
         buffer: BufferId,
+        winhl: &WinHl,
         segs: &[crate::redraw::RowSeg],
         selection: &[Option<(usize, usize)>],
         styles: &mut StyleTable,
@@ -294,6 +296,7 @@ impl EditHost {
                             col,
                             hl_mode_code(decor.hl_mode),
                             &decor.virt_text,
+                            winhl,
                             styles,
                         ))
                     })
@@ -313,13 +316,14 @@ impl EditHost {
         col: u64,
         hl_mode: u64,
         chunks: &[VirtChunk],
+        winhl: &WinHl,
         styles: &mut StyleTable,
     ) -> Value {
         Value::Array(vec![
             Value::from(pos),
             Value::from(col),
             Value::from(hl_mode),
-            self.virt_chunks_value(chunks, styles),
+            self.virt_chunks_value(chunks, winhl, styles),
         ])
     }
 
@@ -327,12 +331,17 @@ impl EditHost {
     /// `hl_group` interned into the per-frame `styles` palette (`Nil` when absent or
     /// unresolved, so the client paints in normal colors). Shared by `virt_text` and
     /// `virt_lines`.
-    pub(crate) fn virt_chunks_value(&self, chunks: &[VirtChunk], styles: &mut StyleTable) -> Value {
+    pub(crate) fn virt_chunks_value(
+        &self,
+        chunks: &[VirtChunk],
+        winhl: &WinHl,
+        styles: &mut StyleTable,
+    ) -> Value {
         let chunks: Vec<Value> = chunks
             .iter()
             .map(|c| {
                 let style_id = match c.hl_group.as_deref() {
-                    Some(group) => match self.editor.highlights.resolve(group) {
+                    Some(group) => match self.resolve_winhl(winhl, group) {
                         Some(style) => Value::from(styles.intern(style) as u64),
                         None => Value::Nil,
                     },
@@ -352,13 +361,14 @@ impl EditHost {
     pub(crate) fn virt_lines_value(
         &self,
         virt_lines: &[Option<Vec<VirtChunk>>],
+        winhl: &WinHl,
         styles: &mut StyleTable,
     ) -> Value {
         Value::Array(
             virt_lines
                 .iter()
                 .map(|row| match row {
-                    Some(chunks) => self.virt_chunks_value(chunks, styles),
+                    Some(chunks) => self.virt_chunks_value(chunks, winhl, styles),
                     None => Value::Nil,
                 })
                 .collect(),

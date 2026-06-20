@@ -1073,12 +1073,30 @@ impl Renderer {
                 let win_clip = self.text_bounds(ox, oy, wcols, text_rows);
                 let sel_bg = style_bg(&view.visual).unwrap_or(0x33_47_5b);
                 let search_bg = style_bg(&view.search_style).unwrap_or(0x6a_5a_1a);
-                let normal_bg = style_bg(&view.normal).unwrap_or(DEFAULT_BG);
-                // `'cursorline'` tint: the colorscheme's `CursorLine` background, or a
-                // subtle lightening of the window background when it leaves it undefined,
-                // so the cursor row still reads as highlighted out of the box.
+                // This window's `'winhighlight'` override of `Normal` (else global),
+                // so a dock with `winhighlight = 'Normal:NormalSB'` paints its own bg.
+                let normal_bg = style_bg(&win.normal(view)).unwrap_or(DEFAULT_BG);
+                // `'cursorline'` tint: the colorscheme's `CursorLine` background (with
+                // any per-window `winhighlight` override), or a subtle lightening of the
+                // window background when it leaves it undefined, so the cursor row still
+                // reads as highlighted out of the box.
                 let cursorline_bg =
-                    style_bg(&view.cursor_line).unwrap_or_else(|| lighten(normal_bg, 0x12));
+                    style_bg(&win.cursor_line_bg(view)).unwrap_or_else(|| lighten(normal_bg, 0x12));
+                // A window whose `'winhighlight'` overrides `Normal` (a dock styled
+                // `Normal:NormalSB`) repaints its whole cell rect with its own
+                // background, so its empty cells / gutter read with the override and
+                // not the global surface fill. Gated on the override so an ordinary
+                // window adds no quad and renders exactly as before.
+                if win.chrome.normal.is_some() {
+                    let (px, py) = self.cell_px(ox, oy);
+                    quads.push(Quad {
+                        x: px,
+                        y: py,
+                        w: self.cell_w * wcols as f32,
+                        h: self.cell_h * text_rows as f32,
+                        color: color_to_rgba(srgb_to_color(normal_bg)),
+                    });
+                }
                 for (i, raw) in win.lines.iter().enumerate() {
                     let row = oy as usize + i;
 
@@ -2892,10 +2910,11 @@ impl Renderer {
             win.relativenumber,
             win.number_width as usize,
         );
+        // Honor any per-window `winhighlight` override of the gutter groups.
         let color = if n == current_line {
-            style_fg(&view.cursor_line_nr).unwrap_or(DEFAULT_FG)
+            style_fg(&win.cursor_line_nr(view)).unwrap_or(DEFAULT_FG)
         } else {
-            style_fg(&view.line_nr).unwrap_or(DEFAULT_LINE_NR)
+            style_fg(&win.line_nr(view)).unwrap_or(DEFAULT_LINE_NR)
         };
         self.push_plain(items, &text, pos, color, bounds);
     }

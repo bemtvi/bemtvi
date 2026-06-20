@@ -16,6 +16,7 @@ use std::collections::BTreeMap;
 
 use nxvim_core::unicode;
 use nxvim_core::BufferId;
+use nxvim_core::WinHl;
 use nxvim_lsp::lsp_types::{Position, Range};
 use nxvim_lsp::{InlayHintData, ServerKey};
 use nxvim_lua::InlayHintMirrorData;
@@ -265,6 +266,7 @@ impl EditHost {
     pub(crate) fn inlay_hints_for(
         &self,
         buffer: BufferId,
+        winhl: &WinHl,
         segs: &[crate::redraw::RowSeg],
         styles: &mut StyleTable,
     ) -> Value {
@@ -282,7 +284,7 @@ impl EditHost {
         let tabstop = buf
             .map(|b| b.options.effective_tabstop())
             .unwrap_or(unicode::TABSTOP);
-        let style_id = match self.editor.highlights.resolve("LspInlayHint") {
+        let style_id = match self.resolve_winhl(winhl, "LspInlayHint") {
             Some(style) => Value::from(styles.intern(style) as u64),
             None => Value::Nil,
         };

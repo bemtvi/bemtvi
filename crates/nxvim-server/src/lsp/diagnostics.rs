@@ -5,6 +5,7 @@
 use std::collections::HashMap;
 
 use nxvim_core::unicode;
+use nxvim_core::WinHl;
 use nxvim_lsp::lsp_types::Diagnostic;
 use nxvim_lsp::PositionEncoding;
 use rmpv::Value;
@@ -92,6 +93,7 @@ impl EditHost {
     pub(crate) fn diagnostics_for(
         &self,
         buffer: nxvim_core::BufferId,
+        winhl: &WinHl,
         segs: &[crate::redraw::RowSeg],
         styles: &mut StyleTable,
     ) -> Value {
@@ -148,11 +150,10 @@ impl EditHost {
                         // row-local columns (so it lands on the right continuation row).
                         let (start_col, end_col) = seg.clip(start_col, end_col)?;
                         let severity = severity_code(d.severity);
-                        let style_id =
-                            match self.editor.highlights.resolve(severity_group(severity)) {
-                                Some(style) => Value::from(styles.intern(style) as u64),
-                                None => Value::Nil,
-                            };
+                        let style_id = match self.resolve_winhl(winhl, severity_group(severity)) {
+                            Some(style) => Value::from(styles.intern(style) as u64),
+                            None => Value::Nil,
+                        };
                         Some(Value::Array(vec![
                             Value::from(start_col as u64),
                             Value::from(end_col as u64),
@@ -180,6 +181,7 @@ impl EditHost {
     pub(crate) fn diagnostics_virt_text_for(
         &self,
         buffer: nxvim_core::BufferId,
+        winhl: &WinHl,
         segs: &[crate::redraw::RowSeg],
         styles: &mut StyleTable,
     ) -> Value {
@@ -219,11 +221,7 @@ impl EditHost {
                 };
                 let severity = severity_code(d.severity);
                 let text = format!("{}{}", self.diag_config.virt_prefix, first_line(&d.message));
-                let style_id = match self
-                    .editor
-                    .highlights
-                    .resolve(severity_virt_group(severity))
-                {
+                let style_id = match self.resolve_winhl(winhl, severity_virt_group(severity)) {
                     Some(style) => Value::from(styles.intern(style) as u64),
                     None => Value::Nil,
                 };
@@ -248,6 +246,7 @@ impl EditHost {
     pub(crate) fn diagnostics_signs_for(
         &self,
         buffer: nxvim_core::BufferId,
+        winhl: &WinHl,
         segs: &[crate::redraw::RowSeg],
         styles: &mut StyleTable,
     ) -> Value {
@@ -284,11 +283,7 @@ impl EditHost {
                 };
                 let severity = severity_code(d.severity);
                 let glyph = self.diag_config.sign_glyph(severity).to_string();
-                let style_id = match self
-                    .editor
-                    .highlights
-                    .resolve(severity_sign_group(severity))
-                {
+                let style_id = match self.resolve_winhl(winhl, severity_sign_group(severity)) {
                     Some(style) => Value::from(styles.intern(style) as u64),
                     None => Value::Nil,
                 };

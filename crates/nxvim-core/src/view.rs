@@ -471,6 +471,14 @@ pub struct WindowView {
     /// text body. `None` for an ordinary text / terminal / directory buffer. See
     /// [`ImageView`].
     pub image: Option<ImageView>,
+    /// This window's effective `'winhighlight'` — the per-window highlight-group
+    /// remap, resolved from the window-local option falling back to the dock's (see
+    /// [`Editor::effective_winhighlight`]). Empty for almost every window. The
+    /// server applies it while resolving this window's highlights, so a group named
+    /// on the left renders with the group on its right *here only*.
+    ///
+    /// [`Editor::effective_winhighlight`]: crate::Editor::effective_winhighlight
+    pub winhl: crate::WinHl,
 }
 
 /// An image-preview window's payload ([`WindowView::image`]): just the filesystem
@@ -1024,6 +1032,7 @@ fn window_view(ed: &Editor, w: &WindowLayout) -> WindowView {
         status_ctx,
         status_visible,
         image,
+        winhl: ed.effective_winhighlight(w.region, &w.options),
     }
 }
 

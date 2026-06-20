@@ -64,11 +64,11 @@ fn rgb(c: u32) -> Color {
 /// paints around it; a tiled window uses `Normal`. `None` when the colorscheme
 /// (and its fallback) leaves the group undefined — the cells keep the terminal
 /// default, as before a theme is loaded.
-fn window_bg(view: &View, floating: bool) -> Option<Style> {
-    if floating {
-        view.normal_float.or(view.normal).map(rt)
+fn window_bg(win: &WindowView, view: &View) -> Option<Style> {
+    if win.floating {
+        win.normal_float(view).map(rt)
     } else {
-        view.normal.map(rt)
+        win.normal(view).map(rt)
     }
 }
 
@@ -77,8 +77,8 @@ fn window_bg(view: &View, floating: bool) -> Option<Style> {
 /// theme that leaves it undefined) it falls back to a subtle dark-gray
 /// background so the line is still visible out of the box — matching how the
 /// other chrome groups degrade to a built-in look.
-fn cursorline_style(view: &View) -> Style {
-    view.cursor_line
+fn cursorline_style(win: &WindowView, view: &View) -> Style {
+    win.cursor_line_bg(view)
         .map(rt)
         .unwrap_or_else(|| Style::default().bg(Color::Indexed(236)))
 }
@@ -245,7 +245,7 @@ pub(crate) fn render(
         // paint the whole box with `Normal` first when there's a margin to fill.
         let outer = window_area(dock.content(win.region), win);
         if win.padding.horizontal() + win.padding.vertical() > 0 {
-            if let Some(bg) = window_bg(view, false) {
+            if let Some(bg) = window_bg(win, view) {
                 frame.render_widget(Block::default().style(bg), outer);
             }
         }
@@ -283,7 +283,7 @@ pub(crate) fn render(
                 // margin or end-of-line gap would show the terminal default. A
                 // bordered float's `float_block` already fills its inner with the
                 // same `NormalFloat` background.
-                if let Some(bg) = window_bg(view, true) {
+                if let Some(bg) = window_bg(win, view) {
                     frame.render_widget(Block::default().style(bg), outer);
                 }
                 outer
@@ -686,7 +686,7 @@ fn render_window(
     // paths pass `None`, leaving the body blank. The buffer is empty, so there is no
     // meaningful cursor — return the body rect and row 0.
     if let Some(image) = &win.image {
-        if let Some(bg) = window_bg(view, win.floating) {
+        if let Some(bg) = window_bg(win, view) {
             frame.render_widget(Block::default().style(bg), text_area);
         }
         if let Some(store) = images {
@@ -905,7 +905,7 @@ fn render_window(
     // and the gutter, end-of-line gaps, and `~` rows all share it. A float uses
     // `NormalFloat` so its body matches the bordered box around it; a tiled window
     // uses `Normal`. With no theme this is skipped.
-    if let Some(bg) = window_bg(view, win.floating) {
+    if let Some(bg) = window_bg(win, view) {
         frame.render_widget(Block::default().style(bg), text_area);
     }
 
@@ -923,7 +923,10 @@ fn render_window(
             width: text_area.width,
             height: 1,
         };
-        frame.render_widget(Block::default().style(cursorline_style(view)), line_area);
+        frame.render_widget(
+            Block::default().style(cursorline_style(win, view)),
+            line_area,
+        );
     }
 
     // Reserve the diagnostic sign column at the far left (vim's signcolumn, left of
@@ -972,7 +975,7 @@ fn render_window(
         visual: view.visual.map(rt),
         search: view.search_style.map(rt),
         incsearch: view.incsearch_style.map(rt),
-        end_of_buffer: view.end_of_buffer.map(rt),
+        end_of_buffer: win.end_of_buffer(view).map(rt),
     };
     // Diagnostic signs ride the band (`frame_signs`, sliced in the interpolation
     // match) just like the underlines and the other overlays, so they slide with the
@@ -1167,9 +1170,9 @@ fn render_gutter(
                 };
                 let cell = gutter_cell(shown, current_line, win.number, win.relativenumber, width);
                 let style = if is_current {
-                    view.cursor_line_nr.map(rt).unwrap_or_default()
+                    win.cursor_line_nr(view).map(rt).unwrap_or_default()
                 } else {
-                    view.line_nr
+                    win.line_nr(view)
                         .map(rt)
                         .unwrap_or_else(|| Style::default().add_modifier(Modifier::DIM))
                 };

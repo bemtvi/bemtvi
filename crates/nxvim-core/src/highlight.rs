@@ -273,6 +273,70 @@ impl Highlights {
     }
 }
 
+/// A window-local `winhighlight` remap (vim's `'winhighlight'` / `'winhl'`): an
+/// ordered list of `from -> to` highlight-group renames applied while rendering a
+/// single window. When a window carries `Normal:NormalSB,EndOfBuffer:Hidden`,
+/// every place that would resolve the group `Normal` in that window resolves
+/// `NormalSB` instead, and `EndOfBuffer` resolves `Hidden`.
+///
+/// The remap is **one level**: [`remap`](Self::remap) substitutes the target name
+/// once, and the caller hands that name to [`Highlights::resolve`], which then
+/// follows the target's *own* `link` chain — but a second `winhighlight` pair is
+/// never chained onto the first (`Normal:A,A:B` leaves `Normal` resolving `A`,
+/// matching vim). Unknown group names on either side are kept verbatim and simply
+/// fail to match anything at resolve time (also vim-faithful); only *syntactically*
+/// malformed entries are dropped, and [`parse_reporting`](Self::parse_reporting)
+/// hands those back so the setter can warn rather than silently ignore them.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct WinHl {
+    /// `(from, to)` pairs in declaration order. Small (a handful of entries at
+    /// most), so a linear scan in [`remap`](Self::remap) is cheaper than a map.
+    pairs: Vec<(String, String)>,
+}
+
+impl WinHl {
+    /// Parse a `'winhighlight'` value (`"Normal:NormalSB,SignColumn:NormalSB"`),
+    /// returning the remap plus every malformed entry (one with no `:` or an empty
+    /// side) for the caller to report. Well-formed pairs are kept in declaration
+    /// order; a later pair for the same `from` wins ([`remap`](Self::remap) reads
+    /// from the end). An empty/whitespace value parses to an empty remap.
+    pub fn parse_reporting(s: &str) -> (Self, Vec<String>) {
+        let mut pairs = Vec::new();
+        let mut bad = Vec::new();
+        for entry in s.split(',').map(str::trim).filter(|e| !e.is_empty()) {
+            match entry.split_once(':') {
+                Some((from, to)) if !from.is_empty() && !to.is_empty() => {
+                    pairs.push((from.to_string(), to.to_string()));
+                }
+                _ => bad.push(entry.to_string()),
+            }
+        }
+        (WinHl { pairs }, bad)
+    }
+
+    /// Parse a `'winhighlight'` value, discarding the malformed-entry report — for
+    /// the render path, where the setter has already validated and warned.
+    pub fn parse(s: &str) -> Self {
+        Self::parse_reporting(s).0
+    }
+
+    /// Whether this remap renames nothing (the common case — most windows).
+    pub fn is_empty(&self) -> bool {
+        self.pairs.is_empty()
+    }
+
+    /// The group name to resolve in place of `group`, or `group` unchanged when no
+    /// pair renames it. One level only (see the type docs); the last matching pair
+    /// wins.
+    pub fn remap<'a>(&'a self, group: &'a str) -> &'a str {
+        self.pairs
+            .iter()
+            .rev()
+            .find(|(from, _)| from == group)
+            .map_or(group, |(_, to)| to.as_str())
+    }
+}
+
 /// Parse a color as written in an `nvim_set_hl` opts table: a `#rrggbb` literal,
 /// a small set of named colors, or `"NONE"`. Returns `None` for `NONE` and for
 /// anything unrecognized (both mean "no color here").

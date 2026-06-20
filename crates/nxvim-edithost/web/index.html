@@ -939,6 +939,9 @@
       const box = document.createElement("div");
       box.className = "win";
       place(box, o.x + rect.x, o.y + rect.y, rect.width, rect.height);
+      // This window's `'winhighlight'` chrome override (a dock's `Normal:NormalSB`
+      // sidebar look), painted on its own box so only this window is recolored.
+      applyWinChrome(box, w);
       gridEl.appendChild(box);
 
       // An image-preview buffer (`'imagepreview'`): paint the picture over the text
@@ -1237,6 +1240,32 @@
       return typeof v === "number" ? paletteStyle(v) : v;
     }
     function chromeCss(style) { return style ? styleToCss(style) : ""; }
+    // A window's `'winhighlight'` chrome override (`w.chrome`, a `key -> style_id`
+    // map for the chrome groups it renames). Applied per window on its `.win` box —
+    // independent of `serverStyled`, since the override styles are interned into
+    // `view.styles` on the wasm build too (the server resolves `NormalSB` &c. even
+    // when global chrome stays JS-synthesized). The box background fills its empty
+    // cells, and the per-window CSS vars cascade to this window's rows/gutter/eob
+    // only. A window with no `winhighlight` has no `chrome` map, so it inherits the
+    // global look unchanged.
+    function applyWinChrome(box, w) {
+      const c = w.chrome;
+      if (!c) return;
+      const norm = paletteStyle(c.normal);
+      if (norm) {
+        const bg = cssColor(norm.bg), fg = cssColor(norm.fg);
+        if (bg) box.style.background = bg;
+        if (fg) box.style.color = fg;
+      }
+      const setVar = (name, id, key) => {
+        const col = cssColor(paletteStyle(id)?.[key]);
+        if (col) box.style.setProperty(name, col);
+      };
+      setVar("--cursorline", c.cursorline, "bg");
+      setVar("--gutter", c.line_nr, "fg");
+      setVar("--gutter-cur", c.cursor_line_nr, "fg");
+      setVar("--eob", c.end_of_buffer, "fg");
+    }
     function applyChrome() {
       const c = view.chrome || {};
       const root = document.documentElement.style;

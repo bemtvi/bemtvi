@@ -46,7 +46,7 @@ pub use extmark::{
     Extmark, ExtmarkStore, HlMode, VirtChunk, VirtDecor, VirtLineRows, VirtTextPos,
     DEFAULT_PRIORITY, SEMANTIC_HL_PRIORITY, SPECIAL_KEY_PRIORITY, TS_HL_PRIORITY,
 };
-pub use highlight::{parse_color, Highlights, HlDef, Rgb, Style};
+pub use highlight::{parse_color, Highlights, HlDef, Rgb, Style, WinHl};
 pub use host::{DirEntry, FileStat, HostFs, StdHostFs};
 pub use input::{key_to_notation, parse_keys, Key, KeyCode, MouseAction, MouseButton, MouseEvent};
 pub use mode::{KeyContext, Mode};

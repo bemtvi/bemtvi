@@ -11,7 +11,7 @@ use nxvim_core::view::{
     MenuView, RegionTabline, RegionTablines, RenderRow, ScrollAnim, Separator, TabView, ViewRect,
     WindowRegion, WindowView,
 };
-use nxvim_core::{BorderStyle, ContentFloatView, MenuPlacement, VirtChunk};
+use nxvim_core::{BorderStyle, ContentFloatView, MenuPlacement, VirtChunk, WinHl};
 use rmpv::Value;
 use std::collections::HashMap;
 
@@ -348,7 +348,7 @@ impl EditHost {
         // arrays for them so the redraw map keeps a stable shape (JS-side highlighting
         // paints from the buffer text instead).
         #[cfg(feature = "native")]
-        let highlights = self.highlights_for(win.buffer, &segments, styles);
+        let highlights = self.highlights_for(win.buffer, &win.winhl, &segments, styles);
         // The browser build highlights *code* JS-side, so it skips the treesitter
         // spans — but extmark highlights (the `nx.decor` / `nx.buf.set_extmark` layer)
         // and LSP semantic tokens are genuinely server-sourced and can't be
@@ -358,7 +358,7 @@ impl EditHost {
         // highlighting; the `js_highlight` frame flag (below) keeps these overlay
         // spans from flipping the client into full server-styled mode.
         #[cfg(not(feature = "native"))]
-        let highlights = self.overlay_highlights_for(win.buffer, &segments, styles);
+        let highlights = self.overlay_highlights_for(win.buffer, &win.winhl, &segments, styles);
         // Display columns of the `^X` / `<xx>` substitutions, for the wasm renderer
         // to colour as `SpecialKey`; the native client paints them from `highlights`,
         // so it gets an empty array (keeping the redraw map shape stable).
@@ -372,19 +372,19 @@ impl EditHost {
         // publish loop), so this projects on **both** builds — unlike the treesitter /
         // LSP overlays above, which are genuinely native-only. The wire shape is the
         // same on either build; only the transport differs.
-        let virt_text = self.virt_text_for(win.buffer, &segments, &selection, styles);
+        let virt_text = self.virt_text_for(win.buffer, &win.winhl, &segments, &selection, styles);
         // Extmark `virt_lines` (whole virtual rows). Core already interleaved them into
         // the window's rows (the `RowKind::VirtLine` rows, unbundled into `virt_lines`
         // above); the server only resolves each chunk's `hl_group` to a frame style id.
         // Shared like `virt_text`.
-        let virt_lines = self.virt_lines_value(&virt_lines, styles);
+        let virt_lines = self.virt_lines_value(&virt_lines, &win.winhl, styles);
         #[cfg(feature = "native")]
         let (diagnostics, diagnostics_virt, diagnostics_signs, sign_width, inlay_hints) = (
-            self.diagnostics_for(win.buffer, &segments, styles),
-            self.diagnostics_virt_text_for(win.buffer, &segments, styles),
-            self.diagnostics_signs_for(win.buffer, &segments, styles),
+            self.diagnostics_for(win.buffer, &win.winhl, &segments, styles),
+            self.diagnostics_virt_text_for(win.buffer, &win.winhl, &segments, styles),
+            self.diagnostics_signs_for(win.buffer, &win.winhl, &segments, styles),
             self.sign_width_for(win.buffer, &numbers, win.signcolumn),
-            self.inlay_hints_for(win.buffer, &segments, styles),
+            self.inlay_hints_for(win.buffer, &win.winhl, &segments, styles),
         );
         // The browser build has no diagnostics, so signs never appear; the sign
         // width still honors a fixed `yes` policy (its `floor`) so the layout matches
@@ -398,7 +398,7 @@ impl EditHost {
             Value::Array(Vec::new()),
         );
         let scroll = match &win.scroll {
-            Some(s) => self.project_band(win.buffer, s, styles),
+            Some(s) => self.project_band(win.buffer, &win.winhl, s, styles),
             None => Value::Nil,
         };
         Value::Map(vec![
@@ -528,6 +528,13 @@ impl EditHost {
                 ]),
             ),
             (Value::from("tabstop"), Value::from(win.tabstop as u64)),
+            // This window's `winhighlight` chrome overrides (a `key -> style_id` map
+            // for the chrome groups it renames, e.g. `Normal:NormalSB`). Empty for a
+            // window with no remap; the client merges it over the global `chrome` map.
+            (
+                Value::from("chrome"),
+                self.window_chrome_overrides(&win.winhl, styles),
+            ),
             (Value::from("special_key"), special_key),
             (Value::from("highlights"), highlights),
             (Value::from("diagnostics"), diagnostics),
@@ -849,6 +856,7 @@ impl EditHost {
     pub(crate) fn project_band(
         &self,
         buffer: nxvim_core::BufferId,
+        winhl: &WinHl,
         s: &ScrollAnim,
         styles: &mut StyleTable,
     ) -> Value {
@@ -869,11 +877,11 @@ impl EditHost {
         // window), so they slide with the text instead of blanking out for the slide.
         #[cfg(feature = "native")]
         let (highlights, inlay_hints, diagnostics_virt, diagnostics, diagnostics_signs) = (
-            self.highlights_for(buffer, &segments, styles),
-            self.inlay_hints_for(buffer, &segments, styles),
-            self.diagnostics_virt_text_for(buffer, &segments, styles),
-            self.diagnostics_for(buffer, &segments, styles),
-            self.diagnostics_signs_for(buffer, &segments, styles),
+            self.highlights_for(buffer, winhl, &segments, styles),
+            self.inlay_hints_for(buffer, winhl, &segments, styles),
+            self.diagnostics_virt_text_for(buffer, winhl, &segments, styles),
+            self.diagnostics_for(buffer, winhl, &segments, styles),
+            self.diagnostics_signs_for(buffer, winhl, &segments, styles),
         );
         #[cfg(not(feature = "native"))]
         let (highlights, inlay_hints, diagnostics_virt, diagnostics, diagnostics_signs) = (
@@ -885,8 +893,8 @@ impl EditHost {
         );
         // Extmark `virt_text` + `virt_lines` ride the band (pure projections, like
         // `window_value`), so they slide with the text instead of flashing on settle.
-        let virt_text = self.virt_text_for(buffer, &segments, &selection, styles);
-        let virt_lines = self.virt_lines_value(&virt_lines, styles);
+        let virt_text = self.virt_text_for(buffer, winhl, &segments, &selection, styles);
+        let virt_lines = self.virt_lines_value(&virt_lines, winhl, styles);
         Value::Map(vec![
             (Value::from("from_row"), Value::from(s.from_row as u64)),
             (Value::from("to_row"), Value::from(s.to_row as u64)),
@@ -925,29 +933,29 @@ impl EditHost {
         ])
     }
 
+    /// Resolve a highlight `group` for a window, honoring its `winhighlight` remap
+    /// (`winhl`) — `group` is renamed once (see [`WinHl::remap`]) before the normal
+    /// link-following resolution. With an empty remap (the common case) this is
+    /// exactly `highlights.resolve(group)`, so non-`winhighlight` windows are
+    /// unchanged.
+    pub(crate) fn resolve_winhl(&self, winhl: &WinHl, group: &str) -> Option<Style> {
+        self.editor.highlights.resolve(winhl.remap(group))
+    }
+
+    /// Like [`resolve_winhl`](Self::resolve_winhl) but for a treesitter capture: the
+    /// capture name is remapped once, then resolved through the `@`-group fallback
+    /// chain. (`winhighlight` keys on the named group, so `Comment:Foo` remaps a
+    /// span tagged `Comment`/`@comment` literally — not the final resolved style.)
+    pub(crate) fn resolve_capture_winhl(&self, winhl: &WinHl, group: &str) -> Option<Style> {
+        self.editor.highlights.resolve_capture(winhl.remap(group))
+    }
+
     /// Resolve the editor-chrome highlight groups (the background, gutter,
     /// selection, and status line) to style-palette indices for this frame. Each
     /// resolved group becomes a `name -> style_id` entry; groups the colorscheme
     /// leaves undefined are simply absent, so the client keeps its built-in look
     /// (e.g. reverse-video selection) for them. Empty map when no theme is loaded.
     pub(crate) fn chrome_styles(&self, styles: &mut StyleTable) -> Value {
-        // Map redraw key -> highlight group. The keys mirror the View regions the
-        // client themes; the groups are neovim's standard chrome groups.
-        const CHROME: &[(&str, &str)] = &[
-            ("normal", "Normal"),
-            ("line_nr", "LineNr"),
-            ("cursor_line_nr", "CursorLineNr"),
-            ("cursorline", "CursorLine"),
-            ("visual", "Visual"),
-            ("search", "Search"),
-            ("incsearch", "IncSearch"),
-            ("status_line", "StatusLine"),
-            ("error_msg", "ErrorMsg"),
-            ("end_of_buffer", "EndOfBuffer"),
-            ("float_border", "FloatBorder"),
-            ("normal_float", "NormalFloat"),
-            ("float_title", "FloatTitle"),
-        ];
         let entries = CHROME
             .iter()
             .filter_map(|(key, group)| {
@@ -957,7 +965,56 @@ impl EditHost {
             .collect();
         Value::Map(entries)
     }
+
+    /// A window's `winhighlight` overrides to the global chrome map: for each chrome
+    /// key whose group this window *renames* (e.g. `Normal:NormalSB` renames the
+    /// `normal` key's `Normal`), the remapped group's resolved style id — so the
+    /// client paints this window's background / gutter / EOB with the renamed group.
+    /// Only the keys the remap actually touches are emitted; every other key (and
+    /// every non-`winhighlight` window) falls back to the global [`chrome_styles`]
+    /// map. Empty for almost every window, so the wire is unchanged for them.
+    ///
+    /// [`chrome_styles`]: Self::chrome_styles
+    fn window_chrome_overrides(&self, winhl: &WinHl, styles: &mut StyleTable) -> Value {
+        if winhl.is_empty() {
+            return Value::Map(Vec::new());
+        }
+        let entries = CHROME
+            .iter()
+            .filter_map(|(key, group)| {
+                let remapped = winhl.remap(group);
+                // Unchanged keys fall back to the global chrome map — emit nothing.
+                if remapped == *group {
+                    return None;
+                }
+                let style = self.editor.highlights.resolve(remapped)?;
+                Some((Value::from(*key), Value::from(styles.intern(style) as u64)))
+            })
+            .collect();
+        Value::Map(entries)
+    }
 }
+
+/// The redraw-key → highlight-group map for editor chrome (background, gutter,
+/// selection, status line, float chrome). The keys mirror the View regions the
+/// client themes; the groups are neovim's standard chrome groups. Shared by the
+/// global [`EditHost::chrome_styles`] map and the per-window `winhighlight`
+/// overrides ([`EditHost::window_chrome_overrides`]).
+const CHROME: &[(&str, &str)] = &[
+    ("normal", "Normal"),
+    ("line_nr", "LineNr"),
+    ("cursor_line_nr", "CursorLineNr"),
+    ("cursorline", "CursorLine"),
+    ("visual", "Visual"),
+    ("search", "Search"),
+    ("incsearch", "IncSearch"),
+    ("status_line", "StatusLine"),
+    ("error_msg", "ErrorMsg"),
+    ("end_of_buffer", "EndOfBuffer"),
+    ("float_border", "FloatBorder"),
+    ("normal_float", "NormalFloat"),
+    ("float_title", "FloatTitle"),
+];
 
 /// A per-redraw palette of distinct resolved [`Style`]s, deduped so identical
 /// styles (common across a theme's many same-colored groups) cost one wire entry
@@ -1777,10 +1834,12 @@ impl EditHost {
         // wire form), so a styled caller (which-key) can colour keys vs.
         // descriptions and dim unavailable rows. A plain caller is one unstyled
         // chunk per line, which resolves to a `Nil` style id (normal colors).
+        // A content float (which-key &c.) is an overlay, not a dock window, so no
+        // `winhighlight` remap applies — resolve its chunks against the global theme.
         let lines = Value::Array(
             shown
                 .iter()
-                .map(|line| self.virt_chunks_value(line, styles))
+                .map(|line| self.virt_chunks_value(line, &WinHl::default(), styles))
                 .collect(),
         );
         Value::Map(vec![

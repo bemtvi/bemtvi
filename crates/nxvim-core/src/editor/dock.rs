@@ -511,9 +511,11 @@ impl Editor {
     }
 
     /// `nx.dock.opt(side).<name> = <string>` — set a string dock option by side
-    /// keyword: `title` (a fixed strip label). `winhighlight` is recognized but not
-    /// implemented yet (it needs per-window backgrounds through the highlight
-    /// pipeline), so it fails loud rather than silently doing nothing.
+    /// keyword: `title` (a fixed strip label) or `winhighlight` (a per-window
+    /// highlight-group remap, `"Normal:NormalSB,EndOfBuffer:Hidden"`, applied to
+    /// every window in the dock). A malformed `winhighlight` entry (no `:` or an
+    /// empty side) is reported rather than silently dropped — the value is still
+    /// stored so the well-formed pairs take effect.
     pub fn set_dock_option_str(&mut self, side: &str, name: &str, value: String) {
         let Some(s) = DockSide::from_keyword(side) else {
             self.echo(format!("E474: Invalid dock side: {side}"));
@@ -522,7 +524,11 @@ impl Editor {
         match name {
             "title" => self.dock_options[s.idx()].title = value,
             "winhighlight" => {
-                return self.echo("nx.dock: 'winhighlight' is not implemented yet".to_string());
+                let bad = crate::WinHl::parse_reporting(&value).1;
+                if !bad.is_empty() {
+                    self.echo(format!("nx.dock: ignoring malformed winhighlight: {bad:?}"));
+                }
+                self.dock_options[s.idx()].winhighlight = value;
             }
             other => return self.echo(format!("E474: unknown dock option: {other}")),
         }
@@ -546,6 +552,34 @@ impl Editor {
     /// when unset or the dock isn't open.
     pub(crate) fn dock_title(&self, side: DockSide) -> &str {
         &self.dock_options[side.idx()].title
+    }
+
+    /// The effective `'winhighlight'` remap for a window in `region` carrying
+    /// window-local options `wo`, parsed for the view projection. The window's own
+    /// `winhighlight` wins when set; otherwise a window in a dock inherits that
+    /// dock's `winhighlight`; otherwise the remap is empty (the common case — most
+    /// windows rename nothing). Parsed here on each redraw, mirroring how
+    /// `'fillchars'` is parsed lazily — the strings are short and windows are few.
+    pub(crate) fn effective_winhighlight(
+        &self,
+        region: crate::view::WindowRegion,
+        wo: &WindowOptions,
+    ) -> crate::WinHl {
+        use crate::view::WindowRegion;
+        if !wo.winhighlight.is_empty() {
+            return crate::WinHl::parse(&wo.winhighlight);
+        }
+        let dock = match region {
+            WindowRegion::Main => None,
+            WindowRegion::DockLeft => Some(DockSide::Left),
+            WindowRegion::DockRight => Some(DockSide::Right),
+            WindowRegion::DockTop => Some(DockSide::Top),
+            WindowRegion::DockBottom => Some(DockSide::Bottom),
+        };
+        match dock.map(|s| &self.dock_options[s.idx()].winhighlight) {
+            Some(s) if !s.is_empty() => crate::WinHl::parse(s),
+            _ => crate::WinHl::default(),
+        }
     }
 
     /// Every **hidden** dock as `(side, label)` in [`DockSide::ALL`] order, for the

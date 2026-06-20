@@ -261,6 +261,58 @@ pub struct WindowView {
     /// instead of the (empty) `lines`. `None` for an ordinary buffer (and from an
     /// older server that omits the key).
     pub image: Option<ImageData>,
+    /// This window's `'winhighlight'` chrome overrides — the chrome groups it
+    /// renames (`Normal:NormalSB`, `EndOfBuffer:Hidden`, …), already resolved to
+    /// styles against this frame's palette. Each field is `None` (fall back to the
+    /// global [`View`] chrome) unless the window's remap touches that group; an
+    /// all-`None` bundle is the common case (any window without `winhighlight`).
+    /// The renderer reads it through the `WindowView::normal`/`line_nr`/… resolvers.
+    pub chrome: WinChrome,
+}
+
+/// A window's per-window chrome, resolved from its `'winhighlight'` remap: the
+/// chrome groups it renames, looked up in the window's `chrome` redraw override and
+/// resolved to styles. A `None` field means "this window doesn't rename that group"
+/// — the renderer falls back to the global [`View`] chrome. Mirrors the subset of
+/// chrome groups the renderer paints per window (background, gutter, cursor line,
+/// end-of-buffer, status line, float background).
+#[derive(Clone, Default)]
+pub struct WinChrome {
+    pub normal: Option<Style>,
+    pub line_nr: Option<Style>,
+    pub cursor_line_nr: Option<Style>,
+    pub cursor_line: Option<Style>,
+    pub end_of_buffer: Option<Style>,
+    pub status_line: Option<Style>,
+    pub normal_float: Option<Style>,
+}
+
+impl WindowView {
+    /// This window's effective chrome style for each region the renderer paints
+    /// per window: the window's own `'winhighlight'` override when it renames the
+    /// group, otherwise the global [`View`] chrome. A window with no `winhighlight`
+    /// always returns the global value, so non-`winhighlight` windows are unchanged.
+    pub fn normal(&self, view: &View) -> Option<Style> {
+        self.chrome.normal.or(view.normal)
+    }
+    pub fn line_nr(&self, view: &View) -> Option<Style> {
+        self.chrome.line_nr.or(view.line_nr)
+    }
+    pub fn cursor_line_nr(&self, view: &View) -> Option<Style> {
+        self.chrome.cursor_line_nr.or(view.cursor_line_nr)
+    }
+    pub fn cursor_line_bg(&self, view: &View) -> Option<Style> {
+        self.chrome.cursor_line.or(view.cursor_line)
+    }
+    pub fn end_of_buffer(&self, view: &View) -> Option<Style> {
+        self.chrome.end_of_buffer.or(view.end_of_buffer)
+    }
+    pub fn status_line(&self, view: &View) -> Option<Style> {
+        self.chrome.status_line.or(view.status_line)
+    }
+    pub fn normal_float(&self, view: &View) -> Option<Style> {
+        self.chrome.normal_float.or(view.normal_float)
+    }
 }
 
 /// An image-preview window's payload (mirrors `nxvim_core::view::ImageView`): the
@@ -936,6 +988,21 @@ fn parse_window(m: &[(Value, Value)], styles: &[Style]) -> WindowView {
         unnamed: map_get(m, "unnamed")
             .and_then(Value::as_bool)
             .unwrap_or(false),
+        chrome: {
+            // The window's `winhighlight` chrome override map (`key -> style_id`),
+            // resolved against this frame's palette. Absent / empty for a window
+            // with no remap, so every field stays `None` (global-chrome fallback).
+            let c = map_get(m, "chrome");
+            WinChrome {
+                normal: chrome_style(c, "normal", styles),
+                line_nr: chrome_style(c, "line_nr", styles),
+                cursor_line_nr: chrome_style(c, "cursor_line_nr", styles),
+                cursor_line: chrome_style(c, "cursorline", styles),
+                end_of_buffer: chrome_style(c, "end_of_buffer", styles),
+                status_line: chrome_style(c, "status_line", styles),
+                normal_float: chrome_style(c, "normal_float", styles),
+            }
+        },
         image: match map_get(m, "image") {
             Some(Value::Map(im)) => Some(ImageData {
                 path: map_str(im, "path"),

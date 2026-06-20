@@ -909,11 +909,34 @@ async fn main_tabline_click_survives_a_top_dock_offset() {
     );
 }
 
+// `winhighlight` is a real dock option now (the per-window highlight remap): a
+// well-formed value is accepted and round-trips through the option surface, and a
+// malformed entry is *reported* (not silently dropped, and not the old "not
+// implemented" stub). The rendering effect is covered in the highlight suite.
 #[tokio::test]
-async fn dock_winhighlight_is_reported_not_silently_ignored() {
-    let (rpc, mut incoming) = start().await;
+async fn dock_winhighlight_valid_value_round_trips() {
+    let (rpc, _incoming) = start().await;
     exec_lua(&rpc, "nx.dock.open{ side = 'left', size = 20 }").await;
     exec_lua(&rpc, "nx.dock.opt('left').winhighlight = 'Normal:NormalSB'").await;
+    let got = exec_lua(&rpc, "return nx.dock.opt('left').winhighlight").await;
+    assert_eq!(
+        got.as_str(),
+        Some("Normal:NormalSB"),
+        "winhighlight is accepted and read back"
+    );
+}
+
+#[tokio::test]
+async fn dock_winhighlight_malformed_entry_is_reported() {
+    let (rpc, mut incoming) = start().await;
+    exec_lua(&rpc, "nx.dock.open{ side = 'left', size = 20 }").await;
+    // `bogus` has no `:` — a malformed pair. The well-formed pair still applies, but
+    // the bad entry is echoed rather than silently ignored.
+    exec_lua(
+        &rpc,
+        "nx.dock.opt('left').winhighlight = 'Normal:NormalSB,bogus'",
+    )
+    .await;
     let rd = wait_redraw(&mut incoming, |m| {
         map_get(m, "message")
             .and_then(Value::as_str)
@@ -924,8 +947,170 @@ async fn dock_winhighlight_is_reported_not_silently_ignored() {
         .and_then(Value::as_str)
         .unwrap_or("");
     assert!(
-        msg.contains("winhighlight") && msg.contains("not implemented"),
-        "winhighlight fails loud, got {msg:?}"
+        msg.contains("malformed") && msg.contains("bogus"),
+        "malformed winhighlight entry is reported, got {msg:?}"
+    );
+    assert!(
+        !msg.contains("not implemented"),
+        "the fail-loud stub is gone, got {msg:?}"
+    );
+}
+
+/// The frame-palette `fg` color of the first highlight span on `row` of the window
+/// in `region` — follows the span's style-id (`[start, end, group, style_id]`) into
+/// the redraw's top-level `styles` palette. `None` when that window/row has no
+/// resolved span. Proves a *resolved* remap, since the wire span keeps the original
+/// group name and only its style id changes.
+fn region_span_fg(map: &[(Value, Value)], region: &str, row: usize) -> Option<u64> {
+    let windows = map_get(map, "windows")?.as_array()?;
+    let win = windows.iter().find_map(|w| match w {
+        Value::Map(m) if map_get(m, "region").and_then(Value::as_str) == Some(region) => Some(m),
+        _ => None,
+    })?;
+    let span = map_get(win, "highlights")?
+        .as_array()?
+        .get(row)?
+        .as_array()?
+        .first()?
+        .as_array()?;
+    let style_id = span.get(3)?.as_u64()? as usize;
+    let Value::Map(style) = map_get(map, "styles")?.as_array()?.get(style_id)? else {
+        return None;
+    };
+    map_get(style, "fg").and_then(Value::as_u64)
+}
+
+// Phase 3: a dock's `winhighlight` remaps the highlight groups its windows resolve.
+// An extmark tagged `Foo` paints `Foo`'s color until the dock sets
+// `winhighlight = 'Foo:Bar'`, after which the *same* span resolves `Bar`'s color —
+// in the dock window only. (A `Normal:NormalSB`-style chrome remap is Phase 4; this
+// proves the per-window *content* path.)
+#[tokio::test]
+async fn dock_winhighlight_remaps_content_highlight_group() {
+    let (rpc, mut incoming) = start().await;
+    // A dock with a line of text, plus two distinctly-colored groups.
+    exec_lua(&rpc, "nx.dock.open{ side = 'left', size = 30 }").await;
+    feed(&rpc, "ihello<Esc>");
+    exec_lua(&rpc, "nx.hl.define(0, 'Foo', { fg = '#ff0000' })").await;
+    exec_lua(&rpc, "nx.hl.define(0, 'Bar', { fg = '#00ff00' })").await;
+    // Tag the whole word with `Foo` via an extmark on the (focused) dock buffer.
+    exec_lua(
+        &rpc,
+        r#"local ns = vim.api.nvim_create_namespace("winhl_t")
+           vim.api.nvim_buf_set_extmark(0, ns, 0, 0, { end_row = 0, end_col = 5, hl_group = "Foo" })"#,
+    )
+    .await;
+
+    // Before any remap: the dock span resolves `Foo` (#ff0000).
+    let before = wait_redraw(&mut incoming, |m| {
+        region_span_fg(m, "dock_left", 0).is_some()
+    })
+    .await;
+    assert_eq!(
+        region_span_fg(&before, "dock_left", 0),
+        Some(0xff0000),
+        "the extmark paints Foo's color before any winhighlight"
+    );
+
+    // After `winhighlight = 'Foo:Bar'`: the same span resolves `Bar` (#00ff00).
+    exec_lua(&rpc, "nx.dock.opt('left').winhighlight = 'Foo:Bar'").await;
+    let after = wait_redraw(&mut incoming, |m| {
+        region_span_fg(m, "dock_left", 0) == Some(0x00ff00)
+    })
+    .await;
+    assert_eq!(
+        region_span_fg(&after, "dock_left", 0),
+        Some(0x00ff00),
+        "winhighlight 'Foo:Bar' remaps the dock window's resolved style to Bar"
+    );
+}
+
+/// The `bg` color of the window-in-`region`'s `chrome[key]` override — follows the
+/// per-window override's style id into the top-level `styles` palette. `None` when
+/// the window carries no override for `key` (it then falls back to global chrome).
+fn region_chrome_bg(map: &[(Value, Value)], region: &str, key: &str) -> Option<u64> {
+    let windows = map_get(map, "windows")?.as_array()?;
+    let win = windows.iter().find_map(|w| match w {
+        Value::Map(m) if map_get(m, "region").and_then(Value::as_str) == Some(region) => Some(m),
+        _ => None,
+    })?;
+    let Value::Map(chrome) = map_get(win, "chrome")? else {
+        return None;
+    };
+    let style_id = map_get(chrome, key)?.as_u64()? as usize;
+    let Value::Map(style) = map_get(map, "styles")?.as_array()?.get(style_id)? else {
+        return None;
+    };
+    map_get(style, "bg").and_then(Value::as_u64)
+}
+
+// Phase 4: a dock's `winhighlight` also remaps *chrome* (the background / gutter /
+// EOB groups resolved globally). `Normal:NormalSB` gives the dock window a per-window
+// `chrome.normal` override resolving NormalSB's background, while the main window
+// carries no override (it falls back to the global `Normal`). This is the sidebar
+// look — the headline use of `winhighlight`.
+#[tokio::test]
+async fn dock_winhighlight_overrides_chrome_normal_per_window() {
+    let (rpc, mut incoming) = start().await;
+    exec_lua(&rpc, "nx.dock.open{ side = 'left', size = 30 }").await;
+    // A distinctly-colored sidebar background group.
+    exec_lua(&rpc, "nx.hl.define(0, 'NormalSB', { bg = '#202030' })").await;
+    exec_lua(&rpc, "nx.dock.opt('left').winhighlight = 'Normal:NormalSB'").await;
+
+    let rd = wait_redraw(&mut incoming, |m| {
+        region_chrome_bg(m, "dock_left", "normal").is_some()
+    })
+    .await;
+    assert_eq!(
+        region_chrome_bg(&rd, "dock_left", "normal"),
+        Some(0x202030),
+        "the dock window's chrome.normal override resolves NormalSB's background"
+    );
+    assert_eq!(
+        region_chrome_bg(&rd, "main", "normal"),
+        None,
+        "the main window carries no chrome override — it uses the global Normal"
+    );
+}
+
+// `winhighlight` is per-window, also reachable on a plain (non-dock) window through
+// `nx.wo` — backing the window-scope claim the example config documents.
+#[tokio::test]
+async fn nx_wo_winhighlight_remaps_a_plain_window() {
+    let (rpc, mut incoming) = start().await;
+    exec_lua(&rpc, "nx.hl.define(0, 'NormalSB', { bg = '#202030' })").await;
+    exec_lua(&rpc, "nx.wo.winhighlight = 'Normal:NormalSB'").await;
+    let rd = wait_redraw(&mut incoming, |m| {
+        region_chrome_bg(m, "main", "normal").is_some()
+    })
+    .await;
+    assert_eq!(
+        region_chrome_bg(&rd, "main", "normal"),
+        Some(0x202030),
+        "nx.wo.winhighlight remaps the focused (non-dock) window's chrome"
+    );
+}
+
+// The shipped examples/dock-winhighlight config must load and render the sidebar:
+// its left dock carries the `Normal:NormalSB` override resolving NormalSB's
+// background (#181825), proving the example works end-to-end (not just that it loads).
+#[tokio::test]
+async fn example_dock_winhighlight_config_renders_the_sidebar() {
+    let (rpc, mut incoming) = start().await;
+    let example = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../examples/dock-winhighlight/init.lua")
+        .canonicalize()
+        .expect("examples/dock-winhighlight/init.lua");
+    let init_lua = std::fs::read_to_string(&example).expect("read example init.lua");
+    exec_lua(&rpc, &init_lua).await;
+    let rd = wait_redraw(&mut incoming, |m| {
+        region_chrome_bg(m, "dock_left", "normal").is_some()
+    })
+    .await;
+    assert_eq!(
+        region_chrome_bg(&rd, "dock_left", "normal"),
+        Some(0x181825),
+        "the example's left dock paints on the NormalSB sidebar background"
     );
 }
 

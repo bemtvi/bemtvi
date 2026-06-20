@@ -17,7 +17,7 @@
 
 use crate::redraw::StyleTable;
 use crate::EditHost;
-use nxvim_core::{unicode, view::WindowView, BufferId};
+use nxvim_core::{unicode, view::WindowView, BufferId, WinHl};
 use rmpv::Value;
 use std::collections::HashMap;
 
@@ -273,6 +273,7 @@ impl EditHost {
     pub(crate) fn highlights_for(
         &self,
         buffer: BufferId,
+        winhl: &WinHl,
         segs: &[crate::redraw::RowSeg],
         styles: &mut StyleTable,
     ) -> Value {
@@ -340,7 +341,7 @@ impl EditHost {
                             // rebase to row-local columns (so a wrapped continuation
                             // row paints only its slice, at the right column).
                             let (start, end) = seg.clip(vc.at(s.start), vc.at(s.end))?;
-                            let style_id = match self.editor.highlights.resolve_capture(&s.group) {
+                            let style_id = match self.resolve_capture_winhl(winhl, &s.group) {
                                 Some(style) => Value::from(styles.intern(style) as u64),
                                 None => Value::Nil,
                             };
@@ -392,9 +393,9 @@ impl EditHost {
                         // Clip the merged span to this row's wrap segment, rebased.
                         let (start, end) = seg.clip(vc.at(sb), vc.at(eb))?;
                         let resolved = if capture {
-                            self.editor.highlights.resolve_capture(group)
+                            self.resolve_capture_winhl(winhl, group)
                         } else {
-                            self.editor.highlights.resolve(group)
+                            self.resolve_winhl(winhl, group)
                         };
                         let style_id = match resolved {
                             Some(style) => Value::from(styles.intern(style) as u64),

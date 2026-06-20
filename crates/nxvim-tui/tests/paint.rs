@@ -665,6 +665,54 @@ fn the_normal_background_fills_the_text_area() {
 }
 
 #[test]
+fn a_windows_winhighlight_chrome_override_repaints_only_its_own_background() {
+    // Two stacked windows over one palette: entry 0 = global Normal (#1e1e2e),
+    // entry 1 = a sidebar NormalSB (#202030). The top window has no `winhighlight`,
+    // so it uses the global `chrome.normal`; the bottom window carries a per-window
+    // `chrome` override remapping `normal` to palette 1 (a dock with
+    // `winhighlight = 'Normal:NormalSB'`). Each background paints independently.
+    let top = match window(rect(0, 0, 20, 4), false, "main.txt", &["main"]) {
+        Value::Map(m) => m,
+        _ => unreachable!(),
+    };
+    let mut bottom = match window(rect(0, 5, 20, 4), true, "dock.txt", &["dock"]) {
+        Value::Map(m) => m,
+        _ => unreachable!(),
+    };
+    // Only the bottom window renames `normal` → palette entry 1.
+    bottom.push((Value::from("chrome"), chrome(vec![("normal", 1)])));
+
+    let v = view(vec![
+        (
+            "styles",
+            Value::Array(vec![
+                style(vec![("bg", rgb(0x1e, 0x1e, 0x2e))]),
+                style(vec![("bg", rgb(0x20, 0x20, 0x30))]),
+            ]),
+        ),
+        ("chrome", chrome(vec![("normal", 0)])),
+        (
+            "windows",
+            Value::Array(vec![Value::Map(top), Value::Map(bottom)]),
+        ),
+    ]);
+    let buf = paint(&v, 20, 10);
+
+    // Top window (no override): global Normal background.
+    assert_eq!(
+        bg(&buf, 10, 0),
+        Some(Color::Rgb(0x1e, 0x1e, 0x2e)),
+        "the un-remapped window keeps the global Normal background"
+    );
+    // Bottom window (winhighlight Normal:NormalSB): the override background.
+    assert_eq!(
+        bg(&buf, 10, 5),
+        Some(Color::Rgb(0x20, 0x20, 0x30)),
+        "the winhighlight window repaints its own background with NormalSB"
+    );
+}
+
+#[test]
 fn the_padding_margin_shares_the_normal_background() {
     // A tiled window with a 2-cell `'padding'` margin and a themed `Normal`
     // background: the blank margin cells around the content must carry that same

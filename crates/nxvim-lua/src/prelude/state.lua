@@ -941,6 +941,8 @@ local WIN_OPT_CANON = {
   fcs = "fillchars",
   padding = "padding",
   pad = "padding",
+  winhighlight = "winhighlight",
+  winhl = "winhighlight",
 }
 local WIN_OPT_DEFAULT = {
   number = true,
@@ -951,6 +953,7 @@ local WIN_OPT_DEFAULT = {
   signcolumn = "auto",
   fillchars = "",
   padding = "",
+  winhighlight = "",
 }
 -- Exposed for this file's nvim_{get,set}_option_value, which classify a name
 -- as window-scoped before routing it through nx.wo.

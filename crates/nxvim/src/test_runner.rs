@@ -84,6 +84,8 @@ fn spawn_server(plugin_dir: PathBuf) -> (Rpc, UnboundedReceiver<Incoming>) {
             // (so `require("<plugin>")` resolves), no persistence, no host clipboard.
             config_dir: None,
             shada: None,
+            workspace_session: false,
+            restore_session: false,
             runtimepath: vec![plugin_dir],
             clipboard: ClipboardProvider::Disabled,
             mouse_clock: None,

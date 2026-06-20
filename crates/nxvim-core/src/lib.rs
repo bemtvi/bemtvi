@@ -38,8 +38,8 @@ pub use editor::{
     FloatRelative, GlobalMarkEntry, JumpPos, Margin, MenuGeom, MenuItem, MenuMetrics,
     MenuPlacement, NumberedMark, PendingOpen, PendingQuitAll, PendingSave, PersistState,
     PreviewScroll, PreviewTarget, PromptPos, QfAction, QfEntry, QfList, QfStack, QfWhich,
-    RegisterEntry, ShadaRequest, StatuslineClick, TabId, TerminalOp, UndoEntry, UndoTreeView,
-    WindowConfigSpec, WindowId,
+    RegisterEntry, SessionDock, SessionState, SessionTab, SessionWindow, ShadaRequest,
+    StatuslineClick, TabId, TerminalOp, UndoEntry, UndoTreeView, WindowConfigSpec, WindowId,
 };
 pub use encoding::Encoding;
 pub use extmark::{

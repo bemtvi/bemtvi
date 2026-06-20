@@ -73,7 +73,9 @@ portable-pty = { workspace = true, optional = true }
 # (`:set regexsyntax=vim`). Enabled here so the whole host workspace — and the
 # integration tests — build it in via feature unification. The C compiles under
 # emscripten too, so it stays on for the wasm `nxvim-edithost` build.
-nxvim-core = { workspace = true, features = ["vim-regex"] }
+# `serde` derives the persistence snapshot (`PersistState` / `SessionState`) so the
+# shada store can serialize the workspace session directly (see `shada.rs`).
+nxvim-core = { workspace = true, features = ["vim-regex", "serde"] }
 nxvim-rpc = { workspace = true, optional = true }
 nxvim-lua.workspace = true
 nxvim-lsp.workspace = true

@@ -40,6 +40,145 @@ use nxvim_server::{
     run_daemon_io as run_server_daemon_io, serve_quic, DaemonClient, ServerInit,
 };
 
+/// The shada-namespace options derived from the command line. nxvim itself never reads
+/// a project file — the namespace is always supplied via `--shada-namespace` (a
+/// workspace plugin's wrapper script relaunches with it). `restore` mirrors
+/// `--restore-session`. Moved onto the server thread, so it is `Send` (plain data).
+#[derive(Clone, Default)]
+struct ShadaOpts {
+    namespace: Option<String>,
+    restore: bool,
+}
+
+impl ShadaOpts {
+    /// Build from the parsed CLI, validating the namespace token and stamping it into
+    /// [`nxvim_server::WORKSPACE_NS_ENV`] so `nx._workspace_namespace()` reads it back.
+    /// Called once in `main`, before any server thread is spawned (no concurrent env
+    /// reader). An invalid namespace aborts — the wrapper supplied a bad value.
+    fn from_cli(cli: &Cli) -> Result<Self> {
+        let namespace =
+            match cli.shada_namespace.as_deref() {
+                Some(raw) => Some(nxvim_server::valid_namespace(raw).ok_or_else(|| {
+                    anyhow!("invalid --shada-namespace {raw:?} (use [A-Za-z0-9_-])")
+                })?),
+                None => None,
+            };
+        std::env::set_var(
+            nxvim_server::SHADA_NAMESPACE_ENV,
+            namespace.as_deref().unwrap_or(""),
+        );
+        Ok(ShadaOpts {
+            namespace,
+            restore: cli.restore_session,
+        })
+    }
+
+    fn store(&self) -> Box<dyn nxvim_server::ShadaStore + Send> {
+        nxvim_server::workspace_shada(self.namespace.as_deref())
+    }
+
+    /// A namespaced launch captures the session; the global store never does.
+    fn capture(&self) -> bool {
+        self.namespace.is_some()
+    }
+
+    /// Restore the layout only when explicitly asked AND a namespace is present.
+    fn do_restore(&self) -> bool {
+        self.namespace.is_some() && self.restore
+    }
+}
+
+/// Env var carrying this process's positional file arguments (newline-joined), read back
+/// by `nx.argv()`. Set once in `main` so it is available in every role.
+const ARGV_ENV: &str = "NXVIM_ARGV";
+
+/// `--lua CODE` headless mode: boot an embedded server with the user's config +
+/// runtimepath (so plugins load), evaluate CODE once, then exit — no UI. CODE is a Lua
+/// EXPRESSION; if it yields a promise the wrapper waits for it to settle. A workspace
+/// wrapper uses this to read its config and relaunch with `--shada-namespace` via
+/// `nx.reexec`, which replaces this process (so the wrapper's `:qa!` never runs).
+fn run_lua_oneshot(code: String) -> Result<()> {
+    use std::time::Duration;
+
+    // Mark this as a oneshot bootstrap so a workspace plugin skips its interactive
+    // auto-evaluation (it should only relaunch, not prompt). `os.getenv("NXVIM_LUA_ONESHOT")`
+    // is the Lua signal. (`NXVIM_ARGV` for `nx.argv()` is already set by `main`.)
+    std::env::set_var("NXVIM_LUA_ONESHOT", "1");
+
+    let (config_dir, runtimepath) = nxvim_server::default_runtime();
+    let (server_end, client_end) = tokio::io::duplex(1 << 16);
+    std::thread::spawn(move || {
+        let init = ServerInit {
+            file: None,
+            config_dir,
+            // A oneshot never persists and offers no first-run UI.
+            shada: None,
+            runtimepath,
+            clipboard: nxvim_server::ClipboardProvider::Disabled,
+            offer_default_recommended: false,
+            cmdline_complete_default: false,
+            ..Default::default()
+        };
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_io()
+            .enable_time()
+            .build()
+            .expect("lua-oneshot server runtime");
+        let _ = runtime.block_on(run_server(server_end, init));
+    });
+
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_io()
+        .enable_time()
+        .build()?;
+    runtime.block_on(async move {
+        let (reader, writer) = tokio::io::split(client_end);
+        let (rpc, _incoming) = nxvim_rpc::connect(reader, writer);
+
+        // Run CODE inside an async context (so a top-level `nx.await` in CODE works),
+        // await it if it yields a promise, and set a completion flag when it settles. If
+        // CODE calls `nx._reexec`, the process is replaced before the flag is ever read.
+        let wrapped = format!(
+            "_G.__nxvim_oneshot_done = false\n\
+             nx.async(function()\n\
+             local __r = ({code})\n\
+             if type(__r) == 'table' and type(__r.next) == 'function' then __r = nx.await(__r) end\n\
+             return __r\n\
+             end)():next(\n\
+             function() _G.__nxvim_oneshot_done = true end,\n\
+             function(e) nx.notify('nxvim --lua: ' .. tostring(e), 4); _G.__nxvim_oneshot_done = true end)\n"
+        );
+        let _ = rpc
+            .request(
+                "nvim_exec_lua",
+                vec![rmpv::Value::from(wrapped), rmpv::Value::Array(vec![])],
+            )
+            .await;
+
+        // Poll the flag until the chunk settles (each request pumps a server tick, so the
+        // async work — fs reads, the reexec — makes progress), bounded so a hung chunk
+        // can't wedge a shell. Returning exits the process (dropping the server thread).
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        loop {
+            let done = rpc
+                .request(
+                    "nvim_exec_lua",
+                    vec![
+                        rmpv::Value::from("return _G.__nxvim_oneshot_done == true"),
+                        rmpv::Value::Array(vec![]),
+                    ],
+                )
+                .await;
+            if matches!(done, Ok(rmpv::Value::Boolean(true))) || std::time::Instant::now() > deadline
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(15)).await;
+        }
+        Ok(())
+    })
+}
+
 /// The argument that runs this binary as the **daemon** (no UI, no editor): just the
 /// fs + process + watch + LSP host the *edit-host split* drives. Defined as a constant
 /// because [`daemon_command`] also passes it to the child it spawns. With `--listen` it
@@ -111,6 +250,18 @@ struct Cli {
     /// With --daemon, bind a QUIC listener at [ADDR] (default 127.0.0.1:8765) instead of using stdio
     #[arg(long, value_name = "ADDR", num_args = 0..=1, requires = "daemon")]
     listen: Option<Option<SocketAddr>>,
+
+    /// Scope shada (marks, registers, session) to a private ns/<NS> subfolder for this launch
+    #[arg(long, value_name = "NS")]
+    shada_namespace: Option<String>,
+
+    /// Restore the saved window/tab layout at startup (requires --shada-namespace)
+    #[arg(long, requires = "shada_namespace")]
+    restore_session: bool,
+
+    /// Run a Lua chunk after sourcing config, then exit (no UI) — for workspace wrapper scripts
+    #[arg(long, value_name = "CODE")]
+    lua: Option<String>,
 }
 
 fn main() -> Result<()> {
@@ -142,6 +293,16 @@ fn main() -> Result<()> {
         .find(|a| !a.starts_with(CONNECT_URI_SCHEME))
         .cloned();
 
+    // Expose every positional file argument to `nx.argv()` (newline-joined), in all
+    // roles, before any server thread reads the environment.
+    let argv: Vec<&str> = cli
+        .targets
+        .iter()
+        .filter(|a| !a.starts_with(CONNECT_URI_SCHEME))
+        .map(String::as_str)
+        .collect();
+    std::env::set_var(ARGV_ENV, argv.join("\n"));
+
     // Plugin test runner role: no editor UI — boot an embedded server, drive the Lua
     // `nx.test` suite, and exit with the pass/fail code. The positional is the plugin
     // dir (default: the cwd).
@@ -169,17 +330,29 @@ fn main() -> Result<()> {
         return run_daemon();
     }
 
+    // Validate + stamp the shada namespace (from `--shada-namespace`) once, before any
+    // server thread. nxvim never reads a project file: the namespace is always on the
+    // command line (a workspace plugin's wrapper relaunches with it).
+    let shada = ShadaOpts::from_cli(&cli)?;
+
+    // `--lua` headless mode: source config (so plugins load), run the one-liner, exit —
+    // no UI. A workspace wrapper uses it to read its config and relaunch with the right
+    // `--shada-namespace`; see `nx.reexec`.
+    if let Some(code) = cli.lua.clone() {
+        return run_lua_oneshot(code);
+    }
+
     // Edit-host split, local half, over QUIC: a `nxvim://…` target (with or without the
     // `--connect-daemon` flag) connects to a `--daemon --listen` listener and routes
     // fs/process/watch/LSP to it. Checked before the stdio-child split below.
     if let Some(uri) = connect_uri {
-        return run_with_daemon_quic(file, &uri);
+        return run_with_daemon_quic(file, &uri, shada);
     }
 
     // Edit-host split, local half, over stdio: the default editor + UI, but spawning a
     // `--daemon` child and routing fs/process/watch/LSP to it over stdio pipes.
     if cli.connect_daemon {
-        return run_with_daemon(file);
+        return run_with_daemon(file, shada);
     }
 
     // In-process, bidirectional transport between client and server.
@@ -192,9 +365,14 @@ fn main() -> Result<()> {
         file,
         config_dir,
         // Persist cross-session state (registers, marks, history, …) under
-        // `stdpath("state")/shada`. Editor state lives where the editor runs, so the
+        // `stdpath("state")/shada`, or a private `ns/<NS>` subfolder when
+        // `--shada-namespace` is given. Editor state lives where the editor runs, so the
         // edit-host split persists locally (only fs/proc cross to the daemon).
-        shada: Some(nxvim_server::default_shada()),
+        shada: Some(shada.store()),
+        // A namespaced launch also captures the editor session (open files + exact
+        // layout); `--restore-session` reapplies it at boot.
+        workspace_session: shada.capture(),
+        restore_session: shada.do_restore(),
         runtimepath,
         // The real editor wires the host clipboard for the `"+` / `"*` registers.
         clipboard: nxvim_server::ClipboardProvider::System,
@@ -328,8 +506,8 @@ fn daemon_command() -> Result<tokio::process::Command> {
 /// daemon (its stdio *is* the wire), wraps it in [`connect_daemon`], and runs the editor
 /// against those seams. The daemon's stderr is redirected to a temp log (it can't corrupt
 /// the TUI); `tail` it to debug the daemon. `kill_on_drop` reaps the child on quit.
-fn run_with_daemon(file: Option<String>) -> Result<()> {
-    run_edit_host_session(file, || {
+fn run_with_daemon(file: Option<String>, shada: ShadaOpts) -> Result<()> {
+    run_edit_host_session(file, shada, || {
         // The daemon's stderr can't share the terminal with the TUI; send it to a
         // log the user can tail to diagnose the daemon side.
         let log_path = std::env::temp_dir().join("nxvim-daemon.log");
@@ -358,9 +536,9 @@ fn run_with_daemon(file: Option<String>) -> Result<()> {
 /// only the transport differs — [`connect_quic`] pins the daemon's cert TOFU and presents
 /// the bearer token, then returns the same five seams. The QUIC endpoint + connection are
 /// owned by `connect_quic`'s link thread, so there is no child to hold.
-fn run_with_daemon_quic(file: Option<String>, uri: &str) -> Result<()> {
+fn run_with_daemon_quic(file: Option<String>, uri: &str, shada: ShadaOpts) -> Result<()> {
     let (url, cert_hash, token) = parse_connect_uri(uri)?;
-    run_edit_host_session(file, move || {
+    run_edit_host_session(file, shada, move || {
         let client = connect_quic(&url, &cert_hash, &token)?;
         Ok((client, Box::new(())))
     })
@@ -372,7 +550,7 @@ fn run_with_daemon_quic(file: Option<String>, uri: &str) -> Result<()> {
 /// and yields the [`DaemonClient`] plus a guard kept alive for the whole session (the
 /// stdio child, so `kill_on_drop` reaps it on quit; `()` for QUIC). Config and the
 /// keystroke path stay local; only fs/process/watch/LSP cross to the daemon.
-fn run_edit_host_session<F>(file: Option<String>, connect: F) -> Result<()>
+fn run_edit_host_session<F>(file: Option<String>, shada: ShadaOpts, connect: F) -> Result<()>
 where
     F: FnOnce() -> Result<(DaemonClient, Box<dyn std::any::Any + Send>)> + Send + 'static,
 {
@@ -391,8 +569,11 @@ where
                 file,
                 config_dir,
                 // Editor + Lua run locally in a daemon session, so shada is local
-                // too (only fs/proc/LSP cross to the daemon).
-                shada: Some(nxvim_server::default_shada()),
+                // too (only fs/proc/LSP cross to the daemon) — including the
+                // `--shada-namespace` workspace store + session.
+                shada: Some(shada.store()),
+                workspace_session: shada.capture(),
+                restore_session: shada.do_restore(),
                 runtimepath,
                 clipboard: nxvim_server::ClipboardProvider::System,
                 mouse_clock: None,

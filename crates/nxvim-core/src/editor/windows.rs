@@ -437,6 +437,59 @@ impl Node {
             }
         }
     }
+
+    /// Project the (private) split tree into a [`LayoutNode`] — the shape, with window
+    /// ids at the leaves — so the persistence layer can capture the EXACT layout without
+    /// `Node` itself crossing the module boundary.
+    fn to_layout(&self) -> LayoutNode {
+        match self {
+            Node::Leaf(id) => LayoutNode::Leaf(*id),
+            Node::Split {
+                dir,
+                children,
+                sizes,
+            } => LayoutNode::Split {
+                vertical: matches!(dir, SplitDir::Vertical),
+                sizes: sizes.clone(),
+                children: children.iter().map(Node::to_layout).collect(),
+            },
+        }
+    }
+
+    /// Rebuild a split tree from a [`LayoutNode`] skeleton (restore). The leaf ids must
+    /// already be minted and present in the accompanying window map.
+    fn from_layout(layout: &LayoutNode) -> Node {
+        match layout {
+            LayoutNode::Leaf(id) => Node::Leaf(*id),
+            LayoutNode::Split {
+                vertical,
+                sizes,
+                children,
+            } => Node::Split {
+                dir: if *vertical {
+                    SplitDir::Vertical
+                } else {
+                    SplitDir::Horizontal
+                },
+                sizes: sizes.clone(),
+                children: children.iter().map(Node::from_layout).collect(),
+            },
+        }
+    }
+}
+
+/// A boundary-crossing snapshot of the split tree's *shape*: the [`Node`] structure with
+/// window ids at the leaves and the split direction flattened to a bool. The window
+/// model keeps [`Node`] private; this is what `persist.rs` captures and rebuilds so a
+/// session restores the EXACT nesting and (proportional) sizes, not an approximation.
+#[derive(Debug, Clone)]
+pub(crate) enum LayoutNode {
+    Leaf(WindowId),
+    Split {
+        vertical: bool,
+        sizes: Vec<usize>,
+        children: Vec<LayoutNode>,
+    },
 }
 
 /// The window layout: every open window keyed by id, the `root` of the split
@@ -496,6 +549,54 @@ impl WindowTree {
             windows,
             root: Node::Leaf(id),
             current: id,
+            separators: Vec::new(),
+            floats: Vec::new(),
+        }
+    }
+
+    /// The split tree's shape as a [`LayoutNode`] (window ids at the leaves) — the
+    /// capture half of session save/restore.
+    pub(crate) fn layout_node(&self) -> LayoutNode {
+        self.root.to_layout()
+    }
+
+    /// A tiled window with the given view state and otherwise-default fields — the
+    /// restore-time twin of [`with_window`](Self::with_window)'s seed window.
+    pub(crate) fn tiled_window(
+        buffer: BufferId,
+        saved_cursor: Cursor,
+        saved_top: usize,
+        saved_leftcol: usize,
+    ) -> Window {
+        Window {
+            buffer,
+            saved_cursor,
+            saved_top,
+            saved_leftcol,
+            saved_cursors: Vec::new(),
+            rect: Rect::default(),
+            options: WindowOptions::default(),
+            float: None,
+            jumps: Vec::new(),
+            jump_idx: 0,
+            resume: None,
+            loclist: None,
+            loclist_bufnr: None,
+        }
+    }
+
+    /// Assemble a tree from a prebuilt window map + a [`LayoutNode`] skeleton (restore).
+    /// `current` must be one of the leaf ids in `root`. Separators are recomputed by the
+    /// next [`relayout`](Self::relayout); there are no floats in a restored layout.
+    pub(crate) fn from_layout(
+        windows: BTreeMap<WindowId, Window>,
+        root: LayoutNode,
+        current: WindowId,
+    ) -> Self {
+        WindowTree {
+            windows,
+            root: Node::from_layout(&root),
+            current,
             separators: Vec::new(),
             floats: Vec::new(),
         }

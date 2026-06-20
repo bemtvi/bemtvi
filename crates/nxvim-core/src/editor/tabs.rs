@@ -61,6 +61,13 @@ impl Editor {
         }
     }
 
+    /// The split-tree shape of tab `id` as a [`LayoutNode`] — the session-capture
+    /// accessor (`persist.rs` resolves the leaf ids to file paths). `None` if `id` names
+    /// no open tab.
+    pub(crate) fn tab_layout_node(&self, id: TabId) -> Option<super::windows::LayoutNode> {
+        self.tab_tree(id).map(|t| t.layout_node())
+    }
+
     /// Every window id in tab `id`, in the same order [`Editor::window_ids`] uses
     /// (`nvim_tabpage_list_wins`). `None` if `id` names no open tab.
     pub fn tab_window_ids(&self, id: TabId) -> Option<Vec<WindowId>> {

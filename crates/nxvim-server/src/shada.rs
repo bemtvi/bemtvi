@@ -127,6 +127,13 @@ const JUMPLIST: TableDefinition<u64, &[u8]> = TableDefinition::new("jumplist");
 /// becomes `'0` next launch.
 const META: TableDefinition<&str, &[u8]> = TableDefinition::new("meta");
 
+/// `session` table: a single `"v"` row holding the msgpack [`SessionState`] (the
+/// open files + tab/split layout for a namespaced workspace). Like the jumplist, the
+/// newest store's whole value wins on merge (keyed by `meta.flush_ts`). A separate
+/// table — rather than a `StoredMeta` field — so an existing global store's
+/// array-encoded `meta` row stays byte-compatible; old stores simply lack the table.
+const SESSION: TableDefinition<&str, &[u8]> = TableDefinition::new("session");
+
 /// A register as stored on disk: its contents, paste kind, and the write
 /// timestamp that drives the cross-instance recency merge.
 #[derive(Serialize, Deserialize)]
@@ -462,6 +469,18 @@ fn write_state(db: &Database, state: &PersistState) -> std::io::Result<()> {
             .insert("meta", bytes.as_slice())
             .map_err(std::io::Error::other)?;
     }
+    {
+        // The session is a whole-value record (newest store wins, keyed by flush_ts):
+        // rewrite the single row, or clear it when there's nothing to save.
+        let mut table = wtxn.open_table(SESSION).map_err(std::io::Error::other)?;
+        table.retain(|_, _| false).map_err(std::io::Error::other)?;
+        if let Some(session) = &state.session {
+            let bytes = rmp_serde::to_vec(session).map_err(std::io::Error::other)?;
+            table
+                .insert("v", bytes.as_slice())
+                .map_err(std::io::Error::other)?;
+        }
+    }
     write_history(&wtxn, HIST_SEARCH, &state.search_history, ts)?;
     write_history(&wtxn, HIST_EX, &state.ex_history, ts)?;
     wtxn.commit().map_err(std::io::Error::other)?;
@@ -509,6 +528,9 @@ struct MergedRaw {
     jumplist: (u64, Vec<StoredPos>),
     /// The newest *clean* exit cursor across the stores (keyed by `meta.exit_ts`).
     exit: (u64, Option<StoredPos>),
+    /// The workspace session (open files + layout): newest store's whole value wins,
+    /// keyed by `meta.flush_ts` like the jumplist. `None` until a store carries one.
+    session: (u64, Option<nxvim_core::SessionState>),
 }
 
 /// Recency-merge a set of opened stores into one [`MergedRaw`]: per-key newest-`ts`
@@ -530,6 +552,9 @@ fn collect_merge<'a>(dbs: impl IntoIterator<Item = &'a Database>) -> MergedRaw {
             if meta.flush_ts > m.jumplist.0 {
                 m.jumplist = (meta.flush_ts, read_jumplist(db));
             }
+            if meta.flush_ts > m.session.0 {
+                m.session = (meta.flush_ts, read_session(db));
+            }
             if let Some(exit) = meta.exit {
                 if meta.exit_ts > m.exit.0 {
                     m.exit = (meta.exit_ts, Some(exit));
@@ -538,6 +563,19 @@ fn collect_merge<'a>(dbs: impl IntoIterator<Item = &'a Database>) -> MergedRaw {
         }
     }
     m
+}
+
+/// Read one store's `session` row (the msgpack [`SessionState`] blob), or `None` when
+/// the table is absent (old store) / empty / undecodable.
+fn read_session(db: &Database) -> Option<nxvim_core::SessionState> {
+    let rtxn = db.begin_read().ok()?;
+    let table = match rtxn.open_table(SESSION) {
+        Ok(t) => t,
+        Err(TableError::TableDoesNotExist(_)) => return None,
+        Err(_) => return None,
+    };
+    let bytes = table.get("v").ok()??;
+    rmp_serde::from_slice(bytes.value()).ok()
 }
 
 /// Project a [`MergedRaw`] (its numbered marks already resolved to `numbered_marks`,
@@ -597,6 +635,9 @@ fn build_state(m: MergedRaw, numbered_marks: Vec<NumberedMark>) -> PersistState 
             })
             .collect(),
         exit_cursor: None,
+        // The restored workspace session (newest store wins); the server only acts on
+        // it when a workspace namespace is active.
+        session: m.session.1,
     }
 }
 
@@ -925,6 +966,43 @@ pub fn shada_dir() -> PathBuf {
 /// [`shada_dir`]. The wasm Worker build injects a redb-over-OPFS store here instead.
 pub fn default_shada() -> Box<dyn ShadaStore + Send> {
     Box::new(RedbFileStore::new(shada_dir()))
+}
+
+/// The environment variable the binary stamps with the active shada namespace (from
+/// `--shada-namespace`). The Lua side reads it back through `nx.shada.namespace()`, so a
+/// plugin can tell whether *this* launch is the namespace it expected (and, if not,
+/// relaunch). Read-only from Lua — nxvim itself never reads a project file; the namespace
+/// is always supplied on the command line.
+pub const SHADA_NAMESPACE_ENV: &str = "NXVIM_SHADA_NAMESPACE";
+
+/// A namespace becomes a single path component under `shada_dir()/ns/`, so it must be a
+/// safe, traversal-free token. Accept only `[A-Za-z0-9_-]` (a v4 UUID and friends),
+/// bounded in length; anything else is rejected. This guards the `--shada-namespace`
+/// value against smuggling `../…` into the store path. Returns the validated namespace.
+pub fn valid_namespace(ns: &str) -> Option<String> {
+    if ns.is_empty() || ns.len() > 128 {
+        return None;
+    }
+    if ns
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    {
+        Some(ns.to_string())
+    } else {
+        None
+    }
+}
+
+/// The store for the native binary, honoring an optional shada `namespace` (the
+/// `--shada-namespace` value, already validated by [`valid_namespace`]). With a
+/// namespace the store lives under `shada_dir()/ns/<namespace>/`, isolating this
+/// project's registers / marks / history / session from the global store and from
+/// other workspaces; without one it is the global [`default_shada`].
+pub fn workspace_shada(namespace: Option<&str>) -> Box<dyn ShadaStore + Send> {
+    match namespace {
+        Some(ns) => Box::new(RedbFileStore::new(shada_dir().join("ns").join(ns))),
+        None => default_shada(),
+    }
 }
 
 /// Whether `path` is a shada store file, for tests asserting compaction. Public so

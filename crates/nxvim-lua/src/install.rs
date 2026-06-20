@@ -845,6 +845,145 @@ pub(crate) fn install_runtime_api(
         })?,
     )?;
 
+    // ----- nx.shada: per-launch shada namespace + session capture (public API) -----
+    //
+    // A PUBLIC surface any plugin can build on (the bundled workspace plugin is just one
+    // consumer). nxvim itself never chooses a namespace or reads a project file; a
+    // launcher passes `--shada-namespace <id>` and these expose / drive the result.
+    let shada_tbl = lua.create_table()?;
+
+    // `nx.shada.namespace()` -> the shada namespace this launch is scoped to (the
+    // `--shada-namespace` value), isolating its marks / registers / session under
+    // `ns/<id>/`, or `nil` for the global store. READ-ONLY: stamped into the environment
+    // by the binary before any Lua runs, so it reports the namespace THIS process was
+    // launched with (which a project file read from Lua can't, since the store is fixed
+    // first). A plugin compares it against its own config to detect a mismatch.
+    shada_tbl.set(
+        "namespace",
+        lua.create_function(|_, ()| {
+            Ok(match std::env::var("NXVIM_SHADA_NAMESPACE") {
+                Ok(s) if !s.is_empty() => Some(s),
+                _ => None,
+            })
+        })?,
+    )?;
+
+    // `nx.shada.save_layout(enable[, opts])` -> opt this session into CAPTURING the
+    // window/tab layout (the exact split tree, open files, cursors, docks) into the
+    // shada, persisted on exit and restored when the editor is launched with
+    // `--restore-session`. Default OFF — a plugin turns it on once it knows the launch is
+    // the namespace it wanted. Only meaningful with a namespace (the global store never
+    // persists layout). `opts` tunes how sizes are stored:
+    //   * `relative_splits` (default true)  — split sizes as proportional percentages,
+    //     so a 30/70 vsplit restores 30/70 at any terminal width (vs absolute cells).
+    //   * `relative_docks`  (default false) — a dock's size as a percentage of the
+    //     screen (so it scales) rather than a fixed cell count.
+    {
+        let sh = shared.clone();
+        shada_tbl.set(
+            "save_layout",
+            lua.create_function(move |_, (enable, opts): (bool, Option<mlua::Table>)| {
+                let mut sh = sh.borrow_mut();
+                sh.session_save_layout = enable;
+                if enable {
+                    let (rel_splits, rel_docks) = match &opts {
+                        Some(t) => (
+                            t.get::<Option<bool>>("relative_splits")?.unwrap_or(true),
+                            t.get::<Option<bool>>("relative_docks")?.unwrap_or(false),
+                        ),
+                        None => (true, false),
+                    };
+                    sh.session_relative_splits = rel_splits;
+                    sh.session_relative_docks = rel_docks;
+                }
+                Ok(())
+            })?,
+        )?;
+    }
+    nx.set("shada", shada_tbl)?;
+
+    // `nx.uuid()` -> a random v4 UUID in canonical `8-4-4-4-12` hex. A public utility
+    // (the workspace plugin mints session namespaces with it).
+    nx.set(
+        "uuid",
+        lua.create_function(|_, ()| {
+            let mut b = [0u8; 16];
+            // `getrandom::Error` only implements `std::error::Error` with getrandom's
+            // `std` feature (dropped in the wasm-eligible no-default-features build), so
+            // format via its always-present `Display` rather than `Error::external`.
+            getrandom::fill(&mut b)
+                .map_err(|e| mlua::Error::RuntimeError(format!("nx.uuid: {e}")))?;
+            b[6] = (b[6] & 0x0f) | 0x40; // version 4
+            b[8] = (b[8] & 0x3f) | 0x80; // variant 1 (RFC 4122)
+            Ok(format!(
+                "{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-\
+                 {:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
+                b[0],
+                b[1],
+                b[2],
+                b[3],
+                b[4],
+                b[5],
+                b[6],
+                b[7],
+                b[8],
+                b[9],
+                b[10],
+                b[11],
+                b[12],
+                b[13],
+                b[14],
+                b[15]
+            ))
+        })?,
+    )?;
+
+    // `nx.argv()` -> the positional file arguments this process was launched with (a
+    // list of strings; empty when none). A launcher / wrapper reads them to forward to a
+    // relaunched editor. Carried through `NXVIM_ARGV` (newline-joined) so the binary
+    // stays the single source of truth.
+    nx.set(
+        "argv",
+        lua.create_function(|lua, ()| {
+            let joined = std::env::var("NXVIM_ARGV").unwrap_or_default();
+            let items: Vec<&str> = if joined.is_empty() {
+                Vec::new()
+            } else {
+                joined.split('\n').collect()
+            };
+            lua.create_sequence_from(items)
+        })?,
+    )?;
+
+    // `nx.reexec(args)` -> replace THIS process with a fresh `nxvim args…` (the current
+    // executable). A launcher uses it to relaunch the editor with chosen flags (e.g.
+    // `--shada-namespace` + `--restore-session`). On Unix this `execv`s (never returns
+    // on success); elsewhere it spawns + exits with the child's status. Raises if the
+    // exec / spawn itself fails.
+    nx.set(
+        "reexec",
+        lua.create_function(|_, args: Vec<String>| -> mlua::Result<()> {
+            let exe = std::env::current_exe()
+                .map_err(|e| mlua::Error::RuntimeError(format!("nx.reexec: current_exe: {e}")))?;
+            let mut cmd = std::process::Command::new(exe);
+            cmd.args(&args);
+            #[cfg(unix)]
+            {
+                use std::os::unix::process::CommandExt;
+                // execv: replaces the image; only returns on failure.
+                let err = cmd.exec();
+                Err(mlua::Error::RuntimeError(format!("nx.reexec: {err}")))
+            }
+            #[cfg(not(unix))]
+            {
+                let status = cmd
+                    .status()
+                    .map_err(|e| mlua::Error::RuntimeError(format!("nx.reexec: {e}")))?;
+                std::process::exit(status.code().unwrap_or(1));
+            }
+        })?,
+    )?;
+
     // `nx.now_ms()`: wall-clock milliseconds since the Unix epoch, as a Lua number
     // (a float, so it stays width-safe on the wasm `i32` integer build). A real
     // time read for timing / scheduling math — the plugin test runner stamps each

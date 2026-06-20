@@ -652,6 +652,18 @@ pub(crate) struct Shared {
     /// no provider is set it skips the whole off-tick decor path (never slices the
     /// visible lines, never re-enters Lua). Phase 2 of `nx.decor`.
     pub(crate) decor_active: bool,
+    /// Whether the workspace session should CAPTURE the window/tab layout into the
+    /// (namespaced) shada. Default `false`; a workspace plugin flips it on via
+    /// `nx.shada.save_layout(true)` once it knows this is the right namespace. The
+    /// server reads it at flush ([`LuaRuntime::session_save_layout`]).
+    pub(crate) session_save_layout: bool,
+    /// Whether split sizes are captured as proportional PERCENTAGES (vs absolute cells).
+    /// Set alongside [`session_save_layout`] from the `relative_splits` option (default
+    /// true). Read by the server at flush.
+    pub(crate) session_relative_splits: bool,
+    /// Whether a dock's size is captured as a PERCENTAGE of the screen (vs absolute
+    /// cells). From the `relative_docks` option (default false). Read at flush.
+    pub(crate) session_relative_docks: bool,
     /// Whether any `nx.on_key_pending` listener has been registered
     /// (`nx._key_pending_register`). The gate the server checks before computing /
     /// pushing the pending-key signal: while no listener is set it never walks the
@@ -1405,6 +1417,22 @@ impl LuaRuntime {
     /// on scroll. Phase 2 of `nx.decor`.
     pub fn has_decor_providers(&self) -> bool {
         self.shared.borrow().decor_active
+    }
+
+    /// Whether a workspace plugin opted this session into capturing the window/tab
+    /// layout (`nx.shada.save_layout`). The server gates session capture on it.
+    pub fn session_save_layout(&self) -> bool {
+        self.shared.borrow().session_save_layout
+    }
+
+    /// Whether split sizes should be captured as proportional percentages (default true).
+    pub fn session_relative_splits(&self) -> bool {
+        self.shared.borrow().session_relative_splits
+    }
+
+    /// Whether dock sizes should be captured as a percentage of the screen (default false).
+    pub fn session_relative_docks(&self) -> bool {
+        self.shared.borrow().session_relative_docks
     }
 
     /// Whether any `nx.on_key_pending` listener has been registered

@@ -93,7 +93,10 @@ pub use nxvim_core::{
 /// file at [`shada_dir`]); the wasm Worker build will pass a redb-over-OPFS store;
 /// tests pass a [`RedbFileStore`] over a temp dir, or `None` to disable.
 #[cfg(feature = "native")]
-pub use shada::{default_shada, is_store_file, shada_dir, RedbFileStore, ShadaStore};
+pub use shada::{
+    default_shada, is_store_file, shada_dir, valid_namespace, workspace_shada, RedbFileStore,
+    ShadaStore, SHADA_NAMESPACE_ENV,
+};
 
 /// The daemon wire protocol for the edit-host split: the daemon-side servers
 /// ([`serve_daemon`] for child processes, [`serve_fs_daemon`] for file reads) and the
@@ -176,6 +179,16 @@ pub struct ServerInit {
     /// it rides [`ServerInit`] onto the server's own thread. See
     /// `docs/plans/2026-06-11-shada-persistence.md`.
     pub shada: Option<Box<dyn ShadaStore + Send>>,
+    /// Whether this launch is a session-scoped workspace (its [`shada`] store is a
+    /// private `ns/<uuid>` subfolder, set via `--shada-namespace`). When `true`, the
+    /// shada additionally **captures** the editor session (open files + exact layout) at
+    /// each flush. Default `false` — the global store never persists layout.
+    pub workspace_session: bool,
+    /// Whether to **restore** a previously captured session (window/tab layout) at boot.
+    /// Explicit and separate from capture: `--restore-session` sets it (requires a
+    /// namespace), so a plain `--shada-namespace` launch isolates marks/registers without
+    /// rearranging your windows. Default `false`.
+    pub restore_session: bool,
     /// Directories Lua searches for modules and runtime files (the runtimepath).
     pub runtimepath: Vec<PathBuf>,
     /// What backs the system-clipboard registers `"+` / `"*`. Defaults to
@@ -400,6 +413,19 @@ pub struct EditHost {
     /// run off the input tick (startup, the debounce arm, exit), never inside it.
     #[cfg(feature = "native")]
     shada: Option<Box<dyn ShadaStore + Send>>,
+    /// Whether this launch is a session-scoped **workspace** (its shada is a private
+    /// `ns/<uuid>` subfolder). Only then does the shada carry the editor *session*
+    /// (open files + layout): capture attaches it at flush, and the boot load applies
+    /// it. Set from [`ServerInit::workspace_session`] (the binary derives it from
+    /// `.nxvim/workspace.json`); `false` for the global store, so plain shada never
+    /// carries layout.
+    #[cfg(feature = "native")]
+    workspace_session: bool,
+    /// Whether to restore the captured session (layout) at boot — the explicit
+    /// `--restore-session` opt-in. Separate from [`workspace_session`](Self::workspace_session)
+    /// (which only governs capture). From [`ServerInit::restore_session`].
+    #[cfg(feature = "native")]
+    restore_session: bool,
     /// Attached UI dimensions `(width, height)`, once a client has attached.
     ui: Option<(usize, usize)>,
     /// Per-buffer highlight memo, keyed by buffer id (created lazily on first
@@ -811,6 +837,10 @@ impl EditHost {
             fx,
             #[cfg(feature = "native")]
             shada: None,
+            #[cfg(feature = "native")]
+            workspace_session: false,
+            #[cfg(feature = "native")]
+            restore_session: false,
             ui: None,
             #[cfg(feature = "native")]
             syntax_states: HashMap::new(),
@@ -1633,7 +1663,19 @@ impl EditHost {
             None => return,
         };
         match result {
-            Ok(state) => self.editor.import_persist(state),
+            Ok(mut state) => {
+                // Pull the workspace session out before import_persist (which only seeds
+                // marks/registers/history); restore the layout eagerly, ONCE at boot, and
+                // only when `--restore-session` asked for it — a `:rshada` re-read must
+                // not re-spawn windows, and a plain namespaced launch must not rearrange.
+                let session = state.session.take();
+                self.editor.import_persist(state);
+                if self.restore_session {
+                    if let Some(session) = session {
+                        self.editor.restore_session(session);
+                    }
+                }
+            }
             Err(e) => {
                 self.editor
                     .echo(format!("shada: could not open store: {e}"));
@@ -1684,6 +1726,14 @@ impl EditHost {
         }
         let mut snap = self.editor.export_persist();
         snap.exit_cursor = None;
+        // Capture the layout only for a namespaced launch whose plugin opted in via
+        // `nx.shada.save_layout(true)` — default off, so a plain session never does.
+        if self.workspace_session && self.lua.session_save_layout() {
+            snap.session = self.editor.export_session(
+                self.lua.session_relative_splits(),
+                self.lua.session_relative_docks(),
+            );
+        }
         if let Some(store) = self.shada.as_mut() {
             // A live checkpoint never compacts: deleting an absorbed sibling while we
             // hold our lock would hide its data from a concurrent launcher. Only the
@@ -1699,7 +1749,13 @@ impl EditHost {
     /// the store drop (releasing its file lock) so the next instance can merge this
     /// one's checkpoint. Best-effort; we're leaving.
     pub(crate) fn shada_flush_final(&mut self) {
-        let snap = self.editor.export_persist();
+        let mut snap = self.editor.export_persist();
+        if self.workspace_session && self.lua.session_save_layout() {
+            snap.session = self.editor.export_session(
+                self.lua.session_relative_splits(),
+                self.lua.session_relative_docks(),
+            );
+        }
         if let Some(store) = self.shada.as_mut() {
             // The clean exit: compact (delete the siblings absorbed at load) *after*
             // this final snapshot — which folds in their data — is durable.
@@ -1975,6 +2031,8 @@ where
     // persistence store (loaded before the first frame) and the optional fake mouse
     // clock (multi-click timing in tests).
     host.shada = init.shada;
+    host.workspace_session = init.workspace_session;
+    host.restore_session = init.restore_session;
     host.mouse_clock = init.mouse_clock;
 
     // No built-in keymap defaults are installed natively any more: the LSP keys

@@ -233,6 +233,10 @@ fn server_init(file: Option<String>, client: Option<DaemonClient>) -> ServerInit
         // Editor state (registers, marks, history) lives where the editor runs — local
         // in both cases — so shada persists locally; only fs/proc cross to the daemon.
         shada: Some(nxvim_server::default_shada()),
+        // The GUI front end does not yet pass `--shada-namespace`, so it uses the global
+        // store and never captures/restores the editor session (v1: TUI only).
+        workspace_session: false,
+        restore_session: false,
         runtimepath,
         clipboard: ClipboardProvider::System,
         mouse_clock: None,

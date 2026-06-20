@@ -178,7 +178,13 @@ local Welcome = nx.view.component({
     local selected = 0
     for _, it in ipairs(view.items) do
       local box = it.checked and "☑" or "☐"
-      local text = box .. " " .. it.label
+      -- Show the FULL source (the exact clone target — owner/repo, url, or dir) as the
+      -- item text, NEVER a friendly basename. This is a trust gate: ticking a row will
+      -- fetch and run that code, so the user must see precisely what they are approving
+      -- (a benign `desc` must not be able to disguise a hostile source). The basename
+      -- label is only a last-resort fallback for a spec that carries no source at all.
+      local name = it.source ~= "" and it.source or it.label
+      local text = box .. " " .. name
       lines[#lines + 1] = text
       local line = #lines - 1
       decor[#decor + 1] = {
@@ -188,11 +194,11 @@ local Welcome = nx.view.component({
         end_col = #box,
         hl_group = it.checked and "NxPluginsLoaded" or "NxPluginsDim",
       }
-      -- A short human description (falling back to the source) trails the name, dim.
-      local detail = (it.desc ~= "" and it.desc) or it.source
-      if detail ~= "" then
+      -- The human description, when present, trails the source dim — extra context
+      -- alongside the source, never a substitute for it.
+      if it.desc ~= "" then
         decor[#decor + 1] =
-          { line = line, col = #text, virt_text = { { " — " .. detail, "NxPluginsDim" } } }
+          { line = line, col = #text, virt_text = { { " — " .. it.desc, "NxPluginsDim" } } }
       end
       if it.checked then
         selected = selected + 1

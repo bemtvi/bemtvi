@@ -742,6 +742,52 @@ async fn welcome_untick_excludes_a_plugin() {
     );
 }
 
+// ----- the welcome checklist is a trust gate: it must show the full source ----
+
+// Ticking a recommendation fetches and runs that code, so the checklist has to show
+// the EXACT clone target (owner/repo / url / dir), never just a friendly name + a
+// human description — otherwise a benign-looking `desc` could disguise a hostile
+// `src`. The rendered item line must contain the full source even when a desc is set.
+#[tokio::test]
+async fn welcome_shows_the_full_source_not_just_name_and_desc() {
+    let (rpc, _i) = start().await;
+    let src = temp_dir("plug_src_visible_src");
+    let repo = make_repo(&src, "realrepo");
+    let _cfg = setup_root_and_config(&rpc, "plug_src_visible").await;
+
+    // A spec whose friendly name + description say nothing about where the code comes
+    // from — the source is a distinct `file://` path the user needs to see.
+    exec_lua(
+        &rpc,
+        &format!(
+            "nx.plugins.recommend({{ {{ \"file://{repo}\",\n\
+               name = \"friendly\", desc = \"Looks harmless\" }} }})\n\
+             nx.plugins.bootstrap()",
+            repo = q(&repo)
+        ),
+    )
+    .await;
+
+    assert!(poll_true(&rpc, "return vim.bo.filetype == 'nxpluginswelcome'").await);
+
+    // The rendered checklist line carries the FULL source path, not just "friendly".
+    let needle = format!("file://{repo}", repo = repo.display());
+    let mut shown = false;
+    for _ in 0..200 {
+        let ls = lines(&rpc).await;
+        if ls.iter().any(|l| l.contains('☑') && l.contains(&needle)) {
+            shown = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(
+        shown,
+        "the welcome checklist must render the full source ({needle}) on the ticked item, \
+         not hide it behind the name/desc"
+    );
+}
+
 // ----- the manager UI: live task state + the dashboard view ------------------
 
 // The manager UI renders LIVE per-plugin progress from `M._tasks` and re-renders via

@@ -862,17 +862,17 @@ async fn echo_of_an_undefined_variable_fails_loud() {
 }
 
 #[tokio::test]
-async fn helptags_is_recognized_and_reports_no_help_system() {
-    // Plugin managers call `:helptags` during install. nxvim has no help system
-    // yet, so the command can't do its job — but it must not fall through to the
-    // unknown-command path (which can abort the caller). It completes with a loud
-    // message saying nothing was generated, and leaves the buffer untouched.
+async fn helptags_points_at_the_nxvim_help_plugin() {
+    // The help system ships as the optional nxvim-help plugin; tag generation is its
+    // `:NxHelptags`. With the plugin absent, `:helptags` must not fall through to the
+    // unknown-command path (which can abort a plugin manager mid-install): it points
+    // the user at the plugin, and leaves the buffer untouched.
     let (rpc, mut incoming) = start(None).await;
     feed(&rpc, "ihello<Esc>");
     let msg = message(&redraw_after(&rpc, &mut incoming, ":helptags ALL<CR>").await);
     assert!(
-        msg.contains("helptags") && msg.to_lowercase().contains("not"),
-        "expected a loud not-supported message, got {msg:?}"
+        msg.contains("nxvim-help") && msg.contains("NxHelptags"),
+        "expected a message pointing at the plugin + :NxHelptags, got {msg:?}"
     );
     assert!(
         !msg.contains("E492") && !msg.contains("Not an editor command"),
@@ -882,5 +882,28 @@ async fn helptags_is_recognized_and_reports_no_help_system() {
         lines(&rpc).await,
         vec!["hello"],
         "helptags must not disturb the buffer"
+    );
+}
+
+#[tokio::test]
+async fn help_without_the_plugin_points_at_it() {
+    // `:help` is provided by the optional nxvim-help plugin. With it absent, the
+    // command points the user at the plugin instead of the bare unknown-command
+    // error, and does not disturb the buffer.
+    let (rpc, mut incoming) = start(None).await;
+    feed(&rpc, "ihello<Esc>");
+    let msg = message(&redraw_after(&rpc, &mut incoming, ":help motion<CR>").await);
+    assert!(
+        msg.contains("nxvim-help"),
+        "expected a message pointing at the nxvim-help plugin, got {msg:?}"
+    );
+    assert!(
+        !msg.contains("E492") && !msg.contains("Not an editor command"),
+        "must be recognized, not reported as an unknown command: {msg:?}"
+    );
+    assert_eq!(
+        lines(&rpc).await,
+        vec!["hello"],
+        "help must not disturb the buffer"
     );
 }

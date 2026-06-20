@@ -787,16 +787,10 @@ impl Editor {
                     self.highlights.clear();
                 }
             }
-            // `:helpt[ags]` — recognized but not implemented: nxvim has no help
-            // system yet (no `:help`, no `doc/tags` generation). Plugin managers
-            // (a plugin manager) call this during install; rather than fail as an
-            // unknown command — which can abort the caller — we complete with a loud
-            // message so the install proceeds. NOT a silent no-op: it says plainly
-            // that no tags were written. Replace with a real generator if/when the
-            // help system lands.
-            "helpt" | "helpta" | "helptag" | "helptags" => {
-                self.echo("helptags: not supported — no help system yet, tags not generated");
-            }
+            // `:help` / `:helpt[ags]` are intentionally NOT handled here: the help
+            // system ships as the optional `nxvim-help` plugin. They defer to the
+            // server (below), which runs the plugin's command when installed or, when
+            // it isn't, points the user at the plugin instead of erroring.
             // `:wsh[ada]` / `:rsh[ada][!]` — the explicit shada flush / reload. The
             // store lives in the server (behind the `ShadaStore` seam), so these only
             // *enqueue* a request the server drains after the tick; they never no-op.

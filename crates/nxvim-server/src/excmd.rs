@@ -198,6 +198,27 @@ impl EditHost {
             // the wasm analogue of native's on-disk parser scan.
             #[cfg(not(feature = "native"))]
             "TSInstallInfo" if !self.lua.has_user_command(name, cur_buf) => self.ts_install_info(),
+            // `:help [topic]` — the help system ships as the optional `nxvim-help`
+            // plugin (it registers `:help` / `:h`, handled by the user-command arm
+            // below when installed). With the plugin absent, point the user at it
+            // rather than emit the bare unknown-command error.
+            _ if matches!(base, "help" | "h") && !self.lua.has_user_command(name, cur_buf) => {
+                self.editor.echo(
+                    "help: the nxvim-help plugin is not installed — add it with \
+                     :Plugins (davidrios/nxvim-help), then use :help {topic}",
+                )
+            }
+            // `:helpt[ags]` — tag generation lives in nxvim-help as `:NxHelptags`
+            // (nxvim has no built-in `:helptags`). A plugin that registered
+            // `:helptags` itself would shadow this via the arm below.
+            _ if matches!(base, "helpt" | "helpta" | "helptag" | "helptags")
+                && !self.lua.has_user_command(name, cur_buf) =>
+            {
+                self.editor.echo(
+                    "helptags: install the nxvim-help plugin (:Plugins) and use \
+                     :NxHelptags to generate help tags",
+                )
+            }
             _ if self.lua.has_user_command(name, cur_buf) => {
                 if let Err(e) = self.lua.run_user_command(name, args, cur_buf) {
                     self.editor

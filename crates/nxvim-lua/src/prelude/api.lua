@@ -763,6 +763,48 @@ function nx.win.saveview()
 end
 vim.fn.winsaveview = nx.win.saveview
 
+-- Window-scroll / cursor SETTERS. These take an *explicit* window id (0 = current)
+-- and queue a concrete-handle op, so — unlike a `winrestview()` that binds to
+-- "current" — they work from inside `nx.win.call(other, …)` without tripping the
+-- call-context lock. Built for a side-by-side diff / scrollbind plugin that mirrors
+-- one window's view onto another. A `WinScrolled` autocmd fires for the moved window.
+
+-- nx.win.set_topline(win, topline): scroll `win` so its first visible buffer line is
+-- `topline` (1-based, neovim/`winsaveview` convention; clamped to the last line).
+function nx.win.set_topline(win, topline)
+  nx._win_set_topline(win or 0, math.max(0, (topline or 1) - 1))
+end
+
+-- nx.win.set_leftcol(win, leftcol): horizontally scroll `win` so its first visible
+-- screen column is `leftcol` (0-based). Only meaningful under `'nowrap'`.
+function nx.win.set_leftcol(win, leftcol)
+  nx._win_set_leftcol(win or 0, math.max(0, leftcol or 0))
+end
+
+-- nx.win.set_cursor(win, line[, col]): move `win`'s cursor to `line` (1-based) /
+-- `col` (0-based byte column, default 0). The explicit-win counterpart of the
+-- (intentionally-absent) `nvim_win_set_cursor`.
+function nx.win.set_cursor(win, line, col)
+  nx._win_set_cursor(win or 0, math.max(0, (line or 1) - 1), math.max(0, col or 0))
+end
+
+-- nx.win.restview(win, view): restore `win`'s view from a `winsaveview`-shaped table
+-- (`topline` 1-based, `leftcol` 0-based, optional `lnum`/`col` cursor) — the
+-- explicit-win `winrestview` analogue. Only the present fields are applied.
+function nx.win.restview(win, view)
+  win = win or 0
+  view = view or {}
+  if view.topline then
+    nx.win.set_topline(win, view.topline)
+  end
+  if view.leftcol then
+    nx.win.set_leftcol(win, view.leftcol)
+  end
+  if view.lnum then
+    nx.win.set_cursor(win, view.lnum, view.col or 0)
+  end
+end
+
 -- nx.screen.row() / nx.screen.col() [aliases vim.fn.screenrow / screencol]: the
 -- cursor's 1-based position on the whole screen, mirrored by the server
 -- (nx._cur_screenrow / _cur_screencol) for the focused window. Popup plugins read

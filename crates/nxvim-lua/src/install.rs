@@ -1167,6 +1167,16 @@ pub(crate) fn install_runtime_api(
     )?;
     let sh = shared.clone();
     nx.set(
+        "_win_set_leftcol",
+        lua.create_function(move |_, (win, leftcol): (u64, usize)| {
+            sh.borrow_mut()
+                .window_ops
+                .push(WindowOp::SetLeftcol { win, leftcol });
+            Ok(())
+        })?,
+    )?;
+    let sh = shared.clone();
+    nx.set(
         "_win_set_width",
         lua.create_function(move |_, (win, width): (u64, usize)| {
             sh.borrow_mut()

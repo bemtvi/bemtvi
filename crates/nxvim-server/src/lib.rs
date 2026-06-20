@@ -578,6 +578,12 @@ pub struct EditHost {
     /// `WinResized` (splits, `<C-w>`-resizes, terminal resizes). `None` until the
     /// seed so the first emit doesn't spuriously fire it.
     last_window_rects: Option<Vec<WindowRect>>,
+    /// Each window's `(id, topline, leftcol)` scroll offset at the last diff; a
+    /// change fires `WinScrolled` for that window (vertical or horizontal scroll).
+    /// `None` until the first diff that runs with a `WinScrolled` handler active —
+    /// gated on a registered handler ([`au_active_events`](Self::au_active_events)),
+    /// so scrolling costs nothing when nothing listens (like `CursorMoved`).
+    last_window_scroll: Option<Vec<(WindowId, usize, usize)>>,
     /// The active tab at the last lifecycle diff; `None` until the startup seed. A
     /// change fires `TabLeave`(old) → … → `TabEnter`(new), bracketing the window
     /// events the switch causes (`TabLeave → WinLeave → … → WinEnter → TabEnter`).
@@ -847,6 +853,7 @@ impl EditHost {
             last_window_id: None,
             known_windows: Vec::new(),
             last_window_rects: None,
+            last_window_scroll: None,
             last_tab_id: None,
             known_tabs: Vec::new(),
             last_cursor: None,

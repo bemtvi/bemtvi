@@ -784,6 +784,10 @@ pub enum WindowOp {
     /// window `win` so its first visible line is `top` (0-based; the prelude
     /// converts neovim's 1-based `topline`).
     SetTopline { win: u64, top: usize },
+    /// `nx.win.set_leftcol(win, N)` — horizontally scroll window `win` so its first
+    /// visible screen column is `leftcol` (0-based). The `'nowrap'` companion of
+    /// [`SetTopline`](Self::SetTopline) for a side-by-side / scrollbind plugin.
+    SetLeftcol { win: u64, leftcol: usize },
     /// `nvim_win_set_width(win, width)` — set window `win`'s column width.
     SetWidth { win: u64, width: usize },
     /// `nvim_win_set_height(win, height)` — set window `win`'s text-row height.

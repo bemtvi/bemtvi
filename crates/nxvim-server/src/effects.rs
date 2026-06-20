@@ -1279,6 +1279,10 @@ impl EditHost {
                 let id = resolve_win(self, win);
                 self.editor.set_window_topline(id, top);
             }
+            WindowOp::SetLeftcol { win, leftcol } => {
+                let id = resolve_win(self, win);
+                self.editor.set_window_leftcol(id, leftcol);
+            }
             WindowOp::SetWidth { win, width } => {
                 let id = resolve_win(self, win);
                 self.editor.set_window_width(id, width);

@@ -1500,6 +1500,26 @@ impl Editor {
         }
     }
 
+    /// Horizontally scroll window `id` so its first visible screen column is
+    /// `leftcol` (0-based). The focused window moves its live viewport; an inactive
+    /// window updates its stashed `leftcol` (applied when next focused). A no-op for
+    /// an unknown id. Backs `vim.fn.winrestview`'s `leftcol` / `nx.win.set_leftcol`.
+    /// Only meaningful with `'nowrap'`; the next cursor move may re-derive `leftcol`
+    /// to keep the cursor visible, as in vim.
+    pub fn set_window_leftcol(&mut self, id: WindowId, leftcol: usize) {
+        let Some((_, _)) = self.tree_of_window(id) else {
+            return;
+        };
+        if id == self.windows.current {
+            self.leftcol = leftcol;
+        } else {
+            self.tree_of_window_mut(id)
+                .expect("checked above")
+                .get_mut(id)
+                .saved_leftcol = leftcol;
+        }
+    }
+
     /// Window `id`'s rect as `(x, y, width, height)` in windows-area cells, or
     /// `None` if there is no such window. `height` includes the status-line row;
     /// the API width/height the server returns derive from this.

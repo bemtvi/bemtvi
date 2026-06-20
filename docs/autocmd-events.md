@@ -7,7 +7,7 @@ matched exactly, and a handler's `callback` receives the event table
 
 > **The list is the emitted set, not all of vim's events.** nxvim fires events as
 > features come to need them. A handler registered for an event that isn't emitted
-> yet (e.g. `WinScrolled`, `ModeChanged`, `OptionSet`) is accepted but simply never
+> yet (e.g. `ModeChanged`, `OptionSet`) is accepted but simply never
 > fires — it does not error. If you need one that's missing, it's a feature gap, not
 > a config mistake.
 
@@ -44,6 +44,7 @@ Ordering on opening a file is `BufReadPost` (or `BufNewFile` for a new path) →
 | `WinEnter` / `WinLeave` | Focus moves to / away from a window. |
 | `WinClosed` | A window is closed. |
 | `WinResized` | A window's rectangle changes (split/resize/layout change). |
+| `WinScrolled` | A window's viewport scrolls — `topline` (vertical) or `leftcol` (horizontal) changes. `match` is the scrolled window's id; fires per-window. **Gated on a registered handler** (high-frequency), so it costs nothing when nothing listens. |
 | `TabNew` | A new tab page is created. |
 | `TabEnter` / `TabLeave` | The active tab changes. |
 | `TabClosed` | A tab page is closed. |

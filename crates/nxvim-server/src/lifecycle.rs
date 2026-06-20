@@ -215,6 +215,21 @@ impl EditHost {
             .as_ref()
             .is_some_and(|prev| *prev != rects);
 
+        // Scroll diff: any window whose `(topline, leftcol)` changed fires
+        // `WinScrolled`. Snapshotted unconditionally — like the `WinResized` rect diff
+        // above and unlike the `CursorMoved` gate — so the baseline is always current
+        // and the *first* scroll after a handler is registered still fires (the fire
+        // itself is gated on a handler below). Compare only windows present in both
+        // snapshots: a window added/closed since the last diff is a `WinNew`/
+        // `WinClosed`, not a scroll.
+        let scroll = self.window_scroll_snapshot();
+        let scrolled = self.last_window_scroll.as_ref().is_some_and(|prev| {
+            scroll.iter().any(|&(w, t, l)| {
+                prev.iter()
+                    .any(|&(pw, pt, pl)| pw == w && (pt, pl) != (t, l))
+            })
+        });
+
         // Tab diff (Phase 3): tabs added/closed and the active-tab change since the
         // last emit. A tab transition always coincides with a window transition (a
         // switch changes the focused window; create/close add or drop windows), but
@@ -257,6 +272,7 @@ impl EditHost {
             && closed_wins.is_empty()
             && !win_changed
             && !resized
+            && !scrolled
             && new_tabs.is_empty()
             && closed_tabs.is_empty()
             && !tab_changed
@@ -370,6 +386,35 @@ impl EditHost {
             self.fire_window("WinResized", cur_win, b);
         }
         self.last_window_rects = Some(rects);
+
+        // `WinScrolled` for every window whose viewport offset changed since the last
+        // diff. Fired per-window with that window as `<amatch>` (more useful for a
+        // diff / scrollbind plugin than neovim's once-with-`v:event`). The baseline is
+        // always rebased (even with no handler), so it stays current; the *fire* is
+        // gated on a registered handler so a no-handler session never enters Lua here.
+        // It rebases to the pre-callback offsets, so a handler that scrolls *another*
+        // window re-fires `WinScrolled` for it next diff — the plugin guards its own
+        // sync loop, as in neovim.
+        let to_fire: Vec<WindowId> = if self.au_active_events.contains("WinScrolled") {
+            match self.last_window_scroll.as_ref() {
+                Some(prev) => scroll
+                    .iter()
+                    .filter(|&&(w, t, l)| {
+                        prev.iter()
+                            .any(|&(pw, pt, pl)| pw == w && (pt, pl) != (t, l))
+                    })
+                    .map(|&(w, _, _)| w)
+                    .collect(),
+                None => Vec::new(),
+            }
+        } else {
+            Vec::new()
+        };
+        self.last_window_scroll = Some(scroll);
+        for win in to_fire {
+            let b = self.editor.window_buffer(win);
+            self.fire_window("WinScrolled", win, b);
+        }
 
         // ----- tab enter / closed (outermost, after the window events) -----
         // `TabEnter` for the now-active tab (after `WinEnter`, closing the
@@ -615,6 +660,19 @@ impl EditHost {
             .window_ids()
             .into_iter()
             .map(|w| (w, self.editor.window_rect(w).unwrap_or_default()))
+            .collect()
+    }
+
+    /// Every window's `(id, topline, leftcol)` in layout order, for the
+    /// [`WinScrolled`] diff. Only computed when a `WinScrolled` handler is active.
+    pub(crate) fn window_scroll_snapshot(&self) -> Vec<(WindowId, usize, usize)> {
+        self.editor
+            .window_ids()
+            .into_iter()
+            .map(|w| {
+                let (top, left) = self.editor.window_scroll(w).unwrap_or((0, 0));
+                (w, top, left)
+            })
             .collect()
     }
 

@@ -885,6 +885,114 @@ async fn moving_the_cursor_in_insert_fires_cursormovedi() {
     assert_eq!(after, "1", "<Right> in insert fires CursorMovedI once");
 }
 
+// ----- WinScrolled -----------------------------------------------------------
+
+/// A 100-line buffer — taller than the 24-row test grid — so the viewport can
+/// actually scroll.
+fn seed_tall_file(dir: &std::path::Path) -> std::path::PathBuf {
+    let file = dir.join("f.txt");
+    let body: String = (1..=100).map(|i| format!("line {i}\n")).collect();
+    std::fs::write(&file, body).expect("seed file");
+    file
+}
+
+#[tokio::test]
+async fn scrolling_the_viewport_fires_winscrolled() {
+    // `G` jumps to the last line, scrolling the viewport down; with a `WinScrolled`
+    // handler active that fires once for the scrolled window, whose id is the match.
+    let dir = temp_dir("au_winscrolled");
+    let file = seed_tall_file(&dir);
+    let (rpc, mut incoming) = start_with_file_and_config(
+        &dir,
+        file.to_str().unwrap(),
+        "_G.n = 0\n_G.m = ''\n\
+         vim.api.nvim_create_autocmd('WinScrolled', { callback = function(a) _G.n = _G.n + 1; _G.m = a.match end })\n",
+    )
+    .await;
+    redraw_after(&rpc, &mut incoming, "G").await;
+    let n = exec_lua(&rpc, "return _G.n").await.as_u64();
+    assert_eq!(n, Some(1), "scrolling to the bottom fires WinScrolled once");
+    let m = exec_lua(&rpc, "return _G.m").await;
+    assert_eq!(m.as_str(), Some("1"), "match is the scrolled window's id");
+}
+
+#[tokio::test]
+async fn cursor_motion_within_the_viewport_does_not_fire_winscrolled() {
+    // WinScrolled tracks the viewport (topline/leftcol), not the cursor: a `j` that
+    // stays on screen must not fire it — proving it isn't a CursorMoved in disguise.
+    let dir = temp_dir("au_winscrolled_nocursor");
+    let file = seed_tall_file(&dir);
+    let (rpc, mut incoming) = start_with_file_and_config(
+        &dir,
+        file.to_str().unwrap(),
+        "_G.n = 0\n\
+         vim.api.nvim_create_autocmd('WinScrolled', { callback = function() _G.n = _G.n + 1 end })\n",
+    )
+    .await;
+    redraw_after(&rpc, &mut incoming, "j").await; // line 1 -> 2, still visible
+    let n = exec_lua(&rpc, "return _G.n").await.as_u64();
+    assert_eq!(n, Some(0), "an on-screen cursor move does not scroll");
+}
+
+#[tokio::test]
+async fn set_topline_scrolls_an_inactive_window_and_fires_winscrolled() {
+    // `nx.win.set_topline(win, N)` scrolls an explicit (here inactive) window to the
+    // 1-based topline N; the change fires WinScrolled for that window on the next
+    // tick. This is the primitive a side-by-side diff plugin uses to mirror scroll.
+    let dir = temp_dir("au_set_topline");
+    let file = seed_tall_file(&dir);
+    let (rpc, mut incoming) = start_with_file_and_config(
+        &dir,
+        file.to_str().unwrap(),
+        "_G.n = 0\n_G.m = ''\n\
+         vim.api.nvim_create_autocmd('WinScrolled', { callback = function(a) _G.n = _G.n + 1; _G.m = a.match end })\n",
+    )
+    .await;
+    // Vertical split: focus moves to the new window (id 2); window 1 is now inactive.
+    redraw_after(&rpc, &mut incoming, "<C-w>v").await;
+    // Reset counters and scroll the *inactive* window 1 to line 40, all off-tick
+    // (nvim_exec_lua queues the op and drains it but doesn't emit lifecycle events).
+    exec_lua(&rpc, "_G.n = 0; _G.m = ''; nx.win.set_topline(1, 40)").await;
+    // A bare tick (`<Esc>` no-op) lets the lifecycle diff observe window 1's scroll.
+    redraw_after(&rpc, &mut incoming, "<Esc>").await;
+    let n = exec_lua(&rpc, "return _G.n").await.as_u64();
+    assert_eq!(n, Some(1), "the programmatic scroll fires WinScrolled once");
+    let m = exec_lua(&rpc, "return _G.m").await;
+    assert_eq!(
+        m.as_str(),
+        Some("1"),
+        "for the inactive window that was scrolled"
+    );
+    let top = exec_lua(&rpc, "return nx.win.call(1, vim.fn.winsaveview).topline")
+        .await
+        .as_u64();
+    assert_eq!(
+        top,
+        Some(40),
+        "winsaveview reports window 1's new 1-based topline"
+    );
+}
+
+#[tokio::test]
+async fn set_leftcol_horizontally_scrolls_an_inactive_window() {
+    // `nx.win.set_leftcol(win, N)` moves a window's first visible screen column
+    // (0-based) — the `'nowrap'` companion of set_topline for a side-by-side diff.
+    let dir = temp_dir("au_set_leftcol");
+    let file = seed_tall_file(&dir);
+    let (rpc, mut incoming) = start_with_file_and_config(&dir, file.to_str().unwrap(), "").await;
+    // Vertical split: focus moves to the new window (id 2); window 1 is now inactive.
+    redraw_after(&rpc, &mut incoming, "<C-w>v").await;
+    exec_lua(&rpc, "nx.win.set_leftcol(1, 7)").await;
+    let left = exec_lua(&rpc, "return nx.win.call(1, vim.fn.winsaveview).leftcol")
+        .await
+        .as_u64();
+    assert_eq!(
+        left,
+        Some(7),
+        "set_leftcol moves the inactive window's leftcol"
+    );
+}
+
 #[tokio::test]
 async fn ex_autocmd_once_fires_exactly_once() {
     // `++once` self-removes after the first fire: firing the event twice runs the

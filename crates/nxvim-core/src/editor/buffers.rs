@@ -1404,6 +1404,13 @@ impl Editor {
         let errors: Vec<bool> = self.messages.iter().map(|m| m.error).collect();
         let last = lines.len().saturating_sub(1);
         self.open_scratch_listing("[Messages]", lines, last);
+        // Messages are free-form (notifications, multi-line errors, stack traces),
+        // so soft-wrap the panel — the global `nowrap` default would clip a long
+        // message off the right edge. Window-local, set after the panel window is
+        // mounted (and current), then re-settle the viewport so the wrapped layout
+        // keeps the selected (newest) line visible.
+        self.windows.cur_mut().options.wrap = true;
+        self.ensure_visible();
         // Paint each error line red. Done after the panel is mounted (its buffer
         // is current and freshly loaded, so the marks survive until the next
         // re-open clears them).

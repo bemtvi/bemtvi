@@ -11,7 +11,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use nxvim_rpc::{Incoming, Rpc};
 use nxvim_server::ServerInit;
-use nxvim_test_harness::{buf_lines, command, cursor, feed, field, lines, start_attached};
+use nxvim_test_harness::{
+    buf_lines, command, cursor, exec_lua, feed, field, lines, start_attached,
+};
 use rmpv::Value;
 use tokio::sync::mpsc::UnboundedReceiver;
 
@@ -456,6 +458,33 @@ async fn ls_lists_open_buffers_with_flags() {
 
     std::fs::remove_file(&a).ok();
     std::fs::remove_file(&b).ok();
+}
+
+/// `:messages` opens its panel with `'wrap'` on, so a long message reads in full
+/// instead of being clipped at the right edge — even though the global default is
+/// `nowrap`. The wrap is window-local to the panel and doesn't leak to the text
+/// window it sprang from.
+#[tokio::test]
+async fn messages_panel_wraps_long_lines() {
+    let (rpc, _incoming) = start().await;
+    // The editing window keeps the global `nowrap` default.
+    assert_eq!(
+        exec_lua(&rpc, "return vim.wo.wrap").await,
+        Value::Boolean(false),
+        "the text window keeps the global nowrap default"
+    );
+    command(
+        &rpc,
+        "echom 'a long message that would otherwise run off the screen'",
+    )
+    .await;
+    command(&rpc, "messages").await;
+    // Focus is locked in the panel window; its wrap is on.
+    assert_eq!(
+        exec_lua(&rpc, "return vim.wo.wrap").await,
+        Value::Boolean(true),
+        "the :messages panel soft-wraps by default"
+    );
 }
 
 #[tokio::test]

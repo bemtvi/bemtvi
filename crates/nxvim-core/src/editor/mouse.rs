@@ -1868,6 +1868,13 @@ impl Editor {
     /// gutter, and horizontal scroll + tab/wide-char column math. Geometry is read
     /// for `win` whether or not it is focused (its live offset if focused, its
     /// stashed one otherwise). `None` only for an unknown window.
+    ///
+    /// `rel_y` is a **screen** row, which under `'wrap'` (or with extmark
+    /// `virt_lines`) is *not* a one-to-one offset onto buffer lines — a wrapped
+    /// line spans several rows. The vertical map walks the same interleaved layout
+    /// the view projects ([`row_skeleton`](crate::view)) backwards from the first
+    /// visible line `top`, so a click on a wrapped line's continuation row resolves
+    /// to that line (at the wrapped column) rather than the next buffer line.
     fn text_cell_to_buf(
         &self,
         win: WindowId,
@@ -1879,20 +1886,81 @@ impl Editor {
         let buf_id = self.window_buffer(win)?;
         let buf = &self.buffers.get(buf_id).buffer;
         let line_count = buf.line_count();
-        // A cell below the last line lands on the last line (vim's behavior).
-        let line = top.saturating_add(rel_y).min(line_count.saturating_sub(1));
         let gutter = self.number_width_for(&opts, line_count);
+        let ts = buf.options.effective_tabstop();
+        // The soft-wrap text width: the content area past the number gutter (the
+        // same `width` the view wraps into). Under `nowrap` wrapping is skipped, so
+        // this is unused; the horizontal `leftcol` scroll applies instead.
+        let wrap = opts.wrap;
+        let (text_width, _) = self.window_text_area(win)?;
+        let width = text_width.saturating_sub(gutter);
+        let wp = opts.wrap_prefix();
+        let virt = buf.virt_lines_by_line();
+
+        // Walk display rows from `top`, counting each buffer line's `virt_lines`
+        // rows and soft-wrap segments, until the target screen row `rel_y` is
+        // reached. Without wrapping / virtual lines this is one row per line and
+        // resolves to `top + rel_y`, the simple inverse.
+        let mut line = top;
+        let mut remaining = rel_y;
+        let seg;
+        let indent; // continuation-prefix cells baked onto the resolved row
+        loop {
+            if line >= line_count {
+                // A cell below the last line lands on the last line's last segment
+                // (vim's "click past the buffer end" behavior).
+                line = line_count.saturating_sub(1);
+                let (segs, ci) = wrap_segs(&buf.line(line), ts, width, wrap, wp);
+                seg = *segs.last().expect("wrap_segs is never empty");
+                indent = if seg.start_col > 0 { ci } else { 0 };
+                break;
+            }
+            let v = virt.get(&line);
+            // `virt_lines` drawn above / below the line are non-text rows; a click
+            // on one resolves to the owning buffer line at column 0.
+            let above = v.map_or(0, |r| r.above.len());
+            if remaining < above {
+                return Some((line, 0));
+            }
+            remaining -= above;
+            let (segs, ci) = wrap_segs(&buf.line(line), ts, width, wrap, wp);
+            if remaining < segs.len() {
+                seg = segs[remaining];
+                indent = if seg.start_col > 0 { ci } else { 0 };
+                break;
+            }
+            remaining -= segs.len();
+            let below = v.map_or(0, |r| r.below.len());
+            if remaining < below {
+                return Some((line, 0));
+            }
+            remaining -= below;
+            line += 1;
+        }
+
         let col = if rel_x < gutter {
             // The number column: place the cursor at the line's start.
             0
+        } else if wrap {
+            // Within the wrapped row: a click on a continuation row's baked-in
+            // `'breakindent'`/`'showbreak'` prefix lands on the segment's first
+            // byte; past it, the row-local cell is rebased onto the segment's start
+            // column before mapping back to a byte (clamped to the segment so it
+            // can't spill onto the next display row).
+            let cell = rel_x - gutter;
+            if cell < indent {
+                seg.start_byte
+            } else {
+                let screen_col = seg.start_col + (cell - indent);
+                crate::unicode::byte_at_virtcol(&buf.line(line), screen_col, ts).min(seg.end_byte)
+            }
         } else {
             // Screen column within the text, undoing the horizontal scroll, then
             // mapped back to a byte offset (rounding a between-cells click to the
             // nearest grapheme). `set_window_cursor`'s clamp pulls a past-EOL
             // result onto the last char in Normal mode.
             let screen_col = (rel_x - gutter).saturating_add(leftcol);
-            let text = buf.line(line);
-            crate::unicode::byte_at_virtcol(&text, screen_col, buf.options.effective_tabstop())
+            crate::unicode::byte_at_virtcol(&buf.line(line), screen_col, ts)
         };
         Some((line, col))
     }
@@ -1948,6 +2016,35 @@ fn window_at_in(tree: &WindowTree, x: usize, y: usize) -> Option<(WindowId, usiz
         .copied()
         .chain(tree.leaves())
         .find_map(probe)
+}
+
+/// The soft-wrap display segments of `text` and the continuation-prefix width that
+/// rebases overlay columns on its continuation rows — the inverse-side companion of
+/// the view's `row_skeleton` wrap split. Under `nowrap` (or `width == 0`) the whole
+/// line is one segment spanning byte `0..len` at column 0 with no prefix.
+fn wrap_segs(
+    text: &str,
+    tabstop: usize,
+    width: usize,
+    wrap: bool,
+    wp: crate::unicode::WrapPrefix,
+) -> (Vec<crate::unicode::WrapSeg>, usize) {
+    if wrap && width > 0 {
+        let indent = crate::unicode::cont_indent(text, tabstop, width, wp);
+        (
+            crate::unicode::wrap_segments_indented(text, tabstop, width, indent),
+            indent,
+        )
+    } else {
+        (
+            vec![crate::unicode::WrapSeg {
+                start_byte: 0,
+                end_byte: text.len(),
+                start_col: 0,
+            }],
+            0,
+        )
+    }
 }
 
 /// One open region's absolute on-screen placement this frame (see

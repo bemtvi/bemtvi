@@ -1837,3 +1837,64 @@ async fn hostile_resize_and_mouse_coords_do_not_oom_the_server() {
     );
     assert_eq!(mode(&rpc).await, "n");
 }
+
+// ===== Soft-wrap: hit-test the right wrapped row =============================
+
+/// Start a server with a **narrow** UI so a long line soft-wraps onto several
+/// screen rows. `'wrap'` is on by default; the caller usually turns the number
+/// gutter off so a global cell maps straight to (line, byte col).
+async fn start_narrow(content: &str, cols: u16) -> (Rpc, UnboundedReceiver<Incoming>) {
+    let path = write_temp("mouse", "txt", content);
+    let init = ServerInit {
+        file: Some(path),
+        ..Default::default()
+    };
+    let (rpc, incoming) = spawn(init);
+    attach(&rpc, cols, 24).await;
+    (rpc, incoming)
+}
+
+/// Clicking the **continuation row** of a soft-wrapped line lands on that line's
+/// wrapped text — not on the next buffer line. This is the reported bug: the
+/// hit-test counted one screen row per buffer line, so a click on a wrapped
+/// line's second display row resolved to the line below it.
+#[tokio::test]
+async fn click_on_wrapped_continuation_row() {
+    // "0123456789ABCDEFGHIJxyz" (23 chars) in a 20-col text area wraps to two
+    // rows: cols 0..19 (bytes 0..20), then "xyz" at start_col 20 (bytes 20..23).
+    let (rpc, _incoming) = start_narrow("0123456789ABCDEFGHIJxyz\nsecondline", 20).await;
+    command(&rpc, "set nonumber norelativenumber wrap").await;
+    // Screen row 1 is the wrapped continuation of line 1; col 1 is its 'y'.
+    feed_mouse(&rpc, "left", "press", 1, 1);
+    assert_eq!(
+        cursor(&rpc).await,
+        (1, 21),
+        "continuation-row click lands on the wrapped line, not the next one"
+    );
+    // The first display row still maps straight through.
+    feed_mouse(&rpc, "left", "press", 0, 5);
+    assert_eq!(cursor(&rpc).await, (1, 5));
+    // And the buffer's *second* line is on screen row 2 once the wrap is counted.
+    feed_mouse(&rpc, "left", "press", 2, 3);
+    assert_eq!(cursor(&rpc).await, (2, 3));
+}
+
+/// Dragging a Visual selection into the middle of a wrapped line keeps the cursor
+/// aligned with the pointer — it doesn't jump to the next line. Mirrors the bug
+/// report (visual-select with the mouse mid-wrapped-line).
+#[tokio::test]
+async fn drag_into_wrapped_continuation_stays_aligned() {
+    let (rpc, _incoming) = start_narrow("0123456789ABCDEFGHIJxyz\nsecondline", 20).await;
+    command(&rpc, "set nonumber norelativenumber wrap").await;
+    feed_mouse(&rpc, "left", "press", 0, 2); // '2' on the first display row
+    feed_mouse(&rpc, "left", "drag", 1, 1); // 'y' on the continuation row
+    assert_eq!(mode(&rpc).await, "v");
+    assert_eq!(
+        cursor(&rpc).await,
+        (1, 21),
+        "the drag end tracks the pointer on the wrapped row"
+    );
+    // Inclusive [(1,2)..=(1,21)] deletes '2'..'y', leaving "01" + "z".
+    feed(&rpc, "d");
+    assert_eq!(lines(&rpc).await, vec!["01z", "secondline"]);
+}

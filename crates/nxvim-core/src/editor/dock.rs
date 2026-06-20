@@ -195,6 +195,15 @@ impl Editor {
         self.tree_of_window(id).and_then(|(_, t)| t.try_get(id))
     }
 
+    /// Mutable [`Editor::window`]: the [`Window`] for `id` in whichever open layer
+    /// owns it (live or parked). The layer-aware counterpart to
+    /// `self.windows.try_get_mut`, which only sees the current layer — needed for
+    /// state that outlives a layer switch, e.g. a location list whose owner window
+    /// is parked while its display is hosted in a dock.
+    pub(crate) fn window_mut(&mut self, id: WindowId) -> Option<&mut Window> {
+        self.tree_of_window_mut(id).and_then(|t| t.try_get_mut(id))
+    }
+
     /// Mutable [`Editor::tree_of_window`]: the tree (live or parked) owning `id`.
     pub(crate) fn tree_of_window_mut(&mut self, id: WindowId) -> Option<&mut WindowTree> {
         for layer in self.open_layers() {

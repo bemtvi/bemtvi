@@ -800,6 +800,12 @@ pub struct Editor {
     /// `None` on cancel. Drained by the server to deliver the result to its
     /// callback — the menu analogue of [`Editor::prompt_results`].
     pub menu_results: Vec<Option<usize>>,
+    /// "Send the picker's current (filtered) results somewhere" outcomes: each entry
+    /// is the matched item keys in display order, pushed by the `send_to_loclist`
+    /// picker action (which also closes the picker). Drained by the server, which
+    /// hands the keys to Lua to build a list — the bulk-result sibling of the
+    /// single-key [`Editor::menu_results`]. Backs the picker's quickfix-style sink.
+    pub picker_sends: Vec<Vec<usize>>,
     /// The list-less **content float** (`nx.ui.float`; the LSP hover / signature
     /// help surface), when open, or `None`. A transient overlay rendering plain
     /// content lines — no list, no selection, **never grabs input**: it is
@@ -1395,6 +1401,7 @@ impl Editor {
             view_selects: Vec::new(),
             menu: None,
             menu_results: Vec::new(),
+            picker_sends: Vec::new(),
             content_float: None,
             picker_query_changes: Vec::new(),
             statusline_clicks: Vec::new(),

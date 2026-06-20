@@ -1303,6 +1303,7 @@ impl Editor {
             "imagepreview" => self.options.imagepreview = value,
             "timeout" => self.options.timeout = value,
             "scrollanim" => self.options.scrollanim = value,
+            "qfdock" => self.options.qfdock = value,
             _ => {}
         }
     }

@@ -668,6 +668,24 @@ impl EditHost {
         // (the editor's `'errorformat'` when the op omits one). A malformed efm
         // fails loud on the message line rather than silently dropping the call.
         for op in self.lua.take_qf_ops() {
+            // "Send/add these results to a list" (`nx.qf.{send,add}_to_{loc,qf}list`):
+            // route the structured items through `list_send`, which honors `'qfdock'`
+            // (a dock tab vs a split). `loclist_win == None` targets the global
+            // quickfix list, `Some(_)` a location list; the action char picks
+            // send (new) vs add (append). Distinct from the `which`-targeted writes.
+            if op.send {
+                let items = op.items.unwrap_or_default();
+                let entries = items.into_iter().map(qf_entry_from_item).collect();
+                let action = if op.action == 'a' {
+                    QfAction::Add
+                } else {
+                    QfAction::New
+                };
+                let to_qf = op.loclist_win.is_none();
+                self.editor
+                    .list_send(entries, op.title.unwrap_or_default(), action, to_qf);
+                continue;
+            }
             let action = match op.action {
                 'a' => QfAction::Add,
                 'r' => QfAction::Replace,
@@ -1815,6 +1833,7 @@ impl EditHost {
             makeprg: go.makeprg.clone(),
             grepprg: go.grepprg.clone(),
             grepformat: go.grepformat.clone(),
+            qfdock: go.qfdock,
         });
         // The register file, mirrored so `vim.fn.getreg` / `getregtype` read the
         // core's current registers (stored cells + the read-only specials). Small
@@ -2622,6 +2641,17 @@ impl EditHost {
                     self.apply_lua_effects();
                 }
             }
+            // "Send the picker's current results to a list" (the `send_to_loclist`
+            // picker action): the action already closed the picker, so deliver the
+            // matched keys to Lua, which builds the list from its item tables.
+            for keys in std::mem::take(&mut self.editor.picker_sends) {
+                self.picker_active = false;
+                if let Err(e) = self.lua.run_picker_send(keys) {
+                    self.editor
+                        .echo(format!("E5108: Error in nx.picker send: {e}"));
+                }
+                self.apply_lua_effects();
+            }
             // Scheduled callbacks (`vim.schedule`) run after the work that queued
             // them converges, but still within this fixpoint — a scheduled fn may
             // itself `vim.schedule` / `vim.cmd`, which re-enters the loop. One
@@ -2639,6 +2669,7 @@ impl EditHost {
                 && self.editor.view_selects.is_empty()
                 && self.editor.prompt_results.is_empty()
                 && self.editor.menu_results.is_empty()
+                && self.editor.picker_sends.is_empty()
                 && self.editor.picker_query_changes.is_empty()
                 && self.editor.complete_query_changes.is_empty()
                 && self.scheduled.is_empty()
@@ -2656,6 +2687,7 @@ impl EditHost {
                 self.editor.view_selects.clear();
                 self.editor.prompt_results.clear();
                 self.editor.menu_results.clear();
+                self.editor.picker_sends.clear();
                 self.editor.picker_query_changes.clear();
                 self.editor.complete_query_changes.clear();
                 self.editor.take_pending_checktime();

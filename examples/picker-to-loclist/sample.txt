@@ -1,0 +1,22 @@
+search results -> quickfix / location-list dock tabs
+=====================================================
+
+Leader is "\". Try, in order:
+
+  \fm   open the custom "marks" picker
+           - <Tab> marks a row (and moves down); mark a couple
+           - <C-q> sends the MARKED rows to a location list
+           - with 'qfdock' on (default) it opens as a bottom-dock TAB
+           - <CR> on an entry jumps HERE, into the main area
+  \fm again, send WITHOUT marking -> it sends ALL the filtered rows
+  \qd   toggle 'qfdock' off, then \fm + <C-q> again -> a split instead
+
+  \lt   send every TODO line below to a saved loclist tab
+  ]l / [l   step through the current location list
+
+A few TODO lines to collect with \lt:
+
+  TODO: wire up the frobnicator
+  (nothing to see here)
+  TODO: paint the bikeshed
+  TODO: write the changelog

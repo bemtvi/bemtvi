@@ -1,0 +1,18 @@
+send / add to a list — the nx.qf.* API
+=======================================
+
+These back the picker's <C-q> and are usable on their own. Each takes an array
+of entry dicts ({ filename =, lnum =, col =, text = }) and an optional title:
+
+  nx.qf.send_to_loclist(list, { title })   a NEW location list
+  nx.qf.add_to_loclist(list, { title })    APPEND to the focused loclist
+  nx.qf.send_to_qflist(list, { title })    the global quickfix list
+  nx.qf.add_to_qflist(list, { title })     APPEND to the quickfix list
+
+All honor 'qfdock'. With it on (default), a location-list *send* opens a new
+bottom-dock tab (several searches side by side); an *add* appends to the focused
+tab; the quickfix list is one reused tab. With 'qfdock' off, each opens the
+classic bottom split.
+
+This second file exists so the "marks" picker and the location preview have more
+than one file to jump between.

@@ -49,6 +49,9 @@ for _, name in ipairs({
   "right",
   "to_start",
   "to_end",
+  "send_to_loclist",
+  "toggle_select",
+  "clear_select",
 }) do
   nx.picker.actions[name] = function()
     nx._picker_action(name)
@@ -76,6 +79,9 @@ for _, m in ipairs({
   { "<Right>", "right", "Cursor right" },
   { "<Home>", "to_start", "Cursor to start" },
   { "<End>", "to_end", "Cursor to end" },
+  { "<C-q>", "send_to_loclist", "Send results to a location list" },
+  { "<Tab>", "toggle_select", "Toggle multi-select on this row" },
+  { "<S-Tab>", "toggle_select", "Toggle multi-select on this row" },
 }) do
   nx.keymap.set("picker", m[1], nx.picker.actions[m[2]], { default = true, desc = m[3] })
 end
@@ -377,6 +383,45 @@ function nx._picker_result(key)
       nx.notify("nx.picker: confirm error: " .. tostring(err), "error")
     end
   end
+end
+
+-- A picker item -> a location-list entry. Only items carrying a `path` make sense
+-- in a list; `row`/`col` are 1-based (the item convention), defaulting to the file
+-- head. `text` is the item's display label (e.g. live_grep's `file:line:col:text`).
+local function picker_item_to_qf(item)
+  return {
+    filename = item.path,
+    lnum = item.row or 1,
+    col = item.col or 1,
+    text = item.text or "",
+  }
+end
+
+-- nx._picker_send(keys): the "send results to a list" outcome (the `send_to_loclist`
+-- picker action / default `<C-q>`). `keys` are the matched item keys in display
+-- order — the *filtered* result set the server captured before closing the picker.
+-- Map them back to their source item tables, keep the ones with a target file, and
+-- hand them to `nx.qf.send_to_loclist` (which honors `'qfdock'`: a new bottom-dock
+-- tab, or a current-window loclist + split). Deferred with `nx.schedule` so the
+-- picker float has closed and focus is back in the main layer before the list opens.
+function nx._picker_send(keys)
+  local p = nx._picker
+  nx._picker = nil
+  if not p then
+    return
+  end
+  picker_cancel_inflight(p)
+  local items = {}
+  for _, key in ipairs(keys) do
+    local it = p.items[key]
+    if it and it.path and it.path ~= "" then
+      items[#items + 1] = picker_item_to_qf(it)
+    end
+  end
+  local title = (p.source and p.source.name) and ("Picker: " .. p.source.name) or "Picker results"
+  nx.schedule(function()
+    nx.qf.send_to_loclist(items, { title = title })
+  end)
 end
 
 -- nx.picker.edit(item): the common confirm action — open `item.path`, and if the

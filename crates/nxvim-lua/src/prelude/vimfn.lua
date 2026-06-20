@@ -570,6 +570,43 @@ function nx.qf.setloclist(winnr, list, action, what)
 end
 vim.fn.setloclist = nx.qf.setloclist
 
+-- The "send/add results to a list" family — the nxvim port of telescope's
+-- send/add-to-{loc,qf}list actions, and the picker's quickfix-style sinks. `list`
+-- is an array of entry dicts (same shape as setloclist); `opts.title` labels the
+-- list / dock tab. All honor 'qfdock': with it ON (default, the nxvim way) the
+-- results open in the bottom dock — a *location-list send* opens a NEW tab (several
+-- searches sit side by side, entries jump into the main layer); an *add* appends to
+-- the focused dock loclist tab; the quickfix list is one reused tab. With it OFF
+-- (the vim/telescope way) they open the classic bottom split of the current window.
+local function nx_list_send(list, opts, action, to_qf)
+  opts = opts or {}
+  local title = opts.title
+  if title ~= nil and type(title) ~= "string" then
+    title = tostring(title)
+  end
+  nx._list_send(list or {}, title, action, to_qf)
+  return 0
+end
+
+-- send_to_loclist: results -> a (new) location list. add_to_loclist: append.
+function nx.qf.send_to_loclist(list, opts)
+  return nx_list_send(list, opts, " ", false)
+end
+function nx.qf.add_to_loclist(list, opts)
+  return nx_list_send(list, opts, "a", false)
+end
+-- send_to_qflist: results -> the global quickfix list. add_to_qflist: append.
+function nx.qf.send_to_qflist(list, opts)
+  return nx_list_send(list, opts, " ", true)
+end
+function nx.qf.add_to_qflist(list, opts)
+  return nx_list_send(list, opts, "a", true)
+end
+nx.send_to_loclist = nx.qf.send_to_loclist
+nx.add_to_loclist = nx.qf.add_to_loclist
+nx.send_to_qflist = nx.qf.send_to_qflist
+nx.add_to_qflist = nx.qf.add_to_qflist
+
 -- Bare-nx muscle-memory aliases onto the canonical nx.qf.* list accessors (the
 -- vim.fn.* aliases were set inline above).
 nx.getqflist = nx.qf.getqflist

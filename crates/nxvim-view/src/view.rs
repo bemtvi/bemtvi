@@ -571,6 +571,9 @@ pub struct MenuData {
     /// Per visible row (parallel to `items`), the matched-character spans to
     /// highlight as half-open **char** ranges (empty for rows with no match).
     pub match_spans: Vec<Vec<(u16, u16)>>,
+    /// Per visible row (parallel to `items`), whether the row is **marked** by the
+    /// picker's multi-select (`<Tab>`). All-false (or empty) when nothing is marked.
+    pub marked: Vec<bool>,
     /// The picker preview pane (Phase 3), present when the source declared a
     /// `preview` kind. `None` for a `select` / preview-less picker — then the box is
     /// the list alone, exactly as before.
@@ -793,6 +796,12 @@ impl View {
                 border_top: map_get(m, "border_top").and_then(Value::as_bool) != Some(false),
                 cmdline: map_get(m, "cmdline").and_then(Value::as_bool) == Some(true),
                 match_spans: parse_multi_spans(map_get(m, "match_spans")),
+                marked: match map_get(m, "marked") {
+                    Some(Value::Array(a)) => {
+                        a.iter().map(|v| v.as_bool().unwrap_or(false)).collect()
+                    }
+                    _ => Vec::new(),
+                },
                 preview: match map_get(m, "preview") {
                     Some(Value::Map(p)) => Some(MenuPreview {
                         lines: map_str_array(p, "lines"),

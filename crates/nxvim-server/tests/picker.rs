@@ -50,6 +50,30 @@ async fn poll_menu(
     None
 }
 
+/// The `region` string of every window painted in a redraw map (`"main"` /
+/// `"dock_bottom"` / …).
+fn regions(map: &[(Value, Value)]) -> Vec<String> {
+    let Some(Value::Array(wins)) = map_get(map, "windows") else {
+        return Vec::new();
+    };
+    wins.iter()
+        .filter_map(|w| match w {
+            Value::Map(m) => map_get(m, "region")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+            _ => None,
+        })
+        .collect()
+}
+
+/// The menu's per-row `marked` flags (multi-select), in visible order.
+fn menu_marked(menu: &[(Value, Value)]) -> Vec<bool> {
+    match map_get(menu, "marked") {
+        Some(Value::Array(a)) => a.iter().map(|v| v.as_bool().unwrap_or(false)).collect(),
+        _ => Vec::new(),
+    }
+}
+
 fn menu_of(map: &[(Value, Value)]) -> Vec<(Value, Value)> {
     match map_get(map, "menu") {
         Some(Value::Map(m)) => m.clone(),
@@ -114,6 +138,166 @@ async fn static_source_streams_then_fuzzy_filters_without_touching_the_buffer() 
         map_get(&menu, "query").and_then(Value::as_str),
         Some("ap"),
         "menu projects the prompt query"
+    );
+}
+
+/// Phase 4: `<C-q>` sends the picker's **current (filtered)** results to a location
+/// list — the nxvim port of telescope's send-to-loclist. With `'qfdock'` on (the
+/// default), the list opens as a bottom-dock tab and `<CR>` on an entry jumps into
+/// the main layer. Only the rows matching the live query are sent, not every
+/// candidate.
+#[tokio::test]
+async fn ctrl_q_sends_filtered_results_to_a_dock_loclist() {
+    let dir = temp_dir("picker_send_loclist");
+    let a = dir.join("a.txt");
+    let b = dir.join("b.txt");
+    std::fs::write(&a, "one\ntwo\nthree\n").expect("write a");
+    std::fs::write(&b, "x\ny\nz\n").expect("write b");
+    let src = format!(
+        r#"
+nx.picker.source {{
+  name = "locs",
+  items = function(ctx)
+    ctx.push {{ text = "foo one", path = "{a}", row = 1, col = 1 }}
+    ctx.push {{ text = "foo two", path = "{b}", row = 2, col = 1 }}
+    ctx.push {{ text = "bar three", path = "{a}", row = 3, col = 1 }}
+  end,
+}}
+"#,
+        a = a.display(),
+        b = b.display(),
+    );
+    let (rpc, mut incoming) = start(&dir, &src).await;
+
+    exec_lua(&rpc, "nx.picker.open('locs')").await;
+    poll_menu(&rpc, &mut incoming).await.expect("menu opens");
+
+    // Filter to the two "foo" rows (the matcher drops "bar three").
+    feed(&rpc, "foo");
+    let menu = menu_of(&poll_menu(&rpc, &mut incoming).await.expect("filtered menu"));
+    assert_eq!(menu_items(&menu), vec!["foo one", "foo two"]);
+
+    // <C-q>: send only those filtered rows to a location list.
+    feed(&rpc, "<C-q>");
+    nxvim_test_harness::barrier(&rpc).await;
+
+    // Only the two filtered entries landed (not "bar three").
+    let summary = exec_lua(
+        &rpc,
+        r#"local l = vim.fn.getloclist(0)
+           local t = {}
+           for _, e in ipairs(l) do t[#t + 1] = e.text end
+           return string.format("%d|%s", #l, table.concat(t, ","))"#,
+    )
+    .await;
+    assert_eq!(
+        summary.as_str(),
+        Some("2|foo one,foo two"),
+        "only the filtered results were sent"
+    );
+
+    // It opened as a bottom-dock tab (the default nxvim way).
+    let rd = drain_to_latest_redraw(&mut incoming, |_| true).expect("a redraw");
+    assert!(
+        regions(&rd).iter().any(|r| r == "dock_bottom"),
+        "results opened in the bottom dock, got {:?}",
+        regions(&rd)
+    );
+
+    // <CR> on the first entry jumps into its file, in the main layer.
+    feed(&rpc, "<CR>");
+    nxvim_test_harness::barrier(&rpc).await;
+    assert_eq!(
+        lines(&rpc).await,
+        vec!["one", "two", "three"],
+        "jumped into the first entry's file (main layer)"
+    );
+    assert_eq!(cursor(&rpc).await.0, 1, "landed on the entry's line");
+}
+
+/// The shipped `examples/picker-to-loclist` config loads end-to-end (so it can't
+/// rot): sourcing its `init.lua` registers the custom source, the `nx.qf.send_*`
+/// API is present, and `'qfdock'` reads on by default.
+#[tokio::test]
+async fn example_picker_to_loclist_config_loads() {
+    let root =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/picker-to-loclist");
+    let init = ServerInit {
+        config_dir: Some(root.clone()),
+        runtimepath: vec![root],
+        ..Default::default()
+    };
+    let (rpc, _incoming) = spawn(init);
+    attach(&rpc, 80, 24).await;
+    let ok = exec_lua(
+        &rpc,
+        r#"return tostring(nx.picker._sources.marks ~= nil)
+             .. "|" .. type(nx.qf.send_to_loclist)
+             .. "|" .. tostring(nx.o.qfdock)"#,
+    )
+    .await;
+    assert_eq!(
+        ok.as_str(),
+        Some("true|function|true"),
+        "example loaded: marks source + send_to_loclist + qfdock default-on"
+    );
+}
+
+/// Phase 5: `<Tab>` multi-selects picker rows (marking them and advancing), the
+/// marks project into the `menu` redraw, and `<C-q>` then sends **only the marked**
+/// rows to the location list (telescope's send-selected). The marks survive even if
+/// the cursor is elsewhere.
+#[tokio::test]
+async fn tab_marks_rows_and_ctrl_q_sends_only_the_marked() {
+    let dir = temp_dir("picker_multiselect");
+    let a = dir.join("a.txt");
+    let b = dir.join("b.txt");
+    std::fs::write(&a, "one\ntwo\nthree\n").expect("write a");
+    std::fs::write(&b, "x\ny\nz\n").expect("write b");
+    let src = format!(
+        r#"
+nx.picker.source {{
+  name = "locs",
+  items = function(ctx)
+    ctx.push {{ text = "alpha", path = "{a}", row = 1, col = 1 }}
+    ctx.push {{ text = "beta", path = "{b}", row = 2, col = 1 }}
+    ctx.push {{ text = "gamma", path = "{a}", row = 3, col = 1 }}
+  end,
+}}
+"#,
+        a = a.display(),
+        b = b.display(),
+    );
+    let (rpc, mut incoming) = start(&dir, &src).await;
+
+    exec_lua(&rpc, "nx.picker.open('locs')").await;
+    poll_menu(&rpc, &mut incoming).await.expect("menu opens");
+
+    // <Tab> marks the current row and advances: mark "alpha", then "beta".
+    feed(&rpc, "<Tab>");
+    feed(&rpc, "<Tab>");
+    let menu = menu_of(&poll_menu(&rpc, &mut incoming).await.expect("marked menu"));
+    assert_eq!(
+        menu_marked(&menu),
+        vec![true, true, false],
+        "alpha and beta are marked, gamma is not"
+    );
+
+    // <C-q> sends only the marked rows (not gamma).
+    feed(&rpc, "<C-q>");
+    nxvim_test_harness::barrier(&rpc).await;
+    let summary = exec_lua(
+        &rpc,
+        r#"local l = vim.fn.getloclist(0)
+           local t = {}
+           for _, e in ipairs(l) do t[#t + 1] = e.text end
+           return string.format("%d|%s", #l, table.concat(t, ","))"#,
+    )
+    .await;
+    assert_eq!(
+        summary.as_str(),
+        Some("2|alpha,beta"),
+        "only the marked rows were sent, in mark order"
     );
 }
 

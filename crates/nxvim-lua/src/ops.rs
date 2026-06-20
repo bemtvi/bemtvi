@@ -738,6 +738,13 @@ pub struct QfSetOp {
     /// case) for the quickfix list. `Some(0)` means "the current window at drain
     /// time" (vim's `winnr` 0).
     pub loclist_win: Option<u64>,
+    /// "Send/add these results to a list" (`nx.qf.{send,add}_to_{loc,qf}list`): route
+    /// `items` through [`Editor::list_send`], which honors `'qfdock'` — a dock tab
+    /// (nxvim) or a split (vim/telescope) — instead of the plain `loclist_win`-targeted
+    /// write. The `action` char picks send (new) vs add (append); `loclist_win`
+    /// (`None` = quickfix, `Some` = location) picks the kind. `false` for every other
+    /// `setqflist`/`setloclist`/`:make` path.
+    pub send: bool,
 }
 
 /// A treesitter bridge request queued by `vim.treesitter.start` / `stop`, the

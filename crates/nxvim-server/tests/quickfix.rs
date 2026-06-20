@@ -13,7 +13,7 @@
 use nxvim_rpc::{Incoming, Rpc};
 use nxvim_server::ServerInit;
 use nxvim_test_harness::{
-    cursor, drain_to_latest_redraw, exec_lua, lines, message, start_attached, write_temp,
+    cursor, drain_to_latest_redraw, exec_lua, lines, map_get, message, start_attached, write_temp,
 };
 use rmpv::Value;
 use tokio::sync::mpsc::UnboundedReceiver;
@@ -69,6 +69,58 @@ async fn message_after(
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
     }
     panic!("no redraw arrived for {keys:?}");
+}
+
+/// Feed `keys`, settle, and return the most-recent queued `redraw` map.
+async fn redraw_after(
+    rpc: &Rpc,
+    incoming: &mut UnboundedReceiver<Incoming>,
+    keys: &str,
+) -> Vec<(Value, Value)> {
+    while incoming.try_recv().is_ok() {}
+    rpc.request("nx_input", vec![Value::from(keys)])
+        .await
+        .expect("input");
+    rpc.request("nvim_get_mode", vec![]).await.expect("barrier");
+    for _ in 0..200 {
+        if let Some(map) = drain_to_latest_redraw(incoming, |_| true) {
+            return map;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    panic!("no redraw arrived for {keys:?}");
+}
+
+/// The `region` string of every window painted in a `redraw` map (`"main"` /
+/// `"dock_bottom"` / …).
+fn regions(map: &[(Value, Value)]) -> Vec<String> {
+    let Some(Value::Array(wins)) = map_get(map, "windows") else {
+        return Vec::new();
+    };
+    wins.iter()
+        .filter_map(|w| match w {
+            Value::Map(m) => map_get(m, "region")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+            _ => None,
+        })
+        .collect()
+}
+
+/// How many tab cells a dock region (`"bottom"` / …) projects in `region_tablines`
+/// (`0` when the region is absent or its tabline is hidden — a single-tab dock at
+/// the default `showtabline`).
+fn region_tab_count(map: &[(Value, Value)], region: &str) -> usize {
+    let Some(Value::Map(rts)) = map_get(map, "region_tablines") else {
+        return 0;
+    };
+    let Some(Value::Map(r)) = map_get(rts, region) else {
+        return 0;
+    };
+    match map_get(r, "tabs") {
+        Some(Value::Array(t)) => t.len(),
+        _ => 0,
+    }
 }
 
 #[tokio::test]
@@ -247,6 +299,337 @@ async fn enter_in_qf_window_jumps_to_the_entry() {
     assert_eq!(cursor(&rpc).await.0, 2, "landed on the entry's line");
 }
 
+/// Phase 1 of "search results → dock lists": a quickfix display hosted as a
+/// **bottom-dock tab** must, on `<CR>`, open the entry in the **main** editing
+/// layer — never inside the dock. The jump target resolves to a main-layer window
+/// (`qf_prev_win`), and `set_current_window` already crosses layers, so this rides
+/// existing machinery; the test guards that the file lands in main and the dock is
+/// not split open to host it.
+#[tokio::test]
+async fn enter_in_dock_hosted_qf_jumps_into_the_main_layer() {
+    let (rpc, mut incoming) = start().await;
+    let path = write_temp("qf_dock_jump", "txt", "one\ntwo\nthree\nfour\n");
+    exec_lua(
+        &rpc,
+        &format!(
+            r#"vim.fn.setqflist({{ {{ filename = "{path}", lnum = 2, col = 1, text = "here" }} }}, " ")"#
+        ),
+    )
+    .await;
+    // Materialise the qf display buffer, grab its bufnr, close its main-layer split,
+    // then host that same buffer as a bottom-dock tab — all existing APIs.
+    message_after(&rpc, &mut incoming, ":copen<CR>").await;
+    let qfbuf = exec_lua(&rpc, "return vim.api.nvim_get_current_buf()")
+        .await
+        .as_u64()
+        .expect("qf display bufnr");
+    exec_lua(&rpc, "vim.cmd('cclose')").await;
+    exec_lua(
+        &rpc,
+        &format!("nx.dock.open{{ side = 'bottom', size = 10, buf = {qfbuf} }}"),
+    )
+    .await;
+    // Precondition: we are focused in the dock-hosted qf display (not main), so the
+    // jump below genuinely originates from the dock.
+    let cur_buf = exec_lua(&rpc, "return vim.api.nvim_get_current_buf()")
+        .await
+        .as_u64();
+    assert_eq!(
+        cur_buf,
+        Some(qfbuf),
+        "focused in the dock-hosted qf display"
+    );
+    let wins_before = win_count(&rpc).await;
+    assert_eq!(wins_before, 2, "one main window + the bottom-dock window");
+
+    // <CR> on the entry, from the dock-hosted display, must jump into main.
+    message_after(&rpc, &mut incoming, "<CR>").await;
+    assert_eq!(buf_name(&rpc).await, path, "landed in the entry's file");
+    assert_eq!(cursor(&rpc).await.0, 2, "landed on the entry's line");
+    assert_eq!(
+        win_count(&rpc).await,
+        wins_before,
+        "the jump reused a main window — it did not split the dock to host the file"
+    );
+}
+
+/// Phase 2: with `'qfdock'` on (the default — the nxvim way), `:copen` hosts the
+/// quickfix display as a tab in the **bottom dock** (not a bottom split), `<CR>`
+/// still jumps into the main layer, and the dock list-tab persists after the jump.
+#[tokio::test]
+async fn copen_hosts_the_list_in_the_bottom_dock_by_default() {
+    let (rpc, mut incoming) = start().await;
+    let path = write_temp("qfdock_on", "txt", "one\ntwo\nthree\nfour\n");
+    exec_lua(
+        &rpc,
+        &format!(
+            r#"vim.fn.setqflist({{ {{ filename = "{path}", lnum = 2, col = 1, text = "here" }} }}, " ")"#
+        ),
+    )
+    .await;
+
+    let rd = redraw_after(&rpc, &mut incoming, ":copen<CR>").await;
+    assert!(
+        regions(&rd).iter().any(|r| r == "dock_bottom"),
+        "qf display hosted in the bottom dock, got regions {:?}",
+        regions(&rd)
+    );
+    // Focused in the dock-hosted display, on the entry.
+    let qfbuf = exec_lua(&rpc, "return vim.api.nvim_get_current_buf()")
+        .await
+        .as_u64();
+    assert!(qfbuf.is_some(), "a qf display buffer is focused");
+
+    // <CR> jumps into the entry's file, in the main layer.
+    let rd2 = redraw_after(&rpc, &mut incoming, "<CR>").await;
+    assert_eq!(buf_name(&rpc).await, path, "jumped into the entry's file");
+    assert_eq!(cursor(&rpc).await.0, 2, "landed on the entry's line");
+    assert!(
+        regions(&rd2).iter().any(|r| r == "dock_bottom"),
+        "the dock list-tab persists after the jump, got {:?}",
+        regions(&rd2)
+    );
+}
+
+/// Phase 3: `nx.qf.send_to_loclist` (the telescope-style "send results to a list"
+/// action) saves each search as its **own** tab in the bottom dock — independent
+/// lists side by side — and `<CR>` on an entry jumps into the main layer.
+#[tokio::test]
+async fn send_to_loclist_saves_each_search_as_its_own_dock_tab() {
+    let (rpc, mut incoming) = start().await;
+    let a = write_temp("send_a", "txt", "one\ntwo\nthree\n");
+    let b = write_temp("send_b", "txt", "alpha\nbeta\ngamma\n");
+
+    // First search -> first dock tab.
+    exec_lua(
+        &rpc,
+        &format!(
+            r#"nx.qf.send_to_loclist({{ {{ filename = "{a}", lnum = 2, col = 1, text = "hit a" }} }}, {{ title = "Search A" }})"#
+        ),
+    )
+    .await;
+    let rd1 = redraw_after(&rpc, &mut incoming, "<Esc>").await;
+    assert!(
+        regions(&rd1).iter().any(|r| r == "dock_bottom"),
+        "the first search opened in the bottom dock"
+    );
+
+    // Second search -> a second, independent dock tab.
+    exec_lua(
+        &rpc,
+        &format!(
+            r#"nx.qf.send_to_loclist({{ {{ filename = "{b}", lnum = 3, col = 1, text = "hit b" }} }}, {{ title = "Search B" }})"#
+        ),
+    )
+    .await;
+    let rd2 = redraw_after(&rpc, &mut incoming, "<Esc>").await;
+    assert_eq!(
+        region_tab_count(&rd2, "bottom"),
+        2,
+        "two searches are saved as two bottom-dock tabs"
+    );
+
+    // The focused (second) tab carries only its own list — the searches are not a
+    // single shared list.
+    let cur = exec_lua(
+        &rpc,
+        r#"local l = vim.fn.getloclist(0)
+           return string.format("%d|%s", #l, l[1] and l[1].text or "")"#,
+    )
+    .await;
+    assert_eq!(cur.as_str(), Some("1|hit b"), "tab B holds search B");
+
+    // Switch to the first tab (gT acts on the focused dock layer); it still holds
+    // search A independently.
+    redraw_after(&rpc, &mut incoming, "gT").await;
+    let prev = exec_lua(
+        &rpc,
+        r#"local l = vim.fn.getloclist(0)
+           return string.format("%d|%s", #l, l[1] and l[1].text or "")"#,
+    )
+    .await;
+    assert_eq!(prev.as_str(), Some("1|hit a"), "tab A still holds search A");
+
+    // <CR> on tab A's entry jumps into its file, in the main layer.
+    let rd3 = redraw_after(&rpc, &mut incoming, "<CR>").await;
+    assert_eq!(buf_name(&rpc).await, a, "jumped into search A's file");
+    assert_eq!(cursor(&rpc).await.0, 2, "landed on the entry's line");
+    assert!(
+        regions(&rd3).iter().any(|r| r == "dock_bottom"),
+        "the dock lists persist after the jump"
+    );
+}
+
+/// Phase 5: the `'qfdock'` option reads and writes through `nx.o` (the example's
+/// toggle relies on it), defaulting on.
+#[tokio::test]
+async fn qfdock_option_reads_and_writes_via_nx_o() {
+    let (rpc, _incoming) = start().await;
+    assert_eq!(
+        exec_lua(&rpc, "return nx.o.qfdock").await.as_bool(),
+        Some(true),
+        "qfdock defaults on"
+    );
+    exec_lua(&rpc, "nx.o.qfdock = false").await;
+    assert_eq!(
+        exec_lua(&rpc, "return nx.o.qfdock").await.as_bool(),
+        Some(false),
+        "nx.o.qfdock round-trips"
+    );
+}
+
+/// Phase 5: the global quickfix list shows as a **single** bottom-dock tab;
+/// `send_to_qflist` fills it and `add_to_qflist` appends — one list, one reused tab.
+#[tokio::test]
+async fn send_and_add_to_qflist_use_one_dock_tab() {
+    let (rpc, mut incoming) = start().await;
+    exec_lua(
+        &rpc,
+        r#"nx.qf.send_to_qflist({ { filename = "a.c", lnum = 1, text = "one" } }, { title = "Q" })"#,
+    )
+    .await;
+    let rd = redraw_after(&rpc, &mut incoming, "<Esc>").await;
+    assert!(
+        regions(&rd).iter().any(|r| r == "dock_bottom"),
+        "the quickfix list opened in the bottom dock"
+    );
+
+    exec_lua(
+        &rpc,
+        r#"nx.qf.add_to_qflist({ { filename = "b.c", lnum = 2, text = "two" } })"#,
+    )
+    .await;
+    let rd2 = redraw_after(&rpc, &mut incoming, "<Esc>").await;
+    assert_eq!(
+        region_tab_count(&rd2, "bottom"),
+        0,
+        "still a single qf tab (a one-tab dock hides its tabline)"
+    );
+    let n = exec_lua(&rpc, "return #vim.fn.getqflist()").await;
+    assert_eq!(
+        n.as_i64(),
+        Some(2),
+        "add_to_qflist appended to the one list"
+    );
+}
+
+/// Phase 5: `add_to_loclist` appends to the **focused** dock loclist tab rather than
+/// opening a new one (telescope's add-to-list semantics).
+#[tokio::test]
+async fn add_to_loclist_appends_to_the_focused_dock_tab() {
+    let (rpc, mut incoming) = start().await;
+    let path = write_temp("addll", "txt", "1\n2\n3\n");
+    exec_lua(
+        &rpc,
+        &format!(
+            r#"nx.qf.send_to_loclist({{ {{ filename = "{path}", lnum = 1, text = "first" }} }}, {{ title = "L" }})"#
+        ),
+    )
+    .await;
+    redraw_after(&rpc, &mut incoming, "<Esc>").await;
+
+    // Focused on the new dock loclist tab; add appends to it (no second tab).
+    exec_lua(
+        &rpc,
+        &format!(
+            r#"nx.qf.add_to_loclist({{ {{ filename = "{path}", lnum = 2, text = "second" }} }})"#
+        ),
+    )
+    .await;
+    let rd = redraw_after(&rpc, &mut incoming, "<Esc>").await;
+    assert_eq!(
+        region_tab_count(&rd, "bottom"),
+        0,
+        "still one loclist tab — add appended, did not open a new tab"
+    );
+    let n = exec_lua(&rpc, "return #vim.fn.getloclist(0)").await;
+    assert_eq!(
+        n.as_i64(),
+        Some(2),
+        "add_to_loclist appended to the same list"
+    );
+}
+
+/// Phase 3: with `:set noqfdock`, `nx.qf.send_to_loclist` falls back to the classic
+/// vim/telescope behavior — it replaces the current window's location list and opens
+/// it in a split (no dock).
+#[tokio::test]
+async fn send_to_loclist_without_qfdock_replaces_and_splits() {
+    let (rpc, mut incoming) = start().await;
+    let path = write_temp("send_nodoc", "txt", "one\ntwo\nthree\n");
+    exec_lua(&rpc, "vim.cmd('set noqfdock')").await;
+    exec_lua(
+        &rpc,
+        &format!(
+            r#"nx.qf.send_to_loclist({{ {{ filename = "{path}", lnum = 2, col = 1, text = "hit" }} }}, {{ title = "Results" }})"#
+        ),
+    )
+    .await;
+    let rd = redraw_after(&rpc, &mut incoming, "<Esc>").await;
+    assert!(
+        !regions(&rd).iter().any(|r| r.starts_with("dock_")),
+        "no dock with noqfdock, got {:?}",
+        regions(&rd)
+    );
+    assert_eq!(win_count(&rpc).await, 2, "the loclist opened in a split");
+}
+
+/// Phase 2: in dock mode, `:cclose` closes the dock-hosted quickfix list (the
+/// bottom dock goes away), mirroring how it closes the split in classic mode.
+#[tokio::test]
+async fn cclose_closes_the_dock_hosted_list() {
+    let (rpc, mut incoming) = start().await;
+    exec_lua(
+        &rpc,
+        r#"vim.fn.setqflist({ { filename = "a.c", lnum = 1, text = "x" } }, " ")"#,
+    )
+    .await;
+    let rd = redraw_after(&rpc, &mut incoming, ":copen<CR>").await;
+    assert!(
+        regions(&rd).iter().any(|r| r == "dock_bottom"),
+        "the list opened in the bottom dock"
+    );
+    let rd2 = redraw_after(&rpc, &mut incoming, ":cclose<CR>").await;
+    assert!(
+        !regions(&rd2).iter().any(|r| r == "dock_bottom"),
+        ":cclose closed the dock list, got regions {:?}",
+        regions(&rd2)
+    );
+}
+
+/// Phase 2: `:set noqfdock` restores the classic vim/telescope behavior — `:copen`
+/// opens a bottom **split** of the current window (no dock), and `<CR>` jumps to the
+/// entry.
+#[tokio::test]
+async fn noqfdock_opens_the_classic_bottom_split() {
+    let (rpc, mut incoming) = start().await;
+    let path = write_temp("qfdock_off", "txt", "one\ntwo\nthree\nfour\n");
+    message_after(&rpc, &mut incoming, ":set noqfdock<CR>").await;
+    exec_lua(
+        &rpc,
+        &format!(
+            r#"vim.fn.setqflist({{ {{ filename = "{path}", lnum = 3, col = 1, text = "x" }} }}, " ")"#
+        ),
+    )
+    .await;
+
+    let rd = redraw_after(&rpc, &mut incoming, ":copen<CR>").await;
+    assert!(
+        !regions(&rd).iter().any(|r| r.starts_with("dock_")),
+        "no dock is opened with noqfdock, got regions {:?}",
+        regions(&rd)
+    );
+    assert_eq!(
+        win_count(&rpc).await,
+        2,
+        "the qf split is a second main-layer window"
+    );
+
+    message_after(&rpc, &mut incoming, "<CR>").await;
+    assert_eq!(buf_name(&rpc).await, path, "jumped into the entry's file");
+    assert_eq!(cursor(&rpc).await.0, 3, "landed on the entry's line");
+}
+
 /// Post-unification, the quickfix `<CR>` is an ordinary buffer-local default map (a
 /// `FileType qf` autocmd), so it is **rebindable** for the first time: a user can map
 /// `<CR>` to something else, or bind the jump to another key, with an ordinary
@@ -325,6 +708,8 @@ async fn cnext_past_the_end_reports_e553() {
 #[tokio::test]
 async fn copen_then_cclose_opens_and_closes_the_window() {
     let (rpc, mut incoming) = start().await;
+    // Split-window open/close mechanics — opt out of the dock default.
+    exec_lua(&rpc, "vim.cmd('set noqfdock')").await;
     exec_lua(
         &rpc,
         r#"vim.fn.setqflist({ { filename = "a.c", lnum = 1, text = "x" } }, " ")"#,
@@ -344,6 +729,8 @@ async fn copen_then_cclose_opens_and_closes_the_window() {
 #[tokio::test]
 async fn nx_qf_loclist_wrappers_open_navigate_and_close() {
     let (rpc, _incoming) = start().await;
+    // Split-window open/navigate/close mechanics — opt out of the dock default.
+    exec_lua(&rpc, "vim.cmd('set noqfdock')").await;
     exec_lua(
         &rpc,
         r#"nx.qf.setloclist(0, {
@@ -397,6 +784,8 @@ async fn copen_opens_a_small_window_at_the_bottom() {
     // under half of 40. (The earlier draft split the focused window 50/50 with the
     // new window on *top* — this asserts the botright placement that replaced it.)
     let (rpc, mut incoming) = start_attached(ServerInit::default(), 80, 40).await;
+    // This asserts the classic bottom-split geometry, so opt out of the dock default.
+    exec_lua(&rpc, "vim.cmd('set noqfdock')").await;
     exec_lua(
         &rpc,
         r#"vim.fn.setqflist({ { filename = "a.c", lnum = 1, text = "x" } }, " ")"#,
@@ -864,6 +1253,8 @@ async fn cnfile_and_cpfile_step_by_file() {
 #[tokio::test]
 async fn closing_a_loclist_owner_closes_its_loclist_window() {
     let (rpc, mut incoming) = start().await;
+    // Split-window owner/loclist lifecycle — opt out of the dock default.
+    exec_lua(&rpc, "vim.cmd('set noqfdock')").await;
     // A second code window first, so closing the owner doesn't hit the last-window
     // guard (which would force the loclist window to stay).
     message_after(&rpc, &mut incoming, ":split<CR>").await;

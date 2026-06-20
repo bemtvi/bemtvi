@@ -2321,6 +2321,7 @@ pub(crate) fn install_runtime_api(
                     open: false,
                     goto_first: false,
                     loclist_win,
+                    send: false,
                 });
                 Ok(())
             },
@@ -2355,6 +2356,46 @@ pub(crate) fn install_runtime_api(
                     open,
                     goto_first: jump,
                     loclist_win,
+                    send: false,
+                });
+                Ok(())
+            },
+        )?,
+    )?;
+
+    // `nx._list_send(items, title, action, to_qf)`: queue a [`QfSetOp`] routed through
+    // [`Editor::list_send`] — the "send/add these results to a list" actions behind
+    // `nx.qf.{send,add}_to_{loc,qf}list` (the picker's quickfix-style sinks). Honors
+    // `'qfdock'`: a dock tab (nxvim) or a split (vim/telescope). `action` is `" "`
+    // (send / new) or `"a"` (add / append); `to_qf` targets the global quickfix list
+    // (encoded as `loclist_win = None`) vs a location list (`Some(0)`). `items` is an
+    // array of entry dicts.
+    let sh = shared.clone();
+    nx.set(
+        "_list_send",
+        lua.create_function(
+            move |_,
+                  (items, title, action, to_qf): (
+                mlua::Table,
+                Option<String>,
+                Option<String>,
+                bool,
+            )| {
+                let mut out = Vec::with_capacity(items.raw_len());
+                for pair in items.sequence_values::<mlua::Table>() {
+                    out.push(qf_item_from_table(&pair?)?);
+                }
+                let action = action.and_then(|a| a.chars().next()).unwrap_or(' ');
+                sh.borrow_mut().qf_ops.push(QfSetOp {
+                    items: Some(out),
+                    lines: None,
+                    efm: None,
+                    action,
+                    title,
+                    open: false,
+                    goto_first: false,
+                    loclist_win: if to_qf { None } else { Some(0) },
+                    send: true,
                 });
                 Ok(())
             },

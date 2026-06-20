@@ -21,6 +21,7 @@ linked from its name; the one-liner is the elevator pitch.
 | --- | --- |
 | [Permanent docks](features/docks.md) | VSCode-style editable edge panels (file tree, terminals, problem lists) that are global across tabs, toggle independently of windows, and carry their own tabs and options. |
 | [Fuzzy picker](features/picker.md) | `nx.picker`: a server-owned fuzzy finder with streaming Lua sources, live (`dynamic`) sources, a file/location preview pane, and fully rebindable keys. |
+| [Quickfix & location-list dock tabs](features/quickfix-dock-lists.md) | Quickfix/location lists open as bottom-dock tabs by default (`'qfdock'`) — several searches side by side, entries jumping into the main area — with the `nx.qf.{send,add}_to_{loc,qf}list` sinks and the picker's `<C-q>` / `<Tab>` multi-select. |
 
 These are described in their design specs today; full guides are being written
 into this section.

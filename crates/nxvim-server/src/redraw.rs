@@ -1438,6 +1438,7 @@ impl EditHost {
             height,
             rows,
             selected,
+            start,
             ..
         } = geom;
 
@@ -1456,6 +1457,16 @@ impl EditHost {
             .iter()
             .map(|(label, _)| Value::from(label.as_str()))
             .collect();
+        // Multi-select: a bool per visible row (parallel to `items`) flagging the
+        // user-marked rows (`<Tab>`), so the client can mark them. Always present;
+        // all-false when nothing is marked.
+        let marked = Value::Array(
+            self.editor
+                .menu_marked_window(start, rows.len())
+                .into_iter()
+                .map(Value::from)
+                .collect(),
+        );
         // Matched-character spans per visible row (parallel to `items`): `[start, end]`
         // half-open **char** ranges the client bolds.
         let match_spans = Value::Array(
@@ -1487,6 +1498,7 @@ impl EditHost {
             (Value::from("width"), Value::from(width as u64)),
             (Value::from("height"), Value::from(height as u64)),
             (Value::from("match_spans"), match_spans),
+            (Value::from("marked"), marked),
         ];
         // The completion popup omits its top border so it sits flush with the line
         // below the cursor. Absent ⇒ a full border (the `select` / picker default).

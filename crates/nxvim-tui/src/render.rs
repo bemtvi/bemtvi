@@ -2408,6 +2408,10 @@ fn render_menu(
     let sel = menu.selected_active.then_some(menu.selected);
     let start = pmenu_start(sel, list_rows);
 
+    // Multi-select: when any row is marked, draw a 2-cell marker gutter on every
+    // list row (a glyph on marked rows). Only when marks are in play, so a plain
+    // picker / `nx.ui.select` / completion popup renders exactly as before.
+    let any_marked = menu.marked.iter().any(|&m| m);
     // Build one list row (or a blank filler past the end of the list).
     let list_line = |r: usize| -> Line<'static> {
         let idx = start + r;
@@ -2415,7 +2419,8 @@ fn render_menu(
             Some(label) => {
                 let empty = Vec::new();
                 let spans = menu.match_spans.get(idx).unwrap_or(&empty);
-                menu_row_line(label, spans, sel == Some(idx), width)
+                let marked = any_marked.then(|| menu.marked.get(idx).copied().unwrap_or(false));
+                menu_row_line(label, spans, sel == Some(idx), width, marked)
             }
             None => Line::from(" ".repeat(width)),
         }
@@ -2727,7 +2732,13 @@ fn preview_line(
 /// `selected`, with the matched-character `spans` (half-open **char** ranges)
 /// bold+underlined so the fuzzy match stands out. Char-indexed to match the
 /// server's char-based spans.
-fn menu_row_line(label: &str, spans: &[(u16, u16)], selected: bool, width: usize) -> Line<'static> {
+fn menu_row_line(
+    label: &str,
+    spans: &[(u16, u16)],
+    selected: bool,
+    width: usize,
+    marked: Option<bool>,
+) -> Line<'static> {
     let base = if selected {
         Style::default().add_modifier(Modifier::REVERSED)
     } else {
@@ -2738,6 +2749,17 @@ fn menu_row_line(label: &str, spans: &[(u16, u16)], selected: bool, width: usize
         .add_modifier(Modifier::UNDERLINED);
     let mut out: Vec<Span> = Vec::new();
     let mut used = 0usize;
+    // Multi-select marker gutter (2 cells), present on every row only while marks
+    // are in play so columns stay aligned: a glyph on marked rows, blanks otherwise.
+    if let Some(is_marked) = marked {
+        let (glyph, st) = if is_marked {
+            ("● ", base.add_modifier(Modifier::BOLD))
+        } else {
+            ("  ", base)
+        };
+        out.push(Span::styled(glyph.to_string(), st));
+        used += 2;
+    }
     for (i, ch) in label.chars().enumerate() {
         if used >= width {
             break;

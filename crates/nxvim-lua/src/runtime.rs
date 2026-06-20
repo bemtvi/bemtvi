@@ -352,6 +352,9 @@ pub struct GoMirror {
     pub makeprg: String,
     pub grepprg: String,
     pub grepformat: String,
+    /// `'qfdock'` — whether quickfix/location lists open as bottom-dock tabs (nxvim)
+    /// vs a split (vim/telescope). Backs `vim.o.qfdock` / `nx.o.qfdock`.
+    pub qfdock: bool,
 }
 
 /// The pure-Lua `vim.*` prelude, split into focused modules under `src/prelude/`
@@ -1514,6 +1517,19 @@ impl LuaRuntime {
             Some(k) => mlua::Value::Integer(lua_int(k as i64)),
             None => mlua::Value::Nil,
         };
+        run.call::<()>((arg,))
+    }
+
+    /// Deliver the picker's "send these results to a list" outcome: the matched item
+    /// `keys` (in display order) go to `nx._picker_send`, which maps them back to the
+    /// source item tables and builds a location list (`nx.qf.send_to_loclist`). The
+    /// bulk-result sibling of [`Self::run_picker_result`].
+    pub fn run_picker_send(&self, keys: Vec<usize>) -> mlua::Result<()> {
+        let nx = self.nx()?;
+        let run: mlua::Function = nx.get("_picker_send")?;
+        let arg = self
+            .lua
+            .create_sequence_from(keys.into_iter().map(|k| k as i64))?;
         run.call::<()>((arg,))
     }
 

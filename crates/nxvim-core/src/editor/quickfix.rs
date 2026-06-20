@@ -18,6 +18,7 @@
 
 use super::*;
 use crate::buffer::Buffer;
+use crate::WindowOptions;
 use std::path::{Path, PathBuf};
 
 /// How a populate request combines with the existing list.
@@ -223,7 +224,7 @@ impl Editor {
     fn qf_stack(&self, which: QfWhich) -> Option<&QfStack> {
         match which {
             QfWhich::Quickfix => Some(&self.qf),
-            QfWhich::Location(w) => self.windows.try_get(w).and_then(|win| win.loclist.as_ref()),
+            QfWhich::Location(w) => self.window(w).and_then(|win| win.loclist.as_ref()),
         }
     }
 
@@ -240,8 +241,7 @@ impl Editor {
         match which {
             QfWhich::Quickfix => self.qf.current_mut(),
             QfWhich::Location(w) => self
-                .windows
-                .try_get_mut(w)
+                .window_mut(w)
                 .and_then(|win| win.loclist.as_mut())
                 .and_then(QfStack::current_mut),
         }
@@ -254,8 +254,7 @@ impl Editor {
         match which {
             QfWhich::Quickfix => Some(&mut self.qf),
             QfWhich::Location(w) => self
-                .windows
-                .try_get_mut(w)
+                .window_mut(w)
                 .map(|win| win.loclist.get_or_insert_with(QfStack::default)),
         }
     }
@@ -501,7 +500,7 @@ impl Editor {
     fn qf_display_bufnr(&self, which: QfWhich) -> Option<BufferId> {
         match which {
             QfWhich::Quickfix => self.qf_bufnr,
-            QfWhich::Location(w) => self.windows.try_get(w).and_then(|win| win.loclist_bufnr),
+            QfWhich::Location(w) => self.window(w).and_then(|win| win.loclist_bufnr),
         }
     }
 
@@ -510,7 +509,7 @@ impl Editor {
         match which {
             QfWhich::Quickfix => self.qf_bufnr = buf,
             QfWhich::Location(w) => {
-                if let Some(win) = self.windows.try_get_mut(w) {
+                if let Some(win) = self.window_mut(w) {
                     win.loclist_bufnr = buf;
                 }
             }
@@ -586,7 +585,86 @@ impl Editor {
         let disp = self
             .qf_display_bufnr(which)
             .expect("display buffer created above");
-        self.open_bottom_window(disp, height);
+        if self.options.qfdock {
+            self.qf_place_in_dock(disp, height);
+        } else {
+            self.open_bottom_window(disp, height);
+        }
+    }
+
+    /// Host `disp` (a `filetype=qf` display buffer) as a tab in the **bottom dock** —
+    /// the nxvim way (`'qfdock'`). The first such list opens the dock; subsequent
+    /// lists add a tab beside it, so several searches sit side by side. `qf_prev_win`
+    /// is already set to the invoking (main-layer) window, so `<CR>` jumps back into
+    /// the main layer (see [`Editor::qf_focus_target_window`]).
+    fn qf_place_in_dock(&mut self, disp: BufferId, height: usize) {
+        if self.dock_is_open(DockSide::Bottom) {
+            self.focus_dock(DockSide::Bottom);
+            self.new_tab(disp, WindowOptions::default());
+        } else {
+            self.open_dock(DockSide::Bottom, height, Some(disp));
+        }
+    }
+
+    /// Send `items` to a **new** location list shown as its own tab in the bottom
+    /// dock — the nxvim "save this search" surface. The new tab's window both *owns*
+    /// and *displays* the list, so every call adds an independent list beside the
+    /// existing ones (unlike the single global quickfix list). `<CR>` on an entry
+    /// jumps into the main editing layer: the owner is the dock window, which is the
+    /// display window too, so it is excluded as the jump target and the
+    /// [`Editor::qf_focus_target_window`] fallback lands in the main layer (which
+    /// `open_layers` always lists first). Returns the owning/display window.
+    pub fn loclist_to_dock(&mut self, items: Vec<QfEntry>, title: String) -> WindowId {
+        let disp = self.add_buffer(Buffer::empty());
+        // `filetype=qf` installs the buffer-local `<CR>` jump map and the qf render.
+        self.set_filetype(disp, "qf");
+        self.qf_place_in_dock(disp, DockSide::Bottom.default_size());
+        let w = self.windows.current;
+        self.qf_set_display_bufnr(QfWhich::Location(w), Some(disp));
+        self.qf_set_items(QfWhich::Location(w), items, QfAction::New, Some(title));
+        w
+    }
+
+    /// Send `items` to a quickfix or location list and show it — the engine behind
+    /// `nx.qf.{send,add}_to_{loc,qf}list` (the picker's quickfix-style sinks, the
+    /// nxvim port of telescope's send/add-to-list actions).
+    ///
+    /// - `to_qf`: the single global **quickfix** list (one window/tab, reused) vs a
+    ///   **location** list.
+    /// - `action`: [`QfAction::New`] for a *send* (a fresh list), [`QfAction::Add`]
+    ///   for an *add* (append).
+    ///
+    /// Honors `'qfdock'`. With it off, both kinds open the classic way — a bottom
+    /// split of the current window. With it on (the nxvim default): the quickfix list
+    /// shows as its (single) bottom-dock tab; a location-list *send* opens a **new**
+    /// dock tab beside the others ([`Editor::loclist_to_dock`]), and a location-list
+    /// *add* appends to the focused dock loclist tab when one is focused (else falls
+    /// back to a new tab — there is nothing to append to).
+    pub fn list_send(&mut self, items: Vec<QfEntry>, title: String, action: QfAction, to_qf: bool) {
+        if to_qf {
+            // One global quickfix list: replace/append, then show (dock tab or split).
+            self.qf_set_items(QfWhich::Quickfix, items, action, Some(title));
+            self.ex_qf_open(QfWhich::Quickfix, "");
+            return;
+        }
+        if !self.options.qfdock {
+            // Classic vim/telescope: the current window's location list + a split.
+            let which = QfWhich::Location(self.windows.current);
+            self.qf_set_items(which, items, action, Some(title));
+            self.ex_qf_open(which, "");
+            return;
+        }
+        // Dock mode. An `add` appends to the focused dock loclist tab if we are on
+        // one; every `send` (and an `add` with no list focused) opens a fresh tab.
+        if matches!(action, QfAction::Add) {
+            if let Some(which @ QfWhich::Location(_)) =
+                self.qf_context_of_buffer(self.current_buffer_id())
+            {
+                self.qf_set_items(which, items, QfAction::Add, Some(title));
+                return;
+            }
+        }
+        self.loclist_to_dock(items, title);
     }
 
     /// `:cclose`/`:lclose` — close `which`'s window if open (leaving focus on a
@@ -596,10 +674,15 @@ impl Editor {
             return;
         };
         let prev = self.windows.current;
-        if self.windows.current != w {
-            self.set_current_window(w);
+        self.set_current_window(w);
+        // A dock-hosted display (the `'qfdock'` way) closes as a *tab* — which tears
+        // the dock down on its last tab — not a window: the dock's last-window guard
+        // would otherwise refuse a `close_window`.
+        if matches!(self.tree_of_window(w), Some((Layer::Dock(_), _))) {
+            self.close_tab();
+        } else {
+            self.close_window();
         }
-        self.close_window();
         if prev != w && self.window_ids().contains(&prev) {
             self.set_current_window(prev);
         }

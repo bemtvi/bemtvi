@@ -340,6 +340,11 @@ pub(crate) struct Menu {
     /// [`Editor::menu_push`] / [`Editor::menu_finish`] swap atomically when
     /// `items_gen` falls behind, so the list never flashes empty while typing.
     items_gen: u64,
+    /// Multi-selection: the source keys the user has **marked** (`<Tab>`), in mark
+    /// order. Keyed by source key (not view index) so a mark survives query edits and
+    /// re-ranking. Empty for `select` / completion (only a picker marks). The picker's
+    /// `send_to_loclist` sends these when non-empty, else the whole filtered view.
+    marked: Vec<usize>,
 }
 
 impl Menu {
@@ -534,6 +539,7 @@ impl Editor {
             docs: false,
             generation: 0,
             items_gen: 0,
+            marked: Vec::new(),
             width: None,
             height: None,
             align: None,
@@ -581,6 +587,7 @@ impl Editor {
             docs: false,
             generation: 0,
             items_gen: 0,
+            marked: Vec::new(),
             width,
             height,
             align,
@@ -651,6 +658,7 @@ impl Editor {
             docs,
             generation: 0,
             items_gen: 0,
+            marked: Vec::new(),
             width: None,
             height: None,
             align: None,
@@ -916,6 +924,7 @@ impl Editor {
             docs: self.complete_config.docs,
             generation: gen,
             items_gen: gen,
+            marked: Vec::new(),
             width: None,
             height: None,
             align: None,
@@ -1107,6 +1116,53 @@ impl Editor {
             "cancel" => {
                 self.menu_results.push(None);
                 self.close_menu();
+                return Ok(());
+            }
+            // "Send these results to a list": the **marked** keys (multi-select) when
+            // any are marked, else the whole filtered view in display order. Then close
+            // — the server hands the keys to Lua to build a location list. The nxvim
+            // port of telescope's send(-selected)-to-loclist.
+            "send_to_loclist" => {
+                let keys = self
+                    .menu
+                    .as_ref()
+                    .map(|m| {
+                        if m.marked.is_empty() {
+                            (0..m.view_len())
+                                .map(|i| m.all_items[m.item_at(i)].key)
+                                .collect()
+                        } else {
+                            m.marked.clone()
+                        }
+                    })
+                    .unwrap_or_default();
+                self.picker_sends.push(keys);
+                self.close_menu();
+                return Ok(());
+            }
+            // Multi-select: toggle the current row's mark and advance to the next row
+            // (telescope's `<Tab>`). Marks are keyed by source key, so they survive
+            // query edits / re-ranking. `clear_select` drops all marks.
+            "toggle_select" => {
+                if let Some(m) = self.menu.as_mut() {
+                    if m.cursor < m.view_len() {
+                        let key = m.all_items[m.item_at(m.cursor)].key;
+                        if let Some(pos) = m.marked.iter().position(|&k| k == key) {
+                            m.marked.remove(pos);
+                        } else {
+                            m.marked.push(key);
+                        }
+                        let last = m.view_len().saturating_sub(1);
+                        m.cursor = (m.cursor + 1).min(last);
+                        m.selected_active = true;
+                    }
+                }
+                return Ok(());
+            }
+            "clear_select" => {
+                if let Some(m) = self.menu.as_mut() {
+                    m.marked.clear();
+                }
                 return Ok(());
             }
             _ => {}
@@ -1354,6 +1410,23 @@ impl Editor {
                 };
                 (label, spans)
             })
+            .collect()
+    }
+
+    /// Whether each row in the visible window `[start, start + count)` is **marked**
+    /// (multi-select), parallel to [`Editor::menu_rows`] — so the client can flag the
+    /// marked rows. All `false` when nothing is marked (the common case); empty when
+    /// no menu is open.
+    pub fn menu_marked_window(&self, start: usize, count: usize) -> Vec<bool> {
+        let Some(m) = self.menu.as_ref() else {
+            return Vec::new();
+        };
+        let end = start.saturating_add(count).min(m.view_len());
+        if m.marked.is_empty() {
+            return vec![false; end.saturating_sub(start)];
+        }
+        (start..end)
+            .map(|i| m.marked.contains(&m.all_items[m.item_at(i)].key))
             .collect()
     }
 

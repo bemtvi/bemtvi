@@ -154,6 +154,14 @@ pub struct Options {
     /// (`'grepformat'`; default [`DFLT_GREPFORMAT`]). Same grammar as
     /// [`Options::errorformat`].
     pub grepformat: String,
+    /// Where a quickfix / location-list display opens (`'qfdock'`; nxvim-native,
+    /// default `true`). When set, `:copen` / `:lopen` (and the picker's
+    /// send-to-list action) host the `filetype=qf` display as a tab in the **bottom
+    /// dock**, and its entries jump into the main editing layer — the nxvim way,
+    /// where several searches can sit side by side as dock tabs. When unset, they
+    /// open the classic way: a bottom **split** of the current window (the
+    /// vim/telescope behavior). Honored by [`crate::editor::quickfix`].
+    pub qfdock: bool,
 }
 
 /// The default `'errorformat'` — vim's compiled-in non-Windows `DFLT_EFM`
@@ -223,6 +231,8 @@ impl Default for Options {
             makeprg: "make".to_string(),
             grepprg: "grep -n $* /dev/null".to_string(),
             grepformat: DFLT_GREPFORMAT.to_string(),
+            // The nxvim way: quickfix / loclist displays open as bottom-dock tabs.
+            qfdock: true,
         }
     }
 }
@@ -1242,6 +1252,13 @@ static OPTIONS: &[OptionInfo] = {
             kind: Str,
             scope: Global,
             doc: "Format of :grep output (like 'errorformat').",
+        },
+        OptionInfo {
+            name: "qfdock",
+            abbrev: Some("qfd"),
+            kind: Bool,
+            scope: Global,
+            doc: "Open quickfix/loclist as bottom-dock tabs (nxvim) vs a split (vim).",
         },
     ]
 };

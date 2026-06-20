@@ -10,7 +10,9 @@
 
 use nxvim_rpc::{Incoming, Rpc};
 use nxvim_server::ServerInit;
-use nxvim_test_harness::{drain_to_latest_redraw, exec_lua, feed, field_str, start_attached};
+use nxvim_test_harness::{
+    cursor_u64, drain_to_latest_redraw, exec_lua, feed, field_str, start_attached,
+};
 use tokio::sync::mpsc::UnboundedReceiver;
 
 async fn start() -> (Rpc, UnboundedReceiver<Incoming>) {
@@ -221,6 +223,35 @@ async fn nx_keymap_set_drives_a_normal_mode_mapping() {
         exec_lua(&rpc, "return vim.g.nx_mapped").await.as_bool(),
         Some(true),
         "a mapping set through nx.keymap.set fires on the mapped key"
+    );
+}
+
+#[tokio::test]
+async fn nx_cursor_set_moves_the_cursor_and_get_and_nvim_alias_agree() {
+    let (rpc, _incoming) = start().await;
+
+    // Two lines so a (row, col) target has somewhere to land.
+    feed(&rpc, "ihello world<CR>second line<Esc>");
+    rpc.request("nvim_get_mode", vec![]).await.expect("barrier");
+
+    // Drive the canonical setter: 1-based row, 0-based col (nx.cursor.get's
+    // convention). Row 1, col 6 → the 'w' of "world".
+    exec_lua(&rpc, "nx.cursor.set({ 1, 6 })").await;
+
+    // The nx getter reads the new position back...
+    let row = exec_lua(&rpc, "return nx.cursor.get()[1]").await.as_u64();
+    let col = exec_lua(&rpc, "return nx.cursor.get()[2]").await.as_u64();
+    assert_eq!(
+        (row, col),
+        (Some(1), Some(6)),
+        "nx.cursor.get reflects the nx.cursor.set move"
+    );
+
+    // ...and the actual window cursor moved, observed through the nvim alias.
+    assert_eq!(
+        cursor_u64(&rpc).await,
+        (1, 6),
+        "nx.cursor.set reached the core; nvim_win_get_cursor agrees"
     );
 }
 

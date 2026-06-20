@@ -1,7 +1,8 @@
 -- nxvim Lua prelude — the READ-ONLY nx.* editor-entity API + highlights/namespaces.
 -- The context getters an autocmd / keymap callback reads to know what fired:
 -- nx.buf.* (name / current / lines / text / line_count / is_loaded / list / …),
--- nx.win.* (current / buf / list / width / height / config / nr / …), nx.cursor.get,
+-- nx.win.* (current / buf / list / width / height / config / nr / …), nx.cursor.get /
+-- nx.cursor.set (the cursor read + the reveal/jump write),
 -- nx.tabpage.* reads, nx.screen.*, nx.mode / nx.current_line, plus the highlight
 -- read/define (nx.hl), namespaces (nx.ns), and the extmark decoration layer. The
 -- matching vim.api.nvim_* / vim.fn.* names are aliased onto each native.
@@ -97,6 +98,21 @@ function nx.cursor.get(win)
   end
   local c = nx._cur_cursor or { row = 1, col = 0 }
   return { c.row, c.col }
+end
+
+-- nx.cursor.set(pos[, win]): move window `win`'s cursor (`0`/nil = the current
+-- window) to `pos`, a `{ row, col }` pair in the SAME convention nx.cursor.get
+-- returns — a 1-based `row` and a 0-based byte `col`. The
+-- target is clamped into the buffer. This is the setter half of the cursor surface:
+-- the reveal / jump-to primitive a picker or a "go to definition"-style plugin uses;
+-- ordinary navigation stays plain normal-mode motion. Like the rest of the window
+-- mutation API it queues a window op the server applies after this chunk (the same
+-- "Lua queues, core mutates" flow), via the nx._win_set_cursor bridge.
+function nx.cursor.set(pos, win)
+  if type(pos) ~= "table" or type(pos[1]) ~= "number" then
+    error("nx.cursor.set: pos must be a { row, col } table (1-based row, 0-based col)", 2)
+  end
+  nx._win_set_cursor(win or 0, pos[1] - 1, pos[2] or 0)
 end
 
 -- nvim_get_current_line(): the text of the line the cursor is on in the current

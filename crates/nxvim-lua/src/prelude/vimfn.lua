@@ -87,6 +87,13 @@ function nx.expand(expr)
   end
   local mods = expr:match("^%%(:.*)$")
   if mods then
+    -- A buffer with no file expands to "" for EVERY modifier (`%:p`, `%:h`, `%:t`, …),
+    -- matching neovim — there is no path to modify. Without this, `%:p` would run
+    -- `fnamemodify("", ":p")`, which resolves the empty name against the cwd and so
+    -- makes a nameless/scratch buffer look like a real file at `<cwd>`.
+    if name == "" then
+      return ""
+    end
     return vim.fn.fnamemodify(name, mods)
   end
   error("expand(): unsupported expression '" .. tostring(expr) .. "'", 2)

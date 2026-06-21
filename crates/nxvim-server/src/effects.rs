@@ -1496,6 +1496,19 @@ impl EditHost {
         }
     }
 
+    /// Refresh the Lua **current-buffer snapshot** (`nx._cur_buf`: number, name,
+    /// filetype) to the editor's current buffer — the current-buffer-identity twin of
+    /// [`push_buf_mirror`](Self::push_buf_mirror)'s content refresh. A Lua getter for the
+    /// *current* buffer (`vim.fn.expand("%")` / `%:p`, the filetype) reads this, so it
+    /// must track the current buffer after every batch — otherwise it lags at whatever
+    /// the last autocmd left (e.g. empty right after `:edit`, before any buffer event).
+    pub(crate) fn refresh_cur_buf_snapshot(&mut self) {
+        let buf = self.editor.current_buffer_id();
+        let name = self.editor.buffer_name(buf).unwrap_or_default();
+        let ft = crate::filetype_of(self.editor.buffer().path.as_deref()).unwrap_or("");
+        let _ = self.lua.set_buf_snapshot(buf.0, &name, ft);
+    }
+
     /// Refresh the Rust→Lua buffer mirror (`nx._bufs` + `nx._cur_cursor` +
     /// current window) the buffer-read API resolves against (Phase 6). Pushed
     /// before any Lua entry that can read buffer/cursor state. The per-buffer line
@@ -2418,6 +2431,9 @@ impl EditHost {
         // can read buffer/cursor state. The Lua API exposes no buffer-text write, so
         // the mirror can't go stale mid-batch from Lua — once-at-entry is enough.
         self.push_buf_mirror();
+        // …and the current-buffer snapshot, so a command body reading `expand("%")` (a
+        // `:NxDiffGit`-style command right after `:edit`) sees the current buffer's name.
+        self.refresh_cur_buf_snapshot();
         // Whether any `:checktime` / watch reconcile reloaded a buffer this drain —
         // a reload re-stamps the disk snapshot (a new inode after an atomic replace),
         // so the per-buffer watch must re-arm against the new key once we settle.

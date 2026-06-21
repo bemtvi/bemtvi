@@ -185,6 +185,11 @@ impl EditHost {
                 // trailing `run_pending`, so a `nvim_buf_get_lines` in the chunk
                 // must see fresh lines (Phase 6).
                 self.push_buf_mirror();
+                // Also refresh the current-buffer snapshot (`nx._cur_buf`), so a getter
+                // reading the *current* buffer — `vim.fn.expand("%")`/`%:p`, the filetype —
+                // sees the buffer current NOW, not whatever the last autocmd left (this
+                // runs before the trailing `run_pending`, so it can't rely on that).
+                self.refresh_cur_buf_snapshot();
                 let value = match self.lua.eval_to_value(&code) {
                     Ok(value) => value,
                     Err(e) => {

@@ -1348,6 +1348,24 @@ pub(crate) fn install_runtime_api(
     )?;
     let sh = shared.clone();
     nx.set(
+        "_open",
+        lua.create_function(move |_, path: String| {
+            sh.borrow_mut()
+                .window_ops
+                .push(WindowOp::OpenSwitchbuf { path });
+            Ok(())
+        })?,
+    )?;
+    let sh = shared.clone();
+    nx.set(
+        "_buf_switch",
+        lua.create_function(move |_, buf: u64| {
+            sh.borrow_mut().window_ops.push(WindowOp::BufSwitch { buf });
+            Ok(())
+        })?,
+    )?;
+    let sh = shared.clone();
+    nx.set(
         "_win_set_topline",
         lua.create_function(move |_, (win, top): (u64, usize)| {
             sh.borrow_mut()

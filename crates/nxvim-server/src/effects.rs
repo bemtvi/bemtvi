@@ -1304,6 +1304,14 @@ impl EditHost {
                 // reload/modified guard — see the op's doc comment.
                 self.editor.jump_to(std::path::Path::new(&path), line, col);
             }
+            WindowOp::OpenSwitchbuf { path } => {
+                // Open honoring 'switchbuf' (the picker's location-less file confirm);
+                // no forced cursor — a reused window keeps its place.
+                self.editor.open_path_switchbuf(std::path::Path::new(&path));
+            }
+            WindowOp::BufSwitch { buf } => {
+                self.editor.switch_to_buffer_switchbuf(BufferId(buf));
+            }
             WindowOp::SetTopline { win, top } => {
                 let id = resolve_win(self, win);
                 self.editor.set_window_topline(id, top);

@@ -440,7 +440,9 @@ function nx.picker.edit(item)
   if item.row then
     nx._jump_to(item.path, item.row - 1, math.max(0, (item.col or 1) - 1))
   else
-    vim.cmd("edit " .. item.path)
+    -- Open honoring 'switchbuf' (a file already shown in another tab is focused
+    -- there under the default `usetab`), not a plain `:edit` into this window.
+    nx._open(item.path)
   end
 end
 
@@ -530,7 +532,9 @@ nx.picker.source({
     end
   end,
   confirm = function(item)
-    vim.cmd("buffer " .. item.bufnr)
+    -- Honor 'switchbuf': a buffer already shown in another tab is focused there
+    -- (the default `usetab`), rather than swapped into the current window.
+    nx._buf_switch(item.bufnr)
   end,
 })
 

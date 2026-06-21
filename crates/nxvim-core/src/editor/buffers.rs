@@ -1339,7 +1339,7 @@ impl Editor {
     /// ([`Editor::edit_in_current_window`]). Returns the buffer now shown, or `None`
     /// on a failed synchronous load. The shared jump kernel behind every located
     /// navigation ([`Editor::jump_to`]).
-    pub(crate) fn open_path_switchbuf(&mut self, path: &Path) -> Option<BufferId> {
+    pub fn open_path_switchbuf(&mut self, path: &Path) -> Option<BufferId> {
         if let Some(buf) = self.find_buffer_by_path(path) {
             if let Some((tab_idx, win)) = self.switchbuf_window(buf) {
                 self.goto_tab_window(tab_idx, win);
@@ -1347,6 +1347,23 @@ impl Editor {
             }
         }
         self.edit_in_current_window(path)
+    }
+
+    /// Switch to an already-loaded buffer honoring `'switchbuf'`: focus a window
+    /// already showing it ([`Editor::switchbuf_window`]) — switching tabs for
+    /// `usetab` — else swap it into the current window ([`Editor::switch_buffer`],
+    /// preserving the buffer's saved cursor). The buffer-number companion of
+    /// [`Editor::open_path_switchbuf`], used by the `nx.picker` buffers source. A
+    /// no-op for an unknown id.
+    pub fn switch_to_buffer_switchbuf(&mut self, buf: BufferId) {
+        if !self.buffers.map.contains_key(&buf) {
+            return;
+        }
+        if let Some((tab_idx, win)) = self.switchbuf_window(buf) {
+            self.goto_tab_window(tab_idx, win);
+        } else {
+            self.switch_buffer(buf);
+        }
     }
 
     /// Land the cursor at the 0-based `(line, byte col)`, clamped to the buffer and

@@ -1686,3 +1686,142 @@ nx.picker.source {{
         "the wheel over the preview scrolled it, not the list"
     );
 }
+
+// ----- Phase 2: picker opens honor 'switchbuf' ------------------------------
+
+/// The current tab id (`nvim_get_current_tabpage`).
+async fn cur_tab(rpc: &Rpc) -> u64 {
+    exec_lua(rpc, "return vim.api.nvim_get_current_tabpage()")
+        .await
+        .as_u64()
+        .expect("tab id")
+}
+
+/// The current buffer id (`nvim_get_current_buf`).
+async fn cur_buf(rpc: &Rpc) -> u64 {
+    exec_lua(rpc, "return vim.api.nvim_get_current_buf()")
+        .await
+        .as_u64()
+        .expect("buf id")
+}
+
+/// The number of open tab pages.
+async fn tab_count(rpc: &Rpc) -> u64 {
+    exec_lua(rpc, "return #vim.api.nvim_list_tabpages()")
+        .await
+        .as_u64()
+        .expect("tab count")
+}
+
+/// Two named buffers, one per tab (zebra in tab 1, mango in the current tab 2),
+/// returning `(dir, zebra path, mango path, zebra bufnr)`.
+async fn two_tabs_two_buffers(rpc: &Rpc, tag: &str) -> (std::path::PathBuf, String, String, u64) {
+    let dir = temp_dir(tag);
+    let zebra = dir.join("zebrafile.txt");
+    let mango = dir.join("mangofile.txt");
+    std::fs::write(&zebra, "alpha\nbeta\n").expect("write zebra");
+    std::fs::write(&mango, "one\ntwo\n").expect("write mango");
+    command(rpc, &format!("edit {}", zebra.display())).await; // tab 1 shows zebra
+    let zebra_buf = cur_buf(rpc).await;
+    command(rpc, &format!("tabedit {}", mango.display())).await; // tab 2 shows mango (current)
+    assert_eq!(cur_tab(rpc).await, 2, "set-up leaves us on tab 2");
+    (
+        dir,
+        zebra.display().to_string(),
+        mango.display().to_string(),
+        zebra_buf,
+    )
+}
+
+/// The built-in `buffers` picker honors the default `'switchbuf'=usetab`: picking a
+/// buffer already shown in another tab switches to that tab instead of swapping it
+/// into the current window.
+#[tokio::test]
+async fn buffers_picker_usetab_switches_to_the_tab_showing_the_buffer() {
+    let dir = temp_dir("picker_buf_usetab");
+    let (rpc, mut incoming) = start(&dir, "").await;
+    let (_d, _zebra, _mango, zebra_buf) =
+        two_tabs_two_buffers(&rpc, "picker_buf_usetab_files").await;
+
+    exec_lua(&rpc, "nx.picker.open('buffers')").await;
+    poll_menu(&rpc, &mut incoming).await.expect("menu opens");
+    feed(&rpc, "zebra"); // narrow to the zebra buffer
+    poll_menu(&rpc, &mut incoming).await;
+    feed(&rpc, "<CR>");
+    nxvim_test_harness::barrier(&rpc).await;
+
+    assert_eq!(tab_count(&rpc).await, 2, "no new tab opened");
+    assert_eq!(
+        cur_tab(&rpc).await,
+        1,
+        "picking the buffer switched to the tab already showing it"
+    );
+    assert_eq!(cur_buf(&rpc).await, zebra_buf);
+}
+
+/// With `'switchbuf'` empty, the `buffers` picker opens the chosen buffer in the
+/// current window — no tab hop (the gating guard).
+#[tokio::test]
+async fn buffers_picker_empty_switchbuf_stays_in_current_tab() {
+    let dir = temp_dir("picker_buf_empty");
+    let (rpc, mut incoming) = start(&dir, "").await;
+    let (_d, _zebra, _mango, zebra_buf) =
+        two_tabs_two_buffers(&rpc, "picker_buf_empty_files").await;
+    exec_lua(&rpc, "nx.o.switchbuf = ''").await;
+
+    exec_lua(&rpc, "nx.picker.open('buffers')").await;
+    poll_menu(&rpc, &mut incoming).await.expect("menu opens");
+    feed(&rpc, "zebra");
+    poll_menu(&rpc, &mut incoming).await;
+    feed(&rpc, "<CR>");
+    nxvim_test_harness::barrier(&rpc).await;
+
+    assert_eq!(cur_tab(&rpc).await, 2, "empty 'switchbuf' makes no tab hop");
+    assert_eq!(
+        cur_buf(&rpc).await,
+        zebra_buf,
+        "the buffer opened in the current tab's window"
+    );
+}
+
+/// A location-less confirm (the `files` shape: `nx.picker.edit` on a `path`-only
+/// item) routes through the `'switchbuf'`-aware open, so picking a file already
+/// shown in another tab switches to that tab.
+#[tokio::test]
+async fn files_style_open_usetab_switches_to_the_tab_showing_the_file() {
+    let dir = temp_dir("picker_file_usetab");
+    let zebra = dir.join("zebrafile.txt");
+    let mango = dir.join("mangofile.txt");
+    std::fs::write(&zebra, "alpha\nbeta\n").expect("write zebra");
+    std::fs::write(&mango, "one\ntwo\n").expect("write mango");
+    let src = format!(
+        r#"
+nx.picker.source {{
+  name = "openfiles",
+  items = function(ctx)
+    ctx.push {{ text = "zebra", path = "{z}" }}
+  end,
+  confirm = function(item) nx.picker.edit(item) end,
+}}
+"#,
+        z = zebra.display(),
+    );
+    let (rpc, mut incoming) = start(&dir, &src).await;
+
+    command(&rpc, &format!("edit {}", zebra.display())).await; // tab 1 shows zebra
+    let zebra_buf = cur_buf(&rpc).await;
+    command(&rpc, &format!("tabedit {}", mango.display())).await; // tab 2 (current)
+
+    exec_lua(&rpc, "nx.picker.open('openfiles')").await;
+    poll_menu(&rpc, &mut incoming).await.expect("menu opens");
+    feed(&rpc, "<CR>");
+    nxvim_test_harness::barrier(&rpc).await;
+
+    assert_eq!(tab_count(&rpc).await, 2, "no new tab opened");
+    assert_eq!(
+        cur_tab(&rpc).await,
+        1,
+        "a location-less file open follows 'switchbuf'=usetab"
+    );
+    assert_eq!(cur_buf(&rpc).await, zebra_buf);
+}

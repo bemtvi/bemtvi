@@ -1148,6 +1148,18 @@ fn chunk_runs_text(value: &Value) -> String {
                 }
             }
             Value::Map(entries) => {
+                // A statusline segment / cell map `{ text: "…", style: … }` (what
+                // `segment_value` builds): take its `text` and don't descend into the
+                // style. This is the shape `global_status` actually carries — without
+                // this arm the mirror would drop every segment's text (the values are
+                // bare strings/ints the `_` arm ignores).
+                if let Some((_, Value::String(s))) = entries
+                    .iter()
+                    .find(|(k, _)| matches!(k, Value::String(ks) if ks.as_str() == Some("text")))
+                {
+                    out.push_str(s.as_str().unwrap_or_default());
+                    return;
+                }
                 for (_, val) in entries {
                     walk(val, out);
                 }

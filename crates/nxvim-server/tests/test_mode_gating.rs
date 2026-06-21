@@ -46,3 +46,30 @@ async fn test_api_is_absent_until_enabled() {
         "nx._ui must be populated once test mode is on"
     );
 }
+
+#[tokio::test]
+async fn ui_statusline_mirror_carries_the_rendered_segment_text() {
+    // `t:statusline()` (the `nx._ui.statusline` mirror) must reflect the actual
+    // rendered global status line. It mirrors `global_status` — an array of
+    // `{ text, style }` segment maps — so the text extractor has to read each map's
+    // `text` key. (Regression: it used to only handle chunk-pair arrays and dropped
+    // the map text entirely, leaving the mirror empty for every statusline.)
+    let (rpc, _incoming) = start_attached(ServerInit::default(), 80, 24).await;
+    rpc.request("nx_enable_test_mode", vec![])
+        .await
+        .expect("enable test mode");
+
+    // A single global bar (laststatus=3) with a literal `%`-format, so the rendered
+    // text is deterministic regardless of file/cursor.
+    feed(&rpc, ":set laststatus=3<CR>");
+    feed(&rpc, ":set statusline=hello-status<CR>");
+    // A keystroke to force a redraw that refreshes the mirror.
+    feed(&rpc, "<Esc>");
+
+    let sl = exec_lua(&rpc, "return nx._ui.statusline").await;
+    assert_eq!(
+        sl,
+        Value::from("hello-status"),
+        "the statusline mirror must carry the rendered global-bar text"
+    );
+}

@@ -830,13 +830,12 @@ pub struct Editor {
     /// `None` on cancel. Drained by the server to deliver the result to its
     /// callback — the menu analogue of [`Editor::prompt_results`].
     pub menu_results: Vec<Option<usize>>,
-    /// The confirm gesture's open mode for the *next* drained picker result: `true`
-    /// when the user confirmed with the tab action (`confirm_tab` / default `<C-t>`),
-    /// so the source opens the chosen item in a new tab; `false` (the default) opens
-    /// in the current window. Set alongside the [`Editor::menu_results`] push and
-    /// taken by the server when it routes the result to `nx._picker_result`. Only the
-    /// picker reads it (`nx.ui.select` ignores it).
-    pub picker_confirm_in_tab: bool,
+    /// The confirm gesture's open mode for the *next* drained picker result — set by
+    /// the `confirm`/`confirm_tab`/`confirm_split`/`confirm_vsplit` actions (default
+    /// `<CR>`/`<C-t>`/`<C-x>`/`<C-v>`) alongside the [`Editor::menu_results`] push,
+    /// and taken by the server when it routes the result to `nx._picker_result`. Only
+    /// the picker reads it (`nx.ui.select` ignores it). See [`menu::PickerOpenMode`].
+    pub picker_confirm_mode: menu::PickerOpenMode,
     /// "Send the picker's current (filtered) results somewhere" outcomes: each entry
     /// is the matched item keys in display order, pushed by the `send_to_loclist`
     /// picker action (which also closes the picker). Drained by the server, which
@@ -1446,7 +1445,7 @@ impl Editor {
             view_selects: Vec::new(),
             menu: None,
             menu_results: Vec::new(),
-            picker_confirm_in_tab: false,
+            picker_confirm_mode: menu::PickerOpenMode::default(),
             picker_sends: Vec::new(),
             content_float: None,
             picker_query_changes: Vec::new(),

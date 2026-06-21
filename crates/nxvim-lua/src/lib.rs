@@ -38,9 +38,9 @@ pub use luafs::{run_fs_job, FileKind, LuaDirEntry, LuaFs, LuaStat, StdLuaFs};
 pub use ops::{
     BufOp, CallbackArgs, ConfirmReq, DecorMark, DecorPublish, DiagnosticData, DockOp, ExtmarkOp,
     FeedKeysOp, FsError, FsJob, FsValue, GlobalOptionOp, HlSet, InlayHintMirrorData, LayerOp,
-    LoopOp, LspClientData, LspOp, LspServerCapabilities, OptionValue, PanelOp, QfItem, QfSetOp,
-    RawKeymap, RawRhs, RegisterSetOp, SemanticTokenData, StatuslineKind, StatuslineTarget, TabOp,
-    TerminalOpenReq, TsOp, UiInputReq, ViewOp, VirtChunkData, VirtDecorData, WindowOp,
+    LoopOp, LspClientData, LspOp, LspServerCapabilities, OpenTarget, OptionValue, PanelOp, QfItem,
+    QfSetOp, RawKeymap, RawRhs, RegisterSetOp, SemanticTokenData, StatuslineKind, StatuslineTarget,
+    TabOp, TerminalOpenReq, TsOp, UiInputReq, ViewOp, VirtChunkData, VirtDecorData, WindowOp,
 };
 pub use runtime::{
     BoMirror, BufBytesEdit, BufMirror, ExtmarkMirror, FloatMirror, GoMirror, HlDefMirror,

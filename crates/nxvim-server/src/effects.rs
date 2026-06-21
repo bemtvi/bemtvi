@@ -1302,17 +1302,19 @@ impl EditHost {
                 path,
                 line,
                 col,
-                new_tab,
+                target,
             } => {
-                // The picker has closed and returned focus by confirm time. `new_tab`
-                // (the `<C-t>` gesture) opens a fresh tab; otherwise navigate the
-                // current window honoring 'switchbuf' — reusing an open buffer without a
-                // reload/modified guard. See the op's doc comment.
+                // The picker has closed and returned focus by confirm time. The confirm
+                // gesture's target opens a fresh tab / split, or — for `Current` —
+                // navigates the focused window honoring 'switchbuf', reusing an open
+                // buffer without a reload/modified guard. See the op's doc comment.
+                use nxvim_lua::OpenTarget;
                 let p = std::path::Path::new(&path);
-                if new_tab {
-                    self.editor.jump_to_tab(p, line, col);
-                } else {
-                    self.editor.jump_to(p, line, col);
+                match target {
+                    OpenTarget::Current => self.editor.jump_to(p, line, col),
+                    OpenTarget::Tab => self.editor.jump_to_tab(p, line, col),
+                    OpenTarget::Split => self.editor.jump_to_split(p, line, col, false),
+                    OpenTarget::Vsplit => self.editor.jump_to_split(p, line, col, true),
                 }
             }
             WindowOp::OpenSwitchbuf { path } => {
@@ -2730,13 +2732,9 @@ impl EditHost {
                     self.apply_lua_effects();
                 } else if self.picker_active {
                     self.picker_active = false;
-                    // The confirm gesture's open mode (default `<C-t>` ⇒ a new tab).
-                    // Taken per-result so it never leaks into the next confirm.
-                    let mode = if std::mem::take(&mut self.editor.picker_confirm_in_tab) {
-                        "tab"
-                    } else {
-                        "current"
-                    };
+                    // The confirm gesture's open mode (`<C-t>`/`<C-x>`/`<C-v>` ⇒ tab /
+                    // split / vsplit). Taken per-result so it never leaks to the next.
+                    let mode = std::mem::take(&mut self.editor.picker_confirm_mode).as_str();
                     if let Err(e) = self.lua.run_picker_result(result, mode) {
                         self.editor
                             .echo(format!("E5108: Error in nx.picker confirm: {e}"));

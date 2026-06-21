@@ -1949,3 +1949,121 @@ nx.picker.source {{
         "the file opened in place"
     );
 }
+
+// ----- Phase 5: <C-x> / <C-v> open the selection in a split -----------------
+
+/// Number of windows in the current tab page.
+async fn win_count(rpc: &Rpc) -> u64 {
+    exec_lua(rpc, "return #vim.api.nvim_tabpage_list_wins(0)")
+        .await
+        .as_u64()
+        .expect("win count")
+}
+
+/// The current window's width / height (`nvim_win_get_width/height`).
+async fn win_width(rpc: &Rpc) -> u64 {
+    exec_lua(rpc, "return vim.api.nvim_win_get_width(0)")
+        .await
+        .as_u64()
+        .expect("win width")
+}
+async fn win_height(rpc: &Rpc) -> u64 {
+    exec_lua(rpc, "return vim.api.nvim_win_get_height(0)")
+        .await
+        .as_u64()
+        .expect("win height")
+}
+
+/// `<C-x>` on a `buffers` entry opens it in a horizontal split of the current tab
+/// (a new window, full width, reduced height) — no new tab, bypassing 'switchbuf'.
+#[tokio::test]
+async fn ctrl_x_opens_a_buffer_in_a_horizontal_split() {
+    let dir = temp_dir("picker_ctrl_x_buf");
+    let (rpc, mut incoming) = start(&dir, "").await;
+    let (_d, _zebra, _mango, zebra_buf) =
+        two_tabs_two_buffers(&rpc, "picker_ctrl_x_buf_files").await;
+
+    exec_lua(&rpc, "nx.picker.open('buffers')").await;
+    poll_menu(&rpc, &mut incoming).await.expect("menu opens");
+    feed(&rpc, "zebra");
+    poll_menu(&rpc, &mut incoming).await;
+    feed(&rpc, "<C-x>");
+    nxvim_test_harness::barrier(&rpc).await;
+
+    assert_eq!(tab_count(&rpc).await, 2, "<C-x> opens no new tab");
+    assert_eq!(cur_tab(&rpc).await, 2, "the split is in the current tab");
+    assert_eq!(win_count(&rpc).await, 2, "<C-x> split the window");
+    assert_eq!(cur_buf(&rpc).await, zebra_buf, "the split shows the buffer");
+    assert!(
+        win_width(&rpc).await >= 78,
+        "a horizontal split keeps full width, got {}",
+        win_width(&rpc).await
+    );
+}
+
+/// `<C-v>` on a `buffers` entry opens it in a vertical split (a new window, reduced
+/// width, full height).
+#[tokio::test]
+async fn ctrl_v_opens_a_buffer_in_a_vertical_split() {
+    let dir = temp_dir("picker_ctrl_v_buf");
+    let (rpc, mut incoming) = start(&dir, "").await;
+    let (_d, _zebra, _mango, zebra_buf) =
+        two_tabs_two_buffers(&rpc, "picker_ctrl_v_buf_files").await;
+
+    exec_lua(&rpc, "nx.picker.open('buffers')").await;
+    poll_menu(&rpc, &mut incoming).await.expect("menu opens");
+    feed(&rpc, "zebra");
+    poll_menu(&rpc, &mut incoming).await;
+    feed(&rpc, "<C-v>");
+    nxvim_test_harness::barrier(&rpc).await;
+
+    assert_eq!(cur_tab(&rpc).await, 2, "the split is in the current tab");
+    assert_eq!(win_count(&rpc).await, 2, "<C-v> split the window");
+    assert_eq!(
+        cur_buf(&rpc).await,
+        zebra_buf,
+        "the vsplit shows the buffer"
+    );
+    assert!(
+        win_width(&rpc).await < 60,
+        "a vertical split narrows the window, got {}",
+        win_width(&rpc).await
+    );
+}
+
+/// `<C-x>` on a located item opens its file in a split with the cursor on the
+/// item's row/col.
+#[tokio::test]
+async fn ctrl_x_opens_a_located_item_in_a_split() {
+    let dir = temp_dir("picker_ctrl_x_loc");
+    let file = dir.join("locfile.txt");
+    std::fs::write(&file, "one\ntwo\nthree\nfour\n").expect("write file");
+    let src = format!(
+        r#"
+nx.picker.source {{
+  name = "locs",
+  items = function(ctx)
+    ctx.push {{ text = "to three", path = "{f}", row = 3, col = 2 }}
+  end,
+  confirm = function(item, mode) nx.picker.edit(item, mode) end,
+}}
+"#,
+        f = file.display(),
+    );
+    let (rpc, mut incoming) = start(&dir, &src).await;
+
+    exec_lua(&rpc, "nx.picker.open('locs')").await;
+    poll_menu(&rpc, &mut incoming).await.expect("menu opens");
+    feed(&rpc, "<C-x>");
+    nxvim_test_harness::barrier(&rpc).await;
+
+    assert_eq!(tab_count(&rpc).await, 1, "<C-x> opens no new tab");
+    assert_eq!(win_count(&rpc).await, 2, "<C-x> split the window");
+    assert_eq!(
+        lines(&rpc).await,
+        vec!["one", "two", "three", "four"],
+        "the split shows the file"
+    );
+    assert_eq!(cursor(&rpc).await, (3, 1), "the cursor landed on the item");
+    let _ = win_height(&rpc).await; // height is reduced; exact value depends on layout
+}

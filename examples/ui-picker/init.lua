@@ -17,6 +17,7 @@
 --   <C-n> / <C-p>   move the selection down / up (also <Down> / <Up>)
 --   <CR>            confirm — runs the source's action on the highlighted item
 --   <C-t>           open the highlighted item in a NEW TAB (telescope's select_tab)
+--   <C-x> / <C-v>   open it in a horizontal / vertical SPLIT
 --   <Esc>           cancel
 --
 -- Picker keys are ordinary `picker`-mode maps, so rebind any of them — e.g. the
@@ -165,4 +166,4 @@ nx.keymap.set("n", "<leader>fp", function()
   nx.picker.open("preview")
 end)
 
-nx.notify("nx.picker playground — try \\ff \\fg \\fb \\fc \\fe \\fp (and <C-t> in any picker)")
+nx.notify("nx.picker playground — try \\ff \\fg \\fb \\fc \\fe \\fp (and <C-t>/<C-x>/<C-v> in any picker)")

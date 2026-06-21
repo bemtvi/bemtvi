@@ -37,6 +37,8 @@ In the open picker (all of these are rebindable — see [Keys](#keys)):
 | `<C-p>` / `<Up>` | Previous item |
 | `<CR>` | Confirm — run the source's action on the highlighted item |
 | `<C-t>` | Confirm in a **new tab** — open the highlighted item in a fresh tab |
+| `<C-x>` | Confirm in a **horizontal split** |
+| `<C-v>` | Confirm in a **vertical split** |
 | `<Esc>` | Cancel |
 | `<Tab>` / `<S-Tab>` | Multi-select — mark/unmark this row and advance (see [Sending results to a list](#sending-results-to-a-list)) |
 | `<C-q>` | Send the results (marked, else all filtered) to a location list |
@@ -110,8 +112,9 @@ nx.picker.source({
 and, if the item carries a 1-based `row` (and optional `col`), jumps the cursor
 there. The `mode` is the confirm gesture (the picker passes it to
 `confirm(item, mode)`): `"current"` opens in the focused window honoring
-[`'switchbuf'`](#switching-to-an-open-tab); `"tab"` (the default `<C-t>`) opens in
-a new tab. Forward it from a custom source's `confirm` to support `<C-t>`:
+[`'switchbuf'`](#switching-to-an-open-tab); `"tab"` / `"split"` / `"vsplit"` (the
+defaults `<C-t>` / `<C-x>` / `<C-v>`) open in a new tab / horizontal split /
+vertical split. Forward it from a custom source's `confirm` to support those keys:
 `confirm = function(item, mode) nx.picker.edit(item, mode) end`.
 
 ### Switching to an open tab

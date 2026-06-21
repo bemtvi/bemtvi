@@ -28,6 +28,36 @@ use crate::input::{Key, KeyCode};
 use crate::mode::KeyContext;
 use crate::view::MenuView;
 
+/// How a confirmed picker pick opens — the gesture the user confirmed with. The
+/// server reads it off [`Editor::picker_confirm_mode`] and forwards the matching
+/// string to `nx._picker_result` → the source's `confirm(item, mode)`. Only the
+/// picker uses it (`nx.ui.select` ignores it). `<C-t>`/`<C-x>`/`<C-v>` map to
+/// `Tab`/`Split`/`Vsplit`; plain `<CR>` is `Current` (honoring `'switchbuf'`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum PickerOpenMode {
+    /// `<CR>` — open in the focused window, honoring `'switchbuf'`.
+    #[default]
+    Current,
+    /// `<C-t>` — open in a new tab.
+    Tab,
+    /// `<C-x>` — open in a horizontal split.
+    Split,
+    /// `<C-v>` — open in a vertical split.
+    Vsplit,
+}
+
+impl PickerOpenMode {
+    /// The mode string handed to Lua (`nx._picker_result` / `confirm(item, mode)`).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            PickerOpenMode::Current => "current",
+            PickerOpenMode::Tab => "tab",
+            PickerOpenMode::Split => "split",
+            PickerOpenMode::Vsplit => "vsplit",
+        }
+    }
+}
+
 /// Where the float (menu or content float) anchors on the shared placement layer.
 /// `Cursor` anchors it under the cursor (the `nx.ui.select` / completion shape);
 /// `Editor` centers it over the editor (the picker shape); `Bottom` pins it to the
@@ -1102,15 +1132,21 @@ impl Editor {
         // Confirm / cancel don't fit the shared `menu.as_mut()` nav block (they push a
         // result + close), so handle them first.
         match action {
-            "confirm" | "confirm_tab" => {
+            "confirm" | "confirm_tab" | "confirm_split" | "confirm_vsplit" => {
                 let chosen = self.menu.as_ref().and_then(|m| {
                     (m.cursor < m.view_len()).then(|| m.all_items[m.item_at(m.cursor)].key)
                 });
                 // A picker with no matches under the current query confirms nothing.
                 if let Some(key) = chosen {
-                    // `confirm_tab` (default `<C-t>`) opens the chosen item in a new tab;
-                    // the server reads this flag when it routes the result to Lua.
-                    self.picker_confirm_in_tab = action == "confirm_tab";
+                    // The confirm gesture's open mode (`<C-t>`/`<C-x>`/`<C-v>` ⇒ a new
+                    // tab / split / vsplit); the server reads it when it routes the
+                    // result to Lua. Plain `confirm` keeps the default (current window).
+                    self.picker_confirm_mode = match action {
+                        "confirm_tab" => menu::PickerOpenMode::Tab,
+                        "confirm_split" => menu::PickerOpenMode::Split,
+                        "confirm_vsplit" => menu::PickerOpenMode::Vsplit,
+                        _ => menu::PickerOpenMode::Current,
+                    };
                     self.menu_results.push(Some(key));
                     self.close_menu();
                 }

@@ -787,6 +787,34 @@ pub enum TsOp {
     },
 }
 
+/// Where a [`WindowOp::Jump`] opens its target — the picker's confirm gesture.
+/// Mirrors `nxvim_core`'s `PickerOpenMode`; the server maps each to the matching
+/// `Editor::jump_to{,_tab,_split}` call.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum OpenTarget {
+    /// `<CR>` — the focused window, honoring `'switchbuf'` (`Editor::jump_to`).
+    #[default]
+    Current,
+    /// `<C-t>` — a new tab (`Editor::jump_to_tab`).
+    Tab,
+    /// `<C-x>` — a horizontal split (`Editor::jump_to_split`).
+    Split,
+    /// `<C-v>` — a vertical split (`Editor::jump_to_split`).
+    Vsplit,
+}
+
+impl OpenTarget {
+    /// Parse the `nx._jump_to` mode string; unknown / absent ⇒ [`Self::Current`].
+    pub fn from_mode(mode: Option<&str>) -> Self {
+        match mode {
+            Some("tab") => OpenTarget::Tab,
+            Some("split") => OpenTarget::Split,
+            Some("vsplit") => OpenTarget::Vsplit,
+            _ => OpenTarget::Current,
+        }
+    }
+}
+
 /// A window mutation queued by the window Lua API (`vim.api.nvim_set_current_win`,
 /// `nvim_win_set_buf`/`set_cursor`/`set_width`/`set_height`/`close`, `nvim_open_win`),
 /// drained by the server in `apply_lua_effects` and applied to the live editor —
@@ -803,19 +831,19 @@ pub enum WindowOp {
     /// `line` is 0-based (the prelude converts neovim's 1-based row); `col` is the
     /// 0-based byte column.
     SetCursor { win: u64, line: usize, col: usize },
-    /// `nx._jump_to(path, line, col[, "tab"])` — navigate to `path` and land the
+    /// `nx._jump_to(path, line, col[, mode])` — navigate to `path` and land the
     /// cursor at the 0-based `(line, col)` (byte column). The non-reloading
     /// navigation primitive behind `nx.picker.edit`'s located jump: unlike a
     /// `:edit`, it reuses an already-open buffer (cwd-aware, so an absolute path
     /// finds a relatively-named buffer) and never guards on `modified` — a jump
-    /// navigates, it does not discard edits or reopen. `new_tab` (the picker's
-    /// `<C-t>`) opens it in a fresh tab instead (`Editor::jump_to_tab`); otherwise
-    /// it honors `'switchbuf'` via `Editor::jump_to`.
+    /// navigates, it does not discard edits or reopen. `target` is the picker's
+    /// confirm gesture: `Tab`/`Split`/`Vsplit` (`<C-t>`/`<C-x>`/`<C-v>`) open in a
+    /// fresh tab / split, `Current` honors `'switchbuf'` via `Editor::jump_to`.
     Jump {
         path: String,
         line: usize,
         col: usize,
-        new_tab: bool,
+        target: OpenTarget,
     },
     /// `nx._open(path)` — open `path` honoring `'switchbuf'` (the `nx.picker` files
     /// source's location-less confirm). A buffer already shown in another tab

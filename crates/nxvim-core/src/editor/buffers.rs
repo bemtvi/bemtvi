@@ -1346,6 +1346,25 @@ impl Editor {
         self.land_cursor(line, col);
     }
 
+    /// Open `path` in a new **split** of the focused window — `vertical` ⇒ a vsplit
+    /// (`<C-v>`), else a horizontal split (`<C-x>`) — and land the cursor at the
+    /// 0-based `(line, byte col)`, the picker's `confirm_split`/`confirm_vsplit`. An
+    /// explicit gesture, so it always splits (ignores `'switchbuf'`) but still reuses
+    /// an already-open buffer cwd-aware ([`Editor::edit_in_current_window`], like a
+    /// jump). A failed synchronous load leaves the split on the previous buffer and
+    /// lands no cursor.
+    pub fn jump_to_split(&mut self, path: &Path, line: usize, col: usize, vertical: bool) {
+        let dir = if vertical {
+            SplitDir::Vertical
+        } else {
+            SplitDir::Horizontal
+        };
+        self.split(dir);
+        if self.edit_in_current_window(path).is_some() {
+            self.land_cursor(line, col);
+        }
+    }
+
     /// Open `path` honoring `'switchbuf'`: if a window already shows its buffer in a
     /// tab we may reuse ([`Editor::switchbuf_window`] — any tab for `usetab`, the
     /// current tab for `useopen`), focus that window (switching tabs as needed) and

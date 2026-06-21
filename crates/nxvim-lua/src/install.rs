@@ -1341,12 +1341,12 @@ pub(crate) fn install_runtime_api(
         "_jump_to",
         lua.create_function(
             move |_, (path, line, col, mode): (String, usize, usize, Option<String>)| {
-                let new_tab = mode.as_deref() == Some("tab");
+                let target = crate::ops::OpenTarget::from_mode(mode.as_deref());
                 sh.borrow_mut().window_ops.push(WindowOp::Jump {
                     path,
                     line,
                     col,
-                    new_tab,
+                    target,
                 });
                 Ok(())
             },

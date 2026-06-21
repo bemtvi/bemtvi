@@ -141,6 +141,16 @@ tab count grows, new tab shows the entry (located: cursor at row/col); plain `<C
 
 ---
 
-## Out of scope (easy follow-ups)
-- `<C-v>`/`<C-x>` (vsplit/split) picker opens — the Phase 3 mode mechanism makes these trivial,
-  but only `<C-t>` was requested.
+## Phase 5 — `<C-x>` / `<C-v>` split opens (added 2026-06-21)
+
+Generalized the Phase 3 confirm mode to cover splits:
+- The bool `picker_confirm_in_tab` became `picker_confirm_mode: PickerOpenMode` (`Current`/`Tab`/
+  `Split`/`Vsplit`); `menu.rs` maps `confirm`/`confirm_tab`/`confirm_split`/`confirm_vsplit`.
+- The `Jump` op's `new_tab: bool` became `target: OpenTarget` (mirrors `PickerOpenMode`);
+  `effects.rs` dispatches to `jump_to` / `jump_to_tab` / new `Editor::jump_to_split(.., vertical)`
+  (split + `edit_in_current_window` + `land_cursor`, ignoring `'switchbuf'`).
+- `picker.lua`: `confirm_split`/`confirm_vsplit` actions + default `<C-x>`/`<C-v>` maps;
+  `nx.picker.edit` routes tab/split/vsplit through `nx._jump_to(.., mode)`; the buffers source
+  opens the window (`:split`/`:vsplit`) then swaps the buffer in.
+- Tests: 3 new in `picker.rs` (buffers `<C-x>` horizontal, buffers `<C-v>` vertical, located
+  `<C-x>` lands cursor). Docs + the ui-picker example updated.

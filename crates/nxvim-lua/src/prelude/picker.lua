@@ -39,6 +39,8 @@ for _, name in ipairs({
   "prev",
   "confirm",
   "confirm_tab",
+  "confirm_split",
+  "confirm_vsplit",
   "cancel",
   "preview_half_down",
   "preview_half_up",
@@ -70,6 +72,8 @@ for _, m in ipairs({
   { "<Up>", "prev", "Previous item" },
   { "<CR>", "confirm", "Confirm selection" },
   { "<C-t>", "confirm_tab", "Open in a new tab" },
+  { "<C-x>", "confirm_split", "Open in a horizontal split" },
+  { "<C-v>", "confirm_vsplit", "Open in a vertical split" },
   { "<Esc>", "cancel", "Cancel" },
   { "<C-d>", "preview_half_down", "Preview half-page down" },
   { "<C-u>", "preview_half_up", "Preview half-page up" },
@@ -442,13 +446,15 @@ end
 -- relative one. `nx._jump_to` reuses the open buffer cwd-aware and skips the
 -- modified guard, so selecting a symbol in the file you're editing just moves the
 -- cursor. A location-less item (the `files` source) is a plain open instead.
--- `mode == "tab"` (the picker's `<C-t>`) opens the item in a NEW tab regardless of
--- `'switchbuf'` (an explicit tab gesture); otherwise the open honors `'switchbuf'`.
+-- `mode` is the confirm gesture: "tab"/"split"/"vsplit" (`<C-t>`/`<C-x>`/`<C-v>`)
+-- open in a NEW tab / split regardless of `'switchbuf'` (an explicit gesture);
+-- "current" (or nil) honors `'switchbuf'`.
 function nx.picker.edit(item, mode)
   local col = math.max(0, (item.col or 1) - 1)
-  if mode == "tab" then
-    -- A fresh tab for the file; located items land the cursor, plain opens at the top.
-    nx._jump_to(item.path, item.row and (item.row - 1) or 0, item.row and col or 0, "tab")
+  if mode == "tab" or mode == "split" or mode == "vsplit" then
+    -- A fresh tab / split for the file; located items land the cursor, plain opens
+    -- start at the top.
+    nx._jump_to(item.path, item.row and (item.row - 1) or 0, item.row and col or 0, mode)
   elseif item.row then
     nx._jump_to(item.path, item.row - 1, col)
   else
@@ -544,10 +550,14 @@ nx.picker.source({
     end
   end,
   confirm = function(item, mode)
-    if mode == "tab" then
-      -- `<C-t>`: show the buffer in a NEW tab (a fresh tab then swap the buffer in,
-      -- reusing the throwaway [No Name] `:tabnew` creates).
-      vim.cmd("tabnew")
+    -- `<C-t>`/`<C-x>`/`<C-v>`: show the buffer in a new tab / split (open the
+    -- window first, then swap the buffer into it — reusing the throwaway [No Name]
+    -- `:tabnew`/`:split`/`:vsplit` create).
+    local pre = (mode == "tab" and "tabnew")
+      or (mode == "split" and "split")
+      or (mode == "vsplit" and "vsplit")
+    if pre then
+      vim.cmd(pre)
       vim.cmd("buffer " .. item.bufnr)
     else
       -- Honor 'switchbuf': a buffer already shown in another tab is focused there

@@ -191,6 +191,13 @@ pub struct ExtmarkMirror {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub hl_group: Option<String>,
     pub priority: u32,
+    /// The mark's gutter sign glyph (`sign_text`), if any — round-tripped so a
+    /// `get_extmarks(details=true)` AFTER the tick (when the server refreshes this
+    /// mirror) still surfaces it, not just the same-chunk write-through.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sign_text: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sign_hl_group: Option<String>,
 }
 
 /// One highlight group's row in the Rust→Lua highlight mirror (`nx._hl_defs`),

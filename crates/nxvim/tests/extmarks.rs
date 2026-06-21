@@ -103,6 +103,57 @@ fn span_with_group(hl: &[Vec<(u64, u64, String)>], group: &str) -> Option<(u64, 
         .map(|(s, e, _)| (*s, *e))
 }
 
+/// Read a `window0` field by key.
+fn win_field<'a>(params: &'a [Value], key: &str) -> Option<&'a Value> {
+    window0(params)
+        .and_then(|win| win.iter().find(|(k, _)| k.as_str() == Some(key)))
+        .map(|(_, v)| v)
+}
+
+/// The focused window's gutter sign on each row as `Some(glyph)` / `None`, from the
+/// `diagnostics_signs` redraw array (`[glyph, code, style_id]` per row).
+fn signs_of(params: &[Value]) -> Vec<Option<String>> {
+    win_field(params, "diagnostics_signs")
+        .and_then(Value::as_array)
+        .map(|rows| {
+            rows.iter()
+                .map(|r| {
+                    r.as_array()
+                        .and_then(|c| c.first())
+                        .and_then(Value::as_str)
+                        .map(str::to_string)
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// The focused window's reserved sign-column width in cells.
+fn sign_width_of(params: &[Value]) -> u64 {
+    win_field(params, "sign_width")
+        .and_then(Value::as_u64)
+        .unwrap_or(0)
+}
+
+/// Poll (bounded) for a redraw whose focused-window signs satisfy `done`.
+async fn wait_for_signs(
+    rpc: &Rpc,
+    incoming: &mut UnboundedReceiver<Incoming>,
+    done: impl Fn(&[Value]) -> bool,
+) -> Vec<Value> {
+    for _ in 0..100 {
+        barrier(rpc).await;
+        tokio::task::yield_now().await;
+        if let Some(params) = drain_latest_redraw(incoming) {
+            if done(&params) {
+                return params;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    panic!("signs never satisfied the condition within timeout");
+}
+
 // ----- tests ----------------------------------------------------------------
 
 /// The headline: an extmark with `hl_group` over a byte range surfaces as a
@@ -826,4 +877,97 @@ async fn virt_text_hide_drops_under_a_visual_selection() {
         vt_texts(vt).contains(&"HIDES".to_string())
     })
     .await;
+}
+
+/// A `sign_text` extmark paints a gutter sign: the glyph shows on the mark's line
+/// in the `diagnostics_signs` column and the window reserves a 2-cell sign column.
+/// (`signcolumn` defaults to `auto`, so the column appears only because a sign does.)
+#[tokio::test]
+async fn a_sign_text_extmark_paints_a_gutter_sign() {
+    let (rpc, mut incoming) = start().await;
+    feed(&rpc, "iline one<CR>line two<CR>line three<Esc>");
+    exec_lua(
+        &rpc,
+        r#"
+        local ns = vim.api.nvim_create_namespace('signs')
+        -- A gutter sign on line 2 (0-based row 1), styled with a group.
+        vim.api.nvim_buf_set_extmark(0, ns, 1, 0, { sign_text = '>>', sign_hl_group = 'WarningMsg' })
+        "#,
+    )
+    .await;
+
+    let params = wait_for_signs(&rpc, &mut incoming, |p| {
+        signs_of(p).get(1) == Some(&Some(">>".to_string()))
+    })
+    .await;
+
+    let signs = signs_of(&params);
+    assert_eq!(
+        signs.get(1),
+        Some(&Some(">>".to_string())),
+        "the sign glyph shows on the mark's line (row 1)"
+    );
+    assert_eq!(signs.first(), Some(&None), "no sign on row 0");
+    assert_eq!(
+        sign_width_of(&params),
+        2,
+        "an extmark sign reserves a 2-cell sign column under signcolumn=auto"
+    );
+}
+
+/// A higher-priority `sign_text` mark wins the single sign cell on a shared line.
+#[tokio::test]
+async fn the_highest_priority_sign_wins_the_cell() {
+    let (rpc, mut incoming) = start().await;
+    feed(&rpc, "ihello<Esc>");
+    exec_lua(
+        &rpc,
+        r#"
+        local ns = vim.api.nvim_create_namespace('prio')
+        vim.api.nvim_buf_set_extmark(0, ns, 0, 0, { sign_text = 'LO', priority = 5 })
+        vim.api.nvim_buf_set_extmark(0, ns, 0, 0, { sign_text = 'HI', priority = 50 })
+        "#,
+    )
+    .await;
+    let params = wait_for_signs(&rpc, &mut incoming, |p| {
+        signs_of(p).first() == Some(&Some("HI".to_string()))
+    })
+    .await;
+    assert_eq!(
+        signs_of(&params).first(),
+        Some(&Some("HI".to_string())),
+        "the priority-50 sign wins over the priority-5 sign"
+    );
+}
+
+/// A `sign_text` mark round-trips through `get_extmarks(details=true)` AFTER the
+/// tick (the server refreshes the Lua mirror), so a plugin can read its sign back.
+#[tokio::test]
+async fn sign_text_round_trips_across_chunks() {
+    let (rpc, _rx) = start().await;
+    feed(&rpc, "ihello<Esc>");
+    exec_lua(
+        &rpc,
+        r#"
+        SignNs = vim.api.nvim_create_namespace('signrt')
+        vim.api.nvim_buf_set_extmark(0, SignNs, 0, 0, { sign_text = '!!', sign_hl_group = 'ErrorMsg' })
+        "#,
+    )
+    .await;
+    // Separate chunk: the mirror was rebuilt from core, so the sign survives.
+    let summary = exec_lua(
+        &rpc,
+        r#"
+        local marks = vim.api.nvim_buf_get_extmarks(0, SignNs, 0, -1, { details = true })
+        if #marks ~= 1 then return 'count=' .. #marks end
+        local d = marks[1][4]
+        return tostring(d.sign_text) .. ',' .. tostring(d.sign_hl_group)
+        "#,
+    )
+    .await;
+    assert_eq!(
+        summary.as_str(),
+        Some("!!,ErrorMsg"),
+        "get_extmarks details returns the sign_text/sign_hl_group after the tick"
+    );
 }

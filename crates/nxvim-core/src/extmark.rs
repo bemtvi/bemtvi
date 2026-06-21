@@ -142,6 +142,12 @@ pub struct VirtDecor {
     pub virt_lines: Vec<Vec<VirtChunk>>,
     /// Draw `virt_lines` above the anchored line rather than below it.
     pub virt_lines_above: bool,
+    /// A gutter sign glyph (1–2 cells, neovim's `sign_text`) drawn in the sign
+    /// column on the anchored line's first display row. `None` ⇒ no sign.
+    pub sign_text: Option<String>,
+    /// The highlight group for [`sign_text`](Self::sign_text) (neovim's
+    /// `sign_hl_group`); `None` paints the glyph in normal colors.
+    pub sign_hl_group: Option<String>,
 }
 
 /// A single extmark, identified within its buffer by `(namespace, id)`.

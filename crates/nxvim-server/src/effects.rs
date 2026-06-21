@@ -148,6 +148,8 @@ fn virt_decor_to_core(d: VirtDecorData) -> nxvim_core::VirtDecor {
         hl_mode,
         virt_lines: d.virt_lines.into_iter().map(chunks).collect(),
         virt_lines_above: d.virt_lines_above,
+        sign_text: d.sign_text,
+        sign_hl_group: d.sign_hl_group,
     }
 }
 
@@ -1609,6 +1611,10 @@ impl EditHost {
                                 }
                                 None => (None, None),
                             };
+                            let (sign_text, sign_hl_group) = match m.decor.as_deref() {
+                                Some(d) => (d.sign_text.clone(), d.sign_hl_group.clone()),
+                                None => (None, None),
+                            };
                             ExtmarkMirror {
                                 ns,
                                 id: m.id,
@@ -1618,6 +1624,8 @@ impl EditHost {
                                 end_col,
                                 hl_group: m.hl_group.clone(),
                                 priority: m.priority,
+                                sign_text,
+                                sign_hl_group,
                             }
                         })
                         .collect();

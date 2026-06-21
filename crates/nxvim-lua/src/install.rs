@@ -129,7 +129,12 @@ fn virt_decor_from_table(t: &Table) -> mlua::Result<Option<VirtDecorData>> {
         }
         None => Vec::new(),
     };
-    if virt_text.is_empty() && virt_lines.is_empty() {
+    // A gutter sign: a 1–2 cell glyph drawn in the sign column on the mark's line.
+    // `sign_text` alone (no virt_text/lines) is a renderable decoration, so it must
+    // not hit the "nothing renderable" early-return below.
+    let sign_text = t.get::<Option<String>>("sign_text")?;
+    let sign_hl_group = t.get::<Option<String>>("sign_hl_group")?;
+    if virt_text.is_empty() && virt_lines.is_empty() && sign_text.is_none() {
         return Ok(None);
     }
     // Reject an unknown `virt_text_pos` / `hl_mode` loud here (at the scripting
@@ -159,6 +164,8 @@ fn virt_decor_from_table(t: &Table) -> mlua::Result<Option<VirtDecorData>> {
         hl_mode,
         virt_lines,
         virt_lines_above: t.get::<Option<bool>>("virt_lines_above")?.unwrap_or(false),
+        sign_text,
+        sign_hl_group,
     }))
 }
 

@@ -374,6 +374,148 @@ impl EditHost {
                 .collect(),
         )
     }
+
+    /// Per visible row, the extmark gutter sign (`sign_text`) as the wire cell
+    /// `[glyph, 0, style_id]` (the same shape diagnostic signs use; `0` is the
+    /// non-diagnostic severity code) paired with the mark's `priority` for the
+    /// cross-source merge, or `None` when the row carries no sign. A sign shows on
+    /// the line's first display row only (like the number); the highest-priority
+    /// `sign_text` mark on the line wins (ties → the most recent / highest id).
+    /// `sign_hl_group` resolves to a frame style id via the shared `nx.decor`
+    /// palette (`Nil` ⇒ the client paints the glyph in normal colors). Read live
+    /// from the buffer's extmark store, like `virt_text_for`; shared by both builds.
+    pub(crate) fn extmark_sign_cells(
+        &self,
+        buffer: BufferId,
+        winhl: &WinHl,
+        segs: &[crate::redraw::RowSeg],
+        styles: &mut StyleTable,
+    ) -> Vec<Option<(Value, u32)>> {
+        let none_rows = || segs.iter().map(|_| None).collect();
+        let Some(buf) = self.editor.buffer_of(buffer) else {
+            return none_rows();
+        };
+        // Bucket sign marks by their anchor buffer line (0-based); cheap (small set).
+        use std::collections::HashMap;
+        let mut by_line: HashMap<usize, Vec<&nxvim_core::Extmark>> = HashMap::new();
+        for m in buf.extmarks.iter_all() {
+            if m.decor.as_deref().is_some_and(|d| d.sign_text.is_some()) {
+                by_line
+                    .entry(buf.byte_to_line(m.start))
+                    .or_default()
+                    .push(m);
+            }
+        }
+        if by_line.is_empty() {
+            return none_rows();
+        }
+        segs.iter()
+            .map(|seg| {
+                let n = seg.line?;
+                // The number sits on the line's first display row only; so does its sign.
+                if !seg.is_first() {
+                    return None;
+                }
+                let marks = by_line.get(&(n - 1))?;
+                let best = marks.iter().max_by_key(|m| (m.priority, m.id))?;
+                let decor = best.decor.as_deref()?;
+                let glyph = decor.sign_text.clone()?;
+                let style_id = match decor
+                    .sign_hl_group
+                    .as_deref()
+                    .and_then(|g| self.resolve_winhl(winhl, g))
+                {
+                    Some(style) => Value::from(styles.intern(style) as u64),
+                    None => Value::Nil,
+                };
+                let cell = Value::Array(vec![Value::from(glyph), Value::from(0u64), style_id]);
+                Some((cell, best.priority))
+            })
+            .collect()
+    }
+
+    /// The merged gutter sign per visible row — extmark `sign_text` marks combined
+    /// with the LSP diagnostic signs into the single sign cell the column paints.
+    /// Per row the highest-`priority` source wins; diagnostics sit at the fixed
+    /// [`DIAGNOSTIC_SIGN_PRIORITY`] (so an explicit extmark sign at the default
+    /// extmark priority shows over a diagnostic; a plugin that wants the diagnostic
+    /// to win sets its mark below that). Returns `None` on a row with no sign.
+    /// Diagnostics are native-only; extmark signs project on both builds.
+    pub(crate) fn merged_sign_cells(
+        &self,
+        buffer: BufferId,
+        winhl: &WinHl,
+        segs: &[crate::redraw::RowSeg],
+        styles: &mut StyleTable,
+    ) -> Vec<Option<Value>> {
+        let ext = self.extmark_sign_cells(buffer, winhl, segs, styles);
+        #[cfg(feature = "native")]
+        let diag: Vec<Value> = match self.diagnostics_signs_for(buffer, winhl, segs, styles) {
+            Value::Array(a) => a,
+            _ => segs.iter().map(|_| Value::Nil).collect(),
+        };
+        #[cfg(not(feature = "native"))]
+        let diag: Vec<Value> = segs.iter().map(|_| Value::Nil).collect();
+
+        segs.iter()
+            .enumerate()
+            .map(|(i, _)| {
+                let d = diag.get(i).filter(|v| !v.is_nil());
+                let e = ext.get(i).and_then(Option::as_ref);
+                match (d, e) {
+                    (Some(dv), Some((ev, prio))) => Some(if *prio > DIAGNOSTIC_SIGN_PRIORITY {
+                        ev.clone()
+                    } else {
+                        dv.clone()
+                    }),
+                    (Some(dv), None) => Some(dv.clone()),
+                    (None, Some((ev, _))) => Some(ev.clone()),
+                    (None, None) => None,
+                }
+            })
+            .collect()
+    }
+}
+
+/// The fixed `priority` a diagnostic gutter sign carries when it competes with an
+/// extmark `sign_text` mark for the row's single sign cell. Below the default
+/// extmark priority (4096) so an explicit plugin sign wins by default.
+pub(crate) const DIAGNOSTIC_SIGN_PRIORITY: u32 = 10;
+
+/// The per-row merged signs as the wire array (`[glyph, code, style_id]` or `Nil`),
+/// the shape the `diagnostics_signs` redraw key has always carried.
+pub(crate) fn signs_value(cells: &[Option<Value>]) -> Value {
+    Value::Array(
+        cells
+            .iter()
+            .map(|c| c.clone().unwrap_or(Value::Nil))
+            .collect(),
+    )
+}
+
+/// The rendered sign-column width in cells from the merged signs and the window's
+/// `'signcolumn'` policy. One sign cell is 2 cells (vim); at most one sign per row
+/// today, so the busiest visible row has 0 or 1 sign. `no` → 0; `auto` collapses to
+/// 0 with no sign else `clamp(1, min, max)`; `yes` reserves its `min` even when
+/// clean. Mirrors the old diagnostics-only `sign_width_for`, now sign-source-agnostic.
+pub(crate) fn sign_width_from_cells(
+    cells: &[Option<Value>],
+    signcolumn: nxvim_core::SignColumn,
+) -> u16 {
+    use nxvim_core::SignColumn;
+    let max_signs: u16 = u16::from(cells.iter().any(Option::is_some));
+    let cols = match signcolumn {
+        SignColumn::No => 0,
+        SignColumn::Auto { min, max } => {
+            if max_signs == 0 {
+                0
+            } else {
+                max_signs.clamp(min, max)
+            }
+        }
+        SignColumn::Yes { min, max } => max_signs.clamp(min, max),
+    };
+    cols * 2
 }
 
 /// The wire code for a [`HlMode`]: `0`=replace, `1`=combine, `2`=blend.

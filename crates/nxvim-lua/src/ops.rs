@@ -593,6 +593,10 @@ pub struct VirtDecorData {
     pub hl_mode: Option<String>,
     pub virt_lines: Vec<Vec<VirtChunkData>>,
     pub virt_lines_above: bool,
+    /// Gutter sign glyph (neovim's `sign_text`); `None` ⇒ no sign.
+    pub sign_text: Option<String>,
+    /// Highlight group for the sign glyph (neovim's `sign_hl_group`).
+    pub sign_hl_group: Option<String>,
 }
 
 #[derive(Clone, Debug)]

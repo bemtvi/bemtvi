@@ -378,23 +378,23 @@ impl EditHost {
         // above); the server only resolves each chunk's `hl_group` to a frame style id.
         // Shared like `virt_text`.
         let virt_lines = self.virt_lines_value(&virt_lines, &win.winhl, styles);
+        // The gutter signs (extmark `sign_text` merged with the LSP diagnostic signs)
+        // and the resulting column width. Extmark signs are core-shared, so this
+        // projects on BOTH builds (the merge runs diagnostics only under `native`);
+        // the width then follows the same `'signcolumn'` policy on either build.
+        let sign_cells = self.merged_sign_cells(win.buffer, &win.winhl, &segments, styles);
+        let diagnostics_signs = crate::extmarks::signs_value(&sign_cells);
+        let sign_width = crate::extmarks::sign_width_from_cells(&sign_cells, win.signcolumn);
         #[cfg(feature = "native")]
-        let (diagnostics, diagnostics_virt, diagnostics_signs, sign_width, inlay_hints) = (
+        let (diagnostics, diagnostics_virt, inlay_hints) = (
             self.diagnostics_for(win.buffer, &win.winhl, &segments, styles),
             self.diagnostics_virt_text_for(win.buffer, &win.winhl, &segments, styles),
-            self.diagnostics_signs_for(win.buffer, &win.winhl, &segments, styles),
-            self.sign_width_for(win.buffer, &numbers, win.signcolumn),
             self.inlay_hints_for(win.buffer, &win.winhl, &segments, styles),
         );
-        // The browser build has no diagnostics, so signs never appear; the sign
-        // width still honors a fixed `yes` policy (its `floor`) so the layout matches
-        // what core reserved.
         #[cfg(not(feature = "native"))]
-        let (diagnostics, diagnostics_virt, diagnostics_signs, sign_width, inlay_hints) = (
+        let (diagnostics, diagnostics_virt, inlay_hints) = (
             Value::Array(Vec::new()),
             Value::Array(Vec::new()),
-            Value::Array(Vec::new()),
-            win.signcolumn.floor_cells() as u16,
             Value::Array(Vec::new()),
         );
         let scroll = match &win.scroll {
@@ -875,17 +875,19 @@ impl EditHost {
         // highlight/inlay/diagnostic arrays. Diagnostic underlines and signs ride the
         // band too (keyed on the per-row wrap `segments`, the same as the settled
         // window), so they slide with the text instead of blanking out for the slide.
+        // Gutter signs ride the band too (extmark + diagnostic, merged), keyed on the
+        // band's per-row `segments` so they slide with the text — like `window_value`.
+        let diagnostics_signs =
+            crate::extmarks::signs_value(&self.merged_sign_cells(buffer, winhl, &segments, styles));
         #[cfg(feature = "native")]
-        let (highlights, inlay_hints, diagnostics_virt, diagnostics, diagnostics_signs) = (
+        let (highlights, inlay_hints, diagnostics_virt, diagnostics) = (
             self.highlights_for(buffer, winhl, &segments, styles),
             self.inlay_hints_for(buffer, winhl, &segments, styles),
             self.diagnostics_virt_text_for(buffer, winhl, &segments, styles),
             self.diagnostics_for(buffer, winhl, &segments, styles),
-            self.diagnostics_signs_for(buffer, winhl, &segments, styles),
         );
         #[cfg(not(feature = "native"))]
-        let (highlights, inlay_hints, diagnostics_virt, diagnostics, diagnostics_signs) = (
-            Value::Array(Vec::new()),
+        let (highlights, inlay_hints, diagnostics_virt, diagnostics) = (
             Value::Array(Vec::new()),
             Value::Array(Vec::new()),
             Value::Array(Vec::new()),

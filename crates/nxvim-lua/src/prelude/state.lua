@@ -1234,6 +1234,13 @@ function nx._set_extmark_mirror(entries)
     local by_ns = {}
     for _, m in ipairs(list) do
       by_ns[m.ns] = by_ns[m.ns] or {}
+      -- Reconstruct the `decoration` sub-table from the round-tripped sign fields so
+      -- a get_extmarks(details=true) AFTER this server refresh still returns the
+      -- gutter sign (the same shape the same-chunk write-through stored).
+      local decoration
+      if m.sign_text ~= nil or m.sign_hl_group ~= nil then
+        decoration = { sign_text = m.sign_text, sign_hl_group = m.sign_hl_group }
+      end
       by_ns[m.ns][m.id] = {
         row = m.row,
         col = m.col,
@@ -1241,6 +1248,7 @@ function nx._set_extmark_mirror(entries)
         end_col = m.end_col,
         hl_group = m.hl_group,
         priority = m.priority,
+        decoration = decoration,
       }
     end
     marks[bufnr] = by_ns

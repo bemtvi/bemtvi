@@ -511,9 +511,12 @@ impl EditHost {
             let row = sym.location.range.start.line as usize;
             let character = sym.location.range.start.character as usize;
             let byte = self.location_byte_col(&path, row, character, encoding);
-            let display = path.to_string_lossy().into_owned();
-            let text = format!("{}  [{}]  {display}:{}", sym.name, sym.kind, row + 1);
-            items.push((text, display, (row + 1) as u32, (byte + 1) as u32));
+            // The row text shows a cwd-relative path; the navigation field keeps
+            // the full path (reused cwd-aware on jump).
+            let nav = path.to_string_lossy().into_owned();
+            let shown = super::display_path(&path);
+            let text = format!("{}  [{}]  {shown}:{}", sym.name, sym.kind, row + 1);
+            items.push((text, nav, (row + 1) as u32, (byte + 1) as u32));
         }
         if items.is_empty() {
             self.editor.echo(kind.empty_message());
@@ -538,7 +541,7 @@ impl EditHost {
         let line = loc.range.start.line as usize;
         let character = loc.range.start.character as usize;
         self.editor.jump_to(&path, line, 0);
-        if self.editor.buffer().path.as_deref() == Some(path.as_path()) {
+        if self.editor.current_buffer_is(&path) {
             let landed = self.editor.cursor.line;
             let text = self.editor.buffer().line(landed);
             let byte = byte_col(encoding, &text, character);
@@ -568,9 +571,10 @@ impl EditHost {
             let row = loc.range.start.line as usize;
             let character = loc.range.start.character as usize;
             let byte = self.location_byte_col(&path, row, character, encoding);
-            let display = path.to_string_lossy().into_owned();
-            let text = format!("{display}:{}:{}", row + 1, byte + 1);
-            items.push((text, display, (row + 1) as u32, (byte + 1) as u32));
+            let nav = path.to_string_lossy().into_owned();
+            let shown = super::display_path(&path);
+            let text = format!("{shown}:{}:{}", row + 1, byte + 1);
+            items.push((text, nav, (row + 1) as u32, (byte + 1) as u32));
         }
         if items.is_empty() {
             self.editor.echo(kind.empty_message());

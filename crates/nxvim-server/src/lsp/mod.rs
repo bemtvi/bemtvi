@@ -699,6 +699,21 @@ pub(crate) fn uri_to_path(uri: &Url) -> Option<PathBuf> {
     uri.to_file_path().ok()
 }
 
+/// A human-facing spelling of `path` for a picker / panel row: stripped to a
+/// cwd-relative path when it lives under the working directory, else left
+/// absolute. Cosmetic only — navigation still carries the full path, which
+/// [`crate::Editor::find_buffer_by_path`] reuses cwd-aware — but it keeps the LSP
+/// symbol / location list readable (and matched to how the file was opened)
+/// instead of every row blaring the absolute path.
+pub(crate) fn display_path(path: &Path) -> String {
+    std::env::current_dir()
+        .ok()
+        .and_then(|cwd| path.strip_prefix(&cwd).ok().map(Path::to_path_buf))
+        .unwrap_or_else(|| path.to_path_buf())
+        .to_string_lossy()
+        .into_owned()
+}
+
 /// Resolve `path` against the current directory if it is relative.
 pub(crate) fn absolutize(path: &Path) -> PathBuf {
     if path.is_absolute() {

@@ -1860,7 +1860,9 @@ impl Editor {
 
         // Re-editing the current file reloads it in place (`:e` / `:e!`),
         // discarding unsaved changes — so the modified guard applies here.
-        if self.buffer().path.as_deref() == Some(path.as_path()) {
+        // cwd-aware: `:e <abs path of the current relative buffer>` reloads in
+        // place too, rather than stranding a duplicate buffer.
+        if self.current_buffer_is(&path) {
             if self.buffer().modified && !bang {
                 self.echo("E37: No write since last change (add ! to override)");
                 return;

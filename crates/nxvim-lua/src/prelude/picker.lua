@@ -425,16 +425,22 @@ function nx._picker_send(keys)
 end
 
 -- nx.picker.edit(item): the common confirm action — open `item.path`, and if the
--- item carries a 1-based `row` (and optional 1-based `col`, as live_grep's items
--- do), jump the cursor there. Uses the supported `nx._win_set_cursor` bridge: the
--- mutating `vim.api.nvim_*` surface (incl. `nvim_win_set_cursor`) is intentionally
--- nil in Lua (ADR 0002), so a plugin must go through `nx.*` / keystrokes to move
--- the cursor. The `:edit` runs (and loads the buffer) before the queued cursor op
--- is applied, so window 0 already shows the opened file when the cursor moves.
+-- item carries a 1-based `row` (and optional 1-based `col`, as live_grep / LSP
+-- location items do), jump the cursor there.
+--
+-- A *located* jump (`item.row` set) goes through the `nx._jump_to` bridge, NOT
+-- `:edit`: a jump must navigate, never reload. `:edit`-ing the location would (a)
+-- error with E37 when the target is the *current* modified buffer (the LSP hands
+-- back an absolute path, but the open buffer may be relatively named) and (b)
+-- strand a duplicate buffer when that absolute path doesn't string-match the
+-- relative one. `nx._jump_to` reuses the open buffer cwd-aware and skips the
+-- modified guard, so selecting a symbol in the file you're editing just moves the
+-- cursor. A location-less item (the `files` source) is a plain open instead.
 function nx.picker.edit(item)
-  vim.cmd("edit " .. item.path)
   if item.row then
-    nx._win_set_cursor(0, item.row - 1, math.max(0, (item.col or 1) - 1))
+    nx._jump_to(item.path, item.row - 1, math.max(0, (item.col or 1) - 1))
+  else
+    vim.cmd("edit " .. item.path)
   end
 end
 

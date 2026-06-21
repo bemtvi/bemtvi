@@ -1282,6 +1282,12 @@ impl EditHost {
                 let id = resolve_win(self, win);
                 self.editor.set_window_cursor(id, line, col);
             }
+            WindowOp::Jump { path, line, col } => {
+                // Always navigates the *current* window (the picker has closed and
+                // returned focus by confirm time), reusing an open buffer without a
+                // reload/modified guard — see the op's doc comment.
+                self.editor.jump_to(std::path::Path::new(&path), line, col);
+            }
             WindowOp::SetTopline { win, top } => {
                 let id = resolve_win(self, win);
                 self.editor.set_window_topline(id, top);

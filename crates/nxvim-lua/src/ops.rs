@@ -790,6 +790,17 @@ pub enum WindowOp {
     /// `line` is 0-based (the prelude converts neovim's 1-based row); `col` is the
     /// 0-based byte column.
     SetCursor { win: u64, line: usize, col: usize },
+    /// `nx._jump_to(path, line, col)` — open-or-switch the *current* window to
+    /// `path` and land the cursor at the 0-based `(line, col)` (byte column). The
+    /// non-reloading navigation primitive behind `nx.picker.edit`'s located jump:
+    /// unlike a `:edit`, it reuses an already-open buffer (cwd-aware, so an
+    /// absolute path finds a relatively-named buffer) and never guards on
+    /// `modified` — a jump navigates, it does not discard edits or reopen.
+    Jump {
+        path: String,
+        line: usize,
+        col: usize,
+    },
     /// `vim.fn.winrestview({ topline = N })` (run via `nvim_win_call`) — scroll
     /// window `win` so its first visible line is `top` (0-based; the prelude
     /// converts neovim's 1-based `topline`).

@@ -804,16 +804,30 @@ impl Editor {
     }
 
     /// The id of an already-open buffer bound to `path`, if any. Matches by
-    /// *lexically* normalized path (so `./a` and `a` are the same buffer),
-    /// **without touching the filesystem** — the pure core never does the
-    /// blocking `canonicalize` syscall this used to run on every `:e`. Symlinks
-    /// are not resolved, matching vim's path-based (not inode-based) buffer dedup.
+    /// cwd-anchored, lexically normalized path (so `./a`, `a`, and the absolute
+    /// `<cwd>/a` are the same buffer — the case that makes an absolute LSP path
+    /// reuse a buffer opened with a relative name), **without touching the
+    /// filesystem** beyond reading the cwd — the pure core never does the blocking
+    /// `canonicalize` syscall this used to run on every `:e`. Symlinks are not
+    /// resolved, matching vim's path-based (not inode-based) buffer dedup. See
+    /// [`super::same_path`] / [`super::absolutize_normalize`].
     pub fn find_buffer_by_path(&self, path: &Path) -> Option<BufferId> {
-        let target = normalize_path(path);
+        let target = super::absolutize_normalize(path);
         self.buffers.map.iter().find_map(|(id, ob)| {
             let stored = ob.buffer.path.as_ref()?;
-            (normalize_path(stored) == target).then_some(*id)
+            (super::absolutize_normalize(stored) == target).then_some(*id)
         })
+    }
+
+    /// Does the current buffer hold `path`? The cwd-aware comparison (so an
+    /// absolute path and a cwd-relative one for the same file match), used wherever
+    /// a caller asks "am I already on this file?" — the `:e` reload guard, the
+    /// go-to jump, the LSP location refine. See [`super::same_path`].
+    pub fn current_buffer_is(&self, path: &Path) -> bool {
+        self.buffer()
+            .path
+            .as_deref()
+            .is_some_and(|p| super::same_path(p, path))
     }
 
     /// Is the current buffer a throwaway scratch buffer — unnamed, unmodified,
@@ -1205,7 +1219,7 @@ impl Editor {
     /// (no new state), so every front end and the LSP go-to / diagnostics
     /// location list share one navigation primitive.
     pub fn jump_to(&mut self, path: &Path, line: usize, col: usize) {
-        let already_current = self.buffer().path.as_deref() == Some(path);
+        let already_current = self.current_buffer_is(path);
         // A go-to (LSP definition/references, a diagnostic, a location-list entry)
         // is a *jump* in vim's sense: record the pre-jump position into the jump
         // list / previous-context mark first, so `<C-o>` returns here. Done before

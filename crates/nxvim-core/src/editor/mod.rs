@@ -132,6 +132,36 @@ fn normalize_path(path: &Path) -> PathBuf {
     out
 }
 
+/// Anchor `path` to the process working directory if it is relative, then
+/// lexically [`normalize_path`] it — so a cwd-relative name (`:e src/foo.rs`) and
+/// the absolute path that names the same file (e.g. what the LSP hands back) hash
+/// to the same key for buffer dedup. The process cwd is the one source of truth:
+/// the server keeps `std::env::current_dir()` equal to the editor's effective
+/// working dir (`:cd` / `fix_current_dir`), and that is what the LSP runs under
+/// too, so this is correct over a remote daemon as well (the daemon's core reads
+/// the daemon's cwd, never the client's). Still filesystem-free apart from reading
+/// the cwd — no symlink resolution, no blocking `stat`/`canonicalize` — matching
+/// vim's path-based (not inode-based) buffer dedup. If the cwd can't be read
+/// (some wasm hosts) it degrades to the old lexical-only behavior.
+fn absolutize_normalize(path: &Path) -> PathBuf {
+    if path.is_absolute() {
+        normalize_path(path)
+    } else if let Ok(cwd) = std::env::current_dir() {
+        normalize_path(&cwd.join(path))
+    } else {
+        normalize_path(path)
+    }
+}
+
+/// Do two paths name the same file once anchored to the process cwd? The
+/// cwd-aware companion of a raw `==` on the stored buffer path — the comparison
+/// every "is this the buffer / file I mean?" site goes through so an absolute and
+/// a cwd-relative spelling of one file are treated as one. See
+/// [`absolutize_normalize`].
+pub(crate) fn same_path(a: &Path, b: &Path) -> bool {
+    absolutize_normalize(a) == absolutize_normalize(b)
+}
+
 /// A cursor position within the current buffer (0-indexed line and column).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct Cursor {

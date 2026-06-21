@@ -379,6 +379,60 @@ async fn insertenter_sees_buffer_context() {
     assert_eq!(msg, format!("1:{}", file.display()));
 }
 
+// ----- ModeChanged: the general mode-transition signal -----------------------
+
+#[tokio::test]
+async fn modechanged_fires_with_old_new_pattern() {
+    // ModeChanged fires on every reported-mode transition, carrying the `old:new`
+    // code pair on `args.match` — `n:i` entering insert, `i:n` leaving, `n:v`
+    // entering visual. This is the general signal a mode-reactive statusline uses.
+    // Count per transition into a table (rather than overwriting one var) so the
+    // `:lua print(...)` reads — which themselves dip through command-line mode — can
+    // never clobber the value being asserted; every read happens back in normal mode.
+    let dir = temp_dir("au_modechanged");
+    let (rpc, mut incoming) = start_with_config(
+        &dir,
+        "_G.hits = {}\n\
+         vim.api.nvim_create_autocmd('ModeChanged', {\n\
+         \x20 callback = function(a) _G.hits[a.match] = (_G.hits[a.match] or 0) + 1 end })\n",
+    )
+    .await;
+    // `i<Esc>`: enter insert (n:i) then leave it (i:n), back in normal to read.
+    redraw_after(&rpc, &mut incoming, "i<Esc>").await;
+    let into_insert = lua_message(&rpc, &mut incoming, "print(_G.hits['n:i'])").await;
+    assert_eq!(into_insert, "1", "entering insert reports n:i");
+    let out_of_insert = lua_message(&rpc, &mut incoming, "print(_G.hits['i:n'])").await;
+    assert_eq!(out_of_insert, "1", "leaving insert reports i:n");
+    // A non-insert transition fires too (the signal isn't insert-only): n→visual.
+    redraw_after(&rpc, &mut incoming, "v<Esc>").await;
+    let into_visual = lua_message(&rpc, &mut incoming, "print(_G.hits['n:v'])").await;
+    assert_eq!(into_visual, "1", "entering visual reports n:v");
+}
+
+#[tokio::test]
+async fn modechanged_glob_pattern_matches_only_its_transition() {
+    // A `*:i` pattern matches any transition *into* insert (the glob the autocmd
+    // matcher already supports), and is silent for transitions that don't end in
+    // insert — so a handler scoped to one mode fires only for it.
+    let dir = temp_dir("au_modechanged_glob");
+    let (rpc, mut incoming) = start_with_config(
+        &dir,
+        "_G.n = 0\n\
+         vim.api.nvim_create_autocmd('ModeChanged', { pattern = '*:i',\n\
+         \x20 callback = function() _G.n = _G.n + 1 end })\n",
+    )
+    .await;
+    // n→visual→normal: never ends in insert, so `*:i` stays silent.
+    redraw_after(&rpc, &mut incoming, "v<Esc>").await;
+    let after_visual = lua_message(&rpc, &mut incoming, "print(_G.n)").await;
+    assert_eq!(after_visual, "0", "*:i ignores a visual round trip");
+    // n→insert matches `*:i` once (read from normal mode after `<Esc>`; the i:n
+    // leave and the `:` command-line dips don't end in insert, so the count stays 1).
+    redraw_after(&rpc, &mut incoming, "i<Esc>").await;
+    let after_insert = lua_message(&rpc, &mut incoming, "print(_G.n)").await;
+    assert_eq!(after_insert, "1", "*:i matches the transition into insert");
+}
+
 // ----- Phase 5: window lifecycle events --------------------------------------
 
 #[tokio::test]

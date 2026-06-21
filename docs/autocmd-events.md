@@ -7,7 +7,7 @@ matched exactly, and a handler's `callback` receives the event table
 
 > **The list is the emitted set, not all of vim's events.** nxvim fires events as
 > features come to need them. A handler registered for an event that isn't emitted
-> yet (e.g. `ModeChanged`, `OptionSet`) is accepted but simply never
+> yet (e.g. `OptionSet`) is accepted but simply never
 > fires — it does not error. If you need one that's missing, it's a feature gap, not
 > a config mistake.
 
@@ -54,6 +54,7 @@ Ordering on opening a file is `BufReadPost` (or `BufNewFile` for a new path) →
 | Event | When it fires |
 | --- | --- |
 | `InsertEnter` / `InsertLeave` | The editor enters / leaves Insert (or Replace) mode. |
+| `ModeChanged` | The reported `mode()` code changes. `match` is the transition `old:new` (e.g. `"n:i"`, `"v:n"`); a handler's `pattern` glob-matches it (`"*:i"`, `"n:*"`, `"*:*"`). A Normal↔MultiCursor swap (both report `"n"`) is silent. **Gated on a registered handler.** |
 
 ## Editing & cursor
 

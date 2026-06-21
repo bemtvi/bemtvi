@@ -1,5 +1,6 @@
 //! Buffer/mode lifecycle autocmd emission: the server-side diff that fires
-//! `BufReadPost`/`FileType`/`BufEnter`/`InsertEnter`, and `init.lua` sourcing.
+//! `BufReadPost`/`FileType`/`BufEnter`/`InsertEnter`/`ModeChanged`, and `init.lua`
+//! sourcing.
 
 #[cfg(feature = "native")]
 use crate::evloop::LoopCommand;
@@ -155,6 +156,16 @@ impl EditHost {
         // is still seen after an insert→normal round trip that took the fast path.
         self.last_mode = mode;
 
+        // `ModeChanged` fires on any change to the *reported* `mode()` code — so a
+        // Normal↔MultiCursor swap (both reporting "n") is correctly silent — with the
+        // pattern `old:new` (e.g. "n:i"), matched by a handler's glob (`*:i`, `n:*`,
+        // `*:*`, …) exactly as in neovim; a handler reads the transition off
+        // `args.match`. Gated on a registered handler so a no-listener session never
+        // even builds the pattern string.
+        let old_code = old_mode.short_code();
+        let new_code = mode.short_code();
+        let mode_changed = old_code != new_code && self.au_active_events.contains("ModeChanged");
+
         // Cursor / text diffs (gated on a registered handler so a bare motion costs
         // nothing when nothing listens). `CursorMoved`(I) fires when the focused
         // window's cursor moves *within the same buffer*; `TextChanged`(I) when the
@@ -266,6 +277,7 @@ impl EditHost {
             && !entered
             && !entered_insert
             && !left_insert
+            && !mode_changed
             && !cursor_moved
             && !text_changed
             && new_wins.is_empty()
@@ -373,6 +385,14 @@ impl EditHost {
         }
         if left_insert {
             self.fire_lifecycle("InsertLeave", old_mode.short_code(), buf, &name);
+        }
+
+        // `ModeChanged` — the general mode-transition signal (fired after the
+        // insert-specific events: the specific event, then the general). The pattern
+        // is `old:new` of the reported `mode()` codes; a mode-reactive statusline /
+        // cursor-shape plugin matches `*:i`, `n:v`, … against it.
+        if mode_changed {
+            self.fire_lifecycle("ModeChanged", &format!("{old_code}:{new_code}"), buf, &name);
         }
 
         // ----- window enter / resized (after the buffer events) -----

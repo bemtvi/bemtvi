@@ -63,6 +63,10 @@ pub struct WindowMirror {
     /// `'wrap'` — whether long lines soft-wrap (so `vim.wo`/`vim.o` read it back;
     /// also what makes a programmatic `vim.wo.wrap = true` reach the core).
     pub wrap: bool,
+    /// `'scrollanim'` — whether this window's viewport scrolls animate, **resolved**
+    /// (the window-local override or, when unset, the global default), so
+    /// `vim.wo[win].scrollanim` reads back the value in effect.
+    pub scrollanim: bool,
     /// `numberwidth` — the minimum number-gutter width (so `vim.wo`/`vim.o` read it
     /// back).
     pub numberwidth: u64,

@@ -1653,6 +1653,7 @@ impl EditHost {
         // The window snapshot (Phase 5): one entry per window in layout order,
         // each carrying its buffer, cursor (1-based row / 0-based col), and text
         // dimensions, so the `nvim_win_*` getters read live state from Lua.
+        let global_scrollanim = self.editor.global_options().scrollanim;
         let wins: Vec<WindowMirror> = self
             .editor
             .window_ids()
@@ -1678,6 +1679,7 @@ impl EditHost {
                     relativenumber: opts.relativenumber,
                     cursorline: opts.cursorline,
                     wrap: opts.wrap,
+                    scrollanim: opts.scrollanim.unwrap_or(global_scrollanim),
                     numberwidth: opts.numberwidth as u64,
                     signcolumn: opts.signcolumn.to_string(),
                     fillchars: opts.fillchars.clone(),

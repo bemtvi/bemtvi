@@ -520,6 +520,14 @@ pub struct WindowOptions {
     /// lazily); empty by default (no remap). A window in a dock with no window-local
     /// value of its own inherits the dock's [`DockOptions::winhighlight`].
     pub winhighlight: String,
+    /// Per-window override of the global [`'scrollanim'`](Options::scrollanim): `None`
+    /// inherits the global value (the common case), `Some(false)` forces this window's
+    /// viewport scrolls to snap instead of slide (and `Some(true)` forces the slide
+    /// even when the global is off). The side-by-side diff sets `Some(false)` on its
+    /// panes so a synced scroll doesn't desync — only the focused pane can animate, so
+    /// a mirrored pane jumping while the focused one slides reads as a glitch. Resolved
+    /// where the gesture is built ([`crate::Editor::finalize_scroll_gesture`]).
+    pub scrollanim: Option<bool>,
 }
 
 impl WindowOptions {
@@ -634,6 +642,8 @@ impl Default for WindowOptions {
             padding: Padding::default(),
             // No window-local highlight remap by default.
             winhighlight: String::new(),
+            // Inherit the global `'scrollanim'` unless a window opts out (the diff does).
+            scrollanim: None,
         }
     }
 }

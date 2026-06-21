@@ -1386,6 +1386,49 @@ async fn noscrollanim_snaps_without_a_scroll_gesture() {
 }
 
 #[tokio::test]
+async fn window_local_scrollanim_off_snaps_only_that_window() {
+    // `'scrollanim'` is a per-window override of the global: `vim.wo.scrollanim = false`
+    // makes the focused window's `<C-d>` snap (no gesture) even though the global is on
+    // — the seam the side-by-side diff uses so a synced scroll doesn't desync (only the
+    // focused pane can animate, so a mirrored pane jumping while it slides looks wrong).
+    let path = write_n_lines("wsca", 100);
+    let (rpc, mut incoming) = start(Some(path)).await;
+    exec_lua(&rpc, "vim.wo.scrollanim = false").await;
+    let _ = lines(&rpc).await; // barrier: the window option lands before the scroll
+
+    // The override reads back through the window mirror (`vim.wo` is the resolved value).
+    assert_eq!(
+        exec_lua(&rpc, "return vim.wo.scrollanim").await.as_bool(),
+        Some(false),
+        "the window-local override reads back"
+    );
+
+    let map = redraw_after(&rpc, &mut incoming, "<C-d>").await;
+    assert!(
+        scroll(&map).is_none(),
+        "a window with scrollanim off snaps even though the global is on"
+    );
+}
+
+#[tokio::test]
+async fn window_local_scrollanim_on_overrides_global_off() {
+    // The override cuts both ways: with the global off, `vim.wo.scrollanim = true` forces
+    // the focused window to slide — proving it's a true per-window override, not just an
+    // off-switch.
+    let path = write_n_lines("wsca2", 100);
+    let (rpc, mut incoming) = start(Some(path)).await;
+    feed(&rpc, ":set noscrollanim<CR>");
+    exec_lua(&rpc, "vim.wo.scrollanim = true").await;
+    let _ = lines(&rpc).await; // barrier
+
+    let map = scroll_after(&rpc, &mut incoming, "<C-d>").await;
+    assert!(
+        scroll(&map).is_some(),
+        "a window with scrollanim on slides even though the global is off"
+    );
+}
+
+#[tokio::test]
 async fn scrollanimduration_caps_the_slide() {
     let path = write_n_lines("scad-cap", 100);
     let (rpc, mut incoming) = start(Some(path)).await;

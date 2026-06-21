@@ -1309,8 +1309,8 @@ impl Editor {
 
     /// Set a boolean window-local option on window `id` (`vim.wo` /
     /// `nvim_win_set_option`). Recognizes `number` / `relativenumber` /
-    /// `cursorline` / `wrap`; a no-op for any other name or an unknown id. `0` is
-    /// resolved to the focused window by the caller.
+    /// `cursorline` / `wrap` / `scrollanim`; a no-op for any other name or an unknown
+    /// id. `0` is resolved to the focused window by the caller.
     pub fn set_window_option_bool(&mut self, id: WindowId, name: &str, value: bool) {
         let Some(t) = self.tree_of_window_mut(id) else {
             return;
@@ -1321,6 +1321,9 @@ impl Editor {
             "relativenumber" => w.options.relativenumber = value,
             "cursorline" => w.options.cursorline = value,
             "wrap" => w.options.wrap = value,
+            // A per-window override of the global `'scrollanim'` (see
+            // [`WindowOptions::scrollanim`]); `Some(value)` shadows the global until unset.
+            "scrollanim" => w.options.scrollanim = Some(value),
             _ => {}
         }
     }

@@ -943,6 +943,10 @@ local WIN_OPT_CANON = {
   cursorline = "cursorline",
   cul = "cursorline",
   wrap = "wrap",
+  -- A per-window override of the global `'scrollanim'`: `vim.wo[win].scrollanim =
+  -- false` makes that window's scrolls snap (the side-by-side diff opts its panes out
+  -- so a synced scroll doesn't desync). `vim.o.scrollanim` stays the global default.
+  scrollanim = "scrollanim",
   numberwidth = "numberwidth",
   nuw = "numberwidth",
   signcolumn = "signcolumn",
@@ -959,6 +963,7 @@ local WIN_OPT_DEFAULT = {
   relativenumber = true,
   cursorline = false,
   wrap = false,
+  scrollanim = true, -- resolved default before the mirror lands (global default is on)
   numberwidth = 4,
   signcolumn = "auto",
   fillchars = "",

@@ -1803,9 +1803,18 @@ impl Editor {
         }
         // Honor `'scrollanim'` / `'scrollanimduration'`: with animation off (or a
         // zero duration cap) emit no `scroll` descriptor, so the client snaps
-        // straight to the destination instead of sliding.
+        // straight to the destination instead of sliding. `'scrollanim'` is resolved
+        // per-window — the focused window's local override (the side-by-side diff sets
+        // it off on its panes), falling back to the global default — since only the
+        // focused window's viewport ever animates.
         let dur_cap = self.options.scrollanimduration as u64;
-        if !self.options.scrollanim || dur_cap == 0 {
+        let scrollanim = self
+            .windows
+            .cur()
+            .options
+            .scrollanim
+            .unwrap_or(self.options.scrollanim);
+        if !scrollanim || dur_cap == 0 {
             return;
         }
         // Cap the visual travel so a huge jump (e.g. `G` in a big file) animates a

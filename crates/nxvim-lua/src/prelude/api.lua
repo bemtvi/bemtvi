@@ -7,12 +7,12 @@
 -- read/define (nx.hl), namespaces (nx.ns), and the extmark decoration layer. The
 -- matching vim.api.nvim_* / vim.fn.* names are aliased onto each native.
 --
--- The buffer-TEXT / lifecycle mutation surface — nvim_buf_set_lines/set_text/set_name,
--- nvim_create_buf / nvim_buf_delete, and the nvim_buf_attach change channel — is
--- intentionally absent: nxvim's config API is autocmds, diagnostics, keymaps, and
--- options/settings, not direct buffer-content mutation. (The window / tab / float
--- create-and-modify API — nvim_open_win, nvim_win_set_*, nvim_set_current_* — does
--- land, queued through the nx._open_win / nx._win_* Rust bridges; see below.)
+-- The buffer-TEXT mutation entry point is nx.buf.set_lines (alias nvim_buf_set_lines) —
+-- the ONE whole-line write, an async promise queued through the nx._buf_set_lines bridge
+-- (see below). The rest of the lifecycle surface — set_text / set_name, nvim_create_buf /
+-- nvim_buf_delete, and the nvim_buf_attach change channel — stays absent until a real
+-- need lands. (The window / tab / float create-and-modify API — nvim_open_win,
+-- nvim_win_set_*, nvim_set_current_* — is queued through nx._open_win / nx._win_*.)
 --
 -- Reads the mirror state / resolvers from prelude/state.lua (loaded just before
 -- this chunk).
@@ -369,6 +369,56 @@ function nx.buf.lines(bufnr, start, end_, strict)
     out[#out + 1] = lines[i]
   end
   return out
+end
+
+-- nx.buf.set_lines(bufnr, start, end_, strict, replacement) -> promise [alias
+-- nvim_buf_set_lines]: replace lines [start, end_) of `bufnr` (0/nil = current) with
+-- `replacement` (a list of whole-line strings), 0-based and end-EXCLUSIVE. Negative
+-- indices count back from the end (`-1` is one past the last line), so `(0, -1, …)`
+-- replaces the WHOLE buffer and `(n, n, …, { "x" })` appends. With `strict` true an
+-- out-of-range index errors; otherwise indices clamp.
+--
+-- This is the editor's ONE buffer-text mutation, and it is ASYNCHRONOUS: the Lua VM
+-- cannot touch the live buffer mid-chunk, so the edit is QUEUED and applied right after
+-- this chunk. The returned promise fulfils (with nil) on the next tick — once the edit
+-- has landed and the buffer mirror reflects it — so `nx.await(nx.buf.set_lines(…))` is
+-- the point at which a following `nx.buf.lines` read sees the new content. The shape and
+-- the buffer's modifiability are validated SYNCHRONOUSLY and raise (fail loud) before
+-- anything is queued: a non-table replacement, a non-string / newline-bearing line, an
+-- unknown buffer, a `nomodifiable` buffer, or (under `strict`) an out-of-range index. A
+-- read-only buffer KIND (terminal / nx.view / quickfix) is refused loudly server-side.
+function nx.buf.set_lines(bufnr, start, end_, strict, replacement)
+  local buf = nx._resolve_bufnr(bufnr)
+  local mirror = nx._bufs[buf]
+  if not mirror or not mirror.lines then
+    error("nvim_buf_set_lines: invalid buffer id " .. tostring(buf), 2)
+  end
+  local bo = nx._bo_mirror[buf]
+  if bo and bo.modifiable == false then
+    error("nvim_buf_set_lines: buffer " .. tostring(buf) .. " is not 'modifiable'", 2)
+  end
+  if type(replacement) ~= "table" then
+    error("nvim_buf_set_lines: replacement must be a list of strings", 2)
+  end
+  for i = 1, #replacement do
+    local line = replacement[i]
+    if type(line) ~= "string" then
+      error(("nvim_buf_set_lines: replacement[%d] is not a string"):format(i), 2)
+    end
+    if line:find("\n", 1, true) then
+      error(("nvim_buf_set_lines: replacement[%d] contains a newline"):format(i), 2)
+    end
+  end
+  local n = #mirror.lines
+  local s = nx._norm_line_index(start, n, strict)
+  local e = nx._norm_line_index(end_, n, strict)
+  if e < s then
+    e = s
+  end
+  nx._buf_set_lines(buf, s, e, replacement)
+  return nx.promise.new(function(resolve)
+    nx.on_next_tick(resolve)
+  end)
 end
 
 -- nx.buf.search(bufnr, pattern, opts) -> match | nil: find `pattern` in `bufnr`
@@ -769,6 +819,7 @@ end
 -- The muscle-memory `vim.api.nvim_*` names, each forwarding to the canonical
 -- `nx.*` native defined above (same function object, same signature).
 vim.api.nvim_buf_get_lines = nx.buf.lines
+vim.api.nvim_buf_set_lines = nx.buf.set_lines
 vim.api.nvim_buf_get_text = nx.buf.text
 vim.api.nvim_buf_get_name = nx.buf.name
 vim.api.nvim_buf_get_offset = nx.buf.offset

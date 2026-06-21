@@ -295,6 +295,10 @@ pub struct BoMirror {
     /// filetype's built-in default when none — mirrored so `nx.bo.commentstring`
     /// reads what `gc`/`gcc` actually wrap lines with.
     pub commentstring: String,
+    /// The buffer's `'modifiable'` flag, mirrored so `vim.bo.modifiable` reads it and
+    /// `nx.buf.set_lines` can fail loud *before* queueing an edit a `nomodifiable`
+    /// buffer would refuse.
+    pub modifiable: bool,
 }
 
 /// One buffer change projected into neovim's `nvim_buf_attach` `on_bytes`

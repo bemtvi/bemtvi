@@ -540,10 +540,11 @@ pub enum LoopOp {
 /// the Rust→Lua *mirror* the server pushes via
 /// [`crate::LuaRuntime::set_buf_mirror`] before running Lua.
 ///
-/// The buffer-*text* / lifecycle mutation surface (`nvim_buf_set_lines` / `set_text`,
-/// `nvim_create_buf`, `nvim_buf_delete`, …) is **not** part of nxvim's Lua API — it is
-/// intentionally absent (see `crates/nxvim-lua/src/prelude/api.lua`'s header); the only
-/// buffer mutation a config reaches is the option write below (`vim.bo`).
+/// Buffer mutations a config / plugin reaches: a buffer-local option write (`vim.bo`)
+/// and the buffer-*text* `set_lines` write (`nx.buf.set_lines` / `nvim_buf_set_lines`).
+/// Both are queued here and applied after the chunk (the Lua VM can't touch the live
+/// editor mid-chunk). The broader lifecycle surface (`set_text`, `nvim_create_buf`,
+/// `nvim_buf_delete`) is still absent — added when a real need lands.
 #[derive(Clone, Debug)]
 pub enum BufOp {
     /// `vim.bo[bufnr].<opt> = value` / `nvim_set_option_value(name, value, {buf})`
@@ -556,6 +557,18 @@ pub enum BufOp {
         /// Canonical option name (`tabstop` / `shiftwidth` / `expandtab`).
         name: String,
         value: OptionValue,
+    },
+    /// `nx.buf.set_lines(bufnr, start, end, _, lines)` / `nvim_buf_set_lines` — replace
+    /// lines `[start, end)` of buffer `bufnr` with `lines`. `start`/`end` are 0-based,
+    /// end-exclusive, and already resolved + clamped against the live line count by the
+    /// Lua front (which validates the shape and fails loud synchronously); the server
+    /// applies it via [`Editor::api_set_lines`](nxvim_core::Editor::api_set_lines), which
+    /// is the lone text-mutation entry point and itself fails loud on a read-only buffer.
+    SetLines {
+        bufnr: u64,
+        start: usize,
+        end: usize,
+        lines: Vec<String>,
     },
 }
 

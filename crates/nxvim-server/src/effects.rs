@@ -1183,6 +1183,22 @@ impl EditHost {
                     OptionValue::String(s) => self.editor.set_buffer_option_str(id, &name, &s),
                 }
             }
+            BufOp::SetLines {
+                bufnr,
+                start,
+                end,
+                lines,
+            } => {
+                // The lone buffer-text mutation. `api_set_lines` fails loud on a
+                // read-only / gone buffer — surface that as a message rather than a
+                // silent no-op (the Lua front already rejected the common bad shapes).
+                if let Err(e) = self
+                    .editor
+                    .api_set_lines(BufferId(bufnr), start, end, &lines)
+                {
+                    self.editor.echo(e);
+                }
+            }
         }
     }
 
@@ -1598,6 +1614,7 @@ impl EditHost {
                     filetype: self.editor.buffer_filetype(id).unwrap_or_default(),
                     ts_highlight: self.editor.ts_highlight_enabled(id),
                     commentstring: self.editor.effective_commentstring(id),
+                    modifiable: o.modifiable,
                 });
                 if !b.extmarks.is_empty() {
                     let marks = b

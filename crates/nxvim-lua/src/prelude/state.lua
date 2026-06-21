@@ -816,6 +816,11 @@ local BUF_OPT_CANON = {
   -- per-buffer override (empty falls back to the filetype default).
   commentstring = "commentstring",
   cms = "commentstring",
+  -- Whether the buffer's text may be changed (`vim.bo.modifiable`). The server
+  -- mirrors it, and `nx.buf.set_lines` reads it to fail loud before queueing an edit
+  -- a `nomodifiable` buffer would refuse.
+  modifiable = "modifiable",
+  ma = "modifiable",
 }
 -- Core defaults, the safety net when the mirror hasn't been pushed for a buffer.
 -- Match nxvim's core: tabstop 4, with shiftwidth/softtabstop following it via
@@ -831,6 +836,7 @@ local BUF_OPT_DEFAULT = {
   fileencoding = "utf-8",
   bomb = false,
   commentstring = "",
+  modifiable = true,
 }
 
 local function bo_get(bufnr, opt)

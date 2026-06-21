@@ -141,8 +141,13 @@ vendored Lua — the engine seam is kept, the command skin is replaced by a noun
 ## Consequences
 
 - **`nx.view` widens the plugin-owned *content* surface — not the entity-mutation
-  one.** The buffer-text/lifecycle API (`nvim_buf_set_lines`, `nvim_create_buf`, …)
-  stays deliberately absent (point 3). But a tree dock needs plugin-controlled
+  one.** The buffer-text mutation API is a single, bounded entry point —
+  `nx.buf.set_lines` (alias `nvim_buf_set_lines`), an **async** whole-line write
+  queued like every other effect and applied after the chunk (it returns a promise
+  that settles once the edit is visible), failing loud on a read-only buffer. The rest
+  of the lifecycle surface (`set_text`, `nvim_create_buf`, `nvim_buf_delete`, the
+  `nvim_buf_attach` change channel) stays absent until a real need lands. But a tree
+  dock needs plugin-controlled
   lines, so the panel's "read-only, plugin-owned, line-controlled buffer with a
   `<CR>` handler" is generalized off its bottom-edge assumption into `nx.view`: a
   mountable (dock / split), inert content surface whose lines a plugin replaces

@@ -162,6 +162,8 @@ impl Editor {
             ob.buffer.options.expandtab = value;
         } else if name == "bomb" {
             ob.buffer.options.bomb = value;
+        } else if name == "modifiable" {
+            ob.buffer.options.modifiable = value;
         }
     }
 
@@ -309,6 +311,85 @@ impl Editor {
     /// open. Cheap (no text copy), unlike [`Editor::lines_of`].
     pub fn line_count_of(&self, id: BufferId) -> Option<usize> {
         self.buffers.map.get(&id).map(|ob| ob.buffer.line_count())
+    }
+
+    /// Replace lines `[start, end)` of buffer `id` with `replacement` — the
+    /// buffer-addressed core of `nvim_buf_set_lines`, and the SOLE buffer-*text*
+    /// mutation the `nx.*` Lua API reaches (queued as [`BufOp::SetLines`] and applied
+    /// after the chunk). `start`/`end` are 0-based, end-exclusive, and already resolved
+    /// (negatives folded, bounds clamped) by the Lua front against the live line count;
+    /// they are re-clamped here for safety.
+    ///
+    /// The edit is one independently-undoable group ([`Editor::push_undo_for`]) routed
+    /// through the [`Buffer::insert`] / [`Buffer::remove`] chokepoints — so `changedtick`,
+    /// the treesitter / LSP / on-bytes journals, and the buffer mirror all follow it —
+    /// and [`Buffer::normalize`]d to keep the rope's single trailing `\n` invariant.
+    ///
+    /// Fails loud (`Err`) rather than silently no-op when the buffer is gone or read-only
+    /// (a live terminal, directory listing, `nx.view`, or quickfix display, or an ordinary
+    /// `nomodifiable` buffer) — vim's `E21`. The Lua wrapper rejects the promise with it.
+    pub fn api_set_lines(
+        &mut self,
+        id: BufferId,
+        start: usize,
+        end: usize,
+        replacement: &[String],
+    ) -> Result<(), String> {
+        // Resolve the byte span under an immutable borrow, then drop it before mutating.
+        let (from, to) = {
+            let buf = match self.buffer_of(id) {
+                Some(b) => b,
+                None => return Err(format!("invalid buffer id: {}", id.0)),
+            };
+            if buf.read_only() || !buf.options.modifiable {
+                return Err("E21: Cannot make changes, 'modifiable' is off".to_string());
+            }
+            let count = buf.line_count();
+            let start = start.min(count);
+            let end = end.clamp(start, count);
+            let from = buf.line_start(start);
+            // Through the line *after* the range, or the whole rope (trailing `\n`
+            // included) when the range runs to the last line — mirrors `ex_delete`.
+            let to = if end >= count {
+                buf.len_bytes()
+            } else {
+                buf.line_start(end)
+            };
+            (from, to)
+        };
+        // A quickfix / location-list display buffer is read-only too, but its identity
+        // is an editor-side registry rather than a `Buffer` flag (checked separately).
+        if self.qf_context_of_buffer(id).is_some() {
+            return Err("E21: Cannot make changes, 'modifiable' is off".to_string());
+        }
+
+        // Each replacement line becomes a whole line: join with `\n` plus a trailing one
+        // so the splice can't merge the last line into the following kept line (an empty
+        // replacement is a pure deletion). `normalize` restores the single trailing `\n`.
+        let chunk = if replacement.is_empty() {
+            String::new()
+        } else {
+            let mut s = replacement.join("\n");
+            s.push('\n');
+            s
+        };
+
+        self.push_undo_for(id);
+        let buf = self
+            .buffer_of_mut(id)
+            .expect("buffer existed under the borrow above");
+        buf.remove(from..to);
+        if !chunk.is_empty() {
+            buf.insert(from, &chunk);
+        }
+        buf.normalize();
+        buf.modified = true;
+        // Keep the focused cursor in bounds when the edit shrank its own buffer (vim
+        // adjusts cursors across a set_lines); background windows clamp when refocused.
+        if id == self.cur_buffer() {
+            self.clamp_cursor();
+        }
+        Ok(())
     }
 
     /// Buffer `id`'s `changedtick` (bumped on every edit / resync), or `None` if no

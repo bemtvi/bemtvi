@@ -1251,6 +1251,28 @@ pub(crate) fn install_runtime_api(
         })?,
     )?;
 
+    // `nx._buf_set_lines(bufnr, start, end, lines)`: queue a [`BufOp::SetLines`] for the
+    // server to apply via `Editor::api_set_lines` (the lone buffer-text mutation). The
+    // prelude (`nx.buf.set_lines` / `nvim_buf_set_lines`) has already validated the shape
+    // and resolved `start`/`end` to 0-based, end-exclusive, clamped indices; here we only
+    // marshal the `lines` table into a `Vec<String>` (non-string entries error loud, as
+    // neovim does for a non-text replacement line).
+    let sh = shared.clone();
+    nx.set(
+        "_buf_set_lines",
+        lua.create_function(
+            move |_, (bufnr, start, end, lines): (u64, i64, i64, Vec<String>)| {
+                sh.borrow_mut().buf_ops.push(BufOp::SetLines {
+                    bufnr,
+                    start: start.max(0) as usize,
+                    end: end.max(0) as usize,
+                    lines,
+                });
+                Ok(())
+            },
+        )?,
+    )?;
+
     // `nx._set_global_option(name, value)`: queue a [`GlobalOptionOp`] for the
     // server to apply to the editor's global options. The prelude (`vim.o`) has
     // canonicalized `name` and written through its `nx._go_mirror`; the wired

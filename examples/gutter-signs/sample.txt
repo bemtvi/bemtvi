@@ -1,0 +1,13 @@
+fn parse_config(input) {            -- line 1: ┃ added
+    let cfg = Config::default();     -- line 2: ┃ added
+    return validate(cfg, input);
+}
+
+let mut total = sum(values);        -- line 5: ~ changed
+
+fn validate(cfg, input) {
+    assert!(input.len() > 0);        -- line 8: _ deletion marker below
+
+    let merged = cfg.merge(input);
+    return merged;
+}

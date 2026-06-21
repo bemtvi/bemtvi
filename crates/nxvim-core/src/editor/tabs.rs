@@ -415,6 +415,21 @@ impl Editor {
         true
     }
 
+    /// Close the main-layer tab page with id `id` (the [`ViewMount::Tab`](super::view)
+    /// teardown path). Crosses back to the main layer first, never closes the last tab
+    /// (a no-op then), and is a no-op for an unknown id. Unlike [`close_tab`] it targets
+    /// a tab by stable id rather than the active index, so closing a diff's tab works
+    /// regardless of which tab is focused.
+    pub(crate) fn close_tab_by_id(&mut self, id: TabId) {
+        self.ensure_main_layer();
+        if self.main_tabs.tabs.len() <= 1 {
+            return;
+        }
+        if let Some(idx) = self.main_tabs.tabs.iter().position(|t| t.id == id) {
+            self.close_tab_at(idx);
+        }
+    }
+
     /// Close the tab page at index `target` of the focused layer (assumed valid,
     /// with `tabs.len() > 1`). Closing the **active** tab promotes a neighbor's
     /// stashed tree to live (the tab to the right, or the last tab); closing an

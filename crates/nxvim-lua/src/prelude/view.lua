@@ -133,9 +133,10 @@ local FLOAT_BORDER =
   { none = true, single = true, double = true, rounded = true, solid = true, shadow = true }
 
 -- :mount(opts) — show the view. `opts.dock = "left"|"right"|"top"|"bottom"` mounts it in
--- that dock (`opts.size` columns/rows); `opts.split = "vsplit"|"split"` mounts it in a
--- split of the main editor area; `opts.float = { … }` mounts it in a floating window.
--- Mounting focuses the view.
+-- that dock (`opts.size` columns/rows); `opts.tab = true` mounts it as the sole window of
+-- a fresh tab page (no split — the view fills the tab; closing it closes the tab);
+-- `opts.split = "vsplit"|"split"` mounts it in a split of the main editor area;
+-- `opts.float = { … }` mounts it in a floating window. Mounting focuses the view.
 --
 -- The float table takes `width` / `height` (inner size; required) — cells (a
 -- number) or a viewport fraction ("50vw" / "30vh" / "50%"), which reflows on
@@ -155,6 +156,8 @@ function View:mount(opts)
   opts = opts or {}
   if opts.dock then
     nx.view._mount_dock(self.id, opts.dock, opts.size)
+  elseif opts.tab then
+    nx.view._mount_tab(self.id)
   elseif opts.split then
     nx.view._mount_split(self.id, opts.split ~= "split")
   elseif opts.float then

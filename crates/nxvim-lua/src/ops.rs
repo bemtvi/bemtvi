@@ -112,6 +112,9 @@ pub enum ViewOp {
     /// `v:mount{ split = "vsplit" | "split" }` — show view `id` in a new split of the
     /// main editor area and focus it (`vertical` for `vsplit`).
     MountSplit { id: u64, vertical: bool },
+    /// `v:mount{ tab = true }` — show view `id` as the sole window of a fresh tab page
+    /// and focus it (no split, no leftover empty window). Closing it closes the tab.
+    MountTab { id: u64 },
     /// `v:mount{ float = { … } }` — show view `id` in a floating window placed by the
     /// float config and focus it. `grab` hard-locks focus to the float (the modal-dialog
     /// case) until unmount; a non-grab float is an ordinary focusable float. The string

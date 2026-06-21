@@ -35,6 +35,17 @@ async fn win_count(rpc: &Rpc) -> usize {
     }
 }
 
+async fn tab_count(rpc: &Rpc) -> usize {
+    match rpc
+        .request("nvim_list_tabpages", vec![])
+        .await
+        .expect("tabs")
+    {
+        Value::Array(a) => a.len(),
+        v => panic!("expected array, got {v:?}"),
+    }
+}
+
 /// The latest redraw map (any frame).
 fn latest(incoming: &mut UnboundedReceiver<Incoming>) -> Vec<(Value, Value)> {
     drain_to_latest_redraw(incoming, |_| true).expect("a redraw frame")
@@ -267,6 +278,65 @@ async fn view_mounts_in_a_split() {
         vec!["one", "two"],
         "the split window shows the view"
     );
+}
+
+/// A view mounted with `{ tab = true }` fills a fresh tab (no split, no empty leftover),
+/// and closing it closes that tab — the clean-layout primitive a diff viewer builds on.
+#[tokio::test]
+async fn view_mounts_in_a_new_tab_and_close_restores() {
+    let (rpc, _incoming) = start().await;
+    feed_sync(&rpc, "imain<Esc>").await;
+    assert_eq!(tab_count(&rpc).await, 1);
+    exec_lua(
+        &rpc,
+        r#"vw = nx.view.create{}
+           vw:set_lines{ "one", "two" }
+           vw:mount{ tab = true }"#,
+    )
+    .await;
+    assert_eq!(tab_count(&rpc).await, 2, "the tab mount added a tab");
+    // The new tab shows the view as its sole window — no leftover empty window.
+    assert_eq!(
+        win_count(&rpc).await,
+        2,
+        "one window per tab (original + view)"
+    );
+    assert_eq!(
+        lines(&rpc).await,
+        vec!["one", "two"],
+        "the tab shows the view"
+    );
+    // Closing the view closes its whole tab, restoring the original.
+    exec_lua(&rpc, "vw:close()").await;
+    assert_eq!(tab_count(&rpc).await, 1, "closing the view closed its tab");
+    assert_eq!(lines(&rpc).await, vec!["main"], "back in the original tab");
+}
+
+/// A second view can `split` beside a tab-mounted one to build a 2-up tab in one go —
+/// the diff layout. The split lands in the diff tab, not the original.
+#[tokio::test]
+async fn tab_mount_plus_split_builds_a_two_pane_tab() {
+    let (rpc, _incoming) = start().await;
+    feed_sync(&rpc, "imain<Esc>").await;
+    exec_lua(
+        &rpc,
+        r#"a = nx.view.create{}; a:set_lines{ "left" }
+           b = nx.view.create{}; b:set_lines{ "right" }
+           a:mount{ tab = true }
+           b:mount{ split = "vsplit" }"#,
+    )
+    .await;
+    assert_eq!(
+        tab_count(&rpc).await,
+        2,
+        "still just the original + diff tab"
+    );
+    // Original tab has 1 window, the diff tab has 2 → 3 windows total.
+    assert_eq!(win_count(&rpc).await, 3, "the diff tab is a 2-up split");
+    // Closing the tab-mounted pane tears down the whole diff tab.
+    exec_lua(&rpc, "a:close(); b:close()").await;
+    assert_eq!(tab_count(&rpc).await, 1);
+    assert_eq!(lines(&rpc).await, vec!["main"]);
 }
 
 /// `:set_decor` lays extmarks on the view buffer (read back via

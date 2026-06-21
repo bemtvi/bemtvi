@@ -459,6 +459,7 @@ impl EditHost {
                         .mount_view_dock(id, &side, size.map(|s| s as usize))
                 }
                 ViewOp::MountSplit { id, vertical } => self.editor.mount_view_split(id, vertical),
+                ViewOp::MountTab { id } => self.editor.mount_view_tab(id),
                 ViewOp::MountFloat {
                     id,
                     relative,

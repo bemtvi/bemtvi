@@ -36,6 +36,12 @@ pub(crate) enum ViewMount {
     Dock(DockSide),
     /// In a split window of the main editor area (`v:mount{ split = … }`).
     Split(WindowId),
+    /// As the sole window of its own tab page (`v:mount{ tab = true }`) — opened with
+    /// [`new_tab`](Editor::new_tab) so the view *fills* a fresh tab instead of splitting
+    /// one (no leftover empty window). `unmount` closes the whole tab, so a plugin laying
+    /// several views into one tab (the first via `tab`, the rest via `split`) tears the
+    /// lot down by closing the tab-mounted one.
+    Tab { tab: TabId, win: WindowId },
     /// In a floating window (`v:mount{ float = … }`). `win` is the float; `prev` is the
     /// window focused at mount, refocused on unmount when `grab` so a modal float feels
     /// transient (open → interact → dismiss → back where you were). `grab` records whether
@@ -93,7 +99,9 @@ impl Editor {
     /// against the live window set so a stale split window reports `None`.
     pub fn view_window(&self, id: u64) -> Option<WindowId> {
         let win = match self.views.get(&id)?.mount.as_ref()? {
-            ViewMount::Float { win, .. } | ViewMount::Split(win) => *win,
+            ViewMount::Float { win, .. } | ViewMount::Split(win) | ViewMount::Tab { win, .. } => {
+                *win
+            }
             ViewMount::Dock(side) => self.layer_tree(Layer::Dock(*side))?.current,
         };
         self.window(win).map(|_| win)
@@ -197,6 +205,26 @@ impl Editor {
         }
     }
 
+    /// `v:mount{ tab = true }` — show view `id` as the sole window of a **new tab**,
+    /// and focus it. Built on [`new_tab`](Editor::new_tab), so the view fills the fresh
+    /// tab directly — no split, no leftover empty window (the friction a `tabnew` +
+    /// split + `:only` dance would have). A plugin builds a multi-pane tab by mounting
+    /// the first view with `tab` and the rest with `split`; [`unmount_view`] on the
+    /// tab-mounted one closes the whole tab. A no-op for an unknown id.
+    pub fn mount_view_tab(&mut self, id: u64) {
+        let Some(buf) = self.view_buffer(id) else {
+            return;
+        };
+        self.unmount_view(id);
+        let options = self.windows.cur().options.clone();
+        self.new_tab(buf, options);
+        let tab = self.current_tab_id();
+        let win = self.current_window_id();
+        if let Some(v) = self.views.get_mut(&id) {
+            v.mount = Some(ViewMount::Tab { tab, win });
+        }
+    }
+
     /// `v:mount{ float = { … } }` — show view `id` in a floating window placed by
     /// `config`, and focus it. When `grab`, the float hard-locks focus (the
     /// [`focus_window`](Editor::focus_window) guard pins focus to it, like the panel) until
@@ -248,6 +276,17 @@ impl Editor {
                     self.set_current_window(win);
                 }
             }
+            Some(ViewMount::Tab { tab, win }) => {
+                // Switch to the view's tab (it may not be active), then focus its window.
+                let (tab, win) = (*tab, *win);
+                self.ensure_main_layer();
+                if self.tab_is_valid(tab) {
+                    self.set_current_tabpage(tab);
+                }
+                if self.windows.try_get(win).is_some() {
+                    self.set_current_window(win);
+                }
+            }
             None => {}
         }
     }
@@ -279,6 +318,7 @@ impl Editor {
         let mount = self.views.get_mut(&id).and_then(|v| v.mount.take());
         match mount {
             Some(ViewMount::Dock(s)) => self.close_dock(s),
+            Some(ViewMount::Tab { tab, .. }) => self.close_tab_by_id(tab),
             Some(ViewMount::Split(win)) if self.windows.try_get(win).is_some() => {
                 self.close_window_by_id(win, true);
             }

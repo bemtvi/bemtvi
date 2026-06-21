@@ -1615,10 +1615,16 @@ impl EditHost {
                                 }
                                 None => (None, None),
                             };
-                            let (sign_text, sign_hl_group) = match m.decor.as_deref() {
+                            let d = m.decor.as_deref();
+                            let (sign_text, sign_hl_group) = match d {
                                 Some(d) => (d.sign_text.clone(), d.sign_hl_group.clone()),
                                 None => (None, None),
                             };
+                            let (line_fill_text, line_fill_hl) =
+                                match d.and_then(|d| d.line_fill.as_ref()) {
+                                    Some(f) => (Some(f.text.clone()), f.hl_group.clone()),
+                                    None => (None, None),
+                                };
                             ExtmarkMirror {
                                 ns,
                                 id: m.id,
@@ -1630,6 +1636,8 @@ impl EditHost {
                                 priority: m.priority,
                                 sign_text,
                                 sign_hl_group,
+                                line_fill_text,
+                                line_fill_hl,
                             }
                         })
                         .collect();

@@ -198,6 +198,12 @@ pub struct ExtmarkMirror {
     pub sign_text: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub sign_hl_group: Option<String>,
+    /// The `line_fill` text / hl (round-tripped like the signs, so a details read
+    /// after the tick still surfaces the whole-line fill the mark carries).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub line_fill_text: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub line_fill_hl: Option<String>,
 }
 
 /// One highlight group's row in the Rust→Lua highlight mirror (`nx._hl_defs`),

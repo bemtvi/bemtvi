@@ -1004,3 +1004,34 @@ async fn a_line_fill_mark_fills_the_row_with_a_glyph() {
         "the row is filled across its width with the glyph, got {text:?}"
     );
 }
+
+/// A `line_fill` mark round-trips through `get_extmarks(details=true)` after the
+/// tick, so a plugin can read back the fill it placed (symmetry with `sign_text`).
+#[tokio::test]
+async fn line_fill_round_trips_across_chunks() {
+    let (rpc, _rx) = start().await;
+    exec_lua(
+        &rpc,
+        r#"
+        FillNs = vim.api.nvim_create_namespace('fillrt')
+        vim.api.nvim_buf_set_extmark(0, FillNs, 0, 0, { line_fill = { text = '.', hl_group = 'NonText' } })
+        "#,
+    )
+    .await;
+    let summary = exec_lua(
+        &rpc,
+        r#"
+        local marks = vim.api.nvim_buf_get_extmarks(0, FillNs, 0, -1, { details = true })
+        if #marks ~= 1 then return 'count=' .. #marks end
+        local lf = marks[1][4].line_fill
+        if not lf then return 'no line_fill' end
+        return tostring(lf.text) .. ',' .. tostring(lf.hl_group)
+        "#,
+    )
+    .await;
+    assert_eq!(
+        summary.as_str(),
+        Some(".,NonText"),
+        "get_extmarks details returns the line_fill text/hl_group after the tick"
+    );
+}

@@ -1241,6 +1241,10 @@ function nx._set_extmark_mirror(entries)
       if m.sign_text ~= nil or m.sign_hl_group ~= nil then
         decoration = { sign_text = m.sign_text, sign_hl_group = m.sign_hl_group }
       end
+      if m.line_fill_text ~= nil then
+        decoration = decoration or {}
+        decoration.line_fill = { text = m.line_fill_text, hl_group = m.line_fill_hl }
+      end
       by_ns[m.ns][m.id] = {
         row = m.row,
         col = m.col,

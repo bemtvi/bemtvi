@@ -1299,11 +1299,35 @@ impl Editor {
         self.push_undo_for(id);
         // Highest start first: applying a later edit can't shift an earlier one.
         edits.sort_by_key(|(range, _)| std::cmp::Reverse(range.start));
+        // Carry the live cursor through the edits the way neovim's `apply_text_edits`
+        // does: an edit *before* the cursor shifts it by the edit's length delta, and
+        // an edit it sits *inside* moves it to the end of the replacement — so the
+        // cursor follows the text it was on (e.g. a rename that inserts a `use`
+        // import above it) instead of staying pinned to a now-stale absolute line/col.
+        // Computed against the pre-edit byte offset; edits run highest-start-first, so
+        // the (lower-start) edits before the cursor fold their deltas in after the one
+        // it straddles has set the base position.
+        let is_current = id == self.cur_buffer();
+        let cursor_byte = is_current.then(|| {
+            let buf = &self.buffers.get(id).buffer;
+            buf.line_start(self.cursor.line) + self.cursor.col
+        });
+        let mut new_cursor = cursor_byte.map(|c| c as i64);
         for (range, text) in edits {
             let buf = &mut self.buffers.get_mut(id).buffer;
             let len = buf.len_bytes();
             let start = buf.text.floor_char_boundary(range.start.min(len));
             let end = buf.text.floor_char_boundary(range.end.min(len));
+            if let (Some(cur), Some(nc)) = (cursor_byte, new_cursor.as_mut()) {
+                if cur >= end {
+                    // Entirely before the cursor: shift by the inserted/removed length.
+                    *nc += text.len() as i64 - (end - start) as i64;
+                } else if cur > start {
+                    // The cursor sits inside the replaced range: land it at the end of
+                    // the new text (in original coords; before-cursor edits then shift).
+                    *nc = (start + text.len()) as i64;
+                }
+            }
             if start < end {
                 buf.remove(start..end);
             }
@@ -1315,8 +1339,8 @@ impl Editor {
         // A workspace edit is a complete one-shot; commit it now so it lands as a
         // single undo node, independent of any later edit to `id`.
         self.commit_undo(id);
-        if id == self.cur_buffer() {
-            self.clamp_cursor();
+        if let Some(nc) = new_cursor {
+            self.set_cursor_char(nc.max(0) as usize);
             self.desired_col = self.cursor_virtcol();
             self.desired_eol = false;
             self.ensure_visible();

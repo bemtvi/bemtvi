@@ -484,6 +484,149 @@ async fn rename_applies_the_workspace_edit() {
     );
 }
 
+/// A rename whose `WorkspaceEdit` inserts a line *above* the cursor (e.g. an added
+/// `use` import) must carry the cursor down with the text it sits on — like
+/// neovim's `apply_text_edits` — not leave it pinned to a now-stale absolute line.
+/// Regression: the cursor was left on the previous line's content (its "previous
+/// edit point") instead of following the symbol it was on.
+#[tokio::test]
+async fn rename_carries_the_cursor_through_edits_above_it() {
+    let _guard = serial_lock().lock().await;
+    let dir = temp_dir("lsp_features_rename_cursor");
+    let uri = file_uri(&dir, "a.rs");
+    // The rename of `foo` → `bar` also inserts a `use bar;` line at the top (an
+    // import the server adds), plus rewrites both occurrences.
+    arm_mock(
+        &dir,
+        &format!(
+            r#"{{
+                "rename": {{
+                    "changes": {{
+                        "{uri}": [
+                            {{
+                                "range": {{ "start": {{ "line": 0, "character": 0 }}, "end": {{ "line": 0, "character": 0 }} }},
+                                "newText": "use bar;\n"
+                            }},
+                            {{
+                                "range": {{ "start": {{ "line": 0, "character": 4 }}, "end": {{ "line": 0, "character": 7 }} }},
+                                "newText": "bar"
+                            }},
+                            {{
+                                "range": {{ "start": {{ "line": 3, "character": 7 }}, "end": {{ "line": 3, "character": 10 }} }},
+                                "newText": "bar"
+                            }}
+                        ]
+                    }}
+                }}
+            }}"#
+        ),
+    );
+    let (rpc, _incoming) =
+        open_with_server(&dir, "let foo = 1\nlet a = 2\nlet b = 3\nreturn foo\n").await;
+    assert!(
+        await_lua_eq(&rpc, "#nx.lsp.clients({ bufnr = 0 })", "1").await,
+        "the mock server should attach"
+    );
+
+    // Park the cursor on the second occurrence (line 4, the `foo` in `return foo`).
+    feed(&rpc, "4G0fo");
+    barrier(&rpc).await;
+    let before = cursor(&rpc).await;
+    assert_eq!(before.0, 4, "precondition: cursor parked on line 4");
+
+    let mut renamed = false;
+    for _ in 0..80 {
+        exec_lua(&rpc, "nx.lsp.rename('bar')").await;
+        nxvim_test_harness::barrier(&rpc).await;
+        if lines(&rpc).await.last().map(String::as_str) == Some("return bar") {
+            renamed = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert!(
+        renamed,
+        "rename should rewrite the symbol and add the import"
+    );
+
+    // The inserted `use bar;` pushed everything down one line, so the symbol the
+    // cursor sat on is now on line 5. The cursor must have followed it there.
+    let after = cursor(&rpc).await;
+    assert_eq!(
+        after.0, 5,
+        "the cursor should follow its line down past the inserted import, \
+         not stay pinned to the now-previous line"
+    );
+}
+
+/// Undoing a rename must land the cursor where it was *before* the rename (on the
+/// renamed symbol), not at the top of the file. Regression: a workspace edit didn't
+/// bake the live cursor into the node it would undo back to, so the root node's
+/// stale top-of-file cursor was restored when the symbol was reached by navigation
+/// (no intervening edit) rather than by editing.
+#[tokio::test]
+async fn undo_of_a_rename_restores_the_pre_rename_cursor() {
+    let _guard = serial_lock().lock().await;
+    let dir = temp_dir("lsp_features_rename_undo");
+    let uri = file_uri(&dir, "a.rs");
+    // Rename `foo` → `bar` on the last line only.
+    arm_mock(
+        &dir,
+        &format!(
+            r#"{{
+                "rename": {{
+                    "changes": {{
+                        "{uri}": [
+                            {{
+                                "range": {{ "start": {{ "line": 3, "character": 7 }}, "end": {{ "line": 3, "character": 10 }} }},
+                                "newText": "bar"
+                            }}
+                        ]
+                    }}
+                }}
+            }}"#
+        ),
+    );
+    let (rpc, _incoming) =
+        open_with_server(&dir, "let a = 1\nlet b = 2\nlet c = 3\nreturn foo\n").await;
+    assert!(
+        await_lua_eq(&rpc, "#nx.lsp.clients({ bufnr = 0 })", "1").await,
+        "the mock server should attach"
+    );
+
+    // Reach the symbol purely by *navigation* (no edit), so the only committed undo
+    // node is the root — whose snapshot cursor is the load-time top of file.
+    feed(&rpc, "4G0fo");
+    barrier(&rpc).await;
+    assert_eq!(cursor(&rpc).await.0, 4, "precondition: cursor on line 4");
+
+    let mut renamed = false;
+    for _ in 0..80 {
+        exec_lua(&rpc, "nx.lsp.rename('bar')").await;
+        nxvim_test_harness::barrier(&rpc).await;
+        if lines(&rpc).await.last().map(String::as_str) == Some("return bar") {
+            renamed = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert!(renamed, "rename should rewrite the symbol");
+
+    // Undo the rename. The text reverts *and* the cursor returns to line 4, not 1.
+    feed(&rpc, "u");
+    barrier(&rpc).await;
+    assert_eq!(
+        lines(&rpc).await.last().map(String::as_str),
+        Some("return foo"),
+        "undo should revert the rename"
+    );
+    assert_eq!(
+        cursor(&rpc).await.0,
+        4,
+        "undo should restore the cursor to the symbol, not the top of the file"
+    );
+}
+
 /// `code_action()` lists the server's actions in the select menu; confirming one
 /// applies its eager `WorkspaceEdit`.
 #[tokio::test]

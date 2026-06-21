@@ -300,6 +300,17 @@ impl Editor {
     /// not consult `snapshot_taken` — a workspace edit is a one-shot mutation.
     pub(crate) fn push_undo_for(&mut self, id: BufferId) {
         self.commit_undo(id);
+        // Bake the live cursor into the node we'll undo back to — exactly as
+        // [`push_undo`](Self::push_undo) does. A rename is typically reached by
+        // *navigating* to the symbol (no intervening edit), so the node `cur` is the
+        // root committed at buffer load, whose frozen snapshot cursor is the top of
+        // file; without this refresh, undoing the rename would jump the cursor there
+        // instead of back to the symbol. Only meaningful for the focused buffer,
+        // whose live cursor this reads — a background buffer's node keeps the saved
+        // cursor `commit_undo` already snapshotted.
+        if id == self.cur_buffer() {
+            self.refresh_undo_cursor_marks(id);
+        }
         let now = self.now_mono;
         self.buffers.get_mut(id).undo.mark_dirty(now);
     }

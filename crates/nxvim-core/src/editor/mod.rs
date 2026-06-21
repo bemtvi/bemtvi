@@ -1974,33 +1974,47 @@ impl Editor {
         self.pending.stage == Stage::ReplacePending
     }
 
-    /// True when the next key is consumed by core as a *literal argument* — the
-    /// `r{char}` replacement, an `f`/`t`/`F`/`T{char}` target, a `"{reg}` register
-    /// name, or an `i`/`a{kind}` text-object kind. Like vim, these argument keys are
-    /// read raw (`plain_vgetc`), **not** through the mapping layer, so the server
-    /// routes them straight to [`Self::input`] instead of the keymap matcher. This
-    /// is what keeps `rg`/`fg` instant: without it the matcher withholds the `g` as
-    /// a live prefix of the native `gd`/`gr` maps and the command appears to hang.
+    /// True when the next key **belongs to a multi-key command already in progress**
+    /// — so it is read raw, **not** through the mapping layer (the server routes it
+    /// straight to [`Self::input`] instead of the keymap matcher). This is vim's rule,
+    /// verified against neovim: the continuation of `dh` (operator + motion), `gj`
+    /// (`g`-prefix), `zt` (`z`-prefix), `<C-w>h` (window), the literal arg of
+    /// `r{c}`/`f{c}`/`"{reg}`/`m{mark}`/`` `{mark} ``/`i{obj}` — none of these go
+    /// through user maps. Without this a bare map on the continuation key breaks the
+    /// built-in: nxvim-tree binds `h`/`l` for fold navigation, so `<C-w>h` /
+    /// `<C-w><C-w>l` / `dh` would fire the tree's map instead of moving; and a `gd`/`gr`
+    /// LSP map would make `rg`/`fg` hang waiting to disambiguate the literal `g`.
     ///
-    /// A mark name is likewise a literal: `m{mark}` sets it, and `` `{mark} ``/
-    /// `'{mark}` jump to it — the name char is read raw, never mapped. Without this
-    /// a mapped prefix that shares the name's first key (e.g. a `[d`/`[e` default
-    /// over the `[` of `` `[ ``/`'['`) would be withheld and the jump would hang.
+    /// **Read straight off grammar state — no per-command list.** Exactly two sources,
+    /// and together they are complete by construction:
+    /// - an armed operator awaiting its motion (`d`/`c`/`y`/`=`; stage stays `Start`);
+    /// - **any** non-`Start` [`Stage`] — every variant is the editor mid-parse of a
+    ///   multi-key command, whether its next key is a grammar char (`g`/`z`/`<C-w>`
+    ///   prefixes) or a literal arg (find/replace/register/mark/text-object). A new
+    ///   prefix command is a new `Stage`, so it is covered automatically; nothing can
+    ///   silently fall out of a hand-kept enumeration.
     ///
-    /// `GPending` and `WindowPending` are deliberately excluded: `g`-prefix and
-    /// `<C-w>`-prefix keys *do* participate in mapping (the native `gd`/`gr`/`gg`
-    /// disambiguation, and user `<C-w>x` maps), so they must still go through the
-    /// matcher.
-    pub fn awaiting_literal_arg(&self) -> bool {
-        matches!(
-            self.pending.stage,
-            Stage::ReplacePending
-                | Stage::FindPending(_)
-                | Stage::RegisterPending
-                | Stage::TextObjectPending(_)
-                | Stage::MarkSetPending
-                | Stage::MarkJumpPending(_, _)
-        )
+    /// A bare count or a selected register (stage `Start`, no operator) is deliberately
+    /// **not** here: there the next key starts a *fresh* command that a mapping may
+    /// claim (`3<leader>x` reads `v:count`; `"a` then a mapped action reads
+    /// `v:register`), matching vim.
+    ///
+    /// The caller's `pending_empty()` gate is what keeps this from clashing with map
+    /// disambiguation: when a map *prefix* collides with a built-in prefix (`gd`/`gr`
+    /// over `g`, a user `<C-w>x`), the matcher **withholds** the prefix, so it never
+    /// reaches the grammar and the stage stays `Start` — the matcher and its
+    /// [`command_status`](crate::command_status) oracle own that case. Only once a
+    /// prefix has reached the grammar *raw* (no map collides with it) does its
+    /// continuation read raw here.
+    ///
+    /// The `<C-w><C-w>` dock chord in non-Normal modes ([`DockChord`]) is intentionally
+    /// *not* special-cased here: its cross still flows through the matcher and the chord
+    /// intercept in [`Self::input`] consumes it (the common case — no map on the cross
+    /// key — already works). If a conflicting map ever needs the same raw read there,
+    /// the fix is to route that chord through the grammar's `WindowLayerPending`, not to
+    /// re-introduce a bespoke clause.
+    pub fn awaiting_command_continuation(&self) -> bool {
+        self.pending.operator.is_some() || self.pending.stage != Stage::Start
     }
 
     /// The fixed end of the visual selection (the other end is [`Self::cursor`]).

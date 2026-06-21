@@ -13,7 +13,7 @@
 use nxvim_rpc::{Incoming, Rpc};
 use nxvim_server::ServerInit;
 use nxvim_test_harness::{
-    attach, cursor, drain_to_latest_redraw, feed, lines, mode, spawn, temp_dir,
+    attach, cursor, drain_to_latest_redraw, feed, lines, lua_bool, mode, spawn, temp_dir,
 };
 use rmpv::Value;
 use tokio::sync::mpsc::UnboundedReceiver;
@@ -779,6 +779,63 @@ async fn operator_dd_and_dw_fire_instantly_under_a_colliding_d_map() {
         lines(&rpc).await,
         vec!["line2", "world", "line3"],
         "dw deleted the first word instantly"
+    );
+}
+
+/// A bare map on a key that is the **continuation of a multi-key built-in** must
+/// not swallow that continuation — vim reads the second key of `g`/`z`/operator
+/// commands (and `<C-w>`, covered in `dock.rs`) raw, never through mapping. This is
+/// the *no-collision* case (distinct from the `gh`/`dh` collision tests above):
+/// `h`/`e`/`t` are mapped bare, and `g`/`z`/`d` are **not** map prefixes, so the
+/// prefix reaches the grammar raw and its continuation must follow it raw. This is
+/// the nxvim-tree report generalized — it binds `h`/`l` for fold navigation, which
+/// previously ate the motion of `dh`/`ge` and the `<C-w>`/layer nav arg.
+#[tokio::test]
+async fn bare_maps_do_not_swallow_builtin_continuations() {
+    let dir = temp_dir("keymap_continuation");
+    let (rpc, _incoming) = start_with_config(
+        &dir,
+        "_G.fired = {}\n\
+         vim.keymap.set('n', 'h', function() _G.fired.h = true end)\n\
+         vim.keymap.set('n', 'j', function() _G.fired.j = true end)\n\
+         vim.keymap.set('n', 't', function() _G.fired.t = true end)\n",
+    )
+    .await;
+
+    // `dh` (operator + left motion): deletes the char left of the cursor; the bare
+    // `h` map must not fire as the motion.
+    feed(&rpc, "iabcdef<Esc>"); // cursor on the final 'f' (col 5)
+    feed(&rpc, "dh");
+    assert_eq!(
+        lines(&rpc).await,
+        vec!["abcdf"],
+        "dh deleted the char left of the cursor — the bare h map did not eat the motion"
+    );
+
+    // `gj` (move down by display line): a two-key `g`-command whose second key is
+    // the bare-mapped `j`. From the top line it must land on line 2, not fire the map.
+    feed(&rpc, "ccline1<CR>line2<Esc>gg"); // two lines, cursor back at the top
+    assert_eq!(cursor(&rpc).await.0, 1, "cursor at the top line");
+    feed(&rpc, "gj");
+    assert_eq!(
+        cursor(&rpc).await.0,
+        2,
+        "gj moved down a display line — the bare j map did not fire"
+    );
+
+    // `zt` (scroll cursor line to top): a `z`-command whose second key is the
+    // bare-mapped `t`. It must run as the viewport command, not the map.
+    feed(&rpc, "zt"); // a no-op on content here, but must not fire the t map
+
+    let fired = lua_bool(
+        &rpc,
+        "return (_G.fired.h or _G.fired.j or _G.fired.t) == true",
+    )
+    .await;
+    assert_eq!(
+        fired,
+        Some(false),
+        "no bare map fired as a built-in continuation (dh / ge / zt all read raw)"
     );
 }
 

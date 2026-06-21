@@ -1782,3 +1782,42 @@ async fn quit_in_a_dock_closes_the_dock_not_the_editor() {
         "no dock window remains: {regs:?}"
     );
 }
+
+/// The `<C-w>` window commands and the `<C-w><C-w>` layer chord read their
+/// direction key (`h`/`j`/`k`/`l`) as a **raw command argument**, never through the
+/// mapping layer — exactly as neovim reads `<C-w>{cmd}`. nxvim-tree binds `h`/`l`
+/// buffer-locally (fold navigation) on its view buffer; before this fix those maps
+/// swallowed the cross arg, so `<C-w><C-w>l` fired the tree's `l` map instead of
+/// crossing layers, stranding focus.
+#[tokio::test]
+async fn window_and_layer_nav_ignore_buffer_local_hl_maps() {
+    let _g = serial_lock();
+    let (rpc, _incoming) = start().await;
+    feed_sync(&rpc, "imain<Esc>").await;
+
+    // A left dock (focused on open) whose buffer maps h/l locally, like the tree.
+    exec_lua(&rpc, "nx.dock.open{ side = 'left', size = 20 }").await;
+    feed_sync(&rpc, "idock<Esc>").await;
+    exec_lua(
+        &rpc,
+        "_G.hl = {}\n\
+         nx.keymap.set('n', 'h', function() _G.hl.h = true end, { buffer = 0 })\n\
+         nx.keymap.set('n', 'l', function() _G.hl.l = true end, { buffer = 0 })",
+    )
+    .await;
+
+    // From the dock the layer cross uses `l`; it must reach the grammar, not the
+    // buffer-local `l` map, and focus must land in the main buffer.
+    feed_sync(&rpc, "<C-w><C-w>l").await;
+    assert_eq!(lines(&rpc).await, vec!["main"], "crossed to the main area");
+    assert_eq!(
+        lua_u64(&rpc, "return (_G.hl.l and 1) or 0").await,
+        Some(0),
+        "the buffer-local `l` map must not fire as the cross arg",
+    );
+
+    // And back the other way: `<C-w><C-w>h` re-focuses the dock (the `h` map on the
+    // *main* buffer is irrelevant here, but the dock's own maps must not fire either).
+    feed_sync(&rpc, "<C-w><C-w>h").await;
+    assert_eq!(lines(&rpc).await, vec!["dock"], "crossed back to the dock");
+}

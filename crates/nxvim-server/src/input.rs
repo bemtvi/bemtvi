@@ -101,12 +101,16 @@ impl EditHost {
             }
             return;
         }
-        // Editing context: a raw-read key bypasses the matcher straight to the
-        // editor — the literal-argument read (`r{char}`, `f{char}`, `"{reg}`) and the
-        // command line's two fixed-grammar sub-states (a `confirm` dialog answer, the
-        // `<C-r>{register}` name). Neither participates in mapping, so neither routes
-        // through a keymap bucket.
-        if (self.editor.awaiting_literal_arg() || self.editor.cmdline_reads_raw())
+        // Editing context: a raw-read key bypasses the matcher straight to the editor
+        // — any key that *belongs to a multi-key command already in progress* (the
+        // motion after an operator, the second key of `g`/`z`/`<C-w>`/`<C-w><C-w>`, the
+        // literal arg of `r`/`f`/`"`/mark/text-object), plus the command line's two
+        // fixed-grammar sub-states (a `confirm` dialog answer, the `<C-r>{register}`
+        // name). None participate in mapping (vim reads them raw), so none route
+        // through a keymap bucket. The `pending_empty` guard preserves the inverse —
+        // a map *prefix* colliding with a built-in prefix is still resolved by the
+        // matcher / `command_status` oracle (see `awaiting_command_continuation`).
+        if (self.editor.awaiting_command_continuation() || self.editor.cmdline_reads_raw())
             && self.keymaps.pending_empty()
         {
             self.editor.input(key);

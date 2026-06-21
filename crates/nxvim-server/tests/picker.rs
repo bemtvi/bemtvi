@@ -243,6 +243,33 @@ async fn example_picker_to_loclist_config_loads() {
     );
 }
 
+/// The shipped `examples/ui-picker` config loads end-to-end (so it can't rot):
+/// its custom sources register, the `confirm_tab` (`<C-t>`) picker action exists,
+/// and `'switchbuf'` reads the `usetab` default.
+#[tokio::test]
+async fn example_ui_picker_config_loads() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/ui-picker");
+    let init = ServerInit {
+        config_dir: Some(root.clone()),
+        runtimepath: vec![root],
+        ..Default::default()
+    };
+    let (rpc, _incoming) = spawn(init);
+    attach(&rpc, 80, 24).await;
+    let ok = exec_lua(
+        &rpc,
+        r#"return tostring(nx.picker._sources.preview ~= nil)
+             .. "|" .. type(nx.picker.actions.confirm_tab)
+             .. "|" .. tostring(nx.o.switchbuf)"#,
+    )
+    .await;
+    assert_eq!(
+        ok.as_str(),
+        Some("true|function|usetab"),
+        "example loaded: preview source + confirm_tab action + switchbuf=usetab default"
+    );
+}
+
 /// Phase 5: `<Tab>` multi-selects picker rows (marking them and advancing), the
 /// marks project into the `menu` redraw, and `<C-q>` then sends **only the marked**
 /// rows to the location list (telescope's send-selected). The marks survive even if

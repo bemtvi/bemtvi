@@ -36,6 +36,7 @@ In the open picker (all of these are rebindable — see [Keys](#keys)):
 | `<C-n>` / `<Down>` | Next item |
 | `<C-p>` / `<Up>` | Previous item |
 | `<CR>` | Confirm — run the source's action on the highlighted item |
+| `<C-t>` | Confirm in a **new tab** — open the highlighted item in a fresh tab |
 | `<Esc>` | Cancel |
 | `<Tab>` / `<S-Tab>` | Multi-select — mark/unmark this row and advance (see [Sending results to a list](#sending-results-to-a-list)) |
 | `<C-q>` | Send the results (marked, else all filtered) to a location list |
@@ -105,8 +106,22 @@ nx.picker.source({
 })
 ```
 
-`nx.picker.edit(item)` is the common confirm action: it opens `item.path` and, if
-the item carries a 1-based `row` (and optional `col`), jumps the cursor there.
+`nx.picker.edit(item, mode)` is the common confirm action: it opens `item.path`
+and, if the item carries a 1-based `row` (and optional `col`), jumps the cursor
+there. The `mode` is the confirm gesture (the picker passes it to
+`confirm(item, mode)`): `"current"` opens in the focused window honoring
+[`'switchbuf'`](#switching-to-an-open-tab); `"tab"` (the default `<C-t>`) opens in
+a new tab. Forward it from a custom source's `confirm` to support `<C-t>`:
+`confirm = function(item, mode) nx.picker.edit(item, mode) end`.
+
+### Switching to an open tab
+
+Where a confirmed pick (and every jump — LSP go-to, quickfix, marks) **lands** is
+governed by `'switchbuf'`. nxvim defaults it to `usetab`: opening a buffer already
+shown in another tab focuses that tab instead of re-opening it in the current
+window. Set it like vim — `nx.o.switchbuf = "useopen"` (reuse a window in the
+current tab only) or `nx.o.switchbuf = ""` (classic: always open in the current
+window). `<C-t>` always makes a new tab regardless (an explicit tab gesture).
 
 The widget windows its rendering and matches incrementally, so a source can
 stream **100k+ candidates** and stay fast; `max_results` (default 100000) is only

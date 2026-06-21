@@ -16,7 +16,11 @@
 --   type            edit the query (the document is NOT touched)
 --   <C-n> / <C-p>   move the selection down / up (also <Down> / <Up>)
 --   <CR>            confirm — runs the source's action on the highlighted item
+--   <C-t>           open the highlighted item in a NEW TAB (telescope's select_tab)
 --   <Esc>           cancel
+--
+-- Picker keys are ordinary `picker`-mode maps, so rebind any of them — e.g. the
+-- default tab key is `nx.keymap.set("picker", "<C-t>", nx.picker.actions.confirm_tab)`.
 --
 -- Sources are thin: they STREAM candidates via `ctx.push`, signal completion by
 -- returning (an `nx.async` source returns its promise; nx is promise-only — no
@@ -51,6 +55,15 @@ end)
 nx.keymap.set("n", "<leader>fG", function()
   nx.picker.open("live_grep", { debounce = 100 })
 end)
+
+-- Where a confirmed pick LANDS is governed by 'switchbuf'. nxvim defaults it to
+-- `usetab`: picking (or any jump to) a buffer ALREADY shown in another tab focuses
+-- that tab instead of re-opening it in the current window. Try it: \fb a file, hit
+-- <C-t> to drop it in a new tab, switch back (`gT`), \fb that same file again with
+-- <CR> — focus jumps to the tab already showing it. Tune it like vim:
+--   nx.o.switchbuf = "usetab"   -- the default; also "useopen" (current tab only)
+--   nx.o.switchbuf = ""         -- classic: always open in the current window
+-- (<C-t> always makes a NEW tab regardless — it is an explicit tab gesture.)
 
 --------------------------------------------------------------------------------
 -- 2. A custom STATIC source — a fixed list, fuzzy-matched in Rust as you type.
@@ -152,4 +165,4 @@ nx.keymap.set("n", "<leader>fp", function()
   nx.picker.open("preview")
 end)
 
-nx.notify("nx.picker playground — try \\ff \\fg \\fb \\fc \\fe \\fp")
+nx.notify("nx.picker playground — try \\ff \\fg \\fb \\fc \\fe \\fp (and <C-t> in any picker)")

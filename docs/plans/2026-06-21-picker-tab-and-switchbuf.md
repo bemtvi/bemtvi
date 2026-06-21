@@ -1,6 +1,6 @@
 # Picker `<C-t>` open-in-tab + `'switchbuf'`-aware jumps
 
-Status: planned — 2026-06-21
+Status: implemented — 2026-06-21 (all four phases landed)
 
 ## Context
 

@@ -53,6 +53,12 @@ pub(crate) struct LspDocState {
     version: i32,
     /// `changedtick` of the last sync we sent (drives `didChange`).
     last_tick: u64,
+    /// The document text the server currently holds — what we last sent it (full at
+    /// `didOpen`, then advanced by each `didChange`). Incremental syncs replay the
+    /// journaled edits over this to compute correct per-encoding positions, then it
+    /// matches the buffer again; a full/resync push resets it to the whole text.
+    /// (neovim's `prev_lines`.) See [`incremental_changes_against`].
+    shadow: String,
     /// `save_tick` of the last sync, mirrored to fire `didSave` exactly when the
     /// buffer is written (`save_tick` bumps only on a successful `:w`).
     last_save_tick: u64,
@@ -395,26 +401,66 @@ pub(crate) fn lsp_position_in(
     }
 }
 
-/// Convert a batch of journaled byte-delta edits in `buffer` into LSP incremental
-/// content changes (each replacing the edit's old `(start..old_end)` range with
-/// its inserted text, in `encoding`) — the buffer-addressed form of the
-/// current-buffer conversion `sync_lsp` does inline.
-pub(crate) fn incremental_changes_in(
-    buffer: &Buffer,
+/// Convert a batch of journaled byte-delta edits into LSP incremental content
+/// changes by replaying them over `shadow` — the text the server *currently*
+/// holds (its last-synced view) — which `shadow` is mutated to match the buffer.
+///
+/// Each LSP change's range describes the document as it was *before* that change
+/// applied (the changes apply sequentially, server-side). The journaled byte
+/// offsets are exactly those intermediate coordinates, so converting them against
+/// `shadow` — and advancing `shadow` by each edit as we go — yields positions in
+/// the right text at each step. This is the only correct way under UTF-16/UTF-32:
+/// the byte→code-unit conversion needs the line as it stood *before* the edit, and
+/// `shadow` still has it (converting against the post-edit buffer would clamp a
+/// shortened line's later columns and corrupt the range — `balance`→`aa`⇒`aae`).
+/// It is neovim's `prev_lines` approach, specialized to explicit edits rather than
+/// a recomputed diff, so it stays incremental in every encoding. The caller keeps
+/// `shadow` across syncs (seeded at `didOpen`, reset on a full/resync push).
+pub(crate) fn incremental_changes_against(
+    shadow: &mut String,
     edits: &[BufferEdit],
     encoding: PositionEncoding,
 ) -> Vec<TextDocumentContentChangeEvent> {
-    edits
-        .iter()
-        .map(|e| TextDocumentContentChangeEvent {
+    let mut changes = Vec::with_capacity(edits.len());
+    for e in edits {
+        let start = e.start_byte.min(shadow.len());
+        let end = e.old_end_byte.min(shadow.len()).max(start);
+        changes.push(TextDocumentContentChangeEvent {
             range: Some(Range {
-                start: lsp_position_in(buffer, encoding, e.start_point.0, e.start_point.1),
-                end: lsp_position_in(buffer, encoding, e.old_end_point.0, e.old_end_point.1),
+                start: shadow_position(shadow, start, encoding),
+                end: shadow_position(shadow, end, encoding),
             }),
             range_length: None,
             text: e.text.clone(),
-        })
-        .collect()
+        });
+        shadow.replace_range(start..end, &e.text);
+    }
+    changes
+}
+
+/// An absolute byte offset in `shadow` as an LSP [`Position`] in `encoding` — the
+/// shadow-addressed sibling of [`lsp_position_in`], used by
+/// [`incremental_changes_against`]. Resolves the line, then the column the chosen
+/// encoding wants from the line's own text (UTF-8 byte = identity).
+fn shadow_position(shadow: &str, byte: usize, encoding: PositionEncoding) -> Position {
+    let byte = byte.min(shadow.len());
+    let prefix = &shadow[..byte];
+    let line = prefix.bytes().filter(|b| *b == b'\n').count();
+    let line_start = prefix.rfind('\n').map_or(0, |i| i + 1);
+    let line_end = shadow[line_start..]
+        .find('\n')
+        .map_or(shadow.len(), |i| line_start + i);
+    let col = byte - line_start;
+    let line_text = &shadow[line_start..line_end];
+    let character = match encoding {
+        PositionEncoding::Utf8 => col,
+        PositionEncoding::Utf16 => unicode::byte_to_utf16(line_text, col),
+        PositionEncoding::Utf32 => line_text[..col.min(line_text.len())].chars().count(),
+    };
+    Position {
+        line: line as u32,
+        character: character as u32,
+    }
 }
 
 /// Byte offset of LSP `character` on `line`, the inverse of [`EditHost::lsp_position`]

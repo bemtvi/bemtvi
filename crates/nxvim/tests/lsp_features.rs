@@ -61,6 +61,74 @@ async fn poll_menu_items(
     None
 }
 
+/// Byte offset of an (ASCII) LSP `(line, character)` position in `text`, clamped to
+/// the line — the test-side inverse used to replay an incremental `didChange`.
+fn pos_to_byte(text: &str, line: u64, ch: u64) -> usize {
+    let mut starts = vec![0usize];
+    for (i, b) in text.bytes().enumerate() {
+        if b == b'\n' {
+            starts.push(i + 1);
+        }
+    }
+    let l = line as usize;
+    let Some(&base) = starts.get(l) else {
+        return text.len();
+    };
+    let line_end = starts.get(l + 1).copied().unwrap_or(text.len());
+    (base + ch as usize).min(line_end)
+}
+
+/// Replay every `textDocument/didChange` the client recorded onto `original`,
+/// reconstructing the document as the *server* sees it, and report whether any
+/// change was a whole-document (range-less) replacement. Diverging from the real
+/// buffer means we sent a bad incremental sync (the server would diagnose phantom
+/// text); a range-less change means we fell back to full-text sync. ASCII-only (so
+/// an LSP character index is a byte index).
+fn replay_server_changes(original: &str, record_path: &Path) -> (String, bool) {
+    let content = std::fs::read_to_string(record_path).unwrap_or_default();
+    let mut doc = original.to_string();
+    let mut any_full = false;
+    for line in content.lines() {
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        if v.get("method").and_then(serde_json::Value::as_str) != Some("textDocument/didChange") {
+            continue;
+        }
+        let Some(changes) = v
+            .pointer("/params/contentChanges")
+            .and_then(|c| c.as_array())
+        else {
+            continue;
+        };
+        for ch in changes {
+            let text = ch
+                .get("text")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("");
+            match ch.get("range") {
+                Some(range) => {
+                    let g = |p: &str| {
+                        range
+                            .pointer(p)
+                            .and_then(serde_json::Value::as_u64)
+                            .unwrap_or(0)
+                    };
+                    let s = pos_to_byte(&doc, g("/start/line"), g("/start/character"));
+                    let e = pos_to_byte(&doc, g("/end/line"), g("/end/character"));
+                    doc.replace_range(s..e, text);
+                }
+                // A `range`-less change is a whole-document replacement (FULL sync).
+                None => {
+                    any_full = true;
+                    doc = text.to_string();
+                }
+            }
+        }
+    }
+    (doc, any_full)
+}
+
 /// Write a mock LSP script and point `$NXVIM_LSP_CMD` at the binary's
 /// `--__lsp-mock` mode. The caller holds `serial_lock`.
 fn arm_mock(dir: &Path, script: &str) {
@@ -629,6 +697,92 @@ async fn undo_of_a_rename_restores_the_pre_rename_cursor() {
         4,
         "undo should restore the cursor to the symbol, not the top of the file"
     );
+}
+
+/// After a multi-occurrence rename, the `didChange` stream we send must reconstruct
+/// *exactly* the renamed buffer on the server side — otherwise the server diagnoses
+/// phantom text. The classic failure is a UTF-16 server (rust-analyzer's default):
+/// the journaled byte deltas were converted to code-unit columns against the
+/// post-edit buffer, clamping a shortened line's later deltas, so `balance` → `aa`
+/// left the server seeing `aae`. Verified under both negotiated encodings.
+async fn check_rename_sync_round_trips(encoding: &str) {
+    let _guard = serial_lock().lock().await;
+    let dir = temp_dir(&format!(
+        "lsp_features_rename_sync_{}",
+        encoding.replace('-', "")
+    ));
+    let uri = file_uri(&dir, "a.rs");
+    let record = dir.join("rec.jsonl");
+    // Rename both `balance` occurrences → `aa`: line 0 (char 4..11) and line 1
+    // (char 9..16, inside `fn f() { balance }`).
+    arm_mock(
+        &dir,
+        &format!(
+            r#"{{
+                "record": "{rec}",
+                "position_encoding": "{encoding}",
+                "rename": {{
+                    "changes": {{
+                        "{uri}": [
+                            {{
+                                "range": {{ "start": {{ "line": 0, "character": 4 }}, "end": {{ "line": 0, "character": 11 }} }},
+                                "newText": "aa"
+                            }},
+                            {{
+                                "range": {{ "start": {{ "line": 1, "character": 9 }}, "end": {{ "line": 1, "character": 16 }} }},
+                                "newText": "aa"
+                            }}
+                        ]
+                    }}
+                }}
+            }}"#,
+            rec = record.display(),
+        ),
+    );
+    let original = "let balance = 1\nfn f() { balance }\n";
+    let (rpc, _incoming) = open_with_server(&dir, original).await;
+    assert!(
+        await_lua_eq(&rpc, "#nx.lsp.clients({ bufnr = 0 })", "1").await,
+        "the mock server should attach"
+    );
+
+    exec_lua(&rpc, "nx.lsp.rename('aa')").await;
+    let mut renamed = false;
+    for _ in 0..80 {
+        nxvim_test_harness::barrier(&rpc).await;
+        if lines(&rpc).await.first().map(String::as_str) == Some("let aa = 1") {
+            renamed = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert!(renamed, "rename should rewrite both occurrences");
+    // Let the post-rename `didChange` flush to the mock's record file.
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    nxvim_test_harness::barrier(&rpc).await;
+
+    let buffer_text = format!("{}\n", lines(&rpc).await.join("\n"));
+    let (server_view, any_full) = replay_server_changes(original, &record);
+    assert_eq!(
+        server_view, buffer_text,
+        "[{encoding}] the server's reconstructed document must match the buffer after the rename"
+    );
+    // The fix must stay *incremental* (neovim-style shadow), not fall back to
+    // shipping the whole document on every change — including under UTF-16.
+    assert!(
+        !any_full,
+        "[{encoding}] the rename should sync as incremental ranged edits, not a full-document replacement"
+    );
+}
+
+#[tokio::test]
+async fn rename_sync_round_trips_utf16() {
+    check_rename_sync_round_trips("utf-16").await;
+}
+
+#[tokio::test]
+async fn rename_sync_round_trips_utf8() {
+    check_rename_sync_round_trips("utf-8").await;
 }
 
 /// A whole-document format (one edit spanning the cursor) must leave the cursor on

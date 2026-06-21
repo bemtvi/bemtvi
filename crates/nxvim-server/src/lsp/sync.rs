@@ -309,6 +309,9 @@ impl EditHost {
             // drained independently when the editor queries highlights).
             let _ = self.editor.buffer_mut().take_lsp_edits();
             let text = self.editor.buffer().text.to_string();
+            // Seed the sync shadow: this is exactly the text the server now holds, so
+            // later incremental `didChange`s replay their deltas over it.
+            state.shadow.clone_from(&text);
             state.version = 1;
             let language_id = state.language_id.clone();
             self.fx.lsp_notify(
@@ -330,17 +333,13 @@ impl EditHost {
         } else if tick_changed && sync_kind != TextDocumentSyncKind::NONE {
             let batch = self.editor.buffer_mut().take_lsp_edits();
             state.version += 1;
-            // Full sync (server's choice, or a whole-rope replacement where deltas
-            // are meaningless) sends the entire text; otherwise incremental deltas.
-            let changes = if batch.resync || sync_kind == TextDocumentSyncKind::FULL {
-                vec![TextDocumentContentChangeEvent {
-                    range: None,
-                    range_length: None,
-                    text: self.editor.buffer().text.to_string(),
-                }]
-            } else {
-                incremental_changes_in(self.editor.buffer(), &batch.edits, encoding)
-            };
+            let changes = Self::did_change_content(
+                self.editor.buffer(),
+                &mut state.shadow,
+                &batch,
+                sync_kind,
+                encoding,
+            );
             self.fx.lsp_notify(
                 key.clone(),
                 LspNotify::DidChange {
@@ -421,21 +420,9 @@ impl EditHost {
             .buffer_of(id)
             .map(|b| b.changedtick)
             .unwrap_or(0);
-        let changes = if batch.resync || sync_kind == TextDocumentSyncKind::FULL {
-            let text = self
-                .editor
-                .buffer_of(id)
-                .map(|b| b.text.to_string())
-                .unwrap_or_default();
-            vec![TextDocumentContentChangeEvent {
-                range: None,
-                range_length: None,
-                text,
-            }]
-        } else {
-            let buffer = self.editor.buffer_of(id).unwrap();
-            incremental_changes_in(buffer, &batch.edits, encoding)
-        };
+        let buffer = self.editor.buffer_of(id).unwrap();
+        let shadow = &mut self.lsp_states.get_mut(&id).unwrap().shadow;
+        let changes = Self::did_change_content(buffer, shadow, &batch, sync_kind, encoding);
         let version = {
             let state = self.lsp_states.get_mut(&id).unwrap();
             state.version += 1;
@@ -450,6 +437,39 @@ impl EditHost {
                 changes,
             },
         );
+    }
+
+    /// The `didChange` content for a drained `batch` against `buffer`: incremental
+    /// deltas only when they are provably faithful, else a whole-document
+    /// replacement.
+    ///
+    /// Incremental changes are journaled byte deltas, converted to LSP positions at
+    /// *sync* time. Incremental deltas replay the journaled edits over `shadow` —
+    /// the text the server currently holds — which converts each delta's columns
+    /// against the line as it stood *before* that edit (correct in any encoding) and
+    /// advances `shadow` to match the buffer. This stays incremental even under
+    /// UTF-16/UTF-32, where converting against the *post-edit* buffer would clamp a
+    /// shortened line's later columns and corrupt the range (`balance`→`aa`⇒`aae`).
+    /// A `resync` batch (whole-rope replace) or a server that asked for `FULL` sync
+    /// sends the whole text and reseeds `shadow` to it.
+    fn did_change_content(
+        buffer: &nxvim_core::Buffer,
+        shadow: &mut String,
+        batch: &nxvim_core::EditBatch,
+        sync_kind: TextDocumentSyncKind,
+        encoding: PositionEncoding,
+    ) -> Vec<TextDocumentContentChangeEvent> {
+        if batch.resync || sync_kind == TextDocumentSyncKind::FULL {
+            let text = buffer.text.to_string();
+            shadow.clone_from(&text);
+            vec![TextDocumentContentChangeEvent {
+                range: None,
+                range_length: None,
+                text,
+            }]
+        } else {
+            incremental_changes_against(shadow, &batch.edits, encoding)
+        }
     }
 
     /// Fire `LspAttach` for the just-attached current buffer with the server's

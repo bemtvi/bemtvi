@@ -1332,6 +1332,20 @@ impl Editor {
         self.land_cursor(line, col);
     }
 
+    /// Open `path` in a **new tab** and land the cursor at the 0-based
+    /// `(line, byte col)` — the picker's `<C-t>` (`confirm_tab`) on a located item.
+    /// An explicit tab gesture, so it ignores `'switchbuf'` (always a fresh tab),
+    /// mirroring `:tabedit`'s find-or-load ([`Editor::open_buffer`], off-tick aware)
+    /// + [`Editor::new_tab`]; a failed synchronous load still opens an empty tab.
+    pub fn jump_to_tab(&mut self, path: &Path, line: usize, col: usize) {
+        let options = self.windows.cur().options.clone();
+        let buf = self
+            .open_buffer(path)
+            .unwrap_or_else(|| self.add_buffer(Buffer::empty()));
+        self.new_tab(buf, options);
+        self.land_cursor(line, col);
+    }
+
     /// Open `path` honoring `'switchbuf'`: if a window already shows its buffer in a
     /// tab we may reuse ([`Editor::switchbuf_window`] — any tab for `usetab`, the
     /// current tab for `useopen`), focus that window (switching tabs as needed) and

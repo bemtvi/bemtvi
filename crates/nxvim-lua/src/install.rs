@@ -1339,12 +1339,18 @@ pub(crate) fn install_runtime_api(
     let sh = shared.clone();
     nx.set(
         "_jump_to",
-        lua.create_function(move |_, (path, line, col): (String, usize, usize)| {
-            sh.borrow_mut()
-                .window_ops
-                .push(WindowOp::Jump { path, line, col });
-            Ok(())
-        })?,
+        lua.create_function(
+            move |_, (path, line, col, mode): (String, usize, usize, Option<String>)| {
+                let new_tab = mode.as_deref() == Some("tab");
+                sh.borrow_mut().window_ops.push(WindowOp::Jump {
+                    path,
+                    line,
+                    col,
+                    new_tab,
+                });
+                Ok(())
+            },
+        )?,
     )?;
     let sh = shared.clone();
     nx.set(

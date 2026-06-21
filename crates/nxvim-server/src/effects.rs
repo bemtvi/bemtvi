@@ -1298,11 +1298,22 @@ impl EditHost {
                 let id = resolve_win(self, win);
                 self.editor.set_window_cursor(id, line, col);
             }
-            WindowOp::Jump { path, line, col } => {
-                // Always navigates the *current* window (the picker has closed and
-                // returned focus by confirm time), reusing an open buffer without a
-                // reload/modified guard — see the op's doc comment.
-                self.editor.jump_to(std::path::Path::new(&path), line, col);
+            WindowOp::Jump {
+                path,
+                line,
+                col,
+                new_tab,
+            } => {
+                // The picker has closed and returned focus by confirm time. `new_tab`
+                // (the `<C-t>` gesture) opens a fresh tab; otherwise navigate the
+                // current window honoring 'switchbuf' — reusing an open buffer without a
+                // reload/modified guard. See the op's doc comment.
+                let p = std::path::Path::new(&path);
+                if new_tab {
+                    self.editor.jump_to_tab(p, line, col);
+                } else {
+                    self.editor.jump_to(p, line, col);
+                }
             }
             WindowOp::OpenSwitchbuf { path } => {
                 // Open honoring 'switchbuf' (the picker's location-less file confirm);
@@ -2719,7 +2730,14 @@ impl EditHost {
                     self.apply_lua_effects();
                 } else if self.picker_active {
                     self.picker_active = false;
-                    if let Err(e) = self.lua.run_picker_result(result) {
+                    // The confirm gesture's open mode (default `<C-t>` ⇒ a new tab).
+                    // Taken per-result so it never leaks into the next confirm.
+                    let mode = if std::mem::take(&mut self.editor.picker_confirm_in_tab) {
+                        "tab"
+                    } else {
+                        "current"
+                    };
+                    if let Err(e) = self.lua.run_picker_result(result, mode) {
                         self.editor
                             .echo(format!("E5108: Error in nx.picker confirm: {e}"));
                     }

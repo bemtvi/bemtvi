@@ -38,6 +38,7 @@ for _, name in ipairs({
   "next",
   "prev",
   "confirm",
+  "confirm_tab",
   "cancel",
   "preview_half_down",
   "preview_half_up",
@@ -68,6 +69,7 @@ for _, m in ipairs({
   { "<C-p>", "prev", "Previous item" },
   { "<Up>", "prev", "Previous item" },
   { "<CR>", "confirm", "Confirm selection" },
+  { "<C-t>", "confirm_tab", "Open in a new tab" },
   { "<Esc>", "cancel", "Cancel" },
   { "<C-d>", "preview_half_down", "Preview half-page down" },
   { "<C-u>", "preview_half_up", "Preview half-page up" },
@@ -365,7 +367,11 @@ end
 -- nx._picker_result(key): the picker resolved. `key` (an integer) confirms the
 -- item under that key for the current generation; `nil` cancels. Either way the
 -- active picker is cleared (and a pending job reaped).
-function nx._picker_result(key)
+-- `mode` is the confirm gesture's open mode — "current" (the focused window) or
+-- "tab" (the default `<C-t>` ⇒ a new tab) — forwarded to `source.confirm(item,
+-- mode)`. Built-in sources honor it (see `nx.picker.edit`); a source that ignores
+-- the second arg simply opens in the current window, as before.
+function nx._picker_result(key, mode)
   local p = nx._picker
   nx._picker = nil
   if not p then
@@ -378,7 +384,7 @@ function nx._picker_result(key)
   end
   local item = p.items[key]
   if item and p.source.confirm then
-    local ok, err = pcall(p.source.confirm, item)
+    local ok, err = pcall(p.source.confirm, item, mode)
     if not ok then
       nx.notify("nx.picker: confirm error: " .. tostring(err), "error")
     end
@@ -436,9 +442,15 @@ end
 -- relative one. `nx._jump_to` reuses the open buffer cwd-aware and skips the
 -- modified guard, so selecting a symbol in the file you're editing just moves the
 -- cursor. A location-less item (the `files` source) is a plain open instead.
-function nx.picker.edit(item)
-  if item.row then
-    nx._jump_to(item.path, item.row - 1, math.max(0, (item.col or 1) - 1))
+-- `mode == "tab"` (the picker's `<C-t>`) opens the item in a NEW tab regardless of
+-- `'switchbuf'` (an explicit tab gesture); otherwise the open honors `'switchbuf'`.
+function nx.picker.edit(item, mode)
+  local col = math.max(0, (item.col or 1) - 1)
+  if mode == "tab" then
+    -- A fresh tab for the file; located items land the cursor, plain opens at the top.
+    nx._jump_to(item.path, item.row and (item.row - 1) or 0, item.row and col or 0, "tab")
+  elseif item.row then
+    nx._jump_to(item.path, item.row - 1, col)
   else
     -- Open honoring 'switchbuf' (a file already shown in another tab is focused
     -- there under the default `usetab`), not a plain `:edit` into this window.
@@ -471,8 +483,8 @@ nx.picker.source({
       end
     end
   end),
-  confirm = function(item)
-    nx.picker.edit(item)
+  confirm = function(item, mode)
+    nx.picker.edit(item, mode)
   end,
 })
 
@@ -504,8 +516,8 @@ nx.picker.source({
       end
     end
   end),
-  confirm = function(item)
-    nx.picker.edit(item)
+  confirm = function(item, mode)
+    nx.picker.edit(item, mode)
   end,
 })
 
@@ -531,10 +543,17 @@ nx.picker.source({
       end
     end
   end,
-  confirm = function(item)
-    -- Honor 'switchbuf': a buffer already shown in another tab is focused there
-    -- (the default `usetab`), rather than swapped into the current window.
-    nx._buf_switch(item.bufnr)
+  confirm = function(item, mode)
+    if mode == "tab" then
+      -- `<C-t>`: show the buffer in a NEW tab (a fresh tab then swap the buffer in,
+      -- reusing the throwaway [No Name] `:tabnew` creates).
+      vim.cmd("tabnew")
+      vim.cmd("buffer " .. item.bufnr)
+    else
+      -- Honor 'switchbuf': a buffer already shown in another tab is focused there
+      -- (the default `usetab`), rather than swapped into the current window.
+      nx._buf_switch(item.bufnr)
+    end
   end,
 })
 

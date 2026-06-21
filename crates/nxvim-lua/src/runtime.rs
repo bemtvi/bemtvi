@@ -1554,14 +1554,17 @@ impl LuaRuntime {
     /// **`key`** (the 1-based wrapper index — `Some`) confirms, `nil` (`None`)
     /// cancels (`nx._picker_result`). The wrapper resolves `key` to the original
     /// item and calls the source's `confirm(item)`, then clears the active picker.
-    pub fn run_picker_result(&self, key: Option<usize>) -> mlua::Result<()> {
+    /// `mode` is the confirm gesture's open mode — `"current"` (open in the focused
+    /// window) or `"tab"` (the default `<C-t>` ⇒ a new tab) — forwarded to the
+    /// source's `confirm(item, mode)`.
+    pub fn run_picker_result(&self, key: Option<usize>, mode: &str) -> mlua::Result<()> {
         let nx = self.nx()?;
         let run: mlua::Function = nx.get("_picker_result")?;
         let arg = match key {
             Some(k) => mlua::Value::Integer(lua_int(k as i64)),
             None => mlua::Value::Nil,
         };
-        run.call::<()>((arg,))
+        run.call::<()>((arg, mode))
     }
 
     /// Deliver the picker's "send these results to a list" outcome: the matched item

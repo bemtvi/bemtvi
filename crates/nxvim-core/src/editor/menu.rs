@@ -1102,12 +1102,15 @@ impl Editor {
         // Confirm / cancel don't fit the shared `menu.as_mut()` nav block (they push a
         // result + close), so handle them first.
         match action {
-            "confirm" => {
+            "confirm" | "confirm_tab" => {
                 let chosen = self.menu.as_ref().and_then(|m| {
                     (m.cursor < m.view_len()).then(|| m.all_items[m.item_at(m.cursor)].key)
                 });
                 // A picker with no matches under the current query confirms nothing.
                 if let Some(key) = chosen {
+                    // `confirm_tab` (default `<C-t>`) opens the chosen item in a new tab;
+                    // the server reads this flag when it routes the result to Lua.
+                    self.picker_confirm_in_tab = action == "confirm_tab";
                     self.menu_results.push(Some(key));
                     self.close_menu();
                 }

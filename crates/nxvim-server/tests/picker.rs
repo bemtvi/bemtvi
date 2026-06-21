@@ -1825,3 +1825,100 @@ nx.picker.source {{
     );
     assert_eq!(cur_buf(&rpc).await, zebra_buf);
 }
+
+// ----- Phase 3: <C-t> opens the selection in a new tab ----------------------
+
+/// `<C-t>` on a `buffers` entry opens that buffer in a **new** tab — even when the
+/// buffer is already shown elsewhere (the explicit tab gesture bypasses
+/// `'switchbuf'`).
+#[tokio::test]
+async fn ctrl_t_opens_a_buffer_in_a_new_tab() {
+    let dir = temp_dir("picker_ctrl_t_buf");
+    let (rpc, mut incoming) = start(&dir, "").await;
+    let (_d, _zebra, _mango, zebra_buf) =
+        two_tabs_two_buffers(&rpc, "picker_ctrl_t_buf_files").await;
+
+    exec_lua(&rpc, "nx.picker.open('buffers')").await;
+    poll_menu(&rpc, &mut incoming).await.expect("menu opens");
+    feed(&rpc, "zebra"); // zebra is already shown in tab 1
+    poll_menu(&rpc, &mut incoming).await;
+    feed(&rpc, "<C-t>");
+    nxvim_test_harness::barrier(&rpc).await;
+
+    assert_eq!(tab_count(&rpc).await, 3, "<C-t> opened a third tab");
+    assert_eq!(cur_tab(&rpc).await, 3, "the new tab is focused");
+    assert_eq!(
+        cur_buf(&rpc).await,
+        zebra_buf,
+        "the new tab shows the picked buffer"
+    );
+}
+
+/// `<C-t>` on a located item opens its file in a new tab with the cursor on the
+/// item's row/col.
+#[tokio::test]
+async fn ctrl_t_opens_a_located_item_in_a_new_tab() {
+    let dir = temp_dir("picker_ctrl_t_loc");
+    let file = dir.join("locfile.txt");
+    std::fs::write(&file, "one\ntwo\nthree\nfour\n").expect("write file");
+    let src = format!(
+        r#"
+nx.picker.source {{
+  name = "locs",
+  items = function(ctx)
+    ctx.push {{ text = "to three", path = "{f}", row = 3, col = 2 }}
+  end,
+  confirm = function(item, mode) nx.picker.edit(item, mode) end,
+}}
+"#,
+        f = file.display(),
+    );
+    let (rpc, mut incoming) = start(&dir, &src).await;
+
+    exec_lua(&rpc, "nx.picker.open('locs')").await;
+    poll_menu(&rpc, &mut incoming).await.expect("menu opens");
+    feed(&rpc, "<C-t>");
+    nxvim_test_harness::barrier(&rpc).await;
+
+    assert_eq!(tab_count(&rpc).await, 2, "<C-t> opened a second tab");
+    assert_eq!(cur_tab(&rpc).await, 2, "the new tab is focused");
+    assert_eq!(
+        lines(&rpc).await,
+        vec!["one", "two", "three", "four"],
+        "the new tab shows the file"
+    );
+    // cursor() reports (1-based row, 0-based col); 1-based col=2 lands at 1.
+    assert_eq!(cursor(&rpc).await, (3, 1), "the cursor landed on the item");
+}
+
+/// `<CR>` is unaffected by the new `<C-t>` mode — it still opens in the current
+/// window (a guard that the per-confirm mode resets, not leaks).
+#[tokio::test]
+async fn cr_still_opens_in_the_current_window_after_adding_ctrl_t() {
+    let dir = temp_dir("picker_cr_guard");
+    let file = dir.join("crfile.txt");
+    std::fs::write(&file, "x\ny\n").expect("write file");
+    let src = format!(
+        r#"
+nx.picker.source {{
+  name = "openone",
+  items = function(ctx) ctx.push {{ text = "x", path = "{f}" }} end,
+  confirm = function(item) nx.picker.edit(item) end,
+}}
+"#,
+        f = file.display(),
+    );
+    let (rpc, mut incoming) = start(&dir, &src).await;
+
+    exec_lua(&rpc, "nx.picker.open('openone')").await;
+    poll_menu(&rpc, &mut incoming).await.expect("menu opens");
+    feed(&rpc, "<CR>");
+    nxvim_test_harness::barrier(&rpc).await;
+
+    assert_eq!(tab_count(&rpc).await, 1, "<CR> opens no new tab");
+    assert_eq!(
+        lines(&rpc).await,
+        vec!["x", "y"],
+        "the file opened in place"
+    );
+}

@@ -913,3 +913,113 @@ async fn bdelete_does_not_close_a_tab_with_other_buffers_in_a_split() {
     let _ = std::fs::remove_file(&a);
     let _ = std::fs::remove_file(&b);
 }
+
+// ----- `'switchbuf'` (useopen / usetab) honored on jumps --------------------
+
+/// Run a Lua chunk, then a barrier so any queued window op (e.g. `nx._jump_to`)
+/// has been applied before the test asserts.
+async fn lua_sync(rpc: &Rpc, code: &str) {
+    exec_lua(rpc, code).await;
+    req(rpc, "nvim_get_mode", vec![]).await;
+}
+
+/// A located jump (`nx._jump_to`) to a buffer already shown in another tab
+/// switches to that tab — the default `'switchbuf'` is `usetab`.
+#[tokio::test]
+async fn jump_with_usetab_switches_to_the_tab_already_showing_the_buffer() {
+    let a = temp_file("swb_usetab_a", "alpha\nbeta\ngamma\n");
+    let b = temp_file("swb_usetab_b", "one\ntwo\n");
+    let (rpc, _incoming) = start().await;
+
+    feed_sync(&rpc, &format!(":edit {a}<CR>")).await; // tab 1 shows A
+    let a_buf = cur_buf(&rpc).await;
+    feed_sync(&rpc, &format!(":tabedit {b}<CR>")).await; // tab 2 shows B (focused)
+    assert_eq!(cur_tab(&rpc).await, 2);
+
+    // The default 'switchbuf' is usetab, so a jump to A (open in tab 1) follows it.
+    lua_sync(&rpc, &format!("nx._jump_to([[{a}]], 2, 0)")).await;
+
+    assert_eq!(
+        tab_order(&rpc).await,
+        vec![1, 2],
+        "usetab jump opens no new tab"
+    );
+    assert_eq!(
+        cur_tab(&rpc).await,
+        1,
+        "usetab jump focuses the tab already showing the buffer"
+    );
+    assert_eq!(cur_buf(&rpc).await, a_buf);
+    assert_eq!(
+        cur_cursor(&rpc).await.0,
+        3,
+        "the jump lands the cursor (row 3)"
+    );
+
+    let _ = std::fs::remove_file(&a);
+    let _ = std::fs::remove_file(&b);
+}
+
+/// `'switchbuf'=useopen` only reuses a window in the *current* tab; a buffer open
+/// solely in another tab is opened in the current window instead.
+#[tokio::test]
+async fn jump_with_useopen_stays_in_the_current_tab() {
+    let a = temp_file("swb_useopen_a", "alpha\nbeta\n");
+    let b = temp_file("swb_useopen_b", "one\ntwo\n");
+    let (rpc, _incoming) = start().await;
+
+    feed_sync(&rpc, &format!(":edit {a}<CR>")).await; // tab 1 shows A
+    let a_buf = cur_buf(&rpc).await;
+    feed_sync(&rpc, &format!(":tabedit {b}<CR>")).await; // tab 2 shows B (focused)
+    lua_sync(&rpc, "nx.o.switchbuf = 'useopen'").await;
+
+    lua_sync(&rpc, &format!("nx._jump_to([[{a}]], 0, 0)")).await;
+
+    assert_eq!(
+        cur_tab(&rpc).await,
+        2,
+        "useopen does not cross to another tab"
+    );
+    assert_eq!(
+        cur_buf(&rpc).await,
+        a_buf,
+        "the buffer opens in the current tab's window"
+    );
+
+    let _ = std::fs::remove_file(&a);
+    let _ = std::fs::remove_file(&b);
+}
+
+/// An empty `'switchbuf'` opens the jump in the current window even when the
+/// buffer is shown in another tab (the gating guard).
+#[tokio::test]
+async fn jump_with_empty_switchbuf_opens_in_current_window() {
+    let a = temp_file("swb_empty_a", "alpha\nbeta\n");
+    let b = temp_file("swb_empty_b", "one\ntwo\n");
+    let (rpc, _incoming) = start().await;
+
+    feed_sync(&rpc, &format!(":edit {a}<CR>")).await;
+    let a_buf = cur_buf(&rpc).await;
+    feed_sync(&rpc, &format!(":tabedit {b}<CR>")).await;
+    lua_sync(&rpc, "nx.o.switchbuf = ''").await;
+
+    lua_sync(&rpc, &format!("nx._jump_to([[{a}]], 0, 0)")).await;
+
+    assert_eq!(
+        cur_tab(&rpc).await,
+        2,
+        "no tab switch with empty 'switchbuf'"
+    );
+    assert_eq!(cur_buf(&rpc).await, a_buf);
+
+    let _ = std::fs::remove_file(&a);
+    let _ = std::fs::remove_file(&b);
+}
+
+/// `'switchbuf'` defaults to `usetab`.
+#[tokio::test]
+async fn switchbuf_defaults_to_usetab() {
+    let (rpc, _incoming) = start().await;
+    let v = exec_lua(&rpc, "return nx.o.switchbuf").await;
+    assert_eq!(v.as_str(), Some("usetab"), "default 'switchbuf' is usetab");
+}

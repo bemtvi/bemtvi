@@ -136,11 +136,13 @@ pub struct Options {
     /// comma-separated list of format parts; default [`DFLT_EFM`]. Global-only for
     /// now (vim's per-buffer `'errorformat'` lands with `:lmake`/buffer compilers).
     pub errorformat: String,
-    /// How a quickfix jump (`<CR>` / `:cc` / `:cnext`) chooses the window to land
-    /// in (`'switchbuf'`): a comma list of `useopen` (reuse a window already on the
-    /// target buffer), `usetab`, `split`, `vsplit`, `newtab`, `uselast`. Empty
-    /// (vim's default) reuses the window the quickfix list was opened from. Honored
-    /// by [`crate::editor::quickfix`]; `usetab` is not yet acted on.
+    /// How a jump (a quickfix `<CR>`/`:cc`/`:cnext`, an LSP go-to, a picker / mark
+    /// jump) chooses the window to land in (`'switchbuf'`): a comma list of
+    /// `useopen` (reuse a window in the *current* tab already on the target buffer),
+    /// `usetab` (reuse such a window in *any* tab, switching to it), `split`,
+    /// `vsplit`. nxvim defaults to `usetab` (vim's default is empty, reusing the
+    /// current window). Honored by [`Editor::jump_to`](crate::editor) and
+    /// [`crate::editor::quickfix`].
     pub switchbuf: String,
     /// The program `:make` runs (`'makeprg'`; default `make`). A `$*` in the value
     /// is replaced by `:make`'s arguments (else they are appended). Run through the
@@ -245,8 +247,9 @@ impl Default for Options {
             scrollback: 10_000,
             // The compiled-in gcc/make-aware errorformat.
             errorformat: DFLT_EFM.to_string(),
-            // Empty: a quickfix jump reuses the window the list was opened from.
-            switchbuf: String::new(),
+            // nxvim default: a jump to a buffer already shown in another tab switches
+            // to that tab (vim's default is empty — reuse the current window).
+            switchbuf: "usetab".to_string(),
             // The compiled-in `:make` / `:grep` programs and grep parser.
             makeprg: "make".to_string(),
             grepprg: "grep -n $* /dev/null".to_string(),
@@ -1266,7 +1269,7 @@ static OPTIONS: &[OptionInfo] = {
             abbrev: Some("swb"),
             kind: Str,
             scope: Global,
-            doc: "How to switch buffers for quickfix and jumps (useopen, split, …).",
+            doc: "How a jump picks its window (useopen, usetab, split, …).",
         },
         OptionInfo {
             name: "makeprg",

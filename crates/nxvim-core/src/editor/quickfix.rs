@@ -884,8 +884,9 @@ impl Editor {
     /// the display window, step to the code window: for the quickfix list the one
     /// `:copen` was invoked from (else any non-display window), for a location list
     /// its **owner** window (the loclist belongs to it). Then a `split`/`vsplit`
-    /// `'switchbuf'` value opens a new window for the jump. (`newtab`/`usetab` are
-    /// not yet acted on.)
+    /// `'switchbuf'` value opens a new window for the jump. (`useopen`/`usetab` are
+    /// acted on downstream by [`Editor::jump_to`], which this jump funnels through —
+    /// so a quickfix jump to a buffer already shown elsewhere reuses that window.)
     fn qf_focus_target_window(&mut self, which: QfWhich) {
         if self.is_quickfix_buffer() {
             let disp_win = self.qf_window_id(which);

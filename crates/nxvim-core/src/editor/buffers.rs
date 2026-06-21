@@ -1320,18 +1320,40 @@ impl Editor {
         if !already_current || line != self.cursor.line {
             self.record_jump_context();
         }
-        // Open-or-switch into the current window through the shared kernel (so a go-to
-        // reuses an already-open buffer, records the alternate `#`, and — in a daemon
-        // session — fetches the target over the wire off-tick). A failed *synchronous*
-        // load returns `None`; bail rather than land the cursor in a phantom buffer.
-        if !already_current && self.edit_in_current_window(path).is_none() {
+        // Open-or-switch through the `'switchbuf'`-aware kernel: a buffer already shown
+        // in another tab (`usetab`) / the current tab (`useopen`) is *focused* there
+        // rather than re-opened here; otherwise it edits in the current window (cwd-aware
+        // reuse, alternate `#`, off-tick wire fetch). A failed *synchronous* load returns
+        // `None`; bail rather than land the cursor in a phantom buffer.
+        if !already_current && self.open_path_switchbuf(path).is_none() {
             return;
         }
 
-        // Land the cursor at (line, byte col), clamped to the buffer. The whole
-        // position is rebuilt from a buffer byte index so it snaps to a grapheme
-        // boundary and a valid normal-mode resting cell, exactly like a search
-        // landing.
+        self.land_cursor(line, col);
+    }
+
+    /// Open `path` honoring `'switchbuf'`: if a window already shows its buffer in a
+    /// tab we may reuse ([`Editor::switchbuf_window`] — any tab for `usetab`, the
+    /// current tab for `useopen`), focus that window (switching tabs as needed) and
+    /// leave its cursor where it sits; otherwise edit it in the current window
+    /// ([`Editor::edit_in_current_window`]). Returns the buffer now shown, or `None`
+    /// on a failed synchronous load. The shared jump kernel behind every located
+    /// navigation ([`Editor::jump_to`]).
+    pub(crate) fn open_path_switchbuf(&mut self, path: &Path) -> Option<BufferId> {
+        if let Some(buf) = self.find_buffer_by_path(path) {
+            if let Some((tab_idx, win)) = self.switchbuf_window(buf) {
+                self.goto_tab_window(tab_idx, win);
+                return Some(buf);
+            }
+        }
+        self.edit_in_current_window(path)
+    }
+
+    /// Land the cursor at the 0-based `(line, byte col)`, clamped to the buffer and
+    /// snapped to a grapheme boundary / valid normal-mode resting cell (exactly like
+    /// a search landing). The cursor-positioning tail shared by [`Editor::jump_to`]
+    /// and [`Editor::jump_to_tab`].
+    fn land_cursor(&mut self, line: usize, col: usize) {
         let line = line.min(self.last_line());
         let byte = self.buffer().line_start(line) + col.min(self.buffer().line(line).len());
         self.set_cursor_char(byte);

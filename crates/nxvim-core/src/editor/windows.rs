@@ -1269,6 +1269,29 @@ impl Editor {
         None
     }
 
+    /// The `(tab index, window id)` a jump to `buf` should reuse per `'switchbuf'`,
+    /// or `None` to open in the current window. `usetab` reuses a window showing
+    /// `buf` in **any** tab (switching to it); `useopen` reuses one only in the
+    /// **current** tab; neither flag (or an empty `'switchbuf'`) means no reuse.
+    /// Built on [`Self::window_showing`] (which scans every tab). Backs the
+    /// `'switchbuf'` handling in [`Editor::open_path_switchbuf`] /
+    /// [`Editor::switch_to_buffer_switchbuf`].
+    pub(crate) fn switchbuf_window(&self, buf: BufferId) -> Option<(usize, WindowId)> {
+        let swb = &self.options.switchbuf;
+        let usetab = swb.split(',').any(|s| s.trim() == "usetab");
+        let useopen = swb.split(',').any(|s| s.trim() == "useopen");
+        if !usetab && !useopen {
+            return None;
+        }
+        let found = self.window_showing(buf)?;
+        // useopen alone is scoped to the current tab; usetab considers every tab.
+        if usetab || found.0 == self.main_tabs.current {
+            Some(found)
+        } else {
+            None
+        }
+    }
+
     /// Rebind window `id` to show buffer `buf` *without* changing focus
     /// (`nvim_win_set_buf`). The focused window swaps its live buffer (like `:b`);
     /// an inactive window updates its binding and clamps its stashed cursor to the

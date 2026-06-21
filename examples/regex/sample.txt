@@ -1,0 +1,12 @@
+nx.regex demo buffer — see init.lua for the :Emails / :Numbers / :Phones / :Redact commands.
+
+Contacts
+  Doe, Jane     jane.doe@acme.io
+  Smith, John   j.smith+work@mail.example.com
+  (no address)  ping me on chat
+
+Order 4090 ships on 2026-06-21.
+call 555-123-4567 before noon
+backup line: 555-987-6543
+
+Notes: alpha beta gamma — try  :lua print(nx.regex([[\bbeta\b]]):find("alpha beta"))

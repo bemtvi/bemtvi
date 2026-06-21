@@ -77,6 +77,7 @@ same surface, later. The in-process Lua host is v1.
 | Namespace | What it is | Backed by (exists today) |
 | --- | --- | --- |
 | `nx.buf` / `nx.win` / `nx.cursor` | snapshot reads, queued edits, `on_change` byte-delta subscription | mirrors + effect queues + the edit journal |
+| `nx.regex` / `nx.buf.search` | real-regex matching for Lua strings (a `string`-library-shaped object) / native buffer text search | the core regex engines — the Rust `regex` crate (`pcre`) + the vendored vim engine (`vim`) |
 | `nx.on(event, opts, fn)` | structured event subscriptions | the lifecycle/autocmd diff |
 | `nx.run` / `nx.run_stream` / `nx.timer` / `nx.fs.*` | async process (promise / async-iterator) / timer / fs | evloop actor + HostFs seams |
 | `nx.hl.set(ns, buf, marks)` | batch-published decorations (known up front) | the extmark layer + priorities |

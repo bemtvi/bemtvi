@@ -2599,6 +2599,18 @@ pub(crate) fn install_runtime_api(
         })?,
     )?;
 
+    // `nx._regex(pat, opts?)`: compile a pattern into the regex object backing
+    // `nx.regex` (the documented Lua wrapper in the prelude). A compiled
+    // `NxRegex` userdata exposing `:find`/`:match`/`:gmatch`/`:gsub`/`:test`.
+    // Defaults to the Rust `regex` crate (`engine = "pcre"`); `engine = "vim"` /
+    // `plain` select the other engines.
+    nx.set(
+        "_regex",
+        lua.create_function(|_, (pat, opts): (String, Option<Table>)| {
+            crate::search::NxRegex::compile(&pat, opts.as_ref())
+        })?,
+    )?;
+
     // `nx._json_decode(str)`: parse a JSON document into the equivalent Lua value
     // (objects -> string-keyed tables, arrays -> sequences, `null` -> nil). Backs
     // `vim.json.decode`; raises on malformed input, matching neovim. The config

@@ -14,7 +14,7 @@
 //! pattern is not supported. The scan starts at `from = { line, col }` (1-based line,
 //! 0-based byte col) and runs forward, or backward with `backward = true`.
 
-use mlua::{Lua, Table, Value};
+use mlua::{Lua, Table, UserData, UserDataMethods, Value, Variadic};
 use regex::RegexBuilder;
 
 /// One match within a single line: byte offsets [start, end) plus the submatch
@@ -67,12 +67,12 @@ impl Compiled {
                 .case_insensitive(ignorecase)
                 .build()
                 .map(Compiled::Pcre)
-                .map_err(|e| format!("nx.buf.search: invalid pcre pattern: {e}")),
+                .map_err(|e| format!("invalid pcre pattern: {e}")),
             "vim" => nxvim_regex::VimRegex::compile(pattern)
                 .map(|re| Compiled::Vim { re, ignorecase })
-                .map_err(|e| format!("nx.buf.search: invalid vim pattern: {e}")),
+                .map_err(|e| format!("invalid vim pattern: {e}")),
             other => Err(format!(
-                "nx.buf.search: engine must be \"pcre\" or \"vim\", got {other:?}"
+                "regex engine must be \"pcre\" or \"vim\", got {other:?}"
             )),
         }
     }
@@ -160,6 +160,62 @@ impl Compiled {
             }
         }
     }
+
+    /// Every non-overlapping match in `line`, left to right (a zero-width match
+    /// advances one char so the walk can't spin). Used by the `nx.regex` object's
+    /// `:gmatch` / `:gsub`, which need the whole match set in one pass.
+    fn all(&self, line: &str) -> Vec<LineHit> {
+        let mut out = Vec::new();
+        match self {
+            Compiled::Pcre(re) => {
+                for c in re.captures_iter(line) {
+                    out.push(pcre_hit(&c));
+                }
+            }
+            Compiled::Plain { needle, ignorecase } => {
+                let hay = if *ignorecase {
+                    line.to_ascii_lowercase()
+                } else {
+                    line.to_string()
+                };
+                let mut from = 0;
+                while from <= hay.len() {
+                    let Some(rel) = hay[from..].find(needle.as_str()) else {
+                        break;
+                    };
+                    let start = from + rel;
+                    let end = start + needle.len();
+                    out.push(LineHit {
+                        start,
+                        end,
+                        captures: vec![],
+                    });
+                    from = advance(line, start, end);
+                }
+            }
+            Compiled::Vim { re, ignorecase } => {
+                let mut from = 0;
+                while from <= line.len() {
+                    let Some(m) = re.exec_line(line, from, *ignorecase).ok().flatten() else {
+                        break;
+                    };
+                    let next = advance(line, m.start, m.end);
+                    out.push(vim_hit(line, &m));
+                    from = next;
+                }
+            }
+        }
+        out
+    }
+
+    /// Whether `line` matches anywhere (cheaper than [`Compiled::first_from`] for
+    /// pcre, which can answer without building captures).
+    fn is_match(&self, line: &str) -> bool {
+        match self {
+            Compiled::Pcre(re) => re.is_match(line),
+            _ => self.first_from(line, 0).is_some(),
+        }
+    }
 }
 
 /// Captures `\1`.. from a pcre match (group 0 is the whole match, skipped). A
@@ -220,32 +276,40 @@ pub fn buf_search(lua: &Lua, lines: Table, pattern: String, opts: Table) -> mlua
     let compiled =
         Compiled::compile(&pattern, plain, &engine, ignorecase).map_err(mlua::Error::runtime)?;
 
-    let line_at = |i: usize| -> mlua::Result<String> {
-        Ok(lines.get::<Option<String>>(i as i64)?.unwrap_or_default())
+    // Fetch line `i` from the mirror as a borrowed Lua string (zero-copy): the
+    // `Compiled` scanners take `&str`, so reading the bytes in place avoids a fresh
+    // Rust `String` allocation per scanned line (a no-match scan would otherwise
+    // allocate one owned line for the whole buffer).
+    let line_str = |i: usize| -> mlua::Result<Option<mlua::String>> {
+        lines.get::<Option<mlua::String>>(i as i64)
     };
 
     if backward {
         for i in (1..=from_line.min(n)).rev() {
-            let line = line_at(i)?;
+            let raw = line_str(i)?;
+            let borrowed = raw.as_ref().map(|s| s.to_str()).transpose()?;
+            let line = borrowed.as_deref().unwrap_or("");
             let before = if i == from_line {
                 Some(from_col.min(line.len()))
             } else {
                 None
             };
-            if let Some(hit) = compiled.last_before(&line, before) {
-                return make_match(lua, i, &line, &hit);
+            if let Some(hit) = compiled.last_before(line, before) {
+                return make_match(lua, i, line, &hit);
             }
         }
     } else {
         for i in from_line..=n {
-            let line = line_at(i)?;
+            let raw = line_str(i)?;
+            let borrowed = raw.as_ref().map(|s| s.to_str()).transpose()?;
+            let line = borrowed.as_deref().unwrap_or("");
             let from = if i == from_line {
                 from_col.min(line.len())
             } else {
                 0
             };
-            if let Some(hit) = compiled.first_from(&line, from) {
-                return make_match(lua, i, &line, &hit);
+            if let Some(hit) = compiled.first_from(line, from) {
+                return make_match(lua, i, line, &hit);
             }
         }
     }
@@ -266,4 +330,262 @@ fn make_match(lua: &Lua, line_no: usize, line: &str, hit: &LineHit) -> mlua::Res
         lua.create_sequence_from(hit.captures.iter().cloned())?,
     )?;
     Ok(Value::Table(t))
+}
+
+/// Slice `s[start..end]`, failing loud rather than panicking if the engine handed
+/// back a reversed or off-char-boundary range (possible with the vim engine's
+/// `\zs`/`\ze`/look-around). Mirrors `vimregex::safe_slice`.
+fn slice(s: &str, start: usize, end: usize) -> mlua::Result<&str> {
+    s.get(start..end).ok_or_else(|| {
+        mlua::Error::runtime(format!(
+            "nx.regex: match byte range {start}..{end} is not a valid slice (off a char boundary or reversed)"
+        ))
+    })
+}
+
+/// Translate a `string.find`-style `init` (1-based, may be negative to count from
+/// the end) into a 0-based byte offset to start scanning from.
+fn norm_init(init: Option<i64>, len: usize) -> usize {
+    match init {
+        None => 0,
+        Some(i) if i > 0 => ((i - 1) as usize).min(len),
+        Some(0) => 0,
+        // Negative: from the end, where -1 is the last byte.
+        Some(i) => len.saturating_sub(i.unsigned_abs() as usize),
+    }
+}
+
+/// `nx.regex(pat, opts?)` — a compiled pattern object for matching **Lua strings**
+/// (a more capable `string.find`/`match`/`gmatch`/`gsub` with a real regex
+/// dialect). Defaults to the Rust `regex` crate (`engine = "pcre"`, canonical
+/// syntax); `engine = "vim"` selects the vim regexp engine and `plain = true` a
+/// literal substring. Offsets follow the `string` library: **1-based**, byte-based,
+/// with `:find`'s `end` inclusive so `s:sub(re:find(s))` is the match.
+pub struct NxRegex {
+    re: Compiled,
+}
+
+impl NxRegex {
+    pub fn compile(pattern: &str, opts: Option<&Table>) -> mlua::Result<Self> {
+        let (plain, engine, ignorecase) = match opts {
+            Some(o) => (
+                o.get::<Option<bool>>("plain")?.unwrap_or(false),
+                o.get::<Option<String>>("engine")?
+                    .unwrap_or_else(|| "pcre".into()),
+                o.get::<Option<bool>>("ignorecase")?.unwrap_or(false),
+            ),
+            None => (false, "pcre".to_string(), false),
+        };
+        let re =
+            Compiled::compile(pattern, plain, &engine, ignorecase).map_err(mlua::Error::runtime)?;
+        Ok(NxRegex { re })
+    }
+}
+
+impl UserData for NxRegex {
+    fn add_methods<M: UserDataMethods<Self>>(methods: &mut M) {
+        // `re:find(s, init?)` -> start, end, cap1, cap2, … (1-based, `end`
+        // inclusive) or nil — like `string.find` in `plain=false` mode.
+        methods.add_method(
+            "find",
+            |lua, this, (text, init): (mlua::String, Option<i64>)| {
+                let s = text.to_str()?;
+                let from = norm_init(init, s.len());
+                let Some(hit) = this.re.first_from(&s, from) else {
+                    // No match -> a single nil, like string.find.
+                    return Ok(Variadic::from_iter([Value::Nil]));
+                };
+                let mut out = vec![
+                    Value::Integer((hit.start + 1) as i64),
+                    Value::Integer(hit.end as i64),
+                ];
+                for c in &hit.captures {
+                    out.push(Value::String(lua.create_string(c)?));
+                }
+                Ok(Variadic::from_iter(out))
+            },
+        );
+
+        // `re:match(s, init?)` -> the capture string(s), or the whole match when
+        // the pattern has no captures, or nil — like `string.match`.
+        methods.add_method(
+            "match",
+            |lua, this, (text, init): (mlua::String, Option<i64>)| {
+                let s = text.to_str()?;
+                let from = norm_init(init, s.len());
+                let Some(hit) = this.re.first_from(&s, from) else {
+                    // No match -> a single nil, like string.match.
+                    return Ok(Variadic::from_iter([Value::Nil]));
+                };
+                let out = if hit.captures.is_empty() {
+                    vec![Value::String(
+                        lua.create_string(slice(&s, hit.start, hit.end)?)?,
+                    )]
+                } else {
+                    hit.captures
+                        .iter()
+                        .map(|c| lua.create_string(c).map(Value::String))
+                        .collect::<mlua::Result<Vec<_>>>()?
+                };
+                Ok(Variadic::from_iter(out))
+            },
+        );
+
+        // `re:gmatch(s)` -> an iterator yielding each match's captures (or the
+        // whole match when the pattern has no captures) — like `string.gmatch`.
+        methods.add_method("gmatch", |lua, this, text: mlua::String| {
+            let s = text.to_str()?;
+            let mut items: Vec<Vec<String>> = Vec::new();
+            for hit in this.re.all(&s) {
+                if hit.captures.is_empty() {
+                    items.push(vec![slice(&s, hit.start, hit.end)?.to_string()]);
+                } else {
+                    items.push(hit.captures);
+                }
+            }
+            let idx = std::cell::Cell::new(0usize);
+            lua.create_function(move |lua, ()| {
+                let i = idx.get();
+                if i >= items.len() {
+                    return Ok(Variadic::new());
+                }
+                idx.set(i + 1);
+                let vals = items[i]
+                    .iter()
+                    .map(|c| lua.create_string(c).map(Value::String))
+                    .collect::<mlua::Result<Vec<_>>>()?;
+                Ok(Variadic::from_iter(vals))
+            })
+        });
+
+        // `re:gsub(s, repl, n?)` -> newstring, count — like `string.gsub`. `repl`
+        // is a string (`%0` whole match, `%1`-`%9` captures, `%%` literal), a
+        // function called with the captures, or a table keyed by the first capture.
+        methods.add_method(
+            "gsub",
+            |lua, this, (text, repl, n): (mlua::String, Value, Option<i64>)| {
+                let s = text.to_str()?;
+                let max = n.filter(|&n| n >= 0).map(|n| n as usize);
+                let mut out = String::new();
+                let mut last = 0usize;
+                let mut count = 0usize;
+                for hit in this.re.all(&s) {
+                    if max.is_some_and(|m| count >= m) {
+                        break;
+                    }
+                    out.push_str(slice(&s, last, hit.start)?);
+                    let whole = slice(&s, hit.start, hit.end)?;
+                    match compute_repl(lua, &repl, whole, &hit.captures)? {
+                        Some(r) => out.push_str(&r),
+                        None => out.push_str(whole),
+                    }
+                    last = hit.end;
+                    count += 1;
+                }
+                out.push_str(slice(&s, last, s.len())?);
+                Ok((lua.create_string(&out)?, count as i64))
+            },
+        );
+
+        // `re:test(s)` -> bool: does the pattern match anywhere.
+        methods.add_method("test", |_, this, text: mlua::String| {
+            Ok(this.re.is_match(&text.to_str()?))
+        });
+    }
+}
+
+/// Expand a `string.gsub`-style replacement template against one match: `%0` is the
+/// whole match, `%1`-`%9` the captures (or the whole match for `%1` when the pattern
+/// has no captures, as in Lua), `%%` a literal `%`. Fails loud on a bad item.
+fn expand_str_repl(template: &str, whole: &str, caps: &[String]) -> mlua::Result<String> {
+    let mut out = String::new();
+    let mut chars = template.chars();
+    while let Some(c) = chars.next() {
+        if c != '%' {
+            out.push(c);
+            continue;
+        }
+        match chars.next() {
+            Some('%') => out.push('%'),
+            Some(d @ '0'..='9') => {
+                let nth = d as usize - '0' as usize;
+                // `%0` is the whole match; so is `%1` when the pattern has no
+                // captures (Lua's rule).
+                if nth == 0 || (caps.is_empty() && nth == 1) {
+                    out.push_str(whole);
+                } else if let Some(cap) = caps.get(nth - 1) {
+                    out.push_str(cap);
+                } else {
+                    return Err(mlua::Error::runtime(format!(
+                        "nx.regex gsub: replacement refers to %{nth} but the pattern has {} capture(s)",
+                        caps.len()
+                    )));
+                }
+            }
+            Some(other) => {
+                return Err(mlua::Error::runtime(format!(
+                    "nx.regex gsub: invalid replacement item '%{other}'"
+                )))
+            }
+            None => {
+                return Err(mlua::Error::runtime(
+                    "nx.regex gsub: replacement string ends with a lone '%'",
+                ))
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Turn a `gsub` function/table replacement *result* into the text to splice in:
+/// `nil`/`false` keeps the original match (Lua semantics), a string/number is used,
+/// anything else is a loud error.
+fn repl_value_to_string(v: Value) -> mlua::Result<Option<String>> {
+    match v {
+        Value::Nil | Value::Boolean(false) => Ok(None),
+        Value::String(s) => Ok(Some(s.to_str()?.to_owned())),
+        Value::Integer(i) => Ok(Some(i.to_string())),
+        Value::Number(n) => Ok(Some(n.to_string())),
+        other => Err(mlua::Error::runtime(format!(
+            "nx.regex gsub: replacement value must be a string, number, or nil/false, got {}",
+            other.type_name()
+        ))),
+    }
+}
+
+/// Compute the replacement text for one match from a `gsub` `repl` (string / table /
+/// function), or `None` to keep the original match. A function is called with the
+/// captures (or the whole match when there are none); a table is keyed by the first
+/// capture (or the whole match).
+fn compute_repl(
+    lua: &Lua,
+    repl: &Value,
+    whole: &str,
+    caps: &[String],
+) -> mlua::Result<Option<String>> {
+    match repl {
+        Value::String(s) => Ok(Some(expand_str_repl(&s.to_str()?, whole, caps)?)),
+        Value::Function(f) => {
+            let args: Vec<Value> = if caps.is_empty() {
+                vec![Value::String(lua.create_string(whole)?)]
+            } else {
+                caps.iter()
+                    .map(|c| lua.create_string(c).map(Value::String))
+                    .collect::<mlua::Result<_>>()?
+            };
+            repl_value_to_string(f.call(Variadic::from_iter(args))?)
+        }
+        Value::Table(t) => {
+            let key = if caps.is_empty() {
+                whole
+            } else {
+                caps[0].as_str()
+            };
+            repl_value_to_string(t.get(key)?)
+        }
+        other => Err(mlua::Error::runtime(format!(
+            "nx.regex gsub: replacement must be a string, table, or function, got {}",
+            other.type_name()
+        ))),
+    }
 }

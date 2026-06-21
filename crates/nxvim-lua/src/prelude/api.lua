@@ -397,6 +397,42 @@ function nx.buf.search(bufnr, pattern, opts)
   return nx._buf_search(buf.lines, pattern, opts or {})
 end
 
+-- nx.regex(pattern, opts) -> regex: compile `pattern` into a reusable regex object
+-- for matching Lua **strings** — a more capable `string.find`/`match`/`gmatch`/`gsub`
+-- with a real regex dialect (named groups, alternation, lazy quantifiers, …). The
+-- match runs in Rust, so a string you already hold in Lua is matched in place (no
+-- copy). For searching *buffer* text instead, use `nx.buf.search`. Raises on an
+-- invalid pattern.
+--
+-- opts (all optional):
+--   engine     = "pcre" | "vim"  -- regex dialect (default "pcre", the `regex` crate)
+--   plain      = false           -- match the pattern literally (ignores `engine`)
+--   ignorecase = false           -- case-insensitive match
+--
+-- Offsets follow the `string` library: 1-based and byte-based, with `:find`'s `end`
+-- inclusive, so `s:sub(re:find(s))` is the matched text. The returned object has:
+--
+--   re:find(s, init?)   -> start, end, cap1, … | nil   (like string.find)
+--   re:match(s, init?)  -> the capture(s), or the whole match if the pattern has
+--                          none, or nil                 (like string.match)
+--   re:gmatch(s)        -> iterator over each match's captures (or whole match)
+--                                                        (like string.gmatch)
+--   re:gsub(s, repl, n?) -> newstring, count            (like string.gsub)
+--       repl is a string (`%0` whole match, `%1`-`%9` captures, `%%` literal `%`),
+--       a function called with the captures (return nil/false to keep the match),
+--       or a table keyed by the first capture.
+--   re:test(s)          -> boolean: does the pattern match anywhere
+--
+-- `init` is 1-based and may be negative to count from the end, as in string.find.
+--
+--   local re = nx.regex([[(\w+)@(\w+)]])
+--   local _, _, user, host = re:find("to jo@acme now")  -- "jo", "acme"
+--   for word in nx.regex([[\w+]]):gmatch("one two") do ... end
+--   local masked = nx.regex([[\d]]):gsub("id 42", "*")  -- "id **"
+function nx.regex(pattern, opts)
+  return nx._regex(pattern, opts)
+end
+
 -- ===== Extmarks layer ==================================================
 -- See docs/specs/2026-06-07-extmark-decoration-layer-design.md. v1 carries the
 -- highlight-relevant attrs only; virtual text / signs / conceal are not modelled

@@ -1403,51 +1403,80 @@ impl Editor {
         // Highest start first: applying a later edit can't shift an earlier one.
         edits.sort_by_key(|(range, _)| std::cmp::Reverse(range.start));
         // Carry the live cursor through the edits the way neovim's `apply_text_edits`
-        // does: an edit *before* the cursor shifts it by the edit's length delta, and
-        // an edit it sits *inside* moves it to the end of the replacement — so the
-        // cursor follows the text it was on (e.g. a rename that inserts a `use`
-        // import above it) instead of staying pinned to a now-stale absolute line/col.
-        // Computed against the pre-edit byte offset; edits run highest-start-first, so
-        // the (lower-start) edits before the cursor fold their deltas in after the one
-        // it straddles has set the base position.
+        // does: an edit that ends *at or before* the cursor shifts it by the row/column
+        // delta the replacement introduces, while an edit the cursor sits *inside* — or
+        // one after it — leaves it put. So the cursor follows the text it was on (a
+        // rename that inserts a `use` import above it carries it down) without a
+        // whole-document reformat — one edit spanning the cursor — dragging it to the
+        // end of the file. The math runs in (row, col) against the pre-edit buffer, so
+        // each edit's original coordinates and its new text's shape are captured here,
+        // before the apply loop mutates the rope.
         let is_current = id == self.cur_buffer();
-        let cursor_byte = is_current.then(|| {
+        let cursor_plan: Vec<(usize, usize, usize, usize, usize, usize)> = if is_current {
             let buf = &self.buffers.get(id).buffer;
-            buf.line_start(self.cursor.line) + self.cursor.col
-        });
-        let mut new_cursor = cursor_byte.map(|c| c as i64);
-        for (range, text) in edits {
+            edits
+                .iter()
+                .map(|(range, text)| {
+                    let len = buf.len_bytes();
+                    let start = buf.text.floor_char_boundary(range.start.min(len));
+                    let end = buf.text.floor_char_boundary(range.end.min(len));
+                    let start_row = buf.byte_to_line(start);
+                    let end_row = buf.byte_to_line(end);
+                    let start_col = start - buf.line_start(start_row);
+                    let end_col = end - buf.line_start(end_row);
+                    // New text shape: how many lines it spans, and the byte length of
+                    // its final line (the column the cursor lands at on the last row).
+                    let new_lines = text.bytes().filter(|b| *b == b'\n').count() + 1;
+                    let last_len = text.rfind('\n').map_or(text.len(), |i| text.len() - i - 1);
+                    (start_row, start_col, end_row, end_col, new_lines, last_len)
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+        for (range, text) in &edits {
             let buf = &mut self.buffers.get_mut(id).buffer;
             let len = buf.len_bytes();
             let start = buf.text.floor_char_boundary(range.start.min(len));
             let end = buf.text.floor_char_boundary(range.end.min(len));
-            if let (Some(cur), Some(nc)) = (cursor_byte, new_cursor.as_mut()) {
-                if cur >= end {
-                    // Entirely before the cursor: shift by the inserted/removed length.
-                    *nc += text.len() as i64 - (end - start) as i64;
-                } else if cur > start {
-                    // The cursor sits inside the replaced range: land it at the end of
-                    // the new text (in original coords; before-cursor edits then shift).
-                    *nc = (start + text.len()) as i64;
-                }
-            }
             if start < end {
                 buf.remove(start..end);
             }
             if !text.is_empty() {
-                buf.insert(start, &text);
+                buf.insert(start, text);
             }
         }
         self.buffers.get_mut(id).buffer.normalize();
-        // A workspace edit is a complete one-shot; commit it now so it lands as a
-        // single undo node, independent of any later edit to `id`.
-        self.commit_undo(id);
-        if let Some(nc) = new_cursor {
-            self.set_cursor_char(nc.max(0) as usize);
+        if is_current {
+            // Replay the edits over the cursor in the same (reverse-document) order
+            // they applied, mutating a running (row, col) — neovim's algorithm.
+            let (mut row, mut col) = (self.cursor.line, self.cursor.col);
+            for &(s_row, s_col, e_row, e_col, new_lines, last_len) in &cursor_plan {
+                let row_delta = new_lines as i64 - (e_row - s_row + 1) as i64;
+                if e_row < row {
+                    row = (row as i64 + row_delta).max(0) as usize;
+                } else if e_row == row && e_col <= col {
+                    row = (row as i64 + row_delta).max(0) as usize;
+                    // The new last-row column, plus how far the cursor sat past the
+                    // edit's end; a single-line replacement also keeps its start column.
+                    col = last_len + (col - e_col);
+                    if new_lines == 1 {
+                        col += s_col;
+                    }
+                }
+            }
+            let row = row.min(self.last_line());
+            let col = col.min(self.buffer().line_len(row));
+            self.set_cursor_char(self.buffer().line_start(row) + col);
             self.desired_col = self.cursor_virtcol();
             self.desired_eol = false;
             self.ensure_visible();
         }
+        // A workspace edit is a complete one-shot; commit it now so it lands as a
+        // single undo node, independent of any later edit to `id`. Committed *after*
+        // the cursor settles so the node carries the post-edit cursor — a later redo
+        // back to it restores where the edit left the cursor, not where it started.
+        self.commit_undo(id);
         // A non-current buffer's saved cursor is clamped by `enter_buffer` on the
         // switch back, so nothing to do here.
     }

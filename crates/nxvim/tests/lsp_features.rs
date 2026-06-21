@@ -534,9 +534,12 @@ async fn rename_carries_the_cursor_through_edits_above_it() {
     let before = cursor(&rpc).await;
     assert_eq!(before.0, 4, "precondition: cursor parked on line 4");
 
+    // Request the rename exactly once and wait for its single reply — re-requesting
+    // in the poll loop can stack a second `use bar;` insert (cursor would land a line
+    // too far), so the apply must be one-shot for the line assertion to be exact.
+    exec_lua(&rpc, "nx.lsp.rename('bar')").await;
     let mut renamed = false;
     for _ in 0..80 {
-        exec_lua(&rpc, "nx.lsp.rename('bar')").await;
         nxvim_test_harness::barrier(&rpc).await;
         if lines(&rpc).await.last().map(String::as_str) == Some("return bar") {
             renamed = true;
@@ -600,9 +603,10 @@ async fn undo_of_a_rename_restores_the_pre_rename_cursor() {
     barrier(&rpc).await;
     assert_eq!(cursor(&rpc).await.0, 4, "precondition: cursor on line 4");
 
+    // One-shot request (re-requesting could double-apply and add extra undo nodes).
+    exec_lua(&rpc, "nx.lsp.rename('bar')").await;
     let mut renamed = false;
     for _ in 0..80 {
-        exec_lua(&rpc, "nx.lsp.rename('bar')").await;
         nxvim_test_harness::barrier(&rpc).await;
         if lines(&rpc).await.last().map(String::as_str) == Some("return bar") {
             renamed = true;
@@ -624,6 +628,136 @@ async fn undo_of_a_rename_restores_the_pre_rename_cursor() {
         cursor(&rpc).await.0,
         4,
         "undo should restore the cursor to the symbol, not the top of the file"
+    );
+}
+
+/// A whole-document format (one edit spanning the cursor) must leave the cursor on
+/// its line, not fling it to the end of the file. Regression: an edit the cursor
+/// sat *inside* moved it to the end of the replacement — the whole buffer.
+#[tokio::test]
+async fn format_does_not_fling_the_cursor_to_end_of_file() {
+    let _guard = serial_lock().lock().await;
+    let dir = temp_dir("lsp_features_fmt_cursor");
+    // One edit replacing the entire (badly-spaced) buffer with a tidy one.
+    arm_mock(
+        &dir,
+        r#"{
+            "formatting": [
+                {
+                    "range": { "start": { "line": 0, "character": 0 }, "end": { "line": 2, "character": 8 } },
+                    "newText": "let a = 1\nlet b = 2\nlet c = 3"
+                }
+            ]
+        }"#,
+    );
+    let (rpc, _incoming) = open_with_server(&dir, "let  a=1\nlet  b=2\nlet  c=3\n").await;
+    assert!(
+        await_lua_eq(&rpc, "#nx.lsp.clients({ bufnr = 0 })", "1").await,
+        "the mock server should attach"
+    );
+
+    // Park the cursor on the middle line.
+    feed(&rpc, "2G0");
+    barrier(&rpc).await;
+    assert_eq!(cursor(&rpc).await.0, 2, "precondition: cursor on line 2");
+
+    // One-shot request, then wait for the reply (re-requesting risks a stale double).
+    exec_lua(&rpc, "nx.lsp.format()").await;
+    let mut formatted = false;
+    for _ in 0..80 {
+        nxvim_test_harness::barrier(&rpc).await;
+        if lines(&rpc).await.get(1).map(String::as_str) == Some("let b = 2") {
+            formatted = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert!(formatted, "formatting should tidy the buffer");
+
+    assert_eq!(
+        cursor(&rpc).await.0,
+        2,
+        "the cursor should stay on its line through a whole-document format, \
+         not fly to the end of the file"
+    );
+}
+
+/// Undo then redo of a format must round-trip the cursor: undo returns it to the
+/// pre-format spot, redo returns it to where the format left it. Regression: the
+/// redo node was committed *before* the cursor was repositioned, so redo restored
+/// the pre-format cursor instead of the post-format one.
+#[tokio::test]
+async fn redo_of_a_format_restores_the_post_format_cursor() {
+    let _guard = serial_lock().lock().await;
+    let dir = temp_dir("lsp_features_fmt_redo");
+    // The format inserts a header line at the top, pushing the cursor's line down.
+    arm_mock(
+        &dir,
+        r#"{
+            "formatting": [
+                {
+                    "range": { "start": { "line": 0, "character": 0 }, "end": { "line": 0, "character": 0 } },
+                    "newText": "// header\n"
+                }
+            ]
+        }"#,
+    );
+    let (rpc, _incoming) = open_with_server(&dir, "let a = 1\nlet b = 2\n").await;
+    assert!(
+        await_lua_eq(&rpc, "#nx.lsp.clients({ bufnr = 0 })", "1").await,
+        "the mock server should attach"
+    );
+
+    // Park the cursor on line 2; the inserted header pushes it down to line 3.
+    feed(&rpc, "2G0");
+    barrier(&rpc).await;
+
+    // Request the format exactly once, then wait for its single reply to apply —
+    // re-requesting in the poll loop would stack extra header inserts (extra undo
+    // nodes) and break the undo/redo sequence this test exercises.
+    exec_lua(&rpc, "nx.lsp.format()").await;
+    let mut formatted = false;
+    for _ in 0..80 {
+        nxvim_test_harness::barrier(&rpc).await;
+        if lines(&rpc).await.first().map(String::as_str) == Some("// header") {
+            formatted = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert!(formatted, "formatting should insert the header");
+    let after_format = cursor(&rpc).await;
+    assert_eq!(
+        after_format.0, 3,
+        "the cursor should follow its line down to 3"
+    );
+
+    // Undo returns the cursor to the pre-format line 2.
+    feed(&rpc, "u");
+    barrier(&rpc).await;
+    assert_eq!(
+        lines(&rpc).await.first().map(String::as_str),
+        Some("let a = 1"),
+        "undo should drop the header"
+    );
+    assert_eq!(
+        cursor(&rpc).await.0,
+        2,
+        "undo should restore the cursor to line 2"
+    );
+
+    // Redo re-applies the format and returns the cursor to where it left it (line 3).
+    feed(&rpc, "<C-r>");
+    barrier(&rpc).await;
+    assert_eq!(
+        lines(&rpc).await.first().map(String::as_str),
+        Some("// header"),
+        "redo should re-insert the header"
+    );
+    assert_eq!(
+        cursor(&rpc).await.0,
+        after_format.0,
+        "redo should restore the post-format cursor, not the pre-format one"
     );
 }
 

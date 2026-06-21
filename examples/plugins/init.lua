@@ -77,12 +77,11 @@ nx.plugins({
     enabled = false, -- illustrative; flip on to actually fetch it
   },
 
-  -- Local development — the surest "runnable" example, since it loads a plugin that
-  -- ships in THIS repo with no network. Point `dir` at the in-tree nxtree plugin
-  -- (a pure-Lua nx.* file explorer); it is loaded directly, never cloned, and
-  -- :PluginClean leaves it alone. Adjust the path to your checkout.
-  -- { name = "nxtree", dir = "/path/to/nxvim/examples/nxtree",
-  --   config = function() require("nxtree").setup({}) end },
+  -- Local development — point `dir` at a plugin checkout on disk: it is loaded
+  -- directly, never cloned, and :PluginClean leaves it alone. The surest "runnable"
+  -- setup, since it needs no network. Adjust the path and module to your plugin.
+  -- { name = "myplugin", dir = "/path/to/your/plugin",
+  --   config = function() require("myplugin").setup({}) end },
 })
 
 -- ----- First-run recommended set (for a distribution / starter config) --------

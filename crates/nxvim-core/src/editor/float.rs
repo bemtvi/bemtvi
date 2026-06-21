@@ -150,7 +150,7 @@ impl Editor {
 
     /// Open a **doc float** for surface `name`: a read-only, non-focusable floating
     /// *window*, backed by a reused scratch buffer, carrying plain text `lines` (the
-    /// LSP hover / signature-help surface). Unlike the borderless, styled
+    /// LSP hover / signature-help surface). Unlike the styled
     /// [content float](Editor::open_content_float) — an overlay outside the window
     /// tree — this is a *real* float window, so it inherits mouse hit-testing,
     /// **wheel scroll**, and the normal window render path for free (the neovim

@@ -9,8 +9,8 @@
 -- the bottom panel: an inert buffer whose lines a plugin sets, that mounts in a
 -- dock or a split, decorates with extmarks, and whose `<CR>` dispatches to an
 -- `on_select` callback. It is the surface a pure-Lua file tree / symbol list / any
--- line-oriented widget is built on. This tiny example is a *fixed* file list — the
--- full lazy filesystem tree (nxtree) is a separate plugin built on exactly this.
+-- line-oriented widget is built on. This tiny example is a *fixed* file list — a
+-- full lazy filesystem tree would be a separate plugin built on exactly this.
 --
 -- TRY IT interactively:
 --   <leader>e   toggle the view in the left dock

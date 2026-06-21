@@ -23,13 +23,19 @@
 
 - [What nxvim adds](features/index.md)
   - [Multi-cursor mode](features/multicursor.md)
+  - [UI primitives](features/ui-primitives.md)
   - [Permanent docks](features/docks.md)
   - [Fuzzy picker](features/picker.md)
+  - [Browser editor](features/browser-editor.md)
+  - [The edit-host split](features/edit-host-split.md)
 
 # Plugin Development
 
 - [Overview](plugins/overview.md)
+- [The nx.* model](plugins/nx-model.md)
 - [Writing plugins](plugins/authoring.md)
+- [Async & promises](plugins/async.md)
+- [Testing plugins](plugins/testing.md)
 - [Autocommand events](plugins/autocmd-events.md)
 
 # nx.* API Reference

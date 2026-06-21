@@ -109,7 +109,8 @@ and a deeper treatment in the [API design](specs/2026-06-11-native-plugin-api.md
   scheduling primitives `nx.schedule` (end of the current tick) /
   `nx.on_next_tick` / `nx.wait_for(pred, opts)` (across ticks). Reach for
   `on_next_tick`/`wait_for` — never a `nx.schedule` re-arm — when waiting on state
-  that only refreshes *between* ticks (e.g. a freshly-mounted window id).
+  that only refreshes *between* ticks (e.g. a freshly-mounted window id). Full
+  guide: **[Async & promises](async.md)**.
 - **UI** — the floating-widget layer `nx.ui.input`/`select`/`confirm`/`float`
   (promise-based, never steals focus for `float`), and `nx.component` (reactive
   state + a pure render + lifecycle) for live popups. Bigger server-owned surfaces:
@@ -143,8 +144,7 @@ nxvim --test-plugin .
 ```
 
 The suite drives a **real** editor (feed keys, assert on buffer / cursor / UI) and
-exits `0`/`1` for CI. See the full guide:
-**[Testing nxvim plugins](specs/2026-06-19-lua-plugin-testing.md)**.
+exits `0`/`1` for CI. See the full guide: **[Testing plugins](plugin-testing.md)**.
 
 ## See also
 

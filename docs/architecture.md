@@ -1123,17 +1123,11 @@ screen," and that is exactly the shape of these tests.
   built-ins fire instantly even under a colliding user prefix, via the shared
   command grammar `nxvim_core::command_status` the matcher consults) are in place
   — enough to load a full colorscheme end to end (see [*Lua*](#lua)).
-  The **LSP and diagnostics surface** is moving the same way. The vendored
-  nvim-lspconfig corpus (~400 `lsp/<server>.lua` configs) and the `vim.lsp` /
-  `vim.diagnostic` Lua compat layer (`prelude/lsp.lua`) — together with their
-  tests and fixtures — have been **removed** in the native-plugin-API cut. What
-  stays is the native LSP engine: the `nxvim-lsp` crate (client, protocol,
-  manager, transport) that does nxvim's own stdio spawning and drives the in-core
-  editing features. Per [ADR 0002](decisions/0002-native-plugin-system.md) the
-  control surface is the `nx.lsp` API's job — the native client and the
-  editing-loop features stay; the vim-named/lspconfig-corpus spelling is
-  refactored into the `nx` API or deleted. (Design background, describing the now
-  superseded vim-named route: the
+  The **LSP and diagnostics surface** is native too: the `nxvim-lsp` crate
+  (client, protocol, manager, transport) does nxvim's own stdio spawning and
+  drives the in-core editing features, and `nx.lsp` is its Lua control surface
+  (server registration, enable, on-attach) — per
+  [ADR 0002](decisions/0002-native-plugin-system.md). (Design background: the
   [LSP support design](specs/2026-06-02-lsp-support-design.md) and the
   [completion plan](plans/2026-06-05-lsp-completion.md).)
 

@@ -92,6 +92,7 @@ subsystems:
 | `nxvim-view`    | (UI layer)                                           | Frontend-neutral decode/input layer (`View`, `Style`, `Key`, `notation`, paste encoding) shared by the native clients. |
 | `nxvim-gui`     | (a GUI frontend)                                     | The native GUI **client** on winit + wgpu + glyphon; the GUI sibling of `nxvim-tui`, consuming the same `View`. |
 | `nxvim-edithost`| —                                                    | The fully client-side **WebAssembly** build of the whole editor (core + Lua + server tick) in a Web Worker; excluded from the Cargo workspace. See [*The web build*](#the-web-build--a-fully-client-side-webassembly-editor). |
+| `nxvim-test-harness` | —                                               | The shared black-box integration-test harness (a `publish = false` dev-dependency of `nxvim` and `nxvim-server`): spawns a real server over an in-process RPC pipe and drives it as a UI client would. See [*Testing philosophy*](#testing-philosophy). |
 | `nxvim`         | the `nvim` entry point                               | Wires an embedded server + the TUI client together over RPC. |
 
 Dependency direction is strictly one-way:
@@ -100,11 +101,16 @@ Dependency direction is strictly one-way:
         nxvim (bin)
         /         \
  nxvim-server   nxvim-tui
-  / | | \           \
-core rpc lua ts     rpc
-      \_______/    /
+  / | | \         /    \
+core rpc lua ts  rpc  view
+      \_______/
        tree-sitter
 ```
+
+The diagram shows the principal spine; the same one-way graph also carries the
+edges it elides — `nxvim` and `nxvim-server` both onto `nxvim-lsp`, `nxvim-lua`
+onto `nxvim-ts` (the treesitter query/control bridge), `nxvim-gui` onto
+`nxvim-server` + `nxvim-view`, and `nxvim-server` onto `nxvim-regex`.
 
 The treesitter engine is a normal crate dependency now: `nxvim-server`
 constructs it and installs it on the editor (which owns a `Box<dyn SyntaxEngine>`
@@ -194,11 +200,15 @@ onto a shared pool.
 
 #### Multi-source scheduling & event ordering
 
-The server's `tokio::select!` loop (`nxvim-server::run`) multiplexes **three**
+The server's `tokio::select!` loop (`nxvim-server::run`) multiplexes **eight**
 event sources against the single-threaded editor: RPC input from the UI, the LSP
-manager, and the async-runtime actor (`evloop.rs` — timers and child processes).
-Treesitter is *not* one of them — it runs in-process and is queried synchronously
-during `redraw`, so highlighting needs no channel or arm. Each source is an mpsc
+manager, the async-runtime actor (`evloop.rs` — timers and child processes),
+terminal child output, off-tick file opens and write-acks from the daemon fs
+seam, `:TSInstall` grammar-build completions, and daemon file-watch events. The
+first three are the always-on primary sources; the rest service the terminal,
+edit-host/daemon, and treesitter-install features. Treesitter highlighting is
+*not* among them — the engine runs in-process and is queried synchronously
+during `redraw`, so it needs no channel or arm. Each source is an mpsc
 channel; the
 matching async actor (a `Send` background task) only ever ferries ids / bytes /
 durations back, never the `!Send` editor or Lua state. This is nxvim's analog of
@@ -280,7 +290,8 @@ a **list of windows** plus the global chrome. Each `WindowView` carries one
 window's `rect`, focus flag, visible text rows, cursor, selection/search spans,
 gutter numbers, and status-line data (file name, modified flag, ruler); the
 `View` adds the inter-split `separators` and the **global** fields one editor has
-(mode label, command line, message, panel). The server sends it as a single
+(mode label, command line, message, and the list-overlay `menu`). The server
+sends it as a single
 `redraw` notification carrying one msgpack map (a `windows` array + a
 `separators` array + the global keys). With one window the list has a single
 entry spanning the whole text area, so the frame is identical to the pre-windows
@@ -308,8 +319,12 @@ map carries:
 - the per-row `highlights` array (aligned with `lines`) of screen-column spans
   `[start, end, group, style_id]`, where `group` is the treesitter capture name
   and `style_id` indexes `styles` (or is `nil` when no colorscheme resolved it);
-- a `chrome` map of editor-region → `style_id` for `Normal`, `LineNr`,
-  `CursorLineNr`, `Visual`, `StatusLine`, and `EndOfBuffer`.
+- a `chrome` map of editor-region → `style_id` for the text background
+  (`Normal`), the number gutter (`LineNr`, `CursorLineNr`), the cursor line
+  (`CursorLine`), the visual selection (`Visual`), search (`Search`,
+  `IncSearch`), the status line (`StatusLine`), errors (`ErrorMsg`), the
+  end-of-buffer filler (`EndOfBuffer`), and float chrome (`FloatBorder`,
+  `NormalFloat`, `FloatTitle`).
 
 The server still owns *which* cells are in a group (byte offsets resolved to
 screen columns via the same tab/wide-char `virtcol` the selection uses); it now
@@ -336,8 +351,9 @@ stay gutter-agnostic.
 The **client owns chrome layout**, but the *window* rects come from the core.
 The client paints each `WindowView` at its `rect` — splitting off that window's
 gutter, drawing its text/selection/search, and a status line on its bottom row —
-then draws the `separators` between splits and reserves the bottom rows for the
-global command/message line and panel. The terminal cursor is drawn only in the
+then draws the `separators` between splits and reserves the bottom row for the
+global command/message line (the panel, being an ordinary bottom-split window,
+is just another `WindowView`). The terminal cursor is drawn only in the
 `focused` window. Because the core lays out the windows (vertical splits divide
 width), the client reports **both** dimensions of the windows area on
 `nx_ui_attach`/`nx_ui_try_resize`. There is still no grid, no cell encoding,
@@ -405,7 +421,7 @@ them. `nxvim-core`'s `Editor` separates the two concerns vim keeps apart:
 
 - **Buffer state** (the "file"): the rope text, path, `modified`,
   `changedtick`, the edit journal, **and** per-buffer undo/redo history. These
-  live in an `OpenBuffer` (the text `Buffer` plus its undo stacks and the
+  live in an `OpenBuffer` (the text `Buffer` plus its branching undo tree and the
   cursor/scroll position saved while the buffer is not current), stored in a
   `BufferStore` keyed by a monotonic, 1-based `BufferId` that is never reused.
 - **Window state** (the "view"): the live cursor, scroll `top`, mode, and
@@ -571,7 +587,7 @@ current window — `:b`/`:e` rebind the focused window's buffer.
   `WinLeave → BufLeave/BufEnter → WinEnter` around a focus change.
 - **Shared per buffer.** Two windows onto one buffer share its `SyntaxState`,
   diagnostics, and undo — each just projects a different `(top, height)` slice.
-  The register, command line, message line, and panel stay **global**; the
+  The register, command line, and message line stay **global**; the
   number-gutter options (`number` / `relativenumber`) are **window-local** (a
   `WindowOptions` per window, set via `:set`/`:setlocal`/`vim.wo`).
 
@@ -619,10 +635,11 @@ cell (past a dock's title prefix) to a `(layer, tab)`. (Design:
 [`docs/plans/2026-06-07-tab-pages.md`](plans/2026-06-07-tab-pages.md),
 [`docs/plans/2026-06-14-per-region-tablines.md`](plans/2026-06-14-per-region-tablines.md).)
 
-Still pending: **more window-local options** (`colorcolumn`, …) beyond the number
-gutter, `cursorline`, soft word-wrap (`wrap`, with its `gj`/`gk` display motions),
-and the scroll options that already ride `WindowOptions`. Floating windows are
-otherwise complete (model,
+Already on `WindowOptions`: the number gutter (`number`/`relativenumber`), the
+cursor-line highlight (`cursorline`), soft word-wrap (`wrap`, with its `gj`/`gk`
+display motions, `breakindent`/`showbreak`), and the horizontal-scroll options.
+Still pending: **more window-local options** (`colorcolumn`, …) beyond those.
+Floating windows are otherwise complete (model,
 paint, dynamic config, edge semantics); the remaining float fidelity knobs
 (`style="minimal"`, `footer`, `bufpos`, `relative="mouse"`) grow as a consumer
 demands them. All four `laststatus` modes ship (`0` never, `1` only with ≥2
@@ -630,82 +647,59 @@ windows, `2` per-window default, `3` a single global status line).
 
 ---
 
-## The message panel
+## The panel (transient bottom overlay)
 
-Multi-line, browsable output — `:messages` (the message history) and `:ls` (the
-buffer list) — lives in a **panel**: a bottom-docked, read-only, navigable
-region that is explicitly **not** a vim window (there is still one text window
-onto one buffer). It is nxvim-native, closest in spirit to neovim's quickfix
-window but simpler: a transient overlay that grabs input focus while open.
+Multi-line, browsable output — `:messages`, `:ls`/`:buffers`, `:registers`,
+`:marks`, `:jumps`, `:changes`, and scripted listings — lives in a **panel**: a
+transient, focus-locked overlay shown in a bottom split. A panel is **not** a
+bespoke widget with its own content model; it is an ordinary `nomodifiable`
+buffer in a `botright` split, with two properties layered on top. It is
+nxvim-native, closest in spirit to neovim's quickfix window.
 
-- **State lives in the core.** `Editor` holds an `Option<Panel>` (title, content
-  lines, a cursor line, a scroll `top`, and a requested height). While a panel is
-  open, `Editor::input` routes every key to it instead of to the buffer, so the
-  usual vertical motions (`j`/`k`/`gg`/`G`/`<C-d>`/`<C-u>`, arrows, `Home`/`End`)
-  scroll the panel; `q`/`Q`/`<Esc>` close it and refocus the text window. The
-  buffer is untouched throughout. A closed (or replaced) panel is retained as a
-  single `last_panel` snapshot, so **`:panelopen`** brings the most recent panel
-  back with its content and selection intact — e.g. reopening an LSP references
-  list after it was dismissed.
-- **Panels can navigate.** A panel may carry a per-line jump target (`set_panel_targets`,
-  a location list like LSP references/diagnostics): `<CR>` on a target line
-  `jump_to`s it (open-or-switch buffer + set cursor) and closes the panel. The
-  targets are part of the `Panel`, so they ride along in the `:panelopen`
-  snapshot — a reopened list still jumps. A line without a target falls back to
-  the select path below.
-- **The editor splits the height it's told.** The client still reports only the
-  text-viewport height (terminal minus the two chrome rows); the editor subtracts
-  the panel's rows from that, so `text_height()` — and therefore the `lines` it
-  projects — already account for the panel. No extra resize round-trip is needed:
-  the redraw reports the panel's clamped content height, and the client lays out
-  `height + 1` rows (content + a `─ Title ──[X]─` title bar) from it, **below the
-  status line** and above the command row, leaving the text area at exactly the
-  row count the core projected.
-- **Long lines wrap, they don't clip.** The panel is full-width with no
-  horizontal scroll, so `panel_view` **word-wraps** each entry to the panel width
-  when it projects (breaking on spaces, hard-breaking an over-long run; counted in
-  screen cells, so tabs/wide chars line up). Wrapping is display-only: the
-  `cursor`/`top` stay *logical-entry* indices, so `j`/`k`/`<CR>`/jump targets still
-  address whole entries and a long hover/message/location row is laid out across
-  rows instead of being cut at the right edge. The projection carries a
-  `cursor_span` (how many display rows the selected entry occupies) so the client
-  highlights the whole wrapped entry as one focused line, and the vertical
-  scroll-into-view is display-row aware so a tall entry's last row stays visible.
+- **It's an ordinary buffer; the core adds only displace + focus-lock.** `Editor`
+  holds an `Option<PanelState>` — just the panel's `window`, the `prev_window` to
+  refocus on close, and an edge `margin` — and *no* content/cursor/scroll state
+  (that all lives in the buffer and its `WindowView`). `open_panel` mounts a
+  buffer in a bottom split (reusing `open_bottom_window` / `remove_window`, which
+  displace the main window into the rows above) and **hard-locks focus** to it: a
+  guard in `Editor::focus_window` refuses to move focus anywhere else, so `<C-w>`
+  navigation, `nvim_set_current_win`, and mouse focus are all inert until
+  `close_panel` dismisses it. Opening a second listing over an open panel
+  re-targets the one window rather than stacking overlays.
+- **Everything inside is plain buffer behavior.** Motions navigate, search works,
+  and long lines wrap (`:messages` just sets `'wrap'` on the panel window) —
+  because the panel *is* a real window onto a real buffer, not because the input
+  loop special-cases it. The activation and dismiss keys are **buffer-local
+  keymaps installed by a `FileType` autocmd**, never hard-coded: the prelude's
+  `FileType nxlisting/nxbuffers/nxpanels/nxpanel` maps bind `q`/`<Esc>` to
+  `nx.panel.close`, and a per-listing `<CR>` action (e.g. `nx.buffers.actions.open`
+  reads the bufnr off the cursor row and switches) is an ordinary `default` map
+  that a user map overrides — rebindable the standard way.
+- **Built-in listings mount here.** `:messages`, `:registers`, `:marks`,
+  `:jumps`, `:changes` go through `Editor::open_scratch_listing(name, lines,
+  cursor)` (filetype `nxlisting`); `:ls`/`:buffers` through
+  `Editor::open_buffer_listing` (filetype `nxbuffers`, whose `<CR>` switches
+  buffer); the named-panel list through `nxpanels`. Each opens scrolled to a
+  chosen cursor line — `:messages` to the newest line, `:ls` to the current
+  buffer.
 - **A message history feeds it.** `Editor::echo` is the one place a user-facing
   message is set; it records each line in a `messages` history (the backing store
   for `:messages`) as well as showing it on the message line. The server routes
   its own messages (errors, captured `print`/`nvim_echo`) through the same call.
-- **It's scriptable.** `Editor::open_panel`/`set_panel_lines`/`set_panel_cursor`/
-  `close_panel` are public, exposed two ways: a Lua `vim.panel.open(title, lines)`
-  / `set_lines(lines)` / `set_cursor(line)` / `close()` table (queued as
-  `PanelOp`s and drained by the server, the same "Lua queues, core mutates" flow
-  as `vim.cmd`/`nvim_set_hl`), and the `nxvim_panel_open` / `nxvim_panel_set_lines`
-  / `nxvim_panel_set_cursor` / `nxvim_panel_close` (plus `nxvim_panel_is_open`)
-  RPC methods, which manipulate the core directly so they work even while the
-  panel holds input focus. So a plugin can use the panel as a general output
-  surface, not just for `:messages`/`:ls`.
-- **It opens on a chosen line.** `open_panel` takes an initial cursor; the panel
-  scrolls so that line is visible. Scripts pass it as a fourth argument
-  (`vim.panel.open(title, lines, on_select, line)`, 1-based to match the
-  `on_select` index, or the `cursor` param on `nxvim_panel_open`, 0-based) and can
-  move it later with `set_cursor`. The two built-ins use this: `:messages` opens
-  scrolled to the end with the newest line selected, and `:ls` opens with the
-  current buffer selected.
-- **`<CR>` is a scriptable callback.** Pressing Enter on a line of a
-  *select-enabled* panel records `(index, line)` in the core (`panel_selects`);
-  the server drains it — the reverse of the queue flow, like an autocmd —
-  invoking the Lua `on_select(line, index)` handler (kept in the Lua registry)
-  and emitting an `nxvim_panel_select` RPC notification for non-Lua clients.
-  Selection is opt-in per panel (`vim.panel.open(title, lines, on_select)` /
-  `vim.panel.on_select(fn)`, or `want_select` on `nxvim_panel_open`): the
-  built-in `:messages` viewer opts out, so a stale handler never fires on it.
-  `:ls` itself rides this path — it opens its panel, then queues
-  `vim.panel.on_select(nx._panel_select_buffer)` (a prelude helper that parses
-  the buffer number off the selected line, jumps to it, and closes the list), so
-  pressing `<CR>` on a listed buffer switches to it.
-- **The `[X]` is clickable.** A left-click on the title bar's close button
-  (`close_button`) closes the panel — one of the panel-overlay gestures in the
-  editor's broader, server-owned mouse support (click, drag-select, multi-click,
+- **It's scriptable.** A plugin mounts its own panel with
+  `nx.panel.open{ name?, lines, filetype?, height?, margin? }` and dismisses it
+  with `nx.panel.close()` — queued as a `PanelOp` drained by the server (the same
+  "Lua queues, core mutates" flow as `vim.cmd`/`nvim_set_hl`). `name` (default
+  `[Panel]`) makes the panel unique, so re-opening replaces its content;
+  `filetype` (default `nxpanel`, whose ftplugin maps `q`/`<Esc>` to close) lets a
+  plugin pass its own filetype and wire its own keys. The only RPC method is the
+  read-only `nxvim_panel_is_open` (clients use it for chrome); there is no
+  separate panel content/cursor RPC because the panel *is* a window — its text,
+  cursor, and scroll ride the ordinary `WindowView`, and the redraw carries no
+  special `panel` map.
+- **Mouse.** A left-click in the panel window focuses its line like any window
+  (focus-lock keeps you inside the panel). It is one gesture in the editor's
+  broader, server-owned mouse support (click, drag-select, multi-click,
   shift-extend, wheel scroll, divider drag, the `'mousemodel'` right-click menu,
   middle-click paste, and tabline clicks), forwarded by both clients as
   `nx_input_mouse` with the server owning the hit-test.
@@ -723,10 +717,6 @@ highlight or scrolls a picker preview — so every front end (TUI, GUI, web) get
 overlay mouse for free by forwarding the same raw `nx_input_mouse` cell, with no
 client-side geometry. (Command-line-mode mouse needs `c` in `'mouse'`; the default
 `nvi` omits it.)
-
-The redraw carries the panel as a `panel` map (`title`, `lines`, `cursor_row`,
-`height`), `Nil` when none is open; the client draws the editing cursor inside
-the panel while it has focus.
 
 ---
 
@@ -777,10 +767,11 @@ the `nx.*` API ([ADR 0002](decisions/0002-native-plugin-system.md);
 is exactly one thing: a closed whitelist of **muscle-memory aliases** —
 variables / options / env (`vim.g`, `vim.o`/`vim.opt`, scoped variants),
 `vim.cmd` / `vim.keymap.set`, the declarative registrations (autocmds, user
-commands, the `nvim_set_hl` highlight helper colorschemes use, `vim.filetype.add`),
+commands, the `nvim_set_hl` highlight helper colorschemes use),
 the pure helpers (`vim.tbl_*`,
 `vim.split`, `vim.inspect`, …), and the callback-shaped async (`vim.notify`,
-`vim.schedule`/`vim.defer_fn`, `vim.ui.*`, callback-form `vim.system`) —
+`vim.schedule`/`vim.defer_fn`, `vim.ui.*`) — process spawning is the
+promise-based `nx.run`, not a `vim.system` alias —
 mapping 1:1 onto the `nx` equivalents so config can be written in familiar
 muscle-memory terms (the
 canonical list: [ADR 0002](decisions/0002-native-plugin-system.md)). The
@@ -828,34 +819,33 @@ designs:
 and
 [the catppuccin colorscheme](specs/2026-06-01-catppuccin-colorscheme-design.md).
 
-### `nx.treesitter` — control, not a parser API
+### Treesitter control — declarative buffer state, not a parser API
 
 The native engine above *is* nxvim's treesitter. There is no Lua parser/AST
 platform: per [ADR 0002](decisions/0002-native-plugin-system.md) the vendored
 neovim `vim.treesitter` Lua (the `LanguageTree` / `get_parser` / `TSNode`
 machinery and the Rust primitives that backed it) was **deleted** — it existed
-only to host third-party neovim plugins, a non-goal. What remains is a small **control**
-surface over the engine, `nx.treesitter`:
+only to host third-party neovim plugins, a non-goal. There is no `nx.treesitter`
+*nor* `vim.treesitter` table at all (`vim.treesitter.*` is wholly absent). What
+remains is a tiny control surface over the engine, and it is **declarative buffer
+state**, not a verb API:
 
-- **Highlight control is declarative buffer state** (the two-noun model):
-  `nx.bo.filetype` chooses the language, `nx.bo.ts_highlight` chooses whether the
-  engine paints it. `nx.treesitter.start(buf, lang)` / `stop(buf)` are thin verbs
-  over those nouns (start = set filetype + enable; stop = disable, keeping the
-  filetype so LSP/indent still see the language). `:set filetype` / `:setf` write
-  the same per-buffer override, so there is a no-Lua path too (the web build,
-  which has no Lua, drives it from the ex line).
-- **Query customization is `nx.treesitter.set_query(lang, name, text)`** — it
-  installs a `highlights` / `injections` / `indents` override straight on the
-  engine (a replace, `nil` to drop). There is no `;extends` / `after-queries` /
-  runtimepath *merge*: base queries come from the engine's data-dir files, an
-  override replaces them.
+- **Highlight control is the two-noun model**: `nx.bo.filetype` chooses the
+  language, `nx.bo.ts_highlight` chooses whether the engine paints it. There is no
+  `start`/`stop` verb — setting the filetype and flipping `ts_highlight` *is* how
+  you start/stop highlighting. `:set filetype` / `:setf` write the same per-buffer
+  override, so there is a no-Lua path too (the web build, which has no Lua, drives
+  it from the ex line).
+- **Query customization is the native bridge `nx._nx_set_ts_query(lang, name,
+  text|nil)`** — it queues a `TsOp::SetQuery` the server pushes straight onto the
+  engine, installing a `highlights` / `injections` / `indents` override (a
+  replace, `nil` to drop). There is no `;extends` / `after-queries` / runtimepath
+  *merge*: base queries come from the engine's data-dir files, an override
+  replaces them.
 
 Injections are engine-native: the engine runs the resolved `injections` query
 over the live tree and parses each region with its child grammar, per-edit and
 synchronous (see [injections](specs/2026-06-08-treesitter-injections-design.md)).
-The one bounded `vim.treesitter` alias kept for muscle memory is `start` / `stop`
-(mapped onto the `nx` verbs); every other `vim.treesitter.*` field is absent and
-fails loud.
 
 The boundary this section embodies — **native engine for editor behavior, a
 Lua scripting layer on top** — is the same one LSP follows (a native
@@ -863,7 +853,7 @@ async server under a Lua control surface), recorded in
 [ADR 0001](decisions/0001-native-engines-vendored-lua-apis.md) and carried
 forward by [ADR 0002](decisions/0002-native-plugin-system.md) (which retires
 the vendored vim-named spelling in favor of `nx.*`). ADR 0001
-also names the *bridge pattern* (`vim.treesitter.start`, LSP semantic tokens)
+also names the *bridge pattern* (the treesitter query bridge, LSP semantic tokens)
 by which a scripting API is wired to the native engine underneath, projecting
 into
 the extmark highlight layer rather than into core's synchronous path.
@@ -1074,7 +1064,8 @@ screen," and that is exactly the shape of these tests.
   paint it unchanged; see
   [the segment plan](plans/2026-06-15-nx-statusline-segments.md)), **viewport
   decorations** (`nx.decor` — off-tick providers woken once per visible-range
-  change that publish generation-gated extmarks, now including **virtual text**;
+  change that publish generation-gated extmarks; v1 renders highlight (`hl`) marks
+  only — `virt_text`/`sign`/`conceal` are not yet exposed in the provider API;
   see [the decor plan](plans/2026-06-15-nx-decor-viewport-decorations.md)), the
   **floating-widget UI layer** (`nx.ui.input`/`select`/`confirm`/`float`,
   promise-based; see
@@ -1096,12 +1087,12 @@ screen," and that is exactly the shape of these tests.
   [*Known approximations*](known-approximations.md).) Treesitter **injections**
   have landed (engine-native, see
   [*Syntax highlighting*](#syntax-highlighting-treesitter)). Treesitter is the
-  **native engine**; control is `nx.treesitter` (see
-  [*`nx.treesitter` — control, not a parser API*](#nxtreesitter--control-not-a-parser-api)):
-  highlight on/off + language are declarative buffer state (`nx.bo.filetype` /
-  `nx.bo.ts_highlight`, also reachable from `:set`), query customization is
-  `nx.treesitter.set_query`, and **injections** are engine-native. There is no Lua
-  parser/AST platform (the vendored `vim.treesitter` Lua was deleted — ADR 0002);
+  **native engine**; control is declarative buffer state (see
+  [*Treesitter control*](#treesitter-control--declarative-buffer-state-not-a-parser-api)):
+  highlight on/off + language are buffer nouns (`nx.bo.filetype` /
+  `nx.bo.ts_highlight`, also reachable from `:set`), query customization is the
+  native bridge `nx._nx_set_ts_query`, and **injections** are engine-native. There
+  is no Lua parser/AST platform (the vendored `vim.treesitter` Lua was deleted — ADR 0002);
   **Lua-driven indent remains the one deferred item on this axis.**
 - **Window-local options.** Multiple **windows** (splits, the layout tree,
   per-window view state, the `<C-w>` family, and the `nvim_win_*` / Lua API),
@@ -1149,8 +1140,9 @@ screen," and that is exactly the shape of these tests.
   the only prompt surface is the callback-shaped `vim.ui.input` / `vim.ui.select`.)
   Legacy Vimscript (`eval.c`) is **not** on the roadmap — see guiding principle 2.
 - A broad options surface. `:set` exists and honors the search booleans, the
-  **window-local** number-gutter options `number` / `relativenumber` and the
-  cursor-line highlight `cursorline` (also via `:setlocal` / `vim.wo` /
+  **window-local** number-gutter options `number` / `relativenumber`, the
+  cursor-line highlight `cursorline`, and soft word-wrap `wrap`
+  (`breakindent`/`showbreak`) (also via `:setlocal` / `vim.wo` /
   `nvim_win_{get,set}_option`) and the window-local
   horizontal-scroll options `sidescroll` / `sidescrolloff` (via `:set`), and the
   **buffer-local** indentation options `tabstop` / `shiftwidth` / `softtabstop` /

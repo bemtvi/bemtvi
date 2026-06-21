@@ -1236,6 +1236,14 @@ pub struct Editor {
     /// though detection / reload live in core. Both `:checktime` and the per-buffer
     /// file watch ([`Editor::checktime_buffer`]) enqueue here.
     pending_checktime: Vec<BufferId>,
+    /// Set by `<C-w>d` / `<C-w><C-d>` (neovim's built-in "show diagnostics under
+    /// the cursor" default), drained by the server with
+    /// [`Editor::take_diagnostic_float`]. The float reads the LSP/client diagnostic
+    /// store that lives behind the server seam, so core only records the request;
+    /// the server opens the float in `run_pending`. (The `]d`/`[d` cursor moves go
+    /// the other way — Lua keymaps → `LspOp` — because they only move the cursor,
+    /// which core *can* do.)
+    pending_diagnostic_float: bool,
 
     /// Deferred shada I/O requests (`:wshada` / `:rshada`) raised this tick, drained
     /// by the server with [`Editor::take_pending_shada`]. Core can't touch the store
@@ -1510,6 +1518,7 @@ impl Editor {
             pending_quit_all: None,
             write_events: Vec::new(),
             pending_checktime: Vec::new(),
+            pending_diagnostic_float: false,
             pending_shada: Vec::new(),
             pending_terminal: Vec::new(),
             terminal_pending_backslash: false,
@@ -1973,6 +1982,11 @@ impl Editor {
     /// is what keeps `rg`/`fg` instant: without it the matcher withholds the `g` as
     /// a live prefix of the native `gd`/`gr` maps and the command appears to hang.
     ///
+    /// A mark name is likewise a literal: `m{mark}` sets it, and `` `{mark} ``/
+    /// `'{mark}` jump to it — the name char is read raw, never mapped. Without this
+    /// a mapped prefix that shares the name's first key (e.g. a `[d`/`[e` default
+    /// over the `[` of `` `[ ``/`'['`) would be withheld and the jump would hang.
+    ///
     /// `GPending` and `WindowPending` are deliberately excluded: `g`-prefix and
     /// `<C-w>`-prefix keys *do* participate in mapping (the native `gd`/`gr`/`gg`
     /// disambiguation, and user `<C-w>x` maps), so they must still go through the
@@ -1984,6 +1998,8 @@ impl Editor {
                 | Stage::FindPending(_)
                 | Stage::RegisterPending
                 | Stage::TextObjectPending(_)
+                | Stage::MarkSetPending
+                | Stage::MarkJumpPending(_, _)
         )
     }
 

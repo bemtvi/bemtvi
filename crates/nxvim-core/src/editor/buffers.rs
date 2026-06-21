@@ -1075,6 +1075,14 @@ impl Editor {
         !self.pending_checktime.is_empty()
     }
 
+    /// Take the pending `<C-w>d` / `<C-w><C-d>` "show diagnostics under the cursor"
+    /// request: `true` once after the chord, then cleared. The server drains this in
+    /// `run_pending` and opens the diagnostic float — core can't, since the
+    /// diagnostic store lives behind the server seam.
+    pub fn take_diagnostic_float(&mut self) -> bool {
+        std::mem::take(&mut self.pending_diagnostic_float)
+    }
+
     /// Whether buffer `id` has unsaved edits — `false` for an unknown buffer. The
     /// server reads this to classify a remote file change (modified ⇒ a `"conflict"`).
     pub fn buffer_modified(&self, id: BufferId) -> bool {

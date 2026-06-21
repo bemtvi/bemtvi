@@ -1,0 +1,17 @@
+-- a tiny "linted" file: the diagnostics below are pinned to these lines
+local function greet(name)
+  prnit("hello, " .. name)        -- typo: prnit (error on this line)
+  return naem                     -- typo: naem (error on this line)
+end
+
+local count = 0
+local unusedLocal = 42            -- never read (warning on this line)
+
+while true do                     -- possible infinite loop (warning)
+  count = count + 1
+  if count > 10 then brek end     -- typo: brek (error on this line)
+end
+
+greet("world")
+local x = undefinedThing          -- undefined (error on this line)
+print(count)                      -- hint: prefer io.write (hint on this line)

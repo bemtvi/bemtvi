@@ -230,6 +230,50 @@ function nx.diagnostic.open_float(_opts)
   nx._diagnostic_open_float()
 end
 
+-- ----- the built-in diagnostic-navigation keymaps (neovim's core defaults) ----
+-- `]d`/`[d` jump to the next/previous diagnostic; `]e`/`[e` to the next/previous
+-- *error* (severity ERROR only). `<C-w>d` (show the cursor's diagnostics in a
+-- float) is the third upstream default, but it rides the native `<C-w>` window
+-- grammar in core, not the keymap engine, so it is wired there — not here.
+-- Registered with `default = true` so a user/plugin map on any of these wins, and
+-- an empty-function map disables it; mirrors the cmdline defaults in keymap.lua.
+--
+-- NOTE: upstream neovim ships `]d`/`[d` and `<C-w>d` as core defaults but NOT
+-- `]e`/`[e` — those are a common (telescope/trouble-era) convention for
+-- error-only navigation, added here alongside the real defaults.
+for _, m in ipairs({
+  {
+    "]d",
+    function()
+      nx.diagnostic.goto_next()
+    end,
+    "Next diagnostic",
+  },
+  {
+    "[d",
+    function()
+      nx.diagnostic.goto_prev()
+    end,
+    "Previous diagnostic",
+  },
+  {
+    "]e",
+    function()
+      nx.diagnostic.goto_next({ severity = nx.diagnostic.severity.ERROR })
+    end,
+    "Next error",
+  },
+  {
+    "[e",
+    function()
+      nx.diagnostic.goto_prev({ severity = nx.diagnostic.severity.ERROR })
+    end,
+    "Previous error",
+  },
+}) do
+  nx.keymap.set("n", m[1], m[2], { default = true, desc = m[3] })
+end
+
 -- The built-in gutter sign glyphs, indexed 1=ERROR…4=HINT (neovim's `E`/`W`/`I`/
 -- `H` letters), overridden per-severity by the `signs.text` map.
 local DEFAULT_SIGN_TEXT = { "E", "W", "I", "H" }

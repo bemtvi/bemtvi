@@ -57,6 +57,12 @@ enum WindowCmd {
     MaxHeight,
     /// `<C-w>|` — maximize the focused window's width.
     MaxWidth,
+    /// `<C-w>d` / `<C-w><C-d>` — show the diagnostics under the cursor in a float
+    /// (neovim's built-in default). The float is a server surface, so core only
+    /// records the request ([`Editor::take_diagnostic_float`]); the server opens it
+    /// in `run_pending`. Independent of the focused layer — it acts on the current
+    /// buffer's diagnostics.
+    ShowDiagnostics,
 }
 
 /// A `<C-w><C-w>` *layer* command — the doubled-prefix grammar that crosses
@@ -88,6 +94,8 @@ fn window_command(key: Key) -> Option<WindowCmd> {
     if key.ctrl {
         return match key.code {
             KeyCode::Char('w') => Some(WindowCmd::FocusCycle(true)),
+            // `<C-w><C-d>` — the control-key twin of `<C-w>d` (neovim maps both).
+            KeyCode::Char('d') => Some(WindowCmd::ShowDiagnostics),
             _ => None,
         };
     }
@@ -115,6 +123,7 @@ fn window_command(key: Key) -> Option<WindowCmd> {
         '<' => WindowCmd::ResizeWidth(false),
         '_' => WindowCmd::MaxHeight,
         '|' => WindowCmd::MaxWidth,
+        'd' => WindowCmd::ShowDiagnostics,
         _ => return None,
     })
 }
@@ -2064,6 +2073,9 @@ impl Editor {
             }
             WindowCmd::MaxHeight => self.maximize_window(SplitDir::Horizontal),
             WindowCmd::MaxWidth => self.maximize_window(SplitDir::Vertical),
+            // The float lives in the server (it reads the LSP/client diagnostic
+            // store core can't touch); just record the request for `run_pending`.
+            WindowCmd::ShowDiagnostics => self.pending_diagnostic_float = true,
         }
     }
 

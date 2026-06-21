@@ -2500,6 +2500,14 @@ impl EditHost {
             // a handler that itself writes (`vim.cmd('w')`) keeps the loop going via the
             // `has_write_events` break check below.
             self.drain_write_events();
+            // `<C-w>d` / `<C-w><C-d>` (neovim's built-in "show diagnostics under the
+            // cursor"): core recorded the chord on the keystroke; open the float here
+            // — the diagnostic store lives behind the server seam, so core can't. The
+            // same surface `nx.diagnostic.open_float()` uses; a clean line is a loud
+            // no-op (an echoed message). One-shot: `take_diagnostic_float` clears it.
+            if self.editor.take_diagnostic_float() {
+                self.diagnostics_open_float();
+            }
             // A completion row whose accept was **delegated** (the built-in `lsp`
             // source): core recorded the chosen row's key on the keystroke; apply its
             // `textEdit` + `additionalTextEdits` here, which core can't (LSP/encoding-

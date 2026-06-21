@@ -459,6 +459,10 @@ local EXTMARK_OPT_DECORATION = {
   virt_lines_leftcol = true,
   sign_text = true,
   sign_hl_group = true,
+  -- `line_fill = { text, hl_group }` — an nx-native whole-line fill (the text
+  -- repeated across the line's width), e.g. a rule on a blank alignment row. Both
+  -- `sign_text` and `line_fill` RENDER (the rest below are stored-but-unpainted).
+  line_fill = true,
   number_hl_group = true,
   line_hl_group = true,
   cursorline_hl_group = true,

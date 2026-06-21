@@ -475,6 +475,76 @@ impl EditHost {
             })
             .collect()
     }
+
+    /// Augment the per-row `virt_text` payload with whole-line `line_fill` overlays:
+    /// for each row whose line carries a `line_fill` mark, append an `Overlay`
+    /// placement at column 0 whose chunk is the fill text repeated to cover the
+    /// window's text body (`text_width` cells — over-provisioned, the client clips
+    /// it to the body). This reuses the existing `virt_text` wire so no client
+    /// change is needed. The fill shows on the line's first display row only; the
+    /// highest-priority `line_fill` mark on a line wins. A no-op (returns the input
+    /// untouched) when no mark carries a fill.
+    pub(crate) fn apply_line_fill(
+        &self,
+        virt_text: Value,
+        buffer: BufferId,
+        segs: &[crate::redraw::RowSeg],
+        text_width: usize,
+        winhl: &WinHl,
+        styles: &mut StyleTable,
+    ) -> Value {
+        if text_width == 0 {
+            return virt_text;
+        }
+        let Some(buf) = self.editor.buffer_of(buffer) else {
+            return virt_text;
+        };
+        // The highest-priority line_fill mark per anchor line (ties → highest id).
+        use std::collections::HashMap;
+        let mut by_line: HashMap<usize, &nxvim_core::Extmark> = HashMap::new();
+        for m in buf.extmarks.iter_all() {
+            if m.decor.as_deref().is_some_and(|d| d.line_fill.is_some()) {
+                by_line
+                    .entry(buf.byte_to_line(m.start))
+                    .and_modify(|best| {
+                        if (m.priority, m.id) > (best.priority, best.id) {
+                            *best = m;
+                        }
+                    })
+                    .or_insert(m);
+            }
+        }
+        if by_line.is_empty() {
+            return virt_text;
+        }
+        let Value::Array(mut rows) = virt_text else {
+            return virt_text;
+        };
+        for (i, seg) in segs.iter().enumerate() {
+            let Some(n) = seg.line else { continue };
+            if !seg.is_first() {
+                continue;
+            }
+            let Some(m) = by_line.get(&(n - 1)) else {
+                continue;
+            };
+            let fill = match m.decor.as_deref().and_then(|d| d.line_fill.as_ref()) {
+                Some(f) if !f.text.is_empty() => f,
+                _ => continue,
+            };
+            // Repeat the fill text to cover the body width (clipped client-side); a
+            // multi-cell glyph just over-provisions a little.
+            let chunk = VirtChunk {
+                text: fill.text.repeat(text_width),
+                hl_group: fill.hl_group.clone(),
+            };
+            let placement = self.virt_placement_value(POS_OVERLAY, 0, 0, &[chunk], winhl, styles);
+            if let Some(Value::Array(row)) = rows.get_mut(i) {
+                row.push(placement);
+            }
+        }
+        Value::Array(rows)
+    }
 }
 
 /// The fixed `priority` a diagnostic gutter sign carries when it competes with an

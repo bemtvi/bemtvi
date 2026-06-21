@@ -134,7 +134,16 @@ fn virt_decor_from_table(t: &Table) -> mlua::Result<Option<VirtDecorData>> {
     // not hit the "nothing renderable" early-return below.
     let sign_text = t.get::<Option<String>>("sign_text")?;
     let sign_hl_group = t.get::<Option<String>>("sign_hl_group")?;
-    if virt_text.is_empty() && virt_lines.is_empty() && sign_text.is_none() {
+    // `line_fill = { text = <str>, hl_group = <str?> }` — an nx-native whole-line
+    // fill (the text repeated across the line). Likewise renderable on its own.
+    let line_fill = match t.get::<Option<Table>>("line_fill")? {
+        Some(f) => Some(VirtChunkData {
+            text: f.get::<String>("text")?,
+            hl_group: f.get::<Option<String>>("hl_group")?,
+        }),
+        None => None,
+    };
+    if virt_text.is_empty() && virt_lines.is_empty() && sign_text.is_none() && line_fill.is_none() {
         return Ok(None);
     }
     // Reject an unknown `virt_text_pos` / `hl_mode` loud here (at the scripting
@@ -166,6 +175,7 @@ fn virt_decor_from_table(t: &Table) -> mlua::Result<Option<VirtDecorData>> {
         virt_lines_above: t.get::<Option<bool>>("virt_lines_above")?.unwrap_or(false),
         sign_text,
         sign_hl_group,
+        line_fill,
     }))
 }
 

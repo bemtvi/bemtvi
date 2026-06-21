@@ -597,6 +597,9 @@ pub struct VirtDecorData {
     pub sign_text: Option<String>,
     /// Highlight group for the sign glyph (neovim's `sign_hl_group`).
     pub sign_hl_group: Option<String>,
+    /// `nx`-native whole-line fill `(text, hl_group)`: the text repeated across the
+    /// line's width. `None` ⇒ no fill.
+    pub line_fill: Option<VirtChunkData>,
 }
 
 #[derive(Clone, Debug)]

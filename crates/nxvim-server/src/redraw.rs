@@ -373,6 +373,18 @@ impl EditHost {
         // LSP overlays above, which are genuinely native-only. The wire shape is the
         // same on either build; only the transport differs.
         let virt_text = self.virt_text_for(win.buffer, &win.winhl, &segments, &selection, styles);
+        // Whole-line `line_fill` overlays (an nx-native blank-row rule). Appended to
+        // the virt_text payload as full-width Overlay placements — over-provisioned to
+        // the window width, the client clips them to the text body — so no client
+        // change. Like virt_text, shared by both builds.
+        let virt_text = self.apply_line_fill(
+            virt_text,
+            win.buffer,
+            &segments,
+            win.rect.width,
+            &win.winhl,
+            styles,
+        );
         // Extmark `virt_lines` (whole virtual rows). Core already interleaved them into
         // the window's rows (the `RowKind::VirtLine` rows, unbundled into `virt_lines`
         // above); the server only resolves each chunk's `hl_group` to a frame style id.

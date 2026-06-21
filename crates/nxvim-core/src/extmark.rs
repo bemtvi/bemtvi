@@ -148,6 +148,11 @@ pub struct VirtDecor {
     /// The highlight group for [`sign_text`](Self::sign_text) (neovim's
     /// `sign_hl_group`); `None` paints the glyph in normal colors.
     pub sign_hl_group: Option<String>,
+    /// An `nx`-native whole-line fill: the [`text`](VirtChunk::text) is repeated
+    /// across the anchored line's text area (e.g. a `-` rule on a blank alignment /
+    /// filler row), in [`hl_group`](VirtChunk::hl_group). Rendered as a full-width
+    /// overlay so a client needs no new wire field. `None` ⇒ no fill.
+    pub line_fill: Option<VirtChunk>,
 }
 
 /// A single extmark, identified within its buffer by `(namespace, id)`.

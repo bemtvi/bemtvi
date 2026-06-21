@@ -150,6 +150,10 @@ fn virt_decor_to_core(d: VirtDecorData) -> nxvim_core::VirtDecor {
         virt_lines_above: d.virt_lines_above,
         sign_text: d.sign_text,
         sign_hl_group: d.sign_hl_group,
+        line_fill: d.line_fill.map(|c| VirtChunk {
+            text: c.text,
+            hl_group: c.hl_group,
+        }),
     }
 }
 

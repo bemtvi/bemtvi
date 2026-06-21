@@ -971,3 +971,36 @@ async fn sign_text_round_trips_across_chunks() {
         "get_extmarks details returns the sign_text/sign_hl_group after the tick"
     );
 }
+
+/// An nx-native `line_fill` mark fills the anchored row with a repeated glyph,
+/// surfacing as a full-width `Overlay` (`pos=2`) virt_text placement at column 0 —
+/// e.g. a `-` rule on a blank alignment / filler row.
+#[tokio::test]
+async fn a_line_fill_mark_fills_the_row_with_a_glyph() {
+    let (rpc, mut incoming) = start().await;
+    // The empty buffer's row 0 is a blank line — fill it.
+    exec_lua(
+        &rpc,
+        r#"
+        local ns = vim.api.nvim_create_namespace('fill')
+        vim.api.nvim_buf_set_extmark(0, ns, 0, 0, { line_fill = { text = '-', hl_group = 'NonText' } })
+        "#,
+    )
+    .await;
+    let vt = wait_for_virt_text(&rpc, &mut incoming, |vt| {
+        vt.iter().any(|(pos, col, chunks)| {
+            *pos == 2 && *col == 0 && chunks.iter().any(|c| c.starts_with("---"))
+        })
+    })
+    .await;
+    let fill = vt
+        .iter()
+        .find(|(pos, _, _)| *pos == 2)
+        .expect("a line_fill Overlay placement");
+    assert_eq!(fill.1, 0, "the fill starts at column 0");
+    let text = fill.2.first().expect("the fill chunk text");
+    assert!(
+        text.len() >= 40 && text.chars().all(|c| c == '-'),
+        "the row is filled across its width with the glyph, got {text:?}"
+    );
+}

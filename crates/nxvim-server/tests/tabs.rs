@@ -1023,3 +1023,56 @@ async fn switchbuf_defaults_to_usetab() {
     let v = exec_lua(&rpc, "return nx.o.switchbuf").await;
     assert_eq!(v.as_str(), Some("usetab"), "default 'switchbuf' is usetab");
 }
+
+/// `:buffer N` (the `:ls`-then-`:b` navigation) honors `'switchbuf'`: under the
+/// default `usetab` it switches to a tab already showing the buffer, rather than
+/// swapping it into the current window.
+#[tokio::test]
+async fn buffer_command_with_usetab_switches_to_the_existing_tab() {
+    let a = temp_file("swb_b_a", "alpha\nbeta\n");
+    let b = temp_file("swb_b_b", "one\ntwo\n");
+    let (rpc, _incoming) = start().await;
+
+    feed_sync(&rpc, &format!(":edit {a}<CR>")).await; // tab 1 shows A
+    let a_buf = cur_buf(&rpc).await;
+    feed_sync(&rpc, &format!(":tabedit {b}<CR>")).await; // tab 2 shows B (focused)
+    assert_eq!(cur_tab(&rpc).await, 2);
+
+    feed_sync(&rpc, &format!(":buffer {a_buf}<CR>")).await;
+
+    assert_eq!(
+        tab_order(&rpc).await,
+        vec![1, 2],
+        ":buffer opens no new tab"
+    );
+    assert_eq!(
+        cur_tab(&rpc).await,
+        1,
+        ":buffer to a buffer open in another tab switches to that tab"
+    );
+    assert_eq!(cur_buf(&rpc).await, a_buf);
+
+    let _ = std::fs::remove_file(&a);
+    let _ = std::fs::remove_file(&b);
+}
+
+/// With `'switchbuf'` empty, `:buffer N` swaps into the current window — no tab hop.
+#[tokio::test]
+async fn buffer_command_with_empty_switchbuf_stays_in_current_tab() {
+    let a = temp_file("swb_be_a", "alpha\nbeta\n");
+    let b = temp_file("swb_be_b", "one\ntwo\n");
+    let (rpc, _incoming) = start().await;
+
+    feed_sync(&rpc, &format!(":edit {a}<CR>")).await;
+    let a_buf = cur_buf(&rpc).await;
+    feed_sync(&rpc, &format!(":tabedit {b}<CR>")).await;
+    lua_sync(&rpc, "nx.o.switchbuf = ''").await;
+
+    feed_sync(&rpc, &format!(":buffer {a_buf}<CR>")).await;
+
+    assert_eq!(cur_tab(&rpc).await, 2, "empty 'switchbuf' makes no tab hop");
+    assert_eq!(cur_buf(&rpc).await, a_buf);
+
+    let _ = std::fs::remove_file(&a);
+    let _ = std::fs::remove_file(&b);
+}

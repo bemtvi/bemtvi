@@ -582,7 +582,11 @@ impl Editor {
             "lspanels" | "panels" => self.ex_lspanels(),
             "b" | "bu" | "buf" | "buffer" => {
                 if let Some(id) = self.resolve_buffer(args) {
-                    self.switch_buffer(id);
+                    // Honor 'switchbuf' (the `:ls`-then-`:b` navigation): under the
+                    // default `usetab` a buffer already shown in another tab is focused
+                    // there, like the picker / a jump; an empty 'switchbuf' swaps it
+                    // into the current window.
+                    self.switch_to_buffer_switchbuf(id);
                 }
             }
             "bn" | "bnext" => self.ex_bnext(parse_count_arg(args)),

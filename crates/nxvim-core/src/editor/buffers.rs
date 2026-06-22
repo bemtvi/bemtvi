@@ -1399,6 +1399,36 @@ impl Editor {
         }
     }
 
+    /// Show an already-loaded buffer in a **new tab** — the picker buffers source's
+    /// `<C-t>`. An explicit gesture, so it always makes a new tab (ignores
+    /// `'switchbuf'`), unlike [`Editor::switch_to_buffer_switchbuf`]. A no-op for an
+    /// unknown id.
+    pub fn open_buffer_in_tab(&mut self, buf: BufferId) {
+        if !self.buffers.map.contains_key(&buf) {
+            return;
+        }
+        let options = self.windows.cur().options.clone();
+        self.new_tab(buf, options);
+    }
+
+    /// Show an already-loaded buffer in a **new split** of the focused window —
+    /// `vertical` ⇒ a vsplit (`<C-v>`), else horizontal (`<C-x>`) — the picker
+    /// buffers source's split gesture. Always splits (ignores `'switchbuf'`); the
+    /// raw [`Editor::switch_buffer`] swaps the buffer into the fresh window. A no-op
+    /// for an unknown id.
+    pub fn open_buffer_in_split(&mut self, buf: BufferId, vertical: bool) {
+        if !self.buffers.map.contains_key(&buf) {
+            return;
+        }
+        let dir = if vertical {
+            SplitDir::Vertical
+        } else {
+            SplitDir::Horizontal
+        };
+        self.split(dir);
+        self.switch_buffer(buf);
+    }
+
     /// Land the cursor at the 0-based `(line, byte col)`, clamped to the buffer and
     /// snapped to a grapheme boundary / valid normal-mode resting cell (exactly like
     /// a search landing). The cursor-positioning tail shared by [`Editor::jump_to`]

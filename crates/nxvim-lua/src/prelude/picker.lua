@@ -550,20 +550,10 @@ nx.picker.source({
     end
   end,
   confirm = function(item, mode)
-    -- `<C-t>`/`<C-x>`/`<C-v>`: show the buffer in a new tab / split (open the
-    -- window first, then swap the buffer into it — reusing the throwaway [No Name]
-    -- `:tabnew`/`:split`/`:vsplit` create).
-    local pre = (mode == "tab" and "tabnew")
-      or (mode == "split" and "split")
-      or (mode == "vsplit" and "vsplit")
-    if pre then
-      vim.cmd(pre)
-      vim.cmd("buffer " .. item.bufnr)
-    else
-      -- Honor 'switchbuf': a buffer already shown in another tab is focused there
-      -- (the default `usetab`), rather than swapped into the current window.
-      nx._buf_switch(item.bufnr)
-    end
+    -- The mode rides the bridge: "current" honors 'switchbuf' (a buffer shown in
+    -- another tab is focused there under the default `usetab`); "tab"/"split"/
+    -- "vsplit" (`<C-t>`/`<C-x>`/`<C-v>`) open it in a new tab / split regardless.
+    nx._buf_switch(item.bufnr, mode)
   end,
 })
 

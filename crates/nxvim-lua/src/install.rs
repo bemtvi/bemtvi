@@ -1365,8 +1365,11 @@ pub(crate) fn install_runtime_api(
     let sh = shared.clone();
     nx.set(
         "_buf_switch",
-        lua.create_function(move |_, buf: u64| {
-            sh.borrow_mut().window_ops.push(WindowOp::BufSwitch { buf });
+        lua.create_function(move |_, (buf, mode): (u64, Option<String>)| {
+            let target = crate::ops::OpenTarget::from_mode(mode.as_deref());
+            sh.borrow_mut()
+                .window_ops
+                .push(WindowOp::BufSwitch { buf, target });
             Ok(())
         })?,
     )?;

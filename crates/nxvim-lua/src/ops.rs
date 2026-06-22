@@ -851,11 +851,13 @@ pub enum WindowOp {
     /// in the current window. Unlike [`Jump`](Self::Jump) it does not force a cursor
     /// position — a reused window keeps its place. See `Editor::open_path_switchbuf`.
     OpenSwitchbuf { path: String },
-    /// `nx._buf_switch(bufnr)` — switch to an already-loaded buffer honoring
-    /// `'switchbuf'` (the `nx.picker` buffers source's confirm): focus a window
-    /// already showing it (switching tabs for `usetab`) else swap it into the
-    /// current window. See `Editor::switch_to_buffer_switchbuf`.
-    BufSwitch { buf: u64 },
+    /// `nx._buf_switch(bufnr[, mode])` — show an already-loaded buffer (the
+    /// `nx.picker` buffers source's confirm). `Current` honors `'switchbuf'` (focus a
+    /// window already showing it, switching tabs for `usetab`, else swap it into the
+    /// current window); `Tab`/`Split`/`Vsplit` (`<C-t>`/`<C-x>`/`<C-v>`) always open
+    /// it in a new tab / split. See `Editor::switch_to_buffer_switchbuf` /
+    /// `open_buffer_in_tab` / `open_buffer_in_split`.
+    BufSwitch { buf: u64, target: OpenTarget },
     /// `vim.fn.winrestview({ topline = N })` (run via `nvim_win_call`) — scroll
     /// window `win` so its first visible line is `top` (0-based; the prelude
     /// converts neovim's 1-based `topline`).

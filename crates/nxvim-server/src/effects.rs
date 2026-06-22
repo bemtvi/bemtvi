@@ -1322,8 +1322,15 @@ impl EditHost {
                 // no forced cursor — a reused window keeps its place.
                 self.editor.open_path_switchbuf(std::path::Path::new(&path));
             }
-            WindowOp::BufSwitch { buf } => {
-                self.editor.switch_to_buffer_switchbuf(BufferId(buf));
+            WindowOp::BufSwitch { buf, target } => {
+                use nxvim_lua::OpenTarget;
+                let id = BufferId(buf);
+                match target {
+                    OpenTarget::Current => self.editor.switch_to_buffer_switchbuf(id),
+                    OpenTarget::Tab => self.editor.open_buffer_in_tab(id),
+                    OpenTarget::Split => self.editor.open_buffer_in_split(id, false),
+                    OpenTarget::Vsplit => self.editor.open_buffer_in_split(id, true),
+                }
             }
             WindowOp::SetTopline { win, top } => {
                 let id = resolve_win(self, win);

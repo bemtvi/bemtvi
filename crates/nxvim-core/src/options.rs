@@ -184,6 +184,13 @@ pub struct Options {
     /// session capture by [`crate::editor::persist`]; the native counterpart of
     /// [`Options::relative_splits`] for edge docks.
     pub relative_docks: bool,
+    /// Whether opening or closing a window automatically re-equalizes every window
+    /// to even sizes (`'equalalways'`; default `true`, as in vim). With it on, a
+    /// `:split` / `:vsplit` and a window close both run the same leaf-count-weighted
+    /// pass `<C-w>=` uses, so the layout stays balanced. Unset it to keep the
+    /// classic carve-from-one-neighbor sizing and only rebalance on an explicit
+    /// `<C-w>=`. Honored by [`crate::editor::windows`].
+    pub equalalways: bool,
 }
 
 /// The default `'errorformat'` — vim's compiled-in non-Windows `DFLT_EFM`
@@ -262,6 +269,8 @@ impl Default for Options {
             // keeps docks at their cell size unless asked otherwise.
             relative_splits: true,
             relative_docks: false,
+            // vim's default: opening/closing a window keeps the layout balanced.
+            equalalways: true,
         }
     }
 }
@@ -1319,6 +1328,13 @@ static OPTIONS: &[OptionInfo] = {
             kind: Bool,
             scope: Global,
             doc: "Save session dock sizes as % of the screen (vs absolute cells).",
+        },
+        OptionInfo {
+            name: "equalalways",
+            abbrev: Some("ea"),
+            kind: Bool,
+            scope: Global,
+            doc: "Opening/closing a window re-equalizes all windows to even sizes.",
         },
     ]
 };

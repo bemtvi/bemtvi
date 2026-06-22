@@ -385,6 +385,9 @@ pub struct GoMirror {
     /// `'relative_docks'` — whether a saved session stores dock sizes as a percentage
     /// of the screen (default false). Backs `nx.o.relative_docks`.
     pub relative_docks: bool,
+    /// `'equalalways'` — whether opening/closing a window re-equalizes all windows
+    /// to even sizes (default true). Backs `vim.o.equalalways` / `nx.o.equalalways`.
+    pub equalalways: bool,
 }
 
 /// The pure-Lua `vim.*` prelude, split into focused modules under `src/prelude/`

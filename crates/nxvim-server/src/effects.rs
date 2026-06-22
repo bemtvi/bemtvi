@@ -1928,6 +1928,7 @@ impl EditHost {
             bdclosetab: go.bdclosetab,
             relative_splits: go.relative_splits,
             relative_docks: go.relative_docks,
+            equalalways: go.equalalways,
         });
         // The register file, mirrored so `vim.fn.getreg` / `getregtype` read the
         // core's current registers (stored cells + the read-only specials). Small

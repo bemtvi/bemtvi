@@ -95,6 +95,7 @@ impl Editor {
             "bdclosetab" => &mut self.options.bdclosetab,
             "relative_splits" => &mut self.options.relative_splits,
             "relative_docks" => &mut self.options.relative_docks,
+            "equalalways" => &mut self.options.equalalways,
             "expandtab" => &mut self.buffer_mut().options.expandtab,
             "bomb" => &mut self.buffer_mut().options.bomb,
             "modifiable" => &mut self.buffer_mut().options.modifiable,

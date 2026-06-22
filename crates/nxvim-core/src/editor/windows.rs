@@ -1109,17 +1109,46 @@ fn maximize_toward(node: &mut Node, target: WindowId, axis: SplitDir) -> bool {
     }
 }
 
-/// Reset every split's `sizes` to equal weights (vim's `<C-w>=`); the next
-/// layout renders even shares.
+/// The maximum number of leaf windows lying side-by-side *along* `dir` within
+/// `node` — vim's `frame_minwidth` / `frame_minheight` window count. A split in
+/// the same orientation as `dir` lays its children end to end, so their counts
+/// **add**; a split across `dir` stacks them in that dimension, so they share the
+/// span and the **max** wins. A leaf is one window wide either way. This is the
+/// weight `<C-w>=` needs so every leaf ends the same size: weighting each child
+/// by its own leaf count would over-credit a child that merely nests *across*
+/// the split direction (e.g. `A | (B/C)` would wrongly give the right column
+/// twice `A`'s width).
+fn span_windows(node: &Node, dir: SplitDir) -> usize {
+    match node {
+        Node::Leaf(_) => 1,
+        Node::Split {
+            dir: d, children, ..
+        } => {
+            let spans = children.iter().map(|c| span_windows(c, dir));
+            if *d == dir {
+                spans.sum()
+            } else {
+                spans.max().unwrap_or(1)
+            }
+        }
+    }
+}
+
+/// Reset every split's `sizes` so the next layout renders all leaf windows at
+/// even size (vim's `<C-w>=`). Each child is weighted by the number of windows
+/// it spans *along the split's own direction* ([`span_windows`]), not a flat `1`
+/// — so a nested, lopsided layout (`A | (B/C)`) equalizes to three equal columns
+/// rather than leaving `A` as wide as the whole `B/C` column.
 fn equalize_node(node: &mut Node) {
     if let Node::Split {
-        children, sizes, ..
+        dir,
+        children,
+        sizes,
     } = node
     {
-        for s in sizes.iter_mut() {
-            *s = 1;
-        }
-        for child in children.iter_mut() {
+        let dir = *dir;
+        for (i, child) in children.iter_mut().enumerate() {
+            sizes[i] = span_windows(child, dir);
             equalize_node(child);
         }
     }
@@ -1434,6 +1463,7 @@ impl Editor {
             "bdclosetab" => self.options.bdclosetab = value,
             "relative_splits" => self.options.relative_splits = value,
             "relative_docks" => self.options.relative_docks = value,
+            "equalalways" => self.options.equalalways = value,
             _ => {}
         }
     }
@@ -2050,6 +2080,12 @@ impl Editor {
         );
         split_leaf(&mut self.windows.root, cur, dir, new_id);
         self.windows.current = new_id;
+        // vim's `'equalalways'` (default on): opening a window re-equalizes the
+        // whole tree so the new split and its siblings share the area evenly,
+        // rather than the new window carving its space out of one neighbor.
+        if self.options.equalalways {
+            equalize_node(&mut self.windows.root);
+        }
         // The new window shows the same buffer at the same position, so the live
         // `cursor`/`top` already describe it — only the viewport shrank.
         self.relayout();
@@ -2202,13 +2238,21 @@ impl Editor {
         let was_focused = victims.contains(&self.windows.current);
         // A float is not in the layout tree — drop it from the float list; a
         // tiled window collapses its parent split.
+        let mut removed_tiled = false;
         for &v in &victims {
             if self.windows.get(v).float.is_some() {
                 self.windows.floats.retain(|f| *f != v);
             } else {
                 remove_leaf(&mut self.windows.root, v);
+                removed_tiled = true;
             }
             self.windows.windows.remove(&v);
+        }
+        // vim's `'equalalways'` (default on): closing a tiled window re-equalizes
+        // the survivors rather than handing all the freed space to one neighbor.
+        // Floats aren't in the tree, so only a tiled close triggers it.
+        if removed_tiled && self.options.equalalways {
+            equalize_node(&mut self.windows.root);
         }
         if was_focused {
             // Pick the spatially nearest survivor (using the pre-relayout rects)

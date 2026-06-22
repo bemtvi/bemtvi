@@ -875,6 +875,9 @@ fn window_view(ed: &Editor, w: &WindowLayout) -> WindowView {
             .clone()
             .filter(|t| !t.is_empty())
             .unwrap_or_else(|| "terminal".to_string())
+    } else if let Some(name) = buf.view_name.as_ref().filter(|n| !n.is_empty()) {
+        // A plugin view (`nx.view`) has no file path; it shows its `create` name.
+        name.clone()
     } else {
         buf.path
             .as_ref()

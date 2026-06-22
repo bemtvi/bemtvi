@@ -70,6 +70,36 @@ fn regions(map: &[(Value, Value)]) -> Vec<String> {
         .collect()
 }
 
+/// The `file_name` (statusline name) of every window in a redraw map.
+fn win_names(map: &[(Value, Value)]) -> Vec<String> {
+    let Some(Value::Array(wins)) = map_get(map, "windows") else {
+        return Vec::new();
+    };
+    wins.iter()
+        .filter_map(|w| match w {
+            Value::Map(m) => map_get(m, "file_name")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+            _ => None,
+        })
+        .collect()
+}
+
+/// The tabline cell labels in a redraw map (empty when only one tab is open).
+fn tab_labels(map: &[(Value, Value)]) -> Vec<String> {
+    let Some(Value::Array(tabs)) = map_get(map, "tabline") else {
+        return Vec::new();
+    };
+    tabs.iter()
+        .filter_map(|t| match t {
+            Value::Map(m) => map_get(m, "label")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+            _ => None,
+        })
+        .collect()
+}
+
 // ===== nx.open / nx.layer ====================================================
 
 /// `nx.open(file, { where = "main" })` fired while a dock is focused opens the file
@@ -337,6 +367,99 @@ async fn tab_mount_plus_split_builds_a_two_pane_tab() {
     exec_lua(&rpc, "a:close(); b:close()").await;
     assert_eq!(tab_count(&rpc).await, 1);
     assert_eq!(lines(&rpc).await, vec!["main"]);
+}
+
+/// A view's `create{ name = … }` is its display name: it shows in the window's statusline
+/// and labels its tab, instead of the `[No Name]` a pathless buffer would read. The hook a
+/// multi-pane diff uses so each pane reads as its side ("ours" / "base" / "theirs").
+#[tokio::test]
+async fn view_name_shows_in_statusline_and_tab_label() {
+    let (rpc, mut incoming) = start().await;
+    feed_sync(&rpc, "imain<Esc>").await;
+    exec_lua(
+        &rpc,
+        r#"vw = nx.view.create{ name = "ours" }
+           vw:set_lines{ "x" }
+           vw:mount{ tab = true }"#,
+    )
+    .await;
+    rpc.request("nvim_get_mode", vec![]).await.expect("barrier");
+    let map = latest(&mut incoming);
+    assert!(
+        win_names(&map).iter().any(|n| n == "ours"),
+        "the view's window shows its create name, not [No Name]: {:?}",
+        win_names(&map)
+    );
+    assert!(
+        tab_labels(&map).iter().any(|l| l == "ours"),
+        "the view's tab is labelled with its name: {:?}",
+        tab_labels(&map)
+    );
+}
+
+/// A view buffer is a surface, not a document: it never appears in `:ls` / `:bnext`
+/// navigation, so once closed it can't be cycled back into. Here `:bnext` from an
+/// ordinary buffer skips the mounted view and wraps to the only other real buffer.
+#[tokio::test]
+async fn view_buffers_are_skipped_by_buffer_navigation() {
+    let (rpc, _incoming) = start().await;
+    // Two ordinary file buffers in the main area.
+    let f1 = write_temp("nxview_nav_a", "txt", "alpha\n");
+    let f2 = write_temp("nxview_nav_b", "txt", "beta\n");
+    exec_lua(&rpc, &format!(r#"nx.open({f1:?}, {{ where = "main" }})"#)).await;
+    exec_lua(&rpc, &format!(r#"nx.open({f2:?}, {{ where = "main" }})"#)).await;
+    // A view, mounted in the main area as a split — its buffer lives in the main layer.
+    exec_lua(
+        &rpc,
+        r#"vw = nx.view.create{ name = "tree" }
+           vw:set_lines{ "view" }
+           vw:mount{ split = "vsplit" }"#,
+    )
+    .await;
+    // Focus a real buffer, then cycle through every buffer with `:bnext`. The view must
+    // never become current — its content ("view") never shows.
+    exec_lua(&rpc, &format!(r#"nx.open({f1:?}, {{ where = "main" }})"#)).await;
+    for _ in 0..4 {
+        feed_sync(&rpc, ":bnext<CR>").await;
+        assert_ne!(
+            lines(&rpc).await,
+            vec!["view"],
+            "`:bnext` must never land on the view buffer"
+        );
+    }
+}
+
+/// Closing a view's window by the USER path (`:q`) fires its `on_close` — the hook a
+/// multi-pane diff uses to tear the whole group down when one pane is `:q`'d. A
+/// programmatic `:close()` does NOT fire it (so the group teardown can't recurse).
+#[tokio::test]
+async fn view_on_close_fires_on_user_quit_only() {
+    let (rpc, _incoming) = start().await;
+    feed_sync(&rpc, "imain<Esc>").await;
+    exec_lua(
+        &rpc,
+        r#"_G.closed = 0
+           vw = nx.view.create{ name = "pane" }
+           vw:set_lines{ "x" }
+           vw:on_close(function() _G.closed = _G.closed + 1 end)
+           vw:mount{ split = "vsplit" }"#,
+    )
+    .await;
+    // Programmatic unmount: must NOT fire on_close (only the user close path records it).
+    exec_lua(&rpc, "vw:unmount()").await;
+    assert_eq!(
+        lua_u64(&rpc, "return _G.closed").await,
+        Some(0),
+        ":unmount() does not fire on_close"
+    );
+    // Re-mount, then close it the way the user does (`:q` on the focused view window).
+    exec_lua(&rpc, "vw:mount{ split = 'vsplit' }").await;
+    feed_sync(&rpc, ":q<CR>").await;
+    assert_eq!(
+        lua_u64(&rpc, "return _G.closed").await,
+        Some(1),
+        "`:q` on the view window fired on_close exactly once"
+    );
 }
 
 /// `:set_decor` lays extmarks on the view buffer (read back via

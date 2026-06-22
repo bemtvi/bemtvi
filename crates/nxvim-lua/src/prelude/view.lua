@@ -64,6 +64,7 @@ function nx.view.create(opts)
     filetype = opts.filetype or "",
     _userdata = {},
     _on_select = nil,
+    _on_close = nil,
   }, View)
   nx._views[id] = self
   nx.view._create(id, self.name, self.filetype)
@@ -87,6 +88,16 @@ end
 -- cursor line and that line's userdata entry. Pure Lua state.
 function View:on_select(fn)
   self._on_select = fn
+  return self
+end
+
+-- :on_close(fn) — `fn()` fires when the USER closes the view's window (`:q` / `:close` /
+-- `<C-w>c` on the view buffer), letting the owner tear down a group of related views
+-- (e.g. close every diff pane when one is `:q`'d). It does NOT fire on a programmatic
+-- `:unmount()` / `:close()` — only the user close path records it — so the handler can
+-- freely close other views without recursion. Pure Lua state.
+function View:on_close(fn)
+  self._on_close = fn
   return self
 end
 
@@ -266,4 +277,14 @@ function nx._view_select(id, line)
   end
   local ud = v._userdata and v._userdata[line]
   v._on_select(line, ud)
+end
+
+-- nx._view_closed(id) — dispatch a USER window-close on view `id` to its handle's
+-- `on_close()`. Called from the server when the user `:q`s / `:close`s a view window. A
+-- no-op when the view is gone or has no handler.
+function nx._view_closed(id)
+  local v = nx._views[id]
+  if v and v._on_close then
+    v._on_close()
+  end
 end

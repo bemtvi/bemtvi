@@ -156,12 +156,20 @@ impl Editor {
                     .expect("an in-range tab of an open layer always has a tree");
                 let buf_id = tree.get(tree.current).buffer;
                 let buf = self.buffers.get(buf_id);
+                // A plugin view (`nx.view`) has no path; it labels the tab with its
+                // `create` name (else `[No Name]`, as a pathless file buffer does).
                 let name = buf
                     .buffer
-                    .path
-                    .as_ref()
-                    .and_then(|p| p.file_name())
-                    .map(|n| n.to_string_lossy().into_owned())
+                    .view_name
+                    .clone()
+                    .filter(|n| !n.is_empty())
+                    .or_else(|| {
+                        buf.buffer
+                            .path
+                            .as_ref()
+                            .and_then(|p| p.file_name())
+                            .map(|n| n.to_string_lossy().into_owned())
+                    })
                     .unwrap_or_else(|| "[No Name]".to_string());
                 TabLabel {
                     name,

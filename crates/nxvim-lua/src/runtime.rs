@@ -1776,6 +1776,18 @@ impl LuaRuntime {
         Ok(())
     }
 
+    /// Fire view `id`'s `on_close` callback (`nx._view_closed`). A no-op when the view
+    /// has no handler. Errors (a throwing handler) are returned for the server to
+    /// surface. Called when the user closes a focused `nx.view` window (`:q` / `:close`).
+    pub fn run_view_closed(&self, id: u64) -> mlua::Result<()> {
+        let nx = self.nx()?;
+        let f: Option<mlua::Function> = nx.get("_view_closed")?;
+        if let Some(f) = f {
+            f.call::<()>(id)?;
+        }
+        Ok(())
+    }
+
     /// Refresh the `nx.view` Rust→Lua mirror: `nx._view_buf[id]` (the backing
     /// buffer number, the extmark / read target), `nx._view_line[id]` (the view
     /// window's 1-based cursor line), and `nx._view_win[id]` (the window showing the

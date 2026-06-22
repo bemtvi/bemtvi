@@ -2116,6 +2116,15 @@ impl Editor {
             return;
         }
         let cur = self.windows.current;
+        // Closing a plugin-view window (`:q`/`:close`/`<C-w>c` on an `nx.view` buffer) is
+        // the user-initiated close path: record the view id so the server fires its Lua
+        // `on_close`, letting the owning plugin tear down a group of related views (e.g.
+        // nxvim-diff closing all three diff panes when one is `:q`'d). The window itself
+        // still closes here; the plugin's teardown — which goes through `destroy_view`,
+        // not this path — closes the siblings without re-firing the event.
+        if let Some(vid) = self.buffer().view_id() {
+            self.view_closes.push(vid);
+        }
         if !self.remove_window(cur) {
             self.echo("E444: Cannot close last window");
         }

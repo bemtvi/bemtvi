@@ -215,6 +215,12 @@ pub struct Buffer {
     /// spawned command at [`crate::editor::Editor::open_terminal`] and updated as the
     /// child changes it. `None` for every non-terminal buffer.
     pub terminal_title: Option<String>,
+    /// A [`BufferKind::View`] plugin view's display name — the `name` passed to
+    /// `nx.view.create{ name = … }`, surfaced as the buffer name in the statusline and
+    /// the tab label (a view has no file [`path`](Buffer::path), so without this it
+    /// reads `[No Name]`). The view analogue of [`terminal_title`](Buffer::terminal_title);
+    /// `None` for every non-view buffer (and a view created without a name).
+    pub view_name: Option<String>,
     /// A monotonic version for an **off-tick image preview** (a [`BufferKind::Image`]
     /// whose bytes are *not* read into the rope — the client renders the picture, see
     /// [`Buffer::from_image_file`] and [`crate::view::WindowView::image`]) with
@@ -262,6 +268,7 @@ impl Buffer {
             marks: HashMap::new(),
             kind: BufferKind::Ordinary,
             terminal_title: None,
+            view_name: None,
             image_gen: 0,
             disk: None,
         }
@@ -390,6 +397,7 @@ impl Buffer {
             marks: HashMap::new(),
             kind: BufferKind::Ordinary,
             terminal_title: None,
+            view_name: None,
             image_gen: 0,
         })
     }
@@ -458,6 +466,7 @@ impl Buffer {
             path: Some(dir.clone()),
             kind: BufferKind::Directory(dir),
             terminal_title: None,
+            view_name: None,
             modified: false,
             options: crate::options::BufferOptions::default(),
             changedtick: 0,

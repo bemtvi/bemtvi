@@ -253,7 +253,10 @@ impl Editor {
         self.buffers
             .map
             .iter()
-            .filter(|(_, ob)| ob.layer == layer)
+            // A plugin view (`nx.view`: a diff pane, a file tree, …) is a surface, not a
+            // document — like the panel buffers below, it never appears in `:ls` or in
+            // `:bnext`/`:bprev`/… navigation, so a closed view can't be cycled back into.
+            .filter(|(_, ob)| ob.layer == layer && ob.buffer.view_id().is_none())
             // Panel display buffers (`[Messages]`, `[Buffers]`, …) are surfaces, not
             // documents: they never appear in `:ls` or in `:bnext`/`:bprev`/… navigation
             // (which all funnel through here). `:lspanels` lists them instead.

@@ -60,12 +60,15 @@ impl Editor {
     /// no-op, so a re-run config doesn't strand a second buffer. The buffer is
     /// created off-screen (no window) — it becomes visible only on
     /// [`mount_view`](Editor::mount_view).
-    pub fn create_view(&mut self, id: u64, _name: String, filetype: String) {
+    pub fn create_view(&mut self, id: u64, name: String, filetype: String) {
         if self.views.contains_key(&id) {
             return;
         }
         let mut buf = Buffer::empty();
         buf.kind = BufferKind::View(id);
+        // The view's display name (statusline / tab label); a view has no file path, so
+        // without this it reads `[No Name]`. Empty → `None` (left nameless).
+        buf.view_name = (!name.is_empty()).then_some(name);
         let buf_id = self.add_buffer(buf);
         // A view's filetype drives treesitter / decoration *and* names the widget for
         // its `FileType` autocmd; default it to `nxview` (the widget identity) when the

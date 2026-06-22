@@ -821,6 +821,13 @@ pub struct Editor {
     /// `on_select(line, userdata)` callback. The view analogue of
     /// [`Editor::prompt_results`].
     pub view_selects: Vec<(u64, usize)>,
+    /// `nx.view` ids whose window the user just closed (`:q` / `:close` / `<C-w>c` on a
+    /// view buffer). Drained by the server to fire the view's Lua `on_close()` handler,
+    /// which lets a plugin tear down a *group* of related views (e.g. nxvim-diff closing
+    /// all three panes when one is `:q`'d). Recorded only on the user close path
+    /// ([`Editor::close_window`]), never on a programmatic `unmount`/`destroy_view`, so a
+    /// plugin's own teardown doesn't re-fire it.
+    pub view_closes: Vec<u64>,
     /// The floating selectable-list widget, when open (`nx.ui.select`; the shared
     /// picker / completion surface). Grabs input focus like the panel, but floats
     /// over the text. See [`menu`](crate::editor::MenuPlacement).
@@ -1443,6 +1450,7 @@ impl Editor {
             messages: Vec::new(),
             views: HashMap::new(),
             view_selects: Vec::new(),
+            view_closes: Vec::new(),
             menu: None,
             menu_results: Vec::new(),
             picker_confirm_mode: menu::PickerOpenMode::default(),

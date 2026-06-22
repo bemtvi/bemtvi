@@ -2588,6 +2588,18 @@ impl EditHost {
                 }
                 self.apply_lua_effects();
             }
+            // A user-closed `nx.view` window (`:q`/`:close` on a view buffer): fire the
+            // view's Lua `on_close()` so the owning plugin can tear down a group of
+            // related views (e.g. nxvim-diff closing all panes when one is `:q`'d). Like
+            // the selects above, the handler may queue lua / view ops, so it drains
+            // inside the fixpoint.
+            for id in std::mem::take(&mut self.editor.view_closes) {
+                if let Err(e) = self.lua.run_view_closed(id) {
+                    self.editor
+                        .echo(format!("E5108: Error in nx.view on_close: {e}"));
+                }
+                self.apply_lua_effects();
+            }
             // `vim.ui.input` results (Phase 8): a submitted (`Some`) or cancelled
             // (`None`) prompt fires the waiting callback off the same tick. The
             // callback may itself open another prompt / queue lua, so this is
@@ -2775,6 +2787,7 @@ impl EditHost {
             if self.editor.lua_queue.is_empty()
                 && self.editor.deferred_commands.is_empty()
                 && self.editor.view_selects.is_empty()
+                && self.editor.view_closes.is_empty()
                 && self.editor.prompt_results.is_empty()
                 && self.editor.menu_results.is_empty()
                 && self.editor.picker_sends.is_empty()
@@ -2793,6 +2806,7 @@ impl EditHost {
                 self.editor.lua_queue.clear();
                 self.editor.deferred_commands.clear();
                 self.editor.view_selects.clear();
+                self.editor.view_closes.clear();
                 self.editor.prompt_results.clear();
                 self.editor.menu_results.clear();
                 self.editor.picker_sends.clear();

@@ -787,6 +787,85 @@ async fn opening_a_nonexistent_file_fires_bufnewfile_not_bufreadpost() {
     assert_eq!(msg, format!("new:{}", file.display()));
 }
 
+#[tokio::test]
+async fn editing_a_file_into_the_reused_noname_buffer_fires_bufreadpost() {
+    // `:edit <file>` into the startup [No Name] buffer reuses that buffer in place
+    // (same bufnr) — and must still fire BufReadPost, then FileType. neovim fires
+    // BufReadPost on *every* read, regardless of whether the buffer id was seen
+    // before; reusing the throwaway must not swallow the read events.
+    let dir = temp_dir("au_edit_reuse_read");
+    let file = dir.join("main.rs");
+    std::fs::write(&file, "fn main() {}\n").expect("write source file");
+    let (rpc, mut incoming) = start_with_config(
+        &dir,
+        "_G.log = {}\n\
+         local function rec(tag) return function() _G.log[#_G.log+1] = tag end end\n\
+         vim.api.nvim_create_autocmd('BufReadPost', { callback = rec('read') })\n\
+         vim.api.nvim_create_autocmd('FileType', { callback = rec('ft') })\n",
+    )
+    .await;
+    redraw_after(
+        &rpc,
+        &mut incoming,
+        &format!(":edit {}<CR>", file.display()),
+    )
+    .await;
+    let msg = lua_message(&rpc, &mut incoming, "print(table.concat(_G.log, ','))").await;
+    assert_eq!(msg, "read,ft");
+}
+
+#[tokio::test]
+async fn editing_a_new_file_into_the_reused_noname_buffer_fires_bufnewfile() {
+    // The BufNewFile mirror of the reuse case: `:edit <path-with-no-file>` into the
+    // startup [No Name] buffer reuses it and fires BufNewFile (not BufReadPost).
+    let dir = temp_dir("au_edit_reuse_new");
+    let file = dir.join("brand_new.rs"); // deliberately not created
+    let (rpc, mut incoming) = start_with_config(
+        &dir,
+        "_G.log = {}\n\
+         vim.api.nvim_create_autocmd('BufNewFile', {\n\
+         \x20 callback = function(a) _G.log[#_G.log+1] = 'new:' .. a.file end })\n\
+         vim.api.nvim_create_autocmd('BufReadPost', {\n\
+         \x20 callback = function() _G.log[#_G.log+1] = 'read' end })\n",
+    )
+    .await;
+    redraw_after(
+        &rpc,
+        &mut incoming,
+        &format!(":edit {}<CR>", file.display()),
+    )
+    .await;
+    let msg = lua_message(&rpc, &mut incoming, "print(table.concat(_G.log, ','))").await;
+    assert_eq!(msg, format!("new:{}", file.display()));
+}
+
+#[tokio::test]
+async fn reediting_the_current_file_refires_bufreadpost() {
+    // `:e! <file>` re-reads the current file in place; neovim re-fires BufReadPost on
+    // every read, so re-editing the current file fires it again. (The bare `:e!` with
+    // no path is a separate gap — nxvim's `:edit` requires a file argument — out of
+    // scope for this bug.)
+    let dir = temp_dir("au_reedit_read");
+    let file = dir.join("main.rs");
+    std::fs::write(&file, "fn main() {}\n").expect("write source file");
+    let (rpc, mut incoming) = start_with_file_and_config(
+        &dir,
+        file.to_str().unwrap(),
+        "_G.n = 0\n\
+         vim.api.nvim_create_autocmd('BufReadPost', { callback = function() _G.n = _G.n + 1 end })\n",
+    )
+    .await;
+    // startup read = 1.
+    let before = lua_message(&rpc, &mut incoming, "print(_G.n)").await;
+    assert_eq!(before, "1", "startup read fires BufReadPost once");
+    redraw_after(&rpc, &mut incoming, &format!(":e! {}<CR>", file.display())).await;
+    let after = lua_message(&rpc, &mut incoming, "print(_G.n)").await;
+    assert_eq!(
+        after, "2",
+        ":e! <file> re-reads the file and re-fires BufReadPost"
+    );
+}
+
 // ----- BufLeave / BufDelete --------------------------------------------------
 
 #[tokio::test]

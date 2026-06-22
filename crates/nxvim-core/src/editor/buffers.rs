@@ -606,6 +606,17 @@ impl Editor {
         std::mem::take(&mut self.pending_opens)
     }
 
+    /// Drain the buffers read from a file *in place* this tick (a local `:edit` that
+    /// reused the throwaway `[No Name]` or re-read the current file via `:e` / `:e!`,
+    /// keeping the same bufnr). The server clears each from its `announced` /
+    /// `fired_filetype` sets before emitting lifecycle events, so the re-read buffer
+    /// fires `BufReadPost` (`BufNewFile`) and `FileType` again — neovim fires those on
+    /// every read, regardless of whether the buffer id was seen before. Empty (a cheap
+    /// no-op) when no in-place read ran this tick.
+    pub fn take_loaded_in_place(&mut self) -> Vec<BufferId> {
+        std::mem::take(&mut self.loaded_in_place)
+    }
+
     /// Record a completed write of `buffer` to `path` for the server to fire
     /// `BufWritePre` / `BufWritePost` on (the pure core can't drive a Lua autocmd).
     /// Called from the synchronous `:w` / `:wall` write path and from the off-tick
@@ -957,6 +968,14 @@ impl Editor {
                 ob.saved_seq = Some(ob.undo.cur_seq());
                 ob.buffer.mark_resync();
                 ob.buffer.modified = false;
+                // Read in place (same bufnr): record it so the server re-fires
+                // `BufReadPost`/`BufNewFile`/`FileType` for this read, just as the
+                // off-tick read path does when its fetched bytes land. neovim fires
+                // those on every read, even when the buffer id was seen before — so a
+                // `:edit` reusing the throwaway `[No Name]` and a `:e!` reload both
+                // re-announce.
+                let id = self.cur_buffer();
+                self.loaded_in_place.push(id);
             }
             Err(e) => self.echo(e.to_string()),
         }

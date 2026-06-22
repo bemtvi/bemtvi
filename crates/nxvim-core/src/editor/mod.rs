@@ -1229,6 +1229,16 @@ pub struct Editor {
     /// already-created (empty) buffer the server fills once the fetch lands. Always
     /// empty when off-tick mode is off.
     pending_opens: Vec<PendingOpen>,
+    /// Buffers whose content was read from a file *in place* this tick — a local
+    /// (synchronous) `:edit` that reused the throwaway `[No Name]` or re-read the
+    /// current file (`:e` / `:e!`), keeping the same bufnr. Drained by the server
+    /// with [`Editor::take_loaded_in_place`], which clears them from its `announced`
+    /// / `fired_filetype` sets so the now-(re)read buffer fires `BufReadPost`
+    /// (`BufNewFile`) and `FileType` again — neovim fires those on *every* read,
+    /// regardless of whether the buffer id was seen before. The off-tick read path
+    /// clears `announced` itself when the fetched bytes land, so it does not record
+    /// here; only the local in-place read does.
+    loaded_in_place: Vec<BufferId>,
     /// A `:wqa` / `:xa` quit deferred until every write its `:wall` enqueued has acked
     /// (off-tick mode), drained by the server with [`Editor::take_pending_quit_all`]. The
     /// single-buffer `:wq` rides [`PendingSave::then_quit`]; the batch quit needs the
@@ -1530,6 +1540,7 @@ impl Editor {
             pending_saves: Vec::new(),
             next_save_seq: 0,
             pending_opens: Vec::new(),
+            loaded_in_place: Vec::new(),
             pending_quit_all: None,
             write_events: Vec::new(),
             pending_checktime: Vec::new(),

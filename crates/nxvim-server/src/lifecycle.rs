@@ -132,6 +132,19 @@ impl EditHost {
     /// touching the core insert chokepoints — the diff sees the result). A cheap
     /// no-op for the vast majority of keys, which change neither buffer nor mode.
     pub(crate) fn emit_lifecycle_events(&mut self) {
+        // Buffers the editor read from a file *in place* this tick (a local `:edit`
+        // reusing the throwaway `[No Name]`, or a `:e` / `:e!` reload of the current
+        // file) keep their bufnr, so they're still "announced" from a prior life. Drop
+        // them from `announced` / `fired_filetype` so the read re-fires `BufReadPost`
+        // (`BufNewFile`) and `FileType` below — neovim fires those on every read,
+        // regardless of whether the buffer id was seen before. The off-tick read path
+        // clears these itself when its fetched bytes land (`load_replica_bytes`); this
+        // covers the synchronous local read that has no such landing hook.
+        for buf in self.editor.take_loaded_in_place() {
+            self.announced.remove(&buf);
+            self.fired_filetype.remove(&buf);
+        }
+
         let buf = self.editor.current_buffer_id();
         let mode = self.editor.mode;
         let cur_win = self.editor.current_window_id();

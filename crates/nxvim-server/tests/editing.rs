@@ -31,6 +31,8 @@ mod encoding;
 mod ex_substitute;
 #[path = "editing/explorer.rs"]
 mod explorer;
+#[path = "editing/fileformat.rs"]
+mod fileformat;
 #[path = "editing/global_cmd.rs"]
 mod global_cmd;
 #[path = "editing/highlights.rs"]

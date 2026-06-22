@@ -814,6 +814,10 @@ local BUF_OPT_CANON = {
   fileencoding = "fileencoding",
   fenc = "fileencoding",
   bomb = "bomb",
+  -- The line-ending style (`nx.bo.fileformat` → "unix"/"dos"/"mac"). Reads return
+  -- the core's per-buffer value (set from the bytes on read, or via `:set ff=`).
+  fileformat = "fileformat",
+  ff = "fileformat",
   -- The comment template `gc`/`gcc` wrap lines with. Reads return the *effective*
   -- value (the buffer override, else the filetype default); a write sets the
   -- per-buffer override (empty falls back to the filetype default).
@@ -838,6 +842,7 @@ local BUF_OPT_DEFAULT = {
   regexsyntax = "pcre",
   fileencoding = "utf-8",
   bomb = false,
+  fileformat = "unix",
   commentstring = "",
   modifiable = true,
 }

@@ -330,6 +330,34 @@ impl Editor {
             }
             return;
         }
+        // `fileformat` is buffer-local and enumerated (unix/dos/mac); a bad value fails
+        // loud (E474). Changing it implies the next write re-converts the line endings, so
+        // it marks the buffer modified (vim does the same). `&` resets to unix.
+        if name == "fileformat" {
+            use crate::options::FileFormat;
+            match op {
+                StrOp::Set(value) => {
+                    let ff = match FileFormat::from_label(&value) {
+                        Some(f) => f,
+                        None => {
+                            self.echo(format!("E474: Invalid argument: fileformat={value}"));
+                            return;
+                        }
+                    };
+                    let changed = self.buffer().options.fileformat != ff;
+                    self.buffer_mut().options.fileformat = ff;
+                    if changed {
+                        self.buffer_mut().modified = true;
+                    }
+                }
+                StrOp::Reset => self.buffer_mut().options.fileformat = FileFormat::Unix,
+                StrOp::Query => {
+                    let ff = self.buffer().options.fileformat;
+                    self.echo(format!("fileformat={ff}"));
+                }
+            }
+            return;
+        }
         // `fileencodings` is the global read-detection list: every comma-separated
         // entry must be `ucs-bom` or a known encoding label, else fail loud rather
         // than leave an unusable list. The store/echo go through the shared global

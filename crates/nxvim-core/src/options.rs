@@ -713,6 +713,43 @@ pub enum RegexSyntax {
     Vim,
 }
 
+/// The line-ending convention a buffer was read with and is written back with
+/// (`'fileformat'`): `\n` (Unix), `\r\n` (Dos), or a lone `\r` (classic Mac). The rope
+/// always stores `\n` internally (read normalizes to it; [`crate::Buffer::to_save_bytes`]
+/// converts back on write), so this is the one place the on-disk line break is decided.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum FileFormat {
+    /// `\n` line endings (the internal form; the default for a new buffer).
+    #[default]
+    Unix,
+    /// `\r\n` line endings.
+    Dos,
+    /// Lone `\r` line endings (classic Mac).
+    Mac,
+}
+
+impl FileFormat {
+    /// Parse a `'fileformat'` value (`"unix"`/`"dos"`/`"mac"`); `None` for anything else.
+    pub fn from_label(label: &str) -> Option<FileFormat> {
+        match label {
+            "unix" => Some(FileFormat::Unix),
+            "dos" => Some(FileFormat::Dos),
+            "mac" => Some(FileFormat::Mac),
+            _ => None,
+        }
+    }
+}
+
+impl std::fmt::Display for FileFormat {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            FileFormat::Unix => "unix",
+            FileFormat::Dos => "dos",
+            FileFormat::Mac => "mac",
+        })
+    }
+}
+
 /// Buffer-local options, the rust-native analogue of neovim's per-buffer scope.
 /// Unlike [`Options`] (one global copy on the editor), a [`BufferOptions`] lives
 /// on each [`crate::Buffer`], so two buffers can indent differently. These are
@@ -765,6 +802,9 @@ pub struct BufferOptions {
     /// Whether to prepend a byte-order mark when writing (`'bomb'`). Set on read
     /// when a BOM was detected, and honored on write. Default `false`.
     pub bomb: bool,
+    /// The line-ending convention (`'fileformat'`): set from the bytes on read and
+    /// honored on write (the rope always holds `\n`). Default [`FileFormat::Unix`].
+    pub fileformat: FileFormat,
     /// Whether the buffer's text may be changed (`'modifiable'`). Default `true`.
     /// When `false`, edits are refused with `E21` at the same chokepoints as a
     /// read-only [`crate::BufferKind`] (via [`crate::Editor::modifiable`]) — vim's
@@ -793,6 +833,8 @@ impl Default for BufferOptions {
             // overrides both per buffer.
             fileencoding: Encoding::UTF8,
             bomb: false,
+            // \n line endings by default; read detection overrides per buffer.
+            fileformat: FileFormat::Unix,
             // An ordinary buffer is editable; the read-only scratch listings flip
             // this to false at creation.
             modifiable: true,
@@ -1082,6 +1124,13 @@ static OPTIONS: &[OptionInfo] = {
             kind: Bool,
             scope: Buffer,
             doc: "Write a byte-order mark (BOM) at the start of the file.",
+        },
+        OptionInfo {
+            name: "fileformat",
+            abbrev: Some("ff"),
+            kind: Str,
+            scope: Buffer,
+            doc: "Line-ending style written when saved: unix, dos, or mac.",
         },
         OptionInfo {
             name: "modifiable",

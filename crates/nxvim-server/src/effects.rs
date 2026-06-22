@@ -1638,6 +1638,7 @@ impl EditHost {
                     regexsyntax: self.editor.resolve_regexsyntax(o.regexsyntax).to_string(),
                     fileencoding: o.fileencoding.to_string(),
                     bomb: o.bomb,
+                    fileformat: o.fileformat.to_string(),
                     modified: b.modified,
                     filetype: self.editor.buffer_filetype(id).unwrap_or_default(),
                     ts_highlight: self.editor.ts_highlight_enabled(id),

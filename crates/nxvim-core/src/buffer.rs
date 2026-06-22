@@ -368,7 +368,11 @@ impl Buffer {
                 crate::encoding::decode_to_rope(&bytes, fileencodings);
             options.fileencoding = fileencoding;
             options.bomb = bomb;
-            Rope::from_str(&decoded)
+            // Detect the line-ending style, then normalize the rope to `\n` so all the
+            // internal machinery (line counts, byte offsets, marks) sees one convention;
+            // `to_save_bytes` converts back to `'fileformat'` on write.
+            options.fileformat = detect_fileformat(&decoded);
+            Rope::from_str(&normalize_eol(&decoded, options.fileformat))
         } else {
             Rope::new()
         };
@@ -820,11 +824,15 @@ impl Buffer {
     /// and sends them over the wire; the browser writes via the File System Access API),
     /// paired with [`Buffer::mark_written`] once the write lands.
     pub fn to_save_bytes(&self) -> Result<Vec<u8>> {
-        crate::encoding::encode_from_str(
-            &self.text.to_string(),
-            self.options.fileencoding,
-            self.options.bomb,
-        )
+        use crate::options::FileFormat;
+        let raw = self.text.to_string();
+        // The rope holds `\n`; convert to the buffer's `'fileformat'` on the way out.
+        let text = match self.options.fileformat {
+            FileFormat::Unix => raw,
+            FileFormat::Dos => raw.replace('\n', "\r\n"),
+            FileFormat::Mac => raw.replace('\n', "\r"),
+        };
+        crate::encoding::encode_from_str(&text, self.options.fileencoding, self.options.bomb)
     }
 
     /// Record a completed *external* write of this buffer to `path` (the in-buffer
@@ -888,6 +896,40 @@ pub enum DiskChange {
     Changed,
     /// The file the buffer was bound to no longer exists on disk.
     Vanished,
+}
+
+/// Detect the line-ending convention from a file's decoded text: the FIRST line break
+/// decides (`\r\n` → Dos, lone `\r` → Mac, `\n` → Unix), matching how vim picks
+/// `'fileformat'` for a consistently-formatted file. No line break at all → Unix.
+fn detect_fileformat(s: &str) -> crate::options::FileFormat {
+    use crate::options::FileFormat;
+    let b = s.as_bytes();
+    let mut i = 0;
+    while i < b.len() {
+        match b[i] {
+            b'\r' => {
+                return if b.get(i + 1) == Some(&b'\n') {
+                    FileFormat::Dos
+                } else {
+                    FileFormat::Mac
+                };
+            }
+            b'\n' => return FileFormat::Unix,
+            _ => i += 1,
+        }
+    }
+    FileFormat::Unix
+}
+
+/// Normalize a decoded file's line endings to `\n` for the rope (the inverse of
+/// [`Buffer::to_save_bytes`]'s conversion). Unix text is returned untouched.
+fn normalize_eol(s: &str, ff: crate::options::FileFormat) -> Cow<'_, str> {
+    use crate::options::FileFormat;
+    match ff {
+        FileFormat::Unix => Cow::Borrowed(s),
+        FileFormat::Dos => Cow::Owned(s.replace("\r\n", "\n")),
+        FileFormat::Mac => Cow::Owned(s.replace('\r', "\n")),
+    }
 }
 
 /// Strip a single trailing line break (`\n` or `\r\n`) from `s`, leaving any

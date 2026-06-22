@@ -282,6 +282,10 @@ pub struct BoMirror {
     /// The buffer's `'bomb'` flag (whether a BOM is written), mirrored for
     /// `vim.bo.bomb`.
     pub bomb: bool,
+    /// The buffer's `'fileformat'` (`"unix"`/`"dos"`/`"mac"`), mirrored so
+    /// `nx.bo.fileformat` / `vim.bo.fileformat` read the core's value (set from the
+    /// bytes on read or by `:set ff=`).
+    pub fileformat: String,
     pub modified: bool,
     /// The buffer's filetype (the treesitter language noun) — explicit override
     /// or extension-derived, mirrored so `nx.bo.filetype` / `vim.bo.filetype` read

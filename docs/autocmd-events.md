@@ -54,7 +54,7 @@ Ordering on opening a file is `BufReadPost` (or `BufNewFile` for a new path) →
 | Event | When it fires |
 | --- | --- |
 | `InsertEnter` / `InsertLeave` | The editor enters / leaves Insert (or Replace) mode. |
-| `ModeChanged` | The reported `mode()` code changes. `match` is the transition `old:new` (e.g. `"n:i"`, `"v:n"`); a handler's `pattern` glob-matches it (`"*:i"`, `"n:*"`, `"*:*"`). A Normal↔MultiCursor swap (both report `"n"`) is silent. **Gated on a registered handler.** |
+| `ModeChanged` | The reported `mode()` code changes. `match` is the transition `old:new` (e.g. `"n:i"`, `"v:n"`); a handler's `pattern` glob-matches it (`"*:i"`, `"n:*"`, `"*:*"`). A Normal↔MultiCursor swap fires `"n:m"` / `"m:n"` (MultiCursor reports its own `"m"`). **Gated on a registered handler.** |
 
 ## Editing & cursor
 

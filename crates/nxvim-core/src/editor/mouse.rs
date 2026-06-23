@@ -1815,8 +1815,8 @@ impl Editor {
             return true;
         }
         let flag = match self.mode {
-            // MultiCursor is a normal-like placement mode (its `mode()` code is
-            // `n`), so it gates on the same `n` flag.
+            // MultiCursor is a normal-like placement mode: mouse maps gate on the
+            // same `n` flag (independent of its now-distinct `mode()` code `m`).
             Mode::Normal | Mode::MultiCursor => 'n',
             Mode::Visual | Mode::VisualLine => 'v',
             Mode::Insert | Mode::Replace => 'i',

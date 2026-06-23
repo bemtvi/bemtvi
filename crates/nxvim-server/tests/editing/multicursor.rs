@@ -60,6 +60,39 @@ fn focused_secondary_cursors(map: &[(Value, Value)]) -> Vec<(u64, u64)> {
         .unwrap_or_default()
 }
 
+/// The reported `mode()` short code from `nvim_get_mode`.
+async fn mode_code(rpc: &Rpc) -> String {
+    let v = rpc
+        .request("nvim_get_mode", vec![])
+        .await
+        .expect("nvim_get_mode");
+    v.as_map()
+        .and_then(|m| {
+            m.iter()
+                .find(|(k, _)| k.as_str() == Some("mode"))
+                .and_then(|(_, v)| v.as_str())
+        })
+        .unwrap_or("")
+        .to_string()
+}
+
+#[tokio::test]
+async fn multicursor_placement_mode_reports_its_own_mode_code() {
+    let (rpc, mut incoming) = start(None).await;
+    feed(&rpc, "iabc<Esc>");
+    assert_eq!(mode_code(&rpc).await, "n", "normal before");
+
+    // `<A-c>` enters MULTICURSOR placement mode. It reports its own `mode()` code
+    // `m` (not `n`) so plugins — e.g. the statusline — can detect it; a Normal↔MC
+    // swap is therefore a real `ModeChanged` (n:m), no longer silently `n:n`.
+    let _ = redraw_after(&rpc, &mut incoming, "<A-c>").await;
+    assert_eq!(mode_code(&rpc).await, "m", "MULTICURSOR reports 'm'");
+
+    // `<Esc>` keeps the placed cursors and returns to Normal.
+    let _ = redraw_after(&rpc, &mut incoming, "<Esc>").await;
+    assert_eq!(mode_code(&rpc).await, "n", "back to normal");
+}
+
 #[tokio::test]
 async fn alt_c_enters_placement_mode_and_drops_a_cursor() {
     let (rpc, mut incoming) = start(None).await;

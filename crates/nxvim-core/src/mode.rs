@@ -70,8 +70,12 @@ impl Mode {
             Mode::Visual => "v",
             Mode::VisualLine => "V",
             Mode::Command => "c",
-            // No vim equivalent; reads as normal mode for `mode()`-checking scripts.
-            Mode::MultiCursor => "n",
+            // nxvim-specific placement mode — no vim equivalent. Reports its own code
+            // `m` (matching the `'m'` keymap trie) so a `mode()`-reading plugin (e.g.
+            // the statusline) can detect it and a Normal↔MultiCursor swap is a real
+            // `ModeChanged` (`n:m`). Editing behaviour is still normal-like (motions
+            // move the primary cursor); only the *reported* code differs.
+            Mode::MultiCursor => "m",
             Mode::Terminal => "t",
         }
     }

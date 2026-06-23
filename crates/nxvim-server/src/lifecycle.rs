@@ -170,8 +170,8 @@ impl EditHost {
         self.last_mode = mode;
 
         // `ModeChanged` fires on any change to the *reported* `mode()` code — so a
-        // Normal↔MultiCursor swap (both reporting "n") is correctly silent — with the
-        // pattern `old:new` (e.g. "n:i"), matched by a handler's glob (`*:i`, `n:*`,
+        // Normal↔MultiCursor swap fires `n:m` / `m:n` (MultiCursor reports its own
+        // `m`) — with the pattern `old:new` (e.g. "n:i"), matched by a handler's glob (`*:i`, `n:*`,
         // `*:*`, …) exactly as in neovim; a handler reads the transition off
         // `args.match`. Gated on a registered handler so a no-listener session never
         // even builds the pattern string.

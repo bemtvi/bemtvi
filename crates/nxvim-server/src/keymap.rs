@@ -669,11 +669,11 @@ impl Keymaps {
 /// `Visual` → `'v'`, `VisualLine` → `'V'`, `Command` → `'c'`). Paired with
 /// [`mode_buckets`], which decides which of these tries a declared map lands in.
 ///
-/// Multi-cursor *placement* mode is the one divergence from `short_code`: it
-/// reports `"n"` so `mode()`-checking scripts read it as normal, but it selects
-/// its **own** `'m'` trie so a `vim.keymap.set('m', …)` map fires only while
-/// placing and a plain `'n'` map does not leak in (the placement grammar still
-/// reaches the editor untouched whenever the `'m'` trie has no match).
+/// Multi-cursor *placement* mode selects its **own** `'m'` trie, so a
+/// `vim.keymap.set('m', …)` map fires only while placing and a plain `'n'` map
+/// does not leak in (the placement grammar still reaches the editor untouched
+/// whenever the `'m'` trie has no match). Its [`short_code`](Mode::short_code) is
+/// also `"m"`, so this matches the reported mode code.
 fn mode_key(mode: Mode) -> char {
     if mode == Mode::MultiCursor {
         return 'm';

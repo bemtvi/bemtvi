@@ -89,10 +89,12 @@ deliberately did *not* refactor that away; secondary cursors are an additive lay
 
 [`Mode::MultiCursor`](../../crates/nxvim-core/src/mode.rs) is a placement mode.
 Its `label()` is `"MULTICURSOR"` (drives the status line and the client's
-`View::is_multicursor()`); its `short_code()` is `"n"`, so `mode()`-checking
-scripts read it as normal mode (there is no vim equivalent to expose). It is not
-visual and not insert, so the input dispatch routes it through `handle_normal` —
-it reuses the whole normal grammar, with the differences below.
+`View::is_multicursor()`); its `short_code()` is `"m"` — a distinct nxvim-specific
+code (no vim equivalent) so a `mode()`-reading plugin (e.g. the status line) can
+detect placement mode and a Normal↔MultiCursor swap is a real `ModeChanged`
+(`n:m` / `m:n`). It matches the `'m'` keymap trie. It is not visual and not insert,
+so the input dispatch routes it through `handle_normal` — it reuses the whole
+normal grammar, with the differences below.
 
 ### Mode-specific keymaps
 

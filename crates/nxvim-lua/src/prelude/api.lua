@@ -1089,15 +1089,17 @@ end
 
 vim.api.nvim_echo = nx.echo
 
--- nx.hl.exists(name) [alias vim.fn.hlexists]: is the highlight group `name` defined?
--- (1 / 0). Backed by the same `nx._hl_defs` registry nvim_get_hl reads (concrete
--- groups and links both count). LuaSnip probes this to drop ext-mark highlight
--- groups that aren't defined (`vim.fn.hlexists(group) == 1 and group or nil`), so a
--- missing builtin errored its setup; an undefined group correctly answers 0.
+-- nx.hl.exists(name): is the highlight group `name` defined? Returns a native
+-- boolean (the rest of `nx.*` is boolean, not vim's 1/0). Backed by the same
+-- `nx._hl_defs` registry nvim_get_hl reads (concrete groups and links both count).
 function nx.hl.exists(name)
-  return (nx._hl_defs or {})[name] ~= nil and 1 or 0
+  return (nx._hl_defs or {})[name] ~= nil
 end
-vim.fn.hlexists = nx.hl.exists
+-- vim.fn.hlexists keeps the vimscript 1/0 contract: LuaSnip probes it as
+-- `vim.fn.hlexists(group) == 1 and group or nil`, which a boolean would break.
+function vim.fn.hlexists(name)
+  return nx.hl.exists(name) and 1 or 0
+end
 
 -- ===== nvim_* deprecated aliases & small gaps ================================
 

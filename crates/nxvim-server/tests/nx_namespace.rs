@@ -286,6 +286,45 @@ async fn nx_hl_define_reaches_get_and_nvim_alias() {
 }
 
 #[tokio::test]
+async fn nx_hl_exists_returns_boolean_vim_alias_returns_number() {
+    let (rpc, _incoming) = start().await;
+
+    // nx.hl.exists is native: a real boolean, true once the group is defined,
+    // false (not nil) for an undefined group.
+    exec_lua(&rpc, "nx.hl.define(0, 'NxExistsHl', { fg = '#ff0000' })").await;
+    assert_eq!(
+        exec_lua(&rpc, "return nx.hl.exists('NxExistsHl')")
+            .await
+            .as_bool(),
+        Some(true),
+        "nx.hl.exists is true for a defined group"
+    );
+    assert_eq!(
+        exec_lua(&rpc, "return nx.hl.exists('NxMissingHl')")
+            .await
+            .as_bool(),
+        Some(false),
+        "nx.hl.exists is false (boolean, not nil) for an undefined group"
+    );
+
+    // vim.fn.hlexists keeps the vimscript 1/0 contract for plugin compat.
+    assert_eq!(
+        exec_lua(&rpc, "return vim.fn.hlexists('NxExistsHl')")
+            .await
+            .as_i64(),
+        Some(1),
+        "vim.fn.hlexists answers 1 for a defined group"
+    );
+    assert_eq!(
+        exec_lua(&rpc, "return vim.fn.hlexists('NxMissingHl')")
+            .await
+            .as_i64(),
+        Some(0),
+        "vim.fn.hlexists answers 0 for an undefined group"
+    );
+}
+
+#[tokio::test]
 async fn nx_user_command_create_runs_and_nvim_alias_agrees() {
     let (rpc, _incoming) = start().await;
 

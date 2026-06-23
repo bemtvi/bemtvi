@@ -16,6 +16,11 @@ fn color_of(segs: &[Seg], needle: &str) -> u32 {
     segs.iter().find(|s| s.text == needle).unwrap().fg
 }
 
+/// The run whose text is `needle`.
+fn seg_of<'a>(segs: &'a [Seg], needle: &str) -> &'a Seg {
+    segs.iter().find(|s| s.text == needle).unwrap()
+}
+
 #[test]
 fn group_fallback_colors_keywords_strings_and_comments_distinctly() {
     // Major component keys the color; comments are italic.
@@ -59,4 +64,47 @@ fn a_resolved_colorscheme_style_wins_over_the_group_fallback() {
     let hl: Vec<HlSpan> = vec![(0, 3, "keyword".into(), Some(0))];
     let segs = row_segments("let x", &hl, &styles, FG, BG, 0);
     assert_eq!(color_of(&segs, "let"), 0x11_22_33);
+}
+
+#[test]
+fn a_span_style_background_is_carried_onto_the_segment() {
+    // The regression: a span whose style sets a `bg` (a diff line tint, or any
+    // colorscheme group with a background) must carry it onto the Seg so the GUI
+    // paints a quad behind the glyph — it was dropped (bg: None), so backgrounds
+    // showed in the TUI but not the GUI.
+    let styles = vec![Style {
+        fg: Some(0xc0_ca_f5),
+        bg: Some(0x1e_2f_3b),
+        ..Default::default()
+    }];
+    let hl: Vec<HlSpan> = vec![(0, 3, "DiffChange".into(), Some(0))];
+    let segs = row_segments("let x", &hl, &styles, FG, BG, 0);
+    assert_eq!(
+        seg_of(&segs, "let").bg,
+        Some(0x1e_2f_3b),
+        "span bg must reach the Seg"
+    );
+    // Unspanned text carries no background.
+    assert_eq!(seg_of(&segs, " x").bg, None);
+}
+
+#[test]
+fn a_reverse_span_leaves_its_segment_background_unset() {
+    // Reverse is painted by push_reverse_fills (a fg-colored quad), so the Seg's own
+    // `bg` must stay None — otherwise the row would get a doubled fill.
+    let styles = vec![Style {
+        fg: Some(0x11_22_33),
+        bg: Some(0x44_55_66),
+        reverse: true,
+        ..Default::default()
+    }];
+    let hl: Vec<HlSpan> = vec![(0, 3, "Visual".into(), Some(0))];
+    let segs = row_segments("let x", &hl, &styles, FG, BG, 0);
+    assert_eq!(
+        seg_of(&segs, "let").bg,
+        None,
+        "reverse run leaves its Seg bg unset"
+    );
+    // The glyph takes the style's bg as its fg (reverse-video).
+    assert_eq!(color_of(&segs, "let"), 0x44_55_66);
 }

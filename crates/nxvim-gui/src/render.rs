@@ -1369,18 +1369,18 @@ impl Renderer {
                     // off at the edge instead of bleeding into the next split.
                     let pos = self.cell_px(text_run_origin(text_x0, win.leftcol), row as u16);
                     self.push_text(items, &segments, pos, fg, text_clip);
-                    // Background quads for any virt_text chunk (inline / overlay) whose
-                    // group set a `bg` — the shaper only draws fgs, and all quads render
-                    // under all glyphs, so this paints the badge behind the chunk.
-                    if !vtext.is_empty() {
-                        self.push_seg_backgrounds(
-                            quads,
-                            &segments,
-                            text_run_origin(text_x0, win.leftcol),
-                            row,
-                            (ox + wcols) as f32 * self.cell_w,
-                        );
-                    }
+                    // Background quads for any segment whose group set a `bg` — a
+                    // buffer-text span (a diff line tint, a colorscheme group with a
+                    // background) or a virt_text chunk (inline / overlay badge). The
+                    // shaper only draws fgs, and all quads render under all glyphs, so
+                    // this paints the fill behind the run.
+                    self.push_seg_backgrounds(
+                        quads,
+                        &segments,
+                        text_run_origin(text_x0, win.leftcol),
+                        row,
+                        (ox + wcols) as f32 * self.cell_w,
+                    );
                     self.push_attr_rules(quads, win, view, text_x0, row, hl, inlay);
 
                     // LSP diagnostic underlines, painted last so they survive over
@@ -1930,9 +1930,12 @@ impl Renderer {
 
     /// Paint a run of `%`-format `segments` left-to-right starting at cell
     /// `(ox, row)`: each segment's own background (when set) as a quad, then its
-    /// text in its own foreground (falling back to `base_fg`). Char count is the
-    /// cell advance (exact for the ASCII/box-drawing text these segments carry).
-    /// Shared by the tabline and the status rows.
+    /// text in its own foreground (falling back to `base_fg`). The char count is the
+    /// cell advance, and each segment's glyphs are **clipped to its own cells** — a
+    /// powerline separator glyph that a (non-`Mono`) Nerd Font renders wider than one
+    /// cell would otherwise bleed past its 1-cell background into the next segment,
+    /// drawing over the neighbour's colour and reading as misaligned. Shared by the
+    /// tabline and the status rows.
     fn paint_segments(
         &mut self,
         segments: &[StatusSegment],
@@ -1952,8 +1955,10 @@ impl Renderer {
             }
             let fg = style.as_ref().and_then(|s| s.fg).unwrap_or(base_fg);
             let pos = self.cell_px(col, row);
-            let full = self.full_bounds();
-            self.push_plain(items, text, pos, fg, full);
+            // Clip to this segment's own cell span so an over-wide glyph cannot bleed
+            // into the next segment (over its background) or shift it.
+            let cell = self.text_bounds(col, row, w.max(1), 1);
+            self.push_plain(items, text, pos, fg, cell);
             col = col.saturating_add(w);
         }
     }
@@ -3120,6 +3125,14 @@ impl Renderer {
             Shaping::Advanced,
             None,
         );
+        // Snap every glyph's advance to a whole number of cells: cosmic-text rounds each
+        // advance to the nearest multiple of this width, so a wide CJK/emoji glyph occupies
+        // two cells (centered in its 2-em box by the font) and the text after it stays on
+        // the grid — the GUI's monospace-cell contract, which plain `Advanced` shaping
+        // (font-native advances) breaks. This relayouts + reshapes, standing in for the
+        // explicit shape below.
+        let cell_w = self.cell_w;
+        buf.set_monospace_width(&mut self.font_system, Some(cell_w));
         buf.shape_until_scroll(&mut self.font_system, false);
         buf
     }
@@ -3307,18 +3320,22 @@ pub fn row_segments(
         let text: String = chars[start..end].iter().collect();
         match s.3.and_then(|id| styles.get(id)) {
             Some(st) => {
-                // Reverse swaps fg/bg: the glyph takes the style's background (or
-                // the editor's `Normal` bg) and a foreground-colored quad behind it
-                // is painted by `push_reverse_fills`, so the run reads inverted.
-                let color = if st.reverse {
-                    st.bg.unwrap_or(normal_bg)
+                // Reverse swaps fg/bg: the glyph takes the style's background (or the
+                // editor's `Normal` bg) and a foreground-colored quad behind it is
+                // painted by `push_reverse_fills`, so the run reads inverted — its own
+                // `bg` stays unset (the reverse fill is its background). A non-reverse
+                // run keeps its fg and carries its group's `bg` (when set) as a quad
+                // painted behind the glyph by `push_seg_backgrounds` — e.g. a diff line
+                // tint, or any colorscheme group with a background.
+                let (color, bg) = if st.reverse {
+                    (st.bg.unwrap_or(normal_bg), None)
                 } else {
-                    st.fg.unwrap_or(fg)
+                    (st.fg.unwrap_or(fg), st.bg)
                 };
                 segments.push(Seg {
                     text,
                     fg: color,
-                    bg: None,
+                    bg,
                     bold: st.bold,
                     italic: st.italic,
                 });

@@ -469,6 +469,29 @@ try {
     wideBox.w != null && asciiBox.w != null && Math.abs(wideBox.w - 2 * asciiBox.w) <= 1,
     JSON.stringify({ wide: wideBox.w, ascii: asciiBox.w }));
 
+  // ---- Single-column symbols / Nerd-Font glyphs are pinned to ONE cell ----
+  // unicode-width counts a box-drawing / arrow / Private-Use (Nerd Font) glyph as ONE
+  // column, but a fallback font often draws it wider, dragging the rest of the line off
+  // the grid. The renderer boxes these (U+2190+) to a single cell so the advance stays
+  // exactly one ASCII cell. Use U+2500 (box drawing) — a real Unicode symbol that needs
+  // no special font. Put it mid-line, land the cursor on it, and measure its box.
+  await page.evaluate(() => window.__nxvim.feed("<Esc>:enew!<CR>iab─cd<Esc>0fc"));
+  const symAfter = await page.evaluate(() => {
+    const cur = document.querySelector("#grid .cur-block");
+    return { curText: cur ? cur.textContent : null };
+  });
+  check("symbol: a one-column symbol keeps the next glyph on its column",
+    symAfter.curText === "c", JSON.stringify(symAfter));
+  await page.evaluate(() => window.__nxvim.feed("0ll"));   // onto the U+2500
+  const symBox = await page.evaluate(() => {
+    const b = document.querySelector("#grid .cur-block");
+    return { text: b ? b.textContent : null, w: b ? b.getBoundingClientRect().width : null };
+  });
+  check("symbol: the one-column symbol box is exactly one ASCII cell wide",
+    symBox.text === "─" && symBox.w != null && asciiBox.w != null
+      && Math.abs(symBox.w - asciiBox.w) <= 1,
+    JSON.stringify({ sym: symBox.w, ascii: asciiBox.w }));
+
   await browser.close();
 } finally {
   cleanup();

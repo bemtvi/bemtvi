@@ -3118,14 +3118,28 @@ impl Renderer {
         for &(start, end) in &nonsnapped {
             let cluster = &full[start..end];
             let col = full[..start].width() as f32; // cells before the cluster
-            let ekey = self.ensure(&[Seg::plain(cluster.to_string(), default_fg)], default_fg);
+                                                    // Carry the cluster's own segment style — its colour (so a symbol/kanji in
+                                                    // a comment is tinted like the comment), and bold/italic. A color-emoji
+                                                    // glyph ignores the fg, but a monochrome icon or CJK glyph needs it.
+            let (cfg, bold, italic) = seg_style_at(segments, start)
+                .map_or((default_fg, false, false), |s| (s.fg, s.bold, s.italic));
+            let ekey = self.ensure(
+                &[Seg {
+                    text: cluster.to_string(),
+                    fg: cfg,
+                    bg: None,
+                    bold,
+                    italic,
+                }],
+                cfg,
+            );
             // A color-emoji font renders smaller than its reserved cells, so draw the
             // glyph at the configured `emoji_scale` (`--emoji-scale`) at its column.
             items.push(TextItem {
                 key: ekey,
                 x: pos.0 + col * cell_w,
                 y,
-                color,
+                color: srgb_to_color(cfg),
                 bounds,
                 scale,
             });
@@ -3854,6 +3868,21 @@ fn nonsnapped_clusters(buf: &Buffer, cell_w: f32) -> Vec<(usize, usize)> {
         }
     }
     out
+}
+
+/// The segment covering byte `byte` in the concatenated segment text (the run that
+/// owns a masked off-grid cluster), so its colour / weight / slant can be carried onto
+/// the separately-drawn glyph. `None` only if `byte` is past the end.
+fn seg_style_at(segments: &[Seg], byte: usize) -> Option<&Seg> {
+    let mut off = 0;
+    for s in segments {
+        let end = off + s.text.len();
+        if byte < end {
+            return Some(s);
+        }
+        off = end;
+    }
+    None
 }
 
 /// Rebuild `segments`, replacing each byte range in `bad` (off-grid clusters, in

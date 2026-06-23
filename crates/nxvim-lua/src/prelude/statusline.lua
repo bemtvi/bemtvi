@@ -207,6 +207,11 @@ end
 -- global one for that window. `opts.format = true` opts a window back to the
 -- `'statusline'` `%`-format even while a global segment layout is active (the
 -- per-region mix); for the global target it clears the global layout.
+--
+-- `opts.separator` is the connector painted before, between, and after the
+-- segments of each half (default `" "`, in the base `StatusLine` look). Pass `""`
+-- to disable it — a powerline / themed statusline manages its own padding and
+-- section arrows and wants a seamless coloured bar with no unstyled gaps.
 function nx.statusline.setup(opts)
   opts = opts or {}
   if type(opts) ~= "table" then
@@ -224,7 +229,14 @@ function nx.statusline.setup(opts)
   end
   local left = name_list(opts.left, "left")
   local right = name_list(opts.right, "right")
-  nx._statusline_setup(target, "segments", left, right)
+  -- `opts.separator` is the connector painted between/around segments (default a
+  -- single space). A powerline / themed statusline that owns its own padding and
+  -- section arrows passes `""` for a seamless, gap-free coloured bar.
+  local separator = opts.separator
+  if separator ~= nil and type(separator) ~= "string" then
+    error("nx.statusline.setup: `separator` must be a string")
+  end
+  nx._statusline_setup(target, "segments", left, right, separator)
   register_events(target_key, custom_names(left, right))
 end
 

@@ -2107,17 +2107,26 @@ pub(crate) fn install_runtime_api(
     // actually accepts. An empty table until the server populates it.
     nx.set("_options_catalog", lua.create_table()?)?;
 
-    // `nx._statusline_setup(win, kind, left, right)`: queue a `nx.statusline.setup{}`
-    // / `reset()` request ([`StatuslineSetupReq`]). `win` is `nil` for the global
-    // layout or a window id for a window-local override; `kind` is `"segments"`
-    // (with the validated `left` / `right` name lists), `"format"` (use the
-    // `%`-format), or `"inherit"` (drop the override). The Lua wrapper validated
-    // every segment name against the built-ins / registered segments.
+    // `nx._statusline_setup(win, kind, left, right, separator)`: queue a
+    // `nx.statusline.setup{}` / `reset()` request ([`StatuslineSetupReq`]). `win` is
+    // `nil` for the global layout or a window id for a window-local override; `kind`
+    // is `"segments"` (with the validated `left` / `right` name lists), `"format"`
+    // (use the `%`-format), or `"inherit"` (drop the override). `separator` is the
+    // connector between/around segments (`nil` ⇒ a single space; `""` to disable it
+    // for a powerline statusline). The Lua wrapper validated every segment name
+    // against the built-ins / registered segments.
     let sh = shared.clone();
     nx.set(
         "_statusline_setup",
         lua.create_function(
-            move |_, (win, kind, left, right): (Option<u64>, String, Vec<String>, Vec<String>)| {
+            move |_,
+                  (win, kind, left, right, separator): (
+                Option<u64>,
+                String,
+                Vec<String>,
+                Vec<String>,
+                Option<String>,
+            )| {
                 let target = match win {
                     Some(w) => StatuslineTarget::Window(w),
                     None => StatuslineTarget::Global,
@@ -2125,7 +2134,13 @@ pub(crate) fn install_runtime_api(
                 let kind = match kind.as_str() {
                     "format" => StatuslineKind::Format,
                     "inherit" => StatuslineKind::Inherit,
-                    _ => StatuslineKind::Segments { left, right },
+                    // The connector defaults to a single space (the plain-bar look);
+                    // a powerline statusline passes `""` to disable it.
+                    _ => StatuslineKind::Segments {
+                        left,
+                        right,
+                        separator: separator.unwrap_or_else(|| " ".to_string()),
+                    },
                 };
                 sh.borrow_mut()
                     .statusline_setups

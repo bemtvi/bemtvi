@@ -11,12 +11,32 @@
 use nxvim_rpc::{Incoming, Rpc};
 use nxvim_server::ServerInit;
 use nxvim_test_harness::{
-    cursor_u64, drain_to_latest_redraw, exec_lua, feed, field_str, start_attached,
+    cursor_u64, drain_to_latest_redraw, exec_lua, feed, field_str, start_attached, wait_redraw,
+    window0_field,
 };
+use rmpv::Value;
 use tokio::sync::mpsc::UnboundedReceiver;
 
 async fn start() -> (Rpc, UnboundedReceiver<Incoming>) {
     start_attached(ServerInit::default(), 80, 24).await
+}
+
+/// The text of each `status` segment of `windows[0]` (the per-window status bar),
+/// in order. A segment whose `style` is `Nil` is an unstyled connector.
+fn status_texts(map: &[(Value, Value)]) -> Vec<String> {
+    let Some(Value::Array(segs)) = window0_field(map, "status") else {
+        return Vec::new();
+    };
+    segs.iter()
+        .filter_map(|seg| match seg {
+            Value::Map(m) => m
+                .iter()
+                .find(|(k, _)| k.as_str() == Some("text"))
+                .and_then(|(_, v)| v.as_str())
+                .map(String::from),
+            _ => None,
+        })
+        .collect()
 }
 
 #[tokio::test]
@@ -282,6 +302,56 @@ async fn nx_hl_define_reaches_get_and_nvim_alias() {
         .as_bool(),
         Some(true),
         "the nvim_get_hl alias reads what nx.hl.define wrote"
+    );
+}
+
+#[tokio::test]
+async fn statusline_default_separator_inserts_unstyled_connectors() {
+    let (rpc, mut incoming) = start().await;
+
+    // A plain `mode` segment layout: the default connector puts an unstyled (Nil
+    // style) leading space before the mode cell — the white gap a powerline bar
+    // must avoid.
+    exec_lua(&rpc, "nx.statusline.setup{ left = { 'mode' } }").await;
+    let map = wait_redraw(&mut incoming, |m| {
+        status_texts(m).iter().any(|t| t.contains("NORMAL"))
+    })
+    .await;
+    let texts = status_texts(&map);
+    assert_eq!(
+        texts.first().map(String::as_str),
+        Some(" "),
+        "the default layout leads with an unstyled connector space: {texts:?}"
+    );
+}
+
+#[tokio::test]
+async fn statusline_empty_separator_drops_the_connector_white_gap() {
+    let (rpc, mut incoming) = start().await;
+
+    // `separator = ""` — the powerline / nxvim-line contract: no leading, trailing,
+    // or inter-segment connector, so the bar is a seamless coloured run with no
+    // unstyled white gaps. The mode cell is the very first segment.
+    exec_lua(
+        &rpc,
+        "nx.statusline.setup{ left = { 'mode' }, separator = '' }",
+    )
+    .await;
+    let map = wait_redraw(&mut incoming, |m| {
+        status_texts(m).iter().any(|t| t.contains("NORMAL"))
+    })
+    .await;
+    // The first segment is the mode cell itself (right-padded with fill to the bar
+    // width is fine) — crucially it does NOT begin with a space, and no standalone
+    // unstyled connector segment exists.
+    let texts = status_texts(&map);
+    assert!(
+        texts.first().is_some_and(|t| t.starts_with("NORMAL")),
+        "no leading connector before the mode cell: {texts:?}"
+    );
+    assert!(
+        !texts.iter().any(|t| t.trim().is_empty()),
+        "no standalone unstyled connector space remains: {texts:?}"
     );
 }
 

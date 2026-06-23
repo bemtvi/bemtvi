@@ -1273,6 +1273,10 @@ pub enum StatuslineKind {
     Segments {
         left: Vec<String>,
         right: Vec<String>,
+        /// The connector between/around segments (`" "` default, `""` to disable —
+        /// for a powerline statusline that owns its own spacing). See
+        /// [`SegmentLayout::separator`](nxvim_core::statusline::SegmentLayout).
+        separator: String,
     },
     /// Use the `'statusline'` `%`-format instead of a segment layout — for a
     /// window this is the per-region "mix": it shows the format even while a global

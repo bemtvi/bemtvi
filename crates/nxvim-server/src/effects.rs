@@ -855,18 +855,36 @@ impl EditHost {
         // re-render on the next settle.
         let mut statusline_changed = false;
         for req in self.lua.take_statusline_setups() {
-            let segments = |left, right| nxvim_core::statusline::SegmentLayout { left, right };
+            let segments = |left, right, separator| nxvim_core::statusline::SegmentLayout {
+                left,
+                right,
+                separator,
+            };
             match (req.target, req.kind) {
-                (StatuslineTarget::Global, StatuslineKind::Segments { left, right }) => {
-                    self.statusline_layout = Some(segments(left, right));
+                (
+                    StatuslineTarget::Global,
+                    StatuslineKind::Segments {
+                        left,
+                        right,
+                        separator,
+                    },
+                ) => {
+                    self.statusline_layout = Some(segments(left, right, separator));
                 }
                 // A global `Format` / `Inherit` clears the global layout (back to
                 // the `%`-format for every inheriting window).
                 (StatuslineTarget::Global, _) => self.statusline_layout = None,
-                (StatuslineTarget::Window(w), StatuslineKind::Segments { left, right }) => {
+                (
+                    StatuslineTarget::Window(w),
+                    StatuslineKind::Segments {
+                        left,
+                        right,
+                        separator,
+                    },
+                ) => {
                     self.statusline_window.insert(
                         WindowId(w),
-                        WindowStatusline::Segments(segments(left, right)),
+                        WindowStatusline::Segments(segments(left, right, separator)),
                     );
                 }
                 (StatuslineTarget::Window(w), StatuslineKind::Format) => {

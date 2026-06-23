@@ -978,6 +978,13 @@ fn coalesce(chars: Vec<Cell>) -> Vec<StatusSegment> {
 pub struct SegmentLayout {
     pub left: Vec<String>,
     pub right: Vec<String>,
+    /// The connector inserted before, between, and after the non-empty segments
+    /// of each half (`group: None`, so it paints in the base `StatusLine` look).
+    /// `" "` is the default — a plain bar wants a space so segments don't butt
+    /// against each other or the edge. **Empty disables it**: a powerline / themed
+    /// statusline (e.g. nxvim-line) manages its own padding and section arrows and
+    /// wants a seamless coloured bar with no unstyled gaps, so it passes `""`.
+    pub separator: String,
 }
 
 /// Whether `name` is a built-in segment (resolved natively each frame from the
@@ -1119,24 +1126,48 @@ fn segment_pieces(
     custom: &dyn Fn(&str) -> Option<Vec<StatusSegment>>,
 ) -> Vec<Piece> {
     let mut pieces: Vec<Piece> = Vec::new();
-    push_side(&spec.left, ctx, mode_label, custom, &mut pieces);
+    push_side(
+        &spec.left,
+        &spec.separator,
+        ctx,
+        mode_label,
+        custom,
+        &mut pieces,
+    );
     pieces.push(Piece::Align);
-    push_side(&spec.right, ctx, mode_label, custom, &mut pieces);
+    push_side(
+        &spec.right,
+        &spec.separator,
+        ctx,
+        mode_label,
+        custom,
+        &mut pieces,
+    );
     pieces
 }
 
-/// Append one side's resolved segments to `pieces`, space-separated, skipping
-/// the empties so they leave no stray separator. A cell carrying an
+/// Append one side's resolved segments to `pieces`, joined by `separator` (and
+/// edged with it), skipping the empties so they leave no stray separator. An empty
+/// `separator` emits no connector at all — a powerline statusline that owns its
+/// padding/arrows wants a gap-free coloured bar. A cell carrying an
 /// [`on_click`](StatusSegment::on_click) handler is wrapped in a
 /// [`Piece::ClickStart`]/`ClickEnd` pair so [`layout_with_clicks`] tracks its
 /// column span (the segment analogue of the `%`-format's `%@…%X`).
 fn push_side(
     names: &[String],
+    separator: &str,
     ctx: &StatuslineCtx,
     mode_label: &str,
     custom: &dyn Fn(&str) -> Option<Vec<StatusSegment>>,
     pieces: &mut Vec<Piece>,
 ) {
+    // The connector painted before/between/after segments; `group: None`, so it
+    // takes the base `StatusLine` look. Empty ⇒ skip it entirely (no white gaps).
+    let connector = |pieces: &mut Vec<Piece>| {
+        if !separator.is_empty() {
+            push_text(pieces, separator.to_string(), None);
+        }
+    };
     let mut wrote = false;
     for name in names {
         let cells = builtin_segment(name, ctx, mode_label)
@@ -1151,9 +1182,9 @@ fn push_side(
         if cells.iter().all(|c| c.text.is_empty()) {
             continue;
         }
-        // A single space between adjacent non-empty segments (and a leading one,
-        // so the bar doesn't butt against the edge).
-        push_text(pieces, " ".to_string(), None);
+        // The connector between adjacent non-empty segments (and a leading one, so
+        // the bar doesn't butt against the edge) — unless disabled (empty).
+        connector(pieces);
         for cell in cells {
             match cell.on_click {
                 Some(handler) => {
@@ -1169,7 +1200,7 @@ fn push_side(
         wrote = true;
     }
     if wrote {
-        push_text(pieces, " ".to_string(), None);
+        connector(pieces);
     }
 }
 
@@ -1541,5 +1572,66 @@ mod tests {
         assert!(parse("%3l").is_err()); // width prefix not supported yet
         assert!(parse("%#Unterminated").is_err());
         assert!(parse("%{unterminated").is_err());
+    }
+
+    /// A custom-segment provider returning one coloured cell per known name.
+    fn colored_cells(name: &str) -> Option<Vec<StatusSegment>> {
+        match name {
+            "nxline_a" => Some(vec![StatusSegment {
+                text: " NORMAL ".into(),
+                group: Some("lualine_a_normal".into()),
+                on_click: None,
+            }]),
+            "nxline_b" => Some(vec![StatusSegment {
+                text: " main ".into(),
+                group: Some("lualine_b_normal".into()),
+                on_click: None,
+            }]),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn default_separator_inserts_unstyled_connector_spaces() {
+        // The plain-bar default: a leading space and a space between segments, both
+        // `group: None` (the base look). This is what makes a powerline bar show
+        // white gaps — the regression the `separator` opt addresses.
+        let spec = SegmentLayout {
+            left: vec!["nxline_a".into(), "nxline_b".into()],
+            right: vec![],
+            separator: " ".into(),
+        };
+        let segs = compose_segments(&spec, &ctx(), "NORMAL", 0, &colored_cells);
+        // First run is the unstyled leading connector, not the coloured mode cell.
+        assert_eq!(segs[0].text, " ");
+        assert!(segs[0].group.is_none(), "leading connector is unstyled");
+        // A `None`-group space sits between the two coloured segments too.
+        assert!(
+            segs.iter()
+                .any(|s| s.group.is_none() && s.text.trim().is_empty()),
+            "an unstyled connector separates the segments"
+        );
+    }
+
+    #[test]
+    fn empty_separator_removes_all_connectors() {
+        // A powerline statusline passes `separator = ""`: no leading, trailing, or
+        // inter-segment connector — every emitted run carries the segment's own
+        // group, so the bar is a seamless colour run with no unstyled white gaps.
+        let spec = SegmentLayout {
+            left: vec!["nxline_a".into(), "nxline_b".into()],
+            right: vec![],
+            separator: String::new(),
+        };
+        let segs = compose_segments(&spec, &ctx(), "NORMAL", 0, &colored_cells);
+        assert!(
+            segs.iter().all(|s| s.group.is_some()),
+            "no unstyled connector cell remains: {segs:?}"
+        );
+        // The bar is exactly the two coloured segments, in order.
+        assert_eq!(segs[0].text, " NORMAL ");
+        assert_eq!(segs[0].group.as_deref(), Some("lualine_a_normal"));
+        assert_eq!(segs[1].text, " main ");
+        assert_eq!(segs[1].group.as_deref(), Some("lualine_b_normal"));
     }
 }

@@ -492,6 +492,43 @@ try {
       && Math.abs(symBox.w - asciiBox.w) <= 1,
     JSON.stringify({ sym: symBox.w, ascii: asciiBox.w }));
 
+  // ---- Right-hugging Nerd separators are anchored to the cell's right edge ----
+  // A left-pointing powerline separator () is shaped with its ink parked at the right
+  // of an advance box wider than its cell; left-anchoring it draws over the next cell.
+  // The renderer measures the ink (Canvas) and, when it hugs the right, pins the ink's
+  // right edge to the box via a negative text-indent (a right-pointing  hugs the left
+  // and keeps the natural anchor). This stays self-consistent whether or not a Nerd
+  // font is installed: with no Nerd font both glyphs fall back to a cell-width box with
+  // centred ink (no hug → no indent), and the assertion still holds.
+  await page.evaluate(() => window.__nxvim.feed("<Esc>:enew!<CR>i\u{e0b0}\u{e0b2}<Esc>"));
+  await sleep(150);
+  const seps = await page.evaluate(() => {
+    const grid = document.getElementById("grid");
+    const ctx = document.createElement("canvas").getContext("2d");
+    ctx.textAlign = "left"; ctx.textBaseline = "alphabetic";
+    ctx.font = `15px ${getComputedStyle(grid).fontFamily}`;
+    const measure = (cp) => {
+      const m = ctx.measureText(String.fromCodePoint(cp));
+      const inkLeft = -m.actualBoundingBoxLeft, inkRight = m.actualBoundingBoxRight;
+      return { hugRight: inkRight > inkLeft && (m.width - inkRight) < inkLeft, inkRight };
+    };
+    const indentOf = (chStr) => {
+      const span = [...document.querySelectorAll("#grid .win .row span")].find((s) => s.textContent === chStr);
+      return span ? parseFloat(getComputedStyle(span).textIndent) || 0 : null;
+    };
+    return {
+      right: { ...measure(0xe0b0), indent: indentOf("\u{e0b0}") },
+      left: { ...measure(0xe0b2), indent: indentOf("\u{e0b2}") },
+    };
+  });
+  // Right-pointing: hugs left → no indent. Left-pointing: hugs right → negative indent.
+  const okRight = seps.right.indent != null && Math.abs(seps.right.indent) < 0.5 && !seps.right.hugRight;
+  const okLeft = seps.left.hugRight
+    ? (seps.left.indent != null && seps.left.indent < -0.5)   // Nerd font present: pinned right
+    : (seps.left.indent != null && Math.abs(seps.left.indent) < 0.5); // no Nerd font: no hug, no indent
+  check("nerd separator: right-hugging glyph anchored to the cell's right edge (left-pointing), left-hugging unshifted",
+    okRight && okLeft, JSON.stringify(seps));
+
   await browser.close();
 } finally {
   cleanup();

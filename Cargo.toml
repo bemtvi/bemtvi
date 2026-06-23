@@ -147,6 +147,10 @@ redb = "=2.2.0"
 rmp-serde = "=1.3.0"
 unicode-width = "=0.2.2"
 unicode-segmentation = "=1.13.2"
+# The GUI's custom font fallback (`UserFallback`) implements cosmic-text's
+# `Fallback` trait, whose `script_fallback` is keyed by `unicode_script::Script`.
+# Pinned to the version cosmic-text resolves so the trait's `Script` type unifies.
+unicode-script = "=0.5.8"
 regex = "=1.12.3"
 portable-pty = "=0.9.0"
 vt100 = "=0.16.2"

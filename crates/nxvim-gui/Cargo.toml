@@ -21,6 +21,9 @@ tokio.workspace = true
 winit.workspace = true
 wgpu.workspace = true
 glyphon.workspace = true
+# `unicode_script::Script` types the `Fallback::script_fallback` impl in render.rs;
+# must be the same crate version cosmic-text (via glyphon) uses (see workspace dep).
+unicode-script.workspace = true
 pollster.workspace = true
 nxvim-rpc.workspace = true
 nxvim-view.workspace = true

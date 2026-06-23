@@ -28,14 +28,16 @@ use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
+use glyphon::cosmic_text::{Fallback, PlatformFallback};
 use glyphon::{
-    Attrs, Buffer, Cache, Color, Family, FontSystem, Metrics, Resolution, Shaping, SwashCache,
-    TextArea, TextAtlas, TextBounds, TextRenderer, Viewport,
+    fontdb, Attrs, Buffer, Cache, Color, Family, FontSystem, Metrics, Resolution, Shaping,
+    SwashCache, TextArea, TextAtlas, TextBounds, TextRenderer, Viewport,
 };
 use nxvim_view::{
     Border, DiagSign, DiagSpan, Geometry, InlayHint, ResizeCursor, StatusSegment, Style, TabData,
     View, VirtChunk, VirtPlacement, WindowRegion, WindowView,
 };
+use unicode_script::Script;
 use winit::window::Window;
 
 use crate::images::{ImageDraw, ImageStatus, ImageStore};
@@ -165,6 +167,78 @@ pub struct ScrollFrame<'a> {
     pub styles: &'a [Style],
 }
 
+/// Intern a font-family name as a `&'static str`. cosmic-text's [`Fallback`] trait
+/// returns `&[&'static str]`, so the user's runtime fallback names must be promoted
+/// to `'static`. Interning (rather than leaking per call) bounds the leak to the set
+/// of distinct names ever configured, so repeated `:set guifont=…` can't grow it.
+fn intern_family(name: &str) -> &'static str {
+    use std::collections::HashSet;
+    use std::sync::{Mutex, OnceLock};
+    static POOL: OnceLock<Mutex<HashSet<&'static str>>> = OnceLock::new();
+    let pool = POOL.get_or_init(|| Mutex::new(HashSet::new()));
+    let mut pool = pool.lock().unwrap();
+    if let Some(&existing) = pool.get(name) {
+        return existing;
+    }
+    let leaked: &'static str = Box::leak(name.to_string().into_boxed_str());
+    pool.insert(leaked);
+    leaked
+}
+
+/// Font fallback that tries the user's configured fallback families before the
+/// platform's defaults — nxvim's analogue of wezterm's `font_with_fallback`. The
+/// user's families (every font after the first in `guifont` / `--font`) are
+/// prepended to the platform [`common_fallback`](Fallback::common_fallback), which
+/// cosmic-text consults right after the primary family for any glyph whose script
+/// has no curated list (`_ => &[]` in the platform tables) — symbols, icons, emoji,
+/// box-drawing, most punctuation: exactly the glyphs a coding font tends to miss. A
+/// real script (CJK, Arabic, …) still resolves through the platform's curated
+/// per-script font first; the user list then covers anything that misses.
+struct UserFallback {
+    /// The user fallback families (interned) followed by the platform common list.
+    common: Vec<&'static str>,
+}
+
+impl UserFallback {
+    /// Build from the user's fallback families (the `guifont` entries after the
+    /// primary), each tried before the platform's own common fallbacks.
+    fn new(fallback_families: &[String]) -> Self {
+        let common = fallback_families
+            .iter()
+            .map(|f| intern_family(f))
+            .chain(PlatformFallback.common_fallback().iter().copied())
+            .collect();
+        Self { common }
+    }
+}
+
+impl Fallback for UserFallback {
+    fn common_fallback(&self) -> &[&'static str] {
+        &self.common
+    }
+    // Forbidden and per-script lists are the platform's unchanged — the user list
+    // only augments the script-agnostic common path.
+    fn forbidden_fallback(&self) -> &[&'static str] {
+        PlatformFallback.forbidden_fallback()
+    }
+    fn script_fallback(&self, script: Script, locale: &str) -> &[&'static str] {
+        PlatformFallback.script_fallback(script, locale)
+    }
+}
+
+/// Build a [`FontSystem`] whose fallback prefers `fallback_families` (the configured
+/// families after the primary). Scans the system fonts once via [`FontSystem::new`],
+/// then rebuilds onto the same database with the custom [`UserFallback`] (cheap — no
+/// second scan).
+fn font_system_with_fallback(fallback_families: &[String]) -> FontSystem {
+    let (locale, db) = FontSystem::new().into_locale_and_db();
+    FontSystem::new_with_locale_and_db_and_fallback(
+        locale,
+        db,
+        UserFallback::new(fallback_families),
+    )
+}
+
 /// The GPU renderer. Owns the surface and everything needed to paint one frame.
 pub struct Renderer {
     surface: wgpu::Surface<'static>,
@@ -210,9 +284,10 @@ pub struct Renderer {
     /// trigger), so every requested size is clamped to it.
     max_dim: u32,
 
-    /// Configured font family name, or `None` for the system monospace. Used when
-    /// shaping each line (and measuring the cell at startup).
-    font_name: Option<String>,
+    /// Configured font families: the first is the primary (shaped against directly
+    /// and measured for the cell); the rest are the fallback chain, baked into
+    /// `font_system`'s [`UserFallback`]. Empty means the system monospace.
+    fonts: Vec<String>,
 
     /// Device-pixel cell size, measured from the configured font once at startup.
     cell_w: f32,
@@ -291,15 +366,15 @@ impl Renderer {
         // the one atlas; only its own glyph-instance buffer is separate.
         let overlay_text =
             TextRenderer::new(&mut atlas, &device, wgpu::MultisampleState::default(), None);
-        let mut font_system = FontSystem::new();
+        let fonts = cfg.fonts.clone();
+        let mut font_system = font_system_with_fallback(fonts.get(1..).unwrap_or(&[]));
         let swash_cache = SwashCache::new();
 
-        let font_name = cfg.font.clone();
         let font_size = cfg.font_size * scale;
         let line_height = (font_size * LINE_SPACING).round();
-        let family = font_name
-            .as_deref()
-            .map(Family::Name)
+        let family = fonts
+            .first()
+            .map(|s| Family::Name(s))
             .unwrap_or(Family::Monospace);
         let (cell_w, cell_h) = measure_cell(&mut font_system, family, font_size, line_height);
 
@@ -320,7 +395,7 @@ impl Renderer {
             _cache: cache,
             rects,
             image_store,
-            font_name,
+            fonts,
             cache: HashMap::new(),
             gen: 0,
             max_dim,
@@ -333,18 +408,25 @@ impl Renderer {
         })
     }
 
-    /// Re-shape with a new font family (`None` = system monospace) and point size,
-    /// re-measuring the cell and dropping the shaped-line cache (its buffers were
-    /// shaped at the old metrics). The caller then re-reports the grid (the cell
+    /// Re-shape with a new font family list (empty = system monospace) and point
+    /// size, re-measuring the cell and dropping the shaped-line cache (its buffers
+    /// were shaped at the old metrics). The caller then re-reports the grid (the cell
     /// size, hence `grid_size`, has changed) and repaints. Backs `:set guifont=…`.
-    pub fn set_font(&mut self, font: Option<&str>, size_pt: f32) {
-        self.font_name = font.map(str::to_string);
+    ///
+    /// `fonts[0]` is the primary; `fonts[1..]` is the fallback chain. When that chain
+    /// changes the [`FontSystem`] is rebuilt with a fresh [`UserFallback`] (reusing
+    /// the already-scanned font database — no rescan); a size-only change skips it.
+    pub fn set_font(&mut self, fonts: &[String], size_pt: f32) {
+        if fonts.get(1..) != self.fonts.get(1..) {
+            self.rebuild_font_system(fonts.get(1..).unwrap_or(&[]));
+        }
+        self.fonts = fonts.to_vec();
         self.font_size = size_pt * self.scale;
         self.line_height = (self.font_size * LINE_SPACING).round();
         let family = self
-            .font_name
-            .as_deref()
-            .map(Family::Name)
+            .fonts
+            .first()
+            .map(|s| Family::Name(s))
             .unwrap_or(Family::Monospace);
         let (cell_w, cell_h) = measure_cell(
             &mut self.font_system,
@@ -355,6 +437,21 @@ impl Renderer {
         self.cell_w = cell_w;
         self.cell_h = cell_h;
         self.cache.clear();
+    }
+
+    /// Swap in a [`FontSystem`] whose fallback prefers `fallback_families`, reusing
+    /// the current system's font database so no rescan happens. The placeholder is an
+    /// empty-database system, immediately dropped once the real database is moved out.
+    fn rebuild_font_system(&mut self, fallback_families: &[String]) {
+        let placeholder =
+            FontSystem::new_with_locale_and_db(String::new(), fontdb::Database::new());
+        let old = std::mem::replace(&mut self.font_system, placeholder);
+        let (locale, db) = old.into_locale_and_db();
+        self.font_system = FontSystem::new_with_locale_and_db_and_fallback(
+            locale,
+            db,
+            UserFallback::new(fallback_families),
+        );
     }
 
     /// The current grid size in cells: `(cols, total_rows)`. The caller reserves
@@ -2993,12 +3090,13 @@ impl Renderer {
     /// or italic face — its weight/slant, so `b`/`i` highlight attributes select a
     /// real heavier/slanted glyph (cosmic-text synthesizes one if the family lacks it).
     fn shape_segments(&mut self, segments: &[Seg]) -> Buffer {
-        // Family borrows `font_name`; the buffer borrows `font_system` — disjoint
-        // fields, so the two borrows coexist.
+        // Family borrows `fonts`; the buffer borrows `font_system` — disjoint fields,
+        // so the two borrows coexist. (The fallback chain lives in `font_system`'s
+        // `UserFallback`, so only the primary family is named here.)
         let family = self
-            .font_name
-            .as_deref()
-            .map(Family::Name)
+            .fonts
+            .first()
+            .map(|s| Family::Name(s))
             .unwrap_or(Family::Monospace);
         let mut buf = Buffer::new(
             &mut self.font_system,

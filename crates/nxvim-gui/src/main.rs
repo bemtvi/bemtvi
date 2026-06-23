@@ -82,8 +82,10 @@ fn main() -> Result<()> {
 /// Parse the command line into `(positionals, config)`: non-flag arguments (the first is
 /// the file to open) in order, plus the font config — `--font <name>` / `--font-size
 /// <pt>` (or the `=` form) set the font, taking precedence over the `NXVIM_GUI_FONT` /
-/// `NXVIM_GUI_FONT_SIZE` environment the config starts from. Unknown flags (e.g.
-/// `--connect-daemon`) are ignored here — they are handled by `main`.
+/// `NXVIM_GUI_FONT_SIZE` environment the config starts from. `--font` accepts a
+/// comma-separated fallback list (`--font "JetBrains Mono,Noto Color Emoji"`), tried in
+/// order for a glyph the primary lacks. Unknown flags (e.g. `--connect-daemon`) are
+/// ignored here — they are handled by `main`.
 fn parse_args(args: &[String]) -> (Vec<String>, GuiConfig) {
     let mut positionals = Vec::new();
     let mut config = GuiConfig::from_env();

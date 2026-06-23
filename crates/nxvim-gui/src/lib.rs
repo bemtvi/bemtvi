@@ -97,8 +97,10 @@ fn in_scroll_zone(row: u16, rows: u16) -> bool {
 /// font name falls back to the system monospace.
 #[derive(Clone, Debug)]
 pub struct GuiConfig {
-    /// Font family name (e.g. `"JetBrains Mono"`); `None` uses the system monospace.
-    pub font: Option<String>,
+    /// Ordered font families: the first is the primary, the rest a wezterm-style
+    /// fallback chain tried in turn for a glyph the primary lacks. Empty uses the
+    /// system monospace. Set from a comma-separated `--font` / `NXVIM_GUI_FONT`.
+    pub fonts: Vec<String>,
     /// Font point size, before the display's scale factor is applied.
     pub font_size: f32,
 }
@@ -106,16 +108,16 @@ pub struct GuiConfig {
 impl Default for GuiConfig {
     fn default() -> Self {
         Self {
-            font: None,
+            fonts: Vec::new(),
             font_size: 15.0,
         }
     }
 }
 
 impl GuiConfig {
-    /// Overrides from the environment: `NXVIM_GUI_FONT` (family) and
-    /// `NXVIM_GUI_FONT_SIZE` (points). Absent/blank/invalid values keep the default;
-    /// CLI flags layered on top take precedence (see `main`).
+    /// Overrides from the environment: `NXVIM_GUI_FONT` (family, or a comma-separated
+    /// fallback list) and `NXVIM_GUI_FONT_SIZE` (points). Absent/blank/invalid values
+    /// keep the default; CLI flags layered on top take precedence (see `main`).
     pub fn from_env() -> Self {
         let mut c = Self::default();
         if let Some(name) = std::env::var_os("NXVIM_GUI_FONT") {
@@ -129,12 +131,15 @@ impl GuiConfig {
         c
     }
 
-    /// Set the font family, ignoring a blank name (which keeps the monospace
-    /// default rather than asking the font system for `""`).
-    pub fn set_font(&mut self, name: &str) {
-        let name = name.trim();
-        if !name.is_empty() {
-            self.font = Some(name.to_string());
+    /// Set the font family list from a comma-separated spec (`"JetBrains Mono,Noto
+    /// Color Emoji"`), like a `guifont` value: each family is trimmed and its
+    /// backslash-escaped spaces unescaped, and blanks are dropped. An all-blank spec
+    /// leaves the list untouched (keeping the monospace default rather than asking
+    /// the font system for `""`).
+    pub fn set_font(&mut self, spec: &str) {
+        let fonts = parse_font_list(spec);
+        if !fonts.is_empty() {
+            self.fonts = fonts;
         }
     }
 
@@ -718,13 +723,18 @@ impl App {
     /// `:set guifont=…` takes effect live. A no-op before the renderer exists; it's
     /// applied from `resumed` once the renderer is built.
     fn apply_guifont(&mut self) {
-        let (family, size) = parse_guifont(&self.view.guifont);
-        let font = family.or_else(|| self.config.font.clone());
+        let (families, size) = parse_guifont(&self.view.guifont);
+        // The `guifont` families win; with none set, fall back to the CLI/env list.
+        let fonts = if families.is_empty() {
+            self.config.fonts.clone()
+        } else {
+            families
+        };
         let size = size.unwrap_or(self.config.font_size);
         let Some(renderer) = self.renderer.as_mut() else {
             return;
         };
-        renderer.set_font(font.as_deref(), size);
+        renderer.set_font(&fonts, size);
         self.applied_guifont = self.view.guifont.clone();
         // The cell size changed, so the grid in cells did too — re-report it (the
         // server re-lays out for the new dimensions) and repaint.
@@ -1052,29 +1062,31 @@ pub fn dialog_action(cmdline: &str, unnamed: bool, remote: bool) -> Option<Dialo
     }
 }
 
-/// Parse a vim / Neovide `guifont` value into `(family, point size)`. The family is
-/// the first of the comma-separated fonts (the font system handles fallback on its
-/// own); a backslash-escaped space (`Fira\ Code`, the `:set` form) is unescaped. A
-/// `:h<n>` field sets the size; other `:` options (`:w`, `:b`, `:i`, `:#e-…`) are
-/// accepted but ignored. Either component is `None` when absent, so the caller can
-/// fall back to its configured default. Pure, so it's unit-tested in `tests/keys.rs`.
-pub fn parse_guifont(guifont: &str) -> (Option<String>, Option<f32>) {
+/// Split a comma-separated font-family list (`"JetBrains Mono,Noto Color Emoji"`)
+/// into individual families: each is trimmed and its backslash-escaped spaces
+/// (`Fira\ Code`, the `:set guifont` form) unescaped, and blank entries are dropped.
+fn parse_font_list(spec: &str) -> Vec<String> {
+    spec.split(',')
+        .map(|f| f.replace("\\ ", " ").trim().to_string())
+        .filter(|f| !f.is_empty())
+        .collect()
+}
+
+/// Parse a vim / Neovide `guifont` value into `(families, point size)`. The families
+/// are the comma-separated list, tried in order as a wezterm-style fallback chain (a
+/// backslash-escaped space, the `:set` form, is unescaped). A `:h<n>` field sets the
+/// size; other `:` options (`:w`, `:b`, `:i`, `:#e-…`) are accepted but ignored. The
+/// family list is empty / the size `None` when absent, so the caller can fall back to
+/// its configured default. Pure, so it's unit-tested in `tests/keys.rs`.
+pub fn parse_guifont(guifont: &str) -> (Vec<String>, Option<f32>) {
     let mut parts = guifont.split(':');
-    let family = parts
-        .next()
-        .unwrap_or("")
-        .split(',')
-        .next()
-        .unwrap_or("")
-        .replace("\\ ", " ");
-    let family = family.trim();
-    let family = (!family.is_empty()).then(|| family.to_string());
+    let families = parse_font_list(parts.next().unwrap_or(""));
 
     let size = parts.find_map(|opt| {
         let pt = opt.strip_prefix('h')?.trim().parse::<f32>().ok()?;
         (pt.is_finite() && pt > 0.0).then_some(pt)
     });
-    (family, size)
+    (families, size)
 }
 
 impl ApplicationHandler<UserEvent> for App {

@@ -4,7 +4,7 @@
 
 use nxvim_gui::{
     dialog_action, encode_key, encode_paste, is_paste, open_dialog_verb, open_path_command,
-    parse_guifont, save_dialog_needed, DialogAction,
+    parse_guifont, save_dialog_needed, DialogAction, GuiConfig,
 };
 use winit::keyboard::{Key, ModifiersState, NamedKey};
 
@@ -175,31 +175,57 @@ fn open_dialog_leaves_other_commands_alone() {
 
 #[test]
 fn guifont_parses_family_and_size() {
+    let fams = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+
     // `Family:h<size>` — the neovim/Neovide form set in init.lua.
     assert_eq!(
         parse_guifont("Source Code Pro:h14"),
-        (Some("Source Code Pro".to_string()), Some(14.0))
+        (fams(&["Source Code Pro"]), Some(14.0))
     );
     // Backslash-escaped spaces (the `:set guifont=...` form) are unescaped.
     assert_eq!(
         parse_guifont("Fira\\ Code:h12"),
-        (Some("Fira Code".to_string()), Some(12.0))
+        (fams(&["Fira Code"]), Some(12.0))
     );
-    // A fallback list uses the first font; extra `:` options are ignored.
+    // A comma list is the full wezterm-style fallback chain (primary first), with
+    // extra `:` options ignored and each family trimmed/unescaped.
     assert_eq!(
-        parse_guifont("JetBrains Mono,Noto Sans:h16:b:#e-subpixel"),
-        (Some("JetBrains Mono".to_string()), Some(16.0))
+        parse_guifont("JetBrains Mono,Noto Color Emoji,Symbols Nerd Font:h16:b:#e-subpixel"),
+        (
+            fams(&["JetBrains Mono", "Noto Color Emoji", "Symbols Nerd Font"]),
+            Some(16.0)
+        )
     );
     // Family only / size only / empty — each component falls back independently.
-    assert_eq!(
-        parse_guifont("Iosevka"),
-        (Some("Iosevka".to_string()), None)
-    );
-    assert_eq!(parse_guifont(":h20"), (None, Some(20.0)));
-    assert_eq!(parse_guifont(""), (None, None));
+    assert_eq!(parse_guifont("Iosevka"), (fams(&["Iosevka"]), None));
+    assert_eq!(parse_guifont(":h20"), (Vec::new(), Some(20.0)));
+    assert_eq!(parse_guifont(""), (Vec::new(), None));
     // A non-positive or junk size is rejected (kept as None, not 0).
-    assert_eq!(parse_guifont("Mono:h0"), (Some("Mono".to_string()), None));
-    assert_eq!(parse_guifont("Mono:hx"), (Some("Mono".to_string()), None));
+    assert_eq!(parse_guifont("Mono:h0"), (fams(&["Mono"]), None));
+    assert_eq!(parse_guifont("Mono:hx"), (fams(&["Mono"]), None));
+}
+
+#[test]
+fn config_font_takes_a_comma_separated_fallback_list() {
+    // `--font` / `NXVIM_GUI_FONT` accepts the same comma list as `guifont`: the
+    // primary first, then the fallback chain (each trimmed, `\ ` unescaped).
+    let mut cfg = GuiConfig::default();
+    assert!(cfg.fonts.is_empty()); // default = system monospace
+
+    cfg.set_font("JetBrains\\ Mono, Noto Color Emoji ,Symbols Nerd Font");
+    assert_eq!(
+        cfg.fonts,
+        vec![
+            "JetBrains Mono".to_string(),
+            "Noto Color Emoji".to_string(),
+            "Symbols Nerd Font".to_string(),
+        ]
+    );
+
+    // An all-blank spec leaves the existing list untouched (keeps the default rather
+    // than asking the font system for `""`).
+    cfg.set_font("  , ");
+    assert_eq!(cfg.fonts.len(), 3);
 }
 
 #[test]

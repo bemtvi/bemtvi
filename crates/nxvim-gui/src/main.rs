@@ -84,8 +84,9 @@ fn main() -> Result<()> {
 /// <pt>` (or the `=` form) set the font, taking precedence over the `NXVIM_GUI_FONT` /
 /// `NXVIM_GUI_FONT_SIZE` environment the config starts from. `--font` accepts a
 /// comma-separated fallback list (`--font "JetBrains Mono,Noto Color Emoji"`), tried in
-/// order for a glyph the primary lacks. Unknown flags (e.g. `--connect-daemon`) are
-/// ignored here — they are handled by `main`.
+/// order for a glyph the primary lacks. `--emoji-scale <f>` sizes emoji / wide
+/// fallback glyphs relative to the cell (default `NXVIM_GUI_EMOJI_SCALE` or 1.0).
+/// Unknown flags (e.g. `--connect-daemon`) are ignored here — handled by `main`.
 fn parse_args(args: &[String]) -> (Vec<String>, GuiConfig) {
     let mut positionals = Vec::new();
     let mut config = GuiConfig::from_env();
@@ -95,6 +96,8 @@ fn parse_args(args: &[String]) -> (Vec<String>, GuiConfig) {
             config.set_font(name);
         } else if let Some(size) = arg.strip_prefix("--font-size=") {
             apply_font_size(&mut config, size);
+        } else if let Some(scale) = arg.strip_prefix("--emoji-scale=") {
+            apply_emoji_scale(&mut config, scale);
         } else if arg == "--font" {
             if let Some(name) = iter.next() {
                 config.set_font(name);
@@ -102,6 +105,10 @@ fn parse_args(args: &[String]) -> (Vec<String>, GuiConfig) {
         } else if arg == "--font-size" {
             if let Some(size) = iter.next() {
                 apply_font_size(&mut config, size);
+            }
+        } else if arg == "--emoji-scale" {
+            if let Some(scale) = iter.next() {
+                apply_emoji_scale(&mut config, scale);
             }
         } else if !arg.starts_with('-') {
             positionals.push(arg.clone());
@@ -115,5 +122,13 @@ fn apply_font_size(config: &mut GuiConfig, value: &str) {
     match value.trim().parse::<f32>() {
         Ok(pt) => config.set_font_size(pt),
         Err(_) => eprintln!("nxvim-gui: ignoring non-numeric --font-size {value:?}"),
+    }
+}
+
+/// Apply an `--emoji-scale` value, warning (but not failing) on a non-numeric one.
+fn apply_emoji_scale(config: &mut GuiConfig, value: &str) {
+    match value.trim().parse::<f32>() {
+        Ok(s) => config.set_emoji_scale(s),
+        Err(_) => eprintln!("nxvim-gui: ignoring non-numeric --emoji-scale {value:?}"),
     }
 }

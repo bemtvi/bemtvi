@@ -2761,6 +2761,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "arboard",
+ "cosmic-text",
  "glyphon",
  "image",
  "nxvim-rpc",
@@ -2771,6 +2772,7 @@ dependencies = [
  "rmpv",
  "tokio",
  "unicode-script",
+ "unicode-width",
  "wgpu",
  "winit",
  "winresource",

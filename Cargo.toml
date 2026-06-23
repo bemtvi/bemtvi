@@ -104,6 +104,12 @@ image = "=0.25.10"
 winit = "=0.30.13"
 wgpu = "=25.0.2"
 glyphon = "=0.9.0"
+# Pulled in directly (same instance glyphon uses) only to enable `monospace_fallback`:
+# without it cosmic-text's `Buffer::set_monospace_width` is a silent no-op, so wide
+# (CJK/emoji) glyphs keep their font-native advance — not snapped to two cells — and
+# the text after them drifts off the cell grid. The feature lets the shaper scale each
+# glyph to a whole number of cells. Version must match glyphon's `cosmic-text` (0.14).
+cosmic-text = { version = "=0.14.2", features = ["monospace_fallback"] }
 pollster = "=0.4.0"
 # Native system file dialog for the GUI's `:eo`/`:wn`/… pickers — all three
 # desktop platforms, no GTK: NSOpenPanel on macOS, the Win32 `IFileDialog` on

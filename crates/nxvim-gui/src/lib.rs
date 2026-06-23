@@ -54,6 +54,9 @@ pub use render::{inlay_shift, splice_inlay, Seg, DEFAULT_INLAY};
 // The pure per-row syntax-coloring layer (run splitting + the no-colorscheme group
 // fallback), exported so the Tier-1 `syntax` test can exercise it without a GPU.
 pub use render::{col_to_screen, group_fallback, rect_subtract, row_segments, text_run_origin};
+// The wide-glyph mask (replace an off-grid emoji cluster with cell-width spaces), so
+// the Tier-1 `wide` test can exercise it without shaping / a GPU.
+pub use render::mask_segments;
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -103,6 +106,10 @@ pub struct GuiConfig {
     pub fonts: Vec<String>,
     /// Font point size, before the display's scale factor is applied.
     pub font_size: f32,
+    /// Render scale for an emoji / wide fallback glyph relative to the text cell — a
+    /// color-emoji font draws smaller than its reserved cells, so this sizes it up.
+    /// Set from `--emoji-scale` / `NXVIM_GUI_EMOJI_SCALE`.
+    pub emoji_scale: f32,
 }
 
 impl Default for GuiConfig {
@@ -110,6 +117,7 @@ impl Default for GuiConfig {
         Self {
             fonts: Vec::new(),
             font_size: 15.0,
+            emoji_scale: 1.0,
         }
     }
 }
@@ -126,6 +134,11 @@ impl GuiConfig {
         if let Ok(size) = std::env::var("NXVIM_GUI_FONT_SIZE") {
             if let Ok(pt) = size.trim().parse::<f32>() {
                 c.set_font_size(pt);
+            }
+        }
+        if let Ok(scale) = std::env::var("NXVIM_GUI_EMOJI_SCALE") {
+            if let Ok(s) = scale.trim().parse::<f32>() {
+                c.set_emoji_scale(s);
             }
         }
         c
@@ -148,6 +161,15 @@ impl GuiConfig {
     pub fn set_font_size(&mut self, pt: f32) {
         if pt.is_finite() && pt > 0.0 {
             self.font_size = pt.clamp(4.0, 200.0);
+        }
+    }
+
+    /// Set the emoji render scale, clamped to `[0.25, 4.0]` so a typo can't blow a
+    /// glyph up across the screen or vanish it. A non-finite or non-positive value is
+    /// ignored (keeps the current scale).
+    pub fn set_emoji_scale(&mut self, scale: f32) {
+        if scale.is_finite() && scale > 0.0 {
+            self.emoji_scale = scale.clamp(0.25, 4.0);
         }
     }
 }

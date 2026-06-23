@@ -38,6 +38,7 @@ use nxvim_view::{
     View, VirtChunk, VirtPlacement, WindowRegion, WindowView,
 };
 use unicode_script::Script;
+use unicode_width::UnicodeWidthStr;
 use winit::window::Window;
 
 use crate::images::{ImageDraw, ImageStatus, ImageStore};
@@ -72,6 +73,13 @@ const MULTICURSOR_ACCENT: u32 = 0xe5_c0_7b;
 struct CacheEntry {
     buffer: Buffer,
     used: u64,
+    /// Byte ranges (into the shaped text) of off-grid glyph clusters — emoji and
+    /// monochrome symbols whose advance didn't snap to the cell grid. Computed once at
+    /// shape time; the text path masks these out of the line and redraws them as
+    /// separately-placed, scaled items so they fill their cells without dragging the
+    /// rest of the line off-grid (see [`Renderer::push_text`]). Empty for the common
+    /// all-narrow line.
+    nonsnapped: Vec<(usize, usize)>,
 }
 
 /// One styled run within a shaped line: its text, foreground color, and the bold
@@ -117,6 +125,9 @@ struct TextItem {
     y: f32,
     color: Color,
     bounds: TextBounds,
+    /// Render scale for the shaped buffer (1.0 for ordinary text). Used to shrink an
+    /// over-wide emoji glyph to fit its cell box (see [`Renderer::push_text`]).
+    scale: f32,
 }
 
 /// An interpolated scroll-slide frame for the focused window, supplied by the
@@ -288,6 +299,9 @@ pub struct Renderer {
     /// and measured for the cell); the rest are the fallback chain, baked into
     /// `font_system`'s [`UserFallback`]. Empty means the system monospace.
     fonts: Vec<String>,
+    /// Render scale for an emoji / wide fallback glyph (see [`Renderer::push_text`]),
+    /// from [`GuiConfig::emoji_scale`].
+    emoji_scale: f32,
 
     /// Device-pixel cell size, measured from the configured font once at startup.
     cell_w: f32,
@@ -396,6 +410,7 @@ impl Renderer {
             rects,
             image_store,
             fonts,
+            emoji_scale: cfg.emoji_scale,
             cache: HashMap::new(),
             gen: 0,
             max_dim,
@@ -527,7 +542,7 @@ impl Renderer {
                     buffer: &e.buffer,
                     left: it.x,
                     top: it.y,
-                    scale: 1.0,
+                    scale: it.scale,
                     bounds: it.bounds,
                     default_color: it.color,
                     custom_glyphs: &[],
@@ -3061,18 +3076,67 @@ impl Renderer {
             return;
         }
         let key = self.ensure(segments, default_fg);
+        let color = srgb_to_color(default_fg);
+        // The common case: every glyph snapped to the cell grid — draw the whole line
+        // as one buffer at the run origin.
+        let nonsnapped = self
+            .cache
+            .get(&key)
+            .map(|e| e.nonsnapped.clone())
+            .unwrap_or_default();
+        if nonsnapped.is_empty() {
+            items.push(TextItem {
+                key,
+                x: pos.0,
+                y: pos.1,
+                color,
+                bounds,
+                scale: 1.0,
+            });
+            return;
+        }
+
+        // Otherwise the line has off-grid clusters (emoji or monochrome symbols). Mask
+        // each to spaces so the rest of the line shapes on-grid (surrounding text stays
+        // aligned), then place each cluster as its own scaled item over the reserved gap.
+        let full: String = segments.iter().map(|s| s.text.as_str()).collect();
+        let masked = mask_segments(segments, &nonsnapped);
+        let mkey = self.ensure(&masked, default_fg);
         items.push(TextItem {
-            key,
+            key: mkey,
             x: pos.0,
             y: pos.1,
-            color: srgb_to_color(default_fg),
+            color,
             bounds,
+            scale: 1.0,
         });
+
+        let (cell_w, cell_h, scale) = (self.cell_w, self.cell_h, self.emoji_scale);
+        // Scaling up anchors the glyph at the cell top, so it grows downward and sits
+        // low. Lift it by half the height growth — `(scale − 1) / 2` of a cell — to
+        // re-center it vertically in the line.
+        let y = pos.1 - (scale - 1.0) / 2.0 * cell_h;
+        for &(start, end) in &nonsnapped {
+            let cluster = &full[start..end];
+            let col = full[..start].width() as f32; // cells before the cluster
+            let ekey = self.ensure(&[Seg::plain(cluster.to_string(), default_fg)], default_fg);
+            // A color-emoji font renders smaller than its reserved cells, so draw the
+            // glyph at the configured `emoji_scale` (`--emoji-scale`) at its column.
+            items.push(TextItem {
+                key: ekey,
+                x: pos.0 + col * cell_w,
+                y,
+                color,
+                bounds,
+                scale,
+            });
+        }
     }
 
     /// Ensure a shaped buffer for `segments` is cached, returning its key. A hit
     /// just refreshes the entry's frame stamp — the whole point: no reshaping for
-    /// a line whose content hasn't changed.
+    /// a line whose content hasn't changed. The emoji-cluster list is computed once
+    /// here, with the shape.
     fn ensure(&mut self, segments: &[Seg], default_fg: u32) -> u64 {
         let key = line_key(segments, default_fg);
         if let Some(e) = self.cache.get_mut(&key) {
@@ -3080,11 +3144,13 @@ impl Renderer {
             return key;
         }
         let buffer = self.shape_segments(segments);
+        let nonsnapped = nonsnapped_clusters(&buffer, self.cell_w);
         self.cache.insert(
             key,
             CacheEntry {
                 buffer,
                 used: self.gen,
+                nonsnapped,
             },
         );
         key
@@ -3125,12 +3191,16 @@ impl Renderer {
             Shaping::Advanced,
             None,
         );
-        // Snap every glyph's advance to a whole number of cells: cosmic-text rounds each
-        // advance to the nearest multiple of this width, so a wide CJK/emoji glyph occupies
-        // two cells (centered in its 2-em box by the font) and the text after it stays on
-        // the grid — the GUI's monospace-cell contract, which plain `Advanced` shaping
-        // (font-native advances) breaks. This relayouts + reshapes, standing in for the
-        // explicit shape below.
+        // Snap every glyph's advance to a whole number of cells: cosmic-text scales each
+        // glyph so its advance is a multiple of this width, so a wide CJK/emoji glyph
+        // occupies two cells (centered in its 2-em box by the font) and the text after it
+        // stays on the grid — the GUI's monospace-cell contract, which plain `Advanced`
+        // shaping (font-native advances) breaks. This relayouts + reshapes.
+        //
+        // CRUCIAL: this is a silent no-op unless cosmic-text is built with the
+        // `monospace_fallback` feature (it gates `Font::monospace_em_width`, which the
+        // scaling reads). nxvim-gui pulls cosmic-text in directly only to enable it — see
+        // the dep note in the workspace `Cargo.toml`. Don't drop that dep.
         let cell_w = self.cell_w;
         buf.set_monospace_width(&mut self.font_system, Some(cell_w));
         buf.shape_until_scroll(&mut self.font_system, false);
@@ -3748,6 +3818,79 @@ fn measure_cell(
         .and_then(|run| run.glyphs.first().map(|g| g.w))
         .unwrap_or(font_size * 0.6);
     (advance.max(1.0), line_height.max(1.0))
+}
+
+/// Byte ranges (into the buffer's line text) of glyph clusters whose advance did
+/// **not** land on the cell grid — emoji *and* monochrome symbols (Nerd Font icons,
+/// powerline separators) from non-monospace fallback fonts that `set_monospace_width`
+/// leaves at their native advance. A glyph is on-grid when its advance is ~a whole
+/// number of `cell_w`; a (near-)zero-advance glyph (a combining mark / joiner) is
+/// skipped. Consecutive off-grid glyphs with touching byte ranges merge into one
+/// cluster, so a multi-glyph emoji (a flag, a ligated ZWJ sequence) is one unit.
+fn nonsnapped_clusters(buf: &Buffer, cell_w: f32) -> Vec<(usize, usize)> {
+    let mut out: Vec<(usize, usize)> = Vec::new();
+    for run in buf.layout_runs() {
+        for g in run.glyphs.iter() {
+            let cells = g.w / cell_w;
+            if cells < 0.5 || (cells - cells.round()).abs() <= 0.15 {
+                continue; // narrow/zero advance, or already a whole cell-count wide
+            }
+            let (s, e) = (g.start.min(g.end), g.start.max(g.end));
+            match out.last_mut() {
+                Some(last) if s <= last.1 => {
+                    last.0 = last.0.min(s);
+                    last.1 = last.1.max(e);
+                }
+                _ => out.push((s, e)),
+            }
+        }
+    }
+    out
+}
+
+/// Rebuild `segments`, replacing each byte range in `bad` (off-grid clusters, in
+/// concatenated-text coordinates) with as many spaces as the cluster's cell width.
+/// The spaces hold the cluster's place on the grid so the rest of the line shapes in
+/// alignment; the cluster itself is then drawn as a separate item over the gap. Pure,
+/// so it's unit-tested in `tests/wide.rs`.
+pub fn mask_segments(segments: &[Seg], bad: &[(usize, usize)]) -> Vec<Seg> {
+    let mut out = Vec::with_capacity(segments.len());
+    let mut off = 0usize; // byte offset of this segment in the concatenation
+    for seg in segments {
+        let seg_start = off;
+        let seg_end = off + seg.text.len();
+        off = seg_end;
+        // The bad ranges overlapping this segment, clipped to it.
+        let mut overlaps: Vec<(usize, usize)> = bad
+            .iter()
+            .filter(|&&(s, e)| s < seg_end && e > seg_start)
+            .map(|&(s, e)| (s.max(seg_start), e.min(seg_end)))
+            .collect();
+        if overlaps.is_empty() {
+            out.push(seg.clone());
+            continue;
+        }
+        overlaps.sort_unstable();
+        let mut text = String::with_capacity(seg.text.len());
+        let mut cur = seg_start;
+        for (s, e) in overlaps {
+            text.push_str(&seg.text[cur - seg_start..s - seg_start]);
+            let removed = &seg.text[s - seg_start..e - seg_start];
+            for _ in 0..removed.width().max(1) {
+                text.push(' ');
+            }
+            cur = e;
+        }
+        text.push_str(&seg.text[cur - seg_start..]);
+        out.push(Seg {
+            text,
+            fg: seg.fg,
+            bg: seg.bg,
+            bold: seg.bold,
+            italic: seg.italic,
+        });
+    }
+    out
 }
 
 /// A sign glyph fitted to exactly `width` cells: truncated if too wide, then

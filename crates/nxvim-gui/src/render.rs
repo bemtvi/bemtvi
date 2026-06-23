@@ -3133,11 +3133,45 @@ impl Renderer {
                 }],
                 cfg,
             );
+            // A fallback font shapes a Nerd glyph inside a box wider than its reserved
+            // cell, with the *ink* parked at one side of that box: a right-pointing ``
+            // hugs the box's left, a left-pointing `` hugs its right (visible in Font
+            // Book). Left-anchoring the box at the cell edge then lands a right-hugging
+            // glyph a cell to the right — the misaligned right-hand separators. Measure
+            // the rasterised ink box: a glyph whose ink hugs the *right* of its advance
+            // is right-aligned to the reserved cell, preserving the seamless powerline
+            // join; a left- or centre-biased glyph keeps the natural left anchor. The
+            // size (`emoji_scale`) is untouched either way.
+            let span = cluster.width().max(1) as f32;
+            let cell_left = pos.0 + col * cell_w;
+            let phys = self
+                .cache
+                .get(&ekey)
+                .and_then(|e| e.buffer.layout_runs().next())
+                .and_then(|r| r.glyphs.first())
+                .map(|g| (g.w, g.physical((0.0, 0.0), 1.0)));
+            let ink = phys.and_then(|(adv, p)| {
+                self.swash_cache
+                    .get_image(&mut self.font_system, p.cache_key)
+                    .as_ref()
+                    .filter(|img| img.placement.width > 0)
+                    .map(|img| (adv, img.placement.left as f32, img.placement.width as f32))
+            });
+            // `left_gap`/`right_gap`: padding between the ink and each edge of the glyph's
+            // advance box. The smaller gap is the side the ink hugs.
+            let x = match ink {
+                Some((adv, ink_left, ink_w)) if (adv - (ink_left + ink_w)) < ink_left => {
+                    // Ink hugs the right of its box: pin the ink's right edge to the
+                    // cell's right edge.
+                    cell_left + span * cell_w - scale * (ink_left + ink_w)
+                }
+                _ => cell_left,
+            };
             // A color-emoji font renders smaller than its reserved cells, so draw the
             // glyph at the configured `emoji_scale` (`--emoji-scale`) at its column.
             items.push(TextItem {
                 key: ekey,
-                x: pos.0 + col * cell_w,
+                x,
                 y,
                 color: srgb_to_color(cfg),
                 bounds,

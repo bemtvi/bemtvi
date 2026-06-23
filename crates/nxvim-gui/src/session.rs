@@ -137,12 +137,22 @@ where
                     return;
                 }
             };
-            // The handshake is up (or it's a local session): unblock the caller.
+            // Build the server config — for a daemon session this fetches + materializes
+            // the remote's config/plugins, so a failure here is a setup failure the caller
+            // must see (before we report the handshake up).
+            let init = match server_init(file, client).await {
+                Ok(init) => init,
+                Err(e) => {
+                    let _ = ready_tx.send(Err(e));
+                    return;
+                }
+            };
+            // The handshake is up and config is staged: unblock the caller.
             if ready_tx.send(Ok(())).is_err() {
                 return; // caller gave up waiting; nothing to serve
             }
             // `_guard` (the daemon child, or nothing) lives until the editor quits.
-            if let Err(e) = run_server(server_end, server_init(file, client)).await {
+            if let Err(e) = run_server(server_end, init).await {
                 eprintln!("nxvim-gui: server error: {e}");
             }
         });
@@ -209,25 +219,45 @@ fn nxvim_bin_name() -> &'static str {
     }
 }
 
-/// The [`ServerInit`] for a GUI session: the editor + Lua + shada always run locally
-/// (config and the keystroke path stay local), so the only thing that varies is the host
-/// seams — `client = None` for the embedded local disk, `Some(daemon)` for the edit-host
-/// split, whose fs/process/watch/LSP/Lua-fs all route to the daemon.
-fn server_init(file: Option<String>, client: Option<DaemonClient>) -> ServerInit {
-    let (config_dir, runtimepath) = nxvim_server::default_runtime();
-    let (host_fs, host_proc, host_fs_async, lsp_transport, fs_jobs) = match client {
-        None => (None, None, None, None, None),
-        Some(c) => (
-            // A daemon session leaves the synchronous `host_fs` unused — every fs read
-            // goes through the async daemon seam below — so it stays `None`.
-            None,
-            Some(Box::new(c.host_proc) as _),
-            Some(Box::new(c.host_fs) as _),
-            Some(Box::new(c.lsp_transport) as _),
-            Some(c.fs_jobs),
-        ),
-    };
-    ServerInit {
+/// The [`ServerInit`] for a GUI session. The editor + Lua + shada always run locally
+/// (the keystroke path stays local); what varies is the host seams and where config
+/// comes from. `client = None` is the embedded local disk (config from local disk).
+/// `Some(daemon)` is the edit-host split: fs/process/watch/LSP/Lua-fs route to the
+/// daemon, and the config + plugins are **fetched from the daemon** (materialized
+/// locally) with the daemon's tree-sitter parser set mirrored — matching the TUI. A
+/// failed config fetch is loud (the caller surfaces it as a handshake error) rather than
+/// a silent fall back to local config.
+async fn server_init(file: Option<String>, client: Option<DaemonClient>) -> Result<ServerInit> {
+    let mut ts_autoinstall = Vec::new();
+    let (config_dir, runtimepath, host_fs, host_proc, host_fs_async, lsp_transport, fs_jobs) =
+        match client {
+            None => {
+                let (config_dir, runtimepath) = nxvim_server::default_runtime();
+                (config_dir, runtimepath, None, None, None, None, None)
+            }
+            Some(c) => {
+                let bundle = c.config.fetch().await.map_err(|e| {
+                    anyhow!("could not fetch the remote config from the daemon: {e}")
+                })?;
+                // Mirror the daemon's installed tree-sitter parsers locally (parsers are
+                // native, never fetched). Captured before `bundle` is consumed.
+                ts_autoinstall = bundle.ts_languages.clone();
+                let (config_dir, runtimepath) = nxvim_server::materialize_remote_config(bundle)
+                    .map_err(|e| anyhow!("could not materialize the remote config locally: {e}"))?;
+                (
+                    // A daemon session leaves the synchronous `host_fs` unused — every fs
+                    // read goes through the async daemon seam below — so it stays `None`.
+                    config_dir,
+                    runtimepath,
+                    None,
+                    Some(Box::new(c.host_proc) as _),
+                    Some(Box::new(c.host_fs) as _),
+                    Some(Box::new(c.lsp_transport) as _),
+                    Some(c.fs_jobs),
+                )
+            }
+        };
+    Ok(ServerInit {
         file,
         config_dir,
         // Editor state (registers, marks, history) lives where the editor runs — local
@@ -250,7 +280,8 @@ fn server_init(file: Option<String>, client: Option<DaemonClient>) -> ServerInit
         // enable command-line completion by default (a config's setup{} still wins).
         offer_default_recommended: true,
         cmdline_complete_default: true,
-    }
+        ts_autoinstall,
+    })
 }
 
 /// Parse a `nxvim://HOST:PORT/TOKEN?cert=HASH` connect URI into the pieces

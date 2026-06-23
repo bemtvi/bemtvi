@@ -69,6 +69,8 @@ mod lsp;
 #[cfg(feature = "native")]
 mod quic;
 #[cfg(feature = "native")]
+mod remote_config;
+#[cfg(feature = "native")]
 mod shada;
 #[cfg(feature = "native")]
 mod treesitter;
@@ -107,11 +109,17 @@ pub use shada::{
 /// what one fetch resolves to.
 #[cfg(feature = "native")]
 pub use daemon::{
-    connect_daemon, serve_daemon, serve_fs_daemon, serve_fs_daemon_on, serve_lsp_daemon,
-    serve_lsp_daemon_on, serve_luafs_daemon, serve_luafs_daemon_on, serve_proc_daemon_on,
-    serve_term_daemon_on, DaemonClient, FsRead, HostFsAsync, RemoteFsJobs, RemoteHostFs,
-    RemoteHostProc, RemoteLspTransport, WatchEvent,
+    connect_daemon, serve_config_daemon, serve_config_daemon_on, serve_daemon, serve_fs_daemon,
+    serve_fs_daemon_on, serve_lsp_daemon, serve_lsp_daemon_on, serve_luafs_daemon,
+    serve_luafs_daemon_on, serve_proc_daemon_on, serve_term_daemon_on, DaemonClient, FsRead,
+    HostFsAsync, RemoteConfig, RemoteConfigBundle, RemoteFsJobs, RemoteHostFs, RemoteHostProc,
+    RemoteLspTransport, WatchEvent,
 };
+/// Materialize a fetched [`RemoteConfigBundle`] onto a local per-process cache and
+/// rebase its roots — so a daemon session runs the remote's config + plugins locally
+/// (Phase 2 of `docs/plans/2026-06-23-remote-config-and-plugins.md`).
+#[cfg(feature = "native")]
+pub use remote_config::{materialize_remote_config, materialize_remote_config_into};
 
 /// The native daemon transport (Open Decision #2): a WebTransport/QUIC listener that
 /// runs the [`run_daemon_io`] multiplexer over one bidi stream ([`serve_quic`], the
@@ -263,6 +271,14 @@ pub struct ServerInit {
     /// `nx.cmdline_complete.setup{ ... }` (e.g. toggling the `docs` preview pane)
     /// still wins. Mirrors `offer_default_recommended`.
     pub cmdline_complete_default: bool,
+    /// The daemon's installed tree-sitter parser languages, so a remote session can
+    /// compile the *same* parsers locally (parsers are native artifacts, never fetched
+    /// over the wire). Compiled **lazily** — the first time a buffer of each filetype
+    /// opens, not all at once at startup. The server hands this set to Lua
+    /// (`nx._remote_ts_autoinstall`), which registers a `FileType` autocmd that
+    /// `:TSInstall`s each on first sight (see [`set_up_remote_ts_autoinstall`]). Empty
+    /// (the default) for a local session — nothing to mirror.
+    pub ts_autoinstall: Vec<String>,
 }
 
 /// How the server provides the `"+` / `"*` clipboard registers.
@@ -337,6 +353,94 @@ fn discover_plugins(config_dir: &Path) -> Vec<PathBuf> {
         }
     }
     plugins
+}
+
+/// Gather this machine's whole config surface for the `config_bundle` daemon leg:
+/// the [`default_runtime`] roots (the config dir + every runtimepath entry, plugins
+/// included) plus every **source** file under them, each paired with its absolute
+/// path. The edit-host mirrors these onto a local cache and points its
+/// `config_dir`/`runtimepath` at the copy, so a remote session loads the *daemon's*
+/// config and plugins (run locally) instead of the client's — see
+/// `docs/plans/2026-06-23-remote-config-and-plugins.md`.
+///
+/// `default_runtime` already folds the config dir into the runtimepath, so its
+/// entries are the complete set of roots to walk; the walk dedups by canonical path
+/// so a nested or symlinked root never fetches a file twice. Native build artifacts
+/// (`.so`/`.dylib`/`.dll`) are **skipped** — tree-sitter parsers and the like are
+/// compiled locally on the client, and a remote-arch binary would not load anyway.
+///
+/// `(config_dir, runtimepath, files, ts_languages)` — `files` is each source file's
+/// absolute path paired with its bytes; `ts_languages` is the daemon's installed
+/// tree-sitter parser languages (so the client can auto-install the same set).
+#[cfg(feature = "native")]
+pub(crate) type ConfigBundleData = (
+    Option<PathBuf>,
+    Vec<PathBuf>,
+    Vec<(PathBuf, Vec<u8>)>,
+    Vec<String>,
+);
+
+#[cfg(feature = "native")]
+pub(crate) fn collect_config_bundle() -> std::io::Result<ConfigBundleData> {
+    let (config_dir, runtimepath) = default_runtime();
+    let mut files = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for root in &runtimepath {
+        walk_config_dir(root, &mut files, &mut seen)?;
+    }
+    // The daemon's installed parser set: the client compiles the same languages
+    // locally (parsers are native artifacts, never fetched — see `walk_config_dir`).
+    let ts_languages = nxvim_ts::installed_parsers()
+        .into_iter()
+        .map(|p| p.lang)
+        .collect();
+    Ok((config_dir, runtimepath, files, ts_languages))
+}
+
+/// Recursively append every source file under `dir` to `out` as `(abspath, bytes)`,
+/// skipping native artifacts (see [`collect_config_bundle`]). A non-existent root is
+/// normal (no config, or an absent plugin dir) → nothing, not an error; any other
+/// read failure is loud (a real, surfaced error, never a silent partial bundle).
+/// `metadata`/`canonicalize` follow symlinks so a plugin symlinked into `pack/*/start`
+/// (a common dev layout) is walked as the directory it points at; the canonical-path
+/// `seen` set both dedups overlapping roots and breaks any symlink cycle.
+#[cfg(feature = "native")]
+fn walk_config_dir(
+    dir: &Path,
+    out: &mut Vec<(PathBuf, Vec<u8>)>,
+    seen: &mut std::collections::HashSet<PathBuf>,
+) -> std::io::Result<()> {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e),
+    };
+    for entry in entries {
+        let entry = entry?;
+        let path = entry.path();
+        let canon = std::fs::canonicalize(&path).unwrap_or_else(|_| path.clone());
+        if !seen.insert(canon) {
+            continue; // already walked via another (nested/symlinked) root, or a cycle
+        }
+        let meta = std::fs::metadata(&path)?; // follows symlinks
+        if meta.is_dir() {
+            walk_config_dir(&path, out, seen)?;
+        } else if meta.is_file() && !is_native_artifact(&path) {
+            let bytes = std::fs::read(&path)?;
+            out.push((path, bytes));
+        }
+    }
+    Ok(())
+}
+
+/// A locally-compiled native artifact (`.so`/`.dylib`/`.dll`) that must not ride the
+/// `config_bundle` across to a possibly-different-arch client.
+#[cfg(feature = "native")]
+fn is_native_artifact(path: &Path) -> bool {
+    matches!(
+        path.extension().and_then(|e| e.to_str()),
+        Some("so" | "dylib" | "dll")
+    )
 }
 
 /// A window's `(id, (x, y, width, height))` rect snapshot, the unit of the
@@ -2078,6 +2182,16 @@ where
     if init.cmdline_complete_default {
         let _ = host.lua.exec("nx.cmdline_complete.setup{}");
     }
+    // Mirror the daemon's installed tree-sitter parsers **lazily**: set up a `FileType`
+    // autocmd (in Lua — `nx._remote_ts_autoinstall`) that `:TSInstall`s a remote
+    // language the first time a buffer of that filetype opens. Parsers are native
+    // artifacts, never fetched over the wire; the compile runs in the background. We
+    // filter to languages not already installed here (the daemon can't know the client's
+    // set), so the Lua side only handles per-session dedup. Registered BEFORE `init.lua`
+    // (like the other built-in setups), so it's in place when the startup buffer's own
+    // `FileType` fires during config sourcing. Empty for a local session.
+    set_up_remote_ts_autoinstall(&mut host, &init.ts_autoinstall);
+
     // Source the user's `init.lua` (if any) before serving the client, exactly
     // as neovim runs config at startup: its options, mappings, and colorscheme
     // are in place by the time the first `redraw` goes out on UI attach.
@@ -2218,6 +2332,7 @@ where
     let (lsp_tx, lsp_rx) = unbounded_channel();
     let (luafs_tx, luafs_rx) = unbounded_channel();
     let (luafs_watch_tx, luafs_watch_rx) = unbounded_channel();
+    let (config_tx, config_rx) = unbounded_channel();
 
     let legs = [
         tokio::spawn(daemon::serve_fs_daemon_on(
@@ -2237,6 +2352,7 @@ where
             rpc.clone(),
             luafs_watch_rx,
         )),
+        tokio::spawn(daemon::serve_config_daemon_on(rpc.clone(), config_rx)),
     ];
 
     // The multiplexer: route each inbound message to its leg by method namespace.
@@ -2263,6 +2379,10 @@ where
                 // The streaming `nx.fs.watch` leg (Phase 3b) — its own recursive watcher,
                 // distinct from the buffer-reconcile `fs_watch` poll above.
                 Some(&luafs_watch_tx)
+            } else if method.starts_with("config_") {
+                // The config leg: `config_bundle` ships the daemon's config + plugins to
+                // the edit-host (fetched once at session start).
+                Some(&config_tx)
             } else {
                 None // unknown method: drop (the peer is the same build)
             }
@@ -2276,11 +2396,63 @@ where
 
     // The edit-host hung up: drop the senders so each leg sees EOF and winds down,
     // then wait for them so child reaping completes before we return.
-    drop((fs_tx, proc_tx, term_tx, lsp_tx, luafs_tx, luafs_watch_tx));
+    drop((
+        fs_tx,
+        proc_tx,
+        term_tx,
+        lsp_tx,
+        luafs_tx,
+        luafs_watch_tx,
+        config_tx,
+    ));
     for leg in legs {
         let _ = leg.await;
     }
     Ok(())
+}
+
+/// Set up the **lazy** tree-sitter auto-install for a daemon session: register the Lua
+/// `FileType` autocmd (`nx._remote_ts_autoinstall`) that `:TSInstall`s a remote language
+/// the first time a buffer of that filetype opens. `remote` is the daemon's installed
+/// parser set; we filter to languages not already installed locally (the daemon can't
+/// know the client's set) and hand only those to Lua, which dedups per session. A no-op
+/// for a local session (empty `remote`) or when every remote language is already here.
+/// Must run before the startup lifecycle seed so the first buffer's `FileType` is caught.
+#[cfg(feature = "native")]
+fn set_up_remote_ts_autoinstall(host: &mut EditHost, remote: &[String]) {
+    if remote.is_empty() {
+        return;
+    }
+    let installed: HashSet<String> = nxvim_ts::installed_parsers()
+        .into_iter()
+        .map(|p| p.lang)
+        .collect();
+    let missing: Vec<String> = remote
+        .iter()
+        .filter(|lang| !installed.contains(lang.as_str()))
+        .cloned()
+        .collect();
+    if missing.is_empty() {
+        return;
+    }
+    // Build a Lua array literal of the missing languages; `{:?}` quotes + escapes each
+    // (parser stems are simple identifiers, so this is just `"rust", "lua"`). Registering
+    // the autocmd is a synchronous `nx._autocmds` mutation and `FileType` dispatch reads
+    // that table directly, so no effect-drain is needed — and we must NOT drain here, or
+    // an early settle would fire the startup `FileType` seed before the user's own config
+    // autocmds are registered.
+    let list = missing
+        .iter()
+        .map(|lang| format!("{lang:?}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    if let Err(e) = host
+        .lua
+        .exec(&format!("nx._remote_ts_autoinstall({{ {list} }})"))
+    {
+        host.editor
+            .echo(format!("nxvim: remote tree-sitter setup failed: {e}"));
+    }
 }
 
 /// Map a buffer's file extension to a treesitter language / filetype name (the

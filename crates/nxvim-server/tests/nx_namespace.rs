@@ -448,6 +448,47 @@ async fn nx_hl_exists_returns_boolean_vim_alias_returns_number() {
 }
 
 #[tokio::test]
+async fn vim_fn_exists_detects_a_user_command() {
+    let (rpc, _incoming) = start().await;
+
+    // An undefined command is 0; vimscript `exists(':Cmd')` reports 2 for a defined
+    // command (its "exact match" value), so a plugin's `exists(':Foo') == 2` probe works.
+    assert_eq!(
+        exec_lua(&rpc, "return vim.fn.exists(':NxExistsCmd')")
+            .await
+            .as_i64(),
+        Some(0),
+        "an undefined :Cmd is 0"
+    );
+    exec_lua(
+        &rpc,
+        "vim.api.nvim_create_user_command('NxExistsCmd', function() end, {})",
+    )
+    .await;
+    assert_eq!(
+        exec_lua(&rpc, "return vim.fn.exists(':NxExistsCmd')")
+            .await
+            .as_i64(),
+        Some(2),
+        "a defined user command exists (2, neovim's exact-match value)"
+    );
+
+    // A buffer-local command counts for the current buffer, like at dispatch.
+    exec_lua(
+        &rpc,
+        "vim.api.nvim_buf_create_user_command(0, 'NxBufExistsCmd', function() end, {})",
+    )
+    .await;
+    assert_eq!(
+        exec_lua(&rpc, "return vim.fn.exists(':NxBufExistsCmd')")
+            .await
+            .as_i64(),
+        Some(2),
+        "a buffer-local command exists for the current buffer"
+    );
+}
+
+#[tokio::test]
 async fn nx_user_command_create_runs_and_nvim_alias_agrees() {
     let (rpc, _incoming) = start().await;
 

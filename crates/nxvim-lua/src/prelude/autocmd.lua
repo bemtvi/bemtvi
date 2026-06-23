@@ -995,3 +995,31 @@ function nx.user_command.buf_get(buf, _opts)
 end
 api.nvim_get_commands = nx.user_command.get
 api.nvim_buf_get_commands = nx.user_command.buf_get
+
+-- nx._remote_ts_autoinstall(langs): in an edit-host (daemon) session, lazily install the
+-- tree-sitter parsers the remote daemon had — the first time a buffer of one of those
+-- filetypes opens. `langs` is the list the server hands over (already filtered to parsers
+-- NOT installed on this client). It registers a FileType autocmd that `:TSInstall`s the
+-- buffer's filetype on first sight (deduped per session). Parsers are native + compiled
+-- locally, so this mirrors the remote's language set without fetching its wrong-arch
+-- binaries. Dogfoods the public FileType + :TSInstall surface — the server only supplies
+-- the language list.
+function nx._remote_ts_autoinstall(langs)
+  local want = {}
+  for _, lang in ipairs(langs or {}) do
+    want[lang] = true
+  end
+  if next(want) == nil then
+    return
+  end
+  local requested = {}
+  nx.autocmd.create("FileType", {
+    callback = function(ev)
+      local ft = ev.match
+      if ft and ft ~= "" and want[ft] and not requested[ft] then
+        requested[ft] = true
+        vim.cmd("TSInstall " .. ft)
+      end
+    end,
+  })
+end

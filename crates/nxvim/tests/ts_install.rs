@@ -189,6 +189,25 @@ async fn start(file: Option<String>) -> (Rpc, UnboundedReceiver<Incoming>) {
     .await
 }
 
+/// Like [`start`] but records the remote daemon's installed parser languages
+/// (`ServerInit.ts_autoinstall`) — so opening a buffer of one of those filetypes
+/// triggers a lazy compile, with no `:TSInstall`.
+async fn start_with_remote_langs(
+    file: Option<String>,
+    langs: Vec<String>,
+) -> (Rpc, UnboundedReceiver<Incoming>) {
+    start_attached(
+        ServerInit {
+            file,
+            ts_autoinstall: langs,
+            ..Default::default()
+        },
+        80,
+        24,
+    )
+    .await
+}
+
 /// Drive the server loop while waiting (up to ~30s) for a message-line frame
 /// whose text contains `needle`. `:TSInstall` runs on a blocking worker and
 /// reports back on a `select!` arm, so we poll: a `mode` round-trip cycles the
@@ -274,6 +293,37 @@ async fn ts_install_compiles_grammar_and_enables_indent() {
     assert!(
         joined.contains("rust") && joined.contains("indents"),
         "TSInstallInfo listing missing rust/indents: {info:?}"
+    );
+}
+
+/// Lazy install of a remote parser: with the daemon's parser set recorded
+/// (`ServerInit.ts_autoinstall`) but **no** `:TSInstall`, opening a buffer of that
+/// filetype for the first time compiles its grammar in the background and lights the
+/// buffer up — the FileType-settle hook drives the same offline compile path. A buffer
+/// of a filetype the remote *didn't* have stays untouched.
+#[tokio::test]
+async fn lazy_install_compiles_a_remote_parser_on_first_open() {
+    let _guard = test_lock().lock().await;
+    let (data_dir, _mirror) = fixture("lazy");
+    // The remote had `rust` installed; this client doesn't yet. No `:TSInstall` issued —
+    // opening the .rs buffer is the only trigger.
+    let file = write_temp("tslazy", "rs", "fn main() {\n    let x = 1;\n}\n");
+    let (rpc, mut incoming) = start_with_remote_langs(Some(file), vec!["rust".to_string()]).await;
+
+    // The lazy compile, kicked off when the .rs filetype settled at open, completes.
+    let msg = wait_for_message(&rpc, &mut incoming, "TSInstall: installed").await;
+    assert!(
+        msg.contains("rust"),
+        "unexpected completion message: {msg:?}"
+    );
+    assert!(
+        data_dir.join("parser").join("rust.so").exists(),
+        "the lazy compile did not write parser/rust.so"
+    );
+    // The already-open buffer lights up once the grammar lands (no edit needed).
+    assert!(
+        wait_for_highlights(&rpc, &mut incoming).await > 0,
+        "the buffer never highlighted after the lazy install"
     );
 }
 

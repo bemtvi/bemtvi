@@ -390,7 +390,9 @@ end
 --     plugin gates every window-option write on `exists('+'..key)`, so an unknown
 --     option is skipped instead of erroring the float setup.
 --   * 'g:'/'b:'/'w:'/'t:'/'v:' prefixed name -> that scoped variable is set.
---   * everything else ('*func', ':Cmd', bare names) -> 0 (can't confirm).
+--   * ':Cmd' -> a user command nxvim can confirm (2, neovim's exact-match value);
+--     a buffer-local command for the current buffer counts, like at dispatch.
+--   * everything else ('*func', built-in ':write', bare names) -> 0 (can't confirm).
 function nx.exists(expr)
   expr = tostring(expr or "")
   local lead = expr:sub(1, 1)
@@ -408,6 +410,13 @@ function nx.exists(expr)
       return tbl[name]
     end)
     return (ok and val ~= nil) and 1 or 0
+  end
+  -- ':Cmd' — a user command (global or buffer-local for the current buffer). neovim
+  -- answers 2 for an exact match, so a `exists(':Foo') == 2` probe works. Built-in
+  -- ex-commands aren't introspectable here, so they stay 0 (honest probing).
+  local cmd = expr:match("^:(%a[%w_]*)")
+  if cmd and nx._resolve_user_command then
+    return nx._resolve_user_command(cmd, 0) ~= nil and 2 or 0
   end
   return 0
 end

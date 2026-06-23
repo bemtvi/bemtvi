@@ -13,9 +13,11 @@
 //!   with its fs/process/watch/LSP host seams pointed at a `--daemon` child instead of
 //!   the local disk. It spawns that daemon (this same binary in `--daemon` mode by
 //!   default, or whatever `NXVIM_DAEMON_CMD` names — e.g. `ssh host nxvim --daemon`),
-//!   wraps the child's stdio in [`nxvim_server::connect_daemon`], and injects the five
-//!   resulting seams into [`ServerInit`]. Config (init.lua, plugins, runtimepath) and
-//!   the keystroke path stay local; only I/O crosses the wire.
+//!   wraps the child's stdio in [`nxvim_server::connect_daemon`], and injects the
+//!   resulting seams into [`ServerInit`]. Config (init.lua, plugins, runtimepath) is
+//!   **fetched from the daemon** (`config_bundle`) and materialized onto a local cache,
+//!   so the session runs the *remote's* config + plugins locally; the keystroke path
+//!   stays local; only I/O crosses the wire.
 //!
 //! The default and `--connect-daemon` roles both run [`nxvim_server::run`] — a full
 //! local editor over an in-process duplex; `--connect-daemon` only differs by pointing
@@ -401,6 +403,9 @@ fn main() -> Result<()> {
         // Command-line completion (`:`+<Tab>) is on by default in the interactive
         // binary; a config's own `nx.cmdline_complete.setup{ ... }` still wins.
         cmdline_complete_default: true,
+        // A local session has no remote parser set to mirror; tree-sitter installs
+        // happen on demand via `:TSInstall`.
+        ts_autoinstall: Vec::new(),
     };
     let server_thread = std::thread::spawn(move || {
         // Test-only fault injection (debug builds only): force a server-thread
@@ -548,8 +553,9 @@ fn run_with_daemon_quic(file: Option<String>, uri: &str, shada: ShadaOpts) -> Re
 /// server (with its host seams pointed at whatever `connect` returns) on its own thread,
 /// and drive the terminal UI on the main thread. `connect` runs inside the server runtime
 /// and yields the [`DaemonClient`] plus a guard kept alive for the whole session (the
-/// stdio child, so `kill_on_drop` reaps it on quit; `()` for QUIC). Config and the
-/// keystroke path stay local; only fs/process/watch/LSP cross to the daemon.
+/// stdio child, so `kill_on_drop` reaps it on quit; `()` for QUIC). Config + plugins
+/// are fetched from the daemon and materialized locally (so the session runs the
+/// remote's config); the keystroke path stays local; fs/process/watch/LSP cross the wire.
 fn run_edit_host_session<F>(file: Option<String>, shada: ShadaOpts, connect: F) -> Result<()>
 where
     F: FnOnce() -> Result<(DaemonClient, Box<dyn std::any::Any + Send>)> + Send + 'static,
@@ -564,13 +570,29 @@ where
             .expect("failed to build server runtime");
         let result: Result<()> = runtime.block_on(async move {
             let (client, _guard) = connect()?;
-            let (config_dir, runtimepath) = nxvim_server::default_runtime();
+            // Config + plugins come from the *daemon*: fetch its config surface over the
+            // wire (one `config_bundle` round trip) and materialize it onto a local
+            // per-process cache, then point `config_dir`/`runtimepath` at that copy. The
+            // editor then loads the remote's config + plugins locally — Lua's synchronous
+            // `require`/runtimepath can't await the daemon, so the files must be local.
+            // A broken daemon link or an unstageable cache is loud (the session can't run
+            // a config it couldn't fetch), not a silent fall back to no config.
+            let bundle =
+                client.config.fetch().await.map_err(|e| {
+                    anyhow!("could not fetch the remote config from the daemon: {e}")
+                })?;
+            // The daemon's installed tree-sitter parsers — compiled locally on demand
+            // (lazily, per filetype; parsers are native, never fetched). Captured before
+            // `bundle` is consumed.
+            let ts_autoinstall = bundle.ts_languages.clone();
+            let (config_dir, runtimepath) = nxvim_server::materialize_remote_config(bundle)
+                .map_err(|e| anyhow!("could not materialize the remote config locally: {e}"))?;
             let init = ServerInit {
                 file,
                 config_dir,
-                // Editor + Lua run locally in a daemon session, so shada is local
-                // too (only fs/proc/LSP cross to the daemon) — including the
-                // `--shada-namespace` workspace store + session.
+                // Editor + Lua run locally in a daemon session (the config is fetched
+                // from the daemon but executed here), so shada is local too — including
+                // the `--shada-namespace` workspace store + session.
                 shada: Some(shada.store()),
                 workspace_session: shada.capture(),
                 restore_session: shada.do_restore(),
@@ -589,6 +611,8 @@ where
                 // command-line completion by default (a config's setup{} still wins).
                 offer_default_recommended: true,
                 cmdline_complete_default: true,
+                // Mirror the daemon's installed tree-sitter parsers locally.
+                ts_autoinstall,
             };
             // `_guard` (the stdio child, or `()` for QUIC) lives until the editor quits.
             run_server(server_end, init).await

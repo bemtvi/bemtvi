@@ -98,6 +98,8 @@ fn spawn_server(plugin_dir: PathBuf) -> (Rpc, UnboundedReceiver<Incoming>) {
             // and leave command-line completion off (a plugin's own setup{} can opt in).
             offer_default_recommended: false,
             cmdline_complete_default: false,
+            // Hermetic: no remote, so no tree-sitter parsers to mirror.
+            ts_autoinstall: Vec::new(),
         };
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_io()

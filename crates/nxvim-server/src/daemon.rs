@@ -200,6 +200,20 @@ const LUAFS_UNWATCH: &str = "luafs_unwatch"; // edit-host → daemon: [id]
 const LUAFS_CHANGE: &str = "luafs_change"; // daemon → edit-host: [id, kind, [path, …]]
 const LUAFS_WATCH_ERR: &str = "luafs_watch_err"; // daemon → edit-host: [id, message]
 
+// The config leg (`config_*`): a single request/response that ships the daemon's
+// whole config surface — its `config_dir`, `runtimepath`, and every source file under
+// those roots — so a remote session loads the *daemon's* config + plugins (fetched,
+// materialized locally, then run locally), not the client's. One round trip; the
+// daemon walks the tree daemon-side and the edit-host mirrors it onto a local cache.
+// See `docs/plans/2026-06-23-remote-config-and-plugins.md`.
+//
+// | direction | method | reply |
+// | edit-host → daemon | `config_bundle []` | `[config_dir?, [runtimepath…], [[abspath, bytes], …], [ts_lang…]]`, or a loud error |
+//
+// `ts_lang…` is the daemon's installed tree-sitter parser languages; the client
+// auto-installs the same set locally (parsers are native artifacts, never fetched).
+const CONFIG_BUNDLE: &str = "config_bundle";
+
 /// What the daemon reports back about one child, demuxed off the wire and handed to
 /// the [`RemoteHostProc::run`] future waiting on that spawn's `id`. Mirrors the two
 /// [`ProcEvents`] reports the future then re-emits to the editor.
@@ -1889,6 +1903,82 @@ pub async fn serve_luafs_watch_daemon_on(
 }
 
 // ============================================================================
+// The config leg (daemon side)
+// ============================================================================
+
+/// Run the daemon end of the *config* wire over `reader`/`writer`, answering
+/// `config_bundle` requests with this machine's config surface (see [`CONFIG_BUNDLE`]).
+/// Returns when the connection closes. The per-leg wrapper the tests drive over a
+/// private duplex; the real binary routes the `config_` namespace into
+/// [`serve_config_daemon_on`] through the [`run_daemon_io`](crate::run_daemon_io) mux.
+pub async fn serve_config_daemon<R, W>(reader: R, writer: W) -> anyhow::Result<()>
+where
+    R: AsyncRead + Unpin + Send + 'static,
+    W: AsyncWrite + Unpin + Send + 'static,
+{
+    let (rpc, incoming) = connect(reader, writer);
+    serve_config_daemon_on(rpc, incoming).await
+}
+
+/// The config leg's connection-agnostic core: answer each `config_bundle` request by
+/// walking the daemon's config tree ([`crate::collect_config_bundle`]) and replying with
+/// the encoded bundle, or a loud error. The leg carries no notifications and holds no
+/// state, so it is a plain request loop (unlike the stateful `fs_*`/`proc_*` legs).
+pub async fn serve_config_daemon_on(
+    rpc: Rpc,
+    mut incoming: UnboundedReceiver<Incoming>,
+) -> anyhow::Result<()> {
+    while let Some(msg) = incoming.recv().await {
+        if let Incoming::Request { id, method, .. } = msg {
+            let reply = match method.as_str() {
+                CONFIG_BUNDLE => serve_config_bundle(),
+                other => Err(Value::from(format!("unknown method: {other}"))),
+            };
+            rpc.respond(id, reply);
+        }
+        // The config leg has no notifications; ignore anything else.
+    }
+    Ok(())
+}
+
+/// Walk the daemon's config surface and project it onto the `config_bundle` wire shape,
+/// or a loud error reply (a failed walk is never a silently-empty bundle).
+fn serve_config_bundle() -> Result<Value, Value> {
+    match crate::collect_config_bundle() {
+        Ok((config_dir, runtimepath, files, ts_languages)) => Ok(encode_config_bundle(
+            config_dir,
+            runtimepath,
+            files,
+            ts_languages,
+        )),
+        Err(e) => Err(Value::from(format!("config_bundle: {e}"))),
+    }
+}
+
+/// `[config_dir?, [runtimepath…], [[abspath, bytes], …], [ts_lang…]]` — the bundle on
+/// the wire ([`decode_config_bundle`] is the inverse). Paths are the daemon's absolute
+/// paths; the edit-host rebases them onto its local cache.
+fn encode_config_bundle(
+    config_dir: Option<PathBuf>,
+    runtimepath: Vec<PathBuf>,
+    files: Vec<(PathBuf, Vec<u8>)>,
+    ts_languages: Vec<String>,
+) -> Value {
+    let path_str = |p: PathBuf| Value::from(p.to_string_lossy().into_owned());
+    Value::Array(vec![
+        config_dir.map_or(Value::Nil, &path_str),
+        Value::Array(runtimepath.into_iter().map(&path_str).collect()),
+        Value::Array(
+            files
+                .into_iter()
+                .map(|(p, bytes)| Value::Array(vec![path_str(p), Value::Binary(bytes)]))
+                .collect(),
+        ),
+        Value::Array(ts_languages.into_iter().map(Value::from).collect()),
+    ])
+}
+
+// ============================================================================
 // The edit-host-side multiplexer
 // ============================================================================
 //
@@ -1907,9 +1997,131 @@ pub async fn serve_luafs_watch_daemon_on(
 // `incoming` covers every leg, and concurrent writes from all legs serialize through
 // `Rpc`'s single out-channel.
 
-/// The four edit-host seams of one daemon connection, all sharing a single link (see
+/// The daemon's config surface, decoded off a `config_bundle` reply: its `config_dir`,
+/// `runtimepath`, and every source file under those roots as `(abspath, bytes)`. Paths
+/// are the **daemon's** absolute paths; the edit-host mirrors the files onto a local
+/// cache and rebases the roots onto it (Phase 2) so a remote session runs the daemon's
+/// config + plugins locally.
+pub struct RemoteConfigBundle {
+    /// The daemon's config dir (`None` if it resolved none — no remote config).
+    pub config_dir: Option<String>,
+    /// The daemon's runtimepath, in load order (config dir + discovered plugins).
+    pub runtimepath: Vec<String>,
+    /// Every fetched source file: its daemon-absolute path and its bytes.
+    pub files: Vec<(String, Vec<u8>)>,
+    /// The daemon's installed tree-sitter parser languages — the client auto-installs
+    /// the same set locally (parsers are native, never fetched over the wire).
+    pub ts_languages: Vec<String>,
+}
+
+/// The edit-host side of the config leg: a [`Rpc`] handle that fetches the daemon's
+/// config surface with one `config_bundle` request. Shares the single daemon link like
+/// the other seams (see [`connect_daemon`]); [`RemoteConfig::connect`] is the per-leg
+/// constructor the tests drive over a private duplex.
+pub struct RemoteConfig {
+    rpc: Rpc,
+}
+
+impl RemoteConfig {
+    /// Connect to a daemon's config leg over `reader`/`writer` (its own link — the
+    /// per-leg path the tests use; the real edit-host builds [`RemoteConfig`] inline in
+    /// [`serve_daemon_link`] over the shared link). The leg carries no notifications,
+    /// but the inbound stream must still be drained or the reader backpressures —
+    /// dropping it would tear the connection down — so a task drains it to EOF.
+    pub fn connect<R, W>(reader: R, writer: W) -> RemoteConfig
+    where
+        R: AsyncRead + Unpin + Send + 'static,
+        W: AsyncWrite + Unpin + Send + 'static,
+    {
+        let (rpc, mut incoming) = connect(reader, writer);
+        tokio::spawn(async move { while incoming.recv().await.is_some() {} });
+        RemoteConfig { rpc }
+    }
+
+    /// Fetch the daemon's config surface (one `config_bundle` round trip). A transport
+    /// failure or a malformed reply is a loud error — never a silently-empty bundle that
+    /// would look like "the remote has no config".
+    pub async fn fetch(&self) -> io::Result<RemoteConfigBundle> {
+        match self.rpc.request(CONFIG_BUNDLE, vec![]).await {
+            Ok(v) => decode_config_bundle(v),
+            Err(e) => Err(io::Error::other(e.to_string())),
+        }
+    }
+}
+
+/// Decode a `config_bundle` reply (the inverse of `encode_config_bundle`): the
+/// `[config_dir?, [runtimepath…], [[abspath, bytes], …], [ts_lang…]]` array. Any shape
+/// mismatch is a loud `InvalidData` error.
+fn decode_config_bundle(v: Value) -> io::Result<RemoteConfigBundle> {
+    let bad = |what: &str| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("config_bundle: malformed {what}"),
+        )
+    };
+    let Value::Array(a) = v else {
+        return Err(bad("reply"));
+    };
+    let mut it = a.into_iter();
+    let config_dir = match it.next() {
+        None | Some(Value::Nil) => None,
+        Some(v) => Some(v.as_str().ok_or_else(|| bad("config_dir"))?.to_owned()),
+    };
+    let Some(Value::Array(rtp)) = it.next() else {
+        return Err(bad("runtimepath"));
+    };
+    let runtimepath = rtp
+        .iter()
+        .map(|v| {
+            v.as_str()
+                .map(str::to_owned)
+                .ok_or_else(|| bad("runtimepath entry"))
+        })
+        .collect::<io::Result<Vec<_>>>()?;
+    let Some(Value::Array(raw_files)) = it.next() else {
+        return Err(bad("files"));
+    };
+    let mut files = Vec::with_capacity(raw_files.len());
+    for f in raw_files {
+        let Value::Array(pair) = f else {
+            return Err(bad("file entry"));
+        };
+        let mut pit = pair.into_iter();
+        let path = pit.next().and_then(|v| v.as_str().map(str::to_owned));
+        let bytes = match pit.next() {
+            Some(Value::Binary(b)) => Some(b),
+            _ => None,
+        };
+        match (path, bytes) {
+            (Some(p), Some(b)) => files.push((p, b)),
+            _ => return Err(bad("file entry")),
+        }
+    }
+    // The installed tree-sitter languages; absent (an older peer) decodes as empty.
+    let ts_languages = match it.next() {
+        None | Some(Value::Nil) => Vec::new(),
+        Some(Value::Array(langs)) => langs
+            .iter()
+            .map(|v| {
+                v.as_str()
+                    .map(str::to_owned)
+                    .ok_or_else(|| bad("ts_languages entry"))
+            })
+            .collect::<io::Result<Vec<_>>>()?,
+        Some(_) => return Err(bad("ts_languages")),
+    };
+    Ok(RemoteConfigBundle {
+        config_dir,
+        runtimepath,
+        files,
+        ts_languages,
+    })
+}
+
+/// The five edit-host seams of one daemon connection, all sharing a single link (see
 /// [`connect_daemon`]). Each field drops straight into the matching
-/// [`ServerInit`](crate::ServerInit) slot.
+/// [`ServerInit`](crate::ServerInit) slot — except [`config`](Self::config), which the
+/// session fetches *before* building `ServerInit` to derive the local config roots.
 pub struct DaemonClient {
     /// The async filesystem seam (`fs_read`/`fs_write`) + the `fs_changed` watch push.
     pub host_fs: RemoteHostFs,
@@ -1920,6 +2132,9 @@ pub struct DaemonClient {
     /// The async `nx.fs` seam (`luafs_op`) — whole-job, decomposed daemon-side. The
     /// event-loop actor `await`s it off the editor tick (no thread park).
     pub fs_jobs: RemoteFsJobs,
+    /// The config seam (`config_bundle`) — fetched once at session start to mirror the
+    /// daemon's config + plugins onto a local cache (Phase 2).
+    pub config: RemoteConfig,
 }
 
 /// Connect to a single daemon over `reader`/`writer` and return all four edit-host
@@ -2009,6 +2224,10 @@ pub(crate) async fn serve_daemon_link(
             next_id: AtomicU64::new(1),
         },
         fs_jobs: RemoteFsJobs { req_tx: fs_jobs_tx },
+        // The config leg shares the link's `Rpc`; its `config_bundle` responses are
+        // msgid-routed inside `Rpc` (never an `Incoming`), so the existing demux drains
+        // the inbound stream — no extra wiring needed here.
+        config: RemoteConfig { rpc: rpc.clone() },
     };
     // Hand the seams out before serving; if the caller already dropped, there's
     // nothing to drive.

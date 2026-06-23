@@ -1,0 +1,15 @@
+Remote config demo
+===================
+
+You are editing this buffer in an edit-host (daemon) session. The config and plugins
+running right now were fetched FROM the daemon and materialized locally — none of it
+came from this client machine's own ~/.config/nxvim.
+
+Verify it:
+
+  :RemoteHello              a command from the remote init.lua
+  :RemotePlugin             a command from a plugin the daemon served
+  :set tabstop?             shows 7 (set by the remote init.lua)
+  :lua nx.notify(_G.REMOTE_GREETING)   require() resolved a remote lua/ module
+
+See init.lua in this directory for how to launch it (locally, or over SSH).

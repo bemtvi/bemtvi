@@ -130,6 +130,37 @@ try {
   const fetchedHl = cdnFetches.some((p) => p.endsWith("queries/highlights.scm"));
   check("install: fetched zig grammar + highlights from the CDN", fetchedWasm && fetchedHl, JSON.stringify(cdnFetches));
 
+  // `#lua-match?` predicate enforcement (highlight.js). zig's query captures every
+  // identifier as `@variable`, then *also* as `@type` only when it matches
+  // `^[A-Z_]…` (a `#lua-match?` predicate). Without enforcing that predicate the
+  // `@type` capture leaked onto every identifier, so a lowercase `foo` mis-coloured
+  // as a type. Type each in a buffer and assert they get DIFFERENT colours: `Bar`
+  // (TitleCase) is a type, `foo` (lowercase) stays a variable.
+  await page.evaluate(() => window.__nxvim.feed("ggdGiconst x = foo + Bar;<Esc>"));
+  const idColors = await (async () => {
+    for (let i = 0; i < 40; i++) {
+      const r = await page.evaluate(() => {
+        const row = document.querySelector("#grid .win .row");
+        if (!row) return null;
+        const runs = [...row.querySelectorAll("span")].map((s) => ({
+          text: s.textContent,
+          color: (s.getAttribute("style") || "").match(/color\s*:\s*([^;]+)/)?.[1]?.trim() || null,
+        }));
+        const colOf = (t) => runs.find((x) => x.text === t)?.color ?? null;
+        return { foo: colOf("foo"), bar: colOf("Bar") };
+      });
+      if (r && r.foo && r.bar) return r;
+      await sleep(100);
+    }
+    return { foo: null, bar: null };
+  })();
+  // colorFor: variable → #abb2bf, type → #e5c07b.
+  check(
+    "lua-match: TitleCase identifier is a type, lowercase stays a variable",
+    idColors.bar === "#e5c07b" && idColors.foo === "#abb2bf",
+    JSON.stringify(idColors),
+  );
+
   // The status line echoes the (honest) outcome.
   let echo = "";
   for (let i = 0; i < 30; i++) {

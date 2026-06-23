@@ -344,6 +344,222 @@ export function createHighlighter({ onReady } = {}) {
     return isAvail(lang) ? lang : null;
   }
 
+  // A tree-sitter metadata/control capture (`@spell` / `@nospell` / `@conceal`) —
+  // a spellcheck/conceal marker, NOT a visual highlight group. Grammars tag nodes
+  // with these alongside a real highlight (`(comment) @comment @spell`); they carry
+  // no colour, so they must not become spans that shadow the highlight they sit
+  // beside. Mirrors `is_metadata_capture` in the Rust engine (`nxvim-ts`).
+  function isMetadataCapture(name) {
+    const major = name.split('.', 1)[0];
+    return major === 'spell' || major === 'nospell' || major === 'conceal';
+  }
+
+  // --- Lua-pattern matcher (for `#lua-match?` predicates) ---------------------------
+  // A faithful port of Lua 5.4's `string.find(s, p) ~= nil` — the question a tree-
+  // sitter `#lua-match?` predicate asks. Lua patterns are NOT regexes: greedy `*`/`+`,
+  // lazy `-`, classes `%a %d %s %w %l %u %p %c %x` (+ uppercase complements), sets
+  // `[...]`, and the specials `%b` / `%f`. web-tree-sitter only enforces the standard
+  // `#match?` predicate, so without this bash's `(#lua-match? … "^#!")` shebang rule
+  // leaks `@keyword.directive` onto every comment. Twin of the Rust `lua_pattern`
+  // module; operates on UTF-16 code units (exact for the ASCII patterns queries use).
+  const L_ESC = 0x25; // '%'
+  const LUA_MAX_DEPTH = 200;
+  const isDigit = (c) => c >= 0x30 && c <= 0x39;
+  const isAlpha = (c) => (c >= 0x41 && c <= 0x5a) || (c >= 0x61 && c <= 0x7a);
+  const isHex = (c) => isDigit(c) || (c >= 0x41 && c <= 0x46) || (c >= 0x61 && c <= 0x66);
+  // C `isgraph`: printable, non-space ASCII. `ispunct`: graphic and not alphanumeric.
+  const isGraph = (c) => c > 0x20 && c < 0x7f;
+  const isPunct = (c) => isGraph(c) && !isAlpha(c) && !isDigit(c);
+
+  function luaMatchClass(c, cl) {
+    let res;
+    switch (cl | 0x20) { // fold to lowercase class letter
+      case 0x61: res = isAlpha(c); break;                       // a
+      case 0x63: res = c < 0x20 || c === 0x7f; break;           // c (control)
+      case 0x64: res = isDigit(c); break;                       // d
+      case 0x67: res = isGraph(c); break;                       // g
+      case 0x6c: res = c >= 0x61 && c <= 0x7a; break;           // l
+      case 0x70: res = isPunct(c); break;                       // p
+      case 0x73: res = c === 0x20 || (c >= 0x09 && c <= 0x0d); break; // s (isspace)
+      case 0x75: res = c >= 0x41 && c <= 0x5a; break;           // u
+      case 0x77: res = isAlpha(c) || isDigit(c); break;         // w
+      case 0x78: res = isHex(c); break;                         // x
+      default: return cl === c;                                 // a literal escaped char
+    }
+    return (cl >= 0x41 && cl <= 0x5a) ? !res : res; // uppercase letter complements
+  }
+
+  function luaMatch(text, pattern) {
+    const anchor = pattern.charCodeAt(0) === 0x5e; // '^'
+    const pat = [];
+    for (let i = anchor ? 1 : 0; i < pattern.length; i++) pat.push(pattern.charCodeAt(i));
+    const src = [];
+    for (let i = 0; i < text.length; i++) src.push(text.charCodeAt(i));
+
+    // Index just past the single pattern item at `p` (literal, `%x` class, or `[...]`).
+    function classEnd(p) {
+      let c = pat[p++];
+      if (c === L_ESC) return p < pat.length ? p + 1 : -1;
+      if (c === 0x5b) { // '['
+        if (pat[p] === 0x5e) p++; // '^'
+        do { // first member read unconditionally, so a leading ']' is literal
+          if (p >= pat.length) return -1;
+          c = pat[p++];
+          if (c === L_ESC && p < pat.length) p++;
+        } while (pat[p] !== 0x5d); // ']'
+        return p + 1;
+      }
+      return p;
+    }
+    function matchBracket(c, p, ec) {
+      let sig = true;
+      if (pat[p + 1] === 0x5e) { sig = false; p++; }
+      for (p++; p < ec; ) {
+        if (pat[p] === L_ESC) { p++; if (luaMatchClass(c, pat[p])) return sig; p++; }
+        else if (pat[p + 1] === 0x2d && p + 2 < ec) { // a range a-z
+          if (pat[p] <= c && c <= pat[p + 2]) return sig; p += 3;
+        } else { if (pat[p] === c) return sig; p++; }
+      }
+      return !sig;
+    }
+    function singleMatch(s, p, ep) {
+      if (s >= src.length) return false;
+      const c = src[s];
+      switch (pat[p]) {
+        case 0x2e: return true;                       // '.'
+        case L_ESC: return luaMatchClass(c, pat[p + 1]);
+        case 0x5b: return matchBracket(c, p, ep - 1); // '['
+        default: return pat[p] === c;
+      }
+    }
+
+    const caps = []; // { init, len } — len -1 unfinished, -2 position
+    let depth = LUA_MAX_DEPTH;
+
+    function doMatch(s, p) {
+      if (depth-- === 0) { depth++; return -1; }
+      const r = doMatchInner(s, p);
+      depth++;
+      return r;
+    }
+    function doMatchInner(s, p) {
+      for (;;) {
+        if (p >= pat.length) return s;
+        const pc = pat[p];
+        if (pc === 0x28) { // '('
+          return pat[p + 1] === 0x29 ? startCapture(s, p + 2, -2) : startCapture(s, p + 1, -1);
+        }
+        if (pc === 0x29) return endCapture(s, p + 1); // ')'
+        if (pc === 0x24 && p + 1 === pat.length) return s === src.length ? s : -1; // '$'
+        if (pc === L_ESC) {
+          const n = pat[p + 1];
+          if (n === 0x62) return matchBalance(s, p + 2);      // %b
+          if (n === 0x66) {                                   // %f[set]
+            p += 2;
+            if (pat[p] !== 0x5b) return -1;
+            const ep = classEnd(p);
+            if (ep < 0) return -1;
+            const prev = s === 0 ? 0 : src[s - 1];
+            const curr = s < src.length ? src[s] : 0;
+            if (!matchBracket(prev, p, ep - 1) && matchBracket(curr, p, ep - 1)) { p = ep; continue; }
+            return -1;
+          }
+          if (n >= 0x30 && n <= 0x39) {                       // %1..%9 backref
+            const ns = matchCapture(s, n);
+            if (ns < 0) return -1;
+            s = ns; p += 2; continue;
+          }
+        }
+        return defaultMatch(s, p);
+      }
+    }
+    function defaultMatch(s, p) {
+      const ep = classEnd(p);
+      if (ep < 0) return -1;
+      const matched = singleMatch(s, p, ep);
+      switch (pat[ep]) {
+        case 0x3f: { // '?'
+          if (matched) { const r = doMatch(s + 1, ep + 1); if (r >= 0) return r; }
+          return doMatch(s, ep + 1);
+        }
+        case 0x2b: return matched ? maxExpand(s + 1, p, ep) : -1; // '+'
+        case 0x2a: return maxExpand(s, p, ep);                    // '*'
+        case 0x2d: return minExpand(s, p, ep);                    // '-'
+        default: return matched ? doMatch(s + 1, ep) : -1;
+      }
+    }
+    function maxExpand(s, p, ep) {
+      let i = 0;
+      while (singleMatch(s + i, p, ep)) i++;
+      for (;;) { const r = doMatch(s + i, ep + 1); if (r >= 0) return r; if (i === 0) return -1; i--; }
+    }
+    function minExpand(s, p, ep) {
+      for (;;) { const r = doMatch(s, ep + 1); if (r >= 0) return r; if (singleMatch(s, p, ep)) s++; else return -1; }
+    }
+    function startCapture(s, p, what) {
+      caps.push({ init: s, len: what });
+      const r = doMatch(s, p);
+      if (r < 0) caps.pop();
+      return r;
+    }
+    function endCapture(s, p) {
+      let l = -1;
+      for (let i = caps.length - 1; i >= 0; i--) if (caps[i].len === -1) { l = i; break; }
+      if (l < 0) return -1;
+      caps[l].len = s - caps[l].init;
+      const r = doMatch(s, p);
+      if (r < 0) caps[l].len = -1;
+      return r;
+    }
+    function matchCapture(s, d) {
+      const idx = d - 0x31; // '1'
+      const cap = caps[idx];
+      if (!cap || cap.len < 0) return -1;
+      const len = cap.len;
+      if (src.length - s < len) return -1;
+      for (let k = 0; k < len; k++) if (src[s + k] !== src[cap.init + k]) return -1;
+      return s + len;
+    }
+    function matchBalance(s, p) {
+      const b = pat[p], e = pat[p + 1];
+      if (b === undefined || e === undefined || src[s] !== b) return -1;
+      let cont = 1;
+      for (let i = s + 1; i < src.length; i++) {
+        if (src[i] === e) { if (--cont === 0) return doMatch(i + 1, p + 2); }
+        else if (src[i] === b) cont++;
+      }
+      return -1;
+    }
+
+    let s = 0;
+    for (;;) {
+      caps.length = 0; depth = LUA_MAX_DEPTH;
+      if (doMatch(s, 0) >= 0) return true;
+      if (anchor || s >= src.length) return false;
+      s++;
+    }
+  }
+
+  // Whether a capture survives its pattern's `#lua-match?` / `#not-lua-match?`
+  // predicates. web-tree-sitter already enforces the standard `#match?` family while
+  // collecting captures, but leaves these neovim-specific ones in `predicatesForPattern`
+  // for us. Each compares a capture's node text to a Lua pattern; we apply those whose
+  // operand names the capture being coloured (the case grammar highlight rules use,
+  // e.g. the shebang rule gating its own `@keyword.directive`). Mirrors the Rust engine.
+  function captureSatisfiesLuaPredicates(query, capture) {
+    const preds = query.predicatesForPattern(capture.patternIndex);
+    if (!preds || !preds.length) return true;
+    for (const pred of preds) {
+      const negate = pred.operator === 'not-lua-match?';
+      if (!negate && pred.operator !== 'lua-match?') continue;
+      const [capArg, strArg] = pred.operands;
+      if (!capArg || capArg.type !== 'capture' || capArg.name !== capture.name) continue;
+      if (!strArg || strArg.type !== 'string') continue;
+      if (luaMatch(capture.node.text, strArg.value) === negate) return false;
+    }
+    return true;
+  }
+
   // Per-buffer-line capture spans for `text` in `lang`: an array indexed by 0-based
   // buffer line, each entry a list of `[startU16, endU16, group]`. Returns null when
   // the grammar isn't loaded yet — and kicks off the async load, after which onReady
@@ -368,6 +584,11 @@ export function createHighlighter({ onReady } = {}) {
       return lo;
     };
     for (const c of caps) {
+      // Drop metadata captures (`@spell`/…) and captures whose `#lua-match?`
+      // predicate fails, at the source — so they never become spans that shadow a
+      // real highlight (this mirrors the server engine's `extract_spans`).
+      if (isMetadataCapture(c.name)) continue;
+      if (!captureSatisfiesLuaPredicates(entry.query, c)) continue;
       const s = c.node.startIndex, e = c.node.endIndex;
       if (e <= s) continue;
       const endLn = lineAt(e - 1);

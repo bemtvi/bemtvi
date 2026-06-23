@@ -14,7 +14,10 @@ use std::time::{Duration, Instant};
 use nxvim_core::{BufferEdit, BufferId, IndentParams, OpenOutcome, Span, SyntaxEngine};
 use ropey::{LineType, Rope};
 use streaming_iterator::StreamingIterator;
-use tree_sitter::{InputEdit, Node, ParseOptions, Parser, Point, Query, QueryCursor, Tree};
+use tree_sitter::{
+    InputEdit, Node, ParseOptions, Parser, Point, Query, QueryCursor, QueryMatch,
+    QueryPredicateArg, Tree,
+};
 
 use crate::loader::{compile_query, query_path, Grammar, LoadError, QueryOverrides};
 
@@ -1086,6 +1089,56 @@ struct Layer<'a> {
     ranges: &'a [Range<usize>],
 }
 
+/// Whether `name` is a tree-sitter metadata/control capture rather than a visual
+/// highlight group. Grammars tag nodes with these alongside a real highlight (e.g.
+/// `(comment) @comment @spell`) to mark spell-check regions (`@spell` / `@nospell`)
+/// or conceal candidates (`@conceal`); they carry no colour, so the painter must
+/// not let them overwrite the highlight capture they sit beside. Matches the major
+/// segment so `@spell.foo`-style refinements are caught too.
+fn is_metadata_capture(name: &str) -> bool {
+    matches!(
+        name.split('.').next().unwrap_or(name),
+        "spell" | "nospell" | "conceal"
+    )
+}
+
+/// Whether match `m` satisfies its `#lua-match?` / `#not-lua-match?` predicates.
+///
+/// These are neovim-specific predicates the tree-sitter binding does not evaluate
+/// (it only enforces the standard `#match?` / `#eq?` / `#any-of?` family while
+/// iterating), so they surface here as *general* predicates. Each compares a
+/// capture's node text against a Lua pattern; a positive `lua-match?` keeps the
+/// match only when the text matches, `not-lua-match?` only when it does not. When a
+/// match carries no such predicate (the overwhelmingly common case) the loop is
+/// empty and this is free. Other general predicates (`#vim-match?`, …) are not
+/// understood and left unenforced — best-effort, not a silent narrowing of a
+/// predicate we *do* support.
+fn match_satisfies_lua_predicates(query: &Query, m: &QueryMatch, shadow: &Rope) -> bool {
+    for pred in query.general_predicates(m.pattern_index) {
+        let negate = match &*pred.operator {
+            "lua-match?" => false,
+            "not-lua-match?" => true,
+            _ => continue,
+        };
+        let Some(QueryPredicateArg::Capture(cap_id)) = pred.args.first() else {
+            continue; // malformed predicate — don't let it filter anything
+        };
+        let Some(QueryPredicateArg::String(pat)) = pred.args.get(1) else {
+            continue;
+        };
+        // Apply to every node this capture matched in the match; like the standard
+        // `#match?`, all must satisfy. A capture absent from the match is vacuously
+        // satisfied (nothing to test).
+        for c in m.captures.iter().filter(|c| c.index == *cap_id) {
+            let text = node_bytes(shadow, c.node.byte_range());
+            if crate::lua_pattern::lua_match(&text, pat.as_bytes()) == negate {
+                return false;
+            }
+        }
+    }
+    true
+}
+
 /// Run each layer's query over the byte range covering the visible lines and
 /// resolve the captures into per-line byte spans. Within a layer the most-specific
 /// (narrowest) capture wins; across layers a deeper (injected) layer overwrites a
@@ -1121,8 +1174,22 @@ fn extract_spans(
         while let Some((m, idx)) = caps.next() {
             let cap = m.captures[*idx];
             let name = names[cap.index as usize];
-            if name.starts_with('_') {
-                continue; // internal/predicate capture, not a highlight group
+            if name.starts_with('_') || is_metadata_capture(name) {
+                // `_`-prefixed captures are internal/predicate; `spell` / `nospell`
+                // / `conceal` are tree-sitter metadata captures (spell-check regions,
+                // conceal marks), not visual highlight groups. neovim never paints
+                // them. Skipping both means a node tagged `(comment) @comment @spell`
+                // keeps `@comment`'s colour instead of being overwritten by the
+                // colour-less metadata capture (which would render as plain text).
+                continue;
+            }
+            // The tree-sitter binding enforces the standard text predicates
+            // (`#match?` / `#eq?` / `#any-of?`) while iterating, but `#lua-match?`
+            // is a neovim-specific predicate it leaves as a general predicate — so
+            // we must apply it ourselves, or e.g. bash's `(#lua-match? … "^#!")`
+            // shebang rule paints every comment as `@keyword.directive`.
+            if !match_satisfies_lua_predicates(layer.query, m, shadow) {
+                continue;
             }
             let (s, e) = (cap.node.start_byte(), cap.node.end_byte());
             if e <= s {

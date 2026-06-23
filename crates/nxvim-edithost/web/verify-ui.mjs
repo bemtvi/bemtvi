@@ -431,12 +431,37 @@ try {
   await page.keyboard.press("Escape");
   await page.keyboard.press("Escape"); // close the wildmenu + command line
 
+  // ---- Wide characters occupy two display columns (CJK / emoji) ----
+  // The server counts a wide glyph as two columns (unicode-width); the DOM renderer
+  // must too. With a one-column-per-codepoint model the cursor and every glyph after a
+  // wide char shifted left by one and the row stopped aligning with an all-ASCII row.
+  // Put a CJK char mid-line, land the cursor on the ASCII char after it, and confirm
+  // the reverse-video cur-block sits on that exact glyph (it landed on the next one,
+  // "d", before the fix).
+  await page.evaluate(() => window.__nxvim.feed("<Esc>:enew!<CR>iab你cd<Esc>0fc"));
+  const wideAfter = await page.evaluate(() => {
+    const cur = document.querySelector("#grid .cur-block");
+    return { curText: cur ? cur.textContent : null };
+  });
+  check("wide char: cursor lands on the ASCII glyph after a CJK char (two-column width)",
+    wideAfter.curText === "c", JSON.stringify(wideAfter));
+
+  // Cursor ON the wide glyph is a single reverse-video cell holding just that glyph —
+  // the continuation column renders nothing, so there is exactly one cur-block.
+  await page.evaluate(() => window.__nxvim.feed("0ll"));
+  const wideOn = await page.evaluate(() => {
+    const blocks = [...document.querySelectorAll("#grid .cur-block")];
+    return { count: blocks.length, text: blocks.map((b) => b.textContent).join("") };
+  });
+  check("wide char: cursor on the CJK glyph is a single block cell holding the glyph",
+    wideOn.count === 1 && wideOn.text === "你", JSON.stringify(wideOn));
+
   await browser.close();
 } finally {
   cleanup();
 }
 
 console.log(failures === 0
-  ? "\nALL PASS — DOM renderer + mouse + selection/cursor + layout + highlighting + wildmenu verified in a real browser"
+  ? "\nALL PASS — DOM renderer + mouse + selection/cursor + layout + highlighting + wildmenu + wide chars verified in a real browser"
   : `\n${failures} FAILED`);
 process.exit(failures === 0 ? 0 : 1);

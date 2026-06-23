@@ -28,7 +28,7 @@
   html, body { margin: 0; height: 100%; background: var(--bg); overflow: hidden; }
   #grid {
     position: absolute; inset: 0;
-    font-family: ui-monospace, "SF Mono", Menlo, Consolas, "DejaVu Sans Mono", monospace;
+    font-family: ui-monospace, "SF Mono", Menlo, Consolas, "DejaVu Sans Mono", "Symbols Nerd Font Mono", monospace;
     white-space: pre; color: var(--fg); background: var(--bg); overflow: hidden; outline: none;
   }
   #grid .row { position: absolute; left: 0; height: var(--ch); line-height: var(--ch); }
@@ -146,6 +146,44 @@
     }
     function escapeHtml(s) {
       return s.replace(/[&<>]/g, (c) => (c === "&" ? "&amp;" : c === "<" ? "&lt;" : "&gt;"));
+    }
+
+    // Display width of a Unicode code point in screen cells (0 / 1 / 2), mirroring
+    // the server's `unicode-width` column model. The server computes every column it
+    // ships (cursor_screen_col, selection / search / highlight spans, virt_text
+    // anchors) with wide characters counting as TWO cells; the DOM renderer must use
+    // the same metric or a CJK / emoji glyph occupies one column here while the server
+    // counted two, shifting the cursor and everything after the glyph out of place
+    // (and misaligning the row against an all-ASCII row).
+    const WIDE_RANGES = [
+      [0x1100, 0x115f], [0x2329, 0x232a], [0x2e80, 0x303e], [0x3041, 0x33ff],
+      [0x3400, 0x4dbf], [0x4e00, 0x9fff], [0xa000, 0xa4cf], [0xa960, 0xa97f],
+      [0xac00, 0xd7a3], [0xf900, 0xfaff], [0xfe10, 0xfe19], [0xfe30, 0xfe6f],
+      [0xff00, 0xff60], [0xffe0, 0xffe6], [0x1b000, 0x1b16f], [0x1f200, 0x1f2ff],
+      [0x1f300, 0x1f64f], [0x1f900, 0x1f9ff], [0x1fa00, 0x1faff], [0x20000, 0x3fffd],
+    ];
+    // Zero-width: combining marks, joiners, variation selectors, the zero-width
+    // space family — width 0, attached to the preceding cell rather than advancing.
+    const ZERO_RANGES = [
+      [0x0300, 0x036f], [0x0483, 0x0489], [0x0591, 0x05bd], [0x0610, 0x061a],
+      [0x064b, 0x065f], [0x0670, 0x0670], [0x06d6, 0x06dc], [0x06df, 0x06e4],
+      [0x0e31, 0x0e31], [0x0e34, 0x0e3a], [0x1ab0, 0x1aff], [0x1dc0, 0x1dff],
+      [0x200b, 0x200f], [0x2060, 0x2064], [0x20d0, 0x20ff], [0xfe00, 0xfe0f],
+      [0xfe20, 0xfe2f], [0xfeff, 0xfeff],
+    ];
+    const inRanges = (cp, ranges) => {
+      for (const [lo, hi] of ranges) if (cp >= lo && cp <= hi) return true;
+      return false;
+    };
+    function charWidth(cp) {
+      // Fast path: ASCII printable (the overwhelmingly common case) is width 1.
+      if (cp >= 0x20 && cp < 0x7f) return 1;
+      // C0 / C1 controls (the server substitutes these into the line as `^X` / `<xx>`
+      // tokens, so raw controls rarely reach here) carry no width of their own.
+      if (cp < 0x20 || (cp >= 0x7f && cp < 0xa0)) return 0;
+      if (inRanges(cp, ZERO_RANGES)) return 0;
+      if (inRanges(cp, WIDE_RANGES)) return 2;
+      return 1;
     }
 
     // ============================================================================
@@ -1028,8 +1066,18 @@
           for (let k = 0; k < n; k++) cells.push({ ch: " ", color: null });
           col += n;
         } else {
-          cells.push({ ch: cp, color: colors ? colors[u16] : null });
-          col += 1;
+          const wcw = charWidth(cp.codePointAt(0));
+          if (wcw === 0 && cells.length) {
+            // Combining / zero-width: glue onto the preceding glyph, no new column.
+            cells[cells.length - 1].ch += cp;
+          } else {
+            cells.push({ ch: cp, color: colors ? colors[u16] : null });
+            // A wide glyph spans two display columns: emit an empty continuation cell
+            // so server columns (wide=2) index the right cell. It renders nothing —
+            // the glyph's own width already covers both columns.
+            if (wcw === 2) cells.push({ ch: "", color: null, cont: true });
+            col += wcw || 1;
+          }
         }
         u16 += cp.length;
       }
@@ -1322,11 +1370,18 @@
       const secCols = new Set((w.secondary_cursors || []).filter(([r]) => r === row).map(([, c]) => c));
       const inSpan = (sp, c) => c >= sp[0] && c < sp[1];
 
+      // One entry per display column (tabs expanded, wide glyphs followed by an empty
+      // continuation column, combining marks glued to the preceding glyph) so each
+      // index lines up with the server's wide=2 column model.
       const expanded = [];
       let c0 = 0;
       for (const cp of line) {
         if (cp === "\t") { const n = tabstop - (c0 % tabstop); for (let k = 0; k < n; k++) expanded.push(" "); c0 += n; }
-        else { expanded.push(cp); c0 += 1; }
+        else {
+          const wcw = charWidth(cp.codePointAt(0));
+          if (wcw === 0 && expanded.length) { expanded[expanded.length - 1] += cp; }
+          else { expanded.push(cp); if (wcw === 2) expanded.push(""); c0 += wcw || 1; }
+        }
       }
 
       const cells = [];

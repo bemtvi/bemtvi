@@ -185,6 +185,15 @@ local Welcome = nx.view.component({
       -- label is only a last-resort fallback for a spec that carries no source at all.
       local name = it.source ~= "" and it.source or it.label
       local text = box .. " " .. name
+      -- The human description, when present, trails the source dim — extra context
+      -- alongside the source, never a substitute for it. It is appended as REAL
+      -- buffer text (not an eol virt_text) so a description longer than the float
+      -- width WRAPS with the window (wrap=true) instead of being clipped at the edge.
+      local desc_col
+      if it.desc ~= "" then
+        desc_col = #text
+        text = text .. " — " .. it.desc
+      end
       lines[#lines + 1] = text
       local line = #lines - 1
       decor[#decor + 1] = {
@@ -194,11 +203,14 @@ local Welcome = nx.view.component({
         end_col = #box,
         hl_group = it.checked and "NxPluginsLoaded" or "NxPluginsDim",
       }
-      -- The human description, when present, trails the source dim — extra context
-      -- alongside the source, never a substitute for it.
-      if it.desc ~= "" then
-        decor[#decor + 1] =
-          { line = line, col = #text, virt_text = { { " — " .. it.desc, "NxPluginsDim" } } }
+      if desc_col then
+        decor[#decor + 1] = {
+          line = line,
+          col = desc_col,
+          end_row = line,
+          end_col = #text,
+          hl_group = "NxPluginsDim",
+        }
       end
       if it.checked then
         selected = selected + 1

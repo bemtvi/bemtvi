@@ -788,6 +788,50 @@ async fn welcome_shows_the_full_source_not_just_name_and_desc() {
     );
 }
 
+// A long plugin description must be REAL buffer text, not an end-of-line virt_text
+// decoration: only real text wraps with the window (the welcome sets wrap=true), so a
+// description longer than the float width would otherwise be truncated at the right
+// edge instead of flowing onto a continuation row. Asserting the desc lands in
+// nvim_buf_get_lines proves it is wrappable buffer content rather than virtual text.
+#[tokio::test]
+async fn welcome_long_description_is_wrappable_real_text() {
+    let (rpc, _i) = start().await;
+    let src = temp_dir("plug_desc_wrap_src");
+    let repo = make_repo(&src, "wraprepo");
+    let _cfg = setup_root_and_config(&rpc, "plug_desc_wrap").await;
+
+    let long = "A very long recommended-plugin description that comfortably exceeds the welcome \
+         float width so the welcome view must wrap it onto another row";
+    exec_lua(
+        &rpc,
+        &format!(
+            "nx.plugins.recommend({{ {{ \"file://{repo}\",\n\
+               name = \"wrappy\", desc = \"{long}\" }} }})\n\
+             nx.plugins.bootstrap()",
+            repo = q(&repo)
+        ),
+    )
+    .await;
+
+    assert!(poll_true(&rpc, "return vim.bo.filetype == 'nxpluginswelcome'").await);
+
+    // The description text must show up in the BUFFER LINES, not only as a virt_text
+    // decoration — that is what lets wrap=true reflow it instead of clipping it.
+    let mut shown = false;
+    for _ in 0..200 {
+        if lines(&rpc).await.iter().any(|l| l.contains(long)) {
+            shown = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(
+        shown,
+        "the welcome description must be real buffer text (so wrap can reflow it), \
+         not an end-of-line virt_text decoration that gets clipped at the float edge"
+    );
+}
+
 // ----- the manager UI: live task state + the dashboard view ------------------
 
 // The manager UI renders LIVE per-plugin progress from `M._tasks` and re-renders via

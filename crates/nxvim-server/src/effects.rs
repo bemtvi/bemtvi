@@ -2951,6 +2951,17 @@ impl EditHost {
                 .collect();
             self.statusline_cache.insert((req.win, req.name), cells);
         }
+
+        // A segment's `render` may DEFINE highlight groups and reference them in the
+        // cells it just published — a powerline statusline (nxvim-line) lazily creates
+        // its separator/transition groups this way. `take_highlights` ran at the top of
+        // `run_pending`, before these renders, so those defines are still queued; fold
+        // them now so the redraw that projects these cells resolves their colours on the
+        // first frame. Without this they resolve to the base look for one tick — an
+        // uncoloured-separator flicker until the next tick folds them.
+        for hl in self.lua.take_highlights() {
+            self.editor.highlights.set_ns(hl.ns, &hl.name, hl_def(&hl));
+        }
     }
 
     /// Whether any `nx.statusline` segment layout is active — the global layout or

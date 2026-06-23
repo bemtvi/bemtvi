@@ -305,6 +305,59 @@ async fn nx_hl_define_reaches_get_and_nvim_alias() {
     );
 }
 
+/// The `style` palette id of the first `status` segment whose text contains
+/// `needle`, or `None` when that segment carries no style (the wire `Nil` — an
+/// unresolved / base-look cell).
+fn status_style_of(map: &[(Value, Value)], needle: &str) -> Option<u64> {
+    let Value::Array(segs) = window0_field(map, "status")? else {
+        return None;
+    };
+    segs.iter().find_map(|seg| {
+        let Value::Map(m) = seg else { return None };
+        let text = m
+            .iter()
+            .find(|(k, _)| k.as_str() == Some("text"))
+            .and_then(|(_, v)| v.as_str())?;
+        if !text.contains(needle) {
+            return None;
+        }
+        m.iter()
+            .find(|(k, _)| k.as_str() == Some("style"))
+            .and_then(|(_, v)| v.as_u64())
+    })
+}
+
+#[tokio::test]
+async fn statusline_segment_render_defining_a_highlight_resolves_same_frame() {
+    let (rpc, mut incoming) = start().await;
+
+    // A segment whose render DEFINES a highlight group and uses it in the same pass
+    // (a powerline plugin's lazily-created separator/transition groups work this
+    // way). The group is queued after the tick's highlight fold, so without folding
+    // the render's defines before projecting, the very first frame resolves it to
+    // Nil — the uncoloured-separator flicker. The first frame the cell appears must
+    // already carry a resolved (non-Nil) style.
+    exec_lua(
+        &rpc,
+        "nx.statusline.segment{ name = 'dynsep', render = function()\n\
+           nx.hl.define(0, 'DynSepHl', { fg = '#ff0000', bg = '#00ff00' })\n\
+           return { { text = 'SEP', hl = 'DynSepHl' } }\n\
+         end }\n\
+         nx.statusline.setup{ left = { 'dynsep' }, separator = '' }",
+    )
+    .await;
+    let map = wait_redraw(&mut incoming, |m| {
+        status_texts(m).iter().any(|t| t.contains("SEP"))
+    })
+    .await;
+    assert!(
+        status_style_of(&map, "SEP").is_some(),
+        "the segment's own highlight must resolve on the first frame it appears, \
+         not flicker uncoloured: {:?}",
+        status_texts(&map)
+    );
+}
+
 #[tokio::test]
 async fn statusline_default_separator_inserts_unstyled_connectors() {
     let (rpc, mut incoming) = start().await;

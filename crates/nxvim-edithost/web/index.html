@@ -185,6 +185,20 @@
       if (inRanges(cp, WIDE_RANGES)) return 2;
       return 1;
     }
+    // True when `ch`'s first code point is a wide (two-column) glyph. Continuation
+    // cells (`ch === ""`) and tab-fill spaces are not wide.
+    const isWideCell = (ch) => ch !== "" && charWidth(ch.codePointAt(0)) === 2;
+    // A wide glyph rendered in flowing text advances by its font's natural width,
+    // which is rarely exactly two cells — a fallback CJK glyph is typically ~1em
+    // while two cells are ~1.2em, so the glyph (and everything after it) drifts left.
+    // Pin it into a fixed two-cell inline-block box so the advance is exactly two
+    // cells regardless of the font; the box's background still paints cursor /
+    // selection across both columns. Baseline is left untouched (no overflow clip),
+    // so the glyph stays vertically aligned with the surrounding ASCII text.
+    function wideCellSpan(ch, cls, css) {
+      const box = `display:inline-block;width:${(2 * cw).toFixed(3)}px;`;
+      return `<span class="${cls}" style="${box}${css || ""}">${escapeHtml(ch)}</span>`;
+    }
 
     // ============================================================================
     // Worker transport. Two modes, picked by capability: SAB (slice 5d) when the
@@ -1177,6 +1191,9 @@
             else css = (cells[c].color ? `color:${cells[c].color};` : "") + (cells[c].bg ? `background:${cells[c].bg};` : "");
           }
         }
+        // A wide glyph breaks the run and renders in its own fixed two-cell box; its
+        // empty continuation cell (next column) then adds nothing.
+        if (isWideCell(cells[c].ch)) { flush(); out += wideCellSpan(cells[c].ch, cls, css); continue; }
         if (cls !== runCls || css !== runCss) { flush(); runCls = cls; runCss = css; }
         run += cells[c].ch;
       }
@@ -1430,6 +1447,9 @@
         if (isFocused && cursorRow === row && painted === cursorPainted) cls = cursorClass();
         else if (!w.focused && cursorRow === row && painted === cursorPainted && !view.command_mode) cls = "cur-hollow";
         const style = (a < 0) ? cell.base : (COLOR_OWNED.has(cls) ? "" : cell.base);
+        // A wide glyph renders in its own fixed two-cell box (see wideCellSpan); its
+        // empty continuation cell at the next column then adds nothing.
+        if (isWideCell(cell.ch)) { flush(); out += wideCellSpan(cell.ch, cls, style); painted += 1; continue; }
         if (cls !== runCls || style !== runStyle) { flush(); runCls = cls; runStyle = style; }
         run += cell.ch;
         painted += 1;

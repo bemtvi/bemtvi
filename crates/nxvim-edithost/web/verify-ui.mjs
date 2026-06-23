@@ -447,14 +447,27 @@ try {
     wideAfter.curText === "c", JSON.stringify(wideAfter));
 
   // Cursor ON the wide glyph is a single reverse-video cell holding just that glyph —
-  // the continuation column renders nothing, so there is exactly one cur-block.
+  // the continuation column renders nothing, so there is exactly one cur-block. Its
+  // rendered box must be exactly two ASCII cells wide (the glyph sits in a fixed
+  // inline-block box), or the glyph and the text after it drift out of column. Measure
+  // the wide cur-block, then the cur-block over an ASCII glyph, and compare.
   await page.evaluate(() => window.__nxvim.feed("0ll"));
-  const wideOn = await page.evaluate(() => {
+  const wideBox = await page.evaluate(() => {
     const blocks = [...document.querySelectorAll("#grid .cur-block")];
-    return { count: blocks.length, text: blocks.map((b) => b.textContent).join("") };
+    return { count: blocks.length, text: blocks.map((b) => b.textContent).join(""),
+      w: blocks[0] ? blocks[0].getBoundingClientRect().width : null };
+  });
+  await page.evaluate(() => window.__nxvim.feed("0"));
+  const asciiBox = await page.evaluate(() => {
+    const b = document.querySelector("#grid .cur-block");
+    return { text: b ? b.textContent : null, w: b ? b.getBoundingClientRect().width : null };
   });
   check("wide char: cursor on the CJK glyph is a single block cell holding the glyph",
-    wideOn.count === 1 && wideOn.text === "你", JSON.stringify(wideOn));
+    wideBox.count === 1 && wideBox.text === "你", JSON.stringify(wideBox));
+  // Within 1px to allow sub-pixel rounding of the half-cell-derived box width.
+  check("wide char: the CJK glyph box is exactly two ASCII cells wide (no visual drift)",
+    wideBox.w != null && asciiBox.w != null && Math.abs(wideBox.w - 2 * asciiBox.w) <= 1,
+    JSON.stringify({ wide: wideBox.w, ascii: asciiBox.w }));
 
   await browser.close();
 } finally {

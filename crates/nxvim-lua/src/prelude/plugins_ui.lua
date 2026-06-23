@@ -239,8 +239,10 @@ function M.ui.welcome(recommended)
       float = {
         width = 74,
         -- Exact fit: the header lines (WELCOME_HEADER) + one row per item + the hint,
-        -- plus the 2 rows the top/bottom `padding` insets.
-        height = #recommended + WELCOME_HEADER + 3,
+        -- plus the 2 rows the top/bottom `padding` insets, plus 3 spare rows so the
+        -- longer descriptions (which now wrap as real text onto a second display row
+        -- at this width) aren't pushed below the float's bottom edge.
+        height = #recommended + WELCOME_HEADER + 6,
         align = "center",
         border = "rounded",
         title = "  Welcome to nxvim  ",

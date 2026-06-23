@@ -547,12 +547,28 @@ try {
       && wideIndents.emoji != null && Math.abs(wideIndents.emoji) < 0.5,
     JSON.stringify(wideIndents));
 
+  // ---- The 'statusline' option drives the rendered status bar ----
+  // The server renders the `%`-format (or its built-in default) into styled segments on
+  // the wasm build too; the client must paint those rather than synthesize its own bar,
+  // or `:set statusline` is silently ignored. Set a sentinel value and read the bar text.
+  await page.evaluate(() => window.__nxvim.feed("<Esc>:set statusline=NXSTATUS<CR>"));
+  await sleep(200);
+  const slSet = await page.evaluate(() =>
+    [...document.querySelectorAll("#grid .statusline")].map((e) => e.textContent).join("|"));
+  check("statusline: ':set statusline=...' renders into the status bar", slSet.includes("NXSTATUS"), slSet);
+  // ...and the Lua surface (vim.o.statusline) drives it too.
+  await page.evaluate(() => window.__nxvim.feed(":lua vim.o.statusline='NXLUA'<CR>"));
+  await sleep(200);
+  const slLua = await page.evaluate(() =>
+    [...document.querySelectorAll("#grid .statusline")].map((e) => e.textContent).join("|"));
+  check("statusline: 'vim.o.statusline' drives the status bar", slLua.includes("NXLUA"), slLua);
+
   await browser.close();
 } finally {
   cleanup();
 }
 
 console.log(failures === 0
-  ? "\nALL PASS — DOM renderer + mouse + selection/cursor + layout + highlighting + wildmenu + wide chars verified in a real browser"
+  ? "\nALL PASS — DOM renderer + mouse + selection/cursor + layout + highlighting + wildmenu + wide chars + statusline verified in a real browser"
   : `\n${failures} FAILED`);
 process.exit(failures === 0 ? 0 : 1);

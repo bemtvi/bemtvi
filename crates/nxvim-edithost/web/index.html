@@ -1140,7 +1140,7 @@
         const bodyRows = Math.max(0, rect.height - (hasStatus ? 1 : 0));
         renderImage(box, w.image, rect.width, bodyRows);
         if (hasStatus) {
-          if (serverStyled) renderStatusSegments(box, w.status || [], bodyRows, rect.width, w.focused);
+          if (w.status?.length) renderStatusSegments(box, w.status, bodyRows, rect.width, w.focused);
           else renderStatus(box, w, bodyRows);
         }
         return;
@@ -1190,12 +1190,12 @@
           box.appendChild(rowEl);
         }
       }
-      if (serverStyled) {
-        if (statusRows > 0 && w.status_visible !== false) {
-          renderStatusSegments(box, w.status || [], textRows, rect.width, w.focused);
-        }
-      } else if (statusRows > 0 && w.status_visible !== false) {
-        renderStatus(box, w, textRows);
+      if (statusRows > 0 && w.status_visible !== false) {
+        // The server renders the `'statusline'` `%`-format (or its built-in default) into
+        // styled segments on BOTH builds, so paint those — they honour `:set statusline`.
+        // The JS-synthesized line is only a fallback for a frame that carries no segments.
+        if (w.status?.length) renderStatusSegments(box, w.status, textRows, rect.width, w.focused);
+        else renderStatus(box, w, textRows);
       }
     }
 
@@ -1639,7 +1639,11 @@
     function renderSegmentBar(segments, width, cls) {
       let html = "";
       for (const { text, style } of (segments || [])) {
-        const css = styleToCss(style);
+        // A status / tabline segment carries a palette *id* (or null when its group is
+        // unset / undefined — the wasm build, with no colorscheme, always sends null and
+        // the segment then shows the base `.statusline` look).
+        const st = typeof style === "number" ? paletteStyle(style) : style;
+        const css = styleToCss(st);
         html += `<span${css ? ` style="${css}"` : ""}>${escapeHtml(text)}</span>`;
       }
       const el = document.createElement("div");

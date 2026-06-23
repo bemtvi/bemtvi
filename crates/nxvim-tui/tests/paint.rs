@@ -287,6 +287,42 @@ fn status_segments_paint_their_own_styles_over_the_base() {
     );
 }
 
+#[test]
+fn status_segment_with_its_own_bg_is_not_inverted_by_the_reverse_base() {
+    // A lualine-style themed segment carries BOTH fg and bg (here dark-on-blue,
+    // like `lualine_a_normal`). With no `StatusLine` group loaded the base look is
+    // reverse-video — but a segment supplying its own bg must paint those literal
+    // colours, NOT inherit the base's REVERSED (which would swap fg/bg and render
+    // blue text on a dark bar). Regression: themed statuslines looked inverted.
+    let v = view(vec![
+        ("lines", lines(&["abc"])),
+        (
+            "styles",
+            Value::Array(vec![style(vec![
+                ("fg", rgb(0x1c, 0x1c, 0x1c)),
+                ("bg", rgb(0x5f, 0xaf, 0xff)),
+            ])]),
+        ),
+        ("status", status(&[("NORMAL", Some(0))])),
+    ]);
+    let buf = paint(&v, 20, 5);
+    assert_eq!(row_text(&buf, 3).trim_end(), "NORMAL");
+    assert!(
+        !reversed(&buf, 0, 3),
+        "a segment with its own bg must not inherit the base REVERSED"
+    );
+    assert_eq!(
+        buf.cell((0, 3)).unwrap().style().fg,
+        Some(Color::Rgb(0x1c, 0x1c, 0x1c)),
+        "the segment paints its literal foreground (dark)"
+    );
+    assert_eq!(
+        buf.cell((0, 3)).unwrap().style().bg,
+        Some(Color::Rgb(0x5f, 0xaf, 0xff)),
+        "the segment paints its literal background (blue)"
+    );
+}
+
 /// A `{ x, y, width, height }` rect sub-map.
 fn rect(x: u64, y: u64, w: u64, h: u64) -> Value {
     Value::Map(vec![

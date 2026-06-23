@@ -2136,7 +2136,21 @@ fn render_status(frame: &mut Frame, area: Rect, segments: &[StatusSegment], view
     let spans: Vec<Span> = segments
         .iter()
         .map(|(text, style)| {
-            let style = style.map_or(base, |s| base.patch(rt(s)));
+            let style = style.map_or(base, |s| {
+                let merged = base.patch(rt(s));
+                // The base's REVERSED is a fallback that fakes fg/bg contrast on an
+                // unstyled bar (no `StatusLine` group loaded). A segment that brings
+                // its own background supplies real colours, so the reverse-video must
+                // not leak through and swap them — clear it (via `sub_modifier`, so it
+                // also overrides the `Paragraph` base set across the row below) unless
+                // the segment asked for reverse itself. Without this a themed
+                // statusline (lualine et al.) renders inverted.
+                if s.bg.is_some() && !s.reverse {
+                    merged.remove_modifier(Modifier::REVERSED)
+                } else {
+                    merged
+                }
+            });
             Span::styled(text.clone(), style)
         })
         .collect();

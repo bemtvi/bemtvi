@@ -284,15 +284,15 @@
     }
     // Some Nerd / powerline separators are shaped by a fallback font inside an advance
     // box wider than their reserved cell, with the *ink* parked at one side: a right-
-    // pointing `` hugs the box's left, a left-pointing `` hugs its right. Left-anchoring
-    // the glyph in its cell then lands a right-hugging separator a cell too far right,
-    // drawing over the next section (the same statusline-separator bug the GUI hit). Mirror
-    // the GUI fix: measure the rasterised ink via Canvas `measureText` (the DOM analogue of
-    // swash's ink placement); when the ink hugs the *right* of its advance, pin the ink's
-    // right edge to the box's right edge via a negative text-indent. Left-/centre-biased
-    // glyphs keep the natural left anchor (shift 0). Detection is by measured ink position,
-    // not a codepoint list, so every right-hugging separator is covered with no maintenance.
-    // Per-codepoint result is memoised — the boxed-glyph set is small and bounded. Applied
+    // pointing `` hugs the box's left, a left-pointing `` hugs its right. Even centred in
+    // its cell a right-hugging separator sits a touch left of where the seamless powerline
+    // join wants it (the same statusline-separator bug the GUI hit). Mirror the GUI fix:
+    // measure the rasterised ink via Canvas `measureText` (the DOM analogue of swash's ink
+    // placement); when the ink hugs the *right* of its advance, nudge it to the box's right
+    // edge with a text-indent ON TOP of the centring `cellBoxSpan` applies. Left-/centre-
+    // biased glyphs get no nudge (shift 0). Detection is by measured ink position, not a
+    // codepoint list, so every right-hugging separator is covered with no maintenance. The
+    // per-codepoint result is memoised — the boxed-glyph set is small and bounded. Applied
     // ONLY to single-column glyphs (see cellBoxSpan): separators are width 1, and a true wide
     // glyph (kanji / emoji) sits naturally in its two-cell box and must never be re-anchored —
     // a font that shapes a kanji right-biased would otherwise get a spurious shift off-grid.
@@ -326,11 +326,14 @@
       const cp = ch.codePointAt(0);
       const cells = charWidth(cp) || 1;
       const boxW = cells * cw;
-      // Re-anchor only single-column glyphs (powerline / Nerd separators). Wide glyphs
-      // keep their natural left anchor in the two-cell box.
+      // Every boxed glyph is centred in its box, so a glyph whose advance is narrower
+      // than its cells (wide CJK / emoji, arrows, box-drawing) sits balanced rather than
+      // hugging the left. ON TOP of that, a right-hugging single-column separator gets the
+      // ink-measured text-indent so its ink lands on the box's right edge (centring alone
+      // leaves it a touch left); the indent only ever applies to width-1 glyphs.
       const shift = cells === 1 ? inkRightShift(cp, boxW) : 0;
       const indent = shift ? `text-indent:${shift.toFixed(3)}px;` : "";
-      return `<span class="${cls}" style="display:inline-block;width:${boxW.toFixed(3)}px;${indent}${css || ""}">${escapeHtml(ch)}</span>`;
+      return `<span class="${cls}" style="display:inline-block;width:${boxW.toFixed(3)}px;text-align:center;${indent}${css || ""}">${escapeHtml(ch)}</span>`;
     }
 
     // ============================================================================

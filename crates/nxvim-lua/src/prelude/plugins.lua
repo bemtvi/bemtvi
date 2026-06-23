@@ -729,19 +729,30 @@ M._default_recommended = {
     config = [[ vim.cmd("colorscheme catppuccin") ]],
   },
   {
-    "davidrios/nx-files",
-    desc = "Fuzzy finder for files & buffers (<leader>ff)",
-    keys = { "<leader>ff" },
-    dependencies = { "davidrios/nx-async-utils" },
+    "davidrios/nxvim-keys-helper",
+    desc = "Popup of available keybindings as you type (which-key)",
+    config = [[ require("nxvim-keys-helper").setup() ]],
   },
   {
-    "davidrios/nx-emoji",
-    desc = "Insert emoji by name (:Emoji)",
-    cmd = "Emoji",
+    "davidrios/nxvim-tree",
+    desc = "File explorer sidebar (<leader>e)",
+    keys = { "<leader>e" },
+    config = [[ require("nxvim-tree").setup() ]],
   },
   {
-    "davidrios/nx-statusline-extras",
-    desc = "Extra statusline segments (git, diagnostics, …)",
+    "davidrios/nxvim-lspconfig",
+    desc = "Quickstart configs for the built-in LSP client",
+    config = [[ require("nxvim-lspconfig").setup() ]],
+  },
+  {
+    "davidrios/nxvim-line",
+    desc = "Configurable statusline (lualine)",
+    config = [[ require("nxvim-line").setup() ]],
+  },
+  {
+    "davidrios/nxvim-diff",
+    desc = "Diff & merge-conflict visualizer",
+    config = [[ require("nxvim-diff").setup() ]],
   },
 }
 

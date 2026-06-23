@@ -529,6 +529,24 @@ try {
   check("nerd separator: right-hugging glyph anchored to the cell's right edge (left-pointing), left-hugging unshifted",
     okRight && okLeft, JSON.stringify(seps));
 
+  // ---- A wide glyph is never re-anchored ----
+  // The ink-shift only applies to single-column glyphs; a kanji / emoji sits naturally in
+  // its two-cell box with no text-indent. (Regression: the shift used to run on wide glyphs
+  // too, and a font that shapes a kanji / emoji right-biased then dragged it off-grid.)
+  await page.evaluate(() => window.__nxvim.feed("<Esc>:enew!<CR>i\u{e0b2}你A\u{e0b2}😀<Esc>"));
+  await sleep(150);
+  const wideIndents = await page.evaluate(() => {
+    const indentOf = (chStr) => {
+      const span = [...document.querySelectorAll("#grid .win .row span")].find((s) => s.textContent === chStr);
+      return span ? parseFloat(getComputedStyle(span).textIndent) || 0 : null;
+    };
+    return { kanji: indentOf("你"), emoji: indentOf("\u{1f600}") };
+  });
+  check("wide glyph: a kanji / emoji keeps a zero indent (ink-shift gated to single-column glyphs)",
+    wideIndents.kanji != null && Math.abs(wideIndents.kanji) < 0.5
+      && wideIndents.emoji != null && Math.abs(wideIndents.emoji) < 0.5,
+    JSON.stringify(wideIndents));
+
   await browser.close();
 } finally {
   cleanup();

@@ -292,12 +292,14 @@
     // right edge to the box's right edge via a negative text-indent. Left-/centre-biased
     // glyphs keep the natural left anchor (shift 0). Detection is by measured ink position,
     // not a codepoint list, so every right-hugging separator is covered with no maintenance.
-    // Per-codepoint result is memoised — the boxed-glyph set is small and bounded.
+    // Per-codepoint result is memoised — the boxed-glyph set is small and bounded. Applied
+    // ONLY to single-column glyphs (see cellBoxSpan): separators are width 1, and a true wide
+    // glyph (kanji / emoji) sits naturally in its two-cell box and must never be re-anchored —
+    // a font that shapes a kanji right-biased would otherwise get a spurious shift off-grid.
     const inkShiftCache = new Map();
     let measureCtx = null;
     function inkRightShift(cp, boxW) {
-      const key = cp * 8 + Math.round(boxW); // boxW varies (1 vs 2 cells); fold into the key
-      const hit = inkShiftCache.get(key);
+      const hit = inkShiftCache.get(cp);
       if (hit !== undefined) return hit;
       let shift = 0;
       try {
@@ -317,13 +319,16 @@
         const leftGap = inkLeft, rightGap = adv - inkRight;
         if (inkRight > inkLeft && rightGap < leftGap) shift = boxW - inkRight;
       } catch { /* measureText unavailable → keep the natural left anchor */ }
-      inkShiftCache.set(key, shift);
+      inkShiftCache.set(cp, shift);
       return shift;
     }
     function cellBoxSpan(ch, cls, css) {
       const cp = ch.codePointAt(0);
-      const boxW = (charWidth(cp) || 1) * cw;
-      const shift = inkRightShift(cp, boxW);
+      const cells = charWidth(cp) || 1;
+      const boxW = cells * cw;
+      // Re-anchor only single-column glyphs (powerline / Nerd separators). Wide glyphs
+      // keep their natural left anchor in the two-cell box.
+      const shift = cells === 1 ? inkRightShift(cp, boxW) : 0;
       const indent = shift ? `text-indent:${shift.toFixed(3)}px;` : "";
       return `<span class="${cls}" style="display:inline-block;width:${boxW.toFixed(3)}px;${indent}${css || ""}">${escapeHtml(ch)}</span>`;
     }

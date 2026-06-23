@@ -80,7 +80,13 @@ async fn latest_message(rpc: &Rpc, incoming: &mut UnboundedReceiver<Incoming>) -
 async fn picker_jump_reuses_a_relatively_opened_buffer() {
     let _guard = serial_lock().lock().await;
     let _cwd = CwdGuard::capture();
-    let dir = temp_dir("lsp_nav_relative");
+    // Canonicalize the temp dir up front: after `:cd` the process cwd reads back
+    // symlink-resolved (macOS temp dirs live under `/var` → `/private/var`), and the
+    // editor's cwd-aware buffer dedup is filesystem-free — it never canonicalizes an
+    // absolute path. A real LSP hands back already-canonical paths, so to model that
+    // (and not the symlink artifact) the ABSOLUTE path we feed must be in the same
+    // canonical form the editor's cwd will be.
+    let dir = std::fs::canonicalize(temp_dir("lsp_nav_relative")).unwrap();
     let file = dir.join("target.txt");
     std::fs::write(&file, "one\ntwo\nthree\nfour\n").unwrap();
     let abs = file.to_string_lossy().into_owned();

@@ -158,6 +158,46 @@ async fn error_messages_flag_the_cmdline_line_red() {
 }
 
 #[tokio::test]
+async fn notify_at_error_level_flags_the_cmdline_line_red() {
+    let (rpc, mut incoming) = start(None).await;
+
+    // `nx.notify` carries a severity; an ERROR-level notification must land on the
+    // message line painted red, like a genuine error — we have only the two message
+    // states, so it routes through the same `echo_err` path. A WARN/INFO/nil-level
+    // notification stays a plain message (no WarningMsg colour on our line yet).
+    let map = redraw_after(
+        &rpc,
+        &mut incoming,
+        ":lua nx.notify('boom', nx.log.levels.ERROR)<CR>",
+    )
+    .await;
+    assert_eq!(message(&map), "boom");
+    assert!(
+        message_is_error(&map),
+        "an ERROR-level nx.notify must flag the cmdline message red"
+    );
+
+    let map = redraw_after(
+        &rpc,
+        &mut incoming,
+        ":lua nx.notify('heads up', nx.log.levels.WARN)<CR>",
+    )
+    .await;
+    assert_eq!(message(&map), "heads up");
+    assert!(
+        !message_is_error(&map),
+        "a WARN-level nx.notify must NOT flag the cmdline message red"
+    );
+
+    let map = redraw_after(&rpc, &mut incoming, ":lua nx.notify('fyi')<CR>").await;
+    assert_eq!(message(&map), "fyi");
+    assert!(
+        !message_is_error(&map),
+        "a level-less nx.notify must NOT flag the cmdline message red"
+    );
+}
+
+#[tokio::test]
 async fn a_panel_is_navigable_with_plain_motions() {
     let (rpc, _incoming) = start(None).await;
     for i in 0..15 {

@@ -184,11 +184,22 @@ function nx._run_stdout(id, lines)
   end
 end
 
-function nx.notify(msg, _level, _opts)
+function nx.notify(msg, level, _opts)
   if type(msg) == "table" then
     msg = table.concat(msg, "\n")
   end
-  print(msg)
+  -- Honour the severity: an ERROR-level notification lands on the message line
+  -- painted red, matching a genuine error (the core `echo_err` path). The message
+  -- line has only two states — error (red) or plain — so WARN and below funnel
+  -- through `print` like any other message; neovim's distinct WarningMsg colour
+  -- has no analogue on our line yet. (`nx.log.levels.ERROR == 4`; guarded so a
+  -- bare-prelude call before `state.lua` loads still works.)
+  local ERROR = (nx.log and nx.log.levels and nx.log.levels.ERROR) or 4
+  if type(level) == "number" and level >= ERROR and nx._echo_err then
+    nx._echo_err(tostring(msg))
+  else
+    print(msg)
+  end
 end
 vim.notify = nx.notify
 

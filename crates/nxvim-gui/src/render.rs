@@ -222,6 +222,13 @@ pub struct Renderer {
     /// The window's scale factor (device pixels per logical pixel), kept so
     /// [`Renderer::set_font`] can rescale a new point size like `new` did.
     scale: f32,
+
+    /// The on-screen text cursor's top-left in physical pixels, captured each frame
+    /// as it's painted (the focused-window cursor, or the command-line cursor while
+    /// in command mode) — `None` when no cursor is shown (a focused picker/panel owns
+    /// it). The client reads it via [`Renderer::ime_cursor_area`] to anchor the IME
+    /// candidate window at the caret instead of the window origin.
+    cursor_px: Option<(f32, f32)>,
 }
 
 impl Renderer {
@@ -322,6 +329,7 @@ impl Renderer {
             font_size,
             line_height,
             scale,
+            cursor_px: None,
         })
     }
 
@@ -385,6 +393,14 @@ impl Renderer {
     /// pixel-precise scroll delta into whole-line wheel notches.
     pub fn cell_size(&self) -> (f32, f32) {
         (self.cell_w, self.cell_h)
+    }
+
+    /// The text cursor's cell rect in physical pixels `(x, y, w, h)` from the last
+    /// painted frame, or `None` when no cursor was shown. The client feeds this to
+    /// `Window::set_ime_cursor_area` so the IME candidate window opens at the caret.
+    pub fn ime_cursor_area(&self) -> Option<(f32, f32, f32, f32)> {
+        self.cursor_px
+            .map(|(x, y)| (x, y, self.cell_w, self.cell_h))
     }
 
     /// Reconfigure the surface after a window resize. The size is clamped to the
@@ -463,6 +479,10 @@ impl Renderer {
         let target = frame
             .texture
             .create_view(&wgpu::TextureViewDescriptor::default());
+
+        // Recomputed below as the cursor is painted (or left `None` when a
+        // picker/panel owns it), so the IME area always reflects this frame.
+        self.cursor_px = None;
 
         self.viewport.update(
             &self.queue,
@@ -1473,6 +1493,8 @@ impl Renderer {
                 }
                 None => (oy + win.cursor_row.min(last_row)) as f32 * self.cell_h,
             };
+            // Anchor the IME candidate window at the caret (read after the frame).
+            self.cursor_px = Some((px, py));
             // In MultiCursor placement mode the active (primary) cursor wears the
             // multi-cursor accent, distinct from the secondaries, so it reads as
             // "the one dropping cursors" — mirroring the TUI.
@@ -1647,6 +1669,9 @@ impl Renderer {
             };
             let col = prompt_width + view.cmdline_cursor as u16;
             let (px, py) = self.cell_px(col, cmd_row);
+            // Composing accented/CJK text in the command line or search: anchor the
+            // IME candidate window at the command-line caret, not the window origin.
+            self.cursor_px = Some((px, py));
             let cursor_color = style_fg(&view.normal).unwrap_or(DEFAULT_FG);
             let c = srgb_to_color_rgba(cursor_color, 0.5);
             quads.push(Quad {

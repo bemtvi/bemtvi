@@ -3,8 +3,8 @@
 //! GUI analogue of `nxvim-tui`'s `keys` test.
 
 use nxvim_gui::{
-    dialog_action, encode_key, is_paste, open_dialog_verb, open_path_command, parse_guifont,
-    save_dialog_needed, DialogAction,
+    dialog_action, encode_key, encode_paste, is_paste, open_dialog_verb, open_path_command,
+    parse_guifont, save_dialog_needed, DialogAction,
 };
 use winit::keyboard::{Key, ModifiersState, NamedKey};
 
@@ -222,6 +222,21 @@ fn paste_gestures_are_recognized_and_dont_shadow_ctrl_v() {
         &Key::Named(NamedKey::Insert),
         ModifiersState::empty()
     ));
+}
+
+#[test]
+fn ime_committed_text_encodes_multibyte_verbatim() {
+    // Composed/non-ASCII input (dead-key accents, AltGr, CJK) arrives as an
+    // `Ime::Commit`, which the GUI feeds through `encode_paste` exactly as it does a
+    // clipboard paste. The committed characters — including multibyte ones — must
+    // reach the server byte-for-byte, not be stripped to a base key or mangled.
+    assert_eq!(encode_paste("é"), "é");
+    assert_eq!(encode_paste("café"), "café");
+    assert_eq!(encode_paste("ñ"), "ñ");
+    // Full IME composition can commit several characters at once (a CJK word).
+    assert_eq!(encode_paste("日本語"), "日本語");
+    // `<` is still escaped so committed text can't open a `<...>` notation form.
+    assert_eq!(encode_paste("a<b"), "a<lt>b");
 }
 
 #[test]

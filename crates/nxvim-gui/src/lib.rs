@@ -43,6 +43,10 @@ pub use input::{encode_key, is_paste};
 pub use mouse::{
     button_name, cell_at, drain_notches, horizontal_action, mouse_modifier, vertical_action,
 };
+// The neutral text-insertion encoder, re-exported so the Tier-1 key test can cover
+// the path IME-committed text takes (composed accents, CJK) — the GUI feeds an
+// `Ime::Commit` through this exactly as it does a clipboard paste.
+pub use nxvim_view::encode_paste;
 pub use session::{parse_connect_uri, spawn_session, spawn_stdio_daemon_session, Session};
 // The pure inline-inlay-hint geometry (the shift math) and the segment splice, so
 // the Tier-1 `inlay` test can exercise them without a GPU — like the mouse helpers.
@@ -58,12 +62,12 @@ use std::time::{Duration, Instant};
 use anyhow::Result;
 use nxvim_rpc::{connect, Incoming, Rpc};
 use nxvim_view::{
-    encode_paste, DiagSign, DiagSpan, HlSpan, InlayHint, ResizeCursor, ScrollData, Style, View,
-    VirtChunk, VirtPlacement,
+    DiagSign, DiagSpan, HlSpan, InlayHint, ResizeCursor, ScrollData, Style, View, VirtChunk,
+    VirtPlacement,
 };
 use rmpv::Value;
 use winit::application::ApplicationHandler;
-use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
+use winit::event::{ElementState, Ime, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::{Key, ModifiersState, NamedKey};
 use winit::platform::modifier_supplement::KeyEventExtModifierSupplement;
@@ -585,6 +589,9 @@ struct App {
     /// further input — the GUI's `timeoutlen` timer (see [`TIMEOUT_LEN`]). Armed by
     /// each keystroke and re-armed by the next, so it measures idle-since-last-key.
     flush_deadline: Option<Instant>,
+    /// The last IME cursor rect `(x, y, w, h)` pushed to the window, so a frame that
+    /// didn't move the caret skips the redundant platform call.
+    ime_area: Option<(f32, f32, f32, f32)>,
     /// Font config (CLI flags / environment) used as the renderer's startup default
     /// and the fallback for any field a `guifont` doesn't set.
     config: GuiConfig,
@@ -636,6 +643,7 @@ impl App {
             wheel_accum: (0.0, 0.0),
             reported: (0, 0),
             flush_deadline: None,
+            ime_area: None,
             config,
             applied_guifont: String::new(),
             open_dir,
@@ -681,6 +689,25 @@ impl App {
         if !notation.is_empty() {
             self.rpc
                 .notify("nx_input", vec![Value::from(notation.as_str())]);
+        }
+    }
+
+    /// Push the just-painted caret rect to the window as the IME cursor area, so the
+    /// platform opens the IME candidate window at the caret instead of the window
+    /// origin. The renderer reports the rect in physical pixels (`None` when a
+    /// picker/panel owns the cursor); only a changed rect is forwarded, since the
+    /// platform call is a no-op-but-not-free per frame.
+    fn update_ime_area(&mut self) {
+        let area = self.renderer.as_ref().and_then(Renderer::ime_cursor_area);
+        if area == self.ime_area {
+            return;
+        }
+        self.ime_area = area;
+        if let (Some(w), Some((x, y, cw, ch))) = (self.window.as_ref(), area) {
+            w.set_ime_cursor_area(
+                winit::dpi::PhysicalPosition::new(x, y),
+                winit::dpi::PhysicalSize::new(cw, ch),
+            );
         }
     }
 
@@ -1087,6 +1114,14 @@ impl ApplicationHandler<UserEvent> for App {
                 return;
             }
         }
+        // Enable IME so composed/non-ASCII text input works: dead-key accent
+        // sequences (Option+e e → "é"), AltGr characters, and full IME composition
+        // (CJK, …) reach us as `WindowEvent::Ime(Ime::Commit(..))`. On macOS this is
+        // mandatory — without it dead-key sequences are never combined and the
+        // composed character is dropped, so non-ASCII typing simply doesn't work.
+        // Plain ASCII keys still arrive as `KeyboardInput` (winit only suppresses it
+        // mid-preedit), so this doesn't double-input ordinary keys.
+        window.set_ime_allowed(true);
         self.window = Some(window);
         self.report_size(true);
         // Apply any `guifont` already received before the renderer existed (a
@@ -1212,6 +1247,22 @@ impl ApplicationHandler<UserEvent> for App {
                 }
             }
             WindowEvent::MouseWheel { delta, .. } => self.mouse_wheel(delta),
+            // Composed text from the IME (dead-key accents, AltGr characters, CJK
+            // composition, …) lands here as one commit rather than as `KeyboardInput`
+            // — see `set_ime_allowed` in `resumed`. Feed it through the same
+            // `encode_paste` the clipboard path uses (one notify, literal insertion,
+            // `<` escaped) so the committed characters reach the buffer exactly as
+            // typed. The empty `Preedit` winit sends right before each commit, and any
+            // in-progress preedit, are ignored: macOS draws its own candidate window,
+            // and the final text is what the commit carries.
+            WindowEvent::Ime(Ime::Commit(text)) => {
+                let notation = encode_paste(&text);
+                if !notation.is_empty() {
+                    self.rpc
+                        .notify("nx_input", vec![Value::from(notation.as_str())]);
+                    self.arm_flush_deadline();
+                }
+            }
             WindowEvent::KeyboardInput { event, .. } if event.state == ElementState::Pressed => {
                 // Paste from the system clipboard (Cmd+V / Ctrl+Shift+V /
                 // Shift+Insert), fed through the same `encode_paste` the TUI uses
@@ -1302,6 +1353,7 @@ impl ApplicationHandler<UserEvent> for App {
                         eprintln!("nxvim-gui: render error: {e}");
                     }
                 }
+                self.update_ime_area();
             }
             _ => {}
         }

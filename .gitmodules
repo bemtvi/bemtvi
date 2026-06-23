@@ -4,6 +4,3 @@
 [submodule "vendor/nvim-lspconfig"]
 	path = vendor/nvim-lspconfig
 	url = https://github.com/neovim/nvim-lspconfig
-[submodule "plugins/nxvim-help"]
-	path = plugins/nxvim-help
-	url = git@github.com:davidrios/nxvim-help.git

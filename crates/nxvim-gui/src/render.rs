@@ -28,7 +28,7 @@ use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
-use glyphon::cosmic_text::{Fallback, PlatformFallback};
+use glyphon::cosmic_text::{CacheKeyFlags, Fallback, PlatformFallback};
 use glyphon::{
     fontdb, Attrs, Buffer, Cache, Color, Family, FontSystem, Metrics, Resolution, Shaping,
     SwashCache, TextArea, TextAtlas, TextBounds, TextRenderer, Viewport,
@@ -3156,9 +3156,10 @@ impl Renderer {
     }
 
     /// Shape `segments` into a fresh glyphon buffer (the expensive op the cache
-    /// exists to avoid repeating). Each run carries its own color and — via a bold
-    /// or italic face — its weight/slant, so `b`/`i` highlight attributes select a
-    /// real heavier/slanted glyph (cosmic-text synthesizes one if the family lacks it).
+    /// exists to avoid repeating). Each run carries its own color, a `bold` weight
+    /// (cosmic-text picks the closest weight, synthesizing if needed), and a *synthetic*
+    /// `italic` skew — see the `FAKE_ITALIC` note below for why italic is not a real
+    /// face here.
     fn shape_segments(&mut self, segments: &[Seg]) -> Buffer {
         // Family borrows `fonts`; the buffer borrows `font_system` — disjoint fields,
         // so the two borrows coexist. (The fallback chain lives in `font_system`'s
@@ -3179,7 +3180,15 @@ impl Renderer {
                 attrs = attrs.weight(glyphon::Weight::BOLD);
             }
             if s.italic {
-                attrs = attrs.style(glyphon::Style::Italic);
+                // Synthetic (skewed) italic, not a real italic *face*. Requesting
+                // `Style::Italic` makes cosmic-text's matcher demand an italic face for
+                // every glyph (`Attrs::matches` gates on exact style) — so a CJK/symbol
+                // glyph in an italic comment, which has no italic fallback font, falls
+                // through the entire font set (slow), renders as tofu, and skips
+                // cell-snapping (dragging the rest of the line off-grid). `FAKE_ITALIC`
+                // keeps the regular face — found fast, and snapped by `monospace_width`
+                // since its advance is unchanged — and skews it at raster instead.
+                attrs = attrs.cache_key_flags(CacheKeyFlags::FAKE_ITALIC);
             }
             (s.text.as_str(), attrs)
         });

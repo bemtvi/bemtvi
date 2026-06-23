@@ -117,7 +117,7 @@ impl Default for GuiConfig {
         Self {
             fonts: Vec::new(),
             font_size: 15.0,
-            emoji_scale: 1.0,
+            emoji_scale: 1.2,
         }
     }
 }

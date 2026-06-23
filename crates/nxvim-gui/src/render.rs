@@ -1946,11 +1946,12 @@ impl Renderer {
     /// Paint a run of `%`-format `segments` left-to-right starting at cell
     /// `(ox, row)`: each segment's own background (when set) as a quad, then its
     /// text in its own foreground (falling back to `base_fg`). The char count is the
-    /// cell advance, and each segment's glyphs are **clipped to its own cells** — a
-    /// powerline separator glyph that a (non-`Mono`) Nerd Font renders wider than one
-    /// cell would otherwise bleed past its 1-cell background into the next segment,
-    /// drawing over the neighbour's colour and reading as misaligned. Shared by the
-    /// tabline and the status rows.
+    /// cell advance. Glyphs are **not** clipped to their segment — they render fully,
+    /// like the body text: an over-wide off-grid glyph (a powerline separator, a Nerd
+    /// Font icon) is masked out of the inline run and redrawn as its own placed, scaled
+    /// item by [`Renderer::push_text`], so it fills its slot (and overlaps into the
+    /// neighbour like a powerline separator should) instead of being cut at the cell
+    /// edge. Shared by the tabline and the status rows.
     fn paint_segments(
         &mut self,
         segments: &[StatusSegment],
@@ -1961,6 +1962,7 @@ impl Renderer {
         items: &mut Vec<TextItem>,
     ) {
         let mut col = ox;
+        let full = self.full_bounds();
         for (text, style) in segments {
             let w = text.chars().count() as u16;
             if let Some(bg) = style.as_ref().and_then(|s| s.bg) {
@@ -1970,10 +1972,7 @@ impl Renderer {
             }
             let fg = style.as_ref().and_then(|s| s.fg).unwrap_or(base_fg);
             let pos = self.cell_px(col, row);
-            // Clip to this segment's own cell span so an over-wide glyph cannot bleed
-            // into the next segment (over its background) or shift it.
-            let cell = self.text_bounds(col, row, w.max(1), 1);
-            self.push_plain(items, text, pos, fg, cell);
+            self.push_plain(items, text, pos, fg, full);
             col = col.saturating_add(w);
         }
     }

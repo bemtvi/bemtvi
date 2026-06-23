@@ -19,7 +19,7 @@ use std::time::Duration;
 use nxvim_rpc::{Incoming, Rpc};
 use nxvim_server::ServerInit;
 use nxvim_test_harness::{
-    attach, exec_lua, feed, lines, lua_bool, spawn, start_attached, temp_dir,
+    attach, cursor, exec_lua, feed, lines, lua_bool, spawn, start_attached, temp_dir,
 };
 use tokio::sync::mpsc::UnboundedReceiver;
 
@@ -739,6 +739,56 @@ async fn welcome_untick_excludes_a_plugin() {
     assert!(
         pluginslua.contains("uno") && !pluginslua.contains("dos"),
         "only the ticked plugin is written to plugins.lua (got: {pluginslua:?})"
+    );
+}
+
+// On mount the welcome must land the cursor ON the first item, not above the list:
+// otherwise `move()` clamps the off-list cursor to row 1 and the very first `j`
+// jumps straight to the SECOND item, skipping the first. The placement has to
+// survive the float grab, which lands a tick after mount.
+#[tokio::test]
+async fn welcome_starts_cursor_on_first_item() {
+    let (rpc, _i) = start().await;
+    let src = temp_dir("plug_cursor_src");
+    let repo1 = make_repo(&src, "ichi");
+    let repo2 = make_repo(&src, "nidan");
+    let _cfg = setup_root_and_config(&rpc, "plug_cursor").await;
+
+    exec_lua(
+        &rpc,
+        &format!(
+            "nx.plugins.recommend({{ {{ \"file://{r1}\", name = \"ichi\" }},\n\
+               {{ \"file://{r2}\", name = \"nidan\" }} }})\n\
+             nx.plugins.bootstrap()",
+            r1 = q(&repo1),
+            r2 = q(&repo2)
+        ),
+    )
+    .await;
+
+    assert!(poll_true(&rpc, "return vim.bo.filetype == 'nxpluginswelcome'").await);
+
+    // The first item is at 1-based line WELCOME_HEADER + 1 = 4 (2 intro + 1 blank).
+    let mut landed = false;
+    for _ in 0..200 {
+        if cursor(&rpc).await.0 == 4 {
+            landed = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(
+        landed,
+        "the welcome cursor should start on the first item (line 4); got {:?}",
+        cursor(&rpc).await
+    );
+
+    // And it must STAY there (not get reset back above the list by a late grab/render).
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    assert_eq!(
+        cursor(&rpc).await.0,
+        4,
+        "the welcome cursor should rest on the first item, not drift off the list"
     );
 }
 

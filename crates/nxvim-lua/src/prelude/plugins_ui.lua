@@ -143,18 +143,21 @@ local Welcome = nx.view.component({
     ctx.keymap_set("n", "<Esc>", skip, { desc = "Skip" })
     ctx.keymap_set("n", "q", skip, { desc = "Skip" })
 
-    -- Land on the first item once the lines exist (next tick).
-    nx.schedule(function()
-      ctx.set_cursor(WELCOME_HEADER + 1)
-    end)
-
-    -- Window-local display, set once the window exists (winid lands a tick after
-    -- mount): wrap long lines (the intro / hint run past the float width), and inset
-    -- the content from the border with `padding` for breathing room.
+    -- Once the window exists (winid lands a tick after mount, AFTER the float grab
+    -- has settled), set the window-local display — wrap long lines (the intro / hint
+    -- / descriptions run past the float width) and inset the content from the border
+    -- with `padding` — and land the cursor on the FIRST item. Doing the cursor here
+    -- rather than via `nx.schedule` is what makes it stick: an earlier same-tick
+    -- placement is reset to the top by the grab, so `j` would skip to the 2nd item.
     nx.wait_for(ctx.winid)
       :next(function()
         ctx.wo.wrap = true
         ctx.wo.padding = "1 2"
+        -- Defer the cursor one more tick so it lands AFTER the `padding` relayout,
+        -- which otherwise resets the float's cursor back to the top.
+        nx.on_next_tick(function()
+          ctx.set_cursor(WELCOME_HEADER + 1)
+        end)
       end)
       :catch(function() end)
 

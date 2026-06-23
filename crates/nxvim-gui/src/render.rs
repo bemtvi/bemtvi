@@ -1797,8 +1797,9 @@ impl Renderer {
     }
 
     /// Paint the tabline on the top row: a custom `'tabline'`'s pre-rendered
-    /// segments when set, else the built-in cells (` {count} {label}{+} `, the
-    /// active cell reverse-video) — the GUI port of the TUI's `render_tabline`.
+    /// segments when set, else the built-in cells (` {count} {label}{+} `) themed
+    /// from `TabLine`/`TabLineSel`/`TabLineFill` — the GUI port of the TUI's
+    /// `render_tabline`.
     fn build_tabline(
         &mut self,
         view: &View,
@@ -1806,13 +1807,19 @@ impl Renderer {
         quads: &mut Vec<Quad>,
         items: &mut Vec<TextItem>,
     ) {
-        let base_bg = style_bg(&view.status_line).unwrap_or(0x1a_1a_1a);
-        let base_fg = style_fg(&view.status_line).unwrap_or(DEFAULT_FG);
-        self.fill_row(quads, 0, cols, base_bg);
+        let colors = TablineColors::resolve(view);
+        self.fill_row(quads, 0, cols, colors.fill_bg);
 
         // A custom `'tabline'` already rendered to styled segments: paint verbatim.
         if !view.tabline.is_empty() && !view.tabline_segments.is_empty() {
-            self.paint_segments(&view.tabline_segments, 0, 0, base_fg, quads, items);
+            self.paint_segments(
+                &view.tabline_segments,
+                0,
+                0,
+                colors.inactive_fg,
+                quads,
+                items,
+            );
             return;
         }
 
@@ -1823,17 +1830,17 @@ impl Renderer {
             0,
             0,
             cols,
-            base_bg,
-            base_fg,
+            &colors,
             quads,
             items,
         );
     }
 
-    /// Paint built-in tabline cells (` {count} {label}{+} `, active cell
-    /// reverse-video) starting at cell `(x0, row)`, preceded by an optional bold
-    /// `title` label (the `nx.dock` dock title). Shared by the global (main)
-    /// tabline and each dock's own tabline ([`build_dock_tablines`]).
+    /// Paint built-in tabline cells (` {count} {label}{+} `) starting at cell
+    /// `(x0, row)`, preceded by an optional `title` label (the `nx.dock` dock
+    /// title). Inactive cells use `TabLine`, the active cell `TabLineSel`, each
+    /// resolved (with status-line / reverse-video fallbacks) in `colors`. Shared by
+    /// the global (main) tabline and each dock's own tabline ([`build_dock_tablines`]).
     #[allow(clippy::too_many_arguments)]
     fn build_tab_cells(
         &mut self,
@@ -1843,8 +1850,7 @@ impl Renderer {
         x0: u16,
         row: u16,
         right: u16,
-        base_bg: u32,
-        base_fg: u32,
+        colors: &TablineColors,
         quads: &mut Vec<Quad>,
         items: &mut Vec<TextItem>,
     ) {
@@ -1858,7 +1864,7 @@ impl Renderer {
             let text = format!(" {title} ");
             let w = text.chars().count() as u16;
             let pos = self.cell_px(col, row);
-            self.push_plain(items, &text, pos, base_fg, clip);
+            self.push_plain(items, &text, pos, colors.inactive_fg, clip);
             col = col.saturating_add(w);
         }
         for (i, tab) in tabs.iter().enumerate() {
@@ -1873,17 +1879,21 @@ impl Renderer {
             let modified = if tab.modified { "+" } else { "" };
             let text = format!(" {count}{}{modified} ", tab.label);
             let w = text.chars().count() as u16;
-            // The active cell is reverse-video: the status fg becomes its ground. The
-            // fill is a quad (unscissored), so clamp its width to the strip edge.
-            let fg = if i == current {
+            // A cell's background is a quad (unscissored), so clamp its width to the
+            // strip edge. The active cell always fills (`TabLineSel`); an inactive
+            // cell fills only when `TabLine` carries its own bg, else the bar fill
+            // shows through.
+            let (fg, cell_bg) = if i == current {
+                (colors.active_fg, Some(colors.active_bg))
+            } else {
+                (colors.inactive_fg, colors.inactive_bg)
+            };
+            if let Some(bg) = cell_bg {
                 let fill_w = w.min(right.saturating_sub(col));
                 if fill_w > 0 {
-                    self.fill_cells(quads, col, row, fill_w, base_fg);
+                    self.fill_cells(quads, col, row, fill_w, bg);
                 }
-                base_bg
-            } else {
-                base_fg
-            };
+            }
             let pos = self.cell_px(col, row);
             self.push_plain(items, &text, pos, fg, clip);
             col = col.saturating_add(w);
@@ -1900,11 +1910,10 @@ impl Renderer {
         quads: &mut Vec<Quad>,
         items: &mut Vec<TextItem>,
     ) {
-        let base_bg = style_bg(&view.status_line).unwrap_or(0x1a_1a_1a);
-        let base_fg = style_fg(&view.status_line).unwrap_or(DEFAULT_FG);
+        let colors = TablineColors::resolve(view);
         for &(x0, row, width, rt, present) in bands {
             if present && !rt.tabs.is_empty() {
-                self.fill_cells(quads, x0, row, width, base_bg);
+                self.fill_cells(quads, x0, row, width, colors.fill_bg);
                 self.build_tab_cells(
                     &rt.title,
                     &rt.tabs,
@@ -1912,8 +1921,7 @@ impl Renderer {
                     x0,
                     row,
                     x0 + width,
-                    base_bg,
-                    base_fg,
+                    &colors,
                     quads,
                     items,
                 );
@@ -2335,10 +2343,20 @@ impl Renderer {
         };
         let text_x0 = wx + sign_w + gutter;
 
-        let popup_bg = lighten(style_bg(&view.normal).unwrap_or(DEFAULT_BG), 0x14);
-        let border = lighten(popup_bg, 0x30);
-        let sel_bg = lighten(popup_bg, 0x28);
-        let fg = style_fg(&view.normal).unwrap_or(DEFAULT_FG);
+        // Themed colors (nvim-cmp / telescope groups, resolved server-side), each
+        // falling back to the built-in derived look when its group is undefined: the
+        // popup bg + fg (`Pmenu` / `TelescopeNormal`), the border (`FloatBorder` /
+        // `TelescopeBorder`), the selection (`PmenuSel` / `TelescopeSelection`), and
+        // the matched-character accent (`CmpItemAbbrMatch` / `TelescopeMatching`).
+        let popup_bg = style_bg(&menu.styles.bg)
+            .unwrap_or_else(|| lighten(style_bg(&view.normal).unwrap_or(DEFAULT_BG), 0x14));
+        let border = style_fg(&menu.styles.border).unwrap_or_else(|| lighten(popup_bg, 0x30));
+        let sel_bg = style_bg(&menu.styles.sel).unwrap_or_else(|| lighten(popup_bg, 0x28));
+        let fg = style_fg(&menu.styles.bg)
+            .or_else(|| style_fg(&view.normal))
+            .unwrap_or(DEFAULT_FG);
+        let sel_fg = style_fg(&menu.styles.sel);
+        let prompt_fg = style_fg(&menu.styles.prompt).unwrap_or(fg);
 
         // The completion popup drops its top border + top padding so it sits flush
         // against the line below the cursor, and shifts one cell left so the left
@@ -2422,7 +2440,7 @@ impl Renderer {
                 items,
                 &text,
                 self.cell_px(cx, content_y0 + prompt_y),
-                fg,
+                prompt_fg,
                 full,
             );
             // The separator: a thin horizontal rule across the list column.
@@ -2450,8 +2468,9 @@ impl Renderer {
         // A noselect completion popup highlights no row and scrolls from the top.
         let sel = menu.selected_active.then_some(menu.selected);
         let start = pmenu_start(sel, list_rows as usize);
-        // A warm accent on matched characters, so the fuzzy match reads at a glance.
-        let match_fg = 0x00E5_C07B;
+        // Matched characters use the theme's match group (`CmpItemAbbrMatch` /
+        // `TelescopeMatching`) when defined, else a warm built-in accent.
+        let match_fg = style_fg(&menu.styles.matched).unwrap_or(0x00E5_C07B);
         for r in 0..list_rows {
             let idx = start + r as usize;
             let Some(label) = menu.items.get(idx) else {
@@ -2461,11 +2480,16 @@ impl Renderer {
             // keep the best match (row 0) at the bottom, nearest the command cursor.
             let display_r = if menu.cmdline { list_rows - 1 - r } else { r };
             let row = content_y0 + list_y0 + display_r;
-            if sel == Some(idx) {
+            // The selected row gets the selection background and (when the theme's
+            // selection group carries one) its own foreground.
+            let row_fg = if sel == Some(idx) {
                 self.fill_cells(quads, cx, row, list_w, sel_bg);
-            }
+                sel_fg.unwrap_or(fg)
+            } else {
+                fg
+            };
             let text = pmenu_row(label, "", list_w as usize);
-            self.push_plain(items, &text, self.cell_px(cx, row), fg, full);
+            self.push_plain(items, &text, self.cell_px(cx, row), row_fg, full);
             // Overdraw the matched characters in the accent color (monospace, so
             // char `i` sits at column `cx + i`).
             if let Some(spans) = menu.match_spans.get(idx) {
@@ -2548,8 +2572,14 @@ impl Renderer {
             } else {
                 ((text_x0 + docs.col).saturating_sub(1), wy + docs.row)
             };
+            // The docs float carries its own groups (`CmpDocumentation` /
+            // `CmpDocumentationBorder`, resolved server-side), falling back to the
+            // popup's bg / fg / border when the colorscheme leaves them undefined.
+            let doc_bg = style_bg(&menu.styles.doc).unwrap_or(popup_bg);
+            let doc_fg = style_fg(&menu.styles.doc).unwrap_or(fg);
+            let doc_border = style_fg(&menu.styles.doc_border).unwrap_or(border);
             let (dbw, dbh) = (docs.width + 2, docs.height + 2);
-            self.fill_rect(quads, dbx, dby, dbw, dbh, popup_bg);
+            self.fill_rect(quads, dbx, dby, dbw, dbh, doc_bg);
             self.draw_glyph_border(
                 items,
                 Border::Single,
@@ -2560,8 +2590,8 @@ impl Renderer {
                 dbh,
                 true,
                 true,
-                fg,
-                border,
+                doc_fg,
+                doc_border,
             );
             let (dcx, dcy) = (dbx + 1, dby + 1);
             for (i, line) in docs.lines.iter().enumerate() {
@@ -2569,7 +2599,13 @@ impl Renderer {
                     break;
                 }
                 let text = pmenu_row(line, "", docs.width as usize);
-                self.push_plain(items, &text, self.cell_px(dcx, dcy + i as u16), fg, full);
+                self.push_plain(
+                    items,
+                    &text,
+                    self.cell_px(dcx, dcy + i as u16),
+                    doc_fg,
+                    full,
+                );
             }
         }
     }
@@ -4002,6 +4038,41 @@ fn style_fg(s: &Option<Style>) -> Option<u32> {
 }
 fn style_bg(s: &Option<Style>) -> Option<u32> {
     s.as_ref().and_then(|st| st.bg)
+}
+
+/// Resolved colors for the built-in tabline cells, from the theme's `TabLine`
+/// (inactive cells + title), `TabLineSel` (active cell) and `TabLineFill` (the bar
+/// background) groups. Each falls back to the status-line tint / reverse-video when
+/// the colorscheme leaves the group undefined, so the tabline stays drawn either way.
+#[derive(Clone, Copy)]
+struct TablineColors {
+    /// The bar background (and the ground for the title / inactive cells).
+    fill_bg: u32,
+    /// Inactive tab + title foreground.
+    inactive_fg: u32,
+    /// Inactive tab background, painted as a per-cell quad only when the theme gives
+    /// `TabLine` its own bg distinct from the bar fill (`None` ⇒ the fill shows through).
+    inactive_bg: Option<u32>,
+    /// Active tab foreground.
+    active_fg: u32,
+    /// Active tab background (always a filled cell).
+    active_bg: u32,
+}
+
+impl TablineColors {
+    fn resolve(view: &View) -> Self {
+        let status_bg = style_bg(&view.status_line).unwrap_or(0x1a_1a_1a);
+        let status_fg = style_fg(&view.status_line).unwrap_or(DEFAULT_FG);
+        Self {
+            fill_bg: style_bg(&view.tabline_fill).unwrap_or(status_bg),
+            inactive_fg: style_fg(&view.tabline_style).unwrap_or(status_fg),
+            inactive_bg: style_bg(&view.tabline_style),
+            // Without a `TabLineSel`, the active cell is the reverse-video of the
+            // status line (status fg becomes its ground), matching the old look.
+            active_fg: style_fg(&view.tabline_sel).unwrap_or(status_bg),
+            active_bg: style_bg(&view.tabline_sel).unwrap_or(status_fg),
+        }
+    }
 }
 
 /// 0xRRGGBB → opaque glyphon [`Color`].

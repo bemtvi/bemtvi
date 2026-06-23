@@ -49,6 +49,10 @@ hl(0, "ColorColumn",  { bg = p.cursor_line })
 hl(0, "MatchParen",   { fg = p.cyan, bold = true })
 hl(0, "Pmenu",        { fg = p.fg, bg = p.bg_dark })
 hl(0, "PmenuSel",     { fg = p.bg, bg = p.blue })
+-- The accent the completion popup / picker paints matched (fuzzy-hit) characters
+-- with, the terminus of the `CmpItemAbbrMatch` / `TelescopeMatching` fallback chain
+-- so the built-in scheme themes them even without those plugin groups defined.
+hl(0, "Special",      { fg = p.cyan })
 hl(0, "Title",        { fg = p.blue, bold = true })
 hl(0, "Directory",    { fg = p.blue })
 hl(0, "ErrorMsg",     { fg = p.red })

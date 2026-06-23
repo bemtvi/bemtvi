@@ -81,6 +81,66 @@ fn menu_of(map: &[(Value, Value)]) -> Vec<(Value, Value)> {
     }
 }
 
+/// Resolve the `menu.styles[region]` palette id against the frame's top-level
+/// `styles` palette and return its `attr` (`"fg"` / `"bg"`) color as `0xRRGGBB`,
+/// or `None` when the region (or attribute) is absent.
+fn menu_style_color(map: &[(Value, Value)], region: &str, attr: &str) -> Option<u32> {
+    let menu = match map_get(map, "menu") {
+        Some(Value::Map(m)) => m,
+        _ => return None,
+    };
+    let styles = match map_get(menu, "styles") {
+        Some(Value::Map(s)) => s,
+        _ => return None,
+    };
+    let id = map_get(styles, region)?.as_u64()? as usize;
+    let palette = match map_get(map, "styles") {
+        Some(Value::Array(a)) => a,
+        _ => return None,
+    };
+    match palette.get(id)? {
+        Value::Map(style) => map_get(style, attr)?.as_u64().map(|n| n as u32),
+        _ => None,
+    }
+}
+
+/// The fuzzy picker resolves its colors from telescope's highlight groups so a
+/// colorscheme themes it automatically: `TelescopeSelection` tints the selected
+/// row, `TelescopeMatching` the matched characters, `TelescopeBorder` the box. The
+/// server resolves them to `menu.styles` palette ids (each with a fallback chain),
+/// so no client hardcodes the popup look.
+#[tokio::test]
+async fn picker_styles_resolve_from_telescope_groups() {
+    let dir = temp_dir("picker_telescope_style");
+    let init = format!(
+        "vim.api.nvim_set_hl(0, 'TelescopeSelection', {{ bg = '#313244' }})\n\
+         vim.api.nvim_set_hl(0, 'TelescopeMatching',  {{ fg = '#f9e2af', bold = true }})\n\
+         vim.api.nvim_set_hl(0, 'TelescopeBorder',    {{ fg = '#585b70' }})\n{STATIC_SRC}"
+    );
+    let (rpc, mut incoming) = start(&dir, &init).await;
+
+    exec_lua(&rpc, "nx.picker.open('fruits')").await;
+    poll_menu(&rpc, &mut incoming).await.expect("menu opens");
+    feed(&rpc, "ap");
+    let map = poll_menu(&rpc, &mut incoming).await.expect("filtered menu");
+
+    assert_eq!(
+        menu_style_color(&map, "sel", "bg"),
+        Some(0x0031_3244),
+        "the selected row uses TelescopeSelection's bg"
+    );
+    assert_eq!(
+        menu_style_color(&map, "match", "fg"),
+        Some(0x00f9_e2af),
+        "matched characters use TelescopeMatching's fg"
+    );
+    assert_eq!(
+        menu_style_color(&map, "border", "fg"),
+        Some(0x0058_5b70),
+        "the box border uses TelescopeBorder's fg"
+    );
+}
+
 /// The menu's visible row labels, in order.
 fn menu_items(menu: &[(Value, Value)]) -> Vec<String> {
     match map_get(menu, "items") {

@@ -273,6 +273,44 @@ async fn float_chrome_groups_resolve_into_the_frame_chrome() {
     assert_eq!(hl_color(style_of("float_title"), "fg"), Some(hex("cba6f7")));
 }
 
+#[tokio::test]
+async fn tabline_chrome_groups_resolve_into_the_frame_chrome() {
+    // The tabline highlight groups (TabLine / TabLineSel / TabLineFill) a
+    // colorscheme defines must reach the client as resolved chrome styles, the
+    // same way StatusLine does — otherwise the built-in tabline falls back to the
+    // status-line colors (or a bare default) and stays unthemed regardless of the
+    // theme.
+    let dir = temp_dir("tabline_chrome");
+    std::fs::create_dir_all(dir.join("colors")).expect("create colors dir");
+    std::fs::write(
+        dir.join("colors").join("cat.lua"),
+        "vim.api.nvim_set_hl(0, 'TabLine',     { fg = '#a6adc8', bg = '#181825' })\n\
+         vim.api.nvim_set_hl(0, 'TabLineSel',  { fg = '#1e1e2e', bg = '#cba6f7' })\n\
+         vim.api.nvim_set_hl(0, 'TabLineFill', { fg = '#6c7086', bg = '#11111b' })\n",
+    )
+    .expect("write colorscheme");
+    let (rpc, mut incoming) = start_with_config(&dir, "vim.cmd.colorscheme('cat')\n").await;
+
+    let map = redraw_after(&rpc, &mut incoming, "").await;
+    let chrome = field(&map, "chrome").expect("chrome map");
+    let styles = field(&map, "styles")
+        .and_then(Value::as_array)
+        .expect("styles palette");
+    let style_of = |key: &str| -> &[(Value, Value)] {
+        let id = chrome_id(chrome, key).unwrap_or_else(|| panic!("{key} resolved in chrome"));
+        match &styles[id] {
+            Value::Map(m) => m.as_slice(),
+            _ => panic!("style entry is not a map"),
+        }
+    };
+    assert_eq!(hl_color(style_of("tabline"), "bg"), Some(hex("181825")));
+    assert_eq!(hl_color(style_of("tabline_sel"), "bg"), Some(hex("cba6f7")));
+    assert_eq!(
+        hl_color(style_of("tabline_fill"), "bg"),
+        Some(hex("11111b"))
+    );
+}
+
 /// The `style_id` a redraw's `chrome` map assigns to region `key`, if resolved.
 fn chrome_id(chrome: &Value, key: &str) -> Option<usize> {
     match chrome {

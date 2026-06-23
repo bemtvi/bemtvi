@@ -530,6 +530,61 @@ async fn plugin_command_appears_in_wildmenu() {
     );
 }
 
+/// The `width` of the menu's docs float (its content column count), or 0 if absent.
+fn menu_docs_width(map: &[(Value, Value)]) -> usize {
+    let Some(Value::Map(menu)) = map_get(map, "menu") else {
+        return 0;
+    };
+    let Some(Value::Map(docs)) = map_get(menu, "docs") else {
+        return 0;
+    };
+    map_get(docs, "width").and_then(Value::as_u64).unwrap_or(0) as usize
+}
+
+#[tokio::test]
+async fn cmdline_docs_wrap_long_lines_to_the_box_width() {
+    let dir = temp_dir("cmdcomplete_wrap");
+    // A command whose description is one long line (no internal newlines), wider than
+    // the docs float — it must word-wrap within the box instead of being cut off at
+    // the right border.
+    let long = "Lorem ipsum dolor sit amet consectetur adipiscing elit sed do eiusmod \
+                tempor incididunt ut labore et dolore magna aliqua ut enim ad minim veniam";
+    let init = format!(
+        "nx.cmdline_complete.setup {{}}\n\
+         nx.user_command.create('Wrapcmd', function() end, {{ desc = '{long}' }})"
+    );
+    let (rpc, mut incoming) = start(&dir, &init).await;
+
+    feed(&rpc, ":Wrapcmd<Tab>");
+    poll_menu(&rpc, &mut incoming).await.expect("menu");
+    feed(&rpc, "<Tab>");
+    let map = wait_redraw(&mut incoming, |m| menu_sel_is(m, 0, true)).await;
+    assert_eq!(menu_items(&map)[0], "Wrapcmd");
+
+    let docs = menu_docs(&map).expect("docs float for the selected command");
+    let width = menu_docs_width(&map);
+    assert!(width > 0, "the docs float has a width");
+    // Every wrapped line fits within the box width — nothing is cut off.
+    assert!(
+        docs.iter().all(|l| l.chars().count() <= width),
+        "every line wraps within width {width}: {docs:?}"
+    );
+    // The long single-line description spans several wrapped rows (synopsis + blank +
+    // the wrapped body), proving it wrapped rather than being windowed to one line.
+    assert!(
+        docs.len() > 3,
+        "the long description wrapped onto multiple rows: {docs:?}"
+    );
+    // No row breaks a word in half — wrapping is word-aware (every token is intact).
+    let joined = docs.join(" ");
+    for word in ["consectetur", "adipiscing", "incididunt", "aliqua"] {
+        assert!(
+            joined.contains(word),
+            "word `{word}` survived wrapping: {docs:?}"
+        );
+    }
+}
+
 #[tokio::test]
 async fn plugin_command_without_desc_shows_synopsis_only() {
     let dir = temp_dir("cmdcomplete");

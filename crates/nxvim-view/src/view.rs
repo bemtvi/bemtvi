@@ -475,6 +475,14 @@ pub struct View {
     pub search_style: Option<Style>,
     pub incsearch_style: Option<Style>,
     pub status_line: Option<Style>,
+    /// Tabline chrome (`TabLine` / `TabLineSel` / `TabLineFill`): the inactive tab
+    /// cells, the active tab cell, and the bar's fill (the strip past the last cell,
+    /// plus a dock's title). `None` when the colorscheme leaves the group undefined —
+    /// the client then keeps its built-in tabline look (the status-line tint / a
+    /// reverse-video active cell). Global — one tabline theme for the whole editor.
+    pub tabline_style: Option<Style>,
+    pub tabline_sel: Option<Style>,
+    pub tabline_fill: Option<Style>,
     /// The `ErrorMsg` look — the red foreground the client paints an error message
     /// line with (`message_error`). `None` when the colorscheme leaves it undefined,
     /// so the client falls back to a plain red foreground.
@@ -539,6 +547,11 @@ pub struct PmenuData {
 #[derive(Clone)]
 pub struct MenuData {
     pub items: Vec<String>,
+    /// The widget's themeable colors, resolved server-side from nvim-cmp /
+    /// telescope highlight groups (see [`MenuStyles`]). Each region is `None` when
+    /// the colorscheme leaves its group chain undefined — the client then keeps its
+    /// built-in look for that region.
+    pub styles: MenuStyles,
     pub selected: usize,
     /// Whether `selected` is an active selection to highlight. `false` for a
     /// freshly opened completion popup (noselect) — no row is highlighted until the
@@ -587,6 +600,33 @@ pub struct MenuData {
     /// window-relative); see the client render. `None` for a `select` / picker or a
     /// row with no docs — the box then stands alone.
     pub docs: Option<MenuDocs>,
+}
+
+/// The menu/picker widget's themeable colors, resolved server-side from the
+/// well-known plugin highlight groups (nvim-cmp's `Pmenu`/`PmenuSel`/
+/// `CmpItemAbbrMatch` for the completion popup; telescope's `Telescope*` for a
+/// picker / `select` list), each with a fallback chain ending in a core chrome
+/// group. A field is `None` when the whole chain is undefined, so the client paints
+/// that region with its built-in look. Mirrors the `menu.styles` redraw submap.
+#[derive(Clone, Default)]
+pub struct MenuStyles {
+    /// The popup background (`Pmenu` / `TelescopeNormal` → `NormalFloat`).
+    pub bg: Option<Style>,
+    /// The selected row's background (`PmenuSel` / `TelescopeSelection` → `Visual`).
+    pub sel: Option<Style>,
+    /// The matched (fuzzy-hit) characters (`CmpItemAbbrMatch` / `TelescopeMatching`).
+    pub matched: Option<Style>,
+    /// The box border (`FloatBorder` / `TelescopeBorder`).
+    pub border: Option<Style>,
+    /// The picker prompt prefix (`TelescopePromptPrefix`); `None` for completion.
+    pub prompt: Option<Style>,
+    /// The picker title (`TelescopeTitle` → `FloatTitle`); `None` for completion.
+    pub title: Option<Style>,
+    /// The docs sidebar's body (`CmpDocumentation` → `Pmenu` → `NormalFloat`) — the
+    /// float beside the completion popup / cmdline wildmenu showing documentation.
+    pub doc: Option<Style>,
+    /// The docs sidebar's border (`CmpDocumentationBorder` → `FloatBorder`).
+    pub doc_border: Option<Style>,
 }
 
 /// The list-less content float mirrored from the redraw (`nx.ui.float`; LSP hover
@@ -735,6 +775,9 @@ impl View {
         self.search_style = chrome("search");
         self.incsearch_style = chrome("incsearch");
         self.status_line = chrome("status_line");
+        self.tabline_style = chrome("tabline");
+        self.tabline_sel = chrome("tabline_sel");
+        self.tabline_fill = chrome("tabline_fill");
         self.error_msg = chrome("error_msg");
         self.end_of_buffer = chrome("end_of_buffer");
         self.float_border = chrome("float_border");
@@ -781,6 +824,20 @@ impl View {
         self.menu = match map_get(map, "menu") {
             Some(Value::Map(m)) => Some(MenuData {
                 items: map_str_array(m, "items"),
+                styles: {
+                    let s = map_get(m, "styles");
+                    let region = |key| chrome_style(s, key, &self.styles);
+                    MenuStyles {
+                        bg: region("bg"),
+                        sel: region("sel"),
+                        matched: region("match"),
+                        border: region("border"),
+                        prompt: region("prompt"),
+                        title: region("title"),
+                        doc: region("doc"),
+                        doc_border: region("doc_border"),
+                    }
+                },
                 selected: map_u64(m, "selected") as usize,
                 selected_active: map_get(m, "selected_active").and_then(Value::as_bool)
                     != Some(false),

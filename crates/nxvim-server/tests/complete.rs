@@ -106,6 +106,69 @@ fn assert_no_query(menu: &[(Value, Value)]) {
     );
 }
 
+/// Resolve the `menu.styles[region]` palette id against the frame's top-level
+/// `styles` palette and return its `attr` (`"fg"` / `"bg"`) color as `0xRRGGBB`.
+fn menu_style_color(map: &[(Value, Value)], region: &str, attr: &str) -> Option<u32> {
+    let menu = match map_get(map, "menu") {
+        Some(Value::Map(m)) => m,
+        _ => return None,
+    };
+    let styles = match map_get(menu, "styles") {
+        Some(Value::Map(s)) => s,
+        _ => return None,
+    };
+    let id = map_get(styles, region)?.as_u64()? as usize;
+    let palette = match map_get(map, "styles") {
+        Some(Value::Array(a)) => a,
+        _ => return None,
+    };
+    match palette.get(id)? {
+        Value::Map(style) => map_get(style, attr)?.as_u64().map(|n| n as u32),
+        _ => None,
+    }
+}
+
+/// The completion popup resolves its colors from nvim-cmp's highlight groups so a
+/// colorscheme themes it automatically: `Pmenu`/`PmenuSel` the popup + selection,
+/// `CmpItemAbbrMatch` the matched characters. The server resolves them to
+/// `menu.styles` palette ids (each with a fallback chain), so no client hardcodes
+/// the popup look.
+#[tokio::test]
+async fn completion_styles_resolve_from_cmp_groups() {
+    let dir = temp_dir("complete_cmp_style");
+    let init = format!(
+        "vim.api.nvim_set_hl(0, 'Pmenu',            {{ bg = '#1e1e2e' }})\n\
+         vim.api.nvim_set_hl(0, 'PmenuSel',         {{ bg = '#45475a' }})\n\
+         vim.api.nvim_set_hl(0, 'CmpItemAbbrMatch', {{ fg = '#89b4fa', bold = true }})\n\
+         vim.api.nvim_set_hl(0, 'CmpDocumentation', {{ bg = '#11111b' }})\n{BUFFER_INIT}"
+    );
+    let (rpc, mut incoming) = start(&dir, &init).await;
+
+    feed(&rpc, "ihello he");
+    let map = poll_menu(&rpc, &mut incoming).await.expect("popup opens");
+
+    assert_eq!(
+        menu_style_color(&map, "bg", "bg"),
+        Some(0x001e_1e2e),
+        "the popup background uses Pmenu's bg"
+    );
+    assert_eq!(
+        menu_style_color(&map, "sel", "bg"),
+        Some(0x0045_475a),
+        "the selected row uses PmenuSel's bg"
+    );
+    assert_eq!(
+        menu_style_color(&map, "match", "fg"),
+        Some(0x0089_b4fa),
+        "matched characters use CmpItemAbbrMatch's fg"
+    );
+    assert_eq!(
+        menu_style_color(&map, "doc", "bg"),
+        Some(0x0011_111b),
+        "the docs sidebar uses CmpDocumentation's bg"
+    );
+}
+
 #[tokio::test]
 async fn buffer_completion_opens_then_accepts_without_touching_the_buffer_until_accept() {
     let dir = temp_dir("complete_open");

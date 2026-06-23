@@ -980,6 +980,63 @@ impl EditHost {
         Value::Map(entries)
     }
 
+    /// Resolve the first defined highlight group in `groups` to a palette id
+    /// (interning it into `styles`), or `None` when none of them is themed. Gives a
+    /// widget region a fallback chain — e.g. `TelescopeSelection` → `PmenuSel` →
+    /// `Visual` — so it themes under a plugin's groups when present and a sensible
+    /// built-in group otherwise.
+    fn resolve_region(&self, groups: &[&str], styles: &mut StyleTable) -> Option<u64> {
+        groups
+            .iter()
+            .find_map(|g| self.editor.highlights.resolve(g))
+            .map(|s| styles.intern(s) as u64)
+    }
+
+    /// The themeable colors of the menu/picker widget, resolved from the well-known
+    /// plugin highlight groups so a colorscheme themes the popup automatically: the
+    /// insert-completion popup follows **nvim-cmp** (`Pmenu` / `PmenuSel` /
+    /// `CmpItemAbbrMatch`), a picker / `select` list follows **telescope**
+    /// (`Telescope*`). Each region falls through a chain ending in a group the
+    /// built-in scheme defines, and is emitted only when something resolves; the
+    /// client keeps its built-in look for an absent region. Returned as a
+    /// `region -> style_id` map (empty ⇒ no key emitted by the caller).
+    fn menu_styles(&self, completion: bool, styles: &mut StyleTable) -> Value {
+        // `(wire key, group fallback chain)`. Completion ↔ cmp groups, picker ↔
+        // telescope groups; both bottom out at the core chrome the built-in scheme
+        // ships so the popup is themed even under `:colorscheme nxvim`.
+        let chains: &[(&str, &[&str])] = if completion {
+            &[
+                ("bg", &["Pmenu", "NormalFloat"]),
+                ("sel", &["PmenuSel", "Visual"]),
+                ("match", &["CmpItemAbbrMatch", "Special"]),
+                ("border", &["FloatBorder"]),
+                // The docs sidebar beside the popup (LSP documentation / cmdline help):
+                // nvim-cmp's dedicated documentation-window groups, else the popup look.
+                ("doc", &["CmpDocumentation", "Pmenu", "NormalFloat"]),
+                ("doc_border", &["CmpDocumentationBorder", "FloatBorder"]),
+            ]
+        } else {
+            &[
+                ("bg", &["TelescopeNormal", "NormalFloat", "Pmenu"]),
+                ("sel", &["TelescopeSelection", "PmenuSel", "Visual"]),
+                ("match", &["TelescopeMatching", "Special"]),
+                ("border", &["TelescopeBorder", "FloatBorder"]),
+                ("prompt", &["TelescopePromptPrefix", "Special"]),
+                ("title", &["TelescopeTitle", "FloatTitle"]),
+                ("doc", &["TelescopePreviewNormal", "NormalFloat", "Pmenu"]),
+                ("doc_border", &["TelescopePreviewBorder", "FloatBorder"]),
+            ]
+        };
+        let entries = chains
+            .iter()
+            .filter_map(|(key, groups)| {
+                self.resolve_region(groups, styles)
+                    .map(|id| (Value::from(*key), Value::from(id)))
+            })
+            .collect();
+        Value::Map(entries)
+    }
+
     /// A window's `winhighlight` overrides to the global chrome map: for each chrome
     /// key whose group this window *renames* (e.g. `Normal:NormalSB` renames the
     /// `normal` key's `Normal`), the remapped group's resolved style id — so the
@@ -1023,6 +1080,9 @@ const CHROME: &[(&str, &str)] = &[
     ("search", "Search"),
     ("incsearch", "IncSearch"),
     ("status_line", "StatusLine"),
+    ("tabline", "TabLine"),
+    ("tabline_sel", "TabLineSel"),
+    ("tabline_fill", "TabLineFill"),
     ("error_msg", "ErrorMsg"),
     ("end_of_buffer", "EndOfBuffer"),
     ("float_border", "FloatBorder"),
@@ -1175,6 +1235,58 @@ fn chunk_runs_text(value: &Value) -> String {
 /// Encode a tab page as a `{ label, modified, window_count }` map for the redraw
 /// map's `tabline` array. The client formats the cell and highlights the active
 /// one (carried separately as `current_tab`).
+/// Word-wrap each of `lines` to at most `width` columns, breaking on whitespace and
+/// hard-breaking a single word longer than `width`. Blank lines are preserved (so a
+/// synopsis / blank / body layout keeps its paragraph break). Used by the cmdline
+/// wildmenu docs float so a long help line flows onto several rows instead of being
+/// cut off at the box's right border. Column = `char` count (the help text is ASCII).
+fn wrap_doc_lines(lines: &[String], width: usize) -> Vec<String> {
+    if width == 0 {
+        return lines.to_vec();
+    }
+    let mut out = Vec::with_capacity(lines.len());
+    // Push `word` onto the wrap output, hard-breaking it into `width`-sized chunks when
+    // it alone overflows the box (a URL / long identifier). Returns the trailing
+    // remainder that becomes the current in-progress row.
+    let break_long = |out: &mut Vec<String>, word: &str| -> String {
+        let mut chars: Vec<char> = word.chars().collect();
+        while chars.len() > width {
+            out.push(chars[..width].iter().collect());
+            chars.drain(..width);
+        }
+        chars.iter().collect()
+    };
+    for line in lines {
+        if line.trim().is_empty() {
+            out.push(String::new());
+            continue;
+        }
+        let mut cur = String::new();
+        for word in line.split_whitespace() {
+            let ww = word.chars().count();
+            if cur.is_empty() {
+                cur = if ww <= width {
+                    word.to_string()
+                } else {
+                    break_long(&mut out, word)
+                };
+            } else if cur.chars().count() + 1 + ww <= width {
+                cur.push(' ');
+                cur.push_str(word);
+            } else {
+                out.push(std::mem::take(&mut cur));
+                cur = if ww <= width {
+                    word.to_string()
+                } else {
+                    break_long(&mut out, word)
+                };
+            }
+        }
+        out.push(cur);
+    }
+    out
+}
+
 fn tab_value(tab: &TabView) -> Value {
     Value::Map(vec![
         (Value::from("label"), Value::from(tab.label.as_str())),
@@ -1526,6 +1638,15 @@ impl EditHost {
             (Value::from("match_spans"), match_spans),
             (Value::from("marked"), marked),
         ];
+        // Themeable colors for the widget (bg / selection / matched chars / border,
+        // plus prompt + title for a picker), resolved from nvim-cmp / telescope
+        // groups. The completion popup and the command-line wildmenu follow cmp; a
+        // picker / `select` list follows telescope.
+        let completion = m.completion || matches!(m.placement, MenuPlacement::Cmdline);
+        let menu_styles = self.menu_styles(completion, styles);
+        if matches!(&menu_styles, Value::Map(m) if !m.is_empty()) {
+            map.push((Value::from("styles"), menu_styles));
+        }
         // The completion popup omits its top border so it sits flush with the line
         // below the cursor. Absent ⇒ a full border (the `select` / picker default).
         if m.completion {
@@ -1745,7 +1866,7 @@ impl EditHost {
         if lines.is_empty() {
             return None;
         }
-        /// Cap the docs float's content width (a long line is windowed, not hard-cut).
+        /// Cap the docs float's content width.
         const MAX_DOCS_W: usize = 60;
         /// Cap its height so a long help text can't tower over the wildmenu.
         const MAX_DOCS_H: usize = 12;
@@ -1765,14 +1886,17 @@ impl EditHost {
             let w = content_w.min(col.saturating_sub(3)).max(1);
             (col.saturating_sub(2 + w), w)
         };
+        // Word-wrap the help text to the resolved box width so a long line flows onto
+        // several rows instead of being cut off at the right border (`wrap=true`).
+        let wrapped = wrap_doc_lines(&lines, docs_w);
         // Bottom-align to the box: cap the height to the rows above the box's content
         // bottom (`row + height`), reserving one for the float's own bottom border.
-        let docs_h = lines
+        let docs_h = wrapped
             .len()
             .min(MAX_DOCS_H)
             .min((row + height).saturating_sub(1).max(1));
         let docs_row = (row + height).saturating_sub(docs_h + 1);
-        let shown = &lines[..docs_h.min(lines.len())];
+        let shown = &wrapped[..docs_h.min(wrapped.len())];
         Some(Value::Map(vec![
             (Value::from("lines"), display_lines_value(shown)),
             (Value::from("row"), Value::from(docs_row as u64)),

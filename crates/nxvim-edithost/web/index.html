@@ -1827,9 +1827,29 @@
       const boxX = menu.cmdline ? rect.x + menu.col : rect.x + menu.col - leftShift;
       const boxY = menu.cmdline ? Math.max(tablineRows, cmdRow - outerH) : serverY;
       const cmdShift = boxY - serverY;
+      // Themed colors (nvim-cmp / telescope groups, resolved server-side into the
+      // `menu.styles` palette ids): the box bg + fg, the border, the selected row, the
+      // matched chars, the prompt. Each is null when the colorscheme leaves its group
+      // undefined — the popup then keeps its built-in CSS look (the `.pmenu*` classes).
+      const ms = menu.styles || {};
+      const mst = (k) => (typeof ms[k] === "number" ? paletteStyle(ms[k]) : null);
+      const sBg = mst("bg"), sSel = mst("sel"), sMatch = mst("match"), sBorder = mst("border"), sPrompt = mst("prompt");
+      const bgCss = sBg && cssColor(sBg.bg), fgCss = sBg && cssColor(sBg.fg);
+      const borderCss = sBorder && cssColor(sBorder.fg);
+      // Apply the selected-row look: the theme's selection style when defined, else the
+      // built-in `.pmenu-sel` class. Shared by the list rows + the preview header / loc.
+      const applySel = (el) => {
+        if (sSel) {
+          if (sSel.bg != null) el.style.background = cssColor(sSel.bg);
+          if (sSel.fg != null) el.style.color = cssColor(sSel.fg);
+        } else {
+          el.classList.add("pmenu-sel");
+        }
+      };
       // The shared single-line glyph border around the list (+ optional preview pane);
       // content sits one cell inside (and one down when there's a top edge).
-      const { cx, cy } = popupChrome(boxX, boxY, menu.width, boxRows, { top, bottom });
+      const { cx, cy } = popupChrome(boxX, boxY, menu.width, boxRows,
+        { top, bottom, bg: bgCss || undefined, borderColor: borderCss || undefined });
       // A noselect completion popup (`selected_active === false`) highlights no row
       // and scrolls from the top.
       const selActive = menu.selected_active !== false;
@@ -1837,11 +1857,14 @@
       const start = selActive && menu.selected >= listRows ? first : 0;
       const box = document.createElement("div");
       box.className = "pmenu";
+      if (bgCss) box.style.background = bgCss;
+      if (fgCss) box.style.color = fgCss;
       place(box, cx, cy, listW, boxRows);
       if (hasPrompt) {
         const text = ("> " + menu.query).slice(0, listW).padEnd(listW);
         const promptEl = document.createElement("div");
-        promptEl.className = "row pmenu-prompt";
+        promptEl.className = "row" + (sPrompt ? "" : " pmenu-prompt");
+        if (sPrompt && sPrompt.fg != null) promptEl.style.color = cssColor(sPrompt.fg);
         promptEl.style.width = listW * cw + "px";
         promptEl.style.fontWeight = "bold";
         promptEl.textContent = text;
@@ -1852,7 +1875,8 @@
         const idx = start + i;
         const label = String(menu.items[idx] ?? "");
         const rowEl = document.createElement("div");
-        rowEl.className = "row" + (selActive && idx === menu.selected ? " pmenu-sel" : "");
+        rowEl.className = "row";
+        if (selActive && idx === menu.selected) applySel(rowEl);
         rowEl.style.width = listW * cw + "px";
         // Bold + accent the matched characters (the fuzzy match), per the server's
         // char-based spans; plain text when this picker/select has no spans.
@@ -1865,7 +1889,8 @@
             const matched = spans.some(([s, e]) => ci >= s && ci < e);
             if (matched) {
               const m = document.createElement("span");
-              m.className = "pmenu-match";
+              if (sMatch) m.setAttribute("style", styleToCss(sMatch));
+              else m.className = "pmenu-match";
               m.textContent = chr;
               rowEl.appendChild(m);
             } else {
@@ -1893,9 +1918,12 @@
         appendGlyphVRule(cx + listW, cy, boxRows);
         const pre = document.createElement("div");
         pre.className = "pmenu";
+        if (bgCss) pre.style.background = bgCss;
+        if (fgCss) pre.style.color = fgCss;
         place(pre, cx + listW + 1, cy, previewW, boxRows);
         const header = document.createElement("div");
-        header.className = "row pmenu-sel";
+        header.className = "row";
+        applySel(header);
         header.style.width = previewW * cw + "px";
         header.textContent = String(pv.title ?? "").slice(0, previewW).padEnd(previewW);
         pre.appendChild(header);
@@ -1904,7 +1932,8 @@
         for (let i = 0; i < menu.height - 1; i++) {
           const rowEl = document.createElement("div");
           const isLoc = loc && loc[0] === i;
-          rowEl.className = "row" + (isLoc ? " pmenu-sel" : "");
+          rowEl.className = "row";
+          if (isLoc) applySel(rowEl);
           rowEl.style.width = previewW * cw + "px";
           // Colour each char by its tree-sitter span (Phase 3b) via the same
           // `cellBaseCss` the window text uses (no diagnostics in a preview); empty
@@ -1937,10 +1966,19 @@
       // grown from a `cmd_area` like the cell-grid clients.
       if (menu.docs) {
         const d = menu.docs;
+        // The docs float themes from its own groups (`CmpDocumentation` /
+        // `CmpDocumentationBorder`, resolved server-side), falling back to the
+        // built-in `.pmenu-doc` CSS when the colorscheme leaves them undefined.
+        const sDoc = mst("doc"), sDocBorder = mst("doc_border");
+        const docBg = sDoc && cssColor(sDoc.bg), docFg = sDoc && cssColor(sDoc.fg);
+        const docBorderCss = sDocBorder && cssColor(sDocBorder.fg);
         const { cx: dcx, cy: dcy } = popupChrome(
-          rect.x + d.col, tablineRows + rect.y + d.row + cmdShift, d.width, d.height);
+          rect.x + d.col, tablineRows + rect.y + d.row + cmdShift, d.width, d.height,
+          { bg: docBg || undefined, borderColor: docBorderCss || undefined });
         const docBox = document.createElement("div");
         docBox.className = "pmenu-doc";
+        if (docBg) docBox.style.background = docBg;
+        if (docFg) docBox.style.color = docFg;
         place(docBox, dcx, dcy, d.width, d.height);
         for (const l of d.lines) {
           const rowEl = document.createElement("div");
@@ -2133,13 +2171,28 @@
       el.style.left = x * cw + "px";
       el.style.top = y * ch + "px";
       el.style.width = width * cw + "px";
-      let s = title ? ` ${title} ` : "";
+      // Theme from the colorscheme's tabline chrome when defined: TabLineFill paints
+      // the bar background (and its trailing gap + the dock title), TabLine the
+      // inactive tabs, TabLineSel the active one. When the theme leaves these unset
+      // (the pure-wasm build sends no tabline chrome) the spans inherit the base
+      // `.statusline` look, so the built-in tabline still draws.
+      const fill = chromeStyle("tabline_fill");
+      const tab = chromeStyle("tabline");
+      const sel = chromeStyle("tabline_sel");
+      if (fill?.bg != null) el.style.background = cssColor(fill.bg);
+      if (fill?.fg != null) el.style.color = cssColor(fill.fg);
+      let html = "";
+      const span = (text, st) => {
+        const css = chromeCss(st);
+        html += `<span${css ? ` style="${css}"` : ""}>${escapeHtml(text)}</span>`;
+      };
+      if (title) span(` ${title} `, fill);
       tabs.forEach((t, i) => {
         const count = t.window_count > 1 ? t.window_count + " " : "";
         const mark = i === current ? "▸" : " ";
-        s += ` ${mark}${count}${t.label}${t.modified ? "+" : ""} `;
+        span(` ${mark}${count}${t.label}${t.modified ? "+" : ""} `, i === current ? sel : tab);
       });
-      el.textContent = s;
+      el.innerHTML = html;
       gridEl.appendChild(el);
     }
     function renderTabline(y) {

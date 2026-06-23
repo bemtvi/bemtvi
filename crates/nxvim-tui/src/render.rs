@@ -534,7 +534,14 @@ impl DockLayout {
         ];
         for (area, region) in docks {
             if let Some(area) = area {
-                render_tab_cells(frame, area, &region.title, &region.tabs, region.current);
+                render_tab_cells(
+                    frame,
+                    area,
+                    &region.title,
+                    &region.tabs,
+                    region.current,
+                    view,
+                );
             }
         }
     }
@@ -2213,24 +2220,42 @@ fn render_tabline(frame: &mut Frame, area: Rect, view: &View) {
         return;
     }
 
-    render_tab_cells(frame, area, "", &view.tabline, view.current_tab);
+    render_tab_cells(frame, area, "", &view.tabline, view.current_tab, view);
 }
 
 /// Paint built-in tabline cells into `area`: an optional bold `title` label first
 /// (the `nx.dock` dock title), then one ` {count} {name}{+} ` cell per tab (the
 /// window count only when >1, a `+` when modified — vim's default), the `current`
-/// cell reverse-video and the strip past the last cell left blank (vim's
+/// cell highlighted and the strip past the last cell left blank (vim's
 /// `TabLineFill`). Shared by the global (main) tabline and each dock's own
 /// tabline. A no-op for an empty strip (no title and no tabs) or zero-height area.
-fn render_tab_cells(frame: &mut Frame, area: Rect, title: &str, tabs: &[TabData], current: usize) {
+///
+/// The colors come from the theme's `TabLine` (inactive cells + bold title),
+/// `TabLineSel` (the active cell) and `TabLineFill` (the bar background) groups
+/// when the colorscheme defines them; otherwise the active cell falls back to
+/// reverse-video and the rest to the terminal default.
+fn render_tab_cells(
+    frame: &mut Frame,
+    area: Rect,
+    title: &str,
+    tabs: &[TabData],
+    current: usize,
+    view: &View,
+) {
     if (title.is_empty() && tabs.is_empty()) || area.height == 0 {
         return;
     }
+    let inactive = view.tabline_style.map(rt).unwrap_or_default();
+    let active = view
+        .tabline_sel
+        .map(rt)
+        .unwrap_or_else(|| Style::default().add_modifier(Modifier::REVERSED));
+    let fill = view.tabline_fill.map(rt).unwrap_or_default();
     let mut spans: Vec<Span> = Vec::with_capacity(tabs.len() + 1);
     if !title.is_empty() {
         spans.push(Span::styled(
             format!(" {title} "),
-            Style::default().add_modifier(Modifier::BOLD),
+            inactive.add_modifier(Modifier::BOLD),
         ));
     }
     for (i, tab) in tabs.iter().enumerate() {
@@ -2241,14 +2266,12 @@ fn render_tab_cells(frame: &mut Frame, area: Rect, title: &str, tabs: &[TabData]
         };
         let modified = if tab.modified { "+" } else { "" };
         let text = format!(" {count}{}{modified} ", tab.label);
-        let style = if i == current {
-            Style::default().add_modifier(Modifier::REVERSED)
-        } else {
-            Style::default()
-        };
+        let style = if i == current { active } else { inactive };
         spans.push(Span::styled(text, style));
     }
-    frame.render_widget(Paragraph::new(Line::from(spans)), area);
+    // Paint the strip past the last cell with `TabLineFill` so the bar's background
+    // matches the theme rather than the terminal default.
+    frame.render_widget(Paragraph::new(Line::from(spans)).style(fill), area);
 }
 
 /// The leading prompt shown ahead of the editable command line: the multi-char
@@ -2379,7 +2402,17 @@ fn render_menu(
     if area.width < 3 || area.height < vborder + 1 {
         return None;
     }
-    let block = Block::new().borders(borders);
+    // Themed colors (nvim-cmp / telescope groups, resolved server-side): the box
+    // background, the border, the selected row, and the matched characters. Each is
+    // `None` when the colorscheme leaves its group undefined — the popup then keeps
+    // the built-in look (no bg, plain border, reverse-video selection, bold match).
+    let bg_style = menu.styles.bg.map(rt).unwrap_or_default();
+    let sel_style = menu.styles.sel.map(rt);
+    let match_style = menu.styles.matched.map(rt);
+    let mut block = Block::new().borders(borders).style(bg_style);
+    if let Some(b) = menu.styles.border.map(rt) {
+        block = block.border_style(b);
+    }
     let inner = block.inner(area);
     frame.render_widget(Clear, area);
     frame.render_widget(block, area);
@@ -2434,16 +2467,29 @@ fn render_menu(
                 let empty = Vec::new();
                 let spans = menu.match_spans.get(idx).unwrap_or(&empty);
                 let marked = any_marked.then(|| menu.marked.get(idx).copied().unwrap_or(false));
-                menu_row_line(label, spans, sel == Some(idx), width, marked)
+                menu_row_line(
+                    label,
+                    spans,
+                    sel == Some(idx),
+                    width,
+                    marked,
+                    sel_style,
+                    match_style,
+                )
             }
             None => Line::from(" ".repeat(width)),
         }
     };
     // `> query` prompt line — the query in bold so it reads as the live input.
+    let prompt_style = menu
+        .styles
+        .prompt
+        .map(rt)
+        .unwrap_or_else(|| Style::default().add_modifier(Modifier::DIM));
     let prompt_line = || -> Line<'static> {
         let query = menu.query.as_deref().unwrap_or("");
         Line::from(vec![
-            Span::styled("> ", Style::default().add_modifier(Modifier::DIM)),
+            Span::styled("> ", prompt_style),
             Span::styled(
                 pmenu_row(query, "", width.saturating_sub(2)),
                 Style::default().add_modifier(Modifier::BOLD),
@@ -2530,7 +2576,7 @@ fn render_menu(
         } else {
             text_area
         };
-        render_menu_docs(frame, base, docs);
+        render_menu_docs(frame, base, docs, &menu.styles);
     }
 
     // The terminal caret sits in the prompt (in the list column), past the `> `
@@ -2630,7 +2676,12 @@ fn content_float_line(
 /// completion popup's one-cell-left-shifted content anchor), so the bordered box is
 /// drawn one cell left of it — the left border then lands flush against the popup's
 /// right border. `docs.row` is the box's top row as-is.
-fn render_menu_docs(frame: &mut Frame, text_area: Rect, docs: &nxvim_view::MenuDocs) {
+fn render_menu_docs(
+    frame: &mut Frame,
+    text_area: Rect,
+    docs: &nxvim_view::MenuDocs,
+    styles: &nxvim_view::MenuStyles,
+) {
     let x = text_area.x.saturating_add(docs.col).saturating_sub(1);
     let y = text_area.y.saturating_add(docs.row);
     let width = (docs.width.saturating_add(2)).min(text_area.right().saturating_sub(x));
@@ -2644,21 +2695,29 @@ fn render_menu_docs(frame: &mut Frame, text_area: Rect, docs: &nxvim_view::MenuD
     if area.width < 3 || area.height < 3 {
         return;
     }
-    let block = Block::new().borders(Borders::ALL);
+    // Themed from the docs groups (`CmpDocumentation` / `CmpDocumentationBorder`,
+    // resolved server-side with `Pmenu` / `FloatBorder` fallbacks): the body bg and
+    // the border. When unset the box keeps its built-in look (no bg, plain border).
+    let body_style = styles.doc.map(rt).unwrap_or_default();
+    let mut block = Block::new().borders(Borders::ALL).style(body_style);
+    if let Some(b) = styles.doc_border.map(rt) {
+        block = block.border_style(b);
+    }
     let inner = block.inner(area);
     frame.render_widget(Clear, area);
     frame.render_widget(block, area);
     let w = inner.width as usize;
+    // Without a themed body the text reads as a dimmed hover; with one, the theme's
+    // own foreground carries the contrast, so don't dim it away.
+    let text_style = styles
+        .doc
+        .map(rt)
+        .unwrap_or_else(|| Style::default().add_modifier(Modifier::DIM));
     let lines: Vec<Line> = docs
         .lines
         .iter()
         .take(inner.height as usize)
-        .map(|l| {
-            Line::from(Span::styled(
-                pmenu_row(l, "", w),
-                Style::default().add_modifier(Modifier::DIM),
-            ))
-        })
+        .map(|l| Line::from(Span::styled(pmenu_row(l, "", w), text_style)))
         .collect();
     frame.render_widget(Paragraph::new(Text::from(lines)), inner);
 }
@@ -2752,15 +2811,25 @@ fn menu_row_line(
     selected: bool,
     width: usize,
     marked: Option<bool>,
+    sel_style: Option<Style>,
+    match_style: Option<Style>,
 ) -> Line<'static> {
+    // The selected row uses the theme's selection group when defined, else
+    // reverse-video. A non-selected row is transparent so the box background shows.
     let base = if selected {
-        Style::default().add_modifier(Modifier::REVERSED)
+        sel_style.unwrap_or_else(|| Style::default().add_modifier(Modifier::REVERSED))
     } else {
         Style::default()
     };
-    let matched = base
-        .add_modifier(Modifier::BOLD)
-        .add_modifier(Modifier::UNDERLINED);
+    // Matched chars use the theme's match group when defined (patched onto the row
+    // base so a selected row keeps its selection background), else a bold underline.
+    let matched = match match_style {
+        Some(m) if selected => base.patch(m),
+        Some(m) => m,
+        None => base
+            .add_modifier(Modifier::BOLD)
+            .add_modifier(Modifier::UNDERLINED),
+    };
     let mut out: Vec<Span> = Vec::new();
     let mut used = 0usize;
     // Multi-select marker gutter (2 cells), present on every row only while marks

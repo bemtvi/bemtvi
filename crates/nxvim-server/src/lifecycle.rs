@@ -112,8 +112,21 @@ impl EditHost {
         if !self.fx.has_remote_fs() {
             return;
         }
+        let win = self.editor.current_window_id();
+        let tab = self.editor.current_tab_id();
         for open in self.editor.take_pending_opens() {
-            let path = open.path.display().to_string();
+            // Resolve a *relative* open against the effective working dir (the edit-host's
+            // `DirState`, which a remote `:cd` moves) before it crosses the wire. The
+            // daemon serves many sessions and keeps no per-session process cwd, so a bare
+            // relative path would resolve against its launch dir and silently ignore
+            // `:cd` — so `:cd dir` then `:e file` must read `<dir>/file`. An absolute path
+            // crosses unchanged. See `docs/plans/2026-06-23-remote-cwd.md`.
+            let path = if open.path.is_relative() {
+                let (_, base) = self.dirs.effective(win, tab);
+                base.join(&open.path).to_string_lossy().into_owned()
+            } else {
+                open.path.display().to_string()
+            };
             self.fx.fs_fetch(open.buffer, path);
         }
     }
@@ -546,6 +559,24 @@ impl EditHost {
         let tab = self.editor.current_tab_id();
         let (scope, want) = self.dirs.effective(win, tab);
         let want = want.to_path_buf();
+        // Daemon session: there is no local process cwd to re-point (a remote path can't be
+        // `set_current_dir`'d here, and the daemon is stateless — it has no per-session
+        // cwd). The focused window's effective dir is the cwd, mirrored into `nx._cwd` so
+        // `vim.fn.getcwd` follows `:lcd`/`:tcd` between windows. When the switch actually
+        // crosses a cwd boundary, announce it with `DirChanged` — the remote analogue of
+        // the local branch below.
+        if self.editor.host_fs_offtick() {
+            let (scope, dir) = self.dirs.effective(win, tab);
+            let scope_pat = scope.pattern();
+            let dir = dir.display().to_string();
+            if self.publish_cwd_mirror() {
+                if let Err(e) = self.lua.fire_dir_changed(scope_pat, &dir) {
+                    self.editor
+                        .echo(format!("E5108: Error in DirChanged autocmd: {e}"));
+                }
+            }
+            return;
+        }
         if std::env::current_dir().ok().as_deref() == Some(want.as_path()) {
             return; // already there — nothing to chdir or announce
         }
@@ -553,6 +584,7 @@ impl EditHost {
             return;
         }
         let cwd = std::env::current_dir().unwrap_or(want);
+        self.publish_cwd_mirror();
         if let Err(e) = self
             .lua
             .fire_dir_changed(scope.pattern(), &cwd.display().to_string())
@@ -560,6 +592,90 @@ impl EditHost {
             self.editor
                 .echo(format!("E5108: Error in DirChanged autocmd: {e}"));
         }
+    }
+
+    /// Reconcile a finished off-tick `:cd` (the daemon `fs_chdir` reply) against the
+    /// optimistic move it already applied. `ex_chdir` moved the cwd immediately (so an
+    /// `:e` / `getcwd` in the same breath sees the new dir) but deferred the announcing
+    /// `DirChanged` to here:
+    ///
+    /// - **Ok(canonical):** reverse the optimistic intermediate and install the daemon's
+    ///   *canonical* dir cleanly (so `:cd -` history and the `prev` pointer are right even
+    ///   when a symlink resolved differently), then fire `DirChanged` — but only if a later
+    ///   `:cd` hasn't already superseded this one (the rollback's guard reports that, in
+    ///   which case the newer `:cd` owns the state and its own announce).
+    /// - **Err(E344):** roll the optimistic move back to where the cwd was and echo the
+    ///   daemon's loud error. No `DirChanged` ever fired for the rejected dir, so no
+    ///   handler ran on it.
+    ///
+    /// A `""`/`~` target made no optimistic move (`undo == None`) — its home is the
+    /// daemon's — so it simply installs on Ok / echoes on Err, the original async path.
+    /// The settle + repaint is the caller's ([`on_chdir_dones`](Self::on_chdir_dones)).
+    /// See `docs/plans/2026-06-23-remote-cwd.md`.
+    pub(crate) fn apply_chdir(&mut self, done: crate::cwd::ChdirDone) {
+        let Some(pending) = self.pending_chdirs.remove(&done.token) else {
+            return; // unknown token (already reconciled) — nothing to do
+        };
+        let crate::cwd::PendingChdir {
+            scope,
+            win,
+            tab,
+            undo,
+        } = pending;
+        match done.result {
+            Ok(canon) => {
+                // Reverse the optimistic move first (if any), so the canonical install
+                // records the correct `prev`. A `false` return means a later `:cd`
+                // superseded this one — leave its state and skip our announce.
+                if let Some(u) = undo {
+                    if !self.dirs.rollback_optimistic(u) {
+                        return;
+                    }
+                }
+                let dir = PathBuf::from(canon);
+                self.dirs.set(scope, win, tab, dir.clone());
+                self.publish_cwd_mirror();
+                if let Err(e) = self
+                    .lua
+                    .fire_dir_changed(scope.pattern(), &dir.display().to_string())
+                {
+                    self.editor
+                        .echo(format!("E5108: Error in DirChanged autocmd: {e}"));
+                }
+            }
+            // The daemon's `E344` (the target isn't a readable directory) or a transport
+            // failure — roll back the optimistic move and surface it loud, never a silent
+            // wrong-cwd.
+            Err(e) => {
+                if let Some(u) = undo {
+                    if self.dirs.rollback_optimistic(u) {
+                        self.publish_cwd_mirror();
+                    }
+                }
+                self.editor.echo(e.to_string());
+            }
+        }
+    }
+
+    /// Push the current effective working directory ([`DirState::effective`]) into the
+    /// `nx._cwd` Lua mirror that `vim.fn.getcwd()` reads. Called on every cwd change —
+    /// the startup seed, `:cd`/`:tcd`/`:lcd`, and a window/tab focus switch — so the
+    /// mirror is the single authoritative cwd for both local and daemon sessions. Cheap
+    /// (one `O(1)` effective-dir lookup + a Lua table set). Returns whether the cwd
+    /// actually *moved* since the last publish (tracked in `published_cwd`), which a
+    /// daemon-session focus switch uses to fire `DirChanged` only on a real boundary.
+    pub(crate) fn publish_cwd_mirror(&mut self) -> bool {
+        let win = self.editor.current_window_id();
+        let tab = self.editor.current_tab_id();
+        let (_, dir) = self.dirs.effective(win, tab);
+        let dir = dir.to_path_buf();
+        let moved = self.published_cwd.as_deref() != Some(dir.as_path());
+        if let Err(e) = self.lua.set_cwd(&dir.to_string_lossy()) {
+            self.editor
+                .echo(format!("E5108: Error publishing cwd mirror: {e}"));
+        }
+        self.published_cwd = Some(dir);
+        moved
     }
 
     /// Reconcile the server's internal per-buffer file watches against the live

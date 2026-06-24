@@ -43,6 +43,7 @@
 //! | direction | method | reply |
 //! | --- | --- | --- |
 //! | edit-host → daemon | `fs_read [path]`         | `["file", bytes]` / `["new"]` / `["dir", path, entries]`, or an RPC error |
+//! | edit-host → daemon | `fs_chdir [path]`        | `["ok", canonical]` (a `:cd` target's resolved dir), or an `E344` RPC error |
 //! | edit-host → daemon | `fs_write [path, bytes]` | `["ok", stat?]`, or an RPC error                |
 //!
 //! `serve_fs_daemon` reads an existing file (`file`), reports a not-yet-existing one as a
@@ -134,6 +135,12 @@ use crate::host::{HostProc, ProcEvents, ProcSpec, StdHostProc};
 
 const FS_READ: &str = "fs_read";
 const FS_WRITE: &str = "fs_write";
+// `:cd` in a daemon session: resolve + validate a directory on the daemon and reply with
+// its canonical path (request/response, like a read). Pure — it does NOT chdir the daemon
+// *process* (one daemon serves many concurrent sessions; a process-global cwd would
+// corrupt the others), so the edit-host owns the logical cwd in `DirState` and resolves
+// its own relative paths against it. See `docs/plans/2026-06-23-remote-cwd.md`.
+const FS_CHDIR: &str = "fs_chdir";
 // The watch leg (`HostWatch`): the edit-host arms/disarms watches on the daemon, the
 // daemon pushes a change. Server-*push* — the only daemon→edit-host *notification* on
 // the fs leg (reads/writes are request/response).
@@ -756,6 +763,21 @@ pub trait HostFsAsync: Send + Sync {
     /// the directory listing (the remote explorer) — whichever the path resolves to.
     fn read(&self, path: String) -> Pin<Box<dyn Future<Output = io::Result<FsRead>> + Send>>;
 
+    /// Resolve + validate a `:cd` target on the daemon, resolving to its canonical absolute
+    /// path (or a loud `E344` error if it isn't a directory) — the off-tick half of
+    /// remote `:cd` (`docs/plans/2026-06-23-remote-cwd.md`). Pure: the daemon does not chdir
+    /// its process (it serves many sessions), so the edit-host installs the returned path
+    /// into its own [`DirState`](crate). The default fails loud — a backend with no remote
+    /// `:cd` support must say so at runtime, not silently succeed (the no-silent-stub rule).
+    fn chdir(&self, _path: String) -> Pin<Box<dyn Future<Output = io::Result<String>> + Send>> {
+        Box::pin(async {
+            Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "remote :cd is not supported by this filesystem backend",
+            ))
+        })
+    }
+
     /// Atomically write `bytes` to `path` (the off-tick `:w`). Resolves to the file's
     /// new [`FileStat`] on success — which the editor stamps as its `disk` baseline so
     /// a later change check doesn't false-positive on our own write — or a loud error
@@ -885,6 +907,22 @@ impl HostFsAsync for RemoteHostFs {
         })
     }
 
+    fn chdir(&self, path: String) -> Pin<Box<dyn Future<Output = io::Result<String>> + Send>> {
+        let rpc = self.rpc.clone();
+        Box::pin(async move {
+            match rpc.request(FS_CHDIR, vec![Value::from(path)]).await {
+                Ok(Value::Array(a)) => decode_fs_chdir(&a),
+                Ok(_) => Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "fs_chdir: malformed reply",
+                )),
+                // A daemon error reply carries the `E344` text (a missing/!dir target) or
+                // a transport failure; either is surfaced loud, never a silent no-move.
+                Err(e) => Err(io::Error::other(e.to_string())),
+            }
+        })
+    }
+
     fn watch(&self, path: String) {
         self.rpc.notify(FS_WATCH, vec![Value::from(path)]);
     }
@@ -960,6 +998,22 @@ fn decode_fs_write(a: &[Value]) -> io::Result<Option<FileStat>> {
     }
 }
 
+/// Decode an `fs_chdir` ok reply (`["ok", canonical]`) to the canonical directory path.
+/// A daemon *error* reply (the `E344` text) never reaches here — `nxvim_rpc` surfaces it
+/// as the `request` future's `Err`, which [`RemoteHostFs::chdir`] maps straight through.
+fn decode_fs_chdir(a: &[Value]) -> io::Result<String> {
+    match (
+        a.first().and_then(Value::as_str),
+        a.get(1).and_then(Value::as_str),
+    ) {
+        (Some("ok"), Some(path)) => Ok(path.to_owned()),
+        _ => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "fs_chdir: malformed ok reply",
+        )),
+    }
+}
+
 /// A [`FileStat`] on the wire: `[secs, nanos, size]`, where `secs`/`nanos` are the
 /// mtime as a duration past the Unix epoch (a `nil` mtime — platform reports none —
 /// becomes a nil `secs`). Kept self-contained so both legs agree on the shape.
@@ -1031,6 +1085,7 @@ pub async fn serve_fs_daemon_on(
                     Incoming::Request { id, method, mut params } => {
                         let reply = match method.as_str() {
                             FS_READ => serve_read(&*fs, &params),
+                            FS_CHDIR => serve_chdir(&*fs, &params),
                             FS_WRITE => {
                                 let reply = serve_write(&*fs, &mut params);
                                 // Self-suppress: a successful write changed the file, but
@@ -1120,6 +1175,61 @@ fn serve_read(fs: &dyn HostFs, params: &[Value]) -> Result<Value, Value> {
         ])),
         Err(e) => Err(Value::from(e.to_string())),
     }
+}
+
+/// Serve one `fs_chdir [path]` against `fs`: resolve a `:cd` target on the daemon and
+/// reply `["ok", canonical]` with its canonical absolute path, or a loud `E344` error if
+/// it isn't a readable directory. Pure — no process `chdir` (the daemon serves many
+/// sessions in one process), so this only *resolves and validates*; the edit-host owns
+/// the logical cwd. An empty path means `:cd` with no argument → the daemon's `$HOME`; a
+/// leading `~` expands against the daemon's home (Unix `:cd` semantics, resolved on the
+/// remote where it belongs). Directory-ness is checked through the [`HostFs`] seam
+/// (`read_dir` succeeds only for a directory), so a fake test backend behaves identically.
+fn serve_chdir(fs: &dyn HostFs, params: &[Value]) -> Result<Value, Value> {
+    let Some(arg) = params.first().and_then(Value::as_str) else {
+        return Err(Value::from("fs_chdir: missing path"));
+    };
+    let target = expand_remote_cd_arg(arg);
+    // `read_dir` is the directory check: it succeeds only for a directory and fails
+    // (NotFound / NotADirectory) for anything else — exactly vim's `E344` condition.
+    match fs.read_dir(&target) {
+        Ok(_) => {
+            // The canonical absolute path (symlinks resolved on the daemon) is what the
+            // edit-host stores + reports, so `:pwd` shows the real remote directory.
+            let canon = fs.canonicalize(&target).unwrap_or(target);
+            Ok(Value::Array(vec![
+                Value::from("ok"),
+                Value::from(canon.to_string_lossy().into_owned()),
+            ]))
+        }
+        Err(e) => Err(Value::from(format!(
+            "E344: Can't change directory to \"{}\": {e}",
+            target.display()
+        ))),
+    }
+}
+
+/// Expand a `:cd` argument on the **daemon** side: an empty arg → `$HOME` (Unix `:cd` with
+/// no directory), a leading `~` / `~/…` → the daemon's home dir, anything else verbatim
+/// (the edit-host already absolutized relative paths against its `DirState`, so what
+/// arrives is absolute or `~`-prefixed). Mirrors the edit-host's local `expand_cd_arg`,
+/// but rooted at the *daemon's* `$HOME` — the home `~` must mean on the remote.
+fn expand_remote_cd_arg(arg: &str) -> PathBuf {
+    let home = || std::env::var_os("HOME").map(PathBuf::from);
+    if arg.is_empty() {
+        return home().unwrap_or_else(|| PathBuf::from("/"));
+    }
+    if let Some(rest) = arg.strip_prefix('~') {
+        if rest.is_empty() {
+            return home().unwrap_or_else(|| PathBuf::from(arg));
+        }
+        if let Some(rest) = rest.strip_prefix('/') {
+            if let Some(h) = home() {
+                return h.join(rest);
+            }
+        }
+    }
+    PathBuf::from(arg)
 }
 
 /// `[[is_dir, name], …]` — a directory's entries on the wire. The edit-host sorts and
@@ -1950,19 +2060,26 @@ fn serve_config_bundle() -> Result<Value, Value> {
             runtimepath,
             files,
             ts_languages,
+            // The daemon's process cwd, to seed the edit-host's `DirState` so a remote
+            // session's `:pwd` / `getcwd` / `:cd` operate on the daemon's directory
+            // (`docs/plans/2026-06-23-remote-cwd.md`). `None` if it can't be read — the
+            // edit-host then falls back to its own local cwd.
+            std::env::current_dir().ok(),
         )),
         Err(e) => Err(Value::from(format!("config_bundle: {e}"))),
     }
 }
 
-/// `[config_dir?, [runtimepath…], [[abspath, bytes], …], [ts_lang…]]` — the bundle on
-/// the wire ([`decode_config_bundle`] is the inverse). Paths are the daemon's absolute
-/// paths; the edit-host rebases them onto its local cache.
+/// `[config_dir?, [runtimepath…], [[abspath, bytes], …], [ts_lang…], cwd?]` — the bundle
+/// on the wire ([`decode_config_bundle`] is the inverse). Paths are the daemon's absolute
+/// paths; the edit-host rebases them onto its local cache. `cwd` is the daemon's working
+/// directory (a trailing field an older peer omits → the edit-host keeps its local cwd).
 fn encode_config_bundle(
     config_dir: Option<PathBuf>,
     runtimepath: Vec<PathBuf>,
     files: Vec<(PathBuf, Vec<u8>)>,
     ts_languages: Vec<String>,
+    cwd: Option<PathBuf>,
 ) -> Value {
     let path_str = |p: PathBuf| Value::from(p.to_string_lossy().into_owned());
     Value::Array(vec![
@@ -1975,6 +2092,7 @@ fn encode_config_bundle(
                 .collect(),
         ),
         Value::Array(ts_languages.into_iter().map(Value::from).collect()),
+        cwd.map_or(Value::Nil, &path_str),
     ])
 }
 
@@ -2012,6 +2130,11 @@ pub struct RemoteConfigBundle {
     /// The daemon's installed tree-sitter parser languages — the client auto-installs
     /// the same set locally (parsers are native, never fetched over the wire).
     pub ts_languages: Vec<String>,
+    /// The daemon's working directory, to seed the edit-host's `DirState` so a remote
+    /// session's `:pwd` / `getcwd` / `:cd` operate on the daemon's cwd. `None` when the
+    /// daemon couldn't read it (or an older peer omitted it) — the edit-host keeps its
+    /// own local cwd. See `docs/plans/2026-06-23-remote-cwd.md`.
+    pub cwd: Option<String>,
 }
 
 /// The edit-host side of the config leg: a [`Rpc`] handle that fetches the daemon's
@@ -2110,11 +2233,17 @@ fn decode_config_bundle(v: Value) -> io::Result<RemoteConfigBundle> {
             .collect::<io::Result<Vec<_>>>()?,
         Some(_) => return Err(bad("ts_languages")),
     };
+    // The daemon's cwd; absent (an older peer) decodes as `None` (keep the local cwd).
+    let cwd = match it.next() {
+        None | Some(Value::Nil) => None,
+        Some(v) => Some(v.as_str().ok_or_else(|| bad("cwd"))?.to_owned()),
+    };
     Ok(RemoteConfigBundle {
         config_dir,
         runtimepath,
         files,
         ts_languages,
+        cwd,
     })
 }
 

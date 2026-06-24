@@ -94,6 +94,20 @@ pub trait HostEffects {
     /// fs (unreachable; the caller gates on [`Self::has_remote_fs`]).
     fn fs_save(&mut self, save: PendingSave);
 
+    /// Off-tick fs — resolve + validate a deferred `:cd` `target` on the daemon (the
+    /// remote analogue of the synchronous local `:cd`, which can't stat the remote disk
+    /// on the editor thread). The daemon's canonical directory or its `E344` error returns
+    /// *inbound* on the run loop's chdir arm, where [`EditHost::apply_chdir`] reconciles it
+    /// against the optimistic move; `token` keys the [`PendingChdir`](crate::cwd) the
+    /// editor stashed (the scope/window/tab + undo). The default is a no-op for a backend
+    /// with no daemon `:cd` (the wasm OPFS host — a documented gap in
+    /// `docs/plans/2026-06-23-remote-cwd.md`); the native daemon overrides it. On native,
+    /// `:cd` only defers in off-tick (daemon) mode, where this is always the overriding
+    /// implementation, so the default never runs.
+    fn fs_chdir(&mut self, target: String, token: u64) {
+        let _ = (target, token);
+    }
+
     /// Off-tick fs — arm a daemon-side watch on `path` (the `HostWatch` leg); a change
     /// returns *inbound* on the watch arm. A no-op without a daemon fs.
     fn fs_watch(&mut self, path: String);
@@ -290,6 +304,10 @@ pub struct NativeEffects {
     /// Delivery for a finished off-tick write — the run loop's save arm drains it. The
     /// effect spawns the write and forwards the [`SaveDone`] (ack-gated saved-state) here.
     save_done_tx: UnboundedSender<SaveDone>,
+    /// Delivery for a finished off-tick `:cd` — the run loop's chdir arm drains it. The
+    /// effect spawns the daemon `fs_chdir` and forwards the [`ChdirDone`] (canonical dir or
+    /// `E344`) here, where `apply_chdir` installs it.
+    chdir_done_tx: UnboundedSender<crate::cwd::ChdirDone>,
     /// The LSP command sink — the manager the editor tick fires `ensure` / `notify` /
     /// `request` at. Its inbound event/reply stream (`lsp_events`) is owned by the run
     /// loop's `select!`, not here (the inbound seam is the 4d slice).
@@ -316,6 +334,7 @@ impl NativeEffects {
         host_fs_async: Option<Arc<dyn HostFsAsync>>,
         open_tx: UnboundedSender<(BufferId, String, io::Result<FsRead>)>,
         save_done_tx: UnboundedSender<SaveDone>,
+        chdir_done_tx: UnboundedSender<crate::cwd::ChdirDone>,
         lsp: LspManager,
         install_tx: UnboundedSender<crate::InstallOutcome>,
         terminals: crate::terminal::native::TerminalManager,
@@ -326,6 +345,7 @@ impl NativeEffects {
             host_fs_async,
             open_tx,
             save_done_tx,
+            chdir_done_tx,
             lsp,
             install_tx,
             terminals,
@@ -379,6 +399,17 @@ impl HostEffects for NativeEffects {
         tokio::spawn(async move {
             let result = fs.write(path, bytes).await;
             let _ = tx.send(SaveDone::new(save, bytes_len, result));
+        });
+    }
+
+    fn fs_chdir(&mut self, target: String, token: u64) {
+        let Some(fs) = self.host_fs_async.clone() else {
+            return;
+        };
+        let tx = self.chdir_done_tx.clone();
+        tokio::spawn(async move {
+            let result = fs.chdir(target).await;
+            let _ = tx.send(crate::cwd::ChdirDone { token, result });
         });
     }
 

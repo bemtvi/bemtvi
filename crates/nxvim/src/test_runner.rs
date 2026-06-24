@@ -100,6 +100,8 @@ fn spawn_server(plugin_dir: PathBuf) -> (Rpc, UnboundedReceiver<Incoming>) {
             cmdline_complete_default: false,
             // Hermetic: no remote, so no tree-sitter parsers to mirror.
             ts_autoinstall: Vec::new(),
+            // No daemon: seed the cwd from the local process.
+            remote_cwd: None,
         };
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_io()

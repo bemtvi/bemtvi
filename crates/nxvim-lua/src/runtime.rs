@@ -2197,6 +2197,16 @@ impl LuaRuntime {
         set.call((bufnr, name, filetype))
     }
 
+    /// Publish the editor's current effective working directory into the `nx._cwd`
+    /// mirror that `vim.fn.getcwd()` reads. The server keeps this equal to
+    /// [`DirState::effective`](crate) on every cwd change (startup seed, `:cd`, window /
+    /// tab focus). In a local session this just tracks the process cwd; in a daemon
+    /// session it is the *daemon's* cwd (a path that need not exist locally), which is
+    /// why `getcwd` reads this mirror rather than `std::env::current_dir`.
+    pub fn set_cwd(&self, cwd: &str) -> mlua::Result<()> {
+        self.nx()?.set("_cwd", cwd)
+    }
+
     /// Drop the Lua-side state scoped to buffer `bufnr` — its buffer-local user
     /// commands and keymaps — when the server detects the buffer was deleted, so a
     /// later buffer that reuses the bufnr can't inherit them.

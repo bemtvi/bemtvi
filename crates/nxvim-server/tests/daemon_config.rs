@@ -112,6 +112,19 @@ async fn config_bundle_ships_the_daemons_config_and_plugins() {
         "runtimepath = config dir + the packaged plugin (neovim's pack layout)"
     );
 
+    // The bundle carries the daemon's cwd, which seeds the edit-host's `DirState` so a
+    // remote session's `:pwd` / `:cd` / `getcwd` operate on the daemon's directory. The
+    // daemon serves in-process here, so its cwd is this test process's cwd.
+    assert_eq!(
+        bundle.cwd.as_deref(),
+        std::env::current_dir()
+            .ok()
+            .as_deref()
+            .map(|p| p.to_string_lossy().into_owned())
+            .as_deref(),
+        "the bundle reports the daemon's working directory (remote-cwd seed)"
+    );
+
     // Look a fetched file up by the path suffix it must carry, asserting its bytes.
     let find = |suffix: &str| -> Option<Vec<u8>> {
         bundle

@@ -406,6 +406,9 @@ fn main() -> Result<()> {
         // A local session has no remote parser set to mirror; tree-sitter installs
         // happen on demand via `:TSInstall`.
         ts_autoinstall: Vec::new(),
+        // Local session: seed the working directory from the local process cwd
+        // (`EditHost::new`'s default), not a daemon.
+        remote_cwd: None,
     };
     let server_thread = std::thread::spawn(move || {
         // Test-only fault injection (debug builds only): force a server-thread
@@ -585,6 +588,9 @@ where
             // (lazily, per filetype; parsers are native, never fetched). Captured before
             // `bundle` is consumed.
             let ts_autoinstall = bundle.ts_languages.clone();
+            // The daemon's cwd seeds `DirState` so `:pwd`/`:cd`/`getcwd` operate on the
+            // remote dir, not this local process's (`docs/plans/2026-06-23-remote-cwd.md`).
+            let remote_cwd = bundle.cwd.clone().map(PathBuf::from);
             let (config_dir, runtimepath) = nxvim_server::materialize_remote_config(bundle)
                 .map_err(|e| anyhow!("could not materialize the remote config locally: {e}"))?;
             let init = ServerInit {
@@ -613,6 +619,8 @@ where
                 cmdline_complete_default: true,
                 // Mirror the daemon's installed tree-sitter parsers locally.
                 ts_autoinstall,
+                // Seed the working directory from the daemon (remote-cwd).
+                remote_cwd,
             };
             // `_guard` (the stdio child, or `()` for QUIC) lives until the editor quits.
             run_server(server_end, init).await

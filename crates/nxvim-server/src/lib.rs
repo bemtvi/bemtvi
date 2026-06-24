@@ -279,6 +279,16 @@ pub struct ServerInit {
     /// `:TSInstall`s each on first sight (see [`set_up_remote_ts_autoinstall`]). Empty
     /// (the default) for a local session — nothing to mirror.
     pub ts_autoinstall: Vec<String>,
+    /// The daemon's working directory, to seed [`DirState`](crate::cwd) in a remote
+    /// session. `None` (the default) seeds it from the **local** process cwd, as a
+    /// local session needs. When set (the edit-host split fetches it over the
+    /// `config_bundle` handshake), `:cd`/`:pwd`/`vim.fn.getcwd` operate on the
+    /// **daemon's** cwd rather than the local process's — the remote-cwd fix
+    /// (`docs/plans/2026-06-23-remote-cwd.md`). The path is the daemon's absolute
+    /// cwd and may not exist on the edit-host's local disk, so it is never
+    /// `set_current_dir`'d locally; it lives only in `DirState` + the `nx._cwd`
+    /// mirror, and `:cd` moves it over the wire (`fs_chdir`).
+    pub remote_cwd: Option<PathBuf>,
 }
 
 /// How the server provides the `"+` / `"*` clipboard registers.
@@ -896,6 +906,19 @@ pub struct EditHost {
     /// the cwd, and a window/tab focus change re-applies the effective dir to the
     /// cwd ([`EditHost::fix_current_dir`]). Seeded from the startup cwd.
     dirs: cwd::DirState,
+    /// In-flight daemon `:cd`s, keyed by the token threaded through
+    /// [`HostEffects::fs_chdir`]: each holds the scope/window/tab and the optimistic-move
+    /// undo, consumed by [`EditHost::apply_chdir`] when the canonical path (or `E344`)
+    /// lands. Empty in a local session (`:cd` resolves synchronously there).
+    pending_chdirs: HashMap<u64, cwd::PendingChdir>,
+    /// Monotonic token source for [`pending_chdirs`](Self::pending_chdirs).
+    next_chdir_token: u64,
+    /// The working directory last pushed into the `nx._cwd` mirror — so
+    /// [`EditHost::publish_cwd_mirror`] can report whether a publish actually *moved* the
+    /// cwd. A daemon-session focus switch uses that to fire `DirChanged` only on a real
+    /// `:lcd`/`:tcd` boundary (the remote analogue of the local `fix_current_dir`), not on
+    /// every window change. `None` until the first publish.
+    published_cwd: Option<PathBuf>,
     /// The wasm build's timer wheel (slice 5d): pending `vim.defer_fn` / `nx.timer`
     /// timers, fired by the Worker when their [`due_ms`](WasmTimer::due_ms) passes on the
     /// JS clock — the serverless analogue of the tokio timers the native build arms via
@@ -1022,6 +1045,9 @@ impl EditHost {
             terminals: HashMap::new(),
             terminal_frozen: HashMap::new(),
             dirs: cwd::DirState::new(std::env::current_dir().unwrap_or_default()),
+            pending_chdirs: HashMap::new(),
+            next_chdir_token: 0,
+            published_cwd: None,
             #[cfg(not(feature = "native"))]
             wasm_timers: Vec::new(),
             #[cfg(not(feature = "native"))]
@@ -2089,6 +2115,11 @@ where
     // spawned task; the finished write comes back here and finalizes on the one
     // server thread. Idle for a local/bare session (no daemon fs → no off-tick saves).
     let (save_done_tx, mut save_done_rx) = unbounded_channel::<save::SaveDone>();
+    // The off-tick `:cd` delivery: `ex_chdir` enqueues a daemon `fs_chdir` on a spawned
+    // task; the resolved canonical dir (or `E344`) comes back here and `apply_chdir`
+    // installs it into `DirState` on the one server thread. Idle for a local session
+    // (`:cd` resolves synchronously through the local disk there).
+    let (chdir_done_tx, mut chdir_done_rx) = unbounded_channel::<cwd::ChdirDone>();
     // The `HostWatch` leg: the daemon pushes `fs_changed`, the [`RemoteHostFs`] demux
     // forwards each into this channel, and the `watch_rx` `select!` arm reconciles it
     // off the editor tick. Created unconditionally (idle for a local/bare session) so
@@ -2120,6 +2151,7 @@ where
             host_fs_async,
             open_tx,
             save_done_tx,
+            chdir_done_tx,
             lsp,
             install_tx,
             terminals,
@@ -2132,6 +2164,18 @@ where
     host.workspace_session = init.workspace_session;
     host.restore_session = init.restore_session;
     host.mouse_clock = init.mouse_clock;
+    // In a daemon session the one true cwd is the *daemon's*, not the local process's
+    // — seed `DirState` from it so `:pwd` / `vim.fn.getcwd` report the remote dir and
+    // `:cd` moves it over the wire (`docs/plans/2026-06-23-remote-cwd.md`). No local
+    // dirs exist yet at startup, so replacing the whole state is safe. A local session
+    // leaves the process-cwd seed `EditHost::new` installed.
+    if let Some(cwd) = init.remote_cwd {
+        host.dirs = cwd::DirState::new(cwd);
+    }
+    // Publish the seeded effective dir into the `nx._cwd` mirror so `vim.fn.getcwd`
+    // reads the authoritative cwd from the very first config line (a remote session's
+    // `init.lua` calling `getcwd()` must see the daemon's dir, not the local process's).
+    host.publish_cwd_mirror();
 
     // No built-in keymap defaults are installed natively any more: the LSP keys
     // (`gd`/`gD`/`gr`/`K`/`<C-k>`) are installed buffer-local by `prelude/lsp.lua` on
@@ -2276,6 +2320,10 @@ where
                     break;
                 }
             }
+            // An off-tick `:cd` finished on the daemon (`fs_chdir`): install the resolved
+            // canonical dir into `DirState` (or echo its `E344`). Idle for a local session,
+            // where `:cd` resolves synchronously.
+            Some(done) = chdir_done_rx.recv() => host.on_chdir_dones(done, &mut chdir_done_rx),
             // The daemon's watch leg pushed a file change (`HostWatch`): reconcile it off
             // the editor tick. Idle for a local/bare session (nothing ever sends here).
             Some(ev) = watch_rx.recv() => host.on_watch_events(ev, &mut watch_rx),

@@ -859,11 +859,22 @@ pub(crate) fn install_runtime_api(
         })?,
     )?;
 
-    // `vim.fn.getcwd()`: the process working directory (the root fallback and the
-    // base for relative->absolute path math in `vim.fs`/`fnamemodify`).
+    // `vim.fn.getcwd()`: the editor's effective working directory (the root fallback
+    // and the base for relative->absolute path math in `vim.fs`/`fnamemodify`). The
+    // server keeps `nx._cwd` equal to the effective dir on every change; read that when
+    // set so a daemon session reports the *daemon's* cwd (which need not exist on the
+    // local disk), falling back to the local process cwd before the first publish / for
+    // a bare session. See `docs/plans/2026-06-23-remote-cwd.md`.
     func.set(
         "getcwd",
-        lua.create_function(|_, ()| {
+        lua.create_function(|lua, ()| {
+            if let Ok(nx) = lua.globals().get::<mlua::Table>("nx") {
+                if let Ok(Some(cwd)) = nx.get::<Option<String>>("_cwd") {
+                    if !cwd.is_empty() {
+                        return Ok(cwd);
+                    }
+                }
+            }
             Ok(std::env::current_dir()
                 .map(|p| p.to_string_lossy().into_owned())
                 .unwrap_or_default())

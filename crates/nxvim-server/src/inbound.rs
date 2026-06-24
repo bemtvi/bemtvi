@@ -215,6 +215,22 @@ impl EditHost {
         }
     }
 
+    /// Coalesce a burst of finished off-tick `:cd`s (the daemon `fs_chdir` reply): install
+    /// each into `DirState` (or echo its `E344`), then settle + repaint. A burst is rare
+    /// (a `:cd` and a focus-driven re-point can land together), but coalescing keeps it to
+    /// one frame, like the sibling arms.
+    pub(crate) fn on_chdir_dones(
+        &mut self,
+        first: crate::cwd::ChdirDone,
+        rx: &mut UnboundedReceiver<crate::cwd::ChdirDone>,
+    ) {
+        self.apply_chdir(first);
+        while let Ok(done) = rx.try_recv() {
+            self.apply_chdir(done);
+        }
+        self.settle_events(true);
+    }
+
     /// Coalesce a burst of remote file-change pushes (the daemon `HostWatch` leg):
     /// reconcile each off the editor tick — the remote analogue of the local per-buffer
     /// watch's `FsEvent` handling — then settle + repaint.

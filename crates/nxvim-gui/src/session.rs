@@ -229,6 +229,10 @@ fn nxvim_bin_name() -> &'static str {
 /// a silent fall back to local config.
 async fn server_init(file: Option<String>, client: Option<DaemonClient>) -> Result<ServerInit> {
     let mut ts_autoinstall = Vec::new();
+    // The daemon's cwd seeds `DirState` so `:pwd`/`:cd`/`getcwd` operate on the remote
+    // dir in a daemon session (`docs/plans/2026-06-23-remote-cwd.md`); `None` for a local
+    // session, which seeds from the local process cwd.
+    let mut remote_cwd = None;
     let (config_dir, runtimepath, host_fs, host_proc, host_fs_async, lsp_transport, fs_jobs) =
         match client {
             None => {
@@ -242,6 +246,7 @@ async fn server_init(file: Option<String>, client: Option<DaemonClient>) -> Resu
                 // Mirror the daemon's installed tree-sitter parsers locally (parsers are
                 // native, never fetched). Captured before `bundle` is consumed.
                 ts_autoinstall = bundle.ts_languages.clone();
+                remote_cwd = bundle.cwd.clone().map(std::path::PathBuf::from);
                 let (config_dir, runtimepath) = nxvim_server::materialize_remote_config(bundle)
                     .map_err(|e| anyhow!("could not materialize the remote config locally: {e}"))?;
                 (
@@ -281,6 +286,7 @@ async fn server_init(file: Option<String>, client: Option<DaemonClient>) -> Resu
         offer_default_recommended: true,
         cmdline_complete_default: true,
         ts_autoinstall,
+        remote_cwd,
     })
 }
 

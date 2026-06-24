@@ -170,8 +170,9 @@ vendored Lua — the engine seam is kept, the command skin is replaced by a noun
   nxvim's objectives, deleted where it doesn't.
 - **Plugin asynchrony lives in `nx`** (`nx.run` / `nx.timer` / `nx.fs` /
   `nx.ui.input`, callback-based). Nothing in the plugin API can block the
-  editor, which also keeps the PUC Lua 5.1 backend (no yield across `pcall`)
-  fully supported by construction.
+  editor, fully supported by construction. (The vendored backend is PUC Lua
+  5.4, whose `pcall`/`xpcall` *do* yield across the C boundary, so even a
+  blocking-read plugin would work — but the API stays non-blocking by design.)
 - **Distribution is first-party**: manifest-declared contributions
   (activation by first use), a built-in package manager over the async
   runtime — no third-party plugin manager layer.

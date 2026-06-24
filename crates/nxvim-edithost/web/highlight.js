@@ -68,14 +68,28 @@ const FG = {
   tag: '#e06c75', 'tag.attribute': '#d19a66', 'tag.delimiter': '#abb2bf',
 };
 
+// The active colorscheme's syntax palette (`capture-name → CSS color`), bridged from
+// the core's highlight registry on the wasm build (server `theme` map → `index.html`
+// → here). Consulted by `colorFor` BEFORE the static `FG` fallback, so loading a
+// colorscheme (catppuccin, …) recolors code to match. `null` until a frame carries a
+// theme; an unthemed capture falls through to `FG` (the built-in One Dark family).
+let runtimeTheme = null;
+
+// Install the colorscheme syntax palette (or `null` to clear). The keys mirror `FG`'s
+// (dotted capture names); each value is a CSS color string. Callers repaint after.
+export function setHlTheme(map) {
+  runtimeTheme = map && Object.keys(map).length ? map : null;
+}
+
 // Resolve a (possibly dotted) capture name to a CSS color, walking the fallback
-// chain `a.b.c` → `a.b` → `a`. Returns null when nothing in the theme matches.
+// chain `a.b.c` → `a.b` → `a` — over the active colorscheme palette first, then the
+// static `FG` table. Returns null when nothing matches.
 // Exported so the remote (server-styled) renderer can reuse this theme as its
 // fallback for highlight spans the server sent without a resolved palette style.
 export function colorFor(group) {
   let g = group;
   for (;;) {
-    const c = FG[g];
+    const c = (runtimeTheme && runtimeTheme[g]) || FG[g];
     if (c) return c;
     const dot = g.lastIndexOf('.');
     if (dot < 0) return null;

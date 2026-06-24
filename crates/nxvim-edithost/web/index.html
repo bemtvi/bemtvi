@@ -93,9 +93,9 @@
     // web-tree-sitter vendor assets (built by build.sh → npm run build:treesitter).
     // When those aren't present the import fails — degrade to plain (un-highlighted)
     // rendering rather than breaking the whole page.
-    let createHighlighter = null, colorFor = () => null;
+    let createHighlighter = null, colorFor = () => null, setHlTheme = () => {};
     try {
-      ({ createHighlighter, colorFor } = await import("./highlight.js"));
+      ({ createHighlighter, colorFor, setHlTheme } = await import("./highlight.js"));
     } catch (e) {
       console.warn("nxvim: syntax highlighting unavailable (tree-sitter vendor not built):", e);
     }
@@ -682,7 +682,32 @@
       // Keep the cache bounded to what's on screen: drop any file no window shows.
       const visible = new Set((frame.windows || []).map((w) => w.file_name));
       for (const k of textByFile.keys()) if (!visible.has(k)) textByFile.delete(k);
+      syncHlTheme(frame);
       applyView();
+    }
+
+    // Bridge the active colorscheme's syntax palette into the JS highlighter. The
+    // server ships `theme` (a `capture-name → style_id` map) + `theme_gen` (the
+    // registry generation) on the wasm build; rebuild the highlighter's `capture →
+    // CSS color` map only when the generation changes (a colorscheme load/switch),
+    // resolving the palette ids against THIS frame's `styles`. Spans are capture
+    // *names* colored at paint time, so the next render picks up the new colors.
+    let lastThemeGen = -1;
+    function syncHlTheme(frame) {
+      // `theme_gen` is the wasm-build marker (absent on the server-styled `:connect`
+      // path, which themes chrome via `render`'s `applyChrome` instead).
+      if (frame.theme_gen == null || frame.theme_gen === lastThemeGen) return;
+      lastThemeGen = frame.theme_gen;
+      const styles = frame.styles || [];
+      const map = {};
+      for (const [name, id] of Object.entries(frame.theme || {})) {
+        const fg = cssColor(styles[id]?.fg);
+        if (fg) map[name] = fg;
+      }
+      setHlTheme(map);
+      // `view` is already this frame (setFrame). Re-theme the chrome vars from the
+      // colorscheme that just loaded/changed (One Dark defaults stay for absent groups).
+      applyChrome();
     }
 
     // ============================================================================
@@ -1467,20 +1492,29 @@
       setVar("--gutter-cur", c.cursor_line_nr, "fg");
       setVar("--eob", c.end_of_buffer, "fg");
     }
+    // Drive the chrome CSS variables (`:root`) from the active colorscheme's resolved
+    // groups. Each chrome key arrives as a palette id (`view.chrome`), resolved here via
+    // `chromeStyle()`; a var is overridden only when its group resolves, so a build with
+    // no colorscheme keeps the built-in One Dark CSS defaults. Runs on the server-styled
+    // `:connect` path (`render`) and, on the wasm build, whenever the colorscheme changes
+    // (`syncHlTheme`) — neither flips `serverStyled`, so JS highlighting stays on.
     function applyChrome() {
-      const c = view.chrome || {};
       const root = document.documentElement.style;
-      if (c.normal?.bg) gridEl.style.background = c.normal.bg;
-      if (c.normal?.fg) gridEl.style.color = c.normal.fg;
-      const setVar = (name, color) => { if (color) root.setProperty(name, color); };
-      setVar("--eob", c.end_of_buffer?.fg);
-      setVar("--gutter", c.line_nr?.fg);
-      setVar("--gutter-cur", c.cursor_line_nr?.fg);
-      setVar("--status-bg", c.status_line?.bg);
-      setVar("--status-fg", c.status_line?.fg);
-      setVar("--sel", c.visual?.bg);
-      setVar("--search", c.search?.bg);
-      setVar("--cursorline", c.cursorline?.bg);
+      const setVar = (name, key, attr) => {
+        const col = cssColor(chromeStyle(key)?.[attr]);
+        if (col) root.setProperty(name, col);
+      };
+      setVar("--bg", "normal", "bg");
+      setVar("--fg", "normal", "fg");
+      setVar("--eob", "end_of_buffer", "fg");
+      setVar("--gutter", "line_nr", "fg");
+      setVar("--gutter-cur", "cursor_line_nr", "fg");
+      setVar("--status-bg", "status_line", "bg");
+      setVar("--status-fg", "status_line", "fg");
+      setVar("--sel", "visual", "bg");
+      setVar("--search", "search", "bg");
+      setVar("--cursorline", "cursorline", "bg");
+      setVar("--cursor", "cursor", "bg");
     }
     function cellBaseCss(col, hlSpans, diagSpans) {
       let css = "";

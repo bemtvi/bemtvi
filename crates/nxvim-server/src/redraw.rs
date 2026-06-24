@@ -61,6 +61,14 @@ impl EditHost {
         // into a per-frame, deduped `styles` palette; the client paints the RGB.
         let mut styles = StyleTable::default();
         let chrome = self.chrome_styles(&mut styles);
+        // The browser build highlights code JS-side, so the colorscheme's syntax
+        // groups can't ride per-window `highlights` spans (those stay empty on wasm).
+        // Resolve them into the same per-frame palette and ship them as `theme`, with
+        // `theme_gen` (the registry generation) so the client rebuilds its JS color
+        // map only when the colorscheme changes. Native builds bake syntax into the
+        // spans, so neither key is emitted there.
+        #[cfg(not(feature = "native"))]
+        let theme = self.syntax_theme(&mut styles);
 
         // The message line shows the diagnostic under the cursor, but only when
         // nothing more important (an error, command output) already holds it —
@@ -239,7 +247,8 @@ impl EditHost {
 
         // Built last: every per-window/`chrome` style id above indexes into it.
         let styles_value = styles.into_value();
-        let map = vec![
+        #[allow(unused_mut)]
+        let mut map = vec![
             (Value::from("windows"), Value::Array(windows)),
             (Value::from("global_status"), global_status),
             (Value::from("separators"), separators),
@@ -324,6 +333,17 @@ impl EditHost {
                 Value::from(cfg!(not(feature = "native"))),
             ),
         ];
+
+        // The colorscheme → JS-highlighter bridge (wasm only; see `syntax_theme`).
+        // `theme_gen` lets the client rebuild its color map only on a colorscheme change.
+        #[cfg(not(feature = "native"))]
+        {
+            map.push((Value::from("theme"), theme));
+            map.push((
+                Value::from("theme_gen"),
+                Value::from(self.editor.highlights.generation()),
+            ));
+        }
 
         self.fx.notify("redraw", vec![Value::Map(map)]);
     }
@@ -997,6 +1017,31 @@ impl EditHost {
         Value::Map(entries)
     }
 
+    /// Resolve the tree-sitter capture groups the browser highlighter colors to
+    /// style-palette ids — the wasm build's bridge from the loaded colorscheme to
+    /// JS-side syntax highlighting (the native builds bake these into per-window
+    /// `highlights` spans instead, so this is wasm-only). Each entry is a capture
+    /// name keyed exactly as `web/highlight.js`'s static `FG` table, resolved via
+    /// the standard capture fallback (`@function.builtin` → `@function` →
+    /// `Function`); the client walks the same dotted-fallback chain over the result,
+    /// so it themes from the colorscheme's `@`-groups and falls back to the static
+    /// table only for captures the scheme leaves undefined. Absent groups are simply
+    /// omitted (the client keeps its built-in color for them).
+    #[cfg(not(feature = "native"))]
+    pub(crate) fn syntax_theme(&self, styles: &mut StyleTable) -> Value {
+        let entries = SYNTAX_CAPTURES
+            .iter()
+            .filter_map(|capture| {
+                let style = self.editor.highlights.resolve_capture(capture)?;
+                Some((
+                    Value::from(*capture),
+                    Value::from(styles.intern(style) as u64),
+                ))
+            })
+            .collect();
+        Value::Map(entries)
+    }
+
     /// Resolve the first defined highlight group in `groups` to a palette id
     /// (interning it into `styles`), or `None` when none of them is themed. Gives a
     /// widget region a fallback chain — e.g. `TelescopeSelection` → `PmenuSel` →
@@ -1090,6 +1135,7 @@ impl EditHost {
 /// overrides ([`EditHost::window_chrome_overrides`]).
 const CHROME: &[(&str, &str)] = &[
     ("normal", "Normal"),
+    ("cursor", "Cursor"),
     ("line_nr", "LineNr"),
     ("cursor_line_nr", "CursorLineNr"),
     ("cursorline", "CursorLine"),
@@ -1105,6 +1151,60 @@ const CHROME: &[(&str, &str)] = &[
     ("float_border", "FloatBorder"),
     ("normal_float", "NormalFloat"),
     ("float_title", "FloatTitle"),
+];
+
+/// The tree-sitter capture names the browser highlighter colors, keyed exactly as
+/// the static `FG` table in `web/highlight.js`. The wasm redraw resolves each
+/// through the colorscheme's capture fallback ([`Highlights::resolve_capture`]) so
+/// the client themes code from the active colorscheme; the client walks the same
+/// dotted-fallback chain (`function.call` → `function`) over the result, so only the
+/// distinctive sub-cases need their own entry. Wasm-only (the native builds resolve
+/// syntax into per-window `highlights` spans directly).
+#[cfg(not(feature = "native"))]
+const SYNTAX_CAPTURES: &[&str] = &[
+    "comment",
+    "keyword",
+    "conditional",
+    "repeat",
+    "exception",
+    "include",
+    "operator",
+    "keyword.operator",
+    "string",
+    "character",
+    "escape",
+    "string.escape",
+    "string.special",
+    "number",
+    "float",
+    "boolean",
+    "constant",
+    "constant.builtin",
+    "function",
+    "function.builtin",
+    "function.macro",
+    "constructor",
+    "type",
+    "type.builtin",
+    "property",
+    "field",
+    "variable.member",
+    "variable",
+    "variable.parameter",
+    "parameter",
+    "variable.builtin",
+    "label",
+    "punctuation",
+    "punctuation.bracket",
+    "punctuation.delimiter",
+    "punctuation.special",
+    "attribute",
+    "annotation",
+    "namespace",
+    "module",
+    "tag",
+    "tag.attribute",
+    "tag.delimiter",
 ];
 
 /// A per-redraw palette of distinct resolved [`Style`]s, deduped so identical

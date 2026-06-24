@@ -410,6 +410,15 @@ pub(crate) struct Window {
     /// *owner* (`<CR>`/`:ll` jump into this window). Never inherited on split (each
     /// `:lopen` mints its own), so a display buffer maps back to exactly one owner.
     pub(crate) loclist_bufnr: Option<BufferId>,
+    /// The sign-column width (in cells) this window's gutter reserved the **last
+    /// time it was rendered**, pushed back from the server's redraw via
+    /// [`Editor::set_window_sign_width`]. Core can't compute it itself: a dynamic
+    /// sign column grows to fit signs that are partly server-owned (LSP diagnostics),
+    /// so the rendered width is only known after the redraw merges every source. The
+    /// mouse hit-test reads it (via [`Editor::window_textoff`]) so a click skips the
+    /// exact gutter the client drew — without it, signs shift every column to the
+    /// right. `0` until the window is first rendered.
+    pub(crate) sign_width: usize,
 }
 
 /// A node in the window layout tree: either a single window (`Leaf`) or a
@@ -543,6 +552,7 @@ impl WindowTree {
                 resume: None,
                 loclist: None,
                 loclist_bufnr: None,
+                sign_width: 0,
             },
         );
         WindowTree {
@@ -582,6 +592,7 @@ impl WindowTree {
             resume: None,
             loclist: None,
             loclist_bufnr: None,
+            sign_width: 0,
         }
     }
 
@@ -1628,14 +1639,31 @@ impl Editor {
     }
 
     /// Window `id`'s text offset — the gutter columns before the first text cell
-    /// (the number gutter plus the sign-column floor core can know about). `None`
-    /// for an unknown id. Feeds the server's screen-column math for
-    /// `vim.fn.screencol`.
+    /// (the number gutter plus the sign column). `None` for an unknown id. Feeds the
+    /// mouse hit-test and the server's screen-column math for `vim.fn.screencol`.
+    ///
+    /// The sign-column width is the one the window **last rendered**
+    /// ([`Window::sign_width`], pushed by the server's redraw), since a dynamic
+    /// `'signcolumn'` grows to fit signs core can't see alone (LSP diagnostics).
+    /// Floored at the static reservation `SignColumn::floor_cells` so a
+    /// `signcolumn=yes` window never under-counts before its first frame lands.
     pub fn window_textoff(&self, id: WindowId) -> Option<usize> {
         let (_, t) = self.tree_of_window(id)?;
         let w = t.get(id);
         let lines = self.buffers.get(w.buffer).buffer.line_count();
-        Some(self.number_width_for(&w.options, lines) + w.options.signcolumn.floor_cells())
+        let signcol = w.sign_width.max(w.options.signcolumn.floor_cells());
+        Some(self.number_width_for(&w.options, lines) + signcol)
+    }
+
+    /// Record the sign-column width (in cells) window `id` reserved this frame, so a
+    /// later mouse hit-test ([`Editor::window_textoff`]) skips the same gutter the
+    /// client drew. Called by the server's redraw, the only place that knows the
+    /// merged width (a dynamic column grows to fit server-owned diagnostic signs).
+    /// A no-op for an unknown id.
+    pub fn set_window_sign_width(&mut self, id: WindowId, cells: usize) {
+        if let Some(t) = self.tree_of_window_mut(id) {
+            t.get_mut(id).sign_width = cells;
+        }
     }
 
     /// Scroll window `id` so its first visible line is `top` (0-based), clamped to
@@ -1817,6 +1845,7 @@ impl Editor {
                 resume: None,
                 loclist: None,
                 loclist_bufnr: None,
+                sign_width: 0,
             },
         );
         self.windows.floats.push(id);
@@ -2076,6 +2105,7 @@ impl Editor {
                 resume: None,
                 loclist,
                 loclist_bufnr: None,
+                sign_width: 0,
             },
         );
         split_leaf(&mut self.windows.root, cur, dir, new_id);
@@ -2117,6 +2147,7 @@ impl Editor {
                 resume: None,
                 loclist: None,
                 loclist_bufnr: None,
+                sign_width: 0,
             },
         );
         // Wrap the entire tiled layout: [existing, new] stacked vertically, the new

@@ -16,8 +16,8 @@
 use nxvim_rpc::{Incoming, Rpc};
 use nxvim_server::ServerInit;
 use nxvim_test_harness::{
-    attach, command, cursor, exec_lua, feed, feed_mouse, feed_mouse_at, lines, message, mode,
-    spawn, temp_dir, wait_redraw, write_temp, FakeClipboard, TestClock,
+    attach, command, cursor, exec_lua, feed, feed_mouse, feed_mouse_at, field, lines, message,
+    mode, spawn, temp_dir, wait_redraw, write_temp, FakeClipboard, TestClock,
 };
 use rmpv::Value;
 use tokio::sync::mpsc::UnboundedReceiver;
@@ -158,6 +158,39 @@ async fn left_click_in_gutter_lands_col0() {
     assert_eq!(cursor(&rpc).await, (2, 0));
     // And col 4+3 = 7 lands 3 cells into the text of line 2 ("second line").
     feed_mouse(&rpc, "left", "press", 1, 7);
+    assert_eq!(cursor(&rpc).await, (2, 3));
+}
+
+/// A dynamic sign column (a gutter that appears only because a sign is placed)
+/// is part of the gutter the hit-test must skip. With `nonumber` the only gutter
+/// is the 2-cell sign column; a click must subtract it, or every column lands two
+/// cells to the right of where the user clicked. Regression test for the
+/// diagnostics-gutter mouse shift.
+#[tokio::test]
+async fn left_click_accounts_for_dynamic_sign_column() {
+    let (rpc, mut incoming) = start("hello world\nsecond line\nthird").await;
+    command(&rpc, "set nonumber norelativenumber").await;
+    // Place a gutter sign so `signcolumn=auto` reserves its 2-cell column. An
+    // extmark sign is core-shared, exercising the same gutter widening a
+    // diagnostic sign drives (the merge is sign-source-agnostic).
+    exec_lua(
+        &rpc,
+        r#"
+        local ns = vim.api.nvim_create_namespace('mouse_sign')
+        vim.api.nvim_buf_set_extmark(0, ns, 1, 0, { sign_text = '>>' })
+        "#,
+    )
+    .await;
+    // Wait until the frame actually reserves the 2-cell sign column, so the
+    // hit-test sees the widened gutter the user clicked against.
+    wait_redraw(&mut incoming, |m| {
+        field(m, "sign_width").and_then(Value::as_u64) == Some(2)
+    })
+    .await;
+    // Sign column = 2 cells, no number gutter. Screen col 5 → text col 5 − 2 = 3,
+    // byte 3 of "second line" ('o'). Without skipping the sign column it would
+    // wrongly land on byte 5 ('d').
+    feed_mouse(&rpc, "left", "press", 1, 5);
     assert_eq!(cursor(&rpc).await, (2, 3));
 }
 

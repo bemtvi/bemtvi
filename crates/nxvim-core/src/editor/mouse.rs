@@ -1886,7 +1886,14 @@ impl Editor {
         let buf_id = self.window_buffer(win)?;
         let buf = &self.buffers.get(buf_id).buffer;
         let line_count = buf.line_count();
-        let gutter = self.number_width_for(&opts, line_count);
+        // The full left gutter — number column **plus** the sign column. The sign
+        // width is the window's last-rendered one (`window_textoff`), so a click
+        // skips the same dynamic gutter the client drew; using only the number
+        // width shifts every column right by the sign column (see the
+        // dynamic-sign-column mouse test).
+        let gutter = self
+            .window_textoff(win)
+            .unwrap_or_else(|| self.number_width_for(&opts, line_count));
         let ts = buf.options.effective_tabstop();
         // The soft-wrap text width: the content area past the number gutter (the
         // same `width` the view wraps into). Under `nowrap` wrapping is skipped, so

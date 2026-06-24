@@ -112,12 +112,25 @@ impl EditHost {
         }
 
         // Project each window: its rect, per-window text/gutter/status data, and
-        // its own buffer's syntax/diagnostic slice.
-        let windows: Vec<Value> = view
-            .windows
-            .iter()
-            .map(|win| self.window_value(win, &view.mode_label, &statusline_fmt, &mut styles))
-            .collect();
+        // its own buffer's syntax/diagnostic slice. Each projection also yields the
+        // sign-column width it reserved this frame (a dynamic column grows to fit
+        // signs core can't see alone) — stashed below so the next mouse hit-test
+        // skips the same gutter the client is about to draw.
+        let mut windows: Vec<Value> = Vec::with_capacity(view.windows.len());
+        let mut sign_widths: Vec<(nxvim_core::WindowId, usize)> =
+            Vec::with_capacity(view.windows.len());
+        for win in &view.windows {
+            let (value, sign_width) =
+                self.window_value(win, &view.mode_label, &statusline_fmt, &mut styles);
+            windows.push(value);
+            sign_widths.push((win.id, sign_width as usize));
+        }
+        // Push each window's rendered sign width back into core, where the mouse
+        // hit-test reads it (`Editor::window_textoff`). `view` is an owned snapshot,
+        // so mutating the editor here doesn't disturb this frame.
+        for (id, cells) in sign_widths {
+            self.editor.set_window_sign_width(id, cells);
+        }
 
         // The single global status line (`laststatus=3`), spanning the full editor
         // width and showing the focused window's facts; `Nil` for modes 0/1/2,
@@ -319,13 +332,16 @@ impl EditHost {
     /// per-window text/cursor/gutter/status fields, and the window's own syntax
     /// highlights, diagnostic underlines, and scroll band (each resolving styles
     /// into the shared per-frame `styles` palette).
+    /// Project one window to its redraw map, returning it paired with the
+    /// sign-column width (in cells) it reserved — the caller stashes that width
+    /// back into core so the mouse hit-test skips the same gutter.
     fn window_value(
         &self,
         win: &WindowView,
         mode_label: &str,
         statusline_fmt: &str,
         styles: &mut StyleTable,
-    ) -> Value {
+    ) -> (Value, u16) {
         // The text body arrives as one self-describing `RenderRow` per screen row
         // (`win.rows`) — the single source of truth core projects from. The wire
         // still carries the parallel per-row arrays clients decode, so unbundle
@@ -413,7 +429,7 @@ impl EditHost {
             Some(s) => self.project_band(win.buffer, &win.winhl, s, styles),
             None => Value::Nil,
         };
-        Value::Map(vec![
+        let value = Value::Map(vec![
             (Value::from("rect"), rect_value(&win.rect)),
             (Value::from("region"), Value::from(region_str(win.region))),
             (Value::from("focused"), Value::from(win.focused)),
@@ -576,7 +592,8 @@ impl EditHost {
                     None => Value::Nil,
                 },
             ),
-        ])
+        ]);
+        (value, sign_width)
     }
 
     /// Project a window's status line as the `status` array — one `{ text, style }`

@@ -1607,7 +1607,10 @@
 
     function renderGutterCell(w, row, width) {
       let html = "";
-      if (serverStyled && w.sign_column) {
+      // Sign column (LSP diagnostics + extmark signs). The server merges and ships the
+      // per-row cell on BOTH builds, so paint it independent of `serverStyled` — on the
+      // wasm build there's no palette, so `id` is null and the severity colour is used.
+      if (w.sign_column) {
         const sign = w.diagnostics_signs?.[row];
         if (sign) {
           const [glyph, sev, id] = sign;

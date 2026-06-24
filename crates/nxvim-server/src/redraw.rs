@@ -407,9 +407,9 @@ impl EditHost {
         // Shared like `virt_text`.
         let virt_lines = self.virt_lines_value(&virt_lines, &win.winhl, styles);
         // The gutter signs (extmark `sign_text` merged with the LSP diagnostic signs)
-        // and the resulting column width. Extmark signs are core-shared, so this
-        // projects on BOTH builds (the merge runs diagnostics only under `native`);
-        // the width then follows the same `'signcolumn'` policy on either build.
+        // and the resulting column width. Both sign sources are core-/tick-shared, so
+        // this projects on BOTH builds; the width then follows the same `'signcolumn'`
+        // policy on either build.
         let sign_cells = self.merged_sign_cells(win.buffer, &win.winhl, &segments, styles);
         let diagnostics_signs = crate::extmarks::signs_value(&sign_cells);
         let sign_width = crate::extmarks::sign_width_from_cells(&sign_cells, win.signcolumn);

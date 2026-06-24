@@ -440,7 +440,9 @@ impl EditHost {
     /// [`DIAGNOSTIC_SIGN_PRIORITY`] (so an explicit extmark sign at the default
     /// extmark priority shows over a diagnostic; a plugin that wants the diagnostic
     /// to win sets its mark below that). Returns `None` on a row with no sign.
-    /// Diagnostics are native-only; extmark signs project on both builds.
+    /// Both sources project on both builds — the diagnostic render store
+    /// (`diagnostics_signs_for`) is tick-driven and feature-agnostic, so the wasm
+    /// build (LSP or `nx.diagnostic.set`) gets the gutter signs too.
     pub(crate) fn merged_sign_cells(
         &self,
         buffer: BufferId,
@@ -449,13 +451,10 @@ impl EditHost {
         styles: &mut StyleTable,
     ) -> Vec<Option<Value>> {
         let ext = self.extmark_sign_cells(buffer, winhl, segs, styles);
-        #[cfg(feature = "native")]
         let diag: Vec<Value> = match self.diagnostics_signs_for(buffer, winhl, segs, styles) {
             Value::Array(a) => a,
             _ => segs.iter().map(|_| Value::Nil).collect(),
         };
-        #[cfg(not(feature = "native"))]
-        let diag: Vec<Value> = segs.iter().map(|_| Value::Nil).collect();
 
         segs.iter()
             .enumerate()

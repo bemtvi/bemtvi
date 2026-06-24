@@ -165,6 +165,62 @@ if (h === 0) {
 // modules won't resolve (the browser build's runtimepath is empty), so this is one file.
 // A broken config is surfaced (non-fatal) — the editor still finishes booting.
 async function bootWithConfig() {
+  // Demo build only: on FIRST boot, seed OPFS with the demo project + tour + init.lua
+  // (web/demo-seed/, fetched as static assets). A sentinel (/.nxvim/.demo-seeded) makes this
+  // a one-time action, so a user's later edits persist across reloads. Runs BEFORE the
+  // init.lua read below so the seeded config applies on this very boot. Non-fatal on failure.
+  if (BUILD.demoSeed) {
+    try {
+      const seeded = await opfsRead("/.nxvim/.demo-seeded"); // kind 1 = absent (not seeded yet)
+      if (seeded.kind !== 0) {
+        const res = await fetch(new URL("demo-seed/manifest.json", import.meta.url));
+        if (!res.ok) throw new Error(`manifest HTTP ${res.status}`);
+        const files = (await res.json()).files || [];
+        const enc = new TextEncoder();
+        for (const rel of files) {
+          const f = await fetch(new URL(`demo-seed/${rel}`, import.meta.url));
+          if (!f.ok) throw new Error(`${rel} HTTP ${f.status}`);
+          const w = await opfsWrite(`/${rel}`, enc.encode(await f.text()));
+          if (!w.ok) throw new Error(`${rel}: ${w.error}`);
+        }
+        await opfsWrite("/.nxvim/.demo-seeded", enc.encode("1"));
+      }
+    } catch (e) {
+      postMessage({ type: "config_error", error: "demo seed: " + String(e) });
+    }
+  }
+  // Demo build only: source the vendored first-party plugin bundle (build-plugins.sh →
+  // web/vendor/plugins/plugins-bundle.lua, an immutable build asset fetched fresh per
+  // deploy). The standard editor ships no plugins (BUILD.plugins=false) and skips this. It
+  // runs BEFORE the OPFS bundle / init.lua so a user override and config `require(...)` both
+  // resolve. A broken/missing bundle is surfaced non-fatally; the editor still boots.
+  if (BUILD.plugins) {
+    try {
+      const res = await fetch(new URL("vendor/plugins/plugins-bundle.lua", import.meta.url));
+      if (res.ok) {
+        const err = readStr(eh_source_lua(h, await res.text()));
+        if (err) postMessage({ type: "config_error", error: "plugin bundle: " + err });
+      } else {
+        postMessage({ type: "config_error", error: `plugin bundle: HTTP ${res.status}` });
+      }
+    } catch (e) {
+      postMessage({ type: "config_error", error: "plugin bundle: " + String(e) });
+    }
+  }
+  // Source an amalgamated plugin bundle seeded into OPFS (a user-supplied bundle, or the
+  // Phase-5 test fixture) — same package.preload mechanism, so an `init.lua` that
+  // `require("nxvim-line")`-class resolves it. Absent → skipped, exactly like an absent
+  // init.lua. A broken bundle is surfaced (non-fatal); the editor still boots.
+  try {
+    const bundle = await opfsRead("/plugins-bundle.lua"); // kind 0 = file (raw `bytes`), 1 = absent
+    const bundleText = bundle.kind === 0 && bundle.bytes ? utf8(bundle.bytes) : "";
+    if (bundleText.length) {
+      const err = readStr(eh_source_lua(h, bundleText));
+      if (err) postMessage({ type: "config_error", error: "plugin bundle: " + err });
+    }
+  } catch (e) {
+    postMessage({ type: "config_error", error: "plugin bundle: " + String(e) });
+  }
   try {
     const cfg = await opfsRead("/init.lua"); // kind 0 = file (raw `bytes`), 1 = absent, 2 = dir, 3 = error
     // A file read returns RAW bytes (`opfsRead` keeps them undecoded for the binary-safe

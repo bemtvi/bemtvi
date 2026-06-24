@@ -105,6 +105,9 @@ try {
   // The gate is open even with no daemon: the local process host advertises a process host.
   // (`vim.system` would now enqueue; the terminal leg is what Phase 1 fulfils.)
   // Write a real python program to OPFS — flat (no indentation) so no autoindent intervenes.
+  // Type into a FRESH buffer: the demo build seeds + opens TOUR.md, whose content loads from
+  // OPFS asynchronously — `:enew` gives a clean [No Name] the pending read can't land in.
+  await page.evaluate(() => window.__nxvim.feed("<Esc>:enew<CR>"));
   await page.evaluate(() => window.__nxvim.feed("ifrom math import sqrt<CR>"));
   await page.evaluate(() => window.__nxvim.feed('print("PYRESULT", int(sqrt(1764)))<CR>'));
   await page.evaluate(() => window.__nxvim.feed('print("interpreter-ok")<Esc>'));

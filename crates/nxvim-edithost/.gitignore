@@ -27,3 +27,7 @@
 
 # basedpyright build clone (build-basedpyright.sh) — regenerated, not committed
 /.basedpyright-src
+
+# First-party plugin clones (build-plugins.sh) — regenerated, not committed. The
+# amalgamated bundle lands under /web/vendor (already ignored above).
+/.plugins-src

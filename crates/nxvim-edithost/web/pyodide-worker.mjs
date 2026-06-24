@@ -31,6 +31,8 @@ let loading = null; // the in-flight load promise (so concurrent opens share one
 let curBuf = null; // the script-mode terminal buffer stdout streams to (one run at a time)
 let interruptBuffer = null; // Uint8Array over a SAB; the editor writes 2 to request a SIGINT
 let procRun = null; // PyProxy of __nx_proc_run, the async-proc (`vim.system`/`jobstart`) runner
+let shExec = null; // PyProxy of __nx_sh_exec, the minimal-shell line executor (bare `:terminal`)
+let nativeFs = null; // mountNativeFS handle; nativeFs.syncfs() persists shell FS writes back to OPFS
 const procKills = new Set(); // proc ids asked to stop before their run could begin
 
 const enc = new TextEncoder();
@@ -72,7 +74,9 @@ async function ensurePyodide() {
     // files live at the OPFS root, so an editor path `/main.py` maps to `/project/main.py`.
     const root = await navigator.storage.getDirectory();
     py.FS.mkdirTree("/project");
-    await py.mountNativeFS("/project", root);
+    // Keep the mount handle: nativeFs.syncfs() writes the shell's FS mutations back to OPFS
+    // (reads through the mount are already live; writes need an explicit sync).
+    nativeFs = await py.mountNativeFS("/project", root);
     // Line-buffer stdout/stderr so each print flushes immediately (without a TTY python would
     // block-buffer and the tail would flush only at teardown, after we post the exit). The runner
     // runs a file as __main__, translating SystemExit / exceptions into an exit code.
@@ -203,7 +207,537 @@ def __nx_proc_run(kind, payload, sys_argv, stdin_text, env_pairs, stream, emit, 
     stdout_bytes = b"" if stream else out.getvalue().encode("utf-8", "replace")
     return (code, stdout_bytes, err.getvalue().encode("utf-8", "replace"))
 `);
+    // The minimal POSIX-ish shell that backs a bare `:terminal`. Implemented in python so its
+    // builtins share the interpreter's exact FS view (the /project mount). The JS side does only
+    // line editing + syncfs; __nx_sh_exec(line) parses + runs one command line and returns
+    // [stdout, stderr, code, exit_flag, cwd_display].
+    py.runPython(`
+import shlex as _shlex, glob as _glob, shutil as _shutil
+
+class _Shell:
+    def __init__(self):
+        self.cwd = "/project"
+        self.env = {"HOME": "/project", "PWD": "/project"}
+
+_sh = _Shell()
+
+def _disp(p):
+    # mount path -> editor path for display ("/project/x" -> "/x", "/project" -> "/")
+    if p == "/project":
+        return "/"
+    if p.startswith("/project/"):
+        return p[len("/project"):]
+    return p
+
+def _resolve(arg, cwd):
+    # editor/relative path -> normalized mount path, clamped so it can never escape /project
+    if not arg:
+        return cwd
+    if arg.startswith("/"):
+        p = os.path.normpath("/project" + arg)
+    else:
+        p = os.path.normpath(os.path.join(cwd, arg))
+    if p != "/project" and not p.startswith("/project/"):
+        return "/project"
+    return p
+
+def _tok(line):
+    lex = _shlex.shlex(line, posix=True, punctuation_chars=True)
+    lex.whitespace_split = True
+    return list(lex)
+
+def _expand(tokens, cwd):
+    out = []
+    for t in tokens:
+        # expand dollar-VAR and curly-brace forms from the shell env
+        s = ""
+        i = 0
+        while i < len(t):
+            if t[i] == "$" and i + 1 < len(t):
+                j = i + 1
+                if t[j] == "{":
+                    k = t.find("}", j)
+                    if k != -1:
+                        s += _sh.env.get(t[j + 1:k], "")
+                        i = k + 1
+                        continue
+                k = j
+                while k < len(t) and (t[k].isalnum() or t[k] == "_"):
+                    k += 1
+                s += _sh.env.get(t[j:k], "")
+                i = k
+                continue
+            s += t[i]
+            i += 1
+        if any(c in s for c in "*?["):
+            pat = s if s.startswith("/") else os.path.join(cwd, s)
+            matches = _glob.glob(pat)
+            if matches:
+                out.extend(sorted(_disp(m) if s.startswith("/") else os.path.relpath(m, cwd) for m in matches))
+                continue
+        out.append(s)
+    return out
+
+def _read_inputs(files, sin, cwd):
+    if not files:
+        return sin
+    txt = ""
+    for x in files:
+        with open(_resolve(x, cwd)) as f:
+            txt += f.read()
+    return txt
+
+def _bi_pwd(a, sin, cwd):
+    return (_disp(cwd) + "\\n", "", 0)
+
+def _bi_cd(a, sin, cwd):
+    target = a[0] if a else "/"
+    p = _resolve(target, cwd)
+    if os.path.isdir(p):
+        _sh.cwd = p
+        _sh.env["PWD"] = p
+        return ("", "", 0)
+    return ("", "cd: " + target + ": No such directory\\n", 1)
+
+def _bi_echo(a, sin, cwd):
+    nl = "\\n"
+    if a and a[0] == "-n":
+        nl = ""
+        a = a[1:]
+    return (" ".join(a) + nl, "", 0)
+
+def _bi_ls(a, sin, cwd):
+    show_all = False
+    paths = []
+    for x in a:
+        if x.startswith("-"):
+            if "a" in x:
+                show_all = True
+        else:
+            paths.append(x)
+    if not paths:
+        paths = ["."]
+    out = ""
+    err = ""
+    code = 0
+    for x in paths:
+        p = _resolve(x, cwd)
+        try:
+            if os.path.isdir(p):
+                for n in sorted(os.listdir(p)):
+                    if not show_all and n.startswith("."):
+                        continue
+                    out += n + ("/" if os.path.isdir(os.path.join(p, n)) else "") + "\\n"
+            elif os.path.exists(p):
+                out += x + "\\n"
+            else:
+                err += "ls: " + x + ": No such file or directory\\n"
+                code = 1
+        except Exception as e:
+            err += "ls: " + str(e) + "\\n"
+            code = 1
+    return (out, err, code)
+
+def _bi_cat(a, sin, cwd):
+    if not a:
+        return (sin, "", 0)
+    out = ""
+    err = ""
+    code = 0
+    for x in a:
+        try:
+            with open(_resolve(x, cwd)) as f:
+                out += f.read()
+        except Exception:
+            err += "cat: " + x + ": No such file or directory\\n"
+            code = 1
+    return (out, err, code)
+
+def _bi_mkdir(a, sin, cwd):
+    parents = False
+    targets = []
+    for x in a:
+        if x == "-p":
+            parents = True
+        elif not x.startswith("-"):
+            targets.append(x)
+    err = ""
+    code = 0
+    for x in targets:
+        p = _resolve(x, cwd)
+        try:
+            if parents:
+                os.makedirs(p, exist_ok=True)
+            else:
+                os.mkdir(p)
+        except FileExistsError:
+            err += "mkdir: " + x + ": File exists\\n"
+            code = 1
+        except Exception as e:
+            err += "mkdir: " + x + ": " + str(e) + "\\n"
+            code = 1
+    return ("", err, code)
+
+def _bi_rm(a, sin, cwd):
+    rec = False
+    force = False
+    targets = []
+    for x in a:
+        if x.startswith("-"):
+            if "r" in x or "R" in x:
+                rec = True
+            if "f" in x:
+                force = True
+        else:
+            targets.append(x)
+    err = ""
+    code = 0
+    for x in targets:
+        p = _resolve(x, cwd)
+        try:
+            if os.path.isdir(p):
+                if rec:
+                    _shutil.rmtree(p)
+                else:
+                    err += "rm: " + x + ": is a directory\\n"
+                    code = 1
+            elif os.path.exists(p):
+                os.remove(p)
+            elif not force:
+                err += "rm: " + x + ": No such file or directory\\n"
+                code = 1
+        except Exception as e:
+            err += "rm: " + x + ": " + str(e) + "\\n"
+            code = 1
+    return ("", err, code)
+
+def _bi_mv(a, sin, cwd):
+    rest = [x for x in a if not x.startswith("-")]
+    if len(rest) < 2:
+        return ("", "mv: missing operand\\n", 1)
+    dst = _resolve(rest[-1], cwd)
+    err = ""
+    code = 0
+    for s in rest[:-1]:
+        try:
+            _shutil.move(_resolve(s, cwd), dst)
+        except Exception as e:
+            err += "mv: " + s + ": " + str(e) + "\\n"
+            code = 1
+    return ("", err, code)
+
+def _bi_cp(a, sin, cwd):
+    rec = False
+    rest = []
+    for x in a:
+        if x.startswith("-"):
+            if "r" in x or "R" in x:
+                rec = True
+        else:
+            rest.append(x)
+    if len(rest) < 2:
+        return ("", "cp: missing operand\\n", 1)
+    dst = _resolve(rest[-1], cwd)
+    err = ""
+    code = 0
+    for s in rest[:-1]:
+        sp = _resolve(s, cwd)
+        try:
+            if os.path.isdir(sp):
+                if rec:
+                    target = os.path.join(dst, os.path.basename(sp)) if os.path.isdir(dst) else dst
+                    _shutil.copytree(sp, target)
+                else:
+                    err += "cp: " + s + ": is a directory\\n"
+                    code = 1
+            else:
+                _shutil.copy(sp, dst)
+        except Exception as e:
+            err += "cp: " + s + ": " + str(e) + "\\n"
+            code = 1
+    return ("", err, code)
+
+def _bi_touch(a, sin, cwd):
+    err = ""
+    code = 0
+    for x in a:
+        if x.startswith("-"):
+            continue
+        p = _resolve(x, cwd)
+        try:
+            with open(p, "a"):
+                os.utime(p, None)
+        except Exception as e:
+            err += "touch: " + x + ": " + str(e) + "\\n"
+            code = 1
+    return ("", err, code)
+
+def _bi_head(a, sin, cwd):
+    n = 10
+    files = []
+    i = 0
+    while i < len(a):
+        if a[i] == "-n" and i + 1 < len(a):
+            n = int(a[i + 1])
+            i += 2
+            continue
+        if a[i].startswith("-") and a[i][1:].isdigit():
+            n = int(a[i][1:])
+            i += 1
+            continue
+        files.append(a[i])
+        i += 1
+    try:
+        txt = _read_inputs(files, sin, cwd)
+    except Exception:
+        return ("", "head: cannot open input\\n", 1)
+    lines = txt.splitlines()[:n]
+    return (("\\n".join(lines) + "\\n") if lines else "", "", 0)
+
+def _bi_tail(a, sin, cwd):
+    n = 10
+    files = []
+    i = 0
+    while i < len(a):
+        if a[i] == "-n" and i + 1 < len(a):
+            n = int(a[i + 1])
+            i += 2
+            continue
+        if a[i].startswith("-") and a[i][1:].isdigit():
+            n = int(a[i][1:])
+            i += 1
+            continue
+        files.append(a[i])
+        i += 1
+    try:
+        txt = _read_inputs(files, sin, cwd)
+    except Exception:
+        return ("", "tail: cannot open input\\n", 1)
+    lines = txt.splitlines()[-n:]
+    return (("\\n".join(lines) + "\\n") if lines else "", "", 0)
+
+def _bi_wc(a, sin, cwd):
+    flags = [x for x in a if x.startswith("-")]
+    files = [x for x in a if not x.startswith("-")]
+    try:
+        txt = _read_inputs(files, sin, cwd)
+    except Exception:
+        return ("", "wc: cannot open input\\n", 1)
+    lc = len(txt.splitlines())
+    wc = len(txt.split())
+    cc = len(txt)
+    if "-l" in flags:
+        return (str(lc) + "\\n", "", 0)
+    if "-w" in flags:
+        return (str(wc) + "\\n", "", 0)
+    if "-c" in flags:
+        return (str(cc) + "\\n", "", 0)
+    return ("%d %d %d\\n" % (lc, wc, cc), "", 0)
+
+def _bi_env(a, sin, cwd):
+    return ("".join(k + "=" + v + "\\n" for k, v in sorted(_sh.env.items())), "", 0)
+
+def _bi_clear(a, sin, cwd):
+    return ("\\x1b[2J\\x1b[H", "", 0)
+
+def _bi_which(a, sin, cwd):
+    out = ""
+    code = 0
+    for x in a:
+        if x == "python":
+            out += "python\\n"
+        elif x in _BUILTINS or x in ("exit", "export", "cd"):
+            out += x + ": shell builtin\\n"
+        else:
+            code = 1
+    return (out, "", code)
+
+_BUILTINS = {
+    "pwd": _bi_pwd, "cd": _bi_cd, "echo": _bi_echo, "ls": _bi_ls, "cat": _bi_cat,
+    "mkdir": _bi_mkdir, "rm": _bi_rm, "mv": _bi_mv, "cp": _bi_cp, "touch": _bi_touch,
+    "head": _bi_head, "tail": _bi_tail, "wc": _bi_wc, "env": _bi_env, "clear": _bi_clear,
+    "which": _bi_which,
+}
+
+def _run_python(a, sin, cwd):
+    out = io.StringIO()
+    err = io.StringIO()
+    old_argv, old_stdin, old_cwd = sys.argv, sys.stdin, os.getcwd()
+    code = 0
+    try:
+        os.chdir(cwd)
+        sys.stdin = io.StringIO(sin)
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            if len(a) >= 3 and a[1] == "-c":
+                sys.argv = ["-c"] + list(a[3:])
+                exec(compile(a[2], "<string>", "exec"), {"__name__": "__main__"})
+            elif len(a) >= 2 and a[1] == "-":
+                exec(compile(sin, "<stdin>", "exec"), {"__name__": "__main__"})
+            elif len(a) >= 2:
+                sys.argv = [a[1]] + list(a[2:])
+                runpy.run_path(_resolve(a[1], cwd), run_name="__main__")
+            else:
+                err.write("python: no REPL inside the shell — use \\\`:terminal python\\\`, or python <file>/-c\\n")
+                code = 127
+    except SystemExit as e:
+        code = 0 if e.code is None else (e.code if isinstance(e.code, int) else 1)
+    except BaseException:
+        traceback.print_exc(file=err)
+        code = 1
+    finally:
+        sys.argv, sys.stdin = old_argv, old_stdin
+        try:
+            os.chdir(old_cwd)
+        except Exception:
+            pass
+    return (out.getvalue(), err.getvalue(), code)
+
+def _run_simple(cmd, sin):
+    # leading VAR=val assignments (command-scoped, unless bare → persisted)
+    assigns = {}
+    while cmd and ("=" in cmd[0]) and not cmd[0].startswith("=") and cmd[0].split("=", 1)[0].replace("_", "").isalnum():
+        k, v = cmd[0].split("=", 1)
+        assigns[k] = v
+        cmd = cmd[1:]
+    if not cmd:
+        for k, v in assigns.items():
+            _sh.env[k] = v
+        return ("", "", 0, False)
+    saved = {k: _sh.env.get(k) for k in assigns}
+    _sh.env.update(assigns)
+    try:
+        args = _expand(cmd, _sh.cwd)
+    finally:
+        for k, old in saved.items():
+            if old is None:
+                _sh.env.pop(k, None)
+            else:
+                _sh.env[k] = old
+    name = args[0]
+    rest = args[1:]
+    if name == "exit":
+        return ("", "", int(rest[0]) if rest and rest[0].lstrip("-").isdigit() else 0, True)
+    if name == "export":
+        for x in rest:
+            if "=" in x:
+                k, v = x.split("=", 1)
+                _sh.env[k] = v
+        return ("", "", 0, False)
+    bi = _BUILTINS.get(name)
+    if bi:
+        try:
+            o, e, c = bi(rest, sin, _sh.cwd)
+            return (o, e, c, False)
+        except Exception as ex:
+            return ("", name + ": " + str(ex) + "\\n", 1, False)
+    if name == "python":
+        o, e, c = _run_python(args, sin, _sh.cwd)
+        return (o, e, c, False)
+    return ("", name + ": command not found\\n", 127, False)
+
+def _split_redir(st):
+    cmd = []
+    rin = rout = None
+    app = False
+    i = 0
+    while i < len(st):
+        t = st[i]
+        if t == ">" and i + 1 < len(st):
+            rout = st[i + 1]
+            app = False
+            i += 2
+        elif t == ">>" and i + 1 < len(st):
+            rout = st[i + 1]
+            app = True
+            i += 2
+        elif t == "<" and i + 1 < len(st):
+            rin = st[i + 1]
+            i += 2
+        else:
+            cmd.append(t)
+            i += 1
+    return cmd, rin, rout, app
+
+def _run_pipeline(toks):
+    stages = []
+    cur = []
+    for t in toks:
+        if t == "|":
+            stages.append(cur)
+            cur = []
+        else:
+            cur.append(t)
+    stages.append(cur)
+    data = ""
+    err = ""
+    code = 0
+    for st in stages:
+        cmd, rin, rout, app = _split_redir(st)
+        if not cmd:
+            continue
+        sin = data
+        if rin is not None:
+            try:
+                with open(_resolve(rin, _sh.cwd)) as f:
+                    sin = f.read()
+            except Exception:
+                return ("", "shell: " + rin + ": No such file\\n", 1, False)
+        o, e, code, ex = _run_simple(cmd, sin)
+        err += e
+        if ex:
+            return (o, err, code, True)
+        if rout is not None:
+            try:
+                with open(_resolve(rout, _sh.cwd), "a" if app else "w") as f:
+                    f.write(o)
+                o = ""
+            except Exception as ee:
+                err += "shell: " + rout + ": " + str(ee) + "\\n"
+                code = 1
+        data = o
+    return (data, err, code, False)
+
+def __nx_sh_exec(line):
+    line = line.strip()
+    if not line:
+        return ["", "", 0, False, _disp(_sh.cwd)]
+    try:
+        toks = _tok(line)
+    except ValueError as e:
+        return ["", "shell: " + str(e) + "\\n", 2, False, _disp(_sh.cwd)]
+    segs = []
+    cur = []
+    conn = ";"
+    for t in toks:
+        if t in (";", "&&", "||"):
+            segs.append((conn, cur))
+            cur = []
+            conn = t
+        else:
+            cur.append(t)
+    segs.append((conn, cur))
+    out = ""
+    err = ""
+    last = 0
+    do_exit = False
+    for conn, stoks in segs:
+        if not stoks:
+            continue
+        if conn == "&&" and last != 0:
+            continue
+        if conn == "||" and last == 0:
+            continue
+        o, e, c, ex = _run_pipeline(stoks)
+        out += o
+        err += e
+        last = c
+        if ex:
+            do_exit = True
+            break
+    return [out, err, int(last), bool(do_exit), _disp(_sh.cwd)]
+`);
     procRun = py.globals.get("__nx_proc_run");
+    shExec = py.globals.get("__nx_sh_exec");
     pyodide = py;
     return py;
   })();
@@ -355,11 +889,111 @@ function replWrite(bytes) {
   }
 }
 
-// `:terminal <argv>`. `python <file>` runs a script; bare `python` opens the REPL; anything else
-// fails loud rather than silently doing nothing.
+// ── shell mode: bare `:terminal` ─────────────────────────────────────────────────────────────
+// A minimal POSIX-ish shell. Same cooked-mode line discipline as the REPL, but each completed
+// line is run by the python executor `__nx_sh_exec` (builtins + pipelines + `python` stages), and
+// FS mutations are flushed back to OPFS with syncfs after every line.
+let shell = null; // { buf, line: number[], running, cwd } when a shell is open
+
+async function startShell(buf) {
+  let py;
+  try {
+    emit(buf, "loading python (first run)…\n");
+    py = await ensurePyodide();
+  } catch (e) {
+    postMessage({ type: "error", error: `pyodide load failed: ${e && e.message ? e.message : e}` });
+    postMessage({ type: "exit", buf, code: 1 });
+    return;
+  }
+  curBuf = buf;
+  shell = { buf, line: [], running: false, cwd: "/" };
+  emit(buf, "nxvim shell — builtins (ls cat cd echo mkdir rm …), pipes/redirects, `python <file>`; Ctrl-D exits\n");
+  shellPrompt();
+}
+
+function shellPrompt() {
+  if (shell) emit(shell.buf, `${shell.cwd} $ `);
+}
+
+// Run one accumulated command line: a SYNC python call (so a runaway `python` stage is Ctrl-C-able
+// via the SAB), then syncfs to persist any file writes back to OPFS.
+async function shellSubmit(line) {
+  if (interruptBuffer) Atomics.store(interruptBuffer, 0, 0); // clear any stale SIGINT
+  shell.running = true;
+  let out = "", err = "", code = 0, ex = false, cwd = shell.cwd;
+  try {
+    const r = shExec(line);
+    [out, err, code, ex, cwd] = r.toJs();
+    r.destroy();
+  } catch (e) {
+    err = `${e && e.message ? e.message : e}\n`;
+    code = 1;
+  }
+  shell.running = false;
+  shell.cwd = cwd;
+  if (out) emit(shell.buf, out);
+  if (err) emit(shell.buf, err);
+  try {
+    if (nativeFs) await nativeFs.syncfs();
+  } catch (e) {
+    emit(shell.buf, `shell: syncfs failed: ${e && e.message ? e.message : e}\n`);
+  }
+  if (!shell) return; // a kill arrived mid-run
+  if (ex) {
+    const b = shell.buf;
+    shell = null;
+    postMessage({ type: "exit", buf: b, code });
+    return;
+  }
+  shellPrompt();
+}
+
+function shellWrite(bytes) {
+  for (let i = 0; i < bytes.length; i++) {
+    const b = bytes[i];
+    if (b === 0x0d || b === 0x0a) {
+      emit(shell.buf, "\n");
+      if (shell.running) continue; // ignore Enter while a command runs
+      const line = dec.decode(new Uint8Array(shell.line));
+      shell.line = [];
+      shellSubmit(line);
+    } else if (b === 0x7f || b === 0x08) {
+      if (shell.line.length) {
+        shell.line.pop();
+        emit(shell.buf, "\b \b");
+      }
+    } else if (b === 0x03) {
+      // Ctrl-C: a running stage was already SIGINT'd via the SAB; at the prompt, cancel the line.
+      if (!shell.running) {
+        shell.line = [];
+        emit(shell.buf, "^C\n");
+        shellPrompt();
+      }
+    } else if (b === 0x04) {
+      // Ctrl-D on an empty line ends the shell.
+      if (shell.line.length === 0 && !shell.running) {
+        emit(shell.buf, "\n");
+        const buf = shell.buf;
+        shell = null;
+        postMessage({ type: "exit", buf, code: 0 });
+        return;
+      }
+    } else if (b >= 0x20) {
+      shell.line.push(b);
+      emit(shell.buf, String.fromCharCode(b));
+    }
+  }
+}
+
+// `:terminal <argv>`. Bare `:terminal` (empty argv) opens the shell; `python <file>` runs a script;
+// bare `python` opens the REPL; anything else fails loud rather than silently doing nothing.
 async function open(buf, argv) {
-  if (!Array.isArray(argv) || argv.length === 0 || argv[0] !== "python") {
-    emit(buf, `nxvim web demo: the in-browser terminal runs \`python [file]\` (got: ${(argv || []).join(" ") || "<shell>"})\n`);
+  if (!Array.isArray(argv) || argv.length === 0) {
+    await startShell(buf);
+    return;
+  }
+  if (argv[0] !== "python") {
+    emit(buf, `${argv.join(" ")}: command not found (this terminal runs the built-in shell or \`python\`)\n`);
     postMessage({ type: "exit", buf, code: 127 });
     return;
   }
@@ -454,11 +1088,13 @@ onmessage = (ev) => {
       postMessage({ type: "error", error: `pyodide open: ${e && e.message ? e.message : e}` }),
     );
   } else if (m.type === "write") {
-    // Keystrokes to the child. Meaningful in REPL mode (line editing); a running script ignores
-    // stdin for now (input() lands in a later phase).
+    // Keystrokes to the child. Meaningful in REPL / shell mode (line editing); a running script
+    // ignores stdin for now (input() lands in a later phase).
     if (repl && repl.buf === m.buf) replWrite(new Uint8Array(m.bytes));
+    else if (shell && shell.buf === m.buf) shellWrite(new Uint8Array(m.bytes));
   } else if (m.type === "kill") {
     if (repl && repl.buf === m.buf) repl = null;
+    if (shell && shell.buf === m.buf) shell = null;
     if (curBuf === m.buf) curBuf = null;
   }
 };

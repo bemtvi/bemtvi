@@ -1,6 +1,6 @@
 # Plan: full in-browser python demo (Pyodide terminal + LSP, static site)
 
-**Status:** proposed — awaiting sign-off
+**Status:** ✅ COMPLETE — all phases (0–8) done; the demo is feature-complete
 **Date:** 2026-06-23
 **Owner thread:** web/edithost
 
@@ -258,22 +258,80 @@ sees what the editor shows and edits are visible to the interpreter.
   verify issues hover via `nx.lsp.request`); completion/go-to-def UX and multi-file project seeding
   (cross-file analysis) are later slices. The demo's `init.lua` LSP config lands in Phase 6.
 
-### Phase 5 — single-file plugin bundle (amalgamation) — *medium (spike #2)*
-- Build step: amalgamate each plugin's Lua tree into ONE `package.preload`-registering Lua
-  file; the existing single-file `init.lua` boot path sources it, then `require`s modules
-  from the preload table (no filesystem, no runtimepath).
-- **Verify:** `require('which-key')`-class resolves from the bundle; a plugin `setup()` runs.
+### Phase 5 — single-file plugin bundle (amalgamation) — *medium (spike #2)* — ✅ DONE
+- **Spike #2 confirmed GREEN:** `package.preload` + the stock `require` resolve a multi-module
+  bundle (including a submodule that itself `require`s another submodule) in the wasm VM — the
+  preload searcher is `require`'s first searcher and `StdLib::ALL_SAFE` loads `package`.
+- **`web/amalgamate-plugins.mjs`** — the build step. Walks each plugin's `lua/` tree, maps each
+  `.lua` to its module name following the default `package.path` order (`foo/init.lua`→`foo`,
+  `foo/bar.lua`→`foo.bar`), and concatenates every module's source into ONE chunk that registers
+  `package.preload["mod"] = function(...) <body> end`. A trailing newline guards a final
+  `-- comment`; duplicate module names across plugins error (no silent clobber). Both a CLI
+  (`-o OUT.lua PLUGIN_DIR…`, or stdout) and an exported `amalgamate(dirs)` the verifier calls.
+- **Boot wiring (`web/worker.mjs`):** `bootWithConfig` sources `/plugins-bundle.lua` from OPFS
+  **before** `/init.lua`, so an `init.lua` that `require("nxvim-line")`-class resolves it from the
+  preload table. Absent (the standard editor seeds none) → skipped, exactly like an absent
+  init.lua; a broken bundle is surfaced non-fatally. The wrapper is sound for any module (a valid
+  Lua chunk is a valid function body → top-level locals stay module-scoped, the file's `return`
+  becomes the module value). *(Seeding the actual first-party bundle into OPFS rides the
+  project-seeding in Phase 6/7; Phase 5 is the mechanism + a general amalgamator.)*
+- **Verified:** `verify-plugin-bundle.mjs` — a multi-file fixture plugin ("which-key": init +
+  config + util, init requiring BOTH submodules) is amalgamated, seeded to OPFS, and
+  `require("which-key").setup{ delay=50 }` runs at boot; its composed label `[which-key@50]`
+  (default name + overridden delay, util-formatted) proves nested require + defaults-merge +
+  return-value threading. Also: a submodule resolves via `require` post-boot (preload persists),
+  a missing module fails loud, and with the bundle absent `require("which-key")` fails (no ambient
+  leak) yet the editor still boots + edits. No regressions: `verify.mjs` + `verify-config.mjs`.
 
-### Phase 6 — bundle the first-party plugins + catppuccin + demo init.lua — *medium*
-- Wire which-key, nvim-tree, lualine, lspconfig, diff + catppuccin; a demo `init.lua`
-  configuring the python LSP, highlighting, and keymaps.
-- **Verify:** plugins load, theme applies, statusline renders.
+### Phase 6 — bundle the first-party plugins + catppuccin + demo init.lua — *medium* — ✅ DONE
+- **Load-bearing shared-core fix (`build.sh` `-sSTACK_SIZE=8MB`):** emscripten's `cwrap`
+  marshals a `"string"` arg onto the C stack (`stringToUTF8OnStack`), and the default stack is
+  64 KB — so `eh_source_lua`/`eh_exec_lua` of any Lua chunk >64 KB trapped (`memory access out
+  of bounds`). The 352 KB plugin bundle hit it; a large user `init.lua` would have too. Bumping
+  the stack to 8 MB fixes it for both builds (verified: the full bundle sources + all 6 plugins
+  `setup()` cleanly).
+- **`build-plugins.sh`** — clones the recommended set (`davidrios/{nxvim-keys-helper,nxvim-tree,
+  nxvim-line,nxvim-lspconfig,nxvim-diff}`) + `davidrios/catppuccin-nxvim` at **pinned commits**
+  (full clone + checkout SHA, so an arbitrary pin resolves), then runs `amalgamate-plugins.mjs`
+  over all six `lua/` trees → `web/vendor/plugins/plugins-bundle.lua`. Idempotent (`--force`),
+  clones cached in `.plugins-src` (gitignored), `NXVIM_PLUGINS_BASE` overrides the host.
+- **Boot wiring:** `web/build-config.js` gains `plugins:false`; `package-site.sh --demo` flips it
+  true, runs `build-plugins.sh`, and ships the bundle (standard flavor strips `web/vendor/plugins`).
+  `worker.mjs` (demo build only, `BUILD.plugins`) fetches + sources the vendored bundle BEFORE the
+  OPFS bundle / init.lua, so the config's `require("nxvim-line")`-class resolves from
+  `package.preload`. Missing/broken → non-fatal.
+- **`web/demo-init.lua`** — the demo config: catppuccin mocha (`require("catppuccin").load()` —
+  the colorscheme path a runtimepath-less browser can't source), which-key (keys-helper), the
+  tree sidebar (`<leader>e`), the lualine-style statusline (`theme="auto"`), the LSP keymaps
+  (lspconfig), the diff commands, and the python LSP via `nx.lsp.config/enable("basedpyright")`
+  (the Phase-4 path; the local host routes any spawn to the bundled basedpyright worker).
+  *(Auto-seeding this into OPFS on first boot rides Phase 7; the verify seeds it directly.)*
+- **Verified:** `verify-plugin-demo.mjs` (against `demo-site/`) — all six modules load from the
+  bundle (`package.loaded`), catppuccin mocha applied (`Normal` = `#cdd6f4`/`#1e1e2e` from the
+  real hl registry), the nxvim-line statusline renders (the `NORMAL` mode segment is in the
+  redraw frame the client paints), and basedpyright is configured + enabled. No regressions:
+  `verify.mjs` / `verify-config.mjs` / `verify-plugin-bundle.mjs` / `verify-pyodide-terminal.mjs`.
 
-### Phase 7 — pre-loaded demo project + tour + python grammar — *medium*
-- Seed OPFS on first boot with a small but **real** multi-file python project + a
-  README/guided-tour buffer. Pre-bundle the python tree-sitter grammar so highlighting
-  works with no `:TSInstall`.
-- **Verify:** project present after boot, highlight colors, tour buffer opens.
+### Phase 7 — pre-loaded demo project + tour + python grammar — *medium* — ✅ DONE
+- **Python tree-sitter grammar was already bundled offline:** `python` is in `web/grammars.js`
+  `BUNDLED` (→ `web/vendor/grammars/python.wasm` + manifest, shipped by the blanket vendor copy),
+  so `.py` highlights with no `:TSInstall`. Phase 7 only had to add the project + tour seeding.
+- **First-boot OPFS seeding (`web/demo-seed/` + `worker.mjs`):** the seed dir holds the editable
+  config (`init.lua`, moved here from `demo-init.lua`), a small real typed python project
+  (`main.py` + `geometry.py`), the guided tour (`TOUR.md`), and a `manifest.json`. On first boot
+  (demo build, `BUILD.demoSeed`) `bootWithConfig` fetches the manifest + each file and writes them
+  into OPFS, guarded by a sentinel (`/.nxvim/.demo-seeded`) so it runs **once** — a user's later
+  edits persist across reloads, never clobbered. Runs before the init.lua read so the seeded
+  config applies on that same boot. `package-site.sh --demo` ships `web/demo-seed/` + flips the flag.
+- **Tour opens on boot:** `init.lua` ends with `edit /TOUR.md` (harmless if absent → empty buffer).
+- **Verified:** `verify-demo-seed.mjs` — from a cleared OPFS, first boot seeds the project + tour +
+  config (read straight back from storage), the tour opens as the startup buffer, `main.py`
+  highlights offline (colored spans, no `:TSInstall` — python grammar pre-bundled), and seeding is
+  one-time (a user edit survives a reload). No regressions across the whole web suite: standard
+  (`verify.mjs`), plugin demo (`verify-plugin-demo.mjs`), and the python legs
+  (`verify-pyodide-{terminal,repl,proc}.mjs`, `verify-basedpyright-lsp.mjs`) — the terminal verify
+  was made seed-robust by typing into a fresh `:enew` buffer (the async `/TOUR.md` read can't land
+  in it) instead of the seeded startup buffer.
 
 ### Phase 8 — deployment / packaging — *medium* — ✅ DONE (deploy wiring; revisit for plugins)
 - Two separate Netlify sites from one repo: **nxvim** (standard editor) via the root
@@ -285,14 +343,41 @@ sees what the editor shows and edits are visible to the interpreter.
   + flips the flag). Pyodide self-hosted (COEP `require-corp` satisfied); `_headers` gives
   cross-origin isolation (the editor's SAB *and* Pyodide's interrupt). Lazy-load keeps the
   ~6 MB off the first paint.
+- **Plugin bundle + project-tour assets now in `--demo` packaging (Phases 6–7):**
+  `package-site.sh --demo` runs `build-plugins.sh` and ships `web/vendor/plugins/plugins-bundle.lua`
+  + `web/demo-seed/`, and flips `build-config` `plugins`/`demoSeed` true; the standard flavor strips
+  `web/vendor/plugins` and ships neither. So the `netlify-build-demo.sh` deploy is complete.
 - **Verified:** the packaged **standard** `_site/` boots green (`verify.mjs` via
   `NXVIM_SERVE_ROOT=_site` — also proving the `build-config.js` packaging fix), and the
   packaged **demo** site (`build-demo.sh` → `package-site --demo`) runs `:terminal python`
-  (`verify-pyodide-terminal.mjs`). *(Will need the plugin bundle + project-tour assets added to
-  the `--demo` packaging in later phases.)*
+  (`verify-pyodide-terminal.mjs`), loads the plugin set (`verify-plugin-demo.mjs`), and seeds the
+  project/tour (`verify-demo-seed.mjs`).
+
+### Phase 9 — minimal POSIX shell in `:terminal` — *medium* — ✅ DONE
+- **Bare `:terminal` now opens a minimal shell** (was: fail-loud 127). `:terminal python [file]`
+  stays the REPL/script path; the core passes an **empty argv** for bare `:terminal`
+  (`nxvim-core/.../terminal.rs` — empty argv = default shell), which `pyodide-worker.mjs open()`
+  routes to the shell. Reuses the REPL's cooked-mode line editor (echo/Backspace/Enter/Ctrl-C/D),
+  the SAB interrupt (a runaway `python` stage is `Ctrl-C`-able), and the Pyodide `/project` mount.
+- **The shell executor is python (`__nx_sh_exec`), so builtins share python's exact FS view.** A
+  line is tokenized with `shlex(posix, punctuation_chars)` (quotes + operators), split on
+  `;`/`&&`/`||`, then per statement into a `|` pipeline with `>`/`>>`/`<` redirects; each stage
+  threads stdout→stdin as a string. Builtins (`cd pwd ls cat echo mkdir rm mv cp touch head tail
+  wc which env export clear exit`) run over the mounted FS; `$VAR`/`${ }` expansion, `VAR=val`
+  (command-scoped) + `export`, and `*?[` globbing are supported; `python [file|-c|-]` runs
+  in-process (stdin-aware); anything else → `command not found` (127).
+- **Write-back to OPFS only (no live editor-buffer refresh, per the decision):** the
+  `mountNativeFS` handle is captured and `nativeFs.syncfs()` runs after each command line, so file
+  mutations (`echo hi > f`, `mkdir`, `rm`) persist to OPFS. `nxvim-tree`'s `nx.fs` watch shows new
+  files; an already-open editor buffer is not auto-reloaded (a `:e!` re-reads it).
+- **Verified:** `verify-pyodide-shell.mjs` — `pwd`/`ls` (sees the seeded project), `echo … > f` +
+  `cat f` (and the bytes land in OPFS), a `cat … | python -c …` pipe (stdin into a python stage),
+  `cd`/`mkdir` + persisted dir, `$VAR`/`export`, and `command not found`. The tour (TOUR.md) now
+  leads with the shell. No regressions: the terminal/repl/proc/lsp/plugin/seed verifies stay green.
 
 ## Non-goals (first cut)
-- A full POSIX shell in `:terminal` (only enough to launch python + the project's commands).
+- ~~A full POSIX shell in `:terminal`~~ — a minimal one landed (Phase 9). Still out: job control,
+  subshells `()`, command substitution `$( )`, here-docs, signals beyond Ctrl-C, non-`python` externals.
 - Pip-installing arbitrary packages at runtime (only the bundled wheels).
 - Multiple concurrent interpreters beyond what the demo needs.
 

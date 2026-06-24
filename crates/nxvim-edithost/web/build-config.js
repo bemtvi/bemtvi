@@ -6,4 +6,10 @@
 // dependency-free ESM constant so worker.mjs can statically import it.
 export const BUILD = {
   localHost: false,
+  // Source the vendored first-party plugin bundle at boot (web/vendor/plugins/plugins-bundle.lua,
+  // built by build-plugins.sh). The python demo (package-site.sh --demo) flips this true.
+  plugins: false,
+  // Seed OPFS on first boot with the demo project + tour + init.lua (web/demo-seed/). The
+  // python demo (package-site.sh --demo) flips this true.
+  demoSeed: false,
 };

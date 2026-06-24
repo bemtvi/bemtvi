@@ -1,0 +1,25 @@
+# Welcome to nxvim — running in your browser
+
+This is the full nxvim editor compiled to WebAssembly, with a real Python
+toolchain running **entirely client-side**. No server, nothing installed —
+the interpreter, the language server, the syntax highlighting and the
+plugins all run in this tab.
+
+## Try it
+
+- `:terminal`                 — a minimal shell: `ls`, `cat main.py`, `cd`, pipes
+  (`cat geometry.py | python -c "import sys; print(len(sys.stdin.read()))"`),
+  redirects (`echo hi > note.txt`); run the project with `python main.py`
+- `:terminal python`          — an interactive REPL (`Ctrl-C` interrupts a loop)
+- open `main.py` / `geometry.py` — `K` hovers, `gd` goes to a definition,
+  `grn` renames; basedpyright type-checks as you type
+- `<space>` (leader), then wait — which-key shows what each key does
+- `<leader>e`                 — toggle the file-tree sidebar
+
+## What's here
+
+- `main.py`      — the entry point; imports the library below
+- `geometry.py`  — a small typed module (a `Circle` dataclass + helpers)
+- `init.lua`     — this editor's config (catppuccin, the plugins, the LSP)
+
+Edit anything — your changes persist in the browser across reloads.

@@ -30,6 +30,8 @@ let pyodide = null; // the loaded runtime (null until the first `open`)
 let loading = null; // the in-flight load promise (so concurrent opens share one load)
 let curBuf = null; // the script-mode terminal buffer stdout streams to (one run at a time)
 let interruptBuffer = null; // Uint8Array over a SAB; the editor writes 2 to request a SIGINT
+let procRun = null; // PyProxy of __nx_proc_run, the async-proc (`vim.system`/`jobstart`) runner
+const procKills = new Set(); // proc ids asked to stop before their run could begin
 
 const enc = new TextEncoder();
 const dec = new TextDecoder();
@@ -75,7 +77,7 @@ async function ensurePyodide() {
     // block-buffer and the tail would flush only at teardown, after we post the exit). The runner
     // runs a file as __main__, translating SystemExit / exceptions into an exit code.
     py.runPython(`
-import sys, runpy, traceback, codeop
+import io, os, sys, runpy, traceback, codeop, contextlib
 try:
     sys.stdout.reconfigure(line_buffering=True)
     sys.stderr.reconfigure(line_buffering=True)
@@ -120,7 +122,88 @@ def __nx_repl_feed(ns, src):
     finally:
         sys.stdout.flush(); sys.stderr.flush()
     return ("ok", "")
+
+# Async-proc leg (vim.system / jobstart). Unlike the terminal — one merged PTY stream — a proc
+# run captures stdout and stderr SEPARATELY and reports an exit code with both, mirroring the
+# daemon's host.rs contract. A streaming run (nx.run_stream) instead pushes newline-stripped
+# stdout lines through 'emit' as they are produced, and returns empty stdout with the exit (the
+# output was already streamed) — exactly as stream_local_process does.
+class _NxProcOut:
+    def __init__(self, emit):
+        self._emit = emit        # callback(list[str]) per completed-line flush, or None to capture
+        self._parts = []         # full capture (non-streaming) joined at the end
+        self._pending = ""       # partial trailing line carried until its newline arrives (streaming)
+    def write(self, s):
+        s = str(s)
+        if self._emit is None:
+            self._parts.append(s)
+        elif s:
+            self._pending += s
+            if "\\n" in self._pending:
+                *lines, self._pending = self._pending.split("\\n")
+                self._emit([ln.rstrip("\\r") for ln in lines])
+        return len(s)
+    def flush(self):
+        pass
+    def getvalue(self):
+        return "".join(self._parts)
+    def finish(self):  # streaming: flush a final unterminated line so its bytes aren't lost
+        if self._emit is not None and self._pending:
+            self._emit([self._pending.rstrip("\\r")])
+            self._pending = ""
+
+def __nx_proc_run(kind, payload, sys_argv, stdin_text, env_pairs, stream, emit, cwd):
+    out = _NxProcOut(emit if stream else None)
+    err = io.StringIO()
+    old_argv, old_stdin = sys.argv, sys.stdin
+    old_cwd = None
+    saved_env = []  # (key, prior value or None) to restore after the run, so env doesn't leak
+    code = 0
+    try:
+        for pair in (env_pairs or []):
+            k, v = str(pair[0]), str(pair[1])
+            saved_env.append((k, os.environ.get(k)))
+            os.environ[k] = v
+        try:
+            old_cwd = os.getcwd()
+            os.chdir(cwd)
+        except Exception:
+            old_cwd = None
+        sys.argv = list(sys_argv)
+        sys.stdin = io.StringIO(stdin_text or "")
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            try:
+                if kind == "file":
+                    runpy.run_path(payload, run_name="__main__")
+                else:
+                    exec(compile(payload, "<string>", "exec"), {"__name__": "__main__"})
+            except SystemExit as e:
+                c = e.code
+                code = 0 if c is None else (c if isinstance(c, int) else 1)
+            except KeyboardInterrupt:
+                err.write("\\nKeyboardInterrupt\\n")
+                code = 130
+            except BaseException:
+                traceback.print_exc(file=err)
+                code = 1
+        out.finish()
+    finally:
+        sys.argv, sys.stdin = old_argv, old_stdin
+        for k, old in saved_env:
+            if old is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = old
+        if old_cwd is not None:
+            try:
+                os.chdir(old_cwd)
+            except Exception:
+                pass
+    # Non-streaming returns the full captured stdout; streaming already pushed it (empty here).
+    stdout_bytes = b"" if stream else out.getvalue().encode("utf-8", "replace")
+    return (code, stdout_bytes, err.getvalue().encode("utf-8", "replace"))
 `);
+    procRun = py.globals.get("__nx_proc_run");
     pyodide = py;
     return py;
   })();
@@ -287,9 +370,86 @@ async function open(buf, argv) {
   }
 }
 
+// ── async-proc leg: `vim.system` / `jobstart` ────────────────────────────────────────────────
+// Run one off-tick process spawn against the Pyodide interpreter (the proc twin of `runScript`,
+// but with stdout/stderr captured separately and an exit code, per the daemon `host.rs` contract).
+// Only `python` is available in this single-interpreter demo; any other argv is command-not-found
+// (exit 127), exactly as a shell reports a missing binary — a localized failure, not a host crash.
+// A streaming spawn (`stream: true`) pushes `proc-stdout` line batches as the run produces them
+// and reports empty stdout with the exit; a plain spawn returns the whole captured stdout.
+async function runProc(req) {
+  const { id, argv, stream } = req;
+  // Synthetic pid (there is no OS process) — a positive value so `vim.system().pid` looks spawned.
+  postMessage({ type: "proc-spawned", id, pid: 100000 + (Number(id) & 0xffff) });
+  let py;
+  try {
+    py = await ensurePyodide();
+  } catch (e) {
+    postMessage({ type: "proc-exited", id, code: 1, stdout: new Uint8Array(0),
+      stderr: enc.encode(`pyodide load failed: ${e && e.message ? e.message : e}\n`) });
+    return;
+  }
+  if (procKills.delete(id)) { // killed before its run could begin (-1 = killed, per the leg)
+    postMessage({ type: "proc-exited", id, code: -1, stdout: new Uint8Array(0), stderr: new Uint8Array(0) });
+    return;
+  }
+  if (!Array.isArray(argv) || argv.length === 0 || argv[0] !== "python") {
+    const cmd = (argv && argv[0]) || "";
+    postMessage({ type: "proc-exited", id, code: 127, stdout: new Uint8Array(0),
+      stderr: enc.encode(`nxvim web demo: command not found: ${cmd}\n`) });
+    return;
+  }
+  // Interpret the python invocation: `-c CODE`, a script `FILE`, or source-from-stdin (`python -`).
+  const rest = argv.slice(1);
+  const stdinText = req.stdin && req.stdin.length ? dec.decode(new Uint8Array(req.stdin)) : "";
+  let kind, payload, sysArgv, progStdin;
+  if (rest[0] === "-c") {
+    kind = "code"; payload = rest[1] ?? ""; sysArgv = ["-c", ...rest.slice(2)]; progStdin = stdinText;
+  } else if (rest.length && rest[0] !== "-" && rest[0] !== "") {
+    kind = "file"; payload = projectPath(rest[0]); sysArgv = [rest[0], ...rest.slice(1)]; progStdin = stdinText;
+  } else {
+    kind = "code"; payload = stdinText; sysArgv = ["-"]; progStdin = ""; // the source IS stdin
+  }
+  const cwd = projectPath(req.cwd || "/");
+  const emit = stream
+    ? (lines) => {
+        const arr = lines.toJs ? lines.toJs() : lines;
+        if (lines.destroy) lines.destroy();
+        postMessage({ type: "proc-stdout", id, lines: arr });
+      }
+    : null;
+  if (interruptBuffer) Atomics.store(interruptBuffer, 0, 0); // clear a stale SIGINT before running
+  let code = 0;
+  let stdout = new Uint8Array(0);
+  let stderr = new Uint8Array(0);
+  try {
+    const r = procRun(kind, payload, sysArgv, progStdin, req.env || [], Boolean(stream), emit, cwd);
+    const [c, o, e] = r.toJs();
+    r.destroy();
+    code = Number(c) | 0;
+    if (o instanceof Uint8Array) stdout = o;
+    if (e instanceof Uint8Array) stderr = e;
+  } catch (e) {
+    // A KeyboardInterrupt (a Ctrl-C / proc-kill SIGINT) can still escape the python guard.
+    stderr = enc.encode(`${e && e.message ? e.message : e}\n`);
+    code = 130;
+  }
+  const transfer = [stdout.buffer, stderr.buffer].filter((b) => b.byteLength);
+  postMessage({ type: "proc-exited", id, code, stdout, stderr }, transfer);
+}
+
 onmessage = (ev) => {
   const m = ev.data;
-  if (m.type === "open") {
+  if (m.type === "proc-open") {
+    runProc(m).catch((e) =>
+      postMessage({ type: "proc-exited", id: m.id, code: 1, stdout: new Uint8Array(0),
+        stderr: enc.encode(`pyodide proc: ${e && e.message ? e.message : e}\n`) }),
+    );
+  } else if (m.type === "proc-kill") {
+    // The running computation (if any) was already SIGINT'd via the shared interrupt buffer by the
+    // editor Worker; record the id so a not-yet-started proc reports a killed exit when its turn comes.
+    procKills.add(m.id);
+  } else if (m.type === "open") {
     open(m.buf, m.argv).catch((e) =>
       postMessage({ type: "error", error: `pyodide open: ${e && e.message ? e.message : e}` }),
     );

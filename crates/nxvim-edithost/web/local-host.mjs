@@ -10,15 +10,16 @@
 // `installLocalHost(ctx)` opens the process-host gate and returns the three drain handlers
 // worker.mjs calls when serverless. `ctx` hands over exactly the Worker internals the host
 // needs, so all the demo-specific code stays in this file:
-//   { setProcHost(on), landHostPush(method, params), toU8(v), liveTerms, reportError(msg) }
+//   { setProcHost(on), landHostPush(method, params), toU8(v), liveTerms, liveProcs, reportError(msg) }
 // - setProcHost(on):   flip the core's `proc_host` gate (eh_set_proc_host) so the editor's
 //                      terminal / async-spawn / LSP branches open.
 // - landHostPush:      land an async host push onto the run loop's notification queue + wake it
 //                      (the local-host twin of the daemon `onDaemonNotify`); the host's
-//                      `term_data`/`term_exit` reuse the daemon leg's landing + vt100 emulation.
+//                      `term_data`/`term_exit` + `proc_*` reuse the daemon legs' landings.
 // - toU8:              normalize transferred bytes to a Uint8Array.
-// - liveTerms:         the Set the run loop's async-park condition reads (a live terminal keeps
-//                      the loop on the non-blocking park so the Worker's messages are received).
+// - liveTerms/liveProcs: the Sets the run loop's async-park condition reads (a live terminal or
+//                      in-flight child keeps the loop on the non-blocking park so the Worker's
+//                      messages are received; the proc one is cleared on `proc_exited`).
 // - reportError:       surface a host-level failure loud (→ the page's config_error channel).
 export function installLocalHost(ctx) {
   // A process host now exists: open the gate (Pyodide loads lazily on the first `:terminal`).
@@ -34,6 +35,11 @@ export function installLocalHost(ctx) {
       const m = ev.data;
       if (m.type === "data") ctx.landHostPush("term_data", [m.buf, ctx.toU8(m.bytes)]);
       else if (m.type === "exit") ctx.landHostPush("term_exit", [m.buf, m.code]);
+      // The async-proc leg's pushes reuse the daemon `proc_*` landings (eh_proc_spawned /
+      // eh_proc_stdout / eh_proc_exited); proc_exited clears the id from `liveProcs` editor-side.
+      else if (m.type === "proc-spawned") ctx.landHostPush("proc_spawned", [m.id, m.pid]);
+      else if (m.type === "proc-stdout") ctx.landHostPush("proc_stdout", [m.id, m.lines]);
+      else if (m.type === "proc-exited") ctx.landHostPush("proc_exited", [m.id, m.code, ctx.toU8(m.stdout), ctx.toU8(m.stderr)]);
       else if (m.type === "interrupt-buffer") interruptBuffer = new Uint8Array(m.buffer);
       else if (m.type === "error") ctx.reportError(m.error);
     };
@@ -73,13 +79,24 @@ export function installLocalHost(ctx) {
       }
     },
 
-    // The proc leg (`vim.system` / `jobstart`) isn't wired to Pyodide yet (a later phase) —
-    // fail loud rather than silently dropping the spawn (CLAUDE.md).
+    // Fulfil the async-proc ops (`vim.system` / `jobstart`) the tick enqueued against the local
+    // Pyodide host. Each spawn runs `python …` in the interpreter (capturing stdout/stderr +
+    // exit, or streaming stdout lines for `nx.run_stream`); the Pyodide Worker answers with
+    // `proc-spawned`/`proc-stdout`/`proc-exited` → the daemon leg's `proc_*` landings. `liveProcs`
+    // keeps the run loop on its non-blocking park so those pushes are received off the event loop.
     proc(reqs) {
-      if (reqs.spawn.length) {
-        ctx.reportError(
-          "local process host: vim.system / jobstart is not available yet (lands in a later phase)",
-        );
+      const w = ensureWorker();
+      for (const s of reqs.spawn) {
+        ctx.liveProcs.add(s.id);
+        w.postMessage({ type: "proc-open", id: s.id, argv: s.argv, cwd: s.cwd ?? null, env: s.env, stdin: s.stdin, stream: s.stream === true });
+      }
+      // Kill: SIGINT the running computation via the shared interrupt buffer (a `postMessage`
+      // would queue behind a worker blocked in a tight python loop), and tell the Worker so a
+      // not-yet-started spawn reports a killed exit. Best-effort — one shared interrupt buffer
+      // and a single-threaded interpreter mean a kill hits whatever is currently running.
+      for (const id of reqs.kill) {
+        requestInterrupt();
+        w.postMessage({ type: "proc-kill", id });
       }
     },
 

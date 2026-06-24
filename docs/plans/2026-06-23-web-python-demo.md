@@ -196,10 +196,29 @@ sees what the editor shows and edits are visible to the interpreter.
 - *Deferred:* python's own `input()`/stdin inside a running program (the REPL's line reading is
   separate and works) — needs a blocking SAB stdin read; a later slice.
 
-### Phase 3 — async proc leg locally (`vim.system`/`jobstart`) — *medium*
-- Fulfill `eh_take_proc_requests` via the same Pyodide shell (so plugins/formatters/linters
-  that shell out work). Streaming stdout → `eh_proc_stdout`; exit → `eh_proc_exited`.
-- **Verify:** `verify-pyodide-proc.mjs`.
+### Phase 3 — async proc leg locally (`vim.system`/`jobstart`) — *medium* — ✅ DONE
+- `web/local-host.mjs` `proc(reqs)` now fulfils the off-tick async-proc seam against the same
+  Pyodide Worker (one shared interpreter for `:terminal` + proc). Each spawn runs `python …` and
+  the Worker answers with `proc-spawned`/`proc-stdout`/`proc-exited` → the existing daemon
+  `proc_*` landings (`eh_proc_spawned`/`eh_proc_stdout`/`eh_proc_exited`); `liveProcs` keeps the
+  run loop on its non-blocking park so the pushes are received. The ctx gains `liveProcs`.
+- `web/pyodide-worker.mjs` `__nx_proc_run` mirrors the daemon `host.rs` contract: stdout/stderr
+  captured **separately** (via `contextlib.redirect_stdout/redirect_stderr`, isolated from the
+  terminal's `curBuf` routing) with an exit code, run in a fresh `__main__` namespace with
+  `sys.argv`/`sys.stdin`/`cwd`/`env` set + restored. A **streaming** spawn (`nx.run_stream`)
+  pushes newline-stripped stdout lines through `proc-stdout` as they're produced and returns
+  empty stdout with the exit (already streamed); a plain spawn returns the whole capture.
+- Invocation forms: `python -c CODE`, a script `FILE` (path rebased onto the `/project` OPFS
+  mount), and source-from-stdin (`python -`). Only `python` is available — any other binary is
+  command-not-found (exit 127, stderr names it), exactly as a shell reports a missing binary (a
+  localized failure, not a host crash). Kill = SIGINT via the shared interrupt buffer (best-effort
+  — one buffer, single-threaded interpreter).
+- **Verified:** `verify-pyodide-proc.mjs` — serverless `nx.run{python -c …}` computes
+  `sum(0..100)=5050` on stdout with a distinct line on stderr (captured separately), `sys.exit(3)`
+  → code 3, an uncaught exception → code 1 + traceback on stderr, a non-python binary → 127,
+  piped stdin read back, and `nx.run_stream` delivers all five streamed lines. No regressions:
+  `verify-pyodide-terminal.mjs` (script) + `verify-pyodide-repl.mjs` (REPL) — the shared Pyodide
+  Worker is unaffected.
 
 ### Phase 4 — basedpyright LSP in a Worker — *large; has its own build pipeline*
 - **4a — build pipeline:** vendor basedpyright git source (`pyright-internal`); produce a

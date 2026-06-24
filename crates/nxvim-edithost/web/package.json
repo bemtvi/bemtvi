@@ -19,7 +19,9 @@
     "verify-terminal": "node verify-terminal.mjs",
     "verify-luafile": "node verify-luafile.mjs",
     "verify-pyodide-terminal": "node verify-pyodide-terminal.mjs",
-    "verify-pyodide-repl": "node verify-pyodide-repl.mjs"
+    "verify-pyodide-repl": "node verify-pyodide-repl.mjs",
+    "verify-pyodide-proc": "node verify-pyodide-proc.mjs",
+    "verify-basedpyright-lsp": "node verify-basedpyright-lsp.mjs"
   },
   "devDependencies": {
     "@msgpack/msgpack": "3.1.3",

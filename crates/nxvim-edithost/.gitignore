@@ -24,3 +24,6 @@
 /treesitter/node_modules
 /treesitter/vendor
 /web/vendor
+
+# basedpyright build clone (build-basedpyright.sh) — regenerated, not committed
+/.basedpyright-src

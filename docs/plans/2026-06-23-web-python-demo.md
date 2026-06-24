@@ -220,16 +220,43 @@ sees what the editor shows and edits are visible to the interpreter.
   `verify-pyodide-terminal.mjs` (script) + `verify-pyodide-repl.mjs` (REPL) — the shared Pyodide
   Worker is unaffected.
 
-### Phase 4 — basedpyright LSP in a Worker — *large; has its own build pipeline*
-- **4a — build pipeline:** vendor basedpyright git source (`pyright-internal`); produce a
-  browser Worker bundle (esbuild/webpack `platform:browser`) with the `process`/no-op shims,
-  a memfs-backed `FileSystem`, `BrowserMessageReader/Writer`, and
-  `createBackgroundAnalysis()→undefined`. Seed typeshed stdlib into the memfs at boot.
-- **4b — wire into the seam:** the editor Worker forwards `eh_take_lsp_requests` to the
-  basedpyright Worker and lands frames via `eh_lsp_stdout`/`exited`. On
-  `didOpen`/`didChange`, write buffer text into the LSP Worker's memfs (basedpyright needs
-  files, not just buffer text).
-- **Verify:** `verify-basedpyright-lsp.mjs` — a diagnostic + a hover/completion round-trip.
+### Phase 4 — basedpyright LSP in a Worker — *large; has its own build pipeline* — ✅ DONE
+- **Key discovery (much easier than the spike feared):** basedpyright's monorepo ships an
+  **official browser target**, `packages/browser-pyright` ("browser-basedpyright"), that already
+  uses `BrowserMessageReader/Writer`, bundles typeshed into a virtual FS, and solves the
+  background-analysis-worker problem — so none of the spike's hand-written entry / Node shims /
+  memfs / `createBackgroundAnalysis` override is needed. (We also evaluated ruff — lint/format
+  only, no hover/completion/goto — and ty's `ty_wasm` — full-featured but alpha + a Rust-wasm build
+  + a protocol adapter; basedpyright won.)
+- **4a — build pipeline (`build-basedpyright.sh`):** clone basedpyright at a pinned tag, `npm
+  install` the monorepo, symlink `typeshed-fallback` → `docstubs` (real docstubs need extra Python
+  tooling; the plain typeshed type-checks identically), `rspack build` the browser package, and
+  vendor the one ~16 MB `pyright.worker.js` into `web/vendor/basedpyright/` (gitignored;
+  `package-site.sh --demo` builds + copies it, like Pyodide). Idempotent (`--force` to rebuild).
+- **4b — framing bridge (`web/local-host.mjs` `lsp(reqs)`):** the editor's `SyncLspClient` speaks
+  `Content-Length`-framed JSON-RPC over `lsp_spawn`/`lsp_stdin`/`lsp_kill`; the worker speaks
+  postMessage'd JSON objects. The bridge de-frames/re-frames across that boundary, lands replies via
+  the existing daemon `lsp_*` paths (`eh_lsp_stdout`/`exited`), and facilitates basedpyright's
+  `browser/newWorker` background-analysis worker (creating it + transferring the MessagePort).
+  `liveLsp` (new ctx field) keeps the run loop on its non-blocking park. **Three load-bearing
+  fixups** found while wiring (the bulk of the effort):
+  - **Workspace under `/w`, disjoint from `/typeshed`:** with the editor's natural root
+    (`file:///`) basedpyright treats typeshed's ~5000 stubs as workspace sources and never analyzes
+    the user's file. Every `file://` uri is rebased `file:///…` ↔ `file:///w/…` across the bridge.
+  - **Synthesize `workspaceFolders`:** nxvim sends only `rootUri`; browser-basedpyright keys its
+    workspace off `workspaceFolders`, so without one it falls to an empty `<default>` workspace.
+  - **`pyright/createFile` before `didOpen`:** the server only analyzes a file once it exists on
+    its FS; the didOpen overlay then supplies live text. Also: guarantee `initializationOptions.files`
+    is an object (it destructures it) and drop `rootPath`.
+- **Verified:** `verify-basedpyright-lsp.mjs` — serverless `nx.run`-free: a python type error
+  (`add("x", 1)`) yields a real basedpyright diagnostic (`"Literal['x']" is not assignable to
+  "int"`) in `nx.diagnostic.get()` (proving typeshed loaded — `int` resolves) and a hover request
+  returns the inferred signature `def add(a: int, b: int) -> int`. No regressions: terminal / repl /
+  proc / core verifies green.
+- *Deferred:* the cursor-anchored hover **float UI** drops the reply on a `cursor_moved`/`buffer_changed`
+  staleness check in the serverless async round-trip (the protocol round-trip itself is correct — the
+  verify issues hover via `nx.lsp.request`); completion/go-to-def UX and multi-file project seeding
+  (cross-file analysis) are later slices. The demo's `init.lua` LSP config lands in Phase 6.
 
 ### Phase 5 — single-file plugin bundle (amalgamation) — *medium (spike #2)*
 - Build step: amalgamate each plugin's Lua tree into ONE `package.preload`-registering Lua

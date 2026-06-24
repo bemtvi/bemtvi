@@ -17,10 +17,65 @@
 //                      (the local-host twin of the daemon `onDaemonNotify`); the host's
 //                      `term_data`/`term_exit` + `proc_*` reuse the daemon legs' landings.
 // - toU8:              normalize transferred bytes to a Uint8Array.
-// - liveTerms/liveProcs: the Sets the run loop's async-park condition reads (a live terminal or
-//                      in-flight child keeps the loop on the non-blocking park so the Worker's
-//                      messages are received; the proc one is cleared on `proc_exited`).
+// - liveTerms/liveProcs/liveLsp: the Sets the run loop's async-park condition reads (a live
+//                      terminal, in-flight child, or running language server keeps the loop on the
+//                      non-blocking park so the Worker's messages are received).
 // - reportError:       surface a host-level failure loud (→ the page's config_error channel).
+//
+// LSP leg (Phase 4): the editor's `SyncLspClient` speaks raw `Content-Length`-framed JSON-RPC
+// bytes over `lsp_spawn`/`lsp_stdin`/`lsp_kill`, but basedpyright's browser worker
+// (web/vendor/basedpyright/pyright.worker.js, built by build-basedpyright.sh) speaks postMessage'd
+// JSON objects via `BrowserMessageReader/Writer`. So the host runs a thin **framing bridge**: it
+// de-frames the editor's bytes into JSON objects for the worker, frames the worker's objects back
+// into `lsp_stdout` bytes, and facilitates basedpyright's background-analysis worker (it can't nest
+// workers, so it asks the host to create them via `browser/newWorker` + a transferred MessagePort).
+
+const LSP_ENC = new TextEncoder();
+const LSP_DEC = new TextDecoder();
+
+// Frame one JSON-RPC object as the `Content-Length: N\r\n\r\n<json>` bytes the editor's
+// `SyncLspClient` parses (the wire shape a real stdio language server emits).
+function frameLsp(obj) {
+  const body = LSP_ENC.encode(JSON.stringify(obj));
+  const header = LSP_ENC.encode(`Content-Length: ${body.length}\r\n\r\n`);
+  const out = new Uint8Array(header.length + body.length);
+  out.set(header, 0);
+  out.set(body, header.length);
+  return out;
+}
+
+// Pull the next complete `Content-Length`-framed JSON-RPC message out of `st.buf` (the editor's
+// stdin bytes accumulate there across `lsp_stdin` pushes), advancing the buffer. Returns the
+// parsed object, or null when a full frame isn't buffered yet.
+function takeLspFrame(st) {
+  const sep = "\r\n\r\n";
+  // The header is ASCII, so decoding the buffer to find the separator is safe (the JSON body may
+  // be multibyte, but we slice it by byte length, not by the decoded string).
+  const text = LSP_DEC.decode(st.buf);
+  const headerEnd = text.indexOf(sep);
+  if (headerEnd < 0) return null;
+  const header = text.slice(0, headerEnd);
+  const m = /content-length:\s*(\d+)/i.exec(header);
+  if (!m) {
+    // Unparseable header — drop up to and past the separator so we don't wedge (fail-soft, but the
+    // dropped bytes are surfaced by the resulting parse gap rather than silently swallowed).
+    st.buf = st.buf.subarray(byteLen(text.slice(0, headerEnd + sep.length)));
+    return null;
+  }
+  const len = Number(m[1]);
+  const bodyStart = byteLen(text.slice(0, headerEnd + sep.length));
+  if (st.buf.length - bodyStart < len) return null; // body not fully arrived yet
+  const body = st.buf.subarray(bodyStart, bodyStart + len);
+  st.buf = st.buf.slice(bodyStart + len);
+  try {
+    return JSON.parse(LSP_DEC.decode(body));
+  } catch {
+    return null;
+  }
+}
+
+const byteLen = (s) => LSP_ENC.encode(s).length;
+
 export function installLocalHost(ctx) {
   // A process host now exists: open the gate (Pyodide loads lazily on the first `:terminal`).
   ctx.setProcHost(true);
@@ -53,6 +108,99 @@ export function installLocalHost(ctx) {
   // boundaries. A no-op until Pyodide has loaded (nothing is running to interrupt yet).
   function requestInterrupt() {
     if (interruptBuffer) Atomics.store(interruptBuffer, 0, 2);
+  }
+
+  // ── LSP (basedpyright) ────────────────────────────────────────────────────────────────────
+  const lspById = new Map(); // wire id -> { fg, bgs: Set<Worker>, buf: Uint8Array }
+
+  const newPyrightWorker = () =>
+    new Worker(new URL("./vendor/basedpyright/pyright.worker.js", import.meta.url));
+
+  // The project is mounted under a dedicated workspace root (`/w`) inside basedpyright's virtual
+  // FS, kept DISJOINT from the bundled typeshed at `/typeshed`. This is load-bearing: with the
+  // editor's natural root (`file:///`, the OPFS root) basedpyright would treat `/typeshed`'s ~5000
+  // stub files as workspace sources and never get to the user's file. So every `file://` uri is
+  // rebased `file:///…` ↔ `file:///w/…` across the bridge (the editor sees its own paths; the
+  // server sees `/w/…`). Diagnostics/hover/definition uris are rebased back on the way out.
+  const VROOT = "w";
+  const toServer = (msg) => JSON.parse(JSON.stringify(msg).replaceAll("file:///", `file:///${VROOT}/`));
+  const toEditor = (msg) => JSON.parse(JSON.stringify(msg).replaceAll(`file:///${VROOT}/`, "file:///"));
+
+  // Boot a basedpyright foreground worker for wire `id` and bridge its output to the editor.
+  function startLspServer(id) {
+    const fg = newPyrightWorker();
+    const st = { fg, bgs: new Set(), buf: new Uint8Array(0) };
+    lspById.set(id, st);
+    ctx.liveLsp.add(id);
+    fg.onmessage = (ev) => {
+      const m = ev.data;
+      // basedpyright can't nest workers (no Safari support), so it asks us to create its
+      // background-analysis worker and wire a MessagePort between the two.
+      if (m && m.type === "browser/newWorker") {
+        const bg = newPyrightWorker();
+        st.bgs.add(bg);
+        bg.onerror = (e) => ctx.reportError(`basedpyright background worker: ${e.message || e}`);
+        bg.postMessage({ type: "browser/boot", mode: "background", initialData: m.initialData, port: m.port }, [m.port]);
+        return;
+      }
+      // Any JSON-RPC message from the server → rebase its uris back to the editor's and frame it
+      // as stdout bytes for the SyncLspClient.
+      if (m && m.jsonrpc) ctx.landHostPush("lsp_stdout", [id, frameLsp(toEditor(m))]);
+    };
+    fg.onerror = (e) => {
+      ctx.reportError(`basedpyright worker: ${e.message || e}`);
+      stopLspServer(id);
+      ctx.landHostPush("lsp_exited", [id, 1, -1]); // a crash → the client surfaces ServerExited
+    };
+    fg.postMessage({ type: "browser/boot", mode: "foreground" });
+  }
+
+  // Feed editor stdin bytes (one or more framed JSON-RPC messages) to the server worker, rebasing
+  // uris into the `/w` workspace. Two server-specific fixups:
+  //  - `initialize`: guarantee `initializationOptions.files` is an object (browser-basedpyright
+  //    destructures it unconditionally), and drop the un-prefixed `rootPath` so the server can't
+  //    fall back to scanning the typeshed-bearing root.
+  //  - `didOpen`: basedpyright only analyzes a file once it exists on its FS, so create it first
+  //    (`pyright/createFile`); the didOpen overlay then supplies the live buffer text.
+  function feedLspStdin(id, bytes) {
+    const st = lspById.get(id);
+    if (!st) return;
+    const merged = new Uint8Array(st.buf.length + bytes.length);
+    merged.set(st.buf, 0);
+    merged.set(bytes, st.buf.length);
+    st.buf = merged;
+    for (;;) {
+      const raw = takeLspFrame(st);
+      if (!raw) break;
+      if (raw.method === "initialize") {
+        const params = (raw.params = raw.params || {});
+        const io = params.initializationOptions && typeof params.initializationOptions === "object" && !Array.isArray(params.initializationOptions)
+          ? params.initializationOptions
+          : {};
+        if (typeof io.files !== "object" || io.files === null || Array.isArray(io.files)) io.files = {};
+        params.initializationOptions = io;
+        delete params.rootPath;
+        // browser-basedpyright keys its workspace off `workspaceFolders`; nxvim's SyncLspClient
+        // sends only `rootUri`, so without this the server falls back to an empty "<default>"
+        // workspace and analyzes nothing. Synthesize one folder at the (about-to-be-remapped) root.
+        params.workspaceFolders = [{ uri: params.rootUri || "file:///", name: VROOT }];
+      }
+      const msg = toServer(raw);
+      if (raw.method === "textDocument/didOpen") {
+        st.fg.postMessage({ jsonrpc: "2.0", method: "pyright/createFile", params: { uri: msg.params.textDocument.uri } });
+      }
+      st.fg.postMessage(msg);
+    }
+  }
+
+  // Tear down a server worker + its background workers (an editor `lsp_kill` or a crash).
+  function stopLspServer(id) {
+    const st = lspById.get(id);
+    if (!st) return;
+    lspById.delete(id);
+    ctx.liveLsp.delete(id);
+    try { st.fg.terminate(); } catch {}
+    for (const bg of st.bgs) { try { bg.terminate(); } catch {} }
   }
 
   return {
@@ -100,13 +248,20 @@ export function installLocalHost(ctx) {
       }
     },
 
-    // The LSP leg (basedpyright) isn't wired yet (a later phase) — fail loud, not a silent drop.
+    // Fulfil the LSP wire ops against the local basedpyright worker (see the framing-bridge note
+    // at the top of this file). Only basedpyright is available in this demo — any other server
+    // fails loud rather than silently dropping the spawn. `liveLsp` keeps the run loop on its
+    // non-blocking park so the worker's `lsp_stdout`/`lsp_exited` pushes are received.
     lsp(reqs) {
-      if (reqs.spawn.length) {
-        ctx.reportError(
-          "local process host: LSP (basedpyright) is not available yet (lands in a later phase)",
-        );
+      for (const s of reqs.spawn) {
+        if (!/pyright/i.test(s.program || "")) {
+          ctx.reportError(`local LSP host: only basedpyright is available in this demo (got "${s.program}")`);
+          continue;
+        }
+        startLspServer(s.id);
       }
+      for (const i of reqs.stdin) feedLspStdin(i.id, ctx.toU8(i.bytes));
+      for (const id of reqs.kill) stopLspServer(id);
     },
   };
 }

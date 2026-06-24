@@ -1919,6 +1919,7 @@ if (BUILD.localHost && !daemonUri) {
     toU8,
     liveTerms,
     liveProcs,
+    liveLsp,
     reportError: (msg) => postMessage({ type: "config_error", error: msg }),
   });
 }

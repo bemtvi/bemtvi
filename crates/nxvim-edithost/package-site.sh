@@ -69,6 +69,11 @@ EOF
   for f in pyodide.mjs pyodide.asm.mjs pyodide.asm.wasm python_stdlib.zip pyodide-lock.json; do
     cp "$PYODIDE_SRC/$f" "$site/web/vendor/pyodide/"
   done
+  # The basedpyright LSP worker (built from source — there is no npm package; see
+  # build-basedpyright.sh). Idempotent: the build is skipped when already vendored.
+  "$here/build-basedpyright.sh"
+  mkdir -p "$site/web/vendor/basedpyright"
+  cp "$here/web/vendor/basedpyright/pyright.worker.js" "$site/web/vendor/basedpyright/"
 fi
 
 # Cross-origin-isolation headers for `_headers`-format hosts (Netlify / Cloudflare

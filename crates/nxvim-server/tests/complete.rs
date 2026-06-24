@@ -729,6 +729,60 @@ async fn a_plugin_source_inline_doc_shows_in_the_docs_sidebar() {
     );
 }
 
+/// The docs sidebar must float over the WHOLE editor, not just the focused
+/// window: when a vertical split narrows the active pane, a sidebar bounded by
+/// that pane has no room beside the popup and collapses to a one-column sliver.
+/// Bounded by the whole editor (floating over the other split) it keeps a usable
+/// width. Regression: it used the focused window's text width as its bound.
+#[tokio::test]
+async fn docs_sidebar_spans_the_whole_editor_after_a_split() {
+    let dir = temp_dir("complete_docs_split");
+    // A long doc so the sidebar can't fit beside the popup within a ~40-col pane,
+    // but does within the 80-col editor.
+    let init = "\
+nx.complete.source {\n\
+  name = 'doc', debounce = 0,\n\
+  complete = function(ctx)\n\
+    if ('hello'):find(ctx.prefix, 1, true) == 1 then\n\
+      ctx.push { text = 'hello', doc = 'This is a fairly long documentation string for the row' }\n\
+    end\n\
+  end,\n\
+}\n\
+nx.complete.setup { sources = { { 'doc' } } }";
+    let (rpc, mut incoming) = start(&dir, init).await;
+
+    // Split vertically; the focused window is now ~40 cols wide.
+    feed(&rpc, "<C-w>v");
+    nxvim_test_harness::barrier(&rpc).await;
+
+    feed(&rpc, "ihel");
+    let _ = poll_menu(&rpc, &mut incoming).await.expect("popup opens");
+    feed(&rpc, "<C-n>"); // select row 0 so the docs sidebar shows
+
+    let mut width = 0u64;
+    for _ in 0..60 {
+        nxvim_test_harness::barrier(&rpc).await;
+        if let Some(map) = drain_to_latest_redraw(&mut incoming, |m| match map_get(m, "menu") {
+            Some(Value::Map(menu)) => matches!(map_get(menu, "docs"), Some(Value::Map(_))),
+            _ => false,
+        }) {
+            let Some(Value::Map(menu)) = map_get(&map, "menu") else {
+                continue;
+            };
+            let Some(Value::Map(docs)) = map_get(menu, "docs") else {
+                continue;
+            };
+            width = map_get(docs, "width").and_then(Value::as_u64).unwrap_or(0);
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    assert!(
+        width >= 20,
+        "the docs sidebar must keep a usable width over the whole editor after a split, got {width}"
+    );
+}
+
 #[tokio::test]
 async fn a_plugin_source_resolve_callback_fills_the_sidebar_lazily() {
     let dir = temp_dir("complete_resolve_docs");

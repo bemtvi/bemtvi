@@ -208,14 +208,14 @@ impl EditHost {
         // `Nil` when none is open. Geometry is computed here from the focused
         // window, the same way the completion popup is placed.
         let menu = match &view.menu {
-            Some(m) => self.project_menu(m, &view, text_width, &mut styles),
+            Some(m) => self.project_menu(m, &view, text_width, w, h, &mut styles),
             None => Value::Nil,
         };
         // The list-less content float (`nx.ui.float`; LSP hover / signature help),
         // `Nil` when none is open. A non-grabbing transient overlay — its geometry
         // is computed here from the cursor (or centered over the editor).
         let float = match &view.content_float {
-            Some(cf) => self.project_content_float(cf, &view, text_width, &mut styles),
+            Some(cf) => self.project_content_float(cf, &view, text_width, w, h, &mut styles),
             None => Value::Nil,
         };
 
@@ -1304,6 +1304,43 @@ fn wrap_doc_lines(lines: &[String], width: usize) -> Vec<String> {
     out
 }
 
+/// Place a docs sidebar of `content_w` columns beside a popup box whose content
+/// starts at `box_col` and is `box_width` wide, within a `bound_w`-column area.
+/// Prefers the right of the box, flipping left when that side has more room, and
+/// returns `(docs_col, docs_w)` — the float's **content** top-left column and its
+/// width, in the bound area's own cells. `None` when neither side fits a readable
+/// width, so a caller shows no sidebar rather than a one-column sliver. Shared by
+/// both docs surfaces (insert-completion + the cmdline wildmenu).
+fn place_docs_beside(
+    box_col: usize,
+    box_width: usize,
+    content_w: usize,
+    bound_w: usize,
+) -> Option<(usize, usize)> {
+    /// Below this, a sidebar is a useless sliver — better none than a 1-col float.
+    const MIN_DOCS_W: usize = 10;
+    // Right of the box: its content spans `[box_col, box_col+box_width)`; each client
+    // draws a 1-cell border, so the box's right border sits at `box_col+box_width` and
+    // the docs float's own left border one cell past it → content at `+2`. A trailing
+    // 1-col margin keeps it off the bound's right edge. Left of the box: the docs
+    // float's right border one cell left of the box's left border (`box_col-1`), so its
+    // content ends at `box_col-3`, starting from the bound's left.
+    let right_start = box_col + box_width + 2;
+    let right_avail = bound_w
+        .saturating_sub(right_start)
+        .saturating_sub(1)
+        .min(content_w);
+    let left_avail = box_col.saturating_sub(3).min(content_w);
+    let (docs_col, docs_w) = if right_avail >= left_avail {
+        (right_start, right_avail)
+    } else {
+        (box_col.saturating_sub(2 + left_avail), left_avail)
+    };
+    // A naturally short doc (already narrower than the minimum) is exempt — it's as
+    // wide as it gets, so accept it; otherwise demand a readable width.
+    (docs_w >= MIN_DOCS_W.min(content_w)).then_some((docs_col, docs_w))
+}
+
 fn tab_value(tab: &TabView) -> Value {
     Value::Map(vec![
         (Value::from("label"), Value::from(tab.label.as_str())),
@@ -1567,6 +1604,8 @@ impl EditHost {
         m: &MenuView,
         view: &nxvim_core::View,
         text_width: usize,
+        editor_w: usize,
+        editor_h: usize,
         styles: &mut StyleTable,
     ) -> Value {
         let focused = view.focused();
@@ -1677,8 +1716,11 @@ impl EditHost {
             // Its docs sidebar (Phase 3): the highlighted command's synopsis + help,
             // a float beside the box. Feature-agnostic (the catalog candidates carry
             // their docs inline — `selected_doc`), so unlike the insert-completion
-            // docs sidebar below this is NOT native-gated.
-            if let Some(docs) = self.project_cmdline_docs(m, row, col, width, height, text_width) {
+            // docs sidebar below this is NOT native-gated. Bounded by the WHOLE editor
+            // (`editor_w`), not the focused window: the wildmenu floats over the
+            // full-width command line, and `col` is a global command-line column — a
+            // split must not squeeze the docs into the active pane.
+            if let Some(docs) = self.project_cmdline_docs(m, row, col, width, height, editor_w) {
                 map.push((Value::from("docs"), docs));
             }
         }
@@ -1710,26 +1752,28 @@ impl EditHost {
         // `Cursor`-placed completion popup rendering the selected `lsp` row's docs.
         // Native-only (the docs come from the server's LSP item cache; the wasm
         // edit-host has no language servers). Absent ⇒ the client draws no sidebar.
+        // It floats over the WHOLE editor (the which-key model), not the focused
+        // window — so a split (or a narrow pane) can't squeeze it into a useless
+        // sliver. Its geometry is computed against the editor windows area, with the
+        // popup box mapped from the focused window's text inner into editor-absolute
+        // (windows-area) cells: the `'padding'` (left + top) and number gutter offset.
         #[cfg(feature = "native")]
         if matches!(m.placement, MenuPlacement::Cursor) {
+            let inner_x = focused.rect.x + focused.padding.left + focused.number_width;
+            let inner_y = focused.rect.y + focused.padding.top;
+            let (abs_col, abs_row) = (inner_x + col, inner_y + row);
             if let Some((docs, meta)) =
-                self.project_complete_docs(m, row, col, width, text_width, text_height)
+                self.project_complete_docs(m, abs_row, abs_col, width, editor_w, editor_h)
             {
                 map.push((Value::from("docs"), docs));
                 // Stash the docs float's box in GLOBAL cells so a wheel over it scrolls
-                // the docs. The placement math is the server's (the content is too), so
-                // core can't recompute it — it's fed back here for the hit-test. The
-                // docs content sits at `(inner_x + col, win_y + row)`; the bordered
-                // outer box is one cell out on every side.
-                // The text-inner origin includes this window's `'padding'` (left +
-                // top), matching where the client paints the body.
-                let inner_x = focused.rect.x + focused.padding.left + focused.number_width;
-                let gx = (inner_x + meta.col).saturating_sub(1);
-                let gy = (focused.rect.y + focused.padding.top + meta.row).saturating_sub(1);
+                // the docs. `meta.col`/`meta.row` are already editor-absolute (windows-
+                // area cells == global cells), so the bordered outer box is just one
+                // cell out on every side.
                 self.editor
                     .stash_complete_docs_hit(Some(nxvim_core::CompleteDocsHit {
-                        x: gx,
-                        y: gy,
+                        x: meta.col.saturating_sub(1),
+                        y: meta.row.saturating_sub(1),
                         w: meta.w + 2,
                         h: meta.h + 2,
                         total: meta.total,
@@ -1748,9 +1792,15 @@ impl EditHost {
     /// (`m.docs`), a row is actively selected (`m.selected_key`) and is an `lsp` row
     /// (`m.selected_source_accept` — the only source whose item cache the server
     /// holds), and that cached item actually carries docs. Rendered as plain lines
-    /// (like hover), placed to the right of the box `(row, col, width)` and flipping to
-    /// its left when the right has no room; `(text_width, text_height)` is the editor
-    /// viewport the float is clamped to.
+    /// (like hover), placed to the right of the popup box and flipping to its left
+    /// when that side has more room.
+    ///
+    /// All geometry is **editor-absolute** (windows-area cells): `row`/`col` are the
+    /// popup box's top-left mapped into the editor windows area, and
+    /// `(editor_w, editor_h)` is the whole editor the float is bounded by — so it
+    /// floats over the entire editor (overlapping other splits) instead of being
+    /// squeezed into a narrow focused pane. Returns `None` rather than a useless
+    /// sliver when neither side can fit a readable width.
     #[cfg(feature = "native")]
     fn project_complete_docs(
         &self,
@@ -1758,8 +1808,8 @@ impl EditHost {
         row: usize,
         col: usize,
         width: usize,
-        text_width: usize,
-        text_height: usize,
+        editor_w: usize,
+        editor_h: usize,
     ) -> Option<(Value, CompleteDocsMeta)> {
         if !m.docs {
             return None;
@@ -1799,27 +1849,15 @@ impl EditHost {
             .max()
             .unwrap_or(1)
             .clamp(1, MAX_DOCS_W);
-        // Place to the right of the box (its content spans `[col, col+width)`; each
-        // client draws a 1-cell border, so the box's right border sits at `col+width`
-        // and the docs float's own left border one cell past it → content at
-        // `col+width+2`). Flip to the left when the right edge overruns the viewport.
-        let right_start = col + width + 2;
-        // `< text_width` keeps a 1-col margin past the float's right border (the
-        // `+ 1 <= text_width` form clippy rejects).
-        let (docs_col, docs_w) = if right_start + content_w < text_width {
-            (right_start, content_w)
-        } else {
-            // Left of the box: the docs float's right border one cell left of the box's
-            // left border (at `col-1`), so its content ends at `col-3`.
-            let w = content_w.min(col.saturating_sub(3)).max(1);
-            (col.saturating_sub(2 + w), w)
-        };
+        // Place beside the box, bounded by the whole editor — flipping to the side
+        // with more room and showing nothing rather than a 1-col sliver.
+        let (docs_col, docs_w) = place_docs_beside(col, width, content_w, editor_w)?;
         // Clamp the height to the rows available below the float's top (a full border
         // costs 2).
         let total = lines.len();
         let docs_h = total
             .min(MAX_DOCS_H)
-            .min(text_height.saturating_sub(row).saturating_sub(2).max(1));
+            .min(editor_h.saturating_sub(row).saturating_sub(2).max(1));
         // Window the lines from the core-owned scroll offset — a wheel over the
         // sidebar advances it (`Editor::scroll_complete_docs`). Clamp so a short tail
         // can't scroll past the end (the offset is also reset to 0 on a selection
@@ -1832,6 +1870,10 @@ impl EditHost {
             (Value::from("col"), Value::from(docs_col as u64)),
             (Value::from("width"), Value::from(docs_w as u64)),
             (Value::from("height"), Value::from(docs_h as u64)),
+            // The geometry is editor-absolute (windows-area cells), so the client
+            // offsets it by the windows-area origin, not the focused window's text
+            // inner — the sidebar floats over the whole editor.
+            (Value::from("editor_relative"), Value::from(true)),
         ]);
         Some((
             value,
@@ -1852,13 +1894,15 @@ impl EditHost {
     /// native LSP item cache — this needs no language server and renders on the wasm
     /// edit-host too (hence no `#[cfg(feature = "native")]`).
     ///
-    /// `(row, col, width, height)` is the wildmenu box (text-area cells). The float
-    /// sits to the **right** of the box (`col + width + 2`), flipping to its left when
-    /// the right edge overruns the viewport, and **bottom-aligns** to the box so it
-    /// abuts the command line alongside it: its bottom border lands on the box's
-    /// content bottom (`row + height`), placing its top at `row + height − docs_h − 1`.
-    /// `None` unless the menu opted into docs, a row is actively selected, and that
-    /// row carries doc text.
+    /// `(row, col, width, height)` is the wildmenu box; `col` is a **global**
+    /// command-line column (the line spans the full width), and `editor_w` is the
+    /// whole editor the float is bounded by — the wildmenu floats over the full-width
+    /// command line, so a split doesn't scope its docs to the focused window. The
+    /// float sits beside the box, flipping to the side with more room, and
+    /// **bottom-aligns** to it so it abuts the command line alongside it: its bottom
+    /// border lands on the box's content bottom (`row + height`), placing its top at
+    /// `row + height − docs_h − 1`. `None` unless the menu opted into docs, a row is
+    /// actively selected, that row carries doc text, and a readable width fits.
     fn project_cmdline_docs(
         &self,
         m: &MenuView,
@@ -1866,7 +1910,7 @@ impl EditHost {
         col: usize,
         width: usize,
         height: usize,
-        text_width: usize,
+        editor_w: usize,
     ) -> Option<Value> {
         if !m.docs {
             return None;
@@ -1893,16 +1937,10 @@ impl EditHost {
             .max()
             .unwrap_or(1)
             .clamp(1, MAX_DOCS_W);
-        // Right of the box, flipping left when the right edge has no room — the same
-        // placement the insert-completion docs sidebar uses (`< text_width` keeps a
-        // one-column margin past the float's right border).
-        let right_start = col + width + 2;
-        let (docs_col, docs_w) = if right_start + content_w < text_width {
-            (right_start, content_w)
-        } else {
-            let w = content_w.min(col.saturating_sub(3)).max(1);
-            (col.saturating_sub(2 + w), w)
-        };
+        // Place beside the box, bounded by the whole editor (the command line spans
+        // the full width) — flipping to the side with more room and showing nothing
+        // rather than a 1-col sliver.
+        let (docs_col, docs_w) = place_docs_beside(col, width, content_w, editor_w)?;
         // Word-wrap the help text to the resolved box width so a long line flows onto
         // several rows instead of being cut off at the right border (`wrap=true`).
         let wrapped = wrap_doc_lines(&lines, docs_w);
@@ -1936,6 +1974,8 @@ impl EditHost {
         cf: &ContentFloatView,
         view: &nxvim_core::View,
         text_width: usize,
+        editor_w: usize,
+        editor_h: usize,
         styles: &mut StyleTable,
     ) -> Value {
         /// Display width of one chunked line: the sum of its chunks' char counts.
@@ -1989,25 +2029,33 @@ impl EditHost {
                 (row, col, width, height)
             }
             // Content floats are never cmdline-placed (only the `nx.cmdline_complete`
-            // menu is); a stray one falls back to editor-centered.
+            // menu is); a stray one falls back to editor-centered. Anchored to the
+            // whole editor (`editor_w`/`editor_h`), not the focused window — a split
+            // must not drag an editor-relative float into the active pane.
             MenuPlacement::Editor | MenuPlacement::Cmdline => {
-                let width = content_w.min(text_width.saturating_sub(CHROME).max(1));
-                let height = count.min(text_height.saturating_sub(CHROME).max(1));
-                let row = text_height.saturating_sub(height + CHROME) / 2;
-                let col = text_width.saturating_sub(width + CHROME) / 2;
+                let width = content_w.min(editor_w.saturating_sub(CHROME).max(1));
+                let height = count.min(editor_h.saturating_sub(CHROME).max(1));
+                let row = editor_h.saturating_sub(height + CHROME) / 2;
+                let col = editor_w.saturating_sub(width + CHROME) / 2;
                 (row, col, width, height)
             }
             MenuPlacement::Bottom => {
                 // Pinned to the editor's bottom-RIGHT corner (the which-key shape):
                 // content-hugging like `Editor`, but the box (content + border chrome)
-                // sits flush against both the last text row and the right edge.
-                let width = content_w.min(text_width.saturating_sub(CHROME).max(1));
-                let height = count.min(text_height.saturating_sub(CHROME).max(1));
-                let row = text_height.saturating_sub(height + CHROME);
-                let col = text_width.saturating_sub(width + CHROME);
+                // sits flush against both the last text row and the right edge — of the
+                // whole editor (`editor_w`/`editor_h`), so a split leaves it in place.
+                let width = content_w.min(editor_w.saturating_sub(CHROME).max(1));
+                let height = count.min(editor_h.saturating_sub(CHROME).max(1));
+                let row = editor_h.saturating_sub(height + CHROME);
+                let col = editor_w.saturating_sub(width + CHROME);
                 (row, col, width, height)
             }
         };
+        // Which base the geometry above is relative to, so the client offsets it by
+        // the matching origin: `Cursor` floats over the focused window's text area
+        // (cursor-anchored hover / signature), while `Editor`/`Bottom` floats anchor
+        // to the whole editor's windows area (the which-key surface).
+        let editor_relative = !matches!(cf.placement, MenuPlacement::Cursor);
         let shown = &cf.lines[..height.min(cf.lines.len())];
         // Each line ships as a chunk run `[[text, style_id], …]` (the `virt_lines`
         // wire form), so a styled caller (which-key) can colour keys vs.
@@ -2028,6 +2076,7 @@ impl EditHost {
             (Value::from("width"), Value::from(width as u64)),
             (Value::from("height"), Value::from(height as u64)),
             (Value::from("border"), Value::from(cf.border.as_str())),
+            (Value::from("editor_relative"), Value::from(editor_relative)),
             (
                 Value::from("title"),
                 cf.title

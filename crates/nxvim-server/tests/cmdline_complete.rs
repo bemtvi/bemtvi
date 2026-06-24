@@ -585,6 +585,74 @@ async fn cmdline_docs_wrap_long_lines_to_the_box_width() {
     }
 }
 
+/// The wildmenu floats over the full-width command line, so its docs sidebar must
+/// be bounded by the WHOLE editor — not the focused window. A vertical split that
+/// narrows the active pane must not narrow the docs float: there is no window
+/// scoping the command line. Regression: the sidebar used the focused window's
+/// text width as its bound.
+#[tokio::test]
+async fn cmdline_docs_use_the_whole_editor_width_not_the_focused_window() {
+    let dir = temp_dir("cmdcomplete_split");
+    // A wide-ish box (15-col name) plus a long description: bounded by a ~40-col
+    // pane the sidebar is squeezed; bounded by the 80-col editor it is far wider.
+    let long_desc = "Recalibrate the doohickey and frobnicate the whatsit thoroughly";
+    let init = format!(
+        "nx.cmdline_complete.setup {{}}\n\
+         nx.user_command.create('LongCommandName', function() end, {{ desc = '{long_desc}' }})"
+    );
+    let (rpc, mut incoming) = start(&dir, &init).await;
+
+    // Split vertically; the focused window is now ~40 cols, the editor still 80.
+    feed(&rpc, "<C-w>v");
+    barrier(&rpc).await;
+
+    feed(&rpc, ":Long<Tab>");
+    poll_menu(&rpc, &mut incoming).await.expect("menu");
+    feed(&rpc, "<Tab>");
+    let map = wait_redraw(&mut incoming, |m| menu_sel_is(m, 0, true)).await;
+    assert_eq!(menu_items(&map)[0], "LongCommandName");
+
+    let width = menu_docs_width(&map);
+    assert!(
+        width > 40,
+        "cmdline docs must use the whole editor width, not the ~40-col focused pane, got {width}"
+    );
+}
+
+#[tokio::test]
+async fn cmdline_docs_keep_a_usable_width_instead_of_a_one_column_sliver() {
+    let dir = temp_dir("cmdcomplete_sliver");
+    // A long command name makes the wildmenu box wide; anchored near the line's
+    // start, the docs float has no room to its right and flips left — where, with
+    // the box hugging the left edge, the old placement squeezed it to a 1-col
+    // sliver. It must instead keep a readable width (or, failing that, not show).
+    let long_desc = "Frobnicate the whatsit and recalibrate the doohickey before the next cycle";
+    let init = format!(
+        "nx.cmdline_complete.setup {{}}\n\
+         nx.user_command.create('AVeryLongUserCommandNameForCmdlineDocs', function() end, \
+         {{ desc = '{long_desc}' }})"
+    );
+    let (rpc, mut incoming) = start(&dir, &init).await;
+
+    feed(&rpc, ":AVery<Tab>");
+    poll_menu(&rpc, &mut incoming).await.expect("menu");
+    feed(&rpc, "<Tab>");
+    let map = wait_redraw(&mut incoming, |m| menu_sel_is(m, 0, true)).await;
+    assert_eq!(
+        menu_items(&map)[0],
+        "AVeryLongUserCommandNameForCmdlineDocs"
+    );
+
+    // Either a readable docs float, or none at all — never a degenerate sliver.
+    if menu_docs(&map).is_some() {
+        let width = menu_docs_width(&map);
+        assert!(
+            width >= 10,
+            "cmdline docs must keep a usable width, not a 1-col sliver, got {width}"
+        );
+    }
+}
+
 #[tokio::test]
 async fn plugin_command_without_desc_shows_synopsis_only() {
     let dir = temp_dir("cmdcomplete");

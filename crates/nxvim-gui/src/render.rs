@@ -2569,6 +2569,11 @@ impl Renderer {
                     (origin.0 + docs.col).saturating_sub(1),
                     (by + docs.row).saturating_sub(menu.row),
                 )
+            } else if docs.editor_relative {
+                // The insert-completion sidebar floats over the whole editor: its
+                // `col`/`row` are windows-area cells (the grid origin), not the focused
+                // window's text inner — so a split can't squeeze it into the focused pane.
+                (docs.col.saturating_sub(1), docs.row)
             } else {
                 ((text_x0 + docs.col).saturating_sub(1), wy + docs.row)
             };
@@ -2625,27 +2630,35 @@ impl Renderer {
         let Some(float) = &view.content_float else {
             return;
         };
-        let Some(win) = view.focused() else {
-            return;
-        };
-        let (mut wx, mut wy) = match win.rect {
-            Some(r) => (origin.0 + r.x, origin.1 + r.y),
-            None => (origin.0, origin.1),
-        };
-        if win.floating && win.border.is_some() {
-            wx += 1;
-            wy += 1;
-        }
-        // `'padding'` insets the text body, so the popup anchors a margin in too.
-        wx += win.padding.left;
-        wy += win.padding.top;
-        let sign_w = win.sign_width;
-        let gutter = if win.number || win.relativenumber {
-            win.number_width
+        // A cursor-anchored float (hover / signature) sits over the focused window's
+        // text area; an `editor`/`bottom`-relative float (the which-key surface)
+        // anchors over the whole editor's windows area at the grid origin, matching
+        // the server's geometry, so a split doesn't drag it into the focused pane.
+        let (text_x0, wy) = if float.editor_relative {
+            (0, 0)
         } else {
-            0
+            let Some(win) = view.focused() else {
+                return;
+            };
+            let (mut wx, mut wy) = match win.rect {
+                Some(r) => (origin.0 + r.x, origin.1 + r.y),
+                None => (origin.0, origin.1),
+            };
+            if win.floating && win.border.is_some() {
+                wx += 1;
+                wy += 1;
+            }
+            // `'padding'` insets the text body, so the popup anchors a margin in too.
+            wx += win.padding.left;
+            wy += win.padding.top;
+            let sign_w = win.sign_width;
+            let gutter = if win.number || win.relativenumber {
+                win.number_width
+            } else {
+                0
+            };
+            (wx + sign_w + gutter, wy)
         };
-        let text_x0 = wx + sign_w + gutter;
 
         // Prefer the colorscheme's float chrome (`NormalFloat` / `FloatBorder` /
         // `FloatTitle`) when defined, else the historical `Normal`-derived fallback.

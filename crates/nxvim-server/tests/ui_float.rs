@@ -300,6 +300,40 @@ async fn editor_placement_centers_the_float() {
     assert!(col > 10, "editor placement should center, got col {col}");
 }
 
+/// A split must not drag an editor-anchored float into the focused window: with
+/// the screen vertically split, an `editor`-relative float still centers over the
+/// *whole* editor, and a `bottom`-relative float (the which-key surface) still
+/// pins to the whole editor's bottom-right corner — not the focused split's.
+/// Regression: both used the focused window's geometry, so a split shoved them
+/// into the active pane.
+#[tokio::test]
+async fn split_keeps_editor_floats_over_the_whole_editor() {
+    let dir = temp_dir("ui_float_split");
+    let (rpc, mut incoming) = start(&dir, "").await;
+
+    // Vertically split the 80-col editor; the focused window is now ~40 cols wide.
+    feed(&rpc, "<C-w>v");
+    nxvim_test_harness::barrier(&rpc).await;
+
+    // A bottom-right float (which-key) pins to the whole editor's right edge — its
+    // left col lands in the editor's right half, far past the ~40-col focused pane.
+    exec_lua(
+        &rpc,
+        "nx.ui.float({ 'which-key here' }, { relative = 'bottom' })",
+    )
+    .await;
+    let map = poll_float(&rpc, &mut incoming, |f| matches!(f, Value::Map(_)))
+        .await
+        .expect("a bottom float redraw surface");
+    let col = map_get(&float_of(&map), "col")
+        .and_then(Value::as_u64)
+        .unwrap();
+    assert!(
+        col > 40,
+        "a `bottom` float must hug the whole editor's right edge after a split, got col {col}"
+    );
+}
+
 #[tokio::test]
 async fn unknown_border_is_rejected_loud() {
     let dir = temp_dir("ui_float_badborder");

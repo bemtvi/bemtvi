@@ -316,18 +316,40 @@ pub(crate) fn render(
     // prompt caret position so we can draw the terminal cursor there.
     let menu_cursor = match (&view.menu, focused_inner) {
         // The command-line wildmenu anchors to the command-line area (frame-bottom,
-        // no gutter), every other menu to the focused window's text inner.
+        // no gutter), every other menu to the focused window's text inner. The
+        // editor windows area (frame minus the command row) is the base for an
+        // editor-relative docs sidebar, so it floats over the whole editor.
         (Some(menu), Some((inner, _, _))) => {
             let base = if menu.cmdline { cmd_area } else { inner };
-            render_menu(frame, base, menu, &view.styles)
+            let f = frame.area();
+            let editor_area =
+                Rect::new(f.x, f.y, f.width, f.height.saturating_sub(dock.cmd.height));
+            render_menu(frame, base, editor_area, menu, &view.styles)
         }
         _ => None,
     };
 
-    // The list-less content float (`nx.ui.float`; LSP hover / signature help)
-    // floats over the focused window's text area, on top, with no input focus.
-    if let (Some(float), Some((inner, _, _))) = (&view.content_float, focused_inner) {
-        render_content_float(frame, inner, float, &view.styles, FloatTheme::of(view));
+    // The list-less content float (`nx.ui.float`; LSP hover / signature help). A
+    // cursor-anchored float floats over the focused window's text area; an
+    // `editor`/`bottom`-relative float (the which-key surface) anchors over the
+    // whole editor's windows area (the frame minus the command row, matching the
+    // server's geometry), so a split doesn't drag it into the focused pane. Drawn
+    // on top, with no input focus.
+    if let Some(float) = &view.content_float {
+        let base = if float.editor_relative {
+            let f = frame.area();
+            Some(Rect::new(
+                f.x,
+                f.y,
+                f.width,
+                f.height.saturating_sub(dock.cmd.height),
+            ))
+        } else {
+            focused_inner.map(|(inner, _, _)| inner)
+        };
+        if let Some(base) = base {
+            render_content_float(frame, base, float, &view.styles, FloatTheme::of(view));
+        }
     }
 
     // An open picker owns the cursor: draw it in the prompt, not the text window
@@ -2340,6 +2362,7 @@ fn render_pmenu(frame: &mut Frame, text_area: Rect, pmenu: &PmenuData, doc_scrol
 fn render_menu(
     frame: &mut Frame,
     text_area: Rect,
+    editor_area: Rect,
     menu: &MenuData,
     styles: &[nxvim_view::Style],
 ) -> Option<(u16, u16)> {
@@ -2573,6 +2596,11 @@ fn render_menu(
                 width: text_area.width,
                 height: text_area.y.saturating_add(text_area.height),
             }
+        } else if docs.editor_relative {
+            // The insert-completion sidebar floats over the whole editor (its geometry
+            // is windows-area-relative), not the focused window's text inner — so a
+            // split can't squeeze it into the focused pane.
+            editor_area
         } else {
             text_area
         };

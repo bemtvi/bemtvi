@@ -649,6 +649,12 @@ pub struct ContentFloatData {
     pub height: u16,
     /// The border style, or `None` for a borderless float (the `"none"` keyword).
     pub border: Option<Border>,
+    /// Which base [`row`](Self::row)/[`col`](Self::col) are relative to: `false`
+    /// (the default) anchors over the focused window's text area — a cursor-anchored
+    /// hover / signature float — while `true` anchors over the whole editor's
+    /// windows area (an `editor`/`bottom`-relative float, the which-key surface), so
+    /// a split doesn't drag it into the focused pane.
+    pub editor_relative: bool,
     /// An optional title drawn on the top border (`None` when untitled).
     pub title: Option<String>,
 }
@@ -663,13 +669,20 @@ pub struct MenuDocs {
     /// The documentation lines (a `detail` / synopsis heading, then the body) —
     /// already windowed to `height`. Plain text, like a hover.
     pub lines: Vec<String>,
-    /// The float's content top-left, **text-area-relative** (the server placed it
-    /// beside the box and clamped it to the viewport).
+    /// The float's content top-left. Relative to the focused window's text area by
+    /// default (the cmdline wildmenu's docs), or to the whole editor's windows area
+    /// when [`editor_relative`](Self::editor_relative) — the insert-completion docs
+    /// sidebar, which floats over the entire editor.
     pub row: u16,
     pub col: u16,
     /// The float's content width / height in cells (the client adds its border).
     pub width: u16,
     pub height: u16,
+    /// Whether [`row`](Self::row)/[`col`](Self::col) are relative to the whole
+    /// editor's windows area (`true`, the insert-completion sidebar — so a split
+    /// doesn't squeeze it into the focused pane) rather than the focused window's
+    /// text area (`false`, the cmdline wildmenu's docs).
+    pub editor_relative: bool,
 }
 
 /// The picker preview pane mirrored from the redraw: the windowed file content for
@@ -877,6 +890,8 @@ impl View {
                         col: map_u16(d, "col"),
                         width: map_u16(d, "width"),
                         height: map_u16(d, "height"),
+                        editor_relative: map_get(d, "editor_relative").and_then(Value::as_bool)
+                            == Some(true),
                     }),
                     _ => None,
                 },
@@ -891,6 +906,8 @@ impl View {
                 width: map_u16(f, "width"),
                 height: map_u16(f, "height"),
                 border: parse_border(map_get(f, "border")),
+                editor_relative: map_get(f, "editor_relative").and_then(Value::as_bool)
+                    == Some(true),
                 title: map_get(f, "title")
                     .and_then(Value::as_str)
                     .map(str::to_string),

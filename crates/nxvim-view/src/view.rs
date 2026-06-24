@@ -581,6 +581,14 @@ pub struct MenuData {
     /// window's text inner — `col` is then a column within the command line and the
     /// box floats just above it. `false` (key absent) for every other menu.
     pub cmdline: bool,
+    /// Whether [`row`](Self::row)/[`col`](Self::col) are **editor-absolute**
+    /// (windows-area cells) rather than focused-window-relative. `true` for the
+    /// `nx.picker` overlay (an `Editor` / `Bottom` placement): the client anchors the
+    /// box to the windows-area origin so it floats over the whole editor instead of
+    /// being squeezed into the active split. `false` (key absent) for the
+    /// cursor-anchored completion popup / `nx.ui.select`. Mirrors
+    /// [`ContentFloatData::editor_relative`].
+    pub editor_relative: bool,
     /// Per visible row (parallel to `items`), the matched-character spans to
     /// highlight as half-open **char** ranges (empty for rows with no match).
     pub match_spans: Vec<Vec<(u16, u16)>>,
@@ -865,6 +873,8 @@ impl View {
                 prompt_bottom: map_get(m, "prompt_pos").and_then(Value::as_str) == Some("bottom"),
                 border_top: map_get(m, "border_top").and_then(Value::as_bool) != Some(false),
                 cmdline: map_get(m, "cmdline").and_then(Value::as_bool) == Some(true),
+                editor_relative: map_get(m, "editor_relative").and_then(Value::as_bool)
+                    == Some(true),
                 match_spans: parse_multi_spans(map_get(m, "match_spans")),
                 marked: match map_get(m, "marked") {
                     Some(Value::Array(a)) => {

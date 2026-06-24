@@ -1485,6 +1485,8 @@ impl Editor {
             leftcol,
             text_width,
             text_height,
+            editor_w,
+            editor_h,
         } = metrics;
         // A picker carries a prompt line plus a separator row between it and the
         // list; `nx.ui.select` carries neither. Both count toward the box height
@@ -1555,16 +1557,23 @@ impl Editor {
             // `Bottom` is a content-float-only placement; a menu never requests it, so
             // it falls in with the centered `Editor` box here.
             MenuPlacement::Editor | MenuPlacement::Bottom => {
+                // A picker is an EDITOR-LEVEL overlay: sized and centered against the
+                // WHOLE editor's windows area (`editor_w`/`editor_h`), not the focused
+                // window — a split must not squeeze it into the active pane. The
+                // resulting box is editor-absolute (windows-area cells); the client
+                // anchors it to the windows-area origin (the `editor_relative` flag the
+                // server emits), the same convention the which-key content float uses.
+                //
                 // A picker is a FIXED box — never content-hugging (that looks ragged).
                 // Resolve the configured extent against the viewport, default ~80% × 60%.
                 const DEFAULT_W: f32 = 0.8;
                 const DEFAULT_H: f32 = 0.6;
-                let max_w = text_width.saturating_sub(2).max(1);
-                let max_h = text_height.saturating_sub(2).max(1);
+                let max_w = editor_w.saturating_sub(2).max(1);
+                let max_h = editor_h.saturating_sub(2).max(1);
                 let width = m
                     .width
-                    .map_or((text_width as f32 * DEFAULT_W).round() as usize, |e| {
-                        e.resolve(text_width)
+                    .map_or((editor_w as f32 * DEFAULT_W).round() as usize, |e| {
+                        e.resolve(editor_w)
                     })
                     .clamp(1, max_w);
                 // The natural floor is `chrome + 1` (the prompt/separator rows plus
@@ -1576,17 +1585,17 @@ impl Editor {
                 let min_h = (chrome + 1).min(max_h);
                 let height = m
                     .height
-                    .map_or((text_height as f32 * DEFAULT_H).round() as usize, |e| {
-                        e.resolve(text_height)
+                    .map_or((editor_h as f32 * DEFAULT_H).round() as usize, |e| {
+                        e.resolve(editor_h)
                     })
                     .clamp(min_h, max_h);
-                // Align the box within the text area, inset by the margin. The
+                // Align the box within the whole editor, inset by the margin. The
                 // default (`align == None`) is `Center` — the historical centered
                 // picker placement. The `+2` accounts for the box's own border, so
                 // the *outer* box (border included) is what gets aligned.
                 let align = m.align.unwrap_or(Align::Center);
                 let (col, row) = place_aligned(
-                    (0, 0, text_width, text_height),
+                    (0, 0, editor_w, editor_h),
                     width.saturating_add(2),
                     height.saturating_add(2),
                     align,
@@ -1661,8 +1670,11 @@ fn menu_start(selected: Option<usize>, list_rows: usize) -> usize {
 /// or recomputed in core for mouse hit-testing. `text_width` / `text_height` are
 /// the focused window's text-area size (its width minus the number gutter, and its
 /// visible row count); the cursor fields are window-relative (the cursor popup
-/// anchors under the caret). `Editor` / `Cmdline` placements ignore the cursor
-/// fields (centered / command-line-anchored), but every caller supplies them.
+/// anchors under the caret). `editor_w` / `editor_h` are the WHOLE editor's
+/// windows-area size — an `Editor` / `Bottom` placement (the picker) sizes and
+/// centers against these, not the focused window, so it overlays the entire editor
+/// rather than the active split. `Cmdline` placement ignores the cursor + editor
+/// fields (command-line-anchored), but every caller supplies them.
 #[derive(Debug, Clone, Copy)]
 pub struct MenuMetrics {
     pub cursor_row: usize,
@@ -1670,11 +1682,16 @@ pub struct MenuMetrics {
     pub leftcol: usize,
     pub text_width: usize,
     pub text_height: usize,
+    pub editor_w: usize,
+    pub editor_h: usize,
 }
 
-/// An open menu's resolved on-screen box, in the focused window's text-area cells
-/// (the command-line area for [`MenuPlacement::Cmdline`]). The geometry both the
-/// server projection and the mouse hit-test consume. `rows` is the visible slice
+/// An open menu's resolved on-screen box. The coordinate base depends on the
+/// placement: the focused window's text-area cells for `Cursor`, the command-line
+/// area for [`MenuPlacement::Cmdline`], and the **whole editor's windows-area
+/// cells** (editor-absolute) for the `Editor` / `Bottom` picker overlay. The
+/// geometry both the server projection and the mouse hit-test consume. `rows` is the
+/// visible slice
 /// `[start, start + rows.len())`; `selected` is the highlighted row rebased into
 /// that window (add `start` for the absolute view index).
 #[derive(Debug, Clone)]

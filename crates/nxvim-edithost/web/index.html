@@ -1819,12 +1819,18 @@
       const bottom = !menu.cmdline;
       const leftShift = !menu.cmdline && menu.border_top === false ? 1 : 0;
       const outerH = boxRows + (top ? 1 : 0) + (bottom ? 1 : 0);
+      // The anchor base: the `nx.picker` overlay (`editor_relative`) is editor-absolute
+      // (windows-area cells), so it anchors at the grid origin and floats over the whole
+      // editor — a split can't drag it into the focused pane; every other menu anchors to
+      // the focused window's text inner (rect + tabline offset).
+      const baseX = menu.editor_relative ? 0 : rect.x;
+      const baseY = menu.editor_relative ? 0 : tablineRows + rect.y;
       // The cmdline wildmenu floats *above* the command line: anchor its outer box so the
       // bottom-border-less list kisses the input. Every other menu's border origin sits
-      // where the server placed it (text-area row `menu.row`). `cmdShift` tracks the
+      // where the server placed it (row `menu.row` off the base). `cmdShift` tracks the
       // resulting vertical displacement so the docs sidebar follows the box.
-      const serverY = tablineRows + rect.y + menu.row;
-      const boxX = menu.cmdline ? rect.x + menu.col : rect.x + menu.col - leftShift;
+      const serverY = baseY + menu.row;
+      const boxX = menu.cmdline ? rect.x + menu.col : baseX + menu.col - leftShift;
       const boxY = menu.cmdline ? Math.max(tablineRows, cmdRow - outerH) : serverY;
       const cmdShift = boxY - serverY;
       // Themed colors (nvim-cmp / telescope groups, resolved server-side into the

@@ -1591,13 +1591,15 @@ struct CompleteDocsMeta {
 }
 
 /// Project the floating selectable-list [`MenuView`] into its redraw sub-map,
-/// computing the bordered box's anchor and content size in **text-area cells**
-/// (the client adds the gutter + text-area origin, then draws the border) — the
-/// same convention and placement strategy as the completion popup. `Cursor`
-/// placement anchors under the cursor and flips above when there's no room
-/// below; `Editor` placement centers the box over the focused window's text area
-/// (the picker refines this when it lands). `text_width` bounds the box to the
-/// editable region. Mirrors `EditHost::pmenu_value`.
+/// computing the bordered box's anchor and content size. A `Cursor` box is in
+/// **text-area cells** (the client adds the gutter + text-area origin, then draws
+/// the border) — the same convention and placement strategy as the completion
+/// popup — anchored under the cursor and flipping above when there's no room below.
+/// The `Editor` / `Bottom` picker overlay is instead sized and centered over the
+/// WHOLE editor (`editor_w`/`editor_h`) and carries the `editor_relative` flag, so
+/// the client floats it over the windows area rather than the focused split.
+/// `text_width` bounds a `Cursor` box to the editable region. Mirrors
+/// `EditHost::pmenu_value`.
 impl EditHost {
     fn project_menu(
         &mut self,
@@ -1623,6 +1625,8 @@ impl EditHost {
                 leftcol: focused.leftcol,
                 text_width,
                 text_height,
+                editor_w,
+                editor_h,
             },
         );
         let nxvim_core::MenuGeom {
@@ -1707,6 +1711,15 @@ impl EditHost {
         // below the cursor. Absent ⇒ a full border (the `select` / picker default).
         if m.completion {
             map.push((Value::from("border_top"), Value::from(false)));
+        }
+        // The `Editor` / `Bottom` picker overlay floats over the WHOLE editor: its
+        // `row`/`col` are editor-absolute (windows-area cells, computed by
+        // `menu_geom` against `editor_w`/`editor_h`), so the client anchors the box to
+        // the windows-area origin instead of the focused window's text inner — a split
+        // can't squeeze it into the active pane. Absent ⇒ window-relative (the
+        // cursor-anchored completion popup / `select`).
+        if matches!(m.placement, MenuPlacement::Editor | MenuPlacement::Bottom) {
+            map.push((Value::from("editor_relative"), Value::from(true)));
         }
         // The command-line wildmenu (`nx.cmdline_complete`) floats above the command
         // line, not the focused window — so the client anchors it to the command-line

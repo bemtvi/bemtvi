@@ -2319,29 +2319,36 @@ impl Renderer {
         let Some(menu) = &view.menu else {
             return;
         };
-        let Some(win) = view.focused() else {
-            return;
-        };
-        // The focused window's text-inner origin in screen cells (rect + gutter),
-        // identical to the popup's anchor derivation.
-        let (mut wx, mut wy) = match win.rect {
-            Some(r) => (origin.0 + r.x, origin.1 + r.y),
-            None => (origin.0, origin.1),
-        };
-        if win.floating && win.border.is_some() {
-            wx += 1;
-            wy += 1;
-        }
-        // `'padding'` insets the text body, so the popup anchors a margin in too.
-        wx += win.padding.left;
-        wy += win.padding.top;
-        let sign_w = win.sign_width;
-        let gutter = if win.number || win.relativenumber {
-            win.number_width
+        // The anchor base for the box. The `nx.picker` overlay (`editor_relative`) is
+        // editor-absolute (windows-area cells), so it anchors at the grid origin and
+        // floats over the whole editor — a split can't drag it into the focused pane;
+        // every other menu anchors to the focused window's text-inner origin (rect +
+        // padding + gutter), identical to the popup's anchor derivation.
+        let (text_x0, wy) = if menu.editor_relative {
+            (0, 0)
         } else {
-            0
+            let Some(win) = view.focused() else {
+                return;
+            };
+            let (mut wx, mut wy) = match win.rect {
+                Some(r) => (origin.0 + r.x, origin.1 + r.y),
+                None => (origin.0, origin.1),
+            };
+            if win.floating && win.border.is_some() {
+                wx += 1;
+                wy += 1;
+            }
+            // `'padding'` insets the text body, so the popup anchors a margin in too.
+            wx += win.padding.left;
+            wy += win.padding.top;
+            let sign_w = win.sign_width;
+            let gutter = if win.number || win.relativenumber {
+                win.number_width
+            } else {
+                0
+            };
+            (wx + sign_w + gutter, wy)
         };
-        let text_x0 = wx + sign_w + gutter;
 
         // Themed colors (nvim-cmp / telescope groups, resolved server-side), each
         // falling back to the built-in derived look when its group is undefined: the

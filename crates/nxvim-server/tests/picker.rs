@@ -201,6 +201,91 @@ async fn static_source_streams_then_fuzzy_filters_without_touching_the_buffer() 
     );
 }
 
+/// A picker is an EDITOR-LEVEL overlay: its box is sized and centered over the
+/// WHOLE editor, not the focused window. With a vertical split the focused pane is
+/// only ~half the width, yet the picker must keep its full-editor width and be
+/// flagged `editor_relative` so the client floats it over the entire editor (not
+/// squeezed into the active pane). Before the fix the geometry was computed against
+/// the focused window's text area, so the box shrank to the split pane and anchored
+/// inside it.
+#[tokio::test]
+async fn picker_overlays_the_whole_editor_not_the_focused_window() {
+    let dir = temp_dir("picker_overlay_editor");
+    let (rpc, mut incoming) = start(&dir, STATIC_SRC).await;
+
+    // Split vertically so the focused window is ~40 cols wide (half of the 80-col
+    // editor). A window-confined picker would size against this narrow pane.
+    command(&rpc, "vsplit").await;
+
+    exec_lua(&rpc, "nx.picker.open('fruits')").await;
+    let menu = menu_of(&poll_menu(&rpc, &mut incoming).await.expect("menu opens"));
+
+    // Default width is ~80% of the 80-col EDITOR (round(80 * 0.8) = 64), far wider
+    // than the ~40-col focused window could hold (~32). This is the headline symptom.
+    assert_eq!(
+        map_get(&menu, "width").and_then(Value::as_u64),
+        Some(64),
+        "picker spans ~80% of the whole editor, not the ~40-col split pane",
+    );
+    // The outer box (width + 2 border = 66) is centered over the whole 80-col
+    // editor: col = (80 - 66) / 2 = 7. A window-anchored box would center within the
+    // ~40-col pane (and the client would offset it by the pane origin).
+    assert_eq!(map_get(&menu, "col").and_then(Value::as_u64), Some(7));
+    // Flagged editor-relative so every client anchors it to the windows area (the
+    // whole editor), not the focused window's text inner.
+    assert_eq!(
+        map_get(&menu, "editor_relative").and_then(Value::as_bool),
+        Some(true),
+        "picker is flagged editor-relative so it floats over the whole editor",
+    );
+}
+
+/// The editor-relative picker's **mouse hit-test** is editor-absolute too: with the
+/// focused window offset into the editor (the right pane of a vsplit, origin ~col 40),
+/// a click on a list row — addressed in global cells, where the box is centered over
+/// the WHOLE editor — must still land on that row. Before the fix the hit-test rebased
+/// the box onto the focused pane, so a click on the (editor-centered) box missed.
+#[tokio::test]
+async fn clicking_a_picker_row_in_a_split_hits_via_editor_absolute_geometry() {
+    let dir = temp_dir("picker_mouse_split");
+    let (rpc, mut incoming) = start(&dir, STATIC_SRC).await;
+    command(&rpc, "set nonumber norelativenumber").await;
+    // Split vertically and focus the RIGHT pane, so the focused window's origin is
+    // well into the editor (~col 40) — not the (0,0) a single window would have.
+    command(&rpc, "vsplit").await;
+    command(&rpc, "wincmd l").await;
+
+    exec_lua(&rpc, "_G.picked = nil; nx.picker.open('fruits')").await;
+    let menu = menu_of(&poll_menu(&rpc, &mut incoming).await.expect("menu opens"));
+    // The box is editor-absolute and centered over the whole editor, not the pane.
+    assert_eq!(
+        map_get(&menu, "editor_relative").and_then(Value::as_bool),
+        Some(true),
+    );
+
+    // Click the third row ("banana") at its GLOBAL cell: the hit-test inverts the
+    // same editor-absolute geometry, so the row highlights.
+    let (r, c) = list_cell(&menu, 2);
+    feed_mouse(&rpc, "left", "press", r, c);
+    let menu = menu_of(
+        &poll_menu(&rpc, &mut incoming)
+            .await
+            .expect("redraw after click"),
+    );
+    assert_eq!(
+        menu_u64(&menu, "selected"),
+        2,
+        "the clicked row highlights — the hit-test is editor-absolute",
+    );
+    // A second click on the highlighted row confirms it.
+    feed_mouse(&rpc, "left", "press", r, c);
+    assert_eq!(
+        exec_lua(&rpc, "return _G.picked").await.as_str(),
+        Some("banana"),
+        "clicking the highlighted row confirms it",
+    );
+}
+
 /// Phase 4: `<C-q>` sends the picker's **current (filtered)** results to a location
 /// list — the nxvim port of telescope's send-to-loclist. With `'qfdock'` on (the
 /// default), the list opens as a bottom-dock tab and `<CR>` on an entry jumps into

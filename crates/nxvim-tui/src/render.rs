@@ -316,14 +316,22 @@ pub(crate) fn render(
     // prompt caret position so we can draw the terminal cursor there.
     let menu_cursor = match (&view.menu, focused_inner) {
         // The command-line wildmenu anchors to the command-line area (frame-bottom,
-        // no gutter), every other menu to the focused window's text inner. The
-        // editor windows area (frame minus the command row) is the base for an
-        // editor-relative docs sidebar, so it floats over the whole editor.
+        // no gutter); the `nx.picker` overlay (`editor_relative`) anchors to the
+        // editor windows area (frame minus the command row) so it floats over the
+        // whole editor, not the focused split; every other menu anchors to the focused
+        // window's text inner. The windows area is also the base for an editor-relative
+        // docs sidebar.
         (Some(menu), Some((inner, _, _))) => {
-            let base = if menu.cmdline { cmd_area } else { inner };
             let f = frame.area();
             let editor_area =
                 Rect::new(f.x, f.y, f.width, f.height.saturating_sub(dock.cmd.height));
+            let base = if menu.cmdline {
+                cmd_area
+            } else if menu.editor_relative {
+                editor_area
+            } else {
+                inner
+            };
             render_menu(frame, base, editor_area, menu, &view.styles)
         }
         _ => None,

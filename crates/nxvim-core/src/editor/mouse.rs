@@ -1489,11 +1489,13 @@ impl Editor {
         let m = self.menu_view()?;
         let (metrics, win, gutter) = self.menu_anchor()?;
         let geom = self.menu_geom(&m, metrics);
-        // The box's outer top-left + border layout, in global cells. Two frames: the
+        // The box's outer top-left + border layout, in global cells. Three frames: the
         // command-line wildmenu anchors to the command-line area (global x, the row
         // just below the windows area) and grows *upward* with a top border and no
-        // bottom one; every other menu anchors to the focused window's text inner and
-        // grows downward.
+        // bottom one; the `Editor` / `Bottom` picker overlay is already editor-absolute
+        // (its `geom` is in windows-area cells), so it anchors at the windows-area
+        // origin; every other menu anchors to the focused window's text inner. All but
+        // the wildmenu grow downward.
         let (box_x, box_y, top_border, vborder) = if matches!(m.placement, MenuPlacement::Cmdline) {
             // `self.height` is the windows-area height, so the command-line row is at
             // that global row and the box's bottom border abuts it; the token column is
@@ -1503,6 +1505,12 @@ impl Editor {
                 .height
                 .checked_sub(geom.height.saturating_add(vborder))?;
             (geom.col, box_y, 1, vborder)
+        } else if matches!(m.placement, MenuPlacement::Editor | MenuPlacement::Bottom) {
+            // Editor-absolute: `geom.col`/`geom.row` are the outer box's top-left in
+            // windows-area cells (origin 0,0), so a split's focused-pane origin does
+            // not enter — the box floats over the whole editor, mirroring the client's
+            // `editor_relative` anchor. A picker is always fully bordered (2 rows).
+            (geom.col, geom.row, 1, 2)
         } else {
             let (wx, wy) = self.window_screen_pos(win)?;
             // The text inner sits past this window's `'padding'` (left + top) and its
@@ -1573,12 +1581,15 @@ impl Editor {
     fn menu_anchor(&self) -> Option<(MenuMetrics, WindowId, usize)> {
         let view = crate::view::View::from_editor(self);
         let f = view.focused();
+        let (editor_w, editor_h) = self.screen_size();
         let metrics = MenuMetrics {
             cursor_row: f.cursor_row,
             cursor_screen_col: f.cursor_screen_col,
             leftcol: f.leftcol,
             text_width: f.rect.width.saturating_sub(f.number_width),
             text_height: f.rows.len(),
+            editor_w,
+            editor_h,
         };
         Some((metrics, f.id, f.number_width))
     }

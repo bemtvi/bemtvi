@@ -60,7 +60,7 @@ emcc "$LIB" "$LUA_A" "$REGEX_A" -o dist/eh.mjs \
   -sALLOW_MEMORY_GROWTH=1 \
   -sEXIT_RUNTIME=0 \
   -sEXPORTED_RUNTIME_METHODS=ccall,cwrap,UTF8ToString,HEAPU8 \
-  -sEXPORTED_FUNCTIONS=_eh_new,_eh_input,_eh_input_mouse,_eh_source_lua,_eh_boot_finish,_eh_attach,_eh_set_clock,_eh_next_deadline,_eh_tick_timers,_eh_take_fs_requests,_eh_save_bytes,_eh_save_len,_eh_fs_read_complete,_eh_fs_write_complete,_eh_take_watch_requests,_eh_remote_file_changed,_eh_set_daemon_connected,_eh_take_proc_requests,_eh_proc_spawned,_eh_proc_stdout,_eh_proc_exited,_eh_take_fs_op_requests,_eh_fs_op_result,_eh_take_fs_watch_requests,_eh_fs_watch_change,_eh_fs_watch_err,_eh_take_terminal_requests,_eh_terminal_data,_eh_terminal_flush,_eh_terminal_exit,_eh_take_lsp_requests,_eh_lsp_stdout,_eh_lsp_stderr,_eh_lsp_exited,_eh_take_clipboard_writes,_eh_clipboard_push,_eh_take_ts_requests,_eh_ts_install_complete,_eh_ts_seed_installed,_eh_export_shada,_eh_load_shada,_eh_exec_lua,_eh_redraw_json,_eh_lines,_eh_aux_lines,_eh_free_string,_eh_free,_malloc,_free
+  -sEXPORTED_FUNCTIONS=_eh_new,_eh_input,_eh_input_mouse,_eh_source_lua,_eh_boot_finish,_eh_attach,_eh_set_clock,_eh_next_deadline,_eh_tick_timers,_eh_take_fs_requests,_eh_save_bytes,_eh_save_len,_eh_fs_read_complete,_eh_fs_write_complete,_eh_take_watch_requests,_eh_remote_file_changed,_eh_set_proc_host,_eh_take_proc_requests,_eh_proc_spawned,_eh_proc_stdout,_eh_proc_exited,_eh_take_fs_op_requests,_eh_fs_op_result,_eh_take_fs_watch_requests,_eh_fs_watch_change,_eh_fs_watch_err,_eh_take_terminal_requests,_eh_terminal_data,_eh_terminal_flush,_eh_terminal_exit,_eh_take_lsp_requests,_eh_lsp_stdout,_eh_lsp_stderr,_eh_lsp_exited,_eh_take_clipboard_writes,_eh_clipboard_push,_eh_take_ts_requests,_eh_ts_install_complete,_eh_ts_seed_installed,_eh_export_shada,_eh_load_shada,_eh_exec_lua,_eh_redraw_json,_eh_lines,_eh_aux_lines,_eh_free_string,_eh_free,_malloc,_free
 
 # 3. Tree-sitter highlighter assets → web/vendor/ (the web-tree-sitter runtime + the
 #    per-language grammar .wasm + sanitized queries) for the in-page syntax highlighter
@@ -106,5 +106,13 @@ cp -r "$MSGPACK_SRC/." web/vendor/msgpack/
 find web/vendor/msgpack \( -name '*.d.ts' -o -name '*.map' -o -name '*.tsbuildinfo' \) -delete
 echo "copied @msgpack/msgpack → web/vendor/msgpack/"
 
+# This is the **standard editor** build: no Pyodide, and `build-config.js` stays `localHost:
+# false`, so the Worker never installs the local process host. The python demo is a *separate*
+# build — `build-demo.sh` — which assembles its own self-contained site (Pyodide + the local
+# host) into demo-site/. Drop any Pyodide a previous demo build may have left in the shared
+# vendor dir, so the standard site is clean.
+rm -rf web/vendor/pyodide
+
 echo
-echo "built dist/eh.mjs — run the harness:  node harness.mjs"
+echo "built dist/eh.mjs (standard editor) — run the harness:  node harness.mjs"
+echo "for the python demo site, run:  ./build-demo.sh"

@@ -15,6 +15,11 @@
 //     this mode (no run loop to wake them); input still works.
 import createModule from "../dist/eh.mjs";
 import { dialDaemon } from "./rpc.mjs";
+// Build-time feature flags. The standard editor build ships `localHost: false`; only the
+// python-demo build (build-demo.sh) flips it true, which makes this Worker install the local
+// in-browser process host (see the boot tail). The demo module is dynamic-imported, so the
+// standard build never even loads it.
+import { BUILD } from "./build-config.js";
 // The `nx.fs` reply is re-encoded to msgpack bytes (faithful binary for a `read` result)
 // before crossing into Rust, which decodes it through the shared `fswire` codec — so JS
 // stays a near-dumb pipe (no per-variant format knowledge). Same vendored lib as rpc.mjs.
@@ -51,10 +56,11 @@ const eh_fs_write_complete = M.cwrap("eh_fs_write_complete", null, ["number", "n
 const eh_take_watch_requests = M.cwrap("eh_take_watch_requests", "number", ["number"]);
 const eh_remote_file_changed = M.cwrap("eh_remote_file_changed", null, ["number", "string", "number", "number", "number"]);
 // Remote proc leg (Phase 6d): the editor enqueues async `vim.system` / `jobstart` spawns
-// off-tick (only when a daemon is connected — `eh_set_daemon_connected` gates it); the Worker
-// forwards each to the daemon and lands its `proc_spawned`/`proc_exited` pushes back into the
-// tick. `eh_proc_exited` takes stdout/stderr as pointer+length (process output is raw bytes).
-const eh_set_daemon_connected = M.cwrap("eh_set_daemon_connected", null, ["number", "number"]);
+// off-tick (only when a process host — a daemon OR a local in-browser Worker host — is present;
+// `eh_set_proc_host` gates it); the Worker forwards each to the host and lands its
+// `proc_spawned`/`proc_exited` pushes back into the tick. `eh_proc_exited` takes stdout/stderr
+// as pointer+length (process output is raw bytes).
+const eh_set_proc_host = M.cwrap("eh_set_proc_host", null, ["number", "number"]);
 const eh_take_proc_requests = M.cwrap("eh_take_proc_requests", "number", ["number"]);
 const eh_proc_spawned = M.cwrap("eh_proc_spawned", null, ["number", "number", "number"]);
 // Streaming stdout (`nx.run_stream`'s batches): the daemon pushes `proc_stdout` batches; the
@@ -760,6 +766,12 @@ let daemonUri = new URL(self.location.href).searchParams.get("daemon");
 let daemon = null; // an RpcClient once connected
 let daemonError = null; // a dial failure reason (daemon mode requested but not connected)
 
+// The local in-browser process host, installed only in the python-demo build (build-config
+// `localHost: true`) and only when serverless — see the boot tail. `null` in the standard
+// editor build (and in daemon mode), where processes ride the wire or fail loud. When set, it
+// fulfils the proc / terminal / LSP off-tick seams locally (Pyodide); see web/local-host.mjs.
+let localHost = null;
+
 async function connectDaemon() {
   if (!daemonUri) return;
   try {
@@ -769,7 +781,7 @@ async function connectDaemon() {
     daemon.onNotify = onDaemonNotify;
     // A process host is now reachable: let the editor tick take its async-spawn branch
     // (`vim.system` / `jobstart`) instead of failing loud.
-    eh_set_daemon_connected(h, 1);
+    eh_set_proc_host(h, 1);
   } catch (e) {
     daemonError = String(e && e.message ? e.message : e);
     postMessage({ type: "config_error", error: `daemon connection failed: ${daemonError}` });
@@ -790,7 +802,7 @@ async function runtimeConnect(uri) {
   }
   // The old wire is gone: no process host until the new dial succeeds, and the new daemon
   // knows none of the old watches or in-flight children.
-  eh_set_daemon_connected(h, 0);
+  eh_set_proc_host(h, 0);
   armedWatches.clear();
   liveProcs.clear();
   liveLsp.clear();
@@ -1089,6 +1101,26 @@ function applyDaemonNotifications() {
   return any;
 }
 
+// Land an async host push onto the run loop's notification queue and wake its park — the local
+// host's twin of `onDaemonNotify`'s push+wake (a one-shot push must bump the SEQ futex the async
+// park watches, not just the microtask waker, or an isolated `term_exit` could sleep to the poll
+// cap; see the daemon-push wake-race note above and in CLAUDE.md/memory). Generic infra: the
+// demo's local host (web/local-host.mjs) receives the Pyodide Worker's `data`/`exit` and calls
+// this so they reuse the daemon leg's `term_data`/`term_exit` landing. Only wired in the demo
+// build (passed into `installLocalHost`); inert in the standard build.
+function landHostPush(method, params) {
+  const wasEmpty = daemonNotifications.length === 0;
+  daemonNotifications.push([method, params]);
+  if (sabMode) {
+    if (wasEmpty) {
+      if (daemonWaker) { const r = daemonWaker; daemonWaker = null; r(); }
+      if (sabCtrl) { Atomics.add(sabCtrl, SEQ, 1); Atomics.notify(sabCtrl, SEQ, 1); }
+    }
+  } else {
+    pump5cDaemon();
+  }
+}
+
 // Feed a `term_data` push's bytes into the vt100 emulator. The bytes are copied into wasm
 // memory (PTY output is binary — NULs / invalid UTF-8 can't ride the cwrap "string"
 // marshalling) and `eh_terminal_data` feeds them; free after the call. Feed only — the caller
@@ -1152,7 +1184,12 @@ function callLspStderr(id, bytes) {
 async function drainProcRequests() {
   const reqs = JSON.parse(readStr(eh_take_proc_requests(h)));
   if (reqs.spawn.length === 0 && reqs.kill.length === 0) return;
-  if (!daemon) return; // defensive: the tick shouldn't enqueue a spawn without a daemon
+  if (!daemon) {
+    // Serverless: route to the local host (demo build) if present — it fails loud for legs it
+    // hasn't wired yet. Standard build: no local host, no enqueued spawns (the gate is closed).
+    if (localHost) localHost.proc(reqs);
+    return;
+  }
   for (const s of reqs.spawn) {
     liveProcs.add(s.id);
     // The 6th param is the stream flag (the daemon's `decode_spawn` reads it):
@@ -1262,7 +1299,11 @@ async function drainTerminalRequests() {
   ) {
     return;
   }
-  if (!daemon) return; // defensive: the tick shouldn't enqueue a terminal op without a daemon
+  if (!daemon) {
+    // Serverless: fulfil `:terminal` against the local in-browser host (demo build) if present.
+    if (localHost) localHost.terminal(reqs);
+    return;
+  }
   for (const o of reqs.open) {
     liveTerms.add(o.buf);
     await daemon.notify("term_open", [o.buf, o.argv, o.cwd ?? null, o.rows, o.cols]);
@@ -1296,7 +1337,12 @@ async function drainTerminalRequests() {
 async function drainLspRequests() {
   const reqs = JSON.parse(readStr(eh_take_lsp_requests(h)));
   if (reqs.spawn.length === 0 && reqs.stdin.length === 0 && reqs.kill.length === 0) return;
-  if (!daemon) return; // defensive: the tick shouldn't enqueue an LSP op without a daemon
+  if (!daemon) {
+    // Serverless: route to the local host (demo build) if present — it fails loud for legs it
+    // hasn't wired yet. Standard build: no local host, no enqueued LSP ops (the gate is closed).
+    if (localHost) localHost.lsp(reqs);
+    return;
+  }
   for (const s of reqs.spawn) {
     liveLsp.add(s.id);
     await daemon.notify("lsp_spawn", [s.id, s.program, s.args, s.cwd]);
@@ -1663,14 +1709,19 @@ async function runLoopSAB(ctrl, data) {
     // keystroke / timer also wakes to flush cross-session state after a quiet period.
     if (shadaDirty) deadline = deadline < 0 ? shadaDueMs : Math.min(deadline, shadaDueMs);
     let timeout = deadline < 0 ? undefined : Math.max(0, deadline - nowMs());
-    const daemonPushing =
-      daemon &&
+    // Any in-flight host work means a push could land asynchronously and must be received off
+    // the event loop — a daemon over the wire OR the local in-browser host (the Pyodide
+    // `:terminal`, whose `term_data`/`term_exit` arrive via the sibling Worker's postMessage).
+    // A thread frozen in blocking `Atomics.wait` can't process those messages, so park async
+    // while a live terminal / child / watch / server exists, in either transport.
+    const hostPushing =
+      (daemon || localHost) &&
       (armedWatches.size > 0 ||
         liveProcs.size > 0 ||
         liveTerms.size > 0 ||
         liveFsWatches.size > 0 ||
         liveLsp.size > 0);
-    if (daemonPushing || indenterBusy()) {
+    if (hostPushing || indenterBusy()) {
       // Don't *block* — a thread frozen in `Atomics.wait` can't run the event loop, so any
       // pending promise stalls. Cases that need it live: a daemon session expecting pushes
       // (a watch armed, or a child in flight — its WebTransport reader must keep running to
@@ -1854,6 +1905,22 @@ onmessage = async (ev) => {
 // live for the first user `:e` — and a dial failure surfaces before "ready". A no-op in
 // serverless (OPFS) mode.
 await connectDaemon();
+
+// Python-demo build, serverless: install the local in-browser process host (the Pyodide
+// interpreter backs `:terminal python …`). It opens the `proc_host` gate; Pyodide itself loads
+// lazily on the first `:terminal`, so this costs nothing until used. The module is
+// dynamic-imported so the standard editor build never loads it. In daemon mode `connectDaemon`
+// already flipped the gate and processes ride the wire, so the local host stays off.
+if (BUILD.localHost && !daemonUri) {
+  const { installLocalHost } = await import("./local-host.mjs");
+  localHost = installLocalHost({
+    setProcHost: (on) => eh_set_proc_host(h, on ? 1 : 0),
+    landHostPush,
+    toU8,
+    liveTerms,
+    reportError: (msg) => postMessage({ type: "config_error", error: msg }),
+  });
+}
 
 // Source the optional /init.lua + finish boot before announcing "ready", so the config
 // is fully applied before the UI attaches and the first frame paints. Run here (module

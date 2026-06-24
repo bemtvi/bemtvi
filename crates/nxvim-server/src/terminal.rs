@@ -820,6 +820,14 @@ impl EditHost {
     /// terminal mode, append the `[Process exited]` notice), drop the emulator, then settle
     /// + repaint. The wasm twin of the native `on_term_event` Exit arm.
     pub fn terminal_exit(&mut self, buf: BufferId, code: i32) {
+        // Mirror the child's final screen into the buffer *before* the emulator is dropped.
+        // A fast-exiting child's last `term_data` and its `term_exit` can land in the same
+        // run-loop pass (the local Pyodide `:terminal` posts them back-to-back; a daemon child
+        // that prints-then-exits can too), and the throttled `terminal_flush` may not have run
+        // between them — so without this projection the tail output is fed but never mirrored
+        // (the buffer would show only the exit notice). Matches the native `on_term_event` Exit
+        // arm; `terminal_closed` appends the `[Process exited]` notice after this content.
+        self.terminal_project(buf);
         self.editor.terminal_closed(buf, code);
         // Freeze the grid's colors before dropping the emulator, so the dead buffer's
         // final output keeps its highlighting as a plain buffer (the native exit arm

@@ -109,8 +109,8 @@ struct Sink {
     /// recorded by [`proc_spawn`](HostEffects::proc_spawn). Drained by
     /// [`eh_take_proc_requests`] for the Worker to forward over WebTransport
     /// (`proc_spawn [id, argv, cwd?, env, stdin]`); the child's pid/exit return via
-    /// [`eh_proc_spawned`] / [`eh_proc_exited`]. Only ever enqueued in a daemon session
-    /// (the tick gates on [`daemon_connected`](Sink::daemon_connected)).
+    /// [`eh_proc_spawned`] / [`eh_proc_exited`]. Only ever enqueued when a process host is
+    /// present (the tick gates on [`proc_host`](Sink::proc_host)).
     #[allow(clippy::type_complexity)]
     proc_spawns: Vec<(
         u64,
@@ -149,8 +149,8 @@ struct Sink {
     /// [`term_open`](HostEffects::term_open). Drained by [`eh_take_terminal_requests`] for the
     /// Worker to forward over WebTransport (`term_open [buf, argv, cwd?, rows, cols]`); the
     /// child's output/exit return as `term_data`/`term_exit` pushes (`eh_terminal_data` /
-    /// `eh_terminal_exit`). Only enqueued in a daemon session (the dispatch gates on
-    /// [`daemon_connected`](Sink::daemon_connected); serverless OPFS has no PTY host).
+    /// `eh_terminal_exit`). Only enqueued when a process host is present (the dispatch gates
+    /// on [`proc_host`](Sink::proc_host); a session with no host has no PTY host).
     #[allow(clippy::type_complexity)]
     term_opens: Vec<(u64, Vec<String>, Option<String>, u16, u16)>,
     /// Input bytes the editor asked to **write** to a terminal PTY (a forwarded keystroke /
@@ -169,12 +169,17 @@ struct Sink {
     /// [`term_interrupted`](HostEffects::term_interrupted); drained in the terminal-requests
     /// JSON (`interrupt`) so the Worker discards the child's in-flight backlog.
     term_interrupts: Vec<u64>,
-    /// Whether a daemon (and thus a process host) is currently connected — flipped by the
-    /// Worker via [`eh_set_daemon_connected`] on a `?daemon=` boot / runtime `:connect` /
-    /// disconnect. Read by [`has_remote_proc`](HostEffects::has_remote_proc) to gate the
-    /// editor's async-spawn branch: serverless OPFS has no process host, so a `vim.system`
-    /// must fail loud in the tick, never silently enqueue a spawn no transport can fulfil.
-    daemon_connected: bool,
+    /// Whether a **process host** is currently available — either a daemon over WebTransport
+    /// *or* a local in-browser Worker host (Pyodide interpreter / basedpyright LSP). Flipped
+    /// by the Worker via [`eh_set_proc_host`] on a `?daemon=` boot / runtime `:connect` /
+    /// local-host bring-up / disconnect. Read by
+    /// [`has_remote_proc`](HostEffects::has_remote_proc) /
+    /// [`has_remote_lsp`](HostEffects::has_remote_lsp) to gate the editor's async-spawn /
+    /// terminal / LSP branches: a session with no process host (serverless OPFS, no local
+    /// host) must fail those loud in the tick, never silently enqueue a request no host can
+    /// fulfil. ("remote" in the gate names means *out-of-core / off-tick*, which a local
+    /// Worker host equally is — not specifically a daemon.)
+    proc_host: bool,
     /// Treesitter grammars the editor newly asked to **install** this convergence (one
     /// per `:TSInstall <lang>`), recorded by [`ts_install`](HostEffects::ts_install).
     /// Drained by [`eh_take_ts_requests`] for the Worker to forward to the UI thread,
@@ -501,10 +506,11 @@ impl HostEffects for WasmEffects {
     }
 
     fn has_remote_proc(&self) -> bool {
-        // A `vim.system` is only possible against a connected daemon — serverless OPFS has
-        // no process host. The Worker flips this on `:connect` / `?daemon=` (`eh_set_daemon_connected`);
-        // when false the tick fails the spawn loud instead of enqueuing it.
-        self.sink.borrow().daemon_connected
+        // A `vim.system` / `:terminal` needs a process host — a connected daemon OR a local
+        // in-browser Worker host (Pyodide). A session with neither has nowhere to run a
+        // process. The Worker flips this via `eh_set_proc_host` on `:connect` / `?daemon=` /
+        // local-host bring-up; when false the tick fails the spawn loud instead of enqueuing it.
+        self.sink.borrow().proc_host
     }
 
     fn fs_op(&mut self, id: u64, job: nxvim_lua::FsJob) {
@@ -634,11 +640,12 @@ impl HostEffects for WasmEffects {
     }
 
     fn has_remote_lsp(&self) -> bool {
-        // Language servers run on the daemon (the browser has no process host), so an LSP is
-        // only possible against a connected daemon — the same gate the proc leg uses. The
-        // Worker flips `daemon_connected` on `:connect` / `?daemon=`; when false the editor
-        // fails `vim.lsp.start` loud rather than enqueuing a spawn no transport can fulfil.
-        self.sink.borrow().daemon_connected
+        // A language server needs a process host — the daemon, or a local in-browser Worker
+        // host (basedpyright's JS langserver). Same gate the proc leg uses. The Worker flips
+        // `proc_host` via `eh_set_proc_host` on `:connect` / `?daemon=` / local-host bring-up;
+        // when false the editor fails `vim.lsp.start` loud rather than enqueuing a spawn no
+        // host can fulfil.
+        self.sink.borrow().proc_host
     }
 }
 
@@ -1205,18 +1212,20 @@ pub unsafe extern "C" fn eh_remote_file_changed(
 // native event-loop actor's proc routing (the daemon side is unchanged — Phase 3c/3q).
 // ============================================================================
 
-/// Tell the core whether a daemon (process host) is connected, flipping the editor tick's
-/// async-spawn branch: `on != 0` enqueues a `vim.system` for the Worker to forward; `0`
-/// (serverless OPFS) fails it loud in the tick. The Worker calls this on a `?daemon=` boot /
-/// runtime `:connect` (1) and on disconnect (0). Unlike the off-tick fs (always on — OPFS is
-/// the serverless fallback), processes have no serverless analogue, so this gate is real.
+/// Tell the core whether a **process host** is available — a daemon over WebTransport *or* a
+/// local in-browser Worker host (the Pyodide interpreter / basedpyright LSP) — flipping the
+/// editor tick's async-spawn / terminal / LSP branches: `on != 0` lets them enqueue requests
+/// for the Worker to fulfil; `0` (no host) fails them loud in the tick. The Worker calls this
+/// on a `?daemon=` boot / runtime `:connect` / local-host bring-up (1) and on disconnect (0).
+/// Unlike the off-tick fs (always on — OPFS is the serverless fallback), a process has no
+/// serverless analogue, so this gate is real.
 ///
 /// # Safety
 /// `h` must come from [`eh_new`] and not yet be freed.
 #[no_mangle]
-pub unsafe extern "C" fn eh_set_daemon_connected(h: *mut WasmEditHost, on: i32) {
+pub unsafe extern "C" fn eh_set_proc_host(h: *mut WasmEditHost, on: i32) {
     if let Some(handle) = h.as_mut() {
-        handle.sink.borrow_mut().daemon_connected = on != 0;
+        handle.sink.borrow_mut().proc_host = on != 0;
     }
 }
 

@@ -60,6 +60,16 @@ try {
   await page.waitForFunction(() => window.__nxvim !== undefined, null, { timeout: 15000 });
   await page.evaluate(() => window.__nxvim.ready);
 
+  // This is the STANDARD editor build: the python-demo local process host must be OFF. Assert
+  // the build flag is false (build-demo.sh's separate demo-site/ flips it true) — a structural
+  // guard that the demo never leaks into the standard build. (`:terminal` here fails loud:
+  // "requires a daemon connection".)
+  const buildFlag = await page.evaluate(() =>
+    import("./build-config.js").then((m) => m.BUILD.localHost),
+  );
+  check("standard build: the python-demo local host is OFF (build-config localHost=false)",
+    buildFlag === false, `localHost=${buildFlag}`);
+
   // 2. Insert text via vim keys through the worker; the real tick runs in the browser.
   await page.evaluate(() => window.__nxvim.feed("ihello world<Esc>"));
   const lines = await page.evaluate(() => window.__nxvim.lines());

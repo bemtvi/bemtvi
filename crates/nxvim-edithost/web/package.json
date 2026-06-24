@@ -17,10 +17,15 @@
     "verify-proc": "node verify-proc.mjs",
     "verify-lsp": "node verify-lsp.mjs",
     "verify-terminal": "node verify-terminal.mjs",
-    "verify-luafile": "node verify-luafile.mjs"
+    "verify-luafile": "node verify-luafile.mjs",
+    "verify-pyodide-terminal": "node verify-pyodide-terminal.mjs",
+    "verify-pyodide-repl": "node verify-pyodide-repl.mjs"
   },
   "devDependencies": {
     "@msgpack/msgpack": "3.1.3",
     "playwright": "1.60.0"
+  },
+  "dependencies": {
+    "pyodide": "314.0.0"
   }
 }

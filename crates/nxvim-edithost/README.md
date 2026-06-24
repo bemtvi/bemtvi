@@ -132,10 +132,23 @@ blocks on input also fires Worker-side timers (`vim.defer_fn` / `nx.timer`) via
 
 ## Build & run
 
+There are **two builds** from this one source tree (see
+[`docs/plans/2026-06-23-web-python-demo.md`](../../docs/plans/2026-06-23-web-python-demo.md)):
+
+- **the standard editor** — `./build.sh` → `dist/` + `web/`. No Pyodide;
+  `web/build-config.js` keeps `localHost: false`, so the Worker never installs the local
+  process host (`:terminal` needs a daemon, as before).
+- **the python demo** — `./build-demo.sh` → a self-contained `demo-site/` (gitignored): the
+  standard build PLUS Pyodide (CPython → wasm) vendored in and `build-config.js` flipped to
+  `localHost: true`, so a serverless `:terminal python <file>` runs CPython in the browser.
+  Serve it with `NXVIM_SERVE_ROOT=demo-site node web/serve.mjs`; verify with
+  `node verify-pyodide-terminal.mjs`.
+
 ```sh
 rustup target add wasm32-unknown-emscripten   # once
 # plus emcc: an installed+activated emsdk, or the system emscripten package
-./build.sh         # → dist/eh.mjs + eh.wasm
+./build.sh         # → dist/eh.mjs + eh.wasm  (standard editor)
+./build-demo.sh    # → demo-site/  (the python demo: Pyodide + the local process host)
 node harness.mjs   # node smoke test: feeds `ihello<Esc>`, asserts lines + a real redraw
 
 # the browser shell:
@@ -192,11 +205,17 @@ Without them the page still runs but degrades to the slower `postMessage` transp
 **timers never fire** (`window.__nxvim.sab` reports which mode is active). The `.wasm`
 must also be served as `application/wasm` (most hosts do this by extension).
 
-- **Netlify:** wired up — `../../netlify.toml` runs `netlify-build.sh` (provisions
-  Rust + the emscripten `emcc` linker, runs `build.sh`, then assembles a clean static
-  root at `_site/`: `web/` + `dist/` as siblings with `web/_headers` copied to the root
-  so `/*` is cross-origin isolated) and redirects `/` → `/web/`. Connect the repo in the
-  dashboard; every push to the production branch deploys.
+- **Netlify (two sites):** the **standard editor** is wired up — `../../netlify.toml` runs
+  `netlify-build.sh` (provisions Rust + the emscripten `emcc` linker via the shared
+  `netlify-provision.sh`, runs `build.sh`, then assembles a clean static root at `_site/`:
+  `web/` + `dist/` as siblings with `_headers` + `_redirects` at the root). The **python
+  demo** is a *separate* Netlify site built by `netlify-build-demo.sh` (same toolchain →
+  `build.sh` → `package-site.sh --demo` → `_site-demo/`, with Pyodide + `localHost:true`).
+  Netlify reads one `netlify.toml` per site, so configure the demo site in the dashboard —
+  Build command `bash crates/nxvim-edithost/netlify-build-demo.sh`, Publish directory
+  `crates/nxvim-edithost/_site-demo` (the env vars are in `netlify-build-demo.sh`'s header).
+  Each `_site*` root carries its own `_headers` + `_redirects`, so the demo needs no
+  `netlify.toml`.
 - **Cloudflare Pages / any `_headers` host:** the `web/_headers` file already sets all
   three for `/*`. Publish a root with `web/` and `dist/` as siblings, `_headers` at the
   root, and `/` → `/web/` (the layout `netlify-build.sh` assembles in `_site/`).

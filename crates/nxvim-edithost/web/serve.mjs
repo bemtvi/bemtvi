@@ -9,10 +9,15 @@
 //   node serve.mjs [port]      # default 8088; open http://localhost:<port>/web/
 import { createServer } from "node:http";
 import { readFile, stat } from "node:fs/promises";
-import { extname, join, normalize } from "node:path";
+import { extname, join, normalize, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
-const ROOT = fileURLToPath(new URL("..", import.meta.url)); // the crate dir
+// The static root to serve. Defaults to the crate dir (the standard editor: web/ + dist/).
+// `NXVIM_SERVE_ROOT` points it at an assembled site instead — e.g. the python-demo's
+// `demo-site/` (build-demo.sh), which has the same web/ + dist/ layout.
+const ROOT = process.env.NXVIM_SERVE_ROOT
+  ? resolve(process.env.NXVIM_SERVE_ROOT)
+  : fileURLToPath(new URL("..", import.meta.url));
 const PORT = Number(process.argv[2]) || 8088;
 
 const MIME = {

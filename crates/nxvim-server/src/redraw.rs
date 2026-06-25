@@ -2324,18 +2324,68 @@ impl EditHost {
 
     /// Ensure [`preview_cache`](EditHost::preview_cache) holds the file for `path`,
     /// reading it through the editor's host FS on a path miss (a hit — the common case
-    /// as the selection moves within one file's matches — does nothing). A read error or
-    /// an off-tick FS fills a single visible placeholder line with `ok = false`.
+    /// as the selection moves within one file's matches — does nothing). A read error
+    /// fills a single visible placeholder line with `ok = false`.
+    ///
+    /// Three sources, in order: an already-loaded buffer's in-memory lines (works
+    /// off-tick + shows unsaved edits); an **async fetch** over the off-tick fs seam
+    /// (daemon / web — placeholder until it lands, see [`apply_preview`]); a synchronous
+    /// local read (native, on-tick).
     fn ensure_preview(&mut self, path: &str) {
-        let p = std::path::Path::new(path);
+        // Resolve a relative target against the effective cwd up front, so the cache key,
+        // the in-memory lookup, the sync read, AND the async fetch/landing all agree on
+        // ONE absolute path. `rg`/`grep` (and the nx.fs fallback) emit cwd-relative paths,
+        // but the daemon/OPFS read carries no session cwd — so an unresolved relative path
+        // would read against the wrong root and the preview would never land.
+        let abs = self.resolve_preview_path(path);
+        let p = abs.as_path();
         if self.preview_cache.path.as_deref() == Some(p) {
             return;
         }
+        // An already-loaded buffer (the buffers picker previews open buffers; a file
+        // item that's open benefits too): read its in-memory lines — no host FS, so it
+        // works off-tick and reflects live unsaved edits.
+        if let Some(id) = self.editor.find_buffer_by_path(p) {
+            let lines = self.editor.lines_of(id).unwrap_or_default();
+            self.store_preview(p, lines, true);
+            return;
+        }
+        // Off-tick fs (daemon / web): the file isn't open and can't be read
+        // synchronously, so kick a fetch over the same `fs_fetch` seam `:edit` uses
+        // (tagged with the reserved [`PREVIEW_FETCH_BUF`] so its landing routes here, not
+        // to a buffer) and show a placeholder until it arrives. Caching the placeholder
+        // under `p` stops the next frame from re-issuing the fetch.
+        if self.editor.host_fs_offtick() {
+            self.fx
+                .fs_fetch(PREVIEW_FETCH_BUF, p.to_string_lossy().into_owned());
+            self.store_preview(p, vec![format!("{}: loading…", p.display())], false);
+            return;
+        }
+        // On-tick local read.
         let (lines, ok) = read_preview_file(&self.editor, p);
-        // Syntax-highlight the whole file once, here on the path miss (Phase 3b), so
-        // moving the selection within one file's matches never re-parses. Keyed by
-        // file line; empty when the read failed or no grammar is installed for the
-        // path's language (the preview then renders plain).
+        self.store_preview(p, lines, ok);
+    }
+
+    /// Resolve a preview target `path` to an absolute path against the effective working
+    /// dir (window-local → tab-local → global, like `:edit`). An already-absolute path is
+    /// returned unchanged. Keeps `rg`/`grep`/nx.fs cwd-relative results readable through
+    /// the off-tick fs seam, which has no session cwd of its own.
+    fn resolve_preview_path(&self, path: &str) -> std::path::PathBuf {
+        let p = std::path::Path::new(path);
+        if p.is_absolute() {
+            return p.to_path_buf();
+        }
+        let win = self.editor.current_window_id();
+        let tab = self.editor.current_tab_id();
+        let (_, base) = self.dirs.effective(win, tab);
+        base.join(p)
+    }
+
+    /// Store the preview `lines` for `path` into [`preview_cache`](EditHost::preview_cache),
+    /// syntax-highlighting the whole file once here (so moving the selection within one
+    /// file's matches never re-parses). Highlights are keyed by 0-based file line; empty
+    /// when the read failed (`ok = false`) or no grammar is installed for the path.
+    fn store_preview(&mut self, p: &std::path::Path, lines: Vec<String>, ok: bool) {
         let highlights = if ok {
             nxvim_core::language_of_path(Some(p)).map_or_else(HashMap::new, |lang| {
                 // Trailing newline to match the engine's buffer invariant (it treats
@@ -2358,6 +2408,36 @@ impl EditHost {
             highlights,
         };
     }
+
+    /// Land an async preview fetch ([`ensure_preview`]'s off-tick branch): replace the
+    /// `"loading…"` placeholder with the fetched `lines`. A no-op when the selection has
+    /// moved to a different target since the fetch was issued (the cache now holds another
+    /// path) — that stale result is dropped, and the new target's own fetch is in flight.
+    /// The caller repaints (native via `settle_events`, wasm via `complete_fs_read`).
+    pub(crate) fn apply_preview(&mut self, path: String, lines: Vec<String>, ok: bool) {
+        if self.preview_cache.path.as_deref() != Some(std::path::Path::new(&path)) {
+            return;
+        }
+        self.store_preview(std::path::Path::new(&path), lines, ok);
+    }
+}
+
+/// The reserved [`BufferId`] an async **preview** fetch ([`EditHost::ensure_preview`])
+/// tags its `fs_fetch` with, so the shared open-landing (`apply_open` /
+/// `complete_fs_read`) routes the bytes to [`EditHost::apply_preview`] instead of into a
+/// buffer. Far above any real bufnr (allocated incrementally from 1) so it never
+/// collides, and below 2^53 so it round-trips exactly through the wasm FFI's `f64`
+/// buffer id. See `docs/plans/2026-06-24-remote-web-pickers.md`.
+pub(crate) const PREVIEW_FETCH_BUF: nxvim_core::BufferId = nxvim_core::BufferId(1 << 48);
+
+/// Decode fetched preview bytes to lines, lossily (a binary file previews as best-effort
+/// text), capped at [`MAX_PREVIEW_BYTES`] so a huge file can't stall the frame.
+pub(crate) fn bytes_to_preview_lines(bytes: &[u8]) -> Vec<String> {
+    let capped = &bytes[..bytes.len().min(MAX_PREVIEW_BYTES as usize)];
+    String::from_utf8_lossy(capped)
+        .lines()
+        .map(str::to_string)
+        .collect()
 }
 
 /// The picker preview pane's read cache: the file last read for the preview, so
@@ -2380,6 +2460,10 @@ pub(crate) struct PreviewCache {
     highlights: HashMap<usize, Vec<nxvim_core::Span>>,
 }
 
+/// Cap on the bytes pulled into a single preview read / fetch — a guard against a huge
+/// file stalling the frame, not a UI limit (the pane only shows a window anyway).
+const MAX_PREVIEW_BYTES: u64 = 2 * 1024 * 1024;
+
 /// Read a file's lines for the read-only preview pane through the editor's host FS,
 /// capped at [`MAX_PREVIEW_BYTES`]. Returns `(lines, ok)`; `ok = false` (with a
 /// single visible placeholder line) when the FS is off-tick (daemon/wasm — preview
@@ -2387,9 +2471,6 @@ pub(crate) struct PreviewCache {
 /// binary file previews as best-effort text rather than erroring.
 fn read_preview_file(editor: &nxvim_core::Editor, path: &std::path::Path) -> (Vec<String>, bool) {
     use std::io::Read as _;
-    /// Cap on the bytes pulled into a single preview read — a guard against a huge
-    /// file stalling the frame, not a UI limit (the pane only shows a window anyway).
-    const MAX_PREVIEW_BYTES: u64 = 2 * 1024 * 1024;
     if editor.host_fs_offtick() {
         return (vec![format!("{}: loading…", path.display())], false);
     }

@@ -69,6 +69,84 @@ function nx.fs.readdir(path)
   return run_fs({ op = "readdir", path = path })
 end
 
+-- nx.fs.walk(dir[, opts]) -> promise of a LIST of file paths relative to `dir`, a
+-- recursive directory listing built from readdir. The transport-agnostic file
+-- enumeration the codebase reaches for when `rg`/`fd` aren't available (the pure web
+-- client, where a spawn has no real shell) — it rides the same off-tick fs seam as
+-- every other nx.fs op, so it works against local disk, a daemon, and OPFS alike.
+-- opts:
+--   max     cap on files returned (default 50000) — a runaway guard on huge trees
+--   hidden  include dotfiles / dotdirs (default false)
+--   skip    set of directory basenames to prune (default { [".git"] = true })
+-- An unreadable subdirectory is skipped (not fatal). MUST be awaited inside nx.async.
+function nx.fs.walk(dir, opts)
+  opts = opts or {}
+  local max = opts.max or 50000
+  local hidden = opts.hidden or false
+  local skip = opts.skip or { [".git"] = true }
+  return nx.async(function()
+    local out = {}
+    -- Relative subdirs still to visit; "" is `dir` itself.
+    local stack = { "" }
+    while #stack > 0 and #out < max do
+      local rel = table.remove(stack)
+      local abs = rel == "" and dir or (dir .. "/" .. rel)
+      -- Skip a directory we can't read (permissions / vanished mid-walk) rather
+      -- than aborting the whole enumeration.
+      local ok, entries = pcall(nx.await, nx.fs.readdir(abs))
+      if ok then
+        for _, e in ipairs(entries) do
+          if hidden or e.name:sub(1, 1) ~= "." then
+            local child = rel == "" and e.name or (rel .. "/" .. e.name)
+            if e.type == "directory" then
+              if not skip[e.name] then
+                stack[#stack + 1] = child
+              end
+            elseif e.type == "file" and #out < max then
+              out[#out + 1] = child
+            end
+          end
+        end
+      end
+    end
+    return out
+  end)()
+end
+
+-- nx.fs.grep(dir, query[, opts]) -> promise of a LIST of matches, each
+-- { path = <rel>, row = <1-based lnum>, col = <1-based>, text = <line> }: a recursive,
+-- transport-agnostic plain-substring search. The fallback the grep picker reaches for
+-- when `rg`/`grep` aren't available (the pure web client) — it rides the same off-tick
+-- fs seam as every other nx.fs op, so it works against local disk, a daemon, and OPFS.
+-- Walks `dir` (nx.fs.walk), reads each file (nx.fs.read_text), and matches `query` as a
+-- LITERAL substring per line. Binary / unreadable files (read_text rejects) are skipped.
+-- `opts` pass through to nx.fs.walk (max / hidden / skip). MUST be awaited inside nx.async.
+function nx.fs.grep(dir, query, opts)
+  return nx.async(function()
+    local out = {}
+    if not query or query == "" then
+      return out
+    end
+    local files = nx.await(nx.fs.walk(dir, opts))
+    local base = dir:gsub("/$", "")
+    for _, rel in ipairs(files) do
+      -- read_text rejects on invalid UTF-8 (a binary file); skip it rather than abort.
+      local ok, text = pcall(nx.await, nx.fs.read_text(base .. "/" .. rel))
+      if ok then
+        local lnum = 0
+        for line in (text .. "\n"):gmatch("(.-)\n") do
+          lnum = lnum + 1
+          local col = line:find(query, 1, true) -- plain (non-pattern) substring
+          if col then
+            out[#out + 1] = { path = rel, row = lnum, col = col, text = line }
+          end
+        end
+      end
+    end
+    return out
+  end)()
+end
+
 -- ----- reading / writing -----------------------------------------------------
 
 -- nx.fs.read(path) -> promise of the file's RAW bytes (a Lua byte-string).

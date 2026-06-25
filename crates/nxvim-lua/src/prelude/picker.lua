@@ -493,26 +493,56 @@ end
 -- ----- built-in sources ------------------------------------------------------
 -- Shipped defaults exercising the three source shapes; a config can register more.
 
--- files: a static source — `rg --files` streamed in, fuzzy-matched locally. An
--- nx.async source: iterate the run_stream's batches with nx.await_each, pushing
--- each path; returning ends the run. The stream is reaped on close via on_cancel.
+-- files: a static source — file paths streamed in, fuzzy-matched locally. An
+-- nx.async source: iterate the run_stream's batches with nx.await_each, pushing each
+-- path; returning ends the run. The stream is reaped on close via on_cancel.
+--
+-- Enumeration falls back through a chain so the picker lists files in every mode:
+-- `rg --files` (fast, .gitignore-aware) → `find` (any real shell lacking rg) → a
+-- transport-agnostic `nx.fs` walk. The binaries need a real shell, so the pure web
+-- client — where a hostless spawn fails loud with code -1 — lands on the nx.fs walk
+-- (which rides the off-tick seam to OPFS / the daemon). Each step runs only when the
+-- previous produced nothing.
 nx.picker.source({
   name = "files",
   layer = "main", -- a picked file opens in the main editor, never a focused dock
   preview = "file", -- the preview pane shows the file's head
   items = nx.async(function(ctx)
-    local stream =
-      nx.run_stream({ cmd = "rg", args = { "--files", "--color=never" }, cwd = ctx.cwd })
-    -- Reap the `rg` job when the picker closes, so a confirmed/cancelled picker
-    -- doesn't leave a process streaming paths into the void.
-    ctx.on_cancel(function()
-      stream:kill()
-    end)
-    for batch in nx.await_each(stream) do
-      for _, l in ipairs(batch) do
-        if l ~= "" then
-          ctx.push({ text = l, path = l })
+    -- Stream a listing command's stdout as candidates; returns whether any landed.
+    -- `strip` removes `find`'s leading "./" so its paths match rg's relative style.
+    local function run(cmd, args, strip)
+      local pushed = false
+      local stream = nx.run_stream({ cmd = cmd, args = args, cwd = ctx.cwd })
+      -- Reap the job when the picker closes, so a confirmed/cancelled picker doesn't
+      -- leave a process streaming paths into the void. Sequential steps each arm this
+      -- for the only stream that can still be running.
+      ctx.on_cancel(function()
+        stream:kill()
+      end)
+      for batch in nx.await_each(stream) do
+        for _, l in ipairs(batch) do
+          if strip then
+            l = l:gsub("^%./", "")
+          end
+          if l ~= "" then
+            pushed = true
+            ctx.push({ text = l, path = l })
+          end
         end
+      end
+      return pushed
+    end
+    if run("rg", { "--files", "--color=never" }) then
+      return
+    end
+    if run("find", { ".", "-type", "f", "-not", "-path", "*/.git/*" }, true) then
+      return
+    end
+    -- No shell / no rg / no find (the pure web client): walk the tree over nx.fs.
+    local ok, files = pcall(nx.await, nx.fs.walk(ctx.cwd))
+    if ok then
+      for _, f in ipairs(files) do
+        ctx.push({ text = f, path = f })
       end
     end
   end),
@@ -521,8 +551,13 @@ nx.picker.source({
   end,
 })
 
--- live_grep: a dynamic source — `rg --vimgrep <query>` re-run per prompt edit, the
--- matcher bypassed; the superseded job is reaped via ctx.on_cancel.
+-- live_grep: a dynamic source — re-run per prompt edit, the matcher bypassed. Search
+-- falls back through a chain so it works in every mode: `rg --vimgrep` (fast,
+-- .gitignore-aware) → `grep -rn` (any real shell lacking rg) → a transport-agnostic
+-- nx.fs walk + in-Lua substring match. The binaries need a real shell, so the pure web
+-- client — where a hostless spawn fails loud with code -1 — lands on the nx.fs match
+-- (which rides the off-tick seam to OPFS). Each step runs only when the previous found
+-- nothing; the superseded job is reaped via ctx.on_cancel.
 nx.picker.source({
   name = "live_grep",
   layer = "main", -- a grep hit opens in the main editor, never a focused dock
@@ -532,21 +567,58 @@ nx.picker.source({
     if ctx.query == "" then
       return
     end
-    local stream = nx.run_stream({
-      cmd = "rg",
-      args = { "--vimgrep", "--color=never", "--", ctx.query },
-      cwd = ctx.cwd,
-    })
-    ctx.on_cancel(function()
-      stream:kill()
-    end)
-    for batch in nx.await_each(stream) do
-      for _, l in ipairs(batch) do
-        -- file:line:col:text
-        local file, lnum, col = l:match("^(.-):(%d+):(%d+):")
-        if file then
-          ctx.push({ text = l, path = file, row = tonumber(lnum), col = tonumber(col) })
+    local q = ctx.query
+
+    -- Stream a grep-like command, parsing `file:lnum[:col]:text` per line; `has_col` for
+    -- rg's `--vimgrep` column. `strip` drops grep's leading "./". Returns whether any
+    -- match landed.
+    local function run(cmd, args, has_col, strip)
+      local pushed = false
+      local stream = nx.run_stream({ cmd = cmd, args = args, cwd = ctx.cwd })
+      ctx.on_cancel(function()
+        stream:kill()
+      end)
+      for batch in nx.await_each(stream) do
+        for _, l in ipairs(batch) do
+          if strip then
+            l = l:gsub("^%./", "")
+          end
+          local file, lnum, col
+          if has_col then
+            file, lnum, col = l:match("^(.-):(%d+):(%d+):")
+          else
+            file, lnum = l:match("^(.-):(%d+):")
+            col = 1
+          end
+          if file then
+            pushed = true
+            ctx.push({ text = l, path = file, row = tonumber(lnum), col = tonumber(col) })
+          end
         end
+      end
+      return pushed
+    end
+
+    if run("rg", { "--vimgrep", "--color=never", "--", q }, true, false) then
+      return
+    end
+    if run("grep", { "-rnI", "--exclude-dir=.git", "--", q, "." }, false, true) then
+      return
+    end
+
+    -- No shell / no rg / no grep (the pure web client): a transport-agnostic nx.fs walk
+    -- + in-Lua substring match. Performance isn't a concern — the pure-client trees are
+    -- small and the picker caps results; pushes for a superseded query are dropped by the
+    -- sink.
+    local ok, matches = pcall(nx.await, nx.fs.grep(ctx.cwd, q))
+    if ok then
+      for _, m in ipairs(matches) do
+        ctx.push({
+          text = m.path .. ":" .. m.row .. ":" .. m.text,
+          path = m.path,
+          row = m.row,
+          col = m.col,
+        })
       end
     end
   end),

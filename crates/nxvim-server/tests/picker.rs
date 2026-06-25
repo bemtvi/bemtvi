@@ -1274,6 +1274,36 @@ async fn buffers_source_lists_open_buffers() {
     );
 }
 
+/// The buffers picker previews an open buffer from its IN-MEMORY lines, not by
+/// re-reading the file — so the preview reflects live unsaved edits, and (the
+/// reported bug) it works on a daemon / the web client where the host FS is off-tick
+/// and a filesystem read can only return a "loading…" placeholder. Proven here by an
+/// unsaved edit: the on-disk file says one thing, the buffer another, and the preview
+/// must show the buffer's content.
+#[tokio::test]
+async fn buffers_preview_reads_the_in_memory_buffer_not_the_file() {
+    let dir = temp_dir("picker_preview_buf");
+    let file = dir.join("doc.txt");
+    std::fs::write(&file, "on disk line\nsecond\n").unwrap();
+    let (rpc, mut incoming) = start(&dir, "").await;
+
+    // Open the file, then edit line 1 in memory WITHOUT saving (a synchronous normal-
+    // mode change) — the buffer now diverges from disk.
+    exec_lua(&rpc, &format!("vim.cmd('edit {}')", file.display())).await;
+    feed(&rpc, "ccLIVE UNSAVED EDIT<Esc>");
+
+    exec_lua(&rpc, "nx.picker.open('buffers')").await;
+    let menu = menu_of(&poll_menu(&rpc, &mut incoming).await.expect("menu opens"));
+    let preview = preview_of(&menu).expect("buffers picker carries a preview pane");
+
+    // The preview shows the buffer's in-memory first line, not the on-disk one.
+    assert_eq!(preview_lines(&preview)[0], "LIVE UNSAVED EDIT");
+    assert_eq!(
+        std::fs::read_to_string(&file).unwrap(),
+        "on disk line\nsecond\n"
+    );
+}
+
 #[tokio::test]
 async fn buffers_picker_is_scoped_to_the_focused_layer() {
     // Like `:ls`, the buffers picker lists only the focused layer's buffers — the

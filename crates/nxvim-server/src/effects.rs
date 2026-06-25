@@ -2139,10 +2139,28 @@ impl EditHost {
                 if self.fx.has_remote_proc() {
                     self.fx.proc_spawn(id, cmd, cwd, env, stdin, stream);
                 } else {
-                    self.editor.echo(
-                        "E: jobs/processes (vim.system / jobstart) require a \
-                         daemon — :connect to one",
-                    );
+                    // No process host (serverless OPFS): a spawn has nowhere to run.
+                    // Complete the caller's promise / stream LOUD with a spawn-failure
+                    // exit (`code = -1`, the same shape a missing binary yields) instead
+                    // of dropping the callback and leaving `nx.run` / `nx.run_stream`
+                    // pending forever. Callers (e.g. the file picker) see the failure and
+                    // fall back (an `nx.fs` walk). The `stderr` explains the cause.
+                    let stderr = b"jobs/processes (vim.system / jobstart) require a \
+                                   daemon \xE2\x80\x94 :connect to one"
+                        .to_vec();
+                    if let Err(e) = self.lua.run_callback(
+                        id,
+                        false,
+                        CallbackArgs::Process {
+                            code: -1,
+                            stdout: Vec::new(),
+                            stderr,
+                        },
+                    ) {
+                        self.editor
+                            .echo(format!("E5108: Error in vim.system on_exit: {e}"));
+                    }
+                    self.apply_lua_effects();
                 }
             }
             // A kill only makes sense for a child the daemon is running; serverless never

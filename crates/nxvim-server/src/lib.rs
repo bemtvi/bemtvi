@@ -1387,6 +1387,19 @@ impl EditHost {
         bytes: &[u8],
         err: &str,
     ) {
+        // A reserved preview fetch (the off-tick branch of `ensure_preview`): route the
+        // bytes to the picker preview cache, NOT into a buffer — a read-only preview must
+        // not run buffer lifecycle. Then repaint, like the buffer path below.
+        if buffer == crate::redraw::PREVIEW_FETCH_BUF {
+            let (lines, ok) = match kind {
+                0 => (crate::redraw::bytes_to_preview_lines(bytes), true),
+                1 => (Vec::new(), true),
+                _ => (vec![format!("{path}: {err}")], false),
+            };
+            self.apply_preview(path, lines, ok);
+            self.redraw();
+            return;
+        }
         match kind {
             0 => self.load_replica_wasm(buffer, path, bytes),
             1 => self.load_replica_wasm(buffer, path, b""),
@@ -1440,6 +1453,13 @@ impl EditHost {
         dir: String,
         entries: Vec<nxvim_core::DirEntry>,
     ) {
+        // A reserved preview fetch that resolved to a directory: show a placeholder in the
+        // preview cache rather than building an explorer listing into a nonexistent buffer.
+        if buffer == crate::redraw::PREVIEW_FETCH_BUF {
+            self.apply_preview(dir, vec!["<directory>".to_string()], false);
+            self.redraw();
+            return;
+        }
         self.load_dir_replica_wasm(buffer, dir, entries);
         self.redraw();
     }

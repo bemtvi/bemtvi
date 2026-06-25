@@ -31,6 +31,20 @@ impl EditHost {
         path: String,
         result: io::Result<FsRead>,
     ) {
+        // A reserved preview fetch (the off-tick branch of `ensure_preview`): route the
+        // bytes to the picker preview cache, NOT into a buffer — a read-only preview must
+        // not run buffer lifecycle (BufReadPost / FileType). The caller (`on_opens`)
+        // repaints via `settle_events`.
+        if buffer == crate::redraw::PREVIEW_FETCH_BUF {
+            let (lines, ok) = match result {
+                Ok(FsRead::File(bytes)) => (crate::redraw::bytes_to_preview_lines(&bytes), true),
+                Ok(FsRead::New) => (Vec::new(), true),
+                Ok(FsRead::Dir { .. }) => (vec!["<directory>".to_string()], false),
+                Err(e) => (vec![format!("{path}: {e}")], false),
+            };
+            self.apply_preview(path, lines, ok);
+            return;
+        }
         match result {
             // Decode through the shared seam (latin1/utf-16/BOM detection +
             // invalid-UTF-8 resilience), exactly as the local `Buffer::from_file`

@@ -94,6 +94,82 @@ async fn readdir_returns_entries_with_kind() {
     let _ = fs::remove_dir_all(&dir);
 }
 
+/// `nx.fs.walk` recurses through subdirectories, returns file paths relative to the
+/// root, prunes `.git` + dotfiles by default, and skips directory entries. This is the
+/// transport-agnostic file enumeration the `files` picker falls back to when `rg`
+/// isn't available (the pure web client).
+#[tokio::test]
+async fn walk_recurses_and_prunes_dotfiles() {
+    let (rpc, _incoming) = start().await;
+    let dir = temp_dir("fs_walk");
+    fs::write(dir.join("a.txt"), b"a").unwrap();
+    fs::create_dir(dir.join("sub")).unwrap();
+    fs::write(dir.join("sub").join("b.txt"), b"b").unwrap();
+    // A dotfile and a pruned .git/ tree must NOT appear.
+    fs::write(dir.join(".hidden"), b"x").unwrap();
+    fs::create_dir(dir.join(".git")).unwrap();
+    fs::write(dir.join(".git").join("config"), b"x").unwrap();
+
+    exec_lua(
+        &rpc,
+        &format!(
+            "_G.out = nil\n\
+             nx.async(function()\n\
+               local files = nx.await(nx.fs.walk(\"{d}\"))\n\
+               table.sort(files)\n\
+               _G.out = table.concat(files, \",\")\n\
+             end)()",
+            d = q(&dir)
+        ),
+    )
+    .await;
+    assert_eq!(
+        poll_settled(&rpc, "return _G.out").await.as_str(),
+        Some("a.txt,sub/b.txt")
+    );
+    let _ = fs::remove_dir_all(&dir);
+}
+
+/// `nx.fs.grep` recursively substring-matches a query across a tree, returning
+/// `{ path, row, col, text }` per hit (paths relative to the root, 1-based row/col),
+/// skipping `.git`/dotfiles and non-matching files. This is the transport-agnostic
+/// search the grep picker falls back to when `rg`/`grep` aren't available (the pure web
+/// client).
+#[tokio::test]
+async fn grep_matches_substring_across_the_tree() {
+    let (rpc, _incoming) = start().await;
+    let dir = temp_dir("fs_grep");
+    fs::write(dir.join("a.txt"), "alpha NEEDLE one\nbeta\n").unwrap();
+    fs::create_dir(dir.join("sub")).unwrap();
+    fs::write(dir.join("sub").join("b.txt"), "no match here\nx NEEDLE y\n").unwrap();
+    fs::write(dir.join("c.txt"), "nothing\n").unwrap();
+
+    // Collect "path:row:col" for each match, sorted, so the assertion is order-free.
+    exec_lua(
+        &rpc,
+        &format!(
+            "_G.out = nil\n\
+             nx.async(function()\n\
+               local ms = nx.await(nx.fs.grep(\"{d}\", \"NEEDLE\"))\n\
+               local parts = {{}}\n\
+               for _, m in ipairs(ms) do\n\
+                 parts[#parts+1] = m.path .. \":\" .. m.row .. \":\" .. m.col\n\
+               end\n\
+               table.sort(parts)\n\
+               _G.out = table.concat(parts, \",\")\n\
+             end)()",
+            d = q(&dir)
+        ),
+    )
+    .await;
+    // a.txt line 1 col 7 ("alpha NEEDLE"), sub/b.txt line 2 col 3 ("x NEEDLE").
+    assert_eq!(
+        poll_settled(&rpc, "return _G.out").await.as_str(),
+        Some("a.txt:1:7,sub/b.txt:2:3")
+    );
+    let _ = fs::remove_dir_all(&dir);
+}
+
 // ----- read / write round-trip ------------------------------------------------
 
 #[tokio::test]

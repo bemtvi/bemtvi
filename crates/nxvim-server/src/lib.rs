@@ -1371,6 +1371,20 @@ impl EditHost {
         self.editor.set_host_fs_offtick(true);
     }
 
+    /// Turn on command-line completion (`:`+`<Tab>` — `nx.cmdline_complete`) by default,
+    /// the wasm analogue of the native binary's `cmdline_complete_default` opt-in
+    /// (`run_io` → `nx.cmdline_complete.setup{}`). The serverless build has no
+    /// [`ServerInit`] to carry that flag, so the cdylib calls this in `eh_new` *after*
+    /// [`boot_begin`](Self::boot_begin) and *before* the optional `init.lua`
+    /// ([`source_config`](Self::source_config)) — exactly the native ordering, so a
+    /// config's own `nx.cmdline_complete.setup{ ... }` (e.g. toggling the docs pane)
+    /// still wins: both setups queue and drain in order on the next `apply_lua_effects`
+    /// (init.lua's, or the first keypress's), last config wins. Without this, the web
+    /// build never enables the engine and `:`+`<Tab>` does nothing.
+    pub fn enable_cmdline_complete(&mut self) {
+        let _ = self.lua.exec("nx.cmdline_complete.setup{}");
+    }
+
     /// Apply a finished off-tick OPFS **file** read the Worker fetched for `buffer` (the
     /// `:edit` / startup analogue of the native [`apply_open`](Self::apply_open), minus the
     /// daemon-only `FsRead` / watch machinery). `kind`: `0` = an existing file (`contents`

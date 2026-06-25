@@ -758,6 +758,11 @@ pub extern "C" fn eh_new() -> *mut WasmEditHost {
     // optional `init.lua` from OPFS next, then calls `eh_boot_finish` to fire the
     // startup lifecycle events + `v:vim_did_enter` (native ordering: config first).
     host.boot_begin();
+    // Enable command-line completion (`:`+<Tab>) by default — the serverless analogue of
+    // the native binary's `cmdline_complete_default` opt-in. Queued here, BEFORE the
+    // Worker sources `init.lua` (`eh_source_lua`), so a config's own
+    // `nx.cmdline_complete.setup{ ... }` still wins (last config drains last).
+    host.enable_cmdline_complete();
     host.attach_ui(DEFAULT_COLS, DEFAULT_ROWS);
     Box::into_raw(Box::new(WasmEditHost { host, sink }))
 }

@@ -1673,6 +1673,35 @@
       return html + `<span class="${cls}">${escapeHtml(cell)}</span>`;
     }
 
+    // Render a single-style run of text into the same boxed-cell model the content
+    // lines use (see `renderLine`): wide glyphs get an empty continuation column and
+    // every wide / Nerd-Font symbol (`cellNeedsBox`) draws in a fixed `cells*cw` box.
+    // Without this a fallback font draws a Nerd glyph wider than its one server column
+    // and drags the rest of the run right — in a status / tabline bar (sized to exactly
+    // `width*cw`) that overflow is clipped, cropping the last few characters off the
+    // right edge (the lualine-on-web crop). Boxing also fixes powerline-separator ink
+    // placement, exactly as on the content lines / GUI.
+    function styledCellsHtml(text, css) {
+      const cells = [];
+      for (const cp of text) {
+        const wcw = charWidth(cp.codePointAt(0));
+        if (wcw === 0 && cells.length) cells[cells.length - 1] += cp; // combining → glue
+        else { cells.push(cp); if (wcw === 2) cells.push(""); }       // wide → continuation
+      }
+      let out = "", run = "";
+      const flush = () => {
+        if (!run) return;
+        out += `<span${css ? ` style="${css}"` : ""}>${escapeHtml(run)}</span>`;
+        run = "";
+      };
+      for (const ch of cells) {
+        if (ch === "") continue;                                       // wide continuation: nothing
+        if (cellNeedsBox(ch)) { flush(); out += cellBoxSpan(ch, "", css); continue; }
+        run += ch;
+      }
+      flush();
+      return out;
+    }
     function renderSegmentBar(segments, width, cls) {
       let html = "";
       for (const { text, style } of (segments || [])) {
@@ -1681,7 +1710,7 @@
         // the segment then shows the base `.statusline` look).
         const st = typeof style === "number" ? paletteStyle(style) : style;
         const css = styleToCss(st);
-        html += `<span${css ? ` style="${css}"` : ""}>${escapeHtml(text)}</span>`;
+        html += styledCellsHtml(text, css);
       }
       const el = document.createElement("div");
       el.className = cls;

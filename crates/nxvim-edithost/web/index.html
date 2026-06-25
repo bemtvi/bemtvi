@@ -903,7 +903,7 @@
         // the settled path so the virtual rows slide with the text.
         const vlines = band.virt_lines && band.virt_lines[i];
         if (Array.isArray(vlines)) {
-          const g = (gutterW > 0 || band.sign_column) ? renderGutterCell(band, i, gutterW) : "";
+          const g = (gutterW > 0 || band.sign_width > 0) ? renderGutterCell(band, i, gutterW) : "";
           rowEl.innerHTML = g + virtChunksHtml(vlines);
           strip.appendChild(rowEl);
           continue;
@@ -1244,7 +1244,7 @@
           // gutter) is a later refinement — today virtual rows begin at the text body.
           const vlines = w.virt_lines && w.virt_lines[r];
           if (Array.isArray(vlines)) {
-            const g = (gutterW > 0 || w.sign_column) ? renderGutterCell(w, r, gutterW) : "";
+            const g = (gutterW > 0 || w.sign_width > 0) ? renderGutterCell(w, r, gutterW) : "";
             rowEl.innerHTML = g + virtChunksHtml(vlines);
             box.appendChild(rowEl);
             continue;
@@ -1445,7 +1445,7 @@
       // inline-virt shift (not painted on this path yet) — an approximation.
       const ra = vtext.filter((p) => p[0] === 3).flatMap((p) => p[3]);
       if (ra.length && rect) {
-        const textW = Math.max(0, rect.width - gutterW - (w.sign_column ? 2 : 0));
+        const textW = Math.max(0, rect.width - gutterW - (w.sign_width || 0));
         const total = ra.reduce((s, [t]) => s + [...t].length, 0);
         const paintedVisible = Math.max(0, cells.length - leftcol);
         const start = Math.max(paintedVisible + 1, textW - total);
@@ -1622,7 +1622,7 @@
     function renderLineServer(w, row, gutterW, rect) {
       const line = w.lines[row] ?? "";
       const isFiller = w.numbers[row] === null;
-      let html = (gutterW > 0 || w.sign_column) ? renderGutterCell(w, row, gutterW) : "";
+      let html = (gutterW > 0 || w.sign_width > 0) ? renderGutterCell(w, row, gutterW) : "";
       if (isFiller) {
         const css = chromeCss(view.chrome?.end_of_buffer);
         return html + `<span class="eob"${css ? ` style="${css}"` : ""}>${escapeHtml(line)}</span>`;
@@ -1721,17 +1721,20 @@
 
     function renderGutterCell(w, row, width) {
       let html = "";
-      // Sign column (LSP diagnostics + extmark signs). The server merges and ships the
-      // per-row cell on BOTH builds, so paint it independent of `serverStyled` — on the
-      // wasm build there's no palette, so `id` is null and the severity colour is used.
-      if (w.sign_column) {
+      // Sign column (LSP diagnostics + extmark signs). The server merges the signs and
+      // ships the rendered column width in cells (`sign_width`, a multiple of 2 per the
+      // `'signcolumn'` policy — 0 when no column is reserved) plus the per-row cell on
+      // BOTH builds, so paint it independent of `serverStyled`. On the wasm build there's
+      // no palette, so `id` is null and the severity colour is used.
+      const sw = w.sign_width || 0;
+      if (sw > 0) {
         const sign = w.diagnostics_signs?.[row];
         if (sign) {
           const [glyph, sev, id] = sign;
           const css = (id != null) ? styleToCss(paletteStyle(id)) : `color:${severityColor(sev)};`;
-          html += `<span${css ? ` style="${css}"` : ""}>${escapeHtml((glyph + " ").slice(0, 2).padEnd(2))}</span>`;
+          html += `<span${css ? ` style="${css}"` : ""}>${escapeHtml((glyph + " ").slice(0, 2).padEnd(sw))}</span>`;
         } else {
-          html += `<span class="gutter">  </span>`;
+          html += `<span class="gutter">${" ".repeat(sw)}</span>`;
         }
       }
       if (width <= 0) return html;

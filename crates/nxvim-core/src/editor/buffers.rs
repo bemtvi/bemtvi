@@ -212,6 +212,14 @@ impl Editor {
                     None => return,
                 }
             };
+        } else if name == "fileformat" {
+            // The line-ending convention (`nx.bo.fileformat = "dos"`), the `vim.bo`
+            // companion to the enumerated `:set fileformat` path. An unknown label is
+            // ignored, like `fileencoding` above.
+            ob.buffer.options.fileformat = match crate::options::FileFormat::from_label(value) {
+                Some(ff) => ff,
+                None => return,
+            };
         }
     }
 

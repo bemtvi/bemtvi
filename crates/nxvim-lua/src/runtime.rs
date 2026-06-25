@@ -496,6 +496,15 @@ const PRELUDE_MODULES: &[(&str, &str)] = &[
     // async). The variable/option/dispatch/keymap nouns are authored as `nx.*`
     // directly in the chunks above, each aliasing `vim.*` onto itself.
     ("nxvim:prelude/nx", include_str!("prelude/nx.lua")),
+    // Built-in `.editorconfig` support. Loads AFTER nx.lua: it builds on `nx.on` /
+    // `nx.augroup` (events) plus `nx.fs` (async, above), `nx.bo` (buffer options,
+    // state.lua) and the `vim.g` / `vim.b` variable toggle. On by default; switch
+    // off with `vim.g.editorconfig = false` (global) or `vim.b.editorconfig = false`
+    // (per buffer).
+    (
+        "nxvim:prelude/editorconfig",
+        include_str!("prelude/editorconfig.lua"),
+    ),
     // The package manager (`nx.plugins`) — declarative install + lazy/eager load
     // over `git` (`nx.run`) and `nx.fs`. Loads AFTER nx.lua: it builds on
     // `nx.command` / `nx.on` (defined there) plus nx.run / nx.fs / nx.promise /

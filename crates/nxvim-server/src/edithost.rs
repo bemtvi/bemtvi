@@ -488,7 +488,7 @@ impl HostEffects for NativeEffects {
 #[cfg(feature = "native")]
 fn image_bytes(path: &str, result: io::Result<FsRead>) -> Result<Value, Value> {
     match result {
-        Ok(FsRead::File(bytes)) => Ok(Value::Binary(bytes)),
+        Ok(FsRead::File(bytes, _)) => Ok(Value::Binary(bytes)),
         Ok(FsRead::New) => Err(Value::from(format!(
             "nxvim_image_read: {path}: no such file"
         ))),

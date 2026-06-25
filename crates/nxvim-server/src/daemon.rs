@@ -730,8 +730,12 @@ fn decode_exited(mut params: Vec<Value>) -> Option<(u64, DaemonEvent)> {
 /// *not* one of these — it surfaces as an `Err` the server echoes loudly, never a silent
 /// empty buffer.
 pub enum FsRead {
-    /// An existing file's bytes — load them into the buffer (a replica of the remote).
-    File(Vec<u8>),
+    /// An existing file's bytes plus its stat at read time — load the bytes into the buffer
+    /// (a replica of the remote) and stamp the [`FileStat`] as the `disk` baseline, so the
+    /// buffer counts as read-from-disk (fires `BufReadPost`, not `BufNewFile`) and the watch
+    /// leg's later `fs_changed` pushes compare against an accurate snapshot. `None` if the
+    /// daemon couldn't stat the (still readable) file — a rare degrade to a size-only baseline.
+    File(Vec<u8>, Option<FileStat>),
     /// The path doesn't exist yet — open an empty new-file buffer named for it (the
     /// `:e newfile` case), so a first `:w` would create it.
     New,
@@ -947,13 +951,16 @@ fn decode_fs_changed(params: Vec<Value>) -> Option<WatchEvent> {
 /// `["file", bytes]` / `["new"]` → [`FsRead`]; anything else is a malformed reply.
 fn decode_fs_read(a: &mut [Value]) -> io::Result<FsRead> {
     match a.first().and_then(Value::as_str) {
-        Some("file") => match a.get_mut(1).map(|v| std::mem::replace(v, Value::Nil)) {
-            Some(Value::Binary(bytes)) => Ok(FsRead::File(bytes)),
-            _ => Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "fs_read: file reply missing bytes",
-            )),
-        },
+        Some("file") => {
+            let stat = a.get(2).and_then(decode_stat);
+            match a.get_mut(1).map(|v| std::mem::replace(v, Value::Nil)) {
+                Some(Value::Binary(bytes)) => Ok(FsRead::File(bytes, stat)),
+                _ => Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "fs_read: file reply missing bytes",
+                )),
+            }
+        }
         Some("new") => Ok(FsRead::New),
         Some("dir") => {
             let path = a
@@ -1163,9 +1170,10 @@ fn serve_read(fs: &dyn HostFs, params: &[Value]) -> Result<Value, Value> {
         return Err(Value::from("fs_read: missing path"));
     };
     match classify(fs, &path) {
-        Ok(FsRead::File(bytes)) => Ok(Value::Array(vec![
+        Ok(FsRead::File(bytes, stat)) => Ok(Value::Array(vec![
             Value::from("file"),
             Value::Binary(bytes),
+            stat.as_ref().map_or(Value::Nil, encode_stat),
         ])),
         Ok(FsRead::New) => Ok(Value::Array(vec![Value::from("new")])),
         Ok(FsRead::Dir { path, entries }) => Ok(Value::Array(vec![
@@ -1286,7 +1294,9 @@ fn classify(fs: &dyn HostFs, path: &Path) -> io::Result<FsRead> {
         Ok(mut reader) => {
             let mut bytes = Vec::new();
             reader.read_to_end(&mut bytes)?;
-            Ok(FsRead::File(bytes))
+            // Stat the file we just read so the edit-host stamps an accurate `disk`
+            // baseline (and so an existing file fires `BufReadPost`, not `BufNewFile`).
+            Ok(FsRead::File(bytes, fs.stat(path)))
         }
         Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(FsRead::New),
         Err(e) => Err(e),

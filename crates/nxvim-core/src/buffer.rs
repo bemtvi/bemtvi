@@ -856,6 +856,16 @@ impl Buffer {
         self.disk
     }
 
+    /// Stamp the disk snapshot directly. For an off-tick replica load (daemon / wasm)
+    /// that landed an *existing* file's bytes but — unlike a local [`Buffer::from_file`]
+    /// read — has no synchronous stat: it records a size-only baseline (`mtime: None`)
+    /// so the buffer counts as read-from-disk, not a `:e new-file`. Without it
+    /// [`disk_stat`](Buffer::disk_stat) stays `None` and the server fires `BufNewFile`
+    /// instead of `BufReadPost` for a file that plainly exists.
+    pub fn set_disk_stat(&mut self, stat: Option<FileStat>) {
+        self.disk = stat;
+    }
+
     /// Whether the bound file changed on disk since nxvim last read or wrote it —
     /// i.e. something *other* than this buffer touched it. Re-stats the file and
     /// compares its mtime/size against the snapshot from the last read/write.

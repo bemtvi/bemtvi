@@ -1415,8 +1415,11 @@ impl EditHost {
             return;
         }
         match kind {
-            0 => self.load_replica_wasm(buffer, path, bytes),
-            1 => self.load_replica_wasm(buffer, path, b""),
+            // kind 0 = an existing file (real bytes); kind 1 = a new file that wasn't on
+            // disk. The flag stamps the read-from-disk baseline for the former so it fires
+            // `BufReadPost`, not `BufNewFile` (see `load_replica_wasm`).
+            0 => self.load_replica_wasm(buffer, path, bytes, true),
+            1 => self.load_replica_wasm(buffer, path, b"", false),
             2 => self.editor.echo(format!(
                 "nxvim: directory read of {path} reached the file applier (use complete_fs_read_dir)"
             )),
@@ -1436,9 +1439,20 @@ impl EditHost {
     /// latter drives syntax); then refresh the Lua snapshot / mirror and drain any
     /// autocmd-queued work (which may itself enqueue further opens/saves the Worker picks up
     /// next).
-    fn load_replica_wasm(&mut self, buffer: BufferId, path: String, bytes: &[u8]) {
+    ///
+    /// `existed` distinguishes an existing-file read (kind 0) from a `:e new-file` (kind 1):
+    /// the wasm read carries no synchronous stat, so an existing file would otherwise look
+    /// like a new file (no `disk_stat`) and fire `BufNewFile`. Stamp a read-from-disk
+    /// baseline for it — before `emit_lifecycle_events` checks `buffer_is_new_file` — so it
+    /// fires `BufReadPost`, the event config keys diagnostics / LSP attach off of.
+    fn load_replica_wasm(&mut self, buffer: BufferId, path: String, bytes: &[u8], existed: bool) {
         self.editor
             .load_bytes_into(buffer, Some(path.clone()), bytes);
+        if existed {
+            // The wasm/OPFS read carries no stat (and serverless has no watch leg), so
+            // pass `None` for a size-only baseline — enough to fire `BufReadPost`.
+            self.editor.mark_replica_read_from_disk(buffer, None);
+        }
         self.announced.remove(&buffer);
         self.fired_filetype.remove(&buffer);
         let ft = filetype_of(Some(Path::new(&path))).unwrap_or("");

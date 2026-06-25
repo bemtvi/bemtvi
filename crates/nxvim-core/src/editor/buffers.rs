@@ -667,6 +667,29 @@ impl Editor {
             .is_some_and(|ob| ob.buffer.path.is_some() && ob.buffer.disk_stat().is_none())
     }
 
+    /// Mark `id` as read from an *existing* file when the read landed off-tick (daemon /
+    /// wasm). Stamp its disk baseline so [`buffer_is_new_file`](Self::buffer_is_new_file)
+    /// reports `false` and the server fires `BufReadPost` rather than `BufNewFile`. Pass the
+    /// real [`FileStat`](crate::FileStat) when the transport carries one (the daemon stats
+    /// the file at read, so the buffer's baseline matches what the watch leg later pushes —
+    /// no spurious "changed on disk"); pass `None` when it doesn't (the serverless wasm/OPFS
+    /// read, which has no synchronous stat and no watch leg), and a size-only baseline is
+    /// synthesized from the just-loaded rope. No-op for a gone or path-less buffer. Call only
+    /// for an existing file — a `:e new-file` must keep its `None` stat to fire `BufNewFile`.
+    pub fn mark_replica_read_from_disk(&mut self, id: BufferId, stat: Option<crate::FileStat>) {
+        let Some(ob) = self.buffers.map.get_mut(&id) else {
+            return;
+        };
+        if ob.buffer.path.is_none() {
+            return;
+        }
+        let stat = stat.unwrap_or(crate::FileStat {
+            mtime: None,
+            size: ob.buffer.len_bytes() as u64,
+        });
+        ob.buffer.set_disk_stat(Some(stat));
+    }
+
     /// Enqueue an off-tick fetch of `path` into `buffer` (an already-created, empty
     /// buffer the caller has set up and, for `:edit`, switched to). The server reads
     /// the bytes off the editor tick and loads them into `buffer` via

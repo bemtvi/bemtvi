@@ -268,3 +268,82 @@ async fn tabnew_fetches_a_file_over_the_wire() {
     // ...and the new tab's buffer is named for the remote path.
     assert_eq!(buf_name(&rpc).await, "/virtual/other.txt");
 }
+
+/// An **existing** remote file opened off-tick fires `BufReadPost` when its content lands —
+/// the daemon stats the file at read and ships the stat, so the replica gets a `disk`
+/// baseline (without it `buffer_is_new_file` is true and the content-load fires `BufNewFile`
+/// too, so a config that seeds diagnostics / attaches an LSP on `BufReadPost` never runs).
+/// The diagnostic the handler seeds therefore lands on the buffer. (The off-tick `:edit`
+/// creates the empty buffer before the fetch returns, so a placeholder `BufNewFile` precedes
+/// the content-load `BufReadPost` — a pre-existing artifact of the off-tick split, not this
+/// fix's concern; the regression guard is that the load now fires `BufReadPost`.) A genuinely
+/// new remote path still fires only `BufNewFile`, proving the distinction is real.
+#[tokio::test]
+async fn edit_existing_remote_file_fires_bufreadpost_not_bufnewfile() {
+    let fake = DaemonFs::default();
+    fake.set("/virtual/note.txt", "alpha\n")
+        .set("/virtual/lint.txt", "needs linting\n");
+    let (rpc, _incoming) = spawn_with_daemon_fs(fake, "/virtual/note.txt").await;
+    await_lines(&rpc, &["alpha"]).await;
+
+    // Tap both events (pattern matches either remote file), then seed a diagnostic from the
+    // BufReadPost handler — exactly the shape of a real `nx.diagnostic.set`-on-read config.
+    exec_lua(
+        &rpc,
+        r#"
+        _G.events = {}
+        local ns = nx.ns.create("daemon-read-test")
+        nx.autocmd.create({ "BufReadPost" }, { pattern = "*lint.txt", callback = function(a)
+          _G.events[#_G.events + 1] = "BufReadPost"
+          nx.diagnostic.set(ns, a.buf, { { lnum = 0, col = 0, severity = 1, message = "lint!" } })
+        end })
+        nx.autocmd.create({ "BufNewFile" }, { pattern = "*lint.txt", callback = function()
+          _G.events[#_G.events + 1] = "BufNewFile"
+        end })
+        return 1
+        "#,
+    )
+    .await;
+
+    // Open the existing remote file (fetched + stat'd over the wire, off-tick).
+    feed(&rpc, ":edit /virtual/lint.txt<CR>");
+    await_lines(&rpc, &["needs linting"]).await;
+
+    let events = exec_lua(&rpc, "return table.concat(_G.events, ',')")
+        .await
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+    assert!(
+        events.split(',').next_back() == Some("BufReadPost"),
+        "the content-load of an existing remote file must fire BufReadPost (got {events:?})"
+    );
+
+    // End-to-end: the BufReadPost handler's diagnostic landed on the opened buffer.
+    assert_eq!(
+        exec_lua(&rpc, "return #nx.diagnostic.get(0)")
+            .await
+            .as_u64(),
+        Some(1),
+        "the BufReadPost handler seeded its diagnostic on the remote file"
+    );
+
+    // The control: a genuinely-new remote path still fires BufNewFile.
+    exec_lua(&rpc, "_G.events = {}").await;
+    feed(&rpc, ":edit /virtual/fresh-lint.txt<CR>");
+    for _ in 0..100 {
+        if buf_name(&rpc).await == "/virtual/fresh-lint.txt" {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let events = exec_lua(&rpc, "return table.concat(_G.events, ',')")
+        .await
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+    assert!(
+        events.split(',').next_back() == Some("BufNewFile") && !events.contains("BufReadPost"),
+        "a missing remote path is still a new file (fires BufNewFile, never BufReadPost; got {events:?})"
+    );
+}

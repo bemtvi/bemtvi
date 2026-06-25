@@ -37,7 +37,7 @@ impl EditHost {
         // repaints via `settle_events`.
         if buffer == crate::redraw::PREVIEW_FETCH_BUF {
             let (lines, ok) = match result {
-                Ok(FsRead::File(bytes)) => (crate::redraw::bytes_to_preview_lines(&bytes), true),
+                Ok(FsRead::File(bytes, _)) => (crate::redraw::bytes_to_preview_lines(&bytes), true),
                 Ok(FsRead::New) => (Vec::new(), true),
                 Ok(FsRead::Dir { .. }) => (vec!["<directory>".to_string()], false),
                 Err(e) => (vec![format!("{path}: {e}")], false),
@@ -50,8 +50,10 @@ impl EditHost {
             // invalid-UTF-8 resilience), exactly as the local `Buffer::from_file`
             // does — no more `from_utf8_lossy` fork that silently mangled non-UTF-8
             // bytes and corrupted them on the next `:w`.
-            Ok(FsRead::File(bytes)) => self.load_replica_bytes(buffer, path, &bytes),
-            Ok(FsRead::New) => self.load_replica_bytes(buffer, path, b""),
+            Ok(FsRead::File(bytes, stat)) => {
+                self.load_replica_bytes(buffer, path, &bytes, true, stat)
+            }
+            Ok(FsRead::New) => self.load_replica_bytes(buffer, path, b"", false, None),
             // A directory: build the in-window file explorer listing into the buffer
             // (Phase 3g). The daemon's canonical `dir` path supersedes the requested one
             // (`:e somedir` resolves to its absolute form), so the listing names and
@@ -79,10 +81,28 @@ impl EditHost {
     /// syntax and LSP. The filetype comes from `path` directly (the buffer is named for
     /// it), so this works whether or not `buffer` is current. Then refresh the Lua
     /// snapshot/mirror and drive the queued autocmd work.
+    ///
+    /// `existed` is whether the remote path was an *existing* file ([`FsRead::File`]) versus
+    /// a `:e new-file` ([`FsRead::New`]); `stat` is that file's stat at read time (the daemon
+    /// stats it during the read). For an existing file, stamp the `disk` baseline — before
+    /// `emit_lifecycle_events` checks `buffer_is_new_file` — so the remote read fires
+    /// `BufReadPost`, not `BufNewFile`, and the watch leg's `fs_changed` compares against an
+    /// accurate snapshot. A new file keeps its `None` stat (fires `BufNewFile`, as
+    /// `vim newfile` does).
     #[cfg(feature = "native")]
-    fn load_replica_bytes(&mut self, buffer: BufferId, path: String, bytes: &[u8]) {
+    fn load_replica_bytes(
+        &mut self,
+        buffer: BufferId,
+        path: String,
+        bytes: &[u8],
+        existed: bool,
+        stat: Option<nxvim_core::FileStat>,
+    ) {
         self.editor
             .load_bytes_into(buffer, Some(path.clone()), bytes);
+        if existed {
+            self.editor.mark_replica_read_from_disk(buffer, stat);
+        }
         self.announced.remove(&buffer);
         self.fired_filetype.remove(&buffer);
         let ft = filetype_of(Some(Path::new(&path))).unwrap_or("");

@@ -1,0 +1,17 @@
+# podman-compose / docker compose front-end for the nxvim remote daemon.
+#
+#     podman compose -f examples/docker-daemon/compose.yaml up --build
+#     # or: docker compose -f examples/docker-daemon/compose.yaml up --build
+#
+# Then, from the repo root: examples/docker-daemon/connect.sh
+services:
+  nxvim-daemon:
+    build:
+      # Build context is the repo root — the Containerfile compiles the whole crate.
+      context: ../..
+      dockerfile: examples/docker-daemon/Containerfile
+    image: nxvim-daemon
+    container_name: nxvim-daemon
+    ports:
+      # QUIC is UDP. Bind to loopback on the host; the token/cert are the real auth.
+      - "127.0.0.1:8765:8765/udp"

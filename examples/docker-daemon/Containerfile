@@ -1,0 +1,49 @@
+# nxvim remote daemon, containerized — native (QUIC) transport.
+#
+# Build from the REPO ROOT (the whole workspace is the build context):
+#
+#     podman build -f examples/docker-daemon/Containerfile -t nxvim-daemon .
+#     # or: docker build -f examples/docker-daemon/Containerfile -t nxvim-daemon .
+#
+# Run it (QUIC is UDP — note the /udp, and publish on loopback only):
+#
+#     podman run --rm -p 127.0.0.1:8765:8765/udp --name nxvim-daemon nxvim-daemon
+#
+# Then connect from the host with examples/docker-daemon/connect.sh.
+
+# ---- build stage: compile the release binary -------------------------------
+FROM docker.io/library/rust:1-bookworm AS build
+
+# `ring` (the QUIC/TLS backend) needs a C compiler + perl; that's the whole list
+# for a native build — tree-sitter parsers are compiled on the CLIENT, not here.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends clang perl pkg-config \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /src
+COPY . .
+# Only the binary crate is needed for the daemon role.
+RUN cargo build --release -p nxvim
+
+# ---- runtime stage: just the binary + the daemon's config & workspace ------
+FROM docker.io/library/debian:bookworm-slim
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=build /src/target/release/nxvim /usr/local/bin/nxvim
+
+# The daemon serves THIS config over the wire (see daemon/init.lua). It is resolved
+# exactly like a local config would be: $NXVIM_CONFIG first.
+COPY examples/docker-daemon/daemon /etc/nxvim
+ENV NXVIM_CONFIG=/etc/nxvim
+
+# The files you actually edit live on the daemon's filesystem (the container).
+COPY examples/docker-daemon/workspace /work
+WORKDIR /work
+
+# QUIC listener. 0.0.0.0 so it's reachable from outside the container; the bearer
+# token + TOFU cert (printed on stdout at startup) are the auth gate.
+EXPOSE 8765/udp
+CMD ["nxvim", "--daemon", "--listen", "0.0.0.0:8765"]

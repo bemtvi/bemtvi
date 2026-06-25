@@ -1,0 +1,16 @@
+This file lives INSIDE the container, at /work/sample.txt.
+
+When you connect to the daemon and open it, every filesystem op — the read that
+filled this buffer, and the write when you :w — happens on the container, not on
+your machine. The keystroke path stays local; only fs/process/watch/LSP cross the
+wire.
+
+Checklist — run these and compare against a plain local launch:
+
+  :WhoAmI          -> "DAEMON config ... (tabstop=8)"   (local config says LOCAL, tabstop=2)
+  :set tabstop?    -> 8                                  (local config sets 2)
+  :pwd             -> /work                              (the daemon's cwd, in the container)
+  :r !hostname     -> the CONTAINER's hostname           (process leg runs on the daemon)
+
+The two init.lua files are different on purpose: this proves a daemon session runs
+the DAEMON's config, fetched over the wire, not the client's.

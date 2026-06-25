@@ -43,6 +43,11 @@
   .incsearch { background: #ffd866; color: #1e2127; }
   .statusline { background: var(--status-bg); color: var(--status-fg); }
   .statusline.focused { color: #e6e6e6; }
+  /* A status / tabline bar paints in two stacked layers — all segment backgrounds
+     first, then all glyph text on top — so an over-wide glyph (a powerline separator,
+     a Nerd icon) overhangs into its neighbour like it should, instead of being
+     overpainted by the next segment's opaque background (the GUI's bg-then-fg passes). */
+  .sl-layer { position: absolute; left: 0; top: 0; height: 100%; white-space: pre; }
   .sep { background: #181a1f; color: var(--gutter); position: absolute; }
   /* Cursor shapes. Block reverses the cell; bar/underline are thin overlays. */
   .cur-block { background: var(--cursor); color: var(--bg); }
@@ -321,6 +326,33 @@
       inkShiftCache.set(cp, shift);
       return shift;
     }
+    // A two-column glyph (CJK / emoji / wide pictograph) whose rasterised ink is wider
+    // than its `cells*cw` box overflows on the right; in a status / tabline bar the next
+    // segment's opaque background then paints over that overflow, clipping the glyph's
+    // right edge ("wide glyphs partially covered on the right"). Measure the ink and,
+    // when it exceeds the box, return the uniform scale that shrinks it to fit — applied
+    // as a (layout-free) `transform`, so the column model is untouched and the glyph just
+    // sits inside its two cells. Width-1 symbols (powerline separators, box-drawing) are
+    // excluded by the caller: they are meant to fill / tile their cell, not shrink.
+    const wideFitCache = new Map();
+    function wideFitScale(cp, boxW) {
+      const hit = wideFitCache.get(cp);
+      if (hit !== undefined) return hit;
+      let scale = 1;
+      try {
+        if (!measureCtx) {
+          measureCtx = document.createElement("canvas").getContext("2d");
+          measureCtx.textAlign = "left";
+          measureCtx.textBaseline = "alphabetic";
+        }
+        measureCtx.font = `${FONT_PX}px ${getComputedStyle(gridEl).fontFamily}`;
+        const m = measureCtx.measureText(String.fromCodePoint(cp));
+        const inkW = m.actualBoundingBoxLeft + m.actualBoundingBoxRight;
+        if (inkW > boxW) scale = boxW / inkW;
+      } catch { /* measureText unavailable → no scaling */ }
+      wideFitCache.set(cp, scale);
+      return scale;
+    }
     function cellBoxSpan(ch, cls, css) {
       const cp = ch.codePointAt(0);
       const cells = charWidth(cp) || 1;
@@ -332,7 +364,11 @@
       // leaves it a touch left); the indent only ever applies to width-1 glyphs.
       const shift = cells === 1 ? inkRightShift(cp, boxW) : 0;
       const indent = shift ? `text-indent:${shift.toFixed(3)}px;` : "";
-      return `<span class="${cls}" style="display:inline-block;width:${boxW.toFixed(3)}px;text-align:center;${indent}${css || ""}">${escapeHtml(ch)}</span>`;
+      // A wide glyph drawn wider than its two cells is scaled down to fit so it can't
+      // bleed into — and be overpainted by — the following segment's background.
+      const scale = cells === 2 ? wideFitScale(cp, boxW) : 1;
+      const tf = scale < 1 ? `transform:scale(${scale.toFixed(3)});` : "";
+      return `<span class="${cls}" style="display:inline-block;width:${boxW.toFixed(3)}px;text-align:center;${indent}${tf}${css || ""}">${escapeHtml(ch)}</span>`;
     }
 
     // ============================================================================
@@ -1467,18 +1503,24 @@
       if (typeof c === "number") return "#" + (c >>> 0).toString(16).padStart(6, "0");
       return c;
     }
-    function styleToCss(s) {
+    // `mode` splits the style for the two-layer status bar: "bg" → background only,
+    // "fg" → colour + weight/slant/decorations only; omitted → the full style (every
+    // other caller). Splitting lets the bar paint backgrounds and glyphs in separate
+    // stacked layers so a glyph's ink is never overpainted by a neighbour's background.
+    function styleToCss(s, mode) {
       if (!s) return "";
       let fg = cssColor(s.fg), bg = cssColor(s.bg);
       if (s.reverse) { const t = fg; fg = bg || "var(--bg)"; bg = t || "var(--fg)"; }
       let css = "";
-      if (fg) css += `color:${fg};`;
-      if (bg) css += `background:${bg};`;
-      if (s.bold) css += "font-weight:700;";
-      if (s.italic) css += "font-style:italic;";
-      if (s.strikethrough) css += "text-decoration:line-through;";
-      else if (s.underline) css += "text-decoration:underline;";
-      else if (s.undercurl) { const sp = cssColor(s.sp); css += `text-decoration:underline wavy;${sp ? `text-decoration-color:${sp};` : ""}`; }
+      if (mode !== "bg") {
+        if (fg) css += `color:${fg};`;
+        if (s.bold) css += "font-weight:700;";
+        if (s.italic) css += "font-style:italic;";
+        if (s.strikethrough) css += "text-decoration:line-through;";
+        else if (s.underline) css += "text-decoration:underline;";
+        else if (s.undercurl) { const sp = cssColor(s.sp); css += `text-decoration:underline wavy;${sp ? `text-decoration-color:${sp};` : ""}`; }
+      }
+      if (mode !== "fg" && bg) css += `background:${bg};`;
       return css;
     }
     function paletteStyle(id) { return id == null ? null : (view.styles[id] || null); }
@@ -1705,7 +1747,11 @@
     // `width*cw`) that overflow is clipped, cropping the last few characters off the
     // right edge (the lualine-on-web crop). Boxing also fixes powerline-separator ink
     // placement, exactly as on the content lines / GUI.
-    function styledCellsHtml(text, css) {
+    // Returns `{ html, cols }`: the foreground (text-only) HTML for a run of single-style
+    // text in the boxed-cell model, plus its display-column count (so the bar can size a
+    // matching background rectangle). `css` should be foreground-only — the background is
+    // painted separately, one layer below, so an over-wide glyph's ink can overhang.
+    function styledCells(text, css) {
       const cells = [];
       for (const cp of text) {
         const wcw = charWidth(cp.codePointAt(0));
@@ -1724,22 +1770,28 @@
         run += ch;
       }
       flush();
-      return out;
+      return { html: out, cols: cells.length };
     }
     function renderSegmentBar(segments, width, cls) {
-      let html = "";
+      // Two stacked layers (see `.sl-layer`): all segment backgrounds first, then all
+      // glyph text on top. A glyph drawn wider than its cell (powerline separator, Nerd
+      // icon) then overhangs its neighbour instead of being clipped by the next segment's
+      // opaque background — matching the GUI/TUI's background-then-foreground passes.
+      let bg = "", fg = "";
       for (const { text, style } of (segments || [])) {
         // A status / tabline segment carries a palette *id* (or null when its group is
         // unset / undefined — the wasm build, with no colorscheme, always sends null and
         // the segment then shows the base `.statusline` look).
         const st = typeof style === "number" ? paletteStyle(style) : style;
-        const css = styleToCss(st);
-        html += styledCellsHtml(text, css);
+        const { html, cols } = styledCells(text, styleToCss(st, "fg"));
+        const bgcss = styleToCss(st, "bg");
+        bg += `<span style="display:inline-block;height:100%;width:${(cols * cw).toFixed(3)}px;${bgcss}"></span>`;
+        fg += html;
       }
       const el = document.createElement("div");
       el.className = cls;
       el.style.width = width * cw + "px";
-      el.innerHTML = html;
+      el.innerHTML = `<span class="sl-layer">${bg}</span><span class="sl-layer">${fg}</span>`;
       return el;
     }
     function renderStatusSegments(box, segments, atRow, width, focused) {

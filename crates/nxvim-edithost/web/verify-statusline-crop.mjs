@@ -55,7 +55,8 @@ try {
     // The status bar is the one carrying our content (the glyph + ENDMARK).
     const bar = bars.find((b) => b.textContent.includes(g));
     if (!bar) return { found: false, barCount: bars.length };
-    const spans = [...bar.querySelectorAll("span")];
+    // Leaf cell/run spans only (skip the two `.sl-layer` wrappers).
+    const spans = [...bar.querySelectorAll("span")].filter((s) => !s.classList.contains("sl-layer"));
     const glyphSpan = spans.find((s) => s.textContent.includes(g));
     const gs = glyphSpan ? getComputedStyle(glyphSpan) : null;
     const barBox = bar.getBoundingClientRect();
@@ -87,6 +88,65 @@ try {
     check("statusline: ENDMARK present (not cropped away)", r.hasEndmark, JSON.stringify(r));
     check("statusline: content does not overflow the bar (no crop)",
       r.scrollWidth <= r.clientWidth + 1 && r.overflowRight < 1, JSON.stringify(r));
+  }
+
+  // ---- wide-glyph fit: a two-column glyph drawn wider than its `2*cw` box used to
+  // overflow on the right and get overpainted by the next segment's background ("wide
+  // glyphs partially covered on the right"). It must now be scaled to fit its box.
+  await page.evaluate(() => window.__nxvim.execLua(
+    "vim.o.laststatus = 2\n" +
+    "vim.o.statusline = 'L🚀R %= W'")); // 🚀 = emoji, ink wider than two cells
+  await sleep(200);
+  const w = await page.evaluate(() => {
+    const { cw } = window.__nxvim.cellMetrics();
+    const bar = [...document.querySelectorAll("#grid .row.statusline")].find((b) => b.textContent.includes("🚀"));
+    if (!bar) return { found: false };
+    const span = [...bar.querySelectorAll("span")].filter((s) => !s.classList.contains("sl-layer")).find((s) => s.textContent.includes("🚀"));
+    if (!span) return { found: false };
+    const boxW = 2 * cw;
+    // Measure the glyph's rasterised ink (the same metric the fix keys on), then apply
+    // the span's transform scale: the scaled ink must fit inside its two-cell box.
+    const ctx = document.createElement("canvas").getContext("2d");
+    ctx.font = `${getComputedStyle(bar).fontSize} ${getComputedStyle(bar).fontFamily}`;
+    const m = ctx.measureText("🚀");
+    const inkW = m.actualBoundingBoxLeft + m.actualBoundingBoxRight;
+    const tr = getComputedStyle(span).transform; // "none" or "matrix(a, ...)"
+    const scale = tr && tr.startsWith("matrix") ? parseFloat(tr.slice(7).split(",")[0]) : 1;
+    return { found: true, boxW, inkW, scale, scaledInk: inkW * scale, display: getComputedStyle(span).display };
+  });
+  check("statusline: wide glyph renders", w.found, JSON.stringify(w));
+  if (w.found) {
+    check("statusline: wide glyph is a boxed cell", w.display === "inline-block", JSON.stringify(w));
+    check("statusline: wide glyph ink fits its two-cell box (not covered)",
+      w.scaledInk <= w.boxW + 0.6, JSON.stringify(w));
+  }
+
+  // ---- two-layer bar: backgrounds first, glyph text on top, so an over-wide width-1
+  // glyph (powerline separator / Nerd icon) overhangs instead of being overpainted by
+  // the next segment's background. A statusline with a Nerd separator + a coloured
+  // segment after it; assert the bar is two stacked layers and the glyph is in the
+  // upper (text) layer while all backgrounds sit in the lower layer.
+  await page.evaluate(() => window.__nxvim.execLua(
+    "vim.api.nvim_set_hl(0, 'SEP', { fg='#ff0000' })\n" +
+    "vim.api.nvim_set_hl(0, 'NXT', { fg='#000000', bg='#00ddaa' })\n" +
+    "vim.o.laststatus = 2\n" +
+    "vim.o.statusline = 'A%#SEP#\\u{e0b0}%#NXT#BBB'")); // U+E0B0 = powerline separator
+  await sleep(200);
+  const L = await page.evaluate(() => {
+    const bar = [...document.querySelectorAll("#grid .row.statusline")].find((b) => b.textContent.includes("\u{e0b0}"));
+    if (!bar) return { found: false };
+    const layers = [...bar.children].filter((c) => c.classList.contains("sl-layer"));
+    if (layers.length !== 2) return { found: true, layerCount: layers.length };
+    const bgLayer = layers[0], fgLayer = layers[1];
+    const bgText = bgLayer.textContent;
+    const sepInFg = [...fgLayer.querySelectorAll("span")].some((s) => s.textContent === "\u{e0b0}");
+    // Background rectangles carry no text; the separator glyph is in the upper layer.
+    return { found: true, layerCount: 2, bgEmpty: bgText.length === 0, sepInFg };
+  });
+  check("statusline: bar renders two stacked layers", L.found && L.layerCount === 2, JSON.stringify(L));
+  if (L.layerCount === 2) {
+    check("statusline: background layer carries no glyphs", L.bgEmpty, JSON.stringify(L));
+    check("statusline: glyph sits in the upper (text) layer, above backgrounds", L.sepInFg, JSON.stringify(L));
   }
 
   await browser.close();

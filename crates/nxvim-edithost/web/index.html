@@ -1315,6 +1315,22 @@
         }
         return null;
       };
+      // LSP / client-set diagnostic underline spans `[start_col, end_col, sev, id]` in
+      // display columns. The server projects these on both builds (same merged store as
+      // the gutter signs); paint a wavy squiggle in the severity colour over the cell,
+      // combined with whatever fg the cell already has — mirrors `cellBaseCss` on the
+      // server-styled path. Loses to cursor/selection (an "owned" cell), like the native
+      // overlay below.
+      const diagSpans = w.diagnostics?.[row] || [];
+      const diagCssAt = (c) => {
+        for (const [s, e, sev, id] of diagSpans) {
+          if (c >= s && c < e) {
+            const sp = (id != null && paletteStyle(id)?.sp) || severityColor(sev);
+            return `text-decoration:underline wavy;text-decoration-color:${sp};text-underline-offset:2px;`;
+          }
+        }
+        return "";
+      };
 
       let run = "", runCls = "", runCss = "", out = "";
       const flush = () => {
@@ -1351,6 +1367,9 @@
             if (sv != null) css = sv;
             else css = (cells[c].color ? `color:${cells[c].color};` : "") + (cells[c].bg ? `background:${cells[c].bg};` : "");
           }
+          // The diagnostic squiggle rides on top of the resolved fg (a text-decoration,
+          // not a colour), so append it after the colour above.
+          if (diagSpans.length) css += diagCssAt(c);
         }
         // A wide glyph or boxed symbol breaks the run and renders in its own fixed-width
         // box; a wide glyph's empty continuation cell (next column) then adds nothing.
@@ -1382,6 +1401,15 @@
         const start = Math.max(paintedVisible + 1, textW - total);
         const pad = Math.max(0, start - paintedVisible);
         out += `<span>${" ".repeat(pad)}</span>` + virtChunksHtml(ra);
+      }
+      // Diagnostic inline virtual text `[text, sev, id]` — the trailing end-of-line
+      // message (`virtual_text = true`). Projected on both builds; render it the same
+      // way the server-styled path does (a one-space gap then the message).
+      const diagVirt = w.diagnostics_virt?.[row];
+      if (diagVirt) {
+        const [text, sev, id] = diagVirt;
+        const vcss = (id != null) ? styleToCss(paletteStyle(id)) : `color:${severityColor(sev)};`;
+        out += `<span${vcss ? ` style="${vcss}"` : ""}> ${escapeHtml(text)}</span>`;
       }
       return html + out;
     }

@@ -433,18 +433,19 @@ impl EditHost {
         let sign_cells = self.merged_sign_cells(win.buffer, &win.winhl, &segments, styles);
         let diagnostics_signs = crate::extmarks::signs_value(&sign_cells);
         let sign_width = crate::extmarks::sign_width_from_cells(&sign_cells, win.signcolumn);
+        // Diagnostic underline spans + inline virtual text. Like the gutter signs
+        // above, both read the core-/tick-shared `diagnostics_merged` store (the LSP
+        // set plus the client-set `nx.diagnostic.set` set, the latter having no server
+        // at all), so they project on BOTH builds — the browser edit-host paints the
+        // squiggles and the trailing message from these payloads. Only `inlay_hints`
+        // stays native-only: it has no client-set source and rides a live LSP.
+        let diagnostics = self.diagnostics_for(win.buffer, &win.winhl, &segments, styles);
+        let diagnostics_virt =
+            self.diagnostics_virt_text_for(win.buffer, &win.winhl, &segments, styles);
         #[cfg(feature = "native")]
-        let (diagnostics, diagnostics_virt, inlay_hints) = (
-            self.diagnostics_for(win.buffer, &win.winhl, &segments, styles),
-            self.diagnostics_virt_text_for(win.buffer, &win.winhl, &segments, styles),
-            self.inlay_hints_for(win.buffer, &win.winhl, &segments, styles),
-        );
+        let inlay_hints = self.inlay_hints_for(win.buffer, &win.winhl, &segments, styles);
         #[cfg(not(feature = "native"))]
-        let (diagnostics, diagnostics_virt, inlay_hints) = (
-            Value::Array(Vec::new()),
-            Value::Array(Vec::new()),
-            Value::Array(Vec::new()),
-        );
+        let inlay_hints = Value::Array(Vec::new());
         let scroll = match &win.scroll {
             Some(s) => self.project_band(win.buffer, &win.winhl, s, styles),
             None => Value::Nil,

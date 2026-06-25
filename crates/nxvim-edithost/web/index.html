@@ -2485,6 +2485,22 @@
     function pickerUnavailable(what) {
       flashStatus(`${what}: this browser has no File System Access API (try Chrome/Edge)`, "#e06c75");
     }
+    // The absolute editor path a picker-chosen file will get, so the `bind` key matches the
+    // path the off-tick read/write actually requests. A picker only hands us a bare basename
+    // (`handle.name`, no directory). The editor resolves a *relative* `:e`/`:w` against the
+    // effective cwd before it crosses to the Worker (`drain_pending_opens` →
+    // `effective.join(name)`), so a bare-name bind would key on `name` while the read asks for
+    // `<cwd>/name` — they'd never match and the read would fall through to OPFS (an empty
+    // buffer). Resolving here and feeding the *absolute* path keeps both sides keyed alike
+    // (an absolute `:e`/`:w` crosses unchanged). `execLua` renders its result via rmpv's
+    // Debug, so unwrap the string out of `…Ok("…")…`; default to root if anything is off.
+    async function editorPath(name) {
+      if (name.startsWith("/")) return name;
+      const rendered = String((await execLuaOp("return vim.fn.getcwd()"))?.result ?? "");
+      const m = /Ok\("((?:\\.|[^"\\])*)"\)/.exec(rendered);
+      const cwd = m ? m[1].replace(/\\(.)/g, "$1") : "/";
+      return cwd.endsWith("/") ? cwd + name : cwd + "/" + name;
+    }
     // Run an ex command by feeding `:<cmd><CR>` as key notation (the Worker tick takes
     // notation via nvim_input, not a direct nvim_command — so the `:` and `<CR>` are
     // required). A literal `<` in a filename would be read as notation, so escape it.
@@ -2543,7 +2559,7 @@
         // Request write access up front (within the picker's activation) so a later bare
         // `:w` to this handle needs no fresh gesture; read-only is fine if declined.
         try { await handle.requestPermission?.({ mode: "readwrite" }); } catch {}
-        const path = handle.name;
+        const path = await editorPath(handle.name);
         fsHandles.set(path, handle);
         bindOp(path);
         runExCommand(`${verb} ${path}`);
@@ -2558,8 +2574,8 @@
       if (!fsApiAvailable) { pickerUnavailable("save"); return; }
       const opts = {};
       if (fw && !fw.unnamed && fw.file_name) opts.suggestedName = fw.file_name.split("/").pop();
-      self.showSaveFilePicker(opts).then((handle) => {
-        const path = handle.name;
+      self.showSaveFilePicker(opts).then(async (handle) => {
+        const path = await editorPath(handle.name);
         fsHandles.set(path, handle);
         bindOp(path);
         runExCommand(`w ${path}`);

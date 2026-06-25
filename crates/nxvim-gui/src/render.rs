@@ -2472,6 +2472,11 @@ impl Renderer {
             });
         }
 
+        // Match-highlight overdraw iterates the *untruncated* label, so it must clip
+        // to the list column or a label wider than `list_w` bleeds its matched chars
+        // over the separator and preview pane (the base row text is already truncated
+        // to `list_w` by `pmenu_row`, so it needs no such guard).
+        let list_bounds = self.text_bounds(cx, content_y0, list_w, menu.height);
         // A noselect completion popup highlights no row and scrolls from the top.
         let sel = menu.selected_active.then_some(menu.selected);
         let start = pmenu_start(sel, list_rows as usize);
@@ -2508,7 +2513,7 @@ impl Renderer {
                             &ch.to_string(),
                             self.cell_px(cx + ci, row),
                             match_fg,
-                            full,
+                            list_bounds,
                         );
                     }
                 }

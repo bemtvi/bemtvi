@@ -77,14 +77,32 @@
   /* A tiny boot/transport indicator, hidden shortly after the first frame. */
   #status { position: fixed; right: 6px; bottom: 4px; font-size: 11px; opacity: .4;
             color: #5c6370; pointer-events: none; z-index: 5; }
-  /* Off-screen input proxy. The grid is a non-editable <div>, and Firefox only fires
+  /* Input proxy. The grid is a non-editable <div>, and Firefox only fires
      `paste`/`copy`/`cut` on an *editable* focused element — so the real keyboard + clipboard
-     target is this hidden, always-focused textarea (the xterm.js "helper textarea" pattern).
-     Kept 1px (not display:none, which can't take focus) and out of the way (z-index/opacity/
-     pointer-events) so it never shows or steals the mouse. */
-  #kbd { position: fixed; top: 0; left: 0; width: 1px; height: 1px; padding: 0; margin: 0;
-         border: 0; outline: none; resize: none; opacity: 0; z-index: -1;
-         overflow: hidden; pointer-events: none; }
+     target is this always-focused textarea (the xterm.js "helper textarea" pattern).
+     `positionImeProxy` parks it over the cursor cell each frame so a macOS / CJK IME
+     composition popup (and the press-and-hold accent menu) anchors to the cursor — both
+     follow the focused element's caret. It must be VISIBLE to the OS text-input system to
+     get a real caret rect, so it can't use `opacity:0`/`z-index:-1`: an invisible or
+     grid-occluded element makes Chrome suppress the IME popup and fall the accent menu back
+     to the viewport origin (the top-left bug). Instead it sits ABOVE the grid and is hidden
+     by transparent text/caret/background; `pointer-events:none` keeps it from stealing the
+     mouse. Font metrics match the grid so the caret rect is one cell tall. `position:
+     absolute` (NOT `fixed`): Chrome miscomputes the IME / accent-menu anchor rect for a
+     `fixed` element and pins the popup near the viewport origin, while Firefox handles it —
+     real editors (CodeMirror/ProseMirror) all use absolute. The page never scrolls (body is
+     `overflow:hidden;height:100%`), so absolute coords equal the viewport coords
+     `positionImeProxy` reads from `getBoundingClientRect`. */
+  #kbd { position: absolute; top: 0; left: 0; width: 1px; height: 1px; padding: 0; margin: 0;
+         border: 0; outline: none; resize: none; overflow: hidden; z-index: 50;
+         pointer-events: none; background: transparent; color: transparent;
+         caret-color: transparent; white-space: pre; font-size: 15px; line-height: 21px;
+         font-family: ui-monospace, "SF Mono", Menlo, Consolas, "DejaVu Sans Mono", "Symbols Nerd Font Mono", monospace; }
+  /* EditContext host (Chrome IME path). Its CSS position is irrelevant — the IME caret is
+     placed from the bounds we report via `updateSelectionBounds`, not the element's layout —
+     so it just needs to be focusable and out of the way. */
+  #ime { position: absolute; top: 0; left: 0; width: 1px; height: 1px; opacity: 0;
+         pointer-events: none; overflow: hidden; outline: none; }
 </style>
 </head>
 <body>
@@ -106,12 +124,34 @@
 
     const FONT_PX = 15, LINE = 1.4;
     const gridEl = document.getElementById("grid");
-    // The hidden editable element that actually owns keyboard + clipboard focus (see #kbd CSS).
-    // Focus it — never the grid — so Firefox delivers `paste` events and every browser routes
-    // keydown here. A non-`grid` focus target is invisible to the user: the renderer draws its
-    // own cursor from the view, not from browser focus.
+    // The element that owns keyboard + clipboard focus. Focus it — never the grid — so
+    // Firefox delivers `paste` events and every browser routes keydown here. It's invisible
+    // to the user: the renderer draws its own cursor from the view, not from browser focus.
     const kbdEl = document.getElementById("kbd");
-    const focusInput = () => kbdEl.focus();
+
+    // IME caret tracking. The OS positions the IME candidate window and the macOS
+    // press-and-hold accent menu at the *focused element's* caret. Parking a hidden textarea
+    // over the drawn cursor is enough for Firefox (it re-queries the textarea's layout live),
+    // but NOT for Chrome: Chrome reports caret bounds to the OS only when the text/selection
+    // changes, not when the element is moved by CSS, so the popup stays pinned to the
+    // textarea's focus-time origin (top-left). The EditContext API is the supported fix for
+    // an editor that draws its own cursor — it lets us report the caret bounds explicitly
+    // (`updateSelectionBounds`), independent of where the host element sits. When available
+    // (Chrome 121+), route focus + keys to a bare <div> carrying an EditContext; Firefox
+    // lacks EditContext and keeps using the textarea. `imeEl` is whichever owns focus.
+    let editCtx = null;
+    let imeEl = kbdEl;
+    if ("EditContext" in window) {
+      const ed = document.createElement("div");
+      ed.id = "ime";
+      ed.tabIndex = -1;
+      ed.setAttribute("aria-hidden", "true");
+      document.body.appendChild(ed);
+      editCtx = new EditContext();
+      ed.editContext = editCtx;
+      imeEl = ed;
+    }
+    const focusInput = () => imeEl.focus();
     const statusEl = document.getElementById("status");
 
     let view = null;          // the latest redraw frame (the server's View map)
@@ -367,7 +407,7 @@
       wideFitCache.set(cp, scale);
       return scale;
     }
-    function cellBoxSpan(ch, cls, css) {
+    function cellBoxSpan(ch, cls, css, id) {
       const cp = ch.codePointAt(0);
       const cells = charWidth(cp) || 1;
       const boxW = cells * cw;
@@ -382,7 +422,7 @@
       // bleed into — and be overpainted by — the following segment's background.
       const scale = cells === 2 ? wideFitScale(cp, boxW) : 1;
       const tf = scale < 1 ? `transform:scale(${scale.toFixed(3)});` : "";
-      return `<span class="${cls}" style="display:inline-block;width:${boxW.toFixed(3)}px;text-align:center;${indent}${tf}${css || ""}">${escapeHtml(ch)}</span>`;
+      return `<span${id ? ` id="${id}"` : ""} class="${cls}" style="display:inline-block;width:${boxW.toFixed(3)}px;text-align:center;${indent}${tf}${css || ""}">${escapeHtml(ch)}</span>`;
     }
 
     // ============================================================================
@@ -1130,6 +1170,7 @@
       if (view.float) renderContentFloat(view.float, tablineRows);
       renderCommand(cmdRow);
       gcImages(); // free blob URLs for previews no longer shown
+      positionImeProxy(); // keep the hidden IME proxy over the cursor so composition popups follow it
     }
 
     function winRect(w) {
@@ -1423,7 +1464,11 @@
         }
         // A wide glyph or boxed symbol breaks the run and renders in its own fixed-width
         // box; a wide glyph's empty continuation cell (next column) then adds nothing.
-        if (cellNeedsBox(cells[c].ch)) { flush(); out += cellBoxSpan(cells[c].ch, cls, css); continue; }
+        const isCursorCell = isFocused && row === cursorRow && c === cursorCol;
+        if (cellNeedsBox(cells[c].ch)) { flush(); out += cellBoxSpan(cells[c].ch, cls, css, isCursorCell ? CURSOR_ID : null); continue; }
+        // The cursor cell is emitted as its own id-tagged span so the off-screen IME
+        // proxy can be parked over it (see positionImeProxy).
+        if (isCursorCell) { flush(); out += `<span id="${CURSOR_ID}" class="${cls}">${escapeHtml(cells[c].ch)}</span>`; continue; }
         if (cls !== runCls || css !== runCss) { flush(); runCls = cls; runCss = css; }
         run += cells[c].ch;
       }
@@ -1433,7 +1478,7 @@
         if (p[1] >= cells.length) out += virtChunksHtml(p[3]);
       }
       if (isFocused && row === cursorRow && cursorCol >= cells.length) {
-        out += `<span class="${cursorClass()}"> </span>`;
+        out += `<span id="${CURSOR_ID}" class="${cursorClass()}"> </span>`;
       }
       // Extmark end-of-line virtual text: a one-cell gap, then each placement's
       // chunks in order, painted in the empty space past the line.
@@ -1462,6 +1507,41 @@
         out += `<span${vcss ? ` style="${vcss}"` : ""}> ${escapeHtml(text)}</span>`;
       }
       return html + out;
+    }
+
+    // The id parked on the focused cursor cell (editor or command line) each frame, so the
+    // IME caret can be reported there — see `positionImeProxy`.
+    const CURSOR_ID = "nx-cursor";
+    // The last cursor-cell rect we reported to the IME, exposed for the verifier (it can't
+    // observe the OS-drawn popup, so it checks we hand the right bounds to the browser).
+    let lastImeRect = null;
+
+    // Tell the OS where the IME caret is, so a CJK composition popup / the macOS accent menu
+    // anchors to the drawn cursor instead of the editor's top-left. Two mechanisms:
+    //   • Chrome (EditContext): report the cursor cell's bounds via `updateSelectionBounds`
+    //     (and the editor region via `updateControlBounds`). The host element's own position
+    //     is irrelevant; Chrome won't re-read a CSS-moved textarea's caret, so we must report
+    //     bounds explicitly.
+    //   • Firefox (no EditContext): park the hidden #kbd textarea over the cursor cell; the
+    //     OS reads its caret there live.
+    // The cursor cell carries `CURSOR_ID`; if none is on screen (no focus, or a mode that
+    // draws no cursor) leave things as they were — composition can't happen without a cursor.
+    function positionImeProxy() {
+      const cur = document.getElementById(CURSOR_ID);
+      if (!cur) return;
+      const r = cur.getBoundingClientRect();
+      lastImeRect = { left: r.left, top: r.top, width: r.width, height: r.height };
+      if (editCtx) {
+        editCtx.updateControlBounds(gridEl.getBoundingClientRect());
+        editCtx.updateSelectionBounds(r);
+        return;
+      }
+      // Firefox path: #kbd is `position: absolute` (no scroll → viewport coords), so the
+      // rect maps straight to left/top. Size it to the cell so the caret lands at its top-left.
+      kbdEl.style.left = r.left + "px";
+      kbdEl.style.top = r.top + "px";
+      kbdEl.style.width = Math.max(1, r.width) + "px";
+      kbdEl.style.height = Math.max(1, r.height) + "px";
     }
 
     function cursorClass() {
@@ -1697,18 +1777,21 @@
           cls = "inlay";
         }
         // Cursor only in the focused window (see the other render path above).
-        if (isFocused && cursorRow === row && painted === cursorPainted) cls = cursorClass();
+        const isCursorCell = isFocused && cursorRow === row && painted === cursorPainted;
+        if (isCursorCell) cls = cursorClass();
         const style = (a < 0) ? cell.base : (COLOR_OWNED.has(cls) ? "" : cell.base);
         // A wide glyph or boxed symbol renders in its own fixed-width box (see
         // cellBoxSpan); a wide glyph's empty continuation cell then adds nothing.
-        if (cellNeedsBox(cell.ch)) { flush(); out += cellBoxSpan(cell.ch, cls, style); painted += 1; continue; }
+        if (cellNeedsBox(cell.ch)) { flush(); out += cellBoxSpan(cell.ch, cls, style, isCursorCell ? CURSOR_ID : null); painted += 1; continue; }
+        // The cursor cell is id-tagged so the off-screen IME proxy can follow it.
+        if (isCursorCell) { flush(); out += `<span id="${CURSOR_ID}" class="${cls}"${style ? ` style="${style}"` : ""}>${escapeHtml(cell.ch)}</span>`; painted += 1; continue; }
         if (cls !== runCls || style !== runStyle) { flush(); runCls = cls; runStyle = style; }
         run += cell.ch;
         painted += 1;
       }
       flush();
       if (isFocused && cursorRow === row && cursorPainted >= painted) {
-        out += `<span class="${cursorClass()}"> </span>`;
+        out += `<span id="${CURSOR_ID}" class="${cursorClass()}"> </span>`;
       }
       const virt = w.diagnostics_virt?.[row];
       if (virt) {
@@ -2391,9 +2474,9 @@
         const chars = [...text];
         let html = "";
         for (let i = 0; i < chars.length; i++) {
-          html += i === curIdx ? `<span class="cur-block">${escapeHtml(chars[i])}</span>` : escapeHtml(chars[i]);
+          html += i === curIdx ? `<span id="${CURSOR_ID}" class="cur-block">${escapeHtml(chars[i])}</span>` : escapeHtml(chars[i]);
         }
-        if (curIdx >= chars.length) html += `<span class="cur-block"> </span>`;
+        if (curIdx >= chars.length) html += `<span id="${CURSOR_ID}" class="cur-block"> </span>`;
         el.innerHTML = html;
       } else if (view.message) {
         el.textContent = view.message;
@@ -2654,7 +2737,10 @@
       } catch (e) { return { ok: false, error: String(e?.message || e) }; }
     }
 
-    kbdEl.addEventListener("keydown", (e) => {
+    // Keys are handled on whichever proxy holds focus — the #kbd textarea (Firefox) or the
+    // EditContext-host #ime div (Chrome). Bind both so focus landing on either is covered;
+    // only one is ever focused, so a key fires the handler once.
+    const onProxyKeydown = (e) => {
       if (e.key === "F5" || e.key === "F12") return;
       if (e.metaKey && !e.ctrlKey) return; // leave browser Cmd-shortcuts alone
       const n = keyToNotation(e);
@@ -2667,7 +2753,52 @@
       // the key (the picker must fire synchronously here to keep the user gesture).
       if (n === "<CR>" && tryFilePickerIntercept()) return;
       feedOp(n);
-    });
+    };
+    for (const el of (imeEl === kbdEl ? [kbdEl] : [kbdEl, imeEl])) el.addEventListener("keydown", onProxyKeydown);
+
+    if (editCtx) {
+      // Chrome IME path. Composed / accented / IME-committed text is delivered as a
+      // `textupdate` on the EditContext (NOT via keydown — those are key 229/`Process`,
+      // which `keyToNotation` drops). Feed the committed text to the editor, then reset the
+      // EditContext's own buffer so its offsets never drift (nxvim renders the text, not the
+      // EditContext). We only feed once composition is *done*: intermediate `textupdate`s
+      // during composition carry the in-progress pre-edit, which we don't paint inline, so
+      // feeding them would insert partial garbage. The press-and-hold accent menu fires a
+      // single `textupdate` with no surrounding composition, so it feeds immediately.
+      let composing = false;
+      const resetEditCtx = () => {
+        if (editCtx.text.length) editCtx.updateText(0, editCtx.text.length, "");
+        editCtx.updateSelection(0, 0);
+      };
+      editCtx.addEventListener("compositionstart", () => { composing = true; });
+      editCtx.addEventListener("textupdate", (e) => {
+        if (composing) return; // wait for compositionend (next handler) to feed the commit
+        if (e.text) feedOp(encodePaste(e.text));
+        resetEditCtx();
+      });
+      editCtx.addEventListener("compositionend", () => {
+        composing = false;
+        const text = editCtx.text;
+        if (text) feedOp(encodePaste(text));
+        resetEditCtx();
+      });
+      // The OS asks for the on-screen rect of each composing character (it can't read our
+      // canvas-style cursor); we don't lay the pre-edit out inline, so anchor every requested
+      // character at the cursor cell. Keeps the candidate window glued to the cursor.
+      editCtx.addEventListener("characterboundsupdate", (e) => {
+        const cur = document.getElementById(CURSOR_ID);
+        if (!cur) return;
+        const r = cur.getBoundingClientRect();
+        const bounds = [];
+        for (let i = e.rangeStart; i < e.rangeEnd; i++) bounds.push(r);
+        editCtx.updateCharacterBounds(e.rangeStart, bounds);
+      });
+    } else {
+      // Firefox path: re-anchor the textarea right as composition begins / updates (the
+      // cursor doesn't move during composition, so no `render()` fires to reposition it).
+      kbdEl.addEventListener("compositionstart", positionImeProxy);
+      kbdEl.addEventListener("compositionupdate", positionImeProxy);
+    }
 
     // ============================================================================
     // Mouse. Core owns the hit-test from a global screen cell to a window + buffer
@@ -2837,13 +2968,20 @@
     // Refresh the `"+`/`"*` read mirror whenever the editor (re)gains focus — switching back
     // from another app/tab is the moment an external copy needs to become visible to `"+p`.
     window.addEventListener("focus", refreshClipboard);
-    kbdEl.addEventListener("focus", refreshClipboard);
-    // The OS paste gesture (Cmd/Ctrl+V, Edit▸Paste, middle-click) lands on the editable input
-    // proxy (a plain <div> never gets `paste` in Firefox) — the direct, no-permission-chip path
-    // to paste, so the user never has to coax the clipboard awake. Re-focus afterwards in case
-    // the gesture (e.g. the Edit menu) moved focus away, and clear any text the browser slipped
-    // into the textarea before `onPaste`'s preventDefault could fire.
-    kbdEl.addEventListener("paste", (e) => { onPaste(e); kbdEl.value = ""; focusInput(); });
+    // The OS paste gesture (Cmd/Ctrl+V, Edit▸Paste, middle-click) lands on the *focused*
+    // input proxy — the #kbd textarea on Firefox (a plain <div> never gets `paste` there), or
+    // the EditContext-host #ime div on Chrome (an editing host, so Chrome does fire `paste` on
+    // it — verified). Bind both proxies so whichever is focused is covered; only one is ever
+    // focused, so no double paste. This is the direct, no-permission-chip path, so the user
+    // never has to coax the clipboard awake. Re-focus afterwards in case the gesture moved
+    // focus away, and clear any text the browser slipped into the textarea before `onPaste`'s
+    // preventDefault could fire.
+    const onProxyPaste = (e) => { onPaste(e); kbdEl.value = ""; focusInput(); };
+    const proxies = imeEl === kbdEl ? [kbdEl] : [kbdEl, imeEl];
+    for (const el of proxies) {
+      el.addEventListener("focus", refreshClipboard);
+      el.addEventListener("paste", onProxyPaste);
+    }
 
     // ============================================================================
     // Boot: measure, create the highlighter, then let the Worker's "ready" attach.
@@ -2889,6 +3027,10 @@
         return fw ? { row: fw.cursor_row, col: fw.cursor_col, screenCol: fw.cursor_screen_col } : null;
       },
       mode: () => latest.frame?.mode_label ?? "",
+      // IME caret tracking, for the verifier: which path is live (Chrome EditContext vs the
+      // Firefox textarea) and the last cursor-cell rect handed to the OS. The OS-drawn popup
+      // itself isn't observable from the page, so the test asserts on the reported bounds.
+      ime: () => ({ editContext: !!editCtx, rect: lastImeRect }),
       cmdline: () => (latest.frame?.command_mode ? promptStr(latest.frame) + latest.frame.cmdline : ""),
       message: () => latest.frame?.message ?? "",
       messageError: () => latest.frame?.message_error === true,

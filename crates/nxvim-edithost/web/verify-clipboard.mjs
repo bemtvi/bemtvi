@@ -74,7 +74,9 @@ async function pasteGesture(page, text) {
   await page.evaluate((t) => {
     const dt = new DataTransfer();
     dt.setData("text/plain", t);
-    // Dispatch on the editable input proxy (#kbd) — the real paste target in every browser.
+    // Dispatch on the editable input proxy (#kbd) — a real paste fires on whichever proxy is
+    // focused (#kbd on Firefox, the EditContext-host #ime div on Chrome), and the handler is
+    // bound to both, so dispatching on #kbd exercises the same onPaste path.
     document.getElementById("kbd").dispatchEvent(
       new ClipboardEvent("paste", { clipboardData: dt, bubbles: true, cancelable: true }),
     );

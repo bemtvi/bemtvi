@@ -2,9 +2,37 @@
 //! soft-tab-aware backspace.
 
 use super::*;
+use crate::editor::syntax::indent_width;
 use crate::input::{Key, KeyCode};
 use crate::mode::Mode;
 use crate::unicode;
+
+/// The closing delimiter an opener auto-pairs to (`(`→`)`, `[`→`]`, `{`→`}`), or
+/// `None` for anything that isn't an auto-paired opener.
+fn close_of(open: char) -> Option<char> {
+    match open {
+        '(' => Some(')'),
+        '[' => Some(']'),
+        '{' => Some('}'),
+        _ => None,
+    }
+}
+
+/// Whether `c` is an auto-paired closing bracket.
+fn is_close_bracket(c: char) -> bool {
+    matches!(c, ')' | ']' | '}')
+}
+
+/// Whether `c` is an auto-paired quote delimiter.
+fn is_quote(c: char) -> bool {
+    matches!(c, '\'' | '"')
+}
+
+/// Whether `c` is a word (identifier) character — a letter, digit, or `_`. Used
+/// by the auto-pairs guards that suppress a pair next to a word.
+fn is_word_char(c: char) -> bool {
+    c.is_alphanumeric() || c == '_'
+}
 
 impl Editor {
     /// Enter Insert mode at a per-cursor target column. `target` is evaluated at
@@ -35,15 +63,54 @@ impl Editor {
     /// the per-cursor primitive behind insert-mode `Enter`, run at every cursor via
     /// [`Editor::for_each_cursor`].
     fn insert_newline(&mut self) {
+        // Auto-pairs block expansion: a newline pressed *between* an open/close
+        // bracket pair lays the closer on its own dedented line and parks the
+        // cursor on a blank line one level deeper — `{|}` + <CR> becomes
+        // `{` / `····|` / `}`.
+        let expand = self.buffer().options.autopairs
+            && self.mode == Mode::Insert
+            && matches!(
+                (self.char_before_cursor(), self.char_after_cursor()),
+                (Some(o), Some(n)) if close_of(o) == Some(n)
+            );
         let at = self.cursor_char();
         self.buffer_mut().insert_char(at, '\n');
         self.cursor.line += 1;
+        // The split leaves the cursor at the start of the new line; the
+        // non-expand path overwrites this via `set_line_indent`, but the
+        // expansion below reads the cursor position, so set it explicitly.
+        self.cursor.col = 0;
         self.buffer_mut().modified = true;
         self.buffer_mut().normalize();
-        // Auto-indent the new line (treesitter, else copy-previous, else 0) and
-        // park the cursor past the indent — vim's `Enter` behavior.
+        if expand {
+            self.expand_pair_newline();
+            return;
+        }
+        // Auto-indent the new line (treesitter, else smart/auto-indent, else 0)
+        // and park the cursor past the indent — vim's `Enter` behavior.
         let width = self.indent_for(self.cursor.line);
         self.cursor.col = self.set_line_indent(self.cursor.line, width);
+    }
+
+    /// Finish an auto-pairs `<CR>` block expansion. On entry the opener line is
+    /// `cursor.line - 1` and the cursor sits at column 0 of the line now holding
+    /// the closer. Split off a blank middle line, indent the closer to the
+    /// opener's level and the middle line one shiftwidth deeper, and leave the
+    /// cursor on the middle line past its indent.
+    fn expand_pair_newline(&mut self) {
+        let opts = self.buffer().options;
+        let base = indent_width(
+            &self.buffer().line(self.cursor.line - 1),
+            opts.effective_tabstop(),
+        );
+        // A second newline before the closer leaves the cursor on a blank line
+        // above it (the closer slides down to `cursor.line + 1`).
+        let at = self.cursor_char();
+        self.buffer_mut().insert_char(at, '\n');
+        self.buffer_mut().normalize();
+        self.set_line_indent(self.cursor.line + 1, base);
+        self.cursor.col =
+            self.set_line_indent(self.cursor.line, base + opts.effective_shiftwidth());
     }
 
     pub(crate) fn handle_insert(&mut self, key: Key) {
@@ -226,6 +293,13 @@ impl Editor {
     /// and advance past it. The per-cursor primitive [`handle_insert`] runs at
     /// every cursor via [`Editor::for_each_cursor`].
     fn insert_char_at_cursor(&mut self, c: char) {
+        let opts = self.buffer().options;
+        // Auto-pairs intercept (Insert mode only — Replace overtypes literally).
+        // When it handles the key it has already moved the cursor / inserted the
+        // pair, so there is nothing more to do.
+        if self.mode == Mode::Insert && opts.autopairs && self.autopair_insert(c) {
+            return;
+        }
         let at = self.cursor_char();
         if self.mode == Mode::Replace && self.cursor.col < self.line_len() {
             let s = self.buffer().line(self.cursor.line);
@@ -236,6 +310,176 @@ impl Editor {
         self.buffer_mut().insert_char(at, c);
         self.cursor.col += c.len_utf8();
         self.buffer_mut().modified = true;
+        // smartindent electric dedent: a closing bracket typed as the first
+        // non-blank char of a line re-indents that line to its opener's level.
+        if self.mode == Mode::Insert && opts.smartindent && is_close_bracket(c) {
+            self.smartindent_close(c);
+        }
+    }
+
+    /// Auto-pairs handling for a typed `c` in Insert mode (the caller gates on the
+    /// buffer's `autopairs` option). Returns `true` when it fully handled the
+    /// keystroke — inserted a delimiter pair and parked the cursor between its
+    /// halves, or stepped past an already-present closer — and `false` to fall
+    /// through to the ordinary single-character insert.
+    ///
+    /// The auto-inserted closer is *not* recorded in the `".` accumulator; dot-
+    /// repeat replays the raw keystrokes and re-runs auto-pairs, so re-recording
+    /// the closer would double it.
+    fn autopair_insert(&mut self, c: char) -> bool {
+        let next = self.char_after_cursor();
+        // Step past a closer/quote the cursor already sits on, so typing the
+        // closer of an auto-inserted pair "types through" it instead of doubling.
+        if (is_close_bracket(c) || is_quote(c)) && next == Some(c) {
+            self.cursor.col += c.len_utf8();
+            return true;
+        }
+        if let Some(close) = close_of(c) {
+            // Don't pair an opener butted against a word char (`(` typed before
+            // `foo` stays a lone `(`) — the common auto-pairs guard.
+            if next.is_some_and(is_word_char) {
+                return false;
+            }
+            self.insert_pair(c, close);
+            return true;
+        }
+        if is_quote(c) {
+            // No pair for an apostrophe inside/next to a word (`don't`), before a
+            // word char, or when we appear to be closing a string already open on
+            // this line (an odd count of this quote before the cursor).
+            if self.char_before_cursor().is_some_and(is_word_char)
+                || next.is_some_and(is_word_char)
+                || self.quote_count_before_cursor(c) % 2 == 1
+            {
+                return false;
+            }
+            self.insert_pair(c, c);
+            return true;
+        }
+        false
+    }
+
+    /// Insert the `open`/`close` delimiter pair at the cursor and park the cursor
+    /// between them.
+    fn insert_pair(&mut self, open: char, close: char) {
+        let at = self.cursor_char();
+        self.buffer_mut().insert_char(at, open);
+        self.buffer_mut().insert_char(at + open.len_utf8(), close);
+        self.cursor.col += open.len_utf8();
+        self.buffer_mut().modified = true;
+    }
+
+    /// The character immediately to the right of the cursor on the current line
+    /// (the cell the cursor sits on), or `None` at end-of-line.
+    fn char_after_cursor(&self) -> Option<char> {
+        let s = self.buffer().line(self.cursor.line);
+        s.get(self.cursor.col..)
+            .and_then(|rest| rest.chars().next())
+    }
+
+    /// The character immediately to the left of the cursor on the current line,
+    /// or `None` at column 0.
+    fn char_before_cursor(&self) -> Option<char> {
+        let s = self.buffer().line(self.cursor.line);
+        s.get(..self.cursor.col)
+            .and_then(|head| head.chars().next_back())
+    }
+
+    /// Count of unescaped `q` quotes on the current line before the cursor — an
+    /// odd count means we're likely *inside* a `q`-delimited string, so a typed
+    /// `q` closes it rather than opening a fresh pair.
+    fn quote_count_before_cursor(&self, q: char) -> usize {
+        let s = self.buffer().line(self.cursor.line);
+        let Some(prefix) = s.get(..self.cursor.col) else {
+            return 0;
+        };
+        let mut count = 0usize;
+        let mut escaped = false;
+        for ch in prefix.chars() {
+            if escaped {
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == q {
+                count += 1;
+            }
+        }
+        count
+    }
+
+    /// `<BS>` between an empty auto-paired delimiter pair (`(|)`, `"|"`, …):
+    /// delete both halves at once. Returns `true` when it handled the delete. The
+    /// caller gates on the `autopairs` option and a non-zero cursor column.
+    fn autopair_backspace(&mut self) -> bool {
+        let (Some(prev), Some(next)) = (self.char_before_cursor(), self.char_after_cursor()) else {
+            return false;
+        };
+        let paired = close_of(prev) == Some(next) || (is_quote(prev) && prev == next);
+        if !paired {
+            return false;
+        }
+        let line_start = self.buffer().line_start(self.cursor.line);
+        let from = self.cursor.col - prev.len_utf8();
+        let to = self.cursor.col + next.len_utf8();
+        self.buffer_mut().remove(line_start + from..line_start + to);
+        self.cursor.col = from;
+        self.buffer_mut().modified = true;
+        self.trim_insert_text(1); // the opener char the user had typed
+        true
+    }
+
+    /// `smartindent` electric dedent: after a closing bracket is typed as the
+    /// first non-blank character of its line, re-indent the line to the column of
+    /// the line holding its matching opener, and keep the cursor just past the
+    /// closer. The caller gates on the `smartindent` option.
+    fn smartindent_close(&mut self, c: char) {
+        let s = self.buffer().line(self.cursor.line);
+        let closer_at = self.cursor.col - c.len_utf8();
+        // Only when nothing but whitespace precedes the just-typed closer.
+        if !s.get(..closer_at).unwrap_or("").trim().is_empty() {
+            return;
+        }
+        let Some(open_line) = self.matching_open_line(c, closer_at) else {
+            return;
+        };
+        let tabstop = self.buffer().options.effective_tabstop();
+        let width = indent_width(&self.buffer().line(open_line), tabstop);
+        let col = self.set_line_indent(self.cursor.line, width);
+        self.cursor.col = col + c.len_utf8();
+    }
+
+    /// The line holding the unmatched opener that pairs with the closer `c` typed
+    /// at byte column `closer_at` on the cursor line — a backward bracket-depth
+    /// scan from just before the closer. `None` when the brackets don't balance.
+    /// Strings and comments aren't recognized; this is a best-effort smartindent
+    /// heuristic, not a parser.
+    fn matching_open_line(&self, c: char, closer_at: usize) -> Option<usize> {
+        let open = match c {
+            ')' => '(',
+            ']' => '[',
+            '}' => '{',
+            _ => return None,
+        };
+        let mut depth = 1i32;
+        let mut upto = closer_at; // the cursor line is scanned only up to the closer
+        let mut l = self.cursor.line as isize;
+        while l >= 0 {
+            let s = self.buffer().line(l as usize);
+            let slice = s.get(..upto).unwrap_or(s.as_str());
+            for ch in slice.chars().rev() {
+                if ch == c {
+                    depth += 1;
+                } else if ch == open {
+                    depth -= 1;
+                    if depth == 0 {
+                        return Some(l as usize);
+                    }
+                }
+            }
+            upto = usize::MAX; // whole line for every line above the cursor line
+            l -= 1;
+        }
+        None
     }
 
     /// Insert the named register's text at every cursor — the `<C-r>{register}`
@@ -326,6 +570,9 @@ impl Editor {
 
     fn insert_backspace(&mut self, soft_tab: Option<(usize, usize)>) {
         if self.cursor.col > 0 {
+            if self.buffer().options.autopairs && self.autopair_backspace() {
+                return;
+            }
             if self.softtab_backspace(soft_tab) {
                 return;
             }

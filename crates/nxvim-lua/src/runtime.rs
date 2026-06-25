@@ -271,6 +271,13 @@ pub struct BoMirror {
     pub shiftwidth: usize,
     pub softtabstop: isize,
     pub expandtab: bool,
+    /// The buffer's `'autoindent'` / `'smartindent'` flags (the grammar-free
+    /// indent fallbacks) and `'autopairs'` flag (bracket/quote auto-pairing),
+    /// mirrored so `vim.bo.autoindent` / `.smartindent` / `.autopairs` read the
+    /// core's value regardless of who set it (`:set`, `vim.bo`).
+    pub autoindent: bool,
+    pub smartindent: bool,
+    pub autopairs: bool,
     /// The buffer's *effective* `'regexsyntax'` dialect (`"pcre"`/`"vim"`) — its
     /// local override resolved against the global, so `vim.bo.regexsyntax` reads
     /// what `/`/`:s` actually use in this buffer.

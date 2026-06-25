@@ -109,6 +109,11 @@ local O_BUF = {
   sts = true,
   expandtab = true,
   et = true,
+  autoindent = true,
+  ai = true,
+  smartindent = true,
+  si = true,
+  autopairs = true,
 }
 -- Global (editor-wide) options: canonical name keyed by name and abbreviation.
 local O_GLOBAL = {
@@ -812,6 +817,14 @@ local BUF_OPT_CANON = {
   sts = "softtabstop",
   expandtab = "expandtab",
   et = "expandtab",
+  -- The grammar-free indent fallbacks (`autoindent`/`smartindent`) and the
+  -- bracket/quote auto-pairing toggle (`autopairs`); writes reach the live
+  -- editor, reads return the core's value.
+  autoindent = "autoindent",
+  ai = "autoindent",
+  smartindent = "smartindent",
+  si = "smartindent",
+  autopairs = "autopairs",
   -- The buffer-local override of the global `regexsyntax` dialect for `/` and
   -- `:s`. `nx.bo.regexsyntax = "vim"` pins this buffer; reads return the
   -- *effective* dialect (the override resolved against the global).
@@ -848,6 +861,9 @@ local BUF_OPT_DEFAULT = {
   shiftwidth = 0,
   softtabstop = -1,
   expandtab = false,
+  autoindent = false,
+  smartindent = false,
+  autopairs = false,
   regexsyntax = "pcre",
   fileencoding = "utf-8",
   bomb = false,

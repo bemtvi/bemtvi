@@ -37,6 +37,8 @@ mod fileformat;
 mod global_cmd;
 #[path = "editing/highlights.rs"]
 mod highlights;
+#[path = "editing/indent_pairs.rs"]
+mod indent_pairs;
 #[path = "editing/jumplist.rs"]
 mod jumplist;
 #[path = "editing/listings.rs"]

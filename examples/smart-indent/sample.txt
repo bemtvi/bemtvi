@@ -1,0 +1,24 @@
+Smart indenting & auto-pairs playground.
+
+This buffer has no filetype, so tree-sitter never indents it — the autoindent /
+smartindent / autopairs options from init.lua are what's doing the work.
+
+Move below this line, press `i`, and try the recipes from init.lua:
+
+
+
+
+Reference (what you should be able to produce by typing, not by hand-indenting):
+
+  if cond {
+    work
+  }
+
+  fn(arg) {
+    body
+  }
+
+  list = [
+    one,
+    two,
+  ]

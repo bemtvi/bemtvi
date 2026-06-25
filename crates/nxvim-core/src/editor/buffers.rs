@@ -160,6 +160,12 @@ impl Editor {
         };
         if name == "expandtab" {
             ob.buffer.options.expandtab = value;
+        } else if name == "autoindent" {
+            ob.buffer.options.autoindent = value;
+        } else if name == "smartindent" {
+            ob.buffer.options.smartindent = value;
+        } else if name == "autopairs" {
+            ob.buffer.options.autopairs = value;
         } else if name == "bomb" {
             ob.buffer.options.bomb = value;
         } else if name == "modifiable" {

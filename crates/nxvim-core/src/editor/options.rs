@@ -97,6 +97,9 @@ impl Editor {
             "relative_docks" => &mut self.options.relative_docks,
             "equalalways" => &mut self.options.equalalways,
             "expandtab" => &mut self.buffer_mut().options.expandtab,
+            "autoindent" => &mut self.buffer_mut().options.autoindent,
+            "smartindent" => &mut self.buffer_mut().options.smartindent,
+            "autopairs" => &mut self.buffer_mut().options.autopairs,
             "bomb" => &mut self.buffer_mut().options.bomb,
             "modifiable" => &mut self.buffer_mut().options.modifiable,
             // A name `resolve_set` accepted as a boolean but no arm above handles is a

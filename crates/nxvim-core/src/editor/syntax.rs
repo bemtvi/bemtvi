@@ -30,7 +30,7 @@ pub(crate) fn fill_indent(start: usize, target: usize, tabstop: usize, expandtab
 /// Visual-column width of `line`'s leading whitespace: spaces count one cell, a
 /// tab advances to the next `tabstop` boundary. The inverse of [`fill_indent`],
 /// used to read a line's existing indent depth for copy-previous autoindent.
-fn indent_width(line: &str, tabstop: usize) -> usize {
+pub(crate) fn indent_width(line: &str, tabstop: usize) -> usize {
     let mut col = 0;
     for b in line.bytes() {
         match b {
@@ -324,9 +324,12 @@ impl Editor {
 
     /// Target indent **width in columns** for `line` of the current buffer, the
     /// single policy + fallback chain behind every auto-indent site (`o`/`O`,
-    /// insert-mode `Enter`, the `=` operators). Treesitter first; then, only when
-    /// ts-indent is *active* for the buffer but inconclusive for this line,
-    /// copy-the-previous-non-blank-line's indent; then column 0.
+    /// insert-mode `Enter`, the `=` operators). Treesitter first (the engine's
+    /// `indents.scm`, vim's `indentexpr`); with no treesitter verdict the
+    /// grammar-free fallbacks take over, in vim's precedence: `smartindent`
+    /// (bracket-aware) over plain `autoindent` (copy-previous). The legacy
+    /// copy-previous that ts-indent leans on when its query is *available* but
+    /// inconclusive for this line still fires too. Otherwise column 0.
     ///
     /// Syncs the engine first so the query sees the just-inserted `\n` (and any
     /// edits since the last redraw) — currency is required for a correct verdict.
@@ -344,8 +347,53 @@ impl Editor {
             Some(s) => (s.indent(buf, line, &p), s.indents_available(buf)),
             None => (None, false),
         };
-        ts.or_else(|| available.then(|| self.autoindent_copy_prev(line)).flatten())
-            .unwrap_or(0)
+        if let Some(w) = ts {
+            return w;
+        }
+        // `smartindent` (bracket-aware) takes precedence over plain `autoindent`.
+        if opts.smartindent {
+            return self.smartindent_for(line);
+        }
+        // `autoindent`, or the ts-available-but-inconclusive copy-previous the
+        // engine has always leaned on, copies the previous non-blank line's indent.
+        if opts.autoindent || available {
+            return self.autoindent_copy_prev(line).unwrap_or(0);
+        }
+        0
+    }
+
+    /// `smartindent` target indent **width in columns** for a freshly-opened
+    /// `line`: the previous non-blank line's indent, plus one shiftwidth when that
+    /// line *opens* a block — its last non-blank character is `{`, `(`, or `[`.
+    /// The bracket-aware grammar-free autoindent (vim's `smartindent`), built on
+    /// the same copy-previous base as [`Self::autoindent_copy_prev`]. The matching
+    /// dedent when a *closing* bracket is typed lives on the insert path
+    /// (`smartindent_close`), since it reacts to a keystroke, not a new line.
+    fn smartindent_for(&self, line: usize) -> usize {
+        let opts = self.buffer().options;
+        let tabstop = opts.effective_tabstop();
+        let Some(prev) = self.prev_nonblank_line(line) else {
+            return 0;
+        };
+        let text = self.buffer().line(prev);
+        let base = indent_width(&text, tabstop);
+        if text.trim_end().ends_with(['{', '(', '[']) {
+            base + opts.effective_shiftwidth()
+        } else {
+            base
+        }
+    }
+
+    /// The nearest non-blank line strictly above `line`, or `None` if there is
+    /// none — the shared scan behind both grammar-free autoindents.
+    fn prev_nonblank_line(&self, line: usize) -> Option<usize> {
+        let mut r = line.checked_sub(1)?;
+        loop {
+            if !self.buffer().line(r).trim().is_empty() {
+                return Some(r);
+            }
+            r = r.checked_sub(1)?;
+        }
     }
 
     /// Copy the indent **width in columns** of the nearest non-blank line above
@@ -353,14 +401,8 @@ impl Editor {
     /// engine falls back to when its query is inconclusive.
     fn autoindent_copy_prev(&self, line: usize) -> Option<usize> {
         let tabstop = self.buffer().options.effective_tabstop();
-        let mut r = line.checked_sub(1)?;
-        loop {
-            let s = self.buffer().line(r);
-            if !s.trim().is_empty() {
-                return Some(indent_width(&s, tabstop));
-            }
-            r = r.checked_sub(1)?;
-        }
+        let prev = self.prev_nonblank_line(line)?;
+        Some(indent_width(&self.buffer().line(prev), tabstop))
     }
 
     /// Replace line `line`'s leading whitespace with indentation of visual width

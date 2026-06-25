@@ -789,6 +789,24 @@ pub struct BufferOptions {
     ///
     /// [`effective_softtabstop`]: BufferOptions::effective_softtabstop
     pub expandtab: bool,
+    /// Copy the previous line's indent onto a freshly-opened line (vim's
+    /// `autoindent`). The grammar-free base autoindent: it fires when there is no
+    /// treesitter verdict for the new line. Off by default, matching vim/neovim.
+    pub autoindent: bool,
+    /// Bracket-aware autoindent (vim's `smartindent`): a line opened after one
+    /// whose last non-blank char is `{`, `(`, or `[` gains one
+    /// [`shiftwidth`](BufferOptions::shiftwidth), and typing a closing bracket as
+    /// the first non-blank char of a line re-indents it to its opener's level.
+    /// Builds on the [`autoindent`](BufferOptions::autoindent) copy-previous base
+    /// and, like it, is the no-treesitter fallback. Off by default.
+    pub smartindent: bool,
+    /// Auto-pair the bracket and quote delimiters `(`, `[`, `{`, `'`, `"`
+    /// (nxvim's own, no vim equivalent): typing an opener inserts its closer and
+    /// parks the cursor between them, typing the closer over an auto-inserted one
+    /// steps past it, `<BS>` between an empty pair deletes both, and `<CR>`
+    /// between an open/close pair lays the closer on its own dedented line. Off by
+    /// default.
+    pub autopairs: bool,
     /// This buffer's `'regexsyntax'` override for `/` search and `:substitute`, or
     /// [`Inherit`](RegexSyntax::Inherit) (the default) to follow the global
     /// [`Options::regexsyntax`]. Resolved by [`crate::Editor::search_engine`].
@@ -827,6 +845,11 @@ impl Default for BufferOptions {
             shiftwidth: 0,
             softtabstop: -1,
             expandtab: false,
+            // Indent/auto-pair conveniences are opt-in (vim/neovim default them
+            // off); a config or filetype rule enables them.
+            autoindent: false,
+            smartindent: false,
+            autopairs: false,
             // No buffer-local override out of the box: follow the global option.
             regexsyntax: RegexSyntax::Inherit,
             // UTF-8 on disk by default; no BOM. Read detection (a later phase)
@@ -1103,6 +1126,27 @@ static OPTIONS: &[OptionInfo] = {
             kind: Bool,
             scope: Buffer,
             doc: "Insert spaces instead of a real <Tab> character.",
+        },
+        OptionInfo {
+            name: "autoindent",
+            abbrev: Some("ai"),
+            kind: Bool,
+            scope: Buffer,
+            doc: "Copy the indent of the previous line onto a new line.",
+        },
+        OptionInfo {
+            name: "smartindent",
+            abbrev: Some("si"),
+            kind: Bool,
+            scope: Buffer,
+            doc: "Bracket-aware autoindent: deeper after { ( [, dedent on closers.",
+        },
+        OptionInfo {
+            name: "autopairs",
+            abbrev: None,
+            kind: Bool,
+            scope: Buffer,
+            doc: "Auto-close and pair-edit brackets and quotes: ( [ { ' \".",
         },
         OptionInfo {
             name: "regexsyntax",

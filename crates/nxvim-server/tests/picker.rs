@@ -1309,6 +1309,123 @@ async fn buffers_picker_is_scoped_to_the_focused_layer() {
     );
 }
 
+// ===== the confirm target layer (`layer = "main" | "active"`) ==============
+
+/// A source declaring `layer = "main"` opens its confirmed file in the **main**
+/// editor layer, even when the picker was launched from a dock. Regression: the
+/// files/live_grep pickers opened into whatever layer had focus, so picking a file
+/// while focused in a sidebar dock yanked the document into the sidebar.
+#[tokio::test]
+async fn a_main_layer_source_opens_the_file_in_main_not_the_dock() {
+    let dir = temp_dir("picker_layer_main");
+    let target = dir.join("target.txt");
+    std::fs::write(&target, "alpha\nbeta\n").unwrap();
+    let init = format!(
+        r#"
+nx.picker.source({{
+  name = "myfiles",
+  layer = "main",
+  items = function(ctx) ctx.push({{ text = "target", path = "{}" }}) end,
+  confirm = function(item, mode, layer) nx.picker.edit(item, mode, layer) end,
+}})
+"#,
+        target.display()
+    );
+    let (rpc, mut incoming) = start(&dir, &init).await;
+
+    // A left dock with a scratch buffer; focus it and mark it.
+    exec_lua(&rpc, "nx.dock.open({ side = 'left', size = 20 })").await;
+    feed(&rpc, "idock<Esc>");
+    assert_eq!(lines(&rpc).await, vec!["dock"], "the dock buffer is marked");
+
+    // Open the picker from the dock and confirm the only file.
+    exec_lua(&rpc, "nx.picker.open('myfiles')").await;
+    poll_menu(&rpc, &mut incoming).await.expect("menu opens");
+    feed(&rpc, "<CR>");
+    nxvim_test_harness::barrier(&rpc).await;
+
+    // The file opened in the focused window — which is now the MAIN layer.
+    assert_eq!(
+        lines(&rpc).await,
+        vec!["alpha", "beta"],
+        "the file opened in the main layer"
+    );
+
+    // The dock is untouched: it still shows its scratch buffer. Under the bug the
+    // dock window would have been replaced by the file.
+    exec_lua(&rpc, "nx.dock.focus('left')").await;
+    assert_eq!(
+        lines(&rpc).await,
+        vec!["dock"],
+        "the dock buffer is unchanged — the file did not land in the sidebar"
+    );
+}
+
+/// The default (no `layer`, i.e. `"active"`): a source confirmed while focused in a
+/// dock opens its file IN that dock — the picker does not force every open to main,
+/// so a dock-local picker (like the layer-scoped `buffers` source) stays local.
+#[tokio::test]
+async fn an_active_layer_source_opens_the_file_in_the_focused_dock() {
+    let dir = temp_dir("picker_layer_active");
+    let target = dir.join("target.txt");
+    std::fs::write(&target, "alpha\nbeta\n").unwrap();
+    let init = format!(
+        r#"
+nx.picker.source({{
+  name = "myfiles",
+  items = function(ctx) ctx.push({{ text = "target", path = "{}" }}) end,
+  confirm = function(item, mode, layer) nx.picker.edit(item, mode, layer) end,
+}})
+"#,
+        target.display()
+    );
+    let (rpc, mut incoming) = start(&dir, &init).await;
+
+    exec_lua(&rpc, "nx.dock.open({ side = 'left', size = 20 })").await;
+    feed(&rpc, "idock<Esc>");
+
+    exec_lua(&rpc, "nx.picker.open('myfiles')").await;
+    poll_menu(&rpc, &mut incoming).await.expect("menu opens");
+    feed(&rpc, "<CR>");
+    nxvim_test_harness::barrier(&rpc).await;
+
+    // The file opened in the focused dock window.
+    assert_eq!(
+        lines(&rpc).await,
+        vec!["alpha", "beta"],
+        "the file opened in the focused dock"
+    );
+
+    // The main layer is untouched (still its empty [No Name] buffer).
+    exec_lua(&rpc, "nx.layer.main()").await;
+    assert_eq!(
+        lines(&rpc).await,
+        vec![""],
+        "main is untouched — the active-layer open stayed in the dock"
+    );
+}
+
+/// The shipped sources carry the right confirm target: `files` / `live_grep` open
+/// in `main` (they find documents to edit), `buffers` in `active` (it is scoped to
+/// the focused layer, so it must stay there — `:ls` semantics).
+#[tokio::test]
+async fn shipped_sources_declare_their_confirm_layer() {
+    let dir = temp_dir("picker_shipped_layers");
+    let (rpc, _incoming) = start(&dir, "").await;
+    assert_eq!(
+        exec_lua(&rpc, "return nx.picker._sources.files.layer").await,
+        Value::from("main"),
+    );
+    assert_eq!(
+        exec_lua(&rpc, "return nx.picker._sources.live_grep.layer").await,
+        Value::from("main"),
+    );
+    assert_eq!(
+        exec_lua(&rpc, "return nx.picker._sources.buffers.layer").await,
+        Value::from("active"),
+    );
+}
+
 // ===== default leader maps =================================================
 
 #[tokio::test]

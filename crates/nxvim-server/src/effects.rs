@@ -1321,12 +1321,19 @@ impl EditHost {
                 line,
                 col,
                 target,
+                to_main,
             } => {
                 // The picker has closed and returned focus by confirm time. The confirm
                 // gesture's target opens a fresh tab / split, or — for `Current` —
                 // navigates the focused window honoring 'switchbuf', reusing an open
                 // buffer without a reload/modified guard. See the op's doc comment.
+                // `to_main` (the source's `layer = "main"`) crosses out of a dock first,
+                // so a picked file lands in the editor and not the sidebar it was
+                // launched from.
                 use nxvim_lua::OpenTarget;
+                if to_main {
+                    self.editor.ensure_main_layer();
+                }
                 let p = std::path::Path::new(&path);
                 match target {
                     OpenTarget::Current => self.editor.jump_to(p, line, col),
@@ -1335,13 +1342,24 @@ impl EditHost {
                     OpenTarget::Vsplit => self.editor.jump_to_split(p, line, col, true),
                 }
             }
-            WindowOp::OpenSwitchbuf { path } => {
+            WindowOp::OpenSwitchbuf { path, to_main } => {
                 // Open honoring 'switchbuf' (the picker's location-less file confirm);
-                // no forced cursor — a reused window keeps its place.
+                // no forced cursor — a reused window keeps its place. `to_main` crosses
+                // out of a dock first (see `WindowOp::Jump`).
+                if to_main {
+                    self.editor.ensure_main_layer();
+                }
                 self.editor.open_path_switchbuf(std::path::Path::new(&path));
             }
-            WindowOp::BufSwitch { buf, target } => {
+            WindowOp::BufSwitch {
+                buf,
+                target,
+                to_main,
+            } => {
                 use nxvim_lua::OpenTarget;
+                if to_main {
+                    self.editor.ensure_main_layer();
+                }
                 let id = BufferId(buf);
                 match target {
                     OpenTarget::Current => self.editor.switch_to_buffer_switchbuf(id),

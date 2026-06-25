@@ -266,7 +266,7 @@ impl Editor {
     /// shared prelude of every tab operation: `switch_tab`/`new_tab` swap
     /// [`Editor::windows`], which must hold the *main* tree (never a dock's) so a
     /// dock never gets stashed into a tab slot.
-    pub(crate) fn ensure_main_layer(&mut self) {
+    pub fn ensure_main_layer(&mut self) {
         if self.focused_layer != Layer::Main {
             self.switch_layer(Layer::Main);
         }

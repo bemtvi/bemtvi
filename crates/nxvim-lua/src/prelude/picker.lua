@@ -139,6 +139,9 @@ function nx.picker.source(spec)
   if spec.preview ~= nil and spec.preview ~= "file" and spec.preview ~= "location" then
     error("nx.picker.source('" .. spec.name .. '\'): preview must be "file" or "location"', 2)
   end
+  if spec.layer ~= nil and spec.layer ~= "main" and spec.layer ~= "active" then
+    error("nx.picker.source('" .. spec.name .. '\'): layer must be "main" or "active"', 2)
+  end
   nx.picker._sources[spec.name] = spec
 end
 
@@ -152,6 +155,10 @@ end
 --   * `preview` — "file" / "location" / nil (no pane).
 --   * `prompt_pos` — "top" (default) / "bottom".
 --   * `debounce` — ms before a `dynamic` source re-runs on a query edit; `0` off.
+--   * `layer` — where a confirmed item opens: "main" crosses back to the main editor
+--     area first (so a file picked while focused in a dock lands in the editor, not
+--     the sidebar), "active" opens in the focused layer. Defaults to "active"; the
+--     shipped `files`/`live_grep` sources set "main", `buffers` stays "active".
 function nx.picker.open(name, opts)
   local source = nx.picker._sources[name]
   if not source then
@@ -166,7 +173,19 @@ function nx.picker.open(name, opts)
   if preview ~= nil and preview ~= "file" and preview ~= "location" then
     error('nx.picker.open: preview must be "file" or "location"', 2)
   end
-  nx._picker = { source = source, items = {}, gen = 0, on_cancel = nil, preview = preview }
+  -- Resolve the confirm target layer: per-open overrides per-source, default "active".
+  local layer = opts.layer
+  if layer == nil then
+    layer = source.layer
+  end
+  if layer == nil then
+    layer = "active"
+  end
+  if layer ~= "main" and layer ~= "active" then
+    error('nx.picker.open: layer must be "main" or "active"', 2)
+  end
+  nx._picker =
+    { source = source, items = {}, gen = 0, on_cancel = nil, preview = preview, layer = layer }
   local width = nx._geom.size(opts.width ~= nil and opts.width or source.width)
   local height = nx._geom.size(opts.height ~= nil and opts.height or source.height)
   -- Placement: `align` (a 9-grid word, default centered) + `margin` (a gap from the
@@ -373,8 +392,9 @@ end
 -- active picker is cleared (and a pending job reaped).
 -- `mode` is the confirm gesture's open mode — "current" (the focused window) or
 -- "tab" (the default `<C-t>` ⇒ a new tab) — forwarded to `source.confirm(item,
--- mode)`. Built-in sources honor it (see `nx.picker.edit`); a source that ignores
--- the second arg simply opens in the current window, as before.
+-- mode, layer)`. `layer` is the resolved confirm target ("main"/"active"); built-in
+-- sources honor both (see `nx.picker.edit`). A source that ignores the extra args
+-- simply opens in the current window, as before.
 function nx._picker_result(key, mode)
   local p = nx._picker
   nx._picker = nil
@@ -388,7 +408,7 @@ function nx._picker_result(key, mode)
   end
   local item = p.items[key]
   if item and p.source.confirm then
-    local ok, err = pcall(p.source.confirm, item, mode)
+    local ok, err = pcall(p.source.confirm, item, mode, p.layer)
     if not ok then
       nx.notify("nx.picker: confirm error: " .. tostring(err), "error")
     end
@@ -449,18 +469,24 @@ end
 -- `mode` is the confirm gesture: "tab"/"split"/"vsplit" (`<C-t>`/`<C-x>`/`<C-v>`)
 -- open in a NEW tab / split regardless of `'switchbuf'` (an explicit gesture);
 -- "current" (or nil) honors `'switchbuf'`.
-function nx.picker.edit(item, mode)
+--
+-- `layer` is the confirm target the picker resolved ("main"/"active"), forwarded to
+-- `confirm` and on to here. "main" crosses back to the main editor layer before
+-- opening, so a file picked while focused in a dock lands in the editor rather than
+-- the sidebar; "active" (or nil) opens in the focused layer.
+function nx.picker.edit(item, mode, layer)
   local col = math.max(0, (item.col or 1) - 1)
+  local to_main = layer == "main"
   if mode == "tab" or mode == "split" or mode == "vsplit" then
     -- A fresh tab / split for the file; located items land the cursor, plain opens
     -- start at the top.
-    nx._jump_to(item.path, item.row and (item.row - 1) or 0, item.row and col or 0, mode)
+    nx._jump_to(item.path, item.row and (item.row - 1) or 0, item.row and col or 0, mode, to_main)
   elseif item.row then
-    nx._jump_to(item.path, item.row - 1, col)
+    nx._jump_to(item.path, item.row - 1, col, nil, to_main)
   else
     -- Open honoring 'switchbuf' (a file already shown in another tab is focused
     -- there under the default `usetab`), not a plain `:edit` into this window.
-    nx._open(item.path)
+    nx._open(item.path, to_main)
   end
 end
 
@@ -472,6 +498,7 @@ end
 -- each path; returning ends the run. The stream is reaped on close via on_cancel.
 nx.picker.source({
   name = "files",
+  layer = "main", -- a picked file opens in the main editor, never a focused dock
   preview = "file", -- the preview pane shows the file's head
   items = nx.async(function(ctx)
     local stream =
@@ -489,8 +516,8 @@ nx.picker.source({
       end
     end
   end),
-  confirm = function(item, mode)
-    nx.picker.edit(item, mode)
+  confirm = function(item, mode, layer)
+    nx.picker.edit(item, mode, layer)
   end,
 })
 
@@ -498,6 +525,7 @@ nx.picker.source({
 -- matcher bypassed; the superseded job is reaped via ctx.on_cancel.
 nx.picker.source({
   name = "live_grep",
+  layer = "main", -- a grep hit opens in the main editor, never a focused dock
   dynamic = true,
   preview = "location", -- scroll the pane to the match and range-highlight it
   items = nx.async(function(ctx)
@@ -522,8 +550,8 @@ nx.picker.source({
       end
     end
   end),
-  confirm = function(item, mode)
-    nx.picker.edit(item, mode)
+  confirm = function(item, mode, layer)
+    nx.picker.edit(item, mode, layer)
   end,
 })
 
@@ -538,6 +566,7 @@ nx.picker.source({
 -- focused one.
 nx.picker.source({
   name = "buffers",
+  layer = "active", -- scoped to the focused layer, so a pick stays in that layer
   preview = "file", -- preview the buffer's backing file (named buffers only)
   items = function(ctx)
     local bufs = nx._bufs or {}
@@ -549,11 +578,13 @@ nx.picker.source({
       end
     end
   end,
-  confirm = function(item, mode)
+  confirm = function(item, mode, layer)
     -- The mode rides the bridge: "current" honors 'switchbuf' (a buffer shown in
     -- another tab is focused there under the default `usetab`); "tab"/"split"/
     -- "vsplit" (`<C-t>`/`<C-x>`/`<C-v>`) open it in a new tab / split regardless.
-    nx._buf_switch(item.bufnr, mode)
+    -- `layer == "main"` would cross out of a dock first; this source is "active", so
+    -- a pick stays in the focused layer — but an override is honored for symmetry.
+    nx._buf_switch(item.bufnr, mode, layer == "main")
   end,
 })
 

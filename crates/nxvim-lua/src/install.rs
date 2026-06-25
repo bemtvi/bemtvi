@@ -1351,13 +1351,21 @@ pub(crate) fn install_runtime_api(
     nx.set(
         "_jump_to",
         lua.create_function(
-            move |_, (path, line, col, mode): (String, usize, usize, Option<String>)| {
+            move |_,
+                  (path, line, col, mode, to_main): (
+                String,
+                usize,
+                usize,
+                Option<String>,
+                Option<bool>,
+            )| {
                 let target = crate::ops::OpenTarget::from_mode(mode.as_deref());
                 sh.borrow_mut().window_ops.push(WindowOp::Jump {
                     path,
                     line,
                     col,
                     target,
+                    to_main: to_main.unwrap_or(false),
                 });
                 Ok(())
             },
@@ -1366,23 +1374,28 @@ pub(crate) fn install_runtime_api(
     let sh = shared.clone();
     nx.set(
         "_open",
-        lua.create_function(move |_, path: String| {
-            sh.borrow_mut()
-                .window_ops
-                .push(WindowOp::OpenSwitchbuf { path });
+        lua.create_function(move |_, (path, to_main): (String, Option<bool>)| {
+            sh.borrow_mut().window_ops.push(WindowOp::OpenSwitchbuf {
+                path,
+                to_main: to_main.unwrap_or(false),
+            });
             Ok(())
         })?,
     )?;
     let sh = shared.clone();
     nx.set(
         "_buf_switch",
-        lua.create_function(move |_, (buf, mode): (u64, Option<String>)| {
-            let target = crate::ops::OpenTarget::from_mode(mode.as_deref());
-            sh.borrow_mut()
-                .window_ops
-                .push(WindowOp::BufSwitch { buf, target });
-            Ok(())
-        })?,
+        lua.create_function(
+            move |_, (buf, mode, to_main): (u64, Option<String>, Option<bool>)| {
+                let target = crate::ops::OpenTarget::from_mode(mode.as_deref());
+                sh.borrow_mut().window_ops.push(WindowOp::BufSwitch {
+                    buf,
+                    target,
+                    to_main: to_main.unwrap_or(false),
+                });
+                Ok(())
+            },
+        )?,
     )?;
     let sh = shared.clone();
     nx.set(

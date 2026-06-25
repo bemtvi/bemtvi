@@ -152,6 +152,20 @@
       return s.replace(/[&<>]/g, (c) => (c === "&" ? "&amp;" : c === "<" ? "&lt;" : "&gt;"));
     }
 
+    // Shorten `s` to at most `width` chars, keeping its head and tail and dropping the
+    // middle behind a single `…` when it won't fit — so a too-long preview path shows
+    // both its root and its filename instead of just the start. Codepoint-based (the
+    // `[...s]` spread) to match the server / native clients, not UTF-16 `.slice`.
+    function elideMiddle(s, width) {
+      const chars = [...s];
+      if (chars.length <= width) return s;
+      if (width <= 1) return chars.slice(0, width).join("");
+      const keep = width - 1; // one column for the `…`
+      const front = keep >> 1; // favour the tail (filename) with the larger half
+      const back = keep - front;
+      return chars.slice(0, front).join("") + "…" + chars.slice(chars.length - back).join("");
+    }
+
     // Display width of a Unicode code point in screen cells (0 / 1 / 2), matching the
     // server EXACTLY. The server lays columns out with `unicode-width` (UAX #11), so the
     // DOM renderer must agree codepoint-for-codepoint or the cursor / selection / search /
@@ -2073,7 +2087,7 @@
         header.className = "row";
         applySel(header);
         header.style.width = previewW * cw + "px";
-        header.textContent = String(pv.title ?? "").slice(0, previewW).padEnd(previewW);
+        header.textContent = elideMiddle(String(pv.title ?? ""), previewW).padEnd(previewW);
         pre.appendChild(header);
         const lines = pv.lines || [];
         const loc = pv.loc; // [row, col] (relative to lines[0]) or null

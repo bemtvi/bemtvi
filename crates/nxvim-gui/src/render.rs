@@ -2531,7 +2531,11 @@ impl Renderer {
             self.draw_glyph_vrule(items, sep_col, content_y0, menu.height, border);
             // The title header: the path on a sel-tinted bar across the pane.
             self.fill_cells(quads, px0, content_y0, preview_w, sel_bg);
-            let title = pmenu_row(&pv.title, "", preview_w as usize);
+            let title = pmenu_row(
+                &elide_middle(&pv.title, preview_w as usize),
+                "",
+                preview_w as usize,
+            );
             self.push_plain(items, &title, self.cell_px(px0, content_y0), fg, full);
             // The windowed file lines below the header (rows 1..content height).
             let content_h = menu.height.saturating_sub(1);
@@ -3410,6 +3414,26 @@ fn pmenu_start(selected: Option<usize>, rows: usize) -> usize {
 }
 
 /// One completion row padded to `width` cells: the `label` left-aligned and the
+/// Shorten `s` to at most `width` chars, keeping its head and tail and dropping the
+/// middle behind a single `…` when it won't fit — so a too-long preview path shows
+/// both its root and its filename instead of just the start. Mirrors the TUI's
+/// `elide_middle`.
+fn elide_middle(s: &str, width: usize) -> String {
+    let chars: Vec<char> = s.chars().collect();
+    if chars.len() <= width {
+        return s.to_string();
+    }
+    if width <= 1 {
+        return chars.iter().take(width).collect();
+    }
+    let keep = width - 1; // one column for the `…`
+    let front = keep / 2; // favour the tail (filename) with the larger half
+    let back = keep - front;
+    let head: String = chars[..front].iter().collect();
+    let tail: String = chars[chars.len() - back..].iter().collect();
+    format!("{head}…{tail}")
+}
+
 /// `detail` (a type/source hint) right-aligned when it fits after a one-cell gap;
 /// a too-long label is truncated. Mirrors the TUI's `pmenu_row`.
 fn pmenu_row(label: &str, detail: &str, width: usize) -> String {

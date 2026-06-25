@@ -2768,7 +2768,7 @@ fn render_preview(frame: &mut Frame, area: Rect, pv: &MenuPreview, palette: &[St
     let cap = area.height as usize;
     let mut lines: Vec<Line<'static>> = Vec::with_capacity(cap);
     lines.push(Line::from(Span::styled(
-        pmenu_row(&pv.title, "", w),
+        pmenu_row(&elide_middle(&pv.title, w), "", w),
         Style::default()
             .add_modifier(Modifier::DIM)
             .add_modifier(Modifier::BOLD),
@@ -3108,6 +3108,26 @@ pub fn pmenu_geometry(width: u16, height: u16, view: &View) -> Option<(u16, u16,
 /// `detail` (a type/source hint) right-aligned when it fits after a one-cell gap.
 /// A too-long label is truncated. Char-count widths are exact for the ASCII
 /// identifiers completion labels usually are.
+/// Shorten `s` to at most `width` chars, keeping its head and tail and dropping the
+/// middle behind a single `…` when it won't fit — so a too-long preview path shows
+/// both its root and its filename instead of just the start. Char-based, matching
+/// the rest of the picker's column math.
+fn elide_middle(s: &str, width: usize) -> String {
+    let chars: Vec<char> = s.chars().collect();
+    if chars.len() <= width {
+        return s.to_string();
+    }
+    if width <= 1 {
+        return chars.iter().take(width).collect();
+    }
+    let keep = width - 1; // one column for the `…`
+    let front = keep / 2; // favour the tail (filename) with the larger half
+    let back = keep - front;
+    let head: String = chars[..front].iter().collect();
+    let tail: String = chars[chars.len() - back..].iter().collect();
+    format!("{head}…{tail}")
+}
+
 fn pmenu_row(label: &str, detail: &str, width: usize) -> String {
     let label: String = label.chars().take(width).collect();
     let label_w = label.chars().count();

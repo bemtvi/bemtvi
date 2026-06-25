@@ -132,6 +132,7 @@ use nxvim_rpc::{connect, Incoming, Rpc};
 
 use crate::evloop::LoopEvent;
 use crate::host::{HostProc, ProcEvents, ProcSpec, StdHostProc};
+use crate::remote_config::{decode_config_bundle, RemoteConfigBundle};
 
 const FS_READ: &str = "fs_read";
 const FS_WRITE: &str = "fs_write";
@@ -2125,28 +2126,6 @@ fn encode_config_bundle(
 // `incoming` covers every leg, and concurrent writes from all legs serialize through
 // `Rpc`'s single out-channel.
 
-/// The daemon's config surface, decoded off a `config_bundle` reply: its `config_dir`,
-/// `runtimepath`, and every source file under those roots as `(abspath, bytes)`. Paths
-/// are the **daemon's** absolute paths; the edit-host mirrors the files onto a local
-/// cache and rebases the roots onto it (Phase 2) so a remote session runs the daemon's
-/// config + plugins locally.
-pub struct RemoteConfigBundle {
-    /// The daemon's config dir (`None` if it resolved none — no remote config).
-    pub config_dir: Option<String>,
-    /// The daemon's runtimepath, in load order (config dir + discovered plugins).
-    pub runtimepath: Vec<String>,
-    /// Every fetched source file: its daemon-absolute path and its bytes.
-    pub files: Vec<(String, Vec<u8>)>,
-    /// The daemon's installed tree-sitter parser languages — the client auto-installs
-    /// the same set locally (parsers are native, never fetched over the wire).
-    pub ts_languages: Vec<String>,
-    /// The daemon's working directory, to seed the edit-host's `DirState` so a remote
-    /// session's `:pwd` / `getcwd` / `:cd` operate on the daemon's cwd. `None` when the
-    /// daemon couldn't read it (or an older peer omitted it) — the edit-host keeps its
-    /// own local cwd. See `docs/plans/2026-06-23-remote-cwd.md`.
-    pub cwd: Option<String>,
-}
-
 /// The edit-host side of the config leg: a [`Rpc`] handle that fetches the daemon's
 /// config surface with one `config_bundle` request. Shares the single daemon link like
 /// the other seams (see [`connect_daemon`]); [`RemoteConfig::connect`] is the per-leg
@@ -2176,85 +2155,14 @@ impl RemoteConfig {
     /// would look like "the remote has no config".
     pub async fn fetch(&self) -> io::Result<RemoteConfigBundle> {
         match self.rpc.request(CONFIG_BUNDLE, vec![]).await {
-            Ok(v) => decode_config_bundle(v),
+            // The decode (shape validation) lives in `remote_config` so the wasm edit-host
+            // shares it; a mismatch is a loud `InvalidData` error here.
+            Ok(v) => {
+                decode_config_bundle(v).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
+            }
             Err(e) => Err(io::Error::other(e.to_string())),
         }
     }
-}
-
-/// Decode a `config_bundle` reply (the inverse of `encode_config_bundle`): the
-/// `[config_dir?, [runtimepath…], [[abspath, bytes], …], [ts_lang…]]` array. Any shape
-/// mismatch is a loud `InvalidData` error.
-fn decode_config_bundle(v: Value) -> io::Result<RemoteConfigBundle> {
-    let bad = |what: &str| {
-        io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("config_bundle: malformed {what}"),
-        )
-    };
-    let Value::Array(a) = v else {
-        return Err(bad("reply"));
-    };
-    let mut it = a.into_iter();
-    let config_dir = match it.next() {
-        None | Some(Value::Nil) => None,
-        Some(v) => Some(v.as_str().ok_or_else(|| bad("config_dir"))?.to_owned()),
-    };
-    let Some(Value::Array(rtp)) = it.next() else {
-        return Err(bad("runtimepath"));
-    };
-    let runtimepath = rtp
-        .iter()
-        .map(|v| {
-            v.as_str()
-                .map(str::to_owned)
-                .ok_or_else(|| bad("runtimepath entry"))
-        })
-        .collect::<io::Result<Vec<_>>>()?;
-    let Some(Value::Array(raw_files)) = it.next() else {
-        return Err(bad("files"));
-    };
-    let mut files = Vec::with_capacity(raw_files.len());
-    for f in raw_files {
-        let Value::Array(pair) = f else {
-            return Err(bad("file entry"));
-        };
-        let mut pit = pair.into_iter();
-        let path = pit.next().and_then(|v| v.as_str().map(str::to_owned));
-        let bytes = match pit.next() {
-            Some(Value::Binary(b)) => Some(b),
-            _ => None,
-        };
-        match (path, bytes) {
-            (Some(p), Some(b)) => files.push((p, b)),
-            _ => return Err(bad("file entry")),
-        }
-    }
-    // The installed tree-sitter languages; absent (an older peer) decodes as empty.
-    let ts_languages = match it.next() {
-        None | Some(Value::Nil) => Vec::new(),
-        Some(Value::Array(langs)) => langs
-            .iter()
-            .map(|v| {
-                v.as_str()
-                    .map(str::to_owned)
-                    .ok_or_else(|| bad("ts_languages entry"))
-            })
-            .collect::<io::Result<Vec<_>>>()?,
-        Some(_) => return Err(bad("ts_languages")),
-    };
-    // The daemon's cwd; absent (an older peer) decodes as `None` (keep the local cwd).
-    let cwd = match it.next() {
-        None | Some(Value::Nil) => None,
-        Some(v) => Some(v.as_str().ok_or_else(|| bad("cwd"))?.to_owned()),
-    };
-    Ok(RemoteConfigBundle {
-        config_dir,
-        runtimepath,
-        files,
-        ts_languages,
-        cwd,
-    })
 }
 
 /// The five edit-host seams of one daemon connection, all sharing a single link (see

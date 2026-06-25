@@ -68,7 +68,9 @@ mod inbound;
 mod lsp;
 #[cfg(feature = "native")]
 mod quic;
-#[cfg(feature = "native")]
+// Un-gated: the materialize half + the wire decoder are shared by the native edit-host
+// and the wasm one (the browser fetches the bundle over WebTransport, then materializes
+// it into emscripten's in-memory FS exactly as the native client stages it on disk).
 mod remote_config;
 #[cfg(feature = "native")]
 mod shada;
@@ -112,14 +114,28 @@ pub use daemon::{
     connect_daemon, serve_config_daemon, serve_config_daemon_on, serve_daemon, serve_fs_daemon,
     serve_fs_daemon_on, serve_lsp_daemon, serve_lsp_daemon_on, serve_luafs_daemon,
     serve_luafs_daemon_on, serve_proc_daemon_on, serve_term_daemon_on, DaemonClient, FsRead,
-    HostFsAsync, RemoteConfig, RemoteConfigBundle, RemoteFsJobs, RemoteHostFs, RemoteHostProc,
-    RemoteLspTransport, WatchEvent,
+    HostFsAsync, RemoteConfig, RemoteFsJobs, RemoteHostFs, RemoteHostProc, RemoteLspTransport,
+    WatchEvent,
 };
-/// Materialize a fetched [`RemoteConfigBundle`] onto a local per-process cache and
-/// rebase its roots — so a daemon session runs the remote's config + plugins locally
-/// (Phase 2 of `docs/plans/2026-06-23-remote-config-and-plugins.md`).
+/// Materialize a fetched bundle onto the per-process cache resolved from the environment
+/// (`$XDG_CACHE_HOME`/`$HOME`) — the native edit-host's entry point.
 #[cfg(feature = "native")]
-pub use remote_config::{materialize_remote_config, materialize_remote_config_into};
+pub use remote_config::materialize_remote_config;
+/// The fetched-config bundle, the wire decoder, and the materialize half — un-gated so the
+/// wasm edit-host shares them with native: native fetches over the daemon link and stages
+/// the files on disk; wasm fetches over WebTransport (in JS) and stages them in emscripten's
+/// in-memory FS. (Phase 2/4 of `docs/plans/2026-06-23-remote-config-and-plugins.md`.)
+pub use remote_config::{
+    decode_config_bundle, decode_config_bundle_bytes, materialize_remote_config_into,
+    RemoteConfigBundle,
+};
+
+/// Where the wasm edit-host stages a fetched [`RemoteConfigBundle`]: a fixed root in
+/// emscripten's in-memory FS (MEMFS). One editor per Worker and the FS is fresh on every
+/// page load, so a fixed path (no pid) is enough, and "fresh every connect" — the native
+/// freshness policy — falls out for free. See [`EditHost::apply_remote_config`].
+#[cfg(not(feature = "native"))]
+const WASM_REMOTE_CACHE_ROOT: &str = "/nxvim/remote";
 
 /// The native daemon transport (Open Decision #2): a WebTransport/QUIC listener that
 /// runs the [`run_daemon_io`] multiplexer over one bidi stream ([`serve_quic`], the
@@ -1132,6 +1148,81 @@ impl EditHost {
         self.apply_lua_effects();
         self.run_pending();
         result
+    }
+
+    /// Apply a fetched [`RemoteConfigBundle`] in a **wasm edit-host (daemon) session** —
+    /// the browser analogue of the native edit-host's fetch→materialize→source path
+    /// (`run_edit_host_session` in `nxvim/src/main.rs`). Run between
+    /// [`boot_begin`](Self::boot_begin) and [`boot_finish`](Self::boot_finish), *instead*
+    /// of the serverless single-file [`source_config`](Self::source_config): in daemon
+    /// mode the editor is *born remote*, so its whole config + plugin surface comes from
+    /// the daemon, not the local OPFS `init.lua`.
+    ///
+    /// The bundle's files are staged into the in-memory FS under [`WASM_REMOTE_CACHE_ROOT`]
+    /// (emscripten MEMFS — the same synchronous FS Lua's `require` / `package.path` and
+    /// `nvim_get_runtime_file` read from), the daemon's `runtimepath` is rebased onto that
+    /// copy and seeded into the VM, the daemon's cwd seeds `DirState`, the daemon's
+    /// tree-sitter parser set is wired for lazy auto-install, and finally the staged
+    /// `init.lua` + package `plugin/` scripts are sourced through the real effects path —
+    /// exactly the native order. A staging failure is a loud `Err` for the Worker to
+    /// surface; a Lua error in the config surfaces on the message line and still lets the
+    /// editor finish booting.
+    ///
+    /// Gated to the no-`native` build: the native edit-host fetches + materializes on the
+    /// async session path (`run_edit_host_session`), not through this synchronous method.
+    #[cfg(not(feature = "native"))]
+    pub fn apply_remote_config(&mut self, bundle: RemoteConfigBundle) -> Result<(), String> {
+        // Read the fields materialize doesn't consume before it takes the bundle by value.
+        let ts_languages = bundle.ts_languages.clone();
+        let remote_cwd = bundle.cwd.clone().map(PathBuf::from);
+        let (config_dir, runtimepath) =
+            materialize_remote_config_into(Path::new(WASM_REMOTE_CACHE_ROOT), bundle)
+                .map_err(|e| format!("staging remote config failed: {e}"))?;
+
+        // The daemon's cwd is the one true cwd of a remote session — seed `DirState` and
+        // publish the mirror before any config line reads `getcwd()` (native ordering).
+        if let Some(cwd) = remote_cwd {
+            self.dirs = cwd::DirState::new(cwd);
+            self.publish_cwd_mirror();
+        }
+
+        // Point `require` / runtime-file lookup at the staged copy: each rebased entry's
+        // `lua/` joins `package.path` and its root joins the runtimepath.
+        for rt in &runtimepath {
+            if let Err(e) = self.lua.add_runtimepath(rt) {
+                self.editor
+                    .echo(format!("nxvim: runtimepath seed failed: {e}"));
+            }
+        }
+
+        // Lazily install the daemon's tree-sitter parser set: register the `FileType`
+        // autocmd (in Lua) that `:TSInstall`s a language the first time a buffer of that
+        // type opens. Registered BEFORE sourcing so the startup buffer's own `FileType` is
+        // caught. (Unlike native, no local-installed filter — the wasm grammar set is
+        // JS-side and `:TSInstall` no-ops an already-present one; the Lua side dedups.)
+        if !ts_languages.is_empty() {
+            let list = ts_languages
+                .iter()
+                .map(|lang| format!("{lang:?}"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            if let Err(e) = self
+                .lua
+                .exec(&format!("nx._remote_ts_autoinstall({{ {list} }})"))
+            {
+                self.editor
+                    .echo(format!("nxvim: remote tree-sitter setup failed: {e}"));
+            }
+        }
+
+        // Source the daemon's `init.lua`, then its package `plugin/` / `after/plugin/`
+        // scripts across the runtimepath — neovim's startup order, through the same real
+        // effects path the native edit-host uses (reads resolve against the staged FS).
+        if let Some(config_dir) = &config_dir {
+            self.source_init(&config_dir.join("init.lua"));
+        }
+        self.source_plugins();
+        Ok(())
     }
 
     /// Feed vim key-notation and project the resulting frame — the wasm Worker's

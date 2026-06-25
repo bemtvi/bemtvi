@@ -31,6 +31,22 @@ NXVIM_DAEMON_CMD='ssh your-host nxvim --daemon' \
 Only fs/process/LSP — and this config fetch — cross the wire; the keystroke path stays
 local.
 
+## Run it from the browser (web build)
+
+The wasm edit-host is born remote the same way. Launch a listening daemon serving this
+directory, then open the web client pointed at it with `?daemon=<uri>`:
+
+```sh
+NXVIM_CONFIG=examples/remote-config cargo run -p nxvim -- --daemon --listen 127.0.0.1:0
+# copy the printed nxvim://… URI, then open the web build with ?daemon=<uri>
+```
+
+The browser fetches the same `config_bundle` over WebTransport, stages it into its
+in-memory FS, and sources the daemon's `init.lua` + plugins — so `require`, the remote
+command, and the remote option all work in the browser too (the local OPFS `init.lua` is
+skipped: in daemon mode the config surface is entirely the daemon's). See
+`crates/nxvim-edithost/web/verify-remote-config.mjs` for an end-to-end check.
+
 ## Verify the remote config is live
 
 - A startup notification: *"loaded init.lua + plugins fetched from the daemon"*.

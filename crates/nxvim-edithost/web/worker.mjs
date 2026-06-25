@@ -31,6 +31,9 @@ const eh_new = M.cwrap("eh_new", "number", []);
 const eh_input = M.cwrap("eh_input", null, ["number", "string"]);
 const eh_input_mouse = M.cwrap("eh_input_mouse", null, ["number", "string", "string", "string", "number", "number"]);
 const eh_source_lua = M.cwrap("eh_source_lua", "number", ["number", "string"]);
+// Apply a fetched remote-config bundle (daemon mode): handle, msgpack-bytes ptr, len → owned
+// error C string (empty on success). The browser twin of the native fetch→materialize→source.
+const eh_apply_remote_config = M.cwrap("eh_apply_remote_config", "number", ["number", "number", "number"]);
 const eh_boot_finish = M.cwrap("eh_boot_finish", null, ["number"]);
 const eh_attach = M.cwrap("eh_attach", null, ["number", "number", "number"]);
 const eh_set_clock = M.cwrap("eh_set_clock", null, ["number", "number"]);
@@ -164,7 +167,10 @@ if (h === 0) {
 // apply to the very first frame (native ordering: config first). `require` of further
 // modules won't resolve (the browser build's runtimepath is empty), so this is one file.
 // A broken config is surfaced (non-fatal) — the editor still finishes booting.
-async function bootWithConfig() {
+// Source the serverless config surface (no daemon): the demo seed, the vendored / OPFS plugin
+// bundles, and a single-file OPFS `/init.lua`. In a daemon session this is skipped entirely —
+// the editor is born remote (see `applyRemoteConfigFromDaemon`).
+async function sourceServerlessConfig() {
   // Demo build only: on FIRST boot, seed OPFS with the demo project + tour + init.lua
   // (web/demo-seed/, fetched as static assets). A sentinel (/.nxvim/.demo-seeded) makes this
   // a one-time action, so a user's later edits persist across reloads. Runs BEFORE the
@@ -232,6 +238,38 @@ async function bootWithConfig() {
     }
   } catch (e) {
     postMessage({ type: "config_error", error: String(e) });
+  }
+}
+
+// Fetch the daemon's config bundle and apply it (born remote): the browser twin of the native
+// edit-host's fetch→materialize→source path. Re-encode the `config_bundle` reply to msgpack and
+// hand the bytes to Rust (`eh_apply_remote_config`), which stages the daemon's config + plugins
+// into the in-memory FS, points the runtimepath at the copy, and sources `init.lua` + plugins —
+// replacing the serverless config path entirely. A failure is surfaced non-fatally; the editor
+// still finishes booting.
+async function applyRemoteConfigFromDaemon() {
+  try {
+    const reply = await daemon.request("config_bundle", []);
+    const bytes = encode(reply);
+    const ptr = bytes.length ? M._malloc(bytes.length) : 0;
+    if (ptr) M.HEAPU8.set(bytes, ptr);
+    const err = readStr(eh_apply_remote_config(h, ptr, bytes.length));
+    if (ptr) M._free(ptr);
+    if (err) postMessage({ type: "config_error", error: "remote config: " + err });
+  } catch (e) {
+    postMessage({ type: "config_error", error: "remote config: " + String(e) });
+  }
+}
+
+// Boot the editor's config: in a daemon session the whole config + plugin surface comes from
+// the daemon (born remote); otherwise it's the local serverless surface. Cross-session state
+// (shada) and the treesitter availability seed then load in BOTH modes, before the startup
+// lifecycle fires (`eh_boot_finish`).
+async function bootWithConfig() {
+  if (daemon) {
+    await applyRemoteConfigFromDaemon();
+  } else {
+    await sourceServerlessConfig();
   }
   // Restore cross-session state (registers/marks/history/jumplist) from OPFS *after* the
   // config (so a config can't clobber a restored mark) and *before* `eh_boot_finish` fires

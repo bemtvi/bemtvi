@@ -6,14 +6,14 @@
 //! the `src/prelude/` Lua modules in [`LuaRuntime::new`].
 
 use std::cell::RefCell;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
 use mlua::{Lua, LuaOptions, LuaSerdeExt, StdLib, Table};
 use serde::Serialize;
 
 use crate::convert::{json_to_lua, lua_int, lua_to_rmpv};
-use crate::host::seed_package_path;
+use crate::host::{seed_one_package_path, seed_package_path};
 use crate::install::fs_stat_table;
 use crate::install::{install_runtime_api, install_vim};
 use crate::ops::{
@@ -858,6 +858,23 @@ impl LuaRuntime {
     /// that iterate get a stable view for the duration of their borrow.
     pub fn runtimepath(&self) -> Vec<PathBuf> {
         self.runtimepath.borrow().clone()
+    }
+
+    /// Append `dir` to the live runtimepath and prepend its `lua/` patterns to
+    /// `package.path`, so the directory's modules are `require`-able and its
+    /// `colors/` / `queries/` / `lsp/` resolve through `nvim_get_runtime_file` — the
+    /// typed Rust twin of the `nx._add_rtp` Lua bridge. Idempotent: a dir already on the
+    /// path is a no-op (no duplicate `package.path` entries). Used to seed a remote
+    /// session's runtimepath after the VM is built (the edit-host fetches the daemon's
+    /// config + plugins, materializes them locally, then points the path at the copy).
+    pub fn add_runtimepath(&self, dir: &Path) -> mlua::Result<()> {
+        let mut paths = self.runtimepath.borrow_mut();
+        if paths.iter().any(|p| p == dir) {
+            return Ok(());
+        }
+        paths.push(dir.to_path_buf());
+        drop(paths);
+        seed_one_package_path(&self.lua, dir)
     }
 
     /// Run a Lua chunk. Errors are returned for the server to surface.

@@ -136,6 +136,35 @@ Each phase commits independently and pauses for review (repo cadence).
 - `examples/remote-config/`: a runnable remote config dir + a short README on
   launching `--daemon` on one side and connecting from the other.
 
+### Phase 4 — the web build: fetch + materialize in the browser ✅ done
+
+The native edit-host stages the daemon's config on disk; the **wasm** edit-host had none
+of this — `mod daemon` / `mod remote_config` / `collect_config_bundle` are all
+`#[cfg(feature = "native")]`, so a daemon-connected browser session only ever sourced its
+local OPFS `/init.lua`. This phase makes the browser *born remote* too, reusing the same
+materialize strategy: the edit-host targets `wasm32-unknown-emscripten`, whose `std::fs`
+hits emscripten's in-memory **MEMFS** — exactly the synchronous FS Lua's `require` /
+`package.path` and `nvim_get_runtime_file` read from. So "stage to a local cache, point
+the roots at it" ports directly, with MEMFS as the cache.
+
+- Un-gate the shared half: move `RemoteConfigBundle` + the wire decoder out of the
+  native-only `daemon` module into `remote_config.rs` (now un-gated), and add
+  `decode_config_bundle_bytes(&[u8])` (rmpv) so the wasm side can reconstruct the bundle
+  from raw msgpack. The native daemon client reuses the same decoder.
+- `EditHost::apply_remote_config(bundle)` (`#[cfg(not(native))]`, in `lib.rs`): materialize
+  into `/nxvim/remote` (MEMFS) via `materialize_remote_config_into`, seed the rebased
+  runtimepath into the VM (`LuaRuntime::add_runtimepath` — the typed twin of `nx._add_rtp`),
+  seed the daemon's cwd, register `nx._remote_ts_autoinstall`, then `source_init` +
+  `source_plugins` — the exact native order, over the staged FS.
+- FFI `eh_apply_remote_config(h, ptr, len)` + a `_eh_apply_remote_config` export.
+- `web/worker.mjs`: in a `?daemon=` session, fetch `config_bundle`, re-encode the reply to
+  msgpack, hand the bytes to Rust, and **skip** the serverless OPFS config path (born
+  remote). Shada stays local (out of scope, as on native).
+- Test `web/verify-remote-config.mjs`: a real `nxvim --daemon` with `NXVIM_CONFIG` on Node's
+  disk (unreadable by the page origin) ships an `init.lua` (sets an option), a `lua/` module
+  (`require`d), and a `pack/*/start/*` plugin; the browser asserts all three took effect —
+  proving config + plugins + `require` came from the daemon over WebTransport.
+
 ## Touch list
 
 - `crates/nxvim-server/src/daemon.rs` — `CONFIG_BUNDLE` constant, encode/decode,

@@ -15,13 +15,124 @@
 
 use std::path::{Component, Path, PathBuf};
 
-use crate::RemoteConfigBundle;
+use rmpv::Value;
+
+/// The daemon's config surface, decoded off a `config_bundle` reply: its `config_dir`,
+/// `runtimepath`, and every source file under those roots as `(abspath, bytes)`. Paths
+/// are the **daemon's** absolute paths; the edit-host mirrors the files onto a local
+/// cache and rebases the roots onto it ([`materialize_remote_config_into`]) so a remote
+/// session runs the daemon's config + plugins locally.
+///
+/// Lives here (not in the native-gated `daemon` module) so the materialize half — and the
+/// wire decoder below — are available to the **wasm** edit-host too: the browser build
+/// fetches the bundle over WebTransport in JS, then hands the re-encoded reply to Rust,
+/// where [`decode_config_bundle_bytes`] reconstructs this struct and the same materialize
+/// runs against emscripten's in-memory FS.
+pub struct RemoteConfigBundle {
+    /// The daemon's config dir (`None` if it resolved none — no remote config).
+    pub config_dir: Option<String>,
+    /// The daemon's runtimepath, in load order (config dir + discovered plugins).
+    pub runtimepath: Vec<String>,
+    /// Every fetched source file: its daemon-absolute path and its bytes.
+    pub files: Vec<(String, Vec<u8>)>,
+    /// The daemon's installed tree-sitter parser languages — the client auto-installs
+    /// the same set locally (parsers are native, never fetched over the wire).
+    pub ts_languages: Vec<String>,
+    /// The daemon's working directory, to seed the edit-host's `DirState` so a remote
+    /// session's `:pwd` / `getcwd` / `:cd` operate on the daemon's cwd. `None` when the
+    /// daemon couldn't read it (or an older peer omitted it) — the edit-host keeps its
+    /// own local cwd.
+    pub cwd: Option<String>,
+}
+
+/// Decode a `config_bundle` reply (the inverse of the daemon's `encode_config_bundle`):
+/// the `[config_dir?, [runtimepath…], [[abspath, bytes], …], [ts_lang…], cwd?]` array.
+/// Any shape mismatch is a loud error string — never a silently-empty bundle that would
+/// look like "the remote has no config". Shared by the native daemon client and the wasm
+/// edit-host (via [`decode_config_bundle_bytes`]).
+pub fn decode_config_bundle(v: Value) -> Result<RemoteConfigBundle, String> {
+    let bad = |what: &str| format!("config_bundle: malformed {what}");
+    let Value::Array(a) = v else {
+        return Err(bad("reply"));
+    };
+    let mut it = a.into_iter();
+    let config_dir = match it.next() {
+        None | Some(Value::Nil) => None,
+        Some(v) => Some(v.as_str().ok_or_else(|| bad("config_dir"))?.to_owned()),
+    };
+    let Some(Value::Array(rtp)) = it.next() else {
+        return Err(bad("runtimepath"));
+    };
+    let runtimepath = rtp
+        .iter()
+        .map(|v| {
+            v.as_str()
+                .map(str::to_owned)
+                .ok_or_else(|| bad("runtimepath entry"))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let Some(Value::Array(raw_files)) = it.next() else {
+        return Err(bad("files"));
+    };
+    let mut files = Vec::with_capacity(raw_files.len());
+    for f in raw_files {
+        let Value::Array(pair) = f else {
+            return Err(bad("file entry"));
+        };
+        let mut pit = pair.into_iter();
+        let path = pit.next().and_then(|v| v.as_str().map(str::to_owned));
+        let bytes = match pit.next() {
+            Some(Value::Binary(b)) => Some(b),
+            _ => None,
+        };
+        match (path, bytes) {
+            (Some(p), Some(b)) => files.push((p, b)),
+            _ => return Err(bad("file entry")),
+        }
+    }
+    // The installed tree-sitter languages; absent (an older peer) decodes as empty.
+    let ts_languages = match it.next() {
+        None | Some(Value::Nil) => Vec::new(),
+        Some(Value::Array(langs)) => langs
+            .iter()
+            .map(|v| {
+                v.as_str()
+                    .map(str::to_owned)
+                    .ok_or_else(|| bad("ts_languages entry"))
+            })
+            .collect::<Result<Vec<_>, _>>()?,
+        Some(_) => return Err(bad("ts_languages")),
+    };
+    // The daemon's cwd; absent (an older peer) decodes as `None` (keep the local cwd).
+    let cwd = match it.next() {
+        None | Some(Value::Nil) => None,
+        Some(v) => Some(v.as_str().ok_or_else(|| bad("cwd"))?.to_owned()),
+    };
+    Ok(RemoteConfigBundle {
+        config_dir,
+        runtimepath,
+        files,
+        ts_languages,
+        cwd,
+    })
+}
+
+/// Decode a `config_bundle` reply from its raw msgpack bytes — the wasm edit-host's entry
+/// point. The browser's JS RPC client decodes the wire to a JS value, re-encodes it to
+/// msgpack, and hands the bytes across the FFI; this reconstructs the [`RemoteConfigBundle`]
+/// the native client gets from [`decode_config_bundle`].
+pub fn decode_config_bundle_bytes(bytes: &[u8]) -> Result<RemoteConfigBundle, String> {
+    let value = rmpv::decode::read_value(&mut &bytes[..])
+        .map_err(|e| format!("config_bundle: undecodable msgpack: {e}"))?;
+    decode_config_bundle(value)
+}
 
 /// Mirror `bundle`'s files into this process's remote-config cache and return the
 /// rebased local `(config_dir, runtimepath)` to feed into [`ServerInit`](crate::ServerInit).
 /// The cache root is `$XDG_CACHE_HOME/nxvim/remote/<pid>` (else `$HOME/.cache/…`); a
 /// failure to resolve it is loud (a remote session with no place to stage its config is
 /// not silently downgraded to "no config").
+#[cfg(feature = "native")]
 pub fn materialize_remote_config(
     bundle: RemoteConfigBundle,
 ) -> std::io::Result<(Option<PathBuf>, Vec<PathBuf>)> {

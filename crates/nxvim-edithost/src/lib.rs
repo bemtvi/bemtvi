@@ -38,7 +38,7 @@ use nxvim_core::{
 };
 use nxvim_lsp::{LspEvent, LspNotify, LspRequest, ReqToken, ServerKey, ServerSpawn, SyncLspClient, WireOp};
 use nxvim_lua::LuaRuntime;
-use nxvim_server::{EditHost, HostEffects};
+use nxvim_server::{decode_config_bundle_bytes, EditHost, HostEffects};
 use rmpv::Value;
 
 // The synchronous Rust→JS treesitter-indent bridge (web/eh-lib.js, linked by build.sh's
@@ -819,6 +819,41 @@ pub unsafe extern "C" fn eh_source_lua(h: *mut WasmEditHost, code: *const c_char
         return into_owned_cstr(String::new());
     };
     match handle.host.source_config(as_str(code)) {
+        Ok(()) => into_owned_cstr(String::new()),
+        Err(e) => into_owned_cstr(e),
+    }
+}
+
+/// Apply a fetched remote-config bundle in a daemon session — the browser twin of the
+/// native edit-host's fetch→materialize→source path. The Worker dials the daemon, fetches
+/// `config_bundle` over WebTransport, re-encodes the reply to msgpack, and hands the bytes
+/// here (`data`/`len`); this decodes them and stages the daemon's config + plugins into
+/// the in-memory FS, points the runtimepath at the copy, and sources `init.lua` + plugins
+/// — all synchronously, so `require` resolves against the staged tree. Run after [`eh_new`]
+/// and *instead of* [`eh_source_lua`] (in daemon mode the editor is born remote), before
+/// [`eh_boot_finish`]. Returns an owned C string: empty on success, else the error message
+/// (the Worker surfaces it non-fatally — the editor still finishes booting).
+///
+/// # Safety
+/// `h` must come from [`eh_new`] and not yet be freed; `data` must point at `len` valid
+/// bytes (or be null with `len` 0). Free the returned pointer with [`eh_free_string`].
+#[no_mangle]
+pub unsafe extern "C" fn eh_apply_remote_config(
+    h: *mut WasmEditHost,
+    data: *const u8,
+    len: usize,
+) -> *mut c_char {
+    let Some(handle) = h.as_mut() else {
+        return into_owned_cstr(String::new());
+    };
+    let bytes = if data.is_null() || len == 0 {
+        &[][..]
+    } else {
+        std::slice::from_raw_parts(data, len)
+    };
+    let result = decode_config_bundle_bytes(bytes)
+        .and_then(|bundle| handle.host.apply_remote_config(bundle));
+    match result {
         Ok(()) => into_owned_cstr(String::new()),
         Err(e) => into_owned_cstr(e),
     }

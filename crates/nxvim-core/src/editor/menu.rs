@@ -1262,17 +1262,11 @@ impl Editor {
     // runs. They are deliberately thin — the behavior lives in the action handlers.
 
     /// Whether an **input-grabbing** menu (a picker or a promptless `nx.ui.select`)
-    /// is open — the menus the mouse drives modally (a click off the box cancels a
-    /// picker; the wheel scrolls the list). The non-grabbing completion popup is
+    /// is open — the menus the mouse drives modally (a click off the box cancels the
+    /// widget; the wheel scrolls the list). The non-grabbing completion popup is
     /// **not** included (it has its own [`Self::completion_active`] path).
     pub(crate) fn picker_or_select_active(&self) -> bool {
         matches!(self.menu_kind(), Some(MenuKind::Picker | MenuKind::Select))
-    }
-
-    /// Whether an open menu is a **picker** (a fuzzy finder with a prompt), the one
-    /// a click outside the box cancels (a `select` ignores an outside click).
-    pub(crate) fn picker_active(&self) -> bool {
-        self.menu_kind() == Some(MenuKind::Picker)
     }
 
     /// Highlight row `idx` (clamped) of an open picker / select — the mouse
@@ -1314,11 +1308,18 @@ impl Editor {
         }
     }
 
-    /// Cancel an open picker (a click off the box) — pushes `None` and closes.
-    /// Routed only for a picker; a `select` ignores an outside click (the caller
-    /// gates on [`Self::picker_active`]).
+    /// Cancel an open picker / select (a click off the box), routed by kind —
+    /// pushes the cancel result (`None`) and closes, like `<Esc>` on the widget.
     pub(crate) fn menu_cancel(&mut self) {
-        let _ = self.apply_picker_action("cancel");
+        match self.menu_kind() {
+            Some(MenuKind::Picker) => {
+                let _ = self.apply_picker_action("cancel");
+            }
+            Some(MenuKind::Select) => {
+                let _ = self.apply_select_action("cancel");
+            }
+            _ => {}
+        }
     }
 
     /// Scroll an open picker's preview pane (a wheel notch over it) by the coarsest

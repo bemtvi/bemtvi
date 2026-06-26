@@ -288,3 +288,33 @@ async fn clicking_a_select_row_highlights_then_confirms() {
         "clicking the highlighted row confirms it"
     );
 }
+
+#[tokio::test]
+async fn clicking_off_a_select_box_cancels_it() {
+    let dir = temp_dir("ui_select_mouse_cancel");
+    let (rpc, mut incoming) = start(&dir, "").await;
+    command(&rpc, "set nonumber norelativenumber").await;
+
+    exec_lua(
+        &rpc,
+        "_G.item, _G.called = nil, false
+         nx.ui.select({ 'alpha', 'beta', 'gamma' }, {})
+           :next(function(it) _G.item, _G.called = it, true end)",
+    )
+    .await;
+    poll_menu(&rpc, &mut incoming).await.expect("select opens");
+
+    // The cursor-anchored box never reaches the top-left corner — a press there
+    // lands off it, which cancels the chooser (the promise resolves with nil).
+    feed_mouse(&rpc, "left", "press", 0, 0);
+    assert_eq!(
+        exec_lua(&rpc, "return _G.called").await,
+        Value::Boolean(true),
+        "a click off the box resolves the chooser"
+    );
+    assert_eq!(
+        exec_lua(&rpc, "return _G.item").await,
+        Value::Nil,
+        "a click off the box cancels (resolves with nil) without choosing a row"
+    );
+}

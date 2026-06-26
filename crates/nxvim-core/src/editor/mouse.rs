@@ -335,8 +335,8 @@ impl Editor {
                 self.mouse_complete_wheel(ev.action == MouseAction::WheelDown, ev.row, ev.col)
             }
             // A picker / `select` grabs the mouse modally while open (like it grabs the
-            // keyboard): a left-press highlights or confirms a row — or cancels a
-            // picker when it lands off the box — and a wheel scrolls the list or the
+            // keyboard): a left-press highlights or confirms a row — or cancels the
+            // widget when it lands off the box — and a wheel scrolls the list or the
             // preview. Drag / release are swallowed so a stray drag can't start a text
             // selection through the box. These run before the chrome / text arms.
             (MouseButton::Left, MouseAction::Press) if self.picker_or_select_active() => {
@@ -1733,11 +1733,10 @@ impl Editor {
                 }
             }
             Some(MenuHit::Preview | MenuHit::Chrome) => {}
-            None => {
-                if self.picker_active() {
-                    self.menu_cancel();
-                }
-            }
+            // A click off the box cancels the chooser — the mouse form of `<Esc>`,
+            // for a picker and a promptless `select` alike (routed by kind in
+            // [`Editor::menu_cancel`]).
+            None => self.menu_cancel(),
         }
     }
 

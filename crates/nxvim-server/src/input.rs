@@ -152,6 +152,7 @@ impl EditHost {
                 code: KeyCode::Mouse {
                     button: click.button,
                     clicks: click.clicks,
+                    kind: click.kind,
                 },
                 shift: click.shift,
                 ctrl: click.ctrl,

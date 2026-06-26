@@ -11,7 +11,7 @@
 //! tab/wide-char [`virtcol`](crate::unicode::virtcol) math, run backwards.
 
 use super::*;
-use crate::input::{MouseAction, MouseButton, MouseEvent};
+use crate::input::{MouseAction, MouseButton, MouseEvent, MouseKind};
 
 /// In-flight left-button selection: the multi-click counter (vim's
 /// `check_multiclick` — a same-cell repeat within `'mousetime'` escalates the
@@ -62,14 +62,16 @@ pub(crate) enum ResizeDrag {
     Dock { side: DockSide },
 }
 
-/// A mouse-button **press** the server still has to resolve against the keymaps: the
-/// button, its multi-click count, the active modifiers, and the screen cell, recorded
-/// on [`Editor::mouse_clicks`] by the press handler. The server turns it into a
-/// [`Key`](crate::input::Key) (`<n-LeftMouse>` / `<C-RightMouse>` / `<MiddleMouse>` /
-/// …), fires the bound mapping if there is one, else runs the per-button default
+/// A mouse **gesture** the server still has to resolve against the keymaps: the button,
+/// its phase ([`kind`](MouseClick::kind) — press / drag / release), multi-click count,
+/// active modifiers, and the screen cell, recorded on [`Editor::mouse_clicks`] by the
+/// gesture handler. The server turns it into a [`Key`](crate::input::Key) (`<n-LeftMouse>`
+/// / `<C-RightMouse>` / `<MiddleMouse>` / `<LeftDrag>` / `<LeftRelease>` / …), fires the
+/// bound mapping if there is one, else runs the per-gesture default
 /// ([`Editor::mouse_apply_default`]).
 ///
-/// **All three buttons** (`Left`/`Right`/`Middle`), with **modifiers**, are mappable.
+/// **All three buttons** (`Left`/`Right`/`Middle`), in every phase (press / drag /
+/// release), with **modifiers**, are mappable.
 /// A plain-left press places the cursor *eagerly* (so a `<LeftMouse>` / `<C-LeftMouse>`
 /// map and the default both act on the click), so its default is just the word/line
 /// escalation. The right / middle / shift-left presses defer their *whole* default to
@@ -81,10 +83,14 @@ pub(crate) enum ResizeDrag {
 /// yet counted (`clicks` is always 1 for them).
 #[derive(Debug, Clone, Copy)]
 pub struct MouseClick {
-    /// The button pressed — `Left`/`Right`/`Middle` (never the wheel/move/thumb).
+    /// The button — `Left`/`Right`/`Middle` (never the wheel/move/thumb).
     pub button: MouseButton,
+    /// Which phase of the gesture this is — `Press` (`<LeftMouse>`), `Drag`
+    /// (`<LeftDrag>`), or `Release` (`<LeftRelease>`). Part of the looked-up key's
+    /// identity, so each is separately mappable.
+    pub kind: MouseKind,
     /// The multi-click count (1 = single, 2 = double, 3 = triple), per `'mousetime'`.
-    /// Counted for the left button only; right/middle are always `1` in v1.
+    /// Counted for a left *press* only; right/middle and every drag/release are `1`.
     pub clicks: u8,
     /// Active modifiers at the press, so `<C-LeftMouse>` is distinguished from a plain
     /// `<LeftMouse>`. `shift` on a left press is the extend gesture (default), still
@@ -400,24 +406,43 @@ impl Editor {
                 self.mouse_queue_press(&ev, MouseButton::Left, 1)
             }
             (MouseButton::Left, MouseAction::Press) => self.mouse_left_press(&ev),
-            (MouseButton::Left, MouseAction::Drag) => self.mouse_left_drag(ev.row, ev.col),
-            // Release ends the drag but keeps `mouse_select` so the next press can
-            // still see this one for multi-click counting; vim keeps the selection.
-            (MouseButton::Left, MouseAction::Release) => {}
+            // A plain-text drag / release is a mappable gesture (`<LeftDrag>` /
+            // `<LeftRelease>`): queue it for the server, which fires a bound map or runs
+            // the default ([`Editor::mouse_apply_default`] — the drag-select for a left
+            // drag; nothing for a release, which vim leaves the selection put for). The
+            // widget / resize / multi-cursor arms above already claimed their drags, so
+            // only a text drag reaches here.
+            (MouseButton::Left, MouseAction::Drag) => {
+                self.mouse_queue_gesture(&ev, MouseButton::Left, MouseKind::Drag)
+            }
+            (MouseButton::Left, MouseAction::Release) => {
+                self.mouse_queue_gesture(&ev, MouseButton::Left, MouseKind::Release)
+            }
             // Right- and middle-press are mappable too (`<RightMouse>` / `<MiddleMouse>`,
             // with modifiers): queue the press, and the server fires a bound map or runs
             // the default ([`Editor::mouse_apply_default`] — the `'mousemodel'` dispatch
             // for right, the `"*` paste for middle). Unlike left, nothing is placed
-            // eagerly: the default does its own selection-aware placement, and a v1
-            // mapped right/middle acts on the current cursor. Drag/release do nothing.
+            // eagerly: the default does its own selection-aware placement, and a mapped
+            // right/middle reads the click via `getmousepos()`. Drag / release are
+            // mappable (`<RightDrag>` / `<MiddleRelease>` / …) with no default.
             (MouseButton::Right, MouseAction::Press) => {
                 self.mouse_queue_press(&ev, MouseButton::Right, 1)
             }
-            (MouseButton::Right, MouseAction::Drag | MouseAction::Release) => {}
+            (MouseButton::Right, MouseAction::Drag) => {
+                self.mouse_queue_gesture(&ev, MouseButton::Right, MouseKind::Drag)
+            }
+            (MouseButton::Right, MouseAction::Release) => {
+                self.mouse_queue_gesture(&ev, MouseButton::Right, MouseKind::Release)
+            }
             (MouseButton::Middle, MouseAction::Press) => {
                 self.mouse_queue_press(&ev, MouseButton::Middle, 1)
             }
-            (MouseButton::Middle, MouseAction::Drag | MouseAction::Release) => {}
+            (MouseButton::Middle, MouseAction::Drag) => {
+                self.mouse_queue_gesture(&ev, MouseButton::Middle, MouseKind::Drag)
+            }
+            (MouseButton::Middle, MouseAction::Release) => {
+                self.mouse_queue_gesture(&ev, MouseButton::Middle, MouseKind::Release)
+            }
             // The wheel scrolls the window *under the pointer* without moving focus
             // or (unless a line scrolls off) the cursor.
             (MouseButton::Wheel, action) => self.mouse_wheel(action, ev.row, ev.col, ev.shift),
@@ -528,6 +553,7 @@ impl Editor {
         // both act on the click.
         self.mouse_clicks.push(MouseClick {
             button: MouseButton::Left,
+            kind: MouseKind::Press,
             clicks: count,
             shift: false,
             ctrl: ev.ctrl,
@@ -542,13 +568,32 @@ impl Editor {
     /// middle button, or a shift-left (the extend gesture). No eager placement: unlike
     /// the plain-left press, the default ([`Editor::mouse_apply_default`]) does its own
     /// selection-aware cursor move, so the press must carry its cell to re-hit-test from.
-    /// A v1 *mapped* right/middle therefore acts on the current cursor (`getmousepos()`
-    /// is a later phase). `clicks` is the multi-click count (always 1 for right/middle
-    /// in v1 — only the left button is multi-counted).
+    /// A *mapped* right/middle reads the click via `getmousepos()`. `clicks` is the
+    /// multi-click count (always 1 for right/middle — only the left button is counted).
     fn mouse_queue_press(&mut self, ev: &MouseEvent, button: MouseButton, clicks: u8) {
         self.mouse_clicks.push(MouseClick {
             button,
+            kind: MouseKind::Press,
             clicks,
+            shift: ev.shift,
+            ctrl: ev.ctrl,
+            alt: ev.alt,
+            row: ev.row,
+            col: ev.col,
+            stamp_ms: ev.stamp_ms,
+        });
+    }
+
+    /// Queue a drag or release gesture (`<LeftDrag>` / `<LeftRelease>` / `<RightDrag>` /
+    /// …) for the server to resolve: a bound map fires, else the default runs (the
+    /// drag-select for a left drag; nothing for a release or a right/middle drag). Like
+    /// the deferred presses it carries the cell so the default re-hit-tests; `clicks` is
+    /// always 1 (a drag / release has no multi-click count).
+    fn mouse_queue_gesture(&mut self, ev: &MouseEvent, button: MouseButton, kind: MouseKind) {
+        self.mouse_clicks.push(MouseClick {
+            button,
+            kind,
+            clicks: 1,
             shift: ev.shift,
             ctrl: ev.ctrl,
             alt: ev.alt,
@@ -575,15 +620,27 @@ impl Editor {
     /// (they were not placed eagerly), so the gesture is applied exactly as the old
     /// eager handlers did, just deferred behind the keymap lookup.
     pub fn mouse_apply_default(&mut self, click: MouseClick) {
-        match click.button {
-            MouseButton::Left if click.shift => {
+        match (click.button, click.kind) {
+            // A shift-left press extends; a plain/ctrl/alt left press escalates the
+            // word/line selection (its base cursor was already placed eagerly).
+            (MouseButton::Left, MouseKind::Press) if click.shift => {
                 self.mouse_left_extend(click.row, click.col, click.stamp_ms)
             }
-            MouseButton::Left => self.mouse_apply_default_select(click.clicks),
-            MouseButton::Right => self.mouse_right_press(click.row, click.col, click.stamp_ms),
-            MouseButton::Middle => self.mouse_middle_press(click.row, click.col),
+            (MouseButton::Left, MouseKind::Press) => self.mouse_apply_default_select(click.clicks),
+            // A left drag extends the in-flight selection; a release leaves it put.
+            (MouseButton::Left, MouseKind::Drag) => self.mouse_left_drag(click.row, click.col),
+            (MouseButton::Left, MouseKind::Release) => {}
+            // Right press → the `'mousemodel'` dispatch; middle press → `"*` paste.
+            (MouseButton::Right, MouseKind::Press) => {
+                self.mouse_right_press(click.row, click.col, click.stamp_ms)
+            }
+            (MouseButton::Middle, MouseKind::Press) => {
+                self.mouse_middle_press(click.row, click.col)
+            }
+            // Right/middle drag & release have no built-in behavior (mapping-only).
+            (MouseButton::Right | MouseButton::Middle, MouseKind::Drag | MouseKind::Release) => {}
             // The wheel / move / thumb buttons are never queued as a `MouseClick`.
-            MouseButton::Wheel | MouseButton::Move | MouseButton::X1 | MouseButton::X2 => {}
+            (MouseButton::Wheel | MouseButton::Move | MouseButton::X1 | MouseButton::X2, _) => {}
         }
     }
 

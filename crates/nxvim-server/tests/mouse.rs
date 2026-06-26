@@ -1661,6 +1661,87 @@ async fn shift_left_mouse_can_be_mapped_and_suppresses_extend() {
     );
 }
 
+// ===== Drag / release as mappable gestures ==================================
+
+/// `<LeftDrag>` is a mappable gesture: the drag fires the map *instead of* the
+/// default text-selection drag, so no Visual selection starts.
+#[tokio::test]
+async fn left_drag_can_be_mapped_and_suppresses_select() {
+    let (rpc, _incoming) = start("hello world\nsecond line\nthird").await;
+    command(&rpc, "set nonumber norelativenumber").await;
+    exec_lua(
+        &rpc,
+        r#"
+        _G.drags = 0
+        nx.keymap.set('n', '<LeftDrag>', function() _G.drags = _G.drags + 1 end)
+        return true
+    "#,
+    )
+    .await;
+    feed_mouse(&rpc, "left", "press", 0, 0);
+    feed_mouse(&rpc, "left", "drag", 0, 4);
+    assert_eq!(exec_lua(&rpc, "return _G.drags").await.as_u64(), Some(1));
+    assert_eq!(
+        mode(&rpc).await,
+        "n",
+        "the mapped <LeftDrag> did not start a Visual selection"
+    );
+}
+
+/// With no `<LeftDrag>` map, a drag still enters Visual select — the default gesture
+/// survives the deferral behind the keymap lookup.
+#[tokio::test]
+async fn an_unmapped_left_drag_still_selects() {
+    let (rpc, _incoming) = start("hello world\nsecond line").await;
+    command(&rpc, "set nonumber norelativenumber").await;
+    feed_mouse(&rpc, "left", "press", 0, 0);
+    feed_mouse(&rpc, "left", "drag", 0, 4);
+    assert_eq!(
+        mode(&rpc).await,
+        "v",
+        "an unmapped drag still enters Visual select"
+    );
+}
+
+/// `<LeftRelease>` is mappable: the button release fires the map.
+#[tokio::test]
+async fn left_release_can_be_mapped() {
+    let (rpc, _incoming) = start("hello world\nsecond line\nthird").await;
+    command(&rpc, "set nonumber norelativenumber").await;
+    exec_lua(
+        &rpc,
+        r#"
+        _G.releases = 0
+        nx.keymap.set('n', '<LeftRelease>', function() _G.releases = _G.releases + 1 end)
+        return true
+    "#,
+    )
+    .await;
+    feed_mouse(&rpc, "left", "press", 1, 2);
+    feed_mouse(&rpc, "left", "release", 1, 2);
+    assert_eq!(exec_lua(&rpc, "return _G.releases").await.as_u64(), Some(1));
+}
+
+/// A right-button drag is mappable too (`<RightDrag>`) — drag/release are wired for
+/// every button, not just the left.
+#[tokio::test]
+async fn right_drag_can_be_mapped() {
+    let (rpc, _incoming) = start("hello world\nsecond line").await;
+    command(&rpc, "set nonumber norelativenumber").await;
+    exec_lua(
+        &rpc,
+        r#"
+        _G.rdrag = 0
+        nx.keymap.set('n', '<RightDrag>', function() _G.rdrag = _G.rdrag + 1 end)
+        return true
+    "#,
+    )
+    .await;
+    feed_mouse(&rpc, "right", "press", 0, 0);
+    feed_mouse(&rpc, "right", "drag", 0, 3);
+    assert_eq!(exec_lua(&rpc, "return _G.rdrag").await.as_u64(), Some(1));
+}
+
 /// An insert-mode left-click moves the caret to the click and stays in Insert
 /// (the default `'mouse'` includes `i`); the caret may sit one past the last char.
 #[tokio::test]

@@ -35,16 +35,30 @@ pub enum KeyCode {
     End,
     PageUp,
     PageDown,
-    /// A mouse **button** as a mappable key — vim's `<LeftMouse>` / `<2-LeftMouse>`
-    /// / `<RightMouse>` / `<MiddleMouse>`. `clicks` is the multi-click count (1 for
-    /// a single click, 2 for a double, …). These never reach `Editor::input` as
-    /// text — the server resolves a press against the keymaps (firing a bound
+    /// A mouse gesture as a mappable key — vim's `<LeftMouse>` / `<2-LeftMouse>` /
+    /// `<RightMouse>` / `<MiddleMouse>` (press), `<LeftDrag>` / `<RightDrag>` /
+    /// `<MiddleDrag>` (drag), and `<LeftRelease>` / … (release). `kind` is which phase
+    /// of the gesture; `clicks` is the multi-click count for a *press* (1 single, 2
+    /// double, …) and always 1 for a drag / release. These never reach `Editor::input`
+    /// as text — the server resolves the gesture against the keymaps (firing a bound
     /// mapping or falling back to the default gesture) and only the *notation* round
     /// trip touches the core. `button` is always one of `Left`/`Right`/`Middle`.
     Mouse {
         button: MouseButton,
         clicks: u8,
+        kind: MouseKind,
     },
+}
+
+/// Which phase of a mouse gesture a mappable [`KeyCode::Mouse`] key is: a button
+/// `Press` (`<LeftMouse>`), a `Drag` while held (`<LeftDrag>`), or a `Release`
+/// (`<LeftRelease>`). The `kind` is part of the key's identity, so `<LeftMouse>`,
+/// `<LeftDrag>`, and `<LeftRelease>` are three distinct, separately-mappable keys.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum MouseKind {
+    Press,
+    Drag,
+    Release,
 }
 
 impl Key {
@@ -279,20 +293,29 @@ pub fn key_to_notation(key: Key) -> String {
         KeyCode::End => (true, "End".to_string()),
         KeyCode::PageUp => (true, "PageUp".to_string()),
         KeyCode::PageDown => (true, "PageDown".to_string()),
-        KeyCode::Mouse { button, clicks } => {
-            let name = match button {
-                MouseButton::Left => "LeftMouse",
-                MouseButton::Right => "RightMouse",
-                MouseButton::Middle => "MiddleMouse",
+        KeyCode::Mouse {
+            button,
+            clicks,
+            kind,
+        } => {
+            let btn = match button {
+                MouseButton::Left => "Left",
+                MouseButton::Right => "Right",
+                MouseButton::Middle => "Middle",
                 // Only Left/Right/Middle are ever built into a Mouse key; the wheel /
                 // move / thumb buttons are gestures, not mappable keys.
-                _ => "LeftMouse",
+                _ => "Left",
             };
-            // `<2-LeftMouse>` for a multi-click, `<LeftMouse>` for a single.
-            if clicks > 1 {
+            let name = match kind {
+                MouseKind::Press => format!("{btn}Mouse"),
+                MouseKind::Drag => format!("{btn}Drag"),
+                MouseKind::Release => format!("{btn}Release"),
+            };
+            // `<2-LeftMouse>` for a multi-click press; drag / release carry no count.
+            if kind == MouseKind::Press && clicks > 1 {
                 (true, format!("{clicks}-{name}"))
             } else {
-                (true, name.to_string())
+                (true, name)
             }
         }
     };
@@ -318,12 +341,14 @@ pub fn key_to_notation(key: Key) -> String {
     s
 }
 
-/// Parse a mouse-button notation stem (after modifier prefixes were stripped) into
-/// its `(button, click-count)`: `"leftmouse"` → `(Left, 1)`, `"2-leftmouse"` →
-/// `(Left, 2)`, `"3-rightmouse"` → `(Right, 3)`. `None` for anything that isn't a
+/// Parse a mouse-gesture notation stem (after modifier prefixes were stripped) into
+/// its `(button, click-count, kind)`: `"leftmouse"` → `(Left, 1, Press)`,
+/// `"2-leftmouse"` → `(Left, 2, Press)`, `"rightdrag"` → `(Right, 1, Drag)`,
+/// `"middlerelease"` → `(Middle, 1, Release)`. `None` for anything that isn't a
 /// `Left`/`Right`/`Middle` mouse name (so a non-mouse `<...>` falls through to the
-/// ordinary special-key table). The count is capped at 4 (vim escalates no further).
-fn parse_mouse_notation(rest: &str) -> Option<(MouseButton, u8)> {
+/// ordinary special-key table). A press's count is capped at 4 (vim escalates no
+/// further); a drag / release carries no count, so it is forced to 1.
+fn parse_mouse_notation(rest: &str) -> Option<(MouseButton, u8, MouseKind)> {
     let lower = rest.to_ascii_lowercase();
     let (clicks, name): (u8, &str) = match lower.split_once('-') {
         Some((n, name)) if !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()) => {
@@ -334,13 +359,21 @@ fn parse_mouse_notation(rest: &str) -> Option<(MouseButton, u8)> {
     if clicks == 0 || clicks > 4 {
         return None;
     }
-    let button = match name {
-        "leftmouse" => MouseButton::Left,
-        "rightmouse" => MouseButton::Right,
-        "middlemouse" => MouseButton::Middle,
+    let (button, kind) = match name {
+        "leftmouse" => (MouseButton::Left, MouseKind::Press),
+        "rightmouse" => (MouseButton::Right, MouseKind::Press),
+        "middlemouse" => (MouseButton::Middle, MouseKind::Press),
+        "leftdrag" => (MouseButton::Left, MouseKind::Drag),
+        "rightdrag" => (MouseButton::Right, MouseKind::Drag),
+        "middledrag" => (MouseButton::Middle, MouseKind::Drag),
+        "leftrelease" => (MouseButton::Left, MouseKind::Release),
+        "rightrelease" => (MouseButton::Right, MouseKind::Release),
+        "middlerelease" => (MouseButton::Middle, MouseKind::Release),
         _ => return None,
     };
-    Some((button, clicks))
+    // Only a press carries a multi-click count; a drag / release is always single.
+    let clicks = if kind == MouseKind::Press { clicks } else { 1 };
+    Some((button, clicks, kind))
 }
 
 fn parse_special(inner: &str) -> Option<Key> {
@@ -369,9 +402,13 @@ fn parse_special(inner: &str) -> Option<Key> {
     // modifier strip above has peeled any `C-`/`S-`/`A-`. The optional `N-` click
     // count is handled here (the `2` of `2-LeftMouse` isn't a modifier, so the loop
     // left it on `rest`).
-    if let Some((button, clicks)) = parse_mouse_notation(rest) {
+    if let Some((button, clicks, kind)) = parse_mouse_notation(rest) {
         return Some(Key {
-            code: KeyCode::Mouse { button, clicks },
+            code: KeyCode::Mouse {
+                button,
+                clicks,
+                kind,
+            },
             ctrl,
             alt,
             shift,

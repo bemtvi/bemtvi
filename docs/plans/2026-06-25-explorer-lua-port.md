@@ -143,8 +143,21 @@ Add **`BufReadCmd`** as a supported autocmd event (neovim-faithful; the general
     don't move the cursor. Tested in `tests/mouse.rs` (4 new: clicked position, zero
     before any click, window-relative excludes a tabline, a `<RightMouse>` map reads the
     click without moving the cursor).
-  - Still deferred: drag/release as mappable gestures (`<LeftDrag>` / `<LeftRelease>`),
-    `v:mouse_*` (set by `getchar()` mouse reads), and right/middle multi-click.
+  - **Follow-up — drag/release as mappable gestures. ✅ DONE 2026-06-26.** `<LeftDrag>` /
+    `<RightDrag>` / `<MiddleDrag>` and `<LeftRelease>` / … are mappable keys (with
+    modifiers). The `KeyCode::Mouse` key gained a `kind` (`Press`/`Drag`/`Release`), so
+    each phase is a distinct, separately-mappable key; the notation parser/render handle
+    the `…Drag` / `…Release` stems (no click count). A plain-text drag/release is queued
+    via `mouse_queue_gesture` (the widget/resize/multi-cursor arms still claim theirs
+    first), and `mouse_apply_default` dispatches the keymap-miss default by
+    `(button, kind)` — the drag-select for a left drag, nothing for a release or a
+    right/middle drag. So a bound `<LeftDrag>` suppresses the selection drag exactly like
+    a press map suppresses its default. Tested in `tests/mouse.rs` (4 new: `<LeftDrag>`
+    fires + suppresses select, an unmapped drag still selects, `<LeftRelease>` fires,
+    `<RightDrag>` fires).
+  - Still deferred: `v:mouse_*` (set specifically by `getchar()` mouse reads — a
+    different mechanism than `getmousepos()`), the scroll wheel as a mappable key
+    (`<ScrollWheelUp>` / …), and right/middle multi-click counting (`<2-RightMouse>`).
 - **Phase 2 — Primitive B (`BufReadCmd`). ✅ DONE 2026-06-25.** A file open is now
   **deferred** (enqueued as a `PendingOpen`) instead of read inline whenever a
   `BufReadCmd` handler is registered (`Editor::should_defer_open` = `host_fs_offtick ||

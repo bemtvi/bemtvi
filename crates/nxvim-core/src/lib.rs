@@ -48,7 +48,9 @@ pub use extmark::{
 };
 pub use highlight::{parse_color, Highlights, HlDef, Rgb, Style, WinHl};
 pub use host::{DirEntry, FileStat, HostFs, StdHostFs};
-pub use input::{key_to_notation, parse_keys, Key, KeyCode, MouseAction, MouseButton, MouseEvent};
+pub use input::{
+    key_to_notation, parse_keys, Key, KeyCode, MouseAction, MouseButton, MouseEvent, MouseKind,
+};
 pub use mode::{KeyContext, Mode};
 pub use options::{BufferOptions, Options, Padding, SignColumn, WindowOptions};
 pub use snippet::{parse_snippet, ParsedSnippet, SnippetError, TabStop};

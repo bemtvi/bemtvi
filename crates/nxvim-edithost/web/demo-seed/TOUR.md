@@ -13,6 +13,8 @@ plugins all run in this tab.
 - `:terminal python`          — an interactive REPL (`Ctrl-C` interrupts a loop)
 - open `main.py` / `geometry.py` — `K` hovers, `gd` goes to a definition,
   `grn` renames; basedpyright type-checks as you type
+- start typing in insert mode — autocomplete pops up (`<C-n>`/`<Tab>` to move,
+  `<CR>` to accept, `<C-e>` to dismiss), with LSP suggestions and docs
 - `<space>` (leader), then wait — which-key shows what each key does
 - `<leader>e`                 — toggle the file-tree sidebar
 

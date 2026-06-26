@@ -48,6 +48,16 @@ nx.lsp.config("basedpyright", {
 })
 nx.lsp.enable("basedpyright")
 
+-- Autocompletion: the native nx.complete engine, popping up as you type. The `lsp`
+-- source (basedpyright, above) leads; the `buffer` word-scan is a fallback for
+-- prose and comments. `min_chars = 1` opens the popup after a single character;
+-- the docs sidebar (on by default) shows the highlighted item's signature/doc.
+--   <C-n>/<Tab> next · <C-p>/<S-Tab> prev · <C-y>/<CR> accept · <C-e> dismiss
+nx.complete.setup({
+  sources = { { "lsp" }, { "buffer", min_chars = 2 } },
+  min_chars = 1,
+})
+
 -- A couple of demo keymaps (the tree, LSP, and which-key sets cover the rest).
 vim.keymap.set("n", "<leader>w", "<cmd>write<cr>", { desc = "Write file" })
 vim.keymap.set("n", "<leader>q", "<cmd>quit<cr>", { desc = "Quit window" })

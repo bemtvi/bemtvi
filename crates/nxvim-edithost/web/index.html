@@ -852,11 +852,16 @@
     function spansForWindow(w) {
       if (!ts || !ts.isReady()) return null;
       if (w.terminal || w.term_colors) return null;
+      const text = w.focused ? bufferText : textByFile.get(w.file_name);
+      if (text == null) return null;
+      // A markdown buffer (an LSP hover / signature doc float, or a `.md` file): the
+      // markdown grammar isn't bundled and single-grammar parsing can't reach injected
+      // code, so highlight its ```lang code fences with their own grammars instead — the
+      // code in a hover is the part worth colouring.
+      if (w.filetype === "markdown") return ts.spansForFencedMarkdown(text);
       const lang =
         ts.langForFiletype(w.filetype) || (w.unnamed ? null : ts.langForName(w.file_name));
       if (!lang) return null;
-      const text = w.focused ? bufferText : textByFile.get(w.file_name);
-      if (text == null) return null;
       return ts.spansForBuffer(lang, text);
     }
 
@@ -2219,19 +2224,39 @@
         pre.appendChild(header);
         const lines = pv.lines || [];
         const loc = pv.loc; // [row, col] (relative to lines[0]) or null
+        // The pure-wasm build has no native tree-sitter engine, so the server ships
+        // EMPTY `pv.highlights`. Highlight the visible slice client-side — the same
+        // web-tree-sitter path window text takes (`spansForWindow`) — keyed off the
+        // preview's file name, mirroring the native `store_preview` (`language_of_path`).
+        // A daemon / server-styled frame already carries real `pv.highlights`, so the
+        // JS path stays dormant there (`!serverStyled`).
+        let pvColors = null;
+        if (!serverStyled && ts && ts.isReady() && pv.title) {
+          const text = lines.join("\n");
+          const lang = ts.langForName(String(pv.title));
+          // A markdown preview highlights its ```lang fences (the markdown grammar isn't
+          // bundled), matching the hover doc-float path; everything else parses whole.
+          const sp = lang
+            ? ts.spansForBuffer(lang, text)
+            : (/\.(md|markdown)$/i.test(String(pv.title)) ? ts.spansForFencedMarkdown(text) : null);
+          if (sp) pvColors = lines.map((ln, i) => ts.colorsForLine(sp[i] || [], String(ln ?? "").length));
+        }
         for (let i = 0; i < menu.height - 1; i++) {
           const rowEl = document.createElement("div");
           const isLoc = loc && loc[0] === i;
           rowEl.className = "row";
           if (isLoc) applySel(rowEl);
           rowEl.style.width = previewW * cw + "px";
-          // Colour each char by its tree-sitter span (Phase 3b) via the same
-          // `cellBaseCss` the window text uses (no diagnostics in a preview); empty
-          // highlights (no grammar / wasm engine) render plain.
+          // Colour each char by its tree-sitter span via the same `cellBaseCss` the
+          // window text uses (no diagnostics in a preview). The server spans win when
+          // present (daemon); otherwise fall back to the client-side `pvColors` fg. A
+          // line with neither renders plain.
           const hlSpans = (pv.highlights && pv.highlights[i]) || [];
+          const colors = pvColors && pvColors[i];
           const chars = [...String(lines[i] ?? "")].slice(0, previewW);
           chars.forEach((chr, ci) => {
-            const css = cellBaseCss(ci, hlSpans, []);
+            let css = cellBaseCss(ci, hlSpans, []);
+            if (!css && colors && colors[ci]) css = `color:${colors[ci]};`;
             if (css) {
               const sp = document.createElement("span");
               sp.setAttribute("style", css);

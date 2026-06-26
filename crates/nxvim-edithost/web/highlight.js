@@ -368,6 +368,53 @@ export function createHighlighter({ onReady } = {}) {
     return isAvail(lang) ? lang : null;
   }
 
+  // The grammar for a fenced-code info string (the `rust` in ```` ```rust ````), or null
+  // when unsupported / not yet available. Takes only the first token (rustdoc writes
+  // ```` ```rust,no_run ````) and resolves it through the filetype / extension / install
+  // alias tables — so `ts`/`js`/`py`/`sh`/`c#` all reach their grammar. No auto-fetch:
+  // `:TSInstall` stays the explicit network gate, exactly like `langForName`.
+  function langForFence(info) {
+    if (!info || !runtimeReady) return null;
+    const k = String(info).toLowerCase().split(/[\s,;]/)[0];
+    if (!k) return null;
+    for (const cand of [FT[k], EXT[k], resolveName(k), k]) {
+      if (cand && isAvail(cand)) return cand;
+    }
+    return null;
+  }
+
+  // Per-line highlight spans for a markdown buffer's fenced code blocks — the LSP hover /
+  // doc-float case (and any `.md` buffer). The markdown grammar isn't bundled and
+  // web-tree-sitter doesn't run tree-sitter injections, so prose / headings stay plain;
+  // but the code INSIDE a ```` ```lang ```` fence — a hover's signature, the part that
+  // matters — is parsed with that language's OWN grammar (when available, bundled or
+  // `:TSInstall`'d) and its spans rebased onto the buffer's lines. Returns per-line spans
+  // (same shape as `spansForBuffer`) or null when nothing highlighted.
+  function spansForFencedMarkdown(text) {
+    if (text == null || !runtimeReady) return null;
+    const lines = text.split('\n');
+    const out = Array.from({ length: lines.length }, () => []);
+    let any = false;
+    for (let i = 0; i < lines.length; ) {
+      const open = lines[i].match(/^\s*(```+|~~~+)\s*([^\s`~]*)/);
+      if (!open) { i++; continue; }
+      const closeRe = open[1][0] === '`' ? /^\s*```+\s*$/ : /^\s*~~~+\s*$/;
+      let j = i + 1;
+      while (j < lines.length && !closeRe.test(lines[j])) j++;
+      const lang = langForFence(open[2]);
+      if (lang) {
+        const sp = spansForBuffer(lang, lines.slice(i + 1, j).join('\n'));
+        if (sp) {
+          for (let k = 0; k < sp.length && i + 1 + k < out.length; k++) {
+            if (sp[k] && sp[k].length) { out[i + 1 + k] = sp[k]; any = true; }
+          }
+        }
+      }
+      i = j + 1;
+    }
+    return any ? out : null;
+  }
+
   // A tree-sitter metadata/control capture (`@spell` / `@nospell` / `@conceal`) —
   // a spellcheck/conceal marker, NOT a visual highlight group. Grammars tag nodes
   // with these alongside a real highlight (`(comment) @comment @spell`); they carry
@@ -649,6 +696,7 @@ export function createHighlighter({ onReady } = {}) {
     langForName,
     langForFiletype,
     spansForBuffer,
+    spansForFencedMarkdown,
     colorsForLine,
     install,
   };

@@ -19,6 +19,8 @@
 --   <C-y> / <CR>             accept the highlighted row (applies its textEdit)
 --   <C-e>                    dismiss the popup
 --   <C-Space>                manual trigger (preselects row 0, so docs show at once)
+--   <C-k>                    signature help for the call under the cursor — type
+--                            `print(` and press <C-k> to float the parameter hints
 --
 -- Note: lua-language-server takes ~20s to index on first attach — completions (and
 -- so the docs sidebar) are empty until it finishes warming up. Give it a moment.
@@ -57,6 +59,10 @@ nx.lsp.config("lua_ls", {
     map("K", nx.lsp.hover)
     map("<leader>rn", nx.lsp.rename)
     map("<leader>ca", nx.lsp.code_action)
+    -- Signature help in INSERT mode: type a call like `print(` and press <C-k> to
+    -- float the parameter hints (the active parameter is shown in brackets). This
+    -- matches the built-in default; setting it here keeps the example self-contained.
+    nx.keymap.set("i", "<C-k>", nx.lsp.signature_help, { buffer = bufnr })
     -- Inlay hints are off by default — turn them on for this buffer (the engine
     -- requests them and paints the type/parameter annotations inline).
     nx.lsp.inlay_hint.enable(true, { bufnr = bufnr })

@@ -63,6 +63,19 @@ nx.complete.setup({
   min_chars = 1,
 })
 
+-- Python indentation: 4 spaces, no hard tabs (PEP 8). Buffer-local options, so a
+-- `FileType` autocmd pins them as each python buffer loads.
+vim.api.nvim_create_autocmd("FileType", {
+  pattern = "python",
+  callback = function(args)
+    local bo = vim.bo[args.buf]
+    bo.expandtab = true
+    bo.shiftwidth = 4
+    bo.softtabstop = 4
+    bo.tabstop = 4
+  end,
+})
+
 -- A couple of demo keymaps (the tree, LSP, and which-key sets cover the rest).
 vim.keymap.set("n", "<leader>w", "<cmd>write<cr>", { desc = "Write file" })
 vim.keymap.set("n", "<leader>q", "<cmd>quit<cr>", { desc = "Quit window" })

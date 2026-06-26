@@ -357,6 +357,39 @@ impl Editor {
         self.ensure_visible_horizontal();
     }
 
+    /// Scroll the focused window to show as much of the current Visual selection
+    /// as possible — used by `gv`. The plain [`ensure_visible`](Self::ensure_visible)
+    /// only keeps the live *cursor* on screen, so after scrolling away a `gv`
+    /// would land with the selection's far end pinned to the top edge and the
+    /// whole body scrolled off above it. Instead: when the selection fits, reveal
+    /// it whole (its first line at the top of the window); when it is taller than
+    /// the window, brim the window with its tail (the cursor end on the last row).
+    /// A no-op when the selection is already wholly on screen, so a `gv` that
+    /// needs no scroll never jerks the viewport. The cursor end stays visible
+    /// either way, so the [`ensure_visible`](Self::ensure_visible) that follows in
+    /// [`input`](Editor::input) leaves the chosen `top` untouched.
+    pub(crate) fn reveal_selection(&mut self) {
+        let th = self.text_height();
+        if th == 0 {
+            return;
+        }
+        // `gv` pins the live cursor to the selection's far end (`` `> ``), so the
+        // span runs from the anchor's line down to the cursor's.
+        let start = self.visual_anchor.line.min(self.cursor.line);
+        // Already wholly on screen — don't yank the viewport around.
+        if start >= self.top && self.cursor_screen_row() < th {
+            return;
+        }
+        // Reveal the whole selection with its first line at the top; if that still
+        // leaves the cursor end past the bottom the selection out-sizes the window,
+        // so pin the cursor end to the last row (the window then brims with its
+        // tail), exactly as a scroll-to-bottom would.
+        self.top = start;
+        if self.cursor_screen_row() >= th {
+            self.top = self.scroll_top_for_bottom(self.cursor.line, th);
+        }
+    }
+
     /// The number of display (text) rows buffer `line` occupies in the focused
     /// window: `1` under `nowrap` (or for a line that fits), else its soft-wrap
     /// segment count. The text-row analogue of a line's `virt_lines` count, so the

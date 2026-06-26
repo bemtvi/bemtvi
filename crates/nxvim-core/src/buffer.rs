@@ -188,6 +188,14 @@ pub struct Buffer {
     /// undo/redo, exactly as `extmarks` are. (Routing/validation lives in
     /// [`crate::editor::marks`]; global `A`–`Z` marks live on the editor.)
     pub marks: HashMap<char, (usize, usize)>,
+    /// The kind of the last Visual selection left in this buffer — `Visual`
+    /// (charwise) or `VisualLine` (linewise) — stamped alongside the `` `< `` /
+    /// `` `> `` selection marks when Visual mode is left. `gv` reads it to restore
+    /// the selection's *shape*, which the position-only marks can't encode (a
+    /// charwise and a linewise selection can cover the very same line span).
+    /// `None` until a Visual selection has ever been made here. (Set in
+    /// [`crate::editor::marks::Editor::record_visual_marks`].)
+    pub last_visual: Option<crate::mode::Mode>,
     /// The **change list** — positions of the changes made in this buffer, oldest
     /// first, navigated with `g;` (older) / `g,` (newer) and listed by `:changes`.
     /// Per-buffer like vim's, and like the buffer-local marks it rides
@@ -264,6 +272,7 @@ impl Buffer {
             changelistidx: 0,
             extmarks: crate::extmark::ExtmarkStore::default(),
             marks: HashMap::new(),
+            last_visual: None,
             kind: BufferKind::Ordinary,
             terminal_title: None,
             view_name: None,
@@ -388,6 +397,7 @@ impl Buffer {
             changelistidx: 0,
             extmarks: crate::extmark::ExtmarkStore::default(),
             marks: HashMap::new(),
+            last_visual: None,
             kind: BufferKind::Ordinary,
             terminal_title: None,
             view_name: None,

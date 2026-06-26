@@ -328,6 +328,125 @@ async fn visual_selection_sets_the_angle_marks() {
 }
 
 #[tokio::test]
+async fn gv_reselects_the_last_charwise_selection() {
+    let (rpc, _incoming) = start(None).await;
+    feed(&rpc, "ialpha beta gamma<Esc>");
+    // Select "beta" charwise (columns 6..=9), then leave visual mode.
+    feed(&rpc, "06lv3l<Esc>");
+    assert_eq!(cursor(&rpc).await, (1, 9));
+    // Park the cursor elsewhere; `gv` re-enters charwise visual over "beta".
+    feed(&rpc, "0");
+    feed(&rpc, "gv");
+    assert_eq!(mode(&rpc).await, "v");
+    assert_eq!(cursor(&rpc).await, (1, 9));
+    // Operating on the reselection deletes exactly "beta".
+    feed(&rpc, "d");
+    assert_eq!(lines(&rpc).await, vec!["alpha  gamma"]);
+}
+
+#[tokio::test]
+async fn gv_reselects_the_last_linewise_selection() {
+    let (rpc, _incoming) = start(None).await;
+    feed(&rpc, "ialpha<Esc>obeta<Esc>ogamma<Esc>odelta<Esc>");
+    // Select lines 2–3 linewise, then leave visual mode.
+    feed(&rpc, "ggjVj<Esc>");
+    // Park on line 1; `gv` re-enters *linewise* visual over the same two lines.
+    feed(&rpc, "gg");
+    feed(&rpc, "gv");
+    assert_eq!(mode(&rpc).await, "V");
+    // A linewise reselect deletes whole lines 2–3, leaving line 1 and line 4.
+    feed(&rpc, "d");
+    assert_eq!(lines(&rpc).await, vec!["alpha", "delta"]);
+}
+
+/// The 1-based buffer line shown on each window row (`window0.numbers`), with
+/// `~` filler rows dropped.
+fn visible_lines(map: &[(Value, Value)]) -> Vec<u64> {
+    window0_field(map, "numbers")
+        .and_then(Value::as_array)
+        .expect("numbers")
+        .iter()
+        .filter_map(Value::as_u64)
+        .collect()
+}
+
+#[tokio::test]
+async fn gv_scrolls_to_reveal_a_selection_left_above_the_viewport() {
+    let (rpc, mut incoming) = start(None).await;
+    // A buffer taller than the 24-row text area.
+    let body = (1..=40)
+        .map(|n| format!("L{n:02}"))
+        .collect::<Vec<_>>()
+        .join("<CR>");
+    feed(&rpc, &format!("i{body}<Esc>"));
+    // Select lines 3–5 linewise, then leave visual mode.
+    feed(&rpc, "gg2jV2j<Esc>");
+    // Scroll the selection off the top of the window.
+    feed(&rpc, "G");
+    // `gv` must scroll the small selection wholly back into view, its first line
+    // at the very top — not pin its end (line 5) to the top with the body above
+    // it scrolled off.
+    let map = latest_after(&rpc, &mut incoming, "gv").await;
+    let visible = visible_lines(&map);
+    assert_eq!(visible.first().copied(), Some(3), "selection start at top");
+    assert!(
+        visible.contains(&5),
+        "selection end visible, got {visible:?}"
+    );
+}
+
+#[tokio::test]
+async fn gv_brims_the_window_with_the_tail_of_an_oversized_selection() {
+    let (rpc, mut incoming) = start(None).await;
+    let body = (1..=40)
+        .map(|n| format!("L{n:02}"))
+        .collect::<Vec<_>>()
+        .join("<CR>");
+    feed(&rpc, &format!("i{body}<Esc>"));
+    // Select lines 1–30 linewise — far taller than the 24-row window.
+    feed(&rpc, "ggV29j<Esc>");
+    feed(&rpc, "G");
+    // The whole selection can't fit, so `gv` fills the window with its tail: the
+    // cursor end (line 30) lands on the last row, line 1 stays off the top.
+    let map = latest_after(&rpc, &mut incoming, "gv").await;
+    let visible = visible_lines(&map);
+    assert_eq!(visible.last().copied(), Some(30), "cursor end on last row");
+    assert!(
+        !visible.contains(&1),
+        "selection start scrolled off, got {visible:?}"
+    );
+}
+
+#[tokio::test]
+async fn gv_without_a_prior_selection_errors_loudly() {
+    let (rpc, mut incoming) = start(None).await;
+    feed(&rpc, "ialpha<Esc>");
+    let map = latest_after(&rpc, &mut incoming, "gv").await;
+    assert!(
+        view_str(&map, "message").contains("E20"),
+        "expected a loud 'mark not set' error, got: {:?}",
+        view_str(&map, "message")
+    );
+    // No selection was entered — still in Normal mode.
+    assert_eq!(mode(&rpc).await, "n");
+}
+
+#[tokio::test]
+async fn gv_remembers_the_shape_across_a_charwise_then_linewise_swap() {
+    let (rpc, _incoming) = start(None).await;
+    feed(&rpc, "ialpha beta gamma<Esc>");
+    // A linewise selection over the (single) line, then a later charwise one:
+    // `gv` must restore the *charwise* shape, not guess linewise from the marks.
+    feed(&rpc, "V<Esc>");
+    feed(&rpc, "06lv3l<Esc>");
+    feed(&rpc, "0");
+    feed(&rpc, "gv");
+    assert_eq!(mode(&rpc).await, "v");
+    feed(&rpc, "d");
+    assert_eq!(lines(&rpc).await, vec!["alpha  gamma"]);
+}
+
+#[tokio::test]
 async fn change_bracket_marks_around_a_yank() {
     let (rpc, _incoming) = start(None).await;
     feed(&rpc, "ihello world<Esc>");

@@ -135,9 +135,57 @@ impl Editor {
         } else {
             (b, a)
         };
-        let marks = &mut self.buffer_mut().marks;
-        marks.insert('<', (lo.line, lo.col));
-        marks.insert('>', (hi.line, hi.col));
+        // Remember the selection's *shape* too, so `gv` restores a linewise
+        // selection as linewise rather than guessing from the (position-only)
+        // marks. `record_visual_marks` is only ever called while leaving Visual
+        // mode, so `self.mode` is the kind we want; guard anyway.
+        let kind = self.mode.is_visual().then_some(self.mode);
+        let buf = self.buffer_mut();
+        buf.marks.insert('<', (lo.line, lo.col));
+        buf.marks.insert('>', (hi.line, hi.col));
+        if let Some(kind) = kind {
+            buf.last_visual = Some(kind);
+        }
+    }
+
+    /// `gv`: reselect the last Visual selection in the current buffer — the area
+    /// bracketed by the `` `< `` / `` `> `` marks, restored in its recorded
+    /// charwise/linewise *shape* (the position-only marks can't tell the two
+    /// apart). The anchor lands on `` `< `` and the live cursor on `` `> ``.
+    /// Fails loudly with vim's *E20* when no Visual selection has been made in
+    /// this buffer yet (the marks were never set, or their lines were since
+    /// deleted and the marks dropped).
+    pub(crate) fn reselect_visual(&mut self) {
+        let buf = self.buffer();
+        let (Some(&(lo_line, lo_col)), Some(&(hi_line, hi_col))) =
+            (buf.marks.get(&'<'), buf.marks.get(&'>'))
+        else {
+            self.echo_err("E20: Mark not set");
+            return;
+        };
+        // The marks are only ever stamped together with the kind, so the
+        // fallback to charwise is just belt-and-suspenders.
+        let kind = buf.last_visual.unwrap_or(Mode::Visual);
+        self.visual_anchor = Cursor {
+            line: lo_line,
+            col: lo_col,
+        };
+        self.cursor = Cursor {
+            line: hi_line,
+            col: hi_col,
+        };
+        self.mode = if kind == Mode::VisualLine {
+            Mode::VisualLine
+        } else {
+            Mode::Visual
+        };
+        // Anchor each placed secondary cursor's own selection (a no-op without a
+        // multi-cursor set), then pull the live end back inside the buffer.
+        self.begin_visual_anchors();
+        self.clamp_cursor();
+        // Scroll so the reselected span is maximally visible, rather than letting
+        // the cursor-only `ensure_visible` pin its far end to the top edge.
+        self.reveal_selection();
     }
 
     /// Promote a shada-restored global mark (`A`–`Z`) from its pending

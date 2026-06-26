@@ -481,6 +481,7 @@ enum NormalCmd {
     EnterVisual,            // v
     EnterVisualLine,        // V
     VisualSwapEnds,         // o / O (move to other end of selection)
+    ReselectVisual,         // gv (reselect the last Visual selection)
     EnterCommand,           // :
     EnterSearch(SearchDir), // / ?
     SearchNext,             // n
@@ -1190,6 +1191,10 @@ fn parse_step(mode: Mode, pending: &PendingCommand, key: Key) -> ParseStep {
             Some('0') => return Complete(ResolvedCommand::Motion(Motion::DisplayLineStart)),
             Some('^') => return Complete(ResolvedCommand::Motion(Motion::DisplayFirstNonBlank)),
             Some('$') => return Complete(ResolvedCommand::Motion(Motion::DisplayLineEnd)),
+            // `gv` reselects the last Visual selection (its area *and* its
+            // charwise/linewise shape), read back from the `` `< `` / `` `> ``
+            // marks and the buffer's recorded last-visual kind.
+            Some('v') => return Complete(ResolvedCommand::Normal(NormalCmd::ReselectVisual)),
             Some('t') => {
                 return Complete(ResolvedCommand::Normal(NormalCmd::TabNext(pending.count)))
             }
@@ -2257,6 +2262,7 @@ impl Editor {
                 self.mode = Mode::Visual;
             }
             NormalCmd::VisualSwapEnds => self.visual_swap_ends(),
+            NormalCmd::ReselectVisual => self.reselect_visual(),
             NormalCmd::EnterVisualLine => {
                 if !self.mode.is_visual() {
                     self.visual_anchor = self.cursor;

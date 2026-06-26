@@ -1846,6 +1846,18 @@ impl EditHost {
             let scol = wx + textoff + cc.saturating_sub(leftcol) + 1;
             let _ = self.lua.set_screen_cursor(srow as u64, scol as u64);
         }
+        // The last mouse event's position (`vim.fn.getmousepos()`), resolved through the
+        // core hit-test, so a mouse mapping fired below reads the clicked cell.
+        let mp = self.editor.mouse_pos();
+        let _ = self.lua.set_mouse_pos(
+            mp.screenrow,
+            mp.screencol,
+            mp.winid,
+            mp.winrow,
+            mp.wincol,
+            mp.line,
+            mp.column,
+        );
         let _ = self.lua.set_buf_mirror(
             &bufs,
             cursor,

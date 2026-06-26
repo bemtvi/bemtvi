@@ -1131,6 +1131,15 @@ end
 function nx._set_vim_did_enter(v)
   nx._v_mirror.vim_did_enter = v and 1 or 0
 end
+-- The last mouse event's position, pushed every tick by the server (backs
+-- vim.fn.getmousepos — see vimfn.lua). 1-based; winid/line/column are 0 off a
+-- window's text.
+nx._mouse_pos = nx._mouse_pos or {}
+function nx._set_mouse_pos(screenrow, screencol, winid, winrow, wincol, line, column)
+  local m = nx._mouse_pos
+  m.screenrow, m.screencol, m.winid = screenrow, screencol, winid
+  m.winrow, m.wincol, m.line, m.column = winrow, wincol, line, column
+end
 nx.v = setmetatable({}, {
   __index = function(_, k)
     if k == "true" then

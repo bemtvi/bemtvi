@@ -77,7 +77,7 @@ pub use self::decor::DecorViewport;
 pub use self::menu::{
     Extent, MenuGeom, MenuItem, MenuMetrics, MenuPlacement, PreviewScroll, PreviewTarget, PromptPos,
 };
-pub use self::mouse::{ClickSurface, CompleteDocsHit, MouseClick, StatuslineClick};
+pub use self::mouse::{ClickSurface, CompleteDocsHit, MouseClick, MousePos, StatuslineClick};
 pub(crate) use self::multicursor::PlacementSnapshot;
 // The off-tick save / open requests (the daemon / edit-host fs path, Phase 3e/3f).
 pub use self::buffers::{
@@ -1088,6 +1088,11 @@ pub struct Editor {
     /// a left-press landed on a split divider. See [`crate::editor::mouse`].
     mouse_resize: Option<mouse::ResizeDrag>,
 
+    /// The global screen cell of the most recent processed mouse event (press, drag,
+    /// release, or wheel), backing [`mouse_pos`](Self::mouse_pos) / `vim.fn.getmousepos`.
+    /// `None` before any mouse event. See [`crate::editor::mouse`].
+    last_mouse: Option<(usize, usize)>,
+
     /// Set by a scroll command or a cursor motion at the moment it fires:
     /// `(top, cursor.line)` *before* the move. Consumed at the end of `input` to
     /// build `pending_scroll` when the viewport ends up moving more than a line.
@@ -1559,6 +1564,7 @@ impl Editor {
             mouse_select: None,
             statusline_click_seq: None,
             mouse_resize: None,
+            last_mouse: None,
             scroll_from: None,
             pending_scroll: None,
             decor_viewports: HashMap::new(),

@@ -134,7 +134,7 @@ impl EditHost {
     /// word/line escalation, shift-extend, `'mousemodel'` dispatch, or `"*` paste).
     /// A plain-left press already placed the cursor (the `<LeftMouse>` default), so a
     /// fired `<LeftMouse>` / `<C-LeftMouse>` map acts on the clicked position; a mapped
-    /// right/middle acts on the current cursor (v1 — `getmousepos()` is a later phase).
+    /// right/middle leaves the cursor put and reads the click via `vim.fn.getmousepos()`.
     /// Called right after `editor.mouse` on both the native dispatch and the wasm
     /// edit-host paths (the "two mouse entry points need settle parity" rule), so a
     /// mapping resolves the same way regardless of front end.

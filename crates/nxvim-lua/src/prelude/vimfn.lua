@@ -169,6 +169,29 @@ function nx.pos.set(expr, pos)
 end
 fn.setpos = nx.pos.set
 
+-- nx.getmousepos() [alias vim.fn.getmousepos]: the most recent mouse event's
+-- position as a dict — `screenrow`/`screencol` (1-based global screen cell),
+-- `winid` (the window the cell is in, 0 if none), `winrow`/`wincol` (1-based,
+-- window-relative, gutter included), `line`/`column` (1-based buffer line and byte
+-- column, 0 off a window's text), and `coladd` (always 0 — nxvim has no
+-- 'virtualedit'). Reads the `nx._mouse_pos` mirror the server pushes from the
+-- editor's last mouse cell, so a mouse mapping (`<RightMouse>`, `<MiddleMouse>`, …)
+-- can act on the *clicked* position rather than the cursor.
+function nx.getmousepos()
+  local m = nx._mouse_pos or {}
+  return {
+    screenrow = m.screenrow or 0,
+    screencol = m.screencol or 0,
+    winid = m.winid or 0,
+    winrow = m.winrow or 0,
+    wincol = m.wincol or 0,
+    line = m.line or 0,
+    column = m.column or 0,
+    coladd = 0,
+  }
+end
+fn.getmousepos = nx.getmousepos
+
 -- ----- match highlighting (matchadd family) ----------------------------------
 -- A per-window registry of match-highlight requests. INCOMPLETE: the registry is
 -- faithful (ids are allocated, stored, and removable, and getmatches reflects it),

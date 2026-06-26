@@ -2566,6 +2566,26 @@ impl LuaRuntime {
     /// whole-screen coordinates `vim.fn.screenrow()` / `vim.fn.screencol()`
     /// return), pushed alongside the buffer mirror. A popup plugin reads them to
     /// keep its popup from covering the cursor.
+    /// Mirror the last mouse event's resolved position (`nx._mouse_pos`, backing
+    /// `vim.fn.getmousepos()`): the global screen cell, the window it lands in, the
+    /// window-relative cell, and the buffer line/column — all 1-based, `0` off a
+    /// window's text. Pushed alongside the buffer mirror so a mouse mapping reads the
+    /// clicked position rather than the cursor.
+    #[allow(clippy::too_many_arguments)]
+    pub fn set_mouse_pos(
+        &self,
+        screenrow: u64,
+        screencol: u64,
+        winid: u64,
+        winrow: u64,
+        wincol: u64,
+        line: u64,
+        column: u64,
+    ) -> mlua::Result<()> {
+        let set: mlua::Function = self.nx()?.get("_set_mouse_pos")?;
+        set.call((screenrow, screencol, winid, winrow, wincol, line, column))
+    }
+
     pub fn set_screen_cursor(&self, row: u64, col: u64) -> mlua::Result<()> {
         let nx = self.nx()?;
         nx.set("_cur_screenrow", row)?;

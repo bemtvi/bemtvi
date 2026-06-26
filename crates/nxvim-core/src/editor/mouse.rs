@@ -75,10 +75,10 @@ pub(crate) enum ResizeDrag {
 /// escalation. The right / middle / shift-left presses defer their *whole* default to
 /// [`Editor::mouse_apply_default`] (selection-aware cursor placement, the `'mousemodel'`
 /// dispatch, the `"*` paste) — which is why the cell (`row`/`col`/`stamp_ms`) rides
-/// along: an unclaimed press re-hit-tests from it. A v1 *mapped* right/middle acts on
-/// the **current** cursor (`getmousepos()` / `v:mouse_*` is a later phase), and
-/// right/middle multi-click (`<2-RightMouse>`) is not yet counted (`clicks` is always 1
-/// for them).
+/// along: an unclaimed press re-hit-tests from it. A *mapped* right/middle does not
+/// move the cursor — the map reads the clicked cell via [`mouse_pos`](Editor::mouse_pos)
+/// / `vim.fn.getmousepos()` instead. Right/middle multi-click (`<2-RightMouse>`) is not
+/// yet counted (`clicks` is always 1 for them).
 #[derive(Debug, Clone, Copy)]
 pub struct MouseClick {
     /// The button pressed — `Left`/`Right`/`Middle` (never the wheel/move/thumb).
@@ -97,6 +97,25 @@ pub struct MouseClick {
     pub row: usize,
     pub col: usize,
     pub stamp_ms: u64,
+}
+
+/// The last mouse event's resolved position — the fields `vim.fn.getmousepos()`
+/// surfaces (see [`Editor::mouse_pos`]). All 1-based. `winid` / `line` / `column` are
+/// `0` when the last click missed a window's text (a separator, status line, or off the
+/// grid), and every field is `0` before the first mouse event.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct MousePos {
+    /// Global screen cell (1-based) — set for every event, even off a window.
+    pub screenrow: u64,
+    pub screencol: u64,
+    /// The window the cell lands in, `0` if none.
+    pub winid: u64,
+    /// The cell relative to that window's top-left (1-based; includes the gutter).
+    pub winrow: u64,
+    pub wincol: u64,
+    /// The buffer position: 1-based `line`, and `column` the 1-based byte column.
+    pub line: u64,
+    pub column: u64,
 }
 
 /// The anchored extent a left-drag extends from, set by the press by click count.
@@ -252,6 +271,9 @@ impl Editor {
         if !self.mouse_enabled() {
             return;
         }
+        // Remember the cell so `vim.fn.getmousepos()` reports this event's position —
+        // every processed gesture updates it (press / drag / release / wheel).
+        self.last_mouse = Some((ev.row, ev.col));
         // A disrupting gesture (a click anywhere, or a wheel that scrolls the text)
         // moves the cursor / scrolls the view, so it dismisses the cursor-anchored
         // transient popups — the hover / signature **doc floats** and the completion
@@ -586,6 +608,44 @@ impl Editor {
     /// right after a gesture). See [`MouseClick`] / [`Editor::mouse_clicks`].
     pub fn take_mouse_clicks(&mut self) -> Vec<MouseClick> {
         std::mem::take(&mut self.mouse_clicks)
+    }
+
+    /// The position of the most recent mouse event, in the shape `vim.fn.getmousepos()`
+    /// returns — global screen cell, the window the cell lands in, the window-relative
+    /// cell, and the buffer position. Resolved through the same [`hit_test`](Self::hit_test)
+    /// the gestures use, so a mouse mapping (`<RightMouse>`, `<MiddleMouse>`, …) can act on
+    /// the *clicked* position rather than the cursor. All-zero before the first mouse
+    /// event; off a window's text only the screen cell is set. The server mirrors this to
+    /// Lua before every callback (`nx._mouse_pos`).
+    pub fn mouse_pos(&self) -> MousePos {
+        let Some((row, col)) = self.last_mouse else {
+            return MousePos::default();
+        };
+        let mut mp = MousePos {
+            screenrow: row as u64 + 1,
+            screencol: col as u64 + 1,
+            ..MousePos::default()
+        };
+        // Only a click on a window's text resolves to a window / buffer position; a
+        // separator / status-line / off-grid cell leaves those fields 0 (as in vim).
+        if let Some(MouseTarget::Text {
+            win,
+            line,
+            col: bcol,
+        }) = self.hit_test(row, col)
+        {
+            mp.winid = win.0;
+            // `window_screen_pos` is the window's *global* top-left (chrome included),
+            // the exact inverse of the cell `hit_test` consumed, so the difference is
+            // the 1-based window-relative cell.
+            if let Some((wx, wy)) = self.window_screen_pos(win) {
+                mp.winrow = (row.saturating_sub(wy) + 1) as u64;
+                mp.wincol = (col.saturating_sub(wx) + 1) as u64;
+            }
+            mp.line = (line + 1) as u64;
+            mp.column = (bcol + 1) as u64;
+        }
+        mp
     }
 
     /// A left-press that hit-tested to a window's status line: focus the window

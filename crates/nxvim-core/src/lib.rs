@@ -36,7 +36,7 @@ pub use editor::{
     CompleteConfig, CompleteDocsHit, CompleteKeys, Cursor, DecorViewport, Editor, Extent,
     FileChangeAction, FileChangeReason, FileChangelist, FileFolds, FileMarkEntry, FloatAnchor,
     FloatConfig, FloatRelative, GlobalMarkEntry, JumpPos, Margin, MenuGeom, MenuItem, MenuMetrics,
-    MenuPlacement, MouseClick, NumberedMark, PendingOpen, PendingQuitAll, PendingSave,
+    MenuPlacement, MouseClick, MousePos, NumberedMark, PendingOpen, PendingQuitAll, PendingSave,
     PersistState, PreviewScroll, PreviewTarget, PromptPos, QfAction, QfEntry, QfList, QfStack,
     QfWhich, RegisterEntry, SessionDock, SessionState, SessionTab, SessionWindow, ShadaRequest,
     StatuslineClick, TabId, TerminalOp, UndoEntry, UndoTreeView, WindowConfigSpec, WindowId,

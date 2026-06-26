@@ -126,13 +126,25 @@ Add **`BufReadCmd`** as a supported autocmd event (neovim-faithful; the general
     selection-extend) behind the keymap lookup via the new `Editor::mouse_apply_default`
     — a bound `<…Mouse>` map suppresses the default, exactly like left. A plain / ctrl /
     alt left still places the cursor *eagerly* (so `<C-LeftMouse>` → go-to-definition
-    works on the click); a v1 mapped right/middle acts on the *current* cursor.
-    Multi-click is still left-only (`<2-RightMouse>` not yet counted), and
-    `getmousepos()` / `v:mouse_*` remain the deferred way to read a click position away
-    from the cursor. Tested in `tests/mouse.rs` (5 new: ctrl-left places + fires, modifier
+    works on the click); a mapped right/middle leaves the cursor put and reads the click
+    via `getmousepos()` (below). Multi-click is still left-only (`<2-RightMouse>` not yet
+    counted). Tested in `tests/mouse.rs` (5 new: ctrl-left places + fires, modifier
     distinguishes the map, right / middle / shift-left fire-and-suppress-default).
+  - **Follow-up — `getmousepos()`. ✅ DONE 2026-06-26.** `vim.fn.getmousepos()` (canonical
+    `nx.getmousepos()`) returns the last mouse event's position as a dict —
+    `screenrow`/`screencol` (1-based global cell), `winid`, `winrow`/`wincol` (1-based,
+    window-relative, gutter included), `line`/`column` (1-based buffer line + byte column,
+    0 off a window's text), `coladd` (always 0). The core records the last event's cell
+    (`Editor.last_mouse`, set in `Editor::mouse`) and `Editor::mouse_pos()` resolves it
+    through the same `hit_test` the gestures use (window-relative via `window_screen_pos`,
+    so chrome above the window is excluded). The server mirrors it to `nx._mouse_pos` in
+    `push_buf_mirror` — which `fire_mapping` runs *before* a mapping's RHS, so a
+    `<RightMouse>` / `<MiddleMouse>` map reads the *clicked* cell even though right/middle
+    don't move the cursor. Tested in `tests/mouse.rs` (4 new: clicked position, zero
+    before any click, window-relative excludes a tabline, a `<RightMouse>` map reads the
+    click without moving the cursor).
   - Still deferred: drag/release as mappable gestures (`<LeftDrag>` / `<LeftRelease>`),
-    `getmousepos()` / `v:mouse_*`, and right/middle multi-click.
+    `v:mouse_*` (set by `getchar()` mouse reads), and right/middle multi-click.
 - **Phase 2 — Primitive B (`BufReadCmd`). ✅ DONE 2026-06-25.** A file open is now
   **deferred** (enqueued as a `PendingOpen`) instead of read inline whenever a
   `BufReadCmd` handler is registered (`Editor::should_defer_open` = `host_fs_offtick ||

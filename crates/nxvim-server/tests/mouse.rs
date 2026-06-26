@@ -1360,6 +1360,157 @@ async fn middle_click_empty_clipboard_is_noop() {
     assert_eq!(mode(&rpc).await, "n");
 }
 
+// ===== getmousepos() ========================================================
+
+/// `vim.fn.getmousepos()` reports the last click's screen cell, window, and buffer
+/// position (all 1-based) — the position signal a mouse handler reads.
+#[tokio::test]
+async fn getmousepos_reports_the_clicked_position() {
+    let (rpc, _incoming) = start("hello world\nsecond line\nthird").await;
+    command(&rpc, "set nonumber norelativenumber").await;
+    let win = current_win(&rpc).await;
+    feed_mouse(&rpc, "left", "press", 1, 3); // global row 1, col 3 → line 2, byte col 3
+    assert_eq!(
+        exec_lua(&rpc, "return vim.fn.getmousepos().winid")
+            .await
+            .as_u64(),
+        Some(win)
+    );
+    assert_eq!(
+        exec_lua(&rpc, "return vim.fn.getmousepos().line")
+            .await
+            .as_u64(),
+        Some(2),
+        "1-based buffer line"
+    );
+    assert_eq!(
+        exec_lua(&rpc, "return vim.fn.getmousepos().column")
+            .await
+            .as_u64(),
+        Some(4),
+        "1-based byte column"
+    );
+    assert_eq!(
+        exec_lua(&rpc, "return vim.fn.getmousepos().screenrow")
+            .await
+            .as_u64(),
+        Some(2)
+    );
+    assert_eq!(
+        exec_lua(&rpc, "return vim.fn.getmousepos().screencol")
+            .await
+            .as_u64(),
+        Some(4)
+    );
+    // The window sits at the screen origin here, so window-relative == screen.
+    assert_eq!(
+        exec_lua(&rpc, "return vim.fn.getmousepos().winrow")
+            .await
+            .as_u64(),
+        Some(2)
+    );
+    assert_eq!(
+        exec_lua(&rpc, "return vim.fn.getmousepos().wincol")
+            .await
+            .as_u64(),
+        Some(4)
+    );
+}
+
+/// Before any mouse event, `getmousepos()` is all-zero for the window/buffer fields
+/// (no stale position) — `winid`/`line`/`column` are 0.
+#[tokio::test]
+async fn getmousepos_is_zero_before_any_click() {
+    let (rpc, _incoming) = start("hello world").await;
+    assert_eq!(
+        exec_lua(&rpc, "return vim.fn.getmousepos().winid")
+            .await
+            .as_u64(),
+        Some(0)
+    );
+    assert_eq!(
+        exec_lua(&rpc, "return vim.fn.getmousepos().line")
+            .await
+            .as_u64(),
+        Some(0)
+    );
+    assert_eq!(
+        exec_lua(&rpc, "return vim.fn.getmousepos().column")
+            .await
+            .as_u64(),
+        Some(0)
+    );
+}
+
+/// `winrow`/`wincol` are window-relative, so chrome above the window (a tabline)
+/// offsets them from the global `screenrow`/`screencol`.
+#[tokio::test]
+async fn getmousepos_window_relative_accounts_for_chrome() {
+    let (rpc, _incoming) = start("hello world\nsecond line\nthird").await;
+    command(&rpc, "set nonumber norelativenumber showtabline=2").await;
+    // The tabline eats global row 0, so the window's first line is global row 1.
+    feed_mouse(&rpc, "left", "press", 2, 5); // global row 2 → window row 2, line 2
+    assert_eq!(
+        exec_lua(&rpc, "return vim.fn.getmousepos().screenrow")
+            .await
+            .as_u64(),
+        Some(3),
+        "global screen row is 1-based from the very top"
+    );
+    assert_eq!(
+        exec_lua(&rpc, "return vim.fn.getmousepos().winrow")
+            .await
+            .as_u64(),
+        Some(2),
+        "window-relative row excludes the tabline above the window"
+    );
+    assert_eq!(
+        exec_lua(&rpc, "return vim.fn.getmousepos().line")
+            .await
+            .as_u64(),
+        Some(2)
+    );
+}
+
+/// The key use case: a `<RightMouse>` map reads `getmousepos()` to act on the
+/// *clicked* cell even though a right-click doesn't move the cursor — the position is
+/// current inside the mapping (the mirror is pushed before the RHS fires).
+#[tokio::test]
+async fn a_mouse_map_reads_getmousepos_for_the_clicked_cell() {
+    let (rpc, _incoming) = start("hello world\nsecond line\nthird").await;
+    command(&rpc, "set nonumber norelativenumber").await;
+    exec_lua(
+        &rpc,
+        r#"
+        _G.clicked_line = nil
+        _G.clicked_col = nil
+        nx.keymap.set('n', '<RightMouse>', function()
+          local p = vim.fn.getmousepos()
+          _G.clicked_line = p.line
+          _G.clicked_col = p.column
+        end)
+        return true
+    "#,
+    )
+    .await;
+    assert_eq!(cursor(&rpc).await, (1, 0));
+    feed_mouse(&rpc, "right", "press", 2, 2); // line 3, byte col 2 → column 3
+    assert_eq!(
+        cursor(&rpc).await,
+        (1, 0),
+        "the right-click map ran without moving the cursor"
+    );
+    assert_eq!(
+        exec_lua(&rpc, "return _G.clicked_line").await.as_u64(),
+        Some(3),
+        "the map saw the clicked line, not the cursor line"
+    );
+    assert_eq!(
+        exec_lua(&rpc, "return _G.clicked_col").await.as_u64(),
+        Some(3)
+    );
+}
+
 // ===== Modifiers + right/middle as mappable buttons =========================
 
 /// `<C-LeftMouse>` is mappable: a Ctrl+left press fires the map, and — like a plain

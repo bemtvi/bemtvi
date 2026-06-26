@@ -578,6 +578,12 @@ pub struct EditHost {
     /// Negotiated runtime state (encoding, sync kind) per started server, learned
     /// from each `initialize` reply.
     lsp_servers: HashMap<ServerKey, ServerRuntime>,
+    /// Whether the user opted into the **signature-help auto-trigger**
+    /// (`nx.lsp.signature_help_autotrigger(true)`). It's the latch the per-buffer
+    /// trigger set hangs off: when set, an attaching server's advertised trigger chars
+    /// are pushed into core; cleared, core's set is emptied so only `<C-k>` triggers
+    /// signature help. See [`crate::editor`]'s `signature` module.
+    signature_auto: bool,
     /// Server keys already handed to `ensure_server`, so a server is requested
     /// once rather than on every redraw (a lazy-start guard).
     lsp_ensured: HashSet<ServerKey>,
@@ -993,6 +999,7 @@ impl EditHost {
             resolved_ts_langs: HashSet::new(),
             lsp_states: HashMap::new(),
             lsp_servers: HashMap::new(),
+            signature_auto: false,
             lsp_ensured: HashSet::new(),
             next_lsp_client_id: 1,
             lsp_dirty: false,

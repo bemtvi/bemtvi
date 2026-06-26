@@ -53,6 +53,12 @@ nx.lsp.config("basedpyright", {
 })
 nx.lsp.enable("basedpyright")
 
+-- Signature help that pops up as you type a call: after `print(` (refreshed at each
+-- `,`), the parameter hints float under the cursor and stay while you fill the args.
+-- Driven by basedpyright's own `signatureHelpProvider.triggerCharacters`; <C-k> still
+-- summons it manually anywhere.
+nx.lsp.signature_help_autotrigger(true)
+
 -- Autocompletion: the native nx.complete engine, popping up as you type. The `lsp`
 -- source (basedpyright, above) leads; the `buffer` word-scan is a fallback for
 -- prose and comments. `min_chars = 1` opens the popup after a single character;

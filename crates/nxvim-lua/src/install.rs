@@ -1589,6 +1589,20 @@ pub(crate) fn install_runtime_api(
         })?,
     )?;
 
+    // `nx._signature_autotrigger(enable)`: queue [`LspOp::SignatureAutoTrigger`] —
+    // opt into auto-showing signature help as you type a call (the server's advertised
+    // trigger chars drive it). The prelude's `nx.lsp.signature_help_autotrigger` wraps it.
+    let sh = shared.clone();
+    nx.set(
+        "_signature_autotrigger",
+        lua.create_function(move |_, enable: bool| {
+            sh.borrow_mut()
+                .lsp_ops
+                .push(LspOp::SignatureAutoTrigger { enable });
+            Ok(())
+        })?,
+    )?;
+
     // `nx._lsp_buf_rename(name)`: queue [`LspOp::Rename`]. The prelude requires
     // the argument (echoing `E471` on nil), so a name always arrives here.
     let sh = shared.clone();

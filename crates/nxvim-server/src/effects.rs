@@ -2720,6 +2720,11 @@ impl EditHost {
                 self.complete_snippet_dispatch(gen);
                 self.apply_lua_effects();
             }
+            // Signature-help auto-trigger: a trigger keystroke (`(` / `,`) raised a
+            // one-shot request in core; issue `textDocument/signatureHelp` for it (when
+            // the current buffer's server supports it). Shared by the native server and
+            // the wasm edit-host, so the demo gets it over the LSP seam too.
+            self.drain_signature_auto_request();
             // Command-line completion (`nx.cmdline_complete`): core stamped the token
             // being completed on `<Tab>` (or an edit while the wildmenu is open).
             // Resolve it synchronously against the bundled catalog source — the filter

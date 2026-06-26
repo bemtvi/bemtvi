@@ -283,6 +283,11 @@ impl Editor {
             self.complete_trigger();
         }
 
+        // Signature-help auto-trigger (opt-in): a `(` / `,` (the server's advertised
+        // trigger chars) fires `textDocument/signatureHelp` as you type the call. A
+        // no-op unless the host pushed a trigger set (enabled + supported).
+        self.signature_after_insert(&key);
+
         // Keep the active tabstop's mirrors in sync with whatever was just typed.
         if self.snippet_active() {
             self.snippet_sync();

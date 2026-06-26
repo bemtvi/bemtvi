@@ -468,6 +468,20 @@ pub(crate) fn provider_caps(caps: &ServerCapabilities) -> ProviderCaps {
         references: present("referencesProvider"),
         hover: present("hoverProvider"),
         signature_help: present("signatureHelpProvider"),
+        // The advertised signature-help trigger/retrigger characters (e.g. `(` / `,`),
+        // flattened — what an opt-in auto-trigger fires on. Read off the typed options
+        // object rather than the JSON probe above (which only yields presence).
+        signature_trigger_chars: caps
+            .signature_help_provider
+            .as_ref()
+            .map(|o| {
+                let mut chars = o.trigger_characters.clone().unwrap_or_default();
+                if let Some(retrigger) = &o.retrigger_characters {
+                    chars.extend(retrigger.iter().cloned());
+                }
+                chars
+            })
+            .unwrap_or_default(),
         completion: present("completionProvider"),
         document_formatting: present("documentFormattingProvider"),
         rename: present("renameProvider"),

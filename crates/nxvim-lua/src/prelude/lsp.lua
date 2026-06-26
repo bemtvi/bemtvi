@@ -457,6 +457,15 @@ end
 function nx.lsp.signature_help()
   nx._lsp_buf(6)
 end
+
+-- nx.lsp.signature_help_autotrigger(enable): opt into auto-showing signature help as
+-- you type a call (after `(`, refreshed at each `,`), instead of only on <C-k>. It is
+-- driven by the *server's* advertised `signatureHelpProvider.triggerCharacters`, so it
+-- only fires for servers that offer signature help. `enable` defaults to true; pass
+-- false to turn it back off. Off unless a config opts in.
+function nx.lsp.signature_help_autotrigger(enable)
+  nx._signature_autotrigger(enable ~= false)
+end
 function nx.lsp.format()
   nx._lsp_buf_format()
 end

@@ -54,6 +54,7 @@ mod persist;
 mod quickfix;
 mod registers;
 mod search;
+mod signature;
 pub mod snippet;
 mod syntax;
 mod tabs;
@@ -925,6 +926,20 @@ pub struct Editor {
     /// can't (the `lsp` source's `textEdit` + `additionalTextEdits`). `None` when the
     /// last accept was a native `buffer` insert (already applied in core).
     pub complete_accept_request: Option<usize>,
+    /// The signature-help **auto-trigger** characters — the server's advertised
+    /// `signatureHelpProvider.{trigger,retrigger}Characters`, pushed in by the host
+    /// when an opted-in user has a server that advertises them attached. Non-empty
+    /// **iff** the auto-trigger is both enabled and supported; empty leaves the manual
+    /// `<C-k>` path untouched. See [`signature`](crate::editor::signature).
+    signature_trigger_chars: Vec<char>,
+    /// Whether a signature **session** is open — the window from a trigger char until
+    /// you leave the call. While set, the signature doc float is *sticky* (kept across
+    /// the next-key dismissal in [`Editor::input`]) instead of transient.
+    signature_session: bool,
+    /// One-shot: an insert keystroke asked for a (re)fired signature-help request. The
+    /// host tick drains it into a `textDocument/signatureHelp` (core can't issue LSP),
+    /// the completion analogue being [`Editor::complete_query_changes`].
+    pub signature_auto_request: bool,
     /// The command-line completion engine's configuration (`nx.cmdline_complete`).
     /// Disabled until a config arrives, so an editor with no command-line completion
     /// is byte-for-byte unchanged. See [`cmdcomplete`](crate::editor::cmdcomplete).
@@ -1534,6 +1549,9 @@ impl Editor {
             mouse_clicks: Vec::new(),
             complete_config: complete::CompleteConfig::default(),
             complete_query_changes: Vec::new(),
+            signature_trigger_chars: Vec::new(),
+            signature_session: false,
+            signature_auto_request: false,
             complete_gen: 0,
             complete_accept_request: None,
             cmdcomplete: cmdcomplete::CmdlineCompleteConfig::default(),
@@ -1732,8 +1750,11 @@ impl Editor {
         // A doc float (the hover / signature-help *window*) is dismissed the same
         // way on the next key. Unlike the content float it is a real float window,
         // so a mouse wheel — which never flows through `input` — scrolls it instead
-        // of closing it (the whole point of backing it with a window).
-        self.close_all_doc_floats();
+        // of closing it (the whole point of backing it with a window). The exception
+        // is an active signature *session*: its float is kept across the keystrokes
+        // that fill the call (see [`signature`](crate::editor::signature)).
+        let in_signature_session = self.signature_session;
+        self.close_transient_doc_floats();
 
         // A focused menu (`nx.ui.select` / the picker) grabs every key the same
         // way — navigation + confirm / cancel — floating over the text. A
@@ -1927,6 +1948,12 @@ impl Editor {
         // motion off-screen, buffer/window switch, edit reflow) and queue it for the
         // server to dispatch to `nx.decor` providers off-tick (`editor/decor.rs`).
         self.recompute_decor_dirty();
+
+        // Leaving insert mode (the `<Esc>` that just processed) ends an open signature
+        // session and closes its sticky float — you are no longer filling the call.
+        if in_signature_session && !self.mode.is_insert() {
+            self.end_signature_session();
+        }
     }
 
     /// Turn a recorded `scroll_from` into a `pending_scroll` animation when the

@@ -100,6 +100,11 @@ pub struct ProviderCaps {
     pub references: bool,
     pub hover: bool,
     pub signature_help: bool,
+    /// The characters the server advertises as `signatureHelpProvider.{trigger,
+    /// retrigger}Characters` (typically `(` and `,`) — what an opt-in auto-trigger
+    /// fires signature help on. Empty when the server sends none (or no signature
+    /// help at all), so the auto-trigger stays off without a real signal to react to.
+    pub signature_trigger_chars: Vec<String>,
     pub completion: bool,
     pub document_formatting: bool,
     pub rename: bool,

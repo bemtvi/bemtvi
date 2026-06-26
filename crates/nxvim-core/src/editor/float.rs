@@ -21,6 +21,11 @@
 use super::menu::{Extent, MenuPlacement};
 use super::windows::{BorderStyle, FloatAnchor, FloatConfig, FloatRelative};
 use super::{BufferId, Editor, WindowId};
+
+/// The surface name of the signature-help doc float — shared by the host (which opens
+/// it in `show_signature_help`) and core's auto-trigger session (which keeps it sticky
+/// across keystrokes and closes it when the call ends). One constant so the two agree.
+pub(crate) const SIGNATURE_DOC_FLOAT: &str = "[Signature]";
 use crate::buffer::Buffer;
 use crate::extmark::VirtChunk;
 use crate::unicode::display_width;
@@ -265,6 +270,33 @@ impl Editor {
             self.close_window_by_id(win, false);
         }
         true
+    }
+
+    /// The next-key doc-float dismissal that runs at the top of [`Editor::input`], but
+    /// **keeping** the signature float while a signature session is open — so an
+    /// auto-triggered signature popup survives the keystrokes that fill the call
+    /// instead of flashing away on the first one. With no session it is exactly
+    /// [`close_all_doc_floats`](Self::close_all_doc_floats).
+    pub(crate) fn close_transient_doc_floats(&mut self) -> bool {
+        if !self.signature_session {
+            return self.close_all_doc_floats();
+        }
+        let mut closed = false;
+        let keep = SIGNATURE_DOC_FLOAT;
+        let kept: Vec<(String, WindowId)> = std::mem::take(&mut self.doc_float_wins)
+            .into_iter()
+            .filter_map(|(name, win)| {
+                if name == keep {
+                    Some((name, win))
+                } else {
+                    self.close_window_by_id(win, false);
+                    closed = true;
+                    None
+                }
+            })
+            .collect();
+        self.doc_float_wins = kept;
+        closed
     }
 
     /// Whether `id` is a reused doc-float scratch buffer. Such buffers are surfaces,

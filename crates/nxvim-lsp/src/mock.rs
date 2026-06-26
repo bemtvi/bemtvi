@@ -336,7 +336,7 @@ fn initialize_result(script: &Value) -> Value {
         "implementationProvider": true,
         "referencesProvider": true,
         "hoverProvider": true,
-        "signatureHelpProvider": {},
+        "signatureHelpProvider": { "triggerCharacters": ["(", ","] },
         "completionProvider": {},
         "documentFormattingProvider": true,
         "renameProvider": true,

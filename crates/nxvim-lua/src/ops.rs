@@ -248,6 +248,13 @@ pub enum LspOp {
     },
     /// `nx.lsp.code_action()` — request `textDocument/codeAction` at the cursor.
     CodeAction,
+    /// `nx.lsp.signature_help_autotrigger(enable)` — opt into (or out of) auto-showing
+    /// signature help as you type a call, driven by the server's advertised trigger
+    /// chars. The server latches the flag and pushes the trigger set into core.
+    SignatureAutoTrigger {
+        /// `true` to enable the auto-trigger, `false` to disable it.
+        enable: bool,
+    },
     /// `vim.diagnostic.goto_next()` / `goto_prev()` — move the cursor to the next
     /// (`forward`) or previous diagnostic in the current buffer, wrapping.
     DiagnosticGoto {

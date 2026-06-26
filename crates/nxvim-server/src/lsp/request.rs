@@ -75,6 +75,54 @@ impl EditHost {
         self.fx.lsp_request(key, token, req);
     }
 
+    /// Recompute core's signature-help **auto-trigger** set from the opt-in flag and
+    /// the attached servers' advertised chars: the union of every started server's
+    /// `signatureHelpProvider` trigger characters while opted in, else empty (which
+    /// turns the auto-trigger off and ends any session). Called when the flag toggles
+    /// and when a server's `initialize` reply lands. Per-buffer correctness — firing
+    /// only where a signature server actually serves — is enforced at drain time, not
+    /// here, so the union is a permissive superset.
+    pub(crate) fn refresh_signature_autotrigger(&mut self) {
+        let chars: Vec<char> = if self.signature_auto {
+            let mut set: Vec<char> = Vec::new();
+            for rt in self.lsp_servers.values() {
+                for &c in &rt.signature_trigger_chars {
+                    if !set.contains(&c) {
+                        set.push(c);
+                    }
+                }
+            }
+            set
+        } else {
+            Vec::new()
+        };
+        self.editor.set_signature_trigger_chars(chars);
+    }
+
+    /// Drain core's one-shot signature auto-request (raised by a trigger keystroke):
+    /// issue `textDocument/signatureHelp` at the cursor — but only when the **current**
+    /// buffer's server actually advertises signature trigger chars. In any other buffer
+    /// the request is silently dropped (and any session ended) rather than echoing a
+    /// "no language server" error on every `(` typed in a non-LSP buffer.
+    pub(crate) fn drain_signature_auto_request(&mut self) {
+        if !std::mem::take(&mut self.editor.signature_auto_request) {
+            return;
+        }
+        if self.current_buffer_has_signature_trigger() {
+            self.request_lsp(LspReqKind::SignatureHelp);
+        } else {
+            self.editor.end_signature_session();
+        }
+    }
+
+    /// Whether the current buffer's (initialized) server advertises signature-help
+    /// trigger characters — the per-buffer gate for the auto-trigger drain.
+    fn current_buffer_has_signature_trigger(&self) -> bool {
+        self.current_lsp_target()
+            .and_then(|(key, _, _)| self.lsp_servers.get(&key))
+            .is_some_and(|rt| !rt.signature_trigger_chars.is_empty())
+    }
+
     /// Bump the request generation and register the in-flight request for `kind`
     /// (buffer/cursor/`changedtick` at issue time), returning its [`ReqToken`].
     /// The single home for the staleness bookkeeping every issue function shares.
@@ -462,7 +510,14 @@ impl EditHost {
         active_parameter: Option<String>,
     ) {
         let Some(signature) = signature else {
-            self.editor.echo(LspReqKind::SignatureHelp.empty_message());
+            // An auto-trigger session reaching an empty reply means you left the call
+            // (typed past the `)`, or the cursor moved out): close the sticky float
+            // silently. Only the manual `<C-k>` path echoes "no signature".
+            if self.editor.signature_session_active() {
+                self.editor.end_signature_session();
+            } else {
+                self.editor.echo(LspReqKind::SignatureHelp.empty_message());
+            }
             return;
         };
         let line = match active_parameter {

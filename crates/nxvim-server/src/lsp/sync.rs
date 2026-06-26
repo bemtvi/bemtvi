@@ -42,6 +42,13 @@ impl EditHost {
                 self.request_lsp_code_action();
                 return;
             }
+            LspOp::SignatureAutoTrigger { enable } => {
+                // Latch the opt-in and (re)derive core's trigger set from whatever
+                // servers are already attached; future attaches refresh it too.
+                self.signature_auto = enable;
+                self.refresh_signature_autotrigger();
+                return;
+            }
             LspOp::WorkspaceSymbol { query } => {
                 self.request_lsp_workspace_symbol(&query);
                 return;
@@ -575,6 +582,15 @@ impl EditHost {
                         semantic_tokens_delta: caps.semantic_tokens_delta,
                         inlay_hints: caps.providers.inlay_hints,
                         folding_range: caps.providers.folding_range,
+                        // Flatten the advertised trigger/retrigger strings to `char`s
+                        // (each is a single character in practice); the auto-trigger
+                        // matches a typed key against these.
+                        signature_trigger_chars: caps
+                            .providers
+                            .signature_trigger_chars
+                            .iter()
+                            .filter_map(|s| s.chars().next())
+                            .collect(),
                     },
                 );
                 // Mirror the client into `nx.lsp._clients[id]` so `on_attach` can
@@ -601,6 +617,9 @@ impl EditHost {
                     }
                 }
                 self.lsp_dirty = true;
+                // Now that this server's advertised signature trigger chars are known,
+                // refresh core's auto-trigger set (a no-op unless the user opted in).
+                self.refresh_signature_autotrigger();
             }
             LspEvent::Diagnostics {
                 uri, diagnostics, ..

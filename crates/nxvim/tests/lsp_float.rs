@@ -294,6 +294,123 @@ async fn signature_help_reply_opens_a_float_window() {
     std::env::remove_var("NXVIM_LSP_CMD");
 }
 
+// ── Signature-help auto-trigger (opt-in, server-advertised trigger chars) ──────
+//
+// The mock advertises `signatureHelpProvider.triggerCharacters = ["(", ","]`, so an
+// opted-in editor fires `textDocument/signatureHelp` when you type `(` while editing.
+// The float is *sticky* across the keystrokes that fill the call (unlike the
+// next-key-transient hover) and closes when you leave insert mode.
+
+/// A signature-help reply script the mock answers any `signatureHelp` request with.
+const SIG_SCRIPT: &str = r#"{ "signature_help": { "signatures": [
+     { "label": "fn foo(a: i32, b: i32)",
+       "parameters": [ { "label": "a: i32" }, { "label": "b: i32" } ] } ],
+     "activeSignature": 0, "activeParameter": 0 } }"#;
+
+/// Poll until the LSP client has finished `initialize` (mirrored into
+/// `nx.lsp._clients`), so the server's advertised trigger chars have reached core.
+async fn wait_for_lsp(rpc: &Rpc) {
+    for _ in 0..200 {
+        if exec_lua(rpc, "return next(nx.lsp._clients) ~= nil").await == Value::Boolean(true) {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+    panic!("the mock LSP never initialized");
+}
+
+/// Poll the redraw stream for a floating doc-float window containing `want`. `None`
+/// once the bounded retries are exhausted with no such float.
+async fn poll_float(
+    rpc: &Rpc,
+    incoming: &mut UnboundedReceiver<Incoming>,
+    want: &str,
+) -> Option<Vec<(Value, Value)>> {
+    for _ in 0..200 {
+        nxvim_test_harness::barrier(rpc).await;
+        if let Some(map) = drain_to_latest_redraw(incoming, |m| floating_window(m).is_some()) {
+            let win = floating_window(&map).expect("a floating window");
+            if window_lines(&win).iter().any(|l| l.contains(want)) {
+                return Some(win);
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+    None
+}
+
+/// Whether any floating window is currently in the latest redraw (bounded poll).
+async fn any_float(rpc: &Rpc, incoming: &mut UnboundedReceiver<Incoming>) -> bool {
+    for _ in 0..8 {
+        nxvim_test_harness::barrier(rpc).await;
+        if drain_to_latest_redraw(incoming, |m| floating_window(m).is_some()).is_some() {
+            return true;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(15)).await;
+    }
+    false
+}
+
+#[tokio::test]
+async fn autotrigger_floats_signature_on_open_paren_and_stays_while_typing() {
+    let _guard = serial_lock().lock().await;
+    let dir = temp_dir("lsp_sig_auto");
+    arm_mock(&dir, SIG_SCRIPT);
+    let (rpc, mut incoming) = start(&dir).await;
+
+    // Opt in, then wait until the server's trigger chars (`(` / `,`) have reached core.
+    exec_lua(&rpc, "nx.lsp.signature_help_autotrigger(true)").await;
+    wait_for_lsp(&rpc).await;
+
+    // Type a call on a fresh line: the `(` auto-fires signature help.
+    feed(&rpc, "ofoo(");
+    let win = poll_float(&rpc, &mut incoming, "fn foo(a: i32, b: i32)")
+        .await
+        .expect("typing `(` auto-opens the signature float");
+    assert!(
+        window_lines(&win).iter().any(|l| l.contains("[a: i32]")),
+        "the active parameter is marked, got {:?}",
+        window_lines(&win)
+    );
+
+    // Typing an argument character keeps the float (it is sticky during the session),
+    // unlike a hover which the next key dismisses.
+    feed(&rpc, "x");
+    assert!(
+        poll_float(&rpc, &mut incoming, "fn foo(a: i32, b: i32)")
+            .await
+            .is_some(),
+        "the signature float survives typing into the call"
+    );
+
+    // Leaving insert mode ends the session and closes the float.
+    feed(&rpc, "<Esc>");
+    assert!(
+        !any_float(&rpc, &mut incoming).await,
+        "leaving insert mode closes the signature float"
+    );
+
+    std::env::remove_var("NXVIM_LSP_CMD");
+}
+
+#[tokio::test]
+async fn autotrigger_is_off_by_default() {
+    let _guard = serial_lock().lock().await;
+    let dir = temp_dir("lsp_sig_auto_off");
+    arm_mock(&dir, SIG_SCRIPT);
+    let (rpc, mut incoming) = start(&dir).await;
+    wait_for_lsp(&rpc).await;
+
+    // No opt-in: typing `(` must NOT float anything — signature help stays manual.
+    feed(&rpc, "ofoo(");
+    assert!(
+        !any_float(&rpc, &mut incoming).await,
+        "without opting in, typing `(` does not auto-open signature help"
+    );
+
+    std::env::remove_var("NXVIM_LSP_CMD");
+}
+
 #[tokio::test]
 async fn empty_hover_echoes_instead_of_an_empty_float() {
     let _guard = serial_lock().lock().await;

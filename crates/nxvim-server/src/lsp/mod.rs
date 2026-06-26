@@ -340,6 +340,11 @@ pub(crate) struct ServerRuntime {
     /// `foldmethod=expr` resolves to the LSP foldexpr requests folding ranges only
     /// from a server that offers them, so this gates the request like `inlay_hints`.
     folding_range: bool,
+    /// The server's advertised `signatureHelpProvider.{trigger,retrigger}Characters`
+    /// (usually `(` / `,`), pre-reduced to `char`s. Pushed into core as the
+    /// auto-trigger set when this server attaches and the user opted in; empty when the
+    /// server advertises none. See `EditHost::signature_auto`.
+    signature_trigger_chars: Vec<char>,
 }
 
 /// Human label for a negotiated position encoding (matches the LSP wire names).

@@ -69,6 +69,11 @@ pub struct QfEntry {
     pub valid: bool,
 }
 
+/// One entry for [`Editor::open_location_list`]: `(path, line, col, text, typ)` with
+/// **0-based** line/col and `typ` the vim quickfix type char (`E`/`W`/`I`/`N`, `0`
+/// for none) that drives the row's severity color.
+pub type LocListEntry = (PathBuf, usize, usize, String, u8);
+
 /// A quickfix or location list: the entries plus a title and the current index.
 #[derive(Debug, Clone, Default)]
 pub struct QfList {
@@ -303,23 +308,22 @@ impl Editor {
     /// Open the current window's **location list** from `entries` and show it
     /// (`:lopen`) — the navigable successor to the retired panel's
     /// `open_panel` + `set_panel_targets` for LSP reference / diagnostic lists.
-    /// Each entry is `(path, line, col, text)` with **0-based** line/col (the form the
-    /// old panel targets used); the loclist stores vim's 1-based columns. The list is
-    /// pushed as a *new* list on the window's stack (recover a prior `:lgrep` with
-    /// `:lolder`), and `<CR>` on a row jumps via the buffer-local `qf` map.
-    pub fn open_location_list(
-        &mut self,
-        entries: Vec<(PathBuf, usize, usize, String)>,
-        title: &str,
-    ) {
+    /// Each entry is `(path, line, col, text, typ)` with **0-based** line/col (the form
+    /// the old panel targets used); the loclist stores vim's 1-based columns. `typ` is
+    /// the vim quickfix type char (`E`/`W`/`I`/`N`, `0` for none) — it drives the row's
+    /// severity color. The list is pushed as a *new* list on the window's stack (recover
+    /// a prior `:lgrep` with `:lolder`), and `<CR>` on a row jumps via the buffer-local
+    /// `qf` map.
+    pub fn open_location_list(&mut self, entries: Vec<LocListEntry>, title: &str) {
         let which = QfWhich::Location(self.windows.current);
         let items = entries
             .into_iter()
-            .map(|(path, line, col, text)| QfEntry {
+            .map(|(path, line, col, text, typ)| QfEntry {
                 filename: Some(path.display().to_string()),
                 lnum: line + 1,
                 col: col + 1,
                 text,
+                typ,
                 valid: true,
                 ..Default::default()
             })
@@ -540,6 +544,44 @@ impl Editor {
             QfWhich::Location(_) => "[Location List]",
         };
         self.load_str_into(buf, Some(name.to_string()), &text);
+        self.qf_paint_severity(buf, which);
+    }
+
+    /// Paint each rendered entry's full row with the highlight group for its error
+    /// `typ` (`E`/`W`/`I`/`N` → `Diagnostic{Error,Warn,Info,Hint}`), so a
+    /// `:LspDiagnostics` / `vim.diagnostic.setloclist` list — and any `:make`/`:grep`
+    /// list carrying type codes — is colored by severity. Entries with no type
+    /// (`typ == 0`, e.g. plain `:grep` matches) are left uncolored. Marks ride the
+    /// reserved [`LISTING_HL_NS`](crate::extmark::LISTING_HL_NS), cleared first so a
+    /// re-render (list replaced in place) repaints cleanly.
+    fn qf_paint_severity(&mut self, buf: BufferId, which: QfWhich) {
+        let groups: Vec<Option<&'static str>> = self
+            .qf_cur(which)
+            .items
+            .iter()
+            .map(|e| qf_type_hl(e.typ))
+            .collect();
+        let Some(b) = self.buffer_of_mut(buf) else {
+            return;
+        };
+        b.extmarks.clear(crate::extmark::LISTING_HL_NS, None);
+        for (line, group) in groups.iter().enumerate() {
+            let Some(group) = group else { continue };
+            if line >= b.line_count() {
+                break;
+            }
+            let start = b.line_start(line);
+            let end = start + b.line_len(line);
+            b.extmarks.set(
+                crate::extmark::LISTING_HL_NS,
+                None,
+                start,
+                Some(end),
+                Some((*group).to_string()),
+                crate::extmark::DEFAULT_PRIORITY,
+                None,
+            );
+        }
     }
 
     /// `which`'s display text: one `file|lnum col N| message` line per entry.
@@ -1113,6 +1155,21 @@ fn qf_render_line(e: &QfEntry) -> String {
     }
     let text = e.text.replace('\n', " ");
     format!("{fname}|{loc}| {text}")
+}
+
+/// The severity highlight group for a quickfix entry's error `typ` char, or `None`
+/// for a typeless entry (a plain output line, e.g. a `:grep` match). The `E`/`W`/
+/// `I`/`N` codes are vim's quickfix type letters — what `:make`/`errorformat`'s
+/// `%t` yields and what `vim.diagnostic.toqflist` maps each severity to.
+fn qf_type_hl(typ: u8) -> Option<&'static str> {
+    match typ {
+        b'E' | b'e' => Some("DiagnosticError"),
+        b'W' | b'w' => Some("DiagnosticWarn"),
+        b'I' | b'i' => Some("DiagnosticInfo"),
+        // `N` is vim's "note"; nxvim's diagnostics map HINT → `N`.
+        b'N' | b'n' | b'H' | b'h' => Some("DiagnosticHint"),
+        _ => None,
+    }
 }
 
 // ---------------------------------------------------------------------------

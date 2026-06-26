@@ -1287,3 +1287,80 @@ async fn closing_a_loclist_owner_closes_its_loclist_window() {
         "closing the owner closed both it and its loclist window"
     );
 }
+
+/// Whether any window in `map` paints highlight `group` across the row whose text
+/// contains `needle`. Scans every window's parallel `lines`/`highlights` arrays
+/// (the loclist is a dock/split window, not necessarily `windows[0]`).
+fn row_has_group(map: &[(Value, Value)], needle: &str, group: &str) -> bool {
+    let Some(Value::Array(windows)) = map_get(map, "windows") else {
+        return false;
+    };
+    for win in windows {
+        let Value::Map(win) = win else { continue };
+        let (Some(lines), Some(hls)) = (
+            map_get(win, "lines").and_then(Value::as_array),
+            map_get(win, "highlights").and_then(Value::as_array),
+        ) else {
+            continue;
+        };
+        for (i, line) in lines.iter().enumerate() {
+            if !line.as_str().is_some_and(|l| l.contains(needle)) {
+                continue;
+            }
+            let hit = hls.get(i).and_then(Value::as_array).is_some_and(|spans| {
+                spans.iter().any(|s| {
+                    s.as_array().and_then(|s| s.get(2)).and_then(Value::as_str) == Some(group)
+                })
+            });
+            if hit {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+#[tokio::test]
+async fn lspdiagnostics_colors_loclist_rows_by_severity() {
+    let (rpc, mut incoming) = start().await;
+    let path = write_temp("diag_color", "txt", "aa\nbb\ncc\ndd\n");
+    message_after(&rpc, &mut incoming, &format!(":e {path}<CR>")).await;
+    // One diagnostic of each severity, on ascending lines so the loclist (sorted by
+    // position) renders them error→warn→info→hint and each message is unique.
+    // `vim.diagnostic.set` pushes into the server's render store, which is what the
+    // `:LspDiagnostics` (location-list) path reads.
+    exec_lua(
+        &rpc,
+        r#"vim.diagnostic.set(1, 0, {
+             { lnum = 0, col = 0, message = "an error here",   severity = 1 },
+             { lnum = 1, col = 0, message = "a warning here",  severity = 2 },
+             { lnum = 2, col = 0, message = "some info here",  severity = 3 },
+             { lnum = 3, col = 0, message = "a hint here",     severity = 4 },
+           })"#,
+    )
+    .await;
+
+    let map = redraw_after(&rpc, &mut incoming, ":LspDiagnostics<CR>").await;
+
+    assert!(
+        row_has_group(&map, "an error here", "DiagnosticError"),
+        "the error row should be painted DiagnosticError"
+    );
+    assert!(
+        row_has_group(&map, "a warning here", "DiagnosticWarn"),
+        "the warning row should be painted DiagnosticWarn"
+    );
+    assert!(
+        row_has_group(&map, "some info here", "DiagnosticInfo"),
+        "the info row should be painted DiagnosticInfo"
+    );
+    assert!(
+        row_has_group(&map, "a hint here", "DiagnosticHint"),
+        "the hint row should be painted DiagnosticHint"
+    );
+    // Severity colors are exclusive: an error row must not also carry the warn group.
+    assert!(
+        !row_has_group(&map, "an error here", "DiagnosticWarn"),
+        "the error row must not be painted with the warning color"
+    );
+}

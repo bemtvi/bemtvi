@@ -688,6 +688,18 @@ pub(crate) fn severity_short(severity: u8) -> char {
     }
 }
 
+/// The vim quickfix type char for a severity code (`1`=ERROR→`E` … `4`=HINT→`N`),
+/// matching `vim.diagnostic.toqflist`. Stored on each loclist entry's `typ`, where
+/// it drives the row's severity color. (HINT maps to `N`, vim's "note", not `H`.)
+pub(crate) fn qf_type_char(severity: u8) -> u8 {
+    match severity {
+        2 => b'W',
+        3 => b'I',
+        4 => b'N',
+        _ => b'E',
+    }
+}
+
 /// The first non-empty line of a (possibly multi-line, markdown) diagnostic
 /// message, for the single-line message line, the location-list rows, and the
 /// inline virtual text. Terminal control characters (ESC, BEL, backspace, …) are

@@ -101,7 +101,7 @@ pub use self::windows::{
 };
 pub(crate) use self::windows::{PendingScroll, TabLabel, WindowLayout, WindowTree};
 // Search vocabulary shared by the command line, the parser, and the View.
-pub use self::quickfix::{QfAction, QfEntry, QfList, QfStack, QfWhich};
+pub use self::quickfix::{LocListEntry, QfAction, QfEntry, QfList, QfStack, QfWhich};
 pub(crate) use self::search::{SearchDir, SearchOffset};
 pub(crate) use self::syntax::fill_indent;
 

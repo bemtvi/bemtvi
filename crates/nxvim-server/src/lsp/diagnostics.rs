@@ -358,7 +358,7 @@ impl EditHost {
     /// [`nxvim_core::Editor::open_location_list`] by `:LspDiagnostics` /
     /// `vim.diagnostic.setloclist`. `None` when there are no diagnostics, or the
     /// buffer has no file path to navigate to.
-    pub(crate) fn diagnostics_location_list(&self) -> Option<Vec<(PathBuf, usize, usize, String)>> {
+    pub(crate) fn diagnostics_location_list(&self) -> Option<Vec<nxvim_core::LocListEntry>> {
         let mut items = self.current_diagnostics_merged();
         if items.is_empty() {
             return None;
@@ -373,12 +373,12 @@ impl EditHost {
                 let character = d.range.start.character as usize;
                 let line = self.editor.buffer().line(row);
                 let byte = byte_col(encoding, &line, character);
-                let text = format!(
-                    "{}: {}",
-                    severity_short(severity_code(d.severity)),
-                    first_line(&d.message),
-                );
-                (path.clone(), row, byte, text)
+                let severity = severity_code(d.severity);
+                let text = format!("{}: {}", severity_short(severity), first_line(&d.message),);
+                // The vim quickfix type char drives the row's severity color
+                // (1=ERROR→`E` … 4=HINT→`N`, matching `vim.diagnostic.toqflist`).
+                let typ = qf_type_char(severity);
+                (path.clone(), row, byte, text, typ)
             })
             .collect();
         Some(entries)

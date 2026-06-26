@@ -3,7 +3,6 @@
 //! and runtime-file lookup.
 
 use crate::cwd::CdScope;
-#[cfg(feature = "native")]
 use crate::lsp::LspReqKind;
 use crate::EditHost;
 use std::path::{Component, Path, PathBuf};
@@ -72,43 +71,38 @@ impl EditHost {
             // `:pw[d]` — print the working directory on the message line.
             _ if matches!(base, "pw" | "pwd") => self.ex_pwd(),
             // Phase-1 LSP observability: dump server/document state into a listing.
-            #[cfg(feature = "native")]
+            // The LSP ex-command surface is NOT native-gated: every method below
+            // works on the wasm edit-host too, where servers run on the daemon and
+            // requests/replies ride `HostEffects::lsp_request` (the web python demo
+            // drives basedpyright this way). Gating them out made `:LspDiagnostics`
+            // & friends fall through to an unknown-command error on the web build
+            // even though diagnostics were flowing.
             "LspInfo" => {
                 let lines = self.lsp_info_lines();
                 self.editor.open_scratch_listing("[LSP info]", lines, 0);
             }
             // Phase-2: list the current buffer's diagnostics as a navigable
             // location list; `<CR>` on a row jumps to it (handled in the core).
-            #[cfg(feature = "native")]
             "LspDiagnostics" => match self.diagnostics_location_list() {
                 Some(entries) => self.editor.open_location_list(entries, "LSP diagnostics"),
                 None => self.editor.echo("No diagnostics"),
             },
             // Phase-3: go-to / references as ex-commands (the keymap-free path;
             // the reply jumps the cursor or opens a panel location list).
-            #[cfg(feature = "native")]
             "LspDefinition" => self.request_lsp(LspReqKind::Definition),
-            #[cfg(feature = "native")]
             "LspDeclaration" => self.request_lsp(LspReqKind::Declaration),
-            #[cfg(feature = "native")]
             "LspTypeDefinition" => self.request_lsp(LspReqKind::TypeDefinition),
-            #[cfg(feature = "native")]
             "LspImplementation" => self.request_lsp(LspReqKind::Implementation),
-            #[cfg(feature = "native")]
             "LspReferences" => self.request_lsp(LspReqKind::References),
             // Phase-4: hover docs into the panel, signature help on the message
             // line (the keymap-free path for `K` / `<C-k>`).
-            #[cfg(feature = "native")]
             "LspHover" => self.request_lsp(LspReqKind::Hover),
-            #[cfg(feature = "native")]
             "LspSignatureHelp" => self.request_lsp(LspReqKind::SignatureHelp),
             // Phase-6: buffer-mutating features. Format/code-action take no
             // argument; rename reads the new name the dispatcher split off — or,
             // with no name, prompts for it through `vim.lsp.buf.rename()`
             // (`vim.ui.input`, Phase 8) instead of erroring.
-            #[cfg(feature = "native")]
             "LspFormat" => self.request_lsp_format(),
-            #[cfg(feature = "native")]
             "LspRename" if args.trim().is_empty() => {
                 if let Err(e) = self.lua.exec("vim.lsp.buf.rename()") {
                     self.editor
@@ -116,9 +110,7 @@ impl EditHost {
                 }
                 self.apply_lua_effects();
             }
-            #[cfg(feature = "native")]
             "LspRename" => self.request_lsp_rename(args),
-            #[cfg(feature = "native")]
             "LspCodeAction" => self.request_lsp_code_action(),
             // `:au[tocmd]` / `:aug[roup]` / `:doau[tocmd]` (with abbreviations and
             // an optional `!`) drive the Lua autocmd registry. The core defers

@@ -165,6 +165,31 @@ try {
   check("lsp: a basedpyright hover request returns the inferred signature (def add(a: int, b: int) -> int)",
     /def add/.test(String(hoverText)) && /int/.test(String(hoverText)), `hover=${JSON.stringify(hoverText)}`);
 
+  // 4. The `:LspDiagnostics` ex-command works on the web build. The diagnostics data above flows
+  //    through `nx.diagnostic.get()`, but the `:Lsp*` ex-command surface lives in the server's
+  //    `resolve_command` and used to be `#[cfg(feature = "native")]`-gated — compiled out of the
+  //    wasm edit-host, so `:LspDiagnostics` fell through to an `E492: Not an editor command` error
+  //    even with diagnostics present. Drive the command and assert it builds a real, navigable
+  //    location list (it focuses the new loclist window, whose `getloclist(0)` carries the entries).
+  await page.evaluate(() => window.__nxvim.feed(":LspDiagnostics<CR>"));
+  const loclist = await until(
+    page,
+    () =>
+      window.__nxvim
+        .execLua(
+          `local ll = nx.getloclist(0) or {}
+           local txts = {}
+           for _, e in ipairs(ll) do txts[#txts+1] = e.text or "" end
+           return table.concat(txts, "||")`,
+        )
+        .then((r) => r.result),
+    (v) => v != null && String(v).length > 0,
+  );
+  const llStr = String(loclist);
+  check(":LspDiagnostics builds a navigable location list on the web build (not E492)",
+    /Literal\['x'\]|not assignable to .*int|cannot be assigned|str→int|E:/.test(llStr) || llStr.length > 0,
+    `loclist=${JSON.stringify(llStr)}`);
+
   await browser.close();
 } catch (e) {
   console.error("verify-basedpyright-lsp error:", e);

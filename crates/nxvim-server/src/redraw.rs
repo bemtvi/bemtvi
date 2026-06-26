@@ -35,6 +35,13 @@ impl EditHost {
         // Color the focused terminal's scrollback only while it's being browsed (never
         // on the live flood path); a no-op when output is live or already materialized.
         self.sync_terminal_styles();
+        // Evaluate a generic Lua `'foldexpr'` for the focused buffer (vim's per-line
+        // model) and push the values into the fold engine *before* projecting, so
+        // `foldmethod=expr` with a non-native foldexpr collapses this frame. Native
+        // only — nxvim-core can't run Lua, and the browser edit-host folds JS-side.
+        // Cached by `changedtick`, so it costs nothing on a frame with no edit.
+        #[cfg(feature = "native")]
+        self.refresh_expr_folds();
         let view = self.editor.view(w, h);
 
         // Refresh every visible buffer's highlights from the in-process engine for
@@ -55,6 +62,12 @@ impl EditHost {
         // `Initialized` (which the consumer defers to "the next sync"), so diagnostics and
         // `didChange` flow without waiting for an explicit request path to sync first.
         self.sync_lsp();
+        // Issue a `textDocument/foldingRange` request when the current buffer uses the
+        // LSP fold source and lacks a fresh result (after `sync_lsp` flushed any
+        // `didChange`, so the server folds against current text). The async reply
+        // pushes the ranges into the fold engine and triggers a repaint; this only
+        // fires for a buffer whose `foldmethod=expr` resolves to `nx.lsp.foldexpr`.
+        self.maybe_request_folding_range();
 
         // Resolve every highlight span and chrome region to a concrete style here
         // on the server (the registry lives in the core). Spans carry an index
@@ -562,6 +575,22 @@ impl EditHost {
             (
                 Value::from("number_width"),
                 Value::from(win.number_width as u64),
+            ),
+            // The fold-marker gutter: its width and the per-row marker strings the
+            // client paints to the left of the sign / number columns. Omitted (width
+            // `0`, empty array) unless `'foldcolumn'` is set.
+            (
+                Value::from("foldcolumn_width"),
+                Value::from(win.foldcolumn_width as u64),
+            ),
+            (
+                Value::from("foldcolumn"),
+                Value::Array(
+                    win.foldcolumn
+                        .iter()
+                        .map(|s| Value::from(s.as_str()))
+                        .collect(),
+                ),
             ),
             // `'padding'` as `[top, right, bottom, left]` cells (CSS order). The
             // client insets this window's content box by it (the same way it

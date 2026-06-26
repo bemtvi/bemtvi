@@ -34,8 +34,8 @@ pub use editor::{
     command_pending_after, command_status, language_of_path, place_aligned, Align, BorderStyle,
     BufferId, ClickSurface, CmdlineCompleteReq, CommandContinuation, CommandPending, CommandStatus,
     CompleteConfig, CompleteDocsHit, CompleteKeys, Cursor, DecorViewport, Editor, Extent,
-    FileChangeAction, FileChangeReason, FileChangelist, FileMarkEntry, FloatAnchor, FloatConfig,
-    FloatRelative, GlobalMarkEntry, JumpPos, Margin, MenuGeom, MenuItem, MenuMetrics,
+    FileChangeAction, FileChangeReason, FileChangelist, FileFolds, FileMarkEntry, FloatAnchor,
+    FloatConfig, FloatRelative, GlobalMarkEntry, JumpPos, Margin, MenuGeom, MenuItem, MenuMetrics,
     MenuPlacement, NumberedMark, PendingOpen, PendingQuitAll, PendingSave, PersistState,
     PreviewScroll, PreviewTarget, PromptPos, QfAction, QfEntry, QfList, QfStack, QfWhich,
     RegisterEntry, SessionDock, SessionState, SessionTab, SessionWindow, ShadaRequest,
@@ -52,5 +52,5 @@ pub use input::{key_to_notation, parse_keys, Key, KeyCode, MouseAction, MouseBut
 pub use mode::{KeyContext, Mode};
 pub use options::{BufferOptions, Options, Padding, SignColumn, WindowOptions};
 pub use snippet::{parse_snippet, ParsedSnippet, SnippetError, TabStop};
-pub use syntax::{IndentParams, OpenOutcome, Span, SyntaxEngine};
+pub use syntax::{FoldRange, IndentParams, OpenOutcome, Span, SyntaxEngine};
 pub use view::{ContentFloatView, MenuView, TabView, View, ViewRect, WindowView};

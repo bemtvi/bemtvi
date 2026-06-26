@@ -40,6 +40,7 @@ mod ex;
 mod explorer;
 pub mod expr;
 mod float;
+mod fold;
 mod insert;
 mod jumps;
 mod marks;
@@ -69,8 +70,8 @@ pub use self::command::{
     command_pending_after, command_status, CommandContinuation, CommandPending, CommandStatus,
 };
 pub(crate) use self::command::{
-    DockChord, FindKind, Motion, MotionKind, MotionResult, MoveAxis, ObjectKind, PendingCommand,
-    Stage,
+    DockChord, FindKind, FoldCmd, Motion, MotionKind, MotionResult, MoveAxis, ObjectKind,
+    PendingCommand, Stage,
 };
 pub use self::complete::{CompleteConfig, CompleteCtx, CompleteKeys};
 pub use self::decor::DecorViewport;
@@ -84,12 +85,13 @@ pub use self::buffers::{
     FileChangeAction, FileChangeReason, PendingOpen, PendingQuitAll, PendingSave,
 };
 pub use self::persist::{
-    FileChangelist, FileMarkEntry, GlobalMarkEntry, JumpPos, NumberedMark, PersistState,
+    FileChangelist, FileFolds, FileMarkEntry, GlobalMarkEntry, JumpPos, NumberedMark, PersistState,
     RegisterEntry, SessionDock, SessionState, SessionTab, SessionWindow, ShadaRequest,
 };
 pub use self::terminal::TerminalOp;
 pub use self::undo::{UndoEntry, UndoTreeView};
 // The window layout subsystem (tree types + layout algebra + window methods).
+pub(crate) use self::fold::Fold;
 pub(crate) use self::jumps::JumpEntry;
 pub(crate) use self::view::ViewState;
 pub use self::windows::{
@@ -693,6 +695,11 @@ pub struct Editor {
     /// file marks), so `g;`/`g,` walk a reopened file's change history. Drained by
     /// [`Editor::seed_pending_file_marks`].
     pending_changelists: HashMap<PathBuf, Vec<(usize, usize)>>,
+    /// Per-file **manual** folds restored from a shada store, keyed by *normalized*
+    /// path. Seeded into the focused window's [`FoldState`](crate::editor::fold)
+    /// when the file becomes its buffer (drained by [`Editor::seed_pending_folds`]),
+    /// so a reopened file gets its `:mkview`-style folds back.
+    pending_folds: HashMap<PathBuf, Vec<(usize, usize, bool)>>,
     /// The focused window's jumplist restored from a shada store, as `(path, line,
     /// col)` not yet resolved to buffers. Materialized into the live window jumps —
     /// opening the files — on the first `<C-o>`/`<C-i>`, so a restored session can
@@ -1196,6 +1203,22 @@ pub struct Editor {
     /// `:set commentstring=…` / `nx.bo.commentstring`. Resolved with
     /// [`Editor::effective_commentstring`].
     commentstrings: HashMap<BufferId, String>,
+    /// Per-buffer `'foldexpr'` — the expression `foldmethod=expr` folds by. Stored
+    /// beside [`Editor::commentstrings`] (a per-buffer string, not a `Copy`
+    /// [`BufferOptions`] slot) and written by `:set foldexpr=…` / `nx.bo.foldexpr`.
+    /// nxvim evaluates only the canonical tree-sitter foldexpr natively (recognized
+    /// by [`Editor::is_treesitter_foldexpr`]); a generic Lua foldexpr is Phase 5.
+    /// Absent ⇒ empty (no expr folds).
+    foldexprs: HashMap<BufferId, String>,
+    /// Server-pushed fold data for the *externally-computed* sources — a generic
+    /// Lua `'foldexpr'` and LSP `foldingRange`. nxvim-core can't evaluate Lua or
+    /// talk to a language server, so the server computes these out-of-band and
+    /// pushes the raw result here (tagged with the `changedtick` it was computed
+    /// for); [`Editor::refresh_folds`] reads it for the
+    /// [`FoldSource::GenericExpr`](crate::editor::fold::FoldSource)/`Lsp` sources,
+    /// applying the buffer's `'foldnestmax'`/`'foldminlines'` itself. Keyed by
+    /// buffer. See [`Editor::set_foldexpr_values`] / [`Editor::set_lsp_folds`].
+    pub(crate) external_folds: HashMap<BufferId, fold::ExternalFolds>,
     /// The host clipboard backing the `"+` / `"*` registers, or `None` in a
     /// bare-core test (or a front end whose platform backend failed to start).
     /// Injected by the server via [`Editor::set_clipboard`]; when absent,
@@ -1429,6 +1452,7 @@ impl Editor {
             pending_file_marks: HashMap::new(),
             numbered_marks: HashMap::new(),
             pending_changelists: HashMap::new(),
+            pending_folds: HashMap::new(),
             pending_jumplist: Vec::new(),
             mode: Mode::Normal,
             cursor: Cursor::default(),
@@ -1533,6 +1557,8 @@ impl Editor {
             syntax_failed: HashSet::new(),
             ts_filetype: HashMap::new(),
             commentstrings: HashMap::new(),
+            foldexprs: HashMap::new(),
+            external_folds: HashMap::new(),
             ts_enabled: HashMap::new(),
             clipboard: None,
             host_fs: Rc::new(StdHostFs),
@@ -1833,6 +1859,10 @@ impl Editor {
             self.desired_col = self.cursor_virtcol();
             self.desired_eol = self.eol_request;
         }
+        // Recompute computed (`indent`/…) folds if this keystroke changed the buffer
+        // or a fold input. Cache-guarded, so an unchanged buffer pays nothing; a
+        // no-op for `foldmethod=manual`.
+        self.refresh_folds();
         self.ensure_visible();
 
         // Edits stay crisp: only a navigation that moved the viewport animates, so

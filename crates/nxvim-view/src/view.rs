@@ -231,6 +231,15 @@ pub struct WindowView {
     /// older server that omits the key.
     pub cursorline: bool,
     pub number_width: u16,
+    /// `'foldcolumn'` width in cells (`0` when off): how many cells the renderer
+    /// reserves for the fold-marker gutter, to the left of the sign / number
+    /// columns. `0` from a server that omits the key.
+    pub foldcolumn_width: u16,
+    /// Per visible row, the fold-marker string to paint in the fold gutter (`-`/`│`
+    /// for open folds, `+` for a closed one, spaces elsewhere), each
+    /// [`foldcolumn_width`](Self::foldcolumn_width) cells wide. Empty when the fold
+    /// column is off or from a server that omits the key.
+    pub foldcolumn: Vec<String>,
     /// This window's `'padding'` — a per-side blank margin (cells) the renderer
     /// leaves around the content box (gutter + text + status), inside any float
     /// border. All-zero (no margin) from a server that omits the key. The window's
@@ -1061,6 +1070,8 @@ fn parse_window(m: &[(Value, Value)], styles: &[Style]) -> WindowView {
             .and_then(Value::as_bool)
             .unwrap_or(false),
         number_width: map_u16(m, "number_width"),
+        foldcolumn_width: map_u16(m, "foldcolumn_width"),
+        foldcolumn: map_str_array(m, "foldcolumn"),
         // `'padding'` as `[top, right, bottom, left]` cells (CSS order); absent ⇒
         // no margin (an older server, or the default).
         padding: parse_padding(map_get(m, "padding")),

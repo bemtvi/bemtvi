@@ -28,11 +28,11 @@ use lsp_types::{
     ClientCapabilities, CodeActionCapabilityResolveSupport, CodeActionClientCapabilities,
     CodeActionKindLiteralSupport, CodeActionLiteralSupport, CompletionClientCapabilities,
     CompletionItemCapability, CompletionItemCapabilityResolveSupport, ConfigurationParams,
-    DocumentFormattingClientCapabilities, GeneralClientCapabilities, InlayHintClientCapabilities,
-    InlayHintResolveClientCapabilities, InlayHintWorkspaceClientCapabilities, MarkupKind,
-    MessageType, PositionEncodingKind, PublishDiagnosticsClientCapabilities,
-    RenameClientCapabilities, SemanticTokenModifier, SemanticTokenType,
-    SemanticTokensClientCapabilities, SemanticTokensClientCapabilitiesRequests,
+    DocumentFormattingClientCapabilities, FoldingRangeClientCapabilities,
+    GeneralClientCapabilities, InlayHintClientCapabilities, InlayHintResolveClientCapabilities,
+    InlayHintWorkspaceClientCapabilities, MarkupKind, MessageType, PositionEncodingKind,
+    PublishDiagnosticsClientCapabilities, RenameClientCapabilities, SemanticTokenModifier,
+    SemanticTokenType, SemanticTokensClientCapabilities, SemanticTokensClientCapabilitiesRequests,
     SemanticTokensFullOptions, SemanticTokensWorkspaceClientCapabilities, ServerCapabilities,
     TextDocumentClientCapabilities, TextDocumentSyncCapability, TextDocumentSyncClientCapabilities,
     TextDocumentSyncKind, TokenFormat, WorkspaceClientCapabilities,
@@ -387,6 +387,14 @@ fn client_capabilities() -> ClientCapabilities {
                     ],
                 }),
             }),
+            // Declare folding-range support so a server answers
+            // `textDocument/foldingRange` — the LSP fold source. We fold whole lines
+            // (no `lineFoldingOnly` is fine), so the defaults suffice.
+            folding_range: Some(FoldingRangeClientCapabilities {
+                dynamic_registration: Some(false),
+                line_folding_only: Some(true),
+                ..Default::default()
+            }),
             ..Default::default()
         }),
         workspace: Some(WorkspaceClientCapabilities {
@@ -452,6 +460,7 @@ pub(crate) fn provider_caps(caps: &ServerCapabilities) -> ProviderCaps {
         code_action: present("codeActionProvider"),
         semantic_tokens: present("semanticTokensProvider"),
         inlay_hints: present("inlayHintProvider"),
+        folding_range: present("foldingRangeProvider"),
     }
 }
 

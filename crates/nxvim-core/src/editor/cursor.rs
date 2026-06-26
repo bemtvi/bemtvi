@@ -410,9 +410,18 @@ impl Editor {
         let buf = self.buffer();
         let virt = buf.virt_lines_by_line();
         let mut rows = 0;
-        for line in self.top..self.cursor.line {
+        let mut line = self.top;
+        while line < self.cursor.line {
+            // A closed fold between `top` and the cursor occupies a single screen
+            // row; skip its hidden interior so the count matches the rendered rows.
+            if let Some(f) = self.collapsing_fold_at(line) {
+                rows += 1;
+                line = f.end + 1;
+                continue;
+            }
             rows += self.line_text_rows(line)
                 + virt.get(&line).map_or(0, |r| r.above.len() + r.below.len());
+            line += 1;
         }
         // The cursor's own row sits *after* its `virt_lines_above` and the wrap
         // segments of its line above the cursor's segment.
@@ -435,13 +444,22 @@ impl Editor {
         let mut top = target;
         while top > 0 {
             let prev = top - 1;
-            let p = self.line_text_rows(prev)
-                + virt.get(&prev).map_or(0, |r| r.above.len() + r.below.len());
+            // A closed fold above the target is one screen row; counting it as such
+            // (and stepping over its whole range) keeps the scroll-to-bottom math in
+            // step with the folded rendering.
+            let (p, prev_top) = match self.collapsing_fold_at(prev) {
+                Some(f) => (1, f.start),
+                None => (
+                    self.line_text_rows(prev)
+                        + virt.get(&prev).map_or(0, |r| r.above.len() + r.below.len()),
+                    prev,
+                ),
+            };
             if rows + p > th {
                 break;
             }
             rows += p;
-            top = prev;
+            top = prev_top;
         }
         top
     }

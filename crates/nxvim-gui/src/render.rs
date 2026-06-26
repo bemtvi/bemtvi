@@ -1002,8 +1002,12 @@ impl Renderer {
             0
         };
         let fg = style_fg(&view.normal).unwrap_or(DEFAULT_FG);
-        let gutter_x0 = ox + sign_w;
-        let text_x0 = ox + sign_w + gutter;
+        // The fold-marker gutter (vim's foldcolumn) sits at the very left, before
+        // the sign and number columns, so every other origin shifts right by it.
+        let fold_w = win.foldcolumn_width;
+        let sign_x0 = ox + fold_w;
+        let gutter_x0 = ox + fold_w + sign_w;
+        let text_x0 = ox + fold_w + sign_w + gutter;
         // Text-area height in cells (the window minus its status row).
         let text_rows = wrows.saturating_sub(u16::from(win.status_visible));
 
@@ -1164,7 +1168,7 @@ impl Renderer {
                             self.push_plain(
                                 items,
                                 &text,
-                                (ox as f32 * self.cell_w, y),
+                                (sign_x0 as f32 * self.cell_w, y),
                                 color,
                                 clip,
                             );
@@ -1334,6 +1338,22 @@ impl Renderer {
                             self.push_plain(
                                 items,
                                 &text,
+                                self.cell_px(sign_x0, row as u16),
+                                color,
+                                win_clip,
+                            );
+                        }
+                    }
+
+                    // The fold-marker gutter at the far left (`-`/`│`/`+`), in the
+                    // line-number color.
+                    if fold_w > 0 {
+                        if let Some(marker) = win.foldcolumn.get(i).filter(|s| !s.trim().is_empty())
+                        {
+                            let color = style_fg(&view.line_nr).unwrap_or(fg);
+                            self.push_plain(
+                                items,
+                                marker,
                                 self.cell_px(ox, row as u16),
                                 color,
                                 win_clip,
@@ -2209,7 +2229,7 @@ impl Renderer {
         } else {
             0
         };
-        let text_x0 = wx + sign_w + gutter;
+        let text_x0 = wx + win.foldcolumn_width + sign_w + gutter;
 
         let cols = self.grid_size().0;
         let popup_bg = lighten(style_bg(&view.normal).unwrap_or(DEFAULT_BG), 0x14);

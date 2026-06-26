@@ -809,3 +809,24 @@ end
 -- enable/is_enabled/get) — the same tables, so a config written either way agrees.
 vim.lsp.semantic_tokens = nx.lsp.semantic_tokens
 vim.lsp.inlay_hint = nx.lsp.inlay_hint
+
+-- `nx.lsp.foldexpr` is the canonical LSP foldexpr, the `foldmethod=expr` fold
+-- source backed by `textDocument/foldingRange`:
+--
+--     nx.bo.foldmethod = "expr"
+--     nx.bo.foldexpr   = "v:lua.nx.lsp.foldexpr()"
+--
+-- nxvim recognizes that exact reference and folds the buffer from the language
+-- server's folding ranges (requested on open/change while the buffer wants LSP
+-- folds — see crates/nxvim-core/src/editor/fold.rs and crates/nxvim-server's
+-- lsp/folding.rs). Like the tree-sitter marker it is never evaluated per line, so
+-- calling it directly is a usage error — fail loud rather than return a wrong
+-- level. `vim.lsp.foldexpr` is the muscle-memory alias; nxvim recognizes both.
+function nx.lsp.foldexpr(_lnum)
+  error(
+    "nx.lsp.foldexpr is a native marker for 'foldmethod=expr' — set it as the "
+      .. "'foldexpr' string ('v:lua.nx.lsp.foldexpr()'), don't call it",
+    2
+  )
+end
+vim.lsp.foldexpr = nx.lsp.foldexpr

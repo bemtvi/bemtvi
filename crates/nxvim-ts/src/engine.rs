@@ -11,7 +11,7 @@ use std::ops::{ControlFlow, Range};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-use nxvim_core::{BufferEdit, BufferId, IndentParams, OpenOutcome, Span, SyntaxEngine};
+use nxvim_core::{BufferEdit, BufferId, FoldRange, IndentParams, OpenOutcome, Span, SyntaxEngine};
 use ropey::{LineType, Rope};
 use streaming_iterator::StreamingIterator;
 use tree_sitter::{
@@ -326,6 +326,15 @@ impl Engine {
                     Some(s) => Some(
                         compile_query(&g.language, &s)
                             .map_err(|e| format!("compiling {lang} injections: {e}"))?,
+                    ),
+                    None => None,
+                };
+            }
+            "folds" => {
+                g.folds = match src {
+                    Some(s) => Some(
+                        compile_query(&g.language, &s)
+                            .map_err(|e| format!("compiling {lang} folds: {e}"))?,
                     ),
                     None => None,
                 };
@@ -898,6 +907,52 @@ impl Engine {
 
         Some(indent.max(0) as usize)
     }
+
+    /// Foldable node ranges for `buffer`, by running the grammar's `folds.scm`
+    /// (`@fold` captures) over the current tree. Each captured node contributes its
+    /// `[start_row, end_row]` inclusive line span; the core turns the set into
+    /// per-line fold levels by containment. Empty when there is no grammar, no fold
+    /// query, or no tree yet — the honest "no tree-sitter folds" cases.
+    pub fn folds(&self, buffer: BufferId) -> Vec<FoldRange> {
+        let Some(state) = self.buffers.get(&buffer) else {
+            return Vec::new();
+        };
+        let Some(tree) = state.tree.as_ref() else {
+            return Vec::new();
+        };
+        let Some(Slot::Loaded(grammar)) = self.grammars.get(&state.language) else {
+            return Vec::new();
+        };
+        let Some(query) = grammar.folds.as_ref() else {
+            return Vec::new();
+        };
+        let rope = &state.shadow;
+        let root = tree.root_node();
+        let names = query.capture_names();
+        let mut out = Vec::new();
+        let mut cursor = QueryCursor::new();
+        let mut caps = cursor.captures(query, root, node_text_provider(rope));
+        while let Some((m, idx)) = caps.next() {
+            let cap = m.captures[*idx];
+            // `@fold` defines the foldable nodes; any other capture (a predicate
+            // helper) is ignored.
+            if names[cap.index as usize] != "fold" {
+                continue;
+            }
+            let node = cap.node;
+            let start = node.start_position().row;
+            let mut end = node.end_position().row;
+            // A node whose range ends at column 0 of its last line doesn't really
+            // occupy that line (its closer sits on the line above), so trim it — the
+            // fold would otherwise swallow a trailing line (neovim's foldexpr does
+            // the same).
+            if end > start && node.end_position().column == 0 {
+                end -= 1;
+            }
+            out.push(FoldRange { start, end });
+        }
+        out
+    }
 }
 
 /// One indent capture's `#set!` directives that the algorithm consults.
@@ -1052,6 +1107,20 @@ impl SyntaxEngine for Engine {
         matches!(
             self.grammars.get(&state.language),
             Some(Slot::Loaded(g)) if g.indents.is_some()
+        )
+    }
+
+    fn folds(&mut self, buffer: BufferId) -> Vec<FoldRange> {
+        Engine::folds(self, buffer)
+    }
+
+    fn folds_available(&self, buffer: BufferId) -> bool {
+        let Some(state) = self.buffers.get(&buffer) else {
+            return false;
+        };
+        matches!(
+            self.grammars.get(&state.language),
+            Some(Slot::Loaded(g)) if g.folds.is_some()
         )
     }
 
@@ -1527,8 +1596,9 @@ fn point((row, col): (usize, usize)) -> Point {
 /// Whether a query name is one the engine itself compiles + executes (the
 /// paint-relevant names), so a resolution-bridge push for it lands on the grammar.
 /// `highlights` and `indents` drive the paint directly; `injections` drives the
-/// sub-language layers built on top of the root tree. Every other resolved name
-/// (`folds`, `textobjects`, …) stays Lua-side and is a no-op here.
+/// sub-language layers built on top of the root tree; `folds` drives the
+/// `foldmethod=expr` tree-sitter fold source. Every other resolved name
+/// (`textobjects`, …) stays Lua-side and is a no-op here.
 fn is_engine_query(name: &str) -> bool {
-    matches!(name, "highlights" | "indents" | "injections")
+    matches!(name, "highlights" | "indents" | "injections" | "folds")
 }

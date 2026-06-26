@@ -1053,3 +1053,59 @@ async fn lsp_and_client_set_diagnostics_coexist_on_one_buffer() {
 
     std::env::remove_var("NXVIM_LSP_CMD");
 }
+
+/// The visible buffer-line numbers of window 0 in `map` (filler rows dropped) — what
+/// the screen shows once folds collapse hidden lines.
+fn visible_numbers(map: &[(Value, Value)]) -> Vec<u64> {
+    window0_field(map, "numbers")
+        .and_then(Value::as_array)
+        .map(|a| a.iter().filter_map(Value::as_u64).collect())
+        .unwrap_or_default()
+}
+
+/// Pump redraws (each `barrier` forces one) until window 0's visible line numbers
+/// satisfy `pred` — used to wait out the async `foldingRange` round-trip. Returns
+/// the matching numbers, or `None` if they never settle.
+async fn poll_visible_numbers(
+    rpc: &Rpc,
+    incoming: &mut UnboundedReceiver<Incoming>,
+    pred: impl Fn(&[u64]) -> bool,
+) -> Option<Vec<u64>> {
+    for _ in 0..200 {
+        barrier(rpc).await;
+        if let Some(map) = drain_to_latest_redraw(incoming, |_| true) {
+            let nums = visible_numbers(&map);
+            if pred(&nums) {
+                return Some(nums);
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    None
+}
+
+/// `foldmethod=expr` with the LSP foldexpr marker requests `textDocument/foldingRange`
+/// and folds the buffer from the server's ranges: a `[1,3]` range collapses lines
+/// 2-4 behind a placeholder, so only lines 1, 2, 5, 6 stay visible.
+#[tokio::test]
+async fn lsp_folding_range_folds_the_buffer() {
+    let _guard = serial_lock().lock().await;
+    let dir = temp_dir("lsp_folding");
+    arm_mock(
+        &dir,
+        r#"{ "folding_ranges": [ { "startLine": 1, "endLine": 3 } ] }"#,
+    );
+    let (rpc, mut incoming) = open_with_server(&dir, "L1\nL2\nL3\nL4\nL5\nL6\n").await;
+    // Switch the buffer to the LSP fold source. The next redraw issues the
+    // foldingRange request, the mock replies, and the fold engine collapses [1,3].
+    feed(&rpc, ":set foldmethod=expr<CR>");
+    feed(&rpc, ":set foldexpr=v:lua.nx.lsp.foldexpr()<CR>");
+    let numbers = poll_visible_numbers(&rpc, &mut incoming, |n| n == [1, 2, 5, 6]).await;
+    assert_eq!(
+        numbers,
+        Some(vec![1, 2, 5, 6]),
+        "the LSP folding range [1,3] should hide lines 3-4"
+    );
+
+    std::env::remove_var("NXVIM_LSP_CMD");
+}

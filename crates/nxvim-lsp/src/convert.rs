@@ -11,15 +11,31 @@
 use lsp_types::{
     AnnotatedTextEdit, CodeActionOrCommand, CodeActionResponse, CompletionItem, CompletionItemKind,
     CompletionResponse, CompletionTextEdit, DocumentChangeOperation, DocumentChanges,
-    DocumentSymbol, DocumentSymbolResponse, Documentation, GotoDefinitionResponse, Hover,
-    HoverContents, InlayHint, InlayHintKind, InlayHintLabel, Location, MarkedString, OneOf,
+    DocumentSymbol, DocumentSymbolResponse, Documentation, FoldingRange, GotoDefinitionResponse,
+    Hover, HoverContents, InlayHint, InlayHintKind, InlayHintLabel, Location, MarkedString, OneOf,
     ParameterLabel, SignatureHelp, SymbolInformation, SymbolKind, TextDocumentEdit, TextEdit, Url,
     WorkspaceEdit, WorkspaceSymbolResponse,
 };
 
 use crate::protocol::{
-    CodeActionData, CompletionItemData, InlayHintData, LspReply, SymbolData, WorkspaceEditData,
+    CodeActionData, CompletionItemData, FoldRangeData, InlayHintData, LspReply, SymbolData,
+    WorkspaceEditData,
 };
+
+/// Reduce a `textDocument/foldingRange` reply to nxvim's whole-line spans: each
+/// range's `[startLine, endLine]` (0-based, inclusive), dropping the optional
+/// character columns and the `kind`. A range whose `endLine` precedes its
+/// `startLine` (malformed) is skipped — the editor's fold model needs `end ≥ start`.
+pub(crate) fn folding_ranges(ranges: Vec<FoldingRange>) -> Vec<FoldRangeData> {
+    ranges
+        .into_iter()
+        .filter(|r| r.end_line >= r.start_line)
+        .map(|r| FoldRangeData {
+            start: r.start_line,
+            end: r.end_line,
+        })
+        .collect()
+}
 
 /// Distill a `textDocument/codeAction` response (a mixed `(Command | CodeAction)[]`)
 /// into the editor-facing list: a `CodeAction`'s `title` + normalized eager

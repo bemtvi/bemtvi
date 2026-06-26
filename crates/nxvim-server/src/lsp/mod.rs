@@ -30,6 +30,7 @@ mod completion;
 pub(crate) use completion::{complete_doc_lines, LspComplete};
 mod diagnostics;
 mod edit;
+mod folding;
 mod inlay;
 mod request;
 mod semantic;
@@ -198,6 +199,7 @@ pub(crate) enum LspReqKind {
     ResolveInlayHint,
     DocumentSymbol,
     WorkspaceSymbol,
+    FoldingRange,
 }
 
 impl LspReqKind {
@@ -221,6 +223,7 @@ impl LspReqKind {
             LspReqKind::ResolveInlayHint => 15,
             LspReqKind::DocumentSymbol => 16,
             LspReqKind::WorkspaceSymbol => 17,
+            LspReqKind::FoldingRange => 18,
         }
     }
 
@@ -244,6 +247,7 @@ impl LspReqKind {
             15 => LspReqKind::ResolveInlayHint,
             16 => LspReqKind::DocumentSymbol,
             17 => LspReqKind::WorkspaceSymbol,
+            18 => LspReqKind::FoldingRange,
             _ => return None,
         })
     }
@@ -289,6 +293,9 @@ impl LspReqKind {
             LspReqKind::ResolveInlayHint => "No inlay hint",
             LspReqKind::DocumentSymbol => "No document symbols",
             LspReqKind::WorkspaceSymbol => "No workspace symbols",
+            // Folding ranges are a background fold refresh; an empty reply just
+            // leaves the buffer unfolded, never a message.
+            LspReqKind::FoldingRange => "No folding ranges",
         }
     }
 }
@@ -329,6 +336,10 @@ pub(crate) struct ServerRuntime {
     /// hints only from a server that offers them (and only while enabled), so this
     /// gates the refresh request the same way `legend` gates semantic tokens.
     inlay_hints: bool,
+    /// Whether the server advertised `foldingRangeProvider`. A buffer whose
+    /// `foldmethod=expr` resolves to the LSP foldexpr requests folding ranges only
+    /// from a server that offers them, so this gates the request like `inlay_hints`.
+    folding_range: bool,
 }
 
 /// Human label for a negotiated position encoding (matches the LSP wire names).

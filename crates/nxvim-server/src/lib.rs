@@ -59,6 +59,8 @@ mod dispatch;
 #[cfg(feature = "native")]
 mod evloop;
 #[cfg(feature = "native")]
+mod folds;
+#[cfg(feature = "native")]
 mod host;
 #[cfg(feature = "native")]
 mod inbound;

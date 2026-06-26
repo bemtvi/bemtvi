@@ -45,12 +45,16 @@ pub enum LoadError {
 /// text as another language). Both optionals are absent when the language ships no
 /// `indents.scm` / `injections.scm`.
 pub struct Grammar {
-    // Field order matters: `language`/`query`/`indents`/`injections` drop before
-    // `_lib`, so the loaded code outlives anything pointing into it.
+    // Field order matters: `language`/`query`/`indents`/`injections`/`folds` drop
+    // before `_lib`, so the loaded code outlives anything pointing into it.
     pub language: Language,
     pub query: Query,
     pub indents: Option<Query>,
     pub injections: Option<Query>,
+    /// Compiled `folds.scm` (`@fold` captures → foldable node ranges), or `None`
+    /// when the language ships no fold query. Drives `foldmethod=expr` with the
+    /// tree-sitter foldexpr (the core builds per-line levels from the ranges).
+    pub folds: Option<Query>,
     _lib: libloading::Library,
 }
 
@@ -115,12 +119,14 @@ impl Grammar {
         // fails to compile is a real error, surfaced like a broken highlights query.
         let indents = load_optional_query(data_dir, lang, &language, "indents", overrides)?;
         let injections = load_optional_query(data_dir, lang, &language, "injections", overrides)?;
+        let folds = load_optional_query(data_dir, lang, &language, "folds", overrides)?;
 
         Ok(Grammar {
             language,
             query,
             indents,
             injections,
+            folds,
             _lib: lib,
         })
     }

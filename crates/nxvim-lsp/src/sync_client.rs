@@ -36,8 +36,8 @@ use std::collections::HashMap;
 
 use lsp_types::{
     CodeAction, CodeActionResponse, CompletionItem, CompletionResponse, ConfigurationParams,
-    DocumentSymbolResponse, GotoDefinitionResponse, Hover, InitializeParams, InitializeResult,
-    InlayHint, Location, PublishDiagnosticsParams, SemanticTokensFullDeltaResult,
+    DocumentSymbolResponse, FoldingRange, GotoDefinitionResponse, Hover, InitializeParams,
+    InitializeResult, InlayHint, Location, PublishDiagnosticsParams, SemanticTokensFullDeltaResult,
     SemanticTokensResult, ShowMessageParams, SignatureHelp, TextEdit, Url, WorkspaceEdit,
     WorkspaceSymbolResponse,
 };
@@ -48,8 +48,8 @@ use crate::client::{
     semantic_tokens_delta, sync_kind_of,
 };
 use crate::convert::{
-    code_actions, completion_reply, document_symbols, documentation_lines, goto_locations,
-    hover_reply, inlay_hint, inlay_label_core, normalize_workspace_edit, pad_label,
+    code_actions, completion_reply, document_symbols, documentation_lines, folding_ranges,
+    goto_locations, hover_reply, inlay_hint, inlay_label_core, normalize_workspace_edit, pad_label,
     signature_help_reply, workspace_symbols,
 };
 use crate::log::LspLog;
@@ -130,6 +130,7 @@ enum ReqKind {
     SemanticTokensDelta,
     InlayHint,
     ResolveInlayHint,
+    FoldingRange,
     Raw,
 }
 
@@ -656,6 +657,9 @@ fn distill(kind: ReqKind, result: Result<Value, String>) -> LspReply {
             }
             None => LspReply::ResolvedInlayHint { label: None },
         },
+        ReqKind::FoldingRange => LspReply::Folds(folding_ranges(
+            decode::<Vec<FoldingRange>>(result).unwrap_or_default(),
+        )),
         // Handled by the caller (needs the transport error string).
         ReqKind::Raw => LspReply::Raw(Ok(Value::Null)),
     }
@@ -846,6 +850,11 @@ fn request_wire(req: LspRequest) -> (String, Value, ReqKind) {
         LspRequest::ResolveInlayHint { hint } => {
             ("inlayHint/resolve".into(), hint, ReqKind::ResolveInlayHint)
         }
+        LspRequest::FoldingRange { uri } => (
+            "textDocument/foldingRange".into(),
+            json!({"textDocument": {"uri": uri}}),
+            ReqKind::FoldingRange,
+        ),
         // A generic `client:request` — the method/params are already raw JSON.
         LspRequest::Raw { method, params } => (method, params, ReqKind::Raw),
     }

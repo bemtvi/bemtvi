@@ -52,6 +52,9 @@ pub struct PersistState {
     /// Per-file changelists (the `g;`/`g,` history), keyed by path, restored when
     /// the file is reopened.
     pub file_changelists: Vec<FileChangelist>,
+    /// Per-file **manual** folds, keyed by path, restored into the window that
+    /// reopens the file (vim's `:mkview`-style fold persistence in shada).
+    pub file_folds: Vec<FileFolds>,
     /// The focused window's jumplist (`<C-o>`/`<C-i>`), oldest entry first, each a
     /// `(path, line, col)`.
     pub jumplist: Vec<JumpPos>,
@@ -152,6 +155,19 @@ pub struct FileChangelist {
     pub entries: Vec<(usize, usize)>,
 }
 
+/// One persisted file's **manual** code folds: the file and its folds, each an
+/// inclusive 0-based `(start, end)` line range plus whether it was closed. Only
+/// `foldmethod=manual` folds persist — computed sources (indent / expr / LSP)
+/// regenerate themselves on open. Restored into the window that reopens the file,
+/// vim's `:mkview`-style fold persistence carried in shada.
+#[derive(Debug, Clone)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct FileFolds {
+    pub path: PathBuf,
+    /// `(start, end, closed)` per fold, outer-before-inner.
+    pub folds: Vec<(usize, usize, bool)>,
+}
+
 /// One position in a persisted jumplist or the exit cursor: a file path and a
 /// 0-based `(line, col)`.
 #[derive(Debug, Clone)]
@@ -239,6 +255,7 @@ impl Editor {
             ex_history: self.ex_history.clone(),
             numbered_marks: self.export_numbered_marks(),
             file_changelists: self.export_changelists(),
+            file_folds: self.export_folds(),
             jumplist: self.export_jumplist(),
             exit_cursor: self.export_exit_cursor(),
             // The session rides the store only for a namespaced workspace; the server
@@ -794,8 +811,16 @@ impl Editor {
                 .entry(super::normalize_path(&entry.path))
                 .or_insert(entry.entries);
         }
+        // Manual folds: keyed by normalized path, seeded into the window that
+        // reopens the file (drained by `seed_pending_folds`).
+        for entry in state.file_folds {
+            self.pending_folds
+                .entry(super::normalize_path(&entry.path))
+                .or_insert(entry.folds);
+        }
         let cur = self.cur_buffer();
         self.seed_pending_file_marks(cur);
+        self.seed_pending_folds();
         // History restored from disk is older than anything typed this session;
         // merge it *ahead* of the (empty, at startup) live history, dropping older
         // duplicates so a repeated entry keeps its newest position.

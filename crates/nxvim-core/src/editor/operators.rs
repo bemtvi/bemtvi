@@ -1,7 +1,7 @@
 //! Operators (`d`/`c`/`y`/`>`/…) and the editing primitives they drive
 //! (delete/yank/paste/join/replace/case).
 
-use super::command::{is_clipboard_register, is_readonly_register, COMMENT_OP};
+use super::command::{is_clipboard_register, is_readonly_register, COMMENT_OP, FOLD_OP};
 use super::*;
 use crate::clipboard::Clipboard;
 use crate::mode::Mode;
@@ -24,7 +24,11 @@ impl Editor {
                 let l2 = self
                     .buffer()
                     .byte_to_line(m.target.min(self.last_char_idx()));
-                let (a, b) = (min(l1, l2), max(l1, l2));
+                // Expand the line range to cover any closed fold it touches: a
+                // linewise operator over a collapsed fold acts on the whole fold
+                // (vim's rule — `dd`/`yy`/`>>` on a fold takes all its lines).
+                let a = self.fold_line_start(min(l1, l2));
+                let b = self.fold_line_end(max(l1, l2));
                 let lo = self.buffer().line_start(a);
                 let hi = self
                     .buffer()
@@ -48,6 +52,15 @@ impl Editor {
         first_line: usize,
     ) {
         if lo >= hi {
+            return;
+        }
+        // `zf{motion}` creates a fold over the motion's lines — it touches no text
+        // and writes no register, so it bypasses the modifiable / register checks
+        // below (folding a read-only buffer is fine).
+        if op == FOLD_OP {
+            let first = self.buffer().byte_to_line(lo);
+            let last = self.buffer().byte_to_line(hi.saturating_sub(1));
+            self.create_fold(first, last);
             return;
         }
         // A live terminal buffer is read-only — refuse every operator that changes
@@ -191,6 +204,16 @@ impl Editor {
             let first = self.buffer().byte_to_line(lo);
             let last = self.buffer().byte_to_line(hi.saturating_sub(1));
             self.reindent_lines(first, last);
+            self.mode = Mode::Normal;
+            self.reset_pending();
+            return;
+        }
+        // Visual `zf` folds the selected lines — like `=`, no yank / register; it
+        // creates the fold and parks the cursor on its first line.
+        if op == FOLD_OP {
+            let first = self.buffer().byte_to_line(lo);
+            let last = self.buffer().byte_to_line(hi.saturating_sub(1));
+            self.create_fold(first, last);
             self.mode = Mode::Normal;
             self.reset_pending();
             return;
@@ -344,7 +367,10 @@ impl Editor {
         let a = self.visual_anchor;
         let b = self.cursor;
         if linewise {
-            let (la, lb) = (min(a.line, b.line), max(a.line, b.line));
+            // Expand to cover any closed fold the selection touches — a linewise
+            // operator over a collapsed fold takes the whole fold (vim's rule).
+            let la = self.fold_line_start(min(a.line, b.line));
+            let lb = self.fold_line_end(max(a.line, b.line));
             let lo = self.buffer().line_start(la);
             let hi = self
                 .buffer()

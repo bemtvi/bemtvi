@@ -38,6 +38,18 @@ fn is_zero(n: &u64) -> bool {
     *n == 0
 }
 
+/// Stringify one `'foldexpr'` per-line result for [`LuaRuntime::eval_foldexpr_lines`]:
+/// a number becomes its integer text (`1`, `-1`, …), a string passes through
+/// (`">1"`, `"="`, …), and any other type reads as `"0"` — the line isn't folded.
+fn foldexpr_value_string(value: &mlua::Value) -> String {
+    match value {
+        mlua::Value::Integer(i) => i.to_string(),
+        mlua::Value::Number(n) => (*n as i64).to_string(),
+        mlua::Value::String(s) => s.to_string_lossy(),
+        _ => "0".to_string(),
+    }
+}
+
 /// One window's row in the Rust→Lua window mirror, in layout order. The
 /// number/relativenumber flags back `vim.wo`'s wired window-local options;
 /// `float` carries a floating window's placement so `nvim_win_get_config` reads
@@ -899,6 +911,34 @@ impl LuaRuntime {
     pub fn eval_to_value(&self, chunk: &str) -> mlua::Result<rmpv::Value> {
         let value: mlua::Value = self.lua.load(chunk).eval()?;
         lua_to_rmpv(&value)
+    }
+
+    /// Evaluate a generic `'foldexpr'` for buffer lines `1..=line_count` — vim's
+    /// per-line fold-expr model, with `v:lnum` (the 1-based line) bound before each
+    /// call — and return one fold value string per line (`"0"`, `"1"`, `">1"`,
+    /// `"<1"`, `"="`, …) for the core fold engine to resolve. nxvim-core can't run
+    /// Lua, so the server drives this off the [`Editor`]'s `'foldexpr'` and pushes
+    /// the result back via `set_foldexpr_values`.
+    ///
+    /// The expression is the `'foldexpr'` value with an optional `v:lua.` prefix
+    /// stripped (the realistic nxvim spelling, e.g. `v:lua.MyMod.foldexpr()`),
+    /// compiled once as `return <expr>` and called per line so the foldexpr re-reads
+    /// `vim.v.lnum` each time. A numeric result stringifies to its integer; a string
+    /// result passes through; anything else reads as `"0"` (the line isn't folded).
+    /// A compile/eval error propagates so the server can surface it (no silent
+    /// no-op).
+    pub fn eval_foldexpr_lines(&self, expr: &str, line_count: usize) -> mlua::Result<Vec<String>> {
+        let trimmed = expr.trim();
+        let chunk = trimmed.strip_prefix("v:lua.").unwrap_or(trimmed);
+        let func: mlua::Function = self.lua.load(format!("return {chunk}")).into_function()?;
+        let vmirror: Table = self.nx()?.get("_v_mirror")?;
+        let mut out = Vec::with_capacity(line_count);
+        for lnum in 1..=line_count {
+            vmirror.set("lnum", lua_int(lnum as i64))?;
+            let value: mlua::Value = func.call(())?;
+            out.push(foldexpr_value_string(&value));
+        }
+        Ok(out)
     }
 
     /// Mirror a buffer's diagnostics into `nx._diagnostics[bufnr]` as the plain

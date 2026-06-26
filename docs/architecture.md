@@ -359,6 +359,31 @@ width), the client reports **both** dimensions of the windows area on
 `nx_ui_attach`/`nx_ui_try_resize`. There is still no grid, no cell encoding,
 and no `ext_linegrid`.
 
+**Folds collapse in the projection, not the buffer.** A *fold* is a per-window
+property — vim's model, so the same buffer folds independently in two windows — but
+the fold *structure* (a nested set of inclusive line ranges) derives from buffer
+content. The core keeps the two separate: a per-window `FoldState` (which folds
+exist and which are closed) plus, for the computed sources, a structure cache keyed
+on `(changedtick, method, …)`. A closed fold simply drops its hidden lines from the
+per-row vectors (`lines`/`numbers`/`highlights`/…) and emits **one** placeholder row
+with the fold's text, so the client renders it as a single line with no protocol
+change — the collapsed-fold shape the parallel-array projection already had. Every
+caller that walks visible lines (motion, scroll, the cursor, redraw, and the
+linewise operators that act on a whole closed fold) goes through the same
+`fold_line_start`/`fold_line_end` helpers, so none hand-rolls fold skipping. The
+fold **structure** comes from one of four sources behind a shared spine
+(`fold.rs`): `manual` (`zf`/`:fold`), `foldmethod=indent`, `foldmethod=expr` (the
+native tree-sitter foldexpr nxvim recognizes as a marker and computes from
+`folds.scm`, or a generic Lua `'foldexpr'` the server evaluates per line with
+`v:lnum` and pushes in), and LSP `textDocument/foldingRange` (selected by the
+`nx.lsp.foldexpr` marker, requested per buffer and pushed in). The latter two are
+*external* sources: nxvim-core can't run Lua or talk to a language server, so the
+server computes them out-of-band and pushes the result into a per-buffer store the
+core builds the same nested structure from — and manual folds (with their closed
+state) round-trip through shada, restored into the window that reopens the file.
+The `foldcolumn` gutter is a client-rendered column (like the number gutter)
+carrying the `+`/`-`/`│` markers. See `docs/plans/2026-06-25-tree-sitter-folds.md`.
+
 **Floating windows are a second, on-top layer.** Each `WindowView` carries
 `floating`, `border` (`none`/`single`/`rounded`/`double`/`solid`), and `title`.
 The list is ordered tiled-windows-first, then the floats bottom-to-top by
@@ -1154,9 +1179,13 @@ screen," and that is exactly the shape of these tests.
   Named/numbered/special **registers** (`:registers`, `setreg`/`getreg`, the
   system clipboard `"+`/`"*`) and **marks** (buffer-local `a`–`z`, global file
   marks `A`–`Z`, the automatic special marks, `:marks`, and `'{mark}` ex-ranges)
-  are both done; what remains here is folds, macros, and the `:map`-family
+  are both done; what remains here is macros and the `:map`-family
   ex-commands (intentionally postponed — keymaps are set via `vim.keymap.set` /
-  `nvim_set_keymap`). (The interactive `/` / `?` cursor search — `n`/`N`,
+  `nvim_set_keymap`).
+  **Code folding** is done across all four sources — manual (`zf`/the `z` family),
+  `foldmethod=indent`, `foldmethod=expr` (the native tree-sitter foldexpr and a
+  generic per-line Lua `'foldexpr'`), and LSP `textDocument/foldingRange` — sharing
+  one per-window fold model (see *Folds* under the view section below). (The interactive `/` / `?` cursor search — `n`/`N`,
   `hlsearch`/`incsearch`, the search options — and `:s` substitution, which
   shares search's canonical-regex engine, are both done; see
   [the search design](specs/2026-06-02-search-design.md) and

@@ -143,17 +143,45 @@ import("./ts-indent.js")
     indenter = createIndenter();
     globalThis.__nxvimTsIndent = (lang, text, line, sw, ts) => indenter.indent(lang, text, line, sw, ts);
     globalThis.__nxvimTsAvailable = (lang) => indenter.available(lang);
-    globalThis.__nxvimTsReload = (lang) => indenter.reload(lang);
   })
   .catch((e) => postMessage({ type: "config_error", error: "ts-indent unavailable: " + (e && e.stack ? e.stack : e) }))
   .finally(() => { indenterSettled = true; });
 
-// Whether the indenter has async work the SAB run loop must stay event-loop-live for: the
-// module import itself, then its init (web-tree-sitter + manifests) and any in-flight grammar
-// load. A thread blocked in `Atomics.wait` can't run those promises, so the loop parks
+// Tree-sitter FOLDS (web/ts-folds.js) — the same in-tick story as the indenter:
+// `foldmethod=expr` + the tree-sitter foldexpr asks the core for fold ranges while
+// converging a keystroke, so the fold runner answers HERE in the worker, synchronously,
+// reached through the `eh_js_ts_folds*` FFI bridge. Loaded dynamically + guarded the same
+// way: a failure degrades to "no tree-sitter folds" (the core leaves folds empty), never
+// aborts the worker.
+let folder = null;
+let folderSettled = false;
+import("./ts-folds.js")
+  .then(({ createFolder }) => {
+    folder = createFolder();
+    globalThis.__nxvimTsFolds = (lang, text) => folder.folds(lang, text);
+    globalThis.__nxvimTsFoldsAvailable = (lang) => folder.available(lang);
+  })
+  .catch((e) => postMessage({ type: "config_error", error: "ts-folds unavailable: " + (e && e.stack ? e.stack : e) }))
+  .finally(() => { folderSettled = true; });
+
+// One `:TSInstall <lang>` evicts BOTH tree-sitter runners' caches for that language, so the
+// next indent/fold query reloads the freshly installed parser + queries. The single
+// `eh_js_ts_reload` FFI export (lib.rs) forwards here.
+globalThis.__nxvimTsReload = (lang) => {
+  if (indenter) indenter.reload(lang);
+  if (folder) folder.reload(lang);
+};
+
+// Whether the tree-sitter runners have async work the SAB run loop must stay event-loop-live
+// for: each module's import, then its init (web-tree-sitter + manifests) and any in-flight
+// grammar load. A thread blocked in `Atomics.wait` can't run those promises, so the loop parks
 // non-blockingly (`Atomics.waitAsync`) while this is true — the same treatment daemon watches
-// get — and only blocks once the indenter is fully idle.
-const indenterBusy = () => !indenterSettled || (indenter !== null && indenter.pendingLoads() > 0);
+// get — and only blocks once both runners are fully idle.
+const indenterBusy = () =>
+  !indenterSettled ||
+  !folderSettled ||
+  (indenter !== null && indenter.pendingLoads() > 0) ||
+  (folder !== null && folder.pendingLoads() > 0);
 
 const h = eh_new();
 if (h === 0) {
@@ -318,6 +346,9 @@ function currentFrame() {
     // the user types `o`/`<CR>` (the grammar load is async; a keystroke that beats it just
     // falls back this once). Cheap + idempotent; the indenter may not be loaded yet.
     if (indenter) indenter.ensureForFrame(frame);
+    // Likewise warm the fold runner so tree-sitter folds are ready before the user enables
+    // `foldmethod=expr`. Same async/idempotent contract as the indenter.
+    if (folder) folder.ensureForFrame(frame);
     return frame;
   } catch (e) {
     postMessage({ type: "fatal", error: `redraw JSON parse failed: ${e}` });

@@ -1490,7 +1490,7 @@
       // inline-virt shift (not painted on this path yet) — an approximation.
       const ra = vtext.filter((p) => p[0] === 3).flatMap((p) => p[3]);
       if (ra.length && rect) {
-        const textW = Math.max(0, rect.width - gutterW - (w.sign_width || 0));
+        const textW = Math.max(0, rect.width - gutterW - (w.foldcolumn_width || 0) - (w.sign_width || 0));
         const total = ra.reduce((s, [t]) => s + [...t].length, 0);
         const paintedVisible = Math.max(0, cells.length - leftcol);
         const start = Math.max(paintedVisible + 1, textW - total);
@@ -1804,6 +1804,13 @@
 
     function renderGutterCell(w, row, width) {
       let html = "";
+      // Fold-marker gutter (vim's foldcolumn) at the very left, before signs and
+      // numbers: the server ships a per-row marker string (`-`/`│`/`+`/blanks).
+      const fcw = w.foldcolumn_width || 0;
+      if (fcw > 0) {
+        const marker = (w.foldcolumn && w.foldcolumn[row]) || "";
+        html += `<span class="gutter">${escapeHtml(marker.padEnd(fcw))}</span>`;
+      }
       // Sign column (LSP diagnostics + extmark signs). The server merges the signs and
       // ships the rendered column width in cells (`sign_width`, a multiple of 2 per the
       // `'signcolumn'` policy — 0 when no column is reserved) plus the per-row cell on

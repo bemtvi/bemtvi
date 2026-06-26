@@ -23,6 +23,34 @@ use crate::mode::Mode;
 /// the generic operator machinery keyed on this char.
 pub(crate) const COMMENT_OP: char = '\u{E000}';
 
+/// The private-use char standing in for the fold-create operator (`zf{motion}`),
+/// the fold sibling of [`COMMENT_OP`]. `zf` arms it like `gc` arms the comment
+/// operator; the following motion's (always linewise) range names the lines to
+/// fold. Routed through the generic operator machinery in
+/// [`Editor::apply_operator_to_range`].
+pub(crate) const FOLD_OP: char = '\u{E001}';
+
+/// A fold command resolved from the `z` prefix (the fold half of the `z` family,
+/// beside the viewport [`ViewPlace`] commands). Each maps to an `Editor::fold_*`
+/// method; [`CreateLines`](FoldCmd::CreateLines) carries its line count via the
+/// command's resolved count (`zF` / `{count}zF`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FoldCmd {
+    Open,                 // zo
+    Close,                // zc
+    Toggle,               // za
+    OpenRecursive,        // zO
+    CloseRecursive,       // zC
+    OpenAll,              // zR
+    CloseAll,             // zM
+    Delete,               // zd
+    DeleteAll,            // zE
+    CreateLines,          // zF — fold `count` lines from the cursor
+    Enable(Option<bool>), // zN(Some true) / zn(Some false) / zi(None: toggle)
+    Next,                 // zj — move to the next fold's start
+    Prev,                 // zk — move to the previous fold's end
+}
+
 /// A `<C-w>` window command: the second key after the `<C-w>` prefix, resolved by
 /// [`parse_step`] and applied in [`Editor::execute`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -201,6 +229,48 @@ fn view_command(key: Key) -> Option<(ViewPlace, bool)> {
         '\r' => (ViewPlace::Top, true),
         '.' => (ViewPlace::Center, true),
         '-' => (ViewPlace::Bottom, true),
+        _ => return None,
+    })
+}
+
+/// Resolve the key after `z` into a **fold** command, or `None` when the key is
+/// not a fold command (so the caller falls through to [`view_command`]). `zf`
+/// behaves like `gc`: in visual mode it folds the selection immediately, in
+/// normal mode it arms the [`FOLD_OP`] operator for the following motion. The
+/// open/close/delete keys complete immediately as a [`NormalCmd::Fold`]; `zF`
+/// folds `count` lines.
+fn fold_command(key: Key, pending: &PendingCommand, mode: Mode) -> Option<ParseStep> {
+    use FoldCmd::*;
+    use ParseStep::{Complete, Prefix};
+    let fold = |fc: FoldCmd| Complete(ResolvedCommand::Normal(NormalCmd::Fold(fc)));
+    Some(match key.as_char()? {
+        // `zf` — create a fold over a motion's lines. Visual mode folds the
+        // selection now; normal mode arms the linewise fold operator.
+        'f' if mode.is_visual() => Complete(ResolvedCommand::VisualOperate(FOLD_OP)),
+        'f' => {
+            let mut next = pending.clone();
+            next.operator = Some(FOLD_OP);
+            next.op_count = pending.count;
+            next.count = None;
+            next.stage = Stage::Start;
+            Prefix(next)
+        }
+        'F' => fold(CreateLines),
+        'o' => fold(Open),
+        'c' => fold(Close),
+        'a' => fold(Toggle),
+        'O' => fold(OpenRecursive),
+        'C' => fold(CloseRecursive),
+        'R' => fold(OpenAll),
+        'M' => fold(CloseAll),
+        'd' => fold(Delete),
+        'E' => fold(DeleteAll),
+        'v' => fold(Open), // `zv` — view cursor: open just enough to reveal it
+        'j' => fold(Next),
+        'k' => fold(Prev),
+        'n' => fold(Enable(Some(false))),
+        'N' => fold(Enable(Some(true))),
+        'i' => fold(Enable(None)),
         _ => return None,
     })
 }
@@ -428,6 +498,7 @@ enum NormalCmd {
         first_nonblank: bool,
         count: Option<usize>, // {count}z… targets that line (1-based)
     },
+    Fold(FoldCmd),          // z-family fold commands: zo/zc/za/zR/zM/zd/zE/zF/zn/…
     JumpBack,               // <C-o> (older jumplist position)
     JumpForward,            // <C-i> / <Tab> (newer position)
     AltBuffer,              // <C-^> / <C-6>
@@ -990,6 +1061,11 @@ fn parse_step(mode: Mode, pending: &PendingCommand, key: Key) -> ParseStep {
             };
         }
         Stage::ZPending => {
+            // Fold commands share the `z` prefix with the viewport ones; resolve
+            // them first, then fall through to `zz`/`zt`/`zb`/`z.`/…
+            if let Some(step) = fold_command(key, pending, mode) {
+                return step;
+            }
             return match view_command(key) {
                 Some((place, first_nonblank)) => {
                     Complete(ResolvedCommand::Normal(NormalCmd::ViewScroll {
@@ -2198,6 +2274,7 @@ impl Editor {
                 first_nonblank,
                 count,
             } => self.view_reposition(place, first_nonblank, count),
+            NormalCmd::Fold(fc) => self.execute_fold(fc, count),
             NormalCmd::JumpBack => self.jump_back(count),
             NormalCmd::JumpForward => self.jump_forward(count),
             NormalCmd::AltBuffer => self.goto_alternate(),

@@ -850,6 +850,18 @@ local BUF_OPT_CANON = {
   -- a `nomodifiable` buffer would refuse.
   modifiable = "modifiable",
   ma = "modifiable",
+  -- The fold buffer-options: the method (`nx.bo.foldmethod = "expr"`), the
+  -- `foldmethod=expr` expression (`nx.bo.foldexpr = "v:lua.vim.treesitter.foldexpr()"`),
+  -- and the nesting / minimum-span caps. The `vim.bo` companions to the `:set
+  -- foldmethod=…` / `:set foldexpr=…` paths; writes reach the live fold engine.
+  foldmethod = "foldmethod",
+  fdm = "foldmethod",
+  foldexpr = "foldexpr",
+  fde = "foldexpr",
+  foldnestmax = "foldnestmax",
+  fdn = "foldnestmax",
+  foldminlines = "foldminlines",
+  fml = "foldminlines",
 }
 -- Core defaults, the safety net when the mirror hasn't been pushed for a buffer.
 -- Match nxvim's core: tabstop 4, with shiftwidth/softtabstop following it via
@@ -870,6 +882,10 @@ local BUF_OPT_DEFAULT = {
   fileformat = "unix",
   commentstring = "",
   modifiable = true,
+  foldmethod = "manual",
+  foldexpr = "",
+  foldnestmax = 20,
+  foldminlines = 1,
 }
 
 local function bo_get(bufnr, opt)
@@ -996,6 +1012,16 @@ local WIN_OPT_CANON = {
   pad = "padding",
   winhighlight = "winhighlight",
   winhl = "winhighlight",
+  -- The per-window fold options: the fold-column gutter width (`vim.wo.foldcolumn`),
+  -- whether closed folds collapse on screen (`vim.wo.foldenable`), and the
+  -- open-depth threshold (`vim.wo.foldlevel` — folds deeper than this display
+  -- closed). The `vim.wo`/`vim.o` companions to `:set foldcolumn=`/`foldlevel=`.
+  foldcolumn = "foldcolumn",
+  fdc = "foldcolumn",
+  foldenable = "foldenable",
+  fen = "foldenable",
+  foldlevel = "foldlevel",
+  fdl = "foldlevel",
 }
 local WIN_OPT_DEFAULT = {
   number = true,
@@ -1008,6 +1034,9 @@ local WIN_OPT_DEFAULT = {
   fillchars = "",
   padding = "",
   winhighlight = "",
+  foldcolumn = 0,
+  foldenable = true,
+  foldlevel = 0,
 }
 -- Exposed for this file's nvim_{get,set}_option_value, which classify a name
 -- as window-scoped before routing it through nx.wo.

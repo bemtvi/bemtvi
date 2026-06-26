@@ -540,6 +540,25 @@ pub struct WindowOptions {
     /// a mirrored pane jumping while the focused one slides reads as a glitch. Resolved
     /// where the gesture is built ([`crate::Editor::finalize_scroll_gesture`]).
     pub scrollanim: Option<bool>,
+    /// `'foldenable'`: whether closed folds collapse on screen in this window. On
+    /// by default (vim's default). A fold can be *created* and marked closed while
+    /// this is off, but nothing collapses until it is on; `zn` clears it, `zN`/`zi`
+    /// restore/toggle it. Read by the view projection (`crate::view`) to decide
+    /// whether to fold lines away. Per-window, as in vim.
+    pub foldenable: bool,
+    /// `'foldcolumn'`: width (in cells) of the gutter column that shows fold
+    /// markers (`-`/`│` for open folds, `+` for a closed one). `0` (the default)
+    /// hides it. Per-window; the projection (`crate::view`) fills a per-row marker
+    /// string this wide that the client paints to the left of the sign / number
+    /// gutter.
+    pub foldcolumn: usize,
+    /// `'foldlevel'`: folds at a level **higher** than this display closed (when
+    /// `'foldenable'`); folds at this level or shallower are open. `0` (vim's
+    /// default) closes every fold of a computed source, `1` shows only the
+    /// outermost level, and a large value opens all. Per-window. Drives the closed
+    /// state of *computed* folds (`indent`/…); changing it re-derives which folds
+    /// are open. Manual folds track their own `zo`/`zc` state and ignore it.
+    pub foldlevel: usize,
 }
 
 impl WindowOptions {
@@ -656,6 +675,13 @@ impl Default for WindowOptions {
             winhighlight: String::new(),
             // Inherit the global `'scrollanim'` unless a window opts out (the diff does).
             scrollanim: None,
+            // Folding is enabled out of the box (vim's default); a closed fold
+            // collapses immediately. `zn` turns it off without losing the folds.
+            foldenable: true,
+            // No fold-marker gutter by default (vim's default `foldcolumn=0`).
+            foldcolumn: 0,
+            // vim's default: every fold of a computed source starts closed.
+            foldlevel: 0,
         }
     }
 }
@@ -711,6 +737,59 @@ pub enum RegexSyntax {
     Pcre,
     /// Vim's magic dialect for this buffer.
     Vim,
+}
+
+/// How a buffer's folds are defined (`'foldmethod'`). `manual` (the default) is
+/// the only source that stores explicit ranges; the rest derive the fold
+/// structure from buffer content. Phase 3 adds `indent` (folds from leading
+/// indent); `expr`/`marker`/`syntax` are recognized names that error loud at
+/// set-time until their phase lands (no silent no-op — see the folds plan).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum FoldMethod {
+    /// Folds created/edited by hand with `zf`/`:fold` and the `z` family.
+    #[default]
+    Manual,
+    /// Folds derived from each line's leading indent (`indent / shiftwidth`).
+    Indent,
+    /// Folds defined by `'foldexpr'`. nxvim evaluates the canonical tree-sitter
+    /// foldexpr natively (the headline source); a generic Lua foldexpr is Phase 5.
+    Expr,
+}
+
+impl FoldMethod {
+    /// Parse a `'foldmethod'` value. `manual`/`indent`/`expr` are supported; the
+    /// other vim names (`marker`/`syntax`/`diff`) are valid spellings but not yet
+    /// implemented, so they parse to an [`Unimplemented`](FoldMethodErr) error the
+    /// caller surfaces as a loud "not supported yet" — never a silent no-op — kept
+    /// distinct from an [`Unknown`](FoldMethodErr) value (E474).
+    pub fn from_label(label: &str) -> Result<FoldMethod, FoldMethodErr> {
+        match label {
+            "manual" => Ok(FoldMethod::Manual),
+            "indent" => Ok(FoldMethod::Indent),
+            "expr" => Ok(FoldMethod::Expr),
+            "marker" | "syntax" | "diff" => Err(FoldMethodErr::Unimplemented),
+            _ => Err(FoldMethodErr::Unknown),
+        }
+    }
+}
+
+impl std::fmt::Display for FoldMethod {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            FoldMethod::Manual => "manual",
+            FoldMethod::Indent => "indent",
+            FoldMethod::Expr => "expr",
+        })
+    }
+}
+
+/// Why a `'foldmethod'` value didn't apply (see [`FoldMethod::from_label`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FoldMethodErr {
+    /// A value vim doesn't define at all (E474).
+    Unknown,
+    /// A real vim foldmethod nxvim hasn't implemented yet — fail loud naming it.
+    Unimplemented,
 }
 
 /// The line-ending convention a buffer was read with and is written back with
@@ -823,6 +902,21 @@ pub struct BufferOptions {
     /// The line-ending convention (`'fileformat'`): set from the bytes on read and
     /// honored on write (the rope always holds `\n`). Default [`FileFormat::Unix`].
     pub fileformat: FileFormat,
+    /// How this buffer's folds are defined (`'foldmethod'`). Default
+    /// [`FoldMethod::Manual`] (folds built by hand). [`FoldMethod::Indent`] derives
+    /// the fold structure from leading indent; the editor recomputes it on edit and
+    /// option change (see [`crate::editor::fold`]). Buffer-local, as in vim.
+    pub foldmethod: FoldMethod,
+    /// Deepest nesting a *computed* foldmethod produces (`'foldnestmax'`). A line's
+    /// indent-derived level is capped at this so deeply-indented code doesn't fold
+    /// into runaway nesting. Default 20 (vim's default). Ignored by `manual`.
+    pub foldnestmax: usize,
+    /// Minimum number of lines a fold must span to display *closed*
+    /// (`'foldminlines'`). A computed fold of `≤ foldminlines` lines stays open even
+    /// when its level says it should close. Default 1 (vim's default ⇒ a fold needs
+    /// two or more lines to collapse). Ignored by `manual` (a hand-made `zf` over a
+    /// single line is already rejected).
+    pub foldminlines: usize,
     /// Whether the buffer's text may be changed (`'modifiable'`). Default `true`.
     /// When `false`, edits are refused with `E21` at the same chokepoints as a
     /// read-only [`crate::BufferKind`] (via [`crate::Editor::modifiable`]) — vim's
@@ -858,6 +952,12 @@ impl Default for BufferOptions {
             bomb: false,
             // \n line endings by default; read detection overrides per buffer.
             fileformat: FileFormat::Unix,
+            // Folds are hand-made out of the box (vim's default); a config or
+            // filetype rule opts a buffer into a computed source.
+            foldmethod: FoldMethod::Manual,
+            // vim's `foldnestmax`/`foldminlines` defaults.
+            foldnestmax: 20,
+            foldminlines: 1,
             // An ordinary buffer is editable; the read-only scratch listings flip
             // this to false at creation.
             modifiable: true,
@@ -1036,6 +1136,27 @@ static OPTIONS: &[OptionInfo] = {
             doc: "Wrap long lines to the window width instead of scrolling off-screen.",
         },
         OptionInfo {
+            name: "foldenable",
+            abbrev: Some("fen"),
+            kind: Bool,
+            scope: Window,
+            doc: "Display closed folds collapsed; off shows every line.",
+        },
+        OptionInfo {
+            name: "foldcolumn",
+            abbrev: Some("fdc"),
+            kind: Num,
+            scope: Window,
+            doc: "Width of the gutter column that shows fold markers.",
+        },
+        OptionInfo {
+            name: "foldlevel",
+            abbrev: Some("fdl"),
+            kind: Num,
+            scope: Window,
+            doc: "Folds deeper than this display closed; 0 closes all.",
+        },
+        OptionInfo {
             name: "numberwidth",
             abbrev: Some("nuw"),
             kind: Num,
@@ -1182,6 +1303,34 @@ static OPTIONS: &[OptionInfo] = {
             kind: Bool,
             scope: Buffer,
             doc: "Allow the buffer's contents to be changed.",
+        },
+        OptionInfo {
+            name: "foldmethod",
+            abbrev: Some("fdm"),
+            kind: Str,
+            scope: Buffer,
+            doc: "How folds are defined: manual, indent, or expr.",
+        },
+        OptionInfo {
+            name: "foldexpr",
+            abbrev: Some("fde"),
+            kind: Str,
+            scope: Buffer,
+            doc: "Expression folds are computed by (foldmethod=expr).",
+        },
+        OptionInfo {
+            name: "foldnestmax",
+            abbrev: Some("fdn"),
+            kind: Num,
+            scope: Buffer,
+            doc: "Maximum nesting depth for computed (indent) folds.",
+        },
+        OptionInfo {
+            name: "foldminlines",
+            abbrev: Some("fml"),
+            kind: Num,
+            scope: Buffer,
+            doc: "Minimum line span for a fold to display closed.",
         },
         OptionInfo {
             name: "filetype",

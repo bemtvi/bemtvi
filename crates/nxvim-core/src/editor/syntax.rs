@@ -300,6 +300,27 @@ impl Editor {
         }
     }
 
+    /// Tree-sitter foldable ranges for `buf` (`folds.scm` `@fold` captures),
+    /// synced to the buffer's current content. Empty when there is no engine, no
+    /// grammar, or no `folds.scm`. The fold source (`editor::fold`) turns these into
+    /// per-line levels and then the nested fold tree.
+    pub(crate) fn ts_folds(&mut self, buf: BufferId) -> Vec<crate::syntax::FoldRange> {
+        self.sync_syntax_engine(buf);
+        match self.syntax.as_mut() {
+            Some(engine) => engine.folds(buf),
+            None => Vec::new(),
+        }
+    }
+
+    /// Whether tree-sitter folds are *available* for `buf` — a grammar with a
+    /// `folds.scm` is loaded. Lets the fold source tell "the query loaded but found
+    /// nothing" apart from "the grammar isn't ready yet" (retry rather than clear).
+    pub(crate) fn ts_folds_available(&self, buf: BufferId) -> bool {
+        self.syntax
+            .as_ref()
+            .is_some_and(|engine| engine.folds_available(buf))
+    }
+
     /// Whether `buf`'s treesitter parse is still in progress — a large file whose
     /// parse was cancelled by the engine's per-frame deadline and is being resumed
     /// across frames. The server reads this after a redraw to keep scheduling frames
@@ -320,6 +341,7 @@ impl Editor {
         self.ts_filetype.remove(&id);
         self.ts_enabled.remove(&id);
         self.commentstrings.remove(&id);
+        self.foldexprs.remove(&id);
     }
 
     /// Target indent **width in columns** for `line` of the current buffer, the

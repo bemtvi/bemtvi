@@ -8,12 +8,16 @@ core captures (`@indent.begin`/`.end`/`.dedent`/`.branch`/`.zero`/`.ignore`/
 and the editor hooks (`o`/`O`, insert-mode `Enter`, the `=` operator family:
 `==`, `=motion`, `gg=G`, visual `=`). `@indent.align` (delimiter alignment) and
 injected-tree indent are the documented phase-6 follow-up; phase 6's other items
-(`indentkeys` retriggers, `vim.treesitter` Lua API, folds) remain pending.
+(`indentkeys` retriggers, the `vim.treesitter` Lua API) remain pending. **Folds
+shipped** on this machinery — the tree-sitter foldexpr runs `folds.scm` through the
+same sync `SyntaxEngine` — alongside the indent / generic-expr / LSP sources; see
+[`docs/plans/2026-06-25-tree-sitter-folds.md`](../plans/2026-06-25-tree-sitter-folds.md).
 **Supersedes** the process-isolation architecture in
 [`2026-06-01-syntax-highlighting-design.md`](2026-06-01-syntax-highlighting-design.md)
 (highlighting *behavior* is unchanged for the user; only where the parser runs
-changes). Folds and the `vim.treesitter` Lua API are explicitly **out of scope**
-here — this doc unblocks them but does not build them.
+changes). Folds and the `vim.treesitter` Lua API were originally **out of scope**
+here — this doc unblocks them. Folds have since shipped (see the plan linked
+above); the `vim.treesitter` Lua API is still pending.
 
 ## Why reverse the worker decision
 

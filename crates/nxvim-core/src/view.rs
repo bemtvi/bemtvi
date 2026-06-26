@@ -12,7 +12,7 @@
 
 use crate::buffer::Buffer;
 use crate::editor::{
-    BorderStyle, BufferId, Cursor, Editor, MenuPlacement, TabLabel, WindowId, WindowLayout,
+    BorderStyle, BufferId, Cursor, Editor, Fold, MenuPlacement, TabLabel, WindowId, WindowLayout,
 };
 use crate::extmark::VirtChunk;
 use crate::mode::Mode;
@@ -76,6 +76,12 @@ pub enum RowKind {
     /// A virtual line (extmark `virt_lines`) interleaved above/below its anchor
     /// buffer line; its chunk run lives in [`RenderRow::virt_line`].
     VirtLine,
+    /// A **closed fold**: one placeholder row standing in for the whole folded
+    /// range. `line` is the fold's first (0-based) buffer line — the row shows its
+    /// number and the fold's placeholder text ([`RenderRow::text`]) — and `count`
+    /// is how many buffer lines the fold collapses. The lines after `line` in the
+    /// range are simply absent from the row list.
+    Fold { line: usize, count: usize },
     /// Filler past the end of the buffer — vim's `~`.
     Filler,
 }
@@ -131,25 +137,28 @@ impl RenderRow {
     /// continuation is an ordinary numbered text row to every client).
     pub fn number(&self) -> Option<usize> {
         match self.kind {
-            RowKind::Line { line, .. } => Some(line + 1),
+            // A closed fold shows its first line's number, like vim.
+            RowKind::Line { line, .. } | RowKind::Fold { line, .. } => Some(line + 1),
             RowKind::VirtLine | RowKind::Filler => None,
         }
     }
 
-    /// 0-based buffer line index when this row renders a real buffer line.
+    /// 0-based buffer line index when this row renders a real buffer line — or a
+    /// closed fold's first line, so the cursor (parked on the fold start) maps to
+    /// this row.
     pub fn line(&self) -> Option<usize> {
         match self.kind {
-            RowKind::Line { line, .. } => Some(line),
+            RowKind::Line { line, .. } | RowKind::Fold { line, .. } => Some(line),
             RowKind::VirtLine | RowKind::Filler => None,
         }
     }
 
     /// The full-line screen column this row's text begins at — its wrap segment's
-    /// `start_col` (`0` for a first/only row, a virtual line, or a filler).
+    /// `start_col` (`0` for a first/only row, a virtual line, a filler, or a fold).
     pub fn start_col(&self) -> usize {
         match self.kind {
             RowKind::Line { start_col, .. } => start_col,
-            RowKind::VirtLine | RowKind::Filler => 0,
+            RowKind::VirtLine | RowKind::Filler | RowKind::Fold { .. } => 0,
         }
     }
 
@@ -423,6 +432,15 @@ pub struct WindowView {
     pub cursorline: bool,
     /// Width in cells of the number column (`0` when both options are off).
     pub number_width: usize,
+    /// `'foldcolumn'` width in cells (`0` when off) — how many cells the client
+    /// reserves for the fold-marker gutter, to the left of the sign / number
+    /// columns. The per-row markers are in [`foldcolumn`](WindowView::foldcolumn).
+    pub foldcolumn_width: usize,
+    /// Per visible row, the fold-marker string to paint in the fold gutter — each
+    /// exactly [`foldcolumn_width`](WindowView::foldcolumn_width) cells wide (`-`/`│`
+    /// for open folds, `+` for a closed one, spaces elsewhere). Empty when
+    /// `foldcolumn` is `0`.
+    pub foldcolumn: Vec<String>,
     /// This window's `'signcolumn'` policy. Carried so the server (which owns the
     /// diagnostics that fill the column) can resolve it to a rendered sign width;
     /// core itself only consults its [`floor`](crate::SignColumn::floor_cells) for
@@ -768,9 +786,17 @@ fn window_view(ed: &Editor, w: &WindowLayout) -> WindowView {
     let tabstop = buf.options.effective_tabstop();
     // The end-of-buffer filler char (`'fillchars'`' `eob`; vim's `~` by default).
     let eob = w.options.fillchars_eob();
+    // Closed folds collapse on screen only while `'foldenable'` is on; otherwise
+    // every line shows. The scroll band (below) is rendered fold-unaware for now —
+    // its geometry helpers don't yet skip folds — so only the settled frame folds.
+    let collapsed = if w.options.foldenable {
+        w.folds.collapsed_regions(line_count)
+    } else {
+        Vec::new()
+    };
     let rows = render_rows(
-        ed, buf, top, height, line_count, w.focused, width, wrap, tabstop, wp, eob, w.cursor,
-        ed.cursor,
+        ed, buf, top, height, line_count, w.focused, width, wrap, tabstop, wp, eob, &collapsed,
+        w.cursor, ed.cursor,
     );
 
     let scroll = if w.focused {
@@ -822,6 +848,9 @@ fn window_view(ed: &Editor, w: &WindowLayout) -> WindowView {
                 tabstop,
                 wp,
                 eob,
+                // The scroll band ignores folds (its geometry helpers don't skip
+                // them yet); fold-aware scrolling lands in a later phase.
+                &[],
                 w.cursor,
                 sel_head,
             );
@@ -897,7 +926,12 @@ fn window_view(ed: &Editor, w: &WindowLayout) -> WindowView {
     // column row-local); `cursor_prefix` is that row's `'breakindent'`/`'showbreak'`
     // prefix width (added back, since the prefix is baked onto the row text), so the
     // cursor lands past the indent on a continuation row. Both `0` on the first row.
-    let (cursor_extra_rows, cursor_seg_col, cursor_prefix) = if wrap && width > 0 {
+    // A cursor parked on a closed fold sits on the single collapsed row, so it has
+    // no wrap segments — skip the wrap math (which would otherwise place it on a
+    // continuation row that the fold replaced).
+    let cursor_folded = collapsed.iter().any(|f| f.contains(cur_line));
+    let (cursor_extra_rows, cursor_seg_col, cursor_prefix) = if wrap && width > 0 && !cursor_folded
+    {
         let line = buf.line(cur_line);
         let indent = unicode::cont_indent(&line, tabstop, width, wp);
         let segs = unicode::wrap_segments_indented(&line, tabstop, width, indent);
@@ -984,6 +1018,23 @@ fn window_view(ed: &Editor, w: &WindowLayout) -> WindowView {
         text_height: height,
     });
 
+    // The fold-marker gutter: one string per visible row, each `foldcolumn` cells
+    // wide. Computed from the window's full fold set (open + closed) so it shows
+    // structure even while a fold is open; blank for virtual / `~` filler rows.
+    let foldcolumn_width = w.options.foldcolumn;
+    let foldcolumn: Vec<String> = if foldcolumn_width > 0 {
+        rows.iter()
+            .map(|r| match r.line() {
+                Some(line) => w
+                    .folds
+                    .column_marker(line, foldcolumn_width, w.options.foldenable),
+                None => " ".repeat(foldcolumn_width),
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+
     WindowView {
         id: w.id,
         rect: ViewRect {
@@ -1026,6 +1077,8 @@ fn window_view(ed: &Editor, w: &WindowLayout) -> WindowView {
         relativenumber: w.options.relativenumber,
         cursorline: w.options.cursorline,
         number_width,
+        foldcolumn_width,
+        foldcolumn,
         signcolumn: w.options.signcolumn,
         padding: pad,
         tabstop: buf.options.effective_tabstop(),
@@ -1168,6 +1221,15 @@ fn cursor_band_row(
     screen_rows_between(buf, base, cursor_line, line_count, wrap, width, tabstop, wp) + above
 }
 
+/// The placeholder text a closed fold shows on its single collapsed row — vim's
+/// default `'foldtext'` shape: a dash run, the folded-line count, and the fold's
+/// first line (leading/trailing whitespace trimmed). Customizable `foldtext` is a
+/// later phase; this is the built-in default.
+fn fold_text(buf: &Buffer, fold: &Fold) -> String {
+    let first = buf.line_cow(fold.start);
+    format!("+--{:>3} lines: {}", fold.line_count(), first.trim())
+}
+
 /// Lay out `height` screen rows starting at buffer line `base`, **expanding** each
 /// buffer line that carries extmark `virt_lines` into extra rows: its
 /// `virt_lines_above` rows, then its text row, then its `virt_lines_below` rows.
@@ -1196,6 +1258,7 @@ fn row_skeleton(
     tabstop: usize,
     wp: unicode::WrapPrefix,
     eob: char,
+    folds: &[Fold],
 ) -> Vec<RenderRow> {
     let virt_by_line = buf.virt_lines_by_line();
     let mut rows = Vec::with_capacity(height);
@@ -1229,6 +1292,28 @@ fn row_skeleton(
                 seg_end_col: usize::MAX,
                 indent: 0,
             });
+            continue;
+        }
+        // A closed fold covering this line collapses its whole range into one
+        // placeholder row (the fold's first-line number + fold text); the lines
+        // after the start are skipped. Checked before virtual lines / wrapping so
+        // a closed fold shows just the fold text, as vim does.
+        if let Some(f) = folds.iter().find(|f| f.contains(buf_line)) {
+            rows.push(RenderRow {
+                kind: RowKind::Fold {
+                    line: f.start,
+                    count: f.line_count(),
+                },
+                text: fold_text(buf, f),
+                virt_line: None,
+                selection: None,
+                secondary_selection: Vec::new(),
+                search: Vec::new(),
+                incsearch: None,
+                seg_end_col: usize::MAX,
+                indent: 0,
+            });
+            buf_line = f.end + 1;
             continue;
         }
         let virt = virt_by_line.get(&buf_line);
@@ -1340,10 +1425,13 @@ fn render_rows(
     tabstop: usize,
     wp: unicode::WrapPrefix,
     eob: char,
+    folds: &[Fold],
     cursor: Cursor,
     sel_head: Cursor,
 ) -> Vec<RenderRow> {
-    let mut rows = row_skeleton(buf, base, height, line_count, wrap, width, tabstop, wp, eob);
+    let mut rows = row_skeleton(
+        buf, base, height, line_count, wrap, width, tabstop, wp, eob, folds,
+    );
     if !focused {
         return rows;
     }

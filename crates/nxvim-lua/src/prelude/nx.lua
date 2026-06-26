@@ -189,6 +189,34 @@ end)
 --
 -- Treesitter highlighting is controlled declaratively through buffer options
 -- (nx.bo.filetype + nx.bo.ts_highlight), part of the options surface in
--- prelude/state.lua — there is no separate nx.treesitter verb API.
+-- prelude/state.lua. The one verb surface is `nx.treesitter.foldexpr`, the
+-- foldmethod=expr fold source.
+--
+-- `nx.treesitter.foldexpr` is the canonical tree-sitter foldexpr, set as a string
+-- reference into 'foldexpr':
+--
+--     nx.bo.foldmethod = "expr"
+--     nx.bo.foldexpr   = "v:lua.nx.treesitter.foldexpr()"
+--
+-- nxvim recognizes that exact reference and computes the folds **natively** (the
+-- engine's `folds.scm` over the parse — see crates/nxvim-core/src/editor/fold.rs),
+-- so this function is a marker, never evaluated per line. Calling it directly is a
+-- usage error (per-line Lua foldexpr evaluation is Phase 5): fail loud rather than
+-- silently return a wrong fold level.
+nx.treesitter = nx.treesitter or {}
+function nx.treesitter.foldexpr(_lnum)
+  error(
+    "nx.treesitter.foldexpr is a native marker for 'foldmethod=expr' — set it as the "
+      .. "'foldexpr' string ('v:lua.nx.treesitter.foldexpr()'), don't call it; per-line "
+      .. "Lua foldexpr evaluation is Phase 5",
+    2
+  )
+end
+
+-- vim.* muscle-memory alias (ADR 0002 §4 whitelist): neovim's canonical spelling
+-- `v:lua.vim.treesitter.foldexpr()`. Same native marker — nxvim recognizes both
+-- the `vim.` and `nx.` references.
+vim.treesitter = vim.treesitter or {}
+vim.treesitter.foldexpr = nx.treesitter.foldexpr
 
 return nx

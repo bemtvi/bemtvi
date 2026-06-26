@@ -51,7 +51,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use nxvim_core::{
-    FileChangelist, FileMarkEntry, GlobalMarkEntry, JumpPos, NumberedMark, PersistState,
+    FileChangelist, FileFolds, FileMarkEntry, GlobalMarkEntry, JumpPos, NumberedMark, PersistState,
     RegisterEntry,
 };
 use redb::{Database, ReadableTable, TableDefinition, TableError};
@@ -116,6 +116,10 @@ const MARKS_NUMBERED: TableDefinition<&str, &[u8]> = TableDefinition::new("marks
 
 /// `changelist_file` table: key is the file path, value a msgpack [`StoredChangelist`].
 const CHANGELIST_FILE: TableDefinition<&str, &[u8]> = TableDefinition::new("changelist_file");
+
+/// `folds_file` table: key is the file path, value a msgpack [`StoredFolds`] — a
+/// file's persisted **manual** folds (vim `:mkview`-style fold persistence).
+const FOLDS_FILE: TableDefinition<&str, &[u8]> = TableDefinition::new("folds_file");
 
 /// `jumplist` table: key is the entry's sequence index (`0`-based, oldest first),
 /// value a msgpack [`StoredPos`]. Rewritten wholesale each flush; the newest store's
@@ -182,6 +186,14 @@ struct StoredPos {
 #[derive(Serialize, Deserialize)]
 struct StoredChangelist {
     entries: Vec<(usize, usize)>,
+    ts: u64,
+}
+
+/// A per-file manual-fold set as stored on disk: each fold's `(start, end, closed)`
+/// (outer-before-inner) and the write timestamp (newest per file wins on merge).
+#[derive(Serialize, Deserialize)]
+struct StoredFolds {
+    folds: Vec<(usize, usize, bool)>,
     ts: u64,
 }
 
@@ -436,6 +448,23 @@ fn write_state(db: &Database, state: &PersistState) -> std::io::Result<()> {
         }
     }
     {
+        // Manual folds key on path; clear so a file whose folds were all deleted
+        // drops out (mirrors the changelist table).
+        let mut table = wtxn.open_table(FOLDS_FILE).map_err(std::io::Error::other)?;
+        table.retain(|_, _| false).map_err(std::io::Error::other)?;
+        for ff in &state.file_folds {
+            let stored = StoredFolds {
+                folds: ff.folds.clone(),
+                ts,
+            };
+            let bytes = rmp_serde::to_vec(&stored).map_err(std::io::Error::other)?;
+            let path = ff.path.to_string_lossy().into_owned();
+            table
+                .insert(path.as_str(), bytes.as_slice())
+                .map_err(std::io::Error::other)?;
+        }
+    }
+    {
         // The jumplist is rewritten wholesale (keys 0..N), so clear first lest a
         // now-shorter list leave stale tail rows.
         let mut table = wtxn.open_table(JUMPLIST).map_err(std::io::Error::other)?;
@@ -521,6 +550,7 @@ struct MergedRaw {
     file_marks: std::collections::HashMap<(String, char), StoredFileMark>,
     numbered: std::collections::HashMap<char, StoredMark>,
     changelist: std::collections::HashMap<String, StoredChangelist>,
+    folds: std::collections::HashMap<String, StoredFolds>,
     hist_search: HistMerge,
     hist_ex: HistMerge,
     /// The jumplist is an ordered sequence, not a union: the newest store's whole
@@ -546,6 +576,7 @@ fn collect_merge<'a>(dbs: impl IntoIterator<Item = &'a Database>) -> MergedRaw {
         merge_file_marks(db, &mut m.file_marks);
         merge_numbered_marks(db, &mut m.numbered);
         merge_changelists(db, &mut m.changelist);
+        merge_folds(db, &mut m.folds);
         merge_history(db, HIST_SEARCH, &mut m.hist_search);
         merge_history(db, HIST_EX, &mut m.hist_ex);
         if let Some(meta) = read_meta(db) {
@@ -622,6 +653,14 @@ fn build_state(m: MergedRaw, numbered_marks: Vec<NumberedMark>) -> PersistState 
             .map(|(path, stored)| FileChangelist {
                 path: path.into(),
                 entries: stored.entries,
+            })
+            .collect(),
+        file_folds: m
+            .folds
+            .into_iter()
+            .map(|(path, stored)| FileFolds {
+                path: path.into(),
+                folds: stored.folds,
             })
             .collect(),
         jumplist: m
@@ -856,6 +895,36 @@ fn merge_changelists(
         let (key, value) = row;
         let path = key.value().to_string();
         let Ok(stored) = rmp_serde::from_slice::<StoredChangelist>(value.value()) else {
+            continue;
+        };
+        match best.get(&path) {
+            Some(existing) if existing.ts >= stored.ts => {}
+            _ => {
+                best.insert(path, stored);
+            }
+        }
+    }
+}
+
+/// Fold one store's `folds_file` table into the best-by-timestamp map, keyed by
+/// path (newest `ts` per file wins — a file's manual folds persist as one row,
+/// like its changelist).
+fn merge_folds(db: &Database, best: &mut std::collections::HashMap<String, StoredFolds>) {
+    let Ok(rtxn) = db.begin_read() else {
+        return;
+    };
+    let table = match rtxn.open_table(FOLDS_FILE) {
+        Ok(table) => table,
+        Err(TableError::TableDoesNotExist(_)) => return,
+        Err(_) => return,
+    };
+    let Ok(iter) = table.iter() else {
+        return;
+    };
+    for row in iter.flatten() {
+        let (key, value) = row;
+        let path = key.value().to_string();
+        let Ok(stored) = rmp_serde::from_slice::<StoredFolds>(value.value()) else {
             continue;
         };
         match best.get(&path) {

@@ -16,7 +16,7 @@ import { Parser, Language, Query } from 'web-tree-sitter';
 import { readFileSync, writeFileSync, mkdirSync, copyFileSync, rmSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { REGISTRY, BUNDLED, highlightSources, indentSource } from '../../web/grammars.js';
+import { REGISTRY, BUNDLED, highlightSources, indentSource, foldSource } from '../../web/grammars.js';
 import { sanitize } from '../../web/ts-sanitize.js';
 
 const ROOT = dirname(dirname(fileURLToPath(import.meta.url))); // tooling dir
@@ -32,6 +32,7 @@ async function main() {
   mkdirSync(join(OUT, 'grammars'), { recursive: true });
   mkdirSync(join(OUT, 'queries'), { recursive: true });
   mkdirSync(join(OUT, 'indents'), { recursive: true });
+  mkdirSync(join(OUT, 'folds'), { recursive: true });
 
   // Runtime (web-tree-sitter.js + .wasm) — copied once; shared by every grammar and
   // by the runtime installer.
@@ -51,6 +52,7 @@ async function main() {
 
   const manifest = [];
   const indented = [];
+  const folded = [];
   for (const name of BUNDLED) {
     const cfg = REGISTRY[name];
     if (!cfg) throw new Error(`BUNDLED lists '${name}', which is not in the registry`);
@@ -91,13 +93,32 @@ async function main() {
     } catch (e) {
       console.log(`  ${''.padEnd(11)} indents: unavailable (${e.message || e}) — skipped`);
     }
+
+    // Folds — best-effort, from nvim-treesitter (the same source native uses),
+    // sanitized against this grammar. A language nvim-treesitter has no folds for is
+    // skipped (it simply has no tree-sitter folds offline until `:TSInstall`).
+    try {
+      const rawFold = await fetchText(foldSource(name));
+      const fld = sanitize(rawFold, Query, lang, tree.rootNode);
+      if (fld.kept > 0) {
+        writeFileSync(join(OUT, 'folds', `${name}.scm`), fld.text);
+        folded.push(name);
+        console.log(`  ${''.padEnd(11)} folds:   ${fld.kept}/${fld.total} patterns`);
+      } else {
+        console.log(`  ${''.padEnd(11)} folds:   none kept — skipped`);
+      }
+    } catch (e) {
+      console.log(`  ${''.padEnd(11)} folds:   unavailable (${e.message || e}) — skipped`);
+    }
   }
 
   writeFileSync(join(OUT, 'manifest.json'), JSON.stringify({ languages: manifest }, null, 2) + '\n');
   // The set of bundled languages that ship an indents.scm, so the worker indenter knows
   // which to load offline without probing for a 404.
   writeFileSync(join(OUT, 'indents.json'), JSON.stringify(indented, null, 2) + '\n');
-  console.log(`vendored ${manifest.length} bundled languages (${indented.length} with indents) + runtime into ./vendor/`);
+  // The set of bundled languages that ship a folds.scm, the fold runner's twin of the above.
+  writeFileSync(join(OUT, 'folds.json'), JSON.stringify(folded, null, 2) + '\n');
+  console.log(`vendored ${manifest.length} bundled languages (${indented.length} with indents, ${folded.length} with folds) + runtime into ./vendor/`);
 }
 
 main().catch((e) => {

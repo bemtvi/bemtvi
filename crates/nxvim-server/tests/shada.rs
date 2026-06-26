@@ -96,6 +96,39 @@ async fn register_survives_a_restart() {
 }
 
 #[tokio::test]
+async fn manual_folds_survive_a_restart() {
+    let dir = temp_dir("shada_folds");
+    let file = write_temp("shada_folds", "txt", "L1\nL2\nL3\nL4\nL5\nL6\n");
+
+    // Session 1: create a closed manual fold over lines 2-4 (`zf2j`), then quit.
+    {
+        let (rpc, incoming) =
+            start_attached(init_with_store(&dir, Some(file.clone())), 80, 25).await;
+        feed(&rpc, "2Gzf2j");
+        assert_eq!(
+            lines(&rpc).await,
+            vec!["L1", "L2", "L3", "L4", "L5", "L6"],
+            "the fold hides lines on screen but leaves the buffer intact"
+        );
+        feed(&rpc, ":qa!<CR>");
+        await_server_exit(incoming).await;
+    }
+
+    // Session 2: reopen the same file. The manual fold is restored *closed*, so
+    // `dd` on its header line (2) deletes the whole fold range — proving both that
+    // the fold survived and that its closed state did.
+    {
+        let (rpc, _incoming) = start_attached(init_with_store(&dir, Some(file)), 80, 25).await;
+        feed(&rpc, "2Gdd");
+        assert_eq!(
+            lines(&rpc).await,
+            vec!["L1", "L5", "L6"],
+            "the restored closed fold makes dd remove all of lines 2-4"
+        );
+    }
+}
+
+#[tokio::test]
 async fn stores_compact_instead_of_accumulating() {
     let dir = temp_dir("shada_compaction");
 

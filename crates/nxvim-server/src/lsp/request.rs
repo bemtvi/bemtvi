@@ -67,6 +67,9 @@ impl EditHost {
             // from `issue_inlay_resolves`, never at the cursor.
             | LspReqKind::SemanticTokens
             | LspReqKind::InlayHints
+            // Folding ranges are whole-buffer too, issued by `request_folding_range`
+            // on open/change while the buffer wants LSP folds, never at the cursor.
+            | LspReqKind::FoldingRange
             | LspReqKind::ResolveInlayHint => return,
         };
         self.fx.lsp_request(key, token, req);
@@ -391,6 +394,12 @@ impl EditHost {
                 // Whole-buffer, focus-independent like semantic tokens: cache to the
                 // issuing buffer and drop on *its* content change.
                 self.on_inlay_hints_reply(req_buffer, req_tick, hints);
+            }
+            LspReply::Folds(folds) => {
+                // Whole-buffer, focus-independent like semantic tokens / inlay hints:
+                // push into the fold engine for the issuing buffer and drop on *its*
+                // content change.
+                self.on_folding_range_reply(req_buffer, req_tick, folds);
             }
             // Generic `client:request` replies are routed to their Lua handler in
             // `on_lsp_event` before reaching here, never through the typed path.

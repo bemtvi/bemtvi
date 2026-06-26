@@ -40,11 +40,54 @@ addToLibrary({
   },
 
   // Drop the cached grammar for the language after a `:TSInstall`, so the next query
-  // reloads it with the freshly installed parser + indents.scm.
+  // reloads it with the freshly installed parser + indents.scm / folds.scm.
   eh_js_ts_reload: function (langPtr) {
     try {
       var f = globalThis.__nxvimTsReload;
       if (f) f(UTF8ToString(langPtr));
     } catch (e) { /* best-effort */ }
+  },
+
+  // Foldable line ranges for the buffer text, written into the caller's i32 out-buffer
+  // as flat [start0, end0, start1, end1, …] pairs (0-based inclusive rows). Returns the
+  // total number of i32s the result needs — which may EXCEED `cap`, in which case only
+  // the first `cap` are written and the core re-calls with a buffer that big. `-1` means
+  // "no tree-sitter folds available" (no runner / grammar still loading / no folds.scm),
+  // distinct from `0` (available, nothing foldable). `langPtr`/`textPtr` are NUL-
+  // terminated UTF-8; `outPtr` is a 4-byte-aligned i32 buffer of `cap` ints.
+  eh_js_ts_folds: function (langPtr, textPtr, outPtr, cap) {
+    try {
+      var f = globalThis.__nxvimTsFolds;
+      if (!f) return -1;
+      var pairs = f(UTF8ToString(langPtr), UTF8ToString(textPtr));
+      if (!pairs) return -1;
+      var idx = outPtr >> 2; // i32 index into HEAP32
+      var total = 0;
+      for (var i = 0; i < pairs.length; i++) {
+        var s = pairs[i][0] | 0, e = pairs[i][1] | 0;
+        // Write only while both ints of this pair fit in the caller's buffer; keep
+        // counting past it so the core knows how big to grow and re-call.
+        if (total + 1 < cap) {
+          HEAP32[idx + total] = s;
+          HEAP32[idx + total + 1] = e;
+        }
+        total += 2;
+      }
+      return total;
+    } catch (e) {
+      return -1;
+    }
+  },
+
+  // Whether tree-sitter folds are available for the language (a grammar with a folds.scm
+  // is loaded), as 1/0 — lets the core tell "loaded, nothing foldable" (empty) from "no
+  // grammar yet" (retry next tick).
+  eh_js_ts_folds_available: function (langPtr) {
+    try {
+      var f = globalThis.__nxvimTsFoldsAvailable;
+      return (f && f(UTF8ToString(langPtr))) ? 1 : 0;
+    } catch (e) {
+      return 0;
+    }
   },
 });

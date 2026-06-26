@@ -13,6 +13,8 @@
     "verify-daemon": "node verify-daemon.mjs",
     "verify-connect": "node verify-connect.mjs",
     "verify-treesitter": "node verify-treesitter.mjs",
+    "verify-treesitter-indent": "node verify-treesitter-indent.mjs",
+    "verify-treesitter-folds": "node verify-treesitter-folds.mjs",
     "verify-clipboard": "node verify-clipboard.mjs",
     "verify-proc": "node verify-proc.mjs",
     "verify-lsp": "node verify-lsp.mjs",

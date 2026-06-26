@@ -106,6 +106,7 @@ pub struct ProviderCaps {
     pub code_action: bool,
     pub semantic_tokens: bool,
     pub inlay_hints: bool,
+    pub folding_range: bool,
 }
 
 /// A fire-and-forget document-sync notification, already in LSP coordinates. The
@@ -264,6 +265,14 @@ pub enum LspRequest {
         uri: Url,
         range: Range,
     },
+    /// `textDocument/foldingRange` — the foldable line ranges of a whole document
+    /// (the LSP fold source). Position-less like `documentSymbol`; requested per
+    /// buffer (on open and after each change) while the buffer's `foldmethod=expr`
+    /// resolves to the LSP foldexpr marker, and the reply ([`LspReply::Folds`])
+    /// carries the line spans the editor pushes into its fold engine.
+    FoldingRange {
+        uri: Url,
+    },
     /// `inlayHint/resolve` — fill a **lazy** hint's `label`/`tooltip` on demand
     /// (Phase 2). The original [`InlayHint`](lsp_types::InlayHint) is round-tripped
     /// verbatim as JSON (kept on [`InlayHintData::resolve_data`]); the manager
@@ -373,6 +382,12 @@ pub enum LspReply {
     /// resolved hint still carried no label, was malformed, or the request failed —
     /// the editor then drops the placeholder rather than painting an empty hint).
     ResolvedInlayHint { label: Option<String> },
+    /// The folding ranges from `textDocument/foldingRange` — each reduced to a
+    /// 0-based inclusive `[start, end]` line span ([`FoldRangeData`]; the optional
+    /// character columns and the `kind` are dropped, nxvim folds whole lines). An
+    /// empty list ⇒ the server found nothing foldable. The editor pushes these into
+    /// its fold engine as the LSP fold source.
+    Folds(Vec<FoldRangeData>),
     /// The reply to an [`LspRequest::Raw`] (Phase 5): the server's raw JSON result
     /// (`Ok`) or an error message (`Err`) — an unsupported method, a transport
     /// failure, or the server replying an error. Routed back to the Lua handler as
@@ -427,6 +442,19 @@ pub struct SymbolData {
     pub name: String,
     pub kind: String,
     pub location: Location,
+}
+
+/// One folding range from `textDocument/foldingRange`, reduced to the inclusive
+/// 0-based buffer-line span nxvim folds. The protocol's `startCharacter` /
+/// `endCharacter` and the semantic `kind` (comment/imports/region) are dropped —
+/// nxvim's fold model is whole-line, and the line span is all its containment →
+/// level builder needs.
+#[derive(Clone, Copy, Debug)]
+pub struct FoldRangeData {
+    /// First folded line (0-based).
+    pub start: u32,
+    /// Last folded line (0-based, inclusive).
+    pub end: u32,
 }
 
 /// One code action distilled for the editor: its `title` for the panel list, its

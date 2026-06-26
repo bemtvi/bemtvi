@@ -198,11 +198,14 @@ impl Editor {
                 }
             }
             Motion::Down => {
-                let l = (line + count).min(last_line);
+                // Fold-aware: each closed fold counts as one line, so `j` steps over
+                // a collapsed range in a single move (and never lands in its hidden
+                // interior). Falls back to plain stepping when no fold is in the way.
+                let l = self.line_below_folds(line, count).min(last_line);
                 MotionResult::linewise(self.buffer().line_start(l), MoveAxis::VerticalKeep)
             }
             Motion::Up => {
-                let l = line.saturating_sub(count);
+                let l = self.line_above_folds(line, count);
                 MotionResult::linewise(self.buffer().line_start(l), MoveAxis::VerticalKeep)
             }
             Motion::DisplayDown => self.display_motion(true, count),
@@ -270,15 +273,18 @@ impl Editor {
                 let line = self
                     .buffer()
                     .byte_to_line(m.target.min(self.last_char_idx()));
-                self.cursor.line = line;
-                self.cursor.col = self.first_non_blank(line);
+                // Landing inside a closed fold (e.g. `G`/`gg`/a mark jump into a
+                // collapsed range) snaps to the fold's visible header line, as vim
+                // does — the cursor is never left on a hidden line.
+                self.cursor.line = self.fold_line_start(line);
+                self.cursor.col = self.first_non_blank(self.cursor.line);
                 self.clamp_cursor();
             }
             MoveAxis::VerticalKeep => {
                 let line = self
                     .buffer()
                     .byte_to_line(m.target.min(self.last_char_idx()));
-                self.cursor.line = line;
+                self.cursor.line = self.fold_line_start(line);
                 self.settle_desired_col(false);
                 self.preserve_desired = true;
             }

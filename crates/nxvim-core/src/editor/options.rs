@@ -80,6 +80,7 @@ impl Editor {
             "number" => &mut self.windows.cur_mut().options.number,
             "relativenumber" => &mut self.windows.cur_mut().options.relativenumber,
             "cursorline" => &mut self.windows.cur_mut().options.cursorline,
+            "foldenable" => &mut self.windows.cur_mut().options.foldenable,
             "wrap" => &mut self.windows.cur_mut().options.wrap,
             "breakindent" => &mut self.windows.cur_mut().options.breakindent,
             "ignorecase" => &mut self.options.ignorecase,
@@ -149,8 +150,9 @@ impl Editor {
                     return;
                 }
                 let min = match name {
-                    "tabstop" | "numberwidth" => 1,
-                    "shiftwidth" | "sidescroll" | "sidescrolloff" => 0,
+                    "tabstop" | "numberwidth" | "foldnestmax" => 1,
+                    "shiftwidth" | "sidescroll" | "sidescrolloff" | "foldcolumn" | "foldlevel"
+                    | "foldminlines" => 0,
                     "softtabstop" => -1,
                     // A wiring gap (see `apply_set_bool`): a numeric option `resolve_set`
                     // accepted but no arm handles. Fail loud, never a silent no-op.
@@ -167,14 +169,25 @@ impl Editor {
                     "sidescroll" => self.windows.cur_mut().options.sidescroll = v as usize,
                     "sidescrolloff" => self.windows.cur_mut().options.sidescrolloff = v as usize,
                     "numberwidth" => self.windows.cur_mut().options.numberwidth = v as usize,
+                    "foldcolumn" => self.windows.cur_mut().options.foldcolumn = v as usize,
+                    // `foldlevel` re-derives which *computed* folds display closed; route
+                    // it through the dedicated setter so the `:set` and `vim.wo` paths
+                    // re-fold identically.
+                    "foldlevel" => self.set_foldlevel(v as usize),
                     _ => {
                         let opts = &mut self.buffer_mut().options;
                         match name {
                             "tabstop" => opts.tabstop = v as usize,
                             "shiftwidth" => opts.shiftwidth = v as usize,
                             "softtabstop" => opts.softtabstop = v as isize,
+                            // Structural knobs for computed folds; a recompute below
+                            // picks up the new value.
+                            "foldnestmax" => opts.foldnestmax = v as usize,
+                            "foldminlines" => opts.foldminlines = v as usize,
                             _ => {}
                         }
+                        // The indent-fold structure depends on these — rebuild it.
+                        self.refresh_folds();
                     }
                 }
             }
@@ -183,6 +196,8 @@ impl Editor {
                     "sidescroll" => self.windows.cur().options.sidescroll as i64,
                     "sidescrolloff" => self.windows.cur().options.sidescrolloff as i64,
                     "numberwidth" => self.windows.cur().options.numberwidth as i64,
+                    "foldcolumn" => self.windows.cur().options.foldcolumn as i64,
+                    "foldlevel" => self.windows.cur().options.foldlevel as i64,
                     "showtabline" => self.options.showtabline as i64,
                     "laststatus" => self.options.laststatus as i64,
                     "mousetime" => self.options.mousetime as i64,
@@ -195,6 +210,8 @@ impl Editor {
                             "tabstop" => opts.tabstop as i64,
                             "shiftwidth" => opts.shiftwidth as i64,
                             "softtabstop" => opts.softtabstop as i64,
+                            "foldnestmax" => opts.foldnestmax as i64,
+                            "foldminlines" => opts.foldminlines as i64,
                             // A wiring gap (see `apply_set_bool`): fail loud, not silent.
                             _ => {
                                 self.echo(format!("E518: Unknown option: {name}"));
@@ -357,6 +374,52 @@ impl Editor {
                 StrOp::Query => {
                     let ff = self.buffer().options.fileformat;
                     self.echo(format!("fileformat={ff}"));
+                }
+            }
+            return;
+        }
+        // `foldmethod` is buffer-local and enumerated. `manual`/`indent` apply;
+        // every other vim name fails loud (E474 for a non-vim value, an explicit
+        // "not supported yet" for a real-but-unimplemented method like `expr`) —
+        // never a silent no-op that leaves folding looking broken. Changing it
+        // rebuilds the fold structure for the new source. `&` resets to `manual`.
+        if name == "foldmethod" {
+            use crate::options::{FoldMethod, FoldMethodErr};
+            match op {
+                StrOp::Set(value) => match FoldMethod::from_label(&value) {
+                    Ok(fdm) => {
+                        self.buffer_mut().options.foldmethod = fdm;
+                        self.refresh_folds();
+                    }
+                    Err(FoldMethodErr::Unknown) => {
+                        self.echo(format!("E474: Invalid argument: foldmethod={value}"));
+                    }
+                    Err(FoldMethodErr::Unimplemented) => {
+                        self.echo(format!("foldmethod={value} is not supported yet"));
+                    }
+                },
+                StrOp::Reset => {
+                    self.buffer_mut().options.foldmethod = FoldMethod::Manual;
+                    self.refresh_folds();
+                }
+                StrOp::Query => {
+                    let fdm = self.buffer().options.foldmethod;
+                    self.echo(format!("foldmethod={fdm}"));
+                }
+            }
+            return;
+        }
+        // `foldexpr` is the buffer-local expression `foldmethod=expr` folds by,
+        // stored beside `commentstring` (a per-buffer string, not a `Copy`
+        // `BufferOptions` slot). `set_foldexpr` warns loud for a non-tree-sitter
+        // expr (Phase 5) and rebuilds the structure. `&` clears it.
+        if name == "foldexpr" {
+            match op {
+                StrOp::Set(value) => self.set_foldexpr(&value),
+                StrOp::Reset => self.set_foldexpr(""),
+                StrOp::Query => {
+                    let fde = self.foldexpr().to_string();
+                    self.echo(format!("foldexpr={fde}"));
                 }
             }
             return;

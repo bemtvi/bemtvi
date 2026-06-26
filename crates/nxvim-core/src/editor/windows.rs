@@ -419,6 +419,11 @@ pub(crate) struct Window {
     /// exact gutter the client drew — without it, signs shift every column to the
     /// right. `0` until the window is first rendered.
     pub(crate) sign_width: usize,
+    /// This window's manual code folds (vim's per-window fold model). Created with
+    /// `zf`/`:fold`, opened/closed by the `z` family, and read by the view
+    /// projection to collapse closed folds. Empty by default; a split inherits a
+    /// clone of its parent's. See [`crate::editor::fold`].
+    pub(crate) folds: super::fold::FoldState,
 }
 
 /// A node in the window layout tree: either a single window (`Leaf`) or a
@@ -553,6 +558,7 @@ impl WindowTree {
                 loclist: None,
                 loclist_bufnr: None,
                 sign_width: 0,
+                folds: super::fold::FoldState::default(),
             },
         );
         WindowTree {
@@ -593,6 +599,7 @@ impl WindowTree {
             loclist: None,
             loclist_bufnr: None,
             sign_width: 0,
+            folds: super::fold::FoldState::default(),
         }
     }
 
@@ -1197,6 +1204,10 @@ pub(crate) struct WindowLayout {
     /// Which screen region (main area or a dock) this window belongs to. Its
     /// `rect` is relative to that region's own origin.
     pub(crate) region: WindowRegion,
+    /// This window's manual folds (a clone of [`Window::folds`]), so the view
+    /// projection can collapse closed folds into placeholder rows. See
+    /// [`crate::editor::fold`].
+    pub(crate) folds: super::fold::FoldState,
 }
 
 /// One tab page's label data for the [`View`] tabline: the file name of the
@@ -1383,6 +1394,7 @@ impl Editor {
             "number" => w.options.number = value,
             "relativenumber" => w.options.relativenumber = value,
             "cursorline" => w.options.cursorline = value,
+            "foldenable" => w.options.foldenable = value,
             "wrap" => w.options.wrap = value,
             // A per-window override of the global `'scrollanim'` (see
             // [`WindowOptions::scrollanim`]); `Some(value)` shadows the global until unset.
@@ -1402,6 +1414,16 @@ impl Editor {
         let w = t.get_mut(id);
         if name == "numberwidth" {
             w.options.numberwidth = value.max(1) as usize;
+        } else if name == "foldcolumn" {
+            w.options.foldcolumn = value.max(0) as usize;
+        } else if name == "foldlevel" {
+            // Set on the target window directly, then re-derive its computed folds'
+            // closed state (only the focused window's are recomputed by
+            // `set_foldlevel`, so set the slot here and refold if this *is* current).
+            w.options.foldlevel = value.max(0) as usize;
+            if self.windows.current == id {
+                self.set_foldlevel(value.max(0) as usize);
+            }
         } else if name == "padding" {
             // `vim.wo.padding = 2` (a bare number) sets a uniform margin; the
             // string forms (`"1 2"`, …) come through `set_window_option_str`. A
@@ -1846,6 +1868,7 @@ impl Editor {
                 loclist: None,
                 loclist_bufnr: None,
                 sign_width: 0,
+                folds: super::fold::FoldState::default(),
             },
         );
         self.windows.floats.push(id);
@@ -2033,6 +2056,7 @@ impl Editor {
                     border,
                     title,
                     region,
+                    folds: w.folds.clone(),
                 });
             }
         }
@@ -2106,6 +2130,7 @@ impl Editor {
                 loclist,
                 loclist_bufnr: None,
                 sign_width: 0,
+                folds: super::fold::FoldState::default(),
             },
         );
         split_leaf(&mut self.windows.root, cur, dir, new_id);
@@ -2148,6 +2173,7 @@ impl Editor {
                 loclist: None,
                 loclist_bufnr: None,
                 sign_width: 0,
+                folds: super::fold::FoldState::default(),
             },
         );
         // Wrap the entire tiled layout: [existing, new] stacked vertically, the new

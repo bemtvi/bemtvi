@@ -139,8 +139,13 @@ impl Editor {
             "tabstop" => ob.buffer.options.tabstop = value.max(1) as usize,
             "shiftwidth" => ob.buffer.options.shiftwidth = value.max(0) as usize,
             "softtabstop" => ob.buffer.options.softtabstop = value.max(-1) as isize,
-            _ => {}
+            "foldnestmax" => ob.buffer.options.foldnestmax = value.max(1) as usize,
+            "foldminlines" => ob.buffer.options.foldminlines = value.max(0) as usize,
+            _ => return,
         }
+        // `shiftwidth`/`tabstop` change the indent scale and the two `fold*` knobs the
+        // computed structure, so a buffer the focused window shows must re-fold.
+        self.refresh_folds();
     }
 
     /// Set a boolean buffer-local option (`expandtab`, `ts_highlight`) on buffer
@@ -197,6 +202,16 @@ impl Editor {
             }
             return;
         }
+        // `foldexpr` is likewise a per-buffer string (not a `Copy` `BufferOptions`
+        // slot). `set_foldexpr` operates on the focused buffer; only forward a write
+        // for that buffer (a non-focused write is a no-op here, matching the
+        // focused-window fold model). Rebuilds the structure.
+        if name == "foldexpr" {
+            if id == self.current_buffer_id() {
+                self.set_foldexpr(value);
+            }
+            return;
+        }
         let Some(ob) = self.buffers.map.get_mut(&id) else {
             return;
         };
@@ -226,6 +241,16 @@ impl Editor {
                 Some(ff) => ff,
                 None => return,
             };
+        } else if name == "foldmethod" {
+            // `nx.bo.foldmethod = "indent"`, the `vim.bo` companion to the enumerated
+            // `:set foldmethod` path. An unknown or not-yet-implemented value is
+            // ignored here (the `:set` ex path is the loud one); a recognized value
+            // rebuilds the fold structure for the new source.
+            match crate::options::FoldMethod::from_label(value) {
+                Ok(fdm) => ob.buffer.options.foldmethod = fdm,
+                Err(_) => return,
+            }
+            self.refresh_folds();
         }
     }
 
@@ -894,6 +919,10 @@ impl Editor {
         self.message.clear();
         self.clamp_cursor();
         self.ensure_visible();
+        // A reopened file gets its shada-restored manual folds back when it becomes
+        // the focused window's buffer (guarded on the window having no folds yet, so
+        // a session's own folds win).
+        self.seed_pending_folds();
     }
 
     /// `<C-^>` — switch to the alternate buffer (`#`), or report `E23` when there

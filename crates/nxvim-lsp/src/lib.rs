@@ -55,9 +55,9 @@ pub use lsp_types;
 // on the protocol JSON layer. All wasm-safe (plain data / pure transforms).
 pub use convert::normalize_workspace_edit;
 pub use protocol::{
-    CodeActionData, CompletionItemData, InlayHintData, LspEvent, LspNotify, LspReply, LspRequest,
-    PositionEncoding, ProviderCaps, RefreshKind, ReqToken, SemanticLegend, SemanticTokensData,
-    ServerCaps, ServerKey, ServerSpawn, SymbolData, WorkspaceEditData,
+    CodeActionData, CompletionItemData, FoldRangeData, InlayHintData, LspEvent, LspNotify,
+    LspReply, LspRequest, PositionEncoding, ProviderCaps, RefreshKind, ReqToken, SemanticLegend,
+    SemanticTokensData, ServerCaps, ServerKey, ServerSpawn, SymbolData, WorkspaceEditData,
 };
 pub use serde_json;
 

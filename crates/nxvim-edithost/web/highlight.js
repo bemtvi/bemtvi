@@ -22,7 +22,7 @@
 // the renderer already does).
 
 import { Parser, Language, Query } from './vendor/web-tree-sitter/web-tree-sitter.js';
-import { EXT, FT, REGISTRY, QUERY_KINDS, highlightSources, indentSource, versionOf, resolveName } from './grammars.js';
+import { EXT, FT, REGISTRY, QUERY_KINDS, highlightSources, indentSource, foldSource, versionOf, resolveName } from './grammars.js';
 import { sanitize } from './ts-sanitize.js';
 
 // Resolve vendored assets relative to THIS module, not the page, so the demo still
@@ -235,6 +235,16 @@ export function createHighlighter({ onReady } = {}) {
         catch {
           try { extras.indents = await fetchText(`${CDN_BASE}/${cfg.pkg}@${ver}/queries/indents.scm`); }
           catch { /* no indents from either source */ }
+        }
+        continue;
+      }
+      // Folds, like indents, come from nvim-treesitter so the browser matches native
+      // (the grammar package's own folds.scm, if any, can differ); fall back to it.
+      if (kind === 'folds') {
+        try { extras.folds = await fetchText(foldSource(name, GH_BASE)); }
+        catch {
+          try { extras.folds = await fetchText(`${CDN_BASE}/${cfg.pkg}@${ver}/queries/folds.scm`); }
+          catch { /* no folds from either source */ }
         }
         continue;
       }

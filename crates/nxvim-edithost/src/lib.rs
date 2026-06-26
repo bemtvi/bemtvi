@@ -33,8 +33,8 @@ use std::ffi::{c_char, CStr, CString};
 use std::rc::Rc;
 
 use nxvim_core::{
-    BufferEdit, BufferId, Clipboard, DirEntry, Editor, IndentParams, NumberedMark, OpenOutcome,
-    PendingSave, PersistState, Span, SyntaxEngine,
+    BufferEdit, BufferId, Clipboard, DirEntry, Editor, FoldRange, IndentParams, NumberedMark,
+    OpenOutcome, PendingSave, PersistState, Span, SyntaxEngine,
 };
 use nxvim_lsp::{LspEvent, LspNotify, LspRequest, ReqToken, ServerKey, ServerSpawn, SyncLspClient, WireOp};
 use nxvim_lua::LuaRuntime;
@@ -61,6 +61,18 @@ extern "C" {
     fn eh_js_ts_available(lang: *const c_char) -> i32;
     /// Drop `lang`'s cached grammar after a `:TSInstall`, so the next query reloads it.
     fn eh_js_ts_reload(lang: *const c_char);
+    /// Foldable line ranges for `text` in `lang`, written into the `cap`-int `out` buffer
+    /// as flat `[start, end, …]` 0-based inclusive pairs. Returns the total number of i32s
+    /// needed (may exceed `cap` — the caller grows + retries); `-1` if no tree-sitter folds
+    /// are available (no runner / grammar loading / no `folds.scm`).
+    fn eh_js_ts_folds(
+        lang: *const c_char,
+        text: *const c_char,
+        out: *mut i32,
+        cap: i32,
+    ) -> i32;
+    /// `1` if a grammar with a `folds.scm` is loaded for `lang`, else `0`.
+    fn eh_js_ts_folds_available(lang: *const c_char) -> i32;
 }
 
 
@@ -362,6 +374,52 @@ impl SyntaxEngine for WasmSyntax {
             return false;
         };
         unsafe { eh_js_ts_available(lang.as_ptr()) != 0 }
+    }
+
+    fn folds(&mut self, buffer: BufferId) -> Vec<FoldRange> {
+        let Some(state) = self.buffers.get(&buffer) else {
+            return Vec::new();
+        };
+        let (Some(lang), Ok(text)) = (
+            Self::lang_cstr(&state.language),
+            CString::new(state.shadow.as_str()),
+        ) else {
+            return Vec::new();
+        };
+        // The worker writes flat `[start, end, …]` i32 pairs into `buf`; it returns the
+        // total count needed, which may exceed `buf.len()` (a fold-dense file) — grow and
+        // retry once in that case. `1024` ints = 512 folds covers the common case.
+        let mut buf = vec![0i32; 1024];
+        loop {
+            let needed = unsafe {
+                eh_js_ts_folds(lang.as_ptr(), text.as_ptr(), buf.as_mut_ptr(), buf.len() as i32)
+            };
+            if needed < 0 {
+                return Vec::new(); // no tree-sitter folds available
+            }
+            let needed = needed as usize;
+            if needed <= buf.len() {
+                buf.truncate(needed);
+                break;
+            }
+            buf = vec![0i32; needed];
+        }
+        buf.chunks_exact(2)
+            .map(|c| FoldRange {
+                start: c[0].max(0) as usize,
+                end: c[1].max(0) as usize,
+            })
+            .collect()
+    }
+
+    fn folds_available(&self, buffer: BufferId) -> bool {
+        let Some(state) = self.buffers.get(&buffer) else {
+            return false;
+        };
+        let Some(lang) = Self::lang_cstr(&state.language) else {
+            return false;
+        };
+        unsafe { eh_js_ts_folds_available(lang.as_ptr()) != 0 }
     }
 
     fn set_query(&mut self, _lang: &str, _name: &str, _text: Option<String>) -> Result<(), String> {

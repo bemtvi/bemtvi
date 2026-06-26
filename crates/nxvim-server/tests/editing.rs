@@ -33,6 +33,8 @@ mod ex_substitute;
 mod explorer;
 #[path = "editing/fileformat.rs"]
 mod fileformat;
+#[path = "editing/folds.rs"]
+mod folds;
 #[path = "editing/global_cmd.rs"]
 mod global_cmd;
 #[path = "editing/highlights.rs"]

@@ -28,6 +28,16 @@ export function indentSource(name, base) {
   return `${root}/nvim-treesitter/nvim-treesitter@${NVIM_TS_REF}/runtime/queries/${name}/indents.scm`;
 }
 
+// The jsDelivr URL for `lang`'s nvim-treesitter `folds.scm` at the pinned ref, or null
+// for a language not in the registry. Folds, like indents, come from nvim-treesitter
+// (not the grammar npm package) so the browser folds match native exactly — native's
+// `install.rs` copies the same nvim-treesitter `runtime/queries/<lang>/folds.scm`.
+export function foldSource(name, base) {
+  if (!REGISTRY[name]) return null;
+  const root = base || 'https://cdn.jsdelivr.net/gh';
+  return `${root}/nvim-treesitter/nvim-treesitter@${NVIM_TS_REF}/runtime/queries/${name}/folds.scm`;
+}
+
 // Pinned package versions — MUST stay in lockstep with treesitter/package.json (the
 // build installs those exact versions; the runtime builds jsDelivr URLs from these).
 export const VERSIONS = {

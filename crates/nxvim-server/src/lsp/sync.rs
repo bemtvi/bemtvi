@@ -574,6 +574,7 @@ impl EditHost {
                         legend: caps.legend.clone(),
                         semantic_tokens_delta: caps.semantic_tokens_delta,
                         inlay_hints: caps.providers.inlay_hints,
+                        folding_range: caps.providers.folding_range,
                     },
                 );
                 // Mirror the client into `nx.lsp._clients[id]` so `on_attach` can

@@ -966,6 +966,19 @@ fn render_window(
         );
     }
 
+    // The fold-marker gutter sits at the very left (vim's foldcolumn, before the
+    // sign and number columns). Painted from the server's per-row `foldcolumn`
+    // strings; absent when `'foldcolumn'` is `0`.
+    let text_area = if win.foldcolumn_width > 0 {
+        let cols =
+            Layout::horizontal([Constraint::Length(win.foldcolumn_width), Constraint::Min(0)])
+                .split(text_area);
+        render_fold_column(frame, cols[0], &win.foldcolumn, win, view);
+        cols[1]
+    } else {
+        text_area
+    };
+
     // Reserve the diagnostic sign column at the far left (vim's signcolumn, left of
     // the number gutter). Its width comes from the server's resolved `signcolumn`
     // policy (`0` = no column); glyphs are painted below, once the palette is built.
@@ -1243,6 +1256,33 @@ fn render_sign_column(
                     Line::from(Span::styled(pad_to_width(glyph, width), style))
                 }
                 None => Line::from(" ".repeat(width)),
+            })
+            .collect::<Vec<_>>(),
+    );
+    frame.render_widget(Paragraph::new(text), area);
+}
+
+/// Paint the fold-marker gutter reserved by [`render_window`]: each visible row's
+/// `foldcolumn` string (`-`/`│` for open folds, `+` for a closed one, blanks
+/// elsewhere), in the line-number palette style. The strings are already exactly
+/// the column width; `pad_to_width` guards a short/over-long one.
+fn render_fold_column(
+    frame: &mut Frame,
+    area: Rect,
+    foldcolumn: &[String],
+    win: &WindowView,
+    view: &View,
+) {
+    let width = area.width as usize;
+    let style = win
+        .line_nr(view)
+        .map(rt)
+        .unwrap_or_else(|| Style::default().add_modifier(Modifier::DIM));
+    let text = Text::from(
+        (0..area.height as usize)
+            .map(|row| {
+                let cell = foldcolumn.get(row).map(String::as_str).unwrap_or("");
+                Line::from(Span::styled(pad_to_width(cell, width), style))
             })
             .collect::<Vec<_>>(),
     );

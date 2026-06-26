@@ -13,17 +13,17 @@ use async_lsp::{LanguageServer, ServerSocket};
 use lsp_types::{
     CodeActionContext, CodeActionParams, CompletionItem, CompletionParams,
     DidChangeTextDocumentParams, DidCloseTextDocumentParams, DidOpenTextDocumentParams,
-    DidSaveTextDocumentParams, DocumentFormattingParams, DocumentSymbolParams, FormattingOptions,
-    GotoDefinitionParams, HoverParams, InlayHint, InlayHintParams, PartialResultParams, Position,
-    ReferenceContext, ReferenceParams, RenameParams, SemanticTokensDeltaParams,
-    SemanticTokensFullDeltaResult, SemanticTokensParams, SemanticTokensResult, SignatureHelpParams,
-    TextDocumentIdentifier, TextDocumentItem, TextDocumentPositionParams, Url,
-    VersionedTextDocumentIdentifier, WorkspaceSymbolParams,
+    DidSaveTextDocumentParams, DocumentFormattingParams, DocumentSymbolParams, FoldingRangeParams,
+    FormattingOptions, GotoDefinitionParams, HoverParams, InlayHint, InlayHintParams,
+    PartialResultParams, Position, ReferenceContext, ReferenceParams, RenameParams,
+    SemanticTokensDeltaParams, SemanticTokensFullDeltaResult, SemanticTokensParams,
+    SemanticTokensResult, SignatureHelpParams, TextDocumentIdentifier, TextDocumentItem,
+    TextDocumentPositionParams, Url, VersionedTextDocumentIdentifier, WorkspaceSymbolParams,
 };
 
 use crate::convert::{
-    code_actions, completion_reply, document_symbols, documentation_lines, goto_locations,
-    hover_reply, inlay_hint, inlay_label_core, normalize_workspace_edit, pad_label,
+    code_actions, completion_reply, document_symbols, documentation_lines, folding_ranges,
+    goto_locations, hover_reply, inlay_hint, inlay_label_core, normalize_workspace_edit, pad_label,
     signature_help_reply, workspace_symbols,
 };
 use crate::log::{LogLevel, LspLog};
@@ -151,6 +151,20 @@ pub(crate) async fn issue_request(
                 Err(e) => {
                     log.log(LogLevel::Warn, name, &format!("documentSymbol failed: {e}"));
                     LspReply::Symbols(Vec::new())
+                }
+            }
+        }
+        LspRequest::FoldingRange { uri } => {
+            let params = FoldingRangeParams {
+                text_document: TextDocumentIdentifier { uri },
+                work_done_progress_params: Default::default(),
+                partial_result_params: Default::default(),
+            };
+            match sock.folding_range(params).await {
+                Ok(ranges) => LspReply::Folds(folding_ranges(ranges.unwrap_or_default())),
+                Err(e) => {
+                    log.log(LogLevel::Warn, name, &format!("foldingRange failed: {e}"));
+                    LspReply::Folds(Vec::new())
                 }
             }
         }
@@ -741,6 +755,7 @@ fn describe_request(req: &LspRequest) -> String {
             )
         }
         LspRequest::DocumentSymbol { .. } => return "→ documentSymbol".to_string(),
+        LspRequest::FoldingRange { .. } => return "→ foldingRange".to_string(),
         LspRequest::WorkspaceSymbol { query } => return format!("→ workspace/symbol '{query}'"),
         LspRequest::SemanticTokensFull { .. } => return "→ semanticTokens/full".to_string(),
         LspRequest::SemanticTokensDelta {

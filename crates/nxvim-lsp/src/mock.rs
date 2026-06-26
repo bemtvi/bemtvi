@@ -284,6 +284,9 @@ pub fn run(script_path: &str) {
             // deserialize into an `InlayHint` — exercising the editor's
             // resolve-failure path (logged, placeholder dropped).
             "inlayHint/resolve" => reply_scripted(&stdout, id, &script, "inlay_resolve"),
+            // Folding ranges: return the scripted `FoldingRange[]` for the whole
+            // document. Absent ⇒ `null` (no folds).
+            "textDocument/foldingRange" => reply_scripted(&stdout, id, &script, "folding_ranges"),
             // Any other request must be answered or the client would wait forever;
             // notifications need no reply. A `custom_replies` map (method ->
             // result) scripts the answer to a generic `client:request` (Phase 5);
@@ -371,6 +374,14 @@ fn initialize_result(script: &Value) -> Value {
                 json!(true)
             };
             base.insert("inlayHintProvider".to_string(), provider);
+        }
+    }
+    // Advertise the folding-range provider only when the script supplies
+    // `folding_ranges` (so a test without it exercises a server that doesn't offer
+    // the feature, leaving the buffer unfolded).
+    if script.get("folding_ranges").is_some() {
+        if let Value::Object(base) = &mut capabilities {
+            base.insert("foldingRangeProvider".to_string(), json!(true));
         }
     }
     if let Some(Value::Object(overrides)) = script.get("capabilities") {

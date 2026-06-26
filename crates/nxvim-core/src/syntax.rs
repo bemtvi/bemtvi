@@ -39,6 +39,19 @@ pub enum OpenOutcome {
     LoadFailed(String),
 }
 
+/// One foldable region from the tree-sitter `folds.scm` query: an inclusive
+/// 0-based buffer-line span `[start, end]` of a `@fold`-captured node. The editor
+/// turns the set of ranges into per-line fold levels by containment (deeper
+/// containment = deeper level), then into nested folds — so the engine only
+/// reports *where* the foldable nodes are, not the fold tree itself.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FoldRange {
+    /// First line the foldable node spans (0-based).
+    pub start: usize,
+    /// Last line the foldable node spans (0-based, inclusive).
+    pub end: usize,
+}
+
 /// The editor's effective indent settings, passed to [`SyntaxEngine::indent`] so
 /// the engine can turn an indent *level* into a target column width.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -114,6 +127,26 @@ pub trait SyntaxEngine {
     /// indentation is active, versus *no ts-indent at all* (keep vim's
     /// autoindent-off default of column 0) when it isn't.
     fn indents_available(&self, buffer: BufferId) -> bool;
+
+    /// Foldable node ranges for `buffer` — the `@fold` captures of the grammar's
+    /// `folds.scm` run over the current parse, each as an inclusive line span. The
+    /// editor builds per-line fold levels from these (by containment) and then the
+    /// nested fold tree, the tree-sitter source behind `foldmethod=expr` with the
+    /// native `nx.treesitter.foldexpr`. Empty when there is no grammar, no
+    /// `folds.scm`, or no parse yet. The default returns nothing — an engine with no
+    /// fold query (the wasm JS-side path until 4b) supplies no tree-sitter folds.
+    fn folds(&mut self, _buffer: BufferId) -> Vec<FoldRange> {
+        Vec::new()
+    }
+
+    /// Whether tree-sitter folds are *available* for `buffer` — a grammar with a
+    /// `folds.scm` is loaded. Lets the editor tell "the fold query is loaded but
+    /// found nothing" (keep an empty fold set) apart from "the grammar isn't ready
+    /// yet" (leave folds untouched and retry), so a still-loading parser doesn't
+    /// transiently clear folds. The default is `false`.
+    fn folds_available(&self, _buffer: BufferId) -> bool {
+        false
+    }
 
     /// Install (or, with `text = None`, clear) a resolved query override for
     /// `(lang, name)` — the engine half of the query-resolution bridge. The Lua

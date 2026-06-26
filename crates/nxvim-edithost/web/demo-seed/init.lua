@@ -25,6 +25,11 @@ require("nxvim-tree").setup({
 -- Statusline; `theme = "auto"` derives the palette from the active colorscheme (catppuccin).
 require("nxvim-line").setup({ options = { theme = "auto" } })
 
+-- An empty bottom tray (a permanent edge dock on a scratch buffer). `autohide = true`
+-- collapses it the instant focus leaves, and pops it back when you cross in
+-- (`<C-w><C-w>j`) or `:DockShow bottom` — out of the way until you want it.
+nx.dock.open({ side = "bottom", size = 8, autohide = true, title = "PANEL" })
+
 -- LSP keymaps (gd / K / grn / gra / grr / gO / <leader>l…); servers configured below.
 require("nxvim-lspconfig").setup({})
 

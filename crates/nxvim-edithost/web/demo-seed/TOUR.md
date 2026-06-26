@@ -17,6 +17,8 @@ plugins all run in this tab.
   `<CR>` to accept, `<C-e>` to dismiss), with LSP suggestions and docs
 - `<space>` (leader), then wait — which-key shows what each key does
 - `<leader>e`                 — toggle the file-tree sidebar
+- `<C-w><C-w>j`               — drop into the bottom panel (it autohides, so it
+  collapses to a `▸PANEL` chip when you leave; click the chip to bring it back)
 
 ## What's here
 

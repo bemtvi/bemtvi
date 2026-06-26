@@ -2,6 +2,7 @@
 //! (delete/yank/paste/join/replace/case).
 
 use super::command::{is_clipboard_register, is_readonly_register, COMMENT_OP, FOLD_OP};
+use super::syntax::indent_width;
 use super::*;
 use crate::clipboard::Clipboard;
 use crate::mode::Mode;
@@ -124,6 +125,15 @@ impl Editor {
                 let last = self.buffer().byte_to_line(hi.saturating_sub(1));
                 self.reindent_lines(first, last);
             }
+            // `>{motion}` / `<{motion}` / `>>` / `<<`: shift whole lines one
+            // `shiftwidth` right or left (always linewise, like `=`). A count
+            // before the operator already became the line range, so the shift
+            // amount here is exactly one `shiftwidth`.
+            '>' | '<' => {
+                let first = self.buffer().byte_to_line(lo);
+                let last = self.buffer().byte_to_line(hi.saturating_sub(1));
+                self.shift_lines(first, last, op == '>', 1);
+            }
             // `gc{motion}` / `gcc` / `gcip`: toggle line comments over whichever
             // lines the range touches (always linewise, even from a charwise
             // motion / text object, like `=`).
@@ -146,6 +156,40 @@ impl Editor {
         for line in first..=last {
             let width = self.indent_for(line);
             self.set_line_indent(line, width);
+        }
+        self.buffer_mut().modified = true;
+        self.cursor.line = first.min(self.last_line());
+        self.cursor.col = self.first_non_blank(self.cursor.line);
+        self.clamp_cursor();
+    }
+
+    /// Shift lines `[first, last]` by `count` shiftwidths — right when `right`
+    /// (`>`/`>>`), else left (`<`/`<<`). The body shared by `>{motion}`, `>>`,
+    /// and visual `>`/`<`. Each line's existing indent (measured in virtual
+    /// columns, tabs honoring `tabstop`) gains / loses `count * shiftwidth`
+    /// columns, clamped at 0; the whitespace is then re-laid by `set_line_indent`
+    /// (spaces under `expandtab`, else tabs+spaces). Blank lines (only whitespace)
+    /// are left untouched, as vim's `>>` never indents an empty line. One undo
+    /// step covers the whole run; the cursor settles on `first`'s first non-blank.
+    fn shift_lines(&mut self, first: usize, last: usize, right: bool, count: usize) {
+        self.push_undo();
+        let last = last.min(self.last_line());
+        let opts = self.buffer().options;
+        let amount = opts.effective_shiftwidth() * count;
+        let tabstop = opts.effective_tabstop();
+        for line in first..=last {
+            let s = self.buffer().line(line);
+            // A blank line keeps no indent (vim leaves empty lines at column 0).
+            if s.trim().is_empty() {
+                continue;
+            }
+            let cur = indent_width(&s, tabstop);
+            let new = if right {
+                cur + amount
+            } else {
+                cur.saturating_sub(amount)
+            };
+            self.set_line_indent(line, new);
         }
         self.buffer_mut().modified = true;
         self.cursor.line = first.min(self.last_line());
@@ -204,6 +248,21 @@ impl Editor {
             let first = self.buffer().byte_to_line(lo);
             let last = self.buffer().byte_to_line(hi.saturating_sub(1));
             self.reindent_lines(first, last);
+            self.mode = Mode::Normal;
+            self.reset_pending();
+            return;
+        }
+        // Visual `>`/`<` shift the selected lines — like `=`, no yank / register.
+        // A count multiplies the shift (`2>` indents by two shiftwidths), matching
+        // vim's visual shift. The cursor settles on the first line, then visual
+        // mode exits.
+        if op == '>' || op == '<' {
+            // Stash the selection's shape so `.` reselects the same extent and
+            // re-shifts (vim's visual `.`), captured before the buffer mutates.
+            self.capture_visual_shape(op);
+            let first = self.buffer().byte_to_line(lo);
+            let last = self.buffer().byte_to_line(hi.saturating_sub(1));
+            self.shift_lines(first, last, op == '>', self.effective_count());
             self.mode = Mode::Normal;
             self.reset_pending();
             return;

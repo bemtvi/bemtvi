@@ -61,6 +61,8 @@ mod registers;
 mod rendering;
 #[path = "editing/search.rs"]
 mod search;
+#[path = "editing/shift.rs"]
+mod shift;
 #[path = "editing/statusline.rs"]
 mod statusline;
 #[path = "editing/text_objects.rs"]

@@ -908,6 +908,8 @@ fn operator_name(op: char) -> &'static str {
         'c' => "Change",
         'y' => "Yank",
         '=' => "Indent",
+        '>' => "Shift right",
+        '<' => "Shift left",
         _ => "Operator",
     }
 }
@@ -1359,6 +1361,8 @@ fn parse_command(mode: Mode, pending: &PendingCommand, key: Key, gpending: bool)
             'y' => return Complete(RC::VisualOperate('y')),
             'c' | 's' => return Complete(RC::VisualOperate('c')),
             '=' => return Complete(RC::VisualOperate('=')),
+            '>' => return Complete(RC::VisualOperate('>')),
+            '<' => return Complete(RC::VisualOperate('<')),
             'v' => return Complete(RC::Normal(N::EnterVisual)),
             'V' => return Complete(RC::Normal(N::EnterVisualLine)),
             // `o`/`O` move the cursor to the other end of the selection (charwise/
@@ -1383,9 +1387,10 @@ fn parse_command(mode: Mode, pending: &PendingCommand, key: Key, gpending: bool)
         'C' => Complete(RC::Normal(N::ChangeToEol)),
         's' => Complete(RC::Normal(N::SubstituteChar)),
         'R' => Complete(RC::Normal(N::EnterReplace)),
-        'd' | 'c' | 'y' | '=' => {
+        'd' | 'c' | 'y' | '=' | '>' | '<' => {
             // Begin an operator (prefix): move count → op_count, drop g-pending.
-            // `=` is the reindent operator (`==`, `=motion`, `gg=G`).
+            // `=` is the reindent operator (`==`, `=motion`, `gg=G`); `>`/`<` are
+            // the shift-right / shift-left operators (`>>`, `<<`, `>j`, `>ip`).
             let mut next = pending.clone();
             next.operator = Some(c);
             next.op_count = pending.count;

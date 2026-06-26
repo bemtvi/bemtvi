@@ -1327,3 +1327,97 @@ fn a_dock_title_paints_at_the_start_of_its_tabline_strip() {
         "content below the strip"
     );
 }
+
+/// A `menu` redraw submap (the picker / `nx.ui.select` float-list). `items` are the
+/// row labels; `spans` are the per-row matched-char ranges (parallel to `items`).
+fn menu_value(items: &[&str], spans: &[&[(u16, u16)]], width: u64, query: Option<&str>) -> Value {
+    let items_v = Value::Array(items.iter().map(|s| Value::from(*s)).collect());
+    let spans_v = Value::Array(
+        spans
+            .iter()
+            .map(|row| {
+                Value::Array(
+                    row.iter()
+                        .map(|&(s, e)| Value::Array(vec![Value::from(s), Value::from(e)]))
+                        .collect(),
+                )
+            })
+            .collect(),
+    );
+    let mut m = vec![
+        (Value::from("items"), items_v),
+        (Value::from("match_spans"), spans_v),
+        (Value::from("selected"), Value::from(0u64)),
+        (Value::from("row"), Value::from(0u64)),
+        (Value::from("col"), Value::from(0u64)),
+        (Value::from("width"), Value::from(width)),
+        (Value::from("height"), Value::from(6u64)),
+    ];
+    if let Some(q) = query {
+        m.push((Value::from("query"), Value::from(q)));
+    }
+    Value::Map(m)
+}
+
+/// The cell symbols spanning columns `x..x + n` of buffer row `y`, as a string.
+fn run_text(buf: &Buffer, x: u16, y: u16, n: u16) -> String {
+    (x..x + n)
+        .map(|xx| buf.cell((xx, y)).map(|c| c.symbol()).unwrap_or(""))
+        .collect()
+}
+
+#[test]
+fn a_picker_row_keeps_the_file_name_when_the_path_overflows() {
+    // A long path in a narrow picker box must not lose its file name: the leading
+    // directories collapse behind a `…`, and the file name (the path tail) stays
+    // whole — that's the thing you scan the list for.
+    let long = "crates/nxvim-core/src/editor/operators.rs"; // 41 chars
+    let menu = menu_value(
+        &[long, "main.rs"],
+        // Highlight "operators" (chars 29..38) on row 0 — it must follow the elision.
+        &[&[(29, 38)], &[]],
+        22,       // a list width the 41-char path can't fit
+        Some(""), // a picker (carries a prompt)
+    );
+    let v = view(vec![("lines", lines(&["x"])), ("menu", menu)]);
+    let buf = paint(&v, 60, 12);
+
+    let rows: Vec<String> = (0..buf.area.height).map(|y| row_text(&buf, y)).collect();
+    let shown = rows.join("\n");
+    // The file name survives, behind a `…` that swallowed the leading directories.
+    assert!(
+        rows.iter().any(|r| r.contains("…editor/operators.rs")),
+        "file name kept after eliding the head:\n{shown}"
+    );
+    // The head is gone — the leading directories never render (no tail truncation,
+    // which would have cut the file name instead).
+    assert!(
+        !shown.contains("crates/nxvim-core"),
+        "leading directories elided, not shown:\n{shown}"
+    );
+    // A short path that fits is shown verbatim, with no ellipsis.
+    assert!(
+        rows.iter()
+            .any(|r| r.contains("main.rs") && !r.contains('…')),
+        "a fitting path renders whole:\n{shown}"
+    );
+
+    // The match highlight tracks the elision: the underlined run still spells
+    // "operators", proving the spans were remapped onto the truncated string.
+    let mut hit = None;
+    'scan: for y in 0..buf.area.height {
+        for x in 0..buf.area.width.saturating_sub(9) {
+            if run_text(&buf, x, y, 9) == "operators" {
+                hit = Some((x, y));
+                break 'scan;
+            }
+        }
+    }
+    let (sx, sy) = hit.expect("the elided path row carries an `operators` run");
+    for x in sx..sx + 9 {
+        assert!(
+            underlined(&buf, x, sy),
+            "matched char underlined at col {x}"
+        );
+    }
+}

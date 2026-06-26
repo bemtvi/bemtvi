@@ -206,6 +206,38 @@
       return chars.slice(0, front).join("") + "…" + chars.slice(chars.length - back).join("");
     }
 
+    // Truncate a picker row `label` to `width` columns while keeping the file name (the
+    // path tail) visible: when a path overflows the row, drop whole leading directory
+    // components behind a single `…` so the file name survives, instead of the head-cut
+    // that would hide the very thing you scan for. `spans` (matched-char char ranges)
+    // are remapped onto the returned string so highlights stay aligned. A row that fits
+    // — or a non-path row (no `/`) — is returned unchanged. Mirrors the native clients'
+    // `elide_keep_tail`; codepoint-based to match the server's char columns.
+    function elideKeepTail(label, spans, width) {
+      const chars = [...label];
+      const n = chars.length;
+      if (n <= width || width === 0 || label.indexOf("/") === -1) return [label, spans];
+      // Reserve one column for the leading `…`; keep at most the last `width - 1` chars.
+      const drop = n - (width - 1);
+      // Prefer a clean cut just after a path separator — the smallest `/`-boundary at or
+      // past `drop` keeps the most directory context that still fits. None ⇒ raw cut.
+      let cut = drop;
+      for (let i = drop; i < n; i++) {
+        if (chars[i - 1] === "/") { cut = i; break; }
+      }
+      const out = "…" + chars.slice(cut).join("");
+      // Remap spans: original index `i` (≥ cut) renders at display index `i - cut + 1`
+      // (the `…` occupies index 0). A span wholly inside the dropped prefix vanishes.
+      const shift = cut - 1;
+      const remapped = [];
+      for (const [s, e] of spans) {
+        const ns = Math.max(s, cut) - shift;
+        const ne = Math.min(e, n) - shift;
+        if (ns < ne) remapped.push([ns, ne]);
+      }
+      return [out, remapped];
+    }
+
     // Display width of a Unicode code point in screen cells (0 / 1 / 2), matching the
     // server EXACTLY. The server lays columns out with `unicode-width` (UAX #11), so the
     // DOM renderer must agree codepoint-for-codepoint or the cursor / selection / search /
@@ -2135,8 +2167,11 @@
         rowEl.style.width = listW * cw + "px";
         // Bold + accent the matched characters (the fuzzy match), per the server's
         // char-based spans; plain text when this picker/select has no spans.
-        const spans = (menu.match_spans && menu.match_spans[idx]) || [];
-        const chars = [...label].slice(0, listW);
+        // Path-priority truncation: keep the file name (path tail) on screen when the
+        // row overflows, dropping leading directories behind a `…` and remapping spans.
+        const rawSpans = (menu.match_spans && menu.match_spans[idx]) || [];
+        const [elidedLabel, spans] = elideKeepTail(label, rawSpans, listW);
+        const chars = [...elidedLabel].slice(0, listW);
         if (spans.length === 0) {
           rowEl.textContent = chars.join("").padEnd(listW);
         } else {

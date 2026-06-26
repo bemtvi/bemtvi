@@ -2520,22 +2520,28 @@ impl Renderer {
             } else {
                 fg
             };
-            let text = pmenu_row(label, "", list_w as usize);
+            // Path-priority truncation: when the row overflows, keep the file name
+            // (the path tail) on screen by dropping leading directory components
+            // behind a `…`, rather than the head-cut `pmenu_row` would apply (which
+            // hides the name). Rows that fit — and non-path rows — pass through; the
+            // match spans are remapped onto the elided string to stay aligned.
+            let empty = Vec::new();
+            let spans = menu.match_spans.get(idx).unwrap_or(&empty);
+            let (label, spans) = elide_keep_tail(label, spans, list_w as usize);
+            let text = pmenu_row(&label, "", list_w as usize);
             self.push_plain(items, &text, self.cell_px(cx, row), row_fg, full);
             // Overdraw the matched characters in the accent color (monospace, so
             // char `i` sits at column `cx + i`).
-            if let Some(spans) = menu.match_spans.get(idx) {
-                for (i, ch) in label.chars().enumerate() {
-                    let ci = i as u16;
-                    if spans.iter().any(|(s, e)| ci >= *s && ci < *e) {
-                        self.push_plain(
-                            items,
-                            &ch.to_string(),
-                            self.cell_px(cx + ci, row),
-                            match_fg,
-                            list_bounds,
-                        );
-                    }
+            for (i, ch) in label.chars().enumerate() {
+                let ci = i as u16;
+                if spans.iter().any(|(s, e)| ci >= *s && ci < *e) {
+                    self.push_plain(
+                        items,
+                        &ch.to_string(),
+                        self.cell_px(cx + ci, row),
+                        match_fg,
+                        list_bounds,
+                    );
                 }
             }
         }
@@ -3466,6 +3472,41 @@ fn pmenu_row(label: &str, detail: &str, width: usize) -> String {
     } else {
         format!("{label:<width$}")
     }
+}
+
+/// Truncate a picker row `label` to `width` columns while keeping the file name (the
+/// path tail) visible: when a path overflows the row, drop whole leading directory
+/// components behind a single `…` so the file name survives, instead of the plain
+/// head-cut that would hide the very thing you scan for. `spans` (matched-char char
+/// ranges into `label`) are remapped onto the returned string so highlights stay
+/// aligned. A row that fits — or a non-path row (no `/`) — is returned unchanged.
+/// Mirrors the TUI's `elide_keep_tail`.
+fn elide_keep_tail(label: &str, spans: &[(u16, u16)], width: usize) -> (String, Vec<(u16, u16)>) {
+    let chars: Vec<char> = label.chars().collect();
+    let n = chars.len();
+    if n <= width || width == 0 || !label.contains('/') {
+        return (label.to_string(), spans.to_vec());
+    }
+    // Reserve one column for the leading `…`; keep at most the last `width - 1` chars.
+    let drop = n - (width - 1);
+    // Prefer a clean cut just after a path separator — the smallest `/`-boundary at
+    // or past `drop` keeps the most directory context that still fits. None ⇒ raw cut.
+    let cut = (drop..n).find(|&i| chars[i - 1] == '/').unwrap_or(drop);
+    let mut out = String::with_capacity(width);
+    out.push('…');
+    out.extend(&chars[cut..]);
+    // Remap spans: original index `i` (≥ cut) renders at display index `i - cut + 1`
+    // (the `…` occupies index 0). A span wholly inside the dropped prefix vanishes.
+    let shift = cut as i64 - 1;
+    let remapped = spans
+        .iter()
+        .filter_map(|&(s, e)| {
+            let ns = (s as i64).max(cut as i64) - shift;
+            let ne = (e as i64).min(n as i64) - shift;
+            (ns < ne).then_some((ns as u16, ne as u16))
+        })
+        .collect();
+    (out, remapped)
 }
 
 /// One `width`-cell gutter cell for buffer line `n` (the cursor sits on

@@ -2919,6 +2919,12 @@ fn menu_row_line(
         out.push(Span::styled(glyph.to_string(), st));
         used += 2;
     }
+    // Path-priority truncation: when the row overflows, keep the file name (the
+    // path tail) on screen by dropping leading directory components behind a `…`,
+    // rather than the plain head-cut below that would hide the name. Rows that fit
+    // — and non-path rows — fall through unchanged; `spans` are remapped to match.
+    let (label, spans) = elide_keep_tail(label, spans, width.saturating_sub(used));
+    let (label, spans) = (label.as_str(), spans.as_slice());
     for (i, ch) in label.chars().enumerate() {
         if used >= width {
             break;
@@ -3178,4 +3184,43 @@ fn pmenu_row(label: &str, detail: &str, width: usize) -> String {
     } else {
         format!("{label:<width$}")
     }
+}
+
+/// Truncate a picker row `label` to `width` columns while keeping the file name (the
+/// path tail) visible. When a path overflows the row, drop whole leading directory
+/// components behind a single `…` so the file name survives — instead of the plain
+/// head-cut the caller would otherwise apply, which truncates the *tail* and hides
+/// the very thing you scan for. `spans` (matched-char char ranges into `label`) are
+/// remapped onto the returned string so highlights still land on the right chars.
+///
+/// A row that already fits — or a non-path row (no `/`) — is returned unchanged, so
+/// only file paths get the tail-priority treatment; the caller's head-cut still
+/// applies to plain labels. When even the file name alone can't fit, the tail is
+/// kept (the name is truncated only because it's impossible to show whole).
+fn elide_keep_tail(label: &str, spans: &[(u16, u16)], width: usize) -> (String, Vec<(u16, u16)>) {
+    let chars: Vec<char> = label.chars().collect();
+    let n = chars.len();
+    if n <= width || width == 0 || !label.contains('/') {
+        return (label.to_string(), spans.to_vec());
+    }
+    // Reserve one column for the leading `…`; keep at most the last `width - 1` chars.
+    let drop = n - (width - 1);
+    // Prefer a clean cut just after a path separator — the smallest `/`-boundary at
+    // or past `drop` keeps the most directory context that still fits. None ⇒ raw cut.
+    let cut = (drop..n).find(|&i| chars[i - 1] == '/').unwrap_or(drop);
+    let mut out = String::with_capacity(width);
+    out.push('…');
+    out.extend(&chars[cut..]);
+    // Remap spans: original index `i` (≥ cut) renders at display index `i - cut + 1`
+    // (the `…` occupies index 0). A span wholly inside the dropped prefix vanishes.
+    let shift = cut as i64 - 1;
+    let remapped = spans
+        .iter()
+        .filter_map(|&(s, e)| {
+            let ns = (s as i64).max(cut as i64) - shift;
+            let ne = (e as i64).min(n as i64) - shift;
+            (ns < ne).then_some((ns as u16, ne as u16))
+        })
+        .collect();
+    (out, remapped)
 }

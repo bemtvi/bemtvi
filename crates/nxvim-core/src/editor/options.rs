@@ -424,6 +424,33 @@ impl Editor {
             }
             return;
         }
+        // `foldmarker` is the buffer-local `start,end` delimiter pair `foldmethod=marker`
+        // folds by, stored beside `foldexpr` (a per-buffer string pair, not a `Copy`
+        // `BufferOptions` slot). The value must be exactly two distinct, non-empty
+        // comma-separated markers — anything else fails loud (E474) rather than leave
+        // an unusable marker set. `&` resets to vim's default `{{{`/`}}}`.
+        if name == "foldmarker" {
+            match op {
+                StrOp::Set(value) => {
+                    let parts: Vec<&str> = value.split(',').collect();
+                    if parts.len() != 2
+                        || parts[0].is_empty()
+                        || parts[1].is_empty()
+                        || parts[0] == parts[1]
+                    {
+                        self.echo(format!("E474: Invalid argument: foldmarker={value}"));
+                        return;
+                    }
+                    self.set_foldmarker(parts[0], parts[1]);
+                }
+                StrOp::Reset => self.reset_foldmarker(),
+                StrOp::Query => {
+                    let (open, close) = self.effective_foldmarker();
+                    self.echo(format!("foldmarker={open},{close}"));
+                }
+            }
+            return;
+        }
         // `fileencodings` is the global read-detection list: every comma-separated
         // entry must be `ucs-bom` or a known encoding label, else fail loud rather
         // than leave an unusable list. The store/echo go through the shared global

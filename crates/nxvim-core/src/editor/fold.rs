@@ -49,6 +49,8 @@ pub(crate) enum FoldSource {
     Manual,
     /// `foldmethod=indent`.
     Indent,
+    /// `foldmethod=marker` — folds bounded by the `'foldmarker'` strings.
+    Marker,
     /// `foldmethod=expr` with the native tree-sitter `foldexpr`.
     Treesitter,
     /// `foldmethod=expr` with a generic Lua `foldexpr`. nxvim-core can't run Lua,
@@ -662,6 +664,7 @@ impl Editor {
         let foldlevel = self.windows.cur().options.foldlevel;
         let ranges = match source {
             FoldSource::Indent => self.compute_indent_folds(),
+            FoldSource::Marker => self.compute_marker_folds(),
             FoldSource::Treesitter => match self.compute_treesitter_folds() {
                 Some(r) => r,
                 // The grammar / parse isn't ready yet — leave the folds untouched and
@@ -708,6 +711,7 @@ impl Editor {
         match self.buffer().options.foldmethod {
             crate::options::FoldMethod::Manual => FoldSource::Manual,
             crate::options::FoldMethod::Indent => FoldSource::Indent,
+            crate::options::FoldMethod::Marker => FoldSource::Marker,
             crate::options::FoldMethod::Expr => {
                 let expr = self.foldexpr();
                 if is_treesitter_foldexpr(expr) {
@@ -1083,6 +1087,122 @@ impl Editor {
         }
         ranges_from_levels(&levels, foldminlines)
     }
+
+    /// Compute `'foldmethod=marker'` folds for the focused buffer: the literal
+    /// `'foldmarker'` start/end strings in the text bound folds (default `{{{`/`}}}`).
+    /// Each line's fold level is computed by vim's `foldlevelMarker` rule
+    /// ([`marker_line_levels`]) — a start marker raises the level at its line, an end
+    /// marker lowers it only *after* its line (so the end-marker line stays in the
+    /// fold), and a number after a marker sets an absolute level — then the per-line
+    /// levels fold into nested ranges via [`ranges_from_levels`].
+    fn compute_marker_folds(&self) -> Vec<(usize, usize, usize)> {
+        let (open, close) = self.effective_foldmarker();
+        let buf = self.buffer();
+        let n = buf.line_count();
+        let nestmax = buf.options.foldnestmax;
+        let foldminlines = buf.options.foldminlines;
+        let mut levels = vec![0usize; n];
+        // `run` is vim's `lvl_next`: the fold level carried into the next line. It is
+        // kept uncapped so deeply-nested markers still *pair* correctly; only the
+        // recorded per-line level is clamped to `'foldnestmax'` (as vim does).
+        let mut run = 0usize;
+        for (i, slot) in levels.iter_mut().enumerate() {
+            let line = buf.line_cow(i);
+            let (lvl, next) = marker_line_levels(&line, &open, &close, run);
+            *slot = lvl.min(nestmax);
+            run = next;
+        }
+        ranges_from_levels(&levels, foldminlines)
+    }
+
+    /// The focused buffer's effective `'foldmarker'` — its `(start, end)` override or
+    /// vim's default `{{{`/`}}}` when unset.
+    pub(crate) fn effective_foldmarker(&self) -> (String, String) {
+        let buf = self.current_buffer_id();
+        self.foldmarkers
+            .get(&buf)
+            .cloned()
+            .unwrap_or_else(default_foldmarker)
+    }
+
+    /// Set the focused buffer's `'foldmarker'` to the `(start, end)` pair and refold.
+    /// The markers don't enter the [`FoldKey`] cache key, so the structure cache is
+    /// busted explicitly to honor the change even on an unchanged `changedtick`.
+    pub(crate) fn set_foldmarker(&mut self, start: &str, end: &str) {
+        let buf = self.current_buffer_id();
+        self.foldmarkers
+            .insert(buf, (start.to_string(), end.to_string()));
+        self.windows.cur_mut().folds.cache = None;
+        self.refresh_folds();
+    }
+
+    /// Reset the focused buffer's `'foldmarker'` to vim's default `{{{`/`}}}` and
+    /// refold.
+    pub(crate) fn reset_foldmarker(&mut self) {
+        let buf = self.current_buffer_id();
+        self.foldmarkers.remove(&buf);
+        self.windows.cur_mut().folds.cache = None;
+        self.refresh_folds();
+    }
+}
+
+/// Vim's default `'foldmarker'` pair (`{{{` / `}}}`).
+fn default_foldmarker() -> (String, String) {
+    ("{{{".to_string(), "}}}".to_string())
+}
+
+/// Apply vim's `foldlevelMarker` to one line: given `start_lvl` (the fold level
+/// carried in from the previous line), scan the line's fold markers left to right
+/// and return `(this_line_level, next_line_level)`. Mirrors vim/neovim's
+/// `fold.c::foldlevelMarker` — a plain start marker raises both levels by one, a
+/// plain end marker lowers only the *next* level (the marker line itself stays in
+/// the fold), and a numbered marker sets an absolute level: `{{{N` sets both to
+/// `N`, `}}}N` ends down to level `N` (the next line is `N-1`, the marker line is
+/// clamped to at most the incoming level so an end marker never *opens* a fold).
+/// Levels are returned uncapped; the caller clamps the recorded level to
+/// `'foldnestmax'`.
+fn marker_line_levels(line: &str, open: &str, close: &str, start_lvl: usize) -> (usize, usize) {
+    // Collect every marker occurrence (non-overlapping per pattern) and process them
+    // in document order, so nesting and absolute-level resets apply left to right.
+    let mut markers: Vec<(usize, bool)> = line
+        .match_indices(open)
+        .map(|(p, _)| (p, true))
+        .chain(line.match_indices(close).map(|(p, _)| (p, false)))
+        .collect();
+    markers.sort_by_key(|&(p, _)| p);
+    let mut lvl = start_lvl;
+    let mut next = start_lvl;
+    for (pos, is_open) in markers {
+        let after = pos + if is_open { open.len() } else { close.len() };
+        let num = leading_number(&line[after..]);
+        match (is_open, num) {
+            // `{{{N` — absolute open to level N.
+            (true, Some(n)) if n > 0 => {
+                lvl = n;
+                next = n;
+            }
+            // `{{{` — nest one deeper.
+            (true, _) => {
+                lvl += 1;
+                next += 1;
+            }
+            // `}}}N` — close down to level N (next line N-1); never opens a fold.
+            (false, Some(n)) if n > 0 => {
+                lvl = n.min(start_lvl);
+                next = n.saturating_sub(1);
+            }
+            // `}}}` — close one level (the marker line stays in the fold).
+            (false, _) => next = next.saturating_sub(1),
+        }
+    }
+    (lvl, next)
+}
+
+/// The value of the run of leading ASCII digits in `s` (a number following a fold
+/// marker, e.g. the `2` in `{{{2`), or `None` when `s` doesn't start with a digit.
+fn leading_number(s: &str) -> Option<usize> {
+    let digits = s.len() - s.trim_start_matches(|c: char| c.is_ascii_digit()).len();
+    (digits > 0).then(|| s[..digits].parse().ok()).flatten()
 }
 
 /// Whether `'foldexpr'` is the canonical tree-sitter foldexpr nxvim computes

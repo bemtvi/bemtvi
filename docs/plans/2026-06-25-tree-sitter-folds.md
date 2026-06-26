@@ -3,9 +3,10 @@
 Status: in progress · 2026-06-25 · Phases 1–5 landed (manual + navigation +
 fold-column gutter; `foldmethod=indent`; native **and** web/wasm tree-sitter
 `foldexpr`; generic Lua `foldexpr` + LSP `foldingRange`). Phase 6 mostly landed:
-operator-over-fold semantics, manual-fold shada persistence, and docs + example
-config (+ the `vim.bo`/`vim.wo` fold-option wiring) are done; `foldtext`
-customization and the `marker` foldmethod remain deferred.
+operator-over-fold semantics, manual-fold shada persistence, the `marker`
+foldmethod, and docs + example config (+ the `vim.bo`/`vim.wo` fold-option wiring)
+are done; `foldtext` customization and the `syntax`/`diff` foldmethods remain
+deferred.
 
 Implements code folding in nxvim. Scope (decided): full fold parity — a generic
 fold model with **manual**, **indent**, **expr / tree-sitter**, and **LSP
@@ -313,11 +314,30 @@ tree-sitter / LSP upgrades), verified end-to-end by loading the shipped config
 the view section) and the tree-sitter spec. Also tested: `vim.bo.foldmethod` reaches
 the live fold engine.
 
+**6d — `marker` foldmethod. ✅ done.** The fifth fold source: `foldmethod=marker`
+folds bounded by the literal `'foldmarker'` start/end strings (default `{{{`/`}}}`).
+A start marker opens a fold at its line (the line shown when closed); the matching
+end marker's line is the fold's last line; markers nest by counting, and a number
+after a marker (`{{{2`) sets an absolute level. Implemented as a pure-core computed
+source (`fold.rs::compute_marker_folds` + the free `marker_line_levels`, a faithful
+port of vim/neovim's `fold.c::foldlevelMarker` — `lvl`/`lvl_next` per line so an
+end-marker line stays inside its fold), feeding the same `ranges_from_levels` spine
+as indent/expr. `'foldmarker'` is a per-buffer `(start, end)` string pair stored
+beside `'foldexpr'` (not a `Copy` `BufferOptions` slot); wired through `:set
+foldmarker=…` (E474 on anything but a distinct non-empty `start,end` pair) and the
+`vim.bo`/`nx.bo` bridge (`set_buffer_option_str` + the `BUF_OPT_CANON`/`fmr`
+whitelist). Changing the markers busts the structure cache (they don't enter the
+`FoldKey`). Being pure-core, it works on the web/wasm edit-host unchanged. Tests
+(`tests/editing/folds.rs`): a marked block folds, nested markers nest, a numbered
+marker sets an absolute level, a custom `'foldmarker'` changes the delimiters,
+editing reflows the fold, an invalid `'foldmarker'` fails loud, and the `nx.bo`
+write reaches the live engine.
+
 **Deferred (not done):**
 - **`foldtext` customization** via a Lua function (default vim-like
   `+-- N lines: <first line>`); `fillchars` `fold:`/`foldopen`/`foldclose`/`foldsep`.
   (`foldlevelstart` / `foldtext` options don't exist in core yet.)
-- `marker` foldmethod (`{{{`/`}}}` via `foldmarker`).
+- `syntax` / `diff` foldmethods (both still fail loud at set-time).
 - Per-window *closed state* persistence for **computed** folds (only manual folds
   persist; matching computed ranges across a recompute on restore is the open work).
 

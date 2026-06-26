@@ -754,20 +754,26 @@ pub enum FoldMethod {
     /// Folds defined by `'foldexpr'`. nxvim evaluates the canonical tree-sitter
     /// foldexpr natively (the headline source); a generic Lua foldexpr is Phase 5.
     Expr,
+    /// Folds bounded by the literal `'foldmarker'` strings in the text (default
+    /// `{{{`/`}}}`). A start marker opens a fold at its line; the matching end
+    /// marker's line is the fold's last line. Nests by counting markers, or an
+    /// explicit level with a number after the marker (`{{{2`).
+    Marker,
 }
 
 impl FoldMethod {
-    /// Parse a `'foldmethod'` value. `manual`/`indent`/`expr` are supported; the
-    /// other vim names (`marker`/`syntax`/`diff`) are valid spellings but not yet
-    /// implemented, so they parse to an [`Unimplemented`](FoldMethodErr) error the
-    /// caller surfaces as a loud "not supported yet" — never a silent no-op — kept
-    /// distinct from an [`Unknown`](FoldMethodErr) value (E474).
+    /// Parse a `'foldmethod'` value. `manual`/`indent`/`expr`/`marker` are
+    /// supported; the other vim names (`syntax`/`diff`) are valid spellings but not
+    /// yet implemented, so they parse to an [`Unimplemented`](FoldMethodErr) error
+    /// the caller surfaces as a loud "not supported yet" — never a silent no-op —
+    /// kept distinct from an [`Unknown`](FoldMethodErr) value (E474).
     pub fn from_label(label: &str) -> Result<FoldMethod, FoldMethodErr> {
         match label {
             "manual" => Ok(FoldMethod::Manual),
             "indent" => Ok(FoldMethod::Indent),
             "expr" => Ok(FoldMethod::Expr),
-            "marker" | "syntax" | "diff" => Err(FoldMethodErr::Unimplemented),
+            "marker" => Ok(FoldMethod::Marker),
+            "syntax" | "diff" => Err(FoldMethodErr::Unimplemented),
             _ => Err(FoldMethodErr::Unknown),
         }
     }
@@ -779,6 +785,7 @@ impl std::fmt::Display for FoldMethod {
             FoldMethod::Manual => "manual",
             FoldMethod::Indent => "indent",
             FoldMethod::Expr => "expr",
+            FoldMethod::Marker => "marker",
         })
     }
 }
@@ -1309,7 +1316,7 @@ static OPTIONS: &[OptionInfo] = {
             abbrev: Some("fdm"),
             kind: Str,
             scope: Buffer,
-            doc: "How folds are defined: manual, indent, or expr.",
+            doc: "How folds are defined: manual, indent, expr, or marker.",
         },
         OptionInfo {
             name: "foldexpr",
@@ -1317,6 +1324,13 @@ static OPTIONS: &[OptionInfo] = {
             kind: Str,
             scope: Buffer,
             doc: "Expression folds are computed by (foldmethod=expr).",
+        },
+        OptionInfo {
+            name: "foldmarker",
+            abbrev: Some("fmr"),
+            kind: Str,
+            scope: Buffer,
+            doc: "The start,end marker pair for foldmethod=marker.",
         },
         OptionInfo {
             name: "foldnestmax",

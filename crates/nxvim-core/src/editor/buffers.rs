@@ -212,6 +212,27 @@ impl Editor {
             }
             return;
         }
+        // `foldmarker` is the `foldmethod=marker` delimiter pair, likewise a
+        // per-buffer string (not a `Copy` `BufferOptions` slot). Like `foldexpr`,
+        // `set_foldmarker` operates on the focused buffer, so only a write for that
+        // buffer applies (the focused-window fold model). A malformed value (not a
+        // `start,end` pair) is ignored here — the `:set` ex path is the loud one;
+        // an empty value resets to vim's default markers.
+        if name == "foldmarker" {
+            if id == self.current_buffer_id() {
+                let parts: Vec<&str> = value.split(',').collect();
+                if value.is_empty() {
+                    self.reset_foldmarker();
+                } else if parts.len() == 2
+                    && !parts[0].is_empty()
+                    && !parts[1].is_empty()
+                    && parts[0] != parts[1]
+                {
+                    self.set_foldmarker(parts[0], parts[1]);
+                }
+            }
+            return;
+        }
         let Some(ob) = self.buffers.map.get_mut(&id) else {
             return;
         };

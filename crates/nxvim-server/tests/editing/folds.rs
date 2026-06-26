@@ -467,13 +467,13 @@ async fn editing_reflows_indent_folds() {
 #[tokio::test]
 async fn unsupported_foldmethod_fails_loud() {
     let (rpc, mut incoming) = indent_fixture(&["a", "b"]).await;
-    // A real vim method nxvim hasn't implemented yet (`marker`/`syntax`): a named,
+    // A real vim method nxvim hasn't implemented yet (`syntax`/`diff`): a named,
     // non-silent error (no silent no-op that leaves folding looking broken).
-    let marker = redraw_after(&rpc, &mut incoming, ":set foldmethod=marker<CR>").await;
+    let syntax = redraw_after(&rpc, &mut incoming, ":set foldmethod=syntax<CR>").await;
     assert!(
-        message(&marker).contains("not supported"),
-        "marker foldmethod should fail loud, got {:?}",
-        message(&marker)
+        message(&syntax).contains("not supported"),
+        "syntax foldmethod should fail loud, got {:?}",
+        message(&syntax)
     );
     // A value vim doesn't define at all is E474.
     let bogus = redraw_after(&rpc, &mut incoming, ":set foldmethod=bogus<CR>").await;
@@ -689,5 +689,167 @@ async fn expr_folds_inert_without_a_grammar() {
         visible_numbers(&map),
         vec![1, 2, 3],
         "no grammar ⇒ no tree-sitter folds, all lines shown"
+    );
+}
+
+// ===== Phase 6: foldmethod=marker ==========================================
+//
+// The fifth fold source: folds bounded by literal markers in the text
+// (`'foldmarker'`, default `{{{`/`}}}`). A start marker opens a fold at its line
+// (the line shown when closed); the matching end marker's line is the fold's last
+// line. Markers nest by counting, and a number after a marker (`{{{2`) sets an
+// absolute level. Computed like indent/expr — recomputed on edit/option change,
+// `'foldlevel'` governs which levels display closed.
+
+#[tokio::test]
+async fn marker_folds_collapse_a_marked_block() {
+    // A plain `{{{`/`}}}` pair folds the lines between (inclusive of both markers).
+    let (rpc, mut incoming) =
+        indent_fixture(&["head {{{", "body1", "body2", "tail }}}", "after"]).await;
+    let map = redraw_after(&rpc, &mut incoming, ":set foldmethod=marker<CR>").await;
+    // foldlevel defaults to 0, so the fold closes: lines 1-4 collapse to the
+    // placeholder on line 1, leaving line 5 visible.
+    assert_eq!(
+        visible_numbers(&map),
+        vec![1, 5],
+        "the marked block (lines 1-4) folds into the placeholder at line 1, got {:?}",
+        visible_numbers(&map)
+    );
+    let rendered = view_lines(&map);
+    assert!(
+        rendered[0].contains("4 lines") && rendered[0].contains("head"),
+        "placeholder shows the span + first line, got {:?}",
+        rendered[0]
+    );
+    // The buffer is untouched — the markers stay in the text.
+    assert_eq!(
+        lines(&rpc).await,
+        vec!["head {{{", "body1", "body2", "tail }}}", "after"],
+        "marker folds don't modify the buffer"
+    );
+}
+
+#[tokio::test]
+async fn marker_folds_nest_by_counting() {
+    // Nested markers: the outer pair spans lines 1-6, the inner pair lines 2-5.
+    let (rpc, mut incoming) = indent_fixture(&[
+        "outer {{{",
+        "inner {{{",
+        "deep1",
+        "deep2",
+        "endin }}}",
+        "endout }}}",
+        "after",
+    ])
+    .await;
+    feed(&rpc, ":set foldmethod=marker<CR>");
+    // foldlevel=1 opens the level-1 outer fold; only the nested level-2 fold
+    // (lines 2-5) stays closed.
+    let map = redraw_after(&rpc, &mut incoming, ":set foldlevel=1<CR>").await;
+    assert_eq!(
+        visible_numbers(&map),
+        vec![1, 2, 6, 7],
+        "only the inner (level-2) marked block folds at foldlevel=1, got {:?}",
+        visible_numbers(&map)
+    );
+    let rendered = view_lines(&map);
+    assert!(
+        rendered[1].contains("4 lines") && rendered[1].contains("inner"),
+        "the inner fold collapses lines 2-5, got {:?}",
+        rendered[1]
+    );
+}
+
+#[tokio::test]
+async fn numbered_marker_sets_absolute_level() {
+    // `{{{1` opens a level-1 fold regardless of nesting; a later `{{{2` nests one
+    // deeper. The `}}}` end markers close them.
+    let (rpc, mut incoming) =
+        indent_fixture(&["a {{{1", "b", "c {{{2", "d", "e }}}", "f }}}", "g"]).await;
+    feed(&rpc, ":set foldmethod=marker<CR>");
+    let map = redraw_after(&rpc, &mut incoming, ":set foldlevel=1<CR>").await;
+    // Level-1 fold (lines 1-6) open; the level-2 fold (lines 3-5) stays closed —
+    // hiding lines 4-5 while line 6 (still in the open outer fold) stays visible.
+    assert_eq!(
+        visible_numbers(&map),
+        vec![1, 2, 3, 6, 7],
+        "the level-2 absolute fold collapses lines 3-5, got {:?}",
+        visible_numbers(&map)
+    );
+}
+
+#[tokio::test]
+async fn custom_foldmarker_changes_the_delimiters() {
+    // `'foldmarker'` overrides the markers; the default `{{{`/`}}}` then no longer
+    // fold, and the custom pair does.
+    let (rpc, mut incoming) =
+        indent_fixture(&["head #region", "body1", "body2", "tail #endregion", "after"]).await;
+    feed(&rpc, ":set foldmarker=#region,#endregion<CR>");
+    let map = redraw_after(&rpc, &mut incoming, ":set foldmethod=marker<CR>").await;
+    assert_eq!(
+        visible_numbers(&map),
+        vec![1, 5],
+        "the custom #region/#endregion pair folds lines 1-4, got {:?}",
+        visible_numbers(&map)
+    );
+}
+
+#[tokio::test]
+async fn editing_reflows_marker_folds() {
+    // Adding a line inside the marked block grows the fold on the next recompute.
+    let (rpc, mut incoming) = indent_fixture(&["head {{{", "body", "tail }}}", "after"]).await;
+    feed(&rpc, ":set foldmethod=marker<CR>");
+    let before = redraw_after(&rpc, &mut incoming, "").await;
+    assert_eq!(
+        visible_numbers(&before),
+        vec![1, 4],
+        "block folds to one row"
+    );
+    assert!(view_lines(&before)[0].contains("3 lines"));
+
+    // Open, insert a line inside the markers, re-close.
+    feed(&rpc, "zR");
+    feed(&rpc, "2Gonew body<Esc>"); // add a line after `body`, still inside the markers
+    let after = redraw_after(&rpc, &mut incoming, ":set foldlevel=0<CR>").await;
+    assert_eq!(
+        visible_numbers(&after),
+        vec![1, 5],
+        "the fold grew to hide the inserted line, got {:?}",
+        visible_numbers(&after)
+    );
+    assert!(
+        view_lines(&after)[0].contains("4 lines"),
+        "fold reflowed to four lines, got {:?}",
+        view_lines(&after)[0]
+    );
+}
+
+#[tokio::test]
+async fn invalid_foldmarker_fails_loud() {
+    let (rpc, mut incoming) = indent_fixture(&["a", "b"]).await;
+    // A `'foldmarker'` without the required start,end pair is rejected (E474),
+    // never silently leaving the markers unset.
+    let map = redraw_after(&rpc, &mut incoming, ":set foldmarker=oops<CR>").await;
+    assert!(
+        message(&map).contains("E474"),
+        "a foldmarker without a comma pair is E474, got {:?}",
+        message(&map)
+    );
+}
+
+#[tokio::test]
+async fn nx_bo_foldmarker_reaches_the_live_engine() {
+    // The `nx.bo`/`vim.bo` foldmarker write reaches the fold engine (not just a
+    // Lua shadow), so a config can pick custom markers without `:set`.
+    let (rpc, mut incoming) =
+        indent_fixture(&["head <!--", "body1", "body2", "tail -->", "after"]).await;
+    exec_lua(&rpc, "nx.bo.foldmarker = '<!--,-->'").await;
+    exec_lua(&rpc, "nx.bo.foldmethod = 'marker'").await;
+    let map = redraw_after(&rpc, &mut incoming, "gg").await;
+    assert_eq!(
+        visible_numbers(&map),
+        vec![1, 5],
+        "the custom <!--/--> pair folds lines 1-4, got {:?}",
+        visible_numbers(&map)
     );
 }

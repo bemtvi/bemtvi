@@ -7,12 +7,14 @@
 --
 -- A *fold* hides a range of lines behind a single placeholder row so you can
 -- collapse the parts of a file you aren't reading. nxvim folds the same way vim
--- does, from any of four sources — and the model (the `z` commands, fold-aware
+-- does, from any of five sources — and the model (the `z` commands, fold-aware
 -- motion, the `foldcolumn` gutter, operators acting on a whole closed fold) is
 -- shared by all of them:
 --
 --   * manual   — folds you create by hand with `zf{motion}` (no config needed)
 --   * indent   — `foldmethod=indent`: fold level follows leading indentation
+--   * marker   — `foldmethod=marker`: folds bounded by literal `{{{`/`}}}` markers
+--                in the text (set the pair with `'foldmarker'`)
 --   * expr     — `foldmethod=expr` + a `'foldexpr'`; the headline is the native
 --                tree-sitter foldexpr, which folds by real syntax (functions,
 --                tables, blocks) rather than indentation
@@ -70,6 +72,12 @@ vim.api.nvim_create_autocmd("BufReadPost", { pattern = "*", callback = use_inden
 --
 --     vim.bo.foldmethod = "expr"
 --     vim.bo.foldexpr   = "v:lua.vim.lsp.foldexpr()"          -- LSP foldingRange
+--
+-- or fold by explicit markers you place in the text (handy for prose / config
+-- files), with no grammar or server needed:
+--
+--     vim.bo.foldmethod = "marker"                            -- {{{ … }}}
+--     -- vim.bo.foldmarker = "#region,#endregion"             -- custom delimiters
 --
 -- The commands, the gutter, motion, persistence, and operator behavior above are
 -- identical — only where the fold ranges come from changes.

@@ -371,13 +371,14 @@ change — the collapsed-fold shape the parallel-array projection already had. E
 caller that walks visible lines (motion, scroll, the cursor, redraw, and the
 linewise operators that act on a whole closed fold) goes through the same
 `fold_line_start`/`fold_line_end` helpers, so none hand-rolls fold skipping. The
-fold **structure** comes from one of four sources behind a shared spine
-(`fold.rs`): `manual` (`zf`/`:fold`), `foldmethod=indent`, `foldmethod=expr` (the
-native tree-sitter foldexpr nxvim recognizes as a marker and computes from
-`folds.scm`, or a generic Lua `'foldexpr'` the server evaluates per line with
-`v:lnum` and pushes in), and LSP `textDocument/foldingRange` (selected by the
-`nx.lsp.foldexpr` marker, requested per buffer and pushed in). The latter two are
-*external* sources: nxvim-core can't run Lua or talk to a language server, so the
+fold **structure** comes from one of five sources behind a shared spine
+(`fold.rs`): `manual` (`zf`/`:fold`), `foldmethod=indent`, `foldmethod=marker`
+(folds bounded by the literal `'foldmarker'` strings, default `{{{`/`}}}`),
+`foldmethod=expr` (the native tree-sitter foldexpr nxvim recognizes as a marker and
+computes from `folds.scm`, or a generic Lua `'foldexpr'` the server evaluates per
+line with `v:lnum` and pushes in), and LSP `textDocument/foldingRange` (selected by
+the `nx.lsp.foldexpr` marker, requested per buffer and pushed in). The generic-expr
+and LSP are *external* sources: nxvim-core can't run Lua or talk to a language server, so the
 server computes them out-of-band and pushes the result into a per-buffer store the
 core builds the same nested structure from — and manual folds (with their closed
 state) round-trip through shada, restored into the window that reopens the file.

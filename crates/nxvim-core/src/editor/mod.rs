@@ -1210,6 +1210,12 @@ pub struct Editor {
     /// by [`Editor::is_treesitter_foldexpr`]); a generic Lua foldexpr is Phase 5.
     /// Absent ⇒ empty (no expr folds).
     foldexprs: HashMap<BufferId, String>,
+    /// Per-buffer `'foldmarker'` — the `(start, end)` delimiter pair `foldmethod=marker`
+    /// folds by. Stored beside [`Editor::foldexprs`] (a per-buffer pair of strings,
+    /// not a `Copy` [`BufferOptions`] slot) and written by `:set foldmarker=…` /
+    /// `nx.bo.foldmarker`. Absent ⇒ vim's default `{{{`/`}}}` (see
+    /// [`Editor::effective_foldmarker`]).
+    foldmarkers: HashMap<BufferId, (String, String)>,
     /// Server-pushed fold data for the *externally-computed* sources — a generic
     /// Lua `'foldexpr'` and LSP `foldingRange`. nxvim-core can't evaluate Lua or
     /// talk to a language server, so the server computes these out-of-band and
@@ -1558,6 +1564,7 @@ impl Editor {
             ts_filetype: HashMap::new(),
             commentstrings: HashMap::new(),
             foldexprs: HashMap::new(),
+            foldmarkers: HashMap::new(),
             external_folds: HashMap::new(),
             ts_enabled: HashMap::new(),
             clipboard: None,

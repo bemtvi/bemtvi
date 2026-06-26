@@ -852,12 +852,15 @@ local BUF_OPT_CANON = {
   ma = "modifiable",
   -- The fold buffer-options: the method (`nx.bo.foldmethod = "expr"`), the
   -- `foldmethod=expr` expression (`nx.bo.foldexpr = "v:lua.vim.treesitter.foldexpr()"`),
-  -- and the nesting / minimum-span caps. The `vim.bo` companions to the `:set
-  -- foldmethod=…` / `:set foldexpr=…` paths; writes reach the live fold engine.
+  -- the `foldmethod=marker` delimiter pair (`nx.bo.foldmarker = "{{{,}}}"`), and the
+  -- nesting / minimum-span caps. The `vim.bo` companions to the `:set foldmethod=…` /
+  -- `:set foldexpr=…` / `:set foldmarker=…` paths; writes reach the live fold engine.
   foldmethod = "foldmethod",
   fdm = "foldmethod",
   foldexpr = "foldexpr",
   fde = "foldexpr",
+  foldmarker = "foldmarker",
+  fmr = "foldmarker",
   foldnestmax = "foldnestmax",
   fdn = "foldnestmax",
   foldminlines = "foldminlines",
@@ -884,6 +887,7 @@ local BUF_OPT_DEFAULT = {
   modifiable = true,
   foldmethod = "manual",
   foldexpr = "",
+  foldmarker = "{{{,}}}",
   foldnestmax = 20,
   foldminlines = 1,
 }

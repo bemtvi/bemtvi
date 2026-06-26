@@ -1,0 +1,9 @@
+# Keep the build context small when a container serves the prebuilt web bundle
+# (see examples/docker-daemon/Containerfile.web). Only web/ and dist/ are copied;
+# the wasm build tree, the grammar-generator tooling, npm installs and the assembled
+# demo sites are all build-time inputs the static server never needs.
+target/
+treesitter/
+**/node_modules/
+demo-site/
+*-site/

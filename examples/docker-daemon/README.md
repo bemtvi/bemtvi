@@ -1,9 +1,13 @@
 # Remote daemon in a container (podman / docker)
 
-nxvim can split itself in two: a thin local **edit-host** (your keystrokes, the UI)
-talking to a remote **daemon** that owns the filesystem, processes, file watches and
-language servers. This example puts that daemon in a container and connects to it
-from your machine over the native transport — **QUIC** (so: UDP).
+nxvim can split itself in two: a thin **edit-host** (your keystrokes, the UI) talking
+to a remote **daemon** that owns the filesystem, processes, file watches and language
+servers. This example puts that daemon in a container and connects to it two ways over
+the same transport — **QUIC** (so: UDP):
+
+- a **native** TUI client running on your machine (`connect.sh`), and
+- the **browser** client served from a second container (`connect-web.sh`), which
+  dials the same daemon over **WebTransport**.
 
 The point of the example is the **config swap**: a daemon session runs the
 *daemon's* config, fetched over the wire, **not** your local one. Two deliberately
@@ -16,15 +20,17 @@ different configs make that visible:
 | `:set tabstop?` | `2` | `8` |
 | filesystem | your machine | the container |
 
-> Native mode only for now — this is the QUIC daemon, not the browser/WebTransport
-> edit-host. Same wire, different packaging.
+> Native daemon only for now — both clients reach the same `--daemon --listen`
+> listener; the daemon side is not itself containerized-anything-special.
 
 ## What's here
 
 ```
-Containerfile        builds the release binary, bakes in daemon/ + workspace/, runs --daemon --listen
-compose.yaml         podman-compose / docker compose front-end for the same
-connect.sh           reads the daemon's connect URI from the container logs and launches the client
+Containerfile        daemon image: release binary, bakes in daemon/ + workspace/, runs --daemon --listen
+Containerfile.web    web image: a slim node server for the prebuilt wasm bundle (static files)
+compose.yaml         podman-compose / docker compose front-end for both containers
+connect.sh           reads the daemon's connect URI from the logs and launches the native TUI client
+connect-web.sh       prints the browser URL (?daemon=…) pointing the web client at the daemon
 local/init.lua       the config used when you run nxvim normally (no daemon)
 daemon/init.lua      the config the container serves over the wire
 daemon/lua/whereami.lua   a require-able module, fetched too (proves the whole runtimepath crosses)
@@ -93,6 +99,47 @@ Now compare with step 1:
 Same client binary, same keystrokes — but the config and the filesystem are the
 container's. That's the daemon split.
 
+## 4. Or connect from the browser (second container)
+
+The browser build of nxvim is arch-independent wasm served as static files. Build the
+bundle once on the host (needs `emcc` + `node`), then serve it from its own container:
+
+```sh
+crates/nxvim-edithost/build.sh        # → crates/nxvim-edithost/dist/ + web/vendor/
+
+podman build -f examples/docker-daemon/Containerfile.web -t nxvim-web crates/nxvim-edithost
+podman run --rm -d -p 127.0.0.1:8088:8088 --name nxvim-web nxvim-web
+```
+
+(or `podman compose … up --build -d`, which brings up both containers at once.)
+
+Now get the page URL — `connect-web.sh` reads the daemon's URI from its container
+logs, points it at the daemon's host-published address, and hangs it off the page as
+`?daemon=…`:
+
+```sh
+examples/docker-daemon/connect-web.sh        # prints http://localhost:8088/web/?daemon=…
+# OPEN=1 examples/docker-daemon/connect-web.sh   # also xdg-opens it
+```
+
+Open that URL in a WebTransport-capable browser (Chrome/Edge). The page boots, dials
+the daemon over WebTransport, and you get the **same daemon session** as the native
+client: `:WhoAmI` → DAEMON, `:e /work/sample.txt` reads the file off the container's
+disk over the wire.
+
+**Why two containers but only one connection:** the web container is a *static file
+server only*. The WebTransport connection is made by your browser, running on the
+host — so it dials the daemon's host-published port (`127.0.0.1:8765`), exactly like
+the native client does. Container-to-container networking isn't on the data path;
+that's why the `?daemon=` URI uses the host address, not a compose service name.
+
+Notes:
+- `http://localhost` is a secure context, so WebTransport is allowed without TLS on
+  the page; `serve.mjs` sends the COOP/COEP/CORP headers the worker's SharedArrayBuffer
+  needs.
+- The daemon's self-signed cert is pinned by hash (`serverCertificateHashes`), so no CA
+  is involved — the same TOFU model the native client uses.
+
 ## How it works
 
 - `nxvim --daemon --listen 0.0.0.0:8765` binds a QUIC listener and serves the
@@ -111,6 +158,6 @@ container's. That's the daemon split.
 ## Teardown
 
 ```sh
-podman rm -f nxvim-daemon
+podman rm -f nxvim-daemon nxvim-web
 # or: podman compose -f examples/docker-daemon/compose.yaml down
 ```

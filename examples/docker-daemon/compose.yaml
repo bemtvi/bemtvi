@@ -1,9 +1,14 @@
-# podman-compose / docker compose front-end for the nxvim remote daemon.
+# podman-compose / docker compose front-end for the nxvim remote daemon + web client.
+#
+#     # Build the wasm bundle once on the host (needs emcc + node):
+#     crates/nxvim-edithost/build.sh
 #
 #     podman compose -f examples/docker-daemon/compose.yaml up --build
 #     # or: docker compose -f examples/docker-daemon/compose.yaml up --build
 #
-# Then, from the repo root: examples/docker-daemon/connect.sh
+# Then, from the repo root, either:
+#     examples/docker-daemon/connect.sh        # native TUI client → daemon
+#     examples/docker-daemon/connect-web.sh    # browser URL → daemon
 services:
   nxvim-daemon:
     build:
@@ -15,3 +20,15 @@ services:
     ports:
       # QUIC is UDP. Bind to loopback on the host; the token/cert are the real auth.
       - "127.0.0.1:8765:8765/udp"
+
+  nxvim-web:
+    build:
+      # Context is the edit-host crate dir (where the prebuilt web/ + dist/ live); the
+      # dockerfile path is relative to that context.
+      context: ../../crates/nxvim-edithost
+      dockerfile: ../../examples/docker-daemon/Containerfile.web
+    image: nxvim-web
+    container_name: nxvim-web
+    ports:
+      # Plain HTTP; localhost is a secure context, so WebTransport works from the page.
+      - "127.0.0.1:8088:8088"

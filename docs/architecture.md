@@ -177,8 +177,11 @@ fs APIs (`vim.fn.readblob`/`glob`/`filereadable`/`executable`/…) route
 through the `LuaFs` seam — local disk by default, the remote daemon in a split — so
 file-picker previewers, root detection, and VCS-status providers see the *project*; while raw Lua
 `io.*`/`os.*`, `require`/`package.path`, the runtimepath (`nvim_get_runtime_file`), and
-`stdpath` stay **local** — plugins and their caches live on the local machine by design
-(the divergence from VS Code's remote-extension-host model).
+`stdpath` stay **local** by default — plugins and their caches live on the local machine
+(the divergence from VS Code's remote-extension-host model). A session opts into the
+daemon's config + plugins (and shada) with `--remote-config` — then the runtimepath is
+fetched over the wire and materialized into a local per-process cache; the browser, which
+has no local disk, is always remote-config. See [the edit-host split](edit-host-split.md).
 
 ### Async design
 

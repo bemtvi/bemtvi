@@ -6,10 +6,12 @@
 --     NXVIM_CONFIG=examples/docker-daemon/local \
 --       cargo run -p nxvim -- examples/docker-daemon/workspace/sample.txt
 --
--- When you instead connect to the containerized daemon (see ../README.md), nxvim
--- does NOT load this file. The editor runs the *daemon's* config, fetched over the
--- wire. The two configs below are deliberately different so you can tell, at a
--- glance, which one is live: run `:WhoAmI` and `:set tabstop?` in each mode.
+-- When you connect to the containerized daemon (see ../README.md) WITH
+-- `--remote-config`, nxvim runs the *daemon's* config instead — fetched over the wire,
+-- and this file is skipped. Without the flag (the native default), this file still
+-- loads: you keep your local config over the daemon's filesystem. The two configs are
+-- deliberately different so you can tell, at a glance, which one is live: run `:WhoAmI`
+-- and `:set tabstop?` in each mode.
 
 -- A distinctive option so `:set tabstop?` shows which config is active.
 nx.o.tabstop = 2

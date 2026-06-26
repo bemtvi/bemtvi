@@ -54,7 +54,9 @@ native edit-host split uses, so only the transport differs:
   (the string `nxvim --daemon --listen` prints), or dial it at runtime with
   `:connect nxvim://…`, and `:e` / `:w` operate on the **daemon's** filesystem over
   **WebTransport** (HTTP/3 / QUIC). Editing still happens entirely in the tab — only
-  fs crosses the wire — and config + shada stay local. Daemon mode also brings
+  fs crosses the wire. Having no local disk, the browser is **always remote-config**:
+  it runs the **daemon's** config + plugins (fetched over the wire) and keeps shada on
+  the daemon, where a native client would default to local. Daemon mode also brings
   **async processes** (`vim.system` / `jobstart`) and **`:terminal`** over the wire;
   LSP over the wire is a later slice.
 

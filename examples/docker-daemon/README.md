@@ -9,16 +9,21 @@ the same transport — **QUIC** (so: UDP):
 - the **browser** client served from a second container (`connect-web.sh`), which
   dials the same daemon over **WebTransport**.
 
-The point of the example is the **config swap**: a daemon session runs the
-*daemon's* config, fetched over the wire, **not** your local one. Two deliberately
-different configs make that visible:
+The point of the example is the **config swap**: a daemon session *can* run the
+*daemon's* config, fetched over the wire, instead of your local one — you choose with
+`--remote-config`. Native clients default to your **local** config (only I/O crosses
+the wire); the **browser** client is always remote. Two deliberately different configs
+make the swap visible:
 
-| | local launch | daemon (container) session |
-|---|---|---|
-| config | `local/init.lua` | `daemon/init.lua` (baked into the image) |
-| `:WhoAmI` | `LOCAL config …` | `DAEMON config …` |
-| `:set tabstop?` | `2` | `8` |
-| filesystem | your machine | the container |
+| | local launch | daemon session (`--remote-config`) | daemon session (default) |
+|---|---|---|---|
+| config | `local/init.lua` | `daemon/init.lua` (baked into the image) | your `local/init.lua` |
+| `:WhoAmI` | `LOCAL config …` | `DAEMON config …` | `LOCAL config …` |
+| `:set tabstop?` | `2` | `8` | `2` |
+| filesystem | your machine | the container | the container |
+
+The `connect.sh` script below passes `--remote-config` by default so the swap is
+visible; the web client (step 4) is remote either way.
 
 > Native daemon only for now — both clients reach the same `--daemon --listen`
 > listener; the daemon side is not itself containerized-anything-special.
@@ -81,7 +86,7 @@ gate, which is why the listener can safely bind `0.0.0.0` inside the container.
 
 `connect.sh` reads that URI from the container logs, rewrites the container-side
 bind host (`0.0.0.0`) to the reachable published one (`127.0.0.1:8765`), and launches
-the client:
+the client with `--remote-config` (so it runs the daemon's config):
 
 ```sh
 examples/docker-daemon/connect.sh
@@ -97,7 +102,18 @@ Now compare with step 1:
   container's `lua/` tree, fetched and materialized locally
 
 Same client binary, same keystrokes — but the config and the filesystem are the
-container's. That's the daemon split.
+container's. That's the daemon split with the config swap.
+
+Drop the config swap and you keep your own config over the daemon's filesystem — the
+native default:
+
+```sh
+REMOTE_CONFIG=0 examples/docker-daemon/connect.sh
+```
+
+Now `:WhoAmI` → **LOCAL config** and `:set tabstop?` → `2` (your `local/init.lua`),
+but `:pwd` is still `/work` and `:r !hostname` is still the container's — only the
+config came back local; the filesystem and processes stay on the daemon.
 
 ## 4. Or connect from the browser (second container)
 
@@ -147,11 +163,14 @@ Notes:
 - The container sets `NXVIM_CONFIG=/etc/nxvim`, so the daemon resolves `daemon/` as
   its config (the same precedence a local launch uses: `$NXVIM_CONFIG`, then
   `$XDG_CONFIG_HOME/nxvim`, then `$HOME/.config/nxvim`).
-- On connect, the client fetches that config over the wire, materializes it into a
-  per-process cache, and runs it locally — Lua's synchronous `require`/runtimepath
-  can't await the network, so the files must be local, but the source of truth is the
-  container. (Native artifacts like `.so` parsers are **not** fetched; the client
-  compiles matching ones on demand. See `examples/remote-config` for that detail.)
+- With `--remote-config` (or any web session), the client fetches that config over the
+  wire, materializes it into a per-process cache, and runs it locally — Lua's
+  synchronous `require`/runtimepath can't await the network, so the files must be local,
+  but the source of truth is the container. (Native artifacts like `.so` parsers are
+  **not** fetched; the client compiles matching ones on demand. See
+  `examples/remote-config` for that detail.) Without the flag, a native client runs your
+  *local* config and does only a lite fetch — the daemon's cwd + parser set, no config
+  files.
 - Only fs/process/watch/LSP — and that config fetch — cross the wire. The keystroke
   path stays entirely local, so editing feels local even when the daemon is remote.
 

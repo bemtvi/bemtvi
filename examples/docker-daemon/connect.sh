@@ -8,6 +8,10 @@
 # the published loopback host:port (the cert SANs include 127.0.0.1, and the hash is
 # pinned TOFU regardless).
 #
+# By default this runs the DAEMON's config (--remote-config), so the config swap below
+# is visible. Set REMOTE_CONFIG=0 to run your *local* config over the daemon's
+# filesystem instead — a quick way to see the two modes side by side.
+#
 # Usage:
 #     examples/docker-daemon/connect.sh [FILE-ON-DAEMON]
 #
@@ -16,6 +20,7 @@
 #     NXVIM_CONTAINER  container name (default: nxvim-daemon)
 #     NXVIM_HOST       reachable host of the published port (default: 127.0.0.1)
 #     NXVIM_PORT       published UDP port (default: 8765)
+#     REMOTE_CONFIG    1 (default) runs the daemon's config; 0 runs your local config
 set -euo pipefail
 
 CLI="${CONTAINER_CLI:-podman}"
@@ -23,6 +28,12 @@ NAME="${NXVIM_CONTAINER:-nxvim-daemon}"
 HOST="${NXVIM_HOST:-127.0.0.1}"
 PORT="${NXVIM_PORT:-8765}"
 FILE="${1:-/work/sample.txt}"
+
+# Native clients default to the LOCAL config; --remote-config opts into the daemon's.
+remote_flag=()
+if [ "${REMOTE_CONFIG:-1}" = "1" ]; then
+  remote_flag=(--remote-config)
+fi
 
 uri="$("$CLI" logs "$NAME" 2>&1 | grep -oE "nxvim://[^']+" | head -n1 || true)"
 if [ -z "$uri" ]; then
@@ -35,4 +46,4 @@ fi
 uri="$(printf '%s' "$uri" | sed -E "s#nxvim://[^/]+#nxvim://${HOST}:${PORT}#")"
 
 echo "connect.sh: dialing $uri" >&2
-exec cargo run -p nxvim -- "$uri" "$FILE"
+exec cargo run -p nxvim -- "${remote_flag[@]}" "$uri" "$FILE"

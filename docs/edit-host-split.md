@@ -75,10 +75,21 @@ In the **GUI**, `:connect nxvim://…` does the same at runtime.
 | --- | --- |
 | Every keystroke, motion, operator, undo | Opening / saving files and the file explorer |
 | The Lua VM and the redraw | Processes — `vim.system` / `jobstart` / `:terminal` |
-| Your config + shada | File-watching — `:checktime` / `'autoread'` / `FileChangedShell` |
+| Your config + shada *(default; see below)* | File-watching — `:checktime` / `'autoread'` / `FileChangedShell` |
 | | LSP requests |
 
 Only the things that were always going to feel like a spinner cross the wire.
+
+### Local or remote config (and shada)
+
+By default a daemon session runs your **local** config and keeps shada (marks /
+registers / history) local — only I/O crosses the wire. Pass **`--remote-config`** to
+run the *daemon's* config + plugins instead: the daemon's config is fetched over the
+wire (one `config_bundle` request, materialized into a per-process cache and run
+locally, since Lua's synchronous `require` can't await the network), and shada follows
+the same choice — a remote-config session keeps its shada **on the daemon**, so a
+remote workspace's editor state travels with it. The browser client has no local disk,
+so it is **always** remote-config. See [`examples/remote-config`](../examples/remote-config).
 
 ### The split-brain filesystem (for Lua)
 
@@ -86,7 +97,8 @@ One subtlety the split forces: *which* filesystem does Lua see? nxvim splits it 
 purpose. **Project-facing** fs APIs route to the daemon — `vim.fn.glob` /
 `filereadable` / `readblob` / `executable`, root detection, a picker's previewer, a
 VCS-status provider — so they see the **project** on the remote. Config and shada stay
-**local**. (This is the `LuaFs` seam.)
+**local** by default, or move to the daemon with `--remote-config` (see above). (This
+is the `LuaFs` seam.)
 
 ## Auth & identity (QUIC)
 

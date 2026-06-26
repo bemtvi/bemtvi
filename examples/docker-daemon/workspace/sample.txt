@@ -5,12 +5,14 @@ filled this buffer, and the write when you :w — happens on the container, not 
 your machine. The keystroke path stays local; only fs/process/watch/LSP cross the
 wire.
 
-Checklist — run these and compare against a plain local launch:
+Checklist — connect.sh passes --remote-config by default, so run these and compare
+against a plain local launch:
 
   :WhoAmI          -> "DAEMON config ... (tabstop=8)"   (local config says LOCAL, tabstop=2)
   :set tabstop?    -> 8                                  (local config sets 2)
   :pwd             -> /work                              (the daemon's cwd, in the container)
   :r !hostname     -> the CONTAINER's hostname           (process leg runs on the daemon)
 
-The two init.lua files are different on purpose: this proves a daemon session runs
-the DAEMON's config, fetched over the wire, not the client's.
+The two init.lua files are different on purpose: with --remote-config a daemon session
+runs the DAEMON's config, fetched over the wire, not the client's. Connect with
+REMOTE_CONFIG=0 and :WhoAmI says LOCAL instead — your config, the daemon's filesystem.

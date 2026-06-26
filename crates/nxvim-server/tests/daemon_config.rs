@@ -18,8 +18,13 @@
 
 use std::path::PathBuf;
 
-use nxvim_server::{connect_daemon, materialize_remote_config_into, RemoteConfig, ServerInit};
-use nxvim_test_harness::{attach, exec_lua, serial_lock, spawn, temp_dir};
+use nxvim_server::{
+    connect_daemon, materialize_remote_config_into, ConfigSource, DaemonClient, RemoteConfig,
+    ServerInit,
+};
+use nxvim_test_harness::{
+    attach, exec_lua, feed, lines, serial_lock, spawn, start_attached, temp_dir,
+};
 
 /// Save an env var, set it to `val` (or remove it when `None`), and restore the prior
 /// value on drop — so a test can scope `NXVIM_CONFIG` to its temp tree without leaking
@@ -66,17 +71,27 @@ fn populate_config(dir: &std::path::Path) -> PathBuf {
     plugin
 }
 
-/// Connect a [`RemoteConfig`] to a `serve_config_daemon` over an in-process duplex and
-/// fetch the bundle — the wire round trip the real session makes at startup.
-async fn fetch_over_wire() -> nxvim_server::RemoteConfigBundle {
+/// Connect a [`RemoteConfig`] to a `serve_config_daemon` over an in-process duplex —
+/// the wire the real session makes at startup. The spawned daemon serves until the
+/// returned [`RemoteConfig`]'s end drops, so the caller can `fetch`/`resolve` on it.
+fn connect_over_wire() -> RemoteConfig {
     let (edit_host_end, daemon_end) = tokio::io::duplex(1 << 16);
     let (daemon_reader, daemon_writer) = tokio::io::split(daemon_end);
     tokio::spawn(async move {
         let _ = nxvim_server::serve_config_daemon(daemon_reader, daemon_writer).await;
     });
     let (host_reader, host_writer) = tokio::io::split(edit_host_end);
-    let remote = RemoteConfig::connect(host_reader, host_writer);
-    remote.fetch().await.expect("config_bundle fetch")
+    RemoteConfig::connect(host_reader, host_writer)
+}
+
+/// Fetch the bundle over a fresh wire. `include_files` is the full vs lite fetch — a
+/// remote-config session asks for the files (`true`), a local-config session for only
+/// the metadata (`false`).
+async fn fetch_over_wire(include_files: bool) -> nxvim_server::RemoteConfigBundle {
+    connect_over_wire()
+        .fetch(include_files)
+        .await
+        .expect("config_bundle fetch")
 }
 
 /// The bundle carries the daemon's config dir, its discovered runtimepath (config dir
@@ -93,7 +108,7 @@ async fn config_bundle_ships_the_daemons_config_and_plugins() {
     let _c = EnvGuard::set("NXVIM_CONFIG", Some(&cfg));
     let _r = EnvGuard::set("NXVIM_RUNTIMEPATH", None);
 
-    let bundle = fetch_over_wire().await;
+    let bundle = fetch_over_wire(true).await;
 
     // The config dir is the daemon's, verbatim.
     assert_eq!(
@@ -168,7 +183,7 @@ async fn config_bundle_is_empty_when_the_daemon_has_no_config() {
     let _c = EnvGuard::set("NXVIM_CONFIG", Some(&missing));
     let _r = EnvGuard::set("NXVIM_RUNTIMEPATH", None);
 
-    let bundle = fetch_over_wire().await;
+    let bundle = fetch_over_wire(true).await;
 
     assert_eq!(
         bundle.config_dir.as_deref(),
@@ -198,7 +213,7 @@ async fn config_bundle_lists_the_daemons_installed_treesitter_languages() {
     let _r = EnvGuard::set("NXVIM_RUNTIMEPATH", None);
     let _d = EnvGuard::set("NXVIM_DATA_DIR", Some(&data));
 
-    let bundle = fetch_over_wire().await;
+    let bundle = fetch_over_wire(true).await;
 
     let mut langs = bundle.ts_languages.clone();
     langs.sort();
@@ -206,6 +221,78 @@ async fn config_bundle_lists_the_daemons_installed_treesitter_languages() {
         langs,
         vec!["lua".to_string(), "rust".to_string()],
         "the bundle lists the daemon's installed treesitter parsers"
+    );
+}
+
+/// The **lite** fetch (`include_files = false`, a `ConfigSource::Local` session) skips
+/// the file walk: the daemon still reports its config dir / cwd / parser set (the
+/// metadata a local-config session needs to seed `DirState` + parsers), but ships **no**
+/// file bytes — a local session runs the client's own config, so transferring the
+/// daemon's tree would be wasted.
+#[tokio::test]
+async fn config_bundle_lite_fetch_skips_the_files() {
+    let _g = serial_lock().lock().await;
+    let cfg = temp_dir("daemon_config_lite");
+    populate_config(&cfg);
+    let _c = EnvGuard::set("NXVIM_CONFIG", Some(&cfg));
+    let _r = EnvGuard::set("NXVIM_RUNTIMEPATH", None);
+    let _d = EnvGuard::set("NXVIM_DATA_DIR", Some(&temp_dir("daemon_config_lite_data")));
+
+    let bundle = fetch_over_wire(false).await;
+
+    // The cheap metadata still crosses (the local session seeds cwd from it).
+    assert_eq!(
+        bundle.config_dir.as_deref(),
+        Some(cfg.to_string_lossy().as_ref()),
+        "the lite fetch still reports the daemon's config dir"
+    );
+    assert!(
+        bundle.cwd.is_some(),
+        "the lite fetch still reports the daemon's cwd (the remote-cwd seed)"
+    );
+    // But the file bytes — the expensive part — are omitted entirely. The full fetch
+    // (asserted above) carries init.lua / lua/ / plugin/; the lite one carries none.
+    assert!(
+        bundle.files.is_empty(),
+        "the lite fetch ships no file bytes (got {:?})",
+        bundle.files.iter().map(|(p, _)| p).collect::<Vec<_>>()
+    );
+}
+
+/// `RemoteConfig::resolve(ConfigSource::Local)` runs **this machine's** config
+/// ([`default_runtime`]) rather than materializing the daemon's, while still seeding the
+/// daemon's cwd so relative paths resolve on the remote disk (the buffers / fs stay on
+/// the daemon in every mode). The config dir is the local one verbatim — never a
+/// remote-config cache path.
+#[tokio::test]
+async fn resolve_local_runs_local_config_and_seeds_remote_cwd() {
+    let _g = serial_lock().lock().await;
+    let cfg = temp_dir("daemon_resolve_local");
+    populate_config(&cfg);
+    let _c = EnvGuard::set("NXVIM_CONFIG", Some(&cfg));
+    let _r = EnvGuard::set("NXVIM_RUNTIMEPATH", None);
+    let _d = EnvGuard::set(
+        "NXVIM_DATA_DIR",
+        Some(&temp_dir("daemon_resolve_local_data")),
+    );
+
+    let resolved = connect_over_wire()
+        .resolve(ConfigSource::Local)
+        .await
+        .expect("resolve local");
+
+    // Local mode sources `init.lua` from the local config dir, verbatim — not a
+    // materialized cache copy (which would live under a `…/remote/<pid>/…` path).
+    assert_eq!(
+        resolved.config_dir.as_deref(),
+        Some(cfg.as_path()),
+        "local mode runs the local config dir (no materialize)"
+    );
+    // The daemon's cwd is still seeded (buffers/fs are remote even with local config).
+    assert_eq!(
+        resolved.remote_cwd,
+        std::env::current_dir().ok(),
+        "local mode still seeds the daemon's cwd for relative-path resolution"
     );
 }
 
@@ -259,7 +346,11 @@ async fn a_daemon_session_loads_the_remotes_config_and_plugins() {
 
     // Fetch the daemon's config and materialize it into cache B — the rebased roots.
     let cache = temp_dir("e2e_remote_cache");
-    let bundle = client.config.fetch().await.expect("config_bundle fetch");
+    let bundle = client
+        .config
+        .fetch(true)
+        .await
+        .expect("config_bundle fetch");
     let (config_dir, runtimepath) =
         materialize_remote_config_into(&cache, bundle).expect("materialize");
     // The server reads its config from B, never from A.
@@ -302,4 +393,318 @@ async fn a_daemon_session_loads_the_remotes_config_and_plugins() {
         Some(true),
         "the remote plugin's plugin/ script ran"
     );
+}
+
+/// Stand up a real daemon (`run_daemon_io`) over an in-process duplex and connect the
+/// full edit-host client — every host seam over one link, as the binary does over stdio.
+/// The daemon serves against the real disk (scoped to the test's temp env), so a
+/// `Remote`-config session's shada lands under the daemon's `shada_dir()`.
+fn spawn_daemon_client() -> DaemonClient {
+    let (host_end, daemon_end) = tokio::io::duplex(1 << 16);
+    let (d_reader, d_writer) = tokio::io::split(daemon_end);
+    tokio::spawn(async move {
+        let _ = nxvim_server::run_daemon_io(d_reader, d_writer).await;
+    });
+    let (h_reader, h_writer) = tokio::io::split(host_end);
+    connect_daemon(h_reader, h_writer)
+}
+
+/// Drain the client's incoming channel until it closes — which happens only after the
+/// server thread fully returns from `run_server`, i.e. *after* the clean-exit flush AND
+/// the awaited remote shada upload. So awaiting this is a reliable "the daemon has the
+/// uploaded shada" barrier, with no reliance on wall-clock timing.
+async fn drain_until_exit(mut incoming: tokio::sync::mpsc::UnboundedReceiver<nxvim_rpc::Incoming>) {
+    while incoming.recv().await.is_some() {}
+}
+
+/// Build the [`ServerInit`] for a `Remote`-config daemon session against `client`: resolve
+/// the remote config + the on-daemon shada (Approach A), exactly as the binary's
+/// `run_edit_host_session` does. Returns the init, ready for `start_attached`.
+async fn remote_session_init(
+    client: DaemonClient,
+    file: Option<String>,
+    namespace: Option<&str>,
+) -> ServerInit {
+    let resolved = client
+        .config
+        .resolve(ConfigSource::Remote)
+        .await
+        .expect("resolve remote config");
+    let (store, remote_shada) = nxvim_server::resolve_session_shada(
+        &client.host_fs,
+        ConfigSource::Remote,
+        resolved.state_dir.as_deref(),
+        namespace,
+        nxvim_server::default_shada(),
+    )
+    .await;
+    assert!(
+        remote_shada.is_some(),
+        "a Remote-config session must get an on-daemon shada target"
+    );
+    ServerInit {
+        file,
+        config_dir: resolved.config_dir,
+        runtimepath: resolved.runtimepath,
+        shada: Some(store),
+        remote_shada,
+        host_proc: Some(Box::new(client.host_proc)),
+        host_fs_async: Some(Box::new(client.host_fs)),
+        lsp_transport: Some(Box::new(client.lsp_transport)),
+        fs_jobs: Some(client.fs_jobs),
+        ..Default::default()
+    }
+}
+
+/// End to end: a `Remote`-config session keeps its shada **on the daemon** (Approach A).
+/// Session 1 yanks a word into register `a` and quits; the editor uploads its staged store
+/// to the daemon over the fs seam. The file appears under the *daemon's* `shada_dir()` (the
+/// temp state dir), and a second Remote-config session restores register `a` from it —
+/// proving the bytes round-tripped through the daemon, not a local store.
+#[tokio::test]
+async fn remote_config_session_keeps_shada_on_the_daemon() {
+    let _g = serial_lock().lock().await;
+    // Scope every state/config/cache dir to temp trees: the daemon's shada (incl. our
+    // remote-session file) lands under XDG_STATE_HOME; the client's materialize cache +
+    // shada staging land under XDG_CACHE_HOME. Hermetic — the real dirs are untouched.
+    let state = temp_dir("remote_shada_state");
+    let _xs = EnvGuard::set("XDG_STATE_HOME", Some(&state));
+    let _xc = EnvGuard::set("XDG_CACHE_HOME", Some(&temp_dir("remote_shada_cache")));
+    let _c = EnvGuard::set("NXVIM_CONFIG", Some(&temp_dir("remote_shada_cfg")));
+    let _r = EnvGuard::set("NXVIM_RUNTIMEPATH", None);
+    let _d = EnvGuard::set("NXVIM_DATA_DIR", Some(&temp_dir("remote_shada_data")));
+
+    // Session 1: type a line, yank "hello" into register `a`, quit. No file — buffers are
+    // beside the point here; we exercise the shada sync, not the off-tick open.
+    {
+        let init = remote_session_init(spawn_daemon_client(), None, None).await;
+        let (rpc, incoming) = start_attached(init, 80, 25).await;
+        feed(&rpc, "ihello world<Esc>");
+        feed(&rpc, "0\"ayiw");
+        assert_eq!(lines(&rpc).await, vec!["hello world"]);
+        feed(&rpc, ":qa!<CR>");
+        // Barrier: the server has flushed AND uploaded the shada to the daemon.
+        drain_until_exit(incoming).await;
+    }
+
+    // The shada landed on the *daemon*, in its remote shada dir — a per-instance `.redb`
+    // store under `<shada_dir>/remote/`, not a local store and not in the daemon's own
+    // native shada dir.
+    let remote_dir = state.join("nxvim/shada/remote");
+    let remote_stores = store_files_in(&remote_dir);
+    assert_eq!(
+        remote_stores.len(),
+        1,
+        "the Remote-config session synced exactly one store to the daemon, got {remote_stores:?}"
+    );
+
+    // Session 2: a fresh Remote-config session downloads the daemon's store and restores
+    // register `a`, so `"ap` pastes "hello" — the state came back over the wire.
+    {
+        let init = remote_session_init(spawn_daemon_client(), None, None).await;
+        let (rpc, _incoming) = start_attached(init, 80, 25).await;
+        feed(&rpc, "\"ap");
+        assert_eq!(
+            lines(&rpc).await,
+            vec!["hello"],
+            "register `a` was restored from the daemon's shada"
+        );
+    }
+}
+
+/// The companion to the round trip above: a **Local**-config daemon session keeps its
+/// shada local (a `.redb` store under the state dir) and writes **no** remote-session
+/// file to the daemon — `local config → local shada`, the native default.
+#[tokio::test]
+async fn local_config_session_keeps_shada_local() {
+    let _g = serial_lock().lock().await;
+    let state = temp_dir("local_shada_state");
+    let _xs = EnvGuard::set("XDG_STATE_HOME", Some(&state));
+    let _xc = EnvGuard::set("XDG_CACHE_HOME", Some(&temp_dir("local_shada_cache")));
+    let _c = EnvGuard::set("NXVIM_CONFIG", Some(&temp_dir("local_shada_cfg")));
+    let _r = EnvGuard::set("NXVIM_RUNTIMEPATH", None);
+    let _d = EnvGuard::set("NXVIM_DATA_DIR", Some(&temp_dir("local_shada_data")));
+
+    let client = spawn_daemon_client();
+    let resolved = client
+        .config
+        .resolve(ConfigSource::Local)
+        .await
+        .expect("resolve local config");
+    let (store, remote_shada) = nxvim_server::resolve_session_shada(
+        &client.host_fs,
+        ConfigSource::Local,
+        resolved.state_dir.as_deref(),
+        None,
+        nxvim_server::default_shada(),
+    )
+    .await;
+    assert!(
+        remote_shada.is_none(),
+        "a Local-config session must NOT get an on-daemon shada target"
+    );
+
+    let init = ServerInit {
+        config_dir: resolved.config_dir,
+        runtimepath: resolved.runtimepath,
+        shada: Some(store),
+        remote_shada,
+        host_proc: Some(Box::new(client.host_proc)),
+        host_fs_async: Some(Box::new(client.host_fs)),
+        lsp_transport: Some(Box::new(client.lsp_transport)),
+        fs_jobs: Some(client.fs_jobs),
+        ..Default::default()
+    };
+    let (rpc, incoming) = start_attached(init, 80, 25).await;
+    feed(&rpc, "ihello<Esc>\"ayiw");
+    feed(&rpc, ":qa!<CR>");
+    drain_until_exit(incoming).await;
+
+    let shada = state.join("nxvim/shada");
+    assert!(
+        !shada.join("remote").exists(),
+        "a Local-config session must not create a remote shada dir on the daemon"
+    );
+    assert!(
+        !store_files_in(&shada).is_empty(),
+        "a Local-config session persists to a local .redb store under {shada:?}"
+    );
+}
+
+/// The `.redb` store files directly under `dir` (non-recursive), for asserting on the
+/// remote shada mirror's contents.
+fn store_files_in(dir: &std::path::Path) -> Vec<PathBuf> {
+    std::fs::read_dir(dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| nxvim_server::is_store_file(p))
+        .collect()
+}
+
+/// Phase 3 (per-instance mirror): the remote shada dir **compacts + carries forward** like
+/// the local store. Session 1 stores register `a` on the daemon; session 2 stores `b`, and
+/// because it absorbs + removes session 1's sibling, the remote dir still holds exactly one
+/// store — bounded by live sessions, not launches. Session 3 sees *both* registers, proving
+/// the carry-forward merge round-tripped through the daemon.
+#[tokio::test]
+async fn remote_shada_compacts_and_merges_across_sessions() {
+    let _g = serial_lock().lock().await;
+    let state = temp_dir("remote_shada_compact_state");
+    let _xs = EnvGuard::set("XDG_STATE_HOME", Some(&state));
+    let _xc = EnvGuard::set(
+        "XDG_CACHE_HOME",
+        Some(&temp_dir("remote_shada_compact_cache")),
+    );
+    let _c = EnvGuard::set("NXVIM_CONFIG", Some(&temp_dir("remote_shada_compact_cfg")));
+    let _r = EnvGuard::set("NXVIM_RUNTIMEPATH", None);
+    let _d = EnvGuard::set(
+        "NXVIM_DATA_DIR",
+        Some(&temp_dir("remote_shada_compact_data")),
+    );
+    let remote_dir = state.join("nxvim/shada/remote");
+
+    // Session 1: yank a line into register `a`, quit.
+    {
+        let init = remote_session_init(spawn_daemon_client(), None, None).await;
+        let (rpc, incoming) = start_attached(init, 80, 25).await;
+        feed(&rpc, "ihello world<Esc>\"ayy");
+        assert_eq!(lines(&rpc).await, vec!["hello world"]);
+        feed(&rpc, ":qa!<CR>");
+        drain_until_exit(incoming).await;
+    }
+    assert_eq!(
+        store_files_in(&remote_dir).len(),
+        1,
+        "one remote store after session 1"
+    );
+
+    // Session 2: yank a line into register `b`, quit. It absorbs session 1's store and
+    // removes it on the daemon, so the count stays at one.
+    {
+        let init = remote_session_init(spawn_daemon_client(), None, None).await;
+        let (rpc, incoming) = start_attached(init, 80, 25).await;
+        feed(&rpc, "ifoo bar<Esc>\"byy");
+        assert_eq!(lines(&rpc).await, vec!["foo bar"]);
+        feed(&rpc, ":qa!<CR>");
+        drain_until_exit(incoming).await;
+    }
+    assert_eq!(
+        store_files_in(&remote_dir).len(),
+        1,
+        "still one remote store after session 2 — session 1's was compacted away"
+    );
+
+    // Session 3: both registers survived the carry-forward (session 1's `a` merged into
+    // session 2's store, which also holds `b`).
+    {
+        let init = remote_session_init(spawn_daemon_client(), None, None).await;
+        let (rpc, _incoming) = start_attached(init, 80, 25).await;
+        feed(&rpc, "\"ap\"bp");
+        assert_eq!(lines(&rpc).await, vec!["", "hello world", "foo bar"]);
+    }
+}
+
+/// Phase 3: `--shada-namespace` isolates a project's shada on the daemon under its own
+/// `remote/ns/<NS>/` dir. A register set in namespace `proj-a` is invisible in `proj-b`,
+/// and reconnecting `proj-a` restores it — two projects on the same daemon never share
+/// marks/registers.
+#[tokio::test]
+async fn remote_shada_namespace_isolates_projects() {
+    let _g = serial_lock().lock().await;
+    let state = temp_dir("remote_shada_ns_state");
+    let _xs = EnvGuard::set("XDG_STATE_HOME", Some(&state));
+    let _xc = EnvGuard::set("XDG_CACHE_HOME", Some(&temp_dir("remote_shada_ns_cache")));
+    let _c = EnvGuard::set("NXVIM_CONFIG", Some(&temp_dir("remote_shada_ns_cfg")));
+    let _r = EnvGuard::set("NXVIM_RUNTIMEPATH", None);
+    let _d = EnvGuard::set("NXVIM_DATA_DIR", Some(&temp_dir("remote_shada_ns_data")));
+    let remote = state.join("nxvim/shada/remote");
+
+    // proj-a: store "alpha" in register `a`.
+    {
+        let init = remote_session_init(spawn_daemon_client(), None, Some("proj-a")).await;
+        let (rpc, incoming) = start_attached(init, 80, 25).await;
+        feed(&rpc, "ialpha<Esc>\"ayy");
+        feed(&rpc, ":qa!<CR>");
+        drain_until_exit(incoming).await;
+    }
+
+    // proj-b: register `a` is empty here (isolated) — pasting it changes nothing. Then
+    // store "beta" in register `b`.
+    {
+        let init = remote_session_init(spawn_daemon_client(), None, Some("proj-b")).await;
+        let (rpc, incoming) = start_attached(init, 80, 25).await;
+        feed(&rpc, "\"ap");
+        assert_eq!(
+            lines(&rpc).await,
+            vec![""],
+            "register `a` from proj-a must NOT leak into proj-b"
+        );
+        feed(&rpc, "ibeta<Esc>\"byy");
+        feed(&rpc, ":qa!<CR>");
+        drain_until_exit(incoming).await;
+    }
+
+    // Each namespace has its own store dir on the daemon.
+    assert_eq!(store_files_in(&remote.join("ns/proj-a")).len(), 1);
+    assert_eq!(store_files_in(&remote.join("ns/proj-b")).len(), 1);
+
+    // Reconnect proj-a: register `a` ("alpha") is back, and `b` (proj-b's) is absent.
+    {
+        let init = remote_session_init(spawn_daemon_client(), None, Some("proj-a")).await;
+        let (rpc, _incoming) = start_attached(init, 80, 25).await;
+        feed(&rpc, "\"ap");
+        assert_eq!(
+            lines(&rpc).await,
+            vec!["", "alpha"],
+            "proj-a's `a` restored"
+        );
+        feed(&rpc, "\"bp");
+        assert_eq!(
+            lines(&rpc).await,
+            vec!["", "alpha"],
+            "proj-b's `b` must NOT appear in proj-a"
+        );
+    }
 }

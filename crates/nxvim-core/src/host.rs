@@ -59,6 +59,27 @@ pub trait HostFs {
 
     /// Resolve symlinks and `.`/`..` to a canonical absolute path.
     fn canonicalize(&self, path: &Path) -> io::Result<PathBuf>;
+
+    /// Recursively create `dir` (and any missing parents); a no-op if it already
+    /// exists. The default fails loud — a backend with no directory-create support
+    /// must say so at runtime, not silently succeed (the no-silent-stub rule). Used
+    /// by the remote-shada mirror to ensure its per-namespace dir before writing.
+    fn create_dir_all(&self, _dir: &Path) -> io::Result<()> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "create_dir_all is not supported by this filesystem backend",
+        ))
+    }
+
+    /// Remove the file at `path`. The default fails loud (see [`HostFs::create_dir_all`]).
+    /// Used by the remote-shada mirror's clean-exit compaction to delete absorbed
+    /// sibling stores on the daemon.
+    fn remove_file(&self, _path: &Path) -> io::Result<()> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "remove_file is not supported by this filesystem backend",
+        ))
+    }
 }
 
 /// The default [`HostFs`]: the real local filesystem via `std::fs`. Every front
@@ -106,6 +127,14 @@ impl HostFs for StdHostFs {
 
     fn canonicalize(&self, path: &Path) -> io::Result<PathBuf> {
         std::fs::canonicalize(path)
+    }
+
+    fn create_dir_all(&self, dir: &Path) -> io::Result<()> {
+        std::fs::create_dir_all(dir)
+    }
+
+    fn remove_file(&self, path: &Path) -> io::Result<()> {
+        std::fs::remove_file(path)
     }
 }
 

@@ -100,8 +100,8 @@ pub use nxvim_core::{
 /// tests pass a [`RedbFileStore`] over a temp dir, or `None` to disable.
 #[cfg(feature = "native")]
 pub use shada::{
-    default_shada, is_store_file, shada_dir, valid_namespace, workspace_shada, RedbFileStore,
-    ShadaStore, SHADA_NAMESPACE_ENV,
+    default_shada, is_store_file, prepare_remote_shada, resolve_session_shada, shada_dir,
+    valid_namespace, workspace_shada, RedbFileStore, RemoteShada, ShadaStore, SHADA_NAMESPACE_ENV,
 };
 
 /// The daemon wire protocol for the edit-host split: the daemon-side servers
@@ -215,6 +215,14 @@ pub struct ServerInit {
     /// namespace), so a plain `--shada-namespace` launch isolates marks/registers without
     /// rearranging your windows. Default `false`.
     pub restore_session: bool,
+    /// For a `Remote`-config daemon session: the on-daemon shada file the staged local
+    /// [`shada`](Self::shada) store syncs to (Approach A — see [`prepare_remote_shada`]).
+    /// `None` (the default) keeps shada purely local. When set, the edit-host uploads the
+    /// store's bytes to the daemon over the fs seam after each flush, so the session's
+    /// editor state persists on the remote machine. Native-only — the web build has its
+    /// own OPFS shada path.
+    #[cfg(feature = "native")]
+    pub remote_shada: Option<RemoteShada>,
     /// Directories Lua searches for modules and runtime files (the runtimepath).
     pub runtimepath: Vec<PathBuf>,
     /// What backs the system-clipboard registers `"+` / `"*`. Defaults to
@@ -383,6 +391,40 @@ fn discover_plugins(config_dir: &Path) -> Vec<PathBuf> {
     plugins
 }
 
+/// Whether a daemon (edit-host) session runs the **daemon's** config + shada or the
+/// **local** machine's. Chosen per connection: the native clients default to `Local`
+/// (the `--remote-config` flag opts into `Remote`); the web client is always `Remote`
+/// (it has no local config / local disk). `Remote` fetches + materializes the daemon's
+/// config tree and (Phase 2) keeps shada on the daemon; `Local` runs
+/// [`default_runtime`] and the local shada, fetching only the daemon's cwd / parser set.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ConfigSource {
+    /// The client's own config + local shada (native default).
+    Local,
+    /// The daemon's config + plugins (materialized locally) + remote shada (web default).
+    Remote,
+}
+
+/// The session config resolved from a [`ConfigSource`] against a daemon's config leg
+/// ([`RemoteConfig::resolve`](crate::RemoteConfig::resolve)): the `config_dir` /
+/// `runtimepath` to source (the daemon's materialized copy for `Remote`, the local roots
+/// for `Local`), plus the daemon's cwd and tree-sitter parser set (seeded in both modes,
+/// since the buffers / fs are always on the daemon).
+#[cfg(feature = "native")]
+pub struct ResolvedConfig {
+    /// The config dir to source `init.lua` from (`None` = no config).
+    pub config_dir: Option<PathBuf>,
+    /// The runtimepath, in load order.
+    pub runtimepath: Vec<PathBuf>,
+    /// The daemon's working directory, to seed `DirState` (`None` = keep local cwd).
+    pub remote_cwd: Option<PathBuf>,
+    /// The daemon's installed tree-sitter parser languages, auto-installed locally.
+    pub ts_autoinstall: Vec<String>,
+    /// The daemon's shada base dir, where a `Remote`-config session stages + syncs its
+    /// shada (`None` if an older daemon omitted it — remote shada then unavailable).
+    pub state_dir: Option<String>,
+}
+
 /// Gather this machine's whole config surface for the `config_bundle` daemon leg:
 /// the [`default_runtime`] roots (the config dir + every runtimepath entry, plugins
 /// included) plus every **source** file under them, each paired with its absolute
@@ -397,24 +439,39 @@ fn discover_plugins(config_dir: &Path) -> Vec<PathBuf> {
 /// (`.so`/`.dylib`/`.dll`) are **skipped** — tree-sitter parsers and the like are
 /// compiled locally on the client, and a remote-arch binary would not load anyway.
 ///
-/// `(config_dir, runtimepath, files, ts_languages)` — `files` is each source file's
-/// absolute path paired with its bytes; `ts_languages` is the daemon's installed
-/// tree-sitter parser languages (so the client can auto-install the same set).
+/// `(config_dir, runtimepath, files, ts_languages, state_dir)` — `files` is each source
+/// file's absolute path paired with its bytes; `ts_languages` is the daemon's installed
+/// tree-sitter parser languages (so the client can auto-install the same set); `state_dir`
+/// is the daemon's shada base dir ([`shada_dir`]), so a `Remote`-config session can keep
+/// its shada on the daemon (Phase 2 of the remote-config-and-shada plan).
 #[cfg(feature = "native")]
 pub(crate) type ConfigBundleData = (
     Option<PathBuf>,
     Vec<PathBuf>,
     Vec<(PathBuf, Vec<u8>)>,
     Vec<String>,
+    PathBuf,
 );
 
 #[cfg(feature = "native")]
-pub(crate) fn collect_config_bundle() -> std::io::Result<ConfigBundleData> {
+pub(crate) fn collect_config_bundle(include_files: bool) -> std::io::Result<ConfigBundleData> {
     let (config_dir, runtimepath) = default_runtime();
+    // The daemon's shada base dir, reported in every bundle so a `Remote`-config session
+    // can stage + sync its shada under it (the daemon runs no shada logic itself — only
+    // whole files cross the wire; the session's `fs_mkdir` creates the actual
+    // `remote[/ns/<NS>]` dir before its first upload). Cheap, so the lite fetch carries it.
+    let state_dir = shada_dir();
+    // A **local-config** session (`ConfigSource::Local`) fetches only the cheap metadata
+    // — the daemon's cwd and its tree-sitter parser set — and runs the *client's* own
+    // config, so it never transfers the daemon's config tree. The lite fetch skips the
+    // (potentially large) file walk entirely; a **remote-config** session asks for the
+    // files (`include_files = true`) and materializes them locally.
     let mut files = Vec::new();
-    let mut seen = std::collections::HashSet::new();
-    for root in &runtimepath {
-        walk_config_dir(root, &mut files, &mut seen)?;
+    if include_files {
+        let mut seen = std::collections::HashSet::new();
+        for root in &runtimepath {
+            walk_config_dir(root, &mut files, &mut seen)?;
+        }
     }
     // The daemon's installed parser set: the client compiles the same languages
     // locally (parsers are native artifacts, never fetched — see `walk_config_dir`).
@@ -422,7 +479,7 @@ pub(crate) fn collect_config_bundle() -> std::io::Result<ConfigBundleData> {
         .into_iter()
         .map(|p| p.lang)
         .collect();
-    Ok((config_dir, runtimepath, files, ts_languages))
+    Ok((config_dir, runtimepath, files, ts_languages, state_dir))
 }
 
 /// Recursively append every source file under `dir` to `out` as `(abspath, bytes)`,
@@ -558,6 +615,14 @@ pub struct EditHost {
     /// (which only governs capture). From [`ServerInit::restore_session`].
     #[cfg(feature = "native")]
     restore_session: bool,
+    /// The on-daemon shada sync for a `Remote`-config session (Approach A): a handle to
+    /// the daemon fs plus the remote file path. `None` for a local-shada session. When
+    /// set, [`shada_checkpoint`](Self::shada_checkpoint) uploads the staged store's bytes
+    /// to the daemon (fire-and-forget) and [`shada_upload_final`](Self::shada_upload_final)
+    /// does the awaited final upload at clean exit. Built in [`run`] from
+    /// [`ServerInit::remote_shada`] + a clone of the daemon `host_fs_async`.
+    #[cfg(feature = "native")]
+    remote_shada: Option<RemoteShadaSync>,
     /// Attached UI dimensions `(width, height)`, once a client has attached.
     ui: Option<(usize, usize)>,
     /// Per-buffer highlight memo, keyed by buffer id (created lazily on first
@@ -992,6 +1057,8 @@ impl EditHost {
             workspace_session: false,
             #[cfg(feature = "native")]
             restore_session: false,
+            #[cfg(feature = "native")]
+            remote_shada: None,
             ui: None,
             #[cfg(feature = "native")]
             syntax_states: HashMap::new(),
@@ -1908,10 +1975,39 @@ pub(crate) fn is_shada_flush_timer(event: &LoopEvent) -> bool {
     matches!(event, LoopEvent::Timer { id, .. } if *id == SHADA_FLUSH_TIMER_ID)
 }
 
+/// The on-daemon shada sync handle for a `Remote`-config session (Approach A, per-instance
+/// mirror): the daemon fs seam, the remote shada **directory**, and the sibling filenames
+/// downloaded at connect (deleted on the daemon at clean-exit compaction). The session
+/// uploads its *own* instance file into `remote_dir` after each flush. `busy` coalesces
+/// overlapping checkpoint uploads — a debounced checkpoint that fires while a prior upload
+/// is still in flight is skipped (the next checkpoint, or the awaited final upload, carries
+/// the latest bytes), so uploads neither pile up nor land out of order.
+#[cfg(feature = "native")]
+struct RemoteShadaSync {
+    fs: Arc<dyn HostFsAsync>,
+    remote_dir: String,
+    downloaded: Vec<String>,
+    busy: Arc<std::sync::atomic::AtomicBool>,
+}
+
+#[cfg(feature = "native")]
+impl RemoteShadaSync {
+    fn new(fs: Arc<dyn HostFsAsync>, remote_dir: String, downloaded: Vec<String>) -> Self {
+        Self {
+            fs,
+            remote_dir,
+            downloaded,
+            busy: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        }
+    }
+}
+
 /// The shada (persistence) glue on the [`EditHost`]: load before the first frame,
 /// the debounced live checkpoint, the clean-exit flush, and the per-message
 /// debounce arming. All run **off** the editor input tick — the store's I/O never
 /// blocks a keystroke. A no-op throughout when persistence is off (`shada: None`).
+/// For a `Remote`-config session the staged store also syncs to the daemon after each
+/// flush (Approach A — see [`RemoteShadaSync`]).
 #[cfg(feature = "native")]
 impl EditHost {
     /// Open + merge + compact the store before the first frame and seed the result
@@ -1993,13 +2089,20 @@ impl EditHost {
         if self.workspace_session && self.lua.session_save_layout() {
             snap.session = self.editor.export_session();
         }
+        let mut flushed = false;
         if let Some(store) = self.shada.as_mut() {
             // A live checkpoint never compacts: deleting an absorbed sibling while we
             // hold our lock would hide its data from a concurrent launcher. Only the
             // clean-exit flush compacts.
-            if let Err(e) = store.flush(&snap, false) {
-                eprintln!("shada: checkpoint flush failed: {e}");
+            match store.flush(&snap, false) {
+                Ok(()) => flushed = true,
+                Err(e) => eprintln!("shada: checkpoint flush failed: {e}"),
             }
+        }
+        // For a `Remote`-config session, push the freshly-committed store to the daemon
+        // (fire-and-forget — the editor tick never blocks on the network).
+        if flushed {
+            self.upload_shada_checkpoint();
         }
     }
 
@@ -2017,6 +2120,84 @@ impl EditHost {
             // this final snapshot — which folds in their data — is durable.
             if let Err(e) = store.flush(&snap, true) {
                 eprintln!("shada: final flush failed: {e}");
+            }
+        }
+    }
+
+    /// The staged store's own instance file as `(remote_target, bytes)` for an upload: the
+    /// file [`current_path`](ShadaStore::current_path) points at, uploaded into the remote
+    /// shada dir under its *own* name (the per-instance mirror). Snapshotted *after* a flush
+    /// has committed it, so the bytes are a consistent redb file. `None` when remote shada
+    /// is off, the store has no backing file, or the read fails (logged, never fatal).
+    fn staged_shada_upload(&self) -> Option<(String, Vec<u8>)> {
+        let sync = self.remote_shada.as_ref()?;
+        let path = self.shada.as_ref()?.current_path()?;
+        let name = path.file_name()?.to_str()?;
+        let target = format!("{}/{}", sync.remote_dir, name);
+        match std::fs::read(&path) {
+            Ok(bytes) => Some((target, bytes)),
+            Err(e) => {
+                eprintln!("shada: could not read staged store for remote upload: {e}");
+                None
+            }
+        }
+    }
+
+    /// Upload our instance file to the daemon after a checkpoint flush (Approach A),
+    /// **fire-and-forget**: snapshot the bytes now (consistent — the flush just
+    /// committed), then write them over the fs seam on a spawned task so the editor tick
+    /// never blocks on the network. Coalesced via [`RemoteShadaSync::busy`] so debounced
+    /// checkpoints can't pile up. A no-op when remote shada is off.
+    fn upload_shada_checkpoint(&self) {
+        use std::sync::atomic::Ordering;
+        let Some(sync) = self.remote_shada.as_ref() else {
+            return;
+        };
+        // Skip if a prior upload is still in flight — the next checkpoint (or the awaited
+        // final upload) carries the latest bytes; this avoids pile-up and out-of-order
+        // writes.
+        if sync.busy.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        let Some((target, bytes)) = self.staged_shada_upload() else {
+            sync.busy.store(false, Ordering::Release);
+            return;
+        };
+        let fs = sync.fs.clone();
+        let busy = sync.busy.clone();
+        tokio::spawn(async move {
+            if let Err(e) = fs.write(target, bytes).await {
+                eprintln!("shada: remote checkpoint upload failed: {e}");
+            }
+            busy.store(false, Ordering::Release);
+        });
+    }
+
+    /// The **awaited** clean-exit sync (Approach A, per-instance mirror): after
+    /// [`shada_flush_final`](Self::shada_flush_final) wrote + locally compacted the staged
+    /// store, upload our instance file to the daemon and *wait* for it (a fire-and-forget
+    /// spawn could be dropped as the process exits, losing the last session's state), then
+    /// delete the absorbed siblings on the daemon so the remote dir stays bounded by live
+    /// sessions. Best-effort (failures logged; we're leaving). A no-op when remote shada is
+    /// off or the store never loaded (nothing absorbed → nothing to remove).
+    pub(crate) async fn shada_upload_final(&self) {
+        let Some(sync) = self.remote_shada.as_ref() else {
+            return;
+        };
+        if self.shada.is_none() {
+            return;
+        }
+        if let Some((target, bytes)) = self.staged_shada_upload() {
+            if let Err(e) = sync.fs.write(target, bytes).await {
+                eprintln!("shada: final remote upload failed: {e}");
+            }
+        }
+        // Mirror the local clean-exit compaction onto the daemon: the siblings we
+        // downloaded were absorbed into our just-uploaded file, so delete them remotely.
+        for name in &sync.downloaded {
+            let target = format!("{}/{}", sync.remote_dir, name);
+            if let Err(e) = sync.fs.remove(target).await {
+                eprintln!("shada: remote compaction (remove {name}) failed: {e}");
             }
         }
     }
@@ -2274,6 +2455,10 @@ where
     // ([`EventLoop`]), the off-tick daemon fs (read/write/watch + the `open_tx` /
     // `save_done_tx` deliveries), and the LSP command sink ([`LspManager`]) the editor
     // tick fires through. The wasm build (slice 5b) swaps a JS-interop implementor here.
+    // Clone the daemon fs handle (an `Arc`) for the remote-shada sync *before* it is moved
+    // into `NativeEffects` below — the staged shada store uploads its bytes back over this
+    // same seam after each flush (Approach A). `None` for a local/bare session.
+    let shada_fs = host_fs_async.clone();
     let mut host = EditHost::new(
         editor,
         lua,
@@ -2295,6 +2480,13 @@ where
     host.shada = init.shada;
     host.workspace_session = init.workspace_session;
     host.restore_session = init.restore_session;
+    // For a `Remote`-config session, pair the remote shada target with the daemon fs
+    // handle so checkpoints + the exit flush sync the staged store to the daemon. Both
+    // are present together (a `Remote` session has a daemon fs); either missing → no sync.
+    host.remote_shada = match (init.remote_shada, shada_fs) {
+        (Some(rs), Some(fs)) => Some(RemoteShadaSync::new(fs, rs.remote_dir, rs.downloaded)),
+        _ => None,
+    };
     host.mouse_clock = init.mouse_clock;
     // In a daemon session the one true cwd is the *daemon's*, not the local process's
     // — seed `DirState` from it so `:pwd` / `vim.fn.getcwd` report the remote dir and
@@ -2468,6 +2660,10 @@ where
     // now) — the store turns it into `'0` on the next launch, so `'0` only ever
     // reflects a clean exit. Best-effort — we're leaving.
     host.shada_flush_final();
+    // For a `Remote`-config session, push the final store to the daemon and **await** it
+    // (a fire-and-forget spawn could be dropped as the process exits, losing the last
+    // session's state). Best-effort; a no-op for a local-shada session.
+    host.shada_upload_final().await;
     Ok(())
 }
 

@@ -25,44 +25,113 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::Result;
+use clap::Parser;
 use nxvim_gui::remote::{self, ConnectTarget};
 use nxvim_gui::{spawn_session, spawn_stdio_daemon_session, GuiConfig};
+use nxvim_server::ConfigSource;
 
-/// Flag that runs the **local** edit-host half of the split: the full editor + GUI
-/// window, with its fs/process/watch/LSP host seams pointed at a `--daemon` child spawned
-/// on stdio (the sibling `nxvim` binary, or `NXVIM_DAEMON_CMD`).
-const CONNECT_DAEMON_FLAG: &str = "--connect-daemon";
+/// nxvim-gui's command line. clap derives the parser, validates flags, errors on unknown
+/// options, and generates `--help`/`--version` — the same real parsing the `nxvim` (TUI)
+/// binary uses, replacing the old hand-rolled scan.
+///
+/// The GUI is a **client only**: there is no `--daemon`/`--listen` serving role and no
+/// `--test-plugin`/`--lua` headless role (run `nxvim` for those). What it does share with
+/// the TUI is the connect surface — the positional [`Cli::targets`] (a FILE and/or a
+/// `nxvim://…` connect URI) and `--connect-daemon` — plus its own font/render options.
+#[derive(Parser)]
+#[command(
+    name = "nxvim-gui",
+    version,
+    about = "A modal, vim-style editor: the native (winit + wgpu) GUI client.",
+    long_about = "A modal, vim-style editor: the native (winit + wgpu) GUI client. With no \
+        role flag, nxvim-gui opens the given file (or an empty buffer) in a window onto a \
+        local editor server. A directory argument opens the system file picker there."
+)]
+struct Cli {
+    /// File to open, and/or a nxvim://… daemon connect URI
+    #[arg(value_name = "TARGET")]
+    targets: Vec<String>,
+
+    /// Run the editor locally but route fs/process/watch/LSP to a --daemon child
+    #[arg(long)]
+    connect_daemon: bool,
+
+    /// In a daemon session (at startup or a later :connect), run the daemon's config +
+    /// plugins instead of the local config (default: local config)
+    #[arg(long)]
+    remote_config: bool,
+
+    /// Font family (comma-separated fallback list), overriding NXVIM_GUI_FONT
+    #[arg(long, value_name = "NAME")]
+    font: Option<String>,
+
+    /// Font size in points, overriding NXVIM_GUI_FONT_SIZE
+    #[arg(long, value_name = "PT")]
+    font_size: Option<f32>,
+
+    /// Emoji / wide-glyph size relative to the cell, overriding NXVIM_GUI_EMOJI_SCALE
+    #[arg(long, value_name = "FACTOR")]
+    emoji_scale: Option<f32>,
+}
 
 fn main() -> Result<()> {
     // If ssh re-invoked this binary as its `SSH_ASKPASS` helper (for a `:connect`
     // host-key/password prompt), pop the native dialog and exit — never start the editor.
+    // Checked before clap, so the askpass argv (a prompt string) is never parsed as flags.
     if let Some(result) = remote::run_askpass_if_invoked() {
         return result;
     }
 
-    let args: Vec<String> = std::env::args().skip(1).collect();
+    // clap parses, validates, and exits with usage/version itself for `--help`/`-h`,
+    // `--version`/`-V`, and unknown options.
+    let cli = Cli::parse();
 
-    // The positional arguments (the first is the file to open) plus the font config
-    // (`--font` / `--font-size`, overriding the `NXVIM_GUI_FONT*` environment).
-    let (positionals, config) = parse_args(&args);
+    // The render config starts from the `NXVIM_GUI_FONT*` environment; the typed CLI
+    // options (already validated by clap) override it.
+    let mut config = GuiConfig::from_env();
+    if let Some(name) = &cli.font {
+        // `set_font` accepts a comma-separated fallback list, tried in order for a glyph
+        // the primary lacks (`--font "JetBrains Mono,Noto Color Emoji"`).
+        config.set_font(name);
+    }
+    if let Some(pt) = cli.font_size {
+        config.set_font_size(pt);
+    }
+    if let Some(scale) = cli.emoji_scale {
+        config.set_emoji_scale(scale);
+    }
 
-    // A `nxvim://…` connect URI (the QUIC daemon target) is not a file; pick the file
-    // from the remaining non-URI positionals.
-    let connect_uri = args.iter().find(|a| remote::is_connect_uri(a)).cloned();
-    let file = positionals.into_iter().find(|a| !remote::is_connect_uri(a));
+    // Which config (+ shada) a daemon session runs: the local machine's by default, or
+    // the daemon's with `--remote-config`. Unlike the TUI, the GUI can `:connect` after a
+    // local start, so the flag is session-wide (it also applies to later `:connect`s) and
+    // is never rejected for a local startup.
+    let config_source = if cli.remote_config {
+        ConfigSource::Remote
+    } else {
+        ConfigSource::Local
+    };
+
+    // A `nxvim://…` connect URI (the QUIC daemon target) is not a file; the first other
+    // positional is the file to open.
+    let connect_uri = cli
+        .targets
+        .iter()
+        .find(|a| remote::is_connect_uri(a))
+        .cloned();
+    let file = cli.targets.into_iter().find(|a| !remote::is_connect_uri(a));
 
     // Edit-host split, local half, over QUIC: a `nxvim://…` target connects to a
     // `--daemon --listen` listener and routes fs/process/watch/LSP to it.
     if let Some(uri) = connect_uri {
-        let session = spawn_session(Some(ConnectTarget::Quic(uri)), file)?;
-        return nxvim_gui::run(session, config, None);
+        let session = spawn_session(Some(ConnectTarget::Quic(uri)), file, config_source)?;
+        return nxvim_gui::run(session, config, None, config_source);
     }
 
     // Edit-host split, local half, over stdio: spawn a `--daemon` child (sibling `nxvim`
     // or `NXVIM_DAEMON_CMD`) and route fs/process/watch/LSP to it over stdio pipes.
-    if args.iter().any(|a| a == CONNECT_DAEMON_FLAG) {
-        let session = spawn_stdio_daemon_session(file)?;
-        return nxvim_gui::run(session, config, None);
+    if cli.connect_daemon {
+        let session = spawn_stdio_daemon_session(file, config_source)?;
+        return nxvim_gui::run(session, config, None, config_source);
     }
 
     // Default role: embedded server on the local disk. A *directory* argument
@@ -75,60 +144,6 @@ fn main() -> Result<()> {
         Some(f) if Path::new(&f).is_dir() => (None, Some(PathBuf::from(f))),
         other => (other, None),
     };
-    let session = spawn_session(None, file)?;
-    nxvim_gui::run(session, config, open_dir)
-}
-
-/// Parse the command line into `(positionals, config)`: non-flag arguments (the first is
-/// the file to open) in order, plus the font config — `--font <name>` / `--font-size
-/// <pt>` (or the `=` form) set the font, taking precedence over the `NXVIM_GUI_FONT` /
-/// `NXVIM_GUI_FONT_SIZE` environment the config starts from. `--font` accepts a
-/// comma-separated fallback list (`--font "JetBrains Mono,Noto Color Emoji"`), tried in
-/// order for a glyph the primary lacks. `--emoji-scale <f>` sizes emoji / wide
-/// fallback glyphs relative to the cell (default `NXVIM_GUI_EMOJI_SCALE` or 1.0).
-/// Unknown flags (e.g. `--connect-daemon`) are ignored here — handled by `main`.
-fn parse_args(args: &[String]) -> (Vec<String>, GuiConfig) {
-    let mut positionals = Vec::new();
-    let mut config = GuiConfig::from_env();
-    let mut iter = args.iter();
-    while let Some(arg) = iter.next() {
-        if let Some(name) = arg.strip_prefix("--font=") {
-            config.set_font(name);
-        } else if let Some(size) = arg.strip_prefix("--font-size=") {
-            apply_font_size(&mut config, size);
-        } else if let Some(scale) = arg.strip_prefix("--emoji-scale=") {
-            apply_emoji_scale(&mut config, scale);
-        } else if arg == "--font" {
-            if let Some(name) = iter.next() {
-                config.set_font(name);
-            }
-        } else if arg == "--font-size" {
-            if let Some(size) = iter.next() {
-                apply_font_size(&mut config, size);
-            }
-        } else if arg == "--emoji-scale" {
-            if let Some(scale) = iter.next() {
-                apply_emoji_scale(&mut config, scale);
-            }
-        } else if !arg.starts_with('-') {
-            positionals.push(arg.clone());
-        }
-    }
-    (positionals, config)
-}
-
-/// Apply a `--font-size` value, warning (but not failing) on a non-numeric one.
-fn apply_font_size(config: &mut GuiConfig, value: &str) {
-    match value.trim().parse::<f32>() {
-        Ok(pt) => config.set_font_size(pt),
-        Err(_) => eprintln!("nxvim-gui: ignoring non-numeric --font-size {value:?}"),
-    }
-}
-
-/// Apply an `--emoji-scale` value, warning (but not failing) on a non-numeric one.
-fn apply_emoji_scale(config: &mut GuiConfig, value: &str) {
-    match value.trim().parse::<f32>() {
-        Ok(s) => config.set_emoji_scale(s),
-        Err(_) => eprintln!("nxvim-gui: ignoring non-numeric --emoji-scale {value:?}"),
-    }
+    let session = spawn_session(None, file, config_source)?;
+    nxvim_gui::run(session, config, open_dir, config_source)
 }

@@ -1,10 +1,21 @@
-# Remote config & plugins
+# Remote config & plugins (and shada)
 
-In an edit-host (daemon) session, nxvim runs the **daemon's** config and plugins, not
-the client's. They are fetched over the wire (one `config_bundle` request),
-materialized into a local per-process cache (`$XDG_CACHE_HOME/nxvim/remote/<pid>`), and
-run locally — Lua's synchronous `require`/runtimepath can't await the network, so the
-files must be local, but the source of truth is the remote.
+In an edit-host (daemon) session, nxvim can run **either** your local config or the
+**daemon's** config and plugins — you choose with `--remote-config`. Native clients
+default to **local**; `--remote-config` opts into the daemon's config. (The web client,
+which has no local disk, is always remote.) Shada (marks/registers/history) follows the
+same choice:
+
+| | config | shada |
+| --- | --- | --- |
+| *(default)* | your **local** config | **local** (`stdpath('state')/shada`) |
+| `--remote-config` | the **daemon's** config + plugins | on the **daemon** (`stdpath('state')/shada/remote-session.shada` there) |
+
+With `--remote-config`, the daemon's config is fetched over the wire (one `config_bundle`
+request), materialized into a local per-process cache (`$XDG_CACHE_HOME/nxvim/remote/<pid>`),
+and run locally — Lua's synchronous `require`/runtimepath can't await the network, so the
+files must be local, but the source of truth is the remote. The remote shada is staged to
+a local redb store that syncs back to the daemon after each flush.
 
 This directory is a runnable remote config that announces itself loudly so you can see
 the mechanism working.
@@ -12,12 +23,16 @@ the mechanism working.
 ## Run it on one machine (local two-process split)
 
 `--connect-daemon` spawns `nxvim --daemon` as a child over stdio; the child inherits
-`NXVIM_CONFIG`, so it serves this directory:
+`NXVIM_CONFIG`, so it serves this directory. Add `--remote-config` to actually run it
+(without the flag you get your *local* config instead):
 
 ```sh
 NXVIM_CONFIG=examples/remote-config \
-  cargo run -p nxvim -- --connect-daemon examples/remote-config/sample.txt
+  cargo run -p nxvim -- --connect-daemon --remote-config examples/remote-config/sample.txt
 ```
+
+Drop `--remote-config` and the same command runs your own `~/.config/nxvim` over the
+daemon's filesystem — a quick way to see the two modes side by side.
 
 ## Run it across machines (real remote over SSH)
 
@@ -25,16 +40,24 @@ Put this directory at `~/.config/nxvim` on the **remote** host, then from the lo
 
 ```sh
 NXVIM_DAEMON_CMD='ssh your-host nxvim --daemon' \
-  cargo run -p nxvim -- --connect-daemon
+  cargo run -p nxvim -- --connect-daemon --remote-config
 ```
 
-Only fs/process/LSP — and this config fetch — cross the wire; the keystroke path stays
-local.
+Only fs/process/LSP — this config fetch, and (with `--remote-config`) the shada sync —
+cross the wire; the keystroke path stays local. Set a mark or yank a register, quit, and
+reconnect with `--remote-config`: the state comes back from the *remote's* shada, while a
+plain (local) session keeps that state on your own machine.
+
+Add `--shada-namespace <project>` to keep each project's remote shada separate on the
+daemon (under `stdpath('state')/shada/remote/ns/<project>/` there) — so marks/registers
+from one remote workspace don't bleed into another. Without it, a single global remote
+store is shared across projects (matching neovim's global-shada semantics).
 
 ## Run it from the browser (web build)
 
-The wasm edit-host is born remote the same way. Launch a listening daemon serving this
-directory, then open the web client pointed at it with `?daemon=<uri>`:
+The wasm edit-host is born remote the same way (the web client is always remote-config).
+Launch a listening daemon serving this directory, then open the web client pointed at it
+with `?daemon=<uri>`:
 
 ```sh
 NXVIM_CONFIG=examples/remote-config cargo run -p nxvim -- --daemon --listen 127.0.0.1:0

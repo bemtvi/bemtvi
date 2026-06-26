@@ -219,7 +219,12 @@ pub enum UserEvent {
 /// thread, then the session loop retires the old server (it winds down on EOF) and
 /// re-attaches the UI onto the new one. The editor always runs local — only the
 /// fs/process/watch/LSP seams cross the wire.
-pub fn run(initial: Session, config: GuiConfig, open_dir: Option<PathBuf>) -> Result<()> {
+pub fn run(
+    initial: Session,
+    config: GuiConfig,
+    open_dir: Option<PathBuf>,
+    config_source: nxvim_server::ConfigSource,
+) -> Result<()> {
     let event_loop = EventLoop::<UserEvent>::with_user_event().build()?;
     let proxy = event_loop.create_proxy();
 
@@ -313,8 +318,15 @@ pub fn run(initial: Session, config: GuiConfig, open_dir: Option<PathBuf>) -> Re
                             Some(target) => {
                                 let file = target.embedded_file();
                                 let tx = built_tx.clone();
+                                // A live `:connect` inherits the session-wide config source
+                                // chosen at startup (`--remote-config`), so every reconnect
+                                // is consistent with the first.
                                 tokio::task::spawn_blocking(move || {
-                                    let _ = tx.send(session::spawn_session(Some(target), file));
+                                    let _ = tx.send(session::spawn_session(
+                                        Some(target),
+                                        file,
+                                        config_source,
+                                    ));
                                 });
                             }
                             None => break 'session, // App (the only sender) is gone

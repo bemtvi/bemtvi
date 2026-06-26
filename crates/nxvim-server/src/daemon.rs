@@ -142,6 +142,12 @@ const FS_WRITE: &str = "fs_write";
 // corrupt the others), so the edit-host owns the logical cwd in `DirState` and resolves
 // its own relative paths against it. See `docs/plans/2026-06-23-remote-cwd.md`.
 const FS_CHDIR: &str = "fs_chdir";
+// Whole-directory primitives for the remote-shada mirror (Approach A, per-instance):
+// `fs_mkdir` ensures the per-namespace remote shada dir exists before the first upload
+// (`fs_write` doesn't create parents), and `fs_remove` deletes an absorbed sibling store
+// on the daemon at clean-exit compaction. Both request/response, like a read.
+const FS_MKDIR: &str = "fs_mkdir";
+const FS_REMOVE: &str = "fs_remove";
 // The watch leg (`HostWatch`): the edit-host arms/disarms watches on the daemon, the
 // daemon pushes a change. Server-*push* — the only daemon→edit-host *notification* on
 // the fs leg (reads/writes are request/response).
@@ -873,6 +879,29 @@ pub trait HostFsAsync: Send + Sync {
         bytes: Vec<u8>,
     ) -> Pin<Box<dyn Future<Output = io::Result<Option<FileStat>>> + Send>>;
 
+    /// Recursively create a directory on the remote (the remote-shada mirror ensures its
+    /// per-namespace dir before writing). The default fails loud — a backend with no
+    /// remote mkdir must say so at runtime, not silently succeed (the no-silent-stub rule).
+    fn mkdir(&self, _path: String) -> Pin<Box<dyn Future<Output = io::Result<()>> + Send>> {
+        Box::pin(async {
+            Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "remote mkdir is not supported by this filesystem backend",
+            ))
+        })
+    }
+
+    /// Remove a file on the remote (the remote-shada mirror's clean-exit compaction
+    /// deletes absorbed sibling stores). The default fails loud (see [`Self::mkdir`]).
+    fn remove(&self, _path: String) -> Pin<Box<dyn Future<Output = io::Result<()>> + Send>> {
+        Box::pin(async {
+            Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "remote remove is not supported by this filesystem backend",
+            ))
+        })
+    }
+
     /// Arm a remote watch on `path` (the `HostWatch` leg): the daemon stats it now as
     /// the baseline and pushes a [`WatchEvent`] each time it changes thereafter.
     /// Fire-and-forget — the change comes back asynchronously via [`Self::take_watch_events`].
@@ -1001,6 +1030,27 @@ impl HostFsAsync for RemoteHostFs {
                 )),
                 // A daemon error reply carries the `E344` text (a missing/!dir target) or
                 // a transport failure; either is surfaced loud, never a silent no-move.
+                Err(e) => Err(io::Error::other(e.to_string())),
+            }
+        })
+    }
+
+    fn mkdir(&self, path: String) -> Pin<Box<dyn Future<Output = io::Result<()>> + Send>> {
+        let rpc = self.rpc.clone();
+        Box::pin(async move {
+            // `["ok"]` on success; any error reply (or transport failure) is loud.
+            match rpc.request(FS_MKDIR, vec![Value::from(path)]).await {
+                Ok(_) => Ok(()),
+                Err(e) => Err(io::Error::other(e.to_string())),
+            }
+        })
+    }
+
+    fn remove(&self, path: String) -> Pin<Box<dyn Future<Output = io::Result<()>> + Send>> {
+        let rpc = self.rpc.clone();
+        Box::pin(async move {
+            match rpc.request(FS_REMOVE, vec![Value::from(path)]).await {
+                Ok(_) => Ok(()),
                 Err(e) => Err(io::Error::other(e.to_string())),
             }
         })
@@ -1172,6 +1222,8 @@ pub async fn serve_fs_daemon_on(
                         let reply = match method.as_str() {
                             FS_READ => serve_read(&*fs, &params),
                             FS_CHDIR => serve_chdir(&*fs, &params),
+                            FS_MKDIR => serve_mkdir(&*fs, &params),
+                            FS_REMOVE => serve_remove(&*fs, &params),
                             FS_WRITE => {
                                 let reply = serve_write(&*fs, &mut params);
                                 // Self-suppress: a successful write changed the file, but
@@ -1293,6 +1345,32 @@ fn serve_chdir(fs: &dyn HostFs, params: &[Value]) -> Result<Value, Value> {
             "E344: Can't change directory to \"{}\": {e}",
             target.display()
         ))),
+    }
+}
+
+/// Recursively create a directory on the daemon (`fs_mkdir [path]` → `["ok"]`), for the
+/// remote-shada mirror to ensure its per-namespace dir before the first upload. A failure
+/// is a loud error reply (the session surfaces it, never a silent no-op).
+fn serve_mkdir(fs: &dyn HostFs, params: &[Value]) -> Result<Value, Value> {
+    let Some(path) = params.first().and_then(Value::as_str) else {
+        return Err(Value::from("fs_mkdir: missing path"));
+    };
+    match fs.create_dir_all(Path::new(path)) {
+        Ok(()) => Ok(Value::Array(vec![Value::from("ok")])),
+        Err(e) => Err(Value::from(format!("fs_mkdir: {e}"))),
+    }
+}
+
+/// Remove a file on the daemon (`fs_remove [path]` → `["ok"]`), for the remote-shada
+/// mirror's clean-exit compaction (deleting an absorbed sibling store). A failure is a
+/// loud error reply.
+fn serve_remove(fs: &dyn HostFs, params: &[Value]) -> Result<Value, Value> {
+    let Some(path) = params.first().and_then(Value::as_str) else {
+        return Err(Value::from("fs_remove: missing path"));
+    };
+    match fs.remove_file(Path::new(path)) {
+        Ok(()) => Ok(Value::Array(vec![Value::from("ok")])),
+        Err(e) => Err(Value::from(format!("fs_remove: {e}"))),
     }
 }
 
@@ -2128,9 +2206,12 @@ pub async fn serve_config_daemon_on(
     mut incoming: UnboundedReceiver<Incoming>,
 ) -> anyhow::Result<()> {
     while let Some(msg) = incoming.recv().await {
-        if let Incoming::Request { id, method, .. } = msg {
+        if let Incoming::Request {
+            id, method, params, ..
+        } = msg
+        {
             let reply = match method.as_str() {
-                CONFIG_BUNDLE => serve_config_bundle(),
+                CONFIG_BUNDLE => serve_config_bundle(&params),
                 other => Err(Value::from(format!("unknown method: {other}"))),
             };
             rpc.respond(id, reply);
@@ -2141,10 +2222,14 @@ pub async fn serve_config_daemon_on(
 }
 
 /// Walk the daemon's config surface and project it onto the `config_bundle` wire shape,
-/// or a loud error reply (a failed walk is never a silently-empty bundle).
-fn serve_config_bundle() -> Result<Value, Value> {
-    match crate::collect_config_bundle() {
-        Ok((config_dir, runtimepath, files, ts_languages)) => Ok(encode_config_bundle(
+/// or a loud error reply (a failed walk is never a silently-empty bundle). `params` is
+/// `[include_files]`: a **local-config** edit-host passes `false` to skip the file walk
+/// (it runs its own config, wanting only the daemon's cwd / parser set); a remote-config
+/// session — or an older peer that sends no arg — gets the full tree (`true`).
+fn serve_config_bundle(params: &[Value]) -> Result<Value, Value> {
+    let include_files = params.first().and_then(Value::as_bool).unwrap_or(true);
+    match crate::collect_config_bundle(include_files) {
+        Ok((config_dir, runtimepath, files, ts_languages, state_dir)) => Ok(encode_config_bundle(
             config_dir,
             runtimepath,
             files,
@@ -2154,21 +2239,27 @@ fn serve_config_bundle() -> Result<Value, Value> {
             // (`docs/plans/2026-06-23-remote-cwd.md`). `None` if it can't be read — the
             // edit-host then falls back to its own local cwd.
             std::env::current_dir().ok(),
+            // The daemon's shada base dir, where a `Remote`-config session stages + syncs
+            // its shada over the fs seam (the daemon itself runs no shada logic).
+            state_dir,
         )),
         Err(e) => Err(Value::from(format!("config_bundle: {e}"))),
     }
 }
 
-/// `[config_dir?, [runtimepath…], [[abspath, bytes], …], [ts_lang…], cwd?]` — the bundle
-/// on the wire ([`decode_config_bundle`] is the inverse). Paths are the daemon's absolute
-/// paths; the edit-host rebases them onto its local cache. `cwd` is the daemon's working
-/// directory (a trailing field an older peer omits → the edit-host keeps its local cwd).
+/// `[config_dir?, [runtimepath…], [[abspath, bytes], …], [ts_lang…], cwd?, state_dir?]` —
+/// the bundle on the wire ([`decode_config_bundle`] is the inverse). Paths are the
+/// daemon's absolute paths; the edit-host rebases the config roots onto its local cache.
+/// `cwd` is the daemon's working directory and `state_dir` its shada base dir — both
+/// trailing fields an older peer omits (→ the edit-host keeps its local cwd / has no
+/// remote shada).
 fn encode_config_bundle(
     config_dir: Option<PathBuf>,
     runtimepath: Vec<PathBuf>,
     files: Vec<(PathBuf, Vec<u8>)>,
     ts_languages: Vec<String>,
     cwd: Option<PathBuf>,
+    state_dir: PathBuf,
 ) -> Value {
     let path_str = |p: PathBuf| Value::from(p.to_string_lossy().into_owned());
     Value::Array(vec![
@@ -2182,6 +2273,7 @@ fn encode_config_bundle(
         ),
         Value::Array(ts_languages.into_iter().map(Value::from).collect()),
         cwd.map_or(Value::Nil, &path_str),
+        path_str(state_dir),
     ])
 }
 
@@ -2228,11 +2320,17 @@ impl RemoteConfig {
         RemoteConfig { rpc }
     }
 
-    /// Fetch the daemon's config surface (one `config_bundle` round trip). A transport
-    /// failure or a malformed reply is a loud error — never a silently-empty bundle that
-    /// would look like "the remote has no config".
-    pub async fn fetch(&self) -> io::Result<RemoteConfigBundle> {
-        match self.rpc.request(CONFIG_BUNDLE, vec![]).await {
+    /// Fetch the daemon's config surface (one `config_bundle` round trip). `include_files`
+    /// asks the daemon to walk + ship its config tree (a remote-config session); `false`
+    /// is the lite fetch (a local-config session — just the daemon's cwd / parser set). A
+    /// transport failure or a malformed reply is a loud error — never a silently-empty
+    /// bundle that would look like "the remote has no config".
+    pub async fn fetch(&self, include_files: bool) -> io::Result<RemoteConfigBundle> {
+        match self
+            .rpc
+            .request(CONFIG_BUNDLE, vec![Value::from(include_files)])
+            .await
+        {
             // The decode (shape validation) lives in `remote_config` so the wasm edit-host
             // shares it; a mismatch is a loud `InvalidData` error here.
             Ok(v) => {
@@ -2240,6 +2338,39 @@ impl RemoteConfig {
             }
             Err(e) => Err(io::Error::other(e.to_string())),
         }
+    }
+
+    /// Resolve the session's config from a [`ConfigSource`](crate::ConfigSource) — the
+    /// shared path both native clients (TUI / GUI) take at connect, so the
+    /// fetch-vs-lite + materialize-vs-local decision lives in one place.
+    ///
+    /// - `Remote`: fetch the full bundle and materialize the daemon's config + plugins
+    ///   onto a local cache ([`materialize_remote_config`](crate::materialize_remote_config)).
+    /// - `Local`: a lite fetch (cwd / parser set only) and the client's own
+    ///   [`default_runtime`](crate::default_runtime) — the buffers / fs still live on the
+    ///   daemon, so the cwd is seeded in both modes for relative-path resolution.
+    ///
+    /// A transport failure or an unstageable cache is loud (a session cannot run a config
+    /// it could not resolve), never a silent fall back.
+    pub async fn resolve(&self, source: crate::ConfigSource) -> io::Result<crate::ResolvedConfig> {
+        let bundle = self
+            .fetch(matches!(source, crate::ConfigSource::Remote))
+            .await?;
+        let remote_cwd = bundle.cwd.clone().map(std::path::PathBuf::from);
+        let ts_autoinstall = bundle.ts_languages.clone();
+        let state_dir = bundle.state_dir.clone();
+        let (config_dir, runtimepath) = match source {
+            crate::ConfigSource::Remote => crate::materialize_remote_config(bundle)
+                .map_err(|e| io::Error::other(format!("materialize remote config: {e}")))?,
+            crate::ConfigSource::Local => crate::default_runtime(),
+        };
+        Ok(crate::ResolvedConfig {
+            config_dir,
+            runtimepath,
+            remote_cwd,
+            ts_autoinstall,
+            state_dir,
+        })
     }
 }
 

@@ -13,7 +13,8 @@ use std::thread::JoinHandle;
 
 use anyhow::{anyhow, Result};
 use nxvim_server::{
-    connect_daemon, connect_quic, run as run_server, ClipboardProvider, DaemonClient, ServerInit,
+    connect_daemon, connect_quic, run as run_server, ClipboardProvider, ConfigSource, DaemonClient,
+    ServerInit,
 };
 use tokio::io::DuplexStream;
 
@@ -48,9 +49,13 @@ pub struct Session {
 /// `file` is the buffer to open (the CLI/`:connect` file, or a daemon target's embedded
 /// `/file`). The daemon child (ssh) lives inside the server thread with `kill_on_drop`,
 /// so it is reaped when the session ends.
-pub fn spawn_session(target: Option<ConnectTarget>, file: Option<String>) -> Result<Session> {
+pub fn spawn_session(
+    target: Option<ConnectTarget>,
+    file: Option<String>,
+    config_source: ConfigSource,
+) -> Result<Session> {
     let remote = target.is_some();
-    spawn_server(remote, file, move || async move {
+    spawn_server(remote, file, config_source, move || async move {
         // Build the host seams: `None` for the embedded local disk, or a daemon client
         // (ssh stdio / quic) for the edit-host split. The ssh child is the session guard.
         match target {
@@ -79,8 +84,11 @@ pub fn spawn_session(target: Option<ConnectTarget>, file: Option<String>) -> Res
 /// target): `$NXVIM_DAEMON_CMD` through `sh -c`, else the sibling `nxvim --daemon`. Its
 /// stderr goes to a temp log (it can't share this binary's stderr cleanly); `tail` it to
 /// debug the daemon side. The returned [`Session`] is a daemon session (`remote = true`).
-pub fn spawn_stdio_daemon_session(file: Option<String>) -> Result<Session> {
-    spawn_server(true, file, || async {
+pub fn spawn_stdio_daemon_session(
+    file: Option<String>,
+    config_source: ConfigSource,
+) -> Result<Session> {
+    spawn_server(true, file, config_source, || async {
         let mut child = spawn_stdio_daemon()?;
         let stdout = child.stdout.take().expect("daemon stdout piped");
         let stdin = child.stdin.take().expect("daemon stdin piped");
@@ -108,7 +116,12 @@ fn guard(value: impl std::any::Any + Send) -> Guard {
 /// server runtime, and its outcome is relayed back so a failed connect is an `Err` here
 /// (before any window/swap) rather than a dead session. `connect` yields the optional
 /// [`DaemonClient`] (`None` = local disk) plus a [`Guard`] kept alive for the session.
-fn spawn_server<F, Fut>(remote: bool, file: Option<String>, connect: F) -> Result<Session>
+fn spawn_server<F, Fut>(
+    remote: bool,
+    file: Option<String>,
+    config_source: ConfigSource,
+    connect: F,
+) -> Result<Session>
 where
     F: FnOnce() -> Fut + Send + 'static,
     Fut: std::future::Future<Output = Result<(Option<DaemonClient>, Guard)>>,
@@ -140,7 +153,7 @@ where
             // Build the server config — for a daemon session this fetches + materializes
             // the remote's config/plugins, so a failure here is a setup failure the caller
             // must see (before we report the handshake up).
-            let init = match server_init(file, client).await {
+            let init = match server_init(file, client, config_source).await {
                 Ok(init) => init,
                 Err(e) => {
                     let _ = ready_tx.send(Err(e));
@@ -223,51 +236,92 @@ fn nxvim_bin_name() -> &'static str {
 /// (the keystroke path stays local); what varies is the host seams and where config
 /// comes from. `client = None` is the embedded local disk (config from local disk).
 /// `Some(daemon)` is the edit-host split: fs/process/watch/LSP/Lua-fs route to the
-/// daemon, and the config + plugins are **fetched from the daemon** (materialized
-/// locally) with the daemon's tree-sitter parser set mirrored — matching the TUI. A
-/// failed config fetch is loud (the caller surfaces it as a handshake error) rather than
-/// a silent fall back to local config.
-async fn server_init(file: Option<String>, client: Option<DaemonClient>) -> Result<ServerInit> {
+/// daemon, and the config is resolved from `config_source` — `Remote` **fetches** the
+/// daemon's config + plugins (materialized locally), `Local` runs this machine's config;
+/// either way the daemon's cwd / tree-sitter parser set are mirrored — matching the TUI.
+/// A failed resolve is loud (the caller surfaces it as a handshake error) rather than a
+/// silent fall back to local config.
+async fn server_init(
+    file: Option<String>,
+    client: Option<DaemonClient>,
+    config_source: ConfigSource,
+) -> Result<ServerInit> {
     let mut ts_autoinstall = Vec::new();
     // The daemon's cwd seeds `DirState` so `:pwd`/`:cd`/`getcwd` operate on the remote
     // dir in a daemon session (`docs/plans/2026-06-23-remote-cwd.md`); `None` for a local
     // session, which seeds from the local process cwd.
     let mut remote_cwd = None;
-    let (config_dir, runtimepath, host_fs, host_proc, host_fs_async, lsp_transport, fs_jobs) =
-        match client {
-            None => {
-                let (config_dir, runtimepath) = nxvim_server::default_runtime();
-                (config_dir, runtimepath, None, None, None, None, None)
-            }
-            Some(c) => {
-                let bundle = c.config.fetch().await.map_err(|e| {
-                    anyhow!("could not fetch the remote config from the daemon: {e}")
-                })?;
-                // Mirror the daemon's installed tree-sitter parsers locally (parsers are
-                // native, never fetched). Captured before `bundle` is consumed.
-                ts_autoinstall = bundle.ts_languages.clone();
-                remote_cwd = bundle.cwd.clone().map(std::path::PathBuf::from);
-                let (config_dir, runtimepath) = nxvim_server::materialize_remote_config(bundle)
-                    .map_err(|e| anyhow!("could not materialize the remote config locally: {e}"))?;
-                (
-                    // A daemon session leaves the synchronous `host_fs` unused — every fs
-                    // read goes through the async daemon seam below — so it stays `None`.
-                    config_dir,
-                    runtimepath,
-                    None,
-                    Some(Box::new(c.host_proc) as _),
-                    Some(Box::new(c.host_fs) as _),
-                    Some(Box::new(c.lsp_transport) as _),
-                    Some(c.fs_jobs),
-                )
-            }
-        };
+    // The on-daemon shada sync target for a `Remote`-config session (Approach A); `None`
+    // for a local-shada session.
+    let mut remote_shada = None;
+    let (
+        config_dir,
+        runtimepath,
+        shada_store,
+        host_fs,
+        host_proc,
+        host_fs_async,
+        lsp_transport,
+        fs_jobs,
+    ) = match client {
+        None => {
+            let (config_dir, runtimepath) = nxvim_server::default_runtime();
+            (
+                config_dir,
+                runtimepath,
+                nxvim_server::default_shada(),
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+        }
+        Some(c) => {
+            // `Remote` materializes the daemon's config + plugins locally; `Local`
+            // (the native default) runs this machine's own config and fetches only the
+            // daemon's cwd / parser set. A failed resolve is loud (the caller surfaces
+            // it as a handshake error), not a silent fall back to local config.
+            let resolved = c.config.resolve(config_source).await.map_err(|e| {
+                anyhow!("could not resolve the session config from the daemon: {e}")
+            })?;
+            ts_autoinstall = resolved.ts_autoinstall;
+            remote_cwd = resolved.remote_cwd;
+            // Shada follows the config source: `Remote` keeps it on the daemon
+            // (download now over `c.host_fs`, before it is moved below; sync back after
+            // each flush), `Local` uses the local store. A download error falls back to
+            // local rather than clobbering the daemon's copy.
+            let (store, rs) = nxvim_server::resolve_session_shada(
+                &c.host_fs,
+                config_source,
+                resolved.state_dir.as_deref(),
+                // The GUI has no `--shada-namespace` yet (v1: TUI only).
+                None,
+                nxvim_server::default_shada(),
+            )
+            .await;
+            remote_shada = rs;
+            (
+                // A daemon session leaves the synchronous `host_fs` unused — every fs
+                // read goes through the async daemon seam below — so it stays `None`.
+                resolved.config_dir,
+                resolved.runtimepath,
+                store,
+                None,
+                Some(Box::new(c.host_proc) as _),
+                Some(Box::new(c.host_fs) as _),
+                Some(Box::new(c.lsp_transport) as _),
+                Some(c.fs_jobs),
+            )
+        }
+    };
     Ok(ServerInit {
         file,
         config_dir,
-        // Editor state (registers, marks, history) lives where the editor runs — local
-        // in both cases — so shada persists locally; only fs/proc cross to the daemon.
-        shada: Some(nxvim_server::default_shada()),
+        // Editor + Lua run locally; shada is local for a `Local`-config session and on the
+        // daemon for a `Remote`-config one (Approach A — synced over the fs seam).
+        shada: Some(shada_store),
+        remote_shada,
         // The GUI front end does not yet pass `--shada-namespace`, so it uses the global
         // store and never captures/restores the editor session (v1: TUI only).
         workspace_session: false,

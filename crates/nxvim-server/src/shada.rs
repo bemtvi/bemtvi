@@ -7,9 +7,15 @@
 //! [`ServerInit::shada`](crate::ServerInit). That matters because the *server* (not
 //! just the core) targets the browser: the native build injects [`RedbFileStore`]
 //! (redb over a real file), and the wasm Worker build will inject a redb store over
-//! an **OPFS** `StorageBackend` — same engine, different bytes underneath. So shada
-//! lives wherever the editor runs (local disk or browser storage), never on the
-//! remote daemon.
+//! an **OPFS** `StorageBackend` — same engine, different bytes underneath. So the store
+//! logic always runs where the editor runs (local disk or browser storage).
+//!
+//! **Remote shada (Approach A).** A `Remote`-config daemon session is the one case the
+//! bytes live *on the daemon*: the store still runs client-side (redb over a local
+//! staging dir), but at connect it is seeded from the daemon's copy and after each flush
+//! its bytes are uploaded back over the whole-file fs seam (the daemon runs no shada
+//! logic — only files cross the wire). See [`prepare_remote_shada`] /
+//! [`resolve_session_shada`] and the *Remote shada* section below.
 //!
 //! **Why per-instance files + merge.** redb is single-process: it takes an
 //! exclusive lock on open, so a shared store every instance writes is impossible.
@@ -90,6 +96,16 @@ pub trait ShadaStore {
     /// numbered marks come through un-shifted (the `'0` shift is a launch event,
     /// not a re-read) and the snapshot carries no `exit_cursor`.
     fn reload(&mut self) -> std::io::Result<PersistState>;
+
+    /// This instance's own store file on disk, once [`load`](ShadaStore::load) has
+    /// opened it (`None` before, or for a store with no single backing file). The
+    /// remote-shada sync reads these bytes after each flush to upload them to the
+    /// daemon — the staged local redb *is* the on-remote artifact (Approach A). The
+    /// default returns `None`: a store that isn't a single local file has nothing to
+    /// upload whole.
+    fn current_path(&self) -> Option<PathBuf> {
+        None
+    }
 }
 
 /// `registers` table: key is the one-char register name, value is a msgpack
@@ -347,6 +363,10 @@ impl ShadaStore for RedbFileStore {
             }
         }
         Ok(())
+    }
+
+    fn current_path(&self) -> Option<PathBuf> {
+        self.path.clone()
     }
 }
 
@@ -1078,4 +1098,172 @@ pub fn workspace_shada(namespace: Option<&str>) -> Box<dyn ShadaStore + Send> {
 /// the integration suite can count surviving files without re-deriving the layout.
 pub fn is_store_file(path: &Path) -> bool {
     path.extension().and_then(|e| e.to_str()) == Some("redb")
+}
+
+// ============================================================================
+// Remote shada (Approach A): the store on the daemon's machine
+// ============================================================================
+//
+// A `Remote`-config daemon session keeps its shada on the **daemon**, not the local
+// client, so the editor state for a remote workspace travels with that workspace. The
+// daemon fs seam is whole-file read/write only (no random access, no cross-machine
+// lock), so redb can't run *live* over it. Instead (Approach A): at connect, mirror the
+// daemon's per-instance store files into a fresh local **staging** dir and run an ordinary
+// [`RedbFileStore`] there (fast local random access, a real local lock); after each flush,
+// upload our own staged instance file back, and at clean exit delete the absorbed siblings
+// on the daemon. The staged local redb *is* the on-remote artifact — only whole-file bytes
+// cross the wire, and the daemon runs no shada logic.
+//
+// **Per-instance mirror.** The remote shada lives in a directory
+// `<state_dir>/remote[/ns/<NS>]/` holding the same `<pid>.<nanos>.<seq>.redb` per-instance
+// files as the local store — so the merge + carry-forward compaction model ports verbatim:
+// every session downloads + merges all siblings, uploads its own file, and at clean exit
+// removes the siblings it absorbed (`fs_remove`), keeping the remote dir bounded by live
+// sessions rather than total launches. Two concurrent remote sessions on the same workspace
+// each see the other's data (recency merge); cross-machine liveness can't be detected, so a
+// live sibling may be transiently removed and re-uploaded — harmless, like the local model's
+// crash-redundancy. `--shada-namespace` isolates a project's remote shada under `ns/<NS>/`,
+// mirroring the local layout. The dir is a sibling of (not inside) the daemon's own native
+// `shada_dir()`, and `read_dir` is non-recursive, so a daemon that also runs nxvim natively
+// never globs these as its own store files.
+
+/// The on-remote shada wiring for a `Remote`-config session: the daemon-side **directory**
+/// the staged store mirrors to, plus the sibling files downloaded at connect (so the
+/// clean-exit compaction can delete the ones it absorbed). Paired with the
+/// [`RedbFileStore`] [`prepare_remote_shada`] returns; the edit-host uploads the store's
+/// own [`current_path`](ShadaStore::current_path) file here after each flush.
+#[cfg(feature = "native")]
+pub struct RemoteShada {
+    /// The remote shada directory on the daemon (`<state_dir>/remote[/ns/<NS>]`).
+    pub remote_dir: String,
+    /// The sibling store filenames downloaded + absorbed at connect, deleted on the daemon
+    /// at clean-exit compaction (mirroring the local store's sibling deletion).
+    pub downloaded: Vec<String>,
+}
+
+/// The remote shada directory for `state_dir` + an optional `--shada-namespace`:
+/// `<state_dir>/remote` (global) or `<state_dir>/remote/ns/<NS>` (namespaced). A sibling of
+/// the daemon's native `shada_dir()` (= `state_dir`) and its `ns/<NS>` subdir, so the two
+/// never collide.
+#[cfg(feature = "native")]
+fn remote_shada_dir(state_dir: &str, namespace: Option<&str>) -> String {
+    let base = format!("{}/remote", state_dir.trim_end_matches('/'));
+    match namespace {
+        Some(ns) => format!("{base}/ns/{ns}"),
+        None => base,
+    }
+}
+
+/// A fresh per-process staging dir for a remote session's shada, cleared on entry so each
+/// connect starts clean (mirrors the remote-config cache): `$XDG_CACHE_HOME/nxvim/
+/// remote-shada/<pid>` (else `$HOME/.cache/…`, else a temp dir).
+#[cfg(feature = "native")]
+fn remote_shada_staging() -> std::io::Result<PathBuf> {
+    let base = if let Some(d) = std::env::var_os("XDG_CACHE_HOME") {
+        PathBuf::from(d)
+    } else if let Some(h) = std::env::var_os("HOME") {
+        PathBuf::from(h).join(".cache")
+    } else {
+        std::env::temp_dir()
+    };
+    let dir = base
+        .join("nxvim")
+        .join("remote-shada")
+        .join(std::process::id().to_string());
+    // Fresh every connect (a stale dir from a crashed prior pid-reuse can't leak in).
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir)?;
+    Ok(dir)
+}
+
+/// Prepare a `Remote`-config session's shada (Approach A, per-instance mirror): ensure the
+/// remote shada dir exists (`fs_mkdir`), download every sibling `.redb` store into a fresh
+/// local staging dir, then build a [`RedbFileStore`] there (which merges them on load).
+/// Returns the store (for [`ServerInit::shada`](crate::ServerInit::shada)) plus the
+/// [`RemoteShada`] sync target (for [`ServerInit::remote_shada`](crate::ServerInit::remote_shada)),
+/// recording the downloaded sibling names for clean-exit compaction. A download error is
+/// **loud** — the caller disables remote shada rather than risk a half-mirrored store.
+#[cfg(feature = "native")]
+pub async fn prepare_remote_shada(
+    host_fs: &dyn crate::HostFsAsync,
+    state_dir: &str,
+    namespace: Option<&str>,
+) -> std::io::Result<(Box<dyn ShadaStore + Send>, RemoteShada)> {
+    let remote_dir = remote_shada_dir(state_dir, namespace);
+    // Ensure the dir exists before listing/writing (`fs_write` doesn't create parents).
+    host_fs.mkdir(remote_dir.clone()).await?;
+    let staging = remote_shada_staging()?;
+    let mut downloaded = Vec::new();
+
+    // List the remote dir and mirror each sibling store file into staging under its own
+    // name, so `RedbFileStore::load` merges them exactly as it merges local siblings.
+    let entries = match host_fs.read(remote_dir.clone()).await? {
+        crate::FsRead::Dir { entries, .. } => entries,
+        // Just-created (or empty): no siblings yet — the first-ever session for this dir.
+        crate::FsRead::New => Vec::new(),
+        crate::FsRead::File(_, _) => {
+            return Err(std::io::Error::other(format!(
+                "remote shada dir {remote_dir:?} is a file, not a directory"
+            )));
+        }
+    };
+    for entry in entries {
+        if entry.is_dir || !entry.name.ends_with(".redb") {
+            continue;
+        }
+        let remote_file = format!("{remote_dir}/{}", entry.name);
+        match host_fs.read(remote_file).await? {
+            crate::FsRead::File(bytes, _) => {
+                std::fs::write(staging.join(&entry.name), bytes)?;
+                downloaded.push(entry.name);
+            }
+            // A sibling that vanished between the listing and the read (a concurrent
+            // session's compaction) is simply not mirrored — no error.
+            crate::FsRead::New => {}
+            crate::FsRead::Dir { .. } => {}
+        }
+    }
+
+    let store: Box<dyn ShadaStore + Send> = Box::new(RedbFileStore::new(staging));
+    Ok((
+        store,
+        RemoteShada {
+            remote_dir,
+            downloaded,
+        },
+    ))
+}
+
+/// Pick a session's shada store from its [`ConfigSource`](crate::ConfigSource) — the
+/// shared path both native clients take at connect, so the download-or-local decision
+/// lives in one place. `Remote` (with a daemon-reported `state_dir`) keeps shada on the
+/// daemon ([`prepare_remote_shada`]); a download error or a daemon that reported no
+/// `state_dir` falls back to `fallback_local` (never clobbering the daemon's copy with a
+/// fresh empty store). `Local` always uses `fallback_local`. Returns the store (for
+/// [`ServerInit::shada`](crate::ServerInit::shada)) and the optional remote sync target
+/// (for [`ServerInit::remote_shada`](crate::ServerInit::remote_shada)).
+#[cfg(feature = "native")]
+pub async fn resolve_session_shada(
+    host_fs: &dyn crate::HostFsAsync,
+    source: crate::ConfigSource,
+    state_dir: Option<&str>,
+    namespace: Option<&str>,
+    fallback_local: Box<dyn ShadaStore + Send>,
+) -> (Box<dyn ShadaStore + Send>, Option<RemoteShada>) {
+    match (source, state_dir) {
+        (crate::ConfigSource::Remote, Some(dir)) => {
+            match prepare_remote_shada(host_fs, dir, namespace).await {
+                Ok((store, rs)) => (store, Some(rs)),
+                Err(e) => {
+                    eprintln!("nxvim: remote shada unavailable ({e}); using local shada");
+                    (fallback_local, None)
+                }
+            }
+        }
+        (crate::ConfigSource::Remote, None) => {
+            eprintln!("nxvim: daemon reported no shada dir; using local shada");
+            (fallback_local, None)
+        }
+        (crate::ConfigSource::Local, _) => (fallback_local, None),
+    }
 }

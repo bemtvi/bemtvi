@@ -14,10 +14,11 @@
 //!   the local disk. It spawns that daemon (this same binary in `--daemon` mode by
 //!   default, or whatever `NXVIM_DAEMON_CMD` names — e.g. `ssh host nxvim --daemon`),
 //!   wraps the child's stdio in [`nxvim_server::connect_daemon`], and injects the
-//!   resulting seams into [`ServerInit`]. Config (init.lua, plugins, runtimepath) is
-//!   **fetched from the daemon** (`config_bundle`) and materialized onto a local cache,
-//!   so the session runs the *remote's* config + plugins locally; the keystroke path
-//!   stays local; only I/O crosses the wire.
+//!   resulting seams into [`ServerInit`]. By default the session runs the **local**
+//!   config (only I/O crosses the wire); `--remote-config` instead **fetches** the
+//!   daemon's config + plugins (`config_bundle`, materialized onto a local cache), so the
+//!   session runs the *remote's* config. (A later phase ties shada to the same choice;
+//!   for now shada stays local in both.) Either way the keystroke path stays local.
 //!
 //! The default and `--connect-daemon` roles both run [`nxvim_server::run`] — a full
 //! local editor over an in-process duplex; `--connect-daemon` only differs by pointing
@@ -33,13 +34,13 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::process::Stdio;
 
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, bail, Result};
 use clap::Parser;
 
 mod test_runner;
 use nxvim_server::{
     bind_quic_listener, connect_daemon, connect_quic, mint_token, run as run_server,
-    run_daemon_io as run_server_daemon_io, serve_quic, DaemonClient, ServerInit,
+    run_daemon_io as run_server_daemon_io, serve_quic, ConfigSource, DaemonClient, ServerInit,
 };
 
 /// The shada-namespace options derived from the command line. nxvim itself never reads
@@ -77,6 +78,12 @@ impl ShadaOpts {
 
     fn store(&self) -> Box<dyn nxvim_server::ShadaStore + Send> {
         nxvim_server::workspace_shada(self.namespace.as_deref())
+    }
+
+    /// The `--shada-namespace` value, so a `Remote`-config session isolates its on-daemon
+    /// shada under `ns/<NS>/` the same way the local store does.
+    fn namespace(&self) -> Option<&str> {
+        self.namespace.as_deref()
     }
 
     /// A namespaced launch captures the session; the global store never does.
@@ -249,6 +256,11 @@ struct Cli {
     #[arg(long)]
     daemon: bool,
 
+    /// When connecting to a daemon, run the daemon's config + plugins instead of the
+    /// local config (default: local config)
+    #[arg(long)]
+    remote_config: bool,
+
     /// With --daemon, bind a QUIC listener at [ADDR] (default 127.0.0.1:8765) instead of using stdio
     #[arg(long, value_name = "ADDR", num_args = 0..=1, requires = "daemon")]
     listen: Option<Option<SocketAddr>>,
@@ -344,17 +356,30 @@ fn main() -> Result<()> {
         return run_lua_oneshot(code);
     }
 
+    // Which config (+ shada) a daemon session runs: the local machine's by default, or
+    // the daemon's with `--remote-config`. `--remote-config` is meaningless without a
+    // connect target — reject it loudly rather than silently ignore it (the TUI has no
+    // live `:connect`, so a connect target must be on the command line).
+    let config_source = if cli.remote_config {
+        ConfigSource::Remote
+    } else {
+        ConfigSource::Local
+    };
+    if cli.remote_config && connect_uri.is_none() && !cli.connect_daemon {
+        bail!("--remote-config only applies when connecting to a daemon (--connect-daemon or a nxvim://… target)");
+    }
+
     // Edit-host split, local half, over QUIC: a `nxvim://…` target (with or without the
     // `--connect-daemon` flag) connects to a `--daemon --listen` listener and routes
     // fs/process/watch/LSP to it. Checked before the stdio-child split below.
     if let Some(uri) = connect_uri {
-        return run_with_daemon_quic(file, &uri, shada);
+        return run_with_daemon_quic(file, &uri, shada, config_source);
     }
 
     // Edit-host split, local half, over stdio: the default editor + UI, but spawning a
     // `--daemon` child and routing fs/process/watch/LSP to it over stdio pipes.
     if cli.connect_daemon {
-        return run_with_daemon(file, shada);
+        return run_with_daemon(file, shada, config_source);
     }
 
     // In-process, bidirectional transport between client and server.
@@ -371,6 +396,8 @@ fn main() -> Result<()> {
         // `--shada-namespace` is given. Editor state lives where the editor runs, so the
         // edit-host split persists locally (only fs/proc cross to the daemon).
         shada: Some(shada.store()),
+        // A local (embedded) session never syncs shada to a daemon.
+        remote_shada: None,
         // A namespaced launch also captures the editor session (open files + exact
         // layout); `--restore-session` reapplies it at boot.
         workspace_session: shada.capture(),
@@ -514,8 +541,12 @@ fn daemon_command() -> Result<tokio::process::Command> {
 /// daemon (its stdio *is* the wire), wraps it in [`connect_daemon`], and runs the editor
 /// against those seams. The daemon's stderr is redirected to a temp log (it can't corrupt
 /// the TUI); `tail` it to debug the daemon. `kill_on_drop` reaps the child on quit.
-fn run_with_daemon(file: Option<String>, shada: ShadaOpts) -> Result<()> {
-    run_edit_host_session(file, shada, || {
+fn run_with_daemon(
+    file: Option<String>,
+    shada: ShadaOpts,
+    config_source: ConfigSource,
+) -> Result<()> {
+    run_edit_host_session(file, shada, config_source, || {
         // The daemon's stderr can't share the terminal with the TUI; send it to a
         // log the user can tail to diagnose the daemon side.
         let log_path = std::env::temp_dir().join("nxvim-daemon.log");
@@ -544,9 +575,14 @@ fn run_with_daemon(file: Option<String>, shada: ShadaOpts) -> Result<()> {
 /// only the transport differs — [`connect_quic`] pins the daemon's cert TOFU and presents
 /// the bearer token, then returns the same five seams. The QUIC endpoint + connection are
 /// owned by `connect_quic`'s link thread, so there is no child to hold.
-fn run_with_daemon_quic(file: Option<String>, uri: &str, shada: ShadaOpts) -> Result<()> {
+fn run_with_daemon_quic(
+    file: Option<String>,
+    uri: &str,
+    shada: ShadaOpts,
+    config_source: ConfigSource,
+) -> Result<()> {
     let (url, cert_hash, token) = parse_connect_uri(uri)?;
-    run_edit_host_session(file, shada, move || {
+    run_edit_host_session(file, shada, config_source, move || {
         let client = connect_quic(&url, &cert_hash, &token)?;
         Ok((client, Box::new(())))
     })
@@ -559,7 +595,12 @@ fn run_with_daemon_quic(file: Option<String>, uri: &str, shada: ShadaOpts) -> Re
 /// stdio child, so `kill_on_drop` reaps it on quit; `()` for QUIC). Config + plugins
 /// are fetched from the daemon and materialized locally (so the session runs the
 /// remote's config); the keystroke path stays local; fs/process/watch/LSP cross the wire.
-fn run_edit_host_session<F>(file: Option<String>, shada: ShadaOpts, connect: F) -> Result<()>
+fn run_edit_host_session<F>(
+    file: Option<String>,
+    shada: ShadaOpts,
+    config_source: ConfigSource,
+    connect: F,
+) -> Result<()>
 where
     F: FnOnce() -> Result<(DaemonClient, Box<dyn std::any::Any + Send>)> + Send + 'static,
 {
@@ -573,36 +614,42 @@ where
             .expect("failed to build server runtime");
         let result: Result<()> = runtime.block_on(async move {
             let (client, _guard) = connect()?;
-            // Config + plugins come from the *daemon*: fetch its config surface over the
-            // wire (one `config_bundle` round trip) and materialize it onto a local
-            // per-process cache, then point `config_dir`/`runtimepath` at that copy. The
-            // editor then loads the remote's config + plugins locally — Lua's synchronous
-            // `require`/runtimepath can't await the daemon, so the files must be local.
-            // A broken daemon link or an unstageable cache is loud (the session can't run
-            // a config it couldn't fetch), not a silent fall back to no config.
-            let bundle =
-                client.config.fetch().await.map_err(|e| {
-                    anyhow!("could not fetch the remote config from the daemon: {e}")
-                })?;
-            // The daemon's installed tree-sitter parsers — compiled locally on demand
-            // (lazily, per filetype; parsers are native, never fetched). Captured before
-            // `bundle` is consumed.
-            let ts_autoinstall = bundle.ts_languages.clone();
-            // The daemon's cwd seeds `DirState` so `:pwd`/`:cd`/`getcwd` operate on the
-            // remote dir, not this local process's (`docs/plans/2026-06-23-remote-cwd.md`).
-            let remote_cwd = bundle.cwd.clone().map(PathBuf::from);
-            let (config_dir, runtimepath) = nxvim_server::materialize_remote_config(bundle)
-                .map_err(|e| anyhow!("could not materialize the remote config locally: {e}"))?;
+            // Resolve the session's config from the chosen source. `Remote`
+            // (`--remote-config`) fetches the daemon's config surface (one `config_bundle`
+            // round trip) and materializes it onto a local per-process cache, then points
+            // `config_dir`/`runtimepath` at that copy — the editor loads the remote's
+            // config + plugins locally (Lua's synchronous `require`/runtimepath can't await
+            // the daemon, so the files must be local). `Local` (the default) runs this
+            // machine's own config and fetches only the daemon's cwd / parser set. Either
+            // way the cwd seeds `DirState` so `:pwd`/`:cd`/`getcwd` operate on the daemon's
+            // dir (`docs/plans/2026-06-23-remote-cwd.md`), and tree-sitter parsers are
+            // compiled locally on demand. A broken link or an unstageable cache is loud
+            // (the session can't run a config it couldn't resolve), not a silent fall back.
+            let resolved = client.config.resolve(config_source).await.map_err(|e| {
+                anyhow!("could not resolve the session config from the daemon: {e}")
+            })?;
+            // Shada follows the config source. `Remote` keeps it on the daemon (Approach
+            // A): download its store into a local staging dir now (before `client.host_fs`
+            // is moved below) and sync it back after each flush. A download error disables
+            // remote shada — fall back to the local store rather than risk clobbering the
+            // daemon's copy with a fresh empty one. `Local` uses the local store as before
+            // (the `--shada-namespace` workspace store + session).
+            let (shada_store, remote_shada) = nxvim_server::resolve_session_shada(
+                &client.host_fs,
+                config_source,
+                resolved.state_dir.as_deref(),
+                shada.namespace(),
+                shada.store(),
+            )
+            .await;
             let init = ServerInit {
                 file,
-                config_dir,
-                // Editor + Lua run locally in a daemon session (the config is fetched
-                // from the daemon but executed here), so shada is local too — including
-                // the `--shada-namespace` workspace store + session.
-                shada: Some(shada.store()),
+                config_dir: resolved.config_dir,
+                shada: Some(shada_store),
+                remote_shada,
                 workspace_session: shada.capture(),
                 restore_session: shada.do_restore(),
-                runtimepath,
+                runtimepath: resolved.runtimepath,
                 clipboard: nxvim_server::ClipboardProvider::System,
                 mouse_clock: None,
                 // The local disk is unused for buffers in a daemon session — every
@@ -618,9 +665,9 @@ where
                 offer_default_recommended: true,
                 cmdline_complete_default: true,
                 // Mirror the daemon's installed tree-sitter parsers locally.
-                ts_autoinstall,
+                ts_autoinstall: resolved.ts_autoinstall,
                 // Seed the working directory from the daemon (remote-cwd).
-                remote_cwd,
+                remote_cwd: resolved.remote_cwd,
             };
             // `_guard` (the stdio child, or `()` for QUIC) lives until the editor quits.
             run_server(server_end, init).await

@@ -43,6 +43,10 @@ pub struct RemoteConfigBundle {
     /// daemon couldn't read it (or an older peer omitted it) — the edit-host keeps its
     /// own local cwd.
     pub cwd: Option<String>,
+    /// The daemon's shada base dir, where a `Remote`-config session stages + syncs its
+    /// shada over the fs seam. `None` when an older peer omitted it — remote shada is
+    /// then unavailable (the session falls back to local shada).
+    pub state_dir: Option<String>,
 }
 
 /// Decode a `config_bundle` reply (the inverse of the daemon's `encode_config_bundle`):
@@ -108,12 +112,19 @@ pub fn decode_config_bundle(v: Value) -> Result<RemoteConfigBundle, String> {
         None | Some(Value::Nil) => None,
         Some(v) => Some(v.as_str().ok_or_else(|| bad("cwd"))?.to_owned()),
     };
+    // The daemon's shada base dir; absent (an older peer) decodes as `None` (no remote
+    // shada — the session falls back to local shada).
+    let state_dir = match it.next() {
+        None | Some(Value::Nil) => None,
+        Some(v) => Some(v.as_str().ok_or_else(|| bad("state_dir"))?.to_owned()),
+    };
     Ok(RemoteConfigBundle {
         config_dir,
         runtimepath,
         files,
         ts_languages,
         cwd,
+        state_dir,
     })
 }
 

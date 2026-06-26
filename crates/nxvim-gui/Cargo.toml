@@ -16,6 +16,9 @@ path = "src/main.rs"
 
 [dependencies]
 anyhow.workspace = true
+# Real CLI parsing (derive), matching the `nxvim` (TUI) binary: `--help`/`--version`,
+# unknown-flag rejection, and typed values come for free instead of hand-rolled scanning.
+clap.workspace = true
 rmpv.workspace = true
 tokio.workspace = true
 winit.workspace = true

@@ -11,14 +11,27 @@
 use nxvim_rpc::{Incoming, Rpc};
 use nxvim_server::ServerInit;
 use nxvim_test_harness::{
-    cursor, drain_to_latest_redraw, exec_lua, feed, lines, lua_u64, map_get, mode, start_attached,
-    write_temp,
+    attach, cursor, drain_to_latest_redraw, exec_lua, feed, feed_mouse_at, lines, lua_u64, map_get,
+    mode, spawn, start_attached, write_temp, TestClock,
 };
 use rmpv::Value;
 use tokio::sync::mpsc::UnboundedReceiver;
 
 async fn start() -> (Rpc, UnboundedReceiver<Incoming>) {
     start_attached(ServerInit::default(), 80, 24).await
+}
+
+/// Like [`start`], but inject a fake mouse clock so a deterministic double-click can be
+/// driven (two presses inside `'mousetime'`). The incoming channel must be kept alive.
+async fn start_clocked() -> (Rpc, TestClock, UnboundedReceiver<Incoming>) {
+    let clock = TestClock::new();
+    let init = ServerInit {
+        mouse_clock: Some(clock.handle()),
+        ..Default::default()
+    };
+    let (rpc, incoming) = spawn(init);
+    attach(&rpc, 80, 24).await;
+    (rpc, clock, incoming)
 }
 
 /// Feed `keys`, then a `nvim_get_mode` barrier so the input is fully processed
@@ -551,6 +564,34 @@ async fn view_on_select_fires_with_line_and_userdata() {
         picked.as_str(),
         Some("2/B"),
         "on_select got the 1-based line and its userdata"
+    );
+}
+
+/// A double-click is the mouse form of `<CR>`: the first press positions the cursor on
+/// the clicked row, and `<2-LeftMouse>` (installed as a view default) confirms it, so
+/// `:on_select` fires for that row with no plugin-side mouse wiring.
+#[tokio::test]
+async fn view_double_click_fires_on_select() {
+    let (rpc, clock, _incoming) = start_clocked().await;
+    exec_lua(
+        &rpc,
+        r#"vw = nx.view.create{}
+           vw:set_lines{ "alpha", "beta", "gamma" }
+           vw:set_userdata{ "A", "B", "C" }
+           vw:on_select(function(line, ud) _G.picked = line .. "/" .. tostring(ud) end)
+           vw:mount{ dock = "left", size = 20 }"#,
+    )
+    .await;
+    // Two left-presses within `'mousetime'` on the left dock's second row (line 2,
+    // "beta") — a double-click. Col 2 is inside the text body.
+    feed_mouse_at(&rpc, &clock, 0, "left", "press", 1, 2);
+    feed_mouse_at(&rpc, &clock, 100, "left", "press", 1, 2);
+    rpc.request("nvim_get_mode", vec![]).await.expect("barrier");
+    let picked = exec_lua(&rpc, "return _G.picked").await;
+    assert_eq!(
+        picked.as_str(),
+        Some("2/B"),
+        "the double-click confirmed the clicked row, firing on_select"
     );
 }
 

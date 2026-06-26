@@ -31,20 +31,30 @@ nx.view.actions.confirm = function()
 end
 
 -- nx._install_view_keymaps(buf) — install the view's buffer-local default activation
--- map. Called by the server right after the view's backing buffer is created (the
+-- maps. Called by the server right after the view's backing buffer is created (the
 -- bufnr is known synchronously in core, ahead of the next-tick `nx._view_buf`
 -- mirror), so the `<CR>` → `on_select` map exists immediately. `default = true` lets a
--- plugin override `<CR>` with its own `{ buffer = buf }` map. A view is an ordinary
--- `nomodifiable` buffer otherwise, so this is its only special key. (The explorer /
+-- plugin override either map with its own `{ buffer = buf }` map. A view is an ordinary
+-- `nomodifiable` buffer otherwise, so these are its only special keys. (The explorer /
 -- quickfix install their maps off a `FileType` autocmd instead — see
 -- prelude/keymap.lua — but a view's filetype is content-semantic and it may never be
 -- the current buffer when `FileType` would fire, so it installs at create time.)
+--
+-- `<2-LeftMouse>` is the mouse form of `<CR>`: a single left-click positions the cursor
+-- on a row (core dock/window mouse handling) and the double-click confirms it, so every
+-- view is clickable for free — a plugin needn't wire the mouse itself.
 function nx._install_view_keymaps(buf)
   nx.keymap.set(
     "n",
     "<CR>",
     nx.view.actions.confirm,
     { buffer = buf, default = true, desc = "Select entry" }
+  )
+  nx.keymap.set(
+    "n",
+    "<2-LeftMouse>",
+    nx.view.actions.confirm,
+    { buffer = buf, default = true, desc = "Select entry (double-click)" }
   )
 end
 

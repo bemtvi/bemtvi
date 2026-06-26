@@ -2284,9 +2284,13 @@
       // The docs sidebar (cmdline-completion Phase 3 / insert-completion docs): a
       // separate bordered float beside the box with the highlighted row's docs. The
       // server placed it (right of the box, flipping left for room) and bottom-aligned
-      // it; geometry is text-area-absolute (the same `rect`-relative convention the box
-      // uses), so it renders directly — the wildmenu is text-area-placed here, not
-      // grown from a `cmd_area` like the cell-grid clients.
+      // it. Its geometry is WINDOWS-AREA-absolute (already baking in the focused
+      // window rect + gutter, see `project_complete_docs`), so the client offsets it
+      // by the windows-area origin — the region origin `o`, which carries any dock
+      // band — exactly like the popup box. Adding `rect.x`/gutter again would
+      // double-count and slide the sidebar off under a left dock. The cmdline wildmenu
+      // is the exception: its `col` is a GLOBAL command-line column (the line spans the
+      // full width), so it keeps the command-line frame (`rect.x` + tabline rows).
       if (menu.docs) {
         const d = menu.docs;
         // The docs float themes from its own groups (`CmpDocumentation` /
@@ -2295,8 +2299,10 @@
         const sDoc = mst("doc"), sDocBorder = mst("doc_border");
         const docBg = sDoc && cssColor(sDoc.bg), docFg = sDoc && cssColor(sDoc.fg);
         const docBorderCss = sDocBorder && cssColor(sDocBorder.fg);
+        const docBaseX = menu.cmdline ? rect.x : o.x;
+        const docBaseY = menu.cmdline ? tablineRows + rect.y : o.y;
         const { cx: dcx, cy: dcy } = popupChrome(
-          rect.x + d.col, tablineRows + rect.y + d.row + cmdShift, d.width, d.height,
+          docBaseX + d.col, docBaseY + d.row + cmdShift, d.width, d.height,
           { bg: docBg || undefined, borderColor: docBorderCss || undefined });
         const docBox = document.createElement("div");
         docBox.className = "pmenu-doc";

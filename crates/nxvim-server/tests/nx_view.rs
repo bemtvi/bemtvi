@@ -595,6 +595,78 @@ async fn view_double_click_fires_on_select() {
     );
 }
 
+/// After navigating up, replacing the content and `set_cursor`-ing to the new last line
+/// lands the cursor there (the REPL "append output, keep cursor at the bottom" pattern —
+/// `set_lines` followed by `set_cursor` in the same batch must not leave the cursor where
+/// navigation parked it).
+#[tokio::test]
+async fn view_set_cursor_after_set_lines_lands_on_the_new_last_line() {
+    let (rpc, _incoming) = start().await;
+    // Mount EMPTY first, then fill — the repl's actual order (open → render).
+    exec_lua(
+        &rpc,
+        r#"vw = nx.view.create{}
+           vw:mount{ dock = "bottom", size = 10 }
+           vw:set_lines{ "a", "b", "c", "d", "e", "f", "g", "h" }
+           vw:set_cursor(8)"#,
+    )
+    .await;
+    feed_sync(&rpc, "gg").await; // park the cursor at the top
+    assert_eq!(cursor(&rpc).await, (1, 0), "gg parked at the top");
+    // Append two lines and ask to keep the cursor on the newest (the repl render).
+    exec_lua(
+        &rpc,
+        r#"vw:set_lines{ "a","b","c","d","e","f","g","h","> 1+1","  ok" }
+           vw:set_cursor(10)"#,
+    )
+    .await;
+    assert_eq!(
+        cursor(&rpc).await,
+        (10, 0),
+        "set_cursor landed on the new last line, not where gg parked it"
+    );
+}
+
+/// `set_cursor` self-heals a drifted dock: if the view's dock window was swapped to a
+/// different buffer (e.g. the dock reused across sessions while the view kept its mount),
+/// `set_cursor` re-shows the view's buffer and positions in it — not on whatever else the
+/// dock drifted to. Regression test for the nxvim-dap REPL "cursor jumps up after pressing
+/// enter" bug.
+#[tokio::test]
+async fn view_set_cursor_reshows_a_drifted_dock_buffer() {
+    let (rpc, _incoming) = start().await;
+    exec_lua(
+        &rpc,
+        r#"vw = nx.view.create{}
+           vw:set_lines{ "one", "two", "three", "four", "five" }
+           vw:mount{ dock = "bottom", size = 10 }"#,
+    )
+    .await;
+    // Drift the dock: open a different (empty) buffer in its window, so the bottom dock no
+    // longer shows the view — though the view still believes it is mounted there.
+    feed_sync(&rpc, ":enew<CR>").await;
+    let drifted = exec_lua(&rpc, "return vim.api.nvim_get_current_buf() ~= vw:bufnr()").await;
+    assert_eq!(
+        drifted,
+        Value::Boolean(true),
+        "the dock drifted off the view"
+    );
+
+    // set_cursor must bring the view back and land in it, not position the drifted buffer.
+    exec_lua(&rpc, "vw:set_cursor(4)").await;
+    let on_view = exec_lua(&rpc, "return vim.api.nvim_get_current_buf() == vw:bufnr()").await;
+    assert_eq!(
+        on_view,
+        Value::Boolean(true),
+        "set_cursor re-showed the view"
+    );
+    assert_eq!(
+        cursor(&rpc).await,
+        (4, 0),
+        "set_cursor landed on the requested line of the view"
+    );
+}
+
 /// Navigation keys move the cursor within the view (and stay clamped to it).
 #[tokio::test]
 async fn view_navigation_moves_the_cursor() {

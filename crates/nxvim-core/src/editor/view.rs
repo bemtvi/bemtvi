@@ -300,12 +300,24 @@ impl Editor {
     /// cursor *write* for a view, whose cursor is otherwise plain normal-mode motion. A
     /// no-op for an unknown / unmounted id (nothing to focus or position).
     pub fn set_view_cursor(&mut self, id: u64, line1: usize) {
+        let Some(buf) = self.view_buffer(id) else {
+            return;
+        };
         if self.views.get(&id).and_then(|v| v.mount.as_ref()).is_none() {
             return;
         }
         self.focus_view(id);
-        // `focus_view` made the view's window current, so `self.cursor` / `last_line`
-        // now address the view buffer.
+        // `focus_view` focuses the view's *layer*, but a dock's focused window can have
+        // drifted to a different buffer (e.g. the dock was reused across sessions while
+        // the view kept its mount), which would point `self.cursor` at the wrong window.
+        // Re-assert the view's buffer in the focused window so the position always lands
+        // on the view itself — never silently on whatever else the dock was showing.
+        if self.cur_buffer() != buf {
+            let win = self.current_window_id();
+            self.set_window_buffer(win, buf);
+        }
+        // The focused window now addresses the view buffer, so `self.cursor` / `last_line`
+        // do too.
         self.cursor.line = line1.saturating_sub(1).min(self.last_line());
         self.cursor.col = 0;
         self.desired_col = 0;

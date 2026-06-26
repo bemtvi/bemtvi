@@ -135,6 +135,157 @@ end
 
 vim.json = nx.json
 
+-- ----- nx.shada.plugin: opt-in isolated plugin storage ----------------------
+
+-- `nx.shada = nx.shada or {}` — the table is created natively (namespace /
+-- save_layout), but guard so this module never depends on load order.
+nx.shada = nx.shada or {}
+
+-- The basename of a path (its last `/`- or `\`-separated component, sans a trailing
+-- separator). The plugin's directory name is its assigned shada namespace.
+local function path_basename(p)
+  return (p:gsub("[/\\]+$", ""):match("[^/\\]+$"))
+end
+
+-- The source path of the chunk that called into us: walk up the stack to the nearest
+-- file-named frame. nxvim sources every config / plugin / `require`d file with an
+-- `@<path>` chunk name, while the embedded prelude chunks (this file included) are
+-- named `nxvim:prelude/*` with no `@`, and C frames carry `=[C]` — so the first
+-- `@`-prefixed source above this function is the chunk that called us. `nil` only
+-- when nothing on the stack is `@`-named. (A bare `:lua` / RPC `exec_lua` / test chunk
+-- IS `@`-named — mlua labels it after its Rust call site, e.g. `@crates/…` — but that
+-- path is under no runtimepath entry, so `assign_namespace` returns nil for it and the
+-- caller treats it as a no-identity context.)
+local function caller_source()
+  for lvl = 2, 40 do
+    local info = debug.getinfo(lvl, "S")
+    if not info then
+      break
+    end
+    if info.source:sub(1, 1) == "@" then
+      return info.source:sub(2)
+    end
+  end
+  return nil
+end
+
+-- Assign a namespace to a caller `src` by attributing it to the runtimepath entry
+-- (plugin root) that contains it — the longest matching prefix wins, so a plugin dir
+-- nested under a broader rtp entry attributes to the plugin, not the parent. Then,
+-- in order: a plugin LOADED BY THE MANAGER (`nx.plugins`) keys on the canonical name
+-- the manager registered (which a `name = …` spec can set apart from the directory
+-- basename); the user's own config root maps to the reserved `user`; otherwise the
+-- namespace is the directory's basename (e.g. `nvim-tree`) — the fallback for a
+-- plugin loaded outside the manager. `nil` when `src` is under no runtimepath entry.
+local function assign_namespace(src)
+  local best
+  for _, dir in ipairs(nx._runtime_paths()) do
+    if src == dir or src:sub(1, #dir + 1) == dir .. "/" then
+      if not best or #dir > #best then
+        best = dir
+      end
+    end
+  end
+  if not best then
+    return nil
+  end
+  -- Manager-registered name wins (tightest identity).
+  local managed = nx.plugins and nx.plugins._namespace_for and nx.plugins._namespace_for(best)
+  if managed then
+    return managed
+  end
+  -- The user's config root is a runtimepath entry too; map it to the reserved `user`
+  -- namespace rather than its (machine-specific) directory name. Compare with trailing
+  -- separators trimmed so `…/nxvim` and `…/nxvim/` match.
+  local trim = function(p)
+    return (p:gsub("[/\\]+$", ""))
+  end
+  local config = vim.fn and vim.fn.stdpath and vim.fn.stdpath("config")
+  if config and trim(best) == trim(config) then
+    return "user"
+  end
+  return path_basename(best)
+end
+
+-- `nx.shada.plugin()` -> an isolated, cross-session key/value store for the calling
+-- plugin. The handle persists into the *current* shada store (global, workspace, or
+-- remote — whichever this session uses), walled off from the core registers / marks
+-- / history and keyed apart from every other plugin's namespace.
+--
+-- The namespace is **assigned, not chosen**: it is derived from where the calling
+-- code lives (its runtimepath / plugin directory), so a plugin can persist its own
+-- data and can never name — and so never read or clobber — another plugin's slice.
+-- Calling it from anywhere in a plugin's files resolves to that one plugin's
+-- namespace. Code in the user's config maps to the reserved `user` namespace.
+--
+-- It is the plugin's opt-in: only a plugin that calls this gets shada storage.
+-- Values may be any JSON-able Lua value (table / string / number / boolean); `get`
+-- returns a fresh copy. Persistence rides the ordinary shada cadence (the debounced
+-- checkpoint + the clean-exit flush); with shada disabled the store still works in
+-- memory for the session but isn't written, exactly like registers and marks.
+--
+--   local store = nx.shada.plugin()       -- no argument: namespace is assigned
+--   store:set("recent", { "a.txt", "b.txt" })
+--   local recent = store:get("recent")    -- the table back, or nil
+--   store:delete("recent")
+--   for _, k in ipairs(store:keys()) do … end
+--   store:clear()
+--
+-- `dev_namespace` is an escape hatch ONLY for a context whose code attributes to no
+-- runtimepath entry — a bare `:lua`, an RPC `exec_lua`, a test — where the namespace
+-- can't be derived, so an explicit one is required. Passing it from a real
+-- plugin/config file (one that DOES attribute) is an error: the namespace there is
+-- always the assigned one.
+function nx.shada.plugin(dev_namespace)
+  -- Attribute the caller's source to its runtimepath entry. `nil` for a context with
+  -- no attributable script (REPL / exec / test, or code outside every rtp entry).
+  local src = caller_source()
+  local assigned = src and assign_namespace(src) or nil
+  local namespace
+  if assigned then
+    if dev_namespace ~= nil then
+      error(
+        "nx.shada.plugin: the namespace is assigned from the plugin's location; "
+          .. "drop the argument",
+        2
+      )
+    end
+    namespace = assigned
+  else
+    if type(dev_namespace) ~= "string" or dev_namespace == "" then
+      error(
+        "nx.shada.plugin: this caller attributes to no plugin (a bare :lua / RPC / "
+          .. "test); pass an explicit namespace, or call it from a plugin file",
+        2
+      )
+    end
+    namespace = dev_namespace
+  end
+  return {
+    namespace = namespace,
+    -- store:set(key, value) — persist `value` (any JSON-able Lua value) under `key`.
+    set = function(_, key, value)
+      nx._shada_plugin_set(namespace, tostring(key), value)
+    end,
+    -- store:get(key) -> the stored value, or nil.
+    get = function(_, key)
+      return nx._shada_plugin_get(namespace, tostring(key))
+    end,
+    -- store:delete(key) — drop one key.
+    delete = function(_, key)
+      nx._shada_plugin_delete(namespace, tostring(key))
+    end,
+    -- store:keys() -> a sorted list of the stored keys.
+    keys = function(_)
+      return nx._shada_plugin_keys(namespace)
+    end,
+    -- store:clear() — drop every key in this namespace.
+    clear = function(_)
+      nx._shada_plugin_clear(namespace)
+    end,
+  }
+end
+
 -- ----- table / list / string helpers ----------------------------------------
 
 -- `nx.tbl.*` / `nx.list.*` are the canonical table/list helper namespaces; the

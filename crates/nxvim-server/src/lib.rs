@@ -164,8 +164,8 @@ use lsp::{
     ServerRuntime,
 };
 use nxvim_core::{
-    BufferId, Editor, FileStat, HostFs, Key, Mode, PendingSave, ShadaRequest, StdHostFs, TabId,
-    WindowId,
+    BufferId, Editor, FileStat, HostFs, Key, Mode, PendingSave, PluginEntry, PluginNamespace,
+    ShadaRequest, StdHostFs, TabId, WindowId,
 };
 #[cfg(feature = "native")]
 use nxvim_lsp::LspManager;
@@ -2032,6 +2032,36 @@ pub(crate) fn is_shada_flush_timer(event: &LoopEvent) -> bool {
     matches!(event, LoopEvent::Timer { id, .. } if *id == SHADA_FLUSH_TIMER_ID)
 }
 
+/// Convert the Lua runtime's plugin-shada tuples (`namespace -> [(key, value)…]`)
+/// into the [`PersistState`] carrier types for a flush. The runtime trades plain
+/// tuples because `nxvim-lua` doesn't depend on `nxvim-core`; this is the single
+/// seam that names both.
+fn tuples_to_plugin_shada(data: Vec<(String, Vec<(String, String)>)>) -> Vec<PluginNamespace> {
+    data.into_iter()
+        .map(|(namespace, entries)| PluginNamespace {
+            namespace,
+            entries: entries
+                .into_iter()
+                .map(|(key, value)| PluginEntry { key, value })
+                .collect(),
+        })
+        .collect()
+}
+
+/// The inverse of [`tuples_to_plugin_shada`]: a loaded [`PersistState`]'s plugin
+/// data back into the runtime's tuple shape for [`LuaRuntime::plugin_shada_seed`] /
+/// [`LuaRuntime::plugin_shada_merge`](nxvim_lua::LuaRuntime::plugin_shada_merge).
+fn plugin_shada_to_tuples(data: Vec<PluginNamespace>) -> Vec<(String, Vec<(String, String)>)> {
+    data.into_iter()
+        .map(|ns| {
+            (
+                ns.namespace,
+                ns.entries.into_iter().map(|e| (e.key, e.value)).collect(),
+            )
+        })
+        .collect()
+}
+
 /// The on-daemon shada sync handle for a `Remote`-config session (Approach A, per-instance
 /// mirror): the daemon fs seam, the remote shada **directory**, and the sibling filenames
 /// downloaded at connect (deleted on the daemon at clean-exit compaction). The session
@@ -2084,7 +2114,13 @@ impl EditHost {
                 // only when `--restore-session` asked for it — a `:rshada` re-read must
                 // not re-spawn windows, and a plain namespaced launch must not rearrange.
                 let session = state.session.take();
+                // Plugin data lives in the Lua runtime, not the editor model — pull it
+                // out (like the session) and seed the opted-in plugins' stores, so a
+                // plugin's `get` returns last session's value on first read.
+                let plugin_data = std::mem::take(&mut state.plugin_data);
                 self.editor.import_persist(state);
+                self.lua
+                    .plugin_shada_seed(plugin_shada_to_tuples(plugin_data));
                 if self.restore_session {
                     if let Some(session) = session {
                         self.editor.restore_session(session);
@@ -2146,6 +2182,7 @@ impl EditHost {
         if self.workspace_session && self.lua.session_save_layout() {
             snap.session = self.editor.export_session();
         }
+        snap.plugin_data = tuples_to_plugin_shada(self.lua.plugin_shada_export());
         let mut flushed = false;
         if let Some(store) = self.shada.as_mut() {
             // A live checkpoint never compacts: deleting an absorbed sibling while we
@@ -2172,6 +2209,7 @@ impl EditHost {
         if self.workspace_session && self.lua.session_save_layout() {
             snap.session = self.editor.export_session();
         }
+        snap.plugin_data = tuples_to_plugin_shada(self.lua.plugin_shada_export());
         if let Some(store) = self.shada.as_mut() {
             // The clean exit: compact (delete the siblings absorbed at load) *after*
             // this final snapshot — which folds in their data — is durable.
@@ -2285,6 +2323,7 @@ impl EditHost {
         }
         let mut snap = self.editor.export_persist();
         snap.exit_cursor = None;
+        snap.plugin_data = tuples_to_plugin_shada(self.lua.plugin_shada_export());
         // `:wshada` is not an exit — don't compact (we're still live and locked).
         let result = self.shada.as_mut().unwrap().flush(&snap, false);
         if let Err(e) = result {
@@ -2303,7 +2342,15 @@ impl EditHost {
         }
         let result = self.shada.as_mut().unwrap().reload();
         match result {
-            Ok(state) => self.editor.apply_persist(state, replace),
+            Ok(mut state) => {
+                // Plugin data is the runtime's, not the editor's — merge it into the
+                // live stores (`replace` overwrites a conflicting live key, else fills
+                // only an unset one), mirroring `apply_persist`'s own rule.
+                let plugin_data = std::mem::take(&mut state.plugin_data);
+                self.editor.apply_persist(state, replace);
+                self.lua
+                    .plugin_shada_merge(plugin_shada_to_tuples(plugin_data), replace);
+            }
             Err(e) => self.editor.echo(format!("E: shada read failed: {e}")),
         }
     }

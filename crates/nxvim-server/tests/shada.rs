@@ -17,7 +17,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use nxvim_server::{is_store_file, PersistState, RedbFileStore, ServerInit, ShadaStore};
-use nxvim_test_harness::{cursor, feed, lines, start_attached, temp_dir, write_temp};
+use nxvim_test_harness::{cursor, exec_lua, feed, lines, start_attached, temp_dir, write_temp};
 use tokio::sync::mpsc::UnboundedReceiver;
 
 /// A server that persists into `dir` via the native redb store.
@@ -621,5 +621,201 @@ async fn no_store_means_no_persistence() {
         feed(&rpc, "\"ap");
         // Nothing pasted: register `a` is empty, so the buffer is unchanged.
         assert_eq!(lines(&rpc).await, vec![""]);
+    }
+}
+
+#[tokio::test]
+async fn plugin_namespace_survives_a_restart() {
+    // A plugin that opts in via `nx.shada.plugin()` keeps its own isolated key/value
+    // data across a restart. Driven over `exec_lua` (no source file on the stack), so
+    // the explicit dev-namespace argument is used here — a real plugin gets its
+    // namespace assigned from its location, covered by the test below.
+    let dir = temp_dir("shada_plugin");
+
+    // Session 1: an opted-in plugin stores a list + a number, then quits.
+    {
+        let (rpc, incoming) = start_attached(init_with_store(&dir, None), 80, 25).await;
+        let stored = exec_lua(
+            &rpc,
+            r#"
+            local s = nx.shada.plugin("demo")
+            s:set("recent", { "a.txt", "b.txt" })
+            s:set("count", 3)
+            return s:get("count")
+            "#,
+        )
+        .await;
+        // Read-back within the session works immediately (in-memory).
+        assert_eq!(stored.as_u64(), Some(3));
+        feed(&rpc, ":qa!<CR>");
+        await_server_exit(incoming).await;
+    }
+
+    // Session 2: a fresh server against the same store. The plugin gets its data
+    // back, and another namespace sees nothing of it (isolation).
+    {
+        let (rpc, _incoming) = start_attached(init_with_store(&dir, None), 80, 25).await;
+        let count = exec_lua(&rpc, r#"return nx.shada.plugin("demo"):get("count")"#).await;
+        assert_eq!(count.as_u64(), Some(3), "number survives the restart");
+
+        let recent = exec_lua(
+            &rpc,
+            r#"return nx.json.encode(nx.shada.plugin("demo"):get("recent"))"#,
+        )
+        .await;
+        assert_eq!(
+            recent.as_str(),
+            Some(r#"["a.txt","b.txt"]"#),
+            "the table value round-trips through JSON"
+        );
+
+        let keys = exec_lua(
+            &rpc,
+            r#"return table.concat(nx.shada.plugin("demo"):keys(), ",")"#,
+        )
+        .await;
+        assert_eq!(keys.as_str(), Some("count,recent"), "keys() is sorted");
+
+        // A different plugin namespace is empty — a plugin sees only its own slice.
+        let other = exec_lua(&rpc, r#"return nx.shada.plugin("other"):get("count")"#).await;
+        assert!(other.is_nil(), "another namespace can't read demo's data");
+    }
+}
+
+#[tokio::test]
+async fn plugin_namespace_is_assigned_from_location() {
+    // The namespace is derived from where the calling code lives (its runtimepath /
+    // plugin dir), not chosen by the plugin. We forge plugin files by loading chunks
+    // with an `@<abs-path>` name under a registered rtp entry — exactly how nxvim
+    // sources a real plugin — and assert each attributes to its own dir.
+    let (rpc, _incoming) = start_attached(ServerInit::default(), 80, 25).await;
+    let summary = exec_lua(
+        &rpc,
+        r#"
+        nx._add_rtp("/virt/plugins/alpha")
+        nx._add_rtp("/virt/plugins/beta")
+        local function as_plugin(path, body)
+          return assert(loadstring(body, "@" .. path))()
+        end
+
+        -- alpha (no argument) -> assigned the "alpha" namespace; a second file in the
+        -- SAME plugin shares it.
+        as_plugin("/virt/plugins/alpha/lua/a.lua", [[ nx.shada.plugin():set("x", 1) ]])
+        local alpha_self =
+          as_plugin("/virt/plugins/alpha/plugin/init.lua", [[ return nx.shada.plugin():get("x") ]])
+
+        -- beta sees nothing of alpha's data — a plugin can't reach another's slice.
+        local beta_x =
+          as_plugin("/virt/plugins/beta/lua/b.lua", [[ return nx.shada.plugin():get("x") ]])
+
+        -- A sourced file may NOT name its own namespace (it is assigned).
+        local forced_ok =
+          as_plugin("/virt/plugins/alpha/lua/c.lua", [[ return pcall(nx.shada.plugin, "forced") ]])
+
+        -- The user's config root maps to the reserved `user` namespace, not its dir
+        -- name. The handle exposes its assigned `.namespace`.
+        local cfg = vim.fn.stdpath("config")
+        nx._add_rtp(cfg)
+        local user_ns =
+          as_plugin(cfg .. "/lua/u.lua", [[ return nx.shada.plugin().namespace ]])
+
+        -- A plugin loaded by the manager keys on the REGISTERED name, even when it
+        -- differs from the install directory's basename.
+        nx.plugins._specs["registered-name"] = { name = "registered-name", _dir = "/virt/managed/pkgdir" }
+        nx._add_rtp("/virt/managed/pkgdir")
+        local managed_ns =
+          as_plugin("/virt/managed/pkgdir/lua/m.lua", [[ return nx.shada.plugin().namespace ]])
+
+        return ("alpha_native=%s alpha_self=%s beta_x=%s forced_ok=%s user_ns=%s managed_ns=%s"):format(
+          tostring(nx._shada_plugin_get("alpha", "x")),
+          tostring(alpha_self),
+          tostring(beta_x),
+          tostring(forced_ok),
+          tostring(user_ns),
+          tostring(managed_ns))
+        "#,
+    )
+    .await;
+    assert_eq!(
+        summary.as_str(),
+        Some(
+            "alpha_native=1 alpha_self=1 beta_x=nil forced_ok=false user_ns=user \
+             managed_ns=registered-name"
+        ),
+        "alpha's two files share the path-derived `alpha` namespace; beta can't see it; \
+         a sourced file can't self-name; the config root maps to `user`; a \
+         manager-loaded plugin keys on its registered name"
+    );
+}
+
+/// Resolve `examples/<name>` to an absolute path from this crate's manifest dir, so
+/// the example tests load the real shipped config regardless of the test cwd.
+fn example_dir(name: &str) -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../examples")
+        .join(name)
+        .canonicalize()
+        .expect("example dir exists")
+}
+
+#[tokio::test]
+async fn example_plugin_shada_remembers_files_across_sessions() {
+    // Drive the shipped `examples/plugin-shada/` end-to-end through the real startup
+    // sourcing (init.lua + the auto-sourced `pack/*/start/*` plugin), proving the
+    // example actually persists per-plugin data in its assigned namespace.
+    let cfg = example_dir("plugin-shada");
+    let plugin = cfg.join("pack/demo/start/recent-files");
+    let sample = cfg.join("sample.txt");
+    let store_dir = temp_dir("shada_example_plugin");
+
+    let init = |file: Option<String>| ServerInit {
+        file,
+        config_dir: Some(cfg.clone()),
+        runtimepath: vec![cfg.clone(), plugin.clone()],
+        shada: Some(Box::new(RedbFileStore::new(store_dir.to_path_buf()))),
+        ..Default::default()
+    };
+
+    // Session 1: open the sample file (the plugin's VimEnter sweep remembers it), quit.
+    {
+        let (rpc, incoming) =
+            start_attached(init(Some(sample.to_string_lossy().into_owned())), 80, 25).await;
+        // Barrier: the sample buffer is loaded (so startup, incl. VimEnter, has run).
+        assert!(!lines(&rpc).await.is_empty());
+        feed(&rpc, ":qa!<CR>");
+        await_server_exit(incoming).await;
+    }
+
+    // Session 2: a fresh server against the same store. The plugin's "recent-files"
+    // namespace holds the sample path, and the config's store counted two launches —
+    // two isolated stores, both restored.
+    {
+        let (rpc, _incoming) = start_attached(init(None), 80, 25).await;
+        let files = exec_lua(
+            &rpc,
+            r#"return nx.json.encode(nx._shada_plugin_get("recent-files", "files"))"#,
+        )
+        .await;
+        let files = files.as_str().unwrap_or("");
+        assert!(
+            files.contains("sample.txt"),
+            "the recent-files plugin remembered the sample across the restart (got {files:?})"
+        );
+
+        // The config's launch counter persisted + incremented. Under this harness the
+        // config attributes to its dir basename (no NXVIM_CONFIG is set, so it isn't
+        // stdpath("config")); the real binary launched with NXVIM_CONFIG maps the same
+        // code to the reserved `user` namespace instead.
+        let cfg_ns = cfg.file_name().unwrap().to_string_lossy().into_owned();
+        let launches = exec_lua(
+            &rpc,
+            &format!(r#"return nx._shada_plugin_get({cfg_ns:?}, "launches")"#),
+        )
+        .await;
+        assert_eq!(
+            launches.as_u64(),
+            Some(2),
+            "the config counted both launches"
+        );
     }
 }

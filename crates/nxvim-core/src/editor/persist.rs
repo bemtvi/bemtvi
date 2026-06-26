@@ -68,6 +68,33 @@ pub struct PersistState {
     /// [`Editor::export_session`]) when a workspace namespace is active, so a
     /// non-workspace shada never carries layout. See `docs/architecture.md`.
     pub session: Option<SessionState>,
+    /// Per-plugin **isolated** key/value data: each entry is one plugin
+    /// namespace's full key→value map. A pure *transport* field — `nxvim-core`
+    /// never reads or writes it (the data lives in the Lua runtime, not the editor
+    /// model). The server fills it from the runtime at flush and seeds it back at
+    /// load, keyed under a namespace so a plugin can only reach its own slice and
+    /// never the core registers / marks / history. Empty for a session with no
+    /// opted-in plugin. See `docs/plans/2026-06-26-plugin-shada-namespaces.md`.
+    pub plugin_data: Vec<PluginNamespace>,
+}
+
+/// One plugin's isolated shada namespace: its name and full key→value map. The
+/// values are opaque strings the plugin serialized (the Lua API JSON-encodes), so
+/// core carries them blind.
+#[derive(Debug, Clone)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct PluginNamespace {
+    pub namespace: String,
+    pub entries: Vec<PluginEntry>,
+}
+
+/// One key/value pair inside a [`PluginNamespace`]. `value` is the plugin's own
+/// serialized blob (JSON, from the `nx.shada.plugin` Lua API) — opaque to core.
+#[derive(Debug, Clone)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct PluginEntry {
+    pub key: String,
+    pub value: String,
 }
 
 /// A captured editor **session**: every tab's EXACT split layout (nesting + sizes) with
@@ -262,6 +289,10 @@ impl Editor {
             // attaches it via export_session() when enabled, so export_persist leaves
             // it None (the global shada never carries layout).
             session: None,
+            // Plugin data lives in the Lua runtime, not the editor model; the server
+            // attaches it at flush (LuaRuntime::plugin_shada_export), so core leaves
+            // it empty here.
+            plugin_data: Vec::new(),
         }
     }
 

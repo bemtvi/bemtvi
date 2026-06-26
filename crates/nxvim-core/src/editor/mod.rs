@@ -88,7 +88,8 @@ pub use self::buffers::{
 };
 pub use self::persist::{
     FileChangelist, FileFolds, FileMarkEntry, GlobalMarkEntry, JumpPos, NumberedMark, PersistState,
-    RegisterEntry, SessionDock, SessionState, SessionTab, SessionWindow, ShadaRequest,
+    PluginEntry, PluginNamespace, RegisterEntry, SessionDock, SessionState, SessionTab,
+    SessionWindow, ShadaRequest,
 };
 pub use self::terminal::TerminalOp;
 pub use self::undo::{UndoEntry, UndoTreeView};

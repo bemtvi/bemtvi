@@ -724,6 +724,15 @@ pub(crate) struct Shared {
     /// `'relative_docks'` options, read straight off the editor at capture — not
     /// mirrored here, so layout sizing isn't coupled to this plugin opt-in.
     pub(crate) session_save_layout: bool,
+    /// Per-plugin isolated shada data: `namespace -> (key -> value)`, where each
+    /// value is the plugin's serialized blob (JSON, from `nx.shada.plugin`). The
+    /// live home of an opted-in plugin's cross-session store: the `nx._shada_plugin_*`
+    /// bridges read/write it, the server seeds it at shada load
+    /// ([`LuaRuntime::plugin_shada_seed`]) and harvests it at flush
+    /// ([`LuaRuntime::plugin_shada_export`]). A `BTreeMap` so `:keys` and the
+    /// exported order are deterministic. Empty for a config with no opted-in plugin.
+    pub(crate) plugin_shada:
+        std::collections::BTreeMap<String, std::collections::BTreeMap<String, String>>,
     /// Whether any `nx.on_key_pending` listener has been registered
     /// (`nx._key_pending_register`). The gate the server checks before computing /
     /// pushing the pending-key signal: while no listener is set it never walks the
@@ -1522,6 +1531,57 @@ impl LuaRuntime {
     /// layout (`nx.shada.save_layout`). The server gates session capture on it.
     pub fn session_save_layout(&self) -> bool {
         self.shared.borrow().session_save_layout
+    }
+
+    /// Harvest the opted-in plugins' isolated shada data as `(namespace, [(key,
+    /// value)…])` tuples for the server to fold into the [`PersistState`] it flushes.
+    /// Plain tuples (not `nxvim-core` types) since this crate doesn't depend on the
+    /// core — the edit-host maps them to `PluginNamespace` / `PluginEntry`.
+    pub fn plugin_shada_export(&self) -> Vec<(String, Vec<(String, String)>)> {
+        self.shared
+            .borrow()
+            .plugin_shada
+            .iter()
+            .map(|(ns, kv)| {
+                (
+                    ns.clone(),
+                    kv.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
+                )
+            })
+            .collect()
+    }
+
+    /// Seed the plugin shada map from a loaded store, **replacing** the live map
+    /// (the boot-time load, before any plugin has written this session). The server
+    /// hands the [`PersistState`]'s plugin data back as the same tuples
+    /// [`plugin_shada_export`](Self::plugin_shada_export) produced.
+    pub fn plugin_shada_seed(&self, data: Vec<(String, Vec<(String, String)>)>) {
+        let mut shared = self.shared.borrow_mut();
+        shared.plugin_shada.clear();
+        for (ns, entries) in data {
+            let map = shared.plugin_shada.entry(ns).or_default();
+            for (k, v) in entries {
+                map.insert(k, v);
+            }
+        }
+    }
+
+    /// Merge a re-read store's plugin data into the live map (`:rshada[!]`). With
+    /// `replace` a stored value overwrites a conflicting live key; otherwise it only
+    /// fills a key the running session hasn't set — mirroring how `apply_persist`
+    /// treats the editor's own state.
+    pub fn plugin_shada_merge(&self, data: Vec<(String, Vec<(String, String)>)>, replace: bool) {
+        let mut shared = self.shared.borrow_mut();
+        for (ns, entries) in data {
+            let map = shared.plugin_shada.entry(ns).or_default();
+            for (k, v) in entries {
+                if replace {
+                    map.insert(k, v);
+                } else {
+                    map.entry(k).or_insert(v);
+                }
+            }
+        }
     }
 
     /// Whether any `nx.on_key_pending` listener has been registered

@@ -790,6 +790,15 @@ autocmd. A colorscheme is just Lua: its `setup()` compiles a highlight table
 populates the highlight registry via the `nx` highlight API (its `nvim_set_hl`
 alias). See the [README](../README.md#configuration) to set one up.
 
+**Plugins persist isolated state.** A plugin opts into cross-session storage with
+`nx.shada.plugin()`: a key/value handle (JSON values) that lives in a dedicated
+table of the active shada store, walled off from the core registers/marks/history.
+The namespace is *assigned, not chosen* — derived from the calling code's
+runtimepath/plugin directory (via `debug.getinfo`), so a plugin reaches only its
+own slice and can't name another's. It rides the ordinary shada flush cadence; see
+the [`nx.shada.plugin` section](specs/2026-06-11-native-plugin-api.md) and
+`examples/plugin-shada/`.
+
 The editor's scripting namespace is its own: config files and plugins target
 the `nx.*` API ([ADR 0002](decisions/0002-native-plugin-system.md);
 [the `nx` design](specs/2026-06-11-native-plugin-api.md)). The lasting `vim.*`

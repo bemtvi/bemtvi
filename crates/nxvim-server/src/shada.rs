@@ -58,7 +58,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use nxvim_core::{
     FileChangelist, FileFolds, FileMarkEntry, GlobalMarkEntry, JumpPos, NumberedMark, PersistState,
-    RegisterEntry,
+    PluginEntry, PluginNamespace, RegisterEntry,
 };
 use redb::{Database, ReadableTable, TableDefinition, TableError};
 use serde::{Deserialize, Serialize};
@@ -142,6 +142,13 @@ const FOLDS_FILE: TableDefinition<&str, &[u8]> = TableDefinition::new("folds_fil
 /// list wins on merge (a jumplist is an ordered sequence, not a union).
 const JUMPLIST: TableDefinition<u64, &[u8]> = TableDefinition::new("jumplist");
 
+/// `plugin` table: key is `(namespace, key)` — one opted-in plugin's isolated
+/// key/value data (`nx.shada.plugin`). Value is a msgpack [`StoredPlugin`]. Keyed
+/// apart from every core table, so a plugin's blob can never reach the registers /
+/// marks / history. Same `(&str, &str)` shape and clear-then-rewrite discipline as
+/// [`MARKS_FILE`].
+const PLUGIN: TableDefinition<(&str, &str), &[u8]> = TableDefinition::new("plugin");
+
 /// `meta` table: a single `"meta"` row holding the schema version, this write's
 /// timestamp (the jumplist recency key), and the last clean-exit cursor that
 /// becomes `'0` next launch.
@@ -187,6 +194,15 @@ struct StoredFileMark {
 #[derive(Serialize, Deserialize)]
 struct StoredHist {
     text: String,
+}
+
+/// One plugin key/value pair as stored on disk: the plugin's serialized blob and
+/// the write timestamp driving the cross-instance recency merge. The namespace and
+/// key live in the `(namespace, key)` table key.
+#[derive(Serialize, Deserialize)]
+struct StoredPlugin {
+    value: String,
+    ts: u64,
 }
 
 /// A bare file position as stored on disk — a jumplist entry or the exit cursor.
@@ -485,6 +501,27 @@ fn write_state(db: &Database, state: &PersistState) -> std::io::Result<()> {
         }
     }
     {
+        // Plugin data keys on `(namespace, key)`; clear before rewrite so a key a
+        // plugin deleted this session drops out (mirrors the per-file marks).
+        let mut table = wtxn.open_table(PLUGIN).map_err(std::io::Error::other)?;
+        table.retain(|_, _| false).map_err(std::io::Error::other)?;
+        for ns in &state.plugin_data {
+            for entry in &ns.entries {
+                let stored = StoredPlugin {
+                    value: entry.value.clone(),
+                    ts,
+                };
+                let bytes = rmp_serde::to_vec(&stored).map_err(std::io::Error::other)?;
+                table
+                    .insert(
+                        (ns.namespace.as_str(), entry.key.as_str()),
+                        bytes.as_slice(),
+                    )
+                    .map_err(std::io::Error::other)?;
+            }
+        }
+    }
+    {
         // The jumplist is rewritten wholesale (keys 0..N), so clear first lest a
         // now-shorter list leave stale tail rows.
         let mut table = wtxn.open_table(JUMPLIST).map_err(std::io::Error::other)?;
@@ -571,6 +608,9 @@ struct MergedRaw {
     numbered: std::collections::HashMap<char, StoredMark>,
     changelist: std::collections::HashMap<String, StoredChangelist>,
     folds: std::collections::HashMap<String, StoredFolds>,
+    /// Per-plugin isolated data, keyed `(namespace, key)` — newest `ts` per pair
+    /// wins, exactly like the file marks.
+    plugin: std::collections::HashMap<(String, String), StoredPlugin>,
     hist_search: HistMerge,
     hist_ex: HistMerge,
     /// The jumplist is an ordered sequence, not a union: the newest store's whole
@@ -597,6 +637,7 @@ fn collect_merge<'a>(dbs: impl IntoIterator<Item = &'a Database>) -> MergedRaw {
         merge_numbered_marks(db, &mut m.numbered);
         merge_changelists(db, &mut m.changelist);
         merge_folds(db, &mut m.folds);
+        merge_plugin(db, &mut m.plugin);
         merge_history(db, HIST_SEARCH, &mut m.hist_search);
         merge_history(db, HIST_EX, &mut m.hist_ex);
         if let Some(meta) = read_meta(db) {
@@ -697,7 +738,32 @@ fn build_state(m: MergedRaw, numbered_marks: Vec<NumberedMark>) -> PersistState 
         // The restored workspace session (newest store wins); the server only acts on
         // it when a workspace namespace is active.
         session: m.session.1,
+        plugin_data: group_plugin(m.plugin),
     }
+}
+
+/// Group the merged `(namespace, key) -> StoredPlugin` map back into one
+/// [`PluginNamespace`] per namespace, each carrying its key→value entries. The
+/// namespaces and the keys within each are sorted, so the seeded Lua state is
+/// deterministic across runs (a redb iteration order isn't guaranteed stable).
+fn group_plugin(
+    map: std::collections::HashMap<(String, String), StoredPlugin>,
+) -> Vec<PluginNamespace> {
+    let mut by_ns: std::collections::BTreeMap<String, Vec<PluginEntry>> =
+        std::collections::BTreeMap::new();
+    for ((namespace, key), stored) in map {
+        by_ns.entry(namespace).or_default().push(PluginEntry {
+            key,
+            value: stored.value,
+        });
+    }
+    by_ns
+        .into_iter()
+        .map(|(namespace, mut entries)| {
+            entries.sort_by(|a, b| a.key.cmp(&b.key));
+            PluginNamespace { namespace, entries }
+        })
+        .collect()
 }
 
 /// The merged numbered marks passed through *unchanged* — the `:rshada` re-read
@@ -951,6 +1017,40 @@ fn merge_folds(db: &Database, best: &mut std::collections::HashMap<String, Store
             Some(existing) if existing.ts >= stored.ts => {}
             _ => {
                 best.insert(path, stored);
+            }
+        }
+    }
+}
+
+/// Fold one store's `plugin` table into the best-by-timestamp map, keyed
+/// `(namespace, key)` (newest `ts` per pair wins). Same recency discipline as the
+/// file marks; a store predating any opted-in plugin has no table (not an error).
+fn merge_plugin(
+    db: &Database,
+    best: &mut std::collections::HashMap<(String, String), StoredPlugin>,
+) {
+    let Ok(rtxn) = db.begin_read() else {
+        return;
+    };
+    let table = match rtxn.open_table(PLUGIN) {
+        Ok(table) => table,
+        Err(TableError::TableDoesNotExist(_)) => return,
+        Err(_) => return,
+    };
+    let Ok(iter) = table.iter() else {
+        return;
+    };
+    for row in iter.flatten() {
+        let (key, value) = row;
+        let (namespace, name) = key.value();
+        let Ok(stored) = rmp_serde::from_slice::<StoredPlugin>(value.value()) else {
+            continue;
+        };
+        let composite = (namespace.to_string(), name.to_string());
+        match best.get(&composite) {
+            Some(existing) if existing.ts >= stored.ts => {}
+            _ => {
+                best.insert(composite, stored);
             }
         }
     }

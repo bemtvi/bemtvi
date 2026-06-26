@@ -1,0 +1,9 @@
+nx.shada.plugin() — opt-in, isolated, per-plugin persistence
+============================================================
+
+Open a few files this session, then quit (:qa) and relaunch with the SAME
+XDG_STATE_HOME. The bundled "recent-files" plugin will have remembered them in
+its own shada namespace, and the config's :Launches counter will have ticked up
+in the separate "user" namespace. Neither store can see the other's keys.
+
+Run :RecentFiles and :Launches after relaunching to see the restored state.

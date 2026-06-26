@@ -937,6 +937,24 @@ pub(crate) fn install_runtime_api(
         })?,
     )?;
 
+    // `nx._runtime_paths()`: the live runtimepath as a list of absolute directory
+    // strings (longest-prefix order is the caller's job). Backs `nx.shada.plugin`'s
+    // namespace attribution — it maps the calling chunk's source file to the rtp
+    // entry (plugin root) that contains it. Reads the same live `Rc` `_add_rtp`
+    // mutates, so a mid-session-installed plugin is attributable immediately.
+    let rtp_list = runtimepath.clone();
+    nx.set(
+        "_runtime_paths",
+        lua.create_function(move |lua, ()| {
+            let paths: Vec<String> = rtp_list
+                .borrow()
+                .iter()
+                .map(|p| p.to_string_lossy().into_owned())
+                .collect();
+            lua.create_sequence_from(paths)
+        })?,
+    )?;
+
     // `vim.fn.getcwd()`: the editor's effective working directory (the root fallback
     // and the base for relative->absolute path math in `vim.fs`/`fnamemodify`). The
     // server keeps `nx._cwd` equal to the effective dir on every change; read that when
@@ -1001,6 +1019,107 @@ pub(crate) fn install_runtime_api(
         )?;
     }
     nx.set("shada", shada_tbl)?;
+
+    // ----- nx.shada.plugin: opt-in, isolated per-plugin shada storage -------------
+    //
+    // The native half of the `nx.shada.plugin()` handle (the ergonomic method wrapper
+    // and the namespace *attribution* live in `prelude/stdlib.lua`). A plugin's data
+    // lives in its own `namespace -> (key -> value)` slice of `Shared::plugin_shada`,
+    // keyed apart from the core registers / marks / history — so a plugin can reach
+    // only its own namespace, never the editor's own shada state. The namespace is
+    // *assigned* from where the calling code lives (its runtimepath / plugin dir), not
+    // chosen by the plugin, so one plugin can't claim another's slice. Values are
+    // stored as JSON (the same `lua_to_json` codec `nx.json.encode` uses), so `set`
+    // accepts any JSON-able Lua value and `get` hands a fresh copy back. The server
+    // seeds this map at shada load and harvests it at flush, so the data rides the
+    // ordinary shada cadence.
+
+    // `nx._shada_plugin_set(ns, key, value)`: JSON-encode `value` and store it under
+    // `(ns, key)`. Overwrites any existing value for the key.
+    {
+        let sh = shared.clone();
+        nx.set(
+            "_shada_plugin_set",
+            lua.create_function(move |_, (ns, key, value): (String, String, mlua::Value)| {
+                let json = lua_to_json(&value)?;
+                let encoded = serde_json::to_string(&json).map_err(mlua::Error::external)?;
+                sh.borrow_mut()
+                    .plugin_shada
+                    .entry(ns)
+                    .or_default()
+                    .insert(key, encoded);
+                Ok(())
+            })?,
+        )?;
+    }
+
+    // `nx._shada_plugin_get(ns, key)` -> the decoded value, or nil when unset.
+    {
+        let sh = shared.clone();
+        nx.set(
+            "_shada_plugin_get",
+            lua.create_function(move |lua, (ns, key): (String, String)| {
+                let encoded = sh
+                    .borrow()
+                    .plugin_shada
+                    .get(&ns)
+                    .and_then(|m| m.get(&key))
+                    .cloned();
+                match encoded {
+                    Some(s) => {
+                        let value: serde_json::Value =
+                            serde_json::from_str(&s).map_err(mlua::Error::external)?;
+                        json_to_lua(lua, &value)
+                    }
+                    None => Ok(mlua::Value::Nil),
+                }
+            })?,
+        )?;
+    }
+
+    // `nx._shada_plugin_delete(ns, key)`: drop one key from the namespace.
+    {
+        let sh = shared.clone();
+        nx.set(
+            "_shada_plugin_delete",
+            lua.create_function(move |_, (ns, key): (String, String)| {
+                if let Some(m) = sh.borrow_mut().plugin_shada.get_mut(&ns) {
+                    m.remove(&key);
+                }
+                Ok(())
+            })?,
+        )?;
+    }
+
+    // `nx._shada_plugin_keys(ns)` -> the namespace's keys, sorted (the `BTreeMap`
+    // iterates in order).
+    {
+        let sh = shared.clone();
+        nx.set(
+            "_shada_plugin_keys",
+            lua.create_function(move |lua, ns: String| {
+                let keys: Vec<String> = sh
+                    .borrow()
+                    .plugin_shada
+                    .get(&ns)
+                    .map(|m| m.keys().cloned().collect())
+                    .unwrap_or_default();
+                lua.create_sequence_from(keys)
+            })?,
+        )?;
+    }
+
+    // `nx._shada_plugin_clear(ns)`: drop every key in the namespace.
+    {
+        let sh = shared.clone();
+        nx.set(
+            "_shada_plugin_clear",
+            lua.create_function(move |_, ns: String| {
+                sh.borrow_mut().plugin_shada.remove(&ns);
+                Ok(())
+            })?,
+        )?;
+    }
 
     // `nx.uuid()` -> a random v4 UUID in canonical `8-4-4-4-12` hex. A public utility
     // (the workspace plugin mints session namespaces with it).

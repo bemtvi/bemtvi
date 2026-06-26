@@ -89,6 +89,7 @@ same surface, later. The in-process Lua host is v1.
 | `nx.picker` | **native fuzzy picker** (prompt + list + preview); plugins = sources | floats + the panel's input-grab pattern; matcher shared with completion |
 | `nx.snippet` | **native snippet engine** (LSP grammar, tabstop mode, choices) | the existing LSP-snippet parse; tabstop session modeled like multi-cursor placement mode |
 | `nx.tree` | generic dock/tree views (file explorer, symbols, git) | the panel generalized to a persistent vertical dock |
+| `nx.shada.plugin()` | opt-in, **isolated** cross-session key/value storage; the namespace is assigned from the calling plugin's location, not chosen | a dedicated table in the shada store + the existing flush cadence |
 
 The same `nx.*` namespace is the **config** API: `init.lua` is written against
 it (`nx.o`/`nx.opt` for options, `nx.keymap`, `nx.on`, `nx.command`, `nx.lsp`
@@ -390,6 +391,39 @@ reported loud (`E5108`) and disabled after repeated failures, matching the
 Decorations you already know — diagnostics from an LSP response, signs from a
 diff — need no provider; they are a plain `nx.hl.set(ns, buf, marks)`. Reach
 for `nx.decor` only when the work is worth scoping to the viewport.
+
+## Plugin persistence — assigned, isolated namespaces (`nx.shada.plugin`)
+
+A plugin that wants to remember something across sessions opts in:
+
+```lua
+local store = nx.shada.plugin()           -- no argument
+store:set("recent", { "a.txt", "b.txt" }) -- any JSON-able Lua value
+local recent = store:get("recent")        -- a fresh copy, or nil
+store:delete("recent"); store:keys(); store:clear()
+```
+
+The data lives in the **current** shada store — global, a `--shada-namespace`
+workspace, or a remote daemon, whichever this session uses — in a dedicated
+table keyed apart from the core editor state, so a plugin's blob can never reach
+the registers / marks / history (and persistence rides the ordinary debounced
+checkpoint + clean-exit flush; with shada off it is in-memory only, like
+registers).
+
+The point is the *namespace*. It is **assigned, not chosen**: `nx.shada.plugin()`
+takes no name and derives one from where the calling code lives — it walks the
+stack to the caller's source file and attributes it to the runtimepath / plugin
+directory that contains it. The namespace is then, in order: the canonical **name
+the package manager registered** for that directory, when the plugin was loaded
+through `nx.plugins` (tightest identity — a `name = …` spec can differ from the
+install dir's basename); the reserved `user` for the config root; otherwise the
+directory's **basename** (the fallback for a plugin loaded outside the manager,
+e.g. a `pack/*/start/*` directory). So a plugin gets its own slice and *cannot
+name* — and so cannot read or clobber — another plugin's. This is stronger than a
+self-chosen string, where any code could claim any namespace. (A bare `:lua` /
+RPC / test, which attributes to no plugin, may pass an explicit namespace as a
+dev escape hatch; a real sourced file passing one is a loud error.) Worked end to
+end in `examples/plugin-shada/`.
 
 ## Treesitter highlighting is buffer state, not a verb
 

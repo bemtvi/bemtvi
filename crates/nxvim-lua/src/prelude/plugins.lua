@@ -319,6 +319,26 @@ local function run_hook(fn)
   return nx.async(fn)()
 end
 
+-- The shada namespace the manager assigns to the plugin installed at `dir` (a
+-- runtimepath entry): the registered `name` of the spec whose `_dir` is `dir`, or
+-- `nil` when no managed plugin lives there. `nx.shada.plugin` consults this so a
+-- manager-loaded plugin keys its store on its canonical `name` — which a `name = …`
+-- spec can set apart from the directory basename — while a plugin loaded outside the
+-- manager falls back to its directory name. Trailing separators are trimmed so
+-- `…/foo` and `…/foo/` match.
+function M._namespace_for(dir)
+  local trim = function(p)
+    return (p:gsub("[/\\]+$", ""))
+  end
+  local target = trim(dir)
+  for name, spec in pairs(M._specs) do
+    if spec._dir and trim(spec._dir) == target then
+      return name
+    end
+  end
+  return nil
+end
+
 -- Load a plugin by name: dependencies first, then put it on the runtimepath, source
 -- its `plugin/` scripts, and run its `config`. Idempotent (a second call is a
 -- no-op) and cycle-safe (a `_loading` guard breaks dependency loops). Returns a

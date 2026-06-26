@@ -2,33 +2,75 @@
 // `Rpc` + reader task (Phase 6b). The native edit-host fulfils the daemon's `HostServices`
 // over `nxvim-rpc` + tokio; the browser Worker has neither (the whole point of `EditHost`
 // is no tokio in the Worker), so the client end of the wire is reimplemented here in JS,
-// driven over a WebTransport (HTTP/3 / QUIC) bidi stream to a real `nxvim --daemon --listen`.
+// driven over WebTransport (HTTP/3 / QUIC) bidi streams to a real `nxvim --daemon --listen`.
+//
+// Multi-stream (see `crates/nxvim-server/src/daemon.rs` → `LegGroup` and
+// `docs/plans/2026-06-26-multi-stream-daemon-transport.md`): the legs are split across four
+// bidi streams by latency class — Control (`fs_*` / `config_*` / `luafs_*`), Proc (`proc_*`),
+// Lsp (`lsp_*`), Term (`term_*`) — so a `term_data` / `proc_stdout` flood can't head-of-line
+// block an `fs_write` save at the QUIC layer. Each stream is prefixed with its group's
+// one-byte tag (the daemon reads it to dispatch the stream); outbound `request`/`notify`
+// pick their stream by method (`groupForMethod`, the JS mirror of `LegGroup::classify`).
 //
 // The wire (see nxvim-rpc): bare msgpack values, no length prefix — msgpack is
 // self-delimiting, so a complete value per frame. `@msgpack/msgpack`'s `decodeMultiStream`
-// reads the bidi stream's `ReadableStream` and yields exactly one decoded value per frame,
+// reads a bidi stream's `ReadableStream` and yields exactly one decoded value per frame,
 // handling the split/coalesced-chunk framing for us. Frame shapes:
 //   request       [0, msgid, method, params]   (edit-host → daemon; we send these)
 //   response      [1, msgid, error, result]    (daemon → edit-host; resolves a request)
 //   notification  [2, method, params]          (either direction, fire-and-forget)
-// Request *responses* are routed by msgid; the daemon's *pushes* (proc/terminal/fs_changed)
-// are notifications surfaced via `onNotify`, which the Worker handles in `onDaemonNotify`.
+// Request *responses* are routed by msgid (globally unique across streams), so the read loop
+// of whichever stream carries the reply resolves it; the daemon's *pushes* (proc/terminal/
+// fs_changed/lsp) are notifications surfaced via `onNotify`, which the Worker handles in
+// `onDaemonNotify`.
 import { encode, decodeMultiStream } from "./vendor/msgpack/index.mjs";
 
-/** A live msgpack-RPC client over one WebTransport bidi stream. */
+// The leg groups and their wire tag bytes — must match `LegGroup::tag` in
+// `crates/nxvim-server/src/daemon.rs`. The browser drives all four (it owns `:terminal` and
+// the `nx.fs.watch` streaming leg, which the native edit-host doesn't).
+const GROUP_TAGS = { control: 0, proc: 1, lsp: 2, term: 3 };
+
+/**
+ * The leg group that owns a wire method — the JS mirror of `LegGroup::classify`. The four
+ * arms partition the method namespace disjointly; an unknown method defaults to Control (the
+ * peer is the same build, so this is belt-and-braces).
+ * @param {string} method @returns {keyof typeof GROUP_TAGS}
+ */
+function groupForMethod(method) {
+  if (method.startsWith("proc_")) return "proc";
+  if (method.startsWith("lsp_")) return "lsp";
+  if (method.startsWith("term_")) return "term";
+  return "control"; // fs_* / config_* / luafs_* and anything else
+}
+
+/** A live msgpack-RPC client over the daemon's per-group WebTransport bidi streams. */
 export class RpcClient {
-  /** @param {WebTransport} transport @param {WebTransportBidirectionalStream} stream */
-  constructor(transport, stream) {
+  /**
+   * @param {WebTransport} transport
+   * @param {Record<keyof typeof GROUP_TAGS, WebTransportBidirectionalStream>} streams
+   */
+  constructor(transport, streams) {
     this.transport = transport;
-    this.writer = stream.writable.getWriter();
-    this.nextId = 1;
+    this.nextId = 1; // globally unique across streams, so responses route unambiguously
     this.pending = new Map(); // msgid -> { resolve, reject }
     this.onNotify = null; // (method, params) => void  — daemon→client pushes
     this.closed = false;
-    // The reader loop runs for the connection's lifetime; a stream error or peer close
-    // ends it and we reject every in-flight request loudly (no silently-hung `:e`/`:w`).
-    this._readLoop(stream.readable).catch((e) => this._fail(e));
-    // A dropped QUIC session must also fail in-flight work, even if the read loop is parked.
+    this.writers = {}; // group name -> WritableStreamDefaultWriter
+    // One writer + read loop per group stream. The first byte written on each stream is its
+    // group tag — the daemon reads it to dispatch the stream to that group's legs (and it
+    // makes the freshly-opened stream visible to the daemon's `accept_bi` promptly). The tag
+    // write is enqueued before any frame, and a WritableStream preserves write order, so it
+    // always precedes the group's RPC frames.
+    for (const name of Object.keys(streams)) {
+      const stream = streams[name];
+      const writer = stream.writable.getWriter();
+      this.writers[name] = writer;
+      writer.write(new Uint8Array([GROUP_TAGS[name]])).catch((e) => this._fail(e));
+      // The reader loop runs for the connection's lifetime; a stream error or peer close
+      // ends it and we reject every in-flight request loudly (no silently-hung `:e`/`:w`).
+      this._readLoop(stream.readable).catch((e) => this._fail(e));
+    }
+    // A dropped QUIC session must also fail in-flight work, even if a read loop is parked.
     transport.closed.then(
       () => this._fail(new Error("daemon connection closed")),
       (e) => this._fail(e),
@@ -84,14 +126,14 @@ export class RpcClient {
     if (this.closed) throw new Error(`daemon connection closed (request ${method})`);
     const msgid = this.nextId++;
     const promise = new Promise((resolve, reject) => this.pending.set(msgid, { resolve, reject }));
-    await this.writer.write(encode([0, msgid, method, params]));
+    await this.writers[groupForMethod(method)].write(encode([0, msgid, method, params]));
     return promise;
   }
 
   /** Fire a notification (no reply). @param {string} method @param {Array<any>} params */
   async notify(method, params = []) {
     if (this.closed) return;
-    await this.writer.write(encode([2, method, params]));
+    await this.writers[groupForMethod(method)].write(encode([2, method, params]));
   }
 
   /**
@@ -116,7 +158,8 @@ export class RpcClient {
  * TOKEN rides the WebTransport CONNECT path (the daemon reads `request.path()`), and the
  * self-signed cert HASH (dotted-hex SHA-256) is pinned TOFU via `serverCertificateHashes`
  * — the browser twin of the native `connect_quic` (`crates/nxvim-server/src/quic.rs`). The
- * edit-host opens the one bidi stream; the daemon multiplexes all six wire legs over it.
+ * edit-host opens one tagged bidi stream per leg group; the daemon serves each group over
+ * its own stream (see {@link RpcClient}).
  */
 export async function dialDaemon(uri) {
   const u = new URL(uri);
@@ -133,6 +176,11 @@ export async function dialDaemon(uri) {
     serverCertificateHashes: [{ algorithm: "sha-256", value: hash }],
   });
   await transport.ready; // rejects loudly on a bad cert/token/transport
-  const stream = await transport.createBidirectionalStream();
-  return new RpcClient(transport, stream);
+  // One bidi stream per leg group. The daemon dispatches by each stream's tag byte (written
+  // first by `RpcClient`), not by open order, so the order here doesn't matter.
+  const streams = {};
+  for (const name of Object.keys(GROUP_TAGS)) {
+    streams[name] = await transport.createBidirectionalStream();
+  }
+  return new RpcClient(transport, streams);
 }

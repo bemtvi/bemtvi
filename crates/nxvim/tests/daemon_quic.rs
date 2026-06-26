@@ -16,7 +16,10 @@
 use std::net::SocketAddr;
 use std::time::Duration;
 
-use nxvim_server::{bind_quic_listener, connect_quic, mint_token, serve_quic, ListenerInfo};
+use nxvim_server::{
+    bind_quic_listener, connect_quic, mint_token, serve_quic, ListenerInfo, ServerInit,
+};
+use nxvim_test_harness::{attach, buf_lines, exec_lua, feed, spawn, temp_dir};
 
 /// Bind a QUIC daemon listener on an ephemeral loopback port and serve it on its own
 /// thread + runtime — the stand-in for a separate `nxvim --daemon --listen` process. The
@@ -80,5 +83,96 @@ async fn the_bearer_token_gates_the_connection() {
         accepted.is_ok(),
         "the correct token must connect: {:?}",
         accepted.err()
+    );
+}
+
+/// Poll `nvim_buf_get_lines` until it matches `want` or the budget runs out — the off-tick
+/// fetch (initial open) lands a moment after attach.
+async fn await_lines(rpc: &nxvim_rpc::Rpc, want: &[&str]) -> Vec<String> {
+    for _ in 0..100 {
+        if buf_lines(rpc, 0).await == want {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    buf_lines(rpc, 0).await
+}
+
+/// The legs split across **separate** QUIC streams (Control / Proc / Lsp) all carry real
+/// traffic, not just the connection setup the token-gate test proves. Drives a full
+/// edit-host `Server` whose seams come from `connect_quic`, against a real `serve_quic`
+/// daemon backed by the `Std*` impls — so a file read/write crosses the **Control** stream
+/// and a spawned process crosses the **Proc** stream, each over its own QUIC bidi.
+///
+/// Faithful, not a no-op: the daemon's `StdHostFs` reads/writes a real temp file and its
+/// `StdHostProc` runs a real `sh`, and the asserted bytes can only have come back across
+/// the wire. (This proves the multi-stream transport *carries* each leg; head-of-line
+/// isolation between the streams is QUIC's per-stream flow control, architectural — a
+/// deterministic latency assertion would be inherently timing-flaky, so it's omitted.)
+#[tokio::test]
+async fn native_legs_round_trip_over_separate_quic_streams() {
+    let info = spawn_quic_daemon();
+    let url = dial_url(&info);
+
+    // A real temp file the daemon's `StdHostFs` serves; its bytes cross the QUIC wire.
+    let dir = temp_dir("quic_multistream");
+    let file = dir.join("note.txt");
+    std::fs::write(&file, "alpha\nbeta\n").expect("seed the remote file");
+
+    let client = connect_quic(&url, &info.cert_hash, &info.token).expect("connect over QUIC");
+    let init = ServerInit {
+        file: Some(file.to_string_lossy().into_owned()),
+        host_proc: Some(Box::new(client.host_proc)),
+        host_fs_async: Some(Box::new(client.host_fs)),
+        lsp_transport: Some(Box::new(client.lsp_transport)),
+        fs_jobs: Some(client.fs_jobs),
+        ..Default::default()
+    };
+    let (rpc, _incoming) = spawn(init);
+    attach(&rpc, 80, 24).await;
+
+    // Control stream — `fs_read`: the file's bytes loaded over the wire into the buffer.
+    assert_eq!(
+        await_lines(&rpc, &["alpha", "beta"]).await,
+        vec!["alpha", "beta"],
+        "the startup file's bytes must arrive over the Control QUIC stream"
+    );
+
+    // Proc stream — a child runs on the *separate* Proc stream and its stdout returns.
+    exec_lua(
+        &rpc,
+        "_G.res = nil\n\
+         nx.run({ cmd = 'sh', args = { '-c', 'echo hello' } }):next(function(r) _G.res = r end)",
+    )
+    .await;
+    let mut proc_stdout = None;
+    for _ in 0..100 {
+        let out = exec_lua(&rpc, "return _G.res and _G.res.stdout").await;
+        if let Some(s) = out.as_str() {
+            proc_stdout = Some(s.to_string());
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(
+        proc_stdout.as_deref(),
+        Some("hello\n"),
+        "the process's stdout must return over the Proc QUIC stream"
+    );
+
+    // Control stream — `fs_write`: append a line and `:w`; the daemon's real file updates.
+    feed(&rpc, "Gonew line<Esc>");
+    feed(&rpc, ":w<CR>");
+    let mut on_disk = String::new();
+    for _ in 0..100 {
+        on_disk = std::fs::read_to_string(&file).unwrap_or_default();
+        if on_disk.contains("new line") {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(
+        on_disk, "alpha\nbeta\nnew line\n",
+        "the save must push the edited bytes back over the Control QUIC stream to disk"
     );
 }

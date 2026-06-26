@@ -172,7 +172,7 @@ use nxvim_lsp::LspManager;
 use nxvim_lsp::{CodeActionData, ServerKey};
 use nxvim_lua::LuaRuntime;
 #[cfg(feature = "native")]
-use nxvim_rpc::{connect, Incoming};
+use nxvim_rpc::{connect, Incoming, Rpc};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
@@ -2464,6 +2464,201 @@ where
     Ok(())
 }
 
+/// The per-leg daemon server tasks for one connection — or, on a multi-stream transport,
+/// one *stream* of a connection — plus the demux that routes inbound methods to them. A
+/// leg is spawned only for the [`LegGroup`](daemon::LegGroup)s passed to [`spawn`]: a
+/// single-stream transport (ssh/stdio, the in-process test duplex) spawns **all four**
+/// groups over one shared [`Rpc`]; a multi-stream transport (QUIC/WebTransport) spawns one
+/// group per stream over that stream's own [`Rpc`]. Either way each leg is the *same*
+/// connection-agnostic `serve_*_daemon_on` core, so a file/process/server behaves
+/// identically however its bytes were carried.
+///
+/// [`spawn`]: DaemonLegs::spawn
+#[cfg(feature = "native")]
+struct DaemonLegs {
+    fs: Option<tokio::sync::mpsc::UnboundedSender<Incoming>>,
+    proc: Option<tokio::sync::mpsc::UnboundedSender<Incoming>>,
+    term: Option<tokio::sync::mpsc::UnboundedSender<Incoming>>,
+    lsp: Option<tokio::sync::mpsc::UnboundedSender<Incoming>>,
+    luafs: Option<tokio::sync::mpsc::UnboundedSender<Incoming>>,
+    luafs_watch: Option<tokio::sync::mpsc::UnboundedSender<Incoming>>,
+    config: Option<tokio::sync::mpsc::UnboundedSender<Incoming>>,
+    handles: Vec<tokio::task::JoinHandle<anyhow::Result<()>>>,
+}
+
+#[cfg(feature = "native")]
+impl DaemonLegs {
+    /// Spawn the leg tasks for every group in `groups`, each writing back through a clone
+    /// of `rpc`, and return the senders the demux routes inbound messages onto. The daemon
+    /// backs every leg with the same `Std*` impl the local server uses.
+    fn spawn(groups: &[daemon::LegGroup], rpc: &Rpc) -> Self {
+        use daemon::LegGroup;
+        use nxvim_lua::StdLuaFs;
+        use tokio::sync::mpsc::unbounded_channel;
+
+        let mut legs = DaemonLegs {
+            fs: None,
+            proc: None,
+            term: None,
+            lsp: None,
+            luafs: None,
+            luafs_watch: None,
+            config: None,
+            handles: Vec::new(),
+        };
+        for &group in groups {
+            match group {
+                LegGroup::Control => {
+                    let (fs_tx, fs_rx) = unbounded_channel();
+                    let (luafs_tx, luafs_rx) = unbounded_channel();
+                    let (luafs_watch_tx, luafs_watch_rx) = unbounded_channel();
+                    let (config_tx, config_rx) = unbounded_channel();
+                    legs.handles.push(tokio::spawn(daemon::serve_fs_daemon_on(
+                        rpc.clone(),
+                        fs_rx,
+                        Box::new(StdHostFs),
+                    )));
+                    legs.handles
+                        .push(tokio::spawn(daemon::serve_luafs_daemon_on(
+                            rpc.clone(),
+                            luafs_rx,
+                            Box::new(StdLuaFs::new()),
+                        )));
+                    legs.handles
+                        .push(tokio::spawn(daemon::serve_luafs_watch_daemon_on(
+                            rpc.clone(),
+                            luafs_watch_rx,
+                        )));
+                    legs.handles
+                        .push(tokio::spawn(daemon::serve_config_daemon_on(
+                            rpc.clone(),
+                            config_rx,
+                        )));
+                    legs.fs = Some(fs_tx);
+                    legs.luafs = Some(luafs_tx);
+                    legs.luafs_watch = Some(luafs_watch_tx);
+                    legs.config = Some(config_tx);
+                }
+                LegGroup::Proc => {
+                    let (proc_tx, proc_rx) = unbounded_channel();
+                    legs.handles.push(tokio::spawn(daemon::serve_proc_daemon_on(
+                        rpc.clone(),
+                        proc_rx,
+                    )));
+                    legs.proc = Some(proc_tx);
+                }
+                LegGroup::Lsp => {
+                    let (lsp_tx, lsp_rx) = unbounded_channel();
+                    legs.handles.push(tokio::spawn(daemon::serve_lsp_daemon_on(
+                        rpc.clone(),
+                        lsp_rx,
+                    )));
+                    legs.lsp = Some(lsp_tx);
+                }
+                LegGroup::Term => {
+                    let (term_tx, term_rx) = unbounded_channel();
+                    legs.handles.push(tokio::spawn(daemon::serve_term_daemon_on(
+                        rpc.clone(),
+                        term_rx,
+                    )));
+                    legs.term = Some(term_tx);
+                }
+            }
+        }
+        legs
+    }
+
+    /// Route one inbound method to its leg's sender, or `None` when this set of legs
+    /// doesn't carry it — an unknown method (the peer is the same build, so it's dropped),
+    /// a daemon→client-only push (`luafs_change`/`luafs_watch_err` never arrive here), or —
+    /// on a multi-stream connection — a method whose group rides a *different* stream.
+    fn route(&self, method: &str) -> Option<&tokio::sync::mpsc::UnboundedSender<Incoming>> {
+        use daemon::LegGroup;
+        match LegGroup::classify(method)? {
+            LegGroup::Control => {
+                if method == "luafs_op" {
+                    self.luafs.as_ref()
+                } else if method == "luafs_watch" || method == "luafs_unwatch" {
+                    self.luafs_watch.as_ref()
+                } else if method.starts_with("fs_") {
+                    self.fs.as_ref()
+                } else if method.starts_with("config_") {
+                    self.config.as_ref()
+                } else {
+                    None
+                }
+            }
+            LegGroup::Proc => self.proc.as_ref(),
+            LegGroup::Lsp => self.lsp.as_ref(),
+            LegGroup::Term => self.term.as_ref(),
+        }
+    }
+
+    /// Drop every leg sender so each leg sees EOF and winds down, then await the tasks so
+    /// child reaping completes before the connection (or stream) closes.
+    async fn shutdown(self) {
+        drop((
+            self.fs,
+            self.proc,
+            self.term,
+            self.lsp,
+            self.luafs,
+            self.luafs_watch,
+            self.config,
+        ));
+        for handle in self.handles {
+            let _ = handle.await;
+        }
+    }
+}
+
+/// Drive one inbound stream into `legs`: route each message to its leg by method until
+/// the peer hangs up (EOF), then wind the legs down. Shared by the single-stream
+/// [`run_daemon_io`] (all four groups over one `Rpc`) and the per-stream
+/// [`run_daemon_group`] (one group over its own stream's `Rpc`).
+#[cfg(feature = "native")]
+async fn pump_daemon_legs(
+    mut incoming: tokio::sync::mpsc::UnboundedReceiver<Incoming>,
+    legs: DaemonLegs,
+) {
+    while let Some(msg) = incoming.recv().await {
+        let method = match &msg {
+            Incoming::Request { method, .. } | Incoming::Notification { method, .. } => {
+                method.as_str()
+            }
+        };
+        // A leg whose task has exited closes its receiver; ignore the send error and keep
+        // multiplexing the rest.
+        if let Some(tx) = legs.route(method) {
+            let _ = tx.send(msg);
+        }
+    }
+    legs.shutdown().await;
+}
+
+/// Serve one [`LegGroup`](daemon::LegGroup)'s legs over a single multiplexed stream's
+/// halves — the multi-stream path, one QUIC/WebTransport stream per group. The stream's
+/// leading group-tag byte has already been consumed by the caller (which is how it chose
+/// `group`), so this is transport-agnostic: it owns the stream's own [`Rpc`] so the group
+/// writes its replies and pushes back on *its* stream, never blocking — or blocked by —
+/// another group's stream. The QUIC listener ([`serve_quic`]) drives one of these per
+/// accepted stream.
+#[cfg(feature = "native")]
+pub(crate) async fn run_daemon_group<R, W>(
+    reader: R,
+    writer: W,
+    group: daemon::LegGroup,
+) -> anyhow::Result<()>
+where
+    R: AsyncRead + Unpin + Send + 'static,
+    W: AsyncWrite + Unpin + Send + 'static,
+{
+    let (rpc, incoming) = connect(reader, writer);
+    let legs = DaemonLegs::spawn(&[group], &rpc);
+    pump_daemon_legs(incoming, legs).await;
+    Ok(())
+}
+
 /// Run the **daemon** role (`nxvim --daemon`) over separate read/write halves
 /// (this process's `stdin` + `stdout`): serve every leg of the edit-host wire — fs
 /// reads/writes, the watch push, child processes, the blocking `vim.system`
@@ -2490,97 +2685,20 @@ where
     R: AsyncRead + Unpin + Send + 'static,
     W: AsyncWrite + Unpin + Send + 'static,
 {
-    use nxvim_lua::StdLuaFs;
-    use tokio::sync::mpsc::unbounded_channel;
-
-    let (rpc, mut incoming) = connect(reader, writer);
-
-    // One forwarding channel per leg; each leg runs its existing loop over its own
-    // demuxed inbound stream and a clone of the shared `Rpc`. The daemon backs every
-    // leg with the same `Std*` impl the local server uses, so a file/process/server
-    // behaves identically run here or across the wire.
-    let (fs_tx, fs_rx) = unbounded_channel();
-    let (proc_tx, proc_rx) = unbounded_channel();
-    let (term_tx, term_rx) = unbounded_channel();
-    let (lsp_tx, lsp_rx) = unbounded_channel();
-    let (luafs_tx, luafs_rx) = unbounded_channel();
-    let (luafs_watch_tx, luafs_watch_rx) = unbounded_channel();
-    let (config_tx, config_rx) = unbounded_channel();
-
-    let legs = [
-        tokio::spawn(daemon::serve_fs_daemon_on(
-            rpc.clone(),
-            fs_rx,
-            Box::new(StdHostFs),
-        )),
-        tokio::spawn(daemon::serve_proc_daemon_on(rpc.clone(), proc_rx)),
-        tokio::spawn(daemon::serve_term_daemon_on(rpc.clone(), term_rx)),
-        tokio::spawn(daemon::serve_lsp_daemon_on(rpc.clone(), lsp_rx)),
-        tokio::spawn(daemon::serve_luafs_daemon_on(
-            rpc.clone(),
-            luafs_rx,
-            Box::new(StdLuaFs::new()),
-        )),
-        tokio::spawn(daemon::serve_luafs_watch_daemon_on(
-            rpc.clone(),
-            luafs_watch_rx,
-        )),
-        tokio::spawn(daemon::serve_config_daemon_on(rpc.clone(), config_rx)),
-    ];
-
-    // The multiplexer: route each inbound message to its leg by method namespace.
-    while let Some(msg) = incoming.recv().await {
-        let leg = {
-            let method = match &msg {
-                Incoming::Request { method, .. } | Incoming::Notification { method, .. } => {
-                    method.as_str()
-                }
-            };
-            if method.starts_with("fs_") {
-                Some(&fs_tx)
-            } else if method.starts_with("proc_") {
-                Some(&proc_tx)
-            } else if method.starts_with("term_") {
-                Some(&term_tx)
-            } else if method.starts_with("lsp_") {
-                Some(&lsp_tx)
-            } else if method == "luafs_op" {
-                // The `nx.fs` off-tick leg — the whole `FsJob` run through `run_fs_job`
-                // against the daemon's `StdLuaFs` (native-daemon and wasm both use it).
-                Some(&luafs_tx)
-            } else if method == "luafs_watch" || method == "luafs_unwatch" {
-                // The streaming `nx.fs.watch` leg (Phase 3b) — its own recursive watcher,
-                // distinct from the buffer-reconcile `fs_watch` poll above.
-                Some(&luafs_watch_tx)
-            } else if method.starts_with("config_") {
-                // The config leg: `config_bundle` ships the daemon's config + plugins to
-                // the edit-host (fetched once at session start).
-                Some(&config_tx)
-            } else {
-                None // unknown method: drop (the peer is the same build)
-            }
-        };
-        // A leg whose task has exited closes its receiver; ignore the send error and
-        // keep multiplexing the rest.
-        if let Some(tx) = leg {
-            let _ = tx.send(msg);
-        }
-    }
-
-    // The edit-host hung up: drop the senders so each leg sees EOF and winds down,
-    // then wait for them so child reaping completes before we return.
-    drop((
-        fs_tx,
-        proc_tx,
-        term_tx,
-        lsp_tx,
-        luafs_tx,
-        luafs_watch_tx,
-        config_tx,
-    ));
-    for leg in legs {
-        let _ = leg.await;
-    }
+    // Single-stream transport (ssh/stdio, the in-process test duplex): all four leg
+    // groups share one ordered stream and one `Rpc`, demuxed by method. (The QUIC /
+    // WebTransport transports give each group its own stream via [`run_daemon_group`].)
+    let (rpc, incoming) = connect(reader, writer);
+    let legs = DaemonLegs::spawn(
+        &[
+            daemon::LegGroup::Control,
+            daemon::LegGroup::Proc,
+            daemon::LegGroup::Lsp,
+            daemon::LegGroup::Term,
+        ],
+        &rpc,
+    );
+    pump_daemon_legs(incoming, legs).await;
     Ok(())
 }
 

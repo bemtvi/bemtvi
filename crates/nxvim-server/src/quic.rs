@@ -12,12 +12,15 @@
 //! (a fuzzy-finder's `rg`, an `npm install`) head-of-line-blocks an `HostFs` save or an LSP
 //! `didChange` queued behind it, and app-level framing can't escape it (the bytes are
 //! already committed to one socket). QUIC's independent streams remove that coupling at
-//! the protocol level. *This slice* still multiplexes all six legs over **one** bidi
-//! stream — the stdio proof carries over verbatim because [`connect_daemon`] /
-//! [`run_daemon_io`] take any `AsyncRead`/`AsyncWrite` and a QUIC bidi stream's halves
-//! implement exactly those. Splitting the six traffic classes onto one QUIC stream *per
-//! `HostServices` class* (the actual HOL escape) is the follow-up the *Transport & stream
-//! multiplexing* section describes; it builds on this listener, it does not block it.
+//! the protocol level, and this transport uses them: the legs are split across **four**
+//! bidi streams by latency class ([`LegGroup`](crate::daemon::LegGroup) — Control / Proc /
+//! Lsp / Term), each carrying one class so a flood on one can't block another. The edit-host
+//! opens one stream per group it uses, tagging each with the group's one-byte id
+//! ([`LegGroup::tag`](crate::daemon::LegGroup)); the daemon reads the tag and serves that
+//! group over the stream ([`run_daemon_group`]). The single-stream stdio path
+//! ([`connect_daemon`] / [`run_daemon_io`]) is unchanged — it demuxes all four groups over
+//! one ordered stream — so an ssh hop and an in-process test duplex still work verbatim.
+//! See `docs/plans/2026-06-26-multi-stream-daemon-transport.md`.
 //!
 //! **Auth (Open Decision #2).** A daemon executes arbitrary processes, so an
 //! unauthenticated listener is remote code execution by design — the TLS cert buys
@@ -38,6 +41,7 @@ use std::net::SocketAddr;
 use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
+use tokio::io::AsyncWriteExt;
 use wtransport::endpoint::endpoint_side;
 use wtransport::endpoint::IncomingSession;
 use wtransport::tls::Sha256Digest;
@@ -47,8 +51,8 @@ use wtransport::{
 
 use nxvim_rpc::connect;
 
-use crate::daemon::{serve_daemon_link, DaemonClient};
-use crate::run_daemon_io;
+use crate::daemon::{serve_daemon_link_inner, DaemonClient, GroupLink, LegGroup};
+use crate::run_daemon_group;
 
 /// The SAN entries the daemon's self-signed cert is minted for. Loopback names cover the
 /// local two-process split and a port-forwarded tunnel; cert-hash pinning
@@ -136,12 +140,13 @@ pub fn bind_quic_listener(
     ))
 }
 
-/// Accept connections forever, running the full six-leg [`run_daemon_io`] multiplexer over
-/// each authenticated connection's single bidi stream. Each connection is served on its
-/// own task, so a slow/stuck peer can't block new ones. A connection that fails auth (bad
-/// or missing bearer `token`) or transport is logged to stderr (the daemon's stderr is a
-/// log file in the `--connect-daemon` wiring — never the TUI) and dropped; per
-/// `No silent stubs or skips`, the rejection is loud, not a silent close.
+/// Accept connections forever, serving each authenticated connection's per-group streams
+/// (one [`run_daemon_group`] per stream — Open Decision #2's stream multiplexing). Each
+/// connection is served on its own task, so a slow/stuck peer can't block new ones. A
+/// connection that fails auth (bad or missing bearer `token`) or transport is logged to
+/// stderr (the daemon's stderr is a log file in the `--connect-daemon` wiring — never the
+/// TUI) and dropped; per `No silent stubs or skips`, the rejection is loud, not a silent
+/// close.
 pub async fn serve_quic(endpoint: Endpoint<endpoint_side::Server>, token: String) -> Result<()> {
     let token: std::sync::Arc<str> = token.into();
     loop {
@@ -155,10 +160,16 @@ pub async fn serve_quic(endpoint: Endpoint<endpoint_side::Server>, token: String
     }
 }
 
-/// Authenticate one incoming session by its CONNECT-path bearer token, then run the
-/// daemon multiplexer over the client's bidi stream until either side hangs up. A token
-/// mismatch returns before `accept()`, so the session is never established — the
-/// edit-host's `connect` errors rather than seeing a half-open link.
+/// Authenticate one incoming session by its CONNECT-path bearer token, then serve the
+/// client's leg-group streams until the connection drops. A token mismatch returns before
+/// `accept()`, so the session is never established — the edit-host's `connect` errors
+/// rather than seeing a half-open link.
+///
+/// After auth, the edit-host opens one bidi stream per [`LegGroup`] it uses, each prefixed
+/// with the group's one-byte tag; the daemon accepts them in a loop and serves each on its
+/// own task ([`serve_group_stream`]), so one group's flood can't head-of-line-block
+/// another. The accept loop ends when the connection closes (every stream then EOFs and
+/// its group winds down).
 async fn serve_one(incoming: IncomingSession, token: &str) -> Result<()> {
     let request = incoming
         .await
@@ -181,13 +192,36 @@ async fn serve_one(incoming: IncomingSession, token: &str) -> Result<()> {
         .accept()
         .await
         .context("accepting the WebTransport session")?;
-    // The edit-host opens the one bidi stream (`open_bi`); the daemon accepts it. All six
-    // legs share it, demuxed by method namespace inside `run_daemon_io`.
-    let (send, recv) = connection
-        .accept_bi()
+
+    // Accept each leg-group stream the edit-host opens over this connection's lifetime
+    // (Control/Proc/Lsp from a native edit-host; the browser adds Term/…). One task per
+    // stream; a bad tag or transport error on one is logged loud and drops only that
+    // stream. The loop ends when `accept_bi` errors — the connection closed.
+    let mut streams = Vec::new();
+    while let Ok((send, recv)) = connection.accept_bi().await {
+        streams.push(tokio::spawn(async move {
+            if let Err(e) = serve_group_stream(recv, send).await {
+                eprintln!("nxvim --daemon: stream ended: {e:#}");
+            }
+        }));
+    }
+    for stream in streams {
+        let _ = stream.await;
+    }
+    Ok(())
+}
+
+/// Read a freshly-accepted stream's leading [`LegGroup`] tag byte, then serve that group's
+/// legs over the rest of the stream ([`run_daemon_group`]). An unrecognised tag is a loud
+/// error (a protocol mismatch — the peer is the same build), surfaced to [`serve_one`]'s
+/// per-stream logging rather than silently dropped.
+async fn serve_group_stream(mut recv: RecvStream, send: SendStream) -> Result<()> {
+    let mut tag = [0u8; 1];
+    recv.read_exact(&mut tag)
         .await
-        .context("accepting the daemon bidi stream")?;
-    run_daemon_io(recv, send).await
+        .context("reading the daemon stream's group tag")?;
+    let group = LegGroup::from_tag(tag[0])?;
+    run_daemon_group(recv, send, group).await
 }
 
 /// Connect to a `--daemon --listen` listener at `url` (`https://host:port`), pinning its
@@ -230,8 +264,7 @@ pub fn connect_quic(url: &str, cert_hash: &str, token: &str) -> Result<DaemonCli
             }
         };
         rt.block_on(async move {
-            let (endpoint, connection, send, recv) = match quic_dial(&connect_url, cert_hash).await
-            {
+            let (endpoint, connection, streams) = match quic_dial(&connect_url, cert_hash).await {
                 Ok(parts) => parts,
                 Err(e) => {
                     let _ = dial_tx.send(Err(e));
@@ -243,12 +276,18 @@ pub fn connect_quic(url: &str, cert_hash: &str, token: &str) -> Result<DaemonCli
             let _endpoint = endpoint;
             let _connection = connection;
 
-            let (rpc, incoming) = connect(recv, send);
+            // One `Rpc`/inbound stream per leg group (Control/Proc/Lsp — the native client
+            // never opens Term). Each rides its own QUIC stream, so a flood on one group
+            // can't head-of-line-block another.
+            let [control, proc, lsp] = streams.map(|(send, recv)| {
+                let (rpc, incoming) = connect(recv, send);
+                GroupLink { rpc, incoming }
+            });
             // The wire is up; tell the caller, then hand off the seams and serve.
             if dial_tx.send(Ok(())).is_err() {
                 return; // caller gave up waiting
             }
-            serve_daemon_link(rpc, incoming, client_tx).await;
+            serve_daemon_link_inner(control, proc, lsp, client_tx).await;
         });
     });
 
@@ -260,18 +299,18 @@ pub fn connect_quic(url: &str, cert_hash: &str, token: &str) -> Result<DaemonCli
         .map_err(|_| anyhow!("connect_quic: the link thread died before handing off the client"))
 }
 
-/// Build the client endpoint, dial `url` (pinning `cert_hash`), and open the one bidi
-/// stream the daemon multiplexer rides. Returns the endpoint + connection (the caller
-/// keeps them alive) and the stream halves: the edit-host **reads** daemon replies off
-/// `recv` and **writes** requests on `send`.
+/// Build the client endpoint, dial `url` (pinning `cert_hash`), and open the native
+/// edit-host's three leg-group bidi streams — Control, Proc, Lsp (the native client never
+/// drives Term). Returns the endpoint + connection (the caller keeps them alive) and the
+/// stream halves per group, in that order; the edit-host **reads** that group's daemon
+/// pushes off `recv` and **writes** its requests on `send`.
 async fn quic_dial(
     url: &str,
     cert_hash: Sha256Digest,
 ) -> Result<(
     Endpoint<endpoint_side::Client>,
     Connection,
-    SendStream,
-    RecvStream,
+    [(SendStream, RecvStream); 3],
 )> {
     let config = ClientConfig::builder()
         .with_bind_default()
@@ -286,13 +325,32 @@ async fn quic_dial(
         .connect(url)
         .await
         .with_context(|| format!("connecting to the daemon at {url} (cert/token rejected?)"))?;
-    let (send, recv) = connection
+    let control = open_group_stream(&connection, LegGroup::Control).await?;
+    let proc = open_group_stream(&connection, LegGroup::Proc).await?;
+    let lsp = open_group_stream(&connection, LegGroup::Lsp).await?;
+    Ok((endpoint, connection, [control, proc, lsp]))
+}
+
+/// Open one bidi stream and write its leg-group tag as the first byte, then flush so the
+/// daemon's `accept_bi` sees the stream (and its tag) promptly even when the group is idle
+/// at startup. Returns the stream halves for [`connect`] to drive.
+async fn open_group_stream(
+    connection: &Connection,
+    group: LegGroup,
+) -> Result<(SendStream, RecvStream)> {
+    let (mut send, recv) = connection
         .open_bi()
         .await
-        .context("opening the daemon bidi stream")?
+        .with_context(|| format!("opening the daemon {group:?} stream"))?
         .await
-        .context("initializing the daemon bidi stream")?;
-    Ok((endpoint, connection, send, recv))
+        .with_context(|| format!("initializing the daemon {group:?} stream"))?;
+    send.write_all(&[group.tag()])
+        .await
+        .with_context(|| format!("writing the {group:?} stream tag"))?;
+    send.flush()
+        .await
+        .with_context(|| format!("flushing the {group:?} stream tag"))?;
+    Ok((send, recv))
 }
 
 /// Compare two byte slices in time independent of where they first differ (and of the

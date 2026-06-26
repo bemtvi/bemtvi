@@ -114,8 +114,12 @@ its job.
 - **ssh vs. QUIC.** ssh stdio carries every leg over one ordered stream — simple, but
   a process flood (a fuzzy-finder's `rg`, an `npm install`) can head-of-line-block a
   file save queued behind it. QUIC gives each traffic class its own stream, removing
-  that coupling at the protocol level; because it's the same `wtransport`/`quinn` stack
-  the browser's WebTransport uses, native and browser **unify on one daemon**.
+  that coupling at the protocol level: the legs ride four independently flow-controlled
+  bidi streams by latency class — Control (`fs` / `config` / `nx.fs`), Proc, Lsp, Term —
+  each prefixed with a one-byte group tag the daemon dispatches on. Because it's the same
+  `wtransport`/`quinn` stack the browser's WebTransport uses, native and browser **unify
+  on one daemon** (the browser opens the same four streams). See
+  [the multi-stream plan](plans/2026-06-26-multi-stream-daemon-transport.md).
 - **`:connect` swaps the backend, not the window.** In the GUI, `:connect` builds a
   *fresh local server* whose seams point at the daemon and re-attaches the same window.
   The editor transport is always the in-process duplex, so the window never notices.

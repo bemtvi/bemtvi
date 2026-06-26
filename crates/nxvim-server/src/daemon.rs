@@ -222,6 +222,84 @@ const LUAFS_WATCH_ERR: &str = "luafs_watch_err"; // daemon → edit-host: [id, m
 // auto-installs the same set locally (parsers are native artifacts, never fetched).
 const CONFIG_BUNDLE: &str = "config_bundle";
 
+/// One latency class of daemon traffic — the unit a multi-stream transport
+/// (QUIC/WebTransport) gives its **own** bidi stream, so a flood on one class can't
+/// head-of-line-block another at the protocol level. The four groups partition every wire
+/// method (see [`LegGroup::classify`]); a single-stream transport (ssh/stdio, the
+/// in-process test duplex) carries all four over one stream instead, demuxed by method.
+///
+/// A stream's group is fixed by a one-byte **tag** ([`LegGroup::tag`]) the *client* writes
+/// as the stream's first byte; the daemon reads it ([`LegGroup::from_tag`]) and routes the
+/// rest of the stream to that group's legs. See
+/// `docs/plans/2026-06-26-multi-stream-daemon-transport.md`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum LegGroup {
+    /// Latency-critical + low-volume: `fs_*` (save/read/watch), `config_*` (one-shot
+    /// bundle), and the `nx.fs` legs (`luafs_op`, `luafs_watch`/`luafs_unwatch`).
+    Control,
+    /// Run-to-completion process floods (`proc_*` — `rg`, `npm install`).
+    Proc,
+    /// The long-lived bidirectional LSP pipe (`lsp_*`).
+    Lsp,
+    /// The streaming PTY (`term_*`) — a browser-only sender today.
+    Term,
+}
+
+impl LegGroup {
+    /// The wire tag byte that names this group on a freshly-opened stream. The client
+    /// writes it as the stream's first byte; the daemon reads it ([`from_tag`]) and
+    /// dispatches the rest of the stream to this group's legs.
+    ///
+    /// [`from_tag`]: LegGroup::from_tag
+    pub(crate) fn tag(self) -> u8 {
+        match self {
+            LegGroup::Control => 0,
+            LegGroup::Proc => 1,
+            LegGroup::Lsp => 2,
+            LegGroup::Term => 3,
+        }
+    }
+
+    /// Resolve a stream's leading tag byte back to its group, or a loud error on an
+    /// unrecognised tag (a protocol mismatch — never silently dropped, per
+    /// `No silent stubs or skips`).
+    pub(crate) fn from_tag(b: u8) -> anyhow::Result<Self> {
+        match b {
+            0 => Ok(LegGroup::Control),
+            1 => Ok(LegGroup::Proc),
+            2 => Ok(LegGroup::Lsp),
+            3 => Ok(LegGroup::Term),
+            other => Err(anyhow::anyhow!("unknown daemon stream group tag {other}")),
+        }
+    }
+
+    /// The group that owns a wire method, or `None` for an unknown method (the peer is
+    /// the same build, so an unrecognised method is dropped). The four arms partition the
+    /// method namespace disjointly — `fs_*` / `config_*` / `luafs_*` to [`Control`],
+    /// `proc_*` to [`Proc`], `lsp_*` to [`Lsp`], `term_*` to [`Term`].
+    ///
+    /// [`Control`]: LegGroup::Control
+    /// [`Proc`]: LegGroup::Proc
+    /// [`Lsp`]: LegGroup::Lsp
+    /// [`Term`]: LegGroup::Term
+    pub(crate) fn classify(method: &str) -> Option<Self> {
+        if method.starts_with("fs_")
+            || method.starts_with("config_")
+            || method.starts_with("luafs_")
+        {
+            Some(LegGroup::Control)
+        } else if method.starts_with("proc_") {
+            Some(LegGroup::Proc)
+        } else if method.starts_with("lsp_") {
+            Some(LegGroup::Lsp)
+        } else if method.starts_with("term_") {
+            Some(LegGroup::Term)
+        } else {
+            None
+        }
+    }
+}
+
 /// What the daemon reports back about one child, demuxed off the wire and handed to
 /// the [`RemoteHostProc::run`] future waiting on that spawn's `id`. Mirrors the two
 /// [`ProcEvents`] reports the future then re-emits to the editor.
@@ -2233,48 +2311,122 @@ where
         .expect("connect_daemon: the link thread could not build a tokio runtime")
 }
 
-/// Build the four edit-host seams over an already-connected `(rpc, incoming)` pair,
-/// hand the [`DaemonClient`] out on `client_tx`, then drive the link — the [`run_fs_jobs`]
-/// job server (the `nx.fs` `luafs_op` leg) plus the single [`run_client_demux`] — until the
-/// daemon hangs up. This is the transport-agnostic heart of [`connect_daemon`]; the QUIC
-/// connector ([`crate::quic::connect_quic`]) calls it with the halves of a QUIC bidi stream,
-/// the link thread keeping the endpoint + connection alive in scope. Runs on the dedicated
-/// link thread's runtime (so the wire is driven off the server's thread — see
-/// [`connect_daemon`]).
+/// One leg group's link to the daemon: the [`Rpc`] its seams issue requests/notifies on,
+/// and the inbound notification stream the daemon pushes back on. A multi-stream transport
+/// (QUIC/WebTransport) gives each group its **own** `(Rpc, incoming)` from a dedicated
+/// stream; a single-stream transport (ssh/stdio) clones one `Rpc` across the three and
+/// splits the one inbound stream into per-group `incoming`s by method
+/// ([`serve_daemon_link`]). Either way the seams and the per-group demuxes are identical.
+pub(crate) struct GroupLink {
+    pub(crate) rpc: Rpc,
+    pub(crate) incoming: UnboundedReceiver<Incoming>,
+}
+
+/// Drive a **single-stream** link (ssh/stdio, the in-process test duplex): every leg group
+/// shares the one `(rpc, incoming)`, so split the one inbound notification stream into the
+/// three logical groups by method and hand them to the same [`serve_daemon_link_inner`] the
+/// multi-stream (QUIC) path uses, with the one `Rpc` cloned across the groups. The
+/// transport-agnostic seam construction lives in `serve_daemon_link_inner`.
 pub(crate) async fn serve_daemon_link(
     rpc: Rpc,
     incoming: UnboundedReceiver<Incoming>,
     client_tx: std::sync::mpsc::Sender<DaemonClient>,
 ) {
-    // Notification-routed legs: shared state the demux forwards into.
+    let (ctrl_tx, ctrl_rx) = unbounded_channel::<Incoming>();
+    let (proc_tx, proc_rx) = unbounded_channel::<Incoming>();
+    let (lsp_tx, lsp_rx) = unbounded_channel::<Incoming>();
+    tokio::spawn(split_incoming(incoming, ctrl_tx, proc_tx, lsp_tx));
+    serve_daemon_link_inner(
+        GroupLink {
+            rpc: rpc.clone(),
+            incoming: ctrl_rx,
+        },
+        GroupLink {
+            rpc: rpc.clone(),
+            incoming: proc_rx,
+        },
+        GroupLink {
+            rpc,
+            incoming: lsp_rx,
+        },
+        client_tx,
+    )
+    .await;
+}
+
+/// Fan a single-stream link's one inbound stream into the three per-group channels by
+/// method (the symmetric twin of the daemon-side `DaemonLegs` demux). A `term_*` push (no
+/// native consumer) or an unknown method drops. On EOF the three senders drop, closing the
+/// per-group demuxes downstream.
+async fn split_incoming(
+    mut incoming: UnboundedReceiver<Incoming>,
+    ctrl_tx: UnboundedSender<Incoming>,
+    proc_tx: UnboundedSender<Incoming>,
+    lsp_tx: UnboundedSender<Incoming>,
+) {
+    while let Some(msg) = incoming.recv().await {
+        let method = match &msg {
+            Incoming::Request { method, .. } | Incoming::Notification { method, .. } => {
+                method.as_str()
+            }
+        };
+        let tx = match LegGroup::classify(method) {
+            Some(LegGroup::Control) => &ctrl_tx,
+            Some(LegGroup::Proc) => &proc_tx,
+            Some(LegGroup::Lsp) => &lsp_tx,
+            // Term has no native client consumer; an unknown method drops (same build).
+            Some(LegGroup::Term) | None => continue,
+        };
+        let _ = tx.send(msg);
+    }
+}
+
+/// Build the five edit-host seams over the three per-group links, hand the
+/// [`DaemonClient`] out on `client_tx`, then drive the link — the [`run_fs_jobs`] job
+/// server (the `nx.fs` `luafs_op` leg, on the **Control** group) plus one demux per group —
+/// until the daemon hangs up. The transport-agnostic heart shared by [`serve_daemon_link`]
+/// (single-stream) and the QUIC connector ([`crate::quic::connect_quic`], one real stream
+/// per group). Each seam issues on its group's `Rpc`: `host_fs`/`fs_jobs`/`config` on
+/// Control, `host_proc` on Proc, `lsp_transport` on Lsp — so a flood on one group's stream
+/// can't head-of-line-block another. Runs on the dedicated link thread's runtime.
+pub(crate) async fn serve_daemon_link_inner(
+    control: GroupLink,
+    proc: GroupLink,
+    lsp: GroupLink,
+    client_tx: std::sync::mpsc::Sender<DaemonClient>,
+) {
+    // Notification-routed legs: shared state each group's demux forwards into.
     let proc_inflight: Inflight = Arc::new(Mutex::new(HashMap::new()));
     let lsp_inflight: LspInflightMap = Arc::new(Mutex::new(HashMap::new()));
     let (watch_tx, watch_rx) = unbounded_channel::<WatchEvent>();
 
     // The `nx.fs` (`luafs_op`) leg: the job channel its seam sends whole `FsJob`s onto and
-    // its job server (below) pulls from.
+    // its job server (below) pulls from. `luafs_op` is a Control method, so the job server
+    // issues on the Control `Rpc`.
     let (fs_jobs_tx, fs_jobs_rx) = unbounded_channel::<FsJobReq>();
 
     let client = DaemonClient {
         host_fs: RemoteHostFs {
-            rpc: rpc.clone(),
+            rpc: control.rpc.clone(),
             watch_rx: Mutex::new(Some(watch_rx)),
         },
         host_proc: RemoteHostProc {
-            rpc: rpc.clone(),
+            rpc: proc.rpc.clone(),
             inflight: proc_inflight.clone(),
             next_id: AtomicU64::new(1),
         },
         lsp_transport: RemoteLspTransport {
-            rpc: rpc.clone(),
+            rpc: lsp.rpc.clone(),
             inflight: lsp_inflight.clone(),
             next_id: AtomicU64::new(1),
         },
         fs_jobs: RemoteFsJobs { req_tx: fs_jobs_tx },
-        // The config leg shares the link's `Rpc`; its `config_bundle` responses are
-        // msgid-routed inside `Rpc` (never an `Incoming`), so the existing demux drains
+        // The config leg shares the Control `Rpc`; its `config_bundle` responses are
+        // msgid-routed inside `Rpc` (never an `Incoming`), so the Control demux just drains
         // the inbound stream — no extra wiring needed here.
-        config: RemoteConfig { rpc: rpc.clone() },
+        config: RemoteConfig {
+            rpc: control.rpc.clone(),
+        },
     };
     // Hand the seams out before serving; if the caller already dropped, there's
     // nothing to drive.
@@ -2282,57 +2434,35 @@ pub(crate) async fn serve_daemon_link(
         return;
     }
 
-    // The `nx.fs` job server rides this shared runtime as a task; the demux is the main
-    // future. Both share the one `incoming`/`Rpc`.
-    tokio::spawn(run_fs_jobs(rpc.clone(), fs_jobs_rx));
-    run_client_demux(incoming, proc_inflight, lsp_inflight, watch_tx).await;
+    // The `nx.fs` job server rides this shared runtime as a task on the Control `Rpc`; the
+    // three per-group demuxes are the main future, joined so the link lives until every
+    // group's stream EOFs.
+    tokio::spawn(run_fs_jobs(control.rpc.clone(), fs_jobs_rx));
+    tokio::join!(
+        run_control_demux(control.incoming, watch_tx),
+        run_demux(proc.incoming, proc_inflight),
+        run_lsp_demux(lsp.incoming, lsp_inflight),
+    );
 }
 
-/// The one demux for every daemon→edit-host notification, fanning each to its leg by
-/// method: `proc_spawned`/`proc_exited` to the in-flight spawn, `fs_changed` to the
-/// watch channel, and the LSP pushes to [`route_lsp_notification`] (which ignores any
-/// non-LSP method, so unknown notifications drop). Request *responses* never arrive here
-/// — [`Rpc`] msgid-routes them internally. On EOF (the daemon hung up) it clears the
-/// proc + LSP maps so every waiting child reports its synthesized exit instead of
-/// hanging, and drops `watch_tx` to end the server's watch arm.
-async fn run_client_demux(
+/// The **Control** group's inbound demux: `fs_changed` to the watch channel. Request
+/// *responses* (`fs_read`/`fs_write`/`luafs_op`/`config_bundle`) never arrive here — [`Rpc`]
+/// msgid-routes them internally. `luafs_change`/`luafs_watch_err` have no native consumer
+/// and drop. On EOF, dropping `watch_tx` ends the server's watch arm.
+async fn run_control_demux(
     mut incoming: UnboundedReceiver<Incoming>,
-    proc_inflight: Inflight,
-    lsp_inflight: LspInflightMap,
     watch_tx: UnboundedSender<WatchEvent>,
 ) {
     while let Some(msg) = incoming.recv().await {
         let Incoming::Notification { method, params } = msg else {
             continue; // the daemon speaks only notifications; ignore stray requests
         };
-        match method.as_str() {
-            PROC_SPAWNED => {
-                if let Some((id, ev)) = decode_spawned(&params) {
-                    forward(&proc_inflight, id, ev);
-                }
+        if method == FS_CHANGED {
+            if let Some(ev) = decode_fs_changed(params) {
+                // The server may not have taken the watch receiver yet at startup; a send
+                // that finds no receiver is harmlessly dropped.
+                let _ = watch_tx.send(ev);
             }
-            PROC_STDOUT => {
-                if let Some((id, ev)) = decode_stdout(params) {
-                    forward(&proc_inflight, id, ev);
-                }
-            }
-            PROC_EXITED => {
-                if let Some((id, ev)) = decode_exited(params) {
-                    forward(&proc_inflight, id, ev);
-                }
-            }
-            FS_CHANGED => {
-                if let Some(ev) = decode_fs_changed(params) {
-                    // The server may not have taken the watch receiver yet at startup; a
-                    // send that finds no receiver is harmlessly dropped.
-                    let _ = watch_tx.send(ev);
-                }
-            }
-            // Everything else routes through the LSP helper, which handles the three
-            // `lsp_*` pushes and no-ops any other (e.g. unknown) method.
-            other => route_lsp_notification(&lsp_inflight, other, params),
         }
     }
-    proc_inflight.lock().unwrap().clear();
-    lsp_inflight.lock().unwrap().clear();
 }

@@ -430,6 +430,71 @@ fn a_left_dock_paints_left_of_the_main_area_with_a_border() {
     );
 }
 
+/// First `(row, col)` where `needle` appears in the painted grid, scanning rows
+/// top-to-bottom. `col` is a cell column — `row_text` joins cell symbols, so the
+/// byte offset is mapped back to a char count (border glyphs are multibyte).
+fn find_text(buf: &Buffer, needle: &str) -> Option<(u16, usize)> {
+    (0..buf.area.height).find_map(|y| {
+        let row = row_text(buf, y);
+        row.find(needle).map(|b| (y, row[..b].chars().count()))
+    })
+}
+
+#[test]
+fn completion_docs_follow_the_menu_past_a_left_dock() {
+    // A completion popup's docs sidebar is `editor_relative` but must stay glued to
+    // the menu's right edge even when a left dock shifts the focused window — it
+    // anchors to the focused window's REGION origin, not the bare frame. (Regression:
+    // it slid left by the dock band and overlapped the list.)
+    //
+    // 40×8 grid (cmd row 7). Left dock width 8 ⇒ the main area starts at col 9 (8
+    // content cells + a separator at col 8), so the focused window's text inner is at
+    // col 9. The menu's box left border lands at 9 + col(2) − left_shift(1) = 10 and
+    // spans cols 10..18; the docs box (col 10, region-relative) must follow at
+    // 9 + 10 − 1 = 18, its body one cell in at col 19.
+    let docs = Value::Map(vec![
+        (Value::from("lines"), lines(&["DOCBODY"])),
+        (Value::from("row"), Value::from(1u64)),
+        (Value::from("col"), Value::from(10u64)),
+        (Value::from("width"), Value::from(7u64)),
+        (Value::from("height"), Value::from(1u64)),
+        (Value::from("editor_relative"), Value::from(true)),
+    ]);
+    let menu = Value::Map(vec![
+        (
+            Value::from("items"),
+            Value::Array(vec![Value::from("world"), Value::from("worry")]),
+        ),
+        (Value::from("selected"), Value::from(0u64)),
+        (Value::from("selected_active"), Value::from(true)),
+        (Value::from("row"), Value::from(1u64)),
+        (Value::from("col"), Value::from(2u64)),
+        (Value::from("width"), Value::from(6u64)),
+        (Value::from("height"), Value::from(2u64)),
+        (Value::from("border_top"), Value::from(false)),
+        (Value::from("docs"), docs),
+    ]);
+    let windows = Value::Array(vec![
+        region_window(rect(0, 0, 8, 6), "dock_left", false, &["TREE"]),
+        region_window(rect(0, 0, 31, 6), "main", true, &["hello wor"]),
+    ]);
+    let v = view(vec![
+        ("windows", windows),
+        ("dock_left", Value::from(8u64)),
+        ("menu", menu),
+    ]);
+    let buf = paint(&v, 40, 8);
+
+    // The list lands in the main area, past the dock band.
+    assert_eq!(find_text(&buf, "world"), Some((1, 11)), "menu list column");
+    // The docs body must sit just right of the menu box, not shifted left into it.
+    assert_eq!(
+        find_text(&buf, "DOCBODY"),
+        Some((2, 19)),
+        "docs sidebar glued to the menu's right edge"
+    );
+}
+
 #[test]
 fn a_top_dock_paints_above_the_main_area() {
     // 20×8 grid (cmd row 7). A top dock of height 2 owns rows 0..2 with a border on

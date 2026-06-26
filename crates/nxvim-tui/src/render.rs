@@ -332,7 +332,16 @@ pub(crate) fn render(
             } else {
                 inner
             };
-            render_menu(frame, base, editor_area, menu, &view.styles)
+            // The insert-completion docs sidebar is `editor_relative`, but its
+            // `col`/`row` are relative to the focused window's REGION origin (the
+            // server derives them from the window's region-local rect). So anchor it
+            // to that region's content rect — which carries any dock band offset —
+            // not the bare frame; otherwise a left/top dock slides the docs off the
+            // menu it sits beside (here it would overlap and erase the list).
+            let docs_base = view
+                .focused()
+                .map_or(editor_area, |w| dock.content(w.region));
+            render_menu(frame, base, docs_base, menu, &view.styles)
         }
         _ => None,
     };
@@ -2410,7 +2419,7 @@ fn render_pmenu(frame: &mut Frame, text_area: Rect, pmenu: &PmenuData, doc_scrol
 fn render_menu(
     frame: &mut Frame,
     text_area: Rect,
-    editor_area: Rect,
+    docs_base: Rect,
     menu: &MenuData,
     styles: &[nxvim_view::Style],
 ) -> Option<(u16, u16)> {
@@ -2645,10 +2654,12 @@ fn render_menu(
                 height: text_area.y.saturating_add(text_area.height),
             }
         } else if docs.editor_relative {
-            // The insert-completion sidebar floats over the whole editor (its geometry
-            // is windows-area-relative), not the focused window's text inner — so a
-            // split can't squeeze it into the focused pane.
-            editor_area
+            // The insert-completion sidebar floats over the focused window's whole
+            // REGION (its geometry is region-relative), not the window's text inner —
+            // so a split can't squeeze it into the focused pane — and `docs_base`
+            // carries the region's content origin (dock band included) so a dock
+            // shifts it with the menu.
+            docs_base
         } else {
             text_area
         };

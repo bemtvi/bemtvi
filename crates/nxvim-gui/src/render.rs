@@ -2612,10 +2612,12 @@ impl Renderer {
                     (by + docs.row).saturating_sub(menu.row),
                 )
             } else if docs.editor_relative {
-                // The insert-completion sidebar floats over the whole editor: its
-                // `col`/`row` are windows-area cells (the grid origin), not the focused
-                // window's text inner — so a split can't squeeze it into the focused pane.
-                (docs.col.saturating_sub(1), docs.row)
+                // The insert-completion sidebar floats over the focused window's whole
+                // REGION: its `col`/`row` are region-relative (a split can't squeeze it
+                // into the focused pane), so anchor it at that region's origin — which
+                // carries any dock band — not the bare grid origin. Otherwise a left/top
+                // dock slides the docs off the menu, overlapping and mixing with the list.
+                (origin.0 + docs.col.saturating_sub(1), origin.1 + docs.row)
             } else {
                 ((text_x0 + docs.col).saturating_sub(1), wy + docs.row)
             };

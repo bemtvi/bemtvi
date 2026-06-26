@@ -2107,10 +2107,18 @@
       const outerH = boxRows + (top ? 1 : 0) + (bottom ? 1 : 0);
       // The anchor base: the `nx.picker` overlay (`editor_relative`) is editor-absolute
       // (windows-area cells), so it anchors at the grid origin and floats over the whole
-      // editor — a split can't drag it into the focused pane; every other menu anchors to
-      // the focused window's text inner (rect + tabline offset).
-      const baseX = menu.editor_relative ? 0 : rect.x;
-      const baseY = menu.editor_relative ? 0 : tablineRows + rect.y;
+      // editor — a split can't drag it into the focused pane; the cmdline wildmenu anchors
+      // to the command line (handled below). A cursor-anchored completion popup / select
+      // sits at the focused window's TEXT BODY: its region origin (which carries any dock
+      // band) + window rect + gutter (foldcolumn + signs + numbers), the same offset the
+      // cursor and the completed word sit at — otherwise a left dock slides the popup off
+      // the word it lines up under.
+      const o = regionOrigin(fw ? fw.region : "main", tablineRows);
+      const gutterW = fw
+        ? (fw.foldcolumn_width || 0) + (fw.sign_width || 0) + (fw.number_width || 0)
+        : 0;
+      const baseX = menu.editor_relative ? 0 : menu.cmdline ? rect.x : o.x + rect.x + gutterW;
+      const baseY = menu.editor_relative ? 0 : menu.cmdline ? tablineRows + rect.y : o.y + rect.y;
       // The cmdline wildmenu floats *above* the command line: anchor its outer box so the
       // bottom-border-less list kisses the input. Every other menu's border origin sits
       // where the server placed it (row `menu.row` off the base). `cmdShift` tracks the

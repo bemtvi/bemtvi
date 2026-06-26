@@ -69,6 +69,24 @@ fn shift_press(rpc: &Rpc, row: usize, col: usize) {
     );
 }
 
+/// Send a button press carrying an arbitrary `modifier` string (e.g. `"C"`,
+/// `"C-S"`, `"A"`) — the general counterpart of [`shift_press`], for driving the
+/// `<C-LeftMouse>` / `<RightMouse>` / `<MiddleMouse>` mappable-button path.
+/// Fire-and-forget; pair with a barrier read.
+fn press_mod(rpc: &Rpc, button: &str, modifier: &str, row: usize, col: usize) {
+    rpc.notify(
+        "nx_input_mouse",
+        vec![
+            Value::from(button),
+            Value::from("press"),
+            Value::from(modifier),
+            Value::from(0u64),
+            Value::from(row as u64),
+            Value::from(col as u64),
+        ],
+    );
+}
+
 /// The focused window's id (`nvim_get_current_win`).
 async fn current_win(rpc: &Rpc) -> u64 {
     rpc.request("nvim_get_current_win", vec![])
@@ -1340,6 +1358,156 @@ async fn middle_click_empty_clipboard_is_noop() {
     feed_mouse(&rpc, "middle", "press", 0, 2);
     assert_eq!(lines(&rpc).await, vec!["hello"], "nothing pasted");
     assert_eq!(mode(&rpc).await, "n");
+}
+
+// ===== Modifiers + right/middle as mappable buttons =========================
+
+/// `<C-LeftMouse>` is mappable: a Ctrl+left press fires the map, and — like a plain
+/// `<LeftMouse>` — the cursor is placed at the click first, so the map can act on the
+/// clicked position (the `<C-LeftMouse>` → go-to-definition idiom).
+#[tokio::test]
+async fn ctrl_left_mouse_can_be_mapped_and_places_cursor() {
+    let (rpc, _incoming) = start("hello world\nsecond line\nthird").await;
+    command(&rpc, "set nonumber norelativenumber").await;
+    exec_lua(
+        &rpc,
+        r#"
+        _G.ctrl_hits = 0
+        _G.line_at_click = nil
+        nx.keymap.set('n', '<C-LeftMouse>', function()
+          _G.ctrl_hits = _G.ctrl_hits + 1
+          _G.line_at_click = vim.fn.line('.')
+        end)
+        return true
+    "#,
+    )
+    .await;
+    press_mod(&rpc, "left", "C", 2, 4); // row 2 → line 3
+    assert_eq!(
+        exec_lua(&rpc, "return _G.ctrl_hits").await.as_u64(),
+        Some(1)
+    );
+    assert_eq!(
+        exec_lua(&rpc, "return _G.line_at_click").await.as_u64(),
+        Some(3),
+        "the cursor was placed on the clicked line before the Ctrl+click map fired"
+    );
+}
+
+/// A modifier distinguishes the mapping: with both `<LeftMouse>` and `<C-LeftMouse>`
+/// bound, a plain left fires only the plain map and a Ctrl+left only the Ctrl map —
+/// neither click triggers the other.
+#[tokio::test]
+async fn a_modifier_distinguishes_the_left_mouse_map() {
+    let (rpc, _incoming) = start("hello world\nsecond line\nthird").await;
+    command(&rpc, "set nonumber norelativenumber").await;
+    exec_lua(
+        &rpc,
+        r#"
+        _G.plain = 0
+        _G.ctrl = 0
+        nx.keymap.set('n', '<LeftMouse>', function() _G.plain = _G.plain + 1 end)
+        nx.keymap.set('n', '<C-LeftMouse>', function() _G.ctrl = _G.ctrl + 1 end)
+        return true
+    "#,
+    )
+    .await;
+    // Distinct cells so the two presses aren't counted as a double-click (a same-cell
+    // repeat within `'mousetime'` would escalate to `<C-2-LeftMouse>`).
+    feed_mouse(&rpc, "left", "press", 0, 0); // plain
+    assert_eq!(exec_lua(&rpc, "return _G.plain").await.as_u64(), Some(1));
+    assert_eq!(
+        exec_lua(&rpc, "return _G.ctrl").await.as_u64(),
+        Some(0),
+        "a plain click must not fire the <C-LeftMouse> map"
+    );
+    press_mod(&rpc, "left", "C", 1, 3); // ctrl, a different cell
+    assert_eq!(
+        exec_lua(&rpc, "return _G.plain").await.as_u64(),
+        Some(1),
+        "a Ctrl+click must not fire the plain <LeftMouse> map"
+    );
+    assert_eq!(exec_lua(&rpc, "return _G.ctrl").await.as_u64(), Some(1));
+}
+
+/// `<RightMouse>` is mappable: the press fires the map *instead of* the `'mousemodel'`
+/// default, so the default `popup_setpos` cursor move is suppressed.
+#[tokio::test]
+async fn right_mouse_can_be_mapped_and_suppresses_the_default() {
+    let (rpc, _incoming) = start("hello world\nsecond line\nthird").await;
+    command(&rpc, "set nonumber norelativenumber").await;
+    exec_lua(
+        &rpc,
+        r#"
+        _G.right_hits = 0
+        nx.keymap.set('n', '<RightMouse>', function() _G.right_hits = _G.right_hits + 1 end)
+        return true
+    "#,
+    )
+    .await;
+    assert_eq!(cursor(&rpc).await, (1, 0));
+    feed_mouse(&rpc, "right", "press", 1, 3); // would move to (2,3) under popup_setpos
+    assert_eq!(
+        exec_lua(&rpc, "return _G.right_hits").await.as_u64(),
+        Some(1)
+    );
+    assert_eq!(
+        cursor(&rpc).await,
+        (1, 0),
+        "the mapped right-click suppressed the popup_setpos cursor move"
+    );
+}
+
+/// `<MiddleMouse>` is mappable: the press fires the map *instead of* the `"*` paste,
+/// so the buffer is untouched.
+#[tokio::test]
+async fn middle_mouse_can_be_mapped_and_suppresses_the_paste() {
+    let (rpc, clip, _incoming) = start_with_clipboard("hello").await;
+    command(&rpc, "set nonumber norelativenumber").await;
+    clip.seed("XX", false);
+    exec_lua(
+        &rpc,
+        r#"
+        _G.mid_hits = 0
+        nx.keymap.set('n', '<MiddleMouse>', function() _G.mid_hits = _G.mid_hits + 1 end)
+        return true
+    "#,
+    )
+    .await;
+    feed_mouse(&rpc, "middle", "press", 0, 0);
+    assert_eq!(exec_lua(&rpc, "return _G.mid_hits").await.as_u64(), Some(1));
+    assert_eq!(
+        lines(&rpc).await,
+        vec!["hello"],
+        "the mapped middle-click suppressed the clipboard paste"
+    );
+}
+
+/// `<S-LeftMouse>` (the selection-extend gesture) is mappable too: the shift-press
+/// fires the map instead of entering Visual to extend.
+#[tokio::test]
+async fn shift_left_mouse_can_be_mapped_and_suppresses_extend() {
+    let (rpc, _incoming) = start("hello world\nsecond line\nthird").await;
+    command(&rpc, "set nonumber norelativenumber").await;
+    exec_lua(
+        &rpc,
+        r#"
+        _G.shift_hits = 0
+        nx.keymap.set('n', '<S-LeftMouse>', function() _G.shift_hits = _G.shift_hits + 1 end)
+        return true
+    "#,
+    )
+    .await;
+    shift_press(&rpc, 0, 6); // unmapped this would enter Visual and extend to col 6
+    assert_eq!(
+        exec_lua(&rpc, "return _G.shift_hits").await.as_u64(),
+        Some(1)
+    );
+    assert_eq!(
+        mode(&rpc).await,
+        "n",
+        "the mapped <S-LeftMouse> did not enter Visual to extend"
+    );
 }
 
 /// An insert-mode left-click moves the caret to the click and stays in Insert

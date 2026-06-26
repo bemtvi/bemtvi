@@ -63,24 +63,40 @@ pub(crate) enum ResizeDrag {
 }
 
 /// A mouse-button **press** the server still has to resolve against the keymaps: the
-/// button, its multi-click count, and the active modifiers, recorded on
-/// [`Editor::mouse_clicks`] by the press handler. The cursor is already placed (the
-/// `<LeftMouse>` default) by the time this is queued; the server turns it into a
-/// [`Key`](crate::input::Key) (`<n-LeftMouse>`), fires the bound mapping if there is
-/// one, else calls [`Editor::mouse_apply_default_select`]. v1 records only the
-/// **left** button (the gesture the explorer's `<2-LeftMouse>` rides); the modifier
-/// fields are carried for the right/middle/`<C-…>` buttons a later phase wires.
+/// button, its multi-click count, the active modifiers, and the screen cell, recorded
+/// on [`Editor::mouse_clicks`] by the press handler. The server turns it into a
+/// [`Key`](crate::input::Key) (`<n-LeftMouse>` / `<C-RightMouse>` / `<MiddleMouse>` /
+/// …), fires the bound mapping if there is one, else runs the per-button default
+/// ([`Editor::mouse_apply_default`]).
+///
+/// **All three buttons** (`Left`/`Right`/`Middle`), with **modifiers**, are mappable.
+/// A plain-left press places the cursor *eagerly* (so a `<LeftMouse>` / `<C-LeftMouse>`
+/// map and the default both act on the click), so its default is just the word/line
+/// escalation. The right / middle / shift-left presses defer their *whole* default to
+/// [`Editor::mouse_apply_default`] (selection-aware cursor placement, the `'mousemodel'`
+/// dispatch, the `"*` paste) — which is why the cell (`row`/`col`/`stamp_ms`) rides
+/// along: an unclaimed press re-hit-tests from it. A v1 *mapped* right/middle acts on
+/// the **current** cursor (`getmousepos()` / `v:mouse_*` is a later phase), and
+/// right/middle multi-click (`<2-RightMouse>`) is not yet counted (`clicks` is always 1
+/// for them).
 #[derive(Debug, Clone, Copy)]
 pub struct MouseClick {
     /// The button pressed — `Left`/`Right`/`Middle` (never the wheel/move/thumb).
     pub button: MouseButton,
     /// The multi-click count (1 = single, 2 = double, 3 = triple), per `'mousetime'`.
+    /// Counted for the left button only; right/middle are always `1` in v1.
     pub clicks: u8,
-    /// Active modifiers at the press (all `false` in v1, which records plain left
-    /// presses only — `<S-LeftMouse>` is the separate extend gesture).
+    /// Active modifiers at the press, so `<C-LeftMouse>` is distinguished from a plain
+    /// `<LeftMouse>`. `shift` on a left press is the extend gesture (default), still
+    /// mappable as `<S-LeftMouse>`.
     pub shift: bool,
     pub ctrl: bool,
     pub alt: bool,
+    /// The press's global screen cell and server-stamped time, so a deferred default
+    /// (right / middle / shift-left, run only on a keymap miss) can re-hit-test it.
+    pub row: usize,
+    pub col: usize,
+    pub stamp_ms: u64,
 }
 
 /// The anchored extent a left-drag extends from, set by the press by click count.
@@ -353,28 +369,32 @@ impl Editor {
             {
                 self.mouse_statusline_press(ev)
             }
-            // Shift+left-press extends the selection to the click (vim's
-            // `<S-LeftMouse>` under the default `popup_setpos` mousemodel) instead
-            // of placing the cursor and starting fresh.
+            // Shift+left-press is the selection-extend gesture (vim's `<S-LeftMouse>`
+            // under the default `popup_setpos` mousemodel). It's a mappable key like
+            // any other mouse button, so it's *queued* for the server: a bound
+            // `<S-LeftMouse>` map fires, else [`Editor::mouse_apply_default`] runs the
+            // extend. (`shift` distinguishes it from a plain left in the keymap.)
             (MouseButton::Left, MouseAction::Press) if ev.shift => {
-                self.mouse_left_extend(ev.row, ev.col, ev.stamp_ms)
+                self.mouse_queue_press(&ev, MouseButton::Left, 1)
             }
-            (MouseButton::Left, MouseAction::Press) => {
-                self.mouse_left_press(ev.row, ev.col, ev.stamp_ms)
-            }
+            (MouseButton::Left, MouseAction::Press) => self.mouse_left_press(&ev),
             (MouseButton::Left, MouseAction::Drag) => self.mouse_left_drag(ev.row, ev.col),
             // Release ends the drag but keeps `mouse_select` so the next press can
             // still see this one for multi-click counting; vim keeps the selection.
             (MouseButton::Left, MouseAction::Release) => {}
-            // Right-press is dispatched by `'mousemodel'` (extend the selection, or
-            // move the cursor / pop a — deferred — menu). Drag/release do nothing.
+            // Right- and middle-press are mappable too (`<RightMouse>` / `<MiddleMouse>`,
+            // with modifiers): queue the press, and the server fires a bound map or runs
+            // the default ([`Editor::mouse_apply_default`] — the `'mousemodel'` dispatch
+            // for right, the `"*` paste for middle). Unlike left, nothing is placed
+            // eagerly: the default does its own selection-aware placement, and a v1
+            // mapped right/middle acts on the current cursor. Drag/release do nothing.
             (MouseButton::Right, MouseAction::Press) => {
-                self.mouse_right_press(ev.row, ev.col, ev.stamp_ms)
+                self.mouse_queue_press(&ev, MouseButton::Right, 1)
             }
             (MouseButton::Right, MouseAction::Drag | MouseAction::Release) => {}
-            // Middle-press pastes the `"*` clipboard register at the click (vim's
-            // `gP`). Drag/release do nothing.
-            (MouseButton::Middle, MouseAction::Press) => self.mouse_middle_press(ev.row, ev.col),
+            (MouseButton::Middle, MouseAction::Press) => {
+                self.mouse_queue_press(&ev, MouseButton::Middle, 1)
+            }
             (MouseButton::Middle, MouseAction::Drag | MouseAction::Release) => {}
             // The wheel scrolls the window *under the pointer* without moving focus
             // or (unless a line scrolls off) the cursor.
@@ -430,7 +450,8 @@ impl Editor {
     /// Visual selection is torn down first (also vim's behavior). For a single
     /// click no selection starts until the first drag; double/triple enter Visual
     /// immediately.
-    fn mouse_left_press(&mut self, row: usize, col: usize, stamp_ms: u64) {
+    fn mouse_left_press(&mut self, ev: &MouseEvent) {
+        let (row, col, stamp_ms) = (ev.row, ev.col, ev.stamp_ms);
         // A press on a collapsed-dock chip (on the idle command-line row) re-shows
         // that dock — the click affordance for the toggle / auto-hide indicator.
         if let Some(side) = self.hidden_chip_at(row, col) {
@@ -478,21 +499,78 @@ impl Editor {
             count,
             anchor: SelectAnchor::Char(self.cursor),
         });
+        // A plain-left click carries its `<C-…>` / `<A-…>` modifiers so a
+        // `<C-LeftMouse>` map is distinguished from a bare `<LeftMouse>`; `shift` is
+        // never set here (a shift-left is the extend gesture, routed to its own arm).
+        // The cursor is already placed above, so a `<C-LeftMouse>` map and the default
+        // both act on the click.
         self.mouse_clicks.push(MouseClick {
             button: MouseButton::Left,
             clicks: count,
             shift: false,
-            ctrl: false,
-            alt: false,
+            ctrl: ev.ctrl,
+            alt: ev.alt,
+            row,
+            col,
+            stamp_ms,
         });
     }
 
-    /// The default `<LeftMouse>` selection escalation, applied by the server when **no**
-    /// `<n-LeftMouse>` mapping claimed a left press: a single click leaves the cursor
-    /// where the press placed it (no Visual), a double click selects the word, a triple
-    /// the line. This is the back half of [`mouse_left_press`], split out so a bound
-    /// mouse mapping can suppress it. Updates the in-flight [`MouseSelect`]'s anchor so a
-    /// following drag extends by the selected unit.
+    /// Queue a press whose default the server runs only on a keymap miss — a right /
+    /// middle button, or a shift-left (the extend gesture). No eager placement: unlike
+    /// the plain-left press, the default ([`Editor::mouse_apply_default`]) does its own
+    /// selection-aware cursor move, so the press must carry its cell to re-hit-test from.
+    /// A v1 *mapped* right/middle therefore acts on the current cursor (`getmousepos()`
+    /// is a later phase). `clicks` is the multi-click count (always 1 for right/middle
+    /// in v1 — only the left button is multi-counted).
+    fn mouse_queue_press(&mut self, ev: &MouseEvent, button: MouseButton, clicks: u8) {
+        self.mouse_clicks.push(MouseClick {
+            button,
+            clicks,
+            shift: ev.shift,
+            ctrl: ev.ctrl,
+            alt: ev.alt,
+            row: ev.row,
+            col: ev.col,
+            stamp_ms: ev.stamp_ms,
+        });
+    }
+
+    /// Run a queued press's default behavior — the server calls this for each press the
+    /// keymaps did **not** claim, so a bound `<…Mouse>` map *suppresses* the default
+    /// rather than both running. Dispatched by button + modifier:
+    ///
+    /// - **plain / ctrl / alt left** — the word/line selection escalation
+    ///   ([`mouse_apply_default_select`](Self::mouse_apply_default_select); the base
+    ///   cursor was already placed eagerly by [`mouse_left_press`]).
+    /// - **shift-left** — extend the selection to the click
+    ///   ([`mouse_left_extend`](Self::mouse_left_extend)).
+    /// - **right** — the `'mousemodel'` dispatch
+    ///   ([`mouse_right_press`](Self::mouse_right_press)).
+    /// - **middle** — paste the `"*` register ([`mouse_middle_press`](Self::mouse_middle_press)).
+    ///
+    /// The right / middle / shift-left defaults re-hit-test from the click's stored cell
+    /// (they were not placed eagerly), so the gesture is applied exactly as the old
+    /// eager handlers did, just deferred behind the keymap lookup.
+    pub fn mouse_apply_default(&mut self, click: MouseClick) {
+        match click.button {
+            MouseButton::Left if click.shift => {
+                self.mouse_left_extend(click.row, click.col, click.stamp_ms)
+            }
+            MouseButton::Left => self.mouse_apply_default_select(click.clicks),
+            MouseButton::Right => self.mouse_right_press(click.row, click.col, click.stamp_ms),
+            MouseButton::Middle => self.mouse_middle_press(click.row, click.col),
+            // The wheel / move / thumb buttons are never queued as a `MouseClick`.
+            MouseButton::Wheel | MouseButton::Move | MouseButton::X1 | MouseButton::X2 => {}
+        }
+    }
+
+    /// The default `<LeftMouse>` selection escalation, applied by [`mouse_apply_default`]
+    /// when **no** `<n-LeftMouse>` mapping claimed a plain left press: a single click
+    /// leaves the cursor where the press placed it (no Visual), a double click selects
+    /// the word, a triple the line. This is the back half of [`mouse_left_press`], split
+    /// out so a bound mouse mapping can suppress it. Updates the in-flight
+    /// [`MouseSelect`]'s anchor so a following drag extends by the selected unit.
     pub fn mouse_apply_default_select(&mut self, clicks: u8) {
         let anchor = match clicks {
             0 | 1 => return,

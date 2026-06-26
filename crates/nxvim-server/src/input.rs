@@ -124,17 +124,20 @@ impl EditHost {
     }
 
     /// Resolve the mouse-button presses the last gesture queued (drained from the
-    /// core) against the keymaps — Primitive A of the explorer-port plan. Each press
-    /// becomes a `<n-LeftMouse>`-style [`Key`] looked up in the current buffer's
-    /// editing trie: a bound mapping **fires** (the click's RHS — e.g. the explorer's
-    /// `<2-LeftMouse>` → open under the cursor), while an unbound click falls back to
-    /// the editor's default word/line selection escalation
-    /// ([`Editor::mouse_apply_default_select`](nxvim_core::Editor::mouse_apply_default_select)).
-    /// The cursor was already placed by the press itself (the `<LeftMouse>` default),
-    /// so a fired mapping acts on the clicked position. Called right after
-    /// `editor.mouse` on both the native dispatch and the wasm edit-host paths (the
-    /// "two mouse entry points need settle parity" rule), so a mapping resolves the
-    /// same way regardless of front end.
+    /// core) against the keymaps — Primitive A of the explorer-port plan, now covering
+    /// all three buttons with modifiers. Each press becomes a `<n-LeftMouse>` /
+    /// `<C-RightMouse>` / `<MiddleMouse>`-style [`Key`] looked up in the current
+    /// buffer's editing trie: a bound mapping **fires** (the click's RHS — e.g. the
+    /// explorer's `<2-LeftMouse>` → open under the cursor), while an unbound click runs
+    /// the editor's per-button default
+    /// ([`Editor::mouse_apply_default`](nxvim_core::Editor::mouse_apply_default) — the
+    /// word/line escalation, shift-extend, `'mousemodel'` dispatch, or `"*` paste).
+    /// A plain-left press already placed the cursor (the `<LeftMouse>` default), so a
+    /// fired `<LeftMouse>` / `<C-LeftMouse>` map acts on the clicked position; a mapped
+    /// right/middle acts on the current cursor (v1 — `getmousepos()` is a later phase).
+    /// Called right after `editor.mouse` on both the native dispatch and the wasm
+    /// edit-host paths (the "two mouse entry points need settle parity" rule), so a
+    /// mapping resolves the same way regardless of front end.
     pub(crate) fn resolve_mouse_clicks(&mut self) {
         let clicks = self.editor.take_mouse_clicks();
         if clicks.is_empty() {
@@ -156,7 +159,7 @@ impl EditHost {
             };
             match self.keymaps.lookup_mouse(scope, key) {
                 Some(m) => self.fire_mapping(m.rhs, m.silent, m.expr),
-                None => self.editor.mouse_apply_default_select(click.clicks),
+                None => self.editor.mouse_apply_default(click),
             }
         }
     }

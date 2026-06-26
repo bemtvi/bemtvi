@@ -116,10 +116,23 @@ Add **`BufReadCmd`** as a supported autocmd event (neovim-faithful; the general
   (`Keymaps::lookup_mouse`) or runs the default word/line escalation
   (`Editor::mouse_apply_default_select`, deferred so a map can suppress it). The
   explorer double-click is now a buffer-local `<2-LeftMouse>` default map in the
-  `FileType nxdir` autocmd; the interim `mouse.rs` special-case is gone. v1 wires the
-  **left** button (plain, no modifiers — `<C-LeftMouse>` / right / middle mapping and
-  drag/release/`getmousepos()` are deferred follow-ons). Tested in `tests/mouse.rs`
-  (general) and `tests/editing/explorer.rs` (the explorer consumer).
+  `FileType nxdir` autocmd; the interim `mouse.rs` special-case is gone. Tested in
+  `tests/mouse.rs` (general) and `tests/editing/explorer.rs` (the explorer consumer).
+  - **Follow-up — modifiers + right/middle buttons. ✅ DONE 2026-06-26.** All three
+    buttons are now mappable with modifiers: `<C-LeftMouse>` / `<A-LeftMouse>`,
+    `<RightMouse>`, `<MiddleMouse>`, `<S-LeftMouse>`, and combos. A `MouseClick` carries
+    its `row`/`col`/`stamp_ms` so the right / middle / shift-left presses defer their
+    *whole* default behaviour (the `'mousemodel'` dispatch, the `"*` paste, the
+    selection-extend) behind the keymap lookup via the new `Editor::mouse_apply_default`
+    — a bound `<…Mouse>` map suppresses the default, exactly like left. A plain / ctrl /
+    alt left still places the cursor *eagerly* (so `<C-LeftMouse>` → go-to-definition
+    works on the click); a v1 mapped right/middle acts on the *current* cursor.
+    Multi-click is still left-only (`<2-RightMouse>` not yet counted), and
+    `getmousepos()` / `v:mouse_*` remain the deferred way to read a click position away
+    from the cursor. Tested in `tests/mouse.rs` (5 new: ctrl-left places + fires, modifier
+    distinguishes the map, right / middle / shift-left fire-and-suppress-default).
+  - Still deferred: drag/release as mappable gestures (`<LeftDrag>` / `<LeftRelease>`),
+    `getmousepos()` / `v:mouse_*`, and right/middle multi-click.
 - **Phase 2 — Primitive B (`BufReadCmd`). ✅ DONE 2026-06-25.** A file open is now
   **deferred** (enqueued as a `PendingOpen`) instead of read inline whenever a
   `BufReadCmd` handler is registered (`Editor::should_defer_open` = `host_fs_offtick ||

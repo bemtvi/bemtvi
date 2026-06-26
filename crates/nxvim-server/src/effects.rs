@@ -2101,6 +2101,37 @@ impl EditHost {
             }),
             #[cfg(feature = "native")]
             LoopOp::Kill { id } => self.fx.loop_command(LoopCommand::Kill { id }),
+            // A duplex `nx.process` child (DAP / framed-protocol transport): spawn it
+            // / feed its stdin through the actor. Its raw output returns on the
+            // `loop_events` arm as `ProcOut`, its exit as `ProcExit`.
+            #[cfg(feature = "native")]
+            LoopOp::ProcOpen { id, cmd, cwd, env } => self.fx.loop_command(LoopCommand::ProcOpen {
+                id,
+                argv: cmd,
+                cwd,
+                env,
+            }),
+            #[cfg(feature = "native")]
+            LoopOp::ProcWrite { id, data } => {
+                self.fx.loop_command(LoopCommand::ProcWrite { id, data })
+            }
+            // The duplex child's `:kill()` — the actor's `Kill` handler terminates it
+            // (duplex + one-shot share the actor's process map natively).
+            #[cfg(feature = "native")]
+            LoopOp::ProcClose { id } => self.fx.loop_command(LoopCommand::Kill { id }),
+            // A `nx.socket` TCP connection (DAP `type="server"` transport): open / write
+            // / close through the actor. Its `connected` / data / close return on the
+            // `loop_events` arm.
+            #[cfg(feature = "native")]
+            LoopOp::SockConnect { id, host, port } => self
+                .fx
+                .loop_command(LoopCommand::SockConnect { id, host, port }),
+            #[cfg(feature = "native")]
+            LoopOp::SockWrite { id, data } => {
+                self.fx.loop_command(LoopCommand::SockWrite { id, data })
+            }
+            #[cfg(feature = "native")]
+            LoopOp::SockClose { id } => self.fx.loop_command(LoopCommand::SockClose { id }),
             // `nx.fs.watch` rides the actor's native watcher (inotify/FSEvents/kqueue),
             // coalesced there; the change events return on the `loop_events` arm.
             #[cfg(feature = "native")]
@@ -2179,6 +2210,75 @@ impl EditHost {
             LoopOp::Kill { id } => {
                 if self.fx.has_remote_proc() {
                     self.fx.proc_kill(id);
+                }
+            }
+            // A duplex `nx.process` child has no wasm transport yet (the daemon proc
+            // leg is one-shot `vim.system` only). Fail *loud* — fire the exit with
+            // `code = -1` so the Lua handle's `on_exit` settles instead of hanging,
+            // and surface the cause on its stderr stream — rather than silently
+            // dropping the spawn.
+            #[cfg(not(feature = "native"))]
+            LoopOp::ProcOpen { id, cmd, cwd, env } => {
+                if self.fx.has_remote_proc() {
+                    self.fx.dproc_open(id, cmd, cwd, env);
+                } else {
+                    // Serverless (no daemon): a duplex child has nowhere to run. Settle
+                    // the Lua handle LOUD (stderr + exit -1) instead of leaving it hung.
+                    if let Err(e) = self.lua.run_process_recv(
+                        id,
+                        b"nx.process (duplex child) requires a daemon \xE2\x80\x94 :connect to one"
+                            .to_vec(),
+                        true,
+                    ) {
+                        self.editor
+                            .echo(format!("E5108: Error in nx.process handler: {e}"));
+                    }
+                    if let Err(e) = self.lua.run_process_exit(id, -1) {
+                        self.editor
+                            .echo(format!("E5108: Error in nx.process on_exit: {e}"));
+                    }
+                    self.apply_lua_effects();
+                }
+            }
+            #[cfg(not(feature = "native"))]
+            LoopOp::ProcWrite { id, data } => {
+                if self.fx.has_remote_proc() {
+                    self.fx.dproc_write(id, data);
+                }
+            }
+            #[cfg(not(feature = "native"))]
+            LoopOp::ProcClose { id } => {
+                if self.fx.has_remote_proc() {
+                    self.fx.dproc_kill(id);
+                }
+            }
+            // `nx.socket` rides the daemon `sock_*` leg when a daemon is connected;
+            // serverless fails the connect *loud* (settles on_close with an error).
+            #[cfg(not(feature = "native"))]
+            LoopOp::SockConnect { id, host, port } => {
+                if self.fx.has_remote_proc() {
+                    self.fx.sock_connect(id, host, port);
+                } else {
+                    if let Err(e) = self.lua.run_socket_closed(
+                        id,
+                        Some("nx.socket (TCP) requires a daemon — :connect to one".to_string()),
+                    ) {
+                        self.editor
+                            .echo(format!("E5108: Error in nx.socket handler: {e}"));
+                    }
+                    self.apply_lua_effects();
+                }
+            }
+            #[cfg(not(feature = "native"))]
+            LoopOp::SockWrite { id, data } => {
+                if self.fx.has_remote_proc() {
+                    self.fx.sock_write(id, data);
+                }
+            }
+            #[cfg(not(feature = "native"))]
+            LoopOp::SockClose { id } => {
+                if self.fx.has_remote_proc() {
+                    self.fx.sock_close(id);
                 }
             }
             // `nx.fs.watch` streams over the daemon `luafs_watch` leg (Phase 3b) when a daemon is
@@ -2278,6 +2378,44 @@ impl EditHost {
                 if let Err(e) = self.lua.run_callback(id, false, args) {
                     self.editor
                         .echo(format!("E5108: Error in vim.system on_exit: {e}"));
+                }
+                self.apply_lua_effects();
+            }
+            LoopEvent::ProcOut { id, data, stderr } => {
+                // A duplex `nx.process` child (DAP transport) emitted a raw chunk:
+                // hand it to the persistent receiver, then drain whatever the Lua
+                // framing/dispatch queued (breakpoint signs, view renders, …).
+                if let Err(e) = self.lua.run_process_recv(id, data, stderr) {
+                    self.editor
+                        .echo(format!("E5108: Error in nx.process handler: {e}"));
+                }
+                self.apply_lua_effects();
+            }
+            LoopEvent::ProcExit { id, code } => {
+                if let Err(e) = self.lua.run_process_exit(id, code) {
+                    self.editor
+                        .echo(format!("E5108: Error in nx.process on_exit: {e}"));
+                }
+                self.apply_lua_effects();
+            }
+            LoopEvent::SockConnected { id } => {
+                if let Err(e) = self.lua.run_socket_connected(id) {
+                    self.editor
+                        .echo(format!("E5108: Error in nx.socket on_connect: {e}"));
+                }
+                self.apply_lua_effects();
+            }
+            LoopEvent::SockData { id, data } => {
+                if let Err(e) = self.lua.run_socket_data(id, data) {
+                    self.editor
+                        .echo(format!("E5108: Error in nx.socket handler: {e}"));
+                }
+                self.apply_lua_effects();
+            }
+            LoopEvent::SockClosed { id, error } => {
+                if let Err(e) = self.lua.run_socket_closed(id, error) {
+                    self.editor
+                        .echo(format!("E5108: Error in nx.socket on_close: {e}"));
                 }
                 self.apply_lua_effects();
             }

@@ -219,6 +219,32 @@ struct Sink {
     /// / [`eh_lsp_exited`]. Daemon-only (the editor gates `vim.lsp.start` on a connected
     /// daemon via [`has_remote_lsp`](HostEffects::has_remote_lsp); serverless fails it loud).
     lsp_ops: Vec<WireOp>,
+    /// Duplex `nx.process` children the editor newly asked to **open** this convergence
+    /// (the `dproc_*` leg — the DAP / framed-protocol transport): `(id, argv, cwd, env)`,
+    /// recorded by [`dproc_open`](HostEffects::dproc_open). Drained by
+    /// [`eh_take_dproc_requests`] for the Worker to forward (`dproc_open [id, argv, cwd?,
+    /// env]`); raw stdout/stderr return via [`eh_dproc_out`], the exit via [`eh_dproc_exit`].
+    /// Daemon-only (a duplex child has no serverless fallback).
+    #[allow(clippy::type_complexity)]
+    dproc_opens: Vec<(u64, Vec<String>, Option<String>, Vec<(String, String)>)>,
+    /// Stdin bytes the editor asked to write to a duplex child (`handle:write`), recorded
+    /// by [`dproc_write`](HostEffects::dproc_write); `(id, bytes)`, drained as `dproc_write`.
+    dproc_writes: Vec<(u64, Vec<u8>)>,
+    /// Duplex children the editor asked to **kill** (`handle:kill`), recorded by
+    /// [`dproc_kill`](HostEffects::dproc_kill); drained as `dproc_kill [id]`.
+    dproc_kills: Vec<u64>,
+    /// `nx.socket` connections the editor newly asked to **open** this convergence (the
+    /// `sock_*` leg — a DAP `type="server"` adapter transport): `(id, host, port)`,
+    /// recorded by [`sock_connect`](HostEffects::sock_connect). Drained by
+    /// [`eh_take_sock_requests`]; `connected`/data/`closed` return via [`eh_sock_connected`]
+    /// / [`eh_sock_data`] / [`eh_sock_closed`]. Daemon-only.
+    sock_connects: Vec<(u64, String, u16)>,
+    /// Bytes the editor asked to send over a connection (`handle:write`), recorded by
+    /// [`sock_write`](HostEffects::sock_write); `(id, bytes)`, drained as `sock_write`.
+    sock_writes: Vec<(u64, Vec<u8>)>,
+    /// Connections the editor asked to **close** (`handle:close`), recorded by
+    /// [`sock_close`](HostEffects::sock_close); drained as `sock_close [id]`.
+    sock_closes: Vec<u64>,
 }
 
 /// The `"+` / `"*` clipboard provider for the browser build — the wasm twin of
@@ -569,6 +595,42 @@ impl HostEffects for WasmEffects {
         // process. The Worker flips this via `eh_set_proc_host` on `:connect` / `?daemon=` /
         // local-host bring-up; when false the tick fails the spawn loud instead of enqueuing it.
         self.sink.borrow().proc_host
+    }
+
+    fn dproc_open(
+        &mut self,
+        id: u64,
+        argv: Vec<String>,
+        cwd: Option<String>,
+        env: Vec<(String, String)>,
+    ) {
+        // A duplex `nx.process` child against the daemon (the DAP transport): record the
+        // open for the Worker to forward (`dproc_open`); its raw stdout/stderr return via
+        // `eh_dproc_out`, the exit via `eh_dproc_exit`.
+        self.sink.borrow_mut().dproc_opens.push((id, argv, cwd, env));
+    }
+
+    fn dproc_write(&mut self, id: u64, bytes: Vec<u8>) {
+        self.sink.borrow_mut().dproc_writes.push((id, bytes));
+    }
+
+    fn dproc_kill(&mut self, id: u64) {
+        self.sink.borrow_mut().dproc_kills.push(id);
+    }
+
+    fn sock_connect(&mut self, id: u64, host: String, port: u16) {
+        // An `nx.socket` connection against the daemon (a DAP `type="server"` transport):
+        // record the connect for the Worker to forward (`sock_connect`); `connected`/data/
+        // `closed` return via `eh_sock_connected` / `eh_sock_data` / `eh_sock_closed`.
+        self.sink.borrow_mut().sock_connects.push((id, host, port));
+    }
+
+    fn sock_write(&mut self, id: u64, bytes: Vec<u8>) {
+        self.sink.borrow_mut().sock_writes.push((id, bytes));
+    }
+
+    fn sock_close(&mut self, id: u64) {
+        self.sink.borrow_mut().sock_closes.push(id);
     }
 
     fn fs_op(&mut self, id: u64, job: nxvim_lua::FsJob) {
@@ -1422,6 +1484,153 @@ pub unsafe extern "C" fn eh_proc_exited(
     handle
         .host
         .proc_exited(id.max(0.0) as u64, code as i32, stdout, stderr);
+}
+
+// ============================================================================
+// Off-tick daemon DUPLEX-process leg (`dproc_*`) and SOCKET leg (`sock_*`). The DAP /
+// framed-protocol transports: the editor enqueues a long-lived child / TCP connection off
+// the tick, the Worker forwards it over WebTransport to a connected daemon, and the daemon
+// streams raw bytes both ways. The browser twin of the native event-loop actor's duplex
+// process / socket routing. Daemon-only (no serverless fallback). See the LSP leg, which
+// has the identical bidirectional shape.
+// ============================================================================
+
+/// Drain the duplex-process opens/writes/kills the editor enqueued, as JSON the Worker
+/// forwards: `{"open":[{"id":N,"argv":[…],"cwd":…,"env":[[k,v],…]}],"write":[{"id":N,
+/// "bytes":[…]}],"kill":[N]}`. Raw stdout/stderr return via [`eh_dproc_out`], the exit via
+/// [`eh_dproc_exit`]. Caller frees with [`eh_free_string`].
+///
+/// # Safety
+/// `h` must come from [`eh_new`] and not yet be freed.
+#[no_mangle]
+pub unsafe extern "C" fn eh_take_dproc_requests(h: *mut WasmEditHost) -> *mut c_char {
+    let Some(handle) = h.as_mut() else {
+        return into_owned_cstr(r#"{"open":[],"write":[],"kill":[]}"#.into());
+    };
+    let mut sink = handle.sink.borrow_mut();
+    let open: Vec<serde_json::Value> = std::mem::take(&mut sink.dproc_opens)
+        .into_iter()
+        .map(|(id, argv, cwd, env)| {
+            serde_json::json!({
+                "id": id,
+                "argv": argv,
+                "cwd": cwd,
+                "env": env.into_iter().map(|(k, v)| vec![k, v]).collect::<Vec<_>>(),
+            })
+        })
+        .collect();
+    let write: Vec<serde_json::Value> = std::mem::take(&mut sink.dproc_writes)
+        .into_iter()
+        .map(|(id, bytes)| serde_json::json!({ "id": id, "bytes": bytes }))
+        .collect();
+    let kill: Vec<u64> = std::mem::take(&mut sink.dproc_kills);
+    into_owned_cstr(serde_json::json!({ "open": open, "write": write, "kill": kill }).to_string())
+}
+
+/// Land a daemon `dproc_out` push: a raw output chunk from a duplex child. `stderr != 0`
+/// selects the error stream. `data` is pointer+length (arbitrary bytes — a framed protocol).
+/// See [`EditHost::dproc_out`].
+///
+/// # Safety
+/// `h` from [`eh_new`], not freed; `data` points to `len` readable bytes (or null when 0).
+#[no_mangle]
+pub unsafe extern "C" fn eh_dproc_out(
+    h: *mut WasmEditHost,
+    id: f64,
+    data: *const u8,
+    len: usize,
+    stderr: i32,
+) {
+    let Some(handle) = h.as_mut() else { return };
+    let bytes = if data.is_null() || len == 0 {
+        Vec::new()
+    } else {
+        std::slice::from_raw_parts(data, len).to_vec()
+    };
+    handle.host.dproc_out(id.max(0.0) as u64, bytes, stderr != 0);
+}
+
+/// Land a daemon `dproc_exit` push: the duplex child exited (`code == -1` on a kill / spawn
+/// failure). See [`EditHost::dproc_exit`].
+///
+/// # Safety
+/// `h` must come from [`eh_new`] and not yet be freed.
+#[no_mangle]
+pub unsafe extern "C" fn eh_dproc_exit(h: *mut WasmEditHost, id: f64, code: f64) {
+    if let Some(handle) = h.as_mut() {
+        handle.host.dproc_exit(id.max(0.0) as u64, code as i32);
+    }
+}
+
+/// Drain the socket connects/writes/closes the editor enqueued, as JSON the Worker forwards:
+/// `{"connect":[{"id":N,"host":"…","port":N}],"write":[{"id":N,"bytes":[…]}],"close":[N]}`.
+/// `connected`/data/`closed` return via [`eh_sock_connected`] / [`eh_sock_data`] /
+/// [`eh_sock_closed`]. Caller frees with [`eh_free_string`].
+///
+/// # Safety
+/// `h` must come from [`eh_new`] and not yet be freed.
+#[no_mangle]
+pub unsafe extern "C" fn eh_take_sock_requests(h: *mut WasmEditHost) -> *mut c_char {
+    let Some(handle) = h.as_mut() else {
+        return into_owned_cstr(r#"{"connect":[],"write":[],"close":[]}"#.into());
+    };
+    let mut sink = handle.sink.borrow_mut();
+    let connect: Vec<serde_json::Value> = std::mem::take(&mut sink.sock_connects)
+        .into_iter()
+        .map(|(id, host, port)| serde_json::json!({ "id": id, "host": host, "port": port }))
+        .collect();
+    let write: Vec<serde_json::Value> = std::mem::take(&mut sink.sock_writes)
+        .into_iter()
+        .map(|(id, bytes)| serde_json::json!({ "id": id, "bytes": bytes }))
+        .collect();
+    let close: Vec<u64> = std::mem::take(&mut sink.sock_closes);
+    into_owned_cstr(
+        serde_json::json!({ "connect": connect, "write": write, "close": close }).to_string(),
+    )
+}
+
+/// Land a daemon `sock_connected` push: the TCP connection is established. See
+/// [`EditHost::sock_connected`].
+///
+/// # Safety
+/// `h` must come from [`eh_new`] and not yet be freed.
+#[no_mangle]
+pub unsafe extern "C" fn eh_sock_connected(h: *mut WasmEditHost, id: f64) {
+    if let Some(handle) = h.as_mut() {
+        handle.host.sock_connected(id.max(0.0) as u64);
+    }
+}
+
+/// Land a daemon `sock_data` push: a raw inbound chunk. `data` is pointer+length. See
+/// [`EditHost::sock_data`].
+///
+/// # Safety
+/// `h` from [`eh_new`], not freed; `data` points to `len` readable bytes (or null when 0).
+#[no_mangle]
+pub unsafe extern "C" fn eh_sock_data(h: *mut WasmEditHost, id: f64, data: *const u8, len: usize) {
+    let Some(handle) = h.as_mut() else { return };
+    let bytes = if data.is_null() || len == 0 {
+        Vec::new()
+    } else {
+        std::slice::from_raw_parts(data, len).to_vec()
+    };
+    handle.host.sock_data(id.max(0.0) as u64, bytes);
+}
+
+/// Land a daemon `sock_closed` push: the connection closed. `err` is a C string with the
+/// failure cause, or null on a clean close. See [`EditHost::sock_closed`].
+///
+/// # Safety
+/// `h` from [`eh_new`], not freed; `err` a valid C string or null.
+#[no_mangle]
+pub unsafe extern "C" fn eh_sock_closed(h: *mut WasmEditHost, id: f64, err: *const c_char) {
+    let Some(handle) = h.as_mut() else { return };
+    let error = if err.is_null() {
+        None
+    } else {
+        Some(as_str(err).to_string())
+    };
+    handle.host.sock_closed(id.max(0.0) as u64, error);
 }
 
 // ============================================================================

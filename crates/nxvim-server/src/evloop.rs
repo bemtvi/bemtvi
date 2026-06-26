@@ -64,6 +64,28 @@ pub enum LoopCommand {
     /// still fires with `code = -1` (the signal is not honored — see
     /// [`LoopOp::Kill`](nxvim_lua::LoopOp::Kill)).
     Kill { id: u64 },
+    /// Spawn `argv` as a **duplex** child (`nx.process.open`): stdin stays open for
+    /// [`ProcWrite`](LoopCommand::ProcWrite), and stdout/stderr stream back as raw
+    /// byte chunks ([`LoopEvent::ProcOut`]) until the [`LoopEvent::ProcExit`].
+    /// Terminate it with the shared [`Kill`](LoopCommand::Kill).
+    ProcOpen {
+        id: u64,
+        argv: Vec<String>,
+        cwd: Option<String>,
+        env: Vec<(String, String)>,
+    },
+    /// Feed `data` to the still-open stdin of the duplex child under `id` (a no-op
+    /// if it already exited).
+    ProcWrite { id: u64, data: Vec<u8> },
+    /// Open a TCP client connection (`nx.socket.connect`): on success
+    /// [`LoopEvent::SockConnected`] fires, then incoming bytes as
+    /// [`LoopEvent::SockData`] until [`LoopEvent::SockClosed`]. Writes go via
+    /// [`SockWrite`](LoopCommand::SockWrite); close with [`SockClose`](LoopCommand::SockClose).
+    SockConnect { id: u64, host: String, port: u16 },
+    /// Send `data` over the connection under `id` (a no-op once closed).
+    SockWrite { id: u64, data: Vec<u8> },
+    /// Close the connection under `id`.
+    SockClose { id: u64 },
     /// Begin watching `path` for changes (native — inotify/FSEvents/kqueue via
     /// `notify`), firing the watcher callback `id` each time it changes until
     /// [`LoopCommand::FsEventStop`]. `recursive` watches a whole subtree (libuv's
@@ -113,6 +135,29 @@ pub enum LoopEvent {
         stdout: Vec<u8>,
         stderr: Vec<u8>,
     },
+    /// A **duplex** child ([`LoopCommand::ProcOpen`]) emitted a raw chunk of output
+    /// — `stderr` distinguishes the two streams. Unframed and un-split (no newline
+    /// batching): the Lua side (`nx.process` consumer, e.g. a DAP client) owns the
+    /// framing. Fires zero or more times before [`LoopEvent::ProcExit`].
+    ProcOut {
+        id: u64,
+        data: Vec<u8>,
+        stderr: bool,
+    },
+    /// A duplex child ([`LoopCommand::ProcOpen`]) exited (`code = -1` on a spawn
+    /// failure or a kill). Fires exactly once, after which the `nx.process` handle
+    /// is dead.
+    ProcExit { id: u64, code: i32 },
+    /// A TCP connection ([`LoopCommand::SockConnect`]) was established.
+    SockConnected { id: u64 },
+    /// A TCP connection emitted a raw chunk of inbound bytes (un-framed — the Lua
+    /// side owns the protocol). Fires zero or more times before [`SockClosed`].
+    ///
+    /// [`SockClosed`]: LoopEvent::SockClosed
+    SockData { id: u64, data: Vec<u8> },
+    /// A TCP connection closed — `error` carries the cause on a connect / I/O
+    /// failure, `None` on a clean EOF / requested close. Fires exactly once.
+    SockClosed { id: u64, error: Option<String> },
     /// A path watched via [`LoopCommand::FsEventStart`] changed (a content/attribute
     /// edit, or a create/delete/rename), or `error` when the watch couldn't be
     /// established (the path doesn't exist, a watch limit was hit). The watch fires
@@ -230,6 +275,16 @@ async fn run_evloop(
     // Live timer tasks and the per-process kill channels, keyed by callback id.
     let mut timers: HashMap<u64, JoinHandle<()>> = HashMap::new();
     let mut procs: HashMap<u64, oneshot::Sender<()>> = HashMap::new();
+    // The still-open stdin sinks of live duplex children (`nx.process.open`), keyed
+    // by callback id. A `ProcWrite` forwards bytes here; the child task drains them
+    // and the entry is dropped when the child exits (closing its stdin → EOF).
+    let mut proc_stdin: HashMap<u64, tokio::sync::mpsc::UnboundedSender<Vec<u8>>> = HashMap::new();
+    // Live TCP connections (`nx.socket`): a close signal + the write sink, keyed by
+    // callback id. A `SockWrite` forwards bytes to the sink; a `SockClose` (or a
+    // dropped close sender) ends the connection task; both are pruned when its task
+    // exits (the receivers drop → these senders report closed).
+    let mut sock_close: HashMap<u64, oneshot::Sender<()>> = HashMap::new();
+    let mut sock_write: HashMap<u64, tokio::sync::mpsc::UnboundedSender<Vec<u8>>> = HashMap::new();
     // Live filesystem watchers (`notify`), keyed by callback id. Each owns its
     // native backend thread; dropping it (on `FsEventStop`, a re-arm, or actor
     // shutdown) stops the watch.
@@ -239,6 +294,14 @@ async fn run_evloop(
         // / processes can't accumulate dead entries. (fs watchers are dropped
         // explicitly on `FsEventStop`, not pruned here.)
         timers.retain(|_, h| !h.is_finished());
+        // Prune duplex children whose task has ended (the kill/stdin receivers
+        // dropped → these senders report closed), so a long-lived session that
+        // opens and closes many `nx.process` children doesn't accumulate dead
+        // entries. One-shot `vim.system` kill senders are pruned the same way.
+        procs.retain(|_, s| !s.is_closed());
+        proc_stdin.retain(|_, s| !s.is_closed());
+        sock_close.retain(|_, s| !s.is_closed());
+        sock_write.retain(|_, s| !s.is_closed());
         match cmd {
             LoopCommand::TimerStart { id, delay, repeat } => {
                 // Re-arming an id replaces its timer (a fresh :start on a handle).
@@ -291,12 +354,62 @@ async fn run_evloop(
                 let events = ProcEvents::new(id, event_tx.clone());
                 tokio::spawn(host_proc.run(spec, kill_rx, events));
             }
+            LoopCommand::ProcOpen { id, argv, cwd, env } => {
+                let (kill_tx, kill_rx) = oneshot::channel();
+                let (stdin_tx, stdin_rx) = tokio::sync::mpsc::unbounded_channel();
+                procs.insert(id, kill_tx);
+                proc_stdin.insert(id, stdin_tx);
+                tokio::spawn(crate::host::run_duplex_process(
+                    id,
+                    argv,
+                    cwd,
+                    env,
+                    kill_rx,
+                    stdin_rx,
+                    event_tx.clone(),
+                ));
+            }
+            LoopCommand::ProcWrite { id, data } => {
+                // Forward to the child's stdin task; a closed channel (the child
+                // exited) silently drops the write — the Lua handle's exit fired.
+                if let Some(sink) = proc_stdin.get(&id) {
+                    let _ = sink.send(data);
+                }
+            }
+            LoopCommand::SockConnect { id, host, port } => {
+                let (close_tx, close_rx) = oneshot::channel();
+                let (write_tx, write_rx) = tokio::sync::mpsc::unbounded_channel();
+                sock_close.insert(id, close_tx);
+                sock_write.insert(id, write_tx);
+                tokio::spawn(crate::host::run_socket_connection(
+                    id,
+                    host,
+                    port,
+                    close_rx,
+                    write_rx,
+                    event_tx.clone(),
+                ));
+            }
+            LoopCommand::SockWrite { id, data } => {
+                if let Some(sink) = sock_write.get(&id) {
+                    let _ = sink.send(data);
+                }
+            }
+            LoopCommand::SockClose { id } => {
+                if let Some(close_tx) = sock_close.remove(&id) {
+                    let _ = close_tx.send(());
+                }
+                sock_write.remove(&id);
+            }
             LoopCommand::Kill { id } => {
                 // Dropping the kill sender (or sending on it) wakes the process
                 // task, which terminates the child via `kill_on_drop`.
                 if let Some(kill_tx) = procs.remove(&id) {
                     let _ = kill_tx.send(());
                 }
+                // Drop the stdin sink too (duplex children) so its writer task sees
+                // the channel close and shuts the pipe.
+                proc_stdin.remove(&id);
             }
             LoopCommand::FsEventStart {
                 id,

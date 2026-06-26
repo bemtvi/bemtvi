@@ -744,6 +744,84 @@ pub(crate) fn install_vim(lua: &Lua, shared: &Rc<RefCell<Shared>>) -> mlua::Resu
             Ok(())
         })?,
     )?;
+    // `nx._proc_open(id, cmd, cwd, env)`: spawn `cmd` (argv list) as a **duplex**
+    // child in the event-loop actor — stdin stays open for `nx._proc_write`, and
+    // stdout/stderr stream back as raw byte chunks via `nx._proc_recv(id, data,
+    // is_stderr)` until the exit fires `nx._proc_exit(id, code)`. Backs
+    // `nx.process.open` (the DAP / framed-protocol transport). Kill with
+    // `nx._proc_kill` (the shared `LoopOp::Kill`).
+    let sh = shared.clone();
+    nx.set(
+        "_proc_open",
+        lua.create_function(
+            move |_, (id, cmd, cwd, env): (u64, Vec<String>, Option<String>, Option<Table>)| {
+                let env = env_pairs(env)?;
+                sh.borrow_mut()
+                    .loop_ops
+                    .push(LoopOp::ProcOpen { id, cmd, cwd, env });
+                Ok(())
+            },
+        )?,
+    )?;
+    // `nx._proc_write(id, data)`: feed `data` (a binary-safe Lua string) to the
+    // running duplex child's stdin. A no-op if it already exited.
+    let sh = shared.clone();
+    nx.set(
+        "_proc_write",
+        lua.create_function(move |_, (id, data): (u64, mlua::String)| {
+            let data = data.as_bytes().to_vec();
+            sh.borrow_mut()
+                .loop_ops
+                .push(LoopOp::ProcWrite { id, data });
+            Ok(())
+        })?,
+    )?;
+    // `nx._proc_kill(id)`: terminate the duplex child under `id`. A dedicated op (not
+    // the one-shot `LoopOp::Kill`) so a wasm session routes it to the `dproc_*` leg.
+    let sh = shared.clone();
+    nx.set(
+        "_proc_kill",
+        lua.create_function(move |_, id: u64| {
+            sh.borrow_mut().loop_ops.push(LoopOp::ProcClose { id });
+            Ok(())
+        })?,
+    )?;
+    // `nx._sock_connect(id, host, port)`: open a TCP client connection in the actor;
+    // on success `nx._sock_connected(id)` fires, then incoming bytes stream back via
+    // `nx._sock_data(id, data)` until `nx._sock_closed(id, err)`. Backs
+    // `nx.socket.connect` (a DAP `type="server"` adapter transport).
+    let sh = shared.clone();
+    nx.set(
+        "_sock_connect",
+        lua.create_function(move |_, (id, host, port): (u64, String, u16)| {
+            sh.borrow_mut()
+                .loop_ops
+                .push(LoopOp::SockConnect { id, host, port });
+            Ok(())
+        })?,
+    )?;
+    // `nx._sock_write(id, data)`: send `data` (a binary-safe Lua string) over the
+    // connection. A no-op once it closed.
+    let sh = shared.clone();
+    nx.set(
+        "_sock_write",
+        lua.create_function(move |_, (id, data): (u64, mlua::String)| {
+            let data = data.as_bytes().to_vec();
+            sh.borrow_mut()
+                .loop_ops
+                .push(LoopOp::SockWrite { id, data });
+            Ok(())
+        })?,
+    )?;
+    // `nx._sock_close(id)`: shut the connection under `id`.
+    let sh = shared.clone();
+    nx.set(
+        "_sock_close",
+        lua.create_function(move |_, id: u64| {
+            sh.borrow_mut().loop_ops.push(LoopOp::SockClose { id });
+            Ok(())
+        })?,
+    )?;
 
     // `vim.fn`: the Vimscript builtins the load path calls. Only the ones that
     // need real filesystem / environment access are Rust-backed; the rest of

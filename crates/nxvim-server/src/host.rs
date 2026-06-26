@@ -334,3 +334,207 @@ async fn stream_local_process(
     let stderr = std::mem::take(&mut *stderr_buf.lock().await);
     events.exited(code, Vec::new(), stderr);
 }
+
+/// Run a **duplex** child (`nx.process.open`) — the keystone for an in-Lua client
+/// that frames its own protocol (DAP / LSP-style Content-Length JSON) over a
+/// long-lived pipe. Unlike [`run_local_process`] it keeps stdin **open** (fed
+/// incrementally from `stdin_rx`, each `nx.process` handle `:write`) and streams
+/// stdout/stderr back as **raw, un-split byte chunks** ([`LoopEvent::ProcOut`]) so
+/// the caller owns the framing — never the newline batching the picker's
+/// `nx.run_stream` does. Exactly one [`LoopEvent::ProcExit`] is sent (`code = -1`
+/// on a spawn failure or a kill), after which the Lua handle is dead.
+pub async fn run_duplex_process(
+    id: u64,
+    argv: Vec<String>,
+    cwd: Option<String>,
+    env: Vec<(String, String)>,
+    mut kill_rx: oneshot::Receiver<()>,
+    mut stdin_rx: tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>,
+    event_tx: UnboundedSender<LoopEvent>,
+) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let Some((program, args)) = argv.split_first() else {
+        let _ = event_tx.send(LoopEvent::ProcExit { id, code: -1 });
+        return;
+    };
+    let mut command = Command::new(program);
+    command
+        .args(args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    // Detach from the editor's controlling terminal (see `run_local_process`): a
+    // debug adapter must never read/write the tty nxvim is painting.
+    #[cfg(unix)]
+    {
+        // SAFETY: `setsid(2)` is async-signal-safe and a fresh fork is never a
+        // group leader; ignore the result defensively (see `run_local_process`).
+        unsafe {
+            command.pre_exec(|| {
+                extern "C" {
+                    fn setsid() -> i32;
+                }
+                setsid();
+                Ok(())
+            });
+        }
+    }
+    if let Some(dir) = cwd {
+        command.current_dir(dir);
+    }
+    for (k, v) in env {
+        command.env(k, v);
+    }
+    let mut child = match command.spawn() {
+        Ok(child) => child,
+        Err(e) => {
+            // Surface the spawn failure on the child's stderr stream (so the Lua
+            // client sees *why*), then the loud exit — never a silent drop.
+            let _ = event_tx.send(LoopEvent::ProcOut {
+                id,
+                data: format!("nx.process: failed to spawn {program}: {e}").into_bytes(),
+                stderr: true,
+            });
+            let _ = event_tx.send(LoopEvent::ProcExit { id, code: -1 });
+            return;
+        }
+    };
+
+    // Feed stdin from `stdin_rx` in a detached task: each `:write` chunk is written
+    // and flushed; when the channel closes (the handle killed / the actor dropped
+    // the sink) the pipe is shut so the child reads EOF.
+    if let Some(mut sink) = child.stdin.take() {
+        tokio::spawn(async move {
+            while let Some(chunk) = stdin_rx.recv().await {
+                if sink.write_all(&chunk).await.is_err() || sink.flush().await.is_err() {
+                    break;
+                }
+            }
+            let _ = sink.shutdown().await;
+        });
+    }
+
+    // Stream stderr as raw chunks from a detached task (so a chatty stderr can't
+    // deadlock the stdout reader against a full pipe).
+    if let Some(mut err) = child.stderr.take() {
+        let tx = event_tx.clone();
+        tokio::spawn(async move {
+            let mut buf = [0u8; 8192];
+            loop {
+                match err.read(&mut buf).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => {
+                        if tx
+                            .send(LoopEvent::ProcOut {
+                                id,
+                                data: buf[..n].to_vec(),
+                                stderr: true,
+                            })
+                            .is_err()
+                        {
+                            break;
+                        }
+                    }
+                }
+            }
+        });
+    }
+
+    // Read stdout raw, racing each read against the kill signal.
+    let mut killed = false;
+    if let Some(mut out) = child.stdout.take() {
+        let mut buf = [0u8; 8192];
+        loop {
+            tokio::select! {
+                read = out.read(&mut buf) => match read {
+                    Ok(0) | Err(_) => break, // EOF — child closed stdout
+                    Ok(n) => {
+                        if event_tx.send(LoopEvent::ProcOut {
+                            id,
+                            data: buf[..n].to_vec(),
+                            stderr: false,
+                        }).is_err() {
+                            return; // server gone
+                        }
+                    }
+                },
+                _ = &mut kill_rx => { killed = true; break; }
+            }
+        }
+    }
+
+    let code = if killed {
+        -1
+    } else {
+        tokio::select! {
+            status = child.wait() => status.ok().and_then(|s| s.code()).unwrap_or(-1),
+            _ = &mut kill_rx => -1,
+        }
+    };
+    let _ = event_tx.send(LoopEvent::ProcExit { id, code });
+}
+
+/// Open a TCP client connection (`nx.socket.connect`) — the duplex sibling of
+/// [`run_duplex_process`] for an adapter that speaks over a socket (a DAP
+/// `type = "server"` adapter) rather than stdio. On a successful connect it sends
+/// [`LoopEvent::SockConnected`], then streams inbound bytes as
+/// [`LoopEvent::SockData`] (raw, un-framed) while draining `write_rx` to the socket,
+/// until EOF / an I/O error / a requested close — then exactly one
+/// [`LoopEvent::SockClosed`] (`error` set on a connect/I-O failure).
+pub async fn run_socket_connection(
+    id: u64,
+    host: String,
+    port: u16,
+    mut close_rx: oneshot::Receiver<()>,
+    mut write_rx: tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>,
+    event_tx: UnboundedSender<LoopEvent>,
+) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let stream = match tokio::net::TcpStream::connect((host.as_str(), port)).await {
+        Ok(s) => s,
+        Err(e) => {
+            let _ = event_tx.send(LoopEvent::SockClosed {
+                id,
+                error: Some(format!("nx.socket: connect to {host}:{port} failed: {e}")),
+            });
+            return;
+        }
+    };
+    if event_tx.send(LoopEvent::SockConnected { id }).is_err() {
+        return; // server gone
+    }
+    let (mut read_half, mut write_half) = stream.into_split();
+
+    // Drain queued writes to the socket from a detached task (concurrent with the
+    // read loop, so a large write can't deadlock against a full receive buffer).
+    tokio::spawn(async move {
+        while let Some(chunk) = write_rx.recv().await {
+            if write_half.write_all(&chunk).await.is_err() || write_half.flush().await.is_err() {
+                break;
+            }
+        }
+        let _ = write_half.shutdown().await;
+    });
+
+    // Read raw inbound bytes, racing each read against the close signal.
+    let mut buf = [0u8; 8192];
+    let error;
+    loop {
+        tokio::select! {
+            read = read_half.read(&mut buf) => match read {
+                Ok(0) => { error = None; break; } // clean EOF (peer closed)
+                Ok(n) => {
+                    if event_tx.send(LoopEvent::SockData { id, data: buf[..n].to_vec() }).is_err() {
+                        return; // server gone
+                    }
+                }
+                Err(e) => { error = Some(format!("nx.socket: read error: {e}")); break; }
+            },
+            _ = &mut close_rx => { error = None; break; } // requested close
+        }
+    }
+    let _ = event_tx.send(LoopEvent::SockClosed { id, error });
+}

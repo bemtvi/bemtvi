@@ -231,6 +231,47 @@ pub trait HostEffects {
     #[cfg(not(feature = "native"))]
     fn term_kill(&mut self, buf: u64);
 
+    /// Open a daemon-side **duplex** child (`nx.process.open` — the DAP / framed-protocol
+    /// transport) over the `dproc_*` leg. The wasm twin of `loop_command(LoopCommand::ProcOpen)`:
+    /// the browser has no local process, so the adapter runs on the daemon and its raw
+    /// stdout/stderr stream back inbound via [`EditHost::dproc_out`](crate::EditHost::dproc_out)
+    /// before [`EditHost::dproc_exit`](crate::EditHost::dproc_exit). Gated on a connected daemon
+    /// ([`Self::has_remote_proc`]); serverless fails the open loud. Wasm-only.
+    #[cfg(not(feature = "native"))]
+    fn dproc_open(
+        &mut self,
+        id: u64,
+        argv: Vec<String>,
+        cwd: Option<String>,
+        env: Vec<(String, String)>,
+    );
+
+    /// Feed bytes to a duplex daemon child's stdin (`handle:write`). Wasm-only.
+    #[cfg(not(feature = "native"))]
+    fn dproc_write(&mut self, id: u64, bytes: Vec<u8>);
+
+    /// Terminate a duplex daemon child (`handle:kill`); its exit returns on `dproc_exit`.
+    /// Wasm-only.
+    #[cfg(not(feature = "native"))]
+    fn dproc_kill(&mut self, id: u64);
+
+    /// Open a daemon-side TCP connection (`nx.socket.connect` — a DAP `type="server"` adapter
+    /// transport) over the `sock_*` leg. The daemon dials `host:port`; success returns on
+    /// [`EditHost::sock_connected`](crate::EditHost::sock_connected), inbound bytes on
+    /// [`EditHost::sock_data`](crate::EditHost::sock_data), close on
+    /// [`EditHost::sock_closed`](crate::EditHost::sock_closed). Wasm-only.
+    #[cfg(not(feature = "native"))]
+    fn sock_connect(&mut self, id: u64, host: String, port: u16);
+
+    /// Send bytes over a daemon TCP connection (`handle:write`). Wasm-only.
+    #[cfg(not(feature = "native"))]
+    fn sock_write(&mut self, id: u64, bytes: Vec<u8>);
+
+    /// Close a daemon TCP connection (`handle:close`); the close returns on `sock_closed`.
+    /// Wasm-only.
+    #[cfg(not(feature = "native"))]
+    fn sock_close(&mut self, id: u64);
+
     /// LSP — ensure `key`'s language server is running (idempotent), spawning it via
     /// `spawn` on first use. Fire-and-forget; the server's notifications and reply
     /// stream return *inbound* — on the native run loop's `lsp_events` arm, or (wasm)

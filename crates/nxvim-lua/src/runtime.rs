@@ -1764,6 +1764,60 @@ impl LuaRuntime {
         run.call::<()>((id, table))
     }
 
+    /// Deliver a raw output chunk from a duplex `nx.process` child to its persistent
+    /// receiver (`nx._proc_recv(id, data, is_stderr)`). `data` is handed over as a
+    /// binary-safe Lua string (un-split, un-decoded — the Lua side owns the framing),
+    /// `stderr` selects the stream. Persistent until [`run_process_exit`] fires. A
+    /// no-op when no handler is registered under `id`.
+    ///
+    /// [`run_process_exit`]: LuaRuntime::run_process_exit
+    pub fn run_process_recv(&self, id: u64, data: Vec<u8>, stderr: bool) -> mlua::Result<()> {
+        let nx = self.nx()?;
+        let run: mlua::Function = nx.get("_proc_recv")?;
+        let data = self.lua.create_string(&data)?;
+        run.call::<()>((id, data, stderr))
+    }
+
+    /// Fire a duplex `nx.process` child's exit (`nx._proc_exit(id, code)`), then drop
+    /// its handler registry entry (a one-shot — the handle is dead afterwards).
+    pub fn run_process_exit(&self, id: u64, code: i32) -> mlua::Result<()> {
+        let nx = self.nx()?;
+        let run: mlua::Function = nx.get("_proc_exit")?;
+        run.call::<()>((id, code))
+    }
+
+    /// Fire an `nx.socket` connection's `on_connect` (`nx._sock_connected(id)`), once
+    /// the TCP connection is established.
+    pub fn run_socket_connected(&self, id: u64) -> mlua::Result<()> {
+        let nx = self.nx()?;
+        let run: mlua::Function = nx.get("_sock_connected")?;
+        run.call::<()>(id)
+    }
+
+    /// Deliver a raw byte chunk from an `nx.socket` connection to its `on_data`
+    /// receiver (`nx._sock_data(id, data)`), as a binary-safe Lua string. Persistent
+    /// until [`run_socket_closed`] fires.
+    ///
+    /// [`run_socket_closed`]: LuaRuntime::run_socket_closed
+    pub fn run_socket_data(&self, id: u64, data: Vec<u8>) -> mlua::Result<()> {
+        let nx = self.nx()?;
+        let run: mlua::Function = nx.get("_sock_data")?;
+        let data = self.lua.create_string(&data)?;
+        run.call::<()>((id, data))
+    }
+
+    /// Fire an `nx.socket` connection's close (`nx._sock_closed(id, err)`) — `err` is
+    /// a string when the connection failed / errored, nil on a clean close. One-shot.
+    pub fn run_socket_closed(&self, id: u64, error: Option<String>) -> mlua::Result<()> {
+        let nx = self.nx()?;
+        let run: mlua::Function = nx.get("_sock_closed")?;
+        let err = match error {
+            Some(msg) => mlua::Value::String(self.lua.create_string(&msg)?),
+            None => mlua::Value::Nil,
+        };
+        run.call::<()>((id, err))
+    }
+
     /// Fire a `nx.fs.watch` stream's pump (`nx._run_fs_watch(id, ev, err)`): an `ev`
     /// table `{ kind, paths }` on a change, or `err` (a string) when the watch failed
     /// to arm / a backend error ended it. Persistent until the stream is `:stop()`ed

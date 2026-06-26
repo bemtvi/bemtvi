@@ -101,6 +101,18 @@ const eh_take_lsp_requests = M.cwrap("eh_take_lsp_requests", "number", ["number"
 const eh_lsp_stdout = M.cwrap("eh_lsp_stdout", null, ["number", "number", "number", "number"]);
 const eh_lsp_stderr = M.cwrap("eh_lsp_stderr", null, ["number", "number", "number", "number"]);
 const eh_lsp_exited = M.cwrap("eh_lsp_exited", null, ["number", "number", "number", "number"]);
+// Duplex-process leg (`dproc_*`) + socket leg (`sock_*`): the DAP / framed-protocol transports
+// (nx.process / nx.socket). Like the LSP leg, the editor enqueues bidirectional ops off-tick
+// (only with a daemon connected — the adapter runs on the daemon); the Worker forwards each and
+// lands the daemon's raw `dproc_out`/`dproc_exit` and `sock_connected`/`sock_data`/`sock_closed`
+// pushes back. Output rides as pointer+length (a framed protocol may carry NULs / binary).
+const eh_take_dproc_requests = M.cwrap("eh_take_dproc_requests", "number", ["number"]);
+const eh_dproc_out = M.cwrap("eh_dproc_out", null, ["number", "number", "number", "number", "number"]);
+const eh_dproc_exit = M.cwrap("eh_dproc_exit", null, ["number", "number", "number"]);
+const eh_take_sock_requests = M.cwrap("eh_take_sock_requests", "number", ["number"]);
+const eh_sock_connected = M.cwrap("eh_sock_connected", null, ["number", "number"]);
+const eh_sock_data = M.cwrap("eh_sock_data", null, ["number", "number", "number", "number"]);
+const eh_sock_closed = M.cwrap("eh_sock_closed", null, ["number", "number", "string"]);
 // Treesitter `:TSInstall` leg: the editor enqueues each install off-tick; the Worker
 // forwards it to the UI thread (web-tree-sitter lives there), which fetches/caches/registers
 // the grammar and lands the outcome back via `eh_ts_install_complete`. `eh_ts_seed_installed`
@@ -931,6 +943,8 @@ async function runtimeConnect(uri) {
   armedWatches.clear();
   liveProcs.clear();
   liveLsp.clear();
+  liveDprocs.clear();
+  liveSocks.clear();
   daemonError = null;
   daemonUri = uri;
   await connectDaemon();
@@ -1005,6 +1019,8 @@ const liveProcs = new Set(); // spawn ids in flight on the daemon (also gates th
 const liveTerms = new Set(); // terminal buffer ids open on the daemon (also gates the async park)
 const liveFsWatches = new Set(); // nx.fs.watch stream ids armed on the daemon (also gates the async park)
 const liveLsp = new Set(); // LSP server wire ids spawned on the daemon (also gates the async park)
+const liveDprocs = new Set(); // duplex nx.process child ids in flight on the daemon (gates the park)
+const liveSocks = new Set(); // nx.socket connection ids in flight on the daemon (gates the park)
 const daemonNotifications = []; // [method, params] pushes received but not yet applied
 let daemonWaker = null; // resolve() to wake the async park the instant a push arrives
 let sabCtrl = null; // the SAB control array (set by runLoopSAB) so a push can wake the futex park
@@ -1216,6 +1232,31 @@ function applyDaemonNotifications() {
       eh_lsp_exited(h, Number(id), code == null ? -1 : Number(code), signal == null ? -1 : Number(signal));
       liveLsp.delete(id);
       any = true;
+    } else if (method === "dproc_out") {
+      // params = [id, bytes(bin), is_stderr(bool)] — a raw output chunk from a duplex
+      // nx.process child (the DAP transport). Hand it to the Lua receiver.
+      callDprocOut(Number(params[0]), toU8(params[1]), params[2] === true || params[2] === 1);
+      any = true;
+    } else if (method === "dproc_exit") {
+      // params = [id, code] — the duplex child exited (-1 on a kill / spawn failure).
+      const id = params[0];
+      eh_dproc_exit(h, Number(id), Number(params[1] ?? -1));
+      liveDprocs.delete(id);
+      any = true;
+    } else if (method === "sock_connected") {
+      // params = [id] — the TCP connection is established.
+      eh_sock_connected(h, Number(params[0]));
+      any = true;
+    } else if (method === "sock_data") {
+      // params = [id, bytes(bin)] — a raw inbound chunk.
+      callSockData(Number(params[0]), toU8(params[1]));
+      any = true;
+    } else if (method === "sock_closed") {
+      // params = [id, error?] — the connection closed (error set on a connect/I-O failure).
+      const id = params[0];
+      eh_sock_closed(h, Number(id), params[1] == null ? null : String(params[1]));
+      liveSocks.delete(id);
+      any = true;
     } else {
       postMessage({ type: "config_error", error: `unhandled daemon push: ${method}` });
     }
@@ -1300,6 +1341,64 @@ function callLspStderr(id, bytes) {
   if (ptr) M.HEAPU8.set(bytes, ptr);
   eh_lsp_stderr(h, id, ptr, bytes.length);
   if (ptr) M._free(ptr);
+}
+
+// Feed a `dproc_out` / `sock_data` push's raw bytes into the Lua receiver. Copied into wasm
+// memory (a framed protocol may carry NULs / binary — it can't ride the cwrap "string"
+// marshalling); free after the call.
+function callDprocOut(id, bytes, stderr) {
+  const ptr = bytes.length ? M._malloc(bytes.length) : 0;
+  if (ptr) M.HEAPU8.set(bytes, ptr);
+  eh_dproc_out(h, id, ptr, bytes.length, stderr ? 1 : 0);
+  if (ptr) M._free(ptr);
+}
+
+function callSockData(id, bytes) {
+  const ptr = bytes.length ? M._malloc(bytes.length) : 0;
+  if (ptr) M.HEAPU8.set(bytes, ptr);
+  eh_sock_data(h, id, ptr, bytes.length);
+  if (ptr) M._free(ptr);
+}
+
+// Forward the duplex-process opens/writes/kills the tick enqueued to the daemon (`dproc_*`).
+// The daemon answers with `dproc_out`/`dproc_exit` pushes. Daemon-only (the tick gates on
+// `has_remote_proc`, so a serverless nx.process fails loud in the core).
+async function drainDprocRequests() {
+  const reqs = JSON.parse(readStr(eh_take_dproc_requests(h)));
+  if (reqs.open.length === 0 && reqs.write.length === 0 && reqs.kill.length === 0) return;
+  if (!daemon) {
+    if (localHost) localHost.dproc?.(reqs);
+    return;
+  }
+  for (const o of reqs.open) {
+    liveDprocs.add(o.id);
+    await daemon.notify("dproc_open", [o.id, o.argv, o.cwd ?? null, o.env]);
+  }
+  for (const w of reqs.write) await daemon.notify("dproc_write", [w.id, new Uint8Array(w.bytes)]);
+  // Keep the id in `liveDprocs` (poll mode) until its `dproc_exit` push arrives — a kill
+  // does NOT end the child synchronously; deleting it here would deep-park the loop before
+  // the exit could be received (it's deleted in applyDaemonNotifications on `dproc_exit`).
+  for (const id of reqs.kill) await daemon.notify("dproc_kill", [id]);
+}
+
+// Forward the socket connects/writes/closes the tick enqueued to the daemon (`sock_*`). The
+// daemon answers with `sock_connected`/`sock_data`/`sock_closed` pushes. Daemon-only.
+async function drainSockRequests() {
+  const reqs = JSON.parse(readStr(eh_take_sock_requests(h)));
+  if (reqs.connect.length === 0 && reqs.write.length === 0 && reqs.close.length === 0) return;
+  if (!daemon) {
+    if (localHost) localHost.sock?.(reqs);
+    return;
+  }
+  for (const c of reqs.connect) {
+    liveSocks.add(c.id);
+    await daemon.notify("sock_connect", [c.id, c.host, c.port]);
+  }
+  for (const w of reqs.write) await daemon.notify("sock_write", [w.id, new Uint8Array(w.bytes)]);
+  // Keep the id in `liveSocks` (poll mode) until its `sock_closed` push arrives — a close
+  // request does NOT settle synchronously (it's deleted in applyDaemonNotifications on
+  // `sock_closed`); deleting here would deep-park before the close could be received.
+  for (const id of reqs.close) await daemon.notify("sock_close", [id]);
 }
 
 // Forward the async process spawns/kills the tick enqueued to the daemon (`proc_spawn` /
@@ -1528,6 +1627,8 @@ async function pump5cDaemon() {
   await drainFsWatchRequests();
   await drainTerminalRequests();
   await drainLspRequests();
+  await drainDprocRequests();
+  await drainSockRequests();
   postMessage(redrawMsg());
 }
 
@@ -1777,6 +1878,8 @@ async function runLoopSAB(ctrl, data) {
     // Forward any LSP wire ops the tick (or a just-applied `lsp_stdout`) enqueued to the daemon
     // (its `lsp_stdout`/`lsp_stderr`/`lsp_exited` pushes return on `onDaemonNotify`).
     await drainLspRequests();
+    await drainDprocRequests();
+    await drainSockRequests();
     // Forward any `:TSInstall` the tick enqueued to the UI thread (fire-and-forget).
     drainTsRequests();
     // Forward any `"+`/`"*` yanks/deletes to the UI thread to write to navigator.clipboard.
@@ -1843,6 +1946,8 @@ async function runLoopSAB(ctrl, data) {
       (daemon || localHost) &&
       (armedWatches.size > 0 ||
         liveProcs.size > 0 ||
+        liveDprocs.size > 0 ||
+        liveSocks.size > 0 ||
         liveTerms.size > 0 ||
         liveFsWatches.size > 0 ||
         liveLsp.size > 0);
@@ -1985,6 +2090,8 @@ onmessage = async (ev) => {
       await drainProcRequests();
       await drainTerminalRequests();
       await drainLspRequests();
+      await drainDprocRequests();
+      await drainSockRequests();
       drainTsRequests();
       drainClipboardWrites();
       postFrame(msg.id);
@@ -2001,6 +2108,8 @@ onmessage = async (ev) => {
       await drainProcRequests();
       await drainTerminalRequests();
       await drainLspRequests();
+      await drainDprocRequests();
+      await drainSockRequests();
       drainTsRequests();
       drainClipboardWrites();
       postFrame(msg.id);
@@ -2015,6 +2124,8 @@ onmessage = async (ev) => {
       await drainProcRequests();
       await drainTerminalRequests();
       await drainLspRequests();
+      await drainDprocRequests();
+      await drainSockRequests();
       drainTsRequests();
       drainClipboardWrites();
       postFrame(msg.id, result);

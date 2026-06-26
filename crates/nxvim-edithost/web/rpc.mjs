@@ -37,7 +37,10 @@ const GROUP_TAGS = { control: 0, proc: 1, lsp: 2, term: 3 };
  * @param {string} method @returns {keyof typeof GROUP_TAGS}
  */
 function groupForMethod(method) {
-  if (method.startsWith("proc_")) return "proc";
+  // dproc_* / sock_* are the duplex nx.process / nx.socket DAP transports — they ride the
+  // Proc stream as process/socket siblings (matches `LegGroup::classify` in daemon.rs).
+  if (method.startsWith("proc_") || method.startsWith("dproc_") || method.startsWith("sock_"))
+    return "proc";
   if (method.startsWith("lsp_")) return "lsp";
   if (method.startsWith("term_")) return "term";
   return "control"; // fs_* / config_* / luafs_* and anything else

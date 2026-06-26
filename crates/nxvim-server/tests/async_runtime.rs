@@ -284,6 +284,180 @@ async fn nx_spawn_is_removed() {
     );
 }
 
+// ----- nx.socket (duplex TCP client) -----------------------------------------
+
+#[tokio::test]
+async fn nx_socket_round_trips_over_tcp() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let (rpc, _incoming) = start().await;
+    // A tiny echo server on an ephemeral port: nx.socket connects, writes "ping" on
+    // connect, and the bytes come back on on_data — proof the TCP transport is duplex.
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        if let Ok((mut sock, _)) = listener.accept().await {
+            let mut buf = [0u8; 1024];
+            loop {
+                match sock.read(&mut buf).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => {
+                        if sock.write_all(&buf[..n]).await.is_err() {
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+    });
+    exec_lua(
+        &rpc,
+        &format!(
+            "_G.got = ''\n\
+             _G.connected = false\n\
+             _G.closed = nil\n\
+             _G.s = nx.socket.connect({{\n\
+               host = '127.0.0.1', port = {port},\n\
+               on_connect = function() _G.connected = true; _G.s:write('ping') end,\n\
+               on_data = function(d) _G.got = _G.got .. d end,\n\
+               on_close = function(e) _G.closed = e or 'clean' end,\n\
+             }})"
+        ),
+    )
+    .await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(
+        lua_bool(&rpc, "return _G.connected").await,
+        Some(true),
+        "on_connect fired"
+    );
+    assert_eq!(exec_lua(&rpc, "return _G.got").await.as_str(), Some("ping"));
+    // Closing fires on_close (clean — no error).
+    exec_lua(&rpc, "_G.s:close()").await;
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    assert_eq!(
+        exec_lua(&rpc, "return _G.closed").await.as_str(),
+        Some("clean"),
+        "on_close fired with no error after a requested close"
+    );
+}
+
+#[tokio::test]
+async fn nx_socket_connect_failure_is_loud() {
+    let (rpc, _incoming) = start().await;
+    // Connecting to a closed port fails LOUD: on_close fires with an error string,
+    // never a silent hang. Port 1 is privileged + unbound — connect refuses fast.
+    exec_lua(
+        &rpc,
+        "_G.connected = false\n\
+         _G.err = nil\n\
+         nx.socket.connect({\n\
+           host = '127.0.0.1', port = 1,\n\
+           on_connect = function() _G.connected = true end,\n\
+           on_close = function(e) _G.err = e end,\n\
+         })",
+    )
+    .await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(lua_bool(&rpc, "return _G.connected").await, Some(false));
+    assert_eq!(
+        lua_bool(&rpc, "return type(_G.err) == 'string' and #_G.err > 0").await,
+        Some(true),
+        "the connect failure surfaced as an on_close error"
+    );
+}
+
+// ----- nx.process (duplex, bidirectional child) ------------------------------
+
+#[tokio::test]
+async fn nx_process_round_trips_stdin_to_stdout() {
+    let (rpc, _incoming) = start().await;
+    // `cat` echoes its stdin to stdout: open it duplex, write two lines on the
+    // still-open stdin, and the persistent on_stdout must receive them back — proof
+    // the channel is bidirectional and long-lived (neither nx.run nor nx.run_stream
+    // can do this, both close stdin at spawn).
+    exec_lua(
+        &rpc,
+        "_G.got = ''\n\
+         _G.code = nil\n\
+         _G.proc = nx.process.open({\n\
+           cmd = 'cat',\n\
+           on_stdout = function(chunk) _G.got = _G.got .. chunk end,\n\
+           on_exit = function(c) _G.code = c end,\n\
+         })\n\
+         _G.proc:write('hello\\n')\n\
+         _G.proc:write('world\\n')",
+    )
+    .await;
+    tokio::time::sleep(Duration::from_millis(250)).await;
+    let got = exec_lua(&rpc, "return _G.got").await;
+    assert_eq!(
+        got.as_str(),
+        Some("hello\nworld\n"),
+        "the child echoed both writes back over the live pipe"
+    );
+    // Still running (cat waits for EOF) — no exit yet.
+    assert_eq!(lua_bool(&rpc, "return _G.code == nil").await, Some(true));
+    // Kill it; the exit callback fires.
+    exec_lua(&rpc, "_G.proc:kill()").await;
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    assert_eq!(
+        lua_bool(&rpc, "return _G.code ~= nil").await,
+        Some(true),
+        "on_exit fired after the kill"
+    );
+}
+
+#[tokio::test]
+async fn nx_process_streams_stderr_and_natural_exit_code() {
+    let (rpc, _incoming) = start().await;
+    // A child that writes stderr then exits non-zero: on_stderr collects the bytes,
+    // on_exit reports the real code.
+    exec_lua(
+        &rpc,
+        "_G.err = ''\n\
+         _G.code = nil\n\
+         nx.process.open({\n\
+           cmd = 'sh',\n\
+           args = { '-c', 'printf oops 1>&2; exit 3' },\n\
+           on_stderr = function(chunk) _G.err = _G.err .. chunk end,\n\
+           on_exit = function(c) _G.code = c end,\n\
+         })",
+    )
+    .await;
+    tokio::time::sleep(Duration::from_millis(250)).await;
+    assert_eq!(exec_lua(&rpc, "return _G.err").await.as_str(), Some("oops"));
+    assert_eq!(lua_u64(&rpc, "return _G.code").await, Some(3));
+}
+
+#[tokio::test]
+async fn nx_process_spawn_failure_is_loud_not_silent() {
+    let (rpc, _incoming) = start().await;
+    // A missing binary fails LOUD: stderr carries the cause and on_exit fires with
+    // code -1 (never a silent hang) — the no-silent-stubs discipline.
+    exec_lua(
+        &rpc,
+        "_G.err = ''\n\
+         _G.code = nil\n\
+         nx.process.open({\n\
+           cmd = 'this-binary-does-not-exist-xyz',\n\
+           on_stderr = function(chunk) _G.err = _G.err .. chunk end,\n\
+           on_exit = function(c) _G.code = c end,\n\
+         })",
+    )
+    .await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(
+        lua_bool(&rpc, "return _G.code == -1").await,
+        Some(true),
+        "spawn failure surfaces as code -1"
+    );
+    assert_eq!(
+        lua_bool(&rpc, "return #_G.err > 0").await,
+        Some(true),
+        "the failure reason rode the stderr stream"
+    );
+}
+
 // ----- Phase 4: robustness (leaks, schedule_wrap) ----------------------------
 
 #[tokio::test]

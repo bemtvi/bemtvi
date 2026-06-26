@@ -113,11 +113,11 @@ pub use shada::{
 /// what one fetch resolves to.
 #[cfg(feature = "native")]
 pub use daemon::{
-    connect_daemon, serve_config_daemon, serve_config_daemon_on, serve_daemon, serve_fs_daemon,
-    serve_fs_daemon_on, serve_lsp_daemon, serve_lsp_daemon_on, serve_luafs_daemon,
-    serve_luafs_daemon_on, serve_proc_daemon_on, serve_term_daemon_on, DaemonClient, FsRead,
-    HostFsAsync, RemoteConfig, RemoteFsJobs, RemoteHostFs, RemoteHostProc, RemoteLspTransport,
-    WatchEvent,
+    connect_daemon, serve_config_daemon, serve_config_daemon_on, serve_daemon,
+    serve_dproc_daemon_on, serve_fs_daemon, serve_fs_daemon_on, serve_lsp_daemon,
+    serve_lsp_daemon_on, serve_luafs_daemon, serve_luafs_daemon_on, serve_proc_daemon_on,
+    serve_sock_daemon_on, serve_term_daemon_on, DaemonClient, FsRead, HostFsAsync, RemoteConfig,
+    RemoteFsJobs, RemoteHostFs, RemoteHostProc, RemoteLspTransport, WatchEvent,
 };
 /// Materialize a fetched bundle onto the per-process cache resolved from the environment
 /// (`$XDG_CACHE_HOME`/`$HOME`) — the native edit-host's entry point.
@@ -1826,6 +1826,63 @@ impl EditHost {
         self.fx.lsp_stderr(id, bytes);
     }
 
+    /// Land a raw output chunk from a duplex `nx.process` daemon child (the `dproc_*`
+    /// leg's `dproc_out` push) — the wasm twin of the native `on_loop_event`'s
+    /// [`LoopEvent::ProcOut`](crate::evloop) arm. Hands the chunk to the persistent Lua
+    /// receiver (`nx._proc_recv`), drains the effects it queues (the DAP framing /
+    /// dispatch — breakpoint signs, view renders), and settles + repaints.
+    pub fn dproc_out(&mut self, id: u64, data: Vec<u8>, stderr: bool) {
+        if let Err(e) = self.lua.run_process_recv(id, data, stderr) {
+            self.editor
+                .echo(format!("E5108: Error in nx.process handler: {e}"));
+        }
+        self.apply_lua_effects();
+        self.settle_events(true);
+    }
+
+    /// Land a duplex `nx.process` daemon child's exit (`dproc_exit`). Fires the Lua
+    /// `on_exit` once and settles.
+    pub fn dproc_exit(&mut self, id: u64, code: i32) {
+        if let Err(e) = self.lua.run_process_exit(id, code) {
+            self.editor
+                .echo(format!("E5108: Error in nx.process on_exit: {e}"));
+        }
+        self.apply_lua_effects();
+        self.settle_events(true);
+    }
+
+    /// Land an `nx.socket` daemon connection's `connected` (`sock_connected`). Fires
+    /// the Lua `on_connect` and settles.
+    pub fn sock_connected(&mut self, id: u64) {
+        if let Err(e) = self.lua.run_socket_connected(id) {
+            self.editor
+                .echo(format!("E5108: Error in nx.socket on_connect: {e}"));
+        }
+        self.apply_lua_effects();
+        self.settle_events(true);
+    }
+
+    /// Land a raw inbound chunk from an `nx.socket` daemon connection (`sock_data`).
+    pub fn sock_data(&mut self, id: u64, data: Vec<u8>) {
+        if let Err(e) = self.lua.run_socket_data(id, data) {
+            self.editor
+                .echo(format!("E5108: Error in nx.socket handler: {e}"));
+        }
+        self.apply_lua_effects();
+        self.settle_events(true);
+    }
+
+    /// Land an `nx.socket` daemon connection's close (`sock_closed`) — `error` set on a
+    /// connect / I-O failure. Fires the Lua `on_close` once and settles.
+    pub fn sock_closed(&mut self, id: u64, error: Option<String>) {
+        if let Err(e) = self.lua.run_socket_closed(id, error) {
+            self.editor
+                .echo(format!("E5108: Error in nx.socket on_close: {e}"));
+        }
+        self.apply_lua_effects();
+        self.settle_events(true);
+    }
+
     /// Land an `lsp_exited` push: the server (wire `id`) exited or its pipe closed. The
     /// `SyncLspClient` surfaces an `LspEvent::ServerExited`, drained here so the editor
     /// tells the user (it re-`ensure`s on the next `FileType`). A negative `code`/`signal`
@@ -2681,6 +2738,12 @@ where
 struct DaemonLegs {
     fs: Option<tokio::sync::mpsc::UnboundedSender<Incoming>>,
     proc: Option<tokio::sync::mpsc::UnboundedSender<Incoming>>,
+    /// The duplex `nx.process` leg (`dproc_*`) — a DAP / framed-protocol transport. Rides
+    /// the Proc group's stream alongside `proc`.
+    dproc: Option<tokio::sync::mpsc::UnboundedSender<Incoming>>,
+    /// The `nx.socket` TCP leg (`sock_*`) — a DAP `type="server"` adapter transport, also on
+    /// the Proc stream.
+    sock: Option<tokio::sync::mpsc::UnboundedSender<Incoming>>,
     term: Option<tokio::sync::mpsc::UnboundedSender<Incoming>>,
     lsp: Option<tokio::sync::mpsc::UnboundedSender<Incoming>>,
     luafs: Option<tokio::sync::mpsc::UnboundedSender<Incoming>>,
@@ -2702,6 +2765,8 @@ impl DaemonLegs {
         let mut legs = DaemonLegs {
             fs: None,
             proc: None,
+            dproc: None,
+            sock: None,
             term: None,
             lsp: None,
             luafs: None,
@@ -2744,11 +2809,24 @@ impl DaemonLegs {
                 }
                 LegGroup::Proc => {
                     let (proc_tx, proc_rx) = unbounded_channel();
+                    let (dproc_tx, dproc_rx) = unbounded_channel();
+                    let (sock_tx, sock_rx) = unbounded_channel();
                     legs.handles.push(tokio::spawn(daemon::serve_proc_daemon_on(
                         rpc.clone(),
                         proc_rx,
                     )));
+                    legs.handles
+                        .push(tokio::spawn(daemon::serve_dproc_daemon_on(
+                            rpc.clone(),
+                            dproc_rx,
+                        )));
+                    legs.handles.push(tokio::spawn(daemon::serve_sock_daemon_on(
+                        rpc.clone(),
+                        sock_rx,
+                    )));
                     legs.proc = Some(proc_tx);
+                    legs.dproc = Some(dproc_tx);
+                    legs.sock = Some(sock_tx);
                 }
                 LegGroup::Lsp => {
                     let (lsp_tx, lsp_rx) = unbounded_channel();
@@ -2791,7 +2869,15 @@ impl DaemonLegs {
                     None
                 }
             }
-            LegGroup::Proc => self.proc.as_ref(),
+            LegGroup::Proc => {
+                if method.starts_with("dproc_") {
+                    self.dproc.as_ref()
+                } else if method.starts_with("sock_") {
+                    self.sock.as_ref()
+                } else {
+                    self.proc.as_ref()
+                }
+            }
             LegGroup::Lsp => self.lsp.as_ref(),
             LegGroup::Term => self.term.as_ref(),
         }
@@ -2803,6 +2889,8 @@ impl DaemonLegs {
         drop((
             self.fs,
             self.proc,
+            self.dproc,
+            self.sock,
             self.term,
             self.lsp,
             self.luafs,

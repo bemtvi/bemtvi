@@ -192,6 +192,27 @@ const LSP_STDOUT: &str = "lsp_stdout"; // daemon → edit-host: [id, bytes]
 const LSP_STDERR: &str = "lsp_stderr"; // daemon → edit-host: [id, bytes]
 const LSP_EXITED: &str = "lsp_exited"; // daemon → edit-host: [id, code?, signal?]
 
+// The duplex-process leg (`dproc_*`): a *long-lived bidirectional pipe* per
+// `nx.process.open` child — the DAP / framed-protocol transport. Like the LSP leg
+// (and unlike the run-to-completion `proc_*`), the child's stdio stays open for its
+// whole life with raw bytes flowing both ways. Distinct from `lsp_*` because the
+// edit-host routes its output to Lua callbacks, not the LSP client.
+const DPROC_OPEN: &str = "dproc_open"; // edit-host → daemon: [id, argv, cwd, env]
+const DPROC_WRITE: &str = "dproc_write"; // edit-host → daemon: [id, bytes]
+const DPROC_KILL: &str = "dproc_kill"; // edit-host → daemon: [id]
+const DPROC_OUT: &str = "dproc_out"; // daemon → edit-host: [id, bytes, is_stderr]
+const DPROC_EXIT: &str = "dproc_exit"; // daemon → edit-host: [id, code]
+
+// The socket leg (`sock_*`): a *long-lived bidirectional TCP connection* per
+// `nx.socket.connect` — a DAP `type="server"` adapter transport. The daemon dials
+// the host:port and streams bytes both ways.
+const SOCK_CONNECT: &str = "sock_connect"; // edit-host → daemon: [id, host, port]
+const SOCK_WRITE: &str = "sock_write"; // edit-host → daemon: [id, bytes]
+const SOCK_CLOSE: &str = "sock_close"; // edit-host → daemon: [id]
+const SOCK_CONNECTED: &str = "sock_connected"; // daemon → edit-host: [id]
+const SOCK_DATA: &str = "sock_data"; // daemon → edit-host: [id, bytes]
+const SOCK_CLOSED: &str = "sock_closed"; // daemon → edit-host: [id, error?]
+
 // The Lua-`nx.fs` off-tick op leg (`luafs_op`): a request/response per **high-level**
 // `nx.fs.*` op (`readdir` / `read_text` / `write` / `copy{recursive}` / …) — the ONE fs
 // path both the native-daemon edit-host (via [`RemoteFsJobs`]) and the wasm edit-host (over
@@ -282,7 +303,10 @@ impl LegGroup {
     /// The group that owns a wire method, or `None` for an unknown method (the peer is
     /// the same build, so an unrecognised method is dropped). The four arms partition the
     /// method namespace disjointly — `fs_*` / `config_*` / `luafs_*` to [`Control`],
-    /// `proc_*` to [`Proc`], `lsp_*` to [`Lsp`], `term_*` to [`Term`].
+    /// `proc_*` / `dproc_*` / `sock_*` to [`Proc`], `lsp_*` to [`Lsp`], `term_*` to [`Term`].
+    /// (`dproc_*` / `sock_*` are the duplex `nx.process` / `nx.socket` DAP transports — they
+    /// ride the Proc stream as process/socket siblings, kept off the latency-critical
+    /// Control stream.)
     ///
     /// [`Control`]: LegGroup::Control
     /// [`Proc`]: LegGroup::Proc
@@ -294,7 +318,10 @@ impl LegGroup {
             || method.starts_with("luafs_")
         {
             Some(LegGroup::Control)
-        } else if method.starts_with("proc_") {
+        } else if method.starts_with("proc_")
+            || method.starts_with("dproc_")
+            || method.starts_with("sock_")
+        {
             Some(LegGroup::Proc)
         } else if method.starts_with("lsp_") {
             Some(LegGroup::Lsp)
@@ -534,7 +561,12 @@ pub async fn serve_proc_daemon_on(
                 // no other variant can reach here.
                 LoopEvent::Timer { .. }
                 | LoopEvent::FsEvent { .. }
-                | LoopEvent::FsResult { .. } => {}
+                | LoopEvent::FsResult { .. }
+                | LoopEvent::ProcOut { .. }
+                | LoopEvent::ProcExit { .. }
+                | LoopEvent::SockConnected { .. }
+                | LoopEvent::SockData { .. }
+                | LoopEvent::SockClosed { .. } => {}
             }
         }
     });
@@ -1916,6 +1948,207 @@ fn decode_lsp_exited(params: &[Value]) -> Option<(u64, Option<i32>, Option<i32>)
     let code = params.get(1).and_then(Value::as_i64).map(|c| c as i32);
     let signal = params.get(2).and_then(Value::as_i64).map(|s| s as i32);
     Some((id, code, signal))
+}
+
+// ----- the duplex-process leg (`dproc_*`) -----------------------------------------
+//
+// The remote half of `nx.process.open`: a long-lived duplex child (the DAP / framed-
+// protocol transport) run on the daemon, with raw stdout/stderr streamed back and
+// stdin fed over the wire. Reuses [`run_duplex_process`](crate::host::run_duplex_process)
+// — the same function the native event-loop actor runs — with a tiny forwarder turning
+// its [`LoopEvent`]s into wire notifications. The wasm edit-host forwards the identical
+// requests over WebTransport; one leg, one shape.
+
+/// A decoded `dproc_open`: `(id, argv, cwd?, env)`.
+type DprocOpen = (u64, Vec<String>, Option<String>, Vec<(String, String)>);
+
+/// `dproc_open` params → `(id, argv, cwd?, env)`. Mirrors [`decode_spawn`]'s shape.
+fn decode_dproc_open(mut params: Vec<Value>) -> Option<DprocOpen> {
+    if params.len() < 4 {
+        return None;
+    }
+    let id = params[0].as_u64()?;
+    let argv = match std::mem::replace(&mut params[1], Value::Nil) {
+        Value::Array(a) => a
+            .into_iter()
+            .filter_map(|v| v.as_str().map(str::to_string))
+            .collect(),
+        _ => return None,
+    };
+    let cwd = params[2].as_str().map(str::to_string);
+    let env = match std::mem::replace(&mut params[3], Value::Nil) {
+        Value::Array(pairs) => pairs
+            .into_iter()
+            .filter_map(|p| match p {
+                Value::Array(kv) => {
+                    let k = kv.first()?.as_str()?.to_string();
+                    let v = kv.get(1)?.as_str()?.to_string();
+                    Some((k, v))
+                }
+                _ => None,
+            })
+            .collect(),
+        _ => Vec::new(),
+    };
+    Some((id, argv, cwd, env))
+}
+
+/// The `dproc_*` leg's connection-agnostic core (see [`serve_proc_daemon_on`] for the
+/// `*_on` convention). Run on a per-connection demuxed `incoming`.
+pub async fn serve_dproc_daemon_on(
+    rpc: Rpc,
+    mut incoming: UnboundedReceiver<Incoming>,
+) -> anyhow::Result<()> {
+    use crate::evloop::LoopEvent;
+    use tokio::sync::mpsc::unbounded_channel;
+
+    // One forwarder turns the children's `LoopEvent`s into wire notifications.
+    let (ev_tx, mut ev_rx) = unbounded_channel::<LoopEvent>();
+    let reply = rpc.clone();
+    tokio::spawn(async move {
+        while let Some(ev) = ev_rx.recv().await {
+            match ev {
+                LoopEvent::ProcOut { id, data, stderr } => reply.notify(
+                    DPROC_OUT,
+                    vec![Value::from(id), Value::Binary(data), Value::from(stderr)],
+                ),
+                LoopEvent::ProcExit { id, code } => {
+                    reply.notify(DPROC_EXIT, vec![Value::from(id), Value::from(code as i64)])
+                }
+                _ => {}
+            }
+        }
+    });
+
+    let mut stdins: HashMap<u64, UnboundedSender<Vec<u8>>> = HashMap::new();
+    let mut kills: HashMap<u64, oneshot::Sender<()>> = HashMap::new();
+    while let Some(msg) = incoming.recv().await {
+        let Incoming::Notification { method, params } = msg else {
+            continue;
+        };
+        match method.as_str() {
+            DPROC_OPEN => {
+                if let Some((id, argv, cwd, env)) = decode_dproc_open(params) {
+                    let (stdin_tx, stdin_rx) = unbounded_channel::<Vec<u8>>();
+                    let (kill_tx, kill_rx) = oneshot::channel();
+                    stdins.insert(id, stdin_tx);
+                    kills.insert(id, kill_tx);
+                    tokio::spawn(crate::host::run_duplex_process(
+                        id,
+                        argv,
+                        cwd,
+                        env,
+                        kill_rx,
+                        stdin_rx,
+                        ev_tx.clone(),
+                    ));
+                }
+            }
+            DPROC_WRITE => {
+                if let Some((id, bytes)) = decode_id_bytes(params) {
+                    if let Some(tx) = stdins.get(&id) {
+                        let _ = tx.send(bytes);
+                    }
+                }
+            }
+            DPROC_KILL => {
+                if let Some(id) = params.first().and_then(Value::as_u64) {
+                    if let Some(kill_tx) = kills.remove(&id) {
+                        let _ = kill_tx.send(());
+                    }
+                    stdins.remove(&id);
+                }
+            }
+            _ => {}
+        }
+        stdins.retain(|_, tx| !tx.is_closed());
+        kills.retain(|_, tx| !tx.is_closed());
+    }
+    Ok(())
+}
+
+// ----- the socket leg (`sock_*`) --------------------------------------------------
+//
+// The remote half of `nx.socket.connect`: a long-lived TCP connection the daemon
+// dials, streaming bytes both ways. Reuses
+// [`run_socket_connection`](crate::host::run_socket_connection).
+
+/// The `sock_*` leg's connection-agnostic core.
+pub async fn serve_sock_daemon_on(
+    rpc: Rpc,
+    mut incoming: UnboundedReceiver<Incoming>,
+) -> anyhow::Result<()> {
+    use crate::evloop::LoopEvent;
+    use tokio::sync::mpsc::unbounded_channel;
+
+    let (ev_tx, mut ev_rx) = unbounded_channel::<LoopEvent>();
+    let reply = rpc.clone();
+    tokio::spawn(async move {
+        while let Some(ev) = ev_rx.recv().await {
+            match ev {
+                LoopEvent::SockConnected { id } => {
+                    reply.notify(SOCK_CONNECTED, vec![Value::from(id)])
+                }
+                LoopEvent::SockData { id, data } => {
+                    reply.notify(SOCK_DATA, vec![Value::from(id), Value::Binary(data)])
+                }
+                LoopEvent::SockClosed { id, error } => reply.notify(
+                    SOCK_CLOSED,
+                    vec![Value::from(id), error.map_or(Value::Nil, Value::from)],
+                ),
+                _ => {}
+            }
+        }
+    });
+
+    let mut writes: HashMap<u64, UnboundedSender<Vec<u8>>> = HashMap::new();
+    let mut closes: HashMap<u64, oneshot::Sender<()>> = HashMap::new();
+    while let Some(msg) = incoming.recv().await {
+        let Incoming::Notification { method, params } = msg else {
+            continue;
+        };
+        match method.as_str() {
+            SOCK_CONNECT => {
+                if let (Some(id), Some(host), Some(port)) = (
+                    params.first().and_then(Value::as_u64),
+                    params.get(1).and_then(|v| v.as_str().map(str::to_owned)),
+                    params.get(2).and_then(Value::as_u64),
+                ) {
+                    let (write_tx, write_rx) = unbounded_channel::<Vec<u8>>();
+                    let (close_tx, close_rx) = oneshot::channel();
+                    writes.insert(id, write_tx);
+                    closes.insert(id, close_tx);
+                    tokio::spawn(crate::host::run_socket_connection(
+                        id,
+                        host,
+                        port as u16,
+                        close_rx,
+                        write_rx,
+                        ev_tx.clone(),
+                    ));
+                }
+            }
+            SOCK_WRITE => {
+                if let Some((id, bytes)) = decode_id_bytes(params) {
+                    if let Some(tx) = writes.get(&id) {
+                        let _ = tx.send(bytes);
+                    }
+                }
+            }
+            SOCK_CLOSE => {
+                if let Some(id) = params.first().and_then(Value::as_u64) {
+                    if let Some(close_tx) = closes.remove(&id) {
+                        let _ = close_tx.send(());
+                    }
+                    writes.remove(&id);
+                }
+            }
+            _ => {}
+        }
+        writes.retain(|_, tx| !tx.is_closed());
+        closes.retain(|_, tx| !tx.is_closed());
+    }
+    Ok(())
 }
 
 // ----- the Lua-filesystem leg (`luafs_op`) ----------------------------------------

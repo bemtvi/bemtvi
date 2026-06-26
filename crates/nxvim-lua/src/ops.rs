@@ -518,6 +518,41 @@ pub enum LoopOp {
     /// carried here: the actor terminates the child unconditionally (it has no
     /// libc binding to deliver an arbitrary signal), a documented approximation.
     Kill { id: u64 },
+    /// `nx.process.open{ cmd, args, … }` — spawn a **duplex** child whose stdin
+    /// stays open for [`ProcWrite`](LoopOp::ProcWrite) and whose stdout/stderr are
+    /// streamed back as raw byte chunks ([`LoopEvent::ProcOut`](../../nxvim_server)),
+    /// not newline batches. The keystone for an in-Lua DAP / language-server-style
+    /// client that frames its own protocol (Content-Length JSON) over a long-lived
+    /// pipe — `nx.run`/`nx.run_stream` can't, since they close stdin at spawn and
+    /// line-split stdout. Terminate it with the shared [`Kill`](LoopOp::Kill).
+    ProcOpen {
+        id: u64,
+        cmd: Vec<String>,
+        cwd: Option<String>,
+        env: Vec<(String, String)>,
+    },
+    /// `handle:write(bytes)` on an [`nx.process`](LoopOp::ProcOpen) handle — feed
+    /// `data` to the running child's still-open stdin (raw bytes, no framing added).
+    /// A no-op if the child has exited / was killed.
+    ProcWrite { id: u64, data: Vec<u8> },
+    /// `handle:kill()` on an [`nx.process`](LoopOp::ProcOpen) handle — terminate the
+    /// duplex child. Distinct from the one-shot [`Kill`](LoopOp::Kill) so a wasm
+    /// session routes it to the duplex (`dproc_*`) daemon leg, not the one-shot
+    /// (`proc_*`) one; natively both share the actor's process map.
+    ProcClose { id: u64 },
+    /// `nx.socket.connect{ host, port, … }` — open a **TCP** client connection whose
+    /// bytes stream back raw ([`LoopEvent::SockData`](../../nxvim_server)) and which
+    /// accepts writes via [`SockWrite`](LoopOp::SockWrite). The duplex sibling of
+    /// [`ProcOpen`](LoopOp::ProcOpen) for adapters that speak over a socket rather
+    /// than stdio (a DAP `type = "server"` adapter). Close it with
+    /// [`SockClose`](LoopOp::SockClose).
+    SockConnect { id: u64, host: String, port: u16 },
+    /// `handle:write(bytes)` on an [`nx.socket`](LoopOp::SockConnect) handle — send
+    /// `data` over the connection (a no-op once it closed).
+    SockWrite { id: u64, data: Vec<u8> },
+    /// `handle:close()` on an [`nx.socket`](LoopOp::SockConnect) handle — shut the
+    /// connection (a no-op if already closed).
+    SockClose { id: u64 },
     /// `nx.fs.watch(path, opts)` — arm a native filesystem watch on `path` (a
     /// subtree when `recursive`) that fires the watch stream under `id` with
     /// coalesced `{ kind, paths }` change batches. Forwarded to the event-loop actor

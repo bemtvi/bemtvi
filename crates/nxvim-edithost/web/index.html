@@ -2303,11 +2303,35 @@
         if (docBg) docBox.style.background = docBg;
         if (docFg) docBox.style.color = docFg;
         place(docBox, dcx, dcy, d.width, d.height);
-        for (const l of d.lines) {
+        // Highlight the docs' ```lang fences client-side: the wasm build ships no spans
+        // for floats, so a completion item's signature (basedpyright sends it fenced as
+        // ```python … ```) would otherwise render as plain text. Reuse the same fence-
+        // based substitute the hover doc-float and markdown previews use — parse each
+        // fenced block with its own grammar and colour those chars; prose stays plain.
+        let docColors = null;
+        if (!serverStyled && ts && ts.isReady()) {
+          const sp = ts.spansForFencedMarkdown(d.lines.join("\n"));
+          if (sp) docColors = d.lines.map((ln, i) => ts.colorsForLine(sp[i] || [], String(ln ?? "").length));
+        }
+        for (let i = 0; i < d.lines.length; i++) {
           const rowEl = document.createElement("div");
           rowEl.className = "row";
           rowEl.style.width = d.width * cw + "px";
-          rowEl.textContent = String(l ?? "").slice(0, d.width).padEnd(d.width);
+          const colors = docColors && docColors[i];
+          const chars = [...String(d.lines[i] ?? "")].slice(0, d.width);
+          chars.forEach((chr, ci) => {
+            const c = colors && colors[ci];
+            if (c) {
+              const sp = document.createElement("span");
+              sp.setAttribute("style", `color:${c};`);
+              sp.textContent = chr;
+              rowEl.appendChild(sp);
+            } else {
+              rowEl.appendChild(document.createTextNode(chr));
+            }
+          });
+          const pad = d.width - chars.length;
+          if (pad > 0) rowEl.appendChild(document.createTextNode(" ".repeat(pad)));
           docBox.appendChild(rowEl);
         }
         gridEl.appendChild(docBox);

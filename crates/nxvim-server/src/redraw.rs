@@ -1711,7 +1711,6 @@ fn special_key_spans(lines: &[String], tabstop: usize) -> Value {
 /// the selected row's total doc-line count — returned by
 /// [`EditHost::project_complete_docs`] so [`EditHost::project_menu`] can convert it
 /// to a global box and stash it in core for the wheel hit-test.
-#[cfg(feature = "native")]
 struct CompleteDocsMeta {
     row: usize,
     col: usize,
@@ -1900,7 +1899,6 @@ impl EditHost {
         // sliver. Its geometry is computed against the editor windows area, with the
         // popup box mapped from the focused window's text inner into editor-absolute
         // (windows-area) cells: the `'padding'` (left + top) and number gutter offset.
-        #[cfg(feature = "native")]
         if matches!(m.placement, MenuPlacement::Cursor) {
             let inner_x = focused.rect.x + focused.padding.left + focused.number_width;
             let inner_y = focused.rect.y + focused.padding.top;
@@ -1944,7 +1942,6 @@ impl EditHost {
     /// floats over the entire editor (overlapping other splits) instead of being
     /// squeezed into a narrow focused pane. Returns `None` rather than a useless
     /// sliver when neither side can fit a readable width.
-    #[cfg(feature = "native")]
     fn project_complete_docs(
         &self,
         m: &MenuView,

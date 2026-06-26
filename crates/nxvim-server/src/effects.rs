@@ -961,16 +961,13 @@ impl EditHost {
             });
             // The built-in `lsp` source is server-native (LSP plumbing + edit
             // application live here, not in Lua/core); remember it + its merge
-            // priority so the trigger drain issues `textDocument/completion`. The
-            // `lsp` source needs the native LSP tree, so this is native-only — the
-            // wasm edit-host has no language servers (Phase 4-E may revisit).
-            #[cfg(feature = "native")]
-            {
-                self.complete_lsp_active = req.lsp;
-                self.complete_lsp_priority = req.lsp_priority;
-            }
-            #[cfg(not(feature = "native"))]
-            let _ = req.lsp_priority;
+            // priority so the trigger drain issues `textDocument/completion`. This
+            // is feature-agnostic: the wasm edit-host now drives a real language
+            // server too (the serverless web demo routes the spawn to an in-browser
+            // basedpyright worker), so `lsp` completion works there just like the
+            // native build — the same `request_lsp`/`on_completion_reply` round-trip.
+            self.complete_lsp_active = req.lsp;
+            self.complete_lsp_priority = req.lsp_priority;
             // The built-in `snippets` source is feature-agnostic (the engine is in
             // core), so it works on the wasm build too.
             self.complete_snippets_active = req.snippets;
@@ -2622,7 +2619,6 @@ impl EditHost {
                 let key = self.editor.complete_accept_request.take().unwrap();
                 self.complete_snippet_accept(key - crate::snippet::SNIPPET_COMPLETE_KEY_BASE);
             }
-            #[cfg(feature = "native")]
             if let Some(key) = self.editor.complete_accept_request.take() {
                 self.complete_lsp_accept(key);
             }
@@ -2630,7 +2626,6 @@ impl EditHost {
             // `lsp` row has unresolved docs, issue a `completionItem/resolve`. Like the
             // accept drain, this runs once per key (the guard skips while in flight), so
             // the sidebar fills in shortly after the user lands on a row.
-            #[cfg(feature = "native")]
             self.complete_lsp_maybe_resolve();
             // The same lazy-docs fetch for a **plugin** row (`nx.complete.source`'s
             // `resolve` callback) — ask Lua to resolve the highlighted row's docs if
@@ -2720,7 +2715,6 @@ impl EditHost {
                 // The built-in `lsp` source is server-native: issue (or re-serve a
                 // cached) `textDocument/completion` for this trigger; the reply
                 // streams into the menu (gen-gated) via `on_completion_reply`.
-                #[cfg(feature = "native")]
                 self.complete_lsp_dispatch(gen);
                 // The built-in `snippets` source is feature-agnostic (core engine).
                 self.complete_snippet_dispatch(gen);

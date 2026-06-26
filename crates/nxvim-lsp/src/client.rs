@@ -29,10 +29,11 @@ use lsp_types::{
     CodeActionKindLiteralSupport, CodeActionLiteralSupport, CompletionClientCapabilities,
     CompletionItemCapability, CompletionItemCapabilityResolveSupport, ConfigurationParams,
     DocumentFormattingClientCapabilities, FoldingRangeClientCapabilities,
-    GeneralClientCapabilities, InlayHintClientCapabilities, InlayHintResolveClientCapabilities,
-    InlayHintWorkspaceClientCapabilities, MarkupKind, MessageType, PositionEncodingKind,
-    PublishDiagnosticsClientCapabilities, RenameClientCapabilities, SemanticTokenModifier,
-    SemanticTokenType, SemanticTokensClientCapabilities, SemanticTokensClientCapabilitiesRequests,
+    GeneralClientCapabilities, HoverClientCapabilities, InlayHintClientCapabilities,
+    InlayHintResolveClientCapabilities, InlayHintWorkspaceClientCapabilities, MarkupKind,
+    MessageType, PositionEncodingKind, PublishDiagnosticsClientCapabilities,
+    RenameClientCapabilities, SemanticTokenModifier, SemanticTokenType,
+    SemanticTokensClientCapabilities, SemanticTokensClientCapabilitiesRequests,
     SemanticTokensFullOptions, SemanticTokensWorkspaceClientCapabilities, ServerCapabilities,
     TextDocumentClientCapabilities, TextDocumentSyncCapability, TextDocumentSyncClientCapabilities,
     TextDocumentSyncKind, TokenFormat, WorkspaceClientCapabilities,
@@ -317,6 +318,19 @@ fn client_capabilities() -> ClientCapabilities {
                     properties: vec!["edit".to_string()],
                 }),
                 data_support: Some(true),
+                ..Default::default()
+            }),
+            // Declare that we accept **markdown** hover contents (preferred) as well as
+            // plaintext. This is load-bearing for syntax-highlighted hovers: pyright /
+            // basedpyright (and others) default to *plaintext* hover unless the client
+            // advertises `contentFormat`, returning a bare `def f() -> None` with no
+            // ```lang fence. With markdown declared, the signature comes back fenced
+            // (```python … ```), which the hover float renders as a `markdown` buffer —
+            // tree-sitter's markdown injection colours the fenced code natively, and the
+            // wasm edit-host's client-side `spansForFencedMarkdown` colours it on the web
+            // build. Without this the fence never exists, so there is nothing to colour.
+            hover: Some(HoverClientCapabilities {
+                content_format: Some(vec![MarkupKind::Markdown, MarkupKind::PlainText]),
                 ..Default::default()
             }),
             // Declare completion-item documentation + resolve support. Most servers

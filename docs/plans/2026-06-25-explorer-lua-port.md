@@ -155,9 +155,21 @@ Add **`BufReadCmd`** as a supported autocmd event (neovim-faithful; the general
     a press map suppresses its default. Tested in `tests/mouse.rs` (4 new: `<LeftDrag>`
     fires + suppresses select, an unmapped drag still selects, `<LeftRelease>` fires,
     `<RightDrag>` fires).
+  - **Follow-up — scroll wheel + right/middle multi-click. ✅ DONE 2026-06-26.** The
+    scroll wheel is a mappable key: `<ScrollWheelUp>` / `<ScrollWheelDown>` /
+    `<ScrollWheelLeft>` / `<ScrollWheelRight>` (with modifiers) via a new
+    `KeyCode::ScrollWheel(WheelDir)` + notation parse/render. A text scroll is queued
+    (`WheelGesture` / `Editor.mouse_wheels`, drained alongside the click queue in
+    `resolve_mouse_clicks`); a bound map fires, else `mouse_apply_wheel_default` runs the
+    old scroll (so an unmapped `<S-ScrollWheel*>` still page-scrolls; the widget-wheel
+    arms still claim theirs first). And right/middle presses are now multi-click counted
+    (`Editor.mouse_button_seq` / `next_button_click`, a separate tracker from the
+    left-button drag counter), so `<2-RightMouse>` / `<3-MiddleMouse>` map. Tested in
+    `tests/mouse.rs` (3 new: `<ScrollWheelDown>` fires + suppresses scroll,
+    `<S-ScrollWheelUp>` is distinct from `<ScrollWheelUp>`, `<2-RightMouse>` on a double
+    right-click).
   - Still deferred: `v:mouse_*` (set specifically by `getchar()` mouse reads — a
-    different mechanism than `getmousepos()`), the scroll wheel as a mappable key
-    (`<ScrollWheelUp>` / …), and right/middle multi-click counting (`<2-RightMouse>`).
+    different mechanism than `getmousepos()`).
 - **Phase 2 — Primitive B (`BufReadCmd`). ✅ DONE 2026-06-25.** A file open is now
   **deferred** (enqueued as a `PendingOpen`) instead of read inline whenever a
   `BufReadCmd` handler is registered (`Editor::should_defer_open` = `host_fs_offtick ||

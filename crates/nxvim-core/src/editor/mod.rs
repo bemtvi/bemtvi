@@ -77,7 +77,9 @@ pub use self::decor::DecorViewport;
 pub use self::menu::{
     Extent, MenuGeom, MenuItem, MenuMetrics, MenuPlacement, PreviewScroll, PreviewTarget, PromptPos,
 };
-pub use self::mouse::{ClickSurface, CompleteDocsHit, MouseClick, MousePos, StatuslineClick};
+pub use self::mouse::{
+    ClickSurface, CompleteDocsHit, MouseClick, MousePos, StatuslineClick, WheelGesture,
+};
 pub(crate) use self::multicursor::PlacementSnapshot;
 // The off-tick save / open requests (the daemon / edit-host fs path, Phase 3e/3f).
 pub use self::buffers::{
@@ -1093,6 +1095,17 @@ pub struct Editor {
     /// `None` before any mouse event. See [`crate::editor::mouse`].
     last_mouse: Option<(usize, usize)>,
 
+    /// Multi-click tracker for the **right / middle** buttons (the left button counts
+    /// via the [`mouse_select`](Self::mouse_select) drag tracker): `(button, row, col,
+    /// stamp_ms, count)` of the last such press, so a same-button same-cell repeat
+    /// within `'mousetime'` escalates the count for `<2-RightMouse>` / `<3-MiddleMouse>`.
+    mouse_button_seq: Option<(crate::input::MouseButton, usize, usize, u64, u8)>,
+
+    /// Scroll-wheel gestures awaiting keymap resolution — the wheel counterpart of
+    /// [`mouse_clicks`](Self::mouse_clicks): the server fires a bound `<ScrollWheelUp>`
+    /// (etc.) map or runs the default scroll. See [`crate::editor::mouse`].
+    pub mouse_wheels: Vec<mouse::WheelGesture>,
+
     /// Set by a scroll command or a cursor motion at the moment it fires:
     /// `(top, cursor.line)` *before* the move. Consumed at the end of `input` to
     /// build `pending_scroll` when the viewport ends up moving more than a line.
@@ -1565,6 +1578,8 @@ impl Editor {
             statusline_click_seq: None,
             mouse_resize: None,
             last_mouse: None,
+            mouse_button_seq: None,
+            mouse_wheels: Vec::new(),
             scroll_from: None,
             pending_scroll: None,
             decor_viewports: HashMap::new(),

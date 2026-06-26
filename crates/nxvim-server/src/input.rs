@@ -140,7 +140,8 @@ impl EditHost {
     /// mapping resolves the same way regardless of front end.
     pub(crate) fn resolve_mouse_clicks(&mut self) {
         let clicks = self.editor.take_mouse_clicks();
-        if clicks.is_empty() {
+        let wheels = self.editor.take_mouse_wheels();
+        if clicks.is_empty() && wheels.is_empty() {
             return;
         }
         // A click may have moved focus to another window/buffer; rebuild the tries for
@@ -161,6 +162,20 @@ impl EditHost {
             match self.keymaps.lookup_mouse(scope, key) {
                 Some(m) => self.fire_mapping(m.rhs, m.silent, m.expr),
                 None => self.editor.mouse_apply_default(click),
+            }
+        }
+        // The scroll wheel resolves the same way (`<ScrollWheelUp>` / `<S-ScrollWheelDown>`
+        // / …): a bound map fires, else the editor's default scroll runs.
+        for wheel in wheels {
+            let key = Key {
+                code: KeyCode::ScrollWheel(wheel.dir),
+                shift: wheel.shift,
+                ctrl: wheel.ctrl,
+                alt: wheel.alt,
+            };
+            match self.keymaps.lookup_mouse(scope, key) {
+                Some(m) => self.fire_mapping(m.rhs, m.silent, m.expr),
+                None => self.editor.mouse_apply_wheel_default(wheel),
             }
         }
     }

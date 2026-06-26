@@ -48,6 +48,12 @@ pub enum KeyCode {
         clicks: u8,
         kind: MouseKind,
     },
+    /// A scroll-wheel notch as a mappable key — vim's `<ScrollWheelUp>` /
+    /// `<ScrollWheelDown>` / `<ScrollWheelLeft>` / `<ScrollWheelRight>` (with optional
+    /// modifiers). Like [`KeyCode::Mouse`], the server resolves it against the keymaps
+    /// (firing a bound mapping or falling back to the default scroll); only the
+    /// notation round trip touches the core.
+    ScrollWheel(WheelDir),
 }
 
 /// Which phase of a mouse gesture a mappable [`KeyCode::Mouse`] key is: a button
@@ -59,6 +65,17 @@ pub enum MouseKind {
     Press,
     Drag,
     Release,
+}
+
+/// A scroll-wheel direction — the notch a [`KeyCode::ScrollWheel`] key (and the
+/// `<ScrollWheel*>` notation) names. `Up`/`Down` scroll the buffer vertically,
+/// `Left`/`Right` horizontally.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum WheelDir {
+    Up,
+    Down,
+    Left,
+    Right,
 }
 
 impl Key {
@@ -318,6 +335,15 @@ pub fn key_to_notation(key: Key) -> String {
                 (true, name)
             }
         }
+        KeyCode::ScrollWheel(dir) => {
+            let d = match dir {
+                WheelDir::Up => "Up",
+                WheelDir::Down => "Down",
+                WheelDir::Left => "Left",
+                WheelDir::Right => "Right",
+            };
+            (true, format!("ScrollWheel{d}"))
+        }
     };
     // A plain printable char with no ctrl/alt is bare (`f`, `F`, `5`); shift is
     // already baked into the character, so it adds no `S-` prefix.
@@ -435,6 +461,10 @@ fn parse_special(inner: &str) -> Option<Key> {
         "end" => KeyCode::End,
         "pageup" => KeyCode::PageUp,
         "pagedown" => KeyCode::PageDown,
+        "scrollwheelup" => KeyCode::ScrollWheel(WheelDir::Up),
+        "scrollwheeldown" => KeyCode::ScrollWheel(WheelDir::Down),
+        "scrollwheelleft" => KeyCode::ScrollWheel(WheelDir::Left),
+        "scrollwheelright" => KeyCode::ScrollWheel(WheelDir::Right),
         other => {
             let mut it = other.chars();
             let c = it.next()?;

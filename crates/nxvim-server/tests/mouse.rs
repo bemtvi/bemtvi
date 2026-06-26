@@ -1742,6 +1742,91 @@ async fn right_drag_can_be_mapped() {
     assert_eq!(exec_lua(&rpc, "return _G.rdrag").await.as_u64(), Some(1));
 }
 
+// ===== Scroll wheel + right/middle multi-click ==============================
+
+/// `<ScrollWheelDown>` is a mappable key: the wheel notch fires the map *instead of*
+/// scrolling the buffer, so the view stays put.
+#[tokio::test]
+async fn scroll_wheel_can_be_mapped_and_suppresses_scroll() {
+    let (rpc, _incoming) = start(&numbered(100)).await;
+    let win = current_win(&rpc).await;
+    exec_lua(
+        &rpc,
+        r#"
+        _G.scrolls = 0
+        nx.keymap.set('n', '<ScrollWheelDown>', function() _G.scrolls = _G.scrolls + 1 end)
+        return true
+    "#,
+    )
+    .await;
+    assert_eq!(win_topline(&rpc, win).await, 1);
+    feed_mouse(&rpc, "wheel", "down", 5, 10);
+    assert_eq!(exec_lua(&rpc, "return _G.scrolls").await.as_u64(), Some(1));
+    assert_eq!(
+        win_topline(&rpc, win).await,
+        1,
+        "the mapped wheel fired instead of scrolling"
+    );
+}
+
+/// A modifier distinguishes a wheel map: `<S-ScrollWheelUp>` is separate from
+/// `<ScrollWheelUp>` — a plain notch fires only the plain map, a shift notch only the
+/// shift map.
+#[tokio::test]
+async fn a_shift_scroll_wheel_is_a_distinct_map() {
+    let (rpc, _incoming) = start(&numbered(100)).await;
+    exec_lua(
+        &rpc,
+        r#"
+        _G.plain = 0
+        _G.shift = 0
+        nx.keymap.set('n', '<ScrollWheelUp>', function() _G.plain = _G.plain + 1 end)
+        nx.keymap.set('n', '<S-ScrollWheelUp>', function() _G.shift = _G.shift + 1 end)
+        return true
+    "#,
+    )
+    .await;
+    feed_mouse(&rpc, "wheel", "up", 5, 10);
+    assert_eq!(exec_lua(&rpc, "return _G.plain").await.as_u64(), Some(1));
+    assert_eq!(
+        exec_lua(&rpc, "return _G.shift").await.as_u64(),
+        Some(0),
+        "a plain wheel must not fire the <S-ScrollWheelUp> map"
+    );
+    wheel_mod(&rpc, "up", "S", 5, 10);
+    assert_eq!(
+        exec_lua(&rpc, "return _G.plain").await.as_u64(),
+        Some(1),
+        "a shift wheel must not fire the plain <ScrollWheelUp> map"
+    );
+    assert_eq!(exec_lua(&rpc, "return _G.shift").await.as_u64(), Some(1));
+}
+
+/// Right/middle presses are multi-click counted now, so `<2-RightMouse>` fires on a
+/// same-cell double right-click (within `'mousetime'`).
+#[tokio::test]
+async fn double_right_click_fires_a_mapped_2rightmouse() {
+    let (rpc, clock, _incoming) = start_clocked("hello world\nsecond line\nthird").await;
+    command(&rpc, "set nonumber norelativenumber mousetime=500").await;
+    exec_lua(
+        &rpc,
+        r#"
+        _G.dbl = 0
+        nx.keymap.set('n', '<2-RightMouse>', function() _G.dbl = _G.dbl + 1 end)
+        return true
+    "#,
+    )
+    .await;
+    feed_mouse_at(&rpc, &clock, 0, "right", "press", 0, 5);
+    assert_eq!(
+        exec_lua(&rpc, "return _G.dbl").await.as_u64(),
+        Some(0),
+        "the first right press is a single click"
+    );
+    feed_mouse_at(&rpc, &clock, 100, "right", "press", 0, 5);
+    assert_eq!(exec_lua(&rpc, "return _G.dbl").await.as_u64(), Some(1));
+}
+
 /// An insert-mode left-click moves the caret to the click and stays in Insert
 /// (the default `'mouse'` includes `i`); the caret may sit one past the last char.
 #[tokio::test]

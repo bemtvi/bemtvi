@@ -444,8 +444,8 @@ pub(crate) fn key_to_terminal_bytes(key: Key) -> Vec<u8> {
         KeyCode::End => b"\x1b[F".to_vec(),
         KeyCode::PageUp => b"\x1b[5~".to_vec(),
         KeyCode::PageDown => b"\x1b[6~".to_vec(),
-        // A mouse-button key (`<LeftMouse>` …) is resolved server-side and never
-        // reaches the terminal as input — it has no PTY byte encoding.
-        KeyCode::Mouse { .. } => Vec::new(),
+        // A mouse key (`<LeftMouse>` / `<ScrollWheelUp>` …) is resolved server-side and
+        // never reaches the terminal as input — it has no PTY byte encoding.
+        KeyCode::Mouse { .. } | KeyCode::ScrollWheel(_) => Vec::new(),
     }
 }

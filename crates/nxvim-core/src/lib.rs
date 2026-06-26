@@ -39,7 +39,8 @@ pub use editor::{
     MenuPlacement, MouseClick, MousePos, NumberedMark, PendingOpen, PendingQuitAll, PendingSave,
     PersistState, PreviewScroll, PreviewTarget, PromptPos, QfAction, QfEntry, QfList, QfStack,
     QfWhich, RegisterEntry, SessionDock, SessionState, SessionTab, SessionWindow, ShadaRequest,
-    StatuslineClick, TabId, TerminalOp, UndoEntry, UndoTreeView, WindowConfigSpec, WindowId,
+    StatuslineClick, TabId, TerminalOp, UndoEntry, UndoTreeView, WheelGesture, WindowConfigSpec,
+    WindowId,
 };
 pub use encoding::Encoding;
 pub use extmark::{
@@ -50,6 +51,7 @@ pub use highlight::{parse_color, Highlights, HlDef, Rgb, Style, WinHl};
 pub use host::{DirEntry, FileStat, HostFs, StdHostFs};
 pub use input::{
     key_to_notation, parse_keys, Key, KeyCode, MouseAction, MouseButton, MouseEvent, MouseKind,
+    WheelDir,
 };
 pub use mode::{KeyContext, Mode};
 pub use options::{BufferOptions, Options, Padding, SignColumn, WindowOptions};

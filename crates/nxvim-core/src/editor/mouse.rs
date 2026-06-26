@@ -11,7 +11,7 @@
 //! tab/wide-char [`virtcol`](crate::unicode::virtcol) math, run backwards.
 
 use super::*;
-use crate::input::{MouseAction, MouseButton, MouseEvent, MouseKind};
+use crate::input::{MouseAction, MouseButton, MouseEvent, MouseKind, WheelDir};
 
 /// In-flight left-button selection: the multi-click counter (vim's
 /// `check_multiclick` — a same-cell repeat within `'mousetime'` escalates the
@@ -122,6 +122,23 @@ pub struct MousePos {
     /// The buffer position: 1-based `line`, and `column` the 1-based byte column.
     pub line: u64,
     pub column: u64,
+}
+
+/// A scroll-wheel notch the server still has to resolve against the keymaps — the
+/// wheel counterpart of [`MouseClick`]. The server turns it into a
+/// [`Key`](crate::input::Key) (`<ScrollWheelUp>` / `<S-ScrollWheelDown>` / …), fires the
+/// bound mapping if there is one, else runs the default scroll
+/// ([`Editor::mouse_apply_wheel_default`]). Carries the cell so the default scrolls the
+/// window under the pointer, and `shift` so an unmapped `<S-ScrollWheel*>` still
+/// page-scrolls.
+#[derive(Debug, Clone, Copy)]
+pub struct WheelGesture {
+    pub dir: WheelDir,
+    pub shift: bool,
+    pub ctrl: bool,
+    pub alt: bool,
+    pub row: usize,
+    pub col: usize,
 }
 
 /// The anchored extent a left-drag extends from, set by the press by click count.
@@ -426,7 +443,8 @@ impl Editor {
             // right/middle reads the click via `getmousepos()`. Drag / release are
             // mappable (`<RightDrag>` / `<MiddleRelease>` / …) with no default.
             (MouseButton::Right, MouseAction::Press) => {
-                self.mouse_queue_press(&ev, MouseButton::Right, 1)
+                let count = self.next_button_click(MouseButton::Right, ev.row, ev.col, ev.stamp_ms);
+                self.mouse_queue_press(&ev, MouseButton::Right, count)
             }
             (MouseButton::Right, MouseAction::Drag) => {
                 self.mouse_queue_gesture(&ev, MouseButton::Right, MouseKind::Drag)
@@ -435,7 +453,9 @@ impl Editor {
                 self.mouse_queue_gesture(&ev, MouseButton::Right, MouseKind::Release)
             }
             (MouseButton::Middle, MouseAction::Press) => {
-                self.mouse_queue_press(&ev, MouseButton::Middle, 1)
+                let count =
+                    self.next_button_click(MouseButton::Middle, ev.row, ev.col, ev.stamp_ms);
+                self.mouse_queue_press(&ev, MouseButton::Middle, count)
             }
             (MouseButton::Middle, MouseAction::Drag) => {
                 self.mouse_queue_gesture(&ev, MouseButton::Middle, MouseKind::Drag)
@@ -443,9 +463,12 @@ impl Editor {
             (MouseButton::Middle, MouseAction::Release) => {
                 self.mouse_queue_gesture(&ev, MouseButton::Middle, MouseKind::Release)
             }
-            // The wheel scrolls the window *under the pointer* without moving focus
-            // or (unless a line scrolls off) the cursor.
-            (MouseButton::Wheel, action) => self.mouse_wheel(action, ev.row, ev.col, ev.shift),
+            // The wheel is a mappable key (`<ScrollWheelUp>` / …): queue it for the
+            // server, which fires a bound map or runs the default — scrolling the window
+            // *under the pointer* without moving focus or (unless a line scrolls off) the
+            // cursor. The widget-wheel arms above (completion / picker / cmdline / doc
+            // float) already claimed their scrolls, so only a text scroll reaches here.
+            (MouseButton::Wheel, action) => self.mouse_queue_wheel(&ev, action),
             // The remaining buttons (X1/X2) and bare moves have no binding; ignore.
             _ => {}
         }
@@ -601,6 +624,77 @@ impl Editor {
             col: ev.col,
             stamp_ms: ev.stamp_ms,
         });
+    }
+
+    /// The multi-click count for a **right / middle** press at `(row, col)` stamped
+    /// `stamp_ms`: one more than the previous same-button same-cell press within
+    /// `'mousetime'` (capped at 4, vim's quad-click), else 1. The left button's count is
+    /// woven into the drag tracker ([`next_click_count`](Self::next_click_count)); this
+    /// is the separate counter for the buttons with no drag gesture, so `<2-RightMouse>`
+    /// / `<3-MiddleMouse>` map. Records the press for the next call.
+    fn next_button_click(
+        &mut self,
+        button: MouseButton,
+        row: usize,
+        col: usize,
+        stamp_ms: u64,
+    ) -> u8 {
+        let count = match self.mouse_button_seq {
+            Some((b, r, c, stamp, n))
+                if b == button
+                    && r == row
+                    && c == col
+                    && stamp_ms.saturating_sub(stamp) <= self.options.mousetime as u64 =>
+            {
+                (n + 1).min(4)
+            }
+            _ => 1,
+        };
+        self.mouse_button_seq = Some((button, row, col, stamp_ms, count));
+        count
+    }
+
+    /// Queue a scroll-wheel notch (`<ScrollWheelUp>` / …) for the server to resolve: a
+    /// bound map fires, else [`mouse_apply_wheel_default`](Self::mouse_apply_wheel_default)
+    /// scrolls. Carries the cell (the default scrolls the window under the pointer) and
+    /// the modifiers (so `<S-ScrollWheelUp>` is distinguished, and an unmapped one still
+    /// page-scrolls). A non-wheel action can't reach here (the `Wheel` button only ever
+    /// parses to the four directions), so it is dropped.
+    fn mouse_queue_wheel(&mut self, ev: &MouseEvent, action: MouseAction) {
+        let dir = match action {
+            MouseAction::WheelUp => WheelDir::Up,
+            MouseAction::WheelDown => WheelDir::Down,
+            MouseAction::WheelLeft => WheelDir::Left,
+            MouseAction::WheelRight => WheelDir::Right,
+            _ => return,
+        };
+        self.mouse_wheels.push(WheelGesture {
+            dir,
+            shift: ev.shift,
+            ctrl: ev.ctrl,
+            alt: ev.alt,
+            row: ev.row,
+            col: ev.col,
+        });
+    }
+
+    /// Drain the scroll-wheel gestures awaiting keymap resolution (the server calls this
+    /// right after a gesture). See [`WheelGesture`] / [`Editor::mouse_wheels`].
+    pub fn take_mouse_wheels(&mut self) -> Vec<WheelGesture> {
+        std::mem::take(&mut self.mouse_wheels)
+    }
+
+    /// The default scroll for a wheel notch the keymaps did **not** claim — the back
+    /// half of the old eager wheel handler, split out so a bound `<ScrollWheel*>` map
+    /// suppresses it (the server runs this only on a keymap miss).
+    pub fn mouse_apply_wheel_default(&mut self, g: WheelGesture) {
+        let action = match g.dir {
+            WheelDir::Up => MouseAction::WheelUp,
+            WheelDir::Down => MouseAction::WheelDown,
+            WheelDir::Left => MouseAction::WheelLeft,
+            WheelDir::Right => MouseAction::WheelRight,
+        };
+        self.mouse_wheel(action, g.row, g.col, g.shift);
     }
 
     /// Run a queued press's default behavior — the server calls this for each press the

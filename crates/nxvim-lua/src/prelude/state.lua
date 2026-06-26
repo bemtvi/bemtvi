@@ -865,6 +865,12 @@ local BUF_OPT_CANON = {
   fdn = "foldnestmax",
   foldminlines = "foldminlines",
   fml = "foldminlines",
+  -- The change flag (`vim.bo.modified` / `:set [no]modified`). Reads return the
+  -- server-mirrored buffer state; a write reaches the core to set/clear it — clearing
+  -- is how a plugin that fills a buffer as a *read* (a `BufReadCmd` directory listing)
+  -- marks it not-an-unsaved-edit (no `[+]`, no E37 on `:q`).
+  modified = "modified",
+  mod = "modified",
 }
 -- Core defaults, the safety net when the mirror hasn't been pushed for a buffer.
 -- Match nxvim's core: tabstop 4, with shiftwidth/softtabstop following it via
@@ -890,6 +896,7 @@ local BUF_OPT_DEFAULT = {
   foldmarker = "{{{,}}}",
   foldnestmax = 20,
   foldminlines = 1,
+  modified = false,
 }
 
 local function bo_get(bufnr, opt)

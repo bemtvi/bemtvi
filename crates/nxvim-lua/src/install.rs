@@ -2346,19 +2346,6 @@ pub(crate) fn install_runtime_api(
             Ok(())
         })?,
     )?;
-    // `nx._explorer_action(name)`: a `FileType nxdir` buffer-local keymap fired the
-    // named action (`open` / `up`) on the file-explorer listing; the server applies
-    // it via `Editor::apply_explorer_action`. (Navigation is ordinary normal-mode
-    // motion now — the listing is a `nomodifiable` buffer — so only the activation
-    // keys cross.)
-    let sh = shared.clone();
-    nx.set(
-        "_explorer_action",
-        lua.create_function(move |_, name: String| {
-            sh.borrow_mut().explorer_actions.push(name);
-            Ok(())
-        })?,
-    )?;
     // `nx._view_action(name)`: a view buffer-local keymap fired the named action
     // (`confirm`) on the focused `nx.view` buffer; the server applies it via
     // `Editor::apply_view_action`. (Navigation is ordinary normal-mode motion now.)

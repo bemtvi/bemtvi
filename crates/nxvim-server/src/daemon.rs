@@ -740,10 +740,10 @@ pub enum FsRead {
     /// The path doesn't exist yet — open an empty new-file buffer named for it (the
     /// `:e newfile` case), so a first `:w` would create it.
     New,
-    /// The path is a **directory** — open it as the in-window file explorer (Phase 3g).
-    /// `path` is the daemon's *canonical* directory path (so `../`/descend navigation is
-    /// unambiguous on the edit-host side); `entries` are its immediate, unsorted entries
-    /// (the edit-host sorts them via [`Buffer::from_dir_entries`](nxvim_core::Buffer)).
+    /// The path is a **directory** — open it as the in-window file explorer. `path` is
+    /// the daemon's *canonical* directory path (so `../`/descend navigation is unambiguous
+    /// on the edit-host side); `entries` are its immediate, unsorted entries (the edit-host
+    /// renders the listing via [`nxvim_core::dir_listing`] for the explorer plugin).
     Dir {
         path: String,
         entries: Vec<DirEntry>,

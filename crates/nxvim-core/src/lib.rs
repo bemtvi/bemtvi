@@ -28,7 +28,7 @@ pub mod syntax;
 pub mod unicode;
 pub mod view;
 
-pub use buffer::{Buffer, BufferEdit, BufferKind, DiskChange, EditBatch};
+pub use buffer::{dir_listing, Buffer, BufferEdit, BufferKind, DiskChange, EditBatch};
 pub use clipboard::Clipboard;
 pub use editor::{
     command_pending_after, command_status, language_of_path, place_aligned, Align, BorderStyle,
@@ -36,9 +36,9 @@ pub use editor::{
     CompleteConfig, CompleteDocsHit, CompleteKeys, Cursor, DecorViewport, Editor, Extent,
     FileChangeAction, FileChangeReason, FileChangelist, FileFolds, FileMarkEntry, FloatAnchor,
     FloatConfig, FloatRelative, GlobalMarkEntry, JumpPos, Margin, MenuGeom, MenuItem, MenuMetrics,
-    MenuPlacement, NumberedMark, PendingOpen, PendingQuitAll, PendingSave, PersistState,
-    PreviewScroll, PreviewTarget, PromptPos, QfAction, QfEntry, QfList, QfStack, QfWhich,
-    RegisterEntry, SessionDock, SessionState, SessionTab, SessionWindow, ShadaRequest,
+    MenuPlacement, MouseClick, NumberedMark, PendingOpen, PendingQuitAll, PendingSave,
+    PersistState, PreviewScroll, PreviewTarget, PromptPos, QfAction, QfEntry, QfList, QfStack,
+    QfWhich, RegisterEntry, SessionDock, SessionState, SessionTab, SessionWindow, ShadaRequest,
     StatuslineClick, TabId, TerminalOp, UndoEntry, UndoTreeView, WindowConfigSpec, WindowId,
 };
 pub use encoding::Encoding;

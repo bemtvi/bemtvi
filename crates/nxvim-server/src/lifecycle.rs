@@ -54,14 +54,15 @@ impl EditHost {
                 self.load_replica_bytes(buffer, path, &bytes, true, stat)
             }
             Ok(FsRead::New) => self.load_replica_bytes(buffer, path, b"", false, None),
-            // A directory: build the in-window file explorer listing into the buffer
-            // (Phase 3g). The daemon's canonical `dir` path supersedes the requested one
-            // (`:e somedir` resolves to its absolute form), so the listing names and
-            // navigates from it.
+            // A directory: fill the file-explorer listing from the entries the fetch read
+            // (the off-tick fetch is what classified the path as a directory — a local
+            // `std::fs` stat can't see a remote path). The daemon's canonical `dir` path
+            // supersedes the requested one. The listing is the same shape the explorer
+            // plugin produces locally, so its navigation / decor work over the wire.
             Ok(FsRead::Dir { path: dir, entries }) => {
                 // A reload can't resolve to a directory; drop a stale post marker.
                 self.reload_posts.remove(&buffer);
-                self.load_dir_replica(buffer, dir, entries)
+                self.load_dir_listing(buffer, dir, entries);
             }
             Err(e) => {
                 // The off-tick re-fetch failed — surface it loudly; no reload happened,
@@ -118,19 +119,38 @@ impl EditHost {
         self.run_pending();
     }
 
-    /// Build the file-explorer listing of remote directory `dir` into `buffer` from the
-    /// off-tick `read_dir` reply (Phase 3g — the directory analogue of [`load_replica_bytes`]).
-    /// `load_dir_into` replaces the buffer with the listing (its `dir` marker routes
-    /// keys to the explorer); clearing `announced` lets the now-named buffer's
-    /// `BufReadPost` fire. A directory has no filetype, so no `FileType`/LSP work — just
-    /// refresh the Lua snapshot/mirror and drive the queued autocmd work.
-    #[cfg(feature = "native")]
-    fn load_dir_replica(&mut self, buffer: BufferId, dir: String, entries: Vec<DirEntry>) {
+    /// Fill `buffer` with the file-explorer listing of remote directory `dir` from an
+    /// off-tick fetch's `entries` — the directory analogue of [`load_replica_bytes`],
+    /// shared by the native ([`apply_open`](Self::apply_open)) and wasm
+    /// ([`complete_fs_read_dir`](Self::complete_fs_read_dir)) off-tick paths. A *remote*
+    /// directory is filled server-side from the entries the fetch already read, rather
+    /// than re-read by the explorer plugin's `nx.fs` (the `nx.fs` op and the file-open
+    /// fetch are separate legs; a daemon may wire only the latter). The result is the
+    /// same shape the plugin's local fill produces — a `nomodifiable`, `filetype=nxdir`
+    /// buffer named for `dir` — so the plugin's stateless navigation and the decor
+    /// provider work identically. Setting the filetype fires `FileType nxdir`, which
+    /// installs the activation maps; clearing `announced` lets the now-named buffer's
+    /// lifecycle re-fire.
+    pub(crate) fn load_dir_listing(
+        &mut self,
+        buffer: BufferId,
+        dir: String,
+        entries: Vec<DirEntry>,
+    ) {
+        let text = nxvim_core::dir_listing(entries);
         self.editor
-            .load_dir_into(buffer, PathBuf::from(&dir), entries);
+            .load_bytes_into(buffer, Some(dir.clone()), text.as_bytes());
+        // The fill is a read, not an edit; hold it read-only via the `'modifiable'`
+        // option (the explorer has no core buffer-kind), and mark it `nxdir` so its
+        // `FileType nxdir` autocmd installs the activation maps and the decor provider
+        // colours it.
+        self.editor
+            .set_buffer_option_bool(buffer, "modifiable", false);
+        self.editor
+            .set_buffer_option_str(buffer, "filetype", "nxdir");
         self.announced.remove(&buffer);
         self.fired_filetype.remove(&buffer);
-        let _ = self.lua.set_buf_snapshot(buffer.0, &dir, "");
+        let _ = self.lua.set_buf_snapshot(buffer.0, &dir, "nxdir");
         self.push_buf_mirror();
         self.emit_lifecycle_events();
         self.run_pending();
@@ -142,13 +162,96 @@ impl EditHost {
     /// named buffer. Called at the tail of [`run_pending`](EditHost::run_pending), so an
     /// `:edit` from a keystroke, `vim.cmd('edit ...')`, or a user command is caught
     /// after the editor converges. A no-op when off-tick mode is off or none ran.
+    /// Fire `BufReadCmd` for a deferred open and report whether a handler **claimed**
+    /// the read (vim's "replace the default read" hook). The handler owns filling
+    /// `buffer` (e.g. the file explorer's listing of a directory), so a `true` return
+    /// tells the caller to skip the default load. Gated on a `BufReadCmd` handler being
+    /// registered, so the common path never crosses into Lua. The path is the autocmd
+    /// `pattern` (so a handler can scope itself, e.g. only directories) and the
+    /// `<afile>`/`<amatch>` arg; `is_dir` is surfaced as `args.isdir` (the one fs fact a
+    /// `*Cmd` handler routinely branches on — the explorer claims directories, declines
+    /// files — passed in because the live Lua fs surface is async). The buffer mirror is
+    /// refreshed first so the handler can read the (empty) buffer. A throwing handler is
+    /// surfaced loud and treated as *unclaimed* (the default read then runs).
+    fn fire_buf_read_cmd(&mut self, buffer: BufferId, path: &Path) -> bool {
+        if !self.au_active_events.contains("BufReadCmd") {
+            return false;
+        }
+        let path_str = path.to_string_lossy().into_owned();
+        // Register the (empty, named) buffer in the Lua mirror before firing so the
+        // handler sees a valid, modifiable buffer it can `nvim_buf_set_lines` into —
+        // the same snapshot the off-tick landing publishes. The filetype derives from
+        // the path; a directory has none (the handler sets `nxdir` itself).
+        let ft = filetype_of(Some(Path::new(&path_str))).unwrap_or("");
+        let _ = self.lua.set_buf_snapshot(buffer.0, &path_str, ft);
+        self.push_buf_mirror();
+        // Whether `<amatch>` is a directory — surfaced as `args.isdir`, the fs fact the
+        // explorer branches on (claim directories, decline files). A local `std::fs`
+        // stat: this fires only for a *local* deferred open (a daemon directory is filled
+        // server-side at the fetch landing, not via `BufReadCmd`), so the path is on this
+        // machine and the stat is accurate.
+        let is_dir = path.is_dir();
+        match self
+            .lua
+            .fire_autocmd_cmd("BufReadCmd", &path_str, buffer.0, is_dir)
+        {
+            Ok(claimed) => {
+                if claimed {
+                    // Settle the handler's buffer edits / queued ops now, before the
+                    // caller moves on (and before any default read it suppressed). A
+                    // direct `apply_lua_effects` drains the `nvim_buf_set_lines` op and
+                    // the handler's `set_filetype` / extmark / command effects — this
+                    // runs *inside* the post-convergence `drain_pending_opens`, where a
+                    // nested `run_pending` does not reach the buffer-op drain.
+                    self.apply_lua_effects();
+                }
+                claimed
+            }
+            Err(e) => {
+                self.editor
+                    .echo(format!("E5108: Error in BufReadCmd for {path_str}: {e}"));
+                false
+            }
+        }
+    }
+
     pub(crate) fn drain_pending_opens(&mut self) {
-        if !self.fx.has_remote_fs() {
+        let opens = self.editor.take_pending_opens();
+        if opens.is_empty() {
             return;
         }
+        // Make sure the autocmd cache reflects the latest registrations before deciding
+        // whether a `BufReadCmd` handler can claim these opens. The per-input-batch path
+        // refreshes this, but a drain can also run during startup (a deferred `nxvim .`
+        // directory, drained while sourcing the prelude / `init.lua` / package plugins),
+        // before any input batch — without this the explorer's just-registered handler
+        // would be missed and the directory read as a file.
+        self.refresh_au_events();
+        let remote = self.fx.has_remote_fs();
         let win = self.editor.current_window_id();
         let tab = self.editor.current_tab_id();
-        for open in self.editor.take_pending_opens() {
+        for open in opens {
+            // BufReadCmd (vim's "replace the read" hook): a Lua handler may claim this
+            // open and own filling the buffer — netrw / the explorer-as-plugin rides
+            // this. A claimed read skips the default load entirely (and, per `*Cmd`
+            // semantics, BufReadPost too — the handler sets the filetype, which fires
+            // FileType). An open only reaches here when deferred, which a local session
+            // does *only* when a BufReadCmd handler is registered, so the fire is never
+            // wasted on the common no-handler path.
+            if self.fire_buf_read_cmd(open.buffer, &open.path) {
+                continue;
+            }
+            if !remote {
+                // A deferred open no handler claimed, in a local (synchronous) session:
+                // read it now through `host_fs` and drive the lifecycle events the read
+                // implies, the synchronous counterpart of the off-tick `apply_open`
+                // landing below.
+                self.editor.load_pending_open(open);
+                self.push_buf_mirror();
+                self.emit_lifecycle_events();
+                self.run_pending();
+                continue;
+            }
             // Resolve a *relative* open against the effective working dir (the edit-host's
             // `DirState`, which a remote `:cd` moves) before it crosses the wire. The
             // daemon serves many sessions and keeps no per-session process cwd, so a bare
@@ -196,6 +299,15 @@ impl EditHost {
         let mode = self.editor.mode;
         let cur_win = self.editor.current_window_id();
         let wins = self.editor.window_ids();
+
+        // A buffer with an open still pending (a deferred `:edit` — every local open now
+        // defers behind the explorer's `BufReadCmd` handler, and an off-tick open always
+        // does) is named but **empty**: its content lands later this convergence
+        // (`drain_pending_opens` → `load_pending_open` / the off-tick landing). Hold its
+        // read lifecycle (`BufReadPost`/`FileType`/`BufEnter`) until then, so those fire
+        // once over the filled buffer rather than prematurely on the empty one (which
+        // would double the `FileType`). `BufLeave` for the buffer being left is unaffected.
+        let pending_open = self.editor.has_pending_open(buf);
 
         let unannounced = !self.announced.contains(&buf);
         // FileType fires on the buffer's first announce *and* whenever its filetype
@@ -396,7 +508,7 @@ impl EditHost {
         // `[No Name]`/scratch buffer was never read. A buffer whose file does not
         // exist on disk fires `BufNewFile` *instead of* `BufReadPost` (matching
         // `vim file-that-does-not-exist`); an existing file fires `BufReadPost`.
-        if unannounced {
+        if unannounced && !pending_open {
             self.announced.insert(buf);
             if file_backed {
                 let event = if self.editor.buffer_is_new_file(buf) {
@@ -417,7 +529,7 @@ impl EditHost {
         // buffers too, so a core-created special buffer's `FileType <ft>` autocmd
         // installs its buffer-local maps (the unified special-buffer model — see
         // docs/plans/2026-06-16-unify-special-buffer-kinds.md).
-        if ft_changed {
+        if ft_changed && !pending_open {
             if let Some(ft) = &cur_ft {
                 self.fire_lifecycle("FileType", ft, buf, &name);
             }
@@ -428,7 +540,7 @@ impl EditHost {
         // `BufEnter` for the one we entered (both file-backed and [No Name]). vim
         // brackets a buffer switch as `BufLeave → BufEnter`; the old buffer's name is
         // its own, so fire it with that context before rebinding `last_buffer_id`.
-        if entered {
+        if entered && !pending_open {
             if let Some(old) = self.last_buffer_id {
                 let old_name = self.editor.buffer_name(old).unwrap_or_default();
                 self.fire_lifecycle("BufLeave", &old_name, old, &old_name);

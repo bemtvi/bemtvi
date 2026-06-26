@@ -143,12 +143,16 @@ impl EditHost {
                 // multi-click detection compares these deltas against `'mousetime'`.
                 ev.stamp_ms = self.mouse_stamp_ms();
                 self.editor.mouse(ev);
+                // Resolve a mouse-button press against the keymaps before settling
+                // effects: a bound `<n-LeftMouse>` map fires (e.g. the explorer's
+                // `<2-LeftMouse>` → open), else the default word/line selection runs.
+                self.resolve_mouse_clicks();
                 // Drain the effects a mouse gesture can queue, the same way the
                 // keyboard path (`input` → `run_pending`) does: a picker / select
                 // confirm or cancel (`menu_results`), a completion accept's delegated
-                // edit (`complete_accept_request`), any callback those fire. Without
-                // this a click that confirms a picker would queue the choice but never
-                // run the source's `confirm`.
+                // edit (`complete_accept_request`), any callback those fire (including
+                // a fired mouse mapping's). Without this a click that confirms a picker
+                // would queue the choice but never run the source's `confirm`.
                 self.run_pending();
                 // A status-line click on a `%@…%X` region fires its Lua handler (and
                 // settles the handler's effects); a no-op for every other gesture.

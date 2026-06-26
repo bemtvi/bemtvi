@@ -413,17 +413,11 @@ vim.fn.maparg = nx.keymap.arg
 -- are ordinary BUFFER-LOCAL default keymaps installed by a `FileType` autocmd — vim's
 -- ftplugin model — overridable the standard way with
 -- `nx.keymap.set('n', lhs, rhs, { buffer = 0 })` (or per-buffer in your own FileType
--- autocmd). Each action fires the existing native bridge (nx._explorer_action /
--- nx._qf_action -> Editor::apply_*_action). (`nx.view`'s `<CR>` is installed the same
--- way, but at create time — see prelude/view.lua.) See
--- docs/plans/2026-06-16-unify-special-buffer-kinds.md.
+-- autocmd). The explorer's actions are pure Lua (`nx.explorer._open` / `_up`, in
+-- prelude/explorer.lua — the netrw-as-plugin); the quickfix one fires the `nx._qf_action`
+-- bridge. (`nx.view`'s `<CR>` is installed the same way, but at create time — see
+-- prelude/view.lua.) See docs/plans/2026-06-16-unify-special-buffer-kinds.md.
 nx.explorer = nx.explorer or {}
-nx.explorer.actions = nx.explorer.actions or {}
-for _, name in ipairs({ "open", "up" }) do
-  nx.explorer.actions[name] = function()
-    nx._explorer_action(name)
-  end
-end
 
 nx.qf = nx.qf or {}
 nx.qf.actions = nx.qf.actions or {}
@@ -436,22 +430,25 @@ nx.qf.actions.jump = function()
 end
 
 -- `default = true` so a user/plugin map on the same key wins; `buffer = args.buf`
--- scopes each map to the just-typed special buffer only.
+-- scopes each map to the just-typed special buffer only. The explorer listing buffer
+-- (`nxdir`) is filled by the `BufReadCmd` handler in prelude/explorer.lua, which sets
+-- this filetype — so these maps land on the listing the moment it exists.
 nx.autocmd.create("FileType", {
   pattern = "nxdir",
   callback = function(args)
-    nx.keymap.set(
-      "n",
-      "<CR>",
-      nx.explorer.actions.open,
-      { buffer = args.buf, default = true, desc = "Open entry" }
-    )
+    local buf = args.buf
+    local open = nx.explorer.actions.open
+    nx.keymap.set("n", "<CR>", open, { buffer = buf, default = true, desc = "Open entry" })
     nx.keymap.set(
       "n",
       "-",
       nx.explorer.actions.up,
-      { buffer = args.buf, default = true, desc = "Parent directory" }
+      { buffer = buf, default = true, desc = "Parent directory" }
     )
+    -- A double-click opens the entry under the pointer (netrw), the mouse form of
+    -- `<CR>`. `<2-LeftMouse>` is an ordinary mappable key (the general mouse-mapping
+    -- primitive): the single click placed the cursor on the row, the double fires this.
+    nx.keymap.set("n", "<2-LeftMouse>", open, { buffer = buf, default = true, desc = "Open entry" })
   end,
 })
 

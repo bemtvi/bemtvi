@@ -3,7 +3,7 @@
 
 use crate::keymap::{MappingRhs, MatchScope, Step};
 use crate::EditHost;
-use nxvim_core::{parse_keys, Key};
+use nxvim_core::{parse_keys, Key, KeyCode};
 
 impl EditHost {
     pub(crate) fn input(&mut self, keys: &str) {
@@ -123,6 +123,44 @@ impl EditHost {
         }
     }
 
+    /// Resolve the mouse-button presses the last gesture queued (drained from the
+    /// core) against the keymaps — Primitive A of the explorer-port plan. Each press
+    /// becomes a `<n-LeftMouse>`-style [`Key`] looked up in the current buffer's
+    /// editing trie: a bound mapping **fires** (the click's RHS — e.g. the explorer's
+    /// `<2-LeftMouse>` → open under the cursor), while an unbound click falls back to
+    /// the editor's default word/line selection escalation
+    /// ([`Editor::mouse_apply_default_select`](nxvim_core::Editor::mouse_apply_default_select)).
+    /// The cursor was already placed by the press itself (the `<LeftMouse>` default),
+    /// so a fired mapping acts on the clicked position. Called right after
+    /// `editor.mouse` on both the native dispatch and the wasm edit-host paths (the
+    /// "two mouse entry points need settle parity" rule), so a mapping resolves the
+    /// same way regardless of front end.
+    pub(crate) fn resolve_mouse_clicks(&mut self) {
+        let clicks = self.editor.take_mouse_clicks();
+        if clicks.is_empty() {
+            return;
+        }
+        // A click may have moved focus to another window/buffer; rebuild the tries for
+        // the now-current buffer so its buffer-local mouse maps are in force.
+        self.refresh_keymaps();
+        let scope = MatchScope::Editing(self.editor.mode);
+        for click in clicks {
+            let key = Key {
+                code: KeyCode::Mouse {
+                    button: click.button,
+                    clicks: click.clicks,
+                },
+                shift: click.shift,
+                ctrl: click.ctrl,
+                alt: click.alt,
+            };
+            match self.keymaps.lookup_mouse(scope, key) {
+                Some(m) => self.fire_mapping(m.rhs, m.silent, m.expr),
+                None => self.editor.mouse_apply_default_select(click.clicks),
+            }
+        }
+    }
+
     /// Resolve a withheld key-prefix on input idle — the matcher's `timeoutlen`
     /// flush (design D4). Mirrors [`input`](Self::input)'s drive, but the steps come
     /// from [`Keymaps::flush`] (no incoming key) instead of `feed`. Refreshing the
@@ -184,6 +222,12 @@ impl EditHost {
         if version != self.au_event_version {
             self.au_event_version = version;
             self.au_active_events = self.lua.autocmd_event_set().into_iter().collect();
+            // Mirror whether a BufReadCmd handler exists down to the core, so a file
+            // open defers (enqueues) instead of reading inline — letting the server
+            // fire BufReadCmd before the default read (Primitive B of the explorer
+            // port). Only changes when the registry version bumps.
+            self.editor
+                .set_bufreadcmd_active(self.au_active_events.contains("BufReadCmd"));
         }
     }
 
@@ -276,7 +320,6 @@ impl EditHost {
         let _ = self.lua.take_output();
         let _ = self.lua.take_picker_actions();
         let _ = self.lua.take_select_actions();
-        let _ = self.lua.take_explorer_actions();
         let _ = self.lua.take_cmdline_actions();
     }
 

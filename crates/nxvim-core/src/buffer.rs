@@ -80,15 +80,13 @@ impl EditBatch {
 /// `Buffer` field rather than riding the enum payload.)
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum BufferKind {
-    /// An ordinary, editable file / scratch buffer. The common case.
+    /// An ordinary, editable file / scratch buffer. The common case. The file
+    /// explorer's directory listing is also an ordinary buffer — a pure-Lua plugin
+    /// (`prelude/explorer.lua`, vim's netrw) fills it via `BufReadCmd` + `nx.fs` and
+    /// holds it read-only with the `'modifiable'` option, so the core has no
+    /// directory-buffer kind.
     #[default]
     Ordinary,
-    /// A **directory listing** — nxvim's in-window file explorer (vim's netrw). The
-    /// payload is the canonical absolute path being listed. Built by
-    /// [`Buffer::from_dir`]; its activation keys (`<CR>` open / `-` parent →
-    /// [`crate::editor::Editor::apply_explorer_action`]) are buffer-local maps on its
-    /// `nxdir` filetype.
-    Directory(PathBuf),
     /// A **plugin-owned view** (`nx.view`) — a plugin-controlled content surface (the
     /// file-tree / list-widget generalization of the bottom panel). The payload is the
     /// Lua-allocated view handle id its `set_lines` / `mount` / `on_select` address it
@@ -308,15 +306,6 @@ impl Buffer {
         !matches!(self.kind, BufferKind::Ordinary)
     }
 
-    /// The canonical directory path when this is a [`BufferKind::Directory`] explorer
-    /// listing, else `None`.
-    pub fn dir(&self) -> Option<&Path> {
-        match &self.kind {
-            BufferKind::Directory(p) => Some(p),
-            _ => None,
-        }
-    }
-
     /// The view handle id when this is a [`BufferKind::View`] plugin view, else `None`.
     pub fn view_id(&self) -> Option<u64> {
         match self.kind {
@@ -420,77 +409,6 @@ impl Buffer {
             disk: fs.stat(path),
             ..Buffer::named(path)
         })
-    }
-
-    /// Build a read-only **directory listing** buffer for `path` — the in-window
-    /// file explorer nxvim opens when asked to edit a directory (vim's netrw).
-    /// The lines are a `../` up-entry followed by the directory's entries sorted
-    /// directories-first then case-insensitively by name, each directory suffixed
-    /// with `/`. The buffer carries `dir: Some(canonical path)` so the editor
-    /// routes navigation keys to the explorer instead of editing it, and the same
-    /// path as its `path` so its name shows the directory (matching netrw).
-    /// Errors only when the directory can't be read (e.g. no permission); an empty
-    /// directory yields just the `../` line.
-    pub fn from_dir(path: impl AsRef<Path>, fs: &dyn HostFs) -> Result<Self> {
-        let path = path.as_ref();
-        // Canonicalize so going up (`../`) and descending (`join`) are
-        // unambiguous however the path was spelled (`.`, a relative dir, a
-        // symlink). Fall back to the given path if it can't be resolved.
-        let dir = fs.canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
-        let entries = fs.read_dir(&dir)?;
-        Ok(Self::from_dir_entries(dir, entries))
-    }
-
-    /// Build the directory-listing buffer for `dir` from an already-fetched, unsorted
-    /// entry list — the [`HostFs`]-free core of [`Buffer::from_dir`]. The daemon /
-    /// edit-host split (`docs/plans/2026-06-09-edit-host-and-browser-lua.md` → Phase 3g)
-    /// reads a *remote* directory off the editor tick (over `HostFsAsync`, not the sync
-    /// [`HostFs`]) and hands the entries here, so the listing is built the same way
-    /// whether the directory was read from local disk or across the wire. `dir` is taken
-    /// as the canonical path (the caller canonicalized it — locally via [`HostFs`], or on
-    /// the daemon side of the wire), so `../`/`join` navigation is unambiguous.
-    pub fn from_dir_entries(dir: PathBuf, entries: Vec<crate::host::DirEntry>) -> Self {
-        let mut entries: Vec<(bool, String)> =
-            entries.into_iter().map(|e| (e.is_dir, e.name)).collect();
-        // Directories first, then case-insensitive by name (netrw's default sort).
-        entries.sort_by(|a, b| {
-            b.0.cmp(&a.0)
-                .then_with(|| a.1.to_lowercase().cmp(&b.1.to_lowercase()))
-        });
-        let mut text = String::from("../\n");
-        for (is_dir, name) in entries {
-            text.push_str(&name);
-            if is_dir {
-                text.push('/');
-            }
-            text.push('\n');
-        }
-        Buffer {
-            text: Rope::from_str(&text),
-            path: Some(dir.clone()),
-            kind: BufferKind::Directory(dir),
-            terminal_title: None,
-            view_name: None,
-            modified: false,
-            options: crate::options::BufferOptions::default(),
-            changedtick: 0,
-            save_tick: 0,
-            edits: Vec::new(),
-            resync: false,
-            lsp_edits: Vec::new(),
-            lsp_resync: false,
-            lua_ts_edits: Vec::new(),
-            lua_ts_resync: false,
-            jump_edits: Vec::new(),
-            changelist: Vec::new(),
-            changelistidx: 0,
-            extmarks: crate::extmark::ExtmarkStore::default(),
-            marks: HashMap::new(),
-            image_gen: 0,
-            // A directory listing is never written back to disk, so it needs no
-            // change tracking.
-            disk: None,
-        }
     }
 
     /// Number of editable lines (excludes the phantom final line).
@@ -848,6 +766,15 @@ impl Buffer {
         self.save_tick += 1;
     }
 
+    /// Stamp `stat` as the disk baseline directly — for a buffer whose content the
+    /// editor deliberately does *not* hold (an `'imagepreview'` image: the bytes are
+    /// never read into the rope, but the redraw's image marker still carries the file's
+    /// size/mtime). Unlike [`mark_written`](Buffer::mark_written) it touches only the
+    /// snapshot, not the name / `modified` / `save_tick`.
+    pub fn stamp_disk(&mut self, stat: Option<FileStat>) {
+        self.disk = stat;
+    }
+
     /// The disk snapshot (mtime+size) from the last read/write, or `None` for a
     /// buffer with no file on disk (scratch, or a `:e new-file` not yet written).
     /// The server keys its per-buffer file watch on `(path, this)` so the watch
@@ -1070,4 +997,31 @@ fn add_to_changelist(list: &mut Vec<(usize, usize)>, pos: (usize, usize)) {
         list.remove(0);
     }
     list.push(pos);
+}
+
+/// Render a directory's entries into the file-explorer listing text — `../` first,
+/// then sub-directories (suffixed `/`), then files, each group sorted
+/// case-insensitively (netrw's default). The off-tick / remote counterpart of the
+/// explorer plugin's Lua `render` (`prelude/explorer.lua`): the server fills a remote
+/// directory's listing from the entries its fetch already read (the `nx.fs` op and the
+/// file-open fetch are separate legs, so the plugin can't re-read remotely), so this
+/// must match the Lua rendering byte-for-byte. The returned text ends with a trailing
+/// newline, ready to load into a buffer.
+pub fn dir_listing(entries: Vec<crate::host::DirEntry>) -> String {
+    let mut entries: Vec<(bool, String)> =
+        entries.into_iter().map(|e| (e.is_dir, e.name)).collect();
+    // Directories first, then case-insensitive by name (netrw's default sort).
+    entries.sort_by(|a, b| {
+        b.0.cmp(&a.0)
+            .then_with(|| a.1.to_lowercase().cmp(&b.1.to_lowercase()))
+    });
+    let mut text = String::from("../\n");
+    for (is_dir, name) in entries {
+        text.push_str(&name);
+        if is_dir {
+            text.push('/');
+        }
+        text.push('\n');
+    }
+    text
 }

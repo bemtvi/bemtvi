@@ -62,6 +62,27 @@ pub(crate) enum ResizeDrag {
     Dock { side: DockSide },
 }
 
+/// A mouse-button **press** the server still has to resolve against the keymaps: the
+/// button, its multi-click count, and the active modifiers, recorded on
+/// [`Editor::mouse_clicks`] by the press handler. The cursor is already placed (the
+/// `<LeftMouse>` default) by the time this is queued; the server turns it into a
+/// [`Key`](crate::input::Key) (`<n-LeftMouse>`), fires the bound mapping if there is
+/// one, else calls [`Editor::mouse_apply_default_select`]. v1 records only the
+/// **left** button (the gesture the explorer's `<2-LeftMouse>` rides); the modifier
+/// fields are carried for the right/middle/`<C-…>` buttons a later phase wires.
+#[derive(Debug, Clone, Copy)]
+pub struct MouseClick {
+    /// The button pressed — `Left`/`Right`/`Middle` (never the wheel/move/thumb).
+    pub button: MouseButton,
+    /// The multi-click count (1 = single, 2 = double, 3 = triple), per `'mousetime'`.
+    pub clicks: u8,
+    /// Active modifiers at the press (all `false` in v1, which records plain left
+    /// presses only — `<S-LeftMouse>` is the separate extend gesture).
+    pub shift: bool,
+    pub ctrl: bool,
+    pub alt: bool,
+}
+
 /// The anchored extent a left-drag extends from, set by the press by click count.
 #[derive(Debug, Clone, Copy)]
 enum SelectAnchor {
@@ -443,18 +464,50 @@ impl Editor {
         self.set_window_cursor(win, line, bcol);
 
         let count = self.next_click_count(row, col, stamp_ms);
-        let anchor = match count {
-            1 => SelectAnchor::Char(self.cursor),
-            2 => self.mouse_select_word(),
-            _ => self.mouse_select_line(),
-        };
+        // Record the gesture with a provisional single-click (char) anchor — enough
+        // for a following drag and for the next press's multi-click counting. The
+        // word/line escalation for a double/triple click is **deferred** to
+        // [`mouse_apply_default_select`], which the server runs only if no
+        // `<n-LeftMouse>` mapping claimed the click: the keymap engine lives in the
+        // server (design D1), so the map-vs-default decision is made there. The click
+        // is queued on `mouse_clicks` for it to resolve.
         self.mouse_select = Some(MouseSelect {
             row,
             col,
             stamp_ms,
             count,
-            anchor,
+            anchor: SelectAnchor::Char(self.cursor),
         });
+        self.mouse_clicks.push(MouseClick {
+            button: MouseButton::Left,
+            clicks: count,
+            shift: false,
+            ctrl: false,
+            alt: false,
+        });
+    }
+
+    /// The default `<LeftMouse>` selection escalation, applied by the server when **no**
+    /// `<n-LeftMouse>` mapping claimed a left press: a single click leaves the cursor
+    /// where the press placed it (no Visual), a double click selects the word, a triple
+    /// the line. This is the back half of [`mouse_left_press`], split out so a bound
+    /// mouse mapping can suppress it. Updates the in-flight [`MouseSelect`]'s anchor so a
+    /// following drag extends by the selected unit.
+    pub fn mouse_apply_default_select(&mut self, clicks: u8) {
+        let anchor = match clicks {
+            0 | 1 => return,
+            2 => self.mouse_select_word(),
+            _ => self.mouse_select_line(),
+        };
+        if let Some(sel) = self.mouse_select.as_mut() {
+            sel.anchor = anchor;
+        }
+    }
+
+    /// Drain the mouse-button presses awaiting keymap resolution (the server calls this
+    /// right after a gesture). See [`MouseClick`] / [`Editor::mouse_clicks`].
+    pub fn take_mouse_clicks(&mut self) -> Vec<MouseClick> {
+        std::mem::take(&mut self.mouse_clicks)
     }
 
     /// A left-press that hit-tested to a window's status line: focus the window

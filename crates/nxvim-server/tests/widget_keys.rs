@@ -269,12 +269,19 @@ async fn open_explorer(init_lua: &str) -> (Rpc, UnboundedReceiver<Incoming>) {
     std::fs::create_dir(content.join("sub")).expect("mkdir sub");
     let (rpc, incoming) = start(&cfg, init_lua).await;
     feed(&rpc, &format!(":e {}<CR>", content.display()));
-    barrier(&rpc).await;
-    assert_eq!(
-        lines(&rpc).await,
-        vec!["../", "sub/", "alpha.txt", "beta.txt"],
-        "explorer listed the fixture directory"
-    );
+    // The explorer (a Lua plugin) fills the listing asynchronously (`nx.fs.readdir`
+    // settles off the tick), so poll until the entries appear — a single barrier can lag
+    // under parallel test load.
+    let want = vec!["../", "sub/", "alpha.txt", "beta.txt"];
+    let mut got = lines(&rpc).await;
+    for _ in 0..100 {
+        if got == want {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        got = lines(&rpc).await;
+    }
+    assert_eq!(got, want, "explorer listed the fixture directory");
     (rpc, incoming)
 }
 

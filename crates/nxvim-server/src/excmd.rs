@@ -10,6 +10,12 @@ use std::path::{Component, Path, PathBuf};
 
 impl EditHost {
     pub(crate) fn run_command(&mut self, cmd: &str) {
+        // Pick up any keymap / autocmd registry change before the command runs — like
+        // the `nx_input` batch does. A `:e` opens a file, and whether it defers for a
+        // `BufReadCmd` handler depends on the up-to-date `au_active_events` cache (the
+        // `bufreadcmd_active` mirror); without this a `:edit` issued before the first
+        // keystroke would miss a handler registered at startup.
+        self.refresh_keymaps();
         self.editor.command(cmd);
         self.emit_lifecycle_events();
         self.run_pending();

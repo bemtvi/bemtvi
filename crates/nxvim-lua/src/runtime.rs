@@ -501,6 +501,13 @@ const PRELUDE_MODULES: &[(&str, &str)] = &[
     // nx.decor: viewport-scoped decoration providers (the registry + off-tick
     // dispatch; needs nx.ns from api and nx.notify from runtime, both above).
     ("nxvim:prelude/decor", include_str!("prelude/decor.lua")),
+    // The file-explorer's visual layer (directory-row highlighting), authored as an
+    // `nx.decor` provider — so it loads AFTER decor.lua, whose `nx.decor.provider`
+    // it registers against.
+    (
+        "nxvim:prelude/explorer",
+        include_str!("prelude/explorer.lua"),
+    ),
     (
         "nxvim:prelude/diagnostic",
         include_str!("prelude/diagnostic.lua"),
@@ -686,11 +693,6 @@ pub(crate) struct Shared {
     /// drained by the server into `Editor::apply_select_action` — the rebindable
     /// `nx.ui.select` keys (next / prev / first / last / confirm / cancel).
     pub(crate) select_actions: Vec<String>,
-    /// Named `explorer` actions an `explorer`-bucket keymap fired
-    /// (`nx._explorer_action`), drained by the server into
-    /// `Editor::apply_explorer_action` — the rebindable file-explorer keys (open /
-    /// up / next / prev / first / last / half + page scroll).
-    pub(crate) explorer_actions: Vec<String>,
     /// Named `view` actions a view buffer-local keymap fired (`nx._view_action`),
     /// drained by the server into `Editor::apply_view_action` — the `nx.view`
     /// activation key (`confirm`).
@@ -1334,12 +1336,6 @@ impl LuaRuntime {
         /// Take the named select actions fired since the last drain, for the server
         /// to apply to the open `nx.ui.select` list via `Editor::apply_select_action`.
         take_select_actions -> Vec<String> = select_actions
-    }
-
-    take_queue! {
-        /// Take the named explorer actions fired since the last drain, for the server
-        /// to apply to the file explorer via `Editor::apply_explorer_action`.
-        take_explorer_actions -> Vec<String> = explorer_actions
     }
 
     take_queue! {
@@ -2167,6 +2163,36 @@ impl LuaRuntime {
     ) -> mlua::Result<()> {
         let fire: mlua::Function = self.nx()?.get("_fire")?;
         fire.call((event, pattern, buf, file))
+    }
+
+    /// Fire a **`*Cmd`** autocmd (currently `BufReadCmd`) and report whether any
+    /// handler matched/ran — the "claimed the read" signal. Like
+    /// [`fire_autocmd_buf`](Self::fire_autocmd_buf) but it captures `nx._fire`'s
+    /// boolean return (the same mechanism as
+    /// [`fire_file_changed`](Self::fire_file_changed)): `true` means a handler owns
+    /// filling the buffer, so the caller skips its default read; `false` means no
+    /// handler matched and the default read proceeds. `pattern` is the path the
+    /// handler's `pattern` opt matches against (so `BufReadCmd` for a directory can be
+    /// scoped), and it is also carried as `<afile>`/`<amatch>` (`args.file`).
+    ///
+    /// **Claim contract:** unlike a plain autocmd (where merely matching counts), a
+    /// `*Cmd` handler **claims** the read by *returning a truthy value*. So a
+    /// `pattern = "*"` handler can decide per path — claim a directory, return `nil`
+    /// for a regular file so the default read still runs. `Ok(true)` ⇒ claimed.
+    ///
+    /// `is_dir` is surfaced to the handler as `args.isdir` — the directory-ness of
+    /// `<amatch>`, the fs fact a `*Cmd` handler routinely branches on (the file
+    /// explorer-as-plugin claims directories, declines files), passed in because the
+    /// live Lua fs surface is async and a handler can't synchronously re-stat.
+    pub fn fire_autocmd_cmd(
+        &self,
+        event: &str,
+        path: &str,
+        buf: u64,
+        is_dir: bool,
+    ) -> mlua::Result<bool> {
+        let fire: mlua::Function = self.nx()?.get("_fire_read_cmd")?;
+        fire.call((event, path, buf, is_dir))
     }
 
     /// Fire an autocmd with buffer context *and* an `args.data` payload — the

@@ -82,11 +82,17 @@ async fn explorer_listing_is_read_only_to_ex_command_edits() {
     std::fs::write(dir.join("beta.txt"), "b\n").expect("write beta");
     let (rpc, mut incoming) = start().await;
     exec_lua(&rpc, &format!("nx.cmd('edit {}')", dir.to_string_lossy())).await;
-    // Sanity: we're actually on the listing, not a stray buffer.
-    assert!(
-        lines(&rpc).await.iter().any(|l| l == "alpha.txt"),
-        "the explorer listing is open"
-    );
+    // The explorer (a Lua plugin) fills the listing asynchronously (`nx.fs.readdir`
+    // settles off the tick), so poll until the entries appear before asserting.
+    let mut listed = false;
+    for _ in 0..100 {
+        if lines(&rpc).await.iter().any(|l| l == "alpha.txt") {
+            listed = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    assert!(listed, "the explorer listing is open");
     assert_ex_edits_refused(&rpc, &mut incoming, "explorer").await;
 }
 

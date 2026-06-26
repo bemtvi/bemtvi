@@ -1854,13 +1854,12 @@ impl Editor {
         }
         let path = PathBuf::from(args);
 
-        // `:e dir` opens the in-window file explorer (netrw): `enter_dir` reuses
-        // the window when the current buffer is a throwaway/explorer and otherwise
-        // opens a fresh listing buffer, keeping the current one in the list.
-        if path.is_dir() {
-            self.enter_dir(&path);
-            return;
-        }
+        // `:e dir` opens the in-window file explorer (vim's netrw), which is a pure-Lua
+        // plugin (`prelude/explorer.lua`). A directory flows through the ordinary
+        // open-or-switch path below: `should_defer_open` (a `BufReadCmd` handler is
+        // registered) enqueues it so the server fires `BufReadCmd` and the explorer claims
+        // the read and fills the listing. The core has no directory-buffer notion, so
+        // there is no directory-specific branch here.
 
         // Re-editing the current file reloads it in place (`:e` / `:e!`),
         // discarding unsaved changes — so the modified guard applies here.

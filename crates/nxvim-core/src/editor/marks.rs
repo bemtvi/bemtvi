@@ -218,6 +218,18 @@ impl Editor {
     /// clamped to the destination buffer in case it shrank since the mark was set.
     pub(crate) fn jump_to_mark_buffer(&mut self, loc: MarkLocation, line_anchor: bool) {
         self.switch_buffer(loc.buf);
+        // The mark's file may be **lazily (re)opened** by a deferred open (a shada-restored
+        // global/numbered mark whose buffer was just minted, or any open behind a
+        // `BufReadCmd` handler): its content hasn't landed yet, so positioning now would
+        // snap to the top and the read landing would reset it. Record the target; the
+        // landing ([`settle_loaded_cursor`]) applies it. Exact `` ` `` lands at the saved
+        // column; line-anchored `'` lands at column 0 (the first-non-blank can't be found
+        // before the lines exist — a negligible nuance for an as-yet-unloaded file).
+        if self.has_pending_open(loc.buf) {
+            let col = if line_anchor { 0 } else { loc.cursor.col };
+            self.pending_open_cursor = Some((loc.buf, loc.cursor.line, col));
+            return;
+        }
         let line = loc.cursor.line.min(self.last_line());
         let col = if line_anchor {
             self.first_non_blank(line)

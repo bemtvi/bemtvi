@@ -353,6 +353,12 @@ impl EditHost {
     /// the editor, and the final captured `print` / `nvim_echo` line becomes the
     /// message.
     pub(crate) fn apply_lua_effects(&mut self) {
+        // Refresh the autocmd cache before running any queued command, so a
+        // `nx.cmd('edit …')` (which runs through `editor.command` here, not the
+        // `run_command` RPC path) sees an up-to-date `bufreadcmd_active` and defers a
+        // directory / `*Cmd`-matched open to the explorer's `BufReadCmd` handler. Cheap:
+        // a version check that only rebuilds when the registry changed.
+        self.refresh_au_events();
         for hl in self.lua.take_highlights() {
             self.editor.highlights.set_ns(hl.ns, &hl.name, hl_def(&hl));
         }
@@ -381,14 +387,6 @@ impl EditHost {
         // each to the open `nx.ui.select` list. Unknown names fail loud.
         for action in self.lua.take_select_actions() {
             if let Err(e) = self.editor.apply_select_action(&action) {
-                self.editor.echo(format!("E5108: {e}"));
-            }
-        }
-        // Explorer actions a `FileType nxdir` buffer-local keymap fired
-        // (`nx._explorer_action`): apply each to the file-explorer listing (`<CR>`
-        // open / `-` up). Unknown names fail loud.
-        for action in self.lua.take_explorer_actions() {
-            if let Err(e) = self.editor.apply_explorer_action(&action) {
                 self.editor.echo(format!("E5108: {e}"));
             }
         }

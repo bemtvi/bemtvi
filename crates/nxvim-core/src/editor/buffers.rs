@@ -175,6 +175,14 @@ impl Editor {
             ob.buffer.options.bomb = value;
         } else if name == "modifiable" {
             ob.buffer.options.modifiable = value;
+        } else if name == "modified" {
+            // vim's `:set [no]modified` (`vim.bo.modified = …`): set or clear the
+            // change flag directly. Clearing it is how a plugin that fills a buffer as
+            // a *read* (a `BufReadCmd` listing) tells the editor "this is the file's
+            // content, not an unsaved edit", so the buffer shows no `[+]` and doesn't
+            // block `:q` with E37 — the `nx.view` `set_view_lines` clear, reached via
+            // the public option surface for a plugin-filled ordinary buffer.
+            ob.buffer.modified = value;
         }
     }
 
@@ -573,6 +581,55 @@ impl Editor {
         self.host_fs_offtick = on;
     }
 
+    /// Mirror whether a `BufReadCmd` autocmd handler is registered (the server reads
+    /// this from its `au_active_events` cache). When on, a file open is deferred so the
+    /// server can fire `BufReadCmd` before the default read — see
+    /// [`should_defer_open`](Self::should_defer_open) and the field doc.
+    pub fn set_bufreadcmd_active(&mut self, on: bool) {
+        self.bufreadcmd_active = on;
+    }
+
+    /// Whether a file open should be **deferred** to the server (enqueued as a
+    /// [`PendingOpen`]) instead of read inline through [`HostFs`](crate::HostFs). True
+    /// in off-tick/daemon mode (the read crosses the wire) *or* when a `BufReadCmd`
+    /// handler is registered (the server fires it first, and a handler may claim the
+    /// read). The common local config with no `BufReadCmd` handler defers nothing, so
+    /// its synchronous read path is unchanged.
+    pub(crate) fn should_defer_open(&self) -> bool {
+        self.host_fs_offtick || self.bufreadcmd_active
+    }
+
+    /// Read `open.path` synchronously through [`HostFs`](crate::HostFs) into
+    /// `open.buffer` — the local fill of a deferred open that the server's `BufReadCmd`
+    /// fire did **not** claim. Mirrors [`load_into_current`](Self::load_into_current)
+    /// (fresh undo rooted at the read, unmodified, syntax re-sync) but targets the
+    /// named buffer rather than the current one, and records it as loaded-in-place so
+    /// the server re-fires `BufReadPost`/`BufNewFile`/`FileType`. A read error is
+    /// echoed, leaving the (empty) buffer in place. A no-op if the buffer was closed
+    /// before the drain.
+    pub fn load_pending_open(&mut self, open: PendingOpen) {
+        let PendingOpen { buffer, path } = open;
+        if !self.buffers.map.contains_key(&buffer) {
+            return;
+        }
+        match self.read_buffer(&path) {
+            Ok(buf) => {
+                let ob = self.buffers.get_mut(buffer);
+                ob.buffer = buf;
+                ob.undo = UndoTree::new(&ob.buffer);
+                ob.saved_seq = Some(ob.undo.cur_seq());
+                ob.buffer.mark_resync();
+                ob.buffer.modified = false;
+                self.loaded_in_place.push(buffer);
+                // Land the cursor: a located jump that was waiting on this deferred open
+                // goes to its target, else the top (a plain `:edit`).
+                self.settle_loaded_cursor(buffer);
+            }
+            Err(e) => self.echo(e.to_string()),
+        }
+        self.seed_pending_file_marks(buffer);
+    }
+
     /// Drain the writes the editor deferred this tick (off-tick save mode). The
     /// server takes these after each input, pushes their bytes over the daemon wire,
     /// and finalizes each on its ack. Empty (a cheap no-op) when off-tick mode is off
@@ -666,6 +723,15 @@ impl Editor {
         std::mem::take(&mut self.pending_opens)
     }
 
+    /// Whether `buffer` has an open still pending (enqueued but not yet filled — a
+    /// deferred `:edit`, off-tick or behind a `BufReadCmd` handler). The server uses
+    /// this to hold a freshly-named-but-empty buffer's read lifecycle
+    /// (`BufReadPost`/`FileType`/`BufEnter`) until the content actually lands, so those
+    /// fire **once**, over the filled buffer, rather than prematurely on the empty one.
+    pub fn has_pending_open(&self, buffer: BufferId) -> bool {
+        self.pending_opens.iter().any(|o| o.buffer == buffer)
+    }
+
     /// Drain the buffers read from a file *in place* this tick (a local `:edit` that
     /// reused the throwaway `[No Name]` or re-read the current file via `:e` / `:e!`,
     /// keeping the same bufnr). The server clears each from its `announced` /
@@ -751,6 +817,16 @@ impl Editor {
         // `read_buffer` → `Buffer::from_image_file`. Off-tick has no synchronous stat, so
         // the disk version is left unset — the client keys its cache on the path.)
         if self.options.imagepreview && super::is_image_path(Some(&path)) {
+            // Stamp the disk baseline (size + mtime the redraw's image marker carries)
+            // when we can stat synchronously — a *local* open (every `:edit` now defers
+            // through here behind the explorer's `BufReadCmd` handler, so this is the live
+            // local image path). Off-tick has no synchronous stat, so it's left unset and
+            // the client keys its cache on the path.
+            let stat = if self.host_fs_offtick {
+                None
+            } else {
+                self.host_fs.stat(&path)
+            };
             if let Some(ob) = self.buffers.map.get_mut(&buffer) {
                 let len = ob.buffer.len_bytes();
                 if len > 0 {
@@ -759,6 +835,7 @@ impl Editor {
                 }
                 ob.buffer.kind = BufferKind::Image;
                 ob.buffer.set_path(Some(path));
+                ob.buffer.stamp_disk(stat);
                 ob.buffer.modified = false;
                 // Bump the preview version so the client re-fetches/re-decodes: off-tick
                 // can't stat, so a reopen (`:e`) or a watch-driven reload — both routed
@@ -784,7 +861,6 @@ impl Editor {
         if !self.buffers.map.contains_key(&buffer) {
             return;
         }
-        let is_current = buffer == self.cur_buffer();
         let ob = self.buffers.get_mut(buffer);
         let len = ob.buffer.len_bytes();
         ob.buffer.remove(0..len);
@@ -801,11 +877,7 @@ impl Editor {
         ob.buffer.mark_clean();
         ob.undo = UndoTree::new(&ob.buffer);
         ob.saved_seq = Some(ob.undo.cur_seq());
-        if is_current {
-            self.cursor = Cursor::default();
-            self.top = 0;
-            self.leftcol = 0;
-        }
+        self.settle_loaded_cursor(buffer);
     }
 
     /// Open a built-in read-only **scratch listing** (`:messages`, `:registers`,
@@ -846,38 +918,6 @@ impl Editor {
             let ob = self.buffers.get_mut(buffer);
             ob.buffer.options.fileencoding = fileencoding;
             ob.buffer.options.bomb = bomb;
-        }
-    }
-
-    /// Turn `buffer` into a read-only **directory listing** of `dir` from an off-tick
-    /// remote `read_dir` — the explorer analogue of [`Editor::load_str_into`] (daemon /
-    /// edit-host split, Phase 3g). In a daemon session core can't read a directory
-    /// through the synchronous [`HostFs`](crate::HostFs) without blocking the editor
-    /// thread on the network, so `:edit <dir>` / descending into a sub-directory enqueue
-    /// a [`PendingOpen`] and the server fetches the entries off-tick; when they land it
-    /// calls this to build the listing (via [`Buffer::from_dir_entries`]) into the
-    /// already-created buffer. Replaces the buffer in place (preserving its id), roots a
-    /// fresh undo tree at the listing, and — when `buffer` is current — resets the
-    /// window to the top, as opening a directory does. A no-op if `buffer` was closed
-    /// before the fetch landed.
-    pub fn load_dir_into(&mut self, buffer: BufferId, dir: PathBuf, entries: Vec<crate::DirEntry>) {
-        if !self.buffers.map.contains_key(&buffer) {
-            return;
-        }
-        let listing = Buffer::from_dir_entries(dir, entries);
-        let is_current = buffer == self.cur_buffer();
-        let ob = self.buffers.get_mut(buffer);
-        ob.buffer = listing;
-        ob.undo = UndoTree::new(&ob.buffer);
-        ob.saved_seq = Some(ob.undo.cur_seq());
-        ob.buffer.mark_resync();
-        // The listing is `filetype=nxdir` (the explorer widget identity), so its
-        // `FileType nxdir` autocmd installs the buffer-local `<CR>`/`-` maps.
-        self.set_filetype(buffer, "nxdir");
-        if is_current {
-            self.cursor = Cursor::default();
-            self.top = 0;
-            self.leftcol = 0;
         }
     }
 
@@ -1322,10 +1362,13 @@ impl Editor {
     /// new tab, …). `None` means a *synchronous* load failed and was already echoed
     /// (off-tick never fails here — the fetch's errors surface later in `apply_open`).
     fn load_new_buffer(&mut self, path: &Path) -> Option<BufferId> {
-        if self.host_fs_offtick {
-            // Off-tick: create the empty named buffer and enqueue the fetch. (When the
-            // path is an image preview, `enqueue_open` marks the buffer inert and skips
-            // the fetch — the centralized policy for every off-tick open path.)
+        if self.should_defer_open() {
+            // Deferred (off-tick fetch, or a BufReadCmd handler that may claim the
+            // read): create the empty named buffer and enqueue. The server fills it —
+            // over the wire off-tick, or via `load_pending_open` locally when no
+            // BufReadCmd handler claims it. (When the path is an image preview,
+            // `enqueue_open` marks the buffer inert and skips the fetch — the
+            // centralized policy for every deferred open path.)
             let id = self.add_buffer(Buffer::named(path.to_path_buf()));
             self.enqueue_open(id, path.to_path_buf());
             Some(id)
@@ -1391,9 +1434,14 @@ impl Editor {
             // and enqueue the fetch (the empty buffer shows until the bytes land); locally:
             // read it in place.
             let id = self.cur_buffer();
-            if self.host_fs_offtick {
+            if self.should_defer_open() {
                 self.buffer_mut().set_path(Some(path.to_path_buf()));
-                self.seed_pending_file_marks(id);
+                // Shada pending marks are seeded by the off-tick fetch landing; for a
+                // BufReadCmd-deferred local open, the synchronous `load_pending_open`
+                // seeds them itself (matching the inline `load_into_current`).
+                if self.host_fs_offtick {
+                    self.seed_pending_file_marks(id);
+                }
                 self.enqueue_open(id, path.to_path_buf());
             } else {
                 self.load_into_current(path);
@@ -1543,12 +1591,44 @@ impl Editor {
     /// a search landing). The cursor-positioning tail shared by [`Editor::jump_to`]
     /// and [`Editor::jump_to_tab`].
     fn land_cursor(&mut self, line: usize, col: usize) {
+        // A located jump onto a buffer whose content is still pending (a deferred open):
+        // the buffer is empty, so clamping now would snap to the top and the read landing
+        // would reset it anyway. Record the target so the landing applies it once the
+        // lines are there (`settle_loaded_cursor`); also set a best-effort clamped cursor
+        // now so a synchronous reader sees something sane in the meantime.
+        let buf = self.cur_buffer();
+        if self.has_pending_open(buf) {
+            self.pending_open_cursor = Some((buf, line, col));
+        }
         let line = line.min(self.last_line());
         let byte = self.buffer().line_start(line) + col.min(self.buffer().line(line).len());
         self.set_cursor_char(byte);
         self.desired_col = self.cursor_virtcol();
         self.desired_eol = false;
         self.ensure_visible();
+    }
+
+    /// Settle the cursor after a deferred open's content lands in `buffer`: if a located
+    /// jump was waiting on it ([`pending_open_cursor`](Editor)), land on that target;
+    /// otherwise reset to the top (a plain `:edit` starts at line 1). A no-op unless
+    /// `buffer` is current (a background landing keeps its own saved position).
+    fn settle_loaded_cursor(&mut self, buffer: BufferId) {
+        if buffer != self.cur_buffer() {
+            return;
+        }
+        if let Some((b, line, col)) = self.pending_open_cursor {
+            if b == buffer {
+                self.pending_open_cursor = None;
+                self.cursor = Cursor::default();
+                self.top = 0;
+                self.leftcol = 0;
+                self.land_cursor(line, col);
+                return;
+            }
+        }
+        self.cursor = Cursor::default();
+        self.top = 0;
+        self.leftcol = 0;
     }
 
     /// Apply a batch of non-overlapping byte-range replacements as **one undo

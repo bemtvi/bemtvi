@@ -35,6 +35,16 @@ pub enum KeyCode {
     End,
     PageUp,
     PageDown,
+    /// A mouse **button** as a mappable key — vim's `<LeftMouse>` / `<2-LeftMouse>`
+    /// / `<RightMouse>` / `<MiddleMouse>`. `clicks` is the multi-click count (1 for
+    /// a single click, 2 for a double, …). These never reach `Editor::input` as
+    /// text — the server resolves a press against the keymaps (firing a bound
+    /// mapping or falling back to the default gesture) and only the *notation* round
+    /// trip touches the core. `button` is always one of `Left`/`Right`/`Middle`.
+    Mouse {
+        button: MouseButton,
+        clicks: u8,
+    },
 }
 
 impl Key {
@@ -269,6 +279,22 @@ pub fn key_to_notation(key: Key) -> String {
         KeyCode::End => (true, "End".to_string()),
         KeyCode::PageUp => (true, "PageUp".to_string()),
         KeyCode::PageDown => (true, "PageDown".to_string()),
+        KeyCode::Mouse { button, clicks } => {
+            let name = match button {
+                MouseButton::Left => "LeftMouse",
+                MouseButton::Right => "RightMouse",
+                MouseButton::Middle => "MiddleMouse",
+                // Only Left/Right/Middle are ever built into a Mouse key; the wheel /
+                // move / thumb buttons are gestures, not mappable keys.
+                _ => "LeftMouse",
+            };
+            // `<2-LeftMouse>` for a multi-click, `<LeftMouse>` for a single.
+            if clicks > 1 {
+                (true, format!("{clicks}-{name}"))
+            } else {
+                (true, name.to_string())
+            }
+        }
     };
     // A plain printable char with no ctrl/alt is bare (`f`, `F`, `5`); shift is
     // already baked into the character, so it adds no `S-` prefix.
@@ -292,6 +318,31 @@ pub fn key_to_notation(key: Key) -> String {
     s
 }
 
+/// Parse a mouse-button notation stem (after modifier prefixes were stripped) into
+/// its `(button, click-count)`: `"leftmouse"` → `(Left, 1)`, `"2-leftmouse"` →
+/// `(Left, 2)`, `"3-rightmouse"` → `(Right, 3)`. `None` for anything that isn't a
+/// `Left`/`Right`/`Middle` mouse name (so a non-mouse `<...>` falls through to the
+/// ordinary special-key table). The count is capped at 4 (vim escalates no further).
+fn parse_mouse_notation(rest: &str) -> Option<(MouseButton, u8)> {
+    let lower = rest.to_ascii_lowercase();
+    let (clicks, name): (u8, &str) = match lower.split_once('-') {
+        Some((n, name)) if !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()) => {
+            (n.parse().ok()?, name)
+        }
+        _ => (1, lower.as_str()),
+    };
+    if clicks == 0 || clicks > 4 {
+        return None;
+    }
+    let button = match name {
+        "leftmouse" => MouseButton::Left,
+        "rightmouse" => MouseButton::Right,
+        "middlemouse" => MouseButton::Middle,
+        _ => return None,
+    };
+    Some((button, clicks))
+}
+
 fn parse_special(inner: &str) -> Option<Key> {
     let mut ctrl = false;
     let mut shift = false;
@@ -312,6 +363,19 @@ fn parse_special(inner: &str) -> Option<Key> {
         } else {
             break;
         }
+    }
+
+    // A mouse-button notation (`LeftMouse`, `2-RightMouse`, …), after the generic
+    // modifier strip above has peeled any `C-`/`S-`/`A-`. The optional `N-` click
+    // count is handled here (the `2` of `2-LeftMouse` isn't a modifier, so the loop
+    // left it on `rest`).
+    if let Some((button, clicks)) = parse_mouse_notation(rest) {
+        return Some(Key {
+            code: KeyCode::Mouse { button, clicks },
+            ctrl,
+            alt,
+            shift,
+        });
     }
 
     let code = match rest.to_ascii_lowercase().as_str() {

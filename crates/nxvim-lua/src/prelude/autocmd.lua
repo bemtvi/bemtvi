@@ -323,6 +323,53 @@ function nx._fire(event, pattern, buf, file, data)
   return any
 end
 
+-- Fire a `*Cmd` autocmd (currently `BufReadCmd`) and return whether a handler
+-- **claimed** the action. The server uses BufReadCmd to let a plugin own a buffer's
+-- read (vim's "replace the read" hook — the file-explorer-as-plugin rides it): a
+-- claimed read skips the server's default load. Unlike `nx._fire` (which reports
+-- merely whether a handler *ran*), a `*Cmd` handler claims by **returning a truthy
+-- value** — so a `pattern = "*"` handler can decide per path (claim a directory,
+-- return nil for a regular file so the default read proceeds). `path` is the match /
+-- `<afile>`; `buf` is the (empty) buffer the handler fills; `isdir` is whether `path`
+-- is a directory (surfaced as `args.isdir`), the fs fact a `*Cmd` handler branches on
+-- without an async re-stat — the file explorer claims directories, declines files.
+function nx._fire_read_cmd(event, path, buf, isdir)
+  local claimed = false
+  local fired -- ids of `++once` autocmds to drop after this pass (nil = none)
+  for _, au in ipairs(nx._autocmds) do
+    local ev = au.event
+    local ev_ok = ev == event or (type(ev) == "table" and vim.tbl_contains(ev, event))
+    if
+      ev_ok
+      and au_pattern_matches(au.opts.pattern, path)
+      and (au.buffer == nil or au.buffer == buf)
+    then
+      local cb = au.opts.callback
+      local ret
+      if type(cb) == "function" then
+        ret = cb({ id = au.id, event = event, match = path, buf = buf, file = path, isdir = isdir })
+      elseif type(au.opts.command) == "string" then
+        -- A command-form `*Cmd` handler can't return a value; running it is the claim.
+        vim.cmd(au.opts.command)
+        ret = true
+      end
+      if ret then
+        claimed = true
+      end
+      if au.opts.once then
+        fired = fired or {}
+        fired[au.id] = true
+      end
+    end
+  end
+  if fired then
+    nx._autocmds = vim.tbl_filter(function(au)
+      return not fired[au.id]
+    end, nx._autocmds)
+  end
+  return claimed
+end
+
 -- The `FileChangedShell` round-trip the server's file-change reconcile drives
 -- (`docs/plans/2026-06-09-edit-host-and-browser-lua.md` → the watch leg). Set
 -- `v:fcs_reason` to `reason` and reset `v:fcs_choice` to "" (neovim's defaults

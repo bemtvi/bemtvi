@@ -37,7 +37,6 @@ mod cursor;
 mod decor;
 mod dock;
 mod ex;
-mod explorer;
 pub mod expr;
 mod float;
 mod fold;
@@ -78,7 +77,7 @@ pub use self::decor::DecorViewport;
 pub use self::menu::{
     Extent, MenuGeom, MenuItem, MenuMetrics, MenuPlacement, PreviewScroll, PreviewTarget, PromptPos,
 };
-pub use self::mouse::{ClickSurface, CompleteDocsHit, StatuslineClick};
+pub use self::mouse::{ClickSurface, CompleteDocsHit, MouseClick, StatuslineClick};
 pub(crate) use self::multicursor::PlacementSnapshot;
 // The off-tick save / open requests (the daemon / edit-host fs path, Phase 3e/3f).
 pub use self::buffers::{
@@ -893,6 +892,15 @@ pub struct Editor {
     /// after the gesture — recomputing that window's click regions and firing the
     /// handler whose span covers the column. See [`mouse`](crate::editor::mouse).
     pub statusline_clicks: Vec<StatuslineClick>,
+    /// Mouse-button presses awaiting the server's keymap resolution. A left-press
+    /// places the cursor (the `<LeftMouse>` default) and pushes a [`MouseClick`]
+    /// here; the server drains it after the gesture and either fires the
+    /// `<n-LeftMouse>` mapping bound in the current buffer or, when none is bound,
+    /// calls [`Editor::mouse_apply_default_select`] for the default word/line
+    /// escalation. The map-vs-default decision lives in the server because the
+    /// keymap engine does (design D1) — the core only records the click. See
+    /// [`mouse`](crate::editor::mouse).
+    pub mouse_clicks: Vec<mouse::MouseClick>,
     /// The native completion engine's configuration (`nx.complete.setup`).
     /// Disabled until a config arrives, so an editor with no completion config is
     /// byte-for-byte unchanged. See [`complete`](crate::editor::complete).
@@ -1246,6 +1254,14 @@ pub struct Editor {
     /// by default — local builds do buffer I/O synchronously. Set via
     /// [`Editor::set_host_fs_offtick`].
     host_fs_offtick: bool,
+    /// Whether a `BufReadCmd` autocmd handler is registered — the server mirrors this
+    /// from its `au_active_events` cache via [`Editor::set_bufreadcmd_active`]. When
+    /// set, a file open is **deferred** (enqueued like an off-tick read) instead of
+    /// read inline, so the server can fire `BufReadCmd` and let a Lua handler claim the
+    /// read before the default load runs (vim's "replace the read" hook — netrw rides
+    /// it). Off by default, so the common no-handler config reads files inline exactly
+    /// as before (zero behavior change). See [`Editor::should_defer_open`].
+    bufreadcmd_active: bool,
     /// Writes deferred this tick under off-tick mode, drained by the server with
     /// [`Editor::take_pending_saves`] (the save analogue of [`Editor::prompt_results`]
     /// / [`Editor::view_selects`]). Always empty when off-tick mode is off.
@@ -1258,6 +1274,14 @@ pub struct Editor {
     /// already-created (empty) buffer the server fills once the fetch lands. Always
     /// empty when off-tick mode is off.
     pending_opens: Vec<PendingOpen>,
+    /// A jump target `(buffer, line, byte-col)` waiting for a **deferred** open to land
+    /// — a located navigation (LSP go-to, a picker `<C-t>`/`<C-x>`, `:e +N`) onto a
+    /// buffer whose content hasn't been read yet (every local open now defers behind the
+    /// explorer's `BufReadCmd` handler; an off-tick open always does). [`land_cursor`]
+    /// records it instead of clamping the cursor onto the still-empty buffer; the read
+    /// landing ([`load_str_into`] / [`load_pending_open`]) applies it once the lines are
+    /// there, so the cursor lands on the located line rather than snapping to the top.
+    pending_open_cursor: Option<(BufferId, usize, usize)>,
     /// Buffers whose content was read from a file *in place* this tick — a local
     /// (synchronous) `:edit` that reused the throwaway `[No Name]` or re-read the
     /// current file (`:e` / `:e!`), keeping the same bufnr. Drained by the server
@@ -1396,25 +1420,24 @@ impl Editor {
     /// `docs/plans/2026-06-09-edit-host-and-browser-lua.md` → Phase 3). The
     /// default-fs [`Editor::open_or_named`] is just this with [`StdHostFs`].
     ///
-    /// Directory detection still goes through `std::path::Path::is_dir`; a remote
-    /// fs would need a type-bearing stat, which arrives with the daemon wire
-    /// protocol. For now only the file *read* / *write* crosses the seam — which
-    /// is the part that has to be backend-agnostic.
+    /// Directory detection goes through `std::path::Path::is_dir` (a *local* startup
+    /// arg; a remote/daemon startup directory is detected on the server's off-tick
+    /// fetch instead). A startup directory opens the file explorer — a pure-Lua plugin
+    /// (`prelude/explorer.lua`) — so it can't be filled at construction (the Lua VM /
+    /// `init.lua` aren't up yet): the buffer is left empty and named for the directory,
+    /// and the open is **enqueued** so the server fires `BufReadCmd` after `init.lua`
+    /// sources and the explorer claims it (the same deferral a runtime `:e dir` uses).
     pub fn open_or_named_with(path: impl Into<PathBuf>, fs: Rc<dyn HostFs>) -> Self {
         let path = path.into();
-        // A directory opens as the in-window file explorer (vim's netrw), not as
-        // text. An unreadable directory (no permission) still fails loud, the same
-        // way an unreadable file does below.
-        let mut editor = if path.is_dir() {
-            match Buffer::from_dir(&path, &*fs) {
-                Ok(buffer) => Editor::with_buffer(buffer),
-                Err(e) => {
-                    let mut editor = Editor::with_buffer(Buffer::named(path.clone()));
-                    editor.echo(format!("E484: Can't open file {}: {e}", path.display()));
-                    editor
-                }
-            }
-        } else {
+        if path.is_dir() {
+            let mut editor = Editor::with_buffer(Buffer::named(path.clone()));
+            editor.host_fs = fs;
+            let buf = editor.cur_buffer();
+            editor.enqueue_open(buf, path);
+            return editor;
+        }
+        // A file (or new file): read it now through `fs`. An unreadable file fails loud.
+        let mut editor =
             match Buffer::from_file(&path, &*fs, crate::encoding::DEFAULT_FILEENCODINGS) {
                 Ok(buffer) => Editor::with_buffer(buffer),
                 Err(e) => {
@@ -1422,16 +1445,8 @@ impl Editor {
                     editor.echo(format!("E484: Can't open file {}: {e}", path.display()));
                     editor
                 }
-            }
-        };
+            };
         editor.host_fs = fs;
-        // A startup directory opens straight into a listing buffer (above) rather than
-        // through `enter_dir`, so mark it `nxdir` here too — its `FileType nxdir`
-        // autocmd is what installs the explorer's buffer-local `<CR>`/`-` maps.
-        if editor.buffer().dir().is_some() {
-            let buf = editor.cur_buffer();
-            editor.set_filetype(buf, "nxdir");
-        }
         editor
     }
 
@@ -1498,6 +1513,7 @@ impl Editor {
             content_float: None,
             picker_query_changes: Vec::new(),
             statusline_clicks: Vec::new(),
+            mouse_clicks: Vec::new(),
             complete_config: complete::CompleteConfig::default(),
             complete_query_changes: Vec::new(),
             complete_gen: 0,
@@ -1570,9 +1586,11 @@ impl Editor {
             clipboard: None,
             host_fs: Rc::new(StdHostFs),
             host_fs_offtick: false,
+            bufreadcmd_active: false,
             pending_saves: Vec::new(),
             next_save_seq: 0,
             pending_opens: Vec::new(),
+            pending_open_cursor: None,
             loaded_in_place: Vec::new(),
             pending_quit_all: None,
             write_events: Vec::new(),

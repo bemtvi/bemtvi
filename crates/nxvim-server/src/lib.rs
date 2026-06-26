@@ -1259,6 +1259,12 @@ impl EditHost {
             Ok(mut ev) => {
                 ev.stamp_ms = self.clock_ms;
                 self.editor.mouse(ev);
+                // Resolve a mouse-button press against the keymaps (the same
+                // `<n-LeftMouse>` mapping path as the native dispatch — the "two mouse
+                // entry points need settle parity" rule), so a bound mouse map (e.g.
+                // the explorer's `<2-LeftMouse>`) fires in the fully-client web build
+                // too, before the gesture's effects are drained below.
+                self.resolve_mouse_clicks();
                 // Drain the effects the gesture can queue, exactly as the native
                 // dispatch path does: a picker / select confirm or cancel
                 // (`menu_results`), a completion accept's delegated edit
@@ -1561,13 +1567,13 @@ impl EditHost {
         self.run_pending();
     }
 
-    /// Apply a finished off-tick OPFS directory listing into `buffer` — the wasm analogue
-    /// of the native `apply_open`'s `FsRead::Dir` arm (Phase 3g over the wire). The Worker
-    /// enumerated OPFS directory `dir` and hands back its `entries`; this turns `buffer`
-    /// into the read-only file-explorer listing (netrw), so `:e <dir>` and descending /
+    /// Apply a finished off-tick OPFS directory landing into `buffer` — the wasm analogue
+    /// of the native `apply_open`'s `FsRead::Dir` arm. The Worker enumerated OPFS directory
+    /// `dir`; this fills the file-explorer listing from those `entries`
+    /// ([`load_dir_listing`](Self::load_dir_listing)), so `:e <dir>` and descending /
     /// going up navigate the browser's OPFS tree exactly as a daemon session navigates the
-    /// remote tree. The whole explorer (`enter_dir` / `explorer_open_entry`) is already
-    /// off-tick-aware in core; this is the only piece that was missing. Repaints after.
+    /// remote tree — the listing is the same shape the explorer plugin produces locally,
+    /// so its navigation and decor work over the wire. Repaints after.
     pub fn complete_fs_read_dir(
         &mut self,
         buffer: BufferId,
@@ -1581,30 +1587,8 @@ impl EditHost {
             self.redraw();
             return;
         }
-        self.load_dir_replica_wasm(buffer, dir, entries);
+        self.load_dir_listing(buffer, dir, entries);
         self.redraw();
-    }
-
-    /// Build the file-explorer listing of OPFS directory `dir` into `buffer` from the
-    /// off-tick enumeration — the directory analogue of [`load_replica_wasm`](Self::load_replica_wasm),
-    /// mirroring the native `load_dir_replica`: [`Editor::load_dir_into`](nxvim_core::Editor)
-    /// replaces the buffer with the listing (its `dir` marker routes keys to the explorer);
-    /// clearing `announced` lets the now-named buffer's `BufReadPost` fire. A directory has
-    /// no filetype, so no `FileType` work — just refresh the snapshot / mirror and drain.
-    fn load_dir_replica_wasm(
-        &mut self,
-        buffer: BufferId,
-        dir: String,
-        entries: Vec<nxvim_core::DirEntry>,
-    ) {
-        self.editor
-            .load_dir_into(buffer, PathBuf::from(&dir), entries);
-        self.announced.remove(&buffer);
-        self.fired_filetype.remove(&buffer);
-        let _ = self.lua.set_buf_snapshot(buffer.0, &dir, "");
-        self.push_buf_mirror();
-        self.emit_lifecycle_events();
-        self.run_pending();
     }
 
     /// Apply a finished off-tick OPFS **write** of `save`'s snapshot: `ok` gates the ack

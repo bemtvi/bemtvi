@@ -486,6 +486,20 @@ impl Keymaps {
             .unwrap_or_default()
     }
 
+    /// Look up a single **mouse-button key** (`<LeftMouse>` / `<2-LeftMouse>` / …) in
+    /// `scope`, returning the mapping bound to it, if any. A mouse key is always one
+    /// complete keystroke — never a live prefix the matcher would withhold (a click
+    /// must act now, not linger waiting for a disambiguating key) — so this is a
+    /// direct, read-only trie classify that bypasses the `pending` withhold/replay
+    /// machinery entirely. `None` (unmapped, or — degenerately — only a longer
+    /// sequence starts here) tells the caller to fall back to the default gesture.
+    pub fn lookup_mouse(&self, scope: MatchScope, key: Key) -> Option<Mapping> {
+        match self.tries.get(&scope.bucket())?.classify(&[key]) {
+            Classify::Complete(m) => Some(m),
+            Classify::Prefix | Classify::None => None,
+        }
+    }
+
     /// Feed one input key in `scope` and return the steps it produced. The server
     /// calls this for every parsed key, executing the steps in order. `scope` is the
     /// buffer's [`Mode`](MatchScope::Editing) for ordinary editing, or a grabbing

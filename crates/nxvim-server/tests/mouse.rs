@@ -326,6 +326,105 @@ async fn press_cancels_active_visual() {
 
 // ===== Phase 3: multi-click — double=word, triple=line ======================
 
+/// `<LeftMouse>` is a mappable key (the general mouse-mapping primitive): a single
+/// left press fires the map, after the cursor is placed at the click.
+#[tokio::test]
+async fn left_mouse_can_be_mapped_like_any_key() {
+    let (rpc, _incoming) = start("hello world\nsecond line\nthird").await;
+    command(&rpc, "set nonumber norelativenumber").await;
+    exec_lua(
+        &rpc,
+        r#"
+        _G.clicks = 0
+        _G.line_at_click = nil
+        nx.keymap.set('n', '<LeftMouse>', function()
+          _G.clicks = _G.clicks + 1
+          _G.line_at_click = vim.fn.line('.')
+        end)
+        return true
+    "#,
+    )
+    .await;
+    feed_mouse(&rpc, "left", "press", 1, 3); // row 1 → line 2
+    assert_eq!(exec_lua(&rpc, "return _G.clicks").await.as_u64(), Some(1));
+    assert_eq!(
+        exec_lua(&rpc, "return _G.line_at_click").await.as_u64(),
+        Some(2),
+        "the cursor was placed on the clicked line before the map fired"
+    );
+}
+
+/// A `<2-LeftMouse>` map fires on the double-click *instead of* the default word
+/// selection — the mapping suppresses the default gesture rather than both running.
+#[tokio::test]
+async fn double_click_fires_a_mapped_2leftmouse_and_suppresses_selection() {
+    let (rpc, clock, _incoming) = start_clocked("hello world\nsecond line\nthird").await;
+    command(&rpc, "set nonumber norelativenumber mousetime=500").await;
+    exec_lua(
+        &rpc,
+        r#"
+        _G.opened = 0
+        nx.keymap.set('n', '<2-LeftMouse>', function() _G.opened = _G.opened + 1 end)
+        return true
+    "#,
+    )
+    .await;
+    feed_mouse_at(&rpc, &clock, 0, "left", "press", 0, 7);
+    assert_eq!(mode(&rpc).await, "n", "the first press is a single click");
+    feed_mouse_at(&rpc, &clock, 100, "left", "press", 0, 7);
+    assert_eq!(exec_lua(&rpc, "return _G.opened").await.as_u64(), Some(1));
+    assert_eq!(
+        mode(&rpc).await,
+        "n",
+        "the mapped double-click did NOT also start a Visual word selection"
+    );
+}
+
+/// A buffer-local `<2-LeftMouse>` map fires only in the buffer it was set for; an
+/// unmapped buffer keeps the default word-select double-click.
+#[tokio::test]
+async fn a_buffer_local_mouse_map_is_scoped_to_its_buffer() {
+    let (rpc, clock, _incoming) = start_clocked("hello world\nsecond line").await;
+    command(&rpc, "set nonumber norelativenumber mousetime=500").await;
+    exec_lua(
+        &rpc,
+        r#"
+        _G.local_hits = 0
+        nx.keymap.set('n', '<2-LeftMouse>', function() _G.local_hits = _G.local_hits + 1 end,
+          { buffer = 0 })
+        return true
+    "#,
+    )
+    .await;
+    // In the mapped buffer the double-click fires the map (no Visual).
+    feed_mouse_at(&rpc, &clock, 0, "left", "press", 0, 7);
+    assert_eq!(mode(&rpc).await, "n");
+    feed_mouse_at(&rpc, &clock, 100, "left", "press", 0, 7);
+    assert_eq!(
+        exec_lua(&rpc, "return _G.local_hits").await.as_u64(),
+        Some(1)
+    );
+    assert_eq!(mode(&rpc).await, "n", "mapped buffer: no default selection");
+
+    // A different buffer (where the map doesn't apply): the double-click falls back
+    // to the default word selection.
+    let other = write_temp("mouse_other", "txt", "alpha beta gamma");
+    command(&rpc, &format!("edit {other}")).await;
+    feed_mouse_at(&rpc, &clock, 1000, "left", "press", 0, 7);
+    assert_eq!(mode(&rpc).await, "n");
+    feed_mouse_at(&rpc, &clock, 1100, "left", "press", 0, 7);
+    assert_eq!(
+        exec_lua(&rpc, "return _G.local_hits").await.as_u64(),
+        Some(1),
+        "the buffer-local map must not fire in another buffer"
+    );
+    assert_eq!(
+        mode(&rpc).await,
+        "v",
+        "the unmapped buffer keeps the default word-select double-click"
+    );
+}
+
 /// Two presses at the same cell within `'mousetime'` count as a double-click and
 /// select the word under the pointer (charwise Visual), like vim. `mousetime` is
 /// driven off the injected fake clock, so the two clicks are exactly 100 ms apart.

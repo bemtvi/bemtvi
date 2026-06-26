@@ -13,14 +13,18 @@
 -- float-widget spec). (The 1-based index is dropped from the promise; the
 -- `vim.ui.select` compat alias keeps the callback `(item, index)` shape.)
 --
+-- The menu opens NOSELECT (like the completion popup): nothing is highlighted
+-- until you move, so <CR> on a just-opened menu does nothing. The first j / k
+-- reveals the highlight at the first row; navigate from there.
 -- Navigate the open menu with:  j / k  (or  <C-n> / <C-p>,  arrows,  gg / G)
 -- Confirm with:  <CR>          Cancel with:  <Esc>  or  q
 
 --------------------------------------------------------------------------------
 -- 1. <leader>p — a plain string chooser.
 --    TYPE:  \p           A menu of three fruits floats under the cursor.
---    Move with j/k, press <CR>. The chosen fruit is echoed; the promise resolves
---    to nil on <Esc>, so you'll see the cancel branch fire.
+--    Move with j/k (the first press reveals the highlight), press <CR>. The chosen
+--    fruit is echoed; the promise resolves to nil on <Esc>, so you'll see the
+--    cancel branch fire.
 --------------------------------------------------------------------------------
 vim.g.mapleader = "\\"
 

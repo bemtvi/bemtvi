@@ -182,15 +182,16 @@ async fn chosen(rpc: &Rpc) -> Option<String> {
         .map(str::to_string)
 }
 
-/// The default select keys still navigate + confirm through the keymap engine:
-/// `j` moves down one (alpha -> beta), `<CR>` confirms.
+/// The default select keys still navigate + confirm through the keymap engine. The
+/// menu opens noselect, so the first `j` reveals the highlight at row 0 (alpha) and
+/// the second moves it to row 1 (beta); `<CR>` then confirms.
 #[tokio::test]
 async fn select_default_keys_navigate_and_confirm() {
     let dir = temp_dir("widget_keys_select_default");
     let (rpc, _incoming) = start(&dir, "").await;
     open_select(&rpc, "").await;
 
-    feed(&rpc, "j");
+    feed(&rpc, "jj");
     feed(&rpc, "<CR>");
     barrier(&rpc).await;
     assert_eq!(chosen(&rpc).await.as_deref(), Some("beta"));
@@ -241,7 +242,7 @@ async fn select_editing_map_does_not_leak() {
     )
     .await;
 
-    feed(&rpc, "j"); // select's next, NOT the normal-mode map
+    feed(&rpc, "jj"); // select's next (reveal row 0, then move to row 1), NOT the normal-mode map
     feed(&rpc, "<CR>");
     barrier(&rpc).await;
     assert_eq!(chosen(&rpc).await.as_deref(), Some("beta"));

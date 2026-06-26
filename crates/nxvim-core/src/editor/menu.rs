@@ -558,7 +558,11 @@ impl Editor {
             filtered: None,
             match_spans: Vec::new(),
             cursor: cursor.min(last),
-            selected_active: true,
+            // Open noselect, like the completion popup / wildmenu: nothing is
+            // highlighted until the user navigates, so `<CR>` on a just-opened menu
+            // does nothing rather than confirming a row no one picked. The first
+            // navigation activates the highlight (`apply_select_action`).
+            selected_active: false,
             placement,
             prompt: None,
             complete_prefix: String::new(),
@@ -1067,8 +1071,12 @@ impl Editor {
         self.message.clear();
         match action {
             "confirm" => {
+                // Only an *active* selection confirms. A noselect menu (nothing
+                // navigated to yet) resolves nothing and stays open — `<CR>` is inert
+                // until the user picks a row, like the completion popup / wildmenu.
                 let chosen = self.menu.as_ref().and_then(|m| {
-                    (m.cursor < m.view_len()).then(|| m.all_items[m.item_at(m.cursor)].key)
+                    (m.selected_active && m.cursor < m.view_len())
+                        .then(|| m.all_items[m.item_at(m.cursor)].key)
                 });
                 if let Some(key) = chosen {
                     self.menu_results.push(Some(key));
@@ -1088,13 +1096,20 @@ impl Editor {
             return Ok(());
         };
         let last = menu.view_len().saturating_sub(1);
+        // The first navigation on a noselect menu activates the highlight at the
+        // current row rather than moving past it; thereafter `next`/`prev` step it
+        // (clamped — the select list doesn't wrap). `first`/`last` always jump. An
+        // unknown action fails loud *before* touching the selection state.
+        let was_active = menu.selected_active;
         match action {
-            "next" => menu.cursor = (menu.cursor + 1).min(last),
-            "prev" => menu.cursor = menu.cursor.saturating_sub(1),
+            "next" if was_active => menu.cursor = (menu.cursor + 1).min(last),
+            "prev" if was_active => menu.cursor = menu.cursor.saturating_sub(1),
+            "next" | "prev" => {}
             "first" => menu.cursor = 0,
             "last" => menu.cursor = last,
             other => return Err(format!("unknown select action {other:?}")),
         }
+        menu.selected_active = true;
         Ok(())
     }
 

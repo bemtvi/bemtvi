@@ -79,8 +79,9 @@ async fn select_promise_resolves_with_chosen_item() {
     )
     .await;
 
-    // Move the highlight down one (alpha -> beta), then confirm.
-    feed(&rpc, "j");
+    // The menu opens noselect: the first `j` reveals the highlight at row 0 (alpha),
+    // a second `j` moves it to row 1 (beta). Then confirm.
+    feed(&rpc, "jj");
     feed(&rpc, "<CR>");
 
     assert_eq!(
@@ -90,6 +91,50 @@ async fn select_promise_resolves_with_chosen_item() {
     assert_eq!(
         exec_lua(&rpc, "return _G.item").await.as_str(),
         Some("beta")
+    );
+}
+
+/// A freshly-opened `nx.ui.select` is **noselect** (like the completion popup /
+/// wildmenu): with nothing highlighted, `<CR>` does nothing — the menu stays open
+/// and the promise is unresolved. Only after a navigation activates a row does
+/// `<CR>` confirm it.
+#[tokio::test]
+async fn cr_does_nothing_until_you_navigate() {
+    let dir = temp_dir("ui_select_noselect_cr");
+    let (rpc, mut incoming) = start(&dir, "").await;
+
+    exec_lua(
+        &rpc,
+        "_G.item, _G.called = 'unset', false
+         nx.ui.select({ 'alpha', 'beta', 'gamma' }, {})
+           :next(function(it) _G.item, _G.called = it, true end)",
+    )
+    .await;
+    let menu = menu_of(&poll_menu(&rpc, &mut incoming).await.expect("select opens"));
+    assert_eq!(
+        map_get(&menu, "selected_active").and_then(Value::as_bool),
+        Some(false),
+        "a fresh select opens noselect — nothing highlighted"
+    );
+
+    // <CR> with nothing selected is inert: the menu stays open, nothing resolves.
+    feed(&rpc, "<CR>");
+    assert_eq!(
+        exec_lua(&rpc, "return _G.called").await,
+        Value::Boolean(false),
+        "<CR> on a noselect select does not resolve the chooser"
+    );
+
+    // Navigate to activate the highlight (row 0), then <CR> confirms it.
+    feed(&rpc, "j");
+    feed(&rpc, "<CR>");
+    assert_eq!(
+        exec_lua(&rpc, "return _G.called").await,
+        Value::Boolean(true)
+    );
+    assert_eq!(
+        exec_lua(&rpc, "return _G.item").await.as_str(),
+        Some("alpha")
     );
 }
 
@@ -109,7 +154,8 @@ async fn vim_ui_select_callback_keeps_item_and_one_based_index() {
     )
     .await;
 
-    feed(&rpc, "j");
+    // Noselect: first `j` reveals row 0, second moves to row 1 (beta, 1-based idx 2).
+    feed(&rpc, "jj");
     feed(&rpc, "<CR>");
 
     assert_eq!(
@@ -221,9 +267,26 @@ async fn menu_surface_projects_items_and_tracks_selection() {
         other => panic!("expected items array, got {other:?}"),
     };
     assert_eq!(items, vec!["one", "two", "three"]);
+    // Opens noselect: the cursor field reports row 0, but nothing is highlighted yet.
     assert_eq!(map_get(&menu, "selected").and_then(Value::as_u64), Some(0));
+    assert_eq!(
+        map_get(&menu, "selected_active").and_then(Value::as_bool),
+        Some(false),
+    );
 
-    // Moving the highlight tracks on the surface.
+    // The first `j` activates the highlight at row 0 (without moving past it).
+    feed(&rpc, "j");
+    let map = poll_menu(&rpc, &mut incoming)
+        .await
+        .expect("a menu redraw surface after activating");
+    let menu = menu_of(&map);
+    assert_eq!(map_get(&menu, "selected").and_then(Value::as_u64), Some(0));
+    assert_eq!(
+        map_get(&menu, "selected_active").and_then(Value::as_bool),
+        Some(true),
+    );
+
+    // A second `j` then moves the highlight to row 1.
     feed(&rpc, "j");
     let map = poll_menu(&rpc, &mut incoming)
         .await

@@ -1157,13 +1157,6 @@ pub fn default_shada() -> Box<dyn ShadaStore + Send> {
     Box::new(RedbFileStore::new(shada_dir()))
 }
 
-/// The environment variable the binary stamps with the active shada namespace (from
-/// `--shada-namespace`). The Lua side reads it back through `nx.shada.namespace()`, so a
-/// plugin can tell whether *this* launch is the namespace it expected (and, if not,
-/// relaunch). Read-only from Lua — nxvim itself never reads a project file; the namespace
-/// is always supplied on the command line.
-pub const SHADA_NAMESPACE_ENV: &str = "NXVIM_SHADA_NAMESPACE";
-
 /// A namespace becomes a single path component under `shada_dir()/ns/`, so it must be a
 /// safe, traversal-free token. Accept only `[A-Za-z0-9_-]` (a v4 UUID and friends),
 /// bounded in length; anything else is rejected. This guards the `--shada-namespace`
@@ -1180,6 +1173,28 @@ pub fn valid_namespace(ns: &str) -> Option<String> {
     } else {
         None
     }
+}
+
+/// Derive a stable shada namespace from a workspace directory (the `--workspace` flag):
+/// the **complete** absolute path with every character outside `[A-Za-z0-9_]` — path
+/// separators included — folded to `-`, so `/home/ada/proj` becomes `-home-ada-proj`. The
+/// mapping is lossy-but-reversible-by-eye and never truncated or hashed: the namespace dir
+/// (`ns/<this>`) reads as the path it came from, so a user who *moves* a project can simply
+/// rename that directory to the new path's folded form and the session follows. The result
+/// is a single, traversal-free path component (no `/` or `.` survive the fold), though a
+/// very deep path can exceed the filesystem's per-component limit — an acceptable trade for
+/// portability, and it fails loud at store creation rather than silently colliding.
+pub fn workspace_namespace(dir: &Path) -> String {
+    dir.to_string_lossy()
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '_' {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect()
 }
 
 /// The store for the native binary, honoring an optional shada `namespace` (the
@@ -1214,18 +1229,21 @@ pub fn is_store_file(path: &Path) -> bool {
 // on the daemon. The staged local redb *is* the on-remote artifact — only whole-file bytes
 // cross the wire, and the daemon runs no shada logic.
 //
-// **Per-instance mirror.** The remote shada lives in a directory
-// `<state_dir>/remote[/ns/<NS>]/` holding the same `<pid>.<nanos>.<seq>.redb` per-instance
+// **Per-instance mirror.** The remote shada lives in a directory (`<state_dir>/ns/<NS>/` for
+// a namespaced session, `<state_dir>/remote/` for a global one — see [`remote_shada_dir`])
+// holding the same `<pid>.<nanos>.<seq>.redb` per-instance
 // files as the local store — so the merge + carry-forward compaction model ports verbatim:
 // every session downloads + merges all siblings, uploads its own file, and at clean exit
 // removes the siblings it absorbed (`fs_remove`), keeping the remote dir bounded by live
 // sessions rather than total launches. Two concurrent remote sessions on the same workspace
 // each see the other's data (recency merge); cross-machine liveness can't be detected, so a
 // live sibling may be transiently removed and re-uploaded — harmless, like the local model's
-// crash-redundancy. `--shada-namespace` isolates a project's remote shada under `ns/<NS>/`,
-// mirroring the local layout. The dir is a sibling of (not inside) the daemon's own native
-// `shada_dir()`, and `read_dir` is non-recursive, so a daemon that also runs nxvim natively
-// never globs these as its own store files.
+// crash-redundancy. A namespaced session (`--workspace` / `--shada-namespace`) targets the
+// daemon's *native* `<state_dir>/ns/<NS>/` — the SAME store a local editor on the daemon
+// machine uses for that namespace — so the two share one per-project shada (the per-instance
+// files merge as concurrent siblings). Only the anonymous *global* remote session stays under a
+// `remote/` sibling, isolated from the daemon's own local global shada; `read_dir` is
+// non-recursive, so the daemon's global `*.redb` is never globbed by a namespaced `ns/<NS>`.
 
 /// The on-remote shada wiring for a `Remote`-config session: the daemon-side **directory**
 /// the staged store mirrors to, plus the sibling files downloaded at connect (so the
@@ -1234,23 +1252,35 @@ pub fn is_store_file(path: &Path) -> bool {
 /// own [`current_path`](ShadaStore::current_path) file here after each flush.
 #[cfg(feature = "native")]
 pub struct RemoteShada {
-    /// The remote shada directory on the daemon (`<state_dir>/remote[/ns/<NS>]`).
+    /// The remote shada directory on the daemon: `<state_dir>/ns/<NS>` for a namespaced
+    /// (workspace) session — the daemon's native per-namespace store, shared with a local
+    /// editor on that host — or `<state_dir>/remote` for an anonymous global session.
     pub remote_dir: String,
     /// The sibling store filenames downloaded + absorbed at connect, deleted on the daemon
     /// at clean-exit compaction (mirroring the local store's sibling deletion).
     pub downloaded: Vec<String>,
 }
 
-/// The remote shada directory for `state_dir` + an optional `--shada-namespace`:
-/// `<state_dir>/remote` (global) or `<state_dir>/remote/ns/<NS>` (namespaced). A sibling of
-/// the daemon's native `shada_dir()` (= `state_dir`) and its `ns/<NS>` subdir, so the two
-/// never collide.
+/// The remote shada directory for `state_dir` (= the daemon's native `shada_dir()`) + an
+/// optional namespace.
+///
+/// A **namespaced** session (a `--workspace` or `--shada-namespace` identity) writes to the
+/// daemon's *native* per-namespace store, `<state_dir>/ns/<NS>` — exactly where a local
+/// editor running **on the daemon machine** with the same namespace keeps it. So a remote
+/// daemon workspace and a native session on that host share one shada: editing
+/// `/srv/proj` over the daemon and SSH-ing in to edit it locally see the same
+/// marks/registers/session. (The per-instance `.redb` + merge/compaction model makes the
+/// two sets of files coexist safely, like any two concurrent sessions.)
+///
+/// An **anonymous** (global, no-namespace) remote session instead stays isolated under
+/// `<state_dir>/remote`, so a generic remote-editing session never merges into — or
+/// clobbers — the daemon machine's own local global shada.
 #[cfg(feature = "native")]
 fn remote_shada_dir(state_dir: &str, namespace: Option<&str>) -> String {
-    let base = format!("{}/remote", state_dir.trim_end_matches('/'));
+    let base = state_dir.trim_end_matches('/');
     match namespace {
         Some(ns) => format!("{base}/ns/{ns}"),
-        None => base,
+        None => format!("{base}/remote"),
     }
 }
 

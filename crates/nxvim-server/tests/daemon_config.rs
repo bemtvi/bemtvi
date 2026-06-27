@@ -646,10 +646,11 @@ async fn remote_shada_compacts_and_merges_across_sessions() {
     }
 }
 
-/// Phase 3: `--shada-namespace` isolates a project's shada on the daemon under its own
-/// `remote/ns/<NS>/` dir. A register set in namespace `proj-a` is invisible in `proj-b`,
-/// and reconnecting `proj-a` restores it — two projects on the same daemon never share
-/// marks/registers.
+/// Phase 3: a namespace isolates a project's shada on the daemon under the daemon's *native*
+/// `ns/<NS>/` dir — the SAME store a local editor on the daemon machine uses for that
+/// namespace, so the two share it (a remote daemon workspace == an on-host session). A
+/// register set in namespace `proj-a` is invisible in `proj-b`, and reconnecting `proj-a`
+/// restores it — two projects on the same daemon never share marks/registers.
 #[tokio::test]
 async fn remote_shada_namespace_isolates_projects() {
     let _g = serial_lock().lock().await;
@@ -659,7 +660,9 @@ async fn remote_shada_namespace_isolates_projects() {
     let _c = EnvGuard::set("NXVIM_CONFIG", Some(&temp_dir("remote_shada_ns_cfg")));
     let _r = EnvGuard::set("NXVIM_RUNTIMEPATH", None);
     let _d = EnvGuard::set("NXVIM_DATA_DIR", Some(&temp_dir("remote_shada_ns_data")));
-    let remote = state.join("nxvim/shada/remote");
+    // A namespaced remote session lands in the daemon's native `shada/ns/<NS>`, NOT under a
+    // `remote/` sibling — that is what lets a local editor on the host share it.
+    let ns_base = state.join("nxvim/shada/ns");
 
     // proj-a: store "alpha" in register `a`.
     {
@@ -686,9 +689,14 @@ async fn remote_shada_namespace_isolates_projects() {
         drain_until_exit(incoming).await;
     }
 
-    // Each namespace has its own store dir on the daemon.
-    assert_eq!(store_files_in(&remote.join("ns/proj-a")).len(), 1);
-    assert_eq!(store_files_in(&remote.join("ns/proj-b")).len(), 1);
+    // Each namespace has its own store dir on the daemon's native shada (shared with a
+    // local on-host editor using the same namespace), not under a `remote/` sibling.
+    assert_eq!(store_files_in(&ns_base.join("proj-a")).len(), 1);
+    assert_eq!(store_files_in(&ns_base.join("proj-b")).len(), 1);
+    assert!(
+        !state.join("nxvim/shada/remote").exists(),
+        "a namespaced remote session must not use the isolated remote/ subdir"
+    );
 
     // Reconnect proj-a: register `a` ("alpha") is back, and `b` (proj-b's) is absent.
     {

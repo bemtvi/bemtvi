@@ -741,6 +741,16 @@ pub(crate) struct Shared {
     /// `'relative_docks'` options, read straight off the editor at capture — not
     /// mirrored here, so layout sizing isn't coupled to this plugin opt-in.
     pub(crate) session_save_layout: bool,
+    /// The shada namespace this launch is scoped to (the `--shada-namespace` value, or a
+    /// `--workspace`-derived token), surfaced read-only to Lua via `nx.shada.namespace()`.
+    /// Seeded by the server from [`ServerInit`](nxvim_server) before any config runs — a
+    /// *daemon* session derives it from the daemon's cwd, which the binary can't know up
+    /// front, so this is a runtime value, not an env var. `None` = the global store.
+    pub(crate) shada_namespace: Option<String>,
+    /// The absolute workspace root for a `--workspace` launch (the daemon's directory for a
+    /// remote session), surfaced via `nx.workspace.dir()` / `nx.workspace.active()`. `None`
+    /// outside a workspace launch. Seeded alongside [`shada_namespace`](Self::shada_namespace).
+    pub(crate) workspace_dir: Option<String>,
     /// Per-plugin isolated shada data: `namespace -> (key -> value)`, where each
     /// value is the plugin's serialized blob (JSON, from `nx.shada.plugin`). The
     /// live home of an opted-in plugin's cross-session store: the `nx._shada_plugin_*`
@@ -1560,6 +1570,24 @@ impl LuaRuntime {
     /// layout (`nx.shada.save_layout`). The server gates session capture on it.
     pub fn session_save_layout(&self) -> bool {
         self.shared.borrow().session_save_layout
+    }
+
+    /// Seed the layout-capture opt-in from the binary, before any config runs. The
+    /// `--workspace` flag uses it so a directory session captures its layout without a
+    /// plugin calling `nx.shada.save_layout`; the config may still toggle it afterwards.
+    pub fn set_session_save_layout(&self, on: bool) {
+        self.shared.borrow_mut().session_save_layout = on;
+    }
+
+    /// Seed the shada namespace + workspace root surfaced to Lua (`nx.shada.namespace()` /
+    /// `nx.workspace.dir()` / `nx.workspace.active()`), before any config runs. The binary
+    /// fills these from the CLI for a local session and from the daemon's cwd for a remote
+    /// one — a runtime value precisely because a daemon session can't know the remote dir
+    /// until after it connects (so env-stamping in the binary wouldn't see it).
+    pub fn set_workspace_identity(&self, namespace: Option<String>, workspace_dir: Option<String>) {
+        let mut s = self.shared.borrow_mut();
+        s.shada_namespace = namespace;
+        s.workspace_dir = workspace_dir;
     }
 
     /// Harvest the opted-in plugins' isolated shada data as `(namespace, [(key,

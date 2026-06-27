@@ -142,6 +142,53 @@ async fn capture_requires_the_plugin_opt_in() {
 }
 
 #[tokio::test]
+async fn workspace_flag_captures_without_a_plugin_opt_in() {
+    // The `--workspace` flag seeds `session_save_layout` ON natively (no plugin / config
+    // call), so a directory session captures and restores its layout out of the box. This
+    // is the inverse of `capture_requires_the_plugin_opt_in`: identical flow, but the
+    // layout DOES come back because the binary opted in for us.
+    let dir = temp_dir("session_ws_store");
+    let file_a = write_temp("session_ws_a", "txt", "a1\na2\n");
+    let file_b = write_temp("session_ws_b", "txt", "b1\nb2\n");
+
+    // The init a `--workspace` launch builds: capture + restore + the native opt-in, and
+    // NEVER calling `nx.shada.save_layout`.
+    let ws_init = |file: Option<String>| ServerInit {
+        file,
+        shada: Some(Box::new(RedbFileStore::new(dir.to_path_buf()))),
+        workspace_session: true,
+        restore_session: true,
+        session_save_layout: true,
+        ..Default::default()
+    };
+
+    {
+        let (rpc, incoming) = start_attached(ws_init(Some(file_a.clone())), 80, 25).await;
+        feed(&rpc, &format!(":vsplit {file_b}<CR>"));
+        assert_eq!(window_count(&rpc).await, 2);
+        // Confirm the native seed reached the runtime — no plugin call was made.
+        assert_eq!(
+            exec_lua(&rpc, "return nx.shada.namespace() == nil")
+                .await
+                .as_bool(),
+            Some(true),
+            "this bare init has no namespace env, yet capture is on via session_save_layout",
+        );
+        feed(&rpc, ":qa<CR>");
+        await_server_exit(incoming).await;
+    }
+
+    {
+        let (rpc, _incoming) = start_attached(ws_init(None), 80, 25).await;
+        assert_eq!(
+            window_count(&rpc).await,
+            2,
+            "the --workspace session captured + restored the split with no opt-in call",
+        );
+    }
+}
+
+#[tokio::test]
 async fn relative_split_sizes_scale_to_the_terminal_width() {
     let dir = temp_dir("session_relsize_store");
     let file_a = write_temp("session_rel_a", "txt", "a1\na2\n");

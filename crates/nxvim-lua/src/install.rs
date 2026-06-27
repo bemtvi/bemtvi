@@ -996,20 +996,19 @@ pub(crate) fn install_runtime_api(
     let shada_tbl = lua.create_table()?;
 
     // `nx.shada.namespace()` -> the shada namespace this launch is scoped to (the
-    // `--shada-namespace` value), isolating its marks / registers / session under
-    // `ns/<id>/`, or `nil` for the global store. READ-ONLY: stamped into the environment
-    // by the binary before any Lua runs, so it reports the namespace THIS process was
-    // launched with (which a project file read from Lua can't, since the store is fixed
-    // first). A plugin compares it against its own config to detect a mismatch.
-    shada_tbl.set(
-        "namespace",
-        lua.create_function(|_, ()| {
-            Ok(match std::env::var("NXVIM_SHADA_NAMESPACE") {
-                Ok(s) if !s.is_empty() => Some(s),
-                _ => None,
-            })
-        })?,
-    )?;
+    // `--shada-namespace` value, or a `--workspace`-derived token), isolating its marks /
+    // registers / session under `ns/<id>/`, or `nil` for the global store. READ-ONLY:
+    // seeded by the server from the binary before any Lua runs, so it reports the namespace
+    // THIS process was launched with (which a project file read from Lua can't, since the
+    // store is fixed first). For a *daemon* session it is the namespace derived from the
+    // daemon's cwd. A plugin compares it against its own config to detect a mismatch.
+    {
+        let sh = shared.clone();
+        shada_tbl.set(
+            "namespace",
+            lua.create_function(move |_, ()| Ok(sh.borrow().shada_namespace.clone()))?,
+        )?;
+    }
 
     // `nx.shada.save_layout(enable)` -> opt this session into CAPTURING the window/tab
     // layout (the exact split tree, open files, cursors, docks) into the shada,
@@ -1030,6 +1029,35 @@ pub(crate) fn install_runtime_api(
         )?;
     }
     nx.set("shada", shada_tbl)?;
+
+    // ----- nx.workspace: the active `--workspace` directory session (public API) -----
+    //
+    // When the binary is launched with `--workspace [dir]` it seeds the absolute workspace
+    // root (and derives the shada namespace from it); these read it back so a plugin can
+    // tell it is running inside a workspace and where the root is. READ-ONLY, like
+    // `nx.shada.namespace()` — nxvim chooses the workspace from the command line, not from
+    // Lua. For a *daemon* session the root is the daemon's directory (the workspace lives on
+    // the remote machine). `nil`/`false` outside a `--workspace` launch.
+    let workspace_tbl = lua.create_table()?;
+
+    // `nx.workspace.dir()` -> the absolute workspace root, or `nil` outside a workspace.
+    {
+        let sh = shared.clone();
+        workspace_tbl.set(
+            "dir",
+            lua.create_function(move |_, ()| Ok(sh.borrow().workspace_dir.clone()))?,
+        )?;
+    }
+
+    // `nx.workspace.active()` -> whether this launch is a `--workspace` directory session.
+    {
+        let sh = shared.clone();
+        workspace_tbl.set(
+            "active",
+            lua.create_function(move |_, ()| Ok(sh.borrow().workspace_dir.is_some()))?,
+        )?;
+    }
+    nx.set("workspace", workspace_tbl)?;
 
     // ----- nx.shada.plugin: opt-in, isolated per-plugin shada storage -------------
     //

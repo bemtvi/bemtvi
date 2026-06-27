@@ -101,7 +101,7 @@ pub use nxvim_core::{
 #[cfg(feature = "native")]
 pub use shada::{
     default_shada, is_store_file, prepare_remote_shada, resolve_session_shada, shada_dir,
-    valid_namespace, workspace_shada, RedbFileStore, RemoteShada, ShadaStore, SHADA_NAMESPACE_ENV,
+    valid_namespace, workspace_namespace, workspace_shada, RedbFileStore, RemoteShada, ShadaStore,
 };
 
 /// The daemon wire protocol for the edit-host split: the daemon-side servers
@@ -215,6 +215,22 @@ pub struct ServerInit {
     /// namespace), so a plain `--shada-namespace` launch isolates marks/registers without
     /// rearranging your windows. Default `false`.
     pub restore_session: bool,
+    /// Seed the layout-capture opt-in (`nx.shada.save_layout`) on at startup, before any
+    /// config runs. The `--workspace` flag sets it so a directory session captures its
+    /// window/tab layout *without* needing a plugin to opt in; a plain `--shada-namespace`
+    /// launch leaves it `false` (the plugin decides). A config may still toggle it via
+    /// `nx.shada.save_layout`. Only meaningful together with [`workspace_session`].
+    pub session_save_layout: bool,
+    /// The shada namespace surfaced to Lua via `nx.shada.namespace()` (the `--shada-namespace`
+    /// value, or a `--workspace`-derived token). Seeded into the runtime before config runs.
+    /// For a daemon workspace this is derived from the *daemon's* cwd post-connect. `None` =
+    /// the global store / not scoped. Independent of where the shada store physically lives.
+    pub shada_namespace: Option<String>,
+    /// The absolute workspace root surfaced via `nx.workspace` (`None` outside `--workspace`).
+    /// The daemon's directory for a remote session. Seeded alongside [`shada_namespace`].
+    ///
+    /// [`shada_namespace`]: Self::shada_namespace
+    pub workspace_dir: Option<String>,
     /// For a `Remote`-config daemon session: the on-daemon shada file the staged local
     /// [`shada`](Self::shada) store syncs to (Approach A — see [`prepare_remote_shada`]).
     /// `None` (the default) keeps shada purely local. When set, the edit-host uploads the
@@ -459,7 +475,8 @@ pub(crate) fn collect_config_bundle(include_files: bool) -> std::io::Result<Conf
     // The daemon's shada base dir, reported in every bundle so a `Remote`-config session
     // can stage + sync its shada under it (the daemon runs no shada logic itself — only
     // whole files cross the wire; the session's `fs_mkdir` creates the actual
-    // `remote[/ns/<NS>]` dir before its first upload). Cheap, so the lite fetch carries it.
+    // `ns/<NS>` (namespaced) or `remote` (global) dir before its first upload). Cheap, so the
+    // lite fetch carries it.
     let state_dir = shada_dir();
     // A **local-config** session (`ConfigSource::Local`) fetches only the cheap metadata
     // — the daemon's cwd and its tree-sitter parser set — and runs the *client's* own
@@ -2504,6 +2521,17 @@ where
         .collect();
     lua.set_options_catalog(&option_rows)
         .map_err(|e| anyhow::anyhow!("option catalog init failed: {e}"))?;
+    // Seed the layout-capture opt-in before any config runs. `--workspace` turns it on so
+    // a directory session captures its window/tab layout without needing a plugin to call
+    // `nx.shada.save_layout`; a plain `--shada-namespace` launch leaves it off (the config
+    // / a plugin decides). A config may still toggle it afterwards either way.
+    if init.session_save_layout {
+        lua.set_session_save_layout(true);
+    }
+    // Seed the shada namespace + workspace root that `nx.shada.namespace()` / `nx.workspace`
+    // report. These are runtime values (not env) because a daemon session derives them from
+    // the daemon's cwd after it connects — the binary can't stamp them up front.
+    lua.set_workspace_identity(init.shada_namespace.clone(), init.workspace_dir.clone());
     // Where the event-loop actor runs off-tick `nx.fs` ops (the ONLY fs surface — there
     // are no synchronous editor-thread fs callers anymore). A bare/local session runs
     // them against a local `StdLuaFs` on the actor's blocking pool; the edit-host split

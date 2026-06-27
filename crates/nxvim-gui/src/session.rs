@@ -326,6 +326,10 @@ async fn server_init(
         // store and never captures/restores the editor session (v1: TUI only).
         workspace_session: false,
         restore_session: false,
+        session_save_layout: false,
+        // The GUI front end is TUI-parity minus sessions (v1) — no workspace identity.
+        shada_namespace: None,
+        workspace_dir: None,
         runtimepath,
         clipboard: ClipboardProvider::System,
         mouse_clock: None,

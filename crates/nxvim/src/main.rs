@@ -43,45 +43,78 @@ use nxvim_server::{
     run_daemon_io as run_server_daemon_io, serve_quic, ConfigSource, DaemonClient, ServerInit,
 };
 
-/// The shada-namespace options derived from the command line. nxvim itself never reads
-/// a project file — the namespace is always supplied via `--shada-namespace` (a
-/// workspace plugin's wrapper script relaunches with it). `restore` mirrors
-/// `--restore-session`. Moved onto the server thread, so it is `Send` (plain data).
+/// The shada-namespace + workspace options derived from the command line. The namespace
+/// comes from `--shada-namespace` or is derived from a `--workspace` directory; the
+/// identity (namespace + root) is surfaced to Lua (`nx.shada.namespace()` / `nx.workspace`)
+/// by seeding the runtime, *not* an env var — a daemon session derives both from the
+/// daemon's cwd after it connects (which the binary can't know up front). Plain `Send` data
+/// moved onto the server thread.
 #[derive(Clone, Default)]
 struct ShadaOpts {
     namespace: Option<String>,
     restore: bool,
+    /// True when launched as a `--workspace` directory session. It forces session capture
+    /// (no plugin opt-in needed) and restore, and exposes the root via `nx.workspace`. The
+    /// shada namespace itself is *not* special: it is the directory-derived value passed
+    /// straight through the `--shada-namespace` machinery (an explicit one overrides it).
+    workspace: bool,
+    /// The absolute workspace root for a local `--workspace` launch. `None` for a non-
+    /// workspace launch *and* for a `--workspace` daemon launch, whose root is the daemon's
+    /// cwd — resolved post-connect by [`ShadaOpts::resolve_remote_workspace`].
+    workspace_dir: Option<String>,
 }
 
 impl ShadaOpts {
-    /// Build from the parsed CLI, validating the namespace token and stamping it into
-    /// [`nxvim_server::WORKSPACE_NS_ENV`] so `nx._workspace_namespace()` reads it back.
-    /// Called once in `main`, before any server thread is spawned (no concurrent env
-    /// reader). An invalid namespace aborts — the wrapper supplied a bad value.
-    fn from_cli(cli: &Cli) -> Result<Self> {
+    /// Build from the parsed CLI, validating the explicit namespace token. `workspace_dir`
+    /// is `Some` only for a *local* `--workspace` launch (the resolved absolute directory);
+    /// a daemon `--workspace` passes `None` here and resolves its root + namespace later
+    /// from the daemon's cwd ([`resolve_remote_workspace`]). An explicit `--shada-namespace`
+    /// always wins over the derived one. An invalid explicit namespace aborts.
+    ///
+    /// [`resolve_remote_workspace`]: Self::resolve_remote_workspace
+    fn from_cli(cli: &Cli, workspace_dir: Option<&std::path::Path>) -> Result<Self> {
+        // An explicit `--shada-namespace` always wins; otherwise a *local* `--workspace`
+        // derives one from the directory (the same `ns/<token>` store, no special-casing).
         let namespace =
             match cli.shada_namespace.as_deref() {
                 Some(raw) => Some(nxvim_server::valid_namespace(raw).ok_or_else(|| {
                     anyhow!("invalid --shada-namespace {raw:?} (use [A-Za-z0-9_-])")
                 })?),
-                None => None,
+                None => workspace_dir.map(nxvim_server::workspace_namespace),
             };
-        std::env::set_var(
-            nxvim_server::SHADA_NAMESPACE_ENV,
-            namespace.as_deref().unwrap_or(""),
-        );
         Ok(ShadaOpts {
             namespace,
-            restore: cli.restore_session,
+            // `--workspace` implies restore; otherwise honor the explicit flag.
+            restore: cli.restore_session || cli.workspace,
+            workspace: cli.workspace,
+            workspace_dir: workspace_dir.map(|d| d.to_string_lossy().into_owned()),
         })
+    }
+
+    /// Resolve a `--workspace` daemon session's identity from the daemon's `remote_cwd`
+    /// (the workspace lives on the remote machine, so its namespace must derive from the
+    /// remote path). A no-op unless this is a workspace launch; an explicit
+    /// `--shada-namespace` is preserved, only the root is filled. Called inside the edit-
+    /// host session once the daemon's cwd is known.
+    fn resolve_remote_workspace(&mut self, remote_cwd: Option<&std::path::Path>) {
+        if !self.workspace {
+            return;
+        }
+        let Some(cwd) = remote_cwd else { return };
+        if self.namespace.is_none() {
+            self.namespace = Some(nxvim_server::workspace_namespace(cwd));
+        }
+        if self.workspace_dir.is_none() {
+            self.workspace_dir = Some(cwd.to_string_lossy().into_owned());
+        }
     }
 
     fn store(&self) -> Box<dyn nxvim_server::ShadaStore + Send> {
         nxvim_server::workspace_shada(self.namespace.as_deref())
     }
 
-    /// The `--shada-namespace` value, so a `Remote`-config session isolates its on-daemon
-    /// shada under `ns/<NS>/` the same way the local store does.
+    /// The shada namespace, so a `Remote`-config session isolates its on-daemon shada under
+    /// `ns/<NS>/` the same way the local store does.
     fn namespace(&self) -> Option<&str> {
         self.namespace.as_deref()
     }
@@ -95,6 +128,32 @@ impl ShadaOpts {
     fn do_restore(&self) -> bool {
         self.namespace.is_some() && self.restore
     }
+
+    /// Seed the layout-capture opt-in (`nx.shada.save_layout`) on at boot. Only a
+    /// `--workspace` launch does this — a plain `--shada-namespace` leaves capture to a
+    /// plugin / the config, preserving the existing behavior.
+    fn session_save_layout(&self) -> bool {
+        self.workspace
+    }
+
+    /// The (owned) shada namespace + workspace root surfaced to Lua via the runtime seed.
+    fn workspace_identity(&self) -> (Option<String>, Option<String>) {
+        (self.namespace.clone(), self.workspace_dir.clone())
+    }
+}
+
+/// Resolve the `--workspace` directory: the positional TARGET, or the cwd when none was
+/// given, canonicalized to an absolute path. It MUST be an existing directory — a
+/// `--workspace` session is a directory session (`nxvim --workspace .`); pointing it at a
+/// file or a missing path is a loud error, not a silent fall-through. Used for a *local*
+/// session; a daemon session resolves its root from the daemon's cwd instead.
+fn resolve_workspace_dir(target: Option<&str>) -> Result<PathBuf> {
+    let raw = target.unwrap_or(".");
+    let abs = std::fs::canonicalize(raw).map_err(|e| anyhow!("--workspace {raw:?}: {e}"))?;
+    if !abs.is_dir() {
+        bail!("--workspace requires a directory, but {raw:?} is not one");
+    }
+    Ok(abs)
 }
 
 /// Env var carrying this process's positional file arguments (newline-joined), read back
@@ -106,13 +165,17 @@ const ARGV_ENV: &str = "NXVIM_ARGV";
 /// EXPRESSION; if it yields a promise the wrapper waits for it to settle. A workspace
 /// wrapper uses this to read its config and relaunch with `--shada-namespace` via
 /// `nx.reexec`, which replaces this process (so the wrapper's `:qa!` never runs).
-fn run_lua_oneshot(code: String) -> Result<()> {
+fn run_lua_oneshot(code: String, shada: &ShadaOpts) -> Result<()> {
     use std::time::Duration;
 
     // Mark this as a oneshot bootstrap so a workspace plugin skips its interactive
     // auto-evaluation (it should only relaunch, not prompt). `os.getenv("NXVIM_LUA_ONESHOT")`
     // is the Lua signal. (`NXVIM_ARGV` for `nx.argv()` is already set by `main`.)
     std::env::set_var("NXVIM_LUA_ONESHOT", "1");
+
+    // Surface any explicit `--shada-namespace` to `nx.shada.namespace()` so a wrapper that
+    // inspects it (before relaunching) reads the value it was launched with.
+    let (shada_namespace, workspace_dir) = shada.workspace_identity();
 
     let (config_dir, runtimepath) = nxvim_server::default_runtime();
     let (server_end, client_end) = tokio::io::duplex(1 << 16);
@@ -122,6 +185,8 @@ fn run_lua_oneshot(code: String) -> Result<()> {
             config_dir,
             // A oneshot never persists and offers no first-run UI.
             shada: None,
+            shada_namespace,
+            workspace_dir,
             runtimepath,
             clipboard: nxvim_server::ClipboardProvider::Disabled,
             offer_default_recommended: false,
@@ -276,6 +341,12 @@ struct Cli {
     /// Run a Lua chunk after sourcing config, then exit (no UI) — for workspace wrapper scripts
     #[arg(long, value_name = "CODE")]
     lua: Option<String>,
+
+    /// Open a directory as a workspace: derive a per-directory shada namespace and
+    /// save/restore the window/split/dock/buffer layout across launches (the TARGET, or
+    /// the cwd, must be a directory). An explicit --shada-namespace overrides the derived one.
+    #[arg(long)]
+    workspace: bool,
 }
 
 fn main() -> Result<()> {
@@ -344,16 +415,28 @@ fn main() -> Result<()> {
         return run_daemon();
     }
 
-    // Validate + stamp the shada namespace (from `--shada-namespace`) once, before any
-    // server thread. nxvim never reads a project file: the namespace is always on the
-    // command line (a workspace plugin's wrapper relaunches with it).
-    let shada = ShadaOpts::from_cli(&cli)?;
+    // `--workspace`: for a *local* session, resolve the directory (the TARGET, or the cwd)
+    // to an absolute path now, so its derived shada namespace + `nx.workspace` root are
+    // known. A non-directory / missing target aborts here. A *daemon* session's workspace
+    // lives on the remote machine — its root + namespace derive from the daemon's cwd
+    // post-connect ([`ShadaOpts::resolve_remote_workspace`]), so skip the local resolve.
+    let is_daemon_session = cli.connect_daemon || connect_uri.is_some();
+    let workspace_dir = if cli.workspace && !is_daemon_session {
+        Some(resolve_workspace_dir(file.as_deref())?)
+    } else {
+        None
+    };
+
+    // Derive the shada namespace (from `--shada-namespace`, or a local `--workspace`
+    // directory) and the workspace identity surfaced to Lua. No env stamping — the runtime
+    // is seeded from `ServerInit`, so a daemon session can fill in the remote-derived values.
+    let shada = ShadaOpts::from_cli(&cli, workspace_dir.as_deref())?;
 
     // `--lua` headless mode: source config (so plugins load), run the one-liner, exit —
     // no UI. A workspace wrapper uses it to read its config and relaunch with the right
     // `--shada-namespace`; see `nx.reexec`.
     if let Some(code) = cli.lua.clone() {
-        return run_lua_oneshot(code);
+        return run_lua_oneshot(code, &shada);
     }
 
     // Which config (+ shada) a daemon session runs: the local machine's by default, or
@@ -402,6 +485,11 @@ fn main() -> Result<()> {
         // layout); `--restore-session` reapplies it at boot.
         workspace_session: shada.capture(),
         restore_session: shada.do_restore(),
+        // `--workspace` auto-opts into capturing the layout (no plugin needed).
+        session_save_layout: shada.session_save_layout(),
+        // Seed the namespace + root that `nx.shada.namespace()` / `nx.workspace` report.
+        shada_namespace: shada.namespace().map(str::to_owned),
+        workspace_dir: shada.workspace_dir.clone(),
         runtimepath,
         // The real editor wires the host clipboard for the `"+` / `"*` registers.
         clipboard: nxvim_server::ClipboardProvider::System,
@@ -628,6 +716,13 @@ where
             let resolved = client.config.resolve(config_source).await.map_err(|e| {
                 anyhow!("could not resolve the session config from the daemon: {e}")
             })?;
+            // A `--workspace` daemon session derives its identity (shada namespace + root)
+            // from the *daemon's* cwd, now that we know it — the workspace lives on the
+            // remote machine. This fills `shada.namespace` (so the store below is keyed by
+            // the remote path, local OR remote) and the root surfaced to `nx.workspace`. A
+            // non-workspace launch / explicit `--shada-namespace` is left as-is.
+            let mut shada = shada;
+            shada.resolve_remote_workspace(resolved.remote_cwd.as_deref());
             // Shada follows the config source. `Remote` keeps it on the daemon (Approach
             // A): download its store into a local staging dir now (before `client.host_fs`
             // is moved below) and sync it back after each flush. A download error disables
@@ -649,6 +744,11 @@ where
                 remote_shada,
                 workspace_session: shada.capture(),
                 restore_session: shada.do_restore(),
+                session_save_layout: shada.session_save_layout(),
+                // The namespace + root reported by `nx.shada.namespace()` / `nx.workspace` —
+                // for a workspace daemon session these are the remote-cwd-derived values.
+                shada_namespace: shada.namespace().map(str::to_owned),
+                workspace_dir: shada.workspace_dir.clone(),
                 runtimepath: resolved.runtimepath,
                 clipboard: nxvim_server::ClipboardProvider::System,
                 mouse_clock: None,

@@ -31,6 +31,17 @@ impl Editor {
         self.dock_exists(side) && !self.dock_hidden[side.idx()]
     }
 
+    /// Whether `layer` is a live, focusable target right now: the main layer always
+    /// is; a dock is only when [`Editor::dock_is_open`]. Callers that want to cross
+    /// to a buffer's home layer ([`Editor::switch_layer`]) guard with this so a
+    /// since-closed (or collapsed) dock falls back gracefully instead of panicking.
+    pub(crate) fn layer_is_open(&self, layer: Layer) -> bool {
+        match layer {
+            Layer::Main => true,
+            Layer::Dock(side) => self.dock_is_open(side),
+        }
+    }
+
     /// Whether the dock on `side` has state at all — a [`TabStack`] in
     /// [`Editor::dock_tabs`], whether visible or hidden. The lifecycle guards
     /// (`open`/`close`/`focus`/`hide`/`show`) test this so they still act on a

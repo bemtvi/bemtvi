@@ -1793,10 +1793,11 @@ impl Editor {
 
     /// `:qa` (and last-window `:q`) — quit the *editor*, but only if nothing
     /// would be lost. With `!`, exit unconditionally (discarding every buffer).
-    /// Otherwise, if any buffer has unsaved changes, *don't* quit: switch the
-    /// window to that buffer (the current one if it's the one modified, else the
-    /// lowest-numbered modified buffer) and report `E37`, so the user sees what's
-    /// blocking the quit. With no modified buffers, exit.
+    /// Otherwise, if any buffer has unsaved changes, *don't* quit: surface that
+    /// buffer (the current one if it's the one modified, else the lowest-numbered
+    /// modified buffer) **in its own layer** — crossing into its home dock when it
+    /// lives in one, never dragging it into the main area — and report `E37`, so the
+    /// user sees what's blocking the quit. With no modified buffers, exit.
     fn ex_quit_all(&mut self, bang: bool) {
         if bang {
             self.should_quit = true;
@@ -1809,8 +1810,16 @@ impl Editor {
         }
         match self.first_modified_buffer() {
             Some(id) => {
-                // Surface the blocking buffer, then warn (the switch clears the
-                // message, so set it afterwards).
+                // Surface the blocking buffer *in its own layer* — buffers are
+                // scoped per layer, so a dock's modified buffer must reappear in
+                // that dock, never get yanked into the main area (which would hide
+                // the real main buffer and retag the dock buffer's home layer).
+                // Cross to its home layer first when it's still open, then show it.
+                let home = self.buffers.get(id).layer;
+                if home != self.focused_layer && self.layer_is_open(home) {
+                    self.switch_layer(home);
+                }
+                // Warn after the switch — the layer/buffer change clears the message.
                 self.switch_buffer(id);
                 self.echo(format!(
                     "E37: No write since last change for buffer {} (add ! to override)",

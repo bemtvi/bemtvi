@@ -11,7 +11,7 @@ use nxvim_rpc::{Incoming, Rpc};
 use nxvim_server::ServerInit;
 use nxvim_test_harness::{
     command, cursor, drain_to_latest_redraw, exec_lua, feed, feed_mouse, lines, lua_u64, map_get,
-    mode, serial_lock, start_attached, wait_redraw, write_temp,
+    message, mode, serial_lock, start_attached, wait_redraw, write_temp,
 };
 use rmpv::Value;
 use tokio::sync::mpsc::UnboundedReceiver;
@@ -152,6 +152,22 @@ fn region_title(map: &[(Value, Value)], region: &str) -> String {
         .and_then(Value::as_str)
         .unwrap_or("")
         .to_string()
+}
+
+/// The `region` string of the window currently marked `focused` in a redraw map.
+fn focused_region(map: &[(Value, Value)]) -> Option<String> {
+    let Some(Value::Array(wins)) = map_get(map, "windows") else {
+        return None;
+    };
+    wins.iter().find_map(|w| {
+        let Value::Map(m) = w else { return None };
+        if map_get(m, "focused").and_then(Value::as_bool) != Some(true) {
+            return None;
+        }
+        map_get(m, "region")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+    })
 }
 
 #[tokio::test]
@@ -1820,4 +1836,58 @@ async fn window_and_layer_nav_ignore_buffer_local_hl_maps() {
     // *main* buffer is irrelevant here, but the dock's own maps must not fire either).
     feed_sync(&rpc, "<C-w><C-w>h").await;
     assert_eq!(lines(&rpc).await, vec!["dock"], "crossed back to the dock");
+}
+
+/// Regression: buffers are scoped to their layer. A `:qa` issued from the **main**
+/// layer, while a *dock* holds a modified buffer, must surface that buffer in its
+/// **own dock** to warn (E37) — never yank it across into the main area (which both
+/// hid the real main buffer and silently retagged the dock buffer's home layer).
+#[tokio::test]
+async fn quitall_surfaces_a_modified_dock_buffer_in_its_dock() {
+    let f = write_temp("dockmod", "txt", "d1\nd2\n");
+    let (rpc, mut incoming) = start().await;
+
+    // Main area: type into the (clean-on-its-own) startup buffer, then save so it
+    // isn't what blocks the quit — only the dock buffer must be modified.
+    feed(&rpc, "imain<Esc>");
+    let mainfile = write_temp("mainclean", "txt", "");
+    command(&rpc, &format!("w {}", mainfile)).await;
+    assert_eq!(lines(&rpc).await, vec!["main"], "main buffer holds 'main'");
+
+    // Open a left dock (it takes focus), load a real file into it, and modify it.
+    exec_lua(&rpc, "nx.dock.open{ side = 'left', size = 24 }").await;
+    command(&rpc, &format!("e {}", f)).await;
+    feed(&rpc, "oMODIFIED<Esc>");
+    assert_eq!(
+        lines(&rpc).await,
+        vec!["d1", "MODIFIED", "d2"],
+        "the dock shows the modified file",
+    );
+
+    // Cross back to the main area; it's clean, the dock's buffer is the only dirty one.
+    feed(&rpc, "<C-w><C-w>l");
+    assert_eq!(
+        lines(&rpc).await,
+        vec!["main"],
+        "focused back in the main area"
+    );
+
+    // `:qa` must refuse (E37) and surface the offending buffer where it lives — in
+    // the dock — so focus crosses *into* the dock rather than dragging the buffer out.
+    command(&rpc, "qa").await;
+    let rd = latest(&mut incoming);
+    assert!(
+        message(&rd).starts_with("E37"),
+        "`:qa` with an unsaved buffer must warn, not quit",
+    );
+    assert_eq!(
+        focused_region(&rd).as_deref(),
+        Some("dock_left"),
+        "the modified buffer is surfaced in its own dock, not pulled into the main area",
+    );
+    assert_eq!(
+        lines(&rpc).await,
+        vec!["d1", "MODIFIED", "d2"],
+        "the dock now shows (and focuses) the buffer blocking the quit",
+    );
 }

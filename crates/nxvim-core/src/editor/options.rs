@@ -97,8 +97,8 @@ impl Editor {
                     | "scrollanim"
                     | "qfdock"
                     | "bdclosetab"
-                    | "relative_splits"
-                    | "relative_docks"
+                    | "relativesplits"
+                    | "relativedocks"
                     | "equalalways"
             ) {
                 let cur = matches!(

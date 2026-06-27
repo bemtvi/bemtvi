@@ -130,7 +130,7 @@ pub struct SessionState {
 
 /// One edge dock: which side, its reserved size in cells (the boot-time fallback), an
 /// optional `size_pct` (the size as a percentage of the screen, when captured with
-/// `relative_docks` so the dock scales), whether it was hidden (parked), and its
+/// `relativedocks` so the dock scales), whether it was hidden (parked), and its
 /// file-backed window layout if any (plugin-owned docks — file trees, terminals — show
 /// unnamed buffers, so their `layout` is `None` and they reopen empty at the saved
 /// geometry for the owning plugin to repopulate).
@@ -341,8 +341,8 @@ impl Editor {
     /// and the focused window marked. Floating windows and unnamed (scratch) buffers are
     /// dropped (single-child splits collapse). Returns `None` when nothing is worth
     /// saving. Pure: reads live state, no I/O.
-    /// The native `'relative_splits'` option (default on) stores split sizes as
-    /// proportional percentages rather than absolute cells; `'relative_docks'` (default
+    /// The native `'relativesplits'` option (default on) stores split sizes as
+    /// proportional percentages rather than absolute cells; `'relativedocks'` (default
     /// off) likewise stores a dock's size as a percentage of the screen so it scales.
     /// Both are read straight off [`Options`](crate::options::Options) here, so any
     /// wrapper that opts a session into capture honors them — they are not coupled to

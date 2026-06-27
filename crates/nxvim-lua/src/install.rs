@@ -1019,7 +1019,7 @@ pub(crate) fn install_runtime_api(
     // `--restore-session`. Default OFF — a plugin turns it on once it knows the launch is
     // the namespace it wanted. Only meaningful with a namespace (the global store never
     // persists layout). How split / dock sizes are stored (proportional vs absolute) is
-    // governed by the native `nx.o.relative_splits` / `nx.o.relative_docks` options,
+    // governed by the native `nx.o.relativesplits` / `nx.o.relativedocks` options,
     // read off the editor at capture — so any wrapper that opts in honors them.
     {
         let sh = shared.clone();

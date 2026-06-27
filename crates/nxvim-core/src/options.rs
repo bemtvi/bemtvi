@@ -183,14 +183,14 @@ pub struct Options {
     /// [`crate::editor::buffers`].
     pub bdclosetab: bool,
     /// Whether a saved session stores split sizes as proportional PERCENTAGES rather
-    /// than absolute cells (`'relative_splits'`; nxvim-native, default `true`). A
+    /// than absolute cells (`'relativesplits'`; nxvim-native, default `true`). A
     /// 30/70 vsplit then restores 30/70 at any terminal width. Read at session
     /// capture by [`crate::editor::persist`] — a property of the native session
     /// persistence, not any one plugin (any wrapper that opts into capture via
     /// `nx.shada.save_layout` honors it).
     pub relative_splits: bool,
     /// Whether a saved session stores a dock's size as a PERCENTAGE of the screen
-    /// rather than absolute cells (`'relative_docks'`; nxvim-native, default
+    /// rather than absolute cells (`'relativedocks'`; nxvim-native, default
     /// `false`, so docks keep their cell size across terminal resizes). Read at
     /// session capture by [`crate::editor::persist`]; the native counterpart of
     /// [`Options::relative_splits`] for edge docks.
@@ -246,8 +246,8 @@ impl Options {
             ("scrollanim", Bool(b)) => self.scrollanim = *b,
             ("qfdock", Bool(b)) => self.qfdock = *b,
             ("bdclosetab", Bool(b)) => self.bdclosetab = *b,
-            ("relative_splits", Bool(b)) => self.relative_splits = *b,
-            ("relative_docks", Bool(b)) => self.relative_docks = *b,
+            ("relativesplits", Bool(b)) => self.relative_splits = *b,
+            ("relativedocks", Bool(b)) => self.relative_docks = *b,
             ("equalalways", Bool(b)) => self.equalalways = *b,
             ("showtabline", Num(n)) => self.showtabline = *n as u8,
             ("laststatus", Num(n)) => self.laststatus = *n as u8,
@@ -292,8 +292,8 @@ impl Options {
             "scrollanim" => Bool(self.scrollanim),
             "qfdock" => Bool(self.qfdock),
             "bdclosetab" => Bool(self.bdclosetab),
-            "relative_splits" => Bool(self.relative_splits),
-            "relative_docks" => Bool(self.relative_docks),
+            "relativesplits" => Bool(self.relative_splits),
+            "relativedocks" => Bool(self.relative_docks),
             "equalalways" => Bool(self.equalalways),
             "showtabline" => Num(self.showtabline as i64),
             "laststatus" => Num(self.laststatus as i64),
@@ -1773,14 +1773,14 @@ static OPTIONS: &[OptionInfo] = {
             doc: "Closing a tab's last buffer with :bd closes the tab (nxvim).",
         },
         OptionInfo {
-            name: "relative_splits",
+            name: "relativesplits",
             abbrev: None,
             kind: Bool,
             scope: Global,
             doc: "Save session split sizes as proportional % (scale with the terminal).",
         },
         OptionInfo {
-            name: "relative_docks",
+            name: "relativedocks",
             abbrev: None,
             kind: Bool,
             scope: Global,

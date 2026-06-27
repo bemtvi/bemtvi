@@ -341,7 +341,7 @@ async fn relative_split_sizes_scale_to_the_terminal_width() {
     // Session 1 at width 80: a 50/50 vertical split (each window ~39 cols).
     {
         let (rpc, incoming) = start_attached(init(&dir, Some(file_a.clone()), true), 80, 25).await;
-        exec_lua(&rpc, "nx.shada.save_layout(true)").await; // relative_splits defaults true
+        exec_lua(&rpc, "nx.shada.save_layout(true)").await; // relativesplits defaults true
         feed(&rpc, &format!(":vsplit {file_b}<CR>"));
         feed(&rpc, ":qa<CR>");
         await_server_exit(incoming).await;
@@ -397,8 +397,8 @@ async fn session_restores_open_docks() {
 }
 
 #[tokio::test]
-async fn relative_docks_native_option_scales_the_dock() {
-    // `relative_docks` is a NATIVE editor option (`nx.o.relative_docks`), not a plugin
+async fn relativedocks_native_option_scales_the_dock() {
+    // `relativedocks` is a NATIVE editor option (`nx.o.relativedocks`), not a plugin
     // setting: any wrapper that opts a session into capture honors it. With it on, a
     // dock's size is stored as a % of the screen and re-derived against the screen the
     // restore runs at (the editor's default 80 cols, before the UI attaches) — so a dock
@@ -411,7 +411,7 @@ async fn relative_docks_native_option_scales_the_dock() {
     {
         let (rpc, incoming) = start_attached(init(&dir, Some(file_a.clone()), true), 160, 25).await;
         exec_lua(&rpc, "nx.shada.save_layout(true)").await;
-        exec_lua(&rpc, "nx.o.relative_docks = true").await;
+        exec_lua(&rpc, "nx.o.relativedocks = true").await;
         exec_lua(&rpc, "nx.dock.open{ side = 'left', size = 80 }").await;
         feed(&rpc, "<Esc>"); // settle a tick so the dock op drains + relayout runs
         feed(&rpc, ":qa<CR>");

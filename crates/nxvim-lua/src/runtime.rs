@@ -420,11 +420,11 @@ pub struct GoMirror {
     /// `'bdclosetab'` — whether `:bd` of a tab's last buffer closes the tab (nxvim)
     /// rather than loading a sibling. Backs `vim.o.bdclosetab` / `nx.o.bdclosetab`.
     pub bdclosetab: bool,
-    /// `'relative_splits'` — whether a saved session stores split sizes as proportional
-    /// percentages (default true). Backs `nx.o.relative_splits`.
+    /// `'relativesplits'` — whether a saved session stores split sizes as proportional
+    /// percentages (default true). Backs `nx.o.relativesplits`.
     pub relative_splits: bool,
-    /// `'relative_docks'` — whether a saved session stores dock sizes as a percentage
-    /// of the screen (default false). Backs `nx.o.relative_docks`.
+    /// `'relativedocks'` — whether a saved session stores dock sizes as a percentage
+    /// of the screen (default false). Backs `nx.o.relativedocks`.
     pub relative_docks: bool,
     /// `'equalalways'` — whether opening/closing a window re-equalizes all windows
     /// to even sizes (default true). Backs `vim.o.equalalways` / `nx.o.equalalways`.
@@ -762,8 +762,8 @@ pub(crate) struct Shared {
     /// (namespaced) shada. Default `false`; a workspace plugin flips it on via
     /// `nx.shada.save_layout(true)` once it knows this is the right namespace. The
     /// server reads it at flush ([`LuaRuntime::session_save_layout`]). How sizes are
-    /// stored (proportional vs absolute) is the native `'relative_splits'` /
-    /// `'relative_docks'` options, read straight off the editor at capture — not
+    /// stored (proportional vs absolute) is the native `'relativesplits'` /
+    /// `'relativedocks'` options, read straight off the editor at capture — not
     /// mirrored here, so layout sizing isn't coupled to this plugin opt-in.
     pub(crate) session_save_layout: bool,
     /// The shada namespace this launch is scoped to (the `--shada-namespace` value, or a

@@ -859,6 +859,19 @@ pub struct Editor {
     /// hands the keys to Lua to build a list — the bulk-result sibling of the
     /// single-key [`Editor::menu_results`]. Backs the picker's quickfix-style sink.
     pub picker_sends: Vec<Vec<usize>>,
+    /// A frozen window of the most-recently-closed **resumable** picker, captured by
+    /// the `confirm`/`cancel`/`send_to_loclist` actions just before it closes (the
+    /// live menu is gone by the time the server drains the outcome). Replayed verbatim
+    /// by `nx.picker.resume()` (`<leader>fr`) — a live-grep order isn't stable across
+    /// runs, so resume can't re-run the source. Bounded to [`menu::RESUME_WINDOW`]
+    /// rows around the cursor. `None` until a resumable picker has closed. See
+    /// [`Editor::snapshot_picker_for_resume`] / [`Editor::restore_picker_snapshot`].
+    picker_snapshot: Option<menu::Menu>,
+    /// The item **keys** of the latest resume snapshot's window, drained by the server
+    /// alongside the picker outcome and handed to Lua (`nx._picker_result` /
+    /// `nx._picker_send`) so it keeps only those item tables for `confirm` — bounding
+    /// Lua's resume memory to the window too. Empty for a non-resumable close.
+    pub picker_resume_keys: Vec<usize>,
     /// The list-less **content float** (`nx.ui.float`; the LSP hover / signature
     /// help surface), when open, or `None`. A transient overlay rendering plain
     /// content lines — no list, no selection, **never grabs input**: it is
@@ -1549,6 +1562,8 @@ impl Editor {
             menu_results: Vec::new(),
             picker_confirm_mode: menu::PickerOpenMode::default(),
             picker_sends: Vec::new(),
+            picker_snapshot: None,
+            picker_resume_keys: Vec::new(),
             content_float: None,
             picker_query_changes: Vec::new(),
             statusline_clicks: Vec::new(),

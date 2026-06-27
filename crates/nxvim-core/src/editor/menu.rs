@@ -58,6 +58,14 @@ impl PickerOpenMode {
     }
 }
 
+/// The bound on the resume snapshot ([`Editor::snapshot_picker_for_resume`]): a
+/// reopened picker (`nx.picker.resume`) shows at most this many rows — a window
+/// around the cursor of the picker as it closed. A live-grep result set has no
+/// stable order across runs, so resume can't re-run the source; it replays this
+/// frozen window instead. Bounding it keeps a closed 100k-row picker from pinning
+/// its whole list in memory until the next picker opens.
+pub(crate) const RESUME_WINDOW: usize = 1000;
+
 /// Where the float (menu or content float) anchors on the shared placement layer.
 /// `Cursor` anchors it under the cursor (the `nx.ui.select` / completion shape);
 /// `Editor` centers it over the editor (the picker shape); `Bottom` pins it to the
@@ -387,6 +395,12 @@ pub(crate) struct Menu {
     /// default `true`). `false` makes `toggle_select` a no-op — a single-choice
     /// picker (e.g. the cmdline file completer) where marking makes no sense.
     multiselect: bool,
+    /// Whether this picker is captured for `nx.picker.resume()` when it closes
+    /// (`nx.picker.source{ resumable = … }`, default `true`). A transient internal
+    /// picker — the cmdline file completer — sets `false` so it never overwrites the
+    /// resume snapshot of the last user-facing picker. Always `false` for a
+    /// `select` / completion / cmdline menu (only a picker resumes).
+    resumable: bool,
 }
 
 impl Menu {
@@ -592,6 +606,7 @@ impl Editor {
             margin: Margin::default(),
             title: None,
             multiselect: false,
+            resumable: false,
         };
         menu.refilter();
         self.menu = Some(menu);
@@ -621,6 +636,7 @@ impl Editor {
         query: &str,
         title: Option<String>,
         multiselect: bool,
+        resumable: bool,
     ) {
         let prompt = Prompt {
             col: query.len(),
@@ -659,6 +675,7 @@ impl Editor {
             margin,
             title,
             multiselect,
+            resumable,
         });
     }
 
@@ -732,6 +749,7 @@ impl Editor {
             margin: Margin::default(),
             title: None,
             multiselect: false,
+            resumable: false,
         });
     }
 
@@ -1012,6 +1030,7 @@ impl Editor {
             margin: Margin::default(),
             title: None,
             multiselect: false,
+            resumable: false,
         });
     }
 
@@ -1187,6 +1206,74 @@ impl Editor {
         self.on_query_changed();
     }
 
+    /// Snapshot a closing **resumable** picker for `nx.picker.resume()` (`<leader>fr`)
+    /// — a frozen [`RESUME_WINDOW`]-row window of the *display* view around the cursor.
+    /// A live-grep result set has no stable order across runs, so resume can't re-run
+    /// the source; it replays this exact window instead. The snapshot is a passthrough
+    /// `Menu` (no query re-filter — the rows already *are* the result), with the
+    /// cursor rebased into the window and only the marks that fall inside it kept. The
+    /// **keys** of the window are returned so the server can tell Lua which item tables
+    /// to retain for `confirm` (bounding Lua's memory to the window too). A non-resumable
+    /// or promptless menu records nothing and returns an empty key list.
+    ///
+    /// Called *before* `close_menu`, which then tears the live menu down.
+    pub fn snapshot_picker_for_resume(&mut self) -> Vec<usize> {
+        let Some(menu) = self.menu.as_ref() else {
+            return Vec::new();
+        };
+        if !menu.resumable || menu.prompt.is_none() {
+            return Vec::new();
+        }
+        let len = menu.view_len();
+        // The window [lo, hi): RESUME_WINDOW rows centered on the cursor, clamped to
+        // the ends (a list shorter than the window keeps all of it). `len - WINDOW`
+        // saturates to 0 when short, so `lo` falls to 0 and `hi` to `len`.
+        let half = RESUME_WINDOW / 2;
+        let lo = menu
+            .cursor
+            .saturating_sub(half)
+            .min(len.saturating_sub(RESUME_WINDOW));
+        let hi = (lo + RESUME_WINDOW).min(len);
+        let window: Vec<MenuItem> = (lo..hi)
+            .map(|i| menu.all_items[menu.item_at(i)].clone())
+            .collect();
+        let keys: Vec<usize> = window.iter().map(|it| it.key).collect();
+        let key_set: std::collections::HashSet<usize> = keys.iter().copied().collect();
+        // Marks that survive the window (the rest are far from the cursor — dropped).
+        let marked: Vec<usize> = menu
+            .marked
+            .iter()
+            .copied()
+            .filter(|k| key_set.contains(k))
+            .collect();
+        let mut snap = menu.clone();
+        snap.all_items = window;
+        // Passthrough: the window IS the displayed result, shown verbatim (the query
+        // stays in the prompt but is not re-applied — it already produced these rows).
+        snap.filtered = None;
+        snap.match_spans.clear();
+        snap.cursor = menu.cursor - lo;
+        snap.selected_active = true;
+        snap.marked = marked;
+        snap.preview_scroll = None;
+        self.picker_snapshot = Some(snap);
+        keys
+    }
+
+    /// Reopen the last resumable picker from its snapshot ([`snapshot_picker_for_resume`]
+    /// (Self::snapshot_picker_for_resume)) — `nx.picker.resume()`. Restores the frozen
+    /// window verbatim (rows, cursor, marks, query). Returns `false` (a no-op) when no
+    /// snapshot exists. The source is re-armed Lua-side, so editing the query re-runs it
+    /// (live grep) or re-ranks the window (a static source); an untouched resume just
+    /// shows the frozen rows.
+    pub fn restore_picker_snapshot(&mut self) -> bool {
+        let Some(snap) = self.picker_snapshot.clone() else {
+            return false;
+        };
+        self.menu = Some(snap);
+        true
+    }
+
     /// Apply a named picker action, dispatched by a `picker`-bucket keymap (the
     /// default maps registered in `prelude/picker.lua`, or a user override). The name
     /// space is the picker's rebindable operations: `next`/`prev` move the selection,
@@ -1197,7 +1284,21 @@ impl Editor {
     pub fn apply_picker_action(&mut self, action: &str) -> Result<(), String> {
         self.message.clear();
         // Confirm / cancel don't fit the shared `menu.as_mut()` nav block (they push a
-        // result + close), so handle them first.
+        // result + close), so handle them first. Every one of them closes the picker,
+        // so snapshot it first for `nx.picker.resume()` — the live menu is gone after
+        // `close_menu`. The window's keys ride [`Editor::picker_resume_keys`] to the
+        // server, which tells Lua which item tables to keep for `confirm`.
+        if matches!(
+            action,
+            "confirm"
+                | "confirm_tab"
+                | "confirm_split"
+                | "confirm_vsplit"
+                | "cancel"
+                | "send_to_loclist"
+        ) {
+            self.picker_resume_keys = self.snapshot_picker_for_resume();
+        }
         match action {
             "confirm" | "confirm_tab" | "confirm_split" | "confirm_vsplit" => {
                 let chosen = self.menu.as_ref().and_then(|m| {

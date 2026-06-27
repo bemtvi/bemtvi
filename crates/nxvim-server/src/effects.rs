@@ -843,6 +843,7 @@ impl EditHost {
                 &req.query,
                 req.title.clone(),
                 req.multiselect,
+                req.resumable,
             );
             self.pending_ui_select = None;
             self.picker_active = true;
@@ -856,6 +857,14 @@ impl EditHost {
             self.editor
                 .picker_query_changes
                 .push((0, req.query.clone()));
+        }
+        // `nx.picker.resume()`: replay the last resumable picker's frozen snapshot.
+        // Unlike a fresh open, NO gen-0 run is kicked — the snapshot *is* the displayed
+        // content (a live-grep order isn't reproducible). The source is re-armed
+        // Lua-side, so a later query edit re-runs it (or re-ranks, for a static source).
+        if self.lua.take_picker_resume() && self.editor.restore_picker_snapshot() {
+            self.pending_ui_select = None;
+            self.picker_active = true;
         }
         // `nx.statusline.setup{}` / `reset()`: set the global or a window-local
         // status line (the latest for each target wins). A global / window-local
@@ -2981,7 +2990,10 @@ impl EditHost {
                     // The confirm gesture's open mode (`<C-t>`/`<C-x>`/`<C-v>` ⇒ tab /
                     // split / vsplit). Taken per-result so it never leaks to the next.
                     let mode = std::mem::take(&mut self.editor.picker_confirm_mode).as_str();
-                    if let Err(e) = self.lua.run_picker_result(result, mode) {
+                    // The resume snapshot's window keys — Lua keeps just those item
+                    // tables for `confirm` after a `nx.picker.resume()`.
+                    let resume_keys = std::mem::take(&mut self.editor.picker_resume_keys);
+                    if let Err(e) = self.lua.run_picker_result(result, mode, &resume_keys) {
                         self.editor
                             .echo(format!("E5108: Error in nx.picker confirm: {e}"));
                     }
@@ -2993,7 +3005,8 @@ impl EditHost {
             // matched keys to Lua, which builds the list from its item tables.
             for keys in std::mem::take(&mut self.editor.picker_sends) {
                 self.picker_active = false;
-                if let Err(e) = self.lua.run_picker_send(keys) {
+                let resume_keys = std::mem::take(&mut self.editor.picker_resume_keys);
+                if let Err(e) = self.lua.run_picker_send(keys, &resume_keys) {
                     self.editor
                         .echo(format!("E5108: Error in nx.picker send: {e}"));
                 }

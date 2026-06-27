@@ -444,6 +444,7 @@ end
 nx.picker.source({
   name = "cmdline_files",
   layer = "main", -- a picked file opens in the main editor, never a focused dock
+  resumable = false, -- transient: confirm pastes into the open cmdline; `<leader>fr` skips it
   dynamic = true,
   debounce = 0, -- a local readdir is instant, so re-list on every keystroke
   multiselect = false, -- a single path is chosen; `<Tab>` marking makes no sense

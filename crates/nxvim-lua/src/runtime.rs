@@ -642,6 +642,10 @@ pub(crate) struct Shared {
     /// `nx.picker.open` requests, drained by the server into the editor's fuzzy
     /// finder (`Editor::open_picker`) after the chunk.
     pub(crate) picker_opens: Vec<PickerOpenReq>,
+    /// `nx.picker.resume()` request: reopen the last resumable picker from its frozen
+    /// snapshot (`Editor::restore_picker_snapshot`). A bare flag — at most one resume
+    /// per chunk — drained by the server after re-arming `nx._picker` Lua-side.
+    pub(crate) picker_resume: bool,
     /// `nx.complete.setup{}` configurations, drained by the server into
     /// `Editor::configure_complete` (the native completion engine, Phase 4-A).
     pub(crate) complete_setups: Vec<CompleteSetupReq>,
@@ -1275,6 +1279,12 @@ impl LuaRuntime {
         take_picker_opens -> Vec<PickerOpenReq> = picker_opens
     }
 
+    /// Take (and clear) the pending `nx.picker.resume()` flag — `true` once since the
+    /// last drain. The server then replays the last picker's frozen snapshot.
+    pub fn take_picker_resume(&self) -> bool {
+        std::mem::take(&mut self.shared.borrow_mut().picker_resume)
+    }
+
     take_queue! {
         /// Take the `nx.complete.setup{}` configurations queued since the last
         /// drain, for the server to apply to the native completion engine.
@@ -1749,28 +1759,50 @@ impl LuaRuntime {
     /// item and calls the source's `confirm(item)`, then clears the active picker.
     /// `mode` is the confirm gesture's open mode — `"current"` (open in the focused
     /// window) or `"tab"` (the default `<C-t>` ⇒ a new tab) — forwarded to the
-    /// source's `confirm(item, mode)`.
-    pub fn run_picker_result(&self, key: Option<usize>, mode: &str) -> mlua::Result<()> {
+    /// source's `confirm(item, mode)`. `resume_keys` are the item keys of the resume
+    /// snapshot's window (empty when the picker isn't resumable) — `nx._picker_result`
+    /// keeps only those item tables on `nx.picker._last` so `confirm` works after a
+    /// resume while bounding retained memory to the window.
+    pub fn run_picker_result(
+        &self,
+        key: Option<usize>,
+        mode: &str,
+        resume_keys: &[usize],
+    ) -> mlua::Result<()> {
         let nx = self.nx()?;
         let run: mlua::Function = nx.get("_picker_result")?;
         let arg = match key {
             Some(k) => mlua::Value::Integer(lua_int(k as i64)),
             None => mlua::Value::Nil,
         };
-        run.call::<()>((arg, mode))
+        run.call::<()>((arg, mode, self.resume_keys_seq(resume_keys)?))
     }
 
     /// Deliver the picker's "send these results to a list" outcome: the matched item
     /// `keys` (in display order) go to `nx._picker_send`, which maps them back to the
     /// source item tables and builds a location list (`nx.qf.send_to_loclist`). The
-    /// bulk-result sibling of [`Self::run_picker_result`].
-    pub fn run_picker_send(&self, keys: Vec<usize>) -> mlua::Result<()> {
+    /// bulk-result sibling of [`Self::run_picker_result`]. `resume_keys` retains the
+    /// snapshot window's item tables for `nx.picker.resume()` (see there).
+    pub fn run_picker_send(&self, keys: Vec<usize>, resume_keys: &[usize]) -> mlua::Result<()> {
         let nx = self.nx()?;
         let run: mlua::Function = nx.get("_picker_send")?;
         let arg = self
             .lua
             .create_sequence_from(keys.into_iter().map(|k| k as i64))?;
-        run.call::<()>((arg,))
+        run.call::<()>((arg, self.resume_keys_seq(resume_keys)?))
+    }
+
+    /// The resume snapshot window's item keys as a Lua sequence (or `nil` when empty —
+    /// a non-resumable close), handed to `nx._picker_result`/`_send` to trim the
+    /// retained item tables to the window.
+    fn resume_keys_seq(&self, keys: &[usize]) -> mlua::Result<mlua::Value> {
+        if keys.is_empty() {
+            return Ok(mlua::Value::Nil);
+        }
+        Ok(mlua::Value::Table(
+            self.lua
+                .create_sequence_from(keys.iter().map(|&k| k as i64))?,
+        ))
     }
 
     /// Dispatch an LSP code-action `command` (Phase 8): runs

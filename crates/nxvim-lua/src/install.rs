@@ -66,11 +66,13 @@ impl UserData for LuaRegex {
 /// `{top=,…}` are all expanded there), so an absent or malformed value is treated
 /// as no margin.
 /// The argument tuple of the `nx._picker_open` bridge: `(dynamic, width, height,
-/// align, margin, prompt_bottom, preview, query, title)` — width/height/align are
-/// raw specs the server parses, `margin` is a `[top, right, bottom, left]` array,
-/// `query` is the initial prompt text (empty for the historical empty-prompt
-/// open), and `title` is the optional box title. Aliased to keep clippy's
-/// complex-type lint quiet on the closure signature.
+/// align, margin, prompt_bottom, preview, query, title, multiselect, resumable)` —
+/// width/height/align are raw specs the server parses, `margin` is a `[top, right,
+/// bottom, left]` array, `query` is the initial prompt text (empty for the historical
+/// empty-prompt open), `title` is the optional box title, and `resumable` gates the
+/// `nx.picker.resume()` snapshot (default true; false for the transient cmdline
+/// completer). Aliased to keep clippy's complex-type lint quiet on the closure
+/// signature.
 type PickerOpenArgs = (
     bool,
     Option<String>,
@@ -81,6 +83,7 @@ type PickerOpenArgs = (
     Option<bool>,
     Option<String>,
     Option<String>,
+    Option<bool>,
     Option<bool>,
 );
 
@@ -2255,6 +2258,7 @@ pub(crate) fn install_runtime_api(
                 query,
                 title,
                 multiselect,
+                resumable,
             ) = args;
             sh.borrow_mut().picker_opens.push(PickerOpenReq {
                 dynamic,
@@ -2271,7 +2275,22 @@ pub(crate) fn install_runtime_api(
                 title: title.filter(|t| !t.is_empty()),
                 // Default-on: only an explicit `multiselect = false` disables marking.
                 multiselect: multiselect.unwrap_or(true),
+                // Default-on: only an explicit `resumable = false` opts out of resume.
+                resumable: resumable.unwrap_or(true),
             });
+            Ok(())
+        })?,
+    )?;
+
+    // `nx._picker_resume()`: reopen the last resumable picker from its frozen snapshot
+    // ([`Editor::restore_picker_snapshot`](nxvim_core::Editor::restore_picker_snapshot)).
+    // Lua has already re-armed `nx._picker` (source + the window's item tables) so
+    // `confirm` and query edits work; this just tells the server to replay the rows.
+    let sh = shared.clone();
+    nx.set(
+        "_picker_resume",
+        lua.create_function(move |_, ()| {
+            sh.borrow_mut().picker_resume = true;
             Ok(())
         })?,
     )?;

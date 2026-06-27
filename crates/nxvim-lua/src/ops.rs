@@ -1316,6 +1316,11 @@ pub struct PickerOpenReq {
     /// Whether `<Tab>` multi-selects rows (`nx.picker.open{ multiselect }`, default
     /// `true`). `false` disables marking — a single-choice picker.
     pub multiselect: bool,
+    /// Whether this picker is captured for `nx.picker.resume()` when it closes
+    /// (`nx.picker.source{ resumable = … }`, default `true`). `false` for a transient
+    /// internal picker (the cmdline file completer) so it never overwrites the resume
+    /// snapshot of the last user-facing picker.
+    pub resumable: bool,
 }
 
 /// Whether a [`StatuslineSetupReq`] sets the **global** segment layout (applies to

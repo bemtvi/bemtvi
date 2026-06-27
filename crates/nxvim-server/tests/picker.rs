@@ -66,6 +66,11 @@ fn regions(map: &[(Value, Value)]) -> Vec<String> {
         .collect()
 }
 
+/// The menu's highlighted row, as a (windowed) view index.
+fn menu_selected(menu: &[(Value, Value)]) -> Option<u64> {
+    map_get(menu, "selected").and_then(Value::as_u64)
+}
+
 /// The menu's per-row `marked` flags (multi-select), in visible order.
 fn menu_marked(menu: &[(Value, Value)]) -> Vec<bool> {
     match map_get(menu, "marked") {
@@ -2529,4 +2534,276 @@ nx.picker.source {{
     );
     assert_eq!(cursor(&rpc).await, (3, 1), "the cursor landed on the item");
     let _ = win_height(&rpc).await; // height is reduced; exact value depends on layout
+}
+
+// ----- resume (telescope's `resume` / `<leader>fr`) --------------------------
+
+#[tokio::test]
+async fn resume_reopens_the_last_picker_with_its_query() {
+    // `nx.picker.resume()` replays the closed picker's frozen content: the displayed
+    // rows and the prompt text come back exactly as they were.
+    let dir = temp_dir("picker_resume_query");
+    let (rpc, mut incoming) = start(&dir, STATIC_SRC).await;
+
+    // Open, narrow to "ap", then close without confirming.
+    exec_lua(&rpc, "nx.picker.open('fruits')").await;
+    poll_menu(&rpc, &mut incoming).await.expect("menu opens");
+    feed(&rpc, "ap");
+    let menu = menu_of(&poll_menu(&rpc, &mut incoming).await.expect("filtered"));
+    assert_eq!(menu_items(&menu), vec!["apple", "apricot"]);
+    feed(&rpc, "<Esc>");
+
+    assert_eq!(
+        exec_lua(&rpc, "return nx.picker._last.name").await.as_str(),
+        Some("fruits"),
+        "the resume slot remembers the source",
+    );
+
+    // Resume: the same picker reopens with the same rows and prompt.
+    exec_lua(&rpc, "nx.picker.resume()").await;
+    let menu = menu_of(&poll_menu(&rpc, &mut incoming).await.expect("resumed menu"));
+    assert_eq!(
+        menu_items(&menu),
+        vec!["apple", "apricot"],
+        "resume replays the exact rows the picker showed at close",
+    );
+    assert_eq!(
+        map_get(&menu, "query").and_then(Value::as_str),
+        Some("ap"),
+        "the prompt shows the resumed query",
+    );
+}
+
+#[tokio::test]
+async fn resume_restores_the_highlighted_row_and_marks() {
+    // Resume restores the *selection*, not just the query: the highlighted row lands
+    // back where it was, and multi-select marks reappear on the same items.
+    let dir = temp_dir("picker_resume_selection");
+    let (rpc, mut incoming) = start(&dir, STATIC_SRC).await;
+
+    exec_lua(&rpc, "nx.picker.open('fruits')").await;
+    poll_menu(&rpc, &mut incoming).await.expect("menu opens");
+
+    // Mark apple + apricot (each <Tab> marks the row and advances), landing the
+    // highlight on banana (row 2).
+    feed(&rpc, "<Tab>"); // mark apple -> cursor on apricot
+    feed(&rpc, "<Tab>"); // mark apricot -> cursor on banana
+    let menu = menu_of(&poll_menu(&rpc, &mut incoming).await.expect("marked"));
+    assert_eq!(menu_selected(&menu), Some(2), "highlight on banana");
+    assert_eq!(
+        menu_marked(&menu),
+        vec![true, true, false, false],
+        "apple + apricot marked",
+    );
+    feed(&rpc, "<Esc>");
+
+    // Resume: same highlight, same marks.
+    exec_lua(&rpc, "nx.picker.resume()").await;
+    let menu = menu_of(&poll_menu(&rpc, &mut incoming).await.expect("resumed"));
+    assert_eq!(
+        menu_items(&menu),
+        vec!["apple", "apricot", "banana", "cherry"]
+    );
+    assert_eq!(
+        menu_selected(&menu),
+        Some(2),
+        "resume restores the highlighted row",
+    );
+    assert_eq!(
+        menu_marked(&menu),
+        vec![true, true, false, false],
+        "resume restores the multi-select marks",
+    );
+}
+
+#[tokio::test]
+async fn resume_with_no_prior_picker_is_a_graceful_noop() {
+    // Before any picker has opened, `resume()` notifies and opens nothing — it must
+    // never error (a `<leader>fr` on a fresh session is harmless).
+    let dir = temp_dir("picker_resume_empty");
+    let (rpc, mut incoming) = start(&dir, STATIC_SRC).await;
+
+    let ok = exec_lua(&rpc, "return pcall(nx.picker.resume)").await;
+    assert_eq!(ok, Value::Boolean(true), "resume never errors");
+    assert!(
+        poll_menu(&rpc, &mut incoming).await.is_none(),
+        "no picker opens when there is nothing to resume",
+    );
+}
+
+#[tokio::test]
+async fn resume_after_confirm_replays_the_list() {
+    // Closing via confirm (not just cancel) also snapshots, so resuming after picking
+    // an item reopens the same frozen list with the highlight on the confirmed row.
+    let dir = temp_dir("picker_resume_confirm");
+    let (rpc, mut incoming) = start(&dir, STATIC_SRC).await;
+
+    exec_lua(&rpc, "_G.picked = nil; nx.picker.open('fruits')").await;
+    poll_menu(&rpc, &mut incoming).await.expect("menu opens");
+    feed(&rpc, "ap");
+    poll_menu(&rpc, &mut incoming).await.expect("filtered");
+    feed(&rpc, "<CR>");
+    assert_eq!(
+        exec_lua(&rpc, "return _G.picked").await.as_str(),
+        Some("apple"),
+        "confirm fired",
+    );
+
+    // Resume reopens the picker as it was at confirm: same rows, same prompt.
+    exec_lua(&rpc, "nx.picker.resume()").await;
+    let menu = menu_of(&poll_menu(&rpc, &mut incoming).await.expect("resumed"));
+    assert_eq!(menu_items(&menu), vec!["apple", "apricot"]);
+    assert_eq!(map_get(&menu, "query").and_then(Value::as_str), Some("ap"));
+
+    // Confirming again works — the item tables survived the snapshot/resume.
+    exec_lua(&rpc, "_G.picked = nil").await;
+    feed(&rpc, "<CR>");
+    assert_eq!(
+        exec_lua(&rpc, "return _G.picked").await.as_str(),
+        Some("apple"),
+        "confirm still resolves the item after a resume",
+    );
+}
+
+#[tokio::test]
+async fn a_non_resumable_source_does_not_clobber_the_resume_slot() {
+    // `resumable = false` (the cmdline file completer) opens without touching the
+    // resume slot, so a transient internal picker can't shadow the last real one —
+    // `<leader>fr` still reopens the user-facing picker.
+    let dir = temp_dir("picker_resume_optout");
+    let src = format!(
+        "{STATIC_SRC}\n\
+         nx.picker.source {{ name = 'scratch', resumable = false,\n\
+           items = function(ctx) ctx.push {{ text = 'x' }} end }}"
+    );
+    let (rpc, mut incoming) = start(&dir, &src).await;
+
+    // A real picker, narrowed and closed — it owns the resume slot.
+    exec_lua(&rpc, "nx.picker.open('fruits')").await;
+    poll_menu(&rpc, &mut incoming).await.expect("fruits opens");
+    feed(&rpc, "ap");
+    poll_menu(&rpc, &mut incoming).await.expect("filtered");
+    feed(&rpc, "<Esc>");
+
+    // The transient picker opens and closes without taking the slot.
+    exec_lua(&rpc, "nx.picker.open('scratch')").await;
+    poll_menu(&rpc, &mut incoming).await.expect("scratch opens");
+    feed(&rpc, "<Esc>");
+
+    assert_eq!(
+        exec_lua(&rpc, "return nx.picker._last.name").await.as_str(),
+        Some("fruits"),
+        "the non-resumable picker left the slot on the last real one",
+    );
+
+    // Resume reopens fruits at "ap", not the scratch picker.
+    exec_lua(&rpc, "nx.picker.resume()").await;
+    let menu = menu_of(&poll_menu(&rpc, &mut incoming).await.expect("resumed"));
+    assert_eq!(menu_items(&menu), vec!["apple", "apricot"]);
+}
+
+#[tokio::test]
+async fn resume_snapshot_is_bounded_to_a_window_around_the_cursor() {
+    // A huge result set isn't kept whole — the snapshot (and the retained item
+    // tables) are bounded to a window around the cursor, so a closed 100k-row picker
+    // doesn't pin its entire list in memory.
+    let dir = temp_dir("picker_resume_window");
+    let src = r#"
+nx.picker.source {
+  name = "many",
+  items = function(ctx)
+    for i = 0, 2999 do ctx.push { text = string.format("item%04d", i) } end
+  end,
+}
+"#;
+    let (rpc, mut incoming) = start(&dir, src).await;
+
+    exec_lua(&rpc, "nx.picker.open('many')").await;
+    poll_menu(&rpc, &mut incoming).await.expect("opens");
+    feed(&rpc, "<Esc>");
+
+    // Only the window's item tables are retained for resume (≤ RESUME_WINDOW = 1000),
+    // not all 3000.
+    let kept = exec_lua(
+        &rpc,
+        "local n = 0; for _ in pairs(nx.picker._last.picker.items) do n = n + 1 end; return n",
+    )
+    .await;
+    assert_eq!(
+        kept,
+        Value::from(1000),
+        "retained items are bounded to the window",
+    );
+
+    // Resume still works — the windowed rows replay, starting at the cursor (row 0).
+    exec_lua(&rpc, "nx.picker.resume()").await;
+    let menu = menu_of(&poll_menu(&rpc, &mut incoming).await.expect("resumed"));
+    assert_eq!(
+        menu_items(&menu).first().map(String::as_str),
+        Some("item0000"),
+        "the window starts at the cursor (row 0)",
+    );
+}
+
+/// A dynamic source whose result *order* changes every run (live-grep's reality).
+/// Each call flips the order, so re-running on resume would show a DIFFERENT list —
+/// resume must replay the captured snapshot instead, without invoking the source.
+const SHUFFLING_SRC: &str = r#"
+_G.run = 0
+nx.picker.source {
+  name = "shuf",
+  dynamic = true,
+  debounce = 0,
+  items = function(ctx)
+    _G.run = _G.run + 1
+    if _G.run % 2 == 1 then
+      ctx.push { text = "one" }
+      ctx.push { text = "two" }
+    else
+      ctx.push { text = "two" }
+      ctx.push { text = "one" }
+    end
+  end,
+  confirm = function(item) _G.picked = item.text end,
+}
+"#;
+
+#[tokio::test]
+async fn resume_replays_the_snapshot_without_rerunning_a_dynamic_source() {
+    // The crux: a live-grep-style source has no stable order, so resume can't re-run
+    // it — it replays the exact rows captured at close.
+    let dir = temp_dir("picker_resume_dynamic");
+    let (rpc, mut incoming) = start(&dir, SHUFFLING_SRC).await;
+
+    exec_lua(&rpc, "nx.picker.open('shuf')").await;
+    let menu = menu_of(&poll_menu(&rpc, &mut incoming).await.expect("opens"));
+    assert_eq!(menu_items(&menu), vec!["one", "two"], "first run order");
+    assert_eq!(exec_lua(&rpc, "return _G.run").await, Value::from(1));
+    feed(&rpc, "<Esc>");
+
+    // Resume shows the SAME rows — and the source was not invoked again (run still 1).
+    // A re-run would flip to ["two", "one"].
+    exec_lua(&rpc, "nx.picker.resume()").await;
+    let menu = menu_of(&poll_menu(&rpc, &mut incoming).await.expect("resumed"));
+    assert_eq!(
+        menu_items(&menu),
+        vec!["one", "two"],
+        "resume replays the frozen snapshot, not a fresh (reordered) search",
+    );
+    assert_eq!(
+        exec_lua(&rpc, "return _G.run").await,
+        Value::from(1),
+        "the source was NOT re-run on resume",
+    );
+
+    // Confirm resolves the snapshot's item; editing the query DOES re-run the source.
+    feed(&rpc, "x");
+    poll_menu(&rpc, &mut incoming)
+        .await
+        .expect("re-ran on edit");
+    assert_eq!(
+        exec_lua(&rpc, "return _G.run").await,
+        Value::from(2),
+        "a query edit after resume re-runs the live source",
+    );
 }

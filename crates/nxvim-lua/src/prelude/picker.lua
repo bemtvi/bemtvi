@@ -129,6 +129,10 @@ end
 -- windows its rendering and matches incrementally, so a source can stream 100k+
 -- candidates and stay fast; `max_results` (default 100000) is only a runaway-source
 -- safety bound.
+--
+-- `resumable = false` opts the source out of `nx.picker.resume()` (`<leader>fr`):
+-- opening it never overwrites the resume slot, so a transient internal picker (the
+-- cmdline file completer) can't shadow the last user-facing one. Defaults to true.
 function nx.picker.source(spec)
   if type(spec) ~= "table" or type(spec.name) ~= "string" then
     error("nx.picker.source: requires a { name = <string>, items = <fn> } table", 2)
@@ -246,7 +250,26 @@ function nx.picker.open(name, opts)
   if multiselect == nil then
     multiselect = true
   end
-  -- The server opens the aligned widget and kicks the initial run (gen 0, query).
+  -- The resume slot (`nx.picker.resume` / `<leader>fr`). The reopen replays a frozen
+  -- snapshot the *server* holds (the displayed rows, cursor, marks, query) — a
+  -- live-grep order isn't reproducible, so we never re-run the source. Lua's only job
+  -- is to keep `nx._picker` (the source + the window's item tables) alive for
+  -- `confirm` and future query edits; `nx._picker_save_resume` fills `last.picker` at
+  -- close. Linked onto the active picker (`_last`) so the close handler updates the
+  -- right record.
+  --
+  -- A source can opt out with `resumable = false` (the cmdline file completer does):
+  -- it is a transient internal picker whose confirm acts on the open command line, so
+  -- replaying it standalone from `<leader>fr` makes no sense. Such a picker leaves the
+  -- slot pointing at the last *real* picker (server-side too — see `resumable`), so
+  -- resume skips it.
+  if source.resumable ~= false then
+    local last = { name = name }
+    nx.picker._last = last
+    nx._picker._last = last
+  end
+  -- The server opens the aligned widget and kicks the initial run (gen 0, query);
+  -- `resumable` tells it whether to snapshot this picker when it closes.
   nx._picker_open(
     source.dynamic == true,
     width,
@@ -257,8 +280,38 @@ function nx.picker.open(name, opts)
     preview ~= nil,
     query,
     title,
-    multiselect == true
+    multiselect == true,
+    source.resumable ~= false
   )
+end
+
+-- nx.picker.resume(): reopen the most-recently-closed picker (telescope's `resume`),
+-- restored to exactly where the user left off — the displayed rows, prompt text,
+-- highlighted row, and multi-select marks. The server replays a frozen snapshot it
+-- captured at close (bounded to a window around the cursor), so a live-grep picker
+-- comes back with its *actual* previous results, not a fresh (differently-ordered)
+-- search. Re-installs `nx._picker` so `confirm` works and a later query edit re-runs
+-- the source. No-op (a gentle notice) before any resumable picker has closed.
+function nx.picker.resume()
+  local last = nx.picker._last
+  if not (last and last.picker) then
+    nx.notify("nx.picker: no picker to resume", "info")
+    return
+  end
+  -- Re-arm the Lua-side runtime (a fresh shallow copy each resume so re-closing
+  -- snapshots cleanly), then let the server replay its frozen menu.
+  local saved = last.picker
+  nx._picker = {
+    source = saved.source,
+    items = saved.items,
+    preview = saved.preview,
+    layer = saved.layer,
+    gen = saved.gen,
+    nitems = saved.nitems,
+    debounce_ms = saved.debounce_ms,
+    _last = last,
+  }
+  nx._picker_resume()
 end
 
 -- Cap on streamed results past which the job is reaped — a *safety* bound against
@@ -425,17 +478,43 @@ function nx._picker_run(gen, query)
   end
 end
 
+-- Save a closing picker's runtime onto its `_last` slot so `nx.picker.resume()` can
+-- re-arm it: the source (for `confirm` + future query edits) and the item tables for
+-- the snapshot window the server kept (`resume_keys`, in display order). Trimming
+-- `items` to the window bounds retained memory the same way the server bounds its
+-- snapshot. Tied to the *closing* picker's own `_last` (`p._last`) so a stale close
+-- never clobbers a newer picker's slot; a `resumable = false` source has no `_last`.
+function nx._picker_save_resume(p, resume_keys)
+  if not (p and p._last and resume_keys) then
+    return
+  end
+  local items = {}
+  for _, key in ipairs(resume_keys) do
+    items[key] = p.items[key]
+  end
+  p._last.picker = {
+    source = p.source,
+    items = items,
+    preview = p.preview,
+    layer = p.layer,
+    gen = p.gen,
+    nitems = p.nitems,
+    debounce_ms = p.debounce_ms,
+  }
+end
+
 -- nx._picker_result(key): the picker resolved. `key` (an integer) confirms the
 -- item under that key for the current generation; `nil` cancels. Either way the
 -- active picker is cleared (and a pending job reaped).
 -- `mode` is the confirm gesture's open mode — "current" (the focused window) or
 -- "tab" (the default `<C-t>` ⇒ a new tab) — forwarded to `source.confirm(item,
 -- mode, layer)`. `layer` is the resolved confirm target ("main"/"active"); built-in
--- sources honor both (see `nx.picker.edit`). A source that ignores the extra args
--- simply opens in the current window, as before.
-function nx._picker_result(key, mode)
+-- sources honor both (see `nx.picker.edit`). `resume_keys` (the snapshot window's
+-- item keys) lets `nx.picker.resume()` re-arm this picker — see `nx._picker_save_resume`.
+function nx._picker_result(key, mode, resume_keys)
   local p = nx._picker
   nx._picker = nil
+  nx._picker_save_resume(p, resume_keys)
   if not p then
     return
   end
@@ -472,9 +551,11 @@ end
 -- hand them to `nx.qf.send_to_loclist` (which honors `'qfdock'`: a new bottom-dock
 -- tab, or a current-window loclist + split). Deferred with `nx.schedule` so the
 -- picker float has closed and focus is back in the main layer before the list opens.
-function nx._picker_send(keys)
+function nx._picker_send(keys, resume_keys)
   local p = nx._picker
   nx._picker = nil
+  -- Keep the resume slot current even when the picker closed via a send.
+  nx._picker_save_resume(p, resume_keys)
   if not p then
     return
   end
@@ -723,5 +804,9 @@ nx.autocmd.create("VimEnter", {
         nx.picker.open(source)
       end, { default = true, desc = m[3] })
     end
+    -- `<leader>fr` reopens the last picker where you left off (telescope's `resume`).
+    nx.keymap.set("n", "<leader>fr", function()
+      nx.picker.resume()
+    end, { default = true, desc = "Resume last picker" })
   end,
 })

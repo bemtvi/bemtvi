@@ -507,6 +507,30 @@ nx.picker.source({
 -- The file-picker case is a SIDE EFFECT (it queues `nx.picker.open`) and returns
 -- the `{ __picker = true }` sentinel: the server recognises it, dismisses the
 -- command line, and lets the queued picker take over (`CmdlineComplete::PickerLaunched`).
+-- Launch the file/dir picker for a path argument and return the `{ __picker }`
+-- sentinel. The path typed so far (`before`'s trailing non-whitespace run) seeds the
+-- picker; since the command line stays open, confirm pastes the choice back into this
+-- same argument token via `nx._cmdline_set_arg`. `dirs_only` lists directories only.
+local function launch_path_picker(before, dirs_only)
+  local prefix = before:match("(%S*)$") or ""
+  pending = { dirs_only = dirs_only }
+  local popts = { query = prefix, title = dirs_only and "Select directory" or "Select file" }
+  if not dirs_only then
+    popts.preview = "file" -- a file preview pane (directories list their contents)
+  end
+  nx.picker.open("cmdline_files", popts)
+  return { __picker = true }
+end
+
+-- The argument completer a user command declared via `create(... { complete = })`
+-- (a buffer-local command shadows a global of the same name) — `"dir"` / `"file"`,
+-- or nil. Lets a registered command (e.g. the GUI's `:workspace`) get the same path
+-- completion the built-in `:cd` / `:edit` get.
+local function user_command_complete(cmd)
+  local rec = nx.user_command.buf_get(0)[cmd] or nx.user_command.get()[cmd]
+  return rec and rec.complete or nil
+end
+
 function nx._cmdline_complete_run(line, col)
   -- Argument region iff a complete word is followed by whitespace before the cursor.
   -- The command word and its trailing space are ASCII, so this byte scan of the
@@ -518,18 +542,12 @@ function nx._cmdline_complete_run(line, col)
       return option_candidates()
     end
     if cmd and (FILE_COMMANDS[cmd] or DIR_COMMANDS[cmd]) then
-      -- The path typed so far is the trailing non-whitespace run; it seeds the picker
-      -- and (since the command line stays open) confirm pastes the choice back into
-      -- this same argument token via `nx._cmdline_set_arg`.
-      local prefix = before:match("(%S*)$") or ""
-      local dirs_only = DIR_COMMANDS[cmd] == true
-      pending = { dirs_only = dirs_only }
-      local popts = { query = prefix, title = dirs_only and "Select directory" or "Select file" }
-      if not dirs_only then
-        popts.preview = "file" -- a file preview pane (directories list their contents)
-      end
-      nx.picker.open("cmdline_files", popts)
-      return { __picker = true }
+      return launch_path_picker(before, DIR_COMMANDS[cmd] == true)
+    end
+    -- A user command that declared a `dir`/`file` argument completer.
+    local uc = cmd and user_command_complete(cmd)
+    if uc == "dir" or uc == "file" then
+      return launch_path_picker(before, uc == "dir")
     end
     return {} -- no argument completer for this command yet
   end

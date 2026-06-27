@@ -1362,28 +1362,21 @@ impl ApplicationHandler<UserEvent> for App {
                     && self.view.cmdline_prefix == ':'
                     && self.view.cmdline_prompt.is_empty()
                 {
-                    // `:connect [user@]host[:port][/file]` / `:connect nxvim://…`
-                    // switches this window to an edit-host (daemon) session. It's a
-                    // client affordance (the server knows nothing of `:connect`), so
-                    // handle it here: dismiss the command line on the current server and
-                    // ask the IO thread to bring the new session up (see
-                    // `UserEvent::Connected`).
+                    // `:connect [user@]host[:port][/file]` / `:connect nxvim://…` switches
+                    // this window to an edit-host (daemon) session, and `:workspace [dir]`
+                    // swaps it onto a fresh local session rooted at the directory. Both are
+                    // client affordances, but they are *also* registered server-side as
+                    // no-op virtual commands (see [`session::CLIENT_INIT_LUA`]) so they get
+                    // completion, help, and history. So request the swap here, but DON'T
+                    // swallow the `<CR>`: let it fall through and submit the command line
+                    // normally, which records it in `:` history and runs the harmless no-op
+                    // body. The swap then arrives async (see `UserEvent::Connected`).
                     if let Some(target) = remote::connect_command(&self.view.cmdline) {
-                        self.rpc.notify("nx_input", vec![Value::from("<Esc>")]);
                         let _ = self.reconnect.send(SessionRequest::Connect(target));
-                        return;
-                    }
-                    // `:workspace [dir]` opens a directory as a workspace: it swaps this
-                    // window onto a fresh **local** session rooted at the directory (its
-                    // own per-directory shada namespace + saved layout). Like `:connect`,
-                    // the server knows nothing of it, so dismiss the command line and ask
-                    // the IO thread to bring the workspace session up.
-                    if let Some(dir) = remote::workspace_command(&self.view.cmdline) {
-                        self.rpc.notify("nx_input", vec![Value::from("<Esc>")]);
+                    } else if let Some(dir) = remote::workspace_command(&self.view.cmdline) {
                         let _ = self
                             .reconnect
                             .send(SessionRequest::Workspace(PathBuf::from(dir)));
-                        return;
                     }
                     let unnamed = self.view.focused().is_some_and(|w| w.unnamed);
                     // `dialog_action` returns `None` in a remote (daemon) session, so

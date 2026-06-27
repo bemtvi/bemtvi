@@ -415,8 +415,29 @@ async fn server_init(
         cmdline_complete_default: true,
         ts_autoinstall,
         remote_cwd,
+        // Register the GUI's client-intercepted commands as no-op virtual commands so
+        // they get name completion, help, cmdline history, and (for `:workspace`)
+        // directory-path completion. The actual session swap is still done client-side
+        // (see [`crate::run`]); the server-side body does nothing.
+        client_init_lua: Some(CLIENT_INIT_LUA.to_string()),
     })
 }
+
+/// Lua run at session startup (via [`ServerInit::client_init_lua`]) to register the GUI's
+/// `:connect` / `:workspace` as no-op user commands — so the command line completes their
+/// names, shows their help, saves them to history, and offers directory completion for
+/// `:workspace`'s argument. The window intercepts both on `<CR>` to perform the real
+/// session swap before this no-op body ever runs (and still lets the keystroke through so
+/// the command is recorded in history).
+const CLIENT_INIT_LUA: &str = r#"
+nx.user_command.create("connect", function() end, {
+  desc = "Connect to a daemon: :connect [user@]host[:port][/file] | nxvim://host:port/token?cert=hash",
+})
+nx.user_command.create("workspace", function() end, {
+  desc = "Open a directory as a workspace: :workspace [dir]",
+  complete = "dir",
+})
+"#;
 
 /// Parse a `nxvim://HOST:PORT/TOKEN?cert=HASH` connect URI into the pieces
 /// [`connect_quic`] needs: the `https://HOST:PORT` dial URL (WebTransport requires the

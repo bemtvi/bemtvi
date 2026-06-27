@@ -1096,6 +1096,133 @@ async fn picker_descends_dirs_previews_them_and_cd_lists_only_dirs() {
 }
 
 #[tokio::test]
+async fn user_command_complete_dir_lists_directories_only() {
+    let dir = temp_dir("cmdcomplete_uc_dir");
+    let tree = dir.join("tree");
+    std::fs::create_dir_all(tree.join("sub")).unwrap();
+    std::fs::write(tree.join("top.txt"), "TOP\n").unwrap();
+
+    // A user command declaring `complete = "dir"` gets the same directory-only argument
+    // completion the built-in `:cd` family gets — the path that powers the GUI's
+    // client-registered `:workspace <dir>`. Lowercase name (as the GUI registers it).
+    let init = "nx.cmdline_complete.setup {}\n\
+        nx.user_command.create('workspace', function() end, \
+        { desc = 'Open a directory as a workspace', complete = 'dir' })";
+    let (rpc, mut incoming) = start(&dir, init).await;
+    rpc.request(
+        "nx_command",
+        vec![Value::from(format!("cd {}", tree.display()))],
+    )
+    .await
+    .expect("cd");
+    barrier(&rpc).await;
+
+    // The command name still completes (and carries its desc as docs)…
+    feed(&rpc, ":works<Tab>");
+    let map = poll_menu(&rpc, &mut incoming)
+        .await
+        .expect("the command-name wildmenu");
+    assert!(
+        menu_items(&map).contains(&"workspace".to_string()),
+        "items: {:?}",
+        menu_items(&map)
+    );
+    feed(&rpc, "<Esc>");
+    poll_no_menu(&rpc, &mut incoming).await;
+    feed(&rpc, "<Esc>");
+    poll_no_menu(&rpc, &mut incoming).await;
+
+    // …and `<Tab>` in its argument lists ONLY directories, titled like `:cd`.
+    feed(&rpc, ":workspace <Tab>");
+    let items = poll_menu_nonempty(&rpc, &mut incoming).await;
+    assert_eq!(
+        items,
+        vec!["sub/"],
+        "a dir-complete user command lists directories only"
+    );
+    let map = poll_menu(&rpc, &mut incoming).await.expect("a menu frame");
+    assert_eq!(menu_title(&map).as_deref(), Some("Select directory"));
+}
+
+#[tokio::test]
+async fn client_init_lua_registers_virtual_commands_with_completion() {
+    let dir = temp_dir("cmdcomplete_client_init");
+    let tree = dir.join("tree");
+    std::fs::create_dir_all(tree.join("sub")).unwrap();
+    std::fs::write(tree.join("top.txt"), "TOP\n").unwrap();
+    std::fs::write(dir.join("init.lua"), "nx.cmdline_complete.setup {}").unwrap();
+
+    // Mirror the GUI: register `:connect` / `:workspace` as no-op virtual commands via
+    // the `client_init_lua` boot seam (run before init.lua). They must then participate
+    // in command-name completion and — for `:workspace` — directory completion.
+    let init = ServerInit {
+        config_dir: Some(dir.clone()),
+        runtimepath: vec![dir.clone()],
+        client_init_lua: Some(
+            "nx.user_command.create('connect', function() end, { desc = 'Connect to a daemon' })\n\
+             nx.user_command.create('workspace', function() end, \
+             { desc = 'Open a workspace', complete = 'dir' })"
+                .to_string(),
+        ),
+        ..Default::default()
+    };
+    let (rpc, mut incoming) = spawn(init);
+    attach(&rpc, 80, 24).await;
+    rpc.request(
+        "nx_command",
+        vec![Value::from(format!("cd {}", tree.display()))],
+    )
+    .await
+    .expect("cd");
+    barrier(&rpc).await;
+
+    // `:connect` completes as a command name (proof the seam registered it)…
+    feed(&rpc, ":conn<Tab>");
+    let map = poll_menu(&rpc, &mut incoming)
+        .await
+        .expect("the command-name wildmenu");
+    assert!(
+        menu_items(&map).contains(&"connect".to_string()),
+        "items: {:?}",
+        menu_items(&map)
+    );
+    feed(&rpc, "<Esc>");
+    poll_no_menu(&rpc, &mut incoming).await;
+    feed(&rpc, "<Esc>");
+    poll_no_menu(&rpc, &mut incoming).await;
+
+    // …and `:workspace` gets directory completion from its `complete = "dir"` spec.
+    feed(&rpc, ":workspace <Tab>");
+    let items = poll_menu_nonempty(&rpc, &mut incoming).await;
+    assert_eq!(items, vec!["sub/"], "workspace lists directories only");
+}
+
+#[tokio::test]
+async fn user_command_complete_file_lists_files() {
+    let dir = temp_dir("cmdcomplete_uc_file");
+    let tree = dir.join("tree");
+    std::fs::create_dir_all(tree.join("sub")).unwrap();
+    std::fs::write(tree.join("top.txt"), "TOP\n").unwrap();
+
+    // `complete = "file"` gets the file picker (directories + files), titled "Select file".
+    let init = "nx.cmdline_complete.setup {}\n\
+        nx.user_command.create('Grepin', function() end, { complete = 'file' })";
+    let (rpc, mut incoming) = start(&dir, init).await;
+    rpc.request(
+        "nx_command",
+        vec![Value::from(format!("cd {}", tree.display()))],
+    )
+    .await
+    .expect("cd");
+    barrier(&rpc).await;
+
+    feed(&rpc, ":Grepin <Tab>");
+    poll_menu_items_eq(&rpc, &mut incoming, &["sub/", "top.txt"]).await;
+    let map = poll_menu(&rpc, &mut incoming).await.expect("a menu frame");
+    assert_eq!(menu_title(&map).as_deref(), Some("Select file"));
+}
+
+#[tokio::test]
 async fn select_directory_row_pastes_the_directory_itself() {
     let dir = temp_dir("cmdcomplete_seldir");
     let tree = dir.join("tree");

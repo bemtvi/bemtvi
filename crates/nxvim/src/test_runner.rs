@@ -107,6 +107,8 @@ fn spawn_server(plugin_dir: PathBuf) -> (Rpc, UnboundedReceiver<Incoming>) {
             ts_autoinstall: Vec::new(),
             // No daemon: seed the cwd from the local process.
             remote_cwd: None,
+            // The plugin-test runner is not an interactive client — no virtual commands.
+            client_init_lua: None,
         };
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_io()

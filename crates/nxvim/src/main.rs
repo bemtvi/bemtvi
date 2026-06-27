@@ -537,6 +537,9 @@ fn main() -> Result<()> {
         // Local session: seed the working directory from the local process cwd
         // (`EditHost::new`'s default), not a daemon.
         remote_cwd: None,
+        // The TUI handles `:connect`/`:workspace` only at startup (flags), not as live
+        // client-intercepted commands, so it registers no virtual commands.
+        client_init_lua: None,
     };
     let server_thread = std::thread::spawn(move || {
         // Test-only fault injection (debug builds only): force a server-thread
@@ -784,6 +787,8 @@ where
                 ts_autoinstall: resolved.ts_autoinstall,
                 // Seed the working directory from the daemon (remote-cwd).
                 remote_cwd: resolved.remote_cwd,
+                // The TUI registers no client-intercepted virtual commands.
+                client_init_lua: None,
             };
             // `_guard` (the stdio child, or `()` for QUIC) lives until the editor quits.
             run_server(server_end, init).await

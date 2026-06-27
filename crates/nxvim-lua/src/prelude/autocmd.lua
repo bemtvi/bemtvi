@@ -20,6 +20,12 @@ nx._user_commands = nx._user_commands or {}
 -- create(), kept parallel to the body registry (so the dispatch path stays a plain
 -- name -> body lookup). Surfaced by get() and the command-line completion catalog.
 nx._user_command_desc = nx._user_command_desc or {}
+-- nx._user_command_complete[name] = spec: the optional `complete` passed to
+-- create() — `"dir"` / `"file"` (the only argument completers wired so far; an
+-- unknown spec is stored but ignored). Kept parallel to the body registry like the
+-- desc table; the command-line completer reads it to offer path completion for a
+-- user command's argument (e.g. the GUI's `:workspace <dir>`).
+nx._user_command_complete = nx._user_command_complete or {}
 -- nx._buf_user_commands[bufnr][name] = command: the buffer-local command
 -- registry (the analogue of the buffer-scoped `nx._keymaps` entries). A
 -- buffer-local command shadows a global one of the same name and is invisible
@@ -28,6 +34,9 @@ nx._buf_user_commands = nx._buf_user_commands or {}
 -- nx._buf_user_command_desc[bufnr][name] = desc: the buffer-local twin of
 -- nx._user_command_desc.
 nx._buf_user_command_desc = nx._buf_user_command_desc or {}
+-- nx._buf_user_command_complete[bufnr][name] = spec: the buffer-local twin of
+-- nx._user_command_complete.
+nx._buf_user_command_complete = nx._buf_user_command_complete or {}
 nx._autocmds = nx._autocmds or {}
 nx._augroups = nx._augroups or {}
 local augroup_seq, autocmd_seq = 0, 0
@@ -66,9 +75,12 @@ end
 -- register a global `:Name`. `command` is a function or an ex-command string.
 -- `opts.desc` (a one-line summary) is stored alongside the body — get() surfaces it
 -- and the command-line completion catalog shows it as the command's docs.
+-- `opts.complete` (`"dir"` / `"file"`) makes `<Tab>` in the command's argument offer
+-- path completion (via the same picker the built-in `:cd` / `:edit` use).
 function nx.user_command.create(name, command, opts)
   nx._user_commands[name] = command
   nx._user_command_desc[name] = type(opts) == "table" and opts.desc or nil
+  nx._user_command_complete[name] = type(opts) == "table" and opts.complete or nil
 end
 
 -- nx.user_command.buf_create(buffer, name, command, opts) [alias
@@ -93,6 +105,12 @@ function nx.user_command.buf_create(buffer, name, command, opts)
     nx._buf_user_command_desc[buffer] = descs
   end
   descs[name] = type(opts) == "table" and opts.desc or nil
+  local completes = nx._buf_user_command_complete[buffer]
+  if not completes then
+    completes = {}
+    nx._buf_user_command_complete[buffer] = completes
+  end
+  completes[name] = type(opts) == "table" and opts.complete or nil
 end
 
 -- Resolve a typed `:Name` to its command definition for buffer `bufnr` (0 =
@@ -119,6 +137,7 @@ end
 function nx._cleanup_buffer(bufnr)
   nx._buf_user_commands[bufnr] = nil
   nx._buf_user_command_desc[bufnr] = nil
+  nx._buf_user_command_complete[bufnr] = nil
   nx._purge_buf_keymaps(bufnr)
 end
 
@@ -1008,7 +1027,7 @@ api.nvim_clear_autocmds = nx.autocmd.clear
 -- defaults for the rest — enough for a command picker to list and run
 -- them. `nx.user_command.get` returns the globals; `nx.user_command.buf_get(buf)`
 -- returns the buffer-local commands for `buf` (0 = current), matching neovim's split.
-local function command_record(name, def, desc)
+local function command_record(name, def, desc, complete)
   return {
     name = name,
     definition = type(def) == "string" and def or "",
@@ -1019,26 +1038,33 @@ local function command_record(name, def, desc)
     bang = false,
     bar = false,
     register = false,
-    complete = nil,
+    -- The argument completer (`"dir"` / `"file"`) passed to create(), or nil — read
+    -- by the command-line completer to offer path completion for the argument.
+    complete = complete,
     range = nil,
   }
 end
-local function commands_map(registry, descs)
+local function commands_map(registry, descs, completes)
   local out = {}
   descs = descs or {}
+  completes = completes or {}
   for name, def in pairs(registry or {}) do
-    out[name] = command_record(name, def, descs[name])
+    out[name] = command_record(name, def, descs[name], completes[name])
   end
   return out
 end
 function nx.user_command.get(_opts)
-  return commands_map(nx._user_commands, nx._user_command_desc)
+  return commands_map(nx._user_commands, nx._user_command_desc, nx._user_command_complete)
 end
 function nx.user_command.buf_get(buf, _opts)
   if buf == nil or buf == 0 then
     buf = nx._cur_buf and nx._cur_buf.bufnr or 0
   end
-  return commands_map((nx._buf_user_commands or {})[buf], (nx._buf_user_command_desc or {})[buf])
+  return commands_map(
+    (nx._buf_user_commands or {})[buf],
+    (nx._buf_user_command_desc or {})[buf],
+    (nx._buf_user_command_complete or {})[buf]
+  )
 end
 api.nvim_get_commands = nx.user_command.get
 api.nvim_buf_get_commands = nx.user_command.buf_get

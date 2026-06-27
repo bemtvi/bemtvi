@@ -339,6 +339,14 @@ pub struct ServerInit {
     /// `set_current_dir`'d locally; it lives only in `DirState` + the `nx._cwd`
     /// mirror, and `:cd` moves it over the wire (`fs_chdir`).
     pub remote_cwd: Option<PathBuf>,
+    /// A Lua chunk the **client** wants run at startup, after the prelude/built-in
+    /// opt-ins and *before* `init.lua` — so a config can still override it. `None` (the
+    /// default) for the TUI and tests. The GUI uses it to register its client-handled
+    /// virtual commands (`:connect` / `:workspace`) as no-op user commands, so they get
+    /// command-name completion, help, and cmdline history (the client still intercepts
+    /// them to do the actual session swap; the server-side body is a no-op). Failing
+    /// loud: a chunk error is surfaced, not swallowed.
+    pub client_init_lua: Option<String>,
 }
 
 /// How the server provides the `"+` / `"*` clipboard registers.
@@ -2841,6 +2849,14 @@ where
     // or the first keypress's) — well before any `:`+<Tab> can be typed.
     if init.cmdline_complete_default {
         let _ = host.lua.exec("nx.cmdline_complete.setup{}");
+    }
+    // Run the client's startup Lua (the GUI registers its `:connect` / `:workspace`
+    // virtual commands here) — BEFORE init.lua, so a config can still override it. A
+    // chunk error is surfaced loudly rather than swallowed.
+    if let Some(code) = &init.client_init_lua {
+        if let Err(e) = host.lua.exec(code) {
+            host.editor.echo(format!("client init lua: {e}"));
+        }
     }
     // Mirror the daemon's installed tree-sitter parsers **lazily**: set up a `FileType`
     // autocmd (in Lua — `nx._remote_ts_autoinstall`) that `:TSInstall`s a remote

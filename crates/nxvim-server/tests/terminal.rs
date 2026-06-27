@@ -891,3 +891,42 @@ async fn live_terminal_is_not_marked_modified() {
         "vim.bo.modified must be false for a live terminal"
     );
 }
+
+/// Once the child exits, the captured output freezes into an ordinary **unnamed**
+/// buffer — and that output is unsaved content with no backing file. So the buffer
+/// is marked **modified**: losing a command's results silently on `:q`/`:qa` would
+/// be a data loss, so it carries `[+]` and arms the `E37` quit guard, exactly like a
+/// hand-edited scratch buffer. (Contrast the *live* terminal above, which mirrors a
+/// screen and must stay unmodified.)
+#[tokio::test]
+async fn exited_terminal_buffer_is_marked_modified() {
+    let _guard = serial_lock().lock().await;
+    let (rpc, _incoming) = start().await;
+
+    command(&rpc, "terminal cat").await;
+    feed(&rpc, "hello<CR>");
+    wait_lines(&rpc, "cat to echo 'hello'", |ls| has_line(ls, "hello")).await;
+
+    // `<C-d>` at the start of a line sends EOF; `cat` exits 0 and the buffer
+    // becomes an ordinary scratch buffer.
+    feed(&rpc, "<C-d>");
+    wait_lines(&rpc, "the process-exit notice", |ls| {
+        ls.iter().any(|l| l.contains("[Process exited 0]"))
+    })
+    .await;
+
+    // It is unnamed (a terminal never had a path)...
+    assert_eq!(
+        buf_name(&rpc).await,
+        "",
+        "an exited terminal buffer is unnamed"
+    );
+
+    // ...and its frozen output is unsaved content, so the buffer is modified.
+    let modified_bo = exec_lua(&rpc, "return vim.bo.modified").await;
+    assert_eq!(
+        modified_bo.as_bool(),
+        Some(true),
+        "an exited terminal's captured output must be marked modified",
+    );
+}

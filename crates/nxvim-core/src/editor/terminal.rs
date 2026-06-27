@@ -269,10 +269,13 @@ impl Editor {
         ob.buffer.insert(at, &notice);
         ob.buffer.normalize();
         ob.buffer.mark_resync();
-        // Reset *after* `mark_resync` (which sets `modified = true`): the exited
-        // terminal's frozen output is not unsaved edits, so the now-ordinary buffer
-        // closes without an `E37` prompt.
-        ob.buffer.modified = false;
+        // Keep the buffer **modified** (`mark_resync` set the flag, and we leave it):
+        // unlike a *live* terminal — a screen mirror that clears the flag on every
+        // refresh — an exited terminal's frozen output is unsaved content with no
+        // backing file. Marking it modified makes `:q`/`:qa` warn (`E37`) before
+        // discarding the child's output, so a command's results aren't lost silently;
+        // it now behaves like any hand-edited unnamed scratch buffer.
+        ob.buffer.modified = true;
         // The child is gone: clear the terminal flag so the buffer becomes an ordinary
         // (editable) scratch buffer holding the final output — keystrokes no longer
         // forward, and the read-only edit guard lifts.

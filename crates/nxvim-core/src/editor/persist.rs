@@ -106,8 +106,9 @@ pub struct PluginEntry {
 }
 
 /// A captured editor **session**: every tab's EXACT split layout (nesting + sizes) with
-/// the open file + view at each leaf, plus which tab was focused. Restored eagerly at
-/// boot ([`Editor::restore_session`]). Window ids are deliberately NOT stored — they're
+/// the open file + view at each leaf, plus which tab was focused, the global quickfix
+/// stack, and each window's location list. Restored eagerly at boot
+/// ([`Editor::restore_session`]). Window ids are deliberately NOT stored — they're
 /// session-local and reminted on restore; positions resolve through file paths.
 #[derive(Debug, Clone)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
@@ -119,6 +120,12 @@ pub struct SessionState {
     /// The edge docks open at capture (left/right/top/bottom), each with its size,
     /// hidden state, and any file-backed content. Empty when no dock was open.
     pub docks: Vec<SessionDock>,
+    /// The global **quickfix** list stack (`:copen` / `:make` / `:grep` results, with
+    /// the `:colder`/`:cnewer` history), so a workspace reopens with its last build /
+    /// search results in place. Empty when no quickfix list was populated. Per-window
+    /// **location** lists ride their [`SessionWindow`] instead.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub quickfix: crate::editor::quickfix::QfStack,
 }
 
 /// One edge dock: which side, its reserved size in cells (the boot-time fallback), an
@@ -169,6 +176,11 @@ pub struct SessionWindow {
     pub col: usize,
     pub top: usize,
     pub active: bool,
+    /// The window's **location** list stack (`:lopen` / `:lgrep` results + their
+    /// `:lolder`/`:lnewer` history), restored onto the rebuilt window. Empty when the
+    /// window had none.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub loclist: crate::editor::quickfix::QfStack,
 }
 
 /// One persisted numbered mark `'0`–`'9`: the digit, the file, and the position.
@@ -341,12 +353,22 @@ impl Editor {
         let mut tabs = Vec::new();
         let mut active_tab = 0;
         for tid in self.tab_ids() {
-            let node = match self.tab_layout_node(tid) {
-                Some(n) => n,
-                None => continue,
+            // Capture against the tab's OWN tree (live for the current tab, the stashed
+            // tree for an inactive tab). The `self.window_*` accessors only see the
+            // current layer's tree, so an inactive tab's window ids resolve to nothing
+            // through them — capturing here drops the whole tab. Read the tree directly.
+            let Some(tree) = self.tab_tree(tid) else {
+                continue;
             };
-            let active = self.tab_current_window(tid);
-            let layout = match self.capture_layout(&node, active, relative_splits) {
+            // The window whose view lives on `self.cursor`/`self.top` (rather than its
+            // stashed `saved_*`) is the focused main window — only when *this* tab is the
+            // current one and the Main layer holds focus (a focused dock parks the main
+            // tree, so its windows carry their saved view).
+            let live = (tid == current_tab && self.focused_layer == super::Layer::Main)
+                .then_some(self.windows.current);
+            let node = tree.layout_node();
+            let active = Some(tree.current);
+            let layout = match self.capture_layout(&node, tree, live, active, relative_splits) {
                 Some(l) => l,
                 None => continue, // no file-backed leaf in this tab
             };
@@ -356,12 +378,14 @@ impl Editor {
             tabs.push(SessionTab { layout });
         }
         let docks = self.export_docks();
-        if tabs.is_empty() && docks.is_empty() {
+        let quickfix = sanitize_qf_stack(&self.qf);
+        if tabs.is_empty() && docks.is_empty() && quickfix.lists.is_empty() {
             return None;
         }
         Some(SessionState {
             tabs,
             active_tab,
+            quickfix,
             docks,
         })
     }
@@ -378,8 +402,9 @@ impl Editor {
             if !self.dock_exists(side) {
                 continue;
             }
+            let live = (self.focused_layer == Layer::Dock(side)).then_some(self.windows.current);
             let layout = self.layer_tree(Layer::Dock(side)).and_then(|t| {
-                self.capture_layout(&t.layout_node(), Some(t.current), relative_splits)
+                self.capture_layout(&t.layout_node(), t, live, Some(t.current), relative_splits)
             });
             let cells = self.dock_option_values(side.keyword()).2;
             // A left/right dock is a fraction of the screen width; top/bottom of height.
@@ -410,28 +435,45 @@ impl Editor {
     /// `None` when nothing file-backed survives. With `relative_splits` the kept sizes are
     /// normalized to percentages (summing ~100) — the restore re-lays them out either way,
     /// since the window model treats split sizes as proportional weights.
+    ///
+    /// `tree` is the tab's own [`WindowTree`] (live or stashed) — leaves resolve their
+    /// buffer + view against it, never through the `self.window_*` accessors, which only
+    /// see the current layer's tree and so would drop every inactive tab's windows. `live`
+    /// names the one window (if any) whose view is on `self.cursor`/`self.top` rather than
+    /// its stashed `saved_*`; `active` is the tab's focused window.
     fn capture_layout(
         &self,
         node: &super::windows::LayoutNode,
+        tree: &super::windows::WindowTree,
+        live: Option<crate::WindowId>,
         active: Option<crate::WindowId>,
         relative_splits: bool,
     ) -> Option<SessionLayout> {
         use super::windows::LayoutNode;
         match node {
             LayoutNode::Leaf(wid) => {
-                let buf = self.window_buffer(*wid)?;
-                let path = self.buffer_name(buf).unwrap_or_default();
+                let w = tree.try_get(*wid)?;
+                let path = self.buffer_name(w.buffer).unwrap_or_default();
                 if path.is_empty() {
                     return None;
                 }
-                let (line, col) = self.window_cursor(*wid).unwrap_or((0, 0));
-                let (top, _leftcol) = self.window_scroll(*wid).unwrap_or((0, 0));
+                let (line, col, top) = if live == Some(*wid) {
+                    (self.cursor.line, self.cursor.col, self.top)
+                } else {
+                    (w.saved_cursor.line, w.saved_cursor.col, w.saved_top)
+                };
+                let loclist = w
+                    .loclist
+                    .as_ref()
+                    .map(sanitize_qf_stack)
+                    .unwrap_or_default();
                 Some(SessionLayout::Leaf(SessionWindow {
                     path: PathBuf::from(path),
                     line,
                     col,
                     top,
                     active: active == Some(*wid),
+                    loclist,
                 }))
             }
             LayoutNode::Split {
@@ -442,7 +484,9 @@ impl Editor {
                 let mut kids = Vec::new();
                 let mut kept_sizes = Vec::new();
                 for (i, child) in children.iter().enumerate() {
-                    if let Some(sl) = self.capture_layout(child, active, relative_splits) {
+                    if let Some(sl) =
+                        self.capture_layout(child, tree, live, active, relative_splits)
+                    {
                         kids.push(sl);
                         kept_sizes.push(sizes.get(i).copied().unwrap_or(1));
                     }
@@ -473,6 +517,11 @@ impl Editor {
         use crate::options::WindowOptions;
         use crate::WindowId;
         use std::collections::BTreeMap;
+        // The global quickfix stack restores regardless of layout (a session may carry
+        // only `:make` results), so seed it before the early return.
+        if !session.quickfix.lists.is_empty() {
+            self.qf = session.quickfix;
+        }
         if session.tabs.is_empty() && session.docks.is_empty() {
             return;
         }
@@ -578,7 +627,12 @@ impl Editor {
                     line: w.line,
                     col: w.col,
                 };
-                windows.insert(id, WindowTree::tiled_window(buf, cursor, w.top, 0));
+                let mut win = WindowTree::tiled_window(buf, cursor, w.top, 0);
+                // Restore the window's location list (its `:lopen` results + history).
+                if !w.loclist.lists.is_empty() {
+                    win.loclist = Some(w.loclist.clone());
+                }
+                windows.insert(id, win);
                 if w.active {
                     *active = Some(id);
                 }
@@ -923,6 +977,21 @@ impl Editor {
             self.recompute_effective_options();
         }
     }
+}
+
+/// Clone a quickfix / location list stack for persistence, dropping the live `bufnr`
+/// of every entry. A buffer number is meaningless across a restart, and a *stale* one
+/// could mis-resolve a jump to whatever buffer reuses that id — so a persisted entry
+/// keeps only its `filename`. A bufnr-only entry (no filename) becomes non-jumpable,
+/// which is correct: the buffer it named is gone.
+fn sanitize_qf_stack(stack: &crate::editor::quickfix::QfStack) -> crate::editor::quickfix::QfStack {
+    let mut out = stack.clone();
+    for list in &mut out.lists {
+        for item in &mut list.items {
+            item.bufnr = 0;
+        }
+    }
+    out
 }
 
 /// Normalize split weights to percentages summing to ~100 (the last child absorbs the

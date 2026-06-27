@@ -49,7 +49,7 @@ impl Editor {
 
     /// The window layout backing tab `id`: the live tree for the active tab, the
     /// stashed tree otherwise. `None` if `id` names no open tab.
-    fn tab_tree(&self, id: TabId) -> Option<&WindowTree> {
+    pub(crate) fn tab_tree(&self, id: TabId) -> Option<&WindowTree> {
         let idx = self.main_tabs.tabs.iter().position(|t| t.id == id)?;
         if idx == self.main_tabs.current {
             // The active tab's main tree is live on `self.windows` — unless a dock
@@ -59,13 +59,6 @@ impl Editor {
         } else {
             self.main_tabs.tabs[idx].tree.as_ref()
         }
-    }
-
-    /// The split-tree shape of tab `id` as a [`LayoutNode`] — the session-capture
-    /// accessor (`persist.rs` resolves the leaf ids to file paths). `None` if `id` names
-    /// no open tab.
-    pub(crate) fn tab_layout_node(&self, id: TabId) -> Option<super::windows::LayoutNode> {
-        self.tab_tree(id).map(|t| t.layout_node())
     }
 
     /// Every window id in tab `id`, in the same order [`Editor::window_ids`] uses

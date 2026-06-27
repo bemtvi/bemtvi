@@ -55,6 +55,24 @@ async fn window_count(rpc: &nxvim_rpc::Rpc) -> i64 {
         .unwrap_or(-1)
 }
 
+async fn tab_count(rpc: &nxvim_rpc::Rpc) -> i64 {
+    exec_lua(rpc, "return #nx.tabpage.list()")
+        .await
+        .as_i64()
+        .unwrap_or(-1)
+}
+
+/// Run `set_code` (a `setqflist`/`setloclist` call, whose server-side op drains after
+/// the chunk), then evaluate `read_code` in a *second* chunk so the op has drained.
+async fn set_then_read(rpc: &nxvim_rpc::Rpc, set_code: &str, read_code: &str) -> String {
+    exec_lua(rpc, set_code).await;
+    exec_lua(rpc, read_code)
+        .await
+        .as_str()
+        .unwrap_or_default()
+        .to_string()
+}
+
 #[tokio::test]
 async fn session_restores_split_layout_files_and_cursor() {
     let dir = temp_dir("session_store");
@@ -111,6 +129,132 @@ async fn session_restores_split_layout_files_and_cursor() {
             cursor(&rpc).await,
             (2, 0),
             "cursor restored in the active window"
+        );
+    }
+}
+
+#[tokio::test]
+async fn session_restores_multiple_tab_pages() {
+    // Two tab pages, each on its own file. The INACTIVE tab's layout is stashed off
+    // `self.windows`, and the `self.window_*` accessors only see the current layer's
+    // tree — so a naive capture resolves an inactive tab's window ids to nothing and
+    // drops the whole tab. The capture reads each tab's own tree, so both come back.
+    let dir = temp_dir("session_tabs_store");
+    let file_a = write_temp("session_tab_a", "txt", "a1\na2\na3\n");
+    let file_b = write_temp("session_tab_b", "txt", "b1\nb2\nb3\n");
+
+    {
+        let (rpc, incoming) = start_attached(init(&dir, Some(file_a.clone()), true), 80, 25).await;
+        exec_lua(&rpc, "nx.shada.save_layout(true)").await;
+        feed(&rpc, &format!(":tabnew {file_b}<CR>")); // tab 2, on file_b (focused)
+        feed(&rpc, "3G");
+        assert_eq!(tab_count(&rpc).await, 2, "two tabs before quit");
+        feed(&rpc, ":qa<CR>");
+        await_server_exit(incoming).await;
+    }
+
+    {
+        let (rpc, _incoming) = start_attached(init(&dir, None, true), 80, 25).await;
+        assert_eq!(tab_count(&rpc).await, 2, "both tab pages came back");
+        // The saved active tab (tab 2, on file_b) is refocused at its cursor line.
+        let name = exec_lua(&rpc, "return nx.buf.name(nx.win.buf(nx.win.current()))")
+            .await
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
+        assert!(name.contains(&file_b), "tab 2 (file_b) is focused: {name}");
+        assert_eq!(cursor(&rpc).await, (3, 0), "its cursor line restored");
+    }
+}
+
+#[tokio::test]
+async fn session_restores_the_quickfix_list() {
+    // The global quickfix stack rides the session: a `:make`/`:grep` result is back in
+    // place (title + entries) after a restart, so `:copen` shows the last build again.
+    let dir = temp_dir("session_qf_store");
+    let file_a = write_temp("session_qf_a", "txt", "a1\na2\na3\n");
+
+    {
+        let (rpc, incoming) = start_attached(init(&dir, Some(file_a.clone()), true), 80, 25).await;
+        exec_lua(&rpc, "nx.shada.save_layout(true)").await;
+        // Set then read back so the queued server-side op has drained into `self.qf`
+        // before the exit flush captures it.
+        let got = set_then_read(
+            &rpc,
+            &format!(
+                r#"vim.fn.setqflist({{}}, " ", {{ title = "build", items = {{
+                     {{ filename = {file_a:?}, lnum = 2, col = 1, text = "boom" }},
+                   }} }})"#,
+            ),
+            r#"local q = vim.fn.getqflist({ items = true, title = true })
+               return string.format("%d|%s|%s", #q.items, q.title, q.items[1].text)"#,
+        )
+        .await;
+        assert_eq!(got, "1|build|boom", "quickfix list populated before quit");
+        feed(&rpc, ":qa<CR>");
+        await_server_exit(incoming).await;
+    }
+
+    {
+        let (rpc, _incoming) = start_attached(init(&dir, None, true), 80, 25).await;
+        let got = exec_lua(
+            &rpc,
+            r#"local q = vim.fn.getqflist({ items = true, title = true })
+               local e = q.items[1]
+               return string.format("%d|%s|%s|%d", #q.items, q.title, e and e.text or "", e and e.lnum or 0)"#,
+        )
+        .await
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+        assert_eq!(
+            got, "1|build|boom|2",
+            "the quickfix list survived the restart"
+        );
+    }
+}
+
+#[tokio::test]
+async fn session_restores_a_window_location_list() {
+    // A window's location list (`:lopen` results) rides its restored window, so the
+    // reopened file shows its last location list.
+    let dir = temp_dir("session_loc_store");
+    let file_a = write_temp("session_loc_a", "txt", "a1\na2\na3\n");
+
+    {
+        let (rpc, incoming) = start_attached(init(&dir, Some(file_a.clone()), true), 80, 25).await;
+        exec_lua(&rpc, "nx.shada.save_layout(true)").await;
+        let got = set_then_read(
+            &rpc,
+            &format!(
+                r#"vim.fn.setloclist(0, {{}}, " ", {{ title = "refs", items = {{
+                     {{ filename = {file_a:?}, lnum = 3, col = 1, text = "ref" }},
+                   }} }})"#,
+            ),
+            r#"local q = vim.fn.getloclist(0, { items = true, title = true })
+               return string.format("%d|%s|%s", #q.items, q.title, q.items[1].text)"#,
+        )
+        .await;
+        assert_eq!(got, "1|refs|ref", "location list populated before quit");
+        feed(&rpc, ":qa<CR>");
+        await_server_exit(incoming).await;
+    }
+
+    {
+        let (rpc, _incoming) = start_attached(init(&dir, None, true), 80, 25).await;
+        let got = exec_lua(
+            &rpc,
+            r#"local q = vim.fn.getloclist(0, { items = true, title = true })
+               local e = q.items[1]
+               return string.format("%d|%s|%s|%d", #q.items, q.title, e and e.text or "", e and e.lnum or 0)"#,
+        )
+        .await
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+        assert_eq!(
+            got, "1|refs|ref|3",
+            "the location list survived on the restored window"
         );
     }
 }

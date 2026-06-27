@@ -49,6 +49,33 @@ nx.keymap.set("n", "<leader>w", function()
   end
 end)
 
+--------------------------------------------------------------------------------
+-- nx.wso — per-workspace OPTION overrides. A workspace can pin a global option to a
+-- project-specific value that takes PRECEDENCE over the global one (`nx.o`) while the
+-- workspace is open, and persists in the workspace shada (re-applied next launch).
+-- Only global options qualify (window/buffer options are per-instance).
+--
+--   nx.wso.foo = v    -- set the override (nx.o.foo then reads v in this workspace)
+--   nx.wso.foo = nil  -- clear it (back to the global value)
+--   nx.wso.foo        -- read the override, or nil when none
+--
+-- Try: in a workspace, `\o` flips case-sensitive search just for THIS project; reopen
+-- the workspace and it's still set, while other projects keep your global default.
+--------------------------------------------------------------------------------
+nx.keymap.set("n", "<leader>o", function()
+  if not nx.workspace.active() then
+    nx.notify("workspace options need a `--workspace` launch", 3)
+    return
+  end
+  -- Toggle this workspace's `ignorecase` override (independent of the global `nx.o`).
+  if nx.wso.ignorecase == nil then
+    nx.wso.ignorecase = not nx.o.ignorecase
+  else
+    nx.wso.ignorecase = not nx.wso.ignorecase
+  end
+  nx.notify("workspace ignorecase = " .. tostring(nx.wso.ignorecase) .. " (persists)", 2)
+end)
+
 -- Greet the user on startup so the example is self-explaining when launched.
 nx.autocmd("VimEnter", {
   callback = function()

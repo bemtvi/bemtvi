@@ -754,6 +754,19 @@ pub struct GlobalOptionOp {
     pub value: OptionValue,
 }
 
+/// A per-workspace **option override** queued by `nx.wso`, drained by the server into the
+/// editor's workspace overlay (`Editor::set_workspace_option`) after the chunk. `value`
+/// `Some` sets the override (winning over the global value), `None` clears it
+/// (`nx.wso.foo = nil` → back to the global value). The Lua side has canonicalized `name`
+/// and written through `nx._wso_mirror`. Only global options are valid; the core validates.
+#[derive(Clone, Debug)]
+pub struct WorkspaceOptionOp {
+    /// Canonical option name (`ignorecase` / `mouse` / …).
+    pub name: String,
+    /// The override value (`Some`), or `None` to clear the override.
+    pub value: Option<OptionValue>,
+}
+
 /// One structured quickfix item from `setqflist(list, …)` — the Lua-side dict
 /// form, before the server resolves it into a `nxvim_core::QfEntry`. Mirrors the
 /// keys vim's `setqflist` accepts; absent keys arrive as their zero value.

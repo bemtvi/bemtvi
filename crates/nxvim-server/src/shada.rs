@@ -161,6 +161,12 @@ const META: TableDefinition<&str, &[u8]> = TableDefinition::new("meta");
 /// array-encoded `meta` row stays byte-compatible; old stores simply lack the table.
 const SESSION: TableDefinition<&str, &[u8]> = TableDefinition::new("session");
 
+/// `workspace_options` table: a single `"v"` row holding the msgpack workspace option
+/// overlay ([`nxvim_core::options::WorkspaceOptions`] — the `nx.wso` per-workspace global
+/// overrides). Like [`SESSION`], the newest store's whole value wins on merge (keyed by
+/// `meta.flush_ts`), and a separate table keeps old stores byte-compatible (they lack it).
+const WORKSPACE_OPTIONS: TableDefinition<&str, &[u8]> = TableDefinition::new("workspace_options");
+
 /// A register as stored on disk: its contents, paste kind, and the write
 /// timestamp that drives the cross-instance recency merge.
 #[derive(Serialize, Deserialize)]
@@ -567,6 +573,21 @@ fn write_state(db: &Database, state: &PersistState) -> std::io::Result<()> {
                 .map_err(std::io::Error::other)?;
         }
     }
+    {
+        // The workspace option overlay is a whole-value record too (newest store wins):
+        // rewrite the single row, or clear it when there are no overrides.
+        let mut table = wtxn
+            .open_table(WORKSPACE_OPTIONS)
+            .map_err(std::io::Error::other)?;
+        table.retain(|_, _| false).map_err(std::io::Error::other)?;
+        if !state.workspace_options.is_empty() {
+            let bytes =
+                rmp_serde::to_vec(&state.workspace_options).map_err(std::io::Error::other)?;
+            table
+                .insert("v", bytes.as_slice())
+                .map_err(std::io::Error::other)?;
+        }
+    }
     write_history(&wtxn, HIST_SEARCH, &state.search_history, ts)?;
     write_history(&wtxn, HIST_EX, &state.ex_history, ts)?;
     wtxn.commit().map_err(std::io::Error::other)?;
@@ -621,6 +642,9 @@ struct MergedRaw {
     /// The workspace session (open files + layout): newest store's whole value wins,
     /// keyed by `meta.flush_ts` like the jumplist. `None` until a store carries one.
     session: (u64, Option<nxvim_core::SessionState>),
+    /// The per-workspace option overlay (`nx.wso`): newest store's whole value wins,
+    /// keyed by `meta.flush_ts` like the session. Empty until a store carries one.
+    workspace_options: (u64, nxvim_core::options::WorkspaceOptions),
 }
 
 /// Recency-merge a set of opened stores into one [`MergedRaw`]: per-key newest-`ts`
@@ -647,6 +671,9 @@ fn collect_merge<'a>(dbs: impl IntoIterator<Item = &'a Database>) -> MergedRaw {
             if meta.flush_ts > m.session.0 {
                 m.session = (meta.flush_ts, read_session(db));
             }
+            if meta.flush_ts > m.workspace_options.0 {
+                m.workspace_options = (meta.flush_ts, read_workspace_options(db));
+            }
             if let Some(exit) = meta.exit {
                 if meta.exit_ts > m.exit.0 {
                     m.exit = (meta.exit_ts, Some(exit));
@@ -668,6 +695,21 @@ fn read_session(db: &Database) -> Option<nxvim_core::SessionState> {
     };
     let bytes = table.get("v").ok()??;
     rmp_serde::from_slice(bytes.value()).ok()
+}
+
+/// Read one store's `workspace_options` row (the msgpack overlay blob), or empty when the
+/// table is absent (old store) / empty / undecodable.
+fn read_workspace_options(db: &Database) -> nxvim_core::options::WorkspaceOptions {
+    let read = || -> Option<nxvim_core::options::WorkspaceOptions> {
+        let rtxn = db.begin_read().ok()?;
+        let table = match rtxn.open_table(WORKSPACE_OPTIONS) {
+            Ok(t) => t,
+            Err(_) => return None,
+        };
+        let bytes = table.get("v").ok()??;
+        rmp_serde::from_slice(bytes.value()).ok()
+    };
+    read().unwrap_or_default()
 }
 
 /// Project a [`MergedRaw`] (its numbered marks already resolved to `numbered_marks`,
@@ -739,6 +781,9 @@ fn build_state(m: MergedRaw, numbered_marks: Vec<NumberedMark>) -> PersistState 
         // it when a workspace namespace is active.
         session: m.session.1,
         plugin_data: group_plugin(m.plugin),
+        // The restored per-workspace option overlay (newest store wins); the editor
+        // re-applies it at import (`seed`/`apply_persist`).
+        workspace_options: m.workspace_options.1,
     }
 }
 

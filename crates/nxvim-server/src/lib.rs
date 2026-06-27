@@ -2219,6 +2219,11 @@ impl EditHost {
         }
         // Fold in the opt-in plugin shada (it lives in the runtime, not the editor).
         snap.plugin_data = tuples_to_plugin_shada(self.lua.plugin_shada_export());
+        // A workspace-scoped session persists its `nx.wso` option overlay too (independent
+        // of layout capture); the global store never carries per-workspace overrides.
+        if self.workspace_session {
+            snap.workspace_options = self.editor.workspace_options().clone();
+        }
         let mut flushed = false;
         if let Some(store) = self.shada.as_mut() {
             // A live checkpoint never compacts: deleting an absorbed sibling while we
@@ -2246,6 +2251,11 @@ impl EditHost {
             snap.session = self.editor.export_session();
         }
         snap.plugin_data = tuples_to_plugin_shada(self.lua.plugin_shada_export());
+        // A workspace-scoped session persists its `nx.wso` option overlay too (independent
+        // of layout capture); the global store never carries per-workspace overrides.
+        if self.workspace_session {
+            snap.workspace_options = self.editor.workspace_options().clone();
+        }
         if let Some(store) = self.shada.as_mut() {
             // The clean exit: compact (delete the siblings absorbed at load) *after*
             // this final snapshot — which folds in their data — is durable.
@@ -2360,6 +2370,11 @@ impl EditHost {
         let mut snap = self.editor.export_persist();
         snap.exit_cursor = None;
         snap.plugin_data = tuples_to_plugin_shada(self.lua.plugin_shada_export());
+        // A workspace-scoped session persists its `nx.wso` option overlay too (independent
+        // of layout capture); the global store never carries per-workspace overrides.
+        if self.workspace_session {
+            snap.workspace_options = self.editor.workspace_options().clone();
+        }
         // `:wshada` is not an exit — don't compact (we're still live and locked).
         let result = self.shada.as_mut().unwrap().flush(&snap, false);
         if let Err(e) = result {

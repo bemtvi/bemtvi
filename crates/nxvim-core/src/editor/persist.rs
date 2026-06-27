@@ -76,6 +76,14 @@ pub struct PersistState {
     /// never the core registers / marks / history. Empty for a session with no
     /// opted-in plugin. See `docs/plans/2026-06-26-plugin-shada-namespaces.md`.
     pub plugin_data: Vec<PluginNamespace>,
+    /// The per-workspace **option overlay** (`nx.wso`): canonical global-option name → the
+    /// workspace's overriding value, which wins over the process-global value while the
+    /// workspace is open. Captured only for a workspace-scoped session (the server attaches
+    /// it like [`PersistState::session`]) and re-applied at load via
+    /// [`Editor::seed_workspace_options`]. `#[serde(default)]` so an older store without it
+    /// loads as no overrides. See [`crate::options::WorkspaceOptions`].
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub workspace_options: crate::options::WorkspaceOptions,
 }
 
 /// One plugin's isolated shada namespace: its name and full key→value map. The
@@ -293,6 +301,10 @@ impl Editor {
             // attaches it at flush (LuaRuntime::plugin_shada_export), so core leaves
             // it empty here.
             plugin_data: Vec::new(),
+            // The workspace option overlay rides the store only for a workspace-scoped
+            // session — the server attaches it at flush (like `session`), so the global
+            // shada never carries per-workspace overrides. Empty here.
+            workspace_options: crate::options::WorkspaceOptions::new(),
         }
     }
 
@@ -879,6 +891,18 @@ impl Editor {
             .into_iter()
             .map(|j| (j.path, j.line, j.col))
             .collect();
+        // Seed the per-workspace option overlay (`nx.wso`) and apply it. Additive: a live
+        // override set this session is kept (unless `replace`); a restored one fills an
+        // unset key. The overlay wins over the global base, so the recompute makes the
+        // effective options reflect the workspace overrides regardless of load order.
+        if !state.workspace_options.is_empty() {
+            for (name, value) in state.workspace_options {
+                if replace || !self.workspace_options.contains_key(&name) {
+                    self.workspace_options.insert(name, value);
+                }
+            }
+            self.recompute_effective_options();
+        }
     }
 }
 

@@ -377,6 +377,48 @@ nx.o = setmetatable({}, {
 })
 vim.o = nx.o
 
+-- Rust→Lua mirror of the core's per-workspace option OVERRIDES (nx.wso), refreshed by
+-- the server (nx._set_wso_mirror) each frame: canonical global-option name -> the
+-- workspace's overriding value currently in effect (including overrides restored from
+-- the workspace shada). Empty outside a --workspace session / before any override.
+nx._wso_mirror = nx._wso_mirror or {}
+function nx._set_wso_mirror(t)
+  nx._wso_mirror = t or {}
+end
+
+-- nx.wso — per-workspace option overrides that take PRECEDENCE over the global value
+-- (the value `nx.o` reads). Only GLOBAL options can be overridden — window/buffer
+-- options are per-instance, with no global tier to sit above. `nx.wso.foo = v` sets the
+-- override (so `nx.o.foo` then reads `v` while the workspace is open); `nx.wso.foo = nil`
+-- clears it (back to the global value); `nx.wso.foo` reads the override, or nil when none.
+-- Overrides persist in the workspace shada and are re-applied at the next launch.
+local function wso_canon(k)
+  local canon = O_GLOBAL[k]
+  if not canon then
+    error(
+      "nx.wso: '"
+        .. tostring(k)
+        .. "' is not a global option — only global options take a workspace override "
+        .. "(window/buffer options are per-instance)",
+      2
+    )
+  end
+  return canon
+end
+nx.wso = setmetatable({}, {
+  __index = function(_, k)
+    return nx._wso_mirror[wso_canon(k)]
+  end,
+  __newindex = function(_, k, v)
+    local canon = wso_canon(k)
+    -- Queue the override (v == nil clears it) and write through the mirror so a
+    -- read-after-write within this chunk is consistent (the server overwrites it on the
+    -- next push, reflecting the core's validated/merged overlay).
+    nx._set_workspace_option(canon, v)
+    nx._wso_mirror[canon] = v
+  end,
+})
+
 -- An option name nxvim actually models (any scope): the routed window/buffer/
 -- global options plus the read-mostly catch-all store. Used by vim.fn.exists to
 -- answer the `&opt` / `+opt` probe honestly — 1 only for options we really have.

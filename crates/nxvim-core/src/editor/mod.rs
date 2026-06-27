@@ -977,8 +977,21 @@ pub struct Editor {
     /// [`cmdcomplete`](crate::editor::cmdcomplete).
     cmdline_complete_saved: Option<(String, usize)>,
     pub should_quit: bool,
-    /// Editor options set via `:set` (number column, …).
+    /// The **effective** global options every read sees (number column, search flags,
+    /// …): [`Editor::global_base`] with the per-workspace [`Editor::workspace_options`]
+    /// overlay applied on top. Recomputed by [`Editor::recompute_effective_options`]
+    /// whenever either layer changes; never written field-by-field outside the setters.
     pub options: Options,
+    /// The process-global option values — what `init.lua` / `:set` / `nx.o` write. The
+    /// *base* layer beneath [`Editor::workspace_options`]; the workspace overlay takes
+    /// precedence, so the effective [`Editor::options`] = this with the overlay applied.
+    /// Equal to `options` when no workspace override is active.
+    global_base: Options,
+    /// The per-workspace option **overlay** (`nx.wso`): canonical global-option name → the
+    /// workspace's overriding value, winning over [`Editor::global_base`]. Persisted in the
+    /// workspace shada and re-applied at load. Empty outside a workspace / before any
+    /// override.
+    workspace_options: crate::options::WorkspaceOptions,
     /// The global quickfix **list stack**: errors parsed from command output /
     /// ingested text via `'errorformat'`, kept as vim's up-to-10-deep history that
     /// `:colder`/`:cnewer` walk. The per-window location lists live on each
@@ -1580,6 +1593,10 @@ impl Editor {
             cmdline_complete_request: None,
             should_quit: false,
             options: Options::default(),
+            // The base + overlay start equal to the effective options (no overrides yet);
+            // a workspace seed or an `nx.wso` write later diverges them via recompute.
+            global_base: Options::default(),
+            workspace_options: crate::options::WorkspaceOptions::new(),
             qf: QfStack::default(),
             qf_bufnr: None,
             panel_buffers: Vec::new(),

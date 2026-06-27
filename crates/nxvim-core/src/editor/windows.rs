@@ -1482,23 +1482,79 @@ impl Editor {
     /// no-op (the Lua side only forwards the canonical wired set). This is the same
     /// state the `:set` ex path writes — the two routes share one home.
     pub fn set_global_option_bool(&mut self, name: &str, value: bool) {
-        match name {
-            "ignorecase" => self.options.ignorecase = value,
-            "smartcase" => self.options.smartcase = value,
-            "wrapscan" => self.options.wrapscan = value,
-            "hlsearch" => self.options.hlsearch = value,
-            "incsearch" => self.options.incsearch = value,
-            "autoread" => self.options.autoread = value,
-            "imagepreview" => self.options.imagepreview = value,
-            "timeout" => self.options.timeout = value,
-            "scrollanim" => self.options.scrollanim = value,
-            "qfdock" => self.options.qfdock = value,
-            "bdclosetab" => self.options.bdclosetab = value,
-            "relative_splits" => self.options.relative_splits = value,
-            "relative_docks" => self.options.relative_docks = value,
-            "equalalways" => self.options.equalalways = value,
-            _ => {}
+        // Write the *base* layer; the effective `options` is recomputed with the workspace
+        // overlay on top, so a workspace override of this option keeps winning.
+        self.global_base
+            .set_scalar(name, &crate::options::OptionScalar::Bool(value));
+        self.recompute_effective_options();
+    }
+
+    /// Recompute the effective [`Options`] (`self.options`) from the process-global base
+    /// plus the per-workspace overlay: clone the base, then apply each
+    /// [`Editor::workspace_options`] override on top so a workspace value wins over the
+    /// global one. Called after any write to either layer. Cheap (one [`Options`] clone +
+    /// a usually-empty overlay), and keeps every option read going through the single
+    /// merged `self.options` field — no read site needs to know the layering exists.
+    pub(crate) fn recompute_effective_options(&mut self) {
+        self.options = self.global_base.clone();
+        for (name, value) in self.workspace_options.iter() {
+            self.options.set_scalar(name, value);
         }
+    }
+
+    /// Set (or, with `None`, clear) a per-workspace **option override** — the `nx.wso`
+    /// surface. The override sits above the process-global value, so it takes precedence
+    /// while the workspace is open and is persisted in the workspace shada. Only **global**
+    /// options can be overridden (window/buffer/dock options are per-instance, with no
+    /// global tier to sit above); the scalar's kind must match the option's. Returns the
+    /// canonical name on success, or an `Err(message)` to echo on an invalid name/kind.
+    pub fn set_workspace_option(
+        &mut self,
+        name: &str,
+        value: Option<crate::options::OptionScalar>,
+    ) -> Result<&'static str, String> {
+        use crate::options::{OptKind, OptScope, OptionScalar};
+        let (canon, kind, scope) = crate::options::option_meta(name)
+            .ok_or_else(|| format!("E518: Unknown option: {name}"))?;
+        if scope != OptScope::Global {
+            return Err(format!(
+                "E5xx: {canon} is a {}-local option; only global options take a workspace override",
+                scope.as_str()
+            ));
+        }
+        if let Some(ref v) = value {
+            let ok = matches!(
+                (kind, v),
+                (OptKind::Bool, OptionScalar::Bool(_))
+                    | (OptKind::Num, OptionScalar::Num(_))
+                    | (OptKind::Str, OptionScalar::Str(_))
+            );
+            if !ok {
+                return Err(format!(
+                    "E521: Number required: {canon} expects a {} value",
+                    kind.as_str()
+                ));
+            }
+            self.workspace_options.insert(canon.to_string(), v.clone());
+        } else {
+            self.workspace_options.remove(canon);
+        }
+        self.recompute_effective_options();
+        Ok(canon)
+    }
+
+    /// The per-workspace option overlay, for the server to mirror to Lua (`nx.wso`) and to
+    /// harvest into the workspace shada at flush.
+    pub fn workspace_options(&self) -> &crate::options::WorkspaceOptions {
+        &self.workspace_options
+    }
+
+    /// Seed the per-workspace option overlay from the loaded workspace shada and apply it,
+    /// at boot. The overlay wins over whatever `init.lua` set as the global base (recompute
+    /// re-applies it on top), so workspace options take precedence regardless of load order.
+    pub fn seed_workspace_options(&mut self, overlay: crate::options::WorkspaceOptions) {
+        self.workspace_options = overlay;
+        self.recompute_effective_options();
     }
 
     /// Set a numeric global option from outside the editor, the numeric analogue
@@ -1523,13 +1579,10 @@ impl Editor {
                 self.echo(format!("E487: Argument must be positive: {name}={value}"));
                 return;
             }
-            match name {
-                "mousetime" => self.options.mousetime = value as usize,
-                "timeoutlen" => self.options.timeoutlen = value as usize,
-                "scrollanimduration" => self.options.scrollanimduration = value as usize,
-                "scrollback" => self.options.scrollback = value as usize,
-                _ => unreachable!("guarded above"),
-            }
+            // Write the *base* layer; recompute applies the workspace overlay on top.
+            self.global_base
+                .set_scalar(name, &crate::options::OptionScalar::Num(value));
+            self.recompute_effective_options();
             return;
         }
         let max = match name {
@@ -1545,11 +1598,9 @@ impl Editor {
             self.echo(format!("E474: Invalid argument: {name}={value}"));
             return;
         }
-        match name {
-            "showtabline" => self.options.showtabline = value as u8,
-            "laststatus" => self.options.laststatus = value as u8,
-            _ => unreachable!("validated above"),
-        }
+        self.global_base
+            .set_scalar(name, &crate::options::OptionScalar::Num(value));
+        self.recompute_effective_options();
         self.relayout();
         self.ensure_visible();
     }
@@ -1568,23 +1619,16 @@ impl Editor {
     /// loud (E518) on an unhandled name instead of silently no-op'ing; the Lua bridge
     /// ignores the result (it forwards only the canonical wired set).
     pub fn set_global_option_str(&mut self, name: &str, value: &str) -> bool {
-        match name {
-            "statusline" => self.options.statusline = value.to_string(),
-            "tabline" => self.options.tabline = value.to_string(),
-            "guifont" => self.options.guifont = value.to_string(),
-            "mouse" => self.options.mouse = value.to_string(),
-            "mousemodel" => self.options.mousemodel = value.to_string(),
-            "mousescroll" => self.options.mousescroll = value.to_string(),
-            "regexsyntax" => self.options.regexsyntax = value.to_string(),
-            "fileencodings" => self.options.fileencodings = value.to_string(),
-            "errorformat" => self.options.errorformat = value.to_string(),
-            "switchbuf" => self.options.switchbuf = value.to_string(),
-            "makeprg" => self.options.makeprg = value.to_string(),
-            "grepprg" => self.options.grepprg = value.to_string(),
-            "grepformat" => self.options.grepformat = value.to_string(),
-            _ => return false,
+        // Write the *base* layer; recompute applies the workspace overlay on top. The
+        // shared name→field map (`Options::set_scalar`) reports whether `name` is a wired
+        // string global, so the `:set` path can still fail loud (E518) on an unknown name.
+        let handled = self
+            .global_base
+            .set_scalar(name, &crate::options::OptionScalar::Str(value.to_string()));
+        if handled {
+            self.recompute_effective_options();
         }
-        true
+        handled
     }
 
     /// The editor's global options, for the server to mirror to Lua (`vim.o`).

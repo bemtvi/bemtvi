@@ -25,7 +25,7 @@ use crate::ops::{
     OptionValue, PanelOp, PickerOpenReq, PickerPush, PreviewPush, QfItem, QfSetOp, RegisterSetOp,
     SnippetAddReq, SnippetSetupReq, StatuslineKind, StatuslinePublishReq, StatuslineSetupReq,
     StatuslineTarget, TabOp, TerminalOpenReq, TsOp, UiFloatReq, UiInputReq, UiSelectReq, ViewOp,
-    VirtChunkData, VirtDecorData, WindowOp,
+    VirtChunkData, VirtDecorData, WindowOp, WorkspaceOptionOp,
 };
 use crate::runtime::{OutputLine, Shared};
 use crate::vimregex;
@@ -1588,6 +1588,32 @@ pub(crate) fn install_runtime_api(
                     .global_ops
                     .push(GlobalOptionOp { name, value });
             }
+            Ok(())
+        })?,
+    )?;
+
+    // `nx._set_workspace_option(name, value)`: queue a [`WorkspaceOptionOp`] for the
+    // server to apply to the editor's per-workspace overlay (`nx.wso`). The prelude has
+    // canonicalized `name`; a `nil` value clears the override (back to the global value),
+    // any other type sets it. Only global options are valid — the core validates and
+    // echoes an error for a window/buffer name or a kind mismatch.
+    let sh = shared.clone();
+    nx.set(
+        "_set_workspace_option",
+        lua.create_function(move |_, (name, value): (String, mlua::Value)| {
+            let value = match value {
+                mlua::Value::Nil => None,
+                mlua::Value::Boolean(b) => Some(OptionValue::Bool(b)),
+                mlua::Value::Integer(n) => Some(OptionValue::Number(lua_i64(n))),
+                mlua::Value::Number(n) => Some(OptionValue::Number(n as i64)),
+                mlua::Value::String(s) => Some(OptionValue::String(s.to_str()?.to_string())),
+                // An unsupported value type is a no-op rather than a clear (a clear is
+                // only an explicit `nil`); the prelude already restricts the surface.
+                _ => return Ok(()),
+            };
+            sh.borrow_mut()
+                .workspace_option_ops
+                .push(WorkspaceOptionOp { name, value });
             Ok(())
         })?,
     )?;

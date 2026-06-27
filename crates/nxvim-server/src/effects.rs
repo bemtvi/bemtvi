@@ -635,6 +635,21 @@ impl EditHost {
                 }
             }
         }
+        // Per-workspace option overrides from `nx.wso`: set (`Some`) or clear (`None`) the
+        // override in the editor's workspace overlay (which wins over the global value). An
+        // invalid name / kind echoes the core's error (fail loud — the prelude restricts the
+        // surface to global options, so this catches a stray non-global / bad value).
+        for op in self.lua.take_workspace_option_ops() {
+            use nxvim_core::options::OptionScalar;
+            let value = op.value.map(|v| match v {
+                OptionValue::Bool(b) => OptionScalar::Bool(b),
+                OptionValue::Number(n) => OptionScalar::Num(n),
+                OptionValue::String(s) => OptionScalar::Str(s),
+            });
+            if let Err(msg) = self.editor.set_workspace_option(&op.name, value) {
+                self.editor.echo(msg);
+            }
+        }
         // Treesitter bridges from `nx.treesitter`: the query-override push
         // (`nx.treesitter.set_query`). Highlight on/off and the language are
         // declarative buffer state now (`nx.bo.ts_highlight` / `nx.bo.filetype`),
@@ -1999,6 +2014,23 @@ impl EditHost {
             relative_docks: go.relative_docks,
             equalalways: go.equalalways,
         });
+        // The per-workspace option overrides currently in effect, mirrored so `nx.wso`
+        // reads the core's overlay (including overrides restored from the workspace shada).
+        // Usually empty, so this is cheap and ungated.
+        let wso: Vec<(String, OptionValue)> = self
+            .editor
+            .workspace_options()
+            .iter()
+            .map(|(name, scalar)| {
+                let v = match scalar {
+                    nxvim_core::options::OptionScalar::Bool(b) => OptionValue::Bool(*b),
+                    nxvim_core::options::OptionScalar::Num(n) => OptionValue::Number(*n),
+                    nxvim_core::options::OptionScalar::Str(s) => OptionValue::String(s.clone()),
+                };
+                (name.clone(), v)
+            })
+            .collect();
+        let _ = self.lua.set_wso_mirror(&wso);
         // The register file, mirrored so `vim.fn.getreg` / `getregtype` read the
         // core's current registers (stored cells + the read-only specials). Small
         // (a handful of short strings), so it isn't gated on a dirty flag.

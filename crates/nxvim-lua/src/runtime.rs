@@ -22,7 +22,7 @@ use crate::ops::{
     LoopOp, LspClientData, LspOp, PanelOp, PickerOpenReq, PickerPush, QfSetOp, RawKeymap, RawRhs,
     RegisterSetOp, SemanticTokenData, SnippetAddReq, SnippetSetupReq, StatuslinePublishReq,
     StatuslineSetupReq, TabOp, TerminalOpenReq, TsOp, UiFloatReq, UiInputReq, UiSelectReq, ViewOp,
-    WindowOp,
+    WindowOp, WorkspaceOptionOp,
 };
 
 /// `skip_serializing_if` predicate: drop a `false` flag from the serialized
@@ -617,6 +617,9 @@ pub(crate) struct Shared {
     /// Global-option writes from `vim.o` for a wired search option, drained by
     /// the server into the editor's global options after the chunk.
     pub(crate) global_ops: Vec<GlobalOptionOp>,
+    /// Per-workspace option overrides from `nx.wso`, drained by the server into the
+    /// editor's workspace overlay after the chunk (`Some` = set, `None` = clear).
+    pub(crate) workspace_option_ops: Vec<WorkspaceOptionOp>,
     /// Treesitter bridge requests from `vim.treesitter.start` / `stop`, drained
     /// by the server into the editor's per-buffer treesitter override.
     pub(crate) ts_ops: Vec<TsOp>,
@@ -1228,6 +1231,12 @@ impl LuaRuntime {
         /// Take the global-option writes queued by `vim.o` since the last drain, for
         /// the server to apply to the editor's global options.
         take_global_ops -> Vec<GlobalOptionOp> = global_ops
+    }
+
+    take_queue! {
+        /// Take the per-workspace option overrides queued by `nx.wso` since the last
+        /// drain, for the server to apply to the editor's workspace overlay.
+        take_workspace_option_ops -> Vec<WorkspaceOptionOp> = workspace_option_ops
     }
 
     take_queue! {
@@ -2655,6 +2664,31 @@ impl LuaRuntime {
         let entry = self.to_lua(go)?;
         let set: mlua::Function = nx.get("_set_go_mirror")?;
         set.call(entry)
+    }
+
+    /// Refresh the Rust→Lua workspace-option mirror (`nx._wso_mirror[name] = value`) that
+    /// `nx.wso` reads — the per-workspace overrides currently in effect (a usually-empty
+    /// `canonical name → value` map). Pushed each frame alongside [`Self::set_go_mirror`]
+    /// so a `nx.wso.foo` read reflects the core's overlay (including overrides restored from
+    /// the workspace shada, not just ones written this session). Replaces the whole table.
+    pub fn set_wso_mirror(
+        &self,
+        overrides: &[(String, crate::ops::OptionValue)],
+    ) -> mlua::Result<()> {
+        use crate::ops::OptionValue;
+        let nx = self.nx()?;
+        let entries = self.lua.create_table()?;
+        for (name, value) in overrides {
+            match value {
+                OptionValue::Bool(b) => entries.set(name.as_str(), *b)?,
+                OptionValue::Number(n) => {
+                    entries.set(name.as_str(), crate::convert::lua_int(*n))?
+                }
+                OptionValue::String(s) => entries.set(name.as_str(), s.as_str())?,
+            }
+        }
+        let set: mlua::Function = nx.get("_set_wso_mirror")?;
+        set.call(entries)
     }
 
     /// Refresh the Rust→Lua register mirror (`nx._registers[name] = { text, type

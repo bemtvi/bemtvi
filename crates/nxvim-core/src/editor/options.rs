@@ -3,7 +3,7 @@
 use super::*;
 use crate::encoding::Encoding;
 use crate::options::{
-    resolve_set, split_set_args, NumOp, RegexSyntax, SetCmd, SetOp, StrOp, WindowOptions,
+    resolve_set, split_set_args, NumOp, OptScope, RegexSyntax, SetCmd, SetOp, StrOp, WindowOptions,
 };
 
 /// Number of decimal digits in `n` (at least 1, so `0` is one digit).
@@ -76,6 +76,51 @@ impl Editor {
             }
             return;
         }
+        // Global boolean options route through the shared setter (which writes the global
+        // *base* layer and recomputes the workspace overlay on top), so a `:set` of a
+        // workspace-overridden option updates the base without clobbering the override — the
+        // `:set` and `vim.o` paths share one home, exactly like the numeric/string globals.
+        if let Some((canon, _, OptScope::Global)) = crate::options::option_meta(name) {
+            // `option_meta` is the whole catalog; only the boolean globals belong here (the
+            // numeric/string ones are handled by `apply_set_num`/`apply_set_str`). Match the
+            // wired boolean globals so a non-bool global falls through to the slot E518 path.
+            if matches!(
+                canon,
+                "ignorecase"
+                    | "smartcase"
+                    | "wrapscan"
+                    | "hlsearch"
+                    | "incsearch"
+                    | "autoread"
+                    | "imagepreview"
+                    | "timeout"
+                    | "scrollanim"
+                    | "qfdock"
+                    | "bdclosetab"
+                    | "relative_splits"
+                    | "relative_docks"
+                    | "equalalways"
+            ) {
+                let cur = matches!(
+                    self.options.get_scalar(canon),
+                    Some(crate::options::OptionScalar::Bool(true))
+                );
+                match op {
+                    SetOp::On => self.set_global_option_bool(canon, true),
+                    SetOp::Off => self.set_global_option_bool(canon, false),
+                    SetOp::Toggle => self.set_global_option_bool(canon, !cur),
+                    SetOp::Query => {
+                        let label = if cur {
+                            canon.to_string()
+                        } else {
+                            format!("no{canon}")
+                        };
+                        self.echo(label);
+                    }
+                }
+                return;
+            }
+        }
         let slot = match name {
             "number" => &mut self.windows.cur_mut().options.number,
             "relativenumber" => &mut self.windows.cur_mut().options.relativenumber,
@@ -83,20 +128,6 @@ impl Editor {
             "foldenable" => &mut self.windows.cur_mut().options.foldenable,
             "wrap" => &mut self.windows.cur_mut().options.wrap,
             "breakindent" => &mut self.windows.cur_mut().options.breakindent,
-            "ignorecase" => &mut self.options.ignorecase,
-            "smartcase" => &mut self.options.smartcase,
-            "wrapscan" => &mut self.options.wrapscan,
-            "hlsearch" => &mut self.options.hlsearch,
-            "incsearch" => &mut self.options.incsearch,
-            "autoread" => &mut self.options.autoread,
-            "imagepreview" => &mut self.options.imagepreview,
-            "timeout" => &mut self.options.timeout,
-            "scrollanim" => &mut self.options.scrollanim,
-            "qfdock" => &mut self.options.qfdock,
-            "bdclosetab" => &mut self.options.bdclosetab,
-            "relative_splits" => &mut self.options.relative_splits,
-            "relative_docks" => &mut self.options.relative_docks,
-            "equalalways" => &mut self.options.equalalways,
             "expandtab" => &mut self.buffer_mut().options.expandtab,
             "autoindent" => &mut self.buffer_mut().options.autoindent,
             "smartindent" => &mut self.buffer_mut().options.smartindent,
@@ -467,8 +498,10 @@ impl Editor {
                     self.set_global_option_str("fileencodings", &value);
                 }
                 // Reset to the built-in default (kept in sync with `Options::default`).
+                // Route through the setter so the base layer / workspace overlay stay
+                // consistent (a bare `self.options` write would be reverted by recompute).
                 StrOp::Reset => {
-                    self.options.fileencodings = "ucs-bom,utf-8,latin1".to_string();
+                    self.set_global_option_str("fileencodings", "ucs-bom,utf-8,latin1");
                 }
                 StrOp::Query => self.echo(format!("fileencodings={}", self.options.fileencodings)),
             }
@@ -481,7 +514,10 @@ impl Editor {
                 StrOp::Set(value) => {
                     self.set_global_option_str("errorformat", &value);
                 }
-                StrOp::Reset => self.options.errorformat = crate::options::DFLT_EFM.to_string(),
+                StrOp::Reset => {
+                    let dflt = crate::options::DFLT_EFM.to_string();
+                    self.set_global_option_str("errorformat", &dflt);
+                }
                 StrOp::Query => self.echo(format!("errorformat={}", self.options.errorformat)),
             }
             return;

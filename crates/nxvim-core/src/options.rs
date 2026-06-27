@@ -193,10 +193,134 @@ pub struct Options {
     pub equalalways: bool,
 }
 
+/// A scalar value for one **global** option, the value type the per-workspace option
+/// overlay ([`WorkspaceOptions`]) stores. Mirrors the three option kinds; the variant
+/// must match the option's [`OptKind`] (`set_workspace_option` validates this), so the
+/// overlay can be re-applied onto [`Options`] verbatim via [`Options::set_scalar`].
+#[derive(Debug, Clone, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub enum OptionScalar {
+    Bool(bool),
+    Num(i64),
+    Str(String),
+}
+
+/// The per-workspace **option overlay**: a sparse map of canonical global-option name →
+/// the workspace's overriding value. It sits *above* the process-global values
+/// ([`crate::Editor`]'s `global_base`): the effective [`Options`] every read sees is
+/// `global_base` with this overlay applied on top, so a workspace value wins over the
+/// global one. Empty outside a `--workspace` session (or before any `nx.wso` write).
+/// Persisted in the workspace shada (a `BTreeMap` so the serialized order is stable).
+pub type WorkspaceOptions = std::collections::BTreeMap<String, OptionScalar>;
+
+impl Options {
+    /// Write one **global** option from a [`OptionScalar`], the single name→field map
+    /// shared by the global setters ([`crate::Editor::set_global_option_bool`] et al.)
+    /// and the workspace-overlay re-apply ([`crate::Editor`]'s `recompute_effective_options`).
+    /// Returns whether `name` is a wired global option *of the scalar's kind* — a
+    /// mismatched kind (e.g. a `Str` for `ignorecase`) writes nothing and returns `false`,
+    /// so the string setter keeps its "was this a wired string global" result. No
+    /// validation (range/enum) happens here; callers validate before writing.
+    pub fn set_scalar(&mut self, name: &str, value: &OptionScalar) -> bool {
+        use OptionScalar::{Bool, Num, Str};
+        match (name, value) {
+            ("ignorecase", Bool(b)) => self.ignorecase = *b,
+            ("smartcase", Bool(b)) => self.smartcase = *b,
+            ("wrapscan", Bool(b)) => self.wrapscan = *b,
+            ("hlsearch", Bool(b)) => self.hlsearch = *b,
+            ("incsearch", Bool(b)) => self.incsearch = *b,
+            ("autoread", Bool(b)) => self.autoread = *b,
+            ("imagepreview", Bool(b)) => self.imagepreview = *b,
+            ("timeout", Bool(b)) => self.timeout = *b,
+            ("scrollanim", Bool(b)) => self.scrollanim = *b,
+            ("qfdock", Bool(b)) => self.qfdock = *b,
+            ("bdclosetab", Bool(b)) => self.bdclosetab = *b,
+            ("relative_splits", Bool(b)) => self.relative_splits = *b,
+            ("relative_docks", Bool(b)) => self.relative_docks = *b,
+            ("equalalways", Bool(b)) => self.equalalways = *b,
+            ("showtabline", Num(n)) => self.showtabline = *n as u8,
+            ("laststatus", Num(n)) => self.laststatus = *n as u8,
+            ("mousetime", Num(n)) => self.mousetime = *n as usize,
+            ("timeoutlen", Num(n)) => self.timeoutlen = *n as usize,
+            ("scrollanimduration", Num(n)) => self.scrollanimduration = *n as usize,
+            ("scrollback", Num(n)) => self.scrollback = *n as usize,
+            ("statusline", Str(s)) => self.statusline = s.clone(),
+            ("tabline", Str(s)) => self.tabline = s.clone(),
+            ("guifont", Str(s)) => self.guifont = s.clone(),
+            ("mouse", Str(s)) => self.mouse = s.clone(),
+            ("mousemodel", Str(s)) => self.mousemodel = s.clone(),
+            ("mousescroll", Str(s)) => self.mousescroll = s.clone(),
+            ("regexsyntax", Str(s)) => self.regexsyntax = s.clone(),
+            ("fileencodings", Str(s)) => self.fileencodings = s.clone(),
+            ("errorformat", Str(s)) => self.errorformat = s.clone(),
+            ("switchbuf", Str(s)) => self.switchbuf = s.clone(),
+            ("makeprg", Str(s)) => self.makeprg = s.clone(),
+            ("grepprg", Str(s)) => self.grepprg = s.clone(),
+            ("grepformat", Str(s)) => self.grepformat = s.clone(),
+            _ => return false,
+        }
+        true
+    }
+
+    /// Read one **global** option as an [`OptionScalar`] by canonical name — the read
+    /// counterpart of [`Options::set_scalar`], used by the `:set` toggle/query path and
+    /// available for inspecting the effective value. `None` for a non-global / unknown name.
+    pub fn get_scalar(&self, name: &str) -> Option<OptionScalar> {
+        use OptionScalar::{Bool, Num, Str};
+        Some(match name {
+            "ignorecase" => Bool(self.ignorecase),
+            "smartcase" => Bool(self.smartcase),
+            "wrapscan" => Bool(self.wrapscan),
+            "hlsearch" => Bool(self.hlsearch),
+            "incsearch" => Bool(self.incsearch),
+            "autoread" => Bool(self.autoread),
+            "imagepreview" => Bool(self.imagepreview),
+            "timeout" => Bool(self.timeout),
+            "scrollanim" => Bool(self.scrollanim),
+            "qfdock" => Bool(self.qfdock),
+            "bdclosetab" => Bool(self.bdclosetab),
+            "relative_splits" => Bool(self.relative_splits),
+            "relative_docks" => Bool(self.relative_docks),
+            "equalalways" => Bool(self.equalalways),
+            "showtabline" => Num(self.showtabline as i64),
+            "laststatus" => Num(self.laststatus as i64),
+            "mousetime" => Num(self.mousetime as i64),
+            "timeoutlen" => Num(self.timeoutlen as i64),
+            "scrollanimduration" => Num(self.scrollanimduration as i64),
+            "scrollback" => Num(self.scrollback as i64),
+            "statusline" => Str(self.statusline.clone()),
+            "tabline" => Str(self.tabline.clone()),
+            "guifont" => Str(self.guifont.clone()),
+            "mouse" => Str(self.mouse.clone()),
+            "mousemodel" => Str(self.mousemodel.clone()),
+            "mousescroll" => Str(self.mousescroll.clone()),
+            "regexsyntax" => Str(self.regexsyntax.clone()),
+            "fileencodings" => Str(self.fileencodings.clone()),
+            "errorformat" => Str(self.errorformat.clone()),
+            "switchbuf" => Str(self.switchbuf.clone()),
+            "makeprg" => Str(self.makeprg.clone()),
+            "grepprg" => Str(self.grepprg.clone()),
+            "grepformat" => Str(self.grepformat.clone()),
+            _ => return None,
+        })
+    }
+}
+
+/// Resolve `name` (or its standard abbreviation) to its canonical spelling, kind, and
+/// scope from the [`OPTIONS`] catalog — the public lookup the workspace-option overlay
+/// uses to validate that a name is a *global* option of the expected kind. `None` for an
+/// unknown option.
+pub fn option_meta(name: &str) -> Option<(&'static str, OptKind, OptScope)> {
+    OPTIONS
+        .iter()
+        .find(|o| o.name == name || o.abbrev == Some(name))
+        .map(|o| (o.name, o.kind, o.scope))
+}
+
 /// The default `'errorformat'` — vim's compiled-in non-Windows `DFLT_EFM`
 /// (`option_vars.h`), recognizing gcc/clang, the `make[N]: Entering directory`
 /// stack, the `In file included from` chains, and the quickfix-window save form.
-pub const DFLT_EFM: &str = "%*[^\"]\"%f\"%*\\D%l: %m,\"%f\"%*\\D%l: %m,%-Gg%\\?make[%*\\d]: *** [%f:%l:%m,%-Gg%\\?make: *** [%f:%l:%m,%-G%f:%l: (Each undeclared identifier is reported only once,%-G%f:%l: for each function it appears in.),%-GIn file included from %f:%l:%c:,%-GIn file included from %f:%l:%c\\,,%-GIn file included from %f:%l:%c,%-GIn file included from %f:%l,%-G%*[ ]from %f:%l:%c,%-G%*[ ]from %f:%l:,%-G%*[ ]from %f:%l\\,,%-G%*[ ]from %f:%l,%f:%l:%c:%m,%f(%l):%m,%f:%l:%m,\"%f\"\\, line %l%*\\D%c%*[^ ] %m,%D%*\\a[%*\\d]: Entering directory %*[`']%f',%X%*\\a[%*\\d]: Leaving directory %*[`']%f',%D%*\\a: Entering directory %*[`']%f',%X%*\\a: Leaving directory %*[`']%f',%DMaking %*\\a in %f,%f|%l| %m";
+pub const DFLT_EFM: &str ="%*[^\"]\"%f\"%*\\D%l: %m,\"%f\"%*\\D%l: %m,%-Gg%\\?make[%*\\d]: *** [%f:%l:%m,%-Gg%\\?make: *** [%f:%l:%m,%-G%f:%l: (Each undeclared identifier is reported only once,%-G%f:%l: for each function it appears in.),%-GIn file included from %f:%l:%c:,%-GIn file included from %f:%l:%c\\,,%-GIn file included from %f:%l:%c,%-GIn file included from %f:%l,%-G%*[ ]from %f:%l:%c,%-G%*[ ]from %f:%l:,%-G%*[ ]from %f:%l\\,,%-G%*[ ]from %f:%l,%f:%l:%c:%m,%f(%l):%m,%f:%l:%m,\"%f\"\\, line %l%*\\D%c%*[^ ] %m,%D%*\\a[%*\\d]: Entering directory %*[`']%f',%X%*\\a[%*\\d]: Leaving directory %*[`']%f',%D%*\\a: Entering directory %*[`']%f',%X%*\\a: Leaving directory %*[`']%f',%DMaking %*\\a in %f,%f|%l| %m";
 
 /// The default `'grepformat'` — neovim's compiled-in value, recognizing
 /// `file:line:col:msg` (ripgrep / `grep -n` with column), `file:line:msg`, and the

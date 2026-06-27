@@ -47,7 +47,9 @@ pub use mouse::{
 // the path IME-committed text takes (composed accents, CJK) — the GUI feeds an
 // `Ime::Commit` through this exactly as it does a clipboard paste.
 pub use nxvim_view::encode_paste;
-pub use session::{parse_connect_uri, spawn_session, spawn_stdio_daemon_session, Session};
+pub use session::{
+    parse_connect_uri, spawn_session, spawn_stdio_daemon_session, spawn_workspace_session, Session,
+};
 // The pure inline-inlay-hint geometry (the shift math) and the segment splice, so
 // the Tier-1 `inlay` test can exercise them without a GPU — like the mouse helpers.
 pub use render::{inlay_shift, splice_inlay, Seg, DEFAULT_INLAY};
@@ -185,6 +187,16 @@ pub(crate) struct ImageFetch {
     pub version: (u64, u64),
 }
 
+/// A request from the App to bring up a **new** session, swapping the live one. Built off
+/// the UI thread by the session loop (see [`run`]) and reported back via
+/// [`UserEvent::Connected`] on success, or `:echoerr` on failure.
+pub enum SessionRequest {
+    /// `:connect …` — switch to an edit-host (daemon/QUIC) session.
+    Connect(remote::ConnectTarget),
+    /// `:workspace <dir>` — switch to a local workspace session rooted at the directory.
+    Workspace(PathBuf),
+}
+
 /// Events the IO thread injects into the winit event loop.
 pub enum UserEvent {
     /// A decoded `redraw`: replace the view and repaint.
@@ -215,10 +227,12 @@ pub enum UserEvent {
 /// embedded local, or a daemon session if launched with `--connect-daemon` / a
 /// `nxvim://` target. After startup, `:connect [user@]host[:port][/file]` or
 /// `:connect nxvim://…` swaps the window onto a **new** local server whose host seams
-/// point at a daemon (see [`session::spawn_session`]): the IO thread builds it off the UI
-/// thread, then the session loop retires the old server (it winds down on EOF) and
-/// re-attaches the UI onto the new one. The editor always runs local — only the
-/// fs/process/watch/LSP seams cross the wire.
+/// point at a daemon (see [`session::spawn_session`]), and `:workspace [dir]` swaps it
+/// onto a fresh **local** session rooted at a directory (its own shada namespace + saved
+/// layout — see [`session::spawn_workspace_session`]). Either way the IO thread builds the
+/// new session off the UI thread, then the session loop retires the old server (it winds
+/// down on EOF) and re-attaches the UI onto the new one. The editor always runs local —
+/// only the fs/process/watch/LSP seams cross the wire.
 pub fn run(
     initial: Session,
     config: GuiConfig,
@@ -239,9 +253,9 @@ pub fn run(
     // Hand the `Rpc` handle from the IO thread back to the main thread once the
     // (first) connection is up, so the winit side can fire input synchronously.
     let (rpc_tx, rpc_rx) = std::sync::mpsc::channel::<Rpc>();
-    // `:connect <target>` from the App requests a switch to a daemon (or local) session.
-    let (reconnect_tx, mut reconnect_rx) =
-        tokio::sync::mpsc::unbounded_channel::<remote::ConnectTarget>();
+    // `:connect <target>` / `:workspace <dir>` from the App request a switch to a new
+    // (daemon or local-workspace) session.
+    let (reconnect_tx, mut reconnect_rx) = tokio::sync::mpsc::unbounded_channel::<SessionRequest>();
     // The image store (render thread) requests remote preview bytes here; the IO thread
     // fulfils each over `nxvim_image_read` on the *current* session and posts the bytes
     // back as `UserEvent::ImageBytes`.
@@ -263,8 +277,10 @@ pub fn run(
             // A finished `:connect` build delivers its new session here, so the handshake
             // (run off the UI thread on the blocking pool) doesn't stall the current
             // session's redraws while it's in flight.
+            // Each carries the command label (`:connect` / `:workspace`) so a build
+            // failure is reported against the command the user actually typed.
             let (built_tx, mut built_rx) =
-                tokio::sync::mpsc::unbounded_channel::<Result<Session>>();
+                tokio::sync::mpsc::unbounded_channel::<(&'static str, Result<Session>)>();
             let mut first = true;
 
             'session: loop {
@@ -315,27 +331,42 @@ pub fn run(
                         // seconds), so the current session keeps rendering meanwhile. The
                         // result arrives on `built_rx`.
                         target = reconnect_rx.recv() => match target {
-                            Some(target) => {
-                                let file = target.embedded_file();
+                            Some(req) => {
                                 let tx = built_tx.clone();
-                                // A live `:connect` inherits the session-wide config source
-                                // chosen at startup (`--remote-config`), so every reconnect
-                                // is consistent with the first.
+                                // A live `:connect`/`:workspace` build runs off the UI
+                                // thread (the ssh/quic handshake — and its askpass dialog —
+                                // can take seconds), so the current session keeps rendering
+                                // meanwhile. A `:connect` inherits the session-wide config
+                                // source chosen at startup (`--remote-config`), so every
+                                // reconnect is consistent with the first.
                                 tokio::task::spawn_blocking(move || {
-                                    let _ = tx.send(session::spawn_session(
-                                        Some(target),
-                                        file,
-                                        config_source,
-                                    ));
+                                    let built = match req {
+                                        SessionRequest::Connect(target) => {
+                                            let file = target.embedded_file();
+                                            (
+                                                ":connect",
+                                                session::spawn_session(
+                                                    Some(target),
+                                                    file,
+                                                    config_source,
+                                                ),
+                                            )
+                                        }
+                                        SessionRequest::Workspace(dir) => (
+                                            ":workspace",
+                                            session::spawn_workspace_session(dir, config_source),
+                                        ),
+                                    };
+                                    let _ = tx.send(built);
                                 });
                             }
                             None => break 'session, // App (the only sender) is gone
                         },
-                        // A `:connect` build finished. On success, restart the session on
-                        // it; on failure, keep the current session and report why.
+                        // A `:connect`/`:workspace` build finished. On success, restart the
+                        // session on it; on failure, keep the current session and report why.
                         built = built_rx.recv() => match built {
-                            Some(Ok(session)) => break session,
-                            Some(Err(err)) => report_connect_error(&rpc, &err),
+                            Some((_, Ok(session))) => break session,
+                            Some((label, Err(err))) => report_session_error(&rpc, label, &err),
                             None => {} // unreachable: `built_tx` is held above
                         },
                         // The render thread needs a remote preview's bytes. Fetch them
@@ -426,14 +457,15 @@ pub fn run(
     Ok(())
 }
 
-/// Report a `:connect` failure (bad host, refused auth, a malformed `nxvim://` URI) in
-/// the GUI message line via the *current* session — the new one never came up. nxvim is
-/// its own editor and has no vimscript `:echohl`; `:echoerr` already renders the text as
-/// an error message. The error chain is flattened to one line (`echoerr` rejects
-/// newlines) and single quotes doubled (Vim string escaping) so a hostname or path can't
-/// break the command.
-fn report_connect_error(rpc: &Rpc, err: &anyhow::Error) {
-    let line = format!(":connect failed: {err:#}").replace('\n', "; ");
+/// Report a session-switch failure in the GUI message line via the *current* session —
+/// the new one never came up. `label` is the command that failed (`:connect` — bad host,
+/// refused auth, a malformed `nxvim://` URI; or `:workspace` — a missing / non-directory
+/// path). nxvim is its own editor and has no vimscript `:echohl`; `:echoerr` already
+/// renders the text as an error message. The error chain is flattened to one line
+/// (`echoerr` rejects newlines) and single quotes doubled (Vim string escaping) so a
+/// hostname or path can't break the command.
+fn report_session_error(rpc: &Rpc, label: &str, err: &anyhow::Error) {
+    let line = format!("{label} failed: {err:#}").replace('\n', "; ");
     let escaped = line.replace('\'', "''");
     rpc.notify(
         "nx_command",
@@ -647,10 +679,10 @@ struct App {
     /// [`dialog_action`]), which would otherwise browse and write the wrong machine.
     /// Updated on a `:connect` swap (see [`UserEvent::Connected`]).
     remote: bool,
-    /// Requests a `:connect <target>` switch to a daemon (or local) session. The IO
+    /// Requests a `:connect <target>` / `:workspace <dir>` switch to a new session. The IO
     /// thread builds the new session and feeds the swapped handle back as
     /// [`UserEvent::Connected`] (see [`run`]).
-    reconnect: tokio::sync::mpsc::UnboundedSender<remote::ConnectTarget>,
+    reconnect: tokio::sync::mpsc::UnboundedSender<SessionRequest>,
     /// Handed to the renderer's image store so it can request remote preview bytes over
     /// the editor RPC (a daemon session's image files aren't on local disk). The IO
     /// thread drains it and posts replies back as [`UserEvent::ImageBytes`].
@@ -663,7 +695,7 @@ impl App {
         config: GuiConfig,
         open_dir: Option<PathBuf>,
         remote: bool,
-        reconnect: tokio::sync::mpsc::UnboundedSender<remote::ConnectTarget>,
+        reconnect: tokio::sync::mpsc::UnboundedSender<SessionRequest>,
         fetch_tx: tokio::sync::mpsc::UnboundedSender<ImageFetch>,
     ) -> Self {
         Self {
@@ -1338,7 +1370,19 @@ impl ApplicationHandler<UserEvent> for App {
                     // `UserEvent::Connected`).
                     if let Some(target) = remote::connect_command(&self.view.cmdline) {
                         self.rpc.notify("nx_input", vec![Value::from("<Esc>")]);
-                        let _ = self.reconnect.send(target);
+                        let _ = self.reconnect.send(SessionRequest::Connect(target));
+                        return;
+                    }
+                    // `:workspace [dir]` opens a directory as a workspace: it swaps this
+                    // window onto a fresh **local** session rooted at the directory (its
+                    // own per-directory shada namespace + saved layout). Like `:connect`,
+                    // the server knows nothing of it, so dismiss the command line and ask
+                    // the IO thread to bring the workspace session up.
+                    if let Some(dir) = remote::workspace_command(&self.view.cmdline) {
+                        self.rpc.notify("nx_input", vec![Value::from("<Esc>")]);
+                        let _ = self
+                            .reconnect
+                            .send(SessionRequest::Workspace(PathBuf::from(dir)));
                         return;
                     }
                     let unnamed = self.view.focused().is_some_and(|w| w.unnamed);

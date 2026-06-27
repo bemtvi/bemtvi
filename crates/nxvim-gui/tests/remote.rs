@@ -5,7 +5,7 @@
 
 use nxvim_gui::parse_connect_uri;
 use nxvim_gui::remote::{
-    connect_command, is_confirmation, is_connect_uri, ConnectTarget, RemoteSpec,
+    connect_command, is_confirmation, is_connect_uri, workspace_command, ConnectTarget, RemoteSpec,
 };
 
 // --- SSH target parsing -----------------------------------------------------
@@ -123,6 +123,46 @@ fn embedded_file_only_from_ssh_targets() {
     assert_eq!(ssh.embedded_file().as_deref(), Some("/a/b.rs"));
     let quic = connect_command("connect nxvim://h:1/t?cert=c").unwrap();
     assert_eq!(quic.embedded_file(), None);
+}
+
+// --- `:workspace` command → directory ---------------------------------------
+
+#[test]
+fn workspace_command_parses_directory_argument() {
+    assert_eq!(
+        workspace_command("workspace /home/me/project").as_deref(),
+        Some("/home/me/project")
+    );
+    // A relative path is taken verbatim (canonicalized when the session is built).
+    assert_eq!(workspace_command("workspace src").as_deref(), Some("src"));
+    // The `:Workspace` capitalization is accepted too, like `:Connect`.
+    assert_eq!(workspace_command("Workspace /tmp").as_deref(), Some("/tmp"));
+}
+
+#[test]
+fn workspace_command_with_no_argument_targets_cwd() {
+    // A bare `:workspace` (or trailing whitespace only) opens the current directory,
+    // matching the TUI's `nxvim --workspace`.
+    assert_eq!(workspace_command("workspace").as_deref(), Some("."));
+    assert_eq!(workspace_command("workspace   ").as_deref(), Some("."));
+}
+
+#[test]
+fn workspace_command_keeps_paths_with_spaces() {
+    // The whole remainder is the path (trimmed), so a directory name with spaces works.
+    assert_eq!(
+        workspace_command("workspace /home/me/My Project").as_deref(),
+        Some("/home/me/My Project")
+    );
+}
+
+#[test]
+fn workspace_command_rejects_other_commands() {
+    assert_eq!(workspace_command("w"), None);
+    assert_eq!(workspace_command("write"), None);
+    // The command word must end at `workspace` — `workspacefoo` is something else.
+    assert_eq!(workspace_command("workspacefoo"), None);
+    assert_eq!(workspace_command("connect host:22"), None);
 }
 
 // --- `nxvim://` URI detection + parsing -------------------------------------

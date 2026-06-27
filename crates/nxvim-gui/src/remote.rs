@@ -140,6 +140,30 @@ pub fn connect_command(cmdline: &str) -> Option<ConnectTarget> {
     RemoteSpec::parse_target(arg).map(ConnectTarget::Ssh)
 }
 
+/// Parse a `:workspace [dir]` command line — the text *after* the `:` (so the leading
+/// word is `workspace`) — into the directory to open as a workspace, or `None` for any
+/// other command line. A bare `:workspace` (no argument) targets the current directory
+/// (`.`), matching the TUI's `nxvim --workspace`. The whole remainder is the path —
+/// trimmed, but otherwise taken verbatim so a directory name with spaces works. The
+/// client intercepts this on `<CR>` and swaps the window onto a fresh **local** workspace
+/// session (the server knows nothing of `:workspace`, exactly like `:connect`).
+pub fn workspace_command(cmdline: &str) -> Option<String> {
+    let trimmed = cmdline.trim_start();
+    let rest = trimmed
+        .strip_prefix("workspace")
+        .or_else(|| trimmed.strip_prefix("Workspace"))?;
+    // The command word must end here — `workspacefoo` is some other command, not
+    // `:workspace` with an argument. An empty remainder (bare `:workspace`) is allowed.
+    match rest.chars().next() {
+        None => Some(".".to_string()),
+        Some(c) if c.is_whitespace() => {
+            let dir = rest.trim();
+            Some(if dir.is_empty() { "." } else { dir }.to_string())
+        }
+        Some(_) => None,
+    }
+}
+
 /// Whether `arg` is a WebTransport daemon URI (`nxvim://…`, the scheme the daemon
 /// prints) rather than an SSH `[user@]host` target.
 pub fn is_connect_uri(arg: &str) -> bool {

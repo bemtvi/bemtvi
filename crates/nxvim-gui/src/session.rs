@@ -8,6 +8,7 @@
 //! only the host seams cross the wire. So `:connect` swaps the seams (a fresh local
 //! server on a daemon), not the editor transport — see [`crate::run`]'s session loop.
 
+use std::path::PathBuf;
 use std::process::Stdio;
 use std::thread::JoinHandle;
 
@@ -55,7 +56,7 @@ pub fn spawn_session(
     config_source: ConfigSource,
 ) -> Result<Session> {
     let remote = target.is_some();
-    spawn_server(remote, file, config_source, move || async move {
+    spawn_server(remote, file, None, config_source, move || async move {
         // Build the host seams: `None` for the embedded local disk, or a daemon client
         // (ssh stdio / quic) for the edit-host split. The ssh child is the session guard.
         match target {
@@ -88,12 +89,59 @@ pub fn spawn_stdio_daemon_session(
     file: Option<String>,
     config_source: ConfigSource,
 ) -> Result<Session> {
-    spawn_server(true, file, config_source, || async {
+    spawn_server(true, file, None, config_source, || async {
         let mut child = spawn_stdio_daemon()?;
         let stdout = child.stdout.take().expect("daemon stdout piped");
         let stdin = child.stdin.take().expect("daemon stdin piped");
         Ok((Some(connect_daemon(stdout, stdin)), guard(child)))
     })
+}
+
+/// Spawn a local **workspace** session rooted at `dir`: an embedded (local-disk) session
+/// that derives a per-directory shada namespace, cds into the directory at startup
+/// (`'workspacecwd'`), and saves/restores the window/split/dock/buffer layout across
+/// launches — the GUI equivalent of the TUI's `nxvim --workspace <dir>`. **Blocking**
+/// (builds the server thread + config like every session). `dir` must be an existing
+/// directory: a non-directory / missing path is a loud `Err` (no silent fall-through),
+/// surfaced to the user via `:echoerr` just like a failed `:connect`.
+pub fn spawn_workspace_session(dir: PathBuf, config_source: ConfigSource) -> Result<Session> {
+    // A `:workspace` is a *directory* session; resolve to an absolute path now (so its
+    // derived shada namespace + `nx.workspace` root are stable) and reject a non-directory
+    // or missing path loudly, matching the TUI's `resolve_workspace_dir`. A leading `~` is
+    // expanded against `$HOME` first — the user typed it in the command line, so (unlike a
+    // shell argument) it is still literal and `canonicalize` would otherwise fail on it.
+    let dir = expand_tilde(dir);
+    let abs =
+        std::fs::canonicalize(&dir).map_err(|e| anyhow!("workspace {}: {e}", dir.display()))?;
+    if !abs.is_dir() {
+        return Err(anyhow!(
+            "workspace requires a directory, but {} is not one",
+            dir.display()
+        ));
+    }
+    // A workspace session is always local (embedded disk); only its shada identity and
+    // session capture differ from the default embedded session.
+    spawn_server(false, None, Some(abs), config_source, || async {
+        Ok((None, no_guard()))
+    })
+}
+
+/// Expand a leading `~` / `~/` in a `:workspace` path against `$HOME`; anything else is
+/// returned verbatim (a relative path canonicalizes against the GUI process's cwd). Mirrors
+/// the server's `:cd` argument expansion so `:workspace ~/code` works as typed.
+fn expand_tilde(dir: PathBuf) -> PathBuf {
+    let Some(s) = dir.to_str() else { return dir };
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    if s == "~" {
+        if let Some(home) = home {
+            return home;
+        }
+    } else if let Some(rest) = s.strip_prefix("~/") {
+        if let Some(home) = home {
+            return home.join(rest);
+        }
+    }
+    dir
 }
 
 /// A session guard: an opaque value kept alive on the server thread for the whole
@@ -119,6 +167,7 @@ fn guard(value: impl std::any::Any + Send) -> Guard {
 fn spawn_server<F, Fut>(
     remote: bool,
     file: Option<String>,
+    workspace: Option<PathBuf>,
     config_source: ConfigSource,
     connect: F,
 ) -> Result<Session>
@@ -153,7 +202,7 @@ where
             // Build the server config — for a daemon session this fetches + materializes
             // the remote's config/plugins, so a failure here is a setup failure the caller
             // must see (before we report the handshake up).
-            let init = match server_init(file, client, config_source).await {
+            let init = match server_init(file, client, workspace, config_source).await {
                 Ok(init) => init,
                 Err(e) => {
                     let _ = ready_tx.send(Err(e));
@@ -241,11 +290,28 @@ fn nxvim_bin_name() -> &'static str {
 /// either way the daemon's cwd / tree-sitter parser set are mirrored — matching the TUI.
 /// A failed resolve is loud (the caller surfaces it as a handshake error) rather than a
 /// silent fall back to local config.
+///
+/// `workspace` is `Some(dir)` only for a local `:workspace <dir>` session (always with
+/// `client = None`): it derives a per-directory shada namespace, forces session
+/// capture/restore, and seeds the root surfaced to `nx.workspace` — the GUI counterpart of
+/// the TUI's `--workspace` wiring. `None` for every other session (plain local or daemon).
 async fn server_init(
     file: Option<String>,
     client: Option<DaemonClient>,
+    workspace: Option<PathBuf>,
     config_source: ConfigSource,
 ) -> Result<ServerInit> {
+    // A `:workspace` session (local only) derives its shada namespace from the directory
+    // and exposes the root to `nx.workspace`; an explicit namespace isn't offered from the
+    // GUI, so the directory-derived one is the only source. `None`/`false` for every other
+    // session (a daemon session never carries a workspace here).
+    let (shada_namespace, workspace_dir) = match &workspace {
+        Some(dir) => (
+            Some(nxvim_server::workspace_namespace(dir)),
+            Some(dir.to_string_lossy().into_owned()),
+        ),
+        None => (None, None),
+    };
     let mut ts_autoinstall = Vec::new();
     // The daemon's cwd seeds `DirState` so `:pwd`/`:cd`/`getcwd` operate on the remote
     // dir in a daemon session (`docs/plans/2026-06-23-remote-cwd.md`); `None` for a local
@@ -266,16 +332,13 @@ async fn server_init(
     ) = match client {
         None => {
             let (config_dir, runtimepath) = nxvim_server::default_runtime();
-            (
-                config_dir,
-                runtimepath,
-                nxvim_server::default_shada(),
-                None,
-                None,
-                None,
-                None,
-                None,
-            )
+            // A `:workspace` session scopes shada to a per-directory `ns/<NS>` store; a
+            // plain local session's primary store IS the global one.
+            let store = match shada_namespace.as_deref() {
+                Some(ns) => nxvim_server::workspace_shada(Some(ns)),
+                None => nxvim_server::default_shada(),
+            };
+            (config_dir, runtimepath, store, None, None, None, None, None)
         }
         Some(c) => {
             // `Remote` materializes the daemon's config + plugins locally; `Local`
@@ -321,18 +384,22 @@ async fn server_init(
         // Editor + Lua run locally; shada is local for a `Local`-config session and on the
         // daemon for a `Remote`-config one (Approach A — synced over the fs seam).
         shada: Some(shada_store),
-        // No `--shada-namespace` from the GUI yet, so the primary store is already global
-        // — no separate global history store needed.
-        global_shada: None,
+        // A `:workspace` session routes history to the global store too (parity with the
+        // TUI's `--workspace`); a plain/daemon session's primary store is already global.
+        global_shada: shada_namespace
+            .as_ref()
+            .map(|_| nxvim_server::default_shada()),
         remote_shada,
-        // The GUI front end does not yet pass `--shada-namespace`, so it uses the global
-        // store and never captures/restores the editor session (v1: TUI only).
-        workspace_session: false,
-        restore_session: false,
-        session_save_layout: false,
-        // The GUI front end is TUI-parity minus sessions (v1) — no workspace identity.
-        shada_namespace: None,
-        workspace_dir: None,
+        // A `:workspace` session captures + restores the editor session (open files +
+        // exact layout) and auto-opts into layout capture, exactly like `--workspace`; a
+        // plain local or daemon session does neither.
+        workspace_session: workspace.is_some(),
+        restore_session: workspace.is_some(),
+        session_save_layout: workspace.is_some(),
+        // Seed the namespace + root that `nx.shada.namespace()` / `nx.workspace` report
+        // (both `None` unless this is a `:workspace` session).
+        shada_namespace,
+        workspace_dir,
         runtimepath,
         clipboard: ClipboardProvider::System,
         mouse_clock: None,

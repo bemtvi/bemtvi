@@ -88,9 +88,9 @@ pub use self::buffers::{
     FileChangeAction, FileChangeReason, PendingOpen, PendingQuitAll, PendingSave,
 };
 pub use self::persist::{
-    FileChangelist, FileFolds, FileMarkEntry, GlobalMarkEntry, JumpPos, NumberedMark, PersistState,
-    PluginEntry, PluginNamespace, RegisterEntry, SessionDock, SessionState, SessionTab,
-    SessionWindow, ShadaRequest,
+    FileChangelist, FileFolds, FileMarkEntry, GlobalMarkEntry, InputHistoryEntry, JumpPos,
+    NumberedMark, PersistState, PluginEntry, PluginNamespace, RegisterEntry, SessionDock,
+    SessionState, SessionTab, SessionWindow, ShadaRequest,
 };
 pub use self::terminal::TerminalOp;
 pub use self::undo::{UndoEntry, UndoTreeView};

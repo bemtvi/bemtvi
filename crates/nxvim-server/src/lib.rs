@@ -2321,6 +2321,7 @@ impl EditHost {
         if !self.primary_keeps_history() {
             snap.ex_history.clear();
             snap.search_history.clear();
+            snap.input_history.clear();
         }
     }
 
@@ -2341,9 +2342,11 @@ impl EditHost {
             return;
         };
         match store.load() {
-            Ok(state) => self
-                .editor
-                .merge_persisted_history(state.ex_history, state.search_history),
+            Ok(state) => self.editor.merge_persisted_history(
+                state.ex_history,
+                state.search_history,
+                state.input_history,
+            ),
             Err(e) => {
                 self.editor
                     .echo(format!("shada: could not open global history store: {e}"));
@@ -2355,10 +2358,11 @@ impl EditHost {
     /// Build the history-only snapshot for the global store (everything else default —
     /// the global store carries no marks / registers / session from a workspace launch).
     fn global_history_snapshot(&self) -> nxvim_core::PersistState {
-        let (ex_history, search_history) = self.editor.export_history();
+        let (ex_history, search_history, input_history) = self.editor.export_history();
         nxvim_core::PersistState {
             ex_history,
             search_history,
+            input_history,
             ..Default::default()
         }
     }

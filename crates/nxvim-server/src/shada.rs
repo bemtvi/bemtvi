@@ -57,8 +57,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use nxvim_core::{
-    FileChangelist, FileFolds, FileMarkEntry, GlobalMarkEntry, JumpPos, NumberedMark, PersistState,
-    PluginEntry, PluginNamespace, RegisterEntry,
+    FileChangelist, FileFolds, FileMarkEntry, GlobalMarkEntry, InputHistoryEntry, JumpPos,
+    NumberedMark, PersistState, PluginEntry, PluginNamespace, RegisterEntry,
 };
 use redb::{Database, ReadableTable, TableDefinition, TableError};
 use serde::{Deserialize, Serialize};
@@ -125,6 +125,12 @@ const MARKS_FILE: TableDefinition<(&str, &str), &[u8]> = TableDefinition::new("m
 /// is a msgpack [`StoredHist`]. Rewritten wholesale each flush.
 const HIST_SEARCH: TableDefinition<u64, &[u8]> = TableDefinition::new("hist_search");
 const HIST_EX: TableDefinition<u64, &[u8]> = TableDefinition::new("hist_ex");
+
+/// `hist_input` table: the per-namespace `nx.ui.input{ history = … }` rings. Key is
+/// `(namespace, sequence)` — the same time-ordered sequence as the `:` / `/` tables,
+/// scoped per namespace — value a msgpack [`StoredHist`]. Rewritten wholesale each
+/// flush, like the other history tables.
+const HIST_INPUT: TableDefinition<(&str, u64), &[u8]> = TableDefinition::new("hist_input");
 
 /// `marks_numbered` table: key is the digit `0`–`9`, value a msgpack [`StoredMark`].
 /// The store *shifts* these at load (`'0` ← last-exit cursor, old `'0`→`'1`, …).
@@ -590,7 +596,34 @@ fn write_state(db: &Database, state: &PersistState) -> std::io::Result<()> {
     }
     write_history(&wtxn, HIST_SEARCH, &state.search_history, ts)?;
     write_history(&wtxn, HIST_EX, &state.ex_history, ts)?;
+    write_input_history(&wtxn, &state.input_history, ts)?;
     wtxn.commit().map_err(std::io::Error::other)?;
+    Ok(())
+}
+
+/// Rewrite the per-namespace `nx.ui.input` history table wholesale: clear it, then
+/// re-key each namespace's entries by the same time-ordered sequence `write_history`
+/// uses (so cross-instance recency compares cleanly), scoped under the namespace.
+fn write_input_history(
+    wtxn: &redb::WriteTransaction,
+    input: &[InputHistoryEntry],
+    ts: u64,
+) -> std::io::Result<()> {
+    let mut table = wtxn.open_table(HIST_INPUT).map_err(std::io::Error::other)?;
+    table.retain(|_, _| false).map_err(std::io::Error::other)?;
+    let base = ts.saturating_mul(HISTORY_CAP as u64);
+    for entry in input {
+        for (i, text) in entry.entries.iter().enumerate() {
+            let stored = StoredHist { text: text.clone() };
+            let bytes = rmp_serde::to_vec(&stored).map_err(std::io::Error::other)?;
+            table
+                .insert(
+                    (entry.namespace.as_str(), base + i as u64),
+                    bytes.as_slice(),
+                )
+                .map_err(std::io::Error::other)?;
+        }
+    }
     Ok(())
 }
 
@@ -634,6 +667,9 @@ struct MergedRaw {
     plugin: std::collections::HashMap<(String, String), StoredPlugin>,
     hist_search: HistMerge,
     hist_ex: HistMerge,
+    /// The per-namespace `nx.ui.input` history rings: one [`HistMerge`] per namespace,
+    /// each folded independently across sibling stores like `hist_search` / `hist_ex`.
+    hist_input: std::collections::HashMap<String, HistMerge>,
     /// The jumplist is an ordered sequence, not a union: the newest store's whole
     /// list wins (keyed by its `meta.flush_ts`).
     jumplist: (u64, Vec<StoredPos>),
@@ -664,6 +700,7 @@ fn collect_merge<'a>(dbs: impl IntoIterator<Item = &'a Database>) -> MergedRaw {
         merge_plugin(db, &mut m.plugin);
         merge_history(db, HIST_SEARCH, &mut m.hist_search);
         merge_history(db, HIST_EX, &mut m.hist_ex);
+        merge_input_history(db, &mut m.hist_input);
         if let Some(meta) = read_meta(db) {
             if meta.flush_ts > m.jumplist.0 {
                 m.jumplist = (meta.flush_ts, read_jumplist(db));
@@ -749,6 +786,7 @@ fn build_state(m: MergedRaw, numbered_marks: Vec<NumberedMark>) -> PersistState 
             .collect(),
         search_history: m.hist_search.finish(),
         ex_history: m.hist_ex.finish(),
+        input_history: group_input_history(m.hist_input),
         numbered_marks,
         file_changelists: m
             .changelist
@@ -808,6 +846,24 @@ fn group_plugin(
             entries.sort_by(|a, b| a.key.cmp(&b.key));
             PluginNamespace { namespace, entries }
         })
+        .collect()
+}
+
+/// Project the per-namespace input-history merge map into the ordered, capped rings the
+/// editor imports — one [`InputHistoryEntry`] per namespace, namespaces sorted so the
+/// seeded state is deterministic (a `HashMap` iteration order isn't).
+fn group_input_history(
+    map: std::collections::HashMap<String, HistMerge>,
+) -> Vec<InputHistoryEntry> {
+    let mut by_ns: std::collections::BTreeMap<String, Vec<String>> =
+        std::collections::BTreeMap::new();
+    for (namespace, merge) in map {
+        by_ns.insert(namespace, merge.finish());
+    }
+    by_ns
+        .into_iter()
+        .filter(|(_, entries)| !entries.is_empty())
+        .map(|(namespace, entries)| InputHistoryEntry { namespace, entries })
         .collect()
 }
 
@@ -971,6 +1027,34 @@ fn merge_history(db: &Database, def: TableDefinition<u64, &[u8]>, merge: &mut Hi
             continue;
         };
         merge.observe(stored.text, key.value());
+    }
+}
+
+/// Fold one store's `hist_input` table into the per-namespace merge map, preserving
+/// each entry's sequence key as its recency — one [`HistMerge`] per namespace, exactly
+/// like [`merge_history`] but split by the key's namespace component.
+fn merge_input_history(db: &Database, merge: &mut std::collections::HashMap<String, HistMerge>) {
+    let Ok(rtxn) = db.begin_read() else {
+        return;
+    };
+    let table = match rtxn.open_table(HIST_INPUT) {
+        Ok(table) => table,
+        Err(TableError::TableDoesNotExist(_)) => return,
+        Err(_) => return,
+    };
+    let Ok(iter) = table.iter() else {
+        return;
+    };
+    for row in iter.flatten() {
+        let (key, value) = row;
+        let (namespace, seq) = key.value();
+        let Ok(stored) = rmp_serde::from_slice::<StoredHist>(value.value()) else {
+            continue;
+        };
+        merge
+            .entry(namespace.to_string())
+            .or_default()
+            .observe(stored.text, seq);
     }
 }
 

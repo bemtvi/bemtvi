@@ -44,6 +44,12 @@ pub struct PersistState {
     pub search_history: Vec<String>,
     /// The ex command-line (`:`) history, oldest entry first.
     pub ex_history: Vec<String>,
+    /// The per-namespace `nx.ui.input{ history = "<ns>" }` rings (e.g. the DAP repl's
+    /// `dap>` prompt recall), each oldest entry first. One entry per namespace; routed
+    /// to the same store and gated by the same `'persisthistory'` scope as the `:` / `/`
+    /// histories above. `#[serde(default)]` so an older store without it loads as none.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub input_history: Vec<InputHistoryEntry>,
     /// The numbered marks `'0`–`'9` (digit `'0'`–`'9'`), each a `(path, line,
     /// col)`. A pure persistence construct — the *store* shifts them at load
     /// (`'0` ← last exit cursor, old `'0`→`'1`, …) — so core only seeds whatever
@@ -103,6 +109,15 @@ pub struct PluginNamespace {
 pub struct PluginEntry {
     pub key: String,
     pub value: String,
+}
+
+/// One `nx.ui.input` history namespace and its ring, oldest entry first — the
+/// persistent form of an [`Editor::prompt_history`] entry.
+#[derive(Debug, Clone)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct InputHistoryEntry {
+    pub namespace: String,
+    pub entries: Vec<String>,
 }
 
 /// A captured editor **session**: every tab's EXACT split layout (nesting + sizes) with
@@ -287,20 +302,58 @@ pub struct RegisterEntry {
 }
 
 impl Editor {
-    /// Merge restored ex / search history into the live rings (older entries ahead of
-    /// what's there, dropping duplicates) and re-cap to `'history'`. The history-only
-    /// counterpart of [`import_persist`](Self::import_persist), used by the server to
-    /// fold in the **global** history store post-config (`persisthistory` including
-    /// `global`) without disturbing the marks / registers the primary store seeded.
-    pub fn merge_persisted_history(&mut self, ex: Vec<String>, search: Vec<String>) {
+    /// Merge restored ex / search / input-namespace history into the live rings (older
+    /// entries ahead of what's there, dropping duplicates) and re-cap to `'history'`. The
+    /// history-only counterpart of [`import_persist`](Self::import_persist), used by the
+    /// server to fold in the **global** history store post-config (`persisthistory`
+    /// including `global`) without disturbing the marks / registers the primary store
+    /// seeded.
+    pub fn merge_persisted_history(
+        &mut self,
+        ex: Vec<String>,
+        search: Vec<String>,
+        input: Vec<InputHistoryEntry>,
+    ) {
         merge_history(&mut self.ex_history, ex);
         merge_history(&mut self.search_history, search);
+        self.merge_input_history(input);
         self.cap_history();
     }
 
-    /// The ex / search history snapshot, for a history-only flush to the global store.
-    pub fn export_history(&self) -> (Vec<String>, Vec<String>) {
-        (self.ex_history.clone(), self.search_history.clone())
+    /// Fold restored `nx.ui.input` namespace rings into the live [`Editor::prompt_history`]
+    /// (per namespace, older entries ahead, dropping duplicates). Does **not** cap — the
+    /// caller re-caps every ring via [`cap_history`](Self::cap_history) once, after all
+    /// merges.
+    fn merge_input_history(&mut self, input: Vec<InputHistoryEntry>) {
+        for entry in input {
+            let ring = self.prompt_history.entry(entry.namespace).or_default();
+            merge_history(ring, entry.entries);
+        }
+    }
+
+    /// The per-namespace `nx.ui.input` history as persistable entries, namespaces sorted
+    /// so a flush is deterministic across runs (the live map's iteration order isn't).
+    fn export_input_history(&self) -> Vec<InputHistoryEntry> {
+        let mut out: Vec<InputHistoryEntry> = self
+            .prompt_history
+            .iter()
+            .map(|(namespace, entries)| InputHistoryEntry {
+                namespace: namespace.clone(),
+                entries: entries.clone(),
+            })
+            .collect();
+        out.sort_by(|a, b| a.namespace.cmp(&b.namespace));
+        out
+    }
+
+    /// The ex / search / input-namespace history snapshot, for a history-only flush to the
+    /// global store.
+    pub fn export_history(&self) -> (Vec<String>, Vec<String>, Vec<InputHistoryEntry>) {
+        (
+            self.ex_history.clone(),
+            self.search_history.clone(),
+            self.export_input_history(),
+        )
     }
 
     /// Snapshot the cross-session state into a [`PersistState`] for the server to
@@ -323,6 +376,7 @@ impl Editor {
             file_marks: self.export_file_marks(),
             search_history: self.search_history.clone(),
             ex_history: self.ex_history.clone(),
+            input_history: self.export_input_history(),
             numbered_marks: self.export_numbered_marks(),
             file_changelists: self.export_changelists(),
             file_folds: self.export_folds(),
@@ -1000,6 +1054,7 @@ impl Editor {
         // duplicates so a repeated entry keeps its newest position.
         merge_history(&mut self.search_history, state.search_history);
         merge_history(&mut self.ex_history, state.ex_history);
+        self.merge_input_history(state.input_history);
         // A restored ring can exceed the live `'history'` cap (a smaller value than the
         // store's persistence ceiling); trim to it.
         self.cap_history();

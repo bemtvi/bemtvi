@@ -358,6 +358,46 @@ async fn search_history_survives_a_restart() {
 }
 
 #[tokio::test]
+async fn input_namespace_history_survives_a_workspace_restart() {
+    // `nx.ui.input{ history = "<ns>" }` rings (e.g. the DAP repl's `dap>` prompt recall)
+    // must persist to the workspace shada like the `:` / `/` histories — they did not, so
+    // a reopened project lost its prompt history under `--workspace`.
+    let gdir = temp_dir("shada_inh_global");
+    let ws = temp_dir("shada_inh_ws");
+
+    // Session 1: open a prompt under the `repl` namespace, submit `myexpr`, then quit.
+    {
+        let (rpc, incoming) = start_attached(init_workspace(&ws, &gdir, None), 80, 25).await;
+        exec_lua(
+            &rpc,
+            "nx.ui.input({ prompt = '> ', history = 'repl' }):next(function() end)",
+        )
+        .await;
+        feed(&rpc, "myexpr<CR>");
+        feed(&rpc, ":qa!<CR>");
+        await_server_exit(incoming).await;
+    }
+
+    // Session 2 (same workspace): a fresh prompt under `repl` recalls `myexpr` with <Up>,
+    // proving the namespace ring was restored from the workspace store.
+    {
+        let (rpc, _incoming) = start_attached(init_workspace(&ws, &gdir, None), 80, 25).await;
+        exec_lua(
+            &rpc,
+            "_G.r = nil
+             nx.ui.input({ prompt = '> ', history = 'repl' }):next(function(t) _G.r = t end)",
+        )
+        .await;
+        feed(&rpc, "<Up><CR>");
+        assert_eq!(
+            exec_lua(&rpc, "return _G.r").await.as_str(),
+            Some("myexpr"),
+            "the input-history namespace ring must restore from the workspace shada"
+        );
+    }
+}
+
+#[tokio::test]
 async fn persisthistory_none_does_not_persist() {
     let dir = temp_dir("shada_phist_none");
     let file = write_temp("shada_phist_none", "txt", "alpha\nbeta\ngamma\n");

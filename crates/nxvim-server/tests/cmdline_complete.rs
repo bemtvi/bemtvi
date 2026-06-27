@@ -958,7 +958,10 @@ fn menu_field_u64(map: &[(Value, Value)], key: &str) -> usize {
 async fn clicking_a_wildmenu_candidate_selects_then_accepts_into_the_line() {
     let dir = temp_dir("cmdcomplete_mouse_click");
     let (rpc, mut incoming) = start(&dir, INIT).await;
-    nxvim_test_harness::command(&rpc, "set mouse=a nonumber norelativenumber").await;
+    // Deliberately the *default* 'mouse' = "nvi" (no 'c'): the wildmenu is nxvim's own
+    // interactive overlay and must be clickable without the user opting command-mode
+    // mouse in. Only `nonumber norelativenumber` here, never `set mouse=a`.
+    nxvim_test_harness::command(&rpc, "set nonumber norelativenumber").await;
 
     feed(&rpc, ":e<Tab>");
     let map = poll_menu(&rpc, &mut incoming)
@@ -1017,7 +1020,9 @@ async fn clicking_a_wildmenu_candidate_selects_then_accepts_into_the_line() {
 async fn wheeling_over_the_wildmenu_cycles_candidates() {
     let dir = temp_dir("cmdcomplete_mouse_wheel");
     let (rpc, mut incoming) = start(&dir, INIT).await;
-    nxvim_test_harness::command(&rpc, "set mouse=a nonumber norelativenumber").await;
+    // Default 'mouse' = "nvi" (no 'c') on purpose — wheeling the wildmenu works without
+    // command-mode mouse opted in, like clicking it. See the click test for why.
+    nxvim_test_harness::command(&rpc, "set nonumber norelativenumber").await;
 
     feed(&rpc, ":e<Tab>");
     let map = poll_menu(&rpc, &mut incoming)

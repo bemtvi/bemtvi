@@ -297,7 +297,14 @@ impl Editor {
     /// mode (vim-faithful — the gesture is simply ignored, not an error). Only the
     /// gestures implemented so far act; the rest are no-ops until their phase.
     pub fn mouse(&mut self, ev: MouseEvent) {
-        if !self.mouse_enabled() {
+        // The command-line wildmenu is nxvim's own interactive overlay (neovim doesn't
+        // click it at all), so a press / wheel that lands on it acts regardless of the
+        // command-mode `'c'` flag — which the default `'mouse'` ("nvi") omits, and which
+        // governs command-line *text* mouse, not this UI affordance. Every other gesture
+        // still obeys `'mouse'` for the current mode. Guarded on the cell hitting the box
+        // (`menu_hit`) so a command-mode click off the wildmenu stays disabled.
+        let on_wildmenu = self.cmdline_complete_active() && self.menu_hit(ev.row, ev.col).is_some();
+        if !self.mouse_enabled() && !on_wildmenu {
             return;
         }
         // Remember the cell so `vim.fn.getmousepos()` reports this event's position —

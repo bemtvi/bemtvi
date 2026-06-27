@@ -76,7 +76,8 @@ pub(crate) use self::command::{
 pub use self::complete::{CompleteConfig, CompleteCtx, CompleteKeys};
 pub use self::decor::DecorViewport;
 pub use self::menu::{
-    Extent, MenuGeom, MenuItem, MenuMetrics, MenuPlacement, PreviewScroll, PreviewTarget, PromptPos,
+    CmdlineCandidate, Extent, MenuGeom, MenuItem, MenuMetrics, MenuPlacement, PreviewScroll,
+    PreviewTarget, PromptPos,
 };
 pub use self::mouse::{
     ClickSurface, CompleteDocsHit, MouseClick, MousePos, StatuslineClick, WheelGesture,
@@ -794,9 +795,21 @@ pub struct Editor {
     /// command line. Only interactively-typed lines are recorded — a programmatic
     /// `nx_command` runs through [`Editor::command`] and never lands here.
     ex_history: Vec<String>,
-    /// Position within the active history ([`Editor::search_history`] or
-    /// [`Editor::ex_history`], per the open prompt's kind) while browsing it;
-    /// `None` when editing a fresh line. Reset each time a command line opens.
+    /// Per-namespace history for scripted [`CmdlineKind::Prompt`] prompts
+    /// (`nx.ui.input{ history = "<namespace>" }`): each namespace is an independent
+    /// recall ring, so a plugin's REPL history is separate from another's. Recorded
+    /// on submit and recalled with `<Up>`/`<Down>` exactly like the ex / search
+    /// histories. Session-only for now (not yet persisted to shada).
+    prompt_history: std::collections::HashMap<String, Vec<String>>,
+    /// The history namespace of the open prompt (the `history` key passed to the
+    /// `nx.ui.input` request), or `None` when the prompt has no history. Set by
+    /// [`Editor::open_prompt`]; selects which [`Editor::prompt_history`] ring
+    /// `active_history` returns and `submit` records into.
+    prompt_history_key: Option<String>,
+    /// Position within the active history ([`Editor::search_history`],
+    /// [`Editor::ex_history`], or the active [`Editor::prompt_history`] ring, per the
+    /// open prompt's kind) while browsing it; `None` when editing a fresh line. Reset
+    /// each time a command line opens.
     hist_idx: Option<usize>,
     /// Whether `hlsearch` highlighting is currently showing. Set by a search,
     /// cleared by `:nohlsearch`; gates the match spans projected into the `View`.
@@ -969,6 +982,22 @@ pub struct Editor {
     /// in one round-trip and rebuilding the menu via [`Editor::open_cmdline_menu`].
     /// `None` when idle. See [`cmdcomplete`](crate::editor::cmdcomplete).
     pub cmdline_complete_request: Option<cmdcomplete::CmdlineCompleteReq>,
+    /// Whether the open [`CmdlineKind::Prompt`] opted into autocomplete
+    /// (`nx.ui.input{ complete = fn }`): gates the `<Tab>` wildmenu for the prompt.
+    /// Set per-prompt by [`Editor::open_prompt`]; the gate is kind-checked, so a stale
+    /// `true` while a non-prompt line is open is inert.
+    prompt_complete_active: bool,
+    /// Whether the open prompt's wildmenu shows the side **docs** pane
+    /// (`nx.ui.input{ complete_docs = true }`): each candidate's `doc` renders in a
+    /// panel beside the list, exactly like the `:`-completion docs pane. Set
+    /// per-prompt by [`Editor::open_prompt`].
+    prompt_complete_docs: bool,
+    /// A pending **prompt** completion request — the `nx.ui.input` analogue of
+    /// [`Editor::cmdline_complete_request`]. Core stamps the token being completed on
+    /// `<Tab>` (and on each edit while the menu is open); the server resolves it by
+    /// calling the prompt's per-call `complete` source (sync or async) and rebuilds
+    /// the wildmenu via [`Editor::open_prompt_complete_menu`]. `None` when idle.
+    pub prompt_complete_request: Option<cmdcomplete::CmdlineCompleteReq>,
     /// The command line as the user typed it **before** the wildmenu rewrote it to a
     /// highlighted candidate (`(line, cursor)`): navigating the wildmenu previews the
     /// selected command in the line (so `<CR>` runs what is shown), and `<Esc>`
@@ -1562,6 +1591,8 @@ impl Editor {
             pending_search_count: 1,
             search_history: Vec::new(),
             ex_history: Vec::new(),
+            prompt_history: std::collections::HashMap::new(),
+            prompt_history_key: None,
             hist_idx: None,
             search_active: false,
             search_origin: Cursor::default(),
@@ -1591,6 +1622,9 @@ impl Editor {
             cmdcomplete: cmdcomplete::CmdlineCompleteConfig::default(),
             cmdline_complete_saved: None,
             cmdline_complete_request: None,
+            prompt_complete_active: false,
+            prompt_complete_docs: false,
+            prompt_complete_request: None,
             should_quit: false,
             options: Options::default(),
             // The base + overlay start equal to the effective options (no overrides yet);

@@ -189,8 +189,10 @@ impl Editor {
                 self.submit_search(&text, dir);
             }
             CmdlineKind::Prompt => {
-                // Hand the typed line to the waiting `vim.ui.input` callback (the
-                // server drains `prompt_results` and fires it).
+                // Record the submission in the prompt's history ring (if it opted into
+                // one) before handing the typed line to the waiting `vim.ui.input`
+                // callback (the server drains `prompt_results` and fires it).
+                self.remember_prompt(&text);
                 self.cmdline_prompt.clear();
                 self.prompt_results.push(Some(text));
             }
@@ -315,13 +317,29 @@ impl Editor {
     /// cursor at its end. `<CR>` / `<Esc>` deliver the result through
     /// [`Editor::prompt_results`]. The server calls this when it drains a queued
     /// `vim.ui.input` request, then fires the registered Lua callback on submit.
-    pub fn open_prompt(&mut self, label: String, default: String) {
+    pub fn open_prompt(
+        &mut self,
+        label: String,
+        default: String,
+        history_key: Option<String>,
+        complete: bool,
+        complete_docs: bool,
+    ) {
         self.cmdline_return_mode = Mode::Normal;
         self.mode = Mode::Command;
         self.cmdline = default;
         self.cmdline_col = self.cmdline.len();
         self.cmdline_kind = CmdlineKind::Prompt;
         self.cmdline_prompt = label;
+        // The prompt's history namespace (`nx.ui.input{ history = … }`): drives
+        // `<Up>`/`<Down>` recall and what `submit` records. Reset the browse position
+        // so the first `<Up>` starts at the newest entry (a prompt opening fresh).
+        self.prompt_history_key = history_key;
+        self.hist_idx = None;
+        // Whether this prompt opted into `<Tab>` autocomplete (`complete = fn`) and
+        // whether its wildmenu shows the side docs pane (`complete_docs`).
+        self.prompt_complete_active = complete;
+        self.prompt_complete_docs = complete_docs;
     }
 
     /// Open the command line as a `vim.fn.confirm` button dialog: a
@@ -452,13 +470,36 @@ impl Editor {
     }
 
     /// The history list for the open command line's kind: ex commands for `:`,
-    /// search patterns for `/`,`?`. A `vim.ui.input` prompt has no history.
+    /// search patterns for `/`,`?`, and — for a `vim.ui.input` prompt — the ring of
+    /// its `history` namespace (empty when it opted into none).
     fn active_history(&self) -> &[String] {
         match self.cmdline_kind {
             CmdlineKind::Ex => &self.ex_history,
             CmdlineKind::Search(_) => &self.search_history,
             CmdlineKind::Confirm => &[],
-            CmdlineKind::Prompt => &[],
+            CmdlineKind::Prompt => self
+                .prompt_history_key
+                .as_ref()
+                .and_then(|k| self.prompt_history.get(k))
+                .map_or(&[], Vec::as_slice),
+        }
+    }
+
+    /// Record a submitted `nx.ui.input` line in its history namespace, skipping an
+    /// empty line or a consecutive duplicate (mirroring [`remember_ex`]). A no-op
+    /// when the prompt opted into no history (`prompt_history_key` is `None`).
+    ///
+    /// [`remember_ex`]: Self::remember_ex
+    fn remember_prompt(&mut self, text: &str) {
+        let Some(key) = self.prompt_history_key.clone() else {
+            return;
+        };
+        if text.is_empty() {
+            return;
+        }
+        let ring = self.prompt_history.entry(key).or_default();
+        if ring.last().map(String::as_str) != Some(text) {
+            ring.push(text.to_string());
         }
     }
 

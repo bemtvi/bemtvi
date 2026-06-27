@@ -137,6 +137,8 @@ impl EditHost {
                     // item cache (`source_accept`), not an inline `doc` / `resolve`.
                     doc: None,
                     resolve: None,
+                    // LSP completion edits the buffer (`textEdit`), not a cmdline span.
+                    replace: None,
                 }
             })
             .collect();

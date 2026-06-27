@@ -134,6 +134,25 @@ end
 -- one is the old callback shape and errors loudly). opts:
 --   prompt  = the label drawn ahead of the editable line (default "")
 --   default = text prefilled into the line, cursor at its end (default "")
+--   history = a namespace string enabling readline-style recall: `<Up>`/`<Down>`
+--             (and `<C-p>`/`<C-n>`) browse the prompts submitted under this
+--             namespace, and each non-empty submission is recorded into it. Each
+--             namespace is an independent ring, so one plugin's REPL history is
+--             separate from another's. Session-only for now. Absent ⇒ no history.
+--   complete = a function `(line, col) -> candidates` driving `<Tab>` autocomplete
+--             (the inline wildmenu above the prompt line — `<Tab>`/`<S-Tab>` cycle,
+--             `<CR>` accepts). `candidates` is a `{ {label, insert?, doc?, start?,
+--             length?}, … }` list (`insert` defaults to `label`), OR a PROMISE of one —
+--             so an async source (e.g. a DAP `completions` request) works. The token
+--             completed is the trailing identifier run before the cursor, UNLESS a
+--             candidate supplies `start` (0-based char offset into the line) + `length`
+--             (chars), an explicit replace span that overrides the token for that row.
+--             `col` is the cursor's 0-based char offset.
+--   complete_docs = show the side docs pane rendering each candidate's `doc` beside
+--             the list (default true when `complete` is set; `false` suppresses it).
+--   complete_debounce = ms to coalesce refresh queries (narrowing an open menu as you
+--             type) so an async source isn't a wire round-trip per keystroke; the
+--             initial `<Tab>` is always immediate (default 100; `0` disables it).
 -- The server owns the prompt: it opens the editor's command line as a labelled
 -- Prompt (Editor::open_prompt), and delivers the result to nx._cb_fns[id] through
 -- the shared prompt_results channel. Non-blocking (ADR 0002 rule 3): the call
@@ -148,12 +167,93 @@ function nx.ui.input(opts, on_confirm)
   if type(opts) ~= "table" then
     error("nx.ui.input: opts must be a table", 2)
   end
+  local history = opts.history
+  if history ~= nil and type(history) ~= "string" then
+    error("nx.ui.input: opts.history must be a string namespace", 2)
+  end
+  local complete = opts.complete
+  if complete ~= nil and type(complete) ~= "function" then
+    error("nx.ui.input: opts.complete must be a function", 2)
+  end
+  -- The side docs pane defaults ON when a completion source is given (so a candidate
+  -- carrying a `doc` shows it); pass `complete_docs = false` to suppress it.
+  local complete_docs = complete ~= nil and opts.complete_docs ~= false
+  -- Refresh queries (narrowing an open menu as you type) coalesce through this debounce
+  -- so an async source isn't a wire round-trip per keystroke; the initial <Tab> is
+  -- always immediate. Default 100ms; `0` disables it (re-query every edit).
+  local debounce_ms = opts.complete_debounce
+  if debounce_ms ~= nil and (type(debounce_ms) ~= "number" or debounce_ms < 0) then
+    error("nx.ui.input: opts.complete_debounce must be a non-negative number (ms)", 2)
+  end
+  debounce_ms = debounce_ms or 100
   return nx.promise.new(function(resolve)
     local id = nx._next_cb_id()
-    -- text: the entered string ("" on an empty <CR>), or nil on cancel.
-    nx._cb_fns[id] = resolve
-    nx._ui_input(tostring(opts.prompt or ""), tostring(opts.default or ""), id)
+    -- text: the entered string ("" on an empty <CR>), or nil on cancel. Tear down the
+    -- active completion source + its debounce on settle so neither leaks into a later
+    -- prompt (only one prompt is open at a time).
+    nx._cb_fns[id] = function(text)
+      if nx._prompt_complete_debounced then
+        nx._prompt_complete_debounced:cancel()
+      end
+      nx._active_prompt_complete = nil
+      nx._prompt_complete_debounced = nil
+      resolve(text)
+    end
+    nx._active_prompt_complete = complete
+    -- A per-prompt debounced wrapper around the source (latest-args, trailing edge).
+    -- nil when there's no source or the user disabled it (`complete_debounce = 0`).
+    nx._prompt_complete_debounced = (complete and debounce_ms > 0)
+        and nx.utils.debounce(function(line, col)
+          nx._do_prompt_complete(complete, line, col)
+        end, debounce_ms)
+      or nil
+    nx._ui_input(
+      tostring(opts.prompt or ""),
+      tostring(opts.default or ""),
+      id,
+      history,
+      complete ~= nil,
+      complete_docs
+    )
   end)
+end
+
+-- The open prompt's `complete` source (`nx.ui.input{ complete = fn }`) and its
+-- per-prompt debounced wrapper, or nil when the prompt opted into none / no debounce.
+-- One prompt is open at a time, so single slots hold them; cleared when it settles.
+nx._active_prompt_complete = nx._active_prompt_complete or nil
+nx._prompt_complete_debounced = nx._prompt_complete_debounced or nil
+
+-- Run the source once and pipe its candidates (a `{ {label, insert?, doc?}, … }` list
+-- OR a promise of one — an async source like the DAP `completions` round-trip) into
+-- the wildmenu via `nx._prompt_complete_show`. `nx.promise.resolve` adapts the sync
+-- and async shapes uniformly; a nil result or an error resolves to an empty list (the
+-- menu just closes — a completion hiccup must not break the prompt). Shared by the
+-- immediate path and the debounced refresh path.
+function nx._do_prompt_complete(fn, line, col)
+  nx.promise.resolve(fn(line, col)):next(function(cands)
+    nx._prompt_complete_show(cands or {})
+  end, function()
+    nx._prompt_complete_show({})
+  end)
+end
+
+-- nx._run_prompt_complete(line, col, refresh): drive the open prompt's `complete`
+-- source for the `<Tab>` wildmenu. The server calls this when core stamps a
+-- prompt-completion request. The initial open (`refresh = false`) queries at once for
+-- a snappy menu; an edit narrowing the open menu (`refresh = true`) coalesces through
+-- the prompt's debounce so a rapid burst of keystrokes is one query, not one per key.
+function nx._run_prompt_complete(line, col, refresh)
+  local fn = nx._active_prompt_complete
+  if not fn then
+    nx._prompt_complete_show({})
+    return
+  end
+  if refresh and nx._prompt_complete_debounced then
+    nx._prompt_complete_debounced(line, col)
+  else
+    nx._do_prompt_complete(fn, line, col)
+  end
 end
 
 -- vim.ui.input(opts, on_confirm): neovim's callback-shaped alias (ADR 0002

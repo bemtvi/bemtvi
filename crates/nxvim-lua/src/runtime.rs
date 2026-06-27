@@ -567,6 +567,11 @@ pub struct OutputLine {
     pub error: bool,
 }
 
+/// One `nx.ui.input` completion candidate resolved by a prompt source: `(label,
+/// insert, doc, range)` where `range` is the optional `(start_char, len_char)`
+/// adapter-specified replace span (DAP `CompletionItem.start`/`length`).
+pub(crate) type PromptCompleteCands = Vec<(String, String, String, Option<(usize, usize)>)>;
+
 /// Side effects produced by running Lua, drained by the server.
 #[derive(Default)]
 pub(crate) struct Shared {
@@ -636,6 +641,14 @@ pub(crate) struct Shared {
     /// `vim.ui.input` prompt requests, drained by the server into the editor's
     /// command line (`Editor::open_prompt`) after the chunk (Phase 8).
     pub(crate) ui_inputs: Vec<UiInputReq>,
+    /// Candidate lists resolved by an `nx.ui.input{ complete = fn }` prompt source,
+    /// drained by the server into the prompt wildmenu
+    /// (`Editor::open_prompt_complete_menu`). Each candidate is `(label, insert, doc,
+    /// range)`, where `range` is the adapter-specified replace span `(start_char,
+    /// len_char)` (the DAP `CompletionItem.start`/`length`, 0-based char offset + char
+    /// count) or `None`. The source may resolve a promise first, so an entry can land a
+    /// tick after the request was stamped.
+    pub(crate) prompt_complete_results: Vec<PromptCompleteCands>,
     /// `nx.ui.select` requests, drained by the server into the editor's floating
     /// selectable-list widget (`Editor::open_menu`) after the chunk.
     pub(crate) ui_selects: Vec<UiSelectReq>,
@@ -1271,6 +1284,12 @@ impl LuaRuntime {
     }
 
     take_queue! {
+        /// Take the prompt-completion candidate lists resolved since the last drain,
+        /// for the server to rebuild the `nx.ui.input` wildmenu.
+        take_prompt_complete_results -> Vec<PromptCompleteCands> = prompt_complete_results
+    }
+
+    take_queue! {
         /// Take the `nx.ui.select` requests queued since the last drain, for the
         /// server to open as floating selectable-list menus.
         take_ui_selects -> Vec<UiSelectReq> = ui_selects
@@ -1552,6 +1571,26 @@ impl LuaRuntime {
             out.push((label, insert, doc));
         }
         Ok(CmdlineComplete::Candidates(out))
+    }
+
+    /// Drive the open `nx.ui.input` prompt's `complete` source for `line` / `col` (the
+    /// `<Tab>` wildmenu trigger). Unlike [`run_cmdline_complete`], this returns
+    /// nothing synchronously: the source may resolve a promise (the DAP `completions`
+    /// request is a network round-trip), so the candidates arrive via
+    /// `nx._prompt_complete_show` — queued in [`Shared::prompt_complete_results`] and
+    /// drained by the server on a later pass. The Lua side (`nx._run_prompt_complete`)
+    /// adapts a plain list or a promise uniformly through `nx.promise.resolve`.
+    ///
+    /// `refresh` is true when the request narrows an already-open wildmenu (an edit),
+    /// false for the initial `<Tab>` — the Lua side queries the initial one immediately
+    /// but coalesces refreshes through the prompt's `complete_debounce` so an async
+    /// source isn't a wire round-trip per keystroke.
+    ///
+    /// [`run_cmdline_complete`]: Self::run_cmdline_complete
+    pub fn run_prompt_complete(&self, line: &str, col: usize, refresh: bool) -> mlua::Result<()> {
+        let nx = self.nx()?;
+        let run: mlua::Function = nx.get("_run_prompt_complete")?;
+        run.call((self.lua.create_string(line)?, lua_int(col as i64), refresh))
     }
 
     /// Populate `nx._options_catalog` with the documented option catalog, so the

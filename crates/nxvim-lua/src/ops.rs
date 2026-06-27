@@ -1219,6 +1219,15 @@ pub struct UiInputReq {
     pub default: String,
     /// The `nx._cb_fns` id whose `on_confirm` wrapper receives the result.
     pub cb_id: u64,
+    /// The history namespace (`opts.history`): enables `<Up>`/`<Down>` recall and
+    /// records submissions under this key. `None` when the prompt opted into none.
+    pub history: Option<String>,
+    /// Whether the prompt opted into `<Tab>` autocomplete (`opts.complete` is a
+    /// function). The source fn itself stays in Lua (`nx._active_prompt_complete`);
+    /// this flag just tells core to enable the wildmenu trigger for the prompt.
+    pub complete: bool,
+    /// Whether the prompt's wildmenu shows the side docs pane (`opts.complete_docs`).
+    pub complete_docs: bool,
 }
 
 /// A `nx.ui.select(items, opts, on_choice)` request: open the floating

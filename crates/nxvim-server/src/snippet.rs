@@ -57,6 +57,8 @@ impl EditHost {
                 // Snippets carry no docs sidebar / lazy-resolve.
                 doc: None,
                 resolve: None,
+                // The snippet trigger replaces the buffer prefix, not a cmdline span.
+                replace: None,
             })
             .collect();
         if !items.is_empty() {

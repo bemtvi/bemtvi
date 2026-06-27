@@ -2168,19 +2168,68 @@ pub(crate) fn install_runtime_api(
         })?,
     )?;
 
-    // `nx._ui_input(prompt, default, cb_id)`: queue a `vim.ui.input` prompt
+    // `nx._ui_input(prompt, default, cb_id, history?)`: queue a `vim.ui.input` prompt
     // ([`UiInputReq`]). The server opens the editor's command line labelled
     // `prompt` (prefilled with `default`) and fires `nx._cb_fns[cb_id]` with the
-    // typed text — or `nil` on cancel — when the user submits (Phase 8).
+    // typed text — or `nil` on cancel — when the user submits (Phase 8). The optional
+    // `history` namespace enables `<Up>`/`<Down>` recall and records submissions.
     let sh = shared.clone();
     nx.set(
         "_ui_input",
-        lua.create_function(move |_, (prompt, default, cb_id): (String, String, u64)| {
-            sh.borrow_mut().ui_inputs.push(UiInputReq {
-                prompt,
-                default,
-                cb_id,
-            });
+        lua.create_function(
+            move |_,
+                  (prompt, default, cb_id, history, complete, complete_docs): (
+                String,
+                String,
+                u64,
+                Option<String>,
+                Option<bool>,
+                Option<bool>,
+            )| {
+                sh.borrow_mut().ui_inputs.push(UiInputReq {
+                    prompt,
+                    default,
+                    cb_id,
+                    history,
+                    complete: complete.unwrap_or(false),
+                    complete_docs: complete_docs.unwrap_or(false),
+                });
+                Ok(())
+            },
+        )?,
+    )?;
+
+    // `nx._prompt_complete_show(candidates)`: the prompt's `complete` source (driven
+    // by `nx._run_prompt_complete`) hands its resolved candidate list back here — a
+    // `{ {label, insert?, doc?, start?, length?}, ... }` array. Queued for the server to
+    // rebuild the prompt wildmenu via `Editor::open_prompt_complete_menu`. `start`
+    // (0-based char offset into the line) + `length` (chars) are the adapter-specified
+    // replace range (DAP `CompletionItem.start`/`length`): when both are present the row
+    // replaces exactly that span instead of the trailing-identifier token. Async-
+    // friendly: the source may resolve a promise first, so this can fire a tick later.
+    let sh = shared.clone();
+    nx.set(
+        "_prompt_complete_show",
+        lua.create_function(move |_, candidates: Table| {
+            let mut out = Vec::new();
+            for item in candidates.sequence_values::<Table>() {
+                let item = item?;
+                let label: String = item.get("label")?;
+                let insert: String = item
+                    .get::<Option<String>>("insert")?
+                    .unwrap_or_else(|| label.clone());
+                let doc: String = item.get::<Option<String>>("doc")?.unwrap_or_default();
+                // An explicit replace range needs both a start and a length; a partial
+                // one is ignored (falls back to the token).
+                let start = item.get::<Option<i64>>("start")?;
+                let length = item.get::<Option<i64>>("length")?;
+                let range = match (start, length) {
+                    (Some(s), Some(l)) if s >= 0 && l >= 0 => Some((s as usize, l as usize)),
+                    _ => None,
+                };
+                out.push((label, insert, doc, range));
+            }
+            sh.borrow_mut().prompt_complete_results.push(out);
             Ok(())
         })?,
     )?;

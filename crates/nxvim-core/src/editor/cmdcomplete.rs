@@ -52,6 +52,11 @@ pub struct CmdlineCompleteReq {
     /// Display width of the command-line text before the token — the column the
     /// menu anchors under (after the `:` prompt char).
     pub anchor_width: usize,
+    /// Whether this request **narrows an already-open** wildmenu (an edit) rather than
+    /// opening it (the initial `<Tab>`). Only consulted for prompt completion, where
+    /// the server queries the initial request at once but debounces refreshes. Always
+    /// `false` for the ex catalog path (its source is a microsecond table scan).
+    pub refresh: bool,
 }
 
 impl Editor {
@@ -82,6 +87,14 @@ impl Editor {
     /// for it from the whole `line`; `:set` arguments complete option names, other
     /// commands' arguments return nothing yet, which closes the menu).
     pub(crate) fn cmdline_complete_trigger(&mut self) {
+        // A scripted prompt (`nx.ui.input{ complete = fn }`) routes to its own
+        // per-call source rather than the ex catalog — different token model (a
+        // trailing identifier run, not a command-name/argument split) and a different
+        // request field the server resolves against the prompt's `complete` callback.
+        if matches!(self.cmdline_kind, CmdlineKind::Prompt) {
+            self.prompt_complete_trigger(false);
+            return;
+        }
         if !self.cmdcomplete.enabled || !matches!(self.cmdline_kind, CmdlineKind::Ex) {
             self.close_cmdline_menu();
             return;
@@ -96,7 +109,94 @@ impl Editor {
             prefix,
             anchor,
             anchor_width,
+            refresh: false,
         });
+    }
+
+    /// Stamp a [`Editor::prompt_complete_request`] for the open `nx.ui.input` prompt
+    /// (a no-op when it opted into no `complete` source). The completed token is the
+    /// **trailing identifier run** before the cursor (word chars + `_`, breaking on
+    /// `.`/space/punctuation) — the natural unit for a REPL word/member completion —
+    /// rather than the ex command-name/argument split. Accepting a row replaces
+    /// `[anchor .. cmdline_col)`; the server fills the candidates from the prompt's
+    /// own `complete` callback.
+    fn prompt_complete_trigger(&mut self, refresh: bool) {
+        if !self.prompt_complete_active {
+            self.close_cmdline_menu();
+            return;
+        }
+        let (anchor, anchor_width, prefix) = self.prompt_complete_token();
+        self.prompt_complete_request = Some(CmdlineCompleteReq {
+            line: self.cmdline.clone(),
+            col: self.cmdline_cursor(),
+            prefix,
+            anchor,
+            anchor_width,
+            refresh,
+        });
+    }
+
+    /// The token being completed in an `nx.ui.input` prompt: the trailing run of
+    /// identifier characters (`is_alphanumeric` or `_`) immediately before the cursor,
+    /// as `(anchor_byte, anchor_display_width, prefix)`. An empty run (the cursor sits
+    /// right after a `.`/space/`(`) anchors at the cursor with an empty prefix, so the
+    /// source's full candidate set shows (e.g. `os.<Tab>` lists every member).
+    fn prompt_complete_token(&self) -> (usize, usize, String) {
+        let upto = &self.cmdline[..self.cmdline_col];
+        let start = upto
+            .char_indices()
+            .rev()
+            .take_while(|(_, c)| c.is_alphanumeric() || *c == '_')
+            .last()
+            .map_or(self.cmdline_col, |(i, _)| i);
+        let anchor_width = crate::unicode::display_width(&upto[..start]);
+        (start, anchor_width, upto[start..].to_string())
+    }
+
+    /// Open / rebuild the prompt wildmenu from `candidates` the server resolved from
+    /// the prompt's `complete` source. Re-extracts the token from the **current** line
+    /// (so an async source that resolved a tick late ranks against the freshest
+    /// prefix), then reuses the shared [`Editor::open_cmdline_menu`]. Shows the side
+    /// docs pane when the prompt opted into it (`complete_docs`). A no-op off a prompt
+    /// line (the prompt closed before the async candidates arrived).
+    ///
+    /// Each candidate is `(label, insert, doc, range)`; `range` is the adapter-specified
+    /// replace span as `(start_char, len_char)` — a 0-based char offset into the line and
+    /// a char count (the DAP `CompletionItem.start`/`length`). When present it is
+    /// converted to a byte `(start, end)` span against the current line and overrides the
+    /// trailing-identifier token for that row; `None` falls back to the token.
+    pub fn open_prompt_complete_menu(&mut self, candidates: Vec<super::CmdlineCandidate>) {
+        if !matches!(self.cmdline_kind, CmdlineKind::Prompt) {
+            return;
+        }
+        let (anchor, anchor_width, prefix) = self.prompt_complete_token();
+        // Map each candidate's `(start_char, len_char)` to a byte span in the line.
+        let candidates: Vec<super::CmdlineCandidate> = candidates
+            .into_iter()
+            .map(|(label, insert, doc, range)| {
+                let bytes = range.map(|(start_char, len_char)| {
+                    self.cmdline_char_span_to_bytes(start_char, len_char)
+                });
+                (label, insert, doc, bytes)
+            })
+            .collect();
+        let docs = self.prompt_complete_docs;
+        self.open_cmdline_menu(anchor, anchor_width, &prefix, candidates, docs);
+    }
+
+    /// Convert a `(start_char, len_char)` span — a 0-based char offset into
+    /// [`Editor::cmdline`] and a char count — into a byte `(start, end)` span, clamped
+    /// to the line. Char-boundary aware so a multibyte line still replaces whole
+    /// characters.
+    fn cmdline_char_span_to_bytes(&self, start_char: usize, len_char: usize) -> (usize, usize) {
+        let bounds: Vec<usize> = self
+            .cmdline
+            .char_indices()
+            .map(|(i, _)| i)
+            .chain(std::iter::once(self.cmdline.len()))
+            .collect();
+        let at = |c: usize| bounds.get(c).copied().unwrap_or(self.cmdline.len());
+        (at(start_char), at(start_char + len_char))
     }
 
     /// Re-run the trigger when a cmdline menu is already open (a content edit
@@ -114,11 +214,19 @@ impl Editor {
         if !self.cmdline_menu_open() {
             return;
         }
+        // A real edit commits any previewed selection (the line is the user's own text
+        // again) — drop the revert snapshot before re-resolving.
+        self.cmdline_complete_saved = None;
+        // A prompt completion re-queries on every edit (live narrowing as you type the
+        // word): there's no "typed past the token into a new one" file-picker hazard
+        // to guard against, so it re-triggers unconditionally while the menu is open.
+        // It's a refresh (narrowing an open menu), so the server debounces it.
+        if matches!(self.cmdline_kind, CmdlineKind::Prompt) {
+            self.prompt_complete_trigger(true);
+            return;
+        }
         let same_token =
             self.cmdline_complete_token().map(|(anchor, ..)| anchor) == self.cmdline_menu_anchor();
-        // A real edit commits any previewed selection (the line is the user's own text
-        // again), whether we narrow or close — so drop the revert snapshot either way.
-        self.cmdline_complete_saved = None;
         if same_token {
             self.cmdline_complete_trigger();
         } else {
@@ -133,17 +241,22 @@ impl Editor {
     /// run is always what the line shows. A no-op while the popup is noselect (nothing
     /// highlighted yet).
     pub(crate) fn cmdline_complete_preview(&mut self) {
-        let Some((anchor, insert)) = self.cmdline_complete_selected() else {
+        // Snapshot the originally-typed line on the first preview; on later previews
+        // restore it first. Cycling rows must restore to the *originally typed* text
+        // (not the last row), and restoring also keeps each row's explicit `replace`
+        // span — indexed against that original line — valid as the user cycles.
+        match self.cmdline_complete_saved.clone() {
+            None => self.cmdline_complete_saved = Some((self.cmdline.clone(), self.cmdline_col)),
+            Some((line, col)) => {
+                self.cmdline = line;
+                self.cmdline_col = col;
+            }
+        }
+        let Some((start, end, insert)) = self.cmdline_complete_selected() else {
             return;
         };
-        // Snapshot the pre-preview line on the first rewrite only — cycling through
-        // rows must keep restoring to the *originally typed* text, not the last row.
-        if self.cmdline_complete_saved.is_none() {
-            self.cmdline_complete_saved = Some((self.cmdline.clone(), self.cmdline_col));
-        }
-        self.cmdline
-            .replace_range(anchor..self.cmdline_col, &insert);
-        self.cmdline_col = anchor + insert.len();
+        self.cmdline.replace_range(start..end, &insert);
+        self.cmdline_col = start + insert.len();
     }
 
     /// Restore the command line to what the user typed before the wildmenu previewed
@@ -185,12 +298,17 @@ impl Editor {
     }
 
     pub(crate) fn cmdline_complete_accept(&mut self) -> bool {
-        let Some((anchor, insert)) = self.cmdline_complete_take_accept() else {
+        // Restore the originally-typed line (a preview may have rewritten it) so the
+        // accepted row's `replace` span — indexed against that line — applies correctly.
+        if let Some((line, col)) = self.cmdline_complete_saved.take() {
+            self.cmdline = line;
+            self.cmdline_col = col;
+        }
+        let Some((start, end, insert)) = self.cmdline_complete_take_accept() else {
             return false;
         };
-        self.cmdline
-            .replace_range(anchor..self.cmdline_col, &insert);
-        self.cmdline_col = anchor + insert.len();
+        self.cmdline.replace_range(start..end, &insert);
+        self.cmdline_col = start + insert.len();
         true
     }
 

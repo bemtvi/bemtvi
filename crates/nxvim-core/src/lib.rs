@@ -32,15 +32,16 @@ pub use buffer::{dir_listing, Buffer, BufferEdit, BufferKind, DiskChange, EditBa
 pub use clipboard::Clipboard;
 pub use editor::{
     command_pending_after, command_status, language_of_path, place_aligned, Align, BorderStyle,
-    BufferId, ClickSurface, CmdlineCompleteReq, CommandContinuation, CommandPending, CommandStatus,
-    CompleteConfig, CompleteDocsHit, CompleteKeys, Cursor, DecorViewport, Editor, Extent,
-    FileChangeAction, FileChangeReason, FileChangelist, FileFolds, FileMarkEntry, FloatAnchor,
-    FloatConfig, FloatRelative, GlobalMarkEntry, JumpPos, LocListEntry, Margin, MenuGeom, MenuItem,
-    MenuMetrics, MenuPlacement, MouseClick, MousePos, NumberedMark, PendingOpen, PendingQuitAll,
-    PendingSave, PersistState, PluginEntry, PluginNamespace, PreviewScroll, PreviewTarget,
-    PromptPos, QfAction, QfEntry, QfList, QfStack, QfWhich, RegisterEntry, SessionDock,
-    SessionState, SessionTab, SessionWindow, ShadaRequest, StatuslineClick, TabId, TerminalOp,
-    UndoEntry, UndoTreeView, WheelGesture, WindowConfigSpec, WindowId,
+    BufferId, ClickSurface, CmdlineCandidate, CmdlineCompleteReq, CommandContinuation,
+    CommandPending, CommandStatus, CompleteConfig, CompleteDocsHit, CompleteKeys, Cursor,
+    DecorViewport, Editor, Extent, FileChangeAction, FileChangeReason, FileChangelist, FileFolds,
+    FileMarkEntry, FloatAnchor, FloatConfig, FloatRelative, GlobalMarkEntry, JumpPos, LocListEntry,
+    Margin, MenuGeom, MenuItem, MenuMetrics, MenuPlacement, MouseClick, MousePos, NumberedMark,
+    PendingOpen, PendingQuitAll, PendingSave, PersistState, PluginEntry, PluginNamespace,
+    PreviewScroll, PreviewTarget, PromptPos, QfAction, QfEntry, QfList, QfStack, QfWhich,
+    RegisterEntry, SessionDock, SessionState, SessionTab, SessionWindow, ShadaRequest,
+    StatuslineClick, TabId, TerminalOp, UndoEntry, UndoTreeView, WheelGesture, WindowConfigSpec,
+    WindowId,
 };
 pub use encoding::Encoding;
 pub use extmark::{

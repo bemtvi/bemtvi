@@ -769,8 +769,27 @@ impl EditHost {
         // queued, the last wins (its label/default is what shows) — a documented
         // single-prompt limitation, not a silent drop.
         for req in self.lua.take_ui_inputs() {
-            self.editor.open_prompt(req.prompt, req.default);
+            self.editor.open_prompt(
+                req.prompt,
+                req.default,
+                req.history,
+                req.complete,
+                req.complete_docs,
+            );
             self.pending_ui_input = Some(req.cb_id);
+        }
+        // Prompt completion candidates resolved by an `nx.ui.input{ complete = fn }`
+        // source (sync, or a tick after the request for an async source): rebuild the
+        // prompt wildmenu from each. Drained every pass so async results land off the
+        // keypress that requested them.
+        for cands in self.lua.take_prompt_complete_results() {
+            let cands: Vec<nxvim_core::CmdlineCandidate> = cands
+                .into_iter()
+                .map(|(label, insert, doc, range)| {
+                    (label, insert, (!doc.is_empty()).then_some(doc), range)
+                })
+                .collect();
+            self.editor.open_prompt_complete_menu(cands);
         }
         // `nx.ui.select`: open the floating selectable-list widget and remember
         // which callback awaits the chosen index. The Lua wrapper never queues an
@@ -1068,6 +1087,7 @@ impl EditHost {
                     source_accept: false,
                     doc: None,
                     resolve: None,
+                    replace: None,
                 })
                 .collect();
             if !items.is_empty() {
@@ -1111,6 +1131,7 @@ impl EditHost {
                     doc: p.doc,
                     // Or a lazy-docs `resolve` handle, resolved on selection.
                     resolve: p.resolve,
+                    replace: None,
                 })
                 .collect();
             if !items.is_empty() {
@@ -2926,10 +2947,12 @@ impl EditHost {
                 let docs = self.editor.cmdline_complete_docs();
                 match self.lua.run_cmdline_complete(&req.line, req.col) {
                     Ok(nxvim_lua::CmdlineComplete::Candidates(cands)) => {
-                        let cands: Vec<(String, String, Option<String>)> = cands
+                        // The ex catalog never sets an explicit replace span (`None`):
+                        // it completes the trailing token via the menu anchor.
+                        let cands: Vec<nxvim_core::CmdlineCandidate> = cands
                             .into_iter()
                             .map(|(label, insert, doc)| {
-                                (label, insert, (!doc.is_empty()).then_some(doc))
+                                (label, insert, (!doc.is_empty()).then_some(doc), None)
                             })
                             .collect();
                         self.editor.open_cmdline_menu(
@@ -2951,6 +2974,26 @@ impl EditHost {
                     Err(e) => self
                         .editor
                         .echo(format!("E5108: Error in nx.cmdline_complete source: {e}")),
+                }
+                self.apply_lua_effects();
+            }
+            // Prompt completion (`nx.ui.input{ complete = fn }`): core stamped the
+            // token on `<Tab>` (or an edit while the wildmenu is open). Unlike the ex
+            // catalog, the source is the prompt's own `complete` callback and may be
+            // async (the DAP `completions` request is a round-trip), so this only
+            // *drives* it here — the candidates arrive via `nx._prompt_complete_show`
+            // (drained above into `open_prompt_complete_menu`), sync or a tick later.
+            if let Some(req) = self.editor.prompt_complete_request.take() {
+                // `req.refresh` distinguishes an edit narrowing the open menu from the
+                // initial `<Tab>`: the Lua side queries the initial one at once but
+                // debounces refreshes (`complete_debounce`).
+                if let Err(e) = self
+                    .lua
+                    .run_prompt_complete(&req.line, req.col, req.refresh)
+                {
+                    self.editor.echo(format!(
+                        "E5108: Error in nx.ui.input completion source: {e}"
+                    ));
                 }
                 self.apply_lua_effects();
             }

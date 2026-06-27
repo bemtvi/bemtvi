@@ -139,6 +139,13 @@ impl Extent {
     }
 }
 
+/// One command-line / prompt completion candidate handed to
+/// [`Editor::open_cmdline_menu`]: `(label, insert, doc, replace)`. `replace` is an
+/// optional explicit `(start_byte, end_byte)` span overriding the trailing-token range
+/// for that row (the prompt path's adapter-specified DAP range); the ex catalog passes
+/// `None`.
+pub type CmdlineCandidate = (String, String, Option<String>, Option<(usize, usize)>);
+
 /// One candidate row: its display `label` and the **opaque source key** that
 /// identifies it back to the engine. For `nx.ui.select` the key is the choice's
 /// 0-based index; for a picker it is the 1-based index into the Lua wrapper's
@@ -184,6 +191,14 @@ pub struct MenuItem {
     /// reply for the sidebar. `None` for an inline-doc / `buffer` / `lsp` / `select`
     /// row — there's nothing to resolve. Phase 4-E.
     pub resolve: Option<u64>,
+    /// An explicit `(start_byte, end_byte)` replace range into the command line for a
+    /// **cmdline/prompt** row, overriding the default `[anchor .. cursor)`. Set when an
+    /// `nx.ui.input` completion source supplies an adapter-specified range (the DAP
+    /// `CompletionItem.start`/`length`): accepting / previewing the row replaces exactly
+    /// this span rather than the trailing-identifier token. `None` ⇒ the default token
+    /// range. The bytes index the line as it was at menu-build time, so preview / accept
+    /// restore that line first (see [`Editor::cmdline_complete_preview`]).
+    pub replace: Option<(usize, usize)>,
 }
 
 /// The outcome of accepting a completion row, returned by
@@ -573,6 +588,7 @@ impl Editor {
                 source_accept: false,
                 doc: None,
                 resolve: None,
+                replace: None,
             })
             .collect();
         let last = all_items.len().saturating_sub(1);
@@ -689,15 +705,20 @@ impl Editor {
     /// matching closes any open popup (the wildmenu just disappears). Opens noselect —
     /// no row highlighted until the user navigates (Phase 2). The server calls this
     /// after resolving an [`Editor::cmdline_complete_request`] against the Lua source.
+    ///
+    /// Each candidate is `(label, insert, doc, replace)`; `replace` is an optional
+    /// explicit `(start_byte, end_byte)` span overriding `[anchor .. cursor)` for that
+    /// row (the prompt path's adapter-specified range — see [`MenuItem::replace`]). The
+    /// ex catalog passes `None`.
     pub fn open_cmdline_menu(
         &mut self,
         anchor: usize,
         anchor_width: usize,
         prefix: &str,
-        candidates: Vec<(String, String, Option<String>)>,
+        candidates: Vec<CmdlineCandidate>,
         docs: bool,
     ) {
-        let labels: Vec<&str> = candidates.iter().map(|(l, _, _)| l.as_str()).collect();
+        let labels: Vec<&str> = candidates.iter().map(|(l, ..)| l.as_str()).collect();
         let ranked = crate::fuzzy::rank(prefix, &labels);
         if ranked.is_empty() {
             self.close_cmdline_menu();
@@ -707,7 +728,7 @@ impl Editor {
         let mut filtered = Vec::with_capacity(ranked.len());
         let mut match_spans = Vec::with_capacity(ranked.len());
         for (key, (idx, spans)) in ranked.into_iter().enumerate() {
-            let (label, insert, doc) = candidates[idx].clone();
+            let (label, insert, doc, replace) = candidates[idx].clone();
             all_items.push(MenuItem {
                 label,
                 key,
@@ -717,6 +738,7 @@ impl Editor {
                 source_accept: false,
                 doc,
                 resolve: None,
+                replace,
             });
             filtered.push(key);
             match_spans.push(spans);
@@ -811,36 +833,44 @@ impl Editor {
         self.menu_kind() == Some(MenuKind::Cmdline)
     }
 
-    /// The actively-highlighted command-line completion's `(anchor, insert_text)`
+    /// The actively-highlighted command-line completion's `(start, end, insert_text)`
     /// **without** closing the menu — the peek twin of
     /// [`cmdline_complete_take_accept`](Self::cmdline_complete_take_accept), used to
     /// preview the selection in the command line as the user cycles. `None` when no
-    /// cmdline menu is open or nothing is selected yet (the noselect popup).
-    pub(crate) fn cmdline_complete_selected(&self) -> Option<(usize, String)> {
+    /// cmdline menu is open or nothing is selected yet (the noselect popup). The replace
+    /// span is the row's explicit `replace` range (the adapter-specified prompt range)
+    /// when set, else the default `[anchor .. cursor)`.
+    pub(crate) fn cmdline_complete_selected(&self) -> Option<(usize, usize, String)> {
         let m = self.menu.as_ref().filter(|m| m.kind == MenuKind::Cmdline)?;
         if !m.selected_active {
             return None;
         }
         let row = m.all_items.get(m.item_at(m.cursor))?;
+        let (start, end) = row.replace.unwrap_or((m.anchor, self.cmdline_col));
         Some((
-            m.anchor,
+            start,
+            end,
             row.insert.clone().unwrap_or_else(|| row.label.clone()),
         ))
     }
 
-    /// The actively-selected command-line completion's `(anchor, insert_text)`,
+    /// The actively-selected command-line completion's `(start, end, insert_text)`,
     /// closing the menu. `None` when no cmdline menu is open **or nothing is selected
     /// yet** (the popup is noselect until the user navigates) — the caller then runs
-    /// the typed line unchanged. The caller rewrites `[anchor .. cmdline_col)` with the
-    /// insert text ([`Editor::cmdline_complete_accept`]).
-    pub(crate) fn cmdline_complete_take_accept(&mut self) -> Option<(usize, String)> {
+    /// the typed line unchanged. The caller rewrites `[start .. end)` with the insert
+    /// text ([`Editor::cmdline_complete_accept`]); the span is the row's explicit
+    /// `replace` range when set, else `[anchor .. cursor)`.
+    pub(crate) fn cmdline_complete_take_accept(&mut self) -> Option<(usize, usize, String)> {
+        let cursor = self.cmdline_col;
         let m = self.cmdline_menu_mut()?;
         if !m.selected_active {
             return None;
         }
         let row = m.all_items.get(m.item_at(m.cursor))?;
+        let (start, end) = row.replace.unwrap_or((m.anchor, cursor));
         let acc = (
-            m.anchor,
+            start,
+            end,
             row.insert.clone().unwrap_or_else(|| row.label.clone()),
         );
         self.menu = None;
@@ -992,6 +1022,8 @@ impl Editor {
                 // `resolve` handle) are appended later via `menu_push`.
                 doc: None,
                 resolve: None,
+                // Insert-mode completion replaces the buffer prefix, not a cmdline span.
+                replace: None,
             });
             filtered.push(key);
             match_spans.push(spans);

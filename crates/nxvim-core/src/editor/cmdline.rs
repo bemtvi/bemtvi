@@ -557,6 +557,21 @@ impl Editor {
         }
     }
 
+    /// The display width of the prompt the client renders ahead of the editable
+    /// command line — the multi-char [`Editor::cmdline_prompt`] label (`nx.ui.input`
+    /// / `confirm`) when one is set, else the single-char [`Editor::cmdline_prefix`]
+    /// (`:` / `/` / `?`). The command-line wildmenu anchors *past* this so the list
+    /// lines up with the token in the line, not with the prompt — without it a
+    /// multi-char prompt (e.g. `dap> `) slides the popup left by its whole width.
+    pub(crate) fn cmdline_prompt_width(&self) -> usize {
+        let label = self.cmdline_prompt();
+        if label.is_empty() {
+            crate::unicode::display_width(&self.cmdline_prefix().to_string())
+        } else {
+            crate::unicode::display_width(label)
+        }
+    }
+
     /// The command cursor's position as a character offset from the start of
     /// [`Editor::cmdline`], for the client to place the terminal cursor.
     pub(crate) fn cmdline_cursor(&self) -> usize {

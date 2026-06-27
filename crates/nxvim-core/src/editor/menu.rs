@@ -1838,7 +1838,9 @@ impl Editor {
                 // above the command line (the bottom of the text area). The whole
                 // (small) list is projected — like `select`, no scroll subtlety.
                 // `anchor_offset` is the display width of the line before the token
-                // (0 for the leading command name), so the box left-aligns under it.
+                // (0 for the leading command name); the prompt the client paints ahead
+                // of the line (`:` for ex, a `nx.ui.input` label like `dap> `) shifts
+                // the token that many cells right, so the box left-aligns under it.
                 let rows = self.menu_rows(0, m.total);
                 let count = rows.len().min(MAX_H);
                 let content_w = rows
@@ -1847,7 +1849,8 @@ impl Editor {
                     .max()
                     .unwrap_or(1)
                     .max(1);
-                let col = m.anchor_offset.min(text_width.saturating_sub(1));
+                let anchor = m.anchor_offset + self.cmdline_prompt_width();
+                let col = anchor.min(text_width.saturating_sub(1));
                 let max_w = text_width.saturating_sub(col).max(1);
                 let width = content_w.min(max_w);
                 // A full bordered box (2 rows of chrome) sitting on the last text rows,

@@ -1357,3 +1357,36 @@ async fn wheeling_over_the_wildmenu_cycles_candidates() {
     let map = wait_redraw(&mut incoming, |m| menu_sel_is(m, 1, true)).await;
     assert_eq!(menu_selection(&map), (1, true));
 }
+
+#[tokio::test]
+async fn prompt_wildmenu_anchors_past_a_multichar_prompt_label() {
+    let dir = temp_dir("cmdcomplete_prompt_anchor");
+    let (rpc, mut incoming) = start(&dir, INIT).await;
+
+    // An `nx.ui.input` prompt whose label (`dap> `) is five cells wide. The client
+    // paints that label ahead of the editable line, so the completed token sits five
+    // cells right of the command-line origin. The wildmenu must anchor under the token,
+    // not at the origin — the bug was that it ignored the prompt width and slid the
+    // popup five cells left of the word it completes.
+    exec_lua(
+        &rpc,
+        "nx.ui.input({ prompt = 'dap> ', complete = function()
+           return { { label = 'print' }, { label = 'property' } }
+         end }):next(function() end)",
+    )
+    .await;
+
+    // Type a token at the very start of the line (anchor offset 0 within the line) and
+    // open the wildmenu. Its `col` is the prompt width (5), proving it anchored past the
+    // label rather than at column 0.
+    feed(&rpc, "pr");
+    feed(&rpc, "<Tab>");
+    let map = poll_menu(&rpc, &mut incoming)
+        .await
+        .expect("the prompt wildmenu opens");
+    assert_eq!(
+        menu_field_u64(&map, "col"),
+        5,
+        "the wildmenu anchors under the token, past the `dap> ` prompt label"
+    );
+}

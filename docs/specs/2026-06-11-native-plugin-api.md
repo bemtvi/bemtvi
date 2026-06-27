@@ -425,6 +425,22 @@ RPC / test, which attributes to no plugin, may pass an explicit namespace as a
 dev escape hatch; a real sourced file passing one is a loud error.) Worked end to
 end in `examples/plugin-shada/`.
 
+Each namespace is capped at **1 MiB** of serialized key+value bytes, so one
+plugin can't bloat the shared store and slow every launch's recency-merge. A
+`set` that would cross the cap fails loud (no silent truncation; the prior value
+is left intact), while a shrink is always allowed so a plugin can recover. It is
+for small structured state — settings, a recent list — not bulk data.
+
+The store is lifecycle-managed. `nx.shada.namespaces()` lists every namespace
+currently stored (an audit of what plugins have stowed), and
+`nx.shada.forget(name)` prunes one. `:PluginClean` uses them: when it removes an
+uninstalled plugin's directory it also forgets that plugin's namespace, so the
+data doesn't outlive the plugin.
+
+It works everywhere the editor runs: the native redb store and the serverless web
+build's OPFS blob round-trip plugin namespaces identically (verified by
+`verify-shada.mjs` across a page reload).
+
 ## Treesitter highlighting is buffer state, not a verb
 
 A small case that sharpens rule 5 ("registrations are data") into a working

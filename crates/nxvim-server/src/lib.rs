@@ -1423,17 +1423,28 @@ impl EditHost {
 
     /// Snapshot the cross-session (shada) state for persistence. The native server
     /// serializes this into its redb store ([`shada`]); the wasm Worker serializes it to
-    /// a JSON blob in OPFS. Pure — just the editor's [`export_persist`](Editor::export_persist).
+    /// a JSON blob in OPFS. Folds in the opt-in **plugin** data, which lives in the Lua
+    /// runtime (not the editor model), so both fronts persist it through this one seam —
+    /// the native flush sites and the wasm `eh_export_shada` alike. The session /
+    /// `exit_cursor` are layered on by the caller (only the native flush carries them).
     pub fn export_persist(&self) -> nxvim_core::PersistState {
-        self.editor.export_persist()
+        let mut state = self.editor.export_persist();
+        state.plugin_data = tuples_to_plugin_shada(self.lua.plugin_shada_export());
+        state
     }
 
     /// Seed cross-session (shada) state restored from the store, before the startup
     /// lifecycle fires (so a restored `` `" `` / registers / history are live for the
-    /// first frame). The wasm Worker calls this between config-sourcing and
-    /// [`boot_finish`](Self::boot_finish), mirroring native's load ordering.
-    pub fn import_persist(&mut self, state: nxvim_core::PersistState) {
+    /// first frame). Seeds the opt-in **plugin** data back into the Lua runtime too (the
+    /// inverse of [`export_persist`](Self::export_persist)), so a plugin's `get` returns
+    /// last session's value on web exactly as on native. The wasm Worker calls this
+    /// between config-sourcing and [`boot_finish`](Self::boot_finish); native's
+    /// `shada_load` calls it after pulling the session out.
+    pub fn import_persist(&mut self, mut state: nxvim_core::PersistState) {
+        let plugin_data = std::mem::take(&mut state.plugin_data);
         self.editor.import_persist(state);
+        self.lua
+            .plugin_shada_seed(plugin_shada_to_tuples(plugin_data));
     }
 
     /// Set the Worker's current JS clock (ms) so a [`WasmTimer`] armed during the next
@@ -2122,7 +2133,8 @@ impl EditHost {
                 let session = state.session.take();
                 // Plugin data lives in the Lua runtime, not the editor model — pull it
                 // out (like the session) and seed the opted-in plugins' stores, so a
-                // plugin's `get` returns last session's value on first read.
+                // plugin's `get` returns last session's value on first read. (The wasm
+                // front does the equivalent inside its own `EditHost::import_persist`.)
                 let plugin_data = std::mem::take(&mut state.plugin_data);
                 self.editor.import_persist(state);
                 self.lua
@@ -2188,6 +2200,7 @@ impl EditHost {
         if self.workspace_session && self.lua.session_save_layout() {
             snap.session = self.editor.export_session();
         }
+        // Fold in the opt-in plugin shada (it lives in the runtime, not the editor).
         snap.plugin_data = tuples_to_plugin_shada(self.lua.plugin_shada_export());
         let mut flushed = false;
         if let Some(store) = self.shada.as_mut() {

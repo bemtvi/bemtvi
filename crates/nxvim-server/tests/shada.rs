@@ -819,3 +819,65 @@ async fn example_plugin_shada_remembers_files_across_sessions() {
         );
     }
 }
+
+#[tokio::test]
+async fn plugin_namespace_enforces_a_size_budget() {
+    // A namespace is capped at 1 MiB: a write that would cross the cap fails LOUD and
+    // leaves the prior contents intact; a shrink afterwards is allowed.
+    let (rpc, _incoming) = start_attached(ServerInit::default(), 80, 25).await;
+    let summary = exec_lua(
+        &rpc,
+        r#"
+        local s = nx.shada.plugin("budget-demo")
+        -- ~900 KB fits.
+        s:set("a", string.rep("x", 900 * 1024))
+        -- Another ~300 KB would push the namespace over 1 MiB -> error.
+        local ok, err = pcall(function() s:set("b", string.rep("y", 300 * 1024)) end)
+        local crossed = tostring(ok) .. "/" .. (tostring(err):match("exceed its 1 MiB") and "msg" or "nomsg")
+
+        -- The failed write stored nothing; "a" is untouched, "b" is absent.
+        local a_len = #(s:get("a") or "")
+        local b_present = s:get("b") ~= nil
+
+        -- Replacing "a" with a small value (a shrink) is always allowed, even though
+        -- the set itself is a write to a near-full namespace.
+        local shrink_ok = pcall(function() s:set("a", "tiny") end)
+
+        return ("crossed=%s a_len=%d b_present=%s shrink_ok=%s"):format(
+          crossed, a_len, tostring(b_present), tostring(shrink_ok))
+        "#,
+    )
+    .await;
+    assert_eq!(
+        summary.as_str(),
+        Some("crossed=false/msg a_len=921600 b_present=false shrink_ok=true"),
+        "the over-budget write fails loud, leaves the namespace intact, and a later shrink succeeds"
+    );
+}
+
+#[tokio::test]
+async fn plugin_namespaces_can_be_listed_and_forgotten() {
+    // nx.shada.namespaces() audits what plugins have stored; nx.shada.forget(ns)
+    // prunes one namespace (its data stops being persisted) without touching another.
+    let (rpc, _incoming) = start_attached(ServerInit::default(), 80, 25).await;
+    let out = exec_lua(
+        &rpc,
+        r#"
+        nx.shada.plugin("alpha"):set("k", 1)
+        nx.shada.plugin("beta"):set("k", 2)
+        local before = table.concat(nx.shada.namespaces(), ",")
+        nx.shada.forget("alpha")
+        local after = table.concat(nx.shada.namespaces(), ",")
+        return ("before=%s after=%s gone=%s kept=%s"):format(
+          before, after,
+          tostring(nx.shada.plugin("alpha"):get("k")),
+          tostring(nx.shada.plugin("beta"):get("k")))
+        "#,
+    )
+    .await;
+    assert_eq!(
+        out.as_str(),
+        Some("before=alpha,beta after=beta gone=nil kept=2"),
+        "namespaces() lists both sorted; forget('alpha') drops only alpha"
+    );
+}

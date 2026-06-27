@@ -691,6 +691,11 @@ function M.clean()
       if e.type == "directory" and not declared[e.name] then
         nx.await(nx.fs.remove(r .. "/" .. e.name, { recursive = true }))
         removed[#removed + 1] = e.name
+        -- Forget the plugin's shada namespace too, so an uninstalled plugin doesn't
+        -- leave its cross-session data orphaned in the store forever. A managed
+        -- plugin lives at `root()/<name>` and keys its `nx.shada.plugin` store on that
+        -- same `<name>`, so the directory name IS the namespace to drop.
+        nx.shada.forget(e.name)
       end
     end
     nx.notify("nx.plugins: removed " .. #removed .. " plugin(s)", #removed > 0 and 2 or 3)

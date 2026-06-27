@@ -74,6 +74,15 @@ try {
   await page.evaluate(() => window.__nxvim.feed("<Esc>"));
   // Ex history: a harmless ex command.
   await page.evaluate(() => window.__nxvim.feed(":set wrap<CR>"));
+  // Plugin shada: a plugin opts in (nx.shada.plugin) and stores a value in its own
+  // isolated namespace. Driven over execLua (no source file on the stack), so the
+  // explicit dev-namespace argument names it — exactly like the native harness.
+  const pluginSet = await page.evaluate(() =>
+    window.__nxvim
+      .execLua('nx.shada.plugin("verify-plugin"):set("greeting", "PLUGIN-PERSISTED")')
+      .then((r) => r.result),
+  );
+  check("plugin shada: set succeeds", !String(pluginSet).startsWith("err:"), `result=${JSON.stringify(pluginSet)}`);
 
   // Flush shada to OPFS and wait for the write to land (resolves on `shada_written`).
   const flushed = await page.evaluate(() => window.__nxvim.shadaFlush().then(() => true).catch((e) => String(e)));
@@ -88,6 +97,8 @@ try {
     } catch (e) { return `ERR:${e}`; }
   });
   check("storage: the shada blob exists in OPFS", blob.includes("HELLO-REG-LINE"), `blob[0..80]=${JSON.stringify(blob.slice(0, 80))}`);
+  // The plugin's value rode the SAME blob (the wasm export folds plugin shada in).
+  check("storage: the plugin shada is in the OPFS blob", blob.includes("PLUGIN-PERSISTED"), `has=${blob.includes("PLUGIN-PERSISTED")}`);
 
   // ── Reload → fresh Worker + editor, same OPFS ────────────────────────────────────────
   await page.reload();
@@ -128,12 +139,24 @@ try {
     `cmdline=${JSON.stringify(exLine)}`,
   );
 
+  // Plugin shada survived: the opted-in plugin reads its value back from its namespace.
+  const pluginVal = await page.evaluate(() =>
+    window.__nxvim
+      .execLua('return tostring(nx.shada.plugin("verify-plugin"):get("greeting"))')
+      .then((r) => r.result),
+  );
+  check(
+    "restore: plugin shada survived the reload (nx.shada.plugin get)",
+    String(pluginVal).includes("PLUGIN-PERSISTED"),
+    `val=${JSON.stringify(pluginVal)}`,
+  );
+
   await browser.close();
 } finally {
   cleanup();
 }
 
 console.log(failures === 0
-  ? "\nALL PASS — serverless shada (registers + search/ex history) persisted across a page reload via OPFS"
+  ? "\nALL PASS — serverless shada (registers + search/ex history + plugin namespaces) persisted across a page reload via OPFS"
   : `\n${failures} FAILED`);
 process.exit(failures === 0 ? 0 : 1);

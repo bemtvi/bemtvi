@@ -1142,3 +1142,46 @@ async fn default_recommended_is_off_unless_opted_in() {
         "without offer_default_recommended the recommended set stays empty (tests stay hermetic)"
     );
 }
+
+#[tokio::test]
+async fn plugin_clean_forgets_shada_namespace() {
+    // :PluginClean removes an undeclared plugin's directory AND forgets its shada
+    // namespace, so an uninstalled plugin doesn't leave cross-session data orphaned.
+    let (rpc, _i) = start().await;
+    let root = setup_root(&rpc, "plug_clean_shada").await;
+
+    // An installed-but-now-undeclared plugin: a dir under the manager root, plus the
+    // shada it stowed under its namespace (== its directory name).
+    std::fs::create_dir_all(root.join("orphan")).unwrap();
+    exec_lua(&rpc, r#"nx.shada.plugin("orphan"):set("seen", true)"#).await;
+    assert_eq!(
+        lua_bool(
+            &rpc,
+            r#"return vim.tbl_contains(nx.shada.namespaces(), "orphan")"#
+        )
+        .await,
+        Some(true),
+        "the orphan namespace is stored before cleaning"
+    );
+
+    // Nothing is declared, so clean removes the dir and forgets the namespace.
+    exec_lua(&rpc, "nx.plugins.clean()").await;
+    assert!(
+        poll_true(
+            &rpc,
+            r#"return not vim.tbl_contains(nx.shada.namespaces(), "orphan")"#
+        )
+        .await,
+        "clean() forgot the removed plugin's shada namespace"
+    );
+    assert!(
+        exec_lua(&rpc, r#"return nx.shada.plugin("orphan"):get("seen")"#)
+            .await
+            .is_nil(),
+        "the orphaned data is gone"
+    );
+    assert!(
+        !root.join("orphan").exists(),
+        "the plugin dir was pruned too"
+    );
+}

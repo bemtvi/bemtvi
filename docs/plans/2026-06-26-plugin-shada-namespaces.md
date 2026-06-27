@@ -134,3 +134,39 @@ claim any string. So `nx.shada.plugin()` takes **no argument** and the namespace
 Keying on *attribution success* (rather than "is there a source file" / "is the
 path absolute") is what makes this robust to both the synthetic exec chunk names
 and a relative `NXVIM_CONFIG`.
+
+**Phase 3 — per-namespace size budget (done).** A namespace is capped at **1 MiB**
+(`PLUGIN_SHADA_BUDGET`, summed `key + serialized-value` bytes) so a runaway plugin
+can't bloat the shared store and slow every launch's recency-merge. Enforced
+fail-loud at write time in `nx._shada_plugin_set`: a `set` that would cross the cap
+*upward* raises (the prior value is left intact); a *shrink* is always allowed, so a
+plugin can recover from a legacy/merge-bloated namespace. Not enforced on load /
+`:rshada` merge (those carry existing data, which the shrink rule lets a plugin trim
+down).
+
+**Phase 4 — lifecycle (done).** The store is now lifecycle-managed so plugin data
+doesn't outlive the plugin:
+
+- `nx.shada.namespaces()` (native `nx._shada_plugin_namespaces`) lists every
+  non-empty stored namespace, sorted — an audit of what plugins have stowed. After a
+  shada load the map holds *all* persisted namespaces, not just this session's
+  openers, so the list is complete.
+- `nx.shada.forget(name)` prunes one namespace (over `nx._shada_plugin_clear`); it
+  stops being written at the next flush.
+- `nx.plugins.clean()` (`:PluginClean`) forgets a removed plugin's namespace as it
+  prunes its directory: a managed plugin lives at `root()/<name>` and keys its store
+  on that same `<name>`, so the directory name *is* the namespace to drop. Only the
+  dirs `clean()` actively removes are forgotten (no blanket "undeclared" sweep — that
+  would wrongly drop `user`, path-derived, lazy, or local-`dir` plugins).
+
+**Phase 5 — web/wasm parity (done).** Plugin shada silently didn't persist on the
+serverless web build: the native flush sites harvest `plugin_data` from the runtime
+inline, but the wasm front goes through `EditHost::export_persist` /
+`import_persist` (the `#[cfg(not(feature = "native"))]` twins backing
+`eh_export_shada` / `eh_load_shada`), which only carried the *editor's* own state.
+Those two methods now fold plugin shada out of / back into the Lua runtime, so the
+OPFS blob round-trips it exactly as the redb store does natively. (Native is
+unchanged — its inline harvest stays; the cfg-split keeps the two fronts' EditHost
+impls separate.) `web/verify-shada.mjs` gains a round-trip: `nx.shada.plugin():set`
+→ flush to OPFS → reload the page (fresh Worker + editor) → `:get` returns the
+value; the value is also asserted present in the on-disk OPFS blob.

@@ -890,6 +890,12 @@ type LspStartArgs = (
     Option<Table>,
 );
 
+/// The per-namespace byte budget for `nx.shada.plugin` storage (1 MiB). A plugin's
+/// namespace is capped at this many bytes of `key + serialized-value`, so a single
+/// plugin can't bloat the shared shada store and slow every launch's recency-merge.
+/// Enforced fail-loud at write time (`nx._shada_plugin_set`).
+const PLUGIN_SHADA_BUDGET: usize = 1024 * 1024;
+
 /// Install the `vim.*` functions that need the host filesystem / environment /
 /// runtimepath and feed the LSP framework (Phase 7a): `nvim_get_runtime_file`
 /// (runtimepath `lsp/` discovery), `vim.fn.getcwd`, the `nx._read_file` /
@@ -1040,7 +1046,12 @@ pub(crate) fn install_runtime_api(
     // ordinary shada cadence.
 
     // `nx._shada_plugin_set(ns, key, value)`: JSON-encode `value` and store it under
-    // `(ns, key)`. Overwrites any existing value for the key.
+    // `(ns, key)`. Overwrites any existing value for the key. Enforces a per-namespace
+    // byte budget ([`PLUGIN_SHADA_BUDGET`]) so a runaway plugin can't bloat the shada
+    // store and slow every launch's recency-merge: a write that would push the
+    // namespace's serialized size over the cap fails LOUD (no silent truncation, and
+    // the prior value is left intact). A write that *shrinks* an already-over-budget
+    // namespace is allowed, so a plugin can always recover by deleting/replacing.
     {
         let sh = shared.clone();
         nx.set(
@@ -1048,11 +1059,23 @@ pub(crate) fn install_runtime_api(
             lua.create_function(move |_, (ns, key, value): (String, String, mlua::Value)| {
                 let json = lua_to_json(&value)?;
                 let encoded = serde_json::to_string(&json).map_err(mlua::Error::external)?;
-                sh.borrow_mut()
-                    .plugin_shada
-                    .entry(ns)
-                    .or_default()
-                    .insert(key, encoded);
+                let mut shared = sh.borrow_mut();
+                let map = shared.plugin_shada.entry(ns.clone()).or_default();
+                // The namespace's current footprint (key + serialized-value bytes per
+                // entry) and what it becomes once this key takes `encoded`.
+                let total: usize = map.iter().map(|(k, v)| k.len() + v.len()).sum();
+                let old = map.get(&key).map_or(0, |v| key.len() + v.len());
+                let new_total = total - old + key.len() + encoded.len();
+                // Block only a write that crosses the cap *upward*; a shrink is always
+                // fine (lets a plugin recover from a legacy/merge-bloated namespace).
+                if new_total > PLUGIN_SHADA_BUDGET && new_total > total {
+                    return Err(mlua::Error::RuntimeError(format!(
+                        "nx.shada.plugin: namespace '{ns}' would exceed its {} MiB shada \
+                         budget (key '{key}' brings it to {new_total} > {PLUGIN_SHADA_BUDGET} bytes)",
+                        PLUGIN_SHADA_BUDGET / (1024 * 1024),
+                    )));
+                }
+                map.insert(key, encoded);
                 Ok(())
             })?,
         )?;
@@ -1122,6 +1145,29 @@ pub(crate) fn install_runtime_api(
             lua.create_function(move |_, ns: String| {
                 sh.borrow_mut().plugin_shada.remove(&ns);
                 Ok(())
+            })?,
+        )?;
+    }
+
+    // `nx._shada_plugin_namespaces()` -> every stored namespace, sorted (the
+    // `BTreeMap` iterates in order). The audit primitive behind `nx.shada.namespaces`:
+    // after a shada load the map holds *all* persisted namespaces (every plugin's,
+    // not just this session's openers), so a user / the package manager can see and
+    // prune what's stored. An empty namespace (cleared but not yet flushed away) is
+    // omitted, so the list reflects live content.
+    {
+        let sh = shared.clone();
+        nx.set(
+            "_shada_plugin_namespaces",
+            lua.create_function(move |lua, ()| {
+                let names: Vec<String> = sh
+                    .borrow()
+                    .plugin_shada
+                    .iter()
+                    .filter(|(_, kv)| !kv.is_empty())
+                    .map(|(ns, _)| ns.clone())
+                    .collect();
+                lua.create_sequence_from(names)
             })?,
         )?;
     }

@@ -224,6 +224,11 @@ end
 -- checkpoint + the clean-exit flush); with shada disabled the store still works in
 -- memory for the session but isn't written, exactly like registers and marks.
 --
+-- A namespace is capped at **1 MiB** (of serialized key+value bytes) so one plugin
+-- can't bloat the shared store; a `set` that would cross the cap raises (the prior
+-- value is left intact). Keep it to small, structured state — settings, a recent
+-- list, a cursor table — not bulk data.
+--
 --   local store = nx.shada.plugin()       -- no argument: namespace is assigned
 --   store:set("recent", { "a.txt", "b.txt" })
 --   local recent = store:get("recent")    -- the table back, or nil
@@ -284,6 +289,26 @@ function nx.shada.plugin(dev_namespace)
       nx._shada_plugin_clear(namespace)
     end,
   }
+end
+
+-- `nx.shada.namespaces()` -> a sorted list of every plugin namespace currently
+-- stored (after a shada load that is *all* persisted namespaces, not just the ones a
+-- plugin opened this session). The audit primitive: a user can see what plugins have
+-- stowed away, and the package manager forgets a removed plugin's namespace on
+-- `:PluginClean`.
+function nx.shada.namespaces()
+  return nx._shada_plugin_namespaces()
+end
+
+-- `nx.shada.forget(namespace)` -> drop a whole namespace's stored data (it stops
+-- being written at the next shada flush). The cross-session counterpart of a handle's
+-- `:clear()`, but addressed by name — for pruning an orphan (e.g. an uninstalled
+-- plugin's leftovers). Fails loud on a non-string / empty name.
+function nx.shada.forget(namespace)
+  if type(namespace) ~= "string" or namespace == "" then
+    error("nx.shada.forget: namespace must be a non-empty string", 2)
+  end
+  nx._shada_plugin_clear(namespace)
 end
 
 -- ----- table / list / string helpers ----------------------------------------

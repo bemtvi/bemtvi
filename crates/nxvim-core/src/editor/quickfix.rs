@@ -38,7 +38,6 @@ pub enum QfAction {
 /// One parsed quickfix/location entry — vim's `qfline_T`, minus the
 /// list-threading pointers.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct QfEntry {
     /// The error's file, resolved against the `%D`/`%X` directory stack. `None`
     /// for a non-error line (plain output text) or an entry addressed only by
@@ -77,7 +76,6 @@ pub type LocListEntry = (PathBuf, usize, usize, String, u8);
 
 /// A quickfix or location list: the entries plus a title and the current index.
 #[derive(Debug, Clone, Default)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct QfList {
     /// The parsed entries, in output order.
     pub items: Vec<QfEntry>,
@@ -118,7 +116,6 @@ pub const QF_MAXLISTS: usize = 10;
 /// `:make`/`:grep`/`:vimgrep`/`:cexpr` (action `' '`) pushes a new list without
 /// losing the previous results.
 #[derive(Debug, Clone, Default)]
-#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct QfStack {
     /// The lists, oldest first; `lists.last()` is the newest.
     pub lists: Vec<QfList>,

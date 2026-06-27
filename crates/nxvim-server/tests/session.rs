@@ -168,9 +168,10 @@ async fn session_restores_multiple_tab_pages() {
 }
 
 #[tokio::test]
-async fn session_restores_the_quickfix_list() {
-    // The global quickfix stack rides the session: a `:make`/`:grep` result is back in
-    // place (title + entries) after a restart, so `:copen` shows the last build again.
+async fn session_does_not_persist_the_quickfix_list() {
+    // The quickfix stack is *not* persisted: a `:make`/`:grep` result is build/search
+    // state, scoped to the editing session, so a restart comes back with an empty list
+    // (only the window layout rides the session).
     let dir = temp_dir("session_qf_store");
     let file_a = write_temp("session_qf_a", "txt", "a1\na2\na3\n");
 
@@ -178,7 +179,7 @@ async fn session_restores_the_quickfix_list() {
         let (rpc, incoming) = start_attached(init(&dir, Some(file_a.clone()), true), 80, 25).await;
         exec_lua(&rpc, "nx.shada.save_layout(true)").await;
         // Set then read back so the queued server-side op has drained into `self.qf`
-        // before the exit flush captures it.
+        // before the exit flush runs.
         let got = set_then_read(
             &rpc,
             &format!(
@@ -197,27 +198,22 @@ async fn session_restores_the_quickfix_list() {
 
     {
         let (rpc, _incoming) = start_attached(init(&dir, None, true), 80, 25).await;
-        let got = exec_lua(
+        let count = exec_lua(
             &rpc,
-            r#"local q = vim.fn.getqflist({ items = true, title = true })
-               local e = q.items[1]
-               return string.format("%d|%s|%s|%d", #q.items, q.title, e and e.text or "", e and e.lnum or 0)"#,
+            r#"local q = vim.fn.getqflist({ items = true })
+               return #q.items"#,
         )
         .await
-        .as_str()
-        .unwrap_or_default()
-        .to_string();
-        assert_eq!(
-            got, "1|build|boom|2",
-            "the quickfix list survived the restart"
-        );
+        .as_i64()
+        .unwrap_or(-1);
+        assert_eq!(count, 0, "the quickfix list did not survive the restart");
     }
 }
 
 #[tokio::test]
-async fn session_restores_a_window_location_list() {
-    // A window's location list (`:lopen` results) rides its restored window, so the
-    // reopened file shows its last location list.
+async fn session_does_not_persist_a_window_location_list() {
+    // A window's location list is build/search state too — it is not persisted, so the
+    // reopened window comes back with an empty location list.
     let dir = temp_dir("session_loc_store");
     let file_a = write_temp("session_loc_a", "txt", "a1\na2\na3\n");
 
@@ -242,20 +238,15 @@ async fn session_restores_a_window_location_list() {
 
     {
         let (rpc, _incoming) = start_attached(init(&dir, None, true), 80, 25).await;
-        let got = exec_lua(
+        let count = exec_lua(
             &rpc,
-            r#"local q = vim.fn.getloclist(0, { items = true, title = true })
-               local e = q.items[1]
-               return string.format("%d|%s|%s|%d", #q.items, q.title, e and e.text or "", e and e.lnum or 0)"#,
+            r#"local q = vim.fn.getloclist(0, { items = true })
+               return #q.items"#,
         )
         .await
-        .as_str()
-        .unwrap_or_default()
-        .to_string();
-        assert_eq!(
-            got, "1|refs|ref|3",
-            "the location list survived on the restored window"
-        );
+        .as_i64()
+        .unwrap_or(-1);
+        assert_eq!(count, 0, "the location list did not survive the restart");
     }
 }
 

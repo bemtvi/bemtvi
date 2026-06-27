@@ -135,12 +135,6 @@ pub struct SessionState {
     /// The edge docks open at capture (left/right/top/bottom), each with its size,
     /// hidden state, and any file-backed content. Empty when no dock was open.
     pub docks: Vec<SessionDock>,
-    /// The global **quickfix** list stack (`:copen` / `:make` / `:grep` results, with
-    /// the `:colder`/`:cnewer` history), so a workspace reopens with its last build /
-    /// search results in place. Empty when no quickfix list was populated. Per-window
-    /// **location** lists ride their [`SessionWindow`] instead.
-    #[cfg_attr(feature = "serde", serde(default))]
-    pub quickfix: crate::editor::quickfix::QfStack,
 }
 
 /// One edge dock: which side, its reserved size in cells (the boot-time fallback), an
@@ -192,11 +186,6 @@ pub struct SessionWindow {
     pub col: usize,
     pub top: usize,
     pub active: bool,
-    /// The window's **location** list stack (`:lopen` / `:lgrep` results + their
-    /// `:lolder`/`:lnewer` history), restored onto the rebuilt window. Empty when the
-    /// window had none.
-    #[cfg_attr(feature = "serde", serde(default))]
-    pub loclist: crate::editor::quickfix::QfStack,
     /// For an **unnamed** (pathless) `[No Name]` buffer persisted with its modified
     /// contents: the buffer's editable lines. `None` for a file-backed window (its
     /// content lives on disk and is reread on restore). Restored as a fresh unnamed
@@ -449,14 +438,12 @@ impl Editor {
             tabs.push(SessionTab { layout });
         }
         let docks = self.export_docks();
-        let quickfix = sanitize_qf_stack(&self.qf);
-        if tabs.is_empty() && docks.is_empty() && quickfix.lists.is_empty() {
+        if tabs.is_empty() && docks.is_empty() {
             return None;
         }
         Some(SessionState {
             tabs,
             active_tab,
-            quickfix,
             docks,
         })
     }
@@ -553,18 +540,12 @@ impl Editor {
                 } else {
                     (w.saved_cursor.line, w.saved_cursor.col, w.saved_top)
                 };
-                let loclist = w
-                    .loclist
-                    .as_ref()
-                    .map(sanitize_qf_stack)
-                    .unwrap_or_default();
                 Some(SessionLayout::Leaf(SessionWindow {
                     path: PathBuf::from(path),
                     line,
                     col,
                     top,
                     active: active == Some(*wid),
-                    loclist,
                     unnamed_contents,
                 }))
             }
@@ -614,11 +595,6 @@ impl Editor {
         use crate::options::WindowOptions;
         use crate::WindowId;
         use std::collections::BTreeMap;
-        // The global quickfix stack restores regardless of layout (a session may carry
-        // only `:make` results), so seed it before the early return.
-        if !session.quickfix.lists.is_empty() {
-            self.qf = session.quickfix;
-        }
         if session.tabs.is_empty() && session.docks.is_empty() {
             return;
         }
@@ -742,11 +718,7 @@ impl Editor {
                     line: w.line,
                     col: w.col,
                 };
-                let mut win = WindowTree::tiled_window(buf, cursor, w.top, 0);
-                // Restore the window's location list (its `:lopen` results + history).
-                if !w.loclist.lists.is_empty() {
-                    win.loclist = Some(w.loclist.clone());
-                }
+                let win = WindowTree::tiled_window(buf, cursor, w.top, 0);
                 windows.insert(id, win);
                 if w.active {
                     *active = Some(id);
@@ -1093,21 +1065,6 @@ impl Editor {
             self.recompute_effective_options();
         }
     }
-}
-
-/// Clone a quickfix / location list stack for persistence, dropping the live `bufnr`
-/// of every entry. A buffer number is meaningless across a restart, and a *stale* one
-/// could mis-resolve a jump to whatever buffer reuses that id — so a persisted entry
-/// keeps only its `filename`. A bufnr-only entry (no filename) becomes non-jumpable,
-/// which is correct: the buffer it named is gone.
-fn sanitize_qf_stack(stack: &crate::editor::quickfix::QfStack) -> crate::editor::quickfix::QfStack {
-    let mut out = stack.clone();
-    for list in &mut out.lists {
-        for item in &mut list.items {
-            item.bufnr = 0;
-        }
-    }
-    out
 }
 
 /// Normalize split weights to percentages summing to ~100 (the last child absorbs the

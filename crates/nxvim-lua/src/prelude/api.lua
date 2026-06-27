@@ -84,6 +84,25 @@ function nx.win.list()
   return nx._win_order or { nx._cur_win or 1000 }
 end
 
+-- nx.win.set_current(win): focus `win` (make it the current window) [alias
+-- nvim_set_current_win]. `win` is a window id (0 / nil = the current window, a no-op).
+-- The switch is queued and applied after the Lua chunk like the other window ops; the
+-- mirror is updated write-through so an immediate nx.win.current() / current-buffer read
+-- in the same chunk reflects the new focus.
+function nx.win.set_current(win)
+  win = resolve_win(win)
+  nx._set_current_win(win)
+  nx._cur_win = win
+  local w = (nx._wins or {})[win]
+  if w then
+    nx._cur_cursor = { row = w.row or 1, col = w.col or 0 }
+    local b = (nx._bufs or {})[w.buffer]
+    nx._cur_buf =
+      { bufnr = w.buffer, name = (b and b.name) or "", filetype = (b and b.filetype) or "" }
+  end
+end
+vim.api.nvim_set_current_win = nx.win.set_current
+
 function nx.win.buf(win)
   win = resolve_win(win)
   local w = (nx._wins or {})[win]

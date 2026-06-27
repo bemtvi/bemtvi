@@ -10,7 +10,7 @@
 
 use nxvim_rpc::{Incoming, Rpc};
 use nxvim_server::ServerInit;
-use nxvim_test_harness::{feed, start_attached};
+use nxvim_test_harness::{exec_lua, feed, start_attached};
 use rmpv::Value;
 use tokio::sync::mpsc::UnboundedReceiver;
 
@@ -68,6 +68,33 @@ async fn build_nested_vsplits(rpc: &Rpc) {
     feed(rpc, "<C-w>v"); // B becomes C | B → tree is A | (C | B)
                          // Barrier so every queued split has converged before we measure.
     let _ = req(rpc, "nvim_get_mode", vec![]).await;
+}
+
+#[tokio::test]
+async fn set_current_focuses_the_requested_window() {
+    let (rpc, _incoming) = start().await;
+    feed(&rpc, "<C-w>v"); // two windows
+    let wins = win_handles(&rpc).await;
+    assert_eq!(wins.len(), 2, "a split yields two windows");
+    let cur = req(&rpc, "nvim_get_current_win", vec![])
+        .await
+        .as_u64()
+        .expect("current win id");
+    let other = *wins
+        .iter()
+        .find(|&&w| w != cur)
+        .expect("an unfocused window");
+
+    // The new public focus API moves the current window to `other`.
+    exec_lua(&rpc, &format!("nx.win.set_current({other})")).await;
+    let now = req(&rpc, "nvim_get_current_win", vec![])
+        .await
+        .as_u64()
+        .expect("current win id");
+    assert_eq!(
+        now, other,
+        "nx.win.set_current focuses the requested window"
+    );
 }
 
 #[tokio::test]

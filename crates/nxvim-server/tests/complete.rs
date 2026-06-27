@@ -783,6 +783,172 @@ nx.complete.setup { sources = { { 'doc' } } }";
     );
 }
 
+/// The latest top-level redraw whose `menu` carries a `docs` sub-map (so a test
+/// can read both the menu geometry and the focused window's gutter widths).
+async fn poll_menu_top_with_docs(
+    rpc: &Rpc,
+    incoming: &mut UnboundedReceiver<Incoming>,
+) -> Option<Vec<(Value, Value)>> {
+    for _ in 0..60 {
+        nxvim_test_harness::barrier(rpc).await;
+        if let Some(map) = drain_to_latest_redraw(incoming, |m| match map_get(m, "menu") {
+            Some(Value::Map(menu)) => matches!(map_get(menu, "docs"), Some(Value::Map(_))),
+            _ => false,
+        }) {
+            return Some(map);
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    None
+}
+
+/// A `u64` value at `key`, panicking when absent (geometry keys are always set).
+fn mu64(map: &[(Value, Value)], key: &str) -> u64 {
+    map_get(map, key)
+        .and_then(Value::as_u64)
+        .unwrap_or_else(|| panic!("missing u64 key {key:?}"))
+}
+
+/// The `docs` sub-map of a menu.
+fn docs_of(menu: &[(Value, Value)]) -> Vec<(Value, Value)> {
+    match map_get(menu, "docs") {
+        Some(Value::Map(d)) => d.clone(),
+        other => panic!("expected a docs map, got {other:?}"),
+    }
+}
+
+/// The focused window's map from a top-level redraw.
+fn focused_window(map: &[(Value, Value)]) -> Vec<(Value, Value)> {
+    let Some(Value::Array(wins)) = map_get(map, "windows") else {
+        panic!("no windows array in redraw");
+    };
+    for w in wins {
+        if let Value::Map(wm) = w {
+            if map_get(wm, "focused").and_then(Value::as_bool) == Some(true) {
+                return wm.clone();
+            }
+        }
+    }
+    panic!("no focused window in redraw");
+}
+
+/// The focused window's region-relative `rect.x` (0 for a single window).
+fn rect_x(win: &[(Value, Value)]) -> u64 {
+    match map_get(win, "rect") {
+        Some(Value::Map(r)) => map_get(r, "x").and_then(Value::as_u64).unwrap_or(0),
+        _ => 0,
+    }
+}
+
+/// The docs sidebar must butt against the popup's right border — its content one
+/// cell past that border. Its region-relative column therefore counts the *whole*
+/// gutter the popup box sits behind: the sign column AND the number column.
+/// Regression: it counted only the number column, sliding the sidebar
+/// `sign_width` cells left of the popup (a visible gap once a sign column shows).
+#[tokio::test]
+async fn docs_sidebar_butts_against_the_popup_past_the_sign_column() {
+    let dir = temp_dir("complete_docs_signcolumn");
+    let init = "\
+nx.complete.source {\n\
+  name = 'doc', debounce = 0,\n\
+  complete = function(ctx)\n\
+    if ('hello'):find(ctx.prefix, 1, true) == 1 then\n\
+      ctx.push { text = 'hello', doc = 'docs for hello' }\n\
+    end\n\
+  end,\n\
+}\n\
+nx.complete.setup { sources = { { 'doc' } } }";
+    let (rpc, mut incoming) = start(&dir, init).await;
+
+    // Reserve a 2-cell sign column so the gutter before the text is non-empty.
+    exec_lua(&rpc, "vim.cmd[[set signcolumn=yes]]").await;
+
+    feed(&rpc, "ihel");
+    let _ = poll_menu(&rpc, &mut incoming).await.expect("popup opens");
+    feed(&rpc, "<C-n>"); // select row 0 so the docs sidebar shows
+
+    let map = poll_menu_top_with_docs(&rpc, &mut incoming)
+        .await
+        .expect("docs sidebar appears");
+    let menu = menu_of(&map);
+    let docs = docs_of(&menu);
+    let win = focused_window(&map);
+    let sign_width = mu64(&win, "sign_width");
+    let number_width = mu64(&win, "number_width");
+    assert!(
+        sign_width >= 2,
+        "signcolumn=yes reserves a sign column, got {sign_width}"
+    );
+    assert_eq!(
+        rect_x(&win),
+        0,
+        "the single window sits at the region origin"
+    );
+
+    let menu_col = mu64(&menu, "col");
+    let menu_width = mu64(&menu, "width");
+    let docs_col = mu64(&docs, "col");
+    // The window has no padding and sits at the region origin, so the sidebar's
+    // region-relative content column is the full gutter (sign + number) + the box
+    // content span + 2 (the box's right border, then the sidebar's own left border).
+    assert_eq!(
+        docs_col,
+        sign_width + number_width + menu_col + menu_width + 2,
+        "docs sidebar butts against the popup including the sign column"
+    );
+}
+
+/// With a left dock open, the sidebar's region-relative geometry must be bounded
+/// by the editor width MINUS that region's left offset (the dock band), or it
+/// overruns the editor's right edge. Regression: it was bounded by the full editor
+/// width, so the box spilled past the right edge by the dock band's width.
+#[tokio::test]
+async fn docs_sidebar_respects_the_right_edge_past_a_left_dock() {
+    let dir = temp_dir("complete_docs_left_dock");
+    let init = "\
+nx.complete.source {\n\
+  name = 'doc', debounce = 0,\n\
+  complete = function(ctx)\n\
+    if ('hello'):find(ctx.prefix, 1, true) == 1 then\n\
+      ctx.push { text = 'hello', doc = 'This is a fairly long documentation string for the row, long enough to want clamping' }\n\
+    end\n\
+  end,\n\
+}\n\
+nx.complete.setup { sources = { { 'doc' } } }";
+    let (rpc, mut incoming) = start(&dir, init).await;
+
+    // Open a 20-col left dock (its band is 21 incl. the separator). Opening a dock
+    // focuses it, so cross back to the main window before completing.
+    exec_lua(&rpc, "nx.dock.open{ side = 'left', size = 20 }").await;
+    feed(&rpc, "<C-w><C-w>l");
+    nxvim_test_harness::barrier(&rpc).await;
+
+    feed(&rpc, "ihel");
+    let _ = poll_menu(&rpc, &mut incoming).await.expect("popup opens");
+    feed(&rpc, "<C-n>");
+
+    let map = poll_menu_top_with_docs(&rpc, &mut incoming)
+        .await
+        .expect("docs sidebar appears");
+    let menu = menu_of(&map);
+    let docs = docs_of(&menu);
+    let docs_col = mu64(&docs, "col");
+    let docs_width = mu64(&docs, "width");
+    // The main region begins one cell past the 20-col dock (band 21). The editor is
+    // 80 cols, so the region-relative right edge is 80 − 21 = 59; the sidebar's box
+    // (content plus its right border) must stay within it.
+    let region_right = 80 - (20 + 1);
+    assert!(
+        docs_col + docs_width <= region_right,
+        "docs sidebar must stay within the editor's right edge: col {docs_col} + width {docs_width} > {region_right}"
+    );
+    // ...and still be usable, not collapsed to a sliver.
+    assert!(
+        docs_width >= 20,
+        "the sidebar keeps a usable width past the dock, got {docs_width}"
+    );
+}
+
 #[tokio::test]
 async fn a_plugin_source_resolve_callback_fills_the_sidebar_lazily() {
     let dir = temp_dir("complete_resolve_docs");
@@ -1065,6 +1231,104 @@ nx.complete.setup { sources = { { 'docs' } } }";
     .await
     .expect("the docs scrolled back to the top");
     assert_eq!(back.first().map(String::as_str), Some("doc line 01"));
+}
+
+/// A 30-line inline doc, for the dock-aware geometry tests below.
+const TALL_DOC_INIT: &str = "\
+nx.complete.source {\n\
+  name = 'docs', debounce = 0,\n\
+  complete = function(ctx)\n\
+    local d = {}\n\
+    for i = 1, 30 do d[i] = string.format('doc line %02d', i) end\n\
+    ctx.push { text = 'alpha', doc = table.concat(d, '\\n') }\n\
+  end,\n\
+}\n\
+nx.complete.setup { sources = { { 'docs' } } }";
+
+/// With a top dock open, the sidebar's region-relative height must be clamped
+/// against the editor height MINUS the region's top offset (the dock band), or a
+/// tall doc opened low in the region runs past the editor's bottom edge.
+/// Regression: it was clamped against the full editor height.
+#[tokio::test]
+async fn docs_sidebar_respects_the_bottom_edge_past_a_top_dock() {
+    let dir = temp_dir("complete_docs_top_dock");
+    let (rpc, mut incoming) = start(&dir, TALL_DOC_INIT).await;
+
+    // A 5-row top dock pushes the main region's screen origin down to row 6 (band 6).
+    // Opening a dock focuses it, so cross down into the main window.
+    exec_lua(&rpc, "nx.dock.open{ side = 'top', size = 5 }").await;
+    feed(&rpc, "<C-w><C-w>j");
+    nxvim_test_harness::barrier(&rpc).await;
+
+    // Put the cursor low in the main region so the popup — and its tall docs sidebar —
+    // opens near the bottom, where an unclamped height would overrun the editor.
+    feed(&rpc, "i");
+    for _ in 0..14 {
+        feed(&rpc, "<CR>");
+    }
+    feed(&rpc, "al");
+    let _ = poll_menu(&rpc, &mut incoming).await.expect("popup opens");
+    feed(&rpc, "<C-n>");
+
+    let map = poll_menu_top_with_docs(&rpc, &mut incoming)
+        .await
+        .expect("docs sidebar appears");
+    let docs = docs_of(&menu_of(&map));
+    let docs_row = mu64(&docs, "row");
+    let docs_height = mu64(&docs, "height");
+    // The main region begins one row past the 5-row top dock (band 6). The editor is
+    // 24 rows, so the region-relative bottom edge is 24 − 6 = 18; the sidebar's rows
+    // must stay within it.
+    let region_bottom = 24 - (5 + 1);
+    assert!(
+        docs_row + docs_height <= region_bottom,
+        "docs sidebar must stay within the editor's bottom edge: row {docs_row} + height {docs_height} > {region_bottom}"
+    );
+}
+
+/// The sidebar's geometry is region-relative, but its wheel hit-test box is stashed
+/// in GLOBAL cells — so with a dock shifting the region's screen origin, a wheel
+/// over the sidebar's on-screen cells must still scroll it. Regression: the box was
+/// stashed in region cells, so a wheel past a dock missed it.
+#[tokio::test]
+async fn wheeling_the_docs_sidebar_hit_tests_in_global_cells_past_a_dock() {
+    let dir = temp_dir("complete_docs_scroll_dock");
+    let (rpc, mut incoming) = start(&dir, TALL_DOC_INIT).await;
+    // Drop the gutter and the tabline so the main region's screen origin is just the
+    // dock band: col 21 (a 20-col dock + its separator), row 0.
+    nxvim_test_harness::command(&rpc, "set nonumber norelativenumber showtabline=0").await;
+
+    exec_lua(&rpc, "nx.dock.open{ side = 'left', size = 20 }").await;
+    feed(&rpc, "<C-w><C-w>l");
+    nxvim_test_harness::barrier(&rpc).await;
+
+    feed(&rpc, "ial");
+    let _ = poll_menu(&rpc, &mut incoming).await.expect("popup opens");
+    feed(&rpc, "<C-n>");
+    let (row, col, top) = poll_docs_box(&rpc, &mut incoming, |ls| {
+        ls.first().map(String::as_str) == Some("doc line 01")
+    })
+    .await
+    .expect("docs sidebar opens at the top");
+    assert_eq!(top.first().map(String::as_str), Some("doc line 01"));
+
+    // Wheel over the sidebar at GLOBAL cells: the main region's origin (col 21) plus
+    // the region-relative box column. Before the fix the box was stashed in region
+    // cells, so this landed off it and nothing scrolled.
+    let region_x = 20 + 1; // the dock content width + its separator
+    for _ in 0..3 {
+        feed_mouse(&rpc, "wheel", "down", row + 1, region_x + col + 1);
+    }
+    let (_, _, scrolled) = poll_docs_box(&rpc, &mut incoming, |ls| {
+        ls.first().map(String::as_str) != Some("doc line 01")
+    })
+    .await
+    .expect("the wheel scrolled the docs sidebar past the dock");
+    assert_eq!(
+        scrolled.first().map(String::as_str),
+        Some("doc line 04"),
+        "three notches over the global box advanced the docs by three lines: {scrolled:?}"
+    );
 }
 
 #[tokio::test]

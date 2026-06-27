@@ -2348,14 +2348,23 @@ impl Editor {
     /// [`Editor::region_geoms`]) plus its region-relative rect — the same place
     /// every client paints it. `None` for an unknown window.
     fn window_screen_pos(&self, win: WindowId) -> Option<(usize, usize)> {
-        let (layer, _) = self.tree_of_window(win)?;
-        let (ox, oy) = self
-            .region_geoms()
-            .into_iter()
-            .find(|g| g.layer == layer)
-            .map(|g| (g.tree.0, g.tree.1))?;
+        let (ox, oy) = self.window_region_origin(win)?;
         let (wx, wy, _, _) = self.window_rect(win)?;
         Some((ox.saturating_add(wx), oy.saturating_add(wy)))
+    }
+
+    /// The global screen origin (top-left) of the window-tree area of the region
+    /// (layer) that `win` belongs to — the cell a client offsets that region's
+    /// region-relative geometry by (past the region's own tabline row, dock band,
+    /// and the global chrome). `None` for an unknown id. The server uses it to bound
+    /// the completion docs sidebar's region-relative box by the editor edges and to
+    /// map it into the global cells the wheel hit-test compares against.
+    pub fn window_region_origin(&self, win: WindowId) -> Option<(usize, usize)> {
+        let (layer, _) = self.tree_of_window(win)?;
+        self.region_geoms()
+            .into_iter()
+            .find(|g| g.layer == layer)
+            .map(|g| (g.tree.0, g.tree.1))
     }
 }
 

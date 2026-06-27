@@ -1902,24 +1902,45 @@ impl EditHost {
         // It floats over the WHOLE editor (the which-key model), not the focused
         // window — so a split (or a narrow pane) can't squeeze it into a useless
         // sliver. Its geometry is computed against the editor windows area, with the
-        // popup box mapped from the focused window's text inner into editor-absolute
-        // (windows-area) cells: the `'padding'` (left + top) and number gutter offset.
+        // popup box mapped from the focused window's text inner into region-relative
+        // (windows-area) cells: the `'padding'` (left + top) and the full gutter (sign
+        // + number column) offset.
         if matches!(m.placement, MenuPlacement::Cursor) {
-            let inner_x = focused.rect.x + focused.padding.left + focused.number_width;
+            // The popup box's region-relative top-left. The horizontal gutter before
+            // the text is the window's *whole* text offset — the sign column AND the
+            // number column (the box content anchors past both). `number_width` alone
+            // drops the sign column, sliding the docs sidebar `sign_width` cells left
+            // of the popup it's meant to butt against.
+            let gutter = self
+                .editor
+                .window_textoff(focused.id)
+                .unwrap_or(focused.number_width);
+            let inner_x = focused.rect.x + focused.padding.left + gutter;
             let inner_y = focused.rect.y + focused.padding.top;
             let (abs_col, abs_row) = (inner_x + col, inner_y + row);
+            // The sidebar floats over the whole editor, but its geometry is
+            // region-relative (the client offsets it by the focused window's region
+            // origin), so bound it by the editor extent MINUS that region's screen
+            // origin — the left/top dock bands plus the global chrome — or it overruns
+            // the editor's right / bottom edge.
+            let (region_x, region_y) = self
+                .editor
+                .window_region_origin(focused.id)
+                .unwrap_or((0, 0));
+            let bound_w = editor_w.saturating_sub(region_x);
+            let bound_h = editor_h.saturating_sub(region_y);
             if let Some((docs, meta)) =
-                self.project_complete_docs(m, abs_row, abs_col, width, editor_w, editor_h)
+                self.project_complete_docs(m, abs_row, abs_col, width, bound_w, bound_h)
             {
                 map.push((Value::from("docs"), docs));
-                // Stash the docs float's box in GLOBAL cells so a wheel over it scrolls
-                // the docs. `meta.col`/`meta.row` are already editor-absolute (windows-
-                // area cells == global cells), so the bordered outer box is just one
-                // cell out on every side.
+                // The docs geometry is region-relative (the client offsets it by the
+                // focused window's region origin), but the wheel hit-test runs in
+                // GLOBAL cells — so add that origin back when stashing the outer box
+                // (one cell out on every side for the border).
                 self.editor
                     .stash_complete_docs_hit(Some(nxvim_core::CompleteDocsHit {
-                        x: meta.col.saturating_sub(1),
-                        y: meta.row.saturating_sub(1),
+                        x: (region_x + meta.col).saturating_sub(1),
+                        y: (region_y + meta.row).saturating_sub(1),
                         w: meta.w + 2,
                         h: meta.h + 2,
                         total: meta.total,
@@ -1941,20 +1962,21 @@ impl EditHost {
     /// (like hover), placed to the right of the popup box and flipping to its left
     /// when that side has more room.
     ///
-    /// All geometry is **editor-absolute** (windows-area cells): `row`/`col` are the
-    /// popup box's top-left mapped into the editor windows area, and
-    /// `(editor_w, editor_h)` is the whole editor the float is bounded by — so it
-    /// floats over the entire editor (overlapping other splits) instead of being
-    /// squeezed into a narrow focused pane. Returns `None` rather than a useless
-    /// sliver when neither side can fit a readable width.
+    /// All geometry is **region-relative** (the focused window's region cells, which
+    /// the client offsets by that region's screen origin): `row`/`col` are the popup
+    /// box's top-left, and `(bound_w, bound_h)` is the editor extent left of / below
+    /// that origin — the float is bounded by the editor edges (overlapping other
+    /// splits) instead of being squeezed into a narrow focused pane, yet can't overrun
+    /// the editor's right / bottom edge. Returns `None` rather than a useless sliver
+    /// when neither side can fit a readable width.
     fn project_complete_docs(
         &self,
         m: &MenuView,
         row: usize,
         col: usize,
         width: usize,
-        editor_w: usize,
-        editor_h: usize,
+        bound_w: usize,
+        bound_h: usize,
     ) -> Option<(Value, CompleteDocsMeta)> {
         if !m.docs {
             return None;
@@ -1994,15 +2016,15 @@ impl EditHost {
             .max()
             .unwrap_or(1)
             .clamp(1, MAX_DOCS_W);
-        // Place beside the box, bounded by the whole editor — flipping to the side
-        // with more room and showing nothing rather than a 1-col sliver.
-        let (docs_col, docs_w) = place_docs_beside(col, width, content_w, editor_w)?;
-        // Clamp the height to the rows available below the float's top (a full border
-        // costs 2).
+        // Place beside the box, bounded by the editor's right edge — flipping to the
+        // side with more room and showing nothing rather than a 1-col sliver.
+        let (docs_col, docs_w) = place_docs_beside(col, width, content_w, bound_w)?;
+        // Clamp the height to the rows available below the float's top down to the
+        // editor's bottom edge (a full border costs 2).
         let total = lines.len();
         let docs_h = total
             .min(MAX_DOCS_H)
-            .min(editor_h.saturating_sub(row).saturating_sub(2).max(1));
+            .min(bound_h.saturating_sub(row).saturating_sub(2).max(1));
         // Window the lines from the core-owned scroll offset — a wheel over the
         // sidebar advances it (`Editor::scroll_complete_docs`). Clamp so a short tail
         // can't scroll past the end (the offset is also reset to 0 on a selection
@@ -2015,9 +2037,9 @@ impl EditHost {
             (Value::from("col"), Value::from(docs_col as u64)),
             (Value::from("width"), Value::from(docs_w as u64)),
             (Value::from("height"), Value::from(docs_h as u64)),
-            // The geometry is editor-absolute (windows-area cells), so the client
-            // offsets it by the windows-area origin, not the focused window's text
-            // inner — the sidebar floats over the whole editor.
+            // The geometry is region-relative (the focused window's region cells), so
+            // the client offsets it by that region's screen origin, not the window's
+            // text inner — the sidebar floats over the whole editor.
             (Value::from("editor_relative"), Value::from(true)),
         ]);
         Some((

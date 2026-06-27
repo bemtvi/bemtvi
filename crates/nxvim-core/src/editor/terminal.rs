@@ -194,11 +194,14 @@ impl Editor {
         ob.buffer.remove(start..len);
         ob.buffer.insert(start, &text);
         ob.buffer.normalize();
-        // A terminal buffer is never "modified" relative to a backing store — it has
-        // none — and these refreshes must not flip the `[+]` flag or arm a write.
-        ob.buffer.modified = false;
         // The whole rope was swapped, so the highlight/extmark layers must re-sync.
         ob.buffer.mark_resync();
+        // A terminal buffer is never "modified" relative to a backing store — it has
+        // none — and these refreshes must not flip the `[+]` flag or arm a write. This
+        // must run *after* `mark_resync`, which sets `modified = true` (it can't tell a
+        // live-screen mirror from an edit); resetting before it would be clobbered,
+        // leaving a live terminal marked modified and blocking `:qa` with `E37`.
+        ob.buffer.modified = false;
 
         if is_current {
             let line = cursor_row.min(self.buffer().line_count().saturating_sub(1));
@@ -265,8 +268,11 @@ impl Editor {
         let at = ob.buffer.len_bytes().saturating_sub(1);
         ob.buffer.insert(at, &notice);
         ob.buffer.normalize();
-        ob.buffer.modified = false;
         ob.buffer.mark_resync();
+        // Reset *after* `mark_resync` (which sets `modified = true`): the exited
+        // terminal's frozen output is not unsaved edits, so the now-ordinary buffer
+        // closes without an `E37` prompt.
+        ob.buffer.modified = false;
         // The child is gone: clear the terminal flag so the buffer becomes an ordinary
         // (editable) scratch buffer holding the final output — keystrokes no longer
         // forward, and the read-only edit guard lifts.

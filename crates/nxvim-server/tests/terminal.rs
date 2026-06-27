@@ -855,3 +855,39 @@ fn first_red_fg_span(map: &[(Value, Value)]) -> Option<u64> {
     }
     None
 }
+
+/// A live terminal mirrors a child's screen, not edited text — so it must never
+/// read as a *modified* buffer (no `[+]` flag, no `E37` blocking `:qa`). Each screen
+/// refresh swaps the whole rope and calls `mark_resync`, which sets `modified = true`;
+/// the terminal projection has to clear that flag *after* the resync, or every live
+/// terminal is wrongly marked modified. Regression test for that ordering bug.
+#[tokio::test]
+async fn live_terminal_is_not_marked_modified() {
+    let _guard = serial_lock().lock().await;
+    let (rpc, mut incoming) = start().await;
+
+    command(&rpc, "terminal cat").await;
+    feed(&rpc, "hello<CR>");
+    wait_lines(&rpc, "cat to echo 'hello'", |ls| has_line(ls, "hello")).await;
+
+    // Barrier, then take the latest frame: the live terminal's window must not flag
+    // the buffer as modified.
+    let _ = rpc.request("nvim_get_mode", vec![]).await;
+    let map = drain_to_latest_redraw(&mut incoming, |m| window0_field(m, "modified").is_some())
+        .expect("a redraw frame carrying the window's modified flag");
+    assert_eq!(
+        window0_field(&map, "modified").and_then(Value::as_bool),
+        Some(false),
+        "a live terminal must not be marked modified"
+    );
+
+    // The modified flag is what arms the `E37` quit guard (`first_modified_buffer`),
+    // so a false flag here is also what lets `:qa` go through — read it back through
+    // Lua to assert the buffer the guard inspects agrees.
+    let modified_bo = exec_lua(&rpc, "return vim.bo.modified").await;
+    assert_eq!(
+        modified_bo.as_bool(),
+        Some(false),
+        "vim.bo.modified must be false for a live terminal"
+    );
+}

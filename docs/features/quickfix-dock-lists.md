@@ -70,6 +70,53 @@ results to a location list — the marked rows if any are marked, else the whole
 filtered set. With `'qfdock'` on (default) each `<C-q>` saves the search as its own
 bottom-dock tab.
 
+## Dynamic (named, function-sourced) lists
+
+A *dynamic list* binds a **name** to a **datasource function**. `nx.qf.refresh(name)`
+re-runs that function and rewrites the bound list in place (action `"r"`), so an open
+quickfix / location window repaints with the fresh results — no stale snapshot. The
+source returns an items array (the same entry-dict shape as `setqflist`) **or a
+promise** resolving to one, so a slow producer (LSP, ripgrep) never blocks the editor.
+
+```lua
+nx.qf.dynamic({
+  name = "todos",
+  title = "TODO / FIXME",
+  source = function()                 -- re-scans the live buffer each refresh
+    local items = {}
+    for i, line in ipairs(vim.api.nvim_buf_get_lines(0, 0, -1, false)) do
+      if line:find("TODO") then
+        items[#items + 1] = { filename = nx.buf.name(), lnum = i, col = 1, text = line }
+      end
+    end
+    return items                      -- or: return some_promise_of_items
+  end,
+})
+
+nx.keymap.set("n", "<leader>tr", function()
+  nx.qf.refresh("todos"):next(function() nx.qf.open() end)
+end)
+```
+
+| Call | Purpose |
+| --- | --- |
+| `nx.qf.dynamic{ name=, source=, loclist=, win=, title= }` | register (or replace) a named list |
+| `nx.qf.refresh(name) -> promise` | re-run the source, rewrite the list in place, repaint |
+| `nx.qf.drop(name) -> bool` | forget the registration (leaves the list contents) |
+
+Pass `loclist = true` for a per-window **location** list; `nx.qf.dynamic` captures the
+current window then (override with `win = <id>`), so refreshing from anywhere still
+targets the right one. A first registration neither populates nor opens the list —
+call `refresh`, then `:copen` / `:lopen` (`nx.qf.open` / `nx.qf.lopen`) to show it.
+
+**Redefining is in place.** Calling `nx.qf.dynamic` again with an existing `name`
+replaces that registration rather than spawning a second list: a location list keeps
+the window a prior call bound (unless you pass an explicit `win`), so redefining a
+*visible* list updates it where it already shows — it never opens a new window or dock
+tab against whatever window happens to be focused now. A redefinition also refreshes
+immediately, so the new source takes effect (repainting an open window) without a
+manual `refresh`.
+
 ## Try it
 
 A runnable playground ships in
@@ -78,6 +125,16 @@ A runnable playground ships in
 ```sh
 NXVIM_CONFIG=examples/picker-to-loclist \
   cargo run -p nxvim -- examples/picker-to-loclist/sample.txt
+```
+
+Dynamic lists have their own playground in
+[`examples/dynamic-lists`](https://github.com/davidrios/nxvim/tree/main/examples/dynamic-lists)
+(`\tr` refreshes a TODO quickfix list, `\lr` a long-lines location list, `\ar` an
+async-sourced one):
+
+```sh
+NXVIM_CONFIG=examples/dynamic-lists \
+  cargo run -p nxvim -- examples/dynamic-lists/sample.txt
 ```
 
 ## How it works (in brief)

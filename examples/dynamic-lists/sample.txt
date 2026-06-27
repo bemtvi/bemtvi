@@ -1,0 +1,12 @@
+dynamic lists demo
+==================
+
+A short line.
+TODO: wire up the refresh keymap and try \tr to see this row appear.
+Another ordinary line that is comfortably under the forty-column threshold? no, this one is long.
+FIXME: this counts as an error-severity row in the TODO/FIXME quickfix list.
+short again
+This sentence is intentionally written to be well over forty columns wide.
+plain
+TODO: a second todo, lower in the file, so the list has more than one entry.
+end

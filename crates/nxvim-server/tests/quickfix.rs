@@ -1364,3 +1364,272 @@ async fn lspdiagnostics_colors_loclist_rows_by_severity() {
         "the error row must not be painted with the warning color"
     );
 }
+
+// --- dynamic (named, function-sourced) lists -------------------------------
+
+/// Poll `first_entry` until it equals `want` (a dynamic refresh fills the list off
+/// a microtask hop, then the server drains the queued op), returning whether it
+/// converged in time.
+async fn poll_first_entry(rpc: &Rpc, want: &str) -> bool {
+    for _ in 0..200 {
+        if first_entry(rpc).await == want {
+            return true;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    false
+}
+
+#[tokio::test]
+async fn dynamic_qflist_refreshes_from_its_source_function() {
+    let (rpc, mut incoming) = start().await;
+    // Register a named dynamic quickfix list whose source reads a counter, so each
+    // refresh yields a different item — proving refresh re-invokes the source and
+    // rewrites the list in place.
+    exec_lua(
+        &rpc,
+        r#"_G.dyn_n = 0
+           nx.qf.dynamic {
+             name = "counter",
+             title = "Counter",
+             source = function()
+               _G.dyn_n = _G.dyn_n + 1
+               return { { filename = "f.rs", lnum = _G.dyn_n, text = "tick " .. _G.dyn_n } }
+             end,
+           }
+           nx.qf.refresh("counter")"#,
+    )
+    .await;
+    // The first refresh populated the list from the source's first result.
+    assert!(
+        poll_first_entry(&rpc, "1|f.rs|1|0|tick 1").await,
+        "first refresh should populate from the source, got {:?}",
+        first_entry(&rpc).await
+    );
+    // Show the list, then refresh again: the source re-runs and the open window
+    // repaints with the new item.
+    message_after(&rpc, &mut incoming, ":copen<CR>").await;
+    exec_lua(&rpc, r#"nx.qf.refresh("counter")"#).await;
+    assert!(
+        poll_first_entry(&rpc, "1|f.rs|2|0|tick 2").await,
+        "second refresh should re-run the source, got {:?}",
+        first_entry(&rpc).await
+    );
+    // The focused quickfix window's rendered buffer reflects the refreshed item.
+    let rendered = lines(&rpc).await;
+    assert_eq!(rendered[0], "f.rs|2| tick 2");
+}
+
+#[tokio::test]
+async fn dynamic_loclist_is_bound_to_its_window() {
+    let (rpc, _incoming) = start().await;
+    exec_lua(
+        &rpc,
+        r#"_G.dyn_win = vim.api.nvim_get_current_win()
+           nx.qf.dynamic {
+             name = "lrefs",
+             loclist = true,
+             title = "LRefs",
+             source = function()
+               return { { filename = "x.rs", lnum = 4, text = "loc" } }
+             end,
+           }
+           nx.qf.refresh("lrefs")"#,
+    )
+    .await;
+    assert_eq!(poll_loclist_count(&rpc, 1).await, 1);
+    let got = exec_lua(
+        &rpc,
+        r#"local l = vim.fn.getloclist(_G.dyn_win)
+           return string.format("%d|%s|%d|%s", #l, l[1].filename, l[1].lnum, l[1].text)"#,
+    )
+    .await;
+    assert_eq!(got.as_str(), Some("1|x.rs|4|loc"));
+}
+
+#[tokio::test]
+async fn dynamic_source_may_return_a_promise() {
+    let (rpc, _incoming) = start().await;
+    // A source that returns a promise (slow producers — LSP, ripgrep) is awaited
+    // before the list is written.
+    exec_lua(
+        &rpc,
+        r#"nx.qf.dynamic {
+             name = "async",
+             source = function()
+               return nx.promise.resolve({ { filename = "p.rs", lnum = 9, text = "async" } })
+             end,
+           }
+           nx.qf.refresh("async")"#,
+    )
+    .await;
+    assert_eq!(poll_qf_count(&rpc, 1).await, 1);
+    assert_eq!(first_entry(&rpc).await, "1|p.rs|9|0|async");
+}
+
+#[tokio::test]
+async fn refresh_unknown_dynamic_list_fails_loud() {
+    let (rpc, _incoming) = start().await;
+    let out = exec_lua(
+        &rpc,
+        r#"local ok, e = pcall(function() return nx.qf.refresh("nope") end)
+           return tostring(ok) .. "|" .. tostring(e)"#,
+    )
+    .await;
+    let s = out.as_str().unwrap_or("");
+    assert!(
+        s.starts_with("false|"),
+        "refresh of an unknown name should error, got {s:?}"
+    );
+    assert!(
+        s.contains("nope"),
+        "the error should name the missing list, got {s:?}"
+    );
+}
+
+#[tokio::test]
+async fn redefining_a_dynamic_qflist_replaces_the_source_in_place() {
+    let (rpc, mut incoming) = start().await;
+    exec_lua(
+        &rpc,
+        r#"nx.qf.dynamic {
+             name = "q", title = "Q",
+             source = function() return { { filename = "a", lnum = 1, text = "before" } } end,
+           }
+           nx.qf.refresh("q")"#,
+    )
+    .await;
+    assert!(poll_first_entry(&rpc, "1|a|1|0|before").await);
+    message_after(&rpc, &mut incoming, ":copen<CR>").await;
+    let n_before = win_count(&rpc).await;
+    // Redefine the SAME name with a new source while the list is open + focused.
+    exec_lua(
+        &rpc,
+        r#"nx.qf.dynamic {
+             name = "q", title = "Q",
+             source = function() return { { filename = "b", lnum = 2, text = "after" } } end,
+           }"#,
+    )
+    .await;
+    // The redefinition refreshed in place — the source is replaced and the open
+    // window repaints — without opening a second window.
+    assert!(
+        poll_first_entry(&rpc, "1|b|2|0|after").await,
+        "redefining should replace the source and refresh, got {:?}",
+        first_entry(&rpc).await
+    );
+    assert_eq!(
+        win_count(&rpc).await,
+        n_before,
+        "redefining the list opened no new window"
+    );
+    let rendered = lines(&rpc).await;
+    assert_eq!(rendered[0], "b|2| after");
+}
+
+#[tokio::test]
+async fn redefining_a_dynamic_loclist_keeps_its_window_binding() {
+    let (rpc, mut incoming) = start().await;
+    exec_lua(
+        &rpc,
+        r#"_G.w1 = vim.api.nvim_get_current_win()
+           nx.qf.dynamic {
+             name = "refs", loclist = true,
+             source = function() return { { filename = "a.rs", lnum = 1, text = "first" } } end,
+           }
+           nx.qf.refresh("refs")"#,
+    )
+    .await;
+    assert_eq!(poll_loclist_count(&rpc, 1).await, 1);
+    // Move focus to a different window, then redefine the same name there.
+    message_after(&rpc, &mut incoming, ":vsplit<CR>").await;
+    exec_lua(
+        &rpc,
+        r#"_G.w2 = vim.api.nvim_get_current_win()
+           nx.qf.dynamic {
+             name = "refs", loclist = true,
+             source = function() return {
+               { filename = "b.rs", lnum = 2, text = "second" },
+               { filename = "b.rs", lnum = 3, text = "second2" },
+             } end,
+           }"#,
+    )
+    .await;
+    // The redefinition stayed bound to w1 (where the list lives) and refreshed it
+    // with the new source — it did NOT rebind to the now-focused w2 (which would
+    // have spawned a second list). w2 inherited w1's list at `:vsplit` time (vim
+    // semantics), so it still holds the *old* "first" snapshot — proof the new
+    // source landed on w1, not on the focused w2.
+    let mut got = String::new();
+    for _ in 0..200 {
+        let v = exec_lua(
+            &rpc,
+            r#"local l1, l2 = vim.fn.getloclist(_G.w1), vim.fn.getloclist(_G.w2)
+               local bound = nx._dynamic_lists["refs"].win
+               return string.format("%d|%s|%s|%s|%s", #l1,
+                 l1[1] and l1[1].text or "",
+                 l2[1] and l2[1].text or "",
+                 bound == _G.w1 and "w1" or "other",
+                 _G.w1 ~= _G.w2 and "split" or "same")"#,
+        )
+        .await;
+        got = v.as_str().unwrap_or("").to_string();
+        if got.starts_with("2|") {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert_eq!(got, "2|second|first|w1|split");
+}
+
+#[tokio::test]
+async fn redefining_an_open_dynamic_loclist_adds_no_window() {
+    let (rpc, mut incoming) = start().await;
+    exec_lua(
+        &rpc,
+        r#"_G.w1 = vim.api.nvim_get_current_win()
+           nx.qf.dynamic {
+             name = "refs", loclist = true,
+             source = function() return { { filename = "a.rs", lnum = 1, text = "first" } } end,
+           }
+           nx.qf.refresh("refs")"#,
+    )
+    .await;
+    assert_eq!(poll_loclist_count(&rpc, 1).await, 1);
+    // Show it (a bottom-dock tab by default); focus lands on the loclist window.
+    message_after(&rpc, &mut incoming, ":lopen<CR>").await;
+    let n_before = win_count(&rpc).await;
+    // Redefine the same name *from inside the open loclist window* — the exact
+    // case that must not spawn a new tab/window.
+    exec_lua(
+        &rpc,
+        r#"nx.qf.dynamic {
+             name = "refs", loclist = true,
+             source = function() return { { filename = "b.rs", lnum = 9, text = "second" } } end,
+           }"#,
+    )
+    .await;
+    let mut got = String::new();
+    for _ in 0..200 {
+        let v = exec_lua(
+            &rpc,
+            r#"local l = vim.fn.getloclist(_G.w1)
+               return (#l == 1) and l[1].text or "<wait>""#,
+        )
+        .await;
+        got = v.as_str().unwrap_or("").to_string();
+        if got == "second" {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert_eq!(
+        got, "second",
+        "redefine refreshed the existing loclist in place"
+    );
+    assert_eq!(
+        win_count(&rpc).await,
+        n_before,
+        "redefining the open loclist opened no new window/tab"
+    );
+}

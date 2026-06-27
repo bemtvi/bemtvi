@@ -648,3 +648,93 @@ async fn relativedocks_native_option_scales_the_dock() {
         );
     }
 }
+
+/// "[name]line/line||[name]…" over every (main + dock) window's buffer — a layout dump
+/// that spans docks (`nx.win.list` enumerates dock windows too), used to assert the
+/// restored unnamed content came back regardless of which layer holds it.
+async fn window_content_dump(rpc: &nxvim_rpc::Rpc) -> String {
+    exec_lua(
+        rpc,
+        r#"local out = {}
+           for _, w in ipairs(nx.win.list()) do
+             local b = nx.win.buf(w)
+             out[#out + 1] = "[" .. (nx.buf.name(b) or "") .. "]" ..
+               table.concat(nx.buf.lines(b, 0, -1), "/")
+           end
+           return table.concat(out, "||")"#,
+    )
+    .await
+    .as_str()
+    .unwrap_or_default()
+    .to_string()
+}
+
+#[tokio::test]
+async fn qa_persists_an_unnamed_buffer_shown_in_a_dock() {
+    // Regression: a modified `[No Name]` buffer parked in an edge **dock** rides the
+    // workspace session just like one in a main window — and a bang-less `:qa` doesn't
+    // block on it. Two bugs were in play: (1) the dock capture hard-coded
+    // `allow_unnamed = false`, so a dock's unnamed content was never saved; (2) `:qa`'s
+    // exemption used `window_showing`, which scans only the main tabs (and, while a dock
+    // is focused, reads the *dock* tree for the active main tab), so it missed both a
+    // dock-shown buffer AND the main-shown one — surfacing `E37` and yanking focus to
+    // the main layer instead of quitting.
+    let dir = temp_dir("session_qa_dock_unnamed");
+    let file_a = write_temp("session_qa_dock_a", "txt", "a1\na2\n");
+
+    {
+        let (rpc, incoming) = start_attached(init(&dir, Some(file_a.clone()), true), 80, 25).await;
+        exec_lua(&rpc, "nx.shada.save_layout(true)").await;
+        // Main area: file_a alongside an unnamed edited buffer in a vsplit.
+        feed(&rpc, ":vnew<CR>");
+        feed(&rpc, "imain scratch<Esc>");
+        // A bottom dock holding its own unnamed edited buffer (focus is now the dock).
+        exec_lua(&rpc, "nx.dock.open{ side = 'bottom', size = 6 }").await;
+        feed(&rpc, "idock scratch<Esc>");
+        // `:qa` (no bang) WHILE THE DOCK IS FOCUSED must quit — every modified buffer is
+        // unnamed and persisted, so none blocks. The await completing proves it quit.
+        feed(&rpc, ":qa<CR>");
+        tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            await_server_exit(incoming),
+        )
+        .await
+        .expect("`:qa` from a focused dock quit without an E37 nag");
+    }
+
+    {
+        let (rpc, _incoming) = start_attached(init(&dir, None, true), 80, 25).await;
+        let dump = window_content_dump(&rpc).await;
+        assert!(
+            dump.contains("main scratch"),
+            "the main-window unnamed buffer came back: {dump}"
+        );
+        assert!(
+            dump.contains("dock scratch"),
+            "the dock unnamed buffer's content came back: {dump}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn qa_from_main_does_not_block_on_a_dock_unnamed_buffer() {
+    // The mirror of the above: `:qa` issued from the MAIN layer must not block on a
+    // modified unnamed buffer living in a dock — it is captured, so quitting is safe.
+    let dir = temp_dir("session_qa_main_then_dock");
+    let file_a = write_temp("session_qa_main_a", "txt", "a1\na2\n");
+
+    let (rpc, incoming) = start_attached(init(&dir, Some(file_a.clone()), true), 80, 25).await;
+    exec_lua(&rpc, "nx.shada.save_layout(true)").await;
+    exec_lua(&rpc, "nx.dock.open{ side = 'bottom', size = 6 }").await;
+    feed(&rpc, "idock scratch<Esc>");
+    // Cross back up out of the bottom dock into the main window, then quit — the dock's
+    // modified unnamed buffer must not keep us here.
+    feed(&rpc, "<C-w>k");
+    feed(&rpc, ":qa<CR>");
+    tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        await_server_exit(incoming),
+    )
+    .await
+    .expect("`:qa` from the main layer quit despite the dock's unnamed buffer");
+}

@@ -1845,10 +1845,10 @@ impl Editor {
 
     /// Whether buffer `id`'s unsaved changes will be **persisted** by the workspace
     /// session on exit, so `:qa` needn't block (`E37`) on it: a modified, ordinary,
-    /// **unnamed** (`[No Name]`) buffer that is shown in a main window (so
-    /// [`Editor::export_session`] captures it), with `'workspacepersistunnamed'` on in a
-    /// layout-capturing session. A *hidden* modified `[No Name]` isn't captured, so it
-    /// still blocks — its content really would be lost.
+    /// **unnamed** (`[No Name]`) buffer that is shown in a window the session captures —
+    /// any main tab *or* any edge dock (see [`Self::buffer_in_persisted_window`]) — with
+    /// `'workspacepersistunnamed'` on in a layout-capturing session. A *hidden* modified
+    /// `[No Name]` isn't captured, so it still blocks — its content really would be lost.
     fn quit_safe_unnamed(&self, id: BufferId) -> bool {
         if !self.options.workspace_persist_unnamed || !self.session_captures_layout {
             return false;
@@ -1856,7 +1856,34 @@ impl Editor {
         let Some(ob) = self.buffers.map.get(&id) else {
             return false;
         };
-        ob.buffer.path.is_none() && !ob.buffer.read_only() && self.window_showing(id).is_some()
+        ob.buffer.path.is_none() && !ob.buffer.read_only() && self.buffer_in_persisted_window(id)
+    }
+
+    /// Whether `buf` is shown in a tiled window the workspace session will CAPTURE: any
+    /// main tab, or any existing edge dock (visible or hidden). Mirrors exactly the trees
+    /// [`Editor::export_session`] + `export_docks` walk, so [`Self::quit_safe_unnamed`]
+    /// exempts precisely the unnamed buffers the session is about to persist. Floating
+    /// windows are excluded (the session never captures floats).
+    ///
+    /// Deliberately does NOT use [`Editor::window_showing`]: that reads `self.windows`
+    /// for the active main tab, which holds the *dock* tree when a dock has focus (the
+    /// main tree is parked then), so it scans the wrong tree and misses a main-layer
+    /// buffer — the exact case (`:qa` from a focused dock) this guards. [`Editor::tab_tree`]
+    /// resolves the active main tab correctly regardless of which layer holds focus.
+    fn buffer_in_persisted_window(&self, buf: BufferId) -> bool {
+        let main_trees = self.tab_ids().into_iter().filter_map(|t| self.tab_tree(t));
+        let dock_trees = super::DockSide::ALL
+            .into_iter()
+            .filter(|&s| self.dock_exists(s))
+            .filter_map(|s| self.layer_tree(super::Layer::Dock(s)));
+        for tree in main_trees.chain(dock_trees) {
+            for win in tree.leaves() {
+                if tree.try_get(win).map(|w| w.buffer) == Some(buf) {
+                    return true;
+                }
+            }
+        }
+        false
     }
 
     /// `nx.open(path, { where })` — open `path` (a file or directory) in the editing

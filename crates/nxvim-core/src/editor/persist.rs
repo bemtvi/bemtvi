@@ -461,15 +461,20 @@ impl Editor {
                 continue;
             }
             let live = (self.focused_layer == Layer::Dock(side)).then_some(self.windows.current);
+            // A dock persists a modified ordinary `[No Name]` buffer the same as a main
+            // window (gated on `'workspacepersistunnamed'`): a user can park an editable
+            // scratch in a dock and expects it to ride the session. A *plugin* dock still
+            // reopens empty for its owner to repopulate — its view buffer is `read_only`,
+            // which `capture_layout` excludes, so this only captures genuine user content.
+            let allow_unnamed = self.options.workspace_persist_unnamed;
             let layout = self.layer_tree(Layer::Dock(side)).and_then(|t| {
-                // Docks never persist unnamed-buffer content (a plugin dock reopens empty).
                 self.capture_layout(
                     &t.layout_node(),
                     t,
                     live,
                     Some(t.current),
                     relative_splits,
-                    false,
+                    allow_unnamed,
                 )
             });
             let cells = self.dock_option_values(side.keyword()).2;

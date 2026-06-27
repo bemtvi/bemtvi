@@ -77,7 +77,7 @@ nx.keymap.set("n", "<leader>o", function()
 end)
 
 -- Greet the user on startup so the example is self-explaining when launched.
-nx.autocmd("VimEnter", {
+nx.autocmd.create("VimEnter", {
   callback = function()
     if nx.workspace.active() then
       nx.notify("workspace ready — layout saves on :qa, restores on relaunch", 2)

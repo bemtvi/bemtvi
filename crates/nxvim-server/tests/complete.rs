@@ -16,7 +16,8 @@
 use nxvim_rpc::{Incoming, Rpc};
 use nxvim_server::ServerInit;
 use nxvim_test_harness::{
-    attach, drain_to_latest_redraw, exec_lua, feed, feed_mouse, lines, map_get, spawn, temp_dir,
+    attach, drain_to_latest_redraw, exec_lua, feed, feed_mouse, feed_mouse_mod, lines, map_get,
+    spawn, temp_dir,
 };
 use rmpv::Value;
 use tokio::sync::mpsc::UnboundedReceiver;
@@ -667,6 +668,108 @@ async fn poll_menu_docs(
         tokio::time::sleep(std::time::Duration::from_millis(5)).await;
     }
     None
+}
+
+/// The latest redraw's docs sub-map (geometry + lines), or `None` if none carries one.
+async fn poll_docs_map(
+    rpc: &Rpc,
+    incoming: &mut UnboundedReceiver<Incoming>,
+) -> Option<Vec<(Value, Value)>> {
+    for _ in 0..60 {
+        nxvim_test_harness::barrier(rpc).await;
+        if let Some(map) = drain_to_latest_redraw(incoming, |m| match map_get(m, "menu") {
+            Some(Value::Map(menu)) => matches!(map_get(menu, "docs"), Some(Value::Map(_))),
+            _ => false,
+        }) {
+            if let Some(Value::Map(menu)) = map_get(&map, "menu") {
+                if let Some(Value::Map(docs)) = map_get(menu, "docs") {
+                    return Some(docs.clone());
+                }
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    None
+}
+
+fn docs_lines(docs: &[(Value, Value)]) -> Vec<String> {
+    match map_get(docs, "lines") {
+        Some(Value::Array(a)) => a
+            .iter()
+            .map(|l| l.as_str().unwrap_or("").to_string())
+            .collect(),
+        other => panic!("expected docs lines array, got {other:?}"),
+    }
+}
+
+fn docs_u64(docs: &[(Value, Value)], key: &str) -> usize {
+    map_get(docs, key)
+        .and_then(Value::as_u64)
+        .unwrap_or_else(|| panic!("docs has a {key}")) as usize
+}
+
+/// A `<S-ScrollWheel>` / horizontal wheel over the completion **docs sidebar** scrolls
+/// it sideways so a doc wider than the pane can be read past its right edge — the docs
+/// counterpart of the picker preview's horizontal scroll.
+#[tokio::test]
+async fn shift_or_horizontal_wheel_scrolls_the_docs_sidebar_sideways() {
+    let dir = temp_dir("complete_docs_hwheel");
+    // A single doc line far wider than the ~60-col docs pane (100 cols of a digit run).
+    let wide = "0123456789".repeat(10);
+    let init = format!(
+        "\
+nx.complete.source {{\n\
+  name = 'doc', debounce = 0,\n\
+  complete = function(ctx)\n\
+    if ('hello'):find(ctx.prefix, 1, true) == 1 then\n\
+      ctx.push {{ text = 'hello', doc = '{wide}' }}\n\
+    end\n\
+  end,\n\
+}}\n\
+nx.complete.setup {{ sources = {{ {{ 'doc' }} }} }}"
+    );
+    let (rpc, mut incoming) = start(&dir, &init).await;
+
+    feed(&rpc, "ihe");
+    let _ = poll_menu(&rpc, &mut incoming).await.expect("popup opens");
+    feed(&rpc, "<C-n>");
+    let docs = poll_docs_map(&rpc, &mut incoming)
+        .await
+        .expect("docs sidebar");
+    let before = docs_lines(&docs)[0].clone();
+    assert!(before.starts_with("0123456789"), "unscrolled: {before:?}");
+    let (row, col) = (docs_u64(&docs, "row"), docs_u64(&docs, "col"));
+
+    // A horizontal wheel-right notch over the docs box scrolls it 6 columns right.
+    feed_mouse(&rpc, "wheel", "right", row + 1, col + 1);
+    let docs = poll_docs_map(&rpc, &mut incoming)
+        .await
+        .expect("docs after h-wheel");
+    let after = docs_lines(&docs)[0].clone();
+    assert_eq!(
+        after,
+        before.chars().skip(6).collect::<String>(),
+        "the doc line scrolled 6 columns right"
+    );
+
+    // Shift + wheel-down is the same gesture: another 6 columns right.
+    feed_mouse_mod(&rpc, "wheel", "down", "S", row + 1, col + 1);
+    let docs = poll_docs_map(&rpc, &mut incoming)
+        .await
+        .expect("docs after S-wheel");
+    assert_eq!(
+        docs_lines(&docs)[0],
+        before.chars().skip(12).collect::<String>()
+    );
+
+    // Wheel-left scrolls back; clamped at column 0 (never negative).
+    for _ in 0..3 {
+        feed_mouse(&rpc, "wheel", "left", row + 1, col + 1);
+    }
+    let docs = poll_docs_map(&rpc, &mut incoming)
+        .await
+        .expect("docs after lefts");
+    assert_eq!(docs_lines(&docs)[0], before, "scrolled back to column 0");
 }
 
 #[tokio::test]

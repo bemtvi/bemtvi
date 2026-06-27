@@ -1717,6 +1717,8 @@ struct CompleteDocsMeta {
     w: usize,
     h: usize,
     total: usize,
+    /// The widest doc line (columns) — the horizontal scroll's upper bound.
+    max_w: usize,
 }
 
 /// Project the floating selectable-list [`MenuView`] into its redraw sub-map,
@@ -1945,6 +1947,8 @@ impl EditHost {
                         h: meta.h + 2,
                         total: meta.total,
                         view_h: meta.h,
+                        max_w: meta.max_w,
+                        view_w: meta.w,
                     }));
             } else {
                 self.editor.stash_complete_docs_hit(None);
@@ -2031,8 +2035,20 @@ impl EditHost {
         // change, so a new row's docs start at the top).
         let scroll = self.editor.complete_docs_scroll().min(total - docs_h);
         let shown = &lines[scroll..(scroll + docs_h).min(total)];
+        // Horizontal scroll: the widest doc line bounds the column offset; slice each
+        // visible line from there (the client renders from column 0). `docs_w` is the
+        // visible column count — the offset is clamped to it in `stash_complete_docs_hit`.
+        let max_w = lines.iter().map(|l| l.chars().count()).max().unwrap_or(0);
+        let hscroll = self
+            .editor
+            .complete_docs_hscroll()
+            .min(max_w.saturating_sub(docs_w));
+        let shown: Vec<String> = shown
+            .iter()
+            .map(|l| l.chars().skip(hscroll).collect())
+            .collect();
         let value = Value::Map(vec![
-            (Value::from("lines"), display_lines_value(shown)),
+            (Value::from("lines"), display_lines_value(&shown)),
             (Value::from("row"), Value::from(row as u64)),
             (Value::from("col"), Value::from(docs_col as u64)),
             (Value::from("width"), Value::from(docs_w as u64)),
@@ -2050,6 +2066,7 @@ impl EditHost {
                 w: docs_w,
                 h: docs_h,
                 total,
+                max_w,
             },
         ))
     }
@@ -2284,20 +2301,29 @@ impl EditHost {
                 // selection moves to a different row/file so each selection re-centers.
                 if self.preview_anchor.as_ref() != Some(target) {
                     self.preview_scroll = 0;
+                    self.preview_hscroll = 0;
                     self.preview_anchor = Some(target.clone());
                 }
                 // Fold this frame's one-shot scroll gesture (`<C-d>`/`<C-u>` half page,
                 // `<C-f>`/`<C-b>` full page) into the persistent offset. Full page keeps
-                // a two-line overlap, matching the editor's normal `<C-f>`/`<C-b>`.
+                // a two-line overlap, matching the editor's normal `<C-f>`/`<C-b>`. A
+                // horizontal gesture (`<S-ScrollWheel>` / horizontal wheel) advances the
+                // column offset instead, a few columns per notch.
                 if let Some(gesture) = m.preview_scroll {
+                    /// Columns per horizontal preview notch (vim's default `'mousescroll'`).
+                    const HSTEP: usize = 6;
                     let half = (pane_h / 2).max(1) as isize;
                     let page = pane_h.saturating_sub(2).max(1) as isize;
-                    self.preview_scroll += match gesture {
-                        nxvim_core::PreviewScroll::HalfDown => half,
-                        nxvim_core::PreviewScroll::HalfUp => -half,
-                        nxvim_core::PreviewScroll::PageDown => page,
-                        nxvim_core::PreviewScroll::PageUp => -page,
-                    };
+                    match gesture {
+                        nxvim_core::PreviewScroll::HalfDown => self.preview_scroll += half,
+                        nxvim_core::PreviewScroll::HalfUp => self.preview_scroll -= half,
+                        nxvim_core::PreviewScroll::PageDown => self.preview_scroll += page,
+                        nxvim_core::PreviewScroll::PageUp => self.preview_scroll -= page,
+                        nxvim_core::PreviewScroll::Right => self.preview_hscroll += HSTEP,
+                        nxvim_core::PreviewScroll::Left => {
+                            self.preview_hscroll = self.preview_hscroll.saturating_sub(HSTEP)
+                        }
+                    }
                 }
                 // The auto window start (show a `location` match ~a third down), clamped
                 // to the file; a file-kind target (no `loc`) starts at the top.
@@ -2315,10 +2341,18 @@ impl EditHost {
                 let cache = &self.preview_cache;
                 let end = (start + pane_h).min(len);
                 let win = cache.lines.get(start..end).unwrap_or(&[]);
+                // Horizontal scroll: clamp the manual column offset to the widest visible
+                // line (so a short window can't stay scrolled past its longest row), fold
+                // the clamp back like the vertical offset, then slice each line + the
+                // match column from there. `preview_w` is the visible column count.
+                let max_w = win.iter().map(|l| l.chars().count()).max().unwrap_or(0);
+                let hscroll = self.preview_hscroll.min(max_w.saturating_sub(preview_w));
+                self.preview_hscroll = hscroll;
                 // Per windowed line, the cached tree-sitter spans mapped to char
                 // columns + per-frame style ids — the same `[start, end, group,
                 // style_id]` shape as a window's text highlights, so the clients reuse
                 // their span renderer. Empty rows (no grammar / blank line) stay plain.
+                // Spans rebase by `hscroll` to match the sliced line.
                 let highlights = Value::Array(
                     win.iter()
                         .enumerate()
@@ -2328,23 +2362,27 @@ impl EditHost {
                                 cache.highlights.get(&(start + i)),
                                 &self.editor.highlights,
                                 styles,
+                                hscroll,
                             )
                         })
                         .collect(),
                 );
+                // Slice each visible line to the horizontal window (the client renders
+                // from column 0 and truncates to the pane width, as before — so at
+                // `hscroll == 0` this is the unchanged full line).
+                let shown: Vec<String> = win
+                    .iter()
+                    .map(|l| l.chars().skip(hscroll).collect())
+                    .collect();
                 // The match position, rebased into the window — only when the read
                 // succeeded (a placeholder has no meaningful location to highlight).
                 let loc = match target.loc {
-                    Some((r, c)) if cache.ok && r >= start && r < end => Some((r - start, c)),
+                    Some((r, c)) if cache.ok && r >= start && r < end => {
+                        Some((r - start, c.saturating_sub(hscroll)))
+                    }
                     _ => None,
                 };
-                (
-                    win.to_vec(),
-                    start + 1,
-                    loc,
-                    target.path.clone(),
-                    highlights,
-                )
+                (shown, start + 1, loc, target.path.clone(), highlights)
             }
             // The picker has a preview pane, but this row carries no target.
             None => {
@@ -2591,6 +2629,7 @@ fn preview_line_spans(
     spans: Option<&Vec<nxvim_core::Span>>,
     highlights: &nxvim_core::Highlights,
     styles: &mut StyleTable,
+    hscroll: usize,
 ) -> Value {
     let Some(spans) = spans else {
         return Value::Array(Vec::new());
@@ -2603,6 +2642,14 @@ fn preview_line_spans(
                 // on char boundaries (defensive — engine spans always should).
                 let start = text.get(..s.start_byte)?.chars().count();
                 let end = text.get(..s.end_byte)?.chars().count();
+                // Rebase into the horizontally-scrolled window: a span fully left of
+                // the first visible column is dropped, the rest shift left by `hscroll`
+                // (the client renders the sliced line from column 0).
+                if end <= hscroll {
+                    return None;
+                }
+                let start = start.saturating_sub(hscroll);
+                let end = end - hscroll;
                 let style_id = match highlights.resolve_capture(&s.group) {
                     Some(style) => Value::from(styles.intern(style) as u64),
                     None => Value::Nil,

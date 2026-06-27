@@ -213,6 +213,10 @@ pub enum PreviewScroll {
     HalfUp,
     PageDown,
     PageUp,
+    /// One horizontal step left / right (a `<S-ScrollWheel>` or horizontal wheel over
+    /// the pane). The server owns the column magnitude, like the vertical gestures.
+    Left,
+    Right,
 }
 
 /// The picker's input-grab query field — a single editable line, modeled on the
@@ -1028,6 +1032,7 @@ impl Editor {
             m.select_next();
             // A new row's docs start at the top.
             self.complete_docs_scroll = 0;
+            self.complete_docs_hscroll = 0;
         }
     }
 
@@ -1035,6 +1040,7 @@ impl Editor {
         if let Some(m) = self.completion_menu_mut() {
             m.select_prev();
             self.complete_docs_scroll = 0;
+            self.complete_docs_hscroll = 0;
         }
     }
 
@@ -1050,6 +1056,7 @@ impl Editor {
                 // A new row's docs start at the top (the mouse hover/click + wheel-list
                 // path lands here too, so scrolling the LIST resets the docs sidebar).
                 self.complete_docs_scroll = 0;
+                self.complete_docs_hscroll = 0;
             }
         }
     }
@@ -1294,9 +1301,11 @@ impl Editor {
                 "preview_page_up" if menu.preview => {
                     menu.preview_scroll = Some(PreviewScroll::PageUp)
                 }
+                "preview_left" if menu.preview => menu.preview_scroll = Some(PreviewScroll::Left),
+                "preview_right" if menu.preview => menu.preview_scroll = Some(PreviewScroll::Right),
                 // A preview gesture with no preview pane is a no-op, not an error.
                 "preview_half_down" | "preview_half_up" | "preview_page_down"
-                | "preview_page_up" => {}
+                | "preview_page_up" | "preview_left" | "preview_right" => {}
                 "backspace" => query_changed = menu.prompt.as_mut().unwrap().backspace(),
                 "delete" => query_changed = menu.prompt.as_mut().unwrap().delete(),
                 "left" => menu.prompt.as_mut().unwrap().cursor_left(),
@@ -1392,6 +1401,18 @@ impl Editor {
             "preview_half_down"
         } else {
             "preview_half_up"
+        };
+        let _ = self.apply_picker_action(action);
+    }
+
+    /// Scroll an open picker's preview pane horizontally one step (a `<S-ScrollWheel>`
+    /// or horizontal wheel over it). The server owns the column magnitude and clamps to
+    /// the widest visible line. A no-op without a preview pane.
+    pub(crate) fn menu_preview_scroll_h(&mut self, right: bool) {
+        let action = if right {
+            "preview_right"
+        } else {
+            "preview_left"
         };
         let _ = self.apply_picker_action(action);
     }

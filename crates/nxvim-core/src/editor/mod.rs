@@ -884,6 +884,11 @@ pub struct Editor {
     /// ([`Editor::stash_complete_docs_hit`]); the offset is core-owned and reset to 0
     /// whenever the completion selection changes. See [`mouse`](crate::editor::mouse).
     complete_docs_scroll: usize,
+    /// The docs sidebar's **horizontal** scroll offset (first visible column), for a
+    /// `<S-ScrollWheel>` / horizontal wheel over a doc whose lines run past the pane.
+    /// Core-owned and clamped to the widest line in [`Editor::stash_complete_docs_hit`],
+    /// reset to 0 alongside [`Editor::complete_docs_scroll`] on a selection change.
+    complete_docs_hscroll: usize,
     complete_docs_hit: Option<mouse::CompleteDocsHit>,
     /// Picker query edits awaiting a (dynamic) source re-run: each `(generation,
     /// query)`. A *static* source never appends here — the local fuzzy matcher
@@ -1566,6 +1571,7 @@ impl Editor {
             doc_float_buffers: Vec::new(),
             doc_float_wins: Vec::new(),
             complete_docs_scroll: 0,
+            complete_docs_hscroll: 0,
             complete_docs_hit: None,
             panel: None,
             view_float_lock: Vec::new(),

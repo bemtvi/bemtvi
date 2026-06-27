@@ -915,6 +915,11 @@ pub struct EditHost {
     /// resets to `0` whenever the selected row's preview target changes ([`preview_anchor`]),
     /// so each selection re-centers. Clamped to the file every frame.
     preview_scroll: isize,
+    /// The picker preview pane's manual **horizontal** scroll offset: the first visible
+    /// column, advanced by a `<S-ScrollWheel>` / horizontal wheel over the pane and
+    /// clamped to the widest visible line. Resets to `0` with [`preview_scroll`] when
+    /// the selected row's preview target changes ([`preview_anchor`]).
+    preview_hscroll: usize,
     /// The preview target the [`preview_scroll`] offset belongs to. When the live target
     /// differs (the selection moved to another row / file), the offset is reset. `None`
     /// before the first preview / on a row with no target.
@@ -1125,6 +1130,7 @@ impl EditHost {
             picker_active: false,
             preview_cache: redraw::PreviewCache::default(),
             preview_scroll: 0,
+            preview_hscroll: 0,
             preview_anchor: None,
             feed_buffer: VecDeque::new(),
             test_mode: false,

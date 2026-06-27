@@ -15,8 +15,8 @@
 use nxvim_rpc::{Incoming, Rpc};
 use nxvim_server::ServerInit;
 use nxvim_test_harness::{
-    attach, command, cursor, drain_to_latest_redraw, exec_lua, feed, feed_mouse, lines, map_get,
-    spawn, temp_dir,
+    attach, command, cursor, drain_to_latest_redraw, exec_lua, feed, feed_mouse, feed_mouse_mod,
+    lines, map_get, spawn, temp_dir,
 };
 use rmpv::Value;
 use tokio::sync::mpsc::UnboundedReceiver;
@@ -2107,6 +2107,73 @@ nx.picker.source {{
         preview_first_line(&preview),
         1 + half,
         "the wheel over the preview scrolled it, not the list"
+    );
+}
+
+#[tokio::test]
+async fn shift_or_horizontal_wheel_scrolls_the_preview_sideways() {
+    let dir = temp_dir("picker_preview_hwheel");
+    // Lines far wider than the preview pane (80 cols of a repeating digit run) so the
+    // horizontal window never bottoms out, and a known column maps to a known char.
+    let wide = "0123456789".repeat(8);
+    let body: String = (0..20).map(|_| format!("{wide}\n")).collect();
+    std::fs::write(dir.join("wide.txt"), &body).unwrap();
+    let wide_path = dir.join("wide.txt");
+    let src = format!(
+        r#"
+nx.picker.source {{
+  name = "pvh",
+  preview = "file",
+  items = function(ctx) ctx.push {{ text = "wide.txt", path = "{p}" }} end,
+}}
+"#,
+        p = wide_path.display(),
+    );
+    let (rpc, mut incoming) = start(&dir, &src).await;
+    command(&rpc, "set nonumber norelativenumber").await;
+
+    exec_lua(&rpc, "nx.picker.open('pvh')").await;
+    let menu = menu_of(&poll_menu(&rpc, &mut incoming).await.expect("menu opens"));
+    let preview = preview_of(&menu).expect("preview pane");
+    let before: String = preview_lines(&preview)[0].clone();
+    assert!(before.starts_with("0123456789"), "unscrolled: {before:?}");
+
+    // A horizontal wheel notch over the preview pane (right ~60% of the box) scrolls it
+    // 6 columns right — the visible line drops its first 6 chars, no vertical move.
+    let row = menu_u64(&menu, "row");
+    let col = menu_u64(&menu, "col");
+    let width = menu_u64(&menu, "width");
+    let (pr, pc) = (row + 3, col + width - 1);
+    feed_mouse(&rpc, "wheel", "right", pr, pc);
+    let menu = menu_of(&poll_menu(&rpc, &mut incoming).await.expect("after h-wheel"));
+    let preview = preview_of(&menu).expect("preview present");
+    assert_eq!(
+        preview_first_line(&preview),
+        1,
+        "horizontal scroll leaves the vertical window alone"
+    );
+    let after: String = preview_lines(&preview)[0].clone();
+    let expected: String = before.chars().skip(6).collect();
+    assert_eq!(after, expected, "the line scrolled 6 columns right");
+
+    // Shift + a vertical wheel-down notch is the same gesture (vim's <S-ScrollWheel>):
+    // it advances another 6 columns right, not down.
+    feed_mouse_mod(&rpc, "wheel", "down", "S", pr, pc);
+    let menu = menu_of(&poll_menu(&rpc, &mut incoming).await.expect("after S-wheel"));
+    let preview = preview_of(&menu).expect("preview present");
+    let after2: String = preview_lines(&preview)[0].clone();
+    assert_eq!(after2, before.chars().skip(12).collect::<String>());
+
+    // A horizontal wheel-left notch scrolls back; another is clamped at column 0.
+    feed_mouse(&rpc, "wheel", "left", pr, pc);
+    feed_mouse(&rpc, "wheel", "left", pr, pc);
+    feed_mouse(&rpc, "wheel", "left", pr, pc);
+    let menu = menu_of(&poll_menu(&rpc, &mut incoming).await.expect("after lefts"));
+    let preview = preview_of(&menu).expect("preview present");
+    assert_eq!(
+        preview_lines(&preview)[0],
+        before,
+        "scrolled all the way back to column 0 (clamped, never negative)"
     );
 }
 

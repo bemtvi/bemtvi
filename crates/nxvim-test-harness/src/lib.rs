@@ -138,6 +138,30 @@ pub fn feed_mouse(rpc: &Rpc, button: &str, action: &str, row: usize, col: usize)
     );
 }
 
+/// Like [`feed_mouse`], but with a `modifier` string (`nx_input_mouse`'s param 3 —
+/// e.g. `"S"` for Shift, `"C-S"` for Ctrl+Shift) so tests can drive `<S-ScrollWheel>`
+/// and other modified gestures.
+pub fn feed_mouse_mod(
+    rpc: &Rpc,
+    button: &str,
+    action: &str,
+    modifier: &str,
+    row: usize,
+    col: usize,
+) {
+    rpc.notify(
+        "nx_input_mouse",
+        vec![
+            Value::from(button),
+            Value::from(action),
+            Value::from(modifier),
+            Value::from(0u64),
+            Value::from(row as u64),
+            Value::from(col as u64),
+        ],
+    );
+}
+
 /// Like [`feed_mouse`], but first advance `clock` to `ms` so the server stamps
 /// this gesture at that time — for driving `'mousetime'`-based multi-click
 /// (double/triple-click) deterministically. Await a barrier (e.g. [`cursor`] /

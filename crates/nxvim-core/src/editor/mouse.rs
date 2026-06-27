@@ -249,6 +249,11 @@ pub struct CompleteDocsHit {
     pub total: usize,
     /// Visible doc rows (the windowed height); the scroll max is `total - view_h`.
     pub view_h: usize,
+    /// The widest doc line, in columns — the horizontal scroll's upper bound.
+    pub max_w: usize,
+    /// Visible doc columns (the windowed content width); the horizontal scroll max is
+    /// `max_w - view_w`.
+    pub view_w: usize,
 }
 
 /// Which `%`-format-rendered chrome row a [`StatuslineClick`] landed on — it tells
@@ -340,12 +345,18 @@ impl Editor {
             {
                 self.mouse_complete_press(ev.row, ev.col)
             }
-            (MouseButton::Wheel, MouseAction::WheelUp | MouseAction::WheelDown)
-                if self.completion_active()
-                    && (self.menu_hit(ev.row, ev.col).is_some()
-                        || self.complete_docs_hit_at(ev.row, ev.col)) =>
+            (
+                MouseButton::Wheel,
+                MouseAction::WheelUp
+                | MouseAction::WheelDown
+                | MouseAction::WheelLeft
+                | MouseAction::WheelRight,
+            ) if self.completion_active()
+                && (self.menu_hit(ev.row, ev.col).is_some()
+                    || self.complete_docs_hit_at(ev.row, ev.col)) =>
             {
-                self.mouse_complete_wheel(ev.action == MouseAction::WheelDown, ev.row, ev.col)
+                let (positive, horizontal) = Self::wheel_axis(&ev);
+                self.mouse_complete_wheel(positive, horizontal, ev.row, ev.col)
             }
             // A picker / `select` grabs the mouse modally while open (like it grabs the
             // keyboard): a left-press highlights or confirms a row — or cancels the
@@ -357,10 +368,15 @@ impl Editor {
             }
             (MouseButton::Left, MouseAction::Drag | MouseAction::Release)
                 if self.picker_or_select_active() => {}
-            (MouseButton::Wheel, MouseAction::WheelUp | MouseAction::WheelDown)
-                if self.picker_or_select_active() =>
-            {
-                self.mouse_menu_wheel(ev.action == MouseAction::WheelDown, ev.row, ev.col)
+            (
+                MouseButton::Wheel,
+                MouseAction::WheelUp
+                | MouseAction::WheelDown
+                | MouseAction::WheelLeft
+                | MouseAction::WheelRight,
+            ) if self.picker_or_select_active() => {
+                let (positive, horizontal) = Self::wheel_axis(&ev);
+                self.mouse_menu_wheel(positive, horizontal, ev.row, ev.col)
             }
             // The command-line wildmenu (`nx.cmdline_complete`) is non-grabbing like the
             // completion popup: a left-press on a candidate highlights it (and previews
@@ -665,6 +681,20 @@ impl Editor {
         };
         self.mouse_button_seq = Some((button, row, col, stamp_ms, count));
         count
+    }
+
+    /// Decode a wheel gesture into `(positive, horizontal)` for the overlay scroll
+    /// handlers: a native horizontal wheel, or a vertical wheel with `Shift` (vim's
+    /// `<S-ScrollWheel>`), scrolls **horizontally**; `positive` means *down* for a
+    /// vertical scroll and *right* for a horizontal one.
+    fn wheel_axis(ev: &MouseEvent) -> (bool, bool) {
+        match ev.action {
+            MouseAction::WheelDown => (true, ev.shift),
+            MouseAction::WheelUp => (false, ev.shift),
+            MouseAction::WheelRight => (true, true),
+            MouseAction::WheelLeft => (false, true),
+            _ => (false, false),
+        }
     }
 
     /// Queue a scroll-wheel notch (`<ScrollWheelUp>` / …) for the server to resolve: a
@@ -1671,12 +1701,20 @@ impl Editor {
         self.complete_docs_hit = hit;
         let max = hit.map_or(0, |h| h.total.saturating_sub(h.view_h));
         self.complete_docs_scroll = self.complete_docs_scroll.min(max);
+        let max_h = hit.map_or(0, |h| h.max_w.saturating_sub(h.view_w));
+        self.complete_docs_hscroll = self.complete_docs_hscroll.min(max_h);
     }
 
     /// The completion docs sidebar's first-visible-line offset — the server windows
     /// the doc lines from here when projecting the sidebar.
     pub fn complete_docs_scroll(&self) -> usize {
         self.complete_docs_scroll
+    }
+
+    /// The docs sidebar's first-visible-**column** offset — the server slices each
+    /// projected doc line from here so a wide doc can be read past the pane's edge.
+    pub fn complete_docs_hscroll(&self) -> usize {
+        self.complete_docs_hscroll
     }
 
     /// Whether `(row, col)` lands on the stashed completion **docs sidebar** box.
@@ -1704,16 +1742,43 @@ impl Editor {
         };
     }
 
+    /// Scroll the completion docs sidebar horizontally by a few columns (a
+    /// `<S-ScrollWheel>` / horizontal wheel over it), bounded by the widest doc line.
+    /// The server slices the projected lines from [`Editor::complete_docs_hscroll`].
+    fn scroll_complete_docs_h(&mut self, right: bool) {
+        /// Columns per horizontal wheel notch — vim's default `'mousescroll'` hor step.
+        const HSTEP: usize = 6;
+        let max = self
+            .complete_docs_hit
+            .map_or(0, |h| h.max_w.saturating_sub(h.view_w));
+        self.complete_docs_hscroll = if right {
+            (self.complete_docs_hscroll + HSTEP).min(max)
+        } else {
+            self.complete_docs_hscroll.saturating_sub(HSTEP)
+        };
+    }
+
     /// A wheel notch over the completion popup moves the highlight one row,
     /// non-wrapping (like dragging a scrollbar — it stops at the ends, unlike
     /// `<C-n>`'s wrap). A noselect popup highlights the first row. Over the **docs
     /// sidebar** beside the popup it scrolls the docs instead, leaving the highlight
-    /// (and so the selected row) untouched.
-    fn mouse_complete_wheel(&mut self, down: bool, row: usize, col: usize) {
+    /// (and so the selected row) untouched — vertically, or **horizontally** when
+    /// `horizontal` (a `<S-ScrollWheel>` / horizontal wheel) so a wide doc reads past
+    /// the pane. A horizontal notch over the *popup list* (not the docs) does nothing —
+    /// the list has no horizontal extent.
+    fn mouse_complete_wheel(&mut self, positive: bool, horizontal: bool, row: usize, col: usize) {
         if self.complete_docs_hit_at(row, col) {
-            self.scroll_complete_docs(down);
+            if horizontal {
+                self.scroll_complete_docs_h(positive);
+            } else {
+                self.scroll_complete_docs(positive);
+            }
             return;
         }
+        if horizontal {
+            return;
+        }
+        let down = positive;
         let Some(m) = self.menu_view() else {
             return;
         };
@@ -1754,12 +1819,17 @@ impl Editor {
     }
 
     /// A wheel notch while a picker / `select` is open: over the preview pane it
-    /// scrolls the preview; over the list (or its chrome) it moves the highlight one
-    /// row, non-wrapping; off the box it is ignored.
-    fn mouse_menu_wheel(&mut self, down: bool, row: usize, col: usize) {
+    /// scrolls the preview — vertically, or **horizontally** when `horizontal` (a
+    /// `<S-ScrollWheel>` / horizontal wheel) so a wide file reads past the pane edge;
+    /// over the list (or its chrome) it moves the highlight one row, non-wrapping (a
+    /// horizontal notch over the list does nothing — the list has no horizontal
+    /// extent); off the box it is ignored.
+    fn mouse_menu_wheel(&mut self, positive: bool, horizontal: bool, row: usize, col: usize) {
         match self.menu_hit(row, col) {
-            Some(MenuHit::Preview) => self.menu_preview_scroll(down),
-            Some(MenuHit::Item(_) | MenuHit::Chrome) => self.menu_step(down),
+            Some(MenuHit::Preview) if horizontal => self.menu_preview_scroll_h(positive),
+            Some(MenuHit::Preview) => self.menu_preview_scroll(positive),
+            Some(MenuHit::Item(_) | MenuHit::Chrome) if horizontal => {}
+            Some(MenuHit::Item(_) | MenuHit::Chrome) => self.menu_step(positive),
             None => {}
         }
     }

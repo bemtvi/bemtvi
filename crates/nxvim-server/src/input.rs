@@ -6,7 +6,29 @@ use crate::EditHost;
 use nxvim_core::{parse_keys, Key, KeyCode};
 
 impl EditHost {
+    /// Whether this session will CAPTURE the window/tab layout on exit — a workspace
+    /// session whose layout capture is opted in (`workspace_session && session_save_layout`,
+    /// the same gate `shada_checkpoint`/`shada_flush_final` use). Mirrored into core each
+    /// input batch so `:qa` can skip its `E37` guard for a modified unnamed buffer the
+    /// session is about to persist. Always `false` off the native build (no workspace
+    /// session there).
+    pub(crate) fn session_captures_layout(&self) -> bool {
+        #[cfg(feature = "native")]
+        {
+            self.workspace_session && self.lua.session_save_layout()
+        }
+        #[cfg(not(feature = "native"))]
+        {
+            false
+        }
+    }
+
     pub(crate) fn input(&mut self, keys: &str) {
+        // Keep core's "a modified unnamed buffer will be persisted on exit" knowledge
+        // fresh before any key (notably `:qa`) is processed: it gates `:qa`'s `E37` skip
+        // on the live `session_save_layout` opt-in, which a plugin can toggle.
+        let captures = self.session_captures_layout();
+        self.editor.set_session_captures_layout(captures);
         // Rebuild the keymap tries if the registry changed since the last batch —
         // once per `nx_input`, not per key, so each keystroke only walks the
         // cached trie (design §6). A map a callback sets mid-batch takes effect on

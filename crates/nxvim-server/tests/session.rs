@@ -10,7 +10,7 @@
 use std::path::Path;
 
 use nxvim_server::{RedbFileStore, ServerInit};
-use nxvim_test_harness::{cursor, exec_lua, feed, start_attached, temp_dir, write_temp};
+use nxvim_test_harness::{cursor, exec_lua, feed, lines, start_attached, temp_dir, write_temp};
 use tokio::sync::mpsc::UnboundedReceiver;
 
 /// A server persisting into `dir`. `session` turns on BOTH capture and restore (the
@@ -257,6 +257,166 @@ async fn session_restores_a_window_location_list() {
             "the location list survived on the restored window"
         );
     }
+}
+
+/// The name of the current window's buffer (`""` for an unnamed `[No Name]`).
+async fn current_buffer_name(rpc: &nxvim_rpc::Rpc) -> String {
+    exec_lua(rpc, "return nx.buf.name(nx.win.buf(nx.win.current()))")
+        .await
+        .as_str()
+        .unwrap_or_default()
+        .to_string()
+}
+
+#[tokio::test]
+async fn session_restores_a_modified_unnamed_buffer() {
+    // A modified `[No Name]` buffer (typed into but never written to a file) rides the
+    // session with its contents — gated on `'workspacepersistunnamed'` (default on).
+    let dir = temp_dir("session_unnamed_store");
+
+    {
+        // Start with no file: the startup `[No Name]` buffer. Type into it (now modified).
+        let (rpc, incoming) = start_attached(init(&dir, None, true), 80, 25).await;
+        exec_lua(&rpc, "nx.shada.save_layout(true)").await;
+        feed(&rpc, "iscratch notes<CR>second line<Esc>");
+        assert_eq!(current_buffer_name(&rpc).await, "", "buffer is unnamed");
+        assert_eq!(lines(&rpc).await, vec!["scratch notes", "second line"]);
+        feed(&rpc, ":qa!<CR>"); // modified → bang; the exit flush still captures
+        await_server_exit(incoming).await;
+    }
+
+    {
+        let (rpc, _incoming) = start_attached(init(&dir, None, true), 80, 25).await;
+        assert_eq!(
+            current_buffer_name(&rpc).await,
+            "",
+            "restored buffer is still unnamed"
+        );
+        assert_eq!(
+            lines(&rpc).await,
+            vec!["scratch notes", "second line"],
+            "the unnamed buffer's contents came back"
+        );
+        // It's marked modified, so it round-trips: a second exit re-captures it.
+        let modified = exec_lua(&rpc, "return vim.bo.modified").await;
+        assert_eq!(
+            modified,
+            rmpv::Value::Boolean(true),
+            "restored unnamed buffer is modified (unsaved content)"
+        );
+    }
+}
+
+#[tokio::test]
+async fn workspacepersistunnamed_off_drops_the_unnamed_buffer() {
+    // With the option off, a modified `[No Name]` buffer is NOT persisted — the inverse
+    // of the test above, proving the gate.
+    let dir = temp_dir("session_unnamed_off_store");
+
+    {
+        let (rpc, incoming) = start_attached(init(&dir, None, true), 80, 25).await;
+        exec_lua(&rpc, "nx.shada.save_layout(true)").await;
+        exec_lua(&rpc, "nx.o.workspacepersistunnamed = false").await;
+        feed(&rpc, "ithrowaway<Esc>");
+        feed(&rpc, ":qa!<CR>");
+        await_server_exit(incoming).await;
+    }
+
+    {
+        let (rpc, _incoming) = start_attached(init(&dir, None, true), 80, 25).await;
+        assert_eq!(
+            lines(&rpc).await,
+            vec![""],
+            "the unnamed buffer was not persisted (fresh empty startup buffer)"
+        );
+    }
+}
+
+#[tokio::test]
+async fn qa_does_not_block_on_a_persisted_unnamed_buffer() {
+    // In a layout-capturing workspace with `'workspacepersistunnamed'` on, a modified
+    // `[No Name]` buffer doesn't block a bang-less `:qa` — its content is saved anyway.
+    let dir = temp_dir("session_qa_persist_store");
+
+    {
+        let (rpc, incoming) = start_attached(init(&dir, None, true), 80, 25).await;
+        exec_lua(&rpc, "nx.shada.save_layout(true)").await; // a capturing session
+        feed(&rpc, "iscratch survived<Esc>"); // modified, shown `[No Name]`
+        feed(&rpc, ":qa<CR>"); // NO bang — must quit despite the modified buffer
+                               // The await completing proves the editor quit (E37 would have kept it alive).
+        tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            await_server_exit(incoming),
+        )
+        .await
+        .expect("`:qa` quit without blocking on the persisted unnamed buffer");
+    }
+
+    {
+        // …and it really was persisted on that bang-less exit.
+        let (rpc, _incoming) = start_attached(init(&dir, None, true), 80, 25).await;
+        assert_eq!(
+            lines(&rpc).await,
+            vec!["scratch survived"],
+            "the unnamed buffer's contents survived the non-bang `:qa`"
+        );
+    }
+}
+
+#[tokio::test]
+async fn qa_still_blocks_a_modified_unnamed_buffer_when_persist_is_off() {
+    // The inverse guard: with `'workspacepersistunnamed'` off the buffer is NOT persisted,
+    // so a bang-less `:qa` must still block (`E37`) — abandoning it would lose the content.
+    let dir = temp_dir("session_qa_block_store");
+    let (rpc, _incoming) = start_attached(init(&dir, None, true), 80, 25).await;
+    exec_lua(&rpc, "nx.shada.save_layout(true)").await;
+    exec_lua(&rpc, "nx.o.workspacepersistunnamed = false").await;
+    feed(&rpc, "ithrowaway<Esc>");
+    feed(&rpc, ":qa<CR>");
+    // The server is still alive (the quit was blocked) — a fresh request still answers.
+    assert_eq!(
+        exec_lua(&rpc, "return 40 + 2").await.as_i64(),
+        Some(42),
+        "`:qa` was blocked (E37): the editor is still running",
+    );
+}
+
+#[tokio::test]
+async fn native_session_options_round_trip_through_the_mirror() {
+    // The session-control options are squashed-name globals; a set must read back through
+    // the server's `nx._go_mirror` push (the mirror key has to match the canonical name,
+    // not the snake_case Rust field). Guards the rename + the new option.
+    let (rpc, _incoming) =
+        start_attached(init(&temp_dir("session_optmirror"), None, true), 80, 25).await;
+    let got = exec_lua(
+        &rpc,
+        r#"
+        nx.o.relativesplits = false
+        nx.o.relativedocks = true
+        nx.o.workspacepersistunnamed = false
+        -- a second exec_lua chunk reads after the server pushes the mirror; do it inline
+        -- via a barrier read so we exercise the round-trip, not just the write-through.
+        return string.format("%s|%s|%s",
+          tostring(nx.o.relativesplits), tostring(nx.o.relativedocks),
+          tostring(nx.o.workspacepersistunnamed))
+        "#,
+    )
+    .await;
+    // Write-through within the chunk; the cross-tick mirror is checked below.
+    assert_eq!(got.as_str(), Some("false|true|false"));
+
+    let after = exec_lua(
+        &rpc,
+        r#"return string.format("%s|%s|%s",
+             tostring(nx.o.relativesplits), tostring(nx.o.relativedocks),
+             tostring(nx.o.workspacepersistunnamed))"#,
+    )
+    .await;
+    assert_eq!(
+        after.as_str(),
+        Some("false|true|false"),
+        "the values survive the server's mirror refresh (rename keys match)"
+    );
 }
 
 #[tokio::test]

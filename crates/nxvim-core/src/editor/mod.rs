@@ -1348,6 +1348,14 @@ pub struct Editor {
     /// by default — local builds do buffer I/O synchronously. Set via
     /// [`Editor::set_host_fs_offtick`].
     host_fs_offtick: bool,
+    /// Whether this session will CAPTURE the window/tab layout on exit — i.e. a
+    /// layout-capturing workspace session (`workspace_session && session_save_layout`,
+    /// both server-side). The server mirrors it in via [`Editor::set_session_captures_layout`]
+    /// each input batch. When set, `:qa` need not block (`E37`) on a *modified unnamed*
+    /// buffer shown in the layout, since `export_session` persists its contents with
+    /// `'workspacepersistunnamed'` — see [`Editor::quit_safe_unnamed`]. `false` by default
+    /// (a non-workspace session loses an abandoned `[No Name]`, so it must still warn).
+    session_captures_layout: bool,
     /// Whether a `BufReadCmd` autocmd handler is registered — the server mirrors this
     /// from its `au_active_events` cache via [`Editor::set_bufreadcmd_active`]. When
     /// set, a file open is **deferred** (enqueued like an off-tick read) instead of
@@ -1484,6 +1492,13 @@ impl Editor {
     /// must be skipped (the preview rides the async FS seam instead).
     pub fn host_fs_offtick(&self) -> bool {
         self.host_fs_offtick
+    }
+
+    /// Tell the editor whether the session captures layout on exit (so `:qa` can skip its
+    /// `E37` guard for a modified unnamed buffer the session persists). The server keeps
+    /// this in sync with `workspace_session && session_save_layout` each input batch.
+    pub fn set_session_captures_layout(&mut self, on: bool) {
+        self.session_captures_layout = on;
     }
 
     pub fn open(path: impl Into<PathBuf>) -> anyhow::Result<Self> {
@@ -1698,6 +1713,7 @@ impl Editor {
             clipboard: None,
             host_fs: Rc::new(StdHostFs),
             host_fs_offtick: false,
+            session_captures_layout: false,
             bufreadcmd_active: false,
             pending_saves: Vec::new(),
             next_save_seq: 0,

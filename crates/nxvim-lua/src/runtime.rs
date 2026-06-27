@@ -421,14 +421,23 @@ pub struct GoMirror {
     /// rather than loading a sibling. Backs `vim.o.bdclosetab` / `nx.o.bdclosetab`.
     pub bdclosetab: bool,
     /// `'relativesplits'` — whether a saved session stores split sizes as proportional
-    /// percentages (default true). Backs `nx.o.relativesplits`.
+    /// percentages (default true). Backs `nx.o.relativesplits`. The serialized Lua mirror
+    /// key must equal the canonical option name (squashed, no `_`), which the snake_case
+    /// Rust field doesn't — so it's renamed for the `nx._go_mirror` table.
+    #[serde(rename = "relativesplits")]
     pub relative_splits: bool,
     /// `'relativedocks'` — whether a saved session stores dock sizes as a percentage
     /// of the screen (default false). Backs `nx.o.relativedocks`.
+    #[serde(rename = "relativedocks")]
     pub relative_docks: bool,
     /// `'equalalways'` — whether opening/closing a window re-equalizes all windows
     /// to even sizes (default true). Backs `vim.o.equalalways` / `nx.o.equalalways`.
     pub equalalways: bool,
+    /// `'workspacepersistunnamed'` — whether a workspace session persists modified
+    /// `[No Name]` buffers with their contents (default true). Backs
+    /// `nx.o.workspacepersistunnamed`.
+    #[serde(rename = "workspacepersistunnamed")]
+    pub workspace_persist_unnamed: bool,
 }
 
 /// The pure-Lua `vim.*` prelude, split into focused modules under `src/prelude/`

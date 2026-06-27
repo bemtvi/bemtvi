@@ -166,8 +166,9 @@ pub enum SessionLayout {
 }
 
 /// One window: the file it showed, its view (cursor line/col + top line), and whether it
-/// was the tab's focused window. Only file-backed windows are captured (a path is
-/// required to reopen the buffer).
+/// was the tab's focused window. A leaf is captured when it shows a file (`path` set) OR,
+/// with `'workspacepersistunnamed'` on, a modified **unnamed** `[No Name]` buffer — then
+/// `path` is empty and [`SessionWindow::unnamed_contents`] carries the buffer's text.
 #[derive(Debug, Clone, Default)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct SessionWindow {
@@ -181,6 +182,12 @@ pub struct SessionWindow {
     /// window had none.
     #[cfg_attr(feature = "serde", serde(default))]
     pub loclist: crate::editor::quickfix::QfStack,
+    /// For an **unnamed** (pathless) `[No Name]` buffer persisted with its modified
+    /// contents: the buffer's editable lines. `None` for a file-backed window (its
+    /// content lives on disk and is reread on restore). Restored as a fresh unnamed
+    /// buffer, marked modified so it round-trips on the next exit.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub unnamed_contents: Option<Vec<String>>,
 }
 
 /// One persisted numbered mark `'0`–`'9`: the digit, the file, and the position.
@@ -368,7 +375,17 @@ impl Editor {
                 .then_some(self.windows.current);
             let node = tree.layout_node();
             let active = Some(tree.current);
-            let layout = match self.capture_layout(&node, tree, live, active, relative_splits) {
+            // Main-area windows may persist a modified `[No Name]` buffer (when
+            // `'workspacepersistunnamed'` is on); docks never do (they reopen empty).
+            let allow_unnamed = self.options.workspace_persist_unnamed;
+            let layout = match self.capture_layout(
+                &node,
+                tree,
+                live,
+                active,
+                relative_splits,
+                allow_unnamed,
+            ) {
                 Some(l) => l,
                 None => continue, // no file-backed leaf in this tab
             };
@@ -404,7 +421,15 @@ impl Editor {
             }
             let live = (self.focused_layer == Layer::Dock(side)).then_some(self.windows.current);
             let layout = self.layer_tree(Layer::Dock(side)).and_then(|t| {
-                self.capture_layout(&t.layout_node(), t, live, Some(t.current), relative_splits)
+                // Docks never persist unnamed-buffer content (a plugin dock reopens empty).
+                self.capture_layout(
+                    &t.layout_node(),
+                    t,
+                    live,
+                    Some(t.current),
+                    relative_splits,
+                    false,
+                )
             });
             let cells = self.dock_option_values(side.keyword()).2;
             // A left/right dock is a fraction of the screen width; top/bottom of height.
@@ -430,9 +455,10 @@ impl Editor {
     }
 
     /// Project a window-model [`LayoutNode`] into a serialisable [`SessionLayout`],
-    /// resolving each leaf window to its file + view. Leaves with no file (unnamed /
-    /// scratch) are dropped, and a split left with one child collapses to that child;
-    /// `None` when nothing file-backed survives. With `relative_splits` the kept sizes are
+    /// resolving each leaf window to its file + view. A leaf with no file is dropped —
+    /// UNLESS `allow_unnamed` and it shows a modified ordinary `[No Name]` buffer, whose
+    /// contents are then captured into the leaf. A split left with one child collapses to
+    /// that child; `None` when nothing survives. With `relative_splits` the kept sizes are
     /// normalized to percentages (summing ~100) — the restore re-lays them out either way,
     /// since the window model treats split sizes as proportional weights.
     ///
@@ -448,15 +474,26 @@ impl Editor {
         live: Option<crate::WindowId>,
         active: Option<crate::WindowId>,
         relative_splits: bool,
+        allow_unnamed: bool,
     ) -> Option<SessionLayout> {
         use super::windows::LayoutNode;
         match node {
             LayoutNode::Leaf(wid) => {
                 let w = tree.try_get(*wid)?;
                 let path = self.buffer_name(w.buffer).unwrap_or_default();
-                if path.is_empty() {
-                    return None;
-                }
+                // A pathless leaf is dropped unless it's a modified ordinary `[No Name]`
+                // buffer we're allowed to persist (`'workspacepersistunnamed'`): then we
+                // capture its lines instead of a path. Non-ordinary buffers (terminals,
+                // views, images — `read_only`) are never captured this way.
+                let unnamed_contents = if path.is_empty() {
+                    let buf = &self.buffers.get(w.buffer).buffer;
+                    if !allow_unnamed || buf.read_only() || !buf.modified {
+                        return None;
+                    }
+                    Some(buf.lines())
+                } else {
+                    None
+                };
                 let (line, col, top) = if live == Some(*wid) {
                     (self.cursor.line, self.cursor.col, self.top)
                 } else {
@@ -474,6 +511,7 @@ impl Editor {
                     top,
                     active: active == Some(*wid),
                     loclist,
+                    unnamed_contents,
                 }))
             }
             LayoutNode::Split {
@@ -484,9 +522,14 @@ impl Editor {
                 let mut kids = Vec::new();
                 let mut kept_sizes = Vec::new();
                 for (i, child) in children.iter().enumerate() {
-                    if let Some(sl) =
-                        self.capture_layout(child, tree, live, active, relative_splits)
-                    {
+                    if let Some(sl) = self.capture_layout(
+                        child,
+                        tree,
+                        live,
+                        active,
+                        relative_splits,
+                        allow_unnamed,
+                    ) {
                         kids.push(sl);
                         kept_sizes.push(sizes.get(i).copied().unwrap_or(1));
                     }
@@ -609,6 +652,24 @@ impl Editor {
         }
     }
 
+    /// Resolve a leaf's buffer on restore: reopen its file (`path` set), or — for a
+    /// persisted **unnamed** `[No Name]` buffer (`unnamed_contents`) — create a fresh
+    /// buffer, load the saved lines, and mark it modified so it round-trips on the next
+    /// exit (its content is unsaved, exactly as it was). `None` when a file no longer
+    /// opens or a pathless leaf carries no contents.
+    fn build_leaf_buffer(&mut self, w: &SessionWindow) -> Option<crate::BufferId> {
+        if !w.path.as_os_str().is_empty() {
+            return self.open_buffer(&w.path);
+        }
+        let lines = w.unnamed_contents.as_ref()?;
+        let id = self.create_buffer();
+        self.load_str_into(id, None, &lines.join("\n"));
+        // `load_str_into` marks the replica clean; a restored `[No Name]` is unsaved by
+        // definition, so flag it modified (keeps `:qa` honest and round-trips capture).
+        self.buffers.get_mut(id).buffer.modified = true;
+        Some(id)
+    }
+
     /// Recursively realise a [`SessionLayout`] into a window map + a [`LayoutNode`]
     /// skeleton: open each leaf's file (minting a fresh window id), drop leaves whose
     /// file is gone, and collapse a split left with one child. `None` if nothing opens.
@@ -621,7 +682,7 @@ impl Editor {
         use super::windows::{LayoutNode, WindowTree};
         match layout {
             SessionLayout::Leaf(w) => {
-                let buf = self.open_buffer(&w.path)?;
+                let buf = self.build_leaf_buffer(w)?;
                 let id = self.alloc_window_id();
                 let cursor = Cursor {
                     line: w.line,

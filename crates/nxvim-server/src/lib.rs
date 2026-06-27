@@ -2232,7 +2232,7 @@ impl EditHost {
         snap.exit_cursor = None;
         // Capture the layout only for a namespaced launch whose plugin opted in via
         // `nx.shada.save_layout(true)` — default off, so a plain session never does.
-        if self.workspace_session && self.lua.session_save_layout() {
+        if self.session_captures_layout() {
             snap.session = self.editor.export_session();
         }
         // Fold in the opt-in plugin shada (it lives in the runtime, not the editor).
@@ -2272,7 +2272,7 @@ impl EditHost {
     /// one's checkpoint. Best-effort; we're leaving.
     pub(crate) fn shada_flush_final(&mut self) {
         let mut snap = self.editor.export_persist();
-        if self.workspace_session && self.lua.session_save_layout() {
+        if self.session_captures_layout() {
             snap.session = self.editor.export_session();
         }
         snap.plugin_data = tuples_to_plugin_shada(self.lua.plugin_shada_export());

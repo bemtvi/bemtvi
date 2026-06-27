@@ -100,6 +100,7 @@ impl Editor {
                     | "relativesplits"
                     | "relativedocks"
                     | "equalalways"
+                    | "workspacepersistunnamed"
             ) {
                 let cur = matches!(
                     self.options.get_scalar(canon),

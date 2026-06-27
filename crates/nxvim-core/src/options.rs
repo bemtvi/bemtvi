@@ -202,6 +202,14 @@ pub struct Options {
     /// classic carve-from-one-neighbor sizing and only rebalance on an explicit
     /// `<C-w>=`. Honored by [`crate::editor::windows`].
     pub equalalways: bool,
+    /// Whether a saved workspace session persists **unnamed** (`[No Name]`) buffers —
+    /// the ordinary, pathless buffers you typed into but never wrote to a file —
+    /// together with their contents, restoring them on the next launch
+    /// (`'workspacepersistunnamed'`; nxvim-native, default `true`). Only *modified*
+    /// unnamed buffers are saved; a pristine startup `[No Name]` is not. Read at session
+    /// capture by [`crate::editor::persist`]. Plugin-owned surfaces (terminals, file
+    /// trees, `nx.view` widgets) are non-ordinary buffers and are never captured this way.
+    pub workspace_persist_unnamed: bool,
 }
 
 /// A scalar value for one **global** option, the value type the per-workspace option
@@ -249,6 +257,7 @@ impl Options {
             ("relativesplits", Bool(b)) => self.relative_splits = *b,
             ("relativedocks", Bool(b)) => self.relative_docks = *b,
             ("equalalways", Bool(b)) => self.equalalways = *b,
+            ("workspacepersistunnamed", Bool(b)) => self.workspace_persist_unnamed = *b,
             ("showtabline", Num(n)) => self.showtabline = *n as u8,
             ("laststatus", Num(n)) => self.laststatus = *n as u8,
             ("mousetime", Num(n)) => self.mousetime = *n as usize,
@@ -295,6 +304,7 @@ impl Options {
             "relativesplits" => Bool(self.relative_splits),
             "relativedocks" => Bool(self.relative_docks),
             "equalalways" => Bool(self.equalalways),
+            "workspacepersistunnamed" => Bool(self.workspace_persist_unnamed),
             "showtabline" => Num(self.showtabline as i64),
             "laststatus" => Num(self.laststatus as i64),
             "mousetime" => Num(self.mousetime as i64),
@@ -458,6 +468,8 @@ impl Default for Options {
             relative_docks: false,
             // vim's default: opening/closing a window keeps the layout balanced.
             equalalways: true,
+            // Keep modified `[No Name]` buffers across a workspace session by default.
+            workspace_persist_unnamed: true,
         }
     }
 }
@@ -1792,6 +1804,13 @@ static OPTIONS: &[OptionInfo] = {
             kind: Bool,
             scope: Global,
             doc: "Opening/closing a window re-equalizes all windows to even sizes.",
+        },
+        OptionInfo {
+            name: "workspacepersistunnamed",
+            abbrev: None,
+            kind: Bool,
+            scope: Global,
+            doc: "Persist modified [No Name] buffers (with contents) in a workspace session.",
         },
     ]
 };

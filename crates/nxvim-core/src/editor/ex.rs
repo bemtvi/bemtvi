@@ -1803,12 +1803,13 @@ impl Editor {
             self.should_quit = true;
             return;
         }
-        if self.buffer().modified {
+        let cur = self.current_buffer_id();
+        if self.buffer().modified && !self.quit_safe_unnamed(cur) {
             // Already showing the offending buffer.
             self.echo("E37: No write since last change (add ! to override)");
             return;
         }
-        match self.first_modified_buffer() {
+        match self.first_blocking_modified_buffer() {
             Some(id) => {
                 // Surface the blocking buffer *in its own layer* — buffers are
                 // scoped per layer, so a dock's modified buffer must reappear in
@@ -1830,13 +1831,32 @@ impl Editor {
         }
     }
 
-    /// The lowest-numbered buffer with unsaved changes, if any.
-    fn first_modified_buffer(&self) -> Option<BufferId> {
+    /// The lowest-numbered buffer whose unsaved changes would actually be **lost** on
+    /// quit — modified, and not a [`quit_safe_unnamed`](Self::quit_safe_unnamed) buffer
+    /// the workspace session is about to persist. `None` when nothing blocks the quit.
+    fn first_blocking_modified_buffer(&self) -> Option<BufferId> {
         self.buffers
             .map
             .iter()
-            .find(|(_, ob)| ob.buffer.modified)
+            .filter(|(_, ob)| ob.buffer.modified)
             .map(|(id, _)| *id)
+            .find(|id| !self.quit_safe_unnamed(*id))
+    }
+
+    /// Whether buffer `id`'s unsaved changes will be **persisted** by the workspace
+    /// session on exit, so `:qa` needn't block (`E37`) on it: a modified, ordinary,
+    /// **unnamed** (`[No Name]`) buffer that is shown in a main window (so
+    /// [`Editor::export_session`] captures it), with `'workspacepersistunnamed'` on in a
+    /// layout-capturing session. A *hidden* modified `[No Name]` isn't captured, so it
+    /// still blocks — its content really would be lost.
+    fn quit_safe_unnamed(&self, id: BufferId) -> bool {
+        if !self.options.workspace_persist_unnamed || !self.session_captures_layout {
+            return false;
+        }
+        let Some(ob) = self.buffers.map.get(&id) else {
+            return false;
+        };
+        ob.buffer.path.is_none() && !ob.buffer.read_only() && self.window_showing(id).is_some()
     }
 
     /// `nx.open(path, { where })` — open `path` (a file or directory) in the editing

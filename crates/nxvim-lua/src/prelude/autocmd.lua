@@ -75,8 +75,15 @@ end
 -- register a global `:Name`. `command` is a function or an ex-command string.
 -- `opts.desc` (a one-line summary) is stored alongside the body — get() surfaces it
 -- and the command-line completion catalog shows it as the command's docs.
--- `opts.complete` (`"dir"` / `"file"`) makes `<Tab>` in the command's argument offer
--- path completion (via the same picker the built-in `:cd` / `:edit` use).
+-- `opts.complete` makes `<Tab>` in the command's argument offer completion:
+--   * `"dir"` / `"file"` — path completion via the picker the built-in `:cd`/`:edit` use;
+--   * a function `fn(args)` — generate candidates dynamically. `args` is the list of
+--     whitespace-separated argument words typed so far, the last being the partial word
+--     under the cursor (`:Cmd <Tab>` → `{}`, `:Cmd a<Tab>` → `{"a"}`, `:Cmd a b<Tab>` →
+--     `{"a","b"}`). It returns a list of candidates — each a string, or a table
+--     `{ label =, insert =, doc = }`. A SYNC function (returns a list) shows inline in
+--     the wildmenu and is re-run as you type; an ASYNC one (returns a promise, e.g. an
+--     `nx.async` function) lists in the picker. A throw / rejection yields no candidates.
 function nx.user_command.create(name, command, opts)
   nx._user_commands[name] = command
   nx._user_command_desc[name] = type(opts) == "table" and opts.desc or nil

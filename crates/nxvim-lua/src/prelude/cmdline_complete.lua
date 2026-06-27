@@ -344,6 +344,12 @@ end
 -- argument token (`nx._cmdline_set_arg`) — the user runs the filled line with <CR>.
 local pending = nil
 
+-- The pending promise for an *async* function completer (a user command's
+-- `complete = function(args)` that returned a promise), read by the
+-- `cmdline_complete_fn` picker source. Only one cmdline picker is open at a time, so a
+-- single module-level handoff slot is enough (the same pattern as `pending`).
+local pending_fn = nil
+
 -- Split a typed path token into `(base, leaf)`: `base` is everything up to and
 -- including the last "/" (kept verbatim so the spliced command stays in the user's
 -- relative/absolute/`~` style), `leaf` is the partial name after it. No "/" ⇒ the
@@ -493,6 +499,77 @@ nx.picker.source({
   end,
 })
 
+-- Normalize one candidate from a function completer's returned list to the shared
+-- `{ label, insert, doc }` shape. A bare string is both the shown label and the
+-- inserted text; a table may set `label` (shown), `insert` (pasted, defaults to the
+-- label/text), and `doc` (the wildmenu docs float). Anything else is dropped.
+local function normalize_candidate(c)
+  if type(c) == "string" then
+    return { label = c, insert = c }
+  elseif type(c) == "table" then
+    local insert = c.insert or c.label or c.text or ""
+    return { label = c.label or c.text or insert, insert = insert, doc = c.doc }
+  end
+  return nil
+end
+
+local function normalize_candidates(list)
+  local out = {}
+  for _, c in ipairs(list or {}) do
+    local n = normalize_candidate(c)
+    if n then
+      out[#out + 1] = n
+    end
+  end
+  return out
+end
+
+-- The picker source for an ASYNC function completer: it awaits the promise the
+-- completer returned (captured in `pending_fn`) and pushes its candidates. A sync
+-- function completer never reaches here — it returns its list straight to the inline
+-- wildmenu (see `nx._cmdline_complete_run`); only a promise-returning one routes
+-- through the picker, since the wildmenu path is synchronous. Confirm pastes the
+-- chosen value into the still-open command line's argument token.
+nx.picker.source({
+  name = "cmdline_complete_fn",
+  resumable = false, -- transient: confirm pastes into the open cmdline
+  multiselect = false, -- a single value is chosen
+  items = nx.async(function(ctx)
+    local spec = pending_fn
+    if not spec or not spec.promise then
+      return
+    end
+    -- Await the completer's promise; a rejection propagates and the picker reports it.
+    local cands = nx.await(spec.promise)
+    for _, c in ipairs(cands or {}) do
+      local n = normalize_candidate(c)
+      if n then
+        ctx.push({ text = n.label, insert = n.insert })
+      end
+    end
+  end),
+  confirm = function(item)
+    nx._cmdline_set_arg(item.insert or item.text)
+  end,
+})
+
+-- The whitespace-separated argument words typed before the cursor (the command name
+-- dropped), the last of which is the partial word being completed. This is what a
+-- function completer receives: `:Cmd<Tab>`/`:Cmd <Tab>` → `{}`, `:Cmd a<Tab>` →
+-- `{ "a" }`, `:Cmd a b<Tab>` → `{ "a", "b" }`.
+local function arg_list(before)
+  local args = {}
+  local first = true
+  for word in before:gmatch("%S+") do
+    if first then
+      first = false -- drop the command name itself
+    else
+      args[#args + 1] = word
+    end
+  end
+  return args
+end
+
 -- nx._cmdline_complete_run(line, col): the candidate source the server calls
 -- synchronously per `<Tab>` (and each edit while the wildmenu is open). It returns
 -- the candidate list — a `{ {label, insert[, doc]}, ... }` array — and core
@@ -523,12 +600,27 @@ local function launch_path_picker(before, dirs_only)
 end
 
 -- The argument completer a user command declared via `create(... { complete = })`
--- (a buffer-local command shadows a global of the same name) — `"dir"` / `"file"`,
--- or nil. Lets a registered command (e.g. the GUI's `:workspace`) get the same path
--- completion the built-in `:cd` / `:edit` get.
+-- (a buffer-local command shadows a global of the same name) — `"dir"` / `"file"`, a
+-- function `fn(args)`, or nil. Lets a registered command (e.g. the GUI's `:workspace`)
+-- get the same path completion the built-in `:cd` / `:edit` get, or generate its own.
 local function user_command_complete(cmd)
   local rec = nx.user_command.buf_get(0)[cmd] or nx.user_command.get()[cmd]
   return rec and rec.complete or nil
+end
+
+-- Whether `v` is a thenable (a promise) — what an *async* completer returns.
+local function is_promise(v)
+  return type(v) == "table" and type(v.next) == "function"
+end
+
+-- Launch the picker for an async function completer: it awaits `promise` (the value
+-- the completer returned) and lists its candidates, seeded/filtered by the partial
+-- argument word. Returns the `{ __picker }` sentinel like the path picker.
+local function launch_fn_picker(before, cmd, promise)
+  local prefix = before:match("(%S*)$") or ""
+  pending_fn = { promise = promise }
+  nx.picker.open("cmdline_complete_fn", { query = prefix, title = ":" .. cmd })
+  return { __picker = true }
 end
 
 function nx._cmdline_complete_run(line, col)
@@ -544,10 +636,27 @@ function nx._cmdline_complete_run(line, col)
     if cmd and (FILE_COMMANDS[cmd] or DIR_COMMANDS[cmd]) then
       return launch_path_picker(before, DIR_COMMANDS[cmd] == true)
     end
-    -- A user command that declared a `dir`/`file` argument completer.
+    -- A user command's declared argument completer: `"dir"`/`"file"` reuse the path
+    -- picker; a function generates candidates from the args typed so far.
     local uc = cmd and user_command_complete(cmd)
     if uc == "dir" or uc == "file" then
       return launch_path_picker(before, uc == "dir")
+    end
+    if type(uc) == "function" then
+      -- Call the completer with the args so far. A throw yields no candidates rather
+      -- than breaking the command line. A SYNC completer returns its list straight to
+      -- the inline wildmenu (core fuzzy-ranks it against the partial word, and re-runs
+      -- this per keystroke so it tracks the growing args); an ASYNC one returns a
+      -- promise, which can't be awaited synchronously here, so it routes through the
+      -- picker instead.
+      local ok, result = pcall(uc, arg_list(before))
+      if not ok then
+        return {}
+      end
+      if is_promise(result) then
+        return launch_fn_picker(before, cmd, result)
+      end
+      return normalize_candidates(result)
     end
     return {} -- no argument completer for this command yet
   end

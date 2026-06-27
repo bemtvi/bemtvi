@@ -1223,6 +1223,70 @@ async fn user_command_complete_file_lists_files() {
 }
 
 #[tokio::test]
+async fn user_command_complete_fn_sync_lists_inline() {
+    let dir = temp_dir("cmdcomplete_fn_sync");
+    // A SYNC function completer returns a candidate list shown inline in the wildmenu
+    // (core fuzzy-ranks it against the partial word).
+    let init = "nx.cmdline_complete.setup {}\n\
+        nx.user_command.create('Sub', function() end, { complete = function(_args) \
+          return { 'add', 'remove', 'list' } end })";
+    let (rpc, mut incoming) = start(&dir, init).await;
+
+    feed(&rpc, ":Sub <Tab>");
+    let map = poll_menu(&rpc, &mut incoming)
+        .await
+        .expect("an inline wildmenu from the sync completer");
+    let items = menu_items(&map);
+    for want in ["add", "remove", "list"] {
+        assert!(items.contains(&want.to_string()), "items: {items:?}");
+    }
+}
+
+#[tokio::test]
+async fn user_command_complete_fn_receives_args_so_far() {
+    let dir = temp_dir("cmdcomplete_fn_args");
+    // The completer branches on the args typed so far: after `Sub add `, it returns the
+    // add-specific candidates — proving `args` carries the prior words.
+    let init = "nx.cmdline_complete.setup {}\n\
+        nx.user_command.create('Sub', function() end, { complete = function(args) \
+          if #args >= 1 and args[1] == 'add' then return { 'apple', 'apricot' } end \
+          return { 'add', 'remove' } end })";
+    let (rpc, mut incoming) = start(&dir, init).await;
+
+    feed(&rpc, ":Sub add <Tab>");
+    let map = poll_menu(&rpc, &mut incoming)
+        .await
+        .expect("the add-specific menu");
+    let items = menu_items(&map);
+    assert!(
+        items.contains(&"apple".to_string()) && items.contains(&"apricot".to_string()),
+        "completer should have seen args = {{'add'}}; items: {items:?}"
+    );
+    assert!(
+        !items.contains(&"remove".to_string()),
+        "top-level candidates must not leak into the add context; items: {items:?}"
+    );
+}
+
+#[tokio::test]
+async fn user_command_complete_fn_async_uses_picker() {
+    let dir = temp_dir("cmdcomplete_fn_async");
+    // An ASYNC completer (returns a promise — here an `nx.async` function) can't feed the
+    // synchronous wildmenu, so it lists in the picker instead.
+    let init = "nx.cmdline_complete.setup {}\n\
+        nx.user_command.create('ASub', function() end, \
+        { complete = nx.async(function(_args) return { 'alpha', 'beta' } end) })";
+    let (rpc, mut incoming) = start(&dir, init).await;
+
+    feed(&rpc, ":ASub <Tab>");
+    poll_menu_items_eq(&rpc, &mut incoming, &["alpha", "beta"]).await;
+    let map = poll_menu(&rpc, &mut incoming)
+        .await
+        .expect("a picker frame");
+    assert_eq!(menu_title(&map).as_deref(), Some(":ASub"));
+}
+
+#[tokio::test]
 async fn select_directory_row_pastes_the_directory_itself() {
     let dir = temp_dir("cmdcomplete_seldir");
     let tree = dir.join("tree");

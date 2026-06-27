@@ -302,6 +302,9 @@ pub struct MenuView {
     /// and caches the docs for the sidebar. `None` for an inline-doc / `buffer` /
     /// `lsp` / noselect row. Only meaningful when [`docs`](Self::docs). Phase 4-E.
     pub selected_resolve: Option<u64>,
+    /// The picker box's optional title (`nx.picker.open(name, { title = … })`),
+    /// rendered on the top border. `None` for the wildmenu / completion / select.
+    pub title: Option<String>,
 }
 
 /// A rectangle in screen cells, relative to the **windows area** (the region the

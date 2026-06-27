@@ -375,6 +375,14 @@ pub(crate) struct Menu {
     /// re-ranking. Empty for `select` / completion (only a picker marks). The picker's
     /// `send_to_loclist` sends these when non-empty, else the whole filtered view.
     marked: Vec<usize>,
+    /// An optional title rendered on the picker box's top border
+    /// (`nx.picker.open(name, { title = … })`). `None` ⇒ no title. Only a picker
+    /// sets it; the wildmenu / completion / select menus leave it `None`.
+    title: Option<String>,
+    /// Whether `<Tab>` multi-selects (marks) rows (`nx.picker.open{ multiselect }`,
+    /// default `true`). `false` makes `toggle_select` a no-op — a single-choice
+    /// picker (e.g. the cmdline file completer) where marking makes no sense.
+    multiselect: bool,
 }
 
 impl Menu {
@@ -578,18 +586,23 @@ impl Editor {
             height: None,
             align: None,
             margin: Margin::default(),
+            title: None,
+            multiselect: false,
         };
         menu.refilter();
         self.menu = Some(menu);
     }
 
     /// Open a fuzzy picker (`nx.picker`): a centered float with a prompt that grabs
-    /// input. Starts empty — the source streams candidates in via
-    /// [`Editor::menu_push`]. `dynamic` selects forward-the-query (live grep) over
-    /// local fuzzy matching. `width` / `height` fix the box size ([`Extent`],
-    /// `None` ⇒ the picker default) — never content-derived. `align` / `margin`
-    /// place the box within the editor area (`None` align ⇒ centered). The server
-    /// invokes the source's initial run after opening (query `""`, generation `0`).
+    /// input. The source streams candidates in via [`Editor::menu_push`].
+    /// `dynamic` selects forward-the-query (live grep) over local fuzzy matching.
+    /// `width` / `height` fix the box size ([`Extent`], `None` ⇒ the picker
+    /// default) — never content-derived. `align` / `margin` place the box within
+    /// the editor area (`None` align ⇒ centered). `query` pre-fills the prompt
+    /// (`nx.picker.open(name, { query = … })`) with the caret at its end, so the
+    /// list opens already filtered against it; empty ⇒ the historical empty-prompt
+    /// open. The server invokes the source's initial run after opening with this
+    /// `query` (generation `0`).
     #[allow(clippy::too_many_arguments)]
     pub fn open_picker(
         &mut self,
@@ -601,18 +614,32 @@ impl Editor {
         align: Option<Align>,
         margin: Margin,
         prompt_pos: PromptPos,
+        query: &str,
+        title: Option<String>,
+        multiselect: bool,
     ) {
+        let prompt = Prompt {
+            col: query.len(),
+            query: query.to_string(),
+        };
+        // A non-empty seed on a STATIC source opens in *filtered* mode (an empty
+        // ranked view), so the items the source streams in are matched against the
+        // seed as they arrive (`extend_view` is a no-op in passthrough). A DYNAMIC
+        // source bypasses the matcher — it filters itself from `ctx.query` (which is
+        // seeded too) — so it must stay in passthrough or its own rows would be
+        // re-ranked away. An empty seed always stays in passthrough.
+        let filtered = (!query.is_empty() && !dynamic).then(Vec::new);
         self.menu = Some(Menu {
             kind: MenuKind::Picker,
             anchor: 0,
             anchor_width: 0,
             all_items: Vec::new(),
-            filtered: None,
+            filtered,
             match_spans: Vec::new(),
             cursor: 0,
             selected_active: true,
             placement,
-            prompt: Some(Prompt::default()),
+            prompt: Some(prompt),
             complete_prefix: String::new(),
             prompt_pos,
             dynamic,
@@ -626,6 +653,8 @@ impl Editor {
             height,
             align,
             margin,
+            title,
+            multiselect,
         });
     }
 
@@ -697,6 +726,8 @@ impl Editor {
             height: None,
             align: None,
             margin: Margin::default(),
+            title: None,
+            multiselect: false,
         });
     }
 
@@ -865,6 +896,18 @@ impl Editor {
         self.menu.as_ref().map(|m| m.kind)
     }
 
+    /// The open **command-line** wildmenu's anchor — the byte offset in
+    /// [`Editor::cmdline`] where the token it is completing starts. `None` when no
+    /// cmdline menu is open. Used by [`cmdline_complete_refresh`](Self::cmdline_complete_refresh)
+    /// to tell a same-token narrowing edit from one that moved past the token (a new
+    /// token, which must not auto-open a fresh completion).
+    pub(crate) fn cmdline_menu_anchor(&self) -> Option<usize> {
+        self.menu
+            .as_ref()
+            .filter(|m| m.kind == MenuKind::Cmdline)
+            .map(|m| m.anchor)
+    }
+
     /// Whether the open menu **grabs all input** (`Select` / `Picker`) — the
     /// signal [`key_context`](Self::key_context) reads to route every key through
     /// the menu's own keymap bucket. A `Complete` menu does not: it floats over the
@@ -963,6 +1006,8 @@ impl Editor {
             height: None,
             align: None,
             margin: Margin::default(),
+            title: None,
+            multiselect: false,
         });
     }
 
@@ -1199,7 +1244,9 @@ impl Editor {
             // query edits / re-ranking. `clear_select` drops all marks.
             "toggle_select" => {
                 if let Some(m) = self.menu.as_mut() {
-                    if m.cursor < m.view_len() {
+                    // A single-choice picker (`multiselect = false`, e.g. the cmdline
+                    // file completer) ignores the mark gesture entirely.
+                    if m.multiselect && m.cursor < m.view_len() {
                         let key = m.all_items[m.item_at(m.cursor)].key;
                         if let Some(pos) = m.marked.iter().position(|&k| k == key) {
                             m.marked.remove(pos);
@@ -1416,6 +1463,7 @@ impl Editor {
                 selected_source_accept: sel.is_some_and(|i| i.source_accept),
                 selected_doc: sel.and_then(|i| i.doc.clone()),
                 selected_resolve: sel.and_then(|i| i.resolve),
+                title: m.title.clone(),
             }
         })
     }

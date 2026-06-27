@@ -201,6 +201,110 @@ async fn static_source_streams_then_fuzzy_filters_without_touching_the_buffer() 
     );
 }
 
+#[tokio::test]
+async fn open_with_an_initial_query_opens_already_filtered() {
+    // `nx.picker.open(name, { query = "ap" })` pre-fills the prompt and kicks the
+    // gen-0 run with that query, so the picker opens already narrowed (the seam the
+    // cmdline file picker rides — `:e src/ed<Tab>` carries `src/ed` into the box)
+    // with the caret parked at the end of the seed.
+    let dir = temp_dir("picker_seeded_query");
+    let (rpc, mut incoming) = start(&dir, STATIC_SRC).await;
+
+    exec_lua(&rpc, "nx.picker.open('fruits', { query = 'ap' })").await;
+    let menu = menu_of(&poll_menu(&rpc, &mut incoming).await.expect("menu opens"));
+
+    assert_eq!(
+        menu_items(&menu),
+        vec!["apple", "apricot"],
+        "the seeded query filters the very first frame"
+    );
+    assert_eq!(
+        map_get(&menu, "query").and_then(Value::as_str),
+        Some("ap"),
+        "the prompt shows the seed"
+    );
+    assert_eq!(
+        map_get(&menu, "query_cursor").and_then(Value::as_u64),
+        Some(2),
+        "the caret parks at the end of the seed so typing appends"
+    );
+
+    // Backspacing the seed widens the list — the seed is ordinary prompt text.
+    feed(&rpc, "<BS>");
+    let menu = menu_of(&poll_menu(&rpc, &mut incoming).await.expect("widened"));
+    assert_eq!(menu_items(&menu), vec!["apple", "apricot", "banana"]);
+}
+
+#[tokio::test]
+async fn open_with_a_title_projects_it_on_the_box() {
+    // `nx.picker.open(name, { title = … })` puts a title on the picker box's top
+    // border; it crosses the wire on the `menu` map for the clients to render.
+    let dir = temp_dir("picker_title");
+    let (rpc, mut incoming) = start(&dir, STATIC_SRC).await;
+
+    exec_lua(&rpc, "nx.picker.open('fruits', { title = 'Pick a fruit' })").await;
+    let menu = menu_of(&poll_menu(&rpc, &mut incoming).await.expect("menu opens"));
+    assert_eq!(
+        map_get(&menu, "title").and_then(Value::as_str),
+        Some("Pick a fruit"),
+        "the picker projects its box title"
+    );
+
+    // A title-less open carries no title key (so the clients draw a plain border).
+    exec_lua(&rpc, "nx.picker.open('fruits')").await;
+    let menu = menu_of(&poll_menu(&rpc, &mut incoming).await.expect("menu reopens"));
+    assert_eq!(map_get(&menu, "title"), None, "no title key when unset");
+}
+
+#[tokio::test]
+async fn built_in_sources_carry_titles() {
+    // The shipped sources name themselves on the box (telescope-style).
+    let dir = temp_dir("picker_builtin_titles");
+    let (rpc, _incoming) = start(&dir, "-- defaults only").await;
+    let titles = exec_lua(
+        &rpc,
+        "local s = nx.picker._sources\n\
+         return (s.files.title or '?') .. '|' .. (s.live_grep.title or '?')\n\
+           .. '|' .. (s.buffers.title or '?')",
+    )
+    .await;
+    assert_eq!(
+        titles.as_str(),
+        Some("Find Files|Live Grep|Buffers"),
+        "the built-in pickers are titled"
+    );
+}
+
+#[tokio::test]
+async fn multiselect_false_disables_tab_marking() {
+    // `nx.picker.open(name, { multiselect = false })` makes `<Tab>` a no-op — a
+    // single-choice picker (the cmdline file completer rides this).
+    let dir = temp_dir("picker_multiselect_off");
+    let (rpc, mut incoming) = start(&dir, STATIC_SRC).await;
+
+    exec_lua(&rpc, "nx.picker.open('fruits', { multiselect = false })").await;
+    poll_menu(&rpc, &mut incoming).await.expect("menu opens");
+    feed(&rpc, "<Tab>");
+    let menu = menu_of(&poll_menu(&rpc, &mut incoming).await.expect("after <Tab>"));
+    assert!(
+        menu_marked(&menu).iter().all(|&m| !m),
+        "no row is marked when multiselect is off: {:?}",
+        menu_marked(&menu)
+    );
+
+    // The default (multiselect on) still marks — proving the flag is what changed it.
+    exec_lua(&rpc, "nx.picker.open('fruits')").await;
+    poll_menu(&rpc, &mut incoming).await.expect("reopens");
+    feed(&rpc, "<Tab>");
+    let menu = poll_menu(&rpc, &mut incoming).await.expect("after <Tab>");
+    let menu = menu_of(&menu);
+    assert!(
+        menu_marked(&menu).iter().any(|&m| m),
+        "the default picker marks on <Tab>: {:?}",
+        menu_marked(&menu)
+    );
+}
+
 /// A picker is an EDITOR-LEVEL overlay: its box is sized and centered over the
 /// WHOLE editor, not the focused window. With a vertical split the focused pane is
 /// only ~half the width, yet the picker must keep its full-editor width and be

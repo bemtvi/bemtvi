@@ -365,6 +365,12 @@ impl EditHost {
         for cmd in self.lua.take_commands() {
             self.editor.command(&cmd);
         }
+        // `nx._cmdline_set_arg(path)`: the file picker confirm pasting a chosen path
+        // into the still-open command line's argument token (no execute — the user
+        // runs the filled line with `<CR>`).
+        for path in self.lua.take_cmdline_set_args() {
+            self.editor.cmdline_replace_arg(&path);
+        }
         // Each captured `print` / `nvim_echo` line becomes a message: the last
         // is shown on the message line, and every line lands in `:messages`. Error
         // writers (`nx.err_write*`) route through `echo_err` so they paint red.
@@ -834,15 +840,22 @@ impl EditHost {
                 } else {
                     nxvim_core::PromptPos::Top
                 },
+                &req.query,
+                req.title.clone(),
+                req.multiselect,
             );
             self.pending_ui_select = None;
             self.picker_active = true;
-            // Kick the source's initial run (generation 0, empty query) through the
-            // same `picker_query_changes` channel a dynamic query edit uses, rather
-            // than running it inline here: the settle fixpoint drains that channel
-            // and re-runs `apply_lua_effects` after, so the `nx.run_stream` the source
-            // queues (already past this pass's `take_loop_ops`) actually starts.
-            self.editor.picker_query_changes.push((0, String::new()));
+            // Kick the source's initial run (generation 0) through the same
+            // `picker_query_changes` channel a dynamic query edit uses, rather than
+            // running it inline here: the settle fixpoint drains that channel and
+            // re-runs `apply_lua_effects` after, so the `nx.run_stream` the source
+            // queues (already past this pass's `take_loop_ops`) actually starts. The
+            // initial query is the seed (`nx.picker.open{ query = … }`), so a seeded
+            // picker opens already filtered; empty is the historical empty-prompt run.
+            self.editor
+                .picker_query_changes
+                .push((0, req.query.clone()));
         }
         // `nx.statusline.setup{}` / `reset()`: set the global or a window-local
         // status line (the latest for each target wins). A global / window-local
@@ -2871,7 +2884,7 @@ impl EditHost {
             if let Some(req) = self.editor.cmdline_complete_request.take() {
                 let docs = self.editor.cmdline_complete_docs();
                 match self.lua.run_cmdline_complete(&req.line, req.col) {
-                    Ok(cands) => {
+                    Ok(nxvim_lua::CmdlineComplete::Candidates(cands)) => {
                         let cands: Vec<(String, String, Option<String>)> = cands
                             .into_iter()
                             .map(|(label, insert, doc)| {
@@ -2886,6 +2899,14 @@ impl EditHost {
                             docs,
                         );
                     }
+                    // A file argument (`:e <Tab>`, …): the source launched the file
+                    // picker (queued in this pass's `take_picker_opens`, drained by
+                    // `apply_lua_effects` below). The command line stays OPEN underneath
+                    // — the picker grabs input while it lives (a `Picker` key context
+                    // wins over Command mode), and on confirm the source pastes the
+                    // chosen path into the argument token via `nx._cmdline_set_arg`,
+                    // leaving the line for the user to run with `<CR>` (no auto-execute).
+                    Ok(nxvim_lua::CmdlineComplete::PickerLaunched) => {}
                     Err(e) => self
                         .editor
                         .echo(format!("E5108: Error in nx.cmdline_complete source: {e}")),

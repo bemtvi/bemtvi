@@ -154,6 +154,12 @@ end
 --   * `align` + `margin` — placement, like a float (see nx.picker.source).
 --   * `preview` — "file" / "location" / nil (no pane).
 --   * `prompt_pos` — "top" (default) / "bottom".
+--   * `query` — initial prompt text: the picker opens already filtered against it
+--     (the gen-0 run uses it instead of ""), caret at its end. Default "".
+--   * `title` — a title centered on the box's top border (e.g. "Find Files"); nil
+--     ⇒ no title. The shipped sources set their own ("Find Files"/"Live Grep"/…).
+--   * `multiselect` — whether `<Tab>` marks rows for a batch action (default true);
+--     `false` is a single-choice picker (no marking).
 --   * `debounce` — ms before a `dynamic` source re-runs on a query edit; `0` off.
 --   * `layer` — where a confirmed item opens: "main" crosses back to the main editor
 --     area first (so a file picked while focused in a dock lands in the editor, not
@@ -211,7 +217,36 @@ function nx.picker.open(name, opts)
     prompt_pos = source.prompt_pos
   end
   local prompt_bottom = prompt_pos == "bottom"
-  -- The server opens the aligned widget and kicks the initial run (gen 0, "").
+  -- The initial prompt text: `nx.picker.open(name, { query = "src/ed" })` opens
+  -- the picker already filtered against `query` (the gen-0 run uses it instead of
+  -- ""), with the caret at its end so the user keeps typing. Defaults to "" — the
+  -- historical empty-prompt open.
+  local query = opts.query
+  if query == nil then
+    query = ""
+  end
+  if type(query) ~= "string" then
+    error("nx.picker.open: query must be a string", 2)
+  end
+  -- An optional title for the picker box's top border (`title = "Select file"`).
+  -- per-open overrides per-source; nil ⇒ no title.
+  local title = opts.title
+  if title == nil then
+    title = source.title
+  end
+  if title ~= nil and type(title) ~= "string" then
+    error("nx.picker.open: title must be a string", 2)
+  end
+  -- Whether `<Tab>` multi-selects (marks) rows; per-open overrides per-source,
+  -- default true. `false` is a single-choice picker (e.g. the cmdline file completer).
+  local multiselect = opts.multiselect
+  if multiselect == nil then
+    multiselect = source.multiselect
+  end
+  if multiselect == nil then
+    multiselect = true
+  end
+  -- The server opens the aligned widget and kicks the initial run (gen 0, query).
   nx._picker_open(
     source.dynamic == true,
     width,
@@ -219,7 +254,10 @@ function nx.picker.open(name, opts)
     align,
     margin,
     prompt_bottom,
-    preview ~= nil
+    preview ~= nil,
+    query,
+    title,
+    multiselect == true
   )
 end
 
@@ -505,6 +543,7 @@ end
 -- previous produced nothing.
 nx.picker.source({
   name = "files",
+  title = "Find Files",
   layer = "main", -- a picked file opens in the main editor, never a focused dock
   preview = "file", -- the preview pane shows the file's head
   items = nx.async(function(ctx)
@@ -560,6 +599,7 @@ nx.picker.source({
 -- nothing; the superseded job is reaped via ctx.on_cancel.
 nx.picker.source({
   name = "live_grep",
+  title = "Live Grep",
   layer = "main", -- a grep hit opens in the main editor, never a focused dock
   dynamic = true,
   preview = "location", -- scroll the pane to the match and range-highlight it
@@ -638,6 +678,7 @@ nx.picker.source({
 -- focused one.
 nx.picker.source({
   name = "buffers",
+  title = "Buffers",
   layer = "active", -- scoped to the focused layer, so a pick stays in that layer
   preview = "file", -- preview the buffer's backing file (named buffers only)
   items = function(ctx)

@@ -879,16 +879,330 @@ async fn set_arg_accept_rewrites_only_the_option_token() {
 }
 
 #[tokio::test]
-async fn non_set_command_args_open_no_menu() {
+async fn command_with_no_arg_completer_opens_no_menu() {
     let dir = temp_dir("cmdcomplete");
     let (rpc, mut incoming) = start(&dir, INIT).await;
 
-    // A command with no argument completer (`:edit <file>` is not wired yet) opens
-    // nothing in its argument region — the wildmenu only covers what has a source.
-    feed(&rpc, ":edit foo<Tab>");
+    // A command that is neither `:set`-family nor file/dir-taking has no argument
+    // completer, so its argument region opens nothing (the wildmenu only covers what
+    // has a source; file commands hand off to the picker instead — see below).
+    feed(&rpc, ":echo foo<Tab>");
     assert!(
         poll_no_menu(&rpc, &mut incoming).await.is_some(),
         "no menu for an un-completable argument"
+    );
+}
+
+/// Poll for the latest redraw whose `menu` map carries at least one item (the
+/// picker streams its rows in asynchronously after opening, so the first frame can
+/// be empty).
+async fn poll_menu_nonempty(rpc: &Rpc, incoming: &mut UnboundedReceiver<Incoming>) -> Vec<String> {
+    for _ in 0..80 {
+        if let Some(map) = poll_menu(rpc, incoming).await {
+            let items = menu_items(&map);
+            if !items.is_empty() {
+                return items;
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    panic!("picker never streamed any items");
+}
+
+/// Poll the picker until its visible rows equal `want` (the dynamic source re-lists
+/// on a query edit; old rows stay visible until the new listing returns, so wait for
+/// the specific set rather than the first non-empty frame).
+async fn poll_menu_items_eq(rpc: &Rpc, incoming: &mut UnboundedReceiver<Incoming>, want: &[&str]) {
+    let mut last = Vec::new();
+    for _ in 0..200 {
+        if let Some(map) = poll_menu(rpc, incoming).await {
+            last = menu_items(&map);
+            if last == want {
+                return;
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    panic!("picker rows never became {want:?}; last={last:?}");
+}
+
+/// Poll the redraw until the command line's text equals `want`, returning that
+/// frame. The picker confirm pastes the chosen path into the still-open command
+/// line on a later tick (`nx._cmdline_set_arg` → `cmdline_replace_arg`), so this
+/// waits for the line to fill — and the cmdline only renders in command mode, so a
+/// match also proves the line stayed open (no auto-execute).
+async fn poll_cmdline_eq(
+    rpc: &Rpc,
+    incoming: &mut UnboundedReceiver<Incoming>,
+    want: &str,
+) -> Vec<(Value, Value)> {
+    let mut last = None;
+    for _ in 0..200 {
+        barrier(rpc).await;
+        if let Some(map) = drain_to_latest_redraw(incoming, |m| cmdline_text(m).is_some()) {
+            last = cmdline_text(&map);
+            if last.as_deref() == Some(want) {
+                return map;
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    panic!("cmdline never became {want:?}; last={last:?}");
+}
+
+/// The picker box's title (`nx.picker.open{ title = … }`), projected on the `menu`.
+fn menu_title(map: &[(Value, Value)]) -> Option<String> {
+    let Some(Value::Map(menu)) = map_get(map, "menu") else {
+        return None;
+    };
+    map_get(menu, "title")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+}
+
+/// The preview pane's lines (the focused row's file head — or, for a directory, its
+/// listing), in order. Empty when there is no preview pane.
+fn menu_preview_lines(map: &[(Value, Value)]) -> Vec<String> {
+    let Some(Value::Map(menu)) = map_get(map, "menu") else {
+        return Vec::new();
+    };
+    let Some(Value::Map(pv)) = map_get(menu, "preview") else {
+        return Vec::new();
+    };
+    match map_get(pv, "lines") {
+        Some(Value::Array(a)) => a
+            .iter()
+            .map(|v| v.as_str().unwrap_or("").to_string())
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// Poll the picker until its preview pane's lines equal `want`.
+async fn poll_preview_eq(rpc: &Rpc, incoming: &mut UnboundedReceiver<Incoming>, want: &[&str]) {
+    let mut last = Vec::new();
+    for _ in 0..200 {
+        if let Some(map) = poll_menu(rpc, incoming).await {
+            last = menu_preview_lines(&map);
+            if last == want {
+                return;
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    panic!("preview lines never became {want:?}; last={last:?}");
+}
+
+#[tokio::test]
+async fn file_command_arg_pastes_the_chosen_path_into_the_open_cmdline() {
+    let dir = temp_dir("cmdcomplete_files");
+    // A known tree under a dedicated dir so the listing is deterministic.
+    let tree = dir.join("tree");
+    std::fs::create_dir_all(tree.join("sub")).unwrap();
+    std::fs::write(tree.join("alpha.txt"), "ALPHA\n").unwrap();
+    std::fs::write(tree.join("beta.txt"), "BETA\n").unwrap();
+    std::fs::write(tree.join("sub").join("nested.txt"), "NESTED\n").unwrap();
+
+    let (rpc, mut incoming) = start(&dir, INIT).await;
+    // Point the editor (and so the picker's `ctx.cwd`) at the tree.
+    rpc.request(
+        "nx_command",
+        vec![Value::from(format!("cd {}", tree.display()))],
+    )
+    .await
+    .expect("cd");
+    barrier(&rpc).await;
+
+    // `:e <Tab>` opens the file picker OVER the still-open command line, titled
+    // "Select file" and listing the cwd with directories first (same-level entries).
+    feed(&rpc, ":e <Tab>");
+    let items = poll_menu_nonempty(&rpc, &mut incoming).await;
+    assert_eq!(
+        items,
+        vec!["sub/", "alpha.txt", "beta.txt"],
+        "the picker lists the cwd, directories first"
+    );
+    let map = poll_menu(&rpc, &mut incoming).await.expect("a menu frame");
+    assert_eq!(
+        menu_title(&map).as_deref(),
+        Some("Select file"),
+        "the file picker is titled"
+    );
+
+    // Typing narrows it (the picker grabs the keys — the document is untouched).
+    feed(&rpc, "al");
+    poll_menu_items_eq(&rpc, &mut incoming, &["alpha.txt"]).await;
+
+    // Confirm PASTES the chosen path into the open `:e ` argument — it does NOT run
+    // the command. The line fills and stays open for the user to press <CR>.
+    feed(&rpc, "<CR>");
+    let map = poll_cmdline_eq(&rpc, &mut incoming, "e alpha.txt").await;
+    assert!(
+        command_mode(&map),
+        "the command line stays open after the paste (no auto-execute)"
+    );
+    // No file was opened — the buffer is still the empty startup buffer.
+    assert_eq!(lines(&rpc).await, vec![""], "confirm did not execute :e");
+}
+
+#[tokio::test]
+async fn picker_descends_dirs_previews_them_and_cd_lists_only_dirs() {
+    let dir = temp_dir("cmdcomplete_descend");
+    let tree = dir.join("tree");
+    std::fs::create_dir_all(tree.join("sub")).unwrap();
+    std::fs::write(tree.join("top.txt"), "TOP\n").unwrap();
+    std::fs::write(tree.join("sub").join("nested.txt"), "NESTED\n").unwrap();
+
+    let (rpc, mut incoming) = start(&dir, INIT).await;
+    rpc.request(
+        "nx_command",
+        vec![Value::from(format!("cd {}", tree.display()))],
+    )
+    .await
+    .expect("cd");
+    barrier(&rpc).await;
+
+    // `:cd <Tab>` lists ONLY directories (the dir-command branch), titled differently.
+    feed(&rpc, ":cd <Tab>");
+    let items = poll_menu_nonempty(&rpc, &mut incoming).await;
+    assert_eq!(items, vec!["sub/"], "a :cd argument lists directories only");
+    let map = poll_menu(&rpc, &mut incoming).await.expect("a menu frame");
+    assert_eq!(menu_title(&map).as_deref(), Some("Select directory"));
+
+    // One <Esc> closes the picker (the `:cd ` line stays open underneath); a second
+    // cancels the command line back to Normal so the next `:` starts fresh.
+    feed(&rpc, "<Esc>");
+    poll_no_menu(&rpc, &mut incoming).await;
+    feed(&rpc, "<Esc>");
+    poll_no_menu(&rpc, &mut incoming).await;
+
+    // `:e <Tab>` lists the cwd; the focused row is the directory `sub/`, so its
+    // preview pane shows the directory's CONTENTS (not a read error).
+    feed(&rpc, ":e <Tab>");
+    poll_menu_items_eq(&rpc, &mut incoming, &["sub/", "top.txt"]).await;
+    poll_preview_eq(&rpc, &mut incoming, &["nested.txt"]).await;
+
+    // Confirming the directory DESCENDS into it (the prompt becomes "sub/", the rows
+    // are its entries by bare name) — the command line stays open underneath. Inside a
+    // sub-directory the first row is the "<select directory>" action (use sub/ as-is).
+    feed(&rpc, "<CR>");
+    poll_menu_items_eq(&rpc, &mut incoming, &["<select directory>", "nested.txt"]).await;
+
+    // Move past the action to the nested file and confirm — its descended path is
+    // pasted into the command line.
+    feed(&rpc, "<C-n>");
+    feed(&rpc, "<CR>");
+    poll_cmdline_eq(&rpc, &mut incoming, "e sub/nested.txt").await;
+}
+
+#[tokio::test]
+async fn select_directory_row_pastes_the_directory_itself() {
+    let dir = temp_dir("cmdcomplete_seldir");
+    let tree = dir.join("tree");
+    std::fs::create_dir_all(tree.join("sub")).unwrap();
+    std::fs::write(tree.join("sub").join("nested.txt"), "N\n").unwrap();
+
+    let (rpc, mut incoming) = start(&dir, INIT).await;
+    rpc.request(
+        "nx_command",
+        vec![Value::from(format!("cd {}", tree.display()))],
+    )
+    .await
+    .expect("cd");
+    barrier(&rpc).await;
+
+    // Descend into sub/ (its first row is the "<select directory>" action).
+    feed(&rpc, ":e <Tab>");
+    poll_menu_items_eq(&rpc, &mut incoming, &["sub/"]).await;
+    feed(&rpc, "<CR>");
+    poll_menu_items_eq(&rpc, &mut incoming, &["<select directory>", "nested.txt"]).await;
+
+    // Confirming the first row (the action) uses the directory itself — `sub/` is
+    // pasted into the command line, not descended into further.
+    feed(&rpc, "<CR>");
+    poll_cmdline_eq(&rpc, &mut incoming, "e sub/").await;
+}
+
+#[tokio::test]
+async fn space_past_a_command_closes_the_wildmenu_and_does_not_auto_open_arg_completion() {
+    // The wildmenu only NARROWS the same token as you type; typing PAST the completed
+    // command into its argument (the space) must not auto-open a completion for the
+    // new token — neither the file picker (`:e`) nor the `:set` option list. The user
+    // re-opens with an explicit <Tab>. (Regression: the space used to launch the
+    // picker the moment the cursor entered the argument region.)
+    let dir = temp_dir("cmdcomplete_space");
+    let (rpc, mut incoming) = start(&dir, INIT).await;
+
+    // Open the command-name wildmenu and narrow it to `edit` (same-token edits).
+    feed(&rpc, ":e<Tab>");
+    poll_menu(&rpc, &mut incoming)
+        .await
+        .expect("the command menu opens");
+    feed(&rpc, "dit");
+    poll_menu(&rpc, &mut incoming)
+        .await
+        .expect("the menu narrows, still open");
+
+    // A space moves into the argument: the wildmenu closes and NOTHING auto-opens
+    // (`poll_no_menu` would see the picker's `menu` map if it had launched).
+    feed(&rpc, " ");
+    let map = poll_no_menu(&rpc, &mut incoming)
+        .await
+        .expect("a frame with no menu after the space");
+    assert!(command_mode(&map), "the command line stays open");
+    assert_eq!(
+        cmdline_text(&map).as_deref(),
+        Some("edit "),
+        "the space lands in the line; no completion was auto-triggered"
+    );
+
+    // The same space gives no menu for a `:set` argument either.
+    feed(&rpc, "<Esc><Esc>");
+    poll_no_menu(&rpc, &mut incoming).await;
+    feed(&rpc, ":set<Tab>");
+    poll_menu(&rpc, &mut incoming).await.expect("the :set menu");
+    feed(&rpc, " ");
+    let map = poll_no_menu(&rpc, &mut incoming)
+        .await
+        .expect("no option list auto-opens on the space");
+    assert_eq!(cmdline_text(&map).as_deref(), Some("set "));
+
+    // …but an explicit <Tab> in the argument region DOES open it (the option list).
+    feed(&rpc, "<Tab>");
+    let items = poll_menu(&rpc, &mut incoming)
+        .await
+        .map(|m| menu_items(&m))
+        .expect("explicit <Tab> opens the option list");
+    assert!(
+        items.contains(&"number".to_string()),
+        "the option completer ran on the explicit <Tab>: {items:?}"
+    );
+}
+
+/// The shipped `examples/cmdline-completion` config loads end-to-end (so it can't
+/// rot): the engine is on and the `cmdline_files` picker source the file-path
+/// completion hands off to is registered.
+#[tokio::test]
+async fn example_cmdline_completion_config_loads() {
+    let root =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/cmdline-completion");
+    let init = ServerInit {
+        config_dir: Some(root.clone()),
+        runtimepath: vec![root],
+        ..Default::default()
+    };
+    let (rpc, _incoming) = spawn(init);
+    attach(&rpc, 80, 24).await;
+    let ok = exec_lua(
+        &rpc,
+        "return tostring(type(nx._cmdline_complete_run))
+           .. '|' .. tostring(nx.picker._sources.cmdline_files ~= nil)",
+    )
+    .await;
+    assert_eq!(
+        ok.as_str(),
+        Some("function|true"),
+        "example loaded: completer + the cmdline_files picker source"
     );
 }
 

@@ -52,10 +52,32 @@
 --   <CR>               accept the highlighted option name into the line (you then
 --                      finish it, e.g. `:set tabstop=4`)
 --
+-- FILE-PATH COMPLETION — a fuzzy PICKER for file/dir arguments:
+--   :e <Tab>           open the nx.picker overlay OVER the still-open command line (a
+--                      centered fuzzy finder titled "Select file", with a preview
+--                      pane), listing the cwd with directories first — the SAME-LEVEL
+--                      entries ranked ahead of anything deeper. The `:` line stays
+--                      open underneath; the picker grabs the keys while it lives.
+--   :e src/ed<Tab>     the picker opens already seeded with `src/ed`, listing `src/`
+--                      filtered to `ed…`
+--   type in the picker narrow the listing; `/` descends into a directory (so does
+--                      confirming one — its preview shows the directory's contents)
+--   inside a directory a "<select directory>" row tops the list: pick it to use that
+--                      directory as the path (e.g. `:cd src/`) instead of descending
+--   <CR> on a file     PASTE the chosen path into the command line (it does NOT run
+--                      the command) — the line becomes e.g. `:e src/foo.rs`, and you
+--                      press <CR> again to actually open it (or keep editing / Tab)
+--   <Esc>              close the picker, leaving the command line as you left it (a
+--                      second <Esc> cancels the line)
+--   :split / :vsplit / :tabedit / :read / :source / :pedit / … hand off the same way
+--   :cd <Tab>          the dir-taking commands (`:cd` / `:lcd` / `:tcd`) list
+--                      directories only, titled "Select directory"
+--
 -- The completer dispatches on the command word: `:set`/`:setlocal` arguments
 -- complete option names (sourced from core's documented catalog — the same single
--- source of truth `:set` itself accepts, so the two can never drift); other
--- commands' arguments have no completer yet, so the wildmenu just stays closed.
+-- source of truth `:set` itself accepts, so the two can never drift); file/dir
+-- commands hand off to the picker (above); any other command's arguments have no
+-- completer yet, so the wildmenu just stays closed.
 
 -- Command-line completion is ON BY DEFAULT in the interactive editor, so this call
 -- is optional — it's here to TUNE the engine. A bare `setup {}` is the default

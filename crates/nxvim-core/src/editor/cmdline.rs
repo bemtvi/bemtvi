@@ -259,10 +259,11 @@ impl Editor {
 
     /// Abandon the open command line and return to normal mode. For a search
     /// prompt this also rewinds the cursor to where the search began, undoing any
-    /// incsearch preview hop (vim's `<Esc>`-cancels-search behavior). `pub(crate)`
-    /// so the dock-navigation path can close the line directly (the `cancel` action
+    /// incsearch preview hop (vim's `<Esc>`-cancels-search behavior). `pub` so the
+    /// dock-navigation path can close the line directly, and the server can dismiss
+    /// it when a file-argument `<Tab>` hands off to the picker (the `cancel` action
     /// is the keymap-driven entry).
-    pub(crate) fn cancel_cmdline(&mut self) {
+    pub fn cancel_cmdline(&mut self) {
         // Abandoning the line also dismisses any open completion popup.
         self.close_cmdline_menu();
         if matches!(self.cmdline_kind, CmdlineKind::Search(_)) {

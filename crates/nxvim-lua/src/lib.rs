@@ -43,6 +43,6 @@ pub use ops::{
     TabOp, TerminalOpenReq, TsOp, UiInputReq, ViewOp, VirtChunkData, VirtDecorData, WindowOp,
 };
 pub use runtime::{
-    BoMirror, BufBytesEdit, BufMirror, ExtmarkMirror, FloatMirror, GoMirror, HlDefMirror,
-    JumpMirror, LuaRuntime, OptionCatalogRow, QfMirror, TabMirror, WindowMirror,
+    BoMirror, BufBytesEdit, BufMirror, CmdlineComplete, ExtmarkMirror, FloatMirror, GoMirror,
+    HlDefMirror, JumpMirror, LuaRuntime, OptionCatalogRow, QfMirror, TabMirror, WindowMirror,
 };

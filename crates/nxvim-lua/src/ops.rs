@@ -1305,6 +1305,17 @@ pub struct PickerOpenReq {
     /// before. The kind itself (file vs location) is implicit in whether the
     /// pushes carry a `loc`.
     pub preview: bool,
+    /// The initial prompt text the picker opens with (`nx.picker.open(name, {
+    /// query = … })`). The widget pre-fills the prompt and the server kicks the
+    /// source's gen-0 run with this query instead of the empty string, so the
+    /// list opens already filtered. Empty ⇒ the historical empty-prompt open.
+    pub query: String,
+    /// An optional title rendered on the picker box's top border
+    /// (`nx.picker.open(name, { title = … })`). `None` ⇒ no title.
+    pub title: Option<String>,
+    /// Whether `<Tab>` multi-selects rows (`nx.picker.open{ multiselect }`, default
+    /// `true`). `false` disables marking — a single-choice picker.
+    pub multiselect: bool,
 }
 
 /// Whether a [`StatuslineSetupReq`] sets the **global** segment layout (applies to

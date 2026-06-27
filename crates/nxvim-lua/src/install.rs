@@ -66,9 +66,11 @@ impl UserData for LuaRegex {
 /// `{top=,…}` are all expanded there), so an absent or malformed value is treated
 /// as no margin.
 /// The argument tuple of the `nx._picker_open` bridge: `(dynamic, width, height,
-/// align, margin, prompt_bottom, preview)` — width/height/align are raw specs the
-/// server parses, `margin` is a `[top, right, bottom, left]` array. Aliased to keep
-/// clippy's complex-type lint quiet on the closure signature.
+/// align, margin, prompt_bottom, preview, query, title)` — width/height/align are
+/// raw specs the server parses, `margin` is a `[top, right, bottom, left]` array,
+/// `query` is the initial prompt text (empty for the historical empty-prompt
+/// open), and `title` is the optional box title. Aliased to keep clippy's
+/// complex-type lint quiet on the closure signature.
 type PickerOpenArgs = (
     bool,
     Option<String>,
@@ -76,6 +78,9 @@ type PickerOpenArgs = (
     Option<String>,
     Option<Vec<u64>>,
     Option<bool>,
+    Option<bool>,
+    Option<String>,
+    Option<String>,
     Option<bool>,
 );
 
@@ -2165,7 +2170,18 @@ pub(crate) fn install_runtime_api(
     nx.set(
         "_picker_open",
         lua.create_function(move |_, args: PickerOpenArgs| {
-            let (dynamic, width, height, align, margin, prompt_bottom, preview) = args;
+            let (
+                dynamic,
+                width,
+                height,
+                align,
+                margin,
+                prompt_bottom,
+                preview,
+                query,
+                title,
+                multiselect,
+            ) = args;
             sh.borrow_mut().picker_opens.push(PickerOpenReq {
                 dynamic,
                 width: width.unwrap_or_default(),
@@ -2177,6 +2193,10 @@ pub(crate) fn install_runtime_api(
                     .unwrap_or([0; 4]),
                 prompt_bottom: prompt_bottom.unwrap_or(false),
                 preview: preview.unwrap_or(false),
+                query: query.unwrap_or_default(),
+                title: title.filter(|t| !t.is_empty()),
+                // Default-on: only an explicit `multiselect = false` disables marking.
+                multiselect: multiselect.unwrap_or(true),
             });
             Ok(())
         })?,
@@ -2328,6 +2348,18 @@ pub(crate) fn install_runtime_api(
         "_cmdline_complete_setup",
         lua.create_function(move |_, docs: bool| {
             sh.borrow_mut().cmdline_complete_setups.push(docs);
+            Ok(())
+        })?,
+    )?;
+    // `nx._cmdline_set_arg(path)`: the file-picker confirm pasting `path` into the
+    // open command line's argument token (the picker was launched over a still-open
+    // `:e <Tab>`; this fills the line without running it). The server drains it into
+    // `Editor::cmdline_replace_arg`.
+    let sh = shared.clone();
+    nx.set(
+        "_cmdline_set_arg",
+        lua.create_function(move |_, path: String| {
+            sh.borrow_mut().cmdline_set_args.push(path);
             Ok(())
         })?,
     )?;

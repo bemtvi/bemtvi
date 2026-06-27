@@ -100,14 +100,29 @@ impl Editor {
     }
 
     /// Re-run the trigger when a cmdline menu is already open (a content edit
-    /// narrowed / changed the token). A no-op when no cmdline menu is open — typing
-    /// before `<Tab>` never opens the menu (on-demand activation).
+    /// narrowed the token). A no-op when no cmdline menu is open — typing before
+    /// `<Tab>` never opens the menu (on-demand activation).
+    ///
+    /// An edit only **narrows the same token**: it re-ranks when the token start is
+    /// unchanged (e.g. `:e<Tab>` then `d` → `edit`). An edit that moves the token
+    /// start — typing *past* the completed word into a new token, the space after a
+    /// command name being the common case — does **not** auto-open a completion for
+    /// the new token; it closes the wildmenu, and the user re-opens with an explicit
+    /// `<Tab>`. This is what keeps the space after `:e` from launching the file
+    /// picker (or `:set ` from popping its option list) before the user asks for it.
     pub(crate) fn cmdline_complete_refresh(&mut self) {
-        if self.cmdline_menu_open() {
-            // A real edit commits any previewed selection: the line is now the user's
-            // own text again, so drop the revert snapshot before re-ranking.
-            self.cmdline_complete_saved = None;
+        if !self.cmdline_menu_open() {
+            return;
+        }
+        let same_token =
+            self.cmdline_complete_token().map(|(anchor, ..)| anchor) == self.cmdline_menu_anchor();
+        // A real edit commits any previewed selection (the line is the user's own text
+        // again), whether we narrow or close — so drop the revert snapshot either way.
+        self.cmdline_complete_saved = None;
+        if same_token {
             self.cmdline_complete_trigger();
+        } else {
+            self.close_cmdline_menu();
         }
     }
 
@@ -149,6 +164,26 @@ impl Editor {
     /// highlighted) leaves the line untouched so the caller runs it as typed. The
     /// popup itself is closed by [`cmdline_complete_take_accept`] on success — the
     /// caller closes any still-open noselect popup separately.
+    /// Replace the current command-line **argument** token with `text`, keeping the
+    /// command line open. This is the file-picker handoff's "paste the chosen path":
+    /// `<Tab>` on `:e <arg>` opens the picker over the still-open line, and confirming
+    /// a file calls here to drop its path into the argument — the user then runs the
+    /// line with `<CR>` (the picker never auto-executes). A no-op off an ex command
+    /// line or when there is no argument token (e.g. still in the command name).
+    pub fn cmdline_replace_arg(&mut self, text: &str) {
+        if !matches!(self.cmdline_kind, CmdlineKind::Ex) {
+            return;
+        }
+        let Some((anchor, _, _)) = self.cmdline_complete_token() else {
+            return;
+        };
+        // The line was not edited while the picker grabbed input, so the token still
+        // ends at the cursor; replace `[anchor .. cmdline_col)` and park the cursor
+        // past the pasted path so further typing appends to it.
+        self.cmdline.replace_range(anchor..self.cmdline_col, text);
+        self.cmdline_col = anchor + text.len();
+    }
+
     pub(crate) fn cmdline_complete_accept(&mut self) -> bool {
         let Some((anchor, insert)) = self.cmdline_complete_take_accept() else {
             return false;

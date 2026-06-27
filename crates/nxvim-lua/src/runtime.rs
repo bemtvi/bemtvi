@@ -50,6 +50,19 @@ fn foldexpr_value_string(value: &mlua::Value) -> String {
     }
 }
 
+/// The outcome of resolving a command-line completion request
+/// (`Runtime::run_cmdline_complete`): either inline catalog candidates for the
+/// wildmenu, or a signal that the Lua source launched the file picker instead
+/// (`:e <Tab>` and the other file-taking commands) — the server then dismisses
+/// the command line and lets the queued picker take over.
+#[derive(Clone, Debug)]
+pub enum CmdlineComplete {
+    /// `(label, insert, doc)` rows for the wildmenu (command names / `:set` options).
+    Candidates(Vec<(String, String, String)>),
+    /// The source opened the file picker; there is no wildmenu to render.
+    PickerLaunched,
+}
+
 /// One window's row in the Rust→Lua window mirror, in layout order. The
 /// number/relativenumber flags back `vim.wo`'s wired window-local options;
 /// `float` carries a floating window's placement so `nvim_win_get_config` reads
@@ -637,6 +650,10 @@ pub(crate) struct Shared {
     /// `docs` flag; the server drains it into `Editor::configure_cmdline_complete`.
     /// Empty until a config arrives, so command-line completion is off by default.
     pub(crate) cmdline_complete_setups: Vec<bool>,
+    /// Pending `nx._cmdline_set_arg(path)` requests — the file picker confirm pasting
+    /// the chosen path into the still-open command line's argument token. The server
+    /// drains each into `Editor::cmdline_replace_arg`.
+    pub(crate) cmdline_set_args: Vec<String>,
     /// Pending `nx.complete.trigger()` requests (a manual completion open). Each is
     /// payload-free; the server runs `Editor::complete_manual_trigger` once if any
     /// arrived since the last drain.
@@ -1267,6 +1284,12 @@ impl LuaRuntime {
     }
 
     take_queue! {
+        /// Take the `nx._cmdline_set_arg(path)` requests queued since the last drain —
+        /// the file picker confirm pasting a chosen path into the open command line.
+        take_cmdline_set_args -> Vec<String> = cmdline_set_args
+    }
+
+    take_queue! {
         /// Take the async completion candidates streamed since the last drain, for
         /// the server to append (generation-gated) to the open completion popup.
         take_complete_pushes -> Vec<CompletePush> = complete_pushes
@@ -1473,14 +1496,20 @@ impl LuaRuntime {
     /// scans), the catalog filter is a microsecond table scan, so it is a single
     /// round-trip on the input path; the server fuzzy-ranks + renders the result via
     /// `Editor::open_cmdline_menu`. `col` is a 0-based char offset into `line`.
-    pub fn run_cmdline_complete(
-        &self,
-        line: &str,
-        col: usize,
-    ) -> mlua::Result<Vec<(String, String, String)>> {
+    ///
+    /// For a **file argument** (`:e <Tab>`, …) the source instead *launches the file
+    /// picker* (a side effect, queued like any `nx.picker.open`) and returns a
+    /// sentinel table (`{ __picker = true }`) — there are no inline candidates. The
+    /// server dismisses the command line and lets the queued picker open take over
+    /// ([`CmdlineComplete::PickerLaunched`]).
+    pub fn run_cmdline_complete(&self, line: &str, col: usize) -> mlua::Result<CmdlineComplete> {
         let nx = self.nx()?;
         let run: mlua::Function = nx.get("_cmdline_complete_run")?;
         let list: Table = run.call((self.lua.create_string(line)?, lua_int(col as i64)))?;
+        // The source launched the file picker rather than returning candidates.
+        if list.get::<Option<bool>>("__picker")? == Some(true) {
+            return Ok(CmdlineComplete::PickerLaunched);
+        }
         let mut out = Vec::new();
         for item in list.sequence_values::<Table>() {
             let item = item?;
@@ -1493,7 +1522,7 @@ impl LuaRuntime {
             let doc: String = item.get::<Option<String>>("doc")?.unwrap_or_default();
             out.push((label, insert, doc));
         }
-        Ok(out)
+        Ok(CmdlineComplete::Candidates(out))
     }
 
     /// Populate `nx._options_catalog` with the documented option catalog, so the

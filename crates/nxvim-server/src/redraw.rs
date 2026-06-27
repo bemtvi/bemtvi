@@ -1841,6 +1841,11 @@ impl EditHost {
         if m.completion {
             map.push((Value::from("border_top"), Value::from(false)));
         }
+        // The picker box's optional title (`nx.picker.open{ title = … }`), rendered
+        // on the top border. Absent ⇒ no title.
+        if let Some(title) = &m.title {
+            map.push((Value::from("title"), Value::from(title.as_str())));
+        }
         // The `Editor` / `Bottom` picker overlay floats over the WHOLE editor: its
         // `row`/`col` are editor-absolute (windows-area cells, computed by
         // `menu_geom` against `editor_w`/`editor_h`), so the client anchors the box to
@@ -2501,16 +2506,56 @@ fn read_preview_file(editor: &nxvim_core::Editor, path: &std::path::Path) -> (Ve
     if editor.host_fs_offtick() {
         return (vec![format!("{}: loading…", path.display())], false);
     }
+    // A directory can't be read as a file — list its entries instead of showing the
+    // error (the file picker previews a focused directory this way, e.g. `:e src/<Tab>`
+    // highlighting a sub-directory). On Linux a directory OPENS fine and only fails at
+    // READ time (`EISDIR`), so both the open and the read errors fall back to the
+    // listing; a genuine non-directory error (permission, missing) still surfaces.
     let reader = match editor.host_fs().open_read(path) {
         Ok(r) => r,
-        Err(e) => return (vec![format!("{}: {e}", path.display())], false),
+        Err(e) => return read_preview_dir(editor, path, &e),
     };
     let mut buf = Vec::new();
     if let Err(e) = reader.take(MAX_PREVIEW_BYTES).read_to_end(&mut buf) {
-        return (vec![format!("{}: {e}", path.display())], false);
+        return read_preview_dir(editor, path, &e);
     }
     let text = String::from_utf8_lossy(&buf);
     (text.lines().map(|l| l.to_string()).collect(), true)
+}
+
+/// The preview lines for a *directory* target: its entries, directories first (each
+/// with a trailing `/`), then files, both alphabetical. Falls back to the original
+/// open error `open_err` when `path` is not a readable directory either (so a real
+/// permission/missing error still shows). Returns `ok = true` for a listing so the
+/// pane renders it as content (an empty directory shows a hint, still `ok`).
+fn read_preview_dir(
+    editor: &nxvim_core::Editor,
+    path: &std::path::Path,
+    open_err: &std::io::Error,
+) -> (Vec<String>, bool) {
+    let mut entries = match editor.host_fs().read_dir(path) {
+        Ok(entries) => entries,
+        Err(_) => return (vec![format!("{}: {open_err}", path.display())], false),
+    };
+    entries.sort_by(|a, b| {
+        b.is_dir
+            .cmp(&a.is_dir)
+            .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
+    });
+    if entries.is_empty() {
+        return (vec!["(empty directory)".to_string()], true);
+    }
+    let lines = entries
+        .into_iter()
+        .map(|e| {
+            if e.is_dir {
+                format!("{}/", e.name)
+            } else {
+                e.name
+            }
+        })
+        .collect();
+    (lines, true)
 }
 
 /// Map one preview line's cached tree-sitter `spans` (byte offsets within the line)

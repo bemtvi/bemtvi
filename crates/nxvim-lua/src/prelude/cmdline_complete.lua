@@ -9,8 +9,15 @@
 --
 -- Phase 1 shipped command NAMES; Phase 3 added the docs pane (each entry carries a
 -- synopsis + one-line description); Phase 4 folded in the user-command merge.
--- Argument completion (`:e <file>`, `:set <opt>`, …) is a later, pure-Lua extension
--- — the source already receives the whole line + cursor.
+-- `:set <opt>` completes option names inline.
+--
+-- A **file argument** (`:e <Tab>`, `:split`, `:cd`, …) is different: instead of the
+-- inline wildmenu it hands off to the full `nx.picker` overlay (a fuzzy finder with
+-- a file preview pane). The source seeds the picker with the path typed so far,
+-- lists one directory at a time with the **same-level** entries ranked first, and
+-- on confirm splices the chosen path back into the command and runs it (`nx.cmd`),
+-- so every file-taking command works — modifiers and all. See
+-- `docs/plans/2026-06-26-cmdline-file-path-picker.md`.
 
 nx.cmdline_complete = nx.cmdline_complete or {}
 
@@ -257,6 +264,234 @@ local function option_candidates()
   return out
 end
 
+-- ----- file-path completion via the picker --------------------------------------
+-- The file-taking ex commands (and their standard abbreviations) whose argument is
+-- a path: `<Tab>` in the argument region opens the file picker rather than the
+-- wildmenu. Kept generous but conservative — every entry opens or writes a file.
+local FILE_COMMANDS = {}
+for _, c in ipairs({
+  "e",
+  "ed",
+  "edi",
+  "edit",
+  "sp",
+  "spl",
+  "spli",
+  "split",
+  "vs",
+  "vsp",
+  "vspl",
+  "vsplit",
+  "new",
+  "vne",
+  "vnew",
+  "tabe",
+  "tabed",
+  "tabedi",
+  "tabedit",
+  "tabnew",
+  "vie",
+  "view",
+  "r",
+  "re",
+  "rea",
+  "read",
+  "w",
+  "wr",
+  "wri",
+  "writ",
+  "write",
+  "wq",
+  "x",
+  "xi",
+  "xit",
+  "sav",
+  "save",
+  "savea",
+  "saveas",
+  "so",
+  "sou",
+  "sour",
+  "sourc",
+  "source",
+  "badd",
+  "drop",
+  "ped",
+  "pedit",
+  "cf",
+  "cfi",
+  "cfile",
+  "lf",
+  "lfi",
+  "lfile",
+  "diffs",
+  "diffsp",
+  "diffsplit",
+}) do
+  FILE_COMMANDS[c] = true
+end
+
+-- Directory-taking commands: the picker lists directories only and confirming one
+-- runs the command on it (`:cd dir`) rather than descending into it.
+local DIR_COMMANDS = {}
+for _, c in ipairs({ "cd", "chd", "chdir", "tcd", "lcd", "lch", "lchdir" }) do
+  DIR_COMMANDS[c] = true
+end
+
+-- The command context captured at handoff, read by the `cmdline_files` source on
+-- confirm. `dirs_only` lists / selects directories (the `:cd` family). The command
+-- line stays open under the picker, so confirm just pastes the chosen path into the
+-- argument token (`nx._cmdline_set_arg`) — the user runs the filled line with <CR>.
+local pending = nil
+
+-- Split a typed path token into `(base, leaf)`: `base` is everything up to and
+-- including the last "/" (kept verbatim so the spliced command stays in the user's
+-- relative/absolute/`~` style), `leaf` is the partial name after it. No "/" ⇒ the
+-- whole token is the leaf and the base is empty (list the cwd).
+local function split_path(token)
+  local base, leaf = token:match("^(.*/)([^/]*)$")
+  if base then
+    return base, leaf
+  end
+  return "", token
+end
+
+-- Resolve the directory to LIST from the typed `base` and the picker `cwd`. A
+-- leading "~" / "~/" expands to $HOME (when set); an absolute base lists itself; a
+-- relative base joins onto cwd. Always returns an absolute path for `nx.fs`.
+local function resolve_dir(base, cwd)
+  if base == "" then
+    return cwd
+  end
+  local p = base
+  if p == "~" or p:sub(1, 2) == "~/" then
+    local home = os.getenv("HOME")
+    if home then
+      p = home .. p:sub(2)
+    end
+  end
+  if p:sub(1, 1) ~= "/" then
+    p = (cwd:gsub("/$", "")) .. "/" .. p
+  end
+  -- Strip the trailing "/" the typed base carries (`sub/`) so `nx.fs.readdir` gets a
+  -- bare directory path; keep a lone root "/".
+  return (p:gsub("(.)/+$", "%1"))
+end
+
+-- A case-insensitive subsequence test (`pat`'s chars appear in order in `s`) — the
+-- fuzzy tier below the exact-prefix tier.
+local function subsequence(s, pat)
+  local i = 1
+  for j = 1, #pat do
+    local found = s:find(pat:sub(j, j), i, true)
+    if not found then
+      return false
+    end
+    i = found + 1
+  end
+  return true
+end
+
+-- Rank a directory's entries against the partial `leaf`, returning the matches in
+-- display order: an exact case-insensitive prefix tier first, then a subsequence
+-- (fuzzy) tier, and within each tier **directories before files**, alphabetically.
+-- These are all immediate children of the listed directory, so ranking them first
+-- is what "prioritise same-level candidates" means here. Dotfiles are hidden unless
+-- the leaf itself starts with "." (vim's wildignore-ish default). `dirs_only` keeps
+-- only directories (and symlinks, which may point at one).
+local function rank_entries(entries, leaf, dirs_only)
+  local lleaf = leaf:lower()
+  local want_hidden = leaf:sub(1, 1) == "."
+  local matches = {}
+  for _, e in ipairs(entries) do
+    local is_dir = e.type == "directory"
+    local kind_ok = (not dirs_only) or is_dir or e.type == "link"
+    local hidden = e.name:sub(1, 1) == "."
+    if kind_ok and (want_hidden or not hidden) then
+      local lname = e.name:lower()
+      local tier
+      if leaf == "" then
+        tier = 2
+      elseif lname:sub(1, #lleaf) == lleaf then
+        tier = 0
+      elseif subsequence(lname, lleaf) then
+        tier = 1
+      end
+      if tier then
+        matches[#matches + 1] = { name = e.name, is_dir = is_dir, tier = tier }
+      end
+    end
+  end
+  table.sort(matches, function(a, b)
+    if a.tier ~= b.tier then
+      return a.tier < b.tier
+    end
+    if a.is_dir ~= b.is_dir then
+      return a.is_dir -- directories first
+    end
+    return a.name:lower() < b.name:lower()
+  end)
+  return matches
+end
+
+-- The cmdline file picker: a DYNAMIC source (so it controls its own ordering —
+-- same-level first — and re-lists as the query is edited). Per query it lists ONE
+-- directory (the one the typed base points at) via `nx.fs.readdir` (async, so it
+-- works native / over the daemon / on wasm-OPFS), pushing the same-level matches.
+-- Crossing a "/" re-roots; confirming a directory descends (file mode) or selects
+-- it (`dirs_only`). Confirming a file splices its path into the captured command
+-- line and runs it.
+nx.picker.source({
+  name = "cmdline_files",
+  layer = "main", -- a picked file opens in the main editor, never a focused dock
+  dynamic = true,
+  debounce = 0, -- a local readdir is instant, so re-list on every keystroke
+  multiselect = false, -- a single path is chosen; `<Tab>` marking makes no sense
+
+  items = nx.async(function(ctx)
+    local base, leaf = split_path(ctx.query)
+    local dir = resolve_dir(base, ctx.cwd)
+    local ok, entries = pcall(nx.await, nx.fs.readdir(dir))
+    if not ok or type(entries) ~= "table" then
+      return -- an unreadable / non-existent directory simply lists nothing
+    end
+    -- Inside a sub-directory (a non-empty base) and not yet filtering: offer a first
+    -- "<select directory>" row that USES this directory as the path rather than
+    -- descending into it — `:cd src/<select directory>` selects `src/`, and a file
+    -- command pastes the directory path. It carries `is_dir = false` so confirm
+    -- pastes it (no descend); typing a leaf hides it so it never shadows a match.
+    if base ~= "" and leaf == "" then
+      ctx.push({ text = "<select directory>", path = base, is_dir = false })
+    end
+    local dirs_only = pending ~= nil and pending.dirs_only
+    for _, m in ipairs(rank_entries(entries, leaf, dirs_only)) do
+      -- A directory shows (and splices) with a trailing "/"; the path keeps the
+      -- typed base so the reconstructed command stays in the user's style.
+      local shown = m.is_dir and (m.name .. "/") or m.name
+      ctx.push({ text = shown, path = base .. shown, is_dir = m.is_dir })
+    end
+  end),
+  confirm = function(item)
+    local dirs_only = pending ~= nil and pending.dirs_only
+    if item.is_dir and not dirs_only then
+      -- Descend: re-open the picker one level deeper, seeded with this directory.
+      -- Deferred a tick so the current picker has fully closed first (the confirm
+      -- runs with `nx._picker` already cleared — re-opening inline would race). The
+      -- command line stays open underneath the whole time.
+      nx.on_next_tick(function()
+        nx.picker.open(
+          "cmdline_files",
+          { query = item.path, preview = "file", title = "Select file" }
+        )
+      end)
+      return
+    end
+    -- Paste the chosen path into the still-open command line's argument token — NO
+    -- execute. The user runs the now-filled line (`:e src/foo.rs`) with <CR>.
+    nx._cmdline_set_arg(item.path)
+  end,
+})
+
 -- nx._cmdline_complete_run(line, col): the candidate source the server calls
 -- synchronously per `<Tab>` (and each edit while the wildmenu is open). It returns
 -- the candidate list — a `{ {label, insert[, doc]}, ... }` array — and core
@@ -265,7 +500,12 @@ end
 -- source picks the candidate set from `line` / `col`:
 --   * still in the command name  → the command catalog (built-ins + user commands);
 --   * in a `:set` argument        → option names (with docs);
+--   * in a file/dir argument      → launch the file picker, return the sentinel;
 --   * any other command's args    → nothing yet (core closes the menu).
+--
+-- The file-picker case is a SIDE EFFECT (it queues `nx.picker.open`) and returns
+-- the `{ __picker = true }` sentinel: the server recognises it, dismisses the
+-- command line, and lets the queued picker take over (`CmdlineComplete::PickerLaunched`).
 function nx._cmdline_complete_run(line, col)
   -- Argument region iff a complete word is followed by whitespace before the cursor.
   -- The command word and its trailing space are ASCII, so this byte scan of the
@@ -275,6 +515,20 @@ function nx._cmdline_complete_run(line, col)
     local cmd = line:match("(%a%w*)") -- the first word — the command name
     if cmd and SET_COMMANDS[cmd] then
       return option_candidates()
+    end
+    if cmd and (FILE_COMMANDS[cmd] or DIR_COMMANDS[cmd]) then
+      -- The path typed so far is the trailing non-whitespace run; it seeds the picker
+      -- and (since the command line stays open) confirm pastes the choice back into
+      -- this same argument token via `nx._cmdline_set_arg`.
+      local prefix = before:match("(%S*)$") or ""
+      local dirs_only = DIR_COMMANDS[cmd] == true
+      pending = { dirs_only = dirs_only }
+      local popts = { query = prefix, title = dirs_only and "Select directory" or "Select file" }
+      if not dirs_only then
+        popts.preview = "file" -- a file preview pane (directories list their contents)
+      end
+      nx.picker.open("cmdline_files", popts)
+      return { __picker = true }
     end
     return {} -- no argument completer for this command yet
   end

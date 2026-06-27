@@ -2098,6 +2098,7 @@ impl Renderer {
         bottom: bool,
         title_fg: u32,
         border_fg: u32,
+        center_title: bool,
     ) {
         if w < 2 || h < 1 {
             return; // no room for left + right rails
@@ -2115,17 +2116,27 @@ impl Renderer {
         let (cw, ch) = (self.cell_w, self.cell_h);
         let px = |col: u16, row: u16| (col as f32 * cw, row as f32 * ch);
 
-        // Top edge: left corner, the title (left-aligned, truncated), a horizontal
-        // fill, then the right corner — title in `title_fg`, the frame in `border_fg`.
+        // Top edge: left corner, the title (truncated), a horizontal fill, then the
+        // right corner — title in `title_fg`, the frame in `border_fg`. `center_title`
+        // splits the fill on both sides of the title (the picker box); otherwise the
+        // title is left-aligned (floats).
         if top {
             let title_s = title.map(|t| format!(" {t} ").chars().take(inner_w).collect::<String>());
             let title_len = title_s.as_deref().map_or(0, |s| s.chars().count());
-            let fill = horiz.to_string().repeat(inner_w - title_len);
-            let mut top_segs = vec![Seg::plain(tl.to_string(), border_fg)];
+            let total_fill = inner_w - title_len;
+            let lfill = if center_title { total_fill / 2 } else { 0 };
+            let rfill = total_fill - lfill;
+            let mut top_segs = vec![Seg::plain(
+                format!("{tl}{}", horiz.to_string().repeat(lfill)),
+                border_fg,
+            )];
             if let Some(ts) = title_s {
                 top_segs.push(Seg::plain(ts, title_fg));
             }
-            top_segs.push(Seg::plain(format!("{fill}{tr}"), border_fg));
+            top_segs.push(Seg::plain(
+                format!("{}{tr}", horiz.to_string().repeat(rfill)),
+                border_fg,
+            ));
             self.push_text(items, &top_segs, px(ox, oy), border_fg, full);
         }
         if bottom {
@@ -2157,7 +2168,7 @@ impl Renderer {
         border_fg: u32,
     ) {
         self.draw_glyph_border(
-            items, border, title, ox, oy, w, h, true, true, title_fg, border_fg,
+            items, border, title, ox, oy, w, h, true, true, title_fg, border_fg, false,
         );
     }
 
@@ -2256,6 +2267,7 @@ impl Renderer {
             true,
             fg,
             border,
+            false,
         );
 
         let rows = pmenu.height as usize;
@@ -2310,6 +2322,7 @@ impl Renderer {
                 true,
                 fg,
                 border,
+                false,
             );
             // Client-side vertical scroll (the box height is the client's to know,
             // so the server has no notion of it): skip the scrolled-past lines,
@@ -2417,7 +2430,9 @@ impl Renderer {
         self.draw_glyph_border(
             items,
             Border::Single,
-            None,
+            // The picker box's title (`nx.picker.open{ title = … }`) on the top edge;
+            // only a fully-bordered picker sets one (the wildmenu / completion don't).
+            menu.title.as_deref().filter(|t| !t.is_empty()),
             bx,
             by,
             box_w,
@@ -2426,6 +2441,7 @@ impl Renderer {
             border_bottom,
             fg,
             border,
+            true, // the picker box title is centered
         );
 
         let full = self.full_bounds();
@@ -2641,6 +2657,7 @@ impl Renderer {
                 true,
                 doc_fg,
                 doc_border,
+                false,
             );
             let (dcx, dcy) = (dbx + 1, dby + 1);
             for (i, line) in docs.lines.iter().enumerate() {

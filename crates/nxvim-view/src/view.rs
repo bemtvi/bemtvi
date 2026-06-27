@@ -584,6 +584,9 @@ pub struct MenuData {
     /// which sits flush against the line below the cursor; `true` (the default,
     /// when the key is absent) for a `select` / picker.
     pub border_top: bool,
+    /// The picker box's optional title (`nx.picker.open{ title = … }`), rendered on
+    /// the top border. `None` (key absent) for the wildmenu / completion / select.
+    pub title: Option<String>,
     /// Whether this is the **command-line** completion wildmenu
     /// (`nx.cmdline_complete`). When set, the client anchors the box to the
     /// command-line area (frame-bottom, no number gutter) rather than the focused
@@ -881,6 +884,9 @@ impl View {
                 query_cursor: map_u16(m, "query_cursor"),
                 prompt_bottom: map_get(m, "prompt_pos").and_then(Value::as_str) == Some("bottom"),
                 border_top: map_get(m, "border_top").and_then(Value::as_bool) != Some(false),
+                title: map_get(m, "title")
+                    .and_then(Value::as_str)
+                    .map(str::to_string),
                 cmdline: map_get(m, "cmdline").and_then(Value::as_bool) == Some(true),
                 editor_relative: map_get(m, "editor_relative").and_then(Value::as_bool)
                     == Some(true),

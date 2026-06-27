@@ -2133,7 +2133,7 @@
       // undefined — the popup then keeps its built-in CSS look (the `.pmenu*` classes).
       const ms = menu.styles || {};
       const mst = (k) => (typeof ms[k] === "number" ? paletteStyle(ms[k]) : null);
-      const sBg = mst("bg"), sSel = mst("sel"), sMatch = mst("match"), sBorder = mst("border"), sPrompt = mst("prompt");
+      const sBg = mst("bg"), sSel = mst("sel"), sMatch = mst("match"), sBorder = mst("border"), sPrompt = mst("prompt"), sTitle = mst("title");
       const bgCss = sBg && cssColor(sBg.bg), fgCss = sBg && cssColor(sBg.fg);
       const borderCss = sBorder && cssColor(sBorder.fg);
       // Apply the selected-row look: the theme's selection style when defined, else the
@@ -2149,7 +2149,11 @@
       // The shared single-line glyph border around the list (+ optional preview pane);
       // content sits one cell inside (and one down when there's a top edge).
       const { cx, cy } = popupChrome(boxX, boxY, menu.width, boxRows,
-        { top, bottom, bg: bgCss || undefined, borderColor: borderCss || undefined });
+        { top, bottom, bg: bgCss || undefined, borderColor: borderCss || undefined,
+          // The picker box's title (`nx.picker.open{ title = … }`) on the top edge,
+          // centered; only a fully-bordered picker sets one (the wildmenu / completion don't).
+          title: menu.title || undefined, titleColor: (sTitle && cssColor(sTitle.fg)) || undefined,
+          centerTitle: true });
       // A noselect completion popup (`selected_active === false`) highlights no row
       // and scrolls from the top.
       const selActive = menu.selected_active !== false;
@@ -2406,7 +2410,7 @@
     // with a blank span between them that the inset content box overlays.
     function appendGlyphBorder(box, totalW, totalH, opts = {}) {
       const { style = "single", title = null, top = true, bottom = true,
-              borderColor = null, titleColor = null } = opts;
+              borderColor = null, titleColor = null, centerTitle = false } = opts;
       const G = floatBorderGlyphs(style);
       const innerW = totalW - 2;
       const bspan = (text) => floatBorderSpan(text, borderColor);
@@ -2424,7 +2428,12 @@
         if (r === 0 && top) {
           const row = mkRow(r);
           const titleStr = title ? ` ${title} `.slice(0, innerW) : "";
-          row.appendChild(bspan(G.tl));
+          // `centerTitle` splits the fill on both sides of the title (the picker box);
+          // otherwise the title is left-aligned, flush after the corner (floats).
+          const totalFill = innerW - titleStr.length;
+          const lfill = centerTitle ? Math.floor(totalFill / 2) : 0;
+          const rfill = totalFill - lfill;
+          row.appendChild(bspan(G.tl + G.h.repeat(lfill)));
           if (titleStr) {
             const t = document.createElement("span");
             t.className = "float-title";
@@ -2432,7 +2441,7 @@
             t.textContent = titleStr;
             row.appendChild(t);
           }
-          row.appendChild(bspan(G.h.repeat(innerW - titleStr.length) + G.tr));
+          row.appendChild(bspan(G.h.repeat(rfill) + G.tr));
         } else if (r === totalH - 1 && bottom) {
           mkRow(r).appendChild(bspan(G.bl + G.h.repeat(innerW) + G.br));
         } else {

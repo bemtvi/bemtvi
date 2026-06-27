@@ -2493,6 +2493,16 @@ fn render_menu(
     if let Some(b) = menu.styles.border.map(rt) {
         block = block.border_style(b);
     }
+    // The picker box's title (`nx.picker.open{ title = … }`), centered on the top
+    // border. Only a fully-bordered picker carries one (the wildmenu / completion
+    // leave it `None`), so it never collides with the missing top border.
+    if let Some(title) = menu.title.as_deref().filter(|t| !t.is_empty()) {
+        let mut line = Line::from(format!(" {title} ")).centered();
+        if let Some(ts) = menu.styles.title.map(rt) {
+            line = line.style(ts);
+        }
+        block = block.title_top(line);
+    }
     let inner = block.inner(area);
     frame.render_widget(Clear, area);
     frame.render_widget(block, area);

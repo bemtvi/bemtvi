@@ -774,6 +774,13 @@ M._default_recommended = {
     desc = "Diff & merge-conflict visualizer",
     config = [[ require("nxvim-diff").setup() ]],
   },
+  {
+    "davidrios/nxvim-dap",
+    desc = "Debugger front end — breakpoints, stepping, REPL (<F5>, <leader>db)",
+    keys = { "<F5>", "<leader>db" },
+    cmd = { "DapContinue", "DapToggleBreakpoint" },
+    config = [[ require("nxvim-dap").setup({}) ]],
+  },
 }
 
 -- Activate the built-in default set as the recommended set, unless one is already

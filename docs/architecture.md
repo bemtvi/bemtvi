@@ -563,8 +563,11 @@ current window — `:b`/`:e` rebind the focused window's buffer.
   Top | Bottom)}`, with the *focused* layer's tree always live on `Editor::windows`
   (the rest park per *Tab pages* above), so `split`/`close`/`focus`/editing/redraw
   act on whatever layer holds focus with zero retargeting. `<C-w><C-w>` is the
-  **layer-switch** prefix: `<C-w><C-w>{h,j,k,l}` crosses main↔dock-by-edge,
-  `<C-w><C-w>{H,J,K,L}` *moves* the focused buffer to the layer on that edge (the
+  **layer-switch** prefix: `<C-w><C-w>{h,j,k,l}` crosses focus *spatially* between
+  the regions — full-width top/bottom bands around a `left|main|right` middle band —
+  stepping to the open region in that direction and wrapping past the far edge
+  (`cross_dir_candidates`/`cross_dir_target`; a no-op when nothing in that direction
+  is open), `<C-w><C-w>{H,J,K,L}` *moves* the focused buffer to the layer on that edge (the
   dock on that side — a no-op if it is closed — or back to main from a dock; the
   source window falls back to a sibling/empty buffer of its own layer via
   `move_buffer_to_layer`), and `<C-w><C-w>{cmd}` crosses then runs the command,

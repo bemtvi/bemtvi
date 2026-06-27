@@ -2085,12 +2085,17 @@ impl Editor {
         let count = self.effective_count() as isize;
         self.reset_pending();
         match cmd {
-            LayerWindowCmd::CrossDir(dir) => match self.focused_layer {
-                // From the main area, focus the dock on that edge (no-op if closed).
-                Layer::Main => self.focus_dock(DockSide::from_dir(dir)),
-                // From a dock, any directional cross returns to the main area.
-                Layer::Dock(_) => self.switch_layer(Layer::Main),
-            },
+            LayerWindowCmd::CrossDir(dir) => {
+                // Spatial cross: step to the open region in that direction (main or
+                // a dock), wrapping past the far edge. A no-op when nothing in that
+                // direction is open.
+                if let Some(target) = self.cross_dir_target(dir) {
+                    match target {
+                        Layer::Main => self.switch_layer(Layer::Main),
+                        Layer::Dock(side) => self.focus_dock(side),
+                    }
+                }
+            }
             LayerWindowCmd::MoveDir(dir) => match self.focused_layer {
                 // From the main area, move the buffer to the dock on that edge — but
                 // only if that dock is open (mirrors `CrossDir`'s closed-dock no-op).
@@ -2119,6 +2124,68 @@ impl Editor {
         // If the cross was a no-op (e.g. a closed dock), no `enter_window` ran to
         // consume the resume request — clear it so it can't leak into a later focus.
         self.restore_mode_on_enter = false;
+    }
+
+    /// The layer a spatial `<C-w><C-w>`+direction cross should focus from the
+    /// currently focused region, or `None` when nothing in that direction is open.
+    fn cross_dir_target(&self, dir: WinDir) -> Option<Layer> {
+        Self::cross_dir_candidates(self.focused_layer, dir)
+            .into_iter()
+            .find(|&layer| layer != self.focused_layer && self.layer_is_open(layer))
+    }
+
+    /// Ordered candidate layers for a spatial `<C-w><C-w>` cross from `from` in
+    /// `dir`; the first that is *open* ([`Editor::layer_is_open`]) wins. `Main` is
+    /// always open, so any list reaching it resolves there. Closed docks are
+    /// skipped — which is also how a press "wraps" past the far edge: e.g. `h` from
+    /// the left dock lists `[Right, Main]`, landing on the right dock when it's open
+    /// and otherwise falling through.
+    ///
+    /// The five regions form full-width top/bottom bands around a left|main|right
+    /// middle band (cf. `region_geoms`):
+    /// ```text
+    ///            TOP            (full width)
+    ///   LEFT  |  MAIN  | RIGHT  (middle band)
+    ///          BOTTOM           (full width)
+    /// ```
+    /// Each axis is a wrap-around ring of the regions it passes through. The
+    /// *vertical* column is `[Top, Main, Bottom]`, so a side dock's up/down moves
+    /// (`Left`/`Right`, whose column has no center) only ever reach top/bottom, never
+    /// main. The *horizontal* row is `[Left, Main, Right]`, but the full-width
+    /// top/bottom docks sit above/below the whole row, so their left/right moves
+    /// target the side docks (main is their vertical neighbour, reached with j/k).
+    fn cross_dir_candidates(from: Layer, dir: WinDir) -> [Layer; 2] {
+        use DockSide::{Bottom, Left, Right, Top};
+        use Layer::{Dock, Main};
+        use WinDir as W;
+        let (l, r, t, b) = (Dock(Left), Dock(Right), Dock(Top), Dock(Bottom));
+        match (from, dir) {
+            // Main: step to the edge dock on that side, else wrap to the opposite.
+            (Main, W::Left) => [l, r],
+            (Main, W::Right) => [r, l],
+            (Main, W::Up) => [t, b],
+            (Main, W::Down) => [b, t],
+            // Left dock: right→main, up/down→top/bottom, left wraps to the right dock.
+            (Dock(Left), W::Right) => [Main, r],
+            (Dock(Left), W::Left) => [r, Main],
+            (Dock(Left), W::Up) => [t, b],
+            (Dock(Left), W::Down) => [b, t],
+            // Right dock: the mirror of the left dock.
+            (Dock(Right), W::Left) => [Main, l],
+            (Dock(Right), W::Right) => [l, Main],
+            (Dock(Right), W::Up) => [t, b],
+            (Dock(Right), W::Down) => [b, t],
+            // Top dock: down→main, up wraps to bottom, left/right→the side docks.
+            (Dock(Top), W::Down) => [Main, b],
+            (Dock(Top), W::Up) => [b, Main],
+            (Dock(Top), W::Left) => [l, r],
+            (Dock(Top), W::Right) => [r, l],
+            // Bottom dock: the mirror of the top dock.
+            (Dock(Bottom), W::Up) => [Main, t],
+            (Dock(Bottom), W::Down) => [t, Main],
+            (Dock(Bottom), W::Left) => [l, r],
+            (Dock(Bottom), W::Right) => [r, l],
+        }
     }
 
     /// Drive one [`WindowCmd`] on the focused layer's tree. Shared by single

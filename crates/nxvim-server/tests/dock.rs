@@ -2,9 +2,10 @@
 //! driven black-box over RPC exactly like `tabs.rs` / `windows`-style suites.
 //!
 //! Docks are global (cross-tab) editable window regions pinned to a screen edge.
-//! `nx.dock.open/close/focus` create and address them; `<C-w><C-w>` crosses focus
-//! between the main area and the docks while single `<C-w>` stays within the
-//! focused layer. These tests drive that surface and assert on buffer content,
+//! `nx.dock.open/close/focus` create and address them; `<C-w><C-w>` + h/j/k/l
+//! crosses focus spatially between the main area and the docks (wrapping past the
+//! far edge) while single `<C-w>` stays within the focused layer. These tests
+//! drive that surface and assert on buffer content,
 //! the window list, and the projected `redraw`.
 
 use nxvim_rpc::{Incoming, Rpc};
@@ -207,7 +208,7 @@ async fn focus_crosses_into_and_out_of_a_dock() {
         "edits go to the dock buffer"
     );
 
-    // From a dock any directional `<C-w><C-w>` returns to the main area.
+    // From the left dock, `<C-w><C-w>l` (rightward) steps into the main area.
     feed(&rpc, "<C-w><C-w>l");
     assert_eq!(lines(&rpc).await, vec!["main"], "back in the main buffer");
 
@@ -1890,4 +1891,116 @@ async fn quitall_surfaces_a_modified_dock_buffer_in_its_dock() {
         vec!["d1", "MODIFIED", "d2"],
         "the dock now shows (and focuses) the buffer blocking the quit",
     );
+}
+
+/// Focus the region `from` (a dock side, or `"main"`), press `<C-w><C-w>{dir}`,
+/// and assert the now-focused buffer's single line is `want` — i.e. that the
+/// spatial cross landed in the expected region.
+async fn assert_cross(rpc: &Rpc, from: &str, dir: &str, want: &str) {
+    if from == "main" {
+        // No `dock.focus('main')`, so reach it deterministically: focus the left
+        // dock, then step right into main (always open).
+        exec_lua(rpc, "nx.dock.focus('left')").await;
+        feed(rpc, "<C-w><C-w>l");
+    } else {
+        exec_lua(rpc, &format!("nx.dock.focus('{from}')")).await;
+    }
+    feed(rpc, &format!("<C-w><C-w>{dir}"));
+    assert_eq!(
+        lines(rpc).await,
+        vec![want.to_string()],
+        "from {from}, <C-w><C-w>{dir} should land in {want}"
+    );
+}
+
+/// With all four docks open, `<C-w><C-w>` + h/j/k/l moves spatially between the
+/// regions (full-width top/bottom bands around a left|main|right middle band),
+/// wrapping past the far edge rather than always bouncing back to main.
+#[tokio::test]
+async fn cw_cw_crosses_spatially_between_docks() {
+    let (rpc, _incoming) = start().await;
+    // Give every region a one-line, identifiable buffer. Opening a dock focuses
+    // it, so the insert lands in that dock's scratch buffer.
+    feed(&rpc, "iMAIN<Esc>");
+    for (side, txt) in [
+        ("left", "LEFT"),
+        ("right", "RIGHT"),
+        ("top", "TOP"),
+        ("bottom", "BOT"),
+    ] {
+        exec_lua(
+            &rpc,
+            &format!("nx.dock.open{{ side = '{side}', size = 8 }}"),
+        )
+        .await;
+        feed(&rpc, &format!("i{txt}<Esc>"));
+    }
+
+    // From the bottom dock (full width): sideways to the side docks, up to main,
+    // down wraps to the top.
+    assert_cross(&rpc, "bottom", "h", "LEFT").await;
+    assert_cross(&rpc, "bottom", "l", "RIGHT").await;
+    assert_cross(&rpc, "bottom", "k", "MAIN").await;
+    assert_cross(&rpc, "bottom", "j", "TOP").await;
+
+    // From the left dock: right to main, up/down to top/bottom, left wraps to the
+    // opposite (right) dock.
+    assert_cross(&rpc, "left", "l", "MAIN").await;
+    assert_cross(&rpc, "left", "k", "TOP").await;
+    assert_cross(&rpc, "left", "j", "BOT").await;
+    assert_cross(&rpc, "left", "h", "RIGHT").await;
+
+    // From the right dock: the mirror of the left dock.
+    assert_cross(&rpc, "right", "h", "MAIN").await;
+    assert_cross(&rpc, "right", "k", "TOP").await;
+    assert_cross(&rpc, "right", "j", "BOT").await;
+    assert_cross(&rpc, "right", "l", "LEFT").await;
+
+    // From the top dock (full width): down to main, up wraps to the bottom,
+    // sideways to the side docks.
+    assert_cross(&rpc, "top", "j", "MAIN").await;
+    assert_cross(&rpc, "top", "k", "BOT").await;
+    assert_cross(&rpc, "top", "h", "LEFT").await;
+    assert_cross(&rpc, "top", "l", "RIGHT").await;
+
+    // From main: out to each edge dock.
+    assert_cross(&rpc, "main", "h", "LEFT").await;
+    assert_cross(&rpc, "main", "l", "RIGHT").await;
+    assert_cross(&rpc, "main", "k", "TOP").await;
+    assert_cross(&rpc, "main", "j", "BOT").await;
+}
+
+/// A direction with no open region beyond it is a no-op (focus stays put), and a
+/// press toward a *closed* dock wraps to the open one on the far edge.
+#[tokio::test]
+async fn cw_cw_cross_no_ops_and_wraps_with_one_axis_open() {
+    let (rpc, _incoming) = start().await;
+    feed(&rpc, "iMAIN<Esc>");
+    // Only the left and right docks are open — the vertical axis is empty.
+    exec_lua(&rpc, "nx.dock.open{ side = 'left', size = 8 }").await;
+    feed(&rpc, "iLEFT<Esc>");
+    exec_lua(&rpc, "nx.dock.open{ side = 'right', size = 8 }").await;
+    feed(&rpc, "iRIGHT<Esc>");
+
+    // In the left dock, up/down find nothing open: focus stays in the dock.
+    exec_lua(&rpc, "nx.dock.focus('left')").await;
+    feed(&rpc, "<C-w><C-w>k");
+    assert_eq!(lines(&rpc).await, vec!["LEFT"], "no top dock: k is a no-op");
+    feed(&rpc, "<C-w><C-w>j");
+    assert_eq!(
+        lines(&rpc).await,
+        vec!["LEFT"],
+        "no bottom dock: j is a no-op"
+    );
+
+    // Pressing left from the left dock wraps to the open right dock.
+    feed(&rpc, "<C-w><C-w>h");
+    assert_eq!(
+        lines(&rpc).await,
+        vec!["RIGHT"],
+        "h wraps to the right dock"
+    );
+    // And left again from the right dock steps back to main.
+    feed(&rpc, "<C-w><C-w>h");
+    assert_eq!(lines(&rpc).await, vec!["MAIN"], "h from right reaches main");
 }

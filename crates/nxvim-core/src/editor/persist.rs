@@ -268,6 +268,22 @@ pub struct RegisterEntry {
 }
 
 impl Editor {
+    /// Merge restored ex / search history into the live rings (older entries ahead of
+    /// what's there, dropping duplicates) and re-cap to `'history'`. The history-only
+    /// counterpart of [`import_persist`](Self::import_persist), used by the server to
+    /// fold in the **global** history store post-config (`persisthistory` including
+    /// `global`) without disturbing the marks / registers the primary store seeded.
+    pub fn merge_persisted_history(&mut self, ex: Vec<String>, search: Vec<String>) {
+        merge_history(&mut self.ex_history, ex);
+        merge_history(&mut self.search_history, search);
+        self.cap_history();
+    }
+
+    /// The ex / search history snapshot, for a history-only flush to the global store.
+    pub fn export_history(&self) -> (Vec<String>, Vec<String>) {
+        (self.ex_history.clone(), self.search_history.clone())
+    }
+
     /// Snapshot the cross-session state into a [`PersistState`] for the server to
     /// write. Pure: reads live editor state, allocates owned copies, touches no
     /// I/O.
@@ -869,6 +885,9 @@ impl Editor {
         // duplicates so a repeated entry keeps its newest position.
         merge_history(&mut self.search_history, state.search_history);
         merge_history(&mut self.ex_history, state.ex_history);
+        // A restored ring can exceed the live `'history'` cap (a smaller value than the
+        // store's persistence ceiling); trim to it.
+        self.cap_history();
         // Numbered marks `'0`–`'9` were already shifted by the store at load; seed
         // them path-based (resolved to a buffer lazily on the `` `0 `` jump).
         for entry in state.numbered_marks {

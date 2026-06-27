@@ -324,6 +324,85 @@ async fn input_rejects_a_non_string_history() {
     );
 }
 
+// ----- 'history' cap ---------------------------------------------------------
+
+#[tokio::test]
+async fn history_option_caps_the_namespace_ring() {
+    let dir = temp_dir("ui_input_hist_cap");
+    let (rpc, _incoming) = start(&dir, "").await;
+
+    // Cap history at 2, then submit three distinct entries under one namespace.
+    exec_lua(&rpc, "nx.o.history = 2").await;
+    for line in ["aaa<CR>", "bbb<CR>", "ccc<CR>"] {
+        exec_lua(
+            &rpc,
+            "nx.ui.input({ prompt = '> ', history = 'h' }):next(function() end)",
+        )
+        .await;
+        feed(&rpc, line);
+    }
+
+    // The oldest ("aaa") was dropped: <Up> walks ccc -> bbb and saturates at bbb,
+    // never reaching aaa.
+    exec_lua(
+        &rpc,
+        "_G.r = nil
+         nx.ui.input({ prompt = '> ', history = 'h' }):next(function(t) _G.r = t end)",
+    )
+    .await;
+    feed(&rpc, "<Up><Up><Up><CR>");
+    assert_eq!(
+        exec_lua(&rpc, "return _G.r").await.as_str(),
+        Some("bbb"),
+        "history=2 must drop the oldest entry"
+    );
+}
+
+#[tokio::test]
+async fn history_option_zero_disables_recall() {
+    let dir = temp_dir("ui_input_hist_zero");
+    let (rpc, _incoming) = start(&dir, "").await;
+
+    // `:set history=0` (the ex path) disables history entirely — nothing recalls.
+    exec_lua(&rpc, "nx.cmd('set history=0')").await;
+    exec_lua(
+        &rpc,
+        "nx.ui.input({ prompt = '> ', history = 'h' }):next(function() end)",
+    )
+    .await;
+    feed(&rpc, "recorded?<CR>");
+
+    exec_lua(
+        &rpc,
+        "_G.r = 'unset'
+         nx.ui.input({ prompt = '> ', history = 'h' }):next(function(t) _G.r = t end)",
+    )
+    .await;
+    feed(&rpc, "<Up><CR>");
+    assert_eq!(
+        exec_lua(&rpc, "return _G.r").await.as_str(),
+        Some(""),
+        "history=0 keeps no entries, so <Up> recalls nothing"
+    );
+}
+
+#[tokio::test]
+async fn history_option_reads_back() {
+    let dir = temp_dir("ui_input_hist_read");
+    let (rpc, _incoming) = start(&dir, "").await;
+
+    // Default, then a write, both via nx.o and the :set query.
+    assert_eq!(
+        exec_lua(&rpc, "return nx.o.history").await.as_i64(),
+        Some(10000)
+    );
+    exec_lua(&rpc, "nx.o.history = 42").await;
+    assert_eq!(
+        exec_lua(&rpc, "return nx.o.history").await.as_i64(),
+        Some(42)
+    );
+}
+
 // ----- nx.ui.input autocomplete (the <Tab> wildmenu) -------------------------
 
 #[tokio::test]

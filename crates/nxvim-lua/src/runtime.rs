@@ -392,6 +392,11 @@ pub struct GoMirror {
     pub scrollanimduration: u64,
     /// `'scrollback'` — the terminal scrollback cap in rows. Backs `vim.o.scrollback`.
     pub scrollback: u64,
+    /// `'history'` — the per-ring history cap. Backs `vim.o.history` / `nx.o.history`.
+    pub history: u64,
+    /// `'persisthistory'` — where history persists (`none`/`workspace`/`global`, comma
+    /// list). Backs `vim.o.persisthistory` / `nx.o.persisthistory`.
+    pub persisthistory: String,
     /// `'timeout'` — whether a mapped sequence waits `timeoutlen` to resolve (on) or
     /// is held forever for the next key (off). Backs `vim.o.timeout` / `nx.o.timeout`.
     pub timeout: bool,

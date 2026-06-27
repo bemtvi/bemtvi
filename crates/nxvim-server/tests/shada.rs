@@ -29,6 +29,18 @@ fn init_with_store(dir: &Path, file: Option<String>) -> ServerInit {
     }
 }
 
+/// A **workspace** server: a private primary store under `primary`, plus the shared
+/// global history store under `global` (used only when `'persisthistory'` targets it).
+fn init_workspace(primary: &Path, global: &Path, file: Option<String>) -> ServerInit {
+    ServerInit {
+        file,
+        shada: Some(Box::new(RedbFileStore::new(primary.to_path_buf()))),
+        global_shada: Some(Box::new(RedbFileStore::new(global.to_path_buf()))),
+        workspace_session: true,
+        ..Default::default()
+    }
+}
+
 /// Drain the client's incoming channel until it closes. The channel closes only
 /// when the server thread has fully returned from `run_server` — which happens
 /// *after* the final shada flush — so awaiting this is a reliable "the store has
@@ -343,6 +355,151 @@ async fn search_history_survives_a_restart() {
         feed(&rpc, "/<Up><CR>");
         assert_eq!(cursor(&rpc).await, (3, 0));
     }
+}
+
+#[tokio::test]
+async fn persisthistory_none_does_not_persist() {
+    let dir = temp_dir("shada_phist_none");
+    let file = write_temp("shada_phist_none", "txt", "alpha\nbeta\ngamma\n");
+
+    // Session 1: disable history persistence, then run a search and quit.
+    {
+        let (rpc, incoming) =
+            start_attached(init_with_store(&dir, Some(file.clone())), 80, 25).await;
+        exec_lua(&rpc, "nx.o.persisthistory = 'none'").await;
+        feed(&rpc, "/gamma<CR>");
+        assert_eq!(cursor(&rpc).await, (3, 0));
+        feed(&rpc, ":qa!<CR>");
+        await_server_exit(incoming).await;
+    }
+
+    // Session 2: nothing was written, so <Up> recalls no pattern — the empty search is
+    // E35 and the cursor stays at the top.
+    {
+        let (rpc, _incoming) = start_attached(init_with_store(&dir, Some(file)), 80, 25).await;
+        feed(&rpc, "/<Up><CR>");
+        assert_eq!(cursor(&rpc).await, (1, 0));
+    }
+}
+
+#[tokio::test]
+async fn default_workspace_history_is_workspace_scoped() {
+    // The default `persisthistory = "workspace,global"` saves to the WORKSPACE store
+    // when one is open (not the global one): a project's history is restored in that
+    // project and does NOT leak to other workspaces.
+    let gdir = temp_dir("shada_dws_global");
+    let ws1 = temp_dir("shada_dws_ws1");
+    let ws2 = temp_dir("shada_dws_ws2");
+    let file = write_temp("shada_dws", "txt", "alpha\nbeta\ngamma\n");
+
+    // Workspace 1: search `/gamma`, then quit.
+    {
+        let (rpc, incoming) =
+            start_attached(init_workspace(&ws1, &gdir, Some(file.clone())), 80, 25).await;
+        feed(&rpc, "/gamma<CR>");
+        assert_eq!(cursor(&rpc).await, (3, 0));
+        feed(&rpc, ":qa!<CR>");
+        await_server_exit(incoming).await;
+    }
+
+    // A DIFFERENT workspace (same shared global store) does NOT see it — the default
+    // kept it workspace-scoped, so `/<Up>` recalls nothing and the cursor stays at top.
+    {
+        let (rpc, _incoming) =
+            start_attached(init_workspace(&ws2, &gdir, Some(file.clone())), 80, 25).await;
+        feed(&rpc, "/<Up><CR>");
+        assert_eq!(
+            cursor(&rpc).await,
+            (1, 0),
+            "history must not leak across workspaces"
+        );
+    }
+
+    // Re-opening workspace 1 restores its history (the workspace is loaded again).
+    {
+        let (rpc, _incoming) =
+            start_attached(init_workspace(&ws1, &gdir, Some(file)), 80, 25).await;
+        feed(&rpc, "/<Up><CR>");
+        assert_eq!(cursor(&rpc).await, (3, 0), "workspace history must restore");
+    }
+}
+
+/// Write an `init.lua` into a fresh config dir and return it, for tests that need a
+/// config-set option (`'persisthistory'` is read post-config).
+fn config_with(slug: &str, lua: &str) -> PathBuf {
+    let dir = temp_dir(slug);
+    std::fs::write(dir.join("init.lua"), lua).expect("write init.lua");
+    dir
+}
+
+/// A workspace server that also sources `config_dir/init.lua` at startup.
+fn init_workspace_cfg(
+    primary: &Path,
+    global: &Path,
+    config_dir: &Path,
+    file: Option<String>,
+) -> ServerInit {
+    ServerInit {
+        config_dir: Some(config_dir.to_path_buf()),
+        ..init_workspace(primary, global, file)
+    }
+}
+
+#[tokio::test]
+async fn persisthistory_global_targets_the_global_store() {
+    // `persisthistory = "global"` on a workspace launch routes history to the shared
+    // global store instead of the workspace one, so it crosses workspaces.
+    let gdir = temp_dir("shada_ptg_global");
+    let ws1 = temp_dir("shada_ptg_ws1");
+    let ws2 = temp_dir("shada_ptg_ws2");
+    let cfg = config_with("shada_ptg_cfg", "nx.o.persisthistory = 'global'");
+    let file = write_temp("shada_ptg", "txt", "alpha\nbeta\ngamma\n");
+
+    // Workspace 1 (history → global): search `/gamma`, quit.
+    {
+        let (rpc, incoming) = start_attached(
+            init_workspace_cfg(&ws1, &gdir, &cfg, Some(file.clone())),
+            80,
+            25,
+        )
+        .await;
+        feed(&rpc, "/gamma<CR>");
+        assert_eq!(cursor(&rpc).await, (3, 0));
+        feed(&rpc, ":qa!<CR>");
+        await_server_exit(incoming).await;
+    }
+
+    // Workspace 2 (different primary, same global, also → global): the global history
+    // restores, so `/<Up>` recalls `gamma`.
+    {
+        let (rpc, _incoming) =
+            start_attached(init_workspace_cfg(&ws2, &gdir, &cfg, Some(file)), 80, 25).await;
+        feed(&rpc, "/<Up><CR>");
+        assert_eq!(
+            cursor(&rpc).await,
+            (3, 0),
+            "global-targeted history must cross workspaces"
+        );
+    }
+}
+
+#[tokio::test]
+async fn persisthistory_rejects_an_invalid_value() {
+    let dir = temp_dir("shada_phist_valid");
+    let (rpc, _incoming) = start_attached(init_with_store(&dir, None), 80, 25).await;
+
+    // A valid value applies; a bogus one is rejected (E474), leaving the prior value.
+    exec_lua(&rpc, "nx.cmd('set persisthistory=global')").await;
+    assert_eq!(
+        exec_lua(&rpc, "return nx.o.persisthistory").await.as_str(),
+        Some("global")
+    );
+    exec_lua(&rpc, "nx.cmd('set persisthistory=bogus')").await;
+    assert_eq!(
+        exec_lua(&rpc, "return nx.o.persisthistory").await.as_str(),
+        Some("global"),
+        "an invalid persisthistory must be rejected, not stored"
+    );
 }
 
 #[tokio::test]

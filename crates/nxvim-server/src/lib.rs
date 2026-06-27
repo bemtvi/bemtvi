@@ -205,6 +205,14 @@ pub struct ServerInit {
     /// it rides [`ServerInit`] onto the server's own thread. See
     /// `docs/plans/2026-06-11-shada-persistence.md`.
     pub shada: Option<Box<dyn ShadaStore + Send>>,
+    /// The **global** history store handle for a workspace launch, used iff
+    /// `'persisthistory'` resolves to `global` (e.g. `"global"` / `"global,workspace"`):
+    /// history then persists here instead of the workspace store (history-only, never
+    /// compacting), so it is shared across projects. `None` for a plain launch (its
+    /// [`shada`] IS the global store) and for a remote/wasm session (single store). The
+    /// binary sets it to [`default_shada`] for a local workspace launch; a test injects a
+    /// temp store. The server only uses it when the option targets `global`.
+    pub global_shada: Option<Box<dyn ShadaStore + Send>>,
     /// Whether this launch is a session-scoped workspace (its [`shada`] store is a
     /// private `ns/<uuid>` subfolder, set via `--shada-namespace`). When `true`, the
     /// shada additionally **captures** the editor session (open files + exact layout) at
@@ -619,6 +627,14 @@ pub struct EditHost {
     /// run off the input tick (startup, the debounce arm, exit), never inside it.
     #[cfg(feature = "native")]
     shada: Option<Box<dyn ShadaStore + Send>>,
+    /// The global history store for a workspace launch whose `'persisthistory'` resolves
+    /// to `global` (see [`ServerInit::global_shada`]) — history then routes here *instead*
+    /// of the workspace store, history-only and never compacting (it shares the global
+    /// dir with plain sessions' full-state files). Opened from `init.global_shada` and
+    /// restored post-config ([`EditHost::init_global_history`], which drops it when the
+    /// session targets the workspace store or `none`). `None` otherwise.
+    #[cfg(feature = "native")]
+    global_history: Option<Box<dyn ShadaStore + Send>>,
     /// Whether this launch is a session-scoped **workspace** (its shada is a private
     /// `ns/<uuid>` subfolder). Only then does the shada carry the editor *session*
     /// (open files + layout): capture attaches it at flush, and the boot load applies
@@ -1075,6 +1091,8 @@ impl EditHost {
             fx,
             #[cfg(feature = "native")]
             shada: None,
+            #[cfg(feature = "native")]
+            global_history: None,
             #[cfg(feature = "native")]
             workspace_session: false,
             #[cfg(feature = "native")]
@@ -2224,6 +2242,10 @@ impl EditHost {
         if self.workspace_session {
             snap.workspace_options = self.editor.workspace_options().clone();
         }
+        // `'persisthistory'` routing: drop history from the primary store's snapshot when
+        // the primary isn't the chosen history store; a workspace launch targeting the
+        // global store writes history there instead (below).
+        self.gate_primary_history(&mut snap);
         let mut flushed = false;
         if let Some(store) = self.shada.as_mut() {
             // A live checkpoint never compacts: deleting an absorbed sibling while we
@@ -2234,6 +2256,9 @@ impl EditHost {
                 Err(e) => eprintln!("shada: checkpoint flush failed: {e}"),
             }
         }
+        // A workspace launch targeting `global`: write history to the global store
+        // instead (history-only, never compacting). A no-op when it isn't the target.
+        self.global_history_flush();
         // For a `Remote`-config session, push the freshly-committed store to the daemon
         // (fire-and-forget — the editor tick never blocks on the network).
         if flushed {
@@ -2256,11 +2281,107 @@ impl EditHost {
         if self.workspace_session {
             snap.workspace_options = self.editor.workspace_options().clone();
         }
+        self.gate_primary_history(&mut snap);
         if let Some(store) = self.shada.as_mut() {
             // The clean exit: compact (delete the siblings absorbed at load) *after*
             // this final snapshot — which folds in their data — is durable.
             if let Err(e) = store.flush(&snap, true) {
                 eprintln!("shada: final flush failed: {e}");
+            }
+        }
+    }
+
+    /// The single store history persists to this session, from the live
+    /// `'persisthistory'` priority list + whether this is a workspace launch (see
+    /// [`effective_history_scope`](nxvim_core::effective_history_scope)).
+    fn history_scope(&self) -> nxvim_core::HistoryScope {
+        nxvim_core::effective_history_scope(
+            &self.editor.global_options().persisthistory,
+            self.workspace_session,
+        )
+    }
+
+    /// Whether the primary store ([`shada`](Self::shada)) is the chosen history store:
+    /// its scope is `Workspace` for a workspace launch, else `Global`. History rides the
+    /// primary's normal flush iff the chosen scope matches; otherwise it routes to the
+    /// separate global store (a workspace launch targeting `global`) or nowhere (`none`).
+    fn primary_keeps_history(&self) -> bool {
+        use nxvim_core::HistoryScope::{Global, Workspace};
+        match self.history_scope() {
+            Workspace => self.workspace_session,
+            Global => !self.workspace_session,
+            nxvim_core::HistoryScope::None => false,
+        }
+    }
+
+    /// Drop the history fields from a primary-store snapshot when the primary isn't the
+    /// chosen history store (so `none`, or a workspace launch targeting `global`, writes
+    /// no history to the workspace store).
+    fn gate_primary_history(&self, snap: &mut nxvim_core::PersistState) {
+        if !self.primary_keeps_history() {
+            snap.ex_history.clear();
+            snap.search_history.clear();
+        }
+    }
+
+    /// Post-config: when a **workspace** launch targets the **global** store
+    /// (`'persisthistory'` resolves to `global` — e.g. `"global"` or `"global,workspace"`),
+    /// restore the shared global history into the rings and keep the store handle for the
+    /// flush sites. Otherwise (the default `workspace`, a plain launch whose primary is
+    /// already global, or `none`) drop the handle so nothing flushes to it. Runs after
+    /// `init.lua` — the primary load (which restores the workspace history) is pre-config.
+    pub(crate) fn init_global_history(&mut self) {
+        let targets_global =
+            self.workspace_session && self.history_scope() == nxvim_core::HistoryScope::Global;
+        if !targets_global {
+            self.global_history = None;
+            return;
+        }
+        let Some(store) = self.global_history.as_mut() else {
+            return;
+        };
+        match store.load() {
+            Ok(state) => self
+                .editor
+                .merge_persisted_history(state.ex_history, state.search_history),
+            Err(e) => {
+                self.editor
+                    .echo(format!("shada: could not open global history store: {e}"));
+                self.global_history = None;
+            }
+        }
+    }
+
+    /// Build the history-only snapshot for the global store (everything else default —
+    /// the global store carries no marks / registers / session from a workspace launch).
+    fn global_history_snapshot(&self) -> nxvim_core::PersistState {
+        let (ex_history, search_history) = self.editor.export_history();
+        nxvim_core::PersistState {
+            ex_history,
+            search_history,
+            ..Default::default()
+        }
+    }
+
+    /// Live-checkpoint the global history store (history-only, `compact = false`): it
+    /// shares the global dir with plain sessions' full-state files, so compacting here
+    /// would delete their marks / registers — only a plain global session compacts.
+    pub(crate) fn global_history_flush(&mut self) {
+        let snap = self.global_history_snapshot();
+        if let Some(store) = self.global_history.as_mut() {
+            if let Err(e) = store.flush(&snap, false) {
+                eprintln!("shada: global history flush failed: {e}");
+            }
+        }
+    }
+
+    /// The global history store's clean-exit flush — still history-only and still
+    /// **never compacting**, for the same reason.
+    pub(crate) fn global_history_flush_final(&mut self) {
+        let snap = self.global_history_snapshot();
+        if let Some(store) = self.global_history.as_mut() {
+            if let Err(e) = store.flush(&snap, false) {
+                eprintln!("shada: global history final flush failed: {e}");
             }
         }
     }
@@ -2644,6 +2765,7 @@ where
     // persistence store (loaded before the first frame) and the optional fake mouse
     // clock (multi-click timing in tests).
     host.shada = init.shada;
+    host.global_history = init.global_shada;
     host.workspace_session = init.workspace_session;
     host.restore_session = init.restore_session;
     // For a `Remote`-config session, pair the remote shada target with the daemon fs
@@ -2738,6 +2860,11 @@ where
     // place (this is what initializes a completion plugin's engine, its sources, etc.).
     host.source_plugins();
 
+    // Fold in the global history store, now that config has set `'persisthistory'`
+    // (sourced above; `shada_load` ran before it). A workspace launch whose option
+    // includes `global` merges the shared global history into its rings here.
+    host.init_global_history();
+
     // The startup file arg was opened (as text) at editor construction, before the
     // config above ran — so a config that turned on `'imagepreview'` couldn't affect
     // that first open. Reconcile it now: if the startup buffer is an image and
@@ -2826,6 +2953,8 @@ where
     // now) — the store turns it into `'0` on the next launch, so `'0` only ever
     // reflects a clean exit. Best-effort — we're leaving.
     host.shada_flush_final();
+    // The global history store's own clean-exit flush (history-only, never compacting).
+    host.global_history_flush_final();
     // For a `Remote`-config session, push the final store to the daemon and **await** it
     // (a fire-and-forget spawn could be dropped as the process exits, losing the last
     // session's state). Best-effort; a no-op for a local-shada session.

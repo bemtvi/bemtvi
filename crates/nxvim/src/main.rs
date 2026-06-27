@@ -113,6 +113,16 @@ impl ShadaOpts {
         nxvim_server::workspace_shada(self.namespace.as_deref())
     }
 
+    /// The **global** history store for a workspace launch (`'persisthistory'` may route
+    /// history here in addition to the namespaced store). `Some` only when a namespace is
+    /// set — a plain launch's primary store IS the global one, so it needs no second
+    /// handle. The server gates actual use on `'persisthistory'` including `global`.
+    fn global_history_store(&self) -> Option<Box<dyn nxvim_server::ShadaStore + Send>> {
+        self.namespace
+            .as_ref()
+            .map(|_| nxvim_server::default_shada())
+    }
+
     /// The shada namespace, so a `Remote`-config session isolates its on-daemon shada under
     /// `ns/<NS>/` the same way the local store does.
     fn namespace(&self) -> Option<&str> {
@@ -479,6 +489,9 @@ fn main() -> Result<()> {
         // `--shada-namespace` is given. Editor state lives where the editor runs, so the
         // edit-host split persists locally (only fs/proc cross to the daemon).
         shada: Some(shada.store()),
+        // The global history store (used iff `'persisthistory'` includes `global` on a
+        // workspace launch); `None` for a plain launch (its primary is already global).
+        global_shada: shada.global_history_store(),
         // A local (embedded) session never syncs shada to a daemon.
         remote_shada: None,
         // A namespaced launch also captures the editor session (open files + exact
@@ -741,6 +754,9 @@ where
                 file,
                 config_dir: resolved.config_dir,
                 shada: Some(shada_store),
+                // A remote/daemon session keeps the existing single-store behavior — the
+                // global history dual-write is native + local only.
+                global_shada: None,
                 remote_shada,
                 workspace_session: shada.capture(),
                 restore_session: shada.do_restore(),

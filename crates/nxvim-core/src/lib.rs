@@ -55,7 +55,10 @@ pub use input::{
     WheelDir,
 };
 pub use mode::{KeyContext, Mode};
-pub use options::{BufferOptions, Options, Padding, SignColumn, WindowOptions};
+pub use options::{
+    effective_history_scope, BufferOptions, HistoryScope, Options, Padding, SignColumn,
+    WindowOptions,
+};
 pub use snippet::{parse_snippet, ParsedSnippet, SnippetError, TabStop};
 pub use syntax::{FoldRange, IndentParams, OpenOutcome, Span, SyntaxEngine};
 pub use view::{ContentFloatView, MenuView, TabView, View, ViewRect, WindowView};

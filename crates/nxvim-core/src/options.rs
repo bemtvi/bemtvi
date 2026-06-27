@@ -131,6 +131,17 @@ pub struct Options {
     /// (neovim's `'scrollback'`; default `10000`). `0` keeps none. Read when a
     /// terminal opens; changing it affects terminals opened afterward.
     pub scrollback: usize,
+    /// The maximum number of entries kept in each history ring — the `:` ex history,
+    /// the `/` search history, and each `nx.ui.input` namespace ring (neovim's
+    /// `'history'`; default `10000`). `0` disables history (nothing recalled). The
+    /// newest entries are kept; a value above the store's persistence ceiling (10000)
+    /// is held in memory but only the newest 10000 survive a restart.
+    pub history: usize,
+    /// Where command-line / search history persists across sessions (nxvim's
+    /// `'persisthistory'`; default `"workspace,global"`). A comma list of `workspace`
+    /// (the per-namespace store) and/or `global` (the shared store), or the lone token
+    /// `none` to persist no history. The server reads it to route the shada flush/load.
+    pub persisthistory: String,
     /// The scanf-style `'errorformat'` used to parse `:make`/`:grep`/`:cbuffer`
     /// output into quickfix entries (see [`crate::editor::quickfix`]). A
     /// comma-separated list of format parts; default [`DFLT_EFM`]. Global-only for
@@ -244,6 +255,8 @@ impl Options {
             ("timeoutlen", Num(n)) => self.timeoutlen = *n as usize,
             ("scrollanimduration", Num(n)) => self.scrollanimduration = *n as usize,
             ("scrollback", Num(n)) => self.scrollback = *n as usize,
+            ("history", Num(n)) => self.history = *n as usize,
+            ("persisthistory", Str(s)) => self.persisthistory = s.clone(),
             ("statusline", Str(s)) => self.statusline = s.clone(),
             ("tabline", Str(s)) => self.tabline = s.clone(),
             ("guifont", Str(s)) => self.guifont = s.clone(),
@@ -288,6 +301,8 @@ impl Options {
             "timeoutlen" => Num(self.timeoutlen as i64),
             "scrollanimduration" => Num(self.scrollanimduration as i64),
             "scrollback" => Num(self.scrollback as i64),
+            "history" => Num(self.history as i64),
+            "persisthistory" => Str(self.persisthistory.clone()),
             "statusline" => Str(self.statusline.clone()),
             "tabline" => Str(self.tabline.clone()),
             "guifont" => Str(self.guifont.clone()),
@@ -304,6 +319,52 @@ impl Options {
             _ => return None,
         })
     }
+}
+
+/// Which single store command-line / search history persists to (and restores from).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HistoryScope {
+    /// The per-workspace (namespace) store.
+    Workspace,
+    /// The shared global store.
+    Global,
+    /// Don't persist history.
+    None,
+}
+
+/// Resolve a `'persisthistory'` value to the **single** store history uses, given
+/// whether a workspace is open. The value is a *priority list*: the first token that
+/// is available wins — `workspace` only when `workspace_open`, `global` always, and
+/// `none` stops with no persistence. So the default `"workspace,global"` saves to the
+/// workspace store when one is open, else falls back to the global store. An empty /
+/// all-unavailable list is [`HistoryScope::None`]. (`:set` validates the value with
+/// [`valid_persisthistory`]; the lenient `nx.o` path skips unknown tokens here.)
+pub fn effective_history_scope(value: &str, workspace_open: bool) -> HistoryScope {
+    for tok in value.split(',') {
+        match tok.trim() {
+            "none" => return HistoryScope::None,
+            "workspace" if workspace_open => return HistoryScope::Workspace,
+            "global" => return HistoryScope::Global,
+            // `workspace` with no workspace open (skip to the fallback), or an unknown
+            // token (lenient): keep scanning the list.
+            _ => {}
+        }
+    }
+    HistoryScope::None
+}
+
+/// Whether a `'persisthistory'` value is well-formed: either the lone token `none`, or
+/// a comma list drawn from `workspace` / `global` (each at most once is not enforced —
+/// duplicates are harmless). Used by the strict `:set` path to reject a typo with E474;
+/// `nx.o` stores any string (lenient policy) and [`parse_persisthistory`] ignores the
+/// rest.
+pub fn valid_persisthistory(value: &str) -> bool {
+    let tokens: Vec<&str> = value.split(',').map(str::trim).collect();
+    if tokens.contains(&"none") {
+        // `none` is exclusive — it may not combine with other tokens.
+        return tokens.len() == 1;
+    }
+    !tokens.is_empty() && tokens.iter().all(|t| *t == "workspace" || *t == "global")
 }
 
 /// Resolve `name` (or its standard abbreviation) to its canonical spelling, kind, and
@@ -376,6 +437,8 @@ impl Default for Options {
             scrollanimduration: 160,
             // Keep 10000 scrolled-off terminal lines, matching neovim's default.
             scrollback: 10_000,
+            history: 10_000,
+            persisthistory: "workspace,global".to_string(),
             // The compiled-in gcc/make-aware errorformat.
             errorformat: DFLT_EFM.to_string(),
             // nxvim default: a jump to a buffer already shown in another tab switches
@@ -1645,6 +1708,20 @@ static OPTIONS: &[OptionInfo] = {
             kind: Num,
             scope: Global,
             doc: "Maximum number of lines kept in a terminal buffer's scrollback.",
+        },
+        OptionInfo {
+            name: "history",
+            abbrev: Some("hi"),
+            kind: Num,
+            scope: Global,
+            doc: "Maximum number of entries kept in each command-line / search history ring.",
+        },
+        OptionInfo {
+            name: "persisthistory",
+            abbrev: Some("phisto"),
+            kind: Str,
+            scope: Global,
+            doc: "Where command-line / search history persists: none, workspace, global (comma list).",
         },
         OptionInfo {
             name: "errorformat",

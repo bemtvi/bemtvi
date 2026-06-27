@@ -2020,6 +2020,8 @@ impl EditHost {
             scrollanim: go.scrollanim,
             scrollanimduration: go.scrollanimduration as u64,
             scrollback: go.scrollback as u64,
+            history: go.history as u64,
+            persisthistory: go.persisthistory.clone(),
             timeout: go.timeout,
             timeoutlen: go.timeoutlen as u64,
             columns: columns as u64,

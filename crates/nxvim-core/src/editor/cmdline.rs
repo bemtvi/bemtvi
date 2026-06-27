@@ -497,9 +497,13 @@ impl Editor {
         if text.is_empty() {
             return;
         }
+        let cap = self.options.history;
         let ring = self.prompt_history.entry(key).or_default();
         if ring.last().map(String::as_str) != Some(text) {
             ring.push(text.to_string());
+            if ring.len() > cap {
+                ring.drain(0..ring.len() - cap);
+            }
         }
     }
 

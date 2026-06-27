@@ -1574,6 +1574,7 @@ impl Editor {
             || name == "timeoutlen"
             || name == "scrollanimduration"
             || name == "scrollback"
+            || name == "history"
         {
             if value < 0 {
                 self.echo(format!("E487: Argument must be positive: {name}={value}"));
@@ -1583,6 +1584,10 @@ impl Editor {
             self.global_base
                 .set_scalar(name, &crate::options::OptionScalar::Num(value));
             self.recompute_effective_options();
+            // A lowered `'history'` trims the live rings to the new cap at once.
+            if name == "history" {
+                self.cap_history();
+            }
             return;
         }
         let max = match name {

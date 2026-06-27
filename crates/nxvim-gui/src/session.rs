@@ -321,6 +321,9 @@ async fn server_init(
         // Editor + Lua run locally; shada is local for a `Local`-config session and on the
         // daemon for a `Remote`-config one (Approach A — synced over the fs seam).
         shada: Some(shada_store),
+        // No `--shada-namespace` from the GUI yet, so the primary store is already global
+        // — no separate global history store needed.
+        global_shada: None,
         remote_shada,
         // The GUI front end does not yet pass `--shada-namespace`, so it uses the global
         // store and never captures/restores the editor session (v1: TUI only).

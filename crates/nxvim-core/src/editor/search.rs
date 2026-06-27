@@ -167,19 +167,34 @@ impl Editor {
     }
 
     /// Record a submitted pattern in the search history, skipping a consecutive
-    /// duplicate (vim collapses repeats).
+    /// duplicate (vim collapses repeats), then trim to the `'history'` cap.
     fn remember_search(&mut self, pattern: &str) {
         if self.search_history.last().map(String::as_str) != Some(pattern) {
             self.search_history.push(pattern.to_string());
+            cap_ring(&mut self.search_history, self.options.history);
         }
     }
 
     /// Record an interactively-submitted `:` command in the ex history, skipping
-    /// an empty line or a consecutive duplicate (vim collapses repeats).
+    /// an empty line or a consecutive duplicate (vim collapses repeats), then trim to
+    /// the `'history'` cap.
     pub(crate) fn remember_ex(&mut self, cmd: &str) {
         let cmd = cmd.trim();
         if !cmd.is_empty() && self.ex_history.last().map(String::as_str) != Some(cmd) {
             self.ex_history.push(cmd.to_string());
+            cap_ring(&mut self.ex_history, self.options.history);
+        }
+    }
+
+    /// Trim every history ring (ex, search, and each `nx.ui.input` namespace ring) to
+    /// the newest `'history'` entries. Used when the option is lowered and after a
+    /// shada merge seeds the rings; the per-push `remember_*` paths trim inline.
+    pub(crate) fn cap_history(&mut self) {
+        let cap = self.options.history;
+        cap_ring(&mut self.ex_history, cap);
+        cap_ring(&mut self.search_history, cap);
+        for ring in self.prompt_history.values_mut() {
+            cap_ring(ring, cap);
         }
     }
 
@@ -653,5 +668,13 @@ impl Editor {
             }
         }
         (matches, current)
+    }
+}
+
+/// Trim a history ring to its newest `cap` entries (dropping the oldest from the
+/// front). `cap == 0` empties it — `'history'` of 0 disables that history.
+fn cap_ring(ring: &mut Vec<String>, cap: usize) {
+    if ring.len() > cap {
+        ring.drain(0..ring.len() - cap);
     }
 }

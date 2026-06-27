@@ -176,6 +176,7 @@ impl Editor {
                     || name == "timeoutlen"
                     || name == "scrollanimduration"
                     || name == "scrollback"
+                    || name == "history"
                 {
                     self.set_global_option_num(name, v);
                     return;
@@ -235,6 +236,7 @@ impl Editor {
                     "timeoutlen" => self.options.timeoutlen as i64,
                     "scrollanimduration" => self.options.scrollanimduration as i64,
                     "scrollback" => self.options.scrollback as i64,
+                    "history" => self.options.history as i64,
                     _ => {
                         let opts = &self.buffer().options;
                         match name {
@@ -519,6 +521,27 @@ impl Editor {
                     self.set_global_option_str("errorformat", &dflt);
                 }
                 StrOp::Query => self.echo(format!("errorformat={}", self.options.errorformat)),
+            }
+            return;
+        }
+        // `persisthistory` is validated on the strict `:set` path — a typo is E474,
+        // never a silently-stored bad value (the `nx.o` compat path stores any string,
+        // and the parser ignores unknown tokens).
+        if name == "persisthistory" {
+            match op {
+                StrOp::Set(value) => {
+                    if crate::options::valid_persisthistory(&value) {
+                        self.set_global_option_str("persisthistory", &value);
+                    } else {
+                        self.echo(format!("E474: Invalid argument: persisthistory={value}"));
+                    }
+                }
+                StrOp::Reset => {
+                    self.set_global_option_str("persisthistory", "workspace,global");
+                }
+                StrOp::Query => {
+                    self.echo(format!("persisthistory={}", self.options.persisthistory))
+                }
             }
             return;
         }

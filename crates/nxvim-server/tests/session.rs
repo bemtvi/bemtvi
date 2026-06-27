@@ -548,6 +548,72 @@ async fn session_restores_open_docks() {
     }
 }
 
+// The widths of the two main split windows (showing `session_ds_a` / `_b`), as
+// "<a>,<b>". Used to compare the live split against the restored one.
+async fn split_widths(rpc: &nxvim_rpc::Rpc) -> (i64, i64) {
+    let s = exec_lua(
+        rpc,
+        "local w = { a = -1, b = -1 }\n\
+         for _, win in ipairs(nx.win.list()) do\n\
+           local name = nx.buf.name(nx.win.buf(win))\n\
+           if name:match('session_ds_a') then w.a = nx.win.width(win) end\n\
+           if name:match('session_ds_b') then w.b = nx.win.width(win) end\n\
+         end\n\
+         return string.format('%d,%d', w.a, w.b)",
+    )
+    .await
+    .as_str()
+    .unwrap_or("")
+    .to_string();
+    let (a, b) = s.split_once(',').expect("two widths");
+    (a.parse().unwrap(), b.parse().unwrap())
+}
+
+#[tokio::test]
+async fn session_restores_split_sizes_under_a_dock_without_drift() {
+    // A split restored alongside a dock must be laid out against the SAME
+    // (dock-reduced) main area it had at save time, so it comes back at exactly its
+    // saved widths. The bug: tabs were rebuilt FIRST — laying every split out at
+    // FULL width — and the dock was restored afterward, so the split was rescaled a
+    // second time once the dock shrank the main area, and that extra rescale drifts
+    // it off its saved widths. Restoring the docks first means the split is laid out
+    // once, at its real width. `relativesplits = false` keeps the saved sizes as
+    // exact cells (not percentages), and both sessions run at the same width, so a
+    // faithful restore reproduces the widths to the cell.
+    let dir = temp_dir("session_dock_split_store");
+    let file_a = write_temp("session_ds_a", "txt", "a1\na2\n");
+    let file_b = write_temp("session_ds_b", "txt", "b1\nb2\n");
+
+    // Session 1 at width 80: a vertical split of two files in the main area plus a
+    // 22-col left dock. Record the live split widths, then capture + quit.
+    let (live_a, live_b) = {
+        let (rpc, incoming) = start_attached(init(&dir, Some(file_a.clone()), true), 80, 25).await;
+        exec_lua(&rpc, "nx.shada.save_layout(true)").await;
+        exec_lua(&rpc, "nx.o.relativesplits = false").await;
+        feed(&rpc, &format!(":vsplit {file_b}<CR>")); // A | B in the main area
+        exec_lua(&rpc, "nx.dock.open{ side = 'left', size = 22 }").await;
+        feed(&rpc, "<Esc>"); // settle a tick so the dock op drains + relayout runs
+        let live = split_widths(&rpc).await;
+        feed(&rpc, ":qa<CR>");
+        await_server_exit(incoming).await;
+        live
+    };
+    assert!(live_a > 0 && live_b > 0, "split exists in session 1");
+
+    // Session 2 at the same width 80: the dock + split come back at the exact saved
+    // widths. With the docks restored after the tabs they drifted by a cell.
+    {
+        let (rpc, _incoming) = start_attached(init(&dir, None, true), 80, 25).await;
+        let (rest_a, rest_b) = split_widths(&rpc).await;
+        assert_eq!(
+            (rest_a, rest_b),
+            (live_a, live_b),
+            "restored split matches the saved widths exactly \
+             (saved {live_a},{live_b}; restored {rest_a},{rest_b})"
+        );
+    }
+}
+
 #[tokio::test]
 async fn relativedocks_native_option_scales_the_dock() {
     // `relativedocks` is a NATIVE editor option (`nx.o.relativedocks`), not a plugin

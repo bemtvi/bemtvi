@@ -598,6 +598,15 @@ impl Editor {
         if session.tabs.is_empty() && session.docks.is_empty() {
             return;
         }
+        // Restore the edge docks FIRST, so the main area is already dock-reduced before any
+        // tab's split tree is laid out. Restoring tabs first would lay every split out at
+        // FULL width and only rescale it once a dock later shrinks the main area — and that
+        // second, lossy rescale drifts a balanced split off its saved proportions. With the
+        // docks in place up front, each tab is laid out exactly once, at its real width.
+        self.restore_docks(&session.docks);
+        // `restore_docks` leaves a dock as the focused layer; tab ops (`new_tab` /
+        // `install_restored_tree`) must run on the main tree, so cross back first.
+        self.ensure_main_layer();
         let mut built_any = false;
         for tab in &session.tabs {
             let mut windows: BTreeMap<WindowId, super::windows::Window> = BTreeMap::new();
@@ -619,11 +628,8 @@ impl Editor {
             built_any = true;
             self.install_restored_tree(tree);
         }
-        // Restore the edge docks (each `open_dock` makes the dock the live layer, so the
-        // rebuilt content installs the same way a main tab does).
-        self.restore_docks(&session.docks);
-        // Focus the saved active tab — this crosses back to the main layer, parking the
-        // docks and leaving the editor focused where it was.
+        // Focus the saved active tab — this leaves the editor focused on the main layer
+        // where it was, with the docks parked behind it.
         let tab_ids = self.tab_ids();
         if let Some(tid) = tab_ids.get(session.active_tab.min(tab_ids.len().saturating_sub(1))) {
             self.set_current_tabpage(*tid);

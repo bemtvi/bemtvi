@@ -427,17 +427,17 @@ pub fn run(
 }
 
 /// Report a `:connect` failure (bad host, refused auth, a malformed `nxvim://` URI) in
-/// the GUI message line via the *current* session — the new one never came up. The error
-/// chain is flattened to one line (`echom` rejects newlines) and single quotes doubled
-/// (Vim string escaping) so a hostname or path can't break the command.
+/// the GUI message line via the *current* session — the new one never came up. nxvim is
+/// its own editor and has no vimscript `:echohl`; `:echoerr` already renders the text as
+/// an error message. The error chain is flattened to one line (`echoerr` rejects
+/// newlines) and single quotes doubled (Vim string escaping) so a hostname or path can't
+/// break the command.
 fn report_connect_error(rpc: &Rpc, err: &anyhow::Error) {
     let line = format!(":connect failed: {err:#}").replace('\n', "; ");
     let escaped = line.replace('\'', "''");
     rpc.notify(
         "nx_command",
-        vec![Value::from(format!(
-            "echohl ErrorMsg|echom '{escaped}'|echohl NONE"
-        ))],
+        vec![Value::from(format!("echoerr '{escaped}'"))],
     );
 }
 

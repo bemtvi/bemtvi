@@ -126,3 +126,44 @@ async fn source_missing_file_errors() {
         "sourcing a missing file should report E484, got {msg:?}"
     );
 }
+
+/// The GUI's `report_connect_error` reports a failed `:connect` on the message line
+/// via the current session. nxvim is its own editor and implements `:echoerr`, but
+/// **not** vimscript's `:echohl` — an `echohl`-bar command (which the GUI used to
+/// emit) dies at the first bar with E492, swallowing the real connect error. Guard
+/// the working form: `:echoerr '<text>'` surfaces the text and never reports E492.
+#[tokio::test]
+async fn echoerr_reports_message_not_e492() {
+    let dir = temp_dir("excmd_echoerr");
+    let (rpc, mut incoming) = start(&dir).await;
+
+    // The form the GUI emits for a connect failure (single quotes Vim-doubled).
+    let msg = message_after(
+        &rpc,
+        &mut incoming,
+        ":echoerr ':connect failed: unknown host ''asdfasd'''<CR>",
+    )
+    .await;
+    assert!(
+        !msg.contains("E492"),
+        ":echoerr must not report E492, got {msg:?}"
+    );
+    assert!(
+        msg.contains("connect failed: unknown host 'asdfasd'"),
+        ":echoerr should surface the connect error text, got {msg:?}"
+    );
+
+    // The old `echohl`-bar form is exactly what produced the reported bug: `echohl`
+    // is not an nxvim ex-command, so the bar command reports E492 (kept as the
+    // documented reason the GUI must not use it).
+    let broken = message_after(
+        &rpc,
+        &mut incoming,
+        ":echohl ErrorMsg|echom 'x'|echohl NONE<CR>",
+    )
+    .await;
+    assert!(
+        broken.contains("E492") && broken.contains("echohl"),
+        "the echohl-bar form should fail with E492 on echohl, got {broken:?}"
+    );
+}

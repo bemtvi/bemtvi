@@ -2865,6 +2865,18 @@ where
     // includes `global` merges the shared global history into its rings here.
     host.init_global_history();
 
+    // A `--workspace <dir>` launch cds into the workspace root at startup (the VSCode
+    // "open folder" model), unless config turned `'workspacecwd'` off. Done AFTER
+    // `init.lua` so a config can disable it, and as a real global `:cd` so `DirChanged`
+    // fires before `VimEnter`. `workspace_dir` is the absolute, canonicalized root
+    // (`None` outside `--workspace`); for a daemon session it already equals the cwd, so
+    // the issued `:cd` is a harmless no-op.
+    if let Some(dir) = init.workspace_dir.clone() {
+        if host.editor.options.workspace_cwd {
+            host.workspace_chdir(&dir);
+        }
+    }
+
     // The startup file arg was opened (as text) at editor construction, before the
     // config above ran — so a config that turned on `'imagepreview'` couldn't affect
     // that first open. Reconcile it now: if the startup buffer is an image and

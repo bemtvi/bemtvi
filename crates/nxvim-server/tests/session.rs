@@ -394,27 +394,28 @@ async fn native_session_options_round_trip_through_the_mirror() {
         nx.o.relativesplits = false
         nx.o.relativedocks = true
         nx.o.workspacepersistunnamed = false
+        nx.o.workspacecwd = false
         -- a second exec_lua chunk reads after the server pushes the mirror; do it inline
         -- via a barrier read so we exercise the round-trip, not just the write-through.
-        return string.format("%s|%s|%s",
+        return string.format("%s|%s|%s|%s",
           tostring(nx.o.relativesplits), tostring(nx.o.relativedocks),
-          tostring(nx.o.workspacepersistunnamed))
+          tostring(nx.o.workspacepersistunnamed), tostring(nx.o.workspacecwd))
         "#,
     )
     .await;
     // Write-through within the chunk; the cross-tick mirror is checked below.
-    assert_eq!(got.as_str(), Some("false|true|false"));
+    assert_eq!(got.as_str(), Some("false|true|false|false"));
 
     let after = exec_lua(
         &rpc,
-        r#"return string.format("%s|%s|%s",
+        r#"return string.format("%s|%s|%s|%s",
              tostring(nx.o.relativesplits), tostring(nx.o.relativedocks),
-             tostring(nx.o.workspacepersistunnamed))"#,
+             tostring(nx.o.workspacepersistunnamed), tostring(nx.o.workspacecwd))"#,
     )
     .await;
     assert_eq!(
         after.as_str(),
-        Some("false|true|false"),
+        Some("false|true|false|false"),
         "the values survive the server's mirror refresh (rename keys match)"
     );
 }

@@ -438,6 +438,11 @@ pub struct GoMirror {
     /// `nx.o.workspacepersistunnamed`.
     #[serde(rename = "workspacepersistunnamed")]
     pub workspace_persist_unnamed: bool,
+    /// `'workspacecwd'` — whether a `--workspace` launch cds into the workspace
+    /// directory at startup (default true). Backs `nx.o.workspacecwd`. The snake_case
+    /// Rust field is renamed to the canonical (squashed) option name for the mirror key.
+    #[serde(rename = "workspacecwd")]
+    pub workspace_cwd: bool,
 }
 
 /// The pure-Lua `vim.*` prelude, split into focused modules under `src/prelude/`

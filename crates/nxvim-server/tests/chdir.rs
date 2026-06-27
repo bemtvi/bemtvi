@@ -378,3 +378,54 @@ async fn lcd_and_tcd_fire_dirchanged_with_their_scope() {
         "tabpage"
     );
 }
+
+/// A `--workspace <dir>` launch (`ServerInit::workspace_dir` set) cds into that directory
+/// at startup, so `getcwd()` reports the workspace root with no `:cd` typed — the
+/// `'workspacecwd'` default-on behavior.
+#[tokio::test]
+async fn workspace_launch_cds_into_the_workspace_dir() {
+    let _g = serial_lock().lock().await;
+    let _cwd = CwdGuard::capture();
+
+    let dir = temp_dir("ws-cwd");
+    let init = ServerInit {
+        workspace_dir: Some(dir.to_string_lossy().into_owned()),
+        ..ServerInit::default()
+    };
+    let (rpc, _incoming) = start_attached(init, 80, 24).await;
+    assert_eq!(getcwd(&rpc).await, canon(&dir));
+}
+
+/// `nx.o.workspacecwd = false` in the config disables the startup auto-cd: the workspace
+/// launch keeps the cwd it was started from, even though `workspace_dir` is set.
+#[tokio::test]
+async fn workspacecwd_off_keeps_the_launch_cwd() {
+    let _g = serial_lock().lock().await;
+    let cwd = CwdGuard::capture();
+    let before = getcwd_raw();
+
+    let cfg = temp_dir("ws-cwd-off-cfg");
+    std::fs::write(cfg.join("init.lua"), "nx.o.workspacecwd = false\n").expect("write init.lua");
+    let dir = temp_dir("ws-cwd-off");
+    let init = ServerInit {
+        config_dir: Some(cfg),
+        workspace_dir: Some(dir.to_string_lossy().into_owned()),
+        ..ServerInit::default()
+    };
+    let (rpc, _incoming) = start_attached(init, 80, 24).await;
+    assert_eq!(
+        getcwd(&rpc).await,
+        before,
+        "workspacecwd off must not move the cwd"
+    );
+    drop(cwd);
+}
+
+/// The launch process cwd as a string, for comparing against `getcwd()` after a no-op
+/// startup (no auto-cd). `current_dir()` already returns the kernel-canonical path.
+fn getcwd_raw() -> String {
+    std::env::current_dir()
+        .expect("cwd")
+        .to_string_lossy()
+        .into_owned()
+}

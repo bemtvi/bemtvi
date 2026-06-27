@@ -939,8 +939,9 @@ async fn completed_options_are_recognized_by_set() {
 
 /// Command-mode mouse needs `'c'` in `'mouse'` (the default `"nvi"` omits it). The
 /// wildmenu floats just above the command line — at the windows-area bottom, which in
-/// the headless harness is the attached row count — so candidate `r` sits that many
-/// rows up, and its content is one cell past the box's left border.
+/// the headless harness is the attached row count — and its list is painted *bottom-up*
+/// (best match nearest the line, growing upward), so the visible candidate `r` sits
+/// `r + 1` rows above the command line, its content one cell past the box's left border.
 const ATTACH_ROWS: usize = 24;
 
 fn menu_field_u64(map: &[(Value, Value)], key: &str) -> usize {
@@ -971,7 +972,11 @@ async fn clicking_a_wildmenu_candidate_selects_then_accepts_into_the_line() {
         want < height,
         "candidate {want} must be visible (height {height})"
     );
-    let click_row = ATTACH_ROWS - height + want;
+    // The list is drawn bottom-up, so logical candidate `want` is painted `want + 1`
+    // rows above the command line — *not* `want` rows down from the box top. Clicking
+    // the box-top-relative row (the old, buggy expectation) lands on candidate
+    // `height - 1 - want` instead, which is the inversion bug this guards against.
+    let click_row = ATTACH_ROWS - 1 - want;
     let click_col = col + 1;
 
     // Click the candidate: it highlights and previews on the command line; the menu

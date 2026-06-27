@@ -223,6 +223,12 @@ struct MenuScreen {
     start: usize,
     /// Total rows in the menu view (bounds the absolute index).
     total: usize,
+    /// The list is painted bottom-up: logical row 0 sits on the *last* visible
+    /// line, growing upward. Set for the command-line wildmenu, which floats above
+    /// its input so the best match kisses the cursor (every client flips the rows —
+    /// TUI `lines.reverse()`, GUI `list_rows - 1 - r`, web `listEls.reverse()`), so
+    /// the hit-test must flip the clicked offset to match what was drawn.
+    inverted: bool,
 }
 
 /// The completion **docs sidebar**'s on-screen box (global cells) plus the selected
@@ -1792,8 +1798,9 @@ impl Editor {
     /// Resolve a **global** screen cell to a spot on the open menu overlay: a
     /// selectable list row (the absolute view index), some other part of the box
     /// ([`MenuHit::Chrome`] — a border / prompt / filler), or `None` when the cell
-    /// is off the menu. Window-anchored placements only (the cmdline wildmenu has
-    /// its own frame, wired later); `None` when no menu is open.
+    /// is off the menu. Covers every placement [`Self::menu_screen`] resolves,
+    /// including the bottom-up cmdline wildmenu (its clicked offset is flipped to
+    /// match the painted rows); `None` when no menu is open.
     fn menu_hit(&self, row: usize, col: usize) -> Option<MenuHit> {
         let s = self.menu_screen()?;
         let (bx, by, bw, bh) = s.box_rect;
@@ -1813,7 +1820,12 @@ impl Editor {
         if (lx..lx.saturating_add(lw)).contains(&col)
             && (ly..ly.saturating_add(lrows)).contains(&row)
         {
-            let idx = s.start + (row - ly);
+            // The clicked offset into the list rect. When the list is painted
+            // bottom-up (the cmdline wildmenu) the top visual row is the last
+            // logical one, so flip the offset before adding the scroll start.
+            let off = row - ly;
+            let off = if s.inverted { lrows - 1 - off } else { off };
+            let idx = s.start + off;
             if idx < s.total {
                 return Some(MenuHit::Item(idx));
             }
@@ -1911,6 +1923,7 @@ impl Editor {
             preview,
             start: geom.start,
             total: m.total,
+            inverted: matches!(m.placement, MenuPlacement::Cmdline),
         })
     }
 

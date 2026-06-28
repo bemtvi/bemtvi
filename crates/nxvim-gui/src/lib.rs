@@ -1361,6 +1361,15 @@ impl ApplicationHandler<UserEvent> for App {
                     && self.view.command_mode
                     && self.view.cmdline_prefix == ':'
                     && self.view.cmdline_prompt.is_empty()
+                    // …but NOT while a completion picker (`nx.picker`, e.g. the
+                    // cmdline file completer) floats over the still-open command
+                    // line: there `<CR>` belongs to the picker so it can descend
+                    // into a directory or paste the chosen path. Intercepting it
+                    // here would pop the native dialog / submit instead, copying
+                    // every directory into the line and running the last one (the
+                    // GUI-only divergence from the TUI, where every key reaches the
+                    // server's picker untouched).
+                    && self.view.menu.is_none()
                 {
                     // `:connect [user@]host[:port][/file]` / `:connect nxvim://…` switches
                     // this window to an edit-host (daemon) session, and `:workspace [dir]`

@@ -3,7 +3,8 @@
 use super::*;
 use crate::encoding::Encoding;
 use crate::options::{
-    resolve_set, split_set_args, NumOp, OptScope, RegexSyntax, SetCmd, SetOp, StrOp, WindowOptions,
+    resolve_set, split_set_args, NumOp, OptKind, OptScope, RegexSyntax, SetCmd, SetOp, StrOp,
+    WindowOptions,
 };
 
 /// Number of decimal digits in `n` (at least 1, so `0` is one digit).
@@ -80,48 +81,30 @@ impl Editor {
         // *base* layer and recomputes the workspace overlay on top), so a `:set` of a
         // workspace-overridden option updates the base without clobbering the override — the
         // `:set` and `vim.o` paths share one home, exactly like the numeric/string globals.
-        if let Some((canon, _, OptScope::Global)) = crate::options::option_meta(name) {
-            // `option_meta` is the whole catalog; only the boolean globals belong here (the
-            // numeric/string ones are handled by `apply_set_num`/`apply_set_str`). Match the
-            // wired boolean globals so a non-bool global falls through to the slot E518 path.
-            if matches!(
-                canon,
-                "ignorecase"
-                    | "smartcase"
-                    | "wrapscan"
-                    | "hlsearch"
-                    | "incsearch"
-                    | "autoread"
-                    | "imagepreview"
-                    | "timeout"
-                    | "scrollanim"
-                    | "qfdock"
-                    | "bdclosetab"
-                    | "relativesplits"
-                    | "relativedocks"
-                    | "equalalways"
-                    | "workspacepersistunnamed"
-                    | "workspacecwd"
-            ) {
-                let cur = matches!(
-                    self.options.get_scalar(canon),
-                    Some(crate::options::OptionScalar::Bool(true))
-                );
-                match op {
-                    SetOp::On => self.set_global_option_bool(canon, true),
-                    SetOp::Off => self.set_global_option_bool(canon, false),
-                    SetOp::Toggle => self.set_global_option_bool(canon, !cur),
-                    SetOp::Query => {
-                        let label = if cur {
-                            canon.to_string()
-                        } else {
-                            format!("no{canon}")
-                        };
-                        self.echo(label);
-                    }
+        // A boolean global is identified by the catalog's own kind+scope classification
+        // (`Bool` + `Global`), not a hand-kept name list — so this can never drift from the
+        // catalog / `Options::set_scalar`. A non-bool global (numeric/string) doesn't match
+        // and falls through to `apply_set_num`/`apply_set_str`; a window/buffer bool falls
+        // through to the slot match below.
+        if let Some((canon, OptKind::Bool, OptScope::Global)) = crate::options::option_meta(name) {
+            let cur = matches!(
+                self.options.get_scalar(canon),
+                Some(crate::options::OptionScalar::Bool(true))
+            );
+            match op {
+                SetOp::On => self.set_global_option_bool(canon, true),
+                SetOp::Off => self.set_global_option_bool(canon, false),
+                SetOp::Toggle => self.set_global_option_bool(canon, !cur),
+                SetOp::Query => {
+                    let label = if cur {
+                        canon.to_string()
+                    } else {
+                        format!("no{canon}")
+                    };
+                    self.echo(label);
                 }
-                return;
             }
+            return;
         }
         let slot = match name {
             "number" => &mut self.windows.cur_mut().options.number,
@@ -169,17 +152,14 @@ impl Editor {
     fn apply_set_num(&mut self, name: &str, op: NumOp) {
         match op {
             NumOp::Set(v) => {
-                // `showtabline` / `laststatus` are the global numeric options;
-                // route them through the shared setter so the `:set` and `vim.o`
-                // paths validate, echo, and relayout identically.
-                if name == "showtabline"
-                    || name == "laststatus"
-                    || name == "mousetime"
-                    || name == "timeoutlen"
-                    || name == "scrollanimduration"
-                    || name == "scrollback"
-                    || name == "history"
-                {
+                // The global numeric options route through the shared setter so the
+                // `:set` and `vim.o` paths validate, echo, and relayout identically.
+                // Identified by the catalog's `Num` + `Global` classification, not a
+                // hand-kept name list, so this can't drift from the catalog.
+                if matches!(
+                    crate::options::option_meta(name),
+                    Some((_, OptKind::Num, OptScope::Global))
+                ) {
                     self.set_global_option_num(name, v);
                     return;
                 }
@@ -226,19 +206,19 @@ impl Editor {
                 }
             }
             NumOp::Query => {
+                // Global numerics read through the shared scalar accessor (catalog-driven),
+                // so the readout can't drift from `set_scalar`'s name→field map; window /
+                // buffer locals (which `get_scalar` doesn't know) fall through below.
+                if let Some(crate::options::OptionScalar::Num(v)) = self.options.get_scalar(name) {
+                    self.echo(format!("{name}={v}"));
+                    return;
+                }
                 let v: i64 = match name {
                     "sidescroll" => self.windows.cur().options.sidescroll as i64,
                     "sidescrolloff" => self.windows.cur().options.sidescrolloff as i64,
                     "numberwidth" => self.windows.cur().options.numberwidth as i64,
                     "foldcolumn" => self.windows.cur().options.foldcolumn as i64,
                     "foldlevel" => self.windows.cur().options.foldlevel as i64,
-                    "showtabline" => self.options.showtabline as i64,
-                    "laststatus" => self.options.laststatus as i64,
-                    "mousetime" => self.options.mousetime as i64,
-                    "timeoutlen" => self.options.timeoutlen as i64,
-                    "scrollanimduration" => self.options.scrollanimduration as i64,
-                    "scrollback" => self.options.scrollback as i64,
-                    "history" => self.options.history as i64,
                     _ => {
                         let opts = &self.buffer().options;
                         match name {
@@ -645,23 +625,15 @@ impl Editor {
                 }
             }
             StrOp::Query => {
-                let value = match name {
-                    "statusline" => self.options.statusline.clone(),
-                    "tabline" => self.options.tabline.clone(),
-                    "guifont" => self.options.guifont.clone(),
-                    "mouse" => self.options.mouse.clone(),
-                    "mousemodel" => self.options.mousemodel.clone(),
-                    "mousescroll" => self.options.mousescroll.clone(),
-                    "switchbuf" => self.options.switchbuf.clone(),
-                    "makeprg" => self.options.makeprg.clone(),
-                    "grepprg" => self.options.grepprg.clone(),
-                    "grepformat" => self.options.grepformat.clone(),
-                    _ => {
-                        unknown(self);
-                        return;
+                // The plain string globals read through the shared scalar accessor
+                // (catalog-driven, so it can't drift from `set_scalar`); the special-cased
+                // strings (filetype, fileencodings, errorformat, …) already returned above.
+                match self.options.get_scalar(name) {
+                    Some(crate::options::OptionScalar::Str(value)) => {
+                        self.echo(format!("{name}={value}"))
                     }
-                };
-                self.echo(format!("{name}={value}"));
+                    _ => unknown(self),
+                }
             }
         }
     }

@@ -26,59 +26,28 @@ async fn set_message(rpc: &Rpc, incoming: &mut UnboundedReceiver<Incoming>, args
 /// way to its storage — `:set <name>?` returns a real readout, never an empty
 /// (silent) message and never E518 (the wiring-gap error). This guards the exact
 /// `imagepreview` bug: a name added to the registry but missing from `apply_set_*`'s
-/// slot match used to silently no-op; now it's loud, and this catches it. Add a name
-/// here when you add one to `canonical`.
+/// slot match used to silently no-op; now it's loud, and this catches it.
+///
+/// The name list is enumerated from the authoritative catalog itself
+/// (`nx._options_catalog`, built from `nxvim_core::options::options_catalog()`),
+/// not hand-kept here — so the guard covers every option automatically and can
+/// never drift from what `:set` actually accepts.
 #[tokio::test]
 async fn every_known_option_is_wired_not_silent() {
     let (rpc, mut incoming) = start().await;
-    let names = [
-        // bool
-        "number",
-        "relativenumber",
-        "cursorline",
-        "ignorecase",
-        "smartcase",
-        "wrapscan",
-        "hlsearch",
-        "incsearch",
-        "autoread",
-        "imagepreview",
-        "expandtab",
-        "bomb",
-        "scrollanim",
-        "timeout",
-        "ts_highlight",
-        // number
-        "tabstop",
-        "shiftwidth",
-        "softtabstop",
-        "sidescroll",
-        "sidescrolloff",
-        "showtabline",
-        "laststatus",
-        "mousetime",
-        "timeoutlen",
-        "scrollanimduration",
-        "scrollback",
-        // string
-        "statusline",
-        "tabline",
-        "guifont",
-        "mouse",
-        "mousemodel",
-        "mousescroll",
-        "regexsyntax",
-        "fileencoding",
-        "fileencodings",
-        "errorformat",
-        "switchbuf",
-        "makeprg",
-        "grepprg",
-        "grepformat",
-        "filetype",
-        "fillchars",
-    ];
-    for name in names {
+    let names = exec_lua(
+        &rpc,
+        "local o = {} \
+         for _, r in ipairs(nx._options_catalog) do o[#o + 1] = r.name end \
+         return table.concat(o, ',')",
+    )
+    .await;
+    let names = names.as_str().expect("catalog names join to a string");
+    assert!(
+        names.split(',').count() >= 70,
+        "the catalog should enumerate every documented option, got {names:?}"
+    );
+    for name in names.split(',') {
         let msg = set_message(&rpc, &mut incoming, &format!("{name}?")).await;
         assert!(
             msg.contains(name) && !msg.contains("E518"),

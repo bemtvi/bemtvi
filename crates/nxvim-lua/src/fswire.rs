@@ -118,6 +118,10 @@ pub fn fs_job_from_value(v: &Value) -> Result<FsJob, String> {
         "realpath" => FsJob::Realpath {
             path: str_field("path")?,
         },
+        "hash_file" => FsJob::HashFile {
+            path: str_field("path")?,
+            algo: str_field("algo")?,
+        },
         other => return Err(format!("luafs_op: unknown op '{other}'")),
     })
 }
@@ -196,6 +200,11 @@ pub fn fs_job_to_value(job: &FsJob) -> Value {
         FsJob::Realpath { path } => m(vec![
             ("op", "realpath".into()),
             ("path", path.as_str().into()),
+        ]),
+        FsJob::HashFile { path, algo } => m(vec![
+            ("op", "hash_file".into()),
+            ("path", path.as_str().into()),
+            ("algo", algo.as_str().into()),
         ]),
     }
 }

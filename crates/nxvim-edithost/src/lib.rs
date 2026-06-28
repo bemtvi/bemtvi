@@ -1780,6 +1780,11 @@ fn fs_job_to_json(id: u64, job: &nxvim_lua::FsJob) -> serde_json::Value {
             put("op", "realpath".into());
             put("path", path.clone().into());
         }
+        FsJob::HashFile { path, algo } => {
+            put("op", "hash_file".into());
+            put("path", path.clone().into());
+            put("algo", algo.clone().into());
+        }
     }
     serde_json::Value::Object(o)
 }

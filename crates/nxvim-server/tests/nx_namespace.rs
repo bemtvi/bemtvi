@@ -748,3 +748,147 @@ async fn nx_align_never_truncates_and_sizes_wide_glyphs() {
         "wide glyphs are padded by cell width, not byte length"
     );
 }
+
+#[tokio::test]
+async fn nx_hash_returns_known_digests() {
+    let (rpc, _incoming) = start().await;
+
+    // Known-answer vectors (NIST / RFC 1321) pin the digests so the wiring is
+    // proven against an external oracle, not just self-consistent.
+    assert_eq!(
+        exec_lua(&rpc, "return nx.hash.sha1('abc')").await.as_str(),
+        Some("a9993e364706816aba3e25717850c26c9cd0d89d"),
+    );
+    assert_eq!(
+        exec_lua(&rpc, "return nx.hash.sha256('abc')")
+            .await
+            .as_str(),
+        Some("ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"),
+    );
+    assert_eq!(
+        exec_lua(&rpc, "return nx.hash.sha512('abc')")
+            .await
+            .as_str(),
+        Some(
+            "ddaf35a193617abacc417349ae20413112e6fa4e89a97ea20a9eeee64b55d39a\
+             2192992a274fc1a836ba3c23a3feebbd454d4423643ce80e2a9ac94fa54ca49f"
+        ),
+    );
+    assert_eq!(
+        exec_lua(&rpc, "return nx.hash.md5('abc')").await.as_str(),
+        Some("900150983cd24fb0d6963f7d28e17f72"),
+    );
+
+    // The empty string hashes to each algorithm's canonical empty digest.
+    assert_eq!(
+        exec_lua(&rpc, "return nx.hash.sha1('')").await.as_str(),
+        Some("da39a3ee5e6b4b0d3255bfef95601890afd80709"),
+    );
+    assert_eq!(
+        exec_lua(&rpc, "return nx.hash.md5('')").await.as_str(),
+        Some("d41d8cd98f00b204e9800998ecf8427e"),
+    );
+}
+
+#[tokio::test]
+async fn nx_hash_handles_binary_input() {
+    let (rpc, _incoming) = start().await;
+
+    // A NUL-embedded byte string must hash by its raw bytes, not a truncated /
+    // UTF-8-validated view. sha256 of the three bytes {0x00, 0xff, 0x41}.
+    assert_eq!(
+        exec_lua(&rpc, "return nx.hash.sha256('\\0\\255A')")
+            .await
+            .as_str(),
+        Some("a90a10503fbfc95789ff38a1bb5039cb71869ab9c0eb1cb51c4a9099f2933c6b"),
+    );
+}
+
+#[tokio::test]
+async fn nx_hash_new_incremental_matches_one_shot() {
+    let (rpc, _incoming) = start().await;
+
+    // Feeding bytes in pieces must equal hashing the whole string at once — the core
+    // promise of an incremental hasher (so you can hash a stream as it arrives).
+    assert_eq!(
+        exec_lua(
+            &rpc,
+            "local h = nx.hash.new('sha256')\n\
+             h:update('ab'); h:update(''); h:update('c')\n\
+             return h:hexdigest()"
+        )
+        .await
+        .as_str(),
+        exec_lua(&rpc, "return nx.hash.sha256('abc')")
+            .await
+            .as_str(),
+        "chunked updates equal the one-shot digest of the same bytes"
+    );
+
+    // hexdigest() does NOT consume the hasher: read an intermediate digest, then keep
+    // feeding. The intermediate equals sha256('ab'); the final equals sha256('abc').
+    assert_eq!(
+        exec_lua(
+            &rpc,
+            "local h = nx.hash.new('sha256')\n\
+             h:update('ab')\n\
+             local mid = h:hexdigest()\n\
+             h:update('c')\n\
+             return mid .. ',' .. h:hexdigest()"
+        )
+        .await
+        .as_str(),
+        Some(
+            "fb8e20fc2e4c3f248c60c39bd652f3c1347298bb977b8b4d5903b85055620603,\
+             ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        ),
+        "hexdigest is non-consuming — an intermediate read does not disturb the running state"
+    );
+
+    // An unknown algorithm fails loud at construction, not with a bad digest later.
+    assert_eq!(
+        exec_lua(
+            &rpc,
+            "local ok, err = pcall(nx.hash.new, 'crc32'); return (not ok) and tostring(err) or 'NO_ERROR'"
+        )
+        .await
+        .as_str()
+        .map(|s| s.contains("unknown algorithm")),
+        Some(true),
+        "nx.hash.new rejects an unknown algorithm"
+    );
+}
+
+#[tokio::test]
+async fn nx_uuid_is_a_unique_v4_uuid() {
+    let (rpc, _incoming) = start().await;
+
+    // The public nx.uuid() (a Lua wrapper over the nx._uuid bridge) returns a canonical
+    // 8-4-4-4-12 v4 UUID: 36 chars, hyphens at the fixed spots, version nibble '4', and
+    // a variant nibble in [89ab]. Pattern-check rather than equality (it's random).
+    assert_eq!(
+        exec_lua(
+            &rpc,
+            "local u = nx.uuid()\n\
+             return tostring(#u == 36\n\
+               and u:sub(9,9) == '-' and u:sub(14,14) == '-'\n\
+               and u:sub(19,19) == '-' and u:sub(24,24) == '-'\n\
+               and u:sub(15,15) == '4'\n\
+               and u:match('^[0-9a-f-]+$') ~= nil\n\
+               and u:sub(20,20):match('[89ab]') ~= nil)"
+        )
+        .await
+        .as_str(),
+        Some("true"),
+        "nx.uuid() returns a canonical lowercase v4 UUID"
+    );
+
+    // Two calls differ — it's actually random, not a fixed stub.
+    assert_eq!(
+        exec_lua(&rpc, "return tostring(nx.uuid() ~= nx.uuid())")
+            .await
+            .as_str(),
+        Some("true"),
+        "successive nx.uuid() calls are unique"
+    );
+}

@@ -208,6 +208,21 @@ function nx.fs.realpath(path)
   return run_fs({ op = "realpath", path = path })
 end
 
+nx.hash = nx.hash or {}
+
+-- nx.hash.file(path[, algo]) -> promise of the file's lowercase-hex digest. The
+-- streaming member of the nx.hash.* family (the in-memory string hashers and the
+-- incremental nx.hash.new live in hash.lua): hashing a file is I/O, so it routes
+-- through the fs machinery rather than reading the file into Lua first. The server
+-- streams the file in fixed 64 KiB chunks and folds each into the hasher, so a 300 MB
+-- file costs 64 KiB of memory — not 300 MB, as `nx.hash.sha256(nx.await(nx.fs.read(path)))`
+-- would. On a remote/browser build the hashing runs entirely on the daemon; only the
+-- short digest crosses the wire, never the file's bytes. `algo` is one of "sha1" /
+-- "sha256" / "sha512" / "md5" (default "sha256"); an unknown algorithm rejects (EINVAL).
+function nx.hash.file(path, algo)
+  return run_fs({ op = "hash_file", path = path, algo = algo or "sha256" })
+end
+
 -- ----- watch (continuous → async-iterator) -----------------------------------
 --
 -- nx.fs.watch(path[, { recursive = false }]) -> a Watch you iterate with

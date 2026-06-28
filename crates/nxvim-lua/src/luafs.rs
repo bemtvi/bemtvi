@@ -628,7 +628,89 @@ pub fn run_fs_job(fs: &dyn LuaFs, job: &FsJob) -> Result<FsValue, FsError> {
             .map(|()| FsValue::Nil)
             .map_err(fs_error),
         FsJob::Realpath { path } => fs.realpath(path).map(FsValue::Text).map_err(fs_error),
+        FsJob::HashFile { path, algo } => hash_file(fs, path, algo).map(FsValue::Text),
     }
+}
+
+/// Stream `path` through `algo` and return its lowercase-hex digest. Reads the file
+/// in fixed 64 KiB chunks off the fd seam and folds each into the hasher, so peak
+/// memory is one chunk regardless of file size — hashing a 300 MB file costs 64 KiB,
+/// not 300 MB. An unknown `algo` is a loud `EINVAL` (never a silent wrong digest).
+fn hash_file(fs: &dyn LuaFs, path: &str, algo: &str) -> Result<String, FsError> {
+    // 64 KiB — large enough to amortize syscall / wire overhead, small enough that
+    // the transient buffer never shows up in a memory profile.
+    const CHUNK: usize = 64 * 1024;
+
+    // Reject an unknown algorithm *before* opening the file, so a typo fails the same
+    // way whether or not the path exists.
+    let mut hasher = new_digest(algo).ok_or_else(|| FsError {
+        code: "EINVAL".into(),
+        message: format!("nx.hash.file: unknown algorithm '{algo}'"),
+    })?;
+
+    let fd = fs.open(path, "r", 0).map_err(fs_error)?;
+    // Fold the stream, then always close the fd — even on a mid-read error — so a
+    // failed hash can't leak a descriptor.
+    let result = (|| {
+        loop {
+            let chunk = fs.read(fd, CHUNK, None)?;
+            if chunk.is_empty() {
+                break; // EOF
+            }
+            hasher.update(&chunk);
+        }
+        Ok(hasher.hex_digest())
+    })();
+    let _ = fs.close(fd);
+    result.map_err(fs_error)
+}
+
+/// Construct a boxed incremental hasher for `algo`, or `None` if the name is unknown.
+/// Shared by the streaming `nx.hash.file` fs op (here) and the incremental `nx.hash.new`
+/// object (`install.rs`), so the same four algorithm names mean the same thing in both.
+pub(crate) fn new_digest(algo: &str) -> Option<Box<dyn DigestStream>> {
+    use sha2::Digest as _;
+    Some(match algo {
+        "sha1" => Box::new(sha1::Sha1::new()),
+        "sha256" => Box::new(sha2::Sha256::new()),
+        "sha512" => Box::new(sha2::Sha512::new()),
+        "md5" => Box::new(md5::Md5::new()),
+        _ => return None,
+    })
+}
+
+/// Object-safe view over a RustCrypto hasher so a hasher can be picked by algorithm name
+/// at runtime without threading the concrete `Digest` type through. (The `digest` crate's
+/// own `DynDigest` needs its `alloc` feature; this keeps the dependency surface to the
+/// `Digest` trait the hashers already pull in.)
+///
+/// `hex_digest` takes `&self` (it clones, then finalizes the clone) rather than consuming,
+/// so the incremental `nx.hash.new` object can read an intermediate digest and keep
+/// feeding chunks afterward — and so one trait serves both the one-finalize file path and
+/// the read-many object. Every RustCrypto hasher is `Clone`, so the bound always holds.
+pub(crate) trait DigestStream {
+    fn update(&mut self, data: &[u8]);
+    fn hex_digest(&self) -> String;
+}
+
+impl<D: sha2::Digest + Clone> DigestStream for D {
+    fn update(&mut self, data: &[u8]) {
+        sha2::Digest::update(self, data);
+    }
+    fn hex_digest(&self) -> String {
+        to_hex(&self.clone().finalize())
+    }
+}
+
+/// Lowercase-hex encode a digest. Shared by the streaming `nx.hash.file` path and the
+/// one-shot `nx.hash.*` natives in `install.rs`, so the two render digests identically.
+pub(crate) fn to_hex(bytes: &[u8]) -> String {
+    use std::fmt::Write as _;
+    let mut s = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        let _ = write!(s, "{b:02x}");
+    }
+    s
 }
 
 /// Shape an [`io::Error`] into the `{ code, message }` an `nx.fs` reject carries.

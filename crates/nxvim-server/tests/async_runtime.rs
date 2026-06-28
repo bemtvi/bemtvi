@@ -490,3 +490,39 @@ async fn schedule_wrap_defers_its_call() {
     assert_eq!(lua_bool(&rpc, "return _G.during == nil").await, Some(true));
     assert_eq!(lua_u64(&rpc, "return _G.got").await, Some(42));
 }
+
+#[tokio::test]
+async fn nx_hash_new_hashes_a_stream_via_await_each() {
+    let (rpc, _incoming) = start().await;
+    // The streaming-data use case: feed a subprocess's stdout into an incremental
+    // hasher chunk by chunk with nx.await_each, never buffering the whole output.
+    // `printf abc` emits no newline, so the single batch carries one line "abc" — the
+    // digest must equal sha256("abc") (proving the streamed feed reconstructs the data).
+    exec_lua(
+        &rpc,
+        "_G.sum = nil\n\
+         nx.async(function()\n\
+           local h = nx.hash.new('sha256')\n\
+           for batch in nx.await_each(nx.run_stream({ cmd = 'sh', args = { '-c', 'printf abc' } })) do\n\
+             for _, line in ipairs(batch) do h:update(line) end\n\
+           end\n\
+           _G.sum = h:hexdigest()\n\
+         end)()",
+    )
+    .await;
+    // Off-tick stream: poll until the async chain sets _G.sum.
+    let mut got = None;
+    for _ in 0..150 {
+        let v = exec_lua(&rpc, "return _G.sum").await;
+        if let Some(s) = v.as_str() {
+            got = Some(s.to_owned());
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(
+        got.as_deref(),
+        Some("ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"),
+        "hashing a stream's chunks via await_each yields sha256 of the concatenated data"
+    );
+}

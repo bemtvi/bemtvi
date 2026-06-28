@@ -42,6 +42,14 @@ function nx.command(name, fn, opts)
   return nx.user_command.create(name, fn, opts)
 end
 
+-- nx.uuid() -> a fresh random (version-4) UUID as a canonical 8-4-4-4-12 lowercase-hex
+-- string, e.g. "f47ac10b-58cc-4372-a567-0e02b2c3d479". Bytes come from the OS CSPRNG,
+-- so each call is unique; handy for a session id, a temp-file name, or any unique key.
+-- Available on every build (native and browser/wasm).
+function nx.uuid()
+  return nx._uuid()
+end
+
 -- Dock-scoped options (the dock scope, alongside nx.bo/nx.wo/nx.o). Set via
 -- `nx.dock.opt(side).<name> = <value>` or inline in `nx.dock.open{...}`; read back
 -- through the same proxy. `nx._dock_opts` is a write-through cache keyed by side,

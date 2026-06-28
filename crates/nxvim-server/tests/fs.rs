@@ -640,3 +640,83 @@ async fn watch_bad_path_rejects_loud() {
     );
     let _ = fs::remove_dir_all(&dir);
 }
+
+// ----- nx.hash.file (streaming digest) ----------------------------------------
+
+#[tokio::test]
+async fn hash_file_streams_a_large_file_and_matches_the_one_shot_digest() {
+    let (rpc, _incoming) = start().await;
+    let dir = temp_dir("fs_hashfile");
+    let file = dir.join("big.bin");
+
+    // Content larger than the 64 KiB streaming chunk, so the read loop folds several
+    // chunks — the path that would break if hashing only saw the first chunk. We hash
+    // the file (streamed in the server) and, independently, the SAME bytes in memory
+    // via the one-shot nx.hash.sha256; the two must agree. This both proves the
+    // streaming digest is correct AND that the two APIs (kept side by side, for
+    // different jobs) render identical digests.
+    exec_lua(
+        &rpc,
+        &format!(
+            "_G.match = nil\n\
+             nx.async(function()\n\
+               local data = string.rep('nxvim-', 50000)\n\
+               nx.await(nx.fs.write(\"{f}\", data))\n\
+               local streamed = nx.await(nx.hash.file(\"{f}\", 'sha256'))\n\
+               local one_shot = nx.hash.sha256(data)\n\
+               _G.streamed = streamed\n\
+               _G.match = (streamed == one_shot) and 'yes' or ('no:' .. streamed .. '/' .. one_shot)\n\
+             end)()",
+            f = q(&file)
+        ),
+    )
+    .await;
+    assert_eq!(
+        poll_settled(&rpc, "return _G.match").await.as_str(),
+        Some("yes"),
+        "the streamed file digest must equal the one-shot digest of the same bytes"
+    );
+    // Pin the actual value against an external oracle too (computed by `sha256sum`),
+    // so a bug that corrupts BOTH paths identically can't pass.
+    assert_eq!(
+        lua_string(&rpc, "return _G.streamed").await.as_deref(),
+        Some("0f486a3805eb4414fc58e2bbcd4c4fbc8b66ed33e21a7d172e2dfdc312888c61"),
+        "the streamed digest matches an external sha256sum of the 300 KB file"
+    );
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn hash_file_defaults_to_sha256_and_rejects_unknown_algo() {
+    let (rpc, _incoming) = start().await;
+    let dir = temp_dir("fs_hashalgo");
+    let file = dir.join("f.txt");
+
+    exec_lua(
+        &rpc,
+        &format!(
+            "_G.dflt = nil\n_G.code = nil\n\
+             nx.async(function()\n\
+               nx.await(nx.fs.write(\"{f}\", 'abc'))\n\
+               -- no algo arg defaults to sha256\n\
+               _G.dflt = (nx.await(nx.hash.file(\"{f}\")) == nx.hash.sha256('abc')) and 'yes' or 'no'\n\
+               -- an unknown algorithm rejects (EINVAL), never a wrong digest\n\
+               local ok, err = pcall(nx.await, nx.hash.file(\"{f}\", 'crc32'))\n\
+               _G.code = (not ok) and err.code or 'NO_ERROR'\n\
+             end)()",
+            f = q(&file)
+        ),
+    )
+    .await;
+    assert_eq!(
+        poll_settled(&rpc, "return _G.dflt").await.as_str(),
+        Some("yes"),
+        "nx.hash.file defaults to sha256"
+    );
+    assert_eq!(
+        poll_settled(&rpc, "return _G.code").await.as_str(),
+        Some("EINVAL"),
+        "an unknown algorithm rejects with EINVAL"
+    );
+    let _ = fs::remove_dir_all(&dir);
+}

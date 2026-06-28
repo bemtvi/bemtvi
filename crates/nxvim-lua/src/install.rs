@@ -56,6 +56,38 @@ impl UserData for LuaRegex {
     }
 }
 
+/// `nx.hash.new(algo)` userdata: an incremental hasher you feed chunk by chunk.
+/// `:update(data)` folds more bytes in (binary-safe — `data` is read as raw bytes);
+/// `:hexdigest()` returns the lowercase-hex digest of everything fed so far WITHOUT
+/// consuming the hasher, so you can keep updating after reading an intermediate digest.
+///
+/// This is the streaming-*data* companion to `nx.hash.file` (streaming a file) and the
+/// one-shot `nx.hash.<algo>` (a whole in-memory string): hash data that arrives in
+/// pieces — a subprocess's stdout, a download — without ever buffering the whole thing:
+///
+/// ```lua
+/// local h = nx.hash.new("sha256")
+/// nx.async(function()
+///   for batch in nx.await_each(nx.run_stream({ cmd = "…" })) do
+///     for _, line in ipairs(batch) do h:update(line) end
+///   end
+///   print(h:hexdigest())
+/// end)()
+/// ```
+struct LuaHasher {
+    inner: Box<dyn crate::luafs::DigestStream>,
+}
+
+impl UserData for LuaHasher {
+    fn add_methods<M: UserDataMethods<Self>>(methods: &mut M) {
+        methods.add_method_mut("update", |_, this, data: mlua::String| {
+            this.inner.update(&data.as_bytes());
+            Ok(())
+        });
+        methods.add_method("hexdigest", |_, this, ()| Ok(this.inner.hex_digest()));
+    }
+}
+
 /// Parse one neovim virtual-text chunk `{ text, hl_group? }` into a
 /// [`VirtChunkData`]. `hl_group` may be a string or absent; a list-of-groups
 /// (neovim's stacked form) is rejected loud rather than silently dropped, matching
@@ -1228,10 +1260,12 @@ pub(crate) fn install_runtime_api(
         )?;
     }
 
-    // `nx.uuid()` -> a random v4 UUID in canonical `8-4-4-4-12` hex. A public utility
-    // (the workspace plugin mints session namespaces with it).
+    // `nx._uuid()` -> a random v4 UUID in canonical `8-4-4-4-12` hex. The private
+    // bridge; the documented public `nx.uuid` is its one-line wrapper in
+    // `prelude/nx.lua` (so the book's generator, which only scans the prelude, picks
+    // it up). The workspace plugin mints session namespaces with it.
     nx.set(
-        "uuid",
+        "_uuid",
         lua.create_function(|_, ()| {
             let mut b = [0u8; 16];
             // `getrandom::Error` only implements `std::error::Error` with getrandom's
@@ -1261,6 +1295,38 @@ pub(crate) fn install_runtime_api(
                 b[14],
                 b[15]
             ))
+        })?,
+    )?;
+
+    // The `nx.hash.*` primitives. The public, documented surface (`nx.hash.sha256`,
+    // `nx.hash.new`, …) is the thin Lua wrapper in `prelude/hash.lua`; these are the
+    // private Rust bridges it calls. Both `_hash` (one-shot) and `_hash_new`
+    // (incremental) go through `crate::luafs::new_digest`, the same constructor the
+    // streaming `nx.hash.file` fs op uses — so an algorithm name means one thing, and a
+    // string, a file, and a stream of the same bytes all produce an identical digest.
+    // Pure-Rust RustCrypto hashers, available on every build (native + wasm).
+    //
+    // `nx._hash(algo, data)` -> the lowercase-hex digest of `data` (read as raw bytes,
+    // so binary input is fine). An unknown `algo` errors.
+    nx.set(
+        "_hash",
+        lua.create_function(|_, (algo, data): (String, mlua::String)| {
+            let mut hasher = crate::luafs::new_digest(&algo).ok_or_else(|| {
+                mlua::Error::runtime(format!("nx.hash: unknown algorithm '{algo}'"))
+            })?;
+            hasher.update(&data.as_bytes());
+            Ok(hasher.hex_digest())
+        })?,
+    )?;
+    // `nx._hash_new(algo)` -> a fresh incremental hasher (a `LuaHasher` userdata) you
+    // feed chunk by chunk. An unknown `algo` errors here, at construction.
+    nx.set(
+        "_hash_new",
+        lua.create_function(|_, algo: String| {
+            let inner = crate::luafs::new_digest(&algo).ok_or_else(|| {
+                mlua::Error::runtime(format!("nx.hash.new: unknown algorithm '{algo}'"))
+            })?;
+            Ok(LuaHasher { inner })
         })?,
     )?;
 
@@ -3262,6 +3328,10 @@ fn fs_job_from_table(job: &Table) -> mlua::Result<FsJob> {
         },
         "realpath" => FsJob::Realpath {
             path: job.get("path")?,
+        },
+        "hash_file" => FsJob::HashFile {
+            path: job.get("path")?,
+            algo: job.get("algo")?,
         },
         other => {
             return Err(mlua::Error::runtime(format!(

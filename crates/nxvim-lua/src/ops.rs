@@ -444,6 +444,12 @@ pub enum FsJob {
     },
     /// `nx.fs.realpath(path)` — the canonical absolute path (symlinks resolved).
     Realpath { path: String },
+    /// `nx.hash.file(path, algo)` — stream the file through `algo` (`sha1` / `sha256`
+    /// / `sha512` / `md5`) and resolve with the lowercase-hex digest. Hashing a file
+    /// is a fs op (not an in-memory `nx.hash.*` call) precisely so a huge file is read
+    /// in fixed-size chunks here, never materialized whole in Lua. An unknown `algo`
+    /// rejects (EINVAL).
+    HashFile { path: String, algo: String },
 }
 
 /// The typed value an [`FsJob`] resolves with — the union of every `nx.fs` op's

@@ -187,6 +187,11 @@ flate2 = "=1.1.9"
 xz2 = "=0.1.7"
 zip = { version = "=4.2.0", default-features = false, features = ["deflate-flate2"] }
 sha2 = "=0.10.9"
+# Hash digests for the `nx.hash.*` Lua utilities (alongside `sha2`, which doubles
+# as the zig-checksum verifier above). All RustCrypto, pure Rust and wasm-safe;
+# they share the `digest = 0.10` trait surface so one `Digest` import covers all.
+sha1 = "=0.10.6"
+md-5 = "=0.10.6"
 
 # LSP client stack — reached only through `nxvim-lsp` (Decision 1/2 of the LSP
 # design). async-lsp owns the JSON-RPC `MainLoop`, framing, id correlation, and

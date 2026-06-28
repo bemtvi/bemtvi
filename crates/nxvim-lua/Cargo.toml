@@ -19,7 +19,12 @@ encoding_rs.workspace = true
 # CSPRNG for `nx._uuid()` — the workspace session-namespace generator. Pure Rust,
 # wasm-safe (emscripten backend).
 getrandom.workspace = true
+# Hash digests backing the `nx.hash.*` utilities (sha1 / sha256 / sha512 / md5).
+# All RustCrypto, pure Rust and wasm-safe, sharing the `digest = 0.10` traits.
+md-5.workspace = true
 mlua.workspace = true
+sha1.workspace = true
+sha2.workspace = true
 # The PCRE engine for `nx.buf.search` (the `regexsyntax=pcre` dialect) — the same
 # `regex` crate the core search uses, so the two agree. Pure Rust, wasm-safe.
 regex.workspace = true

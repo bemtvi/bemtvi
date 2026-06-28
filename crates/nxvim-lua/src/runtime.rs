@@ -501,6 +501,10 @@ const PRELUDE_MODULES: &[(&str, &str)] = &[
     // nx.fs: promise-always filesystem API over the nx._fs_* bridge. After
     // promise.lua (every op returns a promise).
     ("nxvim:prelude/fs", include_str!("prelude/fs.lua")),
+    // nx.hash: the hashing surface (one-shot string digests + the incremental
+    // nx.hash.new) over the nx._hash / nx._hash_new bridges. After fs.lua, which
+    // defines the sibling nx.hash.file (the streamed file digest, an fs op).
+    ("nxvim:prelude/hash", include_str!("prelude/hash.lua")),
     // nx.utils: the general helper namespace (nx.utils.debounce, …) — may build on
     // the timer and promise surfaces loaded just above.
     ("nxvim:prelude/utils", include_str!("prelude/utils.lua")),

@@ -88,11 +88,19 @@ try {
   // 1. The project + tour + config were seeded into OPFS.
   const main = await readOpfs(page, "/main.py");
   const geom = await readOpfs(page, "/geometry.py");
+  const shapes = await readOpfs(page, "/shapes.py");
   const tour = await readOpfs(page, "/TOUR.md");
   const init = await readOpfs(page, "/init.lua");
   check("seed: the demo project is present in OPFS after first boot",
     !!main && /from geometry import/.test(main) && !!geom && /class Circle/.test(geom),
     `main=${JSON.stringify(main?.slice(0, 40))} geom=${JSON.stringify(geom?.slice(0, 40))}`);
+  // shapes.py ships its git conflict markers intact — the nxvim-diff `:NxDiffConflict`
+  // showcase. Assert the diff3 trio is present (a plain copy would strip nothing, but a
+  // botched seed/normalization could), since that is what makes it a 3-way demo.
+  check("seed: shapes.py carries the diff3 conflict markers (nxvim-diff showcase)",
+    !!shapes && /^<<<<<<< /m.test(shapes) && /^\|\|\|\|\|\|\| /m.test(shapes)
+      && /^=======/m.test(shapes) && /^>>>>>>> /m.test(shapes),
+    `shapes=${JSON.stringify(shapes?.slice(0, 40))}`);
   check("seed: the tour + init.lua are present in OPFS",
     !!tour && /Welcome to nxvim/.test(tour) && !!init && /catppuccin/.test(init),
     `tour=${JSON.stringify(tour?.slice(0, 30))}`);

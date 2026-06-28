@@ -1,4 +1,4 @@
 {
   "comment": "Files seeded into OPFS on first boot of the python demo (worker.mjs, demo build). Each is written to / at the listed path; the seeder skips entirely once /.nxvim/.demo-seeded exists, so user edits persist.",
-  "files": ["init.lua", "TOUR.md", "main.py", "geometry.py"]
+  "files": ["init.lua", "TOUR.md", "main.py", "geometry.py", "shapes.py"]
 }

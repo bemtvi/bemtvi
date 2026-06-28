@@ -19,11 +19,16 @@ plugins all run in this tab.
 - `<leader>e`                 — toggle the file-tree sidebar
 - `<C-w><C-w>j`               — drop into the bottom panel (it autohides, so it
   collapses to a `▸PANEL` chip when you leave; click the chip to bring it back)
+- open `shapes.py`, then `:NxDiffConflict` — it carries a real git merge conflict;
+  see it side-by-side as a 3-way **ours | base | theirs** diff. Step conflicts with
+  `]c`/`[c`; resolve the one under the cursor with `co` (ours), `ct` (theirs) or
+  `cb` (both). After you resolve it, `:NxDiffGit` diffs your edits against HEAD
 
 ## What's here
 
 - `main.py`      — the entry point; imports the library below
 - `geometry.py`  — a small typed module (a `Circle` dataclass + helpers)
+- `shapes.py`    — a `Triangle` with an unresolved merge conflict (`:NxDiffConflict`)
 - `init.lua`     — this editor's config (catppuccin, the plugins, the LSP)
 
 Edit anything — your changes persist in the browser across reloads.

@@ -415,6 +415,16 @@ impl SyntaxEngine for WasmSyntax {
         // The worker writes flat `[start, end, …]` i32 pairs into `buf`; it returns the
         // total count needed, which may exceed `buf.len()` (a fold-dense file) — grow and
         // retry once in that case. `1024` ints = 512 folds covers the common case.
+        //
+        // Defence-in-depth: `needed` is a count the JS folds runner returns (driven by the
+        // buffer text, which can be an untrusted file). Cap the retry allocation so a
+        // pathologically fold-dense buffer — or a buggy/hostile runner returning an inflated
+        // count — can't size a multi-GB `Vec` and abort the whole wasm module (the 32-bit
+        // address space tops out at 4 GB). Folds are cosmetic, so we degrade to the ranges
+        // that fit rather than OOM, mirroring this method's existing "return Vec::new() when
+        // unavailable" graceful-fallback shape. `1 << 20` ints = 512K fold ranges (~4 MB) is
+        // far beyond any real file.
+        const MAX_FOLD_INTS: usize = 1 << 20;
         let mut buf = vec![0i32; 1024];
         loop {
             let needed = unsafe {
@@ -428,7 +438,11 @@ impl SyntaxEngine for WasmSyntax {
                 buf.truncate(needed);
                 break;
             }
-            buf = vec![0i32; needed];
+            if buf.len() >= MAX_FOLD_INTS {
+                // Already at the cap; keep the ranges that fit (JS wrote the first `cap`).
+                break;
+            }
+            buf = vec![0i32; needed.min(MAX_FOLD_INTS)];
         }
         buf.chunks_exact(2)
             .map(|c| FoldRange {

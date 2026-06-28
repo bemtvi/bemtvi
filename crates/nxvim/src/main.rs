@@ -640,11 +640,43 @@ fn daemon_command() -> Result<tokio::process::Command> {
     }
 }
 
+/// Open the daemon's stderr log as a **private, symlink-safe** file under the temp dir.
+/// The daemon's diagnostics can't share the terminal with the TUI, so they go here;
+/// `tail` it to debug the daemon side. Two properties matter on a shared `/tmp`:
+///
+/// - **No symlink clobber (CWE-377).** A fixed name (`nxvim-daemon.log`) opened with the
+///   symlink-following [`File::create`](std::fs::File::create) let another local user
+///   pre-plant a symlink at that path and have the daemon's stderr *truncate* one of the
+///   victim's files. The path is now per-pid and opened with `create_new`
+///   (`O_CREAT | O_EXCL`), which refuses to follow a symlink; any leftover (only ever
+///   *our own* per-pid name) is removed first, and if the create still fails — e.g. an
+///   attacker re-planted the name under `/tmp`'s sticky bit — stderr is discarded rather
+///   than written through a hostile path.
+/// - **Not world-readable.** Created `0600` so daemon diagnostics (paths, errors) aren't
+///   exposed to other users of a shared temp dir; the old `File::create` left it `0644`.
+fn daemon_log_stderr() -> Stdio {
+    let path = std::env::temp_dir().join(format!("nxvim-daemon-{}.log", std::process::id()));
+    // Best-effort: clear a stale file from a prior same-pid run (only ever ours). If
+    // another user owns the name under the sticky bit this fails harmlessly — the
+    // `create_new` below then also fails and we fall back to discarding stderr.
+    let _ = std::fs::remove_file(&path);
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    opts.open(&path)
+        .map(Stdio::from)
+        .unwrap_or_else(|_| Stdio::null())
+}
+
 /// Run the **local** edit-host over a stdio-piped `--daemon` child (`--connect-daemon`,
 /// no `nxvim://` target): the local two-process split. The server thread spawns the
 /// daemon (its stdio *is* the wire), wraps it in [`connect_daemon`], and runs the editor
-/// against those seams. The daemon's stderr is redirected to a temp log (it can't corrupt
-/// the TUI); `tail` it to debug the daemon. `kill_on_drop` reaps the child on quit.
+/// against those seams. The daemon's stderr is redirected to a private temp log (it can't
+/// corrupt the TUI); `tail` it to debug the daemon. `kill_on_drop` reaps the child on quit.
 fn run_with_daemon(
     file: Option<String>,
     shada: ShadaOpts,
@@ -652,11 +684,8 @@ fn run_with_daemon(
 ) -> Result<()> {
     run_edit_host_session(file, shada, config_source, || {
         // The daemon's stderr can't share the terminal with the TUI; send it to a
-        // log the user can tail to diagnose the daemon side.
-        let log_path = std::env::temp_dir().join("nxvim-daemon.log");
-        let stderr = std::fs::File::create(&log_path)
-            .map(Stdio::from)
-            .unwrap_or_else(|_| Stdio::null());
+        // private, symlink-safe log the user can tail to diagnose the daemon side.
+        let stderr = daemon_log_stderr();
         let mut child = daemon_command()?
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())

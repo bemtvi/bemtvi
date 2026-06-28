@@ -927,6 +927,24 @@ async fn vimgrep_glob_argument_fails_loud() {
 }
 
 #[tokio::test]
+async fn vimgrep_multibyte_delimiter_does_not_panic() {
+    // Regression: the delimited-form parser used to scan the argument by *bytes*
+    // and then slice `s[1..close]`, which lands mid-character for a multi-byte
+    // delimiter (`«…«`) and panicked the editor thread. The parser is now
+    // char-aware: a multi-byte delimiter parses cleanly and the match is found.
+    let (rpc, mut incoming) = start().await;
+    let path = write_temp("vgmb", "txt", "alpha\nx marks it\n");
+    message_after(&rpc, &mut incoming, &format!(":vimgrep «x« {path}<CR>")).await;
+    // The server is still alive (would have panicked before the fix) and found the
+    // single matching line.
+    assert_eq!(
+        exec_lua(&rpc, "return #vim.fn.getqflist()").await.as_i64(),
+        Some(1),
+        "multi-byte delimiter parses and matches without panicking"
+    );
+}
+
+#[tokio::test]
 async fn make_runs_the_program_populates_and_jumps() {
     let (rpc, mut incoming) = start().await;
     let src = write_temp("mk", "c", "line1\nline2\nline3\nline4\nline5\n");

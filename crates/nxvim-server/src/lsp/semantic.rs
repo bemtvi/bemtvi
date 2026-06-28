@@ -277,7 +277,11 @@ fn apply_token_edits(base: &[SemanticToken], edits: &[SemanticTokensEdit]) -> Ve
         if let Some(data) = &edit.data {
             out.extend(flatten_tokens(data));
         }
-        idx = (start + edit.delete_count as usize).min(old.len());
+        // `delete_count` is an untrusted server `u32`; saturate the add so a huge
+        // value can't overflow `usize` on a 32-bit (wasm) target before the `.min`.
+        idx = start
+            .saturating_add(edit.delete_count as usize)
+            .min(old.len());
     }
     out.extend_from_slice(&old[idx..]);
     chunk_tokens(&out)
@@ -334,11 +338,16 @@ fn decode_tokens(
     for tok in tokens {
         // Absolute position: a non-zero deltaLine moves down and resets the
         // column to deltaStart; a zero deltaLine advances the column on the line.
+        // The deltas are untrusted server `u32`s, so accumulate with saturating
+        // adds: a malformed reply (a near-`u32::MAX` delta) must not overflow-panic
+        // the server thread (a one-line-DoS, like the inverted-range clamp in
+        // [`lsp_range_to_bytes_in`](super::lsp_range_to_bytes_in)). A saturated value
+        // lands far past end-of-buffer and is dropped by the bounds checks below.
         if tok.delta_line > 0 {
-            line += tok.delta_line;
+            line = line.saturating_add(tok.delta_line);
             start_char = tok.delta_start;
         } else {
-            start_char += tok.delta_start;
+            start_char = start_char.saturating_add(tok.delta_start);
         }
         if tok.length == 0 {
             continue;
@@ -349,7 +358,11 @@ fn decode_tokens(
         }
         let text = buffer.line(line_idx);
         let start = byte_col(encoding, &text, start_char as usize);
-        let end = byte_col(encoding, &text, (start_char + tok.length) as usize);
+        let end = byte_col(
+            encoding,
+            &text,
+            start_char.saturating_add(tok.length) as usize,
+        );
         if end <= start {
             continue;
         }

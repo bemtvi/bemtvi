@@ -13,7 +13,7 @@
 //! tasks and never block the consumer.
 
 use std::collections::HashMap;
-use std::io::{self, Cursor};
+use std::io::Cursor;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -215,17 +215,200 @@ async fn writer_task<W>(
 /// peer is sending garbage (or an abusively large message) and tearing the
 /// connection down. Bounds memory against a peer that streams bytes which never
 /// finish a value. (rmpv itself caps str/bin preallocation at 64 KiB and never
-/// preallocates arrays/maps, so a huge length prefix can't OOM us before its
+/// preallocates arrays/maps, so a huge length prefix can't OOM us *before* its
 /// data arrives — this guards the buffer that *holds* those bytes.)
 const MAX_FRAME: usize = 64 * 1024 * 1024; // 64 MiB
 
-/// Maximum container nesting we will decode. rmpv's decoder is recursive, so a
+/// Maximum container nesting we will accept. rmpv's decoder is recursive, so a
 /// peer sending deeply-nested arrays/maps can otherwise overflow the reader
 /// thread's stack and *abort the process* — a far worse outcome than a rejected
 /// message. This cap is well below where recursion threatens the stack and well
-/// above any legitimate RPC payload; exceeding it surfaces as a clean
-/// `DepthLimitExceeded`, which we treat as a malformed frame below.
+/// above any legitimate RPC payload; exceeding it tears the connection down as a
+/// malformed frame. ([`scan_frame`] enforces it without recursing, before rmpv —
+/// itself also depth-capped — ever sees the bytes.)
 const MAX_DEPTH: usize = 128;
+
+/// Maximum number of msgpack *values* (scalars + container slots) one frame may
+/// declare. The wire-byte cap ([`MAX_FRAME`]) alone does **not** bound the
+/// decoded structure: an array/map length prefix is attacker-controlled and can
+/// claim billions of elements in a handful of bytes, which rmpv would then
+/// materialize as a `Vec<Value>` — up to ~40 bytes of heap per 1 wire byte, a
+/// ~40× amplification. This cap is checked against the *declared* length the
+/// instant a container header is read ([`scan_frame`]), so such a frame is
+/// rejected immediately instead of buffering toward [`MAX_FRAME`] and decoding a
+/// multi-gigabyte structure first. Set to [`MAX_FRAME`]: a frame that genuinely
+/// fits within the byte cap can hold at most that many values (each costs ≥1
+/// wire byte), so this never rejects a frame the byte cap would have accepted —
+/// it only short-circuits length prefixes that could never legitimately fit.
+const MAX_VALUES: u64 = MAX_FRAME as u64;
+
+/// Outcome of [`scan_frame`]: walking the buffered bytes for one complete
+/// top-level msgpack value, enforcing allocation budgets on declared lengths.
+enum Scan {
+    /// A complete value occupies the first `usize` bytes of the slice.
+    Complete(usize),
+    /// The buffered bytes are a (valid) prefix of a value — wait for more.
+    Incomplete,
+    /// Declared sizes exceed [`MAX_VALUES`]/[`MAX_DEPTH`]/[`MAX_FRAME`], or a
+    /// declared str/bin/ext length could never fit — reject the peer.
+    TooLarge,
+}
+
+/// Big-endian read of `n` length bytes at `*pos`, advancing `pos`. `None` (→
+/// treat as [`Scan::Incomplete`]) when fewer than `n` bytes are buffered.
+fn read_be(buf: &[u8], pos: &mut usize, n: usize) -> Option<u64> {
+    let end = pos.checked_add(n)?;
+    let bytes = buf.get(*pos..end)?;
+    *pos = end;
+    Some(bytes.iter().fold(0u64, |acc, &b| (acc << 8) | b as u64))
+}
+
+/// Advance `pos` past `n` payload bytes. `None` (→ [`Scan::Incomplete`]) when
+/// the payload isn't fully buffered yet. `n` is always ≤ [`MAX_FRAME`] at the
+/// call sites, so the `as usize` can't truncate (the reader runs only on
+/// 64-bit native targets, where `usize` is 64-bit regardless).
+fn skip(buf: &[u8], pos: &mut usize, n: u64) -> Option<()> {
+    let end = (*pos as u64).checked_add(n)?;
+    if end > buf.len() as u64 {
+        return None;
+    }
+    *pos = end as usize;
+    Some(())
+}
+
+/// Walk one msgpack value at the front of `buf` **without allocating or
+/// recursing**, enforcing the [`MAX_VALUES`]/[`MAX_DEPTH`]/[`MAX_FRAME`] budgets
+/// against the *declared* length fields before rmpv ever acts on them. This is
+/// the guard that turns an attacker-controlled length prefix (which rmpv would
+/// otherwise honor by building a structure dwarfing the wire bytes) into a clean
+/// rejection. Nesting is tracked with an explicit stack of "values still owed at
+/// this level", so the scan itself can't overflow the stack on a deeply nested
+/// frame, and a container's element count is bounded the moment its header is
+/// seen — not after its (possibly never-arriving) elements are buffered.
+fn scan_frame(buf: &[u8]) -> Scan {
+    let mut pos = 0usize;
+    let mut seen: u64 = 0;
+    // stack[i] = number of values still owed at nesting level i. One value is
+    // owed at the (virtual) root: the frame itself.
+    let mut stack: Vec<u64> = vec![1];
+
+    while let Some(top) = stack.last_mut() {
+        if *top == 0 {
+            stack.pop();
+            continue;
+        }
+        *top -= 1;
+
+        seen += 1;
+        if seen > MAX_VALUES {
+            return Scan::TooLarge;
+        }
+        let Some(&marker) = buf.get(pos) else {
+            return Scan::Incomplete;
+        };
+        pos += 1;
+
+        // For a container, push its declared child count as a new level; reject
+        // up front if it would blow the value budget or nest too deep. `2*len`
+        // for maps (key + value) can't overflow a u64 (len ≤ u32::MAX).
+        macro_rules! container {
+            ($count:expr) => {{
+                let count: u64 = $count;
+                if seen.saturating_add(count) > MAX_VALUES || stack.len() >= MAX_DEPTH {
+                    return Scan::TooLarge;
+                }
+                stack.push(count);
+            }};
+        }
+        // A str/bin/ext payload that can't fit in the frame buffer can never
+        // complete — reject rather than buffer toward MAX_FRAME forever.
+        macro_rules! payload {
+            ($len:expr) => {{
+                let len: u64 = $len;
+                if len > MAX_FRAME as u64 {
+                    return Scan::TooLarge;
+                }
+                len
+            }};
+        }
+        macro_rules! adv {
+            ($n:expr) => {
+                if skip(buf, &mut pos, $n).is_none() {
+                    return Scan::Incomplete;
+                }
+            };
+        }
+        macro_rules! lenbytes {
+            ($n:expr) => {
+                match read_be(buf, &mut pos, $n) {
+                    Some(v) => v,
+                    None => return Scan::Incomplete,
+                }
+            };
+        }
+
+        match marker {
+            // fixint (pos/neg), nil, reserved (rmpv decodes 0xc1 as Nil), bools.
+            0x00..=0x7f | 0xe0..=0xff | 0xc0..=0xc3 => {}
+            0xcc | 0xd0 => adv!(1),                      // u8 / i8
+            0xcd | 0xd1 => adv!(2),                      // u16 / i16
+            0xce | 0xd2 | 0xca => adv!(4),               // u32 / i32 / f32
+            0xcf | 0xd3 | 0xcb => adv!(8),               // u64 / i64 / f64
+            0xa0..=0xbf => adv!((marker & 0x1f) as u64), // fixstr
+            // str/bin: read the length field (ends its `pos` borrow), then skip.
+            0xd9 => {
+                let l = payload!(lenbytes!(1));
+                adv!(l)
+            } // str8
+            0xda => {
+                let l = payload!(lenbytes!(2));
+                adv!(l)
+            } // str16
+            0xdb => {
+                let l = payload!(lenbytes!(4));
+                adv!(l)
+            } // str32
+            0xc4 => {
+                let l = payload!(lenbytes!(1));
+                adv!(l)
+            } // bin8
+            0xc5 => {
+                let l = payload!(lenbytes!(2));
+                adv!(l)
+            } // bin16
+            0xc6 => {
+                let l = payload!(lenbytes!(4));
+                adv!(l)
+            } // bin32
+            0x90..=0x9f => container!((marker & 0x0f) as u64), // fixarray
+            0xdc => container!(lenbytes!(2)),                  // array16
+            0xdd => container!(lenbytes!(4)),                  // array32
+            0x80..=0x8f => container!((marker & 0x0f) as u64 * 2), // fixmap
+            0xde => container!(lenbytes!(2) * 2),              // map16
+            0xdf => container!(lenbytes!(4) * 2),              // map32
+            // fixext: 1 type byte + N data bytes.
+            0xd4 => adv!(2),
+            0xd5 => adv!(3),
+            0xd6 => adv!(5),
+            0xd7 => adv!(9),
+            0xd8 => adv!(17),
+            // ext8/16/32: <len-field> then 1 type byte + len data bytes.
+            0xc7 => {
+                let l = payload!(lenbytes!(1));
+                adv!(1 + l)
+            }
+            0xc8 => {
+                let l = payload!(lenbytes!(2));
+                adv!(1 + l)
+            }
+            0xc9 => {
+                let l = payload!(lenbytes!(4));
+                adv!(1 + l)
+            }
+        }
+    }
+    Scan::Complete(pos)
+}
 
 async fn reader_task<R>(mut reader: R, in_tx: mpsc::UnboundedSender<Incoming>, pending: Pending)
 where
@@ -243,29 +426,30 @@ where
         // exactly once below.
         let mut consumed = 0usize;
         loop {
-            let parsed = {
-                let mut cur = Cursor::new(&buf[consumed..]);
-                match rmpv::decode::read_value_with_max_depth(&mut cur, MAX_DEPTH) {
-                    Ok(v) => Ok(Some((v, cur.position() as usize))),
-                    // A short read means the frame isn't fully buffered yet, so
-                    // wait for more bytes. Any other decode error means the
-                    // stream is structurally corrupt (bad marker, depth blown)
-                    // and the leading bytes will never decode — tear the
-                    // connection down instead of re-reading the same bad prefix
-                    // forever.
-                    Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => Ok(None),
-                    Err(_) => Err(()),
-                }
+            // Bound the frame's *declared* sizes before allocating: `scan_frame`
+            // walks the buffered bytes without recursing or allocating and tells
+            // us whether a complete, within-budget value is present. Only then do
+            // we hand that exact, bounded slice to rmpv to materialize. A short
+            // read (`Incomplete`) means the frame isn't fully buffered yet, so
+            // wait for more bytes; a budget/structure violation (`TooLarge`)
+            // means the leading bytes will never decode acceptably — tear the
+            // connection down instead of re-scanning the same bad prefix forever.
+            let n = match scan_frame(&buf[consumed..]) {
+                Scan::Complete(n) => n,
+                Scan::Incomplete => break,
+                Scan::TooLarge => return,
             };
-            match parsed {
-                Ok(Some((val, n))) => {
-                    consumed += n;
-                    if dispatch(val, &in_tx, &pending).is_err() {
-                        return;
-                    }
-                }
-                Ok(None) => break,
-                Err(()) => return, // malformed frame: drop the connection
+            let mut cur = Cursor::new(&buf[consumed..consumed + n]);
+            let val = match rmpv::decode::read_value_with_max_depth(&mut cur, MAX_DEPTH) {
+                Ok(v) => v,
+                // `scan_frame` already vetted completeness, budget and depth, so
+                // rmpv should not fail here; if it nonetheless does, treat the
+                // frame as malformed and drop the connection rather than spin.
+                Err(_) => return,
+            };
+            consumed += n;
+            if dispatch(val, &in_tx, &pending).is_err() {
+                return;
             }
         }
         // Discard the fully-decoded prefix in one shift.

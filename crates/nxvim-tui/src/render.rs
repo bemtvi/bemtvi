@@ -381,7 +381,13 @@ pub(crate) fn render(
         // the multi-char `vim.ui.input` label; the cursor then follows
         // `cmdline_cursor` (a char offset) so it sits mid-line after edits.
         let prompt_width = cmdline_prompt_width(view);
-        let col = cmd_area.x + prompt_width + view.cmdline_cursor as u16;
+        // `cmdline_cursor` is a server-supplied char offset (`usize`); saturate the
+        // cast and the adds so a bogus value can't overflow the column coordinate
+        // (a debug-build panic, a release-build wrap) — ratatui clamps the result.
+        let col = cmd_area
+            .x
+            .saturating_add(prompt_width)
+            .saturating_add(u16::try_from(view.cmdline_cursor).unwrap_or(u16::MAX));
         frame.set_cursor_position((col, cmd_area.y));
     } else if let (Some((inner, cursor_row, shift)), Some(win)) = (focused_inner, view.focused()) {
         // The cursor row is interpolated during a slide, but the column comes
@@ -396,11 +402,19 @@ pub(crate) fn render(
         // `shift` is how far the inline inlay hints on the cursor's row push it
         // right (computed by `render_window` from the same band/window hints it
         // painted, so the cursor tracks the splice during the slide and once settled).
-        let col = inner.x
-            + (win.cursor_screen_col + shift)
+        // All three terms (`cursor_screen_col`, `shift`, `leftcol`) are derived from
+        // server data; saturate the arithmetic so an out-of-range value can't overflow
+        // the coordinate (a debug panic / release wrap). The `.min` already bounds the
+        // result to the window, and ratatui clamps the final cursor position.
+        let col = inner.x.saturating_add(
+            win.cursor_screen_col
+                .saturating_add(shift)
                 .saturating_sub(win.leftcol)
-                .min(inner.width.saturating_sub(1));
-        let row = inner.y + cursor_row.min(inner.height.saturating_sub(1));
+                .min(inner.width.saturating_sub(1)),
+        );
+        let row = inner
+            .y
+            .saturating_add(cursor_row.min(inner.height.saturating_sub(1)));
         frame.set_cursor_position((col, row));
         // A block cursor (normal / visual) envelops the full display width of the
         // grapheme it sits on — a wide CJK/emoji glyph, or a `^X` / `<xx>`
@@ -1092,12 +1106,12 @@ fn render_window(
     // the caller places the focused window's cursor past the splice in either case.
     let cursor_shift =
         inlay_cursor_shift(frame_inlay, cursor_row, win.cursor_screen_col, win.leftcol)
-            + virt_cursor_shift(
+            .saturating_add(virt_cursor_shift(
                 frame_virt_text,
                 cursor_row,
                 win.cursor_screen_col,
                 win.leftcol,
-            );
+            ));
     (text_inner, cursor_row, cursor_shift)
 }
 
@@ -2019,8 +2033,11 @@ fn inlay_cursor_shift(
         .into_iter()
         .flatten()
         .filter(|(hcol, _, _)| *hcol >= leftcol && *hcol <= cursor_col)
-        .map(|(_, text, _)| UnicodeWidthStr::width(text.as_str()) as u16)
-        .sum()
+        // Saturate the width sum: a malicious/buggy server can place arbitrarily wide
+        // hints, and a bare `sum()` would overflow `u16` (a debug-build panic).
+        .fold(0u16, |acc, (_, text, _)| {
+            acc.saturating_add(UnicodeWidthStr::width(text.as_str()) as u16)
+        })
 }
 
 /// The combined width of the inline `virt_text` placements on `cursor_row` at or
@@ -2039,8 +2056,11 @@ fn virt_cursor_shift(
         .flatten()
         .filter(|p| p.pos == VIRT_POS_INLINE && p.col >= leftcol && p.col <= cursor_col)
         .flat_map(|p| p.chunks.iter())
-        .map(|(text, _)| UnicodeWidthStr::width(text.as_str()) as u16)
-        .sum()
+        // Saturate the width sum (see `inlay_cursor_shift`): a `u16` `sum()` over
+        // server-supplied chunk widths would overflow on absurd input.
+        .fold(0u16, |acc, (text, _)| {
+            acc.saturating_add(UnicodeWidthStr::width(text.as_str()) as u16)
+        })
 }
 
 /// The style for an inlay hint: the colorscheme's resolved `LspInlayHint` palette

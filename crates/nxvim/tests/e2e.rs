@@ -368,3 +368,47 @@ fn ts_worker_flag_past_argv1_still_opens_the_editor() {
     s.send(b":q!\r");
     std::fs::remove_file(&path).ok();
 }
+
+#[test]
+#[cfg(unix)]
+#[ignore = "PTY/terminal e2e; needs a real controlling terminal. Run with --ignored. See module header."]
+fn daemon_stderr_log_is_private_and_per_pid() {
+    // The `--connect-daemon` edit-host redirects the daemon child's stderr to a log
+    // under the temp dir. It must be a *private* (owner-only, `0600`) file at a
+    // *per-pid* name — not the old fixed, world-readable `nxvim-daemon.log`, which let
+    // another local user pre-plant a symlink there and have the daemon's stderr truncate
+    // one of the victim's files (CWE-377), and exposed the daemon's diagnostics `0644`.
+    use std::os::unix::fs::PermissionsExt;
+
+    // A benign "daemon" that stays alive but never speaks the wire, so the edit-host
+    // creates the stderr log (done at connect, before the handshake) and we can inspect
+    // it without a real daemon.
+    let mut s = Session::spawn_with_env(
+        &["--connect-daemon"],
+        &[("NXVIM_DAEMON_CMD", "sleep 30")],
+        80,
+        24,
+    );
+    let pid = s._child.process_id().expect("the spawned nxvim has a pid");
+    let log = std::env::temp_dir().join(format!("nxvim-daemon-{pid}.log"));
+
+    // Poll for the log to appear.
+    let mut meta = None;
+    for _ in 0..200 {
+        if let Ok(m) = std::fs::metadata(&log) {
+            meta = Some(m);
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    let meta = meta.unwrap_or_else(|| panic!("daemon stderr log {} never appeared", log.display()));
+
+    let mode = meta.permissions().mode() & 0o777;
+    assert_eq!(
+        mode, 0o600,
+        "daemon stderr log must be owner-only 0600, got {mode:o}"
+    );
+
+    s.send(b":q!\r");
+    std::fs::remove_file(&log).ok();
+}

@@ -1486,3 +1486,54 @@ fn a_picker_row_keeps_the_file_name_when_the_path_overflows() {
         );
     }
 }
+
+/// Every cell symbol painted into `buf`, concatenated. Used to assert the render
+/// never emits a raw terminal control/escape byte the server (or file content the
+/// server surfaced) supplied.
+fn all_symbols(buf: &Buffer) -> String {
+    let mut out = String::new();
+    for y in 0..buf.area.height {
+        for x in 0..buf.area.width {
+            if let Some(c) = buf.cell((x, y)) {
+                out.push_str(c.symbol());
+            }
+        }
+    }
+    out
+}
+
+#[test]
+fn server_supplied_escape_sequences_never_reach_the_terminal() {
+    // SECURITY: a malicious server — or untrusted file content the server surfaces
+    // (a buffer line, a message, a status segment) — must not be able to inject raw
+    // ANSI/OSC escape sequences into the user's terminal. An OSC 52 would hijack the
+    // clipboard, an OSC 0 would rewrite the title bar, a CSI could move the cursor or
+    // clear the screen. The client renders all server text through ratatui spans,
+    // which strip control characters (the ESC introducer included), so the bytes are
+    // neutralised to inert printable residue. This pins that guarantee against a
+    // future regression (a ratatui bump, or someone adding a raw write path).
+    let payload = "x\u{1b}]52;c;cHduZWQ=\u{7}\u{1b}[2J\u{1b}]0;pwned\u{7}\u{1b}[31my";
+    let v = view(vec![
+        ("lines", lines(&[payload])),
+        ("message", Value::from(payload)),
+        ("status", status(&[(payload, None)])),
+    ]);
+    let buf = paint(&v, 40, 6);
+    let painted = all_symbols(&buf);
+    // The ESC introducer and the BEL terminator — the only bytes that make the rest
+    // of the payload an executable escape sequence — must be gone everywhere.
+    assert!(
+        !painted.chars().any(|c| c.is_control()),
+        "no control character may reach the terminal; got {painted:?}"
+    );
+    assert!(
+        !painted.contains('\u{1b}'),
+        "the ESC introducer must be stripped from every rendered cell"
+    );
+    // The inert printable residue still renders (the text passes through; only the
+    // control bytes are removed), so this is sanitisation, not wholesale dropping.
+    assert!(
+        row_text(&buf, 0).contains("52;c;cHduZWQ="),
+        "the printable residue of the buffer line still renders"
+    );
+}

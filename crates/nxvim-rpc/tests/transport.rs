@@ -59,6 +59,36 @@ async fn malformed_frame_closes_connection_instead_of_hanging() {
     );
 }
 
+/// A frame whose array length prefix claims a colossal element count must be
+/// rejected the instant the header is seen — not buffered toward the frame-size
+/// cap while rmpv tries to materialize billions of `Value`s (a tiny crafted
+/// message would otherwise amplify into gigabytes of heap and quadratic CPU).
+/// Before the allocation-budget scan, the inner array reads as an
+/// `UnexpectedEof` (its elements never arrive), so the reader waits forever and
+/// this hangs; after, the oversized declared length tears the connection down,
+/// closing the incoming channel promptly.
+#[tokio::test]
+async fn oversized_length_prefix_is_rejected_promptly() {
+    let (mut peer, _rpc, _peer_reader, mut incoming) = rig();
+
+    // [2, "x", <array32 claiming 0xFFFFFFFF elements>] — 9 bytes, no payload.
+    let bomb = [
+        0x93, // fixarray, 3 elements
+        0x02, // 2 (notification tag)
+        0xa1, 0x78, // fixstr "x"
+        0xdd, 0xff, 0xff, 0xff, 0xff, // array32, len = 4_294_967_295
+    ];
+    peer.write_all(&bomb).await.unwrap();
+
+    // `peer` stays open, so the only way the stream ends is the reader tearing
+    // it down on the abusive length — an EOF can't mask the result here.
+    let outcome = tokio::time::timeout(Duration::from_secs(2), incoming.recv()).await;
+    assert!(
+        matches!(outcome, Ok(None)),
+        "expected teardown on an oversized length prefix, got {outcome:?}"
+    );
+}
+
 /// An in-flight `request().await` must resolve to an error when the connection
 /// drops, not hang forever. Before the fix the reader exiting on EOF left the
 /// request's `oneshot::Sender` sitting in the `pending` map (kept alive by the

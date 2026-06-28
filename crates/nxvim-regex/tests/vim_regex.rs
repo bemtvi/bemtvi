@@ -177,6 +177,24 @@ fn compile_errors_carry_vim_messages() {
 }
 
 #[test]
+fn out_of_range_column_rejected() {
+    // A column past the end of the line must be rejected, not handed to the
+    // engine (which would scan past the NUL terminator — an OOB read).
+    let re = VimRegex::compile("a").unwrap();
+    let line = "abc"; // len 3
+    assert!(re.exec_line(line, 3, false).is_ok()); // col == len is valid (the NUL)
+    assert!(re.exec_line(line, 4, false).is_err()); // one past the end
+    assert!(re.exec_line(line, usize::MAX, false).is_err());
+
+    // Same guard on the multi-line buffer entry point, including a column that
+    // would wrap to a negative `colnr_T` when narrowed to i32.
+    let buf = VimBuffer::from_lines(&["abc"]).unwrap();
+    assert!(buf.exec(&re, 1, 3, false, None).is_ok());
+    assert!(buf.exec(&re, 1, 4, false, None).is_err());
+    assert!(buf.exec(&re, 1, u32::MAX, false, None).is_err());
+}
+
+#[test]
 fn nul_bytes_rejected() {
     assert!(VimRegex::compile("a\0b").is_err());
     let re = VimRegex::compile("a").unwrap();

@@ -332,6 +332,15 @@ impl VimRegex {
     ) -> Result<Option<LineMatch>, VimRegexError> {
         let cline =
             CString::new(line).map_err(|_| VimRegexError("line contains a NUL byte".into()))?;
+        // The engine starts scanning at `line + col` with no bounds check of its
+        // own; a `col` past the end of the line would read past the NUL
+        // terminator (OOB). `col == line.len()` is valid (it points at the NUL).
+        if col > line.len() {
+            return Err(VimRegexError(format!(
+                "column {col} past end of line (length {})",
+                line.len()
+            )));
+        }
         let col = ColnrT::try_from(col).map_err(|_| VimRegexError("column out of range".into()))?;
 
         let guard = engine();
@@ -572,6 +581,18 @@ impl VimBuffer {
     ) -> Result<Option<BufMatch>, VimRegexError> {
         if lnum == 0 || lnum > self.line_count() {
             return Err(VimRegexError(format!("lnum {lnum} out of range")));
+        }
+        // The engine starts scanning at `line + col` with no bounds check of its
+        // own. Reject a `col` past the end of the starting line (OOB read past the
+        // NUL) — and, because `col` is later narrowed `u32 as ColnrT(i32)`, a
+        // value that would wrap to a negative column (OOB read before the buffer).
+        // `col == line length` is valid (it points at the NUL). `lens[lnum]` is
+        // the line's byte length and is always >= 0 (it came from `usize` lengths).
+        let line_len = self.data.lens[lnum as usize] as u32;
+        if col > line_len {
+            return Err(VimRegexError(format!(
+                "col {col} past end of line {lnum} (length {line_len})"
+            )));
         }
         let _guard = engine();
         if re.prog.get().is_null() {

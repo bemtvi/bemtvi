@@ -883,29 +883,53 @@ fn frame(body: &Value) -> Vec<u8> {
 /// payload (a whole-file `didOpen`, a large `semanticTokens` set).
 const MAX_FRAME_LEN: usize = 256 * 1024 * 1024;
 
+/// The largest run of bytes we will buffer *without* a complete `\r\n\r\n` header
+/// terminator in sight (64 KiB). A real LSP frame header is tiny (a `Content-Length`
+/// line, maybe a `Content-Type` — under ~100 bytes), so a stream that piles up past
+/// this with no terminator is corrupt or hostile (or the trailing bytes of a frame
+/// we refused for being over-long): the buffer is dropped rather than allowed to
+/// grow without bound waiting for a terminator that may never come. Without this cap
+/// the [`MAX_FRAME_LEN`] body limit alone leaves a memory-exhaustion hole — a server
+/// that never emits `\r\n\r\n` (or dribbles a never-terminating header line) makes
+/// `inbuf` grow unboundedly, since the body limit only applies *after* a header is
+/// parsed.
+const MAX_HEADER_LEN: usize = 64 * 1024;
+
 /// Drain every complete `Content-Length`-framed JSON-RPC message from `inbuf`,
 /// leaving any trailing partial frame buffered for the next chunk. A malformed
-/// header is skipped (past its terminator) rather than stalling the stream, and an
+/// header is skipped (past its terminator) rather than stalling the stream, an
 /// absurd `Content-Length` (> [`MAX_FRAME_LEN`]) drops the frame rather than
-/// buffering unboundedly.
+/// buffering unboundedly, and an un-terminated header run past [`MAX_HEADER_LEN`]
+/// drops the buffer rather than growing without bound.
 fn parse_frames(inbuf: &mut Vec<u8>) -> Vec<Value> {
     let mut out = Vec::new();
-    while let Some(hdr_end) = find_subsequence(inbuf, b"\r\n\r\n") {
+    loop {
+        let Some(hdr_end) = find_subsequence(inbuf, b"\r\n\r\n") else {
+            // No complete header block buffered. Real headers are tiny, so an
+            // un-terminated run past the cap is corrupt/hostile input (or the
+            // headerless remnant of an over-long frame skipped below): drop it so
+            // `inbuf` can't grow without bound waiting on a terminator. A genuine
+            // partial header well under the cap stays buffered for the next chunk.
+            if inbuf.len() > MAX_HEADER_LEN {
+                inbuf.clear();
+            }
+            break;
+        };
         let body_start = hdr_end + 4;
         let Some(len) = parse_content_length(&inbuf[..hdr_end]) else {
             inbuf.drain(..body_start); // skip the unparseable header, keep going
             continue;
         };
         // An over-long frame is a protocol error: never grow `inbuf` to hold it.
-        // Skip past the header now; the body (when/if it arrives) parses as a fresh
-        // frame and fails the header search, so the trailing bytes drain out rather
-        // than wedging the stream on a length we refuse to honor.
+        // Skip past the header now; the body (when/if it arrives) is headerless, so
+        // it fails the header search above and is dropped by the [`MAX_HEADER_LEN`]
+        // guard rather than wedging the stream on a length we refuse to honor.
         if len > MAX_FRAME_LEN {
             inbuf.drain(..body_start);
             continue;
         }
         if inbuf.len() < body_start + len {
-            break; // body not fully arrived yet
+            break; // body not fully arrived yet (bounded by MAX_FRAME_LEN)
         }
         let body: Vec<u8> = inbuf[body_start..body_start + len].to_vec();
         inbuf.drain(..body_start + len);

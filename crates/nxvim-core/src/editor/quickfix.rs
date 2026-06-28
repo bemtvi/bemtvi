@@ -1149,29 +1149,31 @@ impl Editor {
             jump = true;
             rest = s[end..].trim_start().to_string();
         } else {
-            // Delimited form: find the matching unescaped closing delimiter.
+            // Delimited form: find the matching unescaped closing delimiter. Scan by
+            // char (the delimiter — and the pattern — may be multi-byte), tracking
+            // byte offsets so every slice lands on a char boundary; a byte scan would
+            // panic slicing mid-character for a multi-byte delimiter (e.g. `«…»`).
             let delim = first;
-            let bytes = s.as_bytes();
-            let mut i = 1;
+            let delim_len = delim.len_utf8();
+            let mut chars = s.char_indices().skip(1); // skip the opening delimiter
             let mut close = None;
-            while i < bytes.len() {
-                if bytes[i] == b'\\' && i + 1 < bytes.len() {
-                    i += 2;
+            while let Some((idx, c)) = chars.next() {
+                if c == '\\' {
+                    chars.next(); // a backslash escapes the following char
                     continue;
                 }
-                if bytes[i] as char == delim {
-                    close = Some(i);
+                if c == delim {
+                    close = Some(idx);
                     break;
                 }
-                i += 1;
             }
             let Some(close) = close else {
                 self.echo(format!("E682: Invalid search pattern or delimiter: {s}"));
                 return None;
             };
-            pattern = s[1..close].to_string();
+            pattern = s[delim_len..close].to_string();
             // Flags run from just after the delimiter up to the first blank.
-            let after = &s[close + 1..];
+            let after = &s[close + delim_len..];
             let fend = after.find(char::is_whitespace).unwrap_or(after.len());
             every = false;
             jump = true;

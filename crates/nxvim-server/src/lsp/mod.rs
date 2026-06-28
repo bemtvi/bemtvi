@@ -365,8 +365,18 @@ pub(crate) fn lsp_range_to_bytes_in(
     range: &Range,
     encoding: PositionEncoding,
 ) -> std::ops::Range<usize> {
-    lsp_pos_to_byte_in(buffer, range.start, encoding)
-        ..lsp_pos_to_byte_in(buffer, range.end, encoding)
+    let start = lsp_pos_to_byte_in(buffer, range.start, encoding);
+    let end = lsp_pos_to_byte_in(buffer, range.end, encoding);
+    // A well-formed LSP range has `start <= end`, but the server is untrusted: a
+    // reversed range yields `start > end`, and downstream consumers compute
+    // **unsigned** deltas over it — the cursor-shift planner in
+    // [`Editor::apply_edits_to`](nxvim_core::Editor) (`e_row - s_row`) and the
+    // completion-accept's `r.end - r.start` — which underflow and panic the server
+    // thread on a malformed reply (the same one-line-DoS class the row clamp in
+    // [`lsp_pos_to_byte_in`] already guards). Clamp `end` up to `start` so a
+    // reversed range degrades to an empty (insert-only) edit instead of crashing;
+    // a valid forward range round-trips unchanged.
+    start..end.max(start)
 }
 
 /// Absolute byte offset of an LSP [`Position`] (in `encoding`) within `buffer`:

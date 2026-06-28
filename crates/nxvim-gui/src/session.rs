@@ -243,10 +243,10 @@ where
 /// tokio runtime (the child's pipes bind to it).
 fn spawn_stdio_daemon() -> Result<tokio::process::Child> {
     use tokio::process::Command;
-    let log_path = std::env::temp_dir().join("nxvim-daemon.log");
-    let stderr = std::fs::File::create(&log_path)
-        .map(Stdio::from)
-        .unwrap_or_else(|_| Stdio::null());
+    // The daemon's stderr goes to a private log the user can `tail` to diagnose the
+    // daemon side; it can't share the GUI's terminal. See [`daemon_log_stderr`] for
+    // why the path is per-pid and symlink-safe rather than a fixed `/tmp` name.
+    let stderr = daemon_log_stderr();
     let mut cmd = if let Some(cmd) = std::env::var_os(DAEMON_CMD_ENV) {
         let mut c = Command::new("sh");
         c.arg("-c").arg(cmd);
@@ -270,6 +270,39 @@ fn spawn_stdio_daemon() -> Result<tokio::process::Child> {
         .kill_on_drop(true)
         .spawn()
         .map_err(|e| anyhow!(e).context("spawning the daemon"))
+}
+
+/// Open the daemon's stderr log — a private, symlink-safe temp file.
+///
+/// A fixed shared path (`$TMPDIR/nxvim-daemon.log`) opened with `File::create` is a
+/// classic `/tmp` symlink attack: on a multi-user host an attacker plants that name as
+/// a symlink to a victim-owned file and `File::create` follows it, truncating and then
+/// overwriting the target with daemon diagnostics. Mitigations, matching the TUI binary's
+/// `daemon_log_stderr`:
+/// - **Per-pid path**, so concurrent / repeat runs don't collide and `create_new` can
+///   succeed on a fresh name.
+/// - **`create_new` (`O_CREAT | O_EXCL`)**, which refuses to follow a symlink and refuses
+///   to truncate an existing file; a stale same-pid leftover (only ever *our own*) is
+///   removed first, and if the create still fails (an attacker re-planted the name under
+///   `/tmp`'s sticky bit) stderr is discarded rather than written through a hostile path.
+/// - **Mode `0600`** so daemon diagnostics (paths, errors) aren't exposed to other users
+///   of a shared temp dir.
+fn daemon_log_stderr() -> Stdio {
+    let path = std::env::temp_dir().join(format!("nxvim-daemon-{}.log", std::process::id()));
+    // Best-effort: clear a stale file from a prior same-pid run (only ever ours). If
+    // another user owns the name under the sticky bit this fails harmlessly — the
+    // `create_new` below then also fails and we fall back to discarding stderr.
+    let _ = std::fs::remove_file(&path);
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    opts.open(&path)
+        .map(Stdio::from)
+        .unwrap_or_else(|_| Stdio::null())
 }
 
 /// The sibling daemon binary's file name (`nxvim.exe` on Windows, `nxvim` elsewhere).

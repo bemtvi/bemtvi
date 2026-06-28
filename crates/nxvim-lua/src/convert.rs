@@ -7,6 +7,25 @@
 
 use mlua::{Lua, Table};
 
+/// Maximum table/value nesting the recursive bridges will walk before bailing
+/// out with an error instead of recursing further. Guards against unbounded
+/// native recursion — a *cyclic* Lua table (`t = {}; t.x = t`) or a pathologically
+/// deep one handed to `vim.json.encode` / returned from `nvim_exec_lua` — which
+/// would otherwise overflow the (≈2 MB) server-thread stack and **abort the whole
+/// process** (a Rust stack overflow is uncatchable). 256 is far above any real
+/// config/LSP payload (JSON decoded via serde_json is itself capped at 128 deep)
+/// yet a tiny fraction of the available stack, so legitimate data always converts
+/// and only a cycle / abuse hits the limit — loudly, as a recoverable Lua error.
+const MAX_DEPTH: usize = 256;
+
+/// The loud error raised when [`MAX_DEPTH`] is exceeded — surfaced to Lua (e.g.
+/// `vim.json.encode`) or to the RPC caller (`nvim_exec_lua`) rather than crashing.
+fn too_deep() -> mlua::Error {
+    mlua::Error::external(format!(
+        "value nesting too deep (cycle, or more than {MAX_DEPTH} levels)"
+    ))
+}
+
 /// `mlua::Integer` is the Lua VM's integer width: `i64` on 64-bit native, but `i32`
 /// on wasm32 (`lua_Integer` is `ptrdiff_t`, and wasm32 pointers are 32-bit). nxvim's
 /// values are `i64`-centric, so these two helpers are the single portable bridge
@@ -146,19 +165,26 @@ fn classify_table<V>(
 /// Functions / userdata / threads (not representable over msgpack) collapse to
 /// nil. Covers the scalar-and-table shapes nxvim's synchronous getters return.
 pub(crate) fn lua_to_rmpv(value: &mlua::Value) -> mlua::Result<rmpv::Value> {
+    lua_to_rmpv_at(value, 0)
+}
+
+fn lua_to_rmpv_at(value: &mlua::Value, depth: usize) -> mlua::Result<rmpv::Value> {
     use mlua::Value as L;
+    if depth > MAX_DEPTH {
+        return Err(too_deep());
+    }
     Ok(match value {
         L::Nil => rmpv::Value::Nil,
         L::Boolean(b) => rmpv::Value::from(*b),
         L::Integer(i) => rmpv::Value::from(*i),
         L::Number(n) => rmpv::Value::from(*n),
         L::String(s) => rmpv::Value::from(s.to_str()?.to_string()),
-        L::Table(t) => match classify_table(t, lua_to_rmpv)? {
+        L::Table(t) => match classify_table(t, |v| lua_to_rmpv_at(v, depth + 1))? {
             LuaTable::Array(items) => rmpv::Value::Array(items),
             LuaTable::Map(pairs) => {
                 let mut map = Vec::with_capacity(pairs.len());
                 for (k, v) in pairs {
-                    map.push((lua_to_rmpv(&k)?, v));
+                    map.push((lua_to_rmpv_at(&k, depth + 1)?, v));
                 }
                 rmpv::Value::Map(map)
             }
@@ -174,7 +200,14 @@ pub(crate) fn lua_to_rmpv(value: &mlua::Value) -> mlua::Result<rmpv::Value> {
 /// non-string key is stringified); arrays and integer/float/bool/string/nil map
 /// directly; binary blobs become Lua strings.
 pub(crate) fn rmpv_to_lua(lua: &Lua, value: &rmpv::Value) -> mlua::Result<mlua::Value> {
+    rmpv_to_lua_at(lua, value, 0)
+}
+
+fn rmpv_to_lua_at(lua: &Lua, value: &rmpv::Value, depth: usize) -> mlua::Result<mlua::Value> {
     use rmpv::Value as R;
+    if depth > MAX_DEPTH {
+        return Err(too_deep());
+    }
     Ok(match value {
         R::Nil => mlua::Value::Nil,
         R::Boolean(b) => mlua::Value::Boolean(*b),
@@ -189,7 +222,7 @@ pub(crate) fn rmpv_to_lua(lua: &Lua, value: &rmpv::Value) -> mlua::Result<mlua::
         R::Array(items) => {
             let t = lua.create_table()?;
             for (i, item) in items.iter().enumerate() {
-                t.raw_set(i + 1, rmpv_to_lua(lua, item)?)?;
+                t.raw_set(i + 1, rmpv_to_lua_at(lua, item, depth + 1)?)?;
             }
             mlua::Value::Table(t)
         }
@@ -200,7 +233,7 @@ pub(crate) fn rmpv_to_lua(lua: &Lua, value: &rmpv::Value) -> mlua::Result<mlua::
                     R::String(s) => s.as_str().unwrap_or_default().to_string(),
                     other => other.to_string(),
                 };
-                t.raw_set(key, rmpv_to_lua(lua, v)?)?;
+                t.raw_set(key, rmpv_to_lua_at(lua, v, depth + 1)?)?;
             }
             mlua::Value::Table(t)
         }
@@ -214,7 +247,14 @@ pub(crate) fn rmpv_to_lua(lua: &Lua, value: &rmpv::Value) -> mlua::Result<mlua::
 /// back absent — fine for the `cargo metadata` shape the `lsp/<server>.lua`
 /// configs decode, which only index present string/array fields).
 pub(crate) fn json_to_lua(lua: &Lua, value: &serde_json::Value) -> mlua::Result<mlua::Value> {
+    json_to_lua_at(lua, value, 0)
+}
+
+fn json_to_lua_at(lua: &Lua, value: &serde_json::Value, depth: usize) -> mlua::Result<mlua::Value> {
     use serde_json::Value as J;
+    if depth > MAX_DEPTH {
+        return Err(too_deep());
+    }
     Ok(match value {
         J::Null => mlua::Value::Nil,
         J::Bool(b) => mlua::Value::Boolean(*b),
@@ -226,14 +266,14 @@ pub(crate) fn json_to_lua(lua: &Lua, value: &serde_json::Value) -> mlua::Result<
         J::Array(items) => {
             let t = lua.create_table()?;
             for (i, item) in items.iter().enumerate() {
-                t.raw_set(i + 1, json_to_lua(lua, item)?)?;
+                t.raw_set(i + 1, json_to_lua_at(lua, item, depth + 1)?)?;
             }
             mlua::Value::Table(t)
         }
         J::Object(map) => {
             let t = lua.create_table()?;
             for (k, v) in map {
-                t.raw_set(k.as_str(), json_to_lua(lua, v)?)?;
+                t.raw_set(k.as_str(), json_to_lua_at(lua, v, depth + 1)?)?;
             }
             mlua::Value::Table(t)
         }
@@ -271,14 +311,21 @@ pub(crate) fn env_pairs(env: Option<Table>) -> mlua::Result<Vec<(String, String)
 /// exactly `1..=len` is an array, anything else an object (keys coerced to
 /// strings); non-serializable values (functions / userdata) collapse to `null`.
 pub(crate) fn lua_to_json(value: &mlua::Value) -> mlua::Result<serde_json::Value> {
+    lua_to_json_at(value, 0)
+}
+
+fn lua_to_json_at(value: &mlua::Value, depth: usize) -> mlua::Result<serde_json::Value> {
     use mlua::Value as L;
+    if depth > MAX_DEPTH {
+        return Err(too_deep());
+    }
     Ok(match value {
         L::Nil => serde_json::Value::Null,
         L::Boolean(b) => serde_json::Value::Bool(*b),
         L::Integer(i) => serde_json::Value::from(*i),
         L::Number(n) => serde_json::Value::from(*n),
         L::String(s) => serde_json::Value::from(s.to_str()?.to_string()),
-        L::Table(t) => match classify_table(t, lua_to_json)? {
+        L::Table(t) => match classify_table(t, |v| lua_to_json_at(v, depth + 1))? {
             LuaTable::Array(items) => serde_json::Value::Array(items),
             LuaTable::Map(pairs) => {
                 let mut map = serde_json::Map::new();

@@ -158,6 +158,18 @@ pub struct Engine {
     // Rust drops fields in declaration order, so `buffers` is declared first.
     buffers: HashMap<BufferId, BufferState>,
     grammars: HashMap<String, Slot>,
+    /// Grammars evicted from `grammars` by [`Engine::reload_grammar`] whose dlopen'd
+    /// library must stay mapped for the rest of the session. A *loaded* grammar's
+    /// library is referenced by every open buffer's `Parser` and `Tree` (built from
+    /// its `Language`) — including a parser left mid-parse, whose external-scanner
+    /// payload `ts_parser_delete` frees *through* the library when the buffer is
+    /// re-opened or dropped. Dropping the library at reload time would unmap that
+    /// code out from under those live buffers (the same destroy-after-unload SIGSEGV
+    /// the field order guards against at teardown — see `tests/drop_order.rs`), so a
+    /// reload retires the old grammar here instead of dropping it. Declared **after**
+    /// `buffers` for the same reason `grammars` is: it must outlive every parser/tree
+    /// that points into it.
+    retired_grammars: Vec<Slot>,
     /// Query-text overrides from the resolution bridge, consulted by
     /// [`Grammar::load`] and applied in place by [`Engine::set_query`].
     query_overrides: QueryOverrides,
@@ -172,6 +184,7 @@ impl Engine {
             roots,
             buffers: HashMap::new(),
             grammars: HashMap::new(),
+            retired_grammars: Vec::new(),
             query_overrides: QueryOverrides::new(),
         }
     }
@@ -1077,11 +1090,24 @@ impl SyntaxEngine for Engine {
     }
 
     fn reload_grammar(&mut self, lang: &str) {
-        // Drop the cached slot (Loaded/NotInstalled/Failed); the next `grammar()`
-        // re-resolves it from the search path — picking up a just-installed parser.
-        // Buffers already parsed under the old slot keep their state until the
-        // editor re-opens them (it drops `syntax_opened` markers in step).
-        self.grammars.remove(lang);
+        // Evict the cached slot so the next `grammar()` re-resolves it from the
+        // search path — picking up a just-installed parser. Buffers already parsed
+        // under the old slot keep their state until the editor re-opens them (it
+        // drops `syntax_opened` markers in step).
+        //
+        // A *loaded* grammar must not be dropped here: every open buffer's parser
+        // and tree (and any parser left mid-parse, whose external-scanner payload is
+        // freed *through* the library on drop/re-open) still points into its dlopen'd
+        // `.so`. Dropping it would unmap that code out from under those live buffers —
+        // the destroy-after-unload SIGSEGV `tests/drop_order.rs` exercises, here at
+        // reload time rather than teardown. Retire it so the library stays mapped for
+        // the rest of the session; a not-installed / failed slot owns nothing and is
+        // simply dropped.
+        if let Some(slot) = self.grammars.remove(lang) {
+            if matches!(slot, Slot::Loaded(_)) {
+                self.retired_grammars.push(slot);
+            }
+        }
     }
 
     fn highlights(&mut self, buffer: BufferId, first: usize, last: usize) -> Vec<Span> {

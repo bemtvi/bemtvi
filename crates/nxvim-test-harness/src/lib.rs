@@ -510,11 +510,34 @@ pub fn message(map: &[(Value, Value)]) -> String {
 
 // ===== temp filesystem =======================================================
 
-/// A unique suffix (`<pid>_<n>`) for temp paths, stable within a test process.
+/// A unique suffix (`<pid>_<n>_<rand>`) for temp paths, stable within a test
+/// process. The `<rand>` component is an OS-seeded per-call random value, so a
+/// path is not predictable from pid+counter alone: that narrows the symlink /
+/// TOCTOU window in the world-writable system temp dir (defence in depth on top
+/// of the `create_new` O_EXCL creates below) and avoids spurious collisions when
+/// a pid is reused after an earlier run left files behind.
 fn unique() -> String {
+    use std::hash::BuildHasher;
     static COUNTER: AtomicU64 = AtomicU64::new(0);
     let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-    format!("{}_{n}", std::process::id())
+    let rand = std::hash::RandomState::new().hash_one(n);
+    format!("{}_{n}_{rand:016x}", std::process::id())
+}
+
+/// Create `path` exclusively (O_CREAT|O_EXCL) and write `content` to it. Failing
+/// when the path already exists — including when it is a pre-planted symlink —
+/// defeats the classic temp-file symlink attack in a shared temp dir (a plain
+/// `fs::write` would follow the link and truncate the target). The unique names
+/// mean an existing path is never expected, so this only ever fails loud on an
+/// actual collision / hostile pre-creation, never in normal test flow.
+fn write_new(path: &std::path::Path, content: &[u8]) {
+    use std::io::Write;
+    let mut f = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+        .unwrap_or_else(|e| panic!("create temp file {}: {e}", path.display()));
+    f.write_all(content).expect("write temp file");
 }
 
 /// A fresh, uniquely-named `.txt` temp file path (not created).
@@ -522,17 +545,20 @@ pub fn temp_path(tag: &str) -> PathBuf {
     std::env::temp_dir().join(format!("nxvim_test_{tag}_{}.txt", unique()))
 }
 
-/// Create and return a fresh, uniquely-named temp directory.
+/// Create and return a fresh, uniquely-named temp directory. Uses `create_dir`
+/// (not `create_dir_all`) so it fails loud if the path already exists — an
+/// idempotent `create_dir_all` would silently accept an attacker-planted
+/// directory or symlink at the (otherwise unique) path.
 pub fn temp_dir(tag: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!("nxvim_test_{tag}_{}", unique()));
-    std::fs::create_dir_all(&dir).expect("create temp dir");
+    std::fs::create_dir(&dir).expect("create temp dir");
     dir
 }
 
 /// Write `content` to a fresh temp file with extension `ext`; return its path.
 pub fn write_temp(tag: &str, ext: &str, content: &str) -> String {
     let path = std::env::temp_dir().join(format!("nxvim_test_{tag}_{}.{ext}", unique()));
-    std::fs::write(&path, content).expect("write temp file");
+    write_new(&path, content.as_bytes());
     path.to_string_lossy().into_owned()
 }
 
@@ -540,7 +566,7 @@ pub fn write_temp(tag: &str, ext: &str, content: &str) -> String {
 pub fn write_n_lines(tag: &str, n: usize) -> String {
     let path = temp_path(tag);
     let body: String = (1..=n).map(|i| format!("line{i}\n")).collect();
-    std::fs::write(&path, body).expect("write temp file");
+    write_new(&path, body.as_bytes());
     path.to_string_lossy().into_owned()
 }
 

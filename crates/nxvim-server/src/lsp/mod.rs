@@ -21,10 +21,22 @@ use std::collections::BTreeMap;
 
 use nxvim_lsp::lsp_types::{
     Diagnostic, DiagnosticSeverity, Position, Range, SemanticToken, TextDocumentContentChangeEvent,
-    TextDocumentSyncKind, Url,
+    TextDocumentSyncKind, TextEdit, Url,
 };
 use nxvim_lsp::{PositionEncoding, ProviderCaps, SemanticLegend, ServerKey, ServerSpawn};
 use nxvim_lua::{DiagnosticData, LspServerCapabilities};
+
+/// A workspace edit's edits for a file whose bytes are still being fetched **off-tick**
+/// (a daemon / web session): kept in LSP form plus the originating server's position
+/// encoding, because their byte ranges can only be resolved once the replica buffer's
+/// real contents have landed. Stashed in [`EditHost::pending_replica_edits`] keyed by
+/// the replica buffer's id and applied by `EditHost::apply_pending_replica_edit` when
+/// the fetch completes. (Local sessions read synchronously and apply inline, so they
+/// never populate this.)
+pub(crate) struct PendingReplicaEdit {
+    pub(crate) edits: Vec<TextEdit>,
+    pub(crate) encoding: PositionEncoding,
+}
 
 mod completion;
 pub(crate) use completion::{complete_doc_lines, LspComplete};

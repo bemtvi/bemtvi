@@ -552,6 +552,78 @@ async fn rename_applies_the_workspace_edit() {
     );
 }
 
+/// A project-wide rename whose `WorkspaceEdit` also touches a file that was never
+/// opened must load that file into a buffer on the spot and apply the edit there —
+/// the cross-file rename neovim's `apply_text_edits` does. The unopened file's
+/// buffer is left modified (saved with `:wa`), exactly as the open buffer is.
+#[tokio::test]
+async fn rename_reaches_an_unopened_file() {
+    let _guard = serial_lock().lock().await;
+    let dir = temp_dir("lsp_features_rename_unopened");
+    let uri_a = file_uri(&dir, "a.rs");
+    let uri_b = file_uri(&dir, "b.rs");
+    // `b.rs` exists on disk but is never opened by the test; the rename must reach it.
+    std::fs::write(dir.join("b.rs"), "use a::foo;\nfn g() { foo() }\n").expect("write b.rs");
+    // Rename `foo` → `bar`: one occurrence in the open `a.rs`, two in the unopened `b.rs`.
+    arm_mock(
+        &dir,
+        &format!(
+            r#"{{
+                "rename": {{
+                    "changes": {{
+                        "{uri_a}": [
+                            {{
+                                "range": {{ "start": {{ "line": 0, "character": 4 }}, "end": {{ "line": 0, "character": 7 }} }},
+                                "newText": "bar"
+                            }}
+                        ],
+                        "{uri_b}": [
+                            {{
+                                "range": {{ "start": {{ "line": 0, "character": 7 }}, "end": {{ "line": 0, "character": 10 }} }},
+                                "newText": "bar"
+                            }},
+                            {{
+                                "range": {{ "start": {{ "line": 1, "character": 9 }}, "end": {{ "line": 1, "character": 12 }} }},
+                                "newText": "bar"
+                            }}
+                        ]
+                    }}
+                }}
+            }}"#
+        ),
+    );
+    let (rpc, _incoming) = open_with_server(&dir, "let foo = 1\n").await;
+    assert!(
+        await_lua_eq(&rpc, "#nx.lsp.clients({ bufnr = 0 })", "1").await,
+        "the mock server should attach"
+    );
+
+    // Request the rename once and wait for the open buffer to settle.
+    let mut renamed = false;
+    for _ in 0..80 {
+        exec_lua(&rpc, "nx.lsp.rename('bar')").await;
+        nxvim_test_harness::barrier(&rpc).await;
+        if lines(&rpc).await.first().map(String::as_str) == Some("let bar = 1") {
+            renamed = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert!(renamed, "rename should rewrite the open buffer");
+
+    // The unopened `b.rs` was loaded into a buffer and edited in place. Switch to it
+    // by absolute path (the load reused — not re-read — its on-disk path) and check
+    // both occurrences.
+    let b_path = dir.join("b.rs");
+    feed(&rpc, &format!(":edit {}<CR>", b_path.display()));
+    barrier(&rpc).await;
+    assert_eq!(
+        lines(&rpc).await,
+        vec!["use a::bar;", "fn g() { bar() }"],
+        "the rename should reach both occurrences in the unopened file"
+    );
+}
+
 /// A rename whose `WorkspaceEdit` inserts a line *above* the cursor (e.g. an added
 /// `use` import) must carry the cursor down with the text it sits on — like
 /// neovim's `apply_text_edits` — not leave it pinned to a now-stale absolute line.

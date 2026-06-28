@@ -109,18 +109,28 @@ impl EditHost {
 
     /// Apply a normalized workspace edit (from rename or a code action) across the
     /// files it touches. Each URI is resolved to a buffer: the **open** buffer it
-    /// names, else the file is loaded into a buffer on the spot
-    /// ([`Editor::ensure_buffer_loaded`]) so a project-wide rename reaches files you
-    /// haven't visited — the edit lands in memory (the buffer left modified, saved
-    /// with `:wa`), exactly as neovim's `apply_text_edits` does rather than writing
-    /// straight to disk. Each URI's edits convert to bytes against *its* buffer (a
-    /// freshly-loaded buffer has no negotiated encoding, so it falls back to the
-    /// originating — current — server's), apply as one undo step, and re-sync.
+    /// names, else the file is loaded into a buffer on the spot so a project-wide
+    /// rename reaches files you haven't visited — the edit lands in memory (the buffer
+    /// left modified, saved with `:wa`), exactly as neovim's `apply_text_edits` does
+    /// rather than writing straight to disk. Each URI's edits convert to bytes against
+    /// *its* buffer (a freshly-loaded buffer has no negotiated encoding, so it falls
+    /// back to the originating — current — server's), apply as one undo step, and
+    /// re-sync.
     ///
-    /// A URI whose file can't be brought into a buffer (a load failure, or a
-    /// daemon/off-tick session where the load would be async) is collected and
-    /// reported loud rather than silently dropped (the no-silent-stubs rule). An
-    /// edit that touches nothing applicable reports a brief message.
+    /// Loading an unopened file differs by session:
+    /// - **Local** ([`Editor::ensure_buffer_loaded`]): the file is read synchronously
+    ///   and edited inline, here and now.
+    /// - **Off-tick** (daemon / web — [`Editor::host_fs_offtick`]): the file's bytes
+    ///   cross the wire, so the load is async. The replica buffer is created and its
+    ///   fetch enqueued ([`Editor::enqueue_replica_open`]), and these edits are stashed
+    ///   in [`pending_replica_edits`](EditHost::pending_replica_edits); they apply when
+    ///   the bytes land ([`apply_pending_replica_edit`](EditHost::apply_pending_replica_edit)).
+    ///   Applying now would hit an empty buffer the fetch would then clobber.
+    ///
+    /// A URI whose file can't be brought into a buffer at all (a load failure, or a
+    /// URI that doesn't map to a path) is collected and reported loud rather than
+    /// silently dropped (the no-silent-stubs rule). An edit that touches — and defers —
+    /// nothing applicable reports a brief message.
     pub(crate) fn apply_workspace_edit(&mut self, changes: WorkspaceEditData) {
         // The originating server's encoding (the current buffer's, where the rename /
         // code action was requested): the WorkspaceEdit's positions are all in that
@@ -129,22 +139,49 @@ impl EditHost {
             .buffer_encoding(self.editor.current_buffer_id())
             .unwrap_or(PositionEncoding::Utf8);
         let mut touched = 0usize;
+        let mut deferred = 0usize;
         let mut unresolved: Vec<String> = Vec::new();
         for (uri, edits) in changes {
             if edits.is_empty() {
                 continue;
             }
-            // The open buffer for the URI, else load its file into one. A URI we
-            // can't resolve to a buffer (load failure / off-tick async fetch) is
-            // recorded so it can be reported, never silently skipped.
+            // The open buffer for the URI, else bring its file into one. A URI we
+            // can't resolve to a buffer is recorded so it can be reported, never
+            // silently skipped.
             let id = match self.buffer_id_for_uri(&uri) {
                 Some(id) => id,
                 None => {
-                    match uri_to_path(&uri).and_then(|p| self.editor.ensure_buffer_loaded(&p)) {
-                        Some(id) => id,
-                        None => {
-                            unresolved.push(uri.to_string());
-                            continue;
+                    let Some(path) = uri_to_path(&uri) else {
+                        unresolved.push(uri.to_string());
+                        continue;
+                    };
+                    // `buffer_id_for_uri` resolves symlinks via `fs::canonicalize`, which
+                    // fails for an **off-tick / virtual** path the local disk can't see —
+                    // so an already-open replica buffer slips past it. Match by normalized
+                    // path here and apply inline; only a genuinely unopened file defers.
+                    if let Some(id) = self.editor.find_buffer_by_path(&path) {
+                        id
+                    } else if self.editor.host_fs_offtick() {
+                        // Off-tick: create the replica buffer + enqueue its fetch now,
+                        // stash these edits to apply when the bytes land.
+                        let id = self.editor.enqueue_replica_open(&path);
+                        self.pending_replica_edits
+                            .entry(id)
+                            .or_insert_with(|| PendingReplicaEdit {
+                                edits: Vec::new(),
+                                encoding: origin_encoding,
+                            })
+                            .edits
+                            .extend(edits);
+                        deferred += 1;
+                        continue;
+                    } else {
+                        match self.editor.ensure_buffer_loaded(&path) {
+                            Some(id) => id,
+                            None => {
+                                unresolved.push(uri.to_string());
+                                continue;
+                            }
                         }
                     }
                 }
@@ -171,9 +208,37 @@ impl EditHost {
                 "apply_workspace_edit: could not open {}",
                 unresolved.join(", ")
             ));
-        } else if touched == 0 {
+        } else if touched == 0 && deferred == 0 {
             self.editor.echo("No applicable changes");
         }
+    }
+
+    /// Apply the workspace edits stashed for an **off-tick** replica buffer once its
+    /// bytes have landed — the deferred tail of [`apply_workspace_edit`], called from
+    /// both fetch-landing sites (`load_replica_bytes` native, `load_replica_wasm`
+    /// wasm). Converts each stashed edit's LSP range to bytes against the now-filled
+    /// buffer, in the originating server's encoding (a freshly-fetched replica has no
+    /// server of its own yet), applies as one undo step, and re-syncs. A no-op when
+    /// nothing is stashed for `buffer` — the common case on every other open.
+    pub(crate) fn apply_pending_replica_edit(&mut self, buffer: BufferId) {
+        let Some(pending) = self.pending_replica_edits.remove(&buffer) else {
+            return;
+        };
+        let Some(buf) = self.editor.buffer_of(buffer) else {
+            return;
+        };
+        let byte_edits = pending
+            .edits
+            .iter()
+            .map(|e| {
+                (
+                    lsp_range_to_bytes_in(buf, &e.range, pending.encoding),
+                    e.new_text.clone(),
+                )
+            })
+            .collect();
+        self.editor.apply_edits_to(buffer, byte_edits);
+        self.sync_lsp_buffer(buffer);
     }
 
     /// Offer a code-action reply's titles in the **select menu** (neovim's

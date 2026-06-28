@@ -1400,13 +1400,22 @@ impl Editor {
     /// list **without switching to it** — the find-or-load primitive a *workspace
     /// edit* uses to bring an unopened file's buffer into existence so its edits can
     /// be applied in memory (left modified, persisted by `:wa`, exactly as neovim's
-    /// `apply_text_edits` does — it never writes the edit straight to disk). Reuses
-    /// the shared [`Editor::open_buffer`] kernel for an already-open or local load.
+    /// `apply_text_edits` does — it never writes the edit straight to disk).
     ///
     /// Returns `None` (and loads nothing) in a **daemon / off-tick** session: there
     /// the load is an async fetch that would hand back an *empty* buffer to edit into,
     /// so the caller reports the file as unhandled rather than silently corrupting it.
     /// Also `None` on a synchronous local load failure (already echoed).
+    ///
+    /// Locally the file is read **synchronously**, bypassing the
+    /// [`should_defer_open`](Self::should_defer_open) deferral an ordinary
+    /// [`open_buffer`](Self::open_buffer) honors. A workspace edit needs the file's
+    /// bytes *now* to apply against, and it is not a user `:edit`, so it must not hand
+    /// first dibs to a `BufReadCmd` handler (the always-on explorer registers one, yet
+    /// it only ever claims *directories* — never a rename target). Deferring would add
+    /// an **empty** buffer and enqueue the disk fill for a later tick, so the edit would
+    /// land on emptiness and the fill would then clobber it; the direct read keeps the
+    /// edit and the file's real contents together.
     pub fn ensure_buffer_loaded(&mut self, path: &Path) -> Option<BufferId> {
         if let Some(id) = self.find_buffer_by_path(path) {
             return Some(id);
@@ -1414,7 +1423,30 @@ impl Editor {
         if self.host_fs_offtick {
             return None;
         }
-        self.open_buffer(path)
+        match self.read_buffer(path) {
+            Ok(buf) => Some(self.add_buffer(buf)),
+            Err(e) => {
+                self.echo(e.to_string());
+                None
+            }
+        }
+    }
+
+    /// Off-tick sibling of [`ensure_buffer_loaded`](Self::ensure_buffer_loaded): bring an
+    /// unopened file into a buffer whose bytes are fetched **asynchronously** (a
+    /// daemon / web session, where the file lives across the wire). Reuses an
+    /// already-open buffer; otherwise creates the empty, named replica buffer and
+    /// [enqueues](Self::enqueue_open) its fetch, returning the id **without switching**
+    /// so a workspace edit can stash its edits against it and apply them when the bytes
+    /// land (the synchronous read `ensure_buffer_loaded` does is impossible off-tick, so
+    /// the apply is necessarily deferred). Local sessions use `ensure_buffer_loaded`.
+    pub fn enqueue_replica_open(&mut self, path: &Path) -> BufferId {
+        if let Some(id) = self.find_buffer_by_path(path) {
+            return id;
+        }
+        let id = self.add_buffer(Buffer::named(path.to_path_buf()));
+        self.enqueue_open(id, path.to_path_buf());
+        id
     }
 
     /// Open `path` as the **current window's** buffer — the `:e file` / go-to core. Reuses

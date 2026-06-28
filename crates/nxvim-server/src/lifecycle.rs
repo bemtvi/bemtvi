@@ -62,14 +62,23 @@ impl EditHost {
             Ok(FsRead::Dir { path: dir, entries }) => {
                 // A reload can't resolve to a directory; drop a stale post marker.
                 self.reload_posts.remove(&buffer);
+                // A workspace edit never targets a directory; drop any stranded stash.
+                self.pending_replica_edits.remove(&buffer);
                 self.load_dir_listing(buffer, dir, entries);
             }
             Err(e) => {
                 // The off-tick re-fetch failed — surface it loudly; no reload happened,
-                // so no FileChangedShellPost (the buffer is untouched).
+                // so no FileChangedShellPost (the buffer is untouched). A workspace edit
+                // that was waiting on this file can't apply — drop its stash and report.
                 self.reload_posts.remove(&buffer);
-                self.editor
-                    .echo(format!("nxvim: could not open {path} over the daemon: {e}"))
+                if self.pending_replica_edits.remove(&buffer).is_some() {
+                    self.editor.echo(format!(
+                        "apply_workspace_edit: could not open {path} over the daemon: {e}"
+                    ));
+                } else {
+                    self.editor
+                        .echo(format!("nxvim: could not open {path} over the daemon: {e}"));
+                }
             }
         }
     }
@@ -104,6 +113,11 @@ impl EditHost {
         if existed {
             self.editor.mark_replica_read_from_disk(buffer, stat);
         }
+        // A project-wide rename / code action whose edits reached this (off-tick)
+        // file stashed them while the fetch was in flight; apply them now that the
+        // real contents have landed, before lifecycle events fire so a
+        // `BufReadPost`-driven LSP attach / diagnostics see the renamed text.
+        self.apply_pending_replica_edit(buffer);
         self.announced.remove(&buffer);
         self.fired_filetype.remove(&buffer);
         let ft = filetype_of(Some(Path::new(&path))).unwrap_or("");

@@ -1048,6 +1048,16 @@ pub struct EditHost {
     pending_chdirs: HashMap<u64, cwd::PendingChdir>,
     /// Monotonic token source for [`pending_chdirs`](Self::pending_chdirs).
     next_chdir_token: u64,
+    /// Workspace-edit edits awaiting an **off-tick** replica buffer's bytes, keyed by
+    /// the replica buffer's id. A project-wide rename / code action that touches a file
+    /// not open in a buffer must, in a daemon / web session, fetch that file across the
+    /// wire before its edits can apply; the edits (still in LSP form, plus the
+    /// originating server's encoding) wait here and [`apply_pending_replica_edit`] drains
+    /// the entry when the fetch lands (`load_replica_bytes` / `load_replica_wasm`). Empty
+    /// in a local session — there the file is read synchronously and edited inline.
+    ///
+    /// [`apply_pending_replica_edit`]: EditHost::apply_pending_replica_edit
+    pending_replica_edits: HashMap<BufferId, lsp::PendingReplicaEdit>,
     /// The working directory last pushed into the `nx._cwd` mirror — so
     /// [`EditHost::publish_cwd_mirror`] can report whether a publish actually *moved* the
     /// cwd. A daemon-session focus switch uses that to fire `DirChanged` only on a real
@@ -1187,6 +1197,7 @@ impl EditHost {
             terminal_frozen: HashMap::new(),
             dirs: cwd::DirState::new(std::env::current_dir().unwrap_or_default()),
             pending_chdirs: HashMap::new(),
+            pending_replica_edits: HashMap::new(),
             next_chdir_token: 0,
             published_cwd: None,
             #[cfg(not(feature = "native"))]
@@ -1653,12 +1664,25 @@ impl EditHost {
             // `BufReadPost`, not `BufNewFile` (see `load_replica_wasm`).
             0 => self.load_replica_wasm(buffer, path, bytes, true),
             1 => self.load_replica_wasm(buffer, path, b"", false),
-            2 => self.editor.echo(format!(
-                "nxvim: directory read of {path} reached the file applier (use complete_fs_read_dir)"
-            )),
-            _ => self
-                .editor
-                .echo(format!("nxvim: could not open {path}: {err}")),
+            2 => {
+                // A workspace edit never targets a directory; drop any stranded stash.
+                self.pending_replica_edits.remove(&buffer);
+                self.editor.echo(format!(
+                    "nxvim: directory read of {path} reached the file applier (use complete_fs_read_dir)"
+                ));
+            }
+            _ => {
+                // The OPFS read failed — a workspace edit waiting on this file can't
+                // apply; drop its stash and report (else a generic open error).
+                if self.pending_replica_edits.remove(&buffer).is_some() {
+                    self.editor.echo(format!(
+                        "apply_workspace_edit: could not open {path}: {err}"
+                    ));
+                } else {
+                    self.editor
+                        .echo(format!("nxvim: could not open {path}: {err}"));
+                }
+            }
         }
         self.redraw();
     }
@@ -1686,6 +1710,10 @@ impl EditHost {
             // pass `None` for a size-only baseline — enough to fire `BufReadPost`.
             self.editor.mark_replica_read_from_disk(buffer, None);
         }
+        // A project-wide rename / code action whose edits reached this (off-tick) file
+        // stashed them while the OPFS fetch was in flight; apply them now the real
+        // contents have landed, before lifecycle events fire (mirrors `load_replica_bytes`).
+        self.apply_pending_replica_edit(buffer);
         self.announced.remove(&buffer);
         self.fired_filetype.remove(&buffer);
         let ft = filetype_of(Some(Path::new(&path))).unwrap_or("");

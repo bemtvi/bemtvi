@@ -610,6 +610,48 @@ async fn jumplist_survives_a_restart() {
     }
 }
 
+/// A `--workspace` session keeps its jumplist in its *private* store and never
+/// inherits the shared **global** pool: a jump recorded by an unrelated *plain*
+/// session (which writes to the global store) must not bleed into a fresh
+/// workspace session and surface on its first `<C-o>`. This is the structural
+/// reason nxvim avoids neovim's "random file from another session opens on `<C-o>`"
+/// annoyance — the global store backs the jumplist only for plain launches, while a
+/// workspace session loads its jumplist from `state/shada/ns/<project>/` alone (the
+/// global store is consulted only for `:`/`/` history). Guards that isolation.
+#[tokio::test]
+async fn workspace_jumplist_does_not_inherit_the_global_pool() {
+    let gdir = temp_dir("shada_wsj_global");
+    let wdir = temp_dir("shada_wsj_ws");
+    let foreign = write_temp("shada_wsj_foreign", "txt", "f1\nf2\nf3\nf4\nf5\n");
+    let project = write_temp("shada_wsj_project", "txt", "p1\np2\np3\np4\np5\n");
+
+    // A plain session records a jump (foreign:1) into the shared GLOBAL store.
+    {
+        let (rpc, incoming) =
+            start_attached(init_with_store(&gdir, Some(foreign.clone())), 80, 25).await;
+        feed(&rpc, "G"); // jump from foreign:1
+        feed(&rpc, ":qa!<CR>");
+        await_server_exit(incoming).await;
+    }
+
+    // A FRESH workspace session (own primary store `wdir`, same global store): with
+    // no in-session jump yet, the first `<C-o>` must find nothing — the foreign jump
+    // from the global pool must not have leaked into this workspace's jumplist, so
+    // the cursor stays in the project file and the foreign file is never reopened.
+    {
+        let (rpc, _incoming) =
+            start_attached(init_workspace(&wdir, &gdir, Some(project.clone())), 80, 25).await;
+        assert_eq!(cursor(&rpc).await, (1, 0));
+        feed(&rpc, "<C-o>");
+        let here = exec_lua(&rpc, "return vim.fn.expand('%:p')").await;
+        assert_eq!(
+            here.as_str(),
+            Some(project.as_str()),
+            "a fresh workspace session must not inherit the global jumplist pool"
+        );
+    }
+}
+
 #[tokio::test]
 async fn changelist_survives_a_restart() {
     let dir = temp_dir("shada_changelist");

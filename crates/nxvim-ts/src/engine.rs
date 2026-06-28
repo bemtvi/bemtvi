@@ -721,11 +721,12 @@ impl Engine {
         // (the children parse through `included_ranges`), so the painter reads every
         // layer's predicate text from the one shadow. A child whose grammar isn't
         // loaded contributes nothing (the host paint stands).
-        let mut layers = vec![Layer {
+        let mut layers = Vec::with_capacity(1 + state.injections.len());
+        layers.push(Layer {
             query: &host.query,
             tree,
             ranges: &[], // the host covers the whole buffer — no clipping
-        }];
+        });
         for inj in &state.injections {
             if let Some(Slot::Loaded(child)) = self.grammars.get(&inj.language) {
                 layers.push(Layer {
@@ -1352,12 +1353,17 @@ fn extract_spans(
     }
 
     let mut out = Vec::new();
+    // The per-cell paint buffer, reused across visible lines — cleared + resized
+    // per line rather than freshly allocated each one (it was the hottest per-line
+    // allocation in this pass).
+    let mut groups: Vec<Option<&str>> = Vec::new();
     for line in first_line..last_line {
         let (line_start, content_len) = line_geom[line - first_line];
         if content_len == 0 {
             continue;
         }
-        let mut groups: Vec<Option<&str>> = vec![None; content_len];
+        groups.clear();
+        groups.resize(content_len, None);
         for &(s, e, name) in &buckets[line - first_line] {
             let cs = s.saturating_sub(line_start).min(content_len);
             let ce = (e - line_start).min(content_len);

@@ -36,7 +36,9 @@ use nxvim_core::{
     BufferEdit, BufferId, Clipboard, DirEntry, Editor, FoldRange, IndentParams, NumberedMark,
     OpenOutcome, PendingSave, PersistState, Span, SyntaxEngine,
 };
-use nxvim_lsp::{LspEvent, LspNotify, LspRequest, ReqToken, ServerKey, ServerSpawn, SyncLspClient, WireOp};
+use nxvim_lsp::{
+    LspEvent, LspNotify, LspRequest, ReqToken, ServerKey, ServerSpawn, SyncLspClient, WireOp,
+};
 use nxvim_lua::LuaRuntime;
 use nxvim_server::{decode_config_bundle_bytes, EditHost, HostEffects};
 use rmpv::Value;
@@ -65,16 +67,10 @@ extern "C" {
     /// as flat `[start, end, …]` 0-based inclusive pairs. Returns the total number of i32s
     /// needed (may exceed `cap` — the caller grows + retries); `-1` if no tree-sitter folds
     /// are available (no runner / grammar loading / no `folds.scm`).
-    fn eh_js_ts_folds(
-        lang: *const c_char,
-        text: *const c_char,
-        out: *mut i32,
-        cap: i32,
-    ) -> i32;
+    fn eh_js_ts_folds(lang: *const c_char, text: *const c_char, out: *mut i32, cap: i32) -> i32;
     /// `1` if a grammar with a `folds.scm` is loaded for `lang`, else `0`.
     fn eh_js_ts_folds_available(lang: *const c_char) -> i32;
 }
-
 
 /// The outbound effects the wasm edit-host captures for the UI to drain. The
 /// [`WasmEffects`] writes here; the FFI layer reads it back out (the redraw via
@@ -428,7 +424,12 @@ impl SyntaxEngine for WasmSyntax {
         let mut buf = vec![0i32; 1024];
         loop {
             let needed = unsafe {
-                eh_js_ts_folds(lang.as_ptr(), text.as_ptr(), buf.as_mut_ptr(), buf.len() as i32)
+                eh_js_ts_folds(
+                    lang.as_ptr(),
+                    text.as_ptr(),
+                    buf.as_mut_ptr(),
+                    buf.len() as i32,
+                )
             };
             if needed < 0 {
                 return Vec::new(); // no tree-sitter folds available
@@ -621,7 +622,10 @@ impl HostEffects for WasmEffects {
         // A duplex `nx.process` child against the daemon (the DAP transport): record the
         // open for the Worker to forward (`dproc_open`); its raw stdout/stderr return via
         // `eh_dproc_out`, the exit via `eh_dproc_exit`.
-        self.sink.borrow_mut().dproc_opens.push((id, argv, cwd, env));
+        self.sink
+            .borrow_mut()
+            .dproc_opens
+            .push((id, argv, cwd, env));
     }
 
     fn dproc_write(&mut self, id: u64, bytes: Vec<u8>) {
@@ -809,7 +813,16 @@ unsafe fn as_str<'a>(p: *const c_char) -> &'a str {
 /// Move a `String` out to JS as an owned `char*`; the caller frees it via
 /// [`eh_free_string`] (the harness's `readStr` does this).
 fn into_owned_cstr(s: String) -> *mut c_char {
-    CString::new(s.replace('\0', "")).unwrap().into_raw()
+    // Strip interior NULs (a C string can't carry them), but only pay the copying
+    // `replace` when one is actually present — the redraw JSON crosses here every
+    // keystroke and almost never holds a NUL, so the common path reuses `s`'s buffer
+    // (`CString::new(String)` appends the terminator in place rather than re-copying).
+    let s = if s.as_bytes().contains(&0) {
+        s.replace('\0', "")
+    } else {
+        s
+    };
+    CString::new(s).unwrap().into_raw()
 }
 
 /// Convert a msgpack [`Value`] (an rmpv redraw frame) into a [`serde_json::Value`] for
@@ -1087,6 +1100,11 @@ pub unsafe extern "C" fn eh_take_fs_requests(h: *mut WasmEditHost) -> *mut c_cha
         return into_owned_cstr(r#"{"reads":[],"writes":[]}"#.into());
     };
     let mut sink = handle.sink.borrow_mut();
+    // Idle fast path (the common per-tick case): nothing enqueued → skip building the
+    // serde_json maps + the `to_string`, return the empty shape directly.
+    if sink.fs_reads.is_empty() && sink.fs_write_queue.is_empty() {
+        return into_owned_cstr(r#"{"reads":[],"writes":[]}"#.into());
+    }
     let reads: Vec<serde_json::Value> = sink
         .fs_reads
         .drain(..)
@@ -1123,6 +1141,9 @@ pub unsafe extern "C" fn eh_take_watch_requests(h: *mut WasmEditHost) -> *mut c_
         return into_owned_cstr(r#"{"arm":[],"disarm":[]}"#.into());
     };
     let mut sink = handle.sink.borrow_mut();
+    if sink.watch_arms.is_empty() && sink.watch_disarms.is_empty() {
+        return into_owned_cstr(r#"{"arm":[],"disarm":[]}"#.into());
+    }
     let arm: Vec<String> = std::mem::take(&mut sink.watch_arms);
     let disarm: Vec<String> = std::mem::take(&mut sink.watch_disarms);
     into_owned_cstr(serde_json::json!({ "arm": arm, "disarm": disarm }).to_string())
@@ -1141,6 +1162,12 @@ pub unsafe extern "C" fn eh_take_ts_requests(h: *mut WasmEditHost) -> *mut c_cha
     let Some(handle) = h.as_mut() else {
         return into_owned_cstr("[]".into());
     };
+    {
+        let sink = handle.sink.borrow();
+        if sink.ts_requests.is_empty() {
+            return into_owned_cstr("[]".into());
+        }
+    }
     let reqs: Vec<String> = std::mem::take(&mut handle.sink.borrow_mut().ts_requests);
     into_owned_cstr(serde_json::to_string(&reqs).unwrap_or_else(|_| "[]".into()))
 }
@@ -1159,6 +1186,12 @@ pub unsafe extern "C" fn eh_take_clipboard_writes(h: *mut WasmEditHost) -> *mut 
     let Some(handle) = h.as_mut() else {
         return into_owned_cstr("[]".into());
     };
+    {
+        let sink = handle.sink.borrow();
+        if sink.clipboard_writes.is_empty() {
+            return into_owned_cstr("[]".into());
+        }
+    }
     let writes: Vec<String> = std::mem::take(&mut handle.sink.borrow_mut().clipboard_writes);
     into_owned_cstr(serde_json::to_string(&writes).unwrap_or_else(|_| "[]".into()))
 }
@@ -1419,6 +1452,9 @@ pub unsafe extern "C" fn eh_take_proc_requests(h: *mut WasmEditHost) -> *mut c_c
         return into_owned_cstr(r#"{"spawn":[],"kill":[]}"#.into());
     };
     let mut sink = handle.sink.borrow_mut();
+    if sink.proc_spawns.is_empty() && sink.proc_kills.is_empty() {
+        return into_owned_cstr(r#"{"spawn":[],"kill":[]}"#.into());
+    }
     let spawn: Vec<serde_json::Value> = std::mem::take(&mut sink.proc_spawns)
         .into_iter()
         .map(|(id, argv, cwd, env, stdin, stream)| {
@@ -1522,6 +1558,9 @@ pub unsafe extern "C" fn eh_take_dproc_requests(h: *mut WasmEditHost) -> *mut c_
         return into_owned_cstr(r#"{"open":[],"write":[],"kill":[]}"#.into());
     };
     let mut sink = handle.sink.borrow_mut();
+    if sink.dproc_opens.is_empty() && sink.dproc_writes.is_empty() && sink.dproc_kills.is_empty() {
+        return into_owned_cstr(r#"{"open":[],"write":[],"kill":[]}"#.into());
+    }
     let open: Vec<serde_json::Value> = std::mem::take(&mut sink.dproc_opens)
         .into_iter()
         .map(|(id, argv, cwd, env)| {
@@ -1561,7 +1600,9 @@ pub unsafe extern "C" fn eh_dproc_out(
     } else {
         std::slice::from_raw_parts(data, len).to_vec()
     };
-    handle.host.dproc_out(id.max(0.0) as u64, bytes, stderr != 0);
+    handle
+        .host
+        .dproc_out(id.max(0.0) as u64, bytes, stderr != 0);
 }
 
 /// Land a daemon `dproc_exit` push: the duplex child exited (`code == -1` on a kill / spawn
@@ -1589,6 +1630,9 @@ pub unsafe extern "C" fn eh_take_sock_requests(h: *mut WasmEditHost) -> *mut c_c
         return into_owned_cstr(r#"{"connect":[],"write":[],"close":[]}"#.into());
     };
     let mut sink = handle.sink.borrow_mut();
+    if sink.sock_connects.is_empty() && sink.sock_writes.is_empty() && sink.sock_closes.is_empty() {
+        return into_owned_cstr(r#"{"connect":[],"write":[],"close":[]}"#.into());
+    }
     let connect: Vec<serde_json::Value> = std::mem::take(&mut sink.sock_connects)
         .into_iter()
         .map(|(id, host, port)| serde_json::json!({ "id": id, "host": host, "port": port }))
@@ -1754,6 +1798,12 @@ pub unsafe extern "C" fn eh_take_fs_op_requests(h: *mut WasmEditHost) -> *mut c_
     let Some(handle) = h.as_mut() else {
         return into_owned_cstr("[]".into());
     };
+    {
+        let sink = handle.sink.borrow();
+        if sink.fs_ops.is_empty() {
+            return into_owned_cstr("[]".into());
+        }
+    }
     let ops: Vec<serde_json::Value> = std::mem::take(&mut handle.sink.borrow_mut().fs_ops)
         .iter()
         .map(|(id, job)| fs_job_to_json(*id, job))
@@ -1803,6 +1853,9 @@ pub unsafe extern "C" fn eh_take_fs_watch_requests(h: *mut WasmEditHost) -> *mut
         return into_owned_cstr(r#"{"arm":[],"disarm":[]}"#.into());
     };
     let mut sink = handle.sink.borrow_mut();
+    if sink.fs_watch_arms.is_empty() && sink.fs_watch_disarms.is_empty() {
+        return into_owned_cstr(r#"{"arm":[],"disarm":[]}"#.into());
+    }
     let arm: Vec<serde_json::Value> = std::mem::take(&mut sink.fs_watch_arms)
         .into_iter()
         .map(|(id, path, recursive)| serde_json::json!({ "id": id, "path": path, "recursive": recursive }))
@@ -1863,6 +1916,16 @@ pub unsafe extern "C" fn eh_take_terminal_requests(h: *mut WasmEditHost) -> *mut
         );
     };
     let mut sink = handle.sink.borrow_mut();
+    if sink.term_opens.is_empty()
+        && sink.term_writes.is_empty()
+        && sink.term_resizes.is_empty()
+        && sink.term_kills.is_empty()
+        && sink.term_interrupts.is_empty()
+    {
+        return into_owned_cstr(
+            r#"{"open":[],"write":[],"resize":[],"kill":[],"interrupt":[]}"#.into(),
+        );
+    }
     let open: Vec<serde_json::Value> = std::mem::take(&mut sink.term_opens)
         .into_iter()
         .map(|(buf, argv, cwd, rows, cols)| {
@@ -1967,6 +2030,9 @@ pub unsafe extern "C" fn eh_take_lsp_requests(h: *mut WasmEditHost) -> *mut c_ch
     let Some(handle) = h.as_mut() else {
         return into_owned_cstr(r#"{"spawn":[],"stdin":[],"kill":[]}"#.into());
     };
+    if handle.sink.borrow().lsp_ops.is_empty() {
+        return into_owned_cstr(r#"{"spawn":[],"stdin":[],"kill":[]}"#.into());
+    }
     let ops = std::mem::take(&mut handle.sink.borrow_mut().lsp_ops);
     let mut spawn = Vec::new();
     let mut stdin = Vec::new();

@@ -110,11 +110,14 @@ impl EditHost {
 
         // The global `'statusline'` / `'tabline'` formats (empty ⇒ the built-in
         // look), read once and shared across the window status + tabline projection.
-        let statusline_fmt = self.editor.global_options().statusline;
-        let tabline_fmt = self.editor.global_options().tabline;
+        // `global_options()` returns an owned `Options` (a multi-`String` clone), so
+        // snapshot it once and move the three fields out rather than cloning it thrice.
+        let global_opts = self.editor.global_options();
+        let statusline_fmt = global_opts.statusline;
+        let tabline_fmt = global_opts.tabline;
         // The `'guifont'` value, relayed verbatim for a GUI client to parse and
         // apply; empty (the default) leaves the client on its own font.
-        let guifont = self.editor.global_options().guifont;
+        let guifont = global_opts.guifont;
         // The `'timeout'` / `'timeoutlen'` mapping-timeout config, relayed so each
         // client runs its own idle-flush timer to match: skip arming when `timeout`
         // is off (`notimeout` → a withheld mapped prefix waits forever, which is how
@@ -1598,8 +1601,11 @@ impl RowSeg {
     }
 }
 
-struct RowArrays {
-    lines: Vec<String>,
+struct RowArrays<'a> {
+    /// The per-row display text, borrowed from the source [`RenderRow`]s (the rows
+    /// outlive this projection): the only consumers — [`display_lines_value`] and
+    /// `special_key_spans` — read it as `&str`, so there's nothing to own.
+    lines: Vec<&'a str>,
     numbers: Vec<Option<usize>>,
     /// Per-row wrap segments for the overlay projections (see [`RowSeg`]).
     segments: Vec<RowSeg>,
@@ -1621,9 +1627,9 @@ struct RowArrays {
 /// Unbundle a [`RenderRow`] slice into the parallel per-row arrays the wire
 /// carries (one entry per screen row, in order). The native highlight / inlay /
 /// diagnostic projections then key on `numbers` exactly as before.
-fn unbundle_rows(rows: &[RenderRow]) -> RowArrays {
+fn unbundle_rows(rows: &[RenderRow]) -> RowArrays<'_> {
     RowArrays {
-        lines: rows.iter().map(|r| r.text.clone()).collect(),
+        lines: rows.iter().map(|r| r.text.as_str()).collect(),
         numbers: rows.iter().map(|r| r.number()).collect(),
         segments: rows
             .iter()
@@ -1660,11 +1666,11 @@ pub(crate) fn lines_value(lines: &[String]) -> Value {
 /// original bytes) and its widths match the server's column math (`grapheme_width`),
 /// so the cursor and highlight spans still line up. Used for the window rows and
 /// the scroll band; content reads stay on [`lines_value`].
-pub(crate) fn display_lines_value(lines: &[String]) -> Value {
+pub(crate) fn display_lines_value<S: AsRef<str>>(lines: &[S]) -> Value {
     Value::Array(
         lines
             .iter()
-            .map(|l| Value::from(unicode::display_line(l).as_ref()))
+            .map(|l| Value::from(unicode::display_line(l.as_ref()).as_ref()))
             .collect(),
     )
 }
@@ -1679,11 +1685,12 @@ pub(crate) fn display_lines_value(lines: &[String]) -> Value {
 /// non-native build for that reason — over a daemon the web takes the
 /// server-styled path and gets `SpecialKey` from the highlight spans instead.
 #[cfg(not(feature = "native"))]
-fn special_key_spans(lines: &[String], tabstop: usize) -> Value {
+fn special_key_spans<S: AsRef<str>>(lines: &[S], tabstop: usize) -> Value {
     Value::Array(
         lines
             .iter()
             .map(|l| {
+                let l = l.as_ref();
                 let positions = unicode::unprintable_positions(l);
                 if positions.is_empty() {
                     return Value::Array(Vec::new());

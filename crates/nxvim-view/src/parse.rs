@@ -149,9 +149,11 @@ pub(crate) fn map_str_array(map: &[(Value, Value)], key: &str) -> Vec<String> {
     map_get(map, key)
         .and_then(Value::as_array)
         .map(|a| {
-            a.iter()
-                .filter_map(|v| v.as_str().map(String::from))
-                .collect()
+            // Pre-size to the row count: `filter_map`'s 0 lower-bound size hint
+            // otherwise reallocates as the (rarely-filtered) `lines` array grows.
+            let mut out = Vec::with_capacity(a.len());
+            out.extend(a.iter().filter_map(|v| v.as_str().map(String::from)));
+            out
         })
         .unwrap_or_default()
 }

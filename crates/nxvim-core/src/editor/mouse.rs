@@ -2200,8 +2200,12 @@ impl Editor {
         if tw == 0 {
             return;
         }
-        let opts = self.windows.cur().options.clone();
-        let so = opts.sidescrolloff.min(tw.saturating_sub(1) / 2);
+        let so = self
+            .windows
+            .cur()
+            .options
+            .sidescrolloff
+            .min(tw.saturating_sub(1) / 2);
         let lo = self.leftcol.saturating_add(so);
         let hi = self
             .leftcol

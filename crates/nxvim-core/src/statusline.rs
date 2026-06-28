@@ -504,8 +504,8 @@ fn expand_into(
 ) {
     for item in items {
         match item {
-            Item::Literal(text) => push_text(out, text.clone(), group.clone()),
-            Item::Field(f) => push_text(out, expand_field(*f, ctx), group.clone()),
+            Item::Literal(text) => push_text(out, text, group),
+            Item::Field(f) => push_text(out, &expand_field(*f, ctx), group),
             Item::HlSwitch(g) => *group = g.clone(),
             Item::Align => out.push(Piece::Align),
             Item::Truncate => out.push(Piece::Truncate),
@@ -516,7 +516,7 @@ fn expand_into(
             Item::Expr { kind, raw } => {
                 let result = eval(*kind, raw);
                 match kind {
-                    ExprKind::Eval => push_text(out, result, group.clone()),
+                    ExprKind::Eval => push_text(out, &result, group),
                     ExprKind::EvalItems | ExprKind::Whole => {
                         // The result is itself a format string: re-parse and
                         // expand it inline. A parse error in the (Lua-produced)
@@ -524,7 +524,7 @@ fn expand_into(
                         // dropped, so the failure is visible on the status line.
                         match parse(&result) {
                             Ok(sub) => expand_into(&sub, ctx, eval, group, out),
-                            Err(e) => push_text(out, e, group.clone()),
+                            Err(e) => push_text(out, &e, group),
                         }
                     }
                 }
@@ -536,7 +536,7 @@ fn expand_into(
 /// Append `text` to `out`, coalescing with the previous piece when it is text in
 /// the same highlight group (keeps the piece list tidy and matches how a client
 /// would paint contiguous same-group runs). Empty text is dropped.
-fn push_text(out: &mut Vec<Piece>, text: String, group: Option<String>) {
+fn push_text(out: &mut Vec<Piece>, text: &str, group: &Option<String>) {
     if text.is_empty() {
         return;
     }
@@ -545,12 +545,15 @@ fn push_text(out: &mut Vec<Piece>, text: String, group: Option<String>) {
         group: pg,
     }) = out.last_mut()
     {
-        if *pg == group {
-            prev.push_str(&text);
+        if *pg == *group {
+            prev.push_str(text);
             return;
         }
     }
-    out.push(Piece::Text { text, group });
+    out.push(Piece::Text {
+        text: text.to_string(),
+        group: group.clone(),
+    });
 }
 
 /// Expand a single built-in [`Field`] to its text, per neovim's item semantics.
@@ -1165,7 +1168,7 @@ fn push_side(
     // takes the base `StatusLine` look. Empty ⇒ skip it entirely (no white gaps).
     let connector = |pieces: &mut Vec<Piece>| {
         if !separator.is_empty() {
-            push_text(pieces, separator.to_string(), None);
+            push_text(pieces, separator, &None);
         }
     };
     let mut wrote = false;
@@ -1191,10 +1194,10 @@ fn push_side(
                     pieces.push(Piece::ClickStart {
                         action: ClickAction::Handler { handler, minwid: 0 },
                     });
-                    push_text(pieces, cell.text, cell.group);
+                    push_text(pieces, &cell.text, &cell.group);
                     pieces.push(Piece::ClickEnd);
                 }
-                None => push_text(pieces, cell.text, cell.group),
+                None => push_text(pieces, &cell.text, &cell.group),
             }
         }
         wrote = true;

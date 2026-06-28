@@ -369,16 +369,17 @@ impl SyncLspClient {
     }
 
     fn handle_message(&mut self, key: &ServerKey, msg: Value) {
-        let method = msg
-            .get("method")
-            .and_then(Value::as_str)
-            .map(str::to_string);
-        let id = msg.get("id").cloned();
+        // Borrow `method`/`id` out of the owned `msg` rather than cloning them up
+        // front — only the server-request branch needs an owned `id`.
+        let method = msg.get("method").and_then(Value::as_str);
+        let id = msg.get("id");
         match (method, id) {
             // server → client request (method + id): answer it.
-            (Some(method), Some(req_id)) => self.on_server_request(key, req_id, &method, &msg),
+            (Some(method), Some(req_id)) => {
+                self.on_server_request(key, req_id.clone(), method, &msg)
+            }
             // server → client notification (method, no id).
-            (Some(method), None) => self.on_server_notification(key, &method, &msg),
+            (Some(method), None) => self.on_server_notification(key, method, &msg),
             // response to one of our requests (id, no method).
             (None, Some(req_id)) => {
                 if let Some(rid) = req_id.as_i64() {
@@ -869,8 +870,13 @@ fn pos_params(uri: &Url, position: &lsp_types::Position) -> Value {
 
 /// Frame one JSON-RPC message with its `Content-Length` header for the wire.
 fn frame(body: &Value) -> Vec<u8> {
+    use std::io::Write;
     let json = serde_json::to_vec(body).unwrap_or_default();
-    let mut out = format!("Content-Length: {}\r\n\r\n", json.len()).into_bytes();
+    // Pre-size for the body plus a generous header allowance (the fixed
+    // `Content-Length: \r\n\r\n` text plus the length's decimal digits), so the
+    // header writes and the body append never reallocate.
+    let mut out = Vec::with_capacity(json.len() + 32);
+    let _ = write!(out, "Content-Length: {}\r\n\r\n", json.len());
     out.extend_from_slice(&json);
     out
 }
@@ -928,14 +934,16 @@ fn parse_frames(inbuf: &mut Vec<u8>) -> Vec<Value> {
             inbuf.drain(..body_start);
             continue;
         }
-        if inbuf.len() < body_start + len {
+        let body_end = body_start + len;
+        if inbuf.len() < body_end {
             break; // body not fully arrived yet (bounded by MAX_FRAME_LEN)
         }
-        let body: Vec<u8> = inbuf[body_start..body_start + len].to_vec();
-        inbuf.drain(..body_start + len);
-        if let Ok(v) = serde_json::from_slice::<Value>(&body) {
+        // Parse straight from the buffer slice (no intermediate copy), then drain
+        // the consumed frame once the borrow ends.
+        if let Ok(v) = serde_json::from_slice::<Value>(&inbuf[body_start..body_end]) {
             out.push(v);
         }
+        inbuf.drain(..body_end);
     }
     out
 }

@@ -487,7 +487,7 @@ fn dispatch(
     match arr.first().and_then(Value::as_u64) {
         Some(0) => {
             let id = arr.get(1).and_then(Value::as_u64).unwrap_or(0);
-            let method = arr.get(2).and_then(Value::as_str).unwrap_or("").to_string();
+            let method = take_str(&mut arr, 2);
             let params = take_params(&mut arr, 3);
             in_tx
                 .send(Incoming::Request { id, method, params })
@@ -502,7 +502,7 @@ fn dispatch(
             }
         }
         Some(2) => {
-            let method = arr.get(1).and_then(Value::as_str).unwrap_or("").to_string();
+            let method = take_str(&mut arr, 1);
             let params = take_params(&mut arr, 2);
             in_tx
                 .send(Incoming::Notification { method, params })
@@ -527,6 +527,17 @@ fn take_params(arr: &mut [Value], idx: usize) -> Vec<Value> {
     match take(arr, idx) {
         Value::Array(p) => p,
         _ => Vec::new(),
+    }
+}
+
+/// Move the method-name string out of `arr[idx]` (empty when absent or not a
+/// string). Takes ownership of the decoder's already-allocated `String` rather
+/// than re-allocating a copy via `as_str().to_string()` — this runs on every
+/// inbound frame, where the method name is the only string field.
+fn take_str(arr: &mut [Value], idx: usize) -> String {
+    match take(arr, idx) {
+        Value::String(s) => s.into_str().unwrap_or_default(),
+        _ => String::new(),
     }
 }
 

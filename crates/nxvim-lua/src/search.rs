@@ -319,7 +319,7 @@ pub fn buf_search(lua: &Lua, lines: Table, pattern: String, opts: Table) -> mlua
 /// Build the result table: `{ line, col, end_line, end_col, text, captures }`
 /// (1-based line, 0-based byte cols; `end_col` exclusive).
 fn make_match(lua: &Lua, line_no: usize, line: &str, hit: &LineHit) -> mlua::Result<Value> {
-    let t = lua.create_table()?;
+    let t = lua.create_table_with_capacity(0, 6)?;
     t.set("line", line_no)?;
     t.set("col", hit.start)?;
     t.set("end_line", line_no)?;
@@ -327,7 +327,9 @@ fn make_match(lua: &Lua, line_no: usize, line: &str, hit: &LineHit) -> mlua::Res
     t.set("text", &line[hit.start..hit.end])?;
     t.set(
         "captures",
-        lua.create_sequence_from(hit.captures.iter().cloned())?,
+        // Borrow each capture as `&str` — mlua copies the bytes into the Lua string
+        // either way, so cloning into an intermediate `String` first is wasted work.
+        lua.create_sequence_from(hit.captures.iter().map(String::as_str))?,
     )?;
     Ok(Value::Table(t))
 }

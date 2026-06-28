@@ -1587,7 +1587,7 @@ impl LuaRuntime {
         if list.get::<Option<bool>>("__picker")? == Some(true) {
             return Ok(CmdlineComplete::PickerLaunched);
         }
-        let mut out = Vec::new();
+        let mut out = Vec::with_capacity(list.raw_len());
         for item in list.sequence_values::<Table>() {
             let item = item?;
             let label: String = item.get("label")?;
@@ -2227,7 +2227,7 @@ impl LuaRuntime {
     fn read_keymaps(&self) -> mlua::Result<Vec<RawKeymap>> {
         let nx = self.nx()?;
         let list: Table = nx.get("_keymaps")?;
-        let mut out = Vec::new();
+        let mut out = Vec::with_capacity(list.raw_len());
         for entry in list.sequence_values::<Table>() {
             let entry = entry?;
             let modes = entry

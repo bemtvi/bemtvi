@@ -32,7 +32,7 @@
 //!   than vim's full charsize machinery ('vartabstop', `<xx>` display of
 //!   unprintable bytes, 'list' mode etc. are not modeled).
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::ffi::{c_char, c_int, c_void, CStr, CString};
 use std::fmt;
@@ -330,10 +330,19 @@ impl VimRegex {
         col: usize,
         ignore_case: bool,
     ) -> Result<Option<LineMatch>, VimRegexError> {
-        let cline =
-            CString::new(line).map_err(|_| VimRegexError("line contains a NUL byte".into()))?;
-        // The engine starts scanning at `line + col` with no bounds check of its
-        // own; a `col` past the end of the line would read past the NUL
+        // The engine needs a NUL-terminated subject. `exec_line` is the
+        // hottest path — search/substitute call it once per line (and repeatedly
+        // within a line as the substitute loop advances over each match) — so a
+        // fresh `CString` per call would be one malloc/free per call over a
+        // whole buffer. Reuse a thread-local scratch buffer instead: all
+        // matching is serialized behind the engine lock (held here) and
+        // `vim_regexec` never re-enters this path, so the buffer stays untouched
+        // for the lifetime of the subject pointer we hand the engine.
+        if line.as_bytes().contains(&0) {
+            return Err(VimRegexError("line contains a NUL byte".into()));
+        }
+        // The engine starts scanning at `subject + col` with no bounds check of
+        // its own; a `col` past the end of the line would read past the NUL
         // terminator (OOB). `col == line.len()` is valid (it points at the NUL).
         if col > line.len() {
             return Err(VimRegexError(format!(
@@ -352,51 +361,63 @@ impl VimRegex {
                 "vim regex program is invalid (engine fallback recompile previously failed)".into(),
             ));
         }
-        let mut rm = RegmatchT {
-            regprog: self.prog.get(),
-            startp: [std::ptr::null_mut(); NSUBEXP],
-            endp: [std::ptr::null_mut(); NSUBEXP],
-            rm_matchcol: 0,
-            rm_ic: ignore_case,
-        };
-        let matched = unsafe { vim_regexec(&mut rm, cline.as_ptr(), col) };
-        // The engine may have freed our program and recompiled it (NFA→BT
-        // fallback); adopt the pointer it wrote back so we don't keep a
-        // dangling one. It can also be left NULL if recompilation failed.
-        self.prog.set(rm.regprog);
-        if !matched {
-            if let Some(err) = unsafe { nxre_take_last_error().as_ref() } {
-                let msg = unsafe { CStr::from_ptr(err) }
-                    .to_string_lossy()
-                    .into_owned();
-                return Err(VimRegexError(msg));
-            }
-            return Ok(None);
+
+        thread_local! {
+            static SUBJECT: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
         }
-        let base = cline.as_ptr();
-        let off = |p: *mut c_char| -> Option<usize> {
-            if p.is_null() {
-                None
-            } else {
-                Some(unsafe { p.offset_from(base) } as usize)
+        SUBJECT.with(|cell| {
+            let mut subject = cell.borrow_mut();
+            subject.clear();
+            subject.reserve(line.len() + 1);
+            subject.extend_from_slice(line.as_bytes());
+            subject.push(0);
+            let base = subject.as_ptr() as *const c_char;
+
+            let mut rm = RegmatchT {
+                regprog: self.prog.get(),
+                startp: [std::ptr::null_mut(); NSUBEXP],
+                endp: [std::ptr::null_mut(); NSUBEXP],
+                rm_matchcol: 0,
+                rm_ic: ignore_case,
+            };
+            let matched = unsafe { vim_regexec(&mut rm, base, col) };
+            // The engine may have freed our program and recompiled it (NFA→BT
+            // fallback); adopt the pointer it wrote back so we don't keep a
+            // dangling one. It can also be left NULL if recompilation failed.
+            self.prog.set(rm.regprog);
+            if !matched {
+                if let Some(err) = unsafe { nxre_take_last_error().as_ref() } {
+                    let msg = unsafe { CStr::from_ptr(err) }
+                        .to_string_lossy()
+                        .into_owned();
+                    return Err(VimRegexError(msg));
+                }
+                return Ok(None);
             }
-        };
-        let mut submatches = [None; NSUBEXP];
-        for (sub, (sp, ep)) in submatches
-            .iter_mut()
-            .zip(rm.startp.iter().zip(rm.endp.iter()))
-        {
-            if let (Some(s), Some(e)) = (off(*sp), off(*ep)) {
-                *sub = Some((s, e));
+            let off = |p: *mut c_char| -> Option<usize> {
+                if p.is_null() {
+                    None
+                } else {
+                    Some(unsafe { p.offset_from(base) } as usize)
+                }
+            };
+            let mut submatches = [None; NSUBEXP];
+            for (sub, (sp, ep)) in submatches
+                .iter_mut()
+                .zip(rm.startp.iter().zip(rm.endp.iter()))
+            {
+                if let (Some(s), Some(e)) = (off(*sp), off(*ep)) {
+                    *sub = Some((s, e));
+                }
             }
-        }
-        let (start, end) = submatches[0]
-            .ok_or_else(|| VimRegexError("engine reported a match without bounds".into()))?;
-        Ok(Some(LineMatch {
-            start,
-            end,
-            submatches,
-        }))
+            let (start, end) = submatches[0]
+                .ok_or_else(|| VimRegexError("engine reported a match without bounds".into()))?;
+            Ok(Some(LineMatch {
+                start,
+                end,
+                submatches,
+            }))
+        })
     }
 }
 

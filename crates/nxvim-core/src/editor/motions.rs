@@ -310,7 +310,7 @@ impl Editor {
             return MotionResult::linewise(self.buffer().line_start(l), MoveAxis::VerticalKeep);
         }
         let tab = self.tabstop();
-        let opts = self.windows.cur().options.clone();
+        let opts = &self.windows.cur().options;
         let wp = opts.wrap_prefix();
         let buf = self.buffer();
         // Segment a line with the window's `'breakindent'`/`'showbreak'` continuation
@@ -388,7 +388,7 @@ impl Editor {
             (0, text.len())
         } else {
             let tab = self.tabstop();
-            let opts = self.windows.cur().options.clone();
+            let opts = &self.windows.cur().options;
             let indent = unicode::cont_indent(&text, tab, width, opts.wrap_prefix());
             let segs = unicode::wrap_segments_indented(&text, tab, width, indent);
             let seg = segs

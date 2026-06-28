@@ -44,13 +44,13 @@ pub(crate) fn folding_ranges(ranges: Vec<FoldingRange>) -> Vec<FoldRangeData> {
 pub(crate) fn code_actions(resp: CodeActionResponse) -> Vec<CodeActionData> {
     resp.into_iter()
         .map(|item| match item {
-            CodeActionOrCommand::CodeAction(ca) => {
+            CodeActionOrCommand::CodeAction(mut ca) => {
                 let title = ca.title.clone();
-                let command = ca.command.clone();
-                let edit = ca
-                    .edit
-                    .as_ref()
-                    .map(|e| normalize_workspace_edit(e.clone()));
+                // Move the edit/command out rather than cloning (a `WorkspaceEdit`
+                // is a deep tree); the `resolve` branch below only fires when both
+                // are `None`, so the boxed original is unchanged by taking them.
+                let command = ca.command.take();
+                let edit = ca.edit.take().map(normalize_workspace_edit);
                 // With neither an eager edit nor a command, keep the original
                 // action to resolve lazily; a command makes it directly applicable.
                 let resolve = (edit.is_none() && command.is_none()).then(|| Box::new(ca));
@@ -544,10 +544,13 @@ pub(crate) fn inlay_label_core(hint: &InlayHint) -> String {
 pub(crate) fn pad_label(core: &str, hint: &InlayHint) -> String {
     let pad_l = hint.padding_left.unwrap_or(false);
     let pad_r = hint.padding_right.unwrap_or(false);
-    format!(
-        "{}{}{}",
-        if pad_l { " " } else { "" },
-        core,
-        if pad_r { " " } else { "" },
-    )
+    let mut out = String::with_capacity(core.len() + pad_l as usize + pad_r as usize);
+    if pad_l {
+        out.push(' ');
+    }
+    out.push_str(core);
+    if pad_r {
+        out.push(' ');
+    }
+    out
 }

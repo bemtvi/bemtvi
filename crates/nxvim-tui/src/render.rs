@@ -1,6 +1,8 @@
 //! The renderer: lays the three regions out and paints each with a ratatui
 //! widget, plus the headless [`paint`]/[`ScrollHarness`] test entry points.
 
+use std::borrow::Cow;
+
 use crossterm::cursor::SetCursorStyle;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -1496,7 +1498,7 @@ fn highlight_line(
     // `~` sits at column 0, so the horizontal scroll never moves it.
     if is_filler {
         return Line::from(Span::styled(
-            expanded,
+            expanded.into_owned(),
             theme.end_of_buffer.unwrap_or_default(),
         ));
     }
@@ -2205,9 +2207,11 @@ pub(crate) fn group_style(group: &str) -> Style {
 /// `unicode::virtcol` (`UnicodeWidthStr`) because str width is just the sum of
 /// its chars' widths — so the cursor's `cursor_screen_col` lines up with the
 /// glyphs painted here.
-fn expand_tabs(line: &str, tabstop: usize) -> String {
+fn expand_tabs(line: &str, tabstop: usize) -> Cow<'_, str> {
     if !line.contains('\t') {
-        return line.to_string();
+        // The overwhelmingly common (tab-free) case borrows the line untouched, so
+        // a repaint allocates nothing per row here.
+        return Cow::Borrowed(line);
     }
     let tabstop = tabstop.max(1);
     let mut out = String::with_capacity(line.len() + tabstop);
@@ -2215,14 +2219,16 @@ fn expand_tabs(line: &str, tabstop: usize) -> String {
     for ch in line.chars() {
         if ch == '\t' {
             let spaces = tabstop - (col % tabstop);
-            out.push_str(&" ".repeat(spaces));
+            for _ in 0..spaces {
+                out.push(' ');
+            }
             col += spaces;
         } else {
             out.push(ch);
             col += UnicodeWidthChar::width(ch).unwrap_or(0);
         }
     }
-    out
+    Cow::Owned(out)
 }
 
 /// Paint a status line from the `segments` the server's `%`-format engine
@@ -2257,7 +2263,7 @@ fn render_status(frame: &mut Frame, area: Rect, segments: &[StatusSegment], view
                     merged
                 }
             });
-            Span::styled(text.clone(), style)
+            Span::styled(text.as_str(), style)
         })
         .collect();
 
@@ -2273,7 +2279,7 @@ fn render_command(frame: &mut Frame, area: Rect, view: &View) {
     } else if !view.message.is_empty() {
         // An error message paints with the theme's `ErrorMsg` (red foreground when
         // the colorscheme leaves it undefined); a normal message keeps the default.
-        let mut para = Paragraph::new(view.message.clone());
+        let mut para = Paragraph::new(view.message.as_str());
         if view.message_error {
             para = para.style(
                 view.error_msg
@@ -2311,8 +2317,8 @@ fn render_tabline(frame: &mut Frame, area: Rect, view: &View) {
             .tabline_segments
             .iter()
             .map(|(text, style)| match style {
-                Some(s) => Span::styled(text.clone(), rt(*s)),
-                None => Span::raw(text.clone()),
+                Some(s) => Span::styled(text.as_str(), rt(*s)),
+                None => Span::raw(text.as_str()),
             })
             .collect();
         frame.render_widget(Paragraph::new(Line::from(spans)), area);

@@ -799,7 +799,11 @@ impl View {
         // The style palette must land before windows (their scroll bands snapshot
         // it) and chrome (which indexes into it).
         self.styles = parse_styles(map_get(map, "styles"));
-        let chrome = |key| chrome_style(map_get(map, "chrome"), key, &self.styles);
+        // Hoist the single `chrome` submap lookup out of the per-region closure
+        // below: it is read once for all ~17 regions instead of re-scanning the
+        // top-level redraw map for the same key on every call.
+        let chrome_map = map_get(map, "chrome");
+        let chrome = |key| chrome_style(chrome_map, key, &self.styles);
         self.normal = chrome("normal");
         self.line_nr = chrome("line_nr");
         self.cursor_line_nr = chrome("cursor_line_nr");

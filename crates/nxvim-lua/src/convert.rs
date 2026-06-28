@@ -128,8 +128,11 @@ fn classify_table<V>(
     t: &Table,
     mut conv: impl FnMut(&mlua::Value) -> mlua::Result<V>,
 ) -> mlua::Result<LuaTable<V>> {
-    let len = t.raw_len() as i64;
-    let mut entries: Vec<(i64, V)> = Vec::new();
+    let raw_len = t.raw_len();
+    let len = raw_len as i64;
+    // The sequence part is at most `raw_len` long; reserve it up front (exact for a
+    // pure array, the common case). The map part stays unsized — its length is unknown.
+    let mut entries: Vec<(i64, V)> = Vec::with_capacity(raw_len);
     let mut map: Vec<(mlua::Value, V)> = Vec::new();
     let mut is_seq = true;
     for pair in t.clone().pairs::<mlua::Value, mlua::Value>() {
@@ -220,14 +223,14 @@ fn rmpv_to_lua_at(lua: &Lua, value: &rmpv::Value, depth: usize) -> mlua::Result<
         R::String(s) => mlua::Value::String(lua.create_string(s.as_bytes())?),
         R::Binary(b) => mlua::Value::String(lua.create_string(b)?),
         R::Array(items) => {
-            let t = lua.create_table()?;
+            let t = lua.create_table_with_capacity(items.len(), 0)?;
             for (i, item) in items.iter().enumerate() {
                 t.raw_set(i + 1, rmpv_to_lua_at(lua, item, depth + 1)?)?;
             }
             mlua::Value::Table(t)
         }
         R::Map(pairs) => {
-            let t = lua.create_table()?;
+            let t = lua.create_table_with_capacity(0, pairs.len())?;
             for (k, v) in pairs {
                 let key = match k {
                     R::String(s) => s.as_str().unwrap_or_default().to_string(),
@@ -264,14 +267,14 @@ fn json_to_lua_at(lua: &Lua, value: &serde_json::Value, depth: usize) -> mlua::R
         },
         J::String(s) => mlua::Value::String(lua.create_string(s)?),
         J::Array(items) => {
-            let t = lua.create_table()?;
+            let t = lua.create_table_with_capacity(items.len(), 0)?;
             for (i, item) in items.iter().enumerate() {
                 t.raw_set(i + 1, json_to_lua_at(lua, item, depth + 1)?)?;
             }
             mlua::Value::Table(t)
         }
         J::Object(map) => {
-            let t = lua.create_table()?;
+            let t = lua.create_table_with_capacity(0, map.len())?;
             for (k, v) in map {
                 t.raw_set(k.as_str(), json_to_lua_at(lua, v, depth + 1)?)?;
             }

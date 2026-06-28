@@ -318,6 +318,18 @@ pub struct Renderer {
     /// it). The client reads it via [`Renderer::ime_cursor_area`] to anchor the IME
     /// candidate window at the caret instead of the window origin.
     cursor_px: Option<(f32, f32)>,
+
+    /// Reusable per-frame draw lists, kept across frames so their heap capacity
+    /// survives instead of reallocating the lists from scratch each paint (a
+    /// continuously-repainting scroll animation would otherwise re-grow them every
+    /// frame). [`render`](Self::render) takes them out via `mem::take` so
+    /// `build_frame` can fill them while still borrowing the renderer mutably, then
+    /// stores them back; each is cleared (capacity retained) at the next frame's start.
+    frame_quads: Vec<Quad>,
+    frame_items: Vec<TextItem>,
+    frame_overlay_quads: Vec<Quad>,
+    frame_overlay_items: Vec<TextItem>,
+    frame_image_draws: Vec<ImageDraw>,
 }
 
 impl Renderer {
@@ -420,6 +432,11 @@ impl Renderer {
             line_height,
             scale,
             cursor_px: None,
+            frame_quads: Vec::new(),
+            frame_items: Vec::new(),
+            frame_overlay_quads: Vec::new(),
+            frame_overlay_items: Vec::new(),
+            frame_image_draws: Vec::new(),
         })
     }
 
@@ -535,20 +552,21 @@ impl Renderer {
         cache: &'a HashMap<u64, CacheEntry>,
         items: &'a [TextItem],
     ) -> Vec<TextArea<'a>> {
-        items
-            .iter()
-            .filter_map(|it| {
-                cache.get(&it.key).map(|e| TextArea {
-                    buffer: &e.buffer,
-                    left: it.x,
-                    top: it.y,
-                    scale: it.scale,
-                    bounds: it.bounds,
-                    default_color: it.color,
-                    custom_glyphs: &[],
-                })
+        // Pre-size to the item count (an exact upper bound — only evicted entries are
+        // dropped) so the per-frame area list doesn't grow by repeated reallocation.
+        let mut areas = Vec::with_capacity(items.len());
+        areas.extend(items.iter().filter_map(|it| {
+            cache.get(&it.key).map(|e| TextArea {
+                buffer: &e.buffer,
+                left: it.x,
+                top: it.y,
+                scale: it.scale,
+                bounds: it.bounds,
+                default_color: it.color,
+                custom_glyphs: &[],
             })
-            .collect()
+        }));
+        areas
     }
 
     /// Hand a remote preview's fetched bytes (an `nxvim_image_read` reply, routed from
@@ -615,11 +633,19 @@ impl Renderer {
         // it touches and we can evict the rest.
         self.gen = self.gen.wrapping_add(1);
         let bg = style_bg(&view.normal).unwrap_or(DEFAULT_BG);
-        let mut quads: Vec<Quad> = Vec::new();
-        let mut items: Vec<TextItem> = Vec::new();
-        let mut overlay_quads: Vec<Quad> = Vec::new();
-        let mut overlay_items: Vec<TextItem> = Vec::new();
-        let mut image_draws: Vec<ImageDraw> = Vec::new();
+        // Reuse last frame's draw lists (their capacity is retained); taking them out
+        // of `self` lets `build_frame` fill them while still borrowing the renderer
+        // mutably. They're stored back below so the next frame reuses the allocation.
+        let mut quads = std::mem::take(&mut self.frame_quads);
+        let mut items = std::mem::take(&mut self.frame_items);
+        let mut overlay_quads = std::mem::take(&mut self.frame_overlay_quads);
+        let mut overlay_items = std::mem::take(&mut self.frame_overlay_items);
+        let mut image_draws = std::mem::take(&mut self.frame_image_draws);
+        quads.clear();
+        items.clear();
+        overlay_quads.clear();
+        overlay_items.clear();
+        image_draws.clear();
         // Decode/upload every preview image *before* building the frame, so
         // `build_window` knows decode failures the same frame and paints the
         // `[image: …]` placeholder for them (a one-frame lag could otherwise never
@@ -684,6 +710,15 @@ impl Renderer {
             self.config.width as f32,
             self.config.height as f32,
         );
+
+        // The draw lists are fully consumed (uploaded / prepared); hand them back so
+        // next frame reuses their capacity. Done before the render pass so a transient
+        // pass error can't strand the allocation.
+        self.frame_quads = quads;
+        self.frame_items = items;
+        self.frame_overlay_quads = overlay_quads;
+        self.frame_overlay_items = overlay_items;
+        self.frame_image_draws = image_draws;
 
         let mut encoder = self
             .device
@@ -3186,16 +3221,11 @@ impl Renderer {
         if segments.iter().all(|s| s.text.is_empty()) {
             return;
         }
-        let key = self.ensure(segments, default_fg);
+        let (key, snapped) = self.ensure(segments, default_fg);
         let color = srgb_to_color(default_fg);
         // The common case: every glyph snapped to the cell grid — draw the whole line
-        // as one buffer at the run origin.
-        let nonsnapped = self
-            .cache
-            .get(&key)
-            .map(|e| e.nonsnapped.clone())
-            .unwrap_or_default();
-        if nonsnapped.is_empty() {
+        // as one buffer at the run origin, without re-reading the cache entry.
+        if snapped {
             items.push(TextItem {
                 key,
                 x: pos.0,
@@ -3210,9 +3240,14 @@ impl Renderer {
         // Otherwise the line has off-grid clusters (emoji or monochrome symbols). Mask
         // each to spaces so the rest of the line shapes on-grid (surrounding text stays
         // aligned), then place each cluster as its own scaled item over the reserved gap.
+        let nonsnapped = self
+            .cache
+            .get(&key)
+            .map(|e| e.nonsnapped.clone())
+            .unwrap_or_default();
         let full: String = segments.iter().map(|s| s.text.as_str()).collect();
         let masked = mask_segments(segments, &nonsnapped);
-        let mkey = self.ensure(&masked, default_fg);
+        let (mkey, _) = self.ensure(&masked, default_fg);
         items.push(TextItem {
             key: mkey,
             x: pos.0,
@@ -3235,7 +3270,7 @@ impl Renderer {
                                                     // glyph ignores the fg, but a monochrome icon or CJK glyph needs it.
             let (cfg, bold, italic) = seg_style_at(segments, start)
                 .map_or((default_fg, false, false), |s| (s.fg, s.bold, s.italic));
-            let ekey = self.ensure(
+            let (ekey, _) = self.ensure(
                 &[Seg {
                     text: cluster.to_string(),
                     fg: cfg,
@@ -3292,18 +3327,21 @@ impl Renderer {
         }
     }
 
-    /// Ensure a shaped buffer for `segments` is cached, returning its key. A hit
-    /// just refreshes the entry's frame stamp — the whole point: no reshaping for
-    /// a line whose content hasn't changed. The emoji-cluster list is computed once
-    /// here, with the shape.
-    fn ensure(&mut self, segments: &[Seg], default_fg: u32) -> u64 {
+    /// Ensure a shaped buffer for `segments` is cached, returning its key and whether
+    /// every cluster snapped to the cell grid (the common case — no off-grid emoji /
+    /// symbols, so the caller can draw the line as one buffer without re-reading the
+    /// entry). A hit just refreshes the entry's frame stamp — the whole point: no
+    /// reshaping for a line whose content hasn't changed. The emoji-cluster list is
+    /// computed once here, with the shape.
+    fn ensure(&mut self, segments: &[Seg], default_fg: u32) -> (u64, bool) {
         let key = line_key(segments, default_fg);
         if let Some(e) = self.cache.get_mut(&key) {
             e.used = self.gen;
-            return key;
+            return (key, e.nonsnapped.is_empty());
         }
         let buffer = self.shape_segments(segments);
         let nonsnapped = nonsnapped_clusters(&buffer, self.cell_w);
+        let snapped = nonsnapped.is_empty();
         self.cache.insert(
             key,
             CacheEntry {
@@ -3312,7 +3350,7 @@ impl Renderer {
                 nonsnapped,
             },
         );
-        key
+        (key, snapped)
     }
 
     /// Shape `segments` into a fresh glyphon buffer (the expensive op the cache

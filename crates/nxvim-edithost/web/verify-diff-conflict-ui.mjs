@@ -47,7 +47,9 @@ try {
   await page.goto(`http://localhost:${PORT}/web/index.html`);
   await page.waitForFunction(() => window.__nxvim !== undefined, null, { timeout: 20000 });
   await page.evaluate(() => window.__nxvim.ready);
-  await writeOpfs(page, "init.lua", DEMO_INIT + '\nrequire("nxvim-diff").setup({ signs = true })\n');
+  // The demo init.lua sets `nxvim-diff` `signs = true`, so a fresh conflict view shows
+  // the per-hunk gutter signs — no need to override here.
+  await writeOpfs(page, "init.lua", DEMO_INIT);
   await page.reload();
   await page.waitForFunction(() => window.__nxvim !== undefined, null, { timeout: 20000 });
   await page.evaluate(() => window.__nxvim.ready);

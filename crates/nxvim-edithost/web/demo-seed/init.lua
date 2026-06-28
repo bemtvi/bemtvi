@@ -33,8 +33,9 @@ nx.dock.open({ side = "bottom", size = 8, autohide = true, title = "PANEL" })
 -- LSP keymaps (gd / K / grn / gra / grr / gO / <leader>l…); servers configured below.
 require("nxvim-lspconfig").setup({})
 
--- Diff / merge-conflict visualizer — `:NxDiffGit` / `:NxDiffConflict`.
-require("nxvim-diff").setup({})
+-- Diff / merge-conflict visualizer — `:NxDiffGit` / `:NxDiffConflict`. `signs = true`
+-- shows the per-hunk gutter signs (`+`/`~`/`-`) on changed rows in the diff panes.
+require("nxvim-diff").setup({ signs = true })
 
 -- Python language server: basedpyright, running fully in-browser (Phase 4). The local
 -- process host routes any LSP spawn to the bundled basedpyright worker; `typeshedPaths`

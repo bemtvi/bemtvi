@@ -1355,7 +1355,13 @@
       const line = w.lines[row] ?? "";
       const isFiller = w.numbers[row] === null;
       let html = "";
-      if (gutterW > 0) html += renderGutterCell(w, row, gutterW);
+      // Render the gutter whenever the window reserves ANY of it — a sign column
+      // (`sign_width`) can exist without line numbers (e.g. an `nx.view` diff pane
+      // that sets `signcolumn=yes` but no `number`), so gating on `gutterW` alone
+      // (the number width) drops the signs. Matches the other render paths
+      // (`renderLineServer`, the virt-line / scroll-band rows) and `renderGutterCell`,
+      // which renders the foldcolumn + sign cell and returns early when `width <= 0`.
+      if (gutterW > 0 || w.sign_width > 0) html += renderGutterCell(w, row, gutterW);
       if (isFiller) return html + `<span class="eob">${escapeHtml(line)}</span>`;
 
       const tabstop = w.tabstop || 8;
@@ -2036,8 +2042,16 @@
     function renderContentFloat(float, tablineRows) {
       const fw = view.windows.find((w) => w.focused) || view.windows[0];
       const rect = fw ? winRect(fw) : { x: 0, y: 0 };
-      const x = rect.x + float.col;
-      const y = tablineRows + rect.y + float.row;
+      // An `editor_relative` content float (any non-cursor placement — e.g. a "bottom"
+      // which-key / keys-helper popup) is positioned in editor-absolute (windows-area)
+      // cells, so it anchors at the grid origin, NOT the focused window's rect. Adding
+      // the window rect would double-count the offset and a right-side split (a diff
+      // pane) drags the popup off the right edge of the screen. A cursor-placed float
+      // (LSP hover / signature help) stays window-relative, as before. Mirrors the
+      // `editor_relative` handling in `renderMenu`.
+      const er = float.editor_relative;
+      const x = (er ? 0 : rect.x) + float.col;
+      const y = (er ? tablineRows : tablineRows + rect.y) + float.row;
       const bordered = float.border && float.border !== "none";
       const inner = float.width; // content cell width (border adds a ring around it)
       // The shared chrome draws the bg + glyph border + title; the content box sits one

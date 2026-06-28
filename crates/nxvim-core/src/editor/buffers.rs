@@ -366,6 +366,27 @@ impl Editor {
         })
     }
 
+    /// The buffer's user-facing *display* name — the same precedence the rendered
+    /// statusline and tab label use (see [`crate::view`]'s `file_name`): a terminal
+    /// buffer's window title, else a plugin view's (`nx.view`) `name`, else the file
+    /// path; `""` for a genuinely unnamed buffer. This is what `nvim_buf_get_name` /
+    /// `nx.buf.name` return, so the API matches what the user sees in the statusline.
+    /// Distinct from [`Self::buffer_name`], which is strictly the file path (what
+    /// shada / LSP / marks / jumps need — they must not see a view or terminal label).
+    pub fn display_name(&self, id: BufferId) -> String {
+        if let Some(title) = self.terminal_title(id).filter(|t| !t.is_empty()) {
+            return title;
+        }
+        if let Some(name) = self
+            .buffer_of(id)
+            .and_then(|b| b.view_name.as_ref())
+            .filter(|n| !n.is_empty())
+        {
+            return name.clone();
+        }
+        self.buffer_name(id).unwrap_or_default()
+    }
+
     /// Create a new empty buffer and return its id, without switching to it
     /// (the `nvim_create_buf` entry point).
     pub fn create_buffer(&mut self) -> BufferId {

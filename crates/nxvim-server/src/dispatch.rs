@@ -474,20 +474,18 @@ impl EditHost {
             }
             "nvim_create_buf" => Ok(Value::from(self.editor.create_buffer().0)),
             "nvim_buf_get_name" => {
-                // (buffer): the buffer's file name, "" if unnamed; 0 = current. A
-                // terminal-job buffer has no path, so it reports its window title (the
-                // child's OSC title) as its name — like neovim's `term://…` name.
+                // (buffer): the buffer's display name, "" if unnamed; 0 = current.
+                // `display_name` applies the rendered-statusline precedence — a
+                // terminal-job buffer reports its window title (the child's OSC title,
+                // like neovim's `term://…`), a plugin view (`nx.view`) reports its
+                // create name, otherwise the file path — so the API matches the bar.
                 let handle = uint(params.first(), 0) as u64;
                 let id = if handle == 0 {
                     self.editor.current_buffer_id()
                 } else {
                     BufferId(handle)
                 };
-                let name = self
-                    .editor
-                    .terminal_title(id)
-                    .or_else(|| self.editor.buffer_name(id))
-                    .unwrap_or_default();
+                let name = self.editor.display_name(id);
                 Ok(Value::from(name))
             }
             "nvim_get_hl" => {

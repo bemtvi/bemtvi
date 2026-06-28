@@ -30,7 +30,7 @@ PLUGINS=(
   "davidrios/nxvim-tree	eb1faff0705b0534c727de240f2c16531d434ddc"
   "davidrios/nxvim-line	f8f4d3407a020515cbf1655abbf50eadeae7325d"
   "davidrios/nxvim-lspconfig	e9d13fff6915faecdccb425ffb0ca881c7b0fb8e"
-  "davidrios/nxvim-diff	4b33feab79ff5e83c525afcf4618ed92bec10961"
+  "davidrios/nxvim-diff	bc1d9fdebb478aee3de25ede3f0830feff556392"
   "davidrios/catppuccin-nxvim	865da97bb6cd07e6050130fdf757c944e1651d87"
 )
 

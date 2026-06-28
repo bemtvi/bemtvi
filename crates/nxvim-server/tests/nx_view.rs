@@ -410,6 +410,43 @@ async fn view_name_shows_in_statusline_and_tab_label() {
     );
 }
 
+/// `nx.buf.name` (alias `nvim_buf_get_name`) — what a Lua statusline plugin reads to
+/// label a window — must return the view's create name, not `""`. The name is path-only
+/// in core, but a view has no path; without surfacing `view_name` here a plugin
+/// statusline (e.g. nxvim-line) shows `[No Name]` for every diff pane / file-tree view.
+/// Covers both the current-buffer fast path (`nx.buf.name(0)` via the `_cur_buf`
+/// snapshot) and the by-handle path (the `nx._bufs` mirror a status bar reads per
+/// window).
+#[tokio::test]
+async fn view_name_is_returned_by_buf_get_name() {
+    let (rpc, _incoming) = start().await;
+    feed_sync(&rpc, "imain<Esc>").await;
+    exec_lua(
+        &rpc,
+        r#"vw = nx.view.create{ name = "ours" }
+           vw:set_lines{ "x" }
+           vw:mount{ split = "vsplit" }"#,
+    )
+    .await;
+    // By handle (the `nx._bufs` mirror): the view's buffer reports its name.
+    let by_handle = exec_lua(&rpc, r#"return nx.buf.name(vw:bufnr())"#).await;
+    assert_eq!(
+        by_handle.as_str(),
+        Some("ours"),
+        "nx.buf.name(bufnr) of a view must be its create name, not [No Name]"
+    );
+    // The current-buffer fast path: focus the view (its own tick so the `_cur_buf`
+    // snapshot refreshes), then read `nx.buf.name(0)`.
+    exec_lua(&rpc, r#"vw:focus()"#).await;
+    feed_sync(&rpc, "").await;
+    let current = exec_lua(&rpc, r#"return nx.buf.name(0)"#).await;
+    assert_eq!(
+        current.as_str(),
+        Some("ours"),
+        "nx.buf.name(0) for the focused view must be its create name"
+    );
+}
+
 /// A view buffer is a surface, not a document: it never appears in `:ls` / `:bnext`
 /// navigation, so once closed it can't be cycled back into. Here `:bnext` from an
 /// ordinary buffer skips the mounted view and wraps to the only other real buffer.

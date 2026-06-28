@@ -1664,7 +1664,7 @@ impl EditHost {
     /// the last autocmd left (e.g. empty right after `:edit`, before any buffer event).
     pub(crate) fn refresh_cur_buf_snapshot(&mut self) {
         let buf = self.editor.current_buffer_id();
-        let name = self.editor.buffer_name(buf).unwrap_or_default();
+        let name = self.editor.display_name(buf);
         let ft = crate::filetype_of(self.editor.buffer().path.as_deref()).unwrap_or("");
         let _ = self.lua.set_buf_snapshot(buf.0, &name, ft);
     }
@@ -1730,7 +1730,7 @@ impl EditHost {
                 }
                 self.buf_mirror_lines.insert(id, new_count);
             }
-            let name = self.editor.buffer_name(id).unwrap_or_default();
+            let name = self.editor.display_name(id);
             if let Some(b) = self.editor.buffer_of(id) {
                 let o = b.options;
                 bo.push(BoMirror {

@@ -85,6 +85,53 @@ async fn start() -> (Rpc, UnboundedReceiver<Incoming>) {
     start_attached(ServerInit::default(), 80, 24).await
 }
 
+/// A BUFFER-LOCAL mapped prefix on a focused `nx.view` buffer surfaces through the
+/// pending oracle — the keys-helper / which-key path for a plugin view (e.g.
+/// nxvim-diff's panes, which bind `co`/`ct`/`cb`/`cp`/… buffer-local on each read-only
+/// pane). The invariant: a view's buffer-local maps reach the oracle so a which-key
+/// popup can list them. `c` is also the built-in change operator, so the event MERGES
+/// the operator's motion grammar with the buffer-local `c…` maps — the maps must be in
+/// there (as their second key `o`/`t`, kind `map`, carrying the mapping's `desc`).
+#[tokio::test]
+async fn buffer_local_prefix_on_focused_view_fires_pending() {
+    let (rpc, _incoming) = start().await;
+    // Mount a view and bind its buffer-local c-prefix maps once its buffer exists.
+    exec_lua(
+        &rpc,
+        &format!(
+            "{RECORDER}\
+             vw = nx.view.create{{ name = 'ours' }}\n\
+             vw:set_lines{{ 'alpha', 'beta' }}\n\
+             vw:mount{{ split = 'vsplit' }}"
+        ),
+    )
+    .await;
+    barrier(&rpc).await;
+    exec_lua(
+        &rpc,
+        "local buf = vw:bufnr()\n\
+         nx.keymap.set('n', 'co', function() end, { buffer = buf, desc = 'choose ours' })\n\
+         nx.keymap.set('n', 'ct', function() end, { buffer = buf, desc = 'choose theirs' })\n\
+         vw:focus()",
+    )
+    .await;
+    barrier(&rpc).await;
+    feed(&rpc, "c");
+    let ev = events(&rpc).await;
+    assert!(
+        ev.starts_with("n|c|"),
+        "pressing `c` must fire a pending event: {ev:?}"
+    );
+    assert!(
+        ev.contains("o/choose ours/map"),
+        "the view's buffer-local `co` map must surface in the pending continuations: {ev:?}"
+    );
+    assert!(
+        ev.contains("t/choose theirs/map"),
+        "the view's buffer-local `ct` map must surface in the pending continuations: {ev:?}"
+    );
+}
+
 /// A growing mapped prefix fires the event with its sorted continuations — each
 /// carrying the mapping's `desc` and `kind = "map"`.
 #[tokio::test]

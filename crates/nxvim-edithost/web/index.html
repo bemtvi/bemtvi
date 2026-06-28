@@ -1409,7 +1409,12 @@
       }
 
       const leftcol = w.leftcol || 0;
-      const isFocused = w.focused && !view.command_mode;
+      // A picker (a menu carrying a prompt `query`) moves the cursor into its input box,
+      // so the buffer cursor must hide while it's open — matching the native TUI/GUI
+      // (`picker_open = menu.query.is_some()`). A queryless select / completion popup
+      // keeps the buffer cursor where it is.
+      const pickerOpen = !!(view.menu && view.menu.query != null);
+      const isFocused = w.focused && !view.command_mode && !pickerOpen;
       const cursorCol = w.cursor_screen_col;
       const cursorRow = w.cursor_row;
       const sel = w.selection[row] || null;
@@ -1786,7 +1791,10 @@
       }
       emitHints(Infinity);
 
-      const isFocused = w.focused && !view.command_mode;
+      // Hide the buffer cursor while a picker (a prompt-carrying menu) owns the input —
+      // see the note in the plain renderLine above.
+      const pickerOpen = !!(view.menu && view.menu.query != null);
+      const isFocused = w.focused && !view.command_mode && !pickerOpen;
       const cursorRow = w.cursor_row;
       let inlayShift = 0;
       for (const [hcol, text] of hints) {
@@ -2180,7 +2188,18 @@
         if (sPrompt && sPrompt.fg != null) promptEl.style.color = cssColor(sPrompt.fg);
         promptEl.style.width = listW * cw + "px";
         promptEl.style.fontWeight = "bold";
-        promptEl.textContent = text;
+        // The query input cursor sits after the `> ` prefix at `query_cursor` (a CHAR
+        // offset, mirroring the cmdline cursor), clamped inside the box. Tag it with
+        // CURSOR_ID so the IME proxy follows the picker input, not the hidden buffer.
+        const curIdx = Math.min(2 + menu.query_cursor, listW - 1);
+        const pchars = [...text];
+        let phtml = "";
+        for (let i = 0; i < pchars.length; i++) {
+          phtml += i === curIdx
+            ? `<span id="${CURSOR_ID}" class="cur-block">${escapeHtml(pchars[i])}</span>`
+            : escapeHtml(pchars[i]);
+        }
+        promptEl.innerHTML = phtml;
         // A full-width rule between the prompt and the list, themed off the border
         // group (`TelescopeBorder` &c.) when set, else the built-in chrome color.
         sepEl = document.createElement("div");

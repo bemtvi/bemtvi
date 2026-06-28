@@ -2084,17 +2084,22 @@
       const fw = view.windows.find((w) => w.focused) || view.windows[0];
       const rect = fw ? winRect(fw) : { x: 0, y: 0 };
       // A picker carries a prompt query (even when empty); a nx.ui.select does not.
+      // The prompt costs TWO rows of chrome — the input line plus a horizontal rule
+      // separating it from the list (mirroring the TUI / GUI `chrome = prompt * 2`).
+      // The prompt sits above the list by default, or below it (telescope-style) when
+      // the server asks (`prompt_pos === "bottom"`).
       const hasPrompt = menu.query !== null && menu.query !== undefined;
-      const promptRows = hasPrompt ? 1 : 0;
+      const promptBottom = hasPrompt && menu.prompt_pos === "bottom";
+      const chromeRows = hasPrompt ? 2 : 0;
       // A preview pane (Phase 3) splits the box into a list column (left) + a 1-col
       // glyph separator + a preview column (right). The list keeps `width - previewW - 1`.
       const hasPreview = menu.preview != null;
       const previewW = hasPreview ? Math.max(1, Math.min(menu.preview.width, menu.width - 2)) : 0;
       const listW = hasPreview ? Math.max(1, menu.width - previewW - 1) : menu.width;
-      // Render the FULL box height (`menu.height` is the fixed picker size), padding
-      // empty rows past the item count so the box doesn't shrink to its content.
-      const listRows = Math.max(1, menu.height - promptRows);
-      const boxRows = listRows + promptRows; // inner content height (cells)
+      // Render the FULL box height (`menu.height` is the fixed picker size, chrome
+      // included), padding empty rows past the item count so the box doesn't shrink.
+      const listRows = Math.max(1, menu.height - chromeRows);
+      const boxRows = listRows + chromeRows; // inner content height (cells)
 
       // Border edges per widget kind, mirroring the TUI's render_menu: the cmdline
       // wildmenu drops its BOTTOM edge (it kisses the command line below), a bordered
@@ -2164,15 +2169,25 @@
       if (bgCss) box.style.background = bgCss;
       if (fgCss) box.style.color = fgCss;
       place(box, cx, cy, listW, boxRows);
+      // The `> query` prompt row and the horizontal rule under it (the `chrome`). Built
+      // here but ordered into the box below, so a `prompt_pos === "bottom"` picker can
+      // flip them beneath the list (telescope-style).
+      let promptEl = null, sepEl = null;
       if (hasPrompt) {
         const text = ("> " + menu.query).slice(0, listW).padEnd(listW);
-        const promptEl = document.createElement("div");
+        promptEl = document.createElement("div");
         promptEl.className = "row" + (sPrompt ? "" : " pmenu-prompt");
         if (sPrompt && sPrompt.fg != null) promptEl.style.color = cssColor(sPrompt.fg);
         promptEl.style.width = listW * cw + "px";
         promptEl.style.fontWeight = "bold";
         promptEl.textContent = text;
-        box.appendChild(promptEl);
+        // A full-width rule between the prompt and the list, themed off the border
+        // group (`TelescopeBorder` &c.) when set, else the built-in chrome color.
+        sepEl = document.createElement("div");
+        sepEl.className = "row" + (borderCss ? "" : " float-border");
+        if (borderCss) sepEl.style.color = borderCss;
+        sepEl.style.width = listW * cw + "px";
+        sepEl.textContent = "─".repeat(listW);
       }
       const listEls = [];
       for (let i = 0; i < listRows; i++) {
@@ -2213,7 +2228,12 @@
       // match (row 0) at the BOTTOM, nearest the command cursor — the mirror of a
       // below-cursor completion popup (matches the cell-grid clients).
       if (menu.cmdline) listEls.reverse();
-      for (const el of listEls) box.appendChild(el);
+      // Assemble the box: prompt + rule above the list (default), or below it
+      // (`prompt_pos === "bottom"`); a promptless select is the bare list.
+      const rows = promptBottom
+        ? [...listEls, sepEl, promptEl]
+        : [promptEl, sepEl, ...listEls];
+      for (const el of rows) if (el) box.appendChild(el);
       gridEl.appendChild(box);
 
       // The preview column: a separate panel to the right of the list, with a header

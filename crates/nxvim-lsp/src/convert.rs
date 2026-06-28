@@ -219,12 +219,79 @@ pub(crate) fn hover_reply(hover: Option<Hover>) -> LspReply {
 /// shared distiller for every markup-to-lines reduction — nxvim renders markdown
 /// as plain lines today, so this is a plain `lines()` split (styling is a
 /// follow-up, tracked with hover).
+///
+/// Markdown that wraps inline HTML (pyright / basedpyright encode a docstring's
+/// leading indentation as `&nbsp;`, and escape `<`/`>`/`&`) is decoded back to the
+/// characters it stands for — otherwise the plain-text float shows the literal
+/// `&nbsp;` / `&lt;` noise instead of the intended text.
 fn markup_lines(text: String) -> Vec<String> {
-    let mut lines: Vec<String> = text.lines().map(str::to_string).collect();
+    let mut lines: Vec<String> = text.lines().map(decode_html_entities).collect();
     while lines.last().is_some_and(|l| l.trim().is_empty()) {
         lines.pop();
     }
     lines
+}
+
+/// Decode the HTML character references an LSP server may emit in its markdown
+/// (rendered as plain text here): the handful of named entities that show up in
+/// docstrings plus numeric `&#NN;` / `&#xNN;` references. `&nbsp;` becomes a plain
+/// space (a regular `0x20`, not `U+00A0`) since it stands for indentation. A `&`
+/// that doesn't begin a recognized reference is left untouched, and decoding is a
+/// single left-to-right pass so a decoded `&amp;` is never re-scanned.
+fn decode_html_entities(line: &str) -> String {
+    if !line.contains('&') {
+        return line.to_string();
+    }
+    let mut out = String::with_capacity(line.len());
+    let bytes = line.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] != b'&' {
+            // Copy the next whole char (the entity scan below only matches ASCII).
+            let ch = line[i..].chars().next().unwrap();
+            out.push(ch);
+            i += ch.len_utf8();
+            continue;
+        }
+        // Find the terminating `;` within a bounded window (the longest reference
+        // we handle is `&#xXXXXXX;`); a missing/too-far `;` means this `&` is literal.
+        match line[i + 1..]
+            .find(';')
+            .filter(|&semi| semi <= 9)
+            .and_then(|semi| decode_reference(&line[i + 1..i + 1 + semi]))
+        {
+            Some(ch) => {
+                out.push(ch);
+                i += 1 + line[i + 1..].find(';').unwrap() + 1;
+            }
+            None => {
+                out.push('&');
+                i += 1;
+            }
+        }
+    }
+    out
+}
+
+/// Decode the body of one character reference (the text between `&` and `;`) to its
+/// character, or `None` if it isn't one we recognize.
+fn decode_reference(body: &str) -> Option<char> {
+    match body {
+        "nbsp" => Some(' '),
+        "lt" => Some('<'),
+        "gt" => Some('>'),
+        "amp" => Some('&'),
+        "quot" => Some('"'),
+        "apos" => Some('\''),
+        _ => {
+            let digits = body.strip_prefix('#')?;
+            let code = match digits.strip_prefix(['x', 'X']) {
+                Some(hex) => u32::from_str_radix(hex, 16).ok()?,
+                None => digits.parse().ok()?,
+            };
+            char::from_u32(code)
+        }
+    }
 }
 
 /// The text of a `MarkedString` (a plain markdown string, or the code of a

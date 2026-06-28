@@ -151,6 +151,39 @@ async fn hover_reply_opens_a_float_window() {
 }
 
 #[tokio::test]
+async fn hover_markdown_html_entities_are_decoded_to_plain_text() {
+    // pyright / basedpyright encode a docstring's leading indentation as `&nbsp;`
+    // HTML entities (and escape `<`/`>`/`&` as `&lt;`/`&gt;`/`&amp;`) in its markdown
+    // hover. nxvim renders markdown as plain text, so those entities must be decoded
+    // back to the characters they stand for — otherwise the float shows the literal
+    // `&nbsp;` noise instead of the intended indentation.
+    let _guard = serial_lock().lock().await;
+    let dir = temp_dir("lsp_float_hover_entities");
+    arm_mock(
+        &dir,
+        r#"{ "hover": { "contents": { "kind": "markdown",
+             "value": "Example:\n\n&nbsp;&nbsp;&nbsp;&nbsp;foo &lt;T&gt; &amp; bar" } } }"#,
+    );
+    let (rpc, mut incoming) = start(&dir).await;
+
+    let win = await_doc_float_window(&rpc, &mut incoming, "nx.lsp.hover()", "foo").await;
+    let lines = window_lines(&win);
+    assert!(
+        !lines.iter().any(|l| l.contains("&nbsp;")
+            || l.contains("&lt;")
+            || l.contains("&gt;")
+            || l.contains("&amp;")),
+        "HTML entities should be decoded, not shown literally, got {lines:?}"
+    );
+    assert!(
+        lines.iter().any(|l| l == "    foo <T> & bar"),
+        "leading `&nbsp;` should become spaces and `&lt;`/`&gt;`/`&amp;` their chars, got {lines:?}"
+    );
+
+    std::env::remove_var("NXVIM_LSP_CMD");
+}
+
+#[tokio::test]
 async fn hover_window_scrolls_with_the_wheel_and_a_key_dismisses_it() {
     let _guard = serial_lock().lock().await;
     let dir = temp_dir("lsp_float_hover_scroll");

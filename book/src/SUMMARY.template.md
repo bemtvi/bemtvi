@@ -23,9 +23,13 @@
 
 - [What nxvim adds](features/index.md)
   - [Multi-cursor mode](features/multicursor.md)
+  - [Smooth scrolling](features/smooth-scrolling.md)
+  - [Image previews](features/image-previews.md)
   - [UI primitives](features/ui-primitives.md)
   - [Permanent docks](features/docks.md)
   - [Fuzzy picker](features/picker.md)
+  - [Quickfix & named-list dock tabs](features/quickfix-dock-lists.md)
+  - [Workspaces](features/workspaces.md)
   - [Browser editor](features/browser-editor.md)
   - [The edit-host split](features/edit-host-split.md)
 

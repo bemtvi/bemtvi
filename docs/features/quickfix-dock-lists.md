@@ -1,35 +1,40 @@
-# Quickfix & location-list dock tabs
+# Quickfix & named-list dock tabs
 
-nxvim shows quickfix and location lists as **tabs in the bottom dock** by default,
-not as a split window — so you can keep several searches open side by side and
-flip between them, while activating an entry opens the file in the main editing
-area. The classic vim behavior (a bottom split, one list, replaced in place) is one
-option away.
+nxvim shows the quickfix list and **named lists** as **tabs in the bottom dock**
+by default, not as a split window — so you can keep several searches open side by
+side and flip between them, while activating an entry opens the file in the main
+editing area. The classic vim behavior (a bottom split, one list, replaced in
+place) is one option away. **Location lists are the exception**: they always keep
+vim's behavior — a bottom split owned by their window — and never dock.
 
 This is the surface the [fuzzy picker](picker.md)'s `<C-q>` builds on, but it is a
-general list facility — `:copen`, `:lopen`, `:make`, `:vimgrep`, diagnostics, and
-the `nx.qf.*` API all flow through it.
+general list facility — `:copen`, `:make`, `:vimgrep`, diagnostics, and the
+`nx.qf.*` API all flow through it.
 
 ## The `'qfdock'` option
 
+`'qfdock'` governs only the **dock-oriented lists** — the global quickfix list
+and named lists. It does **not** touch location lists.
+
 | `'qfdock'` | Behavior |
 | --- | --- |
-| **on** (default — the nxvim way) | A list's display opens as a tab in the **bottom dock**. Location lists each get their own tab (so searches stack up); the single global quickfix list is one reused tab. `<CR>` / `:cc` / `:cnext` jump into the **main** layer, leaving the dock in place. |
-| off (`:set noqfdock`) | The classic vim/telescope behavior: a full-width **bottom split** of the current window, the single global quickfix list / per-window location list, replaced in place. |
+| **on** (default — the nxvim way) | The quickfix and named lists open as tabs in the **bottom dock**. The single global quickfix list is one reused tab; each named list gets its own tab (so searches stack up). `<CR>` / `:cc` / `:cnext` jump into the **main** layer, leaving the dock in place. |
+| off (`:set noqfdock`) | The classic vim/telescope behavior: a full-width **bottom split** of the current window, the single global quickfix list, replaced in place. |
 
 ```lua
 nx.o.qfdock = false      -- prefer the classic split behavior
 -- or, transiently:  :set noqfdock  /  :set qfdock
 ```
 
-The option governs `:copen` / `:lopen` and the `nx.qf.{send,add}_to_*` actions
-uniformly, so one switch flips the whole behavior.
+The option governs `:copen`, named lists, and the quickfix `nx.qf.*_qflist`
+actions. **Location lists** (`:lopen`, `nx.qf.{send,add}_to_loclist`) always open
+as a bottom split owned by their window, regardless of this option.
 
 ## Closing a list
 
-`:cclose` / `:lclose` close the list. In dock mode that closes its dock tab (and
-the bottom dock itself when it was the last tab); in split mode it closes the
-split — same command, either way.
+`:cclose` closes the quickfix list — its dock tab (and the bottom dock itself when
+it was the last tab) under `'qfdock'`, or its split otherwise. `:lclose` closes the
+location list's split. Same commands as vim, either way.
 
 Dock tabs are ordinary dock tabs: cycle between saved searches with `gt` / `gT`
 while the dock is focused, cross in and out of the dock with `<C-w><C-w>`. (See

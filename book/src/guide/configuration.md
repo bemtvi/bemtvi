@@ -96,7 +96,7 @@ authoring your own.
 ## Runnable examples
 
 The [`examples/`](https://github.com/davidrios/nxvim/tree/main/examples)
-directory has ~40 self-contained, end-to-end-verified configs — one per feature
+directory has ~70 self-contained, end-to-end-verified configs — one per feature
 (treesitter, LSP, floats, registers, tabs, mouse, statusline, completion,
 picker, snippets, decor, docks, quickfix, image previews, …). Each is a config
 dir you point nxvim at:

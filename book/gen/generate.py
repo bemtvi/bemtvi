@@ -55,9 +55,13 @@ def write(path, text):
 IMPORTS = [
     ("docs/features.md", "features/index.md"),
     ("docs/features/multicursor.md", "features/multicursor.md"),
+    ("docs/features/smooth-scrolling.md", "features/smooth-scrolling.md"),
+    ("docs/features/image-previews.md", "features/image-previews.md"),
+    ("docs/features/workspaces.md", "features/workspaces.md"),
     ("docs/features/ui-primitives.md", "features/ui-primitives.md"),
     ("docs/features/docks.md", "features/docks.md"),
     ("docs/features/picker.md", "features/picker.md"),
+    ("docs/features/quickfix-dock-lists.md", "features/quickfix-dock-lists.md"),
     ("docs/browser-editor.md", "features/browser-editor.md"),
     ("docs/edit-host-split.md", "features/edit-host-split.md"),
     ("docs/architecture.md", "architecture/overview.md"),

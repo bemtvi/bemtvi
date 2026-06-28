@@ -30,10 +30,9 @@ daemon.
 | | In the browser |
 | --- | --- |
 | **Plugins** | `init.lua` is **one self-contained file** — a `require` of further modules / plugins doesn't resolve (the runtimepath is empty and storage reads are async). |
-| **LSP** | Unavailable — fails loud, not silently. |
+| **LSP** | Works both ways. A language server compiled to JS/wasm runs **serverlessly** in a Worker (the python demo ships basedpyright); a real native server runs **over the daemon** (WebTransport). Both ride the same off-tick LSP seam as native. With neither a wasm server nor a daemon, a configured server fails loud, not silently. |
 | **Native tree-sitter** | The in-process parser is gated off the build; highlighting uses the JS-side web-tree-sitter path instead. |
-| **Processes** | Serverless: blocking `vim.fn.system` always fails loud, and async `vim.system` / `jobstart` fail loud too. Both run in **daemon mode** (see [Files](#files)). |
-| **Lua dialect** | PUC Lua only — no LuaJIT `ffi` / `bit`. |
+| **Processes** | Serverless: blocking `vim.fn.system` always fails loud, and async `vim.system` / `jobstart` fail loud too — both need **daemon mode** (see [Files](#files)). |
 | **Hosting** | Requires **cross-origin isolation** (COOP/COEP) for the `SharedArrayBuffer`. Without it, input still works but timers (`nx.timer` / `vim.defer_fn`) don't fire. |
 
 Anything unavailable **fails loud** with a named error rather than faking a result —
@@ -57,8 +56,8 @@ native edit-host split uses, so only the transport differs:
   fs crosses the wire. Having no local disk, the browser is **always remote-config**:
   it runs the **daemon's** config + plugins (fetched over the wire) and keeps shada on
   the daemon, where a native client would default to local. Daemon mode also brings
-  **async processes** (`vim.system` / `jobstart`) and **`:terminal`** over the wire;
-  LSP over the wire is a later slice.
+  **async processes** (`vim.system` / `jobstart`), **`:terminal`**, and **LSP** over
+  the wire — the daemon's real language servers, driven from the tab.
 
 ## Run it locally
 

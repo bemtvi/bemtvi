@@ -11,10 +11,6 @@ API is nxvim's own. Configuration and plugins target the **`nx.*` Lua
 namespace**, where the server owns every UI surface and plugins provide data and
 behavior. There are a few `vim.*` aliases over the native `nx.*` API for convenience.
 
-> **Status: early but substantial.** Day-to-day modal editing, splits, tabs,
-> floating windows, treesitter highlighting, a real Lua plugin runtime, and LSP
-> all work. As well as a set of first-party recommended plugins.
-
 ## How to read this book
 
 - **[Getting started](guide/getting-started.md)** — install or build nxvim and

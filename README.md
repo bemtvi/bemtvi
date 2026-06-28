@@ -15,11 +15,6 @@ every UI surface and plugins provide data and behavior. Colorschemes are
 nxvim's own too — pure-Lua modules that fill the highlight registry through the
 `nx` highlight API.
 
-> **Status: early but substantial.** Day-to-day modal editing, splits, tabs,
-> floating windows, treesitter highlighting, a real Lua config runtime, and LSP
-> all work, as well as a selection of optional first-party plugins.
-> Good enough to be a daily driver.
-
 Test the client-only live demo at https://nxvim-demo.netlify.app. Use the `:eo`
 command to open a local file or `:luao` to load a local lua file as config.
 Use :setf LANG to activate treesitter if not auto detected or :TSInstall to
@@ -115,8 +110,12 @@ client-side tree-sitter highlighter).
 - **Soft word-wrap & smooth scrolling** — `wrap` lays long lines across screen
   rows with display-line motions (`gj`/`gk`, `g0`/`g^`/`g$`), and scrolling
   animates smoothly across screen rows. The window-local
-  `number`/`relativenumber`, `numberwidth`, `signcolumn`, and horizontal-scroll
-  options are honored.
+  `number`/`relativenumber`, `numberwidth`, `signcolumn`, `cursorline`,
+  `breakindent`/`showbreak`, and horizontal-scroll options are honored.
+- **Folds** — `zo`/`zc`/`za`, `zR`/`zM`, `zj`/`zk`, and a fold column, with
+  five fold methods selected by `foldmethod`: `manual` (`zf`), `indent`,
+  `marker` (literal `{{{`/`}}}`), `expr` (a Lua `foldexpr`), and `syntax`
+  driven by treesitter — plus LSP `textDocument/foldingRange`.
 - **Search & substitute** — interactive `/` and `?` with `n`/`N`, `hlsearch`,
   and `incsearch`, plus `:s` with the `g`/`i`/`I`/`n`/`c` flags. Two
   interchangeable regex dialects, selected by the `'regexsyntax'` option: **PCRE**
@@ -157,8 +156,17 @@ client-side tree-sitter highlighter).
 - **In-buffer terminals** — a PTY-backed terminal buffer (`:terminal`) with a
   vt100 emulation layer, end-to-end backpressure for runaway output, and
   scrollback, in both native clients and the web build.
-- **Quickfix & docks** — a quickfix list with `errorformat` parsing, and
-  VSCode-style permanent edge docks (`nx.dock`) with per-region tablines.
+- **Quickfix, location lists & docks** — a quickfix list with `errorformat`
+  parsing, window-local location lists (`:lopen`/`:lvimgrep`), named and
+  dynamic (function-sourced) lists with picker integration, and VSCode-style
+  permanent edge docks (`nx.dock`) with per-region tablines and spatial
+  `<C-w><C-w>` navigation.
+- **Workspaces & a remote daemon** — `nxvim --workspace <dir>` opens a directory
+  as a session that persists its tabs, windows, unnamed buffers, and
+  per-workspace option overrides (`nx.wso`) across restarts. `nxvim --daemon`
+  runs the editor as a headless server a thin client attaches to over
+  QUIC/WebTransport (local *or* remote, vscode-server style), choosing local or
+  remote config on connect.
 - **Image previews** — opening an image buffer renders the picture inline:
   ratatui-image in the terminal, a wgpu textured quad in the GUI, and an
   out-of-band `<img>` in the web build (`nx.o.imagepreview`).
@@ -176,10 +184,11 @@ If you know vim, your muscle memory transfers. Concretely, what's wired today:
 - **Text objects** — `iw aw iW aW`, quotes (`i" a"`, `i' a'`, and backtick),
   brackets (`i( a(`, `i{ a{`, `i[ a[`, `i< a<`, plus `ib`/`ab` and `iB`/`aB`),
   paragraph (`ip ap`), and sentence (`is as`).
-- **Operators** — `d c y`, paste (`p P`), reindent (`=`, `==`, `=motion`,
-  `gg=G`), comment toggle (`gc`/`gcc`, with a per-filetype `commentstring`),
-  replace (`r`), case-toggle (`~`), join (`J`), and the line shortcuts
-  (`x X D C s`). Counts and dot-repeat (`.`) work throughout.
+- **Operators** — `d c y`, paste (`p P`), shift (`>>`/`<<`, `>motion`/`<motion`,
+  `>ip`), reindent (`=`, `==`, `=motion`, `gg=G`), comment toggle (`gc`/`gcc`,
+  with a per-filetype `commentstring`), replace (`r`), case-toggle (`~`), join
+  (`J`), and the line shortcuts (`x X D C s`). Counts and dot-repeat (`.`) work
+  throughout.
 - **Visual modes** — charwise (`v`) and linewise (`V`), `o`/`O` to swap ends,
   operators and text objects over a selection. (Blockwise `<C-v>` is a
   deliberate non-goal — use [multi-cursor](#notable-additions) instead.)
@@ -198,8 +207,8 @@ If you know vim, your muscle memory transfers. Concretely, what's wired today:
 
 Not yet wired (see the [roadmap](#not-yet-implemented-roadmap)): `%` match-pair,
 the paragraph/sentence motions (`{ } ( )`), the screen motions (`H M L`), the
-`gu`/`gU`/`g~` case operators, `>>`/`<<` shift, `gq` reflow, tag objects
-(`it`/`at`), macros (`q`/`@`), and folds.
+`gu`/`gU`/`g~` case operators, `gq` reflow, tag objects (`it`/`at`), and macros
+(`q`/`@`).
 
 ---
 
@@ -263,7 +272,7 @@ nothing more.
 
 ### Runnable examples
 
-The [`examples/`](examples) directory has ~40 self-contained, end-to-end-verified
+The [`examples/`](examples) directory has ~70 self-contained, end-to-end-verified
 configs — one per feature (treesitter, LSP, floats, registers, tabs, mouse,
 statusline, completion, picker, snippets, decor, docks, quickfix, image
 previews, …). Each is a config dir you point nxvim at:
@@ -391,30 +400,20 @@ highlights:
 
 ### Not yet implemented (roadmap)
 
-- **The built-in package manager.** The `nx.*` API itself has largely **landed**
-  — the config surface plus its server-owned plugin surfaces (the `nx.complete`
-  completion engine, the `nx.picker` fuzzy finder, `nx.statusline` segments, the
-  `nx.snippet` engine, `nx.decor` viewport decorations, and the `nx.dock` tree
-  docks) are built and have runnable examples. What's still ahead on the plugin
-  axis is the **manifest loader / built-in package manager**: until it lands,
-  plugins are dropped onto the runtimepath under `pack/*/start/*` by hand. The
-  first plugins to ship through it will be nxvim's own first-party ones — a
-  which-key popup, a file-tree explorer, and friends — written against the
-  `nx.*` API and kept in a separate repo rather than baked into the binary.
-- **Folds and macros** — not built.
+- **Macros** — `q` record / `@` replay aren't built.
 - **Some motions.** `%` match-pair, the paragraph/sentence motions
   (`{` `}` `(` `)`), and the screen motions (`H` `M` `L`) aren't wired yet.
 - **More window-local options.** `wrap`, `number`/`relativenumber`,
-  `numberwidth`, `signcolumn`, `cursorline`, and the horizontal-scroll options
-  are honored; the rest (`colorcolumn`, …) are not.
+  `numberwidth`, `signcolumn`, `cursorline`, `breakindent`/`showbreak`, the
+  fold options (`foldenable`/`foldcolumn`/`foldlevel`), and the horizontal-scroll
+  options are honored; the rest (`colorcolumn`, `cursorcolumn`, …) are not.
 - **A broad options surface.** `:set` honors the search booleans, the
   number-gutter and horizontal-scroll window options, and the buffer-local
   indentation options plus `commentstring` — but the bulk of vim's hundreds of
   options are missing (writes to unsupported options are recorded but inert).
-- **The `>>` / `<<` shift operators, the `gu`/`gU`/`g~` case operators, and the
-  `:map`-family ex-commands.** Indent is reindented via `=` (`==`, `=motion`,
-  `gg=G`); case is toggled via `~`; keymaps are set via `vim.keymap.set` /
-  `nvim_set_keymap`. All intentionally postponed.
+- **The `gu`/`gU`/`g~` case operators and the `:map`-family ex-commands.** Case
+  is toggled via `~`; keymaps are set via `vim.keymap.set` / `nvim_set_keymap`.
+  Both intentionally postponed.
 - **LSP & treesitter edges** — semantic tokens and inlay hints are real but
   approximate (one group per cell, whole-document only, no range requests);
   Lua-driven treesitter indent (`indentexpr`) is deferred. Each approximation is

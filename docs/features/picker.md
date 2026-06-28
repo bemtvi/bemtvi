@@ -12,13 +12,14 @@ your own is a few lines.
 
 ## Using a picker
 
-The three built-in sources are bound out of the box:
+The three built-in sources are bound out of the box, plus a **resume** map:
 
 | Map | Source |
 | --- | --- |
 | `<leader>ff` | `files` — fuzzy file finder |
 | `<leader>fg` | `live_grep` — live grep |
 | `<leader>fb` | `buffers` — open buffers (scoped to the focused layer, like `:ls`) |
+| `<leader>fr` | `resume` — reopen the last picker where you left off |
 
 These are overridable defaults — your own map for the same key wins, and you can
 disable one by binding it to an empty function. To open any registered source
@@ -27,6 +28,21 @@ from your own keymap, call `nx.picker.open`:
 ```lua
 nx.keymap.set("n", "<leader>o", function() nx.picker.open("files") end)
 ```
+
+## Resume — `<leader>fr`
+
+`<leader>fr` (telescope's `resume`) reopens the most-recently-closed picker
+restored to **exactly** where you left off — the same displayed rows, prompt
+text, highlighted row, and multi-select marks. The server replays a frozen
+snapshot it captured at close, so a `live_grep` picker comes back with its
+*actual* previous results rather than a fresh, differently-ordered search;
+editing the query from there re-runs the source as usual. It's a no-op (with a
+gentle notice) before any picker has closed. Call it from your own map with
+`nx.picker.resume()`.
+
+Transient internal pickers (the command-line completion overlay, for instance)
+opt out by setting `resumable = false` on their source, so resume always points
+at the last *real* picker.
 
 In the open picker (all of these are rebindable — see [Keys](#keys)):
 

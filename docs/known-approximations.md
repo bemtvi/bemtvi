@@ -1,57 +1,44 @@
 # Known approximations & missing features
 
-A curated registry of where nxvim's `vim.*` / editor surface **diverges from
-neovim** — both *silent approximations* (it does something plausible, but not
-fully faithfully) and *loud gaps* (it refuses to fake it and raises `not
-implemented`). The scope is what we have **actually bumped into** running real
-configs and plugins, plus the whole subsystems we know are still absent.
+nxvim tracks vim/neovim's **observable editing behavior**, but it is a fresh
+Rust implementation, not a port — so some surfaces are only *approximate*, and
+some subsystems simply aren't built yet. This page maps where nxvim **diverges
+from neovim**, so a config or plugin you bring over holds no surprises.
 
-This file is for planning a sweep. The authoritative, per-function detail lives
-**in the code**, next to each call site — this doc points you at it and records
-only what has *no* call site to tag.
+Two principles shape what follows:
 
-## Two kinds of divergence, and where each is tracked
+- **No silent stubs.** Anything unimplemented **fails loud** — it raises
+  `nxvim: not implemented: <name>` rather than quietly returning a fake value, so
+  a half-working feature never masquerades as a whole one. You find out at
+  runtime exactly what tripped, instead of chasing mysterious wrong behavior.
+- **Honest approximations.** Where nxvim does something plausible but not fully
+  faithful, that is flagged in the source right beside the code, and the larger
+  ones are listed below.
 
-1. **Silent approximation** — returns/does something that looks right but isn't
-   fully faithful (the dangerous kind: it makes a half-working feature look
-   whole). Tagged in code with a greppable `INCOMPLETE:` comment directly above
-   the call site, stating what's wrong and what a faithful implementation needs.
+## Seeing what your own config hits
 
-2. **Loud gap** — not implemented, and it says so: raises
-   `nxvim: not implemented: <name>` through `nx._notimpl(name)` rather than
-   returning a fake value. Self-documenting at the call site (the name is in the
-   raise) and at runtime (see below). This is the project's no-silent-stubs rule
-   (`CLAUDE.md`, and `docs/plans/2026-06-05-lsp-completion.md` Phase 0).
+Every loud gap a running config trips is collected in `nx._notimpl_hits`, so you
+can see precisely which gaps *you* actually hit — not just which ones exist:
 
-The per-function list is **generated from the code, not maintained here**:
-
-```sh
-# Silent approximations — each with its "why" and the fix, inline:
-grep -rn 'INCOMPLETE:' crates/
-
-# Loud "not implemented" gaps — the call sites:
-grep -rn 'vim\._notimpl(' crates/nxvim-lua/src/prelude/
+```lua
+:lua print(vim.inspect(nx._notimpl_hits))
 ```
 
-At runtime, every loud gap a real config trips is recorded in the global
-`nx._notimpl_hits` set (populated by `nx._notimpl` wherever it fires —
-`vim.fn`, the LSP layer, …), so you can see exactly which gaps *a given
-config* hit, not just which exist: inspect it directly
-(`:lua print(vim.inspect(nx._notimpl_hits))`), or via the future `:checkhealth`.
-The runtime scoreboard `nx._report()` also surfaces it as its `notimpl_hits`
-field, alongside the LSP-specific status.
+The precise, always-current per-function detail lives **in the code**: greppable
+`INCOMPLETE:` comments mark the silent approximations (each with its "why" and
+the fix), and `nx._notimpl` raises mark the loud gaps. The sections below cover
+the larger divergences and the whole subsystems that have no single line to point
+at. If this page and the code ever disagree, **the code is right** — treat this
+as a guide, not the registry.
 
-When you implement one: delete its `INCOMPLETE:` tag (or its `nx._notimpl`
-raise). If it's one of the subsystems below, update this file too.
+## Missing or partial subsystems
 
-## Missing features not yet in code
-
-These have **no single call site to tag** because the subsystem itself is
-absent — a config touching them hits a nil index or a generic error, not a named
-gap. Recorded here so the sweep doesn't lose them. Subsystems that are now
-**fully built** (the treesitter platform — `start`/`stop`, customized/on-disk
-queries, injections, incremental `on_bytes` updates; `:TSInstall` fetch/compile)
-are no longer listed here — only the edges that still diverge are.
+These are whole areas where the subsystem itself is absent or only partly built,
+so a config that leans on one meets a nil value or a generic error rather than a
+named gap — worth knowing up front. (Subsystems that are now **fully built** — the
+tree-sitter platform with `start`/`stop`, on-disk and customized queries,
+injections, incremental updates, and `:TSInstall` fetch/compile — aren't listed;
+only the edges that still diverge are.)
 
 - **Treesitter — two edges remain.** The `vim.treesitter` platform is built (see
   the [platform design](specs/2026-06-07-vim-treesitter-lua-platform.md) and
@@ -83,18 +70,28 @@ are no longer listed here — only the edges that still diverge are.
   `nx` API (`nx.run` / `nx.timer` / `nx.fs`); the synchronous host info the
   LSP-config paths need is read through `vim.fn` (`executable` / `exepath` /
   `glob` / `filereadable` / `resolve` / …) instead.
-- **Broad options surface.** `:set` honors the search/number booleans plus the
-  buffer-local indentation options `tabstop` / `shiftwidth` / `softtabstop` /
-  `expandtab` and `commentstring` (also via `:setlocal`, `vim.bo`, and
-  `nvim_{set,get}_option_value`).
-  nxvim breaks with vim's defaults here: `tabstop` defaults to **4**, with
-  `shiftwidth=0` ("follow tabstop") and `softtabstop=-1` ("follow shiftwidth") so
-  the one `tabstop` knob drives the whole indent width. `tabstop`, `softtabstop`,
-  and `expandtab` drive rendering and `<Tab>`; `shiftwidth` only feeds the LSP
-  indent width until the `>>`/`<<` operators land. `commentstring` backs the
-  `gc`/`gcc` comment operator and defaults from the filetype (the ~20 most common
-  languages) when unset. The rest of vim's hundreds of
-  options are still missing, as are **folds** and **macros**.
+- **Broad options surface.** The set of honored options has grown well past the
+  indentation knobs (the authoritative list is `crates/nxvim-core/src/options.rs`).
+  `:set` (and `:setlocal` / `vim.bo` / `nvim_{set,get}_option_value`) honors: the
+  **search** booleans (`ignorecase` / `smartcase` / `wrapscan` / `hlsearch` /
+  `incsearch`); the **window-local rendering** options (`number` /
+  `relativenumber` / `cursorline` / `numberwidth` / `signcolumn` / `wrap` /
+  `breakindent` / `showbreak` / `sidescroll` / `sidescrolloff` / `winhighlight` /
+  `fillchars`); the **fold** options (`foldmethod` / `foldenable` / `foldcolumn` /
+  `foldlevel`); the **buffer-local indentation** options (`tabstop` / `shiftwidth`
+  / `softtabstop` / `expandtab` / `commentstring`); and a set of **nxvim-native**
+  options (`scrollanim` / `scrollanimduration`, `qfdock`, `imagepreview`,
+  `workspacecwd`, `history` / `persisthistory`, `regexsyntax`, `switchbuf`,
+  `laststatus` / `showtabline`, …).
+  nxvim breaks with vim's defaults on indentation: `tabstop` defaults to **4**,
+  with `shiftwidth=0` ("follow tabstop") and `softtabstop=-1` ("follow
+  shiftwidth") so the one `tabstop` knob drives the whole indent width.
+  `tabstop`, `softtabstop`, and `expandtab` drive rendering and `<Tab>`;
+  `shiftwidth` drives the `>>`/`<<` shift operators and the LSP indent width.
+  `commentstring` backs the `gc`/`gcc` comment operator and defaults from the
+  filetype (the ~20 most common languages) when unset. Still, the **bulk** of
+  vim's hundreds of options are missing — a write to an unmodeled option is
+  recorded but inert — as are **macros**.
 - **Legacy Vimscript (`eval.c`).** Deliberately **not** on the roadmap (guiding
   principle 2). `vim.fn.*` is a hand-written set of helper aliases, not an
   interpreter — unimplemented `vim.fn.*` entries are loud gaps, not a TODO to
@@ -115,13 +112,13 @@ are no longer listed here — only the edges that still diverge are.
   buffer; no per-client granularity (one cache per buffer); repaints mid-insert
   (`update_in_insert` always on). See `docs/plans/2026-06-08-lsp-semantic-tokens.md`.
 - **LSP inlay hints approximations.** Painted inline, opt-in
-  (`crates/nxvim-server/src/lsp/inlay.rs`): **string labels only** (per-part
-  `location`/`tooltip`/`textEdits` need `inlayHint/resolve`, Phase 2); **one
-  `LspInlayHint` group** for all kinds (no Type/Parameter split); **whole
-  document, no `range`** (Phase 2); **per-buffer enable only** (no per-client
-  granularity; `vim.lsp.inlay_hint.get` is Phase 2); horizontal-scroll
-  (`leftcol>0`) + inline hints is best-effort; repaints mid-insert. See
-  `docs/plans/2026-06-08-lsp-inlay-hints.md`.
+  (`crates/nxvim-server/src/lsp/inlay.rs`). `inlayHint/resolve` (lazy per-hint
+  label fill) and `vim.lsp.inlay_hint.get` (with a line-range filter) have landed.
+  What still diverges: **one `LspInlayHint` group** for all kinds (no
+  Type/Parameter split); the fetch is **whole-document** — the viewport-scoped
+  `range` request is deferred; **per-buffer enable only** (no per-client
+  granularity); horizontal-scroll (`leftcol>0`) + inline hints is best-effort;
+  repaints mid-insert. See `docs/plans/2026-06-08-lsp-inlay-hints.md`.
 - **Synchronous prompts — one caveat.** `vim.fn.input`/`confirm` return inline
   via a pumped coroutine (`nx._pump`), but only *pumped* entry points (`:lua`
   chunk, keymap, user command) can prompt — Lua sourced at startup or off a bare
@@ -153,23 +150,14 @@ are no longer listed here — only the edges that still diverge are.
   `filename` / `filepath` / `filetype` / `encoding` / `location` / `modified` /
   `readonly` / `diagnostics`.
 
-## Cross-cutting root causes
+## Shared limitations
 
-Many individual approximations share one root cause — fix the root and a batch
-clears at once. (Run the `grep` above for the current, exact call-site list.)
+A handful of the approximations above trace back to the same underlying
+limitation, so they tend to surface together. The notable ones:
 
-| Root cause | Approximations it clears |
+| Limitation | What it affects |
 |---|---|
 | LSP helpers not window-arg-aware (always use the current window) | `make_position_params(window)` is now window-aware (reads the passed window's buffer + cursor), and `open_floating_preview` returns real float handles (a `relative="cursor"` float over a scratch buffer, auto-closing on cursor move). **Remaining:** the completion-doc preview box is still a single bespoke box with no separate preview-window handle / `completeopt` matrix (the completion menu is server-owned chrome, not a window). Note: splits, floats, and tab pages themselves are implemented — see architecture.md *Windows*. |
 | No multi-buffer name/disk registry | `make_text_document_params` (non-current bufnr → empty URI), `locations_to_items` & `apply_workspace_edit` for unopened files |
 | Core honors a fixed set of buffer-local options | `vim.bo` / `nvim_set_option_value` writes other than `filetype` / `tabstop` / `shiftwidth` / `softtabstop` / `expandtab` / `commentstring` / `regexsyntax` / `fileencoding` / `bomb` are recorded but inert |
 | Diagnostic-display surfaces are approximations, not gaps — all four ship. `underline`, `virtual_text` (inline end-of-line message), `signs` (gutter glyph), and the on-demand float (`vim.diagnostic.open_float`) are implemented — see `docs/plans/2026-06-08-diagnostic-display-surfaces.md`. | `vim.diagnostic.config` keys other than `underline` / `virtual_text` / `signs` (`virtual_lines`, `severity_sort`, and the `config.float` pre-style defaults). `open_float` ignores its `opts` (scope/severity filters, `format`/`header`/`prefix`/`border`) — the default cursor-line scope shows, in the bottom panel (plain lines, like hover) not a cursor-anchored bordered popup. The `virtual_text` table honors `prefix` and the `signs` table its `text` glyph map; their `format` / `severity` filters and sign `priority`/`culhl` are not applied, the line's most-severe diagnostic wins the one inline slot / sign cell, and the sign column is client-side only (a fixed 2 cells not subtracted from `nxvim-core`'s text width, so a full-width line under `nowrap` can clip its last two cells). |
-
-## Relationship to the LSP completion plan
-
-[`docs/plans/2026-06-05-lsp-completion.md`](plans/2026-06-05-lsp-completion.md) is the **phased route**
-that drove the LSP surface from "every hollow stub raises" (Phase 0) to today;
-each phase notes the approximations it deliberately left behind. That document is
-*history + plan*, not a live registry. The live registry is the `INCOMPLETE:` /
-`nx._notimpl` tags in code (and this file's missing-features list above). If the
-two ever disagree, the code wins.

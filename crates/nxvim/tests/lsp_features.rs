@@ -1036,7 +1036,9 @@ async fn code_action_lists_then_applies_the_chosen_action() {
     }
     assert!(listed, "the code action should appear in the select menu");
 
-    // Confirming the action applies its edit.
+    // The chooser opens noselect (an explicit pick is required, like the completion
+    // popup), so highlight the row first, then confirm applies its edit.
+    feed(&rpc, "<C-n>");
     feed(&rpc, "<CR>");
     let mut applied = false;
     for _ in 0..40 {

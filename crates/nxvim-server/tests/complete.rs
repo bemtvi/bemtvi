@@ -315,18 +315,14 @@ async fn an_unknown_source_fails_loud() {
     );
 }
 
-/// With `<CR>` mapped as a confirm key, an *unnavigated* popup must NOT eat the
-/// Enter — nothing is selected yet, so `<CR>` inserts a newline (cmp-style
-/// `select = false`). You only accept after explicitly moving the selection.
+/// `<CR>` is a **default** confirm key (alongside `<C-y>`), but an *unnavigated*
+/// popup must NOT eat the Enter — nothing is selected yet, so `<CR>` inserts a
+/// newline (cmp-style `select = false`). You only accept after moving the
+/// selection. No `keys` override here: this guards the built-in default.
 #[tokio::test]
 async fn cr_inserts_a_newline_until_you_navigate() {
     let dir = temp_dir("complete_cr_noselect");
-    let (rpc, mut incoming) = start(
-        &dir,
-        "nx.complete.setup { sources = { { 'buffer', min_chars = 2 } }, \
-         keys = { confirm = { '<C-y>', '<CR>' } } }",
-    )
-    .await;
+    let (rpc, mut incoming) = start(&dir, BUFFER_INIT).await;
 
     // Popup opens, but nothing is selected yet.
     feed(&rpc, "ihello he");
@@ -343,15 +339,13 @@ async fn cr_inserts_a_newline_until_you_navigate() {
     assert_eq!(lines(&rpc).await, vec!["hello he", ""]);
 }
 
+/// The complement: `<CR>` (a default confirm key) accepts the highlighted row once
+/// a navigation has activated the selection. No `keys` override — the built-in
+/// default.
 #[tokio::test]
 async fn cr_accepts_once_you_have_navigated() {
     let dir = temp_dir("complete_cr_navigated");
-    let (rpc, mut incoming) = start(
-        &dir,
-        "nx.complete.setup { sources = { { 'buffer', min_chars = 2 } }, \
-         keys = { confirm = { '<C-y>', '<CR>' } } }",
-    )
-    .await;
+    let (rpc, mut incoming) = start(&dir, BUFFER_INIT).await;
 
     feed(&rpc, "ihello he");
     poll_menu(&rpc, &mut incoming).await.expect("popup opens");

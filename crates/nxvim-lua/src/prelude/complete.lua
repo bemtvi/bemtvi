@@ -55,7 +55,9 @@ local function key_list(spec, action)
 end
 
 -- nx.complete.setup { sources = { { "buffer", min_chars = 3 } }, auto = true,
---   keys = { next = "<C-n>", prev = "<C-p>", confirm = "<C-y>", abort = "<C-e>" } }
+--   keys = { next = "<C-n>", prev = "<C-p>", confirm = { "<C-y>", "<CR>" }, abort = "<C-e>" } }
+-- (`confirm` accepts the highlighted row; `<CR>` only accepts once you've navigated
+--  to one — an unnavigated popup is noselect, so Enter still inserts a newline.)
 -- Enables the engine. `sources` is a list of `{ name, opts... }` entries — a
 -- built-in (`buffer` / `lsp` / `snippets`) or a registered plugin source.
 -- `min_chars` (from a source, or the top level) gates the prefix length before the

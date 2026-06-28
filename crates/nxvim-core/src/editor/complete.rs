@@ -54,10 +54,13 @@ impl Default for CompleteKeys {
                 Key::new(KeyCode::Down),
             ],
             prev: vec![Key::ctrl('p'), shift_tab, Key::new(KeyCode::Up)],
-            // `<CR>` is deliberately *not* a default confirm key: with the menu
-            // auto-open, binding accept to `<CR>` would swallow newlines. Vim's
-            // `<C-y>` is the accept key; a user who wants `<CR>` sets it explicitly.
-            confirm: vec![Key::ctrl('y')],
+            // `<C-y>` (vim's accept) and `<CR>` both accept the **highlighted** row.
+            // `<CR>` is safe as a default because the popup opens *noselect*: with
+            // nothing highlighted (a just-auto-opened popup) `complete_accept` resolves
+            // nothing and the key falls through to a newline (see `insert.rs`'s Confirm
+            // arm). It only accepts once you've navigated to a row — so Enter picks the
+            // highlighted completion without swallowing newlines you meant to type.
+            confirm: vec![Key::ctrl('y'), Key::new(KeyCode::Enter)],
             abort: vec![Key::ctrl('e')],
         }
     }

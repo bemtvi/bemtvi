@@ -41,15 +41,18 @@ In the open picker (all of these are rebindable — see [Keys](#keys)):
 | `<C-v>` | Confirm in a **vertical split** |
 | `<Esc>` | Cancel |
 | `<Tab>` / `<S-Tab>` | Multi-select — mark/unmark this row and advance (see [Sending results to a list](#sending-results-to-a-list)) |
-| `<C-q>` | Send the results (marked, else all filtered) to a location list |
+| `<C-q>` | Send the results (marked, else all filtered) to a named list `<picker>:<query>` |
 | `<C-d>` / `<C-u>` | Scroll the preview pane half-page down / up |
 | `<C-f>` / `<C-b>` | Scroll the preview pane a page down / up |
 
 ## Sending results to a list
 
-`<C-q>` sends the picker's **current results** to a location list — nxvim's take
-on telescope's send-to-loclist, and a fast way to turn a search into a working
-set you can step through with `:lnext` / `:lprev` (or `<CR>` in the list).
+`<C-q>` sends the picker's **current results** to a **named list** keyed
+`<picker>:<query>` — nxvim's take on telescope's send-to-loclist, and a fast way to
+turn a search into a working set you step through with `<CR>` in the list. Each
+distinct search is its own persistent dock tab (re-running the same search updates it
+in place); a named list never collides with the quickfix and survives closing the
+window you sent it from. See [named lists](quickfix-dock-lists.md).
 
 - **Filtered, not everything.** It sends the rows matching your live query — what
   you see — not every candidate the source streamed.
@@ -61,9 +64,9 @@ set you can step through with `:lnext` / `:lprev` (or `<CR>` in the list).
 Where the list opens is governed by the `'qfdock'` option (**on by default**, the
 nxvim way): each send opens as a **tab in the bottom dock**, so several searches
 sit side by side, and `<CR>` on an entry jumps into the main editing area. Set
-`:set noqfdock` for the classic vim/telescope behavior (a bottom split, replaced
-in place). See [Quickfix & location-list dock tabs](quickfix-dock-lists.md) for
-the full model and the `nx.qf.{send,add}_to_{loc,qf}list` API the action builds on.
+`:set noqfdock` for a bottom split instead. See [Quickfix & named dock
+lists](quickfix-dock-lists.md) for the full model and the `nx.qf.list` / `show` API
+the action builds on.
 
 ## Writing a source
 
@@ -216,7 +219,7 @@ nx.keymap.set("picker", "<Tab>", nx.picker.actions.confirm)
 nx.keymap.set("picker", "<C-n>", function() end)
 ```
 
-The actions are `next`, `prev`, `confirm`, `cancel`, `send_to_loclist`,
+The actions are `next`, `prev`, `confirm`, `cancel`, `send_to_list`,
 `toggle_select`, `clear_select`, `preview_half_down`, `preview_half_up`,
 `preview_page_down`, `preview_page_up`, `backspace`, `delete`, `left`, `right`,
 `to_start`, `to_end`. The one key that is *not* a map is an

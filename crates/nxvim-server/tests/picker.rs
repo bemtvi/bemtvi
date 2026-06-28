@@ -395,13 +395,32 @@ async fn clicking_a_picker_row_in_a_split_hits_via_editor_absolute_geometry() {
     );
 }
 
-/// Phase 4: `<C-q>` sends the picker's **current (filtered)** results to a location
-/// list — the nxvim port of telescope's send-to-loclist. With `'qfdock'` on (the
-/// default), the list opens as a bottom-dock tab and `<CR>` on an entry jumps into
-/// the main layer. Only the rows matching the live query are sent, not every
-/// candidate.
+/// Poll the focused window's non-empty rendered rows until there are `want` of them
+/// — a picker `<C-q>` send schedules its named-list dock tab open a couple ticks
+/// later (and focuses it), so its rendered rows appear there.
+async fn poll_sent_rows(rpc: &Rpc, want: usize) -> Vec<String> {
+    let mut rows = Vec::new();
+    for _ in 0..200 {
+        rows = lines(rpc)
+            .await
+            .into_iter()
+            .filter(|l| !l.is_empty())
+            .collect();
+        if rows.len() == want {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    rows
+}
+
+/// Phase 4: `<C-q>` sends the picker's **current (filtered)** results to a
+/// window-independent **named list** keyed `<picker>:<query>` (so each distinct
+/// search is its own persistent dock tab). With `'qfdock'` on (the default), it opens
+/// as a bottom-dock tab and `<CR>` on an entry jumps into the main layer. Only the
+/// rows matching the live query are sent, not every candidate.
 #[tokio::test]
-async fn ctrl_q_sends_filtered_results_to_a_dock_loclist() {
+async fn ctrl_q_sends_filtered_results_to_a_named_dock_list() {
     let dir = temp_dir("picker_send_loclist");
     let a = dir.join("a.txt");
     let b = dir.join("b.txt");
@@ -431,23 +450,14 @@ nx.picker.source {{
     let menu = menu_of(&poll_menu(&rpc, &mut incoming).await.expect("filtered menu"));
     assert_eq!(menu_items(&menu), vec!["foo one", "foo two"]);
 
-    // <C-q>: send only those filtered rows to a location list.
+    // <C-q>: send only those filtered rows to the named list `locs:foo`, which opens
+    // as its own dock tab (focused). Its rendered rows are the two filtered entries
+    // (not "bar three"); each renders as `file|row col col| text`.
     feed(&rpc, "<C-q>");
-    nxvim_test_harness::barrier(&rpc).await;
-
-    // Only the two filtered entries landed (not "bar three").
-    let summary = exec_lua(
-        &rpc,
-        r#"local l = vim.fn.getloclist(0)
-           local t = {}
-           for _, e in ipairs(l) do t[#t + 1] = e.text end
-           return string.format("%d|%s", #l, table.concat(t, ","))"#,
-    )
-    .await;
-    assert_eq!(
-        summary.as_str(),
-        Some("2|foo one,foo two"),
-        "only the filtered results were sent"
+    let rows = poll_sent_rows(&rpc, 2).await;
+    assert!(
+        rows.len() == 2 && rows[0].ends_with("| foo one") && rows[1].ends_with("| foo two"),
+        "only the filtered results were sent, got {rows:?}"
     );
 
     // It opened as a bottom-dock tab (the default nxvim way).
@@ -469,13 +479,13 @@ nx.picker.source {{
     assert_eq!(cursor(&rpc).await.0, 1, "landed on the entry's line");
 }
 
-/// The shipped `examples/picker-to-loclist` config loads end-to-end (so it can't
+/// The shipped `examples/picker-to-named-list` config loads end-to-end (so it can't
 /// rot): sourcing its `init.lua` registers the custom source, the `nx.qf.send_*`
 /// API is present, and `'qfdock'` reads on by default.
 #[tokio::test]
-async fn example_picker_to_loclist_config_loads() {
-    let root =
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/picker-to-loclist");
+async fn example_picker_to_named_list_config_loads() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../examples/picker-to-named-list");
     let init = ServerInit {
         config_dir: Some(root.clone()),
         runtimepath: vec![root],
@@ -526,7 +536,7 @@ async fn example_ui_picker_config_loads() {
 
 /// Phase 5: `<Tab>` multi-selects picker rows (marking them and advancing), the
 /// marks project into the `menu` redraw, and `<C-q>` then sends **only the marked**
-/// rows to the location list (telescope's send-selected). The marks survive even if
+/// rows to the named list (telescope's send-selected). The marks survive even if
 /// the cursor is elsewhere.
 #[tokio::test]
 async fn tab_marks_rows_and_ctrl_q_sends_only_the_marked() {
@@ -564,21 +574,12 @@ nx.picker.source {{
         "alpha and beta are marked, gamma is not"
     );
 
-    // <C-q> sends only the marked rows (not gamma).
+    // <C-q> sends only the marked rows (not gamma) to the named list, in mark order.
     feed(&rpc, "<C-q>");
-    nxvim_test_harness::barrier(&rpc).await;
-    let summary = exec_lua(
-        &rpc,
-        r#"local l = vim.fn.getloclist(0)
-           local t = {}
-           for _, e in ipairs(l) do t[#t + 1] = e.text end
-           return string.format("%d|%s", #l, table.concat(t, ","))"#,
-    )
-    .await;
-    assert_eq!(
-        summary.as_str(),
-        Some("2|alpha,beta"),
-        "only the marked rows were sent, in mark order"
+    let rows = poll_sent_rows(&rpc, 2).await;
+    assert!(
+        rows.len() == 2 && rows[0].ends_with("| alpha") && rows[1].ends_with("| beta"),
+        "only the marked rows were sent, in mark order, got {rows:?}"
     );
 }
 

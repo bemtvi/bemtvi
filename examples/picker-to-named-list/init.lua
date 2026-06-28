@@ -1,9 +1,9 @@
--- ~~~ nxvim: send search results to quickfix / location-list dock tabs ~~~
+-- ~~~ nxvim: send search results to named-list / quickfix dock tabs ~~~
 --
 -- Run it (from the repo root) against the sample buffer:
 --
---     NXVIM_CONFIG=examples/picker-to-loclist \
---       cargo run -p nxvim -- examples/picker-to-loclist/sample.txt
+--     NXVIM_CONFIG=examples/picker-to-named-list \
+--       cargo run -p nxvim -- examples/picker-to-named-list/sample.txt
 --
 -- nxvim's port of telescope's "send results to a loclist" — made better: by
 -- default each send opens as its own TAB in the BOTTOM DOCK, so you can save
@@ -27,14 +27,16 @@ nx.keymap.set("n", "<leader>qd", function()
 end, { desc = "Toggle quickfix dock tabs vs split" })
 
 --------------------------------------------------------------------------------
--- 2. From a picker: <C-q> sends results to a location list; <Tab> multi-selects.
+-- 2. From a picker: <C-q> sends results to a NAMED LIST; <Tab> multi-selects.
 --    The shipped sources work out of the box; here are the leader maps.
 --      \ff  files      \fg  live_grep      \fb  buffers
 --    In the open picker:
 --      <Tab>   mark / unmark this row (and advance) — multi-select
---      <C-q>   send results to a loclist: the MARKED rows if any, else all
---              the rows currently matching your query (not every candidate)
---    With 'qfdock' on, each <C-q> opens the results as a new bottom-dock tab.
+--      <C-q>   send results to the named list `<picker>:<query>`: the MARKED rows
+--              if any, else all the rows currently matching your query (not every
+--              candidate). Each distinct search is its own persistent dock tab
+--              (re-running the same search updates it in place); it never collides
+--              with the quickfix and survives closing the window you sent it from.
 --------------------------------------------------------------------------------
 nx.keymap.set("n", "<leader>ff", function()
   nx.picker.open("files")
@@ -48,7 +50,7 @@ end, { desc = "Buffers" })
 
 -- A custom source over the example files, so <C-q> has something to send even
 -- without `rg` installed. Each item carries a file `path` + 1-based `row` so the
--- loclist entries are jumpable.
+-- named-list entries are jumpable.
 nx.picker.source({
   name = "marks",
   preview = "location",

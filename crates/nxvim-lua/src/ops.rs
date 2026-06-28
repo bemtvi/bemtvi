@@ -823,6 +823,27 @@ pub struct QfSetOp {
     /// (`None` = quickfix, `Some` = location) picks the kind. `false` for every other
     /// `setqflist`/`setloclist`/`:make` path.
     pub send: bool,
+    /// Target a window-independent **named list** instead of the quickfix /
+    /// location list: `Some(name)` interns the name to its `NamedListId` and writes
+    /// that list (the `nx.qf.list(name, …)` path). Takes precedence over `loclist_win`
+    /// when set; `None` (the common case) leaves the quickfix / loclist routing
+    /// untouched.
+    pub named: Option<String>,
+}
+
+/// A lifecycle op on a window-independent **named list**, drained by the server
+/// after the chunk — the `nx.qf.show` / `nx.qf.drop` half of the named-list surface,
+/// separate from the item-write [`QfSetOp`] so a show always runs *after* the
+/// refresh that precedes it (the server drains [`QfSetOp`]s first), with no
+/// `set_current` + `on_next_tick` dance.
+#[derive(Clone, Debug)]
+pub enum NamedListOp {
+    /// `nx.qf.show(name)` — open or focus the named list's bottom-dock tab
+    /// (`Editor::named_list_show`).
+    Show(String),
+    /// `nx.qf.drop(name)` — forget the core named list: close its tab and remove its
+    /// registry entry (`Editor::named_list_drop`).
+    Drop(String),
 }
 
 /// A treesitter bridge request queued by `vim.treesitter.start` / `stop`, the

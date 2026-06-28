@@ -104,7 +104,9 @@ pub use self::windows::{
 };
 pub(crate) use self::windows::{PendingScroll, TabLabel, WindowLayout, WindowTree};
 // Search vocabulary shared by the command line, the parser, and the View.
-pub use self::quickfix::{LocListEntry, QfAction, QfEntry, QfList, QfStack, QfWhich};
+pub use self::quickfix::{
+    LocListEntry, NamedList, NamedListId, QfAction, QfEntry, QfList, QfStack, QfWhich,
+};
 pub(crate) use self::search::{SearchDir, SearchOffset};
 pub(crate) use self::syntax::fill_indent;
 
@@ -867,13 +869,14 @@ pub struct Editor {
     /// the picker reads it (`nx.ui.select` ignores it). See [`menu::PickerOpenMode`].
     pub picker_confirm_mode: menu::PickerOpenMode,
     /// "Send the picker's current (filtered) results somewhere" outcomes: each entry
-    /// is the matched item keys in display order, pushed by the `send_to_loclist`
-    /// picker action (which also closes the picker). Drained by the server, which
-    /// hands the keys to Lua to build a list — the bulk-result sibling of the
-    /// single-key [`Editor::menu_results`]. Backs the picker's quickfix-style sink.
-    pub picker_sends: Vec<Vec<usize>>,
+    /// is `(matched item keys in display order, the live query)`, pushed by the
+    /// `send_to_list` picker action (which also closes the picker). Drained by the
+    /// server, which hands them to Lua to build a list — the bulk-result sibling of the
+    /// single-key [`Editor::menu_results`]. Backs the picker's quickfix-style sink; the
+    /// query names the per-search list (`<picker>:<query>`).
+    pub picker_sends: Vec<(Vec<usize>, String)>,
     /// A frozen window of the most-recently-closed **resumable** picker, captured by
-    /// the `confirm`/`cancel`/`send_to_loclist` actions just before it closes (the
+    /// the `confirm`/`cancel`/`send_to_list` actions just before it closes (the
     /// live menu is gone by the time the server drains the outcome). Replayed verbatim
     /// by `nx.picker.resume()` (`<leader>fr`) — a live-grep order isn't stable across
     /// runs, so resume can't re-run the source. Bounded to [`menu::RESUME_WINDOW`]
@@ -1032,6 +1035,19 @@ pub struct Editor {
     /// marks it read-only (`is_quickfix_buffer`) and re-rendered on list change. A
     /// window shows the quickfix list iff its buffer is this id.
     qf_bufnr: Option<BufferId>,
+    /// The **named-list registry**: window-independent quickfix-flavored lists keyed
+    /// by a stable [`NamedListId`]. Each [`NamedList`] owns its own list-stack and
+    /// (lazily) its bottom-dock display buffer; storage here (not on a window) is what
+    /// lets it survive every window close, unlike a per-window location list. Names
+    /// are interned to ids through [`Editor::named_list_id`] so [`QfWhich`] stays
+    /// `Copy`. Not persisted. See [`quickfix`](crate::editor::quickfix).
+    named_lists: std::collections::HashMap<NamedListId, NamedList>,
+    /// Name → id index for the named-list registry, plus the id allocator
+    /// ([`Editor::next_named_id`]). Interning a new name allocates the next id and
+    /// inserts an empty [`NamedList`] into [`Editor::named_lists`].
+    named_by_name: std::collections::HashMap<String, NamedListId>,
+    /// The next [`NamedListId`] to hand out (monotonic; ids are never reused).
+    next_named_id: u32,
     /// The **named-panel registry**: each distinct panel name (`[Messages]`,
     /// `[Registers]`, `[Buffers]`, `[Marks]`, … and any `nx.panel.open{ name }`) → the one
     /// `nomodifiable` display buffer reused for it. Insertion-ordered for a stable
@@ -1648,6 +1664,9 @@ impl Editor {
             workspace_options: crate::options::WorkspaceOptions::new(),
             qf: QfStack::default(),
             qf_bufnr: None,
+            named_lists: std::collections::HashMap::new(),
+            named_by_name: std::collections::HashMap::new(),
+            next_named_id: 1,
             panel_buffers: Vec::new(),
             doc_float_buffers: Vec::new(),
             doc_float_wins: Vec::new(),

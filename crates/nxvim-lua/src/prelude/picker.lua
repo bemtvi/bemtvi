@@ -52,7 +52,7 @@ for _, name in ipairs({
   "right",
   "to_start",
   "to_end",
-  "send_to_loclist",
+  "send_to_list",
   "toggle_select",
   "clear_select",
 }) do
@@ -85,7 +85,7 @@ for _, m in ipairs({
   { "<Right>", "right", "Cursor right" },
   { "<Home>", "to_start", "Cursor to start" },
   { "<End>", "to_end", "Cursor to end" },
-  { "<C-q>", "send_to_loclist", "Send results to a location list" },
+  { "<C-q>", "send_to_list", "Send results to a named list" },
   { "<Tab>", "toggle_select", "Toggle multi-select on this row" },
   { "<S-Tab>", "toggle_select", "Toggle multi-select on this row" },
 }) do
@@ -544,14 +544,16 @@ local function picker_item_to_qf(item)
   }
 end
 
--- nx._picker_send(keys): the "send results to a list" outcome (the `send_to_loclist`
--- picker action / default `<C-q>`). `keys` are the matched item keys in display
--- order — the *filtered* result set the server captured before closing the picker.
--- Map them back to their source item tables, keep the ones with a target file, and
--- hand them to `nx.qf.send_to_loclist` (which honors `'qfdock'`: a new bottom-dock
--- tab, or a current-window loclist + split). Deferred with `nx.schedule` so the
--- picker float has closed and focus is back in the main layer before the list opens.
-function nx._picker_send(keys, resume_keys)
+-- nx._picker_send(keys, resume_keys, query): the "send results to a list" outcome
+-- (the picker's `<C-q>`). `keys` are the matched item keys in display order — the
+-- *filtered* result set the server captured before closing the picker; `query` is the
+-- live prompt text. Map the keys back to their source item tables, keep the ones with
+-- a target file, and stash them in a **named list** keyed `<picker>:<query>` — so each
+-- distinct search is its own persistent dock tab (re-running the same search updates
+-- it in place), independent of the global quickfix and of any window. Deferred with
+-- `nx.schedule` so the picker float has closed and focus is back in the main layer
+-- before the tab opens.
+function nx._picker_send(keys, resume_keys, query)
   local p = nx._picker
   nx._picker = nil
   -- Keep the resume slot current even when the picker closed via a send.
@@ -567,9 +569,11 @@ function nx._picker_send(keys, resume_keys)
       items[#items + 1] = picker_item_to_qf(it)
     end
   end
-  local title = (p.source and p.source.name) and ("Picker: " .. p.source.name) or "Picker results"
+  local picker_name = (p.source and p.source.name) or "picker"
+  local name = picker_name .. ":" .. (query or "")
   nx.schedule(function()
-    nx.qf.send_to_loclist(items, { title = title })
+    nx.qf.list(name, items, { title = name })
+    nx.qf.show(name)
   end)
 end
 

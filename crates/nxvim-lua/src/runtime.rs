@@ -19,10 +19,10 @@ use crate::install::{install_runtime_api, install_vim};
 use crate::ops::{
     BufOp, CallbackArgs, CompletePush, CompleteSetupReq, ConfirmReq, DecorPublish, DiagnosticData,
     DockOp, ExtmarkOp, FeedKeysOp, FsValue, GlobalOptionOp, HlSet, InlayHintMirrorData, LayerOp,
-    LoopOp, LspClientData, LspOp, PanelOp, PickerOpenReq, PickerPush, QfSetOp, RawKeymap, RawRhs,
-    RegisterSetOp, SemanticTokenData, SnippetAddReq, SnippetSetupReq, StatuslinePublishReq,
-    StatuslineSetupReq, TabOp, TerminalOpenReq, TsOp, UiFloatReq, UiInputReq, UiSelectReq, ViewOp,
-    WindowOp, WorkspaceOptionOp,
+    LoopOp, LspClientData, LspOp, NamedListOp, PanelOp, PickerOpenReq, PickerPush, QfSetOp,
+    RawKeymap, RawRhs, RegisterSetOp, SemanticTokenData, SnippetAddReq, SnippetSetupReq,
+    StatuslinePublishReq, StatuslineSetupReq, TabOp, TerminalOpenReq, TsOp, UiFloatReq, UiInputReq,
+    UiSelectReq, ViewOp, WindowOp, WorkspaceOptionOp,
 };
 
 /// `skip_serializing_if` predicate: drop a `false` flag from the serialized
@@ -657,6 +657,10 @@ pub(crate) struct Shared {
     /// `vim.fn.setqflist` requests, drained by the server into the editor's
     /// quickfix list after the chunk. Reads resolve from the `nx._qflist` mirror.
     pub(crate) qf_ops: Vec<QfSetOp>,
+    /// Named-list lifecycle ops (`nx.qf.show` / `nx.qf.drop` for a `kind = "list"`
+    /// dynamic list), drained *after* [`Self::qf_ops`] so a show observes the
+    /// refresh queued just before it.
+    pub(crate) named_list_ops: Vec<NamedListOp>,
     /// `vim.ui.input` prompt requests, drained by the server into the editor's
     /// command line (`Editor::open_prompt`) after the chunk (Phase 8).
     pub(crate) ui_inputs: Vec<UiInputReq>,
@@ -1297,6 +1301,12 @@ impl LuaRuntime {
     }
 
     take_queue! {
+        /// Take the named-list lifecycle ops (`nx.qf.show` / `nx.qf.drop`) queued
+        /// since the last drain. Drained *after* [`Self::take_qf_ops`].
+        take_named_list_ops -> Vec<NamedListOp> = named_list_ops
+    }
+
+    take_queue! {
         /// Take the `vim.ui.input` prompt requests queued since the last drain, for
         /// the server to open as command-line prompts (Phase 8).
         take_ui_inputs -> Vec<UiInputReq> = ui_inputs
@@ -1846,17 +1856,23 @@ impl LuaRuntime {
     }
 
     /// Deliver the picker's "send these results to a list" outcome: the matched item
-    /// `keys` (in display order) go to `nx._picker_send`, which maps them back to the
-    /// source item tables and builds a location list (`nx.qf.send_to_loclist`). The
-    /// bulk-result sibling of [`Self::run_picker_result`]. `resume_keys` retains the
-    /// snapshot window's item tables for `nx.picker.resume()` (see there).
-    pub fn run_picker_send(&self, keys: Vec<usize>, resume_keys: &[usize]) -> mlua::Result<()> {
+    /// `keys` (in display order) and the live `query` go to `nx._picker_send`, which
+    /// maps the keys back to the source item tables and builds a named list keyed
+    /// `<picker>:<query>`. The bulk-result sibling of [`Self::run_picker_result`].
+    /// `resume_keys` retains the snapshot window's item tables for `nx.picker.resume()`
+    /// (see there).
+    pub fn run_picker_send(
+        &self,
+        keys: Vec<usize>,
+        query: &str,
+        resume_keys: &[usize],
+    ) -> mlua::Result<()> {
         let nx = self.nx()?;
         let run: mlua::Function = nx.get("_picker_send")?;
         let arg = self
             .lua
             .create_sequence_from(keys.into_iter().map(|k| k as i64))?;
-        run.call::<()>((arg, self.resume_keys_seq(resume_keys)?))
+        run.call::<()>((arg, self.resume_keys_seq(resume_keys)?, query))
     }
 
     /// The resume snapshot window's item keys as a Lua sequence (or `nil` when empty —

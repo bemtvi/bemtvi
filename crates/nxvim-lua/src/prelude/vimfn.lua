@@ -644,114 +644,57 @@ nx.setqflist = nx.qf.setqflist
 nx.getloclist = nx.qf.getloclist
 nx.setloclist = nx.qf.setloclist
 
--- Dynamic (named, function-sourced) lists ----------------------------------
+-- Named lists (window-independent, addressed by name) ----------------------
 --
--- A *dynamic list* binds a name to a datasource function; `nx.qf.refresh(name)`
--- re-runs that source and rewrites the bound list in place (action "r"), so an
--- open quickfix / location window repaints with the fresh results. The source
--- returns an items array (the same entry-dict shape as setqflist) OR a promise
--- resolving to one — so a slow producer (LSP, ripgrep) never blocks the editor.
--- The registry is a plain table; the refresh itself is just setqflist/setloclist
--- under the hood, so dynamic lists ride the existing rendering and navigation.
-nx._dynamic_lists = nx._dynamic_lists or {}
+-- A *named list* is like the global quickfix list — structured entries, its own
+-- bottom-dock tab, `<CR>` jumps into the main editing layer — but there can be many,
+-- each addressed by a stable name, and storage lives on the editor (not a window),
+-- so it survives closing any window and never collides with the single quickfix.
+-- That makes it the fit for a persistent plugin panel (e.g. dap's "All Breakpoints"):
+-- the plugin pushes items with nx.qf.list(name, items) whenever its data changes, and
+-- nx.qf.show(name) opens/focuses the tab. Both are thin queues over the existing
+-- quickfix rendering and navigation — no datasource/refresh indirection.
 
-local function nx_dyn_is_callable(v)
-  if type(v) == "function" then
-    return true
+-- nx.qf.list(name, items[, opts]): create or replace the named list `name` from
+-- `items` (an array of entry dicts, the same shape setqflist takes), repainting its
+-- tab if open. Does NOT open or focus the tab — call nx.qf.show(name) for that.
+--   opts.title  (string) the list title shown in the dock tab (defaults to `name`).
+--   opts.action (string) "r" (default, replace in place) / " " (push a new list onto
+--               the stack) / "a" (append to the current list).
+-- Returns the name.
+function nx.qf.list(name, items, opts)
+  if type(name) ~= "string" or name == "" then
+    error("nx.qf.list: name must be a non-empty string", 2)
   end
-  if type(v) == "table" then
-    local mt = getmetatable(v)
-    return mt ~= nil and type(mt.__call) == "function"
+  if type(items) ~= "table" then
+    error("nx.qf.list: items must be an array of entry dicts", 2)
   end
-  return false
+  opts = opts or {}
+  local action = opts.action or "r"
+  nx._set_qflist(items, nil, nil, action, opts.title or name, nil, name)
+  return name
 end
 
--- nx.qf.dynamic(spec): register (or REDEFINE) a named dynamic list. Fields:
---   name     (string, required)   the handle nx.qf.refresh / nx.qf.drop take.
---   source   (function, required) returns an items array, or a promise of one.
---   loclist  (bool, default false) target a window's location list instead of
---            the global quickfix list.
---   win      (window id, loclist only) the owner window; defaults to the current
---            window captured now, so the list stays bound to it even after focus
---            moves. Pass an explicit id to bind another window.
---   title    (string) the list title (defaults to `name`).
--- Calling it again with an existing `name` REPLACES that registration in place
--- rather than spawning a second list: a loclist keeps the window a prior call
--- bound (so redefining a *visible* list updates it where it already shows — no
--- new window / dock tab against whatever happens to be focused now), unless you
--- pass an explicit `win`. A redefinition also refreshes immediately, so the new
--- source takes effect (repainting an open window); a first registration only
--- registers — call nx.qf.refresh(name) to populate it. Returns the name.
-function nx.qf.dynamic(spec)
-  if type(spec) ~= "table" then
-    error("nx.qf.dynamic: spec must be a table", 2)
+-- nx.qf.show(name): open or focus the named list `name`'s bottom-dock tab — the
+-- clean, window-independent reopen (no set_current / on_next_tick dance; the open is
+-- sequenced server-side after any nx.qf.list queued in the same tick). Showing a name
+-- with no items yet opens an empty tab. Returns the name.
+function nx.qf.show(name)
+  if type(name) ~= "string" or name == "" then
+    error("nx.qf.show: name must be a non-empty string", 2)
   end
-  if type(spec.name) ~= "string" or spec.name == "" then
-    error("nx.qf.dynamic: spec.name must be a non-empty string", 2)
-  end
-  if not nx_dyn_is_callable(spec.source) then
-    error("nx.qf.dynamic: spec.source must be a function", 2)
-  end
-  local existing = nx._dynamic_lists[spec.name]
-  local loclist = spec.loclist and true or false
-  local win = nil
-  if loclist then
-    -- An explicit `win` (re)binds; else keep the binding a prior registration
-    -- captured (redefine-in-place); else, on a first registration, the current
-    -- window.
-    if spec.win ~= nil and spec.win ~= 0 then
-      win = spec.win
-    elseif existing ~= nil and existing.win ~= nil then
-      win = existing.win
-    else
-      win = nx.win.current()
-    end
-  end
-  nx._dynamic_lists[spec.name] = {
-    name = spec.name,
-    source = spec.source,
-    loclist = loclist,
-    win = win,
-    title = spec.title or spec.name,
-  }
-  -- Redefining an existing list replaces its source in place: refresh so the
-  -- change takes effect (action "r" only repaints an already-open window; it
-  -- never opens one), instead of leaving stale results until the next manual
-  -- refresh.
-  if existing ~= nil then
-    nx.qf.refresh(spec.name)
-  end
-  return spec.name
+  nx._named_list_show(name)
+  return name
 end
 
--- nx.qf.refresh(name): re-run the named list's source and rewrite its bound list
--- in place (action "r"), repainting an open window. Returns a promise that
--- fulfils with the name once the fresh items have been queued (so callers can
--- chain `:next` / await it). Fails loud on an unknown name.
-function nx.qf.refresh(name)
-  local spec = nx._dynamic_lists[name]
-  if spec == nil then
-    error("nx.qf.refresh: no dynamic list named " .. tostring(name), 2)
-  end
-  return nx.async(function()
-    -- nx.await resolves a plain items array as-is and waits on a returned
-    -- promise, so the source may be sync or async without a branch here.
-    local items = nx.await(spec.source()) or {}
-    local loclist_win = nil
-    if spec.loclist then
-      loclist_win = spec.win or 0
-    end
-    nx._set_qflist(items, nil, nil, "r", spec.title, loclist_win)
-    return spec.name
-  end)()
-end
-
--- nx.qf.drop(name): forget a dynamic-list registration. Returns whether one was
--- removed. Does not touch the list's current contents or its window.
+-- nx.qf.drop(name): forget the named list `name` — close its dock tab if open and
+-- remove its contents from the editor. A no-op for a name that was never used.
 function nx.qf.drop(name)
-  local had = nx._dynamic_lists[name] ~= nil
-  nx._dynamic_lists[name] = nil
-  return had
+  if type(name) ~= "string" or name == "" then
+    error("nx.qf.drop: name must be a non-empty string", 2)
+  end
+  nx._named_list_drop(name)
+  return name
 end
 
 -- nx.qf.open([height]) [wraps `:copen`]: open the quickfix window, optionally

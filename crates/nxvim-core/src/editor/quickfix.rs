@@ -190,10 +190,36 @@ impl QfStack {
     }
 }
 
-/// Which list a quickfix command targets: the single global quickfix list, or the
-/// per-window **location list** owned by a specific window. Every `:c*`/`:l*` pair
-/// shares one implementation parameterized by this — `:copen` is
-/// `ex_qf_open(Quickfix, …)`, `:lopen` is `ex_qf_open(Location(win), …)`.
+/// A stable id for a [`NamedList`] — the `Copy` key threaded through [`QfWhich`] in
+/// place of the list's `String` name (a `String` would break `QfWhich: Copy`, which
+/// ~47 match sites rely on). Allocated by [`Editor::named_list_id`], which interns a
+/// name to its id (create-or-get).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct NamedListId(pub u32);
+
+/// A **named list** — like the global quickfix list (global storage, own bottom-dock
+/// tab, jump into the main editing layer), but addressed by a stable name so there
+/// can be many, each distinct and never colliding with the quickfix. Lives on the
+/// [`Editor`] (not a window), so it survives every window close; reopened / refreshed
+/// **by name** from anywhere. Not persisted.
+#[derive(Debug, Clone, Default)]
+pub struct NamedList {
+    /// The stable name this list is addressed by (the `nx.qf.show(name)` key), and
+    /// the dock-tab label's fallback when the current list carries no title.
+    pub name: String,
+    /// The list-stack, mirroring the quickfix's `:colder`/`:cnewer` history. The
+    /// current list's [`QfList::title`] is the dock-tab label.
+    pub stack: QfStack,
+    /// The display buffer backing this list's dock tab, created lazily on first
+    /// show and kept thereafter (cleared when the tab is closed → reopen re-renders).
+    pub display_bufnr: Option<BufferId>,
+}
+
+/// Which list a quickfix command targets: the single global quickfix list, the
+/// per-window **location list** owned by a specific window, or a window-independent
+/// **named list**. Every `:c*`/`:l*` pair shares one implementation parameterized by
+/// this — `:copen` is `ex_qf_open(Quickfix, …)`, `:lopen` is
+/// `ex_qf_open(Location(win), …)`, and a named list is `ex_qf_open(Named(id), …)`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum QfWhich {
     /// The global quickfix list (`:copen`, `:make`, `setqflist`, …).
@@ -201,6 +227,9 @@ pub enum QfWhich {
     /// The location list owned by the given window (`:lopen`, `:lgrep`,
     /// `setloclist`, …).
     Location(WindowId),
+    /// A window-independent named list, addressed by its interned [`NamedListId`]
+    /// (`nx.qf.show(name)`). Quickfix-flavored but a distinct instance per name.
+    Named(NamedListId),
 }
 
 impl QfWhich {
@@ -209,6 +238,7 @@ impl QfWhich {
         match self {
             QfWhich::Quickfix => "quickfix",
             QfWhich::Location(_) => "location",
+            QfWhich::Named(_) => "list",
         }
     }
 }
@@ -230,6 +260,7 @@ impl Editor {
         match which {
             QfWhich::Quickfix => Some(&self.qf),
             QfWhich::Location(w) => self.window(w).and_then(|win| win.loclist.as_ref()),
+            QfWhich::Named(id) => self.named_lists.get(&id).map(|nl| &nl.stack),
         }
     }
 
@@ -249,6 +280,10 @@ impl Editor {
                 .window_mut(w)
                 .and_then(|win| win.loclist.as_mut())
                 .and_then(QfStack::current_mut),
+            QfWhich::Named(id) => self
+                .named_lists
+                .get_mut(&id)
+                .and_then(|nl| nl.stack.current_mut()),
         }
     }
 
@@ -261,6 +296,9 @@ impl Editor {
             QfWhich::Location(w) => self
                 .window_mut(w)
                 .map(|win| win.loclist.get_or_insert_with(QfStack::default)),
+            // A named list's registry entry is created up front by `named_list_id`,
+            // so it is present here (absent only for a bogus, never-interned id).
+            QfWhich::Named(id) => self.named_lists.get_mut(&id).map(|nl| &mut nl.stack),
         }
     }
 
@@ -286,6 +324,66 @@ impl Editor {
             Some(w @ QfWhich::Location(_)) => w,
             _ => QfWhich::Location(self.current_window_id()),
         }
+    }
+
+    // ---- named lists (window-independent quickfix-flavored lists) ----
+
+    /// Intern `name` to its [`NamedListId`], **creating** the registry entry on first
+    /// use (create-or-get). The fresh [`NamedList`] starts with an empty stack and no
+    /// display buffer; its `name` is recorded (the dock-tab label falls back to it
+    /// until the list is populated with a title). Ids are monotonic and never reused,
+    /// so a `Named(id)` threaded through the accessors always resolves while the list
+    /// lives.
+    pub fn named_list_id(&mut self, name: &str) -> NamedListId {
+        if let Some(&id) = self.named_by_name.get(name) {
+            return id;
+        }
+        let id = NamedListId(self.next_named_id);
+        self.next_named_id += 1;
+        self.named_by_name.insert(name.to_string(), id);
+        self.named_lists.insert(
+            id,
+            NamedList {
+                name: name.to_string(),
+                ..NamedList::default()
+            },
+        );
+        id
+    }
+
+    /// Open or focus the named list `name`'s bottom-dock tab (`nx.qf.show`) — the
+    /// clean, window-independent reopen. Interns the name (showing a not-yet-populated
+    /// list creates an empty one and renders it), then funnels through the shared
+    /// [`Editor::ex_qf_open`], which focuses the tab if already shown or places a fresh
+    /// one beside the other dock lists. No `set_current` + `on_next_tick` dance: the
+    /// open is sequenced here, server-side.
+    pub fn named_list_show(&mut self, name: &str) {
+        let id = self.named_list_id(name);
+        self.ex_qf_open(QfWhich::Named(id), "");
+    }
+
+    /// Forget the named list `name` (`nx.qf.drop`): close its dock tab if shown, drop
+    /// its now-unshown display buffer, and remove its registry entry so the name and
+    /// id are never resolved again. A no-op for an unknown name. The core half of
+    /// `nx.qf.drop` for a `kind = "list"` dynamic list.
+    pub fn named_list_drop(&mut self, name: &str) {
+        let Some(id) = self.named_by_name.remove(name) else {
+            return;
+        };
+        let which = QfWhich::Named(id);
+        // Close its window/tab first (mirrors `:cclose`); the registry entry still
+        // resolves here, so `ex_qf_close` finds the display window.
+        self.ex_qf_close(which);
+        // Delete the scratch display buffer once nothing shows it (a refused
+        // last-window close would keep it visible, so it must keep its buffer).
+        if let Some(buf) = self.qf_display_bufnr(which) {
+            if self.buffers.map.contains_key(&buf)
+                && !self.windows.all_windows().any(|win| win.buffer == buf)
+            {
+                self.delete_buffer(buf, true);
+            }
+        }
+        self.named_lists.remove(&id);
     }
 
     // ---- populating a list ----
@@ -491,6 +589,13 @@ impl Editor {
         if self.qf_bufnr == Some(buf) {
             return Some(QfWhich::Quickfix);
         }
+        if let Some((&id, _)) = self
+            .named_lists
+            .iter()
+            .find(|(_, nl)| nl.display_bufnr == Some(buf))
+        {
+            return Some(QfWhich::Named(id));
+        }
         self.window_ids()
             .into_iter()
             .find(|&w| {
@@ -505,6 +610,7 @@ impl Editor {
         match which {
             QfWhich::Quickfix => self.qf_bufnr,
             QfWhich::Location(w) => self.window(w).and_then(|win| win.loclist_bufnr),
+            QfWhich::Named(id) => self.named_lists.get(&id).and_then(|nl| nl.display_bufnr),
         }
     }
 
@@ -515,6 +621,11 @@ impl Editor {
             QfWhich::Location(w) => {
                 if let Some(win) = self.window_mut(w) {
                     win.loclist_bufnr = buf;
+                }
+            }
+            QfWhich::Named(id) => {
+                if let Some(nl) = self.named_lists.get_mut(&id) {
+                    nl.display_bufnr = buf;
                 }
             }
         }
@@ -540,10 +651,23 @@ impl Editor {
         }
         let text = self.qf_render_text(which);
         let name = match which {
-            QfWhich::Quickfix => "[Quickfix List]",
-            QfWhich::Location(_) => "[Location List]",
+            QfWhich::Quickfix => "[Quickfix List]".to_string(),
+            QfWhich::Location(_) => "[Location List]".to_string(),
+            // A named list's dock tab is labelled by its current list's title
+            // (`nx.qf.list{ title }`), falling back to the list's name.
+            QfWhich::Named(id) => {
+                let title = self.qf_cur(which).title.clone();
+                if !title.is_empty() {
+                    title
+                } else {
+                    self.named_lists
+                        .get(&id)
+                        .map(|nl| format!("[{}]", nl.name))
+                        .unwrap_or_else(|| "[List]".to_string())
+                }
+            }
         };
-        self.load_str_into(buf, Some(name.to_string()), &text);
+        self.load_str_into(buf, Some(name), &text);
         self.qf_paint_severity(buf, which);
     }
 
@@ -934,7 +1058,9 @@ impl Editor {
             let disp_win = self.qf_window_id(which);
             let live = self.window_ids();
             let preferred = match which {
-                QfWhich::Quickfix => self.qf_prev_win,
+                // A named list, like the quickfix, has no owner window: jump back to
+                // the window it was shown from (the main editing layer).
+                QfWhich::Quickfix | QfWhich::Named(_) => self.qf_prev_win,
                 QfWhich::Location(owner) => Some(owner),
             };
             let target = preferred

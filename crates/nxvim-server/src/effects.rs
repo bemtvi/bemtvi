@@ -13,9 +13,9 @@ use nxvim_core::{
 };
 use nxvim_lua::{
     BoMirror, BufBytesEdit, BufMirror, BufOp, CallbackArgs, DecorPublish, DockOp, ExtmarkMirror,
-    ExtmarkOp, FloatMirror, GoMirror, HlDefMirror, HlSet, JumpMirror, LayerOp, LoopOp, OptionValue,
-    PanelOp, QfItem, QfMirror, StatuslineKind, StatuslineTarget, TabMirror, TabOp, TsOp, ViewOp,
-    VirtDecorData, WindowMirror, WindowOp,
+    ExtmarkOp, FloatMirror, GoMirror, HlDefMirror, HlSet, JumpMirror, LayerOp, LoopOp, NamedListOp,
+    OptionValue, PanelOp, QfItem, QfMirror, StatuslineKind, StatuslineTarget, TabMirror, TabOp,
+    TsOp, ViewOp, VirtDecorData, WindowMirror, WindowOp,
 };
 use rmpv::Value;
 use std::collections::HashSet;
@@ -717,21 +717,27 @@ impl EditHost {
                 'r' => QfAction::Replace,
                 _ => QfAction::New,
             };
-            // Quickfix list (`loclist_win == None`) vs a window's location list. A
-            // `Some(0)` targets the current window (vim's `winnr` 0); any other id is
-            // a window handle. Drop the op on a stale window id rather than silently
-            // writing the quickfix list.
-            let which = match op.loclist_win {
-                None => Some(QfWhich::Quickfix),
-                Some(0) => Some(QfWhich::Location(self.editor.current_window_id())),
-                Some(id) => {
-                    let win = WindowId(id);
-                    if self.editor.window_ids().contains(&win) {
-                        Some(QfWhich::Location(win))
-                    } else {
-                        self.editor
-                            .echo(format!("E957: Invalid window number {id}"));
-                        None
+            // A named target (`nx.qf.list(name, …)`) takes precedence over the
+            // quickfix / loclist routing: intern the name to its id and write that
+            // window-independent list. Otherwise: quickfix list (`loclist_win == None`)
+            // vs a window's location list. A `Some(0)` targets the current window
+            // (vim's `winnr` 0); any other id is a window handle. Drop the op on a
+            // stale window id rather than silently writing the quickfix list.
+            let which = if let Some(name) = &op.named {
+                Some(QfWhich::Named(self.editor.named_list_id(name)))
+            } else {
+                match op.loclist_win {
+                    None => Some(QfWhich::Quickfix),
+                    Some(0) => Some(QfWhich::Location(self.editor.current_window_id())),
+                    Some(id) => {
+                        let win = WindowId(id);
+                        if self.editor.window_ids().contains(&win) {
+                            Some(QfWhich::Location(win))
+                        } else {
+                            self.editor
+                                .echo(format!("E957: Invalid window number {id}"));
+                            None
+                        }
                     }
                 }
             };
@@ -761,6 +767,15 @@ impl EditHost {
             // failed (the list is unchanged).
             if ok && (op.open || op.goto_first) {
                 self.editor.qf_post_populate(which, op.open, op.goto_first);
+            }
+        }
+        // Named-list lifecycle ops, drained *after* the `QfSetOp`s above so a
+        // `nx.qf.show` observes the refresh queued just before it (server-sequenced,
+        // no `set_current` + `on_next_tick` dance).
+        for op in self.lua.take_named_list_ops() {
+            match op {
+                NamedListOp::Show(name) => self.editor.named_list_show(&name),
+                NamedListOp::Drop(name) => self.editor.named_list_drop(&name),
             }
         }
         // `vim.ui.input` prompts (Phase 8): open the editor's command line as a
@@ -3079,13 +3094,13 @@ impl EditHost {
                     self.apply_lua_effects();
                 }
             }
-            // "Send the picker's current results to a list" (the `send_to_loclist`
+            // "Send the picker's current results to a list" (the `send_to_list`
             // picker action): the action already closed the picker, so deliver the
-            // matched keys to Lua, which builds the list from its item tables.
-            for keys in std::mem::take(&mut self.editor.picker_sends) {
+            // matched keys (and the live query) to Lua, which builds the named list.
+            for (keys, query) in std::mem::take(&mut self.editor.picker_sends) {
                 self.picker_active = false;
                 let resume_keys = std::mem::take(&mut self.editor.picker_resume_keys);
-                if let Err(e) = self.lua.run_picker_send(keys, &resume_keys) {
+                if let Err(e) = self.lua.run_picker_send(keys, &query, &resume_keys) {
                     self.editor
                         .echo(format!("E5108: Error in nx.picker send: {e}"));
                 }

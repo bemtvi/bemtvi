@@ -1,10 +1,10 @@
-dynamic lists demo
-==================
+named lists demo
+================
 
 A short line.
-TODO: wire up the refresh keymap and try \tr to see this row appear.
+TODO: wire up the keymaps and press \tl to collect this row into a named list.
 Another ordinary line that is comfortably under the forty-column threshold? no, this one is long.
-FIXME: this counts as an error-severity row in the TODO/FIXME quickfix list.
+FIXME: this counts as an error-severity row in the TODO/FIXME named list.
 short again
 This sentence is intentionally written to be well over forty columns wide.
 plain

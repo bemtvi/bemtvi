@@ -1365,14 +1365,20 @@ async fn lspdiagnostics_colors_loclist_rows_by_severity() {
     );
 }
 
-// --- dynamic (named, function-sourced) lists -------------------------------
+// --- named lists (window-independent, addressed by name) -------------------
+//
+// End-to-end coverage for the direct named-list surface: `nx.qf.list(name, items)`
+// populates a window-independent list, `nx.qf.show(name)` opens/focuses its own
+// bottom-dock tab, `nx.qf.drop(name)` removes it. These prove the Lua -> op -> core
+// path (renders in its own tab, never touches the quickfix, jumps into the main
+// layer, drops cleanly). The comprehensive matrix — survives a window close, several
+// named lists side by side, mouse — lands in Phase 6.
 
-/// Poll `first_entry` until it equals `want` (a dynamic refresh fills the list off
-/// a microtask hop, then the server drains the queued op), returning whether it
-/// converged in time.
-async fn poll_first_entry(rpc: &Rpc, want: &str) -> bool {
+/// Poll the focused window's first rendered line until it equals `want` (a named
+/// `show` queues an op the server drains a tick or two later).
+async fn poll_first_line(rpc: &Rpc, want: &str) -> bool {
     for _ in 0..200 {
-        if first_entry(rpc).await == want {
+        if lines(rpc).await.first().map(String::as_str) == Some(want) {
             return true;
         }
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
@@ -1381,255 +1387,227 @@ async fn poll_first_entry(rpc: &Rpc, want: &str) -> bool {
 }
 
 #[tokio::test]
-async fn dynamic_qflist_refreshes_from_its_source_function() {
+async fn named_list_shows_in_its_own_tab_without_touching_the_quickfix() {
+    let (rpc, _incoming) = start().await;
+    let path = write_temp("named_show", "txt", "one\ntwo\nthree\nfour\n");
+    exec_lua(
+        &rpc,
+        &format!(
+            r#"nx.qf.list("panel",
+                 {{ {{ filename = "{path}", lnum = 2, col = 1, text = "hit" }} }},
+                 {{ title = "Panel" }})
+               nx.qf.show("panel")"#
+        ),
+    )
+    .await;
+    // The named list renders its entry in the focused (dock) window...
+    assert!(
+        poll_first_line(&rpc, &format!("{path}|2 col 1| hit")).await,
+        "named list should render its entry, got {:?}",
+        lines(&rpc).await.first()
+    );
+    // ...and it did NOT populate the global quickfix list (the whole point: no
+    // collision with `:grep` / `:make` / another named list).
+    let qf = exec_lua(&rpc, "return #vim.fn.getqflist()").await.as_u64();
+    assert_eq!(qf, Some(0), "a named list must not write the quickfix list");
+}
+
+#[tokio::test]
+async fn named_list_enter_jumps_into_the_main_layer() {
     let (rpc, mut incoming) = start().await;
-    // Register a named dynamic quickfix list whose source reads a counter, so each
-    // refresh yields a different item — proving refresh re-invokes the source and
-    // rewrites the list in place.
+    let path = write_temp("named_jump", "txt", "one\ntwo\nthree\nfour\n");
     exec_lua(
         &rpc,
-        r#"_G.dyn_n = 0
-           nx.qf.dynamic {
-             name = "counter",
-             title = "Counter",
-             source = function()
-               _G.dyn_n = _G.dyn_n + 1
-               return { { filename = "f.rs", lnum = _G.dyn_n, text = "tick " .. _G.dyn_n } }
-             end,
-           }
-           nx.qf.refresh("counter")"#,
+        &format!(
+            r#"nx.qf.list("p",
+                 {{ {{ filename = "{path}", lnum = 3, col = 1, text = "here" }} }})
+               nx.qf.show("p")"#
+        ),
     )
     .await;
-    // The first refresh populated the list from the source's first result.
     assert!(
-        poll_first_entry(&rpc, "1|f.rs|1|0|tick 1").await,
-        "first refresh should populate from the source, got {:?}",
-        first_entry(&rpc).await
+        poll_first_line(&rpc, &format!("{path}|3 col 1| here")).await,
+        "named list should render, got {:?}",
+        lines(&rpc).await.first()
     );
-    // Show the list, then refresh again: the source re-runs and the open window
-    // repaints with the new item.
-    message_after(&rpc, &mut incoming, ":copen<CR>").await;
-    exec_lua(&rpc, r#"nx.qf.refresh("counter")"#).await;
-    assert!(
-        poll_first_entry(&rpc, "1|f.rs|2|0|tick 2").await,
-        "second refresh should re-run the source, got {:?}",
-        first_entry(&rpc).await
+    let wins_before = win_count(&rpc).await;
+    // <CR> from the dock-hosted named display jumps into the main editing layer.
+    message_after(&rpc, &mut incoming, "<CR>").await;
+    assert_eq!(buf_name(&rpc).await, path, "jumped into the entry's file");
+    assert_eq!(cursor(&rpc).await.0, 3, "landed on the entry's line");
+    assert_eq!(
+        win_count(&rpc).await,
+        wins_before,
+        "the jump reused a main window — it did not split the dock"
     );
-    // The focused quickfix window's rendered buffer reflects the refreshed item.
-    let rendered = lines(&rpc).await;
-    assert_eq!(rendered[0], "f.rs|2| tick 2");
 }
 
 #[tokio::test]
-async fn dynamic_loclist_is_bound_to_its_window() {
+async fn named_list_drop_closes_its_tab_and_forgets_it() {
     let (rpc, _incoming) = start().await;
+    let path = write_temp("named_drop", "txt", "x\n");
     exec_lua(
         &rpc,
-        r#"_G.dyn_win = vim.api.nvim_get_current_win()
-           nx.qf.dynamic {
-             name = "lrefs",
-             loclist = true,
-             title = "LRefs",
-             source = function()
-               return { { filename = "x.rs", lnum = 4, text = "loc" } }
-             end,
-           }
-           nx.qf.refresh("lrefs")"#,
+        &format!(
+            r#"nx.qf.list("d",
+                 {{ {{ filename = "{path}", lnum = 1, text = "z" }} }})
+               nx.qf.show("d")"#
+        ),
     )
     .await;
-    assert_eq!(poll_loclist_count(&rpc, 1).await, 1);
-    let got = exec_lua(
-        &rpc,
-        r#"local l = vim.fn.getloclist(_G.dyn_win)
-           return string.format("%d|%s|%d|%s", #l, l[1].filename, l[1].lnum, l[1].text)"#,
-    )
-    .await;
-    assert_eq!(got.as_str(), Some("1|x.rs|4|loc"));
-}
-
-#[tokio::test]
-async fn dynamic_source_may_return_a_promise() {
-    let (rpc, _incoming) = start().await;
-    // A source that returns a promise (slow producers — LSP, ripgrep) is awaited
-    // before the list is written.
-    exec_lua(
-        &rpc,
-        r#"nx.qf.dynamic {
-             name = "async",
-             source = function()
-               return nx.promise.resolve({ { filename = "p.rs", lnum = 9, text = "async" } })
-             end,
-           }
-           nx.qf.refresh("async")"#,
-    )
-    .await;
-    assert_eq!(poll_qf_count(&rpc, 1).await, 1);
-    assert_eq!(first_entry(&rpc).await, "1|p.rs|9|0|async");
-}
-
-#[tokio::test]
-async fn refresh_unknown_dynamic_list_fails_loud() {
-    let (rpc, _incoming) = start().await;
-    let out = exec_lua(
-        &rpc,
-        r#"local ok, e = pcall(function() return nx.qf.refresh("nope") end)
-           return tostring(ok) .. "|" .. tostring(e)"#,
-    )
-    .await;
-    let s = out.as_str().unwrap_or("");
     assert!(
-        s.starts_with("false|"),
-        "refresh of an unknown name should error, got {s:?}"
-    );
-    assert!(
-        s.contains("nope"),
-        "the error should name the missing list, got {s:?}"
-    );
-}
-
-#[tokio::test]
-async fn redefining_a_dynamic_qflist_replaces_the_source_in_place() {
-    let (rpc, mut incoming) = start().await;
-    exec_lua(
-        &rpc,
-        r#"nx.qf.dynamic {
-             name = "q", title = "Q",
-             source = function() return { { filename = "a", lnum = 1, text = "before" } } end,
-           }
-           nx.qf.refresh("q")"#,
-    )
-    .await;
-    assert!(poll_first_entry(&rpc, "1|a|1|0|before").await);
-    message_after(&rpc, &mut incoming, ":copen<CR>").await;
-    let n_before = win_count(&rpc).await;
-    // Redefine the SAME name with a new source while the list is open + focused.
-    exec_lua(
-        &rpc,
-        r#"nx.qf.dynamic {
-             name = "q", title = "Q",
-             source = function() return { { filename = "b", lnum = 2, text = "after" } } end,
-           }"#,
-    )
-    .await;
-    // The redefinition refreshed in place — the source is replaced and the open
-    // window repaints — without opening a second window.
-    assert!(
-        poll_first_entry(&rpc, "1|b|2|0|after").await,
-        "redefining should replace the source and refresh, got {:?}",
-        first_entry(&rpc).await
+        poll_first_line(&rpc, &format!("{path}|1| z")).await,
+        "named list should show before drop"
     );
     assert_eq!(
         win_count(&rpc).await,
-        n_before,
-        "redefining the list opened no new window"
+        2,
+        "main window + the named-list dock tab"
     );
-    let rendered = lines(&rpc).await;
-    assert_eq!(rendered[0], "b|2| after");
-}
-
-#[tokio::test]
-async fn redefining_a_dynamic_loclist_keeps_its_window_binding() {
-    let (rpc, mut incoming) = start().await;
-    exec_lua(
-        &rpc,
-        r#"_G.w1 = vim.api.nvim_get_current_win()
-           nx.qf.dynamic {
-             name = "refs", loclist = true,
-             source = function() return { { filename = "a.rs", lnum = 1, text = "first" } } end,
-           }
-           nx.qf.refresh("refs")"#,
-    )
-    .await;
-    assert_eq!(poll_loclist_count(&rpc, 1).await, 1);
-    // Move focus to a different window, then redefine the same name there.
-    message_after(&rpc, &mut incoming, ":vsplit<CR>").await;
-    exec_lua(
-        &rpc,
-        r#"_G.w2 = vim.api.nvim_get_current_win()
-           nx.qf.dynamic {
-             name = "refs", loclist = true,
-             source = function() return {
-               { filename = "b.rs", lnum = 2, text = "second" },
-               { filename = "b.rs", lnum = 3, text = "second2" },
-             } end,
-           }"#,
-    )
-    .await;
-    // The redefinition stayed bound to w1 (where the list lives) and refreshed it
-    // with the new source — it did NOT rebind to the now-focused w2 (which would
-    // have spawned a second list). w2 inherited w1's list at `:vsplit` time (vim
-    // semantics), so it still holds the *old* "first" snapshot — proof the new
-    // source landed on w1, not on the focused w2.
-    let mut got = String::new();
+    exec_lua(&rpc, r#"nx.qf.drop("d")"#).await;
+    // The op-drained drop closes the dock tab (back to one window).
     for _ in 0..200 {
-        let v = exec_lua(
-            &rpc,
-            r#"local l1, l2 = vim.fn.getloclist(_G.w1), vim.fn.getloclist(_G.w2)
-               local bound = nx._dynamic_lists["refs"].win
-               return string.format("%d|%s|%s|%s|%s", #l1,
-                 l1[1] and l1[1].text or "",
-                 l2[1] and l2[1].text or "",
-                 bound == _G.w1 and "w1" or "other",
-                 _G.w1 ~= _G.w2 and "split" or "same")"#,
-        )
-        .await;
-        got = v.as_str().unwrap_or("").to_string();
-        if got.starts_with("2|") {
-            break;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-    }
-    assert_eq!(got, "2|second|first|w1|split");
-}
-
-#[tokio::test]
-async fn redefining_an_open_dynamic_loclist_adds_no_window() {
-    let (rpc, mut incoming) = start().await;
-    exec_lua(
-        &rpc,
-        r#"_G.w1 = vim.api.nvim_get_current_win()
-           nx.qf.dynamic {
-             name = "refs", loclist = true,
-             source = function() return { { filename = "a.rs", lnum = 1, text = "first" } } end,
-           }
-           nx.qf.refresh("refs")"#,
-    )
-    .await;
-    assert_eq!(poll_loclist_count(&rpc, 1).await, 1);
-    // Show it (a bottom-dock tab by default); focus lands on the loclist window.
-    message_after(&rpc, &mut incoming, ":lopen<CR>").await;
-    let n_before = win_count(&rpc).await;
-    // Redefine the same name *from inside the open loclist window* — the exact
-    // case that must not spawn a new tab/window.
-    exec_lua(
-        &rpc,
-        r#"nx.qf.dynamic {
-             name = "refs", loclist = true,
-             source = function() return { { filename = "b.rs", lnum = 9, text = "second" } } end,
-           }"#,
-    )
-    .await;
-    let mut got = String::new();
-    for _ in 0..200 {
-        let v = exec_lua(
-            &rpc,
-            r#"local l = vim.fn.getloclist(_G.w1)
-               return (#l == 1) and l[1].text or "<wait>""#,
-        )
-        .await;
-        got = v.as_str().unwrap_or("").to_string();
-        if got == "second" {
+        if win_count(&rpc).await == 1 {
             break;
         }
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
     }
     assert_eq!(
-        got, "second",
-        "redefine refreshed the existing loclist in place"
-    );
-    assert_eq!(
         win_count(&rpc).await,
-        n_before,
-        "redefining the open loclist opened no new window/tab"
+        1,
+        "drop closed the named list's dock tab"
+    );
+    // The core list was forgotten too: re-showing the same name yields a fresh,
+    // EMPTY list (the dropped entry's items are gone, not retained).
+    exec_lua(&rpc, r#"nx.qf.show("d")"#).await;
+    for _ in 0..200 {
+        if win_count(&rpc).await == 2 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    let rendered = lines(&rpc).await;
+    assert_eq!(
+        rendered,
+        vec![String::new()],
+        "a re-shown dropped list is empty — drop forgot its contents"
+    );
+}
+
+#[tokio::test]
+async fn named_list_survives_closing_the_window_it_was_shown_from() {
+    let (rpc, _incoming) = start().await;
+    let path = write_temp("named_survive", "txt", "a\nb\nc\nd\n");
+    // Split into a second main window (separate chunk, so the window mirror is
+    // refreshed before the next chunk reads it).
+    exec_lua(&rpc, r#"vim.cmd("split")"#).await;
+    // From the new (focused) window, populate + show the named list, remembering the
+    // window it was shown from. A location list would be *owned* by this window.
+    exec_lua(
+        &rpc,
+        &format!(
+            r#"_G.from = nx.win.current()
+               nx.qf.list("s", {{ {{ filename = "{path}", lnum = 2, text = "kept" }} }}, {{ title = "S" }})
+               nx.qf.show("s")"#
+        ),
+    )
+    .await;
+    assert!(
+        poll_first_line(&rpc, &format!("{path}|2| kept")).await,
+        "named list shown first, got {:?}",
+        lines(&rpc).await.first()
+    );
+    // Close the window the list was shown from, then re-show by name. A loclist would
+    // have died with its owner window; the named list lives on the editor, so it
+    // survives and re-renders its entry.
+    exec_lua(
+        &rpc,
+        r#"nx.win.set_current(_G.from)
+           vim.cmd("close")
+           nx.qf.show("s")"#,
+    )
+    .await;
+    assert!(
+        poll_first_line(&rpc, &format!("{path}|2| kept")).await,
+        "named list survived the originating window's close and re-renders, got {:?}",
+        lines(&rpc).await.first()
+    );
+}
+
+#[tokio::test]
+async fn two_named_lists_coexist_as_separate_tabs() {
+    let (rpc, mut incoming) = start().await;
+    let pa = write_temp("named_a", "txt", "a\n");
+    let pb = write_temp("named_b", "txt", "b\n");
+    exec_lua(
+        &rpc,
+        &format!(
+            r#"nx.qf.list("a", {{ {{ filename = "{pa}", lnum = 1, text = "AAA" }} }}, {{ title = "A" }})
+               nx.qf.show("a")"#
+        ),
+    )
+    .await;
+    assert!(
+        poll_first_line(&rpc, &format!("{pa}|1| AAA")).await,
+        "list a shown"
+    );
+    exec_lua(
+        &rpc,
+        &format!(
+            r#"nx.qf.list("b", {{ {{ filename = "{pb}", lnum = 1, text = "BBB" }} }}, {{ title = "B" }})
+               nx.qf.show("b")"#
+        ),
+    )
+    .await;
+    assert!(
+        poll_first_line(&rpc, &format!("{pb}|1| BBB")).await,
+        "list b shown"
+    );
+    // The bottom dock now hosts two independent named-list tabs side by side.
+    let rd = redraw_after(&rpc, &mut incoming, "<Esc>").await;
+    assert_eq!(
+        region_tab_count(&rd, "bottom"),
+        2,
+        "two named lists are two dock tabs"
+    );
+    // Re-showing "a" focuses its tab and still renders A — b did not overwrite it.
+    exec_lua(&rpc, r#"nx.qf.show("a")"#).await;
+    assert!(
+        poll_first_line(&rpc, &format!("{pa}|1| AAA")).await,
+        "list a is intact and independent of b, got {:?}",
+        lines(&rpc).await.first()
+    );
+    // Neither named list touched the global quickfix list.
+    let qf = exec_lua(&rpc, "return #vim.fn.getqflist()").await.as_u64();
+    assert_eq!(qf, Some(0), "named lists never write the quickfix list");
+}
+
+#[tokio::test]
+async fn named_list_repaints_an_open_tab_in_place() {
+    let (rpc, _incoming) = start().await;
+    let path = write_temp("named_repaint", "txt", "a\nb\nc\n");
+    exec_lua(
+        &rpc,
+        &format!(
+            r#"nx.qf.list("r", {{ {{ filename = "{path}", lnum = 1, text = "first" }} }})
+               nx.qf.show("r")"#
+        ),
+    )
+    .await;
+    assert!(
+        poll_first_line(&rpc, &format!("{path}|1| first")).await,
+        "first render"
+    );
+    // Re-list the same name while its tab is open (no show): the open tab repaints in
+    // place to the new items (action "r" rewrites the current list and re-renders).
+    exec_lua(
+        &rpc,
+        &format!(r#"nx.qf.list("r", {{ {{ filename = "{path}", lnum = 3, text = "second" }} }})"#),
+    )
+    .await;
+    assert!(
+        poll_first_line(&rpc, &format!("{path}|3| second")).await,
+        "the open tab repainted in place to the new items, got {:?}",
+        lines(&rpc).await.first()
     );
 }

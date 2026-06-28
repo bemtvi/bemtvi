@@ -22,10 +22,10 @@ use crate::host::{get_runtime_file, stdpath};
 use crate::ops::{
     BufOp, CompletePush, CompleteSetupReq, ConfirmReq, DecorMark, DecorPublish, DiagnosticData,
     DockOp, ExtmarkOp, FeedKeysOp, FsJob, GlobalOptionOp, HlSet, LayerOp, LoopOp, LspOp,
-    OptionValue, PanelOp, PickerOpenReq, PickerPush, PreviewPush, QfItem, QfSetOp, RegisterSetOp,
-    SnippetAddReq, SnippetSetupReq, StatuslineKind, StatuslinePublishReq, StatuslineSetupReq,
-    StatuslineTarget, TabOp, TerminalOpenReq, TsOp, UiFloatReq, UiInputReq, UiSelectReq, ViewOp,
-    VirtChunkData, VirtDecorData, WindowOp, WorkspaceOptionOp,
+    NamedListOp, OptionValue, PanelOp, PickerOpenReq, PickerPush, PreviewPush, QfItem, QfSetOp,
+    RegisterSetOp, SnippetAddReq, SnippetSetupReq, StatuslineKind, StatuslinePublishReq,
+    StatuslineSetupReq, StatuslineTarget, TabOp, TerminalOpenReq, TsOp, UiFloatReq, UiInputReq,
+    UiSelectReq, ViewOp, VirtChunkData, VirtDecorData, WindowOp, WorkspaceOptionOp,
 };
 use crate::runtime::{OutputLine, Shared};
 use crate::vimregex;
@@ -2954,7 +2954,7 @@ pub(crate) fn install_runtime_api(
     nx.set(
         "_set_qflist",
         lua.create_function(
-            move |_, (items, lines, efm, action, title, loclist_win): QfSetArgs| {
+            move |_, (items, lines, efm, action, title, loclist_win, named): QfSetArgs| {
                 let items = match items {
                     Some(tbl) => {
                         let mut out = Vec::with_capacity(tbl.raw_len());
@@ -2987,6 +2987,7 @@ pub(crate) fn install_runtime_api(
                     goto_first: false,
                     loclist_win,
                     send: false,
+                    named,
                 });
                 Ok(())
             },
@@ -3022,6 +3023,7 @@ pub(crate) fn install_runtime_api(
                     goto_first: jump,
                     loclist_win,
                     send: false,
+                    named: None,
                 });
                 Ok(())
             },
@@ -3061,10 +3063,33 @@ pub(crate) fn install_runtime_api(
                     goto_first: false,
                     loclist_win: if to_qf { None } else { Some(0) },
                     send: true,
+                    named: None,
                 });
                 Ok(())
             },
         )?,
+    )?;
+
+    // `nx._named_list_show(name)` / `nx._named_list_drop(name)`: queue a
+    // [`NamedListOp`] for the server to run after the chunk (and after the
+    // `QfSetOp`s, so a show sees the refresh queued just before it). `show` opens or
+    // focuses the named list's bottom-dock tab; `drop` forgets the core list and
+    // closes its tab. The `kind = "list"` half of `nx.qf.show` / `nx.qf.drop`.
+    let sh = shared.clone();
+    nx.set(
+        "_named_list_show",
+        lua.create_function(move |_, name: String| {
+            sh.borrow_mut().named_list_ops.push(NamedListOp::Show(name));
+            Ok(())
+        })?,
+    )?;
+    let sh = shared.clone();
+    nx.set(
+        "_named_list_drop",
+        lua.create_function(move |_, name: String| {
+            sh.borrow_mut().named_list_ops.push(NamedListOp::Drop(name));
+            Ok(())
+        })?,
     )?;
 
     // `nx._nx_set_ts_query(lang, name, text|nil)`: the native query setter behind
@@ -3252,10 +3277,11 @@ pub(crate) fn fs_stat_table(lua: &Lua, st: &crate::LuaStat) -> mlua::Result<Tabl
 }
 
 /// The positional arguments `nx._set_qflist` receives: `(items, lines, efm,
-/// action, title, loclist_win)`, where `items`/`lines` are Lua arrays, the next
-/// three are strings, and `loclist_win` is the location-list target window
+/// action, title, loclist_win, named)`, where `items`/`lines` are Lua arrays, the
+/// next three are strings, `loclist_win` is the location-list target window
 /// (`nil`/absent for the quickfix list, `0` for the current window — see
-/// [`QfSetOp::loclist_win`]).
+/// [`QfSetOp::loclist_win`]), and `named` is a window-independent named-list target
+/// (`nil` for the quickfix / loclist routing — see [`QfSetOp::named`]).
 type QfSetArgs = (
     Option<mlua::Table>,
     Option<mlua::Table>,
@@ -3263,6 +3289,7 @@ type QfSetArgs = (
     Option<String>,
     Option<String>,
     Option<u64>,
+    Option<String>,
 );
 
 /// Convert one `setqflist` entry dict into a [`QfItem`]. Absent keys take their

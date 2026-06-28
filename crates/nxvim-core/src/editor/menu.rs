@@ -400,7 +400,7 @@ pub(crate) struct Menu {
     /// Multi-selection: the source keys the user has **marked** (`<Tab>`), in mark
     /// order. Keyed by source key (not view index) so a mark survives query edits and
     /// re-ranking. Empty for `select` / completion (only a picker marks). The picker's
-    /// `send_to_loclist` sends these when non-empty, else the whole filtered view.
+    /// `send_to_list` sends these when non-empty, else the whole filtered view.
     marked: Vec<usize>,
     /// An optional title rendered on the picker box's top border
     /// (`nx.picker.open(name, { title = … })`). `None` ⇒ no title. Only a picker
@@ -1327,7 +1327,7 @@ impl Editor {
                 | "confirm_split"
                 | "confirm_vsplit"
                 | "cancel"
-                | "send_to_loclist"
+                | "send_to_list"
         ) {
             self.picker_resume_keys = self.snapshot_picker_for_resume();
         }
@@ -1359,9 +1359,9 @@ impl Editor {
             }
             // "Send these results to a list": the **marked** keys (multi-select) when
             // any are marked, else the whole filtered view in display order. Then close
-            // — the server hands the keys to Lua to build a location list. The nxvim
-            // port of telescope's send(-selected)-to-loclist.
-            "send_to_loclist" => {
+            // — the server hands the keys (and the live query) to Lua to build a named
+            // list. The nxvim port of telescope's send(-selected)-to-list.
+            "send_to_list" => {
                 let keys = self
                     .menu
                     .as_ref()
@@ -1375,7 +1375,13 @@ impl Editor {
                         }
                     })
                     .unwrap_or_default();
-                self.picker_sends.push(keys);
+                // The live query names the per-search list (`<picker>:<query>`).
+                let query = self
+                    .menu
+                    .as_ref()
+                    .map(|m| m.match_query().to_string())
+                    .unwrap_or_default();
+                self.picker_sends.push((keys, query));
                 self.close_menu();
                 return Ok(());
             }

@@ -530,6 +530,33 @@ async fn plugin_command_appears_in_wildmenu() {
     );
 }
 
+#[tokio::test]
+async fn plugin_command_usage_heads_the_docs_like_a_builtin() {
+    let dir = temp_dir("cmdcomplete");
+    // A command that declares a `usage` argument signature: the docs synopsis must read
+    // `:Greet [name]` — exactly how a built-in carries its arguments — so a plugin
+    // command's parameters are discoverable in the same place.
+    let init = "nx.cmdline_complete.setup {}\n\
+        nx.user_command.create('Greet', 'echo hi', \
+            { usage = '[name]', desc = 'Greet someone' })";
+    let (rpc, mut incoming) = start(&dir, init).await;
+
+    feed(&rpc, ":Gre<Tab>");
+    poll_menu(&rpc, &mut incoming)
+        .await
+        .expect("a wildmenu including the plugin command");
+    feed(&rpc, "<Tab>");
+    let map = wait_redraw(&mut incoming, |m| menu_sel_is(m, 0, true)).await;
+    assert_eq!(menu_items(&map)[0], "Greet");
+    let docs = menu_docs(&map).expect("docs for the plugin command");
+    // The synopsis carries the argument signature after the name.
+    assert_eq!(docs.first().map(String::as_str), Some(":Greet [name]"));
+    assert!(
+        docs.iter().any(|l| l.contains("Greet someone")),
+        "docs: {docs:?}"
+    );
+}
+
 /// The `width` of the menu's docs float (its content column count), or 0 if absent.
 fn menu_docs_width(map: &[(Value, Value)]) -> usize {
     let Some(Value::Map(menu)) = map_get(map, "menu") else {

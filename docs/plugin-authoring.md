@@ -90,8 +90,11 @@ and a deeper treatment in the [API design](specs/2026-06-11-native-plugin-api.md
 - **Keymaps** — `nx.keymap.set(mode, lhs, rhs, opts)` / `nx.keymap.del`; introspect
   with `nx.keymap.get`. Always pass a `desc` — it surfaces in completion and
   which-key.
-- **User commands** — `nx.command(name, fn, { desc = … })`; `fn` receives
-  `{ args, fargs, bang, … }`.
+- **User commands** — `nx.command(name, fn, { desc = …, usage = …, complete = … })`;
+  `fn` receives `{ args, fargs, bang, … }`. `usage` is the argument signature in vim
+  help notation (`usage = "[file]"`, `"{name}"`) — it heads the command's `:`-completion
+  docs pane as `:Name <usage>`, exactly like a built-in. `complete` (`"file"` / `"dir"`
+  / a `fn(args)`) drives `<Tab>` completion of the argument.
 - **Autocmds / events** — `nx.on(event, { pattern = … }, fn)` for editor lifecycle
   events (`BufReadPost`, `FileType`, …).
 - **Options & vars** — read/write `nx.o` (global), `nx.bo` (buffer), `nx.wo`

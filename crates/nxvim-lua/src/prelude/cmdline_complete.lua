@@ -191,14 +191,21 @@ end
 -- are merged (a buffer-local shadows a global of the same name, matching dispatch);
 -- `seen` dedups so a buffer-local doesn't list twice and a plugin can't double a
 -- built-in. The command's `desc` (when given) becomes its docs, headed by a `:Name`
--- synopsis; a command with no `desc` shows the synopsis alone.
+-- synopsis; a command with no `desc` shows the synopsis alone. A declared `usage`
+-- argument signature is appended to the synopsis (`:Name [arg]`), like a built-in's.
 local function append_user_commands(out, seen)
   local function add(commands)
     for name, record in pairs(commands) do
       if not seen[name] then
         seen[name] = true
+        -- The synopsis heads the docs float, like a built-in's. A declared `usage`
+        -- argument signature follows the name (`:Name [arg]`); otherwise it's bare.
+        local synopsis = ":" .. name
+        if record.usage and record.usage ~= "" then
+          synopsis = synopsis .. " " .. record.usage
+        end
         local desc = record.desc
-        local doc = ":" .. name
+        local doc = synopsis
         if desc and desc ~= "" then
           doc = doc .. "\n\n" .. desc
         end

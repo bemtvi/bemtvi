@@ -144,3 +144,47 @@ async fn env_var_brace_and_bare_forms_expand() {
         assert_eq!(got.as_str(), Some(want), "expand('{expr}')");
     }
 }
+
+// vim.fn.fnameescape (alias of nx.fname.escape) backslash-escapes the cmdline-magic
+// characters so a path can be fed straight to `:edit`, and guards a leading `>`/`+`
+// and a lone `-`. Cases match real neovim. Inputs are passed through a level-2 long
+// bracket (`[==[ ]==]`) so backslashes/quotes/`]]` in the path stay literal; `\n`/`\t`
+// are written as real bytes via string.char in a separate case.
+#[tokio::test]
+async fn fnameescape_escapes_cmdline_magic() {
+    let (rpc, _incoming) = start().await;
+
+    let cases = [
+        // input              -> escaped
+        ("foo bar", r"foo\ bar"),
+        ("a*b?c[d]", r"a\*b\?c\[d]"),
+        ("a{b`c$d", r"a\{b\`c\$d"),
+        (r"a\b%c#d", r"a\\b\%c\#d"),
+        ("a'b\"c|d", "a\\'b\\\"c\\|d"),
+        ("a!b<c", r"a\!b\<c"),
+        (">foo", r"\>foo"),
+        ("+foo", r"\+foo"),
+        ("-", r"\-"),
+        // a leading `-` that isn't the whole name is left alone
+        ("-foo", "-foo"),
+        ("plain/path.txt", "plain/path.txt"),
+    ];
+    for (input, want) in cases {
+        let lua = format!("return vim.fn.fnameescape([==[{input}]==])");
+        let got = exec_lua(&rpc, &lua).await;
+        assert_eq!(got.as_str(), Some(want), "fnameescape({input:?})");
+    }
+
+    // Whitespace bytes (tab, newline) get escaped too — built via string.char so the
+    // Lua source carries no literal control characters.
+    let got = exec_lua(
+        &rpc,
+        "return vim.fn.fnameescape('a' .. string.char(9) .. 'b' .. string.char(10) .. 'c')",
+    )
+    .await;
+    assert_eq!(
+        got.as_str(),
+        Some("a\\\tb\\\nc"),
+        "fnameescape(tab/newline)"
+    );
+}

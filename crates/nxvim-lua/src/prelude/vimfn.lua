@@ -487,6 +487,50 @@ function nx.fname.modify(fname, mods)
 end
 vim.fn.fnamemodify = nx.fname.modify
 
+-- nx.fname.escape(fname) [alias vim.fn.fnameescape]: escape a file name so it can
+-- be fed literally as an argument on the `:` command line (e.g. to `:edit`). Each
+-- character vim treats as magic on the cmdline gets a backslash prepended — space,
+-- tab, newline, and `* ? [ { ` $ \ % # ' " | ! <` — then a leading `>` or `+`
+-- (special at the start of `:edit` / `:write`) and a lone `-` are guarded too.
+-- Matches real neovim's vim.fn.fnameescape on Unix.
+local FNAME_ESC = {
+  [" "] = true,
+  ["\t"] = true,
+  ["\n"] = true,
+  ["*"] = true,
+  ["?"] = true,
+  ["["] = true,
+  ["{"] = true,
+  ["`"] = true,
+  ["$"] = true,
+  ["\\"] = true,
+  ["%"] = true,
+  ["#"] = true,
+  ["'"] = true,
+  ['"'] = true,
+  ["|"] = true,
+  ["!"] = true,
+  ["<"] = true,
+}
+function nx.fname.escape(fname)
+  fname = fname or ""
+  local out = {}
+  for p = 1, #fname do
+    local ch = fname:sub(p, p)
+    if FNAME_ESC[ch] then
+      out[#out + 1] = "\\"
+    end
+    out[#out + 1] = ch
+  end
+  local s = table.concat(out)
+  local first = s:sub(1, 1)
+  if first == ">" or first == "+" or s == "-" then
+    s = "\\" .. s
+  end
+  return s
+end
+vim.fn.fnameescape = nx.fname.escape
+
 -- Read one list mirror (`nx._qflist` for the quickfix list, or
 -- `nx._loclist[winid]` for a window's location list) into the dict/array shape
 -- getqflist/getloclist return. `mirror` is the entry array; `title` its title.

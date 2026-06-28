@@ -2586,13 +2586,17 @@ fn render_menu(
             ),
         ])
     };
+    // The internal division rules (prompt/list horizontal rule, preview vertical
+    // rule) take the themed border style — the same `TelescopeBorder`/`FloatBorder`
+    // group the box border uses (line ~2493) — so all three clients agree. Only when
+    // the colorscheme leaves the group undefined do we fall back to plain DIM.
+    let sep_style = menu
+        .styles
+        .border
+        .map(rt)
+        .unwrap_or_else(|| Style::default().add_modifier(Modifier::DIM));
     // A full-width horizontal rule separating the prompt from the list.
-    let sep_line = || -> Line<'static> {
-        Line::from(Span::styled(
-            "─".repeat(width),
-            Style::default().add_modifier(Modifier::DIM),
-        ))
-    };
+    let sep_line = || -> Line<'static> { Line::from(Span::styled("─".repeat(width), sep_style)) };
 
     let mut lines: Vec<Line> = Vec::with_capacity(inner_h);
     // The prompt row's offset within `inner` (for the caret); `None` when promptless.
@@ -2627,12 +2631,7 @@ fn render_menu(
     // The preview column: a vertical separator rule, then the windowed file.
     if let Some((sep_x, preview_area, pv)) = preview_layout {
         let sep: Vec<Line> = (0..inner.height)
-            .map(|_| {
-                Line::from(Span::styled(
-                    "│",
-                    Style::default().add_modifier(Modifier::DIM),
-                ))
-            })
+            .map(|_| Line::from(Span::styled("│", sep_style)))
             .collect();
         frame.render_widget(
             Paragraph::new(Text::from(sep)),

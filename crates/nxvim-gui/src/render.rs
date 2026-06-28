@@ -2486,15 +2486,17 @@ impl Renderer {
                 prompt_fg,
                 full,
             );
-            // The separator: a thin horizontal rule across the list column.
-            let (px, py) = self.cell_px(cx, content_y0 + sep_y);
-            quads.push(Quad {
-                x: px,
-                y: py + self.cell_h * 0.5,
-                w: self.cell_w * list_w as f32,
-                h: (self.cell_h * 0.08).max(1.0),
-                color: color_to_rgba(srgb_to_color(border)),
-            });
+            // The separator: a `─` glyph rule across the list column — drawn as box
+            // glyphs (not a thin quad) so it matches the glyph box border, the `│`
+            // preview rule, and the TUI/web clients.
+            let full = self.full_bounds();
+            self.push_plain(
+                items,
+                &"─".repeat(list_w as usize),
+                self.cell_px(cx, content_y0 + sep_y),
+                border,
+                full,
+            );
             // The caret: a thin bar past the `> ` prefix at the query's cursor column.
             let caret = (2 + menu.query_cursor).min(list_w.saturating_sub(1));
             let (cpx, cpy) = self.cell_px(cx + caret, content_y0 + prompt_y);

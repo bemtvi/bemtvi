@@ -2242,7 +2242,7 @@
       if (hasPreview) {
         const pv = menu.preview;
         // A glyph `│` separator divides the list column from the preview pane.
-        appendGlyphVRule(cx + listW, cy, boxRows);
+        appendGlyphVRule(cx + listW, cy, boxRows, "single", borderCss || null);
         const pre = document.createElement("div");
         pre.className = "pmenu";
         if (bgCss) pre.style.background = bgCss;
@@ -2495,7 +2495,7 @@
     // A vertical glyph separator column (`│`) `h` cells tall at (x, y) — the divider
     // between a picker's list column and its preview pane (the TUI draws it as part of
     // the inner block; here it's a thin chrome strip over the shared bg).
-    function appendGlyphVRule(x, y, h, style = "single") {
+    function appendGlyphVRule(x, y, h, style = "single", borderColor = null) {
       const G = floatBorderGlyphs(style);
       const col = document.createElement("div");
       col.className = "popup-chrome";
@@ -2507,7 +2507,7 @@
         row.style.left = "0";
         row.style.top = i * ch + "px";
         row.style.width = cw + "px";
-        row.appendChild(floatBorderSpan(G.v));
+        row.appendChild(floatBorderSpan(G.v, borderColor));
         col.appendChild(row);
       }
       gridEl.appendChild(col);

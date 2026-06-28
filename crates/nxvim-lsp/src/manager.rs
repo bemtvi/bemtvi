@@ -20,22 +20,15 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use async_lsp::LanguageServer;
-use lsp_types::{
-    DidChangeConfigurationParams, InitializeParams, InitializeResult, InitializedParams, Url,
-};
+use lsp_types::{DidChangeConfigurationParams, InitializeResult, InitializedParams};
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 
-use crate::client::{
-    encoding_of, merged_client_capabilities, new_client, provider_caps, semantic_legend,
-    semantic_tokens_delta, sync_kind_of,
-};
+use crate::client::{init_params, new_client, read_init_result};
 use crate::dispatch::{apply_notify, issue_request};
 use crate::log::{LogLevel, LspLog};
-use crate::protocol::{
-    LspEvent, LspNotify, LspRequest, ReqToken, ServerCaps, ServerKey, ServerSpawn,
-};
+use crate::protocol::{LspEvent, LspNotify, LspRequest, ReqToken, ServerKey, ServerSpawn};
 use crate::transport::{LocalLspTransport, LspTransport};
 
 /// Commands from the editor to the supervisor, routed to per-server tasks by key.
@@ -329,26 +322,7 @@ async fn run_server_once(
 
     // Initialize. Race the handshake against the loop ending, so a server that
     // dies mid-handshake is reported rather than hanging the await.
-    // `root_uri` is deprecated in favor of `workspace_folders`, but it is still
-    // the most broadly honored way to tell a server its workspace root, so we set
-    // it deliberately.
-    #[allow(deprecated)]
-    let init = InitializeParams {
-        process_id: Some(std::process::id()),
-        root_uri: Url::from_file_path(&key.root).ok(),
-        // The config's `init_options`, or `settings` as the fallback (neovim's
-        // behavior): a server that reads only `initialization_options` still sees
-        // what a `settings`-only config configured.
-        initialization_options: spawn
-            .init_options
-            .clone()
-            .or_else(|| spawn.settings.clone()),
-        // nxvim's base capabilities with the config's `capabilities` deep-merged
-        // over them (config wins) — so a config that advertises extra capabilities
-        // (snippet support, extra code-action kinds, …) is honored.
-        capabilities: merged_client_capabilities(spawn.capabilities.as_ref(), log, name),
-        ..Default::default()
-    };
+    let init = init_params(&key.root, spawn, Some(std::process::id()), log, name);
     let init_result = tokio::select! {
         res = socket.initialize(init) => res,
         _ = &mut mainloop_fut => {
@@ -387,28 +361,23 @@ async fn run_server_once(
     if let Some(settings) = spawn.settings.clone() {
         let _ = socket.did_change_configuration(DidChangeConfigurationParams { settings });
     }
-    let encoding = encoding_of(&init_result.capabilities);
-    let sync_kind = sync_kind_of(&init_result.capabilities);
-    let providers = provider_caps(&init_result.capabilities);
-    let legend = semantic_legend(&init_result.capabilities);
-    let semantic_tokens_delta = semantic_tokens_delta(&init_result.capabilities);
+    // Distill the handshake into the editor-facing caps/encoding/raw trio (shared
+    // with the sync wasm client). The raw result rides along for the config's
+    // `on_init` hook (Phase 3).
+    let (caps, encoding, raw_init) = read_init_result(&init_result);
     log.log(
         LogLevel::Info,
         name,
-        &format!("initialized: encoding={encoding:?}, sync={sync_kind:?}"),
+        &format!(
+            "initialized: encoding={encoding:?}, sync={:?}",
+            caps.sync_kind
+        ),
     );
     let _ = event_tx.send(LspEvent::Initialized {
         key: key.clone(),
-        caps: ServerCaps {
-            sync_kind,
-            providers,
-            legend,
-            semantic_tokens_delta,
-        },
+        caps,
         encoding,
-        // The raw result for the config's `on_init` hook (Phase 3); `Null` if it
-        // somehow won't serialize (it always should).
-        init_result: serde_json::to_value(&init_result).unwrap_or(serde_json::Value::Null),
+        init_result: raw_init,
     });
 
     // Serve: ferry document-sync notifications to the socket until told to stop

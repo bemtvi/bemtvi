@@ -420,29 +420,32 @@ impl Editor {
     // `DockSide` is crate-private; the server addresses docks by the side keyword
     // the `nx.dock.*` Lua API carries, validated loudly here.
 
+    /// Resolve a dock `side` keyword and run `f` with the parsed [`DockSide`],
+    /// reporting `E474` (no silent fallback) when the keyword is unknown. The shared
+    /// core of the string-keyed `nx.dock.*` verbs.
+    fn with_dock_side(&mut self, side: &str, f: impl FnOnce(&mut Self, DockSide)) {
+        match DockSide::from_keyword(side) {
+            Some(s) => f(self, s),
+            None => self.echo(format!("E474: Invalid dock side: {side}")),
+        }
+    }
+
     /// `nx.dock.open{ side, size?, buf? }` — open/focus a dock by side keyword.
     /// An unknown side is reported (no silent fallback).
     pub fn open_dock_named(&mut self, side: &str, size: Option<usize>, buf: Option<BufferId>) {
-        match DockSide::from_keyword(side) {
-            Some(s) => self.open_dock(s, size.unwrap_or_else(|| s.default_size()), buf),
-            None => self.echo(format!("E474: Invalid dock side: {side}")),
-        }
+        self.with_dock_side(side, |e, s| {
+            e.open_dock(s, size.unwrap_or_else(|| s.default_size()), buf)
+        });
     }
 
     /// `nx.dock.close(side)` — close a dock by side keyword.
     pub fn close_dock_named(&mut self, side: &str) {
-        match DockSide::from_keyword(side) {
-            Some(s) => self.close_dock(s),
-            None => self.echo(format!("E474: Invalid dock side: {side}")),
-        }
+        self.with_dock_side(side, |e, s| e.close_dock(s));
     }
 
     /// `nx.dock.focus(side)` — focus a dock by side keyword.
     pub fn focus_dock_named(&mut self, side: &str) {
-        match DockSide::from_keyword(side) {
-            Some(s) => self.focus_dock(s),
-            None => self.echo(format!("E474: Invalid dock side: {side}")),
-        }
+        self.with_dock_side(side, |e, s| e.focus_dock(s));
     }
 
     /// `nx.layer.focus(target)` / `nx.layer.main()` — move focus to a layer by
@@ -464,26 +467,17 @@ impl Editor {
 
     /// `nx.dock.toggle(side)` — toggle a dock's visibility by side keyword.
     pub fn toggle_dock_named(&mut self, side: &str) {
-        match DockSide::from_keyword(side) {
-            Some(s) => self.toggle_dock(s),
-            None => self.echo(format!("E474: Invalid dock side: {side}")),
-        }
+        self.with_dock_side(side, |e, s| e.toggle_dock(s));
     }
 
     /// `nx.dock.hide(side)` — hide a dock (keep its content) by side keyword.
     pub fn hide_dock_named(&mut self, side: &str) {
-        match DockSide::from_keyword(side) {
-            Some(s) => self.hide_dock(s),
-            None => self.echo(format!("E474: Invalid dock side: {side}")),
-        }
+        self.with_dock_side(side, |e, s| e.hide_dock(s));
     }
 
     /// `nx.dock.show(side)` — show (un-hide) and focus a dock by side keyword.
     pub fn show_dock_named(&mut self, side: &str) {
-        match DockSide::from_keyword(side) {
-            Some(s) => self.show_dock(s),
-            None => self.echo(format!("E474: Invalid dock side: {side}")),
-        }
+        self.with_dock_side(side, |e, s| e.show_dock(s));
     }
 
     /// Whether the dock on `side` (keyword) is present but hidden — the string-keyed

@@ -326,9 +326,7 @@ impl EditHost {
     /// apply request (content-version guarded, like format/rename); its resolved
     /// edit is applied in [`EditHost::on_lsp_reply`].
     pub(crate) fn resolve_code_action(&mut self, action: Box<nxvim_lsp::lsp_types::CodeAction>) {
-        self.sync_lsp();
-        let Some((key, _uri, _encoding)) = self.current_lsp_target() else {
-            self.editor.echo("No language server attached");
+        let Some((key, _uri, _encoding)) = self.lsp_target_or_echo() else {
             return;
         };
         let token = self.register_lsp_request(LspReqKind::ResolveCodeAction);

@@ -284,10 +284,7 @@ impl Editor {
         } else {
             loc.cursor.col
         };
-        self.set_cursor_char(self.buffer().byte_at(line, col));
-        self.desired_col = self.cursor_virtcol();
-        self.desired_eol = false;
-        self.ensure_visible();
+        self.settle_cursor_byte(self.buffer().byte_at(line, col));
     }
 
     /// `:marks [names]` — list the set marks into a read-only scratch listing, mirroring vim's

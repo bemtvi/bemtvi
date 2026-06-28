@@ -1072,19 +1072,7 @@ impl Editor {
         // Resolve blank lines to `min(prev_nonblank, next_nonblank)` — the level
         // that keeps an interior blank inside its block but drops a trailing blank
         // out of the fold above it.
-        for i in 0..n {
-            if !blank[i] {
-                continue;
-            }
-            let prev = (0..i).rev().find(|&j| !blank[j]).map(|j| levels[j]);
-            let next = (i + 1..n).find(|&j| !blank[j]).map(|j| levels[j]);
-            levels[i] = match (prev, next) {
-                (Some(p), Some(q)) => p.min(q),
-                (Some(p), None) => p,
-                (None, Some(q)) => q,
-                (None, None) => 0,
-            };
-        }
+        resolve_masked_levels(&mut levels, &blank);
         ranges_from_levels(&levels, foldminlines)
     }
 
@@ -1198,6 +1186,29 @@ fn marker_line_levels(line: &str, open: &str, close: &str, start_lvl: usize) -> 
     (lvl, next)
 }
 
+/// Resolve every `mask`ed line's fold level to `min(prev_unmasked,
+/// next_unmasked)` — the rule that keeps an interior masked line (a blank line
+/// under `foldmethod=indent`, or a `-1` "undefined" foldexpr value) inside the
+/// shallower of the blocks bracketing it, while a trailing masked run falls out
+/// of the fold above it. A line with no defined neighbour on a side takes the
+/// other side, or level 0 when both sides are masked.
+fn resolve_masked_levels(levels: &mut [usize], mask: &[bool]) {
+    let n = levels.len();
+    for i in 0..n {
+        if !mask[i] {
+            continue;
+        }
+        let prev = (0..i).rev().find(|&j| !mask[j]).map(|j| levels[j]);
+        let next = (i + 1..n).find(|&j| !mask[j]).map(|j| levels[j]);
+        levels[i] = match (prev, next) {
+            (Some(p), Some(q)) => p.min(q),
+            (Some(p), None) => p,
+            (None, Some(q)) => q,
+            (None, None) => 0,
+        };
+    }
+}
+
 /// The value of the run of leading ASCII digits in `s` (a number following a fold
 /// marker, e.g. the `2` in `{{{2`), or `None` when `s` doesn't start with a digit.
 fn leading_number(s: &str) -> Option<usize> {
@@ -1210,10 +1221,19 @@ fn leading_number(s: &str) -> Option<usize> {
 /// The trailing `()` and a `v:lua.` prefix are optional, and surrounding
 /// whitespace is ignored, so the common config spellings all resolve.
 fn is_treesitter_foldexpr(expr: &str) -> bool {
+    matches!(
+        canonical_foldexpr(expr),
+        "vim.treesitter.foldexpr" | "nx.treesitter.foldexpr"
+    )
+}
+
+/// Normalize a `'foldexpr'` to its bare callable name for the native-marker
+/// checks: drop surrounding whitespace, an optional `v:lua.` prefix, and a
+/// trailing `()`, so the common config spellings all collapse to one form.
+fn canonical_foldexpr(expr: &str) -> &str {
     let e = expr.trim();
     let e = e.strip_prefix("v:lua.").unwrap_or(e);
-    let e = e.strip_suffix("()").unwrap_or(e);
-    matches!(e, "vim.treesitter.foldexpr" | "nx.treesitter.foldexpr")
+    e.strip_suffix("()").unwrap_or(e)
 }
 
 /// Whether `'foldexpr'` is the canonical LSP foldexpr marker — `nx.lsp.foldexpr`
@@ -1221,10 +1241,10 @@ fn is_treesitter_foldexpr(expr: &str) -> bool {
 /// reference the fold engine recognizes rather than a per-line Lua call: the
 /// server requests `textDocument/foldingRange` and pushes the ranges in.
 fn is_lsp_foldexpr(expr: &str) -> bool {
-    let e = expr.trim();
-    let e = e.strip_prefix("v:lua.").unwrap_or(e);
-    let e = e.strip_suffix("()").unwrap_or(e);
-    matches!(e, "vim.lsp.foldexpr" | "nx.lsp.foldexpr")
+    matches!(
+        canonical_foldexpr(expr),
+        "vim.lsp.foldexpr" | "nx.lsp.foldexpr"
+    )
 }
 
 /// Turn opaque foldable line spans (tree-sitter `@fold` node ranges or LSP
@@ -1334,19 +1354,7 @@ fn ranges_from_foldexpr_values(
     }
     // Resolve `-1` lines to `min(prev_defined, next_defined)` — the rule that keeps
     // an undefined line inside the shallower of the blocks bracketing it.
-    for i in 0..n {
-        if !undefined[i] {
-            continue;
-        }
-        let prev = (0..i).rev().find(|&j| !undefined[j]).map(|j| levels[j]);
-        let next = (i + 1..n).find(|&j| !undefined[j]).map(|j| levels[j]);
-        levels[i] = match (prev, next) {
-            (Some(p), Some(q)) => p.min(q),
-            (Some(p), None) => p,
-            (None, Some(q)) => q,
-            (None, None) => 0,
-        };
-    }
+    resolve_masked_levels(&mut levels, &undefined);
     ranges_from_levels(&levels, foldminlines)
 }
 

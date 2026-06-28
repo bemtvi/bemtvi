@@ -842,6 +842,25 @@ impl Editor {
         mp
     }
 
+    /// Advance the shared status-line / tabline multi-click counter for a press at
+    /// `(row, col)` stamped `stamp_ms`: bump the run (capped at a triple-click) when
+    /// it repeats on the same cell within `'mousetime'`, else restart at 1. Records
+    /// the new state and returns the click count.
+    fn next_statusline_click(&mut self, row: usize, col: usize, stamp_ms: u64) -> u8 {
+        let clicks = match self.statusline_click_seq {
+            Some((r, c, stamp, count))
+                if r == row
+                    && c == col
+                    && stamp_ms.saturating_sub(stamp) <= self.options.mousetime as u64 =>
+            {
+                (count + 1).min(3)
+            }
+            _ => 1,
+        };
+        self.statusline_click_seq = Some((row, col, stamp_ms, clicks));
+        clicks
+    }
+
     /// A left-press that hit-tested to a window's status line: focus the window
     /// (vim — crossing into its region if it is a dock) and record a
     /// [`StatuslineClick`] for the server to resolve against the line's `%@…%X`
@@ -864,27 +883,8 @@ impl Editor {
         // their own tracker so this press doesn't seed a text drag.
         self.mouse_select = None;
         self.set_current_window(win);
-        let clicks = match self.statusline_click_seq {
-            Some((r, c, stamp, count))
-                if r == ev.row
-                    && c == ev.col
-                    && ev.stamp_ms.saturating_sub(stamp) <= self.options.mousetime as u64 =>
-            {
-                (count + 1).min(3)
-            }
-            _ => 1,
-        };
-        self.statusline_click_seq = Some((ev.row, ev.col, ev.stamp_ms, clicks));
-        let mut modifiers = String::new();
-        if ev.shift {
-            modifiers.push('s');
-        }
-        if ev.ctrl {
-            modifiers.push('c');
-        }
-        if ev.alt {
-            modifiers.push('a');
-        }
+        let clicks = self.next_statusline_click(ev.row, ev.col, ev.stamp_ms);
+        let modifiers = mouse_modifier_str(ev.shift, ev.ctrl, ev.alt);
         self.statusline_clicks.push(StatuslineClick {
             win,
             col,
@@ -908,27 +908,8 @@ impl Editor {
             return;
         };
         self.mouse_select = None;
-        let clicks = match self.statusline_click_seq {
-            Some((r, c, stamp, count))
-                if r == ev.row
-                    && c == ev.col
-                    && ev.stamp_ms.saturating_sub(stamp) <= self.options.mousetime as u64 =>
-            {
-                (count + 1).min(3)
-            }
-            _ => 1,
-        };
-        self.statusline_click_seq = Some((ev.row, ev.col, ev.stamp_ms, clicks));
-        let mut modifiers = String::new();
-        if ev.shift {
-            modifiers.push('s');
-        }
-        if ev.ctrl {
-            modifiers.push('c');
-        }
-        if ev.alt {
-            modifiers.push('a');
-        }
+        let clicks = self.next_statusline_click(ev.row, ev.col, ev.stamp_ms);
+        let modifiers = mouse_modifier_str(ev.shift, ev.ctrl, ev.alt);
         self.statusline_clicks.push(StatuslineClick {
             win: self.current_window_id(),
             col,
@@ -1135,8 +1116,7 @@ impl Editor {
     fn region_at(&self, row: usize, col: usize) -> Option<(Layer, usize, usize)> {
         self.region_geoms().into_iter().find_map(|g| {
             let (x, y, w, h) = g.tree;
-            (col >= x && col < x.saturating_add(w) && row >= y && row < y.saturating_add(h))
-                .then_some((g.layer, x, y))
+            rect_contains(x, y, w, h, col, row).then_some((g.layer, x, y))
         })
     }
 
@@ -1722,10 +1702,9 @@ impl Editor {
     /// last redraw) can never fire.
     fn complete_docs_hit_at(&self, row: usize, col: usize) -> bool {
         self.completion_active()
-            && self.complete_docs_hit.is_some_and(|h| {
-                (h.x..h.x.saturating_add(h.w)).contains(&col)
-                    && (h.y..h.y.saturating_add(h.h)).contains(&row)
-            })
+            && self
+                .complete_docs_hit
+                .is_some_and(|h| rect_contains(h.x, h.y, h.w, h.h, col, row))
     }
 
     /// Scroll the completion docs sidebar one line, non-wrapping (a wheel is a
@@ -1881,22 +1860,16 @@ impl Editor {
     fn menu_hit(&self, row: usize, col: usize) -> Option<MenuHit> {
         let s = self.menu_screen()?;
         let (bx, by, bw, bh) = s.box_rect;
-        if !((bx..bx.saturating_add(bw)).contains(&col)
-            && (by..by.saturating_add(bh)).contains(&row))
-        {
+        if !rect_contains(bx, by, bw, bh, col, row) {
             return None;
         }
         if let Some((px, py, pw, ph)) = s.preview {
-            if (px..px.saturating_add(pw)).contains(&col)
-                && (py..py.saturating_add(ph)).contains(&row)
-            {
+            if rect_contains(px, py, pw, ph, col, row) {
                 return Some(MenuHit::Preview);
             }
         }
         let (lx, ly, lw, lrows) = s.list;
-        if (lx..lx.saturating_add(lw)).contains(&col)
-            && (ly..ly.saturating_add(lrows)).contains(&row)
-        {
+        if rect_contains(lx, ly, lw, lrows, col, row) {
             // The clicked offset into the list rect. When the list is painted
             // bottom-up (the cmdline wildmenu) the top visual row is the last
             // logical one, so flip the offset before adding the scroll start.
@@ -2450,6 +2423,30 @@ impl Editor {
 /// `None` when the cell is on a separator or outside every window. `tree` lays out
 /// at its own origin `(0, 0)`, so the caller subtracts the region's screen origin
 /// before calling (see [`Editor::region_at`]).
+/// The vim mouse-modifier string for a click — `'s'` (shift), `'c'` (ctrl),
+/// `'a'` (alt) in that order, empty when none are held. The form the status-line
+/// / tabline `%@` click regions carry.
+fn mouse_modifier_str(shift: bool, ctrl: bool, alt: bool) -> String {
+    let mut modifiers = String::new();
+    if shift {
+        modifiers.push('s');
+    }
+    if ctrl {
+        modifiers.push('c');
+    }
+    if alt {
+        modifiers.push('a');
+    }
+    modifiers
+}
+
+/// Whether the screen cell `(col, row)` lies inside the `w`×`h` rect anchored at
+/// `(x, y)` — the shared point-in-rect test for the float / menu / docs-sidebar
+/// hit-testing.
+fn rect_contains(x: usize, y: usize, w: usize, h: usize, col: usize, row: usize) -> bool {
+    (x..x.saturating_add(w)).contains(&col) && (y..y.saturating_add(h)).contains(&row)
+}
+
 fn window_at_in(tree: &WindowTree, x: usize, y: usize) -> Option<(WindowId, usize, usize)> {
     let probe = |id: WindowId| -> Option<(WindowId, usize, usize)> {
         let w = tree.get(id);

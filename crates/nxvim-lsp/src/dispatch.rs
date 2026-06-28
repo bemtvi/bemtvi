@@ -16,18 +16,18 @@ use lsp_types::{
     DidSaveTextDocumentParams, DocumentFormattingParams, DocumentSymbolParams, FoldingRangeParams,
     FormattingOptions, GotoDefinitionParams, HoverParams, InlayHint, InlayHintParams,
     PartialResultParams, Position, ReferenceContext, ReferenceParams, RenameParams,
-    SemanticTokensDeltaParams, SemanticTokensFullDeltaResult, SemanticTokensParams,
-    SemanticTokensResult, SignatureHelpParams, TextDocumentIdentifier, TextDocumentItem,
-    TextDocumentPositionParams, Url, VersionedTextDocumentIdentifier, WorkspaceSymbolParams,
+    SemanticTokensDeltaParams, SemanticTokensParams, SignatureHelpParams, TextDocumentIdentifier,
+    TextDocumentItem, TextDocumentPositionParams, Url, VersionedTextDocumentIdentifier,
+    WorkspaceSymbolParams,
 };
 
 use crate::convert::{
-    code_actions, completion_reply, document_symbols, documentation_lines, folding_ranges,
-    goto_locations, hover_reply, inlay_hint, inlay_label_core, normalize_workspace_edit, pad_label,
-    signature_help_reply, workspace_symbols,
+    code_actions, completion_reply, document_symbols, folding_ranges, goto_locations, hover_reply,
+    inlay_hint, normalize_workspace_edit, resolved_completion, resolved_inlay_hint,
+    semantic_tokens_delta_data, semantic_tokens_full, signature_help_reply, workspace_symbols,
 };
 use crate::log::{LogLevel, LspLog};
-use crate::protocol::{LspNotify, LspReply, LspRequest, SemanticTokensData};
+use crate::protocol::{LspNotify, LspReply, LspRequest};
 
 /// Translate an [`LspNotify`] into the corresponding `async-lsp` notification.
 /// Send errors are ignored: a dead socket is detected by the main loop ending.
@@ -322,32 +322,13 @@ pub(crate) async fn issue_request(
                 work_done_progress_params: Default::default(),
                 partial_result_params: Default::default(),
             };
-            match sock.semantic_tokens_full(params).await {
-                // Both the full (`Tokens`) and streamed (`Partial`) shapes carry
-                // the same packed `data`; only the full one has a `result_id` (the
-                // delta cursor — Phase 2). A `null` result ⇒ no tokens.
-                Ok(Some(SemanticTokensResult::Tokens(t))) => {
-                    LspReply::SemanticTokens(SemanticTokensData::Full {
-                        result_id: t.result_id,
-                        tokens: t.data,
-                    })
-                }
-                Ok(Some(SemanticTokensResult::Partial(p))) => {
-                    LspReply::SemanticTokens(SemanticTokensData::Full {
-                        result_id: None,
-                        tokens: p.data,
-                    })
-                }
-                Ok(None) => LspReply::SemanticTokens(empty_semantic_tokens()),
-                Err(e) => {
-                    log.log(
-                        LogLevel::Warn,
-                        name,
-                        &format!("semanticTokens/full failed: {e}"),
-                    );
-                    LspReply::SemanticTokens(empty_semantic_tokens())
-                }
-            }
+            let resp = unwrap_logged(
+                sock.semantic_tokens_full(params).await,
+                log,
+                name,
+                "semanticTokens/full",
+            );
+            LspReply::SemanticTokens(semantic_tokens_full(resp))
         }
         LspRequest::SemanticTokensDelta {
             uri,
@@ -359,39 +340,13 @@ pub(crate) async fn issue_request(
                 work_done_progress_params: Default::default(),
                 partial_result_params: Default::default(),
             };
-            match sock.semantic_tokens_full_delta(params).await {
-                // The server diffed against our `previousResultId`: splice edits.
-                Ok(Some(SemanticTokensFullDeltaResult::TokensDelta(d))) => {
-                    LspReply::SemanticTokens(SemanticTokensData::Delta {
-                        result_id: d.result_id,
-                        edits: d.edits,
-                    })
-                }
-                Ok(Some(SemanticTokensFullDeltaResult::PartialTokensDelta { edits })) => {
-                    LspReply::SemanticTokens(SemanticTokensData::Delta {
-                        result_id: None,
-                        edits,
-                    })
-                }
-                // The server couldn't honor the `previousResultId` (or chose not
-                // to) and answered with a fresh full set: the transparent fallback,
-                // applied by replacing the cache rather than patching it.
-                Ok(Some(SemanticTokensFullDeltaResult::Tokens(t))) => {
-                    LspReply::SemanticTokens(SemanticTokensData::Full {
-                        result_id: t.result_id,
-                        tokens: t.data,
-                    })
-                }
-                Ok(None) => LspReply::SemanticTokens(empty_semantic_tokens()),
-                Err(e) => {
-                    log.log(
-                        LogLevel::Warn,
-                        name,
-                        &format!("semanticTokens/full/delta failed: {e}"),
-                    );
-                    LspReply::SemanticTokens(empty_semantic_tokens())
-                }
-            }
+            let resp = unwrap_logged(
+                sock.semantic_tokens_full_delta(params).await,
+                log,
+                name,
+                "semanticTokens/full/delta",
+            );
+            LspReply::SemanticTokens(semantic_tokens_delta_data(resp))
         }
         LspRequest::InlayHint { uri, range } => {
             let params = InlayHintParams {
@@ -454,10 +409,7 @@ async fn resolve_completion_reply(
         }
     };
     match sock.completion_item_resolve(item).await {
-        Ok(resolved) => LspReply::ResolvedCompletion {
-            documentation: resolved.documentation.and_then(documentation_lines),
-            detail: resolved.detail,
-        },
+        Ok(resolved) => resolved_completion(Some(resolved)),
         Err(e) => {
             log.log(
                 LogLevel::Warn,
@@ -494,11 +446,7 @@ async fn resolve_inlay_hint_reply(
         }
     };
     match sock.inlay_hint_resolve(hint).await {
-        Ok(resolved) => {
-            let core = inlay_label_core(&resolved);
-            let label = (!core.is_empty()).then(|| pad_label(&core, &resolved));
-            LspReply::ResolvedInlayHint { label }
-        }
+        Ok(resolved) => resolved_inlay_hint(Some(&resolved)),
         Err(e) => {
             log.log(
                 LogLevel::Warn,
@@ -705,17 +653,6 @@ fn text_document_position(uri: Url, position: Position) -> TextDocumentPositionP
     TextDocumentPositionParams {
         text_document: TextDocumentIdentifier { uri },
         position,
-    }
-}
-
-/// The "server classified nothing" reply: a full set with no tokens and no
-/// `result_id`. Used for `null`/error replies to both `full` and `full/delta`, so
-/// the editor clears its cache (and drops the `result_id`, falling back to `full`
-/// on the next refresh) rather than guessing.
-fn empty_semantic_tokens() -> SemanticTokensData {
-    SemanticTokensData::Full {
-        result_id: None,
-        tokens: Vec::new(),
     }
 }
 

@@ -93,13 +93,7 @@ pub fn installed_parsers() -> Vec<InstalledParser> {
 /// The grammar names installed under `<root>/parser/` — files named `<lang>.<ext>`
 /// for a loadable extension (`.so` on every OS, plus the platform-native one).
 fn parser_langs_in(root: &Path) -> Vec<String> {
-    let native = if cfg!(target_os = "windows") {
-        "dll"
-    } else if cfg!(target_os = "macos") {
-        "dylib"
-    } else {
-        "so"
-    };
+    let native = loader::native_lib_ext();
     let Ok(entries) = std::fs::read_dir(root.join("parser")) else {
         return Vec::new();
     };

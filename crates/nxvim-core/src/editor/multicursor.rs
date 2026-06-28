@@ -95,13 +95,7 @@ impl Editor {
             return;
         }
         self.clear_anchor_marks();
-        let heads: Vec<(u64, usize)> = self
-            .buffer()
-            .extmarks
-            .iter_with_ns()
-            .filter(|(ns, _)| *ns == CURSOR_NS)
-            .map(|(_, m)| (m.id, m.start))
-            .collect();
+        let heads: Vec<(u64, usize)> = self.cursor_marks().map(|m| (m.id, m.start)).collect();
         for (id, at) in heads {
             self.set_anchor_mark(id, at);
         }
@@ -121,11 +115,8 @@ impl Editor {
         // Swap each secondary's head and anchor. Collect first (the swap mutates
         // the same store we're iterating).
         let pairs: Vec<(u64, usize, usize)> = self
-            .buffer()
-            .extmarks
-            .iter_with_ns()
-            .filter(|(ns, _)| *ns == CURSOR_NS)
-            .filter_map(|(_, m)| Some((m.id, m.start, self.anchor_mark_pos(m.id)?)))
+            .cursor_marks()
+            .filter_map(|m| Some((m.id, m.start, self.anchor_mark_pos(m.id)?)))
             .collect();
         for (id, head, anchor) in pairs {
             self.set_cursor_mark(Some(id), anchor);
@@ -152,11 +143,8 @@ impl Editor {
     /// selection) if somehow unpaired. Only meaningful inside a visual mode.
     pub(crate) fn secondary_selections(&self) -> Vec<(Cursor, Cursor)> {
         let mut heads: Vec<(usize, usize)> = self
-            .buffer()
-            .extmarks
-            .iter_with_ns()
-            .filter(|(ns, _)| *ns == CURSOR_NS)
-            .map(|(_, m)| {
+            .cursor_marks()
+            .map(|m| {
                 let anchor = self.anchor_mark_pos(m.id).unwrap_or(m.start);
                 (anchor, m.start)
             })
@@ -170,23 +158,25 @@ impl Editor {
 
     /// Byte offsets of every secondary cursor in the current buffer, ascending.
     pub(crate) fn secondary_cursor_bytes(&self) -> Vec<usize> {
-        let mut v: Vec<usize> = self
-            .buffer()
-            .extmarks
-            .iter_with_ns()
-            .filter(|(ns, _)| *ns == CURSOR_NS)
-            .map(|(_, m)| m.start)
-            .collect();
+        let mut v: Vec<usize> = self.cursor_marks().map(|m| m.start).collect();
         v.sort_unstable();
         v
     }
 
-    /// Whether any secondary cursor is active on the current buffer.
-    pub(crate) fn has_secondary_cursors(&self) -> bool {
+    /// Every secondary cursor's [`CURSOR_NS`] extmark in the current buffer, in
+    /// store order. The shared read prelude behind the multi-cursor queries (heads,
+    /// byte positions, selection pairs) — each chains its own `map`/`filter`.
+    fn cursor_marks(&self) -> impl Iterator<Item = &crate::extmark::Extmark> {
         self.buffer()
             .extmarks
             .iter_with_ns()
-            .any(|(ns, _)| ns == CURSOR_NS)
+            .filter(|(ns, _)| *ns == CURSOR_NS)
+            .map(|(_, m)| m)
+    }
+
+    /// Whether any secondary cursor is active on the current buffer.
+    pub(crate) fn has_secondary_cursors(&self) -> bool {
+        self.cursor_marks().next().is_some()
     }
 
     /// Whether secondary cursors should take part in the current command. True
@@ -316,11 +306,9 @@ impl Editor {
     pub(crate) fn place_cursor_here(&mut self) {
         let at = self.cursor_char();
         let existing: Vec<u64> = self
-            .buffer()
-            .extmarks
-            .iter_with_ns()
-            .filter(|(ns, m)| *ns == CURSOR_NS && m.start == at)
-            .map(|(_, m)| m.id)
+            .cursor_marks()
+            .filter(|m| m.start == at)
+            .map(|m| m.id)
             .collect();
         let bid = self.cur_buffer();
         if existing.is_empty() {
@@ -339,11 +327,7 @@ impl Editor {
     /// sitting under the primary) leaves it in place rather than toggling it off.
     pub(crate) fn ensure_cursor_here(&mut self) {
         let at = self.cursor_char();
-        let occupied = self
-            .buffer()
-            .extmarks
-            .iter_with_ns()
-            .any(|(ns, m)| ns == CURSOR_NS && m.start == at);
+        let occupied = self.cursor_marks().any(|m| m.start == at);
         if !occupied {
             self.set_cursor_mark(None, at);
         }
@@ -362,13 +346,7 @@ impl Editor {
     /// nearest one (ties → topmost) before the dedup below — the placed set is then
     /// exactly the cursors the user dropped, no more.
     pub(crate) fn finish_multicursor(&mut self) {
-        let marks: Vec<(u64, usize)> = self
-            .buffer()
-            .extmarks
-            .iter_with_ns()
-            .filter(|(ns, _)| *ns == CURSOR_NS)
-            .map(|(_, m)| (m.id, m.start))
-            .collect();
+        let marks: Vec<(u64, usize)> = self.cursor_marks().map(|m| (m.id, m.start)).collect();
         let at = self.cursor_char();
         if !marks.is_empty() && !marks.iter().any(|&(_, s)| s == at) {
             let target = marks
@@ -434,13 +412,7 @@ impl Editor {
 
         // Visit highest byte first (see the method doc). Read ids now; positions
         // are re-read live each step, after prior edits have shifted them.
-        let mut ids: Vec<(u64, usize)> = self
-            .buffer()
-            .extmarks
-            .iter_with_ns()
-            .filter(|(ns, _)| *ns == CURSOR_NS)
-            .map(|(_, m)| (m.id, m.start))
-            .collect();
+        let mut ids: Vec<(u64, usize)> = self.cursor_marks().map(|m| (m.id, m.start)).collect();
         ids.sort_unstable_by_key(|&(_, start)| std::cmp::Reverse(start));
 
         for (id, _) in ids {
@@ -499,11 +471,8 @@ impl Editor {
         // that cell — so seed `seen` with it.
         seen.insert(self.cursor_char());
         let dups: Vec<u64> = self
-            .buffer()
-            .extmarks
-            .iter_with_ns()
-            .filter(|(ns, _)| *ns == CURSOR_NS)
-            .filter_map(|(_, m)| (!seen.insert(m.start)).then_some(m.id))
+            .cursor_marks()
+            .filter_map(|m| (!seen.insert(m.start)).then_some(m.id))
             .collect();
         let bid = self.cur_buffer();
         for id in dups {

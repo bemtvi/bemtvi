@@ -312,6 +312,13 @@ impl WasmSyntax {
     fn lang_cstr(language: &str) -> Option<CString> {
         CString::new(language).ok()
     }
+
+    /// The C-string language for an opened `buffer` (the FFI-bridge query key), or `None`
+    /// when the engine never opened that buffer / its language won't form a C string —
+    /// every grammar-availability check and indent/fold query starts here.
+    fn lang_for(&self, buffer: BufferId) -> Option<CString> {
+        Self::lang_cstr(&self.buffers.get(&buffer)?.language)
+    }
 }
 
 impl SyntaxEngine for WasmSyntax {
@@ -389,13 +396,8 @@ impl SyntaxEngine for WasmSyntax {
     }
 
     fn indents_available(&self, buffer: BufferId) -> bool {
-        let Some(state) = self.buffers.get(&buffer) else {
-            return false;
-        };
-        let Some(lang) = Self::lang_cstr(&state.language) else {
-            return false;
-        };
-        unsafe { eh_js_ts_available(lang.as_ptr()) != 0 }
+        self.lang_for(buffer)
+            .is_some_and(|lang| unsafe { eh_js_ts_available(lang.as_ptr()) != 0 })
     }
 
     fn folds(&mut self, buffer: BufferId) -> Vec<FoldRange> {
@@ -454,13 +456,8 @@ impl SyntaxEngine for WasmSyntax {
     }
 
     fn folds_available(&self, buffer: BufferId) -> bool {
-        let Some(state) = self.buffers.get(&buffer) else {
-            return false;
-        };
-        let Some(lang) = Self::lang_cstr(&state.language) else {
-            return false;
-        };
-        unsafe { eh_js_ts_folds_available(lang.as_ptr()) != 0 }
+        self.lang_for(buffer)
+            .is_some_and(|lang| unsafe { eh_js_ts_folds_available(lang.as_ptr()) != 0 })
     }
 
     fn set_query(&mut self, _lang: &str, _name: &str, _text: Option<String>) -> Result<(), String> {
@@ -810,6 +807,31 @@ unsafe fn as_str<'a>(p: *const c_char) -> &'a str {
     CStr::from_ptr(p).to_str().unwrap_or("")
 }
 
+/// Borrow a JS-supplied `(ptr, len)` byte buffer as a `&[u8]` (empty on null / zero
+/// length). The common marshalling for every FFI export that takes raw bytes
+/// (PTY / process / socket / LSP output, fs payloads) — arbitrary bytes that can't cross
+/// as a C string (NULs / invalid UTF-8).
+///
+/// # Safety
+/// `data` must point at `len` readable bytes for the call's duration (or be null with
+/// `len` 0).
+unsafe fn as_bytes<'a>(data: *const u8, len: usize) -> &'a [u8] {
+    if data.is_null() || len == 0 {
+        &[]
+    } else {
+        std::slice::from_raw_parts(data, len)
+    }
+}
+
+/// Owned-`Vec` twin of [`as_bytes`] for the callers that keep the bytes past the call
+/// (handing them to the core, which stores them).
+///
+/// # Safety
+/// Same contract as [`as_bytes`].
+unsafe fn as_byte_vec(data: *const u8, len: usize) -> Vec<u8> {
+    as_bytes(data, len).to_vec()
+}
+
 /// Move a `String` out to JS as an owned `char*`; the caller frees it via
 /// [`eh_free_string`] (the harness's `readStr` does this).
 fn into_owned_cstr(s: String) -> *mut c_char {
@@ -993,11 +1015,7 @@ pub unsafe extern "C" fn eh_apply_remote_config(
     let Some(handle) = h.as_mut() else {
         return into_owned_cstr(String::new());
     };
-    let bytes = if data.is_null() || len == 0 {
-        &[][..]
-    } else {
-        std::slice::from_raw_parts(data, len)
-    };
+    let bytes = as_bytes(data, len);
     let result = decode_config_bundle_bytes(bytes)
         .and_then(|bundle| handle.host.apply_remote_config(bundle));
     match result {
@@ -1315,11 +1333,7 @@ pub unsafe extern "C" fn eh_fs_read_complete(
             .host
             .complete_fs_read_dir(buffer, path, parse_dir_entries(as_str(contents)));
     } else {
-        let bytes = if data.is_null() || len == 0 {
-            &[][..]
-        } else {
-            std::slice::from_raw_parts(data, len)
-        };
+        let bytes = as_bytes(data, len);
         handle
             .host
             .complete_fs_read(buffer, path, kind, bytes, as_str(contents));
@@ -1521,16 +1535,8 @@ pub unsafe extern "C" fn eh_proc_exited(
     err_len: usize,
 ) {
     let Some(handle) = h.as_mut() else { return };
-    let stdout = if out.is_null() || out_len == 0 {
-        Vec::new()
-    } else {
-        std::slice::from_raw_parts(out, out_len).to_vec()
-    };
-    let stderr = if err.is_null() || err_len == 0 {
-        Vec::new()
-    } else {
-        std::slice::from_raw_parts(err, err_len).to_vec()
-    };
+    let stdout = as_byte_vec(out, out_len);
+    let stderr = as_byte_vec(err, err_len);
     handle
         .host
         .proc_exited(id.max(0.0) as u64, code as i32, stdout, stderr);
@@ -1595,11 +1601,7 @@ pub unsafe extern "C" fn eh_dproc_out(
     stderr: i32,
 ) {
     let Some(handle) = h.as_mut() else { return };
-    let bytes = if data.is_null() || len == 0 {
-        Vec::new()
-    } else {
-        std::slice::from_raw_parts(data, len).to_vec()
-    };
+    let bytes = as_byte_vec(data, len);
     handle
         .host
         .dproc_out(id.max(0.0) as u64, bytes, stderr != 0);
@@ -1667,11 +1669,7 @@ pub unsafe extern "C" fn eh_sock_connected(h: *mut WasmEditHost, id: f64) {
 #[no_mangle]
 pub unsafe extern "C" fn eh_sock_data(h: *mut WasmEditHost, id: f64, data: *const u8, len: usize) {
     let Some(handle) = h.as_mut() else { return };
-    let bytes = if data.is_null() || len == 0 {
-        Vec::new()
-    } else {
-        std::slice::from_raw_parts(data, len).to_vec()
-    };
+    let bytes = as_byte_vec(data, len);
     handle.host.sock_data(id.max(0.0) as u64, bytes);
 }
 
@@ -1830,11 +1828,7 @@ pub unsafe extern "C" fn eh_fs_op_result(
     len: usize,
 ) {
     let Some(handle) = h.as_mut() else { return };
-    let reply = if data.is_null() || len == 0 {
-        Vec::new()
-    } else {
-        std::slice::from_raw_parts(data, len).to_vec()
-    };
+    let reply = as_byte_vec(data, len);
     handle.host.fs_op_result(id.max(0.0) as u64, reply);
 }
 
@@ -1966,11 +1960,7 @@ pub unsafe extern "C" fn eh_terminal_data(
     len: usize,
 ) {
     let Some(handle) = h.as_mut() else { return };
-    let bytes = if data.is_null() || len == 0 {
-        &[][..]
-    } else {
-        std::slice::from_raw_parts(data, len)
-    };
+    let bytes = as_bytes(data, len);
     handle
         .host
         .terminal_feed(BufferId(buf.max(0.0) as u64), bytes);
@@ -2072,11 +2062,7 @@ pub unsafe extern "C" fn eh_take_lsp_requests(h: *mut WasmEditHost) -> *mut c_ch
 #[no_mangle]
 pub unsafe extern "C" fn eh_lsp_stdout(h: *mut WasmEditHost, id: f64, data: *const u8, len: usize) {
     let Some(handle) = h.as_mut() else { return };
-    let bytes = if data.is_null() || len == 0 {
-        Vec::new()
-    } else {
-        std::slice::from_raw_parts(data, len).to_vec()
-    };
+    let bytes = as_byte_vec(data, len);
     handle.host.lsp_stdout(id.max(0.0) as u64, bytes);
 }
 
@@ -2092,11 +2078,7 @@ pub unsafe extern "C" fn eh_lsp_stdout(h: *mut WasmEditHost, id: f64, data: *con
 #[no_mangle]
 pub unsafe extern "C" fn eh_lsp_stderr(h: *mut WasmEditHost, id: f64, data: *const u8, len: usize) {
     let Some(handle) = h.as_mut() else { return };
-    let bytes = if data.is_null() || len == 0 {
-        Vec::new()
-    } else {
-        std::slice::from_raw_parts(data, len).to_vec()
-    };
+    let bytes = as_byte_vec(data, len);
     handle.host.lsp_stderr(id.max(0.0) as u64, bytes);
 }
 

@@ -107,20 +107,29 @@ impl Registers {
         }
         let name = name.to_ascii_lowercase();
         if append {
-            let (mut buf, was_line) = match self.cells.get(&name) {
-                Some(cell) => (cell.text.clone(), cell.kind == RegKind::Line),
-                None => (String::new(), false),
-            };
-            buf.push_str(&text);
-            let merged = if was_line || kind == RegKind::Line {
-                RegKind::Line
-            } else {
-                kind
-            };
+            let (buf, merged) = self.append_cell(name, &text, kind);
             self.set(name, buf, merged);
         } else {
             self.set(name, text, kind);
         }
+    }
+
+    /// Append `text` to register `name`'s current contents, returning the merged
+    /// `(text, kind)` without writing it. The result stays [`RegKind::Line`] if
+    /// either the existing cell or the appended part is linewise (vim's rule); a
+    /// missing register appends onto an empty charwise base.
+    fn append_cell(&self, name: char, text: &str, kind: RegKind) -> (String, RegKind) {
+        let (mut buf, was_line) = match self.cells.get(&name) {
+            Some(cell) => (cell.text.clone(), cell.kind == RegKind::Line),
+            None => (String::new(), false),
+        };
+        buf.push_str(text);
+        let merged = if was_line || kind == RegKind::Line {
+            RegKind::Line
+        } else {
+            kind
+        };
+        (buf, merged)
     }
 
     /// Write an explicitly named register: uppercase `A`–`Z` *appends* to the
@@ -129,16 +138,7 @@ impl Registers {
     fn write_named(&mut self, name: char, text: String, kind: RegKind) {
         if name.is_ascii_uppercase() {
             let lower = name.to_ascii_lowercase();
-            let (mut buf, was_line) = match self.cells.get(&lower) {
-                Some(cell) => (cell.text.clone(), cell.kind == RegKind::Line),
-                None => (String::new(), false),
-            };
-            buf.push_str(&text);
-            let merged = if was_line || kind == RegKind::Line {
-                RegKind::Line
-            } else {
-                kind
-            };
+            let (buf, merged) = self.append_cell(lower, &text, kind);
             self.set(lower, buf.clone(), merged);
             self.set('"', buf, merged);
         } else {

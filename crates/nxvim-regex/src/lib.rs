@@ -161,16 +161,23 @@ fn set_default_context(_guard: &MutexGuard<'_, ()>) {
     unsafe { nxre_set_current(buf as *mut c_void, win as *mut c_void) };
 }
 
-fn take_error(fallback: &str) -> VimRegexError {
-    let msg = unsafe {
+/// Takes the engine's queued error message, if any, clearing it. Returns
+/// `None` when no error is pending (e.g. a plain non-match).
+fn pending_error() -> Option<VimRegexError> {
+    unsafe {
         let p = nxre_take_last_error();
         if p.is_null() {
             None
         } else {
-            Some(CStr::from_ptr(p).to_string_lossy().into_owned())
+            Some(VimRegexError(
+                CStr::from_ptr(p).to_string_lossy().into_owned(),
+            ))
         }
-    };
-    VimRegexError(msg.unwrap_or_else(|| fallback.to_string()))
+    }
+}
+
+fn take_error(fallback: &str) -> VimRegexError {
+    pending_error().unwrap_or_else(|| VimRegexError(fallback.to_string()))
 }
 
 // ---------------------------------------------------------------------------
@@ -314,6 +321,19 @@ impl VimRegex {
         &self.pattern
     }
 
+    /// The compiled program pointer, or a loud error if a prior exec's NFA→BT
+    /// fallback recompile failed and left it NULL (the engine would deref it).
+    /// Call under the engine lock.
+    fn checked_prog(&self) -> Result<*mut c_void, VimRegexError> {
+        let prog = self.prog.get();
+        if prog.is_null() {
+            return Err(VimRegexError(
+                "vim regex program is invalid (engine fallback recompile previously failed)".into(),
+            ));
+        }
+        Ok(prog)
+    }
+
     /// True if the compiled pattern can match across line boundaries
     /// (`\n`, `\_x` classes) — useful for choosing a search strategy.
     pub fn is_multiline(&self) -> bool {
@@ -354,13 +374,7 @@ impl VimRegex {
 
         let guard = engine();
         set_default_context(&guard);
-        if self.prog.get().is_null() {
-            // A prior exec's NFA→BT fallback recompile failed and left the
-            // program NULL; the engine would deref it. Fail loud.
-            return Err(VimRegexError(
-                "vim regex program is invalid (engine fallback recompile previously failed)".into(),
-            ));
-        }
+        let prog = self.checked_prog()?;
 
         thread_local! {
             static SUBJECT: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
@@ -374,7 +388,7 @@ impl VimRegex {
             let base = subject.as_ptr() as *const c_char;
 
             let mut rm = RegmatchT {
-                regprog: self.prog.get(),
+                regprog: prog,
                 startp: [std::ptr::null_mut(); NSUBEXP],
                 endp: [std::ptr::null_mut(); NSUBEXP],
                 rm_matchcol: 0,
@@ -386,11 +400,8 @@ impl VimRegex {
             // dangling one. It can also be left NULL if recompilation failed.
             self.prog.set(rm.regprog);
             if !matched {
-                if let Some(err) = unsafe { nxre_take_last_error().as_ref() } {
-                    let msg = unsafe { CStr::from_ptr(err) }
-                        .to_string_lossy()
-                        .into_owned();
-                    return Err(VimRegexError(msg));
+                if let Some(err) = pending_error() {
+                    return Err(err);
                 }
                 return Ok(None);
             }
@@ -616,16 +627,10 @@ impl VimBuffer {
             )));
         }
         let _guard = engine();
-        if re.prog.get().is_null() {
-            // A prior exec's NFA→BT fallback recompile failed and left the
-            // program NULL; the engine would deref it. Fail loud.
-            return Err(VimRegexError(
-                "vim regex program is invalid (engine fallback recompile previously failed)".into(),
-            ));
-        }
+        let prog = re.checked_prog()?;
 
         let mut rmm = RegmmatchT {
-            regprog: re.prog.get(),
+            regprog: prog,
             startpos: [LposT::default(); NSUBEXP],
             endpos: [LposT::default(); NSUBEXP],
             rmm_matchcol: 0,
@@ -668,11 +673,8 @@ impl VimBuffer {
             return Err(VimRegexError("vim regex match timed out".into()));
         }
         if nlines == 0 {
-            if let Some(err) = unsafe { nxre_take_last_error().as_ref() } {
-                let msg = unsafe { CStr::from_ptr(err) }
-                    .to_string_lossy()
-                    .into_owned();
-                return Err(VimRegexError(msg));
+            if let Some(err) = pending_error() {
+                return Err(err);
             }
             return Ok(None);
         }

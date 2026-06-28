@@ -334,6 +334,18 @@ fn parse_count_arg(args: &str) -> usize {
     parse_opt_count_arg(args).unwrap_or(1)
 }
 
+/// Format vim's substitute summary line — `"{count} {sing|plur} on {lines}
+/// line[s]"` — with the count/line singular-plural agreement the `:s` counting,
+/// edit, and confirm passes all share (only the noun differs: `match`/`matches`
+/// for the `n` flag, `substitution`/`substitutions` for an actual run).
+fn fmt_subst_report(count: usize, sing: &str, plur: &str, lines: usize) -> String {
+    format!(
+        "{count} {} on {lines} {}",
+        if count == 1 { sing } else { plur },
+        if lines == 1 { "line" } else { "lines" },
+    )
+}
+
 /// A positive numeric command argument, or `None` when absent / non-numeric. The
 /// `Option`-preserving form of [`parse_count_arg`] — `:tabnext` (no count → next
 /// tab) needs the absent case distinguished from `1` (no count → tab 1).
@@ -1128,11 +1140,7 @@ impl Editor {
             if matches == 0 {
                 self.echo(format!("E486: Pattern not found: {pattern}"));
             } else {
-                self.echo(format!(
-                    "{matches} {} on {nlines} {}",
-                    if matches == 1 { "match" } else { "matches" },
-                    if nlines == 1 { "line" } else { "lines" },
-                ));
+                self.echo(fmt_subst_report(matches, "match", "matches", nlines));
                 self.set_substitute_search(pattern);
             }
             return;
@@ -1185,14 +1193,11 @@ impl Editor {
 
         // vim stays silent for a single substitution on a single line.
         if subs != 1 || nlines != 1 {
-            self.echo(format!(
-                "{subs} {} on {nlines} {}",
-                if subs == 1 {
-                    "substitution"
-                } else {
-                    "substitutions"
-                },
-                if nlines == 1 { "line" } else { "lines" },
+            self.echo(fmt_subst_report(
+                subs,
+                "substitution",
+                "substitutions",
+                nlines,
             ));
         }
     }
@@ -1666,16 +1671,11 @@ impl Editor {
         // one substitution or more than one line (vim stays silent otherwise).
         self.message.clear();
         if sc.subs != 0 && (sc.subs != 1 || sc.nlines != 1) {
-            self.echo(format!(
-                "{} {} on {} {}",
+            self.echo(fmt_subst_report(
                 sc.subs,
-                if sc.subs == 1 {
-                    "substitution"
-                } else {
-                    "substitutions"
-                },
+                "substitution",
+                "substitutions",
                 sc.nlines,
-                if sc.nlines == 1 { "line" } else { "lines" },
             ));
         }
     }

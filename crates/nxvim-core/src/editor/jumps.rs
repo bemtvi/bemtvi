@@ -158,13 +158,7 @@ impl Editor {
         if target.buf != self.cur_buffer() {
             self.switch_buffer(target.buf);
         }
-        let line = target.line.min(self.last_line());
-        let max_col = self.buffer().line(line).trim_end_matches('\n').len();
-        let col = target.col.min(max_col);
-        self.set_cursor_char(self.buffer().byte_at(line, col));
-        self.desired_col = self.cursor_virtcol();
-        self.desired_eol = false;
-        self.ensure_visible();
+        self.settle_cursor_at(target.line, target.col);
     }
 
     /// Shift every window's jumplist to follow the line edits each buffer recorded

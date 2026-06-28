@@ -5,6 +5,7 @@
 //! array-vs-map rule lives in a single place. Also the small opts-table readers
 //! the `nvim_set_hl` / `vim.system` bridges lean on.
 
+use crate::ops::OptionValue;
 use mlua::{Lua, Table};
 
 /// Maximum table/value nesting the recursive bridges will walk before bailing
@@ -63,6 +64,23 @@ pub(crate) fn color_field(opts: &Table, key: &str) -> mlua::Result<Option<String
 /// non-boolean reads as `false`.
 pub(crate) fn flag_field(opts: &Table, key: &str) -> mlua::Result<bool> {
     Ok(opts.get::<Option<bool>>(key)?.unwrap_or(false))
+}
+
+/// Coerce a Lua value into the wire [`OptionValue`] the option-write bridges
+/// (`nx._buf_set_option` / `_set_global_option` / `_win_set_option` /
+/// `dock._set_opt` / `_set_workspace_option`) queue: a boolean → `Bool`, an
+/// integer/float → `Number`, a string → `String`. Any other type (or a non-UTF-8
+/// Lua string) yields `None`, which every caller treats as "ignore this write".
+/// `nil` is *not* special-cased here — the workspace bridge handles `nil` as an
+/// explicit clear before consulting this helper.
+pub(crate) fn value_to_option(value: &mlua::Value) -> mlua::Result<Option<OptionValue>> {
+    Ok(match value {
+        mlua::Value::Boolean(b) => Some(OptionValue::Bool(*b)),
+        mlua::Value::Integer(n) => Some(OptionValue::Number(lua_i64(*n))),
+        mlua::Value::Number(n) => Some(OptionValue::Number(*n as i64)),
+        mlua::Value::String(s) => s.to_str().ok().map(|s| OptionValue::String(s.to_string())),
+        _ => None,
+    })
 }
 
 /// Parse a color spec — as already normalized by [`color_field`] to `"#rrggbb"`,

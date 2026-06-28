@@ -58,16 +58,7 @@ impl HlDef {
     /// Whether this definition carries no usable style (no colors, no attrs, no
     /// link) — the cleared state. Resolving such a group yields `None`.
     fn is_blank(&self) -> bool {
-        self.fg.is_none()
-            && self.bg.is_none()
-            && self.sp.is_none()
-            && !self.bold
-            && !self.italic
-            && !self.underline
-            && !self.undercurl
-            && !self.strikethrough
-            && !self.reverse
-            && self.link.is_none()
+        self.link.is_none() && Style::from_def(self).is_empty()
     }
 }
 

@@ -85,6 +85,39 @@ fn cursorline_style(win: &WindowView, view: &View) -> Style {
         .unwrap_or_else(|| Style::default().bg(Color::Indexed(236)))
 }
 
+/// The base style for status-line-tinted chrome — the per-window/global status
+/// bars, the split separators, and the permanent-dock border lines. The theme's
+/// `StatusLine` group when a colorscheme defines it, else reverse-video (vim's
+/// `WinSeparator`/status default out of the box).
+fn status_line_style(view: &View) -> Style {
+    view.status_line
+        .map(rt)
+        .unwrap_or_else(|| Style::default().add_modifier(Modifier::REVERSED))
+}
+
+/// Paint a horizontal run of `glyph` (`len` cells wide) at `(x, y)` in `style`.
+fn paint_hline(frame: &mut Frame, x: u16, y: u16, len: u16, glyph: &str, style: Style) {
+    if len == 0 {
+        return;
+    }
+    frame.render_widget(
+        Paragraph::new(Span::styled(glyph.repeat(len as usize), style)),
+        Rect::new(x, y, len, 1),
+    );
+}
+
+/// Paint a vertical run of `glyph` (`len` cells tall, one per row) at `(x, y)` in
+/// `style`.
+fn paint_vline(frame: &mut Frame, x: u16, y: u16, len: u16, glyph: &str, style: Style) {
+    if len == 0 {
+        return;
+    }
+    let rows: Vec<Line> = (0..len)
+        .map(|_| Line::from(Span::styled(glyph.to_string(), style)))
+        .collect();
+    frame.render_widget(Paragraph::new(Text::from(rows)), Rect::new(x, y, 1, len));
+}
+
 /// Map a neutral float [`nxvim_view::Border`] to the ratatui [`BorderType`] used
 /// to draw it. `Solid` (neovim's space border) renders as the nearest line style.
 fn bt(b: nxvim_view::Border) -> BorderType {
@@ -605,33 +638,48 @@ impl DockLayout {
     /// the **heavy** box-drawing glyphs (`━`/`┃`) so a permanent dock edge reads as
     /// distinct from the light (`─`/`│`) borders between ordinary window splits.
     fn render_borders(&self, frame: &mut Frame, view: &View) {
-        let style = view
-            .status_line
-            .map(rt)
-            .unwrap_or_else(|| Style::default().add_modifier(Modifier::REVERSED));
-        let hline = |frame: &mut Frame, x: u16, y: u16, len: u16| {
-            frame.render_widget(
-                Paragraph::new(Span::styled("━".repeat(len as usize), style)),
-                Rect::new(x, y, len, 1),
-            );
-        };
-        let vline = |frame: &mut Frame, x: u16, y: u16, len: u16| {
-            let rows: Vec<Line> = (0..len)
-                .map(|_| Line::from(Span::styled("┃", style)))
-                .collect();
-            frame.render_widget(Paragraph::new(Text::from(rows)), Rect::new(x, y, 1, len));
-        };
+        // The permanent-dock edges use the **heavy** box-drawing glyphs (`━`/`┃`) so
+        // a dock border reads as distinct from the light (`─`/`│`) split separators.
+        let style = status_line_style(view);
         if self.dt > 0 {
-            hline(frame, self.top.x, self.top.y + self.dt, self.top.width);
+            paint_hline(
+                frame,
+                self.top.x,
+                self.top.y + self.dt,
+                self.top.width,
+                "━",
+                style,
+            );
         }
         if self.db > 0 {
-            hline(frame, self.bottom.x, self.bottom.y - 1, self.bottom.width);
+            paint_hline(
+                frame,
+                self.bottom.x,
+                self.bottom.y - 1,
+                self.bottom.width,
+                "━",
+                style,
+            );
         }
         if self.dl > 0 {
-            vline(frame, self.left.x + self.dl, self.mid.y, self.mid.height);
+            paint_vline(
+                frame,
+                self.left.x + self.dl,
+                self.mid.y,
+                self.mid.height,
+                "┃",
+                style,
+            );
         }
         if self.dr > 0 {
-            vline(frame, self.right.x - 1, self.mid.y, self.mid.height);
+            paint_vline(
+                frame,
+                self.right.x - 1,
+                self.mid.y,
+                self.mid.height,
+                "┃",
+                style,
+            );
         }
     }
 }
@@ -1179,36 +1227,23 @@ fn paint_cursor_cell(
 /// (reverse-video out of the box), matching vim's `WinSeparator` default of
 /// reusing the status-line look. None to draw with a single window.
 fn render_separators(frame: &mut Frame, dock: &DockLayout, separators: &[Separator], view: &View) {
-    let style = view
-        .status_line
-        .map(rt)
-        .unwrap_or_else(|| Style::default().add_modifier(Modifier::REVERSED));
+    let style = status_line_style(view);
     for sep in separators {
         // Each separator is relative to its region's content origin.
         let wins_area = dock.content(sep.region);
         let x = wins_area.x + sep.x;
         let y = wins_area.y + sep.y;
-        let (w, h, lines): (u16, u16, Vec<Line>) = if sep.vertical {
-            // A column of `│`, one cell per row.
-            let rows = (0..sep.length)
-                .map(|_| Line::from(Span::styled("│", style)))
-                .collect();
-            (1, sep.length, rows)
-        } else {
-            // A single row of `─`.
-            let row = vec![Line::from(Span::styled(
-                "─".repeat(sep.length as usize),
-                style,
-            ))];
-            (sep.length, 1, row)
-        };
-        let rect = Rect::new(
-            x,
-            y,
-            w.min(wins_area.right().saturating_sub(x)),
-            h.min(wins_area.bottom().saturating_sub(y)),
-        );
-        frame.render_widget(Paragraph::new(Text::from(lines)), rect);
+        // Clamp the run to the windows area so a separator near an edge can't paint
+        // past it (the guard reproduces the old zero-size-rect clamp exactly).
+        if sep.vertical {
+            if wins_area.right() > x {
+                let len = sep.length.min(wins_area.bottom().saturating_sub(y));
+                paint_vline(frame, x, y, len, "│", style);
+            }
+        } else if wins_area.bottom() > y {
+            let len = sep.length.min(wins_area.right().saturating_sub(x));
+            paint_hline(frame, x, y, len, "─", style);
+        }
     }
 }
 
@@ -2240,10 +2275,7 @@ fn expand_tabs(line: &str, tabstop: usize) -> Cow<'_, str> {
 /// `segments` (an older server) leaves the bare base look across the row. Shared
 /// by the per-window status row and the global status line (`laststatus=3`).
 fn render_status(frame: &mut Frame, area: Rect, segments: &[StatusSegment], view: &View) {
-    let base = view
-        .status_line
-        .map(rt)
-        .unwrap_or_else(|| Style::default().add_modifier(Modifier::REVERSED));
+    let base = status_line_style(view);
 
     let spans: Vec<Span> = segments
         .iter()
@@ -2656,18 +2688,7 @@ fn render_menu(
 
     // The preview column: a vertical separator rule, then the windowed file.
     if let Some((sep_x, preview_area, pv)) = preview_layout {
-        let sep: Vec<Line> = (0..inner.height)
-            .map(|_| Line::from(Span::styled("│", sep_style)))
-            .collect();
-        frame.render_widget(
-            Paragraph::new(Text::from(sep)),
-            Rect {
-                x: sep_x,
-                y: inner.y,
-                width: 1,
-                height: inner.height,
-            },
-        );
+        paint_vline(frame, sep_x, inner.y, inner.height, "│", sep_style);
         let palette: Vec<Style> = styles.iter().copied().map(rt).collect();
         render_preview(frame, preview_area, pv, &palette);
     }

@@ -799,15 +799,22 @@ impl Editor {
     /// then does `<CR>` accept (until then it runs the typed line unchanged). A no-op
     /// unless a cmdline menu is open.
     pub(crate) fn cmdline_complete_next(&mut self) {
-        if let Some(m) = self.cmdline_menu_mut() {
-            m.select_next();
-        }
-        self.cmdline_complete_preview();
+        self.cmdline_complete_navigate(true);
     }
 
     pub(crate) fn cmdline_complete_prev(&mut self) {
+        self.cmdline_complete_navigate(false);
+    }
+
+    /// Step the wildmenu selection one row (`down` = forward) and re-preview it in
+    /// the command line — the shared body of `cmdline_complete_next`/`_prev`.
+    fn cmdline_complete_navigate(&mut self, down: bool) {
         if let Some(m) = self.cmdline_menu_mut() {
-            m.select_prev();
+            if down {
+                m.select_next();
+            } else {
+                m.select_prev();
+            }
         }
         self.cmdline_complete_preview();
     }
@@ -1079,17 +1086,24 @@ impl Editor {
     /// `<CR>` accept (otherwise it's a plain newline). A no-op unless a completion
     /// menu is open.
     pub(crate) fn complete_select_next(&mut self) {
-        if let Some(m) = self.completion_menu_mut() {
-            m.select_next();
-            // A new row's docs start at the top.
-            self.complete_docs_scroll = 0;
-            self.complete_docs_hscroll = 0;
-        }
+        self.complete_select_navigate(true);
     }
 
     pub(crate) fn complete_select_prev(&mut self) {
+        self.complete_select_navigate(false);
+    }
+
+    /// Step the completion selection one row (`down` = forward) and reset the docs
+    /// scroll to the new row's top — the shared body of
+    /// `complete_select_next`/`_prev`. A no-op unless a completion menu is open.
+    fn complete_select_navigate(&mut self, down: bool) {
         if let Some(m) = self.completion_menu_mut() {
-            m.select_prev();
+            if down {
+                m.select_next();
+            } else {
+                m.select_prev();
+            }
+            // A new row's docs start at the top.
             self.complete_docs_scroll = 0;
             self.complete_docs_hscroll = 0;
         }
@@ -1489,10 +1503,10 @@ impl Editor {
         }
     }
 
-    /// Move the highlight one row, non-wrapping (a wheel notch over the list) —
-    /// routed to the open menu's own `next`/`prev` action by kind.
-    pub(crate) fn menu_step(&mut self, down: bool) {
-        let action = if down { "next" } else { "prev" };
+    /// Route a string action to whichever list menu is open (picker or select),
+    /// ignoring its result; a no-op when no list menu is open. The shared dispatch
+    /// behind `menu_step`/`menu_confirm`/`menu_cancel` (the mouse/wheel entry points).
+    fn dispatch_menu_action(&mut self, action: &str) {
         match self.menu_kind() {
             Some(MenuKind::Picker) => {
                 let _ = self.apply_picker_action(action);
@@ -1504,32 +1518,22 @@ impl Editor {
         }
     }
 
+    /// Move the highlight one row, non-wrapping (a wheel notch over the list) —
+    /// routed to the open menu's own `next`/`prev` action by kind.
+    pub(crate) fn menu_step(&mut self, down: bool) {
+        self.dispatch_menu_action(if down { "next" } else { "prev" });
+    }
+
     /// Confirm the highlighted row of an open picker / select (a click on the
     /// already-highlighted row), routed by kind — pushes the chosen key and closes.
     pub(crate) fn menu_confirm(&mut self) {
-        match self.menu_kind() {
-            Some(MenuKind::Picker) => {
-                let _ = self.apply_picker_action("confirm");
-            }
-            Some(MenuKind::Select) => {
-                let _ = self.apply_select_action("confirm");
-            }
-            _ => {}
-        }
+        self.dispatch_menu_action("confirm");
     }
 
     /// Cancel an open picker / select (a click off the box), routed by kind —
     /// pushes the cancel result (`None`) and closes, like `<Esc>` on the widget.
     pub(crate) fn menu_cancel(&mut self) {
-        match self.menu_kind() {
-            Some(MenuKind::Picker) => {
-                let _ = self.apply_picker_action("cancel");
-            }
-            Some(MenuKind::Select) => {
-                let _ = self.apply_select_action("cancel");
-            }
-            _ => {}
-        }
+        self.dispatch_menu_action("cancel");
     }
 
     /// Scroll an open picker's preview pane (a wheel notch over it) by the coarsest

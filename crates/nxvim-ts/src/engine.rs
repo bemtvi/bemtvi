@@ -95,14 +95,7 @@ impl BufferState {
         let mut callback = |byte: usize, _: Point| -> &[u8] { read_chunk(shadow, byte) };
         // Cancel the parse once it has run longer than the deadline — the
         // in-process replacement for the worker's "never stalls the UI" property.
-        let started = Instant::now();
-        let mut budget = |_: &tree_sitter::ParseState| -> ControlFlow<()> {
-            if started.elapsed() >= PARSE_DEADLINE {
-                ControlFlow::Break(())
-            } else {
-                ControlFlow::Continue(())
-            }
-        };
+        let mut budget = deadline_budget(Instant::now(), PARSE_DEADLINE);
         let options = ParseOptions::new().progress_callback(&mut budget);
         // A `None` result means the deadline fired mid-parse. tree-sitter keeps the
         // outstanding parse on the parser, so the *next* `parse` call resumes where
@@ -319,39 +312,30 @@ impl Engine {
         let Some(Slot::Loaded(g)) = self.grammars.get_mut(lang) else {
             return Ok(());
         };
+        // Compile an *optional* query (`None` source → no query) against the live
+        // language, labelling a compile error with the query name. Shared by the
+        // optional arms below; `highlights` stays separate since its absence is an
+        // error, not "no query". `language` is a cheap (ref-counted) clone so the
+        // closure can borrow it while each arm assigns back into `g`.
+        let language = g.language.clone();
+        let compile_opt = |src: Option<String>, what: &str| -> Result<Option<Query>, String> {
+            match src {
+                Some(s) => Ok(Some(
+                    compile_query(&language, &s)
+                        .map_err(|e| format!("compiling {lang} {what}: {e}"))?,
+                )),
+                None => Ok(None),
+            }
+        };
         match name {
             "highlights" => {
                 let s = src.ok_or_else(|| format!("no highlights query on disk for '{lang}'"))?;
-                g.query = compile_query(&g.language, &s)
+                g.query = compile_query(&language, &s)
                     .map_err(|e| format!("compiling {lang} highlights: {e}"))?;
             }
-            "indents" => {
-                g.indents = match src {
-                    Some(s) => Some(
-                        compile_query(&g.language, &s)
-                            .map_err(|e| format!("compiling {lang} indents: {e}"))?,
-                    ),
-                    None => None,
-                };
-            }
-            "injections" => {
-                g.injections = match src {
-                    Some(s) => Some(
-                        compile_query(&g.language, &s)
-                            .map_err(|e| format!("compiling {lang} injections: {e}"))?,
-                    ),
-                    None => None,
-                };
-            }
-            "folds" => {
-                g.folds = match src {
-                    Some(s) => Some(
-                        compile_query(&g.language, &s)
-                            .map_err(|e| format!("compiling {lang} folds: {e}"))?,
-                    ),
-                    None => None,
-                };
-            }
+            "indents" => g.indents = compile_opt(src, "indents")?,
+            "injections" => g.injections = compile_opt(src, "injections")?,
+            "folds" => g.folds = compile_opt(src, "folds")?,
             _ => unreachable!("guarded above"),
         }
         Ok(())
@@ -521,13 +505,7 @@ impl Engine {
                 continue;
             }
             let tree = {
-                let mut budget = |_: &tree_sitter::ParseState| -> ControlFlow<()> {
-                    if started.elapsed() >= INJECTION_DEADLINE {
-                        ControlFlow::Break(())
-                    } else {
-                        ControlFlow::Continue(())
-                    }
-                };
+                let mut budget = deadline_budget(started, INJECTION_DEADLINE);
                 let options = ParseOptions::new().progress_callback(&mut budget);
                 let mut callback = |byte: usize, _: Point| -> &[u8] { read_chunk(shadow, byte) };
                 parser.parse_with_options(&mut callback, old.as_ref(), Some(options))
@@ -763,14 +741,7 @@ impl Engine {
         let shadow = Rope::from_str(text);
         // Parse under the same wall-clock deadline as `reparse`, so a pathologically
         // large preview file can't stall the frame (it just renders plain).
-        let started = Instant::now();
-        let mut budget = |_: &tree_sitter::ParseState| -> ControlFlow<()> {
-            if started.elapsed() >= PARSE_DEADLINE {
-                ControlFlow::Break(())
-            } else {
-                ControlFlow::Continue(())
-            }
-        };
+        let mut budget = deadline_budget(Instant::now(), PARSE_DEADLINE);
         let options = ParseOptions::new().progress_callback(&mut budget);
         let mut callback = |byte: usize, _: Point| -> &[u8] { read_chunk(&shadow, byte) };
         let Some(tree) = parser.parse_with_options(&mut callback, None, Some(options)) else {
@@ -1609,6 +1580,25 @@ fn node_text_provider(rope: &Rope) -> impl tree_sitter::TextProvider<&[u8]> + '_
         rope,
         pos: node.start_byte(),
         end: node.end_byte(),
+    }
+}
+
+/// A tree-sitter parse progress callback that cancels the parse once it has run
+/// past `deadline` (measured from `started`) — the in-process replacement for the
+/// worker's "never stalls the UI" property. Shared by the root reparse, the
+/// injection-layer parses, and the off-buffer preview parse so the budget logic
+/// lives in one place. Bind the result to a `let mut` and pass it to
+/// `ParseOptions::progress_callback` (it must outlive the `ParseOptions`).
+fn deadline_budget(
+    started: Instant,
+    deadline: Duration,
+) -> impl FnMut(&tree_sitter::ParseState) -> ControlFlow<()> {
+    move |_: &tree_sitter::ParseState| {
+        if started.elapsed() >= deadline {
+            ControlFlow::Break(())
+        } else {
+            ControlFlow::Continue(())
+        }
     }
 }
 

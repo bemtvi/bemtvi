@@ -171,26 +171,49 @@ impl Editor {
         s.bytes().take_while(|b| *b == b' ' || *b == b'\t').count()
     }
 
-    pub(crate) fn set_cursor_char(&mut self, idx: usize) {
-        let idx = self
-            .buffer()
-            .text
-            .floor_char_boundary(idx.min(self.last_char_idx()));
+    /// Place the cursor at byte `idx`, first clamping it to `max` and snapping to
+    /// a char boundary. The shared body behind `set_cursor_char` (clamps to the
+    /// last addressable char) and `set_cursor_char_insert` (allows the
+    /// past-the-end insert column).
+    fn set_cursor_clamped(&mut self, idx: usize, max: usize) {
+        let idx = self.buffer().text.floor_char_boundary(idx.min(max));
         let line = self.buffer().byte_to_line(idx);
         self.cursor.line = line;
         self.cursor.col = idx - self.buffer().line_start(line);
         self.snap_cursor();
     }
 
+    pub(crate) fn set_cursor_char(&mut self, idx: usize) {
+        let max = self.last_char_idx();
+        self.set_cursor_clamped(idx, max);
+    }
+
     pub(crate) fn set_cursor_char_insert(&mut self, idx: usize) {
-        let idx = self
-            .buffer()
-            .text
-            .floor_char_boundary(idx.min(self.buffer().len_bytes()));
-        let line = self.buffer().byte_to_line(idx);
-        self.cursor.line = line;
-        self.cursor.col = idx - self.buffer().line_start(line);
-        self.snap_cursor();
+        let max = self.buffer().len_bytes();
+        self.set_cursor_clamped(idx, max);
+    }
+
+    /// Settle the cursor on byte `byte`: place it there, refresh the desired
+    /// (virtual) column, clear the keep-at-EOL flag, and scroll it into view.
+    /// The shared landing tail used by jump/change/mark navigation.
+    pub(crate) fn settle_cursor_byte(&mut self, byte: usize) {
+        self.set_cursor_char(byte);
+        self.desired_col = self.cursor_virtcol();
+        self.desired_eol = false;
+        self.ensure_visible();
+    }
+
+    /// Land the cursor at `(line, col)`, clamping the line to the last line and
+    /// the column to that line's last real character (the trailing `\n` excluded),
+    /// then run the shared settle tail. Used by jumplist / change-list navigation,
+    /// which store raw `(line, col)` pairs that may be stale against an edited
+    /// buffer. (Distinct from [`Editor::land_cursor`], which clamps to the full
+    /// line length and threads deferred-open landing.)
+    pub(crate) fn settle_cursor_at(&mut self, line: usize, col: usize) {
+        let line = line.min(self.last_line());
+        let max_col = self.buffer().line(line).trim_end_matches('\n').len();
+        let col = col.min(max_col);
+        self.settle_cursor_byte(self.buffer().byte_at(line, col));
     }
 
     pub(crate) fn move_vertical(&mut self, delta: i64, allow_eol: bool) {

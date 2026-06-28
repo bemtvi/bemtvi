@@ -26,9 +26,7 @@ impl EditHost {
         // fired during input — ahead of `redraw`'s own `sync_lsp` — so without
         // this the server would answer a stale document (e.g. completion ranges
         // computed against text the user already changed).
-        self.sync_lsp();
-        let Some((key, uri, encoding)) = self.current_lsp_target() else {
-            self.editor.echo("No language server attached");
+        let Some((key, uri, encoding)) = self.lsp_target_or_echo() else {
             return;
         };
         let (row, col) = (self.editor.cursor.line, self.editor.cursor.col);
@@ -206,9 +204,7 @@ impl EditHost {
     /// On reply, the `TextEdit[]` is applied iff the buffer hasn't changed since
     /// (the content-version guard in [`EditHost::on_lsp_reply`]).
     pub(crate) fn request_lsp_format(&mut self) {
-        self.sync_lsp();
-        let Some((key, uri, _encoding)) = self.current_lsp_target() else {
-            self.editor.echo("No language server attached");
+        let Some((key, uri, _encoding)) = self.lsp_target_or_echo() else {
             return;
         };
         let token = self.register_lsp_request(LspReqKind::Formatting);
@@ -227,9 +223,7 @@ impl EditHost {
     /// Unlike the cursor-anchored requests it carries the user's fuzzy query, not a
     /// position; on reply the matching symbols open in the picker (`apply_lsp_symbols`).
     pub(crate) fn request_lsp_workspace_symbol(&mut self, query: &str) {
-        self.sync_lsp();
-        let Some((key, _uri, _encoding)) = self.current_lsp_target() else {
-            self.editor.echo("No language server attached");
+        let Some((key, _uri, _encoding)) = self.lsp_target_or_echo() else {
             return;
         };
         let token = self.register_lsp_request(LspReqKind::WorkspaceSymbol);
@@ -252,9 +246,7 @@ impl EditHost {
                 .echo("E471: Argument required: :LspRename {newname}");
             return;
         }
-        self.sync_lsp();
-        let Some((key, uri, encoding)) = self.current_lsp_target() else {
-            self.editor.echo("No language server attached");
+        let Some((key, uri, encoding)) = self.lsp_target_or_echo() else {
             return;
         };
         let (row, col) = (self.editor.cursor.line, self.editor.cursor.col);
@@ -275,9 +267,7 @@ impl EditHost {
     /// the diagnostics under the cursor as context. On reply the action titles are
     /// listed in the panel; `<CR>` applies the chosen action's eager edit.
     pub(crate) fn request_lsp_code_action(&mut self) {
-        self.sync_lsp();
-        let Some((key, uri, encoding)) = self.current_lsp_target() else {
-            self.editor.echo("No language server attached");
+        let Some((key, uri, encoding)) = self.lsp_target_or_echo() else {
             return;
         };
         let (row, col) = (self.editor.cursor.line, self.editor.cursor.col);
@@ -298,6 +288,19 @@ impl EditHost {
                 diagnostics,
             },
         );
+    }
+
+    /// Flush pending document edits ([`sync_lsp`](EditHost::sync_lsp)) and resolve the
+    /// current buffer's [`current_lsp_target`](Self::current_lsp_target), echoing the
+    /// standard "No language server attached" message on `None`. The shared preamble
+    /// every cursor/buffer LSP issue function opens with.
+    pub(crate) fn lsp_target_or_echo(&mut self) -> Option<(ServerKey, Url, PositionEncoding)> {
+        self.sync_lsp();
+        let target = self.current_lsp_target();
+        if target.is_none() {
+            self.editor.echo("No language server attached");
+        }
+        target
     }
 
     /// The current buffer's `(server, uri, encoding)` once its server finished
@@ -555,6 +558,29 @@ impl EditHost {
         }
     }
 
+    /// Open `nx.picker` over already-built picker `items` (`(text, nav-path, 1-based
+    /// row, 1-based col)`), or echo `kind`'s empty message when none survived. The
+    /// shared tail of [`apply_lsp_symbols`](Self::apply_lsp_symbols) /
+    /// [`open_locations_panel`](Self::open_locations_panel); `what` ("symbol" /
+    /// "location") only names the surface in the error echo. The picker open is a Lua
+    /// effect, so this drains it (`apply_lua_effects`) like `fire_lsp_attach` does.
+    fn present_lsp_picker(
+        &mut self,
+        kind: LspReqKind,
+        items: Vec<(String, String, u32, u32)>,
+        what: &str,
+    ) {
+        if items.is_empty() {
+            self.editor.echo(kind.empty_message());
+            return;
+        }
+        if let Err(e) = self.lua.show_lsp_locations(&items) {
+            self.editor
+                .echo(format!("E5108: Error opening LSP {what} picker: {e}"));
+        }
+        self.apply_lua_effects();
+    }
+
     /// Open `nx.picker` over a document/workspace symbol reply — each row is
     /// `name  [Kind]  path:line`, jumping to the symbol's location on confirm. Like
     /// the location picker this dogfreeds the shared engine; the symbol's `name` and
@@ -582,15 +608,7 @@ impl EditHost {
             let text = format!("{}  [{}]  {shown}:{}", sym.name, sym.kind, row + 1);
             items.push((text, nav, (row + 1) as u32, (byte + 1) as u32));
         }
-        if items.is_empty() {
-            self.editor.echo(kind.empty_message());
-            return;
-        }
-        if let Err(e) = self.lua.show_lsp_locations(&items) {
-            self.editor
-                .echo(format!("E5108: Error opening LSP symbol picker: {e}"));
-        }
-        self.apply_lua_effects();
+        self.present_lsp_picker(kind, items, "symbol");
     }
 
     /// Jump the cursor to one LSP [`Location`]. Opens/switches to the target on
@@ -640,15 +658,7 @@ impl EditHost {
             let text = format!("{shown}:{}:{}", row + 1, byte + 1);
             items.push((text, nav, (row + 1) as u32, (byte + 1) as u32));
         }
-        if items.is_empty() {
-            self.editor.echo(kind.empty_message());
-            return;
-        }
-        if let Err(e) = self.lua.show_lsp_locations(&items) {
-            self.editor
-                .echo(format!("E5108: Error opening LSP location picker: {e}"));
-        }
-        self.apply_lua_effects();
+        self.present_lsp_picker(kind, items, "location");
     }
 
     /// Best-effort LSP char→byte column for a target location: exact when the

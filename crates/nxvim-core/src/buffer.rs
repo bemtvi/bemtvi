@@ -378,30 +378,13 @@ impl Buffer {
         // Record what's on disk right now (mtime + size), so a later `:w` can tell
         // if the file changed underneath us. `None` for a not-yet-existing file.
         let disk = fs.stat(path);
+        // Only `text`/`options`/`disk` differ from a freshly-`named` buffer; every
+        // other field keeps its default, so spread rather than re-list them all.
         Ok(Buffer {
             text,
-            path: Some(path.to_path_buf()),
-            modified: false,
             options,
-            changedtick: 0,
-            save_tick: 0,
             disk,
-            edits: Vec::new(),
-            resync: false,
-            lsp_edits: Vec::new(),
-            lsp_resync: false,
-            lua_ts_edits: Vec::new(),
-            lua_ts_resync: false,
-            jump_edits: Vec::new(),
-            changelist: Vec::new(),
-            changelistidx: 0,
-            extmarks: crate::extmark::ExtmarkStore::default(),
-            marks: HashMap::new(),
-            last_visual: None,
-            kind: BufferKind::Ordinary,
-            terminal_title: None,
-            view_name: None,
-            image_gen: 0,
+            ..Buffer::named(path)
         })
     }
 

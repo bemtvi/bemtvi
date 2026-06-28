@@ -527,9 +527,17 @@ impl EditHost {
     /// Resolve a window-handle RPC argument to a [`WindowId`], mapping neovim's
     /// `0` (and a missing argument) to the current window.
     fn resolve_win(&self, v: Option<&Value>) -> WindowId {
-        match v.and_then(Value::as_u64) {
-            Some(0) | None => self.editor.current_window_id(),
-            Some(n) => WindowId(n),
+        self.resolve_win_handle(v.and_then(Value::as_u64).unwrap_or(0))
+    }
+
+    /// Resolve a numeric window handle to a [`WindowId`], mapping neovim's `0` to the
+    /// current window — the `relative = "win"` resolution shared by the float-config
+    /// parsers.
+    fn resolve_win_handle(&self, w: u64) -> WindowId {
+        if w == 0 {
+            self.editor.current_window_id()
+        } else {
+            WindowId(w)
         }
     }
 
@@ -554,12 +562,7 @@ impl EditHost {
             "cursor" => FloatRelative::Cursor,
             "win" => {
                 let w = get("win").and_then(Value::as_u64).unwrap_or(0);
-                let id = if w == 0 {
-                    self.editor.current_window_id()
-                } else {
-                    WindowId(w)
-                };
-                FloatRelative::Win(id)
+                FloatRelative::Win(self.resolve_win_handle(w))
             }
             other => {
                 return Err(format!(
@@ -586,14 +589,7 @@ impl EditHost {
         let margin = build_margin(value_margin(get("margin")));
         let border = match get("border") {
             None => BorderStyle::None,
-            // A non-string `border` (neovim's per-edge glyph array) is not rendered
-            // yet; treat it as the default `none` rather than erroring, as before.
-            Some(v) => {
-                let kw = v.as_str().unwrap_or("none");
-                BorderStyle::from_keyword(kw).ok_or_else(|| {
-                    format!("nvim_open_win: 'border' style '{kw}' is not supported yet")
-                })?
-            }
+            Some(v) => parse_border(v, "nvim_open_win")?,
         };
         Ok(FloatConfig {
             relative,
@@ -629,12 +625,7 @@ impl EditHost {
             Some("cursor") => spec.relative = Some(FloatRelative::Cursor),
             Some("win") => {
                 let w = get("win").and_then(Value::as_u64).unwrap_or(0);
-                let id = if w == 0 {
-                    self.editor.current_window_id()
-                } else {
-                    WindowId(w)
-                };
-                spec.relative = Some(FloatRelative::Win(id));
+                spec.relative = Some(FloatRelative::Win(self.resolve_win_handle(w)));
             }
             Some(other) => {
                 return Err(format!(
@@ -649,11 +640,7 @@ impl EditHost {
             );
         }
         if let Some(b) = get("border") {
-            // As in `parse_float_config`, a non-string `border` falls back to `none`.
-            let kw = b.as_str().unwrap_or("none");
-            spec.border = Some(BorderStyle::from_keyword(kw).ok_or_else(|| {
-                format!("nvim_win_set_config: 'border' style '{kw}' is not supported yet")
-            })?);
+            spec.border = Some(parse_border(b, "nvim_win_set_config")?);
         }
         spec.row = get("row").and_then(as_int);
         spec.col = get("col").and_then(as_int);
@@ -843,6 +830,16 @@ fn as_int(v: &Value) -> Option<isize> {
 
 fn text(v: Option<&Value>) -> String {
     v.and_then(Value::as_str).unwrap_or("").to_string()
+}
+
+/// Parse a float `border` value → [`BorderStyle`], shared by `nvim_open_win` and
+/// `nvim_win_set_config` (`ctx` names the method in the error). A non-string
+/// `border` (neovim's per-edge glyph array) is not rendered yet; it falls back to
+/// the default `none` rather than erroring. An unknown keyword is a loud error.
+fn parse_border(v: &Value, ctx: &str) -> Result<BorderStyle, String> {
+    let kw = v.as_str().unwrap_or("none");
+    BorderStyle::from_keyword(kw)
+        .ok_or_else(|| format!("{ctx}: 'border' style '{kw}' is not supported yet"))
 }
 
 fn flag(v: Option<&Value>, default: bool) -> bool {

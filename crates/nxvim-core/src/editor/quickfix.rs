@@ -920,19 +920,22 @@ impl Editor {
         }
     }
 
-    /// `:cfirst`/`:clast` (and `:l*` twins) — jump to the first / last valid entry.
-    pub(crate) fn ex_qf_first(&mut self, which: QfWhich) {
-        match self.qf_cur(which).items.iter().position(|e| e.valid) {
+    /// `:cfirst`/`:clast` (and `:l*` twins) — jump to the valid entry chosen by
+    /// `finder` (first via `position`, last via `rposition`), or echo `E42` when
+    /// the list holds none.
+    fn qf_jump_valid(&mut self, which: QfWhich, finder: impl FnOnce(&[QfEntry]) -> Option<usize>) {
+        match finder(&self.qf_cur(which).items) {
             Some(i) => self.qf_jump_to_index(which, i),
             None => self.echo("E42: No Errors".to_string()),
         }
     }
 
+    pub(crate) fn ex_qf_first(&mut self, which: QfWhich) {
+        self.qf_jump_valid(which, |items| items.iter().position(|e| e.valid));
+    }
+
     pub(crate) fn ex_qf_last(&mut self, which: QfWhich) {
-        match self.qf_cur(which).items.iter().rposition(|e| e.valid) {
-            Some(i) => self.qf_jump_to_index(which, i),
-            None => self.echo("E42: No Errors".to_string()),
-        }
+        self.qf_jump_valid(which, |items| items.iter().rposition(|e| e.valid));
     }
 
     /// `:colder`/`:cnewer` (and `:lolder`/`:lnewer`) — walk `which`'s list stack

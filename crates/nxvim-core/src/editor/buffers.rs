@@ -1634,10 +1634,7 @@ impl Editor {
         }
         let line = line.min(self.last_line());
         let byte = self.buffer().line_start(line) + col.min(self.buffer().line(line).len());
-        self.set_cursor_char(byte);
-        self.desired_col = self.cursor_virtcol();
-        self.desired_eol = false;
-        self.ensure_visible();
+        self.settle_cursor_byte(byte);
     }
 
     /// Settle the cursor after a deferred open's content lands in `buffer`: if a located

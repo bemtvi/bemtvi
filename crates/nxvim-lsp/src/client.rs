@@ -29,14 +29,14 @@ use lsp_types::{
     CodeActionKindLiteralSupport, CodeActionLiteralSupport, CompletionClientCapabilities,
     CompletionItemCapability, CompletionItemCapabilityResolveSupport, ConfigurationParams,
     DocumentFormattingClientCapabilities, FoldingRangeClientCapabilities,
-    GeneralClientCapabilities, HoverClientCapabilities, InlayHintClientCapabilities,
-    InlayHintResolveClientCapabilities, InlayHintWorkspaceClientCapabilities, MarkupKind,
-    MessageType, PositionEncodingKind, PublishDiagnosticsClientCapabilities,
-    RenameClientCapabilities, SemanticTokenModifier, SemanticTokenType,
-    SemanticTokensClientCapabilities, SemanticTokensClientCapabilitiesRequests,
+    GeneralClientCapabilities, HoverClientCapabilities, InitializeParams, InitializeResult,
+    InlayHintClientCapabilities, InlayHintResolveClientCapabilities,
+    InlayHintWorkspaceClientCapabilities, MarkupKind, MessageType, PositionEncodingKind,
+    PublishDiagnosticsClientCapabilities, RenameClientCapabilities, SemanticTokenModifier,
+    SemanticTokenType, SemanticTokensClientCapabilities, SemanticTokensClientCapabilitiesRequests,
     SemanticTokensFullOptions, SemanticTokensWorkspaceClientCapabilities, ServerCapabilities,
     TextDocumentClientCapabilities, TextDocumentSyncCapability, TextDocumentSyncClientCapabilities,
-    TextDocumentSyncKind, TokenFormat, WorkspaceClientCapabilities,
+    TextDocumentSyncKind, TokenFormat, Url, WorkspaceClientCapabilities,
     WorkspaceEditClientCapabilities,
 };
 #[cfg(feature = "native")]
@@ -47,7 +47,7 @@ use crate::log::{LogLevel, LspLog};
 // (gated below) use `LspEvent`/`RefreshKind`/`ServerKey`.
 #[cfg(feature = "native")]
 use crate::protocol::{LspEvent, RefreshKind, ServerKey};
-use crate::protocol::{PositionEncoding, ProviderCaps, SemanticLegend};
+use crate::protocol::{PositionEncoding, ProviderCaps, SemanticLegend, ServerCaps, ServerSpawn};
 
 /// State shared by the client `MainLoop`'s notification handlers: which server
 /// this loop belongs to, the channel to forward distilled events on, and the log.
@@ -435,6 +435,50 @@ fn client_capabilities() -> ClientCapabilities {
         }),
         ..Default::default()
     }
+}
+
+/// The `initialize` request params shared by the async manager and the sync wasm
+/// client: the workspace `root` as `root_uri`, the config's `init_options` (falling
+/// back to `settings`, neovim's behavior), and nxvim's base capabilities with the
+/// config's `capabilities` deep-merged over them. `process_id` is the only thing
+/// that differs between the paths — `Some(pid)` natively, `None` in the browser.
+#[allow(deprecated)] // root_uri is the broadest way to convey the workspace root
+pub(crate) fn init_params(
+    root: &std::path::Path,
+    spawn: &ServerSpawn,
+    process_id: Option<u32>,
+    log: &LspLog,
+    name: &str,
+) -> InitializeParams {
+    InitializeParams {
+        process_id,
+        root_uri: Url::from_file_path(root).ok(),
+        initialization_options: spawn
+            .init_options
+            .clone()
+            .or_else(|| spawn.settings.clone()),
+        capabilities: merged_client_capabilities(spawn.capabilities.as_ref(), log, name),
+        ..Default::default()
+    }
+}
+
+/// Read an `initialize` result into the editor-facing trio both dispatch paths
+/// forward on [`LspEvent::Initialized`]: the distilled [`ServerCaps`], the
+/// negotiated [`PositionEncoding`], and the raw result JSON (for the config's
+/// `on_init` hook; `Null` if it somehow won't serialize). Shared so the async
+/// manager and the sync wasm client distill the handshake identically.
+pub(crate) fn read_init_result(
+    init: &InitializeResult,
+) -> (ServerCaps, PositionEncoding, serde_json::Value) {
+    let caps = ServerCaps {
+        sync_kind: sync_kind_of(&init.capabilities),
+        providers: provider_caps(&init.capabilities),
+        legend: semantic_legend(&init.capabilities),
+        semantic_tokens_delta: semantic_tokens_delta(&init.capabilities),
+    };
+    let encoding = encoding_of(&init.capabilities);
+    let raw = serde_json::to_value(init).unwrap_or(serde_json::Value::Null);
+    (caps, encoding, raw)
 }
 
 /// The position encoding the server chose (LSP defaults to UTF-16 when the

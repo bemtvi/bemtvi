@@ -331,13 +331,10 @@ impl EditHost {
         // Keep the `nx._cwd` mirror (`vim.fn.getcwd`) in step with `DirState`.
         self.publish_cwd_mirror();
         // Announce the change so `DirChanged` handlers (project / session plugins) run.
-        if let Err(e) = self
+        let r = self
             .lua
-            .fire_dir_changed(scope.pattern(), &cwd.display().to_string())
-        {
-            self.editor
-                .echo(format!("E5108: Error in DirChanged autocmd: {e}"));
-        }
+            .fire_dir_changed(scope.pattern(), &cwd.display().to_string());
+        self.report_autocmd_err("DirChanged", r);
         self.apply_lua_effects();
     }
 
@@ -603,10 +600,8 @@ impl EditHost {
         }
         self.apply_lua_effects();
         let _ = self.lua.set_global_var("colors_name", name);
-        if let Err(e) = self.lua.fire_autocmd("ColorScheme", name) {
-            self.editor
-                .echo(format!("E5108: Error in ColorScheme autocmd: {e}"));
-        }
+        let r = self.lua.fire_autocmd("ColorScheme", name);
+        self.report_autocmd_err("ColorScheme", r);
         self.apply_lua_effects();
     }
 

@@ -130,6 +130,30 @@ pub struct RenderRow {
 }
 
 impl RenderRow {
+    /// A structural row with no overlay state: `selection`/`secondary_selection`/
+    /// `search`/`incsearch` all start empty (the overlay passes fill them in later).
+    /// The shared constructor for every row [`row_skeleton`] emits — virtual lines,
+    /// `~` fillers, closed folds, and the wrapped / unwrapped text segments.
+    fn structural(
+        kind: RowKind,
+        text: String,
+        virt_line: Option<Vec<VirtChunk>>,
+        seg_end_col: usize,
+        indent: usize,
+    ) -> RenderRow {
+        RenderRow {
+            kind,
+            text,
+            virt_line,
+            selection: None,
+            secondary_selection: Vec::new(),
+            search: Vec::new(),
+            incsearch: None,
+            seg_end_col,
+            indent,
+        }
+    }
+
     /// 1-based buffer line number for the number column — `Some` for a real
     /// [`RowKind::Line`] row (virtual / filler rows show no number). A soft-wrap
     /// continuation row repeats its line's number (a v1 cosmetic: vim blanks the
@@ -1266,17 +1290,13 @@ fn row_skeleton(
     let virt_by_line = buf.virt_lines_by_line();
     let mut rows = Vec::with_capacity(height);
     let push_virt = |rows: &mut Vec<RenderRow>, chunks: &[VirtChunk]| {
-        rows.push(RenderRow {
-            kind: RowKind::VirtLine,
-            text: String::new(),
-            virt_line: Some(chunks.to_vec()),
-            selection: None,
-            secondary_selection: Vec::new(),
-            search: Vec::new(),
-            incsearch: None,
-            seg_end_col: usize::MAX,
-            indent: 0,
-        });
+        rows.push(RenderRow::structural(
+            RowKind::VirtLine,
+            String::new(),
+            Some(chunks.to_vec()),
+            usize::MAX,
+            0,
+        ));
     };
     let mut buf_line = base;
     while rows.len() < height {
@@ -1284,17 +1304,13 @@ fn row_skeleton(
             // `~` filler past the end of the buffer (no number, no virtual content).
             // The marker char is `'fillchars'`' `eob` key (vim's `~` by default;
             // `eob:\ ` blanks it).
-            rows.push(RenderRow {
-                kind: RowKind::Filler,
-                text: eob.to_string(),
-                virt_line: None,
-                selection: None,
-                secondary_selection: Vec::new(),
-                search: Vec::new(),
-                incsearch: None,
-                seg_end_col: usize::MAX,
-                indent: 0,
-            });
+            rows.push(RenderRow::structural(
+                RowKind::Filler,
+                eob.to_string(),
+                None,
+                usize::MAX,
+                0,
+            ));
             continue;
         }
         // A closed fold covering this line collapses its whole range into one
@@ -1302,20 +1318,16 @@ fn row_skeleton(
         // after the start are skipped. Checked before virtual lines / wrapping so
         // a closed fold shows just the fold text, as vim does.
         if let Some(f) = folds.iter().find(|f| f.contains(buf_line)) {
-            rows.push(RenderRow {
-                kind: RowKind::Fold {
+            rows.push(RenderRow::structural(
+                RowKind::Fold {
                     line: f.start,
                     count: f.line_count(),
                 },
-                text: fold_text(buf, f),
-                virt_line: None,
-                selection: None,
-                secondary_selection: Vec::new(),
-                search: Vec::new(),
-                incsearch: None,
-                seg_end_col: usize::MAX,
-                indent: 0,
-            });
+                fold_text(buf, f),
+                None,
+                usize::MAX,
+                0,
+            ));
             buf_line = f.end + 1;
             continue;
         }
@@ -1353,36 +1365,28 @@ fn row_skeleton(
                 // The segment's end column (where the next segment begins) bounds the
                 // overlay clip; the last segment runs to end-of-line (`MAX`). The baked
                 // prefix is the rebase offset on continuation rows only.
-                rows.push(RenderRow {
-                    kind: RowKind::Line {
+                rows.push(RenderRow::structural(
+                    RowKind::Line {
                         line: buf_line,
                         start_col: seg.start_col,
                     },
-                    text: row_text,
-                    virt_line: None,
-                    selection: None,
-                    secondary_selection: Vec::new(),
-                    search: Vec::new(),
-                    incsearch: None,
-                    seg_end_col: segs.get(i + 1).map_or(usize::MAX, |s| s.start_col),
-                    indent: if seg.start_col == 0 { 0 } else { indent },
-                });
+                    row_text,
+                    None,
+                    segs.get(i + 1).map_or(usize::MAX, |s| s.start_col),
+                    if seg.start_col == 0 { 0 } else { indent },
+                ));
             }
         } else if rows.len() < height {
-            rows.push(RenderRow {
-                kind: RowKind::Line {
+            rows.push(RenderRow::structural(
+                RowKind::Line {
                     line: buf_line,
                     start_col: 0,
                 },
                 text,
-                virt_line: None,
-                selection: None,
-                secondary_selection: Vec::new(),
-                search: Vec::new(),
-                incsearch: None,
-                seg_end_col: usize::MAX,
-                indent: 0,
-            });
+                None,
+                usize::MAX,
+                0,
+            ));
         }
         if rows.len() >= height {
             break;

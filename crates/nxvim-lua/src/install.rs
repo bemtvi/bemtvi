@@ -15,17 +15,17 @@ use mlua::{Lua, Table, UserData, UserDataMethods, Variadic};
 use unicode_width::UnicodeWidthStr;
 
 use crate::convert::{
-    color_field, color_to_u32, env_pairs, flag_field, json_to_lua, lua_i64, lua_to_json,
-    opt_table_to_json, stringify,
+    color_field, color_to_u32, env_pairs, flag_field, json_to_lua, lua_to_json, opt_table_to_json,
+    stringify, value_to_option,
 };
 use crate::host::{get_runtime_file, stdpath};
 use crate::ops::{
     BufOp, CompletePush, CompleteSetupReq, ConfirmReq, DecorMark, DecorPublish, DiagnosticData,
     DockOp, ExtmarkOp, FeedKeysOp, FsJob, GlobalOptionOp, HlSet, LayerOp, LoopOp, LspOp,
-    NamedListOp, OptionValue, PanelOp, PickerOpenReq, PickerPush, PreviewPush, QfItem, QfSetOp,
-    RegisterSetOp, SnippetAddReq, SnippetSetupReq, StatuslineKind, StatuslinePublishReq,
-    StatuslineSetupReq, StatuslineTarget, TabOp, TerminalOpenReq, TsOp, UiFloatReq, UiInputReq,
-    UiSelectReq, ViewOp, VirtChunkData, VirtDecorData, WindowOp, WorkspaceOptionOp,
+    NamedListOp, PanelOp, PickerOpenReq, PickerPush, PreviewPush, QfItem, QfSetOp, RegisterSetOp,
+    SnippetAddReq, SnippetSetupReq, StatuslineKind, StatuslinePublishReq, StatuslineSetupReq,
+    StatuslineTarget, TabOp, TerminalOpenReq, TsOp, UiFloatReq, UiInputReq, UiSelectReq, ViewOp,
+    VirtChunkData, VirtDecorData, WindowOp, WorkspaceOptionOp,
 };
 use crate::runtime::{OutputLine, Shared};
 use crate::vimregex;
@@ -92,6 +92,46 @@ fn read_margin(cfg: &Table) -> mlua::Result<[u64; 4]> {
     Ok(match m {
         Some(v) if v.len() == 4 => [v[0], v[1], v[2], v[3]],
         _ => [0; 4],
+    })
+}
+
+/// The float placement fields shared by `nx._mount_float` ([`ViewOp::MountFloat`])
+/// and `nx._open_float` ([`WindowOp::OpenFloat`]). Both ops carry these verbatim
+/// plus a couple of own fields (the view mount adds `grab`; the window open adds
+/// `buf`/`enter`), so the common reads live here in one place. The prelude has
+/// already validated the enumerated strings (`relative`/`anchor`/`border`/`align`),
+/// so the reads trust them.
+struct FloatPlacement {
+    relative: String,
+    win: u64,
+    anchor: String,
+    row: i64,
+    col: i64,
+    width: String,
+    height: String,
+    align: Option<String>,
+    margin: [u64; 4],
+    zindex: u32,
+    focusable: bool,
+    border: String,
+    title: Option<String>,
+}
+
+fn read_float_placement(cfg: &Table) -> mlua::Result<FloatPlacement> {
+    Ok(FloatPlacement {
+        relative: cfg.get("relative")?,
+        win: cfg.get::<Option<u64>>("win")?.unwrap_or(0),
+        anchor: cfg.get("anchor")?,
+        row: cfg.get("row")?,
+        col: cfg.get("col")?,
+        width: cfg.get("width")?,
+        height: cfg.get("height")?,
+        align: cfg.get::<Option<String>>("align")?,
+        margin: read_margin(cfg)?,
+        zindex: cfg.get("zindex")?,
+        focusable: cfg.get("focusable")?,
+        border: cfg.get("border")?,
+        title: cfg.get::<Option<String>>("title")?,
     })
 }
 
@@ -317,48 +357,26 @@ pub(crate) fn install_vim(lua: &Lua, shared: &Rc<RefCell<Shared>>) -> mlua::Resu
             Ok(())
         })?,
     )?;
-    let sh = shared.clone();
-    dock.set(
-        "close",
-        lua.create_function(move |_, side: String| {
-            sh.borrow_mut().dock_ops.push(DockOp::Close { side });
-            Ok(())
-        })?,
-    )?;
-    let sh = shared.clone();
-    dock.set(
-        "focus",
-        lua.create_function(move |_, side: String| {
-            sh.borrow_mut().dock_ops.push(DockOp::Focus { side });
-            Ok(())
-        })?,
-    )?;
-    // `toggle`/`hide`/`show` — collapse a dock from view while keeping its content
-    // parked (VSCode-style), the counterpart of `close` (which drops the content).
-    let sh = shared.clone();
-    dock.set(
-        "toggle",
-        lua.create_function(move |_, side: String| {
-            sh.borrow_mut().dock_ops.push(DockOp::Toggle { side });
-            Ok(())
-        })?,
-    )?;
-    let sh = shared.clone();
-    dock.set(
-        "hide",
-        lua.create_function(move |_, side: String| {
-            sh.borrow_mut().dock_ops.push(DockOp::Hide { side });
-            Ok(())
-        })?,
-    )?;
-    let sh = shared.clone();
-    dock.set(
-        "show",
-        lua.create_function(move |_, side: String| {
-            sh.borrow_mut().dock_ops.push(DockOp::Show { side });
-            Ok(())
-        })?,
-    )?;
+    // `close`/`focus`, plus the `toggle`/`hide`/`show` trio that collapses a dock
+    // from view while keeping its content parked (VSCode-style) — each a single
+    // `DockOp` variant taking only the `side` string.
+    macro_rules! dock_side_op {
+        ($name:literal, $variant:ident) => {{
+            let sh = shared.clone();
+            dock.set(
+                $name,
+                lua.create_function(move |_, side: String| {
+                    sh.borrow_mut().dock_ops.push(DockOp::$variant { side });
+                    Ok(())
+                })?,
+            )?;
+        }};
+    }
+    dock_side_op!("close", Close);
+    dock_side_op!("focus", Focus);
+    dock_side_op!("toggle", Toggle);
+    dock_side_op!("hide", Hide);
+    dock_side_op!("show", Show);
     // `nx._dock_set_opt(side, name, value)`: queue a [`DockOp::SetOption`] for the
     // dock scope. The prelude's `nx.dock.opt(side)` proxy (and the inline keys of
     // `nx.dock.open{...}`) call this after write-through to `nx._dock_opts`. A
@@ -370,16 +388,7 @@ pub(crate) fn install_vim(lua: &Lua, shared: &Rc<RefCell<Shared>>) -> mlua::Resu
         "_set_opt",
         lua.create_function(
             move |_, (side, name, value): (String, String, mlua::Value)| {
-                let value = match value {
-                    mlua::Value::Boolean(b) => Some(OptionValue::Bool(b)),
-                    mlua::Value::Integer(n) => Some(OptionValue::Number(lua_i64(n))),
-                    mlua::Value::Number(n) => Some(OptionValue::Number(n as i64)),
-                    mlua::Value::String(s) => {
-                        s.to_str().ok().map(|s| OptionValue::String(s.to_string()))
-                    }
-                    _ => None,
-                };
-                if let Some(value) = value {
+                if let Some(value) = value_to_option(&value)? {
                     sh.borrow_mut()
                         .dock_ops
                         .push(DockOp::SetOption { side, name, value });
@@ -500,22 +509,38 @@ pub(crate) fn install_vim(lua: &Lua, shared: &Rc<RefCell<Shared>>) -> mlua::Resu
     view.set(
         "_mount_float",
         lua.create_function(move |_, (id, cfg): (u64, Table)| {
+            let grab = cfg.get("grab")?;
+            let FloatPlacement {
+                relative,
+                win,
+                anchor,
+                row,
+                col,
+                width,
+                height,
+                align,
+                margin,
+                zindex,
+                focusable,
+                border,
+                title,
+            } = read_float_placement(&cfg)?;
             sh.borrow_mut().view_ops.push(ViewOp::MountFloat {
                 id,
-                relative: cfg.get("relative")?,
-                win: cfg.get::<Option<u64>>("win")?.unwrap_or(0),
-                anchor: cfg.get("anchor")?,
-                row: cfg.get("row")?,
-                col: cfg.get("col")?,
-                width: cfg.get("width")?,
-                height: cfg.get("height")?,
-                align: cfg.get::<Option<String>>("align")?,
-                margin: read_margin(&cfg)?,
-                zindex: cfg.get("zindex")?,
-                focusable: cfg.get("focusable")?,
-                border: cfg.get("border")?,
-                title: cfg.get::<Option<String>>("title")?,
-                grab: cfg.get("grab")?,
+                relative,
+                win,
+                anchor,
+                row,
+                col,
+                width,
+                height,
+                align,
+                margin,
+                zindex,
+                focusable,
+                border,
+                title,
+                grab,
             });
             Ok(())
         })?,
@@ -1523,16 +1548,7 @@ pub(crate) fn install_runtime_api(
     nx.set(
         "_buf_set_option",
         lua.create_function(move |_, (bufnr, name, value): (u64, String, mlua::Value)| {
-            let value = match value {
-                mlua::Value::Boolean(b) => Some(OptionValue::Bool(b)),
-                mlua::Value::Integer(n) => Some(OptionValue::Number(lua_i64(n))),
-                mlua::Value::Number(n) => Some(OptionValue::Number(n as i64)),
-                mlua::Value::String(s) => {
-                    s.to_str().ok().map(|s| OptionValue::String(s.to_string()))
-                }
-                _ => None,
-            };
-            if let Some(value) = value {
+            if let Some(value) = value_to_option(&value)? {
                 sh.borrow_mut()
                     .buf_ops
                     .push(BufOp::SetOption { bufnr, name, value });
@@ -1572,18 +1588,9 @@ pub(crate) fn install_runtime_api(
     nx.set(
         "_set_global_option",
         lua.create_function(move |_, (name, value): (String, mlua::Value)| {
-            let value = match value {
-                mlua::Value::Boolean(b) => Some(OptionValue::Bool(b)),
-                mlua::Value::Integer(n) => Some(OptionValue::Number(lua_i64(n))),
-                mlua::Value::Number(n) => Some(OptionValue::Number(n as i64)),
-                // `statusline` and other string globals (the prelude forwards
-                // only the canonical wired set).
-                mlua::Value::String(s) => {
-                    s.to_str().ok().map(|s| OptionValue::String(s.to_string()))
-                }
-                _ => None,
-            };
-            if let Some(value) = value {
+            // A number rides as `Number` for symmetry; `statusline` and other
+            // string globals as `String` (the prelude forwards only the wired set).
+            if let Some(value) = value_to_option(&value)? {
                 sh.borrow_mut()
                     .global_ops
                     .push(GlobalOptionOp { name, value });
@@ -1601,15 +1608,14 @@ pub(crate) fn install_runtime_api(
     nx.set(
         "_set_workspace_option",
         lua.create_function(move |_, (name, value): (String, mlua::Value)| {
-            let value = match value {
-                mlua::Value::Nil => None,
-                mlua::Value::Boolean(b) => Some(OptionValue::Bool(b)),
-                mlua::Value::Integer(n) => Some(OptionValue::Number(lua_i64(n))),
-                mlua::Value::Number(n) => Some(OptionValue::Number(n as i64)),
-                mlua::Value::String(s) => Some(OptionValue::String(s.to_str()?.to_string())),
-                // An unsupported value type is a no-op rather than a clear (a clear is
-                // only an explicit `nil`); the prelude already restricts the surface.
-                _ => return Ok(()),
+            // An explicit `nil` clears the override (back to the global value); a
+            // supported scalar sets it; any other type is a no-op (not a clear).
+            let value = if value.is_nil() {
+                None
+            } else if let Some(value) = value_to_option(&value)? {
+                Some(value)
+            } else {
+                return Ok(());
             };
             sh.borrow_mut()
                 .workspace_option_ops
@@ -1746,16 +1752,7 @@ pub(crate) fn install_runtime_api(
     nx.set(
         "_win_set_option",
         lua.create_function(move |_, (win, name, value): (u64, String, mlua::Value)| {
-            let value = match value {
-                mlua::Value::Boolean(b) => Some(OptionValue::Bool(b)),
-                mlua::Value::Integer(n) => Some(OptionValue::Number(lua_i64(n))),
-                mlua::Value::Number(n) => Some(OptionValue::Number(n as i64)),
-                mlua::Value::String(s) => {
-                    s.to_str().ok().map(|s| OptionValue::String(s.to_string()))
-                }
-                _ => None,
-            };
-            if let Some(value) = value {
+            if let Some(value) = value_to_option(&value)? {
                 sh.borrow_mut()
                     .window_ops
                     .push(WindowOp::SetOption { win, name, value });
@@ -1793,22 +1790,39 @@ pub(crate) fn install_runtime_api(
     nx.set(
         "_open_float",
         lua.create_function(move |_, cfg: Table| {
+            let buf = cfg.get("buf")?;
+            let enter = cfg.get("enter")?;
+            let FloatPlacement {
+                relative,
+                win,
+                anchor,
+                row,
+                col,
+                width,
+                height,
+                align,
+                margin,
+                zindex,
+                focusable,
+                border,
+                title,
+            } = read_float_placement(&cfg)?;
             sh.borrow_mut().window_ops.push(WindowOp::OpenFloat {
-                buf: cfg.get("buf")?,
-                enter: cfg.get("enter")?,
-                relative: cfg.get("relative")?,
-                win: cfg.get::<Option<u64>>("win")?.unwrap_or(0),
-                anchor: cfg.get("anchor")?,
-                row: cfg.get("row")?,
-                col: cfg.get("col")?,
-                width: cfg.get("width")?,
-                height: cfg.get("height")?,
-                align: cfg.get::<Option<String>>("align")?,
-                margin: read_margin(&cfg)?,
-                zindex: cfg.get("zindex")?,
-                focusable: cfg.get("focusable")?,
-                border: cfg.get("border")?,
-                title: cfg.get::<Option<String>>("title")?,
+                buf,
+                enter,
+                relative,
+                win,
+                anchor,
+                row,
+                col,
+                width,
+                height,
+                align,
+                margin,
+                zindex,
+                focusable,
+                border,
+                title,
             });
             Ok(())
         })?,

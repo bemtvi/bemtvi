@@ -179,16 +179,14 @@ async fn run(dir: PathBuf, files: Vec<PathBuf>) -> Result<bool> {
 
 /// `nvim_exec_lua(code)` returning its value; panics-to-error on a transport failure.
 async fn exec_lua(rpc: &Rpc, code: &str) -> Result<Value> {
-    rpc.request(
-        "nvim_exec_lua",
-        vec![Value::from(code), Value::Array(vec![])],
-    )
-    .await
-    .map_err(|e| anyhow!("nvim_exec_lua failed: {e}"))
+    exec_lua_checked(rpc, code)
+        .await
+        .map_err(|e| anyhow!("nvim_exec_lua failed: {e}"))
 }
 
 /// Like [`exec_lua`] but surfaces a *Lua* error (the server replies with an error
-/// payload) as an `Err`, for sourcing spec files where a throw must be reported.
+/// payload) as an `Err` verbatim, for sourcing spec files where a throw must be
+/// reported. [`exec_lua`] wraps this to add the transport-context prefix.
 async fn exec_lua_checked(rpc: &Rpc, code: &str) -> Result<Value> {
     rpc.request(
         "nvim_exec_lua",

@@ -158,36 +158,34 @@ pub(crate) fn map_str_array(map: &[(Value, Value)], key: &str) -> Vec<String> {
         .unwrap_or_default()
 }
 
+/// Decode a single `[a, b]` wire value into a `(u16, u16)` pair, truncating each
+/// `u64` (with a `0` fallback for a missing/non-int element). `None` when the
+/// value isn't a 2-element array. The shared primitive behind every `[start,
+/// end]` / `[row, col]` decode (`parse_spans`, `parse_multi_spans`, `parse_pair`,
+/// `parse_cursor_list`).
+pub(crate) fn pair_u16(value: &Value) -> Option<(u16, u16)> {
+    match value.as_array() {
+        Some(pair) if pair.len() == 2 => Some((
+            pair[0].as_u64().unwrap_or(0) as u16,
+            pair[1].as_u64().unwrap_or(0) as u16,
+        )),
+        _ => None,
+    }
+}
+
 /// Parse a per-row array of `[start, end]` selection-span pairs (`Nil` rows
 /// become `None`).
 pub(crate) fn parse_spans(value: Option<&Value>) -> Vec<Option<(u16, u16)>> {
     value
         .and_then(Value::as_array)
-        .map(|a| {
-            a.iter()
-                .map(|v| match v.as_array() {
-                    Some(pair) if pair.len() == 2 => Some((
-                        pair[0].as_u64().unwrap_or(0) as u16,
-                        pair[1].as_u64().unwrap_or(0) as u16,
-                    )),
-                    _ => None,
-                })
-                .collect()
-        })
+        .map(|a| a.iter().map(pair_u16).collect())
         .unwrap_or_default()
 }
 
 /// Parse a `[a, b]` pair (e.g. the picker preview's `loc` row/col) into
 /// `Some((a, b))`, or `None` when the value is `Nil` / absent / malformed.
 pub(crate) fn parse_pair(value: Option<&Value>) -> Option<(u16, u16)> {
-    let pair = value?.as_array()?;
-    if pair.len() != 2 {
-        return None;
-    }
-    Some((
-        pair[0].as_u64().unwrap_or(0) as u16,
-        pair[1].as_u64().unwrap_or(0) as u16,
-    ))
+    pair_u16(value?)
 }
 
 /// Parse the redraw `padding` field — a `[top, right, bottom, left]` array of
@@ -221,18 +219,7 @@ pub(crate) fn parse_multi_spans(value: Option<&Value>) -> SearchSpans {
             rows.iter()
                 .map(|row| {
                     row.as_array()
-                        .map(|spans| {
-                            spans
-                                .iter()
-                                .filter_map(|v| match v.as_array() {
-                                    Some(pair) if pair.len() == 2 => Some((
-                                        pair[0].as_u64().unwrap_or(0) as u16,
-                                        pair[1].as_u64().unwrap_or(0) as u16,
-                                    )),
-                                    _ => None,
-                                })
-                                .collect()
-                        })
+                        .map(|spans| spans.iter().filter_map(pair_u16).collect())
                         .unwrap_or_default()
                 })
                 .collect()
@@ -276,10 +263,11 @@ pub(crate) fn parse_highlights(value: Option<&Value>) -> Vec<Vec<HlSpan>> {
         .unwrap_or_default()
 }
 
-/// Parse the `diagnostics_virt` redraw key into per-row optional inline
-/// decorations: each row is `Nil` (no virt text) or `[text, severity, style_id]`.
-/// Malformed entries decode to `None`, leaving that row undecorated.
-pub(crate) fn parse_diagnostics_virt(value: Option<&Value>) -> Vec<Option<DiagVirt>> {
+/// Decode a per-row `[text, severity, style_id]` payload (`Nil` → `None`,
+/// malformed → `None`) — the shared shape behind both `diagnostics_virt` (inline
+/// text) and `diagnostics_signs` (gutter glyphs), whose `DiagVirt` / `DiagSign`
+/// aliases are the same `(String, u8, Option<usize>)` tuple.
+fn parse_text_sev_style(value: Option<&Value>) -> Vec<Option<(String, u8, Option<usize>)>> {
     value
         .and_then(Value::as_array)
         .map(|rows| {
@@ -300,24 +288,40 @@ pub(crate) fn parse_diagnostics_virt(value: Option<&Value>) -> Vec<Option<DiagVi
         .unwrap_or_default()
 }
 
+/// Parse the `diagnostics_virt` redraw key into per-row optional inline
+/// decorations: each row is `Nil` (no virt text) or `[text, severity, style_id]`.
+/// Malformed entries decode to `None`, leaving that row undecorated.
+pub(crate) fn parse_diagnostics_virt(value: Option<&Value>) -> Vec<Option<DiagVirt>> {
+    parse_text_sev_style(value)
+}
+
 /// Parse the `diagnostics_signs` redraw key into per-row optional gutter signs:
 /// each row is `Nil` (no sign) or `[glyph, severity, style_id]`. Malformed entries
 /// decode to `None`, leaving that row's sign cell blank. Same shape as
 /// [`parse_diagnostics_virt`].
 pub(crate) fn parse_diagnostics_signs(value: Option<&Value>) -> Vec<Option<DiagSign>> {
+    parse_text_sev_style(value)
+}
+
+/// Decode one chunk run `[[text, style_id], …]` into `Vec<VirtChunk>`: each `[text,
+/// style_id]` pair becomes `(String, Option<usize>)` (a `Nil` id paints in the
+/// normal foreground). A non-array value yields an empty run; malformed chunks are
+/// dropped. The shared inner decode for `virt_text` chunk runs, `virt_lines`, and
+/// the content float's `lines`.
+pub(crate) fn parse_chunks(value: &Value) -> Vec<VirtChunk> {
     value
-        .and_then(Value::as_array)
-        .map(|rows| {
-            rows.iter()
-                .map(|row| {
-                    let t = row.as_array()?;
-                    if t.len() != 3 {
+        .as_array()
+        .map(|chunks| {
+            chunks
+                .iter()
+                .filter_map(|c| {
+                    let c = c.as_array()?;
+                    if c.len() != 2 {
                         return None;
                     }
                     Some((
-                        t[0].as_str()?.to_string(),
-                        t[1].as_u64()? as u8,
-                        t[2].as_u64().map(|id| id as usize),
+                        c[0].as_str()?.to_string(),
+                        c[1].as_u64().map(|id| id as usize),
                     ))
                 })
                 .collect()
@@ -343,25 +347,11 @@ pub(crate) fn parse_virt_text(value: Option<&Value>) -> Vec<Vec<VirtPlacement>> 
                                     if t.len() != 4 {
                                         return None;
                                     }
-                                    let chunks = t[3]
-                                        .as_array()?
-                                        .iter()
-                                        .filter_map(|c| {
-                                            let c = c.as_array()?;
-                                            if c.len() != 2 {
-                                                return None;
-                                            }
-                                            Some((
-                                                c[0].as_str()?.to_string(),
-                                                c[1].as_u64().map(|id| id as usize),
-                                            ))
-                                        })
-                                        .collect();
                                     Some(VirtPlacement {
                                         pos: t[0].as_u64()? as u8,
                                         col: t[1].as_u64()? as u16,
                                         hl_mode: t[2].as_u64()? as u8,
-                                        chunks,
+                                        chunks: parse_chunks(&t[3]),
                                     })
                                 })
                                 .collect()
@@ -384,24 +374,9 @@ pub(crate) fn parse_virt_lines(value: Option<&Value>) -> Vec<Option<Vec<VirtChun
         .and_then(Value::as_array)
         .map(|rows| {
             rows.iter()
-                .map(|row| {
-                    let chunks = row.as_array()?;
-                    Some(
-                        chunks
-                            .iter()
-                            .filter_map(|c| {
-                                let c = c.as_array()?;
-                                if c.len() != 2 {
-                                    return None;
-                                }
-                                Some((
-                                    c[0].as_str()?.to_string(),
-                                    c[1].as_u64().map(|id| id as usize),
-                                ))
-                            })
-                            .collect(),
-                    )
-                })
+                // A non-array row stays `None` (a real text row or `~` filler);
+                // an array row is a virtual line whose chunks we decode.
+                .map(|row| row.as_array().map(|_| parse_chunks(row)))
                 .collect()
         })
         .unwrap_or_default()
@@ -414,29 +389,7 @@ pub(crate) fn parse_virt_lines(value: Option<&Value>) -> Vec<Option<Vec<VirtChun
 pub(crate) fn parse_float_lines(value: Option<&Value>) -> Vec<Vec<VirtChunk>> {
     value
         .and_then(Value::as_array)
-        .map(|rows| {
-            rows.iter()
-                .map(|row| {
-                    row.as_array()
-                        .map(|chunks| {
-                            chunks
-                                .iter()
-                                .filter_map(|c| {
-                                    let c = c.as_array()?;
-                                    if c.len() != 2 {
-                                        return None;
-                                    }
-                                    Some((
-                                        c[0].as_str()?.to_string(),
-                                        c[1].as_u64().map(|id| id as usize),
-                                    ))
-                                })
-                                .collect()
-                        })
-                        .unwrap_or_default()
-                })
-                .collect()
-        })
+        .map(|rows| rows.iter().map(parse_chunks).collect())
         .unwrap_or_default()
 }
 
@@ -585,17 +538,7 @@ pub(crate) fn parse_bools(value: Option<&Value>) -> Vec<bool> {
 pub(crate) fn parse_cursor_list(value: Option<&Value>) -> Vec<(u16, u16)> {
     value
         .and_then(Value::as_array)
-        .map(|a| {
-            a.iter()
-                .filter_map(|v| match v.as_array() {
-                    Some(pair) if pair.len() == 2 => Some((
-                        pair[0].as_u64().unwrap_or(0) as u16,
-                        pair[1].as_u64().unwrap_or(0) as u16,
-                    )),
-                    _ => None,
-                })
-                .collect()
-        })
+        .map(|a| a.iter().filter_map(pair_u16).collect())
         .unwrap_or_default()
 }
 

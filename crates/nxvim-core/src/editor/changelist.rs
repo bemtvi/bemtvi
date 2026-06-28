@@ -71,13 +71,7 @@ impl Editor {
     fn goto_change(&mut self, target: usize) {
         let (line, col) = self.buffer().changelist[target];
         self.buffer_mut().changelistidx = target;
-        let line = line.min(self.last_line());
-        let max_col = self.buffer().line(line).trim_end_matches('\n').len();
-        let col = col.min(max_col);
-        self.set_cursor_char(self.buffer().byte_at(line, col));
-        self.desired_col = self.cursor_virtcol();
-        self.desired_eol = false;
-        self.ensure_visible();
+        self.settle_cursor_at(line, col);
     }
 
     /// `:changes` — list the current buffer's change list into a read-only scratch listing,

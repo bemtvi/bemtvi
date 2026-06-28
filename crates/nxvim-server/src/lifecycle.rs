@@ -730,10 +730,8 @@ impl EditHost {
             let scope_pat = scope.pattern();
             let dir = dir.display().to_string();
             if self.publish_cwd_mirror() {
-                if let Err(e) = self.lua.fire_dir_changed(scope_pat, &dir) {
-                    self.editor
-                        .echo(format!("E5108: Error in DirChanged autocmd: {e}"));
-                }
+                let r = self.lua.fire_dir_changed(scope_pat, &dir);
+                self.report_autocmd_err("DirChanged", r);
             }
             return;
         }
@@ -745,13 +743,10 @@ impl EditHost {
         }
         let cwd = std::env::current_dir().unwrap_or(want);
         self.publish_cwd_mirror();
-        if let Err(e) = self
+        let r = self
             .lua
-            .fire_dir_changed(scope.pattern(), &cwd.display().to_string())
-        {
-            self.editor
-                .echo(format!("E5108: Error in DirChanged autocmd: {e}"));
-        }
+            .fire_dir_changed(scope.pattern(), &cwd.display().to_string());
+        self.report_autocmd_err("DirChanged", r);
     }
 
     /// Reconcile a finished off-tick `:cd` (the daemon `fs_chdir` reply) against the
@@ -795,13 +790,10 @@ impl EditHost {
                 let dir = PathBuf::from(canon);
                 self.dirs.set(scope, win, tab, dir.clone());
                 self.publish_cwd_mirror();
-                if let Err(e) = self
+                let r = self
                     .lua
-                    .fire_dir_changed(scope.pattern(), &dir.display().to_string())
-                {
-                    self.editor
-                        .echo(format!("E5108: Error in DirChanged autocmd: {e}"));
-                }
+                    .fire_dir_changed(scope.pattern(), &dir.display().to_string());
+                self.report_autocmd_err("DirChanged", r);
             }
             // The daemon's `E344` (the target isn't a readable directory) or a transport
             // failure — roll back the optimistic move and surface it loud, never a silent
@@ -985,6 +977,39 @@ impl EditHost {
             .collect()
     }
 
+    /// Surface the standard `E5108` echo for an autocmd-firing result: a no-op on
+    /// `Ok`, the canonical `Error in {event} autocmd` message on `Err`. The single
+    /// home for the error-reporting half every `fire_*` autocmd call site shares.
+    pub(crate) fn report_autocmd_err<E: std::fmt::Display>(
+        &mut self,
+        event: &str,
+        res: Result<(), E>,
+    ) {
+        if let Err(e) = res {
+            self.editor
+                .echo(format!("E5108: Error in {event} autocmd: {e}"));
+        }
+    }
+
+    /// Fire `FileChangedShell` for `buf` (changed on disk for `reason`), echoing the
+    /// standard error on failure and returning whether a handler ran (so the caller
+    /// can honour `v:fcs_choice`). Shared by the local and remote watch reconcilers.
+    pub(crate) fn fire_file_changed_checked(
+        &mut self,
+        reason: FileChangeReason,
+        buf: BufferId,
+        file: &str,
+    ) -> bool {
+        match self.lua.fire_file_changed(reason.as_str(), buf.0, file) {
+            Ok(fired) => fired,
+            Err(e) => {
+                self.editor
+                    .echo(format!("E5108: Error in FileChangedShell autocmd: {e}"));
+                false
+            }
+        }
+    }
+
     /// Fire a window-lifecycle autocmd (`WinNew`/`WinEnter`/`WinLeave`/
     /// `WinClosed`/`WinResized`). The pattern / `<amatch>` is the window id (as a
     /// string, like neovim); the callback's buffer context is the window's buffer
@@ -997,10 +1022,8 @@ impl EditHost {
         };
         // Keep the buffer mirror in lockstep, as the buffer-event path does.
         self.push_buf_mirror();
-        if let Err(e) = self.lua.fire_autocmd_buf(event, &pattern, bufnr, &file) {
-            self.editor
-                .echo(format!("E5108: Error in {event} autocmd: {e}"));
-        }
+        let r = self.lua.fire_autocmd_buf(event, &pattern, bufnr, &file);
+        self.report_autocmd_err(event, r);
         self.apply_lua_effects();
     }
 
@@ -1021,10 +1044,8 @@ impl EditHost {
         };
         // Keep the buffer mirror in lockstep, as the window-event path does.
         self.push_buf_mirror();
-        if let Err(e) = self.lua.fire_autocmd_buf(event, &pattern, bufnr, &file) {
-            self.editor
-                .echo(format!("E5108: Error in {event} autocmd: {e}"));
-        }
+        let r = self.lua.fire_autocmd_buf(event, &pattern, bufnr, &file);
+        self.report_autocmd_err(event, r);
         self.apply_lua_effects();
     }
 
@@ -1038,10 +1059,8 @@ impl EditHost {
         // Keep the buffer mirror in lockstep: an autocmd callback runs here before
         // the caller's `run_pending`, so refresh `nx._bufs` / the cursor too.
         self.push_buf_mirror();
-        if let Err(e) = self.lua.fire_autocmd_buf(event, pattern, buf.0, file) {
-            self.editor
-                .echo(format!("E5108: Error in {event} autocmd: {e}"));
-        }
+        let r = self.lua.fire_autocmd_buf(event, pattern, buf.0, file);
+        self.report_autocmd_err(event, r);
         self.apply_lua_effects();
     }
 
@@ -1065,10 +1084,8 @@ impl EditHost {
         let _ = self.lua.set_buf_snapshot(buf.0, path, ft);
         self.push_buf_mirror();
         for event in ["BufWritePre", "BufWrite", "BufWritePost"] {
-            if let Err(e) = self.lua.fire_autocmd_buf(event, path, buf.0, path) {
-                self.editor
-                    .echo(format!("E5108: Error in {event} autocmd: {e}"));
-            }
+            let r = self.lua.fire_autocmd_buf(event, path, buf.0, path);
+            self.report_autocmd_err(event, r);
         }
         self.apply_lua_effects();
     }
@@ -1082,10 +1099,8 @@ impl EditHost {
     pub(crate) fn fire_buf_delete(&mut self, buf: BufferId) {
         let pattern = buf.0.to_string();
         self.push_buf_mirror();
-        if let Err(e) = self.lua.fire_autocmd_buf("BufDelete", &pattern, buf.0, "") {
-            self.editor
-                .echo(format!("E5108: Error in BufDelete autocmd: {e}"));
-        }
+        let r = self.lua.fire_autocmd_buf("BufDelete", &pattern, buf.0, "");
+        self.report_autocmd_err("BufDelete", r);
         self.apply_lua_effects();
     }
 
@@ -1142,14 +1157,7 @@ impl EditHost {
                 // A `FileChangedShell` handler commonly reads buffer state and `vim.v`;
                 // refresh the mirror so it sees the live buffer before the round-trip.
                 self.push_buf_mirror();
-                let fired = match self.lua.fire_file_changed(reason.as_str(), buf.0, &file) {
-                    Ok(fired) => fired,
-                    Err(e) => {
-                        self.editor
-                            .echo(format!("E5108: Error in FileChangedShell autocmd: {e}"));
-                        false
-                    }
-                };
+                let fired = self.fire_file_changed_checked(reason, buf, &file);
                 self.apply_lua_effects();
                 // A handler that left `v:fcs_choice` empty is the one case neovim fires
                 // no `FileChangedShellPost` for (it `return 2`s); every other path warns
@@ -1183,13 +1191,10 @@ impl EditHost {
             return;
         };
         self.push_buf_mirror();
-        if let Err(e) = self
+        let r = self
             .lua
-            .fire_autocmd_buf("FileChangedShellPost", &file, buf.0, &file)
-        {
-            self.editor
-                .echo(format!("E5108: Error in FileChangedShellPost autocmd: {e}"));
-        }
+            .fire_autocmd_buf("FileChangedShellPost", &file, buf.0, &file);
+        self.report_autocmd_err("FileChangedShellPost", r);
         self.apply_lua_effects();
     }
 
@@ -1233,14 +1238,7 @@ impl EditHost {
         }
         // A FileChangedShell handler may read buffer state and `vim.v`.
         self.push_buf_mirror();
-        let fired = match self.lua.fire_file_changed(reason.as_str(), buf.0, &path) {
-            Ok(fired) => fired,
-            Err(e) => {
-                self.editor
-                    .echo(format!("E5108: Error in FileChangedShell autocmd: {e}"));
-                false
-            }
-        };
+        let fired = self.fire_file_changed_checked(reason, buf, &path);
         self.apply_lua_effects();
         let mut do_reload = false;
         let mut fire_post = true;

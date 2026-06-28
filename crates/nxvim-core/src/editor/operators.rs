@@ -40,6 +40,15 @@ impl Editor {
         self.apply_operator_to_range(op, lo, hi, linewise, first_line);
     }
 
+    /// The inclusive line span `[first, last]` touched by the byte range `[lo,
+    /// hi)`: the line containing `lo` through the line containing the last byte
+    /// before `hi`. Used by the linewise operators (`=`/`>`/`<`/`zf`/`gc`).
+    fn line_span(&self, lo: usize, hi: usize) -> (usize, usize) {
+        let first = self.buffer().byte_to_line(lo);
+        let last = self.buffer().byte_to_line(hi.saturating_sub(1));
+        (first, last)
+    }
+
     /// Apply `op` to the absolute byte range `[lo, hi)`. `linewise`/`first_line`
     /// control linewise settling; charwise callers (motions, text objects) pass
     /// `(false, 0)`. Unlike `apply_operator`, the range is explicit and need not
@@ -59,8 +68,7 @@ impl Editor {
         // and writes no register, so it bypasses the modifiable / register checks
         // below (folding a read-only buffer is fine).
         if op == FOLD_OP {
-            let first = self.buffer().byte_to_line(lo);
-            let last = self.buffer().byte_to_line(hi.saturating_sub(1));
+            let (first, last) = self.line_span(lo, hi);
             self.create_fold(first, last);
             return;
         }
@@ -121,8 +129,7 @@ impl Editor {
             // `=` reindents whole lines (always linewise, even from a charwise
             // motion / text object), then settles on the first line's first non-blank.
             '=' => {
-                let first = self.buffer().byte_to_line(lo);
-                let last = self.buffer().byte_to_line(hi.saturating_sub(1));
+                let (first, last) = self.line_span(lo, hi);
                 self.reindent_lines(first, last);
             }
             // `>{motion}` / `<{motion}` / `>>` / `<<`: shift whole lines one
@@ -130,16 +137,14 @@ impl Editor {
             // before the operator already became the line range, so the shift
             // amount here is exactly one `shiftwidth`.
             '>' | '<' => {
-                let first = self.buffer().byte_to_line(lo);
-                let last = self.buffer().byte_to_line(hi.saturating_sub(1));
+                let (first, last) = self.line_span(lo, hi);
                 self.shift_lines(first, last, op == '>', 1);
             }
             // `gc{motion}` / `gcc` / `gcip`: toggle line comments over whichever
             // lines the range touches (always linewise, even from a charwise
             // motion / text object, like `=`).
             COMMENT_OP => {
-                let first = self.buffer().byte_to_line(lo);
-                let last = self.buffer().byte_to_line(hi.saturating_sub(1));
+                let (first, last) = self.line_span(lo, hi);
                 self.toggle_comment_lines(first, last);
             }
             _ => {}
@@ -245,8 +250,7 @@ impl Editor {
         // `=` reindents the selected lines; unlike d/y/c it neither yanks nor needs
         // the shared snapshot (`reindent_lines` takes its own), so handle it first.
         if op == '=' {
-            let first = self.buffer().byte_to_line(lo);
-            let last = self.buffer().byte_to_line(hi.saturating_sub(1));
+            let (first, last) = self.line_span(lo, hi);
             self.reindent_lines(first, last);
             self.mode = Mode::Normal;
             self.reset_pending();
@@ -260,8 +264,7 @@ impl Editor {
             // Stash the selection's shape so `.` reselects the same extent and
             // re-shifts (vim's visual `.`), captured before the buffer mutates.
             self.capture_visual_shape(op);
-            let first = self.buffer().byte_to_line(lo);
-            let last = self.buffer().byte_to_line(hi.saturating_sub(1));
+            let (first, last) = self.line_span(lo, hi);
             self.shift_lines(first, last, op == '>', self.effective_count());
             self.mode = Mode::Normal;
             self.reset_pending();
@@ -270,8 +273,7 @@ impl Editor {
         // Visual `zf` folds the selected lines — like `=`, no yank / register; it
         // creates the fold and parks the cursor on its first line.
         if op == FOLD_OP {
-            let first = self.buffer().byte_to_line(lo);
-            let last = self.buffer().byte_to_line(hi.saturating_sub(1));
+            let (first, last) = self.line_span(lo, hi);
             self.create_fold(first, last);
             self.mode = Mode::Normal;
             self.reset_pending();
@@ -280,8 +282,7 @@ impl Editor {
         // Visual `gc` toggles comments on the selected lines — like `=`, no yank /
         // register, its own undo step inside `toggle_comment_lines`.
         if op == COMMENT_OP {
-            let first = self.buffer().byte_to_line(lo);
-            let last = self.buffer().byte_to_line(hi.saturating_sub(1));
+            let (first, last) = self.line_span(lo, hi);
             self.toggle_comment_lines(first, last);
             self.mode = Mode::Normal;
             self.reset_pending();

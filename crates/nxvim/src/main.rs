@@ -559,23 +559,34 @@ fn main() -> Result<()> {
         }
     });
 
-    // The client (terminal UI) runs on the main thread.
+    // The client (terminal UI) runs on the main thread; when it exits the dropped
+    // stream signals the server to wind down, and a server-thread panic surfaces as
+    // exit 101 (see `drive_tui_and_join`).
+    drive_tui_and_join(client_end, server_thread)
+}
+
+/// Run the terminal UI client on the main thread until it exits, then join the
+/// server thread. When the client exits, the dropped `client_end` stream signals
+/// the server to wind down. A server-thread *panic* is surfaced as a non-zero exit
+/// (101, Rust's conventional panic code) with a diagnostic — taking precedence over
+/// a clean client `result`, since a crashed server is the more important failure.
+/// (The old `let _ = join()` discarded the payload, so a crash exited 0 and looked
+/// exactly like a clean `:q`.) Shared by the default and edit-host roles.
+fn drive_tui_and_join(
+    client_end: tokio::io::DuplexStream,
+    server_thread: std::thread::JoinHandle<()>,
+) -> Result<()> {
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_time()
         .build()?;
     let result = runtime.block_on(nxvim_tui::run(client_end));
 
-    // When the client exits, the dropped stream signals the server to wind down.
-    // Report a server-thread *panic* as a non-zero exit with a diagnostic: the
-    // old `let _ = join()` discarded the payload, so a server crash exited 0 and
-    // looked exactly like a clean `:q`. This takes precedence over `result`,
-    // since a crashed server is the more important failure to surface.
     if let Err(payload) = server_thread.join() {
         eprintln!(
             "nxvim: server thread panicked: {}",
             panic_message(payload.as_ref())
         );
-        std::process::exit(101); // Rust's conventional panic exit code
+        std::process::exit(101);
     }
     result
 }
@@ -828,19 +839,7 @@ where
     });
 
     // The client (terminal UI) runs on the main thread, exactly as the default role.
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_time()
-        .build()?;
-    let result = runtime.block_on(nxvim_tui::run(client_end));
-
-    if let Err(payload) = server_thread.join() {
-        eprintln!(
-            "nxvim: server thread panicked: {}",
-            panic_message(payload.as_ref())
-        );
-        std::process::exit(101);
-    }
-    result
+    drive_tui_and_join(client_end, server_thread)
 }
 
 /// Parse a `nxvim://HOST:PORT/TOKEN?cert=HASH` connect URI into the pieces

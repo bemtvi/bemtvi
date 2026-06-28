@@ -69,7 +69,7 @@ struct ParserEntry {
 
 /// Install grammar `lang` into `data_dir`. See the module docs for the flow.
 pub fn install(data_dir: &Path, lang: &str) -> Result<InstallReport> {
-    if !is_valid_language(lang) {
+    if !crate::loader::is_valid_language(lang) {
         bail!("invalid language name '{lang}' (letters, digits, '_' and '-' only)");
     }
 
@@ -599,13 +599,4 @@ fn github_owner_repo(url: &str) -> Option<(String, String)> {
         return None;
     }
     Some((owner, repo))
-}
-
-/// A grammar identifier: non-empty, ASCII letters/digits/`_`/`-` (same rule the
-/// loader enforces before joining the name into a path).
-fn is_valid_language(lang: &str) -> bool {
-    !lang.is_empty()
-        && lang
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
 }

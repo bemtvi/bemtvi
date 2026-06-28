@@ -36,26 +36,22 @@ use std::collections::HashMap;
 
 use lsp_types::{
     CodeAction, CodeActionResponse, CompletionItem, CompletionResponse, ConfigurationParams,
-    DocumentSymbolResponse, FoldingRange, GotoDefinitionResponse, Hover, InitializeParams,
-    InitializeResult, InlayHint, Location, PublishDiagnosticsParams, SemanticTokensFullDeltaResult,
+    DocumentSymbolResponse, FoldingRange, GotoDefinitionResponse, Hover, InitializeResult,
+    InlayHint, Location, PublishDiagnosticsParams, SemanticTokensFullDeltaResult,
     SemanticTokensResult, ShowMessageParams, SignatureHelp, TextEdit, Url, WorkspaceEdit,
     WorkspaceSymbolResponse,
 };
 use serde_json::{json, Value};
 
-use crate::client::{
-    configuration_reply, encoding_of, merged_client_capabilities, provider_caps, semantic_legend,
-    semantic_tokens_delta, sync_kind_of,
-};
+use crate::client::{configuration_reply, init_params, read_init_result};
 use crate::convert::{
-    code_actions, completion_reply, document_symbols, documentation_lines, folding_ranges,
-    goto_locations, hover_reply, inlay_hint, inlay_label_core, normalize_workspace_edit, pad_label,
-    signature_help_reply, workspace_symbols,
+    code_actions, completion_reply, document_symbols, folding_ranges, goto_locations, hover_reply,
+    inlay_hint, normalize_workspace_edit, resolved_completion, resolved_inlay_hint,
+    semantic_tokens_delta_data, semantic_tokens_full, signature_help_reply, workspace_symbols,
 };
 use crate::log::LspLog;
 use crate::protocol::{
-    LspEvent, LspNotify, LspReply, LspRequest, RefreshKind, ReqToken, SemanticTokensData,
-    ServerCaps, ServerKey, ServerSpawn,
+    LspEvent, LspNotify, LspReply, LspRequest, RefreshKind, ReqToken, ServerKey, ServerSpawn,
 };
 
 /// One raw operation the wasm host forwards to the daemon's LSP leg. `Spawn`/`Kill`
@@ -184,7 +180,6 @@ impl SyncLspClient {
     /// key is left alone). Mints a wire id, enqueues the `Spawn`, and sends
     /// `initialize` straight away — the daemon processes `lsp_spawn` before the
     /// `lsp_stdin` that follows on the same ordered stream.
-    #[allow(deprecated)] // root_uri is the broadest way to convey the workspace root
     pub fn ensure_server(&mut self, key: ServerKey, spawn: ServerSpawn) {
         if self.servers.contains_key(&key) {
             return;
@@ -211,16 +206,7 @@ impl SyncLspClient {
             args: spawn.args.clone(),
             cwd: key.root.to_string_lossy().into_owned(),
         });
-        let init = InitializeParams {
-            process_id: None,
-            root_uri: Url::from_file_path(&key.root).ok(),
-            initialization_options: spawn
-                .init_options
-                .clone()
-                .or_else(|| spawn.settings.clone()),
-            capabilities: merged_client_capabilities(spawn.capabilities.as_ref(), &self.log, &name),
-            ..Default::default()
-        };
+        let init = init_params(&key.root, &spawn, None, &self.log, &name);
         let params = serde_json::to_value(&init).unwrap_or(Value::Null);
         self.send_request(&key, "initialize", params, Pending::Handshake);
     }
@@ -437,14 +423,7 @@ impl SyncLspClient {
                     return;
                 }
             };
-        let caps = ServerCaps {
-            sync_kind: sync_kind_of(&init.capabilities),
-            providers: provider_caps(&init.capabilities),
-            legend: semantic_legend(&init.capabilities),
-            semantic_tokens_delta: semantic_tokens_delta(&init.capabilities),
-        };
-        let encoding = encoding_of(&init.capabilities);
-        let init_result = serde_json::to_value(&init).unwrap_or(Value::Null);
+        let (caps, encoding, init_result) = read_init_result(&init);
         self.events.push(LspEvent::Initialized {
             key: key.clone(),
             caps,
@@ -601,47 +580,14 @@ fn distill(kind: ReqKind, result: Result<Value, String>) -> LspReply {
                 .and_then(|a| a.edit)
                 .map(normalize_workspace_edit),
         ),
-        ReqKind::ResolveCompletion => match decode::<CompletionItem>(result) {
-            Some(item) => LspReply::ResolvedCompletion {
-                documentation: item.documentation.and_then(documentation_lines),
-                detail: item.detail,
-            },
-            None => LspReply::ResolvedCompletion {
-                documentation: None,
-                detail: None,
-            },
-        },
+        ReqKind::ResolveCompletion => resolved_completion(decode::<CompletionItem>(result)),
         ReqKind::SemanticTokensFull => {
-            LspReply::SemanticTokens(match decode::<SemanticTokensResult>(result) {
-                Some(SemanticTokensResult::Tokens(t)) => SemanticTokensData::Full {
-                    result_id: t.result_id,
-                    tokens: t.data,
-                },
-                Some(SemanticTokensResult::Partial(p)) => SemanticTokensData::Full {
-                    result_id: None,
-                    tokens: p.data,
-                },
-                None => empty_semantic_tokens(),
-            })
+            LspReply::SemanticTokens(semantic_tokens_full(decode::<SemanticTokensResult>(result)))
         }
         ReqKind::SemanticTokensDelta => {
-            LspReply::SemanticTokens(match decode::<SemanticTokensFullDeltaResult>(result) {
-                Some(SemanticTokensFullDeltaResult::TokensDelta(d)) => SemanticTokensData::Delta {
-                    result_id: d.result_id,
-                    edits: d.edits,
-                },
-                Some(SemanticTokensFullDeltaResult::PartialTokensDelta { edits }) => {
-                    SemanticTokensData::Delta {
-                        result_id: None,
-                        edits,
-                    }
-                }
-                Some(SemanticTokensFullDeltaResult::Tokens(t)) => SemanticTokensData::Full {
-                    result_id: t.result_id,
-                    tokens: t.data,
-                },
-                None => empty_semantic_tokens(),
-            })
+            LspReply::SemanticTokens(semantic_tokens_delta_data(decode::<
+                SemanticTokensFullDeltaResult,
+            >(result)))
         }
         ReqKind::InlayHint => LspReply::InlayHints(
             decode::<Vec<InlayHint>>(result)
@@ -650,28 +596,12 @@ fn distill(kind: ReqKind, result: Result<Value, String>) -> LspReply {
                 .map(inlay_hint)
                 .collect(),
         ),
-        ReqKind::ResolveInlayHint => match decode::<InlayHint>(result) {
-            Some(hint) => {
-                let core = inlay_label_core(&hint);
-                let label = (!core.is_empty()).then(|| pad_label(&core, &hint));
-                LspReply::ResolvedInlayHint { label }
-            }
-            None => LspReply::ResolvedInlayHint { label: None },
-        },
+        ReqKind::ResolveInlayHint => resolved_inlay_hint(decode::<InlayHint>(result).as_ref()),
         ReqKind::FoldingRange => LspReply::Folds(folding_ranges(
             decode::<Vec<FoldingRange>>(result).unwrap_or_default(),
         )),
         // Handled by the caller (needs the transport error string).
         ReqKind::Raw => LspReply::Raw(Ok(Value::Null)),
-    }
-}
-
-/// The "server classified nothing" reply (a full set, no tokens, no `result_id`),
-/// matching the native dispatch's `empty_semantic_tokens`.
-fn empty_semantic_tokens() -> SemanticTokensData {
-    SemanticTokensData::Full {
-        result_id: None,
-        tokens: Vec::new(),
     }
 }
 

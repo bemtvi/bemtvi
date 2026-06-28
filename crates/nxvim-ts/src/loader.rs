@@ -224,7 +224,7 @@ fn open_language(
 /// (e.g. `rust`, `c`, `cpp`, `c_sharp`, `tsx`). Excluding `.`, `/`, `\` and the
 /// empty string is what makes path traversal and absolute-path escapes
 /// impossible when the name is joined into `data_dir`.
-fn is_valid_language(lang: &str) -> bool {
+pub(crate) fn is_valid_language(lang: &str) -> bool {
     !lang.is_empty()
         && lang
             .bytes()
@@ -244,17 +244,24 @@ pub fn has_parser(data_dir: &Path, lang: &str) -> bool {
 /// its parsers `<lang>.so` even on macOS.
 fn parser_path(data_dir: &Path, lang: &str) -> Option<PathBuf> {
     let dir = data_dir.join("parser");
-    let native = if cfg!(target_os = "windows") {
+    ["so", native_lib_ext()]
+        .into_iter()
+        .map(|ext| dir.join(format!("{lang}.{ext}")))
+        .find(|p| p.exists())
+}
+
+/// The platform's native shared-library extension for parser objects (`dll` on
+/// Windows, `dylib` on macOS, `so` elsewhere). `.so` is also tried first on every
+/// OS because nvim-treesitter names its parsers `<lang>.so` even on macOS, so
+/// callers pair this with `"so"`.
+pub(crate) fn native_lib_ext() -> &'static str {
+    if cfg!(target_os = "windows") {
         "dll"
     } else if cfg!(target_os = "macos") {
         "dylib"
     } else {
         "so"
-    };
-    ["so", native]
-        .into_iter()
-        .map(|ext| dir.join(format!("{lang}.{ext}")))
-        .find(|p| p.exists())
+    }
 }
 
 pub(crate) fn query_path(data_dir: &Path, lang: &str, file: &str) -> PathBuf {

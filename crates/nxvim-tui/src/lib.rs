@@ -37,7 +37,7 @@ use crossterm::event::{
     EventStream, KeyEventKind, KeyModifiers, MouseButton, MouseEventKind,
 };
 use futures::StreamExt;
-use nxvim_rpc::{connect, Incoming};
+use nxvim_rpc::{connect, Incoming, Rpc};
 use nxvim_view::{encode_paste, View};
 use rmpv::Value;
 use std::io::Write;
@@ -276,17 +276,7 @@ where
                     // nxvim is single-grid.
                     MouseEventKind::Down(MouseButton::Left) => {
                         let size = terminal.size().unwrap_or_default();
-                        rpc.notify(
-                            "nx_input_mouse",
-                            vec![
-                                Value::from("left"),
-                                Value::from("press"),
-                                Value::from(mouse_modifier(m.modifiers)),
-                                Value::from(0u64),
-                                Value::from(m.row as u64),
-                                Value::from(m.column as u64),
-                            ],
-                        );
+                        send_mouse(&rpc, "left", "press", &mouse_modifier(m.modifiers), m.row, m.column);
                         // Arm edge auto-scroll if the press already landed in the edge
                         // band (a press-and-hold there scrolls without a drag).
                         autoscroll = in_scroll_zone(m.row, size.height).then_some((m.row, m.column));
@@ -297,17 +287,7 @@ where
                     // server no-ops them unless a text press set an anchor, so a
                     // stray drag over chrome does nothing.
                     MouseEventKind::Drag(MouseButton::Left) => {
-                        rpc.notify(
-                            "nx_input_mouse",
-                            vec![
-                                Value::from("left"),
-                                Value::from("drag"),
-                                Value::from(mouse_modifier(m.modifiers)),
-                                Value::from(0u64),
-                                Value::from(m.row as u64),
-                                Value::from(m.column as u64),
-                            ],
-                        );
+                        send_mouse(&rpc, "left", "drag", &mouse_modifier(m.modifiers), m.row, m.column);
                         // (Re)arm continuous auto-scroll when the drag is parked in
                         // the edge band; disarm once it moves back into the body.
                         let size = terminal.size().unwrap_or_default();
@@ -316,17 +296,7 @@ where
                     }
                     MouseEventKind::Up(MouseButton::Left) => {
                         autoscroll = None; // release ends the drag, so stop scrolling
-                        rpc.notify(
-                            "nx_input_mouse",
-                            vec![
-                                Value::from("left"),
-                                Value::from("release"),
-                                Value::from(mouse_modifier(m.modifiers)),
-                                Value::from(0u64),
-                                Value::from(m.row as u64),
-                                Value::from(m.column as u64),
-                            ],
-                        );
+                        send_mouse(&rpc, "left", "release", &mouse_modifier(m.modifiers), m.row, m.column);
                     }
                     // Right / middle press: no client-owned overlay claims them, so
                     // forward straight to the server, which owns the gesture — the
@@ -339,17 +309,7 @@ where
                         } else {
                             "middle"
                         };
-                        rpc.notify(
-                            "nx_input_mouse",
-                            vec![
-                                Value::from(name),
-                                Value::from("press"),
-                                Value::from(mouse_modifier(m.modifiers)),
-                                Value::from(0u64),
-                                Value::from(m.row as u64),
-                                Value::from(m.column as u64),
-                            ],
-                        );
+                        send_mouse(&rpc, name, "press", &mouse_modifier(m.modifiers), m.row, m.column);
                     }
                     // The mouse wheel: forward every notch to the server, which owns
                     // the hit-test back to the window — or the overlay (the completion
@@ -364,17 +324,7 @@ where
                             MouseEventKind::ScrollRight => "right",
                             _ => "left",
                         };
-                        rpc.notify(
-                            "nx_input_mouse",
-                            vec![
-                                Value::from("wheel"),
-                                Value::from(action),
-                                Value::from(mouse_modifier(m.modifiers)),
-                                Value::from(0u64),
-                                Value::from(m.row as u64),
-                                Value::from(m.column as u64),
-                            ],
-                        );
+                        send_mouse(&rpc, "wheel", action, &mouse_modifier(m.modifiers), m.row, m.column);
                     }
                     _ => {}
                 },
@@ -386,7 +336,7 @@ where
                     "redraw" => {
                         view.update(&params);
                         anim = arm_animation(&view, anim.take());
-                        terminal.draw(|frame| render(frame, &view, anim.as_ref(), 0, Some(&mut image_store)))?;
+                        draw_frame(terminal, &view, anim.as_ref(), &mut image_store)?;
                         // Match the cursor shape to the mode (a thin bar in insert
                         // mode). Emitted only on change so it doesn't flicker.
                         let want = cursor_style(&view);
@@ -407,7 +357,7 @@ where
                 if anim.as_ref().is_some_and(|a| a.start.elapsed() >= a.duration) {
                     anim = None; // settle: render the destination view below
                 }
-                terminal.draw(|frame| render(frame, &view, anim.as_ref(), 0, Some(&mut image_store)))?;
+                draw_frame(terminal, &view, anim.as_ref(), &mut image_store)?;
             },
             // `timeoutlen` idle flush: a keystroke armed the timer and nothing
             // followed within `'timeoutlen'`, so nudge the server to resolve any key
@@ -426,17 +376,7 @@ where
             // text body and re-extends the selection; held still, this paces it.
             _ = sleep(AUTOSCROLL_INTERVAL), if autoscroll.is_some() => {
                 if let Some((row, col)) = autoscroll {
-                    rpc.notify(
-                        "nx_input_mouse",
-                        vec![
-                            Value::from("left"),
-                            Value::from("drag"),
-                            Value::from(""),
-                            Value::from(0u64),
-                            Value::from(row as u64),
-                            Value::from(col as u64),
-                        ],
-                    );
+                    send_mouse(&rpc, "left", "drag", "", row, col);
                 }
             },
             // A remote preview needs its bytes: fetch them over `nxvim_image_read` on a
@@ -462,7 +402,7 @@ where
             // store and repaint, so the picture replaces its loading placeholder.
             bytes = img_bytes_rx.recv() => if let Some((path, version, result)) = bytes {
                 image_store.deliver(path, version, result);
-                terminal.draw(|frame| render(frame, &view, anim.as_ref(), 0, Some(&mut image_store)))?;
+                draw_frame(terminal, &view, anim.as_ref(), &mut image_store)?;
             },
         }
     }
@@ -473,6 +413,37 @@ where
 /// Text-area height = terminal height minus the chrome rows we render ourselves.
 fn text_height(terminal_height: u16) -> u16 {
     terminal_height.saturating_sub(CHROME_ROWS).max(1)
+}
+
+/// Forward one mouse gesture to the server as an `nx_input_mouse` notification.
+/// `button`/`action` name the gesture (e.g. `"left"`/`"press"`, `"wheel"`/`"down"`),
+/// `mods` is the [`mouse_modifier`] string, and `row`/`col` the global cell. `grid`
+/// is always `0` — nxvim is single-grid.
+fn send_mouse(rpc: &Rpc, button: &str, action: &str, mods: &str, row: u16, col: u16) {
+    rpc.notify(
+        "nx_input_mouse",
+        vec![
+            Value::from(button),
+            Value::from(action),
+            Value::from(mods),
+            Value::from(0u64),
+            Value::from(row as u64),
+            Value::from(col as u64),
+        ],
+    );
+}
+
+/// Paint the current `view` (mid-`anim` when one is in flight) into `terminal` via
+/// the shared [`render`]. The three event-loop repaint sites — a `redraw`, an
+/// animation tick, and a delivered image — all funnel through here.
+fn draw_frame(
+    terminal: &mut DefaultTerminal,
+    view: &View,
+    anim: Option<&Animation>,
+    image_store: &mut images::ImageStore,
+) -> Result<()> {
+    terminal.draw(|frame| render(frame, view, anim, 0, Some(image_store)))?;
+    Ok(())
 }
 
 /// The `nx_input_mouse` modifier string for a crossterm mouse event's

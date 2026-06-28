@@ -1195,10 +1195,7 @@ impl Renderer {
                     // blanking out for the slide (the settled path paints the same).
                     if sign_w > 0 {
                         if let Some(Some((glyph, severity, id))) = s.diagnostics_signs.get(k) {
-                            let color = id
-                                .and_then(|id| s.styles.get(id))
-                                .and_then(|st| st.fg)
-                                .unwrap_or_else(|| severity_color(*severity));
+                            let color = diag_color(s.styles, *id, *severity, false);
                             let text = pad_to_width(glyph, sign_w as usize);
                             self.push_plain(
                                 items,
@@ -1211,10 +1208,7 @@ impl Renderer {
                     }
                     if let Some(diags) = s.diagnostics.get(k) {
                         for (ds, de, severity, id) in diags {
-                            let color = id
-                                .and_then(|id| s.styles.get(id))
-                                .and_then(|st| st.sp.or(st.fg))
-                                .unwrap_or_else(|| severity_color(*severity));
+                            let color = diag_color(s.styles, *id, *severity, true);
                             self.push_underline_at(
                                 quads,
                                 text_x0,
@@ -1259,14 +1253,7 @@ impl Renderer {
                 // not the global surface fill. Gated on the override so an ordinary
                 // window adds no quad and renders exactly as before.
                 if win.chrome.normal.is_some() {
-                    let (px, py) = self.cell_px(ox, oy);
-                    quads.push(Quad {
-                        x: px,
-                        y: py,
-                        w: self.cell_w * wcols as f32,
-                        h: self.cell_h * text_rows as f32,
-                        color: color_to_rgba(srgb_to_color(normal_bg)),
-                    });
+                    self.fill_rect(quads, ox, oy, wcols, text_rows, normal_bg);
                 }
                 for (i, raw) in win.lines.iter().enumerate() {
                     let row = oy as usize + i;
@@ -1276,14 +1263,7 @@ impl Renderer {
                     // search quads so those win on the cells they cover; every quad
                     // sits under the glyphs, so the gutter number and text paint on top.
                     if win.cursorline && i == win.cursor_row as usize {
-                        let (px, py) = self.cell_px(ox, row as u16);
-                        quads.push(Quad {
-                            x: px,
-                            y: py,
-                            w: self.cell_w * wcols as f32,
-                            h: self.cell_h,
-                            color: color_to_rgba(srgb_to_color(cursorline_bg)),
-                        });
+                        self.fill_cells(quads, ox, row as u16, wcols, cursorline_bg);
                     }
 
                     // A `virt_lines` virtual row: a whole extra screen line of extmark
@@ -1365,10 +1345,7 @@ impl Renderer {
                     // severe glyph for the line sits at the window's left edge.
                     if sign_w > 0 {
                         if let Some(Some((glyph, severity, id))) = win.diagnostics_signs.get(i) {
-                            let color = id
-                                .and_then(|id| view.styles.get(id))
-                                .and_then(|st| st.fg)
-                                .unwrap_or_else(|| severity_color(*severity));
+                            let color = diag_color(&view.styles, *id, *severity, false);
                             let text = pad_to_width(glyph, sign_w as usize);
                             self.push_plain(
                                 items,
@@ -1457,10 +1434,7 @@ impl Renderer {
                     // the syntax/selection: a thin colored rule under the cells.
                     if let Some(diags) = win.diagnostics.get(i) {
                         for (s, e, severity, id) in diags {
-                            let color = id
-                                .and_then(|id| view.styles.get(id))
-                                .and_then(|st| st.sp.or(st.fg))
-                                .unwrap_or_else(|| severity_color(*severity));
+                            let color = diag_color(&view.styles, *id, *severity, true);
                             self.push_underline(
                                 quads,
                                 text_x0,
@@ -1490,10 +1464,7 @@ impl Renderer {
                             let limit = (ox + wcols).saturating_sub(start);
                             if limit > 0 {
                                 let shown: String = text.chars().take(limit as usize).collect();
-                                let color = id
-                                    .and_then(|id| view.styles.get(id))
-                                    .and_then(|st| st.fg)
-                                    .unwrap_or_else(|| severity_color(*severity));
+                                let color = diag_color(&view.styles, *id, *severity, false);
                                 self.push_plain(
                                     items,
                                     &shown,
@@ -2065,8 +2036,7 @@ impl Renderer {
         Self::occlude_overlay_text(items, self.text_bounds(ox, oy, r.width, r.height));
         // Prefer the colorscheme's float chrome (`NormalFloat` bg) when defined,
         // else the historical fallback: a slightly lightened `Normal` background.
-        let bg = style_bg(&view.normal_float)
-            .unwrap_or_else(|| lighten(style_bg(&view.normal).unwrap_or(DEFAULT_BG), 0x10));
+        let bg = float_bg(view, 0x10);
         // Opaque fill over the whole float rect.
         let (px, py) = self.cell_px(ox, oy);
         quads.push(Quad {
@@ -2760,8 +2730,7 @@ impl Renderer {
 
         // Prefer the colorscheme's float chrome (`NormalFloat` / `FloatBorder` /
         // `FloatTitle`) when defined, else the historical `Normal`-derived fallback.
-        let popup_bg = style_bg(&view.normal_float)
-            .unwrap_or_else(|| lighten(style_bg(&view.normal).unwrap_or(DEFAULT_BG), 0x14));
+        let popup_bg = float_bg(view, 0x14);
         let border = style_fg(&view.float_border).unwrap_or_else(|| lighten(popup_bg, 0x30));
         let fg = style_fg(&view.normal).unwrap_or(DEFAULT_FG);
         let title_fg = style_fg(&view.float_title).unwrap_or(fg);
@@ -2850,6 +2819,25 @@ impl Renderer {
         self.fill_cells(quads, 0, row, cols, color);
     }
 
+    /// Resolve a buffer-column `span` to the on-screen cell range `[start, end)` it
+    /// covers: anchored at column `base`, shifted left by `leftcol`, and pushed right
+    /// past any inlay hints inserted before each endpoint. `None` when the span lands
+    /// empty (or fully scrolled off the left), so a span-quad / underline / strike
+    /// caller can early-out. Shared by [`Self::push_underline_at`],
+    /// [`Self::push_strike`], [`Self::push_span_quad`], and [`Self::push_span_quad_at`].
+    fn span_cols(
+        &self,
+        base: u16,
+        span: (u16, u16),
+        leftcol: u16,
+        inlay: &[InlayHint],
+    ) -> Option<(u16, u16)> {
+        let (s, e) = span;
+        let start = base + s.saturating_sub(leftcol) + inlay_shift(inlay, leftcol, s, true);
+        let end = base + e.saturating_sub(leftcol) + inlay_shift(inlay, leftcol, e, false);
+        (end > start).then_some((start, end))
+    }
+
     /// Push a thin underline rule under cells `[s, e)` of `row` (a diagnostic
     /// underline / undercurl approximation), offset left by `leftcol` and anchored
     /// at column `base` like [`push_span_quad`].
@@ -2882,12 +2870,9 @@ impl Renderer {
         inlay: &[InlayHint],
         color: u32,
     ) {
-        let (s, e) = span;
-        let start = base + s.saturating_sub(leftcol) + inlay_shift(inlay, leftcol, s, true);
-        let end = base + e.saturating_sub(leftcol) + inlay_shift(inlay, leftcol, e, false);
-        if end <= start {
+        let Some((start, end)) = self.span_cols(base, span, leftcol, inlay) else {
             return;
-        }
+        };
         let h = (self.cell_h * 0.08).max(1.0);
         quads.push(Quad {
             x: start as f32 * self.cell_w,
@@ -2912,12 +2897,9 @@ impl Renderer {
         inlay: &[InlayHint],
         color: u32,
     ) {
-        let (s, e) = span;
-        let start = base + s.saturating_sub(leftcol) + inlay_shift(inlay, leftcol, s, true);
-        let end = base + e.saturating_sub(leftcol) + inlay_shift(inlay, leftcol, e, false);
-        if end <= start {
+        let Some((start, end)) = self.span_cols(base, span, leftcol, inlay) else {
             return;
-        }
+        };
         let (px, py) = self.cell_px(start, row as u16);
         let h = (self.cell_h * 0.08).max(1.0);
         quads.push(Quad {
@@ -3012,12 +2994,9 @@ impl Renderer {
         inlay: &[InlayHint],
         color: u32,
     ) {
-        let (s, e) = span;
-        let start = base + s.saturating_sub(leftcol) + inlay_shift(inlay, leftcol, s, true);
-        let end = base + e.saturating_sub(leftcol) + inlay_shift(inlay, leftcol, e, false);
-        if end <= start {
+        let Some((start, end)) = self.span_cols(base, span, leftcol, inlay) else {
             return;
-        }
+        };
         let (px, py) = self.cell_px(start, row as u16);
         quads.push(Quad {
             x: px,
@@ -3046,12 +3025,9 @@ impl Renderer {
         clip_top: f32,
         clip_bottom: f32,
     ) {
-        let (s, e) = span;
-        let start = base + s.saturating_sub(leftcol) + inlay_shift(inlay, leftcol, s, true);
-        let end = base + e.saturating_sub(leftcol) + inlay_shift(inlay, leftcol, e, false);
-        if end <= start {
+        let Some((start, end)) = self.span_cols(base, span, leftcol, inlay) else {
             return;
-        }
+        };
         let top = y.max(clip_top);
         let bottom = (y + self.cell_h).min(clip_bottom);
         if bottom <= top {
@@ -3426,6 +3402,16 @@ fn severity_color(severity: u8) -> u32 {
     }
 }
 
+/// Resolve a diagnostic's paint color: the highlight group `id` (when the
+/// colorscheme defined it) else the built-in [`severity_color`] for `severity`.
+/// `prefer_sp` picks the group's `sp` (special) color before its `fg` — underlines
+/// use the special color, signs and virtual text use the foreground.
+fn diag_color(styles: &[Style], id: Option<usize>, severity: u8, prefer_sp: bool) -> u32 {
+    id.and_then(|id| styles.get(id))
+        .and_then(|st| if prefer_sp { st.sp.or(st.fg) } else { st.fg })
+        .unwrap_or_else(|| severity_color(severity))
+}
+
 /// Subtract the rect `hole` from rect `a` (both `(left, top, right, bottom)` in
 /// pixels), returning the ≤4 disjoint pieces of `a` not covered by `hole` — the
 /// whole of `a` when they don't overlap, nothing when `hole` fully covers `a`.
@@ -3470,6 +3456,14 @@ pub fn rect_subtract(
 fn lighten(c: u32, d: u8) -> u32 {
     let f = |b: u8| b.saturating_add(d) as u32;
     (f((c >> 16) as u8) << 16) | (f((c >> 8) as u8) << 8) | f(c as u8)
+}
+
+/// The opaque background for an overlay surface (a float / popup box): the
+/// colorscheme's `NormalFloat`, else the editor background [`lighten`]ed by
+/// `lighten_amt` so the box lifts off the text behind it.
+fn float_bg(view: &View, lighten_amt: u8) -> u32 {
+    style_bg(&view.normal_float)
+        .unwrap_or_else(|| lighten(style_bg(&view.normal).unwrap_or(DEFAULT_BG), lighten_amt))
 }
 
 /// Inset a `(x, y, w, h)` cell rect by a window's `'padding'` — a per-side blank

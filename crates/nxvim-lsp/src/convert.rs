@@ -13,13 +13,14 @@ use lsp_types::{
     CompletionResponse, CompletionTextEdit, DocumentChangeOperation, DocumentChanges,
     DocumentSymbol, DocumentSymbolResponse, Documentation, FoldingRange, GotoDefinitionResponse,
     Hover, HoverContents, InlayHint, InlayHintKind, InlayHintLabel, Location, MarkedString, OneOf,
-    ParameterLabel, SignatureHelp, SymbolInformation, SymbolKind, TextDocumentEdit, TextEdit, Url,
-    WorkspaceEdit, WorkspaceSymbolResponse,
+    ParameterLabel, SemanticTokensFullDeltaResult, SemanticTokensResult, SignatureHelp,
+    SymbolInformation, SymbolKind, TextDocumentEdit, TextEdit, Url, WorkspaceEdit,
+    WorkspaceSymbolResponse,
 };
 
 use crate::protocol::{
-    CodeActionData, CompletionItemData, FoldRangeData, InlayHintData, LspReply, SymbolData,
-    WorkspaceEditData,
+    CodeActionData, CompletionItemData, FoldRangeData, InlayHintData, LspReply, SemanticTokensData,
+    SymbolData, WorkspaceEditData,
 };
 
 /// Reduce a `textDocument/foldingRange` reply to nxvim's whole-line spans: each
@@ -553,4 +554,91 @@ pub(crate) fn pad_label(core: &str, hint: &InlayHint) -> String {
         out.push(' ');
     }
     out
+}
+
+/// Distill an `inlayHint/resolve` reply (the resolved hint, or `None` on a
+/// malformed/error/absent result) into [`LspReply::ResolvedInlayHint`]: its padded
+/// label, or `None` when the resolved hint still carries no usable label (the
+/// editor drops the placeholder rather than paint an empty hint — never a fake).
+/// Shared by the async (native) and sync (wasm) dispatch paths.
+pub(crate) fn resolved_inlay_hint(hint: Option<&InlayHint>) -> LspReply {
+    let label = hint.and_then(|hint| {
+        let core = inlay_label_core(hint);
+        (!core.is_empty()).then(|| pad_label(&core, hint))
+    });
+    LspReply::ResolvedInlayHint { label }
+}
+
+/// Distill a `completionItem/resolve` reply (the resolved item, or `None` on a
+/// malformed/error/absent result) into [`LspReply::ResolvedCompletion`]: its
+/// `documentation` (markup → plain lines) and `detail`, both `None` when absent so
+/// the editor leaves a docless item docless rather than fake a doc. Shared by the
+/// async (native) and sync (wasm) dispatch paths.
+pub(crate) fn resolved_completion(item: Option<CompletionItem>) -> LspReply {
+    match item {
+        Some(item) => LspReply::ResolvedCompletion {
+            documentation: item.documentation.and_then(documentation_lines),
+            detail: item.detail,
+        },
+        None => LspReply::ResolvedCompletion {
+            documentation: None,
+            detail: None,
+        },
+    }
+}
+
+/// The "server classified nothing" semantic-tokens reply: a full set with no
+/// tokens and no `result_id`, so the editor clears its cache (and drops the
+/// `result_id`, falling back to `full` on the next refresh) rather than guessing.
+/// Used for `null`/error replies to both `full` and `full/delta`.
+pub(crate) fn empty_semantic_tokens() -> SemanticTokensData {
+    SemanticTokensData::Full {
+        result_id: None,
+        tokens: Vec::new(),
+    }
+}
+
+/// Distill a `textDocument/semanticTokens/full` reply into [`SemanticTokensData`].
+/// Both the full (`Tokens`) and streamed (`Partial`) shapes carry the same packed
+/// `data`; only the full one has a `result_id` (the delta cursor — Phase 2). A
+/// `None` result ⇒ no tokens. Shared by the async (native) and sync (wasm) paths.
+pub(crate) fn semantic_tokens_full(resp: Option<SemanticTokensResult>) -> SemanticTokensData {
+    match resp {
+        Some(SemanticTokensResult::Tokens(t)) => SemanticTokensData::Full {
+            result_id: t.result_id,
+            tokens: t.data,
+        },
+        Some(SemanticTokensResult::Partial(p)) => SemanticTokensData::Full {
+            result_id: None,
+            tokens: p.data,
+        },
+        None => empty_semantic_tokens(),
+    }
+}
+
+/// Distill a `textDocument/semanticTokens/full/delta` reply into
+/// [`SemanticTokensData`]: a `TokensDelta` becomes an edit splice against our
+/// `previousResultId`; a fresh full `Tokens` set is the transparent fallback when
+/// the server couldn't honor the previous id (the editor replaces its cache rather
+/// than patching it). A `None` result ⇒ no tokens. Shared by both dispatch paths.
+pub(crate) fn semantic_tokens_delta_data(
+    resp: Option<SemanticTokensFullDeltaResult>,
+) -> SemanticTokensData {
+    match resp {
+        Some(SemanticTokensFullDeltaResult::TokensDelta(d)) => SemanticTokensData::Delta {
+            result_id: d.result_id,
+            edits: d.edits,
+        },
+        Some(SemanticTokensFullDeltaResult::PartialTokensDelta { edits }) => {
+            SemanticTokensData::Delta {
+                result_id: None,
+                edits,
+            }
+        }
+        Some(SemanticTokensFullDeltaResult::Tokens(t)) => SemanticTokensData::Full {
+            result_id: t.result_id,
+            tokens: t.data,
+        },
+        None => empty_semantic_tokens(),
+    }
 }

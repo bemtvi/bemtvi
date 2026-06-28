@@ -494,13 +494,10 @@ impl EditHost {
         // Keep the buffer mirror fresh: an `on_attach` body commonly reads buffer
         // lines / the cursor and runs before the trailing `run_pending` (Phase 6).
         self.push_buf_mirror();
-        if let Err(e) = self
+        let r = self
             .lua
-            .fire_autocmd_data("LspAttach", file, buf.0, file, client_id)
-        {
-            self.editor
-                .echo(format!("E5108: Error in LspAttach autocmd: {e}"));
-        }
+            .fire_autocmd_data("LspAttach", file, buf.0, file, client_id);
+        self.report_autocmd_err("LspAttach", r);
         self.apply_lua_effects();
     }
 
@@ -510,13 +507,10 @@ impl EditHost {
     /// (`didClose`) or a server that exited, neither of which is necessarily the
     /// current buffer. User `LspDetach` callbacks still get `args.buf`/`data`.
     pub(crate) fn fire_lsp_detach(&mut self, buf: BufferId, file: &str, client_id: u64) {
-        if let Err(e) = self
+        let r = self
             .lua
-            .fire_autocmd_data("LspDetach", file, buf.0, file, client_id)
-        {
-            self.editor
-                .echo(format!("E5108: Error in LspDetach autocmd: {e}"));
-        }
+            .fire_autocmd_data("LspDetach", file, buf.0, file, client_id);
+        self.report_autocmd_err("LspDetach", r);
         self.apply_lua_effects();
     }
 

@@ -63,12 +63,7 @@ pub struct Rpc {
 impl Rpc {
     /// Fire-and-forget notification.
     pub fn notify(&self, method: &str, params: Vec<Value>) {
-        let msg = Value::Array(vec![
-            Value::from(2u64),
-            Value::from(method),
-            Value::Array(params),
-        ]);
-        let _ = self.out.send(encode(&msg));
+        let _ = self.out.send(notification(method, params));
     }
 
     /// Backpressured notification for **bulk, one-way streaming** data — terminal
@@ -81,12 +76,7 @@ impl Rpc {
     /// connection has closed. Use only for high-volume data that can tolerate pacing;
     /// control/latency-sensitive frames must use [`notify`](Self::notify).
     pub async fn notify_stream(&self, method: &str, params: Vec<Value>) {
-        let msg = Value::Array(vec![
-            Value::from(2u64),
-            Value::from(method),
-            Value::Array(params),
-        ]);
-        let _ = self.stream.send(encode(&msg)).await;
+        let _ = self.stream.send(notification(method, params)).await;
     }
 
     /// Send a request and await its response.
@@ -552,4 +542,15 @@ fn encode(val: &Value) -> Vec<u8> {
     let mut buf = Vec::with_capacity(ENCODE_BUF_HINT);
     rmpv::encode::write_value(&mut buf, val).expect("msgpack encoding cannot fail to a Vec");
     buf
+}
+
+/// Build and encode a notification frame `[2, method, params]`. Shared by
+/// [`Rpc::notify`] and [`Rpc::notify_stream`], which differ only in the channel
+/// the encoded bytes are handed to.
+fn notification(method: &str, params: Vec<Value>) -> Vec<u8> {
+    encode(&Value::Array(vec![
+        Value::from(2u64),
+        Value::from(method),
+        Value::Array(params),
+    ]))
 }

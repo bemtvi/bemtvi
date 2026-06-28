@@ -125,17 +125,7 @@ impl TestClock {
 /// read to observe the effect. For modifiers or to assert the RPC *rejects* a
 /// malformed call, drive `nx_input_mouse` directly.
 pub fn feed_mouse(rpc: &Rpc, button: &str, action: &str, row: usize, col: usize) {
-    rpc.notify(
-        "nx_input_mouse",
-        vec![
-            Value::from(button),
-            Value::from(action),
-            Value::from(""),
-            Value::from(0u64),
-            Value::from(row as u64),
-            Value::from(col as u64),
-        ],
-    );
+    feed_mouse_mod(rpc, button, action, "", row, col);
 }
 
 /// Like [`feed_mouse`], but with a `modifier` string (`nx_input_mouse`'s param 3 —
@@ -190,25 +180,7 @@ pub async fn command(rpc: &Rpc, cmd: &str) {
 /// Fetch all current-buffer lines. Doubles as a **barrier**: awaiting the
 /// response guarantees the server has processed every message queued before it.
 pub async fn lines(rpc: &Rpc) -> Vec<String> {
-    let result = rpc
-        .request(
-            "nvim_buf_get_lines",
-            vec![
-                Value::from(0u64),
-                Value::from(0i64),
-                Value::from(-1i64),
-                Value::Boolean(false),
-            ],
-        )
-        .await
-        .expect("get_lines");
-    match result {
-        Value::Array(items) => items
-            .into_iter()
-            .filter_map(|v| v.as_str().map(str::to_string))
-            .collect(),
-        _ => Vec::new(),
-    }
+    buf_lines(rpc, 0).await
 }
 
 /// Lines of an explicit buffer `handle` (0 = current).
@@ -431,9 +403,7 @@ pub fn redraw_get<'a>(params: &'a [Value], key: &str) -> Option<&'a Value> {
     let Value::Map(map) = params.first()? else {
         return None;
     };
-    map.iter()
-        .find(|(k, _)| k.as_str() == Some(key))
-        .map(|(_, v)| v)
+    map_get(map, key)
 }
 
 /// The first window's sub-map (`windows[0]`) from the raw params, or `None`.
@@ -448,10 +418,7 @@ pub fn window0(params: &[Value]) -> Option<&Vec<(Value, Value)>> {
 /// A per-window value (`windows[0][key]`) addressed through the raw params.
 /// *Params convention.*
 pub fn window0_get<'a>(params: &'a [Value], key: &str) -> Option<&'a Value> {
-    window0(params)?
-        .iter()
-        .find(|(k, _)| k.as_str() == Some(key))
-        .map(|(_, v)| v)
+    map_get(window0(params)?, key)
 }
 
 /// The redraw's message-line text, addressed through the raw params.

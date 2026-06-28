@@ -892,3 +892,58 @@ async fn nx_uuid_is_a_unique_v4_uuid() {
         "successive nx.uuid() calls are unique"
     );
 }
+
+#[tokio::test]
+async fn nx_rust_backed_utility_wrappers_resolve() {
+    let (rpc, _incoming) = start().await;
+
+    // The documented Lua wrappers (prelude/nx.lua) over the Rust nx._* bridges must all
+    // exist and have the right shape — proving the prelude loaded and each public name
+    // still points at a live native. Callable wrappers are checked as functions; the
+    // read-only ones are invoked and their value/type asserted.
+    assert_eq!(
+        exec_lua(
+            &rpc,
+            "local fn = {}\n\
+             for _, n in ipairs({ 'echo', 'argv', 'reexec', 'now_ms', 'runtime_file', 'open' }) do\n\
+               fn[#fn+1] = n .. '=' .. type(nx[n])\n\
+             end\n\
+             fn[#fn+1] = 'layer.focus=' .. type(nx.layer.focus)\n\
+             fn[#fn+1] = 'layer.main=' .. type(nx.layer.main)\n\
+             fn[#fn+1] = 'terminal.open=' .. type(nx.terminal.open)\n\
+             return table.concat(fn, ',')"
+        )
+        .await
+        .as_str(),
+        Some(
+            "echo=function,argv=function,reexec=function,now_ms=function,\
+             runtime_file=function,open=function,layer.focus=function,\
+             layer.main=function,terminal.open=function"
+        ),
+    );
+
+    // The read-only utilities return real values through the wrapper.
+    assert_eq!(
+        exec_lua(
+            &rpc,
+            "return type(nx.argv()) .. ',' .. type(nx.now_ms()) .. ',' ..\n\
+                    type(nx.runtime_file('lsp/nonesuch.lua', false)) .. ',' ..\n\
+                    type(nx.workspace.dir == nil and 'function' or nx.workspace.dir()) .. ',' ..\n\
+                    tostring(nx.workspace.active())"
+        )
+        .await
+        .as_str(),
+        // no --workspace launch: dir() is nil (type 'nil'), active() is false.
+        Some("table,number,table,nil,false"),
+    );
+
+    // nx.echo reaches the message line, and its nvim_echo alias is the same native.
+    exec_lua(&rpc, "nx.echo('swept-hello')").await;
+    assert_eq!(
+        exec_lua(&rpc, "return type(vim.api.nvim_echo)")
+            .await
+            .as_str(),
+        Some("function"),
+        "nvim_echo alias survives the wrapper split"
+    );
+}

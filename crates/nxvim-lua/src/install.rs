@@ -294,7 +294,7 @@ pub(crate) fn install_vim(lua: &Lua, shared: &Rc<RefCell<Shared>>) -> mlua::Resu
         });
         Ok(())
     })?;
-    nx.set("echo", echo)?;
+    nx.set("_echo", echo)?;
     // `nx._echo_err(msg)`: the error sibling of `nx.echo` — backs `nx.err_write` /
     // `nx.err_writeln` (and the `nvim_err_write*` aliases) so an error message is
     // routed through the core's `echo_err` and painted red, rather than blending in
@@ -437,7 +437,7 @@ pub(crate) fn install_vim(lua: &Lua, shared: &Rc<RefCell<Shared>>) -> mlua::Resu
     // default opens in the current window like `:edit`.
     let sh = shared.clone();
     nx.set(
-        "open",
+        "_open",
         lua.create_function(move |_, (path, opts): (String, Option<mlua::Table>)| {
             let where_main = match opts {
                 Some(o) => o.get::<Option<String>>("where")?.as_deref() == Some("main"),
@@ -470,7 +470,7 @@ pub(crate) fn install_vim(lua: &Lua, shared: &Rc<RefCell<Shared>>) -> mlua::Resu
             Ok(())
         })?,
     )?;
-    nx.set("layer", layer)?;
+    nx.set("_layer", layer)?;
 
     // `nx.view` raw bridges — each queues a [`ViewOp`] the server drains into the
     // core's view registry. The handle object (`nx.view.create` returning a table
@@ -644,7 +644,7 @@ pub(crate) fn install_vim(lua: &Lua, shared: &Rc<RefCell<Shared>>) -> mlua::Resu
             Ok(())
         })?,
     )?;
-    nx.set("terminal", terminal)?;
+    nx.set("_terminal", terminal)?;
 
     // `nx.panel`: the transient, focus-locked bottom overlay over an ordinary
     // `nomodifiable` buffer (the successor to the retired bespoke panel). The surface is
@@ -983,7 +983,7 @@ pub(crate) fn install_runtime_api(
         let hits = get_runtime_file(&rtp.borrow(), &name, all.unwrap_or(false));
         lua.create_sequence_from(hits)
     })?;
-    nx.set("runtime_file", runtime_file)?;
+    nx.set("_runtime_file", runtime_file)?;
 
     // `nx._add_rtp(dir)`: append `dir` to the live runtimepath and prepend its
     // `lua/` patterns to `package.path`, so the directory's modules are
@@ -1117,7 +1117,7 @@ pub(crate) fn install_runtime_api(
             lua.create_function(move |_, ()| Ok(sh.borrow().workspace_dir.is_some()))?,
         )?;
     }
-    nx.set("workspace", workspace_tbl)?;
+    nx.set("_workspace", workspace_tbl)?;
 
     // ----- nx.shada.plugin: opt-in, isolated per-plugin shada storage -------------
     //
@@ -1335,7 +1335,7 @@ pub(crate) fn install_runtime_api(
     // relaunched editor. Carried through `NXVIM_ARGV` (newline-joined) so the binary
     // stays the single source of truth.
     nx.set(
-        "argv",
+        "_argv",
         lua.create_function(|lua, ()| {
             let joined = std::env::var("NXVIM_ARGV").unwrap_or_default();
             let items: Vec<&str> = if joined.is_empty() {
@@ -1353,7 +1353,7 @@ pub(crate) fn install_runtime_api(
     // on success); elsewhere it spawns + exits with the child's status. Raises if the
     // exec / spawn itself fails.
     nx.set(
-        "reexec",
+        "_reexec",
         lua.create_function(|_, args: Vec<String>| -> mlua::Result<()> {
             let exe = std::env::current_exe()
                 .map_err(|e| mlua::Error::RuntimeError(format!("nx.reexec: current_exe: {e}")))?;
@@ -1382,7 +1382,7 @@ pub(crate) fn install_runtime_api(
     // test's duration with it, since `os.clock` measures CPU time (≈0 across an
     // awaited tick) rather than wall time. Public: useful to any plugin author.
     nx.set(
-        "now_ms",
+        "_now_ms",
         lua.create_function(|_, ()| {
             Ok(std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)

@@ -50,6 +50,97 @@ function nx.uuid()
   return nx._uuid()
 end
 
+-- ----- Rust-backed utilities ------------------------------------------------
+-- The utilities below are implemented natively (the nx._* bridges installed by the
+-- Rust runtime); these are the thin, documented Lua wrappers that surface them — so
+-- the book's API generator, which reads this prelude, lists them. Each forwards
+-- verbatim to its bridge. (The sub-namespace tables are seeded up front so every doc
+-- comment sits directly above the function it documents.)
+nx.layer = {}
+nx.terminal = {}
+nx.workspace = {}
+
+-- nx.echo(msg) -> nil. Append `msg` (a string) to the message line — the programmatic
+-- echo, the canonical form of vim.api.nvim_echo. For a transient, separately-styled
+-- notification prefer nx.notify.
+function nx.echo(msg)
+  return nx._echo(msg)
+end
+
+-- nx.argv() -> the list of positional file arguments this process was launched with
+-- (strings; empty when none). A launcher / wrapper reads them to forward to a
+-- relaunched editor; carried through the NXVIM_ARGV environment variable, so the
+-- binary stays the single source of truth.
+function nx.argv()
+  return nx._argv()
+end
+
+-- nx.reexec(args) -> does not return on success. Replace THIS process with a fresh
+-- `nxvim <args…>` of the current executable — a launcher relaunches the editor with
+-- chosen flags this way (e.g. { "--shada-namespace", ns, "--restore-session" }). On
+-- Unix this execv()s (never returns on success); elsewhere it spawns and exits with
+-- the child's status. Raises if the exec / spawn itself fails.
+function nx.reexec(args)
+  return nx._reexec(args)
+end
+
+-- nx.now_ms() -> a monotonic timestamp in milliseconds (a number) for timing and
+-- scheduling math. Unlike os.clock (CPU time, ≈0 across an awaited tick) it advances
+-- with real wall-clock time, so it measures durations that span async work.
+function nx.now_ms()
+  return nx._now_ms()
+end
+
+-- nx.runtime_file(name[, all]) -> full paths of runtimepath files matching `name` (a
+-- runtimepath-relative path whose final component may be globbed with `*`), as a list.
+-- With `all` falsey it returns just the first match (a one- or zero-element list).
+-- Reads the LIVE runtimepath, so a plugin installed mid-session contributes its files
+-- immediately. The lsp/<server>.lua config-discovery primitive.
+function nx.runtime_file(name, all)
+  return nx._runtime_file(name, all)
+end
+
+-- nx.open(path[, opts]) -> nil. Open a file or directory in the editing area, like
+-- `:edit`. With `opts.where == "main"` it first crosses to the main editor layer (so
+-- an open fired from a dock / sidebar keymap lands in the main area, not the dock);
+-- the default opens in the current window.
+function nx.open(path, opts)
+  return nx._open(path, opts)
+end
+
+-- nx.layer.focus(target) -> nil. Move keyboard focus across the layout's layers:
+-- `target` is "main" (the main editing area) or a dock's name.
+function nx.layer.focus(target)
+  return nx._layer.focus(target)
+end
+
+-- nx.layer.main() -> nil. Shorthand for nx.layer.focus("main") — focus the main
+-- editor area.
+function nx.layer.main()
+  return nx._layer.main()
+end
+
+-- nx.terminal.open([opts]) -> nil. Open a terminal job programmatically — the API twin
+-- of `:terminal`. `opts.cmd` is a string (whitespace-split into argv, no shell) or a
+-- list (argv verbatim, so an argument may contain spaces); omitted runs the default
+-- shell. `opts.cwd` defaults to the editor's working directory.
+function nx.terminal.open(opts)
+  return nx._terminal.open(opts)
+end
+
+-- nx.workspace.dir() -> the absolute workspace root (a string), or nil when this is not
+-- a `--workspace` launch. Read-only — nxvim chooses the workspace from the command
+-- line, not from Lua. For a daemon session this is the daemon's directory.
+function nx.workspace.dir()
+  return nx._workspace.dir()
+end
+
+-- nx.workspace.active() -> true if this launch is a `--workspace` directory session,
+-- false otherwise.
+function nx.workspace.active()
+  return nx._workspace.active()
+end
+
 -- Dock-scoped options (the dock scope, alongside nx.bo/nx.wo/nx.o). Set via
 -- `nx.dock.opt(side).<name> = <value>` or inline in `nx.dock.open{...}`; read back
 -- through the same proxy. `nx._dock_opts` is a write-through cache keyed by side,

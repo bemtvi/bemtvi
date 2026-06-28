@@ -1106,7 +1106,10 @@ function vim.api.nvim_get_hl_by_name(name, rgb)
   return out
 end
 
-vim.api.nvim_echo = nx.echo
+-- nvim_echo aliases nx.echo. Bind the private nx._echo bridge directly: this chunk
+-- loads before nx.lua (where the documented nx.echo wrapper is defined), and both name
+-- the same native, so the alias is identical either way.
+vim.api.nvim_echo = nx._echo
 
 -- nx.hl.exists(name): is the highlight group `name` defined? Returns a native
 -- boolean (the rest of `nx.*` is boolean, not vim's 1/0). Backed by the same

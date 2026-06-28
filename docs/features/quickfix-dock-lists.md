@@ -37,16 +37,19 @@ while the dock is focused, cross in and out of the dock with `<C-w><C-w>`. (See
 
 ## Sending results to a list
 
-The `nx.qf.*` family populates a list and shows it, honoring `'qfdock'`. Each takes
-an array of entry dicts (`{ filename =, lnum =, col =, text = }`, the `setloclist`
-shape) and an optional `{ title = }`:
+The `nx.qf.*` family populates a list and shows it. Each takes an array of entry
+dicts (`{ filename =, lnum =, col =, text = }`, the `setloclist` shape) and an
+optional `{ title = }`:
 
 | Function | Effect |
 | --- | --- |
-| `nx.qf.send_to_loclist(list, opts)` | A **new** location list. In dock mode → a new bottom-dock tab beside the others; in split mode → replaces the current window's loclist + opens a split. |
-| `nx.qf.add_to_loclist(list, opts)` | **Append** to the focused dock loclist tab (or the current window's loclist in split mode). |
-| `nx.qf.send_to_qflist(list, opts)` | Replace the global quickfix list and show it (one reused tab / split). |
+| `nx.qf.send_to_loclist(list, opts)` | Replace the **current window's** location list and open it in a bottom split (vim behavior — a loclist is window-scoped and never docks). |
+| `nx.qf.add_to_loclist(list, opts)` | **Append** to the current window's location list. |
+| `nx.qf.send_to_qflist(list, opts)` | Replace the global quickfix list and show it (one reused dock tab under `'qfdock'`, else a split). |
 | `nx.qf.add_to_qflist(list, opts)` | **Append** to the global quickfix list and show it. |
+
+To save several searches as side-by-side dock tabs, use a **named list**
+(`nx.qf.list` / `show`, below) — that, not the loclist, is the dock-tab surface.
 
 (Bare `nx.send_to_loclist` etc. aliases exist too.) Example — send the current
 buffer's TODO lines to a saved location list:
@@ -137,15 +140,21 @@ NXVIM_CONFIG=examples/named-lists \
 
 ## How it works (in brief)
 
-A location list is owned by a window. In dock mode each saved search is a dock-tab
-window that both owns *and* displays its own location list — so N searches are N
-independent lists for free. A jump excludes the display window as its target, so it
-falls back to the main layer (which is always enumerated first), landing the file in
-the editing area rather than inside the dock. The picker's `<C-q>` captures the
-matched item keys **and the live query** server-side, then (in Lua) builds a named
-list keyed `<picker>:<query>` from them via `nx.qf.list` + `nx.qf.show`.
+Three list flavors share one rendering / navigation engine, differing only in where
+they're stored and shown:
 
-A **named list** is the same dock-tab-with-its-own-list shape, but its list lives in
-an editor-side registry keyed by name rather than on the dock window — so it is
-addressed (and re-shown) by name and outlives the window, while reusing the identical
-rendering, severity painting, and main-layer jump.
+- The **quickfix** list is global. Under `'qfdock'` (default) it shows as the single
+  bottom-dock tab; otherwise a bottom split.
+- A **location list** is owned by a window (vim's model). `:lopen` / `send_to_loclist`
+  open it in a bottom split of that window; closing the owner closes the list. It
+  never docks — `'qfdock'` does not apply to it.
+- A **named list** is the dock-tab "save searches" surface. Its list lives in an
+  editor-side registry keyed by name (not on a window), so it is addressed and
+  re-shown by name, sits beside other named lists as its own dock tab, and outlives
+  any window close.
+
+All three jump the same way: a jump excludes the display window as its target, so it
+falls back to the main layer (always enumerated first), landing the file in the
+editing area rather than inside the dock. The picker's `<C-q>` captures the matched
+item keys **and the live query** server-side, then (in Lua) builds a named list keyed
+`<picker>:<query>` via `nx.qf.list` + `nx.qf.show`.

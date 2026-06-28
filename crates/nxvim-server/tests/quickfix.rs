@@ -391,73 +391,70 @@ async fn copen_hosts_the_list_in_the_bottom_dock_by_default() {
     );
 }
 
-/// Phase 3: `nx.qf.send_to_loclist` (the telescope-style "send results to a list"
-/// action) saves each search as its **own** tab in the bottom dock — independent
-/// lists side by side — and `<CR>` on an entry jumps into the main layer.
+/// A window-scoped location list keeps vim's behavior — `nx.qf.send_to_loclist` opens
+/// it in a **bottom split** (never a dock tab, even with `'qfdock'` on), a second send
+/// from the same window **replaces** that window's one list, and `<CR>` jumps to the
+/// entry. (Saving several searches as side-by-side dock tabs is the named-list job.)
 #[tokio::test]
-async fn send_to_loclist_saves_each_search_as_its_own_dock_tab() {
+async fn send_to_loclist_opens_a_split_and_replaces_the_window_list() {
     let (rpc, mut incoming) = start().await;
     let a = write_temp("send_a", "txt", "one\ntwo\nthree\n");
     let b = write_temp("send_b", "txt", "alpha\nbeta\ngamma\n");
+    // The window we send from owns the loclist (vim's per-window list).
+    exec_lua(&rpc, "_G.w = nx.win.current()").await;
+    let before = win_count(&rpc).await;
 
-    // First search -> first dock tab.
+    // First search: the loclist opens in a bottom split, NOT the dock (qfdock is on).
     exec_lua(
         &rpc,
         &format!(
-            r#"nx.qf.send_to_loclist({{ {{ filename = "{a}", lnum = 2, col = 1, text = "hit a" }} }}, {{ title = "Search A" }})"#
+            r#"nx.qf.send_to_loclist({{ {{ filename = "{a}", lnum = 2, col = 1, text = "hit a" }} }}, {{ title = "A" }})"#
         ),
     )
     .await;
     let rd1 = redraw_after(&rpc, &mut incoming, "<Esc>").await;
     assert!(
-        regions(&rd1).iter().any(|r| r == "dock_bottom"),
-        "the first search opened in the bottom dock"
+        !regions(&rd1).iter().any(|r| r.starts_with("dock_")),
+        "a loclist must not open in the dock, got {:?}",
+        regions(&rd1)
+    );
+    assert_eq!(
+        win_count(&rpc).await,
+        before + 1,
+        "the loclist opened in a split"
     );
 
-    // Second search -> a second, independent dock tab.
+    // Second search from the same window REPLACES that window's loclist (one list per
+    // window) — it reuses the loclist window, opening no second window/tab.
     exec_lua(
         &rpc,
         &format!(
-            r#"nx.qf.send_to_loclist({{ {{ filename = "{b}", lnum = 3, col = 1, text = "hit b" }} }}, {{ title = "Search B" }})"#
+            r#"nx.qf.send_to_loclist({{ {{ filename = "{b}", lnum = 3, col = 1, text = "hit b" }} }}, {{ title = "B" }})"#
         ),
     )
     .await;
-    let rd2 = redraw_after(&rpc, &mut incoming, "<Esc>").await;
+    redraw_after(&rpc, &mut incoming, "<Esc>").await;
     assert_eq!(
-        region_tab_count(&rd2, "bottom"),
-        2,
-        "two searches are saved as two bottom-dock tabs"
+        win_count(&rpc).await,
+        before + 1,
+        "the second send reused the loclist window"
     );
-
-    // The focused (second) tab carries only its own list — the searches are not a
-    // single shared list.
     let cur = exec_lua(
         &rpc,
-        r#"local l = vim.fn.getloclist(0)
+        r#"local l = vim.fn.getloclist(_G.w)
            return string.format("%d|%s", #l, l[1] and l[1].text or "")"#,
     )
     .await;
-    assert_eq!(cur.as_str(), Some("1|hit b"), "tab B holds search B");
-
-    // Switch to the first tab (gT acts on the focused dock layer); it still holds
-    // search A independently.
-    redraw_after(&rpc, &mut incoming, "gT").await;
-    let prev = exec_lua(
-        &rpc,
-        r#"local l = vim.fn.getloclist(0)
-           return string.format("%d|%s", #l, l[1] and l[1].text or "")"#,
-    )
-    .await;
-    assert_eq!(prev.as_str(), Some("1|hit a"), "tab A still holds search A");
-
-    // <CR> on tab A's entry jumps into its file, in the main layer.
-    let rd3 = redraw_after(&rpc, &mut incoming, "<CR>").await;
-    assert_eq!(buf_name(&rpc).await, a, "jumped into search A's file");
-    assert_eq!(cursor(&rpc).await.0, 2, "landed on the entry's line");
-    assert!(
-        regions(&rd3).iter().any(|r| r == "dock_bottom"),
-        "the dock lists persist after the jump"
+    assert_eq!(
+        cur.as_str(),
+        Some("1|hit b"),
+        "the window's loclist was replaced with search B"
     );
+
+    // <CR> in the loclist window jumps into B's file.
+    message_after(&rpc, &mut incoming, "<CR>").await;
+    assert_eq!(buf_name(&rpc).await, b, "jumped into search B's file");
+    assert_eq!(cursor(&rpc).await.0, 3, "landed on the entry's line");
 }
 
 /// Phase 5: the `'qfdock'` option reads and writes through `nx.o` (the example's
@@ -513,12 +510,13 @@ async fn send_and_add_to_qflist_use_one_dock_tab() {
     );
 }
 
-/// Phase 5: `add_to_loclist` appends to the **focused** dock loclist tab rather than
-/// opening a new one (telescope's add-to-list semantics).
+/// `add_to_loclist` appends to the current window's location list (vim's add-to-list
+/// semantics) — it does not open a second window.
 #[tokio::test]
-async fn add_to_loclist_appends_to_the_focused_dock_tab() {
+async fn add_to_loclist_appends_to_the_window_list() {
     let (rpc, mut incoming) = start().await;
     let path = write_temp("addll", "txt", "1\n2\n3\n");
+    exec_lua(&rpc, "_G.w = nx.win.current()").await;
     exec_lua(
         &rpc,
         &format!(
@@ -526,9 +524,14 @@ async fn add_to_loclist_appends_to_the_focused_dock_tab() {
         ),
     )
     .await;
-    redraw_after(&rpc, &mut incoming, "<Esc>").await;
+    let rd = redraw_after(&rpc, &mut incoming, "<Esc>").await;
+    assert!(
+        !regions(&rd).iter().any(|r| r.starts_with("dock_")),
+        "the loclist is a split, not a dock tab"
+    );
+    let before = win_count(&rpc).await;
 
-    // Focused on the new dock loclist tab; add appends to it (no second tab).
+    // add appends to the same window's loclist (no new window).
     exec_lua(
         &rpc,
         &format!(
@@ -536,17 +539,17 @@ async fn add_to_loclist_appends_to_the_focused_dock_tab() {
         ),
     )
     .await;
-    let rd = redraw_after(&rpc, &mut incoming, "<Esc>").await;
+    redraw_after(&rpc, &mut incoming, "<Esc>").await;
     assert_eq!(
-        region_tab_count(&rd, "bottom"),
-        0,
-        "still one loclist tab — add appended, did not open a new tab"
+        win_count(&rpc).await,
+        before,
+        "add appended in place — no new window"
     );
-    let n = exec_lua(&rpc, "return #vim.fn.getloclist(0)").await;
+    let n = exec_lua(&rpc, "return #vim.fn.getloclist(_G.w)").await;
     assert_eq!(
         n.as_i64(),
         Some(2),
-        "add_to_loclist appended to the same list"
+        "add_to_loclist appended to the same window's list"
     );
 }
 

@@ -167,13 +167,14 @@ pub struct Options {
     /// (`'grepformat'`; default [`DFLT_GREPFORMAT`]). Same grammar as
     /// [`Options::errorformat`].
     pub grepformat: String,
-    /// Where a quickfix / location-list display opens (`'qfdock'`; nxvim-native,
-    /// default `true`). When set, `:copen` / `:lopen` (and the picker's
-    /// send-to-list action) host the `filetype=qf` display as a tab in the **bottom
-    /// dock**, and its entries jump into the main editing layer — the nxvim way,
-    /// where several searches can sit side by side as dock tabs. When unset, they
-    /// open the classic way: a bottom **split** of the current window (the
-    /// vim/telescope behavior). Honored by [`crate::editor::quickfix`].
+    /// Where the **quickfix** and **named** list displays open (`'qfdock'`;
+    /// nxvim-native, default `true`). When set, `:copen` and a named-list show host
+    /// the `filetype=qf` display as a tab in the **bottom dock**, entries jumping into
+    /// the main editing layer — the nxvim way, where several lists sit side by side as
+    /// dock tabs. When unset, they open the classic way: a bottom **split** of the
+    /// current window. A window-scoped **location list** (`:lopen`) is *not* governed
+    /// by this — it always keeps vim's behavior (a bottom split owned by its window).
+    /// Honored by [`crate::editor::quickfix`].
     pub qfdock: bool,
     /// Whether `:bdelete` of a tab's *last* buffer closes the tab page (`'bdclosetab'`;
     /// nxvim-native, default `true`). When set, deleting the only buffer a tab shows —

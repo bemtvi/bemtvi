@@ -751,7 +751,16 @@ impl Editor {
         let disp = self
             .qf_display_bufnr(which)
             .expect("display buffer created above");
-        if self.options.qfdock {
+        // `'qfdock'` governs the dock-oriented lists — the quickfix list and named
+        // lists open as bottom-dock tabs when it is set (the default), or as a classic
+        // bottom split when it is off. A window-scoped **location list** always keeps
+        // vim's behavior: a bottom split of the current window, owned by it (`:lopen`),
+        // never a dock tab — regardless of `'qfdock'`.
+        let dock = match which {
+            QfWhich::Named(_) | QfWhich::Quickfix => self.options.qfdock,
+            QfWhich::Location(_) => false,
+        };
+        if dock {
             self.qf_place_in_dock(disp, height);
         } else {
             self.open_bottom_window(disp, height);
@@ -772,65 +781,31 @@ impl Editor {
         }
     }
 
-    /// Send `items` to a **new** location list shown as its own tab in the bottom
-    /// dock — the nxvim "save this search" surface. The new tab's window both *owns*
-    /// and *displays* the list, so every call adds an independent list beside the
-    /// existing ones (unlike the single global quickfix list). `<CR>` on an entry
-    /// jumps into the main editing layer: the owner is the dock window, which is the
-    /// display window too, so it is excluded as the jump target and the
-    /// [`Editor::qf_focus_target_window`] fallback lands in the main layer (which
-    /// `open_layers` always lists first). Returns the owning/display window.
-    pub fn loclist_to_dock(&mut self, items: Vec<QfEntry>, title: String) -> WindowId {
-        let disp = self.add_buffer(Buffer::empty());
-        // `filetype=qf` installs the buffer-local `<CR>` jump map and the qf render.
-        self.set_filetype(disp, "qf");
-        self.qf_place_in_dock(disp, DockSide::Bottom.default_size());
-        let w = self.windows.current;
-        self.qf_set_display_bufnr(QfWhich::Location(w), Some(disp));
-        self.qf_set_items(QfWhich::Location(w), items, QfAction::New, Some(title));
-        w
-    }
-
-    /// Send `items` to a quickfix or location list and show it — the engine behind
-    /// `nx.qf.{send,add}_to_{loc,qf}list` (the picker's quickfix-style sinks, the
-    /// nxvim port of telescope's send/add-to-list actions).
+    /// Send `items` to the quickfix or a location list and show it — the engine behind
+    /// `nx.qf.{send,add}_to_{loc,qf}list` (the nxvim port of telescope's send/add-to-list
+    /// actions).
     ///
-    /// - `to_qf`: the single global **quickfix** list (one window/tab, reused) vs a
-    ///   **location** list.
+    /// - `to_qf`: the single global **quickfix** list (one window/tab, reused) vs the
+    ///   **location** list of the current window (vim's per-window list).
     /// - `action`: [`QfAction::New`] for a *send* (a fresh list), [`QfAction::Add`]
     ///   for an *add* (append).
     ///
-    /// Honors `'qfdock'`. With it off, both kinds open the classic way — a bottom
-    /// split of the current window. With it on (the nxvim default): the quickfix list
-    /// shows as its (single) bottom-dock tab; a location-list *send* opens a **new**
-    /// dock tab beside the others ([`Editor::loclist_to_dock`]), and a location-list
-    /// *add* appends to the focused dock loclist tab when one is focused (else falls
-    /// back to a new tab — there is nothing to append to).
+    /// The quickfix list honors `'qfdock'` (a bottom-dock tab, the default, or a
+    /// split). The location list always keeps vim behavior: it replaces/appends the
+    /// current window's list and opens it in a bottom split (never a dock tab). For
+    /// the "save several searches as side-by-side dock tabs" surface, use a **named
+    /// list** ([`Editor::named_list_show`]) instead.
     pub fn list_send(&mut self, items: Vec<QfEntry>, title: String, action: QfAction, to_qf: bool) {
-        if to_qf {
-            // One global quickfix list: replace/append, then show (dock tab or split).
-            self.qf_set_items(QfWhich::Quickfix, items, action, Some(title));
-            self.ex_qf_open(QfWhich::Quickfix, "");
-            return;
-        }
-        if !self.options.qfdock {
-            // Classic vim/telescope: the current window's location list + a split.
-            let which = QfWhich::Location(self.windows.current);
-            self.qf_set_items(which, items, action, Some(title));
-            self.ex_qf_open(which, "");
-            return;
-        }
-        // Dock mode. An `add` appends to the focused dock loclist tab if we are on
-        // one; every `send` (and an `add` with no list focused) opens a fresh tab.
-        if matches!(action, QfAction::Add) {
-            if let Some(which @ QfWhich::Location(_)) =
-                self.qf_context_of_buffer(self.current_buffer_id())
-            {
-                self.qf_set_items(which, items, QfAction::Add, Some(title));
-                return;
-            }
-        }
-        self.loclist_to_dock(items, title);
+        let which = if to_qf {
+            QfWhich::Quickfix
+        } else {
+            // The current window's location list — or, when invoked from inside a
+            // loclist display window, the list it shows (its owner), so an add lands
+            // on the right list.
+            self.loclist_which()
+        };
+        self.qf_set_items(which, items, action, Some(title));
+        self.ex_qf_open(which, "");
     }
 
     /// `:cclose`/`:lclose` — close `which`'s window if open (leaving focus on a

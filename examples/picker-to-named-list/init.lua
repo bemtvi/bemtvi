@@ -75,11 +75,13 @@ end, { desc = "Custom 'marks' picker (try <Tab> then <C-q>)" })
 
 --------------------------------------------------------------------------------
 -- 3. The nx.qf.* API directly — build a list yourself, no picker needed.
---      nx.qf.send_to_loclist(list, { title })   a NEW loclist  (dock: new tab)
---      nx.qf.add_to_loclist(list, { title })    APPEND to the focused loclist
---      nx.qf.send_to_qflist(list, { title })    the global quickfix list
+--      nx.qf.send_to_loclist(list, { title })   the current window's loclist (split)
+--      nx.qf.add_to_loclist(list, { title })    APPEND to the window's loclist
+--      nx.qf.send_to_qflist(list, { title })    the global quickfix list (dock tab)
 --      nx.qf.add_to_qflist(list, { title })     APPEND to the quickfix list
---    \lt sends every TODO line in the current buffer to a saved loclist tab.
+--    A loclist keeps vim behavior (a split, owned by the window). For a persistent,
+--    named dock tab use nx.qf.list/show as in section 2. \lt sends this buffer's
+--    TODO lines to the window's loclist.
 --------------------------------------------------------------------------------
 nx.keymap.set("n", "<leader>lt", function()
   local items = {}
@@ -93,12 +95,12 @@ nx.keymap.set("n", "<leader>lt", function()
   else
     nx.qf.send_to_loclist(items, { title = "TODOs" })
   end
-end, { desc = "Send TODO lines to a loclist tab" })
+end, { desc = "Send TODO lines to the window's loclist" })
 
 -- Step through whichever list is current with the usual commands:
 --   :lnext / :lprev   (location list)     :cnext / :cprev   (quickfix)
---   <CR> in the list  jump to the entry (into the main area when docked)
---   :lclose / :cclose close the list (its dock tab, or the split)
+--   <CR> in the list  jump to the entry (into the main area)
+--   :lclose / :cclose close the list (the loclist split, or the quickfix dock tab)
 nx.keymap.set("n", "]l", function()
   vim.cmd("lnext")
 end, { desc = "Next loclist entry" })

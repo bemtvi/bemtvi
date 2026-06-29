@@ -133,6 +133,127 @@ async fn session_restores_split_layout_files_and_cursor() {
     }
 }
 
+/// The "|"-joined, sorted names of every listed buffer (`nvim_list_bufs`), for asserting
+/// which buffers survive a restart regardless of whether they are shown in a window.
+async fn buffer_names(rpc: &nxvim_rpc::Rpc) -> String {
+    exec_lua(
+        rpc,
+        r#"
+        local out = {}
+        for _, b in ipairs(vim.api.nvim_list_bufs()) do
+          out[#out + 1] = vim.api.nvim_buf_get_name(b)
+        end
+        table.sort(out)
+        return table.concat(out, "|")
+        "#,
+    )
+    .await
+    .as_str()
+    .unwrap_or_default()
+    .to_string()
+}
+
+#[tokio::test]
+async fn session_restores_hidden_buffers() {
+    // A workspace session must restore buffers that are LOADED but not shown in any window
+    // (you `:edit` a second file, leaving the first hidden in the buffer list). The capture
+    // walked only the window layout, so hidden buffers were dropped on restart — they must
+    // come back in the buffer list (windowless), reachable via `:bnext` / `:ls`.
+    let dir = temp_dir("session_hidden_store");
+    let file_a = write_temp("session_hidden_a", "txt", "a1\na2\na3\n");
+    let file_b = write_temp("session_hidden_b", "txt", "b1\nb2\n");
+
+    {
+        let (rpc, incoming) = start_attached(init(&dir, Some(file_a.clone()), true), 80, 25).await;
+        exec_lua(&rpc, "nx.shada.save_layout(true)").await;
+        // Park the cursor on line 3 of file_a, then open file_b in the same window — file_a
+        // stays loaded but hidden (the alternate), with its view saved.
+        feed(&rpc, "3G");
+        feed(&rpc, &format!(":edit {file_b}<CR>"));
+        let names = buffer_names(&rpc).await;
+        assert!(
+            names.contains(&file_a) && names.contains(&file_b),
+            "precondition: file_a is hidden-but-listed alongside the shown file_b: {names}"
+        );
+        assert_eq!(
+            window_count(&rpc).await,
+            1,
+            "only one window (file_b shown)"
+        );
+        feed(&rpc, ":qa<CR>");
+        await_server_exit(incoming).await;
+    }
+
+    {
+        let (rpc, _incoming) = start_attached(init(&dir, None, true), 80, 25).await;
+        // Only file_b is windowed, but BOTH files are back in the buffer list.
+        assert_eq!(window_count(&rpc).await, 1, "the single window came back");
+        let names = buffer_names(&rpc).await;
+        assert!(
+            names.contains(&file_a),
+            "the hidden buffer file_a was restored to the buffer list: {names}"
+        );
+        assert!(
+            names.contains(&file_b),
+            "the windowed buffer file_b came back too: {names}"
+        );
+        // Switch to the restored hidden buffer: its real contents are loaded and its saved
+        // view (cursor on line 3) came back too.
+        feed(&rpc, &format!(":buffer {file_a}<CR>"));
+        assert_eq!(
+            lines(&rpc).await,
+            vec!["a1", "a2", "a3"],
+            "hidden buffer's bytes"
+        );
+        assert_eq!(
+            cursor(&rpc).await,
+            (3, 0),
+            "hidden buffer's saved cursor restored"
+        );
+    }
+}
+
+#[tokio::test]
+async fn session_does_not_save_an_open_panel() {
+    // Quitting with a panel surface open (`:messages`, `:ls`, `:registers`, …) must NOT save
+    // it into the layout: a panel buffer is named (`[Messages]`), so the layout capture used
+    // to treat it as a file and restore a split with an empty buffer named for the panel. A
+    // panel is not a document (`:ls` hides it) — drop its window leaf so the split collapses.
+    let dir = temp_dir("session_panel_store");
+    let file_a = write_temp("session_panel_a", "txt", "a1\na2\n");
+
+    {
+        let (rpc, incoming) = start_attached(init(&dir, Some(file_a.clone()), true), 80, 25).await;
+        exec_lua(&rpc, "nx.shada.save_layout(true)").await;
+        feed(&rpc, ":messages<CR>"); // opens the [Messages] panel as a bottom split
+        assert_eq!(
+            window_count(&rpc).await,
+            2,
+            "file window + the messages panel"
+        );
+        feed(&rpc, ":qa<CR>");
+        await_server_exit(incoming).await;
+    }
+
+    {
+        let (rpc, _incoming) = start_attached(init(&dir, None, true), 80, 25).await;
+        assert_eq!(
+            window_count(&rpc).await,
+            1,
+            "only the file window came back — the panel split was not saved"
+        );
+        let names = buffer_names(&rpc).await;
+        assert!(
+            !names.contains("[Messages]"),
+            "the panel was not restored as an (empty) buffer: {names}"
+        );
+        assert!(
+            names.contains(&file_a),
+            "the real file did come back: {names}"
+        );
+    }
+}
+
 #[tokio::test]
 async fn session_drops_ephemeral_views() {
     // A view created WITHOUT `persist` is ephemeral: it does not ride the session, so the

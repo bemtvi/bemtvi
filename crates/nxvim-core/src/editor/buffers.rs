@@ -321,16 +321,23 @@ impl Editor {
         self.buffers
             .map
             .iter()
-            // A plugin view (`nx.view`: a diff pane, a file tree, …) is a surface, not a
-            // document — like the panel buffers below, it never appears in `:ls` or in
-            // `:bnext`/`:bprev`/… navigation, so a closed view can't be cycled back into.
-            .filter(|(_, ob)| ob.layer == layer && ob.buffer.view_id().is_none())
-            // Panel display buffers (`[Messages]`, `[Buffers]`, …) are surfaces, not
-            // documents: they never appear in `:ls` or in `:bnext`/`:bprev`/… navigation
-            // (which all funnel through here). `:lspanels` lists them instead.
-            .filter(|(id, _)| !self.is_panel_buffer(**id) && !self.is_doc_float_buffer(**id))
+            .filter(|(id, ob)| ob.layer == layer && self.is_listed_buffer(**id))
             .map(|(id, _)| *id)
             .collect()
+    }
+
+    /// Whether buffer `id` is a **listed document** — the buffers `:ls` shows and
+    /// `:bnext`/`:bprev` cycle. Excludes the non-document *surfaces*: plugin views
+    /// (`nx.view`: a diff pane, a file tree, …), panel display buffers (`[Messages]`,
+    /// `[Buffers]`, …), and doc floats. The single source of truth for "what's in `:ls`",
+    /// shared by [`buffers_in_layer`](Self::buffers_in_layer) (the listing) and the
+    /// workspace session's hidden-buffer capture, so the two never drift. Layer-independent
+    /// — the per-layer scoping of `:ls` is applied separately by its caller.
+    pub(crate) fn is_listed_buffer(&self, id: BufferId) -> bool {
+        let Some(ob) = self.buffers.map.get(&id) else {
+            return false;
+        };
+        ob.buffer.view_id().is_none() && !self.is_panel_buffer(id) && !self.is_doc_float_buffer(id)
     }
 
     /// Record that buffer `id` now lives in `layer` (its window layer). A no-op if

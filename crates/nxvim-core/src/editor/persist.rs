@@ -135,6 +135,26 @@ pub struct SessionState {
     /// The edge docks open at capture (left/right/top/bottom), each with its size,
     /// hidden state, and any file-backed content. Empty when no dock was open.
     pub docks: Vec<SessionDock>,
+    /// File-backed buffers that were **loaded but not shown in any window** at capture —
+    /// the hidden buffers you reach with `:bnext` / `:ls` (e.g. you `:edit` a second file,
+    /// leaving the first hidden). Re-added to the buffer list (windowless) on restore so
+    /// the whole working set survives, not just what happened to be on screen. Empty when
+    /// every loaded buffer was visible. `#[serde(default)]` so an older store still loads.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub hidden_buffers: Vec<SessionHiddenBuffer>,
+}
+
+/// One **hidden** (loaded-but-windowless) file-backed buffer captured into the session: its
+/// path and its saved view (cursor + scroll), re-opened into the buffer list on restore.
+/// Only ordinary file buffers ride this — terminals, images, and plugin views are excluded,
+/// as they are from the window-leaf capture.
+#[derive(Debug, Clone, Default)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct SessionHiddenBuffer {
+    pub path: PathBuf,
+    pub line: usize,
+    pub col: usize,
+    pub top: usize,
 }
 
 /// One edge dock: which side, its reserved size in cells (the boot-time fallback), an
@@ -458,13 +478,15 @@ impl Editor {
             tabs.push(SessionTab { layout });
         }
         let docks = self.export_docks();
-        if tabs.is_empty() && docks.is_empty() {
+        let hidden_buffers = self.export_hidden_buffers();
+        if tabs.is_empty() && docks.is_empty() && hidden_buffers.is_empty() {
             return None;
         }
         Some(SessionState {
             tabs,
             active_tab,
             docks,
+            hidden_buffers,
         })
     }
 
@@ -520,6 +542,74 @@ impl Editor {
         docks
     }
 
+    /// The set of buffer ids shown in **any** window — every main tab's tree plus every
+    /// edge dock's tree (leaves + floats). Used to tell a hidden buffer (loaded but in no
+    /// window) from a visible one when capturing the session. Over-including a windowed
+    /// buffer here is harmless (it just isn't captured as hidden); the invariant that
+    /// matters is that a truly hidden buffer is never in this set (it is in no window).
+    fn windowed_buffers(&self) -> std::collections::HashSet<crate::BufferId> {
+        use super::{DockSide, Layer};
+        let mut shown = std::collections::HashSet::new();
+        let add = |shown: &mut std::collections::HashSet<crate::BufferId>,
+                   tree: &super::windows::WindowTree| {
+            for wid in tree.leaves() {
+                if let Some(w) = tree.try_get(wid) {
+                    shown.insert(w.buffer);
+                }
+            }
+            for &wid in &tree.floats {
+                if let Some(w) = tree.try_get(wid) {
+                    shown.insert(w.buffer);
+                }
+            }
+        };
+        for tid in self.tab_ids() {
+            if let Some(tree) = self.tab_tree(tid) {
+                add(&mut shown, tree);
+            }
+        }
+        for side in DockSide::ALL {
+            if let Some(tree) = self.layer_tree(Layer::Dock(side)) {
+                add(&mut shown, tree);
+            }
+        }
+        shown
+    }
+
+    /// Capture every **hidden** (loaded, file-backed, but windowless) buffer — the working
+    /// set you reach with `:bnext` / `:ls` beyond what's on screen. The eligibility rule is
+    /// exactly `:ls`'s ([`Editor::is_listed_buffer`]): only listed *documents* ride the
+    /// session — never the non-document surfaces `:ls` hides (plugin views, panels, doc
+    /// floats), so the session never saves a buffer the user can't see in `:ls`. Restored by
+    /// re-reading the path, so a buffer with no name (an unnamed scratch, a terminal) is not
+    /// captured here — a *windowed* modified `[No Name]` rides the layout via
+    /// `'workspacepersistunnamed'` instead. The saved view (cursor + scroll) rides along so
+    /// `:b` lands where you left it.
+    fn export_hidden_buffers(&self) -> Vec<SessionHiddenBuffer> {
+        let shown = self.windowed_buffers();
+        let mut out = Vec::new();
+        for (&id, ob) in &self.buffers.map {
+            if shown.contains(&id) || !self.is_listed_buffer(id) {
+                continue;
+            }
+            let Some(path) = ob
+                .buffer
+                .path
+                .as_ref()
+                .filter(|p| !p.as_os_str().is_empty())
+            else {
+                continue;
+            };
+            out.push(SessionHiddenBuffer {
+                path: path.clone(),
+                line: ob.saved_cursor.line,
+                col: ob.saved_cursor.col,
+                top: ob.saved_top,
+            });
+        }
+        out
+    }
+
     /// Project a window-model [`LayoutNode`] into a serialisable [`SessionLayout`],
     /// resolving each leaf window to its file + view. A leaf with no file is dropped —
     /// UNLESS `allow_unnamed` and it shows a modified ordinary `[No Name]` buffer, whose
@@ -556,6 +646,15 @@ impl Editor {
                     .buffer
                     .view_id()
                     .and_then(|vid| self.view_persist_of(vid));
+                // A non-document SURFACE shown in this window — a panel (`[Messages]`,
+                // `[Buffers]`, …), a doc float, or an *unpersisted* plugin view — is never
+                // part of the saved layout. A panel buffer is *named* (`[Messages]`), so
+                // without this it would be captured as a "file" leaf and restored as a split
+                // holding an empty buffer named for the panel. Drop the leaf (its split
+                // collapses); only listed documents and persisted views ride the session.
+                if view_persist.is_none() && !self.is_listed_buffer(w.buffer) {
+                    return None;
+                }
                 let path = self.buffer_name(w.buffer).unwrap_or_default();
                 // A pathless leaf is dropped unless it's a persisted view (handled above) OR
                 // a modified ordinary `[No Name]` buffer we're allowed to persist
@@ -632,9 +731,14 @@ impl Editor {
         use crate::options::WindowOptions;
         use crate::WindowId;
         use std::collections::BTreeMap;
-        if session.tabs.is_empty() && session.docks.is_empty() {
+        if session.tabs.is_empty() && session.docks.is_empty() && session.hidden_buffers.is_empty()
+        {
             return;
         }
+        // Re-add the hidden (windowless) buffers to the buffer list FIRST, before the windows
+        // are built — so they exist when `:bnext`/`:ls` enumerate, and a windowed leaf that
+        // happens to name the same file finds the already-loaded buffer (no duplicate).
+        self.restore_hidden_buffers(&session.hidden_buffers);
         // Restore the edge docks FIRST, so the main area is already dock-reduced before any
         // tab's split tree is laid out. Restoring tabs first would lay every split out at
         // FULL width and only rescale it once a dock later shrinks the main area — and that
@@ -731,6 +835,27 @@ impl Editor {
             }
             if d.hidden {
                 self.hide_dock(side);
+            }
+        }
+    }
+
+    /// Re-open each captured **hidden** buffer into the buffer list without placing it in a
+    /// window (the find-or-load `open_buffer` adds it and returns without switching). Its
+    /// saved view (cursor + scroll) is restored onto the loaded buffer so a later `:b` lands
+    /// where it was. A file that no longer opens is skipped. Runs before the window layout is
+    /// rebuilt, so a windowed leaf naming the same file reuses the buffer loaded here.
+    fn restore_hidden_buffers(&mut self, hidden: &[SessionHiddenBuffer]) {
+        for h in hidden {
+            if h.path.as_os_str().is_empty() {
+                continue;
+            }
+            if let Some(id) = self.open_buffer(&h.path) {
+                let ob = self.buffers.get_mut(id);
+                ob.saved_cursor = Cursor {
+                    line: h.line,
+                    col: h.col,
+                };
+                ob.saved_top = h.top;
             }
         }
     }

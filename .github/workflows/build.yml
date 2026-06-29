@@ -186,27 +186,6 @@ jobs:
             echo "SIGN_KEYCHAIN=$KEYCHAIN"
           } >> "$GITHUB_ENV"
 
-      - name: Write hardened-runtime entitlements (macOS)
-        if: matrix.os == 'macos'
-        shell: bash
-        run: |
-          # The default Lua backend is LuaJIT, which allocates executable memory
-          # at runtime. Under the hardened runtime that needs these entitlements
-          # or running compiled Lua crashes (notarization does NOT catch this —
-          # it only checks the signature, not runtime JIT behavior).
-          ENT="$RUNNER_TEMP/entitlements.plist"
-          cat > "$ENT" <<'PLIST'
-          <?xml version="1.0" encoding="UTF-8"?>
-          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-          <plist version="1.0">
-          <dict>
-            <key>com.apple.security.cs.allow-jit</key><true/>
-            <key>com.apple.security.cs.allow-unsigned-executable-memory</key><true/>
-          </dict>
-          </plist>
-          PLIST
-          echo "ENTITLEMENTS=$ENT" >> "$GITHUB_ENV"
-
       # ── macOS TUI: sign → installer .pkg → notarize → staple ──────────────
       - name: Build, sign, notarize & staple installer .pkg (macOS, TUI)
         if: matrix.os == 'macos' && matrix.kind == 'tui'
@@ -216,7 +195,7 @@ jobs:
           AC_API_KEY_ID: ${{ secrets.AC_API_KEY_ID }}
           AC_API_ISSUER_ID: ${{ secrets.AC_API_ISSUER_ID }}
         run: |
-          # shellcheck disable=SC2154  # SIGN_*/INSTALLER_IDENTITY/ENTITLEMENTS arrive via $GITHUB_ENV
+          # shellcheck disable=SC2154  # SIGN_*/INSTALLER_IDENTITY arrive via $GITHUB_ENV
           set -euo pipefail
           if [ -z "${INSTALLER_IDENTITY:-}" ]; then
             echo "::error::No Developer ID Installer identity found — set the MACOS_INSTALLER_CERT_P12 / MACOS_INSTALLER_CERT_PASSWORD secrets (a .pkg cannot be notarized unsigned)"
@@ -226,7 +205,6 @@ jobs:
 
           # 1. Hardened-runtime sign the binary (Developer ID Application).
           codesign --force --options runtime --timestamp \
-            --entitlements "$ENTITLEMENTS" \
             --keychain "$SIGN_KEYCHAIN" --sign "$SIGN_IDENTITY" "$BIN"
           codesign --verify --strict --verbose=2 "$BIN"
 
@@ -262,7 +240,7 @@ jobs:
         if: matrix.os == 'macos' && matrix.kind == 'gui'
         shell: bash
         run: |
-          # shellcheck disable=SC2154  # SIGN_*/ENTITLEMENTS arrive via $GITHUB_ENV
+          # shellcheck disable=SC2154  # SIGN_* arrive via $GITHUB_ENV
           set -euo pipefail
           APP="$RUNNER_TEMP/nxvim.app"
           mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
@@ -310,13 +288,11 @@ jobs:
           </dict>
           </plist>
           PLIST
-          # Sign inner executable first, then the bundle (hardened runtime + JIT
-          # entitlements for LuaJIT).
+          # Sign inner executable first, then the bundle (hardened runtime; the
+          # PUC Lua backend needs no JIT entitlements).
           codesign --force --options runtime --timestamp \
-            --entitlements "$ENTITLEMENTS" \
             --keychain "$SIGN_KEYCHAIN" --sign "$SIGN_IDENTITY" "$APP/Contents/MacOS/nxvim-gui"
           codesign --force --options runtime --timestamp \
-            --entitlements "$ENTITLEMENTS" \
             --keychain "$SIGN_KEYCHAIN" --sign "$SIGN_IDENTITY" "$APP"
           codesign --verify --strict --verbose=2 "$APP"
 

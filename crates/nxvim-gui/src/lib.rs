@@ -59,6 +59,9 @@ pub use render::{col_to_screen, group_fallback, rect_subtract, row_segments, tex
 // The wide-glyph mask (replace an off-grid emoji cluster with cell-width spaces), so
 // the Tier-1 `wide` test can exercise it without shaping / a GPU.
 pub use render::mask_segments;
+// The sRGB→linear color conversions feeding the quad pipeline, exported so the Tier-1
+// `color` test can pin the channel order without a GPU.
+pub use render::{color_to_rgba, srgb_to_color, srgb_to_color_rgba};
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;

@@ -4239,17 +4239,21 @@ impl TablineColors {
 }
 
 /// 0xRRGGBB → opaque glyphon [`Color`].
-fn srgb_to_color(c: u32) -> Color {
+pub fn srgb_to_color(c: u32) -> Color {
     Color::rgb((c >> 16) as u8, (c >> 8) as u8, c as u8)
 }
-fn srgb_to_color_rgba(c: u32, alpha: f32) -> [f32; 4] {
+pub fn srgb_to_color_rgba(c: u32, alpha: f32) -> [f32; 4] {
     let lin = srgb_u32_to_linear(c);
     [lin[0], lin[1], lin[2], alpha]
 }
-fn color_to_rgba(c: Color) -> [f32; 4] {
+pub fn color_to_rgba(c: Color) -> [f32; 4] {
     // glyphon Color is sRGB bytes; our quad pipeline targets an sRGB surface, so
-    // convert to linear (the GPU applies the sRGB encode on store).
-    let [r, g, b, a] = c.0.to_le_bytes();
+    // convert to linear (the GPU applies the sRGB encode on store). cosmic-text packs
+    // `Color.0` as `0xAARRGGBB`, so its little-endian bytes are `[B, G, R, A]` — bind
+    // them in that order, then repack as `0xRRGGBB`. (Getting this order wrong swaps
+    // the red and blue channels, invisible on desaturated chrome but glaring on a
+    // saturated statusline fill where R ≠ B.)
+    let [b, g, r, a] = c.0.to_le_bytes();
     let lin = srgb_u32_to_linear((r as u32) << 16 | (g as u32) << 8 | b as u32);
     [lin[0], lin[1], lin[2], a as f32 / 255.0]
 }

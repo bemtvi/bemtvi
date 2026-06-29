@@ -443,6 +443,44 @@ async fn nx_terminal_open_list_cmd_preserves_argument_spaces() {
     .await;
 }
 
+/// Arrow / Home / End keys honor the child's **application cursor-key mode** (DECCKM). A
+/// full-screen app (`less`, vim, …) enables it via `smkx` (`\E[?1h`); thereafter the
+/// terminal must send Home as `\EOH` (the app's `khome`), not the default `\E[H` — else the
+/// app misreads the trailing letter as a command (`less`: Home→help, End→tail-follow). The
+/// child here turns the mode on with `printf`, then `cat -v` echoes input with control bytes
+/// made visible (`ESC` → `^[`), so a pressed `<Home>` must show as `^[OH`, not `^[[H`.
+#[tokio::test]
+async fn cursor_keys_use_application_mode_when_the_child_enables_it() {
+    let _guard = serial_lock().lock().await;
+    let (rpc, _incoming) = start().await;
+
+    // `\\033[?1h` (DECCKM on) then `cat -v` (echo input, control bytes visible). The `\\033`
+    // reaches the shell's `printf` as a literal `\033` (Lua/raw-string layers preserve the
+    // backslash), which printf renders to the real ESC byte the emulator parses.
+    exec_lua(
+        &rpc,
+        r#"nx.terminal.open{ cmd = {'sh', '-c', 'printf "\\033[?1h"; exec cat -v'} }"#,
+    )
+    .await;
+    // Type a plain char and wait for its echo: this proves `cat -v` is running, which means
+    // the earlier `printf` (and thus the mode-set) has already been processed and mirrored.
+    feed(&rpc, "x");
+    wait_lines(&rpc, "cat -v to be echoing input", |ls| {
+        ls.iter().any(|l| l.contains('x'))
+    })
+    .await;
+
+    feed(&rpc, "<Home>");
+    let ls = wait_lines(&rpc, "Home sent in application mode (^[OH)", |ls| {
+        ls.iter().any(|l| l.contains("^[OH"))
+    })
+    .await;
+    assert!(
+        !ls.iter().any(|l| l.contains("^[[H")),
+        "Home must be the application-mode ^[OH, never the default ^[[H, got: {ls:?}"
+    );
+}
+
 /// `nx.terminal.open{ cwd = ... }` starts the child in the requested directory.
 #[tokio::test]
 async fn nx_terminal_open_respects_an_explicit_cwd() {

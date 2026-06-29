@@ -21,6 +21,7 @@ use std::time::Duration;
 use nxvim_rpc::{connect, Incoming, Rpc};
 use nxvim_server::{RemoteHostTerm, ServerInit};
 use nxvim_test_harness::{attach, buf_lines, feed, spawn, temp_dir};
+use rmpv::Value;
 use tokio::sync::mpsc::UnboundedReceiver;
 
 /// Start a real editor whose `:terminal` seam is a [`RemoteHostTerm`] connected to a
@@ -110,6 +111,78 @@ async fn terminal_input_round_trips_to_the_daemon_child() {
         lines.concat().contains("hello"),
         "input typed in a remote terminal must reach the daemon's child and echo back, got: \
          {lines:?}"
+    );
+}
+
+/// Parse `"<rows> <cols>"` (an `stty size` line) into its rows, ignoring command echoes /
+/// prompts. Requires exactly two integer fields so `sh-3.2$ stty size` (three+ fields) and
+/// the bare `stty size` echo (non-numeric) are skipped.
+fn parse_stty_rows(line: &str) -> Option<u32> {
+    match line.split_whitespace().collect::<Vec<_>>().as_slice() {
+        [r, c] => Some((r.parse::<u32>().ok()?, c.parse::<u32>().ok()?).0),
+        _ => None,
+    }
+}
+
+/// Repeatedly run `stty size` in the current (interactive) remote terminal until the PTY's
+/// row count reaches `want_min`, returning the last value seen. Re-running each poll is
+/// deliberate: a UI resize forwards to the daemon PTY asynchronously (`term_resize` over the
+/// wire → SIGWINCH), and each `feed` drives a redraw whose `sync_terminal_sizes` forwards it —
+/// so a fresh `stty` eventually observes the grown size once it lands. The *last* two-integer
+/// line in the buffer is the newest `stty` output.
+async fn poll_stty_rows(rpc: &Rpc, want_min: u32) -> u32 {
+    let mut last = 0;
+    for _ in 0..120 {
+        feed(rpc, "stty size<CR>");
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        if let Some(r) = buf_lines(rpc, 0)
+            .await
+            .iter()
+            .rev()
+            .find_map(|l| parse_stty_rows(l))
+        {
+            last = r;
+            if r >= want_min {
+                return r;
+            }
+        }
+    }
+    last
+}
+
+/// A remote terminal's PTY tracks the editor window size, so a full-screen pager fills the
+/// screen instead of showing only a few lines. The child opens at the editor's rows/cols
+/// (`term_open`), and a later UI resize is forwarded over the wire (`term_resize`) — so the
+/// child's own `stty size` reflects the *current* size, not a stale tiny one. This guards the
+/// resize leg: if it weren't forwarded, a terminal opened in a briefly-small window (or before
+/// layout settles, as a GUI can) would stay tiny — the "shows only a few lines" report.
+#[tokio::test]
+async fn remote_terminal_pty_tracks_window_resizes() {
+    let dir = temp_dir("remote_term_size");
+    let (rpc, _incoming) = spawn_remote_term(&dir.to_string_lossy()).await;
+
+    // Open one interactive shell; the initial 24-row attach yields a ~23-row PTY (a row goes
+    // to the status line).
+    feed(&rpc, ":terminal sh<CR>");
+    let initial = poll_stty_rows(&rpc, 1).await;
+    assert!(
+        (20..=24).contains(&initial),
+        "the remote PTY should open at the attached size (~23 rows for a 24-row UI), got {initial}"
+    );
+
+    // Grow the UI to 50 rows; the new size must cross the wire to the daemon PTY.
+    rpc.request(
+        "nx_ui_try_resize",
+        vec![Value::from(120u64), Value::from(50u64), Value::Map(vec![])],
+    )
+    .await
+    .expect("nx_ui_try_resize");
+
+    let resized = poll_stty_rows(&rpc, 45).await;
+    assert!(
+        resized >= 45,
+        "a UI resize must forward to the remote PTY (≈49 rows for a 50-row UI), got {resized} — \
+         a terminal stuck near the initial {initial} rows is the 'shows only a few lines' bug"
     );
 }
 

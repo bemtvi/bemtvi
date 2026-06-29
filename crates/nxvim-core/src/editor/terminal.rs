@@ -88,6 +88,9 @@ impl Editor {
         self.set_current_buffer(buf);
         self.mode = Mode::Terminal;
         self.terminal_pending_backslash = false;
+        // A fresh emulator starts in normal cursor-key mode; the child re-enables
+        // application mode (if it wants it) and the server mirrors that on the next project.
+        self.terminal_app_cursor = false;
         self.pending_terminal.push(TerminalOp::Open {
             buf,
             argv,
@@ -180,6 +183,7 @@ impl Editor {
         tail_lines: &[String],
         cursor_row: usize,
         cursor_col: usize,
+        app_cursor: bool,
     ) {
         if !self.is_terminal_buffer(buf) {
             return;
@@ -204,6 +208,9 @@ impl Editor {
         ob.buffer.modified = false;
 
         if is_current {
+            // Mirror the focused terminal's application-cursor-key mode so the next arrow /
+            // Home / End keystroke is encoded in the form the child's terminfo expects.
+            self.terminal_app_cursor = app_cursor;
             let line = cursor_row.min(self.buffer().line_count().saturating_sub(1));
             let line_text = self.buffer().line(line);
             // vt100 reports a *screen* column (display cells); the editor stores cursor
@@ -317,7 +324,7 @@ impl Editor {
                 return;
             }
             let mut bytes = vec![0x1c];
-            bytes.extend(key_to_terminal_bytes(key));
+            bytes.extend(key_to_terminal_bytes(key, self.terminal_app_cursor));
             self.pending_terminal.push(TerminalOp::Send { buf, bytes });
             return;
         }
@@ -362,7 +369,7 @@ impl Editor {
             return;
         }
         self.terminal_esc_count = 0;
-        let bytes = key_to_terminal_bytes(key);
+        let bytes = key_to_terminal_bytes(key, self.terminal_app_cursor);
         if !bytes.is_empty() {
             self.pending_terminal.push(TerminalOp::Send { buf, bytes });
         }
@@ -403,16 +410,34 @@ impl Editor {
 /// PTY — printable text as UTF-8, the usual C0 control bytes, and the standard
 /// `ESC [`-style sequences for the special keys. Pure: no editor state, so it is
 /// trivially testable and identical across every front end.
-pub(crate) fn key_to_terminal_bytes(key: Key) -> Vec<u8> {
+pub(crate) fn key_to_terminal_bytes(key: Key, app_cursor: bool) -> Vec<u8> {
     // Alt/Meta sends ESC then the unmodified key's bytes (xterm's "metaSendsEscape").
     if key.alt {
-        let mut inner = key_to_terminal_bytes(Key { alt: false, ..key });
+        let mut inner = key_to_terminal_bytes(Key { alt: false, ..key }, app_cursor);
         if inner.is_empty() {
             return inner;
         }
         let mut bytes = vec![0x1b];
         bytes.append(&mut inner);
         return bytes;
+    }
+    // The cursor keys (arrows + Home/End) have two encodings, selected by the child's
+    // DECCKM state: the default `\E[_` form, or — once a full-screen app enables
+    // application cursor-key mode (`smkx` → `\E[?1h`) — the `\EO_` form its terminfo binds
+    // (`kcuu1=\EOA`, `khome=\EOH`, `kend=\EOF`, …). Sending the wrong one makes the app
+    // miss the key entirely: `less` reads `\E[H` as a stray `H` (its help command), `\E[F`
+    // as `F` (tail-follow). The numeric-keypad keys (PageUp/Down, Delete) are `\E[_~`
+    // sequences unaffected by DECCKM, so they stay below.
+    let csi: u8 = if app_cursor { b'O' } else { b'[' };
+    let cursor_seq = |last: u8| vec![0x1b, csi, last];
+    match key.code {
+        KeyCode::Up => return cursor_seq(b'A'),
+        KeyCode::Down => return cursor_seq(b'B'),
+        KeyCode::Right => return cursor_seq(b'C'),
+        KeyCode::Left => return cursor_seq(b'D'),
+        KeyCode::Home => return cursor_seq(b'H'),
+        KeyCode::End => return cursor_seq(b'F'),
+        _ => {}
     }
     match key.code {
         KeyCode::Char(c) => {
@@ -445,12 +470,14 @@ pub(crate) fn key_to_terminal_bytes(key: Key) -> Vec<u8> {
         KeyCode::Backspace => vec![0x7f],
         KeyCode::Esc => vec![0x1b],
         KeyCode::Delete => b"\x1b[3~".to_vec(),
-        KeyCode::Up => b"\x1b[A".to_vec(),
-        KeyCode::Down => b"\x1b[B".to_vec(),
-        KeyCode::Right => b"\x1b[C".to_vec(),
-        KeyCode::Left => b"\x1b[D".to_vec(),
-        KeyCode::Home => b"\x1b[H".to_vec(),
-        KeyCode::End => b"\x1b[F".to_vec(),
+        // Arrows + Home/End are handled above (DECCKM-aware). PageUp/Down are vt220 keypad
+        // sequences unaffected by application cursor mode.
+        KeyCode::Up
+        | KeyCode::Down
+        | KeyCode::Right
+        | KeyCode::Left
+        | KeyCode::Home
+        | KeyCode::End => unreachable!("cursor keys handled by the DECCKM block above"),
         KeyCode::PageUp => b"\x1b[5~".to_vec(),
         KeyCode::PageDown => b"\x1b[6~".to_vec(),
         // A mouse key (`<LeftMouse>` / `<ScrollWheelUp>` …) is resolved server-side and

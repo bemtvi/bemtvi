@@ -1484,6 +1484,14 @@ pub struct Editor {
     /// mode's `<C-r>{register}`. Plain `<C-r>` is left for the child (shell reverse
     /// search), so this is behind a prefix. Always `false` outside that two-key chord.
     terminal_awaiting_register: bool,
+    /// Whether the current terminal's child has enabled **application cursor-key mode**
+    /// (DECCKM, `\E[?1h` — emitted by a full-screen app's `smkx`). When set, the arrow /
+    /// Home / End keys must be sent in the `\EO_` form (`\EOA` … `\EOH`/`\EOF`) the app's
+    /// terminfo expects, not the default `\E[_` cursor form — otherwise e.g. `less` doesn't
+    /// recognize Home/End and treats the trailing letter as a command (`H`→help, `F`→tail).
+    /// Mirrored from the vt100 emulator (`screen().application_cursor()`) by the server each
+    /// projection via [`Editor::terminal_update`]; reset when a new terminal opens.
+    terminal_app_cursor: bool,
 }
 
 impl Editor {
@@ -1758,6 +1766,7 @@ impl Editor {
             terminal_cursor: (0, 0),
             terminal_last_esc_ms: 0,
             terminal_awaiting_register: false,
+            terminal_app_cursor: false,
         };
         // Lay the sole window out into the default area so per-window rect
         // accessors (text width/height) are valid before the first `resize`.

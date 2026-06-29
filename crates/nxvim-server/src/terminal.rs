@@ -374,10 +374,20 @@ impl EditHost {
         };
         let (cy, cx) = screen.cursor_position();
         let cursor_row = hist_len + cy as usize;
+        // DECCKM: a full-screen child enables application cursor-key mode, which changes how
+        // arrow/Home/End keystrokes must be encoded (`\EO_` vs `\E[_`). Mirror it to core so
+        // the next keystroke is sent in the form the child expects.
+        let app_cursor = screen.application_cursor();
         let title = emu.parser.callbacks().title.clone();
 
-        self.editor
-            .terminal_update(buf, replace_from, &tail, cursor_row, cx as usize);
+        self.editor.terminal_update(
+            buf,
+            replace_from,
+            &tail,
+            cursor_row,
+            cx as usize,
+            app_cursor,
+        );
         if let Some(title) = title {
             self.editor.terminal_set_title(buf, &title);
         }

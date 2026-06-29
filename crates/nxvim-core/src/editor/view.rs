@@ -28,6 +28,14 @@ pub(crate) struct ViewState {
     pub buf: BufferId,
     /// How the view is currently shown, or `None` while unmounted.
     pub mount: Option<ViewMount>,
+    /// The `(namespace, id)` the plugin chose for cross-session persistence
+    /// (`nx.view.create{ persist = }`), or `None` for an ephemeral view. Core round-trips
+    /// this opaque pair through the workspace session: on capture it tags the view's slot;
+    /// on restore it reserves the slot and hands the id back to the owning plugin, which
+    /// keyed its own `nx.shada.plugin()` store by `id` and rebuilds the content. Core never
+    /// stores the view's lines — only this pair — so persistence stays content-agnostic.
+    /// Independent of `'workspacepersistunnamed'` (that governs editable scratch).
+    pub persist: Option<(String, String)>,
 }
 
 /// Where a [`ViewState`] is mounted — the window region `focus` / `unmount` act on.
@@ -59,8 +67,15 @@ impl Editor {
     /// treesitter / decoration). Idempotent: a second create on a live id is a
     /// no-op, so a re-run config doesn't strand a second buffer. The buffer is
     /// created off-screen (no window) — it becomes visible only on
-    /// [`mount_view`](Editor::mount_view).
-    pub fn create_view(&mut self, id: u64, name: String, filetype: String) {
+    /// [`mount_view`](Editor::mount_view). `persist` is the `(namespace, id)` the view opts
+    /// into cross-session restore with (`None` ⇒ ephemeral), stored on the [`ViewState`].
+    pub fn create_view(
+        &mut self,
+        id: u64,
+        name: String,
+        filetype: String,
+        persist: Option<(String, String)>,
+    ) {
         if self.views.contains_key(&id) {
             return;
         }
@@ -86,8 +101,16 @@ impl Editor {
             ViewState {
                 buf: buf_id,
                 mount: None,
+                persist,
             },
         );
+    }
+
+    /// The `(namespace, id)` view `vid` opted into cross-session persistence with, or
+    /// `None` for an ephemeral view / unknown id. Used by the session capture to tag a
+    /// persisted view's slot ([`Editor::capture_layout`]).
+    pub(crate) fn view_persist_of(&self, vid: u64) -> Option<(String, String)> {
+        self.views.get(&vid).and_then(|v| v.persist.clone())
     }
 
     /// The backing buffer of view `id` (the `nx._view_buf` mirror / extmark target),
@@ -385,6 +408,85 @@ impl Editor {
                 Ok(())
             }
             other => Err(format!("unknown view action {other:?}")),
+        }
+    }
+
+    /// Adopt the reserved restore slot `win` for view `view_id` — the `place(view)` step of
+    /// an [`nx.view.on_restore`](crate) handler, driven by `nx.view._adopt`. Retargets the
+    /// placeholder window (minted by [`Editor::build_layout`] for a `view_persist` leaf) to
+    /// the view's backing buffer, records the mount so `:focus`/`:unmount` resolve it, drops
+    /// the now-orphaned placeholder buffer, and clears the pending claim. Handles a slot in
+    /// any **open** layer — the main active tab or a dock (the dogfood cases) — and,
+    /// best-effort, a slot parked in an inactive tab (the content lands; cross-tab focus is
+    /// imperfect). A no-op if the view or the reserved window is gone — the claim is dropped
+    /// either way, so it never lingers as an uncollapsible orphan.
+    pub fn adopt_view(&mut self, view_id: u64, win: WindowId) {
+        let Some(buf) = self.view_buffer(view_id) else {
+            self.pending_view_restores.retain(|p| p.win != win);
+            return;
+        };
+        // Resolve the slot against an open layer first (so `set_window_buffer` relayouts and
+        // handles the focused window), extracting the layer + placeholder buffer up front so
+        // no borrow of `self` outlives the mutating calls below.
+        let open_slot = self
+            .tree_of_window(win)
+            .map(|(layer, t)| (layer, t.get(win).buffer));
+        if let Some((layer, placeholder)) = open_slot {
+            self.set_window_buffer(win, buf);
+            // A dock-layer slot is a Dock mount; a main-layer slot (a split, or the sole
+            // window of a tab) is a Split mount — closing a sole-window tab closes the tab
+            // anyway, so Split's semantics suffice.
+            let mount = match layer {
+                Layer::Dock(side) => ViewMount::Dock(side),
+                Layer::Main => ViewMount::Split(win),
+            };
+            if let Some(v) = self.views.get_mut(&view_id) {
+                v.mount = Some(mount);
+            }
+            if placeholder != buf {
+                self.delete_buffer(placeholder, true);
+            }
+        } else {
+            // The slot is parked in an inactive tab: swap the buffer in place so the content
+            // lands where it was rather than stranding a placeholder. Cross-tab focus via the
+            // Split mount is imperfect (it assumes the active tab) — an accepted edge.
+            let mut placeholder = None;
+            for t in self.parked_trees_mut() {
+                if let Some(w) = t.try_get_mut(win) {
+                    placeholder = Some(w.buffer);
+                    w.buffer = buf;
+                    break;
+                }
+            }
+            if let Some(placeholder) = placeholder {
+                self.set_buffer_layer(buf, Layer::Main);
+                if let Some(v) = self.views.get_mut(&view_id) {
+                    v.mount = Some(ViewMount::Split(win));
+                }
+                if placeholder != buf {
+                    self.delete_buffer(placeholder, true);
+                }
+            }
+        }
+        self.pending_view_restores.retain(|p| p.win != win);
+    }
+
+    /// Collapse the reserved slots of every persisted view no plugin adopted (its owner is
+    /// gone, or it registered no `nx.view.on_restore`): close each unclaimed window — a dock
+    /// shuts, a split collapses — the same fate as a restored file window whose file
+    /// vanished. Called once after the restore dispatch drains. Clears the pending list.
+    pub fn collapse_unclaimed_view_restores(&mut self) {
+        for p in std::mem::take(&mut self.pending_view_restores) {
+            match self.tree_of_window(p.win) {
+                Some((Layer::Dock(side), _)) => self.close_dock(side),
+                Some((Layer::Main, _)) => {
+                    self.close_window_by_id(p.win, true);
+                }
+                // Parked in an inactive tab: closing it needs a tab switch, and an unclaimed
+                // view there is a rare edge (a multi-tab persisted view whose plugin is
+                // gone). Left as the placeholder rather than churning the focused tab.
+                None => {}
+            }
         }
     }
 }

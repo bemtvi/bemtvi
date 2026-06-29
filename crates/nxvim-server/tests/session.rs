@@ -134,6 +134,222 @@ async fn session_restores_split_layout_files_and_cursor() {
 }
 
 #[tokio::test]
+async fn session_drops_ephemeral_views() {
+    // A view created WITHOUT `persist` is ephemeral: it does not ride the session, so the
+    // restore leaves no pending claim (and its slot collapses, as today).
+    let dir = temp_dir("session_view_eph_store");
+    let file_a = write_temp("session_view_eph_a", "txt", "a1\na2\na3\n");
+
+    {
+        let (rpc, incoming) = start_attached(init(&dir, Some(file_a.clone()), true), 80, 25).await;
+        exec_lua(&rpc, "nx.shada.save_layout(true)").await;
+        exec_lua(
+            &rpc,
+            r#"
+            local v = nx.view.create{ name = "TV", filetype = "nxview" }  -- no persist
+            v:set_lines({ "x" })
+            v:mount{ split = "vsplit" }
+            "#,
+        )
+        .await;
+        assert_eq!(window_count(&rpc).await, 2, "file_a | ephemeral view");
+        feed(&rpc, ":qa<CR>");
+        await_server_exit(incoming).await;
+    }
+
+    {
+        let (rpc, _incoming) = start_attached(init(&dir, None, true), 80, 25).await;
+        let n = exec_lua(&rpc, "return #nx.view.pending_restores()")
+            .await
+            .as_i64()
+            .unwrap_or(-1);
+        assert_eq!(n, 0, "an ephemeral view leaves no pending restore");
+        assert_eq!(
+            window_count(&rpc).await,
+            1,
+            "the ephemeral view's slot collapsed; only file_a remains"
+        );
+    }
+}
+
+/// The on_restore handler a restoring session registers at boot: it reads the view's saved
+/// lines back from its own plugin-shada (keyed by the persist id) and adopts the reserved
+/// slot. Stashes the rebuilt handle at `nx._test_restored_view` so the test can read its
+/// content regardless of which layer (dock / split) the slot is in. Registered with an
+/// explicit namespace because `client_init_lua` attributes to no runtimepath entry.
+const RESTORE_HANDLER: &str = r#"
+nx.view.on_restore(function(id, place)
+  local data = nx.shada.plugin("treens"):get("view:" .. id) or {}
+  local v = nx.view.create{
+    name = "Tree", filetype = "nxview", persist = id, namespace = "treens",
+  }
+  v:set_lines(data)
+  nx._test_restored_view = v
+  place(v)
+end, "treens")
+"#;
+
+/// Read back the lines of the view the restore handler rebuilt, as "l1|l2|…".
+async fn restored_view_content(rpc: &nxvim_rpc::Rpc) -> String {
+    exec_lua(
+        rpc,
+        r#"
+        local v = nx._test_restored_view
+        if not v or not v:bufnr() then return "<none>" end
+        return table.concat(nx.buf.lines(v:bufnr(), 0, -1, false), "|")
+        "#,
+    )
+    .await
+    .as_str()
+    .unwrap_or_default()
+    .to_string()
+}
+
+#[tokio::test]
+async fn session_restores_a_persisted_view_in_a_dock_through_on_restore() {
+    // The full round trip: a plugin mounts a persisted view in a left dock and stashes its
+    // content in its own plugin-shada keyed by the view's persist id. After a restart, the
+    // restore reserves the dock slot, the plugin's `on_restore` handler rebuilds the view
+    // from its shada and adopts the reserved window — content and dock geometry both back.
+    let dir = temp_dir("session_view_rt_dock_store");
+
+    {
+        let (rpc, incoming) = start_attached(init(&dir, None, true), 80, 25).await;
+        exec_lua(&rpc, "nx.shada.save_layout(true)").await;
+        exec_lua(
+            &rpc,
+            r#"
+            local lines = { "root", "  a.txt", "  b.txt" }
+            local v = nx.view.create{
+              name = "Tree", filetype = "nxview", persist = "main", namespace = "treens",
+            }
+            v:set_lines(lines)
+            v:mount{ dock = "left", size = 30 }
+            nx.shada.plugin("treens"):set("view:main", lines)
+            "#,
+        )
+        .await;
+        feed(&rpc, ":qa<CR>");
+        await_server_exit(incoming).await;
+    }
+
+    {
+        let mut si = init(&dir, None, true);
+        si.client_init_lua = Some(RESTORE_HANDLER.to_string());
+        let (rpc, _incoming) = start_attached(si, 80, 25).await;
+        let pending = exec_lua(&rpc, "return #nx.view.pending_restores()")
+            .await
+            .as_i64()
+            .unwrap_or(-1);
+        assert_eq!(pending, 0, "the persisted view's slot was adopted");
+        assert_eq!(
+            restored_view_content(&rpc).await,
+            "root|  a.txt|  b.txt",
+            "the plugin rebuilt the view's content from its own shada"
+        );
+        // The left dock came back (it shrinks the main window below full width).
+        let w = main_win_width(&rpc).await;
+        assert!(
+            w < 70,
+            "the restored view's left dock shrinks the main (got {w})"
+        );
+    }
+}
+
+#[tokio::test]
+async fn session_restores_a_persisted_view_in_a_split_through_on_restore() {
+    // The Layer::Main adoption path: a persisted view mounted in a main-area split comes
+    // back in a real main window (visible to `nx.win.list()`), adopted from the reserved
+    // slot alongside the restored file window.
+    let dir = temp_dir("session_view_rt_split_store");
+    let file_a = write_temp("session_view_rt_a", "txt", "a1\na2\n");
+
+    {
+        let (rpc, incoming) = start_attached(init(&dir, Some(file_a.clone()), true), 80, 25).await;
+        exec_lua(&rpc, "nx.shada.save_layout(true)").await;
+        exec_lua(
+            &rpc,
+            r#"
+            local lines = { "alpha", "beta" }
+            local v = nx.view.create{
+              name = "Tree", filetype = "nxview", persist = "main", namespace = "treens",
+            }
+            v:set_lines(lines)
+            v:mount{ split = "vsplit" }
+            nx.shada.plugin("treens"):set("view:main", lines)
+            "#,
+        )
+        .await;
+        feed(&rpc, ":qa<CR>");
+        await_server_exit(incoming).await;
+    }
+
+    {
+        let mut si = init(&dir, Some(file_a.clone()), true);
+        si.client_init_lua = Some(RESTORE_HANDLER.to_string());
+        let (rpc, _incoming) = start_attached(si, 80, 25).await;
+        assert_eq!(
+            window_count(&rpc).await,
+            2,
+            "file_a window + the adopted view window"
+        );
+        assert_eq!(
+            restored_view_content(&rpc).await,
+            "alpha|beta",
+            "the view's content was rebuilt into the adopted main-area window"
+        );
+        let names = window_buffer_names(&rpc).await;
+        assert!(
+            names.contains(&file_a),
+            "file_a restored alongside: {names}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn session_collapses_a_persisted_view_with_no_handler() {
+    // When the owning plugin is gone (no `on_restore` registered), the reserved slot is an
+    // orphan: it collapses, exactly like a restored file window whose file vanished. The
+    // dock does not come back; only the restored file window remains.
+    let dir = temp_dir("session_view_orphan_store");
+    let file_a = write_temp("session_view_orphan_a", "txt", "a1\na2\n");
+
+    {
+        let (rpc, incoming) = start_attached(init(&dir, Some(file_a.clone()), true), 80, 25).await;
+        exec_lua(&rpc, "nx.shada.save_layout(true)").await;
+        exec_lua(
+            &rpc,
+            r#"
+            local v = nx.view.create{
+              name = "Tree", filetype = "nxview", persist = "main", namespace = "treens",
+            }
+            v:set_lines({ "root" })
+            v:mount{ split = "vsplit" }
+            "#,
+        )
+        .await;
+        assert_eq!(window_count(&rpc).await, 2, "file_a | view before quit");
+        feed(&rpc, ":qa<CR>");
+        await_server_exit(incoming).await;
+    }
+
+    {
+        // No client_init_lua: nothing registers `on_restore`, so the slot is unclaimed.
+        let (rpc, _incoming) = start_attached(init(&dir, Some(file_a.clone()), true), 80, 25).await;
+        let pending = exec_lua(&rpc, "return #nx.view.pending_restores()")
+            .await
+            .as_i64()
+            .unwrap_or(-1);
+        assert_eq!(pending, 0, "the unclaimed slot was drained by the collapse");
+        assert_eq!(
+            window_count(&rpc).await,
+            1,
+            "the orphan view's slot collapsed; only file_a remains"
+        );
+    }
+}
+
+#[tokio::test]
 async fn session_restores_multiple_tab_pages() {
     // Two tab pages, each on its own file. The INACTIVE tab's layout is stashed off
     // `self.windows`, and the `self.window_*` accessors only see the current layer's

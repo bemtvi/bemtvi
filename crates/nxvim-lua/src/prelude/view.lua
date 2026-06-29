@@ -61,24 +61,97 @@ end
 local View = {}
 View.__index = View
 
--- nx.view.create{ name?, filetype? } -> handle. Mints the backing read-only buffer
--- (off-screen until mounted) and returns the handle. `filetype` drives treesitter /
--- decoration on the view buffer.
+-- nx.view.create{ name?, filetype?, persist?, namespace? } -> handle. Mints the backing
+-- read-only buffer (off-screen until mounted) and returns the handle. `filetype` drives
+-- treesitter / decoration on the view buffer.
+--
+-- `persist` opts the view into cross-session restore: it is a stable, plugin-chosen string
+-- id (instance-unique within the plugin) that core round-trips through the workspace
+-- session — recording only `(namespace, id)` + the view's slot, never its content. On
+-- restore core reserves the slot and hands the id back via `nx.view.on_restore`, and the
+-- plugin (which keyed its own `nx.shada.plugin()` store by the same id) rebuilds the
+-- content. Absent ⇒ the view is ephemeral (today's behavior — not persisted). The owning
+-- `namespace` is auto-derived from the calling plugin's location (same resolver as
+-- `nx.shada.plugin()`); `opts.namespace` is the escape hatch for a context that attributes
+-- to no runtimepath entry (a bare `:lua` / RPC / test) and is an error from a real plugin
+-- file — exactly the `nx.shada.plugin(dev_namespace)` contract.
 function nx.view.create(opts)
   opts = opts or {}
   nx._view_next_id = nx._view_next_id + 1
   local id = nx._view_next_id
+  local persist = opts.persist
+  local namespace
+  if persist ~= nil then
+    if type(persist) ~= "string" or persist == "" then
+      error("nx.view.create: persist must be a non-empty string id", 2)
+    end
+    namespace = nx._resolve_namespace(opts.namespace, "nx.view.create")
+  end
   local self = setmetatable({
     id = id,
     name = opts.name or "",
     filetype = opts.filetype or "",
+    persist = persist, -- plugin-chosen stable id (nil ⇒ ephemeral)
+    namespace = namespace, -- core-resolved owner namespace (nil when not persisted)
     _userdata = {},
     _on_select = nil,
     _on_close = nil,
   }, View)
   nx._views[id] = self
-  nx.view._create(id, self.name, self.filetype)
+  nx.view._create(id, self.name, self.filetype, namespace or "", persist or "")
   return self
+end
+
+-- nx.view.pending_restores() -> the views a session restore reserved a slot for but that
+-- no plugin has adopted yet, each `{ namespace=, id=, win= }` (`win` is the reserved
+-- window). The pull primitive behind `nx.view.on_restore` and the black-box test hook.
+-- Refreshed each tick from core's `nx._view_pending` mirror.
+function nx.view.pending_restores()
+  return nx._view_pending or {}
+end
+
+-- nx.view.on_restore(fn[, namespace]) — register THIS plugin's restorer for persisted
+-- views. After a session restore, core reserves a slot (a placeholder window) for every
+-- persisted view the plugin had open; once plugins have loaded, each reserved slot whose
+-- owning namespace matches is dispatched to `fn(id, place)`:
+--   * `id` is the plugin-chosen persist string (the same one passed to `create{ persist=}`),
+--   * `place(view)` drops a freshly-created view into the reserved window.
+-- The plugin keyed its own `nx.shada.plugin()` store by `id`, so it reads its saved state
+-- back and rebuilds the view's content before calling `place`. The owning namespace is
+-- resolved from the caller's location; the optional `namespace` arg is the escape hatch for
+-- a no-attribution context (a bare `:lua` / RPC / test), the same contract as create's.
+nx._view_restorers = nx._view_restorers or {} -- namespace -> fn
+function nx.view.on_restore(fn, namespace)
+  if type(fn) ~= "function" then
+    error("nx.view.on_restore: expected a function", 2)
+  end
+  local ns = nx._resolve_namespace(namespace, "nx.view.on_restore")
+  nx._view_restorers[ns] = fn
+  return fn
+end
+
+-- nx._run_view_restores() — dispatch each pending restore to its namespace's registered
+-- `on_restore` handler. Called by the server ONCE, after plugins are sourced (so handlers
+-- exist) and after core has refreshed `nx._view_pending`. Each handler gets `(id, place)`
+-- where `place(view)` adopts the reserved window via `nx.view._adopt`. A handler error is
+-- surfaced, not fatal — its slot stays pending and core collapses it afterwards. Entries
+-- whose namespace has no handler (the plugin is gone) are left for the same collapse.
+function nx._run_view_restores()
+  for _, e in ipairs(nx._view_pending or {}) do
+    local fn = nx._view_restorers[e.namespace]
+    if fn then
+      local win = e.win
+      local ok, err = pcall(fn, e.id, function(view)
+        return view:place_in(win)
+      end)
+      if not ok then
+        nx.notify(
+          "nx.view.on_restore[" .. tostring(e.namespace) .. "] failed: " .. tostring(err),
+          4
+        )
+      end
+    end
+  end
 end
 
 -- :set_lines(lines) — replace the view's content wholesale.
@@ -228,6 +301,16 @@ function View:mount(opts)
   else
     nx.notify("nx.view:mount: pass one of { dock = … } / { split = … } / { float = … }", 4)
   end
+  return self
+end
+
+-- :place_in(win) — adopt the reserved restore slot `win` for this view: retarget that
+-- placeholder window (minted by a session restore for a persisted view) to this view's
+-- backing buffer, instead of opening a fresh window like `:mount`. This is what the `place`
+-- argument handed to an `nx.view.on_restore` handler calls
+-- (`place = function(view) view:place_in(win) end`), so a plugin rarely calls it directly.
+function View:place_in(win)
+  nx.view._adopt(self.id, win)
   return self
 end
 

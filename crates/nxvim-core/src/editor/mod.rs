@@ -853,6 +853,13 @@ pub struct Editor {
     /// ([`Editor::close_window`]), never on a programmatic `unmount`/`destroy_view`, so a
     /// plugin's own teardown doesn't re-fire it.
     pub view_closes: Vec<u64>,
+    /// Slots a session restore reserved for **persisted plugin views** (`nx.view.create{
+    /// persist = }`) that no plugin has adopted yet — each a `(namespace, id)` + reserved
+    /// placeholder window ([`PendingViewRestore`]). Filled by [`Editor::restore_session`]
+    /// at boot (before plugins load), mirrored to Lua as `nx._view_pending`, and drained by
+    /// the `nx.view.on_restore` dispatch once plugins are sourced; survivors are orphans
+    /// whose slots collapse. Empty outside the boot-restore window.
+    pub(crate) pending_view_restores: Vec<self::persist::PendingViewRestore>,
     /// The floating selectable-list widget, when open (`nx.ui.select`; the shared
     /// picker / completion surface). Grabs input focus like the panel, but floats
     /// over the text. See [`menu`](crate::editor::MenuPlacement).
@@ -1633,6 +1640,7 @@ impl Editor {
             views: HashMap::new(),
             view_selects: Vec::new(),
             view_closes: Vec::new(),
+            pending_view_restores: Vec::new(),
             menu: None,
             menu_results: Vec::new(),
             picker_confirm_mode: menu::PickerOpenMode::default(),

@@ -2178,6 +2178,25 @@ impl LuaRuntime {
         Ok(())
     }
 
+    /// Refresh `nx._view_pending` — the persisted plugin views a session restore reserved
+    /// a slot for but that no plugin has adopted yet. Each entry is a `{ namespace, id,
+    /// win }` table (the owning plugin namespace, the plugin-chosen persist id, and the
+    /// reserved window). `nx.view.pending_restores()` reads it, and the `on_restore`
+    /// dispatch (Phase 2) drains it. Usually empty, so cheap.
+    pub fn set_view_pending(&self, pending: &[(String, String, u64)]) -> mlua::Result<()> {
+        let nx = self.nx()?;
+        let arr = self.lua.create_table()?;
+        for (i, (namespace, id, win)) in pending.iter().enumerate() {
+            let e = self.lua.create_table()?;
+            e.set("namespace", namespace.clone())?;
+            e.set("id", id.clone())?;
+            e.set("win", *win)?;
+            arr.set(i + 1, e)?;
+        }
+        nx.set("_view_pending", arr)?;
+        Ok(())
+    }
+
     /// The current `nx._keymaps_version`, bumped by every `vim.keymap.set`/`del`.
     /// The server reads it once per input batch and rebuilds its tries only when
     /// it advanced — so per keystroke it walks the cached trie, never the bridge.

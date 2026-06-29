@@ -482,12 +482,25 @@ pub(crate) fn install_vim(lua: &Lua, shared: &Rc<RefCell<Shared>>) -> mlua::Resu
     let sh = shared.clone();
     view.set(
         "_create",
-        lua.create_function(move |_, (id, name, filetype): (u64, String, String)| {
-            sh.borrow_mut()
-                .view_ops
-                .push(ViewOp::Create { id, name, filetype });
-            Ok(())
-        })?,
+        lua.create_function(
+            move |_,
+                  (id, name, filetype, namespace, persist): (
+                u64,
+                String,
+                String,
+                String,
+                String,
+            )| {
+                sh.borrow_mut().view_ops.push(ViewOp::Create {
+                    id,
+                    name,
+                    filetype,
+                    namespace,
+                    persist,
+                });
+                Ok(())
+            },
+        )?,
     )?;
     let sh = shared.clone();
     view.set(
@@ -574,6 +587,14 @@ pub(crate) fn install_vim(lua: &Lua, shared: &Rc<RefCell<Shared>>) -> mlua::Resu
                 title,
                 grab,
             });
+            Ok(())
+        })?,
+    )?;
+    let sh = shared.clone();
+    view.set(
+        "_adopt",
+        lua.create_function(move |_, (id, win): (u64, u64)| {
+            sh.borrow_mut().view_ops.push(ViewOp::Adopt { id, win });
             Ok(())
         })?,
     )?;

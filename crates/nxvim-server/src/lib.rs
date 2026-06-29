@@ -2932,6 +2932,14 @@ where
     // before the lifecycle seed below, so the events fire over the final buffer.)
     host.editor.reconcile_image_preview();
 
+    // Dispatch any persisted-view restores the session reopened: the layout came back at
+    // `shada_load` (before plugins) with each persisted `nx.view` slot reserved as a
+    // placeholder; now that `init.lua` + the plugins are sourced (so their
+    // `nx.view.on_restore` handlers are registered), hand each reserved slot to its owning
+    // plugin to adopt, and collapse any slot left unclaimed. Done BEFORE the window-set
+    // seed below so the placeholder churn fires no spurious `WinNew`/`WinClosed`.
+    host.restore_persisted_views();
+
     // Startup seed: the initial buffer and the config's autocmds both exist now,
     // so fire the first buffer's lifecycle events (`BufReadPost`→`FileType`→
     // `BufEnter` for a file arg, `BufEnter` alone for the bare `[No Name]`).

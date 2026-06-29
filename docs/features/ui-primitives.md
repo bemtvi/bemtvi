@@ -136,6 +136,54 @@ v:mount({ dock = "left", size = 30 })
 | `:mount(opts)` | Show it — `{ dock = … }` / `{ split = "vsplit"\|"split" }` / `{ float = … }` / `{ tab = true }`. |
 | `:bufnr()` / `:winid()` | The backing buffer / showing window (live, from the mirror). |
 | `:line()` / `:set_cursor(n)` | Read / move the 1-based cursor line. |
+| `:place_in(win)` | Adopt a reserved restore slot (used by `nx.view.on_restore`, below). |
+
+### Persisting a view across sessions
+
+A view opts into the workspace session by passing `persist` — a stable, plugin-chosen
+string id (instance-unique within your plugin) — to `create`. The editor records only the
+`(namespace, id)` pair and the view's slot in the layout, **never its content**: the plugin
+owns what's worth saving and stores it in its own [`nx.shada.plugin()`](shada) store, keyed
+by the same id.
+
+On restart the editor reopens the layout with each persisted view's slot held by an empty
+placeholder window, then — once your plugin has loaded — calls the restorer you registered
+with `nx.view.on_restore` so you can rebuild the view and drop it into the reserved slot:
+
+```lua
+-- Save side: create with a persist id, and stash whatever you need to rebuild it.
+local function open_tree(state)
+  local v = nx.view.create({ name = "Files", filetype = "nxfiles", persist = "main" })
+  v:set_lines(render(state))
+  v:on_select(...)
+  -- The plugin owns the content; persist just enough to rebuild it.
+  nx.shada.plugin():set("view:main", state)
+  -- Clean up the stored state if the user closes the view for good.
+  v:on_close(function() nx.shada.plugin():delete("view:main") end)
+  v:mount({ dock = "left", size = 30 })
+  return v
+end
+
+-- Restore side: register once at load. `id` is the persist string; `place(view)` drops a
+-- freshly-built view into the reserved slot instead of opening a new window.
+nx.view.on_restore(function(id, place)
+  local state = nx.shada.plugin():get("view:" .. id)
+  local v = nx.view.create({ name = "Files", filetype = "nxfiles", persist = id })
+  v:set_lines(render(state))
+  v:on_select(...)
+  place(v)
+end)
+```
+
+The owning namespace is derived from your plugin's location, exactly like
+`nx.shada.plugin()` — so two plugins can both use `persist = "main"` without colliding, and
+a persisted view whose plugin is no longer installed has its slot quietly collapsed on
+restore. From a context that attributes to no plugin (a bare `:lua`, an RPC, a test), pass
+an explicit `namespace = "…"` to both `create` and `on_restore`, the same escape hatch
+`nx.shada.plugin(namespace)` takes. **GC:** the editor never deletes your stored state —
+delete it yourself when the view is closed for good (the `on_close` line above). A view
+created without `persist` is ephemeral: it does not ride the session. Session persistence is
+a native-build feature (the web build does not restore layouts yet).
 
 ## Widgets — ready-made prompts
 

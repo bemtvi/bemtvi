@@ -450,8 +450,17 @@ impl EditHost {
         // file-tree "mount, then return focus to the editor" idiom.
         for op in self.lua.take_view_ops() {
             match op {
-                ViewOp::Create { id, name, filetype } => {
-                    self.editor.create_view(id, name, filetype);
+                ViewOp::Create {
+                    id,
+                    name,
+                    filetype,
+                    namespace,
+                    persist,
+                } => {
+                    // A non-empty `persist` opts the view into cross-session restore, keyed
+                    // by `(namespace, persist)`; empty ⇒ ephemeral (the pair is `None`).
+                    let persist = (!persist.is_empty()).then_some((namespace, persist));
+                    self.editor.create_view(id, name, filetype, persist);
                     // Install the view's buffer-local `<CR>` → on_select map now, off
                     // the synchronously-known backing bufnr (the view is read-only and
                     // may never be the current buffer for a `FileType` event, so it
@@ -508,6 +517,7 @@ impl EditHost {
                         Err(e) => self.editor.echo(format!("nx.view:mount{{ float }}: {e}")),
                     }
                 }
+                ViewOp::Adopt { id, win } => self.editor.adopt_view(id, WindowId(win)),
                 ViewOp::Unmount { id } => self.editor.unmount_view(id),
                 ViewOp::Focus { id } => self.editor.focus_view(id),
                 ViewOp::Destroy { id } => self.editor.destroy_view(id),
@@ -2011,6 +2021,12 @@ impl EditHost {
         // backing buffer) and `:line()` read the current buffer number / cursor line
         // without a server round-trip. Cheap (one entry per open view, usually zero).
         let _ = self.lua.set_view_mirror(&self.editor.view_mirror());
+        // The plugin views a session restore reserved a slot for but no plugin has
+        // adopted yet (`nx.view.pending_restores()` / the `on_restore` dispatch). Usually
+        // empty (only just after a restore that carried persisted views).
+        let _ = self
+            .lua
+            .set_view_pending(&self.editor.view_pending_restores());
         // Global options, mirrored so `vim.o` reads the core's current value (the
         // default until set, and values set via the `:set` ex path). Cheap (the
         // five search flags, showtabline/laststatus, statusline/tabline/guifont,

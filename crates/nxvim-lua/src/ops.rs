@@ -89,12 +89,18 @@ pub enum LayerOp {
 /// content / mount / lifecycle signals cross the bridge.
 #[derive(Clone, Debug)]
 pub enum ViewOp {
-    /// `nx.view.create{ name, filetype }` — register view `id` and mint its backing
-    /// read-only buffer (`filetype` drives treesitter / decoration; empty ⇒ none).
+    /// `nx.view.create{ name, filetype, persist?, namespace? }` — register view `id` and
+    /// mint its backing read-only buffer (`filetype` drives treesitter / decoration;
+    /// empty ⇒ none). `persist` is the plugin-chosen stable id the view opts into
+    /// cross-session restore with (empty ⇒ ephemeral, not persisted); `namespace` is its
+    /// core-resolved owning plugin (empty when `persist` is empty). Core round-trips the
+    /// `(namespace, persist)` pair through the workspace session.
     Create {
         id: u64,
         name: String,
         filetype: String,
+        namespace: String,
+        persist: String,
     },
     /// `v:set_lines(lines)` — replace view `id`'s content wholesale.
     SetLines { id: u64, lines: Vec<String> },
@@ -143,6 +149,10 @@ pub enum ViewOp {
         title: Option<String>,
         grab: bool,
     },
+    /// `v:place_in(win)` — adopt the reserved restore slot `win` (a session restore's
+    /// placeholder window for a persisted view) for view `id`: retarget that window to the
+    /// view's backing buffer. The `place(view)` step of an `nx.view.on_restore` handler.
+    Adopt { id: u64, win: u64 },
     /// `v:unmount()` — remove view `id` from view, keeping the backing buffer alive.
     Unmount { id: u64 },
     /// `v:focus()` — move focus to the window showing view `id`.

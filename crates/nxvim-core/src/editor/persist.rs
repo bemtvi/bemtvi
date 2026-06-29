@@ -192,6 +192,26 @@ pub struct SessionWindow {
     /// buffer, marked modified so it round-trips on the next exit.
     #[cfg_attr(feature = "serde", serde(default))]
     pub unnamed_contents: Option<Vec<String>>,
+    /// For a leaf showing a **persisted plugin view** (`nx.view.create{ persist = }`): the
+    /// `(namespace, id)` the plugin chose. `path` is empty and `unnamed_contents` is `None`
+    /// — core stores only this opaque pair, never the view's content. On restore the slot
+    /// is reserved as an empty placeholder window and the owning plugin (resolved by
+    /// `namespace`) adopts it and rebuilds its content. `None` for an ordinary leaf.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub view_persist: Option<(String, String)>,
+}
+
+/// A plugin view whose slot a session restore reserved (a `view_persist` leaf): the owning
+/// plugin `namespace`, the plugin-chosen `id`, and the reserved placeholder `win`. Accrued
+/// on [`Editor::restore_session`] into [`Editor::pending_view_restores`], mirrored to Lua
+/// as `nx._view_pending`, and drained by the `nx.view.on_restore` dispatch once plugins
+/// load — the owning plugin recreates its view and adopts `win`. Any entry left unclaimed
+/// is an orphan (its plugin is gone) and its slot collapses.
+#[derive(Debug, Clone)]
+pub struct PendingViewRestore {
+    pub namespace: String,
+    pub id: String,
+    pub win: crate::WindowId,
 }
 
 /// One persisted numbered mark `'0`–`'9`: the digit, the file, and the position.
@@ -526,12 +546,23 @@ impl Editor {
         match node {
             LayoutNode::Leaf(wid) => {
                 let w = tree.try_get(*wid)?;
+                // A plugin view that opted into persistence (`nx.view.create{ persist = }`)
+                // is captured by its `(namespace, id)` regardless of the read-only refusal
+                // below — that's the one sanctioned way a `read_only` buffer rides the
+                // session. Independent of `'workspacepersistunnamed'`.
+                let view_persist = self
+                    .buffers
+                    .get(w.buffer)
+                    .buffer
+                    .view_id()
+                    .and_then(|vid| self.view_persist_of(vid));
                 let path = self.buffer_name(w.buffer).unwrap_or_default();
-                // A pathless leaf is dropped unless it's a modified ordinary `[No Name]`
-                // buffer we're allowed to persist (`'workspacepersistunnamed'`): then we
-                // capture its lines instead of a path. Non-ordinary buffers (terminals,
-                // views, images — `read_only`) are never captured this way.
-                let unnamed_contents = if path.is_empty() {
+                // A pathless leaf is dropped unless it's a persisted view (handled above) OR
+                // a modified ordinary `[No Name]` buffer we're allowed to persist
+                // (`'workspacepersistunnamed'`): then we capture its lines instead of a path.
+                // Other non-ordinary buffers (terminals, images, unpersisted views —
+                // `read_only`) are never captured this way.
+                let unnamed_contents = if path.is_empty() && view_persist.is_none() {
                     let buf = &self.buffers.get(w.buffer).buffer;
                     if !allow_unnamed || buf.read_only() || !buf.modified {
                         return None;
@@ -552,6 +583,7 @@ impl Editor {
                     top,
                     active: active == Some(*wid),
                     unnamed_contents,
+                    view_persist,
                 }))
             }
             LayoutNode::Split {
@@ -641,6 +673,16 @@ impl Editor {
         }
     }
 
+    /// The pending persisted-view slots as `(namespace, id, win)` for the Lua mirror
+    /// (`nx._view_pending`, read by `nx.view.pending_restores()` and the `on_restore`
+    /// dispatch). Empty outside the boot-restore window.
+    pub fn view_pending_restores(&self) -> Vec<(String, String, u64)> {
+        self.pending_view_restores
+            .iter()
+            .map(|p| (p.namespace.clone(), p.id.clone(), p.win.0))
+            .collect()
+    }
+
     /// Reopen each saved [`SessionDock`] at its side + size, rebuilding any file-backed
     /// content (a plugin dock reopens empty for its owner to repopulate) and re-hiding a
     /// dock that was parked.
@@ -723,6 +765,30 @@ impl Editor {
         use super::windows::{LayoutNode, WindowTree};
         match layout {
             SessionLayout::Leaf(w) => {
+                // A persisted plugin view: reserve the slot with an empty placeholder buffer
+                // and record a pending claim keyed by `(namespace, id)`. The owning plugin
+                // adopts the reserved window after it loads (`nx.view.on_restore`); an
+                // unclaimed slot collapses at the end of the restore tick. We never recreate
+                // the view here — its content, callbacks, and keymaps all live in the plugin.
+                if let Some((namespace, vid)) = &w.view_persist {
+                    let buf = self.create_buffer();
+                    let id = self.alloc_window_id();
+                    let cursor = Cursor {
+                        line: w.line,
+                        col: w.col,
+                    };
+                    let win = WindowTree::tiled_window(buf, cursor, w.top, 0);
+                    windows.insert(id, win);
+                    if w.active {
+                        *active = Some(id);
+                    }
+                    self.pending_view_restores.push(PendingViewRestore {
+                        namespace: namespace.clone(),
+                        id: vid.clone(),
+                        win: id,
+                    });
+                    return Some(LayoutNode::Leaf(id));
+                }
                 let buf = self.build_leaf_buffer(w)?;
                 let id = self.alloc_window_id();
                 let cursor = Cursor {

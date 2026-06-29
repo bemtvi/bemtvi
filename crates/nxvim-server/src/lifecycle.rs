@@ -691,6 +691,32 @@ impl EditHost {
         self.sync_buffer_watches();
     }
 
+    /// Dispatch the persisted `nx.view` slots a session restore reserved. The layout came
+    /// back at `shada_load` (before plugins) with each persisted view's slot held by a
+    /// placeholder window and recorded in the editor's pending list; now that the config and
+    /// plugins are sourced (their `nx.view.on_restore` handlers registered), refresh the
+    /// `nx._view_pending` mirror, run the Lua dispatch (each owning plugin recreates its view
+    /// and adopts its reserved window), drain the queued view ops, then collapse any slot
+    /// left unclaimed (the plugin is gone / registered no handler). A no-op when nothing was
+    /// reserved, so an ordinary launch pays nothing.
+    pub(crate) fn restore_persisted_views(&mut self) {
+        if self.editor.view_pending_restores().is_empty() {
+            return;
+        }
+        let _ = self
+            .lua
+            .set_view_pending(&self.editor.view_pending_restores());
+        if let Err(e) = self.lua.exec("nx._run_view_restores()") {
+            self.editor
+                .echo(format!("E5117: Error restoring plugin views: {e}"));
+        }
+        self.apply_lua_effects();
+        self.run_pending();
+        // Whatever no plugin adopted is an orphan; close its reserved slot.
+        self.editor.collapse_unclaimed_view_restores();
+        self.apply_lua_effects();
+    }
+
     /// Fire the startup `VimEnter` autocmd — the "editor has finished starting"
     /// hook — then drain its effects. Run once, right after `v:vim_did_enter` is
     /// set: `init.lua` and the package `plugin/` scripts have all run, so a handler

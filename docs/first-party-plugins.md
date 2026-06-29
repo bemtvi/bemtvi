@@ -29,7 +29,6 @@ worth studying it for.
 | [**nxvim-keys-helper**](https://github.com/davidrios/nxvim-keys-helper) | Live popup of the keys that can follow what you've typed (a which-key) | Reacting to partial key sequences with `nx.on_key_pending`, building a floating popup with `nx.component`, debounce (`nx.utils.debounce`), and width-aware layout (`nx.str.displaywidth`). |
 | [**nxvim-dap**](https://github.com/davidrios/nxvim-dap) | Debug Adapter Protocol client (sibling of `nvim-dap`) | The richest example: duplex transports (`nx.process`, `nx.socket`) carrying a framed RPC protocol, signs, a sidebar dock and REPL over `nx.view` / `nx.ui`, and cross-tick scheduling (`nx.on_next_tick`). |
 | [**nxvim-diff**](https://github.com/davidrios/nxvim-diff) | Meld-style side-by-side diff viewer | Linked windows with synchronized scroll (`nx.win.set_topline` / `set_cursor`), shelling out via `nx.run`, and per-line highlight decorations. |
-| [**nxvim-workspace**](https://github.com/davidrios/nxvim-workspace) | VSCode-style project workspaces | Committable project-local JSON config (`nx.json`), layout save/restore through `nx.shada`, async file IO (`nx.fs`), and `nx.user_command`. |
 | [**nxvim-help**](https://github.com/davidrios/nxvim-help) | Vim-style `:help` | A navigable read-only `nx.view` surface, runtime-file lookup (`nx.runtime_file`), tag jumping, and syntax highlighting — built entirely on `nx.*` with no core changes. |
 
 Every one ships its own integration-test suite (most run a real server over the

@@ -66,6 +66,7 @@ IMPORTS = [
     ("docs/edit-host-split.md", "features/edit-host-split.md"),
     ("docs/architecture.md", "architecture/overview.md"),
     ("docs/nx-model.md", "plugins/nx-model.md"),
+    ("docs/first-party-plugins.md", "plugins/first-party.md"),
     ("docs/plugin-authoring.md", "plugins/authoring.md"),
     ("docs/async.md", "plugins/async.md"),
     ("docs/plugin-testing.md", "plugins/testing.md"),

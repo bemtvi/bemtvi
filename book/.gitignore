@@ -8,6 +8,7 @@ src/features/
 src/architecture/
 src/appendix/
 src/plugins/nx-model.md
+src/plugins/first-party.md
 src/plugins/authoring.md
 src/plugins/async.md
 src/plugins/testing.md

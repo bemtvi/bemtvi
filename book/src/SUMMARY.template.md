@@ -36,6 +36,7 @@
 # Plugin Development
 
 - [Overview](plugins/overview.md)
+- [First-party plugins](plugins/first-party.md)
 - [The nx.* model](plugins/nx-model.md)
 - [Writing plugins](plugins/authoring.md)
 - [Async & promises](plugins/async.md)

@@ -19,7 +19,7 @@ Requires the [GitHub CLI](https://cli.github.com). Verify an archive against the
 attestation GitHub stores for it:
 
 ```sh
-gh attestation verify nxvim-0.2.0-x86_64-linux-musl.tar.gz --repo davidrios/nxvim
+gh attestation verify nxvim-0.2.0-x86_64-linux.tar.gz --repo davidrios/nxvim
 ```
 
 A successful run confirms the artifact was produced by the `nxvim` release

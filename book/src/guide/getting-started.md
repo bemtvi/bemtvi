@@ -5,10 +5,11 @@
 Grab a binary from the
 [**latest release**](https://github.com/davidrios/nxvim/releases/latest) (or the
 rolling [`edge`](https://github.com/davidrios/nxvim/releases/tag/edge) build from
-`main`). Binaries are published for Linux (`x86_64`/`aarch64`, musl-static),
-macOS (`x86_64`/`aarch64`, signed & notarized `.pkg`/`.dmg`), and Windows
-(`x86_64`). Each release ships both the terminal editor (`nxvim`) and the native
-GUI (`nxvim-gui`).
+`main`). Binaries are published for Linux (`x86_64`/`aarch64`, glibc), macOS
+(`x86_64`/`aarch64`, signed & notarized `.pkg`/`.dmg`), and Windows (`x86_64`).
+Each release ships both the terminal editor (`nxvim`) and the native GUI
+(`nxvim-gui`); on Linux the GUI is published as a single-file, desktop-integrated
+`.AppImage` (alongside a plain `.tar.gz`).
 
 Then run it on a file (the argument is optional):
 

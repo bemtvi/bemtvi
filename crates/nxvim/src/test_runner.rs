@@ -98,6 +98,7 @@ fn spawn_server(plugin_dir: PathBuf) -> (Rpc, UnboundedReceiver<Incoming>) {
             host_proc: None,
             host_fs_async: None,
             lsp_transport: None,
+            host_term: None,
             fs_jobs: None,
             // Hermetic: never offer the built-in recommended set / first-run welcome,
             // and leave command-line completion off (a plugin's own setup{} can opt in).

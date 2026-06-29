@@ -122,7 +122,9 @@ use std::time::{Duration, UNIX_EPOCH};
 
 use rmpv::Value;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, DuplexStream, ReadBuf};
-use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
+use tokio::sync::mpsc::{
+    channel, unbounded_channel, Receiver, Sender, UnboundedReceiver, UnboundedSender,
+};
 use tokio::sync::oneshot;
 
 use nxvim_core::{DirEntry, FileStat, HostFs};
@@ -495,6 +497,161 @@ async fn run_demux(mut incoming: UnboundedReceiver<Incoming>, inflight: Inflight
 fn forward(inflight: &Inflight, id: u64, ev: DaemonEvent) {
     if let Some(tx) = inflight.lock().unwrap().get(&id) {
         let _ = tx.send(ev);
+    }
+}
+
+/// Backpressure window for the remote terminal's inbound `term_data`/`term_exit` →
+/// [`TermEvent`] channel — the edit-host twin of the daemon-side bound (and of the
+/// local [`TerminalManager`](crate::terminal::native::TerminalManager)'s `TERM_EVENT_CAP`).
+/// When the run loop's `on_term_events` arm falls behind, the demux's `send().await`
+/// blocks, the demux stops draining the wire, and the daemon's backpressured `term_data`
+/// stream throttles the child — so a flood never queues without bound.
+const REMOTE_TERM_EVENT_CAP: usize = 4;
+
+/// The edit-host-side **terminal** seam: forwards `:terminal` ops to the daemon's PTY host
+/// over the Term leg and surfaces the child's output/exit back as [`TermEvent`]s — the
+/// native twin of the wasm `HostEffects::term_*` path. The daemon runs the real PTY
+/// ([`serve_term_daemon_on`]); this seam only ships `term_open`/`term_write`/`term_resize`/
+/// `term_kill` notifications and decodes the `term_data`/`term_exit` pushes into the *same*
+/// `TermEvent` channel the local [`TerminalManager`](crate::terminal::native::TerminalManager)
+/// feeds, so the run loop's [`on_term_events`](crate::EditHost::on_term_events) arm consumes a
+/// remote terminal identically to a local one. Without this, a daemon session would open a PTY
+/// on the *local* machine (the bug `docs/plans/2026-06-28-native-remote-terminal.md` fixes).
+pub struct RemoteHostTerm {
+    /// The Term-leg `Rpc` outbound ops are sent on (its own QUIC stream, or the shared
+    /// single-stream `Rpc` on ssh/stdio).
+    rpc: Rpc,
+    /// The decoded inbound events, handed to the run loop once via [`take_events`]. `None`
+    /// thereafter (a second take would strand the producer).
+    ///
+    /// [`take_events`]: RemoteHostTerm::take_events
+    events: Option<Receiver<crate::terminal::native::TermEvent>>,
+}
+
+impl RemoteHostTerm {
+    /// Connect to a daemon over `reader`/`writer` (a standalone duplex / ssh stdio) and
+    /// spawn the demux that decodes its `term_data`/`term_exit` pushes. Mirrors
+    /// [`RemoteHostProc::connect`]; the multiplexer path builds the seam over a shared
+    /// group link via [`with_link`](Self::with_link) instead.
+    pub fn connect<R, W>(reader: R, writer: W) -> RemoteHostTerm
+    where
+        R: AsyncRead + Unpin + Send + 'static,
+        W: AsyncWrite + Unpin + Send + 'static,
+    {
+        let (rpc, incoming) = connect(reader, writer);
+        Self::with_link(rpc, incoming)
+    }
+
+    /// Build the seam over an already-connected Term group link (the
+    /// [`serve_daemon_link_inner`] / QUIC multiplexer path): `rpc` sends ops, `incoming`
+    /// is the Term group's demuxed inbound stream the term demux drains.
+    pub(crate) fn with_link(rpc: Rpc, incoming: UnboundedReceiver<Incoming>) -> RemoteHostTerm {
+        let (event_tx, event_rx) =
+            channel::<crate::terminal::native::TermEvent>(REMOTE_TERM_EVENT_CAP);
+        tokio::spawn(run_term_demux(incoming, event_tx));
+        RemoteHostTerm {
+            rpc,
+            events: Some(event_rx),
+        }
+    }
+
+    /// Take the inbound `TermEvent` receiver (once) — the run loop selects on it in place
+    /// of the local terminal actor's. Returns `None` if already taken.
+    pub(crate) fn take_events(&mut self) -> Option<Receiver<crate::terminal::native::TermEvent>> {
+        self.events.take()
+    }
+
+    /// Ship a `term_open` for `buf`: run `argv` (empty ⇒ the daemon's default shell) in
+    /// `cwd` (the daemon-side absolute dir), sized `rows`×`cols`.
+    pub(crate) fn open(
+        &self,
+        buf: u64,
+        argv: Vec<String>,
+        cwd: Option<String>,
+        rows: u16,
+        cols: u16,
+    ) {
+        self.rpc.notify(
+            TERM_OPEN,
+            vec![
+                Value::from(buf),
+                Value::Array(argv.into_iter().map(Value::from).collect()),
+                cwd.map(Value::from).unwrap_or(Value::Nil),
+                Value::from(rows),
+                Value::from(cols),
+            ],
+        );
+    }
+
+    /// Ship input bytes to `buf`'s daemon PTY (a forwarded keystroke / paste).
+    pub(crate) fn write(&self, buf: u64, bytes: Vec<u8>) {
+        self.rpc
+            .notify(TERM_WRITE, vec![Value::from(buf), Value::Binary(bytes)]);
+    }
+
+    /// Ship a resize so the daemon child re-lays-out.
+    pub(crate) fn resize(&self, buf: u64, rows: u16, cols: u16) {
+        self.rpc.notify(
+            TERM_RESIZE,
+            vec![Value::from(buf), Value::from(rows), Value::from(cols)],
+        );
+    }
+
+    /// Ship a kill: terminate `buf`'s daemon child and forget the session.
+    pub(crate) fn kill(&self, buf: u64) {
+        self.rpc.notify(TERM_KILL, vec![Value::from(buf)]);
+    }
+}
+
+/// Pump the daemon's `term_data`/`term_exit` pushes off the Term wire and decode each into a
+/// [`TermEvent`](crate::terminal::native::TermEvent) on the bounded channel the run loop drains
+/// — the symmetric twin of the daemon-side forwarder in [`serve_term_daemon_on`]. Ends when the
+/// wire EOFs (the channel sender drops, so the run loop's terminal arm sees no more events) or
+/// the run loop drops its receiver (no consumer left).
+async fn run_term_demux(
+    mut incoming: UnboundedReceiver<Incoming>,
+    event_tx: Sender<crate::terminal::native::TermEvent>,
+) {
+    use crate::terminal::native::TermEvent;
+    use nxvim_core::BufferId;
+
+    while let Some(msg) = incoming.recv().await {
+        let Incoming::Notification { method, params } = msg else {
+            continue; // the daemon speaks only notifications; ignore stray requests
+        };
+        let ev = match method.as_str() {
+            TERM_DATA => {
+                let buf = params.first().and_then(Value::as_u64);
+                let bytes = params.get(1).and_then(|v| match v {
+                    Value::Binary(b) => Some(b.clone()),
+                    Value::String(s) => Some(s.as_bytes().to_vec()),
+                    _ => None,
+                });
+                match (buf, bytes) {
+                    (Some(buf), Some(bytes)) => TermEvent::Data {
+                        buf: BufferId(buf),
+                        bytes,
+                    },
+                    _ => continue,
+                }
+            }
+            TERM_EXIT => match params.first().and_then(Value::as_u64) {
+                Some(buf) => TermEvent::Exit {
+                    buf: BufferId(buf),
+                    code: params
+                        .get(1)
+                        .and_then(Value::as_i64)
+                        .map(|c| c as i32)
+                        .unwrap_or(-1),
+                },
+                None => continue,
+            },
+            _ => continue,
+        };
+        // The run loop dropped its receiver (shutdown) — nothing left to feed.
+        if event_tx.send(ev).await.is_err() {
+            break;
+        }
     }
 }
 
@@ -2618,6 +2775,10 @@ pub struct DaemonClient {
     pub host_proc: RemoteHostProc,
     /// The streaming-pipe LSP seam (`lsp_*`).
     pub lsp_transport: RemoteLspTransport,
+    /// The terminal seam (`term_*`): `:terminal` opens a PTY on the **daemon** and streams
+    /// its output back, so a remote session's terminal runs where the files are — not on the
+    /// local machine.
+    pub host_term: RemoteHostTerm,
     /// The async `nx.fs` seam (`luafs_op`) — whole-job, decomposed daemon-side. The
     /// event-loop actor `await`s it off the editor tick (no thread park).
     pub fs_jobs: RemoteFsJobs,
@@ -2688,7 +2849,7 @@ pub(crate) struct GroupLink {
 
 /// Drive a **single-stream** link (ssh/stdio, the in-process test duplex): every leg group
 /// shares the one `(rpc, incoming)`, so split the one inbound notification stream into the
-/// three logical groups by method and hand them to the same [`serve_daemon_link_inner`] the
+/// four logical groups by method and hand them to the same [`serve_daemon_link_inner`] the
 /// multi-stream (QUIC) path uses, with the one `Rpc` cloned across the groups. The
 /// transport-agnostic seam construction lives in `serve_daemon_link_inner`.
 pub(crate) async fn serve_daemon_link(
@@ -2699,7 +2860,8 @@ pub(crate) async fn serve_daemon_link(
     let (ctrl_tx, ctrl_rx) = unbounded_channel::<Incoming>();
     let (proc_tx, proc_rx) = unbounded_channel::<Incoming>();
     let (lsp_tx, lsp_rx) = unbounded_channel::<Incoming>();
-    tokio::spawn(split_incoming(incoming, ctrl_tx, proc_tx, lsp_tx));
+    let (term_tx, term_rx) = unbounded_channel::<Incoming>();
+    tokio::spawn(split_incoming(incoming, ctrl_tx, proc_tx, lsp_tx, term_tx));
     serve_daemon_link_inner(
         GroupLink {
             rpc: rpc.clone(),
@@ -2710,23 +2872,28 @@ pub(crate) async fn serve_daemon_link(
             incoming: proc_rx,
         },
         GroupLink {
-            rpc,
+            rpc: rpc.clone(),
             incoming: lsp_rx,
+        },
+        GroupLink {
+            rpc,
+            incoming: term_rx,
         },
         client_tx,
     )
     .await;
 }
 
-/// Fan a single-stream link's one inbound stream into the three per-group channels by
-/// method (the symmetric twin of the daemon-side `DaemonLegs` demux). A `term_*` push (no
-/// native consumer) or an unknown method drops. On EOF the three senders drop, closing the
-/// per-group demuxes downstream.
+/// Fan a single-stream link's one inbound stream into the four per-group channels by
+/// method (the symmetric twin of the daemon-side `DaemonLegs` demux). An unknown method
+/// drops (the peer is the same build). On EOF the four senders drop, closing the per-group
+/// demuxes downstream.
 async fn split_incoming(
     mut incoming: UnboundedReceiver<Incoming>,
     ctrl_tx: UnboundedSender<Incoming>,
     proc_tx: UnboundedSender<Incoming>,
     lsp_tx: UnboundedSender<Incoming>,
+    term_tx: UnboundedSender<Incoming>,
 ) {
     while let Some(msg) = incoming.recv().await {
         let method = match &msg {
@@ -2738,25 +2905,28 @@ async fn split_incoming(
             Some(LegGroup::Control) => &ctrl_tx,
             Some(LegGroup::Proc) => &proc_tx,
             Some(LegGroup::Lsp) => &lsp_tx,
-            // Term has no native client consumer; an unknown method drops (same build).
-            Some(LegGroup::Term) | None => continue,
+            Some(LegGroup::Term) => &term_tx,
+            None => continue, // unknown method (same build) — drop
         };
         let _ = tx.send(msg);
     }
 }
 
-/// Build the five edit-host seams over the three per-group links, hand the
+/// Build the six edit-host seams over the four per-group links, hand the
 /// [`DaemonClient`] out on `client_tx`, then drive the link — the [`run_fs_jobs`] job
 /// server (the `nx.fs` `luafs_op` leg, on the **Control** group) plus one demux per group —
 /// until the daemon hangs up. The transport-agnostic heart shared by [`serve_daemon_link`]
 /// (single-stream) and the QUIC connector ([`crate::quic::connect_quic`], one real stream
 /// per group). Each seam issues on its group's `Rpc`: `host_fs`/`fs_jobs`/`config` on
-/// Control, `host_proc` on Proc, `lsp_transport` on Lsp — so a flood on one group's stream
-/// can't head-of-line-block another. Runs on the dedicated link thread's runtime.
+/// Control, `host_proc` on Proc, `lsp_transport` on Lsp, `host_term` on Term — so a flood on
+/// one group's stream can't head-of-line-block another. The Term seam owns its own demux
+/// (spawned in [`RemoteHostTerm::with_link`]); the other three are joined below. Runs on the
+/// dedicated link thread's runtime.
 pub(crate) async fn serve_daemon_link_inner(
     control: GroupLink,
     proc: GroupLink,
     lsp: GroupLink,
+    term: GroupLink,
     client_tx: std::sync::mpsc::Sender<DaemonClient>,
 ) {
     // Notification-routed legs: shared state each group's demux forwards into.
@@ -2784,6 +2954,9 @@ pub(crate) async fn serve_daemon_link_inner(
             inflight: lsp_inflight.clone(),
             next_id: AtomicU64::new(1),
         },
+        // The Term seam owns its own demux (spawned in `with_link`), draining the term
+        // group's inbound stream into the `TermEvent` channel the run loop selects on.
+        host_term: RemoteHostTerm::with_link(term.rpc, term.incoming),
         fs_jobs: RemoteFsJobs { req_tx: fs_jobs_tx },
         // The config leg shares the Control `Rpc`; its `config_bundle` responses are
         // msgid-routed inside `Rpc` (never an `Incoming`), so the Control demux just drains

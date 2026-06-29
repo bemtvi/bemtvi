@@ -361,6 +361,7 @@ async fn server_init(
         host_proc,
         host_fs_async,
         lsp_transport,
+        host_term,
         fs_jobs,
     ) = match client {
         None => {
@@ -371,7 +372,17 @@ async fn server_init(
                 Some(ns) => nxvim_server::workspace_shada(Some(ns)),
                 None => nxvim_server::default_shada(),
             };
-            (config_dir, runtimepath, store, None, None, None, None, None)
+            (
+                config_dir,
+                runtimepath,
+                store,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
         }
         Some(c) => {
             // `Remote` materializes the daemon's config + plugins locally; `Local`
@@ -407,6 +418,8 @@ async fn server_init(
                 Some(Box::new(c.host_proc) as _),
                 Some(Box::new(c.host_fs) as _),
                 Some(Box::new(c.lsp_transport) as _),
+                // `:terminal` opens its PTY on the daemon (where the files are), not locally.
+                Some(c.host_term),
                 Some(c.fs_jobs),
             )
         }
@@ -440,6 +453,7 @@ async fn server_init(
         host_proc,
         host_fs_async,
         lsp_transport,
+        host_term,
         fs_jobs,
         // The GUI is the interactive editor — offer the built-in default recommended
         // set on a fresh setup (a config's own recommend{} still overrides it), and

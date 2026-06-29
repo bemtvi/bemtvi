@@ -117,7 +117,7 @@ pub use daemon::{
     serve_dproc_daemon_on, serve_fs_daemon, serve_fs_daemon_on, serve_lsp_daemon,
     serve_lsp_daemon_on, serve_luafs_daemon, serve_luafs_daemon_on, serve_proc_daemon_on,
     serve_sock_daemon_on, serve_term_daemon_on, DaemonClient, FsRead, HostFsAsync, RemoteConfig,
-    RemoteFsJobs, RemoteHostFs, RemoteHostProc, RemoteLspTransport, WatchEvent,
+    RemoteFsJobs, RemoteHostFs, RemoteHostProc, RemoteHostTerm, RemoteLspTransport, WatchEvent,
 };
 /// Materialize a fetched bundle onto the per-process cache resolved from the environment
 /// (`$XDG_CACHE_HOME`/`$HOME`) — the native edit-host's entry point.
@@ -297,6 +297,16 @@ pub struct ServerInit {
     /// so it rides [`ServerInit`] onto the server's own thread, where it is rebuilt into
     /// the shared `Arc<dyn LspTransport>` the [`LspManager`] holds.
     pub lsp_transport: Option<Box<dyn nxvim_lsp::LspTransport + Send>>,
+    /// The terminal seam a daemon session's `:terminal` opens its PTY through. `None` (the
+    /// default) opens a **local** PTY via the [`TerminalManager`](crate::terminal::native);
+    /// the edit-host split injects a daemon-backed [`RemoteHostTerm`] here so the terminal
+    /// child runs on the **remote** where the files are, streaming its output back over the
+    /// Term leg while editing stays local — the native twin of the wasm `term_*` path. When
+    /// set, [`NativeEffects`](crate::edithost::NativeEffects) routes `:terminal` ops to it
+    /// (and the run loop selects on its `TermEvent` stream) instead of the local actor.
+    /// Native-only (the wasm build owns its own terminal transport).
+    #[cfg(feature = "native")]
+    pub host_term: Option<RemoteHostTerm>,
     /// The async `nx.fs` daemon seam. `None` (the default) runs `nx.fs` ops on the local
     /// disk (the event-loop actor's [`StdLuaFs`](nxvim_lua::StdLuaFs) on its blocking pool);
     /// the edit-host split injects a daemon-backed [`RemoteFsJobs`] so a plugin reads the
@@ -2747,7 +2757,17 @@ where
     // The terminal actor: owns the local PTYs `:terminal` spawns, streaming their
     // output back on `term_events`. Lazily started on the first open (the `EventLoop`
     // pattern), so a session with no terminal spawns nothing.
-    let (terminals, mut term_events) = terminal::native::TerminalManager::new();
+    let (terminals, local_term_events) = terminal::native::TerminalManager::new();
+    // A daemon session routes `:terminal` to the remote instead: take its inbound
+    // `TermEvent` stream (decoded from the daemon's `term_data`/`term_exit` pushes) so the
+    // run loop's `on_term_events` arm consumes a remote terminal exactly like a local one,
+    // and hand the command seam to `NativeEffects` below. A local session keeps the local
+    // actor's stream. Either way the arm's type is one `Receiver<TermEvent>`.
+    let mut host_term = init.host_term;
+    let mut term_events = match host_term.as_mut().and_then(|t| t.take_events()) {
+        Some(remote_events) => remote_events,
+        None => local_term_events,
+    };
     // `:TSInstall` runs the fetch+compile off-thread (`spawn_blocking`); results
     // come back here and are applied on the one server thread.
     let (install_tx, mut install_events) = unbounded_channel::<InstallOutcome>();
@@ -2799,6 +2819,7 @@ where
             lsp,
             install_tx,
             terminals,
+            host_term,
         )),
     );
     // The two capabilities `new` defaults but the native session injects: the

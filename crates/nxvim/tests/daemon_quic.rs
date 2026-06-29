@@ -98,17 +98,19 @@ async fn await_lines(rpc: &nxvim_rpc::Rpc, want: &[&str]) -> Vec<String> {
     buf_lines(rpc, 0).await
 }
 
-/// The legs split across **separate** QUIC streams (Control / Proc / Lsp) all carry real
-/// traffic, not just the connection setup the token-gate test proves. Drives a full
+/// The legs split across **separate** QUIC streams (Control / Proc / Lsp / Term) all carry
+/// real traffic, not just the connection setup the token-gate test proves. Drives a full
 /// edit-host `Server` whose seams come from `connect_quic`, against a real `serve_quic`
-/// daemon backed by the `Std*` impls — so a file read/write crosses the **Control** stream
-/// and a spawned process crosses the **Proc** stream, each over its own QUIC bidi.
+/// daemon backed by the `Std*` impls — so a file read/write crosses the **Control** stream,
+/// a spawned process crosses the **Proc** stream, and a `:terminal` PTY crosses the **Term**
+/// stream, each over its own QUIC bidi.
 ///
-/// Faithful, not a no-op: the daemon's `StdHostFs` reads/writes a real temp file and its
-/// `StdHostProc` runs a real `sh`, and the asserted bytes can only have come back across
-/// the wire. (This proves the multi-stream transport *carries* each leg; head-of-line
-/// isolation between the streams is QUIC's per-stream flow control, architectural — a
-/// deterministic latency assertion would be inherently timing-flaky, so it's omitted.)
+/// Faithful, not a no-op: the daemon's `StdHostFs` reads/writes a real temp file, its
+/// `StdHostProc` runs a real `sh`, and the daemon's terminal engine spawns a real PTY whose
+/// echo crosses back — the asserted bytes can only have come back across the wire. (This
+/// proves the multi-stream transport *carries* each leg; head-of-line isolation between the
+/// streams is QUIC's per-stream flow control, architectural — a deterministic latency
+/// assertion would be inherently timing-flaky, so it's omitted.)
 #[tokio::test]
 async fn native_legs_round_trip_over_separate_quic_streams() {
     let info = spawn_quic_daemon();
@@ -125,6 +127,7 @@ async fn native_legs_round_trip_over_separate_quic_streams() {
         host_proc: Some(Box::new(client.host_proc)),
         host_fs_async: Some(Box::new(client.host_fs)),
         lsp_transport: Some(Box::new(client.lsp_transport)),
+        host_term: Some(client.host_term),
         fs_jobs: Some(client.fs_jobs),
         ..Default::default()
     };
@@ -174,5 +177,25 @@ async fn native_legs_round_trip_over_separate_quic_streams() {
     assert_eq!(
         on_disk, "alpha\nbeta\nnew line\n",
         "the save must push the edited bytes back over the Control QUIC stream to disk"
+    );
+
+    // Term stream — a real PTY runs on the daemon: open an interactive shell, type a marker
+    // `echo`, and the child's echoed output streams back over the *separate* Term QUIC stream.
+    feed(&rpc, ":terminal sh<CR>");
+    feed(&rpc, "echo QUICTERMOK<CR>");
+    let mut term_text = String::new();
+    for _ in 0..100 {
+        // The marker may wrap across the terminal's fixed-width rows, so match the lines
+        // concatenated. The echoed *command* contains `QUICTERMOK` too, but either way it can
+        // only be here if the PTY's bytes crossed the Term stream.
+        term_text = buf_lines(&rpc, 0).await.concat();
+        if term_text.contains("QUICTERMOK") {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(
+        term_text.contains("QUICTERMOK"),
+        "a `:terminal` child's output must return over the Term QUIC stream, got: {term_text:?}"
     );
 }

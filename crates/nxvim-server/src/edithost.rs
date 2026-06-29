@@ -80,6 +80,13 @@ pub trait HostEffects {
     #[cfg(feature = "native")]
     fn terminal_command(&mut self, cmd: crate::terminal::native::TermCommand);
 
+    /// Whether `:terminal` ops route to a **remote** daemon PTY (a daemon session) rather
+    /// than a local one. The native `dispatch_terminal_ops` uses it to resolve the open's
+    /// default cwd against the daemon's working dir ([`DirState`](crate::cwd)) instead of the
+    /// local process cwd. `false` for a local/bare session. Native only.
+    #[cfg(feature = "native")]
+    fn has_remote_term(&self) -> bool;
+
     /// Off-tick fs — fetch a buffer's bytes over the daemon read leg (a startup /
     /// `:edit` open). Fire-and-forget: the fetched bytes (or a read error) return
     /// *inbound* on the run loop's open arm, not here. A silent no-op when no daemon fs
@@ -361,6 +368,12 @@ pub struct NativeEffects {
     /// `Resize` / `Kill` at. Its inbound output/exit stream (`term_events`) is owned by
     /// the run loop's `select!`, not here (the [`EventLoop`] pattern).
     terminals: crate::terminal::native::TerminalManager,
+    /// The **remote** terminal seam for a daemon session: when `Some`, `:terminal` ops are
+    /// forwarded to the daemon's PTY host (over the Term leg) instead of the local
+    /// [`terminals`](Self::terminals) actor, so the child runs where the files are. `None` for
+    /// a local/bare session, which spawns a local PTY. The matching inbound `TermEvent` stream
+    /// is selected on by the run loop (the local actor's stream is left idle).
+    host_term: Option<crate::daemon::RemoteHostTerm>,
 }
 
 #[cfg(feature = "native")]
@@ -379,6 +392,7 @@ impl NativeEffects {
         lsp: LspManager,
         install_tx: UnboundedSender<crate::InstallOutcome>,
         terminals: crate::terminal::native::TerminalManager,
+        host_term: Option<crate::daemon::RemoteHostTerm>,
     ) -> Self {
         Self {
             rpc,
@@ -390,6 +404,7 @@ impl NativeEffects {
             lsp,
             install_tx,
             terminals,
+            host_term,
         }
     }
 }
@@ -412,8 +427,31 @@ impl HostEffects for NativeEffects {
     }
 
     fn terminal_command(&mut self, cmd: crate::terminal::native::TermCommand) {
-        // Lazily spawns the terminal actor on first use, same as `loop_command`.
-        self.terminals.send(cmd);
+        use crate::terminal::native::TermCommand;
+        // A daemon session forwards the op to the remote PTY host (the child runs where the
+        // files are); a local/bare session spawns a local PTY, lazily starting the terminal
+        // actor on first use (same as `loop_command`). Either path's output/exit returns on
+        // the one `TermEvent` stream the run loop selects on.
+        let Some(term) = &self.host_term else {
+            self.terminals.send(cmd);
+            return;
+        };
+        match cmd {
+            TermCommand::Open {
+                buf,
+                argv,
+                cwd,
+                rows,
+                cols,
+            } => term.open(buf.0, argv, cwd, rows, cols),
+            TermCommand::Write { buf, bytes } => term.write(buf.0, bytes),
+            TermCommand::Resize { buf, rows, cols } => term.resize(buf.0, rows, cols),
+            TermCommand::Kill { buf } => term.kill(buf.0),
+        }
+    }
+
+    fn has_remote_term(&self) -> bool {
+        self.host_term.is_some()
     }
 
     fn fs_fetch(&mut self, buffer: BufferId, path: String) {

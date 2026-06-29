@@ -522,6 +522,9 @@ fn main() -> Result<()> {
         // default); a daemon-backed LSP transport is injected here by the edit-host
         // split.
         lsp_transport: None,
+        // The local binary opens `:terminal` PTYs locally (the default); a daemon-backed
+        // terminal seam is injected here by the edit-host split.
+        host_term: None,
         // The local binary runs `nx.fs` against the local disk (the actor's `StdLuaFs`);
         // a daemon-backed `luafs_op` seam is injected here by the edit-host split.
         fs_jobs: None,
@@ -817,6 +820,8 @@ where
                 host_proc: Some(Box::new(client.host_proc)),
                 host_fs_async: Some(Box::new(client.host_fs)),
                 lsp_transport: Some(Box::new(client.lsp_transport)),
+                // `:terminal` opens its PTY on the daemon (where the files are), not locally.
+                host_term: Some(client.host_term),
                 fs_jobs: Some(client.fs_jobs),
                 // A daemon-backed session is still the interactive editor — offer the
                 // built-in default recommended set on first run, and enable

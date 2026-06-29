@@ -276,10 +276,9 @@ pub fn connect_quic(url: &str, cert_hash: &str, token: &str) -> Result<DaemonCli
             let _endpoint = endpoint;
             let _connection = connection;
 
-            // One `Rpc`/inbound stream per leg group (Control/Proc/Lsp — the native client
-            // never opens Term). Each rides its own QUIC stream, so a flood on one group
-            // can't head-of-line-block another.
-            let [control, proc, lsp] = streams.map(|(send, recv)| {
+            // One `Rpc`/inbound stream per leg group (Control/Proc/Lsp/Term). Each rides its
+            // own QUIC stream, so a flood on one group can't head-of-line-block another.
+            let [control, proc, lsp, term] = streams.map(|(send, recv)| {
                 let (rpc, incoming) = connect(recv, send);
                 GroupLink { rpc, incoming }
             });
@@ -287,7 +286,7 @@ pub fn connect_quic(url: &str, cert_hash: &str, token: &str) -> Result<DaemonCli
             if dial_tx.send(Ok(())).is_err() {
                 return; // caller gave up waiting
             }
-            serve_daemon_link_inner(control, proc, lsp, client_tx).await;
+            serve_daemon_link_inner(control, proc, lsp, term, client_tx).await;
         });
     });
 
@@ -300,17 +299,18 @@ pub fn connect_quic(url: &str, cert_hash: &str, token: &str) -> Result<DaemonCli
 }
 
 /// Build the client endpoint, dial `url` (pinning `cert_hash`), and open the native
-/// edit-host's three leg-group bidi streams — Control, Proc, Lsp (the native client never
-/// drives Term). Returns the endpoint + connection (the caller keeps them alive) and the
-/// stream halves per group, in that order; the edit-host **reads** that group's daemon
-/// pushes off `recv` and **writes** its requests on `send`.
+/// edit-host's four leg-group bidi streams — Control, Proc, Lsp, Term. Returns the endpoint +
+/// connection (the caller keeps them alive) and the stream halves per group, in that order;
+/// the edit-host **reads** that group's daemon pushes off `recv` and **writes** its requests
+/// on `send`. (The daemon's `accept_bi` loop serves whatever groups the client opens, keyed by
+/// each stream's leading tag byte — so adding the Term stream needs no daemon-side change.)
 async fn quic_dial(
     url: &str,
     cert_hash: Sha256Digest,
 ) -> Result<(
     Endpoint<endpoint_side::Client>,
     Connection,
-    [(SendStream, RecvStream); 3],
+    [(SendStream, RecvStream); 4],
 )> {
     let config = ClientConfig::builder()
         .with_bind_default()
@@ -328,7 +328,8 @@ async fn quic_dial(
     let control = open_group_stream(&connection, LegGroup::Control).await?;
     let proc = open_group_stream(&connection, LegGroup::Proc).await?;
     let lsp = open_group_stream(&connection, LegGroup::Lsp).await?;
-    Ok((endpoint, connection, [control, proc, lsp]))
+    let term = open_group_stream(&connection, LegGroup::Term).await?;
+    Ok((endpoint, connection, [control, proc, lsp, term]))
 }
 
 /// Open one bidi stream and write its leg-group tag as the first byte, then flush so the

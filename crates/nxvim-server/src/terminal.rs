@@ -684,13 +684,23 @@ impl EditHost {
                     // Build the emulator first so the very next redraw projects the
                     // (blank) screen at the right size, then spawn the PTY behind it.
                     self.terminal_open_emu(buf, rows, cols, scrollback);
-                    // `portable-pty` defaults a `None` cwd to `$HOME`; the shell should
-                    // instead open in the editor's working directory, so resolve it here
-                    // (the server owns process I/O — core stays pure).
+                    // A `None` cwd defaults the PTY to `$HOME`; the shell should instead
+                    // open in the editor's working directory. In a daemon session the child
+                    // runs on the *remote*, so resolve against the daemon's effective dir
+                    // ([`DirState`], which honors `:cd`/`:lcd`) — never the local process
+                    // cwd, which doesn't exist on the daemon. A local session keeps using the
+                    // local process cwd. (Core stays pure — the server owns this.)
                     let cwd = cwd.or_else(|| {
-                        std::env::current_dir()
-                            .ok()
-                            .map(|p| p.to_string_lossy().into_owned())
+                        if self.fx.has_remote_term() {
+                            let win = self.editor.current_window_id();
+                            let tab = self.editor.current_tab_id();
+                            let (_, dir) = self.dirs.effective(win, tab);
+                            Some(dir.display().to_string())
+                        } else {
+                            std::env::current_dir()
+                                .ok()
+                                .map(|p| p.to_string_lossy().into_owned())
+                        }
                     });
                     self.fx.terminal_command(native::TermCommand::Open {
                         buf,

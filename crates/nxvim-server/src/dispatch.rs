@@ -122,6 +122,9 @@ impl EditHost {
                 Ok(Value::Nil)
             }
             "nx_input" => {
+                // The user is driving now — release any restored-session focus hold so their
+                // own navigation wins from here (see `Editor::finalize_session_focus`).
+                self.editor.clear_session_focus_hold();
                 let keys = text(params.first());
                 self.input(&keys);
                 Ok(Value::from(keys.len() as u64))
@@ -131,6 +134,9 @@ impl EditHost {
             // (param 3) is ignored and the editor hit-tests the cell itself. A
             // malformed button/action/modifier is a loud error at the boundary.
             "nx_input_mouse" => {
+                // A click is the user taking over too — release the restored-focus hold so a
+                // click into (or away from) a sidebar sticks.
+                self.editor.clear_session_focus_hold();
                 let button = text(params.first());
                 let action = text(params.get(1));
                 let modifier = text(params.get(2));

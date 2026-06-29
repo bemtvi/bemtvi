@@ -2784,6 +2784,13 @@ impl EditHost {
     /// repaints. Factored out so the syntax/LSP/loop arms share one tail and no
     /// off-tick callback's deferred `vim.cmd` is left undriven.
     pub(crate) fn settle_events(&mut self, dirty: bool) {
+        // Hold a restored session's focus through startup: re-pin the layer it was quit from
+        // BEFORE this settle's repaint, so a sidebar plugin's async dock-(re)build — which
+        // can grab focus several ticks in — never shows. Cheap no-op once focus already sits
+        // where the restore wanted it; the first real key / mouse releases the hold (see
+        // `nx_input` in dispatch). Done here, the shared internal-event settle, so it covers
+        // every async source (timers, the tree's `wait_for` build, LSP, watches).
+        self.editor.finalize_session_focus();
         let had_scheduled = !self.scheduled.is_empty();
         self.run_pending();
         // An off-tick callback (a timer, a scheduled fn) may have queued

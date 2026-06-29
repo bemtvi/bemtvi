@@ -142,6 +142,15 @@ pub struct SessionState {
     /// every loaded buffer was visible. `#[serde(default)]` so an older store still loads.
     #[cfg_attr(feature = "serde", serde(default))]
     pub hidden_buffers: Vec<SessionHiddenBuffer>,
+    /// The keyword of the layer that held focus at capture: `"main"`, or a dock side
+    /// (`"left"`/`"right"`/`"top"`/`"bottom"`). The layout itself records which *window*
+    /// was active within each tab/dock, but not which *layer* the cursor sat in — so a
+    /// session quit from the main area while a dock was open used to reopen with the cursor
+    /// stranded in the dock (its plugin grabs focus as it re-adopts the dock). Restored last,
+    /// after the layout + any persisted-view adoption settle, so focus lands where you left
+    /// it. `#[serde(default)]` → an older store (or `""`) falls back to the main layer.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub focus_layer: String,
 }
 
 /// One **hidden** (loaded-but-windowless) file-backed buffer captured into the session: its
@@ -482,11 +491,16 @@ impl Editor {
         if tabs.is_empty() && docks.is_empty() && hidden_buffers.is_empty() {
             return None;
         }
+        let focus_layer = match self.focused_layer {
+            super::Layer::Main => "main".to_string(),
+            super::Layer::Dock(side) => side.keyword().to_string(),
+        };
         Some(SessionState {
             tabs,
             active_tab,
             docks,
             hidden_buffers,
+            focus_layer,
         })
     }
 
@@ -769,12 +783,64 @@ impl Editor {
             built_any = true;
             self.install_restored_tree(tree);
         }
-        // Focus the saved active tab — this leaves the editor focused on the main layer
-        // where it was, with the docks parked behind it.
+        // Focus the saved active tab — this leaves the editor focused on the main layer,
+        // with the docks parked behind it.
         let tab_ids = self.tab_ids();
         if let Some(tid) = tab_ids.get(session.active_tab.min(tab_ids.len().saturating_sub(1))) {
             self.set_current_tabpage(*tid);
         }
+        // Stash the captured focus layer to apply once the layout (and any persisted-view
+        // adoption that re-mounts a dock) has settled — see [`finalize_session_focus`]. We
+        // can't focus a dock here: it may still hold an unadopted placeholder, and we just
+        // had to land on the main layer for the tab build above.
+        if !session.focus_layer.is_empty() {
+            self.pending_session_focus = Some(session.focus_layer);
+        }
+    }
+
+    /// Whether a restored session's focus layer is still being held — the boot-restore
+    /// window is open and no user input has taken over yet (see [`finalize_session_focus`]).
+    pub fn session_focus_pending(&self) -> bool {
+        self.pending_session_focus.is_some()
+    }
+
+    /// Release the restored-focus hold: the user has acted (a key / mouse), so from here
+    /// their own focus choices win. Called on the first real user input.
+    pub fn clear_session_focus_hold(&mut self) {
+        self.pending_session_focus = None;
+    }
+
+    /// Re-assert the focus layer a session restore captured in
+    /// [`Editor::pending_session_focus`] — so a session reopens with the cursor in the layer
+    /// you left it (the main area, or a dock), undoing any focus a sidebar plugin grabbed
+    /// while (re)building its dock. **Peeks**, never clears: a file-tree's async mount can
+    /// focus its dock many ticks into startup, well past the one VimEnter point, so the hold
+    /// re-applies on every settle until the first user input releases it
+    /// ([`clear_session_focus_hold`]). A dock that didn't come back (orphaned / closed) falls
+    /// back to the main layer. A no-op once focus already sits where the restore wanted it
+    /// (or nothing was stashed); returns whether it moved focus this call.
+    pub fn finalize_session_focus(&mut self) -> bool {
+        let Some(keyword) = self.pending_session_focus.as_deref() else {
+            return false;
+        };
+        let target = if keyword == "main" {
+            super::Layer::Main
+        } else {
+            match super::DockSide::from_keyword(keyword) {
+                // A captured dock that is no longer open (orphaned view, closed) leaves
+                // focus on the main layer rather than erroring — graceful, like a vanished
+                // file's window collapsing.
+                Some(side) if self.layer_is_open(super::Layer::Dock(side)) => {
+                    super::Layer::Dock(side)
+                }
+                _ => super::Layer::Main,
+            }
+        };
+        if self.focused_layer == target {
+            return false;
+        }
+        self.switch_layer(target);
+        true
     }
 
     /// The pending persisted-view slots as `(namespace, id, win)` for the Lua mirror

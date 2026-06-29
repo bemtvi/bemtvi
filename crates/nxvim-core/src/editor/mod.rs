@@ -860,6 +860,15 @@ pub struct Editor {
     /// the `nx.view.on_restore` dispatch once plugins are sourced; survivors are orphans
     /// whose slots collapse. Empty outside the boot-restore window.
     pub(crate) pending_view_restores: Vec<self::persist::PendingViewRestore>,
+    /// The layer a restored session was quit from — the keyword captured in
+    /// [`SessionState::focus_layer`] (`"main"` or a dock side), HELD until the user first
+    /// acts. [`Editor::restore_session`] stashes it (it cannot focus a dock mid-restore: the
+    /// dock may hold an unadopted placeholder, and the tab build must run on the main layer);
+    /// [`Editor::finalize_session_focus`] re-pins it on every settle through startup, since a
+    /// sidebar plugin's async (re)build can grab its dock several ticks in — well past the
+    /// one `VimEnter` point. The first real key / mouse releases the hold
+    /// ([`Editor::clear_session_focus_hold`]). `None` once released or never set.
+    pub(crate) pending_session_focus: Option<String>,
     /// The floating selectable-list widget, when open (`nx.ui.select`; the shared
     /// picker / completion surface). Grabs input focus like the panel, but floats
     /// over the text. See [`menu`](crate::editor::MenuPlacement).
@@ -1649,6 +1658,7 @@ impl Editor {
             view_selects: Vec::new(),
             view_closes: Vec::new(),
             pending_view_restores: Vec::new(),
+            pending_session_focus: None,
             menu: None,
             menu_results: Vec::new(),
             picker_confirm_mode: menu::PickerOpenMode::default(),

@@ -350,6 +350,8 @@ async fn session_restores_a_persisted_view_in_a_dock_through_on_restore() {
             "#,
         )
         .await;
+        exec_lua(&rpc, "nx.layer.main()").await; // quit from main, so the width probe below
+                                                 // measures the main window (not the dock)
         feed(&rpc, ":qa<CR>");
         await_server_exit(incoming).await;
     }
@@ -1035,6 +1037,7 @@ async fn session_restores_open_docks() {
         let (rpc, incoming) = start_attached(init(&dir, Some(file_a.clone()), true), 80, 25).await;
         exec_lua(&rpc, "nx.shada.save_layout(true)").await;
         exec_lua(&rpc, "nx.dock.open{ side = 'left', size = 22 }").await;
+        exec_lua(&rpc, "nx.layer.main()").await; // quit from the main area (focus rides along)
         feed(&rpc, "<Esc>"); // settle a tick so the dock op drains + relayout runs
         feed(&rpc, ":qa<CR>");
         await_server_exit(incoming).await;
@@ -1048,6 +1051,98 @@ async fn session_restores_open_docks() {
         assert!(
             w < 70,
             "the restored left dock shrinks the main window (got {w})"
+        );
+    }
+}
+
+#[tokio::test]
+async fn session_restores_focus_left_in_a_dock() {
+    // The focused LAYER rides the session: quit with the cursor in a dock and the restore
+    // lands focus back in that dock, not the main area. The layout records which *window* was
+    // active within each region, but the focused-layer keyword is what says the cursor sat in
+    // the dock rather than the main editor.
+    let dir = temp_dir("session_focus_dock_store");
+    let file_a = write_temp("session_fdock_a", "txt", "a1\na2\n");
+    let file_b = write_temp("session_fdock_b", "txt", "b1\nb2\n");
+
+    {
+        let (rpc, incoming) = start_attached(init(&dir, Some(file_a.clone()), true), 80, 25).await;
+        exec_lua(&rpc, "nx.shada.save_layout(true)").await;
+        exec_lua(&rpc, "nx.dock.open{ side = 'left', size = 22 }").await; // focuses the dock
+        feed(&rpc, &format!(":edit {file_b}<CR>")); // the dock now shows file_b; focus stays
+        feed(&rpc, "<Esc>");
+        assert!(
+            current_buffer_name(&rpc).await.contains(&file_b),
+            "precondition: focus is the dock (showing file_b) at quit"
+        );
+        feed(&rpc, ":qa<CR>");
+        await_server_exit(incoming).await;
+    }
+
+    {
+        let (rpc, _incoming) = start_attached(init(&dir, None, true), 80, 25).await;
+        let name = current_buffer_name(&rpc).await;
+        assert!(
+            name.contains(&file_b),
+            "focus restored to the dock (file_b), not the main area: got {name:?}"
+        );
+    }
+}
+
+/// An `nx.view.on_restore` handler that — like a real file-tree sidebar — FOCUSES its dock as
+/// it re-adopts the reserved window. Reproduces the focus-theft that used to strand the cursor
+/// in the dock after a restore.
+const FOCUS_GRAB_RESTORE_HANDLER: &str = r#"
+nx.view.on_restore(function(id, place)
+  local v = nx.view.create{
+    name = "Tree", filetype = "nxview", persist = id, namespace = "treens",
+  }
+  v:set_lines({ "root", "  a.txt" })
+  place(v)
+  v:focus()  -- a sidebar plugin grabbing focus as it re-adopts its dock (nvim-tree-style)
+end, "treens")
+"#;
+
+#[tokio::test]
+async fn session_restores_main_focus_even_when_a_dock_plugin_grabs_it() {
+    // The reported annoyance, exactly: a left dock (a file-tree plugin's persisted view) is
+    // open but the cursor is in the MAIN editor at `:qa`. On restart the plugin re-adopts its
+    // dock and focuses it — which stranded the cursor in the dock. The captured focus layer is
+    // re-asserted AFTER the plugin restore + VimEnter, so focus lands back in the main area.
+    let dir = temp_dir("session_focus_main_grab_store");
+    let file_a = write_temp("session_fmain_a", "txt", "a1\na2\n");
+
+    {
+        let (rpc, incoming) = start_attached(init(&dir, Some(file_a.clone()), true), 80, 25).await;
+        exec_lua(&rpc, "nx.shada.save_layout(true)").await;
+        exec_lua(
+            &rpc,
+            r#"
+            local v = nx.view.create{
+              name = "Tree", filetype = "nxview", persist = "main", namespace = "treens",
+            }
+            v:set_lines({ "root", "  a.txt" })
+            v:mount{ dock = "left", size = 30 }  -- mounting focuses the dock
+            "#,
+        )
+        .await;
+        exec_lua(&rpc, "nx.layer.main()").await; // cross back to the main editor before quit
+        assert!(
+            current_buffer_name(&rpc).await.contains(&file_a),
+            "precondition: focus is the main file before quit"
+        );
+        feed(&rpc, ":qa<CR>");
+        await_server_exit(incoming).await;
+    }
+
+    {
+        let mut si = init(&dir, None, true);
+        si.client_init_lua = Some(FOCUS_GRAB_RESTORE_HANDLER.to_string());
+        let (rpc, _incoming) = start_attached(si, 80, 25).await;
+        let name = current_buffer_name(&rpc).await;
+        assert!(
+            name.contains(&file_a),
+            "focus returned to the main editor, not the dock the plugin grabbed: got {name:?}"
         );
     }
 }
@@ -1135,6 +1230,7 @@ async fn relativedocks_native_option_scales_the_dock() {
         exec_lua(&rpc, "nx.shada.save_layout(true)").await;
         exec_lua(&rpc, "nx.o.relativedocks = true").await;
         exec_lua(&rpc, "nx.dock.open{ side = 'left', size = 80 }").await;
+        exec_lua(&rpc, "nx.layer.main()").await; // measure the MAIN window after restore
         feed(&rpc, "<Esc>"); // settle a tick so the dock op drains + relayout runs
         feed(&rpc, ":qa<CR>");
         await_server_exit(incoming).await;
@@ -1241,4 +1337,73 @@ async fn qa_from_main_does_not_block_on_a_dock_unnamed_buffer() {
     )
     .await
     .expect("`:qa` from the main layer quit despite the dock's unnamed buffer");
+}
+
+/// A restore handler that focuses its dock on a DEFERRED tick — `nx.on_next_tick` (twice),
+/// past `VimEnter` — the way a real sidebar finishes its async build and focuses itself well
+/// after startup. The one-shot re-assert can't catch this; the held re-pin does.
+const DEFERRED_GRAB_RESTORE_HANDLER: &str = r#"
+nx.view.on_restore(function(id, place)
+  local v = nx.view.create{
+    name = "Tree", filetype = "nxview", persist = id, namespace = "treens",
+  }
+  v:set_lines({ "root", "  a.txt" })
+  place(v)
+  nx.on_next_tick(function()
+    nx.on_next_tick(function()
+      v:focus() -- async self-focus, several ticks into startup
+    end)
+  end)
+end, "treens")
+"#;
+
+#[tokio::test]
+async fn session_holds_main_focus_against_a_deferred_dock_grab() {
+    // The durable guarantee behind the reported annoyance: even when a sidebar plugin grabs
+    // its dock on a DEFERRED tick (after VimEnter), the restored main focus is held until the
+    // user acts — and released the moment they do.
+    let dir = temp_dir("session_deferred_grab_store");
+    let file_a = write_temp("session_defgrab_a", "txt", "a1\na2\n");
+
+    {
+        let (rpc, incoming) = start_attached(init(&dir, Some(file_a.clone()), true), 80, 25).await;
+        exec_lua(&rpc, "nx.shada.save_layout(true)").await;
+        exec_lua(
+            &rpc,
+            r#"
+            local v = nx.view.create{
+              name = "Tree", filetype = "nxview", persist = "main", namespace = "treens",
+            }
+            v:set_lines({ "root", "  a.txt" })
+            v:mount{ dock = "left", size = 30 }
+            "#,
+        )
+        .await;
+        exec_lua(&rpc, "nx.layer.main()").await;
+        feed(&rpc, ":qa<CR>");
+        await_server_exit(incoming).await;
+    }
+
+    {
+        let mut si = init(&dir, None, true);
+        si.client_init_lua = Some(DEFERRED_GRAB_RESTORE_HANDLER.to_string());
+        let (rpc, _incoming) = start_attached(si, 80, 25).await;
+        // Pump idle ticks so the deferred self-focus fires; the hold re-pins each time.
+        for _ in 0..30 {
+            rpc.request("nvim_get_mode", vec![]).await.expect("barrier");
+        }
+        assert!(
+            current_buffer_name(&rpc).await.contains(&file_a),
+            "main focus held against the deferred dock grab (no user input yet)"
+        );
+        // The user takes over: a keypress releases the hold, so an explicit cross into the
+        // dock now sticks (the focused buffer is the dock's "Tree" view, not file_a).
+        feed(&rpc, "<Esc>");
+        exec_lua(&rpc, "nx.layer.focus('left')").await;
+        let nm = current_buffer_name(&rpc).await;
+        assert!(
+            !nm.contains(&file_a),
+            "after the user acts the hold is released — focusing the dock sticks (got {nm:?})"
+        );
+    }
 }

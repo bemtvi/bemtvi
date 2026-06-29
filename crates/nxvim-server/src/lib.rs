@@ -2999,6 +2999,17 @@ where
     // Fire the VimEnter autocmd (the package manager's first-run prompt hooks it).
     host.fire_vim_enter();
 
+    // Last word on focus: re-assert the layer the restored session was quit from (`"main"`
+    // or a dock). The layout came back focused on the main layer, but a dock plugin that
+    // re-adopts its window during `restore_persisted_views` / `VimEnter` can yank focus into
+    // the dock — so a session quit from the main area would reopen with the cursor stranded
+    // there. This runs after both, so it restores where you actually left off. A no-op
+    // unless a focus layer was captured.
+    if host.editor.finalize_session_focus() {
+        host.apply_lua_effects();
+        host.run_pending();
+    }
+
     // The run loop is a thin translator over the `host` (the standalone `EditHost`): each
     // arm receives one event off a transport and hands the whole batch to an inbound-seam
     // handler (`inbound.rs`), which coalesces the channel, runs the per-event tick method,

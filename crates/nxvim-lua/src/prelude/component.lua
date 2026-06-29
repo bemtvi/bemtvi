@@ -185,25 +185,32 @@ end
 -- ----- backends: how a component's render output reaches a surface ----------------------
 
 -- The "view" backend: a focus-taking, navigable nx.view buffer. `render` -> { lines, decor }.
+--
+-- `opts.persist` (a stable id) + `opts._create_ns` (the resolved owner namespace) opt the
+-- backing view into cross-session restore — the component core threads them in for a
+-- persistent mount (see `mount_persistent`); absent, the view is ephemeral as before. The
+-- surface is NOT shown in the constructor: the core calls `show(mode)` to either mount it
+-- fresh (`mode.fresh`) or adopt a reserved restore slot (`mode.place`).
 local function view_backend(opts)
   nx.view._component_ns = nx.view._component_ns or nx.ns.create("nx.view.component")
-  local v = nx.view.create({ name = opts.name or "nx-component", filetype = opts.filetype })
-  if opts.dock then
-    v:mount({ dock = opts.dock, size = opts.size })
-  elseif opts.split then
-    v:mount({ split = opts.split })
-  else
-    v:mount({ float = opts.float or { width = 50, height = 12, grab = true } })
-  end
+  local v = nx.view.create({
+    name = opts.name or "nx-component",
+    filetype = opts.filetype,
+    persist = opts.persist, -- nil ⇒ ephemeral (the default)
+    namespace = opts._create_ns, -- explicit owner ns for the persist case; nil otherwise
+  })
 
   -- Blank the end-of-buffer `~` fillers in the component's window. A component
   -- surface (file tree / dashboard / dialog) is plugin-owned content, not an editable
   -- file, so the empty rows below it should read as blank rather than show a text
   -- buffer's tildes. Window-local (`fillchars` `eob:` → a space); set once the window
-  -- exists — its winid arrives a tick after mount via the `nx._view_win` mirror, so
-  -- wait for it across ticks. Best-effort (`:catch`): a dock/split surface could close
-  -- before its window settles. Opt out with `opts.eob = true`.
-  if not opts.eob then
+  -- exists — its winid arrives a tick after the surface shows via the `nx._view_win`
+  -- mirror, so wait for it across ticks. Best-effort (`:catch`): a dock/split surface
+  -- could close before its window settles. Opt out with `opts.eob = true`.
+  local function blank_eob()
+    if opts.eob then
+      return
+    end
     nx.wait_for(function()
       return v:winid()
     end)
@@ -213,7 +220,23 @@ local function view_backend(opts)
       :catch(function() end)
   end
 
+  -- show(mode) — put the view on screen. `mode.place` adopts a reserved restore slot (the
+  -- persisted-view path); otherwise mount fresh per the dock / split / float opts.
+  local function show(mode)
+    if mode and mode.place then
+      v:place_in(mode.place)
+    elseif opts.dock then
+      v:mount({ dock = opts.dock, size = opts.size })
+    elseif opts.split then
+      v:mount({ split = opts.split })
+    else
+      v:mount({ float = opts.float or { width = 50, height = 12, grab = true } })
+    end
+    blank_eob()
+  end
+
   return {
+    show = show,
     -- The backing buffer number arrives a tick after create/mount (the nx._view_buf mirror).
     ready = function()
       return v:bufnr() ~= nil
@@ -222,7 +245,17 @@ local function view_backend(opts)
       if type(out) ~= "table" then
         return
       end
-      v:set_lines(out.lines or out) -- accept { lines=, decor= } or a bare line list
+      -- Materialize the line list into a plain sequence before it crosses to native. A
+      -- `render` that returns reactive state directly (`{ lines = state.list }`) hands us a
+      -- reactive proxy whose elements live in a wrapped raw table — native iteration would
+      -- see it EMPTY and silently blank the view. An `ipairs` copy (the proxy honours `#` /
+      -- `__index`) sidesteps that, so returning reactive state from `render` just works.
+      local raw = out.lines or out
+      local lines = {}
+      for _, l in ipairs(raw) do
+        lines[#lines + 1] = l
+      end
+      v:set_lines(lines)
       if out.decor then
         v:set_decor(nx.view._component_ns, out.decor)
       end
@@ -311,6 +344,9 @@ local function float_backend(opts)
     title = opts.title,
   }
   local adapter = {} -- identity token for content-float ownership
+  -- A content float has no separate mount step (it appears via `apply` when the render is
+  -- non-empty), so `show` is a no-op; floats are transient and never persisted.
+  adapter.show = function() end
   adapter.ready = function()
     return true -- no backing buffer to wait on
   end
@@ -366,6 +402,37 @@ end
 
 local BACKENDS = { view = view_backend, float = float_backend }
 
+-- ----- persisted view components: the shared restore router -----------------------------
+--
+-- A persistent view component (`mount{ persist=, … }`) opts its backing view into the
+-- session, exactly like a raw `nx.view.create{ persist=}`. On a restore, core reserves the
+-- view's slot and dispatches it to that namespace's `nx.view.on_restore` handler. Since
+-- on_restore is one-handler-per-namespace, the framework registers a SINGLE router per
+-- namespace and routes the reserved `(id, place)` to the matching component's adopt fn — so
+-- many persistent components in one namespace coexist.
+nx._component_restorers = nx._component_restorers or {} -- ns -> { id -> adopt_fn }
+nx._component_router_ns = nx._component_router_ns or {} -- ns -> true (router registered)
+
+local function register_component_restorer(ns, raw_namespace, id, adopt)
+  local reg = nx._component_restorers[ns]
+  if not reg then
+    reg = {}
+    nx._component_restorers[ns] = reg
+  end
+  reg[id] = adopt
+  if not nx._component_router_ns[ns] then
+    nx._component_router_ns[ns] = true
+    -- `raw_namespace` (the user's `opts.namespace`, possibly nil) resolves to `ns` exactly
+    -- as create / shada did, so on_restore keys this router under the same ns core dispatches.
+    nx.view.on_restore(function(rid, place)
+      local fn = nx._component_restorers[ns] and nx._component_restorers[ns][rid]
+      if fn then
+        fn(place)
+      end
+    end, raw_namespace)
+  end
+end
+
 -- ----- nx.component: the generic core ---------------------------------------------------
 
 -- nx.component(def) -> { mount(opts) } — build a reactive, Vue-shaped UI component for
@@ -413,6 +480,20 @@ local BACKENDS = { view = view_backend, float = float_backend }
 -- `relative` / `border`. Render errors and setup errors are caught and surfaced via
 -- `nx.notify` rather than crashing the editor.
 --
+-- Persistence (view surface) — `mount{ persist = "<id>", … }` opts a view component into
+-- cross-session restore, the high-level form of `nx.view.create{ persist=}` +
+-- `nx.view.on_restore`. The framework resolves the owning namespace ONCE (from the
+-- mount call site, or `opts.namespace` for a no-attribution context — the same escape-hatch
+-- contract as `nx.shada.plugin()`), records only `(namespace, id)` + the view's slot in the
+-- session, and on a restart picks fresh-vs-restore for you: it adopts the reserved slot if
+-- the session reopened the view, else mounts fresh — no `on_restore` handler, no `VimEnter`
+-- fallback. The content is the component's own: `setup` reads it from `ctx.store` and a
+-- mutation saves it back. A persistent component's `ctx` gains:
+--   * `ctx.store` — `nx.shada.plugin(ns)` for the resolved owner namespace: an isolated,
+--     cross-session key/value slice. Read saved state in `setup`, write it on every change.
+--   * `ctx.namespace` — the resolved owner namespace; `ctx.persist_id` — the stable id.
+-- (`examples/view-persist/` is a runnable pinned-notes plugin built on exactly this.)
+--
 -- Example — a live-updating counter in a floating view:
 --
 -- ```lua
@@ -440,10 +521,12 @@ function nx.component(def)
     end
   end
 
-  local M = {}
-  function M.mount(opts)
-    opts = opts or {}
+  -- instantiate(opts, show_mode) — build one live instance: create the surface, show it
+  -- (mount fresh via `show_mode.fresh`, or adopt a reserved restore slot via
+  -- `show_mode.place`), then run the reactive lifecycle. Returns the instance handle.
+  local function instantiate(opts, show_mode)
     local backend = make_backend(opts)
+    backend.show(show_mode)
 
     local inst = { _closed = false, _on_close = {} }
     local state -- whatever setup returns; the render input
@@ -519,6 +602,15 @@ function nx.component(def)
         ctx[k] = val
       end
     end
+    -- Persisted-view extras: a stable per-component cross-session store + identity, keyed by
+    -- the resolved owner namespace. `mount_persistent` resolved it once at its attributing
+    -- call site and threads it here explicitly, so this `nx.shada.plugin(ns)` never has to
+    -- re-attribute off the (deferred / async) stack.
+    if opts._resolved_ns then
+      ctx.namespace = opts._resolved_ns
+      ctx.persist_id = opts.persist
+      ctx.store = nx.shada.plugin(opts._resolved_ns)
+    end
 
     -- The whole lifecycle, as one linear async flow: wait for the surface to be ready, run
     -- setup (awaiting it if async), then the first render. Subsequent renders are reactive.
@@ -538,13 +630,68 @@ function nx.component(def)
     return inst
   end
 
+  -- mount_persistent(opts) — a persistent view mount (`mount{ persist=, … }`). Resolve the
+  -- owner namespace ONCE, synchronously, at this (attributing) call site, then thread it
+  -- explicitly through every later deferred / async call (create, the store, the restore
+  -- router) so none of them re-attribute off the stack. Returns a proxy handle immediately;
+  -- the real instance is built when EITHER a session restore claims the reserved slot OR the
+  -- fresh fallback fires (whichever wins — `_real` makes `build` idempotent).
+  local function mount_persistent(opts)
+    local id = opts.persist
+    local ns = nx._resolve_namespace(opts.namespace, "nx.view.component: persist")
+    opts._resolved_ns = ns -- ctx.store / ctx.namespace key
+    opts._create_ns = ns -- explicit owner ns for nx.view.create in off-stack contexts
+
+    local proxy = { _closed = false }
+    function proxy:close()
+      if self._closed then
+        return
+      end
+      self._closed = true
+      if self._real then
+        self._real:close()
+      end
+    end
+    local function build(show_mode)
+      if proxy._real or proxy._closed then
+        return
+      end
+      proxy._real = instantiate(opts, show_mode)
+    end
+
+    -- Restore route: claim the reserved slot if this session reopened the view.
+    register_component_restorer(ns, opts.namespace, id, function(place)
+      build({ place = place })
+    end)
+    -- Fresh fallback: `nx.on_next_tick` runs AFTER boot's restore dispatch, so when no
+    -- restore claimed us, mount fresh; idempotent against the restore route via `build`.
+    nx.on_next_tick(function()
+      build({ fresh = true })
+    end)
+
+    return proxy
+  end
+
+  local M = {}
+  function M.mount(opts)
+    opts = opts or {}
+    -- A persistent mount (a stable `persist` id) is supported on the built-in view backend
+    -- only — it's the surface a session can reserve a slot for. Defer showing until a
+    -- restore or the fresh fallback claims it.
+    if opts.persist and make_backend == view_backend then
+      return mount_persistent(opts)
+    end
+    return instantiate(opts, { fresh = true })
+  end
+
   return M
 end
 
 -- nx.view.component(def) — the view-backed component (a focus-taking nx.view buffer): the
 -- common case (file tree, list, modal dialog). Sugar over `nx.component` with the view
 -- backend; `mount(opts)` takes the view surface options (name / filetype / dock / split /
--- float).
+-- float), plus `persist = "<id>"` (+ optional `namespace`) to make the view survive a
+-- restart — see the Persistence note on `nx.component` above.
 function nx.view.component(def)
   assert(type(def) == "table", "nx.view.component: pass a { setup, render } table")
   return nx.component({

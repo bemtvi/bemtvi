@@ -420,10 +420,13 @@ install dir's basename); the reserved `user` for the config root; otherwise the
 directory's **basename** (the fallback for a plugin loaded outside the manager,
 e.g. a `pack/*/start/*` directory). So a plugin gets its own slice and *cannot
 name* — and so cannot read or clobber — another plugin's. This is stronger than a
-self-chosen string, where any code could claim any namespace. (A bare `:lua` /
-RPC / test, which attributes to no plugin, may pass an explicit namespace as a
-dev escape hatch; a real sourced file passing one is a loud error.) Worked end to
-end in `examples/plugin-shada/`.
+self-chosen string, where any code could claim any namespace. (A context that
+attributes to no plugin — a bare `:lua` / RPC / test, or a deferred/async callback
+whose stack no longer carries the plugin chunk — may pass an explicit namespace as
+an escape hatch; a sourced file may pass one only if it **equals** its assigned
+namespace (a harmless self-statement a framework can rely on when it resolves the
+namespace once and threads it explicitly) — claiming a *different* one is a loud
+error.) Worked end to end in `examples/plugin-shada/`.
 
 Each namespace is capped at **1 MiB** of serialized key+value bytes, so one
 plugin can't bloat the shared store and slow every launch's recency-merge. A

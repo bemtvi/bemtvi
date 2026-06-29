@@ -185,6 +185,29 @@ delete it yourself when the view is closed for good (the `on_close` line above).
 created without `persist` is ephemeral: it does not ride the session. Session persistence is
 a native-build feature (the web build does not restore layouts yet).
 
+**The high-level way: a persistent component.** The `create` + `on_restore` + fresh-mount
+dance above is what `nx.view.component` (see [Components](#components--reactive-uis) above)
+automates. Pass `persist = "<id>"` to
+`mount` and the framework resolves the namespace once, threads it through the backing view +
+a per-component `ctx.store`, and on restart adopts the reserved slot or mounts fresh for you
+— no `on_restore` handler, no `VimEnter` fallback:
+
+```lua
+local Files = nx.view.component({
+  setup = function(ctx)
+    local s = ctx.reactive({ tree = ctx.store:get("tree") or load_tree() })
+    ctx.on_close(function() ctx.store:delete("tree") end)  -- GC is still yours
+    return s
+  end,
+  render = function(s) return { lines = render_tree(s.tree) } end,
+})
+Files.mount({ name = "Files", filetype = "nxfiles", persist = "main", dock = "left", size = 30 })
+```
+
+`ctx.store` is this component's `nx.shada.plugin()` slice; mutate it on every change and the
+sidebar comes back intact. A full runnable example is `examples/view-persist/`. Reach for the
+raw `create` / `on_restore` pair only when you need a surface the component doesn't model.
+
 ## Widgets — ready-made prompts
 
 The `nx.ui` widgets are the common interactions, prebuilt. The three input ones are

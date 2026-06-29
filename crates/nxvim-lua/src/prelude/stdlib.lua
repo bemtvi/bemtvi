@@ -179,7 +179,12 @@ end
 -- plugin loaded outside the manager. `nil` when `src` is under no runtimepath entry.
 local function assign_namespace(src)
   local best
-  for _, dir in ipairs(nx._runtime_paths()) do
+  for _, raw in ipairs(nx._runtime_paths()) do
+    -- Trim trailing separators before matching: a runtimepath entry carried in with a
+    -- trailing slash (e.g. `NXVIM_CONFIG=examples/foo/`) would otherwise compare against
+    -- `dir .. "/"` → a double-slash that never prefixes the `@<dir>/<file>` source path, so
+    -- the calling file would attribute to NO plugin and persistence calls would raise.
+    local dir = (raw:gsub("[/\\]+$", ""))
     if src == dir or src:sub(1, #dir + 1) == dir .. "/" then
       if not best or #dir > #best then
         best = dir
@@ -236,28 +241,38 @@ end
 --   for _, k in ipairs(store:keys()) do … end
 --   store:clear()
 --
--- `dev_namespace` is an escape hatch ONLY for a context whose code attributes to no
--- runtimepath entry — a bare `:lua`, an RPC `exec_lua`, a test — where the namespace
--- can't be derived, so an explicit one is required. Passing it from a real
--- plugin/config file (one that DOES attribute) is an error: the namespace there is
--- always the assigned one.
+-- `dev_namespace` is an escape hatch for a context whose code attributes to no
+-- runtimepath entry — a bare `:lua`, an RPC `exec_lua`, a test, or a deferred/async
+-- callback whose stack no longer carries the plugin chunk — where the namespace can't be
+-- derived, so an explicit one is required.
 -- `nx._resolve_namespace(dev_namespace, what)` -> the persistence namespace for the
 -- calling context, with the `dev_namespace` escape-hatch contract: it is *assigned* from
--- the caller's plugin location (its runtimepath entry); passing an explicit one from a
--- context that DOES attribute is an error (the namespace there is fixed — letting a plugin
--- name another's would break isolation); a context that attributes to nothing (a bare
--- `:lua` / RPC `exec_lua` / test / off-rtp helper) MUST pass one. Shared by
--- `nx.shada.plugin()` and `nx.view.create{ persist=, namespace= }` so the two persistence
--- surfaces obey one rule. `what` names the calling API in the errors; `error(_, 3)` points
--- the blame at the user's call to that API (1 = here, 2 = the API, 3 = its caller).
+-- the caller's plugin location (its runtimepath entry). A context that attributes to
+-- nothing (a bare `:lua` / RPC `exec_lua` / test / off-rtp helper / async callback) MUST
+-- pass one. A context that DOES attribute may pass one only if it **equals** the assigned
+-- namespace (a redundant but harmless self-statement — useful when a framework resolves
+-- the namespace once at an attributing call site and threads it explicitly through later
+-- deferred/async calls); naming a *different* namespace is an error (it would break
+-- isolation — a plugin can never name another's). Shared by `nx.shada.plugin()` and
+-- `nx.view.create{ persist=, namespace= }` so the two persistence surfaces obey one rule.
+-- `what` names the calling API in the errors; `error(_, 3)` points the blame at the user's
+-- call to that API (1 = here, 2 = the API, 3 = its caller).
 function nx._resolve_namespace(dev_namespace, what)
   -- Attribute the caller's source to its runtimepath entry. `nil` for a context with
   -- no attributable script (REPL / exec / test, or code outside every rtp entry).
   local src = caller_source()
   local assigned = src and assign_namespace(src) or nil
   if assigned then
-    if dev_namespace ~= nil then
-      error(what .. ": the namespace is assigned from the caller's location; drop it", 3)
+    if dev_namespace ~= nil and dev_namespace ~= assigned then
+      error(
+        what
+          .. ": this caller's namespace is '"
+          .. assigned
+          .. "' (assigned from its location); it cannot claim '"
+          .. tostring(dev_namespace)
+          .. "'",
+        3
+      )
     end
     return assigned
   end

@@ -947,9 +947,14 @@ async fn plugin_namespace_is_assigned_from_location() {
         local beta_x =
           as_plugin("/virt/plugins/beta/lua/b.lua", [[ return nx.shada.plugin():get("x") ]])
 
-        -- A sourced file may NOT name its own namespace (it is assigned).
+        -- A sourced file may NOT claim a DIFFERENT namespace (it would break isolation).
         local forced_ok =
           as_plugin("/virt/plugins/alpha/lua/c.lua", [[ return pcall(nx.shada.plugin, "forced") ]])
+
+        -- ...but it MAY redundantly restate its OWN assigned namespace (a framework that
+        -- resolves the ns once at an attributing site and threads it explicitly relies on this).
+        local self_ok, self_ns =
+          as_plugin("/virt/plugins/alpha/lua/d.lua", [[ return pcall(function() return nx.shada.plugin("alpha").namespace end) ]])
 
         -- The user's config root maps to the reserved `user` namespace, not its dir
         -- name. The handle exposes its assigned `.namespace`.
@@ -965,11 +970,13 @@ async fn plugin_namespace_is_assigned_from_location() {
         local managed_ns =
           as_plugin("/virt/managed/pkgdir/lua/m.lua", [[ return nx.shada.plugin().namespace ]])
 
-        return ("alpha_native=%s alpha_self=%s beta_x=%s forced_ok=%s user_ns=%s managed_ns=%s"):format(
+        return ("alpha_native=%s alpha_self=%s beta_x=%s forced_ok=%s self_ok=%s self_ns=%s user_ns=%s managed_ns=%s"):format(
           tostring(nx._shada_plugin_get("alpha", "x")),
           tostring(alpha_self),
           tostring(beta_x),
           tostring(forced_ok),
+          tostring(self_ok),
+          tostring(self_ns),
           tostring(user_ns),
           tostring(managed_ns))
         "#,
@@ -978,12 +985,38 @@ async fn plugin_namespace_is_assigned_from_location() {
     assert_eq!(
         summary.as_str(),
         Some(
-            "alpha_native=1 alpha_self=1 beta_x=nil forced_ok=false user_ns=user \
-             managed_ns=registered-name"
+            "alpha_native=1 alpha_self=1 beta_x=nil forced_ok=false self_ok=true self_ns=alpha \
+             user_ns=user managed_ns=registered-name"
         ),
         "alpha's two files share the path-derived `alpha` namespace; beta can't see it; \
-         a sourced file can't self-name; the config root maps to `user`; a \
-         manager-loaded plugin keys on its registered name"
+         a sourced file can't claim a different namespace but may restate its own; the \
+         config root maps to `user`; a manager-loaded plugin keys on its registered name"
+    );
+}
+
+#[tokio::test]
+async fn plugin_namespace_tolerates_a_trailing_slash_rtp_entry() {
+    // A runtimepath entry carried in with a TRAILING SLASH (e.g. `NXVIM_CONFIG=foo/`) must
+    // still attribute the files under it: the prefix match trims the entry first, so it does
+    // not become a never-matching `foo//`. Regression for the "this caller attributes to no
+    // plugin" error a trailing-slash launch raised.
+    let (rpc, _incoming) = start_attached(ServerInit::default(), 80, 25).await;
+    let got = exec_lua(
+        &rpc,
+        r#"
+        nx._add_rtp("/virt/slashed/")        -- registered WITH a trailing slash
+        local function as_plugin(path, body)
+          return assert(loadstring(body, "@" .. path))()
+        end
+        -- A file under it resolves to the dir's basename, not an error.
+        return as_plugin("/virt/slashed/lua/x.lua", [[ return nx.shada.plugin().namespace ]])
+        "#,
+    )
+    .await;
+    assert_eq!(
+        got.as_str(),
+        Some("slashed"),
+        "a trailing-slash rtp entry still attributes its files (basename namespace)"
     );
 }
 

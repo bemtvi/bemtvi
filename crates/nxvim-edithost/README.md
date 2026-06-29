@@ -205,17 +205,19 @@ Without them the page still runs but degrades to the slower `postMessage` transp
 **timers never fire** (`window.__nxvim.sab` reports which mode is active). The `.wasm`
 must also be served as `application/wasm` (most hosts do this by extension).
 
-- **Netlify (two sites):** the **standard editor** is wired up — `../../netlify.toml` runs
-  `netlify-build.sh` (provisions Rust + the emscripten `emcc` linker via the shared
-  `netlify-provision.sh`, runs `build.sh`, then assembles a clean static root at `_site/`:
-  `web/` + `dist/` as siblings with `_headers` + `_redirects` at the root). The **python
-  demo** is a *separate* Netlify site built by `netlify-build-demo.sh` (same toolchain →
+- **Netlify (two sites):** the **standard editor** is wired up — `../../netlify.toml` (base
+  directory = repo root) runs `netlify-build.sh` (provisions Rust + the emscripten `emcc` linker
+  via the shared `netlify-provision.sh`, runs `build.sh`, then assembles a clean static root at
+  `_site/`: `web/` + `dist/` as siblings with `_headers` + `_redirects` at the root). The
+  **python demo** is a *separate* Netlify site built by `netlify-build-demo.sh` (same toolchain →
   `build.sh` → `package-site.sh --demo` → `_site-demo/`, with Pyodide + `localHost:true`).
-  Netlify reads one `netlify.toml` per site, so configure the demo site in the dashboard —
-  Build command `bash crates/nxvim-edithost/netlify-build-demo.sh`, Publish directory
-  `crates/nxvim-edithost/_site-demo` (the env vars are in `netlify-build-demo.sh`'s header).
-  Each `_site*` root carries its own `_headers` + `_redirects`, so the demo needs no
-  `netlify.toml`.
+  Netlify resolves a `netlify.toml` relative to each site's **base directory** and file-based
+  `[build]` settings can't be overridden in the dashboard, so the demo can't share the root
+  config with blank UI build settings — the root `[build]` would win. Instead it has its own
+  `crates/nxvim-edithost/netlify.toml`; in the dashboard set the demo site's **Base directory** to
+  `crates/nxvim-edithost` (build command + publish + env come from that file — leave the UI build
+  fields blank). Each `_site*` root carries its own `_headers` + `_redirects`, so that
+  `netlify.toml` needs no `[[redirects]]`.
 - **Cloudflare Pages / any `_headers` host:** the `web/_headers` file already sets all
   three for `/*`. Publish a root with `web/` and `dist/` as siblings, `_headers` at the
   root, and `/` → `/web/` (the layout `netlify-build.sh` assembles in `_site/`).

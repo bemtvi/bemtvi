@@ -3,15 +3,13 @@
 # WebAssembly and driven in a Web Worker. Connect the repo once in the Netlify dashboard;
 # thereafter every push to the production branch runs the build below and deploys it.
 #
-# This file configures the STANDARD editor site (e.g. nxvim.netlify.app). The python demo is a
-# SEPARATE site (e.g. nxvim-demo.netlify.app) — same repo, different build. Netlify reads one
-# netlify.toml per site (from its base dir), so the demo site is configured in the dashboard,
-# not here:
-#   Base directory:    (repo root — leave blank)
-#   Build command:     bash crates/nxvim-edithost/netlify-build-demo.sh
-#   Publish directory: crates/nxvim-edithost/_site-demo
-#   Environment:       NODE_VERSION=24  RUST_VERSION=1.96.0  EMSDK_VERSION=6.0.0
-# Its publish root carries its own _headers + _redirects, so it needs no netlify.toml of its own.
+# This file configures the STANDARD editor site (e.g. nxvim.netlify.app), whose base directory
+# is the repo root. The python demo is a SEPARATE site (e.g. nxvim-demo.netlify.app) — same repo,
+# different build. Netlify resolves a netlify.toml relative to each site's *base directory*, and
+# file-based [build] settings can't be overridden from the dashboard — so the demo can't reuse a
+# blank base + UI build settings (this root [build] would win). Instead it gets its own
+# crates/nxvim-edithost/netlify.toml and sets its base directory there; see that file's header
+# for the dashboard setup.
 #
 # The build compiles to wasm via emscripten (emcc) and vendors the tree-sitter grammars,
 # then assembles a clean static publish root at crates/nxvim-edithost/_site (the page's

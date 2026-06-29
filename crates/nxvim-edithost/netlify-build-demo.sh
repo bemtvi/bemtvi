@@ -5,17 +5,19 @@
 # <file>` runs CPython in the browser with no backend.
 #
 # This is a SEPARATE Netlify site from the standard editor. The root netlify.toml configures the
-# standard site (nxvim); configure the demo site (nxvim-demo) in the Netlify dashboard with:
+# standard site (nxvim); the demo site (nxvim-demo) is configured by THIS crate's netlify.toml
+# (../netlify-edithost is the repo root; the file is crates/nxvim-edithost/netlify.toml). In the
+# Netlify dashboard, the only setting the demo site needs is:
 #
-#   Base directory:    (repo root — leave blank)
-#   Build command:     bash crates/nxvim-edithost/netlify-build-demo.sh
-#   Publish directory: crates/nxvim-edithost/_site-demo
-#   Environment:       NODE_VERSION=24  RUST_VERSION=1.96.0  EMSDK_VERSION=6.0.0
+#   Base directory:    crates/nxvim-edithost   (makes Netlify read this crate's netlify.toml,
+#                                                not the repo-root one; build command + publish
+#                                                come from there — leave them blank in the UI)
+#   Environment:       NODE_VERSION=24  RUST_VERSION=1.96.0  EMSDK_VERSION=6.0.0  (also in that toml)
 #
-# (Same toolchain env as the standard site; the script also defaults them if unset.) The
+# (Same toolchain env as the standard site; this script also defaults them if unset.) The
 # assembled _site-demo/ carries its own _headers (cross-origin isolation — required for both
-# the editor's SAB and Pyodide's interrupt) and _redirects (/ → /web/), so no per-site
-# netlify.toml is needed. See docs/plans/2026-06-23-web-python-demo.md.
+# the editor's SAB and Pyodide's interrupt) and _redirects (/ → /web/), so no [[redirects]] is
+# needed in that netlify.toml. See docs/plans/2026-06-23-web-python-demo.md.
 set -euo pipefail
 
 here="$(cd "$(dirname "$0")" && pwd)"

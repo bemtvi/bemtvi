@@ -377,6 +377,27 @@ async fn builtin_nxvim_colorscheme_loads_with_no_runtime_file() {
 }
 
 #[tokio::test]
+async fn builtin_nxvim_colorscheme_shows_eob_tildes() {
+    // The `~` end-of-buffer fillers must stay visible under the bundled scheme:
+    // `EndOfBuffer` is highlighted like `NonText` (vim's default), so its fg is
+    // the gutter colour, *not* the Normal background (which would hide them).
+    let dir = temp_dir("eob_nxvim");
+    let (rpc, mut incoming) = start_with_config(&dir, "").await;
+    let _ = redraw_after(&rpc, &mut incoming, ":colorscheme nxvim<CR>").await;
+    let eob = get_hl(&rpc, "EndOfBuffer").await;
+    assert_eq!(
+        hl_color(&eob, "fg"),
+        Some(hex("4b5263")),
+        "EndOfBuffer should be the gutter colour (like NonText), so `~` fillers are visible"
+    );
+    assert_ne!(
+        hl_color(&eob, "fg"),
+        Some(hex("282c34")),
+        "EndOfBuffer fg must not equal the Normal background, or the `~` fillers vanish"
+    );
+}
+
+#[tokio::test]
 async fn user_colors_file_overrides_the_builtin_scheme() {
     // A `colors/nxvim.lua` on the runtimepath shadows the bundled scheme — the
     // runtimepath is searched first, the built-in is only the fallback.

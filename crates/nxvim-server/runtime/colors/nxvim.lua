@@ -43,7 +43,9 @@ hl(0, "Search",       { fg = p.bg, bg = p.yellow })
 hl(0, "IncSearch",    { fg = p.bg, bg = p.orange })
 hl(0, "CurSearch",    { fg = p.bg, bg = p.orange })
 hl(0, "StatusLine",   { fg = p.fg, bg = p.bg_dark })
-hl(0, "EndOfBuffer",  { fg = p.bg })
+-- `~` end-of-buffer fillers, highlighted like NonText (vim's default) so they
+-- stay visible — using the Normal bg here would blend them into the background.
+hl(0, "EndOfBuffer",  { fg = p.gutter })
 hl(0, "SignColumn",   { bg = p.bg })
 hl(0, "ColorColumn",  { bg = p.cursor_line })
 hl(0, "MatchParen",   { fg = p.cyan, bold = true })

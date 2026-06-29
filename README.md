@@ -30,7 +30,7 @@ prerelease built from `main`). Binaries are published for five targets:
 
 | OS      | Terminal editor (`nxvim`)       | GUI (`nxvim-gui`)                |
 | ------- | ------------------------------- | -------------------------------- |
-| Linux   | `x86_64` / `aarch64` (`.tar.gz`, musl-static) | `x86_64` / `aarch64` (`.tar.gz` or `.AppImage`) |
+| Linux   | `x86_64` / `aarch64` (`.tar.gz`, glibc ≥ 2.17) | `x86_64` / `aarch64` (`.tar.gz` or `.AppImage`) |
 | macOS   | `x86_64` / `aarch64` (`.pkg`, signed & notarized) | `x86_64` / `aarch64` (`.dmg`)   |
 | Windows | `x86_64` (`.zip`)               | `x86_64` (`.zip`)                |
 

@@ -1059,6 +1059,19 @@ pub(crate) mod native {
         if let Some(dir) = cwd {
             builder.cwd(dir);
         }
+        // Advertise a terminal type describing nxvim's own vt100 emulator (which projects
+        // indexed AND 24-bit `Rgb` color), overriding whatever `TERM` nxvim inherited. This
+        // matters most in a daemon session: the `--daemon` is launched over ssh *without a
+        // PTY*, so it has no usable `TERM` to pass down — leaving it makes ncurses apps fail
+        // (`less`: "I need something more specific") and disables color (`ls --color` shows
+        // none). A fixed `xterm-256color` + `COLORTERM=truecolor` keeps the child consistent
+        // with nxvim's truecolor-first rendering and works whether the PTY is local or on the
+        // daemon (this `open_pty` serves both). A child that needs a different `TERM` can set
+        // it in its own shell. (Future: have the client advertise its display's real color
+        // depth so a low-color terminal degrades the child too — for now nxvim assumes
+        // truecolor everywhere, as its own UI already does.)
+        builder.env("TERM", "xterm-256color");
+        builder.env("COLORTERM", "truecolor");
         let child = pair.slave.spawn_command(builder)?;
         // Drop the slave handle so the child is the only writer to the pty — once it
         // exits, the master read returns EOF and the reader thread ends.

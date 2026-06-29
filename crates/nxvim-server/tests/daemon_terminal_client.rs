@@ -112,3 +112,11 @@ async fn terminal_input_round_trips_to_the_daemon_child() {
          {lines:?}"
     );
 }
+
+// The remote terminal child's `TERM`/`COLORTERM` (so ncurses pagers work and color is
+// enabled even though the daemon has no usable `TERM` of its own) is set by the shared
+// `open_pty` — the *daemon's* copy of it — not carried over the wire (`term_open` ships only
+// argv/cwd/rows/cols). It is therefore covered rigorously by
+// `terminal::terminal_advertises_its_emulator_term_over_a_bogus_ambient_one`, which forces a
+// bogus ambient `TERM` (an end-to-end daemon test can't, since the daemon shares the test
+// process's inherited environment).

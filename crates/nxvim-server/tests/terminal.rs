@@ -486,6 +486,35 @@ async fn terminal_inherits_the_parent_environment() {
     .await;
 }
 
+/// `:terminal` advertises a `TERM`/`COLORTERM` that describe **nxvim's own vt100 emulator**
+/// — not whatever the editor happened to inherit. nxvim renders the child into its own
+/// emulator (256-color + 24-bit `Rgb`), so the child must be told that, regardless of the
+/// ambient `TERM`. This matters most in a daemon session launched over ssh *without a PTY*,
+/// where the daemon has **no** `TERM` at all: ncurses apps then fail (`less`: "I need
+/// something more specific") and color is disabled. The same `open_pty` serves local and
+/// daemon, so forcing a bogus ambient `TERM` here proves the override for both. A child that
+/// truly needs a different `TERM` can still set it in its own shell.
+#[tokio::test]
+async fn terminal_advertises_its_emulator_term_over_a_bogus_ambient_one() {
+    let _guard = serial_lock().lock().await;
+    // SAFETY: terminal tests hold `serial_lock`, so no other test in this binary races
+    // this process-global mutation. Reproduce the daemon-over-ssh environment: a useless
+    // `TERM` and no `COLORTERM`.
+    std::env::set_var("TERM", "unknown");
+    std::env::remove_var("COLORTERM");
+    let (rpc, _incoming) = start().await;
+
+    // `env` prints every variable as `KEY=value`; the child must see nxvim's values, not
+    // the bogus `unknown` / absent ones it would have inherited.
+    command(&rpc, "terminal env").await;
+    wait_lines(
+        &rpc,
+        "the child to see nxvim's emulator TERM/COLORTERM",
+        |ls| has_line(ls, "TERM=xterm-256color") && has_line(ls, "COLORTERM=truecolor"),
+    )
+    .await;
+}
+
 /// `:terminal` starts the child in the editor's working directory, not `$HOME`.
 /// `portable-pty` defaults a `None` cwd to the home directory, so without the
 /// server filling in the process cwd the shell would open in the wrong place.

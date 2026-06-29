@@ -12,7 +12,8 @@ use nxvim_rpc::{Incoming, Rpc};
 use nxvim_server::ServerInit;
 use nxvim_test_harness::{
     attach, command, cursor, drain_to_latest_redraw, exec_lua, feed, lines, map_get, mode,
-    serial_lock, spawn, start_attached, temp_dir, window0_field, write_temp, TestClock,
+    serial_lock, spawn, start_attached, temp_dir, wait_redraw, window0_field, write_temp,
+    TestClock,
 };
 use rmpv::Value;
 use tokio::sync::mpsc::UnboundedReceiver;
@@ -115,6 +116,67 @@ async fn terminal_echoes_input_and_reports_exit() {
         mode(&rpc).await,
         "n",
         "should leave terminal mode when the child exits"
+    );
+}
+
+/// The first window's rendered viewport lines (`windows[0].lines`) from a redraw
+/// map — what the user actually sees on screen, after scrolling, not the raw
+/// buffer.
+fn viewport_lines(map: &[(Value, Value)]) -> Vec<String> {
+    let Some(Value::Map(win)) = map_get(map, "windows").and_then(|w| w.as_array()?.first()) else {
+        return Vec::new();
+    };
+    map_get(win, "lines")
+        .and_then(Value::as_array)
+        .map(|a| {
+            a.iter()
+                .map(|l| l.as_str().unwrap_or("").trim_end().to_string())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// A full-screen app entering the **alternate screen** must fill the window from the
+/// top, even when the terminal has already scrolled. The alternate screen drops the
+/// scrollback, so the buffer suddenly shrinks to the live screen's height; a stale
+/// `top` (scrolled down for the prior, taller output) would then sit past the new
+/// end of the buffer, and the live screen would render as a single line floating over
+/// a field of `~` — the user-visible "less thinks the screen has just one line" bug.
+/// The PTY is sized to the window, so the live screen always *is* the last
+/// `text_height` buffer lines; terminal-job mode must pin the viewport there.
+#[tokio::test]
+async fn alternate_screen_fills_the_window_after_scrolling() {
+    let _guard = serial_lock().lock().await;
+    let (rpc, mut incoming) = start().await;
+
+    // Scroll the main grid with 60 lines, then switch to the alternate screen and
+    // draw a full page: a marker at home (`ALTTOP`) and one on the last row
+    // (`ALTBOT`, via a row index that clamps to the bottom), leaving the cursor at
+    // the bottom — exactly where `less` parks it on its status line. `\027` is Lua's
+    // *decimal* escape for ESC (0x1b); `\033` would be byte 33, a literal `!`.
+    let script = r#"nx.terminal.open{ cmd = {'sh','-c',
+        'i=0; while [ $i -lt 60 ]; do i=$((i+1)); echo main$i; done; '
+        .. 'printf "\027[?1049h\027[HALTTOP\027[99;1HALTBOT"; sleep 30'} }"#;
+    exec_lua(&rpc, script).await;
+
+    // Wait until the alternate-screen page has rendered into the viewport.
+    let map = wait_redraw(&mut incoming, |m| {
+        viewport_lines(m).iter().any(|l| l == "ALTBOT")
+    })
+    .await;
+
+    let vp = viewport_lines(&map);
+    assert_eq!(
+        vp.first().map(String::as_str),
+        Some("ALTTOP"),
+        "the alternate screen's top line should sit at the top of the window, not be \
+         scrolled off; full viewport: {vp:?}",
+    );
+    // And the page is not a lone line over a sea of end-of-buffer markers.
+    let tildes = vp.iter().filter(|l| l.as_str() == "~").count();
+    assert_eq!(
+        tildes, 0,
+        "the live screen should fill the window — no `~` past-end rows; viewport: {vp:?}",
     );
 }
 

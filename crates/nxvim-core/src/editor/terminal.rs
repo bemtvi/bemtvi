@@ -231,6 +231,19 @@ impl Editor {
                 self.cursor.line = line;
                 self.cursor.col = col;
                 self.clamp_cursor();
+                // The PTY is sized to the window, so the child's live screen always *is*
+                // the last `text_height` lines of the buffer; pin the viewport there so it
+                // fills the window from the bottom. `ensure_visible` alone only keeps the
+                // cursor on screen, which misbehaves when the buffer *shrinks*: a full-screen
+                // app entering the alternate screen drops the scrollback, and a `top` left
+                // scrolled down for the prior (taller) output would then sit past the new end
+                // — rendering the live screen as a single line over a field of `~`. Re-pinning
+                // every frame keeps the live screen aligned regardless of how the buffer grew
+                // or shrank since the last projection.
+                self.top = self
+                    .buffer()
+                    .line_count()
+                    .saturating_sub(self.text_height());
                 self.ensure_visible();
             }
         }

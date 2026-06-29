@@ -153,6 +153,12 @@ end
 -- current. Net buffer count is unchanged — the netrw "reuse the window, don't strand
 -- the old listing" behaviour (descend in place; opening a file destroys the listing).
 local function replace_with(cur, path)
+  -- The explorer's navigation math is absolute (an unambiguous `dir .. "/" .. name`), but
+  -- the buffer the user lands on reads better named relative to cwd — netrw's model, and
+  -- what `:edit relative/path` would have produced by hand. `:.` returns the path relative
+  -- to cwd when it lives under it, and leaves an outside path (a parent above cwd, a remote
+  -- `/virtual/...`) absolute. Relativise before escaping so the `:edit` arg is the final name.
+  path = vim.fn.fnamemodify(path, ":.")
   vim.cmd("edit " .. edit_escape(path))
   vim.cmd("bwipeout! " .. cur)
 end

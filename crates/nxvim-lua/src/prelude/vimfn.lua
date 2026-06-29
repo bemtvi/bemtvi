@@ -402,6 +402,26 @@ vim.fn.expand = nx.expand
 -- one), `:e` (extension; consecutive `:e` widen it to the last k dot-components,
 -- vim's quirk). An unsupported modifier errors loud rather than silently passing
 -- the name through. Cases match real neovim's vim.fn.fnamemodify.
+-- Lexically simplify an absolute path the way vim's `:p` does (its `simplify_filename`
+-- half): collapse `//`, drop `.` components, and resolve each `..` against the preceding
+-- component (a `..` at the root is dropped — you can't ascend past `/`). Pure string math,
+-- no symlink resolution — so `fnamemodify(".", ":p")` is the cwd (not `<cwd>/.`) and
+-- `"a/./b"`/`"a/../b"` collapse, matching neovim and keeping the result a clean prefix for
+-- the `:.` / `:~` relativisers (a stray `/.` would defeat their literal cwd-prefix match).
+local function simplify_abs(path)
+  local parts = {}
+  for comp in path:gmatch("[^/]+") do
+    if comp == ".." then
+      if #parts > 0 then
+        table.remove(parts)
+      end
+    elseif comp ~= "." then
+      parts[#parts + 1] = comp
+    end
+  end
+  return "/" .. table.concat(parts, "/")
+end
+
 nx.fname = nx.fname or {}
 function nx.fname.modify(fname, mods)
   fname = fname or ""
@@ -415,6 +435,7 @@ function nx.fname.modify(fname, mods)
       elseif fname:sub(1, 1) ~= "/" then
         fname = vim.fn.getcwd() .. "/" .. fname
       end
+      fname = simplify_abs(fname)
       i = i + 2
     elseif m == ":~" then
       local home = os.getenv("HOME") or ""

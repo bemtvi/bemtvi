@@ -16,12 +16,13 @@ automatic, per-directory, and carries its own option overrides.
 
 ## Opening a workspace
 
-Launch with `--workspace`, pointing at a directory (or the current directory if
-no target is given):
+`--workspace` takes the directory as its value (a bare `--workspace` uses the
+current directory). The positional `TARGET` is a *separate* optional file to open:
 
 ```sh
-nxvim --workspace ~/code/myproject     # open a directory as a workspace
-nxvim --workspace                      # the current directory
+nxvim --workspace ~/code/myproject          # open a directory as a workspace
+nxvim --workspace ~/code/myproject README.md  # …and open a file in it
+nxvim --workspace                           # the current directory
 ```
 
 `--workspace` does three things:
@@ -32,8 +33,9 @@ nxvim --workspace                      # the current directory
   derived one.)
 - **Enables session capture and restore** with no plugin opt-in — the layout is
   saved on exit and replayed on the next launch.
-- **Changes the working directory** to the workspace root (the
-  [`'workspacecwd'`](#the-workspacecwd-option) option, on by default).
+- **Changes the working directory** to the workspace root (by default; pass
+  [`--workspace-no-cwd`](#keeping-the-launch-directory) to keep the launch
+  directory). A relative `TARGET` file then resolves against the workspace root.
 
 The native GUI also exposes a client-side **`:workspace [dir]`** command: a bare
 `:workspace` reopens the current directory as a workspace, and `:workspace <dir>`
@@ -58,18 +60,21 @@ The quickfix and location lists are deliberately *not* part of the session
 (they are transient search results, not layout); marks and registers ride the
 ordinary shada store within the workspace's namespace.
 
-## The `'workspacecwd'` option
+## Keeping the launch directory — `--workspace-no-cwd`
 
-`'workspacecwd'` (nxvim-native, **default `true`**) controls whether a
-`--workspace` launch makes the workspace directory the process working directory
-— the editor issues a global `:cd` to the root at startup. Turn it off in your
-`init.lua` (before the first frame) to keep the launch directory:
+By default a `--workspace` launch makes the workspace directory the process
+working directory: the editor cds into the root at **boot**, before it opens any
+file or restores the session, so relative paths and the session's (relative,
+portable) buffer paths resolve against the root. Pass `--workspace-no-cwd` to keep
+the directory you launched from instead:
 
-```lua
-nx.o.workspacecwd = false      -- don't cd into the workspace root
+```sh
+nxvim --workspace ~/code/myproject --workspace-no-cwd
 ```
 
-It has no effect outside a `--workspace` session.
+The cd is a launch-time decision (a CLI flag), not a config option — there is no
+`init.lua` knob, so the working directory is settled from the first instruction.
+`--workspace-no-cwd` has no effect without `--workspace`.
 
 ## Per-workspace option overrides — `nx.wso`
 

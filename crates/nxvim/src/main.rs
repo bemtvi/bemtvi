@@ -85,8 +85,8 @@ impl ShadaOpts {
         Ok(ShadaOpts {
             namespace,
             // `--workspace` implies restore; otherwise honor the explicit flag.
-            restore: cli.restore_session || cli.workspace,
-            workspace: cli.workspace,
+            restore: cli.restore_session || cli.workspace.is_some(),
+            workspace: cli.workspace.is_some(),
             workspace_dir: workspace_dir.map(|d| d.to_string_lossy().into_owned()),
         })
     }
@@ -152,13 +152,13 @@ impl ShadaOpts {
     }
 }
 
-/// Resolve the `--workspace` directory: the positional TARGET, or the cwd when none was
-/// given, canonicalized to an absolute path. It MUST be an existing directory — a
-/// `--workspace` session is a directory session (`nxvim --workspace .`); pointing it at a
-/// file or a missing path is a loud error, not a silent fall-through. Used for a *local*
-/// session; a daemon session resolves its root from the daemon's cwd instead.
-fn resolve_workspace_dir(target: Option<&str>) -> Result<PathBuf> {
-    let raw = target.unwrap_or(".");
+/// Resolve the `--workspace DIR` value (the cwd for bare `--workspace`, via clap's
+/// `default_missing_value`), canonicalized to an absolute path. It MUST be an existing
+/// directory — a `--workspace` session is a directory session (`nxvim --workspace .`);
+/// pointing it at a file or a missing path is a loud error, not a silent fall-through. Used
+/// for a *local* session; a daemon session resolves its root from the daemon's cwd instead.
+fn resolve_workspace_dir(dir: Option<&str>) -> Result<PathBuf> {
+    let raw = dir.unwrap_or(".");
     let abs = std::fs::canonicalize(raw).map_err(|e| anyhow!("--workspace {raw:?}: {e}"))?;
     if !abs.is_dir() {
         bail!("--workspace requires a directory, but {raw:?} is not one");
@@ -352,11 +352,16 @@ struct Cli {
     #[arg(long, value_name = "CODE")]
     lua: Option<String>,
 
-    /// Open a directory as a workspace: derive a per-directory shada namespace and
-    /// save/restore the window/split/dock/buffer layout across launches (the TARGET, or
-    /// the cwd, must be a directory). An explicit --shada-namespace overrides the derived one.
-    #[arg(long)]
-    workspace: bool,
+    /// Open DIR as a workspace: cd into it, derive a per-directory shada namespace, and
+    /// save/restore the window/split/dock/buffer layout across launches (DIR must be an
+    /// existing directory; bare `--workspace` uses the cwd). The TARGET positional is a
+    /// separate optional file to open. An explicit --shada-namespace overrides the derived one.
+    #[arg(long, value_name = "DIR", num_args = 0..=1, default_missing_value = ".")]
+    workspace: Option<String>,
+
+    /// With --workspace, do NOT cd into the workspace directory (keep the launch cwd)
+    #[arg(long, requires = "workspace")]
+    workspace_no_cwd: bool,
 }
 
 fn main() -> Result<()> {
@@ -425,14 +430,15 @@ fn main() -> Result<()> {
         return run_daemon();
     }
 
-    // `--workspace`: for a *local* session, resolve the directory (the TARGET, or the cwd)
-    // to an absolute path now, so its derived shada namespace + `nx.workspace` root are
-    // known. A non-directory / missing target aborts here. A *daemon* session's workspace
-    // lives on the remote machine — its root + namespace derive from the daemon's cwd
-    // post-connect ([`ShadaOpts::resolve_remote_workspace`]), so skip the local resolve.
+    // `--workspace DIR`: for a *local* session, resolve the directory value (the cwd for
+    // bare `--workspace`) to an absolute path now, so its derived shada namespace +
+    // `nx.workspace` root are known. A non-directory / missing dir aborts here. A *daemon*
+    // session's workspace lives on the remote machine — its root + namespace derive from the
+    // daemon's cwd post-connect ([`ShadaOpts::resolve_remote_workspace`]), so skip the local
+    // resolve. The TARGET positional is a separate optional file, no longer the workspace dir.
     let is_daemon_session = cli.connect_daemon || connect_uri.is_some();
-    let workspace_dir = if cli.workspace && !is_daemon_session {
-        Some(resolve_workspace_dir(file.as_deref())?)
+    let workspace_dir = if cli.workspace.is_some() && !is_daemon_session {
+        Some(resolve_workspace_dir(cli.workspace.as_deref())?)
     } else {
         None
     };
@@ -503,6 +509,10 @@ fn main() -> Result<()> {
         // Seed the namespace + root that `nx.shada.namespace()` / `nx.workspace` report.
         shada_namespace: shada.namespace().map(str::to_owned),
         workspace_dir: shada.workspace_dir.clone(),
+        // cd into the workspace root at boot (the canonical `nxvim --workspace DIR`),
+        // unless `--workspace-no-cwd` keeps the launch cwd. Known here, before the server
+        // opens any file or restores the session — so no later reconciliation is needed.
+        workspace_cwd: cli.workspace.is_some() && !cli.workspace_no_cwd,
         runtimepath,
         // The real editor wires the host clipboard for the `"+` / `"*` registers.
         clipboard: nxvim_server::ClipboardProvider::System,
@@ -811,6 +821,9 @@ where
                 // for a workspace daemon session these are the remote-cwd-derived values.
                 shada_namespace: shada.namespace().map(str::to_owned),
                 workspace_dir: shada.workspace_dir.clone(),
+                // A daemon session's workspace cd happens on the daemon (remote cwd); the
+                // local half never cds.
+                workspace_cwd: false,
                 runtimepath: resolved.runtimepath,
                 clipboard: nxvim_server::ClipboardProvider::System,
                 mouse_clock: None,

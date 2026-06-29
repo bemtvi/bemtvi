@@ -12,9 +12,8 @@
 --     restores it on the next launch — no plugin or `nx.shada.save_layout`
 --     call needed;
 --   * it cds into the workspace directory at startup, so relative paths and
---     `:find` resolve against the project root (the `'workspacecwd'` option,
---     on by default — set `nx.o.workspacecwd = false` below to keep the cwd you
---     launched from);
+--     `:find` resolve against the project root (pass `--workspace-no-cwd` on the
+--     command line to keep the cwd you launched from instead);
 --   * it exposes the workspace root to plugins via `nx.workspace`.
 --
 -- An explicit `--shada-namespace NAME` overrides the derived namespace (the
@@ -35,8 +34,8 @@
 --   3. Relaunch the SAME command — the split comes back automatically.
 --
 -- Try `\w` any time to see whether you are in a workspace and where its root is.
--- `:pwd` reports the cwd — under `--workspace` it's the workspace root (see
--- `'workspacecwd'` above).
+-- `:pwd` reports the cwd — under `--workspace` it's the workspace root (unless you
+-- passed `--workspace-no-cwd`).
 
 vim.g.mapleader = "\\"
 

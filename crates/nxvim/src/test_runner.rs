@@ -91,6 +91,7 @@ fn spawn_server(plugin_dir: PathBuf) -> (Rpc, UnboundedReceiver<Incoming>) {
             session_save_layout: false,
             shada_namespace: None,
             workspace_dir: None,
+            workspace_cwd: false,
             runtimepath: vec![plugin_dir],
             clipboard: ClipboardProvider::Disabled,
             mouse_clock: None,

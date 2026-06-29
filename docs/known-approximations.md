@@ -81,7 +81,7 @@ only the edges that still diverge are.)
   `foldlevel`); the **buffer-local indentation** options (`tabstop` / `shiftwidth`
   / `softtabstop` / `expandtab` / `commentstring`); and a set of **nxvim-native**
   options (`scrollanim` / `scrollanimduration`, `qfdock`, `imagepreview`,
-  `workspacecwd`, `history` / `persisthistory`, `regexsyntax`, `switchbuf`,
+  `history` / `persisthistory`, `regexsyntax`, `switchbuf`,
   `laststatus` / `showtabline`, …).
   nxvim breaks with vim's defaults on indentation: `tabstop` defaults to **4**,
   with `shiftwidth=0` ("follow tabstop") and `softtabstop=-1` ("follow

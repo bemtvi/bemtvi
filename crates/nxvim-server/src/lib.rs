@@ -239,6 +239,13 @@ pub struct ServerInit {
     ///
     /// [`shada_namespace`]: Self::shada_namespace
     pub workspace_dir: Option<String>,
+    /// Whether a `--workspace` launch cds into [`workspace_dir`](Self::workspace_dir) at boot
+    /// (the canonical `nxvim --workspace DIR`; `--workspace-no-cwd` clears it). Done *before*
+    /// the editor opens any file or restores the session, so a relative startup file and the
+    /// session's relative buffer paths resolve against the workspace root with no later
+    /// reconciliation. `false` (the default) outside a local cd-ing `--workspace` launch — a
+    /// daemon session cds on the daemon instead.
+    pub workspace_cwd: bool,
     /// For a `Remote`-config daemon session: the on-daemon shada file the staged local
     /// [`shada`](Self::shada) store syncs to (Approach A — see [`prepare_remote_shada`]).
     /// `None` (the default) keeps shada purely local. When set, the edit-host uploads the
@@ -2222,6 +2229,11 @@ impl EditHost {
                     .plugin_shada_seed(plugin_shada_to_tuples(plugin_data));
                 if self.restore_session {
                     if let Some(session) = session {
+                        // The session stores buffer paths **relative to the workspace root** (a
+                        // portable shada). A `--workspace` launch has already cd'd into that
+                        // root at boot (see `run_io`), so the restore's synchronous local file
+                        // reads resolve correctly and the buffers keep their relative names (so
+                        // `:ls` reads relative in the workspace) — no path reconciliation here.
                         self.editor.restore_session(session);
                     }
                 }
@@ -2607,6 +2619,21 @@ where
 {
     let (rpc, mut incoming) = connect(reader, writer);
 
+    // A `--workspace DIR` launch cds into the workspace root **now**, at boot — before the
+    // editor opens the startup file, seeds its `DirState`, or restores the session. Because
+    // the cwd decision is a CLI flag (not the old `'workspacecwd'` Lua option, which was only
+    // known after `init.lua` and forced a late cd plus path-reconciliation hacks), the cwd is
+    // correct from the first instruction: a relative startup file and the session's relative
+    // buffer paths just resolve against the workspace root. `--workspace-no-cwd` clears the
+    // flag; a daemon session cds on the daemon, so its local half leaves this off.
+    if init.workspace_cwd {
+        if let Some(dir) = &init.workspace_dir {
+            if let Err(e) = std::env::set_current_dir(dir) {
+                eprintln!("nxvim: could not cd into workspace {dir:?}: {e}");
+            }
+        }
+    }
+
     // The editor reads/writes buffers through this fs — the local disk by default,
     // or an injected (eventually daemon-backed) backend. Rebuilt here, on the
     // server thread, into the single-threaded `Rc<dyn HostFs>` the editor holds
@@ -2933,18 +2960,6 @@ where
     // (sourced above; `shada_load` ran before it). A workspace launch whose option
     // includes `global` merges the shared global history into its rings here.
     host.init_global_history();
-
-    // A `--workspace <dir>` launch cds into the workspace root at startup (the VSCode
-    // "open folder" model), unless config turned `'workspacecwd'` off. Done AFTER
-    // `init.lua` so a config can disable it, and as a real global `:cd` so `DirChanged`
-    // fires before `VimEnter`. `workspace_dir` is the absolute, canonicalized root
-    // (`None` outside `--workspace`); for a daemon session it already equals the cwd, so
-    // the issued `:cd` is a harmless no-op.
-    if let Some(dir) = init.workspace_dir.clone() {
-        if host.editor.options.workspace_cwd {
-            host.workspace_chdir(&dir);
-        }
-    }
 
     // The startup file arg was opened (as text) at editor construction, before the
     // config above ran — so a config that turned on `'imagepreview'` couldn't affect

@@ -950,6 +950,33 @@ async fn vim_fn_fnamemodify_resolves_against_cwd() {
 }
 
 #[tokio::test]
+async fn vim_fn_fnamemodify_p_simplifies_dot_and_dotdot() {
+    let (rpc, _incoming) = start(None).await;
+    // `:p` lexically simplifies `.`, `..`, and `//` after making the name absolute (vim's
+    // `simplify_filename`), so the result is a clean prefix the `:.`/`:~` relativisers can
+    // match — a stray `/.` (e.g. from `:p` of `.`) would otherwise survive into every
+    // explorer-opened path and defeat the statusline's `:~:.` (the reported bug).
+    let out = exec_lua(
+        &rpc,
+        r#"local cwd = vim.fn.getcwd()
+           local f = vim.fn.fnamemodify
+           return table.concat({
+             f(".", ":p") == cwd and "dot-ok" or ("dot-bad:" .. f(".", ":p")),
+             f("a/./b.txt", ":p") == cwd .. "/a/b.txt" and "mid-ok" or ("mid-bad:" .. f("a/./b.txt", ":p")),
+             f("a/../b.txt", ":p") == cwd .. "/b.txt" and "up-ok" or ("up-bad:" .. f("a/../b.txt", ":p")),
+             f("/x/y/./z", ":p") == "/x/y/z" and "abs-ok" or ("abs-bad:" .. f("/x/y/./z", ":p")),
+             -- the round-trip that broke relativisation: `:p` then `:.` is the bare tail.
+             f(f(".", ":p") .. "/sample.txt", ":.") == "sample.txt" and "rt-ok" or "rt-bad",
+           }, "\n")"#,
+    )
+    .await;
+    assert_eq!(
+        out.as_str().unwrap(),
+        "dot-ok\nmid-ok\nup-ok\nabs-ok\nrt-ok"
+    );
+}
+
+#[tokio::test]
 async fn vim_fn_fnamemodify_unsupported_modifier_errors_loud() {
     let (rpc, _incoming) = start(None).await;
     // A modifier with no implementation (`:s///`) raises (named), per the

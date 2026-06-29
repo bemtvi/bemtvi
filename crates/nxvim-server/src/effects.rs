@@ -2068,7 +2068,6 @@ impl EditHost {
             relative_docks: go.relative_docks,
             equalalways: go.equalalways,
             workspace_persist_unnamed: go.workspace_persist_unnamed,
-            workspace_cwd: go.workspace_cwd,
         });
         // The per-workspace option overrides currently in effect, mirrored so `nx.wso`
         // reads the core's overlay (including overrides restored from the workspace shada).

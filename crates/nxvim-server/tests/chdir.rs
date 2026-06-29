@@ -379,9 +379,9 @@ async fn lcd_and_tcd_fire_dirchanged_with_their_scope() {
     );
 }
 
-/// A `--workspace <dir>` launch (`ServerInit::workspace_dir` set) cds into that directory
-/// at startup, so `getcwd()` reports the workspace root with no `:cd` typed — the
-/// `'workspacecwd'` default-on behavior.
+/// A `--workspace <dir>` launch (`workspace_dir` + `workspace_cwd`) cds into that directory
+/// at boot, so `getcwd()` reports the workspace root with no `:cd` typed — the canonical
+/// `nxvim --workspace DIR`.
 #[tokio::test]
 async fn workspace_launch_cds_into_the_workspace_dir() {
     let _g = serial_lock().lock().await;
@@ -390,33 +390,33 @@ async fn workspace_launch_cds_into_the_workspace_dir() {
     let dir = temp_dir("ws-cwd");
     let init = ServerInit {
         workspace_dir: Some(dir.to_string_lossy().into_owned()),
+        workspace_cwd: true,
         ..ServerInit::default()
     };
     let (rpc, _incoming) = start_attached(init, 80, 24).await;
     assert_eq!(getcwd(&rpc).await, canon(&dir));
 }
 
-/// `nx.o.workspacecwd = false` in the config disables the startup auto-cd: the workspace
-/// launch keeps the cwd it was started from, even though `workspace_dir` is set.
+/// `--workspace-no-cwd` (`workspace_cwd = false`): the workspace launch keeps the cwd it was
+/// started from, even though `workspace_dir` is set — the cd is purely a CLI decision now,
+/// not a Lua option, so there is no init.lua override to honor.
 #[tokio::test]
-async fn workspacecwd_off_keeps_the_launch_cwd() {
+async fn workspace_no_cwd_keeps_the_launch_cwd() {
     let _g = serial_lock().lock().await;
     let cwd = CwdGuard::capture();
     let before = getcwd_raw();
 
-    let cfg = temp_dir("ws-cwd-off-cfg");
-    std::fs::write(cfg.join("init.lua"), "nx.o.workspacecwd = false\n").expect("write init.lua");
     let dir = temp_dir("ws-cwd-off");
     let init = ServerInit {
-        config_dir: Some(cfg),
         workspace_dir: Some(dir.to_string_lossy().into_owned()),
+        workspace_cwd: false,
         ..ServerInit::default()
     };
     let (rpc, _incoming) = start_attached(init, 80, 24).await;
     assert_eq!(
         getcwd(&rpc).await,
         before,
-        "workspacecwd off must not move the cwd"
+        "--workspace-no-cwd must not move the cwd"
     );
     drop(cwd);
 }

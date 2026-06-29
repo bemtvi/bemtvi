@@ -99,7 +99,7 @@ pub fn spawn_stdio_daemon_session(
 
 /// Spawn a local **workspace** session rooted at `dir`: an embedded (local-disk) session
 /// that derives a per-directory shada namespace, cds into the directory at startup
-/// (`'workspacecwd'`), and saves/restores the window/split/dock/buffer layout across
+/// (always, like the TUI's `--workspace`), and saves/restores the window/split/dock/buffer layout across
 /// launches — the GUI equivalent of the TUI's `nxvim --workspace <dir>`. **Blocking**
 /// (builds the server thread + config like every session). `dir` must be an existing
 /// directory: a non-directory / missing path is a loud `Err` (no silent fall-through),
@@ -446,6 +446,9 @@ async fn server_init(
         // (both `None` unless this is a `:workspace` session).
         shada_namespace,
         workspace_dir,
+        // A GUI `:workspace` always cds into the workspace root at boot (no `--workspace-no-cwd`
+        // equivalent), exactly like the TUI's default `--workspace DIR`.
+        workspace_cwd: workspace.is_some(),
         runtimepath,
         clipboard: ClipboardProvider::System,
         mouse_clock: None,

@@ -211,13 +211,6 @@ pub struct Options {
     /// capture by [`crate::editor::persist`]. Plugin-owned surfaces (terminals, file
     /// trees, `nx.view` widgets) are non-ordinary buffers and are never captured this way.
     pub workspace_persist_unnamed: bool,
-    /// Whether opening a directory with `--workspace` makes that directory the process
-    /// working directory at startup (`'workspacecwd'`; nxvim-native, default `true`) —
-    /// the VSCode "open folder" model, so relative paths, `:find`, and project plugins
-    /// resolve against the project root. Read once after config by the server's startup,
-    /// which issues a global `:cd` to the workspace root; a config can turn it off before
-    /// then. Has no effect outside a `--workspace` session.
-    pub workspace_cwd: bool,
 }
 
 /// A scalar value for one **global** option, the value type the per-workspace option
@@ -266,7 +259,6 @@ impl Options {
             ("relativedocks", Bool(b)) => self.relative_docks = *b,
             ("equalalways", Bool(b)) => self.equalalways = *b,
             ("workspacepersistunnamed", Bool(b)) => self.workspace_persist_unnamed = *b,
-            ("workspacecwd", Bool(b)) => self.workspace_cwd = *b,
             ("showtabline", Num(n)) => self.showtabline = *n as u8,
             ("laststatus", Num(n)) => self.laststatus = *n as u8,
             ("mousetime", Num(n)) => self.mousetime = *n as usize,
@@ -314,7 +306,6 @@ impl Options {
             "relativedocks" => Bool(self.relative_docks),
             "equalalways" => Bool(self.equalalways),
             "workspacepersistunnamed" => Bool(self.workspace_persist_unnamed),
-            "workspacecwd" => Bool(self.workspace_cwd),
             "showtabline" => Num(self.showtabline as i64),
             "laststatus" => Num(self.laststatus as i64),
             "mousetime" => Num(self.mousetime as i64),
@@ -480,8 +471,6 @@ impl Default for Options {
             equalalways: true,
             // Keep modified `[No Name]` buffers across a workspace session by default.
             workspace_persist_unnamed: true,
-            // `--workspace <dir>` cds into <dir> at startup by default.
-            workspace_cwd: true,
         }
     }
 }
@@ -1823,13 +1812,6 @@ static OPTIONS: &[OptionInfo] = {
             kind: Bool,
             scope: Global,
             doc: "Persist modified [No Name] buffers (with contents) in a workspace session.",
-        },
-        OptionInfo {
-            name: "workspacecwd",
-            abbrev: None,
-            kind: Bool,
-            scope: Global,
-            doc: "A --workspace launch cds into the workspace directory at startup.",
         },
     ]
 };

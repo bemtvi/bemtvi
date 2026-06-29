@@ -338,18 +338,6 @@ impl EditHost {
         self.apply_lua_effects();
     }
 
-    /// Make the `--workspace` directory the working directory at startup — the
-    /// `'workspacecwd'` behavior. Issued as a **global** `:cd` so it travels the exact same
-    /// path a manual `:cd` does: [`DirState`] update, the `nx._cwd` mirror, and the
-    /// `DirChanged` autocmd (so project plugins fire), including the daemon off-tick leg
-    /// (where the directory already *is* the cwd, so the move is a harmless no-op). Called
-    /// once from `run_server` after config, so a config can turn `'workspacecwd'` off first.
-    /// `dir` is the absolute, already-canonicalized workspace root.
-    #[cfg(feature = "native")]
-    pub(crate) fn workspace_chdir(&mut self, dir: &str) {
-        self.ex_chdir(CdScope::Global, dir);
-    }
-
     /// `:pwd` — print the working directory (the current window's effective dir) on the
     /// message line. Reads [`DirState`] rather than `std::env::current_dir()` so a daemon
     /// session reports the *daemon's* cwd, not the local process's; for a local session

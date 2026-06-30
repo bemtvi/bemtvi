@@ -100,6 +100,33 @@ VCS-status provider — so they see the **project** on the remote. Config and sh
 **local** by default, or move to the daemon with `--remote-config` (see above). (This
 is the `LuaFs` seam.)
 
+## Staying connected (auto-reconnect)
+
+Because the editor runs **local** and only the seams cross the wire, a dropped
+connection — a laptop sleeping past the QUIC idle timeout, an ssh hop dropping, a network
+blip — does **not** tear the session down. The link **re-dials underneath the seam
+handles the editor already holds**: your buffers, undo, cursor, windows and Lua state are
+untouched, and the transport beneath them reconnects. While the link is down, remote ops
+(save, read, LSP, watch, terminal) fail *loud* rather than hanging.
+
+- **Automatic.** A drop is retried a few times with backoff (≈0.5 → 8 s). On success the
+  seams rebind and editing resumes with no action from you. If the budget is spent the
+  link parks **disconnected** and tells you to run `:reconnect`.
+- **`:reconnect`** re-dials now (and resets the retry budget); **`:disconnect`** drops the
+  link on demand. Both are server-side ex-commands, so they work on the TUI too.
+- **Status** is a first-class API: `nx.daemon.status()` returns `"connected"` /
+  `"reconnecting"` / `"disconnected"` (or `nil` for a local session), and a
+  `User DaemonStatusChanged` autocmd fires on every change — so a statusline component can
+  render it (green / yellow / red). See [`examples/daemon-status`](../examples/daemon-status).
+- **On reconnect** the editor re-syncs what a *fresh* daemon doesn't know about: it
+  re-opens LSP servers, re-arms file watches, and **re-stats** open files — a file changed
+  while the link was down is detected (an unmodified buffer autoreloads; an edited one is
+  flagged as a conflict). Remote terminals/jobs do not survive a drop (the PTYs die with
+  the link) and are surfaced as exited; reopen them with `:terminal`.
+
+All three transports reconnect — ssh/stdio, QUIC, and the browser's WebTransport. (Daemon-
+*side* session survival — keeping terminals/jobs alive across a drop — is out of scope.)
+
 ## Auth & identity (QUIC)
 
 A daemon executes arbitrary processes, so an open listener is **remote code execution

@@ -57,7 +57,11 @@ native edit-host split uses, so only the transport differs:
   it runs the **daemon's** config + plugins (fetched over the wire) and keeps shada on
   the daemon, where a native client would default to local. Daemon mode also brings
   **async processes** (`vim.system` / `jobstart`), **`:terminal`**, and **LSP** over
-  the wire — the daemon's real language servers, driven from the tab.
+  the wire — the daemon's real language servers, driven from the tab. A dropped
+  WebTransport link **auto-reconnects** (the tab's editor is local, so your buffers
+  survive): the Worker re-dials underneath the seams and re-syncs them — re-opening LSP,
+  re-arming watches, and re-statting open files (a change made while disconnected is
+  caught) — exactly like the native clients. `nx.daemon.status()` reports the link state.
 
 ## Run it locally
 

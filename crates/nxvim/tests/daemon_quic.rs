@@ -1,23 +1,26 @@
 //! Black-box test of the **native daemon transport** — the WebTransport/QUIC listener
-//! (`nxvim --daemon --listen`) and the edit-host-side [`connect_quic`], the last leg of
-//! the edit-host split (see `docs/plans/2026-06-09-edit-host-and-browser-lua.md` →
-//! Phase 3q / Open Decision #2).
+//! (`nxvim --daemon --listen`) and the edit-host-side [`connect_quic_reconnecting`], the last
+//! leg of the edit-host split (see `docs/plans/2026-06-09-edit-host-and-browser-lua.md` →
+//! Phase 3q / Open Decision #2) and its auto-reconnect
+//! (`docs/plans/2026-06-29-daemon-reconnect.md` → Phase 7).
 //!
 //! This suite proves the QUIC *transport*: the listener runs in-process on its own
 //! thread + runtime — a faithful stand-in for the separate daemon process (a different
 //! runtime, reached only over a loopback QUIC socket) — and a real in-process edit-host
-//! [`Server`](nxvim_server) drives it through `connect_quic`, which pins the daemon's
-//! self-signed cert TOFU and presents the launch-minted bearer token. Because
-//! `connect_quic` / `connect_daemon` are transport-agnostic, the editor-facing behavior
-//! is identical to stdio — so the assertions that matter here are the two the stdio
-//! suite *can't* make: that the wire actually crosses a QUIC connection, and that the
-//! bearer token gates it (a bad token is rejected, the right one connects).
+//! [`Server`](nxvim_server) drives it through [`connect_quic_reconnecting`], which pins the
+//! daemon's self-signed cert TOFU and presents the launch-minted bearer token. Because the
+//! connect paths are transport-agnostic, the editor-facing behavior is identical to stdio —
+//! so the assertions that matter here are the ones the stdio suite *can't* make: that the wire
+//! actually crosses a QUIC connection, that the bearer token gates it (a bad token is
+//! rejected, the right one connects), and that a dropped QUIC link **re-dials** a fresh
+//! connection (four new streams) under the seams.
 
 use std::net::SocketAddr;
 use std::time::Duration;
 
 use nxvim_server::{
-    bind_quic_listener, connect_quic, mint_token, serve_quic, ListenerInfo, ServerInit,
+    bind_quic_listener, connect_quic_reconnecting, mint_token, serve_quic, ListenerInfo,
+    ReconnectPolicy, ServerInit,
 };
 use nxvim_test_harness::{attach, buf_lines, exec_lua, feed, spawn, temp_dir};
 
@@ -66,19 +69,30 @@ async fn the_bearer_token_gates_the_connection() {
     // idle-timing-out session) fails loudly rather than stalling the suite.
     let bad_url = url.clone();
     let bad_cert = info.cert_hash.clone();
-    let rejected =
-        tokio::task::spawn_blocking(move || connect_quic(&bad_url, &bad_cert, &"0".repeat(64)));
+    let rejected = tokio::task::spawn_blocking(move || {
+        connect_quic_reconnecting(
+            &bad_url,
+            &bad_cert,
+            &"0".repeat(64),
+            ReconnectPolicy::default(),
+        )
+    });
     let rejected = tokio::time::timeout(Duration::from_secs(10), rejected)
         .await
-        .expect("connect_quic with a bad token must return within 10s, not hang")
+        .expect("connect_quic_reconnecting with a bad token must return within 10s, not hang")
         .expect("join the connect task");
     assert!(
         rejected.is_err(),
-        "a bad bearer token must be rejected, but connect_quic succeeded"
+        "a bad bearer token must be rejected, but connect_quic_reconnecting succeeded"
     );
 
     // The correct credentials connect.
-    let accepted = connect_quic(&url, &info.cert_hash, &info.token);
+    let accepted = connect_quic_reconnecting(
+        &url,
+        &info.cert_hash,
+        &info.token,
+        ReconnectPolicy::default(),
+    );
     assert!(
         accepted.is_ok(),
         "the correct token must connect: {:?}",
@@ -121,7 +135,13 @@ async fn native_legs_round_trip_over_separate_quic_streams() {
     let file = dir.join("note.txt");
     std::fs::write(&file, "alpha\nbeta\n").expect("seed the remote file");
 
-    let client = connect_quic(&url, &info.cert_hash, &info.token).expect("connect over QUIC");
+    let (client, _handle) = connect_quic_reconnecting(
+        &url,
+        &info.cert_hash,
+        &info.token,
+        ReconnectPolicy::default(),
+    )
+    .expect("connect over QUIC");
     let init = ServerInit {
         file: Some(file.to_string_lossy().into_owned()),
         host_proc: Some(Box::new(client.host_proc)),
@@ -197,5 +217,86 @@ async fn native_legs_round_trip_over_separate_quic_streams() {
     assert!(
         term_text.contains("QUICTERMOK"),
         "a `:terminal` child's output must return over the Term QUIC stream, got: {term_text:?}"
+    );
+}
+
+/// The current `nx.daemon.status()` phase.
+async fn status(rpc: &nxvim_rpc::Rpc) -> Option<String> {
+    exec_lua(rpc, "return nx.daemon.status()")
+        .await
+        .as_str()
+        .map(str::to_string)
+}
+
+/// Poll `nx.daemon.status()` until it reads `want`.
+async fn await_status(rpc: &nxvim_rpc::Rpc, want: &str) {
+    for _ in 0..200 {
+        if status(rpc).await.as_deref() == Some(want) {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(
+        status(rpc).await.as_deref(),
+        Some(want),
+        "nx.daemon.status() never reached {want:?}"
+    );
+}
+
+/// QUIC auto-reconnect (the daemon-reconnect plan's Phase 7): the link re-dials a **fresh**
+/// QUIC connection — re-opening all four leg-group streams — under the seam handles the editor
+/// holds, so the local buffers/undo survive. Drives the real reconnecting `connect_quic_reconnecting`
+/// against a live `serve_quic` daemon: `:disconnect` parks the link, then `:reconnect` re-dials
+/// the *same* listener over a brand-new QUIC connection, and the Control stream works again —
+/// proving the multi-stream dialer (not just the initial connect) round-trips. It also proves
+/// the reconnect **re-stat**: a file changed on the remote while the link was down is detected
+/// and autoreloaded over the new connection.
+#[tokio::test]
+async fn quic_link_reconnects_and_restats_over_a_fresh_connection() {
+    let info = spawn_quic_daemon();
+    let url = dial_url(&info);
+
+    let dir = temp_dir("quic_reconnect");
+    let file = dir.join("note.txt");
+    std::fs::write(&file, "one\n").expect("seed the remote file");
+
+    let (client, handle) = connect_quic_reconnecting(
+        &url,
+        &info.cert_hash,
+        &info.token,
+        ReconnectPolicy::default(),
+    )
+    .expect("connect over QUIC");
+    let init = ServerInit {
+        file: Some(file.to_string_lossy().into_owned()),
+        host_fs_async: Some(Box::new(client.host_fs)),
+        // Hand the link to the editor so `:disconnect`/`:reconnect` drive it and the status
+        // transition fires the reconnect resync.
+        daemon_link: Some(handle),
+        ..Default::default()
+    };
+    let (rpc, _incoming) = spawn(init);
+    attach(&rpc, 80, 24).await;
+    assert_eq!(
+        await_lines(&rpc, &["one"]).await,
+        vec!["one"],
+        "the startup file loads over the initial QUIC connection"
+    );
+
+    // Take the QUIC link down, change the remote file while it's down, then re-dial: the
+    // supervisor opens a brand-new QUIC connection (four fresh streams) to the same listener.
+    feed(&rpc, ":disconnect<CR>");
+    await_status(&rpc, "disconnected").await;
+    std::fs::write(&file, "two over the new link\n").expect("external change during the outage");
+
+    feed(&rpc, ":reconnect<CR>");
+    await_status(&rpc, "connected").await;
+
+    // The unmodified buffer autoreloads the changed bytes — fetched over the *new* QUIC
+    // connection's Control stream, with the re-armed watch carrying the disk baseline.
+    assert_eq!(
+        await_lines(&rpc, &["two over the new link"]).await,
+        vec!["two over the new link"],
+        "after the QUIC re-dial the re-stat reloads the externally-changed file over the new link"
     );
 }

@@ -71,13 +71,20 @@
 //!
 //! | direction | method | params |
 //! | --- | --- | --- |
-//! | edit-host → daemon | `fs_watch [path]`   | arm a watch on `path` |
+//! | edit-host → daemon | `fs_watch [path, known?]` | arm a watch on `path` (`known` = the edit-host's disk baseline) |
 //! | edit-host → daemon | `fs_unwatch [path]` | drop the watch |
 //! | daemon → edit-host | `fs_changed [path, stat?]` | `path` changed (nil stat = vanished) |
 //!
 //! `serve_fs_daemon` baselines each watched path's stat at `fs_watch` time and re-stats
 //! on a coarse [`WATCH_POLL`] interval (the daemon is the lag-tolerant leg), pushing
-//! `fs_changed` whenever one drifts. A successful `fs_write` refreshes the baseline so
+//! `fs_changed` whenever one drifts. The optional `known` stat closes the **reconnect**
+//! gap: a re-dialed daemon is a fresh process that lost every prior baseline, so a file
+//! changed *during the outage* would otherwise be silently re-baselined as the new normal.
+//! When the edit-host re-arms a watch it passes its own last-read/written stat as `known`;
+//! the daemon compares it to the live stat and, if they differ, pushes `fs_changed`
+//! immediately (the edit-host reconciles via the normal `reconcile_remote_change` path —
+//! autoread reload or `FileChangedShell`). On the initial arm `known` equals the live stat,
+//! so nothing spurious fires. A successful `fs_write` refreshes the baseline so
 //! the edit-host's **own** save doesn't echo back as an external change. The edit-host
 //! turns each push into a [`WatchEvent`] the server reconciles off the editor tick (the
 //! `FileChangedShell` round-trip; a reload re-fetches over `fs_read`) — the remote
@@ -126,6 +133,7 @@ use tokio::sync::mpsc::{
     channel, unbounded_channel, Receiver, Sender, UnboundedReceiver, UnboundedSender,
 };
 use tokio::sync::oneshot;
+use tokio::sync::watch;
 
 use nxvim_core::{DirEntry, FileStat, HostFs};
 use nxvim_lsp::{LspChannel, LspProcess, LspTransport, ServerSpawn};
@@ -357,6 +365,654 @@ enum DaemonEvent {
 /// entry when the child exits.
 type Inflight = Arc<Mutex<HashMap<u64, UnboundedSender<DaemonEvent>>>>;
 
+// ----- reconnectable link (Phase 1 of `docs/plans/2026-06-29-daemon-reconnect.md`) ------
+//
+// The editor runs *local*; the daemon only provides the fs/proc/lsp/term seams. So a
+// dropped connection must not tear the session down (that loses the local buffers/undo) —
+// it must re-dial *underneath the seam handles the editor already holds*. [`LinkRpc`] is
+// the indirection that makes that possible: every seam issues on a `LinkRpc` rather than a
+// concrete [`Rpc`], so the link supervisor can swap the current connection's `Rpc` in and
+// out without the seams (or the editor) ever being rebuilt. While disconnected the cell is
+// empty and every request/notify fails *loud* — never hangs.
+
+/// A swappable handle to the current daemon connection's [`Rpc`]. Cloned into every seam;
+/// the link supervisor publishes a live `Rpc` on each (re)dial and clears it on a drop.
+#[derive(Clone)]
+pub(crate) struct LinkRpc {
+    inner: Arc<Mutex<Option<Rpc>>>,
+}
+
+impl LinkRpc {
+    /// An empty (disconnected) cell — the reconnecting supervisor fills it on each dial.
+    fn empty() -> LinkRpc {
+        LinkRpc {
+            inner: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    /// A fixed, never-swapped handle wrapping one connection's `Rpc` — the one-shot paths
+    /// (the per-leg `connect` constructors) that never reconnect.
+    fn fixed(rpc: Rpc) -> LinkRpc {
+        LinkRpc {
+            inner: Arc::new(Mutex::new(Some(rpc))),
+        }
+    }
+
+    /// Publish the current connection's `Rpc` (on dial), or clear it (on drop).
+    fn set(&self, rpc: Option<Rpc>) {
+        *self.inner.lock().unwrap() = rpc;
+    }
+
+    /// The current `Rpc`, cloned (cheap — it is `Arc`-backed), or `None` while disconnected.
+    fn current(&self) -> Option<Rpc> {
+        self.inner.lock().unwrap().clone()
+    }
+
+    /// Issue a request on the current connection; a loud error while disconnected (never a
+    /// hang), so a seam op during an outage fails fast instead of parking forever.
+    async fn request(&self, method: &str, params: Vec<Value>) -> anyhow::Result<Value> {
+        match self.current() {
+            Some(rpc) => rpc.request(method, params).await,
+            None => Err(anyhow::anyhow!("daemon disconnected")),
+        }
+    }
+
+    /// Fire a notification on the current connection; dropped while disconnected.
+    fn notify(&self, method: &str, params: Vec<Value>) {
+        if let Some(rpc) = self.current() {
+            rpc.notify(method, params);
+        }
+    }
+}
+
+/// One dialed daemon connection's four leg-group links (Control/Proc/Lsp/Term). The
+/// single-stream dialer ([`dial_single_stream`]) splits one stream into the four; the QUIC
+/// dialer ([`crate::quic`]) opens one real stream per group and builds this directly via
+/// [`DialedConnection::from_groups`].
+pub(crate) struct DialedConnection {
+    control: GroupLink,
+    proc: GroupLink,
+    lsp: GroupLink,
+    term: GroupLink,
+}
+
+impl DialedConnection {
+    /// Assemble a connection from its four already-built per-group links — the QUIC dialer's
+    /// entry point (one `GroupLink` per real bidi stream). The single-stream path builds the
+    /// same shape by splitting one stream ([`split_single_stream`]).
+    pub(crate) fn from_groups(
+        control: GroupLink,
+        proc: GroupLink,
+        lsp: GroupLink,
+        term: GroupLink,
+    ) -> DialedConnection {
+        DialedConnection {
+            control,
+            proc,
+            lsp,
+            term,
+        }
+    }
+}
+
+/// The stable, connection-independent state a link keeps across re-dials: the swappable
+/// per-group [`LinkRpc`] cells the seams issue on, plus the shared inbound state the
+/// per-connection demuxes feed. All of this outlives any one connection, so seam handles
+/// and push channels survive a reconnect.
+struct LinkState {
+    control_rpc: LinkRpc,
+    proc_rpc: LinkRpc,
+    lsp_rpc: LinkRpc,
+    term_rpc: LinkRpc,
+    proc_inflight: Inflight,
+    lsp_inflight: LspInflightMap,
+    watch_tx: UnboundedSender<WatchEvent>,
+    term_event_tx: Sender<crate::terminal::native::TermEvent>,
+    /// Taken once to drive the `luafs_op` job server (which survives reconnects via the
+    /// swappable Control cell).
+    fs_jobs_rx: Option<UnboundedReceiver<FsJobReq>>,
+}
+
+impl LinkState {
+    fn take_fs_jobs_rx(&mut self) -> UnboundedReceiver<FsJobReq> {
+        self.fs_jobs_rx
+            .take()
+            .expect("LinkState::take_fs_jobs_rx called once")
+    }
+}
+
+/// Build the six edit-host seams over fresh, empty [`LinkRpc`] cells + the stable push
+/// channels, returning the [`LinkState`] the supervisor drives and the [`DaemonClient`] the
+/// editor holds. The seams reference the cells, so a later [`LinkState`] re-dial rebinds
+/// them in place. Shared by the one-shot path ([`serve_daemon_link_inner`]) and the
+/// reconnecting path ([`connect_daemon_reconnecting_on`]).
+fn build_link() -> (LinkState, DaemonClient) {
+    let control_rpc = LinkRpc::empty();
+    let proc_rpc = LinkRpc::empty();
+    let lsp_rpc = LinkRpc::empty();
+    let term_rpc = LinkRpc::empty();
+    let proc_inflight: Inflight = Arc::new(Mutex::new(HashMap::new()));
+    let lsp_inflight: LspInflightMap = Arc::new(Mutex::new(HashMap::new()));
+    let (watch_tx, watch_rx) = unbounded_channel::<WatchEvent>();
+    let (term_event_tx, term_event_rx) =
+        channel::<crate::terminal::native::TermEvent>(REMOTE_TERM_EVENT_CAP);
+    let (fs_jobs_tx, fs_jobs_rx) = unbounded_channel::<FsJobReq>();
+
+    let client = DaemonClient {
+        host_fs: RemoteHostFs {
+            rpc: control_rpc.clone(),
+            watch_rx: Mutex::new(Some(watch_rx)),
+        },
+        host_proc: RemoteHostProc {
+            rpc: proc_rpc.clone(),
+            inflight: proc_inflight.clone(),
+            next_id: AtomicU64::new(1),
+        },
+        lsp_transport: RemoteLspTransport {
+            rpc: lsp_rpc.clone(),
+            inflight: lsp_inflight.clone(),
+            next_id: AtomicU64::new(1),
+        },
+        host_term: RemoteHostTerm::from_parts(term_rpc.clone(), term_event_rx),
+        fs_jobs: RemoteFsJobs { req_tx: fs_jobs_tx },
+        config: RemoteConfig {
+            rpc: control_rpc.clone(),
+        },
+    };
+    let state = LinkState {
+        control_rpc,
+        proc_rpc,
+        lsp_rpc,
+        term_rpc,
+        proc_inflight,
+        lsp_inflight,
+        watch_tx,
+        term_event_tx,
+        fs_jobs_rx: Some(fs_jobs_rx),
+    };
+    (state, client)
+}
+
+/// Serve one connection: publish its per-group `Rpc`s into the swappable cells, then run the
+/// four per-group demuxes (which feed the *stable* push channels). Returns when the
+/// connection drops (all four group streams EOF). The caller [`clear_cells`] afterwards (so
+/// the clear also covers the case where serving is *cancelled* by a `:disconnect`).
+async fn run_connection(state: &LinkState, conn: DialedConnection) {
+    publish_cells(state, &conn);
+
+    // The `luafs_op` job server already runs against the Control cell for the link's
+    // lifetime (spawned by the caller), so it is not re-run here. The four demuxes are the
+    // connection's; they end when its streams EOF.
+    tokio::join!(
+        run_control_demux(conn.control.incoming, state.watch_tx.clone()),
+        run_demux(conn.proc.incoming, state.proc_inflight.clone()),
+        run_lsp_demux(conn.lsp.incoming, state.lsp_inflight.clone()),
+        run_term_demux(conn.term.incoming, state.term_event_tx.clone()),
+    );
+}
+
+/// Publish `conn`'s four per-group `Rpc`s into the swappable cells, so the seams the editor
+/// holds route onto this connection. Split out from [`run_connection`] so a re-dial can fill
+/// the cells *before* the supervisor announces [`DaemonStatus::Connected`] — the editor's
+/// reconnect resync fires on that transition and must issue (re-arm watches, re-open LSP) onto
+/// live cells, never the just-cleared ones.
+fn publish_cells(state: &LinkState, conn: &DialedConnection) {
+    state.control_rpc.set(Some(conn.control.rpc.clone()));
+    state.proc_rpc.set(Some(conn.proc.rpc.clone()));
+    state.lsp_rpc.set(Some(conn.lsp.rpc.clone()));
+    state.term_rpc.set(Some(conn.term.rpc.clone()));
+}
+
+/// Empty the swappable cells so every subsequent seam op fails loud until the next dial (the
+/// demuxes already cleared the proc/lsp inflight maps, failing their pending spawns with a
+/// synthesized exit rather than a hang). Called after a connection drops *or* is cancelled.
+fn clear_cells(state: &LinkState) {
+    state.control_rpc.set(None);
+    state.proc_rpc.set(None);
+    state.lsp_rpc.set(None);
+    state.term_rpc.set(None);
+}
+
+/// Split one freshly-connected **single-stream** transport (a duplex / ssh stdio) into the
+/// four leg-group [`GroupLink`]s by method — the reconnecting twin of [`serve_daemon_link`],
+/// and the body a single-stream dialer wraps. Synchronous (it only builds the `Rpc` + spawns
+/// the demux split), so it must be called within a tokio runtime. The QUIC dialer skips this
+/// entirely — it opens a real stream per group and builds the [`DialedConnection`] directly.
+fn split_single_stream<R, W>(reader: R, writer: W) -> DialedConnection
+where
+    R: AsyncRead + Unpin + Send + 'static,
+    W: AsyncWrite + Unpin + Send + 'static,
+{
+    let (rpc, incoming) = connect(reader, writer);
+    let (ctrl_tx, ctrl_rx) = unbounded_channel::<Incoming>();
+    let (proc_tx, proc_rx) = unbounded_channel::<Incoming>();
+    let (lsp_tx, lsp_rx) = unbounded_channel::<Incoming>();
+    let (term_tx, term_rx) = unbounded_channel::<Incoming>();
+    tokio::spawn(split_incoming(incoming, ctrl_tx, proc_tx, lsp_tx, term_tx));
+    DialedConnection::from_groups(
+        GroupLink {
+            rpc: rpc.clone(),
+            incoming: ctrl_rx,
+        },
+        GroupLink {
+            rpc: rpc.clone(),
+            incoming: proc_rx,
+        },
+        GroupLink {
+            rpc: rpc.clone(),
+            incoming: lsp_rx,
+        },
+        GroupLink {
+            rpc,
+            incoming: term_rx,
+        },
+    )
+}
+
+/// The connection state of a reconnecting daemon link, surfaced to the editor (and through
+/// it to `nx.daemon.status()` / a statusline component, later phases). Carried on a
+/// [`watch`] channel so a consumer reads the latest value and awaits changes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DaemonStatus {
+    /// A live connection — every seam works.
+    Connected,
+    /// The connection dropped and the supervisor is auto-retrying (`attempt` of `max`).
+    Reconnecting { attempt: u32, max: u32 },
+    /// No connection: either the auto-retry budget is exhausted (the editor should tell the
+    /// user to run `:reconnect`) or `:disconnect` was issued. The supervisor stays parked
+    /// until [`ReconnectHandle::reconnect`].
+    Disconnected,
+}
+
+/// How aggressively a dropped link is auto-retried before giving up and waiting for a manual
+/// `:reconnect`. Backoff for attempt *n* is `min(base * 2^(n-1), cap)`.
+#[derive(Clone, Copy, Debug)]
+pub struct ReconnectPolicy {
+    /// How many auto-retries before giving up (then a manual `:reconnect` resets the budget).
+    pub max_attempts: u32,
+    /// The first attempt's backoff; each subsequent attempt doubles it up to `cap`.
+    pub base: Duration,
+    /// The longest a single backoff may grow to.
+    pub cap: Duration,
+}
+
+impl Default for ReconnectPolicy {
+    /// "A few times, then tell the user to `:reconnect`": 5 attempts over 0.5 → 8 s.
+    fn default() -> Self {
+        ReconnectPolicy {
+            max_attempts: 5,
+            base: Duration::from_millis(500),
+            cap: Duration::from_secs(8),
+        }
+    }
+}
+
+impl ReconnectPolicy {
+    /// The backoff before attempt `n` (1-based), capped.
+    fn backoff(&self, attempt: u32) -> Duration {
+        let shift = attempt.saturating_sub(1).min(31);
+        let scaled = self.base.saturating_mul(1u32 << shift);
+        scaled.min(self.cap)
+    }
+}
+
+/// A control message from the editor to the link supervisor.
+#[derive(Clone, Copy)]
+enum LinkCommand {
+    /// `:reconnect` — re-dial now and reset the retry budget.
+    Reconnect,
+    /// `:disconnect` — drop the live connection (if any) and stay down until a `:reconnect`.
+    Disconnect,
+}
+
+/// A handle the editor holds to drive a reconnecting daemon link: trigger a `:reconnect` /
+/// `:disconnect`, read the current [`DaemonStatus`], or subscribe to status changes. The
+/// seams rebind in place on a re-dial — the editor keeps its local buffers/undo.
+pub struct ReconnectHandle {
+    cmd_tx: UnboundedSender<LinkCommand>,
+    status: watch::Receiver<DaemonStatus>,
+}
+
+impl ReconnectHandle {
+    /// Re-dial the daemon now, resetting the auto-retry budget. Use after the supervisor has
+    /// given up (status [`DaemonStatus::Disconnected`]), or to retry sooner than the backoff.
+    pub fn reconnect(&self) {
+        let _ = self.cmd_tx.send(LinkCommand::Reconnect);
+    }
+
+    /// Drop the live connection (if any) and stay disconnected until a [`reconnect`](Self::reconnect).
+    pub fn disconnect(&self) {
+        let _ = self.cmd_tx.send(LinkCommand::Disconnect);
+    }
+
+    /// The current link status.
+    pub fn status(&self) -> DaemonStatus {
+        *self.status.borrow()
+    }
+
+    /// A receiver the editor's run loop selects on to learn of status changes off the tick.
+    pub fn subscribe(&self) -> watch::Receiver<DaemonStatus> {
+        self.status.clone()
+    }
+}
+
+/// How serving a single connection ended.
+enum Served {
+    /// The connection dropped (its streams EOF'd) — the supervisor should auto-retry.
+    Dropped,
+    /// `:disconnect` cancelled it — stay down until a manual `:reconnect`.
+    Disconnect,
+    /// The editor dropped its [`ReconnectHandle`] (session ending) — stop maintaining.
+    Closed,
+}
+
+/// Serve `conn` until it drops, or until a `:disconnect`/handle-drop arrives on `cmd_rx`.
+/// A `:reconnect` while already connected is ignored (we keep serving). The caller
+/// [`clear_cells`] after this returns (covering the cancelled case too).
+async fn serve_connection(
+    state: &LinkState,
+    conn: DialedConnection,
+    cmd_rx: &mut UnboundedReceiver<LinkCommand>,
+) -> Served {
+    let serving = run_connection(state, conn);
+    tokio::pin!(serving);
+    loop {
+        tokio::select! {
+            _ = &mut serving => return Served::Dropped,
+            cmd = cmd_rx.recv() => match cmd {
+                Some(LinkCommand::Reconnect) => continue, // already connected: ignore
+                Some(LinkCommand::Disconnect) => return Served::Disconnect,
+                None => return Served::Closed,
+            },
+        }
+    }
+}
+
+/// Sleep for `dur`, unless a command arrives first.
+enum Waited {
+    Elapsed,
+    Cmd(LinkCommand),
+    Closed,
+}
+
+async fn wait_or_cmd(dur: Duration, cmd_rx: &mut UnboundedReceiver<LinkCommand>) -> Waited {
+    tokio::select! {
+        _ = tokio::time::sleep(dur) => Waited::Elapsed,
+        cmd = cmd_rx.recv() => match cmd {
+            Some(c) => Waited::Cmd(c),
+            None => Waited::Closed,
+        },
+    }
+}
+
+/// Re-dial a dropped link with bounded backoff. On a successful dial, serve that connection
+/// and return how *it* ended. If `immediate`, the first attempt skips its backoff (a manual
+/// `:reconnect`). If every attempt fails, returns [`Served::Disconnect`] so the caller parks
+/// as "given up — run `:reconnect`".
+async fn reconnect_cycle<D, DFut>(
+    state: &LinkState,
+    make: &mut D,
+    cmd_rx: &mut UnboundedReceiver<LinkCommand>,
+    status: &watch::Sender<DaemonStatus>,
+    policy: &ReconnectPolicy,
+    immediate: bool,
+) -> Served
+where
+    D: FnMut() -> DFut,
+    DFut: Future<Output = anyhow::Result<DialedConnection>>,
+{
+    for attempt in 1..=policy.max_attempts {
+        status.send_replace(DaemonStatus::Reconnecting {
+            attempt,
+            max: policy.max_attempts,
+        });
+        // Back off before each attempt (a manual reconnect skips the first wait), but let a
+        // command interrupt the wait — a `:reconnect` to dial now, a `:disconnect` to stop.
+        if !(immediate && attempt == 1) {
+            match wait_or_cmd(policy.backoff(attempt), cmd_rx).await {
+                Waited::Elapsed | Waited::Cmd(LinkCommand::Reconnect) => {}
+                Waited::Cmd(LinkCommand::Disconnect) => return Served::Disconnect,
+                Waited::Closed => return Served::Closed,
+            }
+        }
+        match make().await {
+            Ok(conn) => {
+                // Fill the cells *before* announcing Connected: the editor's reconnect resync
+                // (off the Connected transition) re-arms watches + re-opens LSP, and those ops
+                // must land on this live connection, not the cleared cells. `run_connection`
+                // re-publishes the same `Rpc`s (idempotent).
+                publish_cells(state, &conn);
+                status.send_replace(DaemonStatus::Connected);
+                return serve_connection(state, conn, cmd_rx).await;
+            }
+            // A failed attempt is loud (the daemon log) and falls through to the next.
+            Err(e) => eprintln!("nxvim daemon link: re-dial attempt {attempt} failed: {e:#}"),
+        }
+    }
+    // Budget exhausted: give up and wait for a manual `:reconnect`.
+    Served::Disconnect
+}
+
+/// The reconnect supervisor: serve the first connection, then on each drop auto-retry with
+/// bounded backoff ([`reconnect_cycle`]); on `:disconnect` or budget exhaustion, park as
+/// [`DaemonStatus::Disconnected`] until a manual `:reconnect`. The same [`LinkState`] (and so
+/// the same seam handles) is reused throughout, so the editor never rebuilds.
+async fn maintain_link<D, DFut>(
+    state: LinkState,
+    mut make: D,
+    first: DialedConnection,
+    mut cmd_rx: UnboundedReceiver<LinkCommand>,
+    status: watch::Sender<DaemonStatus>,
+    policy: ReconnectPolicy,
+) where
+    D: FnMut() -> DFut,
+    DFut: Future<Output = anyhow::Result<DialedConnection>>,
+{
+    let mut served = serve_connection(&state, first, &mut cmd_rx).await;
+    loop {
+        clear_cells(&state);
+        match served {
+            Served::Closed => return,
+            // Auto-retry a lost connection.
+            Served::Dropped => {
+                served =
+                    reconnect_cycle(&state, &mut make, &mut cmd_rx, &status, &policy, false).await;
+            }
+            // Given up / explicitly disconnected: park until a manual `:reconnect`.
+            Served::Disconnect => {
+                status.send_replace(DaemonStatus::Disconnected);
+                served = loop {
+                    match cmd_rx.recv().await {
+                        None => return,
+                        Some(LinkCommand::Disconnect) => continue, // already down
+                        Some(LinkCommand::Reconnect) => {
+                            break reconnect_cycle(
+                                &state,
+                                &mut make,
+                                &mut cmd_rx,
+                                &status,
+                                &policy,
+                                true,
+                            )
+                            .await
+                        }
+                    }
+                };
+            }
+        }
+    }
+}
+
+/// Connect to a daemon over a **reconnectable** single-stream transport, driven on the
+/// *current* tokio runtime (no dedicated link thread). `make` produces a fresh
+/// reader/writer on each (re)dial — a duplex+daemon factory (tests), or a re-spawned ssh
+/// child (Phase 4). On a drop the supervisor auto-retries per `policy`, then parks as
+/// [`DaemonStatus::Disconnected`] until [`ReconnectHandle::reconnect`]. Returns the
+/// [`DaemonClient`] the editor holds and a [`ReconnectHandle`] (status + `:reconnect` /
+/// `:disconnect`). The initial dial is awaited, so a connect failure is a loud `Err` here,
+/// before the editor is built.
+///
+/// The GUI/TUI wrap this on a dedicated link thread (later phase); a test drives it directly
+/// on its own runtime.
+pub async fn connect_daemon_reconnecting_on<F, Fut, R, W>(
+    mut make: F,
+    policy: ReconnectPolicy,
+) -> anyhow::Result<(DaemonClient, ReconnectHandle)>
+where
+    F: FnMut() -> Fut + Send + 'static,
+    Fut: Future<Output = anyhow::Result<(R, W)>> + Send + 'static,
+    R: AsyncRead + Unpin + Send + 'static,
+    W: AsyncWrite + Unpin + Send + 'static,
+{
+    // Adapt the single-stream reader/writer factory into a `DialedConnection` dialer (split
+    // the one stream into the four leg groups), then run the transport-agnostic supervisor.
+    let dialer = move || {
+        let fut = make();
+        async move {
+            let (reader, writer) = fut.await?;
+            Ok(split_single_stream(reader, writer))
+        }
+    };
+    connect_reconnecting_on(dialer, policy).await
+}
+
+/// The transport-agnostic core of the **current-runtime** reconnecting connect: dial the
+/// first connection from `make` (a [`DialedConnection`] dialer — single-stream-split or QUIC),
+/// build the stable seams, and spawn the supervisor. Shared by the single-stream
+/// ([`connect_daemon_reconnecting_on`]) and QUIC ([`crate::quic`]) entry points; a test drives
+/// it directly on its own runtime.
+pub(crate) async fn connect_reconnecting_on<D, DFut>(
+    mut make: D,
+    policy: ReconnectPolicy,
+) -> anyhow::Result<(DaemonClient, ReconnectHandle)>
+where
+    D: FnMut() -> DFut + Send + 'static,
+    DFut: Future<Output = anyhow::Result<DialedConnection>> + Send + 'static,
+{
+    let first = make().await?;
+    let (mut state, client) = build_link();
+    // The `luafs_op` job server rides the swappable Control cell, so it survives reconnects.
+    tokio::spawn(run_fs_jobs(
+        state.control_rpc.clone(),
+        state.take_fs_jobs_rx(),
+    ));
+    let (cmd_tx, cmd_rx) = unbounded_channel::<LinkCommand>();
+    let (status_tx, status_rx) = watch::channel(DaemonStatus::Connected);
+    tokio::spawn(maintain_link(state, make, first, cmd_rx, status_tx, policy));
+    Ok((
+        client,
+        ReconnectHandle {
+            cmd_tx,
+            status: status_rx,
+        },
+    ))
+}
+
+/// Connect to a daemon over a **reconnectable** single-stream transport on a **dedicated
+/// link thread** (its own current-thread runtime) — the production twin of
+/// [`connect_daemon`], with auto-reconnect. The wire runs off the server thread for the
+/// same reason `connect_daemon`/`connect_quic` do (Open Decision #5: a synchronous seam
+/// bridge parks the server thread on a `std` reply channel, so the wire must be driven
+/// elsewhere or the park starves the reader carrying its own reply). `make` re-spawns the
+/// transport on each (re)dial — for the GUI/TUI that re-runs `ssh … nxvim --daemon` and
+/// keeps the child alive itself.
+///
+/// **Blocking**: waits for the initial dial, so a bad host / refused connect is a loud
+/// `Err` here (before the editor is built), exactly like `connect_daemon`. The returned
+/// [`ReconnectHandle`] drops into [`ServerInit::daemon_link`](crate::ServerInit) so the run
+/// loop reflects status + `:reconnect`/`:disconnect` drive the link; on a drop the
+/// supervisor auto-retries per `policy`, then parks until a manual reconnect.
+pub fn connect_daemon_reconnecting<F, Fut, R, W>(
+    mut make: F,
+    policy: ReconnectPolicy,
+) -> anyhow::Result<(DaemonClient, ReconnectHandle)>
+where
+    F: FnMut() -> Fut + Send + 'static,
+    Fut: Future<Output = anyhow::Result<(R, W)>> + Send + 'static,
+    R: AsyncRead + Unpin + Send + 'static,
+    W: AsyncWrite + Unpin + Send + 'static,
+{
+    let dialer = move || {
+        let fut = make();
+        async move {
+            let (reader, writer) = fut.await?;
+            Ok(split_single_stream(reader, writer))
+        }
+    };
+    connect_reconnecting_thread(dialer, policy)
+}
+
+/// The transport-agnostic core of the **dedicated-link-thread** reconnecting connect (the
+/// production twin of [`connect_daemon`] / [`connect_quic`]): on its own current-thread
+/// runtime, dial `make`'s first connection, hand the seams + handle back to the blocked
+/// caller, then drive the supervisor until the editor drops its handle. The wire runs off the
+/// server thread for the same reason `connect_daemon` does (Open Decision #5: a synchronous
+/// seam bridge parks the server thread, so the wire must be driven elsewhere). `make` is the
+/// [`DialedConnection`] dialer — the QUIC path builds its endpoint + opens four streams here,
+/// the ssh path re-spawns its child and splits one stream. Blocking: the initial dial is
+/// awaited, so a bad host / refused connect is a loud `Err` before the editor is built.
+pub(crate) fn connect_reconnecting_thread<D, DFut>(
+    make: D,
+    policy: ReconnectPolicy,
+) -> anyhow::Result<(DaemonClient, ReconnectHandle)>
+where
+    D: FnMut() -> DFut + Send + 'static,
+    DFut: Future<Output = anyhow::Result<DialedConnection>> + Send + 'static,
+{
+    let (tx, rx) = std::sync::mpsc::channel::<anyhow::Result<(DaemonClient, ReconnectHandle)>>();
+    std::thread::spawn(move || {
+        let rt = match tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+        {
+            Ok(rt) => rt,
+            Err(e) => {
+                let _ = tx.send(Err(
+                    anyhow::anyhow!(e).context("building the daemon link runtime")
+                ));
+                return;
+            }
+        };
+        rt.block_on(async move {
+            let mut make = make;
+            // The initial dial (blocking the caller below); a failure surfaces as the
+            // caller's `Err` rather than a half-built session.
+            let first = match make().await {
+                Ok(conn) => conn,
+                Err(e) => {
+                    let _ = tx.send(Err(e));
+                    return;
+                }
+            };
+            let (mut state, client) = build_link();
+            tokio::spawn(run_fs_jobs(
+                state.control_rpc.clone(),
+                state.take_fs_jobs_rx(),
+            ));
+            let (cmd_tx, cmd_rx) = unbounded_channel::<LinkCommand>();
+            let (status_tx, status_rx) = watch::channel(DaemonStatus::Connected);
+            let handle = ReconnectHandle {
+                cmd_tx,
+                status: status_rx,
+            };
+            // Hand the seams + handle back to the (blocked) caller; if it already gave up,
+            // there's nothing to drive.
+            if tx.send(Ok((client, handle))).is_err() {
+                return;
+            }
+            // Drive the supervisor on this thread until the editor drops its handle (session
+            // swap / quit closes the command channel) — then return so the runtime drops,
+            // aborting the per-connection wire tasks and reaping the transport (the ssh child
+            // / QUIC connection the dialer holds). This is why the wrapper awaits rather than
+            // spawning.
+            maintain_link(state, make, first, cmd_rx, status_tx, policy).await;
+        });
+    });
+    rx.recv().map_err(|_| {
+        anyhow::anyhow!("connect_daemon_reconnecting: the link thread died before dialing")
+    })?
+}
+
 /// A [`HostProc`] that runs children on a remote daemon instead of locally: each
 /// [`run`](HostProc::run) forwards the spawn over the wire and relays the daemon's
 /// pid/exit back to the editor's [`ProcEvents`], so the event-loop actor that drives
@@ -367,7 +1023,7 @@ type Inflight = Arc<Mutex<HashMap<u64, UnboundedSender<DaemonEvent>>>>;
 /// id counter) so it rides [`ServerInit`](crate::ServerInit) onto the server thread
 /// and is shared across spawns by the actor, exactly as the local host is.
 pub struct RemoteHostProc {
-    rpc: Rpc,
+    rpc: LinkRpc,
     inflight: Inflight,
     /// Per-spawn correlation id minted here (not the editor's callback id, which
     /// never needs to cross the wire — the demux routes purely by this).
@@ -389,7 +1045,7 @@ impl RemoteHostProc {
         let inflight: Inflight = Arc::new(Mutex::new(HashMap::new()));
         tokio::spawn(run_demux(incoming, inflight.clone()));
         RemoteHostProc {
-            rpc,
+            rpc: LinkRpc::fixed(rpc),
             inflight,
             next_id: AtomicU64::new(1),
         }
@@ -520,7 +1176,7 @@ const REMOTE_TERM_EVENT_CAP: usize = 4;
 pub struct RemoteHostTerm {
     /// The Term-leg `Rpc` outbound ops are sent on (its own QUIC stream, or the shared
     /// single-stream `Rpc` on ssh/stdio).
-    rpc: Rpc,
+    rpc: LinkRpc,
     /// The decoded inbound events, handed to the run loop once via [`take_events`]. `None`
     /// thereafter (a second take would strand the producer).
     ///
@@ -549,9 +1205,19 @@ impl RemoteHostTerm {
         let (event_tx, event_rx) =
             channel::<crate::terminal::native::TermEvent>(REMOTE_TERM_EVENT_CAP);
         tokio::spawn(run_term_demux(incoming, event_tx));
+        RemoteHostTerm::from_parts(LinkRpc::fixed(rpc), event_rx)
+    }
+
+    /// Build the seam from an already-swappable `rpc` cell and the (stable) inbound
+    /// `TermEvent` receiver. The reconnecting path ([`build_link`]) creates the channel and
+    /// runs the term demux itself (per connection), so this only stores the fields.
+    fn from_parts(
+        rpc: LinkRpc,
+        events: Receiver<crate::terminal::native::TermEvent>,
+    ) -> RemoteHostTerm {
         RemoteHostTerm {
             rpc,
-            events: Some(event_rx),
+            events: Some(events),
         }
     }
 
@@ -1094,9 +1760,12 @@ pub trait HostFsAsync: Send + Sync {
     /// Arm a remote watch on `path` (the `HostWatch` leg): the daemon stats it now as
     /// the baseline and pushes a [`WatchEvent`] each time it changes thereafter.
     /// Fire-and-forget — the change comes back asynchronously via [`Self::take_watch_events`].
-    /// The default is a no-op (an impl with no remote, e.g. a local fake that never
-    /// pushes).
-    fn watch(&self, _path: String) {}
+    /// `known` is the edit-host's disk baseline for the path: the daemon compares it to the
+    /// live stat at arm time and pushes a change immediately if they differ, so a file that
+    /// changed while the link was down (a re-dialed daemon lost its old baselines) is caught
+    /// on re-arm rather than silently re-baselined. `None` skips that one-shot compare.
+    /// The default is a no-op (an impl with no remote, e.g. a local fake that never pushes).
+    fn watch(&self, _path: String, _known: Option<FileStat>) {}
 
     /// Disarm the remote watch on `path` (the buffer closed / lost its file). The
     /// default is a no-op, matching [`Self::watch`].
@@ -1127,7 +1796,7 @@ pub struct WatchEvent {
 /// request/response, so (unlike [`RemoteHostProc`]) there is no per-call demux:
 /// [`nxvim_rpc`] routes each response to its awaiting `request` by msgid.
 pub struct RemoteHostFs {
-    rpc: Rpc,
+    rpc: LinkRpc,
     /// The receiver of `fs_changed` pushes, handed to the server once via
     /// [`HostFsAsync::take_watch_events`]. Behind a `Mutex<Option<…>>` because the
     /// trait method is `&self` and the receiver can only be taken out once.
@@ -1162,7 +1831,7 @@ impl RemoteHostFs {
             }
         });
         RemoteHostFs {
-            rpc,
+            rpc: LinkRpc::fixed(rpc),
             watch_rx: Mutex::new(Some(watch_rx)),
         }
     }
@@ -1245,8 +1914,14 @@ impl HostFsAsync for RemoteHostFs {
         })
     }
 
-    fn watch(&self, path: String) {
-        self.rpc.notify(FS_WATCH, vec![Value::from(path)]);
+    fn watch(&self, path: String, known: Option<FileStat>) {
+        self.rpc.notify(
+            FS_WATCH,
+            vec![
+                Value::from(path),
+                known.map_or(Value::Nil, |s| encode_stat(&s)),
+            ],
+        );
     }
 
     fn unwatch(&self, path: String) {
@@ -1445,8 +2120,24 @@ pub async fn serve_fs_daemon_on(
                             {
                                 // Baseline the current stat so the very next poll doesn't
                                 // misfire on a file that hasn't changed since the open.
-                                let stat = fs.stat(&path);
-                                watches.insert(path, stat);
+                                let now = fs.stat(&path);
+                                // The reconnect re-stat: the edit-host passes its own disk
+                                // baseline as `known`. If the live file already differs (it
+                                // changed while the link was down — this fresh daemon never
+                                // saw it), push `fs_changed` now so the edit-host reconciles
+                                // it, rather than adopting the changed file as the new
+                                // silent baseline. An absent/equal `known` pushes nothing.
+                                let known = params.get(1).and_then(decode_stat);
+                                if params.get(1).is_some_and(|v| !v.is_nil()) && known != now {
+                                    rpc.notify(
+                                        FS_CHANGED,
+                                        vec![
+                                            Value::from(path.to_string_lossy().into_owned()),
+                                            now.map_or(Value::Nil, |s| encode_stat(&s)),
+                                        ],
+                                    );
+                                }
+                                watches.insert(path, now);
                             }
                         }
                         FS_UNWATCH => {
@@ -1674,7 +2365,7 @@ type LspInflightMap = Arc<Mutex<HashMap<u64, LspInflight>>>;
 /// side of the split — the long-lived bidirectional-pipe analogue of
 /// [`RemoteHostProc`]'s run-to-completion path.
 pub struct RemoteLspTransport {
-    rpc: Rpc,
+    rpc: LinkRpc,
     inflight: LspInflightMap,
     /// Per-spawn correlation id minted here; the demux routes purely by it.
     next_id: AtomicU64,
@@ -1693,7 +2384,7 @@ impl RemoteLspTransport {
         let inflight: LspInflightMap = Arc::new(Mutex::new(HashMap::new()));
         tokio::spawn(run_lsp_demux(incoming, inflight.clone()));
         RemoteLspTransport {
-            rpc,
+            rpc: LinkRpc::fixed(rpc),
             inflight,
             next_id: AtomicU64::new(1),
         }
@@ -1754,7 +2445,7 @@ impl LspTransport for RemoteLspTransport {
 /// drops the `exit_tx`, so `wait` resolves to `(None, None)` rather than hanging.
 struct RemoteLspProcess {
     id: u64,
-    rpc: Rpc,
+    rpc: LinkRpc,
     exit_rx: oneshot::Receiver<(Option<i32>, Option<i32>)>,
 }
 
@@ -1818,7 +2509,7 @@ fn route_lsp_notification(inflight: &LspInflightMap, method: &str, params: Vec<V
 
 /// Forward everything the manager writes to a server's stdin onto the wire as
 /// `lsp_stdin` chunks, until the duplex closes (the manager's loop ended).
-async fn pump_lsp_stdin(id: u64, mut reader: DuplexStream, rpc: Rpc) {
+async fn pump_lsp_stdin(id: u64, mut reader: DuplexStream, rpc: LinkRpc) {
     let mut buf = [0u8; 8192];
     loop {
         match reader.read(&mut buf).await {
@@ -2330,7 +3021,7 @@ type FsJobReq = (
 /// The `luafs_op` leg's job server: pull each whole [`FsJob`](nxvim_lua::FsJob) off
 /// `req_rx`, send it as one `luafs_op` request over `rpc`, decode the reply through the
 /// shared [`fswire`](nxvim_lua) codec, and deliver the typed result to the awaiting actor.
-async fn run_fs_jobs(rpc: Rpc, mut req_rx: UnboundedReceiver<FsJobReq>) {
+async fn run_fs_jobs(rpc: LinkRpc, mut req_rx: UnboundedReceiver<FsJobReq>) {
     while let Some((job, reply_tx)) = req_rx.recv().await {
         let result = match rpc
             .request(LUAFS_OP, vec![nxvim_lua::fs_job_to_value(&job)])
@@ -2384,7 +3075,7 @@ impl RemoteFsJobs {
                 // The luafs_op leg has no daemon→edit-host pushes; drain so the connection
                 // isn't torn down (dropping the receiver would).
                 tokio::spawn(async move { while incoming.recv().await.is_some() {} });
-                run_fs_jobs(rpc, req_rx).await;
+                run_fs_jobs(LinkRpc::fixed(rpc), req_rx).await;
             });
         });
         RemoteFsJobs { req_tx }
@@ -2691,7 +3382,7 @@ fn encode_config_bundle(
 /// the other seams (see [`connect_daemon`]); [`RemoteConfig::connect`] is the per-leg
 /// constructor the tests drive over a private duplex.
 pub struct RemoteConfig {
-    rpc: Rpc,
+    rpc: LinkRpc,
 }
 
 impl RemoteConfig {
@@ -2707,7 +3398,9 @@ impl RemoteConfig {
     {
         let (rpc, mut incoming) = connect(reader, writer);
         tokio::spawn(async move { while incoming.recv().await.is_some() {} });
-        RemoteConfig { rpc }
+        RemoteConfig {
+            rpc: LinkRpc::fixed(rpc),
+        }
     }
 
     /// Fetch the daemon's config surface (one `config_bundle` round trip). `include_files`
@@ -2919,9 +3612,11 @@ async fn split_incoming(
 /// (single-stream) and the QUIC connector ([`crate::quic::connect_quic`], one real stream
 /// per group). Each seam issues on its group's `Rpc`: `host_fs`/`fs_jobs`/`config` on
 /// Control, `host_proc` on Proc, `lsp_transport` on Lsp, `host_term` on Term — so a flood on
-/// one group's stream can't head-of-line-block another. The Term seam owns its own demux
-/// (spawned in [`RemoteHostTerm::with_link`]); the other three are joined below. Runs on the
-/// dedicated link thread's runtime.
+/// one group's stream can't head-of-line-block another. Runs on the dedicated link thread's
+/// runtime. **One-shot**: it serves a single connection and returns when it drops (the link
+/// thread winds down) — the reconnecting path ([`connect_daemon_reconnecting_on`]) reuses
+/// the same seam construction ([`build_link`]) and per-connection demuxes ([`run_connection`])
+/// but loops over re-dials instead.
 pub(crate) async fn serve_daemon_link_inner(
     control: GroupLink,
     proc: GroupLink,
@@ -2929,57 +3624,30 @@ pub(crate) async fn serve_daemon_link_inner(
     term: GroupLink,
     client_tx: std::sync::mpsc::Sender<DaemonClient>,
 ) {
-    // Notification-routed legs: shared state each group's demux forwards into.
-    let proc_inflight: Inflight = Arc::new(Mutex::new(HashMap::new()));
-    let lsp_inflight: LspInflightMap = Arc::new(Mutex::new(HashMap::new()));
-    let (watch_tx, watch_rx) = unbounded_channel::<WatchEvent>();
-
-    // The `nx.fs` (`luafs_op`) leg: the job channel its seam sends whole `FsJob`s onto and
-    // its job server (below) pulls from. `luafs_op` is a Control method, so the job server
-    // issues on the Control `Rpc`.
-    let (fs_jobs_tx, fs_jobs_rx) = unbounded_channel::<FsJobReq>();
-
-    let client = DaemonClient {
-        host_fs: RemoteHostFs {
-            rpc: control.rpc.clone(),
-            watch_rx: Mutex::new(Some(watch_rx)),
-        },
-        host_proc: RemoteHostProc {
-            rpc: proc.rpc.clone(),
-            inflight: proc_inflight.clone(),
-            next_id: AtomicU64::new(1),
-        },
-        lsp_transport: RemoteLspTransport {
-            rpc: lsp.rpc.clone(),
-            inflight: lsp_inflight.clone(),
-            next_id: AtomicU64::new(1),
-        },
-        // The Term seam owns its own demux (spawned in `with_link`), draining the term
-        // group's inbound stream into the `TermEvent` channel the run loop selects on.
-        host_term: RemoteHostTerm::with_link(term.rpc, term.incoming),
-        fs_jobs: RemoteFsJobs { req_tx: fs_jobs_tx },
-        // The config leg shares the Control `Rpc`; its `config_bundle` responses are
-        // msgid-routed inside `Rpc` (never an `Incoming`), so the Control demux just drains
-        // the inbound stream — no extra wiring needed here.
-        config: RemoteConfig {
-            rpc: control.rpc.clone(),
-        },
-    };
-    // Hand the seams out before serving; if the caller already dropped, there's
-    // nothing to drive.
+    let (mut state, client) = build_link();
+    // The `nx.fs` (`luafs_op`) job server rides the swappable Control cell (a one-shot link
+    // never re-dials, but the wiring is shared with the reconnecting path).
+    tokio::spawn(run_fs_jobs(
+        state.control_rpc.clone(),
+        state.take_fs_jobs_rx(),
+    ));
+    // Hand the seams out before serving; if the caller already dropped, there's nothing
+    // to drive.
     if client_tx.send(client).is_err() {
         return;
     }
-
-    // The `nx.fs` job server rides this shared runtime as a task on the Control `Rpc`; the
-    // three per-group demuxes are the main future, joined so the link lives until every
-    // group's stream EOFs.
-    tokio::spawn(run_fs_jobs(control.rpc.clone(), fs_jobs_rx));
-    tokio::join!(
-        run_control_demux(control.incoming, watch_tx),
-        run_demux(proc.incoming, proc_inflight),
-        run_lsp_demux(lsp.incoming, lsp_inflight),
-    );
+    // Serve this single connection until every group's stream EOFs, then return.
+    run_connection(
+        &state,
+        DialedConnection {
+            control,
+            proc,
+            lsp,
+            term,
+        },
+    )
+    .await;
+    clear_cells(&state);
 }
 
 /// The **Control** group's inbound demux: `fs_changed` to the watch channel. Request

@@ -318,4 +318,29 @@ end
 vim.treesitter = vim.treesitter or {}
 vim.treesitter.foldexpr = nx.treesitter.foldexpr
 
+-- nx.daemon.* — the reconnecting remote-daemon link's connection status, surfaced so a
+-- plugin (e.g. a statusline component) can show it. A daemon session runs the editor
+-- locally and reaches the remote only through the link; when it drops, the supervisor
+-- auto-retries a few times and then parks Disconnected until `:reconnect`. The server
+-- pushes the current phase here (and fires `User DaemonStatusChanged`) on every change.
+nx.daemon = nx.daemon or {}
+-- The current phase, mirrored from the server: "connected" | "reconnecting" |
+-- "disconnected", or nil for a local (non-daemon) session.
+nx._daemon_status = nil
+
+-- nx.daemon.status() -> "connected"|"reconnecting"|"disconnected"|nil
+-- The live daemon connection phase, or nil when this session has no daemon link (local).
+-- A statusline component renders connected green / reconnecting yellow / disconnected red,
+-- and hides itself on nil.
+function nx.daemon.status()
+  return nx._daemon_status
+end
+
+-- Server-internal: set the phase and fire `User DaemonStatusChanged` so a statusline /
+-- plugin re-renders. Called from the run loop's daemon-status arm on every change.
+function nx._set_daemon_status(phase)
+  nx._daemon_status = phase
+  nx.autocmd.exec("User", { pattern = "DaemonStatusChanged" })
+end
+
 return nx

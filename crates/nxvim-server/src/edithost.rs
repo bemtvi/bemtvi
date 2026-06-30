@@ -116,8 +116,13 @@ pub trait HostEffects {
     }
 
     /// Off-tick fs — arm a daemon-side watch on `path` (the `HostWatch` leg); a change
-    /// returns *inbound* on the watch arm. A no-op without a daemon fs.
-    fn fs_watch(&mut self, path: String);
+    /// returns *inbound* on the watch arm. A no-op without a daemon fs. `known` is the
+    /// edit-host's disk baseline for the path: a re-dialed daemon compares it to the live
+    /// stat at arm time and pushes a change immediately if they differ, so an edit made
+    /// while the link was down is caught when [`sync_buffer_watches`] re-arms on reconnect.
+    ///
+    /// [`sync_buffer_watches`]: crate::EditHost::sync_buffer_watches
+    fn fs_watch(&mut self, path: String, known: Option<nxvim_core::FileStat>);
 
     /// Off-tick fs — disarm the daemon watch on `path` (the buffer closed / lost its
     /// file). A no-op without a daemon fs.
@@ -285,6 +290,12 @@ pub trait HostEffects {
     /// via [`lsp_take_events`](Self::lsp_take_events). Native runs a local/daemon child
     /// through the `LspManager`; wasm drives the `SyncLspClient` over the daemon wire.
     fn lsp_ensure(&mut self, key: ServerKey, spawn: ServerSpawn);
+
+    /// LSP — cleanly shut down `key`'s language server and forget it (a no-op if no such
+    /// server is running). The reconnect resync uses this to tear down servers whose remote
+    /// child died with the dropped link (and whose respawn would have hit the dead wire)
+    /// before re-ensuring them fresh against the new connection.
+    fn lsp_shutdown(&mut self, key: ServerKey);
 
     /// LSP — fire-and-forget a document-sync notification (`didOpen` / `didChange` /
     /// `didSave` / `didClose`) at `key`'s server. Dropped if no such server is running.
@@ -492,9 +503,9 @@ impl HostEffects for NativeEffects {
         });
     }
 
-    fn fs_watch(&mut self, path: String) {
+    fn fs_watch(&mut self, path: String, known: Option<nxvim_core::FileStat>) {
         if let Some(fs) = &self.host_fs_async {
-            fs.watch(path);
+            fs.watch(path, known);
         }
     }
 
@@ -536,6 +547,10 @@ impl HostEffects for NativeEffects {
 
     fn lsp_ensure(&mut self, key: ServerKey, spawn: ServerSpawn) {
         self.lsp.ensure_server(key, spawn);
+    }
+
+    fn lsp_shutdown(&mut self, key: ServerKey) {
+        self.lsp.shutdown(key);
     }
 
     fn lsp_notify(&mut self, key: ServerKey, note: LspNotify) {

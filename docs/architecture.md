@@ -183,6 +183,29 @@ daemon's config + plugins (and shada) with `--remote-config` — then the runtim
 fetched over the wire and materialized into a local per-process cache; the browser, which
 has no local disk, is always remote-config. See [the edit-host split](edit-host-split.md).
 
+Because the editor is local, a **dropped connection must not tear the session down** — the
+buffers, undo, cursor, windows, and Lua state all live on the local side and would be lost
+with it. So an ssh/stdio daemon link is **reconnectable**: a supervisor on a dedicated link
+thread (`nxvim_server::connect_daemon_reconnecting`) keeps the seam handles the editor holds
+fixed and swaps the *connection beneath them* (a `LinkRpc` cell per leg group). On EOF (a
+laptop sleeping past QUIC's idle timeout, an ssh hop dropping) it auto-retries with bounded
+backoff (`ReconnectPolicy`: 5 attempts over 0.5 → 8 s), re-spawning `ssh … nxvim --daemon`;
+on success the seams rebind and editing continues. If the budget is spent it parks and tells
+the user to run `:reconnect` (`:disconnect` drops it on demand). The link's `DaemonStatus`
+(`Connected` / `Reconnecting{attempt,max}` / `Disconnected`) rides a `watch` channel into the
+run loop, which mirrors it to `nx.daemon.status()` and fires a `User DaemonStatusChanged`
+autocmd so a statusline component can render it (green / yellow / red). A re-dialed daemon is
+a **fresh process** that knows nothing of the prior session, so on a genuine reconnect the
+editor **re-syncs the seams** off the tick: it re-opens LSP servers against the new connection
+(from each server's cached spawn), re-arms every file watch *carrying the buffer's disk
+baseline* so the daemon detects a file changed during the outage and pushes it (the unmodified
+buffer autoreloads; a locally-edited one is a conflict and is left alone), and surfaces that
+remote terminals/jobs were lost (their PTYs died with the link). Daemon-side session survival
+(persisting terminals/jobs across a drop) is explicitly out of scope. See
+[the daemon-reconnect plan](plans/2026-06-29-daemon-reconnect.md). *(QUIC and the web/wasm
+edit-host stay one-shot for now — the ssh path covers the reported sleep/wake case; their
+reconnect is a later phase.)*
+
 ### Async design
 
 Both sides run on single-threaded tokio runtimes (the editor core, like

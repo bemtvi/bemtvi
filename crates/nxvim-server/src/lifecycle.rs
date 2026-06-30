@@ -11,7 +11,7 @@ use crate::{FsRead, WatchEvent, INTERNAL_WATCH_BASE};
 use nxvim_core::{
     BufferId, DirEntry, FileChangeAction, FileChangeReason, FileStat, TabId, WindowId,
 };
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::io;
 use std::path::{Path, PathBuf};
 
@@ -877,22 +877,25 @@ impl EditHost {
             // `fs_changed`, so this tracks only paths — no stat snapshot, no re-arm on a
             // reload (the daemon re-baselines its own view). A `fs_changed` push lands on
             // the `watch_rx` arm and reconciles via `on_remote_file_changed`.
-            let want: HashSet<String> = self
+            let want: HashMap<String, Option<FileStat>> = self
                 .editor
                 .buffer_ids()
                 .into_iter()
                 .filter_map(|id| self.editor.buffer_watch_key(id))
-                .map(|(path, _)| path.to_string_lossy().into_owned())
+                .map(|(path, stat)| (path.to_string_lossy().into_owned(), stat))
                 .collect();
-            for path in &want {
+            for (path, stat) in &want {
                 if self.remote_watches.insert(path.clone()) {
-                    self.fx.fs_watch(path.clone());
+                    // Pass the buffer's disk baseline so a re-dialed daemon (which lost its
+                    // own baselines) detects a change made while the link was down — the
+                    // reconnect resync clears `remote_watches` to force this re-arm.
+                    self.fx.fs_watch(path.clone(), *stat);
                 }
             }
             let stale: Vec<String> = self
                 .remote_watches
                 .iter()
-                .filter(|p| !want.contains(*p))
+                .filter(|p| !want.contains_key(*p))
                 .cloned()
                 .collect();
             for path in stale {
@@ -957,28 +960,90 @@ impl EditHost {
         if !self.fx.has_remote_fs() {
             return;
         }
-        let want: HashSet<String> = self
+        let want: HashMap<String, Option<FileStat>> = self
             .editor
             .buffer_ids()
             .into_iter()
             .filter_map(|id| self.editor.buffer_watch_key(id))
-            .map(|(path, _)| path.to_string_lossy().into_owned())
+            .map(|(path, stat)| (path.to_string_lossy().into_owned(), stat))
             .collect();
-        for path in &want {
+        for (path, stat) in &want {
             if self.remote_watches.insert(path.clone()) {
-                self.fx.fs_watch(path.clone());
+                // Pass the buffer's disk baseline so a re-dialed daemon detects a change made
+                // while the link was down — the reconnect resync clears `remote_watches` to
+                // force this re-arm (Phase 7).
+                self.fx.fs_watch(path.clone(), *stat);
             }
         }
         let stale: Vec<String> = self
             .remote_watches
             .iter()
-            .filter(|p| !want.contains(*p))
+            .filter(|p| !want.contains_key(*p))
             .cloned()
             .collect();
         for path in stale {
             self.remote_watches.remove(&path);
             self.fx.fs_unwatch(path);
         }
+    }
+
+    /// Land a daemon link **phase** (`"connected"` / `"reconnecting"` / `"disconnected"`) on the
+    /// editor off the tick — the shared body both the native run-loop status arm
+    /// ([`on_daemon_status`](Self::on_daemon_status)) and the wasm `eh_daemon_status` FFI drive.
+    /// Mirrors the phase into `nx.daemon.status()` and fires the `User DaemonStatusChanged`
+    /// autocmd (so a statusline component re-renders), and on a genuine reconnect (`reconnected`)
+    /// re-syncs the remote seams ([`resync_after_reconnect`](Self::resync_after_reconnect)) before
+    /// settling. The native-only `:reconnect` hint on give-up is echoed by the caller, not here.
+    pub fn apply_daemon_phase(&mut self, phase: &str, reconnected: bool) {
+        // `phase` is one of three fixed literals from the supervisor, so the formatted chunk is
+        // injection-safe.
+        if let Err(e) = self.lua.exec(&format!("nx._set_daemon_status('{phase}')")) {
+            self.editor.echo(format!("DaemonStatusChanged error: {e}"));
+        }
+        self.apply_lua_effects();
+        if reconnected {
+            self.resync_after_reconnect();
+        }
+        self.settle_events(true);
+    }
+
+    /// Re-establish the remote seams after a reconnect, off the editor tick. The editor's local
+    /// state (buffers, undo, cursor, windows, Lua) survived the outage; only the daemon-backed
+    /// seams need rebinding, which the supervisor already did underneath. This re-arms what the
+    /// *fresh* daemon doesn't know about:
+    ///
+    /// - **fs watches** — clear the armed set so [`sync_buffer_watches`](Self::sync_buffer_watches)
+    ///   re-sends `fs_watch` for every open buffer (native: carrying its disk baseline, so the
+    ///   daemon detects a file changed *during* the outage).
+    /// - **LSP** — re-open every server against the new connection
+    ///   ([`resync_lsp_after_reconnect`](Self::resync_lsp_after_reconnect)).
+    /// - **terminals** — a re-dialed daemon lost every PTY, so the live terminal buffers are
+    ///   dead. Freeze each as an exited terminal (editable, output preserved) and tell the user.
+    ///   Background jobs already surfaced their own `-1` exit when the link dropped.
+    ///
+    /// Shared by the native run loop and the wasm edit-host (the daemon-reconnect plan's Phase 7).
+    pub(crate) fn resync_after_reconnect(&mut self) {
+        self.remote_watches.clear();
+        self.sync_buffer_watches();
+        self.resync_lsp_after_reconnect();
+
+        let lost: Vec<BufferId> = self
+            .editor
+            .buffer_ids()
+            .into_iter()
+            .filter(|&id| self.editor.is_terminal_buffer(id))
+            .collect();
+        for &buf in &lost {
+            self.editor.terminal_closed(buf, -1);
+        }
+        if !lost.is_empty() {
+            let n = lost.len();
+            let noun = if n == 1 { "terminal" } else { "terminals" };
+            self.editor.echo(format!(
+                "daemon reconnected — {n} remote {noun} lost (reopen with :terminal)"
+            ));
+        }
+        self.apply_lua_effects();
     }
 
     /// Every window's `(id, rect)` in layout order, for the [`WinResized`] diff.

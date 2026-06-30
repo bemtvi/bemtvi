@@ -111,6 +111,8 @@ fn spawn_server(plugin_dir: PathBuf) -> (Rpc, UnboundedReceiver<Incoming>) {
             remote_cwd: None,
             // The plugin-test runner is not an interactive client — no virtual commands.
             client_init_lua: None,
+            // No daemon link in the plugin-test runner.
+            daemon_link: None,
         };
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_io()

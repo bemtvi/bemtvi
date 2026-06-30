@@ -10,12 +10,13 @@
 
 use std::path::PathBuf;
 use std::process::Stdio;
+use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 
 use anyhow::{anyhow, Result};
 use nxvim_server::{
-    connect_daemon, connect_quic, run as run_server, ClipboardProvider, ConfigSource, DaemonClient,
-    ServerInit,
+    connect_daemon_reconnecting, connect_quic_reconnecting, run as run_server, ClipboardProvider,
+    ConfigSource, DaemonClient, ReconnectHandle, ReconnectPolicy, ServerInit,
 };
 use tokio::io::DuplexStream;
 
@@ -58,24 +59,49 @@ pub fn spawn_session(
     let remote = target.is_some();
     spawn_server(remote, file, None, config_source, move || async move {
         // Build the host seams: `None` for the embedded local disk, or a daemon client
-        // (ssh stdio / quic) for the edit-host split. The ssh child is the session guard.
+        // (ssh stdio / quic) for the edit-host split.
         match target {
-            None => Ok((None, no_guard())),
+            None => Ok((None, None, no_guard())),
             Some(ConnectTarget::Ssh(spec)) => {
                 // `ssh … nxvim --daemon` over stdio: the child's stdout/stdin *is* the
-                // daemon wire. `connect_daemon` drives it for the five host seams.
-                let mut child = ssh_daemon_command(&spec).spawn().map_err(|e| {
-                    anyhow!(e).context("spawning ssh (is it installed and on PATH?)")
-                })?;
-                let stdout = child.stdout.take().expect("ssh stdout piped");
-                let stdin = child.stdin.take().expect("ssh stdin piped");
-                Ok((Some(connect_daemon(stdout, stdin)), guard(child)))
+                // daemon wire. Use the RECONNECTING link so a dropped ssh hop (laptop
+                // sleep, network blip) re-spawns `ssh …` and rebinds the seams in place —
+                // the editor keeps its local buffers/undo. The factory re-runs the ssh
+                // command on each (re)dial and holds the current child (kill_on_drop reaps
+                // the previous one when the next dial replaces it).
+                let child_slot: DaemonChildSlot = Arc::new(Mutex::new(None));
+                let make = move || {
+                    let spec = spec.clone();
+                    let slot = child_slot.clone();
+                    async move {
+                        let mut child = ssh_daemon_command(&spec).spawn().map_err(|e| {
+                            anyhow!(e).context("spawning ssh (is it installed and on PATH?)")
+                        })?;
+                        let stdout = child.stdout.take().expect("ssh stdout piped");
+                        let stdin = child.stdin.take().expect("ssh stdin piped");
+                        // Replace (and so reap) the previous child, keeping this one alive
+                        // for the connection's lifetime on the link thread.
+                        *slot.lock().unwrap() = Some(child);
+                        Ok((stdout, stdin))
+                    }
+                };
+                let (client, handle) =
+                    connect_daemon_reconnecting(make, ReconnectPolicy::default())?;
+                Ok((Some(client), Some(handle), no_guard()))
             }
             Some(ConnectTarget::Quic(uri)) => {
                 let (url, cert_hash, token) = parse_connect_uri(&uri)?;
-                // `connect_quic` blocks on its own link thread until the QUIC +
-                // WebTransport session is up, then returns the five seams (or fails loud).
-                Ok((Some(connect_quic(&url, &cert_hash, &token)?), no_guard()))
+                // `connect_quic_reconnecting` blocks on its own link thread until the QUIC +
+                // WebTransport session is up, then returns the seams + a reconnect handle (or
+                // fails loud). On a drop (sleep/wake, a network blip) the supervisor re-dials a
+                // fresh QUIC connection under the seams, like the ssh path.
+                let (client, handle) = connect_quic_reconnecting(
+                    &url,
+                    &cert_hash,
+                    &token,
+                    ReconnectPolicy::default(),
+                )?;
+                Ok((Some(client), Some(handle), no_guard()))
             }
         }
     })
@@ -90,10 +116,21 @@ pub fn spawn_stdio_daemon_session(
     config_source: ConfigSource,
 ) -> Result<Session> {
     spawn_server(true, file, None, config_source, || async {
-        let mut child = spawn_stdio_daemon()?;
-        let stdout = child.stdout.take().expect("daemon stdout piped");
-        let stdin = child.stdin.take().expect("daemon stdin piped");
-        Ok((Some(connect_daemon(stdout, stdin)), guard(child)))
+        // Reconnecting like the ssh path: re-spawn the daemon command on each (re)dial and
+        // hold the current child on the link thread (kill_on_drop reaps the previous).
+        let child_slot: DaemonChildSlot = Arc::new(Mutex::new(None));
+        let make = move || {
+            let slot = child_slot.clone();
+            async move {
+                let mut child = spawn_stdio_daemon()?;
+                let stdout = child.stdout.take().expect("daemon stdout piped");
+                let stdin = child.stdin.take().expect("daemon stdin piped");
+                *slot.lock().unwrap() = Some(child);
+                Ok((stdout, stdin))
+            }
+        };
+        let (client, handle) = connect_daemon_reconnecting(make, ReconnectPolicy::default())?;
+        Ok((Some(client), Some(handle), no_guard()))
     })
 }
 
@@ -122,7 +159,7 @@ pub fn spawn_workspace_session(dir: PathBuf, config_source: ConfigSource) -> Res
     // A workspace session is always local (embedded disk); only its shada identity and
     // session capture differ from the default embedded session.
     spawn_server(false, None, Some(abs), config_source, || async {
-        Ok((None, no_guard()))
+        Ok((None, None, no_guard()))
     })
 }
 
@@ -145,17 +182,19 @@ fn expand_tilde(dir: PathBuf) -> PathBuf {
 }
 
 /// A session guard: an opaque value kept alive on the server thread for the whole
-/// session — the daemon child (so `kill_on_drop` reaps it on quit), or nothing.
+/// session. With the reconnecting daemon links, the ssh/stdio child lives on the **link
+/// thread** (the factory's [`DaemonChildSlot`]), so daemon sessions now use [`no_guard`]
+/// too — the type stays for symmetry and any future server-thread-scoped guard.
 type Guard = Box<dyn std::any::Any + Send>;
 
-/// The empty guard for a local or quic session (quic owns its link thread internally).
+/// The current daemon child the reconnecting factory holds alive on the link thread across a
+/// connection; each (re)dial replaces it, reaping the previous one via `kill_on_drop`.
+type DaemonChildSlot = Arc<Mutex<Option<tokio::process::Child>>>;
+
+/// The empty guard for a local / daemon / quic session (the daemon child, if any, lives on
+/// its own link thread, not the server thread).
 fn no_guard() -> Guard {
     Box::new(())
-}
-
-/// Box a value (the daemon child) as a session [`Guard`].
-fn guard(value: impl std::any::Any + Send) -> Guard {
-    Box::new(value)
 }
 
 /// The shared session-spawn scaffolding: run the editor server on its own thread with
@@ -173,7 +212,9 @@ fn spawn_server<F, Fut>(
 ) -> Result<Session>
 where
     F: FnOnce() -> Fut + Send + 'static,
-    Fut: std::future::Future<Output = Result<(Option<DaemonClient>, Guard)>>,
+    Fut: std::future::Future<
+        Output = Result<(Option<DaemonClient>, Option<ReconnectHandle>, Guard)>,
+    >,
 {
     let (server_end, client_end) = tokio::io::duplex(1 << 16);
     // `ready` carries only the handshake outcome back here; the server thread then owns
@@ -192,7 +233,7 @@ where
             }
         };
         runtime.block_on(async move {
-            let (client, _guard) = match connect().await {
+            let (client, daemon_link, _guard) = match connect().await {
                 Ok(parts) => parts,
                 Err(e) => {
                     let _ = ready_tx.send(Err(e));
@@ -202,7 +243,8 @@ where
             // Build the server config — for a daemon session this fetches + materializes
             // the remote's config/plugins, so a failure here is a setup failure the caller
             // must see (before we report the handshake up).
-            let init = match server_init(file, client, workspace, config_source).await {
+            let init = match server_init(file, client, daemon_link, workspace, config_source).await
+            {
                 Ok(init) => init,
                 Err(e) => {
                     let _ = ready_tx.send(Err(e));
@@ -331,6 +373,7 @@ fn nxvim_bin_name() -> &'static str {
 async fn server_init(
     file: Option<String>,
     client: Option<DaemonClient>,
+    daemon_link: Option<ReconnectHandle>,
     workspace: Option<PathBuf>,
     config_source: ConfigSource,
 ) -> Result<ServerInit> {
@@ -470,6 +513,10 @@ async fn server_init(
         // directory-path completion. The actual session swap is still done client-side
         // (see [`crate::run`]); the server-side body does nothing.
         client_init_lua: Some(CLIENT_INIT_LUA.to_string()),
+        // The reconnecting daemon link (ssh/stdio) — its status flows into the editor + Lua
+        // (`nx.daemon.status()`) and `:reconnect`/`:disconnect` drive it. `None` for a local
+        // session, or a one-shot QUIC connect.
+        daemon_link,
     })
 }
 

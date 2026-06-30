@@ -38,6 +38,7 @@
 //!   hash and not mTLS — Open Decision #2.)
 
 use std::net::SocketAddr;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
@@ -51,7 +52,10 @@ use wtransport::{
 
 use nxvim_rpc::connect;
 
-use crate::daemon::{serve_daemon_link_inner, DaemonClient, GroupLink, LegGroup};
+use crate::daemon::{
+    connect_reconnecting_thread, DaemonClient, DialedConnection, GroupLink, LegGroup,
+    ReconnectHandle, ReconnectPolicy,
+};
 use crate::run_daemon_group;
 
 /// The SAN entries the daemon's self-signed cert is minted for. Loopback names cover the
@@ -61,14 +65,26 @@ use crate::run_daemon_group;
 const CERT_SANS: [&str; 3] = ["localhost", "127.0.0.1", "::1"];
 
 /// The client's keep-alive ping interval — an editor session is mostly idle between
-/// keystrokes, and without keep-alive the QUIC idle timeout would tear the (otherwise
-/// healthy) connection down. Kept well under [`MAX_IDLE_TIMEOUT`].
+/// keystrokes, and without keep-alive the QUIC idle timeout would tear an *actively-used but
+/// momentarily quiet* connection down. Kept well under [`MAX_IDLE_TIMEOUT`] so a healthy idle
+/// session never trips it. (This is distinct from sleep/wake: a suspended laptop sends no
+/// keep-alives for minutes/hours, so the link *does* idle out — that drop is the
+/// [`connect_quic_reconnecting`] supervisor's job, which re-dials on wake.)
 const KEEP_ALIVE: Duration = Duration::from_secs(3);
 
 /// How long a connection may sit with no traffic before QUIC considers it dead. The
 /// effective timeout is the min of both peers' values; the client's keep-alive
-/// ([`KEEP_ALIVE`]) keeps an idle-but-live session under it.
+/// ([`KEEP_ALIVE`]) keeps an idle-but-live session under it. A modest value is deliberate now
+/// that the link reconnects: a genuinely dead connection (the peer suspended, the network
+/// gone) is detected within this window and re-dialed, rather than the editor's remote ops
+/// hanging on a zombie link — so this trades "survive a multi-minute stall without a re-dial"
+/// (pointless: a sleep far exceeds any sane idle timeout) for "notice death promptly".
 const MAX_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// The current QUIC dial's endpoint + connection, held alive on the reconnect link thread for
+/// the connection's lifetime — [`connect_quic_reconnecting`]'s dialer replaces the slot on each
+/// re-dial, dropping the previous (which tears the dead link, and its now-stale streams, down).
+type LiveQuic = Arc<Mutex<Option<(Endpoint<endpoint_side::Client>, Connection)>>>;
 
 /// What a freshly-bound daemon listener publishes for an edit-host to connect: the bound
 /// address (resolved, so an ephemeral `:0` port is concrete), the self-signed cert's
@@ -224,78 +240,62 @@ async fn serve_group_stream(mut recv: RecvStream, send: SendStream) -> Result<()
     run_daemon_group(recv, send, group).await
 }
 
-/// Connect to a `--daemon --listen` listener at `url` (`https://host:port`), pinning its
-/// self-signed cert by `cert_hash` (TOFU) and presenting `token` on the CONNECT path, and
-/// return the five edit-host seams of that one connection — the QUIC twin of
-/// [`connect_daemon`](crate::connect_daemon). Blocks until the QUIC handshake +
-/// WebTransport session + bidi stream are up (or fails loud if any step does), so the
-/// caller has a live [`DaemonClient`] to drop into [`ServerInit`](crate::ServerInit) on
-/// return.
+/// Connect to a `--daemon --listen` listener at `url` (`https://host:port`) over a
+/// **reconnectable** QUIC link, pinning its self-signed cert by `cert_hash` (TOFU) and
+/// presenting `token` on the CONNECT path — the QUIC twin of
+/// [`connect_daemon_reconnecting`](crate::connect_daemon_reconnecting). Returns the
+/// [`DaemonClient`] the editor holds plus a [`ReconnectHandle`] (status + `:reconnect` /
+/// `:disconnect`); the initial dial is awaited, so a bad host / refused cert-or-token is a
+/// loud `Err` here before the editor is built.
 ///
-/// Like `connect_daemon`, the link runs on its **own** OS thread + current-thread runtime
-/// (not the server runtime): the blocking bridges park the editor/Lua thread on a `std`
-/// reply channel, and that parked thread *is* the server runtime, so the wire must be
-/// driven elsewhere or the park starves the reader carrying its own reply (Open Decision
-/// #5's deadlock trap). The QUIC [`Endpoint`] + [`Connection`] are created on, and kept
-/// alive by, that link thread for the session's lifetime.
-pub fn connect_quic(url: &str, cert_hash: &str, token: &str) -> Result<DaemonClient> {
+/// Like the ssh path, the link runs on its **own** OS thread + current-thread runtime (not the
+/// server runtime): the blocking seam bridges park the editor/Lua thread on a `std` reply
+/// channel, and that parked thread *is* the server runtime, so the wire must be driven
+/// elsewhere or the park starves the reader carrying its own reply (Open Decision #5's deadlock
+/// trap). On a drop (the laptop sleeping past QUIC's idle timeout, the network blipping) the
+/// supervisor re-dials a fresh QUIC connection — re-opening the four leg-group streams — under
+/// the seam handles the editor holds, so the local buffers/undo survive. The current
+/// [`Endpoint`] + [`Connection`] are held alive on the link thread by the dialer's slot; each
+/// re-dial replaces them (dropping the previous, which tears the dead link down).
+pub fn connect_quic_reconnecting(
+    url: &str,
+    cert_hash: &str,
+    token: &str,
+    policy: ReconnectPolicy,
+) -> Result<(DaemonClient, ReconnectHandle)> {
     let cert_hash: Sha256Digest = cert_hash
         .parse()
         .map_err(|e| anyhow!("invalid daemon cert hash {cert_hash:?}: {e}"))?;
     // The bearer token is the CONNECT path; the daemon reads it from `request.path()`.
     let connect_url = format!("{}/{}", url.trim_end_matches('/'), token);
 
-    // Two std channels back to the (non-async) caller thread: the dial outcome (so a
-    // failed connect/auth surfaces as an `Err` here) and then the built client (sent by
-    // `serve_daemon_link`). Sends come from the link thread, recvs from this thread — no
-    // self-deadlock.
-    let (dial_tx, dial_rx) = std::sync::mpsc::channel::<Result<()>>();
-    let (client_tx, client_rx) = std::sync::mpsc::channel::<DaemonClient>();
+    // The current dial's endpoint + connection, kept alive on the link thread for the
+    // connection's lifetime; each (re)dial replaces them, dropping the previous (which tears
+    // the old QUIC link, and its now-dead streams, down).
+    let live: LiveQuic = Arc::new(Mutex::new(None));
 
-    std::thread::spawn(move || {
-        let rt = match tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-        {
-            Ok(rt) => rt,
-            Err(e) => {
-                let _ = dial_tx.send(Err(anyhow!(e).context("building the daemon link runtime")));
-                return;
-            }
-        };
-        rt.block_on(async move {
-            let (endpoint, connection, streams) = match quic_dial(&connect_url, cert_hash).await {
-                Ok(parts) => parts,
-                Err(e) => {
-                    let _ = dial_tx.send(Err(e));
-                    return;
-                }
-            };
-            // Keep the endpoint + connection alive for the whole session; dropping either
-            // would tear the QUIC link (and its streams) down.
-            let _endpoint = endpoint;
-            let _connection = connection;
-
+    // The `DialedConnection` dialer the transport-agnostic supervisor drives: open a fresh
+    // QUIC connection + its four leg-group streams on each call. A new client endpoint per
+    // dial binds a fresh local UDP socket — cheap, and it sidesteps reusing a half-torn one.
+    let make = move || {
+        let connect_url = connect_url.clone();
+        let cert_hash = cert_hash.clone();
+        let live = live.clone();
+        async move {
+            let (endpoint, connection, streams) = quic_dial(&connect_url, cert_hash).await?;
             // One `Rpc`/inbound stream per leg group (Control/Proc/Lsp/Term). Each rides its
             // own QUIC stream, so a flood on one group can't head-of-line-block another.
             let [control, proc, lsp, term] = streams.map(|(send, recv)| {
                 let (rpc, incoming) = connect(recv, send);
                 GroupLink { rpc, incoming }
             });
-            // The wire is up; tell the caller, then hand off the seams and serve.
-            if dial_tx.send(Ok(())).is_err() {
-                return; // caller gave up waiting
-            }
-            serve_daemon_link_inner(control, proc, lsp, term, client_tx).await;
-        });
-    });
+            // Keep the new endpoint + connection alive; replacing the slot drops the previous.
+            *live.lock().unwrap() = Some((endpoint, connection));
+            Ok(DialedConnection::from_groups(control, proc, lsp, term))
+        }
+    };
 
-    dial_rx
-        .recv()
-        .map_err(|_| anyhow!("connect_quic: the link thread died before dialing the daemon"))??;
-    client_rx
-        .recv()
-        .map_err(|_| anyhow!("connect_quic: the link thread died before handing off the client"))
+    connect_reconnecting_thread(make, policy)
 }
 
 /// Build the client endpoint, dial `url` (pinning `cert_hash`), and open the native

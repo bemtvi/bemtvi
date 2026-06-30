@@ -103,11 +103,13 @@ struct Sink {
     /// the Worker reports the OPFS write done ([`eh_fs_write_complete`]), which removes it.
     fs_writes: HashMap<u64, PendingSave>,
     /// File paths the editor newly asked to **watch** this convergence (the remote watch
-    /// leg — Phase 6 watch slice), recorded by [`fs_watch`](HostEffects::fs_watch). Drained
-    /// by [`eh_take_watch_requests`] for the Worker to arm on the daemon (`fs_watch [path]`
+    /// leg — Phase 6 watch slice), recorded by [`fs_watch`](HostEffects::fs_watch). Each carries
+    /// the editor's disk baseline (`Some` once the file was read) so a re-dialed daemon can
+    /// detect a change made *during* an outage on re-arm (the reconnect re-stat — Phase 7). Drained
+    /// by [`eh_take_watch_requests`] for the Worker to arm on the daemon (`fs_watch [path, known?]`
     /// over WebTransport); a serverless OPFS session has no change source, so the Worker
     /// drops them. A `fs_changed` push the arm yields lands back via [`eh_remote_file_changed`].
-    watch_arms: Vec<String>,
+    watch_arms: Vec<(String, Option<nxvim_core::FileStat>)>,
     /// File paths the editor newly asked to **stop watching** (a buffer closed / lost its
     /// file), recorded by [`fs_unwatch`](HostEffects::fs_unwatch); the disarm twin of
     /// [`watch_arms`](Sink::watch_arms), drained by [`eh_take_watch_requests`].
@@ -552,12 +554,15 @@ impl HostEffects for WasmEffects {
         sink.fs_write_queue.push(seq);
     }
 
-    fn fs_watch(&mut self, path: String) {
+    fn fs_watch(&mut self, path: String, known: Option<nxvim_core::FileStat>) {
         // The remote watch leg (Phase 6): record the arm for the Worker to forward to the
-        // daemon (`fs_watch [path]` over WebTransport) — the wasm twin of the native
+        // daemon (`fs_watch [path, known?]` over WebTransport) — the wasm twin of the native
         // `sync_buffer_watches` arming a watch. A serverless OPFS session has no external
-        // writer, so the Worker drops it; either way the editor arms uniformly.
-        self.sink.borrow_mut().watch_arms.push(path);
+        // writer, so the Worker drops it; either way the editor arms uniformly. `known` is the
+        // buffer's disk baseline: a re-dialed daemon (which lost its own baselines) compares it
+        // to the live file at arm time and pushes a change made *during* the outage (the
+        // reconnect re-stat — Phase 7), so an outage-window edit isn't silently re-baselined.
+        self.sink.borrow_mut().watch_arms.push((path, known));
     }
 
     fn fs_unwatch(&mut self, path: String) {
@@ -727,6 +732,15 @@ impl HostEffects for WasmEffects {
         // wire ops drain to the Sink for the Worker to forward (`lsp_spawn` + `lsp_stdin`).
         // Only reached with a daemon connected (the editor gates on `has_remote_lsp`).
         self.lsp.ensure_server(key, spawn);
+        self.flush_lsp_wire();
+    }
+
+    fn lsp_shutdown(&mut self, key: ServerKey) {
+        // Cleanly stop the server in the sync client (the framed `shutdown`/`exit` drain to
+        // the Sink as `lsp_stdin` for the Worker). The reconnect resync that uses this is
+        // native-only today (the web link stays one-shot until Phase 7), so this is wired for
+        // signature parity — harmless if never called on web.
+        self.lsp.shutdown(key);
         self.flush_lsp_wire();
     }
 
@@ -1145,11 +1159,14 @@ pub unsafe extern "C" fn eh_take_fs_requests(h: *mut WasmEditHost) -> *mut c_cha
 }
 
 /// Drain the remote-watch arm/disarm requests the editor enqueued since the last call, as
-/// JSON `{"arm":["…"],"disarm":["…"]}` — the watch leg's outbound half. In a daemon session
-/// the Worker forwards each as an `fs_watch` / `fs_unwatch` notification over WebTransport;
-/// serverless OPFS has no change source, so the Worker drops them. A `fs_changed` push the
-/// daemon sends in response lands back through [`eh_remote_file_changed`]. Caller frees with
-/// [`eh_free_string`].
+/// JSON `{"arm":[{"path":"…","stat":[secs,nanos,size]|null},…],"disarm":["…"]}` — the watch
+/// leg's outbound half. In a daemon session the Worker forwards each arm as an
+/// `fs_watch [path, stat?]` (and each disarm as `fs_unwatch [path]`) notification over
+/// WebTransport; `stat` is the editor's disk baseline (the wire `[secs,nanos,size]` shape the
+/// daemon's `decode_stat` reads, `secs=null` when the mtime is unknown), so a re-dialed daemon
+/// catches an outage-window change on re-arm (Phase 7). Serverless OPFS has no change source, so
+/// the Worker drops them. A `fs_changed` push the daemon sends in response lands back through
+/// [`eh_remote_file_changed`]. Caller frees with [`eh_free_string`].
 ///
 /// # Safety
 /// `h` must come from [`eh_new`] and not yet be freed.
@@ -1162,9 +1179,27 @@ pub unsafe extern "C" fn eh_take_watch_requests(h: *mut WasmEditHost) -> *mut c_
     if sink.watch_arms.is_empty() && sink.watch_disarms.is_empty() {
         return into_owned_cstr(r#"{"arm":[],"disarm":[]}"#.into());
     }
-    let arm: Vec<String> = std::mem::take(&mut sink.watch_arms);
+    let arm: Vec<serde_json::Value> = std::mem::take(&mut sink.watch_arms)
+        .into_iter()
+        .map(|(path, stat)| serde_json::json!({ "path": path, "stat": stat.map(stat_to_wire_json) }))
+        .collect();
     let disarm: Vec<String> = std::mem::take(&mut sink.watch_disarms);
     into_owned_cstr(serde_json::json!({ "arm": arm, "disarm": disarm }).to_string())
+}
+
+/// Encode a [`FileStat`](nxvim_core::FileStat) as the wire `[secs, nanos, size]` array the
+/// daemon's `decode_stat` reads (mirroring the native `encode_stat`): `secs` is `null` when the
+/// mtime is unknown. Used by [`eh_take_watch_requests`] to carry the disk baseline as the
+/// reconnect re-stat's `known` stat.
+fn stat_to_wire_json(stat: nxvim_core::FileStat) -> serde_json::Value {
+    let (secs, nanos) = match stat
+        .mtime
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+    {
+        Some(d) => (serde_json::json!(d.as_secs()), serde_json::json!(d.subsec_nanos())),
+        None => (serde_json::Value::Null, serde_json::json!(0)),
+    };
+    serde_json::json!([secs, nanos, stat.size])
 }
 
 /// Drain the treesitter grammars the editor asked to install this convergence (one per
@@ -1324,6 +1359,9 @@ pub unsafe extern "C" fn eh_fs_read_complete(
     contents: *const c_char,
     data: *const u8,
     len: usize,
+    has_stat: i32,
+    size: f64,
+    mtime_ms: f64,
 ) {
     let Some(handle) = h.as_mut() else { return };
     let buffer = BufferId(buffer.max(0.0) as u64);
@@ -1334,9 +1372,23 @@ pub unsafe extern "C" fn eh_fs_read_complete(
             .complete_fs_read_dir(buffer, path, parse_dir_entries(as_str(contents)));
     } else {
         let bytes = as_bytes(data, len);
+        // The daemon's `fs_read` reply carries the remote file's stat; thread it as the
+        // read-from-disk baseline so the reconnect re-stat can compare against it. An OPFS
+        // (serverless) read has none (`has_stat == 0`). `mtime_ms < 0` ⇒ unknown mtime.
+        let stat = (has_stat != 0).then(|| {
+            let mtime = if mtime_ms < 0.0 {
+                None
+            } else {
+                Some(std::time::UNIX_EPOCH + std::time::Duration::from_millis(mtime_ms as u64))
+            };
+            nxvim_core::FileStat {
+                size: size.max(0.0) as u64,
+                mtime,
+            }
+        });
         handle
             .host
-            .complete_fs_read(buffer, path, kind, bytes, as_str(contents));
+            .complete_fs_read(buffer, path, kind, bytes, as_str(contents), stat);
     }
 }
 
@@ -1423,6 +1475,28 @@ pub unsafe extern "C" fn eh_remote_file_changed(
         size.max(0.0) as u64,
         mtime,
     );
+}
+
+/// Land a daemon link **status phase** on the web edit-host — the browser twin of the native
+/// run loop's `DaemonStatus` arm (the daemon-reconnect plan's Phase 7). The Worker's reconnect
+/// supervisor calls this on every transition: `phase` is `"connected"` / `"reconnecting"` /
+/// `"disconnected"`, and `reconnected != 0` marks a genuine reconnect (a down link came back, not
+/// the initial connect). It mirrors the phase into `nx.daemon.status()`, fires the
+/// `User DaemonStatusChanged` autocmd, and on a reconnect re-syncs the seams (re-arm watches,
+/// re-open LSP, freeze lost terminals) so the fresh daemon picks up where the old one left off.
+///
+/// # Safety
+/// `h` must come from [`eh_new`] and not yet be freed; `phase` a valid C string.
+#[no_mangle]
+pub unsafe extern "C" fn eh_daemon_status(
+    h: *mut WasmEditHost,
+    phase: *const c_char,
+    reconnected: i32,
+) {
+    let Some(handle) = h.as_mut() else { return };
+    handle
+        .host
+        .apply_daemon_phase(as_str(phase), reconnected != 0);
 }
 
 // ============================================================================

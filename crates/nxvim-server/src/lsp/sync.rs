@@ -238,6 +238,9 @@ impl EditHost {
         spawn.settings = settings;
         spawn.capabilities = capabilities;
         if !self.lsp_ensured.contains(&key) {
+            // Remember the spawn so the daemon reconnect resync can re-`ensure` a fresh
+            // server against the new connection (the remote child died with the link).
+            self.lsp_spawns.insert(key.clone(), spawn.clone());
             self.fx.lsp_ensure(key.clone(), spawn);
             self.lsp_ensured.insert(key.clone());
         }
@@ -251,6 +254,47 @@ impl EditHost {
         state.language_id = filetype;
         state.uri = Some(uri);
         // Wake a sync so the bound buffer opens as soon as the server initializes.
+        self.lsp_dirty = true;
+    }
+
+    /// Re-attach every LSP server after a **daemon reconnect**. A dropped link kills the
+    /// remote language-server children (the synthetic `lsp_exited` detached their buffers),
+    /// and the manager's own auto-respawn would have fired at the dead wire — so a fresh
+    /// connection has no servers. Tear each known server down (clearing the lazy-start guard)
+    /// and re-`ensure` it from the cached [`ServerSpawn`] against the new connection; the
+    /// `Initialized` reply for each fresh server re-opens its bound buffers via the existing
+    /// restart path, so documents re-sync with no per-buffer `didOpen` here. Shared by the
+    /// native run loop and the wasm edit-host's reconnect (the daemon-reconnect plan's Phase 7) —
+    /// `fx.lsp_shutdown` / `fx.lsp_ensure` have both a native (`LspManager`) and a wasm
+    /// (`SyncLspClient`) implementation.
+    pub(crate) fn resync_lsp_after_reconnect(&mut self) {
+        // Every server a buffer is still bound to (the binding on `lsp_states` survives a
+        // drop — only `opened` was cleared), plus any still in the runtime map.
+        let keys: std::collections::HashSet<ServerKey> = self
+            .lsp_states
+            .values()
+            .filter_map(|s| s.server.clone())
+            .chain(self.lsp_servers.keys().cloned())
+            .collect();
+        for key in keys {
+            // Drop the dead/phantom server task so a re-`ensure` spawns a fresh one (the
+            // manager leaves a still-open server's task alone), then re-ensure from the
+            // remembered spawn against the live wire.
+            self.fx.lsp_shutdown(key.clone());
+            self.lsp_ensured.remove(&key);
+            self.lsp_servers.remove(&key);
+            if let Some(spawn) = self.lsp_spawns.get(&key).cloned() {
+                self.fx.lsp_ensure(key.clone(), spawn);
+                self.lsp_ensured.insert(key);
+            }
+        }
+        // Force a fresh `didOpen` for every bound buffer once its server re-initializes.
+        for state in self.lsp_states.values_mut() {
+            if state.server.is_some() {
+                state.opened = false;
+                state.version = 0;
+            }
+        }
         self.lsp_dirty = true;
     }
 

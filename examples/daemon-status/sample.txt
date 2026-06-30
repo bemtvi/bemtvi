@@ -1,0 +1,16 @@
+Open this file in a daemon session to watch the connection-status segment.
+
+The "daemon" segment on the right of the status bar tracks the remote link:
+
+  ● daemon            connected   (green)  — every remote op works
+  ◌ reconnecting…     reconnecting (yellow) — the link dropped; auto-retrying
+  ✕ disconnected      disconnected (red)   — gave up; run :reconnect
+
+Things to try:
+  - :disconnect            drop the link on demand        -> red
+  - :reconnect             re-dial now (resets the budget) -> yellow -> green
+  - sleep the laptop / pull the network briefly            -> yellow -> green
+    (the link auto-recovers with no command — your buffer and undo survive)
+
+In a LOCAL session (no :connect) the segment renders nothing — nx.daemon.status()
+returns nil, so the component hides itself.

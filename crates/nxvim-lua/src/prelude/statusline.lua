@@ -177,7 +177,11 @@ local function register_events(target_key, names)
   for _, name in ipairs(names) do
     local spec = nx.statusline._segments[name]
     for _, ev in ipairs(spec.events or {}) do
-      ids[#ids + 1] = nx.autocmd.create(ev, {
+      -- A two-word entry `"Event Pattern"` (e.g. `"User DaemonStatusChanged"`) narrows the
+      -- trigger to that pattern; a bare event name matches all patterns, as before.
+      local event, pattern = ev:match("^(%S+)%s+(.+)$")
+      ids[#ids + 1] = nx.autocmd.create(event or ev, {
+        pattern = pattern,
         callback = function()
           nx.statusline.invalidate(name)
         end,

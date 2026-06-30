@@ -25,7 +25,7 @@ use nxvim_rpc::Incoming;
 use std::io;
 use tokio::sync::mpsc::{Receiver, UnboundedReceiver};
 
-use crate::daemon::{FsRead, WatchEvent};
+use crate::daemon::{DaemonStatus, FsRead, WatchEvent};
 use crate::evloop::LoopEvent;
 use crate::save::SaveDone;
 use crate::terminal::native::TermEvent;
@@ -244,6 +244,35 @@ impl EditHost {
             self.on_remote_file_changed(ev);
         }
         self.settle_events(true);
+    }
+
+    /// Reflect a reconnecting daemon link's [`DaemonStatus`] change into the editor + Lua, off
+    /// the editor tick. Maps the native status enum onto the shared phase string, shows the
+    /// loud "run `:reconnect`" hint once the auto-retry budget is spent (`Disconnected`), and
+    /// delegates the mirror-to-Lua + reconnect resync to the shared
+    /// [`apply_daemon_phase`](Self::apply_daemon_phase) (which the wasm edit-host's
+    /// `eh_daemon_status` FFI also drives). A genuine reconnect is a `Reconnecting`/`Disconnected`
+    /// → `Connected` transition — the *first* `Connected` is the initial connect, no resync.
+    pub(crate) fn on_daemon_status(&mut self, status: DaemonStatus) {
+        let phase = match status {
+            DaemonStatus::Connected => "connected",
+            DaemonStatus::Reconnecting { .. } => "reconnecting",
+            DaemonStatus::Disconnected => "disconnected",
+        };
+        let reconnected = matches!(status, DaemonStatus::Connected)
+            && matches!(
+                self.prev_daemon_status,
+                Some(DaemonStatus::Reconnecting { .. }) | Some(DaemonStatus::Disconnected)
+            );
+        self.prev_daemon_status = Some(status);
+        // The `:reconnect` hint is native-only (the wasm edit-host has no such ex-command — its
+        // supervisor auto-retries and the user re-`:connect`s), so it lives here, not in the
+        // shared `apply_daemon_phase`.
+        if matches!(status, DaemonStatus::Disconnected) {
+            self.editor
+                .echo("daemon disconnected — run :reconnect to restore the link");
+        }
+        self.apply_daemon_phase(phase, reconnected);
     }
 
     /// If the editor asked to quit, notify the client (`nxvim_exit`) and report `true` so

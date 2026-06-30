@@ -59,6 +59,12 @@ export class RpcClient {
     this.onNotify = null; // (method, params) => void  — daemon→client pushes
     this.closed = false;
     this.writers = {}; // group name -> WritableStreamDefaultWriter
+    // Resolves the instant this link dies (a stream error, a dropped QUIC session, or an
+    // explicit `close()`). The reconnect supervisor awaits it to know when to re-dial, so it
+    // never has to poll `closed`. Resolved exactly once (in `_fail`).
+    this.dead = new Promise((resolve) => {
+      this._markDead = resolve;
+    });
     // One writer + read loop per group stream. The first byte written on each stream is its
     // group tag — the daemon reads it to dispatch the stream to that group's legs (and it
     // makes the freshly-opened stream visible to the daemon's `accept_bi` promptly). The tag
@@ -118,6 +124,8 @@ export class RpcClient {
     this.closed = true;
     for (const { reject } of this.pending.values()) reject(err);
     this.pending.clear();
+    // Wake the reconnect supervisor (or anything else awaiting this link's death).
+    this._markDead(err);
   }
 
   /**

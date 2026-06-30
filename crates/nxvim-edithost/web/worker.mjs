@@ -52,12 +52,16 @@ const eh_save_len = M.cwrap("eh_save_len", "number", ["number", "number"]);
 // (h, buffer, path, kind, contents, data, len) — a file's raw bytes cross as the data/len
 // pair (so non-UTF-8 reaches Rust intact for the encoding seam); contents carries only the
 // dir JSON / error message. See `landFsRead`.
-const eh_fs_read_complete = M.cwrap("eh_fs_read_complete", null, ["number", "number", "string", "number", "string", "number", "number"]);
+const eh_fs_read_complete = M.cwrap("eh_fs_read_complete", null, ["number", "number", "string", "number", "string", "number", "number", "number", "number", "number"]);
 const eh_fs_write_complete = M.cwrap("eh_fs_write_complete", null, ["number", "number", "number", "number", "number", "string"]);
 // Remote watch leg (Phase 6): the editor arms one watch per file-backed buffer off-tick; the
 // Worker forwards each to the daemon and lands its `fs_changed` pushes back into the tick.
 const eh_take_watch_requests = M.cwrap("eh_take_watch_requests", "number", ["number"]);
 const eh_remote_file_changed = M.cwrap("eh_remote_file_changed", null, ["number", "string", "number", "number", "number"]);
+// Daemon link status (Phase 7): the reconnect supervisor lands each phase
+// ("connected"/"reconnecting"/"disconnected") here; `reconnected != 0` triggers the seam resync
+// (re-arm watches, re-open LSP, freeze lost terminals) and it mirrors to `nx.daemon.status()`.
+const eh_daemon_status = M.cwrap("eh_daemon_status", null, ["number", "string", "number"]);
 // Remote proc leg (Phase 6d): the editor enqueues async `vim.system` / `jobstart` spawns
 // off-tick (only when a process host — a daemon OR a local in-browser Worker host — is present;
 // `eh_set_proc_host` gates it); the Worker forwards each to the host and lands its
@@ -909,18 +913,131 @@ let daemonError = null; // a dial failure reason (daemon mode requested but not 
 // fulfils the proc / terminal / LSP off-tick seams locally (Pyodide); see web/local-host.mjs.
 let localHost = null;
 
-async function connectDaemon() {
-  if (!daemonUri) return;
+// ---- Reconnect supervisor (the daemon-reconnect plan's Phase 7) ----------------------------
+// The editor runs LOCAL (wasm); only the fs/proc/lsp/term seams cross the WebTransport wire, so a
+// dropped connection must NOT lose the local buffers/undo. The supervisor re-dials underneath the
+// seam handles the editor holds and re-syncs them (re-arm watches, re-open LSP, freeze lost
+// terminals) via `eh_daemon_status` — the browser mirror of the native `connect_daemon_reconnecting`
+// supervisor (crates/nxvim-server/src/daemon.rs). Status rides `nx.daemon.status()` like native.
+
+// Auto-retry policy — mirrors the native `ReconnectPolicy::default` (5 attempts over 0.5 → 8 s).
+const RECONNECT = { maxAttempts: 5, baseMs: 500, capMs: 8000 };
+// Bumped on every intentional teardown (a runtime `:connect` replacing the link), so a background
+// serve loop from a retired link sees its generation is stale and exits without re-dialing.
+let daemonGen = 0;
+// True while the supervisor is between a drop and recovery (or give-up). It forces the SAB run
+// loop's NON-blocking park (`Atomics.waitAsync`): a dropped link clears the live-state sets, so
+// `hostPushing` goes false and the loop would otherwise take the *blocking* `Atomics.wait` branch
+// — freezing the event loop, so the supervisor's `setTimeout` backoff and the WebTransport dial
+// (both event-loop work) would never run and the reconnect would hang forever.
+let daemonReconnecting = false;
+
+const sleep = (ms) => new Promise((res) => setTimeout(res, ms));
+const backoffMs = (attempt) => Math.min(RECONNECT.baseMs * 2 ** (attempt - 1), RECONNECT.capMs);
+
+// Land a daemon link phase on the editor. Enqueued as a synthetic notification so it applies on
+// the run loop like any daemon push (`applyDaemonNotifications` calls `eh_daemon_status`), which
+// mirrors it to `nx.daemon.status()`, fires `User DaemonStatusChanged`, and — when `reconnected`
+// — runs the seam resync. The wake mirrors `onDaemonNotify`'s.
+function setDaemonStatus(phase, reconnected) {
+  const wasEmpty = daemonNotifications.length === 0;
+  daemonNotifications.push(["__daemon_status", [phase, reconnected ? 1 : 0]]);
+  if (sabMode) {
+    if (wasEmpty) {
+      if (daemonWaker) {
+        const r = daemonWaker;
+        daemonWaker = null;
+        r();
+      }
+      if (sabCtrl) {
+        Atomics.add(sabCtrl, SEQ, 1);
+        Atomics.notify(sabCtrl, SEQ, 1);
+      }
+    }
+  } else {
+    pump5cDaemon();
+  }
+}
+
+// Forget every per-connection live-state set: a fresh daemon knows none of the old watches,
+// children, language servers, or terminals. Gates the proc host off until the re-dial lands.
+function clearDaemonLiveState() {
+  eh_set_proc_host(h, 0);
+  armedWatches.clear();
+  liveProcs.clear();
+  liveTerms.clear();
+  liveFsWatches.clear();
+  liveLsp.clear();
+  liveDprocs.clear();
+  liveSocks.clear();
+}
+
+// Dial once and, on success, wire the link up + announce `connected`. `reconnected` marks a
+// re-dial after a drop (so the editor runs its seam resync); `false` is the initial connect.
+async function dialOnce(reconnected) {
   try {
     daemon = await dialDaemon(daemonUri);
-    // The watch leg's `fs_changed` pushes and the proc leg's `proc_spawned`/`proc_exited`
-    // pushes arrive here.
+    // The watch leg's `fs_changed` pushes and the proc/lsp/term pushes arrive via this handler.
     daemon.onNotify = onDaemonNotify;
-    // A process host is now reachable: let the editor tick take its async-spawn branch
-    // (`vim.system` / `jobstart`) instead of failing loud.
+    // A process host is reachable again: let the editor tick take its async branches.
     eh_set_proc_host(h, 1);
+    daemonError = null;
+    setDaemonStatus("connected", reconnected);
+    return true;
   } catch (e) {
+    daemon = null;
     daemonError = String(e && e.message ? e.message : e);
+    return false;
+  }
+}
+
+// The background half of the supervisor: hold a live link and, on an unexpected drop, auto-retry
+// with bounded backoff, then park `disconnected`. Runs until its generation is retired (an
+// intentional `:connect` teardown bumps `daemonGen`). The initial dial is the caller's
+// (`startDaemonSupervisor`); this drives every dial *after* it.
+async function serveDaemonLink(myGen) {
+  while (myGen === daemonGen && daemon) {
+    await daemon.dead.catch(() => {}); // wait for THIS connection to die
+    if (myGen !== daemonGen) return; // an intentional replace/teardown won the race
+    // The link is down: drop the dead client so the seams read "not connected" (fail loud)
+    // rather than a closed `RpcClient`, and forget the per-connection live state. Keep the run
+    // loop event-loop-live (`daemonReconnecting`) so the backoff + dial below actually run.
+    daemon = null;
+    clearDaemonLiveState();
+    daemonReconnecting = true;
+    setDaemonStatus("reconnecting", false);
+    let recovered = false;
+    for (let attempt = 1; attempt <= RECONNECT.maxAttempts && myGen === daemonGen; attempt++) {
+      await sleep(backoffMs(attempt));
+      if (myGen !== daemonGen) {
+        daemonReconnecting = false;
+        return;
+      }
+      if (await dialOnce(true)) {
+        recovered = true;
+        break;
+      }
+    }
+    daemonReconnecting = false;
+    if (!recovered) {
+      // Budget spent: park disconnected. A web session has no `:reconnect` ex-command, so the
+      // user re-`:connect`s (which restarts a fresh supervisor) to restore the link.
+      setDaemonStatus("disconnected", false);
+      return;
+    }
+  }
+}
+
+// Start (or restart) the reconnect supervisor for `daemonUri`: dial once (awaited, so a boot /
+// `:connect` failure surfaces synchronously), then drive the background serve+retry loop. A
+// no-op without a `?daemon=` / `:connect` target.
+async function startDaemonSupervisor() {
+  if (!daemonUri) return;
+  const myGen = daemonGen;
+  if (await dialOnce(false)) {
+    serveDaemonLink(myGen); // background — NOT awaited (it serves for the link's lifetime)
+  } else {
+    setDaemonStatus("disconnected", false);
     postMessage({ type: "config_error", error: `daemon connection failed: ${daemonError}` });
   }
 }
@@ -928,26 +1045,20 @@ async function connectDaemon() {
 // Runtime `:connect nxvim://…`: dial a daemon *after* boot and re-point the off-tick fs/watch
 // seam from OPFS onto the wire — the browser twin of nxvim-gui's client-side `:connect`, which
 // the editor core knows nothing about (the UI intercepts it on `<CR>` and routes the URI here).
-// Replaces any existing link (a prior `?daemon=` boot or an earlier `:connect`): the old wire
-// is torn down, its watches forgotten (the new daemon knows none of them), and future `:e`/`:w`
-// route to the new daemon. Posts a `connected` status the UI flashes. Config + shada stay LOCAL
-// (OPFS) regardless, exactly as in `?daemon=` mode.
+// Replaces any existing link (a prior `?daemon=` boot or an earlier `:connect`): the old wire is
+// torn down (retiring its supervisor via `daemonGen`), its watches forgotten (the new daemon
+// knows none of them), and future `:e`/`:w` route to the new daemon. Posts a `connected` status
+// the UI flashes. Config + shada stay LOCAL (OPFS) regardless, exactly as in `?daemon=` mode.
 async function runtimeConnect(uri) {
+  daemonGen++; // retire any running supervisor (and its serve loop) for the prior link
   if (daemon) {
     daemon.close();
     daemon = null;
   }
-  // The old wire is gone: no process host until the new dial succeeds, and the new daemon
-  // knows none of the old watches or in-flight children.
-  eh_set_proc_host(h, 0);
-  armedWatches.clear();
-  liveProcs.clear();
-  liveLsp.clear();
-  liveDprocs.clear();
-  liveSocks.clear();
+  clearDaemonLiveState();
   daemonError = null;
   daemonUri = uri;
-  await connectDaemon();
+  await startDaemonSupervisor();
   postMessage({ type: "connected", ok: !!daemon, uri, error: daemonError });
 }
 
@@ -960,8 +1071,10 @@ async function daemonRead(path) {
     const reply = await daemon.request("fs_read", [path]);
     const tag = Array.isArray(reply) ? reply[0] : null;
     // Keep the RAW bytes (`reply[1]` is a Uint8Array off the msgpack bin) for the encoding
-    // seam — don't `utf8()`-decode here, that would mangle non-UTF-8 content.
-    if (tag === "file") return { kind: 0, bytes: reply[1] };
+    // seam — don't `utf8()`-decode here, that would mangle non-UTF-8 content. `reply[2]` is the
+    // remote file's stat (`[secs, nanos, size]` | nil) — carried as the read-from-disk baseline
+    // so the reconnect re-stat can compare against it (Phase 7).
+    if (tag === "file") return { kind: 0, bytes: reply[1], stat: reply[2] };
     if (tag === "new") return { kind: 1, text: "" };
     if (tag === "dir") {
       // Daemon entries are `[[is_dir, name], …]`; the wasm dir applier wants `[{is_dir,name}]`.
@@ -1157,7 +1270,13 @@ function applyDaemonNotifications() {
   let any = false;
   for (let n; (n = daemonNotifications.shift()); ) {
     const [method, params] = n;
-    if (method === "term_data") {
+    if (method === "__daemon_status") {
+      // A locally-enqueued link phase from the reconnect supervisor (not a wire push):
+      // params = [phase, reconnected]. Land it on the editor — mirrors `nx.daemon.status()`,
+      // fires `User DaemonStatusChanged`, and on a reconnect runs the seam resync.
+      eh_daemon_status(h, String(params[0]), Number(params[1]));
+      any = true;
+    } else if (method === "term_data") {
       // params = [buf, bytes(bin)] — the child's raw PTY output. Feed only; project later.
       const buf = Number(params[0]);
       const bytes = toU8(params[1]);
@@ -1587,9 +1706,12 @@ async function drainWatchRequests() {
   const reqs = JSON.parse(readStr(eh_take_watch_requests(h)));
   if (reqs.arm.length === 0 && reqs.disarm.length === 0) return;
   if (!daemon) return; // serverless OPFS — no remote to watch
-  for (const path of reqs.arm) {
-    armedWatches.add(path);
-    await daemon.notify("fs_watch", [path]);
+  for (const w of reqs.arm) {
+    armedWatches.add(w.path);
+    // Forward the editor's disk baseline (`w.stat` = the wire `[secs,nanos,size]` array, or
+    // null before the file was read) as the known stat, so a re-dialed daemon detects a change
+    // made *during* the outage on re-arm — the reconnect re-stat, at parity with native.
+    await daemon.notify("fs_watch", w.stat ? [w.path, w.stat] : [w.path]);
   }
   for (const path of reqs.disarm) {
     armedWatches.delete(path);
@@ -1643,6 +1765,12 @@ async function pump5cDaemon() {
 // malloc'd buffer for the synchronous call, then freed — there's no `await` between the
 // `HEAPU8.set` and the call, so ALLOW_MEMORY_GROWTH can't detach the heap mid-sequence.
 function landFsRead(buffer, path, kind, res) {
+  // The daemon read's stat (`res.stat` = `[secs, nanos, size]`) becomes the read-from-disk
+  // baseline; an OPFS read has none. `mtime_ms < 0` signals an unknown mtime.
+  const st = Array.isArray(res.stat) ? res.stat : null;
+  const hasStat = st ? 1 : 0;
+  const size = st ? (st[2] ?? 0) : 0;
+  const mtimeMs = st && st[0] != null ? (st[0] ?? 0) * 1000 + Math.floor((st[1] ?? 0) / 1e6) : -1;
   if (kind === 0) {
     const src = res.bytes;
     const bytes = src instanceof Uint8Array ? src : src ? new Uint8Array(src) : new Uint8Array(0);
@@ -1650,12 +1778,12 @@ function landFsRead(buffer, path, kind, res) {
     const ptr = len ? M._malloc(len) : 0;
     if (ptr) M.HEAPU8.set(bytes, ptr);
     try {
-      eh_fs_read_complete(h, buffer, path, kind, "", ptr, len);
+      eh_fs_read_complete(h, buffer, path, kind, "", ptr, len, hasStat, size, mtimeMs);
     } finally {
       if (ptr) M._free(ptr);
     }
   } else {
-    eh_fs_read_complete(h, buffer, path, kind, res.text ?? "", 0, 0);
+    eh_fs_read_complete(h, buffer, path, kind, res.text ?? "", 0, 0, 0, 0, -1);
   }
 }
 
@@ -1951,7 +2079,7 @@ async function runLoopSAB(ctrl, data) {
         liveTerms.size > 0 ||
         liveFsWatches.size > 0 ||
         liveLsp.size > 0);
-    if (hostPushing || indenterBusy()) {
+    if (hostPushing || indenterBusy() || daemonReconnecting) {
       // Don't *block* — a thread frozen in `Atomics.wait` can't run the event loop, so any
       // pending promise stalls. Cases that need it live: a daemon session expecting pushes
       // (a watch armed, or a child in flight — its WebTransport reader must keep running to
@@ -2047,6 +2175,21 @@ onmessage = async (ev) => {
     postMessage(redrawMsg());
     return;
   }
+  // Test-only: force the live daemon link to drop (as a network blip / sleep would), WITHOUT
+  // retiring the supervisor — so its serve loop sees the death and auto-reconnects to the same
+  // daemon. The reconnect verification (`verify-reconnect.mjs`) uses this to exercise recovery
+  // deterministically; normal UI never sends it. `transport.close()` makes `transport.closed`
+  // resolve → `RpcClient._fail` → `daemon.dead` → `serveDaemonLink` re-dials.
+  if (msg.type === "debug_drop_daemon") {
+    if (daemon) {
+      try {
+        daemon.transport.close();
+      } catch {
+        // already closing/closed
+      }
+    }
+    return;
+  }
   // Clipboard mirror push (5c; SAB routes it via a ring type-8 frame in `drain()`). The UI
   // read `navigator.clipboard` and handed us its text — update what a `"+`/`"*` paste reads.
   // No repaint: the cache change is invisible until a paste consumes it.
@@ -2138,9 +2281,9 @@ onmessage = async (ev) => {
 };
 
 // Connect the daemon (if `?daemon=` was passed) *before* boot finishes, so the link is
-// live for the first user `:e` — and a dial failure surfaces before "ready". A no-op in
-// serverless (OPFS) mode.
-await connectDaemon();
+// live for the first user `:e` — and a dial failure surfaces before "ready". Starts the
+// reconnect supervisor (a dropped link auto-re-dials). A no-op in serverless (OPFS) mode.
+await startDaemonSupervisor();
 
 // Python-demo build, serverless: install the local in-browser process host (the Pyodide
 // interpreter backs `:terminal python …`). It opens the `proc_host` gate; Pyodide itself loads

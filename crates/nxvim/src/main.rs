@@ -39,8 +39,9 @@ use clap::Parser;
 
 mod test_runner;
 use nxvim_server::{
-    bind_quic_listener, connect_daemon, connect_quic, mint_token, run as run_server,
-    run_daemon_io as run_server_daemon_io, serve_quic, ConfigSource, DaemonClient, ServerInit,
+    bind_quic_listener, connect_daemon_reconnecting, connect_quic_reconnecting, mint_token,
+    run as run_server, run_daemon_io as run_server_daemon_io, serve_quic, ConfigSource,
+    DaemonClient, ReconnectHandle, ReconnectPolicy, ServerInit,
 };
 
 /// The shada-namespace + workspace options derived from the command line. The namespace
@@ -553,6 +554,9 @@ fn main() -> Result<()> {
         // The TUI handles `:connect`/`:workspace` only at startup (flags), not as live
         // client-intercepted commands, so it registers no virtual commands.
         client_init_lua: None,
+        // The reconnecting daemon link is not wired into the TUI yet (a later phase migrates
+        // `--connect-daemon` / QUIC to the reconnecting dialer); a one-shot link has no handle.
+        daemon_link: None,
     };
     let server_thread = std::thread::spawn(move || {
         // Test-only fault injection (debug builds only): force a server-thread
@@ -707,31 +711,42 @@ fn run_with_daemon(
     config_source: ConfigSource,
 ) -> Result<()> {
     run_edit_host_session(file, shada, config_source, || {
-        // The daemon's stderr can't share the terminal with the TUI; send it to a
-        // private, symlink-safe log the user can tail to diagnose the daemon side.
-        let stderr = daemon_log_stderr();
-        let mut child = daemon_command()?
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(stderr)
-            .kill_on_drop(true)
-            .spawn()?;
-        let stdout = child.stdout.take().expect("daemon stdout piped");
-        let stdin = child.stdin.take().expect("daemon stdin piped");
-
-        // One connection → all five host seams (the edit-host multiplexer). Hold the
-        // child for the whole session; dropping it (on quit) reaps the daemon via
-        // `kill_on_drop`.
-        let client = connect_daemon(stdout, stdin);
-        Ok((client, Box::new(child)))
+        // Reconnecting: re-spawn the daemon command on each (re)dial so a dropped link
+        // (the daemon died, or — for an `NXVIM_DAEMON_CMD="ssh …"` split — the hop dropped
+        // on sleep) re-establishes the seams in place, keeping the editor's local state.
+        // The current child lives on the link thread (kill_on_drop reaps the previous one
+        // when the next dial replaces it).
+        let slot: std::sync::Arc<std::sync::Mutex<Option<tokio::process::Child>>> =
+            std::sync::Arc::new(std::sync::Mutex::new(None));
+        let make = move || {
+            let slot = slot.clone();
+            async move {
+                // The daemon's stderr can't share the terminal with the TUI; send it to a
+                // private, symlink-safe log the user can tail to diagnose the daemon side.
+                let stderr = daemon_log_stderr();
+                let mut child = daemon_command()?
+                    .stdin(Stdio::piped())
+                    .stdout(Stdio::piped())
+                    .stderr(stderr)
+                    .kill_on_drop(true)
+                    .spawn()?;
+                let stdout = child.stdout.take().expect("daemon stdout piped");
+                let stdin = child.stdin.take().expect("daemon stdin piped");
+                *slot.lock().unwrap() = Some(child);
+                Ok((stdout, stdin))
+            }
+        };
+        let (client, handle) = connect_daemon_reconnecting(make, ReconnectPolicy::default())?;
+        Ok((client, Some(handle), Box::new(())))
     })
 }
 
 /// Run the **local** edit-host over a QUIC connection to a `--daemon --listen` listener
 /// (a `nxvim://HOST:PORT/TOKEN?cert=HASH` target). Same editor + TUI as the stdio split;
-/// only the transport differs — [`connect_quic`] pins the daemon's cert TOFU and presents
-/// the bearer token, then returns the same five seams. The QUIC endpoint + connection are
-/// owned by `connect_quic`'s link thread, so there is no child to hold.
+/// only the transport differs — [`connect_quic_reconnecting`] pins the daemon's cert TOFU and
+/// presents the bearer token, then returns the same seams plus a reconnect handle. The QUIC
+/// endpoint + connection are owned by the link thread (no child to hold), and re-dialed under
+/// the seams on a drop (sleep/wake, a network blip), like the ssh path.
 fn run_with_daemon_quic(
     file: Option<String>,
     uri: &str,
@@ -740,8 +755,9 @@ fn run_with_daemon_quic(
 ) -> Result<()> {
     let (url, cert_hash, token) = parse_connect_uri(uri)?;
     run_edit_host_session(file, shada, config_source, move || {
-        let client = connect_quic(&url, &cert_hash, &token)?;
-        Ok((client, Box::new(())))
+        let (client, handle) =
+            connect_quic_reconnecting(&url, &cert_hash, &token, ReconnectPolicy::default())?;
+        Ok((client, Some(handle), Box::new(())))
     })
 }
 
@@ -759,7 +775,12 @@ fn run_edit_host_session<F>(
     connect: F,
 ) -> Result<()>
 where
-    F: FnOnce() -> Result<(DaemonClient, Box<dyn std::any::Any + Send>)> + Send + 'static,
+    F: FnOnce() -> Result<(
+            DaemonClient,
+            Option<ReconnectHandle>,
+            Box<dyn std::any::Any + Send>,
+        )> + Send
+        + 'static,
 {
     let (server_end, client_end) = tokio::io::duplex(1 << 16);
 
@@ -770,7 +791,7 @@ where
             .build()
             .expect("failed to build server runtime");
         let result: Result<()> = runtime.block_on(async move {
-            let (client, _guard) = connect()?;
+            let (client, daemon_link, _guard) = connect()?;
             // Resolve the session's config from the chosen source. `Remote`
             // (`--remote-config`) fetches the daemon's config surface (one `config_bundle`
             // round trip) and materializes it onto a local per-process cache, then points
@@ -847,6 +868,10 @@ where
                 remote_cwd: resolved.remote_cwd,
                 // The TUI registers no client-intercepted virtual commands.
                 client_init_lua: None,
+                // The reconnecting daemon link (ssh/stdio) — its status flows into
+                // `nx.daemon.status()` and `:reconnect`/`:disconnect` drive it. `None` for a
+                // one-shot QUIC connect.
+                daemon_link,
             };
             // `_guard` (the stdio child, or `()` for QUIC) lives until the editor quits.
             run_server(server_end, init).await

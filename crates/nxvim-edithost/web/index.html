@@ -3187,6 +3187,9 @@
       cellMetrics: () => ({ cw, ch }),
       execLua: (code) => execLuaOp(code),
       attach: (c, r) => attachOp(c, r),
+      // Test-only: force the live daemon link to drop (as a sleep/network blip would) so the
+      // Worker's reconnect supervisor auto-re-dials. Used by verify-reconnect.mjs.
+      debugDropDaemon: () => worker.postMessage({ type: "debug_drop_daemon" }),
       lines: () => latest.lines,
       frame: () => latest.frame,
       cursor: () => {

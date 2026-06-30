@@ -113,11 +113,13 @@ pub use shada::{
 /// what one fetch resolves to.
 #[cfg(feature = "native")]
 pub use daemon::{
-    connect_daemon, serve_config_daemon, serve_config_daemon_on, serve_daemon,
-    serve_dproc_daemon_on, serve_fs_daemon, serve_fs_daemon_on, serve_lsp_daemon,
-    serve_lsp_daemon_on, serve_luafs_daemon, serve_luafs_daemon_on, serve_proc_daemon_on,
-    serve_sock_daemon_on, serve_term_daemon_on, DaemonClient, FsRead, HostFsAsync, RemoteConfig,
-    RemoteFsJobs, RemoteHostFs, RemoteHostProc, RemoteHostTerm, RemoteLspTransport, WatchEvent,
+    connect_daemon, connect_daemon_reconnecting, connect_daemon_reconnecting_on,
+    serve_config_daemon, serve_config_daemon_on, serve_daemon, serve_dproc_daemon_on,
+    serve_fs_daemon, serve_fs_daemon_on, serve_lsp_daemon, serve_lsp_daemon_on, serve_luafs_daemon,
+    serve_luafs_daemon_on, serve_proc_daemon_on, serve_sock_daemon_on, serve_term_daemon_on,
+    DaemonClient, DaemonStatus, FsRead, HostFsAsync, ReconnectHandle, ReconnectPolicy,
+    RemoteConfig, RemoteFsJobs, RemoteHostFs, RemoteHostProc, RemoteHostTerm, RemoteLspTransport,
+    WatchEvent,
 };
 /// Materialize a fetched bundle onto the per-process cache resolved from the environment
 /// (`$XDG_CACHE_HOME`/`$HOME`) — the native edit-host's entry point.
@@ -141,12 +143,15 @@ const WASM_REMOTE_CACHE_ROOT: &str = "/nxvim/remote";
 
 /// The native daemon transport (Open Decision #2): a WebTransport/QUIC listener that
 /// runs the [`run_daemon_io`] multiplexer over one bidi stream ([`serve_quic`], the
-/// `--daemon --listen` role), and the edit-host-side [`connect_quic`] that pins the
-/// daemon's self-signed cert TOFU + presents the launch-minted bearer token and returns
-/// the same [`DaemonClient`] `connect_daemon` does over stdio. [`bind_quic_listener`]
-/// mints the identity/token and resolves the bound address (for an ephemeral `:0` port).
+/// `--daemon --listen` role), and the edit-host-side [`connect_quic_reconnecting`] that pins
+/// the daemon's self-signed cert TOFU + presents the launch-minted bearer token and returns
+/// the same [`DaemonClient`] the ssh path does — plus a [`ReconnectHandle`] so a dropped QUIC
+/// link auto-re-dials. [`bind_quic_listener`] mints the identity/token and resolves the bound
+/// address (for an ephemeral `:0` port).
 #[cfg(feature = "native")]
-pub use quic::{bind_quic_listener, connect_quic, mint_token, serve_quic, ListenerInfo};
+pub use quic::{
+    bind_quic_listener, connect_quic_reconnecting, mint_token, serve_quic, ListenerInfo,
+};
 
 /// The outbound async-effect seam the synchronous [`EditHost`] tick emits through
 /// (redraws / notifications to the client, off-tick fs, the event-loop / LSP command
@@ -169,7 +174,7 @@ use nxvim_core::{
 };
 #[cfg(feature = "native")]
 use nxvim_lsp::LspManager;
-use nxvim_lsp::{CodeActionData, ServerKey};
+use nxvim_lsp::{CodeActionData, ServerKey, ServerSpawn};
 use nxvim_lua::LuaRuntime;
 #[cfg(feature = "native")]
 use nxvim_rpc::{connect, Incoming, Rpc};
@@ -364,6 +369,16 @@ pub struct ServerInit {
     /// them to do the actual session swap; the server-side body is a no-op). Failing
     /// loud: a chunk error is surfaced, not swallowed.
     pub client_init_lua: Option<String>,
+    /// The reconnecting daemon link's handle, when the session connects to a `--daemon`
+    /// over a reconnectable transport. `None` (the default) for a local/bare session — and
+    /// for a one-shot daemon link (the non-reconnecting `connect_daemon`/`connect_quic`
+    /// paths). When set, the run loop reflects its [`DaemonStatus`] into the editor + Lua
+    /// (`nx.daemon.status()`, the `User DaemonStatusChanged` autocmd, a "run `:reconnect`"
+    /// message on give-up), and `:reconnect` / `:disconnect` drive it. Native-only — the
+    /// reconnectable link ([`ReconnectHandle`]) lives in the native-gated transport tree; the
+    /// wasm edit-host's own reconnect is a later phase.
+    #[cfg(feature = "native")]
+    pub daemon_link: Option<ReconnectHandle>,
 }
 
 /// How the server provides the `"+` / `"*` clipboard registers.
@@ -644,6 +659,21 @@ pub struct EditHost {
     /// today's behavior verbatim; the wasm build swaps in a JS-interop + daemon-link
     /// implementor. See [`edithost`].
     fx: Box<dyn HostEffects>,
+    /// The reconnecting daemon link's handle for a remote session, or `None` for a
+    /// local/bare/one-shot session. Shared by the run loop's status arm (which reflects
+    /// [`DaemonStatus`] changes into the editor + Lua), the `:reconnect` / `:disconnect`
+    /// ex-commands, and — via the pushed Lua mirror — `nx.daemon.status()`. Set from
+    /// [`ServerInit::daemon_link`] in [`run_io`]. Native-only (the reconnect link is too).
+    #[cfg(feature = "native")]
+    daemon_link: Option<ReconnectHandle>,
+    /// The last [`DaemonStatus`] the run loop reflected, so [`on_daemon_status`] can tell a
+    /// genuine **reconnect** (a `Reconnecting`/`Disconnected` → `Connected` transition, which
+    /// triggers the state re-sync) from the initial connect (the first `Connected`). `None`
+    /// until the first status lands. Native-only (the reconnect link is too).
+    ///
+    /// [`on_daemon_status`]: EditHost::on_daemon_status
+    #[cfg(feature = "native")]
+    prev_daemon_status: Option<DaemonStatus>,
     /// The persistence (shada) store, or `None` when persistence is off (the test
     /// default). Loaded before the first frame ([`EditHost::shada_load`]), written by
     /// the debounced live checkpoint ([`EditHost::shada_checkpoint`]) and the
@@ -710,6 +740,12 @@ pub struct EditHost {
     /// Server keys already handed to `ensure_server`, so a server is requested
     /// once rather than on every redraw (a lazy-start guard).
     lsp_ensured: HashSet<ServerKey>,
+    /// The [`ServerSpawn`] each ensured server was started with, kept so the daemon
+    /// reconnect resync can re-`ensure` a fresh server against the new connection without
+    /// re-running the Lua `nx.lsp.start` dispatch (the remote child died with the dropped
+    /// link, and its respawn would have hit the dead wire). Only a daemon session ever reads
+    /// it back; cheap to keep otherwise.
+    lsp_spawns: HashMap<ServerKey, ServerSpawn>,
     /// The next LSP client id to assign. Each `(name, root)` server gets one,
     /// stable across respawns (reused when its runtime is replaced), and it is
     /// the handle `LspAttach`'s `data.client_id` carries to Lua (Slice 3).
@@ -1125,6 +1161,10 @@ impl EditHost {
             lua,
             fx,
             #[cfg(feature = "native")]
+            daemon_link: None,
+            #[cfg(feature = "native")]
+            prev_daemon_status: None,
+            #[cfg(feature = "native")]
             shada: None,
             #[cfg(feature = "native")]
             global_history: None,
@@ -1143,6 +1183,7 @@ impl EditHost {
             lsp_servers: HashMap::new(),
             signature_auto: false,
             lsp_ensured: HashSet::new(),
+            lsp_spawns: HashMap::new(),
             next_lsp_client_id: 1,
             lsp_dirty: false,
             lsp_req_gen: 0,
@@ -1661,6 +1702,7 @@ impl EditHost {
         kind: u8,
         bytes: &[u8],
         err: &str,
+        stat: Option<FileStat>,
     ) {
         // A reserved preview fetch (the off-tick branch of `ensure_preview`): route the
         // bytes to the picker preview cache, NOT into a buffer — a read-only preview must
@@ -1679,8 +1721,8 @@ impl EditHost {
             // kind 0 = an existing file (real bytes); kind 1 = a new file that wasn't on
             // disk. The flag stamps the read-from-disk baseline for the former so it fires
             // `BufReadPost`, not `BufNewFile` (see `load_replica_wasm`).
-            0 => self.load_replica_wasm(buffer, path, bytes, true),
-            1 => self.load_replica_wasm(buffer, path, b"", false),
+            0 => self.load_replica_wasm(buffer, path, bytes, true, stat),
+            1 => self.load_replica_wasm(buffer, path, b"", false, None),
             2 => {
                 // A workspace edit never targets a directory; drop any stranded stash.
                 self.pending_replica_edits.remove(&buffer);
@@ -1719,13 +1761,22 @@ impl EditHost {
     /// like a new file (no `disk_stat`) and fire `BufNewFile`. Stamp a read-from-disk
     /// baseline for it — before `emit_lifecycle_events` checks `buffer_is_new_file` — so it
     /// fires `BufReadPost`, the event config keys diagnostics / LSP attach off of.
-    fn load_replica_wasm(&mut self, buffer: BufferId, path: String, bytes: &[u8], existed: bool) {
+    fn load_replica_wasm(
+        &mut self,
+        buffer: BufferId,
+        path: String,
+        bytes: &[u8],
+        existed: bool,
+        stat: Option<FileStat>,
+    ) {
         self.editor
             .load_bytes_into(buffer, Some(path.clone()), bytes);
         if existed {
-            // The wasm/OPFS read carries no stat (and serverless has no watch leg), so
-            // pass `None` for a size-only baseline — enough to fire `BufReadPost`.
-            self.editor.mark_replica_read_from_disk(buffer, None);
+            // Stamp the read-from-disk baseline so the read fires `BufReadPost`, not
+            // `BufNewFile`. A *daemon* read carries the remote's real stat (threaded here from
+            // `fs_read`'s reply) so the reconnect re-stat can compare against an accurate
+            // snapshot; a serverless OPFS read has no stat (`None`) — a size-only baseline.
+            self.editor.mark_replica_read_from_disk(buffer, stat);
         }
         // A project-wide rename / code action whose edits reached this (off-tick) file
         // stashed them while the OPFS fetch was in flight; apply them now the real
@@ -2824,6 +2875,18 @@ where
             }
         });
     }
+    // The reconnecting daemon link's status feed: the supervisor publishes
+    // Connected/Reconnecting/Disconnected on a `watch`, and the `daemon_status_rx` arm
+    // reflects each into the editor + Lua off the tick. A local/bare/one-shot session has no
+    // link, so a placeholder channel keeps the arm valid but idle (its sender, kept bound for
+    // the whole loop, never sends — so `changed()` pends forever).
+    let (_daemon_status_keep, mut daemon_status_rx) = match init.daemon_link.as_ref() {
+        Some(link) => (None, link.subscribe()),
+        None => {
+            let (tx, rx) = tokio::sync::watch::channel(daemon::DaemonStatus::Connected);
+            (Some(tx), rx)
+        }
+    };
 
     // The native outbound-effect seam: the client wire ([`Rpc`]), the event-loop actor
     // ([`EventLoop`]), the off-tick daemon fs (read/write/watch + the `open_tx` /
@@ -2864,6 +2927,10 @@ where
         _ => None,
     };
     host.mouse_clock = init.mouse_clock;
+    // The reconnecting daemon link handle (status + `:reconnect`/`:disconnect`), moved onto
+    // the host now that `daemon_status_rx` is already subscribed above. `None` for a
+    // local/bare/one-shot session.
+    host.daemon_link = init.daemon_link;
     // In a daemon session the one true cwd is the *daemon's*, not the local process's
     // — seed `DirState` from it so `:pwd` / `vim.fn.getcwd` report the remote dir and
     // `:cd` moves it over the wire (`docs/plans/2026-06-23-remote-cwd.md`). No local
@@ -3010,6 +3077,14 @@ where
         host.run_pending();
     }
 
+    // Reflect the initial daemon link status (Connected) into the editor + Lua so a
+    // statusline shows it from the first frame; subsequent changes arrive on the
+    // `daemon_status_rx` arm below.
+    if host.daemon_link.is_some() {
+        let status = *daemon_status_rx.borrow();
+        host.on_daemon_status(status);
+    }
+
     // The run loop is a thin translator over the `host` (the standalone `EditHost`): each
     // arm receives one event off a transport and hands the whole batch to an inbound-seam
     // handler (`inbound.rs`), which coalesces the channel, runs the per-event tick method,
@@ -3059,6 +3134,15 @@ where
             // The daemon's watch leg pushed a file change (`HostWatch`): reconcile it off
             // the editor tick. Idle for a local/bare session (nothing ever sends here).
             Some(ev) = watch_rx.recv() => host.on_watch_events(ev, &mut watch_rx),
+            // The reconnecting daemon link changed state (Connected/Reconnecting/
+            // Disconnected): reflect it into the editor + Lua off the tick — the
+            // `nx.daemon.status()` mirror, the `User DaemonStatusChanged` autocmd, and a
+            // "run :reconnect" message once the auto-retry budget is spent. Idle for a
+            // local/bare/one-shot session (the placeholder sender never sends).
+            Ok(()) = daemon_status_rx.changed() => {
+                let status = *daemon_status_rx.borrow_and_update();
+                host.on_daemon_status(status);
+            }
         }
     }
     // The loop has exited (quit or client disconnect): flush the final snapshot to

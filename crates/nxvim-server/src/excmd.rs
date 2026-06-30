@@ -70,6 +70,11 @@ impl EditHost {
             }
             // `:pw[d]` — print the working directory on the message line.
             _ if matches!(base, "pw" | "pwd") => self.ex_pwd(),
+            // `:reconnect` / `:disconnect` — drive a remote session's daemon link. The link
+            // re-dials underneath the seams the editor already holds, so neither command
+            // touches local buffers/undo. No-ops with a loud message in a local session.
+            "reconnect" => self.ex_reconnect(),
+            "disconnect" => self.ex_disconnect(),
             // Phase-1 LSP observability: dump server/document state into a listing.
             // The LSP ex-command surface is NOT native-gated: every method below
             // works on the wasm edit-host too, where servers run on the daemon and
@@ -347,6 +352,37 @@ impl EditHost {
         let tab = self.editor.current_tab_id();
         let (_, dir) = self.dirs.effective(win, tab);
         self.editor.echo(dir.display().to_string());
+    }
+
+    /// `:reconnect` — re-dial the remote daemon now, resetting the auto-retry budget. Use
+    /// after the link gave up (status `disconnected`) or to retry sooner than the backoff.
+    /// The seams rebind in place, so the editor keeps its buffers/undo. A loud no-op in a
+    /// local session.
+    fn ex_reconnect(&mut self) {
+        // The reconnectable link is native-only (its handle lives in the native transport
+        // tree); the wasm edit-host has no `:reconnect` yet (a later phase).
+        #[cfg(feature = "native")]
+        if let Some(link) = &self.daemon_link {
+            link.reconnect();
+            self.editor.echo("reconnecting to the daemon…");
+            return;
+        }
+        self.editor
+            .echo("E: :reconnect needs a daemon session (this session is local)");
+    }
+
+    /// `:disconnect` — drop the live daemon link and stay disconnected until `:reconnect`.
+    /// The editor keeps editing locally; remote ops (save, LSP, watch, terminal) fail loud
+    /// until reconnected. A loud no-op in a local session.
+    fn ex_disconnect(&mut self) {
+        #[cfg(feature = "native")]
+        if let Some(link) = &self.daemon_link {
+            link.disconnect();
+            self.editor.echo("disconnecting from the daemon");
+            return;
+        }
+        self.editor
+            .echo("E: :disconnect needs a daemon session (this session is local)");
     }
 
     /// `:make[!]` / `:grep[!]` — run `'makeprg'` / `'grepprg'` and route the output

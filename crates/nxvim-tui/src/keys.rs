@@ -59,6 +59,7 @@ pub fn encode_key(ev: KeyEvent) -> Option<String> {
         KeyCode::End => Key::End,
         KeyCode::PageUp => Key::PageUp,
         KeyCode::PageDown => Key::PageDown,
+        KeyCode::F(n) => Key::Function(n),
         _ => return None,
     };
     Some(notation(ctrl, alt, shift, key))

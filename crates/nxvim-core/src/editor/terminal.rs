@@ -493,6 +493,23 @@ pub(crate) fn key_to_terminal_bytes(key: Key, app_cursor: bool) -> Vec<u8> {
         | KeyCode::End => unreachable!("cursor keys handled by the DECCKM block above"),
         KeyCode::PageUp => b"\x1b[5~".to_vec(),
         KeyCode::PageDown => b"\x1b[6~".to_vec(),
+        // Function keys → the standard xterm encodings, so a TUI running inside the
+        // terminal receives them. F1-F4 are SS3 (`ESC O P..S`); F5+ are CSI `~` codes.
+        KeyCode::Function(n) => match n {
+            1 => b"\x1bOP".to_vec(),
+            2 => b"\x1bOQ".to_vec(),
+            3 => b"\x1bOR".to_vec(),
+            4 => b"\x1bOS".to_vec(),
+            5 => b"\x1b[15~".to_vec(),
+            6 => b"\x1b[17~".to_vec(),
+            7 => b"\x1b[18~".to_vec(),
+            8 => b"\x1b[19~".to_vec(),
+            9 => b"\x1b[20~".to_vec(),
+            10 => b"\x1b[21~".to_vec(),
+            11 => b"\x1b[23~".to_vec(),
+            12 => b"\x1b[24~".to_vec(),
+            _ => Vec::new(), // no standard encoding beyond F12
+        },
         // A mouse key (`<LeftMouse>` / `<ScrollWheelUp>` …) is resolved server-side and
         // never reaches the terminal as input — it has no PTY byte encoding.
         KeyCode::Mouse { .. } | KeyCode::ScrollWheel(_) => Vec::new(),

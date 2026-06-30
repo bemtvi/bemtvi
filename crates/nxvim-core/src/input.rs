@@ -35,6 +35,10 @@ pub enum KeyCode {
     End,
     PageUp,
     PageDown,
+    /// A function key `<F1>`..`<F12>` (and beyond — terminals/`crossterm` report up to
+    /// `F12`, but the notation is open-ended). Carried as a mappable key like the named
+    /// keys above so a plugin can bind `<F5>` and a client (TUI/GUI) can deliver it.
+    Function(u8),
     /// A mouse gesture as a mappable key — vim's `<LeftMouse>` / `<2-LeftMouse>` /
     /// `<RightMouse>` / `<MiddleMouse>` (press), `<LeftDrag>` / `<RightDrag>` /
     /// `<MiddleDrag>` (drag), and `<LeftRelease>` / … (release). `kind` is which phase
@@ -310,6 +314,7 @@ pub fn key_to_notation(key: Key) -> String {
         KeyCode::End => (true, "End".to_string()),
         KeyCode::PageUp => (true, "PageUp".to_string()),
         KeyCode::PageDown => (true, "PageDown".to_string()),
+        KeyCode::Function(n) => (true, format!("F{n}")),
         KeyCode::Mouse {
             button,
             clicks,
@@ -465,6 +470,13 @@ fn parse_special(inner: &str) -> Option<Key> {
         "scrollwheeldown" => KeyCode::ScrollWheel(WheelDir::Down),
         "scrollwheelleft" => KeyCode::ScrollWheel(WheelDir::Left),
         "scrollwheelright" => KeyCode::ScrollWheel(WheelDir::Right),
+        // Function keys `<F1>`, `<F12>`, … — an `f` followed by a 1+ digit number.
+        fk if fk.len() >= 2
+            && fk.starts_with('f')
+            && fk[1..].bytes().all(|b| b.is_ascii_digit()) =>
+        {
+            KeyCode::Function(fk[1..].parse().ok()?)
+        }
         other => {
             let mut it = other.chars();
             let c = it.next()?;

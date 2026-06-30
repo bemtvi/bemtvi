@@ -2681,7 +2681,14 @@
     };
     function keyToNotation(e) {
       let base = SPECIAL[e.key];
-      const isSpecial = !!base;
+      let isSpecial = !!base;
+      // Function keys: the browser already names them "F1".."F12" — the vim notation
+      // stem. Treat as a named key so it wraps (<F5>) and shift/ctrl become modifiers
+      // (<S-F5>/<C-F6>), matching the TUI/GUI clients and the core parser.
+      if (!base && /^F\d+$/.test(e.key)) {
+        base = e.key;
+        isSpecial = true;
+      }
       if (!base) {
         // With a Ctrl/Alt modifier read e.code so the BASE letter survives composition.
         if ((e.ctrlKey || e.altKey) && /^Key[A-Z]$/.test(e.code)) {
@@ -2908,6 +2915,9 @@
     // EditContext-host #ime div (Chrome). Bind both so focus landing on either is covered;
     // only one is ever focused, so a key fires the handler once.
     const onProxyKeydown = (e) => {
+      // F5 (reload) and F12 (devtools) stay with the browser; other F-keys (F6/F10/F11…)
+      // are encoded by keyToNotation and fed. So a web dap session uses :DapContinue for
+      // "continue" (the F5 default is browser-reserved here) but F10/F11/F6 work as keys.
       if (e.key === "F5" || e.key === "F12") return;
       if (e.metaKey && !e.ctrlKey) return; // leave browser Cmd-shortcuts alone
       const n = keyToNotation(e);

@@ -98,7 +98,37 @@ fn navigation_keys_use_angle_notation() {
 
 #[test]
 fn unmapped_keys_return_none() {
-    assert_eq!(note(KeyCode::F(1), KeyModifiers::NONE), None);
+    // A key code with no vim-notation mapping is dropped (the caller ignores it).
+    // (`Insert` has no notation here; F-keys used to be here too — see below.)
+    assert_eq!(note(KeyCode::Insert, KeyModifiers::NONE), None);
+}
+
+#[test]
+fn function_keys_map_to_angle_notation() {
+    // Regression: crossterm reports F-keys as `KeyCode::F(n)`, but encode_key had no
+    // arm for them, so they hit the catch-all and were dropped — `<F5>` (and the dap
+    // plugin's default <F5>/<F10>/<F11> bindings) never reached the server in the TUI.
+    assert_eq!(
+        note(KeyCode::F(5), KeyModifiers::NONE).as_deref(),
+        Some("<F5>")
+    );
+    assert_eq!(
+        note(KeyCode::F(1), KeyModifiers::NONE).as_deref(),
+        Some("<F1>")
+    );
+    assert_eq!(
+        note(KeyCode::F(12), KeyModifiers::NONE).as_deref(),
+        Some("<F12>")
+    );
+    // Modifiers wrap the named key (`<S-F5>`, `<C-F6>`).
+    assert_eq!(
+        note(KeyCode::F(5), KeyModifiers::SHIFT).as_deref(),
+        Some("<S-F5>")
+    );
+    assert_eq!(
+        note(KeyCode::F(6), KeyModifiers::CONTROL).as_deref(),
+        Some("<C-F6>")
+    );
 }
 
 #[test]

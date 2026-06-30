@@ -25,6 +25,9 @@ pub enum Key {
     End,
     PageUp,
     PageDown,
+    /// A function key `<F1>`..`<F12>` (terminals report up to F12; the notation is
+    /// open-ended). The `u8` is the number, so `Function(5)` notates as `<F5>`.
+    Function(u8),
 }
 
 /// Translate a neutral key press (with its `ctrl`/`alt`/`shift` modifiers) into vim
@@ -76,6 +79,7 @@ pub fn notation(ctrl: bool, alt: bool, shift: bool, key: Key) -> String {
         Key::End => wrap("End"),
         Key::PageUp => wrap("PageUp"),
         Key::PageDown => wrap("PageDown"),
+        Key::Function(n) => wrap(&format!("F{n}")),
     }
 }
 

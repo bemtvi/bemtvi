@@ -120,6 +120,27 @@ async fn function_map_fires_and_withholds_its_keys() {
     );
 }
 
+/// A function key (`<F5>`) fires its mapping. Regression: function keys weren't
+/// modeled in the notation parser at all — `<F5>` parsed to nothing, so both the
+/// `keymap.set` LHS and the fed input were empty, and the map never matched. (This
+/// is what made the dap plugin's default `<F5>`/`<F10>`/`<F11>` bindings inert.)
+#[tokio::test]
+async fn function_key_map_fires() {
+    let dir = temp_dir("keymap_fkey");
+    let (rpc, mut incoming) = start_with_config(
+        &dir,
+        "vim.keymap.set('n', '<F5>', function() print('F5_RAN') end)\n",
+    )
+    .await;
+
+    let redraw = redraw_after(&rpc, &mut incoming, "<F5>").await;
+    assert_eq!(
+        message(&redraw),
+        "F5_RAN",
+        "the <F5> mapping's function ran"
+    );
+}
+
 /// A `noremap` string RHS is fed straight to the editor: `Y` → `y$` yanks to
 /// end-of-line, observable by pasting it back.
 #[tokio::test]

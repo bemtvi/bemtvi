@@ -18,8 +18,10 @@ services:
     image: nxvim-daemon
     container_name: nxvim-daemon
     ports:
-      # QUIC is UDP. Bind to loopback on the host; the token/cert are the real auth.
-      - "127.0.0.1:8765:8765/udp"
+      # QUIC is UDP. Published on ALL host interfaces (no 127.0.0.1 prefix) so the daemon
+      # is reachable off-host — the per-launch token + TOFU cert are the auth gate. Drop
+      # the bind back to "127.0.0.1:8765:8765/udp" if you only want local access.
+      - "8765:8765/udp"
 
   nxvim-web:
     build:
@@ -30,5 +32,8 @@ services:
     image: nxvim-web
     container_name: nxvim-web
     ports:
-      # Plain HTTP; localhost is a secure context, so WebTransport works from the page.
-      - "127.0.0.1:8088:8088"
+      # Plain HTTP, published on ALL host interfaces. NOTE: WebTransport needs a secure
+      # context — that holds on http://localhost, but NOT when the page is reached over
+      # this off-host binding by IP/hostname (you'd need HTTPS in front). For local use,
+      # bind back to "127.0.0.1:8088:8088" and open http://localhost:8088.
+      - "8089:8088"

@@ -2,9 +2,11 @@
 # examples/docker-daemon) compiles from source inside the image, so none of the
 # local build output, VCS, or web/node artifacts need to be sent.
 target/
+**/target/
 .git/
 **/node_modules/
 crates/nxvim-web/pkg/
 crates/nxvim-web/dist/
 **/*.wasm
 vendor/neovim/
+.basedpyright-src

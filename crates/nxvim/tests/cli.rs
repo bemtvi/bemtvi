@@ -55,6 +55,83 @@ fn run(mut cmd: Command, timeout: Duration) -> (ExitStatus, String, Duration) {
     (status, stderr, start.elapsed())
 }
 
+/// Like [`run`], but also captures stdout — for the `--lua` output-routing tests that
+/// assert a script's `print` reaches the process's real stdout. Returns
+/// (status, stdout, stderr, elapsed).
+fn run_io(mut cmd: Command, timeout: Duration) -> (ExitStatus, String, String, Duration) {
+    let start = Instant::now();
+    let mut child = cmd.spawn().expect("spawn nxvim");
+    let status = loop {
+        if let Some(status) = child.try_wait().expect("try_wait") {
+            break status;
+        }
+        if start.elapsed() > timeout {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("nxvim did not exit within {timeout:?}");
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    let mut stdout = String::new();
+    if let Some(mut pipe) = child.stdout.take() {
+        let _ = pipe.read_to_string(&mut stdout);
+    }
+    let mut stderr = String::new();
+    if let Some(mut pipe) = child.stderr.take() {
+        let _ = pipe.read_to_string(&mut stderr);
+    }
+    (status, stdout, stderr, start.elapsed())
+}
+
+/// A `--lua` script's `print(...)` must reach the process's real **stdout** — the
+/// headless one-shot has no UI, so output routed only to the message line would vanish.
+/// A shell/CI running `nxvim --lua '...print(x)...'` must be able to read it back.
+#[test]
+fn lua_oneshot_print_goes_to_stdout() {
+    let cfg = fresh_dir("cfg");
+    let mut cmd = nxvim(&cfg);
+    cmd.arg("--lua").arg("print('hello_stdout_marker')");
+    let (status, stdout, stderr, _) = run_io(cmd, Duration::from_secs(45));
+    assert!(
+        status.success(),
+        "a printing --lua CODE must exit 0: {status:?} (stderr: {stderr})"
+    );
+    assert!(
+        stdout.contains("hello_stdout_marker"),
+        "print output must reach stdout, got stdout: {stdout:?} stderr: {stderr:?}"
+    );
+    let _ = std::fs::remove_dir_all(&cfg);
+}
+
+/// A `--lua` script's error-writer output (`nx.err_writeln`) must reach **stderr**,
+/// kept off stdout so a caller consuming the script's stdout as data isn't polluted by
+/// diagnostics. (Plain `print` → stdout is covered above.)
+#[test]
+fn lua_oneshot_err_write_goes_to_stderr() {
+    let cfg = fresh_dir("cfg");
+    let mut cmd = nxvim(&cfg);
+    cmd.arg("--lua")
+        .arg("nx.err_writeln('err_stderr_marker'); print('out_stdout_marker')");
+    let (status, stdout, stderr, _) = run_io(cmd, Duration::from_secs(45));
+    assert!(
+        status.success(),
+        "the script must exit 0: {status:?} (stderr: {stderr})"
+    );
+    assert!(
+        stderr.contains("err_stderr_marker"),
+        "nx.err_writeln output must reach stderr, got stderr: {stderr:?}"
+    );
+    assert!(
+        !stdout.contains("err_stderr_marker"),
+        "error output must NOT leak onto stdout, got stdout: {stdout:?}"
+    );
+    assert!(
+        stdout.contains("out_stdout_marker"),
+        "plain print must still reach stdout, got stdout: {stdout:?}"
+    );
+    let _ = std::fs::remove_dir_all(&cfg);
+}
+
 /// A `--lua` CODE with a **compile error** must exit non-zero promptly, with the Lua
 /// error on stderr — not swallow the failed `nvim_exec_lua`, spin out the full 30s
 /// completion poll (the flag-setting chunk never ran), and exit 0 as if it succeeded.

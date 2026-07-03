@@ -343,6 +343,13 @@ pub struct ServerInit {
     /// `nx.cmdline_complete.setup{ ... }` (e.g. toggling the `docs` preview pane)
     /// still wins. Mirrors `offer_default_recommended`.
     pub cmdline_complete_default: bool,
+    /// Route captured Lua message output (`print` / `nvim_echo` / `nx.err_write*`) to the
+    /// process's real stdout / stderr instead of the (absent) message line. `false` (the
+    /// default) keeps the normal in-editor routing; the `nxvim --lua CODE` one-shot sets it
+    /// `true` so a headless script's `print` reaches the shell/CI that launched it. Only ever
+    /// set for that one-shot — an interactive/daemon session's stdout carries the RPC wire, so
+    /// writing to it there would corrupt the transport. See [`EditHost::lua_stdio`].
+    pub lua_stdio: bool,
     /// The daemon's installed tree-sitter parser languages, so a remote session can
     /// compile the *same* parsers locally (parsers are native artifacts, never fetched
     /// over the wire). Compiled **lazily** — the first time a buffer of each filetype
@@ -1029,6 +1036,15 @@ pub struct EditHost {
     /// and the `nx.test` framework is installed. Off by default, so a normal editor
     /// session neither pays the mirror cost nor exposes the test API.
     test_mode: bool,
+    /// Route captured Lua message output (`print` / `nvim_echo` / the `nx.err_write*`
+    /// error writers) to the process's real **stdout / stderr** instead of the editor
+    /// message line. Set only by the headless `nxvim --lua CODE` one-shot (via
+    /// [`ServerInit::lua_stdio`]), which has no UI attached — so a script's `print`
+    /// reaches the shell/CI that launched it rather than vanishing into a `:messages`
+    /// buffer nobody reads. Off by default (an interactive/daemon session's stdout is
+    /// the RPC transport, so writing to it would corrupt the wire). Error lines go to
+    /// stderr, plain lines to stdout, matching the one-shot's exit-status contract.
+    lua_stdio: bool,
     /// Buffers with an off-tick write currently on the wire — at most one per buffer,
     /// so a buffer's overlapping `:w`s serialize (snapshot order = wire order) rather
     /// than racing. Cleared when the write acks.
@@ -1245,6 +1261,7 @@ impl EditHost {
             preview_anchor: None,
             feed_buffer: VecDeque::new(),
             test_mode: false,
+            lua_stdio: false,
             saves_inflight: HashSet::new(),
             saves_queued: HashMap::new(),
             quit_all_gate: None,
@@ -2927,6 +2944,10 @@ where
         _ => None,
     };
     host.mouse_clock = init.mouse_clock;
+    // The `--lua` one-shot routes `print` / echo / error output to the real stdout/stderr
+    // (no UI is attached to show the message line). Safe only here: this session's client
+    // wire is an in-process duplex, so the process stdout is free.
+    host.lua_stdio = init.lua_stdio;
     // The reconnecting daemon link handle (status + `:reconnect`/`:disconnect`), moved onto
     // the host now that `daemon_status_rx` is already subscribed above. `None` for a
     // local/bare/one-shot session.

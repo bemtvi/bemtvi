@@ -377,11 +377,15 @@ impl EditHost {
         // Each captured `print` / `nvim_echo` line becomes a message: the last
         // is shown on the message line, and every line lands in `:messages`. Error
         // writers (`nx.err_write*`) route through `echo_err` so they paint red.
+        // Under the headless `--lua` one-shot ([`lua_stdio`](EditHost::lua_stdio)) there
+        // is no UI, so each line goes to the real stdout (plain) / stderr (error) instead,
+        // reaching the shell/CI that launched it.
         for line in self.lua.take_output() {
-            if line.error {
-                self.editor.echo_err(line.text);
-            } else {
-                self.editor.echo(line.text);
+            match (self.lua_stdio, line.error) {
+                (true, false) => println!("{}", line.text),
+                (true, true) => eprintln!("{}", line.text),
+                (false, false) => self.editor.echo(line.text),
+                (false, true) => self.editor.echo_err(line.text),
             }
         }
         // Picker actions a `picker`-bucket keymap fired (`nx._picker_action`): apply

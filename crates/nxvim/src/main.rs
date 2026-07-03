@@ -280,6 +280,9 @@ fn run_lua_oneshot(code: String, shada: &ShadaOpts, workspace_cwd: bool) -> Resu
             clipboard: nxvim_server::ClipboardProvider::Disabled,
             offer_default_recommended: false,
             cmdline_complete_default: false,
+            // Headless: no UI is attached, so route `print` / echo / error output to the
+            // real stdout/stderr instead of an invisible message line.
+            lua_stdio: true,
             ..Default::default()
         };
         let runtime = tokio::runtime::Builder::new_current_thread()
@@ -638,6 +641,8 @@ fn main() -> Result<()> {
         // Command-line completion (`:`+<Tab>) is on by default in the interactive
         // binary; a config's own `nx.cmdline_complete.setup{ ... }` still wins.
         cmdline_complete_default: true,
+        // Interactive: `print` shows on the message line, not stdout (which the TUI owns).
+        lua_stdio: false,
         // A local session has no remote parser set to mirror; tree-sitter installs
         // happen on demand via `:TSInstall`.
         ts_autoinstall: Vec::new(),
@@ -963,6 +968,8 @@ where
                 // command-line completion by default (a config's setup{} still wins).
                 offer_default_recommended: true,
                 cmdline_complete_default: true,
+                // Interactive: `print` shows on the message line, not stdout.
+                lua_stdio: false,
                 // Mirror the daemon's installed tree-sitter parsers locally.
                 ts_autoinstall: resolved.ts_autoinstall,
                 // Seed the working directory from the daemon (remote-cwd).

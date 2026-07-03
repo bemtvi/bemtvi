@@ -506,6 +506,8 @@ async fn server_init(
         // enable command-line completion by default (a config's setup{} still wins).
         offer_default_recommended: true,
         cmdline_complete_default: true,
+        // Interactive: `print` shows on the message line, not stdout.
+        lua_stdio: false,
         ts_autoinstall,
         remote_cwd,
         // Register the GUI's client-intercepted commands as no-op virtual commands so

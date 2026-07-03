@@ -2848,7 +2848,17 @@ where
         }
         None => Arc::new(StdHostProc),
     };
-    let (evloop, mut loop_events) = EventLoop::new(host_proc, fs_backend);
+    // The LOCAL twins of the session's proc/fs seams, for `local`-flagged ops — the
+    // `nx.plugins` manager's git + discovery. Always the real local disk / local child
+    // process, so plugins are cloned and discovered locally (they load into this local
+    // Lua VM via the local runtimepath) even in a daemon session, where `host_proc`/
+    // `fs_backend` above route to the remote. In a bare/local session these resolve to the
+    // same local disk the session already uses, so behavior is unchanged.
+    // See `docs/plans/2026-07-03-remote-aware-plugin-manager.md`.
+    let local_host_proc: Arc<dyn HostProc> = Arc::new(StdHostProc);
+    let local_fs_backend = evloop::FsBackend::Local(Arc::new(nxvim_lua::StdLuaFs::new()));
+    let (evloop, mut loop_events) =
+        EventLoop::new(host_proc, fs_backend, local_host_proc, local_fs_backend);
     // The terminal actor: owns the local PTYs `:terminal` spawns, streaming their
     // output back on `term_events`. Lazily started on the first open (the `EventLoop`
     // pattern), so a session with no terminal spawns nothing.

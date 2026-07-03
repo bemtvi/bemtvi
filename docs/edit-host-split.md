@@ -100,6 +100,17 @@ VCS-status provider — so they see the **project** on the remote. Config and sh
 **local** by default, or move to the daemon with `--remote-config` (see above). (This
 is the `LuaFs` seam.)
 
+**Plugin management is always local.** The `nx.plugins` manager clones, discovers, and
+sources plugins on the **local disk** in every session — even a daemon / `--remote-config`
+one — because a plugin loads into the *local* Lua VM (its dir is added to the local
+runtimepath and `require`d). So `:PluginSync` downloads into the local
+`stdpath('data')/plugins`, and a `dir=` plugin is read locally; a git clone runs the local
+`git`, never the daemon's. (A loaded plugin's *own* runtime `nx.fs` / `nx.run` still route
+to the daemon — it edits the remote's files.) This is separate from the `pack/*/start`
+plugins a `--remote-config` session fetches in the `config_bundle`: those come *from* the
+daemon and are materialized into the local cache alongside the config. Either way, plugin
+code ends up on the local disk where the VM can load it.
+
 ## Staying connected (auto-reconnect)
 
 Because the editor runs **local** and only the seams cross the wire, a dropped

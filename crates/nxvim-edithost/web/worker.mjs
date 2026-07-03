@@ -1590,10 +1590,16 @@ async function drainFsOpRequests() {
       // is written verbatim (OPFS).
       const req = { ...op };
       delete req.id;
+      // `local` (the plugin manager's discover/source) always hits the local OPFS store,
+      // never the daemon — plugin management is local even in a daemon session (see
+      // docs/plans/2026-07-03-remote-aware-plugin-manager.md). Strip the flag so it never
+      // reaches the op map the daemon/OPFS handlers read.
+      const forceLocal = req.local === true;
+      delete req.local;
       if (Array.isArray(req.data)) req.data = new Uint8Array(req.data);
       let reply;
       try {
-        reply = daemonUri ? await daemonFsOp(req) : await opfsFsOp(req);
+        reply = daemonUri && !forceLocal ? await daemonFsOp(req) : await opfsFsOp(req);
       } catch (e) {
         reply = ["err", "EIO", String(e && e.message ? e.message : e)];
       }

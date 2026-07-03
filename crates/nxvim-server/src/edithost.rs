@@ -193,7 +193,7 @@ pub trait HostEffects {
     /// method is wasm-only. `job` is the typed op descriptor; the wasm impl forwards it to the
     /// Worker, which sends one `luafs_op` request and lands the reply back through `fs_op_result`.
     #[cfg(not(feature = "native"))]
-    fn fs_op(&mut self, id: u64, job: nxvim_lua::FsJob);
+    fn fs_op(&mut self, id: u64, job: nxvim_lua::FsJob, local: bool);
 
     /// Arm a streaming `nx.fs.watch` over the daemon `luafs_watch` leg (Phase 3b) — the wasm twin
     /// of the native `loop_command(LoopCommand::FsEventStart)`. Fire-and-forget: change batches

@@ -167,6 +167,29 @@ try {
   check("nx.fs read of a missing daemon path rejects with err.code == ENOENT",
     /ENOENT/.test(String(code)), `code=${JSON.stringify(code)}`);
 
+  // ── 5. a LOCAL fs op (the plugin manager's seam) hits OPFS, NOT the daemon ─────────────────
+  // Plugin management is local even in a daemon session (plugins load into the local VM). The
+  // low-level `nx._local_fs_op` seam the manager uses routes to the local OPFS store, so a file
+  // that exists ONLY on the daemon's disk is INVISIBLE to it — while a session `nx.fs.exists`
+  // sees it over the wire. The two disagreeing on the SAME path is the proof of the split.
+  await luaResult(page, `_G.__sess, _G.__loc, _G.__locerr = nil, nil, nil
+     nx.fs.exists("${readFile}"):next(function(v) _G.__sess = v end)
+     do
+       local id = nx._next_cb_id()
+       nx._cb_fns[id] = function(err, value)
+         if err ~= nil then _G.__locerr = tostring(err.message or err) else _G.__loc = value end
+       end
+       nx._local_fs_op({ op = "exists", path = "${readFile}" }, id)
+     end
+     return 1`);
+  const split = await until(page,
+    () => window.__nxvim.execLua(
+      "return tostring(_G.__sess) .. '/' .. tostring(_G.__loc) .. '/' .. tostring(_G.__locerr)"
+    ).then((r) => r.result),
+    (v) => /^(true|false)\/(true|false)/.test(String(v)));
+  check("a LOCAL fs op routes to OPFS, not the daemon (session sees the daemon file; local does not)",
+    /^true\/false/.test(String(split)), `sess/loc/err=${JSON.stringify(split)}`);
+
   await browser.close();
 } catch (e) {
   console.error("verify-fs-op error:", e);
@@ -177,6 +200,6 @@ try {
 }
 
 console.log(failures === 0
-  ? "\nALL PASS — browser nx.fs runs on a real nxvim --daemon over WebTransport (read_text, readdir, write-to-daemon, ENOENT)"
+  ? "\nALL PASS — browser nx.fs runs on a real nxvim --daemon over WebTransport (read_text, readdir, write-to-daemon, ENOENT, local→OPFS split)"
   : `\n${failures} FAILED`);
 process.exit(failures === 0 ? 0 : 1);

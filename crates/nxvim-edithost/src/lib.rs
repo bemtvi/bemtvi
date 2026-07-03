@@ -141,7 +141,7 @@ struct Sink {
     /// leg over WebTransport when connected, else to OPFS (Phase 3a, serverless), and lands the
     /// typed result via [`eh_fs_op_result`]. Always enqueued on wasm (there is always *some* fs —
     /// OPFS is the serverless fallback), unlike the daemon-only proc leg.
-    fs_ops: Vec<(u64, nxvim_lua::FsJob)>,
+    fs_ops: Vec<(u64, nxvim_lua::FsJob, bool)>,
     /// Streaming `nx.fs.watch` arms the editor enqueued this convergence (the `luafs_watch` leg —
     /// Phase 3b): `(stream_id, path, recursive)` per `nx.fs.watch`, recorded by
     /// [`fs_watch_stream`](HostEffects::fs_watch_stream). Drained by [`eh_take_fs_watch_requests`]
@@ -653,13 +653,14 @@ impl HostEffects for WasmEffects {
         self.sink.borrow_mut().sock_closes.push(id);
     }
 
-    fn fs_op(&mut self, id: u64, job: nxvim_lua::FsJob) {
-        // An off-tick `nx.fs` op against the daemon (Phase 2): record the (cb_id, job) for
-        // the Worker to forward over WebTransport (`eh_take_fs_op_requests` → one `luafs_op`
-        // request). The daemon runs `run_fs_job` and its typed result returns via
-        // `eh_fs_op_result`. Only reached when a daemon is connected (the tick gates `nx.fs`
-        // on `has_remote_proc`, like the proc leg); serverless `nx.fs` fails loud in the core.
-        self.sink.borrow_mut().fs_ops.push((id, job));
+    fn fs_op(&mut self, id: u64, job: nxvim_lua::FsJob, local: bool) {
+        // An off-tick `nx.fs` op (Phase 2): record the (cb_id, job, local) for the Worker to
+        // fulfill (`eh_take_fs_op_requests`). A normal op routes to the daemon `luafs_op` leg
+        // (connected) else OPFS (serverless); a `local`-flagged op (the plugin manager's
+        // discover / source) ALWAYS routes to the local OPFS store, never the daemon —
+        // plugin management is local (see the plan doc). The typed result returns via
+        // `eh_fs_op_result`.
+        self.sink.borrow_mut().fs_ops.push((id, job, local));
     }
 
     fn fs_watch_stream(&mut self, id: u64, path: String, recursive: bool) {
@@ -1778,10 +1779,14 @@ pub unsafe extern "C" fn eh_sock_closed(h: *mut WasmEditHost, id: f64, err: *con
 /// `nxvim_lua::fs_job_from_value` decoder. `data` (write/append) rides as a JSON byte array
 /// (the Worker converts it to a byte buffer so it crosses as msgpack `bin`), exactly as the
 /// proc leg's `stdin` does.
-fn fs_job_to_json(id: u64, job: &nxvim_lua::FsJob) -> serde_json::Value {
+fn fs_job_to_json(id: u64, job: &nxvim_lua::FsJob, local: bool) -> serde_json::Value {
     use nxvim_lua::FsJob;
     let mut o = serde_json::Map::new();
     o.insert("id".into(), serde_json::json!(id));
+    // A `local`-flagged op (the plugin manager's discover / source) must hit the local
+    // store (OPFS) even in a daemon session — the Worker routes on this. See
+    // `docs/plans/2026-07-03-remote-aware-plugin-manager.md`.
+    o.insert("local".into(), serde_json::json!(local));
     let mut put = |k: &str, v: serde_json::Value| {
         o.insert(k.into(), v);
     };
@@ -1884,7 +1889,7 @@ pub unsafe extern "C" fn eh_take_fs_op_requests(h: *mut WasmEditHost) -> *mut c_
     }
     let ops: Vec<serde_json::Value> = std::mem::take(&mut handle.sink.borrow_mut().fs_ops)
         .iter()
-        .map(|(id, job)| fs_job_to_json(*id, job))
+        .map(|(id, job, local)| fs_job_to_json(*id, job, *local))
         .collect();
     into_owned_cstr(serde_json::Value::Array(ops).to_string())
 }

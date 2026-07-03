@@ -2208,6 +2208,7 @@ impl EditHost {
                 env,
                 stdin,
                 stream,
+                local,
             } => self.fx.loop_command(LoopCommand::Spawn {
                 id,
                 argv: cmd,
@@ -2215,6 +2216,7 @@ impl EditHost {
                 env,
                 stdin,
                 stream,
+                local,
             }),
             #[cfg(feature = "native")]
             LoopOp::Kill { id } => self.fx.loop_command(LoopCommand::Kill { id }),
@@ -2268,7 +2270,9 @@ impl EditHost {
             // daemon session — now off the editor tick instead of inline). The typed
             // result returns on the `loop_events` arm as a `FsResult`.
             #[cfg(feature = "native")]
-            LoopOp::Fs { id, job } => self.fx.loop_command(LoopCommand::Fs { id, job }),
+            LoopOp::Fs { id, job, local } => {
+                self.fx.loop_command(LoopCommand::Fs { id, job, local })
+            }
             // The browser build has no tokio event loop; timers ride the Worker-side
             // wheel instead (slice 5d) — `vim.defer_fn` / `nx.timer` arm and fire there.
             #[cfg(not(feature = "native"))]
@@ -2293,8 +2297,30 @@ impl EditHost {
                 env,
                 stdin,
                 stream,
+                local,
             } => {
-                if self.fx.has_remote_proc() {
+                // A `local` spawn (the plugin manager's git) has nowhere to run on web — a
+                // browser has no local process host, and routing it to the daemon would clone
+                // on the *remote* (the bug this whole change fixes). Fail it LOUD instead: on
+                // web, plugins arrive materialized via `config_bundle`, never git-cloned.
+                if local {
+                    let stderr = b"plugin sync (git) needs a local process host, which a \
+                                   browser lacks \xE2\x80\x94 web plugins are fetched, not cloned"
+                        .to_vec();
+                    if let Err(e) = self.lua.run_callback(
+                        id,
+                        false,
+                        CallbackArgs::Process {
+                            code: -1,
+                            stdout: Vec::new(),
+                            stderr,
+                        },
+                    ) {
+                        self.editor
+                            .echo(format!("E5108: Error in vim.system on_exit: {e}"));
+                    }
+                    self.apply_lua_effects();
+                } else if self.fx.has_remote_proc() {
                     self.fx.proc_spawn(id, cmd, cwd, env, stdin, stream);
                 } else {
                     // No process host (serverless OPFS): a spawn has nowhere to run.
@@ -2442,8 +2468,11 @@ impl EditHost {
             // — the same daemon-or-OPFS split the off-tick `:e`/`:w` seam already uses. There
             // is always *some* fs on wasm (OPFS is the serverless fallback), so this never
             // needs the proc leg's "no host" loud reject, and never silently hits MEMFS.
+            // On wasm the "local" store is OPFS: a `local`-flagged op (the plugin manager)
+            // routes there instead of the daemon `luafs_op` leg (the Worker decides on the
+            // `local` flag `fs_op` forwards). Plugin management stays local on web too.
             #[cfg(not(feature = "native"))]
-            LoopOp::Fs { id, job } => self.fx.fs_op(id, job),
+            LoopOp::Fs { id, job, local } => self.fx.fs_op(id, job, local),
         }
     }
 

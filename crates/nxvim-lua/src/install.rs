@@ -798,6 +798,38 @@ pub(crate) fn install_vim(lua: &Lua, shared: &Rc<RefCell<Shared>>) -> mlua::Resu
                     env,
                     stdin,
                     stream: false,
+                    local: false,
+                });
+                Ok(())
+            },
+        )?,
+    )?;
+    // `nx._local_system_async(id, cmd, cwd, env, stdin)` — the LOCAL-always twin of
+    // `nx._system_async`: the child runs on the local host even when the session's
+    // processes route to a daemon. Backs the `nx.plugins` manager's git (clone / pull):
+    // plugins are downloaded to the local disk, where the local runtimepath loads them.
+    let sh = shared.clone();
+    nx.set(
+        "_local_system_async",
+        lua.create_function(
+            move |_,
+                  (id, cmd, cwd, env, stdin): (
+                u64,
+                Vec<String>,
+                Option<String>,
+                Option<Table>,
+                Option<mlua::String>,
+            )| {
+                let env = env_pairs(env)?;
+                let stdin = stdin.map(|s| s.as_bytes().to_vec()).unwrap_or_default();
+                sh.borrow_mut().loop_ops.push(LoopOp::Spawn {
+                    id,
+                    cmd,
+                    cwd,
+                    env,
+                    stdin,
+                    stream: false,
+                    local: true,
                 });
                 Ok(())
             },
@@ -822,6 +854,7 @@ pub(crate) fn install_vim(lua: &Lua, shared: &Rc<RefCell<Shared>>) -> mlua::Resu
                     env,
                     stdin: Vec::new(),
                     stream: true,
+                    local: false,
                 });
                 Ok(())
             },
@@ -1447,6 +1480,25 @@ pub(crate) fn install_runtime_api(
             sh.borrow_mut().loop_ops.push(LoopOp::Fs {
                 id: cb_id,
                 job: fs_job,
+                local: false,
+            });
+            Ok(())
+        })?,
+    )?;
+    // `nx._local_fs_op(job, cb_id)` — the LOCAL-always twin of `nx._fs_op`: the op runs
+    // against the local `LuaFs` even when the session's `nx.fs` routes to a daemon. Used
+    // only by the `nx.plugins` manager (clone / discover / source): plugins load into the
+    // local Lua VM via the local runtimepath, so their management must see the local disk,
+    // never the remote's. See `docs/plans/2026-07-03-remote-aware-plugin-manager.md`.
+    let sh = shared.clone();
+    nx.set(
+        "_local_fs_op",
+        lua.create_function(move |_, (job, cb_id): (Table, u64)| {
+            let fs_job = fs_job_from_table(&job)?;
+            sh.borrow_mut().loop_ops.push(LoopOp::Fs {
+                id: cb_id,
+                job: fs_job,
+                local: true,
             });
             Ok(())
         })?,

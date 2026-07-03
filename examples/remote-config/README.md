@@ -88,6 +88,20 @@ pack/demo/start/remote-demo/plugin/…      a packaged plugin (fetched + sourced
 sample.txt                                a buffer with the checklist above
 ```
 
+### Two kinds of plugin, two paths
+
+This example uses a `pack/*/start` plugin, which rides the `config_bundle`: it comes
+*from* the daemon and is materialized into the local cache alongside the config.
+
+A plugin declared with **`nx.plugins`** (the git-clone manager) is different — it is
+**always managed on the local disk**, in every session, even `--remote-config`. That is
+deliberate: a plugin loads into the *local* Lua VM (its dir is added to the local
+runtimepath and `require`d), so `:PluginSync` clones into your local
+`stdpath('data')/plugins` with the local `git`, never onto the daemon. (A loaded plugin's
+own runtime `nx.fs` / `nx.run` still route to the daemon — it edits the remote's files.)
+So both plugin styles end up on the local disk where the VM can load them; they just
+arrive by different routes.
+
 Native artifacts (`.so`/`.dylib`/`.dll`) are deliberately **not** fetched — tree-sitter
 parsers and the like are compiled locally on the client, where they match its arch.
 Instead, the client learns which parser languages the remote had installed and

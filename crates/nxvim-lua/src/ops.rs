@@ -533,6 +533,13 @@ pub enum LoopOp {
         /// `false` (`vim.system`) the child runs to completion and the whole stdout
         /// is delivered once with the exit — the original one-shot behavior.
         stream: bool,
+        /// Run on the **local** host regardless of the session's process routing
+        /// (`nx._local_system_async`). `nx.run`/`nx.run_stream` default this `false` —
+        /// they route to the session's `host_proc` (the daemon in an edit-host session).
+        /// The `nx.plugins` manager sets it `true` for git: plugins are cloned onto the
+        /// local disk (they load into the local Lua VM via the local runtimepath), never
+        /// on the remote. See `docs/plans/2026-07-03-remote-aware-plugin-manager.md`.
+        local: bool,
     },
     /// `handle:kill(signal)` on a `vim.system` handle spawned async — terminate the
     /// child running under `id`. A no-op if it already exited. The `signal`
@@ -595,7 +602,14 @@ pub enum LoopOp {
     /// returns inbound as [`LoopEvent::FsResult`](../../nxvim_server) → a
     /// [`CallbackArgs::FsResult`]. Wasm: forwarded to the daemon `luafs` leg over
     /// WebTransport (the wasm `fs_op` seam — Phase 2 of the off-tick plan).
-    Fs { id: u64, job: FsJob },
+    ///
+    /// `local` forces the op onto the **local** [`LuaFs`](crate::LuaFs) even in a session
+    /// whose `nx.fs` routes to a daemon (`nx._local_fs_op`). `nx.fs.*` defaults it `false`
+    /// (session routing). The `nx.plugins` manager sets it `true` for its clone / discover
+    /// / source ops — plugin management is a local-VM concern (`require` + runtimepath are
+    /// local), so it must see the local disk, not the remote's. See
+    /// `docs/plans/2026-07-03-remote-aware-plugin-manager.md`.
+    Fs { id: u64, job: FsJob, local: bool },
 }
 
 /// A buffer-local *option* write queued by the Lua side, drained by the server in

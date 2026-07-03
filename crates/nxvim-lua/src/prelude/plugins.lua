@@ -13,6 +13,11 @@
 -- UI paints before plugins finish loading. Loaded LAST in the prelude — it builds
 -- on nx.run / nx.fs / nx.promise / nx.async / nx.command / nx.keymap / nx.on /
 -- nx.notify, all installed above.
+--
+-- Management runs on the LOCAL disk even in a daemon / remote-config session (plugins
+-- load into the local Lua VM via the local runtimepath): the clone / discover / source
+-- ops go through the local-always seams (`lfs` / `local_run` below), NOT the session's
+-- `nx.fs` / `nx.run`. See docs/plans/2026-07-03-remote-aware-plugin-manager.md.
 
 nx.plugins = nx.plugins or {}
 local M = nx.plugins
@@ -31,6 +36,83 @@ M._loading = M._loading or {} -- name -> true while a load is in flight (cycle g
 -- `M.on_change`. Survives a re-source (`or {}`) so an open UI keeps its history.
 M._tasks = M._tasks or {}
 M._watchers = M._watchers or {} -- on_change callbacks, fired on any state transition
+
+-- ----- local-always fs + proc (plugin management is a LOCAL concern) ----------
+-- Plugin management runs on the LOCAL disk even in a daemon / remote-config session:
+-- clones land under `stdpath("data")/plugins` and load into THIS (local) Lua VM via the
+-- local runtimepath (`nx._add_rtp` + `require`, both local). So the manager clones,
+-- discovers, and sources through the local-always seams — `nx._local_fs_op` /
+-- `nx._local_system_async` — never the session's `nx.fs` / `nx.run`, which in an edit-host
+-- session route to the *remote* daemon (where the plugin would be cloned but never loaded).
+-- Runtime plugin code is untouched: a loaded plugin's own `nx.fs` / `nx.run` still route to
+-- the session (remote), because it edits the remote's files. See
+-- docs/plans/2026-07-03-remote-aware-plugin-manager.md.
+local function local_fs_op(job)
+  return nx.promise.new(function(resolve, reject)
+    local id = nx._next_cb_id()
+    nx._cb_fns[id] = function(err, value)
+      if err ~= nil then
+        reject(err)
+      else
+        resolve(value)
+      end
+    end
+    nx._local_fs_op(job, id)
+  end)
+end
+
+-- The subset of `nx.fs` the manager uses, forced onto the local disk. Same job shapes and
+-- promise contract as `nx.fs.*` (see prelude/fs.lua) — only the routing differs.
+local lfs = {
+  exists = function(path)
+    return local_fs_op({ op = "exists", path = path })
+  end,
+  readdir = function(path)
+    return local_fs_op({ op = "readdir", path = path })
+  end,
+  read_text = function(path)
+    return local_fs_op({ op = "read_text", path = path })
+  end,
+  write = function(path, data)
+    return local_fs_op({ op = "write", path = path, data = data })
+  end,
+  append = function(path, data)
+    return local_fs_op({ op = "append", path = path, data = data })
+  end,
+  mkdir = function(path, opts)
+    return local_fs_op({ op = "mkdir", path = path, recursive = opts and opts.recursive or false })
+  end,
+  remove = function(path, opts)
+    return local_fs_op({ op = "remove", path = path, recursive = opts and opts.recursive or false })
+  end,
+}
+
+-- The local twin of `nx.run` (one-shot child, resolves { code, stdout, stderr }) — the
+-- manager's git runs on the local host so a clone lands on the local disk.
+local function local_run(spec)
+  return nx.promise.new(function(resolve)
+    local id = nx._next_cb_id()
+    nx._cb_fns[id] = function(result)
+      resolve({
+        code = result.code,
+        stdout = result.stdout or "",
+        stderr = result.stderr or "",
+      })
+    end
+    local cmd = spec.cmd
+    if type(cmd) == "string" then
+      cmd = { cmd }
+    end
+    local argv = {}
+    for _, c in ipairs(cmd) do
+      argv[#argv + 1] = c
+    end
+    for _, a in ipairs(spec.args or {}) do
+      argv[#argv + 1] = a
+    end
+    nx._local_system_async(id, argv, spec.cwd, spec.env, spec.stdin)
+  end)
+end
 
 -- Fire every change watcher (a load completing, a task transitioning). Wrapped in
 -- pcall so one bad observer can't break the manager. The UI uses this to re-render.
@@ -260,10 +342,10 @@ local function collect_lua(dir)
   return nx.async(function()
     local out = {}
     local function walk(d)
-      if not nx.await(nx.fs.exists(d)) then
+      if not nx.await(lfs.exists(d)) then
         return
       end
-      local entries = nx.await(nx.fs.readdir(d))
+      local entries = nx.await(lfs.readdir(d))
       table.sort(entries, function(a, b)
         return a.name < b.name
       end)
@@ -292,7 +374,7 @@ local function source_runtime(dir)
     for _, sub in ipairs({ "plugin", "after/plugin" }) do
       local files = nx.await(collect_lua(dir .. "/" .. sub))
       for _, f in ipairs(files) do
-        local content = nx.await(nx.fs.read_text(f))
+        local content = nx.await(lfs.read_text(f))
         local chunk, lerr = loadstring(content, "@" .. f)
         if not chunk then
           nx.notify("nx.plugins: cannot load " .. f .. ": " .. tostring(lerr), 4)
@@ -357,7 +439,7 @@ function M.load(name)
     for _, dep in ipairs(spec._deps) do
       nx.await(M.load(dep))
     end
-    local present = spec.dir ~= nil or nx.await(nx.fs.exists(spec._dir))
+    local present = spec.dir ~= nil or nx.await(lfs.exists(spec._dir))
     if not present then
       error("nx.plugins: '" .. name .. "' is not installed — run :PluginSync", 0)
     end
@@ -469,7 +551,7 @@ local function activate_eager()
       -- `nx._maybe_collapse_view_restores`.
       nx._view_restore_pending_loads = (nx._view_restore_pending_loads or 0) + 1
       nx.async(function()
-        if spec.dir ~= nil or nx.await(nx.fs.exists(spec._dir)) then
+        if spec.dir ~= nil or nx.await(lfs.exists(spec._dir)) then
           nx.await(M.load(name))
         end
       end)()
@@ -562,7 +644,7 @@ end
 -- ----- git operations ---------------------------------------------------------
 
 local function git(args, cwd)
-  return nx.run({ cmd = M._opts.git, args = args, cwd = cwd, env = GIT_ENV })
+  return local_run({ cmd = M._opts.git, args = args, cwd = cwd, env = GIT_ENV })
 end
 
 -- Clone `name` if missing. Resolves a status string: "local" (a `dir` dev plugin,
@@ -574,11 +656,11 @@ function M._install(name)
     if spec.dir ~= nil then
       return "local"
     end
-    if nx.await(nx.fs.exists(spec._dir)) then
+    if nx.await(lfs.exists(spec._dir)) then
       return "exists"
     end
     set_task(name, "install", "running", "cloning")
-    nx.await(nx.fs.mkdir(root(), { recursive = true }))
+    nx.await(lfs.mkdir(root(), { recursive = true }))
     local args = { "clone", "--filter=blob:none" }
     local ref = spec.branch or spec.tag
     if ref then
@@ -624,7 +706,7 @@ function M._update(name)
     if spec.commit or spec.tag then
       return "pinned"
     end
-    if not nx.await(nx.fs.exists(spec._dir)) then
+    if not nx.await(lfs.exists(spec._dir)) then
       return "missing"
     end
     set_task(name, "update", "running", "pulling")
@@ -702,13 +784,13 @@ function M.clean()
       end
     end
     local r = root()
-    if not nx.await(nx.fs.exists(r)) then
+    if not nx.await(lfs.exists(r)) then
       return {}
     end
     local removed = {}
-    for _, e in ipairs(nx.await(nx.fs.readdir(r))) do
+    for _, e in ipairs(nx.await(lfs.readdir(r))) do
       if e.type == "directory" and not declared[e.name] then
-        nx.await(nx.fs.remove(r .. "/" .. e.name, { recursive = true }))
+        nx.await(lfs.remove(r .. "/" .. e.name, { recursive = true }))
         removed[#removed + 1] = e.name
         -- Forget the plugin's shada namespace too, so an uninstalled plugin doesn't
         -- leave its cross-session data orphaned in the store forever. A managed
@@ -893,16 +975,16 @@ function M._persist_recommended(specs)
   specs = specs or M._recommended
   return nx.async(function()
     local cfg = config_dir()
-    nx.await(nx.fs.mkdir(cfg .. "/lua", { recursive = true }))
-    nx.await(nx.fs.write(cfg .. "/lua/plugins.lua", serialize_recommended(specs)))
+    nx.await(lfs.mkdir(cfg .. "/lua", { recursive = true }))
+    nx.await(lfs.write(cfg .. "/lua/plugins.lua", serialize_recommended(specs)))
     local init = cfg .. "/init.lua"
     local existing = ""
-    if nx.await(nx.fs.exists(init)) then
-      existing = nx.await(nx.fs.read_text(init))
+    if nx.await(lfs.exists(init)) then
+      existing = nx.await(lfs.read_text(init))
     end
     if not existing:find("require%(%s*['\"]plugins['\"]%s*%)") then
       local lead = (existing ~= "" and existing:sub(-1) ~= "\n") and "\n" or ""
-      nx.await(nx.fs.append(init, lead .. 'require("plugins")\n'))
+      nx.await(lfs.append(init, lead .. 'require("plugins")\n'))
     end
   end)()
 end
@@ -926,14 +1008,14 @@ function M.bootstrap()
     if M._prompting or #M._order > 0 or #M._recommended == 0 then
       return
     end
-    if nx.await(nx.fs.exists(prompted_marker())) then
+    if nx.await(lfs.exists(prompted_marker())) then
       return
     end
     M._prompting = true
     -- Record that we asked BEFORE showing the view, so we never nag again whatever
     -- the user does with it (chooses, skips, or just quits).
-    nx.await(nx.fs.mkdir(root(), { recursive = true }))
-    nx.await(nx.fs.write(prompted_marker(), "1\n"))
+    nx.await(lfs.mkdir(root(), { recursive = true }))
+    nx.await(lfs.write(prompted_marker(), "1\n"))
 
     -- The welcome checklist resolves to the list of chosen raw specs ({} on skip).
     -- (Fallback to a plain confirm if the UI module somehow isn't present — e.g. a
@@ -984,7 +1066,7 @@ function M.status()
     local out = M.list()
     for _, row in ipairs(out) do
       local spec = M._specs[row.name]
-      row.installed = spec.dir ~= nil or nx.await(nx.fs.exists(spec._dir))
+      row.installed = spec.dir ~= nil or nx.await(lfs.exists(spec._dir))
     end
     return out
   end)()

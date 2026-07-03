@@ -58,6 +58,10 @@ pub enum LoopCommand {
         /// Stream stdout incrementally (`nx.run_stream`'s streamed stdout) rather than
         /// delivering it whole with the exit (`vim.system`). See [`ProcSpec`].
         stream: bool,
+        /// Run on the actor's **local** [`HostProc`] instead of the session's — the
+        /// `nx.plugins` manager's git, so plugins clone onto the local disk even in a
+        /// daemon session. `false` for `nx.run`/`nx.run_stream` (session routing).
+        local: bool,
     },
     /// Terminate the async child running under `id` (a no-op if it already
     /// exited). The child is terminated via `kill_on_drop`, and its `on_exit`
@@ -102,7 +106,11 @@ pub enum LoopCommand {
     /// disk on the blocking pool, or the daemon's `luafs_op` leg — and send the typed
     /// result back as [`LoopEvent::FsResult`] for callback `id`. Off the editor tick, so a
     /// large/slow op (a daemon round-trip, a recursive copy) never janks the editor.
-    Fs { id: u64, job: FsJob },
+    ///
+    /// `local` runs it against the actor's **local** [`FsBackend`] rather than the session's
+    /// — the `nx.plugins` manager's clone / discover / source ops, which must see the local
+    /// disk (plugins load into the local Lua VM). `false` for `nx.fs.*` (session routing).
+    Fs { id: u64, job: FsJob, local: bool },
 }
 
 /// An event from the actor back to the server thread, delivered to the main
@@ -214,6 +222,14 @@ pub struct EventLoop {
     /// the lazy start — a session that never touches `nx.fs` (or a timer / process) spawns
     /// nothing.
     fs: FsBackend,
+    /// The **local** twins of `host_proc` / `fs`, used for `local`-flagged
+    /// [`Spawn`](LoopCommand::Spawn) / [`Fs`](LoopCommand::Fs) ops — the `nx.plugins`
+    /// manager's git + discovery, which stay on the local disk even in a daemon session
+    /// (plugins load into the local Lua VM). In a bare/local session these are the same
+    /// disk the session already uses; in a daemon session they bypass the remote routing.
+    /// See `docs/plans/2026-07-03-remote-aware-plugin-manager.md`.
+    local_host_proc: Arc<dyn HostProc>,
+    local_fs: FsBackend,
     started: bool,
 }
 
@@ -224,6 +240,8 @@ impl EventLoop {
     pub fn new(
         host_proc: Arc<dyn HostProc>,
         fs: FsBackend,
+        local_host_proc: Arc<dyn HostProc>,
+        local_fs: FsBackend,
     ) -> (EventLoop, UnboundedReceiver<LoopEvent>) {
         let (cmd_tx, cmd_rx) = unbounded_channel();
         let (event_tx, event_rx) = unbounded_channel();
@@ -232,6 +250,8 @@ impl EventLoop {
             start: Some((cmd_rx, event_tx)),
             host_proc,
             fs,
+            local_host_proc,
+            local_fs,
             started: false,
         };
         (evloop, event_rx)
@@ -248,6 +268,8 @@ impl EventLoop {
                 event_tx,
                 self.host_proc.clone(),
                 self.fs.clone(),
+                self.local_host_proc.clone(),
+                self.local_fs.clone(),
             ));
             self.started = true;
         }
@@ -271,6 +293,8 @@ async fn run_evloop(
     event_tx: UnboundedSender<LoopEvent>,
     host_proc: Arc<dyn HostProc>,
     fs: FsBackend,
+    local_host_proc: Arc<dyn HostProc>,
+    local_fs: FsBackend,
 ) {
     // Live timer tasks and the per-process kill channels, keyed by callback id.
     let mut timers: HashMap<u64, JoinHandle<()>> = HashMap::new();
@@ -341,6 +365,7 @@ async fn run_evloop(
                 env,
                 stdin,
                 stream,
+                local,
             } => {
                 let (kill_tx, kill_rx) = oneshot::channel();
                 procs.insert(id, kill_tx);
@@ -352,7 +377,10 @@ async fn run_evloop(
                     stream,
                 };
                 let events = ProcEvents::new(id, event_tx.clone());
-                tokio::spawn(host_proc.run(spec, kill_rx, events));
+                // `local` git (the plugin manager) runs on the local host; everything else
+                // on the session host (the daemon, in an edit-host session).
+                let proc = if local { &local_host_proc } else { &host_proc };
+                tokio::spawn(proc.run(spec, kill_rx, events));
             }
             LoopCommand::ProcOpen { id, argv, cwd, env } => {
                 let (kill_tx, kill_rx) = oneshot::channel();
@@ -450,15 +478,18 @@ async fn run_evloop(
             LoopCommand::FsEventStop { id } => {
                 fs_watchers.remove(&id); // dropping the watcher stops it
             }
-            LoopCommand::Fs { id, job } => {
+            LoopCommand::Fs { id, job, local } => {
                 // Run the op off the actor's async task and send the typed result back for
                 // the server to settle the promise on its one thread. Spawned so concurrent
                 // ops don't serialize behind one another. Two paths (see [`FsBackend`]):
                 // local disk runs `run_fs_job` on the blocking pool (a quick syscall);
                 // native-daemon sends the whole job over `luafs_op` and `await`s the reply
-                // (no thread park — it's a tokio request on the link).
+                // (no thread park — it's a tokio request on the link). A `local`-flagged op
+                // (the plugin manager's discover / source) always takes the local backend,
+                // bypassing the session's remote routing.
                 let event_tx = event_tx.clone();
-                match &fs {
+                let fs = if local { &local_fs } else { &fs };
+                match fs {
                     FsBackend::Local(lua_fs) => {
                         let lua_fs = lua_fs.clone();
                         tokio::spawn(async move {

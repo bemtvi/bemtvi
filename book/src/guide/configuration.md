@@ -54,7 +54,7 @@ promise, so the UI paints before plugins finish loading.
 -- ~/.config/nxvim/init.lua
 nx.plugins({
   -- "owner/repo" shorthand expands to a GitHub clone.
-  { "davidrios/nxvim-keys-helper",
+  { "nxvim/nxvim-keys-helper",
     config = function() require("nxvim-keys-helper").setup({}) end },
 
   -- Lazy-load on a trigger: any of cmd / event / ft / keys makes it lazy.

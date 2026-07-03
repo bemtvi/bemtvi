@@ -767,39 +767,39 @@ end
 -- selene: allow(mixed_table)
 M._default_recommended = {
   {
-    "davidrios/catppuccin-nxvim",
+    "nxvim/catppuccin-nxvim",
     name = "catppuccin",
     desc = "Soothing pastel colorscheme",
     config = [[ vim.cmd("colorscheme catppuccin") ]],
   },
   {
-    "davidrios/nxvim-keys-helper",
+    "nxvim/nxvim-keys-helper",
     desc = "Popup of available keybindings as you type (which-key)",
     config = [[ require("nxvim-keys-helper").setup() ]],
   },
   {
-    "davidrios/nxvim-tree",
+    "nxvim/nxvim-tree",
     desc = "File explorer sidebar (<leader>e)",
     keys = { "<leader>e" },
     config = [[ require("nxvim-tree").setup() ]],
   },
   {
-    "davidrios/nxvim-lspconfig",
+    "nxvim/nxvim-lspconfig",
     desc = "Quickstart configs for the built-in LSP client",
     config = [[ require("nxvim-lspconfig").setup() ]],
   },
   {
-    "davidrios/nxvim-line",
+    "nxvim/nxvim-line",
     desc = "Configurable statusline (lualine)",
     config = [[ require("nxvim-line").setup() ]],
   },
   {
-    "davidrios/nxvim-diff",
+    "nxvim/nxvim-diff",
     desc = "Diff & merge-conflict visualizer",
     config = [[ require("nxvim-diff").setup() ]],
   },
   {
-    "davidrios/nxvim-dap",
+    "nxvim/nxvim-dap",
     desc = "Debugger front end — breakpoints, stepping, REPL (<F5>, <leader>db)",
     keys = { "<F5>", "<leader>db" },
     cmd = { "DapContinue", "DapToggleBreakpoint" },

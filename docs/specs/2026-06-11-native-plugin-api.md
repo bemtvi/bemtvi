@@ -119,8 +119,8 @@ runtime (real `git clone` via `nx.run`):
 
 ```lua
 nx.plugins {
-  { "davidrios/nx-files" },
-  { "davidrios/nx-emoji" },
+  { "nxvim/nx-files" },
+  { "nxvim/nx-emoji" },
 }
 -- :PluginSync clones/updates; :PluginList shows state
 ```

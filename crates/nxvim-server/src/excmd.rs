@@ -208,7 +208,7 @@ impl EditHost {
             _ if matches!(base, "help" | "h") && !self.lua.has_user_command(name, cur_buf) => {
                 self.editor.echo(
                     "help: the nxvim-help plugin is not installed — add it with \
-                     :Plugins (davidrios/nxvim-help), then use :help {topic}",
+                     :Plugins (nxvim/nxvim-help), then use :help {topic}",
                 )
             }
             // `:helpt[ags]` — tag generation lives in nxvim-help as `:NxHelptags`

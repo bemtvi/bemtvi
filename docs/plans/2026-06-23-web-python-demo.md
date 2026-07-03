@@ -291,7 +291,7 @@ sees what the editor shows and edits are visible to the interpreter.
   the stack to 8 MB fixes it for both builds (verified: the full bundle sources + all 6 plugins
   `setup()` cleanly).
 - **`build-plugins.sh`** — clones the recommended set (`davidrios/{nxvim-keys-helper,nxvim-tree,
-  nxvim-line,nxvim-lspconfig,nxvim-diff}`) + `davidrios/catppuccin-nxvim` at **pinned commits**
+  nxvim-line,nxvim-lspconfig,nxvim-diff}`) + `nxvim/catppuccin-nxvim` at **pinned commits**
   (full clone + checkout SHA, so an arbitrary pin resolves), then runs `amalgamate-plugins.mjs`
   over all six `lua/` trees → `web/vendor/plugins/plugins-bundle.lua`. Idempotent (`--force`),
   clones cached in `.plugins-src` (gitignored), `NXVIM_PLUGINS_BASE` overrides the host.

@@ -59,7 +59,7 @@ clones, runtimepaths, and loads them (with optional lazy triggers):
 ```lua
 nx.plugins({
   -- eager:
-  { "davidrios/nxvim-keys-helper",
+  { "nxvim/nxvim-keys-helper",
     config = function() require("nxvim-keys-helper").setup({}) end },
 
   -- lazy by key / command / event / filetype:
@@ -127,7 +127,7 @@ for everyone, so let us know if you find anything missing.
 
 ## A worked example
 
-[`nxvim-keys-helper`](https://github.com/davidrios/nxvim-keys-helper) — the
+[`nxvim-keys-helper`](https://github.com/nxvim/nxvim-keys-helper) — the
 first-party which-key — is a compact, real-world plugin: it subscribes to the
 pending-key oracle (`nx.on_key_pending`), debounces with `nx.utils.debounce`, and
 renders the continuations on a non-focus `nx.component{ surface = "float" }`. It is

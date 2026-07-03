@@ -290,7 +290,7 @@ by declaring it with the built-in manager and running `:PluginSync`:
 
 ```lua
 nx.plugins({
-  { "davidrios/nxvim-keys-helper",
+  { "nxvim/nxvim-keys-helper",
     config = function() require("nxvim-keys-helper").setup({}) end },
 })
 ```

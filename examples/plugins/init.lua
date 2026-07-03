@@ -37,7 +37,7 @@ nx.plugins({
   -- eagerly; `config` runs once it is on the runtimepath, so `colorscheme`
   -- resolves the freshly-installed colors/.
   {
-    "davidrios/catppuccin-nxvim",
+    "nxvim/catppuccin-nxvim",
     name = "catppuccin",
     config = function()
       vim.cmd("colorscheme catppuccin")
@@ -48,7 +48,7 @@ nx.plugins({
   -- `:Emoji`, which then re-dispatches against the real command the plugin defines.
   -- (An `nx.complete.source` / `nx.picker.source`-shaped plugin — see the spec.)
   {
-    "davidrios/nx-emoji",
+    "nxvim/nx-emoji",
     cmd = "Emoji",
     config = function()
       require("nx-emoji").setup({})
@@ -60,9 +60,9 @@ nx.plugins({
   -- lhs loads the plugin, then the keypress is fed back so its own mapping handles
   -- it. Dependencies load first.
   {
-    "davidrios/nx-files",
+    "nxvim/nx-files",
     keys = { "<leader>ff" },
-    dependencies = { "davidrios/nx-async-utils" },
+    dependencies = { "nxvim/nx-async-utils" },
     config = function()
       require("nx-files").setup({})
     end,

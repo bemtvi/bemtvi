@@ -38,7 +38,7 @@ nx.plugins.recommend({
   -- A colorscheme (a pure-Lua module filling the highlight registry). Its `config`
   -- runs once it's installed + on the runtimepath, so `colorscheme` resolves.
   {
-    "davidrios/catppuccin-nxvim",
+    "nxvim/catppuccin-nxvim",
     name = "catppuccin",
     desc = "Soothing pastel colorscheme",
     config = [[ vim.cmd("colorscheme catppuccin") ]],
@@ -46,17 +46,17 @@ nx.plugins.recommend({
 
   -- An nx.*-native plugin, lazy by command: not loaded until the first `:Emoji`.
   {
-    "davidrios/nx-emoji",
+    "nxvim/nx-emoji",
     desc = "Insert emoji by name (:Emoji)",
     cmd = "Emoji",
   },
 
   -- An nx.*-native fuzzy finder, lazy by key, with a dependency (loaded first).
   {
-    "davidrios/nx-files",
+    "nxvim/nx-files",
     desc = "Fuzzy finder for files & buffers (<leader>ff)",
     keys = { "<leader>ff" },
-    dependencies = { "davidrios/nx-async-utils" },
+    dependencies = { "nxvim/nx-async-utils" },
   },
 })
 

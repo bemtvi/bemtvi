@@ -119,7 +119,7 @@ Reads (plain, correct after an await):
 ## A real example
 
 `nxvim-keys-helper` (the which-key plugin) ships
-[`test/popup_spec.lua`](https://github.com/davidrios/nxvim-keys-helper): it feeds a
+[`test/popup_spec.lua`](https://github.com/nxvim/nxvim-keys-helper): it feeds a
 leader prefix, waits for the debounced popup, and asserts on `t:float().text` —
 group names, leaf descriptions, the built-in `z` grammar, close-on-abort.
 

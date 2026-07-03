@@ -133,9 +133,9 @@ For plugins that touch the clipboard or the filesystem:
 
 ## A real example
 
-[`nxvim-keys-helper`](https://github.com/davidrios/nxvim-keys-helper) (the
+[`nxvim-keys-helper`](https://github.com/nxvim/nxvim-keys-helper) (the
 first-party which-key) ships a real suite,
-[`test/popup_spec.lua`](https://github.com/davidrios/nxvim-keys-helper): it feeds a
+[`test/popup_spec.lua`](https://github.com/nxvim/nxvim-keys-helper): it feeds a
 leader prefix, `t:wait_for`s the debounced popup, and asserts on `t:float().text` —
 group names, leaf descriptions, the built-in `z` grammar, and close-on-abort. It is
 a compact model of a UI plugin tested entirely through its observable surface.

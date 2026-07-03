@@ -32,7 +32,9 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use nxvim_core::{DirEntry, FileStat, HostFs};
-use nxvim_server::{DaemonClient, DaemonStatus, ReconnectHandle, ReconnectPolicy, ServerInit};
+use nxvim_server::{
+    DaemonClient, DaemonStatus, FsRead, HostFsAsync, ReconnectHandle, ReconnectPolicy, ServerInit,
+};
 use nxvim_test_harness::{attach, buf_lines, exec_lua, feed, spawn};
 use tokio::io::{DuplexStream, ReadHalf, WriteHalf};
 use tokio::task::JoinHandle;
@@ -327,6 +329,46 @@ async fn status_mirror_event_and_commands_drive_the_link() {
     // `:disconnect` drops it again on demand.
     feed(&rpc, ":disconnect<CR>");
     await_status(&rpc, "disconnected").await;
+}
+
+/// Regression: the seams must be live the *instant* `connect_daemon_reconnecting_on` returns.
+///
+/// The reconnect supervisor runs as a *spawned* task, and it is what fills the swappable link
+/// cells with the live connection's `Rpc`s (inside `run_connection`). If that is the *only*
+/// place the cells are published, the caller's first seam op races the supervisor: the client
+/// is handed back before the spawned task is ever polled, so the cell is still empty and the op
+/// fails loud with "daemon disconnected". In production that first op is the config-resolve
+/// round trip a fresh `--daemon --listen` connect issues at startup, surfaced to the user as the
+/// intermittent `could not resolve the session config from the daemon: daemon disconnected`. The
+/// fix publishes the cells *before* returning the client.
+///
+/// This reproduces it deterministically: issue an fs op the moment the connect returns, with no
+/// intervening `.await` that could yield to the supervisor. The empty-cell path returns `Err`
+/// synchronously (it never yields), so pre-fix the op fails without the wire ever being reached —
+/// a determinstic failure, not a timing race — while post-fix it reaches the live remote.
+#[tokio::test]
+async fn seams_are_live_the_instant_connect_returns() {
+    const PATH: &str = "/virtual/note.txt";
+    let dialer = Dialer::new(DaemonFs::with(PATH, "hello world\n"));
+    let (client, _handle) =
+        nxvim_server::connect_daemon_reconnecting_on(dialer.make(), fast_policy())
+            .await
+            .expect("the initial daemon dial succeeds");
+
+    // The first seam op after connect — nothing between the return above and this call yields to
+    // the runtime, so the spawned supervisor has had no chance to publish the cells. It must
+    // still reach the (live) remote file rather than fail "daemon disconnected".
+    match client.host_fs.read(PATH.to_string()).await {
+        Ok(FsRead::File(bytes, _)) => assert_eq!(
+            String::from_utf8_lossy(&bytes),
+            "hello world\n",
+            "the first seam op reaches the live remote file"
+        ),
+        Ok(_) => panic!("expected the remote file bytes from the first seam op"),
+        Err(e) => panic!(
+            "the first seam op after connect failed instead of reaching the live remote: {e}"
+        ),
+    }
 }
 
 /// A dropped link is **auto-retried** and recovers with no manual action — the headline

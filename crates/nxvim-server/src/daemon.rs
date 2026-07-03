@@ -552,10 +552,13 @@ async fn run_connection(state: &LinkState, conn: DialedConnection) {
 }
 
 /// Publish `conn`'s four per-group `Rpc`s into the swappable cells, so the seams the editor
-/// holds route onto this connection. Split out from [`run_connection`] so a re-dial can fill
-/// the cells *before* the supervisor announces [`DaemonStatus::Connected`] — the editor's
-/// reconnect resync fires on that transition and must issue (re-arm watches, re-open LSP) onto
-/// live cells, never the just-cleared ones.
+/// holds route onto this connection. Split out from [`run_connection`] so it can also fill the
+/// cells *before* the supervisor task runs — the initial connect publishes here before handing
+/// the client back (so the caller's first seam op — the config-resolve round trip — lands on a
+/// live cell rather than racing the not-yet-polled supervisor), and a re-dial publishes before
+/// announcing [`DaemonStatus::Connected`] (the editor's reconnect resync fires on that
+/// transition and must re-arm watches / re-open LSP onto live cells, never the just-cleared
+/// ones). Idempotent — `run_connection` re-publishes the same `Rpc`s.
 fn publish_cells(state: &LinkState, conn: &DialedConnection) {
     state.control_rpc.set(Some(conn.control.rpc.clone()));
     state.proc_rpc.set(Some(conn.proc.rpc.clone()));
@@ -907,6 +910,12 @@ where
     ));
     let (cmd_tx, cmd_rx) = unbounded_channel::<LinkCommand>();
     let (status_tx, status_rx) = watch::channel(DaemonStatus::Connected);
+    // Publish the first connection's `Rpc`s into the cells *before* returning the client:
+    // the caller issues the config-resolve round trip the instant this returns, and the
+    // supervisor (`maintain_link`, spawned below) has not run its own `publish_cells` yet, so
+    // the first seam op would otherwise race it and fail loud with "daemon disconnected".
+    // Idempotent with `run_connection`'s re-publish.
+    publish_cells(&state, &first);
     tokio::spawn(maintain_link(state, make, first, cmd_rx, status_tx, policy));
     Ok((
         client,
@@ -1004,6 +1013,15 @@ where
                 cmd_tx,
                 status: status_rx,
             };
+            // Publish the first connection's `Rpc`s into the swappable cells *before* handing
+            // the client back: the caller (a different thread) unblocks on `tx.send` and
+            // immediately issues the config-resolve round trip, which must land on a live cell.
+            // The cells are otherwise only filled later, inside the supervisor's `run_connection`
+            // — spawned as `maintain_link` below and not yet polled at this point — so without
+            // this the very first seam op races the supervisor and fails loud with "daemon
+            // disconnected" (the intermittent `could not resolve the session config from the
+            // daemon`). Idempotent: `run_connection` re-publishes the same `Rpc`s.
+            publish_cells(&state, &first);
             // Hand the seams + handle back to the (blocked) caller; if it already gave up,
             // there's nothing to drive.
             if tx.send(Ok((client, handle))).is_err() {

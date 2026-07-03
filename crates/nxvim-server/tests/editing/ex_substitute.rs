@@ -712,3 +712,47 @@ async fn regexsyntax_global_default_via_vim_o() {
     feed(&rpc, ":s/\\(\\w\\+\\) \\(\\w\\+\\)/\\2 \\1/<CR>");
     assert_eq!(lines(&rpc).await, vec!["world hello"]);
 }
+
+// ===== oversized addresses / counts must clamp, never overflow ===============
+
+#[tokio::test]
+async fn huge_ex_line_address_clamps_to_the_last_line() {
+    // A line address wider than i64 used to overflow the accumulator (a panic in
+    // debug builds); vim clamps any out-of-range address to the last line.
+    let (rpc, _incoming) = start(None).await;
+    feed(&rpc, "ione<CR>two<CR>three<Esc>gg");
+    feed(&rpc, ":99999999999999999999<CR>");
+    assert_eq!(
+        cursor(&rpc).await,
+        (3, 0),
+        "an oversized address lands on the last line"
+    );
+}
+
+#[tokio::test]
+async fn huge_ex_address_offset_clamps_to_the_last_line() {
+    let (rpc, _incoming) = start(None).await;
+    feed(&rpc, "ione<CR>two<CR>three<Esc>gg");
+    feed(&rpc, ":.+99999999999999999999<CR>");
+    assert_eq!(
+        cursor(&rpc).await,
+        (3, 0),
+        "an oversized +offset lands on the last line"
+    );
+}
+
+#[tokio::test]
+async fn huge_substitute_count_means_to_end_of_file() {
+    // `:s/pat/rep/ N` substitutes over N lines from the range's end; an N near
+    // usize::MAX used to overflow `hi + c - 1` before the clamp (debug panic).
+    // vim treats an oversized count as "through the last line".
+    let (rpc, _incoming) = start(None).await;
+    // From line 2, so `range.hi (1) + usize::MAX` genuinely overflows pre-fix.
+    feed(&rpc, "ifoo<CR>foo<CR>foo<Esc>2gg");
+    feed(&rpc, ":s/foo/bar/ 18446744073709551615<CR>");
+    assert_eq!(
+        lines(&rpc).await,
+        vec!["foo", "bar", "bar"],
+        "the count clamps to the end of the file"
+    );
+}

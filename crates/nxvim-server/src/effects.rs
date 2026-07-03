@@ -160,7 +160,10 @@ fn virt_decor_to_core(d: VirtDecorData) -> nxvim_core::VirtDecor {
 fn byte_of(buf: &nxvim_core::Buffer, row: i64, col: i64) -> usize {
     let n = buf.line_count();
     let row = (row.max(0) as usize).min(n);
-    let line_len = if row < n { buf.line(row).len() } else { 0 };
+    // `line_len`, not `line(...).len()`: the latter copies the whole line into a
+    // fresh String just to read its length, and this runs per extmark set — e.g.
+    // once per mark of every `nx.decor` viewport publish (per scroll frame).
+    let line_len = if row < n { buf.line_len(row) } else { 0 };
     let col = (col.max(0) as usize).min(line_len);
     buf.line_start(row) + col
 }
@@ -3377,6 +3380,10 @@ pub(crate) fn parse_extent(spec: &str) -> Option<nxvim_core::Extent> {
             .trim()
             .parse::<f32>()
             .ok()
+            // `f32::from_str` accepts `nan`/`inf`, and `NaN.clamp(…)` stays NaN —
+            // which would silently size a zero float instead of the loud
+            // invalid-spec error every other bad value gets. Reject non-finite.
+            .filter(|n| n.is_finite())
             .map(|n| nxvim_core::Extent::Frac((n / 100.0).clamp(0.1, 1.0)));
     }
     spec.parse::<u16>().ok().map(nxvim_core::Extent::Cells)

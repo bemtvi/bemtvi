@@ -571,6 +571,15 @@ fn clear_cells(state: &LinkState) {
     state.proc_rpc.set(None);
     state.lsp_rpc.set(None);
     state.term_rpc.set(None);
+    // Also drop every pending proc/LSP waiter. The demuxes clear these maps when a
+    // connection ends *naturally* (their `incoming` streams EOF), but a **cancelled**
+    // serve — the `:disconnect` path drops the `run_connection` future mid-poll —
+    // never reaches those clears, and a spawn awaiting its daemon report would park
+    // forever (its sender stays alive inside the shared map, which outlives the
+    // connection). Dropping the senders here is exactly the synthesized-exit path
+    // the natural end relies on; doing it twice is an idempotent no-op.
+    state.proc_inflight.lock().unwrap().clear();
+    state.lsp_inflight.lock().unwrap().clear();
 }
 
 /// Split one freshly-connected **single-stream** transport (a duplex / ssh stdio) into the
@@ -1063,6 +1072,19 @@ impl HostProc for RemoteHostProc {
         let inflight = self.inflight.clone();
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         Box::pin(async move {
+            // While disconnected, fail LOUD and fast: `notify` below would be
+            // dropped on the floor, and nothing would ever resolve this spawn (the
+            // inflight entry isn't tied to any connection, so no teardown clears
+            // it) — the job's `on_exit` would hang forever. This is the seam
+            // contract ("while disconnected … fails loud, never hangs") applied to
+            // the one notify-based seam that otherwise couldn't honor it. A drop
+            // racing in right after this check is the cancelled-serve case, which
+            // `clear_cells` fails over by dropping the pending senders.
+            if rpc.current().is_none() {
+                events.spawned(None);
+                events.exited(-1, Vec::new(), b"vim.system: daemon disconnected".to_vec());
+                return;
+            }
             // Register *before* the spawn request so the daemon's reply can never
             // race ahead of a receiver to land in.
             let (tx, mut rx) = unbounded_channel::<DaemonEvent>();

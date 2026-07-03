@@ -67,7 +67,9 @@ const AUTOSCROLL_INTERVAL: Duration = Duration::from_millis(40);
 /// rows (the status line and below, where a drag has crossed past the text body)
 /// qualify; the server decides whether that actually scrolls the focused window.
 fn in_scroll_zone(row: u16, height: u16) -> bool {
-    row == 0 || row + 2 >= height
+    // Saturate: `row` comes straight off the terminal's wire, so a bogus value
+    // near `u16::MAX` must not overflow (a debug-build panic in the input loop).
+    row == 0 || row.saturating_add(2) >= height
 }
 
 /// RAII guard for terminal mouse capture: enables mouse reporting on creation
@@ -191,6 +193,9 @@ where
     let (reader, writer) = tokio::io::split(stream);
     let (rpc, mut incoming) = connect(reader, writer);
 
+    // Fail loud if the attach itself fails (a broken transport / a server-side
+    // error): swallowing it would leave the client running unattached — it would
+    // then exit "successfully" without ever having painted a frame.
     rpc.request(
         "nx_ui_attach",
         vec![
@@ -200,7 +205,7 @@ where
         ],
     )
     .await
-    .ok();
+    .map_err(|e| anyhow::anyhow!("nx_ui_attach failed: {e}"))?;
 
     // Remote (daemon-session) image previews: the file lives on the daemon, so the
     // store fetches its bytes over `nxvim_image_read` instead of reading local disk.

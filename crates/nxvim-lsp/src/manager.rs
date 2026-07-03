@@ -240,9 +240,12 @@ async fn run_server(
                 key: key.clone(),
                 message: format!("lsp: {message}"),
             });
-            // Idle, still draining commands so the manager's sends never error,
-            // until the manager drops us.
-            while rx.recv().await.is_some() {}
+            // Return — *dropping the receiver* — rather than idling on it: the
+            // supervisor's respawn check is `tx.is_closed()`, so a still-open
+            // channel here would make every later `Ensure` for this key a no-op
+            // (the server could never be started again without a full shutdown).
+            // Sends to the closed channel are fire-and-forget and their errors
+            // ignored, so nothing needs us to keep draining.
             return;
         }
 
@@ -294,13 +297,29 @@ async fn run_server_once(
     } = channel;
     // Drain the server's stderr into the log, one line at a time, until it closes
     // (server exit). Each line is logged at WARN so it shows at the default level.
+    // Drained as raw bytes with a lossy decode, NOT `lines()`: stderr is not
+    // guaranteed UTF-8 (binary logging, raw panic dumps), and `next_line()`
+    // *errors* on an undecodable line — ending the loop used to abandon the pipe,
+    // whose closed read end then killed the server on its next stderr write
+    // (SIGPIPE / `eprintln!` panic). The channel is purely diagnostic, so junk on
+    // it must never take the server down; keep draining to EOF.
     if let Some(stderr) = stderr {
         let log = log.clone();
         let name = key.name.clone();
         tokio::spawn(async move {
-            let mut lines = BufReader::new(stderr).lines();
-            while let Ok(Some(line)) = lines.next_line().await {
-                log.log(LogLevel::Warn, &name, &format!("stderr: {line}"));
+            let mut reader = BufReader::new(stderr);
+            let mut buf = Vec::new();
+            loop {
+                buf.clear();
+                match reader.read_until(b'\n', &mut buf).await {
+                    // EOF (server exit), or the pipe itself broke.
+                    Ok(0) | Err(_) => break,
+                    Ok(_) => {
+                        let line = String::from_utf8_lossy(&buf);
+                        let line = line.trim_end_matches(['\n', '\r']);
+                        log.log(LogLevel::Warn, &name, &format!("stderr: {line}"));
+                    }
+                }
             }
         });
     }

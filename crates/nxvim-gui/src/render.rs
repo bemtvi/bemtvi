@@ -38,7 +38,7 @@ use nxvim_view::{
     View, VirtChunk, VirtPlacement, WindowRegion, WindowView,
 };
 use unicode_script::Script;
-use unicode_width::UnicodeWidthStr;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 use winit::window::Window;
 
 use crate::images::{ImageDraw, ImageStatus, ImageStore};
@@ -471,6 +471,17 @@ impl Renderer {
         self.cache.clear();
     }
 
+    /// Update the window's scale factor (device pixels per logical pixel) after a
+    /// `ScaleFactorChanged` — the window moved onto a different-DPI monitor. The
+    /// caller then re-applies the current font ([`Self::set_font`]), which
+    /// re-derives the device-pixel metrics from the unchanged point size and
+    /// re-measures the cell. A non-finite / non-positive factor is ignored.
+    pub fn set_scale(&mut self, scale: f32) {
+        if scale.is_finite() && scale > 0.0 {
+            self.scale = scale;
+        }
+    }
+
     /// Swap in a [`FontSystem`] whose fallback prefers `fallback_families`, reusing
     /// the current system's font database so no rescan happens. The placeholder is an
     /// empty-database system, immediately dropped once the real database is moved out.
@@ -539,8 +550,13 @@ impl Renderer {
         if width == 0 || height == 0 {
             return;
         }
-        self.config.width = width.min(self.max_dim);
-        self.config.height = height.min(self.max_dim);
+        let (w, h) = (width.min(self.max_dim), height.min(self.max_dim));
+        if (w, h) == (self.config.width, self.config.height) {
+            return; // unchanged — skip the swapchain reconfigure (winit can
+                    // re-report the same size on focus/DPI churn)
+        }
+        self.config.width = w;
+        self.config.height = h;
         self.surface.configure(&self.device, &self.config);
     }
 
@@ -1798,14 +1814,12 @@ impl Renderer {
         self.push_plain(items, &text, pos, fg, full);
 
         // The command-line cursor: a semi-transparent block past the leading prompt
-        // (a single prefix char, or the multi-char `vim.ui.input` label).
+        // (a single prefix char, or the multi-char `vim.ui.input` label). The caret
+        // cell is display-width based — `cmdline_cursor` is a char offset, and a
+        // wide CJK/emoji char in the prompt or the typed text occupies two cells of
+        // the shaped run (see [`cmdline_caret_col`]).
         if view.command_mode {
-            let prompt_width = if view.cmdline_prompt.is_empty() {
-                1 // `:` / `/` / `?`
-            } else {
-                view.cmdline_prompt.chars().count() as u16
-            };
-            let col = prompt_width + view.cmdline_cursor as u16;
+            let col = cmdline_caret_col(&view.cmdline_prompt, &view.cmdline, view.cmdline_cursor);
             let (px, py) = self.cell_px(col, cmd_row);
             // Composing accented/CJK text in the command line or search: anchor the
             // IME candidate window at the command-line caret, not the window origin.
@@ -2502,8 +2516,11 @@ impl Renderer {
                 border,
                 full,
             );
-            // The caret: a thin bar past the `> ` prefix at the query's cursor column.
-            let caret = (2 + menu.query_cursor).min(list_w.saturating_sub(1));
+            // The caret: a thin bar past the `> ` prefix at the query cursor —
+            // display-width based, since `query_cursor` is a char offset and a wide
+            // CJK char in the query occupies two cells (see [`query_caret_col`]).
+            let caret =
+                query_caret_col(query, menu.query_cursor as usize).min(list_w.saturating_sub(1));
             let (cpx, cpy) = self.cell_px(cx + caret, content_y0 + prompt_y);
             let c = srgb_to_color_rgba(fg, 0.9);
             quads.push(Quad {
@@ -3592,6 +3609,45 @@ fn gutter_cell(
     }
 }
 
+/// The command-line caret's screen cell (cell 0 = the line's first cell): the
+/// leading prompt — the single-cell `:`/`/`/`?` prefix, or the multi-char
+/// `vim.ui.input` label — followed by the text before the caret. `cursor_chars`
+/// (`View::cmdline_cursor`) is a **char offset** on the wire (nxvim-core's
+/// `cmdline_cursor()`), and the row is painted as one shaped run in which a wide
+/// CJK/emoji char occupies two cells, so both the prompt and the pre-caret text
+/// must be measured by display width — counting chars lands the caret one cell
+/// short per wide char, out from under the glyph it edits (the server measures
+/// the prompt with `display_width` too). Pure, so it's unit-tested in
+/// `tests/caret.rs`.
+pub fn cmdline_caret_col(prompt: &str, line: &str, cursor_chars: usize) -> u16 {
+    let prompt_cells = if prompt.is_empty() {
+        1 // `:` / `/` / `?` — a single-cell prefix
+    } else {
+        prompt.width() as u16
+    };
+    prompt_cells + cells_before(line, cursor_chars)
+}
+
+/// The picker prompt caret's cell offset within the list column: the `"> "`
+/// prefix (two cells) plus the query text before the caret. `cursor_chars`
+/// (`MenuData::query_cursor`) is a **char offset** on the wire, measured onto
+/// the shaped run by display width — the same wide-char rationale as
+/// [`cmdline_caret_col`]. Pure, so it's unit-tested in `tests/caret.rs`.
+pub fn query_caret_col(query: &str, cursor_chars: usize) -> u16 {
+    2 + cells_before(query, cursor_chars)
+}
+
+/// The display-width cells of the first `chars` chars of `s` — how a char-offset
+/// wire field maps onto the shaped run's cell grid, where a wide CJK/emoji char
+/// takes two cells and a zero-width combining mark takes none. An offset past the
+/// end clamps to the string's full width (`take` saturates).
+fn cells_before(s: &str, chars: usize) -> u16 {
+    s.chars()
+        .take(chars)
+        .map(|c| c.width().unwrap_or(0))
+        .sum::<usize>() as u16
+}
+
 /// Map a buffer screen-column to its absolute screen cell in a window whose text
 /// area starts at `text_x0` and is horizontally scrolled by `leftcol` columns: the
 /// column slides left by `leftcol`, clamping at `text_x0` for anything scrolled off
@@ -4177,6 +4233,9 @@ fn pad_to_width(s: &str, width: usize) -> String {
 /// Expand `\t` to spaces up to the next `tabstop` multiple, so a char index in
 /// the result equals a screen column for ASCII/tab text.
 fn expand_tabs(line: &str, tabstop: usize) -> String {
+    if !line.contains('\t') {
+        return line.to_string(); // hot path: one memcpy, no per-char walk
+    }
     let mut out = String::with_capacity(line.len());
     let mut col = 0;
     for ch in line.chars() {

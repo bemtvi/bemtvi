@@ -34,6 +34,10 @@ globals:
   # calls `table.unpack` directly (the `table` field isn't in selene's lua51 std).
   table.unpack:
     any: true
+  # 5.3+ `table.move`; vim.split's trimempty shift uses it. Same reasoning:
+  # not in selene's lua51 std, provided by nxvim's PUC 5.4.
+  table.move:
+    any: true
   # 5.2+ coroutine introspection; `nx.await` uses it to detect an enclosing
   # nx.async coroutine. Not in selene's lua51 std, so declare it here.
   coroutine.isyieldable:

@@ -338,6 +338,56 @@ fn is_multiline_reflects_pattern() {
 }
 
 // ---------------------------------------------------------------------------
+// regression: the engine's current-context cache (curbuf/curwin are pinned
+// lazily — the C tables are only rebuilt when the context actually changes)
+
+#[test]
+fn context_switches_between_buffers_with_different_iskeyword() {
+    let re = VimRegex::compile("\\k\\+").unwrap();
+    let mut with_dash = VimBuffer::from_lines(&["foo-bar"]).unwrap();
+    with_dash.set_iskeyword("@,48-57,_,192-255,-").unwrap();
+    let plain = VimBuffer::from_lines(&["foo-bar"]).unwrap();
+    // interleave: each exec must see its own buffer's keyword table, not a
+    // stale cached context from the previous call
+    for _ in 0..3 {
+        let m = with_dash.exec(&re, 1, 0, false, None).unwrap().unwrap();
+        assert_eq!((m.start.col, m.end.col), (0, 7)); // "foo-bar"
+        let m = plain.exec(&re, 1, 0, false, None).unwrap().unwrap();
+        assert_eq!((m.start.col, m.end.col), (0, 3)); // "foo"
+    }
+}
+
+#[test]
+fn exec_line_uses_default_context_after_buffer_exec() {
+    let re = VimRegex::compile("\\k\\+").unwrap();
+    let mut buf = VimBuffer::from_lines(&["foo-bar"]).unwrap();
+    buf.set_iskeyword("@,48-57,_,192-255,-").unwrap();
+    let m = buf.exec(&re, 1, 0, false, None).unwrap().unwrap();
+    assert_eq!((m.start.col, m.end.col), (0, 7)); // buffer iskeyword: "foo-bar"
+
+    // exec_line must re-pin the default context (default 'iskeyword', where
+    // '-' is not a keyword char), not keep matching against `buf`'s
+    let m = re.exec_line("foo-bar", 0, false).unwrap().unwrap();
+    assert_eq!((m.start, m.end), (0, 3)); // "foo"
+}
+
+#[test]
+fn buffer_drop_and_realloc_repins_context() {
+    // Cycle create → exec → drop: each drop NULLs curbuf/curwin on the C
+    // side and each new buf_T typically reuses the freed address, so a
+    // context cache that fails to re-pin would leave curbuf NULL/stale — the
+    // \%V assertion gates on `rex.reg_buf == curbuf` and would silently stop
+    // matching. Iterate so at least one round hits the address-reuse case.
+    let re = VimRegex::compile("\\%V\\w\\+").unwrap();
+    for _ in 0..5 {
+        let mut buf = VimBuffer::from_lines(&["foo bar baz"]).unwrap();
+        buf.set_visual(BufPos { lnum: 1, col: 4 }, BufPos { lnum: 1, col: 6 }, 'v');
+        let m = buf.exec(&re, 1, 0, false, None).unwrap().unwrap();
+        assert_eq!((m.start.col, m.end.col), (4, 7)); // "bar"
+    }
+}
+
+// ---------------------------------------------------------------------------
 // regression: many compiled programs alive at once, drop order
 
 #[test]

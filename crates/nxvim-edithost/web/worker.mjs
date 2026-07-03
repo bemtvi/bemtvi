@@ -959,17 +959,42 @@ function setDaemonStatus(phase, reconnected) {
   }
 }
 
-// Forget every per-connection live-state set: a fresh daemon knows none of the old watches,
-// children, language servers, or terminals. Gates the proc host off until the re-dial lands.
+// Forget every per-connection live-state set — a fresh daemon knows none of the old watches,
+// children, language servers, or terminals — and FAIL the in-flight work loudly. The native
+// legs synthesize a failure on teardown (daemon.rs: `run_demux` reports a `-1` proc exit "so
+// the editor's one-shot on_exit always fires and is never leaked"; `run_lsp_demux` drops each
+// exit_tx so a waiting server reports an exit "rather than hanging") — without the same here,
+// an in-flight `nx.run` promise / `nx.process` on_exit / `nx.socket` on_close / `nx.fs.watch`
+// pull would hang forever across a drop (a silent stub, per CLAUDE.md "fail loud"). The
+// synthetic events ride the same notification queue as real daemon pushes, so they land on
+// the run loop — the tick's single consumer — through exactly the code path a wire push
+// takes. Watches carry no user callback (they re-arm via the reconnect resync) and lost
+// terminals are frozen by the resync too (`resync_after_reconnect`, native parity), so both
+// are just cleared. Gates the proc host off until the re-dial lands.
 function clearDaemonLiveState() {
   eh_set_proc_host(h, 0);
   armedWatches.clear();
-  liveProcs.clear();
   liveTerms.clear();
-  liveFsWatches.clear();
-  liveLsp.clear();
+  // Snapshot + clear before pushing: under 5c the push applies synchronously
+  // (pump5cDaemon), and its landing deletes from these very sets.
+  const procs = [...liveProcs];
+  liveProcs.clear();
+  const dprocs = [...liveDprocs];
   liveDprocs.clear();
+  const socks = [...liveSocks];
   liveSocks.clear();
+  const fsWatches = [...liveFsWatches];
+  liveFsWatches.clear();
+  const lsps = [...liveLsp];
+  liveLsp.clear();
+  for (const id of procs) landHostPush("proc_exited", [id, -1, null, "daemon connection closed"]);
+  for (const id of dprocs) landHostPush("dproc_exit", [id, -1]);
+  for (const id of socks) landHostPush("sock_closed", [id, "daemon connection closed"]);
+  for (const id of fsWatches) landHostPush("luafs_watch_err", [id, "daemon connection closed"]);
+  // A dropped link is a server exit to the SyncLspClient (nil code/signal = "not collected",
+  // exactly what the native demux's dropped exit_tx reports); it surfaces ServerExited and
+  // the reconnect resync re-spawns the server against the new wire.
+  for (const id of lsps) landHostPush("lsp_exited", [id, null, null]);
 }
 
 // Dial once and, on success, wire the link up + announce `connected`. `reconnected` marks a
@@ -1663,10 +1688,11 @@ async function drainTerminalRequests() {
     scheduleDiscardCheck();
   }
   for (const r of reqs.resize) await daemon.notify("term_resize", [r.buf, r.rows, r.cols]);
-  for (const buf of reqs.kill) {
-    liveTerms.delete(buf);
-    await daemon.notify("term_kill", [buf]);
-  }
+  // Keep the buf in `liveTerms` until its `term_exit` push arrives — a kill does NOT end
+  // the PTY child synchronously; deleting it here would deep-park the loop (blocking wait)
+  // before the exit could be received (the same rule as the dproc/sock kill paths; it's
+  // deleted in applyDaemonNotifications on `term_exit`).
+  for (const buf of reqs.kill) await daemon.notify("term_kill", [buf]);
 }
 
 // Forward the LSP wire ops the SyncLspClient enqueued to the daemon (`lsp_spawn` / `lsp_stdin` /
@@ -1693,10 +1719,12 @@ async function drainLspRequests() {
   for (const i of reqs.stdin) {
     await daemon.notify("lsp_stdin", [i.id, new Uint8Array(i.bytes)]);
   }
-  for (const id of reqs.kill) {
-    liveLsp.delete(id);
-    await daemon.notify("lsp_kill", [id]);
-  }
+  // Keep the id in `liveLsp` until its `lsp_exited` push arrives — the daemon kills the
+  // server and reports the exit asynchronously; deleting it here would deep-park the loop
+  // before the push could be received (the same rule as the dproc/sock kill paths; it's
+  // deleted in applyDaemonNotifications on `lsp_exited`). A kill for an id the daemon
+  // doesn't know (a post-reconnect shutdown of a pre-drop server) was never in the set.
+  for (const id of reqs.kill) await daemon.notify("lsp_kill", [id]);
 }
 
 // Forward the watch arm/disarm requests the editor enqueued to the daemon (`fs_watch` /

@@ -203,3 +203,67 @@ async fn equalize_balances_nested_horizontal_splits() {
         "`<C-w>=` equalizes stacked rows by leaf count too: {after:?}"
     );
 }
+
+/// Closing the last *tiled* window by id while a **float** holds focus closes
+/// the floats and keeps the tiled window (neovim's rule) — and must re-point
+/// focus at the survivor. It used to leave `windows.current` dangling on the
+/// freed float id, poisoning every later current-window lookup.
+#[tokio::test]
+async fn closing_last_tiled_window_with_focused_float_refocuses_the_survivor() {
+    let (rpc, _incoming) = start().await;
+    let tiled = req(&rpc, "nvim_get_current_win", vec![])
+        .await
+        .as_u64()
+        .expect("current win handle");
+    // Open a float and give it focus (`enter = true`).
+    let config = Value::Map(vec![
+        (Value::from("relative"), Value::from("editor")),
+        (Value::from("row"), Value::from(2u64)),
+        (Value::from("col"), Value::from(3u64)),
+        (Value::from("width"), Value::from(20u64)),
+        (Value::from("height"), Value::from(5u64)),
+    ]);
+    let float = req(
+        &rpc,
+        "nvim_open_win",
+        vec![Value::from(0u64), Value::from(true), config],
+    )
+    .await
+    .as_u64()
+    .expect("float handle");
+    assert_ne!(float, tiled);
+    assert_eq!(
+        req(&rpc, "nvim_get_current_win", vec![])
+            .await
+            .as_u64()
+            .expect("current"),
+        float,
+        "the float took focus"
+    );
+
+    // Close the *tiled* window while the float is focused: the floats close
+    // instead and the tiled window survives.
+    req(
+        &rpc,
+        "nvim_win_close",
+        vec![Value::from(tiled), Value::from(false)],
+    )
+    .await;
+    assert_eq!(
+        win_handles(&rpc).await,
+        vec![tiled],
+        "the tiled window survives; the floats are closed"
+    );
+    assert_eq!(
+        req(&rpc, "nvim_get_current_win", vec![])
+            .await
+            .as_u64()
+            .expect("current"),
+        tiled,
+        "focus fell back to the surviving tiled window, not the freed float id"
+    );
+    // The editor is still fully operable.
+    feed(&rpc, "iok<Esc>");
+    let cur = req(&rpc, "nvim_win_get_cursor", vec![Value::from(tiled)]).await;
+    assert!(matches!(cur, Value::Array(_)), "server still answers");
+}

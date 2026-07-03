@@ -14,6 +14,7 @@
 //! pattern is not supported. The scan starts at `from = { line, col }` (1-based line,
 //! 0-based byte col) and runs forward, or backward with `backward = true`.
 
+use crate::convert::lua_int;
 use mlua::{Lua, Table, UserData, UserDataMethods, Value, Variadic};
 use regex::RegexBuilder;
 
@@ -82,6 +83,14 @@ impl Compiled {
         if from > line.len() {
             return None;
         }
+        // A match can only start on a char boundary, but `from` is a caller-chosen
+        // byte offset that may point inside a multi-byte char (e.g. a `:find` init).
+        // Round it up to the next boundary so the slicing / engines below never
+        // panic on an off-boundary start.
+        let mut from = from;
+        while !line.is_char_boundary(from) {
+            from += 1;
+        }
         match self {
             Compiled::Plain { needle, ignorecase } => {
                 let hay = if *ignorecase {
@@ -98,10 +107,10 @@ impl Compiled {
                     }
                 })
             }
-            Compiled::Pcre(re) => re
-                .captures_iter(line)
-                .find(|c| c.get(0).map(|m| m.start() >= from).unwrap_or(false))
-                .map(|c| pcre_hit(&c)),
+            // `captures_at` restarts the scan at `from`, so a match overlapping an
+            // earlier (pre-`from`) one is still found — walking the non-overlapping
+            // match set from offset 0 would skip it (and rescan the prefix for nothing).
+            Compiled::Pcre(re) => re.captures_at(line, from).map(|c| pcre_hit(&c)),
             Compiled::Vim { re, ignorecase } => re
                 .exec_line(line, from, *ignorecase)
                 .ok()
@@ -122,20 +131,24 @@ impl Compiled {
                     line.to_string()
                 };
                 // last occurrence whose start is < limit
-                let upper = hay.len().min(limit.saturating_add(needle.len()));
-                hay[..upper.min(hay.len())]
-                    .rfind(needle.as_str())
-                    .and_then(|start| {
-                        if start < limit {
-                            Some(LineHit {
-                                start,
-                                end: start + needle.len(),
-                                captures: vec![],
-                            })
-                        } else {
-                            None
-                        }
-                    })
+                let mut upper = hay.len().min(limit.saturating_add(needle.len()));
+                // A valid-UTF-8 needle can only match ending on a char boundary, so
+                // flooring a mid-char `upper` (limit is a caller-chosen byte offset)
+                // excludes no match while keeping the slice panic-free.
+                while !hay.is_char_boundary(upper) {
+                    upper -= 1;
+                }
+                hay[..upper].rfind(needle.as_str()).and_then(|start| {
+                    if start < limit {
+                        Some(LineHit {
+                            start,
+                            end: start + needle.len(),
+                            captures: vec![],
+                        })
+                    } else {
+                        None
+                    }
+                })
             }
             Compiled::Pcre(re) => re
                 .captures_iter(line)
@@ -398,8 +411,8 @@ impl UserData for NxRegex {
                     return Ok(Variadic::from_iter([Value::Nil]));
                 };
                 let mut out = vec![
-                    Value::Integer((hit.start + 1) as i64),
-                    Value::Integer(hit.end as i64),
+                    Value::Integer(lua_int((hit.start + 1) as i64)),
+                    Value::Integer(lua_int(hit.end as i64)),
                 ];
                 for c in &hit.captures {
                     out.push(Value::String(lua.create_string(c)?));

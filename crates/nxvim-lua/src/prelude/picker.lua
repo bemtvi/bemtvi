@@ -609,7 +609,8 @@ function nx.picker.edit(item, mode, layer)
   else
     -- Open honoring 'switchbuf' (a file already shown in another tab is focused
     -- there under the default `usetab`), not a plain `:edit` into this window.
-    nx._open(item.path, to_main)
+    -- Distinct bridge from nx.open's `nx._open` (the `:edit`-like layer open).
+    nx._open_switchbuf(item.path, to_main)
   end
 end
 

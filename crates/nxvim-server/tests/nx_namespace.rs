@@ -11,8 +11,8 @@
 use nxvim_rpc::{Incoming, Rpc};
 use nxvim_server::ServerInit;
 use nxvim_test_harness::{
-    cursor_u64, drain_to_latest_redraw, exec_lua, feed, field_str, start_attached, wait_redraw,
-    window0_field,
+    cursor_u64, drain_to_latest_redraw, exec_lua, feed, field_str, map_get, start_attached,
+    wait_redraw, window0_field,
 };
 use rmpv::Value;
 use tokio::sync::mpsc::UnboundedReceiver;
@@ -224,6 +224,52 @@ async fn nx_command_defines_a_runnable_user_command() {
         exec_lua(&rpc, "return vim.g.nx_pinged").await.as_bool(),
         Some(true),
         "a :command defined through nx.command runs"
+    );
+}
+
+#[tokio::test]
+async fn a_user_command_can_be_invoked_with_a_bang() {
+    let (rpc, _incoming) = start().await;
+
+    // `:NxBang!` must dispatch to the registered user command — the trailing
+    // `!` is the command's bang, not part of its name, so the user-command
+    // lookup must match on the bare name (it used to fall through to
+    // `E492: Not an editor command: NxBang!`).
+    exec_lua(
+        &rpc,
+        "nx.command('NxBang', function() vim.g.nx_banged = true end, { bang = true })",
+    )
+    .await;
+    exec_lua(&rpc, "vim.cmd('NxBang!')").await;
+    assert_eq!(
+        exec_lua(&rpc, "return vim.g.nx_banged").await.as_bool(),
+        Some(true),
+        "a user command invoked with a trailing bang runs"
+    );
+}
+
+#[tokio::test]
+async fn a_user_command_callback_observes_opts_bang() {
+    let (rpc, _incoming) = start().await;
+
+    // The callback's `opts.bang` must reflect the invocation: true for `:Cmd!`,
+    // false for `:Cmd` — not a hard-coded false.
+    exec_lua(
+        &rpc,
+        "_G.bangs = {}\n\
+         nx.command('NxBangSee', function(o)\n\
+         \x20 _G.bangs[#_G.bangs + 1] = tostring(o.bang)\n\
+         end, { bang = true })",
+    )
+    .await;
+    exec_lua(&rpc, "vim.cmd('NxBangSee!')").await;
+    exec_lua(&rpc, "vim.cmd('NxBangSee')").await;
+    assert_eq!(
+        exec_lua(&rpc, "return table.concat(_G.bangs, ',')")
+            .await
+            .as_str(),
+        Some("true,false"),
+        "opts.bang reflects whether the invocation carried a trailing !"
     );
 }
 
@@ -945,5 +991,114 @@ async fn nx_rust_backed_utility_wrappers_resolve() {
             .as_str(),
         Some("function"),
         "nvim_echo alias survives the wrapper split"
+    );
+}
+
+// ----- nx.notify / nx.inspect / stdlib regressions ---------------------------
+
+/// `nx.notify(msg, "error")` — the string severity spelling several surfaces use
+/// (decor providers, picker/complete source errors) — must paint the red error
+/// line exactly like the numeric `vim.log.levels.ERROR`, not degrade to a plain
+/// print.
+#[tokio::test]
+async fn nx_notify_string_error_level_paints_the_error_line() {
+    let (rpc, mut incoming) = start().await;
+    exec_lua(&rpc, "nx.notify('boom happened', 'error')").await;
+    rpc.request("nvim_get_mode", vec![]).await.expect("barrier");
+    let frame = drain_to_latest_redraw(&mut incoming, |_| true).expect("a redraw arrived");
+    assert_eq!(field_str(&frame, "message"), "boom happened");
+    assert_eq!(
+        map_get(&frame, "message_error").and_then(Value::as_bool),
+        Some(true),
+        "a string 'error' severity must reach the error line, not a plain print"
+    );
+}
+
+/// `nx.inspect` on a self-referencing table renders `<cycle>` instead of
+/// overflowing the stack — plugins inspect arbitrary state (parent-linked trees).
+#[tokio::test]
+async fn nx_inspect_handles_cycles() {
+    let (rpc, _incoming) = start().await;
+    let out = exec_lua(
+        &rpc,
+        "local t = { name = 'root' }\n\
+         t.me = t\n\
+         local ok, s = pcall(nx.inspect, t)\n\
+         return tostring(ok) .. ':' .. (ok and (s:find('<cycle>', 1, true) and 'marked' or s) or tostring(s))",
+    )
+    .await;
+    assert_eq!(out.as_str(), Some("true:marked"));
+}
+
+/// A separator pattern that matches an empty string would leave the split scan
+/// in place forever; vim.split must fail loud (neovim's "Infinite loop detected"
+/// contract) instead of hanging the editor.
+#[tokio::test]
+async fn vim_split_zero_width_separator_pattern_fails_loud_not_hang() {
+    let (rpc, _incoming) = start().await;
+    let out = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        exec_lua(
+            &rpc,
+            "local ok, err = pcall(vim.split, 'abc', 'x*')\n\
+             return tostring(ok) .. ':' .. tostring(err)",
+        ),
+    )
+    .await
+    .expect("vim.split with a zero-width separator must error, not spin forever");
+    let s = out.as_str().unwrap_or_default().to_string();
+    assert!(
+        s.starts_with("false:") && s.contains("empty string"),
+        "expected a loud named error, got {s:?}"
+    );
+}
+
+/// The ordinary split shapes still hold after the zero-width guard (incl.
+/// trimempty's leading/trailing removal, which now shifts once instead of
+/// re-shifting per removal).
+#[tokio::test]
+async fn vim_split_trimempty_drops_leading_and_trailing_empties() {
+    let (rpc, _incoming) = start().await;
+    let out = exec_lua(
+        &rpc,
+        "return table.concat(vim.split(',,a,b,,', ',', { trimempty = true }), '|')",
+    )
+    .await;
+    assert_eq!(out.as_str(), Some("a|b"));
+    let (rpc2, _inc2) = start().await;
+    let all_empty = exec_lua(
+        &rpc2,
+        "return tostring(#vim.split(',,,', ',', { trimempty = true }))",
+    )
+    .await;
+    assert_eq!(all_empty.as_str(), Some("0"));
+}
+
+/// `vim.fn.bufnr(name)` prefers the exactly-named buffer over a suffix match —
+/// and never lets `pairs` iteration order pick between them.
+#[tokio::test]
+async fn bufnr_prefers_an_exact_name_over_a_suffix_match() {
+    let (rpc, _incoming) = start().await;
+    let dir = nxvim_test_harness::temp_dir("bufnr_exact");
+    std::fs::create_dir_all(dir.join("sub")).unwrap();
+    std::fs::write(dir.join("init.lua"), "top\n").unwrap();
+    std::fs::write(dir.join("sub").join("init.lua"), "nested\n").unwrap();
+
+    // Open the suffix-matching buffer FIRST so it holds the lower bufnr (the one a
+    // first-match-wins scan would return), then the exactly-named one.
+    exec_lua(&rpc, &format!("vim.cmd('cd {}')", dir.display())).await;
+    exec_lua(&rpc, "vim.cmd('edit sub/init.lua')").await;
+    exec_lua(&rpc, "vim.cmd('edit init.lua')").await;
+
+    let name = exec_lua(
+        &rpc,
+        "local nr = vim.fn.bufnr('init.lua')\n\
+         return (nx._bufs[nr] or {}).name or ('no buffer ' .. tostring(nr))",
+    )
+    .await;
+    assert_eq!(
+        name.as_str(),
+        Some("init.lua"),
+        "bufnr('init.lua') must resolve to the exactly-named buffer, not the sub/init.lua suffix match"
     );
 }

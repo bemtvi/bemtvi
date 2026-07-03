@@ -967,7 +967,9 @@ impl Editor {
             Some(c) if c.is_ascii_digit() => {
                 let mut n = 0i64;
                 while let Some(d) = bytes.get(*i).filter(|b| b.is_ascii_digit()) {
-                    n = n * 10 + i64::from(d - b'0');
+                    // Saturate: an absurdly wide address must clamp to the last
+                    // line below, not overflow (a debug-build panic).
+                    n = n.saturating_mul(10).saturating_add(i64::from(d - b'0'));
                     *i += 1;
                 }
                 line = n - 1; // 1-based source line -> 0-based index
@@ -982,14 +984,19 @@ impl Editor {
             let mut n = 0i64;
             let mut digits = false;
             while let Some(d) = bytes.get(*i).filter(|b| b.is_ascii_digit()) {
-                n = n * 10 + i64::from(d - b'0');
+                // Saturating, as for the base address above.
+                n = n.saturating_mul(10).saturating_add(i64::from(d - b'0'));
                 *i += 1;
                 digits = true;
             }
             if !digits {
                 n = 1;
             }
-            line += if sign == b'+' { n } else { -n };
+            line = if sign == b'+' {
+                line.saturating_add(n)
+            } else {
+                line.saturating_sub(n)
+            };
             have_offset = true;
         }
 
@@ -1123,7 +1130,12 @@ impl Editor {
         // A trailing count restricts the edit to `count` lines from the range's
         // last line (vim semantics), overriding the range's start.
         let (lo, hi) = match count {
-            Some(c) => (range.hi, (range.hi + c - 1).min(self.last_line())),
+            // `c >= 1` is guaranteed by the parse; saturate so a huge count means
+            // "through the last line" instead of overflowing before the clamp.
+            Some(c) => (
+                range.hi,
+                range.hi.saturating_add(c - 1).min(self.last_line()),
+            ),
             None => (range.lo, range.hi),
         };
 

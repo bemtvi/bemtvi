@@ -119,14 +119,48 @@ fn split_handle_at(view: &View, geo: Geometry, row: u16, col: u16) -> Option<Res
             let left = ox.saturating_add(sep.x);
             let right = left.saturating_add(sep.length);
             let in_x = col >= left && col < right;
-            // The separator row resizes the split; so does the status row one cell
-            // above it (the status-line handle for the window directly above).
-            if in_x && (row == sy || row.saturating_add(1) == sy) {
+            if in_x && row == sy {
+                return Some(ResizeCursor::Row);
+            }
+            // The status row one cell above the separator is a handle too (vim's
+            // status-line drag for the window directly above) — but only when that
+            // window actually shows a status row. With `'laststatus'` 0/3 the row is
+            // ordinary text and the server's authoritative hit-test (which grabs a
+            // *status* row, `rel_y == text_height`) denies it; mirror that.
+            if in_x
+                && row.saturating_add(1) == sy
+                && status_visible_at(
+                    view,
+                    sep.region,
+                    col.saturating_sub(ox),
+                    row.saturating_sub(oy),
+                )
+            {
                 return Some(ResizeCursor::Row);
             }
         }
     }
     None
+}
+
+/// Whether the (tiled) window covering the **region-relative** cell `(y, x)`
+/// shows its own status row (`'laststatus'`). Floats are skipped — they overlay
+/// the tiled tree and never own a split's status handle. `true` when no window
+/// rect covers the cell: the legacy flat redraw carries no rects, and there the
+/// historical every-window-has-a-status behavior is the right fallback.
+fn status_visible_at(view: &View, region: WindowRegion, x: u16, y: u16) -> bool {
+    view.windows
+        .iter()
+        .filter(|w| !w.floating && w.region == region)
+        .find_map(|w| {
+            let r = w.rect?;
+            let inside = x >= r.x
+                && x < r.x.saturating_add(r.width)
+                && y >= r.y
+                && y < r.y.saturating_add(r.height);
+            inside.then_some(w.status_visible)
+        })
+        .unwrap_or(true)
 }
 
 /// The absolute screen origin of a region's window-tree area (below its own

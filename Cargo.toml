@@ -96,6 +96,11 @@ ratatui-image = { version = "=11.0.4", default-features = false, features = [
     "crossterm",
 ] }
 image = "=0.25.10"
+# Raw `poll(2)` for the TUI's does-this-terminal-answer-queries probe (see
+# `nxvim-tui/src/images.rs::terminal_answers_status_query`): it must wait for a
+# reply *without consuming stdin*, which `std::io` can't express. Already in the
+# tree transitively; pinned to the resolved version.
+libc = "=0.2.186"
 # Native GUI client stack (`nxvim-gui`). winit owns the window + input event loop,
 # wgpu the GPU surface, and glyphon the text rendering (it re-exports cosmic-text,
 # so the GUI reaches `FontSystem`/`Buffer`/`Attrs`/… through `glyphon::`). glyphon

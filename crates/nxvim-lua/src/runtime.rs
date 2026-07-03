@@ -2949,7 +2949,26 @@ impl LuaRuntime {
     /// (`name`, `args`, `fargs`, `bang`); a string command is queued as an
     /// ex-command. Effects land in [`Shared`] and are drained by the server like
     /// any other chunk.
+    ///
+    /// The bang-less wire shape, kept so the server call site keeps compiling
+    /// until it migrates; forwards with `bang = false`. New callers should use
+    /// [`Self::run_user_command_bang`] and pass the invocation's parsed `!`.
     pub fn run_user_command(&self, name: &str, args: &str, bufnr: u64) -> mlua::Result<()> {
+        self.run_user_command_bang(name, args, bufnr, false)
+    }
+
+    /// [`Self::run_user_command`], with the invocation's `!` threaded through:
+    /// `bang` is whether the typed command carried a trailing bang (`:Name!`),
+    /// surfaced to a function command as `opts.bang` — so a command registered
+    /// with `bang = true` can actually branch on it. (A string command is queued
+    /// unchanged; its body spells its own bangs.)
+    pub fn run_user_command_bang(
+        &self,
+        name: &str,
+        args: &str,
+        bufnr: u64,
+        bang: bool,
+    ) -> mlua::Result<()> {
         match self.user_command(name, bufnr)? {
             mlua::Value::Function(f) => {
                 let opts = self.lua.create_table()?;
@@ -2960,7 +2979,7 @@ impl LuaRuntime {
                     fargs.set(i + 1, a)?;
                 }
                 opts.set("fargs", fargs)?;
-                opts.set("bang", false)?;
+                opts.set("bang", bang)?;
                 f.call::<()>(opts)?;
                 Ok(())
             }

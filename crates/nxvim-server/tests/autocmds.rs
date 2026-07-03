@@ -1143,3 +1143,52 @@ async fn ex_autocmd_once_fires_exactly_once() {
     let n = exec_lua(&rpc, "return _G.n").await;
     assert_eq!(n.as_u64(), Some(1), "++once autocmd fired exactly once");
 }
+
+/// Autocmd glob bracket classes support negation: shell-style `[!a]` and
+/// vim-style `[^a]` both exclude the listed characters (they must not match the
+/// characters literally, which is what an unrepaired Lua class would do).
+#[tokio::test]
+async fn glob_bracket_negation_excludes_the_listed_chars() {
+    let dir = temp_dir("au_negclass");
+    let (rpc, _incoming) = start_with_config(&dir, "").await;
+    let out = exec_lua(
+        &rpc,
+        "_G.hits = {}\n\
+         vim.api.nvim_create_autocmd('User', { pattern = '[!a]*.txt',\n\
+         \x20 callback = function(a) _G.hits[#_G.hits + 1] = 'bang:' .. a.match end })\n\
+         vim.api.nvim_create_autocmd('User', { pattern = '[^b]*.txt',\n\
+         \x20 callback = function(a) _G.hits[#_G.hits + 1] = 'caret:' .. a.match end })\n\
+         vim.api.nvim_exec_autocmds('User', { pattern = 'a.txt' })\n\
+         vim.api.nvim_exec_autocmds('User', { pattern = 'b.txt' })\n\
+         return table.concat(_G.hits, ',')",
+    )
+    .await;
+    // 'a.txt' is excluded by [!a] but allowed by [^b]; 'b.txt' the other way round.
+    assert_eq!(out.as_str(), Some("caret:a.txt,bang:b.txt"));
+}
+
+/// A malformed bracket class in an autocmd pattern (`foo[bar`) must not blow up
+/// the event fire: autocmds registered after it still run, and the malformed
+/// spelling itself still matches exactly (it just matches nothing as a glob).
+#[tokio::test]
+async fn malformed_glob_class_does_not_abort_the_event_fire() {
+    let dir = temp_dir("au_badclass");
+    let (rpc, _incoming) = start_with_config(&dir, "").await;
+    let out = exec_lua(
+        &rpc,
+        "_G.good, _G.exact = 0, 0\n\
+         vim.api.nvim_create_autocmd('User', { pattern = 'foo[bar',\n\
+         \x20 callback = function() _G.exact = _G.exact + 1 end })\n\
+         vim.api.nvim_create_autocmd('User', { pattern = '*.txt',\n\
+         \x20 callback = function() _G.good = _G.good + 1 end })\n\
+         vim.api.nvim_exec_autocmds('User', { pattern = 'foobar.txt' })\n\
+         vim.api.nvim_exec_autocmds('User', { pattern = 'foo[bar' })\n\
+         return 'good=' .. _G.good .. ',exact=' .. _G.exact",
+    )
+    .await;
+    assert_eq!(
+        out.as_str(),
+        Some("good=1,exact=1"),
+        "the malformed class must not raise mid-fire (skipping later autocmds); the exact spelling still matches"
+    );
+}

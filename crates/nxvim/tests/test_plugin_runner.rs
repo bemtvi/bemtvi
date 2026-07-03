@@ -86,6 +86,45 @@ fn failing_assertion_exits_nonzero() {
 }
 
 #[test]
+fn broken_spec_is_reported_and_fails_the_run() {
+    // A spec that fails to *load* (syntax error / top-level throw) must fail the run
+    // and be named in the report — not be silently skipped while the rest passes
+    // (the server's `nvim_exec_lua` swallows Lua errors into an `:echo` + `Nil`
+    // reply, so the runner has to detect the load failure itself).
+    let dir = fixture_dir("broken");
+    std::fs::write(
+        dir.join("test/broken_spec.lua"),
+        "nx.test.describe('x', function( -- unterminated\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("test/good_spec.lua"),
+        r#"
+        nx.test.describe("good", function()
+          nx.test.it("still runs", function(t)
+            nx.test.expect(1).to_be(1)
+          end)
+        end)
+        "#,
+    )
+    .unwrap();
+
+    let (ok, stdout) = run(&dir);
+    assert!(
+        !ok,
+        "a spec that fails to load must fail the run; stdout:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("broken_spec.lua"),
+        "the report must name the broken file; stdout:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("1 passed"),
+        "the healthy spec must still run; stdout:\n{stdout}"
+    );
+}
+
+#[test]
 fn isolation_between_tests() {
     // A buffer edit in one test must not bleed into the next (fresh-slate per test).
     let dir = fixture_dir("iso");

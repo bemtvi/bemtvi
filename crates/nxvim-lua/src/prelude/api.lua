@@ -1460,12 +1460,19 @@ function nx.buf.nr(expr)
   if type(expr) == "number" then
     return nx._bufs[expr] and expr or -1
   end
+  -- An exactly-named buffer always wins; only when none exists does a suffix
+  -- match apply (taking the lowest bufnr so ties resolve deterministically —
+  -- `pairs` order must not decide which of two suffix matches is returned).
+  local suffix
   for bufnr, buf in pairs(nx._bufs) do
     local name = buf.name or ""
-    if name == expr or name:sub(-#expr) == expr then
+    if name == expr then
       return bufnr
     end
+    if name:sub(-#expr) == expr and (suffix == nil or bufnr < suffix) then
+      suffix = bufnr
+    end
   end
-  return -1
+  return suffix or -1
 end
 vim.fn.bufnr = nx.buf.nr

@@ -193,9 +193,13 @@ function nx.notify(msg, level, _opts)
   -- line has only two states — error (red) or plain — so WARN and below funnel
   -- through `print` like any other message; neovim's distinct WarningMsg colour
   -- has no analogue on our line yet. (`nx.log.levels.ERROR == 4`; guarded so a
-  -- bare-prelude call before `state.lua` loads still works.)
+  -- bare-prelude call before `state.lua` loads still works.) A string severity
+  -- ("error", "warn", …, the vim.log.levels key spelling) counts too — several
+  -- surfaces pass `"error"`, and degrading those to a plain print would hide them.
   local ERROR = (nx.log and nx.log.levels and nx.log.levels.ERROR) or 4
-  if type(level) == "number" and level >= ERROR and nx._echo_err then
+  local is_error = (type(level) == "number" and level >= ERROR)
+    or (type(level) == "string" and level:lower() == "error")
+  if is_error and nx._echo_err then
     nx._echo_err(tostring(msg))
   else
     print(msg)
@@ -211,8 +215,12 @@ function nx.notify_once(msg, level, opts)
 end
 vim.notify_once = nx.notify_once
 
--- nx.inspect [alias vim.inspect]: pretty-print a value (tables recursively).
+-- nx.inspect [alias vim.inspect]: pretty-print a value (tables recursively). A
+-- table reached again on the current descent renders as "<cycle>" — a plugin
+-- inspects arbitrary state (parent-linked trees, self-referencing registries),
+-- and unguarded recursion would blow the C stack instead of printing.
 function nx.inspect(value)
+  local seen = {}
   local function ins(v, indent)
     if type(v) ~= "table" then
       if type(v) == "string" then
@@ -220,10 +228,15 @@ function nx.inspect(value)
       end
       return tostring(v)
     end
+    if seen[v] then
+      return "<cycle>"
+    end
+    seen[v] = true
     local parts = {}
     for k, val in pairs(v) do
       parts[#parts + 1] = indent .. "  " .. tostring(k) .. " = " .. ins(val, indent .. "  ")
     end
+    seen[v] = nil
     return "{\n" .. table.concat(parts, ",\n") .. "\n" .. indent .. "}"
   end
   return ins(value, "")

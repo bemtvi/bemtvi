@@ -2314,8 +2314,17 @@ impl Editor {
                 return false;
             }
             self.close_all_floats();
+            // Closing the floats may have removed the *focused* window (a
+            // focused float while the last tiled window is closed by id —
+            // `nvim_win_close` on it): re-point focus at the surviving tiled
+            // window rather than leaving `current` dangling on a freed id.
+            let refocus = !self.windows.windows.contains_key(&self.windows.current);
             self.relayout();
-            self.ensure_visible();
+            if refocus {
+                self.enter_window(id);
+            } else {
+                self.ensure_visible();
+            }
             return true;
         }
         let closing_rect = self.windows.get(id).rect;

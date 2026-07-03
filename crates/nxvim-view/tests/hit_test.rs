@@ -3,7 +3,9 @@
 //! build a [`View`] + [`Geometry`] by hand and assert the cell→cursor mapping,
 //! the client-side mirror of the server's `resize_handle_at`/`dock_handle_at`.
 
-use nxvim_view::{resize_handle_at, Geometry, ResizeCursor, Separator, View, WindowRegion};
+use nxvim_view::{
+    resize_handle_at, Geometry, ResizeCursor, Separator, View, WinRect, WindowRegion, WindowView,
+};
 
 /// An 80×24 grid with no chrome: 80 columns, 23 windows-area rows (24 − cmdline).
 fn geo() -> Geometry {
@@ -67,6 +69,60 @@ fn horizontal_separator_and_status_row_above_are_row_cursors() {
         Some(ResizeCursor::Row)
     );
     assert_eq!(resize_handle_at(&view, geo(), 12, 20), None);
+}
+
+/// A pair of vertically stacked windows around a horizontal divider at row 11,
+/// each `status_visible` per the argument — the `laststatus` shapes: `true` for
+/// per-window status rows (laststatus=2), `false` for hidden ones (0 / 3, where
+/// the freed row is ordinary text).
+fn stacked_view(status_visible: bool) -> View {
+    let win = |y: u16| WindowView {
+        rect: Some(WinRect {
+            x: 0,
+            y,
+            width: 80,
+            height: 11,
+        }),
+        status_visible,
+        ..Default::default()
+    };
+    View {
+        windows: vec![win(0), win(12)],
+        separators: vec![Separator {
+            vertical: false,
+            x: 0,
+            y: 11,
+            length: 80,
+            region: WindowRegion::Main,
+        }],
+        ..Default::default()
+    }
+}
+
+#[test]
+fn text_row_above_separator_is_no_handle_when_status_is_hidden() {
+    // laststatus=0/3: the upper window has no status row, so the row above the
+    // divider is ordinary text — the server's authoritative hit-test only grabs
+    // a *status* row there, and the mirror must agree (no bogus resize cursor
+    // over the last text line of every upper split).
+    let view = stacked_view(false);
+    assert_eq!(resize_handle_at(&view, geo(), 10, 20), None);
+    // The divider itself still resizes.
+    assert_eq!(
+        resize_handle_at(&view, geo(), 11, 20),
+        Some(ResizeCursor::Row)
+    );
+}
+
+#[test]
+fn status_row_above_separator_is_a_handle_when_status_is_shown() {
+    // laststatus=2: the upper window's bottom rect row is its status line, the
+    // classic vim status-line drag handle.
+    let view = stacked_view(true);
+    assert_eq!(
+        resize_handle_at(&view, geo(), 10, 20),
+        Some(ResizeCursor::Row)
+    );
 }
 
 #[test]

@@ -55,7 +55,13 @@ pub fn spawn(init: ServerInit) -> (Rpc, UnboundedReceiver<Incoming>) {
             .enable_time()
             .build()
             .expect("server runtime");
-        let _ = runtime.block_on(run_server(server_end, init));
+        // `run_server` returns `Ok(())` on a normal client disconnect (test
+        // teardown), so an `Err` here is a genuine server failure. Surface it —
+        // swallowing it leaves the test to die later with an opaque
+        // "rpc connection closed" and no hint of the root cause.
+        if let Err(e) = runtime.block_on(run_server(server_end, init)) {
+            eprintln!("nxvim-test-harness: server thread exited with error: {e:#}");
+        }
     });
     let (reader, writer) = tokio::io::split(client_end);
     connect(reader, writer)
@@ -356,8 +362,12 @@ pub fn drain_to_latest_redraw(
     }
 }
 
-/// Wait for the most recent `redraw` whose map satisfies `keep`, up to a generous
-/// timeout. *Map convention.*
+/// Wait for a `redraw` whose map satisfies `keep`, up to a generous timeout:
+/// the most recent match already queued, else the first match to arrive.
+/// *Map convention.* Because the await path returns the *first* arrival that
+/// matches, pass a predicate specific enough to reject stale frames (a previous
+/// action's trailing barrier repaint can land late under load) — a `|_| true`
+/// predicate here has take-first semantics whenever the queue is empty.
 ///
 /// Unlike [`drain_to_latest_redraw`] — which only inspects frames already queued
 /// in `incoming` — this also *awaits* frames the client reader task has not

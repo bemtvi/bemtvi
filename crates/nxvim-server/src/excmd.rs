@@ -222,10 +222,14 @@ impl EditHost {
                      :NxHelptags to generate help tags",
                 )
             }
-            _ if self.lua.has_user_command(name, cur_buf) => {
-                if let Err(e) = self.lua.run_user_command(name, args, cur_buf) {
+            // Look the command up by its bare name (`base`): a trailing `!` is the
+            // invocation's bang, never part of the registered name, so matching on
+            // `name` would send `:PluginSync!` to E492 even though the command
+            // exists.
+            _ if self.lua.has_user_command(base, cur_buf) => {
+                if let Err(e) = self.lua.run_user_command_bang(base, args, cur_buf, bang) {
                     self.editor
-                        .echo(format!("E5108: Error executing command {name}: {e}"));
+                        .echo(format!("E5108: Error executing command {base}: {e}"));
                 }
                 self.apply_lua_effects();
             }

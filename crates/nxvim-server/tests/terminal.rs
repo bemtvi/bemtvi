@@ -1059,3 +1059,48 @@ async fn exited_terminal_buffer_is_marked_modified() {
         "an exited terminal's captured output must be marked modified",
     );
 }
+
+/// Whether `pid` currently exists (`kill -0`). A reaped process (no zombie) fails.
+fn pid_alive(pid: u32) -> bool {
+    std::process::Command::new("kill")
+        .args(["-0", &pid.to_string()])
+        .status()
+        .is_ok_and(|s| s.success())
+}
+
+/// Wiping a **live** terminal buffer must kill its PTY child. `:bd!` on a running
+/// terminal used to remove the buffer without ever enqueueing `TerminalOp::Kill`
+/// (nothing constructed that variant), orphaning the child — a leaked process per
+/// wiped terminal, on native and web alike.
+#[tokio::test]
+async fn deleting_a_live_terminal_buffer_kills_the_child() {
+    let _guard = serial_lock().lock().await;
+    let (rpc, _incoming) = start().await;
+
+    // The child prints its own pid, then `exec`s into a long sleep (same pid).
+    exec_lua(
+        &rpc,
+        "nx.terminal.open{ cmd = {'sh', '-c', 'echo $$; exec sleep 600'} }",
+    )
+    .await;
+    let ls = wait_lines(&rpc, "the child to print its pid", |ls| {
+        ls.first().is_some_and(|l| l.trim().parse::<u32>().is_ok())
+    })
+    .await;
+    let pid: u32 = ls[0].trim().parse().expect("pid line");
+    assert!(pid_alive(pid), "precondition: the child is running");
+
+    // Leave terminal-job mode and delete the buffer while the child is still live.
+    feed(&rpc, "<C-\\><C-n>");
+    feed(&rpc, ":bd!<CR>");
+
+    // The child must be killed (and reaped — `kill -0` on a zombie still succeeds,
+    // and the PTY reader thread reaps after the kill) within the poll window.
+    for _ in 0..200 {
+        if !pid_alive(pid) {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    panic!("the terminal's child (pid {pid}) survived :bd! on its buffer");
+}

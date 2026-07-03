@@ -735,3 +735,32 @@ async fn mark_jump_pending_lists_set_marks() {
         "mark a with position + line preview: {frame}"
     );
 }
+
+/// A withheld prefix containing a *modified* `>` must render as its named escape
+/// (`<C-gt>`): the inline spelling `<C->>` closes at the FIRST `>` when re-parsed
+/// (`parse_keys` tokenizes `<C->` → junk), so it can never round-trip through a
+/// which-key that re-feeds or displays the pending keys.
+#[tokio::test]
+async fn pending_keys_render_modified_gt_as_named_escape() {
+    let (rpc, _incoming) = start().await;
+    exec_lua(
+        &rpc,
+        &format!(
+            "{RECORDER}\
+             nx.keymap.set('n', '<C-gt>d', function() end, {{ desc = 'gt-d' }})\n\
+             nx.keymap.set('n', '<C-gt>x', function() end, {{ desc = 'gt-x' }})"
+        ),
+    )
+    .await;
+    feed(&rpc, "<C-gt>");
+    barrier(&rpc).await;
+    let got = events(&rpc).await;
+    assert!(
+        got.contains("|<C-gt>|"),
+        "the pending prefix renders as the named escape <C-gt>, got {got:?}"
+    );
+    assert!(
+        !got.contains("<C->>"),
+        "must never emit <C->> (it re-parses as literal chars), got {got:?}"
+    );
+}

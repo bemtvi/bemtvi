@@ -414,15 +414,23 @@ pub(crate) fn render(
     if view.command_mode {
         // Offset past the leading prompt — a single prefix char (`:`/`/`/`?`) or
         // the multi-char `vim.ui.input` label; the cursor then follows
-        // `cmdline_cursor` (a char offset) so it sits mid-line after edits.
+        // `cmdline_cursor` so it sits mid-line after edits.
         let prompt_width = cmdline_prompt_width(view);
-        // `cmdline_cursor` is a server-supplied char offset (`usize`); saturate the
+        // `cmdline_cursor` is a server-supplied *char* offset, but the terminal
+        // cursor needs a *display column* — a wide (CJK) char occupies two cells —
+        // so measure the painted width of the chars before the caret. Saturate the
         // cast and the adds so a bogus value can't overflow the column coordinate
         // (a debug-build panic, a release-build wrap) — ratatui clamps the result.
+        let caret: usize = view
+            .cmdline
+            .chars()
+            .take(view.cmdline_cursor)
+            .map(|c| UnicodeWidthChar::width(c).unwrap_or(0))
+            .sum();
         let col = cmd_area
             .x
             .saturating_add(prompt_width)
-            .saturating_add(u16::try_from(view.cmdline_cursor).unwrap_or(u16::MAX));
+            .saturating_add(u16::try_from(caret).unwrap_or(u16::MAX));
         frame.set_cursor_position((col, cmd_area.y));
     } else if let (Some((inner, cursor_row, shift)), Some(win)) = (focused_inner, view.focused()) {
         // The cursor row is interpolated during a slide, but the column comes
@@ -2421,10 +2429,11 @@ fn cmdline_prompt_str(view: &View) -> String {
     }
 }
 
-/// Display width (in cells, approximated as char count) of the leading prompt,
-/// used to place the command cursor past it.
+/// Display width (in cells — wide chars count two) of the leading prompt, used to
+/// place the command cursor past it. Matches the server's `cmdline_prompt_width`
+/// (`unicode::display_width`), so the wildmenu anchor and the caret agree.
 fn cmdline_prompt_width(view: &View) -> u16 {
-    cmdline_prompt_str(view).chars().count() as u16
+    u16::try_from(str_width(&cmdline_prompt_str(view))).unwrap_or(u16::MAX)
 }
 
 /// Draw the completion popup as a bordered overlay over the text area: a box
@@ -2724,8 +2733,21 @@ fn render_menu(
 
     // The terminal caret sits in the prompt (in the list column), past the `> `
     // prefix at the query's text-cursor column (clamped inside the column).
+    // `query_cursor` is a *char* offset (the server's `cursor_chars()`); the caret
+    // column is display cells, so measure the painted width of the chars before it
+    // (a wide CJK char in the query occupies two cells).
     prompt_row.map(|row| {
-        let caret = (2 + menu.query_cursor).min(list_area.width.saturating_sub(1));
+        let qw: usize = menu
+            .query
+            .as_deref()
+            .unwrap_or("")
+            .chars()
+            .take(menu.query_cursor as usize)
+            .map(|c| UnicodeWidthChar::width(c).unwrap_or(0))
+            .sum();
+        let caret = u16::try_from(2 + qw)
+            .unwrap_or(u16::MAX)
+            .min(list_area.width.saturating_sub(1));
         (list_area.x + caret, list_area.y + row as u16)
     })
 }
@@ -2992,17 +3014,28 @@ fn menu_row_line(
     // — and non-path rows — fall through unchanged; `spans` are remapped to match.
     let (label, spans) = elide_keep_tail(label, spans, width.saturating_sub(used));
     let (label, spans) = (label.as_str(), spans.as_slice());
+    // Coalesce runs of identically-styled chars into one span (the same walk
+    // `preview_line` does) instead of a per-char span — a picker frame renders
+    // dozens of rows, and per-char `Span`/`String` allocations add up.
+    let mut run = String::new();
+    let mut run_matched = false;
     for (i, ch) in label.chars().enumerate() {
         if used >= width {
             break;
         }
         let i = i as u16;
         let is_match = spans.iter().any(|(s, e)| i >= *s && i < *e);
-        out.push(Span::styled(
-            ch.to_string(),
-            if is_match { matched } else { base },
-        ));
+        if is_match != run_matched && !run.is_empty() {
+            let style = if run_matched { matched } else { base };
+            out.push(Span::styled(std::mem::take(&mut run), style));
+        }
+        run_matched = is_match;
+        run.push(ch);
         used += 1;
+    }
+    if !run.is_empty() {
+        let style = if run_matched { matched } else { base };
+        out.push(Span::styled(run, style));
     }
     if used < width {
         out.push(Span::styled(" ".repeat(width - used), base));
@@ -3053,6 +3086,15 @@ fn text_inner_rect(width: u16, height: u16, view: &View) -> Rect {
         Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).split(area)[0]
     } else {
         area
+    };
+    // The fold-marker gutter sits at the very left (before the sign and number
+    // columns), mirroring `render_window` — without it the popup anchor drifts
+    // left by the foldcolumn width whenever `'foldcolumn'` is on.
+    let text_area = if win.foldcolumn_width > 0 {
+        Layout::horizontal([Constraint::Length(win.foldcolumn_width), Constraint::Min(0)])
+            .split(text_area)[1]
+    } else {
+        text_area
     };
     // Reserve the sign column first (left of the number gutter), mirroring
     // `render_window`, so the popup anchors past both gutters.

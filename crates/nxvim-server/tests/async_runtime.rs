@@ -270,6 +270,41 @@ async fn nx_run_stream_iterates_batches_via_await_each() {
 }
 
 #[tokio::test]
+async fn nx_run_stream_exit_carries_stderr() {
+    let (rpc, _incoming) = start().await;
+    // A streaming run's exit result must carry the child's whole stderr, like
+    // `nx.run`'s does (a failing `rg` source's error message is how a picker
+    // reports WHY it produced nothing). The child hands its stderr to a
+    // background writer that outlives the shell, so the stream (stdout) ends
+    // immediately while stderr EOF lands ~200ms later — the exit must wait for
+    // stderr EOF (as `nx.run`'s `wait_with_output` does), not report whatever a
+    // detached collector happened to have gathered at exit time.
+    exec_lua(
+        &rpc,
+        "_G.exit = nil\n\
+         nx.async(function()\n\
+           local s = nx.run_stream({ cmd = 'sh', args = { '-c',\n\
+             '( sleep 0.2; echo oops >&2 ) >/dev/null & exit 3' } })\n\
+           for _ in nx.await_each(s) do end\n\
+           _G.exit = s._exit\n\
+         end)()",
+    )
+    .await;
+    tokio::time::sleep(Duration::from_millis(700)).await;
+    assert_eq!(
+        lua_u64(&rpc, "return _G.exit and _G.exit.code").await,
+        Some(3)
+    );
+    assert_eq!(
+        exec_lua(&rpc, "return _G.exit and _G.exit.stderr")
+            .await
+            .as_str(),
+        Some("oops\n"),
+        "the streaming exit result must carry the child's stderr"
+    );
+}
+
+#[tokio::test]
 async fn nx_spawn_is_removed() {
     let (rpc, _incoming) = start().await;
     // The callback-shaped nx.spawn is gone — nx is promise-only.

@@ -154,7 +154,7 @@ async fn run(dir: PathBuf, files: Vec<PathBuf>) -> Result<bool> {
     for file in &files {
         let code =
             std::fs::read_to_string(file).with_context(|| format!("reading {}", file.display()))?;
-        if let Err(e) = exec_lua_checked(&rpc, &code).await {
+        if let Err(e) = source_spec(&rpc, file, &code).await {
             load_errors.push((file.clone(), e.to_string()));
         }
     }
@@ -181,23 +181,41 @@ async fn run(dir: PathBuf, files: Vec<PathBuf>) -> Result<bool> {
     Ok(report(&results, &load_errors))
 }
 
-/// `nvim_exec_lua(code)` returning its value; panics-to-error on a transport failure.
+/// `nvim_exec_lua(code)` returning its value; `Err` on a transport failure. A *Lua*
+/// failure in `code` never arrives as an error — the server turns it into an `:echo`
+/// and replies `Nil` — so chunks whose failure must be observed report their own
+/// outcome as a value (see [`source_spec`]).
 async fn exec_lua(rpc: &Rpc, code: &str) -> Result<Value> {
-    exec_lua_checked(rpc, code)
-        .await
-        .map_err(|e| anyhow!("nvim_exec_lua failed: {e}"))
-}
-
-/// Like [`exec_lua`] but surfaces a *Lua* error (the server replies with an error
-/// payload) as an `Err` verbatim, for sourcing spec files where a throw must be
-/// reported. [`exec_lua`] wraps this to add the transport-context prefix.
-async fn exec_lua_checked(rpc: &Rpc, code: &str) -> Result<Value> {
     rpc.request(
         "nvim_exec_lua",
         vec![Value::from(code), Value::Array(vec![])],
     )
     .await
-    .map_err(|e| anyhow!("{e}"))
+    .map_err(|e| anyhow!("nvim_exec_lua failed: {e}"))
+}
+
+/// Source one spec file, surfacing a load error (syntax) or a top-level throw as an
+/// `Err` with the Lua message. `nvim_exec_lua` can't carry a Lua error over the wire
+/// (it echoes and replies `Nil`), so the spec is compiled and run *inside* a wrapper
+/// chunk — `load` + `pcall` — that returns the error text as a value; the chunk is
+/// named after the file so line numbers in the message point at the real spec.
+async fn source_spec(rpc: &Rpc, file: &Path, code: &str) -> Result<()> {
+    let chunk = format!(
+        "local __f, __e = load({src}, {name})\n\
+         if not __f then return tostring(__e) end\n\
+         local __ok, __err = pcall(__f)\n\
+         if not __ok then return tostring(__err) end\n\
+         return true",
+        src = crate::lua_quote(code),
+        name = crate::lua_quote(&format!("@{}", file.display())),
+    );
+    match exec_lua(rpc, &chunk).await? {
+        Value::Boolean(true) => Ok(()),
+        Value::String(err) => Err(anyhow!("{}", err.as_str().unwrap_or("Lua load error"))),
+        other => Err(anyhow!(
+            "sourcing the spec failed unexpectedly (got {other})"
+        )),
+    }
 }
 
 // ----- reporting -------------------------------------------------------------

@@ -79,6 +79,38 @@ async fn find_honours_init() {
 }
 
 #[tokio::test]
+async fn find_with_init_sees_matches_overlapping_an_earlier_one() {
+    let (rpc, _inc) = server().await;
+    // string.find("aaaa", "aa", 2) is 2:3 — the scan restarts at init, it does not
+    // reuse the non-overlapping match set computed from the string start (which
+    // would skip 2:3 and land on 3:4).
+    let out = run(
+        &rpc,
+        r#"local re = nx.regex([[aa]])
+           local a, b = re:find("aaaa", 2)
+           return a..":"..b"#,
+    )
+    .await;
+    assert_eq!(out, "2:3");
+}
+
+#[tokio::test]
+async fn find_plain_with_mid_char_init_matches_like_string_find() {
+    let (rpc, _inc) = server().await;
+    // "€" is 3 bytes; init = 3 points inside it. string.find("€b", "b", 3) is 4:4 —
+    // a byte-offset init inside a multi-byte char must not error, it just can't
+    // start a match there.
+    let out = run(
+        &rpc,
+        r#"local re = nx.regex("b", { plain = true })
+           local a, b = re:find("\u{20AC}b", 3)
+           return a..":"..b"#,
+    )
+    .await;
+    assert_eq!(out, "4:4");
+}
+
+#[tokio::test]
 async fn match_returns_captures_or_whole() {
     let (rpc, _inc) = server().await;
     let out = run(

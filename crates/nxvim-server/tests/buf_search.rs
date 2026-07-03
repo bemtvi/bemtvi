@@ -69,6 +69,17 @@ async fn from_position_skips_past_the_start_column() {
 }
 
 #[tokio::test]
+async fn pcre_from_position_sees_matches_overlapping_an_earlier_one() {
+    let (rpc, _inc) = open("xaaaa\n").await;
+    // Non-overlapping matches from col 0 are 1..3 and 3..5; the scan must restart at
+    // `from` instead, so from col 2 the match is 2..4 — not 3..5.
+    assert_eq!(
+        search(&rpc, r#""aa", { from = { line = 1, col = 2 } }"#).await,
+        "1:2:4:aa:"
+    );
+}
+
+#[tokio::test]
 async fn backward_finds_the_last_match_before_the_start() {
     let (rpc, _inc) = open(CONTENT).await;
     assert_eq!(

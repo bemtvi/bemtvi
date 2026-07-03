@@ -19,7 +19,21 @@ impl Editor {
         let cur = self.cursor_char();
         let (lo, hi, linewise, first_line) = match m.kind {
             MotionKind::Exclusive => (min(cur, m.target), max(cur, m.target), false, 0),
-            MotionKind::Inclusive => (min(cur, m.target), max(cur, m.target) + 1, false, 0),
+            MotionKind::Inclusive => {
+                // vim never lets an inclusive charwise motion swallow a line
+                // break: when the motion's end sits where no character exists —
+                // `$`/`g$` on an empty line, `e` stopped at the buffer's final
+                // newline — the would-be included cell is the line's `\n`, and
+                // vim clips the range short of it (`d$`/`y$` on an empty line
+                // are no-ops; `ye` at the buffer end yanks without the newline).
+                let end = max(cur, m.target);
+                let hi = if self.char_at(end) == '\n' {
+                    end
+                } else {
+                    end + 1
+                };
+                (min(cur, m.target), hi, false, 0)
+            }
             MotionKind::Linewise => {
                 let l1 = self.cursor.line;
                 let l2 = self
@@ -62,6 +76,18 @@ impl Editor {
         first_line: usize,
     ) {
         if lo >= hi {
+            // A change over an empty range (`cl` / `c$` / `cw` on an empty
+            // line) still enters Insert mode in vim — the deletion is empty,
+            // the mode switch isn't.
+            if op == 'c' {
+                if !self.modifiable() {
+                    self.refuse_edit();
+                    return;
+                }
+                self.push_undo();
+                self.mode = Mode::Insert;
+                self.snapshot_taken = true;
+            }
             return;
         }
         // `zf{motion}` creates a fold over the motion's lines — it touches no text

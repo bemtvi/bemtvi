@@ -307,9 +307,17 @@ local function au_one_pattern_matches(pat, pattern)
     target = pattern:match("[^/]*$") or pattern
   end
   -- Build an anchored Lua pattern: escape Lua magic (but not the glob `* ? [`),
-  -- then turn the shell wildcards into their Lua-pattern equivalents.
+  -- then turn the shell wildcards into their Lua-pattern equivalents. A bracket
+  -- class rides through as-is, but its negation spellings need repair: shell-style
+  -- `[!abc]` becomes Lua's `[^abc]`, and vim-style `[^abc]` gets its `^` un-escaped
+  -- (the blanket escape above can't tell it opened a class).
   local lp = pat:gsub("[%(%)%.%%%+%-%^%$]", "%%%1"):gsub("%*", ".*"):gsub("%?", ".")
-  return target:match("^" .. lp .. "$") ~= nil
+  lp = lp:gsub("%[!", "[^"):gsub("%[%%%^", "[^")
+  -- A malformed class (`foo[bar`) is not a valid Lua pattern; treat it as matching
+  -- nothing rather than raising out of every subsequent event fire (a buffer
+  -- literally named `foo[bar` was already caught by the exact compare above).
+  local ok, matched = pcall(string.match, target, "^" .. lp .. "$")
+  return ok and matched ~= nil
 end
 
 -- Whether the autocmd's `pat` (a string, a list, or nil = match-all) matches the

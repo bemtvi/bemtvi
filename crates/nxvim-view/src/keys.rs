@@ -59,7 +59,16 @@ pub fn notation(ctrl: bool, alt: bool, shift: bool, key: Key) -> String {
     match key {
         Key::Char(c) => {
             if !prefix.is_empty() {
-                format!("<{prefix}{c}>")
+                // A literal '>' would terminate the `<...>` form early on the
+                // server (its scan ends at the first '>', so `<C->>` falls apart
+                // into five literal keys); use the `gt` named escape, which the
+                // server resolves back to '>'. A '<' inside the form is
+                // unambiguous and stays inline (`<C-<>`), matching core.
+                if c == '>' {
+                    format!("<{prefix}gt>")
+                } else {
+                    format!("<{prefix}{c}>")
+                }
             } else if c == '<' {
                 "<lt>".to_string()
             } else {

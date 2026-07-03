@@ -36,6 +36,7 @@ use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::ffi::{c_char, c_int, c_void, CStr, CString};
 use std::fmt;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Mutex, MutexGuard, OnceLock};
 
 // ---------------------------------------------------------------------------
@@ -134,12 +135,32 @@ fn engine() -> MutexGuard<'static, ()> {
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
+/// The `buf` pointer most recently made current via `nxre_set_current`, or 0
+/// when unknown (nothing set yet, the current buffer was freed, or its
+/// options changed). Only read/written while holding the engine lock, which
+/// provides the ordering — `Relaxed` suffices.
+static CURRENT_BUF: AtomicUsize = AtomicUsize::new(0);
+
+/// Makes `buf`/`win` the engine's current context, skipping the C call when
+/// `buf` is already current. `nxre_set_current` reparses the option strings
+/// and rebuilds the 256-entry character tables every call, which is pure
+/// waste on the per-line `exec_line`/`exec` hot paths where the context
+/// rarely changes. The cache is cleared whenever it could go stale: a
+/// `VimBuffer` drop (the C side NULLs `curbuf`, and a later allocation could
+/// reuse the address) and `set_iskeyword` (chartabs must be rebuilt).
+fn make_current(_guard: &MutexGuard<'_, ()>, buf: *mut c_void, win: *mut c_void) {
+    if CURRENT_BUF.load(Ordering::Relaxed) != buf as usize {
+        unsafe { nxre_set_current(buf, win) };
+        CURRENT_BUF.store(buf as usize, Ordering::Relaxed);
+    }
+}
+
 /// Default match context: `curbuf`/`curwin` must never be NULL (the engine
 /// reads them for `\k`-style classes even in single-line matching), and a
 /// dropped `VimBuffer` clears them. Every entry point that isn't bound to a
 /// specific `VimBuffer` pins this default context (vim option defaults,
 /// empty text) before calling into the engine. Created once, never freed.
-fn set_default_context(_guard: &MutexGuard<'_, ()>) {
+fn set_default_context(guard: &MutexGuard<'_, ()>) {
     static CTX: OnceLock<(usize, usize)> = OnceLock::new();
     let &(buf, win) = CTX.get_or_init(|| {
         extern "C" fn empty_line(
@@ -158,7 +179,7 @@ fn set_default_context(_guard: &MutexGuard<'_, ()>) {
             (buf as usize, win as usize)
         }
     });
-    unsafe { nxre_set_current(buf as *mut c_void, win as *mut c_void) };
+    make_current(guard, buf as *mut c_void, win as *mut c_void);
 }
 
 /// Takes the engine's queued error message, if any, clearing it. Returns
@@ -338,7 +359,12 @@ impl VimRegex {
     /// (`\n`, `\_x` classes) — useful for choosing a search strategy.
     pub fn is_multiline(&self) -> bool {
         let _guard = engine();
-        unsafe { re_multiline(self.prog.get()) != 0 }
+        // The program can be NULL if a prior exec's NFA→BT fallback recompile
+        // failed (`vim_regexec` writes NULL back; see `checked_prog`).
+        // `re_multiline` dereferences it unconditionally, so answer "not
+        // multiline" instead of crashing — the next exec fails loud.
+        let prog = self.prog.get();
+        !prog.is_null() && unsafe { re_multiline(prog) != 0 }
     }
 
     /// Matches against a single line (no line breaks), starting at byte
@@ -555,6 +581,11 @@ impl VimBuffer {
         let c = CString::new(iskeyword)
             .map_err(|_| VimRegexError("iskeyword contains a NUL byte".into()))?;
         let _guard = engine();
+        // Invalidate the current-context cache so the next exec re-runs
+        // `nxre_set_current` and rebuilds the character tables against the
+        // new value (`nxre_buf_set_iskeyword` rebuilds the buffer-local
+        // table itself, but the cache must not assume anything stayed put).
+        CURRENT_BUF.store(0, Ordering::Relaxed);
         if unsafe { nxre_buf_set_iskeyword(self.buf, c.as_ptr()) } {
             Ok(())
         } else {
@@ -626,7 +657,7 @@ impl VimBuffer {
                 "col {col} past end of line {lnum} (length {line_len})"
             )));
         }
-        let _guard = engine();
+        let guard = engine();
         let prog = re.checked_prog()?;
 
         let mut rmm = RegmmatchT {
@@ -648,8 +679,8 @@ impl VimBuffer {
         });
         let mut timed_out: c_int = 0;
         let ud = &*self.data as *const BufferData as *mut c_void;
+        make_current(&guard, self.buf, self.win);
         let nlines = unsafe {
-            nxre_set_current(self.buf, self.win);
             nxre_set_mark_provider(Some(buffer_mark_lookup), ud);
             let r = vim_regexec_multi(
                 &mut rmm,
@@ -706,6 +737,15 @@ impl VimBuffer {
 impl Drop for VimBuffer {
     fn drop(&mut self) {
         let _guard = engine();
+        // The C side NULLs `curbuf`/`curwin` when the current ones are freed,
+        // and a later allocation may reuse this address — clear the cache so
+        // the next exec re-pins its context instead of matching a stale
+        // pointer against a freed (or recycled) one. (Defense in depth: today
+        // every path that could see a recycled address re-pins anyway,
+        // because `from_lines` pins the default context first.)
+        if CURRENT_BUF.load(Ordering::Relaxed) == self.buf as usize {
+            CURRENT_BUF.store(0, Ordering::Relaxed);
+        }
         unsafe {
             nxre_win_free(self.win);
             nxre_buf_free(self.buf);

@@ -707,6 +707,18 @@ impl EditHost {
                 // its runtime + Lua client. A respawn re-`initialize`s into a fresh
                 // client id and re-attaches (neovim treats a restart as a new
                 // client), so this is also the restart's detach half.
+                //
+                // Clear the lazy-start guard for the dead server, so the next
+                // `vim.lsp.start` / FileType dispatch re-`ensure`s it. Without this
+                // a server whose breaker gave up (or, on wasm, any exited server —
+                // the sync client doesn't auto-respawn) could never be started
+                // again: the guard would swallow every later start. While the
+                // native breaker is still retrying, the extra `lsp_ensure` a
+                // re-start sends is idempotent (the manager leaves a still-open
+                // server's task alone). Cleared unconditionally — a server that
+                // died before `Initialized` never registered in `lsp_servers`, and
+                // it especially must stay re-startable.
+                self.lsp_ensured.remove(&key);
                 if let Some(client_id) = self.lsp_servers.remove(&key).map(|r| r.client_id) {
                     // Buffers attached to this server, with a display name for the
                     // event's `args.file`. Clear `opened` so a later `:bdelete`

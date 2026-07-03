@@ -87,6 +87,13 @@
 //!   request *reply* (definition/hover/formatting/…), so a test can edit the
 //!   buffer before the reply lands and prove the editor's stale-drop (e.g. the
 //!   formatting content-version guard). `0`/absent ⇒ no delay.
+//! - `stderr_noise`: bytes of **non-UTF-8** junk (`0xFF` lines) written to stderr
+//!   before the mock starts serving, modeling a server whose stderr is binary /
+//!   invalid UTF-8 (raw panic dumps, binary logging). Sized past the pipe
+//!   capacity, this write only completes if the client keeps *draining* stderr
+//!   through the invalid bytes; a stderr write failure kills the mock, exactly as
+//!   it kills a real server (SIGPIPE for a C server, an `eprintln!` panic for a
+//!   Rust one) when the client abandons the read end.
 
 use std::io::{BufRead, BufReader, Write};
 
@@ -100,6 +107,26 @@ pub fn run(script_path: &str) {
         .ok()
         .and_then(|s| serde_json::from_str(&s).ok())
         .unwrap_or(Value::Null);
+
+    // `stderr_noise`: flood stderr with invalid-UTF-8 lines *before* serving (see
+    // the module doc). A write failure means the client abandoned the read end —
+    // die, exactly as a real server does (SIGPIPE / `eprintln!` panic); the
+    // fatality is the point, so a client that stops draining is caught by the
+    // test rather than the mock quietly swallowing the broken pipe (Rust ignores
+    // SIGPIPE, so `write_all` reports it as an error instead).
+    if let Some(n) = script.get("stderr_noise").and_then(Value::as_u64) {
+        let mut err = std::io::stderr().lock();
+        let mut line = vec![0xFFu8; 4095];
+        line.push(b'\n');
+        let mut written = 0u64;
+        while written < n {
+            if err.write_all(&line).is_err() {
+                std::process::exit(1);
+            }
+            written += line.len() as u64;
+        }
+        let _ = err.flush();
+    }
 
     let stdin = std::io::stdin();
     let mut reader = BufReader::new(stdin.lock());

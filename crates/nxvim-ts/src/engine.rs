@@ -8,7 +8,7 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::ops::{ControlFlow, Range};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use nxvim_core::{BufferEdit, BufferId, FoldRange, IndentParams, OpenOutcome, Span, SyntaxEngine};
@@ -182,6 +182,21 @@ impl Engine {
         }
     }
 
+    /// The search root `lang`'s grammar resolves from: the first root with an
+    /// installed parser, else the writable data dir (so a genuinely-missing
+    /// grammar still reports NotInstalled from there). Both the parser *and* its
+    /// disk queries load from this root, so the pair stays matched — the query
+    /// reads in [`Self::read_disk_query`] must use this, not `data_dir`, or a
+    /// grammar borrowed from a read-only fallback root (an existing neovim
+    /// `site/`) would report "no base query" to the resolution bridge.
+    fn root_for(&self, lang: &str) -> &Path {
+        self.roots
+            .iter()
+            .find(|r| crate::loader::has_parser(r, lang))
+            .map(PathBuf::as_path)
+            .unwrap_or(&self.data_dir)
+    }
+
     /// Lazily load (and cache) the grammar for `lang`, returning its cache slot.
     /// The load — and its outcome (loaded / not-installed / failed) — happens once
     /// per language; later calls are a cache hit.
@@ -190,12 +205,7 @@ impl Engine {
             // Pick the first search root that actually has this parser (its queries
             // load from the same root); fall back to the writable data dir so a
             // genuinely-missing grammar still reports NotInstalled from there.
-            let root = self
-                .roots
-                .iter()
-                .find(|r| crate::loader::has_parser(r, lang))
-                .cloned()
-                .unwrap_or_else(|| self.data_dir.clone());
+            let root = self.root_for(lang).to_path_buf();
             let slot = match Grammar::load(&root, lang, &self.query_overrides) {
                 Ok(g) => Slot::Loaded(Box::new(g)),
                 Err(LoadError::NotInstalled) => Slot::NotInstalled,
@@ -279,9 +289,11 @@ impl Engine {
     /// Read the on-disk `<name>.scm` for `lang`, returning `None` when absent. The
     /// base content [`set_query`](Self::set_query) reverts to on clear and that
     /// [`set_query_overlay`](Self::set_query_overlay) compares a resolved overlay
-    /// against.
+    /// against. Read from [`Self::root_for`]'s root — the one the parser (and its
+    /// queries) actually load from — so a grammar resolved from a read-only
+    /// fallback root reports *its* base, not a missing `data_dir` file.
     fn read_disk_query(&self, lang: &str, name: &str) -> Result<Option<String>, String> {
-        let path = query_path(&self.data_dir, lang, &format!("{name}.scm"));
+        let path = query_path(self.root_for(lang), lang, &format!("{name}.scm"));
         match std::fs::read_to_string(&path) {
             Ok(s) => Ok(Some(s)),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
@@ -493,8 +505,21 @@ impl Engine {
             // hint and the stale fallback if this frame's parse is cancelled.
             let old = old_by_lang.get_mut(&language).and_then(Vec::pop);
 
-            // `included_ranges` must be ascending and non-overlapping.
+            // `included_ranges` must be ascending and non-overlapping. A combined
+            // pattern can match *nested* nodes (a section inside a section), whose
+            // ranges overlap — passed through raw, `set_included_ranges` would
+            // reject them and the whole layer would silently drop. Merge each
+            // overlap into its union (identical coverage for both the child parse
+            // and the painter's clipping).
             ranges.sort_by_key(|r| r.start);
+            ranges.dedup_by(|next, prev| {
+                if next.start <= prev.end {
+                    prev.end = prev.end.max(next.end);
+                    true
+                } else {
+                    false
+                }
+            });
             let Some(state) = self.buffers.get(&buffer) else {
                 return;
             };
@@ -550,16 +575,32 @@ impl Engine {
     /// (Re)initialize a buffer from full text and do the initial parse. The
     /// [`OpenOutcome`] reports whether an *installed* grammar failed to load
     /// (worth echoing) vs the silent no-grammar / parsed-fine cases.
+    ///
+    /// `open` is also the language-*switch* path (`:set filetype=`, `:w other.ext`):
+    /// the editor re-opens an already-known buffer under its new language. Every
+    /// early return below therefore drops any previous language's `BufferState` —
+    /// leaving it in place would keep painting (and incrementally updating) the
+    /// *old* language's highlights on a buffer the editor believes has none.
     pub fn open(&mut self, buffer: BufferId, lang: &str, text: &str) -> OpenOutcome {
         let language = match self.grammar(lang) {
             Slot::Loaded(g) => g.language.clone(),
-            Slot::NotInstalled => return OpenOutcome::Ok, // silent: best-effort
-            Slot::Failed(reason) => return OpenOutcome::LoadFailed(reason.clone()),
+            Slot::NotInstalled => {
+                // Silent: best-effort. But a switch away from a highlighted
+                // language must still forget the stale parse state.
+                self.buffers.remove(&buffer);
+                return OpenOutcome::Ok;
+            }
+            Slot::Failed(reason) => {
+                let reason = reason.clone();
+                self.buffers.remove(&buffer);
+                return OpenOutcome::LoadFailed(reason);
+            }
         };
         let mut parser = Parser::new();
         if let Err(e) = parser.set_language(&language) {
             // Unreachable in practice (the ABI is probed at load), but report it
             // honestly rather than silently dropping the buffer.
+            self.buffers.remove(&buffer);
             return OpenOutcome::LoadFailed(format!("set_language: {e}"));
         }
         let mut state = BufferState {
@@ -1288,8 +1329,17 @@ fn extract_spans(
     let mut line_geom: Vec<(usize, usize)> = Vec::with_capacity(n_lines);
     for line in first_line..last_line {
         let line_start = shadow.line_to_byte_idx(line, LINE_TYPE);
-        let text = shadow.line(line, LINE_TYPE).to_string();
-        let content_len = text.trim_end_matches(['\n', '\r']).len();
+        let line_end = shadow.line_to_byte_idx(line + 1, LINE_TYPE);
+        // Trim the trailing `\n` / `\r` terminator bytes off the content length
+        // by inspecting the last byte(s) in place — this used to materialize each
+        // visible line into a fresh `String` every frame just to `trim_end` it.
+        let mut content_len = line_end - line_start;
+        while content_len > 0 {
+            match read_chunk(shadow, line_start + content_len - 1).first() {
+                Some(&(b'\n' | b'\r')) => content_len -= 1,
+                _ => break,
+            }
+        }
         line_geom.push((line_start, content_len));
     }
 

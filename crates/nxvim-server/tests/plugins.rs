@@ -1185,3 +1185,74 @@ async fn plugin_clean_forgets_shada_namespace() {
         "the plugin dir was pruned too"
     );
 }
+
+// ----- load-failure recovery ---------------------------------------------------
+
+/// A load that fails mid-flight (here: a dependency that isn't installed) must
+/// drop the `_loading` in-flight guard. Leaving it set wedges the plugin forever:
+/// every later load attempt sees `_loading` truthy and silently resolves `false`,
+/// so the plugin can never be retried (e.g. after a :PluginSync installs the dep).
+#[tokio::test]
+async fn a_failed_dependency_load_does_not_wedge_the_dependent() {
+    let (rpc, _incoming) = start().await;
+    setup_root(&rpc, "wedge").await;
+
+    // A real local dir for the dependent (loadable), depending on a declared but
+    // never-installed plugin, so the dependency's load rejects.
+    let dir = temp_dir("wedge_leafy");
+    std::fs::create_dir_all(dir.join("plugin")).unwrap();
+    std::fs::write(
+        dir.join("plugin").join("leafy.lua"),
+        "_G.leafy_plugin = true\n",
+    )
+    .unwrap();
+
+    exec_lua(
+        &rpc,
+        &format!(
+            "nx.plugins.add({{ {{ name = \"leafy\", dir = \"{}\", lazy = true,\n\
+             \x20 dependencies = {{ \"ghost/ghost\" }} }} }})\n\
+             _G.first = nil\n\
+             nx.plugins.load(\"leafy\"):next(\n\
+             \x20 function(v) _G.first = \"resolved:\" .. tostring(v) end,\n\
+             \x20 function(e) _G.first = \"rejected\" end)",
+            q(&dir)
+        ),
+    )
+    .await;
+
+    assert!(
+        poll_true(&rpc, "return _G.first ~= nil").await,
+        "the load settled"
+    );
+    assert_eq!(
+        exec_lua(&rpc, "return _G.first").await.as_str(),
+        Some("rejected"),
+        "the missing dependency rejects the dependent's load"
+    );
+    // The substance: the in-flight guard is released again.
+    assert_eq!(
+        lua_bool(&rpc, "return nx.plugins._loading.leafy ~= true").await,
+        Some(true),
+        "a failed load must clear the _loading guard so the plugin can be retried"
+    );
+    // And a retry is a real retry — it rejects loudly again instead of silently
+    // resolving false off the stale guard.
+    exec_lua(
+        &rpc,
+        "_G.second = nil\n\
+         nx.plugins.load(\"leafy\"):next(\n\
+         \x20 function(v) _G.second = \"resolved:\" .. tostring(v) end,\n\
+         \x20 function(e) _G.second = \"rejected\" end)",
+    )
+    .await;
+    assert!(
+        poll_true(&rpc, "return _G.second ~= nil").await,
+        "the retry settled"
+    );
+    assert_eq!(
+        exec_lua(&rpc, "return _G.second").await.as_str(),
+        Some("rejected"),
+        "a retry after a failed load re-attempts (and re-reports) instead of no-opping"
+    );
+}

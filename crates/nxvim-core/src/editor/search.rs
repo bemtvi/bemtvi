@@ -219,7 +219,13 @@ impl Editor {
             return;
         };
         let pattern = if bounded {
-            format!(r"\b{word}\b")
+            // The whole-word boundaries are spelled in the active engine's
+            // dialect: vim's magic dialect has no `\b` (it reads as a literal
+            // that matches nothing), its word boundaries are `\<` / `\>`.
+            match self.search_engine() {
+                RegexEngine::Vim => format!(r"\<{word}\>"),
+                RegexEngine::Pcre => format!(r"\b{word}\b"),
+            }
         } else {
             word
         };
@@ -344,6 +350,10 @@ impl Editor {
     /// immediate self-hit; backward looks left of it. Matching is line-by-line;
     /// side-effect free (the shared core of `run_search` and the incsearch
     /// preview).
+    /// The wrap scan is computed **lazily**: both callers use it only when the
+    /// primary match misses, and this runs per `n`-step / per incsearch
+    /// keystroke — an unconditional second full scan from the buffer's far end
+    /// would be pure waste on every hit.
     fn search_matches(
         &self,
         re: &SearchRegex,
@@ -351,14 +361,22 @@ impl Editor {
         from: usize,
     ) -> (Option<MatchRange>, Option<MatchRange>) {
         match dir {
-            SearchDir::Forward => (
-                self.match_forward_from(re, self.next_grapheme_idx(from)),
-                self.match_forward_from(re, 0),
-            ),
-            SearchDir::Backward => (
-                self.match_backward_before(re, from),
-                self.match_backward_before(re, self.buffer().len_bytes()),
-            ),
+            SearchDir::Forward => {
+                let primary = self.match_forward_from(re, self.next_grapheme_idx(from));
+                let wrapped = primary
+                    .is_none()
+                    .then(|| self.match_forward_from(re, 0))
+                    .flatten();
+                (primary, wrapped)
+            }
+            SearchDir::Backward => {
+                let primary = self.match_backward_before(re, from);
+                let wrapped = primary
+                    .is_none()
+                    .then(|| self.match_backward_before(re, self.buffer().len_bytes()))
+                    .flatten();
+                (primary, wrapped)
+            }
         }
     }
 

@@ -671,6 +671,43 @@ fn command_mode_renders_the_colon_line() {
     assert_eq!(row_text(&buf, 4).trim_end(), ":w");
 }
 
+#[test]
+fn command_cursor_lands_past_wide_chars() {
+    // The server's `cmdline_cursor` is a *char* offset, but the terminal cursor
+    // needs a *display column*. With CJK in the line the two diverge: "e 日本" is
+    // 4 chars but 6 cells (each CJK glyph is 2 cells wide), so a caret placed at
+    // prompt + char-offset lands mid-glyph, two cells short of the real end.
+    let v = view(vec![
+        ("command_mode", Value::from(true)),
+        ("cmdline", Value::from("e 日本")),
+        ("cmdline_cursor", Value::from(4u64)), // char offset: end of the line
+    ]);
+    let (buf, cursor) = paint_with_cursor(&v, 20, 5);
+    // ':' col 0, 'e' 1, ' ' 2, 日 3–4, 本 5–6 (each wide glyph spans two cells).
+    assert_eq!(buf.cell((3, 4)).unwrap().symbol(), "日");
+    assert_eq!(buf.cell((5, 4)).unwrap().symbol(), "本");
+    // The caret sits past the wide glyphs' display width, at col 7.
+    assert_eq!(
+        cursor,
+        Some((7, 4)),
+        "caret past the wide chars' display width, not at the char count"
+    );
+}
+
+#[test]
+fn command_cursor_accounts_for_a_wide_prompt() {
+    // A multi-char `nx.ui.input` prompt with wide chars offsets the caret by its
+    // display width (名(2)+前(2)+>(1)+space(1) = 6 cells), not its char count (4).
+    let v = view(vec![
+        ("command_mode", Value::from(true)),
+        ("cmdline_prompt", Value::from("名前> ")),
+        ("cmdline", Value::from("ab")),
+        ("cmdline_cursor", Value::from(2u64)),
+    ]);
+    let (_buf, cursor) = paint_with_cursor(&v, 20, 5);
+    assert_eq!(cursor, Some((8, 4)), "prompt width measured in cells");
+}
+
 // ----- Phase 5: truecolor styles from the server's resolved payload ----------
 
 /// One `styles`-palette entry: `0xRRGGBB` ints for the colors present, attribute
@@ -1485,6 +1522,37 @@ fn a_picker_row_keeps_the_file_name_when_the_path_overflows() {
             "matched char underlined at col {x}"
         );
     }
+}
+
+#[test]
+fn picker_prompt_caret_lands_past_a_wide_query() {
+    // The picker prompt caret follows `query_cursor` — a *char* offset (the
+    // server's `cursor_chars()`) — but the caret column is display cells: a CJK
+    // query ("日本": 2 chars, 4 cells) must push the caret its painted width.
+    let menu = Value::Map(vec![
+        (Value::from("items"), Value::Array(vec![Value::from("one")])),
+        (Value::from("selected"), Value::from(0u64)),
+        (Value::from("row"), Value::from(0u64)),
+        (Value::from("col"), Value::from(0u64)),
+        (Value::from("width"), Value::from(20u64)),
+        (Value::from("height"), Value::from(6u64)),
+        (Value::from("query"), Value::from("日本")),
+        (Value::from("query_cursor"), Value::from(2u64)),
+    ]);
+    let v = view(vec![("lines", lines(&["x"])), ("menu", menu)]);
+    let (buf, cursor) = paint_with_cursor(&v, 40, 12);
+    // The prompt row (inside the fully-bordered box) paints `> 日本`: `>` at the
+    // inner column, then the wide glyphs at two cells each.
+    let (qy, qx) = find_text(&buf, "日").expect("query rendered in the prompt row");
+    let qx = qx as u16;
+    assert_eq!(buf.cell((qx + 2, qy)).unwrap().symbol(), "本");
+    // Caret: "> " (2 cells) + 日本 (4 cells) past the inner column — 4 cells after
+    // 日's first cell — not 2 (the char count).
+    assert_eq!(
+        cursor,
+        Some((qx + 4, qy)),
+        "picker caret measured in display cells, not chars"
+    );
 }
 
 /// Every cell symbol painted into `buf`, concatenated. Used to assert the render

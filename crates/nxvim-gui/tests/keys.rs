@@ -3,8 +3,8 @@
 //! GUI analogue of `nxvim-tui`'s `keys` test.
 
 use nxvim_gui::{
-    dialog_action, encode_key, encode_paste, is_paste, open_dialog_verb, open_path_command,
-    parse_guifont, save_dialog_needed, DialogAction, GuiConfig,
+    altgr_composed, dialog_action, encode_key, encode_paste, is_paste, open_dialog_verb,
+    open_path_command, parse_guifont, save_dialog_needed, DialogAction, GuiConfig,
 };
 use winit::keyboard::{Key, ModifiersState, NamedKey};
 
@@ -74,6 +74,22 @@ fn ctrl_and_alt_get_prefixed() {
 }
 
 #[test]
+fn multi_char_character_is_sent_literally() {
+    // Some layouts / compose fallbacks deliver several characters in one keystroke
+    // (winit's `Key::Character` is a string, not a char). The whole payload must
+    // reach the server verbatim — not be silently truncated to the first char.
+    assert_eq!(
+        note(ch("日本"), ModifiersState::empty()).as_deref(),
+        Some("日本")
+    );
+    // `<` is still escaped so a multi-char payload can't smuggle a `<...>` form.
+    assert_eq!(
+        note(ch("a<b"), ModifiersState::empty()).as_deref(),
+        Some("a<lt>b")
+    );
+}
+
+#[test]
 fn literal_less_than_is_escaped() {
     assert_eq!(
         note(ch("<"), ModifiersState::empty()).as_deref(),
@@ -91,6 +107,38 @@ fn navigation_keys_use_angle_notation() {
         note(Key::Named(NamedKey::PageDown), ModifiersState::empty()).as_deref(),
         Some("<PageDown>")
     );
+}
+
+#[test]
+fn altgr_composition_is_typing_not_a_chord() {
+    // Windows reports AltGr as Ctrl+Alt: `AltGr+E` on a European layout arrives as
+    // `Character("€")` with CONTROL|ALT set. The layout *composed* the key
+    // (logical ≠ un-modified base), so it is typing — the client must send the €,
+    // not the `<C-A-e>` chord that would swallow it.
+    let ca = ModifiersState::CONTROL | ModifiersState::ALT;
+    assert!(altgr_composed(&ch("€"), &ch("e"), ca));
+    assert!(altgr_composed(&ch("@"), &ch("q"), ca)); // AltGr+Q on German layouts
+
+    // A real Ctrl+Alt chord composes nothing: logical == base → chord behavior.
+    assert!(!altgr_composed(&ch("e"), &ch("e"), ca));
+    // Shift folds into the logical character ("#" from "3"), so a difference under
+    // Ctrl+Alt+Shift proves nothing — the chord keeps chord behavior.
+    assert!(!altgr_composed(
+        &ch("#"),
+        &ch("3"),
+        ca | ModifiersState::SHIFT
+    ));
+    // CapsLock uppercases the logical key; a case-only difference isn't composition.
+    assert!(!altgr_composed(&ch("A"), &ch("a"), ca));
+    // Ctrl-only / Alt-only combos are never AltGr.
+    assert!(!altgr_composed(&ch("€"), &ch("e"), ModifiersState::CONTROL));
+    assert!(!altgr_composed(&ch("€"), &ch("e"), ModifiersState::ALT));
+    // Named keys can't be composed characters.
+    assert!(!altgr_composed(
+        &Key::Named(NamedKey::Tab),
+        &Key::Named(NamedKey::Tab),
+        ca
+    ));
 }
 
 #[test]

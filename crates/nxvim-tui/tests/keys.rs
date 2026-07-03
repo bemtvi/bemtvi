@@ -178,6 +178,30 @@ fn legacy_c0_control_bytes_map_to_vim_notation() {
 }
 
 #[test]
+fn legacy_c0_control_bytes_keep_the_alt_modifier() {
+    // Alt+Ctrl+] arrives as an ESC-prefixed 0x1D, which crossterm decodes as
+    // Alt+Ctrl+'5' (the same C0 mapping as above, plus ALT for the ESC prefix).
+    // The remap must keep the Alt modifier and still canonicalize the C0 byte —
+    // not fall through to `<C-A-5>`, which matches no `<C-A-]>` mapping.
+    assert_eq!(
+        note(
+            KeyCode::Char('5'),
+            KeyModifiers::CONTROL | KeyModifiers::ALT
+        )
+        .as_deref(),
+        Some("<C-A-]>")
+    );
+    assert_eq!(
+        note(
+            KeyCode::Char('4'),
+            KeyModifiers::CONTROL | KeyModifiers::ALT
+        )
+        .as_deref(),
+        Some("<C-A-\\>")
+    );
+}
+
+#[test]
 fn combined_ctrl_alt_prefixes_both() {
     assert_eq!(
         note(

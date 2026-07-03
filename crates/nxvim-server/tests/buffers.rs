@@ -913,3 +913,26 @@ async fn hash_expands_to_the_alternate_file() {
     std::fs::remove_file(&a).ok();
     std::fs::remove_file(&b).ok();
 }
+
+#[tokio::test]
+async fn buf_attach_callback_effects_drain_in_the_same_batch() {
+    let (rpc, mut incoming) = start().await;
+
+    // The `nvim_buf_attach` change channel: the server fires `nx._buf_changed`
+    // once per changed buffer while refreshing the mirror at the start of
+    // `run_pending`. Effects the callback queues (here a `print`, which becomes
+    // the message line) must drain in the SAME input batch — a raw insert
+    // keystroke runs no other Lua, so a stranded effect queue would leave the
+    // message empty until some later event happened to drain it.
+    exec_lua(
+        &rpc,
+        "nx._buf_changed = function(buf, tick) print('ATTACH-DRAINED') end",
+    )
+    .await;
+    feed(&rpc, "ix");
+    assert_eq!(
+        message(&rpc, &mut incoming).await,
+        "ATTACH-DRAINED",
+        "an on_lines-style callback's queued output drains in the batch that fired it"
+    );
+}

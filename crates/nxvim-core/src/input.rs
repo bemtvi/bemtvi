@@ -300,6 +300,11 @@ pub fn key_to_notation(key: Key) -> String {
         // A bare '<' is written `<lt>` so the result re-parses to '<' and never
         // opens a spurious special form.
         KeyCode::Char('<') if !key.ctrl && !key.alt => (true, "lt".to_string()),
+        // A *modified* '>' must use its named escape (`<C-gt>`): written inline
+        // as `<C->>` the parser would close the form at the FIRST '>', so it
+        // could never round-trip. (A bare '>' stays literal, and a modified '<'
+        // is fine inline — `<C-<>` parses.)
+        KeyCode::Char('>') if key.ctrl || key.alt => (true, "gt".to_string()),
         KeyCode::Char(c) => (false, c.to_string()),
         KeyCode::Enter => (true, "CR".to_string()),
         KeyCode::Esc => (true, "Esc".to_string()),

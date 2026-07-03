@@ -93,9 +93,8 @@ impl ImageStore {
     /// answers nothing) falls back to unicode halfblocks, so previews still render
     /// — just coarser.
     pub(crate) fn new(fetch_tx: UnboundedSender<ImageFetch>) -> Self {
-        let picker = Picker::from_query_stdio().unwrap_or_else(|_| Picker::halfblocks());
         ImageStore {
-            picker,
+            picker: detect_picker(),
             cache: HashMap::new(),
             remote: HashMap::new(),
             fetch_tx,
@@ -226,6 +225,103 @@ impl ImageStore {
         };
         self.remote.insert(path, RemoteSlot { version, state });
     }
+}
+
+/// Detect the graphics protocol — but only *query* a terminal that provably answers
+/// queries; anything else gets the halfblocks fallback outright.
+///
+/// `Picker::from_query_stdio` (ratatui-image 11.0.4) spawns a helper thread that
+/// blocks in `stdin.read()` until it sees the reply to its `ESC[5n` device-status
+/// query — its termination sentinel. On a terminal that answers nothing (a dumb
+/// PTY, `TERM=dumb`, some ssh hops / multiplexers) that reply never comes: the
+/// caller times out and falls back to halfblocks, but the helper thread stays
+/// parked on the blocking read. It then *swallows the first keystrokes the user
+/// types* (they land in its `read`), and on its way out — its result channel is
+/// closed by then, so the loop errors — it runs its `disable_raw_mode()` cleanup,
+/// dropping the terminal back to cooked mode. Every later keystroke is then
+/// line-buffered by the PTY and never reaches the input reader: all input is dead.
+/// (Caught by the PTY e2e tests, `crates/nxvim/tests/e2e.rs`.)
+///
+/// The probe sends the same `ESC[5n` and waits on `poll(2)`, which can wait
+/// *without consuming stdin* and leaves nothing behind on timeout — so a mute
+/// terminal costs one bounded wait and keeps a fully working keyboard.
+fn detect_picker() -> Picker {
+    if terminal_answers_status_query() {
+        Picker::from_query_stdio().unwrap_or_else(|_| Picker::halfblocks())
+    } else {
+        Picker::halfblocks()
+    }
+}
+
+/// Probe whether the terminal answers an `ESC[5n` device-status report (the query
+/// every terminal is expected to implement, and the one `from_query_stdio` relies
+/// on to terminate). Waits via [`stdin_readable_within`] — never a blocking read —
+/// then drains the pending reply so the *stale* `ESC[0n` can't terminate the real
+/// capability query prematurely (its parser treats any status report as "done").
+/// Raw mode is already on here (`ratatui::init` ran), so the reply isn't held back
+/// by the line discipline.
+#[cfg(unix)]
+fn terminal_answers_status_query() -> bool {
+    use std::io::{Read, Write};
+
+    let mut out = std::io::stdout();
+    if out
+        .write_all(b"\x1b[5n")
+        .and_then(|()| out.flush())
+        .is_err()
+    {
+        return false;
+    }
+    // Generous first wait: a slow hop (ssh) can sit on the reply for a while.
+    if !stdin_readable_within(std::time::Duration::from_millis(1000)) {
+        return false;
+    }
+    // Drain until a quiet gap so the capability query starts from clean input.
+    let mut stdin = std::io::stdin();
+    let mut buf = [0u8; 64];
+    loop {
+        match stdin.read(&mut buf) {
+            // EOF / error: stdin will never carry a reply — don't query.
+            Ok(0) | Err(_) => return false,
+            Ok(_) => {}
+        }
+        if !stdin_readable_within(std::time::Duration::from_millis(50)) {
+            return true;
+        }
+    }
+}
+
+/// `poll(2)` stdin for readability within `timeout` — waits without consuming a
+/// byte, and holds no resources once it returns (unlike a parked reader thread).
+#[cfg(unix)]
+fn stdin_readable_within(timeout: std::time::Duration) -> bool {
+    use std::os::unix::io::AsRawFd;
+
+    let mut pfd = libc::pollfd {
+        fd: std::io::stdin().as_raw_fd(),
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        let remain = deadline.saturating_duration_since(std::time::Instant::now());
+        let ms = i32::try_from(remain.as_millis()).unwrap_or(i32::MAX);
+        match unsafe { libc::poll(&mut pfd, 1, ms) } {
+            // Interrupted by a signal: retry with the remaining budget (a zero
+            // budget makes `poll` return 0 immediately, ending the loop).
+            -1 if std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted => {
+                continue;
+            }
+            n => return n > 0 && (pfd.revents & libc::POLLIN) != 0,
+        }
+    }
+}
+
+/// Non-unix fallback: no `poll(2)` to probe with, so keep the direct query (the
+/// pre-probe behavior; crossterm's Windows console path answers via the API).
+#[cfg(not(unix))]
+fn terminal_answers_status_query() -> bool {
+    true
 }
 
 /// The largest aspect-preserving sub-rect of `area` the image fits in — never

@@ -21,18 +21,20 @@ pub fn encode_key(ev: KeyEvent) -> Option<String> {
     // CTRL-^ and CTRL-_, but crossterm decodes them as Ctrl+'4'..'7' (its unix
     // parse.rs maps `c - 0x1C + b'4'`). nxvim doesn't enable the kitty keyboard
     // protocol, so a real digit can't reach here carrying CONTROL — these always
-    // came from those bytes. Remap them to vim's canonical notation so bindings
-    // like <C-]> (help tag jump) and <C-^> (alternate file) actually fire instead
-    // of arriving as <C-5>/<C-6> and matching nothing.
-    if ctrl && !alt {
+    // came from those bytes (an ESC-prefixed one additionally carries ALT). Remap
+    // them to vim's canonical notation so bindings like <C-]> (help tag jump) and
+    // <C-^> (alternate file) actually fire instead of arriving as <C-5>/<C-6> and
+    // matching nothing; the Alt modifier rides along (`<C-A-]>`).
+    if ctrl {
         if let KeyCode::Char(c @ '4'..='7') = ev.code {
             let name = match c {
-                '4' => r"<C-\>",
-                '5' => "<C-]>",
-                '6' => "<C-^>",
-                _ => "<C-_>",
+                '4' => '\\',
+                '5' => ']',
+                '6' => '^',
+                _ => '_',
             };
-            return Some(name.to_string());
+            let a = if alt { "A-" } else { "" };
+            return Some(format!("<C-{a}{name}>"));
         }
     }
 

@@ -7,7 +7,7 @@
 //! expects. A key with no mapping (a bare modifier, a dead key) yields `None`
 //! and is dropped — the same contract the TUI follows.
 
-use nxvim_view::{notation, Key as VimKey};
+use nxvim_view::{encode_paste, notation, Key as VimKey};
 use winit::keyboard::{Key, ModifiersState, NamedKey};
 
 /// Encode a winit logical key + modifiers as vim key-notation, or `None` for a
@@ -20,6 +20,17 @@ use winit::keyboard::{Key, ModifiersState, NamedKey};
 /// A control combo still arrives as the base character (`Ctrl+w` → `Character("w")`
 /// + `control_key()`), which yields `<C-w>`.
 pub fn encode_key(logical: &Key, mods: ModifiersState) -> Option<String> {
+    // A multi-character payload (some layouts / compose fallbacks emit several
+    // characters for one keystroke — winit's `Key::Character` is a string, not a
+    // char) can't be a `<...>` chord; feed it through the literal-text encoder
+    // (the IME-commit / paste path) rather than silently truncating to the first
+    // char.
+    if let Key::Character(s) = logical {
+        if s.chars().count() > 1 {
+            let text = encode_paste(s);
+            return (!text.is_empty()).then_some(text);
+        }
+    }
     let key = translate(logical)?;
     Some(notation(
         mods.control_key(),
@@ -27,6 +38,32 @@ pub fn encode_key(logical: &Key, mods: ModifiersState) -> Option<String> {
         mods.shift_key(),
         key,
     ))
+}
+
+/// Whether a keystroke that arrived with **Ctrl+Alt** held is actually *AltGr
+/// typing*, not a `<C-A-…>` chord. Windows reports AltGr as Ctrl+Alt, so `AltGr+E`
+/// on a European layout arrives as `Character("€")` + `control_key()` +
+/// `alt_key()` — encoding that as a chord of the un-composed base key sends
+/// `<C-A-e>` and the typed `€` never reaches the buffer. The tell is the layout
+/// having *composed* the logical key into a different character than the
+/// unmodified base key (`logical` vs winit's `key_without_modifiers`).
+///
+/// Deliberately conservative:
+/// - Shift held ⇒ `false` — Shift folds into the logical character (`#` from `3`),
+///   so a difference proves nothing; a `<C-A-S-…>` chord keeps chord behavior.
+/// - A case-only difference ⇒ `false` — that's CapsLock, not composition.
+/// - Anything but Ctrl+Alt on two `Character` keys ⇒ `false`.
+///
+/// The caller additionally skips this on macOS, where Option composes on its own
+/// and is deliberately mapped to `<A-…>` chords via `key_without_modifiers`.
+pub fn altgr_composed(logical: &Key, base: &Key, mods: ModifiersState) -> bool {
+    if !mods.control_key() || !mods.alt_key() || mods.shift_key() || mods.super_key() {
+        return false;
+    }
+    match (logical, base) {
+        (Key::Character(l), Key::Character(b)) => l.to_lowercase() != b.to_lowercase(),
+        _ => false,
+    }
 }
 
 /// Whether `logical` + `mods` is a "paste from system clipboard" gesture: Cmd+V

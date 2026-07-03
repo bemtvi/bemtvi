@@ -39,7 +39,7 @@ pub mod remote;
 mod render;
 mod session;
 
-pub use input::{encode_key, is_paste};
+pub use input::{altgr_composed, encode_key, is_paste};
 pub use mouse::{
     button_name, cell_at, drain_notches, horizontal_action, mouse_modifier, vertical_action,
 };
@@ -59,6 +59,9 @@ pub use render::{col_to_screen, group_fallback, rect_subtract, row_segments, tex
 // The wide-glyph mask (replace an off-grid emoji cluster with cell-width spaces), so
 // the Tier-1 `wide` test can exercise it without shaping / a GPU.
 pub use render::mask_segments;
+// The pure caret-cell math for the command line and the picker prompt (char-offset
+// wire fields → display-width cells), exported for the Tier-1 `caret` test.
+pub use render::{cmdline_caret_col, query_caret_col};
 // The sRGB→linear color conversions feeding the quad pipeline, exported so the Tier-1
 // `color` test can pin the channel order without a GPU.
 pub use render::{color_to_rgba, srgb_to_color, srgb_to_color_rgba};
@@ -1291,9 +1294,18 @@ impl ApplicationHandler<UserEvent> for App {
                     w.request_redraw();
                 }
             }
-            WindowEvent::ScaleFactorChanged { .. } => {
-                // The renderer measures cells in device pixels; a DPI change is
-                // surfaced as a following `Resized`, which re-reports the grid.
+            WindowEvent::ScaleFactorChanged { scale_factor, .. } => {
+                // The renderer's cell metrics are device pixels (`points × scale`),
+                // so a DPI change — dragging the window onto a different-scale
+                // monitor — must re-derive them; the following `Resized` only
+                // reconfigures the surface, so without this the glyphs keep the old
+                // monitor's pixel size (wrong physical size + a wrong grid).
+                // Re-applying the current font at the new scale re-measures the
+                // cell, re-reports the grid, and repaints.
+                if let Some(r) = self.renderer.as_mut() {
+                    r.set_scale(scale_factor as f32);
+                    self.apply_guifont();
+                }
             }
             WindowEvent::ModifiersChanged(mods) => self.mods = mods.state(),
             // Track the pointer (winit's button/wheel events carry no position) and,
@@ -1344,7 +1356,16 @@ impl ApplicationHandler<UserEvent> for App {
                     self.arm_flush_deadline();
                 }
             }
-            WindowEvent::KeyboardInput { event, .. } if event.state == ElementState::Pressed => {
+            // `is_synthetic` presses are winit's focus-gain enumeration of keys
+            // already held (X11/Windows) — state bookkeeping, not typing. Feeding
+            // them through would inject a spurious keystroke every time the window
+            // regains focus while a key is down (e.g. the `w` of an Alt-Tab still
+            // held). Real key events arrive with `is_synthetic == false`.
+            WindowEvent::KeyboardInput {
+                event,
+                is_synthetic: false,
+                ..
+            } if event.state == ElementState::Pressed => {
                 // Paste from the system clipboard (Cmd+V / Ctrl+Shift+V /
                 // Shift+Insert), fed through the same `encode_paste` the TUI uses
                 // for terminal bracketed paste. Claimed before key encoding so the
@@ -1423,12 +1444,28 @@ impl ApplicationHandler<UserEvent> for App {
                 // base key (it also drops Shift, fine for a chord like `<A-c>`); plain
                 // typing keeps `logical_key`, where the platform has folded Shift into
                 // the character so `A` stays `A`.
-                let key = if self.mods.control_key() || self.mods.alt_key() {
-                    event.key_without_modifiers()
+                //
+                // Exception: Windows reports **AltGr** as Ctrl+Alt, so `AltGr+E` (€ on
+                // European layouts) arrives as Ctrl+Alt+`Character("€")`. That's
+                // *typing*, not a chord — sending `<C-A-e>` would swallow the € — so
+                // when the layout composed the logical key into a different character
+                // than the base ([`altgr_composed`]), pass the composed character
+                // through with no modifier prefix. Skipped on macOS, where Option-only
+                // composition is deliberately mapped to `<A-…>` chords (above).
+                let altgr = !cfg!(target_os = "macos")
+                    && input::altgr_composed(
+                        &event.logical_key,
+                        &event.key_without_modifiers(),
+                        self.mods,
+                    );
+                let (key, mods) = if altgr {
+                    (event.logical_key.clone(), ModifiersState::empty())
+                } else if self.mods.control_key() || self.mods.alt_key() {
+                    (event.key_without_modifiers(), self.mods)
                 } else {
-                    event.logical_key.clone()
+                    (event.logical_key.clone(), self.mods)
                 };
-                if let Some(notation) = input::encode_key(&key, self.mods) {
+                if let Some(notation) = input::encode_key(&key, mods) {
                     self.rpc
                         .notify("nx_input", vec![Value::from(notation.as_str())]);
                     // Arm the `timeoutlen` flush; the next key re-arms it, so it

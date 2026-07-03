@@ -36,7 +36,15 @@ pub enum Incoming {
     },
 }
 
-type Pending = Arc<Mutex<HashMap<u64, oneshot::Sender<std::result::Result<Value, Value>>>>>;
+type PendingMap = HashMap<u64, oneshot::Sender<std::result::Result<Value, Value>>>;
+
+/// In-flight requests awaiting a response, keyed by msgid. `None` once the
+/// connection has been torn down: the cleanup task in [`connect`] `take`s the
+/// map exactly once (failing every outstanding request), so a [`Rpc::request`]
+/// racing that teardown must be refused at registration — its frame can still
+/// be accepted by the outbound channel (the aborted writer may outlive the
+/// drain by a poll), but nothing would ever resolve or drop its oneshot.
+type Pending = Arc<Mutex<Option<PendingMap>>>;
 
 /// Bounded capacity of the [`Rpc::notify_stream`] channel — how many bulk frames
 /// (e.g. terminal PTY chunks) may sit queued for the writer before a producer
@@ -83,7 +91,17 @@ impl Rpc {
     pub async fn request(&self, method: &str, params: Vec<Value>) -> Result<Value> {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = oneshot::channel();
-        self.pending.lock().unwrap().insert(id, tx);
+        // Register under the lock only while the connection is live (`Some`).
+        // The teardown drain flips it to `None` under this same lock, so a
+        // sender can never be inserted *after* the drain — the interleaving
+        // that would leave this call parked forever on an unreachable oneshot.
+        {
+            let mut pending = self.pending.lock().unwrap();
+            match pending.as_mut() {
+                Some(map) => map.insert(id, tx),
+                None => return Err(anyhow!("rpc connection closed")),
+            };
+        }
         let msg = Value::Array(vec![
             Value::from(0u64),
             Value::from(id),
@@ -91,7 +109,9 @@ impl Rpc {
             Value::Array(params),
         ]);
         if self.out.send(encode(&msg)).is_err() {
-            self.pending.lock().unwrap().remove(&id);
+            if let Some(map) = self.pending.lock().unwrap().as_mut() {
+                map.remove(&id);
+            }
             return Err(anyhow!("rpc connection closed"));
         }
         match rx.await {
@@ -121,7 +141,7 @@ where
     let (out_tx, out_rx) = mpsc::unbounded_channel::<Vec<u8>>();
     let (stream_tx, stream_rx) = mpsc::channel::<Vec<u8>>(STREAM_CAP);
     let (in_tx, in_rx) = mpsc::unbounded_channel::<Incoming>();
-    let pending: Pending = Arc::new(Mutex::new(HashMap::new()));
+    let pending: Pending = Arc::new(Mutex::new(Some(HashMap::new())));
 
     let mut writer_handle = tokio::spawn(writer_task(writer, out_rx, stream_rx));
     let mut reader_handle = tokio::spawn(reader_task(reader, in_tx, pending.clone()));
@@ -129,16 +149,18 @@ where
     // Couple the two halves and fail in-flight requests on teardown. When either
     // task ends — the reader on EOF/corrupt frame, the writer on a write error —
     // the connection is dead: abort the survivor (so a dropped reader can't leave
-    // the writer parked on `out_rx`, and vice versa) and drain `pending`, so every
-    // outstanding `request().await` resolves to an error instead of blocking
-    // forever on a oneshot whose sender would otherwise linger in the map.
+    // the writer parked on `out_rx`, and vice versa) and `take` the pending map,
+    // which both fails every outstanding `request().await` (their senders drop)
+    // and marks the connection closed (`None`), so a request racing this drain
+    // is refused at registration instead of parking forever on a oneshot the
+    // (already-taken) map can no longer hand to anyone.
     let cleanup = pending.clone();
     tokio::spawn(async move {
         tokio::select! {
             _ = &mut writer_handle => reader_handle.abort(),
             _ = &mut reader_handle => writer_handle.abort(),
         }
-        cleanup.lock().unwrap().clear();
+        cleanup.lock().unwrap().take();
     });
 
     let rpc = Rpc {
@@ -151,12 +173,21 @@ where
 }
 
 async fn writer_task<W>(
-    mut writer: W,
+    writer: W,
     mut out_rx: mpsc::UnboundedReceiver<Vec<u8>>,
     mut stream_rx: mpsc::Receiver<Vec<u8>>,
 ) where
     W: AsyncWrite + Unpin,
 {
+    // Buffer the sink: callers hand `connect` raw transports (TCP, QUIC
+    // streams, stdio, the in-process duplex), where each `write_all` is its own
+    // syscall and `flush` on e.g. `TcpStream` is a no-op — so unbuffered, the
+    // batch coalescing below still pays one syscall *per frame*. Buffered, a
+    // batch's frames coalesce in memory and the single `flush` at the end
+    // performs the actual write (frames larger than the buffer write through).
+    // Every loop iteration flushes before parking for more input, so no bytes
+    // ever sit unflushed while the connection idles.
+    let mut writer = tokio::io::BufWriter::new(writer);
     loop {
         // Wait for the next frame on either channel; `biased` so the unbounded
         // control channel (`out`) is always preferred over the bounded streaming
@@ -487,7 +518,7 @@ fn dispatch(
             let id = arr.get(1).and_then(Value::as_u64).unwrap_or(0);
             let err = take(&mut arr, 2);
             let res = take(&mut arr, 3);
-            if let Some(tx) = pending.lock().unwrap().remove(&id) {
+            if let Some(tx) = pending.lock().unwrap().as_mut().and_then(|m| m.remove(&id)) {
                 let _ = tx.send(if err.is_nil() { Ok(res) } else { Err(err) });
             }
         }

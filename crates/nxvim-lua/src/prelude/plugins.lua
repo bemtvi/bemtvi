@@ -353,13 +353,12 @@ function M.load(name)
     return nx.promise.reject({ message = "nx.plugins: unknown plugin '" .. tostring(name) .. "'" })
   end
   M._loading[name] = true
-  return nx.async(function()
+  local loading = nx.async(function()
     for _, dep in ipairs(spec._deps) do
       nx.await(M.load(dep))
     end
     local present = spec.dir ~= nil or nx.await(nx.fs.exists(spec._dir))
     if not present then
-      M._loading[name] = false
       error("nx.plugins: '" .. name .. "' is not installed — run :PluginSync", 0)
     end
     nx._add_rtp(spec._dir)
@@ -373,10 +372,17 @@ function M.load(name)
       end))
     end
     M._loaded[name] = true
-    M._loading[name] = false
     notify_change() -- a UI watching load state repaints this plugin as loaded
     return true
   end)()
+  -- The in-flight guard must drop on EVERY exit — success, "not installed", a
+  -- dependency's rejection re-raised by the await, a runtime-source failure.
+  -- Clearing it only on the happy paths wedged the plugin forever: each later
+  -- trigger saw `_loading` truthy and silently resolved `false`, so a load could
+  -- never be retried (e.g. after installing the missing dependency).
+  return loading:finally(function()
+    M._loading[name] = false
+  end)
 end
 
 -- Load `name` and report a rejection (uninstalled / load error) on the message

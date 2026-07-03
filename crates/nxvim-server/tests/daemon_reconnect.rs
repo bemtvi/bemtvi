@@ -617,3 +617,127 @@ async fn dedicated_thread_wrapper_auto_recovers() {
         "the dedicated-thread link auto-recovers and the save resumes"
     );
 }
+
+/// Like [`start`], but also wires the daemon-backed **proc** seam (`nx.run` /
+/// `vim.system` spawn over the daemon), so the process-path outage behavior is
+/// testable. The fake daemon serves only the fs leg — irrelevant here: these tests
+/// exercise the *link-down* paths, which must resolve locally without any daemon.
+async fn start_with_proc(
+    dialer: &Dialer,
+    path: &str,
+) -> (
+    nxvim_rpc::Rpc,
+    tokio::sync::mpsc::UnboundedReceiver<nxvim_rpc::Incoming>,
+    ReconnectHandle,
+) {
+    let (client, handle) =
+        nxvim_server::connect_daemon_reconnecting_on(dialer.make(), fast_policy())
+            .await
+            .expect("the initial daemon dial succeeds");
+    let DaemonClient {
+        host_fs, host_proc, ..
+    } = client;
+    let init = ServerInit {
+        file: Some(path.to_string()),
+        host_fs_async: Some(Box::new(host_fs)),
+        host_proc: Some(Box::new(host_proc)),
+        ..Default::default()
+    };
+    let (rpc, incoming) = spawn(init);
+    attach(&rpc, 80, 24).await;
+    (rpc, incoming, handle)
+}
+
+/// Kick a daemon-backed `nx.run` and stash its result in `_G.res`.
+async fn spawn_probe(rpc: &nxvim_rpc::Rpc) {
+    exec_lua(
+        rpc,
+        "_G.res = nil\n\
+         nx.run({ cmd = 'sh', args = { '-c', 'echo hi' } }):next(function(r) _G.res = r end)",
+    )
+    .await;
+}
+
+/// Poll until `_G.res` resolved, returning its `code` — or `None` if it never did
+/// (the hang these tests exist to rule out).
+async fn probe_code(rpc: &nxvim_rpc::Rpc) -> Option<i64> {
+    for _ in 0..100 {
+        let code = exec_lua(rpc, "return _G.res and _G.res.code").await;
+        if !code.is_nil() {
+            return code.as_i64();
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    None
+}
+
+/// A `nx.run` issued while the link is DOWN must fail loud (`code = -1`, the cause
+/// on stderr) — never park forever on a spawn notification that was dropped on the
+/// floor (the seam contract: "while disconnected … fails loud, never hangs").
+#[tokio::test]
+async fn a_spawn_while_disconnected_fails_loud_instead_of_hanging() {
+    const PATH: &str = "/virtual/spawn.txt";
+    let dialer = Dialer::new(DaemonFs::with(PATH, "one\n"));
+    let (rpc, _incoming, handle) = start_with_proc(&dialer, PATH).await;
+    await_lines(&rpc, &["one"]).await;
+
+    handle.disconnect();
+    let mut down = false;
+    for _ in 0..200 {
+        if handle.status() == DaemonStatus::Disconnected {
+            down = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(down, "the disconnect parks the link Disconnected");
+
+    spawn_probe(&rpc).await;
+    assert_eq!(
+        probe_code(&rpc).await,
+        Some(-1),
+        "a spawn while disconnected resolves loud with code -1 (it must not hang)"
+    );
+    let err = exec_lua(&rpc, "return _G.res.stderr").await;
+    assert!(
+        err.as_str().unwrap_or("").contains("disconnected"),
+        "the failure names the cause: {err:?}"
+    );
+}
+
+/// A spawn already IN FLIGHT when the user `:disconnect`s must have its exit
+/// synthesized (`code = -1`) — cancelling the connection's serve must fail the
+/// pending waiters exactly like a naturally-dropped connection does, or the job's
+/// `on_exit` (and any `:wq` gated on it) hangs forever.
+#[tokio::test]
+async fn an_inflight_spawn_synthesizes_an_exit_on_disconnect() {
+    const PATH: &str = "/virtual/inflight.txt";
+    let dialer = Dialer::new(DaemonFs::with(PATH, "one\n"));
+    let (rpc, _incoming, handle) = start_with_proc(&dialer, PATH).await;
+    await_lines(&rpc, &["one"]).await;
+
+    // The fake daemon serves no proc leg, so this spawn parks awaiting a report
+    // that will never come while the link is up — exactly an in-flight child.
+    spawn_probe(&rpc).await;
+    tokio::time::sleep(Duration::from_millis(80)).await;
+    assert!(
+        exec_lua(&rpc, "return _G.res == nil").await.as_bool() == Some(true),
+        "the spawn is genuinely in flight before the disconnect"
+    );
+
+    handle.disconnect();
+    let mut down = false;
+    for _ in 0..200 {
+        if handle.status() == DaemonStatus::Disconnected {
+            down = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(down, "the disconnect parks the link Disconnected");
+    assert_eq!(
+        probe_code(&rpc).await,
+        Some(-1),
+        "an in-flight spawn's exit is synthesized when the link is dropped"
+    );
+}

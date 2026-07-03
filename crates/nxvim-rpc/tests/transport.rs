@@ -117,6 +117,75 @@ async fn in_flight_request_fails_when_the_connection_drops() {
     }
 }
 
+/// A `request()` racing connection teardown must resolve to an error, never
+/// hang. The teardown task drains `pending` exactly once; a request that
+/// registers its oneshot *after* that drain — while the aborted writer task is
+/// still mid-poll on another worker, so the outbound channel still accepts the
+/// frame — parks forever on a sender nothing will ever complete or drop. The
+/// window only opens on a multi-thread runtime with the writer busy (an idle
+/// writer is dropped synchronously inside `abort()`, closing the channel before
+/// the drain), so this floods the writer with notifications while hammering
+/// requests across many teardowns and requires every request to resolve. Before
+/// the fix some iteration's request lands in the drain-to-writer-death window
+/// and times out; after the fix the closed marker under the `pending` lock
+/// fails it fast in every interleaving.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn request_racing_teardown_errors_instead_of_hanging() {
+    for iter in 0..400u32 {
+        let (peer, rpc, mut peer_reader, _incoming) = rig();
+
+        // Drain the peer side so the writer's `write_all`s stay Ready — a
+        // writer parked on a full pipe is idle, and an idle writer is aborted
+        // synchronously, which closes the window this test exists to hit.
+        let drain = tokio::spawn(async move {
+            let mut sink = [0u8; 1 << 16];
+            while peer_reader.read(&mut sink).await.unwrap_or(0) > 0 {}
+        });
+
+        // Keep the writer task busy: an unbounded stream of notifications keeps
+        // its coalescing drain loop spinning inside a single long poll, so the
+        // teardown's `abort()` lands mid-poll and defers the writer's death.
+        let flood_rpc = rpc.clone();
+        let flood = tokio::spawn(async move {
+            let payload = vec![Value::from("x".repeat(512))];
+            loop {
+                for _ in 0..16 {
+                    flood_rpc.notify("flood", payload.clone());
+                }
+                tokio::task::yield_now().await;
+            }
+        });
+
+        // Hammer requests through the teardown. The peer never answers, so
+        // every request must resolve to an error — either drained at teardown
+        // or refused on the dead channel. A timeout is the hang.
+        let req_rpc = rpc.clone();
+        let requester = tokio::spawn(async move {
+            let mut errors = 0u32;
+            while errors < 8 {
+                match tokio::time::timeout(Duration::from_secs(2), req_rpc.request("r", vec![]))
+                    .await
+                {
+                    Ok(Err(_)) => errors += 1, // resolved — correct
+                    Ok(Ok(v)) => panic!("request unexpectedly succeeded: {v:?}"),
+                    Err(_) => return true, // hung in the teardown window
+                }
+            }
+            false
+        });
+
+        // Let the flood and requester spin up, then kill the peer->us pipe so
+        // the reader EOFs and teardown races the busy writer.
+        tokio::time::sleep(Duration::from_micros(200)).await;
+        drop(peer);
+
+        let hung = requester.await.expect("requester task panicked");
+        flood.abort();
+        drain.abort();
+        assert!(!hung, "iteration {iter}: request racing teardown hung");
+    }
+}
+
 /// A frame split across two reads (a genuinely truncated prefix, then the rest)
 /// must still be reassembled and dispatched — i.e. the malformed-frame teardown
 /// must not also kill legitimately-incomplete reads. Passes before and after

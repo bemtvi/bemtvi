@@ -2077,6 +2077,16 @@ impl Editor {
         // **within the same layer**: closing a document in the main area must never
         // pull in a dock's buffer (or vice versa). The replacement layer is the
         // focused one, since the focused window is the one losing `target`.
+        // Deleting a **live** terminal buffer takes its PTY child with it: enqueue
+        // the kill for the server's effect loop, or the child would be orphaned (a
+        // leaked process per wiped terminal). Only for a still-live session — an
+        // exited terminal's kind was already flipped back to `Ordinary` by
+        // `terminal_closed`, so a normal exit never double-kills.
+        if self.is_terminal_buffer(target) {
+            self.pending_terminal
+                .push(crate::editor::terminal::TerminalOp::Kill { buf: target });
+        }
+
         let was_current = target == self.cur_buffer();
         let layer = self.focused_layer;
         let replacement = if was_current {

@@ -171,12 +171,87 @@ fn resolve_workspace_dir(dir: Option<&str>) -> Result<PathBuf> {
 /// by `nx.argv()`. Set once in `main` so it is available in every role.
 const ARGV_ENV: &str = "NXVIM_ARGV";
 
+/// Quote `s` as a Lua string literal (double-quoted, with the escapes Lua needs), so
+/// arbitrary user code/paths can be embedded in a generated chunk and re-compiled
+/// Lua-side via `load` — the only way to *observe* a load error, since the server's
+/// `nvim_exec_lua` reports a failed chunk as an `:echo` + `Nil` reply, not an error.
+pub(crate) fn lua_quote(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    for c in s.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\0' => out.push_str("\\0"),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
+/// The bootstrap chunk `--lua` runs CODE through. It compiles CODE Lua-side — as an
+/// expression first (`return (CODE)`, the documented shape), falling back to a chunk
+/// *body* so statement-form CODE (`return x`, multi-statement chunks) works — and
+/// **returns the compile error as a string** when both fail (`nvim_exec_lua` cannot
+/// carry it as an RPC error; see [`lua_quote`]). On success it starts the evaluation
+/// inside `nx.async` (so a top-level `nx.await` works), awaits a returned promise, and
+/// records the outcome in the two globals the completion poll reads —
+/// `__nxvim_oneshot_done` (settled) and `__nxvim_oneshot_err` (the stringified
+/// rejection, `nil` on success) — then returns `true`.
+fn oneshot_bootstrap(code: &str) -> String {
+    let src = lua_quote(code);
+    format!(
+        "_G.__nxvim_oneshot_done = false\n\
+         _G.__nxvim_oneshot_err = nil\n\
+         local __src = {src}\n\
+         local __f = load('return (' .. __src .. ')', '=--lua')\n\
+         if not __f then\n\
+         local __e\n\
+         __f, __e = load(__src, '=--lua')\n\
+         if not __f then return tostring(__e) end\n\
+         end\n\
+         nx.async(function()\n\
+         local __r = __f()\n\
+         if type(__r) == 'table' and type(__r.next) == 'function' then __r = nx.await(__r) end\n\
+         return __r\n\
+         end)():next(\n\
+         function() _G.__nxvim_oneshot_done = true end,\n\
+         function(e)\n\
+         _G.__nxvim_oneshot_err = tostring(e)\n\
+         nx.notify('nxvim --lua: ' .. tostring(e), 4)\n\
+         _G.__nxvim_oneshot_done = true\n\
+         end)\n\
+         return true\n"
+    )
+}
+
+/// `nvim_exec_lua(code)`, surfacing a dead transport as an `Err`. (A *Lua* failure
+/// never arrives here as an error — the server echoes it and replies `Nil` — which is
+/// why the generated chunks report their own outcome as a value.)
+async fn oneshot_exec(rpc: &nxvim_rpc::Rpc, code: &str) -> Result<rmpv::Value> {
+    rpc.request(
+        "nvim_exec_lua",
+        vec![rmpv::Value::from(code), rmpv::Value::Array(vec![])],
+    )
+    .await
+    .map_err(|e| anyhow!("{e}"))
+}
+
 /// `--lua CODE` headless mode: boot an embedded server with the user's config +
 /// runtimepath (so plugins load), evaluate CODE once, then exit — no UI. CODE is a Lua
-/// EXPRESSION; if it yields a promise the wrapper waits for it to settle. A workspace
-/// wrapper uses this to read its config and relaunch with `--shada-namespace` via
-/// `nx.reexec`, which replaces this process (so the wrapper's `:qa!` never runs).
-fn run_lua_oneshot(code: String, shada: &ShadaOpts) -> Result<()> {
+/// EXPRESSION (statement-form CODE like `return x` is also accepted, compiled as a
+/// chunk body); if it yields a promise the wrapper waits for it to settle. The exit
+/// status reports the outcome for shells/CI: `0` when CODE settles cleanly, non-zero
+/// (with the error on stderr) when it fails to load, throws/rejects, or never settles
+/// within the deadline — never a silent success. A workspace wrapper uses this to read
+/// its config and relaunch with `--shada-namespace` via `nx.reexec`, which replaces
+/// this process (so the wrapper's `:qa!` never runs). `workspace_cwd` mirrors the
+/// interactive launch: a `--workspace DIR` one-shot runs CODE with DIR as the cwd
+/// (unless `--workspace-no-cwd`).
+fn run_lua_oneshot(code: String, shada: &ShadaOpts, workspace_cwd: bool) -> Result<()> {
     use std::time::Duration;
 
     // Mark this as a oneshot bootstrap so a workspace plugin skips its interactive
@@ -198,6 +273,9 @@ fn run_lua_oneshot(code: String, shada: &ShadaOpts) -> Result<()> {
             shada: None,
             shada_namespace,
             workspace_dir,
+            // A `--workspace DIR` one-shot cds into DIR like the interactive launch, so
+            // CODE's relative paths resolve against the workspace root.
+            workspace_cwd,
             runtimepath,
             clipboard: nxvim_server::ClipboardProvider::Disabled,
             offer_default_recommended: false,
@@ -220,47 +298,48 @@ fn run_lua_oneshot(code: String, shada: &ShadaOpts) -> Result<()> {
         let (reader, writer) = tokio::io::split(client_end);
         let (rpc, _incoming) = nxvim_rpc::connect(reader, writer);
 
-        // Run CODE inside an async context (so a top-level `nx.await` in CODE works),
-        // await it if it yields a promise, and set a completion flag when it settles. If
-        // CODE calls `nx._reexec`, the process is replaced before the flag is ever read.
-        let wrapped = format!(
-            "_G.__nxvim_oneshot_done = false\n\
-             nx.async(function()\n\
-             local __r = ({code})\n\
-             if type(__r) == 'table' and type(__r.next) == 'function' then __r = nx.await(__r) end\n\
-             return __r\n\
-             end)():next(\n\
-             function() _G.__nxvim_oneshot_done = true end,\n\
-             function(e) nx.notify('nxvim --lua: ' .. tostring(e), 4); _G.__nxvim_oneshot_done = true end)\n"
-        );
-        let _ = rpc
-            .request(
-                "nvim_exec_lua",
-                vec![rmpv::Value::from(wrapped), rmpv::Value::Array(vec![])],
-            )
-            .await;
+        // Run CODE via the bootstrap chunk (see [`oneshot_bootstrap`]): it compiles
+        // CODE Lua-side, reports a load failure back as a string value, and otherwise
+        // starts the async evaluation that sets the completion globals when it
+        // settles. If CODE calls `nx._reexec`, the process is replaced before the
+        // globals are ever read. A load failure is fatal — surfaced with the Lua error
+        // and a non-zero exit, never swallowed into a 30-second poll of a flag the
+        // chunk never got to set.
+        match oneshot_exec(&rpc, &oneshot_bootstrap(&code)).await? {
+            rmpv::Value::Boolean(true) => {}
+            rmpv::Value::String(err) => bail!(
+                "--lua CODE failed to load: {}",
+                err.as_str().unwrap_or("Lua error")
+            ),
+            other => bail!("--lua: the bootstrap chunk failed unexpectedly (got {other})"),
+        }
 
-        // Poll the flag until the chunk settles (each request pumps a server tick, so the
-        // async work — fs reads, the reexec — makes progress), bounded so a hung chunk
-        // can't wedge a shell. Returning exits the process (dropping the server thread).
-        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        // Poll until the chunk settles (each request pumps a server tick, so the async
+        // work — fs reads, the reexec — makes progress), bounded so a hung chunk can't
+        // wedge a shell. One request reads both globals: `nil` while pending, `true` on
+        // success, the rejection string on failure. Returning exits the process
+        // (dropping the server thread); an error exits non-zero via `main`'s `Result`.
+        const SETTLE_TIMEOUT: Duration = Duration::from_secs(30);
+        let deadline = std::time::Instant::now() + SETTLE_TIMEOUT;
         loop {
-            let done = rpc
-                .request(
-                    "nvim_exec_lua",
-                    vec![
-                        rmpv::Value::from("return _G.__nxvim_oneshot_done == true"),
-                        rmpv::Value::Array(vec![]),
-                    ],
-                )
-                .await;
-            if matches!(done, Ok(rmpv::Value::Boolean(true))) || std::time::Instant::now() > deadline
-            {
-                break;
+            let done = oneshot_exec(
+                &rpc,
+                "if _G.__nxvim_oneshot_done then return _G.__nxvim_oneshot_err or true end",
+            )
+            .await
+            .map_err(|e| anyhow!("--lua: the embedded server went away: {e}"))?;
+            match done {
+                rmpv::Value::Boolean(true) => return Ok(()),
+                rmpv::Value::String(err) => {
+                    bail!("--lua: {}", err.as_str().unwrap_or("Lua error"))
+                }
+                _ => {}
+            }
+            if std::time::Instant::now() > deadline {
+                bail!("--lua CODE did not settle within {SETTLE_TIMEOUT:?} (a stuck await?)");
             }
             tokio::time::sleep(Duration::from_millis(15)).await;
         }
-        Ok(())
     })
 }
 
@@ -345,8 +424,10 @@ struct Cli {
     #[arg(long, value_name = "NS")]
     shada_namespace: Option<String>,
 
-    /// Restore the saved window/tab layout at startup (requires --shada-namespace)
-    #[arg(long, requires = "shada_namespace")]
+    /// Restore the saved window/tab layout at startup (requires --shada-namespace or
+    /// --workspace, which derives a namespace from the directory; validated in `main`,
+    /// since clap's `requires` cannot express the either/or)
+    #[arg(long)]
     restore_session: bool,
 
     /// Run a Lua chunk after sourcing config, then exit (no UI) — for workspace wrapper scripts
@@ -380,6 +461,14 @@ fn main() -> Result<()> {
     // clap parses, validates, and exits with usage/version itself for `--help`/`-h`,
     // `--version`/`-V`, unknown options, and conflicting roles.
     let cli = Cli::parse();
+
+    // `--restore-session` needs a shada namespace to restore *from*: an explicit
+    // `--shada-namespace`, or the one a `--workspace` launch derives from its directory.
+    // clap's `requires` can't express the either/or, so validate it here — loudly, in
+    // every role, rather than silently never restoring.
+    if cli.restore_session && cli.shada_namespace.is_none() && cli.workspace.is_none() {
+        bail!("--restore-session requires --shada-namespace or --workspace");
+    }
 
     // The first `nxvim://…` positional is the QUIC connect target; the first other
     // positional is the file (or, for --test-plugin, the plugin dir).
@@ -453,7 +542,11 @@ fn main() -> Result<()> {
     // no UI. A workspace wrapper uses it to read its config and relaunch with the right
     // `--shada-namespace`; see `nx.reexec`.
     if let Some(code) = cli.lua.clone() {
-        return run_lua_oneshot(code, &shada);
+        return run_lua_oneshot(
+            code,
+            &shada,
+            cli.workspace.is_some() && !cli.workspace_no_cwd,
+        );
     }
 
     // Which config (+ shada) a daemon session runs: the local machine's by default, or
@@ -571,9 +664,9 @@ fn main() -> Result<()> {
             .enable_time()
             .build()
             .expect("failed to build server runtime");
-        if let Err(err) = runtime.block_on(run_server(server_end, init)) {
-            eprintln!("nxvim: server error: {err}");
-        }
+        runtime
+            .block_on(run_server(server_end, init))
+            .map_err(|err| anyhow!("server error: {err}"))
     });
 
     // The client (terminal UI) runs on the main thread; when it exits the dropped
@@ -584,28 +677,36 @@ fn main() -> Result<()> {
 
 /// Run the terminal UI client on the main thread until it exits, then join the
 /// server thread. When the client exits, the dropped `client_end` stream signals
-/// the server to wind down. A server-thread *panic* is surfaced as a non-zero exit
-/// (101, Rust's conventional panic code) with a diagnostic — taking precedence over
-/// a clean client `result`, since a crashed server is the more important failure.
-/// (The old `let _ = join()` discarded the payload, so a crash exited 0 and looked
-/// exactly like a clean `:q`.) Shared by the default and edit-host roles.
+/// the server to wind down. A server-thread failure is surfaced as a non-zero exit,
+/// taking precedence over a clean client `result`, since a crashed server is the
+/// more important failure: a *panic* exits 101 (Rust's conventional panic code), an
+/// `Err` return (a failed daemon connect, an edit-host setup error) exits 1 with the
+/// message on stderr. (The old code discarded both — a panic *or* error exited 0 and
+/// looked exactly like a clean `:q`.) Both checks run after the TUI has restored the
+/// terminal. Shared by the default and edit-host roles.
 fn drive_tui_and_join(
     client_end: tokio::io::DuplexStream,
-    server_thread: std::thread::JoinHandle<()>,
+    server_thread: std::thread::JoinHandle<Result<()>>,
 ) -> Result<()> {
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_time()
         .build()?;
     let result = runtime.block_on(nxvim_tui::run(client_end));
 
-    if let Err(payload) = server_thread.join() {
-        eprintln!(
-            "nxvim: server thread panicked: {}",
-            panic_message(payload.as_ref())
-        );
-        std::process::exit(101);
+    match server_thread.join() {
+        Err(payload) => {
+            eprintln!(
+                "nxvim: server thread panicked: {}",
+                panic_message(payload.as_ref())
+            );
+            std::process::exit(101);
+        }
+        Ok(Err(err)) => {
+            eprintln!("nxvim: {err:#}");
+            std::process::exit(1);
+        }
+        Ok(Ok(())) => result,
     }
-    result
 }
 
 /// Run the daemon (`--daemon`) over this process's stdin/stdout until the edit-host
@@ -876,9 +977,9 @@ where
             // `_guard` (the stdio child, or `()` for QUIC) lives until the editor quits.
             run_server(server_end, init).await
         });
-        if let Err(err) = result {
-            eprintln!("nxvim: edit-host error: {err}");
-        }
+        // Surfaced (message + non-zero exit) by `drive_tui_and_join` after the TUI
+        // has wound down and restored the terminal.
+        result.map_err(|err| anyhow!("edit-host error: {err}"))
     });
 
     // The client (terminal UI) runs on the main thread, exactly as the default role.

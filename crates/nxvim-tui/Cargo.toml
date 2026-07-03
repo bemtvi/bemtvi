@@ -21,3 +21,8 @@ image.workspace = true
 unicode-width.workspace = true
 nxvim-rpc.workspace = true
 nxvim-view.workspace = true
+
+# `poll(2)` on stdin for the graphics-protocol probe in `images.rs` — waiting for
+# a query reply without consuming (or leaking a reader on) stdin is unix-specific.
+[target.'cfg(unix)'.dependencies]
+libc.workspace = true

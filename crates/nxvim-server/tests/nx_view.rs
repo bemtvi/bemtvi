@@ -161,6 +161,66 @@ async fn nx_open_default_opens_in_the_current_window() {
     );
 }
 
+/// `nx.open` is `:edit`-like: it opens in the current window even when another
+/// window already shows the file — it must NOT borrow the picker's switchbuf
+/// behavior and jump focus to that other window. (Regression: the picker's
+/// switchbuf bridge was registered under the same `nx._open` key, shadowing this
+/// documented semantic.)
+#[tokio::test]
+async fn nx_open_edits_in_place_when_the_file_is_visible_elsewhere() {
+    let (rpc, _incoming) = start().await;
+    let file = write_temp("nxopen_inplace", "txt", "shared-file\n");
+
+    // Window A shows the file; split off window B (focused) holding a fresh buffer.
+    exec_lua(&rpc, &format!("nx.open({:?})", file)).await;
+    feed_sync(&rpc, ":vsplit<CR>:enew<CR>").await;
+    assert_eq!(
+        lines(&rpc).await,
+        vec![""],
+        "focused window holds a scratch"
+    );
+
+    // `:edit`-like: the focused window itself now shows the file …
+    exec_lua(&rpc, &format!("nx.open({:?})", file)).await;
+    assert_eq!(lines(&rpc).await, vec!["shared-file"]);
+    // … so BOTH windows show it (switchbuf would instead have jumped away and
+    // left the scratch window empty).
+    feed_sync(&rpc, "<C-w>w").await;
+    assert_eq!(
+        lines(&rpc).await,
+        vec!["shared-file"],
+        "the other window still shows the file: nx.open edited in place, not switchbuf-jumped"
+    );
+}
+
+/// `nx.open` with an opts table that does NOT say `where = "main"` opens in the
+/// current window — a truthy-but-wrong opts value must not cross to main.
+/// (Regression: the shadowing `Option<bool>` bridge coerced ANY table to `true`.)
+#[tokio::test]
+async fn nx_open_with_non_main_opts_stays_in_the_current_window() {
+    let (rpc, _incoming) = start().await;
+    let file = write_temp("nxopen_opts", "txt", "in-the-dock\n");
+
+    feed_sync(&rpc, "imain<Esc>").await;
+    exec_lua(&rpc, "nx.dock.open{ side = 'left', size = 20 }").await;
+    // An opts table without `where = "main"` — must open inside the focused dock.
+    exec_lua(&rpc, &format!("nx.open({:?}, {{}})", file)).await;
+    // The main area still shows its own buffer (the file did NOT land there) …
+    exec_lua(&rpc, "nx.layer.main()").await;
+    assert_eq!(
+        lines(&rpc).await,
+        vec!["main"],
+        "an opts table without where='main' must not cross to the main area"
+    );
+    // … and the dock is where the file opened.
+    exec_lua(&rpc, "nx.layer.focus('left')").await;
+    assert_eq!(
+        lines(&rpc).await,
+        vec!["in-the-dock"],
+        "the file opened in the current (dock) window"
+    );
+}
+
 /// `nx.layer.main()` / `nx.layer.focus(side)` round-trip focus between the main
 /// area and a dock.
 #[tokio::test]

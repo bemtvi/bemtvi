@@ -1769,9 +1769,14 @@ pub(crate) fn install_runtime_api(
             },
         )?,
     )?;
+    // The picker's location-less file open, honoring 'switchbuf'. Deliberately NOT
+    // `_open` — that key is the `nx.open(path, { where })` bridge (`LayerOp::Open`,
+    // installed by `install_vim`), and registering this one under the same name
+    // shadowed it: `nx.open`'s opts table coerced to `to_main = true` (any table is
+    // truthy) and every plain `nx.open` silently gained switchbuf jumps.
     let sh = shared.clone();
     nx.set(
-        "_open",
+        "_open_switchbuf",
         lua.create_function(move |_, (path, to_main): (String, Option<bool>)| {
             sh.borrow_mut().window_ops.push(WindowOp::OpenSwitchbuf {
                 path,

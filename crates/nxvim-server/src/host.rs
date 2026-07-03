@@ -283,16 +283,19 @@ async fn stream_local_process(
     use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
 
     // Collect stderr concurrently in a detached task so a child that writes a lot
-    // of stderr can't deadlock against the stdout reader (both pipes full).
-    let stderr_buf = std::sync::Arc::new(tokio::sync::Mutex::new(Vec::new()));
-    if let Some(mut err) = child.stderr.take() {
-        let sink = stderr_buf.clone();
+    // of stderr can't deadlock against the stdout reader (both pipes full). The
+    // task is **awaited** on a natural exit (below) so the exit result carries the
+    // whole stderr — reading a shared buffer at exit time instead would race the
+    // collector's own EOF and racily lose some or all of it (`child.wait()` and the
+    // collector's final read both wake on the same process exit). `nx.run`'s
+    // non-streaming path (`wait_with_output`) waits for pipe EOF the same way.
+    let stderr_task = child.stderr.take().map(|mut err| {
         tokio::spawn(async move {
             let mut buf = Vec::new();
             let _ = err.read_to_end(&mut buf).await;
-            *sink.lock().await = buf;
-        });
-    }
+            buf
+        })
+    });
 
     // Stream stdout in batches: each newline-terminated line is pushed, and the
     // accumulated batch is flushed whenever a read yields (natural OS-read
@@ -328,10 +331,24 @@ async fn stream_local_process(
     } else {
         tokio::select! {
             status = child.wait() => status.ok().and_then(|s| s.code()).unwrap_or(-1),
-            _ = &mut kill_rx => -1,
+            _ = &mut kill_rx => {
+                killed = true;
+                -1
+            }
         }
     };
-    let stderr = std::mem::take(&mut *stderr_buf.lock().await);
+    let stderr = match stderr_task {
+        // Natural exit: wait for stderr EOF (every writer closed the pipe), so the
+        // exit result carries the whole stream — `wait_with_output` parity.
+        Some(handle) if !killed => handle.await.unwrap_or_default(),
+        // Killed: don't block the exit on a pipe a grandchild may hold open; a
+        // kill's stderr is best-effort (and was racy-empty before).
+        Some(handle) => {
+            handle.abort();
+            Vec::new()
+        }
+        None => Vec::new(),
+    };
     events.exited(code, Vec::new(), stderr);
 }
 

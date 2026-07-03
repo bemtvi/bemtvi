@@ -344,29 +344,21 @@ fn a_server_thread_panic_exits_nonzero() {
 
 #[test]
 #[ignore = "PTY/terminal e2e; needs a real controlling terminal. Run with --ignored. See module header."]
-fn ts_worker_flag_past_argv1_still_opens_the_editor() {
-    // R10: the worker flag must only be honored as argv[1] (how the server
-    // spawns the worker). Passed as a later positional — e.g. a file literally
-    // named `--__ts-worker` — it must NOT silently turn the editor into a
-    // headless worker (which renders nothing and reads stdin as RPC).
-    let path = std::env::temp_dir().join(format!("nxvim_e2e_r10_{}.txt", std::process::id()));
-    std::fs::write(&path, "gamma\ndelta\n").unwrap();
-
-    // argv: [nxvim, <file>, --__ts-worker]. argv[1] is the real file, so the
-    // editor opens it; the trailing flag is just an extra positional.
-    let mut s = Session::spawn(&[path.to_str().unwrap(), "--__ts-worker"], 80, 24);
-    let ok = s.wait_until(Duration::from_secs(5), |scr| {
-        let t = scr.contents();
-        t.contains("gamma") && t.contains("delta")
-    });
+fn an_edit_host_connect_failure_exits_nonzero() {
+    // A server-thread *error* (not just a panic) must surface as a non-zero exit.
+    // The cheapest real trigger: a `nxvim://…` connect target with a malformed cert
+    // hash — `connect_quic_reconnecting` fails immediately, the server thread returns
+    // `Err`, and the process must not report success to the shell (the old code
+    // printed "edit-host error" to stderr and then exited 0, indistinguishable from
+    // a clean `:q` in scripts).
+    let mut s = Session::spawn(&["nxvim://127.0.0.1:1/tok?cert=zz"], 80, 24);
+    let status = s
+        .wait_exit(Duration::from_secs(15))
+        .expect("nxvim should exit promptly when the daemon connect fails");
     assert!(
-        ok,
-        "the editor should have opened the file, not run as a worker:\n{}",
-        s.screen_text()
+        !status.success(),
+        "an edit-host connect failure must not exit 0"
     );
-
-    s.send(b":q!\r");
-    std::fs::remove_file(&path).ok();
 }
 
 #[test]

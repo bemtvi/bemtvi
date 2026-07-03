@@ -640,6 +640,12 @@ function nx.str.split(s, sep, opts)
       parts[#parts + 1] = string.sub(s, pos)
       break
     end
+    -- A zero-width separator match that doesn't advance the scan (`to < pos`,
+    -- e.g. the pattern "x*" matching empty) would spin this loop forever; fail
+    -- loud instead, exactly like neovim's gsplit ("Infinite loop detected").
+    if to < pos then
+      error("vim.split: separator pattern matched an empty string (would loop forever)", 2)
+    end
     parts[#parts + 1] = string.sub(s, pos, from - 1)
     pos = to + 1
   end
@@ -647,8 +653,18 @@ function nx.str.split(s, sep, opts)
     while #parts > 0 and parts[#parts] == "" do
       parts[#parts] = nil
     end
-    while #parts > 0 and parts[1] == "" do
-      table.remove(parts, 1)
+    -- Drop leading empties with one shift (table.remove(parts, 1) per empty
+    -- re-shifts the whole array each time — O(n²) on many leading separators).
+    local first = 1
+    while parts[first] == "" do
+      first = first + 1
+    end
+    if first > 1 then
+      local n = #parts
+      table.move(parts, first, n, 1)
+      for i = n - first + 2, n do
+        parts[i] = nil
+      end
     end
   end
   return parts

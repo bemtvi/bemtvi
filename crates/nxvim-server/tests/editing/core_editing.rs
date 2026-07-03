@@ -907,3 +907,91 @@ async fn help_without_the_plugin_points_at_it() {
         "help must not disturb the buffer"
     );
 }
+
+// ===== inclusive motions never swallow a line break ==========================
+// vim's rule: a charwise inclusive motion whose end sits where no character
+// exists (`$`/`g$` on an empty line, `e` stopped at the buffer's final newline)
+// has nothing to include — the line break is never part of the range. Verified
+// against nvim: `d$`/`y$` on an empty line are no-ops, `c$`/`cl`/`cw` there
+// still enter Insert without joining, `de`/`ye` at the buffer end act on the
+// word alone.
+
+#[tokio::test]
+async fn d_dollar_on_an_empty_line_is_a_noop() {
+    let (rpc, _incoming) = start(None).await;
+    feed(&rpc, "ia<CR><CR>b<Esc>");
+    feed(&rpc, "2ggd$");
+    assert_eq!(
+        lines(&rpc).await,
+        vec!["a", "", "b"],
+        "d$ on an empty line must not delete the line break"
+    );
+}
+
+#[tokio::test]
+async fn y_dollar_on_an_empty_line_yanks_nothing() {
+    let (rpc, _incoming) = start(None).await;
+    feed(&rpc, "ia<CR><CR>b<Esc>");
+    feed(&rpc, "2ggy$p");
+    assert_eq!(
+        lines(&rpc).await,
+        vec!["a", "", "b"],
+        "y$ on an empty line yanks nothing, so p pastes nothing"
+    );
+}
+
+#[tokio::test]
+async fn c_dollar_on_an_empty_line_enters_insert_without_joining() {
+    let (rpc, _incoming) = start(None).await;
+    feed(&rpc, "ia<CR><CR>b<Esc>");
+    feed(&rpc, "2ggc$XY<Esc>");
+    assert_eq!(lines(&rpc).await, vec!["a", "XY", "b"]);
+}
+
+#[tokio::test]
+async fn c_l_on_an_empty_line_enters_insert() {
+    let (rpc, _incoming) = start(None).await;
+    feed(&rpc, "ia<CR><CR>b<Esc>");
+    feed(&rpc, "2ggclXY<Esc>");
+    assert_eq!(lines(&rpc).await, vec!["a", "XY", "b"]);
+}
+
+#[tokio::test]
+async fn c_w_on_an_empty_line_enters_insert_without_joining() {
+    let (rpc, _incoming) = start(None).await;
+    feed(&rpc, "ia<CR><CR>b<Esc>");
+    feed(&rpc, "2ggcwXY<Esc>");
+    assert_eq!(lines(&rpc).await, vec!["a", "XY", "b"]);
+}
+
+#[tokio::test]
+async fn de_at_the_buffer_end_deletes_the_word_not_the_line_break() {
+    // `e` from the buffer's last word stops at the final newline; the inclusive
+    // delete takes the word but never the line break (vim leaves the empty line).
+    let (rpc, _incoming) = start(None).await;
+    feed(&rpc, "ia<CR><CR>b<Esc>");
+    feed(&rpc, "Gde");
+    assert_eq!(lines(&rpc).await, vec!["a", "", ""]);
+}
+
+#[tokio::test]
+async fn ye_at_the_buffer_end_yanks_without_the_line_break() {
+    let (rpc, _incoming) = start(None).await;
+    feed(&rpc, "ia<CR><CR>b<Esc>");
+    feed(&rpc, "GyeP");
+    assert_eq!(
+        lines(&rpc).await,
+        vec!["a", "", "bb"],
+        "ye yanks the bare word (charwise, no newline), so P doubles it in place"
+    );
+}
+
+#[tokio::test]
+async fn visual_d_on_an_empty_line_deletes_the_line_break() {
+    // The visual selection on an empty line *does* cover the line break (vim:
+    // `vd` there joins) — unlike the operator-motion `d$`, which must not.
+    let (rpc, _incoming) = start(None).await;
+    feed(&rpc, "ia<CR><CR>b<Esc>");
+    feed(&rpc, "2ggvd");
+    assert_eq!(lines(&rpc).await, vec!["a", "b"]);
+}

@@ -736,10 +736,11 @@ impl HostEffects for WasmEffects {
     }
 
     fn lsp_shutdown(&mut self, key: ServerKey) {
-        // Cleanly stop the server in the sync client (the framed `shutdown`/`exit` drain to
-        // the Sink as `lsp_stdin` for the Worker). The reconnect resync that uses this is
-        // native-only today (the web link stays one-shot until Phase 7), so this is wired for
-        // signature parity — harmless if never called on web.
+        // Cleanly stop the server in the sync client (the framed `exit` + the `Kill` drain to
+        // the Sink as `lsp_stdin`/`lsp_kill` for the Worker). Driven on web by the reconnect
+        // resync (Phase 7: `eh_daemon_status` → `resync_lsp_after_reconnect`), which retires
+        // the pre-drop wire id before `lsp_ensure` re-spawns against the fresh link — the
+        // old id's ops land on the new daemon as harmless unknown-id no-ops.
         self.lsp.shutdown(key);
         self.flush_lsp_wire();
     }

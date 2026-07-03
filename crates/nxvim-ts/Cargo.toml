@@ -22,3 +22,10 @@ flate2.workspace = true
 xz2.workspace = true
 zip.workspace = true
 sha2.workspace = true
+
+[dev-dependencies]
+# Grammar fixtures for the hermetic engine tests (`tests/fixture/`): the crates'
+# registry sources provide the C parser to compile and the bundled queries — no
+# network, no `:TSInstall` (the same pattern as `crates/nxvim/tests/syntax.rs`).
+tree-sitter-rust.workspace = true
+tree-sitter-md.workspace = true

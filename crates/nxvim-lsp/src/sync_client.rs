@@ -250,6 +250,7 @@ impl SyncLspClient {
         if let Some(state) = self.servers.remove(&key) {
             self.by_id.remove(&state.id);
             self.wire.push(WireOp::Kill { id: state.id });
+            self.fail_pending(&key, state, "language server shut down");
         }
     }
 
@@ -284,7 +285,9 @@ impl SyncLspClient {
         let Some(key) = self.by_id.remove(&id) else {
             return;
         };
-        self.servers.remove(&key);
+        if let Some(state) = self.servers.remove(&key) {
+            self.fail_pending(&key, state, "language server exited");
+        }
         self.events.push(LspEvent::ServerExited {
             key,
             message: "language server exited".to_string(),
@@ -413,6 +416,11 @@ impl SyncLspClient {
                 Err(e) => {
                     if let Some(state) = self.servers.remove(key) {
                         self.by_id.remove(&state.id);
+                        // The child is alive (it *answered* `initialize`, however
+                        // malformed) — kill it, or the daemon holds a zombie
+                        // server no one will ever talk to again.
+                        self.wire.push(WireOp::Kill { id: state.id });
+                        self.fail_pending(key, state, "initialize failed");
                     }
                     self.events.push(LspEvent::ServerExited {
                         key: key.clone(),
@@ -444,6 +452,40 @@ impl SyncLspClient {
             state.phase = Phase::Ready;
         }
         self.flush_queued(key);
+    }
+
+    /// Resolve every in-flight (and still-queued) request of a dying/removed server
+    /// with the degraded reply its native twin produces when a socket dies
+    /// mid-request (the detached `issue_request` gets an `Err`, distilled to the
+    /// uniform empty case) — so no [`ReqToken`] is ever dropped on the floor: a
+    /// typed reply clears its feature's pending state, and a generic
+    /// `client:request` fires its Lua handler with the error rather than leaking
+    /// the deferred callback forever.
+    fn fail_pending(&mut self, key: &ServerKey, state: ServerState, reason: &str) {
+        let failed = |kind: ReqKind| match kind {
+            // `distill` leaves `Raw` to the caller (it needs the error string).
+            ReqKind::Raw => LspReply::Raw(Err(reason.to_string())),
+            kind => distill(kind, Err(reason.to_string())),
+        };
+        for pending in state.pending.into_values() {
+            if let Pending::Feature(token, kind) = pending {
+                self.events.push(LspEvent::Reply {
+                    key: key.clone(),
+                    token,
+                    reply: failed(kind),
+                });
+            }
+        }
+        for ob in state.queued {
+            if let Outbound::Request(token, req) = ob {
+                let (_, _, kind) = request_wire(req);
+                self.events.push(LspEvent::Reply {
+                    key: key.clone(),
+                    token,
+                    reply: failed(kind),
+                });
+            }
+        }
     }
 
     fn flush_queued(&mut self, key: &ServerKey) {
@@ -839,21 +881,26 @@ const MAX_HEADER_LEN: usize = 64 * 1024;
 /// drops the buffer rather than growing without bound.
 fn parse_frames(inbuf: &mut Vec<u8>) -> Vec<Value> {
     let mut out = Vec::new();
+    // Walk a cursor over the buffer and drain everything consumed *once* at the
+    // end — a per-frame `drain` would shift the whole remaining buffer for every
+    // frame (quadratic over a chunk that carries many messages).
+    let mut pos = 0usize;
     loop {
-        let Some(hdr_end) = find_subsequence(inbuf, b"\r\n\r\n") else {
+        let tail = &inbuf[pos..];
+        let Some(hdr_end) = find_subsequence(tail, b"\r\n\r\n") else {
             // No complete header block buffered. Real headers are tiny, so an
             // un-terminated run past the cap is corrupt/hostile input (or the
             // headerless remnant of an over-long frame skipped below): drop it so
             // `inbuf` can't grow without bound waiting on a terminator. A genuine
             // partial header well under the cap stays buffered for the next chunk.
-            if inbuf.len() > MAX_HEADER_LEN {
-                inbuf.clear();
+            if tail.len() > MAX_HEADER_LEN {
+                pos = inbuf.len();
             }
             break;
         };
-        let body_start = hdr_end + 4;
-        let Some(len) = parse_content_length(&inbuf[..hdr_end]) else {
-            inbuf.drain(..body_start); // skip the unparseable header, keep going
+        let body_start = pos + hdr_end + 4;
+        let Some(len) = parse_content_length(&tail[..hdr_end]) else {
+            pos = body_start; // skip the unparseable header, keep going
             continue;
         };
         // An over-long frame is a protocol error: never grow `inbuf` to hold it.
@@ -861,20 +908,20 @@ fn parse_frames(inbuf: &mut Vec<u8>) -> Vec<Value> {
         // it fails the header search above and is dropped by the [`MAX_HEADER_LEN`]
         // guard rather than wedging the stream on a length we refuse to honor.
         if len > MAX_FRAME_LEN {
-            inbuf.drain(..body_start);
+            pos = body_start;
             continue;
         }
         let body_end = body_start + len;
         if inbuf.len() < body_end {
             break; // body not fully arrived yet (bounded by MAX_FRAME_LEN)
         }
-        // Parse straight from the buffer slice (no intermediate copy), then drain
-        // the consumed frame once the borrow ends.
+        // Parse straight from the buffer slice (no intermediate copy).
         if let Ok(v) = serde_json::from_slice::<Value>(&inbuf[body_start..body_end]) {
             out.push(v);
         }
-        inbuf.drain(..body_end);
+        pos = body_end;
     }
+    inbuf.drain(..pos);
     out
 }
 

@@ -241,6 +241,11 @@ impl Editor {
     /// space — so it returns an inclusive end-of-word target instead.
     fn word_motion(&self, count: usize) -> MotionResult {
         let mut idx = self.cursor_char();
+        // `cw` on an empty line changes nothing — vim empties the motion (the
+        // line break is never swallowed) but still enters Insert mode.
+        if self.pending.operator == Some('c') && self.line_len() == 0 {
+            return MotionResult::exclusive(idx);
+        }
         if self.pending.operator == Some('c')
             && idx <= self.last_char_idx()
             && char_class(self.char_at(idx)) != CharClass::Blank

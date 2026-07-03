@@ -842,3 +842,20 @@ async fn search_from_visual_line_mode_stays_visual_line() {
     feed(&rpc, "d");
     assert_eq!(lines(&rpc).await, vec![""]);
 }
+
+#[tokio::test]
+async fn star_uses_vim_word_boundaries_under_vim_regexsyntax() {
+    // `*` builds a whole-word pattern in the dialect of the active engine: under
+    // `:set regexsyntax=vim` the boundaries must be spelled `\<`/`\>` — vim's
+    // magic dialect has no `\b` (it reads as a literal), so a PCRE-spelled
+    // pattern would match nothing and `*` would report E486 without moving.
+    let (rpc, _incoming) = start(None).await;
+    feed(&rpc, "ifoo<CR>foobar<CR>foo<Esc>gg0");
+    feed(&rpc, ":set regexsyntax=vim<CR>");
+    feed(&rpc, "*");
+    assert_eq!(
+        cursor(&rpc).await,
+        (3, 0),
+        "whole-word * skips 'foobar' and lands on the standalone 'foo'"
+    );
+}

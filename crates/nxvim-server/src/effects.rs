@@ -524,6 +524,7 @@ impl EditHost {
                 ViewOp::Unmount { id } => self.editor.unmount_view(id),
                 ViewOp::Focus { id } => self.editor.focus_view(id),
                 ViewOp::Destroy { id } => self.editor.destroy_view(id),
+                ViewOp::CollapseUnclaimed => self.editor.collapse_unclaimed_view_restores(),
             }
         }
         // `nx.panel` open / close — mount a scripted panel (a `nomodifiable` buffer in a

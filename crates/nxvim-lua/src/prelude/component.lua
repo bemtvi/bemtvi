@@ -424,12 +424,19 @@ local function register_component_restorer(ns, raw_namespace, id, adopt)
     nx._component_router_ns[ns] = true
     -- `raw_namespace` (the user's `opts.namespace`, possibly nil) resolves to `ns` exactly
     -- as create / shada did, so on_restore keys this router under the same ns core dispatches.
+    -- Registering the router also drains any slot already reserved for a component already in
+    -- `reg` (this one included) — the pull that lets a router registered LATE, from an async
+    -- plugin `config`, still claim its slots.
     nx.view.on_restore(function(rid, place)
       local fn = nx._component_restorers[ns] and nx._component_restorers[ns][rid]
       if fn then
         fn(place)
       end
     end, raw_namespace)
+  else
+    -- The router is already registered (an earlier component in this namespace drained it),
+    -- so `on_restore`'s drain won't re-run for this newly-added id — re-attempt just its slot.
+    nx._claim_pending_restore(ns, id)
   end
 end
 

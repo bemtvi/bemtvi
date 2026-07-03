@@ -622,6 +622,14 @@ pub(crate) fn install_vim(lua: &Lua, shared: &Rc<RefCell<Shared>>) -> mlua::Resu
             Ok(())
         })?,
     )?;
+    let sh = shared.clone();
+    view.set(
+        "_collapse_orphans",
+        lua.create_function(move |_, ()| {
+            sh.borrow_mut().view_ops.push(ViewOp::CollapseUnclaimed);
+            Ok(())
+        })?,
+    )?;
     nx.set("view", view)?;
 
     // `nx.terminal`: open a terminal job programmatically — the API twin of the

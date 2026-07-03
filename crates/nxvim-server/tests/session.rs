@@ -472,6 +472,215 @@ async fn session_collapses_a_persisted_view_with_no_handler() {
     }
 }
 
+/// Lua-escape a path for embedding in a double-quoted string literal.
+fn q(path: &Path) -> String {
+    path.to_string_lossy()
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"")
+}
+
+/// Write a throwaway plugin dir at `<base>` whose `lua/<name>/init.lua` exposes a `setup`
+/// that registers an `nx.view.on_restore` handler (rebuilding a persisted view from the
+/// plugin's own shada). Declared to `nx.plugins` with `name = <name>`, so the manager keys
+/// its namespace on `<name>` — matching the slot the first session recorded. Returns the dir.
+fn write_restore_plugin(base: &Path, name: &str) -> std::path::PathBuf {
+    let luadir = base.join("lua").join(name);
+    std::fs::create_dir_all(&luadir).unwrap();
+    std::fs::write(
+        luadir.join("init.lua"),
+        format!(
+            r#"local M = {{}}
+function M.setup()
+  nx.view.on_restore(function(id, place)
+    local data = nx.shada.plugin("{name}"):get("view:" .. id) or {{}}
+    local v = nx.view.create{{
+      name = "Tree", filetype = "nxview", persist = id, namespace = "{name}",
+    }}
+    v:set_lines(data)
+    nx._test_restored_view = v
+    place(v)
+  end)
+  _G.async_setup_ran = true
+end
+return M
+"#
+        ),
+    )
+    .unwrap();
+    base.to_path_buf()
+}
+
+/// Poll `code` (a `return`-style chunk) until it is `true` (~4s), driving a tick each round
+/// so the async plugin load settles. Returns whether it landed.
+async fn poll_true(rpc: &nxvim_rpc::Rpc, code: &str) -> bool {
+    for _ in 0..200 {
+        if exec_lua(rpc, code).await.as_bool() == Some(true) {
+            return true;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    false
+}
+
+#[tokio::test]
+async fn session_restores_a_persisted_view_when_the_owning_plugin_loads_async() {
+    // The async-load race: a plugin loaded via `nx.plugins({ config = ... })` registers its
+    // `nx.view.on_restore` handler on a LATER tick — its `config` runs in a fire-and-forget
+    // async load that only completes after the boot restore dispatch. The reserved slot must
+    // survive until that late registration claims it, instead of collapsing at boot (the bug:
+    // the slot was gone before the plugin ever got a chance to adopt it).
+    let dir = temp_dir("session_view_async_plugin_store");
+    let root = temp_dir("session_view_async_plugin_root").join("install");
+    let plugdir = write_restore_plugin(&temp_dir("session_view_async_plugin_dir"), "treens");
+
+    // Session 1: create + mount a persisted view (via the RPC escape hatch, ns "treens") in a
+    // left dock, stash its content in the plugin's own shada, quit.
+    {
+        let (rpc, incoming) = start_attached(init(&dir, None, true), 80, 25).await;
+        exec_lua(&rpc, "nx.shada.save_layout(true)").await;
+        exec_lua(
+            &rpc,
+            r#"
+            local lines = { "root", "  a.txt", "  b.txt" }
+            local v = nx.view.create{
+              name = "Tree", filetype = "nxview", persist = "main", namespace = "treens",
+            }
+            v:set_lines(lines)
+            v:mount{ dock = "left", size = 30 }
+            nx.shada.plugin("treens"):set("view:main", lines)
+            "#,
+        )
+        .await;
+        exec_lua(&rpc, "nx.layer.main()").await; // quit from main
+        feed(&rpc, ":qa<CR>");
+        await_server_exit(incoming).await;
+    }
+
+    // Session 2: the owning plugin is declared to `nx.plugins` and loads EAGERLY but
+    // asynchronously — its `config` (registering `on_restore`) runs after boot, so the fix's
+    // deferred collapse + pull-on-register are what let it claim the slot.
+    {
+        let mut si = init(&dir, None, true);
+        si.client_init_lua = Some(format!(
+            "nx.plugins.setup_manager({{ root = \"{root}\" }})\n\
+             nx.plugins {{ {{ name = \"treens\", dir = \"{plug}\",\n\
+               config = function() require(\"treens\").setup() end }} }}",
+            root = q(&root),
+            plug = q(&plugdir),
+        ));
+        let (rpc, _incoming) = start_attached(si, 80, 25).await;
+
+        // The async load must complete and its `on_restore` claim the reserved slot.
+        assert!(
+            poll_true(
+                &rpc,
+                "return _G.async_setup_ran == true and #nx.view.pending_restores() == 0",
+            )
+            .await,
+            "the async plugin loaded and its on_restore claimed the reserved slot"
+        );
+        assert_eq!(
+            restored_view_content(&rpc).await,
+            "root|  a.txt|  b.txt",
+            "the async plugin rebuilt the view's content from its own shada"
+        );
+        // The left dock came back (it shrinks the main window below full width).
+        let w = main_win_width(&rpc).await;
+        assert!(
+            w < 70,
+            "the restored view's left dock shrinks the main (got {w})"
+        );
+    }
+}
+
+/// Write a plugin dir whose `setup` mounts a persistent `nx.view.component` in a left dock —
+/// the framework path (no hand-written `on_restore`). Loaded via `nx.plugins`, its namespace
+/// is the manager `name`, so `ctx.store` and the reserved slot line up across sessions.
+fn write_component_plugin(base: &Path, name: &str) -> std::path::PathBuf {
+    let luadir = base.join("lua").join(name);
+    std::fs::create_dir_all(&luadir).unwrap();
+    std::fs::write(
+        luadir.join("init.lua"),
+        r#"local M = {}
+function M.setup()
+  local C = nx.view.component({
+    setup = function(ctx)
+      _G.cplug_buf = ctx.bufnr()
+      return ctx.reactive({ lines = ctx.store:get("view:" .. ctx.persist_id) or { "default" } })
+    end,
+    render = function(s) return { lines = s.lines } end,
+  })
+  C.mount({ persist = "notes", dock = "left", size = 30 })
+  _G.cplug_setup_ran = true
+end
+return M
+"#,
+    )
+    .unwrap();
+    base.to_path_buf()
+}
+
+#[tokio::test]
+async fn session_restores_a_persisted_component_when_the_owning_plugin_loads_async() {
+    // The framework path under an async load: a plugin loaded via `nx.plugins({ config = … })`
+    // mounts a persistent `nx.view.component` on a later tick. Its restore router registers
+    // (via `on_restore`) after the boot dispatch, so the reserved slot must survive and the
+    // router's pull-on-register must adopt it — rebuilding content from `ctx.store`.
+    let dir = temp_dir("session_component_async_store");
+    let root = temp_dir("session_component_async_root").join("install");
+    let plugdir = write_component_plugin(&temp_dir("session_component_async_dir"), "notes");
+
+    let decl = format!(
+        "nx.plugins.setup_manager({{ root = \"{root}\" }})\n\
+         nx.plugins {{ {{ name = \"notes\", dir = \"{plug}\",\n\
+           config = function() require(\"notes\").setup() end }} }}",
+        root = q(&root),
+        plug = q(&plugdir),
+    );
+
+    // Session 1: the plugin mounts fresh (default), then we seed its store and quit.
+    {
+        let mut si = init(&dir, None, true);
+        si.client_init_lua = Some(decl.clone());
+        let (rpc, incoming) = start_attached(si, 80, 25).await;
+        exec_lua(&rpc, "nx.shada.save_layout(true)").await;
+        assert!(
+            poll_true(&rpc, "return _G.cplug_setup_ran == true").await,
+            "the async plugin loaded and mounted its component fresh"
+        );
+        exec_lua(
+            &rpc,
+            r#"nx.shada.plugin("notes"):set("view:notes", { "r1", "r2" })"#,
+        )
+        .await;
+        feed(&rpc, ":qa<CR>");
+        await_server_exit(incoming).await;
+    }
+
+    // Session 2: the plugin loads async again; its component router adopts the reserved slot.
+    {
+        let mut si = init(&dir, None, true);
+        si.client_init_lua = Some(decl);
+        let (rpc, _incoming) = start_attached(si, 80, 25).await;
+        assert!(
+            poll_true(
+                &rpc,
+                r#"local b = _G.cplug_buf
+                   if not b then return false end
+                   return table.concat(nx.buf.lines(b, 0, -1, false), "|") == "r1|r2"
+                     and #nx.view.pending_restores() == 0"#,
+            )
+            .await,
+            "the async component adopted the reserved slot and rebuilt from ctx.store"
+        );
+        assert_eq!(
+            window_count(&rpc).await,
+            2,
+            "main + the restored component dock"
+        );
+    }
+}
+
 /// A persistent **component** (`nx.view.component` + `mount{ persist=}`) the framework
 /// drives end-to-end: it resolves the owner namespace once, threads it into the backing
 /// view + `ctx.store`, and on a restore its built-in router adopts the reserved slot and

@@ -462,13 +462,26 @@ local function activate_eager()
   for _, name in ipairs(M._order) do
     local spec = M._specs[name]
     if enabled(spec) and not spec.lazy and not M._loaded[name] then
+      -- Count this load as in flight for the persisted-view restore coordinator: an eager
+      -- plugin's `config` may register an `nx.view.on_restore` handler on a later tick, so a
+      -- reserved view slot it owns must not be reaped as an orphan until this load settles.
+      -- (Balanced by the `:finally` below, whichever way the load resolves.) See
+      -- `nx._maybe_collapse_view_restores`.
+      nx._view_restore_pending_loads = (nx._view_restore_pending_loads or 0) + 1
       nx.async(function()
         if spec.dir ~= nil or nx.await(nx.fs.exists(spec._dir)) then
           nx.await(M.load(name))
         end
-      end)():catch(function(err)
-        nx.notify(tostring(err and err.message or err), 4)
-      end)
+      end)()
+        :catch(function(err)
+          nx.notify(tostring(err and err.message or err), 4)
+        end)
+        :finally(function()
+          nx._view_restore_pending_loads = math.max(0, (nx._view_restore_pending_loads or 1) - 1)
+          if nx._maybe_collapse_view_restores then
+            nx._maybe_collapse_view_restores()
+          end
+        end)
     end
   end
 end

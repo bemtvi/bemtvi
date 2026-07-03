@@ -110,48 +110,119 @@ function nx.view.pending_restores()
   return nx._view_pending or {}
 end
 
+nx._view_restorers = nx._view_restorers or {} -- namespace -> fn
+-- Slots already handed to a handler this session, keyed "<ns>\0<id>", so the boot push
+-- dispatch and a late `on_restore` drain-now never adopt the same slot twice (core drops an
+-- adopted slot from the pending list, but the two dispatch paths can run within one tick,
+-- before the `nx._view_pending` mirror refreshes).
+nx._view_claimed = nx._view_claimed or {}
+
+-- Hand one pending restore entry `e` to handler `fn`. The slot is marked claimed only when
+-- the handler actually calls `place(view)` — a handler that declines this id (the component
+-- framework's per-namespace router is a no-op for ids it hasn't registered yet) or errors
+-- before placing leaves the slot UNCLAIMED, so a later attempt (a sibling component that
+-- mounts after the router's first drain, or a reloaded plugin) can still adopt it. The
+-- top-of-function guard makes a re-dispatch of an already-placed slot a no-op.
+local function dispatch_restore(e, fn)
+  local key = tostring(e.namespace) .. "\0" .. tostring(e.id)
+  if nx._view_claimed[key] then
+    return
+  end
+  local win = e.win
+  local ok, err = pcall(fn, e.id, function(view)
+    nx._view_claimed[key] = true
+    return view:place_in(win)
+  end)
+  if not ok then
+    nx.notify("nx.view.on_restore[" .. tostring(e.namespace) .. "] failed: " .. tostring(err), 4)
+  end
+end
+
 -- nx.view.on_restore(fn[, namespace]) — register THIS plugin's restorer for persisted
--- views. After a session restore, core reserves a slot (a placeholder window) for every
--- persisted view the plugin had open; once plugins have loaded, each reserved slot whose
--- owning namespace matches is dispatched to `fn(id, place)`:
+-- views, AND immediately claim any slot already reserved for it. After a session restore,
+-- core reserves a slot (a placeholder window) for every persisted view the plugin had open;
+-- each reserved slot whose owning namespace matches is dispatched to `fn(id, place)`:
 --   * `id` is the plugin-chosen persist string (the same one passed to `create{ persist=}`),
 --   * `place(view)` drops a freshly-created view into the reserved window.
 -- The plugin keyed its own `nx.shada.plugin()` store by `id`, so it reads its saved state
 -- back and rebuilds the view's content before calling `place`. The owning namespace is
 -- resolved from the caller's location; the optional `namespace` arg is the escape hatch for
 -- a no-attribution context (a bare `:lua` / RPC / test), the same contract as create's.
-nx._view_restorers = nx._view_restorers or {} -- namespace -> fn
+--
+-- Call it whenever the plugin has finished loading — it is safe to register LATE. A plugin
+-- loaded via `nx.plugins({ config = … })` runs its `config` (and this call) on a tick after
+-- the server's boot restore dispatch, so that pass never sees its handler; the drain-now loop
+-- below adopts the still-reserved slot at registration time instead. (Slots are reserved at
+-- `shada_load`, before any plugin code runs, so they are already present in the live
+-- `nx._view_pending` mirror whenever this is called.) Orphan slots are not reaped until every
+-- eager plugin load has settled (see `nx._maybe_collapse_view_restores`), so a late handler
+-- reliably gets its chance.
 function nx.view.on_restore(fn, namespace)
   if type(fn) ~= "function" then
     error("nx.view.on_restore: expected a function", 2)
   end
   local ns = nx._resolve_namespace(namespace, "nx.view.on_restore")
   nx._view_restorers[ns] = fn
+  for _, e in ipairs(nx._view_pending or {}) do
+    if e.namespace == ns then
+      dispatch_restore(e, fn)
+    end
+  end
   return fn
 end
 
--- nx._run_view_restores() — dispatch each pending restore to its namespace's registered
--- `on_restore` handler. Called by the server ONCE, after plugins are sourced (so handlers
--- exist) and after core has refreshed `nx._view_pending`. Each handler gets `(id, place)`
--- where `place(view)` adopts the reserved window via `nx.view._adopt`. A handler error is
--- surfaced, not fatal — its slot stays pending and core collapses it afterwards. Entries
--- whose namespace has no handler (the plugin is gone) are left for the same collapse.
+-- nx._claim_pending_restore(ns, id) — re-attempt the reserved slot for a SINGLE `(ns, id)`
+-- against `ns`'s registered handler. `on_restore`'s drain covers a namespace's slots at
+-- registration time, but the component framework registers one router per namespace and adds
+-- components to it incrementally: a component that mounts after the router's first drain needs
+-- its own slot re-attempted, which this does (idempotent via the claimed guard). A no-op when
+-- the namespace has no handler or the slot is gone / already adopted.
+function nx._claim_pending_restore(ns, id)
+  local fn = nx._view_restorers[ns]
+  if not fn then
+    return
+  end
+  for _, e in ipairs(nx._view_pending or {}) do
+    if e.namespace == ns and tostring(e.id) == tostring(id) then
+      dispatch_restore(e, fn)
+    end
+  end
+end
+
+-- nx._run_view_restores() — the BOOT push dispatch, run ONCE by the server after the config
+-- and boot-sourced plugins are in place (`restore_persisted_views`), with `nx._view_pending`
+-- freshly mirrored. Delivers each reserved slot to its namespace's already-registered handler
+-- (a synchronous `init.lua` / `pack/start` plugin — an async `nx.plugins` handler registers
+-- later and self-claims via `on_restore`'s drain-now). Then decides orphan collapse.
 function nx._run_view_restores()
   for _, e in ipairs(nx._view_pending or {}) do
     local fn = nx._view_restorers[e.namespace]
     if fn then
-      local win = e.win
-      local ok, err = pcall(fn, e.id, function(view)
-        return view:place_in(win)
-      end)
-      if not ok then
-        nx.notify(
-          "nx.view.on_restore[" .. tostring(e.namespace) .. "] failed: " .. tostring(err),
-          4
-        )
-      end
+      dispatch_restore(e, fn)
     end
   end
+  nx._view_restore_boot_ran = true
+  nx._maybe_collapse_view_restores()
+end
+
+-- Orphan collapse coordinator. A reserved slot no plugin adopts must eventually collapse (its
+-- placeholder window lingers empty otherwise), but only once no plugin can still claim it.
+-- Two facts gate that: the boot push dispatch has run (synchronous handlers had their turn —
+-- and it only runs when a restore actually reserved slots, so this also stays a no-op when
+-- there were none), and no eager `nx.plugins` load is in flight (an async `config` that would
+-- register a handler on a later tick). The plugin manager maintains the in-flight count in
+-- `nx._view_restore_pending_loads` and calls this as each load settles. When both hold,
+-- enqueue the collapse — harmless to call repeatedly, since core reaps the pending list once
+-- and any later call finds it empty.
+nx._view_restore_pending_loads = nx._view_restore_pending_loads or 0
+function nx._maybe_collapse_view_restores()
+  if not nx._view_restore_boot_ran then
+    return
+  end
+  if (nx._view_restore_pending_loads or 0) > 0 then
+    return
+  end
+  nx.view._collapse_orphans()
 end
 
 -- :set_lines(lines) — replace the view's content wholesale.

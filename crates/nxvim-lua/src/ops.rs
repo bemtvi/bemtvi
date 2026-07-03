@@ -159,6 +159,12 @@ pub enum ViewOp {
     Focus { id: u64 },
     /// `v:close()` — unmount view `id` and drop its backing buffer + registry entry.
     Destroy { id: u64 },
+    /// `nx.view._collapse_orphans()` — close every session-reserved restore slot no plugin
+    /// has adopted yet (each becomes an empty placeholder window otherwise). Enqueued by the
+    /// Lua restore coordinator once it is confident no more claims are coming (the boot
+    /// dispatch found no async plugin loads in flight, or the last such load just settled), so
+    /// an async-loaded plugin's `nx.view.on_restore` gets its chance before its slot is reaped.
+    CollapseUnclaimed,
 }
 
 /// A request to the transient bottom **panel** (`nx.panel`), queued by the `nx.panel.*`

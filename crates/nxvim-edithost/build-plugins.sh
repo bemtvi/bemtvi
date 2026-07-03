@@ -27,8 +27,8 @@ BUNDLE="$OUT/plugins-bundle.lua"
 # catppuccin colorscheme (the sole neovim-plugin surface). Keep pins in lock-step with the demo.
 PLUGINS=(
   "nxvim/nxvim-keys-helper	6a467c80a131d5325d13cc3e60d3eff403a7e13e"
-  "nxvim/nxvim-tree	eb1faff0705b0534c727de240f2c16531d434ddc"
-  "nxvim/nxvim-line	f8f4d3407a020515cbf1655abbf50eadeae7325d"
+  "nxvim/nxvim-tree	217af933d92b0cbf76bb9712566ffc67aa07a203"
+  "nxvim/nxvim-line	b4514e6c56ea75e956f016969d915a4da7c62f3a"
   "nxvim/nxvim-lspconfig	e9d13fff6915faecdccb425ffb0ca881c7b0fb8e"
   "nxvim/nxvim-diff	bc1d9fdebb478aee3de25ede3f0830feff556392"
   "nxvim/catppuccin-nxvim	865da97bb6cd07e6050130fdf757c944e1651d87"

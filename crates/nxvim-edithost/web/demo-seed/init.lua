@@ -16,7 +16,7 @@ require("catppuccin").load("mocha")
 -- which-key-style popup over the pending-key oracle.
 require("nxvim-keys-helper").setup({})
 
--- File-explorer sidebar — `<leader>e` / `:NxvimTree` toggle (setup installs both).
+-- File-explorer sidebar — `<leader>e` / `:Tree` toggle (setup installs both).
 require("nxvim-tree").setup({
   width = 32,
   open_on_start = true,

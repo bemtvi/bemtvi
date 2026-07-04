@@ -362,23 +362,37 @@ impl Editor {
 
     /// Unique words in the current buffer that fuzzy-match `prefix` are gathered
     /// here as raw candidates (the ranking + match spans are computed in
-    /// [`Editor::set_complete_menu`]). The partial word being typed (a candidate
-    /// equal to `prefix`) is excluded — it can't complete to itself. Capped at a
+    /// [`Editor::set_complete_menu`]). Two occurrences are excluded so a word never
+    /// completes to itself: the partial word being typed (a candidate equal to
+    /// `prefix`), and — crucially when completing in the *middle* of a word — the
+    /// exact word instance the cursor sits inside (e.g. the caret parked inside
+    /// `AN_EXAMPLE` must not be offered `AN_EXAMPLE`). Only that one instance is
+    /// skipped, keyed on its byte range, so a *distinct* occurrence of the same
+    /// spelling elsewhere in the buffer is still a valid suggestion. Capped at a
     /// generous bound so a pathological buffer can't stall the keystroke.
     fn buffer_candidates(&self, prefix: &str) -> Vec<String> {
         const MAX_CANDIDATES: usize = 5000;
+        // Absolute byte offset of the cursor: the word run that spans it is the one
+        // being typed, so its single occurrence is skipped below.
+        let cursor_byte = self.cursor_char();
         let mut seen: HashSet<String> = HashSet::new();
         let mut out: Vec<String> = Vec::new();
         'lines: for row in 0..self.buffer().line_count() {
             let s = self.buffer().line(row);
+            let line_off = self.buffer().line_start(row);
             let mut start = None;
+            let mut push = |st: usize, end: usize, out: &mut Vec<String>| -> bool {
+                // The word under the cursor is `[st, end]` with the caret anywhere in
+                // that inclusive range (end included: the caret at the word's end is
+                // still "inside" the word being typed).
+                let under_cursor = line_off + st <= cursor_byte && cursor_byte <= line_off + end;
+                !under_cursor && push_word(&s[st..end], prefix, &mut seen, out)
+            };
             for (i, c) in s.char_indices() {
                 match (is_word_char(c), start) {
                     (true, None) => start = Some(i),
                     (false, Some(st)) => {
-                        if push_word(&s[st..i], prefix, &mut seen, &mut out)
-                            && out.len() >= MAX_CANDIDATES
-                        {
+                        if push(st, i, &mut out) && out.len() >= MAX_CANDIDATES {
                             break 'lines;
                         }
                         start = None;
@@ -387,7 +401,7 @@ impl Editor {
                 }
             }
             if let Some(st) = start {
-                push_word(&s[st..], prefix, &mut seen, &mut out);
+                push(st, s.len(), &mut out);
             }
             if out.len() >= MAX_CANDIDATES {
                 break;

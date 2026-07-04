@@ -202,6 +202,56 @@ async fn buffer_completion_opens_then_accepts_without_touching_the_buffer_until_
     );
 }
 
+/// The word the cursor sits *inside* must never be offered as a completion of its own
+/// prefix. With a single `AN_EXAMPLE` on the line and the caret in the middle (after
+/// `AN_EX`), completing `AN_EX` must not suggest `AN_EXAMPLE` — that is the very word
+/// being typed. The only buffer word is the one under the cursor, so nothing opens.
+#[tokio::test]
+async fn does_not_suggest_the_word_under_the_cursor() {
+    let dir = temp_dir("complete_word_under_cursor");
+    let (rpc, mut incoming) = start(
+        &dir,
+        "nx.complete.setup { sources = { { 'buffer', min_chars = 2 } }, auto = false }",
+    )
+    .await;
+
+    // A single AN_EXAMPLE, caret parked in the middle (after AN_EX — 5 chars from end).
+    feed(&rpc, "iAN_EXAMPLE<Left><Left><Left><Left><Left>");
+    exec_lua(&rpc, "nx.complete.trigger()").await;
+    // The only buffer word is the one under the cursor: if a popup opens at all it must
+    // not offer AN_EXAMPLE (completing a word to itself).
+    if let Some(map) = poll_menu(&rpc, &mut incoming).await {
+        let menu = menu_of(&map);
+        assert!(
+            !menu_items(&menu).contains(&"AN_EXAMPLE".to_string()),
+            "the word under the cursor must not complete to itself, got {:?}",
+            menu_items(&menu)
+        );
+    }
+}
+
+/// A *distinct* occurrence of the same text elsewhere is still a valid suggestion —
+/// only the exact instance the cursor sits inside is excluded, not every word with
+/// that spelling. Two `AN_EXAMPLE`s: caret in the middle of the second still offers
+/// the first.
+#[tokio::test]
+async fn suggests_a_distinct_occurrence_of_the_word_under_the_cursor() {
+    let dir = temp_dir("complete_distinct_occurrence");
+    let (rpc, mut incoming) = start(
+        &dir,
+        "nx.complete.setup { sources = { { 'buffer', min_chars = 2 } }, auto = false }",
+    )
+    .await;
+
+    feed(
+        &rpc,
+        "iAN_EXAMPLE<CR>AN_EXAMPLE<Left><Left><Left><Left><Left>",
+    );
+    exec_lua(&rpc, "nx.complete.trigger()").await;
+    let menu = menu_of(&poll_menu(&rpc, &mut incoming).await.expect("popup opens"));
+    assert_eq!(menu_items(&menu), vec!["AN_EXAMPLE"]);
+}
+
 /// The completion trigger is a Lua keymap installed by `nx.complete.setup` (it is no
 /// longer a Rust native default). With `auto = false`, typing never opens the popup —
 /// only the default `<C-Space>` trigger key does. Pressing it opens the menu, proving

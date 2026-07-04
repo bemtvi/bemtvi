@@ -460,6 +460,16 @@ struct Cli {
 /// `workspace.library` at `$NXVIM_RUNTIME` and the Lua language server expands it.
 const RUNTIME_ENV: &str = "NXVIM_RUNTIME";
 
+/// The directory the extracted Lua runtime lives in, with no `DIR` override: an explicit
+/// `$NXVIM_RUNTIME` if the user (or a prior launch) exported one, else the standard
+/// `<data-dir>/nxvim/runtime` (matching `stdpath("data")`). Shared by `--extract-lua-runtime`
+/// and the startup export in `main`, so both agree on the default location.
+fn default_runtime_dir() -> PathBuf {
+    std::env::var_os(RUNTIME_ENV)
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(nxvim_lua::stdpath("data")).join("runtime"))
+}
+
 /// Handle `--extract-lua-runtime [DIR]`: write the embedded `nx.*`/`vim.*` prelude to a
 /// directory the Lua language server can index (`workspace.library`), then return.
 ///
@@ -471,10 +481,8 @@ const RUNTIME_ENV: &str = "NXVIM_RUNTIME";
 fn extract_lua_runtime(dir_arg: String) -> Result<()> {
     let dir = if !dir_arg.is_empty() {
         PathBuf::from(dir_arg)
-    } else if let Some(env) = std::env::var_os(RUNTIME_ENV) {
-        PathBuf::from(env)
     } else {
-        PathBuf::from(nxvim_lua::stdpath("data")).join("runtime")
+        default_runtime_dir()
     };
 
     let written = nxvim_lua::extract_prelude(&dir)
@@ -554,6 +562,16 @@ fn main() -> Result<()> {
         .map(String::as_str)
         .collect();
     std::env::set_var(ARGV_ENV, argv.join("\n"));
+
+    // Expose the Lua runtime dir in this process's environment (mirroring NXVIM_ARGV), so the
+    // editor's own Lua and every `nx.run` child — which inherit this env — can resolve
+    // `$NXVIM_RUNTIME` with no shell config. Set-if-absent: an explicit shell export, or a
+    // custom `--extract-lua-runtime DIR` location the user already exported, wins over the
+    // `<data-dir>/nxvim/runtime` default. Runs in every role that reaches here (the
+    // `--extract-lua-runtime` branch returned above and resolves its own destination).
+    if std::env::var_os(RUNTIME_ENV).is_none() {
+        std::env::set_var(RUNTIME_ENV, default_runtime_dir());
+    }
 
     // Plugin test runner role: no editor UI — boot an embedded server, drive the Lua
     // `nx.test` suite, and exit with the pass/fail code. The positional is the plugin

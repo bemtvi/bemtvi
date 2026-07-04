@@ -436,3 +436,55 @@ fn extract_lua_runtime_defaults_to_data_dir_and_prints_export() {
     let _ = std::fs::remove_dir_all(&cfg);
     let _ = std::fs::remove_dir_all(&data);
 }
+
+/// nxvim exposes `$NXVIM_RUNTIME` in its OWN process environment (mirroring `$NXVIM_ARGV`),
+/// so the editor's Lua — and every `nx.run` child, which inherits this process's env — sees
+/// the extracted-runtime dir without the user exporting anything. With the var unset at
+/// launch it defaults to `stdpath("data")/runtime` (driven here by `XDG_DATA_HOME`). We read
+/// it back through a `--lua` one-shot's `os.getenv`.
+#[test]
+fn nxvim_runtime_env_defaults_and_is_visible_to_lua() {
+    let cfg = fresh_dir("cfg");
+    let data = fresh_dir("xdg_data");
+    let mut cmd = nxvim(&cfg);
+    cmd.env_remove("NXVIM_RUNTIME");
+    cmd.env("XDG_DATA_HOME", &data);
+    cmd.arg("--lua")
+        .arg("print(os.getenv('NXVIM_RUNTIME') or 'NXVIM_RUNTIME_IS_NIL')");
+    let (status, stdout, stderr, _) = run_io(cmd, Duration::from_secs(45));
+    assert!(
+        status.success(),
+        "--lua reading $NXVIM_RUNTIME must exit 0: {status:?} (stderr: {stderr})"
+    );
+    let want = data.join("nxvim").join("runtime");
+    assert!(
+        stdout.contains(want.to_str().unwrap()),
+        "the editor must default $NXVIM_RUNTIME to <data-dir>/nxvim/runtime, got stdout: {stdout:?}"
+    );
+    let _ = std::fs::remove_dir_all(&cfg);
+    let _ = std::fs::remove_dir_all(&data);
+}
+
+/// The editor exposes `$NXVIM_RUNTIME` set-if-absent: an already-exported value (a user's
+/// shell export, or a custom `--extract-lua-runtime DIR` location) is respected verbatim,
+/// never clobbered by the default.
+#[test]
+fn nxvim_runtime_env_respects_existing_export() {
+    let cfg = fresh_dir("cfg");
+    let custom = fresh_dir("custom_rt");
+    let mut cmd = nxvim(&cfg);
+    cmd.env("NXVIM_RUNTIME", &custom);
+    cmd.arg("--lua")
+        .arg("print(os.getenv('NXVIM_RUNTIME') or 'NXVIM_RUNTIME_IS_NIL')");
+    let (status, stdout, stderr, _) = run_io(cmd, Duration::from_secs(45));
+    assert!(
+        status.success(),
+        "--lua reading $NXVIM_RUNTIME must exit 0: {status:?} (stderr: {stderr})"
+    );
+    assert!(
+        stdout.contains(custom.to_str().unwrap()),
+        "an exported $NXVIM_RUNTIME must be respected, got stdout: {stdout:?}"
+    );
+    let _ = std::fs::remove_dir_all(&cfg);
+    let _ = std::fs::remove_dir_all(&custom);
+}

@@ -1041,6 +1041,75 @@ async fn installing_via_the_manager_prompts_to_restart() {
     );
 }
 
+// The restart notice is a MODAL that GRABS focus — it sits above the manager in the
+// focus stack, so a single <Esc> dismisses the notice and returns to the manager,
+// rather than the manager's own <Esc> map eating the key and closing the manager
+// underneath a still-open notice. (Regression: the notice used to be a non-grabbing
+// content float, so the first <Esc> closed the manager and a second was needed for
+// the notice.)
+#[tokio::test]
+async fn restart_notice_grabs_focus_so_one_esc_dismisses_it() {
+    let (rpc, _i) = start().await;
+    let src = temp_dir("plug_restart_focus_src");
+    let repo = make_repo(&src, "phi");
+    setup_root(&rpc, "plug_restart_focus").await;
+
+    exec_lua(
+        &rpc,
+        &format!(
+            "nx.plugins {{ {{ \"file://{repo}\", name = \"phi\" }} }}",
+            repo = q(&repo)
+        ),
+    )
+    .await;
+    exec_lua(&rpc, "vim.cmd('Plugins')").await;
+
+    let mut ready = false;
+    for _ in 0..200 {
+        if lines(&rpc).await.join("\n").contains("I install") {
+            ready = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(ready, "the dashboard should render before we press I");
+    feed(&rpc, "I");
+
+    // Wait for the notice to appear as a real (grabbing) surface, with the manager
+    // still open beneath it.
+    assert!(
+        poll_true(
+            &rpc,
+            "local ui = nx.plugins.ui\n\
+             return ui._restart_instance ~= nil\n\
+               and ui._restart_instance._closed ~= true\n\
+               and ui._instance ~= nil and ui._instance._closed ~= true"
+        )
+        .await,
+        "the restart notice should mount as a grabbing modal above the open manager"
+    );
+
+    // A single <Esc> dismisses the notice — and leaves the manager open.
+    feed(&rpc, "<Esc>");
+    assert!(
+        poll_true(
+            &rpc,
+            "return nx.plugins.ui._restart_instance._closed == true"
+        )
+        .await,
+        "one <Esc> should dismiss the restart notice"
+    );
+    assert!(
+        poll_true(
+            &rpc,
+            "return nx.plugins.ui._instance ~= nil\n\
+               and nx.plugins.ui._instance._closed ~= true"
+        )
+        .await,
+        "dismissing the notice must NOT close the manager underneath it"
+    );
+}
+
 // `:PluginsWelcome` opens the welcome checklist ON DEMAND, ignoring the first-run
 // ask-once marker (and the "no plugins declared" gate), then installs + persists the
 // chosen set — the way to re-pick the recommended set after first-run is over.

@@ -257,6 +257,56 @@ function M.ui.welcome(recommended)
   end)
 end
 
+-- ----- the restart-required notice --------------------------------------------
+-- A small MODAL float shown after a manager install actually clones something (a
+-- fresh clone only loads cleanly from a clean startup, so we prompt to restart).
+-- It GRABS focus — unlike a plain content float — so it sits ABOVE the manager in
+-- the focus stack: <Esc>/<CR>/q dismiss the notice and return focus to the manager
+-- beneath it. A non-grabbing float instead leaves focus on the manager, whose own
+-- <Esc> map eats the key and closes the manager out from under the still-open
+-- notice (the user then needs a second <Esc> for the notice itself).
+local RESTART_HINT = "<Esc> dismiss"
+local Notice = nx.view.component({
+  setup = function(ctx, props)
+    local function close()
+      ctx.close()
+    end
+    ctx.keymap_set("n", "<Esc>", close, { desc = "Dismiss" })
+    ctx.keymap_set("n", "<CR>", close, { desc = "Dismiss" })
+    ctx.keymap_set("n", "q", close, { desc = "Dismiss" })
+    -- Inset the content from the border once the window exists (mirrors Welcome).
+    nx.wait_for(ctx.winid)
+      :next(function()
+        ctx.wo.padding = "1 2"
+      end)
+      :catch(function() end)
+    return { n = props.n }
+  end,
+
+  render = function(view)
+    local lines = {
+      "Installed " .. view.n .. " new plugin(s).",
+      "",
+      "Restart nxvim to finish loading them.",
+      "",
+      RESTART_HINT,
+    }
+    local hint = #lines - 1
+    return {
+      lines = lines,
+      decor = {
+        {
+          line = hint,
+          col = 0,
+          end_row = hint,
+          end_col = #RESTART_HINT,
+          hl_group = "NxPluginsDim",
+        },
+      },
+    }
+  end,
+})
+
 -- ----- the manager dashboard --------------------------------------------------
 
 local SPINNER = { "⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏" }
@@ -337,18 +387,28 @@ local Manager = nx.view.component({
     -- A freshly-cloned plugin is on the runtimepath, but its `plugin/` scripts and
     -- (for an eager plugin) its `config` only run cleanly from a clean startup — so
     -- after an install that actually clones something, prompt to restart. Centered,
-    -- transient popup (the next key dismisses it). `M.ui._restart_shown` records that
-    -- it fired (an introspection hook for tests).
+    -- focus-grabbing modal (see the `Notice` component) so a single <Esc> dismisses
+    -- the notice and returns to the manager beneath it. `M.ui._restart_shown` records
+    -- that it fired and `M.ui._restart_instance` is the live mount (introspection
+    -- hooks for tests).
     local function restart_popup(n)
       if (n or 0) < 1 then
         return
       end
       M.ui._restart_shown = true
-      nx.ui.float({
-        "Installed " .. n .. " new plugin(s).",
-        "",
-        "Restart nxvim to finish loading them.",
-      }, { title = " Restart required ", relative = "editor", border = "rounded" })
+      M.ui._restart_instance = Notice.mount({
+        name = "nx-plugins-restart",
+        filetype = "nxpluginsrestart",
+        float = {
+          width = 46,
+          height = 7, -- 5 content rows + the 2 rows `padding` insets top/bottom
+          align = "center",
+          border = "rounded",
+          title = " Restart required ",
+          grab = true,
+        },
+        props = { n = n },
+      })
     end
 
     -- Run a verb that may install, reporting errors and popping the restart notice

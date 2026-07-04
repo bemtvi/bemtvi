@@ -326,3 +326,99 @@ fn unknown_internal_flag_is_rejected_loudly() {
     );
     let _ = std::fs::remove_dir_all(&cfg);
 }
+
+/// `--extract-lua-runtime DIR` dumps the embedded `nx.*`/`vim.*` prelude to DIR as real
+/// `.lua` files (so a Lua language server can index the API via `workspace.library`),
+/// exits 0, and echoes the `.luarc.json` snippet. Each file must be the actual prelude
+/// source — here we assert the `nx` namespace file landed and defines the global.
+#[test]
+fn extract_lua_runtime_writes_prelude_to_explicit_dir() {
+    let cfg = fresh_dir("cfg");
+    let out = fresh_dir("rt");
+    let mut cmd = nxvim(&cfg);
+    cmd.env_remove("NXVIM_RUNTIME");
+    cmd.arg("--extract-lua-runtime").arg(&out);
+    let (status, stdout, stderr, _) = run_io(cmd, Duration::from_secs(45));
+    assert!(
+        status.success(),
+        "--extract-lua-runtime must exit 0: {status:?} (stderr: {stderr})"
+    );
+    let nx = out.join("prelude").join("nx.lua");
+    assert!(
+        nx.exists(),
+        "the nx prelude file must be written, missing {}",
+        nx.display()
+    );
+    let src = std::fs::read_to_string(&nx).unwrap();
+    assert!(
+        src.contains("nx = nx or {}"),
+        "the extracted file must be the real prelude source that defines `nx`"
+    );
+    assert!(
+        stdout.contains("workspace.library"),
+        "the .luarc.json hint must be printed, got stdout: {stdout:?}"
+    );
+    let _ = std::fs::remove_dir_all(&cfg);
+    let _ = std::fs::remove_dir_all(&out);
+}
+
+/// With no DIR argument, extraction targets `$NXVIM_RUNTIME` when it is set — the
+/// directory a user's `.luarc.json` `["$NXVIM_RUNTIME"]` resolves to. Since the var is
+/// already exported, the tool must NOT re-print the `export NXVIM_RUNTIME=…` hint.
+#[test]
+fn extract_lua_runtime_honors_nxvim_runtime_env() {
+    let cfg = fresh_dir("cfg");
+    let out = fresh_dir("rt_env");
+    let mut cmd = nxvim(&cfg);
+    cmd.env("NXVIM_RUNTIME", &out);
+    cmd.arg("--extract-lua-runtime");
+    let (status, stdout, stderr, _) = run_io(cmd, Duration::from_secs(45));
+    assert!(
+        status.success(),
+        "--extract-lua-runtime must exit 0: {status:?} (stderr: {stderr})"
+    );
+    assert!(
+        out.join("prelude").join("nx.lua").exists(),
+        "extraction must target $NXVIM_RUNTIME when no DIR is given"
+    );
+    assert!(
+        !stdout.contains("export NXVIM_RUNTIME"),
+        "no export hint when the var is already set, got stdout: {stdout:?}"
+    );
+    let _ = std::fs::remove_dir_all(&cfg);
+    let _ = std::fs::remove_dir_all(&out);
+}
+
+/// With neither a DIR argument nor `$NXVIM_RUNTIME`, extraction falls back to the
+/// standard data dir (`stdpath("data")/runtime`, driven here by `XDG_DATA_HOME`) and
+/// prints the `export NXVIM_RUNTIME=…` line the user must add to their shell.
+#[test]
+fn extract_lua_runtime_defaults_to_data_dir_and_prints_export() {
+    let cfg = fresh_dir("cfg");
+    let data = fresh_dir("xdg_data");
+    let mut cmd = nxvim(&cfg);
+    cmd.env_remove("NXVIM_RUNTIME");
+    cmd.env("XDG_DATA_HOME", &data);
+    cmd.arg("--extract-lua-runtime");
+    let (status, stdout, stderr, _) = run_io(cmd, Duration::from_secs(45));
+    assert!(
+        status.success(),
+        "--extract-lua-runtime must exit 0: {status:?} (stderr: {stderr})"
+    );
+    let nx = data
+        .join("nxvim")
+        .join("runtime")
+        .join("prelude")
+        .join("nx.lua");
+    assert!(
+        nx.exists(),
+        "the default must be <data-dir>/nxvim/runtime, missing {}",
+        nx.display()
+    );
+    assert!(
+        stdout.contains("export NXVIM_RUNTIME"),
+        "the export hint must be printed when the var is unset, got stdout: {stdout:?}"
+    );
+    let _ = std::fs::remove_dir_all(&cfg);
+    let _ = std::fs::remove_dir_all(&data);
+}

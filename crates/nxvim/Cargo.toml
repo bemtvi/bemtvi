@@ -20,6 +20,8 @@ tokio.workspace = true
 # this binary depends on native-gated server items, so it must not rely on feature
 # unification from a `--workspace` build to turn `native` on.
 nxvim-server = { workspace = true, features = ["native"] }
+# Direct dep for `--extract-lua-runtime` (prelude source + stdpath resolver).
+nxvim-lua.workspace = true
 nxvim-tui.workspace = true
 nxvim-lsp.workspace = true
 # The `--test-plugin` runner drives an embedded server as an RPC client (the same

@@ -115,7 +115,7 @@ pub(crate) fn seed_one_package_path(lua: &mlua::Lua, dir: &Path) -> mlua::Result
 /// neovim derives its standard paths from XDG (with `$HOME` fallbacks). `config`
 /// additionally honors `$NXVIM_CONFIG`. Unknown `what` falls back to the cache
 /// dir rather than erroring.
-pub(crate) fn stdpath(what: &str) -> String {
+pub fn stdpath(what: &str) -> String {
     let home = std::env::var_os("HOME").map(PathBuf::from);
     let xdg = |var: &str, fallback: &str| -> PathBuf {
         if let Some(dir) = std::env::var_os(var) {

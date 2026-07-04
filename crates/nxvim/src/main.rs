@@ -447,6 +447,58 @@ struct Cli {
     /// With --workspace, do NOT cd into the workspace directory (keep the launch cwd)
     #[arg(long, requires = "workspace")]
     workspace_no_cwd: bool,
+
+    /// Extract the embedded Lua runtime (the `nx.*`/`vim.*` prelude source) to a
+    /// directory and exit, so the Lua language server can index the API. Writes to
+    /// [DIR], else $NXVIM_RUNTIME, else <data-dir>/nxvim/runtime; point your
+    /// `.luarc.json` `workspace.library` at that path.
+    #[arg(long, value_name = "DIR", num_args = 0..=1, default_missing_value = "")]
+    extract_lua_runtime: Option<String>,
+}
+
+/// Env var naming the extracted Lua runtime directory. A `.luarc.json` can point its
+/// `workspace.library` at `$NXVIM_RUNTIME` and the Lua language server expands it.
+const RUNTIME_ENV: &str = "NXVIM_RUNTIME";
+
+/// Handle `--extract-lua-runtime [DIR]`: write the embedded `nx.*`/`vim.*` prelude to a
+/// directory the Lua language server can index (`workspace.library`), then return.
+///
+/// The destination resolves in priority order: the `DIR` argument if given, else an
+/// already-set `$NXVIM_RUNTIME`, else `<data-dir>/nxvim/runtime` (the standard data path,
+/// matching `stdpath("data")`). We set `$NXVIM_RUNTIME` for this process and — since a
+/// child cannot mutate the parent shell — print the export line the user should add so
+/// their `.luarc.json`'s `$NXVIM_RUNTIME` resolves in future sessions.
+fn extract_lua_runtime(dir_arg: String) -> Result<()> {
+    let dir = if !dir_arg.is_empty() {
+        PathBuf::from(dir_arg)
+    } else if let Some(env) = std::env::var_os(RUNTIME_ENV) {
+        PathBuf::from(env)
+    } else {
+        PathBuf::from(nxvim_lua::stdpath("data")).join("runtime")
+    };
+
+    let written = nxvim_lua::extract_prelude(&dir)
+        .map_err(|e| anyhow!("--extract-lua-runtime: writing to {}: {e}", dir.display()))?;
+
+    // Absolute path so the printed export line works from any cwd.
+    let abs = std::fs::canonicalize(&dir).unwrap_or(dir);
+    let already_set = std::env::var_os(RUNTIME_ENV).is_some();
+    std::env::set_var(RUNTIME_ENV, &abs);
+
+    println!(
+        "Extracted {} Lua runtime file(s) to {}",
+        written.len(),
+        abs.display()
+    );
+    if !already_set {
+        println!(
+            "\nAdd this to your shell so `.luarc.json` can resolve $NXVIM_RUNTIME:\n  \
+             export {RUNTIME_ENV}={}",
+            abs.display()
+        );
+    }
+    println!("\n.luarc.json:\n  {{ \"workspace.library\": [\"${RUNTIME_ENV}\"] }}");
+    Ok(())
 }
 
 fn main() -> Result<()> {
@@ -464,6 +516,13 @@ fn main() -> Result<()> {
     // clap parses, validates, and exits with usage/version itself for `--help`/`-h`,
     // `--version`/`-V`, unknown options, and conflicting roles.
     let cli = Cli::parse();
+
+    // `--extract-lua-runtime [DIR]`: dump the embedded prelude to disk for the Lua
+    // language server, then exit. Standalone — it starts no editor and needs no other
+    // flag, so it runs before any role dispatch or validation below.
+    if let Some(dir) = cli.extract_lua_runtime {
+        return extract_lua_runtime(dir);
+    }
 
     // `--restore-session` needs a shada namespace to restore *from*: an explicit
     // `--shada-namespace`, or the one a `--workspace` launch derives from its directory.

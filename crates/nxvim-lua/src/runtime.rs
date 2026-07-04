@@ -577,6 +577,28 @@ const PRELUDE_MODULES: &[(&str, &str)] = &[
     ),
 ];
 
+/// Write every embedded prelude Lua module to `dir` as a real file, so the Lua
+/// language server can index nxvim's `nx.*` / `vim.*` API from source (point its
+/// `workspace.library` at `dir`). Each `nxvim:prelude/<name>` chunk is written to
+/// `<dir>/prelude/<name>.lua`, preserving the sub-path in the chunk name. `dir`
+/// (and any parent it names) is created if absent. Returns the written file paths.
+pub fn extract_prelude(dir: &Path) -> std::io::Result<Vec<PathBuf>> {
+    let mut written = Vec::with_capacity(PRELUDE_MODULES.len());
+    for (name, src) in PRELUDE_MODULES {
+        // Chunk names are `nxvim:prelude/<name>`; drop the `nxvim:` scheme prefix
+        // and lay the rest out as directories under `dir` (so `prelude/` is a real
+        // subdir), then add the `.lua` extension.
+        let rel = name.strip_prefix("nxvim:").unwrap_or(name);
+        let path = dir.join(rel).with_extension("lua");
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::write(&path, src)?;
+        written.push(path);
+    }
+    Ok(written)
+}
+
 /// One line of captured Lua message output plus whether it was emitted as an
 /// *error* (`nx.err_write*`) — so the server paints it red rather than routing it
 /// through the plain message path.

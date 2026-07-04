@@ -34,6 +34,7 @@ mod search;
 mod vimregex;
 
 pub use fswire::{fs_job_from_value, fs_job_to_value, fs_result_from_value, fs_result_to_value};
+pub use host::stdpath;
 pub use luafs::{run_fs_job, FileKind, LuaDirEntry, LuaFs, LuaStat, StdLuaFs};
 pub use ops::{
     BufOp, CallbackArgs, ConfirmReq, DecorMark, DecorPublish, DiagnosticData, DockOp, ExtmarkOp,
@@ -44,6 +45,7 @@ pub use ops::{
     VirtDecorData, WindowOp,
 };
 pub use runtime::{
-    BoMirror, BufBytesEdit, BufMirror, CmdlineComplete, ExtmarkMirror, FloatMirror, GoMirror,
-    HlDefMirror, JumpMirror, LuaRuntime, OptionCatalogRow, QfMirror, TabMirror, WindowMirror,
+    extract_prelude, BoMirror, BufBytesEdit, BufMirror, CmdlineComplete, ExtmarkMirror,
+    FloatMirror, GoMirror, HlDefMirror, JumpMirror, LuaRuntime, OptionCatalogRow, QfMirror,
+    TabMirror, WindowMirror,
 };

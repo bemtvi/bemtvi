@@ -2735,6 +2735,7 @@ dependencies = [
  "anyhow",
  "clap",
  "nxvim-lsp",
+ "nxvim-lua",
  "nxvim-rpc",
  "nxvim-server",
  "nxvim-test-harness",

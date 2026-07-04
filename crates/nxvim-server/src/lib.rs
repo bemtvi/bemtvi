@@ -1133,6 +1133,16 @@ pub struct EditHost {
     /// `:lcd`/`:tcd` boundary (the remote analogue of the local `fix_current_dir`), not on
     /// every window change. `None` until the first publish.
     published_cwd: Option<PathBuf>,
+    /// Whether this session's `nx.fs` runs against a **remote daemon** whose cwd was seeded
+    /// into `DirState` (a `--connect-daemon` native session, or a `?daemon=` web session that
+    /// fetched `config_bundle`). Gates the outbound `nx.fs` / spawn cwd rebase in
+    /// [`apply_loop_op`](EditHost::apply_loop_op): only such a session needs a relative path
+    /// absolutized against `DirState` before the wire (the daemon is stateless). `false` for a
+    /// bare/local session (the process cwd *is* the effective dir) and — critically — for a
+    /// serverless web session (OPFS is root-relative and cwd-less, so rebasing would break it).
+    /// Set where `DirState` is seeded from a daemon cwd (`run_server` native / `apply_remote_config`
+    /// wasm); this is the correct daemon-fs gate, unlike `host_fs_offtick()` (true for OPFS too).
+    remote_cwd_seeded: bool,
     /// The wasm build's timer wheel (slice 5d): pending `vim.defer_fn` / `nx.timer`
     /// timers, fired by the Worker when their [`due_ms`](WasmTimer::due_ms) passes on the
     /// JS clock — the serverless analogue of the tokio timers the native build arms via
@@ -1275,6 +1285,7 @@ impl EditHost {
             pending_replica_edits: HashMap::new(),
             next_chdir_token: 0,
             published_cwd: None,
+            remote_cwd_seeded: false,
             #[cfg(not(feature = "native"))]
             wasm_timers: Vec::new(),
             #[cfg(not(feature = "native"))]
@@ -1395,6 +1406,10 @@ impl EditHost {
         if let Some(cwd) = remote_cwd {
             self.dirs = cwd::DirState::new(cwd);
             self.publish_cwd_mirror();
+            // A `?daemon=` web session: `nx.fs` routes to the daemon (stateless cwd), so
+            // mark it for the `apply_loop_op` relative-path rebase. A serverless session
+            // has `remote_cwd == None` and stays `false` (OPFS is root-relative, cwd-less).
+            self.remote_cwd_seeded = true;
         }
 
         // Point `require` / runtime-file lookup at the staged copy: each rebased entry's
@@ -1434,6 +1449,22 @@ impl EditHost {
         }
         self.source_plugins();
         Ok(())
+    }
+
+    /// Seed the session cwd from a **runtime** daemon connect (`:connect nxvim://…`), the
+    /// browser twin of the boot-time [`apply_remote_config`](Self::apply_remote_config) cwd
+    /// seed. A runtime `:connect` re-points the fs seam at a new daemon but does NOT re-fetch
+    /// `config_bundle` (that would re-source the whole config), so the daemon's cwd — the one
+    /// true cwd of the now-remote session — never reached `DirState`, and a relative `nx.fs`
+    /// path stayed unrebased. The Worker fetches it (a `realpath(".")` over the fresh `luafs`
+    /// leg) and hands it here: install it as the effective dir, refresh the `nx._cwd` mirror
+    /// (`getcwd`), and mark the session daemon-fs so [`apply_loop_op`](Self::apply_loop_op)
+    /// rebases relative `nx.fs` / spawn paths against it — exactly as the boot path does.
+    #[cfg(not(feature = "native"))]
+    pub fn seed_remote_cwd(&mut self, cwd: std::path::PathBuf) {
+        self.dirs = cwd::DirState::new(cwd);
+        self.publish_cwd_mirror();
+        self.remote_cwd_seeded = true;
     }
 
     /// Feed vim key-notation and project the resulting frame — the wasm Worker's
@@ -2969,6 +3000,9 @@ where
     // leaves the process-cwd seed `EditHost::new` installed.
     if let Some(cwd) = init.remote_cwd {
         host.dirs = cwd::DirState::new(cwd);
+        // This session's `nx.fs` runs against the daemon; mark it so `apply_loop_op`
+        // rebases relative paths against `DirState` before they cross the wire.
+        host.remote_cwd_seeded = true;
     }
     // Publish the seeded effective dir into the `nx._cwd` mirror so `vim.fn.getcwd`
     // reads the authoritative cwd from the very first config line (a remote session's

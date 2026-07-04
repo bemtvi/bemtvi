@@ -1040,6 +1040,26 @@ pub unsafe extern "C" fn eh_apply_remote_config(
     }
 }
 
+/// Seed the session cwd from a **runtime** `:connect nxvim://…` (the browser twin of the
+/// boot-time `eh_apply_remote_config` cwd seed). A runtime connect re-points the fs seam at a
+/// new daemon but does NOT re-fetch `config_bundle`, so the daemon's cwd never reaches
+/// `DirState` and a relative `nx.fs` path stays unrebased (resolving against the stale
+/// serverless/previous dir). The Worker fetches the new daemon's cwd (a `realpath(".")` over
+/// the fresh `luafs` leg) and hands it here; [`EditHost::seed_remote_cwd`] installs it as the
+/// effective dir, refreshes `nx._cwd`, and marks the session daemon-fs so relative `nx.fs` /
+/// spawn paths rebase against it. A no-op-safe null / empty `cwd` is ignored.
+///
+/// # Safety
+/// `h` must come from [`eh_new`] and not yet be freed; `cwd` a valid C string.
+#[no_mangle]
+pub unsafe extern "C" fn eh_seed_remote_cwd(h: *mut WasmEditHost, cwd: *const c_char) {
+    let Some(handle) = h.as_mut() else { return };
+    let cwd = as_str(cwd);
+    if !cwd.is_empty() {
+        handle.host.seed_remote_cwd(std::path::PathBuf::from(cwd));
+    }
+}
+
 /// Finish serverless startup: fire the lifecycle events and mark `v:vim_did_enter`.
 /// Run by the Worker after [`eh_new`] and the optional [`eh_source_lua`] config sourcing
 /// — the second half of the boot [`eh_new`] began.

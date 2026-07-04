@@ -11,6 +11,7 @@ use nxvim_core::{
     DecorViewport, FloatAnchor, FloatConfig, FloatRelative, QfAction, QfEntry, QfWhich, TabId,
     UndoEntry, UndoTreeView, WindowConfigSpec, WindowId,
 };
+use nxvim_lua::FsJob;
 use nxvim_lua::{
     BoMirror, BufBytesEdit, BufMirror, BufOp, CallbackArgs, DecorPublish, DockOp, ExtmarkMirror,
     ExtmarkOp, FloatMirror, GoMirror, HlDefMirror, HlSet, JumpMirror, LayerOp, LoopOp, NamedListOp,
@@ -2177,6 +2178,119 @@ impl EditHost {
         }
     }
 
+    /// Absolutize a relative path against the session's effective working directory
+    /// (the focused window's [`DirState`], which a remote `:cd` moves) — the rebase a
+    /// daemon session needs before a path crosses the wire. One daemon process serves
+    /// many sessions and keeps no per-session cwd, so a bare relative path shipped raw
+    /// resolves against the daemon's launch dir and silently ignores `:cd`. The same
+    /// rebase [`drain_pending_opens`](Self::drain_pending_opens) does for a relative
+    /// `:edit`. An absolute path crosses unchanged. Only meaningful off-tick — a local
+    /// session's process cwd already *is* the effective dir, so callers gate on
+    /// [`remote_cwd_seeded`](EditHost::remote_cwd_seeded) — the daemon-fs gate, `false` for a
+    /// serverless web (OPFS) session whose paths are root-relative and must not be rebased.
+    fn abs_against_cwd(&self, path: &str) -> String {
+        if std::path::Path::new(path).is_relative() {
+            let win = self.editor.current_window_id();
+            let tab = self.editor.current_tab_id();
+            let (_, base) = self.dirs.effective(win, tab);
+            base.join(path).to_string_lossy().into_owned()
+        } else {
+            path.to_string()
+        }
+    }
+
+    /// Resolve a spawned child's working directory for a daemon session so `nx.run` /
+    /// `vim.system` with no (or a relative) `cwd` runs where the session's cwd points —
+    /// neovim's `vim.system` inherits the editor's cwd, but a bare daemon spawn would
+    /// otherwise inherit the *daemon's* launch dir (the same stale-cwd class as a raw
+    /// `nx.fs` path). A `None` cwd defaults to the effective dir; a relative one rebases;
+    /// an absolute one (the common `cwd = vim.fn.getcwd()` a statusline passes) is kept.
+    /// Off-tick + session-routed only — a local session's child already inherits the
+    /// process cwd, and a `local` spawn (the plugin manager's git) runs on the local disk.
+    #[cfg(feature = "native")]
+    fn spawn_cwd(&self, cwd: Option<String>, local: bool) -> Option<String> {
+        if local || !self.remote_cwd_seeded {
+            return cwd;
+        }
+        let win = self.editor.current_window_id();
+        let tab = self.editor.current_tab_id();
+        let (_, base) = self.dirs.effective(win, tab);
+        Some(match cwd {
+            Some(c) => self.abs_against_cwd(&c),
+            None => base.to_string_lossy().into_owned(),
+        })
+    }
+
+    /// Rebase every path an [`FsJob`] carries against the session cwd (see
+    /// [`abs_against_cwd`](Self::abs_against_cwd)) so a relative `nx.fs.*` op resolves
+    /// against the edit-host's `DirState` rather than the daemon's launch dir. Called on
+    /// the outbound `nx.fs` path in a daemon session for a *session*-routed op (a `local`
+    /// op runs on the local disk against the local process cwd, so it is left untouched).
+    fn rebase_fs_job(&self, job: FsJob) -> FsJob {
+        match job {
+            FsJob::Stat { path } => FsJob::Stat {
+                path: self.abs_against_cwd(&path),
+            },
+            FsJob::Lstat { path } => FsJob::Lstat {
+                path: self.abs_against_cwd(&path),
+            },
+            FsJob::Exists { path } => FsJob::Exists {
+                path: self.abs_against_cwd(&path),
+            },
+            FsJob::Readdir { path } => FsJob::Readdir {
+                path: self.abs_against_cwd(&path),
+            },
+            FsJob::Read { path } => FsJob::Read {
+                path: self.abs_against_cwd(&path),
+            },
+            FsJob::ReadText { path, encoding } => FsJob::ReadText {
+                path: self.abs_against_cwd(&path),
+                encoding,
+            },
+            FsJob::Write { path, data } => FsJob::Write {
+                path: self.abs_against_cwd(&path),
+                data,
+            },
+            FsJob::Append { path, data } => FsJob::Append {
+                path: self.abs_against_cwd(&path),
+                data,
+            },
+            FsJob::Mkdir {
+                path,
+                recursive,
+                mode,
+            } => FsJob::Mkdir {
+                path: self.abs_against_cwd(&path),
+                recursive,
+                mode,
+            },
+            FsJob::Rename { from, to } => FsJob::Rename {
+                from: self.abs_against_cwd(&from),
+                to: self.abs_against_cwd(&to),
+            },
+            FsJob::Remove { path, recursive } => FsJob::Remove {
+                path: self.abs_against_cwd(&path),
+                recursive,
+            },
+            FsJob::Copy {
+                src,
+                dst,
+                recursive,
+            } => FsJob::Copy {
+                src: self.abs_against_cwd(&src),
+                dst: self.abs_against_cwd(&dst),
+                recursive,
+            },
+            FsJob::Realpath { path } => FsJob::Realpath {
+                path: self.abs_against_cwd(&path),
+            },
+            FsJob::HashFile { path, algo } => FsJob::HashFile {
+                path: self.abs_against_cwd(&path),
+                algo,
+            },
+        }
+    }
+
     /// Route one [`LoopOp`]: enqueue a `Schedule` for the `run_pending` drain, or
     /// forward a timer / process op to the event-loop actor (a fire-and-forget
     /// [`LoopCommand`], never awaited).
@@ -2212,7 +2326,7 @@ impl EditHost {
             } => self.fx.loop_command(LoopCommand::Spawn {
                 id,
                 argv: cmd,
-                cwd,
+                cwd: self.spawn_cwd(cwd, local),
                 env,
                 stdin,
                 stream,
@@ -2271,6 +2385,15 @@ impl EditHost {
             // result returns on the `loop_events` arm as a `FsResult`.
             #[cfg(feature = "native")]
             LoopOp::Fs { id, job, local } => {
+                // A session-routed op in a daemon session crosses to a stateless daemon,
+                // so absolutize its relative path(s) against the edit-host's `DirState`
+                // first (a `local` op runs on the local disk against the process cwd, so
+                // it is left untouched).
+                let job = if !local && self.remote_cwd_seeded {
+                    self.rebase_fs_job(job)
+                } else {
+                    job
+                };
                 self.fx.loop_command(LoopCommand::Fs { id, job, local })
             }
             // The browser build has no tokio event loop; timers ride the Worker-side
@@ -2472,7 +2595,20 @@ impl EditHost {
             // routes there instead of the daemon `luafs_op` leg (the Worker decides on the
             // `local` flag `fs_op` forwards). Plugin management stays local on web too.
             #[cfg(not(feature = "native"))]
-            LoopOp::Fs { id, job, local } => self.fx.fs_op(id, job, local),
+            LoopOp::Fs { id, job, local } => {
+                // A `?daemon=` web session routes a session (`!local`) op to the stateless
+                // daemon over `luafs_op`, so absolutize its relative path(s) against `DirState`
+                // first — the same rebase the native daemon arm does. A serverless / OPFS
+                // session (`remote_cwd_seeded == false`) is NEVER rebased: OPFS is root-relative
+                // and cwd-less, so its `.` must stay `.` (the Worker maps it to the OPFS root).
+                // A `local` op (plugin manager) rides OPFS on web, so it is left untouched too.
+                let job = if !local && self.remote_cwd_seeded {
+                    self.rebase_fs_job(job)
+                } else {
+                    job
+                };
+                self.fx.fs_op(id, job, local)
+            }
         }
     }
 

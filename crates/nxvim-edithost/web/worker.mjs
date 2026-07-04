@@ -34,6 +34,9 @@ const eh_source_lua = M.cwrap("eh_source_lua", "number", ["number", "string"]);
 // Apply a fetched remote-config bundle (daemon mode): handle, msgpack-bytes ptr, len → owned
 // error C string (empty on success). The browser twin of the native fetch→materialize→source.
 const eh_apply_remote_config = M.cwrap("eh_apply_remote_config", "number", ["number", "number", "number"]);
+// Seed the session cwd from a RUNTIME `:connect` (boot uses eh_apply_remote_config): the Worker
+// fetches the new daemon's cwd and hands it here so relative `nx.fs`/spawn paths rebase against it.
+const eh_seed_remote_cwd = M.cwrap("eh_seed_remote_cwd", null, ["number", "string"]);
 const eh_boot_finish = M.cwrap("eh_boot_finish", null, ["number"]);
 const eh_attach = M.cwrap("eh_attach", null, ["number", "number", "number"]);
 const eh_set_clock = M.cwrap("eh_set_clock", null, ["number", "number"]);
@@ -1084,6 +1087,21 @@ async function runtimeConnect(uri) {
   daemonError = null;
   daemonUri = uri;
   await startDaemonSupervisor();
+  // Seed the session cwd from the newly-connected daemon (boot does this via config_bundle, but a
+  // runtime `:connect` re-points the fs seam WITHOUT re-fetching the bundle). Without it, a relative
+  // `nx.fs` path would resolve against the stale (serverless/previous) dir. `realpath(".")` over the
+  // fresh luafs leg returns the daemon's own cwd; hand it to the core (DirState + `nx._cwd` mirror +
+  // the rebase gate). Best-effort — a fetch failure leaves the cwd as-is rather than breaking connect.
+  if (daemon) {
+    try {
+      const reply = await daemonFsOp({ op: "realpath", path: "." });
+      if (Array.isArray(reply) && reply[0] === "ok" && Array.isArray(reply[1]) && reply[1][0] === "text") {
+        eh_seed_remote_cwd(h, String(reply[1][1]));
+      }
+    } catch {
+      // leave the cwd unseeded — relative nx.fs stays daemon-launch-dir-relative until a fix
+    }
+  }
   postMessage({ type: "connected", ok: !!daemon, uri, error: daemonError });
 }
 

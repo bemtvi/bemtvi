@@ -18,7 +18,7 @@ import { chromium } from "playwright";
 import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { setTimeout as sleep } from "node:timers/promises";
-import { globSync, mkdtempSync, readFileSync, writeFileSync, mkdirSync, existsSync } from "node:fs";
+import { globSync, mkdtempSync, readFileSync, writeFileSync, mkdirSync, existsSync, realpathSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -55,6 +55,14 @@ async function until(page, fn, pred, ms = 8000) {
 const luaResult = (page, code) =>
   page.evaluate((c) => window.__nxvim.execLua(c).then((r) => r.result), code);
 
+// `execLua().result` renders as `ok:<rmpv Debug>` / `err:<msg>` (see index.html execLuaOp); a
+// string value shows as `String(Utf8String { s: Ok("<content>") })`. Extract <content> for an
+// exact compare (substring/regex checks tolerate the wrapper, but a path equality needs it clean).
+function plainStr(v) {
+  const m = String(v).match(/Ok\("((?:[^"\\]|\\.)*)"\)/);
+  return m ? m[1].replace(/\\n/g, "\n").replace(/\\"/g, '"').replace(/\\\\/g, "\\") : String(v);
+}
+
 // ── The daemon's working tree (real disk; the browser reads/writes it OVER THE WIRE) ─────────
 const root = mkdtempSync(join(tmpdir(), "nxvim-fsop-"));
 const readFile = join(root, "hello.txt");
@@ -66,9 +74,13 @@ writeFileSync(join(listDir, "beta.txt"), "b");
 mkdirSync(join(listDir, "subdir"));
 const writeTarget = join(root, "written-by-browser.txt");
 const missing = join(root, "does-not-exist.txt");
+// A subdir under the daemon's cwd, holding a file addressed by a RELATIVE path after `:cd`.
+const deepDir = join(root, "deep");
+mkdirSync(deepDir);
+writeFileSync(join(deepDir, "nested.txt"), "NESTED-VIA-RELATIVE-PATH\n");
 
-// ── Spawn the real daemon; parse its connect URI from stdout ──────────────────────────────
-const daemon = spawn(NXVIM, ["--daemon", "--listen", "127.0.0.1:0"], { stdio: ["ignore", "pipe", "pipe"] });
+// ── Spawn the real daemon (cwd = `root`, so the session's cwd seeds there) ──────────────────
+const daemon = spawn(NXVIM, ["--daemon", "--listen", "127.0.0.1:0"], { cwd: root, stdio: ["ignore", "pipe", "pipe"] });
 let uri = null;
 let daemonOut = "";
 daemon.stdout.on("data", (d) => {
@@ -182,13 +194,42 @@ try {
        nx._local_fs_op({ op = "exists", path = "${readFile}" }, id)
      end
      return 1`);
-  const split = await until(page,
+  const split = plainStr(await until(page,
     () => window.__nxvim.execLua(
       "return tostring(_G.__sess) .. '/' .. tostring(_G.__loc) .. '/' .. tostring(_G.__locerr)"
     ).then((r) => r.result),
-    (v) => /^(true|false)\/(true|false)/.test(String(v)));
+    (v) => /(true|false)\/(true|false)/.test(plainStr(v))));
   check("a LOCAL fs op routes to OPFS, not the daemon (session sees the daemon file; local does not)",
-    /^true\/false/.test(String(split)), `sess/loc/err=${JSON.stringify(split)}`);
+    /^true\/false/.test(split), `sess/loc/err=${JSON.stringify(split)}`);
+
+  // ── 6. RELATIVE nx.fs path resolves against the session cwd and FOLLOWS a remote `:cd` ──────
+  // The session cwd seeds from the daemon's cwd (`root`); a relative `nx.fs` path must be
+  // absolutized against it (the edit-host's `DirState`) before crossing the wire, because the
+  // daemon is stateless and would otherwise resolve `.` against its own launch dir. Without the
+  // rebase (the bug), `nx.fs.read_text("nested.txt")` after `:cd deep` ENOENTs / hits the wrong dir.
+  const rootReal = realpathSync(root);
+  const cwd0 = plainStr(await luaResult(page, "return vim.fn.getcwd()"));
+  check("web daemon session seeds its cwd from the daemon (getcwd == daemon cwd)",
+    cwd0 === rootReal, `getcwd=${JSON.stringify(cwd0)} want=${JSON.stringify(rootReal)}`);
+
+  // `:cd deep` (relative) moves the session cwd into <root>/deep, then a relative read.
+  await luaResult(page, 'vim.cmd("cd deep") return 1');
+  const cwd1 = plainStr(await until(page,
+    () => window.__nxvim.execLua("return vim.fn.getcwd()").then((r) => r.result),
+    (v) => /\/deep"\)/.test(String(v))));
+  check("a relative `:cd deep` moves the web session cwd into the subdirectory",
+    cwd1 === join(rootReal, "deep"), `getcwd=${JSON.stringify(cwd1)}`);
+
+  await luaResult(page, `_G.__rel, _G.__relerr = nil, nil
+     nx.fs.read_text("nested.txt"):next(
+       function(t) _G.__rel = t end,
+       function(e) _G.__relerr = e.code .. ":" .. e.message end)
+     return 1`);
+  const rel = await until(page,
+    () => window.__nxvim.execLua("return _G.__rel or _G.__relerr or ''").then((r) => r.result),
+    (v) => /NESTED-VIA-RELATIVE-PATH|ENOENT/.test(String(v)));
+  check("a RELATIVE nx.fs.read_text after `:cd` resolves against the new cwd (over the wire)",
+    /NESTED-VIA-RELATIVE-PATH/.test(String(rel)), `rel=${JSON.stringify(rel)}`);
 
   await browser.close();
 } catch (e) {

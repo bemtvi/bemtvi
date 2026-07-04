@@ -354,6 +354,20 @@ fn extract_lua_runtime_writes_prelude_to_explicit_dir() {
         src.contains("nx = nx or {}"),
         "the extracted file must be the real prelude source that defines `nx`"
     );
+    // The generated globals stub gives the Lua language server a definition site for the
+    // Rust-injected `vim` global (else every `vim.*` alias reads as an undefined global).
+    let stub = out.join("nxvim-globals.lua");
+    assert!(
+        stub.exists(),
+        "the globals stub must be written, missing {}",
+        stub.display()
+    );
+    assert!(
+        std::fs::read_to_string(&stub)
+            .unwrap()
+            .contains("vim = vim"),
+        "the globals stub must declare the Rust-injected `vim` global"
+    );
     assert!(
         stdout.contains("workspace.library"),
         "the .luarc.json hint must be printed, got stdout: {stdout:?}"

@@ -100,12 +100,34 @@ function nx.runtime_file(name, all)
   return nx._runtime_file(name, all)
 end
 
--- nx.open(path[, opts]) -> nil. Open a file or directory in the editing area, like
--- `:edit`. With `opts.where == "main"` it first crosses to the main editor layer (so
--- an open fired from a dock / sidebar keymap lands in the main area, not the dock);
--- the default opens in the current window.
+-- nx.open(path[, opts]) -> nil. Open a file (or a directory, which opens the file
+-- explorer) in the editing area. `opts` is an optional table:
+--
+--   • reuse (boolean, default true) — "open or jump". How to handle the file when
+--     it is already up:
+--       - shown in a window  → focus that window (across tabs under the default
+--         `'switchbuf'` = `usetab`); the file is NOT reloaded and no split is made.
+--       - loaded but hidden  → show that existing buffer in the current window,
+--         preserving its edits and cursor (no re-read, no duplicate buffer).
+--       - not open at all     → read it fresh into the current window.
+--     This is what a file explorer, a "go to file", or a jump-to-source wants:
+--     click a file that's already on screen and you land on it rather than getting
+--     a second copy. Set `reuse = false` for plain `:edit` semantics — always load
+--     into the current window even when another window already shows the file, e.g.
+--     to deliberately place a buffer into a split you just created.
+--
+--   • where ("main" | nil) — with `where = "main"` the open first crosses to the
+--     main editor layer, so an open fired from a dock / sidebar keymap lands in the
+--     main area instead of inside the dock. Omitted, it opens in the current window.
+--
+-- Note: only `reuse` (the default) consults `'switchbuf'`, and `'switchbuf'` only
+-- ever redirects to a window already DISPLAYING the buffer — a hidden buffer has no
+-- such window, hence the "loaded but hidden" case above.
 function nx.open(path, opts)
-  return nx._open(path, opts)
+  if opts and opts.reuse == false then
+    return nx._open(path, opts)
+  end
+  return nx._open_switchbuf(path, opts and opts.where == "main")
 end
 
 -- nx.layer.focus(target) -> nil. Move keyboard focus across the layout's layers:

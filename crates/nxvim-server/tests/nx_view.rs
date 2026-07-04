@@ -161,13 +161,46 @@ async fn nx_open_default_opens_in_the_current_window() {
     );
 }
 
-/// `nx.open` is `:edit`-like: it opens in the current window even when another
-/// window already shows the file — it must NOT borrow the picker's switchbuf
-/// behavior and jump focus to that other window. (Regression: the picker's
-/// switchbuf bridge was registered under the same `nx._open` key, shadowing this
-/// documented semantic.)
+/// `nx.open` defaults to `'switchbuf'`-honoring reuse: opening a file that is already
+/// shown in another window JUMPS focus to that window instead of reloading it into the
+/// current one. This is the file-explorer / jump-to-source "open-or-jump" gesture; it
+/// also avoids the `:edit`-into-a-modified-buffer error when the file is already up.
 #[tokio::test]
-async fn nx_open_edits_in_place_when_the_file_is_visible_elsewhere() {
+async fn nx_open_jumps_to_a_window_already_showing_the_file() {
+    let (rpc, _incoming) = start().await;
+    let file = write_temp("nxopen_jump", "txt", "shared-file\n");
+
+    // Window A shows the file; split off window B (focused) holding a fresh buffer.
+    exec_lua(&rpc, &format!("nx.open({:?})", file)).await;
+    feed_sync(&rpc, ":vsplit<CR>:enew<CR>").await;
+    assert_eq!(
+        lines(&rpc).await,
+        vec![""],
+        "focused window holds a scratch"
+    );
+
+    // Default open of the already-visible file jumps back to window A …
+    exec_lua(&rpc, &format!("nx.open({:?})", file)).await;
+    assert_eq!(
+        lines(&rpc).await,
+        vec!["shared-file"],
+        "focus jumped to the window already showing the file"
+    );
+    // … leaving window B's scratch untouched (the file was NOT reloaded into it).
+    feed_sync(&rpc, "<C-w>w").await;
+    assert_eq!(
+        lines(&rpc).await,
+        vec![""],
+        "the other window still holds its scratch: nx.open jumped, it did not edit-in-place"
+    );
+}
+
+/// `nx.open(path, { reuse = false })` opts back into `:edit` semantics: it loads the
+/// file into the current window even when another window already shows it (so BOTH
+/// windows then show it) — how the explorer's split/tab gestures place a file into
+/// the window they just created.
+#[tokio::test]
+async fn nx_open_reuse_false_edits_in_place() {
     let (rpc, _incoming) = start().await;
     let file = write_temp("nxopen_inplace", "txt", "shared-file\n");
 
@@ -180,16 +213,15 @@ async fn nx_open_edits_in_place_when_the_file_is_visible_elsewhere() {
         "focused window holds a scratch"
     );
 
-    // `:edit`-like: the focused window itself now shows the file …
-    exec_lua(&rpc, &format!("nx.open({:?})", file)).await;
+    // reuse = false: the focused window itself now shows the file …
+    exec_lua(&rpc, &format!("nx.open({:?}, {{ reuse = false }})", file)).await;
     assert_eq!(lines(&rpc).await, vec!["shared-file"]);
-    // … so BOTH windows show it (switchbuf would instead have jumped away and
-    // left the scratch window empty).
+    // … so BOTH windows show it (the default would have jumped away instead).
     feed_sync(&rpc, "<C-w>w").await;
     assert_eq!(
         lines(&rpc).await,
         vec!["shared-file"],
-        "the other window still shows the file: nx.open edited in place, not switchbuf-jumped"
+        "the other window also shows the file: reuse = false edited in place"
     );
 }
 

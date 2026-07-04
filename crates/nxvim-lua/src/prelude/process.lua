@@ -29,11 +29,32 @@ local function build_argv(spec)
 end
 
 -- nx.run { cmd, args, cwd, env, stdin } -> promise of { code, stdout, stderr }.
--- Runs a child to completion off the input tick, collecting all of stdout. It
+-- Runs a child to completion off the input tick, buffering all of its stdout and
+-- stderr and resolving once, on exit.
+--
+-- Spec fields:
+--   * cmd   — the program. A string, or an argv list whose first element is the
+--             program. Spawned directly, with NO shell: nothing is word-split,
+--             quoted, or glob-expanded, so pass each argument as its own element.
+--   * args  — optional list appended after `cmd`, so `{ cmd = "git", args = { "log" } }`
+--             and `{ cmd = { "git", "log" } }` are equivalent.
+--   * cwd   — optional working directory for the child.
+--   * env   — optional { NAME = value } map of environment overrides.
+--   * stdin — optional string piped to the child; its stdin then closes (EOF).
+--
 -- RESOLVES (never rejects) with the exit result: a non-zero `code` is the caller's
 -- to act on, and a spawn failure (e.g. binary not found) surfaces as `code = -1`
--- with empty output — exactly like vim.system. The one-shot promise twin of
--- nx.run_stream.
+-- with empty output — exactly like vim.system. Await it inside nx.async, or chain
+-- with :next / :catch:
+--
+--   nx.async(function()
+--     local r = nx.await(nx.run({ cmd = "git", args = { "rev-parse", "HEAD" } }))
+--     if r.code == 0 then nx.print(r.stdout) end
+--   end)()
+--
+-- The one-shot promise twin of nx.run_stream (stream stdout as it arrives). For a
+-- duplex child whose stdin stays open for a framed protocol (LSP/DAP) use
+-- nx.process instead.
 function nx.run(spec)
   if type(spec) ~= "table" then
     error("nx.run: expected a table { cmd, args, ... }, got " .. type(spec), 2)
@@ -79,8 +100,23 @@ function Stream:kill()
 end
 
 -- nx.run_stream { cmd, args, cwd, env } -> Stream. Spawns a child and streams its
--- stdout in newline-delimited batches. The streaming twin of nx.run; the picker /
--- completion sources consume it to feed results as they arrive.
+-- stdout as it arrives, in newline-delimited batches — each batch a list of lines
+-- with the trailing newline stripped. Takes the same spec as nx.run minus `stdin`
+-- (the child's stdin is closed at spawn). Only stdout is surfaced: stderr and the
+-- exit code are not readable through the Stream.
+--
+-- The streaming twin of nx.run — reach for it when output is large or long-lived
+-- and you want to act on lines as they come (the picker / completion sources feed
+-- results this way) rather than waiting for the child to exit. Iterate it with
+-- nx.await_each inside an nx.async function; call :kill() to reap the child early
+-- (e.g. a superseded query):
+--
+--   nx.async(function()
+--     local stream = nx.run_stream({ cmd = "rg", args = { "TODO" } })
+--     for batch in nx.await_each(stream) do
+--       for _, line in ipairs(batch) do nx.print(line) end
+--     end
+--   end)()
 function nx.run_stream(spec)
   if type(spec) ~= "table" then
     error("nx.run_stream: expected a table { cmd, args, ... }, got " .. type(spec), 2)

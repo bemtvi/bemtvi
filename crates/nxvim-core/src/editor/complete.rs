@@ -66,6 +66,22 @@ impl Default for CompleteKeys {
     }
 }
 
+/// How accepting a completion treats the text to the *right* of the cursor when the
+/// caret sits in the middle of a word. `Insert` keeps the suffix — it replaces only
+/// the typed prefix `[anchor .. cursor)`, so completing `AN_EX|AMPLE` with `AN_OTHER`
+/// yields `AN_OTHERAMPLE`. `Replace` (the default) swaps the whole word
+/// `[anchor .. word_end)`, yielding `AN_OTHER`. The default confirm keys use the
+/// engine's configured behavior; a plugin can bind a second key to the *other* one
+/// via `nx.complete.accept{ behavior = … }`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum AcceptBehavior {
+    /// Replace only the typed prefix, leaving any word suffix past the cursor.
+    Insert,
+    /// Replace the whole word the cursor is inside.
+    #[default]
+    Replace,
+}
+
 /// Engine configuration, set by `nx.complete.setup{}`. Disabled until a config
 /// arrives, so an editor with no completion config behaves exactly as before.
 #[derive(Clone, Debug)]
@@ -76,6 +92,9 @@ pub struct CompleteConfig {
     /// The prefix must be at least this many characters before the menu opens.
     pub min_chars: usize,
     pub keys: CompleteKeys,
+    /// What the confirm keys do when the caret sits mid-word: replace the whole word
+    /// (default) or only the typed prefix. See [`AcceptBehavior`].
+    pub accept: AcceptBehavior,
     /// At least one configured source needs **off-input-path dispatch** — a Lua
     /// `complete` function or the built-in `lsp` source. When set, a trigger emits a
     /// `(gen, ctx)` onto [`Editor::complete_query_changes`] for the server to
@@ -108,6 +127,7 @@ impl Default for CompleteConfig {
             auto: true,
             min_chars: 1,
             keys: CompleteKeys::default(),
+            accept: AcceptBehavior::default(),
             has_async: false,
             buffer_priority: 0,
             docs: true,
@@ -277,34 +297,69 @@ impl Editor {
         }
     }
 
-    /// Accept the highlighted completion. For a native (`buffer`) row, replace the
-    /// typed prefix `[anchor .. cursor)` with the row's insert text and park the
-    /// cursor past it. For a **delegated** (`source_accept`) row — the `lsp` source —
-    /// core can't apply the edit (it is LSP/encoding-agnostic), so it records the
-    /// row's `key` on [`Editor::complete_accept_request`] for the server to apply and
-    /// closes the menu. Returns whether anything was accepted — `false` when no menu
-    /// is open or **nothing is selected yet** (noselect), so the caller lets the key
-    /// fall through (e.g. `<CR>` makes a newline). The native edit groups into the
-    /// surrounding insert session (the snapshot is already held).
+    /// Accept the highlighted completion under the engine's configured
+    /// [`AcceptBehavior`] (the default confirm-key path). See
+    /// [`Editor::complete_accept_with`].
     pub fn complete_accept(&mut self) -> bool {
+        self.complete_accept_with(self.complete_config.accept)
+    }
+
+    /// Accept the highlighted completion under an explicit `behavior` — the path a
+    /// key bound to `nx.complete.accept{ behavior = … }` takes. For a native
+    /// (`buffer`) row, replace the word span with the row's insert text and park the
+    /// cursor past it; the span is `[anchor .. cursor)` under [`AcceptBehavior::Insert`]
+    /// and `[anchor .. word_end)` under [`AcceptBehavior::Replace`] (swapping the whole
+    /// word the caret sits inside, not just the typed prefix). For a **delegated**
+    /// (`source_accept`) row — the `lsp` / `snippets` source — core can't apply the edit
+    /// (it is LSP/encoding-agnostic), so it records the row's `key` on
+    /// [`Editor::complete_accept_request`] and, under `Replace`, the word end on
+    /// [`Editor::complete_accept_extend_to`] for the server to apply, and closes the
+    /// menu. Returns whether anything was accepted — `false` when no menu is open or
+    /// **nothing is selected yet** (noselect), so the caller lets the key fall through
+    /// (e.g. `<CR>` makes a newline). The native edit groups into the surrounding
+    /// insert session (the snapshot is already held).
+    pub fn complete_accept_with(&mut self, behavior: AcceptBehavior) -> bool {
         let Some(acc) = self.complete_take_accept() else {
             return false;
         };
+        let cursor_byte = self.cursor_char();
+        // Under `Replace`, extend the replaced span rightward over the rest of the
+        // word the caret sits inside; `Insert` stops at the cursor. `anchor` is always
+        // ≤ the cursor (the prefix is the word chars left of it), so the span is valid.
+        let remove_end = match behavior {
+            AcceptBehavior::Insert => cursor_byte,
+            AcceptBehavior::Replace => self.word_end_at_cursor(),
+        };
         if acc.source_accept {
             // The server applies the source's edit (textEdit + additionalTextEdits)
-            // after this key returns; the menu is already closed by `take_accept`.
+            // after this key returns; the menu is already closed by `take_accept`. Hand
+            // it the word end so a `Replace` accept swaps the whole word (core doesn't
+            // apply the delegated edit); `None` ⇒ the server stops at the cursor.
             self.complete_accept_request = Some(acc.key);
+            self.complete_accept_extend_to = (remove_end > cursor_byte).then_some(remove_end);
             return true;
         }
-        let cursor_byte = self.cursor_char();
-        // `anchor` is always ≤ the cursor (the prefix is the word chars left of
-        // it), so this replaces exactly the typed prefix.
-        self.buffer_mut().remove(acc.anchor..cursor_byte);
+        self.buffer_mut().remove(acc.anchor..remove_end);
         self.buffer_mut().insert(acc.anchor, &acc.insert);
         self.buffer_mut().normalize();
         self.buffer_mut().modified = true;
         self.set_cursor_char_insert(acc.anchor + acc.insert.len());
         true
+    }
+
+    /// Absolute byte offset of the end of the word the cursor sits in: the cursor
+    /// extended right over the run of word chars on its line. Equals the cursor when
+    /// the char at the cursor is not a word char (caret at a word's end, or on a
+    /// non-word char). The [`AcceptBehavior::Replace`] accept replaces up to here.
+    fn word_end_at_cursor(&self) -> usize {
+        let line = self.buffer().line(self.cursor.line);
+        let col = self.cursor.col.min(line.len());
+        let end = line[col..]
+            .char_indices()
+            .take_while(|&(_, c)| is_word_char(c))
+            .last()
+            .map_or(col, |(i, c)| col + i + c.len_utf8());
+        self.buffer().line_start(self.cursor.line) + end
     }
 
     /// The word prefix being completed: `(anchor, prefix)`, where `anchor` is the

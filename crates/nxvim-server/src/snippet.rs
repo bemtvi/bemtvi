@@ -70,6 +70,9 @@ impl EditHost {
     /// trigger word, entering the tabstop session. A malformed / unsupported body
     /// errors loud (echoed) and inserts nothing rather than dumping raw `$1` text.
     pub(crate) fn complete_snippet_accept(&mut self, idx: usize) {
+        // A `Replace`-behavior accept (caret mid-word) hands us the word end; taken up
+        // front so an early return can't leak it into the next accept.
+        let extend_to = self.editor.complete_accept_extend_to.take();
         let Some(entry) = self.snippet_complete.get(idx).cloned() else {
             return;
         };
@@ -87,8 +90,10 @@ impl EditHost {
         let line = self.editor.buffer().line(row);
         let word_start = trigger_word_start(&line, col);
         let line_start = self.editor.buffer().line_start(row);
+        // Extend the replaced span over the rest of the word under a `Replace` accept.
+        let end = extend_to.map_or(line_start + col, |e| (line_start + col).max(e));
         self.editor
-            .expand_snippet(line_start + word_start, line_start + col, parsed);
+            .expand_snippet(line_start + word_start, end, parsed);
     }
 
     /// Apply a `nx.snippet.add` registration to the per-filetype store.

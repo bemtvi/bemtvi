@@ -2559,6 +2559,7 @@ pub(crate) fn install_runtime_api(
         String,
         bool,
         i32,
+        String,
     );
     nx.set(
         "_complete_setup",
@@ -2579,6 +2580,7 @@ pub(crate) fn install_runtime_api(
                 trigger_chars,
                 snippets,
                 snippets_priority,
+                accept,
             ): CompleteSetupArgs| {
                 sh.borrow_mut().complete_setups.push(CompleteSetupReq {
                     auto,
@@ -2595,6 +2597,7 @@ pub(crate) fn install_runtime_api(
                     trigger_chars,
                     snippets,
                     snippets_priority,
+                    accept,
                 });
                 Ok(())
             },
@@ -2610,6 +2613,19 @@ pub(crate) fn install_runtime_api(
         "_complete_trigger",
         lua.create_function(move |_, ()| {
             sh.borrow_mut().complete_triggers.push(());
+            Ok(())
+        })?,
+    )?;
+
+    // `nx._complete_accept(behavior)`: queue an accept of the highlighted completion
+    // row under `behavior` (`"insert"` / `"replace"`, or `""` ⇒ the configured
+    // default). The remappable alternate to the default confirm key — a plugin binds
+    // two keys to the two behaviors. The server accepts the row after the chunk.
+    let sh = shared.clone();
+    nx.set(
+        "_complete_accept",
+        lua.create_function(move |_, behavior: String| {
+            sh.borrow_mut().complete_accepts.push(behavior);
             Ok(())
         })?,
     )?;

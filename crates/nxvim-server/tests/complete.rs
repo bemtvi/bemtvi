@@ -252,6 +252,100 @@ async fn suggests_a_distinct_occurrence_of_the_word_under_the_cursor() {
     assert_eq!(menu_items(&menu), vec!["AN_EXAMPLE"]);
 }
 
+/// Accepting a completion while the caret sits in the *middle* of a word replaces the
+/// **whole word** by default (`accept = "replace"`), not just the typed prefix: with
+/// the caret after `AN_` in `AN_EXAMPLE`, accepting `AN_OTHER` yields `AN_OTHER`, not
+/// `AN_OTHEREXAMPLE`.
+#[tokio::test]
+async fn accept_replaces_the_whole_word_by_default() {
+    let dir = temp_dir("complete_accept_replace");
+    let (rpc, mut incoming) = start(
+        &dir,
+        "nx.complete.setup { sources = { { 'buffer', min_chars = 2 } }, auto = false }",
+    )
+    .await;
+
+    // `AN_OTHER` on line 1 is the candidate; type `AN_EXAMPLE` on line 2, caret after
+    // `AN_` (7 chars from the end of the 10-char word).
+    feed(
+        &rpc,
+        "iAN_OTHER<CR>AN_EXAMPLE<Left><Left><Left><Left><Left><Left><Left>",
+    );
+    exec_lua(&rpc, "nx.complete.trigger()").await;
+    let menu = menu_of(&poll_menu(&rpc, &mut incoming).await.expect("popup opens"));
+    assert_eq!(menu_items(&menu), vec!["AN_OTHER"]);
+    feed(&rpc, "<C-y>");
+    assert_eq!(lines(&rpc).await, vec!["AN_OTHER", "AN_OTHER"]);
+}
+
+/// `accept = "insert"` keeps the suffix past the cursor — the old behavior: with the
+/// caret after `AN_` in `AN_EXAMPLE`, accepting `AN_OTHER` replaces only the `AN_`
+/// prefix, leaving `EXAMPLE` → `AN_OTHEREXAMPLE`.
+#[tokio::test]
+async fn accept_insert_behavior_keeps_the_word_suffix() {
+    let dir = temp_dir("complete_accept_insert");
+    let (rpc, mut incoming) = start(
+        &dir,
+        "nx.complete.setup { sources = { { 'buffer', min_chars = 2 } }, auto = false, \
+         accept = 'insert' }",
+    )
+    .await;
+
+    feed(
+        &rpc,
+        "iAN_OTHER<CR>AN_EXAMPLE<Left><Left><Left><Left><Left><Left><Left>",
+    );
+    exec_lua(&rpc, "nx.complete.trigger()").await;
+    let menu = menu_of(&poll_menu(&rpc, &mut incoming).await.expect("popup opens"));
+    assert_eq!(menu_items(&menu), vec!["AN_OTHER"]);
+    feed(&rpc, "<C-y>");
+    assert_eq!(lines(&rpc).await, vec!["AN_OTHER", "AN_OTHEREXAMPLE"]);
+}
+
+/// `nx.complete.accept{ behavior = … }` is remappable: two keys can accept under
+/// different behaviors regardless of the configured default. Here the default is
+/// `replace`, but a `<C-j>` mapped to `nx.complete.accept('insert')` keeps the suffix,
+/// while a `<C-l>` mapped to `nx.complete.accept('replace')` swaps the whole word.
+#[tokio::test]
+async fn mapped_accept_keys_choose_behavior() {
+    let dir = temp_dir("complete_accept_mapped");
+    let (rpc, mut incoming) = start(
+        &dir,
+        "nx.complete.setup { sources = { { 'buffer', min_chars = 2 } }, auto = false }\n\
+         nx.keymap.set('i', '<C-j>', function() nx.complete.accept('insert') end)\n\
+         nx.keymap.set('i', '<C-l>', function() nx.complete.accept('replace') end)",
+    )
+    .await;
+
+    // First word (line 2): accept with the insert-mapped key → suffix kept.
+    feed(
+        &rpc,
+        "iAN_OTHER<CR>AN_EXAMPLE<Left><Left><Left><Left><Left><Left><Left>",
+    );
+    exec_lua(&rpc, "nx.complete.trigger()").await;
+    assert_eq!(
+        menu_items(&menu_of(
+            &poll_menu(&rpc, &mut incoming).await.expect("popup")
+        )),
+        vec!["AN_OTHER"]
+    );
+    feed(&rpc, "<C-j>");
+    assert_eq!(lines(&rpc).await, vec!["AN_OTHER", "AN_OTHEREXAMPLE"]);
+
+    // Second word (line 3): accept with the replace-mapped key → whole word swapped.
+    feed(
+        &rpc,
+        "<Esc>oAN_EXAMPLE<Left><Left><Left><Left><Left><Left><Left>",
+    );
+    exec_lua(&rpc, "nx.complete.trigger()").await;
+    poll_menu(&rpc, &mut incoming).await.expect("popup reopens");
+    feed(&rpc, "<C-l>");
+    assert_eq!(
+        lines(&rpc).await,
+        vec!["AN_OTHER", "AN_OTHEREXAMPLE", "AN_OTHER"]
+    );
+}
+
 /// The completion trigger is a Lua keymap installed by `nx.complete.setup` (it is no
 /// longer a Rust native default). With `auto = false`, typing never opens the popup —
 /// only the default `<C-Space>` trigger key does. Pressing it opens the menu, proving

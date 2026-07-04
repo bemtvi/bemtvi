@@ -745,6 +745,11 @@ pub(crate) struct Shared {
     /// payload-free; the server runs `Editor::complete_manual_trigger` once if any
     /// arrived since the last drain.
     pub(crate) complete_triggers: Vec<()>,
+    /// Pending `nx.complete.accept{ behavior = … }` requests: each is the behavior
+    /// string (`"insert"` / `"replace"`, or `""` to use the configured default). The
+    /// server accepts the highlighted row under that behavior — the remappable
+    /// alternate to the default confirm key.
+    pub(crate) complete_accepts: Vec<String>,
     /// Streamed **async** completion candidates (`nx.complete` source `push`),
     /// drained by the server (generation-gated) into `Editor::menu_push` to append
     /// to the open completion popup. Empty for a buffer-only config. Phase 4-B.
@@ -1396,6 +1401,12 @@ impl LuaRuntime {
         /// Take the pending `nx.complete.trigger()` requests since the last drain;
         /// a non-empty result means the server runs a manual completion open.
         take_complete_triggers -> Vec<()> = complete_triggers
+    }
+
+    take_queue! {
+        /// Take the pending `nx.complete.accept{}` requests since the last drain; each
+        /// is a behavior string the server accepts the highlighted row under.
+        take_complete_accepts -> Vec<String> = complete_accepts
     }
 
     take_queue! {

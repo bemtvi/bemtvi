@@ -153,6 +153,10 @@ impl EditHost {
     /// its text, apply any `additionalTextEdits` (imports), and leave the cursor after
     /// the inserted text, all as one undo step. Stays in insert mode, as vim does.
     pub(crate) fn complete_lsp_accept(&mut self, key: usize) {
+        // A `Replace`-behavior accept (caret mid-word) hands us the word end to extend
+        // the replaced range to; taken up front so an early return can't leak it into
+        // the next accept. `None` ⇒ an `Insert` accept, or the caret was at the word end.
+        let extend_to = self.editor.complete_accept_extend_to.take();
         let Some(item) = self
             .lsp_complete
             .as_ref()
@@ -172,7 +176,7 @@ impl EditHost {
 
         // The primary edit: the item's explicit textEdit, else replace the word
         // (word_start..cursor) with insertText (falling back to the label).
-        let (primary_range, primary_text) = match &item.text_edit {
+        let (mut primary_range, primary_text) = match &item.text_edit {
             Some(edit) => (
                 self.lsp_range_to_bytes(&edit.range, encoding),
                 edit.new_text.clone(),
@@ -187,6 +191,11 @@ impl EditHost {
                 (start..end, text)
             }
         };
+        // Extend the primary range rightward over the rest of the word (the whole
+        // token is swapped, not just the typed prefix) under a `Replace` accept.
+        if let Some(end) = extend_to {
+            primary_range.end = primary_range.end.max(end);
+        }
 
         // A snippet item (`insertTextFormat = Snippet`): expand `primary_text`'s
         // `$1`/`${1:default}`/`$0` through the native engine rather than inserting it

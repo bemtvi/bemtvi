@@ -73,7 +73,7 @@ pub(crate) use self::command::{
     DockChord, FindKind, FoldCmd, Motion, MotionKind, MotionResult, MoveAxis, ObjectKind,
     PendingCommand, Stage,
 };
-pub use self::complete::{CompleteConfig, CompleteCtx, CompleteKeys};
+pub use self::complete::{AcceptBehavior, CompleteConfig, CompleteCtx, CompleteKeys};
 pub use self::decor::DecorViewport;
 pub use self::menu::{
     CmdlineCandidate, Extent, MenuGeom, MenuItem, MenuMetrics, MenuPlacement, PreviewScroll,
@@ -977,6 +977,13 @@ pub struct Editor {
     /// can't (the `lsp` source's `textEdit` + `additionalTextEdits`). `None` when the
     /// last accept was a native `buffer` insert (already applied in core).
     pub complete_accept_request: Option<usize>,
+    /// Paired with [`Editor::complete_accept_request`] for a **delegated** accept under
+    /// [`AcceptBehavior::Replace`]: the absolute byte offset the server should extend
+    /// the replaced range to (the end of the word the caret was inside), so the whole
+    /// word is swapped rather than just the typed prefix. `None` ⇒ the server stops at
+    /// the cursor (an `Insert` accept, or a caret already at the word's end). Taken by
+    /// the server when it applies the delegated edit.
+    pub complete_accept_extend_to: Option<usize>,
     /// The signature-help **auto-trigger** characters — the server's advertised
     /// `signatureHelpProvider.{trigger,retrigger}Characters`, pushed in by the host
     /// when an opted-in user has a server that advertises them attached. Non-empty
@@ -1676,6 +1683,7 @@ impl Editor {
             signature_auto_request: false,
             complete_gen: 0,
             complete_accept_request: None,
+            complete_accept_extend_to: None,
             cmdcomplete: cmdcomplete::CmdlineCompleteConfig::default(),
             cmdline_complete_saved: None,
             cmdline_complete_request: None,

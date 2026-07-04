@@ -85,6 +85,17 @@ fn qf_entry_from_item(it: QfItem) -> QfEntry {
     }
 }
 
+/// Map an `nx.complete` accept-behavior string to the core enum. `"insert"` keeps a
+/// word suffix past the cursor; anything else (`"replace"`, or an empty/unknown
+/// string) is the `Replace` default — swap the whole word. The Lua wrapper validates
+/// the surface, so this only ever sees the two names in practice.
+fn parse_accept_behavior(s: &str) -> nxvim_core::AcceptBehavior {
+    match s {
+        "insert" => nxvim_core::AcceptBehavior::Insert,
+        _ => nxvim_core::AcceptBehavior::Replace,
+    }
+}
+
 /// Project a core [`QfList`]'s entries into the [`QfMirror`] rows the Lua side
 /// reads (`nx._qflist` / `nx._loclist[win]`).
 fn qf_mirror_items(list: &nxvim_core::QfList) -> Vec<QfMirror> {
@@ -1044,6 +1055,7 @@ impl EditHost {
                 auto: req.auto,
                 min_chars: req.min_chars,
                 keys,
+                accept: parse_accept_behavior(&req.accept),
                 has_async: req.has_async,
                 buffer_priority: req.buffer_priority,
                 docs: req.docs,
@@ -1098,6 +1110,22 @@ impl EditHost {
         // arrived; it ignores `auto` / `min_chars` (an explicit request).
         if !self.lua.take_complete_triggers().is_empty() {
             self.editor.complete_manual_trigger();
+        }
+        // `nx.complete.accept{ behavior = … }` / a mapped key: accept the highlighted
+        // row under an explicit behavior (the remappable alternate to the default
+        // confirm key). An empty string uses the engine's configured default. The
+        // native edit applies here; a delegated (`lsp` / `snippets`) row sets
+        // `complete_accept_request`, drained by the trailing `run_pending`.
+        for behavior in self.lua.take_complete_accepts() {
+            match behavior.as_str() {
+                "" => {
+                    self.editor.complete_accept();
+                }
+                other => {
+                    self.editor
+                        .complete_accept_with(parse_accept_behavior(other));
+                }
+            }
         }
         // Picker candidates streamed in: feed them into the open widget,
         // generation-gated — a batch from a query the user has already typed past

@@ -1512,6 +1512,10 @@ pub struct CompleteSetupReq {
     pub snippets: bool,
     /// Merge priority of the `snippets` source (`0` when not configured).
     pub snippets_priority: i32,
+    /// What the confirm keys do when the caret sits mid-word: `"replace"` (default)
+    /// swaps the whole word, `"insert"` keeps the suffix past the cursor. The server
+    /// maps this to [`AcceptBehavior`](nxvim_core::AcceptBehavior).
+    pub accept: String,
 }
 
 /// A `nx.snippet.setup{}` request: the tabstop-jump keys as vim notation lists

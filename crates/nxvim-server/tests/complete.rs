@@ -1800,3 +1800,135 @@ async fn example_mouse_widgets_config_loads_and_completion_is_clickable() {
     feed_mouse(&rpc, "left", "press", row0, col);
     assert_eq!(lines(&rpc).await, vec!["function function"]);
 }
+
+/// The docs float window's `line_bg` layer as `(row, style_id)` pairs — the per-row
+/// line-background (neovim's `line_hl_group`) the client paints full-width under the
+/// text. The server only emits a row whose group resolved, so `style_id` is
+/// `Some(..)` in practice; `None` guards a malformed entry.
+fn win_line_bg(win: &[(Value, Value)]) -> Vec<(u64, Option<u64>)> {
+    match map_get(win, "line_bg") {
+        Some(Value::Array(a)) => a
+            .iter()
+            .filter_map(|e| {
+                let e = e.as_array()?;
+                Some((e.first()?.as_u64()?, e.get(1).and_then(Value::as_u64)))
+            })
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// A fenced code block in the docs float carries a full-width `line_hl_group`
+/// background on its body lines (the `@markup.raw.block` region under `:colorscheme
+/// nxvim`) — projected as the `line_bg` layer, *not* as a `@markup.raw.block` span in
+/// the winner-takes-cell `highlights` merge (the reverted approach that let syntax
+/// override it). The surrounding prose carries no background.
+#[tokio::test]
+async fn a_fenced_code_block_in_the_docs_float_carries_a_line_background() {
+    let dir = temp_dir("complete_docs_codeblock_bg");
+    let init = "\
+nx.complete.source {\n\
+  name = 'doc', debounce = 0,\n\
+  complete = function(ctx)\n\
+    if ('hello'):find(ctx.prefix, 1, true) == 1 then\n\
+      ctx.push { text = 'hello', doc = 'run:\\n\\n```\\nmake build\\n```' }\n\
+    end\n\
+  end,\n\
+}\n\
+nx.complete.setup { sources = { { 'doc' } } }\n\
+vim.cmd('colorscheme nxvim')";
+    let (rpc, mut incoming) = start(&dir, init).await;
+    feed(&rpc, "ihe");
+    let _ = poll_menu(&rpc, &mut incoming).await.expect("popup opens");
+    feed(&rpc, "<C-n>");
+    let win = poll_docs_win(&rpc, &mut incoming, |ls| {
+        ls.iter().any(|l| l.contains("make build"))
+    })
+    .await
+    .expect("docs float appears");
+    let vis = win_lines(&win);
+    let code_row = vis
+        .iter()
+        .position(|l| l.trim() == "make build")
+        .expect("the code body row is visible") as u64;
+    let prose_row = vis
+        .iter()
+        .position(|l| l.contains("run:"))
+        .expect("the prose row is visible") as u64;
+    let line_bg = win_line_bg(&win);
+    // The fenced body line carries a resolved line background...
+    assert!(
+        matches!(
+            line_bg.iter().find(|(r, _)| *r == code_row),
+            Some((_, Some(_)))
+        ),
+        "the code row {code_row} carries a resolved line_bg, got {line_bg:?}"
+    );
+    // ...while the prose above it does not — only the fenced region is a code block.
+    assert!(
+        !line_bg.iter().any(|(r, _)| *r == prose_row),
+        "the prose row {prose_row} carries no line_bg, got {line_bg:?}"
+    );
+    // Regression guard for the reverted fix: the block background is the `line_bg`
+    // layer, never a `@markup.raw.block` span in `highlights` (where the winner-takes-
+    // cell merge let syntax spans override it). So syntax colouring composes on top.
+    if let Some(Value::Array(hl)) = map_get(&win, "highlights") {
+        let as_span = hl
+            .iter()
+            .flat_map(|row| match row {
+                Value::Array(spans) => spans.clone(),
+                _ => Vec::new(),
+            })
+            .any(|span| {
+                matches!(&span, Value::Array(f)
+                    if f.get(2).and_then(Value::as_str) == Some("@markup.raw.block"))
+            });
+        assert!(
+            !as_span,
+            "the code-block background must be a line_bg layer, not a highlights span: {hl:?}"
+        );
+    }
+}
+
+/// A code line wider than the docs float **wraps**, and every wrapped display row
+/// carries the `line_bg` background — a `line_hl_group` marks the *buffer* line, and
+/// the projection walks screen rows, so each continuation row of the code line is
+/// backed (not just its first row).
+#[tokio::test]
+async fn a_wrapped_code_line_backs_every_continuation_row() {
+    let dir = temp_dir("complete_docs_codeblock_wrap");
+    // One code line far wider than the ≤~60-col docs float, so it wraps to several rows.
+    let long = "x".repeat(200);
+    let init = format!(
+        "\
+nx.complete.source {{\n\
+  name = 'doc', debounce = 0,\n\
+  complete = function(ctx)\n\
+    if ('hello'):find(ctx.prefix, 1, true) == 1 then\n\
+      ctx.push {{ text = 'hello', doc = '```\\n{long}\\n```' }}\n\
+    end\n\
+  end,\n\
+}}\n\
+nx.complete.setup {{ sources = {{ {{ 'doc' }} }} }}\n\
+vim.cmd('colorscheme nxvim')"
+    );
+    let (rpc, mut incoming) = start(&dir, &init).await;
+    feed(&rpc, "ihe");
+    let _ = poll_menu(&rpc, &mut incoming).await.expect("popup opens");
+    feed(&rpc, "<C-n>");
+    let win = poll_docs_win(&rpc, &mut incoming, |ls| {
+        ls.iter().any(|l| l.contains("xxxx"))
+    })
+    .await
+    .expect("docs float appears");
+    let line_bg = win_line_bg(&win);
+    // The single code line wraps to ≥2 display rows, each carrying a resolved background.
+    assert!(
+        line_bg.len() >= 2,
+        "the wrapped code line backs every continuation row (>=2), got {line_bg:?}"
+    );
+    assert!(
+        line_bg.iter().all(|(_, s)| s.is_some()),
+        "every wrapped code row carries a resolved line_bg, got {line_bg:?}"
+    );
+}

@@ -324,12 +324,41 @@ impl Editor {
                     })),
                 );
             }
+            // Back each fenced code block with a full-width `@markup.raw.block`
+            // line background (neovim's `line_hl_group`) — a point mark per block
+            // line, projected as the per-window `line_bg` layer and painted *under*
+            // the text. This is what makes a code block read as a solid code region:
+            // it spans the full width (unlike a char-range span) and composes with the
+            // per-language syntax spans lowered below (unlike a merged background span,
+            // which the syntax winner-takes-cell resolution would override). A
+            // language-less fence gets the background with no syntax on top. Blank
+            // lines inside the block carry the marker too, so they still tint.
+            for block in &rendered.code {
+                let end = (block.first_line + block.len).min(b.line_count());
+                for line in block.first_line..end {
+                    let at = b.line_start(line);
+                    b.extmarks.set(
+                        DOC_MD_NS,
+                        None,
+                        at,
+                        None,
+                        None,
+                        DEFAULT_PRIORITY,
+                        Some(Box::new(VirtDecor {
+                            line_hl_group: Some("@markup.raw.block".to_string()),
+                            ..VirtDecor::default()
+                        })),
+                    );
+                }
+            }
         }
 
         // Fenced code blocks: highlight each block's text in its own language and
-        // lower the resulting spans onto the buffer as extmarks. Fail-soft — a block
-        // with no `lang` or no installed grammar simply stays plain (the background
-        // above still reads it as code).
+        // lower the resulting spans onto the buffer as extmarks — these sit *on top*
+        // of the full-width `@markup.raw.block` line background set above (a separate
+        // `line_bg` layer, so they compose rather than fight the winner-takes-cell
+        // merge). Fail-soft — a block with no `lang` or no installed grammar simply
+        // stays plain, still reading as code via that background.
         for block in &rendered.code {
             let Some(lang) = block.lang.as_deref() else {
                 continue;

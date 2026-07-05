@@ -1309,11 +1309,23 @@
       if (scrollAnim && w.focused) {
         renderScrollBand(box, w, rect, winSpans);
       } else {
+        // The line-background layer (`line_hl_group` — e.g. rendered-markdown code
+        // blocks in a doc float): per screen row, the palette bg to tint the whole
+        // row with, the `'cursorline'` model. Resolved once per window; cell spans
+        // paint their own bg over it, so syntax colouring composes on top.
+        const lineBg = {};
+        for (const [row, id] of (w.line_bg || [])) {
+          const bg = cssColor(paletteStyle(id)?.bg);
+          if (bg) lineBg[row] = bg;
+        }
         for (let r = 0; r < textRows; r++) {
           const rowEl = document.createElement("div");
           rowEl.className = "row";
           rowEl.style.top = r * ch + "px";
           rowEl.style.width = rect.width * cw + "px";
+          // A `line_hl_group` background on this row, painted before the cursorline
+          // tint (below) so the cursor's active line still wins where both apply.
+          if (lineBg[r]) rowEl.style.background = lineBg[r];
           // `'cursorline'`: tint the cursor's screen row across the window width. The
           // cell spans below paint their own bg over it where they have one (cursor,
           // selection, search), so only the untouched cells show the tint. The cursor

@@ -134,7 +134,9 @@ hl(0, "@markup.strikethrough", { strikethrough = true })
 -- Inline `code`: the string colour on a code-region background, so it stands out from
 -- prose (in a rendered doc float / hover the inline-code span composes cleanly). A
 -- fenced ```block``` reads as code via its per-language syntax colouring; the
--- `@markup.raw.block` background is defined for markdown-typed *buffers*.
+-- `@markup.raw.block` background additionally backs each fenced code-block line as a
+-- full-width `line_hl_group` region (the doc-float hover / completion / cmdline docs
+-- surfaces paint it via the `line_bg` layer), and will back markdown-typed *buffers*.
 hl(0, "@markup.raw",         { fg = p.green, bg = p.cursor_line })
 hl(0, "@markup.raw.block",   { bg = p.cursor_line })
 hl(0, "@markup.link.label",  { fg = p.blue })

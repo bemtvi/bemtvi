@@ -1279,6 +1279,18 @@ impl Renderer {
                 if win.chrome.normal.is_some() {
                     self.fill_rect(quads, ox, oy, wcols, text_rows, normal_bg);
                 }
+                // The line-background layer (`line_hl_group` — e.g. rendered-markdown
+                // code blocks in a doc float): tint each marked screen row across the
+                // whole window (sign + gutter + text), the `'cursorline'` model. Pushed
+                // before the per-row quads (and the cursorline tint below), so those —
+                // and every glyph — draw on top and syntax colouring composes with it.
+                for &(brow, style) in &win.line_bg {
+                    if (brow as usize) < text_rows as usize {
+                        if let Some(bg) = style_bg(&Some(style)) {
+                            self.fill_cells(quads, ox, oy + brow, wcols, bg);
+                        }
+                    }
+                }
                 for (i, raw) in win.lines.iter().enumerate() {
                     let row = oy as usize + i;
 

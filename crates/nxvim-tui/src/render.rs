@@ -1045,6 +1045,23 @@ fn render_window(
         frame.render_widget(Block::default().style(bg), text_area);
     }
 
+    // The line-background layer (`line_hl_group` — e.g. rendered-markdown code
+    // blocks in a doc float): tint each marked screen row across the whole window
+    // width, the `'cursorline'` model (a full-width `Block` under the gutter, text,
+    // and overlays, so those all draw on top and syntax colouring composes with the
+    // tint). Painted *before* the cursorline tint so the cursor's active line still
+    // wins on a row that carries both. Rows the server didn't mark add nothing.
+    for &(brow, style) in &win.line_bg {
+        let row = text_area.y + brow.min(text_area.height.saturating_sub(1));
+        let line_area = Rect {
+            x: text_area.x,
+            y: row,
+            width: text_area.width,
+            height: 1,
+        };
+        frame.render_widget(Block::default().style(rt(style)), line_area);
+    }
+
     // `'cursorline'`: tint the cursor's screen row across the whole window width
     // (sign column, gutter, and text). Painted right after the `Normal` background
     // so the gutter numbers, text spans, and overlays (selection / search /

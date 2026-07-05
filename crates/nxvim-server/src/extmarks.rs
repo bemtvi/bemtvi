@@ -307,6 +307,70 @@ impl EditHost {
         Value::Array(rows)
     }
 
+    /// The **line-background** layer (neovim's `line_hl_group`, `hl_eol` semantics):
+    /// per visible screen row whose buffer line carries a `line_hl_group` extmark,
+    /// the pair `[row, style_id]` — the group resolved (with `winhighlight` remap)
+    /// into this frame's `styles` palette. The client paints each row's background
+    /// across the full text width *before* the text, the way `'cursorline'` does, so
+    /// syntax spans / selection / search compose on top. Emitted on **both** builds
+    /// (the marker is a core extmark; the doc-float renderer sets it): an empty array
+    /// when no visible line carries one, keeping the wire shape stable.
+    ///
+    /// Wrapping is handled for free: [`RowSeg::line`](crate::redraw::RowSeg::line)
+    /// maps each *screen* row to its buffer line, so every wrapped continuation row of
+    /// a marked line gets the same background. Where several `line_hl_group` marks
+    /// anchor on one line the highest [`priority`](nxvim_core::Extmark::priority) wins.
+    pub(crate) fn line_bg_for(
+        &self,
+        buffer: BufferId,
+        winhl: &WinHl,
+        segs: &[crate::redraw::RowSeg],
+        styles: &mut StyleTable,
+    ) -> Value {
+        let empty = || Value::Array(Vec::new());
+        let Some(buf) = self.editor.buffer_of(buffer) else {
+            return empty();
+        };
+        // Bucket line_hl_group marks by their anchor buffer line (0-based), keeping
+        // the highest-priority group per line. Cheap: the mark set is small, scanned
+        // once per frame (like `virt_text_for`).
+        use std::collections::HashMap;
+        let mut by_line: HashMap<usize, (&str, u32)> = HashMap::new();
+        for m in buf.extmarks.iter_all() {
+            let Some(group) = m.decor.as_deref().and_then(|d| d.line_hl_group.as_deref()) else {
+                continue;
+            };
+            let line = buf.byte_to_line(m.start);
+            by_line
+                .entry(line)
+                .and_modify(|e| {
+                    if m.priority >= e.1 {
+                        *e = (group, m.priority);
+                    }
+                })
+                .or_insert((group, m.priority));
+        }
+        if by_line.is_empty() {
+            return empty();
+        }
+        let rows: Vec<Value> = segs
+            .iter()
+            .enumerate()
+            .filter_map(|(row, seg)| {
+                let group = by_line.get(&(seg.line? - 1))?.0;
+                // A `line_hl_group` is a named highlight group (not a treesitter
+                // capture), so resolve it directly — the same `resolve_winhl` the
+                // extmark `hl_group` projection uses for its direct groups.
+                let style = self.resolve_winhl(winhl, group)?;
+                Some(Value::Array(vec![
+                    Value::from(row as u64),
+                    Value::from(styles.intern(style) as u64),
+                ]))
+            })
+            .collect();
+        Value::Array(rows)
+    }
+
     /// Encode one virtual-text placement as `[pos, col, hl_mode, chunks]`, resolving
     /// each chunk's `hl_group` to a frame-palette style id (`Nil` when the group is
     /// absent or unresolved — the client then paints in normal colors).

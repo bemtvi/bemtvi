@@ -514,6 +514,29 @@ pub(crate) fn chrome_style(chrome: Option<&Value>, key: &str, styles: &[Style]) 
     styles.get(id).copied()
 }
 
+/// Parse the per-window `line_bg` layer — the line-background rows (neovim's
+/// `line_hl_group`, `hl_eol` semantics): each entry is `[row, style_id]`, resolved
+/// against this frame's `styles` palette to `(row, Style)`. The renderer paints each
+/// row's background across the full text-area width *before* the text, the way
+/// `'cursorline'` does, so syntax spans compose on top. A malformed entry, or one
+/// whose `style_id` the palette doesn't hold, is dropped; an absent / empty array
+/// (an older server, or no line backgrounds) yields an empty vec.
+pub(crate) fn parse_line_bg(value: Option<&Value>, styles: &[Style]) -> Vec<(u16, Style)> {
+    value
+        .and_then(Value::as_array)
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| {
+                    let e = v.as_array()?;
+                    let row = e.first()?.as_u64()? as u16;
+                    let id = e.get(1)?.as_u64()? as usize;
+                    Some((row, *styles.get(id)?))
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 /// Parse a per-row array of 1-based line numbers (`Nil` rows become `None`).
 pub(crate) fn parse_numbers(value: Option<&Value>) -> Vec<Option<usize>> {
     value

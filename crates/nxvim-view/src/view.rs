@@ -10,10 +10,10 @@ use rmpv::Value;
 use crate::parse::{
     chrome_style, map_get, map_str, map_str_array, map_u16, map_u64, parse_bools, parse_border,
     parse_cursor_list, parse_diagnostics, parse_diagnostics_signs, parse_diagnostics_virt,
-    parse_float_lines, parse_highlights, parse_inlay_hints, parse_multi_spans, parse_numbers,
-    parse_padding, parse_pair, parse_pmenu_items, parse_spans, parse_status, parse_styles,
-    parse_virt_lines, parse_virt_text, DiagSign, DiagSpan, DiagVirt, HlSpan, IncSearchSpans,
-    InlayHint, PmenuItem, SearchSpans, StatusSegment, VirtChunk, VirtPlacement,
+    parse_float_lines, parse_highlights, parse_inlay_hints, parse_line_bg, parse_multi_spans,
+    parse_numbers, parse_padding, parse_pair, parse_pmenu_items, parse_spans, parse_status,
+    parse_styles, parse_virt_lines, parse_virt_text, DiagSign, DiagSpan, DiagVirt, HlSpan,
+    IncSearchSpans, InlayHint, PmenuItem, SearchSpans, StatusSegment, VirtChunk, VirtPlacement,
 };
 use crate::style::{Border, Style};
 
@@ -230,6 +230,14 @@ pub struct WindowView {
     /// (`cursor_row`) with the [`View::cursor_line`] background. `false` from an
     /// older server that omits the key.
     pub cursorline: bool,
+    /// The **line-background** layer (neovim's `line_hl_group`, `hl_eol` semantics):
+    /// per screen row that carries a line background, the pair `(row, style)`. The
+    /// renderer paints each row's background across the full text-area width *before*
+    /// the text — the `'cursorline'` model — so the gutter, text spans, and overlays
+    /// draw on top and syntax colouring composes with the tint. Used by the rendered
+    /// markdown doc floats to back fenced code blocks. Empty from an older server (no
+    /// key) or when no visible line carries a background.
+    pub line_bg: Vec<(u16, Style)>,
     pub number_width: u16,
     /// `'foldcolumn'` width in cells (`0` when off): how many cells the renderer
     /// reserves for the fold-marker gutter, to the left of the sign / number
@@ -1042,6 +1050,7 @@ fn parse_window(m: &[(Value, Value)], styles: &[Style]) -> WindowView {
         cursorline: map_get(m, "cursorline")
             .and_then(Value::as_bool)
             .unwrap_or(false),
+        line_bg: parse_line_bg(map_get(m, "line_bg"), styles),
         number_width: map_u16(m, "number_width"),
         foldcolumn_width: map_u16(m, "foldcolumn_width"),
         foldcolumn: map_str_array(m, "foldcolumn"),

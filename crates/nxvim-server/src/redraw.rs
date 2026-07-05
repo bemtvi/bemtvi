@@ -442,6 +442,12 @@ impl EditHost {
         // above); the server only resolves each chunk's `hl_group` to a frame style id.
         // Shared like `virt_text`.
         let virt_lines = self.virt_lines_value(&virt_lines, &win.winhl, styles);
+        // The line-background layer (`line_hl_group`): per screen row whose buffer
+        // line carries one, `[row, style_id]`. Painted under the text like
+        // `'cursorline'`, so the doc-float code blocks read as full-width code regions
+        // with syntax composed on top. Core-/tick-shared (a core extmark), so BOTH
+        // builds project it.
+        let line_bg = self.line_bg_for(win.buffer, &win.winhl, &segments, styles);
         // The gutter signs (extmark `sign_text` merged with the LSP diagnostic signs)
         // and the resulting column width. Both sign sources are core-/tick-shared, so
         // this projects on BOTH builds; the width then follows the same `'signcolumn'`
@@ -622,6 +628,7 @@ impl EditHost {
             (Value::from("diagnostics_virt"), diagnostics_virt),
             (Value::from("virt_text"), virt_text),
             (Value::from("virt_lines"), virt_lines),
+            (Value::from("line_bg"), line_bg),
             (Value::from("diagnostics_signs"), diagnostics_signs),
             (Value::from("sign_width"), Value::from(sign_width as u64)),
             (Value::from("inlay_hints"), inlay_hints),
@@ -979,6 +986,9 @@ impl EditHost {
         // `window_value`), so they slide with the text instead of flashing on settle.
         let virt_text = self.virt_text_for(buffer, winhl, &segments, &selection, styles);
         let virt_lines = self.virt_lines_value(&virt_lines, winhl, styles);
+        // The line-background layer rides the band too, so a code block's tint slides
+        // with the text (mirrors `window_value`).
+        let line_bg = self.line_bg_for(buffer, winhl, &segments, styles);
         Value::Map(vec![
             (Value::from("from_row"), Value::from(s.from_row as u64)),
             (Value::from("to_row"), Value::from(s.to_row as u64)),
@@ -1011,6 +1021,7 @@ impl EditHost {
             (Value::from("inlay_hints"), inlay_hints),
             (Value::from("virt_text"), virt_text),
             (Value::from("virt_lines"), virt_lines),
+            (Value::from("line_bg"), line_bg),
             (Value::from("diagnostics_virt"), diagnostics_virt),
             (Value::from("diagnostics"), diagnostics),
             (Value::from("diagnostics_signs"), diagnostics_signs),

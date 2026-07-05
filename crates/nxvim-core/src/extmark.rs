@@ -161,6 +161,16 @@ pub struct VirtDecor {
     /// filler row), in [`hl_group`](VirtChunk::hl_group). Rendered as a full-width
     /// overlay so a client needs no new wire field. `None` ⇒ no fill.
     pub line_fill: Option<VirtChunk>,
+    /// neovim's `line_hl_group` — a highlight group that backs the **whole line**
+    /// (full width, `hl_eol` semantics), not a char range. A mark carrying it means
+    /// "tint this line's background with that group". Unlike an `hl_group` range span
+    /// (which merges into the winner-takes-cell resolution and so loses every cell a
+    /// syntax span covers, and never reaches past the text) this projects as a
+    /// separate per-window `line_bg` layer the clients paint *under* the text — the
+    /// [`cursorline`](crate::view::WindowView::cursorline) model — so syntax colouring
+    /// composes on top and the fill spans the full width. Used by the rendered
+    /// markdown doc floats to back fenced code blocks. `None` ⇒ no line background.
+    pub line_hl_group: Option<String>,
 }
 
 /// A single extmark, identified within its buffer by `(namespace, id)`.

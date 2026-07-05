@@ -1047,13 +1047,15 @@ pub(crate) fn install_runtime_api(
     })?;
     nx.set("_runtime_file", runtime_file)?;
 
-    // `nx._add_rtp(dir)`: append `dir` to the live runtimepath and prepend its
-    // `lua/` patterns to `package.path`, so the directory's modules are
-    // `require`-able and its `colors/` / `queries/` / `lsp/` resolve through
-    // `nvim_get_runtime_file` — all without a restart. The package manager
-    // (`nx.plugins`) calls this the instant a plugin is on disk, before it sources
-    // the plugin's `plugin/` scripts or runs its `config`. Idempotent: a dir
-    // already on the path is a no-op (no duplicate `package.path` entries).
+    // `nx._add_rtp(dir)`: append `dir` to the live runtimepath and rebuild
+    // `package.path` from it, so the directory's modules are `require`-able and its
+    // `colors/` / `queries/` / `lsp/` resolve through `nvim_get_runtime_file` — all
+    // without a restart. The package manager (`nx.plugins`) calls this the instant a
+    // plugin is on disk, before it sources the plugin's `plugin/` scripts or runs its
+    // `config`. The rebuild keeps runtimepath order, so a plugin's `lua/` lands AFTER
+    // the config dir (which is first) — a plugin can never shadow the user's own
+    // `require("plugins")` / config module. Idempotent: a dir already on the path is a
+    // no-op (no duplicate `package.path` entries).
     let rtp_add = runtimepath.clone();
     nx.set(
         "_add_rtp",
@@ -1063,9 +1065,8 @@ pub(crate) fn install_runtime_api(
             if paths.contains(&path) {
                 return Ok(false);
             }
-            paths.push(path.clone());
-            drop(paths);
-            crate::host::seed_one_package_path(lua, &path)?;
+            paths.push(path);
+            crate::host::seed_package_path(lua, &paths)?;
             Ok(true)
         })?,
     )?;

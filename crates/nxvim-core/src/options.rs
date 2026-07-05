@@ -1093,6 +1093,16 @@ pub struct BufferOptions {
     /// between an open/close pair lays the closer on its own dedented line. Off by
     /// default.
     pub autopairs: bool,
+    /// Whether the `=` reindent operator lays indentation onto **blank** lines
+    /// (nxvim's own, no vim equivalent — VS Code's editor exposes the same
+    /// toggle). Off by default, matching neovim: `op_reindent` forces a
+    /// whitespace-only line to column 0 and never asks the indent source
+    /// (treesitter / `smartindent` / `autoindent`) for its verdict, so `=`
+    /// leaves — and actively clears — empty lines at column 0. Turn it on to
+    /// keep the enclosing block's indent on blank lines instead (some
+    /// formatters and coding styles prefer it). Only affects `=`; a freshly
+    /// *opened* line via `o`/`<CR>` is still pre-indented regardless.
+    pub indentemptylines: bool,
     /// This buffer's `'regexsyntax'` override for `/` search and `:substitute`, or
     /// [`Inherit`](RegexSyntax::Inherit) (the default) to follow the global
     /// [`Options::regexsyntax`]. Resolved by [`crate::Editor::search_engine`].
@@ -1151,6 +1161,9 @@ impl Default for BufferOptions {
             autoindent: false,
             smartindent: false,
             autopairs: false,
+            // `=` clears blank lines to column 0 out of the box (neovim's
+            // behavior); opt in to keep the block indent on them.
+            indentemptylines: false,
             // No buffer-local override out of the box: follow the global option.
             regexsyntax: RegexSyntax::Inherit,
             // UTF-8 on disk by default; no BOM. Read detection (a later phase)
@@ -1475,6 +1488,13 @@ static OPTIONS: &[OptionInfo] = {
             kind: Bool,
             scope: Buffer,
             doc: "Auto-close and pair-edit brackets and quotes: ( [ { ' \".",
+        },
+        OptionInfo {
+            name: "indentemptylines",
+            abbrev: Some("iel"),
+            kind: Bool,
+            scope: Buffer,
+            doc: "Let = indent blank lines instead of clearing them to column 0.",
         },
         OptionInfo {
             name: "regexsyntax",

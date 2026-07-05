@@ -1162,6 +1162,13 @@ pub struct Editor {
     /// Set when an undo snapshot has already been taken for the current edit
     /// "session" (e.g. an insert), so we group the whole session into one undo.
     snapshot_taken: bool,
+    /// The line an auto-indent (`o`/`O`/`<CR>`) just filled with indentation that
+    /// the cursor still sits in, *untouched* — vim's `did_ai`. Any content key
+    /// clears it (the next `handle_insert` takes it); if it survives to `<Esc>`
+    /// the auto-indent is scrubbed so leaving an opened line without typing yields
+    /// a truly-empty line, not trailing whitespace. Suppressed by the
+    /// `indentemptylines` opt-in (same knob as the `=` blank-line rule).
+    ai_open_line: Option<usize>,
     /// Current time in **monotonic** seconds, injected by the server before each
     /// message (core does no I/O, so it can't read a clock itself). Stamped onto
     /// undo nodes at commit and surfaced via `vim.fn.undotree()`/`localtime()`;
@@ -1728,6 +1735,7 @@ impl Editor {
             insert_text: String::new(),
             pending_visual: None,
             snapshot_taken: false,
+            ai_open_line: None,
             now_mono: 0,
             now_ms: 0,
             soft_tab: None,

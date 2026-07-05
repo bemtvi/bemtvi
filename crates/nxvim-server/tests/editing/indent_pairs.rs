@@ -192,3 +192,146 @@ async fn example_config_enables_smart_indent_end_to_end() {
         "smartindent carried the block indent and autopairs closed the paren",
     );
 }
+
+// ===== `=` reindent: blank lines =============================================
+//
+// The `=` operator mirrors neovim's `op_reindent`: a blank line is forced to
+// column 0 and never handed to the indent source (which would return the
+// enclosing block's indent), so `=` never leaves whitespace on an empty line.
+// The `indentemptylines` opt-in restores the old fill-the-block behavior.
+
+/// Seed the buffer with a brace block wrapping one blank line — `{` / `` / `}`
+/// — with `expandtab shiftwidth=4` so the assertions read as literal spaces.
+/// Typed with no indent source active, so the three lines land verbatim.
+async fn seed_brace_block_with_blank(rpc: &Rpc) {
+    feed(rpc, ":set expandtab shiftwidth=4<CR>");
+    feed(rpc, "i{<CR><CR>}<Esc>");
+    assert_eq!(lines(rpc).await, vec!["{", "", "}"], "seed");
+}
+
+#[tokio::test]
+async fn reindent_leaves_blank_lines_empty_by_default() {
+    let (rpc, _incoming) = start(None).await;
+    seed_brace_block_with_blank(&rpc).await;
+    // smartindent would indent the blank middle line to the block's depth; `=`
+    // must instead leave it at column 0 (the reported bug added `    ` there).
+    feed(&rpc, ":set smartindent<CR>");
+    feed(&rpc, "gg=G");
+    assert_eq!(lines(&rpc).await, vec!["{", "", "    }"]);
+}
+
+#[tokio::test]
+async fn reindent_indents_blank_lines_when_indentemptylines_set() {
+    let (rpc, _incoming) = start(None).await;
+    seed_brace_block_with_blank(&rpc).await;
+    // Opt in: `=` now fills the blank line to the enclosing block's indent.
+    feed(&rpc, ":set smartindent indentemptylines<CR>");
+    feed(&rpc, "gg=G");
+    assert_eq!(lines(&rpc).await, vec!["{", "    ", "    }"]);
+}
+
+#[tokio::test]
+async fn indentemptylines_option_reads_back_through_vim_bo() {
+    let (rpc, _incoming) = start(None).await;
+    feed(&rpc, ":set indentemptylines<CR>");
+    let v = exec_lua(&rpc, "return vim.bo.indentemptylines").await;
+    assert_eq!(
+        v.as_bool(),
+        Some(true),
+        "vim.bo.indentemptylines reflects :set"
+    );
+    // The `iel` abbrev round-trips too.
+    feed(&rpc, ":set noiel<CR>");
+    let v = exec_lua(&rpc, "return vim.bo.indentemptylines").await;
+    assert_eq!(v.as_bool(), Some(false), ":set noiel clears it");
+}
+
+// ===== insert `<CR>`: the line left behind ===================================
+
+#[tokio::test]
+async fn double_enter_leaves_no_trailing_whitespace() {
+    // Pressing `<CR>` twice inside an indented block leaves the middle line
+    // *truly* empty — the block stays indented, the hole doesn't carry the
+    // auto-indent whitespace (vim's autoindent behavior).
+    let (rpc, _incoming) = start(None).await;
+    feed(&rpc, ":set expandtab shiftwidth=4 smartindent<CR>");
+    feed(&rpc, "iif x {<CR>foo<CR><CR>bar<Esc>");
+    assert_eq!(lines(&rpc).await, vec!["if x {", "    foo", "", "    bar"]);
+}
+
+#[tokio::test]
+async fn double_enter_keeps_indent_when_indentemptylines_set() {
+    // With the opt-in, the auto-indent is left on the blank line, matching the
+    // pre-fix behavior for users who want it.
+    let (rpc, _incoming) = start(None).await;
+    feed(
+        &rpc,
+        ":set expandtab shiftwidth=4 smartindent indentemptylines<CR>",
+    );
+    feed(&rpc, "iif x {<CR>foo<CR><CR>bar<Esc>");
+    assert_eq!(
+        lines(&rpc).await,
+        vec!["if x {", "    foo", "    ", "    bar"]
+    );
+}
+
+// ===== `o` / `<CR>` then immediate `<Esc>`: the did_ai scrub =================
+
+#[tokio::test]
+async fn open_line_then_escape_leaves_no_trailing_whitespace() {
+    // `o` opens an auto-indented line; pressing `<Esc>` without typing scrubs
+    // the indent so the line is truly empty (vim's did_ai), not `    `.
+    let (rpc, _incoming) = start(None).await;
+    feed(&rpc, ":set expandtab shiftwidth=4 smartindent<CR>");
+    feed(&rpc, "iif x {<Esc>");
+    feed(&rpc, "o<Esc>");
+    assert_eq!(lines(&rpc).await, vec!["if x {", ""]);
+}
+
+#[tokio::test]
+async fn enter_then_escape_leaves_no_trailing_whitespace() {
+    // The `<CR>`-then-immediate-`<Esc>` variant: the freshly opened line is
+    // scrubbed the same way.
+    let (rpc, _incoming) = start(None).await;
+    feed(&rpc, ":set expandtab shiftwidth=4 smartindent<CR>");
+    feed(&rpc, "iif x {<CR><Esc>");
+    assert_eq!(lines(&rpc).await, vec!["if x {", ""]);
+}
+
+#[tokio::test]
+async fn open_line_then_type_keeps_the_indent() {
+    // Typing on the opened line clears the did_ai arm, so the indent stays —
+    // only an *untouched* auto-indent is scrubbed.
+    let (rpc, _incoming) = start(None).await;
+    feed(&rpc, ":set expandtab shiftwidth=4 smartindent<CR>");
+    feed(&rpc, "iif x {<Esc>");
+    feed(&rpc, "obody<Esc>");
+    assert_eq!(lines(&rpc).await, vec!["if x {", "    body"]);
+}
+
+#[tokio::test]
+async fn escape_does_not_scrub_a_preexisting_whitespace_line() {
+    // Entering insert on a line that already holds whitespace (not auto-indent)
+    // and leaving without typing preserves it — did_ai only fires for indent the
+    // open *itself* generated, matching vim.
+    let (rpc, _incoming) = start(None).await;
+    feed(&rpc, ":set expandtab shiftwidth=4<CR>");
+    // Build a whitespace-only line without any auto-indent in play.
+    feed(&rpc, "i    <Esc>");
+    assert_eq!(lines(&rpc).await, vec!["    "], "seed a spaces-only line");
+    // Re-enter insert on it and leave without typing: the spaces survive.
+    feed(&rpc, "A<Esc>");
+    assert_eq!(lines(&rpc).await, vec!["    "]);
+}
+
+#[tokio::test]
+async fn open_line_then_escape_keeps_indent_when_indentemptylines_set() {
+    let (rpc, _incoming) = start(None).await;
+    feed(
+        &rpc,
+        ":set expandtab shiftwidth=4 smartindent indentemptylines<CR>",
+    );
+    feed(&rpc, "iif x {<Esc>");
+    feed(&rpc, "o<Esc>");
+    assert_eq!(lines(&rpc).await, vec!["if x {", "    "]);
+}

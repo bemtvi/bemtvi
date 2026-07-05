@@ -184,8 +184,20 @@ impl Editor {
     fn reindent_lines(&mut self, first: usize, last: usize) {
         self.push_undo();
         let last = last.min(self.last_line());
+        let indent_blanks = self.buffer().options.indentemptylines;
         for line in first..=last {
-            let width = self.indent_for(line);
+            // A blank line is forced to column 0, never handed to the indent
+            // source — mirroring neovim's `op_reindent` (`amount = *l == NUL ?
+            // 0 : how()`): treesitter/smartindent would happily return the
+            // enclosing block's indent for an empty line (correct for a freshly
+            // *opened* line via `o`/`<CR>`, wrong for `=`), so `=` bypasses them
+            // and clears any whitespace-only line to truly empty. The
+            // `indentemptylines` option opts back into filling blank lines.
+            let width = if !indent_blanks && self.buffer().line(line).trim().is_empty() {
+                0
+            } else {
+                self.indent_for(line)
+            };
             self.set_line_indent(line, width);
         }
         self.buffer_mut().modified = true;
@@ -734,6 +746,9 @@ impl Editor {
         self.cursor.col = self.set_line_indent(self.cursor.line, width);
         self.mode = Mode::Insert;
         self.snapshot_taken = true;
+        // Arm the did_ai scrub: a nonzero auto-indent on the freshly-opened
+        // (empty) line, untouched, so `<Esc>` with nothing typed clears it.
+        self.ai_open_line = (width > 0).then_some(self.cursor.line);
     }
 
     /// Install the host clipboard backing the `"+` / `"*` registers. The server

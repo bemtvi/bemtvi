@@ -1789,6 +1789,7 @@ impl EditHost {
                     autoindent: o.autoindent,
                     smartindent: o.smartindent,
                     autopairs: o.autopairs,
+                    indentemptylines: o.indentemptylines,
                     regexsyntax: self.editor.resolve_regexsyntax(o.regexsyntax).to_string(),
                     fileencoding: o.fileencoding.to_string(),
                     bomb: o.bomb,

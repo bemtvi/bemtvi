@@ -303,6 +303,9 @@ pub struct BoMirror {
     pub autoindent: bool,
     pub smartindent: bool,
     pub autopairs: bool,
+    /// Whether `=` reindents blank lines (`'indentemptylines'`), mirrored so
+    /// `nx.bo.indentemptylines` / `vim.bo.indentemptylines` read the core value.
+    pub indentemptylines: bool,
     /// The buffer's *effective* `'regexsyntax'` dialect (`"pcre"`/`"vim"`) — its
     /// local override resolved against the global, so `vim.bo.regexsyntax` reads
     /// what `/`/`:s` actually use in this buffer.

@@ -875,6 +875,10 @@ local BUF_OPT_CANON = {
   smartindent = "smartindent",
   si = "smartindent",
   autopairs = "autopairs",
+  -- Whether `=` reindents blank lines (default off ⇒ blank lines snap to
+  -- column 0); a write reaches the live editor, a read returns the core value.
+  indentemptylines = "indentemptylines",
+  iel = "indentemptylines",
   -- The buffer-local override of the global `regexsyntax` dialect for `/` and
   -- `:s`. `nx.bo.regexsyntax = "vim"` pins this buffer; reads return the
   -- *effective* dialect (the override resolved against the global).

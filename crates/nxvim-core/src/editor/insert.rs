@@ -90,6 +90,22 @@ impl Editor {
         // and park the cursor past the indent — vim's `Enter` behavior.
         let width = self.indent_for(self.cursor.line);
         self.cursor.col = self.set_line_indent(self.cursor.line, width);
+        // The line just left behind is blank when you press `<CR>` without
+        // typing on it (two `<CR>`s in a row, or `<CR>` on a fresh auto-indent):
+        // vim removes its auto-indent so the empty line is *truly* empty, not a
+        // run of trailing whitespace — the block stays indented, the hole
+        // doesn't. Gated by the same `indentemptylines` opt-in as `=`.
+        if !self.buffer().options.indentemptylines {
+            let left = self.cursor.line - 1;
+            if self.buffer().line(left).trim().is_empty() {
+                self.set_line_indent(left, 0);
+            }
+        }
+        // Arm the did_ai scrub for the new line too, but only when it is now
+        // whitespace-only — a `<CR>` in the *middle* of a line carries real text
+        // onto the new line, which must keep its indent on `<Esc>`.
+        self.ai_open_line = (width > 0 && self.buffer().line(self.cursor.line).trim().is_empty())
+            .then_some(self.cursor.line);
     }
 
     /// Finish an auto-pairs `<CR>` block expansion. On entry the opener line is
@@ -190,11 +206,25 @@ impl Editor {
         // `<Tab>` (or a chained soft-tab `<BS>`). Take it here so every key clears
         // it; only the Tab/Backspace arms thread it through and may re-arm it.
         let soft_tab = self.soft_tab.take();
+        // The did_ai arm (an untouched auto-indent) is consumed by *this* key: any
+        // key clears it, only `<Esc>` acts on it. `<CR>` clears it here and then
+        // re-arms it for the line it opens (`insert_newline`).
+        let ai_open = self.ai_open_line.take();
         match key.code {
             KeyCode::Esc => {
                 // Leaving Insert ends any snippet session (its tabstops are dropped).
                 self.end_snippet();
                 self.mode = Mode::Normal;
+                // Scrub an auto-indent the cursor never typed into (vim's did_ai):
+                // `o`/`O`/`<CR>` then `<Esc>` leaves a *truly* empty line, not a run
+                // of trailing whitespace. Opt out with `indentemptylines`.
+                if ai_open == Some(self.cursor.line)
+                    && !self.buffer().options.indentemptylines
+                    && self.buffer().line(self.cursor.line).trim().is_empty()
+                {
+                    self.set_line_indent(self.cursor.line, 0);
+                    self.cursor.col = 0;
+                }
                 // `` `^ `` — where Insert mode was last left — is the insert-stop
                 // column, captured before the normal-mode backstep below.
                 self.record_last_insert();

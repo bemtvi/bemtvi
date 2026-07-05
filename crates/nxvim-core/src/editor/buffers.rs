@@ -171,6 +171,8 @@ impl Editor {
             ob.buffer.options.smartindent = value;
         } else if name == "autopairs" {
             ob.buffer.options.autopairs = value;
+        } else if name == "indentemptylines" {
+            ob.buffer.options.indentemptylines = value;
         } else if name == "bomb" {
             ob.buffer.options.bomb = value;
         } else if name == "modifiable" {

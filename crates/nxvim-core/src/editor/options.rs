@@ -117,6 +117,7 @@ impl Editor {
             "autoindent" => &mut self.buffer_mut().options.autoindent,
             "smartindent" => &mut self.buffer_mut().options.smartindent,
             "autopairs" => &mut self.buffer_mut().options.autopairs,
+            "indentemptylines" => &mut self.buffer_mut().options.indentemptylines,
             "bomb" => &mut self.buffer_mut().options.bomb,
             "modifiable" => &mut self.buffer_mut().options.modifiable,
             // A name `resolve_set` accepted as a boolean but no arm above handles is a

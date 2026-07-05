@@ -28,7 +28,7 @@ BUNDLE="$OUT/plugins-bundle.lua"
 PLUGINS=(
   "nxvim/nxvim-keys-helper	6a467c80a131d5325d13cc3e60d3eff403a7e13e"
   "nxvim/nxvim-tree	aee0b7a6e34418673cccd618fca0f013319fd86f"
-  "nxvim/nxvim-line	7049ba527bb0d4f84173b782e2a20120011be482"
+  "nxvim/nxvim-line	04c3092eb38a3f09b6da37e31313759f5caca8e7"
   "nxvim/nxvim-lspconfig	e9d13fff6915faecdccb425ffb0ca881c7b0fb8e"
   "nxvim/nxvim-diff	bc1d9fdebb478aee3de25ede3f0830feff556392"
   "nxvim/catppuccin-nxvim	d511af676dba4d96ff8a7aca69853d3d8d3f83a2"

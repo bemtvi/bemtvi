@@ -100,8 +100,10 @@ impl EditHost {
             if remap {
                 self.feed_matcher(key);
             } else {
-                self.editor.input(key);
-                self.emit_lifecycle_events();
+                // A `noremap` feed still fires the built-in `default` maps (cmdline
+                // control keys, special-buffer opens) — same as a `noremap` string
+                // RHS — so a fed `:cmd<CR>` runs instead of hanging in the cmdline.
+                self.feed_noremap_key(key);
             }
             // Drive the fed key's effects (a fired Lua mapping, queued commands)
             // and any further keys it fed; refresh tries in case a map changed them.
@@ -349,8 +351,7 @@ impl EditHost {
             Ok(keys) => {
                 self.discard_lua_effects();
                 for key in parse_keys(&keys) {
-                    self.editor.input(key);
-                    self.emit_lifecycle_events();
+                    self.feed_noremap_key(key);
                 }
             }
             Err(e) => {
@@ -389,16 +390,64 @@ impl EditHost {
                 self.apply_lua_effects();
             }
             MappingRhs::Keys(keys, _noremap) => {
-                // A string RHS that reaches the server is fed straight to the
-                // editor, bypassing the trie. The matcher only hands these over
-                // for the non-remapping cases: a `noremap` RHS, or a `remap` RHS
-                // that exhausted its re-feed budget (recursive remap expansion
-                // happens inside the matcher's `feed`, never here).
+                // A string RHS that reaches the server is a non-remapping feed: a
+                // `noremap` RHS, or a `remap` RHS that exhausted its re-feed budget
+                // (recursive remap expansion happens inside the matcher's `feed`,
+                // never here). Its keys don't trigger *user* maps — but nxvim's
+                // built-in cmdline control keys (`<CR>` submit, `<Esc>` cancel, …)
+                // and special-buffer opens are `default` maps, and vim's built-ins
+                // still act under `noremap`, so each key is routed through
+                // `feed_noremap_key` (which fires a matching default map and
+                // otherwise feeds the editor) rather than straight to the editor —
+                // else `:tabnew<CR>` would type the command but never run it.
                 for key in keys {
-                    self.editor.input(key);
-                    self.emit_lifecycle_events();
+                    self.feed_noremap_key(key);
                 }
             }
+        }
+    }
+
+    /// Feed one key of a **non-remapping** stream (a `noremap` string RHS, an
+    /// `<expr>`-computed feed, or an `nvim_feedkeys` `'n'` feed) into the editor.
+    ///
+    /// The key must not trigger *user* maps (`noremap` never remaps), but the
+    /// built-in behaviors nxvim implements as `default` keymaps must still act, just
+    /// as vim's built-ins do under `noremap`: the `cmdline` control keys (`<CR>`
+    /// submit, `<Esc>` cancel, `<BS>`, the arrows, `<C-r>`) and the special-buffer
+    /// `<CR>`/`-` opens are all `default` maps that are *inert* in `Editor::input`
+    /// (they route through the matcher, never `handle_command`). So we look the key
+    /// up against the current scope's default maps and fire a match, feeding the
+    /// editor raw only when there is none.
+    ///
+    /// The scope is recomputed from the **live** editor mode on every call, so a
+    /// mode-changing RHS lands each key in the right bucket — `:tabnew<CR>` enters
+    /// the command line on `:`, types `tabnew`, then matches `<CR>` in the `cmdline`
+    /// (`'c'`) bucket and submits. A single fixed scope (as the matcher's internal
+    /// remap re-feed uses) would keep looking in the mode the RHS started in and miss
+    /// the submit, leaving the command typed-but-unrun.
+    pub(crate) fn feed_noremap_key(&mut self, key: Key) {
+        // A map set / buffer switch earlier in this same RHS (e.g. `:tabnew` opened a
+        // new buffer) may have invalidated the cached tries; refresh before the
+        // lookup (a cheap version check on the common no-change path).
+        self.refresh_keymaps();
+        // Core's fixed-grammar raw reads own the next key ahead of any map, exactly as
+        // in `feed_matcher`: a `<C-r>{reg}` name, a `confirm` answer, or the argument
+        // of an in-progress multi-key command (`f{char}`, the motion after an
+        // operator). Feed those straight to the editor.
+        if self.editor.awaiting_command_continuation() || self.editor.cmdline_reads_raw() {
+            self.editor.input(key);
+            self.emit_lifecycle_events();
+            return;
+        }
+        let scope = match crate::keymap::widget_bucket(self.editor.key_context()) {
+            Some(bucket) => MatchScope::Widget(bucket),
+            None => MatchScope::Editing(self.editor.mode),
+        };
+        if let Some(m) = self.keymaps.lookup_default(scope, key) {
+            self.fire_mapping(m.rhs, m.silent, m.expr);
+        } else {
+            self.editor.input(key);
+            self.emit_lifecycle_events();
         }
     }
 }

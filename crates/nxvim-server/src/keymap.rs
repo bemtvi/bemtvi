@@ -143,6 +143,12 @@ pub struct Mapping {
     /// a continuation's label. `None` for a map with no description. Unused by
     /// matching.
     pub desc: Option<String>,
+    /// Whether this is a `default` (built-in / plugin-installed) map rather than a
+    /// user map. A `noremap` fed RHS skips user maps but must still fire the default
+    /// maps that encode built-in behavior — the `cmdline` control keys (`<CR>`
+    /// submit, `<Esc>` cancel, …) and the special-buffer opens — so the feed path
+    /// consults this (see [`Keymaps::lookup_default`]).
+    pub default: bool,
 }
 
 /// A snapshot of the live pending key-context the **`KeyPending`** event carries to
@@ -422,6 +428,7 @@ impl Keymaps {
                 silent: entry.silent,
                 expr: entry.expr,
                 desc: entry.desc.clone(),
+                default: entry.default,
             };
             for mode in &entry.modes {
                 // A declared map-mode (`'n'`, `'v'`/`'x'`, `''` = all, …) fans out
@@ -497,6 +504,23 @@ impl Keymaps {
         match self.tries.get(&scope.bucket())?.classify(&[key]) {
             Classify::Complete(m) => Some(m),
             Classify::Prefix | Classify::None => None,
+        }
+    }
+
+    /// Look up a single key that completes a **default** map in `scope` — the built-in
+    /// behavior nxvim encodes as `default` keymaps (the `cmdline` control keys `<CR>`
+    /// submit / `<Esc>` cancel / `<BS>` / …, and the special-buffer `<CR>`/`-` opens).
+    /// A `noremap` fed RHS ([`EditHost::feed_noremap_key`]) consults this so those
+    /// built-ins still fire, exactly as vim's built-ins do for a `noremap` mapping,
+    /// while a *user* map at the same key is skipped (`noremap` never remaps). A direct
+    /// single-key trie classify like [`lookup_mouse`](Self::lookup_mouse) — no withhold,
+    /// so it fires at once (control keys are all single-key). `None` when the key is
+    /// unmapped, only begins a longer sequence, or completes a **user** map — the
+    /// caller then feeds it raw to the editor.
+    pub fn lookup_default(&self, scope: MatchScope, key: Key) -> Option<Mapping> {
+        match self.tries.get(&scope.bucket())?.classify(&[key]) {
+            Classify::Complete(m) if m.default => Some(m),
+            _ => None,
         }
     }
 

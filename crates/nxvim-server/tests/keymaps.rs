@@ -160,6 +160,98 @@ async fn string_map_is_fed_to_the_editor() {
     );
 }
 
+/// A `noremap` string RHS whose keys include an ex command with a trailing `<CR>`
+/// executes that command: `<Space>t` → `:tabnew<CR>` opens a second tab page.
+#[tokio::test]
+async fn string_map_ex_command_with_cr_executes() {
+    let dir = temp_dir("keymap_str_ex");
+    let (rpc, _incoming) =
+        start_with_config(&dir, "vim.keymap.set('n', '<Space>t', ':tabnew<CR>')\n").await;
+
+    feed(&rpc, "ihello<Esc>");
+    assert_eq!(lines(&rpc).await, vec!["hello"]);
+
+    let before = nxvim_test_harness::exec_lua(&rpc, "return #vim.api.nvim_list_tabpages()").await;
+    assert_eq!(before.as_u64(), Some(1), "one tab page to start");
+
+    // The mapped `:tabnew<CR>` must run: `<CR>` submits the command line (a `default`
+    // cmdline map), it is not typed as text and left in the cmdline. Before the fix
+    // the noremap RHS was fed straight to `editor.input`, so `<CR>` was inert and the
+    // editor stayed in command mode showing `tabnew`.
+    feed(&rpc, " t");
+    assert_eq!(
+        mode(&rpc).await,
+        "n",
+        "the command line submitted and closed"
+    );
+    let after = nxvim_test_harness::exec_lua(&rpc, "return #vim.api.nvim_list_tabpages()").await;
+    assert_eq!(
+        after.as_u64(),
+        Some(2),
+        "the mapped :tabnew<CR> executed and opened a second tab"
+    );
+}
+
+/// The reported bug's exact shape: a `<leader>`-prefixed map whose RHS is an ex
+/// command followed by more special keys (`:...<CR>` then normal-mode keys). The
+/// `<CR>` runs the command and the trailing keys act — none are typed literally.
+/// Here `<leader>d` → `:$<CR>gg` jumps to the last line then back to the first, so
+/// the cursor ends at the top and the buffer is untouched.
+#[tokio::test]
+async fn leader_map_ex_then_normal_keys_all_apply() {
+    let dir = temp_dir("keymap_leader_ex");
+    let (rpc, _incoming) = start_with_config(
+        &dir,
+        "vim.g.mapleader = ' '\nvim.keymap.set('n', '<leader>d', ':$<CR>gg')\n",
+    )
+    .await;
+
+    feed(&rpc, "iline1<CR>line2<CR>line3<Esc>");
+    assert_eq!(lines(&rpc).await, vec!["line1", "line2", "line3"]);
+
+    feed(&rpc, " d");
+    assert_eq!(
+        mode(&rpc).await,
+        "n",
+        "back in normal mode, not stuck in cmdline"
+    );
+    assert_eq!(
+        cursor(&rpc).await,
+        (1, 0),
+        ":$<CR> jumped to the last line, then gg returned to the first"
+    );
+    assert_eq!(
+        lines(&rpc).await,
+        vec!["line1", "line2", "line3"],
+        "the RHS was motion/command only — nothing was typed into the buffer"
+    );
+}
+
+/// A `noremap` string RHS still skips *user* maps (that is what `noremap` means),
+/// even as it now fires built-in `default` maps. A user map `x` → `iZ<Esc>` must not
+/// fire when a noremap RHS feeds `x`: `Q` → `xx` deletes two characters (built-in
+/// `x`), it does not insert `Z`s.
+#[tokio::test]
+async fn noremap_rhs_still_skips_user_maps() {
+    let dir = temp_dir("keymap_noremap_user");
+    let (rpc, _incoming) = start_with_config(
+        &dir,
+        "vim.keymap.set('n', 'x', 'iZ<Esc>')\nvim.keymap.set('n', 'Q', 'xx')\n",
+    )
+    .await;
+
+    feed(&rpc, "ihello<Esc>0");
+    assert_eq!(lines(&rpc).await, vec!["hello"]);
+
+    // Q feeds `xx` noremap: built-in delete-char twice, not the user `x` → iZ<Esc> map.
+    feed(&rpc, "Q");
+    assert_eq!(
+        lines(&rpc).await,
+        vec!["llo"],
+        "noremap `xx` deleted two chars via the built-in, ignoring the user x map"
+    );
+}
+
 /// A multi-key map fires only on the full sequence.
 #[tokio::test]
 async fn multikey_map_fires_on_full_sequence() {

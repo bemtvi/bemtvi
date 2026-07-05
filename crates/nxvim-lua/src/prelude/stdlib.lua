@@ -212,39 +212,6 @@ local function assign_namespace(src)
   return path_basename(best)
 end
 
--- `nx.shada.plugin()` -> an isolated, cross-session key/value store for the calling
--- plugin. The handle persists into the *current* shada store (global, workspace, or
--- remote — whichever this session uses), walled off from the core registers / marks
--- / history and keyed apart from every other plugin's namespace.
---
--- The namespace is **assigned, not chosen**: it is derived from where the calling
--- code lives (its runtimepath / plugin directory), so a plugin can persist its own
--- data and can never name — and so never read or clobber — another plugin's slice.
--- Calling it from anywhere in a plugin's files resolves to that one plugin's
--- namespace. Code in the user's config maps to the reserved `user` namespace.
---
--- It is the plugin's opt-in: only a plugin that calls this gets shada storage.
--- Values may be any JSON-able Lua value (table / string / number / boolean); `get`
--- returns a fresh copy. Persistence rides the ordinary shada cadence (the debounced
--- checkpoint + the clean-exit flush); with shada disabled the store still works in
--- memory for the session but isn't written, exactly like registers and marks.
---
--- A namespace is capped at **1 MiB** (of serialized key+value bytes) so one plugin
--- can't bloat the shared store; a `set` that would cross the cap raises (the prior
--- value is left intact). Keep it to small, structured state — settings, a recent
--- list, a cursor table — not bulk data.
---
---   local store = nx.shada.plugin()       -- no argument: namespace is assigned
---   store:set("recent", { "a.txt", "b.txt" })
---   local recent = store:get("recent")    -- the table back, or nil
---   store:delete("recent")
---   for _, k in ipairs(store:keys()) do … end
---   store:clear()
---
--- `dev_namespace` is an escape hatch for a context whose code attributes to no
--- runtimepath entry — a bare `:lua`, an RPC `exec_lua`, a test, or a deferred/async
--- callback whose stack no longer carries the plugin chunk — where the namespace can't be
--- derived, so an explicit one is required.
 -- `nx._resolve_namespace(dev_namespace, what)` -> the persistence namespace for the
 -- calling context, with the `dev_namespace` escape-hatch contract: it is *assigned* from
 -- the caller's plugin location (its runtimepath entry). A context that attributes to
@@ -287,6 +254,41 @@ function nx._resolve_namespace(dev_namespace, what)
   return dev_namespace
 end
 
+-- `nx.shada.plugin()` -> an isolated, cross-session key/value store for the calling
+-- plugin. The handle persists into the *current* shada store (global, workspace, or
+-- remote — whichever this session uses), walled off from the core registers / marks
+-- / history and keyed apart from every other plugin's namespace.
+--
+-- The namespace is **assigned, not chosen**: it is derived from where the calling
+-- code lives (its runtimepath / plugin directory), so a plugin can persist its own
+-- data and can never name — and so never read or clobber — another plugin's slice.
+-- Calling it from anywhere in a plugin's files resolves to that one plugin's
+-- namespace. Code in the user's config maps to the reserved `user` namespace.
+--
+-- It is the plugin's opt-in: only a plugin that calls this gets shada storage.
+-- Values may be any JSON-able Lua value (table / string / number / boolean); `get`
+-- returns a fresh copy. Persistence rides the ordinary shada cadence (the debounced
+-- checkpoint + the clean-exit flush); with shada disabled the store still works in
+-- memory for the session but isn't written, exactly like registers and marks.
+--
+-- A namespace is capped at **1 MiB** (of serialized key+value bytes) so one plugin
+-- can't bloat the shared store; a `set` that would cross the cap raises (the prior
+-- value is left intact). Keep it to small, structured state — settings, a recent
+-- list, a cursor table — not bulk data.
+--
+-- ```lua
+-- local store = nx.shada.plugin()       -- no argument: namespace is assigned
+-- store:set("recent", { "a.txt", "b.txt" })
+-- local recent = store:get("recent")    -- the table back, or nil
+-- store:delete("recent")
+-- for _, k in ipairs(store:keys()) do … end
+-- store:clear()
+-- ```
+--
+-- `dev_namespace` is an escape hatch for a context whose code attributes to no
+-- runtimepath entry — a bare `:lua`, an RPC `exec_lua`, a test, or a deferred/async
+-- callback whose stack no longer carries the plugin chunk — where the namespace can't be
+-- derived, so an explicit one is required.
 function nx.shada.plugin(dev_namespace)
   local namespace = nx._resolve_namespace(dev_namespace, "nx.shada.plugin")
   return {

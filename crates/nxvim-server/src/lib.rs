@@ -63,6 +63,8 @@ mod folds;
 #[cfg(feature = "native")]
 mod host;
 #[cfg(feature = "native")]
+mod http;
+#[cfg(feature = "native")]
 mod inbound;
 // The LSP consumer subtree is synchronous and tick-driven — shared by the native
 // build (events from the async `LspManager`) and the wasm build (events from the
@@ -115,11 +117,11 @@ pub use shada::{
 pub use daemon::{
     connect_daemon, connect_daemon_reconnecting, connect_daemon_reconnecting_on,
     serve_config_daemon, serve_config_daemon_on, serve_daemon, serve_dproc_daemon_on,
-    serve_fs_daemon, serve_fs_daemon_on, serve_lsp_daemon, serve_lsp_daemon_on, serve_luafs_daemon,
-    serve_luafs_daemon_on, serve_proc_daemon_on, serve_sock_daemon_on, serve_term_daemon_on,
-    DaemonClient, DaemonStatus, FsRead, HostFsAsync, ReconnectHandle, ReconnectPolicy,
-    RemoteConfig, RemoteFsJobs, RemoteHostFs, RemoteHostProc, RemoteHostTerm, RemoteLspTransport,
-    WatchEvent,
+    serve_fs_daemon, serve_fs_daemon_on, serve_http_daemon, serve_http_daemon_on, serve_lsp_daemon,
+    serve_lsp_daemon_on, serve_luafs_daemon, serve_luafs_daemon_on, serve_proc_daemon_on,
+    serve_sock_daemon_on, serve_term_daemon_on, DaemonClient, DaemonStatus, FsRead, HostFsAsync,
+    ReconnectHandle, ReconnectPolicy, RemoteConfig, RemoteFsJobs, RemoteHostFs, RemoteHostProc,
+    RemoteHostTerm, RemoteHttp, RemoteLspTransport, WatchEvent,
 };
 /// Materialize a fetched bundle onto the per-process cache resolved from the environment
 /// (`$XDG_CACHE_HOME`/`$HOME`) — the native edit-host's entry point.
@@ -329,6 +331,13 @@ pub struct ServerInit {
     /// (boxed) so it rides [`ServerInit`] onto the server thread, where `run_server` turns
     /// it into the actor's [`FsBackend`](crate::evloop::FsBackend).
     pub fs_jobs: Option<RemoteFsJobs>,
+    /// The async `nx.http` daemon seam. `None` (the default) runs `nx.http.fetch` on the
+    /// local machine (the event-loop actor's `ureq` on its blocking pool); the edit-host
+    /// split injects a daemon-backed [`RemoteHttp`] so a request runs on the *daemon* (which
+    /// owns the network) over the `http_op` leg. `run_server` turns it into the actor's
+    /// [`HttpBackend`](crate::evloop::HttpBackend). The HTTP twin of [`fs_jobs`](Self::fs_jobs).
+    #[cfg(feature = "native")]
+    pub http_jobs: Option<RemoteHttp>,
     /// Whether to offer nxvim's built-in default recommended plugin set on a fresh
     /// setup. `false` (the default) leaves the recommended set empty, so the headless
     /// test suites never trip the first-run welcome; the interactive binary sets it
@@ -2010,6 +2019,32 @@ impl EditHost {
         self.settle_events(true);
     }
 
+    /// Land the typed result of an off-tick `nx.http.fetch` (the `http_op` leg's reply, or the
+    /// browser `fetch()`'s result) — the wasm twin of the native `on_loop_event`'s
+    /// [`LoopEvent::HttpResult`](crate::evloop) arm. `reply` is the `["ok", <response>] |
+    /// ["err", message]` envelope re-encoded to msgpack bytes by the Worker (bytes, not a C
+    /// string, because a response body carries raw bytes); this decodes it (via
+    /// [`nxvim_lua::http_result_from_value`]) into the `Result<HttpResponse, HttpError>` the
+    /// promise resolves / rejects with, runs the callback, drains the effects it queues, then
+    /// settles and repaints. A malformed reply decodes to a loud transport error, never a
+    /// silent success.
+    pub fn http_result(&mut self, id: u64, reply: Vec<u8>) {
+        let result = match rmpv::decode::read_value(&mut &reply[..]) {
+            Ok(value) => nxvim_lua::http_result_from_value(&value),
+            Err(e) => Err(nxvim_lua::HttpError {
+                message: format!("nx.http: malformed http_op reply: {e}"),
+            }),
+        };
+        if let Err(e) =
+            self.lua
+                .run_callback(id, false, nxvim_lua::CallbackArgs::HttpResult { result })
+        {
+            self.editor
+                .echo(format!("E5108: Error in nx.http handler: {e}"));
+        }
+        self.apply_lua_effects();
+        self.settle_events(true);
+    }
     /// Feed one `lsp_stdout` push (the LSP leg's daemon→edit-host direction) into the
     /// [`SyncLspClient`](nxvim_lsp::SyncLspClient), then drain the events it produced —
     /// the wasm twin of the native run loop's `lsp_events` arm ([`on_lsp_events`]). The
@@ -2853,6 +2888,13 @@ where
         Some(remote) => evloop::FsBackend::Remote(remote),
         None => evloop::FsBackend::Local(Arc::new(nxvim_lua::StdLuaFs::new())),
     };
+    // Where the actor runs off-tick `nx.http.fetch` requests: a local `ureq` round-trip
+    // (bare/local session), or the daemon's `http_op` leg (edit-host split — the request
+    // runs on the daemon, which owns the network). Like `fs_backend`, off the editor tick.
+    let http_backend = match init.http_jobs {
+        Some(remote) => evloop::HttpBackend::Remote(remote),
+        None => evloop::HttpBackend::Local,
+    };
     // Language servers are spawned through this transport — real local children by
     // default, or an injected daemon-backed tunnel. Rebuilt here, on the server thread,
     // into the shared `Arc<dyn LspTransport>` the manager holds (`ServerInit` carried it
@@ -2888,8 +2930,13 @@ where
     // See `docs/plans/2026-07-03-remote-aware-plugin-manager.md`.
     let local_host_proc: Arc<dyn HostProc> = Arc::new(StdHostProc);
     let local_fs_backend = evloop::FsBackend::Local(Arc::new(nxvim_lua::StdLuaFs::new()));
-    let (evloop, mut loop_events) =
-        EventLoop::new(host_proc, fs_backend, local_host_proc, local_fs_backend);
+    let (evloop, mut loop_events) = EventLoop::new(
+        host_proc,
+        fs_backend,
+        http_backend,
+        local_host_proc,
+        local_fs_backend,
+    );
     // The terminal actor: owns the local PTYs `:terminal` spawns, streaming their
     // output back on `term_events`. Lazily started on the first open (the `EventLoop`
     // pattern), so a session with no terminal spawns nothing.
@@ -3250,6 +3297,9 @@ struct DaemonLegs {
     lsp: Option<tokio::sync::mpsc::UnboundedSender<Incoming>>,
     luafs: Option<tokio::sync::mpsc::UnboundedSender<Incoming>>,
     luafs_watch: Option<tokio::sync::mpsc::UnboundedSender<Incoming>>,
+    /// The `nx.http` leg (`http_op`) — a request/response per fetch, run daemon-side. Rides
+    /// the Control group's stream alongside `luafs`/`fs`/`config`.
+    http: Option<tokio::sync::mpsc::UnboundedSender<Incoming>>,
     config: Option<tokio::sync::mpsc::UnboundedSender<Incoming>>,
     handles: Vec<tokio::task::JoinHandle<anyhow::Result<()>>>,
 }
@@ -3273,6 +3323,7 @@ impl DaemonLegs {
             lsp: None,
             luafs: None,
             luafs_watch: None,
+            http: None,
             config: None,
             handles: Vec::new(),
         };
@@ -3282,6 +3333,7 @@ impl DaemonLegs {
                     let (fs_tx, fs_rx) = unbounded_channel();
                     let (luafs_tx, luafs_rx) = unbounded_channel();
                     let (luafs_watch_tx, luafs_watch_rx) = unbounded_channel();
+                    let (http_tx, http_rx) = unbounded_channel();
                     let (config_tx, config_rx) = unbounded_channel();
                     legs.handles.push(tokio::spawn(daemon::serve_fs_daemon_on(
                         rpc.clone(),
@@ -3299,6 +3351,10 @@ impl DaemonLegs {
                             rpc.clone(),
                             luafs_watch_rx,
                         )));
+                    legs.handles.push(tokio::spawn(daemon::serve_http_daemon_on(
+                        rpc.clone(),
+                        http_rx,
+                    )));
                     legs.handles
                         .push(tokio::spawn(daemon::serve_config_daemon_on(
                             rpc.clone(),
@@ -3307,6 +3363,7 @@ impl DaemonLegs {
                     legs.fs = Some(fs_tx);
                     legs.luafs = Some(luafs_tx);
                     legs.luafs_watch = Some(luafs_watch_tx);
+                    legs.http = Some(http_tx);
                     legs.config = Some(config_tx);
                 }
                 LegGroup::Proc => {
@@ -3363,6 +3420,8 @@ impl DaemonLegs {
                     self.luafs.as_ref()
                 } else if method == "luafs_watch" || method == "luafs_unwatch" {
                     self.luafs_watch.as_ref()
+                } else if method == "http_op" {
+                    self.http.as_ref()
                 } else if method.starts_with("fs_") {
                     self.fs.as_ref()
                 } else if method.starts_with("config_") {
@@ -3397,6 +3456,7 @@ impl DaemonLegs {
             self.lsp,
             self.luafs,
             self.luafs_watch,
+            self.http,
             self.config,
         ));
         for handle in self.handles {

@@ -406,6 +406,7 @@ async fn server_init(
         lsp_transport,
         host_term,
         fs_jobs,
+        http_jobs,
     ) = match client {
         None => {
             let (config_dir, runtimepath) = nxvim_server::default_runtime();
@@ -419,6 +420,7 @@ async fn server_init(
                 config_dir,
                 runtimepath,
                 store,
+                None,
                 None,
                 None,
                 None,
@@ -464,6 +466,7 @@ async fn server_init(
                 // `:terminal` opens its PTY on the daemon (where the files are), not locally.
                 Some(c.host_term),
                 Some(c.fs_jobs),
+                Some(c.http),
             )
         }
     };
@@ -501,6 +504,7 @@ async fn server_init(
         lsp_transport,
         host_term,
         fs_jobs,
+        http_jobs,
         // The GUI is the interactive editor — offer the built-in default recommended
         // set on a fresh setup (a config's own recommend{} still overrides it), and
         // enable command-line completion by default (a config's setup{} still wins).

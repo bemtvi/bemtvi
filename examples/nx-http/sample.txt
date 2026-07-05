@@ -1,0 +1,36 @@
+nx.http — a fetch-modeled, promise-only HTTP client
+====================================================
+
+This buffer is just a scratchpad. The demo lives in init.lua; press the leader
+maps (leader is "\") in Normal mode and watch the message line:
+
+    \h   GET https://example.com            → status + byte count + content-type
+    \j   GET https://api.github.com/…       → decode JSON, show a field (res:json())
+    \p   POST https://httpbin.org/anything  → send a JSON body, read it back echoed
+    \x   GET http://127.0.0.1:1             → a transport failure (the :catch path)
+    \r   GET httpbin.org/redirect/1         → redirect='manual' (don't follow the 3xx)
+    \l   GET https://example.com            → nx.http.fetch_local (forced local network)
+
+nx.http.fetch(url, opts) returns a PROMISE of a Response and never blocks the
+editor. Like the browser's fetch, any HTTP status RESOLVES (check response.ok /
+response.status); only a network/transport failure REJECTS with { message }.
+
+Response: { status, ok, statusText, headers = { [name] = value }, body }
+          plus  res:text()  and  res:json().
+
+opts: { method = "GET", query = { … }, headers = { … }, body = <string|table>,
+        form = { … }, timeout = <ms>, redirect = "follow"|"manual"|"error",
+        max_redirects = <n> }
+      - query: query params, encoded + appended to the URL (?a=1&b=2) — no hand-building.
+      - body:  a non-string body is JSON-encoded, with a JSON Content-Type added for you.
+      - form:  a table sent as an application/x-www-form-urlencoded body.
+      - redirect: as in the browser fetch (follow / manual / error); max_redirects caps it.
+      Building blocks are public too: nx.http.encode_query / encode_uri_component /
+      build_url (all backed by the rust-url crates, not a bespoke encoder).
+
+nx.http.fetch_local(url, opts) — identical to nx.http.fetch but always runs on THIS
+      machine's network (never routed to a daemon in a remote session), like the plugin
+      manager's local-only nx.fs. In a plain local session it's exactly nx.http.fetch.
+
+The same API runs natively (ureq, off-tick), over a daemon (on the daemon), and
+in a serverless browser build (the browser's own fetch()).

@@ -80,6 +80,13 @@ nucleo-matcher = "=0.3.1"
 # the default `alloc` build is stable and portable. See
 # docs/plans/2026-06-14-encoding-and-invalid-utf8.md.
 encoding_rs = "=0.8.35"
+# URL query-string + component percent-encoding for `nx.http` (the `query`/`form` opts
+# and `nx.http.encode_query` / `encode_uri_component`). The canonical `rust-url`
+# (servo) crates — pure Rust, wasm-safe, and already in the tree via `url`/`ureq`, so
+# no bespoke encoder. `form_urlencoded` builds `application/x-www-form-urlencoded`
+# query/body strings; `percent-encoding` does single-component `encodeURIComponent`.
+form_urlencoded = "=1.2.2"
+percent-encoding = "=2.3.2"
 crossterm = { version = "=0.29.0", features = ["event-stream"] }
 ratatui = "=0.30.1"
 # In-terminal image rendering for the TUI client's `'imagepreview'` (Phase 2): a

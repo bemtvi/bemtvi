@@ -36,6 +36,35 @@ const server = createServer(async (req, res) => {
   res.setHeader("Cross-Origin-Resource-Policy", "same-origin");
 
   const urlPath = decodeURIComponent(new URL(req.url, "http://x").pathname);
+  // A small same-origin test API for the `nx.http` verifier (verify-http.mjs): fixed
+  // responses the serverless browser `fetch()` can hit without CORS. Additive — no other
+  // harness touches /api/.
+  if (urlPath.startsWith("/api/")) {
+    const send = (code, type, body) => {
+      res.writeHead(code, { "Content-Type": type });
+      res.end(body);
+    };
+    switch (urlPath) {
+      case "/api/hello":
+        return send(200, "text/plain", "hello world");
+      case "/api/data":
+        return send(200, "application/json", JSON.stringify({ name: "nx", count: 3 }));
+      case "/api/missing":
+        return send(404, "text/plain", "nope");
+      case "/api/target":
+        // Echo the full request target (path + query) so a test can read the query
+        // string the client built + encoded.
+        return send(200, "text/plain", req.url);
+      case "/api/echo": {
+        const chunks = [];
+        req.on("data", (c) => chunks.push(c));
+        req.on("end", () => send(200, "text/plain", Buffer.concat(chunks).toString("utf8")));
+        return;
+      }
+      default:
+        return send(404, "text/plain", "unknown api route");
+    }
+  }
   // The app lives under /web/; redirect the bare root there rather than serving
   // index.html *at* `/` — the page loads `./worker.mjs` / `../dist/eh.mjs` relative to
   // the document URL, so it only resolves correctly when that URL is under /web/.

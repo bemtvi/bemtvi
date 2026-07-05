@@ -16,6 +16,11 @@ rust-version.workspace = true
 anyhow.workspace = true
 # Decode `nx.fs.read_text` through the multi-encoding seam (pure Rust, wasm-safe).
 encoding_rs.workspace = true
+# URL query-string + component percent-encoding for `nx.http` (query params / form
+# bodies). The canonical `rust-url` crates — pure Rust, wasm-safe — so the encoding is
+# an established lib, not a bespoke Lua implementation. See `prelude/http.lua`.
+form_urlencoded.workspace = true
+percent-encoding.workspace = true
 # CSPRNG for `nx._uuid()` — the workspace session-namespace generator. Pure Rust,
 # wasm-safe (emscripten backend).
 getrandom.workspace = true

@@ -142,6 +142,15 @@ struct Sink {
     /// typed result via [`eh_fs_op_result`]. Always enqueued on wasm (there is always *some* fs —
     /// OPFS is the serverless fallback), unlike the daemon-only proc leg.
     fs_ops: Vec<(u64, nxvim_lua::FsJob, bool)>,
+    /// Off-tick `nx.http.fetch` requests the editor enqueued this convergence (the `http_op`
+    /// leg): `(cb_id, request)` per `nx.http.fetch`, recorded by [`http_op`](HostEffects::http_op).
+    /// Drained by [`eh_take_http_requests`]; the Worker routes each to the daemon `http_op` leg
+    /// over WebTransport when connected, else runs the browser's own `fetch()` (serverless — the
+    /// browser always has one, so this is always enqueable, no host gate), and lands the typed
+    /// result via [`eh_http_result`].
+    /// Each is `(id, request, local)` — `local` (`nx.http.fetch_local`) forces the browser's
+    /// own `fetch()` even when a daemon is connected (the Worker routes on it).
+    http_ops: Vec<(u64, nxvim_lua::HttpRequest, bool)>,
     /// Streaming `nx.fs.watch` arms the editor enqueued this convergence (the `luafs_watch` leg —
     /// Phase 3b): `(stream_id, path, recursive)` per `nx.fs.watch`, recorded by
     /// [`fs_watch_stream`](HostEffects::fs_watch_stream). Drained by [`eh_take_fs_watch_requests`]
@@ -661,6 +670,14 @@ impl HostEffects for WasmEffects {
         // plugin management is local (see the plan doc). The typed result returns via
         // `eh_fs_op_result`.
         self.sink.borrow_mut().fs_ops.push((id, job, local));
+    }
+
+    fn http_op(&mut self, id: u64, request: nxvim_lua::HttpRequest, local: bool) {
+        // An off-tick `nx.http.fetch`: record the (cb_id, request, local) for the Worker to
+        // fulfill (`eh_take_http_requests`). Routes to the daemon `http_op` leg when connected
+        // (unless `local` — `nx.http.fetch_local` — which forces the browser `fetch()`), else
+        // the browser's own `fetch()`. The typed result returns via `eh_http_result`.
+        self.sink.borrow_mut().http_ops.push((id, request, local));
     }
 
     fn fs_watch_stream(&mut self, id: u64, path: String, recursive: bool) {
@@ -1937,6 +1954,98 @@ pub unsafe extern "C" fn eh_fs_op_result(
     handle.host.fs_op_result(id.max(0.0) as u64, reply);
 }
 
+// ============================================================================
+// Off-tick `nx.http.fetch` leg (`http_op`). The async HTTP path: the editor enqueues a
+// request off the keystroke tick (the browser can't block), the Worker runs the round-trip
+// — over a connected daemon's `http_op` leg, else the browser's own `fetch()` — and the
+// typed result lands back here to resolve the promise. The browser twin of the native
+// event-loop actor's `nx.http` routing. Unlike `nx.fs`, a serverless session needs no
+// daemon (the browser always has `fetch()`).
+// ============================================================================
+
+/// Lower an [`HttpRequest`](nxvim_lua::HttpRequest) into the JSON object the Worker forwards
+/// (`{ id, method, url, headers, body, timeout_ms }`). `headers` is a list of `[name, value]`
+/// pairs; `body` rides as a JSON byte array (the Worker converts it to a byte buffer — for a
+/// daemon forward it crosses as msgpack `bin`, for a `fetch()` it becomes the request body).
+fn http_request_to_json(id: u64, req: &nxvim_lua::HttpRequest, local: bool) -> serde_json::Value {
+    let headers: Vec<serde_json::Value> = req
+        .headers
+        .iter()
+        .map(|(k, v)| serde_json::json!([k, v]))
+        .collect();
+    let mut o = serde_json::Map::new();
+    o.insert("id".into(), serde_json::json!(id));
+    // `local` forces the browser `fetch()` (bypass the daemon) — `nx.http.fetch_local`.
+    o.insert("local".into(), serde_json::json!(local));
+    o.insert("method".into(), req.method.clone().into());
+    o.insert("url".into(), req.url.clone().into());
+    o.insert("headers".into(), serde_json::Value::Array(headers));
+    o.insert("body".into(), serde_json::json!(req.body));
+    o.insert("redirect".into(), req.redirect.clone().into());
+    o.insert(
+        "timeout_ms".into(),
+        match req.timeout_ms {
+            Some(ms) => serde_json::json!(ms),
+            None => serde_json::Value::Null,
+        },
+    );
+    o.insert(
+        "max_redirects".into(),
+        match req.max_redirects {
+            Some(n) => serde_json::json!(n),
+            None => serde_json::Value::Null,
+        },
+    );
+    serde_json::Value::Object(o)
+}
+
+/// Drain the off-tick `nx.http.fetch` requests the editor enqueued since the last call, as a
+/// JSON array of request objects (`[{ id, method, url, headers, body, timeout_ms }, …]`),
+/// emptying the queue so each is forwarded exactly once. The Worker runs one round-trip per
+/// object (daemon `http_op` or browser `fetch()`) and lands the reply via [`eh_http_result`].
+/// Caller frees with [`eh_free_string`].
+///
+/// # Safety
+/// `h` must come from [`eh_new`] and not yet be freed.
+#[no_mangle]
+pub unsafe extern "C" fn eh_take_http_requests(h: *mut WasmEditHost) -> *mut c_char {
+    let Some(handle) = h.as_mut() else {
+        return into_owned_cstr("[]".into());
+    };
+    {
+        let sink = handle.sink.borrow();
+        if sink.http_ops.is_empty() {
+            return into_owned_cstr("[]".into());
+        }
+    }
+    let ops: Vec<serde_json::Value> = std::mem::take(&mut handle.sink.borrow_mut().http_ops)
+        .iter()
+        .map(|(id, req, local)| http_request_to_json(*id, req, *local))
+        .collect();
+    into_owned_cstr(serde_json::Value::Array(ops).to_string())
+}
+
+/// Land the typed result of an off-tick `nx.http.fetch` (the `http_op` leg's reply, or the
+/// browser `fetch()`'s result msgpack-encoded by the Worker): resolve / reject the promise
+/// enqueued under `id`, then settle + repaint. `reply` is the `["ok", <response>] | ["err",
+/// message]` envelope as **msgpack bytes** (pointer+length, not a C string — a response body
+/// carries raw bytes a C string would mangle); Rust decodes it through the shared
+/// `nxvim_lua::httpwire` codec. See [`EditHost::http_result`].
+///
+/// # Safety
+/// `h` must come from [`eh_new`] and not yet be freed; `data` must point to `len` readable
+/// bytes (or be null when `len` is 0).
+#[no_mangle]
+pub unsafe extern "C" fn eh_http_result(
+    h: *mut WasmEditHost,
+    id: f64,
+    data: *const u8,
+    len: usize,
+) {
+    let Some(handle) = h.as_mut() else { return };
+    let reply = as_byte_vec(data, len);
+    handle.host.http_result(id.max(0.0) as u64, reply);
+}
 /// Drain the streaming `nx.fs.watch` arm/disarm requests the editor enqueued since the last call,
 /// as JSON `{"arm":[{"id":N,"path":"…","recursive":bool}],"disarm":[N]}` — the `luafs_watch` leg's
 /// outbound half. The Worker forwards each arm as `luafs_watch [id, path, recursive]` and each

@@ -26,6 +26,7 @@
 mod convert;
 mod fswire;
 mod host;
+mod httpwire;
 mod install;
 mod luafs;
 mod ops;
@@ -35,14 +36,17 @@ mod vimregex;
 
 pub use fswire::{fs_job_from_value, fs_job_to_value, fs_result_from_value, fs_result_to_value};
 pub use host::stdpath;
+pub use httpwire::{
+    http_request_from_value, http_request_to_value, http_result_from_value, http_result_to_value,
+};
 pub use luafs::{run_fs_job, FileKind, LuaDirEntry, LuaFs, LuaStat, StdLuaFs};
 pub use ops::{
     BufOp, CallbackArgs, ConfirmReq, DecorMark, DecorPublish, DiagnosticData, DockOp, ExtmarkOp,
-    FeedKeysOp, FsError, FsJob, FsValue, GlobalOptionOp, HlSet, InlayHintMirrorData, LayerOp,
-    LoopOp, LspClientData, LspOp, LspServerCapabilities, NamedListOp, OpenTarget, OptionValue,
-    PanelOp, QfItem, QfSetOp, RawKeymap, RawRhs, RegisterSetOp, SemanticTokenData, StatuslineKind,
-    StatuslineTarget, TabOp, TerminalOpenReq, TsOp, UiInputReq, ViewOp, VirtChunkData,
-    VirtDecorData, WindowOp,
+    FeedKeysOp, FsError, FsJob, FsValue, GlobalOptionOp, HlSet, HttpError, HttpRequest,
+    HttpResponse, InlayHintMirrorData, LayerOp, LoopOp, LspClientData, LspOp,
+    LspServerCapabilities, NamedListOp, OpenTarget, OptionValue, PanelOp, QfItem, QfSetOp,
+    RawKeymap, RawRhs, RegisterSetOp, SemanticTokenData, StatuslineKind, StatuslineTarget, TabOp,
+    TerminalOpenReq, TsOp, UiInputReq, ViewOp, VirtChunkData, VirtDecorData, WindowOp,
 };
 pub use runtime::{
     extract_prelude, BoMirror, BufBytesEdit, BufMirror, CmdlineComplete, ExtmarkMirror,

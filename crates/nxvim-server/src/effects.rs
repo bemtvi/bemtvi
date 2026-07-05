@@ -2425,6 +2425,15 @@ impl EditHost {
                 };
                 self.fx.loop_command(LoopCommand::Fs { id, job, local })
             }
+            // `nx.http.fetch` — hand the whole request to the actor (a local `ureq`
+            // round-trip, or the daemon `http_op` leg). No rebase like `nx.fs`: the URL is
+            // absolute, nothing is resolved against the cwd. `local` (`nx.http.fetch_local`)
+            // forces the local `ureq` even in a daemon session.
+            #[cfg(feature = "native")]
+            LoopOp::Http { id, request, local } => {
+                self.fx
+                    .loop_command(LoopCommand::Http { id, request, local })
+            }
             // The browser build has no tokio event loop; timers ride the Worker-side
             // wheel instead (slice 5d) — `vim.defer_fn` / `nx.timer` arm and fire there.
             #[cfg(not(feature = "native"))]
@@ -2638,6 +2647,12 @@ impl EditHost {
                 };
                 self.fx.fs_op(id, job, local)
             }
+            // `nx.http.fetch` on wasm: hand the request to the Worker (the daemon `http_op`
+            // leg when connected, else the browser's own `fetch()`). No host gate — the
+            // browser always has `fetch()`, so a serverless session runs HTTP directly.
+            // `local` (`nx.http.fetch_local`) forces the browser `fetch()`, bypassing the daemon.
+            #[cfg(not(feature = "native"))]
+            LoopOp::Http { id, request, local } => self.fx.http_op(id, request, local),
         }
     }
 
@@ -2780,6 +2795,19 @@ impl EditHost {
                 {
                     self.editor
                         .echo(format!("E5108: Error in nx.fs handler: {e}"));
+                }
+                self.apply_lua_effects();
+            }
+            LoopEvent::HttpResult { id, result } => {
+                // An off-tick `nx.http.fetch` settled: resolve / reject its promise on this
+                // thread (the typed response is marshalled to Lua in `run_callback`), then
+                // drain whatever the reaction queued.
+                if let Err(e) =
+                    self.lua
+                        .run_callback(id, false, CallbackArgs::HttpResult { result })
+                {
+                    self.editor
+                        .echo(format!("E5108: Error in nx.http handler: {e}"));
                 }
                 self.apply_lua_effects();
             }

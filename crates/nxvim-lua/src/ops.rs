@@ -493,6 +493,65 @@ pub struct FsError {
     pub message: String,
 }
 
+/// One `nx.http.fetch` request, as plain data — the descriptor the `nx._http_fetch`
+/// bridge queues off-tick (carried by [`LoopOp::Http`] natively, the wasm
+/// `HostEffects::http_op` path on the browser). The actual round-trip runs off the
+/// editor tick — `ureq` on the event-loop actor's blocking pool (native / daemon), or
+/// the browser's `fetch()` (serverless wasm) — so the type stays transport-free and
+/// wasm-safe (no `ureq` in `nxvim-lua`). `body` rides as owned bytes (the Lua
+/// byte-string the caller passed, empty for a bodyless GET); headers are ordered
+/// `(name, value)` pairs so a caller can send repeated headers.
+#[derive(Clone, Debug)]
+pub struct HttpRequest {
+    /// The HTTP method, upper-cased (`GET` / `POST` / `PUT` / `DELETE` / …). Defaults
+    /// to `GET` at the Lua boundary when the caller omits it.
+    pub method: String,
+    /// The absolute request URL (`http://` or `https://`).
+    pub url: String,
+    /// Request headers as ordered `(name, value)` pairs.
+    pub headers: Vec<(String, String)>,
+    /// The request body's raw bytes (empty when there is none).
+    pub body: Vec<u8>,
+    /// Optional overall timeout in milliseconds; `None` uses the backend default.
+    pub timeout_ms: Option<u64>,
+    /// Redirect handling, mirroring `fetch`'s `redirect`: `"follow"` (the default —
+    /// follow up to [`max_redirects`](Self::max_redirects)), `"manual"` (don't follow;
+    /// resolve with the 3xx response as-is), or `"error"` (reject the promise on a
+    /// redirect). Validated at the Lua boundary.
+    pub redirect: String,
+    /// The maximum number of redirects to follow when `redirect == "follow"`; `None`
+    /// uses the backend default. Ignored for `"manual"` / `"error"`.
+    pub max_redirects: Option<u32>,
+}
+
+/// The response an [`HttpRequest`] resolves with — the `Response` table the
+/// `nx.http.fetch` promise resolves with (`{ status, ok, statusText, headers, body }`,
+/// plus `:text()` / `:json()`). Marshalled into Lua once in
+/// [`LuaRuntime::run_callback`](crate::LuaRuntime), so the shape is identical whether the
+/// round-trip ran on the native actor, the daemon `http_op` leg, or the browser `fetch()`.
+/// A non-2xx status is still a *resolved* response (`ok == false`) — matching `fetch`,
+/// only a transport/network failure rejects (an [`HttpError`]).
+#[derive(Clone, Debug)]
+pub struct HttpResponse {
+    /// The HTTP status code (200, 404, 500, …).
+    pub status: u16,
+    /// The reason phrase (`"OK"`, `"Not Found"`, …); may be empty on HTTP/2 peers.
+    pub status_text: String,
+    /// Response headers as ordered `(lowercased-name, value)` pairs.
+    pub headers: Vec<(String, String)>,
+    /// The response body's raw bytes.
+    pub body: Vec<u8>,
+}
+
+/// The error an [`HttpRequest`] rejects with — a network / transport failure (DNS,
+/// connect, TLS, timeout, a malformed URL). Mirrors `fetch`, whose promise rejects
+/// only on such failures (never on an HTTP error status). `message` is the human string
+/// the Lua promise rejects with (as a `{ message }` table, like [`FsError`]).
+#[derive(Clone, Debug)]
+pub struct HttpError {
+    pub message: String,
+}
+
 /// A request to the async runtime (the "event loop"), queued by the `nx.schedule`
 /// / `nx.timer` / `vim.system` (`nx.run`) family and drained by the
 /// server in `apply_lua_effects`. Each op carries a `cb_id` into `nx._cb_fns`
@@ -610,6 +669,22 @@ pub enum LoopOp {
     /// local), so it must see the local disk, not the remote's. See
     /// `docs/plans/2026-07-03-remote-aware-plugin-manager.md`.
     Fs { id: u64, job: FsJob, local: bool },
+    /// An `nx.http.fetch` request (`nx._http_fetch`) — run the round-trip off the editor
+    /// tick and resolve / reject the promise registered under `id` when it settles.
+    /// `local` forces it onto the **local** network (the actor's `ureq`, or the browser's
+    /// own `fetch()`) even in a session whose `nx.http` routes to a daemon
+    /// (`nx._local_http_fetch`) — the HTTP twin of the [`Fs`](LoopOp::Fs) `local` flag;
+    /// `false` follows the session routing (the daemon in an edit-host session). Native:
+    /// forwarded to the event-loop actor ([`LoopCommand::Http`](../../nxvim_server), run
+    /// `ureq` on `spawn_blocking` — or, when `!local`, over the `http_op` leg); the result
+    /// returns inbound as [`LoopEvent::HttpResult`](../../nxvim_server) → a
+    /// [`CallbackArgs::HttpResult`]. Wasm: forwarded to `HttpEffects::http_op` (the browser
+    /// `fetch()`, or the daemon `http_op` leg when connected and `!local`).
+    Http {
+        id: u64,
+        request: HttpRequest,
+        local: bool,
+    },
 }
 
 /// A buffer-local *option* write queued by the Lua side, drained by the server in
@@ -1112,6 +1187,18 @@ pub enum CallbackArgs {
         /// The op's outcome: `Ok` resolves the promise with the marshalled value,
         /// `Err` rejects it with the `{ code, message }` table.
         result: Result<FsValue, FsError>,
+    },
+    /// The settled result of an `nx.http.fetch` request ([`LoopOp::Http`]): the callback
+    /// is run as `nx._run_cb(id, false, err, response)` — `err` the `{ message }` table
+    /// (with `response` nil) on a transport failure, or `err` nil with `response` the
+    /// marshalled `{ status, ok, statusText, headers, body }` table. The typed
+    /// [`HttpResponse`] → Lua conversion happens once in
+    /// [`run_callback`](crate::LuaRuntime::run_callback), so it is identical whether the
+    /// round-trip ran on the native actor, the daemon `http_op` leg, or the browser `fetch()`.
+    HttpResult {
+        /// `Ok` resolves the promise with the marshalled response, `Err` rejects it with
+        /// the `{ message }` table (fetch rejects only on a network/transport failure).
+        result: Result<HttpResponse, HttpError>,
     },
 }
 

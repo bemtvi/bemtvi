@@ -195,6 +195,19 @@ pub trait HostEffects {
     #[cfg(not(feature = "native"))]
     fn fs_op(&mut self, id: u64, job: nxvim_lua::FsJob, local: bool);
 
+    /// Off-tick `nx.http.fetch` request (`nx._http_fetch`) — the wasm twin of the native
+    /// `loop_command(LoopCommand::Http)`. Fire-and-forget: the round-trip runs in the Worker
+    /// (the daemon `http_op` leg when connected, else the browser's own `fetch()`) and its
+    /// typed result returns *inbound* via [`EditHost::http_result`](crate::EditHost::http_result),
+    /// not here. Unlike `nx.fs` / processes there is no host gate: the browser always has
+    /// `fetch()`, so a serverless session runs HTTP directly (no daemon required). Native-only
+    /// builds run `nx.http` on the event-loop actor via `loop_command`, so this is wasm-only.
+    /// `local` (`nx.http.fetch_local`) forces the browser's own `fetch()` even when a daemon
+    /// is connected (bypassing the `http_op` leg) — the wasm analogue of the actor's local
+    /// `ureq`.
+    #[cfg(not(feature = "native"))]
+    fn http_op(&mut self, id: u64, request: nxvim_lua::HttpRequest, local: bool);
+
     /// Arm a streaming `nx.fs.watch` over the daemon `luafs_watch` leg (Phase 3b) — the wasm twin
     /// of the native `loop_command(LoopCommand::FsEventStart)`. Fire-and-forget: change batches
     /// return *inbound* via [`EditHost::fs_watch_event`](crate::EditHost::fs_watch_event) and a

@@ -21,7 +21,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use notify::{EventKind, RecommendedWatcher, RecursiveMode, Watcher};
-use nxvim_lua::{run_fs_job, FsError, FsJob, FsValue, LuaFs};
+use nxvim_lua::{run_fs_job, FsError, FsJob, FsValue, HttpError, HttpRequest, HttpResponse, LuaFs};
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
@@ -111,6 +111,19 @@ pub enum LoopCommand {
     /// — the `nx.plugins` manager's clone / discover / source ops, which must see the local
     /// disk (plugins load into the local Lua VM). `false` for `nx.fs.*` (session routing).
     Fs { id: u64, job: FsJob, local: bool },
+    /// Run an off-tick `nx.http.fetch` request (`nx._http_fetch`) through the actor's
+    /// [`HttpBackend`] — a local `ureq` round-trip on the blocking pool, or the daemon's
+    /// `http_op` leg — and send the typed result back as [`LoopEvent::HttpResult`] for
+    /// callback `id`. Off the editor tick, so a slow request (a far server, a large body)
+    /// never janks the editor. Unlike [`Fs`](LoopCommand::Fs) there is no `local` flag —
+    /// HTTP has no local-VM concern (it always follows the session's network routing).
+    /// `local` forces it onto the actor's LOCAL `ureq` (`nx.http.fetch_local`) even when the
+    /// session's [`HttpBackend`] routes to a daemon; `false` follows the session routing.
+    Http {
+        id: u64,
+        request: HttpRequest,
+        local: bool,
+    },
 }
 
 /// An event from the actor back to the server thread, delivered to the main
@@ -190,6 +203,13 @@ pub enum LoopEvent {
         id: u64,
         result: Result<FsValue, FsError>,
     },
+    /// An off-tick `nx.http.fetch` request ([`LoopCommand::Http`]) settled: the typed
+    /// result the promise registered under `id` resolves / rejects with. The server runs
+    /// the matching `nx._run_cb` on its one thread (the marshalling to Lua happens there).
+    HttpResult {
+        id: u64,
+        result: Result<HttpResponse, HttpError>,
+    },
 }
 
 /// Where the actor runs off-tick `nx.fs` ops. One path per session topology — never
@@ -203,6 +223,39 @@ pub enum LoopEvent {
 pub enum FsBackend {
     Local(Arc<dyn LuaFs + Send + Sync>),
     Remote(crate::daemon::RemoteFsJobs),
+}
+
+/// Where the actor runs off-tick `nx.http.fetch` requests. The HTTP sibling of
+/// [`FsBackend`], one path per session topology:
+/// - [`Local`](HttpBackend::Local) — native-bare: a local `ureq` round-trip
+///   ([`run_http_request`](crate::http::run_http_request)) on the blocking pool.
+/// - [`Remote`](HttpBackend::Remote) — native-daemon: the request crosses in one `http_op`
+///   request via [`RemoteHttp`](crate::daemon::RemoteHttp), run on the daemon (which owns
+///   the network — the same reason `nx.fs` / processes route there). An `await`, not a park.
+#[derive(Clone)]
+pub enum HttpBackend {
+    Local,
+    Remote(crate::daemon::RemoteHttp),
+}
+
+impl HttpBackend {
+    /// Run `request` through this backend and return the typed result. Async — the caller
+    /// is the actor's task, so `Local` offloads the blocking `ureq` call to the blocking
+    /// pool (never parking the actor) and `Remote` awaits the `http_op` round-trip.
+    async fn run(&self, request: HttpRequest) -> Result<HttpResponse, HttpError> {
+        match self {
+            HttpBackend::Local => {
+                tokio::task::spawn_blocking(move || crate::http::run_http_request(&request))
+                    .await
+                    .unwrap_or_else(|e| {
+                        Err(HttpError {
+                            message: format!("nx.http: request task failed: {e}"),
+                        })
+                    })
+            }
+            HttpBackend::Remote(remote) => remote.run(request).await,
+        }
+    }
 }
 
 /// Handle the server holds to drive the event loop. Cheap to construct; the actor
@@ -222,6 +275,9 @@ pub struct EventLoop {
     /// the lazy start — a session that never touches `nx.fs` (or a timer / process) spawns
     /// nothing.
     fs: FsBackend,
+    /// Where off-tick `nx.http.fetch` requests run — a local `ureq` round-trip, or the
+    /// daemon's `http_op` leg (see [`HttpBackend`]). Cloned into the actor when it starts.
+    http: HttpBackend,
     /// The **local** twins of `host_proc` / `fs`, used for `local`-flagged
     /// [`Spawn`](LoopCommand::Spawn) / [`Fs`](LoopCommand::Fs) ops — the `nx.plugins`
     /// manager's git + discovery, which stay on the local disk even in a daemon session
@@ -240,6 +296,7 @@ impl EventLoop {
     pub fn new(
         host_proc: Arc<dyn HostProc>,
         fs: FsBackend,
+        http: HttpBackend,
         local_host_proc: Arc<dyn HostProc>,
         local_fs: FsBackend,
     ) -> (EventLoop, UnboundedReceiver<LoopEvent>) {
@@ -250,6 +307,7 @@ impl EventLoop {
             start: Some((cmd_rx, event_tx)),
             host_proc,
             fs,
+            http,
             local_host_proc,
             local_fs,
             started: false,
@@ -268,6 +326,7 @@ impl EventLoop {
                 event_tx,
                 self.host_proc.clone(),
                 self.fs.clone(),
+                self.http.clone(),
                 self.local_host_proc.clone(),
                 self.local_fs.clone(),
             ));
@@ -293,6 +352,7 @@ async fn run_evloop(
     event_tx: UnboundedSender<LoopEvent>,
     host_proc: Arc<dyn HostProc>,
     fs: FsBackend,
+    http: HttpBackend,
     local_host_proc: Arc<dyn HostProc>,
     local_fs: FsBackend,
 ) {
@@ -516,6 +576,24 @@ async fn run_evloop(
                         });
                     }
                 }
+            }
+            LoopCommand::Http { id, request, local } => {
+                // Run the round-trip off the actor's async task (spawned so concurrent
+                // fetches don't serialize) and send the typed result back for the server to
+                // settle the promise. `HttpBackend::run` offloads the blocking `ureq` call to
+                // the blocking pool (native-bare) or awaits the `http_op` leg (native-daemon)
+                // — either way the actor is never parked. A `local`-flagged request
+                // (`nx.http.fetch_local`) forces the local `ureq` even in a daemon session.
+                let event_tx = event_tx.clone();
+                let backend = if local {
+                    HttpBackend::Local
+                } else {
+                    http.clone()
+                };
+                tokio::spawn(async move {
+                    let result = backend.run(request).await;
+                    let _ = event_tx.send(LoopEvent::HttpResult { id, result });
+                });
             }
         }
         // Forget kill channels whose process tasks have closed them (the child

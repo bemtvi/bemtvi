@@ -38,6 +38,7 @@ native = [
     "nxvim-lsp/native",
     "dep:nxvim-ts",
     "dep:portable-pty",
+    "dep:ureq",
 ]
 
 [dependencies]
@@ -84,6 +85,11 @@ nxvim-lsp.workspace = true
 # — it shells out to a C compiler at `:TSInstall` and `dlopen`s the grammar, neither
 # of which exists in the browser (wasm highlighting is JS-side, in `nxvim-edithost`).
 nxvim-ts = { workspace = true, optional = true }
+# The blocking HTTP client backing `nx.http.fetch` (native / daemon). Runs on the
+# event-loop actor's `spawn_blocking` pool — off the editor tick — over its bundled
+# rustls TLS (the same client `nxvim-ts` uses for `:TSInstall`). Native-only: the
+# browser build routes `nx.http` to the daemon `http_op` leg or its own `fetch()`.
+ureq = { workspace = true, optional = true }
 
 [dev-dependencies]
 # Shared black-box test harness. The single Lua backend (PUC lua54) comes from

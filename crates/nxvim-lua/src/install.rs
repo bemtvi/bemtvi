@@ -21,14 +21,63 @@ use crate::convert::{
 use crate::host::{get_runtime_file, stdpath};
 use crate::ops::{
     BufOp, CompletePush, CompleteSetupReq, ConfirmReq, DecorMark, DecorPublish, DiagnosticData,
-    DockOp, ExtmarkOp, FeedKeysOp, FsJob, GlobalOptionOp, HlSet, LayerOp, LoopOp, LspOp,
-    NamedListOp, PanelOp, PickerOpenReq, PickerPush, PreviewPush, QfItem, QfSetOp, RegisterSetOp,
-    SnippetAddReq, SnippetSetupReq, StatuslineKind, StatuslinePublishReq, StatuslineSetupReq,
-    StatuslineTarget, TabOp, TerminalOpenReq, TsOp, UiFloatReq, UiInputReq, UiSelectReq, ViewOp,
-    VirtChunkData, VirtDecorData, WindowOp, WorkspaceOptionOp,
+    DockOp, ExtmarkOp, FeedKeysOp, FsJob, GlobalOptionOp, HlSet, HttpRequest, LayerOp, LoopOp,
+    LspOp, NamedListOp, PanelOp, PickerOpenReq, PickerPush, PreviewPush, QfItem, QfSetOp,
+    RegisterSetOp, SnippetAddReq, SnippetSetupReq, StatuslineKind, StatuslinePublishReq,
+    StatuslineSetupReq, StatuslineTarget, TabOp, TerminalOpenReq, TsOp, UiFloatReq, UiInputReq,
+    UiSelectReq, ViewOp, VirtChunkData, VirtDecorData, WindowOp, WorkspaceOptionOp,
 };
 use crate::runtime::{OutputLine, Shared};
 use crate::vimregex;
+
+/// The Lua args both `nx._http_fetch` and `nx._http_stream` take: the callback id, url,
+/// method, headers (as `{ name, value }` pair-lists — mlua has no `FromLua` for a bare
+/// tuple, so the wrapper sends pair-lists), the body, an optional timeout (ms), the
+/// redirect mode (`follow`/`manual`/`error`), and an optional max-redirects. Shared so the
+/// one-shot and streaming bridges build the same [`HttpRequest`].
+type HttpArgs = (
+    u64,
+    String,
+    String,
+    Vec<Vec<String>>,
+    mlua::String,
+    Option<u64>,
+    String,
+    Option<u32>,
+);
+
+/// Build an [`HttpRequest`] from the parsed [`HttpArgs`] (minus the callback id) — the
+/// shared request-shaping the `nx._http_fetch` / `nx._http_stream` bridges both use.
+fn build_http_request(
+    url: String,
+    method: String,
+    headers: Vec<Vec<String>>,
+    body: Vec<u8>,
+    timeout_ms: Option<u64>,
+    redirect: String,
+    max_redirects: Option<u32>,
+) -> HttpRequest {
+    let headers = headers
+        .into_iter()
+        .filter_map(|mut pair| match (pair.first(), pair.get(1)) {
+            (Some(_), Some(_)) => {
+                let value = pair.remove(1);
+                let name = pair.remove(0);
+                Some((name, value))
+            }
+            _ => None,
+        })
+        .collect();
+    HttpRequest {
+        method,
+        url,
+        headers,
+        body,
+        timeout_ms,
+        redirect,
+        max_redirects,
+    }
+}
 
 /// `vim.regex(pat)` userdata: a vim pattern compiled by the real vim regexp engine
 /// ([`nxvim_regex`]). Its `:match_str(text)` returns the match's `(start, end)`
@@ -1504,6 +1553,103 @@ pub(crate) fn install_runtime_api(
             Ok(())
         })?,
     )?;
+    // ===== nx.http (fetch) ================================================
+    // `nx._http_fetch(cb_id, url, method, headers, body, timeout_ms)` queues an HTTP
+    // round-trip OFF the editor tick: it pushes a [`LoopOp::Http`] carrying the typed
+    // [`HttpRequest`] and the promise's callback id, and returns immediately (the promise
+    // the `nx.http.fetch` wrapper built is still pending). The event-loop actor runs the
+    // round-trip on its blocking pool with `ureq` (native) — or over the daemon `http_op`
+    // leg (native-daemon / wasm) / the browser `fetch()` (serverless wasm) — and the
+    // result returns inbound as a `CallbackArgs::HttpResult`, which fires
+    // `nx._run_cb(cb_id, false, err, response)` to settle the promise. `headers` is a list
+    // of `{ name, value }` pairs; `body` a (possibly empty) byte-string; `timeout_ms` an
+    // optional number. Fetch semantics: a non-2xx status still RESOLVES (the wrapper reads
+    // `response.ok`); only a transport failure rejects (`err = { message }`).
+    let sh = shared.clone();
+    nx.set(
+        "_http_fetch",
+        lua.create_function(
+            move |_, (cb_id, url, method, headers, body, timeout_ms, redirect, max_redirects): HttpArgs| {
+                sh.borrow_mut().loop_ops.push(LoopOp::Http {
+                    id: cb_id,
+                    request: build_http_request(
+                        url,
+                        method,
+                        headers,
+                        body.as_bytes().to_vec(),
+                        timeout_ms,
+                        redirect,
+                        max_redirects,
+                    ),
+                    local: false,
+                });
+                Ok(())
+            },
+        )?,
+    )?;
+    // `nx._local_http_fetch(...)` — the LOCAL-always twin of `nx._http_fetch`: the request
+    // runs on this machine's `ureq` (or the browser's own `fetch()`) even when the session's
+    // `nx.http` routes to a daemon. The HTTP analogue of `nx._local_fs_op`; backs the public
+    // `nx.http.fetch_local`.
+    let sh = shared.clone();
+    nx.set(
+        "_local_http_fetch",
+        lua.create_function(
+            move |_, (cb_id, url, method, headers, body, timeout_ms, redirect, max_redirects): HttpArgs| {
+                sh.borrow_mut().loop_ops.push(LoopOp::Http {
+                    id: cb_id,
+                    request: build_http_request(
+                        url,
+                        method,
+                        headers,
+                        body.as_bytes().to_vec(),
+                        timeout_ms,
+                        redirect,
+                        max_redirects,
+                    ),
+                    local: true,
+                });
+                Ok(())
+            },
+        )?,
+    )?;
+
+    // `nx._url_encode_query(pairs)` -> the `application/x-www-form-urlencoded` string for
+    // `pairs` (a list of `{ name, value }` two-string lists), built by the canonical
+    // `form_urlencoded` crate (the `rust-url` serializer) — no bespoke encoder. Backs
+    // `nx.http.encode_query` (query params / form bodies). The Lua side flattens a map /
+    // list-values into `pairs`; the (risky) percent-encoding is the established lib's.
+    nx.set(
+        "_url_encode_query",
+        lua.create_function(|_, pairs: Vec<Vec<String>>| {
+            let mut ser = form_urlencoded::Serializer::new(String::new());
+            for pair in &pairs {
+                if let (Some(name), Some(value)) = (pair.first(), pair.get(1)) {
+                    ser.append_pair(name, value);
+                }
+            }
+            Ok(ser.finish())
+        })?,
+    )?;
+    // `nx._url_encode_component(s)` -> `s` percent-encoded for a single URL component,
+    // matching JavaScript's `encodeURIComponent`: every byte outside the RFC 3986
+    // unreserved set (`A-Z a-z 0-9 - _ . ~`) becomes `%XX`. Uses the `percent-encoding`
+    // crate (`rust-url`); backs `nx.http.encode_uri_component`.
+    nx.set(
+        "_url_encode_component",
+        lua.create_function(|lua, s: mlua::String| {
+            // encodeURIComponent leaves the unreserved marks unencoded — start from
+            // "encode everything non-alphanumeric" and carve those four back out.
+            const COMPONENT: &percent_encoding::AsciiSet = &percent_encoding::NON_ALPHANUMERIC
+                .remove(b'-')
+                .remove(b'_')
+                .remove(b'.')
+                .remove(b'~');
+            let encoded = percent_encoding::percent_encode(&s.as_bytes(), COMPONENT).to_string();
+            lua.create_string(&encoded)
+        })?,
+    )?;
+
     // `nx._fs_watch(id, path, recursive)` / `nx._fs_unwatch(id)`: arm / cancel a
     // native filesystem watch feeding the Lua watch stream `id`. Changes fire back
     // as `nx._run_fs_watch(id, ev, err)` (prelude/fs.lua) until stopped. Queued like

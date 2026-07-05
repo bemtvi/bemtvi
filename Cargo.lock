@@ -2810,11 +2810,13 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "encoding_rs",
+ "form_urlencoded",
  "getrandom 0.3.4",
  "md-5",
  "mlua",
  "nxvim-regex",
  "nxvim-ts",
+ "percent-encoding",
  "regex",
  "rmpv",
  "serde",
@@ -2859,6 +2861,7 @@ dependencies = [
  "rmpv",
  "serde",
  "tokio",
+ "ureq",
  "vt100",
  "wtransport",
 ]

@@ -499,6 +499,10 @@ const PRELUDE_MODULES: &[(&str, &str)] = &[
     // nx.fs: promise-always filesystem API over the nx._fs_* bridge. After
     // promise.lua (every op returns a promise).
     ("nxvim:prelude/fs", include_str!("prelude/fs.lua")),
+    // nx.http: promise-always HTTP client (fetch-modeled) over the nx._http_fetch
+    // bridge. After promise.lua (returns a promise) and stdlib.lua (uses nx.json for
+    // JSON bodies / `res:json()`).
+    ("nxvim:prelude/http", include_str!("prelude/http.lua")),
     // nx.hash: the hashing surface (one-shot string digests + the incremental
     // nx.hash.new) over the nx._hash / nx._hash_new bridges. After fs.lua, which
     // defines the sibling nx.hash.file (the streamed file digest, an fs op).
@@ -2008,6 +2012,37 @@ impl LuaRuntime {
                     Err(e) => {
                         let err = self.lua.create_table()?;
                         err.set("code", e.code)?;
+                        err.set("message", e.message)?;
+                        run.call::<()>((id, keep, mlua::Value::Table(err), mlua::Value::Nil))
+                    }
+                }
+            }
+            CallbackArgs::HttpResult { result } => {
+                // `nx.http.fetch` settle: fire `nx._run_cb(id, false, err, response)`. On a
+                // transport failure `err` is the `{ message }` table (response nil); on
+                // success `err` is nil and `response` the marshalled `{ status, ok,
+                // statusText, headers, body }` table. A non-2xx status is a *success* here
+                // (fetch semantics) — the `ok` flag carries it; only a network/transport
+                // failure rejects.
+                match result {
+                    Ok(resp) => {
+                        let response = self.lua.create_table()?;
+                        response.set("status", resp.status)?;
+                        response.set("ok", (200..300).contains(&resp.status))?;
+                        response.set("statusText", resp.status_text)?;
+                        // Headers as a `{ [name] = value }` map (lowercased names), plus a
+                        // parallel ordered list under a hidden key so repeated headers and
+                        // order survive if a caller wants them.
+                        let headers = self.lua.create_table()?;
+                        for (name, value) in &resp.headers {
+                            headers.set(name.as_str(), value.as_str())?;
+                        }
+                        response.set("headers", headers)?;
+                        response.set("body", self.lua.create_string(&resp.body)?)?;
+                        run.call::<()>((id, keep, mlua::Value::Nil, response))
+                    }
+                    Err(e) => {
+                        let err = self.lua.create_table()?;
                         err.set("message", e.message)?;
                         run.call::<()>((id, keep, mlua::Value::Table(err), mlua::Value::Nil))
                     }

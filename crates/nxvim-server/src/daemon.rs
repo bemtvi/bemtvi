@@ -234,6 +234,15 @@ const SOCK_CLOSED: &str = "sock_closed"; // daemon → edit-host: [id, error?]
 // `luafs` leg, which backed the removed synchronous `vim.fn` fs builtins, is gone.)
 const LUAFS_OP: &str = "luafs_op";
 
+// The Lua-`nx.http.fetch` off-tick leg (`http_op`): a request/response per fetch, carrying
+// a whole [`HttpRequest`](nxvim_lua::HttpRequest) run through
+// [`run_http_request`](crate::http::run_http_request) on the daemon (which owns the network
+// and dodges the browser's CORS — the same reason `nx.fs` / processes route to the daemon).
+// The request is a map (`{ method, url, headers, body, … }`), the reply the `["ok", …] |
+// ["err", message]` envelope `nxvim_lua::httpwire` encodes. Both the native-daemon edit-host
+// (via [`RemoteHttp`]) and the wasm edit-host (over WebTransport) use this one leg.
+const HTTP_OP: &str = "http_op";
+
 // The Lua-`nx.fs.watch` streaming leg (`luafs_watch`): the wasm route for the streaming watch
 // (Phase 3b of the off-tick plan). DISTINCT from the buffer-reconcile `fs_watch` leg (a coarse
 // single-path stat-poll keyed by path): this is a recursive, change-classified watch keyed by a
@@ -312,7 +321,7 @@ impl LegGroup {
 
     /// The group that owns a wire method, or `None` for an unknown method (the peer is
     /// the same build, so an unrecognised method is dropped). The four arms partition the
-    /// method namespace disjointly — `fs_*` / `config_*` / `luafs_*` to [`Control`],
+    /// method namespace disjointly — `fs_*` / `config_*` / `luafs_*` / `http_*` to [`Control`],
     /// `proc_*` / `dproc_*` / `sock_*` to [`Proc`], `lsp_*` to [`Lsp`], `term_*` to [`Term`].
     /// (`dproc_*` / `sock_*` are the duplex `nx.process` / `nx.socket` DAP transports — they
     /// ride the Proc stream as process/socket siblings, kept off the latency-critical
@@ -326,6 +335,7 @@ impl LegGroup {
         if method.starts_with("fs_")
             || method.starts_with("config_")
             || method.starts_with("luafs_")
+            || method.starts_with("http_")
         {
             Some(LegGroup::Control)
         } else if method.starts_with("proc_")
@@ -471,6 +481,8 @@ struct LinkState {
     /// Taken once to drive the `luafs_op` job server (which survives reconnects via the
     /// swappable Control cell).
     fs_jobs_rx: Option<UnboundedReceiver<FsJobReq>>,
+    /// Taken once to drive the `http_op` job server (the HTTP twin of `fs_jobs_rx`).
+    http_jobs_rx: Option<UnboundedReceiver<HttpJobReq>>,
 }
 
 impl LinkState {
@@ -478,6 +490,12 @@ impl LinkState {
         self.fs_jobs_rx
             .take()
             .expect("LinkState::take_fs_jobs_rx called once")
+    }
+
+    fn take_http_jobs_rx(&mut self) -> UnboundedReceiver<HttpJobReq> {
+        self.http_jobs_rx
+            .take()
+            .expect("LinkState::take_http_jobs_rx called once")
     }
 }
 
@@ -497,6 +515,7 @@ fn build_link() -> (LinkState, DaemonClient) {
     let (term_event_tx, term_event_rx) =
         channel::<crate::terminal::native::TermEvent>(REMOTE_TERM_EVENT_CAP);
     let (fs_jobs_tx, fs_jobs_rx) = unbounded_channel::<FsJobReq>();
+    let (http_jobs_tx, http_jobs_rx) = unbounded_channel::<HttpJobReq>();
 
     let client = DaemonClient {
         host_fs: RemoteHostFs {
@@ -515,6 +534,9 @@ fn build_link() -> (LinkState, DaemonClient) {
         },
         host_term: RemoteHostTerm::from_parts(term_rpc.clone(), term_event_rx),
         fs_jobs: RemoteFsJobs { req_tx: fs_jobs_tx },
+        http: RemoteHttp {
+            req_tx: http_jobs_tx,
+        },
         config: RemoteConfig {
             rpc: control_rpc.clone(),
         },
@@ -529,6 +551,7 @@ fn build_link() -> (LinkState, DaemonClient) {
         watch_tx,
         term_event_tx,
         fs_jobs_rx: Some(fs_jobs_rx),
+        http_jobs_rx: Some(http_jobs_rx),
     };
     (state, client)
 }
@@ -903,10 +926,15 @@ where
 {
     let first = make().await?;
     let (mut state, client) = build_link();
-    // The `luafs_op` job server rides the swappable Control cell, so it survives reconnects.
+    // The `luafs_op` / `http_op` job servers ride the swappable Control cell, so they survive
+    // reconnects.
     tokio::spawn(run_fs_jobs(
         state.control_rpc.clone(),
         state.take_fs_jobs_rx(),
+    ));
+    tokio::spawn(run_http_jobs(
+        state.control_rpc.clone(),
+        state.take_http_jobs_rx(),
     ));
     let (cmd_tx, cmd_rx) = unbounded_channel::<LinkCommand>();
     let (status_tx, status_rx) = watch::channel(DaemonStatus::Connected);
@@ -1006,6 +1034,10 @@ where
             tokio::spawn(run_fs_jobs(
                 state.control_rpc.clone(),
                 state.take_fs_jobs_rx(),
+            ));
+            tokio::spawn(run_http_jobs(
+                state.control_rpc.clone(),
+                state.take_http_jobs_rx(),
             ));
             let (cmd_tx, cmd_rx) = unbounded_channel::<LinkCommand>();
             let (status_tx, status_rx) = watch::channel(DaemonStatus::Connected);
@@ -1425,6 +1457,7 @@ pub async fn serve_proc_daemon_on(
                 LoopEvent::Timer { .. }
                 | LoopEvent::FsEvent { .. }
                 | LoopEvent::FsResult { .. }
+                | LoopEvent::HttpResult { .. }
                 | LoopEvent::ProcOut { .. }
                 | LoopEvent::ProcExit { .. }
                 | LoopEvent::SockConnected { .. }
@@ -3058,6 +3091,14 @@ type FsJobReq = (
     tokio::sync::oneshot::Sender<Result<nxvim_lua::FsValue, nxvim_lua::FsError>>,
 );
 
+/// One queued HTTP job on the link thread — the [`HttpRequest`](nxvim_lua::HttpRequest) and
+/// the oneshot the awaiting actor parks on for the typed result. The HTTP sibling of
+/// [`FsJobReq`].
+type HttpJobReq = (
+    nxvim_lua::HttpRequest,
+    tokio::sync::oneshot::Sender<Result<nxvim_lua::HttpResponse, nxvim_lua::HttpError>>,
+);
+
 /// The `luafs_op` leg's job server: pull each whole [`FsJob`](nxvim_lua::FsJob) off
 /// `req_rx`, send it as one `luafs_op` request over `rpc`, decode the reply through the
 /// shared [`fswire`](nxvim_lua) codec, and deliver the typed result to the awaiting actor.
@@ -3144,6 +3185,97 @@ impl RemoteFsJobs {
     }
 }
 
+// ----- the Lua-HTTP leg (`http_op`) -----------------------------------------------
+//
+// The HTTP sibling of the `luafs_op` leg: how a **native-daemon** session runs `nx.http`.
+// The event-loop actor hands a whole [`HttpRequest`](nxvim_lua::HttpRequest) to
+// [`RemoteHttp`], it crosses in ONE `http_op` request, and the daemon runs it through
+// [`run_http_request`](crate::http::run_http_request). The wasm edit-host forwards the
+// identical `http_op` request over WebTransport — one leg, one shape. Parks no thread: the
+// actor `await`s the reply on the shared link runtime.
+
+/// The `http_op` leg's job server: pull each [`HttpRequest`](nxvim_lua::HttpRequest) off
+/// `req_rx`, send it as one `http_op` request over `rpc`, decode the reply through the
+/// shared [`httpwire`](nxvim_lua) codec, and deliver the typed result to the awaiting actor.
+async fn run_http_jobs(rpc: LinkRpc, mut req_rx: UnboundedReceiver<HttpJobReq>) {
+    while let Some((request, reply_tx)) = req_rx.recv().await {
+        let result = match rpc
+            .request(HTTP_OP, vec![nxvim_lua::http_request_to_value(&request)])
+            .await
+        {
+            Ok(v) => nxvim_lua::http_result_from_value(&v),
+            // A transport failure (daemon gone) rejects the promise loud — never a panic.
+            Err(e) => Err(nxvim_lua::HttpError {
+                message: format!("nx.http: daemon error: {e}"),
+            }),
+        };
+        let _ = reply_tx.send(result);
+    }
+}
+
+/// The edit-host side of the `http_op` leg for a **native-daemon** session — the actor sends
+/// a whole [`HttpRequest`](nxvim_lua::HttpRequest) here and `await`s its typed result. Holds a
+/// tokio sender to the shared link runtime's [`run_http_jobs`]; `Clone` so each `nx.http`
+/// request can be driven concurrently. The HTTP twin of [`RemoteFsJobs`].
+#[derive(Clone)]
+pub struct RemoteHttp {
+    req_tx: UnboundedSender<HttpJobReq>,
+}
+
+impl RemoteHttp {
+    /// Connect to a daemon over `reader`/`writer` as a standalone leg, spawning a dedicated
+    /// link thread (its own current-thread runtime + the RPC link) that runs
+    /// [`run_http_jobs`]. The multiplexed [`connect_daemon`] builds a `RemoteHttp` directly
+    /// instead (sharing one link across all legs); this single-leg form drives the `http_op`
+    /// leg in isolation (tests). Mirrors [`RemoteFsJobs::connect`].
+    pub fn connect<R, W>(reader: R, writer: W) -> RemoteHttp
+    where
+        R: AsyncRead + Unpin + Send + 'static,
+        W: AsyncWrite + Unpin + Send + 'static,
+    {
+        let (req_tx, req_rx) = unbounded_channel::<HttpJobReq>();
+        std::thread::spawn(move || {
+            let rt = match tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            {
+                Ok(rt) => rt,
+                // A runtime we can't build means the link is dead on arrival; `req_rx` drops,
+                // so every `run` sees the channel closed and rejects loudly.
+                Err(_) => return,
+            };
+            rt.block_on(async move {
+                let (rpc, mut incoming) = connect(reader, writer);
+                // The http_op leg has no daemon→edit-host pushes; drain so the connection
+                // isn't torn down (dropping the receiver would).
+                tokio::spawn(async move { while incoming.recv().await.is_some() {} });
+                run_http_jobs(LinkRpc::fixed(rpc), req_rx).await;
+            });
+        });
+        RemoteHttp { req_tx }
+    }
+
+    /// Send `request` to the daemon over `http_op` and `await` the typed result. Off the
+    /// editor tick (the caller is the actor's async task), so this is a tokio await, not a
+    /// thread park; a dropped link rejects loud.
+    pub async fn run(
+        &self,
+        request: nxvim_lua::HttpRequest,
+    ) -> Result<nxvim_lua::HttpResponse, nxvim_lua::HttpError> {
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        if self.req_tx.send((request, reply_tx)).is_err() {
+            return Err(nxvim_lua::HttpError {
+                message: "nx.http: daemon link is gone".to_string(),
+            });
+        }
+        reply_rx.await.unwrap_or_else(|_| {
+            Err(nxvim_lua::HttpError {
+                message: "nx.http: daemon link dropped the request".to_string(),
+            })
+        })
+    }
+}
+
 /// Run one high-level `nx.fs` op (the `luafs_op` leg): decode the request map into an
 /// [`FsJob`](nxvim_lua::FsJob), run it through [`run_fs_job`](nxvim_lua::run_fs_job) against
 /// the daemon's `fs`, and shape the `["ok", <fs-value>] | ["err", code, message]` reply.
@@ -3208,6 +3340,63 @@ pub async fn serve_luafs_daemon_on(
                         {
                             Ok(v) => Ok(v),
                             Err(e) => Err(Value::from(format!("luafs_op: join error: {e}"))),
+                        };
+                    rpc.respond(id, reply);
+                });
+            } else {
+                rpc.respond(id, Err(Value::from(format!("unknown method: {method}"))));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Run one `nx.http.fetch` request (the `http_op` leg): decode the request map into an
+/// [`HttpRequest`](nxvim_lua::HttpRequest), run it through
+/// [`run_http_request`](crate::http::run_http_request), and shape the `["ok", …] | ["err",
+/// message]` reply. A request that doesn't decode is a loud `["err", …]` reply, never a
+/// silent empty fetch.
+fn serve_http_op(params: &[Value]) -> Value {
+    let Some(req) = params.first() else {
+        return nxvim_lua::http_result_to_value(&Err(nxvim_lua::HttpError {
+            message: "http_op: request has no request".to_string(),
+        }));
+    };
+    match nxvim_lua::http_request_from_value(req) {
+        Ok(request) => nxvim_lua::http_result_to_value(&crate::http::run_http_request(&request)),
+        Err(message) => nxvim_lua::http_result_to_value(&Err(nxvim_lua::HttpError { message })),
+    }
+}
+
+/// Run the daemon end of the *HTTP* wire over `reader`/`writer` (the standalone
+/// single-leg form, for tests — the multiplexed daemon fans `http_op` into
+/// [`serve_http_daemon_on`] instead). Returns when the connection closes.
+pub async fn serve_http_daemon<R, W>(reader: R, writer: W) -> anyhow::Result<()>
+where
+    R: AsyncRead + Unpin + Send + 'static,
+    W: AsyncWrite + Unpin + Send + 'static,
+{
+    let (rpc, incoming) = connect(reader, writer);
+    serve_http_daemon_on(rpc, incoming).await
+}
+
+/// The `nx.http.fetch` leg's connection-agnostic core (the daemon side of the `http_op`
+/// leg — the HTTP twin of [`serve_luafs_daemon_on`]). Serves each `http_op` request by
+/// running its round-trip on a blocking-pool thread (`ureq` is blocking) so a slow request
+/// can't stall the reader; the typed reply crosses back on the same `Rpc`.
+pub async fn serve_http_daemon_on(
+    rpc: Rpc,
+    mut incoming: UnboundedReceiver<Incoming>,
+) -> anyhow::Result<()> {
+    while let Some(msg) = incoming.recv().await {
+        if let Incoming::Request { id, method, params } = msg {
+            if method == HTTP_OP {
+                let rpc = rpc.clone();
+                tokio::spawn(async move {
+                    let reply =
+                        match tokio::task::spawn_blocking(move || serve_http_op(&params)).await {
+                            Ok(v) => Ok(v),
+                            Err(e) => Err(Value::from(format!("http_op: join error: {e}"))),
                         };
                     rpc.respond(id, reply);
                 });
@@ -3515,6 +3704,9 @@ pub struct DaemonClient {
     /// The async `nx.fs` seam (`luafs_op`) — whole-job, decomposed daemon-side. The
     /// event-loop actor `await`s it off the editor tick (no thread park).
     pub fs_jobs: RemoteFsJobs,
+    /// The async `nx.http` seam (`http_op`) — the whole request runs on the daemon (which
+    /// owns the network). The event-loop actor `await`s it off the editor tick.
+    pub http: RemoteHttp,
     /// The config seam (`config_bundle`) — fetched once at session start to mirror the
     /// daemon's config + plugins onto a local cache (Phase 2).
     pub config: RemoteConfig,
@@ -3665,11 +3857,15 @@ pub(crate) async fn serve_daemon_link_inner(
     client_tx: std::sync::mpsc::Sender<DaemonClient>,
 ) {
     let (mut state, client) = build_link();
-    // The `nx.fs` (`luafs_op`) job server rides the swappable Control cell (a one-shot link
-    // never re-dials, but the wiring is shared with the reconnecting path).
+    // The `nx.fs` (`luafs_op`) / `nx.http` (`http_op`) job servers ride the swappable Control
+    // cell (a one-shot link never re-dials, but the wiring is shared with the reconnecting path).
     tokio::spawn(run_fs_jobs(
         state.control_rpc.clone(),
         state.take_fs_jobs_rx(),
+    ));
+    tokio::spawn(run_http_jobs(
+        state.control_rpc.clone(),
+        state.take_http_jobs_rx(),
     ));
     // Hand the seams out before serving; if the caller already dropped, there's nothing
     // to drive.

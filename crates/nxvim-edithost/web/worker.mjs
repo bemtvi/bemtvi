@@ -83,6 +83,12 @@ const eh_proc_exited = M.cwrap("eh_proc_exited", null, ["number", "number", "num
 // rides as pointer+length (re-encoded msgpack — a `read` result is raw bytes Rust decodes).
 const eh_take_fs_op_requests = M.cwrap("eh_take_fs_op_requests", "number", ["number"]);
 const eh_fs_op_result = M.cwrap("eh_fs_op_result", null, ["number", "number", "number", "number"]);
+// Remote `nx.http.fetch` leg (`http_op`): the editor enqueues each request off-tick; the Worker
+// runs the round-trip over a connected daemon (`http_op`) else the browser's own `fetch()`
+// (serverless — no daemon needed), and lands the reply via `eh_http_result`. The reply rides as
+// pointer+length (re-encoded msgpack — a response body is raw bytes Rust decodes).
+const eh_take_http_requests = M.cwrap("eh_take_http_requests", "number", ["number"]);
+const eh_http_result = M.cwrap("eh_http_result", null, ["number", "number", "number", "number"]);
 // Streaming `nx.fs.watch` over the daemon (Phase 3b): the editor arms/disarms a recursive watch
 // off-tick (only with a daemon — serverless has no change source); the Worker forwards each over
 // WebTransport (`luafs_watch`/`luafs_unwatch`) and lands the daemon's `luafs_change`/`luafs_watch_err`
@@ -1672,6 +1678,105 @@ function landFsOpResult(id, reply) {
   }
 }
 
+// Forward the off-tick `nx.http.fetch` requests the tick enqueued, routed to the daemon when
+// connected (the `http_op` leg — the daemon owns the network, dodging CORS) else the browser's
+// own `fetch()` (serverless — no daemon required, unlike `nx.fs`). Each produces the `["ok",
+// {status, status_text, headers, body}] | ["err", message]` envelope `landHttpResult` re-encodes
+// to msgpack and lands via `eh_http_result` (resolving the promise). Drained sequentially,
+// looping until dry — landing a result can fire a chained fetch in the continuation. Returns
+// whether any request was handled (so the caller repaints).
+async function drainHttpRequests() {
+  let didWork = false;
+  for (;;) {
+    const ops = JSON.parse(readStr(eh_take_http_requests(h)));
+    if (ops.length === 0) return didWork;
+    didWork = true;
+    for (const op of ops) {
+      const id = op.id;
+      const req = { ...op };
+      delete req.id;
+      // `local` (`nx.http.fetch_local`) forces the browser `fetch()`, never the daemon.
+      const forceLocal = req.local === true;
+      delete req.local;
+      // `body` rode as a JSON byte array; make it a Uint8Array (crosses as msgpack `bin` to
+      // the daemon, or becomes the `fetch` body verbatim).
+      if (Array.isArray(req.body)) req.body = new Uint8Array(req.body);
+      let reply;
+      try {
+        reply = daemonUri && !forceLocal ? await daemonHttpOp(req) : await browserHttpFetch(req);
+      } catch (e) {
+        reply = ["err", String(e && e.message ? e.message : e)];
+      }
+      landHttpResult(id, reply);
+    }
+  }
+}
+
+// Run one `nx.http.fetch` on the daemon (the `http_op` leg). A dropped link returns a loud error
+// (never a silent fall back to the browser `fetch()`), exactly as `daemonFsOp`.
+async function daemonHttpOp(req) {
+  if (!daemon) return ["err", daemonError || "daemon not connected"];
+  try {
+    return await daemon.request("http_op", [req]);
+  } catch (e) {
+    return ["err", String(e && e.message ? e.message : e)];
+  }
+}
+
+// Run one `nx.http.fetch` with the browser's own `fetch()` (serverless — no daemon). Fetch
+// semantics: any HTTP status is a *resolved* response (`["ok", …]`); only a network / transport
+// failure (or an abort on `timeout_ms`) rejects (`["err", message]`). Subject to CORS, as any
+// browser fetch is.
+async function browserHttpFetch(req) {
+  const headers = {};
+  for (const pair of req.headers || []) headers[pair[0]] = pair[1];
+  const init = { method: req.method || "GET", headers };
+  // Redirect handling maps straight onto the browser fetch() `redirect` option
+  // ("follow" | "manual" | "error"). `max_redirects` has no fetch() equivalent (the
+  // browser sets its own cap), so it only applies to the native/daemon `ureq` path.
+  if (req.redirect) init.redirect = req.redirect;
+  // GET/HEAD take no body; anything else sends the raw bytes.
+  const method = (req.method || "GET").toUpperCase();
+  if (req.body && req.body.length > 0 && method !== "GET" && method !== "HEAD") {
+    init.body = req.body;
+  }
+  let timer;
+  if (req.timeout_ms) {
+    const ctrl = new AbortController();
+    init.signal = ctrl.signal;
+    timer = setTimeout(() => ctrl.abort(), req.timeout_ms);
+  }
+  try {
+    const res = await fetch(req.url, init);
+    const body = new Uint8Array(await res.arrayBuffer());
+    const respHeaders = [];
+    res.headers.forEach((value, name) => respHeaders.push([name.toLowerCase(), value]));
+    return [
+      "ok",
+      { status: res.status, status_text: res.statusText, headers: respHeaders, body },
+    ];
+  } catch (e) {
+    return ["err", String(e && e.message ? e.message : e)];
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
+// Land one `nx.http.fetch` reply into the tick: re-encode the `["ok"|"err", …]` envelope to
+// msgpack bytes (a response body's raw bytes survive as `bin`) and hand them to `eh_http_result`,
+// which decodes them through the shared `httpwire` codec and resolves/rejects the promise. No
+// `await` between `HEAPU8.set` and the call, so heap growth can't detach the buffer.
+function landHttpResult(id, reply) {
+  const bytes = encode(reply);
+  const ptr = bytes.length ? M._malloc(bytes.length) : 0;
+  if (ptr) M.HEAPU8.set(bytes, ptr);
+  try {
+    eh_http_result(h, id, ptr, bytes.length);
+  } finally {
+    if (ptr) M._free(ptr);
+  }
+}
+
 // Forward the terminal ops the tick enqueued to the daemon (`term_open` / `term_write` /
 // `term_resize` / `term_kill` — the web `:terminal`, Phase 7). The daemon runs the real PTY
 // and answers with `term_data`/`term_exit` pushes (`onDaemonNotify`). Only reached in a daemon
@@ -1797,6 +1902,7 @@ async function pump5cDaemon() {
   applyDaemonNotifications();
   await fulfillFsRequests();
   await drainFsOpRequests();
+  await drainHttpRequests();
   await drainProcRequests();
   await drainFsWatchRequests();
   await drainTerminalRequests();
@@ -2043,6 +2149,10 @@ async function runLoopSAB(ctrl, data) {
     // Request/response within this pass (we're not parked), so each reply lands before the
     // repaint below — the op's promise resolves and the UI sees its effect.
     const fsOpWork = await drainFsOpRequests();
+    // Forward any off-tick `nx.http.fetch` the tick enqueued — to the daemon (`http_op`) when
+    // connected, else the browser's own `fetch()` (serverless — no daemon needed). Each reply
+    // lands before the repaint below, so the fetch's promise resolves and the UI sees its effect.
+    const httpWork = await drainHttpRequests();
     // Forward any watches the tick armed/disarmed (file-backed buffers opened/closed) to the
     // daemon, so it begins/stops pushing `fs_changed` for them.
     await drainWatchRequests();
@@ -2064,13 +2174,13 @@ async function runLoopSAB(ctrl, data) {
     drainTsRequests();
     // Forward any `"+`/`"*` yanks/deletes to the UI thread to write to navigator.clipboard.
     drainClipboardWrites();
-    if (fired || acks.length || fsWork || fsOpWork || notified || tsLanded || termFlushed) {
+    if (fired || acks.length || fsWork || fsOpWork || httpWork || notified || tsLanded || termFlushed) {
       postMessage(redrawMsg({ acks, results }));
     }
     // Persistence (shada): any input this pass arms the debounced checkpoint; a requested
     // flush (tab hidden) writes immediately with the exit cursor. The checkpoint write is
     // async (OPFS) — awaiting it here is fine (the thread isn't parked yet).
-    if (acks.length || results.length || fsWork || fsOpWork) {
+    if (acks.length || results.length || fsWork || fsOpWork || httpWork) {
       shadaDirty = true;
       shadaDueMs = nowMs() + SHADA_DEBOUNCE_MS;
     }
@@ -2280,6 +2390,7 @@ onmessage = async (ev) => {
       eh_input(h, String(msg.notation));
       await fulfillFsRequests();
       await drainFsOpRequests();
+      await drainHttpRequests();
       await drainWatchRequests();
       await drainFsWatchRequests();
       await drainProcRequests();
@@ -2298,6 +2409,7 @@ onmessage = async (ev) => {
       eh_input_mouse(h, String(msg.button), String(msg.action), String(msg.modifier), msg.row | 0, msg.col | 0);
       await fulfillFsRequests();
       await drainFsOpRequests();
+      await drainHttpRequests();
       await drainWatchRequests();
       await drainFsWatchRequests();
       await drainProcRequests();
@@ -2314,6 +2426,7 @@ onmessage = async (ev) => {
       const result = readStr(eh_exec_lua(h, String(msg.code)));
       await fulfillFsRequests();
       await drainFsOpRequests();
+      await drainHttpRequests();
       await drainWatchRequests();
       await drainFsWatchRequests();
       await drainProcRequests();

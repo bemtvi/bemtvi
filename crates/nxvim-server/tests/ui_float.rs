@@ -208,6 +208,42 @@ async fn the_next_key_dismisses_the_float() {
         .expect("the float is gone after the next key");
 }
 
+/// A transient content float must be dismissed by the next key EVEN when that key
+/// fires a **Lua-function mapping**. The dismissal is per input key, not tied to a
+/// key reaching `Editor::input`: a mapped Lua RHS runs *outside* `Editor::input`
+/// (the matcher's `Step::Fire` path), so a dismissal wired only there would leave
+/// the float hanging until an *unmapped* key came along — the two-`<Esc>` bug the
+/// plugin-manager restart notice hit (an `<Esc>` map closed its host without ever
+/// dismissing the notice float). Regression guard for that whole class.
+#[tokio::test]
+async fn a_lua_mapped_key_also_dismisses_the_float() {
+    let dir = temp_dir("ui_float_dismiss_mapped");
+    let (rpc, mut incoming) = start(&dir, "").await;
+
+    // `x` is a Lua-function map: it fires via the matcher's `Step::Fire` path, which
+    // runs the handler directly and never calls `Editor::input`.
+    exec_lua(
+        &rpc,
+        "nx.keymap.set('n', 'x', function() _G.hit = (_G.hit or 0) + 1 end)",
+    )
+    .await;
+    exec_lua(&rpc, "nx.ui.float({ 'transient' }, {})").await;
+    poll_float(&rpc, &mut incoming, |f| matches!(f, Value::Map(_)))
+        .await
+        .expect("the float opens");
+
+    feed(&rpc, "x");
+    // The mapping ran (so the key really was consumed by the map, not the editor)…
+    assert_eq!(
+        exec_lua(&rpc, "return _G.hit").await,
+        Value::Integer(1.into())
+    );
+    // …and the transient float is gone, dismissed by that same mapped key.
+    poll_float(&rpc, &mut incoming, |f| matches!(f, Value::Nil))
+        .await
+        .expect("the float is gone after the mapped key");
+}
+
 #[tokio::test]
 async fn a_persistent_float_survives_keystrokes() {
     let dir = temp_dir("ui_float_persist");

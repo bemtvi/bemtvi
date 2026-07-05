@@ -60,6 +60,17 @@ impl EditHost {
         // `nx.complete.setup` — so they ride the matcher like any user map; the
         // `command_status` oracle keeps core's `g`-motions (`gg`/`dgg`/…) intact under
         // the `g`-prefix collision.
+
+        // "The next key dismisses a transient content float" is a per-*key* rule, so
+        // apply it HERE — before the matcher can route this key into a mapping. A
+        // mapped key fires its RHS *outside* `Editor::input` (the sole other place
+        // that clears the float), so a float wiped only there would survive a
+        // Lua-handler map and hang until an unmapped key arrived (the plugin-manager
+        // restart notice's two-`<Esc>` bug). Clearing first still lets a map that
+        // OPENS a float keep it: this key clears the *previous* float, the RHS opens
+        // the new one after, and it lives until the following key. A *persistent*
+        // float (which-key) is untouched — the dismissal skips it.
+        self.editor.dismiss_transient_content_float();
         self.feed_matcher(key);
     }
 

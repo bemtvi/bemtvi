@@ -19,8 +19,10 @@ use std::time::Duration;
 use nxvim_rpc::{Incoming, Rpc};
 use nxvim_server::ServerInit;
 use nxvim_test_harness::{
-    attach, cursor, exec_lua, feed, lines, lua_bool, spawn, start_attached, temp_dir,
+    attach, barrier, cursor, drain_to_latest_redraw, exec_lua, feed, lines, lua_bool, map_get,
+    spawn, start_attached, temp_dir,
 };
+use rmpv::Value;
 use tokio::sync::mpsc::UnboundedReceiver;
 
 async fn start() -> (Rpc, UnboundedReceiver<Incoming>) {
@@ -95,6 +97,29 @@ fn make_repo(base: &Path, name: &str) -> PathBuf {
 async fn poll_true(rpc: &Rpc, code: &str) -> bool {
     for _ in 0..200 {
         if lua_bool(rpc, code).await == Some(true) {
+            return true;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    false
+}
+
+/// Poll (via the redraw `float` surface) for the content float being present
+/// (`want = true`, a map) or gone (`want = false`, `Nil`). The `float` redraw key
+/// is the `nx.ui.float` content-float slot — the restart notice — distinct from the
+/// manager's own `nx.view` window. Take-latest, so the reader task settles.
+async fn poll_float_present(
+    rpc: &Rpc,
+    incoming: &mut UnboundedReceiver<Incoming>,
+    want: bool,
+) -> bool {
+    for _ in 0..200 {
+        barrier(rpc).await;
+        if drain_to_latest_redraw(incoming, |m| {
+            matches!(map_get(m, "float"), Some(Value::Map(_))) == want
+        })
+        .is_some()
+        {
             return true;
         }
         tokio::time::sleep(Duration::from_millis(20)).await;
@@ -1041,15 +1066,16 @@ async fn installing_via_the_manager_prompts_to_restart() {
     );
 }
 
-// The restart notice is a MODAL that GRABS focus — it sits above the manager in the
-// focus stack, so a single <Esc> dismisses the notice and returns to the manager,
-// rather than the manager's own <Esc> map eating the key and closing the manager
-// underneath a still-open notice. (Regression: the notice used to be a non-grabbing
-// content float, so the first <Esc> closed the manager and a second was needed for
-// the notice.)
+// The restart notice is a plain, NON-grabbing content float (`nx.ui.float`) — a
+// transient popup the next key wipes. A single <Esc> dismisses it even though that
+// same <Esc> also fires the manager's own <Esc> map underneath, because a transient
+// content float is dismissed at the per-key DISPATCH level (before the key routes
+// into a mapping), not only when a key reaches `Editor::input`. (Regression: the
+// dismissal used to run only inside `Editor::input`, which a mapped <Esc> bypasses,
+// so the notice lingered on that first <Esc> and a second was needed to clear it.)
 #[tokio::test]
-async fn restart_notice_grabs_focus_so_one_esc_dismisses_it() {
-    let (rpc, _i) = start().await;
+async fn one_esc_dismisses_the_restart_notice() {
+    let (rpc, mut incoming) = start().await;
     let src = temp_dir("plug_restart_focus_src");
     let repo = make_repo(&src, "phi");
     setup_root(&rpc, "plug_restart_focus").await;
@@ -1075,38 +1101,22 @@ async fn restart_notice_grabs_focus_so_one_esc_dismisses_it() {
     assert!(ready, "the dashboard should render before we press I");
     feed(&rpc, "I");
 
-    // Wait for the notice to appear as a real (grabbing) surface, with the manager
-    // still open beneath it.
+    // The notice fires and shows as the content float over the open manager.
     assert!(
-        poll_true(
-            &rpc,
-            "local ui = nx.plugins.ui\n\
-             return ui._restart_instance ~= nil\n\
-               and ui._restart_instance._closed ~= true\n\
-               and ui._instance ~= nil and ui._instance._closed ~= true"
-        )
-        .await,
-        "the restart notice should mount as a grabbing modal above the open manager"
+        poll_true(&rpc, "return nx.plugins.ui._restart_shown == true").await,
+        "installing via the manager should prompt to restart"
+    );
+    assert!(
+        poll_float_present(&rpc, &mut incoming, true).await,
+        "the restart notice should show as a content float"
     );
 
-    // A single <Esc> dismisses the notice — and leaves the manager open.
+    // A single <Esc> dismisses it — even though the manager's own <Esc> map (a Lua
+    // handler that fires outside `Editor::input`) runs on the same key.
     feed(&rpc, "<Esc>");
     assert!(
-        poll_true(
-            &rpc,
-            "return nx.plugins.ui._restart_instance._closed == true"
-        )
-        .await,
-        "one <Esc> should dismiss the restart notice"
-    );
-    assert!(
-        poll_true(
-            &rpc,
-            "return nx.plugins.ui._instance ~= nil\n\
-               and nx.plugins.ui._instance._closed ~= true"
-        )
-        .await,
-        "dismissing the notice must NOT close the manager underneath it"
+        poll_float_present(&rpc, &mut incoming, false).await,
+        "one <Esc> should dismiss the restart notice content float"
     );
 }
 

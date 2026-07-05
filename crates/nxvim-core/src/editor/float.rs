@@ -131,6 +131,22 @@ impl Editor {
         self.content_float.take().is_some()
     }
 
+    /// Dismiss a *transient* content float (`nx.ui.float`, a hover / diagnostic) —
+    /// the "next key wipes it" rule. A *persistent* float (which-key, `persist =
+    /// true`) is left alone. Idempotent; returns whether a float was cleared.
+    ///
+    /// Called from the top of [`input`](Editor::input) for keys that flow through it,
+    /// AND from the server's per-key dispatch so a key consumed by a **mapping**
+    /// (whose Lua/native RHS runs *outside* `input`) dismisses the float too — else a
+    /// mapped key waves nothing away and the float hangs until an unmapped key lands.
+    pub fn dismiss_transient_content_float(&mut self) -> bool {
+        if matches!(&self.content_float, Some(f) if !f.persistent) {
+            self.content_float = None;
+            return true;
+        }
+        false
+    }
+
     /// Close the open content float **only if** it is the persistent float keyed by
     /// `id`. A handle whose float was already replaced (a newer persistent float, a
     /// transient hover) no-ops here rather than closing whatever happens to be open.

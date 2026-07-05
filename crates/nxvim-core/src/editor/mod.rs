@@ -1895,9 +1895,7 @@ impl Editor {
         // key. A *persistent* float (`nx.ui.float{ persist = true }`, e.g. a
         // which-key popup observing keys via `nx.on_key`) is left alone — it lives
         // until its handle closes it or a replacement, not until the next key.
-        if matches!(&self.content_float, Some(f) if !f.persistent) {
-            self.content_float = None;
-        }
+        self.dismiss_transient_content_float();
         // A doc float (the hover / signature-help *window*) is dismissed the same
         // way on the next key. Unlike the content float it is a real float window,
         // so a mouse wheel — which never flows through `input` — scrolls it instead

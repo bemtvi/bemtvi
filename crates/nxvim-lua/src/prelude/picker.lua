@@ -109,13 +109,13 @@ end
 -- at `item.row` / `item.col` (1-based). Omitted ⇒ no preview pane; per-open
 -- overridable via `nx.picker.open(name, { preview = … })`. Optional `width` /
 -- `height` fix the box size — a cell count
--- (number) or a CSS-style viewport fraction string ("80vw" / "60vh" / "50%");
+-- (number) or a CSS-style viewport fraction string (`"80vw"` / `"60vh"` / `"50%"`);
 -- omitted ⇒ the default (~80vw x 60vh). The picker is never content-sized.
--- Optional `align` ("top-left"…"center"…"bottom-right", default centered) +
+-- Optional `align` (`"top-left"`…`"center"`…`"bottom-right"`, default centered) +
 -- `margin` (a gap from the editor edges: a number — the vertical gap, horizontal
 -- sides 2x to look even — or {vertical, horizontal} / {top, right, bottom, left} /
 -- {top=, …}) place the box like a float. Optional
--- `prompt_pos` = "top" (default) or "bottom" places the input above or below the
+-- `prompt_pos` = `"top"` (default) or `"bottom"` places the input above or below the
 -- results list.
 --
 -- For a `dynamic` source (which spawns per query), `debounce` (ms) sets the
@@ -153,22 +153,22 @@ end
 -- Each `opts` field overrides the matching field on the source (which in turn
 -- overrides the picker default):
 --   * `width` / `height` — a FIXED box size: a cell count (e.g. 100) or a CSS-style
---     viewport fraction string ("80vw" / "60vh" / "50%"). The picker is never
+--     viewport fraction string (`"80vw"` / `"60vh"` / `"50%"`). The picker is never
 --     content-sized (a content-hugging box looks ragged).
---   * `align` + `margin` — placement, like a float (see nx.picker.source).
---   * `preview` — "file" / "location" / nil (no pane).
---   * `prompt_pos` — "top" (default) / "bottom".
+--   * `align` + `margin` — placement, like a float (see `nx.picker.source`).
+--   * `preview` — `"file"` / `"location"` / nil (no pane).
+--   * `prompt_pos` — `"top"` (default) / `"bottom"`.
 --   * `query` — initial prompt text: the picker opens already filtered against it
---     (the gen-0 run uses it instead of ""), caret at its end. Default "".
---   * `title` — a title centered on the box's top border (e.g. "Find Files"); nil
---     ⇒ no title. The shipped sources set their own ("Find Files"/"Live Grep"/…).
+--     (the gen-0 run uses it instead of `""`), caret at its end. Default `""`.
+--   * `title` — a title centered on the box's top border (e.g. `"Find Files"`); nil
+--     ⇒ no title. The shipped sources set their own (`"Find Files"`/`"Live Grep"`/…).
 --   * `multiselect` — whether `<Tab>` marks rows for a batch action (default true);
 --     `false` is a single-choice picker (no marking).
 --   * `debounce` — ms before a `dynamic` source re-runs on a query edit; `0` off.
---   * `layer` — where a confirmed item opens: "main" crosses back to the main editor
+--   * `layer` — where a confirmed item opens: `"main"` crosses back to the main editor
 --     area first (so a file picked while focused in a dock lands in the editor, not
---     the sidebar), "active" opens in the focused layer. Defaults to "active"; the
---     shipped `files`/`live_grep` sources set "main", `buffers` stays "active".
+--     the sidebar), `"active"` opens in the focused layer. Defaults to `"active"`; the
+--     shipped `files`/`live_grep` sources set `"main"`, `buffers` stays `"active"`.
 function nx.picker.open(name, opts)
   local source = nx.picker._sources[name]
   if not source then
@@ -336,7 +336,7 @@ local function picker_cancel_inflight(p)
 end
 
 -- nx._picker_run(gen, query): (re-)run the active source for `query` under `gen`.
--- Called by the server on open (gen 0, "") and on each dynamic query edit. A
+-- Called by the server on open (gen 0, `""`) and on each dynamic query edit. A
 -- **dynamic** source is DEBOUNCED — a query edit cancels the in-flight job and any
 -- pending run, then schedules the search `debounce` ms later, so a fast typist
 -- spawns one process per pause, not one per keystroke. Static / the initial run
@@ -506,9 +506,9 @@ end
 -- nx._picker_result(key): the picker resolved. `key` (an integer) confirms the
 -- item under that key for the current generation; `nil` cancels. Either way the
 -- active picker is cleared (and a pending job reaped).
--- `mode` is the confirm gesture's open mode — "current" (the focused window) or
--- "tab" (the default `<C-t>` ⇒ a new tab) — forwarded to `source.confirm(item,
--- mode, layer)`. `layer` is the resolved confirm target ("main"/"active"); built-in
+-- `mode` is the confirm gesture's open mode — `"current"` (the focused window) or
+-- `"tab"` (the default `<C-t>` ⇒ a new tab) — forwarded to `source.confirm(item,
+-- mode, layer)`. `layer` is the resolved confirm target (`"main"`/`"active"`); built-in
 -- sources honor both (see `nx.picker.edit`). `resume_keys` (the snapshot window's
 -- item keys) lets `nx.picker.resume()` re-arm this picker — see `nx._picker_save_resume`.
 function nx._picker_result(key, mode, resume_keys)
@@ -589,14 +589,14 @@ end
 -- relative one. `nx._jump_to` reuses the open buffer cwd-aware and skips the
 -- modified guard, so selecting a symbol in the file you're editing just moves the
 -- cursor. A location-less item (the `files` source) is a plain open instead.
--- `mode` is the confirm gesture: "tab"/"split"/"vsplit" (`<C-t>`/`<C-x>`/`<C-v>`)
+-- `mode` is the confirm gesture: `"tab"`/`"split"`/`"vsplit"` (`<C-t>`/`<C-x>`/`<C-v>`)
 -- open in a NEW tab / split regardless of `'switchbuf'` (an explicit gesture);
--- "current" (or nil) honors `'switchbuf'`.
+-- `"current"` (or nil) honors `'switchbuf'`.
 --
--- `layer` is the confirm target the picker resolved ("main"/"active"), forwarded to
--- `confirm` and on to here. "main" crosses back to the main editor layer before
+-- `layer` is the confirm target the picker resolved (`"main"`/`"active"`), forwarded to
+-- `confirm` and on to here. `"main"` crosses back to the main editor layer before
 -- opening, so a file picked while focused in a dock lands in the editor rather than
--- the sidebar; "active" (or nil) opens in the focused layer.
+-- the sidebar; `"active"` (or nil) opens in the focused layer.
 function nx.picker.edit(item, mode, layer)
   local col = math.max(0, (item.col or 1) - 1)
   local to_main = layer == "main"

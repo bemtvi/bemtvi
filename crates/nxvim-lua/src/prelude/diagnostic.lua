@@ -1,5 +1,5 @@
--- nxvim Lua prelude — nx.diagnostic [alias vim.diagnostic].
--- The Lua diagnostics surface (nx.diagnostic.get / goto / setloclist / config) over the mirror the server pushes.
+-- nxvim Lua prelude — `nx.diagnostic` [alias `vim.diagnostic`].
+-- The Lua diagnostics surface (`nx.diagnostic.get` / goto / setloclist / config) over the mirror the server pushes.
 -- Loaded as one of the sequential prelude chunks by `LuaRuntime::new`
 -- (see runtime.rs); the pure-Lua half of `nx.*` layered on the Rust bridge.
 
@@ -7,7 +7,7 @@ local vim = vim
 
 -- ----- nx.diagnostic: the Lua diagnostics surface ---------------------------
 -- `get` reads the Rust→Lua mirror (`nx._diagnostics`, keyed by bufnr, refreshed
--- on every publishDiagnostics via `nx._set_diagnostics`); the actions
+-- on every `publishDiagnostics` via `nx._set_diagnostics`); the actions
 -- (`goto_next`/`goto_prev`/`setloclist`) and `config` enqueue an `LspOp` the
 -- server applies, reusing the native cursor-move / panel / underline paths.
 nx.diagnostic = nx.diagnostic or {}
@@ -31,7 +31,7 @@ function nx._set_diagnostics(bufnr, list)
   nx._diagnostics[bufnr or 0] = list or {}
 end
 
--- Client-set diagnostics (vim.diagnostic.set), keyed by bufnr → namespace → list.
+-- Client-set diagnostics (`vim.diagnostic.set`), keyed by bufnr → namespace → list.
 -- Kept apart from the LSP-pushed mirror above so a plugin that manages its own
 -- diagnostics (a plugin's view, in its own scratch buffer + namespace)
 -- never collides with a file buffer's LSP diagnostics. `get` merges both.
@@ -89,7 +89,7 @@ local function diag_ns_wanted(ns, want)
   return ns == want
 end
 
--- nx.diagnostic.get([bufnr, [opts]]): diagnostics as plain tables. `nil` bufnr →
+-- `nx.diagnostic.get([bufnr, [opts]])`: diagnostics as plain tables. `nil` bufnr →
 -- every buffer; `0` → the current one. `opts.severity` (a number) filters. The
 -- entries are copied out (callers must not mutate the mirror), each tagged with
 -- its `bufnr`, matching neovim's shape.
@@ -159,7 +159,7 @@ end
 -- `vim.diagnostic.toqflist`.
 local SEVERITY_TYPE = { "E", "W", "I", "N" }
 
--- nx.diagnostic.toqflist(diagnostics): convert a list of diagnostic tables (the
+-- `nx.diagnostic.toqflist(diagnostics)`: convert a list of diagnostic tables (the
 -- shape `nx.diagnostic.get` returns) into quickfix/location-list items. Mirrors
 -- neovim's `vim.diagnostic.toqflist`: 0-based diagnostic positions become 1-based
 -- list columns, the message becomes the entry text, and severity maps to the type
@@ -190,7 +190,7 @@ function nx.diagnostic.toqflist(diagnostics)
   return items
 end
 
--- nx.diagnostic.setqflist([opts]): replace the quickfix list with every buffer's
+-- `nx.diagnostic.setqflist([opts])`: replace the quickfix list with every buffer's
 -- diagnostics and (unless `opts.open == false`) open the quickfix window. `opts`:
 -- `severity` filter, `title`, `open`.
 function nx.diagnostic.setqflist(opts)
@@ -203,7 +203,7 @@ function nx.diagnostic.setqflist(opts)
   end
 end
 
--- nx.diagnostic.setloclist([opts]): populate the current window's location list
+-- `nx.diagnostic.setloclist([opts])`: populate the current window's location list
 -- with the current buffer's diagnostics (a real, navigable loclist now that one
 -- exists) and open it. `opts`: `bufnr` (default current), `severity`, `title`,
 -- `open`.
@@ -220,7 +220,7 @@ function nx.diagnostic.setloclist(opts)
   end
 end
 
--- nx.diagnostic.open_float([opts]): open a float listing the cursor line's
+-- `nx.diagnostic.open_float([opts])`: open a float listing the cursor line's
 -- diagnostics in full (the multi-line messages with source/code that the inline
 -- virtual text truncates). The server reads the cursor at apply time and routes
 -- through the float surface (the bottom panel hover uses); a clean line opens
@@ -278,7 +278,7 @@ end
 -- `H` letters), overridden per-severity by the `signs.text` map.
 local DEFAULT_SIGN_TEXT = { "E", "W", "I", "H" }
 
--- nx.diagnostic.config([opts]): merge `opts` into the stored config and return
+-- `nx.diagnostic.config([opts])`: merge `opts` into the stored config and return
 -- the merged table when called bare. nxvim renders three surfaces — the underline
 -- spans (`underline`), the inline end-of-line message (`virtual_text`), and the
 -- gutter sign column (`signs`) — so those keys drive rendering; the rest are
@@ -324,11 +324,11 @@ function nx.diagnostic.config(opts, _namespace)
   )
 end
 
--- nx.diagnostic.set(namespace, bufnr, diagnostics[, opts]): replace the
+-- `nx.diagnostic.set(namespace, bufnr, diagnostics[, opts])`: replace the
 -- diagnostics for (namespace, bufnr). `bufnr` 0 means the current buffer. The
 -- entries are stored as given (each typically { lnum, col, message, severity });
 -- `opts` (display overrides) is accepted but not yet honored — see the INCOMPLETE
--- note on nx._diagnostics_ns. A plugin drives its own
+-- note on `nx._diagnostics_ns`. A plugin drives its own
 -- buffer's diagnostics through this.
 function nx.diagnostic.set(namespace, bufnr, diagnostics, _opts)
   if bufnr == 0 then
@@ -343,7 +343,7 @@ function nx.diagnostic.set(namespace, bufnr, diagnostics, _opts)
   diag_sync_client(bufnr)
 end
 
--- nx.diagnostic.reset([namespace, [bufnr]]): clear client-set diagnostics. With
+-- `nx.diagnostic.reset([namespace, [bufnr]])`: clear client-set diagnostics. With
 -- no args, every namespace in every buffer; with a namespace, that namespace in
 -- every buffer (or just `bufnr` when given). A plugin calls this when its
 -- float closes — it used to crash because the function was missing.

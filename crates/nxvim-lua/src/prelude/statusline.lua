@@ -17,8 +17,8 @@ nx.statusline = nx.statusline or {}
 -- Registered custom segments (`nx.statusline.segment{}`), keyed by name. Each is a
 -- `{ name, render = function(ctx) -> cells, events = { ... } }` spec.
 nx.statusline._segments = nx.statusline._segments or {}
--- Autocmd ids registered for invalidation, keyed by target ("global" or
--- "win:<id>"), so a re-`setup{}` of one target replaces only its own autocmds and
+-- Autocmd ids registered for invalidation, keyed by target (`"global"` or
+-- `"win:<id>"`), so a re-`setup{}` of one target replaces only its own autocmds and
 -- leaves the others (the global layout and each window-local one) intact.
 nx.statusline._au = nx.statusline._au or {}
 
@@ -37,8 +37,8 @@ local BUILTIN = {
   diagnostics = true,
 }
 
--- nx.statusline.segment { name = "git", events = { "BufEnter", "DirChanged" },
---   render = function(ctx) return { { text = " main", hl = "StatusGit" } } end }
+-- `nx.statusline.segment` { name = `"git"`, events = { `"BufEnter"`, `"DirChanged"` },
+--   render = function(ctx) return { { text = `" main"`, hl = `"StatusGit"` } } end }
 -- Register a custom segment. `render(ctx)` (ctx = { buf, win, focused }) returns a
 -- list of cells `{ text = "…", hl = "Group"? }`, or nil/empty for nothing.
 -- `events` (optional) are standard autocmd event names that invalidate it.
@@ -67,7 +67,7 @@ end
 
 -- Validate one side's (`left`/`right`) list of segment names: each must be a
 -- built-in or a registered custom segment — an unknown name is a hard error (no
--- silent blank), the same no-stub rule nx.complete's source list enforces.
+-- silent blank), the same no-stub rule `nx.complete`'s source list enforces.
 local function name_list(spec, side)
   if spec == nil then
     return {}
@@ -152,7 +152,7 @@ function nx.statusline._rerender(name)
   end
 end
 
--- nx.statusline.invalidate(name): mark a custom segment dirty so the server
+-- `nx.statusline.invalidate(name)`: mark a custom segment dirty so the server
 -- re-renders it (per window) when the current input settles. The async pattern:
 -- a job finishes, caches its data, then invalidates its own segment. Deferring to
 -- the server (rather than rendering inline) means a re-render always runs against
@@ -203,7 +203,7 @@ local function target_of(win, fname)
   return win, win and ("win:" .. win) or "global"
 end
 
--- nx.statusline.setup { left = { "mode", "filename" }, right = { "diagnostics", "location" } }
+-- `nx.statusline.setup` { left = { `"mode"`, `"filename"` }, right = { `"diagnostics"`, `"location"` } }
 -- Activate a segment layout. While the global layout is active it takes precedence
 -- over the `'statusline'` `%`-format for every window without its own override.
 --
@@ -249,7 +249,7 @@ end
 -- reference (the same bridge `%{}`/`%!` use), naming a Lua function. Called by the
 -- server (`run_statusline_click`) with neovim's click arguments:
 --   (minwid, clicks, button, modifiers)
--- where `button` is "l"/"r"/"m" and `modifiers` is a string of "s"/"c"/"a" (shift /
+-- where `button` is `"l"`/`"r"`/`"m"` and `modifiers` is a string of `"s"`/`"c"`/`"a"` (shift /
 -- ctrl / alt). Resolves the expression to a function and calls it; a non-`v:lua`
 -- handler, an unresolvable expression, or a non-function result errors loud
 -- (CLAUDE.md no-silent-stub) so a misconfigured region is visible, not ignored.
@@ -271,7 +271,7 @@ function nx._statusline_click(handler, minwid, clicks, button, mods)
   fn(minwid, clicks, button, mods)
 end
 
--- nx.statusline.reset([win]): drop a window-local override (0 = current window) so
+-- `nx.statusline.reset([win])`: drop a window-local override (0 = current window) so
 -- the window re-inherits the global layout. With no `win` it clears the global
 -- layout, returning every inheriting window to the `'statusline'` `%`-format.
 function nx.statusline.reset(win)

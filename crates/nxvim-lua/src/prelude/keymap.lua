@@ -1,8 +1,8 @@
 -- nxvim Lua prelude — keymaps.
--- The canonical nx.keymap.* natives over the nx._keymaps snapshot the server
--- compiles into per-mode tries: the ergonomic nx.keymap.set / nx.keymap.del
--- (vim.keymap aliases onto them) and the lower-level `:map`-family natives
--- (nx.keymap.raw_set / raw_buf_set / buf_del / get / buf_get) the muscle-memory
+-- The canonical `nx.keymap`.* natives over the `nx._keymaps` snapshot the server
+-- compiles into per-mode tries: the ergonomic `nx.keymap.set` / `nx.keymap.del`
+-- (`vim.keymap` aliases onto them) and the lower-level `:map`-family natives
+-- (`nx.keymap.raw_set` / raw_buf_set / buf_del / get / buf_get) the muscle-memory
 -- nvim_*_keymap names alias onto, in one block at the end of the file (ADR 0002).
 -- Loaded as one of the sequential prelude chunks by `LuaRuntime::new`
 -- (see runtime.rs); the pure-Lua half of `vim.*` layered on the Rust bridge.
@@ -10,12 +10,12 @@
 local vim = vim
 
 -- ----- keymaps ---------------------------------------------------------------
--- vim.keymap.set / .del store entries in a pure-Lua registry the server reads
+-- `vim.keymap.set` / .del store entries in a pure-Lua registry the server reads
 -- back as data (unlike autocmds, whose *matching* stays in Lua); the server
 -- compiles the snapshot into per-mode prefix tries and matches keystrokes there.
--- A function RHS is held in nx._keymap_fns keyed by the entry's stable id and
--- invoked from Rust via nx._run_keymap(id) — the run_user_command analogue.
--- Every mutation bumps nx._keymaps_version so the server rebuilds its tries
+-- A function RHS is held in `nx._keymap_fns` keyed by the entry's stable id and
+-- invoked from Rust via `nx._run_keymap`(id) — the run_user_command analogue.
+-- Every mutation bumps `nx._keymaps_version` so the server rebuilds its tries
 -- only when the registry actually changed (checked once per input batch).
 
 nx._keymaps = nx._keymaps or {}
@@ -38,7 +38,7 @@ local function keymap_modes(mode)
 end
 
 -- Expand <leader>/<localleader> in an LHS to the current mapleader/maplocalleader
--- (vim.g.mapleader / vim.g.maplocalleader, each defaulting to "\" as in vim),
+-- (`vim.g.mapleader` / `vim.g.maplocalleader`, each defaulting to `"\"` as in vim),
 -- matching neovim's *set-time* expansion: the leader in force when the map is
 -- defined is baked in, so a later mapleader change doesn't retroactively move it.
 -- The notation names match case-insensitively (`<Leader>` == `<leader>`). The
@@ -64,7 +64,7 @@ end
 
 -- Resolve a `buffer` opt to a concrete buffer number: 0 means "the current
 -- buffer", resolved at call-time against the snapshot the server refreshes (the
--- same convention nvim_create_autocmd uses), so a buffer-local map declared with
+-- same convention `nvim_create_autocmd` uses), so a buffer-local map declared with
 -- `buffer = 0` is pinned to the buffer that was current when it was set.
 local function keymap_resolve_buffer(buffer)
   if buffer == 0 then
@@ -74,7 +74,7 @@ local function keymap_resolve_buffer(buffer)
 end
 
 -- Does a mapping already exist for `lhs` overlapping any of `modes` at the given
--- `buffer` scope? Backs `<unique>` (opts.unique): vim errors (E227) rather than
+-- `buffer` scope? Backs `<unique>` (`opts.unique`): vim errors (E227) rather than
 -- overwrite. Compares the already-leader-expanded `lhs`/resolved `buffer` the
 -- caller holds, and treats any mode overlap as a clash.
 local function keymap_clashes(modes, lhs, buffer)
@@ -94,10 +94,10 @@ local function keymap_clashes(modes, lhs, buffer)
   return false
 end
 
--- Register one keymap entry into nx._keymaps — the core of nx.keymap.set (which
--- the lower-level nvim_set_keymap / nvim_buf_set_keymap shim onto). `modes` is a
--- list of mode codes; `rhs` a function (stored in nx._keymap_fns) or a string (fed
--- as keys). `opts` is a normalized table the caller fills in: `noremap` (nx.keymap
+-- Register one keymap entry into `nx._keymaps` — the core of `nx.keymap.set` (which
+-- the lower-level `nvim_set_keymap` / `nvim_buf_set_keymap` shim onto). `modes` is a
+-- list of mode codes; `rhs` a function (stored in `nx._keymap_fns`) or a string (fed
+-- as keys). `opts` is a normalized table the caller fills in: `noremap` (`nx.keymap`
 -- defaults it true, the nvim_* family false — design D5), `buffer`, `desc`, `default`, and
 -- the Phase-4 flags `nowait` / `silent` / `expr` (read by the matcher / fire path)
 -- and `unique` (a set-time check, never stored). `<leader>` is expanded in both LHS
@@ -159,7 +159,7 @@ function nx._purge_buf_keymaps(bufnr)
 end
 
 -- Remove the mappings for `lhs` in `modes` at the given `buffer` scope (nil for
--- global, a resolved number for buffer-local) — the core of nx.keymap.del (which
+-- global, a resolved number for buffer-local) — the core of `nx.keymap.del` (which
 -- the nvim_*_del_keymap family shims onto). A matched entry loses only the requested
 -- modes; it survives (with the rest) if it covered more, and is dropped — along
 -- with any function RHS it held — only when no modes remain. Re-sourcing a config
@@ -194,9 +194,9 @@ local function keymap_remove(modes, lhs, buffer)
   nx._keymaps_version = nx._keymaps_version + 1
 end
 
--- nx.keymap.set(mode, lhs, rhs, opts): map `lhs` to `rhs` in `mode`.
--- `rhs` is a function (stored in nx._keymap_fns) or a string (fed as keys).
--- Maps are non-recursive by default (the nx.keymap.set convention); pass
+-- `nx.keymap.set`(mode, lhs, rhs, opts): map `lhs` to `rhs` in `mode`.
+-- `rhs` is a function (stored in `nx._keymap_fns`) or a string (fed as keys).
+-- Maps are non-recursive by default (the `nx.keymap.set` convention); pass
 -- `opts.remap = true` for a recursive map whose RHS keys are re-fed through the
 -- mapping layer (or, equivalently, `opts.noremap = false`). `opts.desc` is stored
 -- but unused; `opts.buffer` ties the map to one buffer (0 = current), `opts.default`
@@ -217,7 +217,7 @@ function nx.keymap.set(mode, lhs, rhs, opts)
   })
 end
 
--- nx.keymap.del(mode, lhs, opts): remove the mapping(s) for `lhs` in `mode`.
+-- `nx.keymap.del`(mode, lhs, opts): remove the mapping(s) for `lhs` in `mode`.
 -- `opts.buffer` (0 = current) targets a buffer-local map; absent targets globals.
 function nx.keymap.del(mode, lhs, opts)
   opts = opts or {}
@@ -234,7 +234,7 @@ end
 -- `opts.noremap = true`. `raw_buf_set` takes a leading `buffer` (0 = current);
 -- `raw_set` is the global form (buffer `nil`).
 
--- nx.keymap.raw_buf_set(buffer, mode, lhs, rhs, opts) [alias nvim_buf_set_keymap].
+-- `nx.keymap.raw_buf_set`(buffer, mode, lhs, rhs, opts) [alias `nvim_buf_set_keymap`].
 function nx.keymap.raw_buf_set(buffer, mode, lhs, rhs, opts)
   opts = opts or {}
   nx.keymap.set(mode, lhs, opts.callback or rhs, {
@@ -249,15 +249,15 @@ function nx.keymap.raw_buf_set(buffer, mode, lhs, rhs, opts)
   })
 end
 
--- nx.keymap.raw_set(mode, lhs, rhs, opts) [alias nvim_set_keymap]: the global form
+-- `nx.keymap.raw_set`(mode, lhs, rhs, opts) [alias `nvim_set_keymap`]: the global form
 -- of the raw setter (a buffer-less raw_buf_set).
 function nx.keymap.raw_set(mode, lhs, rhs, opts)
   nx.keymap.raw_buf_set(nil, mode, lhs, rhs, opts)
 end
 
--- nx.keymap.buf_del(buffer, mode, lhs) [alias nvim_buf_del_keymap]: remove a
--- buffer-local mapping. The global form, nvim_del_keymap, aliases nx.keymap.del
--- directly — its (mode, lhs) call already matches nx.keymap.del's signature.
+-- `nx.keymap.buf_del`(buffer, mode, lhs) [alias `nvim_buf_del_keymap`]: remove a
+-- buffer-local mapping. The global form, `nvim_del_keymap`, aliases `nx.keymap.del`
+-- directly — its (mode, lhs) call already matches `nx.keymap.del`'s signature.
 function nx.keymap.buf_del(buffer, mode, lhs)
   nx.keymap.del(mode, lhs, { buffer = buffer })
 end
@@ -274,14 +274,14 @@ end
 
 -- Textlock for <expr> mappings. An <expr> RHS must *compute* the keys to feed and
 -- not change editor state (vim's textlock); while this is set the mutation funnels
--- (currently vim.cmd) refuse. A simple, honest sandbox: the common offender raises
+-- (currently `vim.cmd`) refuse. A simple, honest sandbox: the common offender raises
 -- rather than silently no-ops, and the server additionally discards any effects an
 -- <expr> RHS queued, so nothing it did leaks regardless.
 nx._expr_lock = false
 
 -- Run the <expr> function RHS for entry `id` and return the keys it produced (its
--- return value coerced to a string; nil/false → ""). Runs under nx._expr_lock so
--- vim.cmd refuses; pcall guarantees the lock is cleared even if the RHS throws,
+-- return value coerced to a string; nil/false → `""`). Runs under `nx._expr_lock` so
+-- `vim.cmd` refuses; pcall guarantees the lock is cleared even if the RHS throws,
 -- after which the error is re-raised for Rust to surface (the mapping then feeds
 -- nothing). A no-op id yields "".
 function nx._run_keymap_expr(id)
@@ -303,7 +303,7 @@ end
 
 -- ----- reading mappings back: nvim_get_keymap / maparg ----------------------
 -- The introspection side of the registry: where the matcher *consumes*
--- nx._keymaps (compiled to tries server-side), these read it back as the maparg
+-- `nx._keymaps` (compiled to tries server-side), these read it back as the maparg
 -- dict shape neovim hands plugins. A plugin that builds an overlay of your
 -- mappings walks these to discover what is bound.
 
@@ -349,8 +349,8 @@ local function keymap_dict(e, mode)
   return d
 end
 
--- nx.keymap.get(mode) [alias nvim_get_keymap]: every GLOBAL mapping that applies
--- in `mode`, as maparg dicts. Buffer-local maps are excluded (nx.keymap.buf_get
+-- `nx.keymap.get`(mode) [alias `nvim_get_keymap`]: every GLOBAL mapping that applies
+-- in `mode`, as maparg dicts. Buffer-local maps are excluded (`nx.keymap.buf_get`
 -- returns those).
 function nx.keymap.get(mode)
   local out = {}
@@ -362,7 +362,7 @@ function nx.keymap.get(mode)
   return out
 end
 
--- nx.keymap.buf_get(buffer, mode) [alias nvim_buf_get_keymap]: the BUFFER-LOCAL
+-- `nx.keymap.buf_get`(buffer, mode) [alias `nvim_buf_get_keymap`]: the BUFFER-LOCAL
 -- mappings of `buffer` (0 = current) that apply in `mode`, as maparg dicts.
 function nx.keymap.buf_get(buffer, mode)
   buffer = nx._resolve_bufnr(buffer)
@@ -375,7 +375,7 @@ function nx.keymap.buf_get(buffer, mode)
   return out
 end
 
--- nx.keymap.arg(name, mode, abbr, dict) [alias vim.fn.maparg]: the mapping bound to
+-- `nx.keymap.arg`(name, mode, abbr, dict) [alias `vim.fn.maparg`]: the mapping bound to
 -- `name` in `mode`. With `dict` truthy returns the full maparg dict (or `{}` when
 -- unmapped); else the rhs string ("" when unmapped, or for a function RHS). `abbr`
 -- (abbreviation lookup) is accepted and ignored — nxvim has no abbreviations. A
@@ -421,10 +421,10 @@ nx.explorer = nx.explorer or {}
 
 nx.qf = nx.qf or {}
 nx.qf.actions = nx.qf.actions or {}
--- nx.qf.actions.jump(): the default `<CR>` action in the quickfix window — jump to
+-- `nx.qf.actions.jump`(): the default `<CR>` action in the quickfix window — jump to
 -- the entry on the cursor's line. Bound buffer-locally as a `default` map by the
 -- `FileType qf` autocmd, so a user `<CR>` map overrides it (the rebindable
--- panel-action pattern; cf. nx.buffers.actions.open).
+-- panel-action pattern; cf. `nx.buffers.actions.open`).
 nx.qf.actions.jump = function()
   nx._qf_action("jump")
 end
@@ -473,7 +473,7 @@ nx.autocmd.create("FileType", {
 -- about-to-be-removed panel one).
 nx.buffers = nx.buffers or {}
 nx.buffers.actions = nx.buffers.actions or {}
--- nx.buffers.actions.open(): the default `<CR>` action inside the `:ls` / `:buffers`
+-- `nx.buffers.actions.open`(): the default `<CR>` action inside the `:ls` / `:buffers`
 -- list panel (filetype `nxbuffers`). Reads the buffer number off the start of the
 -- cursor's row, closes the panel, and switches to that buffer — scheduled so the
 -- switch lands in the main window after the panel close restores focus. Bound
@@ -554,7 +554,7 @@ nx.autocmd.create("FileType", {
 -- bucket (`mode = "cmdline"` is the readable alias), so every control key is
 -- configurable with `nx.keymap.set("cmdline", "<key>", nx.cmdline.actions.<name>)`
 -- (or the muscle-memory `nx.keymap.set("c", …)`). Each action fires through the
--- engine (nx._cmdline_action -> Editor::apply_cmdline_action). Typed TEXT is the
+-- engine (`nx._cmdline_action` -> `Editor::apply_cmdline_action`). Typed TEXT is the
 -- residual fallthrough — an unmapped printable inserts into the line — so the hot
 -- path stays core-direct; only the control keys round-trip Lua. The `<C-r>{reg}`
 -- register name and a `vim.fn.confirm` answer are fixed grammars read raw, NOT
@@ -573,7 +573,7 @@ for _, name in ipairs({
   "history_prev",
   "history_next",
   "insert_register",
-  -- `<Tab>` / `<S-Tab>`: open the command-line completion popup (nx.cmdline_complete,
+  -- `<Tab>` / `<S-Tab>`: open the command-line completion popup (`nx.cmdline_complete`,
   -- the float-list widget's fifth orchestration), then cycle the selection forward /
   -- backward while it is open. The other navigation + accept keys overload the
   -- existing cmdline keys when the popup is open — `<CR>` (submit) accepts the
@@ -613,7 +613,7 @@ for _, m in ipairs({
 end
 
 -- ----- the pending-key event (which-key / showcmd) -------------------------
--- nx.on_key_pending(fn): subscribe to the engine-computed pending-key signal. The
+-- `nx.on_key_pending`(fn): subscribe to the engine-computed pending-key signal. The
 -- server fires it whenever the *pending key-context changes* — a mapped prefix
 -- grows (you type <leader>, then w) or clears (the sequence completed, broke, or
 -- the idle flush resolved it) — NOT per keystroke (ADR 0002 rule 4: no per-key
@@ -642,7 +642,7 @@ end
 -- empty; sources A/C (mapped prefixes) leave `label` nil and list keys.
 --
 -- This is the render-time oracle a native which-key plugin debounces
--- (nx.utils.debounce) and draws as a persistent nx.ui.float. Continuations come from
+-- (`nx.utils.debounce`) and draws as a persistent `nx.ui.float`. Continuations come from
 -- the mapped-prefix trie (user + native-default maps, sources A/C) AND the built-in
 -- command grammar's finite prefixes (source B); the open built-in states are
 -- surfaced via `label` instead.
@@ -658,9 +658,9 @@ function nx.on_key_pending(fn)
   nx._key_pending_register()
 end
 
--- nx._key_pending_dispatch(ctx): fan one pending-key event out to every registered
+-- `nx._key_pending_dispatch`(ctx): fan one pending-key event out to every registered
 -- handler (called from Rust on each pending-context change). A throwing handler is
--- isolated (surfaced via nx.notify) so one bad listener can't starve the others.
+-- isolated (surfaced via `nx.notify`) so one bad listener can't starve the others.
 function nx._key_pending_dispatch(ctx)
   for _, fn in ipairs(nx._on_key_pending) do
     local ok, err = pcall(fn, ctx)
@@ -673,7 +673,7 @@ end
 -- ----- vim.api.nvim_*_keymap compatibility aliases -------------------------
 -- The muscle-memory `vim.api.nvim_*` names for the keymap natives above, each
 -- forwarding to the canonical `nx.keymap.*` (same function object, same
--- signature). nvim_del_keymap aliases the ergonomic nx.keymap.del directly — its
+-- signature). `nvim_del_keymap` aliases the ergonomic `nx.keymap.del` directly — its
 -- (mode, lhs) call already matches that signature with `opts` left nil.
 vim.api.nvim_set_keymap = nx.keymap.raw_set
 vim.api.nvim_buf_set_keymap = nx.keymap.raw_buf_set

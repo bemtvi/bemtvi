@@ -20,10 +20,10 @@ nx.decor = nx.decor or {}
 -- `nx._decor.last`, for inspection / tests). Each provider: { name, bufs, on_range, ns }.
 nx._decor = nx._decor or { providers = {} }
 
--- nx.decor.provider { name, bufs?, on_range }: register a viewport decoration
+-- `nx.decor.provider { name, bufs?, on_range }`: register a viewport decoration
 -- provider. `on_range(ctx, publish)` is called off the frame, once per visible-range
 -- change of a matching window, with a snapshot
---   ctx = { win, buf, top, bot, lines, filetype, buftype, gen }
+--   `ctx = { win, buf, top, bot, lines, filetype, buftype, gen }`
 -- (`top`/`bot` are 0-based inclusive buffer rows; `lines` is exactly that slice;
 -- `gen` is the viewport generation a publish carries back). `bufs` scopes the
 -- provider: `bufs.filetype = { "lua", "rust" }` runs it only in those filetypes,
@@ -192,7 +192,7 @@ local MAX_DECOR_ERRORS = 3
 -- provider's namespace via `nx._decor_publish` (carrying `ctx.gen`, so the server drops
 -- a publish from a viewport the user already scrolled past); it also records the latest
 -- set on `nx._decor.last` for inspection / tests. An error is surfaced loud
--- (`E5108`-style, Decision 7); after MAX_DECOR_ERRORS consecutive failures the provider
+-- (`E5108`-style, Decision 7); after `MAX_DECOR_ERRORS` consecutive failures the provider
 -- is disabled (skipped until re-registered). A clean run resets the counter.
 local function run_provider(p, ctx)
   local gen = ctx.gen
@@ -239,8 +239,8 @@ local function run_provider(p, ctx)
   end
 end
 
--- nx._decor_dispatch(ctx): the server calls this off-tick, once per visible-range
--- change, with ctx = { win, buf, top, bot, lines, filetype, buftype, gen }. Runs each matching,
+-- `nx._decor_dispatch(ctx)`: the server calls this off-tick, once per visible-range
+-- change, with `ctx = { win, buf, top, bot, lines, filetype, buftype, gen }`. Runs each matching,
 -- non-disabled provider's `on_range` (via `run_provider`). A provider with a `debounce`
 -- coalesces a fast continuous scroll into one run: each viewport change (re-)arms a
 -- per-window trailing debounce, so `on_range` fires once the window stops moving for

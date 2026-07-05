@@ -54,17 +54,17 @@ local function key_list(spec, action)
   error("nx.complete.setup: keys." .. action .. " must be a string or list of strings")
 end
 
--- nx.complete.setup { sources = { { "buffer", min_chars = 3 } }, auto = true,
---   keys = { next = "<C-n>", prev = "<C-p>", confirm = { "<C-y>", "<CR>" }, abort = "<C-e>" } }
+-- nx.complete.setup { sources = { { `"buffer"`, min_chars = 3 } }, auto = true,
+--   keys = { next = `"<C-n>"`, prev = `"<C-p>"`, confirm = { `"<C-y>"`, `"<CR>"` }, abort = `"<C-e>"` } }
 -- (`confirm` accepts the highlighted row; `<CR>` only accepts once you've navigated
 --  to one — an unnavigated popup is noselect, so Enter still inserts a newline.)
 -- Enables the engine. `sources` is a list of `{ name, opts... }` entries — a
 -- built-in (`buffer` / `lsp` / `snippets`) or a registered plugin source.
 -- `min_chars` (from a source, or the top level) gates the prefix length before the
 -- popup opens. `auto` (default true) completes as you type. `keys` overrides any of
--- the four control actions. `accept` (default "replace") decides what the confirm
--- keys do when the caret is in the *middle* of a word: "replace" swaps the whole
--- word, "insert" keeps the suffix past the cursor. `nx.complete.accept{ behavior }`
+-- the four control actions. `accept` (default `"replace"`) decides what the confirm
+-- keys do when the caret is in the *middle* of a word: `"replace"` swaps the whole
+-- word, `"insert"` keeps the suffix past the cursor. `nx.complete.accept{ behavior }`
 -- overrides it for a specific key (bind one key to each behavior).
 function nx.complete.setup(opts)
   opts = opts or {}
@@ -230,13 +230,13 @@ end
 
 -- nx.complete.accept(behavior): accept the highlighted completion row under an
 -- explicit accept behavior, ignoring the engine's configured default. `behavior` is
--- "insert" (replace only the typed prefix, keeping any word suffix past the cursor)
--- or "replace" (swap the whole word the caret sits inside); nil / omitted uses the
+-- `"insert"` (replace only the typed prefix, keeping any word suffix past the cursor)
+-- or `"replace"` (swap the whole word the caret sits inside); nil / omitted uses the
 -- configured default. Passed a table, it reads `behavior` from it (so
 -- `nx.complete.accept{ behavior = "replace" }` works too). Bind two keys to the two
 -- behaviors for insert-vs-replace on demand, e.g.
---   nx.keymap.set("i", "<C-y>", function() nx.complete.accept("insert") end)
---   nx.keymap.set("i", "<C-l>", function() nx.complete.accept("replace") end)
+--   `nx.keymap.set("i", "<C-y>", function() nx.complete.accept("insert") end)`
+--   `nx.keymap.set("i", "<C-l>", function() nx.complete.accept("replace") end)`
 -- A no-op when the popup is closed or nothing is highlighted (like the confirm key).
 function nx.complete.accept(behavior)
   if type(behavior) == "table" then

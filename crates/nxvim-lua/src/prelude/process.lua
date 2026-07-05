@@ -3,15 +3,15 @@
 -- `nx` is promise-only (ADR 0002): no callback-shaped one-shot async. So instead
 -- of the old `nx.spawn{ on_stdout, on_exit }`, running a child is either:
 --
---   * nx.run{ ... }        -> a PROMISE of { code, stdout, stderr }   (one-shot)
---   * nx.run_stream{ ... } -> a STREAM you iterate with nx.await_each (streaming)
+--   * `nx.run{ ... }`        -> a PROMISE of `{ code, stdout, stderr }`   (one-shot)
+--   * `nx.run_stream{ ... }` -> a STREAM you iterate with `nx.await_each` (streaming)
 --
 -- Two transports back these (both in install.rs): `nx._system_async` collects all
--- stdout and fires once on exit (nx.run); `nx._spawn_stream` streams stdout in
--- newline-delimited batches (nx.run_stream). Loaded after promise.lua — nx.run*
--- build on nx.promise / nx.async / nx.await.
+-- stdout and fires once on exit (`nx.run`); `nx._spawn_stream` streams stdout in
+-- newline-delimited batches (`nx.run_stream`). Loaded after promise.lua — `nx.run*`
+-- build on `nx.promise` / `nx.async` / `nx.await`.
 
--- Build an argv list from { cmd = string|list, args = list } — `cmd` is a string
+-- Build an argv list from `{ cmd = string|list, args = list }` — `cmd` is a string
 -- or an argv list, `args` is appended.
 local function build_argv(spec)
   local cmd = spec.cmd
@@ -28,24 +28,24 @@ local function build_argv(spec)
   return argv
 end
 
--- nx.run { cmd, args, cwd, env, stdin } -> promise of { code, stdout, stderr }.
+-- `nx.run { cmd, args, cwd, env, stdin }` -> promise of `{ code, stdout, stderr }`.
 -- Runs a child to completion off the input tick, buffering all of its stdout and
 -- stderr and resolving once, on exit.
 --
 -- Spec fields:
---   * cmd   — the program. A string, or an argv list whose first element is the
+--   * `cmd`   — the program. A string, or an argv list whose first element is the
 --             program. Spawned directly, with NO shell: nothing is word-split,
 --             quoted, or glob-expanded, so pass each argument as its own element.
---   * args  — optional list appended after `cmd`, so `{ cmd = "git", args = { "log" } }`
+--   * `args`  — optional list appended after `cmd`, so `{ cmd = "git", args = { "log" } }`
 --             and `{ cmd = { "git", "log" } }` are equivalent.
---   * cwd   — optional working directory for the child.
---   * env   — optional { NAME = value } map of environment overrides.
---   * stdin — optional string piped to the child; its stdin then closes (EOF).
+--   * `cwd`   — optional working directory for the child.
+--   * `env`   — optional `{ NAME = value }` map of environment overrides.
+--   * `stdin` — optional string piped to the child; its stdin then closes (EOF).
 --
 -- RESOLVES (never rejects) with the exit result: a non-zero `code` is the caller's
 -- to act on, and a spawn failure (e.g. binary not found) surfaces as `code = -1`
--- with empty output — exactly like vim.system. Await it inside nx.async, or chain
--- with :next / :catch:
+-- with empty output — exactly like `vim.system`. Await it inside `nx.async`, or chain
+-- with `:next` / `:catch`:
 --
 -- ```lua
 -- nx.async(function()
@@ -54,9 +54,9 @@ end
 -- end)()
 -- ```
 --
--- The one-shot promise twin of nx.run_stream (stream stdout as it arrives). For a
+-- The one-shot promise twin of `nx.run_stream` (stream stdout as it arrives). For a
 -- duplex child whose stdin stays open for a framed protocol (LSP/DAP) use
--- nx.process instead.
+-- `nx.process` instead.
 function nx.run(spec)
   if type(spec) ~= "table" then
     error("nx.run: expected a table { cmd, args, ... }, got " .. type(spec), 2)
@@ -76,7 +76,7 @@ end
 
 -- A Stream over a streaming child's stdout. `:next()` returns a promise of the
 -- next batch (a list of lines) or `nil` at end-of-stream; `:kill()` reaps the
--- child early. Consume it with nx.await_each inside an nx.async function.
+-- child early. Consume it with `nx.await_each` inside an `nx.async` function.
 --
 -- SEQUENTIAL contract: at most one outstanding `:next()` at a time (which is what
 -- a `for` loop does). Batches arriving between `:next()` calls buffer in `_queue`;
@@ -101,16 +101,16 @@ function Stream:kill()
   nx._system_kill(self._id)
 end
 
--- nx.run_stream { cmd, args, cwd, env } -> Stream. Spawns a child and streams its
+-- `nx.run_stream { cmd, args, cwd, env }` -> Stream. Spawns a child and streams its
 -- stdout as it arrives, in newline-delimited batches — each batch a list of lines
--- with the trailing newline stripped. Takes the same spec as nx.run minus `stdin`
+-- with the trailing newline stripped. Takes the same spec as `nx.run` minus `stdin`
 -- (the child's stdin is closed at spawn). Only stdout is surfaced: stderr and the
 -- exit code are not readable through the Stream.
 --
--- The streaming twin of nx.run — reach for it when output is large or long-lived
+-- The streaming twin of `nx.run` — reach for it when output is large or long-lived
 -- and you want to act on lines as they come (the picker / completion sources feed
 -- results this way) rather than waiting for the child to exit. Iterate it with
--- nx.await_each inside an nx.async function; call :kill() to reap the child early
+-- `nx.await_each` inside an `nx.async` function; call `:kill()` to reap the child early
 -- (e.g. a superseded query):
 --
 -- ```lua
@@ -153,9 +153,9 @@ function nx.run_stream(spec)
   return self
 end
 
--- nx.await_each(stream): a `for`-loop iterator over a Stream's batches. Each step
+-- `nx.await_each(stream)`: a `for`-loop iterator over a Stream's batches. Each step
 -- awaits the next batch; the loop ends when the stream is exhausted (`:next()`
--- resolves nil). MUST run inside an nx.async function (nx.await suspends the
+-- resolves nil). MUST run inside an `nx.async` function (`nx.await` suspends the
 -- enclosing coroutine).
 --
 -- ```lua
@@ -171,8 +171,8 @@ end
 
 -- ----- nx.process: a duplex (bidirectional) child --------------------------------
 --
--- nx.run / nx.run_stream are read-only and one-shot: they close the child's stdin at
--- spawn and (run_stream) newline-split its stdout. A framed wire protocol — a Debug
+-- `nx.run` / `nx.run_stream` are read-only and one-shot: they close the child's stdin at
+-- spawn and (`run_stream`) newline-split its stdout. A framed wire protocol — a Debug
 -- Adapter (DAP) or a language server speaking Content-Length JSON — needs the
 -- opposite: stdin stays OPEN for incremental writes, and stdout arrives as raw,
 -- un-split byte chunks the caller frames itself. `nx.process.open` is that transport
@@ -182,11 +182,11 @@ end
 -- It is deliberately handler-shaped, not promise-shaped: a long-lived process is a
 -- bidirectional event source (stdout chunks, stderr chunks, one exit), not a value
 -- that resolves once. (`nx` is promise-only for ONE-SHOT async; a persistent stream
--- of events stays handler-based — same as autocmds / nx.fs.watch.)
+-- of events stays handler-based — same as autocmds / `nx.fs.watch`.)
 
 nx.process = nx.process or {}
 
--- id -> { on_stdout, on_stderr, on_exit } for every live duplex child.
+-- id -> `{ on_stdout, on_stderr, on_exit }` for every live duplex child.
 nx._proc_handlers = nx._proc_handlers or {}
 
 -- Native callback: a raw output chunk arrived (`data` is a binary-safe string;
@@ -238,7 +238,7 @@ function Process:kill()
   nx._proc_kill(self.id)
 end
 
--- nx.process.open { cmd, args, cwd, env, on_stdout, on_stderr, on_exit } -> handle.
+-- `nx.process.open { cmd, args, cwd, env, on_stdout, on_stderr, on_exit }` -> handle.
 -- Spawns a duplex child and returns a handle with `:write(data)` and `:kill()`. The
 -- callbacks fire on the editor thread (they may queue effects — extmarks, view
 -- renders — like any nx callback): `on_stdout(chunk)` / `on_stderr(chunk)` per raw
@@ -253,7 +253,7 @@ function nx.process.open(spec)
     on_stdout = spec.on_stdout,
     on_stderr = spec.on_stderr,
     on_exit = function(code)
-      -- Mark dead before the user's on_exit so a `:write` from inside it no-ops.
+      -- Mark dead before the user's `on_exit` so a `:write` from inside it no-ops.
       handle._alive = false
       if spec.on_exit then
         spec.on_exit(code)
@@ -266,15 +266,15 @@ end
 
 -- ----- nx.socket: a duplex TCP client connection ---------------------------------
 --
--- The socket sibling of nx.process, for a framed-protocol peer that listens on a TCP
--- port instead of speaking over stdio — a DAP adapter run in "server" mode (`type =
+-- The socket sibling of `nx.process`, for a framed-protocol peer that listens on a TCP
+-- port instead of speaking over stdio — a DAP adapter run in `"server"` mode (`type =
 -- "server"`), which the debuggee or a launcher starts and the client connects to.
 -- Same handler-shaped surface (`on_connect` / `on_data` / `on_close`), same duplex
 -- contract: `handle:write(bytes)` sends, inbound bytes arrive raw on `on_data`.
 
 nx.socket = nx.socket or {}
 
--- id -> { on_connect, on_data, on_close, connected } for every live connection.
+-- id -> `{ on_connect, on_data, on_close, connected }` for every live connection.
 nx._sock_handlers = nx._sock_handlers or {}
 
 -- Native callback: the TCP connection is established.
@@ -334,10 +334,10 @@ function Socket:close()
   nx._sock_close(self.id)
 end
 
--- nx.socket.connect { host, port, on_connect, on_data, on_close } -> handle. Opens a
+-- `nx.socket.connect { host, port, on_connect, on_data, on_close }` -> handle. Opens a
 -- TCP client connection and returns a handle with `:write(data)` and `:close()`. The
 -- callbacks fire on the editor thread: `on_connect()` once connected, `on_data(chunk)`
--- per raw inbound batch, `on_close(err)` exactly once (err set on a connect/I-O
+-- per raw inbound batch, `on_close(err)` exactly once (`err` set on a connect/I-O
 -- failure).
 function nx.socket.connect(spec)
   if type(spec) ~= "table" then

@@ -10,16 +10,16 @@ nx = nx or {}
 nx.utils = nx.utils or {}
 
 -- ----- nx.utils.debounce -----------------------------------------------------
--- nx.utils.debounce(fn, ms): wrap `fn` into a trailing-edge debounce over
--- nx.timer — the returned value runs `fn` once, `ms` after the LAST call, so a
+-- `nx.utils.debounce(fn, ms)`: wrap `fn` into a trailing-edge debounce over
+-- `nx.timer` — the returned value runs `fn` once, `ms` after the LAST call, so a
 -- burst of rapid calls collapses to a single invocation with the most recent
 -- arguments. A timing/control-flow helper (which-key's show-delay, on-change
 -- handlers, resize / scroll reactions); it runs nothing on the input path.
 --
 -- It is callback-shaped, NOT promise-shaped: debounce coalesces a stream of many
 -- calls, whereas a promise models one eventual value — different jobs. They
--- compose, though: pass an nx.async function as `fn` to kick awaitable work after
--- the quiet period, and reach for nx.promise.delay when you want an *await-able*
+-- compose, though: pass an `nx.async` function as `fn` to kick awaitable work after
+-- the quiet period, and reach for `nx.promise.delay` when you want an *await-able*
 -- one-shot sleep instead.
 --
 -- The result is callable AND carries:

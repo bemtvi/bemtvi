@@ -1,8 +1,8 @@
--- nxvim Lua prelude — nx.promise, a Promises/A+ surface shaped like the browser's.
+-- nxvim Lua prelude — `nx.promise`, a Promises/A+ surface shaped like the browser's.
 --
 -- `nx` async is PROMISE-ONLY (ADR 0002): a one-shot async API returns a promise
--- (nx.run, nx.fs, …) and streaming is an async-iterator over them (nx.run_stream +
--- nx.await_each). `nx.promise` is the foundation: the exact object model the
+-- (`nx.run`, `nx.fs`, …) and streaming is an async-iterator over them (`nx.run_stream` +
+-- `nx.await_each`). `nx.promise` is the foundation: the exact object model the
 -- browser exposes — `nx.promise.new(executor)`, `:next`/`:catch`/`:finally`, and
 -- the `nx.promise.all/all_settled/race/any/resolve/reject/try` combinators — plus
 -- `nx.async`/`nx.await` coroutine sugar so a chain of awaits reads like
@@ -17,7 +17,7 @@
 --
 -- It is an nxvim-native surface (no `vim.*` twin — neovim core has no Promise), so
 -- it lives entirely on `nx`. As the async FOUNDATION every later surface builds on
--- (process / picker / complete / nx.ui), it loads early — right after the runtime
+-- (process / picker / complete / `nx.ui`), it loads early — right after the runtime
 -- services it needs: `nx.schedule` (the microtask primitive the reactions run on)
 -- and `nx.timer` (the wall-clock deferral `nx.promise.delay` uses), both installed
 -- in prelude/runtime.lua just above.
@@ -31,8 +31,8 @@ local function microtask(fn)
   nx.schedule(fn)
 end
 
--- A value is "callable" if it's a function or a table with a __call metamethod —
--- the test Promises/A+ uses before treating an onFulfilled/onRejected as a handler.
+-- A value is "callable" if it's a function or a table with a `__call` metamethod —
+-- the test Promises/A+ uses before treating an `onFulfilled`/`onRejected` as a handler.
 local function is_callable(v)
   if type(v) == "function" then
     return true
@@ -168,7 +168,7 @@ resolve_promise = function(p, x)
   settle(p, FULFILLED, x)
 end
 
--- :next(on_fulfilled, on_rejected) — the spine. Returns a NEW promise resolved
+-- `:next(on_fulfilled, on_rejected)` — the spine. Returns a NEW promise resolved
 -- with the handler's return (adopting it if it's itself a promise), or rejected
 -- if the handler throws. A missing handler passes the value/reason straight
 -- through to the returned promise, which is what makes a bare `:catch` at the end
@@ -205,12 +205,12 @@ function Promise:next(on_fulfilled, on_rejected)
   return result
 end
 
--- :catch(on_rejected) — sugar for :next(nil, on_rejected), verbatim browser.
+-- `:catch(on_rejected)` — sugar for `:next(nil, on_rejected)`, verbatim browser.
 function Promise:catch(on_rejected)
   return self:next(nil, on_rejected)
 end
 
--- :finally(on_finally) — run `on_finally` whichever way the promise settles, then
+-- `:finally(on_finally)` — run `on_finally` whichever way the promise settles, then
 -- pass the original value/reason through untouched (so `finally` can't swallow a
 -- result or a rejection). Matches the browser's pass-through semantics.
 function Promise:finally(on_finally)
@@ -231,9 +231,9 @@ end
 
 local M = {}
 
--- nx.promise.new(executor): the browser constructor. `executor(resolve, reject)`
+-- `nx.promise.new(executor)`: the browser constructor. `executor(resolve, reject)`
 -- runs SYNCHRONOUSLY now (as in the browser); a throw inside it rejects the
--- promise. `nx.promise(executor)` is the same thing via __call sugar.
+-- promise. `nx.promise(executor)` is the same thing via `__call` sugar.
 function M.new(executor)
   local p = new_pending()
   if executor ~= nil then
@@ -252,7 +252,7 @@ function M.new(executor)
   return p
 end
 
--- nx.promise.resolve(value): a promise already fulfilled with `value` (or, if
+-- `nx.promise.resolve(value)`: a promise already fulfilled with `value` (or, if
 -- `value` is itself a promise/thenable, the very same/adopted promise).
 function M.resolve(value)
   if is_promise(value) then
@@ -263,14 +263,14 @@ function M.resolve(value)
   return p
 end
 
--- nx.promise.reject(reason): a promise already rejected with `reason`.
+-- `nx.promise.reject(reason)`: a promise already rejected with `reason`.
 function M.reject(reason)
   local p = new_pending()
   settle(p, REJECTED, reason)
   return p
 end
 
--- nx.promise.try(fn, ...): run `fn(...)` INSIDE a promise — a synchronous throw
+-- `nx.promise.try(fn, ...)`: run `fn(...)` INSIDE a promise — a synchronous throw
 -- becomes a rejection, and a returned promise (or plain value) is adopted. So a
 -- function that may fail either way (sync error before it returns, or async
 -- rejection of what it returns) folds into ONE chain: no `pcall` + branch at the
@@ -280,7 +280,7 @@ function M.try(fn, ...)
   local args = { ... }
   local argc = select("#", ...)
   return M.new(function(resolve)
-    -- A throw in `fn` propagates out of this executor, which M.new turns into a
+    -- A throw in `fn` propagates out of this executor, which `M.new` turns into a
     -- rejection; a returned promise is adopted by `resolve` (the resolution proc).
     resolve(fn(table.unpack(args, 1, argc)))
   end)
@@ -291,9 +291,9 @@ local function list_len(t)
   return #t
 end
 
--- nx.promise.all(list): fulfils with the array of every value once ALL fulfil, in
+-- `nx.promise.all(list)`: fulfils with the array of every value once ALL fulfil, in
 -- input order; rejects as soon as ANY rejects (with that reason). An empty list
--- fulfils immediately with {}.
+-- fulfils immediately with `{}`.
 function M.all(list)
   return M.new(function(resolve, reject)
     local n = list_len(list)
@@ -314,9 +314,9 @@ function M.all(list)
   end)
 end
 
--- nx.promise.all_settled(list) [alias allSettled]: fulfils once every promise
--- settles, with an array of outcome tables: { status = "fulfilled", value = v }
--- or { status = "rejected", reason = e }. Never rejects.
+-- `nx.promise.all_settled(list)` [alias `allSettled`]: fulfils once every promise
+-- settles, with an array of outcome tables: `{ status = "fulfilled", value = v }`
+-- or `{ status = "rejected", reason = e }`. Never rejects.
 function M.all_settled(list)
   return M.new(function(resolve)
     local n = list_len(list)
@@ -342,7 +342,7 @@ function M.all_settled(list)
   end)
 end
 
--- nx.promise.race(list): settles the moment the FIRST input settles, adopting its
+-- `nx.promise.race(list)`: settles the moment the FIRST input settles, adopting its
 -- fulfilment or rejection. An empty list stays pending forever (as in the
 -- browser).
 function M.race(list)
@@ -353,8 +353,8 @@ function M.race(list)
   end)
 end
 
--- nx.promise.any(list): fulfils with the first value to fulfil; rejects only if
--- ALL reject, with an aggregate { errors = {...} }. An empty list rejects at once.
+-- `nx.promise.any(list)`: fulfils with the first value to fulfil; rejects only if
+-- ALL reject, with an aggregate `{ errors = {...} }`. An empty list rejects at once.
 function M.any(list)
   return M.new(function(resolve, reject)
     local n = list_len(list)
@@ -377,8 +377,8 @@ end
 
 -- ----- nx-native conveniences (still promise-shaped) -------------------------
 
--- nx.promise.delay(ms[, value]): a promise that fulfils with `value` after `ms`
--- wall-clock milliseconds, on the loop. The promise-flavoured vim.defer_fn — the
+-- `nx.promise.delay(ms[, value])`: a promise that fulfils with `value` after `ms`
+-- wall-clock milliseconds, on the loop. The promise-flavoured `vim.defer_fn` — the
 -- await-able sleep that makes retry/debounce chains read linearly.
 function M.delay(ms, value)
   return M.new(function(resolve)
@@ -388,18 +388,18 @@ function M.delay(ms, value)
   end)
 end
 
--- nx.wait_for(predicate[, opts]) -> promise: poll `predicate` BETWEEN ticks until it
+-- `nx.wait_for(predicate[, opts])` -> promise: poll `predicate` BETWEEN ticks until it
 -- returns a truthy value, then fulfil with that value. The await-able form of the
 -- bounded "spin until a cross-tick condition holds" loop that recurs across the
 -- codebase — a freshly-mounted window's id, a server-repopulated mirror, a view
--- buffer that exists next tick. It yields the tick (nx.on_next_tick) between checks, so
+-- buffer that exists next tick. It yields the tick (`nx.on_next_tick`) between checks, so
 -- those mirrors actually refresh, instead of spinning within one convergence the way
--- a bare nx.schedule re-arm does. `predicate` is checked once immediately, then once
+-- a bare `nx.schedule` re-arm does. `predicate` is checked once immediately, then once
 -- per following tick.
 --
---   opts.tries     max checks before giving up (default 200 — a few seconds of ticks)
---   opts.interval  ms between checks (default: the next tick); set for slower polling
---   opts.message   the rejection message used on timeout
+--   `opts.tries`     max checks before giving up (default 200 — a few seconds of ticks)
+--   `opts.interval`  ms between checks (default: the next tick); set for slower polling
+--   `opts.message`   the rejection message used on timeout
 --
 -- REJECTS (so an `nx.await` fails loud and a chain can `:catch`) if the condition
 -- never holds within `tries`, or if `predicate` throws. RESOLVES with the predicate's
@@ -436,12 +436,12 @@ function M.wait_for(predicate, opts)
 end
 nx.wait_for = M.wait_for
 
--- nx.promise.wrap(fn): lift a single-callback async function into a
+-- `nx.promise.wrap(fn)`: lift a single-callback async function into a
 -- promise-returning one. The wrapped function appends a resolver as the LAST
 -- argument and resolves with whatever that callback receives (its single arg, or
 -- all of them as a table when there's more than one) — the shape nxvim's own
--- callback APIs use (nx.ui.select's on_choice, an on_exit, …). Use this to turn
--- "pass me a callback" surfaces into await-ables; reach for nx.promise.new
+-- callback APIs use (`nx.ui.select`'s `on_choice`, an `on_exit`, …). Use this to turn
+-- "pass me a callback" surfaces into await-ables; reach for `nx.promise.new`
 -- directly when the callback uses a node-style (err, value) convention.
 function M.wrap(fn)
   return function(...)
@@ -468,7 +468,7 @@ setmetatable(M, {
 })
 
 -- Browser-name aliases so muscle memory works (the canonical names are snake_case
--- to match the rest of nx.*).
+-- to match the rest of `nx.*`).
 M.allSettled = M.all_settled
 
 nx.promise = M
@@ -505,7 +505,7 @@ function nx.async(fn)
       local co = coroutine.create(fn)
       -- Drive the coroutine one resume at a time. Each yield hands us the awaited
       -- value; we resolve it to a promise and re-enter when it settles, passing
-      -- (ok, value) back so nx.await can return the value or raise the reason.
+      -- (ok, value) back so `nx.await` can return the value or raise the reason.
       local function step(...)
         local ok, yielded = coroutine.resume(co, ...)
         if not ok then
@@ -528,10 +528,10 @@ function nx.async(fn)
   end
 end
 
--- nx.await(awaitable): suspend the enclosing nx.async coroutine until `awaitable`
+-- `nx.await(awaitable)`: suspend the enclosing `nx.async` coroutine until `awaitable`
 -- settles. Returns the fulfilment value, or raises the rejection reason as an
 -- error (which, uncaught, rejects the async function's promise). Errors loudly if
--- called outside an nx.async coroutine — there is nothing to suspend.
+-- called outside an `nx.async` coroutine — there is nothing to suspend.
 function nx.await(awaitable)
   -- `coroutine.isyieldable()` is false on the main thread and true inside a
   -- coroutine — exactly "is there an nx.async frame to suspend?". (The 5.1

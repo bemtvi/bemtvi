@@ -81,8 +81,8 @@ if not bit then
   }
 end
 
--- nx.str.* string helpers (aliases vim.fn.trim / str2list / nr2char / strchars /
--- strdisplaywidth / strcharpart / strtrans). nx.str.trim(text[, mask[, dir]]):
+-- `nx.str.*` string helpers (aliases `vim.fn.trim` / `str2list` / `nr2char` / `strchars` /
+-- `strdisplaywidth` / `strcharpart` / `strtrans`). `nx.str.trim(text[, mask[, dir]])`:
 -- strip the characters in `mask` (default the whitespace set) from `text`. `dir` 0
 -- trims both ends (default), 1 leading only, 2 trailing only. `mask` is a *set* of
 -- characters, not a pattern. nvim-dap-python trims command output through this.
@@ -120,14 +120,14 @@ vim.fn.trim = nx.str.trim
 -- JSON encoder of its own.
 nx.json = nx.json or {}
 
--- nx.json.encode(value[, opts]) -> string. `opts.pretty` (default false) emits a
+-- `nx.json.encode(value[, opts]) -> string`. `opts.pretty` (default false) emits a
 -- 2-space-indented, multi-line document for human-readable / diff-friendly files;
 -- omit it for the compact one-liner.
 function nx.json.encode(value, opts)
   return nx._json_encode(value, opts)
 end
 
--- nx.json.decode(str) -> value. Parses a JSON document (objects -> string-keyed
+-- `nx.json.decode(str) -> value`. Parses a JSON document (objects -> string-keyed
 -- tables, arrays -> sequences, `null` -> nil); raises on malformed input.
 function nx.json.decode(str)
   return nx._json_decode(str)
@@ -341,13 +341,13 @@ end
 nx.tbl = nx.tbl or {}
 nx.list = nx.list or {}
 
--- nx.tbl.is_empty(t) [alias vim.tbl_isempty]: does `t` have no entries?
+-- `nx.tbl.is_empty(t)` [alias `vim.tbl_isempty`]: does `t` have no entries?
 function nx.tbl.is_empty(t)
   return next(t) == nil
 end
 vim.tbl_isempty = nx.tbl.is_empty
 
--- nx.tbl.contains(t, value) [alias vim.tbl_contains]: is `value` one of `t`'s values?
+-- `nx.tbl.contains(t, value)` [alias `vim.tbl_contains`]: is `value` one of `t`'s values?
 function nx.tbl.contains(t, value)
   for _, v in pairs(t) do
     if v == value then
@@ -358,7 +358,7 @@ function nx.tbl.contains(t, value)
 end
 vim.tbl_contains = nx.tbl.contains
 
--- nx.tbl.keys(t) [alias vim.tbl_keys]: a list of `t`'s keys.
+-- `nx.tbl.keys(t)` [alias `vim.tbl_keys`]: a list of `t`'s keys.
 function nx.tbl.keys(t)
   local keys = {}
   for k in pairs(t) do
@@ -368,7 +368,7 @@ function nx.tbl.keys(t)
 end
 vim.tbl_keys = nx.tbl.keys
 
--- nx.tbl.values(t) [alias vim.tbl_values]: a list of `t`'s values.
+-- `nx.tbl.values(t)` [alias `vim.tbl_values`]: a list of `t`'s values.
 function nx.tbl.values(t)
   local values = {}
   for _, v in pairs(t) do
@@ -378,7 +378,7 @@ function nx.tbl.values(t)
 end
 vim.tbl_values = nx.tbl.values
 
--- nx.tbl.count(t) [alias vim.tbl_count]: number of entries in `t` (any keys, not just the sequence).
+-- `nx.tbl.count(t)` [alias `vim.tbl_count`]: number of entries in `t` (any keys, not just the sequence).
 function nx.tbl.count(t)
   local n = 0
   for _ in pairs(t) do
@@ -388,7 +388,7 @@ function nx.tbl.count(t)
 end
 vim.tbl_count = nx.tbl.count
 
--- nx.tbl.deep_equal(a, b) [alias vim.deep_equal]: structural equality (recurses
+-- `nx.tbl.deep_equal(a, b)` [alias `vim.deep_equal`]: structural equality (recurses
 -- into tables, comparing keys and values). A general config/plugin helper.
 function nx.tbl.deep_equal(a, b)
   if a == b then
@@ -411,9 +411,9 @@ function nx.tbl.deep_equal(a, b)
 end
 vim.deep_equal = nx.tbl.deep_equal
 
--- nx.npcall(fn, ...) [alias vim.npcall]: pcall that maps failure to nil — `select(2, pcall(...))`
+-- `nx.npcall(fn, ...)` [alias `vim.npcall`]: `pcall` that maps failure to nil — `select(2, pcall(...))`
 -- on success, nil on error. A neovim helper kept for config/plugin convenience
--- (wrap a call that may raise and treat failure as "no value").
+-- (wrap a call that may raise and treat failure as `"no value"`).
 function nx.npcall(fn, ...)
   local ok, rv = pcall(fn, ...)
   if ok then
@@ -422,8 +422,8 @@ function nx.npcall(fn, ...)
 end
 vim.npcall = nx.npcall
 
--- nx.nonnil(...) [alias vim.nonnil]: the first non-nil argument, or nil (verbatim from neovim's
--- vim/_core/shared.lua; the replacement for the deprecated vim.F.if_nil). A general
+-- `nx.nonnil(...)` [alias `vim.nonnil`]: the first non-nil argument, or nil (verbatim from neovim's
+-- vim/_core/shared.lua; the replacement for the deprecated `vim.F.if_nil`). A general
 -- helper for defaulting an optional value.
 function nx.nonnil(...)
   local nargs = select("#", ...)
@@ -437,9 +437,9 @@ function nx.nonnil(...)
 end
 vim.nonnil = nx.nonnil
 
--- nx._tointeger / nx._assert_integer: integer coercion (verbatim from neovim's
--- vim/_core/shared.lua). vim.func._memoize uses them to parse a `concat-N` hash
--- spec; _assert_integer raises on a non-integer, _tointeger returns nil.
+-- `nx._tointeger` / `nx._assert_integer`: integer coercion (verbatim from neovim's
+-- vim/_core/shared.lua). `vim.func._memoize` uses them to parse a `concat-N` hash
+-- spec; `_assert_integer` raises on a non-integer, `_tointeger` returns nil.
 function nx._tointeger(x, base)
   local n = tonumber(x, base)
   if n and n == math.floor(n) then
@@ -451,10 +451,10 @@ function nx._assert_integer(x, base)
   return nx._tointeger(x, base) or error(("Cannot convert %s to integer"):format(x))
 end
 
--- nx.tbl.get(o, ...) [alias vim.tbl_get]: follow the `...` keys into nested table `o`, returning the
+-- `nx.tbl.get(o, ...)` [alias `vim.tbl_get`]: follow the `...` keys into nested table `o`, returning the
 -- value reached or nil if any step is missing (or hits a non-table before the
 -- last key). The safe nested access `lsp/<server>.lua` configs use to read deep
--- settings (e.g. rust_analyzer's `settings['rust-analyzer'].cargo.sysrootSrc`).
+-- settings (e.g. `rust_analyzer`'s `settings['rust-analyzer'].cargo.sysrootSrc`).
 function nx.tbl.get(o, ...)
   local keys = { ... }
   if #keys == 0 then
@@ -473,7 +473,7 @@ function nx.tbl.get(o, ...)
 end
 vim.tbl_get = nx.tbl.get
 
--- nx.tbl.filter(f, t) [alias vim.tbl_filter]: Iterates with `pairs` (not `ipairs`) to match neovim: callers filter
+-- `nx.tbl.filter(f, t)` [alias `vim.tbl_filter`]: Iterates with `pairs` (not `ipairs`) to match neovim: callers filter
 -- name-keyed maps too (a plugin manager filters its plugin set, keyed by plugin
 -- name), not just arrays. The result is always a fresh array.
 function nx.tbl.filter(f, t)
@@ -487,7 +487,7 @@ function nx.tbl.filter(f, t)
 end
 vim.tbl_filter = nx.tbl.filter
 
--- nx.tbl.map(f, t) [alias vim.tbl_map]: apply `f` to each value, keeping keys.
+-- `nx.tbl.map(f, t)` [alias `vim.tbl_map`]: apply `f` to each value, keeping keys.
 function nx.tbl.map(f, t)
   local out = {}
   for k, v in pairs(t) do
@@ -497,7 +497,7 @@ function nx.tbl.map(f, t)
 end
 vim.tbl_map = nx.tbl.map
 
--- nx.tbl.flatten(t) [alias vim.tbl_flatten]: a single list with every nested list flattened into it
+-- `nx.tbl.flatten(t)` [alias `vim.tbl_flatten`]: a single list with every nested list flattened into it
 -- (depth-first). Deprecated in neovim but still called by `lspconfig.util`.
 function nx.tbl.flatten(t)
   local out = {}
@@ -515,7 +515,7 @@ function nx.tbl.flatten(t)
 end
 vim.tbl_flatten = nx.tbl.flatten
 
--- nx.tbl.deepcopy(orig) [alias vim.deepcopy]: a recursive copy of `orig` (metatables preserved).
+-- `nx.tbl.deepcopy(orig)` [alias `vim.deepcopy`]: a recursive copy of `orig` (metatables preserved).
 function nx.tbl.deepcopy(orig)
   if type(orig) ~= "table" then
     return orig
@@ -528,7 +528,7 @@ function nx.tbl.deepcopy(orig)
 end
 vim.deepcopy = nx.tbl.deepcopy
 
--- nx.tbl.deep_extend(behavior, ...) [alias vim.tbl_deep_extend]: Merge `...` maps into one. `behavior` is "force" | "keep" | "error". Nested
+-- `nx.tbl.deep_extend(behavior, ...)` [alias `vim.tbl_deep_extend`]: Merge `...` maps into one. `behavior` is `"force"` | `"keep"` | `"error"`. Nested
 -- tables merge recursively; scalar conflicts resolve per `behavior`.
 function nx.tbl.deep_extend(behavior, ...)
   local result = {}
@@ -550,7 +550,7 @@ function nx.tbl.deep_extend(behavior, ...)
 end
 vim.tbl_deep_extend = nx.tbl.deep_extend
 
--- nx.tbl.extend(behavior, ...) [alias vim.tbl_extend]: Shallow variant of nx.tbl.deep_extend.
+-- `nx.tbl.extend(behavior, ...)` [alias `vim.tbl_extend`]: Shallow variant of `nx.tbl.deep_extend`.
 function nx.tbl.extend(behavior, ...)
   local result = {}
   for i = 1, select("#", ...) do
@@ -566,7 +566,7 @@ function nx.tbl.extend(behavior, ...)
 end
 vim.tbl_extend = nx.tbl.extend
 
--- nx.list.extend(dst, src, start, finish) [alias vim.list_extend]: append `src[start..finish]` onto `dst`.
+-- `nx.list.extend(dst, src, start, finish)` [alias `vim.list_extend`]: append `src[start..finish]` onto `dst`.
 function nx.list.extend(dst, src, start, finish)
   start = start or 1
   finish = finish or #src
@@ -577,7 +577,7 @@ function nx.list.extend(dst, src, start, finish)
 end
 vim.list_extend = nx.list.extend
 
--- nx.list.slice(list, start, finish) [alias vim.list_slice]: a copy of `list[start..finish]` (1-based,
+-- `nx.list.slice(list, start, finish)` [alias `vim.list_slice`]: a copy of `list[start..finish]` (1-based,
 -- inclusive; negative indices count from the end, as neovim). A completion plugin
 -- caps its menu with `vim.list_slice(entries, 1, max_view_entries)`.
 function nx.list.slice(list, start, finish)
@@ -598,18 +598,18 @@ function nx.list.slice(list, start, finish)
 end
 vim.list_slice = nx.list.slice
 
--- nx.str.startswith(s, prefix) [alias vim.startswith]: does `s` begin with `prefix`?
+-- `nx.str.startswith(s, prefix)` [alias `vim.startswith`]: does `s` begin with `prefix`?
 function nx.str.startswith(s, prefix)
   return s:sub(1, #prefix) == prefix
 end
 vim.startswith = nx.str.startswith
--- nx.str.endswith(s, suffix) [alias vim.endswith]: does `s` end with `suffix`?
+-- `nx.str.endswith(s, suffix)` [alias `vim.endswith`]: does `s` end with `suffix`?
 function nx.str.endswith(s, suffix)
   return suffix == "" or s:sub(-#suffix) == suffix
 end
 vim.endswith = nx.str.endswith
 
--- nx.str.split(s, sep, opts) [alias vim.split]: split `s` on `sep`.
+-- `nx.str.split(s, sep, opts)` [alias `vim.split`]: split `s` on `sep`.
 function nx.str.split(s, sep, opts)
   -- Legacy positional form `vim.split(s, sep, plain)`: neovim keeps this
   -- backward-compat (a boolean third arg is the `plain` flag), and nvim-treesitter
@@ -760,10 +760,10 @@ local function utf8_encode(cp)
   )
 end
 
--- nx.str.to_list(s[, utf8]) [alias vim.fn.str2list]: the codepoint of each character
+-- `nx.str.to_list(s[, utf8])` [alias `vim.fn.str2list`]: the codepoint of each character
 -- in `s`, as a list of numbers (`str2list("AB") == { 65, 66 }`). nxvim is always
 -- UTF-8, so the `utf8` flag is accepted and ignored (the result is the same either
--- way). A plugin's key parser round-trips a keymap's lhs through this and nr2char.
+-- way). A plugin's key parser round-trips a keymap's lhs through this and `nr2char`.
 function nx.str.to_list(s, _utf8)
   s = tostring(s or "")
   local out, i = {}, 1
@@ -779,15 +779,15 @@ function nx.str.to_list(s, _utf8)
 end
 vim.fn.str2list = nx.str.to_list
 
--- nx.str.from_char(nr[, utf8]) [alias vim.fn.nr2char]: the string for codepoint `nr`
--- (`nr2char(65) == "A"`). The inverse of one nx.str.to_list element; nxvim is always
+-- `nx.str.from_char(nr[, utf8])` [alias `vim.fn.nr2char`]: the string for codepoint `nr`
+-- (`nr2char(65) == "A"`). The inverse of one `nx.str.to_list` element; nxvim is always
 -- UTF-8 so `utf8` is accepted and ignored.
 function nx.str.from_char(nr, _utf8)
   return utf8_encode(nr)
 end
 vim.fn.nr2char = nx.str.from_char
 
--- nx.str.chars(s[, skipcc]) [alias vim.fn.strchars]: number of characters
+-- `nx.str.chars(s[, skipcc])` [alias `vim.fn.strchars`]: number of characters
 -- (codepoints) in `s`. INCOMPLETE: `skipcc` (skip composing characters) is ignored —
 -- every codepoint counts, since nxvim doesn't classify combining marks.
 function nx.str.chars(s, _skipcc)
@@ -804,11 +804,11 @@ function nx.str.chars(s, _skipcc)
 end
 vim.fn.strchars = nx.str.chars
 
--- nx.str.displaywidth(s[, col]) [alias vim.fn.strdisplaywidth]: the display cells `s`
+-- `nx.str.displaywidth(s[, col])` [alias `vim.fn.strdisplaywidth`]: the display cells `s`
 -- occupies, expanding tabs to the next tabstop boundary and counting wide chars as
 -- two. `col` is the starting screen column used for tab-stop math (default 0); the
 -- return value is the width of `s` itself (cells consumed beyond `col`). INCOMPLETE:
--- tabs expand on a fixed tabstop of 8, not the current buffer's 'tabstop'.
+-- tabs expand on a fixed tabstop of 8, not the current buffer's `'tabstop'`.
 function nx.str.displaywidth(s, col)
   s = tostring(s or "")
   local ts, base = 8, col or 0
@@ -829,11 +829,11 @@ function nx.str.displaywidth(s, col)
 end
 vim.fn.strdisplaywidth = nx.str.displaywidth
 
--- nx.str.utfindex(s, [encoding,] index) [alias vim.str_utfindex]: convert a *byte* offset into `s` to a
+-- `nx.str.utfindex(s, [encoding,] index)` [alias `vim.str_utfindex`]: convert a *byte* offset into `s` to a
 -- UTF code-unit count, supporting both neovim signatures (a completion plugin probes
 -- the version and uses whichever the running editor offers):
---   * pre-0.11  vim.str_utfindex(s [, byteidx])        -> utf32, utf16  (two values)
---   * 0.11+     vim.str_utfindex(s, encoding, byteidx) -> single index for encoding
+--   * pre-0.11  `vim.str_utfindex(s [, byteidx])`        -> utf32, utf16  (two values)
+--   * 0.11+     `vim.str_utfindex(s, encoding, byteidx)` -> single index for encoding
 -- `byteidx` defaults to #s (end of string) and is clamped into range. The count is
 -- whole codepoints whose start byte falls at or before `byteidx`; a codepoint
 -- outside the BMP (4-byte UTF-8) is one utf-32 unit but two utf-16 units.
@@ -872,11 +872,11 @@ function nx.str.utfindex(s, a, b)
 end
 vim.str_utfindex = nx.str.utfindex
 
--- nx.str.byteindex(s, [encoding,] index) [alias vim.str_byteindex]: the inverse — the byte offset of the
--- `index`-th UTF code unit. Mirrors str_utfindex's dual signature; the legacy form
+-- `nx.str.byteindex(s, [encoding,] index)` [alias `vim.str_byteindex`]: the inverse — the byte offset of the
+-- `index`-th UTF code unit. Mirrors `str_utfindex`'s dual signature; the legacy form
 -- counts utf-32 units (a 4-byte codepoint is one unit), the 0.11+ form honors the
 -- requested encoding (utf-16 lets `index` land mid-astral, snapping to the
--- codepoint start). Clamps past-the-end indices to #s.
+-- codepoint start). Clamps past-the-end indices to `#s`.
 local function byteindex_for(s, index, utf16)
   if index == nil or index <= 0 then
     return 0
@@ -909,7 +909,7 @@ function nx.str.byteindex(s, a, b)
 end
 vim.str_byteindex = nx.str.byteindex
 
--- nx.str.charpart(s, start[, len]) [alias vim.fn.strcharpart]: the substring of `s`
+-- `nx.str.charpart(s, start[, len])` [alias `vim.fn.strcharpart`]: the substring of `s`
 -- starting at character index `start` (0-based), spanning `len` characters (default:
 -- to the end). A negative `start` drops that many leading characters off the count
 -- (vim's behavior) and clamps the start to 0.
@@ -941,8 +941,8 @@ function nx.str.charpart(s, start, len)
 end
 vim.fn.strcharpart = nx.str.charpart
 
--- nx.str.trans(s) [alias vim.fn.strtrans]: `s` with unprintable characters shown as
--- printable text — control chars 0x00–0x1F as ^@…^_, 0x7F as ^? — matching vim, so a
+-- `nx.str.trans(s)` [alias `vim.fn.strtrans`]: `s` with unprintable characters shown as
+-- printable text — control chars `0x00`–`0x1F` as `^@`…`^_`, `0x7F` as `^?` — matching vim, so a
 -- key label built from raw bytes displays readably. Multibyte UTF-8 is left intact.
 function nx.str.trans(s)
   s = tostring(s or "")
@@ -958,23 +958,23 @@ function nx.str.trans(s)
 end
 vim.fn.strtrans = nx.str.trans
 
--- nx.keytrans(s) [alias vim.fn.keytrans]: translate the internal form of a key
+-- `nx.keytrans(s)` [alias `vim.fn.keytrans`]: translate the internal form of a key
 -- sequence to readable key notation (`<C-w>`, `<Space>`, …). nxvim represents keys
--- AS that notation throughout (parse_keys / nvim_feedkeys consume notation directly,
--- and nvim_replace_termcodes returns its input unchanged), so the internal form
+-- AS that notation throughout (`parse_keys` / `nvim_feedkeys` consume notation directly,
+-- and `nvim_replace_termcodes` returns its input unchanged), so the internal form
 -- already IS the notation — this returns `s` unchanged, the inverse of
--- nvim_replace_termcodes exactly as in vim.
+-- `nvim_replace_termcodes` exactly as in vim.
 function nx.keytrans(s)
   return tostring(s or "")
 end
 vim.fn.keytrans = nx.keytrans
 
--- nx.str.width(s) [alias nx.strwidth / vim.api.nvim_strwidth]: the display width
+-- `nx.str.width(s)` [alias `nx.strwidth` / `vim.api.nvim_strwidth`]: the display width
 -- of `s` in terminal cells, computed natively by the `nx._strwidth` Rust helper
 -- (the same `unicode-width` table the renderer measures with — so this and the
 -- drawn frame always agree). Wide (CJK / emoji) graphemes count as two, combining
--- marks as zero; tabs are NOT expanded (reach for nx.str.displaywidth when you
--- need tab expansion). This is the measure the nx.align.* helpers below size lines
+-- marks as zero; tabs are NOT expanded (reach for `nx.str.displaywidth` when you
+-- need tab expansion). This is the measure the `nx.align.*` helpers below size lines
 -- against. The `nx.strwidth` / `nvim_strwidth` names are kept as neovim-compat
 -- aliases onto the same native helper (they previously ran a coarser pure-Lua
 -- heuristic that mis-sized combining marks as one cell).
@@ -983,36 +983,36 @@ nx.str.width = nx._strwidth
 nx.strwidth = nx._strwidth
 vim.api.nvim_strwidth = nx._strwidth
 
--- nx.align.{left,center,right}(line, width): pad a single line with spaces so it
+-- `nx.align.{left,center,right}(line, width)`: pad a single line with spaces so it
 -- spans `width` display cells. `left` keeps the text at the start (pad on the
 -- right), `right` pushes it to the end (pad on the left), and `center` splits the
 -- padding, sending any odd leftover cell to the right. A line already at or wider
 -- than `width` is returned unchanged — these only add spaces, never truncate.
--- Width is measured with nx.str.width, so wide glyphs pad correctly.
+-- Width is measured with `nx.str.width`, so wide glyphs pad correctly.
 nx.align = nx.align or {}
 
--- nx.align.left(line, width): pad `line` on the RIGHT with spaces so it spans
+-- `nx.align.left(line, width)`: pad `line` on the RIGHT with spaces so it spans
 -- `width` display cells, keeping the text flush left. A line already at or wider
 -- than `width` is returned unchanged — it only adds spaces, never truncates.
--- Width is measured with nx.str.width, so wide (CJK / emoji) glyphs pad correctly.
+-- Width is measured with `nx.str.width`, so wide (CJK / emoji) glyphs pad correctly.
 function nx.align.left(line, width)
   line = tostring(line or "")
   local pad = (width or 0) - nx.str.width(line)
   return pad > 0 and line .. string.rep(" ", pad) or line
 end
 
--- nx.align.right(line, width): like nx.align.left, but pads on the LEFT so the
+-- `nx.align.right(line, width)`: like `nx.align.left`, but pads on the LEFT so the
 -- text sits flush right within `width` display cells. At or over `width` → returned
--- unchanged; cell-width aware (nx.str.width).
+-- unchanged; cell-width aware (`nx.str.width`).
 function nx.align.right(line, width)
   line = tostring(line or "")
   local pad = (width or 0) - nx.str.width(line)
   return pad > 0 and string.rep(" ", pad) .. line or line
 end
 
--- nx.align.center(line, width): like nx.align.left, but splits the padding so the
+-- `nx.align.center(line, width)`: like `nx.align.left`, but splits the padding so the
 -- text is centred within `width` display cells; an odd leftover cell goes to the
--- right. At or over `width` → returned unchanged; cell-width aware (nx.str.width).
+-- right. At or over `width` → returned unchanged; cell-width aware (`nx.str.width`).
 function nx.align.center(line, width)
   line = tostring(line or "")
   local pad = (width or 0) - nx.str.width(line)
@@ -1023,7 +1023,7 @@ function nx.align.center(line, width)
   return string.rep(" ", left) .. line .. string.rep(" ", pad - left)
 end
 
--- nx.tbl.spairs(t) [alias vim.spairs]: pairs() in sorted-key order. Neovim's stable-iteration helper —
+-- `nx.tbl.spairs(t)` [alias `vim.spairs`]: `pairs()` in sorted-key order. Neovim's stable-iteration helper —
 -- a custom `'tabline'`/`str_join` uses it so output order is deterministic.
 function nx.tbl.spairs(t)
   local keys = {}
@@ -1042,7 +1042,7 @@ function nx.tbl.spairs(t)
 end
 vim.spairs = nx.tbl.spairs
 
--- nx.print(...) [alias vim.print]: pretty-print each argument (via nx.inspect) on the message
+-- `nx.print(...)` [alias `vim.print`]: pretty-print each argument (via `nx.inspect`) on the message
 -- line and return them unchanged, so it can wrap a value inline. Strings print
 -- verbatim; tables are inspected.
 function nx.print(...)
@@ -1063,7 +1063,7 @@ vim.print = nx.print
 local Iter = {}
 Iter.__index = Iter
 
--- nx.iter(src[, state, ctrl]) [alias vim.iter]: wrap a list-like table OR a Lua iterator triple
+-- `nx.iter(src[, state, ctrl])` [alias `vim.iter`]: wrap a list-like table OR a Lua iterator triple
 -- in a chainable iterator. The triple form is what `vim.iter(vim.fs.parents(p))`
 -- passes — `vim.fs.parents` returns `(fn, state, start)`, which Lua spreads as
 -- three args here — so the ancestors are drained eagerly into the item list.
@@ -1169,7 +1169,7 @@ function Iter:totable()
   return self._items
 end
 
--- nx.str.substitute(str, pat, sub, flags) [alias vim.fn.substitute]: a real vim-regex
+-- `nx.str.substitute(str, pat, sub, flags)` [alias `vim.fn.substitute`]: a real vim-regex
 -- substitution, backed by the Rust engine (`nx._substitute`) so plugins that rely on
 -- vim's magic dialect + replacement syntax (`\(\)`, `\{-}`, `&`, `\1`, `\U…\E`, …) get
 -- the same result neovim gives. This is a DIFFERENT dialect from nxvim's `/` search
@@ -1180,12 +1180,12 @@ function nx.str.substitute(str, pat, sub, flags)
 end
 vim.fn.substitute = nx.str.substitute
 
--- vim.trim(s): aliases the canonical nx.str.trim (defined in stdlib.lua, a
+-- `vim.trim(s)`: aliases the canonical `nx.str.trim` (defined in stdlib.lua, a
 -- superset accepting an optional mask/dir).
 vim.trim = nx.str.trim
 
--- nx.list.is_list(t) [alias vim.islist]: true iff `t` is a list (a table whose
--- keys are exactly 1..#t).
+-- `nx.list.is_list(t)` [alias `vim.islist`]: true iff `t` is a list (a table whose
+-- keys are exactly `1..#t`).
 nx.list = nx.list or {}
 function nx.list.is_list(t)
   if type(t) ~= "table" then

@@ -16,11 +16,11 @@
 --
 -- WHERE it renders is a pluggable BACKEND, so the same reactive core drives different
 -- surfaces. Two ship here:
---   * "view"  — a focus-taking, navigable `nx.view` buffer (dock / split / grabbing float).
+--   * `"view"`  — a focus-taking, navigable `nx.view` buffer (dock / split / grabbing float).
 --               `render` returns `{ lines, decor }`; `ctx` gains `keymap_set` / `line` /
 --               `set_cursor` / `bufnr`. This is what a file tree / picker / modal dialog
 --               wants. `nx.view.component(def)` is the sugar for it.
---   * "float" — a NON-focus `nx.ui.float` content float (the which-key surface). It never
+--   * `"float"` — a NON-focus `nx.ui.float` content float (the which-key surface). It never
 --               steals focus and binds no keys; `render` returns `{ lines, title?,
 --               relative?, border? }` (lines may be styled chunk rows), and an EMPTY render
 --               hides the float. Reach it with `nx.component{ surface = "float", … }`.
@@ -184,7 +184,7 @@ end
 
 -- ----- backends: how a component's render output reaches a surface ----------------------
 
--- The "view" backend: a focus-taking, navigable nx.view buffer. `render` -> { lines, decor }.
+-- The `"view"` backend: a focus-taking, navigable `nx.view` buffer. `render` -> { lines, decor }.
 --
 -- `opts.persist` (a stable id) + `opts._create_ns` (the resolved owner namespace) opt the
 -- backing view into cross-session restore — the component core threads them in for a
@@ -220,7 +220,7 @@ local function view_backend(opts)
       :catch(function() end)
   end
 
-  -- show(mode) — put the view on screen. `mode.place` adopts a reserved restore slot (the
+  -- `show(mode)` — put the view on screen. `mode.place` adopts a reserved restore slot (the
   -- persisted-view path); otherwise mount fresh per the dock / split / float opts.
   local function show(mode)
     if mode and mode.place then
@@ -237,7 +237,7 @@ local function view_backend(opts)
 
   return {
     show = show,
-    -- The backing buffer number arrives a tick after create/mount (the nx._view_buf mirror).
+    -- The backing buffer number arrives a tick after create/mount (the `nx._view_buf` mirror).
     ready = function()
       return v:bufnr() ~= nil
     end,
@@ -279,7 +279,7 @@ local function view_backend(opts)
         winid = function()
           return v:winid()
         end,
-        -- ctx.bo / ctx.wo — the view's buffer-local and window-local options, the same
+        -- `ctx.bo` / `ctx.wo` — the view's buffer-local and window-local options, the same
         -- `vim.bo[buf]` / `vim.wo[win]` tables scoped to this view (e.g.
         -- `ctx.bo.shiftwidth = 2`, `ctx.bo.expandtab = true`; `ctx.wo.number = true`,
         -- `ctx.wo.wrap = false`). Use the option's real scope — display options like
@@ -310,7 +310,7 @@ local function view_backend(opts)
             end
           end,
         }),
-        -- A thin wrapper over nx.keymap.set(mode, lhs, rhs, opts) — same signature — that
+        -- A thin wrapper over `nx.keymap.set(mode, lhs, rhs, opts)` — same signature — that
         -- defaults `buffer` to this view and `nowait` on; any field the caller passes wins.
         keymap_set = function(mode, lhs, rhs, user_opts)
           local merged = { buffer = v:bufnr(), nowait = true }
@@ -324,7 +324,7 @@ local function view_backend(opts)
   }
 end
 
--- nx.ui.float is a SINGLE editor-wide content-float slot (the core holds one
+-- `nx.ui.float` is a SINGLE editor-wide content-float slot (the core holds one
 -- `content_float`), so two float components displaying at once would clobber each other.
 -- Track which live float component currently owns that slot so a second one fails LOUD
 -- (CLAUDE.md: no silent clobber) rather than silently stealing it. Ownership is held only
@@ -332,7 +332,7 @@ end
 -- visible at the same time coexist fine.
 local content_float_owner = nil
 
--- The "float" backend: a non-focus nx.ui.float content float. `render` ->
+-- The `"float"` backend: a non-focus `nx.ui.float` content float. `render` ->
 -- { lines, title?, relative?, border? }. An empty render hides the float (and a later
 -- non-empty one re-opens it), so a component can show/hide by what it returns — which is
 -- exactly the which-key shape. Takes no focus and binds no keys (no ctx extras).
@@ -442,7 +442,7 @@ end
 
 -- ----- nx.component: the generic core ---------------------------------------------------
 
--- nx.component(def) -> { mount(opts) } — build a reactive, Vue-shaped UI component for
+-- `nx.component(def)` -> { mount(opts) } — build a reactive, Vue-shaped UI component for
 -- a plugin surface, then `:mount()` one or more instances of it. The reactive core is
 -- surface-agnostic: the same component can drive a focus-taking buffer or a passive
 -- float, chosen per `def` / `mount`.
@@ -466,16 +466,16 @@ end
 --     re-evaluates only when a reactive input it read last time has changed.
 --   * `ctx.refresh()` — force a re-render. `ctx.props` — the `opts.props` from `mount`.
 --   * `ctx.on_close(fn)` / `ctx.close()` — register a teardown hook / close the instance.
---   On the "view" surface `ctx` also gains: `ctx.view`, `ctx.bufnr()`, `ctx.winid()`,
+--   On the `"view"` surface `ctx` also gains: `ctx.view`, `ctx.bufnr()`, `ctx.winid()`,
 --   `ctx.line()`, `ctx.set_cursor(n)`, `ctx.bo` / `ctx.wo` (the view's buffer/window-local
 --   option tables), and `ctx.keymap_set(mode, lhs, rhs, opts)` (buffer-scoped + `nowait`
 --   by default).
 --
 -- Surfaces — what `render` returns, and how the surface behaves:
---   * "view"  — a focus-taking, navigable `nx.view` buffer (dock / split / grabbing
+--   * `"view"`  — a focus-taking, navigable `nx.view` buffer (dock / split / grabbing
 --     float): the file-tree / list / modal-dialog case. `render` returns
 --     `{ lines, decor }` (or a bare line list). `nx.view.component(def)` is the sugar.
---   * "float" — a NON-focus `nx.ui.float` content float (the which-key surface): never
+--   * `"float"` — a NON-focus `nx.ui.float` content float (the which-key surface): never
 --     steals focus, binds no keys. `render` returns `{ lines, title?, relative?, border? }`;
 --     an EMPTY render HIDES the float (a later non-empty one re-opens it), so a component
 --     shows/hides purely by what it returns. Only one float component may display at once
@@ -528,7 +528,7 @@ function nx.component(def)
     end
   end
 
-  -- instantiate(opts, show_mode) — build one live instance: create the surface, show it
+  -- `instantiate(opts, show_mode)` — build one live instance: create the surface, show it
   -- (mount fresh via `show_mode.fresh`, or adopt a reserved restore slot via
   -- `show_mode.place`), then run the reactive lifecycle. Returns the instance handle.
   local function instantiate(opts, show_mode)
@@ -591,7 +591,7 @@ function nx.component(def)
       reactive = function(tbl)
         return make_reactive(tbl or {}, schedule_render)
       end,
-      -- ctx.computed(getter) -> a cached derived value, read as `c()` (or `c.value`). It
+      -- `ctx.computed(getter)` -> a cached derived value, read as `c()` (or `c.value`). It
       -- re-evaluates only when a reactive value it read has changed.
       computed = function(getter)
         return make_computed(getter)
@@ -637,7 +637,7 @@ function nx.component(def)
     return inst
   end
 
-  -- mount_persistent(opts) — a persistent view mount (`mount{ persist=, … }`). Resolve the
+  -- `mount_persistent(opts)` — a persistent view mount (`mount{ persist=, … }`). Resolve the
   -- owner namespace ONCE, synchronously, at this (attributing) call site, then thread it
   -- explicitly through every later deferred / async call (create, the store, the restore
   -- router) so none of them re-attribute off the stack. Returns a proxy handle immediately;
@@ -694,7 +694,7 @@ function nx.component(def)
   return M
 end
 
--- nx.view.component(def) — the view-backed component (a focus-taking nx.view buffer): the
+-- `nx.view.component(def)` — the view-backed component (a focus-taking `nx.view` buffer): the
 -- common case (file tree, list, modal dialog). Sugar over `nx.component` with the view
 -- backend; `mount(opts)` takes the view surface options (name / filetype / dock / split /
 -- float), plus `persist = "<id>"` (+ optional `namespace`) to make the view survive a

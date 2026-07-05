@@ -191,12 +191,12 @@ function nx.explorer._up(buf)
   replace_with(buf, parent)
 end
 
--- nx.explorer.actions — the public, rebindable activation actions (current-buffer
+-- `nx.explorer.actions` — the public, rebindable activation actions (current-buffer
 -- wrappers over the stateless `_open`/`_up`). A user/plugin extends or rebinds the
 -- explorer with an ordinary buffer-local map in a `FileType nxdir` autocmd, e.g.
---   nx.autocmd.create("FileType", { pattern = "nxdir", callback = function(a)
---     nx.keymap.set("n", "<C-j>", nx.explorer.actions.open, { buffer = a.buf })
---   end })
+--   `nx.autocmd.create("FileType", { pattern = "nxdir", callback = function(a)`
+--     `nx.keymap.set("n", "<C-j>", nx.explorer.actions.open, { buffer = a.buf })`
+--   `end })`
 -- The default `<CR>`/`-`/`<2-LeftMouse>` maps (prelude/keymap.lua) are these too.
 nx.explorer.actions = nx.explorer.actions or {}
 nx.explorer.actions.open = function()
@@ -206,7 +206,7 @@ nx.explorer.actions.up = function()
   nx.explorer._up(vim.api.nvim_get_current_buf())
 end
 
--- nx.explorer.enable(): turn the explorer on. Registers the `BufReadCmd` handler that
+-- `nx.explorer.enable()`: turn the explorer on. Registers the `BufReadCmd` handler that
 -- claims directory opens — `pattern = "*"` deciding per path via `args.isdir`, so it
 -- claims directories and lets every file read fall through to the editor's default load
 -- (netrw's exact model). Idempotent. Calling it makes a `BufReadCmd` handler exist,

@@ -7,8 +7,8 @@ local vim = vim
 
 -- ----- misc ------------------------------------------------------------------
 
--- nx._notimpl(name): the loud-failure funnel for not-yet-implemented surface.
--- Records `name` into nx._notimpl_hits (a set, so a future `:checkhealth` /
+-- `nx._notimpl(name)`: the loud-failure funnel for not-yet-implemented surface.
+-- Records `name` into `nx._notimpl_hits` (a set, so a future `:checkhealth` /
 -- `nx._report` can enumerate which gaps a real config actually hit) and
 -- raises a named error. A stub that quietly returns a fake/empty value makes a
 -- broken server look configured; routing every hollow stub through here turns
@@ -28,7 +28,7 @@ end
 -- nxvim doesn't have yet resolves to a stub that records and raises through
 -- `nx._notimpl` when *called* — never on mere access. That matters two ways:
 --   * neovim's `vim.fn` is likewise always-callable (an unknown function raises
---     E117 at call time, and `if vim.fn.foo then` is truthy), so feature-probing
+--     `E117` at call time, and `if vim.fn.foo then` is truthy), so feature-probing
 --     configs keep working; returning nil here would diverge.
 --   * a gap surfaces as "nxvim: not implemented: vim.fn.<name>" pointing at the
 --     call site, so a missing builtin is a one-line diagnosis rather than a buried
@@ -45,10 +45,10 @@ setmetatable(vim.fn, {
 })
 
 -- ----- the async runtime: the deferred-callback registry ---------------------
--- The spine of nxvim's event loop. A deferred function (nx.schedule, defer_fn,
--- a timer, a system on_exit) is stored by integer id in nx._cb_fns
--- and run *later*, by id, from Rust — the nx._keymap_fns / nx._run_keymap shape
--- applied to async work. nx._next_cb_id() allocates a fresh id; nx._run_cb runs
+-- The spine of nxvim's event loop. A deferred function (`nx.schedule`, `defer_fn`,
+-- a timer, a system on_exit) is stored by integer id in `nx._cb_fns`
+-- and run *later*, by id, from Rust — the `nx._keymap_fns` / `nx._run_keymap` shape
+-- applied to async work. `nx._next_cb_id()` allocates a fresh id; `nx._run_cb` runs
 -- one and (unless `keep`) drops it so the registry can't grow unbounded.
 nx._cb_fns = nx._cb_fns or {}
 nx._cb_seq = nx._cb_seq or 0
@@ -58,11 +58,11 @@ function nx._next_cb_id()
 end
 
 -- Run the callback registered under `id`, forwarding any extra args. `keep` is
--- false for one-shots (vim.schedule, defer_fn, a system on_exit) — the entry is
+-- false for one-shots (`vim.schedule`, `defer_fn`, a system on_exit) — the entry is
 -- dropped *before* the call so a throwing or re-scheduling callback still leaves
 -- the registry clean — and true for a repeating timer, whose fn is retained
--- across fires (its :stop()/:close() drops it). A nil id (already stopped) is a
--- silent no-op. The return value is forwarded so an <expr>-like caller could read
+-- across fires (its `:stop()`/`:close()` drops it). A nil id (already stopped) is a
+-- silent no-op. The return value is forwarded so an `<expr>`-like caller could read
 -- it; current callers ignore it.
 function nx._run_cb(id, keep, ...)
   local fn = nx._cb_fns[id]
@@ -82,10 +82,10 @@ function nx._run_cb(id, keep, ...)
   end
 end
 
--- nx.schedule(fn): defer `fn` to the end of the current convergence — it runs
+-- `nx.schedule(fn)`: defer `fn` to the end of the current convergence — it runs
 -- after the work that scheduled it settles, no longer nested in the caller's
 -- stack frame (the strict improvement over the old inline `fn()`), but still
--- within the same input tick (not a later wall-clock turn; that is defer_fn).
+-- within the same input tick (not a later wall-clock turn; that is `defer_fn`).
 -- This is exactly what the colorscheme's "defer to avoid reentrancy" wants.
 function nx.schedule(fn)
   local id = nx._next_cb_id()
@@ -94,7 +94,7 @@ function nx.schedule(fn)
 end
 vim.schedule = nx.schedule
 
--- nx.schedule_wrap [alias vim.schedule_wrap] (fn): return a function that, when
+-- `nx.schedule_wrap` [alias `vim.schedule_wrap`] (fn): return a function that, when
 -- called, schedules `fn` with whatever arguments it was given — a common plugin
 -- idiom for "run this callback safely on the loop". The captured args ride into
 -- the deferred call via a closure.
@@ -110,17 +110,17 @@ end
 vim.schedule_wrap = nx.schedule_wrap
 
 -- ----- nx.timer [alias vim.defer_fn] -----------------------------------------
--- The wall-clock sibling of nx.schedule: where nx.schedule runs `fn` at the end of
--- the current convergence (same tick, a microtask), nx.timer runs it `timeout` ms
+-- The wall-clock sibling of `nx.schedule`: where `nx.schedule` runs `fn` at the end of
+-- the current convergence (same tick, a microtask), `nx.timer` runs it `timeout` ms
 -- from now on a LATER tick. It rides the event-loop actor through the
--- nx._timer_start / nx._timer_stop bridge: a callback id is registered in
--- nx._cb_fns, the actor sleeps and fires LoopEvent::Timer, and the server runs the
+-- `nx._timer_start` / `nx._timer_stop` bridge: a callback id is registered in
+-- `nx._cb_fns`, the actor sleeps and fires `LoopEvent::Timer`, and the server runs the
 -- callback by id on its thread. Both deferral primitives live here, next to the
--- nx._cb_fns registry and the nx._run_cb cleanup above (which clears
--- nx._timer_active for a spent one-shot). nx.promise.delay builds on this.
+-- `nx._cb_fns` registry and the `nx._run_cb` cleanup above (which clears
+-- `nx._timer_active` for a spent one-shot). `nx.promise.delay` builds on this.
 nx._timer_active = nx._timer_active or {}
 
--- A minimal timer handle returned by nx.timer, so a caller can :stop() the
+-- A minimal timer handle returned by `nx.timer`, so a caller can `:stop()` the
 -- deferral before it fires (neovim returns a uv timer; nxvim returns this). It is
 -- NOT the libuv handle API — the `nx` timer surface is the supported one.
 local defer_handle = {}
@@ -135,10 +135,10 @@ function defer_handle:is_active()
   return nx._timer_active[self._id] == true
 end
 
--- nx.timer(fn, timeout): the canonical timer / defer primitive (aliased by
--- vim.defer_fn) — run `fn` once, `timeout` ms from now, on the loop — the
+-- `nx.timer(fn, timeout)`: the canonical timer / defer primitive (aliased by
+-- `vim.defer_fn`) — run `fn` once, `timeout` ms from now, on the loop — the
 -- off-tick deferral configs use for retry patterns. Returns a handle so the
--- caller can :stop() it before it fires.
+-- caller can `:stop()` it before it fires.
 function nx.timer(fn, timeout)
   local id = nx._next_cb_id()
   nx._cb_fns[id] = fn
@@ -148,19 +148,19 @@ function nx.timer(fn, timeout)
 end
 vim.defer_fn = nx.timer
 
--- nx.on_next_tick(fn): run `fn` on the NEXT event-loop tick — the turn after the
--- current one finishes. The cross-tick sibling of nx.schedule: where nx.schedule
+-- `nx.on_next_tick(fn)`: run `fn` on the NEXT event-loop tick — the turn after the
+-- current one finishes. The cross-tick sibling of `nx.schedule`: where `nx.schedule`
 -- fires at the end of THIS convergence (a same-tick microtask, so it cannot observe
 -- state that only refreshes between ticks — a freshly-mounted window's id, a mirror
--- the server repopulates each turn), nx.on_next_tick yields the tick entirely and runs
+-- the server repopulates each turn), `nx.on_next_tick` yields the tick entirely and runs
 -- on the next one, when those mirrors have been refreshed. A zero-delay one-shot
--- timer is exactly that. Returns the timer handle, so a caller can :stop() it before
+-- timer is exactly that. Returns the timer handle, so a caller can `:stop()` it before
 -- it fires. (Poll across several ticks by calling it again from within `fn`.)
 function nx.on_next_tick(fn)
   return nx.timer(fn, 0)
 end
 
--- pid registry for async vim.system handles. The event-loop actor reports a
+-- pid registry for async `vim.system` handles. The event-loop actor reports a
 -- spawned child's OS pid back to the server, which records it here keyed by the
 -- handle's callback id; the handle's `.pid` reads through this table (nil until
 -- the spawn lands, since it can't be known synchronously on a single thread).
@@ -170,11 +170,11 @@ function nx._set_proc_pid(id, pid)
 end
 
 -- Streaming-stdout registry for streaming-child handles (`nx.run_stream`, defined
--- in prelude/process.lua). Unlike nx._cb_fns (one-shot), an on_stdout fires
+-- in prelude/process.lua). Unlike `nx._cb_fns` (one-shot), an on_stdout fires
 -- repeatedly — once per newline-delimited batch the child emits — so its function
 -- persists here, keyed by the spawn's callback id, and is dropped only when the
 -- child exits (the exit dispatcher clears it). The server calls
--- nx._run_stdout(id, lines) per ProcessStdout event; a nil entry (no handler, or
+-- `nx._run_stdout(id, lines)` per `ProcessStdout` event; a nil entry (no handler, or
 -- already exited) is a silent no-op.
 nx._stdout_fns = nx._stdout_fns or {}
 function nx._run_stdout(id, lines)
@@ -207,7 +207,7 @@ function nx.notify(msg, level, _opts)
 end
 vim.notify = nx.notify
 
--- nx.notify_once [alias vim.notify_once]: in neovim this dedups by message; we have
+-- `nx.notify_once` [alias `vim.notify_once`]: in neovim this dedups by message; we have
 -- no message history to dedup against during a one-shot colorscheme load, so route
 -- to notify.
 function nx.notify_once(msg, level, opts)
@@ -215,8 +215,8 @@ function nx.notify_once(msg, level, opts)
 end
 vim.notify_once = nx.notify_once
 
--- nx.inspect [alias vim.inspect]: pretty-print a value (tables recursively). A
--- table reached again on the current descent renders as "<cycle>" — a plugin
+-- `nx.inspect` [alias `vim.inspect`]: pretty-print a value (tables recursively). A
+-- table reached again on the current descent renders as `"<cycle>"` — a plugin
 -- inspects arbitrary state (parent-linked trees, self-referencing registries),
 -- and unguarded recursion would blow the C stack instead of printing.
 function nx.inspect(value)

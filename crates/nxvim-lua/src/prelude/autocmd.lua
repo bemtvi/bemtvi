@@ -79,9 +79,9 @@ function nx._au_event_set()
   return out
 end
 
--- nx.user_command.create(name, command, opts) [alias nvim_create_user_command]:
+-- `nx.user_command.create(name, command, opts)` [alias `nvim_create_user_command`]:
 -- register a global `:Name`. `command` is a function or an ex-command string.
--- `opts.desc` (a one-line summary) is stored alongside the body — get() surfaces it
+-- `opts.desc` (a one-line summary) is stored alongside the body — `get()` surfaces it
 -- and the command-line completion catalog shows it as the command's docs.
 -- `opts.usage` (a string) is the command's ARGUMENT signature — the part after the
 -- name, in vim help notation (`{arg}` required, `[arg]` optional), e.g.
@@ -104,11 +104,11 @@ function nx.user_command.create(name, command, opts)
   nx._user_command_usage[name] = type(opts) == "table" and opts.usage or nil
 end
 
--- nx.user_command.buf_create(buffer, name, command, opts) [alias
--- nvim_buf_create_user_command]: register a *buffer-local* command (`buffer` 0 =
+-- `nx.user_command.buf_create(buffer, name, command, opts)` [alias
+-- `nvim_buf_create_user_command`]: register a *buffer-local* command (`buffer` 0 =
 -- current). It dispatches only while that buffer is current and shadows a global
 -- command of the same name there — everywhere else it's unknown. Lives in its own
--- per-bufnr table so the global registry stays clean; nx._resolve_user_command
+-- per-bufnr table so the global registry stays clean; `nx._resolve_user_command`
 -- consults both at dispatch.
 function nx.user_command.buf_create(buffer, name, command, opts)
   if buffer == nil or buffer == 0 then
@@ -144,7 +144,7 @@ end
 -- current): a buffer-local command for that buffer wins over a global of the
 -- same name (matching neovim), and a buffer-local command is invisible from any
 -- other buffer. The server passes the editor's authoritative current bufnr, so
--- this never relies on a possibly-stale nx._cur_buf. Returns the function /
+-- this never relies on a possibly-stale `nx._cur_buf`. Returns the function /
 -- string body, or nil when no command matches.
 function nx._resolve_user_command(name, bufnr)
   if bufnr == nil or bufnr == 0 then
@@ -169,9 +169,9 @@ function nx._cleanup_buffer(bufnr)
   nx._purge_buf_keymaps(bufnr)
 end
 
--- nx.augroup.create(name, opts) -> id [alias nvim_create_augroup]: define (or look
+-- `nx.augroup.create(name, opts)` -> id [alias `nvim_create_augroup`]: define (or look
 -- up) an autocommand group and return its numeric id. An augroup is just a named
--- bucket for autocmds: pass the returned id as `opts.group` to nx.autocmd.create so
+-- bucket for autocmds: pass the returned id as `opts.group` to `nx.autocmd.create` so
 -- the whole set can be cleared and re-registered as a unit.
 --
 -- Arguments:
@@ -211,9 +211,9 @@ function nx.augroup.create(name, opts)
   return id
 end
 
--- nx.autocmd.create(event, opts) -> id [alias nvim_create_autocmd]: run something
+-- `nx.autocmd.create(event, opts)` -> id [alias `nvim_create_autocmd`]: run something
 -- whenever `event` fires. Returns the autocmd's numeric id (pass it to
--- nx.autocmd.del to remove it). `event` is an event name (`"FileType"`,
+-- `nx.autocmd.del` to remove it). `event` is an event name (`"FileType"`,
 -- `"BufEnter"`, …) or a list of names to share one handler — see the
 -- [autocommand events](../plugins/autocmd-events.md) reference for the events
 -- nxvim emits and what each carries.
@@ -223,7 +223,7 @@ end
 --     ex-command string queued instead. Provide one of the two.
 --   * `pattern` — a glob (or list of globs) the event's match string is tested
 --     against (e.g. `"*.lua"`, `{ "*.c", "*.h" }`). Omitted / `"*"` matches all.
---   * `group` — an augroup, by numeric id or by name (see nx.augroup.create). Ties
+--   * `group` — an augroup, by numeric id or by name (see `nx.augroup.create`). Ties
 --     this autocmd to the group so a later `clear` of that group drops it.
 --   * `buffer` — make it buffer-local: it then fires only for that buffer (and
 --     `pattern` is ignored). `0` resolves to the current buffer at registration time.
@@ -232,7 +232,7 @@ end
 -- The `callback` receives one table describing the event:
 --   `{ id, event, match, buf, file, data }` — `id` this autocmd's id, `event` the
 --   event name, `match` the matched pattern string, `buf` the buffer number, `file`
---   its name, and `data` an event-specific payload (e.g. LspAttach carries
+--   its name, and `data` an event-specific payload (e.g. `LspAttach` carries
 --   `{ client_id = … }`), nil for most events.
 --
 -- ```lua
@@ -260,7 +260,7 @@ function nx.autocmd.create(event, opts)
   return autocmd_seq
 end
 
--- nx.autocmd.del(id) [alias nvim_del_autocmd]: remove the autocmd with this id,
+-- `nx.autocmd.del(id)` [alias `nvim_del_autocmd`]: remove the autocmd with this id,
 -- so it stops firing.
 function nx.autocmd.del(id)
   nx._autocmds = vim.tbl_filter(function(au)
@@ -270,15 +270,15 @@ function nx.autocmd.del(id)
 end
 
 -- Fire the registered autocmds for `event` whose pattern matches `pattern`,
--- with optional buffer context. Called from Rust (LuaRuntime::fire_autocmd*)
--- when the editor triggers an event, and from nvim_exec_autocmds. A function
+-- with optional buffer context. Called from Rust (`LuaRuntime::fire_autocmd*`)
+-- when the editor triggers an event, and from `nvim_exec_autocmds`. A function
 -- handler runs with the callback args table `{id, event, match, buf, file}`; a
 -- string `command` is queued as an ex-command. Match rules: event equals (or is
 -- in) the registered event; pattern is nil/"*", equals `pattern`, or is in the
 -- registered pattern list; a buffer-local autocmd only fires for its `buffer`.
 -- `buf`/`file` are nil for back-compat callers (e.g. ColorScheme), in which
 -- case `file` falls back to `pattern` (the old behavior). `data` is the optional
--- `args.data` payload (LspAttach/LspDetach carry `{ client_id = … }`); nil otherwise.
+-- `args.data` payload (`LspAttach`/`LspDetach` carry `{ client_id = … }`); nil otherwise.
 -- An autocmd registered with `opts.once` (`:autocmd … ++once`) fires once and is
 -- then dropped — collected during the pass and removed after it, so the live
 -- iteration isn't mutated underneath `ipairs`.
@@ -290,7 +290,7 @@ end
 -- and `*`, a `pat` holding a shell glob metacharacter (`*` `?` `[`) is matched as
 -- vim's file-pattern: a glob with no `/` matches the path *tail* (`*.lua` matches
 -- any `.lua` file), one with a `/` the whole path. A metacharacter-free `pat` is
--- only ever an exact compare (so a FileType `rust` autocmd can't glob-match a path).
+-- only ever an exact compare (so a `FileType` `rust` autocmd can't glob-match a path).
 local function au_one_pattern_matches(pat, pattern)
   if pat == "*" or pat == pattern then
     return true
@@ -321,7 +321,7 @@ local function au_one_pattern_matches(pat, pattern)
 end
 
 -- Whether the autocmd's `pat` (a string, a list, or nil = match-all) matches the
--- fired `pattern`. Used by nx._fire below.
+-- fired `pattern`. Used by `nx._fire` below.
 local function au_pattern_matches(pat, pattern)
   if pat == nil then
     return true
@@ -379,7 +379,7 @@ function nx._fire(event, pattern, buf, file, data)
 end
 
 -- Fire a `*Cmd` autocmd (currently `BufReadCmd`) and return whether a handler
--- **claimed** the action. The server uses BufReadCmd to let a plugin own a buffer's
+-- **claimed** the action. The server uses `BufReadCmd` to let a plugin own a buffer's
 -- read (vim's "replace the read" hook — the file-explorer-as-plugin rides it): a
 -- claimed read skips the server's default load. Unlike `nx._fire` (which reports
 -- merely whether a handler *ran*), a `*Cmd` handler claims by **returning a truthy
@@ -427,10 +427,10 @@ end
 
 -- The `FileChangedShell` round-trip the server's file-change reconcile drives
 -- (`docs/plans/2026-06-09-edit-host-and-browser-lua.md` → the watch leg). Set
--- `v:fcs_reason` to `reason` and reset `v:fcs_choice` to "" (neovim's defaults
+-- `v:fcs_reason` to `reason` and reset `v:fcs_choice` to `""` (neovim's defaults
 -- before the autocmd), fire `FileChangedShell` for `buf`/`file`, and return whether
 -- any handler ran. A handler reads `vim.v.fcs_reason` and may set `vim.v.fcs_choice`
--- to "reload"/"edit"/"ask" to redirect the reconcile; the server reads it back via
+-- to `"reload"`/`"edit"`/`"ask"` to redirect the reconcile; the server reads it back via
 -- `nx._fcs_choice`.
 function nx._fire_file_changed(reason, buf, file)
   nx._v_mirror.fcs_reason = reason
@@ -438,7 +438,7 @@ function nx._fire_file_changed(reason, buf, file)
   return nx._fire("FileChangedShell", file, buf, file)
 end
 
--- Read the `v:fcs_choice` a `FileChangedShell` handler set (or "" if none did) —
+-- Read the `v:fcs_choice` a `FileChangedShell` handler set (or `""` if none did) —
 -- the second half of the round-trip above.
 function nx._fcs_choice()
   return nx._v_mirror.fcs_choice or ""
@@ -448,7 +448,7 @@ end
 -- server calls this through `LuaRuntime::fire_dir_changed`). Set `v:event` to
 -- neovim's `{ cwd, scope, changed_window }` payload before firing — a handler
 -- reading `vim.v.event.cwd` (project / session plugins) sees it — and pass the
--- same table as `args.data`. The autocmd pattern matches `scope` ("global" for
+-- same table as `args.data`. The autocmd pattern matches `scope` (`"global"` for
 -- `:cd`); `<afile>` (`args.file`) is the new directory.
 function nx._fire_dir_changed(scope, cwd)
   local event = { cwd = cwd, scope = scope, changed_window = false }
@@ -456,7 +456,7 @@ function nx._fire_dir_changed(scope, cwd)
   nx._fire("DirChanged", scope, nil, cwd, event)
 end
 
--- nx.autocmd.exec(event, opts) [alias nvim_exec_autocmds]: fire `event` (or a
+-- `nx.autocmd.exec(event, opts)` [alias `nvim_exec_autocmds`]: fire `event` (or a
 -- list of events) manually. `opts.pattern` (string or list) is matched as in
 -- registration; `opts.buffer` supplies the buffer context (defaulting to the
 -- current snapshot buffer), and the callback's `args.file` is the snapshot name
@@ -484,7 +484,7 @@ function nx.autocmd.exec(event, opts)
   end
 end
 
--- nx.autocmd.get(opts) [alias nvim_get_autocmds]: introspect the registered
+-- `nx.autocmd.get(opts)` [alias `nvim_get_autocmds`]: introspect the registered
 -- autocmds — a debugging affordance for confirming what `clear`/`del` left
 -- behind. Returns a list of `{id, event, group, group_name, pattern, buffer,
 -- command}` entries, optionally filtered by `opts.event` (string or list) and
@@ -547,8 +547,8 @@ nx._cur_augroup = nil
 
 -- Does `au` match the group / event-list / pattern-list filter? A nil filter
 -- field means "any" (so a bare `:autocmd!` clears everything in scope). Events
--- and patterns are lists; a "*" event matches any event. A pattern-less autocmd
--- is treated as "*" for matching, mirroring nx._fire's pattern rule.
+-- and patterns are lists; a `"*"` event matches any event. A pattern-less autocmd
+-- is treated as `"*"` for matching, mirroring `nx._fire`'s pattern rule.
 local function au_matches(au, group, events, patterns)
   if group ~= nil and au.group ~= group then
     return false
@@ -607,7 +607,7 @@ local function au_list(group, events, patterns)
 end
 
 -- Pull the first whitespace-delimited word off `s`, returning the word and the
--- trimmed remainder (both "" when `s` is empty).
+-- trimmed remainder (both `""` when `s` is empty).
 local function take_word(s)
   local w = s:match("^(%S+)")
   if not w then
@@ -657,7 +657,7 @@ end
 -- group/event/pattern filter are removed first; with a trailing command, a new
 -- autocmd is then registered. With no command and no bang it lists the matching
 -- autocmds. `<buffer>` as the pattern registers a buffer-local autocmd for the
--- current buffer. `++once` fires once then self-removes (honored by nx._fire);
+-- current buffer. `++once` fires once then self-removes (honored by `nx._fire`);
 -- `++nested` is accepted (nxvim already lets events nest).
 function nx._ex_autocmd(bang, args)
   local rest = vim.trim(args)
@@ -735,8 +735,8 @@ function nx._ex_autocmd(bang, args)
 end
 
 -- :doau[tocmd] {event} [pattern]: fire `event` now (optionally for a pattern),
--- the manual analogue of nvim_exec_autocmds. The optional [group] argument vim
--- accepts is not supported — nx._fire has no group filter — so the first word
+-- the manual analogue of `nvim_exec_autocmds`. The optional [group] argument vim
+-- accepts is not supported — `nx._fire` has no group filter — so the first word
 -- is always the event; pass the event directly.
 function nx._ex_doautocmd(args)
   args = vim.trim(args):gsub("^<nomodeline>%s*", "")
@@ -752,17 +752,17 @@ end
 -- :com[mand][!] [attrs] {Name} {replacement} — define a user command. The
 -- replacement is a verbatim ex-command template, run on invocation with the
 -- common `<…>` escapes expanded against that call's args. It registers into the
--- same nx._user_commands (or, with -buffer, the current buffer's local) store
--- the nvim_create_user_command API uses, so a `:command`-defined command and an
+-- same `nx._user_commands` (or, with `-buffer`, the current buffer's local) store
+-- the `nvim_create_user_command` API uses, so a `:command`-defined command and an
 -- API-defined one dispatch identically — which is how most vimscript plugins
--- define their commands. Returns "" on success, an `E…` error, or a newline-
+-- define their commands. Returns `""` on success, an `E…` error, or a newline-
 -- joined listing for a bare `:command`. `bang` is the replace-existing `!`.
 --
--- INCOMPLETE vs neovim: attributes other than -buffer are parsed-and-ignored
+-- INCOMPLETE vs neovim: attributes other than `-buffer` are parsed-and-ignored
 -- (the command still registers and runs, just without arg-count / completion
--- enforcement); the range/count escapes (<line1>/<line2>/<count>) and an
--- invocation-time <bang> aren't plumbed through user-command dispatch yet, so
--- they expand to "".
+-- enforcement); the range/count escapes (`<line1>`/`<line2>`/`<count>`) and an
+-- invocation-time `<bang>` aren't plumbed through user-command dispatch yet, so
+-- they expand to `""`.
 function nx._ex_command(bang, args, bufnr)
   local s = vim.trim(args or "")
   if s == "" then
@@ -882,9 +882,9 @@ for _, w in ipairs({ "doau", "doaut", "doauto", "doautoc", "doautocm", "doautocm
   AUTOCMD_HEADS[w] = "doau"
 end
 
--- nvim_exec(src, output): run the ex-command(s) in `src` (one or more newline-
+-- `nvim_exec(src, output)`: run the ex-command(s) in `src` (one or more newline-
 -- separated lines) and, when `output` is truthy, return the text they produced as
--- a single string; otherwise return "". This is the legacy (pre-0.9) form lualine
+-- a single string; otherwise return `""`. This is the legacy (pre-0.9) form lualine
 -- calls — `nvim_exec('au lualine <event> <pat>', true):find(cmd)` — to read the
 -- `:au` listing back and dedupe its autocmds.
 --
@@ -892,7 +892,7 @@ end
 -- text is generated synchronously in Lua (the autocmd group). Any other command is
 -- still run, via the normal queued `vim.cmd` path, but its message-line output is
 -- asynchronous and cannot be read back here. So requesting `output` capture of a
--- non-capturable command FAILS LOUD rather than returning a misleading "" — a stub
+-- non-capturable command FAILS LOUD rather than returning a misleading `""` — a stub
 -- that faked an empty capture would make a caller's `:find` on the result silently
 -- wrong, exactly the "quietly succeeds" failure nxvim forbids.
 local function exec_capture(src, output)
@@ -926,16 +926,16 @@ local function exec_capture(src, output)
   return output and table.concat(captured, "\n") or ""
 end
 
--- nx.exec(src, output) [alias nvim_exec]: run the ex-command(s) in `src` and,
--- when `output` is truthy, return the text they produced (see exec_capture).
+-- `nx.exec(src, output)` [alias `nvim_exec`]: run the ex-command(s) in `src` and,
+-- when `output` is truthy, return the text they produced (see `exec_capture`).
 function nx.exec(src, output)
   return exec_capture(src, output)
 end
 
--- nvim_exec2(src, opts): the 0.9+ neovim-shaped wrapper around nvim_exec — same
+-- `nvim_exec2(src, opts)`: the 0.9+ neovim-shaped wrapper around `nvim_exec` — same
 -- execution, but the captured text is returned under `.output` (only when
 -- `opts.output` is set). A `vim.api`-only compat shim with no distinct nx twin
--- (the canonical nxvim form is nx.exec); its body only wraps the sibling nvim_
+-- (the canonical nxvim form is `nx.exec`); its body only wraps the sibling nvim_
 -- function, so it carries no implementation of its own.
 function vim.api.nvim_exec2(src, opts)
   opts = opts or {}
@@ -944,8 +944,8 @@ function vim.api.nvim_exec2(src, opts)
 end
 
 -- ----- vim.cmd: callable AND indexable ---------------------------------------
--- vim.cmd("…") queues a raw ex-command (the Rust function installed earlier);
--- vim.cmd.colorscheme("x") / vim.cmd.set("number") build "<name> <args…>".
+-- `vim.cmd("…")` queues a raw ex-command (the Rust function installed earlier);
+-- `vim.cmd.colorscheme("x")` / `vim.cmd.set("number")` build `"<name> <args…>"`.
 do
   local raw_cmd = vim.cmd
   -- An <expr> mapping RHS must not change editor state (textlock): while
@@ -1000,11 +1000,11 @@ vim.api.nvim_exec_autocmds = nx.autocmd.exec
 vim.api.nvim_get_autocmds = nx.autocmd.get
 vim.api.nvim_exec = nx.exec
 
--- nx.autocmd.clear(opts) [alias nvim_clear_autocmds]: remove every autocmd
--- matching the filter — the bulk analogue of nx.autocmd.del. `opts.event`
+-- `nx.autocmd.clear(opts)` [alias `nvim_clear_autocmds`]: remove every autocmd
+-- matching the filter — the bulk analogue of `nx.autocmd.del`. `opts.event`
 -- (string/list), `opts.group` (id or name), `opts.buffer`, and `opts.pattern`
 -- (string/list) all narrow the set; an empty opts clears everything. Mirrors
--- nx.autocmd.get's matching.
+-- `nx.autocmd.get`'s matching.
 function nx.autocmd.clear(opts)
   opts = opts or {}
   local want_events = opts.event and (type(opts.event) == "table" and opts.event or { opts.event })
@@ -1056,8 +1056,8 @@ function nx.autocmd.clear(opts)
 end
 api.nvim_clear_autocmds = nx.autocmd.clear
 
--- nx.user_command.get(opts) / nx.user_command.buf_get(buf, opts) [aliases
--- nvim_get_commands / nvim_buf_get_commands]: the user-command registry as
+-- `nx.user_command.get(opts)` / `nx.user_command.buf_get(buf, opts)` [aliases
+-- `nvim_get_commands` / `nvim_buf_get_commands`]: the user-command registry as
 -- neovim's introspection map (name -> definition record). nxvim's registry stores
 -- only the command body, so the record carries `name`/`definition` with permissive
 -- defaults for the rest — enough for a command picker to list and run
@@ -1115,13 +1115,13 @@ end
 api.nvim_get_commands = nx.user_command.get
 api.nvim_buf_get_commands = nx.user_command.buf_get
 
--- nx._remote_ts_autoinstall(langs): in an edit-host (daemon) session, lazily install the
+-- `nx._remote_ts_autoinstall(langs)`: in an edit-host (daemon) session, lazily install the
 -- tree-sitter parsers the remote daemon had — the first time a buffer of one of those
 -- filetypes opens. `langs` is the list the server hands over (already filtered to parsers
--- NOT installed on this client). It registers a FileType autocmd that `:TSInstall`s the
+-- NOT installed on this client). It registers a `FileType` autocmd that `:TSInstall`s the
 -- buffer's filetype on first sight (deduped per session). Parsers are native + compiled
 -- locally, so this mirrors the remote's language set without fetching its wrong-arch
--- binaries. Dogfoods the public FileType + :TSInstall surface — the server only supplies
+-- binaries. Dogfoods the public `FileType` + `:TSInstall` surface — the server only supplies
 -- the language list.
 function nx._remote_ts_autoinstall(langs)
   local want = {}

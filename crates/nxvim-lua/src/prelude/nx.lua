@@ -42,8 +42,8 @@ function nx.command(name, fn, opts)
   return nx.user_command.create(name, fn, opts)
 end
 
--- nx.uuid() -> a fresh random (version-4) UUID as a canonical 8-4-4-4-12 lowercase-hex
--- string, e.g. "f47ac10b-58cc-4372-a567-0e02b2c3d479". Bytes come from the OS CSPRNG,
+-- `nx.uuid()` -> a fresh random (version-4) UUID as a canonical 8-4-4-4-12 lowercase-hex
+-- string, e.g. `"f47ac10b-58cc-4372-a567-0e02b2c3d479"`. Bytes come from the OS CSPRNG,
 -- so each call is unique; handy for a session id, a temp-file name, or any unique key.
 -- Available on every build (native and browser/wasm).
 function nx.uuid()
@@ -60,38 +60,38 @@ nx.layer = {}
 nx.terminal = {}
 nx.workspace = {}
 
--- nx.echo(msg) -> nil. Append `msg` (a string) to the message line — the programmatic
--- echo, the canonical form of vim.api.nvim_echo. For a transient, separately-styled
--- notification prefer nx.notify.
+-- `nx.echo(msg)` -> nil. Append `msg` (a string) to the message line — the programmatic
+-- echo, the canonical form of `vim.api.nvim_echo`. For a transient, separately-styled
+-- notification prefer `nx.notify`.
 function nx.echo(msg)
   return nx._echo(msg)
 end
 
--- nx.argv() -> the list of positional file arguments this process was launched with
+-- `nx.argv()` -> the list of positional file arguments this process was launched with
 -- (strings; empty when none). A launcher / wrapper reads them to forward to a
--- relaunched editor; carried through the NXVIM_ARGV environment variable, so the
+-- relaunched editor; carried through the `NXVIM_ARGV` environment variable, so the
 -- binary stays the single source of truth.
 function nx.argv()
   return nx._argv()
 end
 
--- nx.reexec(args) -> does not return on success. Replace THIS process with a fresh
+-- `nx.reexec(args)` -> does not return on success. Replace THIS process with a fresh
 -- `nxvim <args…>` of the current executable — a launcher relaunches the editor with
--- chosen flags this way (e.g. { "--shada-namespace", ns, "--restore-session" }). On
--- Unix this execv()s (never returns on success); elsewhere it spawns and exits with
+-- chosen flags this way (e.g. { `"--shada-namespace"`, ns, `"--restore-session"` }). On
+-- Unix this `execv()`s (never returns on success); elsewhere it spawns and exits with
 -- the child's status. Raises if the exec / spawn itself fails.
 function nx.reexec(args)
   return nx._reexec(args)
 end
 
--- nx.now_ms() -> a monotonic timestamp in milliseconds (a number) for timing and
--- scheduling math. Unlike os.clock (CPU time, ≈0 across an awaited tick) it advances
+-- `nx.now_ms()` -> a monotonic timestamp in milliseconds (a number) for timing and
+-- scheduling math. Unlike `os.clock` (CPU time, ≈0 across an awaited tick) it advances
 -- with real wall-clock time, so it measures durations that span async work.
 function nx.now_ms()
   return nx._now_ms()
 end
 
--- nx.runtime_file(name[, all]) -> full paths of runtimepath files matching `name` (a
+-- `nx.runtime_file(name[, all])` -> full paths of runtimepath files matching `name` (a
 -- runtimepath-relative path whose final component may be globbed with `*`), as a list.
 -- With `all` falsey it returns just the first match (a one- or zero-element list).
 -- Reads the LIVE runtimepath, so a plugin installed mid-session contributes its files
@@ -100,7 +100,7 @@ function nx.runtime_file(name, all)
   return nx._runtime_file(name, all)
 end
 
--- nx.open(path[, opts]) -> nil. Open a file (or a directory, which opens the file
+-- `nx.open(path[, opts])` -> nil. Open a file (or a directory, which opens the file
 -- explorer) in the editing area. `opts` is an optional table:
 --
 --   * `reuse` (boolean, default true) — "open or jump". How to handle the file when
@@ -116,7 +116,7 @@ end
 --     a second copy. Set `reuse = false` for plain `:edit` semantics — always load
 --     into the current window even when another window already shows the file, e.g.
 --     to deliberately place a buffer into a split you just created.
---   * `where` ("main" | nil) — with `where = "main"` the open first crosses to the
+--   * `where` (`"main"` | nil) — with `where = "main"` the open first crosses to the
 --     main editor layer, so an open fired from a dock / sidebar keymap lands in the
 --     main area instead of inside the dock. Omitted, it opens in the current window.
 --
@@ -130,19 +130,19 @@ function nx.open(path, opts)
   return nx._open_switchbuf(path, opts and opts.where == "main")
 end
 
--- nx.layer.focus(target) -> nil. Move keyboard focus across the layout's layers:
--- `target` is "main" (the main editing area) or a dock's name.
+-- `nx.layer.focus(target)` -> nil. Move keyboard focus across the layout's layers:
+-- `target` is `"main"` (the main editing area) or a dock's name.
 function nx.layer.focus(target)
   return nx._layer.focus(target)
 end
 
--- nx.layer.main() -> nil. Shorthand for nx.layer.focus("main") — focus the main
+-- `nx.layer.main()` -> nil. Shorthand for `nx.layer.focus("main")` — focus the main
 -- editor area.
 function nx.layer.main()
   return nx._layer.main()
 end
 
--- nx.terminal.open([opts]) -> nil. Open a terminal job programmatically — the API twin
+-- `nx.terminal.open([opts])` -> nil. Open a terminal job programmatically — the API twin
 -- of `:terminal`. `opts.cmd` is a string (whitespace-split into argv, no shell) or a
 -- list (argv verbatim, so an argument may contain spaces); omitted runs the default
 -- shell. `opts.cwd` defaults to the editor's working directory.
@@ -150,14 +150,14 @@ function nx.terminal.open(opts)
   return nx._terminal.open(opts)
 end
 
--- nx.workspace.dir() -> the absolute workspace root (a string), or nil when this is not
+-- `nx.workspace.dir()` -> the absolute workspace root (a string), or nil when this is not
 -- a `--workspace` launch. Read-only — nxvim chooses the workspace from the command
 -- line, not from Lua. For a daemon session this is the daemon's directory.
 function nx.workspace.dir()
   return nx._workspace.dir()
 end
 
--- nx.workspace.active() -> true if this launch is a `--workspace` directory session,
+-- `nx.workspace.active()` -> true if this launch is a `--workspace` directory session,
 -- false otherwise.
 function nx.workspace.active()
   return nx._workspace.active()
@@ -199,7 +199,7 @@ local function dock_set_opt(side, name, value)
   nx.dock._set_opt(side, name, value)
 end
 
--- `nx.dock.opt(side)` — an options proxy for one dock, mirroring nx.wo/nx.bo:
+-- `nx.dock.opt(side)` — an options proxy for one dock, mirroring `nx.wo`/`nx.bo`:
 -- reads return the cached value (or the default), writes queue the change.
 nx.dock.opt = function(side)
   return setmetatable({}, {
@@ -235,7 +235,7 @@ end
 
 -- Wrap `nx.panel.open` (the Rust bridge) so its geometry rides the shared
 -- `nx._geom` vocabulary like every other surface: `height` accepts cells or a
--- viewport fraction ("30vh" / "50%"), and `margin` accepts a number / {v,h} /
+-- viewport fraction (`"30vh"` / `"50%"`), and `margin` accepts a number / {v,h} /
 -- {t,r,b,l} / {top=, …} — all normalized to the wire shape the bridge expects
 -- (a height string, a `[top, right, bottom, left]` margin array). The panel stays
 -- bottom-anchored; `margin` is a gap from the screen edges (top is ignored).
@@ -309,12 +309,12 @@ end)
 -- `nx.*` in prelude/runtime.lua, with `vim.*` aliased onto them there.)
 --
 -- Treesitter highlighting is controlled declaratively through buffer options
--- (nx.bo.filetype + nx.bo.ts_highlight), part of the options surface in
+-- (`nx.bo.filetype` + `nx.bo.ts_highlight`), part of the options surface in
 -- prelude/state.lua. The one verb surface is `nx.treesitter.foldexpr`, the
 -- foldmethod=expr fold source.
 --
 -- `nx.treesitter.foldexpr` is the canonical tree-sitter foldexpr, set as a string
--- reference into 'foldexpr':
+-- reference into `'foldexpr'`:
 --
 --     nx.bo.foldmethod = "expr"
 --     nx.bo.foldexpr   = "v:lua.nx.treesitter.foldexpr()"
@@ -346,11 +346,11 @@ vim.treesitter.foldexpr = nx.treesitter.foldexpr
 -- auto-retries a few times and then parks Disconnected until `:reconnect`. The server
 -- pushes the current phase here (and fires `User DaemonStatusChanged`) on every change.
 nx.daemon = nx.daemon or {}
--- The current phase, mirrored from the server: "connected" | "reconnecting" |
--- "disconnected", or nil for a local (non-daemon) session.
+-- The current phase, mirrored from the server: `"connected"` | `"reconnecting"` |
+-- `"disconnected"`, or nil for a local (non-daemon) session.
 nx._daemon_status = nil
 
--- nx.daemon.status() -> "connected"|"reconnecting"|"disconnected"|nil
+-- `nx.daemon.status()` -> `"connected"`|`"reconnecting"`|`"disconnected"`|nil
 -- The live daemon connection phase, or nil when this session has no daemon link (local).
 -- A statusline component renders connected green / reconnecting yellow / disconnected red,
 -- and hides itself on nil.

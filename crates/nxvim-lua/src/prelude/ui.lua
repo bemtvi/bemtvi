@@ -1,29 +1,29 @@
--- nxvim Lua prelude — the async UI surface (nx.ui).
--- The four small async UI primitives the native-plugin-API names (nx.ui.input /
+-- nxvim Lua prelude — the async UI surface (`nx.ui`).
+-- The four small async UI primitives the native-plugin-API names (`nx.ui.input` /
 -- select / confirm / float — docs/specs/2026-06-11-native-plugin-api.md). None
 -- blocks (ADR 0002 rule 3): each returns at once and the result arrives on a later
--- tick. (The deferral primitives nx.schedule / nx.timer live in prelude/runtime.lua.)
---   nx.ui.input   — a one-line text prompt over the editor's command line.
---                   PROMISE-ONLY: nx.ui.input(opts) -> a promise of the text.
---   nx.ui.select  — a chooser over the floating selectable-list widget, one
+-- tick. (The deferral primitives `nx.schedule` / `nx.timer` live in prelude/runtime.lua.)
+--   `nx.ui.input`   — a one-line text prompt over the editor's command line.
+--                   PROMISE-ONLY: `nx.ui.input(opts)` -> a promise of the text.
+--   `nx.ui.select`  — a chooser over the floating selectable-list widget, one
 --                   consumer of the server's shared float layer
 --                   (docs/specs/2026-06-14-nx-ui-float-widget.md). PROMISE-ONLY:
---                   nx.ui.select(items, opts) -> a promise of the chosen item.
---   nx.ui.confirm — a yes/no confirmation over the command line (nx-native; neovim
---                   spells this blocking vim.fn.confirm, which the nx model omits).
---                   PROMISE-ONLY: nx.ui.confirm(message, opts) -> a promise of bool.
---   nx.ui.float   — the list-less content float (the widget's sibling, also the LSP
+--                   `nx.ui.select(items, opts)` -> a promise of the chosen item.
+--   `nx.ui.confirm` — a yes/no confirmation over the command line (nx-native; neovim
+--                   spells this blocking `vim.fn.confirm`, which the nx model omits).
+--                   PROMISE-ONLY: `nx.ui.confirm(message, opts)` -> a promise of bool.
+--   `nx.ui.float`   — the list-less content float (the widget's sibling, also the LSP
 --                   hover surface). Fire-and-forget by default (no result); with
---                   `persist = true` it returns a resource HANDLE (:update/:close/
---                   :is_open), not an async result — so it stays non-promise.
---   nx.ui.open    — hand a path/URL to the OS opener (open / explorer / xdg-open).
---                   PROMISE-ONLY: nx.ui.open(uri) -> a promise of the run result.
+--                   `persist = true` it returns a resource HANDLE (`:update`/`:close`/
+--                   `:is_open`), not an async result — so it stays non-promise.
+--   `nx.ui.open`    — hand a path/URL to the OS opener (`open` / `explorer` / `xdg-open`).
+--                   PROMISE-ONLY: `nx.ui.open(uri)` -> a promise of the run result.
 -- `nx` async is promise-only (ADR 0002 / docs/plans/2026-06-16-nx-promise-only-async.md):
 -- a one-shot async API returns a promise, never a callback. The callback shape lives
 -- on the `vim.ui.*` muscle-memory aliases (the bounded compat layer), which adapt the
--- promise back to neovim's on_confirm / on_choice signatures. input and select map the
--- chosen value back through nx._cb_fns; confirm shares the command-line prompt plumbing
--- with input (one prompt open at a time). The nx.validate / nx.deprecate no-ops are not
+-- promise back to neovim's `on_confirm` / `on_choice` signatures. input and select map the
+-- chosen value back through `nx._cb_fns`; confirm shares the command-line prompt plumbing
+-- with input (one prompt open at a time). The `nx.validate` / `nx.deprecate` no-ops are not
 -- part of nxvim's config API and remain intentionally absent.
 local vim = vim
 nx = nx or {}
@@ -64,10 +64,10 @@ local function select_into(items, opts, cb)
   nx._ui_select(labels, opts.prompt or "", id)
 end
 
--- nx.ui.select(items, opts) -> a PROMISE that resolves to the chosen item, or to
--- nil on cancel (<Esc> / q). Promise-only: there is no on_choice argument (passing
+-- `nx.ui.select(items, opts)` -> a PROMISE that resolves to the chosen item, or to
+-- nil on cancel (<Esc> / q). Promise-only: there is no `on_choice` argument (passing
 -- one is the old callback shape and errors loudly). The 1-based index is dropped —
--- recover it from the item, or use the vim.ui.select alias, which keeps it.
+-- recover it from the item, or use the `vim.ui.select` alias, which keeps it.
 --
 -- opts:
 --   * `prompt` — the label drawn above the list (default none).
@@ -86,8 +86,8 @@ function nx.ui.select(items, opts, on_choice)
   end)
 end
 
--- vim.ui.select(items, opts, on_choice): neovim's callback-shaped alias (ADR 0002
--- whitelist) — on_choice(item, index), or on_choice(nil, nil) on cancel. Kept on the
+-- `vim.ui.select(items, opts, on_choice)`: neovim's callback-shaped alias (ADR 0002
+-- whitelist) — `on_choice(item, index)`, or `on_choice(nil, nil)` on cancel. Kept on the
 -- compat layer so plugins (telescope, …) that pass a callback and read the index
 -- still work; nx code uses the promise form above.
 function vim.ui.select(items, opts, on_choice)
@@ -99,7 +99,7 @@ end
 -- engine, NOT a hardcoded grab: the server selects the `select` bucket while the
 -- list owns input, so navigation / confirm / cancel are configurable with
 -- `nx.keymap.set('select', '<key>', nx.ui.select_actions.<name>)`. Each action fires
--- through the engine (nx._select_action -> Editor::apply_select_action). A select
+-- through the engine (`nx._select_action` -> `Editor::apply_select_action`). A select
 -- list has NO query, so there is no text fallthrough — an unmapped key is inert.
 nx.ui.select_actions = nx.ui.select_actions or {}
 for _, name in ipairs({ "next", "prev", "first", "last", "confirm", "cancel" }) do
@@ -131,8 +131,8 @@ for _, m in ipairs({
 end
 
 -- ----- nx.ui.input [alias vim.ui.input] --------------------------------------
--- nx.ui.input(opts) -> a PROMISE that resolves to the entered string on <CR>, or
--- to nil on <Esc> (cancel). Promise-only: there is no on_confirm argument (passing
+-- `nx.ui.input(opts)` -> a PROMISE that resolves to the entered string on <CR>, or
+-- to nil on <Esc> (cancel). Promise-only: there is no `on_confirm` argument (passing
 -- one is the old callback shape and errors loudly).
 --
 -- opts:
@@ -158,11 +158,11 @@ end
 --     `<Tab>` is always immediate (default 100; `0` disables it).
 --
 -- The server owns the prompt: it opens the editor's command line as a labelled
--- Prompt (Editor::open_prompt), and delivers the result to nx._cb_fns[id] through
--- the shared prompt_results channel. Non-blocking (ADR 0002 rule 3): the call
+-- Prompt (`Editor::open_prompt`), and delivers the result to `nx._cb_fns[id]` through
+-- the shared `prompt_results` channel. Non-blocking (ADR 0002 rule 3): the call
 -- returns at once and the promise settles on a later tick. Note an empty submission
--- (<CR> on an empty line) resolves to "" (not nil) — only <Esc> cancels, matching
--- neovim's vim.ui.input.
+-- (<CR> on an empty line) resolves to `""` (not nil) — only <Esc> cancels, matching
+-- neovim's `vim.ui.input`.
 function nx.ui.input(opts, on_confirm)
   if on_confirm ~= nil then
     error("nx.ui.input is promise-only: nx.ui.input(opts):next(fn)", 2)
@@ -242,7 +242,7 @@ function nx._do_prompt_complete(fn, line, col)
   end)
 end
 
--- nx._run_prompt_complete(line, col, refresh): drive the open prompt's `complete`
+-- `nx._run_prompt_complete(line, col, refresh)`: drive the open prompt's `complete`
 -- source for the `<Tab>` wildmenu. The server calls this when core stamps a
 -- prompt-completion request. The initial open (`refresh = false`) queries at once for
 -- a snappy menu; an edit narrowing the open menu (`refresh = true`) coalesces through
@@ -260,8 +260,8 @@ function nx._run_prompt_complete(line, col, refresh)
   end
 end
 
--- vim.ui.input(opts, on_confirm): neovim's callback-shaped alias (ADR 0002
--- whitelist) — on_confirm(text) on <CR>, on_confirm(nil) on cancel. Kept on the
+-- `vim.ui.input(opts, on_confirm)`: neovim's callback-shaped alias (ADR 0002
+-- whitelist) — `on_confirm(text)` on <CR>, `on_confirm(nil)` on cancel. Kept on the
 -- compat layer for plugins; nx code uses the promise form above.
 function vim.ui.input(opts, on_confirm)
   on_confirm = on_confirm or function() end
@@ -269,18 +269,18 @@ function vim.ui.input(opts, on_confirm)
 end
 
 -- ----- nx.ui.confirm ---------------------------------------------------------
--- nx.ui.confirm(message, opts) -> a PROMISE that resolves to a boolean — true on
--- Yes, false on No or cancel (<Esc>). Promise-only: there is no on_choice argument
+-- `nx.ui.confirm(message, opts)` -> a PROMISE that resolves to a boolean — true on
+-- Yes, false on No or cancel (<Esc>). Promise-only: there is no `on_choice` argument
 -- (the old callback forms — a third arg, or opts-as-function — error loudly).
 --
 -- opts (optional):
 --   * `default` — `true` | `false`, which button `<CR>` selects (default `true` = Yes).
 --
--- nx-native (no vim.ui twin): neovim spells this blocking vim.fn.confirm, which the
--- nx model omits (rule 3). For an arbitrary multi-choice menu use nx.ui.select
+-- nx-native (no `vim.ui` twin): neovim spells this blocking `vim.fn.confirm`, which the
+-- nx model omits (rule 3). For an arbitrary multi-choice menu use `nx.ui.select`
 -- instead — confirm is deliberately just yes/no. The server opens a single-keypress
--- Confirm dialog (Editor::open_confirm) sharing the prompt_results channel with
--- nx.ui.input (one prompt open at a time); the chosen 1-based button index arrives
+-- Confirm dialog (`Editor::open_confirm`) sharing the `prompt_results` channel with
+-- `nx.ui.input` (one prompt open at a time); the chosen 1-based button index arrives
 -- as a string, which the wrapper folds to the boolean (1 = Yes; 2 = No; 0 = cancel).
 function nx.ui.confirm(message, opts, on_choice)
   if type(opts) == "function" or on_choice ~= nil then
@@ -354,7 +354,7 @@ local function chunk_text(chunks)
 end
 
 -- Normalize `contents` into a list of chunk LINES (each `{ {text, hl}, … }`),
--- dropping a single trailing empty line so a markdown body ending in "\n" doesn't
+-- dropping a single trailing empty line so a markdown body ending in `"\n"` doesn't
 -- render a blank last row. Accepts:
 --   * a string                  → split on newlines, each a single plain chunk
 --   * a list of strings         → each a single plain chunk
@@ -417,7 +417,7 @@ function float_handle:is_open()
   return nx._float_open_id == self._id
 end
 
--- nx.ui.float(contents, opts): open the list-less content float — the sibling of
+-- `nx.ui.float(contents, opts)`: open the list-less content float — the sibling of
 -- the selectable-list widget (docs/specs/2026-06-14-nx-ui-float-widget.md, "What
 -- stays out of this widget") — rendering content with no list / selection.
 -- `contents` is a string (split on newlines), a list of line strings, or — for a
@@ -433,7 +433,7 @@ end
 --   * `relative` — `"cursor"` (default, anchors at the cursor) | `"editor"` (centered)
 --     | `"bottom"` (pinned to the editor's bottom-right corner — the which-key shape).
 --   * `persist` — when truthy, the float survives keystrokes (it is not dismissed by
---     the next key) and nx.ui.float returns a HANDLE with `:update(contents, opts)` /
+--     the next key) and `nx.ui.float` returns a HANDLE with `:update(contents, opts)` /
 --     `:close()` / `:is_open()`. This is the surface a key-observer plugin (e.g.
 --     which-key) renders through, refreshing it as keys arrive.
 -- Without `persist` it is fire-and-forget: the server owns the float, its
@@ -457,11 +457,11 @@ function nx.ui.float(contents, opts)
 end
 
 -- ----- nx.ui.open [alias vim.ui.open] ----------------------------------------
--- nx.ui.open(uri) -> a PROMISE of the opener's exit result { code, stdout, stderr }
--- (the nx.run shape). Hands `uri` — a file path or a URL — to the OS opener chosen
--- by platform (nx._ui_opener: `open` on macOS, `explorer` on Windows, `xdg-open`
--- elsewhere) and runs it off-tick. Like nx.run it RESOLVES rather than rejects: a
--- missing opener surfaces as code = -1 and a non-zero opener exit as that code —
+-- `nx.ui.open(uri)` -> a PROMISE of the opener's exit result `{ code, stdout, stderr }`
+-- (the `nx.run` shape). Hands `uri` — a file path or a URL — to the OS opener chosen
+-- by platform (`nx._ui_opener`: `open` on macOS, `explorer` on Windows, `xdg-open`
+-- elsewhere) and runs it off-tick. Like `nx.run` it RESOLVES rather than rejects: a
+-- missing opener surfaces as `code = -1` and a non-zero opener exit as that code —
 -- the caller decides what to do with it. Promise-only (ADR 0002): no callback arg.
 function nx.ui.open(uri)
   if type(uri) ~= "string" then
@@ -473,8 +473,8 @@ function nx.ui.open(uri)
   return nx.run({ cmd = argv })
 end
 
--- vim.ui.open(path): neovim's opener alias (ADR 0002 whitelist). neovim returns a
--- blocking handle (SystemObj) plus an error string; nxvim has no blocking handle,
+-- `vim.ui.open(path)`: neovim's opener alias (ADR 0002 whitelist). neovim returns a
+-- blocking handle (`SystemObj`) plus an error string; nxvim has no blocking handle,
 -- so this returns the async PROMISE instead — truthy on the optimistic path, the
 -- closest faithful mapping. Callers that ignore the return (the common
 -- `vim.ui.open(url)`) work unchanged.

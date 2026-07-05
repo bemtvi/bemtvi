@@ -7,9 +7,9 @@ local vim = vim
 local fn = vim.fn
 nx = nx or {}
 
--- nx.line(expr) [alias vim.fn.line]: a buffer line number. "." is the cursor line
--- (1-based), "$" the last line (the line count). The window-relative forms
--- ("w0"/"w$") need the scroll position, which the mirror doesn't carry yet, so they
+-- `nx.line(expr)` [alias `vim.fn.line`]: a buffer line number. `"."` is the cursor line
+-- (1-based), `"$"` the last line (the line count). The window-relative forms
+-- (`"w0"`/`"w$"`) need the scroll position, which the mirror doesn't carry yet, so they
 -- error loud.
 function nx.line(expr)
   if expr == "." then
@@ -22,8 +22,8 @@ function nx.line(expr)
 end
 vim.fn.line = nx.line
 
--- nx.col(expr) [alias vim.fn.col]: a byte column (1-based). "." is the cursor
--- column, "$" one past the end of the cursor line (its byte length + 1), matching vim.
+-- `nx.col(expr)` [alias `vim.fn.col`]: a byte column (1-based). `"."` is the cursor
+-- column, `"$"` one past the end of the cursor line (its byte length + 1), matching vim.
 function nx.col(expr)
   if expr == "." then
     return ((nx._cur_cursor or {}).col or 0) + 1
@@ -37,17 +37,17 @@ function nx.col(expr)
 end
 vim.fn.col = nx.col
 
--- nx.localtime() [alias vim.fn.localtime]: the current time in seconds. nxvim
+-- `nx.localtime()` [alias `vim.fn.localtime`]: the current time in seconds. nxvim
 -- sources this from a MONOTONIC clock (the server's `nx._mono_secs`, the same base
 -- stamped onto undo nodes), not wall-clock unix epoch, so `localtime() - node.time`
--- elapsed math (e.g. the undotree visualizer's "N minutes ago") stays correct and
+-- elapsed math (e.g. the undotree visualizer's `"N minutes ago"`) stays correct and
 -- non-negative across NTP steps and manual clock changes. Only differences matter.
 function nx.localtime()
   return nx._mono_secs or 0
 end
 vim.fn.localtime = nx.localtime
 
--- nx.undotree.get([bufnr]) [alias vim.fn.undotree]: the buffer's undo tree, in neovim's shape
+-- `nx.undotree.get([bufnr])` [alias `vim.fn.undotree`]: the buffer's undo tree, in neovim's shape
 -- ({ seq_last, seq_cur, save_last, save_cur, time_cur, synced, entries }, each
 -- entry { seq, time, save?, alt? }). Reads the `nx._undotree` mirror the server
 -- projects from the core's branching history before each Lua entry; `bufnr`
@@ -75,9 +75,9 @@ vim.fn.undotree = nx.undotree.get
 -- (vim.fn.fnamemodify lives in prelude/fs.lua, alongside the other path vim.fn;
 -- this chunk's expand routes through it at call time.)
 
--- nx.expand(expr) [alias vim.fn.expand]: the `%` (current file) forms autocmd
+-- `nx.expand(expr)` [alias `vim.fn.expand`]: the `%` (current file) forms autocmd
 -- callbacks and statuslines use to resolve paths, backed by the current-buffer
--- snapshot. `%` is the stored name; `%:<mods>` routes through fnamemodify (so `%:t`,
+-- snapshot. `%` is the stored name; `%:<mods>` routes through `fnamemodify` (so `%:t`,
 -- `%:p`, `%:h`, `%:r`, `%:~:.`, … all work). A non-`%` expression errors loud.
 -- (the override below extends this with cursor keywords / globs, re-binding nx.expand.)
 function nx.expand(expr)
@@ -100,7 +100,7 @@ function nx.expand(expr)
 end
 vim.fn.expand = nx.expand
 
--- nx.pum.visible() [alias vim.fn.pumvisible]: whether the insert-mode completion
+-- `nx.pum.visible()` [alias `vim.fn.pumvisible`]: whether the insert-mode completion
 -- popup is showing. nxvim doesn't surface the popup-menu state to Lua, so this is
 -- truthfully 0 in the contexts a plugin checks it (a prompt buffer has no ins-completion
 -- menu) — an honest "not visible", not a faked value.
@@ -110,7 +110,7 @@ function nx.pum.visible()
 end
 vim.fn.pumvisible = nx.pum.visible
 
--- nx.jumplist.get([winnr [, tabnr]]) [alias vim.fn.getjumplist]: the window's jumplist as
+-- `nx.jumplist.get([winnr [, tabnr]])` [alias `vim.fn.getjumplist`]: the window's jumplist as
 -- `{ list, curidx }`. `list` is an array of `{ bufnr, lnum, col, coladd }` dicts
 -- oldest-first (lnum 1-based, col 0-based byte); `curidx` is the navigation
 -- pointer `<C-o>`/`<C-i>` walk — a 0-based index into `list`, equal to `#list`
@@ -140,9 +140,9 @@ function nx.jumplist.get(winnr, _tabnr)
 end
 fn.getjumplist = nx.jumplist.get
 
--- nx.pos.get(expr) [alias vim.fn.getpos]: a position as `{bufnr, lnum, col, off}`
--- (1-based lnum/col). "." is the cursor; "'<" / "'>" are the visual-selection
--- corners — nxvim doesn't mirror those marks to vim.fn yet, so they fall back to the
+-- `nx.pos.get(expr)` [alias `vim.fn.getpos`]: a position as `{bufnr, lnum, col, off}`
+-- (1-based lnum/col). `"."` is the cursor; `"'<"` / `"'>"` are the visual-selection
+-- corners — nxvim doesn't mirror those marks to `vim.fn` yet, so they fall back to the
 -- cursor (a grep-from-selection plugin then greps the cursor word, a graceful
 -- degradation rather than an error). Backs a plugin's visual-selection range read.
 nx.pos = nx.pos or {}
@@ -155,7 +155,7 @@ function nx.pos.get(expr)
 end
 fn.getpos = nx.pos.get
 
--- nx.pos.set(expr, pos) [alias vim.fn.setpos]: move the cursor when `expr` is "."
+-- `nx.pos.set(expr, pos)` [alias `vim.fn.setpos`]: move the cursor when `expr` is `"."`
 -- (the only settable position nxvim models); `pos` is `{bufnr, lnum, col, off}`.
 -- Other marks are accepted but not stored (no writable-mark mirror), returning 0.
 function nx.pos.set(expr, pos)
@@ -169,12 +169,12 @@ function nx.pos.set(expr, pos)
 end
 fn.setpos = nx.pos.set
 
--- nx.getmousepos() [alias vim.fn.getmousepos]: the most recent mouse event's
+-- `nx.getmousepos()` [alias `vim.fn.getmousepos`]: the most recent mouse event's
 -- position as a dict — `screenrow`/`screencol` (1-based global screen cell),
 -- `winid` (the window the cell is in, 0 if none), `winrow`/`wincol` (1-based,
 -- window-relative, gutter included), `line`/`column` (1-based buffer line and byte
 -- column, 0 off a window's text), and `coladd` (always 0 — nxvim has no
--- 'virtualedit'). Reads the `nx._mouse_pos` mirror the server pushes from the
+-- `'virtualedit'`). Reads the `nx._mouse_pos` mirror the server pushes from the
 -- editor's last mouse cell, so a mouse mapping (`<RightMouse>`, `<MiddleMouse>`, …)
 -- can act on the *clicked* position rather than the cursor.
 function nx.getmousepos()
@@ -207,18 +207,18 @@ local function match_store(win)
   nx._matches[win] = nx._matches[win] or {}
   return nx._matches[win]
 end
--- nx.match.* (aliases vim.fn.matchadd / matchaddpos / matchdelete / clearmatches /
--- getmatches): the per-window match-highlight registry.
+-- `nx.match.*` (aliases `vim.fn.matchadd` / `matchaddpos` / `matchdelete` / `clearmatches` /
+-- `getmatches`): the per-window match-highlight registry.
 nx.match = nx.match or {}
--- nx.match.add(group, pattern[, priority[, id[, opts]]]) -> id [alias vim.fn.matchadd]:
+-- `nx.match.add(group, pattern[, priority[, id[, opts]]])` -> id [alias `vim.fn.matchadd`]:
 -- register a request to highlight every match of the regex `pattern` with highlight
 -- group `group` in a window. `priority` orders overlapping matches (default 10); `id`
 -- requests a specific match id (nil / -1 auto-allocates a fresh one); `opts.window`
 -- targets a window other than the current one. Returns the match id.
 --
--- CAVEAT: the registry is faithful — ids are allocated and stored, and nx.match.get
+-- CAVEAT: the registry is faithful — ids are allocated and stored, and `nx.match.get`
 -- reflects them — but nxvim does NOT yet render these matches (there is no `:match` /
--- matchadd decoration path in the core). The highlight is recorded but not painted,
+-- `matchadd` decoration path in the core). The highlight is recorded but not painted,
 -- and the call succeeds rather than failing loud. (A previewer that uses it to tint a
 -- search term shows correct content, just un-tinted for now.)
 function nx.match.add(group, pattern, priority, id, opts)
@@ -228,11 +228,11 @@ function nx.match.add(group, pattern, priority, id, opts)
   store[mid] = { group = group, pattern = pattern, priority = priority or 10, id = mid }
   return mid
 end
--- nx.match.addpos(group, pos[, priority[, id[, opts]]]) -> id [alias vim.fn.matchaddpos]:
--- like nx.match.add, but highlights explicit positions instead of a regex. `pos` is a
+-- `nx.match.addpos(group, pos[, priority[, id[, opts]]])` -> id [alias `vim.fn.matchaddpos`]:
+-- like `nx.match.add`, but highlights explicit positions instead of a regex. `pos` is a
 -- list whose items are a line number, `{lnum}`, or `{lnum, col, len}` (1-based). Same
--- id / priority / opts.window handling — and the same not-yet-rendered caveat as
--- nx.match.add.
+-- id / priority / `opts.window` handling — and the same not-yet-rendered caveat as
+-- `nx.match.add`.
 function nx.match.addpos(group, pos, priority, id, opts)
   nx._match_seq = nx._match_seq + 1
   local mid = (id and id ~= -1) and id or nx._match_seq
@@ -240,7 +240,7 @@ function nx.match.addpos(group, pos, priority, id, opts)
   store[mid] = { group = group, pos = pos, priority = priority or 10, id = mid }
   return mid
 end
--- nx.match.delete(id[, win]) -> 0 | -1 [alias vim.fn.matchdelete]: remove the match
+-- `nx.match.delete(id[, win])` -> 0 | -1 [alias `vim.fn.matchdelete`]: remove the match
 -- with id `id` from window `win` (0/nil = current). Returns 0 if it existed, else -1.
 function nx.match.delete(id, win)
   local store = match_store(win)
@@ -248,16 +248,16 @@ function nx.match.delete(id, win)
   store[id] = nil
   return existed and 0 or -1
 end
--- nx.match.clear([win]) -> 0 [alias vim.fn.clearmatches]: remove every match from
+-- `nx.match.clear([win])` -> 0 [alias `vim.fn.clearmatches`]: remove every match from
 -- window `win` (0/nil = current).
 function nx.match.clear(win)
   nx._matches[(win == nil or win == 0) and (nx._cur_win or 1000) or win] = {}
   return 0
 end
--- nx.match.get([win]) -> list [alias vim.fn.getmatches]: the registered matches of
+-- `nx.match.get([win])` -> list [alias `vim.fn.getmatches`]: the registered matches of
 -- window `win` (0/nil = current), id-ascending. Each entry is
--- `{ group, id, priority, pattern? | pos? }` — the `pattern` form from nx.match.add,
--- the `pos` form from nx.match.addpos.
+-- `{ group, id, priority, pattern? | pos? }` — the `pattern` form from `nx.match.add`,
+-- the `pos` form from `nx.match.addpos`.
 function nx.match.get(win)
   local out = {}
   for _, m in pairs(match_store(win)) do
@@ -274,7 +274,7 @@ fn.matchdelete = nx.match.delete
 fn.clearmatches = nx.match.clear
 fn.getmatches = nx.match.get
 
--- nx.expand(expr[, nosuf, list]) [alias vim.fn.expand]: superset of the
+-- `nx.expand(expr[, nosuf, list])` [alias `vim.fn.expand`]: superset of the
 -- snapshot-backed `%` form (the base nx.expand above) that
 -- plugins also drive with cursor keywords, `~`/`$ENV` paths, and
 -- wildcards. Resolution order:
@@ -287,7 +287,7 @@ fn.getmatches = nx.match.get
 --   * an unmodeled `<...>` keyword errors loud (no silent literal passthrough)
 --   * leading `~` / `$VAR`    — home / environment expansion
 --   * anything else           — the path with ~/$ expanded, returned verbatim
--- This re-binds nx.expand (the base loaded earlier), keeping its `%` behavior.
+-- This re-binds `nx.expand` (the base loaded earlier), keeping its `%` behavior.
 local expand_pct = nx.expand
 local function cursor_word(big)
   local c = nx._cur_cursor or { row = 1, col = 0 }
@@ -393,15 +393,15 @@ function nx.expand(expr, nosuf, list)
 end
 vim.fn.expand = nx.expand
 
--- nx.fname.modify(fname, mods) [alias vim.fn.fnamemodify]: apply vim's filename
+-- `nx.fname.modify(fname, mods)` [alias `vim.fn.fnamemodify`]: apply vim's filename
 -- modifiers left to right. A pure path-string helper (no I/O beyond reading cwd),
--- so it lives with the vim.fn read builtins — `expand('%:t')` / `'%:h'` and a
+-- so it lives with the `vim.fn` read builtins — `expand('%:t')` / `'%:h'` and a
 -- `'statusline'` `%f` route through it. Supported: `:p` (absolute against cwd),
--- `:~` (relative to $HOME with `~`), `:.` (relative to cwd when under it), `:h`
+-- `:~` (relative to `$HOME` with `~`), `:.` (relative to cwd when under it), `:h`
 -- (head/dir), `:t` (tail), `:r` (root, strip one extension — a leading dot isn't
 -- one), `:e` (extension; consecutive `:e` widen it to the last k dot-components,
 -- vim's quirk). An unsupported modifier errors loud rather than silently passing
--- the name through. Cases match real neovim's vim.fn.fnamemodify.
+-- the name through. Cases match real neovim's `vim.fn.fnamemodify`.
 -- Lexically simplify an absolute path the way vim's `:p` does (its `simplify_filename`
 -- half): collapse `//`, drop `.` components, and resolve each `..` against the preceding
 -- component (a `..` at the root is dropped — you can't ascend past `/`). Pure string math,
@@ -508,12 +508,12 @@ function nx.fname.modify(fname, mods)
 end
 vim.fn.fnamemodify = nx.fname.modify
 
--- nx.fname.escape(fname) [alias vim.fn.fnameescape]: escape a file name so it can
+-- `nx.fname.escape(fname)` [alias `vim.fn.fnameescape`]: escape a file name so it can
 -- be fed literally as an argument on the `:` command line (e.g. to `:edit`). Each
 -- character vim treats as magic on the cmdline gets a backslash prepended — space,
 -- tab, newline, and `* ? [ { ` $ \ % # ' " | ! <` — then a leading `>` or `+`
 -- (special at the start of `:edit` / `:write`) and a lone `-` are guarded too.
--- Matches real neovim's vim.fn.fnameescape on Unix.
+-- Matches real neovim's `vim.fn.fnameescape` on Unix.
 local FNAME_ESC = {
   [" "] = true,
   ["\t"] = true,
@@ -581,14 +581,14 @@ local function nx_read_list(mirror, title, what)
   return out
 end
 
--- nx.qf: the canonical quickfix / location-list surface (ADR 0002). The list
--- accessors are defined as nx.qf.* here; the bare nx.* and vim.fn.* spellings are
--- muscle-memory aliases onto them (the vim.fn ones set inline, the bare-nx ones in
+-- `nx.qf`: the canonical quickfix / location-list surface (ADR 0002). The list
+-- accessors are defined as `nx.qf.*` here; the bare `nx.*` and `vim.fn.*` spellings are
+-- muscle-memory aliases onto them (the `vim.fn` ones set inline, the bare-nx ones in
 -- one block below the definitions). The window / navigation commands further down
 -- are thin wrappers over the `:c*` / `:l*` ex-commands.
 nx.qf = nx.qf or {}
 
--- nx.qf.getqflist([what]) -> list | dict [aliases nx.getqflist / vim.fn.getqflist]:
+-- `nx.qf.getqflist([what])` -> list | dict [aliases `nx.getqflist` / `vim.fn.getqflist`]:
 -- the quickfix list. With no argument (or a non-table), returns the array of entry
 -- dicts (a shallow copy of the `nx._qflist` mirror the server pushes). With a `what`
 -- dict, returns a dict carrying only the requested keys (`title` / `items` / `size`).
@@ -621,12 +621,12 @@ local function nx_setlist_args(list, action, what)
   return items, lines, efm, action, title
 end
 
--- nx.qf.setqflist(list[, action[, what]]) -> 0 [aliases nx.setqflist /
--- vim.fn.setqflist]: populate the quickfix list. `list` is an array of entry dicts;
--- `action` is " " (new / the default), "a" (append), or "r" (replace current).
+-- `nx.qf.setqflist(list[, action[, what]])` -> 0 [aliases `nx.setqflist` /
+-- `vim.fn.setqflist`]: populate the quickfix list. `list` is an array of entry dicts;
+-- `action` is `" "` (new / the default), `"a"` (append), or `"r"` (replace current).
 -- `what` may instead carry `lines` (raw output parsed against `efm`), `items`,
 -- `title`, or `efm`. The work happens server-side (a queued op), so the parsed result
--- is visible to nx.qf.getqflist() only after the server drains the op — read it on a
+-- is visible to `nx.qf.getqflist()` only after the server drains the op — read it on a
 -- later tick.
 function nx.qf.setqflist(list, action, what)
   local items, lines, efm, act, title = nx_setlist_args(list, action, what)
@@ -635,10 +635,10 @@ function nx.qf.setqflist(list, action, what)
 end
 vim.fn.setqflist = nx.qf.setqflist
 
--- nx.qf.getloclist(winnr[, what]) -> list | dict [aliases nx.getloclist /
--- vim.fn.getloclist]: the location list of window `winnr` (0 = current window;
+-- `nx.qf.getloclist(winnr[, what])` -> list | dict [aliases `nx.getloclist` /
+-- `vim.fn.getloclist`]: the location list of window `winnr` (0 = current window;
 -- otherwise an nxvim window id, NOT vim's 1-based window number). Same return shape
--- as nx.qf.getqflist; an empty list when the window has none.
+-- as `nx.qf.getqflist`; an empty list when the window has none.
 function nx.qf.getloclist(winnr, what)
   local win = winnr
   if win == nil or win == 0 then
@@ -652,10 +652,10 @@ function nx.qf.getloclist(winnr, what)
 end
 vim.fn.getloclist = nx.qf.getloclist
 
--- nx.qf.setloclist(winnr, list[, action[, what]]) -> 0 [aliases nx.setloclist /
--- vim.fn.setloclist]: populate the location list of window `winnr` (0 = current
+-- `nx.qf.setloclist(winnr, list[, action[, what]])` -> 0 [aliases `nx.setloclist` /
+-- `vim.fn.setloclist`]: populate the location list of window `winnr` (0 = current
 -- window; otherwise an nxvim window id). Same `list`/`action`/`what` semantics as
--- nx.qf.setqflist, only scoped to a window. Queued server-side like setqflist.
+-- `nx.qf.setqflist`, only scoped to a window. Queued server-side like `setqflist`.
 function nx.qf.setloclist(winnr, list, action, what)
   local items, lines, efm, act, title = nx_setlist_args(list, action, what)
   -- 0 / nil ride through as 0 ("current window at drain time"); the server resolves
@@ -683,14 +683,14 @@ local function nx_list_send(list, opts, action, to_qf)
   return 0
 end
 
--- send_to_loclist: results -> a (new) location list. add_to_loclist: append.
+-- `send_to_loclist`: results -> a (new) location list. `add_to_loclist`: append.
 function nx.qf.send_to_loclist(list, opts)
   return nx_list_send(list, opts, " ", false)
 end
 function nx.qf.add_to_loclist(list, opts)
   return nx_list_send(list, opts, "a", false)
 end
--- send_to_qflist: results -> the global quickfix list. add_to_qflist: append.
+-- `send_to_qflist`: results -> the global quickfix list. `add_to_qflist`: append.
 function nx.qf.send_to_qflist(list, opts)
   return nx_list_send(list, opts, " ", true)
 end
@@ -716,13 +716,13 @@ nx.setloclist = nx.qf.setloclist
 -- each addressed by a stable name, and storage lives on the editor (not a window),
 -- so it survives closing any window and never collides with the single quickfix.
 -- That makes it the fit for a persistent plugin panel (e.g. dap's "All Breakpoints"):
--- the plugin pushes items with nx.qf.list(name, items) whenever its data changes, and
--- nx.qf.show(name) opens/focuses the tab. Both are thin queues over the existing
+-- the plugin pushes items with `nx.qf.list(name, items)` whenever its data changes, and
+-- `nx.qf.show(name)` opens/focuses the tab. Both are thin queues over the existing
 -- quickfix rendering and navigation — no datasource/refresh indirection.
 
--- nx.qf.list(name, items[, opts]): create or replace the named list `name` from
--- `items` (an array of entry dicts, the same shape setqflist takes), repainting its
--- tab if open. Does NOT open or focus the tab — call nx.qf.show(name) for that.
+-- `nx.qf.list(name, items[, opts])`: create or replace the named list `name` from
+-- `items` (an array of entry dicts, the same shape `setqflist` takes), repainting its
+-- tab if open. Does NOT open or focus the tab — call `nx.qf.show(name)` for that.
 --
 --   * `opts.title` (string) — the list title shown in the dock tab (defaults to `name`).
 --   * `opts.action` (string) — `"r"` (default, replace in place) / `" "` (push a new
@@ -742,9 +742,9 @@ function nx.qf.list(name, items, opts)
   return name
 end
 
--- nx.qf.show(name): open or focus the named list `name`'s bottom-dock tab — the
--- clean, window-independent reopen (no set_current / on_next_tick dance; the open is
--- sequenced server-side after any nx.qf.list queued in the same tick). Showing a name
+-- `nx.qf.show(name)`: open or focus the named list `name`'s bottom-dock tab — the
+-- clean, window-independent reopen (no `set_current` / `on_next_tick` dance; the open is
+-- sequenced server-side after any `nx.qf.list` queued in the same tick). Showing a name
 -- with no items yet opens an empty tab. Returns the name.
 function nx.qf.show(name)
   if type(name) ~= "string" or name == "" then
@@ -754,7 +754,7 @@ function nx.qf.show(name)
   return name
 end
 
--- nx.qf.drop(name): forget the named list `name` — close its dock tab if open and
+-- `nx.qf.drop(name)`: forget the named list `name` — close its dock tab if open and
 -- remove its contents from the editor. A no-op for a name that was never used.
 function nx.qf.drop(name)
   if type(name) ~= "string" or name == "" then
@@ -764,29 +764,29 @@ function nx.qf.drop(name)
   return name
 end
 
--- nx.qf.open([height]) [wraps `:copen`]: open the quickfix window, optionally
+-- `nx.qf.open([height])` [wraps `:copen`]: open the quickfix window, optionally
 -- `height` rows tall.
 function nx.qf.open(height)
   vim.cmd(height and ("copen " .. height) or "copen")
 end
--- nx.qf.close() [wraps `:cclose`]: close the quickfix window.
+-- `nx.qf.close()` [wraps `:cclose`]: close the quickfix window.
 function nx.qf.close()
   vim.cmd("cclose")
 end
--- nx.qf.next() [wraps `:cnext`]: jump to the next entry in the quickfix list.
+-- `nx.qf.next()` [wraps `:cnext`]: jump to the next entry in the quickfix list.
 function nx.qf.next()
   vim.cmd("cnext")
 end
--- nx.qf.prev() [wraps `:cprev`]: jump to the previous entry in the quickfix list.
+-- `nx.qf.prev()` [wraps `:cprev`]: jump to the previous entry in the quickfix list.
 function nx.qf.prev()
   vim.cmd("cprev")
 end
--- nx.qf.older([count]) [wraps `:colder`]: go to an older quickfix list in the stack
+-- `nx.qf.older([count])` [wraps `:colder`]: go to an older quickfix list in the stack
 -- (`count` lists back, default 1).
 function nx.qf.older(count)
   vim.cmd(count and ("colder " .. count) or "colder")
 end
--- nx.qf.newer([count]) [wraps `:cnewer`]: go to a newer quickfix list in the stack
+-- `nx.qf.newer([count])` [wraps `:cnewer`]: go to a newer quickfix list in the stack
 -- (`count` lists forward, default 1).
 function nx.qf.newer(count)
   vim.cmd(count and ("cnewer " .. count) or "cnewer")
@@ -794,29 +794,29 @@ end
 -- The location-list counterparts of the quickfix window / navigation wrappers
 -- above — thin wrappers over the `:l*` ex-commands, acting on the CURRENT window's
 -- location list rather than the global quickfix list.
--- nx.qf.lopen([height]) [wraps `:lopen`]: open the location-list window, optionally
+-- `nx.qf.lopen([height])` [wraps `:lopen`]: open the location-list window, optionally
 -- `height` rows tall.
 function nx.qf.lopen(height)
   vim.cmd(height and ("lopen " .. height) or "lopen")
 end
--- nx.qf.lclose() [wraps `:lclose`]: close the location-list window.
+-- `nx.qf.lclose()` [wraps `:lclose`]: close the location-list window.
 function nx.qf.lclose()
   vim.cmd("lclose")
 end
--- nx.qf.lnext() [wraps `:lnext`]: jump to the next entry in the location list.
+-- `nx.qf.lnext()` [wraps `:lnext`]: jump to the next entry in the location list.
 function nx.qf.lnext()
   vim.cmd("lnext")
 end
--- nx.qf.lprev() [wraps `:lprev`]: jump to the previous entry in the location list.
+-- `nx.qf.lprev()` [wraps `:lprev`]: jump to the previous entry in the location list.
 function nx.qf.lprev()
   vim.cmd("lprev")
 end
--- nx.qf.lolder([count]) [wraps `:lolder`]: go to an older location list in the
+-- `nx.qf.lolder([count])` [wraps `:lolder`]: go to an older location list in the
 -- window's stack (`count` lists back, default 1).
 function nx.qf.lolder(count)
   vim.cmd(count and ("lolder " .. count) or "lolder")
 end
--- nx.qf.lnewer([count]) [wraps `:lnewer`]: go to a newer location list in the
+-- `nx.qf.lnewer([count])` [wraps `:lnewer`]: go to a newer location list in the
 -- window's stack (`count` lists forward, default 1).
 function nx.qf.lnewer(count)
   vim.cmd(count and ("lnewer " .. count) or "lnewer")

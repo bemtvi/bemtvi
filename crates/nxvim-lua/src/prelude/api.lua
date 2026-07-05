@@ -34,8 +34,8 @@ nx.ns = nx.ns or {}
 -- The local alias keeps this file's many window call sites terse.
 local resolve_win = nx._resolve_win
 
--- nx.buf.name(bufnr) -> string [alias nvim_buf_get_name / vim.fn.bufname]: the full
--- name (path) of buffer `bufnr`; `0` / nil means the current buffer. Returns "" for
+-- `nx.buf.name(bufnr)` -> string [alias `nvim_buf_get_name` / `vim.fn.bufname`]: the full
+-- name (path) of buffer `bufnr`; `0` / nil means the current buffer. Returns `""` for
 -- an unnamed or unknown buffer. Read from the buffer mirror, so it can name any open
 -- buffer — e.g. a custom 'tabline' labelling a buffer shown in another tab.
 function nx.buf.name(bufnr)
@@ -56,13 +56,13 @@ end
 -- `nx.buf.set_lines`): plugins supply data through the higher-level surfaces, per
 -- this file's header. Throughout, a `bufnr` of `0` / nil means the current buffer.
 --
--- nx.buf.current() -> bufnr [alias nvim_get_current_buf]: the current buffer's
+-- `nx.buf.current()` -> bufnr [alias `nvim_get_current_buf`]: the current buffer's
 -- number (`0` if there is none).
 function nx.buf.current()
   return (nx._cur_buf or {}).bufnr or 0
 end
 
--- nvim_get_mode(): the editor's current mode, read from the `nx._cur_mode`
+-- `nvim_get_mode()`: the editor's current mode, read from the `nx._cur_mode`
 -- snapshot the server refreshes before each Lua entry. `blocking` is always
 -- false — the in-VM Lua bindings only run when the server is between keys, so it
 -- is never blocked on input here. (The dedicated RPC method serves remote clients.)
@@ -71,7 +71,7 @@ function nx.mode()
 end
 
 -- Window API (Phase 5). Reads resolve against the `nx._wins` mirror the server
--- refreshes before running Lua; mutations queue a WindowOp (the `nx._win_*` /
+-- refreshes before running Lua; mutations queue a `WindowOp` (the `nx._win_*` /
 -- `nx._open_win` Rust bridges) the server drains into the live editor after the
 -- chunk, the same "Lua queues, core mutates" flow as the buffer API. `0`/`nil`
 -- means the current window throughout.
@@ -84,10 +84,10 @@ function nx.win.list()
   return nx._win_order or { nx._cur_win or 1000 }
 end
 
--- nx.win.set_current(win): focus `win` (make it the current window) [alias
--- nvim_set_current_win]. `win` is a window id (0 / nil = the current window, a no-op).
+-- `nx.win.set_current(win)`: focus `win` (make it the current window) [alias
+-- `nvim_set_current_win`]. `win` is a window id (0 / nil = the current window, a no-op).
 -- The switch is queued and applied after the Lua chunk like the other window ops; the
--- mirror is updated write-through so an immediate nx.win.current() / current-buffer read
+-- mirror is updated write-through so an immediate `nx.win.current()` / current-buffer read
 -- in the same chunk reflects the new focus.
 function nx.win.set_current(win)
   win = resolve_win(win)
@@ -119,14 +119,14 @@ function nx.cursor.get(win)
   return { c.row, c.col }
 end
 
--- nx.cursor.set(pos[, win]): move window `win`'s cursor (`0`/nil = the current
--- window) to `pos`, a `{ row, col }` pair in the SAME convention nx.cursor.get
+-- `nx.cursor.set(pos[, win])`: move window `win`'s cursor (`0`/nil = the current
+-- window) to `pos`, a `{ row, col }` pair in the SAME convention `nx.cursor.get`
 -- returns — a 1-based `row` and a 0-based byte `col`. The
 -- target is clamped into the buffer. This is the setter half of the cursor surface:
 -- the reveal / jump-to primitive a picker or a "go to definition"-style plugin uses;
 -- ordinary navigation stays plain normal-mode motion. Like the rest of the window
 -- mutation API it queues a window op the server applies after this chunk (the same
--- "Lua queues, core mutates" flow), via the nx._win_set_cursor bridge.
+-- "Lua queues, core mutates" flow), via the `nx._win_set_cursor` bridge.
 function nx.cursor.set(pos, win)
   if type(pos) ~= "table" or type(pos[1]) ~= "number" then
     error("nx.cursor.set: pos must be a { row, col } table (1-based row, 0-based col)", 2)
@@ -134,7 +134,7 @@ function nx.cursor.set(pos, win)
   nx._win_set_cursor(win or 0, pos[1] - 1, pos[2] or 0)
 end
 
--- nvim_get_current_line(): the text of the line the cursor is on in the current
+-- `nvim_get_current_line()`: the text of the line the cursor is on in the current
 -- window/buffer (no trailing newline). Composed from the cursor row and the
 -- buffer's lines — a completion plugin reads this when it builds a completion
 -- `context`, which runs as soon as its core spins up, so a missing builtin would
@@ -157,25 +157,25 @@ function nx.win.height(win)
   return w and w.height or 0
 end
 
--- nvim_win_call(win, fn) / nvim_buf_call(buf, fn): run `fn` as if `win`/`buf`
+-- `nvim_win_call(win, fn)` / `nvim_buf_call(buf, fn)`: run `fn` as if `win`/`buf`
 -- were current, returning fn's result. In neovim these temporarily switch the
 -- editor's current window/buffer for the duration of the callback; in nxvim the
 -- callback runs synchronously in-VM, where "current" is the mirror the server
--- pushed (nx._cur_win / nx._cur_buf / nx._cur_cursor). So these swap that
+-- pushed (`nx._cur_win` / `nx._cur_buf` / `nx._cur_cursor`). So these swap that
 -- mirror context for the call, run `fn`, and restore it — which makes every
--- *read* inside the callback (nvim_win_get_cursor, nvim_get_current_buf,
--- vim.fn.line/col/winnr, …) resolve against the requested window/buffer, and
--- every explicit-handle write that nxvim *does* expose (vim.bo[buf] option sets,
--- nvim_buf_set_extmark(buf, …)) resolves the swapped mirror at call time and queues
+-- *read* inside the callback (`nvim_win_get_cursor`, `nvim_get_current_buf`,
+-- `vim.fn.line`/`col`/`winnr`, …) resolve against the requested window/buffer, and
+-- every explicit-handle write that nxvim *does* expose (`vim.bo[buf]` option sets,
+-- `nvim_buf_set_extmark(buf, …)`) resolves the swapped mirror at call time and queues
 -- that concrete handle — so it, too, targets the right place.
 --
 -- What nxvim CAN'T do is retarget a mutation that binds to "current" only at
--- DRAIN time — an ex-command (vim.cmd), feedkeys, or an LSP buf request — since
+-- DRAIN time — an ex-command (`vim.cmd`), feedkeys, or an LSP buf request — since
 -- the queued-ops model applies those against the editor's real current
 -- buffer/window after the chunk, which this call never actually switched. Rather
 -- than silently mutate the wrong context, `nx._call_ctx_lock` is set for the
 -- duration of a call whose target differs from the real current, and those
--- funnels raise while it is set (see nx._assert_call_ctx). Plugins use these
+-- funnels raise while it is set (see `nx._assert_call_ctx`). Plugins use these
 -- calls to read a window's view/dimensions, which is fully faithful.
 function nx.win.call(win, fn)
   win = resolve_win(win)
@@ -200,7 +200,7 @@ function nx.win.call(win, fn)
   return ret
 end
 
--- nx.buf.call(buf, fn) -> any [alias nvim_buf_call]: run `fn` with `buf` (0/nil =
+-- `nx.buf.call(buf, fn)` -> any [alias `nvim_buf_call`]: run `fn` with `buf` (0/nil =
 -- current) installed as the current-buffer context, then restore the previous
 -- context and return whatever `fn` returned. Use it so buffer-relative lookups
 -- inside `fn` (name, options) resolve against `buf`. An error in `fn` propagates.
@@ -268,7 +268,7 @@ function nx.tabpage.win(tab)
   return t and t.current_window or (nx._cur_win or 1000)
 end
 
--- nvim_win_get_config(win): the float placement of `win` as neovim's config map,
+-- `nvim_win_get_config(win)`: the float placement of `win` as neovim's config map,
 -- or `{ relative = "" }` for a tiled window. Reads the `nx._wins` mirror (the
 -- server pushes each float's config into `w.float`; `nvim_open_win` /
 -- `nvim_win_set_config` write through it so a read within the same chunk agrees).
@@ -302,28 +302,28 @@ function nx.win.config(win)
   return cfg
 end
 
--- nx.buf.is_loaded(bufnr) -> bool [alias nvim_buf_is_loaded]: whether `bufnr` (0/nil
+-- `nx.buf.is_loaded(bufnr)` -> bool [alias `nvim_buf_is_loaded`]: whether `bufnr` (0/nil
 -- = current) names a buffer that is loaded into memory. Backed by the buffer mirror,
 -- which carries every loaded buffer.
 function nx.buf.is_loaded(bufnr)
   return nx._bufs[nx._resolve_bufnr(bufnr)] ~= nil
 end
 
--- nx.buf.is_valid(bufnr) -> bool [alias nvim_buf_is_valid]: whether `bufnr` (0/nil =
+-- `nx.buf.is_valid(bufnr)` -> bool [alias `nvim_buf_is_valid`]: whether `bufnr` (0/nil =
 -- current) names a buffer nxvim knows about. There is no separate "valid but
--- unloaded" state in the mirror yet, so this currently matches nx.buf.is_loaded.
+-- unloaded" state in the mirror yet, so this currently matches `nx.buf.is_loaded`.
 function nx.buf.is_valid(bufnr)
   return nx._bufs[nx._resolve_bufnr(bufnr)] ~= nil
 end
 
--- nx.buf.line_count(bufnr) -> integer [alias nvim_buf_line_count]: the number of
+-- `nx.buf.line_count(bufnr)` -> integer [alias `nvim_buf_line_count`]: the number of
 -- lines in `bufnr` (0/nil = current); `0` for an unknown buffer.
 function nx.buf.line_count(bufnr)
   local buf = nx._bufs[nx._resolve_bufnr(bufnr)]
   return (buf and buf.lines) and #buf.lines or 0
 end
 
--- nx.buf.offset(bufnr, index) -> integer [alias nvim_buf_get_offset]: the byte
+-- `nx.buf.offset(bufnr, index)` -> integer [alias `nvim_buf_get_offset`]: the byte
 -- offset at which 0-based line `index` starts — the sum of every preceding line's
 -- bytes plus its newline. `index == line_count` gives the buffer's total byte
 -- length. Returns `-1` for an unknown buffer.
@@ -340,11 +340,11 @@ function nx.buf.offset(bufnr, index)
   return off
 end
 
--- nx.buf.text(bufnr, start_row, start_col, end_row, end_col[, opts]) -> lines [alias
--- nvim_buf_get_text]: the text of `bufnr` spanning (start_row, start_col) up to
+-- `nx.buf.text(bufnr, start_row, start_col, end_row, end_col[, opts])` -> lines [alias
+-- `nvim_buf_get_text`]: the text of `bufnr` spanning (start_row, start_col) up to
 -- (end_row, end_col), returned as a list of lines (the span split on newlines). Rows
 -- are 0-based; columns are 0-based byte indices into their line; the end position is
--- exclusive. Use this for a sub-line span — use nx.buf.lines for whole lines.
+-- exclusive. Use this for a sub-line span — use `nx.buf.lines` for whole lines.
 function nx.buf.text(bufnr, start_row, start_col, end_row, end_col, _opts)
   local buf = nx._bufs[nx._resolve_bufnr(bufnr)]
   if not buf or not buf.lines then
@@ -362,7 +362,7 @@ function nx.buf.text(bufnr, start_row, start_col, end_row, end_col, _opts)
   return out
 end
 
--- nx.buf.lines(bufnr, start, end_[, strict]) -> lines [alias nvim_buf_get_lines]:
+-- `nx.buf.lines(bufnr, start, end_[, strict])` -> lines [alias `nvim_buf_get_lines`]:
 -- the lines of `bufnr` (0/nil = current) in the 0-based, end-EXCLUSIVE range
 -- [start, end_). Negative indices count back from the end (`-1` is one past the last
 -- line), so `(0, -1)` is the whole buffer. With `strict` true an out-of-range index
@@ -390,8 +390,8 @@ function nx.buf.lines(bufnr, start, end_, strict)
   return out
 end
 
--- nx.buf.set_lines(bufnr, start, end_, strict, replacement) -> promise [alias
--- nvim_buf_set_lines]: replace lines [start, end_) of `bufnr` (0/nil = current) with
+-- `nx.buf.set_lines(bufnr, start, end_, strict, replacement)` -> promise [alias
+-- `nvim_buf_set_lines`]: replace lines [start, end_) of `bufnr` (0/nil = current) with
 -- `replacement` (a list of whole-line strings), 0-based and end-EXCLUSIVE. Negative
 -- indices count back from the end (`-1` is one past the last line), so `(0, -1, …)`
 -- replaces the WHOLE buffer and `(n, n, …, { "x" })` appends. With `strict` true an
@@ -405,7 +405,7 @@ end
 -- the buffer's modifiability are validated SYNCHRONOUSLY and raise (fail loud) before
 -- anything is queued: a non-table replacement, a non-string / newline-bearing line, an
 -- unknown buffer, a `nomodifiable` buffer, or (under `strict`) an out-of-range index. A
--- read-only buffer KIND (terminal / nx.view / quickfix) is refused loudly server-side.
+-- read-only buffer KIND (terminal / `nx.view` / quickfix) is refused loudly server-side.
 function nx.buf.set_lines(bufnr, start, end_, strict, replacement)
   local buf = nx._resolve_bufnr(bufnr)
   local mirror = nx._bufs[buf]
@@ -440,7 +440,7 @@ function nx.buf.set_lines(bufnr, start, end_, strict, replacement)
   end)
 end
 
--- nx.buf.search(bufnr, pattern, opts) -> match | nil: find `pattern` in `bufnr`
+-- `nx.buf.search(bufnr, pattern, opts)` -> match | nil: find `pattern` in `bufnr`
 -- (0/nil = current) over the buffer mirror, line by line. The native counterpart to
 -- scanning lines in Lua — it runs the match in Rust (the `regex` crate or the vim
 -- engine) so a plugin can jump straight to a section (a conflict marker, a heading).
@@ -463,7 +463,7 @@ end
 --
 -- with `line`/`end_line` 1-based, `col`/`end_col` 0-based byte offsets (end
 -- exclusive), `text` the matched substring, and `captures` the submatch strings
--- (`\1`.., "" for a group that didn't participate). Matching is line-by-line, so a
+-- (`\1`.., `""` for a group that didn't participate). Matching is line-by-line, so a
 -- multi-line (`\n`-spanning) pattern is not supported.
 function nx.buf.search(bufnr, pattern, opts)
   local buf = nx._bufs[nx._resolve_bufnr(bufnr)]
@@ -473,7 +473,7 @@ function nx.buf.search(bufnr, pattern, opts)
   return nx._buf_search(buf.lines, pattern, opts or {})
 end
 
--- nx.regex(pattern, opts) -> regex: compile `pattern` into a reusable regex object
+-- `nx.regex(pattern, opts)` -> regex: compile `pattern` into a reusable regex object
 -- for matching Lua **strings** — a more capable `string.find`/`match`/`gmatch`/`gsub`
 -- with a real regex dialect (named groups, alternation, lazy quantifiers, …). The
 -- match runs in Rust, so a string you already hold in Lua is matched in place (no
@@ -504,7 +504,7 @@ end
 -- re:test(s)           -> boolean: does the pattern match anywhere
 -- ```
 --
--- `init` is 1-based and may be negative to count from the end, as in string.find.
+-- `init` is 1-based and may be negative to count from the end, as in `string.find`.
 --
 -- ```lua
 -- local re = nx.regex([[(\w+)@(\w+)]])
@@ -521,7 +521,7 @@ end
 -- highlight-relevant attrs only; virtual text / signs / conceal are not modelled
 -- yet and are rejected loudly rather than silently ignored.
 
--- nvim_create_namespace(name): create-or-get a namespace id by name (an empty /
+-- `nvim_create_namespace(name)`: create-or-get a namespace id by name (an empty /
 -- nil name mints a fresh anonymous one each call). Ids are allocated Lua-side, so
 -- the call returns synchronously; the server only ever sees the id on a mark.
 function nx.ns.create(name)
@@ -596,9 +596,9 @@ local EXTMARK_OPT_DECORATION = {
   invalidate = true,
 }
 
--- nx.buf.set_extmark(buffer, ns, line, col[, opts]) -> id [alias
--- nvim_buf_set_extmark]: place (or update, via `opts.id`) an extmark in `buffer`
--- under namespace `ns` (see nx.ns.create) at 0-based `line` / `col` (col a byte
+-- `nx.buf.set_extmark(buffer, ns, line, col[, opts])` -> id [alias
+-- `nvim_buf_set_extmark`]: place (or update, via `opts.id`) an extmark in `buffer`
+-- under namespace `ns` (see `nx.ns.create`) at 0-based `line` / `col` (col a byte
 -- offset). `opts` carries the highlight-relevant attrs — `end_row` / `end_col` for a
 -- ranged mark, `hl_group`, `priority`, … — and an unsupported decoration key fails
 -- loud rather than being ignored. Returns the mark id. The mutation is queued for
@@ -654,7 +654,7 @@ function nx.buf.set_extmark(buffer, ns, line, col, opts)
   return mark_id
 end
 
--- nx.buf.del_extmark(buffer, ns, id) -> bool [alias nvim_buf_del_extmark]: remove
+-- `nx.buf.del_extmark(buffer, ns, id)` -> bool [alias `nvim_buf_del_extmark`]: remove
 -- mark `id` of namespace `ns` from `buffer`. Returns whether the mark existed.
 function nx.buf.del_extmark(buffer, ns, id)
   local b = nx._resolve_bufnr(buffer)
@@ -667,8 +667,8 @@ function nx.buf.del_extmark(buffer, ns, id)
   return existed
 end
 
--- nx.buf.clear_namespace(buffer, ns, line_start, line_end) [alias
--- nvim_buf_clear_namespace]: drop namespace `ns`'s extmarks in `buffer` whose line
+-- `nx.buf.clear_namespace(buffer, ns, line_start, line_end)` [alias
+-- `nvim_buf_clear_namespace`]: drop namespace `ns`'s extmarks in `buffer` whose line
 -- is in the 0-based range [line_start, line_end) — `line_end == -1` means to the end
 -- of the buffer. `ns == -1` clears every namespace.
 function nx.buf.clear_namespace(buffer, ns, line_start, line_end)
@@ -706,8 +706,8 @@ local function extmark_pos_bound(p)
   error("nvim_buf_get_extmarks: only 0, -1, and {row, col} positions are supported", 2)
 end
 
--- nx.buf.extmarks(buffer, ns, start, end_[, opts]) -> list [alias
--- nvim_buf_get_extmarks]: the extmarks of namespace `ns` in `buffer` within the
+-- `nx.buf.extmarks(buffer, ns, start, end_[, opts])` -> list [alias
+-- `nvim_buf_get_extmarks`]: the extmarks of namespace `ns` in `buffer` within the
 -- position range `start`..`end_` — each bound is `0` (buffer start), `-1` (buffer
 -- end), or a `{row, col}` pair. Entries come in (row, col, id) order, each `{id,
 -- row, col}` (or `{id, row, col, details}` with `opts.details`). `ns == -1` returns
@@ -780,26 +780,26 @@ function nx.buf.extmarks(buffer, ns, start, end_, opts)
   return out
 end
 
--- nvim_replace_termcodes(str, from_part, do_lt, special): in neovim, translate
+-- `nvim_replace_termcodes(str, from_part, do_lt, special)`: in neovim, translate
 -- key notation (`<CR>`, `<C-w>`, `<lt>`, …) into the internal terminal-byte
--- encoding. nxvim represents keys as that *notation* throughout — parse_keys and
--- nvim_feedkeys consume notation directly — so the canonical internal form of a
+-- encoding. nxvim represents keys as that *notation* throughout — `parse_keys` and
+-- `nvim_feedkeys` consume notation directly — so the canonical internal form of a
 -- key string already IS the notation, and this returns `str` unchanged. The
--- result round-trips exactly through nvim_feedkeys (which re-parses the notation),
+-- result round-trips exactly through `nvim_feedkeys` (which re-parses the notation),
 -- which is the contract callers rely on (build a "feed string", later feed it).
--- The flags (from_part / do_lt / special) only shape neovim's byte output and are
+-- The flags (`from_part` / `do_lt` / `special`) only shape neovim's byte output and are
 -- accepted for call-compatibility; `<lt>` and the special names are handled by
--- parse_keys at feed time, so no pre-translation is needed here.
+-- `parse_keys` at feed time, so no pre-translation is needed here.
 function nx.replace_termcodes(str, _from_part, _do_lt, _special)
   return tostring(str or "")
 end
 
--- nx.hl.define (the canonical highlight setter) is installed from Rust — it
+-- `nx.hl.define` (the canonical highlight setter) is installed from Rust — it
 -- captures the group definition for the server to fold into the core highlight
 -- registry — so it is not (re)defined here; the `vim.api.nvim_set_hl` alias is
 -- added in the block at the end of the file.
 
--- nvim_get_hl(ns, opts): read highlight group definitions from the mirror the
+-- `nvim_get_hl(ns, opts)`: read highlight group definitions from the mirror the
 -- server refreshes when the registry changes. `ns == 0` reads the global table
 -- (`nx._hl_defs`); a non-zero `ns` reads that namespace's own table
 -- (`nx._hl_defs_ns[ns]`), with no fallback to the global table — matching
@@ -888,10 +888,10 @@ vim.api.nvim_replace_termcodes = nx.replace_termcodes
 
 -- ----- window view / screen position (the vim.fn.* popup plugins read) -------
 -- These resolve the *current* window — which `nvim_win_call(win, fn)` swaps to its
--- target for the duration of the call (nx._cur_win / nx._cur_cursor), so a
+-- target for the duration of the call (`nx._cur_win` / `nx._cur_cursor`), so a
 -- `nvim_win_call(popup, vim.fn.winsaveview)` reads the popup's view.
 
--- nx.win.saveview() [alias vim.fn.winsaveview]: the current window's view — cursor
+-- `nx.win.saveview()` [alias `vim.fn.winsaveview`]: the current window's view — cursor
 -- position, scroll (`topline`/`leftcol`), and the cursor-restore fields neovim
 -- returns. nxvim has no separate `curswant`/`coladd`/`skipcol` state, so those
 -- mirror `col` / are 0.
@@ -919,26 +919,26 @@ vim.fn.winsaveview = nx.win.saveview
 -- call-context lock. Built for a side-by-side diff / scrollbind plugin that mirrors
 -- one window's view onto another. A `WinScrolled` autocmd fires for the moved window.
 
--- nx.win.set_topline(win, topline): scroll `win` so its first visible buffer line is
+-- `nx.win.set_topline(win, topline)`: scroll `win` so its first visible buffer line is
 -- `topline` (1-based, neovim/`winsaveview` convention; clamped to the last line).
 function nx.win.set_topline(win, topline)
   nx._win_set_topline(win or 0, math.max(0, (topline or 1) - 1))
 end
 
--- nx.win.set_leftcol(win, leftcol): horizontally scroll `win` so its first visible
+-- `nx.win.set_leftcol(win, leftcol)`: horizontally scroll `win` so its first visible
 -- screen column is `leftcol` (0-based). Only meaningful under `'nowrap'`.
 function nx.win.set_leftcol(win, leftcol)
   nx._win_set_leftcol(win or 0, math.max(0, leftcol or 0))
 end
 
--- nx.win.set_cursor(win, line[, col]): move `win`'s cursor to `line` (1-based) /
+-- `nx.win.set_cursor(win, line[, col])`: move `win`'s cursor to `line` (1-based) /
 -- `col` (0-based byte column, default 0). The explicit-win counterpart of the
 -- (intentionally-absent) `nvim_win_set_cursor`.
 function nx.win.set_cursor(win, line, col)
   nx._win_set_cursor(win or 0, math.max(0, (line or 1) - 1), math.max(0, col or 0))
 end
 
--- nx.win.restview(win, view): restore `win`'s view from a `winsaveview`-shaped table
+-- `nx.win.restview(win, view)`: restore `win`'s view from a `winsaveview`-shaped table
 -- (`topline` 1-based, `leftcol` 0-based, optional `lnum`/`col` cursor) — the
 -- explicit-win `winrestview` analogue. Only the present fields are applied.
 function nx.win.restview(win, view)
@@ -955,9 +955,9 @@ function nx.win.restview(win, view)
   end
 end
 
--- nx.screen.row() / nx.screen.col() [aliases vim.fn.screenrow / screencol]: the
+-- `nx.screen.row()` / `nx.screen.col()` [aliases `vim.fn.screenrow` / `screencol`]: the
 -- cursor's 1-based position on the whole screen, mirrored by the server
--- (nx._cur_screenrow / _cur_screencol) for the focused window. Popup plugins read
+-- (`nx._cur_screenrow` / `_cur_screencol`) for the focused window. Popup plugins read
 -- them to avoid drawing a popup over the cursor.
 nx.screen = nx.screen or {}
 function nx.screen.row()
@@ -972,8 +972,8 @@ vim.fn.screencol = nx.screen.col
 -- `nx.wo` / `vim.wo` (window-local options) live with the other option scopes in
 -- prelude/state.lua; the gutter mirror (`nx._wins`) and `nx._resolve_win` it
 -- reads are defined here. The deprecated window-scoped getters/setters carry no
--- implementation of their own — they wrap the sibling nvim_*_option_value funnels
--- (nx.option.get / nx.option.set) with the scope pinned to a window.
+-- implementation of their own — they wrap the sibling `nvim_*_option_value` funnels
+-- (`nx.option.get` / `nx.option.set`) with the scope pinned to a window.
 function vim.api.nvim_win_get_option(win, name)
   return vim.api.nvim_get_option_value(name, { win = win or 0 })
 end
@@ -984,31 +984,31 @@ end
 -- ----- vim.fn editor-state builtins (statusline / lualine, Phase 5) ----------
 -- The Vimscript builtins a real `'statusline'` (and lualine) call from inside a
 -- `%{}`/`%!` expression. Each reads the Rust→Lua mirror the server refreshes
--- before evaluating the statusline (nx._cur_mode / nx._cur_cursor / nx._bufs /
--- nx._cur_buf / nx._wins), so a live redraw reflects the current frame. An
+-- before evaluating the statusline (`nx._cur_mode` / `nx._cur_cursor` / `nx._bufs` /
+-- `nx._cur_buf` / `nx._wins`), so a live redraw reflects the current frame. An
 -- unsupported argument fails loud (the no-silent-stub rule) rather than guessing.
 
--- nx.mode_str([expanded]) [alias vim.fn.mode]: the single-letter mode code
--- ("n"/"i"/"v"/"V"/"R"/"c"). (Distinct from nx.mode(), which returns the
--- nvim_get_mode `{mode, blocking}` table.) INCOMPLETE: `expanded` is ignored — the
--- core has a flat Mode (no operator-pending / sub-state), so mode(1)'s multi-char
--- forms ("no", "niI", …) don't exist here; the short code is returned for both.
+-- `nx.mode_str([expanded])` [alias `vim.fn.mode`]: the single-letter mode code
+-- (`"n"`/`"i"`/`"v"`/`"V"`/`"R"`/`"c"`). (Distinct from `nx.mode()`, which returns the
+-- `nvim_get_mode` `{mode, blocking}` table.) INCOMPLETE: `expanded` is ignored — the
+-- core has a flat `Mode` (no operator-pending / sub-state), so `mode(1)`'s multi-char
+-- forms (`"no"`, `"niI"`, …) don't exist here; the short code is returned for both.
 function nx.mode_str(_expanded)
   return nx._cur_mode or "n"
 end
 vim.fn.mode = nx.mode_str
 
--- nx.cmdtype.get() [alias vim.fn.getcmdtype]: the type char of the open command
--- line — ":" (ex), "/" or "?" (search), "@" (a scripted input/confirm prompt) — or
--- "" when none is open. Read from the nx._cur_cmdtype mirror the server refreshes.
+-- `nx.cmdtype.get()` [alias `vim.fn.getcmdtype`]: the type char of the open command
+-- line — `":"` (ex), `"/"` or `"?"` (search), `"@"` (a scripted input/confirm prompt) — or
+-- `""` when none is open. Read from the `nx._cur_cmdtype` mirror the server refreshes.
 nx.cmdtype = nx.cmdtype or {}
 function nx.cmdtype.get()
   return nx._cur_cmdtype or ""
 end
 vim.fn.getcmdtype = nx.cmdtype.get
 
--- nx.win.nr([arg]) [alias vim.fn.winnr]: the current window's 1-based number (its
--- index in the layout order), or with "$" the number of windows. (vim's "#"
+-- `nx.win.nr([arg])` [alias `vim.fn.winnr`]: the current window's 1-based number (its
+-- index in the layout order), or with `"$"` the number of windows. (vim's `"#"`
 -- previous-window form needs window history the mirror doesn't keep, so it errors.)
 function nx.win.nr(arg)
   if arg == nil or arg == "." then
@@ -1026,10 +1026,10 @@ function nx.win.nr(arg)
 end
 vim.fn.winnr = nx.win.nr
 
--- nx.tabpage.nr([arg]) [alias vim.fn.tabpagenr]: the current tab page's 1-based
--- number, or with "$" the number of tab pages — the tab analogue of winnr(). Backs
+-- `nx.tabpage.nr([arg])` [alias `vim.fn.tabpagenr`]: the current tab page's 1-based
+-- number, or with `"$"` the number of tab pages — the tab analogue of `winnr()`. Backs
 -- the loop in a custom `'tabline'` (`for i = 1, tabpagenr('$')`). Resolves from the
--- `nx._tabs` / nx._tab_order mirror the server pushes before evaluating the tabline.
+-- `nx._tabs` / `nx._tab_order` mirror the server pushes before evaluating the tabline.
 function nx.tabpage.nr(arg)
   if arg == nil or arg == "." then
     return vim.api.nvim_tabpage_get_number(0)
@@ -1040,7 +1040,7 @@ function nx.tabpage.nr(arg)
 end
 vim.fn.tabpagenr = nx.tabpage.nr
 
--- nx.tabpage.buflist(nr) [alias vim.fn.tabpagebuflist]: the list of buffer numbers
+-- `nx.tabpage.buflist(nr)` [alias `vim.fn.tabpagebuflist`]: the list of buffer numbers
 -- shown in tab page `nr` (1-based; nil/0 is the current tab), one per window in that
 -- tab — what a custom `'tabline'` label reads to find the tab's active file. Reads
 -- the tab mirror's per-window `buffers` (parallel to `windows`), which the server
@@ -1063,13 +1063,13 @@ function nx.tabpage.buflist(nr)
 end
 vim.fn.tabpagebuflist = nx.tabpage.buflist
 
--- (vim.fn.bufnr / bufname live in prelude/fs.lua, which loads after this chunk —
+-- (`vim.fn.bufnr` / `bufname` live in prelude/fs.lua, which loads after this chunk —
 -- the canonical "additional vim.fn" home — so they aren't (re)defined here.)
 
--- nx.win.width_nr(nr) / nx.win.height_nr(nr) [aliases vim.fn.winwidth / winheight]:
+-- `nx.win.width_nr(nr)` / `nx.win.height_nr(nr)` [aliases `vim.fn.winwidth` / `winheight`]:
 -- a window's text dimensions, addressed by window *number* (1-based layout index;
--- 0 = current). The `_nr` suffix distinguishes them from nx.win.width / nx.win.height
--- (the nvim_win_get_* form), which take a window *handle*.
+-- 0 = current). The `_nr` suffix distinguishes them from `nx.win.width` / `nx.win.height`
+-- (the `nvim_win_get_*` form), which take a window *handle*.
 local function win_by_number(nr)
   if nr == nil or nr == 0 then
     return nx._cur_win or 1000
@@ -1087,10 +1087,10 @@ end
 vim.fn.winwidth = nx.win.width_nr
 vim.fn.winheight = nx.win.height_nr
 
--- nvim_get_hl_by_name(name, rgb): the pre-0.9 highlight reader (lualine and other
+-- `nvim_get_hl_by_name(name, rgb)`: the pre-0.9 highlight reader (lualine and other
 -- older plugins still call it). Returns the *resolved* group (link chain followed)
 -- in the legacy shape — `foreground`/`background`/`special` truecolor ints plus
--- the set boolean attrs — rather than nvim_get_hl's `fg`/`bg`/`sp`. nxvim's
+-- the set boolean attrs — rather than `nvim_get_hl`'s `fg`/`bg`/`sp`. nxvim's
 -- registry is truecolor-only, so only `rgb == true` (RGB output) can be honored; a
 -- cterm read (`rgb` false/nil) has no backing model and fails loud rather than
 -- returning RGB ints mislabeled as cterm indices. An unknown group returns `{}`.
@@ -1120,18 +1120,18 @@ function vim.api.nvim_get_hl_by_name(name, rgb)
   return out
 end
 
--- nvim_echo aliases nx.echo. Bind the private nx._echo bridge directly: this chunk
--- loads before nx.lua (where the documented nx.echo wrapper is defined), and both name
+-- `nvim_echo` aliases `nx.echo`. Bind the private `nx._echo` bridge directly: this chunk
+-- loads before nx.lua (where the documented `nx.echo` wrapper is defined), and both name
 -- the same native, so the alias is identical either way.
 vim.api.nvim_echo = nx._echo
 
--- nx.hl.exists(name): is the highlight group `name` defined? Returns a native
+-- `nx.hl.exists(name)`: is the highlight group `name` defined? Returns a native
 -- boolean (the rest of `nx.*` is boolean, not vim's 1/0). Backed by the same
--- `nx._hl_defs` registry nvim_get_hl reads (concrete groups and links both count).
+-- `nx._hl_defs` registry `nvim_get_hl` reads (concrete groups and links both count).
 function nx.hl.exists(name)
   return (nx._hl_defs or {})[name] ~= nil
 end
--- vim.fn.hlexists keeps the vimscript 1/0 contract: LuaSnip probes it as
+-- `vim.fn.hlexists` keeps the vimscript 1/0 contract: LuaSnip probes it as
 -- `vim.fn.hlexists(group) == 1 and group or nil`, which a boolean would break.
 function vim.fn.hlexists(name)
   return nx.hl.exists(name) and 1 or 0
@@ -1139,26 +1139,26 @@ end
 
 -- ===== nvim_* deprecated aliases & small gaps ================================
 
--- nx.buf.set_option(buf, name, value) [alias nvim_buf_set_option]: set buffer-local
+-- `nx.buf.set_option(buf, name, value)` [alias `nvim_buf_set_option`]: set buffer-local
 -- option `name` to `value` on `buf` (0/nil = current). A pre-0.10 accessor kept
 -- because plugins call it pervasively (bufhidden / modifiable / filetype / buftype
--- on scratch buffers); in new code prefer nx.option.set(name, value, { buf = buf }),
+-- on scratch buffers); in new code prefer `nx.option.set(name, value, { buf = buf })`,
 -- which this wraps.
 function nx.buf.set_option(buf, name, value)
   nx.option.set(name, value, { buf = buf })
 end
--- nx.buf.get_option(buf, name) -> value [alias nvim_buf_get_option]: read buffer-
+-- `nx.buf.get_option(buf, name)` -> value [alias `nvim_buf_get_option`]: read buffer-
 -- local option `name` from `buf` (0/nil = current) — the read counterpart of
--- nx.buf.set_option. In new code prefer nx.option.get(name, { buf = buf }).
+-- `nx.buf.set_option`. In new code prefer `nx.option.get(name, { buf = buf })`.
 function nx.buf.get_option(buf, name)
   return nx.option.get(name, { buf = buf })
 end
 api.nvim_buf_set_option = nx.buf.set_option
 api.nvim_buf_get_option = nx.buf.get_option
 
--- nvim_win_is_valid(win): whether `win` names a window the mirror knows about
+-- `nvim_win_is_valid(win)`: whether `win` names a window the mirror knows about
 -- (0/nil is the current window, always valid while one exists). The window
--- analogue of nvim_buf_is_valid — picker teardown/resize guards call it constantly.
+-- analogue of `nvim_buf_is_valid` — picker teardown/resize guards call it constantly.
 function nx.win.is_valid(win)
   if win == nil or win == 0 then
     return (nx._cur_win or nil) ~= nil
@@ -1167,11 +1167,11 @@ function nx.win.is_valid(win)
 end
 api.nvim_win_is_valid = nx.win.is_valid
 
--- Message writers (aliases nvim_err_writeln / nvim_err_write / nvim_out_write).
+-- Message writers (aliases `nvim_err_writeln` / `nvim_err_write` / `nvim_out_write`).
 -- Error writers route through `nx._echo_err`, which lands on the message line and
 -- in `:messages` painted red (the core `echo_err` path); `out_write` funnels
--- through `print` like a plain message. nvim_err_writeln/out_write append a
--- newline; the *_write forms don't (the message line is line-oriented, so both
+-- through `print` like a plain message. `nvim_err_writeln`/`out_write` append a
+-- newline; the `*_write` forms don't (the message line is line-oriented, so both
 -- just emit the text).
 function nx.err_writeln(msg)
   nx._echo_err(tostring(msg or ""))
@@ -1186,7 +1186,7 @@ api.nvim_err_writeln = nx.err_writeln
 api.nvim_err_write = nx.err_write
 api.nvim_out_write = nx.out_write
 
--- nvim_win_get_position(win): the window's top-left as 0-based {row, col} screen
+-- `nvim_win_get_position(win)`: the window's top-left as 0-based {row, col} screen
 -- coordinates. Exact for a float (its placement); a tiled window's screen origin
 -- isn't carried in the mirror, so it reports {0, 0} — a documented approximation
 -- (a float-positioning plugin positions its own floats and reads their config
@@ -1201,7 +1201,7 @@ function nx.win.position(win)
 end
 api.nvim_win_get_position = nx.win.position
 
--- nx.buf.list([opts]) -> list of bufnr [alias nvim_list_bufs, which always lists
+-- `nx.buf.list([opts])` -> list of bufnr [alias `nvim_list_bufs`, which always lists
 -- all]: the buffer handles the mirror knows, ascending. By default every buffer
 -- across every layer (main area + all docks). Pass `{ focused = true }` to list only
 -- the **focused** layer's buffers — the per-region list (`:ls` is scoped the same
@@ -1217,15 +1217,15 @@ function nx.buf.list(opts)
   table.sort(ids)
   return ids
 end
--- nvim_list_bufs takes no arguments and lists *all* buffers; bind the default
+-- `nvim_list_bufs` takes no arguments and lists *all* buffers; bind the default
 -- (all-layers) behavior so a stray caller can never accidentally scope it.
 function api.nvim_list_bufs()
   return nx.buf.list()
 end
 
--- nx.list_uis() [alias nvim_list_uis]: the attached UIs. nxvim drives one client
+-- `nx.list_uis()` [alias `nvim_list_uis`]: the attached UIs. nxvim drives one client
 -- at a time, so this reports a single UI sized to the editor screen
--- (vim.o.columns/lines), with the fields a layout calculation reads. The ext_*
+-- (`vim.o.columns`/`lines`), with the fields a layout calculation reads. The `ext_*`
 -- feature flags are all false (nxvim's redraw protocol carries no external-UI
 -- widgets).
 function nx.list_uis()
@@ -1249,12 +1249,12 @@ function nx.list_uis()
 end
 api.nvim_list_uis = nx.list_uis
 
--- nvim_cmd(cmd, opts): the structured ex-command form. nxvim's command engine
+-- `nvim_cmd(cmd, opts)`: the structured ex-command form. nxvim's command engine
 -- consumes a string, so flatten {cmd, args, bang} into one and route through
--- nvim_command — the body only adapts the table shape onto that sibling nvim_
+-- `nvim_command` — the body only adapts the table shape onto that sibling nvim_
 -- funnel, so it carries no implementation of its own (there is no structured nx
--- twin; the canonical nxvim form is the string-taking nx.cmd). `opts.output`
--- capture isn't modelled (returns ""); the common callers
+-- twin; the canonical nxvim form is the string-taking `nx.cmd`). `opts.output`
+-- capture isn't modelled (returns `""`); the common callers
 -- (`nvim_cmd{cmd='normal', args={...}, bang=true}`) only need the side effect.
 function api.nvim_cmd(cmd, opts)
   local s = cmd.cmd
@@ -1270,16 +1270,16 @@ function api.nvim_cmd(cmd, opts)
   end
 end
 
--- nx.buf.getline(buf, lnum[, end]) [alias vim.fn.getbufline]: lines `lnum..end`
+-- `nx.buf.getline(buf, lnum[, end])` [alias `vim.fn.getbufline`]: lines `lnum..end`
 -- (1-based inclusive) of a buffer, or just `lnum` when `end` is omitted. Wraps
--- nx.buf.lines (0-based, end-exclusive). An out-of-range request yields {} (vim).
+-- `nx.buf.lines` (0-based, end-exclusive). An out-of-range request yields {} (vim).
 function nx.buf.getline(buf, lnum, lend)
   lend = lend or lnum
   return api.nvim_buf_get_lines(nx._resolve_bufnr(buf), lnum - 1, lend, false)
 end
 vim.fn.getbufline = nx.buf.getline
 
--- nx.win.getid([winnr[, tabnr]]) [alias vim.fn.win_getid]: the window id for a
+-- `nx.win.getid([winnr[, tabnr]])` [alias `vim.fn.win_getid`]: the window id for a
 -- 1-based window number (default: the current window). `tabnr` is accepted but only
 -- the current tab's layout order is consulted (the global window mirror carries it).
 function nx.win.getid(winnr, _tabnr)
@@ -1290,7 +1290,7 @@ function nx.win.getid(winnr, _tabnr)
 end
 vim.fn.win_getid = nx.win.getid
 
--- nx.win.findbuf(bufnr) [alias vim.fn.win_findbuf]: the ids of every window currently
+-- `nx.win.findbuf(bufnr)` [alias `vim.fn.win_findbuf`]: the ids of every window currently
 -- displaying `bufnr`.
 function nx.win.findbuf(bufnr)
   local out = {}
@@ -1304,7 +1304,7 @@ function nx.win.findbuf(bufnr)
 end
 vim.fn.win_findbuf = nx.win.findbuf
 
--- nx.win.gettype([winid]) [alias vim.fn.win_gettype]: "popup" for a float, "" for a
+-- `nx.win.gettype([winid])` [alias `vim.fn.win_gettype`]: `"popup"` for a float, `""` for a
 -- normal window — the distinction a plugin draws to know whether a window is one of
 -- its own floats.
 function nx.win.gettype(winid)
@@ -1314,7 +1314,7 @@ function nx.win.gettype(winid)
 end
 vim.fn.win_gettype = nx.win.gettype
 
--- nx.win.screenpos(winnr) [alias vim.fn.win_screenpos]: the 1-based (row, col) screen
+-- `nx.win.screenpos(winnr)` [alias `vim.fn.win_screenpos`]: the 1-based (row, col) screen
 -- position of a window's top-left text cell. Known exactly for a float (its
 -- placement); a tiled window's screen origin isn't carried in the mirror, so it
 -- reports {1, 1} (top-left) — a documented approximation float-positioning plugins
@@ -1329,7 +1329,7 @@ function nx.win.screenpos(winnr)
 end
 vim.fn.win_screenpos = nx.win.screenpos
 
--- nx.wininfo.get([winid]) [alias vim.fn.getwininfo]: per-window info dicts (all
+-- `nx.wininfo.get([winid])` [alias `vim.fn.getwininfo`]: per-window info dicts (all
 -- windows when winid is omitted). Carries the fields a layout reads —
 -- winid/winnr/bufnr/width/height/tabnr — from the window mirror. INCOMPLETE:
 -- topline/botline are coarse (the mirror has no per-window scroll), and winrow/wincol
@@ -1374,12 +1374,12 @@ function nx.wininfo.get(winid)
 end
 vim.fn.getwininfo = nx.wininfo.get
 
--- nx.screen.pos(win, lnum, col) [alias vim.fn.screenpos]: the 1-based screen cell
+-- `nx.screen.pos(win, lnum, col)` [alias `vim.fn.screenpos`]: the 1-based screen cell
 -- {row, col, curscol, endcol} of buffer position [lnum, col] in window `win`
 -- (0/current). A completion plugin reads it to anchor its completion menu at the cursor.
 -- Computed from the window mirror's origin + scroll: row counts down from the top
 -- text line; col is the display width of the line up to `col`, shifted by the
--- horizontal scroll. INCOMPLETE: inherits nx.win.screenpos's tiled-origin
+-- horizontal scroll. INCOMPLETE: inherits `nx.win.screenpos`'s tiled-origin
 -- approximation ({1,1}) and does not add a number/sign textoff; curscol/endcol
 -- collapse onto col. Faithful for the common single-window, gutterless case.
 function nx.screen.pos(win, lnum, col)
@@ -1403,7 +1403,7 @@ function nx.screen.pos(win, lnum, col)
 end
 vim.fn.screenpos = nx.screen.pos
 
--- nx.bufinfo.get([arg]) [alias vim.fn.getbufinfo]: per-buffer info dicts. `arg` is a
+-- `nx.bufinfo.get([arg])` [alias `vim.fn.getbufinfo`]: per-buffer info dicts. `arg` is a
 -- bufnr (one buffer), an opts table ({buflisted=1, bufloaded=1, …} — filters), or
 -- absent (all buffers). nxvim's core models neither buflisted nor a changed flag
 -- yet, so every buffer reports listed/loaded and unchanged; the filters narrow.
@@ -1450,12 +1450,12 @@ function nx.bufinfo.get(arg)
 end
 vim.fn.getbufinfo = nx.bufinfo.get
 
--- vim.fn.bufname(bufnr): the buffer's name — nx.buf.name already resolves 0/nil to
+-- `vim.fn.bufname(bufnr)`: the buffer's name — `nx.buf.name` already resolves 0/nil to
 -- the current buffer, so this is a direct alias onto it.
 vim.fn.bufname = nx.buf.name
 
--- nx.buf.nr(expr) [alias vim.fn.bufnr]: the buffer number for `expr`. "" / "%" / nil
--- / 0 -> current buffer; "$" -> the last (largest) buffer number; a string -> the
+-- `nx.buf.nr(expr)` [alias `vim.fn.bufnr`]: the buffer number for `expr`. `""` / `"%"` / nil
+-- / 0 -> current buffer; `"$"` -> the last (largest) buffer number; a string -> the
 -- loaded buffer whose name matches (exact, else suffix), -1 when none. Backed by
 -- the Phase-6 `nx._bufs` mirror.
 function nx.buf.nr(expr)

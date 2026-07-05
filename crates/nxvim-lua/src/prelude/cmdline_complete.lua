@@ -170,7 +170,7 @@ local BUILTIN = {
   { "TSInstallInfo", ":TSInstallInfo", "List installed / available tree-sitter parsers." },
 }
 
--- nx.cmdline_complete.setup{ docs = true }: enable the engine. `docs` toggles the
+-- `nx.cmdline_complete.setup{ docs = true }`: enable the engine. `docs` toggles the
 -- params/help preview pane (Phase 3; default true). A bare call enables it with
 -- defaults. Failing loud on a non-table argument (no silent stub).
 function nx.cmdline_complete.setup(opts)
@@ -358,8 +358,8 @@ local pending = nil
 local pending_fn = nil
 
 -- Split a typed path token into `(base, leaf)`: `base` is everything up to and
--- including the last "/" (kept verbatim so the spliced command stays in the user's
--- relative/absolute/`~` style), `leaf` is the partial name after it. No "/" ⇒ the
+-- including the last `"/"` (kept verbatim so the spliced command stays in the user's
+-- relative/absolute/`~` style), `leaf` is the partial name after it. No `"/"` ⇒ the
 -- whole token is the leaf and the base is empty (list the cwd).
 local function split_path(token)
   local base, leaf = token:match("^(.*/)([^/]*)$")
@@ -370,7 +370,7 @@ local function split_path(token)
 end
 
 -- Resolve the directory to LIST from the typed `base` and the picker `cwd`. A
--- leading "~" / "~/" expands to $HOME (when set); an absolute base lists itself; a
+-- leading `"~"` / `"~/"` expands to `$HOME` (when set); an absolute base lists itself; a
 -- relative base joins onto cwd. Always returns an absolute path for `nx.fs`.
 local function resolve_dir(base, cwd)
   if base == "" then
@@ -410,7 +410,7 @@ end
 -- (fuzzy) tier, and within each tier **directories before files**, alphabetically.
 -- These are all immediate children of the listed directory, so ranking them first
 -- is what "prioritise same-level candidates" means here. Dotfiles are hidden unless
--- the leaf itself starts with "." (vim's wildignore-ish default). `dirs_only` keeps
+-- the leaf itself starts with `"."` (vim's wildignore-ish default). `dirs_only` keeps
 -- only directories (and symlinks, which may point at one).
 local function rank_entries(entries, leaf, dirs_only)
   local lleaf = leaf:lower()
@@ -451,7 +451,7 @@ end
 -- same-level first — and re-lists as the query is edited). Per query it lists ONE
 -- directory (the one the typed base points at) via `nx.fs.readdir` (async, so it
 -- works native / over the daemon / on wasm-OPFS), pushing the same-level matches.
--- Crossing a "/" re-roots; confirming a directory descends (file mode) or selects
+-- Crossing a `"/"` re-roots; confirming a directory descends (file mode) or selects
 -- it (`dirs_only`). Confirming a file splices its path into the captured command
 -- line and runs it.
 nx.picker.source({
@@ -577,7 +577,7 @@ local function arg_list(before)
   return args
 end
 
--- nx._cmdline_complete_run(line, col): the candidate source the server calls
+-- `nx._cmdline_complete_run(line, col)`: the candidate source the server calls
 -- synchronously per `<Tab>` (and each edit while the wildmenu is open). It returns
 -- the candidate list — a `{ {label, insert[, doc]}, ... }` array — and core
 -- fuzzy-ranks it against the token it extracted. Core completes either the leading

@@ -14,7 +14,7 @@ nx.snippet = nx.snippet or {}
 -- The `snippets` completion source offers these for the current buffer's filetype.
 nx.snippet._byft = nx.snippet._byft or {}
 
--- nx.snippet.setup { jump_next = "<Tab>", jump_prev = "<S-Tab>" }
+-- `nx.snippet.setup` { jump_next = `"<Tab>"`, jump_prev = `"<S-Tab>"` }
 -- Configure the tabstop-jump keys. Either may be a string or a list of strings; an
 -- omitted key keeps its default (`<Tab>` / `<S-Tab>`).
 function nx.snippet.setup(opts)
@@ -40,7 +40,7 @@ function nx.snippet.setup(opts)
   nx._snippet_setup(key_list(opts.jump_next, "jump_next"), key_list(opts.jump_prev, "jump_prev"))
 end
 
--- nx.snippet.add("rust", { { trigger = "fn", body = "fn ${1:name}() {\n\t$0\n}" }, ... })
+-- `nx.snippet.add`(`"rust"`, { { trigger = `"fn"`, body = `"fn ${1:name}() {\n\t$0\n}"` }, ... })
 -- Register snippets for a filetype. `trigger` and `body` are required strings.
 -- Function bodies (dynamic / context-aware) are not supported yet and error loud
 -- rather than silently dropping the snippet (deferred to a later phase).
@@ -74,7 +74,7 @@ function nx.snippet.add(ft, list)
   nx._snippet_add(ft, triggers, bodies)
 end
 
--- nx.snippet.expand("for ${1:i} = 1, ${2:n} do\n\t$0\nend")
+-- `nx.snippet.expand`(`"for ${1:i} = 1, ${2:n} do\n\t$0\nend"`)
 -- Expand a snippet body at the cursor immediately, entering Insert mode at the
 -- first tabstop. Errors loud on a malformed / unsupported body.
 function nx.snippet.expand(body)

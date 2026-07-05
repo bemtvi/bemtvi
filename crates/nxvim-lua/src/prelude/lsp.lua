@@ -77,7 +77,7 @@ local function nonempty(t)
   return nil
 end
 
--- The directory part of a path (strip the trailing `/component`); "" at the root.
+-- The directory part of a path (strip the trailing `/component`); `""` at the root.
 local function dirname(path)
   return (path:gsub("/[^/]*$", ""))
 end
@@ -192,7 +192,7 @@ local function resolve(name)
   )
 end
 
--- nx.lsp.config(name, opts): accumulate `opts` into `name`'s override layer
+-- `nx.lsp.config(name, opts)`: accumulate `opts` into `name`'s override layer
 -- (deep-merged over any prior call — configs compose across files and plugins).
 -- `"*"` is the all-clients base inherited by every server. Function-call form
 -- only: there is no `nx.lsp.config[name] = {…}` table-assignment sugar.
@@ -383,7 +383,7 @@ local function ensure_dispatcher()
   })
 end
 
--- nx.lsp.enable(names): mark configs for auto-activation on current and future
+-- `nx.lsp.enable(names)`: mark configs for auto-activation on current and future
 -- buffers and install the dispatcher. `names` is a string or a list. `"*"` is the
 -- base layer, not an activatable server, so it is rejected here.
 function nx.lsp.enable(names)
@@ -406,7 +406,7 @@ function nx.lsp.enable(names)
   end
 end
 
--- nx.lsp.disable(names): the inverse of `enable` — future buffers won't start the
+-- `nx.lsp.disable(names)`: the inverse of `enable` — future buffers won't start the
 -- named servers (already-running servers keep serving until their buffers close).
 function nx.lsp.disable(names)
   if type(names) == "string" then
@@ -417,7 +417,7 @@ function nx.lsp.disable(names)
   end
 end
 
--- nx.lsp.start(cfg, opts): the low-level, un-merged direct start (the raw
+-- `nx.lsp.start(cfg, opts)`: the low-level, un-merged direct start (the raw
 -- `LspOp::Start`) for advanced/manual use — bypasses the registry. `cfg` is a
 -- resolved config (`{ name, cmd, root_dir, filetypes, settings, … }`); `opts.bufnr`
 -- is the buffer to attach (default the current one), `opts.filetype` its languageId.
@@ -458,8 +458,8 @@ function nx.lsp.signature_help()
   nx._lsp_buf(6)
 end
 
--- nx.lsp.signature_help_autotrigger(enable): opt into auto-showing signature help as
--- you type a call (after `(`, refreshed at each `,`), instead of only on <C-k>. It is
+-- `nx.lsp.signature_help_autotrigger(enable)`: opt into auto-showing signature help as
+-- you type a call (after `(`, refreshed at each `,`), instead of only on `<C-k>`. It is
 -- driven by the *server's* advertised `signatureHelpProvider.triggerCharacters`, so it
 -- only fires for servers that offer signature help. `enable` defaults to true; pass
 -- false to turn it back off. Off unless a config opts in.
@@ -473,14 +473,14 @@ function nx.lsp.code_action()
   nx._lsp_buf_code_action()
 end
 
--- nx.lsp.document_symbol(): the symbols defined in the current document, opened in
--- nx.picker (kind 16 mirrors LspReqKind::DocumentSymbol::as_u16).
+-- `nx.lsp.document_symbol()`: the symbols defined in the current document, opened in
+-- `nx.picker` (kind 16 mirrors `LspReqKind::DocumentSymbol::as_u16`).
 function nx.lsp.document_symbol()
   nx._lsp_buf(16)
 end
 
--- nx.lsp.workspace_symbol(query): symbols across the workspace matching `query`,
--- opened in nx.picker. With no query, prompt for one via nx.ui.input (non-blocking)
+-- `nx.lsp.workspace_symbol(query)`: symbols across the workspace matching `query`,
+-- opened in `nx.picker`. With no query, prompt for one via `nx.ui.input` (non-blocking)
 -- — an empty/cancelled prompt does nothing.
 function nx.lsp.workspace_symbol(query)
   if type(query) == "string" then
@@ -494,7 +494,7 @@ function nx.lsp.workspace_symbol(query)
   end)
 end
 
--- nx.lsp.rename(new_name): rename the symbol under the cursor. With a name, request
+-- `nx.lsp.rename(new_name)`: rename the symbol under the cursor. With a name, request
 -- it straight away; with none (the bare `nx.keymap.set("n", "<leader>rn",
 -- nx.lsp.rename)` case), prompt for it via `nx.ui.input` (non-blocking promise),
 -- prefilled with the symbol under the cursor, and rename on confirm. An empty /
@@ -519,7 +519,7 @@ end
 -- dropped server-side). `on_attach` / `on_init` receive this same handle.
 local function make_client(id, name, capabilities)
   local client = { id = id, name = name, server_capabilities = capabilities or {} }
-  -- client:request(method, params, handler): issue a generic LSP request; the
+  -- `client:request(method, params, handler)`: issue a generic LSP request; the
   -- reply runs `handler(err, result)` off-tick (err a message string on failure,
   -- result the server's value on success — exactly one set). An unimplemented or
   -- uncapable method fails loud through `err`, never a silent no-op.
@@ -528,14 +528,14 @@ local function make_client(id, name, capabilities)
     nx._cb_fns[cb_id] = handler or function() end
     nx._lsp_client_request(self.id, method, params, cb_id)
   end
-  -- client:notify(method, params): fire-and-forget a generic LSP notification.
+  -- `client:notify(method, params)`: fire-and-forget a generic LSP notification.
   function client:notify(method, params)
     nx._lsp_client_notify(self.id, method, params)
   end
   return client
 end
 
--- nx.lsp.clients(filter): a snapshot list of active clients, narrowable by
+-- `nx.lsp.clients(filter)`: a snapshot list of active clients, narrowable by
 -- `filter.bufnr` (the clients attached to that buffer; `0`/nil = current) and/or
 -- `filter.name` (the config name). Reads the mirror — no request is issued.
 function nx.lsp.clients(filter)
@@ -558,7 +558,7 @@ function nx.lsp.clients(filter)
   return out
 end
 
--- nx.lsp.request(method, params, handler, bufnr): sugar resolving the buffer's
+-- `nx.lsp.request(method, params, handler, bufnr)`: sugar resolving the buffer's
 -- primary client and issuing `client:request`. No attached client fails loud.
 function nx.lsp.request(method, params, handler, bufnr)
   local client = nx.lsp.clients({ bufnr = bufnr or 0 })[1]
@@ -569,7 +569,7 @@ function nx.lsp.request(method, params, handler, bufnr)
   client:request(method, params, handler)
 end
 
--- nx.lsp.notify(method, params, bufnr): the fire-and-forget sibling of `request`.
+-- `nx.lsp.notify(method, params, bufnr)`: the fire-and-forget sibling of `request`.
 function nx.lsp.notify(method, params, bufnr)
   local client = nx.lsp.clients({ bufnr = bufnr or 0 })[1]
   if not client then
@@ -651,7 +651,7 @@ end
 nx.lsp._semantic_on = nx.lsp._semantic_on or {}
 nx.lsp._inlay_on = nx.lsp._inlay_on or {}
 
--- nx.lsp.semantic_tokens.* — the per-buffer projection (start/stop), the
+-- `nx.lsp.semantic_tokens.*` — the per-buffer projection (start/stop), the
 -- editor-wide gate (enable), a manual refresh, and the synchronous read getter.
 nx.lsp.semantic_tokens = nx.lsp.semantic_tokens or {}
 
@@ -682,7 +682,7 @@ function nx.lsp.semantic_tokens.force_refresh(bufnr)
   nx._lsp_semantic_refresh(cur_bufnr(bufnr))
 end
 
--- get_at_pos(bufnr, row, col): the decoded tokens covering the 0-based (row, col)
+-- `get_at_pos(bufnr, row, col)`: the decoded tokens covering the 0-based (row, col)
 -- (neovim's `vim.lsp.semantic_tokens.get_at_pos`). `col` is a 0-based byte column;
 -- a token covers `[start_col, end_col)`. Returns a list (possibly empty).
 function nx.lsp.semantic_tokens.get_at_pos(bufnr, row, col)
@@ -696,11 +696,11 @@ function nx.lsp.semantic_tokens.get_at_pos(bufnr, row, col)
   return out
 end
 
--- nx.lsp.inlay_hint.* — the per-buffer inline hints (off by default), the
+-- `nx.lsp.inlay_hint.*` — the per-buffer inline hints (off by default), the
 -- synchronous read getter, and the enabled-state probe.
 nx.lsp.inlay_hint = nx.lsp.inlay_hint or {}
 
--- enable(enable?, filter?): flip the per-buffer inlay-hint paint. `enable`
+-- `enable(enable?, filter?)`: flip the per-buffer inlay-hint paint. `enable`
 -- defaults to true; `filter.bufnr` (0/nil = current) targets the buffer
 -- (neovim's modern `vim.lsp.inlay_hint.enable(enable, { bufnr })`).
 function nx.lsp.inlay_hint.enable(enable, filter)
@@ -713,13 +713,13 @@ function nx.lsp.inlay_hint.enable(enable, filter)
   nx._lsp_inlay_hint_enable(bufnr, enable)
 end
 
--- is_enabled(filter?): whether inlay hints are on for the buffer.
+-- `is_enabled(filter?)`: whether inlay hints are on for the buffer.
 function nx.lsp.inlay_hint.is_enabled(filter)
   local bufnr = cur_bufnr(filter and filter.bufnr)
   return nx.lsp._inlay_on[bufnr] == true
 end
 
--- get(filter?): the decoded inlay hints in a buffer (`filter.bufnr`, 0/nil =
+-- `get(filter?)`: the decoded inlay hints in a buffer (`filter.bufnr`, 0/nil =
 -- current), each `{ bufnr, client_id, inlay_hint = <decoded entry> }` to match
 -- neovim's shape. `filter.range` ({ start_line, end_line }, 0-based inclusive)
 -- narrows by line. Reads the mirror — no request is issued.
@@ -739,8 +739,8 @@ end
 -- ----- locations → nx.picker (design principle 4: dogfood the shared engine) --
 -- A goto-family reply with >1 hit, `references`, and document/workspace symbols
 -- all resolve to a location list the server hands here. Rather than a server-owned
--- loclist, the result flows into nx.picker with the built-in "location" preview
--- (scroll + range-highlight the match), confirm jumps via nx.picker.edit. A single
+-- loclist, the result flows into `nx.picker` with the built-in `"location"` preview
+-- (scroll + range-highlight the match), confirm jumps via `nx.picker.edit`. A single
 -- goto hit never reaches here — the server jumps straight to it.
 nx.lsp._location_items = nx.lsp._location_items or {}
 
@@ -766,7 +766,7 @@ local function ensure_location_source()
   })
 end
 
--- nx.lsp._show_locations(items): open the picker over a server-resolved location
+-- `nx.lsp._show_locations(items)`: open the picker over a server-resolved location
 -- list. Each item is `{ text, path, row (1-based), col (1-based) }`. Called by the
 -- server (runtime.rs `show_lsp_locations`) when a reply carries more than one hit.
 function nx.lsp._show_locations(items)

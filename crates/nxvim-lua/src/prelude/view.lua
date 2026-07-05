@@ -22,7 +22,7 @@ nx._views = nx._views or {} -- id -> handle
 nx._view_next_id = nx._view_next_id or 0
 
 -- The view's one activation action: `<CR>` → confirm → the handle's `on_select`. It
--- fires the native bridge (nx._view_action -> Editor::apply_view_action). Navigation
+-- fires the native bridge (`nx._view_action` -> `Editor::apply_view_action`). Navigation
 -- is plain normal-mode motion on the nomodifiable view buffer, so this is the only
 -- view action.
 nx.view.actions = nx.view.actions or {}
@@ -30,7 +30,7 @@ nx.view.actions.confirm = function()
   nx._view_action("confirm")
 end
 
--- nx._install_view_keymaps(buf) — install the view's buffer-local default activation
+-- `nx._install_view_keymaps(buf)` — install the view's buffer-local default activation
 -- maps. Called by the server right after the view's backing buffer is created (the
 -- bufnr is known synchronously in core, ahead of the next-tick `nx._view_buf`
 -- mirror), so the `<CR>` → `on_select` map exists immediately. `default = true` lets a
@@ -61,7 +61,7 @@ end
 local View = {}
 View.__index = View
 
--- nx.view.create{ name?, filetype?, persist?, namespace? } -> handle. Mints the backing
+-- `nx.view.create{ name?, filetype?, persist?, namespace? }` -> handle. Mints the backing
 -- read-only buffer (off-screen until mounted) and returns the handle. `filetype` drives
 -- treesitter / decoration on the view buffer.
 --
@@ -102,7 +102,7 @@ function nx.view.create(opts)
   return self
 end
 
--- nx.view.pending_restores() -> the views a session restore reserved a slot for but that
+-- `nx.view.pending_restores()` -> the views a session restore reserved a slot for but that
 -- no plugin has adopted yet, each `{ namespace=, id=, win= }` (`win` is the reserved
 -- window). The pull primitive behind `nx.view.on_restore` and the black-box test hook.
 -- Refreshed each tick from core's `nx._view_pending` mirror.
@@ -138,7 +138,7 @@ local function dispatch_restore(e, fn)
   end
 end
 
--- nx.view.on_restore(fn[, namespace]) — register THIS plugin's restorer for persisted
+-- `nx.view.on_restore(fn[, namespace])` — register THIS plugin's restorer for persisted
 -- views, AND immediately claim any slot already reserved for it. After a session restore,
 -- core reserves a slot (a placeholder window) for every persisted view the plugin had open;
 -- each reserved slot whose owning namespace matches is dispatched to `fn(id, place)`:
@@ -171,7 +171,7 @@ function nx.view.on_restore(fn, namespace)
   return fn
 end
 
--- nx._claim_pending_restore(ns, id) — re-attempt the reserved slot for a SINGLE `(ns, id)`
+-- `nx._claim_pending_restore(ns, id)` — re-attempt the reserved slot for a SINGLE `(ns, id)`
 -- against `ns`'s registered handler. `on_restore`'s drain covers a namespace's slots at
 -- registration time, but the component framework registers one router per namespace and adds
 -- components to it incrementally: a component that mounts after the router's first drain needs
@@ -189,7 +189,7 @@ function nx._claim_pending_restore(ns, id)
   end
 end
 
--- nx._run_view_restores() — the BOOT push dispatch, run ONCE by the server after the config
+-- `nx._run_view_restores()` — the BOOT push dispatch, run ONCE by the server after the config
 -- and boot-sourced plugins are in place (`restore_persisted_views`), with `nx._view_pending`
 -- freshly mirrored. Delivers each reserved slot to its namespace's already-registered handler
 -- (a synchronous `init.lua` / `pack/start` plugin — an async `nx.plugins` handler registers
@@ -225,27 +225,27 @@ function nx._maybe_collapse_view_restores()
   nx.view._collapse_orphans()
 end
 
--- :set_lines(lines) — replace the view's content wholesale.
+-- `:set_lines(lines)` — replace the view's content wholesale.
 function View:set_lines(lines)
   nx.view._set_lines(self.id, lines or {})
   return self
 end
 
--- :set_userdata(list) — opaque per-line data, parallel to the lines (1-based). The
+-- `:set_userdata(list)` — opaque per-line data, parallel to the lines (1-based). The
 -- entry for the selected line is handed to `on_select`. Pure Lua state.
 function View:set_userdata(list)
   self._userdata = list or {}
   return self
 end
 
--- :on_select(fn) — `fn(line, userdata)` fires on `<CR>` / confirm, with the 1-based
+-- `:on_select(fn)` — `fn(line, userdata)` fires on `<CR>` / confirm, with the 1-based
 -- cursor line and that line's userdata entry. Pure Lua state.
 function View:on_select(fn)
   self._on_select = fn
   return self
 end
 
--- :on_close(fn) — `fn()` fires when the USER closes the view's window (`:q` / `:close` /
+-- `:on_close(fn)` — `fn()` fires when the USER closes the view's window (`:q` / `:close` /
 -- `<C-w>c` on the view buffer), letting the owner tear down a group of related views
 -- (e.g. close every diff pane when one is `:q`'d). It does NOT fire on a programmatic
 -- `:unmount()` / `:close()` — only the user close path records it — so the handler can
@@ -255,19 +255,19 @@ function View:on_close(fn)
   return self
 end
 
--- :bufnr() — the backing buffer number (from the mirror), or nil before the view's
+-- `:bufnr()` — the backing buffer number (from the mirror), or nil before the view's
 -- buffer exists (i.e. before the create op has drained). The target for extmarks.
 function View:bufnr()
   return nx._view_buf and nx._view_buf[self.id]
 end
 
--- :winid() — the window currently showing the view (from the mirror), or nil while the
+-- `:winid()` — the window currently showing the view (from the mirror), or nil while the
 -- view is unmounted. The target for window-local options (`vim.wo[winid]`).
 function View:winid()
   return nx._view_win and nx._view_win[self.id]
 end
 
--- :set_decor(ns, marks) — replace namespace `ns`'s decoration on the view buffer
+-- `:set_decor(ns, marks)` — replace namespace `ns`'s decoration on the view buffer
 -- with `marks`. Each mark is `{ line, col, <extmark opts> }` (0-based `line`/`col`,
 -- then any `nvim_buf_set_extmark` opt: `hl_group`, `end_col`, `virt_text`,
 -- `sign_text`, `priority`, …). A no-op (warned) before the buffer exists.
@@ -297,22 +297,22 @@ local FLOAT_ANCHOR = { NW = true, NE = true, SW = true, SE = true }
 local FLOAT_BORDER =
   { none = true, single = true, double = true, rounded = true, solid = true, shadow = true }
 
--- :mount(opts) — show the view. `opts.dock = "left"|"right"|"top"|"bottom"` mounts it in
+-- `:mount(opts)` — show the view. `opts.dock = "left"|"right"|"top"|"bottom"` mounts it in
 -- that dock (`opts.size` columns/rows); `opts.tab = true` mounts it as the sole window of
 -- a fresh tab page (no split — the view fills the tab; closing it closes the tab);
 -- `opts.split = "vsplit"|"split"` mounts it in a split of the main editor area;
 -- `opts.float = { … }` mounts it in a floating window. Mounting focuses the view.
 --
 -- The float table takes `width` / `height` (inner size; required) — cells (a
--- number) or a viewport fraction ("50vw" / "30vh" / "50%"), which reflows on
--- resize — `relative` ("editor"|"win"|"cursor", default "editor"), and either the
--- high-level `align` ("top-left"|"top"|"top-right"|"left"|"center"|"right"|
--- "bottom-left"|"bottom"|"bottom-right") + `margin` (a gap from the edges: a number
+-- number) or a viewport fraction (`"50vw"` / `"30vh"` / `"50%"`), which reflows on
+-- resize — `relative` (`"editor"`|`"win"`|`"cursor"`, default `"editor"`), and either the
+-- high-level `align` (`"top-left"`|`"top"`|`"top-right"`|`"left"`|`"center"`|`"right"`|
+-- `"bottom-left"`|`"bottom"`|`"bottom-right"`) + `margin` (a gap from the edges: a number
 -- — the vertical gap, the horizontal sides getting 2x to look even since cells are
 -- ~2x taller than wide — or an explicit {vertical, horizontal} / {top, right,
 -- bottom, left} / {top=, …}), or the
--- low-level `anchor` ("NW"|"NE"|"SW"|"SE", default "NW") + `row` / `col` (offset,
--- default 0). Plus `border` (default "rounded"), `title`, `zindex`, `focusable`, and
+-- low-level `anchor` (`"NW"`|`"NE"`|`"SW"`|`"SE"`, default `"NW"`) + `row` / `col` (offset,
+-- default 0). Plus `border` (default `"rounded"`), `title`, `zindex`, `focusable`, and
 -- `grab`. `grab` (default true) hard-locks focus to the float
 -- like the bottom panel — `<C-w>` can't leave it and unmount restores the prior window —
 -- which is what a modal dialog (a checkbox list, a confirm) wants; pass `grab = false` for
@@ -375,7 +375,7 @@ function View:mount(opts)
   return self
 end
 
--- :place_in(win) — adopt the reserved restore slot `win` for this view: retarget that
+-- `:place_in(win)` — adopt the reserved restore slot `win` for this view: retarget that
 -- placeholder window (minted by a session restore for a persisted view) to this view's
 -- backing buffer, instead of opening a fresh window like `:mount`. This is what the `place`
 -- argument handed to an `nx.view.on_restore` handler calls
@@ -385,32 +385,32 @@ function View:place_in(win)
   return self
 end
 
--- :unmount() — remove the view from view, keeping it (and its content) alive for a
--- later :mount.
+-- `:unmount()` — remove the view from view, keeping it (and its content) alive for a
+-- later `:mount`.
 function View:unmount()
   nx.view._unmount(self.id)
   return self
 end
 
--- :focus() — move focus to the window showing the view.
+-- `:focus()` — move focus to the window showing the view.
 function View:focus()
   nx.view._focus(self.id)
   return self
 end
 
--- :line() — the view's 1-based cursor line (from the mirror), valid while the view
+-- `:line()` — the view's 1-based cursor line (from the mirror), valid while the view
 -- is focused. nil before the buffer exists.
 function View:line()
   return nx._view_line and nx._view_line[self.id]
 end
 
--- :cursor() — the view's cursor as `(line, col)`. `col` is always 0 in v1 (a view's
+-- `:cursor()` — the view's cursor as `(line, col)`. `col` is always 0 in v1 (a view's
 -- cursor rests at column 0); the line is `:line()`.
 function View:cursor()
   return self:line(), 0
 end
 
--- :set_cursor(line) — focus the view and move its cursor to 1-based `line` (clamped
+-- `:set_cursor(line)` — focus the view and move its cursor to 1-based `line` (clamped
 -- to the content; column 0). The reveal / find-file primitive — the one sanctioned
 -- cursor write; ordinary navigation is plain normal-mode motion.
 function View:set_cursor(line)
@@ -418,20 +418,20 @@ function View:set_cursor(line)
   return self
 end
 
--- :redraw() — request a repaint. The editor already repaints at the end of every
+-- `:redraw()` — request a repaint. The editor already repaints at the end of every
 -- input batch / drained chunk, so this is a no-op kept for API completeness (and so
 -- a plugin can express intent at the call site).
 function View:redraw()
   return self
 end
 
--- :close() — unmount the view and drop its backing buffer and registry entry.
+-- `:close()` — unmount the view and drop its backing buffer and registry entry.
 function View:close()
   nx.view._destroy(self.id)
   nx._views[self.id] = nil
 end
 
--- nx._view_select(id, line) — dispatch a `<CR>`/confirm on view `id` to its handle's
+-- `nx._view_select(id, line)` — dispatch a `<CR>`/confirm on view `id` to its handle's
 -- `on_select(line, userdata[line])`. Called from the server after the core records
 -- the select. A no-op when the view has no handler.
 function nx._view_select(id, line)
@@ -443,7 +443,7 @@ function nx._view_select(id, line)
   v._on_select(line, ud)
 end
 
--- nx._view_closed(id) — dispatch a USER window-close on view `id` to its handle's
+-- `nx._view_closed(id)` — dispatch a USER window-close on view `id` to its handle's
 -- `on_close()`. Called from the server when the user `:q`s / `:close`s a view window. A
 -- no-op when the view is gone or has no handler.
 function nx._view_closed(id)

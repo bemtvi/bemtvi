@@ -87,6 +87,13 @@ encoding_rs = "=0.8.35"
 # query/body strings; `percent-encoding` does single-component `encodeURIComponent`.
 form_urlencoded = "=1.2.2"
 percent-encoding = "=2.3.2"
+# CommonMark + GFM parser backing the markdown renderer for read-only doc popups
+# (LSP hover / completion docs / picker preview): a pull parser that emits an event
+# stream `nxvim_core::markdown` walks into stripped display lines + highlight spans.
+# `default-features = false` drops its `html`/`getopts` bits — we only want the
+# parser. Pure Rust, no C, no async/IO ⇒ lives inside the synchronous `nxvim-core`
+# and compiles under emscripten for the wasm edit-host.
+pulldown-cmark = { version = "=0.13.4", default-features = false }
 crossterm = { version = "=0.29.0", features = ["event-stream"] }
 ratatui = "=0.30.1"
 # In-terminal image rendering for the TUI client's `'imagepreview'` (Phase 2): a

@@ -330,33 +330,34 @@ async fn cr_accepts_selection_then_executes() {
 
 // ---- Phase 3: docs preview sidebar -------------------------------------------------
 
-/// The menu's `docs` sub-map lines, or `None` when no docs float is projected.
+/// The `[CmdlineDocs]` doc-float **window** map from a redraw, or `None`. The wildmenu
+/// docs are a real float window now (not a `menu.docs` overlay), read out of `windows[]`
+/// by the scratch buffer's name.
+fn cmdline_docs_window(map: &[(Value, Value)]) -> Option<Vec<(Value, Value)>> {
+    let Some(Value::Array(wins)) = map_get(map, "windows") else {
+        return None;
+    };
+    wins.iter().find_map(|w| match w {
+        Value::Map(wm)
+            if map_get(wm, "file_name").and_then(Value::as_str) == Some("[CmdlineDocs]") =>
+        {
+            Some(wm.clone())
+        }
+        _ => None,
+    })
+}
+
+/// The wildmenu docs float's plain-text lines, or `None` when no docs float is open.
 fn menu_docs(map: &[(Value, Value)]) -> Option<Vec<String>> {
-    let Some(Value::Map(menu)) = map_get(map, "menu") else {
-        return None;
-    };
-    let Some(Value::Map(docs)) = map_get(menu, "docs") else {
-        return None;
-    };
-    match map_get(docs, "lines") {
+    let win = cmdline_docs_window(map)?;
+    match map_get(&win, "lines") {
         Some(Value::Array(lines)) => Some(
             lines
                 .iter()
-                .map(|l| match l {
-                    // Each docs line is a chunk run `[[text, hl], …]`; join the texts.
-                    Value::Array(chunks) => chunks
-                        .iter()
-                        .filter_map(|c| match c {
-                            Value::Array(c) => c.first().and_then(Value::as_str),
-                            _ => None,
-                        })
-                        .collect::<String>(),
-                    Value::String(s) => s.as_str().unwrap_or("").to_string(),
-                    other => panic!("unexpected docs line {other:?}"),
-                })
+                .map(|l| l.as_str().unwrap_or("").to_string())
                 .collect(),
         ),
-        other => panic!("expected docs lines array, got {other:?}"),
+        other => panic!("expected docs window lines array, got {other:?}"),
     }
 }
 
@@ -369,7 +370,12 @@ async fn docs_pane_shows_selected_command() {
     feed(&rpc, ":ed<Tab>");
     poll_menu(&rpc, &mut incoming).await.expect("menu");
     feed(&rpc, "<Tab>");
-    let map = wait_redraw(&mut incoming, |m| menu_sel_is(m, 0, true)).await;
+    // The docs float opens in the same settle that activates the selection, so wait for
+    // a frame carrying both the selection and the `[CmdlineDocs]` window.
+    let map = wait_redraw(&mut incoming, |m| {
+        menu_sel_is(m, 0, true) && cmdline_docs_window(m).is_some()
+    })
+    .await;
     assert_eq!(menu_items(&map)[0], "edit", "items: {:?}", menu_items(&map));
 
     let docs = menu_docs(&map).expect("a docs float beside the selected row");
@@ -557,15 +563,16 @@ async fn plugin_command_usage_heads_the_docs_like_a_builtin() {
     );
 }
 
-/// The `width` of the menu's docs float (its content column count), or 0 if absent.
+/// The content width of the wildmenu docs float (its window rect width minus the two
+/// border cells), or 0 if absent.
 fn menu_docs_width(map: &[(Value, Value)]) -> usize {
-    let Some(Value::Map(menu)) = map_get(map, "menu") else {
+    let Some(win) = cmdline_docs_window(map) else {
         return 0;
     };
-    let Some(Value::Map(docs)) = map_get(menu, "docs") else {
+    let Some(Value::Map(r)) = map_get(&win, "rect") else {
         return 0;
     };
-    map_get(docs, "width").and_then(Value::as_u64).unwrap_or(0) as usize
+    (map_get(r, "width").and_then(Value::as_u64).unwrap_or(0) as usize).saturating_sub(2)
 }
 
 #[tokio::test]

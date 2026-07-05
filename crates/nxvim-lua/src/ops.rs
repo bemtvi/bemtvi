@@ -1588,6 +1588,9 @@ pub struct CompleteSetupReq {
     /// rendered server-side from the `lsp` source's cache + `completionItem/resolve`).
     /// On by default; a `buffer`-only config simply never has docs to show. Phase 4-D.
     pub docs: bool,
+    /// Wrap a doc line wider than the docs float within the float (default on) rather
+    /// than truncating at its edge — sets the docs-float window's `wrap` option.
+    pub docs_wrap: bool,
     /// The union of every active source's **trigger chars** as a plain string (each
     /// char is one trigger), e.g. `":"` for an emoji source's `trigger = { chars = {
     /// ":" } }`. The server splits it into the engine's `trigger_chars`. Empty when no

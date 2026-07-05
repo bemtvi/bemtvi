@@ -2343,67 +2343,9 @@
         gridEl.appendChild(pre);
       }
 
-      // The docs sidebar (cmdline-completion Phase 3 / insert-completion docs): a
-      // separate bordered float beside the box with the highlighted row's docs. The
-      // server placed it (right of the box, flipping left for room) and bottom-aligned
-      // it. Its geometry is WINDOWS-AREA-absolute (already baking in the focused
-      // window rect + gutter, see `project_complete_docs`), so the client offsets it
-      // by the windows-area origin — the region origin `o`, which carries any dock
-      // band — exactly like the popup box. Adding `rect.x`/gutter again would
-      // double-count and slide the sidebar off under a left dock. The cmdline wildmenu
-      // is the exception: its `col` is a GLOBAL command-line column (the line spans the
-      // full width), so it keeps the command-line frame (`rect.x` + tabline rows).
-      if (menu.docs) {
-        const d = menu.docs;
-        // The docs float themes from its own groups (`CmpDocumentation` /
-        // `CmpDocumentationBorder`, resolved server-side), falling back to the
-        // built-in `.pmenu-doc` CSS when the colorscheme leaves them undefined.
-        const sDoc = mst("doc"), sDocBorder = mst("doc_border");
-        const docBg = sDoc && cssColor(sDoc.bg), docFg = sDoc && cssColor(sDoc.fg);
-        const docBorderCss = sDocBorder && cssColor(sDocBorder.fg);
-        const docBaseX = menu.cmdline ? rect.x : o.x;
-        const docBaseY = menu.cmdline ? tablineRows + rect.y : o.y;
-        const { cx: dcx, cy: dcy } = popupChrome(
-          docBaseX + d.col, docBaseY + d.row + cmdShift, d.width, d.height,
-          { bg: docBg || undefined, borderColor: docBorderCss || undefined });
-        const docBox = document.createElement("div");
-        docBox.className = "pmenu-doc";
-        if (docBg) docBox.style.background = docBg;
-        if (docFg) docBox.style.color = docFg;
-        place(docBox, dcx, dcy, d.width, d.height);
-        // Highlight the docs' ```lang fences client-side: the wasm build ships no spans
-        // for floats, so a completion item's signature (basedpyright sends it fenced as
-        // ```python … ```) would otherwise render as plain text. Reuse the same fence-
-        // based substitute the hover doc-float and markdown previews use — parse each
-        // fenced block with its own grammar and colour those chars; prose stays plain.
-        let docColors = null;
-        if (!serverStyled && ts && ts.isReady()) {
-          const sp = ts.spansForFencedMarkdown(d.lines.join("\n"));
-          if (sp) docColors = d.lines.map((ln, i) => ts.colorsForLine(sp[i] || [], String(ln ?? "").length));
-        }
-        for (let i = 0; i < d.lines.length; i++) {
-          const rowEl = document.createElement("div");
-          rowEl.className = "row";
-          rowEl.style.width = d.width * cw + "px";
-          const colors = docColors && docColors[i];
-          const chars = [...String(d.lines[i] ?? "")].slice(0, d.width);
-          chars.forEach((chr, ci) => {
-            const c = colors && colors[ci];
-            if (c) {
-              const sp = document.createElement("span");
-              sp.setAttribute("style", `color:${c};`);
-              sp.textContent = chr;
-              rowEl.appendChild(sp);
-            } else {
-              rowEl.appendChild(document.createTextNode(chr));
-            }
-          });
-          const pad = d.width - chars.length;
-          if (pad > 0) rowEl.appendChild(document.createTextNode(" ".repeat(pad)));
-          docBox.appendChild(rowEl);
-        }
-        gridEl.appendChild(docBox);
-      }
+      // (The completion / cmdline **docs** are no longer a `menu.docs` overlay — they
+      // render as real doc-float windows through the normal window path, so there is
+      // nothing to draw here.)
     }
 
     // A synthesized status line (the wasm build emits no %-format statusline segments

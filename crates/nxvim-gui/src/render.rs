@@ -2656,69 +2656,9 @@ impl Renderer {
             }
         }
 
-        // The docs sidebar: a separate fully-bordered float beside the popup — the
-        // selected `lsp` row's documentation for an insert-completion popup (Phase
-        // 4-D), or the highlighted command's synopsis + help for the cmdline wildmenu
-        // (Phase 3), dimmed like a hover. The server placed it (right of the box,
-        // flipping left for room); `col` is the inner content column, so the box is
-        // drawn one cell left of it (its left border lands flush against the popup's
-        // right border). For an ordinary menu `row`/`col` are window-text-area
-        // absolute (`wy`/`text_x0` base); the cmdline wildmenu is drawn growing up
-        // from `cmd_row` (box top `by`, gutter-free `origin.0` columns), so rebase the
-        // float onto the box: its frame top is `by + (docs.row − menu.row)`.
-        if let Some(docs) = &menu.docs {
-            let (dbx, dby) = if menu.cmdline {
-                (
-                    (origin.0 + docs.col).saturating_sub(1),
-                    (by + docs.row).saturating_sub(menu.row),
-                )
-            } else if docs.editor_relative {
-                // The insert-completion sidebar floats over the focused window's whole
-                // REGION: its `col`/`row` are region-relative (a split can't squeeze it
-                // into the focused pane), so anchor it at that region's origin — which
-                // carries any dock band — not the bare grid origin. Otherwise a left/top
-                // dock slides the docs off the menu, overlapping and mixing with the list.
-                (origin.0 + docs.col.saturating_sub(1), origin.1 + docs.row)
-            } else {
-                ((text_x0 + docs.col).saturating_sub(1), wy + docs.row)
-            };
-            // The docs float carries its own groups (`CmpDocumentation` /
-            // `CmpDocumentationBorder`, resolved server-side), falling back to the
-            // popup's bg / fg / border when the colorscheme leaves them undefined.
-            let doc_bg = style_bg(&menu.styles.doc).unwrap_or(popup_bg);
-            let doc_fg = style_fg(&menu.styles.doc).unwrap_or(fg);
-            let doc_border = style_fg(&menu.styles.doc_border).unwrap_or(border);
-            let (dbw, dbh) = (docs.width + 2, docs.height + 2);
-            self.fill_rect(quads, dbx, dby, dbw, dbh, doc_bg);
-            self.draw_glyph_border(
-                items,
-                Border::Single,
-                None,
-                dbx,
-                dby,
-                dbw,
-                dbh,
-                true,
-                true,
-                doc_fg,
-                doc_border,
-                false,
-            );
-            let (dcx, dcy) = (dbx + 1, dby + 1);
-            for (i, line) in docs.lines.iter().enumerate() {
-                if i as u16 >= docs.height {
-                    break;
-                }
-                let text = pmenu_row(line, "", docs.width as usize);
-                self.push_plain(
-                    items,
-                    &text,
-                    self.cell_px(dcx, dcy + i as u16),
-                    doc_fg,
-                    full,
-                );
-            }
-        }
+        // (The completion / cmdline **docs** are no longer a `menu.docs` overlay — they
+        // render as real doc-float windows through the normal window path, so there is
+        // nothing to draw here.)
     }
 
     /// Build the list-less content float (`nx.ui.float`; LSP hover / signature

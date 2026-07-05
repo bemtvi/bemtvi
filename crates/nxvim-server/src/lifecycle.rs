@@ -312,7 +312,17 @@ impl EditHost {
         let buf = self.editor.current_buffer_id();
         let mode = self.editor.mode;
         let cur_win = self.editor.current_window_id();
-        let wins = self.editor.window_ids();
+        // Internal doc-float windows (hover / signature / completion / cmdline docs) are
+        // UI surfaces, not user windows: exclude them so opening / replacing / moving one
+        // (the completion docs float refreshes every keystroke) fires no user
+        // `WinNew`/`WinClosed` autocmds — the window twin of the doc-float *buffer* being
+        // kept out of `:ls`.
+        let wins: Vec<WindowId> = self
+            .editor
+            .window_ids()
+            .into_iter()
+            .filter(|w| !self.editor.is_doc_float_window(*w))
+            .collect();
 
         // A buffer with an open still pending (a deferred `:edit` — every local open now
         // defers behind the explorer's `BufReadCmd` handler, and an off-tick open always
@@ -1056,6 +1066,7 @@ impl EditHost {
         self.editor
             .window_ids()
             .into_iter()
+            .filter(|w| !self.editor.is_doc_float_window(*w))
             .map(|w| (w, self.editor.window_rect(w).unwrap_or_default()))
             .collect()
     }
@@ -1066,6 +1077,7 @@ impl EditHost {
         self.editor
             .window_ids()
             .into_iter()
+            .filter(|w| !self.editor.is_doc_float_window(*w))
             .map(|w| {
                 let (top, left) = self.editor.window_scroll(w).unwrap_or((0, 0));
                 (w, top, left)

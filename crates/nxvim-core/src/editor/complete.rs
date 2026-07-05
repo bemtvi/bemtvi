@@ -110,6 +110,11 @@ pub struct CompleteConfig {
     /// from its LSP item cache (`completionItem/resolve` for lazy docs). On by
     /// default; a `buffer`-only config simply never has docs to show.
     pub docs: bool,
+    /// Wrap a doc line wider than the docs float within the float (default on) rather
+    /// than truncating it at the right edge. Sets the docs-float window's `wrap`
+    /// option; height still clamps and the wheel scrolls vertically. Off ⇒ long lines
+    /// truncate at the float's edge.
+    pub docs_wrap: bool,
     /// The union of every configured source's **trigger chars** (`nx.complete.source
     /// { trigger = { chars = { ":" } } }`, Phase 4-E). When the char immediately left
     /// of the word being completed is one of these, the engine folds it into the
@@ -131,6 +136,7 @@ impl Default for CompleteConfig {
             has_async: false,
             buffer_priority: 0,
             docs: true,
+            docs_wrap: true,
             trigger_chars: Vec::new(),
         }
     }
@@ -173,6 +179,18 @@ impl Editor {
     /// any key notation into [`Key`]s).
     pub fn configure_complete(&mut self, config: CompleteConfig) {
         self.complete_config = config;
+    }
+
+    /// Whether the docs float should wrap a doc line wider than its width (the
+    /// configured `docs_wrap`, default on) rather than truncating at the edge.
+    pub fn complete_docs_wrap(&self) -> bool {
+        self.complete_config.docs_wrap
+    }
+
+    /// Whether the completion docs float is enabled (`nx.complete.setup{ docs = … }`,
+    /// on by default). Off ⇒ the server never opens a docs float beside the popup.
+    pub fn complete_docs_enabled(&self) -> bool {
+        self.complete_config.docs
     }
 
     /// Classify `key` against the configured control keys, when a completion menu

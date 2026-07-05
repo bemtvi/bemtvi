@@ -6,10 +6,12 @@
 --       cargo run -p nxvim -- examples/ui-complete-lsp/sample.lua
 --
 -- This is the completion engine (docs/specs/2026-06-14-nx-ui-float-widget.md,
--- Phase 4) driving the built-in **`lsp`** source, with the **docs sidebar** beside
--- the popup. As you navigate the completion list, a float to the right (flipping
--- left when there's no room) shows the selected item's signature (`detail`) and
--- documentation. Many servers — lua_ls and rust_analyzer especially — send docs
+-- Phase 4) driving the built-in **`lsp`** source, with the **docs float** beside the
+-- popup — a real, non-focusable float window (the same model LSP hover uses), so the
+-- docs are syntax-highlighted (the signature is fenced in the buffer's language) and
+-- scroll with the mouse wheel. As you navigate the list, the float to the right
+-- (flipping left when there's no room) shows the selected item's signature (`detail`)
+-- and documentation. Many servers — lua_ls and rust_analyzer especially — send docs
 -- only on demand, so nxvim issues `completionItem/resolve` for the highlighted row
 -- and renders the reply **server-side** (no Lua at frame time, ADR 0002 rule 4).
 --
@@ -30,12 +32,14 @@ vim.g.mapleader = "\\"
 --------------------------------------------------------------------------------
 -- Enable completion with the `lsp` source first (priority 100, above `buffer`),
 -- and the native `buffer` word-scan as a fallback. `docs = true` is the default —
--- the sidebar only renders for `lsp` rows that carry documentation, so a buffer
--- word simply shows none. Set `docs = false` to turn the sidebar off.
+-- the docs float only renders for `lsp` rows that carry documentation, so a buffer
+-- word simply shows none. Set `docs = false` to turn it off. `docs_wrap` (default
+-- true) wraps a long doc line within the float instead of truncating it.
 nx.complete.setup {
   sources = { { "lsp" }, { "buffer", min_chars = 2 } },
   min_chars = 1,
-  -- docs = false,  -- uncomment to hide the docs sidebar
+  -- docs = false,       -- uncomment to hide the docs float
+  -- docs_wrap = false,  -- uncomment to truncate long doc lines instead of wrapping
 }
 
 --------------------------------------------------------------------------------

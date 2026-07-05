@@ -8,10 +8,10 @@
 //! back (`MenuItem.source_accept`).
 //!
 //! This replaces the retired bespoke completion pmenu. The docs-beside-popup the old
-//! `pmenu_value` projected is back as the unified **docs sidebar** (Phase 4-D): the
-//! selected `lsp` row's `detail` + `documentation`, lazily fetched via
-//! `completionItem/resolve` (`complete_lsp_maybe_resolve` / `on_completion_resolve_reply`)
-//! and rendered server-side beside the popup (`EditHost::project_complete_docs`).
+//! `pmenu_value` projected is back as a **doc-float window** (Phase 4-D): the selected
+//! `lsp` row's `detail` + `documentation`, lazily fetched via `completionItem/resolve`
+//! (`complete_lsp_maybe_resolve` / `on_completion_resolve_reply`), built into markdown by
+//! `EditHost::lsp_complete_docs_md` and rendered by `Editor::open_completion_docs_float`.
 
 use nxvim_core::{BufferId, Mode};
 use nxvim_lsp::{CompletionItemData, PositionEncoding};
@@ -372,32 +372,38 @@ impl EditHost {
     }
 }
 
-/// Reduce a completion item's `detail` + `documentation` to the plain display lines
-/// the docs sidebar renders (Phase 4-D): `detail` first (a one-line signature), a
-/// blank separator, then the `documentation` body — each split on its own newlines,
-/// trailing blanks trimmed. Both are already plain text (the LSP layer distilled any
-/// markdown to lines, exactly like hover). Empty when the item carries neither, which
-/// suppresses the sidebar (no empty float).
-pub(crate) fn complete_doc_lines(item: &CompletionItemData) -> Vec<String> {
-    let mut out: Vec<String> = Vec::new();
-    if let Some(detail) = item
-        .detail
-        .as_deref()
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-    {
-        out.extend(detail.lines().map(str::to_string));
-    }
-    if let Some(doc) = item
-        .documentation
-        .as_deref()
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-    {
-        if !out.is_empty() {
-            out.push(String::new()); // a blank line between the signature and the body
+impl EditHost {
+    /// Build the **markdown** the completion docs float renders for an `lsp` row
+    /// (Phase 4-D, now the doc-float-window model): the item's `detail` — a one-line
+    /// code signature — as a fenced code block in the *current buffer's* language, then
+    /// a blank line and the `documentation` body (already markdown). Fencing the
+    /// signature is what buys it syntax highlighting in the float for free (the win over
+    /// the old text-only sidebar); the float's markdown renderer highlights each fenced
+    /// block in its own language (fail-soft when the grammar is absent). `None` when the
+    /// item carries neither, which closes the float rather than showing an empty box.
+    pub(crate) fn lsp_complete_docs_md(&self, item: &CompletionItemData) -> Option<String> {
+        let mut md = String::new();
+        if let Some(detail) = item
+            .detail
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            let ft = self
+                .editor
+                .buffer_filetype(self.editor.current_buffer_id())
+                .unwrap_or_default();
+            md.push_str(&format!("```{ft}\n{detail}\n```\n\n"));
         }
-        out.extend(doc.lines().map(str::to_string));
+        if let Some(doc) = item
+            .documentation
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            md.push_str(doc);
+        }
+        let md = md.trim_end();
+        (!md.is_empty()).then(|| md.to_string())
     }
-    out
 }

@@ -13,6 +13,41 @@
 use super::*;
 use crate::input::{MouseAction, MouseButton, MouseEvent, MouseKind, WheelDir};
 
+/// Place a docs sidebar of `content_w` columns beside a popup box whose content
+/// starts at `box_col` and is `box_width` wide, within a `bound_w`-column area.
+/// Prefers the right of the box, flipping left when that side has more room, and
+/// returns `(docs_col, docs_w)` — the float's **content** top-left column and its
+/// width, in the bound area's own (region) cells. `None` when neither side fits a
+/// readable width, so the caller shows no sidebar rather than a one-column sliver.
+fn place_docs_beside(
+    box_col: usize,
+    box_width: usize,
+    content_w: usize,
+    bound_w: usize,
+) -> Option<(usize, usize)> {
+    /// Below this, a sidebar is a useless sliver — better none than a 1-col float.
+    const MIN_DOCS_W: usize = 10;
+    // Right of the box: its content spans `[box_col, box_col+box_width)`; the box's
+    // right border sits at `box_col+box_width` and the docs float's own left border one
+    // cell past it → content at `+2`. A trailing 1-col margin keeps it off the bound's
+    // right edge. Left of the box: the docs float's right border one cell left of the
+    // box's left border, so its content ends at `box_col-3`, starting from the bound's left.
+    let right_start = box_col + box_width + 2;
+    let right_avail = bound_w
+        .saturating_sub(right_start)
+        .saturating_sub(1)
+        .min(content_w);
+    let left_avail = box_col.saturating_sub(3).min(content_w);
+    let (docs_col, docs_w) = if right_avail >= left_avail {
+        (right_start, right_avail)
+    } else {
+        (box_col.saturating_sub(2 + left_avail), left_avail)
+    };
+    // A naturally short doc (already narrower than the minimum) is exempt — it's as
+    // wide as it gets, so accept it; otherwise demand a readable width.
+    (docs_w >= MIN_DOCS_W.min(content_w)).then_some((docs_col, docs_w))
+}
+
 /// In-flight left-button selection: the multi-click counter (vim's
 /// `check_multiclick` — a same-cell repeat within `'mousetime'` escalates the
 /// selected unit) plus the anchor a drag extends from. One value spans a whole
@@ -231,31 +266,6 @@ struct MenuScreen {
     inverted: bool,
 }
 
-/// The completion **docs sidebar**'s on-screen box (global cells) plus the selected
-/// row's total doc-line count and the visible height — stashed by the server each
-/// redraw ([`Editor::stash_complete_docs_hit`]) so the core can hit-test a wheel
-/// over the docs float and bound its scroll. Unlike the menu box (recomputed from
-/// [`Editor::menu_geom`]) the docs geometry is *content-derived* and the content is
-/// server-owned (the LSP item cache / `resolve` / a plugin's inline doc), so it
-/// can't be recomputed here — the server feeds it back.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct CompleteDocsHit {
-    /// Outer box `(x, y, w, h)` in global screen cells (border included).
-    pub x: usize,
-    pub y: usize,
-    pub w: usize,
-    pub h: usize,
-    /// Total lines in the selected row's docs (the scroll's upper bound).
-    pub total: usize,
-    /// Visible doc rows (the windowed height); the scroll max is `total - view_h`.
-    pub view_h: usize,
-    /// The widest doc line, in columns — the horizontal scroll's upper bound.
-    pub max_w: usize,
-    /// Visible doc columns (the windowed content width); the horizontal scroll max is
-    /// `max_w - view_w`.
-    pub view_w: usize,
-}
-
 /// Which `%`-format-rendered chrome row a [`StatuslineClick`] landed on — it tells
 /// the server which format to re-run and at what width when resolving the click's
 /// column to a [`ClickAction`](crate::statusline::ClickAction).
@@ -341,20 +351,22 @@ impl Editor {
             (MouseButton::Left, MouseAction::Press)
                 if self.completion_active()
                     && (self.menu_hit(ev.row, ev.col).is_some()
-                        || self.complete_docs_hit_at(ev.row, ev.col)) =>
+                        || self.doc_float_at(ev.row, ev.col)) =>
             {
+                // A press on the docs float (a real window now) is a no-op —
+                // `mouse_complete_press` acts only on a menu-box row hit.
                 self.mouse_complete_press(ev.row, ev.col)
             }
+            // A wheel over the popup **box** moves the highlight one row; a wheel over
+            // the docs float beside it falls through to the native window-scroll path
+            // (`mouse_queue_wheel`), since the docs float is now a real scrollable window.
             (
                 MouseButton::Wheel,
                 MouseAction::WheelUp
                 | MouseAction::WheelDown
                 | MouseAction::WheelLeft
                 | MouseAction::WheelRight,
-            ) if self.completion_active()
-                && (self.menu_hit(ev.row, ev.col).is_some()
-                    || self.complete_docs_hit_at(ev.row, ev.col)) =>
-            {
+            ) if self.completion_active() && self.menu_hit(ev.row, ev.col).is_some() => {
                 let (positive, horizontal) = Self::wheel_axis(&ev);
                 self.mouse_complete_wheel(positive, horizontal, ev.row, ev.col)
             }
@@ -518,16 +530,19 @@ impl Editor {
         if !matches!(ev.action, MouseAction::Press) && !is_wheel {
             return;
         }
-        // A wheel scrolling a doc float keeps it open (and scrolls only it).
+        // A wheel scrolling a doc float keeps it open (and scrolls only it). Otherwise
+        // dismiss the *transient* doc floats (hover) but keep the ones owned by a live
+        // widget — the signature session and, crucially here, the completion docs float
+        // while its popup is open (so a wheel over the text doesn't wipe it).
         if !(is_wheel && self.doc_float_at(ev.row, ev.col)) {
-            self.close_all_doc_floats();
+            self.close_transient_doc_floats();
         }
         // The completion popup closes when the gesture lands away from it — over the
-        // text, not on the popup box or its docs sidebar (those have their own
+        // text, not on the popup box or its docs float (those have their own
         // wheel/click handlers and don't disrupt the cursor anchor).
         if self.completion_active()
             && self.menu_hit(ev.row, ev.col).is_none()
-            && !self.complete_docs_hit_at(ev.row, ev.col)
+            && !self.doc_float_at(ev.row, ev.col)
         {
             self.close_completion();
         }
@@ -1672,88 +1687,13 @@ impl Editor {
         }
     }
 
-    /// Stash the completion **docs sidebar**'s on-screen box (server-computed each
-    /// redraw, `None` when no sidebar shows) so a later wheel can hit-test it. Clamps
-    /// the scroll offset to the new content (a shorter doc can't stay scrolled past
-    /// its end). The geometry is server-fed because the docs content — and so its
-    /// size — is server-owned (LSP cache / `resolve` / a plugin's inline doc).
-    pub fn stash_complete_docs_hit(&mut self, hit: Option<CompleteDocsHit>) {
-        self.complete_docs_hit = hit;
-        let max = hit.map_or(0, |h| h.total.saturating_sub(h.view_h));
-        self.complete_docs_scroll = self.complete_docs_scroll.min(max);
-        let max_h = hit.map_or(0, |h| h.max_w.saturating_sub(h.view_w));
-        self.complete_docs_hscroll = self.complete_docs_hscroll.min(max_h);
-    }
-
-    /// The completion docs sidebar's first-visible-line offset — the server windows
-    /// the doc lines from here when projecting the sidebar.
-    pub fn complete_docs_scroll(&self) -> usize {
-        self.complete_docs_scroll
-    }
-
-    /// The docs sidebar's first-visible-**column** offset — the server slices each
-    /// projected doc line from here so a wide doc can be read past the pane's edge.
-    pub fn complete_docs_hscroll(&self) -> usize {
-        self.complete_docs_hscroll
-    }
-
-    /// Whether `(row, col)` lands on the stashed completion **docs sidebar** box.
-    /// Gated on a live completion menu so a stale stash (the menu closed since the
-    /// last redraw) can never fire.
-    fn complete_docs_hit_at(&self, row: usize, col: usize) -> bool {
-        self.completion_active()
-            && self
-                .complete_docs_hit
-                .is_some_and(|h| rect_contains(h.x, h.y, h.w, h.h, col, row))
-    }
-
-    /// Scroll the completion docs sidebar one line, non-wrapping (a wheel is a
-    /// scrollbar, not a wrap), bounded by the stashed content height. The server
-    /// windows the doc lines from [`Editor::complete_docs_scroll`] on the next redraw.
-    fn scroll_complete_docs(&mut self, down: bool) {
-        let max = self
-            .complete_docs_hit
-            .map_or(0, |h| h.total.saturating_sub(h.view_h));
-        self.complete_docs_scroll = if down {
-            (self.complete_docs_scroll + 1).min(max)
-        } else {
-            self.complete_docs_scroll.saturating_sub(1)
-        };
-    }
-
-    /// Scroll the completion docs sidebar horizontally by a few columns (a
-    /// `<S-ScrollWheel>` / horizontal wheel over it), bounded by the widest doc line.
-    /// The server slices the projected lines from [`Editor::complete_docs_hscroll`].
-    fn scroll_complete_docs_h(&mut self, right: bool) {
-        /// Columns per horizontal wheel notch — vim's default `'mousescroll'` hor step.
-        const HSTEP: usize = 6;
-        let max = self
-            .complete_docs_hit
-            .map_or(0, |h| h.max_w.saturating_sub(h.view_w));
-        self.complete_docs_hscroll = if right {
-            (self.complete_docs_hscroll + HSTEP).min(max)
-        } else {
-            self.complete_docs_hscroll.saturating_sub(HSTEP)
-        };
-    }
-
-    /// A wheel notch over the completion popup moves the highlight one row,
+    /// A wheel notch over the completion popup box moves the highlight one row,
     /// non-wrapping (like dragging a scrollbar — it stops at the ends, unlike
-    /// `<C-n>`'s wrap). A noselect popup highlights the first row. Over the **docs
-    /// sidebar** beside the popup it scrolls the docs instead, leaving the highlight
-    /// (and so the selected row) untouched — vertically, or **horizontally** when
-    /// `horizontal` (a `<S-ScrollWheel>` / horizontal wheel) so a wide doc reads past
-    /// the pane. A horizontal notch over the *popup list* (not the docs) does nothing —
-    /// the list has no horizontal extent.
-    fn mouse_complete_wheel(&mut self, positive: bool, horizontal: bool, row: usize, col: usize) {
-        if self.complete_docs_hit_at(row, col) {
-            if horizontal {
-                self.scroll_complete_docs_h(positive);
-            } else {
-                self.scroll_complete_docs(positive);
-            }
-            return;
-        }
+    /// `<C-n>`'s wrap). A noselect popup highlights the first row. A horizontal notch
+    /// over the list does nothing — the list has no horizontal extent. (The docs float
+    /// beside the popup is a real window; a wheel over it scrolls it via the native
+    /// window mouse path, not here.)
+    fn mouse_complete_wheel(&mut self, positive: bool, horizontal: bool, _row: usize, _col: usize) {
         if horizontal {
             return;
         }
@@ -1998,6 +1938,104 @@ impl Editor {
         Some((metrics, f.id, f.number_width))
     }
 
+    /// The completion **docs float**'s placement beside the popup box: its outer
+    /// top-left `(row, col)` and inner `(width, height)`, all in the focused window's
+    /// **region cells** (its layer's tree lays out at origin `0,0`; the client offsets
+    /// by the region's screen origin) — the space a `FloatRelative::Editor` float is
+    /// positioned in, so the float lands exactly where the server-projected popup
+    /// overlay does. `content_lines` (the rendered doc lines) sizes it: widest line ×
+    /// count, each clamped so a long doc scrolls rather than filling the screen. The
+    /// float butts against the popup — its content one cell past the popup's right
+    /// border, flipping to the left when that side has more room — and top-aligns its
+    /// content with the popup's first row, so the outer box (border included) sits one
+    /// row/col out. `None` when no completion popup is open, or neither side fits a
+    /// readable width. Region math mirrors the old `redraw.rs::project_complete_docs`.
+    /// The open completion popup box's `menu_geom` col/row/width plus its window — the
+    /// content-independent part of the docs float's placement, used as the signature
+    /// that decides whether [`open_completion_docs_float`](Self::open_completion_docs_float)
+    /// can skip a redundant reopen. `None` when no completion popup is open.
+    pub(crate) fn complete_docs_box_geom(&self) -> Option<(usize, usize, usize, WindowId)> {
+        let m = self.menu_view()?;
+        if !m.completion || !matches!(m.placement, MenuPlacement::Cursor) {
+            return None;
+        }
+        let (metrics, win, _num) = self.menu_anchor()?;
+        let geom = self.menu_geom(&m, metrics);
+        Some((geom.col, geom.row, geom.width, win))
+    }
+
+    /// The open cmdline **wildmenu** box's `menu_geom` row/col/width/height (windows-area
+    /// frame) plus the editor width — what the server's cmdline-docs sync needs to place
+    /// the docs float beside / below it (the same inputs the old `project_cmdline_docs`
+    /// received at redraw). `None` unless a [`MenuPlacement::Cmdline`] menu is open.
+    pub fn cmdline_menu_box(&self) -> Option<(usize, usize, usize, usize, usize)> {
+        let m = self.menu_view()?;
+        if !matches!(m.placement, MenuPlacement::Cmdline) {
+            return None;
+        }
+        let (metrics, _win, _num) = self.menu_anchor()?;
+        let geom = self.menu_geom(&m, metrics);
+        let (editor_w, _) = self.screen_size();
+        Some((geom.row, geom.col, geom.width, geom.height, editor_w))
+    }
+
+    pub(crate) fn complete_docs_geom(
+        &self,
+        content_lines: &[String],
+        wrap: bool,
+    ) -> Option<(usize, usize, u16, u16)> {
+        /// Cap the docs float's content width — a long signature wraps off-screen otherwise.
+        const MAX_DOCS_W: usize = 60;
+        /// Cap its height — a huge docstring shouldn't fill the screen beside a popup.
+        const MAX_DOCS_H: usize = 12;
+        let m = self.menu_view()?;
+        if !m.completion || !matches!(m.placement, MenuPlacement::Cursor) {
+            return None;
+        }
+        let (metrics, win, _num) = self.menu_anchor()?;
+        let geom = self.menu_geom(&m, metrics);
+        let (rx, ry, _rw, _rh) = self.window_rect(win)?;
+        let pad = self
+            .window_options(win)
+            .map(|o| o.padding)
+            .unwrap_or_default();
+        // The gutter the popup box sits behind is the window's *whole* text offset —
+        // the sign column AND the number column — not just the number width, or the
+        // sidebar slides `sign_width` cells left of the popup it butts against.
+        let gutter = self.window_textoff(win).unwrap_or(0);
+        // The popup box's content top-left, region-relative.
+        let content_col = rx + pad.left + gutter + geom.col;
+        let content_row = ry + pad.top + geom.row;
+        // Bound by the editor edges MINUS this region's screen origin (the dock bands +
+        // global chrome), so the float can't overrun the editor's right / bottom edge.
+        let (region_x, region_y) = self.window_region_origin(win).unwrap_or((0, 0));
+        let (editor_w, editor_h) = self.screen_size();
+        let bound_w = editor_w.saturating_sub(region_x);
+        let bound_h = editor_h.saturating_sub(region_y);
+        let content_w = content_lines
+            .iter()
+            .map(|l| l.chars().count())
+            .max()
+            .unwrap_or(1)
+            .clamp(1, MAX_DOCS_W);
+        let (docs_col, docs_w) = place_docs_beside(content_col, geom.width, content_w, bound_w)?;
+        // Height counts the **wrapped** display rows: with `wrap` on a doc line wider than
+        // `docs_w` (a reflowed markdown paragraph is one long line) spans several rows, so
+        // sizing to the raw line count would leave the body one row tall with the rest
+        // clipped. Clamped to the cap and to the room below the float's top.
+        let docs_h = crate::unicode::wrapped_row_count(content_lines, docs_w, wrap)
+            .min(MAX_DOCS_H)
+            .min(bound_h.saturating_sub(content_row).saturating_sub(2).max(1));
+        // The outer box (border included) sits one row/col out from the content, so the
+        // content lands at `(content_row, docs_col)` — flush one cell past the popup border.
+        Some((
+            content_row.saturating_sub(1),
+            docs_col.saturating_sub(1),
+            docs_w as u16,
+            docs_h as u16,
+        ))
+    }
+
     /// Scroll wheel: scroll the window **under the pointer** by `'mousescroll'`
     /// (`Shift` makes a vertical notch a full page), leaving focus and — unless a
     /// line scrolls off — the cursor where they are. A notch over no window (the
@@ -2149,6 +2187,13 @@ impl Editor {
         ) else {
             return 0;
         };
+        // A `wrap`ped window never scrolls horizontally (vim disables it under `wrap`):
+        // a long line flows onto the next screen row instead of running off the right
+        // edge, so there is nothing off-screen to reach — the docs float (`wrap` on)
+        // relies on this so a wide code line can't be wheeled sideways.
+        if opts.wrap {
+            return 0;
+        }
         let buf = &self.buffers.get(buf_id).buffer;
         let line_count = buf.line_count();
         let text_w = content_w.saturating_sub(self.number_width_for(&opts, line_count));

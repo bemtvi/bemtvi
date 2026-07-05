@@ -322,6 +322,55 @@ async fn nx_cursor_set_moves_the_cursor_and_get_and_nvim_alias_agree() {
 }
 
 #[tokio::test]
+async fn nxvim_colorscheme_styles_markdown_code_and_markup() {
+    let (rpc, _incoming) = start().await;
+    exec_lua(&rpc, "vim.cmd('colorscheme nxvim')").await;
+
+    // Inline `code` / fenced ```blocks``` get a code-region background so a rendered
+    // docstring's code stands out from the surrounding prose (the reported gap: code
+    // in the hover / completion-docs float had no special formatting).
+    let raw_bg = exec_lua(
+        &rpc,
+        "return vim.api.nvim_get_hl(0, { name = '@markup.raw' }).bg",
+    )
+    .await;
+    assert!(
+        raw_bg.as_u64().is_some(),
+        "@markup.raw (inline code) has a background under :colorscheme nxvim, got {raw_bg:?}"
+    );
+    let block_bg = exec_lua(
+        &rpc,
+        "return vim.api.nvim_get_hl(0, { name = '@markup.raw.block' }).bg",
+    )
+    .await;
+    assert!(
+        block_bg.as_u64().is_some(),
+        "@markup.raw.block (fenced code) has a background, got {block_bg:?}"
+    );
+    // Emphasis / headings read as such, too.
+    assert_eq!(
+        exec_lua(
+            &rpc,
+            "return vim.api.nvim_get_hl(0, { name = '@markup.strong' }).bold"
+        )
+        .await
+        .as_bool(),
+        Some(true),
+        "@markup.strong is bold"
+    );
+    assert!(
+        exec_lua(
+            &rpc,
+            "return vim.api.nvim_get_hl(0, { name = '@markup.heading.1' }).fg"
+        )
+        .await
+        .as_u64()
+        .is_some(),
+        "@markup.heading.1 has a colour"
+    );
+}
+
+#[tokio::test]
 async fn nx_hl_define_reaches_get_and_nvim_alias() {
     let (rpc, _incoming) = start().await;
 

@@ -507,6 +507,12 @@ const PRELUDE_MODULES: &[(&str, &str)] = &[
     // nx.hash.new) over the nx._hash / nx._hash_new bridges. After fs.lua, which
     // defines the sibling nx.hash.file (the streamed file digest, an fs op).
     ("nxvim:prelude/hash", include_str!("prelude/hash.lua")),
+    // nx.markdown: the CommonMark+GFM renderer surface (nx.markdown.render) over the
+    // pure nx._markdown_render bridge. Self-contained — needs only the native bridge.
+    (
+        "nxvim:prelude/markdown",
+        include_str!("prelude/markdown.lua"),
+    ),
     // nx.utils: the general helper namespace (nx.utils.debounce, …) — may build on
     // the timer and promise surfaces loaded just above.
     ("nxvim:prelude/utils", include_str!("prelude/utils.lua")),

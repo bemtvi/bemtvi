@@ -105,13 +105,14 @@ try {
   await page.evaluate(() => window.__nxvim.feed("<Esc><Esc>"));
   await sleep(150);
 
-  // ---- Cmdline wildmenu docs float (CmpDocumentation group + wrap) ----
-  const DOCBG = "rgb(17, 17, 27)"; // #11111b  CmpDocumentation bg
+  // ---- Cmdline wildmenu docs float (a real [CmdlineDocs] doc-float window + wrap) ----
+  // The wildmenu docs are no longer a `menu.docs` overlay — they render in a real
+  // doc-float window, word-wrapped server-side to the box width. Read it from the frame
+  // (the redraw the server produced) rather than the DOM: its lines are the wrapped rows.
   const longDesc =
     "Lorem ipsum dolor sit amet consectetur adipiscing elit sed do eiusmod " +
     "tempor incididunt ut labore et dolore magna aliqua ut enim ad minim veniam";
   await page.evaluate((desc) => window.__nxvim.execLua(
-    "vim.api.nvim_set_hl(0, 'CmpDocumentation', { bg = '#11111b' })\n" +
     "nx.cmdline_complete.setup {}\n" +
     "nx.user_command.create('Wrapcmd', function() end, { desc = [[" + desc + "]] })"), longDesc);
   await sleep(100);
@@ -121,16 +122,15 @@ try {
   await sleep(200);
 
   const docs = await page.evaluate(() => {
-    const box = document.querySelector("#grid .pmenu-doc");
-    if (!box) return null;
-    const rows = [...box.querySelectorAll(".row")];
-    // The widest rendered row's text length (every row is padded to the box width).
-    const widths = rows.map((r) => r.textContent.length);
-    return { bg: getComputedStyle(box).backgroundColor, rowCount: rows.length, maxW: Math.max(...widths, 0) };
+    const f = window.__nxvim.frame() || {};
+    const w = (f.windows || []).find((win) => win.file_name === "[CmdlineDocs]");
+    if (!w) return null;
+    const lines = w.lines || [];
+    const widths = lines.map((l) => String(l).length);
+    return { rowCount: lines.length, maxW: Math.max(...widths, 0) };
   });
-  check("docs: float paints", docs !== null, JSON.stringify(docs));
+  check("docs: the doc-float window paints", docs !== null, JSON.stringify(docs));
   if (docs) {
-    check("docs: uses CmpDocumentation bg", docs.bg === DOCBG, JSON.stringify(docs));
     check("docs: long desc wrapped onto multiple rows", docs.rowCount > 3, JSON.stringify(docs));
     check("docs: every row fits the box width (<=60)", docs.maxW > 0 && docs.maxW <= 60, JSON.stringify(docs));
   }

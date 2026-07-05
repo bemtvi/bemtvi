@@ -559,8 +559,8 @@ pub struct PmenuData {
 /// size in **text-area cells** (the client adds the gutter and text-area origin,
 /// then draws a bordered box) — the same convention as [`PmenuData`], but the
 /// rows are plain labels (no kind / detail). A picker may also carry a side
-/// [`preview`](Self::preview) pane and a completion popup a [`docs`](Self::docs)
-/// sidebar.
+/// [`preview`](Self::preview) pane. (A completion popup's docs render in a separate
+/// doc-float window, not as part of this menu data.)
 #[derive(Clone)]
 pub struct MenuData {
     pub items: Vec<String>,
@@ -619,15 +619,6 @@ pub struct MenuData {
     /// `preview` kind. `None` for a `select` / preview-less picker — then the box is
     /// the list alone, exactly as before.
     pub preview: Option<MenuPreview>,
-    /// The **docs sidebar**, present when the highlighted row carries documentation:
-    /// a `Cursor`-placed completion popup's selected `lsp` row (Phase 4-D), or the
-    /// cmdline wildmenu's selected command synopsis + help (cmdline-completion Phase
-    /// 3). A *separate* bordered float beside the box (right, flipping left for room),
-    /// not a column within it like [`preview`](Self::preview). For a cmdline wildmenu
-    /// the float's geometry is rebased onto the box (which is `cmd_area`-anchored, not
-    /// window-relative); see the client render. `None` for a `select` / picker or a
-    /// row with no docs — the box then stands alone.
-    pub docs: Option<MenuDocs>,
 }
 
 /// The menu/picker widget's themeable colors, resolved server-side from the
@@ -661,7 +652,7 @@ pub struct MenuStyles {
 /// / signature help): the content lines, the float's absolute geometry (text-area
 /// content coordinates, same convention as [`MenuData::row`]/`col`), its border
 /// style keyword, and an optional title drawn on the top border. Rendered as its
-/// own bordered box, like [`MenuDocs`] but standalone. See [`View::content_float`].
+/// own bordered box. See [`View::content_float`].
 #[derive(Clone)]
 pub struct ContentFloatData {
     /// The content lines (already windowed to `height`), each a run of styled
@@ -685,32 +676,6 @@ pub struct ContentFloatData {
     pub editor_relative: bool,
     /// An optional title drawn on the top border (`None` when untitled).
     pub title: Option<String>,
-}
-
-/// The docs sidebar mirrored from the redraw: the highlighted item's documentation
-/// lines and the float's absolute geometry (text-area-relative content coordinates,
-/// same convention as [`MenuData::row`]/`col`). Rendered as its own bordered box
-/// beside the completion popup (Phase 4-D) or the cmdline wildmenu (cmdline-completion
-/// Phase 3). See [`MenuData::docs`].
-#[derive(Clone)]
-pub struct MenuDocs {
-    /// The documentation lines (a `detail` / synopsis heading, then the body) —
-    /// already windowed to `height`. Plain text, like a hover.
-    pub lines: Vec<String>,
-    /// The float's content top-left. Relative to the focused window's text area by
-    /// default (the cmdline wildmenu's docs), or to the whole editor's windows area
-    /// when [`editor_relative`](Self::editor_relative) — the insert-completion docs
-    /// sidebar, which floats over the entire editor.
-    pub row: u16,
-    pub col: u16,
-    /// The float's content width / height in cells (the client adds its border).
-    pub width: u16,
-    pub height: u16,
-    /// Whether [`row`](Self::row)/[`col`](Self::col) are relative to the whole
-    /// editor's windows area (`true`, the insert-completion sidebar — so a split
-    /// doesn't squeeze it into the focused pane) rather than the focused window's
-    /// text area (`false`, the cmdline wildmenu's docs).
-    pub editor_relative: bool,
 }
 
 /// The picker preview pane mirrored from the redraw: the windowed file content for
@@ -919,18 +884,6 @@ impl View {
                         width: map_u16(p, "width"),
                         loc: parse_pair(map_get(p, "loc")),
                         highlights: parse_highlights(map_get(p, "highlights")),
-                    }),
-                    _ => None,
-                },
-                docs: match map_get(m, "docs") {
-                    Some(Value::Map(d)) => Some(MenuDocs {
-                        lines: map_str_array(d, "lines"),
-                        row: map_u16(d, "row"),
-                        col: map_u16(d, "col"),
-                        width: map_u16(d, "width"),
-                        height: map_u16(d, "height"),
-                        editor_relative: map_get(d, "editor_relative").and_then(Value::as_bool)
-                            == Some(true),
                     }),
                     _ => None,
                 },

@@ -79,9 +79,7 @@ pub use self::menu::{
     CmdlineCandidate, Extent, MenuGeom, MenuItem, MenuMetrics, MenuPlacement, PreviewScroll,
     PreviewTarget, PromptPos,
 };
-pub use self::mouse::{
-    ClickSurface, CompleteDocsHit, MouseClick, MousePos, StatuslineClick, WheelGesture,
-};
+pub use self::mouse::{ClickSurface, MouseClick, MousePos, StatuslineClick, WheelGesture};
 pub(crate) use self::multicursor::PlacementSnapshot;
 // The off-tick save / open requests (the daemon / edit-host fs path, Phase 3e/3f).
 pub use self::buffers::{
@@ -922,19 +920,14 @@ pub struct Editor {
     /// dismisses it in [`Editor::input`] — but a mouse wheel never reaches `input`,
     /// so it scrolls the popup instead of closing it.
     doc_float_wins: Vec<(String, WindowId)>,
-    /// The completion **docs sidebar**'s scroll offset (first visible doc line) and
-    /// the server-stashed on-screen box for hit-testing a wheel over it. The docs
-    /// content is server-owned (LSP cache / `resolve` / a plugin's inline doc), so
-    /// the server feeds the box geometry back each redraw
-    /// ([`Editor::stash_complete_docs_hit`]); the offset is core-owned and reset to 0
-    /// whenever the completion selection changes. See [`mouse`](crate::editor::mouse).
-    complete_docs_scroll: usize,
-    /// The docs sidebar's **horizontal** scroll offset (first visible column), for a
-    /// `<S-ScrollWheel>` / horizontal wheel over a doc whose lines run past the pane.
-    /// Core-owned and clamped to the widest line in [`Editor::stash_complete_docs_hit`],
-    /// reset to 0 alongside [`Editor::complete_docs_scroll`] on a selection change.
-    complete_docs_hscroll: usize,
-    complete_docs_hit: Option<mouse::CompleteDocsHit>,
+    /// The signature of the currently-open **completion docs float** — its markdown +
+    /// the popup box geometry it was placed against + `wrap`. `open_completion_docs_float`
+    /// skips a redundant close+reopen when the signature is unchanged (a bare mouse wheel
+    /// over the float, an idle repaint), so the float keeps its scroll offset instead of
+    /// snapping back to the top every event; a keystroke that moves the popup or changes
+    /// the selection shifts the signature and re-places it. `None` when the float is
+    /// closed. See [`float`](crate::editor::float).
+    completion_docs_sig: Option<float::CompletionDocsSig>,
     /// Picker query edits awaiting a (dynamic) source re-run: each `(generation,
     /// query)`. A *static* source never appends here — the local fuzzy matcher
     /// handles its query edits in core. Drained by the server, which stamps the
@@ -1711,9 +1704,7 @@ impl Editor {
             panel_buffers: Vec::new(),
             doc_float_buffers: Vec::new(),
             doc_float_wins: Vec::new(),
-            complete_docs_scroll: 0,
-            complete_docs_hscroll: 0,
-            complete_docs_hit: None,
+            completion_docs_sig: None,
             panel: None,
             view_float_lock: Vec::new(),
             qf_prev_win: None,

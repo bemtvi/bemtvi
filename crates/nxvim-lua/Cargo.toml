@@ -14,6 +14,10 @@ rust-version.workspace = true
 
 [dependencies]
 anyhow.workspace = true
+# The editor core, for the pure `nxvim_core::markdown` renderer behind
+# `nx.markdown.render`. Pure Rust, wasm-safe — no editor state is touched (the
+# renderer is a string→data transform), so this is a plain library edge.
+nxvim-core.workspace = true
 # Decode `nx.fs.read_text` through the multi-encoding seam (pure Rust, wasm-safe).
 encoding_rs.workspace = true
 # URL query-string + component percent-encoding for `nx.http` (query params / form

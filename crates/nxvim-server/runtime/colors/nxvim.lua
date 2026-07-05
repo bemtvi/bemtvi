@@ -116,6 +116,33 @@ hl(0, "@tag",                 { fg = p.red })
 hl(0, "@tag.attribute",       { fg = p.orange })
 hl(0, "@tag.delimiter",       { fg = p.fg })
 
+-- Markdown markup captures (`@markup.*`) — how the hover / completion-docs float and
+-- markdown previews render a docstring. Without these a rendered doc reads as flat
+-- prose: code isn't distinct, headings and emphasis don't stand out. Inline code and
+-- fenced blocks get a subtle background so they read as *code regions* even when the
+-- fenced language has no grammar to colour.
+hl(0, "@markup.heading",   { fg = p.blue, bold = true })
+hl(0, "@markup.heading.1", { fg = p.blue, bold = true })
+hl(0, "@markup.heading.2", { fg = p.blue, bold = true })
+hl(0, "@markup.heading.3", { fg = p.cyan, bold = true })
+hl(0, "@markup.heading.4", { fg = p.cyan, bold = true })
+hl(0, "@markup.heading.5", { fg = p.green, bold = true })
+hl(0, "@markup.heading.6", { fg = p.green, bold = true })
+hl(0, "@markup.strong",        { bold = true })
+hl(0, "@markup.italic",        { italic = true })
+hl(0, "@markup.strikethrough", { strikethrough = true })
+-- Inline `code`: the string colour on a code-region background, so it stands out from
+-- prose (in a rendered doc float / hover the inline-code span composes cleanly). A
+-- fenced ```block``` reads as code via its per-language syntax colouring; the
+-- `@markup.raw.block` background is defined for markdown-typed *buffers*.
+hl(0, "@markup.raw",         { fg = p.green, bg = p.cursor_line })
+hl(0, "@markup.raw.block",   { bg = p.cursor_line })
+hl(0, "@markup.link.label",  { fg = p.blue })
+hl(0, "@markup.link.url",    { fg = p.cyan, underline = true })
+hl(0, "@markup.link",        { fg = p.cyan, underline = true })
+hl(0, "@markup.list",        { fg = p.cyan })
+hl(0, "@markup.quote",       { fg = p.comment, italic = true })
+
 -- Diagnostics (matches the GUI's severity palette).
 hl(0, "DiagnosticError", { fg = p.red })
 hl(0, "DiagnosticWarn",  { fg = p.yellow })

@@ -153,26 +153,23 @@ try {
   await page.evaluate(() => window.__nxvim.feed("<C-n>"));
   await sleep(1200);
 
-  // The docs sidebar: basedpyright sends the item's signature as a ```python-fenced markdown
-  // block, which must (a) reach the web build at all — it was `#[cfg(native)]`-gated out —
-  // and (b) be syntax-highlighted client-side (the wasm build ships no spans for floats, so
-  // the renderer fence-highlights it). Assert both: the docs lines carry a python fence, and
-  // the rendered `.pmenu-doc` box paints more than one foreground colour.
+  // The docs float: basedpyright sends the item's signature + docstring, which now render
+  // in a real doc-float WINDOW ([CompletionDocs]) beside the popup (not the old `menu.docs`
+  // overlay) — and must reach the web build at all (the LSP docs are no longer
+  // `#[cfg(native)]`-gated). The markdown renderer strips the ```python fence, so the
+  // window's stripped lines carry the `def sqrt` signature text.
   const docs = await until(
     page,
-    () => { const m = (window.__nxvim.frame() || {}).menu; return m && m.docs ? m.docs.lines : null; },
-    (v) => v != null && v.some((l) => /```python/.test(String(l))),
+    () => {
+      const f = window.__nxvim.frame() || {};
+      const w = (f.windows || []).find((win) => win.file_name === "[CompletionDocs]");
+      return w ? w.lines : null;
+    },
+    (v) => v != null && v.some((l) => /def sqrt/.test(String(l))),
   );
-  check("complete docs: the sidebar shows the item's ```python-fenced signature",
-    Array.isArray(docs) && docs.some((l) => /```python/.test(String(l))) && docs.some((l) => /def sqrt/.test(String(l))),
+  check("complete docs: the doc-float window shows the item's signature",
+    Array.isArray(docs) && docs.some((l) => /def sqrt/.test(String(l))),
     `docs=${JSON.stringify(docs)}`);
-  const docColors = await page.evaluate(() => {
-    const cells = Array.from(document.querySelectorAll(".pmenu-doc span"));
-    const colors = new Set(cells.map((el) => getComputedStyle(el).color));
-    return { spanCount: cells.length, distinct: colors.size };
-  });
-  check("complete docs: the fenced signature is syntax-highlighted (multiple colours in .pmenu-doc)",
-    docColors.spanCount > 0 && docColors.distinct >= 2, JSON.stringify(docColors));
 
   // Accept the highlighted row (<C-y>) and confirm the buffer now reads `value = math.sqrt`
   // — the chosen item's edit was applied through the server-native accept path.

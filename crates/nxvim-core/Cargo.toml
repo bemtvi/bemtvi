@@ -30,5 +30,6 @@ unicode-segmentation.workspace = true
 regex.workspace = true
 nucleo-matcher.workspace = true
 encoding_rs.workspace = true
+pulldown-cmark.workspace = true
 nxvim-regex = { workspace = true, optional = true }
 serde = { workspace = true, optional = true }

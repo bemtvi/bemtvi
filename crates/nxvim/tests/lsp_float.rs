@@ -134,17 +134,21 @@ async fn hover_reply_opens_a_float_window() {
     // The hover is a real float WINDOW now (so it can scroll), not the content-float
     // `float` surface — assert it appears in `windows[]` carrying the markup.
     let win = await_doc_float_window(&rpc, &mut incoming, "nx.lsp.hover()", "scripted hover").await;
+    // LSP doc content is markdown, now RENDERED: the scratch buffer holds the stripped
+    // text — the `` `foo` `` inline code shows as plain `foo` (backticks gone).
     assert!(
-        window_lines(&win).iter().any(|l| l.contains("foo")),
-        "hover float window should carry the markup, got {:?}",
+        window_lines(&win)
+            .iter()
+            .any(|l| l == "foo: a scripted hover symbol"),
+        "hover markdown should render stripped, got {:?}",
         window_lines(&win)
     );
-    // LSP doc content is markdown, so the scratch buffer is typed `markdown` by
-    // default (free tree-sitter highlighting).
-    assert_eq!(
+    // The rendered buffer is left untyped (styling comes from the render's extmarks),
+    // so a filetype ts pass never repaints the already-stripped text as markdown.
+    assert_ne!(
         window_filetype(&win),
         "markdown",
-        "the hover doc-float buffer defaults to the markdown filetype"
+        "the rendered hover buffer is not typed markdown"
     );
 
     std::env::remove_var("NXVIM_LSP_CMD");
@@ -175,9 +179,12 @@ async fn hover_markdown_html_entities_are_decoded_to_plain_text() {
             || l.contains("&amp;")),
         "HTML entities should be decoded, not shown literally, got {lines:?}"
     );
+    // The renderer decodes `&lt;`/`&gt;`/`&amp;` to their characters; `&nbsp;` becomes
+    // a non-breaking space (whitespace, trimmed here) so the indentation is kept as a
+    // paragraph rather than being swallowed as a code block.
     assert!(
-        lines.iter().any(|l| l == "    foo <T> & bar"),
-        "leading `&nbsp;` should become spaces and `&lt;`/`&gt;`/`&amp;` their chars, got {lines:?}"
+        lines.iter().any(|l| l.trim_start() == "foo <T> & bar"),
+        "`&lt;`/`&gt;`/`&amp;` should decode to their chars, got {lines:?}"
     );
 
     std::env::remove_var("NXVIM_LSP_CMD");
@@ -188,11 +195,16 @@ async fn hover_window_scrolls_with_the_wheel_and_a_key_dismisses_it() {
     let _guard = serial_lock().lock().await;
     let dir = temp_dir("lsp_float_hover_scroll");
     // A tall hover (more lines than the float's 20-row cap) so there is content to
-    // scroll past — the whole reason a doc float is a window, not a content overlay.
-    let body = (0..30)
-        .map(|i| format!("hover line {i:02}"))
-        .collect::<Vec<_>>()
-        .join("\\n");
+    // scroll past — the whole reason a doc float is a window, not a content overlay. A
+    // **code block** so the lines stay distinct (outside a fence, markdown collapses the
+    // single newlines into one wrapped paragraph).
+    let body = format!(
+        "```\\n{}\\n```",
+        (0..30)
+            .map(|i| format!("hover line {i:02}"))
+            .collect::<Vec<_>>()
+            .join("\\n")
+    );
     arm_mock(
         &dir,
         &format!(r#"{{ "hover": {{ "contents": {{ "kind": "markdown", "value": "{body}" }} }} }}"#),

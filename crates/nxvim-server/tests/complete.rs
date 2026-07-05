@@ -16,8 +16,7 @@
 use nxvim_rpc::{Incoming, Rpc};
 use nxvim_server::ServerInit;
 use nxvim_test_harness::{
-    attach, drain_to_latest_redraw, exec_lua, feed, feed_mouse, feed_mouse_mod, lines, map_get,
-    spawn, temp_dir,
+    attach, drain_to_latest_redraw, exec_lua, feed, feed_mouse, lines, map_get, spawn, temp_dir,
 };
 use rmpv::Value;
 use tokio::sync::mpsc::UnboundedReceiver;
@@ -777,137 +776,294 @@ nx.complete.source {\n\
 }\n\
 nx.complete.setup { sources = { { 'buffer', min_chars = 2 }, { 'emoji' } } }";
 
-/// The docs-sidebar lines of the latest redraw whose menu carries a `docs` sub-map.
-async fn poll_menu_docs(
-    rpc: &Rpc,
-    incoming: &mut UnboundedReceiver<Incoming>,
-) -> Option<Vec<String>> {
-    for _ in 0..60 {
-        nxvim_test_harness::barrier(rpc).await;
-        if let Some(map) = drain_to_latest_redraw(incoming, |m| match map_get(m, "menu") {
-            Some(Value::Map(menu)) => matches!(map_get(menu, "docs"), Some(Value::Map(_))),
-            _ => false,
-        }) {
-            let Some(Value::Map(menu)) = map_get(&map, "menu") else {
-                continue;
-            };
-            let Some(Value::Map(docs)) = map_get(menu, "docs") else {
-                continue;
-            };
-            if let Some(Value::Array(lines)) = map_get(docs, "lines") {
-                return Some(
-                    lines
-                        .iter()
-                        .map(|l| l.as_str().unwrap_or("").to_string())
-                        .collect(),
-                );
-            }
+/// The `[CompletionDocs]` doc-float **window** map from a top-level redraw, or `None`.
+/// The completion docs are a real float window now (not a `menu.docs` overlay), so
+/// tests read them out of the `windows` array by the scratch buffer's name.
+fn docs_window(map: &[(Value, Value)]) -> Option<Vec<(Value, Value)>> {
+    let Some(Value::Array(wins)) = map_get(map, "windows") else {
+        return None;
+    };
+    wins.iter().find_map(|w| match w {
+        Value::Map(wm)
+            if map_get(wm, "file_name").and_then(Value::as_str) == Some("[CompletionDocs]") =>
+        {
+            Some(wm.clone())
         }
-        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-    }
-    None
+        _ => None,
+    })
 }
 
-/// The latest redraw's docs sub-map (geometry + lines), or `None` if none carries one.
-async fn poll_docs_map(
-    rpc: &Rpc,
-    incoming: &mut UnboundedReceiver<Incoming>,
-) -> Option<Vec<(Value, Value)>> {
-    for _ in 0..60 {
-        nxvim_test_harness::barrier(rpc).await;
-        if let Some(map) = drain_to_latest_redraw(incoming, |m| match map_get(m, "menu") {
-            Some(Value::Map(menu)) => matches!(map_get(menu, "docs"), Some(Value::Map(_))),
-            _ => false,
-        }) {
-            if let Some(Value::Map(menu)) = map_get(&map, "menu") {
-                if let Some(Value::Map(docs)) = map_get(menu, "docs") {
-                    return Some(docs.clone());
-                }
-            }
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-    }
-    None
-}
-
-fn docs_lines(docs: &[(Value, Value)]) -> Vec<String> {
-    match map_get(docs, "lines") {
+/// A window map's visible `lines` (the viewport slice — so it reflects a scroll).
+fn win_lines(win: &[(Value, Value)]) -> Vec<String> {
+    match map_get(win, "lines") {
         Some(Value::Array(a)) => a
             .iter()
             .map(|l| l.as_str().unwrap_or("").to_string())
             .collect(),
-        other => panic!("expected docs lines array, got {other:?}"),
+        _ => Vec::new(),
     }
 }
 
-fn docs_u64(docs: &[(Value, Value)], key: &str) -> usize {
-    map_get(docs, key)
-        .and_then(Value::as_u64)
-        .unwrap_or_else(|| panic!("docs has a {key}")) as usize
+/// A window map's `rect` field (`x`/`y`/`width`/`height`) — the OUTER box, region cells.
+fn win_rect(win: &[(Value, Value)], key: &str) -> u64 {
+    match map_get(win, "rect") {
+        Some(Value::Map(r)) => map_get(r, key)
+            .and_then(Value::as_u64)
+            .unwrap_or_else(|| panic!("rect has a {key}")),
+        other => panic!("window has a rect map, got {other:?}"),
+    }
 }
 
-/// A `<S-ScrollWheel>` / horizontal wheel over the completion **docs sidebar** scrolls
-/// it sideways so a doc wider than the pane can be read past its right edge — the docs
-/// counterpart of the picker preview's horizontal scroll.
+/// Poll for the latest redraw carrying the completion docs float window whose visible
+/// lines satisfy `want`, returning that window map.
+async fn poll_docs_win(
+    rpc: &Rpc,
+    incoming: &mut UnboundedReceiver<Incoming>,
+    want: impl Fn(&[String]) -> bool,
+) -> Option<Vec<(Value, Value)>> {
+    for _ in 0..60 {
+        nxvim_test_harness::barrier(rpc).await;
+        if let Some(map) = drain_to_latest_redraw(incoming, |m| {
+            docs_window(m).is_some_and(|w| want(&win_lines(&w)))
+        }) {
+            if let Some(w) = docs_window(&map) {
+                return Some(w);
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    None
+}
+
+/// The completion docs float's lines of the latest redraw carrying it.
+async fn poll_docs_lines(
+    rpc: &Rpc,
+    incoming: &mut UnboundedReceiver<Incoming>,
+) -> Option<Vec<String>> {
+    poll_docs_win(rpc, incoming, |_| true)
+        .await
+        .map(|w| win_lines(&w))
+}
+
+/// Inline `code` in the docs float renders with the colorscheme's `@markup.raw` style
+/// (a resolved style id on the span), so a docstring's code stands out from prose — the
+/// end-to-end proof of the "code isn't visible" fix (the renderer emits the span, the
+/// colorscheme styles it).
 #[tokio::test]
-async fn shift_or_horizontal_wheel_scrolls_the_docs_sidebar_sideways() {
-    let dir = temp_dir("complete_docs_hwheel");
-    // A single doc line far wider than the ~60-col docs pane (100 cols of a digit run).
-    let wide = "0123456789".repeat(10);
+async fn inline_code_in_the_docs_float_is_styled_under_a_colorscheme() {
+    let dir = temp_dir("complete_docs_code_style");
+    let init = "\
+nx.complete.source {\n\
+  name = 'doc', debounce = 0,\n\
+  complete = function(ctx)\n\
+    if ('hello'):find(ctx.prefix, 1, true) == 1 then\n\
+      ctx.push { text = 'hello', doc = 'call `foo()` now' }\n\
+    end\n\
+  end,\n\
+}\n\
+nx.complete.setup { sources = { { 'doc' } } }\n\
+vim.cmd('colorscheme nxvim')";
+    let (rpc, mut incoming) = start(&dir, init).await;
+    feed(&rpc, "ihe");
+    let _ = poll_menu(&rpc, &mut incoming).await.expect("popup opens");
+    feed(&rpc, "<C-n>");
+    let win = poll_docs_win(&rpc, &mut incoming, |ls| {
+        ls.iter().any(|l| l.contains("foo()"))
+    })
+    .await
+    .expect("docs float appears");
+    // Find the `@markup.raw` span in the docs window highlights; its 4th field (the
+    // resolved style id) must be non-nil — i.e. the colorscheme actually coloured it.
+    let Some(Value::Array(hl)) = map_get(&win, "highlights") else {
+        panic!("docs window has highlights");
+    };
+    let styled_raw = hl
+        .iter()
+        .flat_map(|row| match row {
+            Value::Array(spans) => spans.clone(),
+            _ => Vec::new(),
+        })
+        .any(|span| match span {
+            Value::Array(f) => {
+                f.get(2).and_then(Value::as_str) == Some("@markup.raw")
+                    && f.get(3).is_some_and(|s| !matches!(s, Value::Nil))
+            }
+            _ => false,
+        });
+    assert!(
+        styled_raw,
+        "inline code carries a styled @markup.raw span: {hl:?}"
+    );
+}
+
+/// A fenced code block in the docs float renders its body with the fences stripped (a
+/// block with a language additionally gets per-language syntax colouring, covered by the
+/// hover tests where a grammar is loaded).
+#[tokio::test]
+async fn code_blocks_in_the_docs_float_drop_their_fences() {
+    let dir = temp_dir("complete_docs_codeblock");
+    let init = "\
+nx.complete.source {\n\
+  name = 'doc', debounce = 0,\n\
+  complete = function(ctx)\n\
+    if ('hello'):find(ctx.prefix, 1, true) == 1 then\n\
+      ctx.push { text = 'hello', doc = 'run:\\n\\n```\\nmake build\\n```' }\n\
+    end\n\
+  end,\n\
+}\n\
+nx.complete.setup { sources = { { 'doc' } } }";
+    let (rpc, mut incoming) = start(&dir, init).await;
+    feed(&rpc, "ihe");
+    let _ = poll_menu(&rpc, &mut incoming).await.expect("popup opens");
+    feed(&rpc, "<C-n>");
+    let win = poll_docs_win(&rpc, &mut incoming, |ls| {
+        ls.iter().any(|l| l.contains("make build"))
+    })
+    .await
+    .expect("docs float appears");
+    let lines = win_lines(&win);
+    assert!(
+        lines.iter().any(|l| l.trim() == "make build") && lines.iter().all(|l| !l.contains("```")),
+        "code block body renders without fences: {lines:?}"
+    );
+}
+
+/// A long paragraph (one reflowed markdown line) that wraps within the float sizes the
+/// float to its **wrapped** row count — not one visible body row with the rest clipped.
+/// (The buffer holds one line; the window wraps it, and the float height must fit the
+/// wrapped rows.)
+#[tokio::test]
+async fn a_wrapped_paragraph_sizes_the_docs_float_to_its_wrapped_height() {
+    let dir = temp_dir("complete_docs_wrap_height");
+    // ~250 columns of prose on a single source line — markdown keeps it one paragraph,
+    // which wraps to several display rows within the ≤60-col float.
+    let para = "word ".repeat(50);
     let init = format!(
         "\
 nx.complete.source {{\n\
   name = 'doc', debounce = 0,\n\
   complete = function(ctx)\n\
     if ('hello'):find(ctx.prefix, 1, true) == 1 then\n\
-      ctx.push {{ text = 'hello', doc = '{wide}' }}\n\
+      ctx.push {{ text = 'hello', doc = '{para}' }}\n\
     end\n\
   end,\n\
 }}\n\
 nx.complete.setup {{ sources = {{ {{ 'doc' }} }} }}"
     );
     let (rpc, mut incoming) = start(&dir, &init).await;
-
     feed(&rpc, "ihe");
     let _ = poll_menu(&rpc, &mut incoming).await.expect("popup opens");
     feed(&rpc, "<C-n>");
-    let docs = poll_docs_map(&rpc, &mut incoming)
-        .await
-        .expect("docs sidebar");
-    let before = docs_lines(&docs)[0].clone();
-    assert!(before.starts_with("0123456789"), "unscrolled: {before:?}");
-    let (row, col) = (docs_u64(&docs, "row"), docs_u64(&docs, "col"));
-
-    // A horizontal wheel-right notch over the docs box scrolls it 6 columns right.
-    feed_mouse(&rpc, "wheel", "right", row + 1, col + 1);
-    let docs = poll_docs_map(&rpc, &mut incoming)
-        .await
-        .expect("docs after h-wheel");
-    let after = docs_lines(&docs)[0].clone();
-    assert_eq!(
-        after,
-        before.chars().skip(6).collect::<String>(),
-        "the doc line scrolled 6 columns right"
+    let win = poll_docs_win(&rpc, &mut incoming, |ls| {
+        ls.iter().any(|l| l.contains("word"))
+    })
+    .await
+    .expect("docs float appears");
+    // The float is sized to the wrapped display rows: several body rows are visible, and
+    // the outer height (rows + 2 border) is far taller than the 3 a raw-line-count height
+    // (1 body + border) would give.
+    assert!(
+        win_lines(&win).len() > 1,
+        "several wrapped body rows are visible, got {:?}",
+        win_lines(&win)
     );
-
-    // Shift + wheel-down is the same gesture: another 6 columns right.
-    feed_mouse_mod(&rpc, "wheel", "down", "S", row + 1, col + 1);
-    let docs = poll_docs_map(&rpc, &mut incoming)
-        .await
-        .expect("docs after S-wheel");
-    assert_eq!(
-        docs_lines(&docs)[0],
-        before.chars().skip(12).collect::<String>()
+    let h = win_rect(&win, "height");
+    assert!(
+        h >= 5,
+        "the float sizes to the wrapped paragraph height (>=5 rows), got {h}"
     );
+}
 
-    // Wheel-left scrolls back; clamped at column 0 (never negative).
-    for _ in 0..3 {
-        feed_mouse(&rpc, "wheel", "left", row + 1, col + 1);
-    }
-    let docs = poll_docs_map(&rpc, &mut incoming)
+/// `nx.complete.setup { docs_wrap = false }` is accepted (the configurable-wrap knob)
+/// and the docs float still opens beside the popup.
+#[tokio::test]
+async fn docs_wrap_is_configurable() {
+    let dir = temp_dir("complete_docs_wrap");
+    let init = "\
+nx.complete.source {\n\
+  name = 'doc', debounce = 0,\n\
+  complete = function(ctx)\n\
+    if ('hello'):find(ctx.prefix, 1, true) == 1 then\n\
+      ctx.push { text = 'hello', doc = 'docs for hello' }\n\
+    end\n\
+  end,\n\
+}\n\
+nx.complete.setup { sources = { { 'doc' } }, docs_wrap = false }";
+    let (rpc, mut incoming) = start(&dir, init).await;
+    feed(&rpc, "ihe");
+    let _ = poll_menu(&rpc, &mut incoming).await.expect("popup opens");
+    feed(&rpc, "<C-n>");
+    let docs = poll_docs_lines(&rpc, &mut incoming)
         .await
-        .expect("docs after lefts");
-    assert_eq!(docs_lines(&docs)[0], before, "scrolled back to column 0");
+        .expect("docs float appears with docs_wrap = false");
+    assert!(
+        docs.iter().any(|l| l.contains("docs for hello")),
+        "{docs:?}"
+    );
+}
+
+/// The completion docs render in a real **float window** (in `windows[]`, backed by
+/// the `[CompletionDocs]` scratch buffer) beside the popup — stripped markdown lines
+/// plus `@markup.*` highlight spans, the same wire hover uses. This is the win of the
+/// migration off the bespoke text-only `menu.docs` overlay: syntax highlighting for free.
+#[tokio::test]
+async fn completion_docs_render_in_a_highlighted_float_window() {
+    let dir = temp_dir("complete_docs_window");
+    let init = "\
+nx.complete.source {\n\
+  name = 'md', debounce = 0,\n\
+  complete = function(ctx)\n\
+    if ('hello'):find(ctx.prefix, 1, true) == 1 then\n\
+      ctx.push { text = 'hello', doc = '# Heading\\n\\nUses **bold** text.' }\n\
+    end\n\
+  end,\n\
+}\n\
+nx.complete.setup { sources = { { 'md' } } }";
+    let (rpc, mut incoming) = start(&dir, init).await;
+    feed(&rpc, "ihe");
+    let _ = poll_menu(&rpc, &mut incoming).await.expect("popup opens");
+    feed(&rpc, "<C-n>");
+    let win = poll_docs_win(&rpc, &mut incoming, |ls| {
+        ls.iter().any(|l| l.trim() == "Heading")
+    })
+    .await
+    .expect("the docs float window appears");
+    // A real float window.
+    assert_eq!(
+        map_get(&win, "floating").and_then(Value::as_bool),
+        Some(true)
+    );
+    // Stripped markdown lines (no raw `#` / `**`).
+    let lines = win_lines(&win);
+    assert!(
+        lines.iter().any(|l| l.trim() == "Heading")
+            && lines.iter().any(|l| l.contains("Uses bold text.")),
+        "stripped markdown: {lines:?}"
+    );
+    assert!(
+        lines.iter().all(|l| !l.contains('#') && !l.contains("**")),
+        "no raw markers: {lines:?}"
+    );
+    // The `highlights` wire carries the `@markup.*` spans (heading + strong).
+    let Some(Value::Array(hl)) = map_get(&win, "highlights") else {
+        panic!("docs window has a highlights array");
+    };
+    let groups: Vec<String> = hl
+        .iter()
+        .flat_map(|row| match row {
+            Value::Array(spans) => spans.clone(),
+            _ => Vec::new(),
+        })
+        .filter_map(|span| match span {
+            Value::Array(fields) => fields.get(2).and_then(Value::as_str).map(String::from),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        groups.iter().any(|g| g.starts_with("@markup.heading"))
+            && groups.iter().any(|g| g == "@markup.strong"),
+        "docs highlights carry the @markup.* spans: {groups:?}"
+    );
 }
 
 #[tokio::test]
@@ -961,12 +1117,52 @@ async fn a_plugin_source_inline_doc_shows_in_the_docs_sidebar() {
     // renders the emoji's inline `doc`.
     let _ = poll_menu(&rpc, &mut incoming).await.expect("popup opens");
     feed(&rpc, "<C-n>");
-    let docs = poll_menu_docs(&rpc, &mut incoming)
+    let docs = poll_docs_lines(&rpc, &mut incoming)
         .await
-        .expect("docs sidebar appears");
+        .expect("docs float appears");
     assert!(
         docs.iter().any(|l| l.contains("A smiley face")),
         "the plugin row's inline doc shows in the sidebar: {docs:?}"
+    );
+}
+
+/// A row's inline `doc` is markdown, so the docs sidebar renders it *stripped* (no
+/// `#`, `**`, or backticks) via the shared renderer — the same treatment as hover,
+/// text-only here since the sidebar carries no highlight channel.
+#[tokio::test]
+async fn a_plugin_source_markdown_doc_is_rendered_stripped_in_the_sidebar() {
+    let dir = temp_dir("complete_md_docs");
+    let init = "\
+nx.complete.source {\n\
+  name = 'md', debounce = 0,\n\
+  complete = function(ctx)\n\
+    if ('hello'):find(ctx.prefix, 1, true) == 1 then\n\
+      ctx.push { text = 'hello', doc = '# Heading\\n\\nUses **bold** and `code`.' }\n\
+    end\n\
+  end,\n\
+}\n\
+nx.complete.setup { sources = { { 'md' } } }";
+    let (rpc, mut incoming) = start(&dir, init).await;
+
+    feed(&rpc, "ihe");
+    let _ = poll_menu(&rpc, &mut incoming).await.expect("popup opens");
+    feed(&rpc, "<C-n>");
+    let docs = poll_docs_lines(&rpc, &mut incoming)
+        .await
+        .expect("docs float appears");
+
+    assert!(
+        docs.iter().any(|l| l.trim() == "Heading"),
+        "heading rendered without '#': {docs:?}"
+    );
+    assert!(
+        docs.iter().any(|l| l.contains("Uses bold and code.")),
+        "inline markup stripped: {docs:?}"
+    );
+    assert!(
+        docs.iter()
+            .all(|l| !l.contains("**") && !l.contains('#') && !l.contains('`')),
+        "no raw markdown markers remain: {docs:?}"
     );
 }
 
@@ -998,43 +1194,31 @@ nx.complete.setup { sources = { { 'doc' } } }";
 
     feed(&rpc, "ihel");
     let _ = poll_menu(&rpc, &mut incoming).await.expect("popup opens");
-    feed(&rpc, "<C-n>"); // select row 0 so the docs sidebar shows
+    feed(&rpc, "<C-n>"); // select row 0 so the docs float shows
 
-    let mut width = 0u64;
-    for _ in 0..60 {
-        nxvim_test_harness::barrier(&rpc).await;
-        if let Some(map) = drain_to_latest_redraw(&mut incoming, |m| match map_get(m, "menu") {
-            Some(Value::Map(menu)) => matches!(map_get(menu, "docs"), Some(Value::Map(_))),
-            _ => false,
-        }) {
-            let Some(Value::Map(menu)) = map_get(&map, "menu") else {
-                continue;
-            };
-            let Some(Value::Map(docs)) = map_get(menu, "docs") else {
-                continue;
-            };
-            width = map_get(docs, "width").and_then(Value::as_u64).unwrap_or(0);
-            break;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-    }
+    let win = poll_docs_win(&rpc, &mut incoming, |_| true)
+        .await
+        .expect("docs float appears");
+    // The float's inner content width (its outer rect minus the two border cells) must
+    // stay usable — it floats over the whole editor, not the narrow ~40-col split pane.
+    let width = win_rect(&win, "width").saturating_sub(2);
     assert!(
         width >= 20,
-        "the docs sidebar must keep a usable width over the whole editor after a split, got {width}"
+        "the docs float must keep a usable width over the whole editor after a split, got {width}"
     );
 }
 
-/// The latest top-level redraw whose `menu` carries a `docs` sub-map (so a test
-/// can read both the menu geometry and the focused window's gutter widths).
+/// The latest top-level redraw carrying BOTH the completion popup `menu` and its docs
+/// float window (so a test can read the menu geometry, the focused window's gutter
+/// widths, and the docs window rect from one consistent frame).
 async fn poll_menu_top_with_docs(
     rpc: &Rpc,
     incoming: &mut UnboundedReceiver<Incoming>,
 ) -> Option<Vec<(Value, Value)>> {
     for _ in 0..60 {
         nxvim_test_harness::barrier(rpc).await;
-        if let Some(map) = drain_to_latest_redraw(incoming, |m| match map_get(m, "menu") {
-            Some(Value::Map(menu)) => matches!(map_get(menu, "docs"), Some(Value::Map(_))),
-            _ => false,
+        if let Some(map) = drain_to_latest_redraw(incoming, |m| {
+            matches!(map_get(m, "menu"), Some(Value::Map(_))) && docs_window(m).is_some()
         }) {
             return Some(map);
         }
@@ -1048,14 +1232,6 @@ fn mu64(map: &[(Value, Value)], key: &str) -> u64 {
     map_get(map, key)
         .and_then(Value::as_u64)
         .unwrap_or_else(|| panic!("missing u64 key {key:?}"))
-}
-
-/// The `docs` sub-map of a menu.
-fn docs_of(menu: &[(Value, Value)]) -> Vec<(Value, Value)> {
-    match map_get(menu, "docs") {
-        Some(Value::Map(d)) => d.clone(),
-        other => panic!("expected a docs map, got {other:?}"),
-    }
 }
 
 /// The focused window's map from a top-level redraw.
@@ -1081,11 +1257,11 @@ fn rect_x(win: &[(Value, Value)]) -> u64 {
     }
 }
 
-/// The docs sidebar must butt against the popup's right border — its content one
-/// cell past that border. Its region-relative column therefore counts the *whole*
-/// gutter the popup box sits behind: the sign column AND the number column.
-/// Regression: it counted only the number column, sliding the sidebar
-/// `sign_width` cells left of the popup (a visible gap once a sign column shows).
+/// The docs float must butt against the popup's right border — its content one cell
+/// past that border. Its region-relative column therefore counts the *whole* gutter the
+/// popup box sits behind: the sign column AND the number column. Regression: it counted
+/// only the number column, sliding the float `sign_width` cells left of the popup (a
+/// visible gap once a sign column shows).
 #[tokio::test]
 async fn docs_sidebar_butts_against_the_popup_past_the_sign_column() {
     let dir = temp_dir("complete_docs_signcolumn");
@@ -1106,13 +1282,13 @@ nx.complete.setup { sources = { { 'doc' } } }";
 
     feed(&rpc, "ihel");
     let _ = poll_menu(&rpc, &mut incoming).await.expect("popup opens");
-    feed(&rpc, "<C-n>"); // select row 0 so the docs sidebar shows
+    feed(&rpc, "<C-n>"); // select row 0 so the docs float shows
 
     let map = poll_menu_top_with_docs(&rpc, &mut incoming)
         .await
-        .expect("docs sidebar appears");
+        .expect("docs float appears");
     let menu = menu_of(&map);
-    let docs = docs_of(&menu);
+    let docs = docs_window(&map).expect("docs float window");
     let win = focused_window(&map);
     let sign_width = mu64(&win, "sign_width");
     let number_width = mu64(&win, "number_width");
@@ -1128,14 +1304,14 @@ nx.complete.setup { sources = { { 'doc' } } }";
 
     let menu_col = mu64(&menu, "col");
     let menu_width = mu64(&menu, "width");
-    let docs_col = mu64(&docs, "col");
-    // The window has no padding and sits at the region origin, so the sidebar's
-    // region-relative content column is the full gutter (sign + number) + the box
-    // content span + 2 (the box's right border, then the sidebar's own left border).
+    // The docs float's OUTER box (its rect.x, border included) sits one cell past the
+    // popup's right border: the full gutter (sign + number) + the box content span + 1
+    // (the popup's right border, then the float's own left border is the outer box). Its
+    // content (rect.x + 1) is thus 2 cells past the popup content — flush adjacency.
     assert_eq!(
-        docs_col,
-        sign_width + number_width + menu_col + menu_width + 2,
-        "docs sidebar butts against the popup including the sign column"
+        win_rect(&docs, "x"),
+        sign_width + number_width + menu_col + menu_width + 1,
+        "docs float butts against the popup including the sign column"
     );
 }
 
@@ -1170,23 +1346,23 @@ nx.complete.setup { sources = { { 'doc' } } }";
 
     let map = poll_menu_top_with_docs(&rpc, &mut incoming)
         .await
-        .expect("docs sidebar appears");
-    let menu = menu_of(&map);
-    let docs = docs_of(&menu);
-    let docs_col = mu64(&docs, "col");
-    let docs_width = mu64(&docs, "width");
+        .expect("docs float appears");
+    let docs = docs_window(&map).expect("docs float window");
+    // The docs float's OUTER rect is region-relative (main-region cells). Its right edge
+    // (rect.x + rect.width, border included) must stay within the region.
+    let docs_col = win_rect(&docs, "x");
+    let docs_outer_width = win_rect(&docs, "width");
     // The main region begins one cell past the 20-col dock (band 21). The editor is
-    // 80 cols, so the region-relative right edge is 80 − 21 = 59; the sidebar's box
-    // (content plus its right border) must stay within it.
+    // 80 cols, so the region-relative right edge is 80 − 21 = 59.
     let region_right = 80 - (20 + 1);
     assert!(
-        docs_col + docs_width <= region_right,
-        "docs sidebar must stay within the editor's right edge: col {docs_col} + width {docs_width} > {region_right}"
+        docs_col + docs_outer_width <= region_right,
+        "docs float must stay within the editor's right edge: x {docs_col} + width {docs_outer_width} > {region_right}"
     );
-    // ...and still be usable, not collapsed to a sliver.
+    // ...and still be usable, not collapsed to a sliver (inner width past the border).
     assert!(
-        docs_width >= 20,
-        "the sidebar keeps a usable width past the dock, got {docs_width}"
+        docs_outer_width.saturating_sub(2) >= 20,
+        "the float keeps a usable width past the dock, got {docs_outer_width}"
     );
 }
 
@@ -1213,9 +1389,9 @@ nx.complete.setup { sources = { { 'lazy' } }, min_chars = 2 }";
     let _ = poll_menu(&rpc, &mut incoming).await.expect("popup opens");
     // Select the row — the server resolves its docs off the input path.
     feed(&rpc, "<C-n>");
-    let docs = poll_menu_docs(&rpc, &mut incoming)
+    let docs = poll_docs_lines(&rpc, &mut incoming)
         .await
-        .expect("docs sidebar appears after resolve");
+        .expect("docs float appears after resolve");
     assert!(
         docs.iter().any(|l| l.contains("resolved docs for ab_lazy")),
         "the resolve callback's docs fill the sidebar: {docs:?}"
@@ -1365,91 +1541,55 @@ async fn scrolling_the_text_closes_the_completion_popup() {
     );
 }
 
-/// The docs sidebar `(row, col, lines)` of the latest redraw whose `menu.docs`
-/// sub-map's lines satisfy `want` — `row`/`col` are its text-area content cells
-/// (global cells once the gutter is off).
-async fn poll_docs_box(
-    rpc: &Rpc,
-    incoming: &mut UnboundedReceiver<Incoming>,
-    want: impl Fn(&[String]) -> bool,
-) -> Option<(usize, usize, Vec<String>)> {
-    let docs_lines = |docs: &[(Value, Value)]| -> Vec<String> {
-        match map_get(docs, "lines") {
-            Some(Value::Array(ls)) => ls
-                .iter()
-                .map(|l| l.as_str().unwrap_or("").to_string())
-                .collect(),
-            _ => Vec::new(),
-        }
-    };
-    for _ in 0..60 {
-        nxvim_test_harness::barrier(rpc).await;
-        if let Some(map) = drain_to_latest_redraw(incoming, |m| match map_get(m, "menu") {
-            Some(Value::Map(menu)) => match map_get(menu, "docs") {
-                Some(Value::Map(docs)) => want(&docs_lines(docs)),
-                _ => false,
-            },
-            _ => false,
-        }) {
-            let Some(Value::Map(menu)) = map_get(&map, "menu") else {
-                continue;
-            };
-            let Some(Value::Map(docs)) = map_get(menu, "docs") else {
-                continue;
-            };
-            let row = map_get(docs, "row").and_then(Value::as_u64)? as usize;
-            let col = map_get(docs, "col").and_then(Value::as_u64)? as usize;
-            return Some((row, col, docs_lines(docs)));
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-    }
-    None
-}
-
 #[tokio::test]
 async fn wheeling_over_the_completion_docs_sidebar_scrolls_it() {
     let dir = temp_dir("complete_docs_scroll");
-    // One row carrying a TALL inline doc (more lines than the sidebar's 12-row cap),
-    // so the docs float has content to scroll.
+    // One row carrying a TALL inline doc (more lines than the float's 12-row cap), so
+    // the docs float window has content to scroll. A **code block** so the 30 lines stay
+    // distinct — outside a code fence, markdown collapses the single newlines into one
+    // wrapped paragraph.
     let init = "\
 nx.complete.source {\n\
   name = 'docs', debounce = 0,\n\
   complete = function(ctx)\n\
     local d = {}\n\
     for i = 1, 30 do d[i] = string.format('doc line %02d', i) end\n\
-    ctx.push { text = 'alpha', doc = table.concat(d, '\\n') }\n\
+    ctx.push { text = 'alpha', doc = '```\\n' .. table.concat(d, '\\n') .. '\\n```' }\n\
   end,\n\
 }\n\
 nx.complete.setup { sources = { { 'docs' } } }";
     let (rpc, mut incoming) = start(&dir, init).await;
-    // Drop the gutter so the docs sidebar's text-area cells are global screen cells.
+    // Drop the gutter so the docs float's region cells are the global screen cells.
     nxvim_test_harness::command(&rpc, "set nonumber norelativenumber").await;
 
     feed(&rpc, "ial");
     let _ = poll_menu(&rpc, &mut incoming).await.expect("popup opens");
-    // Select row 0 so the docs sidebar shows (it renders only for an active row).
+    // Select row 0 so the docs float shows (it renders only for an active row).
     feed(&rpc, "<C-n>");
-    let (row, col, top) = poll_docs_box(&rpc, &mut incoming, |ls| {
+    let win = poll_docs_win(&rpc, &mut incoming, |ls| {
         ls.first().map(String::as_str) == Some("doc line 01")
     })
     .await
-    .expect("docs sidebar opens at the top");
-    assert_eq!(top.first().map(String::as_str), Some("doc line 01"));
+    .expect("docs float opens at the top");
+    // The float is a real window now — a wheel over it scrolls it natively (no bespoke
+    // hit-test). Feed the wheel inside its box (past the border).
+    let (rx, ry) = (win_rect(&win, "x") as usize, win_rect(&win, "y") as usize);
 
-    // Three wheel-down notches over the docs float scroll it down three lines — the
+    // Three wheel-down notches over the docs window scroll it down three lines — the
     // wheel acts on the docs, NOT the highlight (which stays on row 0).
     for _ in 0..3 {
-        feed_mouse(&rpc, "wheel", "down", row + 1, col + 1);
+        feed_mouse(&rpc, "wheel", "down", ry + 1, rx + 1);
     }
-    let (_, _, scrolled) = poll_docs_box(&rpc, &mut incoming, |ls| {
+    let scrolled = poll_docs_win(&rpc, &mut incoming, |ls| {
         ls.first().map(String::as_str) != Some("doc line 01")
     })
     .await
-    .expect("the wheel scrolled the docs sidebar");
+    .expect("the wheel scrolled the docs window");
     assert_eq!(
-        scrolled.first().map(String::as_str),
-        Some("doc line 04"),
-        "three wheel-down notches advanced the docs by three lines: {scrolled:?}"
+        win_lines(&scrolled).first().map(String::as_str),
+        Some("doc line 10"),
+        "three wheel-down notches advanced the docs by 3×3 lines (mousescroll ver:3): {:?}",
+        win_lines(&scrolled)
     );
     let menu = menu_of(
         &poll_menu(&rpc, &mut incoming)
@@ -1462,26 +1602,79 @@ nx.complete.setup { sources = { { 'docs' } } }";
         "wheeling the docs did not move the popup highlight"
     );
 
-    // Wheeling back up returns to the top, non-wrapping (stops at line 01).
+    // Wheeling back up returns to the top (clamped at line 01).
     for _ in 0..5 {
-        feed_mouse(&rpc, "wheel", "up", row + 1, col + 1);
+        feed_mouse(&rpc, "wheel", "up", ry + 1, rx + 1);
     }
-    let (_, _, back) = poll_docs_box(&rpc, &mut incoming, |ls| {
+    let back = poll_docs_win(&rpc, &mut incoming, |ls| {
         ls.first().map(String::as_str) == Some("doc line 01")
     })
     .await
     .expect("the docs scrolled back to the top");
-    assert_eq!(back.first().map(String::as_str), Some("doc line 01"));
+    assert_eq!(
+        win_lines(&back).first().map(String::as_str),
+        Some("doc line 01")
+    );
 }
 
-/// A 30-line inline doc, for the dock-aware geometry tests below.
+/// With `docs_wrap` on (the default) a wide doc line wraps within the float, so the
+/// float must NOT scroll horizontally — a `<S-ScrollWheel>` / horizontal wheel over it
+/// is a no-op (vim disables horizontal scroll under `wrap`). Regression: it scrolled.
+#[tokio::test]
+async fn a_wrapped_docs_float_does_not_scroll_horizontally() {
+    let dir = temp_dir("complete_docs_nohscroll");
+    // A single doc line far wider than the ~60-col float (100 cols of a digit run).
+    let wide = "0123456789".repeat(10);
+    let init = format!(
+        "\
+nx.complete.source {{\n\
+  name = 'doc', debounce = 0,\n\
+  complete = function(ctx)\n\
+    if ('hello'):find(ctx.prefix, 1, true) == 1 then\n\
+      ctx.push {{ text = 'hello', doc = '`{wide}`' }}\n\
+    end\n\
+  end,\n\
+}}\n\
+nx.complete.setup {{ sources = {{ {{ 'doc' }} }} }}"
+    );
+    let (rpc, mut incoming) = start(&dir, &init).await;
+    nxvim_test_harness::command(&rpc, "set nonumber norelativenumber").await;
+
+    feed(&rpc, "ihe");
+    let _ = poll_menu(&rpc, &mut incoming).await.expect("popup opens");
+    feed(&rpc, "<C-n>");
+    let win = poll_docs_win(&rpc, &mut incoming, |ls| {
+        ls.first().is_some_and(|l| l.starts_with("0123456789"))
+    })
+    .await
+    .expect("docs float opens");
+    assert_eq!(mu64(&win, "leftcol"), 0, "starts unscrolled");
+    let (rx, ry) = (win_rect(&win, "x") as usize, win_rect(&win, "y") as usize);
+
+    // A horizontal wheel over the wrapped float must not scroll it sideways.
+    for _ in 0..3 {
+        feed_mouse(&rpc, "wheel", "right", ry + 1, rx + 1);
+    }
+    nxvim_test_harness::barrier(&rpc).await;
+    let win = poll_docs_win(&rpc, &mut incoming, |_| true)
+        .await
+        .expect("docs float still open");
+    assert_eq!(
+        mu64(&win, "leftcol"),
+        0,
+        "a wrapped docs float never scrolls horizontally"
+    );
+}
+
+/// A 30-line inline doc (a code block, so the lines stay distinct rather than
+/// collapsing into one wrapped markdown paragraph), for the dock-aware geometry tests.
 const TALL_DOC_INIT: &str = "\
 nx.complete.source {\n\
   name = 'docs', debounce = 0,\n\
   complete = function(ctx)\n\
     local d = {}\n\
     for i = 1, 30 do d[i] = string.format('doc line %02d', i) end\n\
-    ctx.push { text = 'alpha', doc = table.concat(d, '\\n') }\n\
+    ctx.push { text = 'alpha', doc = '```\\n' .. table.concat(d, '\\n') .. '\\n```' }\n\
   end,\n\
 }\n\
 nx.complete.setup { sources = { { 'docs' } } }";
@@ -1513,24 +1706,25 @@ async fn docs_sidebar_respects_the_bottom_edge_past_a_top_dock() {
 
     let map = poll_menu_top_with_docs(&rpc, &mut incoming)
         .await
-        .expect("docs sidebar appears");
-    let docs = docs_of(&menu_of(&map));
-    let docs_row = mu64(&docs, "row");
-    let docs_height = mu64(&docs, "height");
+        .expect("docs float appears");
+    let docs = docs_window(&map).expect("docs float window");
+    // The docs float's OUTER rect is region-relative (main-region cells).
+    let docs_row = win_rect(&docs, "y");
+    let docs_height = win_rect(&docs, "height");
     // The main region begins one row past the 5-row top dock (band 6). The editor is
-    // 24 rows, so the region-relative bottom edge is 24 − 6 = 18; the sidebar's rows
-    // must stay within it.
+    // 24 rows, so the region-relative bottom edge is 24 − 6 = 18; the float's rows must
+    // stay within it.
     let region_bottom = 24 - (5 + 1);
     assert!(
         docs_row + docs_height <= region_bottom,
-        "docs sidebar must stay within the editor's bottom edge: row {docs_row} + height {docs_height} > {region_bottom}"
+        "docs float must stay within the editor's bottom edge: y {docs_row} + height {docs_height} > {region_bottom}"
     );
 }
 
-/// The sidebar's geometry is region-relative, but its wheel hit-test box is stashed
-/// in GLOBAL cells — so with a dock shifting the region's screen origin, a wheel
-/// over the sidebar's on-screen cells must still scroll it. Regression: the box was
-/// stashed in region cells, so a wheel past a dock missed it.
+/// The docs float's geometry is region-relative, but the mouse hit-test resolves a
+/// GLOBAL cell back to a window — so with a dock shifting the region's screen origin, a
+/// wheel over the float's on-screen cells must still scroll it (via the native window
+/// mouse path, not the retired bespoke stash).
 #[tokio::test]
 async fn wheeling_the_docs_sidebar_hit_tests_in_global_cells_past_a_dock() {
     let dir = temp_dir("complete_docs_scroll_dock");
@@ -1546,29 +1740,28 @@ async fn wheeling_the_docs_sidebar_hit_tests_in_global_cells_past_a_dock() {
     feed(&rpc, "ial");
     let _ = poll_menu(&rpc, &mut incoming).await.expect("popup opens");
     feed(&rpc, "<C-n>");
-    let (row, col, top) = poll_docs_box(&rpc, &mut incoming, |ls| {
+    let win = poll_docs_win(&rpc, &mut incoming, |ls| {
         ls.first().map(String::as_str) == Some("doc line 01")
     })
     .await
-    .expect("docs sidebar opens at the top");
-    assert_eq!(top.first().map(String::as_str), Some("doc line 01"));
-
-    // Wheel over the sidebar at GLOBAL cells: the main region's origin (col 21) plus
-    // the region-relative box column. Before the fix the box was stashed in region
-    // cells, so this landed off it and nothing scrolled.
+    .expect("docs float opens at the top");
+    // The float rect is region-relative (main-region cells); its GLOBAL screen cell adds
+    // the region origin (col 21, row 0). Wheel there, inside the box (past the border).
     let region_x = 20 + 1; // the dock content width + its separator
+    let (rx, ry) = (win_rect(&win, "x") as usize, win_rect(&win, "y") as usize);
     for _ in 0..3 {
-        feed_mouse(&rpc, "wheel", "down", row + 1, region_x + col + 1);
+        feed_mouse(&rpc, "wheel", "down", ry + 1, region_x + rx + 1);
     }
-    let (_, _, scrolled) = poll_docs_box(&rpc, &mut incoming, |ls| {
+    let scrolled = poll_docs_win(&rpc, &mut incoming, |ls| {
         ls.first().map(String::as_str) != Some("doc line 01")
     })
     .await
-    .expect("the wheel scrolled the docs sidebar past the dock");
+    .expect("the wheel scrolled the docs window past the dock");
     assert_eq!(
-        scrolled.first().map(String::as_str),
-        Some("doc line 04"),
-        "three notches over the global box advanced the docs by three lines: {scrolled:?}"
+        win_lines(&scrolled).first().map(String::as_str),
+        Some("doc line 10"),
+        "three notches over the global box advanced the docs by 3×3 lines: {:?}",
+        win_lines(&scrolled)
     );
 }
 

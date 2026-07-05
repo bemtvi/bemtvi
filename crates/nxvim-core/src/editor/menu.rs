@@ -836,7 +836,7 @@ impl Editor {
 
     /// Whether the open menu is the command-line wildmenu (`nx.cmdline_complete`),
     /// the one the mouse drives in command mode.
-    pub(crate) fn cmdline_complete_active(&self) -> bool {
+    pub fn cmdline_complete_active(&self) -> bool {
         self.menu_kind() == Some(MenuKind::Cmdline)
     }
 
@@ -1103,9 +1103,6 @@ impl Editor {
             } else {
                 m.select_prev();
             }
-            // A new row's docs start at the top.
-            self.complete_docs_scroll = 0;
-            self.complete_docs_hscroll = 0;
         }
     }
 
@@ -1118,10 +1115,6 @@ impl Editor {
             if len > 0 {
                 m.selected_active = true;
                 m.cursor = idx.min(len - 1);
-                // A new row's docs start at the top (the mouse hover/click + wheel-list
-                // path lands here too, so scrolling the LIST resets the docs sidebar).
-                self.complete_docs_scroll = 0;
-                self.complete_docs_hscroll = 0;
             }
         }
     }
@@ -1643,6 +1636,31 @@ impl Editor {
             return None;
         }
         m.selected_item().map(|i| (i.key, i.source_accept))
+    }
+
+    /// The actively-highlighted completion row's **inline** docs (`push { doc = … }`
+    /// from a plugin async source) — the docs float renders this markdown directly,
+    /// unlike an `lsp` row (server LSP cache) or a `resolve` row (server-fetched).
+    /// `None` unless a completion menu is open with an active selection whose row
+    /// carries an inline `doc`.
+    pub fn complete_selected_doc(&self) -> Option<String> {
+        let m = self.menu.as_ref()?;
+        if m.kind != MenuKind::Complete {
+            return None;
+        }
+        m.selected_item().and_then(|i| i.doc.clone())
+    }
+
+    /// The actively-highlighted **cmdline wildmenu** row's inline docs (the catalog
+    /// candidate's `doc` — synopsis + help), which the cmdline docs float renders as
+    /// plain text. `None` unless a [`MenuKind::Cmdline`] menu is open with an active
+    /// selection whose row carries a `doc` (the popup is noselect until navigated).
+    pub fn cmdline_selected_doc(&self) -> Option<String> {
+        let m = self.menu.as_ref()?;
+        if m.kind != MenuKind::Cmdline {
+            return None;
+        }
+        m.selected_item().and_then(|i| i.doc.clone())
     }
 
     /// The actively-highlighted completion row's **lazy-docs resolve handle** — the

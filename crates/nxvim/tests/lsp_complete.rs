@@ -65,25 +65,31 @@ async fn poll_menu_items(
     }
 }
 
-/// The docs-sidebar lines of the latest redraw whose menu carries a `docs` sub-map,
-/// or `None` if none arrives within the poll window. The sidebar's `lines` are the
-/// selected item's `detail` + `documentation` (Phase 4-D).
+/// The completion **docs float window** (`[CompletionDocs]`) lines of the latest redraw
+/// carrying it, or `None` if none arrives within the poll window. The completion docs
+/// are a real doc-float window now (not a `menu.docs` overlay): its stripped-markdown
+/// lines are the selected item's `detail` (fenced) + `documentation` (Phase 4-D).
 async fn poll_menu_docs(
     rpc: &Rpc,
     incoming: &mut UnboundedReceiver<Incoming>,
 ) -> Option<Vec<String>> {
+    fn docs_window(map: &[(Value, Value)]) -> Option<Vec<(Value, Value)>> {
+        let Some(Value::Array(wins)) = map_get(map, "windows") else {
+            return None;
+        };
+        wins.iter().find_map(|w| match w {
+            Value::Map(wm)
+                if map_get(wm, "file_name").and_then(Value::as_str) == Some("[CompletionDocs]") =>
+            {
+                Some(wm.clone())
+            }
+            _ => None,
+        })
+    }
     nxvim_test_harness::barrier(rpc).await;
-    let map = drain_to_latest_redraw(incoming, |m| match map_get(m, "menu") {
-        Some(Value::Map(menu)) => matches!(map_get(menu, "docs"), Some(Value::Map(_))),
-        _ => false,
-    })?;
-    let Some(Value::Map(menu)) = map_get(&map, "menu") else {
-        return None;
-    };
-    let Some(Value::Map(docs)) = map_get(menu, "docs") else {
-        return None;
-    };
-    match map_get(docs, "lines") {
+    let map = drain_to_latest_redraw(incoming, |m| docs_window(m).is_some())?;
+    let win = docs_window(&map)?;
+    match map_get(&win, "lines") {
         Some(Value::Array(lines)) => Some(
             lines
                 .iter()

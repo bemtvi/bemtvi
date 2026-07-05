@@ -154,6 +154,13 @@ function nx.complete.setup(opts)
   if docs == nil then
     docs = true
   end
+  -- The docs float wraps a long doc line within itself by default; `docs_wrap = false`
+  -- truncates long lines at the float's edge instead. The wheel still scrolls it
+  -- vertically either way.
+  local docs_wrap = opts.docs_wrap
+  if docs_wrap == nil then
+    docs_wrap = true
+  end
   -- `accept` (default "replace") decides what the confirm keys do when the caret sits
   -- in the *middle* of a word: "replace" swaps the whole word, "insert" keeps the
   -- suffix past the cursor. `nx.complete.accept{ behavior = … }` overrides it per-key.
@@ -197,6 +204,7 @@ function nx.complete.setup(opts)
     buffer_priority,
     lsp_priority,
     docs == true,
+    docs_wrap == true,
     trigger_chars,
     saw_snippets,
     snippets_priority,

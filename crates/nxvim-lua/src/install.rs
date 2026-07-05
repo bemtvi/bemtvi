@@ -168,6 +168,15 @@ type PickerOpenArgs = (
     Option<bool>,
 );
 
+/// The number of `char`s before byte offset `byte` in `s` — to turn the markdown
+/// renderer's byte-anchored spans into the char columns `nx.markdown.render` reports.
+/// A `byte` at or past the end clamps to the char count.
+fn byte_to_char(s: &str, byte: usize) -> usize {
+    s.get(..byte.min(s.len()))
+        .map(|p| p.chars().count())
+        .unwrap_or_else(|| s.chars().count())
+}
+
 fn read_margin(cfg: &Table) -> mlua::Result<[u64; 4]> {
     let m: Option<Vec<u64>> = cfg.get("margin")?;
     Ok(match m {
@@ -366,6 +375,51 @@ pub(crate) fn install_vim(lua: &Lua, shared: &Rc<RefCell<Shared>>) -> mlua::Resu
     nx.set(
         "_strwidth",
         lua.create_function(|_, s: String| Ok(UnicodeWidthStr::width(s.as_str())))?,
+    )?;
+    // `nx._markdown_render(src)` (exposed by the prelude as `nx.markdown.render`):
+    // parse CommonMark+GFM `src` into stripped display lines + `@markup.*` highlight
+    // ranges, via the pure `nxvim_core::markdown` renderer (the same one the LSP doc
+    // floats use). Returns `{ lines = {..}, highlights = { {line, col_start, col_end,
+    // group}, .. }, fills = { {line, char, group}, .. } }` with 1-based line and
+    // **char** columns (`col_end` exclusive) so Lua layout code and callers index by
+    // column, not byte. `fills` are whole-line rules (thematic breaks / table
+    // separators): repeat `char` across that line. Pure — no editor state.
+    nx.set(
+        "_markdown_render",
+        lua.create_function(|lua, src: String| {
+            let rendered = nxvim_core::markdown::render(&src);
+            let out = lua.create_table()?;
+            let lines = lua.create_table()?;
+            for (i, line) in rendered.lines.iter().enumerate() {
+                lines.set(i + 1, line.as_str())?;
+            }
+            out.set("lines", lines)?;
+            let highlights = lua.create_table()?;
+            for (i, span) in rendered.spans.iter().enumerate() {
+                let line = rendered
+                    .lines
+                    .get(span.line)
+                    .map(String::as_str)
+                    .unwrap_or("");
+                let hl = lua.create_table()?;
+                hl.set("line", span.line + 1)?;
+                hl.set("col_start", byte_to_char(line, span.start) + 1)?;
+                hl.set("col_end", byte_to_char(line, span.end) + 1)?;
+                hl.set("group", span.group)?;
+                highlights.set(i + 1, hl)?;
+            }
+            out.set("highlights", highlights)?;
+            let fills = lua.create_table()?;
+            for (i, fill) in rendered.fills.iter().enumerate() {
+                let f = lua.create_table()?;
+                f.set("line", fill.line + 1)?;
+                f.set("char", fill.ch.to_string())?;
+                f.set("group", fill.group)?;
+                fills.set(i + 1, f)?;
+            }
+            out.set("fills", fills)?;
+            Ok(out)
+        })?,
     )?;
     // `nvim_set_hl(ns, name, opts)`: capture the group definition for the server
     // to fold into the core registry, keyed by namespace. `ns == 0` is the global
@@ -2703,6 +2757,7 @@ pub(crate) fn install_runtime_api(
         i32,
         i32,
         bool,
+        bool,
         String,
         bool,
         i32,
@@ -2724,6 +2779,7 @@ pub(crate) fn install_runtime_api(
                 buffer_priority,
                 lsp_priority,
                 docs,
+                docs_wrap,
                 trigger_chars,
                 snippets,
                 snippets_priority,
@@ -2741,6 +2797,7 @@ pub(crate) fn install_runtime_api(
                     buffer_priority,
                     lsp_priority,
                     docs,
+                    docs_wrap,
                     trigger_chars,
                     snippets,
                     snippets_priority,

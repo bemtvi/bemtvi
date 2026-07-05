@@ -1059,6 +1059,7 @@ impl EditHost {
                 has_async: req.has_async,
                 buffer_priority: req.buffer_priority,
                 docs: req.docs,
+                docs_wrap: req.docs_wrap,
                 trigger_chars: req.trigger_chars.chars().collect(),
             });
             // The built-in `lsp` source is server-native (LSP plumbing + edit
@@ -3038,6 +3039,125 @@ impl EditHost {
     /// else the unknown-command error), and repeat until nothing new is queued.
     /// Both queues feed each other — a user command can `vim.cmd(...)`, a `:lua`
     /// can define a command — so a single fixpoint loop covers them.
+    /// Refresh the **completion docs float** beside the popup — the doc-float-window
+    /// replacement for the old `menu.docs` overlay. Sources the selected row's docs
+    /// markdown (inline plugin `doc`, a plugin `resolve`'s cached docs, or an `lsp`
+    /// row's `detail` + `documentation`) and hands it to `open_completion_docs_float`,
+    /// which owns the placement + rendering; passes the configured `docs_wrap`. Closes
+    /// the float when no popup is open, docs are disabled, or the row has none. Called
+    /// once per settle from [`run_pending`](Self::run_pending) after the selection /
+    /// resolve is final — so it also updates when an async `completionItem/resolve` or
+    /// a plugin `resolve` reply lands (each re-settles).
+    pub(crate) fn sync_complete_docs_float(&mut self) {
+        if !self.editor.completion_active() || !self.editor.complete_docs_enabled() {
+            self.editor.close_completion_docs_float();
+            return;
+        }
+        let Some(md) = self.selected_complete_docs_md() else {
+            self.editor.close_completion_docs_float();
+            return;
+        };
+        let wrap = self.editor.complete_docs_wrap();
+        self.editor.open_completion_docs_float(&md, wrap);
+    }
+
+    /// The markdown the [`sync_complete_docs_float`](Self::sync_complete_docs_float)
+    /// renders for the actively-selected completion row, from whichever of the three
+    /// docs sources fits it: a plugin async row's **inline** `doc`; else a plugin row's
+    /// **resolve** handle whose docs the server fetched lazily into
+    /// `complete_resolve_docs`; else an `lsp` row whose `detail` + `documentation` live
+    /// in the server's LSP item cache. `None` for a noselect popup, a `buffer` row, or a
+    /// row whose lazy docs haven't landed yet.
+    fn selected_complete_docs_md(&self) -> Option<String> {
+        // Inline docs (a plugin source's `push { doc = … }`).
+        if let Some(doc) = self.editor.complete_selected_doc() {
+            return Some(doc);
+        }
+        // A plugin `resolve` handle → the server-fetched docs cache. On the wasm edit-host
+        // the plugin resolve path (`complete_plugin_maybe_resolve`) never runs, so the
+        // cache is always empty there and this simply yields `None`.
+        if let Some(id) = self.editor.complete_selected_resolve() {
+            return self.complete_resolve_docs.get(&id).cloned();
+        }
+        // An `lsp` row → the server's LSP item cache (`detail` + `documentation`). LSP
+        // completion runs on both builds (native locally, wasm over the daemon), so this
+        // is not native-gated — the web python demo shows completion docs too.
+        if let Some((key, true)) = self.editor.complete_selected() {
+            let item = self.lsp_complete.as_ref()?.items.get(key)?;
+            return self.lsp_complete_docs_md(item);
+        }
+        None
+    }
+
+    /// Refresh the **cmdline wildmenu docs** float beside the wildmenu box — the
+    /// doc-float-window replacement for the old `menu.docs` overlay on the cmdline path.
+    /// Plain help text (no markdown render): the highlighted catalog row's `doc`,
+    /// word-wrapped to the resolved width and bottom-aligned to the box (so it abuts the
+    /// command line alongside it), exactly as `project_cmdline_docs` placed it. Closes
+    /// the float when no wildmenu is open, docs are disabled, or no row is selected.
+    /// Called once per settle from [`run_pending`](Self::run_pending).
+    pub(crate) fn sync_cmdline_docs_float(&mut self) {
+        if !self.editor.cmdline_complete_active() || !self.editor.cmdline_complete_docs() {
+            self.editor.close_cmdline_docs_float();
+            return;
+        }
+        let Some(doc) = self.editor.cmdline_selected_doc() else {
+            self.editor.close_cmdline_docs_float();
+            return;
+        };
+        let lines: Vec<String> = doc
+            .lines()
+            .map(str::to_string)
+            .skip_while(|l| l.trim().is_empty())
+            .collect();
+        let Some((box_row, box_col, box_w, box_h, editor_w)) = self.editor.cmdline_menu_box()
+        else {
+            self.editor.close_cmdline_docs_float();
+            return;
+        };
+        if lines.is_empty() {
+            self.editor.close_cmdline_docs_float();
+            return;
+        }
+        /// Cap the docs float's content width / height (the wildmenu help preview).
+        const MAX_DOCS_W: usize = 60;
+        const MAX_DOCS_H: usize = 12;
+        let content_w = lines
+            .iter()
+            .map(|l| l.chars().count())
+            .max()
+            .unwrap_or(1)
+            .clamp(1, MAX_DOCS_W);
+        // Beside the box, bounded by the whole editor (the command line spans the full
+        // width), flipping to the side with more room — or nothing rather than a sliver.
+        let Some((docs_col, docs_w)) =
+            crate::redraw::place_docs_beside(box_col, box_w, content_w, editor_w)
+        else {
+            self.editor.close_cmdline_docs_float();
+            return;
+        };
+        // Word-wrap to the resolved width (the window carries the pre-wrapped lines, so
+        // its own `wrap` stays off — the lines already fit) and bottom-align to the box:
+        // the content bottom lands on the box's content bottom (`box_row + box_h`).
+        let wrapped = crate::redraw::wrap_doc_lines(&lines, docs_w);
+        let docs_h = wrapped
+            .len()
+            .min(MAX_DOCS_H)
+            .min((box_row + box_h).saturating_sub(1).max(1));
+        let docs_row = (box_row + box_h).saturating_sub(docs_h + 1);
+        // The float's OUTER box (border included) sits one row/col out so the content
+        // lands at `(docs_row, docs_col)` — flush against the box, the same cells the old
+        // bordered overlay drew its content in.
+        self.editor.open_cmdline_docs_float(
+            wrapped,
+            docs_row.saturating_sub(1),
+            docs_col.saturating_sub(1),
+            docs_w as u16,
+            docs_h,
+            false,
+        );
+    }
+
     pub(crate) fn run_pending(&mut self) {
         // Cap on fixpoint rounds before we conclude the queued work is
         // self-perpetuating — a command or `on_select` callback that re-queues
@@ -3412,6 +3532,13 @@ impl EditHost {
         // batch boundary, after everything has settled. Idempotent: a no-op when
         // nothing changed since the last per-key diff (the common case).
         self.emit_lifecycle_events();
+        // Refresh the completion docs float beside the popup (the doc-float-window
+        // replacement for the old `menu.docs` overlay) now that the selection / any
+        // landed resolve is final. It's excluded from the lifecycle diff above
+        // (`is_doc_float_window`), so replacing / repositioning it each keystroke fires
+        // no user window autocmds.
+        self.sync_complete_docs_float();
+        self.sync_cmdline_docs_float();
         // A reconcile that reloaded a buffer changed its `(path, disk-stat)` watch key
         // (a fresh inode after an atomic replace); re-arm the per-buffer watch so it
         // follows the file. Idempotent — `sync_buffer_watches` no-ops when keys match.

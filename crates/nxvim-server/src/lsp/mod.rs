@@ -39,7 +39,7 @@ pub(crate) struct PendingReplicaEdit {
 }
 
 mod completion;
-pub(crate) use completion::{complete_doc_lines, LspComplete};
+pub(crate) use completion::LspComplete;
 mod diagnostics;
 mod edit;
 mod folding;

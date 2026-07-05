@@ -52,6 +52,14 @@ pub const SNIPPET_NS: u32 = u32::MAX - 2;
 /// never collide with a plugin namespace. Sits just below [`SNIPPET_NS`].
 pub const LISTING_HL_NS: u32 = u32::MAX - 3;
 
+/// Reserved namespace for the markdown doc-float's rendered styling — the inline
+/// `@markup.*` highlight ranges, fenced-code syntax spans, and thematic-break
+/// [`line_fill`](VirtDecor::line_fill)s that [`Editor::open_markdown_float`] paints
+/// over the (reused) hover/doc scratch buffer, cleared and repainted on each new
+/// reply. Like the listing highlights it is a reserved range/decor namespace, set
+/// right after the content loads. Sits just below [`LISTING_HL_NS`].
+pub const DOC_MD_NS: u32 = u32::MAX - 4;
+
 /// neovim's `DEFAULT_PRIO` for extmark highlights — above the treesitter
 /// highlighter's baseline ([`TS_HL_PRIORITY`]), so a plugin / semantic-token
 /// mark wins over the base syntax color by default.

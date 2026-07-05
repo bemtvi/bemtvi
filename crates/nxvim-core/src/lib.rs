@@ -19,6 +19,7 @@ pub mod fuzzy;
 pub mod highlight;
 pub mod host;
 pub mod input;
+pub mod markdown;
 pub mod mode;
 pub mod options;
 pub mod search;
@@ -33,11 +34,11 @@ pub use clipboard::Clipboard;
 pub use editor::{
     command_pending_after, command_status, language_of_path, place_aligned, AcceptBehavior, Align,
     BorderStyle, BufferId, ClickSurface, CmdlineCandidate, CmdlineCompleteReq, CommandContinuation,
-    CommandPending, CommandStatus, CompleteConfig, CompleteDocsHit, CompleteKeys, Cursor,
-    DecorViewport, Editor, Extent, FileChangeAction, FileChangeReason, FileChangelist, FileFolds,
-    FileMarkEntry, FloatAnchor, FloatConfig, FloatRelative, GlobalMarkEntry, InputHistoryEntry,
-    JumpPos, LocListEntry, Margin, MenuGeom, MenuItem, MenuMetrics, MenuPlacement, MouseClick,
-    MousePos, NumberedMark, PendingOpen, PendingQuitAll, PendingSave, PersistState, PluginEntry,
+    CommandPending, CommandStatus, CompleteConfig, CompleteKeys, Cursor, DecorViewport, Editor,
+    Extent, FileChangeAction, FileChangeReason, FileChangelist, FileFolds, FileMarkEntry,
+    FloatAnchor, FloatConfig, FloatRelative, GlobalMarkEntry, InputHistoryEntry, JumpPos,
+    LocListEntry, Margin, MenuGeom, MenuItem, MenuMetrics, MenuPlacement, MouseClick, MousePos,
+    NumberedMark, PendingOpen, PendingQuitAll, PendingSave, PersistState, PluginEntry,
     PluginNamespace, PreviewScroll, PreviewTarget, PromptPos, QfAction, QfEntry, QfList, QfStack,
     QfWhich, RegisterEntry, SessionDock, SessionState, SessionTab, SessionWindow, ShadaRequest,
     StatuslineClick, TabId, TerminalOp, UndoEntry, UndoTreeView, WheelGesture, WindowConfigSpec,

@@ -1392,7 +1392,7 @@ fn chunk_runs_text(value: &Value) -> String {
 /// synopsis / blank / body layout keeps its paragraph break). Used by the cmdline
 /// wildmenu docs float so a long help line flows onto several rows instead of being
 /// cut off at the box's right border. Column = `char` count (the help text is ASCII).
-fn wrap_doc_lines(lines: &[String], width: usize) -> Vec<String> {
+pub(crate) fn wrap_doc_lines(lines: &[String], width: usize) -> Vec<String> {
     if width == 0 {
         return lines.to_vec();
     }
@@ -1446,7 +1446,7 @@ fn wrap_doc_lines(lines: &[String], width: usize) -> Vec<String> {
 /// width, in the bound area's own cells. `None` when neither side fits a readable
 /// width, so a caller shows no sidebar rather than a one-column sliver. Shared by
 /// both docs surfaces (insert-completion + the cmdline wildmenu).
-fn place_docs_beside(
+pub(crate) fn place_docs_beside(
     box_col: usize,
     box_width: usize,
     content_w: usize,
@@ -1716,20 +1716,6 @@ fn special_key_spans<S: AsRef<str>>(lines: &[S], tabstop: usize) -> Value {
     )
 }
 
-/// The completion docs sidebar's resolved geometry (text-area content cells) plus
-/// the selected row's total doc-line count — returned by
-/// [`EditHost::project_complete_docs`] so [`EditHost::project_menu`] can convert it
-/// to a global box and stash it in core for the wheel hit-test.
-struct CompleteDocsMeta {
-    row: usize,
-    col: usize,
-    w: usize,
-    h: usize,
-    total: usize,
-    /// The widest doc line (columns) — the horizontal scroll's upper bound.
-    max_w: usize,
-}
-
 /// Project the floating selectable-list [`MenuView`] into its redraw sub-map,
 /// computing the bordered box's anchor and content size. A `Cursor` box is in
 /// **text-area cells** (the client adds the gutter + text-area origin, then draws
@@ -1871,16 +1857,9 @@ impl EditHost {
         // area (frame-bottom, no number gutter) instead of the window's text inner.
         if matches!(m.placement, MenuPlacement::Cmdline) {
             map.push((Value::from("cmdline"), Value::from(true)));
-            // Its docs sidebar (Phase 3): the highlighted command's synopsis + help,
-            // a float beside the box. Feature-agnostic (the catalog candidates carry
-            // their docs inline — `selected_doc`), so unlike the insert-completion
-            // docs sidebar below this is NOT native-gated. Bounded by the WHOLE editor
-            // (`editor_w`), not the focused window: the wildmenu floats over the
-            // full-width command line, and `col` is a global command-line column — a
-            // split must not squeeze the docs into the active pane.
-            if let Some(docs) = self.project_cmdline_docs(m, row, col, width, height, editor_w) {
-                map.push((Value::from("docs"), docs));
-            }
+            // Its docs are no longer a `menu.docs` overlay — they render as a real
+            // doc-float window beside/below the box, opened during input handling
+            // (`EditHost::sync_cmdline_docs_float`). See the plan doc.
         }
         // The prompt query: present (even when empty) for a picker, absent for a
         // promptless `nx.ui.select`. Its presence tells the client to draw a prompt row,
@@ -1906,252 +1885,12 @@ impl EditHost {
         if let Some(preview) = preview {
             map.push((Value::from("preview"), preview));
         }
-        // The completion docs sidebar (Phase 4-D): a separate float beside a
-        // `Cursor`-placed completion popup rendering the selected `lsp` row's docs.
-        // Native-only (the docs come from the server's LSP item cache; the wasm
-        // edit-host has no language servers). Absent ⇒ the client draws no sidebar.
-        // It floats over the WHOLE editor (the which-key model), not the focused
-        // window — so a split (or a narrow pane) can't squeeze it into a useless
-        // sliver. Its geometry is computed against the editor windows area, with the
-        // popup box mapped from the focused window's text inner into region-relative
-        // (windows-area) cells: the `'padding'` (left + top) and the full gutter (sign
-        // + number column) offset.
-        if matches!(m.placement, MenuPlacement::Cursor) {
-            // The popup box's region-relative top-left. The horizontal gutter before
-            // the text is the window's *whole* text offset — the sign column AND the
-            // number column (the box content anchors past both). `number_width` alone
-            // drops the sign column, sliding the docs sidebar `sign_width` cells left
-            // of the popup it's meant to butt against.
-            let gutter = self
-                .editor
-                .window_textoff(focused.id)
-                .unwrap_or(focused.number_width);
-            let inner_x = focused.rect.x + focused.padding.left + gutter;
-            let inner_y = focused.rect.y + focused.padding.top;
-            let (abs_col, abs_row) = (inner_x + col, inner_y + row);
-            // The sidebar floats over the whole editor, but its geometry is
-            // region-relative (the client offsets it by the focused window's region
-            // origin), so bound it by the editor extent MINUS that region's screen
-            // origin — the left/top dock bands plus the global chrome — or it overruns
-            // the editor's right / bottom edge.
-            let (region_x, region_y) = self
-                .editor
-                .window_region_origin(focused.id)
-                .unwrap_or((0, 0));
-            let bound_w = editor_w.saturating_sub(region_x);
-            let bound_h = editor_h.saturating_sub(region_y);
-            if let Some((docs, meta)) =
-                self.project_complete_docs(m, abs_row, abs_col, width, bound_w, bound_h)
-            {
-                map.push((Value::from("docs"), docs));
-                // The docs geometry is region-relative (the client offsets it by the
-                // focused window's region origin), but the wheel hit-test runs in
-                // GLOBAL cells — so add that origin back when stashing the outer box
-                // (one cell out on every side for the border).
-                self.editor
-                    .stash_complete_docs_hit(Some(nxvim_core::CompleteDocsHit {
-                        x: (region_x + meta.col).saturating_sub(1),
-                        y: (region_y + meta.row).saturating_sub(1),
-                        w: meta.w + 2,
-                        h: meta.h + 2,
-                        total: meta.total,
-                        view_h: meta.h,
-                        max_w: meta.max_w,
-                        view_w: meta.w,
-                    }));
-            } else {
-                self.editor.stash_complete_docs_hit(None);
-            }
-        }
+        // The completion docs are no longer a `menu.docs` overlay projected here — they
+        // render as a **real doc-float window** beside the popup, opened during input
+        // handling (`EditHost::sync_complete_docs_float`) via `Editor::open_completion_docs_float`,
+        // which owns the placement and gets syntax highlighting + native wheel scroll
+        // for free (the hover model). See docs/plans/2026-07-05-completion-docs-real-window.md.
         Value::Map(map)
-    }
-
-    /// The completion **docs sidebar** (Phase 4-D — the widget-spec `preview =
-    /// "markdown"` kind in cursor placement): a float beside the popup rendering the
-    /// selected row's documentation. `None` unless the menu opted into docs
-    /// (`m.docs`), a row is actively selected (`m.selected_key`) and is an `lsp` row
-    /// (`m.selected_source_accept` — the only source whose item cache the server
-    /// holds), and that cached item actually carries docs. Rendered as plain lines
-    /// (like hover), placed to the right of the popup box and flipping to its left
-    /// when that side has more room.
-    ///
-    /// All geometry is **region-relative** (the focused window's region cells, which
-    /// the client offsets by that region's screen origin): `row`/`col` are the popup
-    /// box's top-left, and `(bound_w, bound_h)` is the editor extent left of / below
-    /// that origin — the float is bounded by the editor edges (overlapping other
-    /// splits) instead of being squeezed into a narrow focused pane, yet can't overrun
-    /// the editor's right / bottom edge. Returns `None` rather than a useless sliver
-    /// when neither side can fit a readable width.
-    fn project_complete_docs(
-        &self,
-        m: &MenuView,
-        row: usize,
-        col: usize,
-        width: usize,
-        bound_w: usize,
-        bound_h: usize,
-    ) -> Option<(Value, CompleteDocsMeta)> {
-        if !m.docs {
-            return None;
-        }
-        // Three docs sources feed this sidebar: a plugin async row carries its docs
-        // **inline** (`selected_doc`, Phase 4-E), rendered verbatim; or it carries a
-        // **resolve handle** (`selected_resolve`) whose docs the server fetched lazily
-        // into `complete_resolve_docs`; or an `lsp` row (`selected_source_accept`) has
-        // its docs in the server's LSP item cache. A `buffer` row has none.
-        let lines: Vec<String> = if let Some(doc) = m.selected_doc.as_deref().or_else(|| {
-            m.selected_resolve
-                .and_then(|id| self.complete_resolve_docs.get(&id))
-                .map(String::as_str)
-        }) {
-            doc.lines()
-                .map(str::to_string)
-                .skip_while(|l| l.trim().is_empty())
-                .collect()
-        } else if m.selected_source_accept {
-            let key = m.selected_key?;
-            let item = self.lsp_complete.as_ref()?.items.get(key)?;
-            crate::lsp::complete_doc_lines(item)
-        } else {
-            return None;
-        };
-        if lines.is_empty() {
-            return None;
-        }
-        /// Cap the docs float's content width — a long signature wraps off-screen
-        /// otherwise; the body is windowed, not a hard limit.
-        const MAX_DOCS_W: usize = 60;
-        /// Cap its height — a huge docstring shouldn't fill the screen beside a popup.
-        const MAX_DOCS_H: usize = 12;
-        let content_w = lines
-            .iter()
-            .map(|l| l.chars().count())
-            .max()
-            .unwrap_or(1)
-            .clamp(1, MAX_DOCS_W);
-        // Place beside the box, bounded by the editor's right edge — flipping to the
-        // side with more room and showing nothing rather than a 1-col sliver.
-        let (docs_col, docs_w) = place_docs_beside(col, width, content_w, bound_w)?;
-        // Clamp the height to the rows available below the float's top down to the
-        // editor's bottom edge (a full border costs 2).
-        let total = lines.len();
-        let docs_h = total
-            .min(MAX_DOCS_H)
-            .min(bound_h.saturating_sub(row).saturating_sub(2).max(1));
-        // Window the lines from the core-owned scroll offset — a wheel over the
-        // sidebar advances it (`Editor::scroll_complete_docs`). Clamp so a short tail
-        // can't scroll past the end (the offset is also reset to 0 on a selection
-        // change, so a new row's docs start at the top).
-        let scroll = self.editor.complete_docs_scroll().min(total - docs_h);
-        let shown = &lines[scroll..(scroll + docs_h).min(total)];
-        // Horizontal scroll: the widest doc line bounds the column offset; slice each
-        // visible line from there (the client renders from column 0). `docs_w` is the
-        // visible column count — the offset is clamped to it in `stash_complete_docs_hit`.
-        let max_w = lines.iter().map(|l| l.chars().count()).max().unwrap_or(0);
-        let hscroll = self
-            .editor
-            .complete_docs_hscroll()
-            .min(max_w.saturating_sub(docs_w));
-        let shown: Vec<String> = shown
-            .iter()
-            .map(|l| l.chars().skip(hscroll).collect())
-            .collect();
-        let value = Value::Map(vec![
-            (Value::from("lines"), display_lines_value(&shown)),
-            (Value::from("row"), Value::from(row as u64)),
-            (Value::from("col"), Value::from(docs_col as u64)),
-            (Value::from("width"), Value::from(docs_w as u64)),
-            (Value::from("height"), Value::from(docs_h as u64)),
-            // The geometry is region-relative (the focused window's region cells), so
-            // the client offsets it by that region's screen origin, not the window's
-            // text inner — the sidebar floats over the whole editor.
-            (Value::from("editor_relative"), Value::from(true)),
-        ]);
-        Some((
-            value,
-            CompleteDocsMeta {
-                row,
-                col: docs_col,
-                w: docs_w,
-                h: docs_h,
-                total,
-                max_w,
-            },
-        ))
-    }
-
-    /// The command-line wildmenu's **docs sidebar** (Phase 3): the highlighted
-    /// command's synopsis + description, a bordered float beside the menu box. The
-    /// catalog candidates carry their docs **inline** ([`MenuView::selected_doc`]),
-    /// so — unlike [`project_complete_docs`](Self::project_complete_docs), fed by the
-    /// native LSP item cache — this needs no language server and renders on the wasm
-    /// edit-host too (hence no `#[cfg(feature = "native")]`).
-    ///
-    /// `(row, col, width, height)` is the wildmenu box; `col` is a **global**
-    /// command-line column (the line spans the full width), and `editor_w` is the
-    /// whole editor the float is bounded by — the wildmenu floats over the full-width
-    /// command line, so a split doesn't scope its docs to the focused window. The
-    /// float sits beside the box, flipping to the side with more room, and
-    /// **bottom-aligns** to it so it abuts the command line alongside it: its bottom
-    /// border lands on the box's content bottom (`row + height`), placing its top at
-    /// `row + height − docs_h − 1`. `None` unless the menu opted into docs, a row is
-    /// actively selected, that row carries doc text, and a readable width fits.
-    fn project_cmdline_docs(
-        &self,
-        m: &MenuView,
-        row: usize,
-        col: usize,
-        width: usize,
-        height: usize,
-        editor_w: usize,
-    ) -> Option<Value> {
-        if !m.docs {
-            return None;
-        }
-        // `selected_doc` is `Some` only when a row is actively selected (the popup is
-        // noselect until the user navigates) and that catalog row carries a `doc`.
-        let lines: Vec<String> = m
-            .selected_doc
-            .as_deref()?
-            .lines()
-            .map(str::to_string)
-            .skip_while(|l| l.trim().is_empty())
-            .collect();
-        if lines.is_empty() {
-            return None;
-        }
-        /// Cap the docs float's content width.
-        const MAX_DOCS_W: usize = 60;
-        /// Cap its height so a long help text can't tower over the wildmenu.
-        const MAX_DOCS_H: usize = 12;
-        let content_w = lines
-            .iter()
-            .map(|l| l.chars().count())
-            .max()
-            .unwrap_or(1)
-            .clamp(1, MAX_DOCS_W);
-        // Place beside the box, bounded by the whole editor (the command line spans
-        // the full width) — flipping to the side with more room and showing nothing
-        // rather than a 1-col sliver.
-        let (docs_col, docs_w) = place_docs_beside(col, width, content_w, editor_w)?;
-        // Word-wrap the help text to the resolved box width so a long line flows onto
-        // several rows instead of being cut off at the right border (`wrap=true`).
-        let wrapped = wrap_doc_lines(&lines, docs_w);
-        // Bottom-align to the box: cap the height to the rows above the box's content
-        // bottom (`row + height`), reserving one for the float's own bottom border.
-        let docs_h = wrapped
-            .len()
-            .min(MAX_DOCS_H)
-            .min((row + height).saturating_sub(1).max(1));
-        let docs_row = (row + height).saturating_sub(docs_h + 1);
-        let shown = &wrapped[..docs_h.min(wrapped.len())];
-        Some(Value::Map(vec![
-            (Value::from("lines"), display_lines_value(shown)),
-            (Value::from("row"), Value::from(docs_row as u64)),
-            (Value::from("col"), Value::from(docs_col as u64)),
-            (Value::from("width"), Value::from(docs_w as u64)),
-            (Value::from("height"), Value::from(docs_h as u64)),
-        ]))
     }
 
     /// Project the list-less **content float** (`nx.ui.float`; LSP hover /

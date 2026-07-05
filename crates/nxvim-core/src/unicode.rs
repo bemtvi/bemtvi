@@ -67,6 +67,22 @@ pub fn display_width(s: &str) -> usize {
     UnicodeWidthStr::width(s)
 }
 
+/// The number of display **rows** `lines` occupy when soft-wrapped to `width` columns:
+/// each line takes `ceil(display_width / width)` rows (at least one, so a blank line
+/// still costs a row), summed. This is the height a `wrap`ped float needs to show the
+/// content without clipping — a single long line (a reflowed markdown paragraph) spans
+/// several rows. With `wrap` off, or a zero width, it is just the line count (each line
+/// truncates to one row).
+pub fn wrapped_row_count(lines: &[String], width: usize, wrap: bool) -> usize {
+    if !wrap || width == 0 {
+        return lines.len();
+    }
+    lines
+        .iter()
+        .map(|l| display_width(l).max(1).div_ceil(width))
+        .sum()
+}
+
 /// Virtual (screen-cell) column of byte offset `byte`: the cells occupied by
 /// `line[..byte]`, with tabs expanding to the next multiple of `tabstop` and
 /// wide characters counting as two (via `unicode-width`). If `byte` is not on a

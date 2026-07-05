@@ -490,15 +490,18 @@ impl EditHost {
     }
 
     /// Render a hover reply in the cursor-anchored **doc float** — a real,
-    /// non-focusable float window over a scratch buffer ([`Editor::open_doc_float`]),
-    /// so the (potentially long) markup scrolls with the mouse wheel and keyboard.
-    /// An empty reply shows a brief message instead of an empty float.
+    /// non-focusable float window over a scratch buffer, so the (potentially long)
+    /// markup scrolls with the mouse wheel and keyboard. The reply is markdown, so it
+    /// renders through [`Editor::open_markdown_float`]: the markup is *rendered*
+    /// (stripped + styled) rather than shown verbatim. An empty reply shows a brief
+    /// message instead of an empty float.
     pub(crate) fn show_hover(&mut self, lines: Vec<String>) {
         if lines.is_empty() {
             self.editor.echo(LspReqKind::Hover.empty_message());
             return;
         }
-        self.editor.open_doc_float("[Hover]", lines, "markdown");
+        self.editor
+            .open_markdown_float("[Hover]", &lines.join("\n"));
     }
 
     /// Render a signature-help reply in the cursor-anchored **doc float** (the same

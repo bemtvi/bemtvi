@@ -393,16 +393,7 @@ pub(crate) fn render(
             } else {
                 inner
             };
-            // The insert-completion docs sidebar is `editor_relative`, but its
-            // `col`/`row` are relative to the focused window's REGION origin (the
-            // server derives them from the window's region-local rect). So anchor it
-            // to that region's content rect — which carries any dock band offset —
-            // not the bare frame; otherwise a left/top dock slides the docs off the
-            // menu it sits beside (here it would overlap and erase the list).
-            let docs_base = view
-                .focused()
-                .map_or(editor_area, |w| dock.content(w.region));
-            render_menu(frame, base, docs_base, menu, &view.styles)
+            render_menu(frame, base, menu, &view.styles)
         }
         _ => None,
     };
@@ -2532,7 +2523,6 @@ fn render_pmenu(frame: &mut Frame, text_area: Rect, pmenu: &PmenuData, doc_scrol
 fn render_menu(
     frame: &mut Frame,
     text_area: Rect,
-    docs_base: Rect,
     menu: &MenuData,
     styles: &[nxvim_view::Style],
 ) -> Option<(u16, u16)> {
@@ -2748,34 +2738,9 @@ fn render_menu(
         render_preview(frame, preview_area, pv, &palette);
     }
 
-    // The docs sidebar: a separate bordered float beside the popup — the selected
-    // `lsp` row's documentation for an insert-completion popup (Phase 4-D), or the
-    // highlighted command's synopsis + help for the cmdline wildmenu (Phase 3). Its
-    // geometry is text-area-absolute. For an ordinary menu `text_area` IS the window
-    // text inner, so it renders directly; the cmdline wildmenu is drawn growing up
-    // from `cmd_area` (`area` is its box), so rebase onto the box's rendered position
-    // — a base whose origin maps text-area row `menu.row` back to the box's top frame
-    // row, columns staying in the gutter-free command-line space.
-    if let Some(docs) = &menu.docs {
-        let base = if menu.cmdline {
-            Rect {
-                x: text_area.x,
-                y: area.y.saturating_sub(menu.row),
-                width: text_area.width,
-                height: text_area.y.saturating_add(text_area.height),
-            }
-        } else if docs.editor_relative {
-            // The insert-completion sidebar floats over the focused window's whole
-            // REGION (its geometry is region-relative), not the window's text inner —
-            // so a split can't squeeze it into the focused pane — and `docs_base`
-            // carries the region's content origin (dock band included) so a dock
-            // shifts it with the menu.
-            docs_base
-        } else {
-            text_area
-        };
-        render_menu_docs(frame, base, docs, &menu.styles);
-    }
+    // (The completion / cmdline **docs** are no longer a `menu.docs` overlay — they
+    // render as real doc-float windows through the normal window path, so nothing to
+    // draw here.)
 
     // The terminal caret sits in the prompt (in the list column), past the `> `
     // prefix at the query's text-cursor column (clamped inside the column).
@@ -2877,60 +2842,6 @@ fn content_float_line(
         spans.push(Span::raw(" ".repeat(width - painted)));
     }
     Line::from(spans)
-}
-
-/// Draw the completion docs sidebar (Phase 4-D) as its own fully-bordered float at
-/// `docs`'s text-area-relative **content** geometry: the documentation lines (dimmed,
-/// like a hover) inside a box. A sibling of the completion popup, not a column within
-/// it; the server already positioned it beside the popup and clamped it on screen.
-/// `docs.col` names the inner content **column** (the same convention as the
-/// completion popup's one-cell-left-shifted content anchor), so the bordered box is
-/// drawn one cell left of it — the left border then lands flush against the popup's
-/// right border. `docs.row` is the box's top row as-is.
-fn render_menu_docs(
-    frame: &mut Frame,
-    text_area: Rect,
-    docs: &nxvim_view::MenuDocs,
-    styles: &nxvim_view::MenuStyles,
-) {
-    let x = text_area.x.saturating_add(docs.col).saturating_sub(1);
-    let y = text_area.y.saturating_add(docs.row);
-    let width = (docs.width.saturating_add(2)).min(text_area.right().saturating_sub(x));
-    let height = (docs.height.saturating_add(2)).min(text_area.bottom().saturating_sub(y));
-    let area = Rect {
-        x,
-        y,
-        width,
-        height,
-    };
-    if area.width < 3 || area.height < 3 {
-        return;
-    }
-    // Themed from the docs groups (`CmpDocumentation` / `CmpDocumentationBorder`,
-    // resolved server-side with `Pmenu` / `FloatBorder` fallbacks): the body bg and
-    // the border. When unset the box keeps its built-in look (no bg, plain border).
-    let body_style = styles.doc.map(rt).unwrap_or_default();
-    let mut block = Block::new().borders(Borders::ALL).style(body_style);
-    if let Some(b) = styles.doc_border.map(rt) {
-        block = block.border_style(b);
-    }
-    let inner = block.inner(area);
-    frame.render_widget(Clear, area);
-    frame.render_widget(block, area);
-    let w = inner.width as usize;
-    // Without a themed body the text reads as a dimmed hover; with one, the theme's
-    // own foreground carries the contrast, so don't dim it away.
-    let text_style = styles
-        .doc
-        .map(rt)
-        .unwrap_or_else(|| Style::default().add_modifier(Modifier::DIM));
-    let lines: Vec<Line> = docs
-        .lines
-        .iter()
-        .take(inner.height as usize)
-        .map(|l| Line::from(Span::styled(pmenu_row(l, "", w), text_style)))
-        .collect();
-    frame.render_widget(Paragraph::new(Text::from(lines)), inner);
 }
 
 /// Render the picker preview column: a dim title row (the file path) then the

@@ -223,6 +223,14 @@ if (h === 0) {
 // Source the serverless config surface (no daemon): the demo seed, the vendored / OPFS plugin
 // bundles, and a single-file OPFS `/init.lua`. In a daemon session this is skipped entirely —
 // the editor is born remote (see `applyRemoteConfigFromDaemon`).
+// Boot-time build assets (the demo seed + the vendored plugin bundle) are re-emitted on every
+// `build-demo` and MUST reflect the latest build. `serve.mjs` sends no cache headers, so a plain
+// `fetch()` lets the browser reuse a stale copy from its HTTP cache across soft reloads — which
+// shipped the OLD plugin bundle even after a rebuild (a bundled plugin's `nx.shada.plugin()` then
+// raised "attributes to no plugin" against the pre-fix amalgamation). `cache: "reload"` always
+// hits the network for these one-shot assets, so a rebuilt bundle reaches the VM on the next load.
+const FRESH = { cache: "reload" };
+
 async function sourceServerlessConfig() {
   // Demo build only: on FIRST boot, seed OPFS with the demo project + tour + init.lua
   // (web/demo-seed/, fetched as static assets). A sentinel (/.nxvim/.demo-seeded) makes this
@@ -232,12 +240,12 @@ async function sourceServerlessConfig() {
     try {
       const seeded = await opfsRead("/.nxvim/.demo-seeded"); // kind 1 = absent (not seeded yet)
       if (seeded.kind !== 0) {
-        const res = await fetch(new URL("demo-seed/manifest.json", import.meta.url));
+        const res = await fetch(new URL("demo-seed/manifest.json", import.meta.url), FRESH);
         if (!res.ok) throw new Error(`manifest HTTP ${res.status}`);
         const files = (await res.json()).files || [];
         const enc = new TextEncoder();
         for (const rel of files) {
-          const f = await fetch(new URL(`demo-seed/${rel}`, import.meta.url));
+          const f = await fetch(new URL(`demo-seed/${rel}`, import.meta.url), FRESH);
           if (!f.ok) throw new Error(`${rel} HTTP ${f.status}`);
           const w = await opfsWrite(`/${rel}`, enc.encode(await f.text()));
           if (!w.ok) throw new Error(`${rel}: ${w.error}`);
@@ -255,7 +263,7 @@ async function sourceServerlessConfig() {
   // resolve. A broken/missing bundle is surfaced non-fatally; the editor still boots.
   if (BUILD.plugins) {
     try {
-      const res = await fetch(new URL("vendor/plugins/plugins-bundle.lua", import.meta.url));
+      const res = await fetch(new URL("vendor/plugins/plugins-bundle.lua", import.meta.url), FRESH);
       if (res.ok) {
         const err = readStr(eh_source_lua(h, await res.text()));
         if (err) postMessage({ type: "config_error", error: "plugin bundle: " + err });

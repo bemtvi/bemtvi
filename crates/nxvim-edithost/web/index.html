@@ -2278,8 +2278,9 @@
       // background-highlighted. Plain text in Phase 3a (no syntax colours yet).
       if (hasPreview) {
         const pv = menu.preview;
-        // A glyph `│` separator divides the list column from the preview pane.
-        appendGlyphVRule(cx + listW, cy, boxRows, "single", borderCss || null);
+        // A glyph `│` separator divides the list column from the preview pane. Pass the
+        // themed bg so the strip tracks the colorscheme (else it stays `.popup-chrome` dark).
+        appendGlyphVRule(cx + listW, cy, boxRows, "single", borderCss || null, bgCss || null);
         const pre = document.createElement("div");
         pre.className = "pmenu";
         if (bgCss) pre.style.background = bgCss;
@@ -2531,11 +2532,15 @@
 
     // A vertical glyph separator column (`│`) `h` cells tall at (x, y) — the divider
     // between a picker's list column and its preview pane (the TUI draws it as part of
-    // the inner block; here it's a thin chrome strip over the shared bg).
-    function appendGlyphVRule(x, y, h, style = "single", borderColor = null) {
+    // the inner block; here it's a thin chrome strip over the shared bg). `bg` themes the
+    // strip off the widget's resolved background so it tracks the colorscheme; without it
+    // the `.popup-chrome` class' hardcoded dark bg stayed dark under a light theme while
+    // the list / preview panes beside it themed correctly.
+    function appendGlyphVRule(x, y, h, style = "single", borderColor = null, bg = null) {
       const G = floatBorderGlyphs(style);
       const col = document.createElement("div");
       col.className = "popup-chrome";
+      if (bg) col.style.background = bg;
       place(col, x, y, 1, h);
       for (let i = 0; i < h; i++) {
         const row = document.createElement("div");

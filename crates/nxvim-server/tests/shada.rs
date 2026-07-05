@@ -995,6 +995,60 @@ async fn plugin_namespace_is_assigned_from_location() {
 }
 
 #[tokio::test]
+async fn browser_bundled_plugin_attributes_via_its_named_chunk() {
+    // Regression for the python web demo crash "nx.shada.plugin: this caller attributes to
+    // no plugin". The browser build amalgamates every plugin's `lua/` tree into ONE Lua file
+    // that the wasm boot sources under the single chunk name `@init.lua` with an EMPTY
+    // runtimepath. A plugin that calls `nx.shada.plugin()` at load (e.g. nxvim-tree's session
+    // persistence) therefore attributed to nothing and raised — taking the whole config down.
+    //
+    // The fix is in the amalgamator: instead of an inline `preload = function() … end` (which
+    // inherits the bundle's `@init.lua` source), it compiles each module through
+    // `load(<src>, "@<root>/lua/<rel>")` — a plugin-scoped chunk name — and registers a
+    // synthetic runtimepath root, so a bundled plugin attributes to its own namespace exactly
+    // as a native install does. This drives both shapes to prove the contract the amalgamator
+    // now satisfies.
+    let (rpc, _incoming) = start_attached(ServerInit::default(), 80, 25).await;
+    let summary = exec_lua(
+        &rpc,
+        r#"
+        -- OLD (broken) amalgamator shape: an inline preload function DEFINED in the bundle
+        -- chunk, so its source is `@init.lua`; with no rtp entry for it, nx.shada.plugin()
+        -- can't attribute. Forge the exact bundle source name via `load(..., "@init.lua")`.
+        assert(load(
+          'package.preload["oldtree"] = function(...)\n' ..
+          '  return nx.shada.plugin().namespace\n' ..
+          'end',
+          "@init.lua"))()
+        local old_ok, old_err = pcall(require, "oldtree")
+
+        -- NEW (fixed) amalgamator shape: a synthetic rtp root + the module compiled under its
+        -- own `@<root>/lua/<rel>` chunk name. A module that persists at load resolves to the
+        -- install-dir-basename namespace and its write lands in that isolated slice.
+        nx._add_rtp("/nxvim-plugins/webtree")
+        package.preload["webtree"] = assert(load(
+          'nx.shada.plugin():set("v", 42)\nreturn nx.shada.plugin().namespace',
+          "@/nxvim-plugins/webtree/lua/webtree/init.lua"))
+        local new_ns = require("webtree")
+
+        return ("old_ok=%s old_err=%s new_ns=%s stored=%s"):format(
+          tostring(old_ok),
+          tostring(old_err ~= nil and old_err:find("attributes to no plugin", 1, true) ~= nil),
+          tostring(new_ns),
+          tostring(nx._shada_plugin_get("webtree", "v")))
+        "#,
+    )
+    .await;
+    assert_eq!(
+        summary.as_str(),
+        Some("old_ok=false old_err=true new_ns=webtree stored=42"),
+        "an inline bundle module (source @init.lua, no rtp) raises the attribution error, \
+         while the amalgamator's load-named chunk + synthetic rtp root attributes a bundled \
+         plugin to its own isolated namespace"
+    );
+}
+
+#[tokio::test]
 async fn plugin_namespace_tolerates_a_trailing_slash_rtp_entry() {
     // A runtimepath entry carried in with a TRAILING SLASH (e.g. `NXVIM_CONFIG=foo/`) must
     // still attribute the files under it: the prefix match trims the entry first, so it does

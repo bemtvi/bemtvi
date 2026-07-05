@@ -10,12 +10,36 @@
 // locals stay module-scoped, and the file's `return` becomes the module value `require`
 // hands back. (Verified end-to-end by verify-plugin-bundle.mjs.)
 //
+// Per-plugin IDENTITY. A module compiled inline shares the whole bundle's chunk name
+// (`@init.lua`, the name `source_config` gives it), so persistence attribution — which
+// derives a plugin's `nx.shada` namespace from the calling chunk's `@<path>` source under a
+// registered runtimepath entry — can't tell one bundled plugin from another and, with an
+// empty runtimepath, raises "this caller attributes to no plugin" (a plugin that calls
+// `nx.shada.plugin()` / `nx.view.create{ persist }` at load, e.g. nxvim-tree's session
+// persistence, crashes the whole config). So instead of an inline function literal we compile
+// each module through `load(<src>, "@<root>/lua/<rel>")` — giving it a distinct, plugin-scoped
+// chunk name — and register a synthetic runtimepath root (`nx._add_rtp`) per plugin. That
+// reproduces, in the browser, exactly the native attribution: a bundled plugin resolves to its
+// own install-dir-basename namespace, isolated from every other plugin and from the user config.
+//
 // Usage:
 //   node amalgamate-plugins.mjs [-o OUT.lua] PLUGIN_DIR [PLUGIN_DIR ...]
 // Each PLUGIN_DIR is a plugin repo root containing a `lua/` tree. With no -o, prints to
 // stdout. Also exported as `amalgamate(pluginDirs)` for direct use by the verifier.
 import { readdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
-import { join, relative, sep } from "node:path";
+import { basename, join, relative, sep } from "node:path";
+
+// Wrap `body` as a Lua long-bracket string with a level whose closer can't appear inside it,
+// so any module source (including one with its own `]]` / `]=]` long strings) round-trips. A
+// leading newline is prepended: Lua drops the first newline after the opener, so the module's
+// own line 1 stays line 1 and error tracebacks point at the real source line.
+function luaLongString(body) {
+  const content = `\n${body}`;
+  let level = 0;
+  while (content.includes(`]${"=".repeat(level)}]`)) level++;
+  const eq = "=".repeat(level);
+  return `[${eq}[${content}]${eq}]`;
+}
 
 // Map a .lua path (relative to a plugin's `lua/` dir) to its Lua module name, matching the
 // default `package.path` search order `?.lua;?/init.lua`:
@@ -56,16 +80,27 @@ export function amalgamate(pluginDirs) {
       throw new Error(`plugin has no lua/ directory: ${dir}`);
     }
     if (!entries.length) throw new Error(`plugin lua/ is empty: ${luaDir}`);
+    // A synthetic, browser-only runtimepath root for this plugin. Its basename IS the plugin's
+    // persistence namespace (matching the native "install-dir basename" fallback); the absolute
+    // `/nxvim-plugins/` prefix keeps it clear of any real MEMFS path so a stray relative
+    // `require` can never resolve against it. Registered once so the plugin's chunks attribute.
+    const root = `/nxvim-plugins/${basename(dir)}`;
+    out.push(`if nx and nx._add_rtp then nx._add_rtp(${JSON.stringify(root)}) end`);
     for (const { full, rel } of entries) {
       const mod = moduleName(rel);
       if (!mod) throw new Error(`cannot derive a module name for ${full}`);
       if (seen.has(mod)) throw new Error(`duplicate module "${mod}": ${seen.get(mod)} vs ${full}`);
       seen.set(mod, full);
       const body = readFileSync(full, "utf8");
-      out.push(`package.preload[${JSON.stringify(mod)}] = function(...)`);
-      // Trailing newline guards a final `-- comment` with no EOL from swallowing `end`.
-      out.push(body.endsWith("\n") ? body : `${body}\n`);
-      out.push("end");
+      // Compile the module through `load` with a plugin-scoped `@<root>/lua/<rel>` chunk name so
+      // its `nx.shada` / persistence calls attribute to this plugin (see the header note). `load`
+      // returns the module's function verbatim — the preload searcher hands it straight to
+      // `require`, whose `...` still carries the module name / path exactly as before.
+      const chunkName = `@${root}/lua/${rel.split(sep).join("/")}`;
+      out.push(
+        `package.preload[${JSON.stringify(mod)}] = ` +
+          `assert(load(${luaLongString(body)}, ${JSON.stringify(chunkName)}))`,
+      );
       out.push("");
     }
   }

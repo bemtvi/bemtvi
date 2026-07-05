@@ -311,6 +311,137 @@ async fn tabline_chrome_groups_resolve_into_the_frame_chrome() {
     );
 }
 
+#[tokio::test]
+async fn msg_area_chrome_group_resolves_into_the_frame_chrome() {
+    // The command-line / message row used to carry no dedicated chrome group, so a
+    // colorscheme (e.g. catppuccin) could not theme it — the row stayed the
+    // terminal default. `MsgArea` now bridges to the client as `chrome.msg_area`
+    // so the cmdline picks up the theme (issue: "the cmd line is not being themed").
+    let dir = temp_dir("msgarea_chrome");
+    std::fs::create_dir_all(dir.join("colors")).expect("create colors dir");
+    std::fs::write(
+        dir.join("colors").join("cat.lua"),
+        "vim.api.nvim_set_hl(0, 'Normal',  { fg = '#cdd6f4', bg = '#1e1e2e' })\n\
+         vim.api.nvim_set_hl(0, 'MsgArea', { fg = '#cdd6f4', bg = '#181825' })\n",
+    )
+    .expect("write colorscheme");
+    let (rpc, mut incoming) = start_with_config(&dir, "vim.cmd.colorscheme('cat')\n").await;
+
+    let map = redraw_after(&rpc, &mut incoming, "").await;
+    let chrome = field(&map, "chrome").expect("chrome map");
+    let styles = field(&map, "styles")
+        .and_then(Value::as_array)
+        .expect("styles palette");
+    let id = chrome_id(chrome, "msg_area").expect("MsgArea resolved as chrome.msg_area");
+    let style = match &styles[id] {
+        Value::Map(m) => m.as_slice(),
+        _ => panic!("style entry is not a map"),
+    };
+    assert_eq!(hl_color(style, "fg"), Some(hex("cdd6f4")));
+    assert_eq!(hl_color(style, "bg"), Some(hex("181825")));
+}
+
+#[tokio::test]
+async fn win_separator_chrome_group_resolves_into_the_frame_chrome() {
+    // Split / dock separators used to reuse the (often bright) StatusLine look.
+    // `WinSeparator` now bridges to the client as `chrome.win_separator`, so a
+    // theme's dim separator colour (e.g. catppuccin's near-background `crust`)
+    // reaches the renderer (issue: "the tui split/dock separators are too bright").
+    let dir = temp_dir("winsep_chrome");
+    std::fs::create_dir_all(dir.join("colors")).expect("create colors dir");
+    std::fs::write(
+        dir.join("colors").join("cat.lua"),
+        "vim.api.nvim_set_hl(0, 'StatusLine',   { fg = '#cdd6f4', bg = '#181825' })\n\
+         vim.api.nvim_set_hl(0, 'WinSeparator', { fg = '#11111b' })\n",
+    )
+    .expect("write colorscheme");
+    let (rpc, mut incoming) = start_with_config(&dir, "vim.cmd.colorscheme('cat')\n").await;
+
+    let map = redraw_after(&rpc, &mut incoming, "").await;
+    let chrome = field(&map, "chrome").expect("chrome map");
+    let styles = field(&map, "styles")
+        .and_then(Value::as_array)
+        .expect("styles palette");
+    let id =
+        chrome_id(chrome, "win_separator").expect("WinSeparator resolved as chrome.win_separator");
+    let style = match &styles[id] {
+        Value::Map(m) => m.as_slice(),
+        _ => panic!("style entry is not a map"),
+    };
+    assert_eq!(
+        hl_color(style, "fg"),
+        Some(hex("11111b")),
+        "the separator carries WinSeparator's dim foreground, not the status-line bg"
+    );
+}
+
+/// Resolve `chrome[key]`'s `fg` through the redraw's `styles` palette (`None` when
+/// the group is undefined for this frame).
+fn chrome_fg(map: &[(Value, Value)], key: &str) -> Option<u64> {
+    let chrome = field(map, "chrome")?;
+    let id = chrome_id(chrome, key)?;
+    let styles = field(map, "styles").and_then(Value::as_array)?;
+    match styles.get(id)? {
+        Value::Map(style) => hl_color(style, "fg"),
+        _ => None,
+    }
+}
+
+#[tokio::test]
+async fn colorscheme_switch_repaints_win_separator_after_a_split() {
+    // Repro: open under a dark theme, split so a separator exists, then switch to a
+    // light theme. The redraw after the switch must carry the NEW WinSeparator, not
+    // the stale dark one — else the split/dock separators keep the old theme's
+    // colour (a dark line on a light background).
+    let dir = temp_dir("winsep_switch");
+    std::fs::create_dir_all(dir.join("colors")).expect("create colors dir");
+    std::fs::write(
+        dir.join("colors").join("dark.lua"),
+        "vim.api.nvim_set_hl(0, 'Normal', { fg = '#cdd6f4', bg = '#1e1e2e' })\n\
+         vim.api.nvim_set_hl(0, 'WinSeparator', { fg = '#11111b' })\n",
+    )
+    .expect("write dark");
+    std::fs::write(
+        dir.join("colors").join("light.lua"),
+        "vim.api.nvim_set_hl(0, 'Normal', { fg = '#4c4f69', bg = '#eff1f5' })\n\
+         vim.api.nvim_set_hl(0, 'WinSeparator', { fg = '#dce0e8' })\n",
+    )
+    .expect("write light");
+    let (rpc, mut incoming) = start_with_config(&dir, "vim.cmd.colorscheme('dark')\n").await;
+
+    // A vertical split so the layout carries a separator.
+    let map = redraw_after(&rpc, &mut incoming, ":vsplit<CR>").await;
+    assert!(
+        field(&map, "separators")
+            .and_then(Value::as_array)
+            .map(|a| !a.is_empty())
+            .unwrap_or(false),
+        "the vsplit produced at least one separator"
+    );
+    assert_eq!(
+        chrome_fg(&map, "win_separator"),
+        Some(hex("11111b")),
+        "under the dark theme the separator is dark crust"
+    );
+
+    // Switch to the light theme; the next frame's win_separator must update.
+    let map2 = redraw_after(&rpc, &mut incoming, ":colorscheme light<CR>").await;
+    assert_eq!(
+        chrome_fg(&map2, "win_separator"),
+        Some(hex("dce0e8")),
+        "after switching themes the separator repaints to the light theme's WinSeparator"
+    );
+    // …and the frame must STILL carry the separators — a redraw that drops them
+    // makes a client paint none, leaving the stale (dark) cells from the prior frame.
+    assert!(
+        field(&map2, "separators")
+            .and_then(Value::as_array)
+            .map(|a| !a.is_empty())
+            .unwrap_or(false),
+        "the colorscheme-switch frame still carries the split separators"
+    );
+}
+
 /// The `style_id` a redraw's `chrome` map assigns to region `key`, if resolved.
 fn chrome_id(chrome: &Value, key: &str) -> Option<usize> {
     match chrome {

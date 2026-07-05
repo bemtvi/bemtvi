@@ -901,9 +901,17 @@ impl Renderer {
             self.build_window(view, win, win_scroll, rect, quads, items, image_draws);
         }
 
-        // Separators between splits — thin grey lines, each offset by its region's
-        // content origin like the windows they divide.
-        let sep = srgb_to_color(style_bg(&view.status_line).unwrap_or(0x40_40_40));
+        // Separators between splits — thin lines, each offset by its region's
+        // content origin like the windows they divide. Coloured by the theme's
+        // `WinSeparator` (its foreground is the line colour — e.g. catppuccin's dim
+        // `crust`), falling back to the status-line background when the colorscheme
+        // leaves `WinSeparator` undefined.
+        let sep = srgb_to_color(
+            style_fg(&view.win_separator)
+                .or_else(|| style_bg(&view.win_separator))
+                .or_else(|| style_bg(&view.status_line))
+                .unwrap_or(0x40_40_40),
+        );
         let mut line = |px: f32, py: f32, w: f32, h: f32| {
             quads.push(Quad {
                 x: px,
@@ -1415,8 +1423,16 @@ impl Renderer {
                     // it. Both walk the same highlight spans (see the methods).
                     self.push_reverse_fills(quads, win, view, text_x0, row, hl, inlay);
                     let vtext = win.virt_text.get(i).map(Vec::as_slice).unwrap_or(&[]);
+                    // `~` end-of-buffer filler rows (`numbers[i] == None`, no tokens)
+                    // paint with the theme's `EndOfBuffer` foreground rather than the
+                    // `Normal` text fg — matching the TUI and vim's default look.
+                    let row_fg = if matches!(win.numbers.get(i), Some(None)) {
+                        style_fg(&view.end_of_buffer).unwrap_or(fg)
+                    } else {
+                        fg
+                    };
                     let mut segments =
-                        row_segments(&display, hl, &view.styles, fg, normal_bg, win.leftcol);
+                        row_segments(&display, hl, &view.styles, row_fg, normal_bg, win.leftcol);
                     // Inline + overlay extmark `virt_text` transform the base segments
                     // (shift / overwrite); inlay hints splice in too. The common no-virt
                     // row keeps the cheaper inlay-only splice (tested path, untouched).
@@ -1431,7 +1447,7 @@ impl Renderer {
                     // to this window's text area so a line wider than the window cuts
                     // off at the edge instead of bleeding into the next split.
                     let pos = self.cell_px(text_run_origin(text_x0, win.leftcol), row as u16);
-                    self.push_text(items, &segments, pos, fg, text_clip);
+                    self.push_text(items, &segments, pos, row_fg, text_clip);
                     // Background quads for any segment whose group set a `bg` — a
                     // buffer-text span (a diff line tint, a colorscheme group with a
                     // background) or a virt_text chunk (inline / overlay badge). The
@@ -1789,7 +1805,12 @@ impl Renderer {
             } else {
                 format!("{}{}", view.cmdline_prefix, view.cmdline)
             };
-            (line, style_fg(&view.normal).unwrap_or(DEFAULT_FG))
+            (
+                line,
+                style_fg(&view.msg_area)
+                    .or_else(|| style_fg(&view.normal))
+                    .unwrap_or(DEFAULT_FG),
+            )
         } else if !view.message.is_empty() {
             // An error message paints with the theme's `ErrorMsg` foreground (a plain
             // red when the colorscheme leaves it undefined); else the default fg.

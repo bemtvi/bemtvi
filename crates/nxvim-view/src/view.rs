@@ -484,6 +484,10 @@ pub struct View {
     pub search_style: Option<Style>,
     pub incsearch_style: Option<Style>,
     pub status_line: Option<Style>,
+    /// The `WinSeparator` look — the split / dock border glyphs (`│` / `─`). `None`
+    /// when the colorscheme leaves it undefined, so the client falls back to the
+    /// status-line tint (vim's out-of-the-box separator look). Global.
+    pub win_separator: Option<Style>,
     /// Tabline chrome (`TabLine` / `TabLineSel` / `TabLineFill`): the inactive tab
     /// cells, the active tab cell, and the bar's fill (the strip past the last cell,
     /// plus a dock's title). `None` when the colorscheme leaves the group undefined —
@@ -496,6 +500,10 @@ pub struct View {
     /// line with (`message_error`). `None` when the colorscheme leaves it undefined,
     /// so the client falls back to a plain red foreground.
     pub error_msg: Option<Style>,
+    /// The `MsgArea` look — the command line / message row (vim's message area).
+    /// `None` when the colorscheme leaves it undefined, so the client paints the
+    /// row with `Normal` (vim's default: the message area tracks `Normal`). Global.
+    pub msg_area: Option<Style>,
     pub end_of_buffer: Option<Style>,
     /// Float chrome (`FloatBorder` / `NormalFloat` / `FloatTitle`). `None` when
     /// the colorscheme leaves the group undefined — the client then keeps its
@@ -812,10 +820,12 @@ impl View {
         self.search_style = chrome("search");
         self.incsearch_style = chrome("incsearch");
         self.status_line = chrome("status_line");
+        self.win_separator = chrome("win_separator");
         self.tabline_style = chrome("tabline");
         self.tabline_sel = chrome("tabline_sel");
         self.tabline_fill = chrome("tabline_fill");
         self.error_msg = chrome("error_msg");
+        self.msg_area = chrome("msg_area");
         self.end_of_buffer = chrome("end_of_buffer");
         self.float_border = chrome("float_border");
         self.normal_float = chrome("normal_float");

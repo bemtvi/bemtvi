@@ -61,6 +61,10 @@ fn bg(buf: &Buffer, x: u16, y: u16) -> Option<Color> {
     buf.cell((x, y)).and_then(|c| c.style().bg)
 }
 
+fn fg(buf: &Buffer, x: u16, y: u16) -> Option<Color> {
+    buf.cell((x, y)).and_then(|c| c.style().fg)
+}
+
 fn underline_color(buf: &Buffer, x: u16, y: u16) -> Option<Color> {
     buf.cell((x, y)).and_then(|c| c.style().underline_color)
 }
@@ -385,6 +389,85 @@ fn two_stacked_windows_each_paint_text_a_status_line_and_a_separator() {
     assert!(reversed(&buf, 0, 3), "top status reversed");
     assert!(reversed(&buf, 0, 8), "bottom status reversed");
     assert_eq!(row_text(&buf, 9).trim_end(), "");
+}
+
+#[test]
+fn separator_recolors_when_the_colorscheme_switches() {
+    // Repro of the reported bug: open under a dark theme, split (a separator
+    // appears), switch to a light theme. The separator must repaint to the new
+    // theme's WinSeparator, not keep the old dark colour. Uses the in-place
+    // `View::update` the live TUI client feeds each redraw through.
+    let windows = || {
+        Value::Array(vec![
+            window(rect(0, 0, 20, 4), false, "top.txt", &["top"]),
+            window(rect(0, 5, 20, 4), true, "bot.txt", &["bot"]),
+        ])
+    };
+    let separators = || {
+        Value::Array(vec![Value::Map(vec![
+            (Value::from("vertical"), Value::from(false)),
+            (Value::from("x"), Value::from(0u64)),
+            (Value::from("y"), Value::from(4u64)),
+            (Value::from("length"), Value::from(20u64)),
+        ])])
+    };
+    // Palette: 0 = dark WinSeparator fg + dark Normal bg, 1 = light WinSeparator fg
+    // + light Normal bg. WinSeparator carries only a fg (like catppuccin), so the
+    // separator cell's background must come from Normal — otherwise it keeps the
+    // terminal's own bg and reads as a dark strip on the light theme.
+    let styles = Value::Array(vec![
+        Value::Map(vec![(Value::from("fg"), Value::from(0x11_11_1bu64))]), // 0: dark sep fg
+        Value::Map(vec![(Value::from("fg"), Value::from(0xdc_e0_e8u64))]), // 1: light sep fg
+        Value::Map(vec![(Value::from("bg"), Value::from(0x1e_1e_2eu64))]), // 2: dark Normal bg
+        Value::Map(vec![(Value::from("bg"), Value::from(0xef_f1_f5u64))]), // 3: light Normal bg
+    ]);
+    let chrome = |sep: u64, normal: u64| {
+        Value::Map(vec![
+            (Value::from("win_separator"), Value::from(sep)),
+            (Value::from("normal"), Value::from(normal)),
+        ])
+    };
+
+    // Frame 1 — dark theme: the horizontal separator on row 4 is dark crust on the
+    // dark Normal background.
+    let mut v = view(vec![
+        ("windows", windows()),
+        ("separators", separators()),
+        ("styles", styles.clone()),
+        ("chrome", chrome(0, 2)),
+    ]);
+    let buf = paint(&v, 20, 10);
+    assert_eq!(row_text(&buf, 4), "─".repeat(20), "the separator is drawn");
+    assert_eq!(
+        fg(&buf, 0, 4),
+        Some(Color::Rgb(0x11, 0x11, 0x1b)),
+        "dark sep fg"
+    );
+    assert_eq!(
+        bg(&buf, 0, 4),
+        Some(Color::Rgb(0x1e, 0x1e, 0x2e)),
+        "the separator cell takes Normal's bg, not the terminal default"
+    );
+
+    // Frame 2 — switch to the light theme, fed through the same in-place update path
+    // the live client uses. Both the glyph and the cell bg must repaint.
+    v.update(&redraw(vec![
+        ("windows", windows()),
+        ("separators", separators()),
+        ("styles", styles.clone()),
+        ("chrome", chrome(1, 3)),
+    ]));
+    let buf2 = paint(&v, 20, 10);
+    assert_eq!(
+        fg(&buf2, 0, 4),
+        Some(Color::Rgb(0xdc, 0xe0, 0xe8)),
+        "after switching themes the separator glyph repaints light"
+    );
+    assert_eq!(
+        bg(&buf2, 0, 4),
+        Some(Color::Rgb(0xef, 0xf1, 0xf5)),
+        "…and the separator cell background repaints to the light Normal (not a dark strip)"
+    );
 }
 
 /// A window sub-map carrying a `region` (for dock layout tests). No status row.

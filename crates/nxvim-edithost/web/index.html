@@ -48,7 +48,10 @@
      a Nerd icon) overhangs into its neighbour like it should, instead of being
      overpainted by the next segment's opaque background (the GUI's bg-then-fg passes). */
   .sl-layer { position: absolute; left: 0; top: 0; height: 100%; white-space: pre; }
-  .sep { background: #181a1f; color: var(--gutter); position: absolute; }
+  /* The split/dock separator: the `WinSeparator` glyph (`--win-sep`, falling back to
+     the gutter colour) on the editor background (`--bg`) so the cell tracks the theme
+     rather than a hardcoded dark strip that stays dark under a light colorscheme. */
+  .sep { background: var(--bg, #181a1f); color: var(--win-sep, var(--gutter)); position: absolute; }
   /* Cursor shapes. Block reverses the cell; bar/underline are thin overlays. */
   .cur-block { background: var(--cursor); color: var(--bg); }
   .cur-bar { box-shadow: inset 2px 0 0 0 var(--cursor); }
@@ -1719,6 +1722,7 @@
       setVar("--eob", "end_of_buffer", "fg");
       setVar("--gutter", "line_nr", "fg");
       setVar("--gutter-cur", "cursor_line_nr", "fg");
+      setVar("--win-sep", "win_separator", "fg");
       setVar("--status-bg", "status_line", "bg");
       setVar("--status-fg", "status_line", "fg");
       setVar("--sel", "visual", "bg");

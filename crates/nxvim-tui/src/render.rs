@@ -95,6 +95,32 @@ fn status_line_style(view: &View) -> Style {
         .unwrap_or_else(|| Style::default().add_modifier(Modifier::REVERSED))
 }
 
+/// The style for the split separators and permanent-dock border glyphs: the
+/// theme's `WinSeparator` group when the colorscheme defines it, else the
+/// status-line tint (vim's out-of-the-box separator look — a colorscheme with no
+/// `WinSeparator` still reuses its status bar's colours here). Keeping this off
+/// [`status_line_style`] lets a theme give its separators a dimmer, distinct
+/// colour (e.g. catppuccin's near-background `crust`) instead of the brighter
+/// status-line background.
+fn separator_style(view: &View) -> Style {
+    let base = view
+        .win_separator
+        .map(rt)
+        .unwrap_or_else(|| status_line_style(view));
+    // `WinSeparator` commonly sets only a foreground (e.g. catppuccin's dim `crust`
+    // glyph colour). Without a background the separator cell — which sits *between*
+    // windows and is painted by no window — keeps the terminal's own background,
+    // showing as a dark strip between light windows on a light colorscheme. Give it
+    // the editor's `Normal` background (like vim, where a separator inherits Normal's
+    // bg) so the cell tracks the theme instead of the terminal.
+    if base.bg.is_none() {
+        if let Some(bg) = view.normal.map(rt).and_then(|s| s.bg) {
+            return base.bg(bg);
+        }
+    }
+    base
+}
+
 /// Paint a horizontal run of `glyph` (`len` cells wide) at `(x, y)` in `style`.
 fn paint_hline(frame: &mut Frame, x: u16, y: u16, len: u16, glyph: &str, style: Style) {
     if len == 0 {
@@ -648,7 +674,8 @@ impl DockLayout {
     fn render_borders(&self, frame: &mut Frame, view: &View) {
         // The permanent-dock edges use the **heavy** box-drawing glyphs (`━`/`┃`) so
         // a dock border reads as distinct from the light (`─`/`│`) split separators.
-        let style = status_line_style(view);
+        // They share the split separators' `WinSeparator` tint.
+        let style = separator_style(view);
         if self.dt > 0 {
             paint_hline(
                 frame,
@@ -1235,7 +1262,7 @@ fn paint_cursor_cell(
 /// (reverse-video out of the box), matching vim's `WinSeparator` default of
 /// reusing the status-line look. None to draw with a single window.
 fn render_separators(frame: &mut Frame, dock: &DockLayout, separators: &[Separator], view: &View) {
-    let style = status_line_style(view);
+    let style = separator_style(view);
     for sep in separators {
         // Each separator is relative to its region's content origin.
         let wins_area = dock.content(sep.region);
@@ -2310,24 +2337,43 @@ fn render_status(frame: &mut Frame, area: Rect, segments: &[StatusSegment], view
     frame.render_widget(Paragraph::new(Line::from(spans)).style(base), area);
 }
 
+/// The base style for the command-line / message row: the theme's `MsgArea`
+/// group layered over `Normal`, so the row picks up the colorscheme's background
+/// (vim's default — the message area tracks `Normal` unless `MsgArea` overrides
+/// it). Empty when no theme is loaded, leaving the terminal default.
+fn msg_area_style(view: &View) -> Style {
+    let base = view.normal.map(rt).unwrap_or_default();
+    match view.msg_area {
+        Some(m) => base.patch(rt(m)),
+        None => base,
+    }
+}
+
 fn render_command(frame: &mut Frame, area: Rect, view: &View) {
+    let base = msg_area_style(view);
+    // Fill the whole row with the message-area background first, so the idle row
+    // (and the blank tail past a short command / message) carries the theme rather
+    // than the terminal default.
+    frame.render_widget(Paragraph::new("").style(base), area);
     if view.command_mode {
         frame.render_widget(
-            Paragraph::new(format!("{}{}", cmdline_prompt_str(view), view.cmdline)),
+            Paragraph::new(format!("{}{}", cmdline_prompt_str(view), view.cmdline)).style(base),
             area,
         );
     } else if !view.message.is_empty() {
         // An error message paints with the theme's `ErrorMsg` (red foreground when
-        // the colorscheme leaves it undefined); a normal message keeps the default.
-        let mut para = Paragraph::new(view.message.as_str());
-        if view.message_error {
-            para = para.style(
+        // the colorscheme leaves it undefined); a normal message keeps the msg-area
+        // base.
+        let style = if view.message_error {
+            base.patch(
                 view.error_msg
                     .map(rt)
                     .unwrap_or_else(|| Style::default().fg(Color::Red)),
-            );
-        }
-        frame.render_widget(para, area);
+            )
+        } else {
+            base
+        };
+        frame.render_widget(Paragraph::new(view.message.as_str()).style(style), area);
     } else if !view.hidden_docks.is_empty() {
         // The idle command row advertises collapsed (hidden) docks as `▸{label}`
         // chips — the only on-screen hint a hidden dock still exists. A click on one
@@ -2341,7 +2387,7 @@ fn render_command(frame: &mut Frame, area: Rect, view: &View) {
             }
             spans.push(Span::styled(format!("▸{label}"), chip_style));
         }
-        frame.render_widget(Paragraph::new(Line::from(spans)), area);
+        frame.render_widget(Paragraph::new(Line::from(spans)).style(base), area);
     }
 }
 

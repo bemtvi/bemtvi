@@ -485,6 +485,10 @@ impl Editor {
                 return;
             }
         };
+        // The raw range text (`%`, `2,3`, …) preceding the command name. Line-range
+        // commands use the resolved `range`; the buffer-range commands (`:bdelete`
+        // & co.) re-parse this span as *buffer numbers* instead.
+        let range_text = &cmd[..cmd.len() - rest.len()];
         let rest = rest.trim_start();
         if rest.is_empty() {
             if range.explicit {
@@ -605,7 +609,9 @@ impl Editor {
             "bp" | "bN" | "bprev" | "bprevious" | "bNext" => self.ex_bprev(parse_count_arg(args)),
             "bf" | "bfirst" | "br" | "brewind" => self.ex_bfirst(),
             "bl" | "blast" => self.ex_blast(),
-            "bd" | "bdel" | "bdelete" | "bw" | "bwipe" | "bwipeout" => self.ex_bdelete(args, bang),
+            "bd" | "bdel" | "bdelete" | "bw" | "bwipe" | "bwipeout" => {
+                self.ex_bdelete(range.explicit, range_text, args, bang)
+            }
             // Quickfix / location-list ingest from a buffer. `:cbuffer` replaces the
             // list, `:caddbuffer` appends; the `:cget*` variants are identical here.
             // Every `:c*` has its `:l*` twin acting on the focused window's location

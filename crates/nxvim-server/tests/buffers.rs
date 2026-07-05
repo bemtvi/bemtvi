@@ -605,6 +605,65 @@ async fn bdelete_rebinds_other_windows_showing_the_buffer() {
     );
 }
 
+/// `:%bd` deletes every listed buffer (the buffer-number `%` range), leaving a
+/// single fresh `[No Name]` — never zero buffers.
+#[tokio::test]
+async fn percent_range_bdelete_wipes_every_buffer() {
+    let a = temp_file("a", "a\n");
+    let b = temp_file("b", "b\n");
+    let c = temp_file("c", "c\n");
+    let (rpc, _incoming) = start().await;
+
+    command(&rpc, &format!("e {}", name(&a))).await; // 1
+    command(&rpc, &format!("e {}", name(&b))).await; // 2
+    command(&rpc, &format!("e {}", name(&c))).await; // 3
+    assert_eq!(list_bufs(&rpc).await, vec![1, 2, 3]);
+
+    command(&rpc, "%bd").await;
+
+    // Every buffer gone; a fresh empty one takes their place.
+    let bufs = list_bufs(&rpc).await;
+    assert_eq!(bufs.len(), 1);
+    assert!(bufs[0] > 3, "the deleted ids are not reused");
+    assert_eq!(lines(&rpc).await, vec![""]);
+
+    std::fs::remove_file(&a).ok();
+    std::fs::remove_file(&b).ok();
+    std::fs::remove_file(&c).ok();
+}
+
+/// A numeric buffer range (`:2,3bd`) deletes exactly the buffers whose numbers
+/// fall in that inclusive span, and a leading single address (`:1bd`) deletes
+/// just that buffer.
+#[tokio::test]
+async fn numeric_range_bdelete_targets_buffers_by_number() {
+    let a = temp_file("a", "a\n");
+    let b = temp_file("b", "b\n");
+    let c = temp_file("c", "c\n");
+    let d = temp_file("d", "d\n");
+    let (rpc, _incoming) = start().await;
+
+    command(&rpc, &format!("e {}", name(&a))).await; // 1
+    command(&rpc, &format!("e {}", name(&b))).await; // 2
+    command(&rpc, &format!("e {}", name(&c))).await; // 3
+    command(&rpc, &format!("e {}", name(&d))).await; // 4 (current)
+    assert_eq!(list_bufs(&rpc).await, vec![1, 2, 3, 4]);
+
+    // Delete buffers 2 and 3 (not the current one) — no bang needed, unmodified.
+    command(&rpc, "2,3bd").await;
+    assert_eq!(list_bufs(&rpc).await, vec![1, 4]);
+    assert_eq!(lines(&rpc).await, vec!["d"], "current buffer unchanged");
+
+    // A single leading address deletes just that buffer.
+    command(&rpc, "1bd").await;
+    assert_eq!(list_bufs(&rpc).await, vec![4]);
+
+    std::fs::remove_file(&a).ok();
+    std::fs::remove_file(&b).ok();
+    std::fs::remove_file(&c).ok();
+    std::fs::remove_file(&d).ok();
+}
+
 #[tokio::test]
 async fn buffer_rpc_api_lists_reads_switches_and_creates() {
     let a = temp_file("a", "a1\na2\n");

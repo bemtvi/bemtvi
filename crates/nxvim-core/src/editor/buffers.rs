@@ -2045,15 +2045,123 @@ impl Editor {
         }
     }
 
-    /// `:bdelete` / `:bwipeout` — remove a buffer from the list (default the
-    /// current one). Refuses a modified buffer without `!`. When the current
-    /// buffer is removed, the window moves to the alternate (or the nearest
-    /// remaining id); removing the last buffer leaves a fresh `[No Name]`.
-    pub(crate) fn ex_bdelete(&mut self, args: &str, bang: bool) {
+    /// `:bdelete` / `:bwipeout` — remove buffers from the list. With no range or
+    /// argument, the current buffer; with a `{bufname}`/number argument, that one.
+    /// A leading ex range (`:%bd`, `:2,3bd`, `:1bd`) is interpreted as *buffer
+    /// numbers* (vim's `ADDR_BUFFERS`): `%` is every listed buffer, `N,M` the
+    /// existing buffers whose number falls in `[N, M]`. Refuses a modified buffer
+    /// without `!`. When the current buffer is removed, the window moves to the
+    /// alternate (or the nearest remaining id); removing the last buffer leaves a
+    /// fresh `[No Name]`.
+    pub(crate) fn ex_bdelete(
+        &mut self,
+        range_explicit: bool,
+        range_text: &str,
+        args: &str,
+        bang: bool,
+    ) {
+        if range_explicit {
+            match self.resolve_buffer_range(range_text) {
+                Ok(targets) => {
+                    for target in targets {
+                        self.delete_buffer(target, bang);
+                    }
+                }
+                Err(e) => self.echo(e),
+            }
+            return;
+        }
         let Some(target) = self.resolve_buffer(args) else {
             return;
         };
         self.delete_buffer(target, bang);
+    }
+
+    /// Resolve a raw ex range (`%`, `N`, `N,M`, `$`, `.`) as **buffer numbers**
+    /// for the buffer-range commands (`:bdelete` & co.). Returns the existing,
+    /// listed buffers whose id falls in the inclusive numeric span, in ascending
+    /// id order. `%` spans every listed buffer. A malformed range, or a single
+    /// numeric address naming a buffer that does not exist, fails loud (matching
+    /// `:b`'s `E86`).
+    fn resolve_buffer_range(&self, range_text: &str) -> Result<Vec<BufferId>, String> {
+        let listed: Vec<u64> = self
+            .buffer_ids()
+            .into_iter()
+            .filter(|id| self.is_listed_buffer(*id))
+            .map(|id| id.0)
+            .collect();
+
+        let text = range_text.trim();
+        let (lo, hi) = if text == "%" {
+            // `%` — the whole buffer list, first to last.
+            match (listed.first(), listed.last()) {
+                (Some(&f), Some(&l)) => (f, l),
+                _ => return Ok(Vec::new()),
+            }
+        } else {
+            let bytes = text.as_bytes();
+            let mut i = 0;
+            let lo = self.parse_buffer_address(text, &mut i)?;
+            let hi = if matches!(bytes.get(i), Some(b',') | Some(b';')) {
+                i += 1;
+                self.parse_buffer_address(text, &mut i)?
+            } else {
+                lo
+            };
+            if lo > hi {
+                return Err("E16: Invalid range".to_string());
+            }
+            (lo, hi)
+        };
+
+        // A single existing address (e.g. `:5bd`) with no listed buffer in range
+        // still targets that exact buffer number; an unopened one is an error.
+        if lo == hi && !listed.contains(&lo) {
+            if self.buffers.map.contains_key(&BufferId(lo)) {
+                return Ok(vec![BufferId(lo)]);
+            }
+            return Err(format!("E86: Buffer {lo} does not exist"));
+        }
+        Ok(listed
+            .into_iter()
+            .filter(|id| *id >= lo && *id <= hi)
+            .map(BufferId)
+            .collect())
+    }
+
+    /// Parse one buffer address at `*i`: `$` (last buffer), `.` (current), or a
+    /// literal buffer number. Advances `*i` past what it consumes. Fails loud on
+    /// an empty/unknown token so a bad range reports rather than guessing.
+    fn parse_buffer_address(&self, text: &str, i: &mut usize) -> Result<u64, String> {
+        let bytes = text.as_bytes();
+        let listed: Vec<u64> = self
+            .buffer_ids()
+            .into_iter()
+            .filter(|id| self.is_listed_buffer(*id))
+            .map(|id| id.0)
+            .collect();
+        match bytes.get(*i) {
+            Some(b'$') => {
+                *i += 1;
+                listed
+                    .last()
+                    .copied()
+                    .ok_or_else(|| "E16: Invalid range".to_string())
+            }
+            Some(b'.') => {
+                *i += 1;
+                Ok(self.cur_buffer().0)
+            }
+            Some(c) if c.is_ascii_digit() => {
+                let mut n = 0u64;
+                while let Some(d) = bytes.get(*i).filter(|b| b.is_ascii_digit()) {
+                    n = n.saturating_mul(10).saturating_add(u64::from(d - b'0'));
+                    *i += 1;
+                }
+                Ok(n)
+            }
+            _ => Err("E16: Invalid range".to_string()),
+        }
     }
 
     /// Remove buffer `target` from the editor — the shared core of `:bdelete` and

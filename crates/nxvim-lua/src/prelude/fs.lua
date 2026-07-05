@@ -75,9 +75,13 @@ end
 -- client, where a spawn has no real shell) — it rides the same off-tick fs seam as
 -- every other nx.fs op, so it works against local disk, a daemon, and OPFS alike.
 -- opts:
---   max     cap on files returned (default 50000) — a runaway guard on huge trees
---   hidden  include dotfiles / dotdirs (default false)
---   skip    set of directory basenames to prune (default { [".git"] = true })
+--
+-- ```
+-- max     cap on files returned (default 50000) — a runaway guard on huge trees
+-- hidden  include dotfiles / dotdirs (default false)
+-- skip    set of directory basenames to prune (default { [".git"] = true })
+-- ```
+--
 -- An unreadable subdirectory is skipped (not fatal). MUST be awaited inside nx.async.
 function nx.fs.walk(dir, opts)
   opts = opts or {}

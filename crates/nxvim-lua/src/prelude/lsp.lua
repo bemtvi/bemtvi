@@ -822,8 +822,10 @@ vim.lsp.inlay_hint = nx.lsp.inlay_hint
 -- `nx.lsp.foldexpr` is the canonical LSP foldexpr, the `foldmethod=expr` fold
 -- source backed by `textDocument/foldingRange`:
 --
---     nx.bo.foldmethod = "expr"
---     nx.bo.foldexpr   = "v:lua.nx.lsp.foldexpr()"
+-- ```lua
+-- nx.bo.foldmethod = "expr"
+-- nx.bo.foldexpr   = "v:lua.nx.lsp.foldexpr()"
+-- ```
 --
 -- nxvim recognizes that exact reference and folds the buffer from the language
 -- server's folding ranges (requested on open/change while the buffer wants LSP

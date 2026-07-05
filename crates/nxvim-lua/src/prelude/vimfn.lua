@@ -723,9 +723,11 @@ nx.setloclist = nx.qf.setloclist
 -- nx.qf.list(name, items[, opts]): create or replace the named list `name` from
 -- `items` (an array of entry dicts, the same shape setqflist takes), repainting its
 -- tab if open. Does NOT open or focus the tab — call nx.qf.show(name) for that.
---   opts.title  (string) the list title shown in the dock tab (defaults to `name`).
---   opts.action (string) "r" (default, replace in place) / " " (push a new list onto
---               the stack) / "a" (append to the current list).
+--
+--   * `opts.title` (string) — the list title shown in the dock tab (defaults to `name`).
+--   * `opts.action` (string) — `"r"` (default, replace in place) / `" "` (push a new
+--     list onto the stack) / `"a"` (append to the current list).
+--
 -- Returns the name.
 function nx.qf.list(name, items, opts)
   if type(name) ~= "string" or name == "" then

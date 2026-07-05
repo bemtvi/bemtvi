@@ -47,19 +47,23 @@ end
 -- holding it all in memory. `algo` is one of "sha1" / "sha256" / "sha512" / "md5"; an
 -- unknown name errors here, at construction. The returned object has two methods:
 --
---   h:update(chunk)  -- fold more raw bytes in; call as many times as you like
---   h:hexdigest()    -- lowercase-hex digest of everything fed so far. NON-consuming:
---                       you may read an intermediate digest and keep updating after.
+-- ```
+-- h:update(chunk)  -- fold more raw bytes in; call as many times as you like
+-- h:hexdigest()    -- lowercase-hex digest of everything fed so far. NON-consuming:
+--                     you may read an intermediate digest and keep updating after.
+-- ```
 --
 -- Drive it from a stream with nx.await_each — feed each chunk in as it arrives:
 --
---   nx.async(function()
---     local h = nx.hash.new("sha256")
---     for batch in nx.await_each(nx.run_stream({ cmd = "curl", args = { "-s", url } })) do
---       for _, line in ipairs(batch) do h:update(line) end
---     end
---     print(h:hexdigest())
---   end)()
+-- ```lua
+-- nx.async(function()
+--   local h = nx.hash.new("sha256")
+--   for batch in nx.await_each(nx.run_stream({ cmd = "curl", args = { "-s", url } })) do
+--     for _, line in ipairs(batch) do h:update(line) end
+--   end
+--   print(h:hexdigest())
+-- end)()
+-- ```
 --
 -- Note nx.run_stream is line-oriented (newlines are stripped from each batch). For a
 -- byte-exact digest of arbitrary binary output, feed the raw chunks from

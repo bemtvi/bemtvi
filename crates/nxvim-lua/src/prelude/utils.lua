@@ -23,8 +23,12 @@ nx.utils = nx.utils or {}
 -- one-shot sleep instead.
 --
 -- The result is callable AND carries:
---   :cancel()  drop a pending invocation (the next call re-arms)
---   :flush()   run a pending invocation now (no-op when idle)
+--
+-- ```
+-- :cancel()  drop a pending invocation (the next call re-arms)
+-- :flush()   run a pending invocation now (no-op when idle)
+-- ```
+--
 -- Each call (re)arms the timer; nothing fires until the calls stop for `ms`.
 function nx.utils.debounce(fn, ms)
   if type(fn) ~= "function" then

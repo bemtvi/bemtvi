@@ -480,12 +480,14 @@ nx.promise = M
 -- settles and evaluates to its value (or re-raises its rejection as a Lua error),
 -- so a sequence of awaits reads top-to-bottom with no nesting:
 --
---     local load = nx.async(function(path)
---       local stat = nx.await(fs.stat(path))
---       local data = nx.await(fs.read(path))
---       return parse(data, stat)
---     end)
---     load("init.lua"):next(use):catch(report)
+-- ```lua
+-- local load = nx.async(function(path)
+--   local stat = nx.await(fs.stat(path))
+--   local data = nx.await(fs.read(path))
+--   return parse(data, stat)
+-- end)
+-- load("init.lua"):next(use):catch(report)
+-- ```
 --
 -- A rejected await raises inside the coroutine, so you can handle it either way:
 -- wrap the await in `pcall` to catch it locally (PUC 5.2+ yields across a `pcall`

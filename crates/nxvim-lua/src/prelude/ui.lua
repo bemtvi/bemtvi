@@ -67,10 +67,12 @@ end
 -- nx.ui.select(items, opts) -> a PROMISE that resolves to the chosen item, or to
 -- nil on cancel (<Esc> / q). Promise-only: there is no on_choice argument (passing
 -- one is the old callback shape and errors loudly). The 1-based index is dropped —
--- recover it from the item, or use the vim.ui.select alias, which keeps it. opts:
---   prompt      = the label drawn above the list (default none)
---   format_item = item -> display string (default tostring); the original item
---                 round-trips to the resolved value regardless.
+-- recover it from the item, or use the vim.ui.select alias, which keeps it.
+--
+-- opts:
+--   * `prompt` — the label drawn above the list (default none).
+--   * `format_item` — an `item -> display string` mapper (default `tostring`); the
+--     original item round-trips to the resolved value regardless.
 function nx.ui.select(items, opts, on_choice)
   if on_choice ~= nil then
     error("nx.ui.select is promise-only: nx.ui.select(items, opts):next(fn)", 2)
@@ -131,28 +133,30 @@ end
 -- ----- nx.ui.input [alias vim.ui.input] --------------------------------------
 -- nx.ui.input(opts) -> a PROMISE that resolves to the entered string on <CR>, or
 -- to nil on <Esc> (cancel). Promise-only: there is no on_confirm argument (passing
--- one is the old callback shape and errors loudly). opts:
---   prompt  = the label drawn ahead of the editable line (default "")
---   default = text prefilled into the line, cursor at its end (default "")
---   history = a namespace string enabling readline-style recall: `<Up>`/`<Down>`
---             (and `<C-p>`/`<C-n>`) browse the prompts submitted under this
---             namespace, and each non-empty submission is recorded into it. Each
---             namespace is an independent ring, so one plugin's REPL history is
---             separate from another's. Session-only for now. Absent ⇒ no history.
---   complete = a function `(line, col) -> candidates` driving `<Tab>` autocomplete
---             (the inline wildmenu above the prompt line — `<Tab>`/`<S-Tab>` cycle,
---             `<CR>` accepts). `candidates` is a `{ {label, insert?, doc?, start?,
---             length?}, … }` list (`insert` defaults to `label`), OR a PROMISE of one —
---             so an async source (e.g. a DAP `completions` request) works. The token
---             completed is the trailing identifier run before the cursor, UNLESS a
---             candidate supplies `start` (0-based char offset into the line) + `length`
---             (chars), an explicit replace span that overrides the token for that row.
---             `col` is the cursor's 0-based char offset.
---   complete_docs = show the side docs pane rendering each candidate's `doc` beside
---             the list (default true when `complete` is set; `false` suppresses it).
---   complete_debounce = ms to coalesce refresh queries (narrowing an open menu as you
---             type) so an async source isn't a wire round-trip per keystroke; the
---             initial `<Tab>` is always immediate (default 100; `0` disables it).
+-- one is the old callback shape and errors loudly).
+--
+-- opts:
+--   * `prompt` — the label drawn ahead of the editable line (default `""`).
+--   * `default` — text prefilled into the line, cursor at its end (default `""`).
+--   * `history` — a namespace string enabling readline-style recall: `<Up>`/`<Down>`
+--     (and `<C-p>`/`<C-n>`) browse the prompts submitted under this namespace, and each
+--     non-empty submission is recorded into it. Each namespace is an independent ring,
+--     so one plugin's REPL history is separate from another's. Session-only for now.
+--     Absent ⇒ no history.
+--   * `complete` — a function `(line, col) -> candidates` driving `<Tab>` autocomplete
+--     (the inline wildmenu above the prompt line — `<Tab>`/`<S-Tab>` cycle, `<CR>`
+--     accepts). `candidates` is a `{ {label, insert?, doc?, start?, length?}, … }` list
+--     (`insert` defaults to `label`), OR a PROMISE of one — so an async source (e.g. a
+--     DAP `completions` request) works. The token completed is the trailing identifier
+--     run before the cursor, UNLESS a candidate supplies `start` (0-based char offset
+--     into the line) + `length` (chars), an explicit replace span that overrides the
+--     token for that row. `col` is the cursor's 0-based char offset.
+--   * `complete_docs` — show the side docs pane rendering each candidate's `doc` beside
+--     the list (default true when `complete` is set; `false` suppresses it).
+--   * `complete_debounce` — ms to coalesce refresh queries (narrowing an open menu as
+--     you type) so an async source isn't a wire round-trip per keystroke; the initial
+--     `<Tab>` is always immediate (default 100; `0` disables it).
+--
 -- The server owns the prompt: it opens the editor's command line as a labelled
 -- Prompt (Editor::open_prompt), and delivers the result to nx._cb_fns[id] through
 -- the shared prompt_results channel. Non-blocking (ADR 0002 rule 3): the call
@@ -267,9 +271,11 @@ end
 -- ----- nx.ui.confirm ---------------------------------------------------------
 -- nx.ui.confirm(message, opts) -> a PROMISE that resolves to a boolean — true on
 -- Yes, false on No or cancel (<Esc>). Promise-only: there is no on_choice argument
--- (the old callback forms — a third arg, or opts-as-function — error loudly). opts
--- (optional):
---   default = true | false  -- which button <CR> selects (default true = Yes)
+-- (the old callback forms — a third arg, or opts-as-function — error loudly).
+--
+-- opts (optional):
+--   * `default` — `true` | `false`, which button `<CR>` selects (default `true` = Yes).
+--
 -- nx-native (no vim.ui twin): neovim spells this blocking vim.fn.confirm, which the
 -- nx model omits (rule 3). For an arbitrary multi-choice menu use nx.ui.select
 -- instead — confirm is deliberately just yes/no. The server opens a single-keypress
@@ -419,16 +425,17 @@ end
 -- `{ {text, hl_group?}, … }` (neovim's virt_text shape): each chunk paints its
 -- text in `hl_group`, so a row can colour its key one group and its description
 -- another, or dim a whole row with a `Comment`/dim group. Plain and chunk rows mix
--- freely; a plain row is just one un-grouped chunk. `opts`:
---   border   = "none"|"single"|"rounded"|"double"|"solid"  (default "rounded")
---   title    = a string drawn on the top border (optional)
---   relative = "cursor" (default, anchors at the cursor) | "editor" (centered) |
---              "bottom" (pinned to the editor's bottom-right corner — the
---              which-key shape)
---   persist  = when truthy, the float survives keystrokes (it is not dismissed by
---              the next key) and nx.ui.float returns a HANDLE with :update(contents,
---              opts) / :close() / :is_open(). This is the surface a key-observer
---              plugin (e.g. which-key) renders through, refreshing it as keys arrive.
+-- freely; a plain row is just one un-grouped chunk.
+--
+-- opts:
+--   * `border` — `"none"|"single"|"rounded"|"double"|"solid"` (default `"rounded"`).
+--   * `title` — a string drawn on the top border (optional).
+--   * `relative` — `"cursor"` (default, anchors at the cursor) | `"editor"` (centered)
+--     | `"bottom"` (pinned to the editor's bottom-right corner — the which-key shape).
+--   * `persist` — when truthy, the float survives keystrokes (it is not dismissed by
+--     the next key) and nx.ui.float returns a HANDLE with `:update(contents, opts)` /
+--     `:close()` / `:is_open()`. This is the surface a key-observer plugin (e.g.
+--     which-key) renders through, refreshing it as keys arrive.
 -- Without `persist` it is fire-and-forget: the server owns the float, its
 -- geometry, and its dismissal (the next key closes it); returns nil. Empty
 -- contents open nothing. LSP hover and signature help use the non-persistent form.

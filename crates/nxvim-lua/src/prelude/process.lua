@@ -47,10 +47,12 @@ end
 -- with empty output — exactly like vim.system. Await it inside nx.async, or chain
 -- with :next / :catch:
 --
---   nx.async(function()
---     local r = nx.await(nx.run({ cmd = "git", args = { "rev-parse", "HEAD" } }))
---     if r.code == 0 then nx.print(r.stdout) end
---   end)()
+-- ```lua
+-- nx.async(function()
+--   local r = nx.await(nx.run({ cmd = "git", args = { "rev-parse", "HEAD" } }))
+--   if r.code == 0 then nx.print(r.stdout) end
+-- end)()
+-- ```
 --
 -- The one-shot promise twin of nx.run_stream (stream stdout as it arrives). For a
 -- duplex child whose stdin stays open for a framed protocol (LSP/DAP) use
@@ -111,12 +113,14 @@ end
 -- nx.await_each inside an nx.async function; call :kill() to reap the child early
 -- (e.g. a superseded query):
 --
---   nx.async(function()
---     local stream = nx.run_stream({ cmd = "rg", args = { "TODO" } })
---     for batch in nx.await_each(stream) do
---       for _, line in ipairs(batch) do nx.print(line) end
---     end
---   end)()
+-- ```lua
+-- nx.async(function()
+--   local stream = nx.run_stream({ cmd = "rg", args = { "TODO" } })
+--   for batch in nx.await_each(stream) do
+--     for _, line in ipairs(batch) do nx.print(line) end
+--   end
+-- end)()
+-- ```
 function nx.run_stream(spec)
   if type(spec) ~= "table" then
     error("nx.run_stream: expected a table { cmd, args, ... }, got " .. type(spec), 2)
@@ -154,9 +158,11 @@ end
 -- resolves nil). MUST run inside an nx.async function (nx.await suspends the
 -- enclosing coroutine).
 --
---   for batch in nx.await_each(stream) do
---     for _, line in ipairs(batch) do ... end
---   end
+-- ```lua
+-- for batch in nx.await_each(stream) do
+--   for _, line in ipairs(batch) do ... end
+-- end
+-- ```
 function nx.await_each(stream)
   return function()
     return nx.await(stream:next())

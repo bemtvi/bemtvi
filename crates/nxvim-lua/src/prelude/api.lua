@@ -446,14 +446,21 @@ end
 -- engine) so a plugin can jump straight to a section (a conflict marker, a heading).
 --
 -- opts (all optional):
---   plain      = false           -- literal substring (ignores `engine`)
---   engine     = "pcre" | "vim"  -- regex dialect (default "pcre")
---   from       = { line=1, col=0 } -- start position: 1-based line, 0-based byte col
---   backward   = false           -- search upward from `from` instead of down
---   ignorecase = false           -- case-insensitive match
+--
+-- ```
+-- plain      = false             -- literal substring (ignores `engine`)
+-- engine     = "pcre" | "vim"    -- regex dialect (default "pcre")
+-- from       = { line=1, col=0 } -- start position: 1-based line, 0-based byte col
+-- backward   = false             -- search upward from `from` instead of down
+-- ignorecase = false             -- case-insensitive match
+-- ```
 --
 -- Returns nil when there is no match, else:
---   { line, col, end_line, end_col, text, captures }
+--
+-- ```
+-- { line, col, end_line, end_col, text, captures }
+-- ```
+--
 -- with `line`/`end_line` 1-based, `col`/`end_col` 0-based byte offsets (end
 -- exclusive), `text` the matched substring, and `captures` the submatch strings
 -- (`\1`.., "" for a group that didn't participate). Matching is line-by-line, so a
@@ -474,30 +481,37 @@ end
 -- invalid pattern.
 --
 -- opts (all optional):
---   engine     = "pcre" | "vim"  -- regex dialect (default "pcre", the `regex` crate)
---   plain      = false           -- match the pattern literally (ignores `engine`)
---   ignorecase = false           -- case-insensitive match
+--
+-- ```
+-- engine     = "pcre" | "vim"  -- regex dialect (default "pcre", the `regex` crate)
+-- plain      = false           -- match the pattern literally (ignores `engine`)
+-- ignorecase = false           -- case-insensitive match
+-- ```
 --
 -- Offsets follow the `string` library: 1-based and byte-based, with `:find`'s `end`
 -- inclusive, so `s:sub(re:find(s))` is the matched text. The returned object has:
 --
---   re:find(s, init?)   -> start, end, cap1, … | nil   (like string.find)
---   re:match(s, init?)  -> the capture(s), or the whole match if the pattern has
---                          none, or nil                 (like string.match)
---   re:gmatch(s)        -> iterator over each match's captures (or whole match)
---                                                        (like string.gmatch)
---   re:gsub(s, repl, n?) -> newstring, count            (like string.gsub)
---       repl is a string (`%0` whole match, `%1`-`%9` captures, `%%` literal `%`),
---       a function called with the captures (return nil/false to keep the match),
---       or a table keyed by the first capture.
---   re:test(s)          -> boolean: does the pattern match anywhere
+-- ```
+-- re:find(s, init?)    -> start, end, cap1, … | nil   (like string.find)
+-- re:match(s, init?)   -> the capture(s), or the whole match if the pattern
+--                         has none, or nil            (like string.match)
+-- re:gmatch(s)         -> iterator over each match's captures or whole match
+--                                                     (like string.gmatch)
+-- re:gsub(s, repl, n?) -> newstring, count            (like string.gsub)
+--     repl is a string (`%0` whole match, `%1`-`%9` captures, `%%` literal `%`),
+--     a function called with the captures (return nil/false to keep the match),
+--     or a table keyed by the first capture.
+-- re:test(s)           -> boolean: does the pattern match anywhere
+-- ```
 --
 -- `init` is 1-based and may be negative to count from the end, as in string.find.
 --
---   local re = nx.regex([[(\w+)@(\w+)]])
---   local _, _, user, host = re:find("to jo@acme now")  -- "jo", "acme"
---   for word in nx.regex([[\w+]]):gmatch("one two") do ... end
---   local masked = nx.regex([[\d]]):gsub("id 42", "*")  -- "id **"
+-- ```lua
+-- local re = nx.regex([[(\w+)@(\w+)]])
+-- local _, _, user, host = re:find("to jo@acme now")  -- "jo", "acme"
+-- for word in nx.regex([[\w+]]):gmatch("one two") do ... end
+-- local masked = nx.regex([[\d]]):gsub("id 42", "*")  -- "id **"
+-- ```
 function nx.regex(pattern, opts)
   return nx._regex(pattern, opts)
 end

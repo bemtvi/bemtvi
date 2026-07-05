@@ -271,7 +271,7 @@ local function trig_str(list)
 end
 
 local Manager = nx.view.component({
-  setup = function(ctx)
+  setup = function(ctx, props)
     -- `tick` forces a re-render when manager state (non-reactive: tasks / load flags)
     -- changes; `spin` advances the spinner; `status` holds the disk-checked installed
     -- map; `expanded` tracks which rows show details.
@@ -399,6 +399,14 @@ local Manager = nx.view.component({
         ctx.wo.padding = "1 2"
       end)
       :catch(function() end)
+
+    -- First-run / `:PluginsWelcome` opens the manager WITH an install to run (rather
+    -- than syncing silently in the background): kick it off once mounted so the
+    -- dashboard shows the live per-plugin progress (spinner → ✓/✗) and pops the
+    -- restart notice on completion, right here in the same reused verb path as `S`.
+    if props and props.sync_on_open then
+      run_installing(M.sync())
+    end
 
     return { state = state, line_to_name = line_to_name }
   end,
@@ -555,8 +563,11 @@ local Manager = nx.view.component({
   end,
 })
 
--- M.ui.open() — open (or, if already open, leave focused) the manager dashboard.
-function M.ui.open()
+-- M.ui.open(opts) — open (or, if already open, leave focused) the manager dashboard.
+-- `opts.sync_on_open` makes the freshly-mounted manager run a sync immediately (the
+-- welcome / first-run path: show the dashboard, then the live install status), reusing
+-- the same verb path as pressing `S`. Ignored if the manager is already open.
+function M.ui.open(opts)
   if M.ui._instance and not M.ui._instance._closed then
     return M.ui._instance
   end
@@ -572,7 +583,7 @@ function M.ui.open()
       title = "  nxvim plugins  ",
       grab = true,
     },
-    props = {},
+    props = { sync_on_open = opts and opts.sync_on_open or nil },
   })
   return M.ui._instance
 end
@@ -603,7 +614,9 @@ nx.command("PluginsWelcome", function()
       return nx.async(function()
         nx.await(M._persist_recommended(chosen))
         M.add(chosen)
-        nx.await(M.sync())
+        -- Open the manager and let IT run the install, so the chosen set installs in
+        -- view (live progress) instead of silently in the background.
+        M.ui.open({ sync_on_open = true })
       end)()
     end)
     :catch(function(err)

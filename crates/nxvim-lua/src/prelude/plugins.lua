@@ -1034,7 +1034,15 @@ function M.bootstrap()
     end
     nx.await(M._persist_recommended(chosen))
     M.add(chosen)
-    nx.await(M.sync())
+    -- Open the manager dashboard and let IT run the install, so first-run shows the
+    -- live per-plugin progress (spinner → ✓/✗ + the restart notice) instead of
+    -- installing silently in the background. Fall back to a plain sync in a headless
+    -- build that stubbed the UI out.
+    if M.ui and M.ui.open then
+      M.ui.open({ sync_on_open = true })
+    else
+      nx.await(M.sync())
+    end
   end)()
 end
 

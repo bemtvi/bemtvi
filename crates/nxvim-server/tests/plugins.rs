@@ -600,6 +600,40 @@ async fn first_run_offers_recommended_and_persists_on_yes() {
     );
 }
 
+// The first-run flow must not install silently in the background: confirming the
+// welcome checklist OPENS THE MANAGER DASHBOARD, and the chosen set installs THERE
+// with live per-plugin status. (Regression: bootstrap used to `await M.sync()` with
+// no UI, so the welcome vanished and installs ran invisibly.)
+#[tokio::test]
+async fn welcome_confirm_opens_the_manager_and_installs_there() {
+    let (rpc, _i) = start().await;
+    let src = temp_dir("plug_wman_src");
+    let repo = make_repo(&src, "iota");
+    let (_root, _cfg) = setup_root_and_config(&rpc, "plug_wman").await;
+
+    exec_lua(
+        &rpc,
+        &format!(
+            "nx.plugins.recommend({{ {{ \"file://{repo}\", name = \"iota\" }} }})\n\
+             nx.plugins.bootstrap()",
+            repo = q(&repo)
+        ),
+    )
+    .await;
+    assert!(poll_true(&rpc, "return vim.bo.filetype == 'nxpluginswelcome'").await);
+
+    // Confirming the welcome hands off to the manager dashboard (not a silent sync)…
+    assert!(
+        feed_until(&rpc, "<CR>", "return vim.bo.filetype == 'nxplugins'").await,
+        "confirming the welcome should open the manager dashboard"
+    );
+    // …and the install runs THERE — the chosen plugin ends up cloned + loaded.
+    assert!(
+        poll_true(&rpc, "return nx.plugins._loaded.iota == true").await,
+        "the manager should install the chosen set with live status"
+    );
+}
+
 // Skipping the welcome (Esc) records the marker (so it never asks again) and writes
 // nothing to the user's config.
 #[tokio::test]

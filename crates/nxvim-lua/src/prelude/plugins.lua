@@ -30,9 +30,10 @@ M._loaded = M._loaded or {} -- name -> true once fully loaded (config ran)
 M._loading = M._loading or {} -- name -> true while a load is in flight (cycle guard)
 
 -- Per-plugin operation state, so a UI can render LIVE progress (a spinner while a
--- clone/pull runs, a ✓/✗ when it finishes). `name -> { op = "install"|"update",
--- state = "running"|"done"|"error", msg = <human text> }`. The git verbs below set
--- entries here; the manager UI (prelude/plugins_ui.lua) reads them and subscribes via
+-- clone/pull runs, a ✓/✗ when it finishes).
+-- `name -> { op = "install"|"update", state = "running"|"done"|"error", msg = <human text> }`.
+-- The git verbs below set entries here; the manager UI (prelude/plugins_ui.lua) reads
+-- them and subscribes via
 -- `M.on_change`. Survives a re-source (`or {}`) so an open UI keeps its history.
 M._tasks = M._tasks or {}
 M._watchers = M._watchers or {} -- on_change callbacks, fired on any state transition

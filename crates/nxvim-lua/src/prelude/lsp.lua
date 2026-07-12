@@ -106,8 +106,8 @@ end
 -- Upward `root_markers` search from the buffer's file, walking the project tree
 -- through the async `nx.fs` seam (local on native-bare, the daemon's `luafs_op` over
 -- the wire otherwise — so this works on every front end with NO editor-thread block).
--- `nx.async` makes this an async *function* (the Lua analogue of a JS `async
--- function`): calling `find_root(bufnr, markers)` runs the body as a coroutine and
+-- `nx.async` makes this an async *function* (the Lua analogue of a JS
+-- `async function`): calling `find_root(bufnr, markers)` runs the body as a coroutine and
 -- returns a PROMISE of the first ancestor directory holding one of `markers`, or nil
 -- (the server then falls back to the file's directory). Each `nx.fs.readdir` that
 -- rejects (an unreadable / non-directory ancestor) is treated as "no markers here" and
@@ -209,8 +209,8 @@ end
 
 -- ----- enable / the engine-side FileType -> Start dispatch --------------------
 
--- Resolve `cfg.cmd` to an argv. A function `cmd` is neovim's `cmd(dispatchers,
--- config)` builder (the many `node_modules/.bin` resolvers); nxvim does its own
+-- Resolve `cfg.cmd` to an argv. A function `cmd` is neovim's `cmd(dispatchers, config)`
+-- builder (the many `node_modules/.bin` resolvers); nxvim does its own
 -- stdio spawn, so the dispatchers are a stub and `vim.lsp.rpc.start` (below)
 -- returns the argv it is handed. A throwing builder yields `nil, reason`.
 local function resolve_cmd(cfg, root)
@@ -495,9 +495,10 @@ function nx.lsp.workspace_symbol(query)
 end
 
 -- `nx.lsp.rename(new_name)`: rename the symbol under the cursor. With a name, request
--- it straight away; with none (the bare `nx.keymap.set("n", "<leader>rn",
--- nx.lsp.rename)` case), prompt for it via `nx.ui.input` (non-blocking promise),
--- prefilled with the symbol under the cursor, and rename on confirm. An empty /
+-- it straight away; with none (the bare
+-- `nx.keymap.set("n", "<leader>rn", nx.lsp.rename)` case), prompt for it via
+-- `nx.ui.input` (non-blocking promise), prefilled with the symbol under the cursor, and
+-- rename on confirm. An empty /
 -- cancelled prompt does nothing.
 function nx.lsp.rename(new_name)
   if type(new_name) == "string" and new_name ~= "" then
@@ -612,8 +613,8 @@ function nx.lsp._run_on_init(id, result)
   end
 end
 
--- The server is exiting (handle still in `_clients`): run `on_exit(code, signal,
--- client)` before `_remove_client` clears it.
+-- The server is exiting (handle still in `_clients`): run `on_exit(code, signal, client)`
+-- before `_remove_client` clears it.
 function nx.lsp._run_on_exit(id, code, signal)
   local client = nx.lsp._clients[id]
   if not client then

@@ -709,8 +709,8 @@ end
 -- `nx.buf.extmarks(buffer, ns, start, end_[, opts])` -> list [alias
 -- `nvim_buf_get_extmarks`]: the extmarks of namespace `ns` in `buffer` within the
 -- position range `start`..`end_` — each bound is `0` (buffer start), `-1` (buffer
--- end), or a `{row, col}` pair. Entries come in (row, col, id) order, each `{id,
--- row, col}` (or `{id, row, col, details}` with `opts.details`). `ns == -1` returns
+-- end), or a `{row, col}` pair. Entries come in (row, col, id) order, each
+-- `{id, row, col}` (or `{id, row, col, details}` with `opts.details`). `ns == -1` returns
 -- marks from every namespace. Reads the mirror, so it reflects marks set earlier in
 -- this chunk; positions are current as of chunk start.
 function nx.buf.extmarks(buffer, ns, start, end_, opts)

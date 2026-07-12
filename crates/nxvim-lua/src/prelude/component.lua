@@ -21,9 +21,10 @@
 --               `set_cursor` / `bufnr`. This is what a file tree / picker / modal dialog
 --               wants. `nx.view.component(def)` is the sugar for it.
 --   * `"float"` — a NON-focus `nx.ui.float` content float (the which-key surface). It never
---               steals focus and binds no keys; `render` returns `{ lines, title?,
---               relative?, border? }` (lines may be styled chunk rows), and an EMPTY render
---               hides the float. Reach it with `nx.component{ surface = "float", … }`.
+--               steals focus and binds no keys; `render` returns
+--               `{ lines, title?, relative?, border? }` (lines may be styled chunk rows),
+--               and an EMPTY render hides the float. Reach it with
+--               `nx.component{ surface = "float", … }`.
 -- A third party can pass `def.backend` (a `function(opts) -> adapter`) to render anywhere.
 
 local vim = vim

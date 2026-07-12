@@ -241,14 +241,15 @@ end
 --   * `opts` — an optional table:
 --       * `method`  — HTTP method (default `"GET"`); upper-cased for you.
 --       * `query`   — query parameters appended to `url` (encoded), so you never build
---                     `?a=1&b=2` by hand. A `{ [name] = value }` map or a `{ {name,
---                     value}, ... }` pair-list (repeated/ordered keys); a LIST value
---                     repeats the key. See `nx.http.encode_query`.
---       * `headers` — request headers, a `{ [name] = value }` map or a `{ {name,
---                     value}, ... }` pair-list (for repeated / ordered headers).
+--                     `?a=1&b=2` by hand. A `{ [name] = value }` map or a
+--                     `{ {name, value}, ... }` pair-list (repeated/ordered keys); a LIST
+--                     value repeats the key. See `nx.http.encode_query`.
+--       * `headers` — request headers, a `{ [name] = value }` map or a
+--                     `{ {name, value}, ... }` pair-list (for repeated / ordered headers).
 --       * `body`    — the request body. A string is sent verbatim; any other value is
---                     encoded to JSON (`nx.json.encode`) AND a `Content-Type:
---                     application/json` header is added unless the caller set one.
+--                     encoded to JSON (`nx.json.encode`) AND a
+--                     `Content-Type: application/json` header is added unless the caller
+--                     set one.
 --       * `form`    — a table sent as an `application/x-www-form-urlencoded` body (same
 --                     shape as `query`); sets the content-type header unless the caller
 --                     did. Mutually exclusive with `body`.

@@ -637,9 +637,9 @@ end
 -- `ctx.label` (a string, or nil) is the **source B** channel: the built-in command
 -- grammar's open pending states — `f`/`t`/`F`/`T` find-char, `r` replace, `i`/`a`
 -- text-object, marks, registers, `<C-w>` — have no finite key list to enumerate, so
--- they arrive with `continuations = {}` and a human label instead (`"Find
--- character"`). A which-key renders the label as a hint card when `continuations` is
--- empty; sources A/C (mapped prefixes) leave `label` nil and list keys.
+-- they arrive with `continuations = {}` and a human label instead
+-- (`"Find character"`). A which-key renders the label as a hint card when
+-- `continuations` is empty; sources A/C (mapped prefixes) leave `label` nil and list keys.
 --
 -- This is the render-time oracle a native which-key plugin debounces
 -- (`nx.utils.debounce`) and draws as a persistent `nx.ui.float`. Continuations come from

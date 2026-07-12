@@ -486,9 +486,10 @@ end
 
 -- `nx.autocmd.get(opts)` [alias `nvim_get_autocmds`]: introspect the registered
 -- autocmds — a debugging affordance for confirming what `clear`/`del` left
--- behind. Returns a list of `{id, event, group, group_name, pattern, buffer,
--- command}` entries, optionally filtered by `opts.event` (string or list) and
--- `opts.group` (id or name). Run it interactively as
+-- behind. Returns a list of
+-- `{id, event, group, group_name, pattern, buffer, command}` entries, optionally
+-- filtered by `opts.event` (string or list) and `opts.group` (id or name). Run it
+-- interactively as
 -- `:lua print(vim.inspect(nx.autocmd.get({})))`.
 function nx.autocmd.get(opts)
   opts = opts or {}

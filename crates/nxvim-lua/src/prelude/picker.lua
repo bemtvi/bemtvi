@@ -61,8 +61,8 @@ for _, name in ipairs({
   end
 end
 
--- The default picker bindings — `default = true` so a user `nx.keymap.set('picker',
--- …)` for the same key wins by the precedence ladder; binding a key to an empty
+-- The default picker bindings — `default = true` so a user `nx.keymap.set('picker', …)`
+-- for the same key wins by the precedence ladder; binding a key to an empty
 -- function (`nx.keymap.set('picker', '<C-n>', function() end)`) disables it. These
 -- mirror the keys the picker used to hardcode.
 for _, m in ipairs({
@@ -507,10 +507,11 @@ end
 -- item under that key for the current generation; `nil` cancels. Either way the
 -- active picker is cleared (and a pending job reaped).
 -- `mode` is the confirm gesture's open mode — `"current"` (the focused window) or
--- `"tab"` (the default `<C-t>` ⇒ a new tab) — forwarded to `source.confirm(item,
--- mode, layer)`. `layer` is the resolved confirm target (`"main"`/`"active"`); built-in
--- sources honor both (see `nx.picker.edit`). `resume_keys` (the snapshot window's
--- item keys) lets `nx.picker.resume()` re-arm this picker — see `nx._picker_save_resume`.
+-- `"tab"` (the default `<C-t>` ⇒ a new tab) — forwarded to
+-- `source.confirm(item, mode, layer)`. `layer` is the resolved confirm target
+-- (`"main"`/`"active"`); built-in sources honor both (see `nx.picker.edit`).
+-- `resume_keys` (the snapshot window's item keys) lets `nx.picker.resume()` re-arm this
+-- picker — see `nx._picker_save_resume`.
 function nx._picker_result(key, mode, resume_keys)
   local p = nx._picker
   nx._picker = nil

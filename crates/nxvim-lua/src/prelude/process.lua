@@ -267,8 +267,8 @@ end
 -- ----- nx.socket: a duplex TCP client connection ---------------------------------
 --
 -- The socket sibling of `nx.process`, for a framed-protocol peer that listens on a TCP
--- port instead of speaking over stdio — a DAP adapter run in `"server"` mode (`type =
--- "server"`), which the debuggee or a launcher starts and the client connects to.
+-- port instead of speaking over stdio — a DAP adapter run in `"server"` mode
+-- (`type = "server"`), which the debuggee or a launcher starts and the client connects to.
 -- Same handler-shaped surface (`on_connect` / `on_data` / `on_close`), same duplex
 -- contract: `handle:write(bytes)` sends, inbound bytes arrive raw on `on_data`.
 

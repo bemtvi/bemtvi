@@ -108,8 +108,8 @@ for _, name in ipairs({ "next", "prev", "first", "last", "confirm", "cancel" }) 
   end
 end
 
--- The default select bindings — `default = true` so a user `nx.keymap.set('select',
--- …)` wins, and an empty-function map disables a key. `gg` is a two-key default map
+-- The default select bindings — `default = true` so a user `nx.keymap.set('select', …)`
+-- wins, and an empty-function map disables a key. `gg` is a two-key default map
 -- (the multi-key widget map the same trie handles); these mirror the vim-style list
 -- keys select used to hardcode.
 for _, m in ipairs({

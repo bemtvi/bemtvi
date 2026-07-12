@@ -718,6 +718,10 @@ fn main() -> Result<()> {
         // The interactive binary offers nxvim's built-in default recommended set on a
         // fresh setup (the first-run welcome); a config's own recommend{} overrides it.
         offer_default_recommended: true,
+        // Seed the client-owned system-plugin tier (`stdpath("data")/system/*`) into every
+        // session — loaded before init.lua, guaranteed present before any connect. Empty on
+        // a fresh install (no system dir), so nothing changes until a connector is installed.
+        system_plugins: nxvim_server::discover_system_plugins(),
         // Command-line completion (`:`+<Tab>) is on by default in the interactive
         // binary; a config's own `nx.cmdline_complete.setup{ ... }` still wins.
         cmdline_complete_default: true,
@@ -1049,6 +1053,10 @@ where
                 // built-in default recommended set on first run, and enable
                 // command-line completion by default (a config's setup{} still wins).
                 offer_default_recommended: true,
+                // Seed the client-owned system-plugin tier into the daemon session too:
+                // system plugins load into the LOCAL VM via the local runtimepath (like the
+                // remote-aware plugin manager), so a connector persists across the reload.
+                system_plugins: nxvim_server::discover_system_plugins(),
                 cmdline_complete_default: true,
                 // Interactive: `print` shows on the message line, not stdout.
                 lua_stdio: false,

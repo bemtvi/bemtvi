@@ -509,6 +509,9 @@ async fn server_init(
         // set on a fresh setup (a config's own recommend{} still overrides it), and
         // enable command-line completion by default (a config's setup{} still wins).
         offer_default_recommended: true,
+        // Seed the client-owned system-plugin tier into every session (local and daemon
+        // alike) — loaded before init.lua, so a connector persists across a session swap.
+        system_plugins: nxvim_server::discover_system_plugins(),
         cmdline_complete_default: true,
         // Interactive: `print` shows on the message line, not stdout.
         lua_stdio: false,

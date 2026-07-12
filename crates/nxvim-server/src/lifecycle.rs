@@ -1412,8 +1412,19 @@ impl EditHost {
         // Clone the paths so the immutable runtimepath borrow doesn't outlive the
         // mutable `self` use while sourcing.
         let runtimepath: Vec<PathBuf> = self.lua.runtimepath().to_vec();
+        // Skip the system-plugin tier: those dirs were sourced in the dedicated
+        // pre-`init.lua` phase (native `run`) — or, for a plugin promoted at runtime via
+        // `nx.plugins.system{}`/`promote`, are sourced by the manager's own
+        // `source_runtime` — so re-sourcing them here would run their `plugin/` scripts
+        // twice. The live tier registry is the source of truth (it covers both boot and
+        // runtime promotion); an empty/absent registry (the wasm remote-config path,
+        // tests) skips nothing.
+        let system_dirs = self.system_plugin_dirs();
         for sub in ["plugin", "after/plugin"] {
             for rt in &runtimepath {
+                if system_dirs.contains(rt) {
+                    continue;
+                }
                 for file in collect_lua_scripts(&rt.join(sub)) {
                     let src = match std::fs::read_to_string(&file) {
                         Ok(src) => src,
@@ -1429,6 +1440,52 @@ impl EditHost {
             }
         }
         self.run_pending();
+    }
+
+    /// Source the `plugin/` / `after/plugin/` scripts of a specific set of directories
+    /// (the system-plugin tier, in the pre-`init.lua` phase), in the same order and
+    /// through the same real effects path as [`source_plugins`](Self::source_plugins).
+    /// Their `lua/` trees are already on the runtimepath (spliced at boot), so `require`
+    /// resolves; this runs their registration scripts. Reads the LOCAL disk, so a system
+    /// plugin loads locally even in a daemon session.
+    pub(crate) fn source_specific_plugins(&mut self, dirs: &[PathBuf]) {
+        for sub in ["plugin", "after/plugin"] {
+            for dir in dirs {
+                for file in collect_lua_scripts(&dir.join(sub)) {
+                    let src = match std::fs::read_to_string(&file) {
+                        Ok(src) => src,
+                        Err(_) => continue,
+                    };
+                    let name = format!("@{}", file.display());
+                    if let Err(e) = self.lua.exec_named(&src, &name) {
+                        self.editor
+                            .echo(format!("Error sourcing {}: {e}", file.display()));
+                    }
+                    self.apply_lua_effects();
+                }
+            }
+        }
+        self.run_pending();
+    }
+
+    /// The live system-plugin tier dirs, read from the `nx.plugins` registry — the set
+    /// [`source_plugins`](Self::source_plugins) skips so a system plugin is never sourced
+    /// twice. Covers both boot-declared and runtime-promoted (`nx.plugins.system`) system
+    /// plugins. Empty when the registry is absent (wasm remote-config, tests with no tier).
+    fn system_plugin_dirs(&self) -> Vec<PathBuf> {
+        let value = match self.lua.eval_to_value(
+            "return nx.plugins and nx.plugins._system_dirs and nx.plugins._system_dirs() or {}",
+        ) {
+            Ok(v) => v,
+            Err(_) => return Vec::new(),
+        };
+        match value {
+            rmpv::Value::Array(items) => items
+                .into_iter()
+                .filter_map(|v| v.as_str().map(PathBuf::from))
+                .collect(),
+            _ => Vec::new(),
+        }
     }
 }
 

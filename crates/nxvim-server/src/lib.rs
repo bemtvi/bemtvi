@@ -345,6 +345,22 @@ pub struct ServerInit {
     /// runs (a config's own `nx.plugins.recommend{...}` still overrides it). Mirrors
     /// how `shada` / `clipboard` keep tests hermetic while the binary opts in.
     pub offer_default_recommended: bool,
+    /// The **system-plugin tier** — local plugins the *client* loads into this session
+    /// before `init.lua`, un-shadowable-from-config in load order but never able to
+    /// hijack a user module name (they sit AHEAD of managed plugins but BEHIND the
+    /// config dir on `package.path`). Empty (the default) so headless suites and
+    /// `--lua` stay hermetic, exactly like `offer_default_recommended`; the interactive
+    /// binaries populate it from the client-owned system dir
+    /// (`stdpath("data")/system/*`, see [`discover_system_plugins`]). Each spec is a
+    /// resolved **local dir** — the server only ever sees real dirs, so a system plugin
+    /// loads through the same path (rtp + `plugin/` sourcing) as any managed plugin,
+    /// with real files (tracebacks + LS visibility). The dirs are spliced into the
+    /// runtimepath (after the config dir) and sourced in a dedicated phase before
+    /// `init.lua`; the later `source_plugins` pass skips them so they load exactly once.
+    /// Runs through the local disk so a system plugin loads locally even in a daemon
+    /// session (consistent with the remote-aware plugin manager). See
+    /// `docs/plans/2026-07-05-remote-connectors-and-system-plugins.md` → §A.
+    pub system_plugins: Vec<SystemPluginSpec>,
     /// Whether to enable command-line completion (`nx.cmdline_complete` — `:`+`<Tab>`)
     /// by default. `false` (the default) leaves the engine off, so the headless test
     /// suites stay byte-for-byte unchanged; the interactive binary sets it `true`,
@@ -447,6 +463,59 @@ fn resolve_config_dir() -> Option<PathBuf> {
         return Some(PathBuf::from(xdg).join("nxvim"));
     }
     std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".config").join("nxvim"))
+}
+
+/// One entry in the [system-plugin tier](ServerInit::system_plugins): a resolved
+/// local plugin dir plus the `name` it registers under (its require key / shada
+/// namespace / directory basename). Not embedded — always a real on-disk repo,
+/// cloned into the system dir like any managed plugin.
+#[cfg(feature = "native")]
+#[derive(Clone, Debug)]
+pub struct SystemPluginSpec {
+    /// The plugin's name — the system-dir subdirectory basename, its require key,
+    /// and the key the tier registry / promotion API address it by.
+    pub name: String,
+    /// The plugin's resolved local directory (`stdpath("data")/system/<name>`, or a
+    /// dev checkout). The server adds this to the runtimepath and sources its
+    /// `plugin/` scripts.
+    pub dir: PathBuf,
+}
+
+/// The client-owned **system-plugin dir**: `stdpath("data")/system`. One plugin repo
+/// per immediate subdirectory. Leaned to DATA (managed artifacts, not hand-edited
+/// config) per the plan's open decision.
+#[cfg(feature = "native")]
+pub fn system_plugin_dir() -> PathBuf {
+    PathBuf::from(nxvim_lua::stdpath("data")).join("system")
+}
+
+/// Scan the [system-plugin dir](system_plugin_dir) into the tier the interactive
+/// binaries thread onto every [`ServerInit`]. Each immediate subdirectory is one
+/// system plugin, named for its basename. A missing/unreadable dir yields none (the
+/// common no-system-plugins case), so a fresh install stays empty — matching the
+/// default-empty `system_plugins` that keeps headless suites hermetic.
+#[cfg(feature = "native")]
+pub fn discover_system_plugins() -> Vec<SystemPluginSpec> {
+    let dir = system_plugin_dir();
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return Vec::new();
+    };
+    let mut specs: Vec<SystemPluginSpec> = entries
+        .flatten()
+        .filter(|e| e.path().is_dir())
+        .filter_map(|e| {
+            let name = e.file_name().to_string_lossy().into_owned();
+            // Skip dotfiles / hidden dirs (`.git`, editor scratch) — a system plugin
+            // is a named repo, never a leading-dot dir.
+            (!name.starts_with('.')).then(|| SystemPluginSpec {
+                name,
+                dir: e.path(),
+            })
+        })
+        .collect();
+    // Deterministic load order across runs (readdir order is unspecified).
+    specs.sort_by(|a, b| a.name.cmp(&b.name));
+    specs
 }
 
 /// Every immediate `<config>/pack/*/start/*` directory — installed plugins, each
@@ -2746,7 +2815,7 @@ where
 /// the two-half shape is kept so a transport whose directions are distinct objects
 /// needn't `join` them only to be `split` straight back apart.
 #[cfg(feature = "native")]
-async fn run_io<R, W>(reader: R, writer: W, init: ServerInit) -> anyhow::Result<()>
+async fn run_io<R, W>(reader: R, writer: W, mut init: ServerInit) -> anyhow::Result<()>
 where
     R: AsyncRead + Unpin + Send + 'static,
     W: AsyncWrite + Unpin + Send + 'static,
@@ -2848,6 +2917,32 @@ where
         }
         ClipboardProvider::Custom(cb) => editor.set_clipboard(cb),
         ClipboardProvider::Disabled => {}
+    }
+    // System-plugin tier (§A): splice the client-seeded system-plugin dirs into the
+    // runtimepath right AFTER the config dir, so `seed_package_path` (which orders
+    // `package.path` by runtimepath position) places their `lua/` modules ahead of any
+    // managed plugin but behind the user's own config — a system plugin can never hijack
+    // a config module name. Deduped against dirs already present. Captured as
+    // `(name, dir)` pairs for the early system-load phase below; the dirs are sourced
+    // there (before `init.lua`) and skipped by the later `source_plugins` pass, so each
+    // loads exactly once.
+    let system_specs: Vec<(String, PathBuf)> = init
+        .system_plugins
+        .iter()
+        .map(|s| (s.name.clone(), s.dir.clone()))
+        .collect();
+    {
+        let mut insert_at = init
+            .config_dir
+            .as_ref()
+            .and_then(|c| init.runtimepath.iter().position(|p| p == c))
+            .map_or(0, |i| i + 1);
+        for (_, dir) in &system_specs {
+            if !init.runtimepath.contains(dir) {
+                init.runtimepath.insert(insert_at, dir.clone());
+                insert_at += 1;
+            }
+        }
     }
     let lua =
         LuaRuntime::new(init.runtimepath).map_err(|e| anyhow::anyhow!("lua init failed: {e}"))?;
@@ -3090,6 +3185,33 @@ where
     // lives on `host` from here, so the debounced checkpoint and the exit flush both
     // reach it through the seam.
     host.shada_load();
+
+    // System-plugin tier (§A): load the client-seeded system plugins BEFORE the
+    // recommended set / `client_init_lua` / `init.lua`, so a connector (or any system
+    // plugin) is guaranteed present before any config line runs. Their dirs are already
+    // on the runtimepath (spliced after the config dir above), so `require` and their
+    // `colors/`/`queries/`/`lsp/` resolve; here we register them in the `nx.plugins`
+    // tier registry and source their `plugin/` scripts synchronously — the manager's
+    // sourcing loop, reused. Sourcing reads the LOCAL disk (`std::fs`), so a system
+    // plugin loads locally even in a daemon session, consistent with the remote-aware
+    // manager. The later `source_plugins` pass skips these dirs (it queries the live
+    // tier registry), so each loads exactly once.
+    if !system_specs.is_empty() {
+        let list = system_specs
+            .iter()
+            .map(|(name, dir)| format!("{{ name = {name:?}, dir = {:?} }}", dir.to_string_lossy()))
+            .collect::<Vec<_>>()
+            .join(", ");
+        if let Err(e) = host
+            .lua
+            .exec(&format!("nx.plugins._register_system({{ {list} }})"))
+        {
+            host.editor
+                .echo(format!("nxvim: system-plugin registration failed: {e}"));
+        }
+        let dirs: Vec<PathBuf> = system_specs.iter().map(|(_, dir)| dir.clone()).collect();
+        host.source_specific_plugins(&dirs);
+    }
 
     // Offer the built-in default recommended set on a fresh setup — BEFORE init.lua,
     // so a config's own `nx.plugins.recommend{...}` (or declaring any plugin) still

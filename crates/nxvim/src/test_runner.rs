@@ -102,6 +102,8 @@ fn spawn_server(plugin_dir: PathBuf) -> (Rpc, UnboundedReceiver<Incoming>) {
             host_term: None,
             fs_jobs: None,
             http_jobs: None,
+            // Hermetic: no system-plugin tier (the plugin under test is the only rtp entry).
+            system_plugins: Vec::new(),
             // Hermetic: never offer the built-in recommended set / first-run welcome,
             // and leave command-line completion off (a plugin's own setup{} can opt in).
             offer_default_recommended: false,

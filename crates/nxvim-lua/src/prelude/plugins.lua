@@ -29,6 +29,15 @@ M._order = M._order or {} -- declaration order (names), for deterministic sync
 M._loaded = M._loaded or {} -- name -> true once fully loaded (config ran)
 M._loading = M._loading or {} -- name -> true while a load is in flight (cycle guard)
 
+-- The SYSTEM-PLUGIN TIER: `name -> { name = , dir = }` for plugins the client seeds into
+-- every session (before `init.lua`), plus any promoted at runtime via `M.system` / `M.promote`.
+-- Kept SEPARATE from `M._specs`/`M._order` so the managed verbs (sync/update/clean) never
+-- touch a system plugin — a system plugin is never a dangling managed clone. The server
+-- reads `M._system_dirs()` to skip these when it sources the runtimepath (they are sourced
+-- in the dedicated phase before `init.lua` / by `M.system`), so each loads exactly once. See
+-- docs/plans/2026-07-05-remote-connectors-and-system-plugins.md → §A.
+M._system = M._system or {} -- name -> { name = , dir = }
+
 -- Per-plugin operation state, so a UI can render LIVE progress (a spinner while a
 -- clone/pull runs, a ✓/✗ when it finishes).
 -- `name -> { op = "install"|"update", state = "running"|"done"|"error", msg = <human text> }`.
@@ -193,6 +202,18 @@ local function config_dir()
     M._opts.config = vim.fn.stdpath("config")
   end
   return M._opts.config
+end
+
+-- The client-owned SYSTEM-PLUGIN DIR: `stdpath("data")/system`, one plugin repo per
+-- subdir. `M.system` / `M.promote` clone/copy a plugin here so the client re-seeds it
+-- into every future session; the native client scans it at startup
+-- (`nxvim_server::discover_system_plugins`). Overridable via setup_manager{ system = }
+-- (a test points it at a temp dir), mirroring `root` / `config`.
+local function system_dir()
+  if not M._opts.system then
+    M._opts.system = vim.fn.stdpath("data") .. "/system"
+  end
+  return M._opts.system
 end
 
 -- ----- spec normalization ----------------------------------------------------
@@ -802,6 +823,132 @@ function M.clean()
     end
     nx.notify("nx.plugins: removed " .. #removed .. " plugin(s)", #removed > 0 and 2 or 3)
     return removed
+  end)()
+end
+
+-- ----- system-plugin tier ----------------------------------------------------
+
+-- Record the boot system-plugin set the server seeds from the client's system dir.
+-- Called from the server's pre-`init.lua` system-load phase with `{ { name=, dir= }, … }`;
+-- the dirs are already on the runtimepath (spliced at boot) and their `plugin/` scripts
+-- are sourced by the server right after this, so this only records the tier so
+-- `M._system_dirs()` (the server's source-skip set) and `M.list_system()` see them, and a
+-- config can introspect the tier. Never re-sources — that is the server's job here.
+function M._register_system(list)
+  for _, s in ipairs(list or {}) do
+    if s.name and s.dir then
+      M._system[s.name] = { name = s.name, dir = s.dir }
+    end
+  end
+end
+
+-- The live system-plugin tier dirs, as a plain array — the set the server's
+-- `source_plugins` pass skips so a system plugin is never sourced twice. Covers both the
+-- boot set (`_register_system`) and any runtime promotion (`M.system` / `M.promote`).
+function M._system_dirs()
+  local dirs = {}
+  for _, s in pairs(M._system) do
+    dirs[#dirs + 1] = s.dir
+  end
+  return dirs
+end
+
+-- A synchronous snapshot of the system tier: `{ { name=, dir= }, … }`, sorted by name.
+function M.list_system()
+  local out = {}
+  for _, s in pairs(M._system) do
+    out[#out + 1] = { name = s.name, dir = s.dir }
+  end
+  table.sort(out, function(a, b)
+    return a.name < b.name
+  end)
+  return out
+end
+
+-- Clone `src` (an "owner/repo" / url) or a local `dir` checkout into the system dir at
+-- `target`, unless already present. Fails loud on a git error. Local `dir` checkouts are
+-- cloned (not referenced) so the client re-seeds the plugin into every future session —
+-- the system dir is the only place the client scan looks. Runs on the LOCAL disk (the
+-- local-always seam), like all plugin management.
+local function clone_into_system(name, url, dir, target)
+  return nx.async(function()
+    nx.await(lfs.mkdir(system_dir(), { recursive = true }))
+    if nx.await(lfs.exists(target)) then
+      return
+    end
+    local args
+    if dir ~= nil then
+      -- A dev checkout: a plain local clone captures its current state into the tier.
+      args = { "clone", dir, target }
+    else
+      args = { "clone", "--filter=blob:none", "--depth", "1", url, target }
+    end
+    local res = nx.await(git(args))
+    if res.code ~= 0 then
+      error("nx.plugins.system: git clone failed for " .. name .. ": " .. res.stderr, 0)
+    end
+  end)()
+end
+
+-- Register `target` (a dir under the system dir) into the tier and LOAD it into the
+-- current session — put it on the runtimepath, source its `plugin/` scripts, run `config`.
+-- So a runtime promotion takes effect NOW as well as for every future session/swap.
+local function activate_system(name, target, config)
+  return nx.async(function()
+    M._system[name] = { name = name, dir = target }
+    nx._add_rtp(target)
+    nx.await(source_runtime(target))
+    if config then
+      nx.await(run_hook(config):catch(function(err)
+        nx.notify(
+          "nx.plugins.system[" .. name .. "].config: " .. tostring(err and err.message or err),
+          4
+        )
+      end))
+    end
+    notify_change()
+  end)()
+end
+
+-- `nx.plugins.system(spec)` — inject a plugin into the system tier: clone/copy it into the
+-- system dir (via the local-always seam) and load it into the current session, so it takes
+-- effect now AND is re-seeded by the client into every future session (the VS Code
+-- "install a connector" move). `spec` is a normal plugin spec (string shorthand / table).
+-- Returns a promise of the plugin's name. Callable form for `init.lua`.
+function M.system(spec)
+  local s = normalize(spec)
+  local target = system_dir() .. "/" .. s.name
+  return nx.async(function()
+    nx.await(clone_into_system(s.name, s.url, s.dir, target))
+    nx.await(activate_system(s.name, target, s.config))
+    return s.name
+  end)()
+end
+
+-- `nx.plugins.promote(name)` — promote an already-declared managed plugin into the system
+-- tier: clone its on-disk checkout into the system dir and register it, so it persists into
+-- every future session. Loads the system copy now unless the plugin is already loaded this
+-- session. REJECTS (loud) for an unknown plugin. Returns a promise of the name.
+function M.promote(name)
+  local spec = M._specs[name]
+  if not spec then
+    return nx.promise.reject({
+      message = "nx.plugins.promote: unknown plugin '" .. tostring(name) .. "'",
+    })
+  end
+  local target = system_dir() .. "/" .. name
+  return nx.async(function()
+    -- Clone from the plugin's on-disk checkout (a dev `dir` or the managed clone) so the
+    -- exact installed state moves into the tier, offline.
+    nx.await(clone_into_system(name, nil, spec.dir or spec._dir, target))
+    if M._loaded[name] then
+      -- Already loaded this session; just register the system copy for future sessions.
+      M._system[name] = { name = name, dir = target }
+      notify_change()
+    else
+      nx.await(activate_system(name, target, spec.config))
+    end
+    return name
   end)()
 end
 

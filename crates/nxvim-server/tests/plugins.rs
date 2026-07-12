@@ -1369,3 +1369,116 @@ async fn a_failed_dependency_load_does_not_wedge_the_dependent() {
         "a retry after a failed load re-attempts (and re-reports) instead of no-opping"
     );
 }
+
+// ----- system-plugin tier: runtime promotion (§A) ----------------------------
+
+/// `nx.plugins.system{...}` clones a plugin into the system dir (via the local-always
+/// seam) and loads it into the current session, so it takes effect now AND is re-seeded
+/// by the client into every future session. It stays OUT of the managed spec set.
+#[tokio::test]
+async fn nx_plugins_system_clones_into_the_system_dir_and_loads() {
+    let base = temp_dir("plugins_system_api");
+    let src = base.join("src");
+    std::fs::create_dir_all(&src).unwrap();
+    let repo = make_repo(&src, "conn");
+    let sysdir = base.join("data").join("system");
+
+    let (rpc, _incoming) = start().await;
+    exec_lua(
+        &rpc,
+        &format!(
+            "nx.plugins.setup_manager({{ root = \"{root}\", system = \"{sys}\" }})\n\
+             nx.plugins.system({{ \"file://{repo}\", name = \"conn\" }})",
+            root = q(&base.join("install")),
+            sys = q(&sysdir),
+            repo = q(&repo),
+        ),
+    )
+    .await;
+
+    // The plugin's own plugin/ script ran → it loaded into this session.
+    assert!(
+        poll_true(&rpc, "return _G.conn_plugin == true").await,
+        "nx.plugins.system must load the plugin into the current session",
+    );
+    // It landed physically under the system dir (so the client re-seeds it next launch).
+    assert!(
+        sysdir.join("conn").join("plugin").join("conn.lua").exists(),
+        "the plugin must be cloned into the system dir",
+    );
+    // Registered in the tier, and NOT leaked into the managed spec set.
+    assert_eq!(
+        lua_bool(&rpc, "return nx.plugins._system['conn'] ~= nil").await,
+        Some(true),
+        "the plugin must be registered in the system tier",
+    );
+    assert_eq!(
+        lua_bool(&rpc, "return nx.plugins._specs['conn'] == nil").await,
+        Some(true),
+        "a system plugin must not become a managed spec (sync/clean must ignore it)",
+    );
+}
+
+/// `nx.plugins.promote(name)` moves an already-declared managed plugin into the system
+/// tier: it clones the on-disk checkout into the system dir and registers it, so it
+/// persists into every future session. Rejects loudly for an unknown plugin.
+#[tokio::test]
+async fn nx_plugins_promote_moves_a_managed_plugin_into_the_tier() {
+    let base = temp_dir("plugins_promote");
+    let src = base.join("src");
+    std::fs::create_dir_all(&src).unwrap();
+    let repo = make_repo(&src, "promo");
+    let sysdir = base.join("data").join("system");
+
+    let (rpc, _incoming) = start().await;
+    exec_lua(
+        &rpc,
+        &format!(
+            "nx.plugins.setup_manager({{ root = \"{root}\", system = \"{sys}\" }})\n\
+             nx.plugins({{ {{ \"file://{repo}\", name = \"promo\" }} }})\n\
+             nx.plugins.sync()",
+            root = q(&base.join("install")),
+            sys = q(&sysdir),
+            repo = q(&repo),
+        ),
+    )
+    .await;
+    // Wait for the managed plugin to install + load first.
+    assert!(
+        poll_true(&rpc, "return nx.plugins._loaded['promo'] == true").await,
+        "the managed plugin should install and load",
+    );
+
+    // Promote it into the system tier.
+    exec_lua(
+        &rpc,
+        "_G.PROMOTED = nil\nnx.plugins.promote('promo'):next(function() _G.PROMOTED = true end)",
+    )
+    .await;
+    assert!(
+        poll_true(&rpc, "return _G.PROMOTED == true").await,
+        "promote should resolve",
+    );
+    assert!(
+        sysdir
+            .join("promo")
+            .join("plugin")
+            .join("promo.lua")
+            .exists(),
+        "promote must clone the plugin into the system dir",
+    );
+    assert_eq!(
+        lua_bool(&rpc, "return nx.plugins._system['promo'] ~= nil").await,
+        Some(true),
+        "the promoted plugin must be registered in the system tier",
+    );
+
+    // Unknown plugin rejects loudly.
+    exec_lua(&rpc, "_G.REJ = nil\nnx.plugins.promote('nope'):next(function() _G.REJ = 'ok' end, function() _G.REJ = 'rej' end)").await;
+    assert!(poll_true(&rpc, "return _G.REJ ~= nil").await, "settled");
+    assert_eq!(
+        exec_lua(&rpc, "return _G.REJ").await.as_str(),
+        Some("rej"),
+        "promote of an unknown plugin must reject",
+    );
+}

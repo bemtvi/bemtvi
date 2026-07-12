@@ -766,6 +766,10 @@ pub struct VirtDecorData {
     /// `nx`-native whole-line fill `(text, hl_group)`: the text repeated across the
     /// line's width. `None` ⇒ no fill.
     pub line_fill: Option<VirtChunkData>,
+    /// neovim's `line_hl_group` — a highlight group backing the whole line's
+    /// background (full width, `hl_eol` semantics), projected as the per-window
+    /// `line_bg` layer painted under the text. `None` ⇒ no line background.
+    pub line_hl_group: Option<String>,
 }
 
 #[derive(Clone, Debug)]

@@ -166,10 +166,7 @@ fn virt_decor_to_core(d: VirtDecorData) -> nxvim_core::VirtDecor {
             text: c.text,
             hl_group: c.hl_group,
         }),
-        // Not yet exposed on the public `nx.buf.set_extmark` surface (see the
-        // doc-float line-background plan's "out of scope"); the internal doc-float
-        // renderer sets it directly on core marks.
-        line_hl_group: None,
+        line_hl_group: d.line_hl_group,
     }
 }
 

@@ -152,6 +152,73 @@ async fn fenced_code_block_drops_the_fences_and_keeps_the_body() {
     // tests — the Lua surface intentionally exposes only lines + highlights.)
 }
 
+/// The first fenced code block as `first_line,last_line,lang` (1-based, inclusive; empty
+/// `lang` for a bare fence), or `""` when the source has none.
+async fn first_code(rpc: &Rpc, src: &str) -> String {
+    let code = format!(
+        "local r = nx.markdown.render({src:?})\n\
+         local c = r.code[1]\n\
+         if not c then return '' end\n\
+         return string.format('%d,%d,%s', c.first_line, c.last_line, c.lang or '')"
+    );
+    lua_string(rpc, &code).await.unwrap_or_default()
+}
+
+#[tokio::test]
+async fn render_reports_fenced_code_blocks_with_bounds_and_language() {
+    let (rpc, _incoming) = start().await;
+    // A `lua` fence: two body lines (the fences are stripped), so the block spans the
+    // 1-based inclusive rows 1..2, tagged `lua`.
+    assert_eq!(
+        first_code(&rpc, "```lua\nlocal x = 1\nprint(x)\n```").await,
+        "1,2,lua"
+    );
+    // A bare fence keeps its bounds but reports no language (empty).
+    assert_eq!(first_code(&rpc, "```\nmake build\n```").await, "1,1,");
+    // Blocks are line-tracked against the stripped output: a leading paragraph pushes the
+    // block down (a blank line separates them), so a one-line fence lands on line 3.
+    assert_eq!(first_code(&rpc, "intro\n\n```\ncode\n```").await, "3,3,");
+}
+
+/// A compact projection of `nx.markdown.to_view(src)`: `first=<lines[1]>|fence=<bool>|
+/// linehl=<bool>|overlay=<bool>|heading=<bool>` — enough to assert the view-ready assembly
+/// (prose stripped/styled, code fence kept + backed + hidden).
+async fn to_view_summary(rpc: &Rpc, src: &str) -> String {
+    let code = format!(
+        "local v = nx.markdown.to_view({src:?})\n\
+         local has = function(p)\n\
+           for _, m in ipairs(v.decor) do if p(m) then return true end end\n\
+           return false\n\
+         end\n\
+         local fence = false\n\
+         for _, l in ipairs(v.lines) do if l:match('^```rust') then fence = true end end\n\
+         return table.concat({{\n\
+           'first=' .. (v.lines[1] or ''),\n\
+           'fence=' .. tostring(fence),\n\
+           'linehl=' .. tostring(has(function(m) return m.line_hl_group == '@markup.raw.block' end)),\n\
+           'overlay=' .. tostring(has(function(m) return m.virt_text_pos == 'overlay' end)),\n\
+           'heading=' .. tostring(has(function(m) return m.hl_group == '@markup.heading.1' end)),\n\
+         }}, '|')"
+    );
+    lua_string(rpc, &code).await.unwrap_or_default()
+}
+
+#[tokio::test]
+async fn to_view_assembles_stripped_prose_and_kept_hidden_code_fences() {
+    let (rpc, _incoming) = start().await;
+    let s = to_view_summary(&rpc, "# Title\n\nsome **bold**\n\n```rust\nfn z() {}\n```").await;
+    // Prose is rendered: the heading line is stripped to "Title" and carries a styled
+    // `@markup.heading.1` span.
+    assert!(s.contains("first=Title"), "heading stripped: {s}");
+    assert!(s.contains("heading=true"), "heading styled: {s}");
+    // The code block is kept as a raw ```rust fence (so tree-sitter injection can fire),
+    // backed with an `@markup.raw.block` line background, and its fence lines are hidden
+    // behind a blanking overlay.
+    assert!(s.contains("fence=true"), "code fence kept: {s}");
+    assert!(s.contains("linehl=true"), "code block backed: {s}");
+    assert!(s.contains("overlay=true"), "fence hidden by overlay: {s}");
+}
+
 #[tokio::test]
 async fn link_shows_its_label_then_the_url() {
     let (rpc, _incoming) = start().await;
@@ -242,29 +309,97 @@ async fn thematic_break_emits_a_rule_fill() {
 
 // ----- shipped example -------------------------------------------------------
 
-/// A content-float's rendered text rows (each row is a run of `[text, style]` chunks).
-fn content_float_lines(map: &[(Value, Value)]) -> Vec<String> {
-    let Some(Value::Map(float)) = map_get(map, "float") else {
-        return Vec::new();
+/// The rendered-markdown **float window** map — the example now mounts an
+/// `nx.view.component` as a real floating window (`floating == true`).
+fn float_window(map: &[(Value, Value)]) -> Option<Vec<(Value, Value)>> {
+    let Some(Value::Array(wins)) = map_get(map, "windows") else {
+        return None;
     };
-    let Some(Value::Array(rows)) = map_get(float, "lines") else {
-        return Vec::new();
+    wins.iter()
+        .filter_map(Value::as_map)
+        .find(|w| map_get(w, "floating").and_then(Value::as_bool) == Some(true))
+        .map(|w| w.to_vec())
+}
+
+/// A window map's text rows (an ordinary window `lines` string array, not a content-float
+/// chunk run).
+fn win_lines(win: &[(Value, Value)]) -> Vec<String> {
+    match map_get(win, "lines") {
+        Some(Value::Array(rows)) => rows
+            .iter()
+            .map(|r| r.as_str().unwrap_or_default().to_string())
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// A window map's string field (e.g. `filetype`).
+fn win_str(win: &[(Value, Value)], key: &str) -> String {
+    map_get(win, key)
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string()
+}
+
+/// Whether visible row `row` carries an **overlay** virt_text placement — the wire shape
+/// is a per-row array of `[pos, col, hl_mode, chunks]`, `pos == 2` being overlay. The
+/// example uses one to blank a hidden code-fence delimiter line.
+fn win_row_has_overlay(win: &[(Value, Value)], row: usize) -> bool {
+    let Some(Value::Array(rows)) = map_get(win, "virt_text") else {
+        return false;
     };
-    rows.iter()
-        .map(|row| match row {
-            Value::Array(chunks) => chunks
+    rows.get(row)
+        .and_then(Value::as_array)
+        .is_some_and(|placements| {
+            placements
                 .iter()
-                .filter_map(|c| c.as_array()?.first()?.as_str())
-                .collect::<String>(),
-            _ => String::new(),
+                .any(|p| p.as_array().and_then(|f| f.first()).and_then(Value::as_u64) == Some(2))
         })
-        .collect()
+}
+
+/// The window's `line_bg` layer as `(row, style_id)` pairs — the full-width line
+/// backgrounds (neovim's `line_hl_group`) the example paints on fenced code-block lines.
+fn win_line_bg(win: &[(Value, Value)]) -> Vec<(u64, Option<u64>)> {
+    match map_get(win, "line_bg") {
+        Some(Value::Array(a)) => a
+            .iter()
+            .filter_map(|e| {
+                let e = e.as_array()?;
+                Some((e.first()?.as_u64()?, e.get(1).and_then(Value::as_u64)))
+            })
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// Every highlight group name painted on the float window's `highlights` rows (each span
+/// is `[start, end, group, style_id]`) — proves the component's `set_decor` styling
+/// reached the window.
+fn float_window_groups(win: &[(Value, Value)]) -> Vec<String> {
+    let mut out = Vec::new();
+    if let Some(Value::Array(rows)) = map_get(win, "highlights") {
+        for row in rows {
+            if let Value::Array(spans) = row {
+                for span in spans {
+                    if let Some(g) = span
+                        .as_array()
+                        .and_then(|s| s.get(2))
+                        .and_then(Value::as_str)
+                    {
+                        out.push(g.to_string());
+                    }
+                }
+            }
+        }
+    }
+    out
 }
 
 /// The shipped `examples/markdown/` config must load and render its sample buffer:
-/// pressing `K` runs the config's `nx.markdown.render` → `nx.ui.float` glue and opens
-/// a popup whose content is the *stripped* markdown — the "verified end-to-end"
-/// example convention.
+/// pressing `K` runs the config's `nx.markdown.render` → `nx.view.component` glue and
+/// opens a **real floating window** whose content is the *stripped* markdown — the
+/// "verified end-to-end" example convention. Being a real window (not an overlay) is
+/// what makes it scroll.
 #[tokio::test]
 async fn shipped_example_renders_the_buffer_into_a_float() {
     let example_dir =
@@ -281,22 +416,87 @@ async fn shipped_example_renders_the_buffer_into_a_float() {
     };
     let (rpc, mut incoming) = spawn(init);
     attach(&rpc, 100, 40).await;
+    // A theme so the rendered `@markup.*` groups (and the code-block `@markup.raw.block`
+    // line background) resolve to styles — the example itself leaves the colorscheme to
+    // the user.
+    exec_lua(&rpc, "vim.cmd('colorscheme nxvim')").await;
 
-    // The config maps `K` to render the current buffer into a popup float.
+    // The config maps `K` to render the current buffer into a floating window. The view
+    // buffer/window and the component's first render arrive over the next few ticks (the
+    // `nx._view_buf`/`_view_win` mirror + the reactive lifecycle), so poll for it.
     feed(&rpc, "K");
-    barrier(&rpc).await;
-    let map = drain_to_latest_redraw(&mut incoming, |m| !content_float_lines(m).is_empty())
-        .expect("the example's markdown popup opens");
-    let lines = content_float_lines(&map);
+    let mut win = None;
+    for _ in 0..60 {
+        barrier(&rpc).await;
+        // Wait for the frame carrying the styled heading — the view buffer, its window,
+        // the lines, and the `set_decor` extmarks all settle over the next few ticks.
+        if let Some(map) = drain_to_latest_redraw(&mut incoming, |m| {
+            float_window(m).is_some_and(|w| {
+                float_window_groups(&w)
+                    .iter()
+                    .any(|g| g == "@markup.heading.1")
+            })
+        }) {
+            win = float_window(&map);
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    let win = win.expect("the example's markdown float window opens with styling");
+    let lines = win_lines(&win);
 
     assert!(
         lines.iter().any(|l| l.contains("Markdown rendering")),
-        "the heading renders (stripped of '#'): {lines:?}"
+        "the heading renders (stripped of '#') in the float window: {lines:?}"
     );
+    // Prose markup is stripped (`**bold**` → `bold`); code fences are intentionally NOT
+    // stripped (kept for the tree-sitter injection below) so they aren't checked here.
     assert!(
-        lines
-            .iter()
-            .all(|l| !l.contains("**") && !l.contains("```")),
-        "no raw markdown markers in the popup: {lines:?}"
+        lines.iter().all(|l| !l.contains("**")),
+        "no raw inline markers in the rendered prose: {lines:?}"
+    );
+    // The component's `set_decor` styling reaches the window: the H1 heading carries an
+    // `@markup.heading.1` span (byte-column-converted from the renderer's char columns).
+    let groups = float_window_groups(&win);
+    assert!(
+        groups.iter().any(|g| g == "@markup.heading.1"),
+        "the rendered heading is styled @markup.heading.1: {groups:?}"
+    );
+    // The view is typed `markdown` so the grammar's fenced-code injections highlight each
+    // code block in its own language (rust here) — the "native tree-sitter" path.
+    assert_eq!(
+        win_str(&win, "filetype"),
+        "markdown",
+        "the rendered-markdown view is filetype=markdown so injections fire"
+    );
+    // The sample's fenced code block lives lower in the document; scroll the focused float
+    // to it (`G`) and confirm: it reads as a code region (a resolved `line_bg` background),
+    // its ```rust fence is KEPT in the buffer (so injection can fire) but HIDDEN by an
+    // overlay so it reads as rendered.
+    feed(&rpc, "G");
+    let mut scrolled = None;
+    for _ in 0..60 {
+        barrier(&rpc).await;
+        if let Some(map) = drain_to_latest_redraw(&mut incoming, |m| {
+            float_window(m).is_some_and(|w| win_line_bg(&w).iter().any(|(_, s)| s.is_some()))
+        }) {
+            scrolled = float_window(&map);
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    let scrolled = scrolled.expect("scrolling reveals the backed code block");
+    assert!(
+        win_line_bg(&scrolled).iter().any(|(_, s)| s.is_some()),
+        "a code-block line is backed by a resolved line_bg after scrolling"
+    );
+    let scrolled_lines = win_lines(&scrolled);
+    let fence_row = scrolled_lines
+        .iter()
+        .position(|l| l.starts_with("```rust"))
+        .expect("the ```rust fence is kept in the buffer for injection");
+    assert!(
+        win_row_has_overlay(&scrolled, fence_row),
+        "the kept fence line is hidden by a blanking overlay: {scrolled_lines:?}"
     );
 }

@@ -559,12 +559,16 @@ local EXTMARK_OPT_OK = {
 --   * `virt_lines_leftcol` (start a virtual line over the gutter rather than the text
 --     body) is a pending refinement: it needs a per-virtual-row flag threaded through
 --     the core row layout and the wire; until then virtual lines start at the text body.
--- The remainder — signs, conceal, the line-highlight groups, and the gravity flags —
--- are likewise accepted and stored but unpainted. A documented approximation (the
--- matchadd / winblend pattern): a plugin that decorates with, say, gutter signs loads
--- and runs; those supplementary glyphs just aren't painted yet. Rejecting them loud
--- would instead break the plugin's render path. The core extmark store still tracks
--- the mark's POSITION (for get_extmarks) regardless.
+-- `line_hl_group` (a full-width line background, neovim's `line_hl_group`) also
+-- RENDERS — projected as the per-window `line_bg` layer painted under the text, the
+-- `'cursorline'` model — so a plugin can back a whole line (e.g. a markdown code block
+-- with `@markup.raw.block`) end to end. The remainder — signs' `sign_hl_group`,
+-- conceal, the other line-highlight groups, and the gravity flags — are likewise
+-- accepted and stored but unpainted. A documented approximation (the matchadd /
+-- winblend pattern): a plugin that decorates with, say, gutter signs loads and runs;
+-- those supplementary glyphs just aren't painted yet. Rejecting them loud would instead
+-- break the plugin's render path. The core extmark store still tracks the mark's
+-- POSITION (for get_extmarks) regardless.
 local EXTMARK_OPT_DECORATION = {
   virt_text = true,
   virt_text_pos = true,

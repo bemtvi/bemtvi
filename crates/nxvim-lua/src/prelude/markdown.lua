@@ -10,18 +10,20 @@
 nx.markdown = nx.markdown or {}
 
 -- nx.markdown.render(src) -> { lines = {string,..}, highlights = { hl, .. },
---                             fills = { fill, .. } }
+--                             fills = { fill, .. }, code = { block, .. } }
 --
 -- Parse `src` (CommonMark + GFM: tables, strikethrough, task lists) into stripped
 -- display lines with the markup syntax removed (`**bold**` -> `bold`, `# Title` ->
 -- `Title`, ` ``` ` fences dropped, `- x` -> `• x`, `> q` -> `▎ q`, `- [ ]` -> `☐`),
 -- plus the styling to paint over them. Each highlight is a table:
 --
---   { line = <1-based line>, col_start = <1-based char col>,
---     col_end = <exclusive char col>, group = "<@markup.* capture>" }
+-- ```
+-- { line = <1-based line>, col_start = <1-based char col>,
+--   col_end = <exclusive char col>, group = "<@markup.* capture>" }
+-- ```
 --
 -- Columns are CHARACTER columns (not bytes), so they index `lines[hl.line]` the way
--- Lua string.sub / display code counts. `group` is a neovim `@markup.*` treesitter
+-- Lua `string.sub` / display code counts. `group` is a neovim `@markup.*` treesitter
 -- capture (`@markup.strong`, `@markup.heading.1`, `@markup.raw`, `@markup.link.label`,
 -- `@markup.quote`, `@markup.list`, …), so a colorscheme that styles treesitter
 -- markdown styles these identically.
@@ -30,7 +32,135 @@ nx.markdown = nx.markdown or {}
 -- separator: each `{ line = <1-based>, char = "─", group = "<@markup.*>" }` means
 -- "repeat `char` across the width of `lines[line]`". Render them as a full-width run.
 --
+-- `code` are the fenced code blocks, each
+-- `{ first_line = <1-based>, last_line = <1-based, inclusive>, lang = "<fence language>"? }`
+-- — `lang` is absent for a bare ` ``` ` fence. Use it to back a block as a code region
+-- (set `line_hl_group = "@markup.raw.block"` on `first_line..last_line` — the doc-float
+-- look) or to syntax-highlight its body in `lang`.
+--
 -- Pure and infallible: unsupported constructs still contribute their text.
 function nx.markdown.render(src)
   return nx._markdown_render(src or "")
+end
+
+-- `nx.markdown.render` reports styling in 1-based CHARACTER columns; extmarks take
+-- 0-based BYTE columns. Convert the `c`-th character boundary (1-based; `c` may be one
+-- past the last char, an exclusive end) to its 0-based byte offset in `line`.
+local function char_to_byte(line, c)
+  return (utf8.offset(line, c) or (#line + 1)) - 1
+end
+
+-- nx.markdown.to_view(src[, opts]) -> { lines = {string,..}, decor = { mark, .. } }
+--
+-- Turn markdown `src` into **view-ready** content: the display `lines` plus the `decor`
+-- extmarks that style them — exactly the `{ lines, decor }` shape an `nx.view.component`
+-- `render` returns (or hand `lines` to `view:set_lines` and `decor` to `view:set_decor`).
+-- The higher-level companion to `nx.markdown.render`: `render` gives the raw pieces,
+-- `to_view` assembles them into something you can drop straight onto a surface.
+--
+--   * Prose is *rendered*: the stripped lines, styled with `render`'s `@markup.*` spans
+--     (as ranged `hl_group` extmarks in byte columns).
+--   * Thematic breaks / table separators become a full-line rule glyph.
+--   * Fenced code blocks are LEFT as raw ` ``` ` fences (so tree-sitter can highlight
+--     them — see below), backed with a full-width `line_hl_group` code background, and
+--     their fence delimiter lines are hidden behind a blanking `virt_text` overlay so the
+--     block reads as rendered.
+--
+-- IMPORTANT — code-block syntax highlighting: the fences are kept on purpose. Mount the
+-- surface with `filetype = "markdown"` (e.g.
+-- `nx.view.component{...}:mount{ filetype = "markdown", … }`) so the markdown grammar's
+-- injections highlight each fenced block in its own language. Without that `filetype` the
+-- code still shows (backed, fences hidden) but unhighlighted. Per-language highlighting
+-- needs that language's grammar installed.
+--
+-- `opts` (all optional):
+--   * `rule_width` (default 80): cells a thematic-break / table-separator rule spans.
+--   * `code_hl_group` (default `"@markup.raw.block"`): the code-block background group.
+--
+-- Pure Lua over `nx.markdown.render`; no editor state, so it runs on every build.
+function nx.markdown.to_view(src, opts)
+  opts = opts or {}
+  local rule_width = opts.rule_width or 80
+  local code_group = opts.code_hl_group or "@markup.raw.block"
+  local r = nx.markdown.render(src)
+
+  -- Where each fenced block opens, and which stripped lines are code (prose-only spans
+  -- skip these — the injected grammar highlights the code body).
+  local block_start, in_code = {}, {}
+  for _, b in ipairs(r.code) do
+    block_start[b.first_line] = b
+    for l = b.first_line, b.last_line do
+      in_code[l] = true
+    end
+  end
+  local fill_at = {}
+  for _, f in ipairs(r.fills) do
+    fill_at[f.line] = f
+  end
+
+  local lines, decor = {}, {}
+  local out_of = {} -- stripped line (1-based) -> output row (1-based); fences shift rows
+  local function push(line)
+    lines[#lines + 1] = line
+    return #lines
+  end
+
+  local i, n = 1, #r.lines
+  while i <= n do
+    local b = block_start[i]
+    if b then
+      -- Re-wrap the block in its ``` fences so injection fires, back the whole block as a
+      -- code region, and hide the two fence delimiter lines behind a blanking overlay.
+      local open_row = push("```" .. (b.lang or ""))
+      for l = b.first_line, b.last_line do
+        out_of[l] = push(r.lines[l])
+      end
+      local close_row = push("```")
+      for row = open_row, close_row do
+        decor[#decor + 1] = { line = row - 1, col = 0, line_hl_group = code_group }
+      end
+      for _, fr in ipairs({ open_row, close_row }) do
+        decor[#decor + 1] = {
+          line = fr - 1,
+          col = 0,
+          virt_text = { { string.rep(" ", #lines[fr]), code_group } },
+          virt_text_pos = "overlay",
+        }
+      end
+      i = b.last_line + 1
+    else
+      local f = fill_at[i]
+      if f then
+        local rule = string.rep(f.char, rule_width)
+        out_of[i] = push(rule)
+        decor[#decor + 1] = {
+          line = out_of[i] - 1,
+          col = 0,
+          end_row = out_of[i] - 1,
+          end_col = #rule,
+          hl_group = f.group,
+        }
+      else
+        out_of[i] = push(r.lines[i])
+      end
+      i = i + 1
+    end
+  end
+
+  -- Inline prose spans, remapped to their output row (code lines handled by injection).
+  for _, h in ipairs(r.highlights) do
+    if not in_code[h.line] then
+      local row = out_of[h.line]
+      local text = r.lines[h.line]
+      decor[#decor + 1] = {
+        line = row - 1,
+        col = char_to_byte(text, h.col_start),
+        end_row = row - 1,
+        end_col = char_to_byte(text, h.col_end),
+        hl_group = h.group,
+      }
+    end
+  end
+
+  return { lines = lines, decor = decor }
 end

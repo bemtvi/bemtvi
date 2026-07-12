@@ -42,3 +42,7 @@ globals:
   # nx.async coroutine. Not in selene's lua51 std, so declare it here.
   coroutine.isyieldable:
     args: []
+  # 5.3+ `utf8` library (present in nxvim's PUC 5.4); `nx.markdown.to_view` uses
+  # `utf8.offset` for char→byte column conversion. Open-ended like `bit`.
+  utf8:
+    any: true

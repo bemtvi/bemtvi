@@ -281,7 +281,15 @@ fn virt_decor_from_table(t: &Table) -> mlua::Result<Option<VirtDecorData>> {
         }),
         None => None,
     };
-    if virt_text.is_empty() && virt_lines.is_empty() && sign_text.is_none() && line_fill.is_none() {
+    // `line_hl_group = "<group>"` — the full-width line background (neovim's
+    // `line_hl_group`), a renderable decoration on its own (the `line_bg` layer).
+    let line_hl_group = t.get::<Option<String>>("line_hl_group")?;
+    if virt_text.is_empty()
+        && virt_lines.is_empty()
+        && sign_text.is_none()
+        && line_fill.is_none()
+        && line_hl_group.is_none()
+    {
         return Ok(None);
     }
     // Reject an unknown `virt_text_pos` / `hl_mode` loud here (at the scripting
@@ -314,6 +322,7 @@ fn virt_decor_from_table(t: &Table) -> mlua::Result<Option<VirtDecorData>> {
         sign_text,
         sign_hl_group,
         line_fill,
+        line_hl_group,
     }))
 }
 
@@ -380,10 +389,14 @@ pub(crate) fn install_vim(lua: &Lua, shared: &Rc<RefCell<Shared>>) -> mlua::Resu
     // parse CommonMark+GFM `src` into stripped display lines + `@markup.*` highlight
     // ranges, via the pure `nxvim_core::markdown` renderer (the same one the LSP doc
     // floats use). Returns `{ lines = {..}, highlights = { {line, col_start, col_end,
-    // group}, .. }, fills = { {line, char, group}, .. } }` with 1-based line and
-    // **char** columns (`col_end` exclusive) so Lua layout code and callers index by
-    // column, not byte. `fills` are whole-line rules (thematic breaks / table
-    // separators): repeat `char` across that line. Pure — no editor state.
+    // group}, .. }, fills = { {line, char, group}, .. }, code = { {first_line,
+    // last_line, lang?}, .. } }` with 1-based lines and **char** columns (`col_end`
+    // exclusive) so Lua layout code and callers index by column, not byte. `fills` are
+    // whole-line rules (thematic breaks / table separators): repeat `char` across that
+    // line. `code` are the fenced code blocks: `first_line`/`last_line` are 1-based
+    // inclusive line bounds and `lang` the fence language (nil for a bare fence) — so a
+    // caller can back the block (e.g. a `line_hl_group` region) or highlight its body.
+    // Pure — no editor state.
     nx.set(
         "_markdown_render",
         lua.create_function(|lua, src: String| {
@@ -418,6 +431,19 @@ pub(crate) fn install_vim(lua: &Lua, shared: &Rc<RefCell<Shared>>) -> mlua::Resu
                 fills.set(i + 1, f)?;
             }
             out.set("fills", fills)?;
+            let code = lua.create_table()?;
+            for (i, block) in rendered.code.iter().enumerate() {
+                let c = lua.create_table()?;
+                // 1-based inclusive line bounds: first_line is 0-based, the block spans
+                // `len` lines, so last_line = first_line0 + len.
+                c.set("first_line", block.first_line + 1)?;
+                c.set("last_line", block.first_line + block.len)?;
+                if let Some(lang) = &block.lang {
+                    c.set("lang", lang.as_str())?;
+                }
+                code.set(i + 1, c)?;
+            }
+            out.set("code", code)?;
             Ok(out)
         })?,
     )?;

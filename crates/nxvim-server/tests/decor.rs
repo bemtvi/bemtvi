@@ -751,3 +751,61 @@ async fn buftype_scopes_a_provider_to_buffer_kind() {
         "the quickfix window's buffer is buftype \"quickfix\": {qf_bt:?}"
     );
 }
+
+/// window 0's `line_bg` layer as `(row, style_id)` pairs — the full-width line
+/// backgrounds (neovim's `line_hl_group`) painted under the text.
+fn window0_line_bg(map: &[(Value, Value)]) -> Vec<(u64, Option<u64>)> {
+    match window0_field(map, "line_bg").and_then(Value::as_array) {
+        Some(a) => a
+            .iter()
+            .filter_map(|e| {
+                let e = e.as_array()?;
+                Some((e.first()?.as_u64()?, e.get(1).and_then(Value::as_u64)))
+            })
+            .collect(),
+        None => Vec::new(),
+    }
+}
+
+#[tokio::test]
+async fn line_hl_group_extmark_renders_as_a_line_bg_layer() {
+    // The public `nx.buf.set_extmark(..., { line_hl_group = <group> })` backs a whole line
+    // with a full-width background — projected as the per-window `line_bg` layer painted
+    // under the text (the `'cursorline'` model), so syntax spans compose on top. Set one on
+    // the middle line of a real buffer under `:colorscheme nxvim` and read it back.
+    let dir = temp_dir("decor_line_hl");
+    let file = dir.join("a.txt");
+    std::fs::write(&file, "one\ntwo\nthree\n").expect("write file");
+    std::fs::write(dir.join("init.lua"), "vim.cmd('colorscheme nxvim')").expect("write init");
+    let init = ServerInit {
+        config_dir: Some(dir.to_path_buf()),
+        runtimepath: vec![dir.to_path_buf()],
+        file: Some(file.to_string_lossy().into_owned()),
+        ..Default::default()
+    };
+    let (rpc, mut incoming) = spawn(init);
+    attach(&rpc, 80, 24).await;
+
+    exec_lua(
+        &rpc,
+        "local ns = nx.ns.create('line-hl-test')\n\
+         nx.buf.set_extmark(0, ns, 1, 0, { line_hl_group = '@markup.raw.block' })",
+    )
+    .await;
+
+    // Row 1 (0-based, the "two" line) now carries a resolved line background; the other
+    // rows do not.
+    let map = wait_redraw(&mut incoming, |m| {
+        window0_line_bg(m).iter().any(|(r, _)| *r == 1)
+    })
+    .await;
+    let line_bg = window0_line_bg(&map);
+    assert!(
+        matches!(line_bg.iter().find(|(r, _)| *r == 1), Some((_, Some(_)))),
+        "the line_hl_group line carries a resolved line_bg: {line_bg:?}"
+    );
+    assert!(
+        !line_bg.iter().any(|(r, _)| *r == 0 || *r == 2),
+        "only the marked line is backed, not its neighbours: {line_bg:?}"
+    );
+}

@@ -1135,3 +1135,114 @@ async fn markdown_injects_rust_into_a_fenced_code_block() {
         "markdown injects rust into the fenced code block: {hl:?}"
     );
 }
+
+/// The floating window (the rendered-markdown popup) from a redraw, or `None`.
+fn float_win(params: &[Value]) -> Option<Vec<(Value, Value)>> {
+    let Value::Map(map) = params.first()? else {
+        return None;
+    };
+    let windows = map
+        .iter()
+        .find(|(k, _)| k.as_str() == Some("windows"))?
+        .1
+        .as_array()?;
+    windows
+        .iter()
+        .filter_map(Value::as_map)
+        .find(|w| {
+            w.iter()
+                .any(|(k, v)| k.as_str() == Some("floating") && v.as_bool() == Some(true))
+        })
+        .map(|w| w.to_vec())
+}
+
+/// A window map's visible text rows.
+fn win_text(win: &[(Value, Value)]) -> Vec<String> {
+    win.iter()
+        .find(|(k, _)| k.as_str() == Some("lines"))
+        .and_then(|(_, v)| v.as_array())
+        .map(|rows| {
+            rows.iter()
+                .map(|r| r.as_str().unwrap_or_default().to_string())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// A window map's per-row highlight spans `[(start, end, group)]`.
+fn win_hl(win: &[(Value, Value)]) -> Vec<Vec<(u64, u64, String)>> {
+    win.iter()
+        .find(|(k, _)| k.as_str() == Some("highlights"))
+        .and_then(|(_, v)| v.as_array())
+        .map(|rows| {
+            rows.iter()
+                .map(|row| {
+                    row.as_array()
+                        .map(|spans| {
+                            spans
+                                .iter()
+                                .filter_map(|s| {
+                                    let a = s.as_array()?;
+                                    Some((
+                                        a[0].as_u64()?,
+                                        a[1].as_u64()?,
+                                        a[2].as_str()?.to_string(),
+                                    ))
+                                })
+                                .collect()
+                        })
+                        .unwrap_or_default()
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// End-to-end proof that the shipped `examples/markdown/` float highlights its code
+/// blocks in their own language: the example keeps the ```rust fence in the view buffer
+/// and types it `markdown`, so the grammar's injection paints `fn` inside the block as a
+/// rust keyword — exactly the native path, no bespoke highlighting in the config.
+#[tokio::test]
+async fn markdown_example_float_injects_rust_into_code_blocks() {
+    let _guard = test_lock().lock().await;
+    fixture_data_dir();
+    let example_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/markdown");
+    let file = write_temp(
+        "md-ex",
+        "md",
+        "# Title\n\nprose here.\n\n```rust\nfn zzz() {}\n```\n",
+    );
+    let (rpc, mut incoming) = start_full(Some(file), Vec::new(), Some(example_dir)).await;
+
+    // The example maps `K` to render the current buffer into the float.
+    feed(&rpc, "K");
+
+    // Poll for the float whose `fn zzz` code row carries a rust `@keyword` span — the
+    // injection painting over the markdown host (the view is filetype=markdown).
+    let mut injected = false;
+    for _ in 0..100 {
+        barrier(&rpc).await;
+        tokio::task::yield_now().await;
+        if let Some(params) = drain_latest_redraw(&mut incoming) {
+            if let Some(win) = float_win(&params) {
+                let lines = win_text(&win);
+                let hl = win_hl(&win);
+                if let Some(row) = lines.iter().position(|l| l.contains("fn zzz")) {
+                    if hl.get(row).is_some_and(|spans| {
+                        spans
+                            .iter()
+                            .any(|(_, _, g)| g.split('.').next() == Some("keyword"))
+                    }) {
+                        injected = true;
+                        break;
+                    }
+                }
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(
+        injected,
+        "the example float injects rust: `fn` in the code block paints as a keyword"
+    );
+}

@@ -1452,12 +1452,18 @@ pub async fn serve_proc_daemon_on(
                     ],
                 ),
                 // The daemon only spawns processes — it arms no timers, no filesystem
-                // watches, and no `nx.fs` ops (the luafs leg has its own handler) — so
-                // no other variant can reach here.
+                // watches, no `nx.fs` ops (the luafs leg has its own handler), and no
+                // `nx.http.mount` listener (mounts are always local: the Lua VM that answers
+                // them lives in the edit-host) — so no other variant can reach here.
                 LoopEvent::Timer { .. }
                 | LoopEvent::FsEvent { .. }
                 | LoopEvent::FsResult { .. }
                 | LoopEvent::HttpResult { .. }
+                | LoopEvent::HttpMountResult { .. }
+                | LoopEvent::HttpServerRequest { .. }
+                | LoopEvent::HttpServerTimeout { .. }
+                | LoopEvent::HttpRebound { .. }
+                | LoopEvent::HttpRebindErr { .. }
                 | LoopEvent::ProcOut { .. }
                 | LoopEvent::ProcExit { .. }
                 | LoopEvent::SockConnected { .. }

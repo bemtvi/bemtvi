@@ -21,20 +21,20 @@ use crate::convert::{
 use crate::host::{get_runtime_file, stdpath};
 use crate::ops::{
     BufOp, CompletePush, CompleteSetupReq, ConfirmReq, DecorMark, DecorPublish, DiagnosticData,
-    DockOp, ExtmarkOp, FeedKeysOp, FsJob, GlobalOptionOp, HlSet, HttpRequest, LayerOp, LoopOp,
-    LspOp, NamedListOp, PanelOp, PickerOpenReq, PickerPush, PreviewPush, QfItem, QfSetOp,
-    RegisterSetOp, SnippetAddReq, SnippetSetupReq, StatuslineKind, StatuslinePublishReq,
+    DockOp, ExtmarkOp, FeedKeysOp, FsJob, GlobalOptionOp, HlSet, HttpRequest, HttpServerReply,
+    LayerOp, LoopOp, LspOp, NamedListOp, PanelOp, PickerOpenReq, PickerPush, PreviewPush, QfItem,
+    QfSetOp, RegisterSetOp, SnippetAddReq, SnippetSetupReq, StatuslineKind, StatuslinePublishReq,
     StatuslineSetupReq, StatuslineTarget, TabOp, TerminalOpenReq, TsOp, UiFloatReq, UiInputReq,
     UiSelectReq, ViewOp, VirtChunkData, VirtDecorData, WindowOp, WorkspaceOptionOp,
 };
 use crate::runtime::{OutputLine, Shared};
 use crate::vimregex;
 
-/// The Lua args both `nx._http_fetch` and `nx._http_stream` take: the callback id, url,
-/// method, headers (as `{ name, value }` pair-lists — mlua has no `FromLua` for a bare
+/// The Lua args both `nx._http_fetch` and `nx._local_http_fetch` take: the callback id,
+/// url, method, headers (as `{ name, value }` pair-lists — mlua has no `FromLua` for a bare
 /// tuple, so the wrapper sends pair-lists), the body, an optional timeout (ms), the
 /// redirect mode (`follow`/`manual`/`error`), and an optional max-redirects. Shared so the
-/// one-shot and streaming bridges build the same [`HttpRequest`].
+/// session-routed and local-forced bridges build the same [`HttpRequest`].
 type HttpArgs = (
     u64,
     String,
@@ -46,18 +46,13 @@ type HttpArgs = (
     Option<u32>,
 );
 
-/// Build an [`HttpRequest`] from the parsed [`HttpArgs`] (minus the callback id) — the
-/// shared request-shaping the `nx._http_fetch` / `nx._http_stream` bridges both use.
-fn build_http_request(
-    url: String,
-    method: String,
-    headers: Vec<Vec<String>>,
-    body: Vec<u8>,
-    timeout_ms: Option<u64>,
-    redirect: String,
-    max_redirects: Option<u32>,
-) -> HttpRequest {
-    let headers = headers
+/// Flatten the `{ name, value }` pair-lists the Lua HTTP bridges send into ordered
+/// `(name, value)` header pairs (mlua has no `FromLua` for a bare tuple, hence the
+/// pair-list on the wire). A malformed pair is dropped rather than panicking — the Lua
+/// wrappers build these, so a short pair is unreachable by a plugin. Shared by the
+/// outbound `nx._http_fetch` family and the inbound `nx._http_respond`.
+fn header_pairs(headers: Vec<Vec<String>>) -> Vec<(String, String)> {
+    headers
         .into_iter()
         .filter_map(|mut pair| match (pair.first(), pair.get(1)) {
             (Some(_), Some(_)) => {
@@ -67,11 +62,24 @@ fn build_http_request(
             }
             _ => None,
         })
-        .collect();
+        .collect()
+}
+
+/// Build an [`HttpRequest`] from the parsed [`HttpArgs`] (minus the callback id) — the
+/// shared request-shaping the `nx._http_fetch` / `nx._local_http_fetch` bridges both use.
+fn build_http_request(
+    url: String,
+    method: String,
+    headers: Vec<Vec<String>>,
+    body: Vec<u8>,
+    timeout_ms: Option<u64>,
+    redirect: String,
+    max_redirects: Option<u32>,
+) -> HttpRequest {
     HttpRequest {
         method,
         url,
-        headers,
+        headers: header_pairs(headers),
         body,
         timeout_ms,
         redirect,
@@ -1692,6 +1700,62 @@ pub(crate) fn install_runtime_api(
                 Ok(())
             },
         )?,
+    )?;
+
+    // `nx._http_mount(cb_id, name, timeout_ms)` — publish a plugin's subroute at
+    // `/plugin/<name>/*` on the editor's ONE listener, binding it if this is the first
+    // mount (nothing binds before that). Queues a `LoopOp::HttpMount` and returns
+    // immediately; the bound origin comes back as a `CallbackArgs::HttpMountResult`, which
+    // fires `nx._run_cb(cb_id, false, err, origin)` to settle the `nx.http.mount` promise.
+    // Backs the public `nx.http.mount`. No address here — `'httphost'`/`'httpport'` live on
+    // the editor, which this side cannot see; the effects layer reads them as it dispatches.
+    let sh = shared.clone();
+    nx.set(
+        "_http_mount",
+        lua.create_function(move |_, (cb_id, name, timeout_ms): (u64, String, u64)| {
+            sh.borrow_mut().loop_ops.push(LoopOp::HttpMount {
+                id: cb_id,
+                name,
+                timeout_ms,
+            });
+            Ok(())
+        })?,
+    )?;
+    // `nx._http_respond(req_id, status, headers, body)` — answer the in-flight mount
+    // request `req_id` (a `respond(res)` inside an `on_request`). `headers` is a list of
+    // `{ name, value }` pairs; `body` a (possibly empty) byte-string. `req_id` is unique
+    // across every mount, so no mount id rides along. Fire-and-forget: the Lua side has
+    // already validated the reply and closed its slot, so anything the actor no longer
+    // knows about was reported there.
+    let sh = shared.clone();
+    nx.set(
+        "_http_respond",
+        lua.create_function(
+            move |_, (req_id, status, headers, body): (u64, u16, Vec<Vec<String>>, mlua::String)| {
+                sh.borrow_mut().loop_ops.push(LoopOp::HttpRespond {
+                    req_id,
+                    reply: HttpServerReply {
+                        status,
+                        headers: header_pairs(headers),
+                        body: body.as_bytes().to_vec(),
+                    },
+                });
+                Ok(())
+            },
+        )?,
+    )?;
+    // `nx._http_unmount(cb_id)` — retire the route mounted under `cb_id` (`mount:close()`).
+    // The listener stays bound for the session; in-flight requests for this mount are
+    // dropped (their clients get a 503).
+    let sh = shared.clone();
+    nx.set(
+        "_http_unmount",
+        lua.create_function(move |_, cb_id: u64| {
+            sh.borrow_mut()
+                .loop_ops
+                .push(LoopOp::HttpUnmount { id: cb_id });
+            Ok(())
+        })?,
     )?;
 
     // `nx._url_encode_query(pairs)` -> the `application/x-www-form-urlencoded` string for

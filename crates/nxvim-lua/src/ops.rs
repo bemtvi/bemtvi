@@ -552,6 +552,60 @@ pub struct HttpError {
     pub message: String,
 }
 
+/// One inbound request to an `nx.http.mount` handler, as plain data — the descriptor
+/// the actor's listener hands the Lua `on_request`. The INBOUND twin of [`HttpRequest`],
+/// and deliberately a separate type: an inbound request has no URL / redirect policy /
+/// timeout of its own, and it carries the routing (`name`) an outbound one never does.
+///
+/// Transport-free and wasm-safe (no `axum` in `nxvim-lua`) for the same reason
+/// [`HttpRequest`] is: the bytes arrive from an `axum` listener natively, and from a
+/// Service Worker's `fetch` interception on the browser. Both worlds marshal *this* into
+/// Lua, so a plugin's handler is identical in each.
+#[derive(Clone, Debug)]
+pub struct HttpServerRequest {
+    /// The mount this request routed to (the `<name>` in `/plugin/<name>/…`). Carried so
+    /// a handler shared between mounts can tell them apart.
+    pub name: String,
+    /// The HTTP method, upper-cased (`GET` / `POST` / …).
+    pub method: String,
+    /// The **mount-relative** path, always leading-slashed: `/plugin/example/style.css`
+    /// arrives as `/style.css`, and a bare `/plugin/example` as `/`. Relative so the same
+    /// handler works under any prefix or origin — the native port and the browser's
+    /// Service Worker origin included.
+    pub path: String,
+    /// The full path as requested, prefix included (`/plugin/example/style.css`) — for a
+    /// handler that needs to build absolute links back to itself.
+    pub raw_path: String,
+    /// Decoded query parameters as ordered `(name, value)` pairs (repeats preserved).
+    pub query: Vec<(String, String)>,
+    /// Request headers as ordered `(lowercased-name, value)` pairs.
+    pub headers: Vec<(String, String)>,
+    /// The request body's raw bytes (empty when there is none).
+    pub body: Vec<u8>,
+}
+
+/// The reply an [`HttpServerRequest`] is answered with — what a mount handler passes to
+/// its `respond(res)`. The inbound twin of [`HttpResponse`]; separate for the same reason
+/// [`HttpServerRequest`] is (no `ok` / `statusText` — those are things a *client* reads
+/// off a response, not things a server chooses).
+#[derive(Clone, Debug)]
+pub struct HttpServerReply {
+    /// The status code to send (`200` when the handler omits it).
+    pub status: u16,
+    /// Response headers as ordered `(name, value)` pairs.
+    pub headers: Vec<(String, String)>,
+    /// The response body's raw bytes (empty when there is none).
+    pub body: Vec<u8>,
+}
+
+/// Why an [`LoopOp::HttpMount`] failed — a bind failure (the port is taken, the host
+/// doesn't resolve) or a duplicate mount name. Rejects the `nx.http.mount` promise as a
+/// `{ message }` table, like [`HttpError`].
+#[derive(Clone, Debug)]
+pub struct HttpMountError {
+    pub message: String,
+}
+
 /// A request to the async runtime (the "event loop"), queued by the `nx.schedule`
 /// / `nx.timer` / `vim.system` (`nx.run`) family and drained by the
 /// server in `apply_lua_effects`. Each op carries a `cb_id` into `nx._cb_fns`
@@ -685,6 +739,42 @@ pub enum LoopOp {
         request: HttpRequest,
         local: bool,
     },
+    /// `nx.http.mount{ name, on_request }` — publish a plugin's subroute at
+    /// `/plugin/<name>/*` on the editor's **one** listener, binding that listener first if
+    /// this is the first mount. Settles the promise registered under `id` with the mount's
+    /// URL ([`CallbackArgs::HttpMountResult`]), or rejects it on a bind failure / a
+    /// duplicate name.
+    ///
+    /// Carries no address: `'httphost'`/`'httpport'` live on the editor, which this side of
+    /// the bridge cannot see. The effects layer reads them off the editor as it dispatches
+    /// and hands the actor a concrete `host:port` — so the option stays the single source of
+    /// truth and the actor never reads editor state (which is `!Send` and lives on the
+    /// editor thread).
+    ///
+    /// Nothing binds until this op arrives: a config with no HTTP plugin opens no port and
+    /// spawns no task. Native only — a browser tab cannot bind a TCP port, so the wasm arm
+    /// routes to the Service Worker seam instead.
+    HttpMount {
+        id: u64,
+        name: String,
+        /// How long the request may sit unanswered before the client gets a `504` and the
+        /// slot is reclaimed — `opts.timeout`. Guards the leak of a handler that never
+        /// calls `respond`.
+        timeout_ms: u64,
+    },
+    /// `respond(res)` inside a mount handler — answer the in-flight request `req_id`.
+    ///
+    /// `req_id` is globally unique across every mount (one counter in the actor), so this
+    /// carries no mount id: the actor completes whichever pending request holds it. A
+    /// `req_id` the actor no longer knows (it timed out, or the mount closed) is dropped —
+    /// the Lua side detects that case first and notifies loud, so it is never a silent
+    /// success here.
+    HttpRespond { req_id: u64, reply: HttpServerReply },
+    /// `mount:close()` — retire the route registered under `id`. In-flight requests for it
+    /// are dropped (their clients get a `503`). The listener itself stays bound for the
+    /// session: an idle listener costs nothing, and a stable origin survives a plugin
+    /// reload.
+    HttpUnmount { id: u64 },
 }
 
 /// A buffer-local *option* write queued by the Lua side, drained by the server in
@@ -1203,6 +1293,19 @@ pub enum CallbackArgs {
         /// `Ok` resolves the promise with the marshalled response, `Err` rejects it with
         /// the `{ message }` table (fetch rejects only on a network/transport failure).
         result: Result<HttpResponse, HttpError>,
+    },
+    /// The settled result of an [`LoopOp::HttpMount`]: the callback runs as
+    /// `nx._run_cb(id, false, err, origin)` — `err` the `{ message }` table (with `origin`
+    /// nil) when the listener couldn't bind or the name was taken, or `err` nil with
+    /// `origin` the bound origin string (`"http://127.0.0.1:53124"`) the Lua side turns
+    /// into the mount's `:url()`.
+    ///
+    /// Carrying the origin *through the promise* is what lets `'httpport' = 0` work: the
+    /// concrete port only exists after the bind, which is cross-tick state `nx.schedule`
+    /// cannot poll for. The plugin gets it already settled and never polls.
+    HttpMountResult {
+        /// `Ok(origin)` resolves the promise with the bound origin; `Err` rejects it.
+        result: Result<String, HttpMountError>,
     },
 }
 

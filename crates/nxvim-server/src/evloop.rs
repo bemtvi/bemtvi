@@ -21,7 +21,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use notify::{EventKind, RecommendedWatcher, RecursiveMode, Watcher};
-use nxvim_lua::{run_fs_job, FsError, FsJob, FsValue, HttpError, HttpRequest, HttpResponse, LuaFs};
+use nxvim_lua::{
+    run_fs_job, FsError, FsJob, FsValue, HttpError, HttpRequest, HttpResponse, HttpServerReply,
+    HttpServerRequest, LuaFs,
+};
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
@@ -124,6 +127,31 @@ pub enum LoopCommand {
         request: HttpRequest,
         local: bool,
     },
+    /// `nx.http.mount` — publish a plugin's subroute at `/plugin/<name>/*` on the editor's
+    /// one listener, binding it on `host:port` if this is the first mount. Settles the
+    /// mount promise with [`LoopEvent::HttpMountResult`].
+    ///
+    /// `host`/`port` are the `'httphost'`/`'httpport'` values the effects layer read off the
+    /// editor as it dispatched — the actor is *told* the address and never reads editor
+    /// state (which is `!Send` and lives on the editor thread). Ignored once a listener
+    /// exists; moving it afterwards is [`HttpRebind`](LoopCommand::HttpRebind).
+    HttpMount {
+        id: u64,
+        name: String,
+        host: String,
+        port: u16,
+        timeout: Duration,
+    },
+    /// `respond(res)` in a mount handler — complete the parked request `req_id`. Carries no
+    /// mount id: `req_id` is unique across every mount.
+    HttpRespond { req_id: u64, reply: HttpServerReply },
+    /// `mount:close()` — retire the route owned by `id` and 503 its in-flight requests. The
+    /// listener stays bound for the session.
+    HttpUnmount { id: u64 },
+    /// An `'httphost'` / `'httpport'` write while mounts are serving — move the listener to
+    /// `host:port`. Binds the new address before dropping the old, so a failure changes
+    /// nothing and reports [`LoopEvent::HttpRebindErr`]. A no-op when nothing is bound.
+    HttpRebind { host: String, port: u16 },
 }
 
 /// An event from the actor back to the server thread, delivered to the main
@@ -209,6 +237,48 @@ pub enum LoopEvent {
     HttpResult {
         id: u64,
         result: Result<HttpResponse, HttpError>,
+    },
+    /// An [`LoopCommand::HttpMount`] settled: `Ok(origin)` (the bound origin, e.g.
+    /// `"http://127.0.0.1:53124"`) resolves the mount promise, `Err(message)` rejects it (a
+    /// taken port, a duplicate name). Carrying the origin is what makes `'httpport' = 0`
+    /// usable — the concrete port only exists after the bind.
+    HttpMountResult {
+        id: u64,
+        result: Result<String, String>,
+    },
+    /// An inbound request routed to the mount owned by callback `id`. The actor's axum
+    /// handler is parked on `req_id` until the plugin's `respond` comes back as a
+    /// [`LoopCommand::HttpRespond`]. Persistent — one per request, for the mount's life.
+    HttpServerRequest {
+        id: u64,
+        req_id: u64,
+        request: HttpServerRequest,
+    },
+    /// A mount handler left `req_id` unanswered past its timeout. The client already has its
+    /// `504` and the actor has dropped the slot; this tells the Lua side so it can close its
+    /// own slot and notify (a silent 504 would leave a plugin author nothing to debug).
+    HttpServerTimeout { req_id: u64 },
+    /// The listener moved to a new origin after an `'httphost'`/`'httpport'` write. Every
+    /// mount stayed live; only the origin changed, so the Lua side updates the one place
+    /// `Mount:origin()` reads.
+    ///
+    /// Echoes back the `host`/`port` it bound with, rather than leaving the editor to assume
+    /// the current option values are the ones that landed: two rebinds can be in flight at
+    /// once (`:set httpport=9000` then `9001` before the first replies), so "what succeeded"
+    /// has to be stated, not inferred.
+    HttpRebound {
+        origin: String,
+        host: String,
+        port: u16,
+    },
+    /// A rebind failed — the old listener is still serving, untouched. The editor notifies
+    /// and reverts the option, so it can never disagree with the live address. Carries the
+    /// `host`/`port` that failed so the editor only reverts if that is still what the option
+    /// says (the user may have moved on to a third value already).
+    HttpRebindErr {
+        message: String,
+        host: String,
+        port: u16,
     },
 }
 
@@ -373,6 +443,9 @@ async fn run_evloop(
     // native backend thread; dropping it (on `FsEventStop`, a re-arm, or actor
     // shutdown) stops the watch.
     let mut fs_watchers: HashMap<u64, RecommendedWatcher> = HashMap::new();
+    // The `nx.http.mount` routes + listener. Cheap to hold: it binds nothing until the first
+    // `HttpMount` command, so a session with no HTTP plugin never opens a port.
+    let mut http_mounts = crate::httpmount::HttpMounts::new(event_tx.clone());
     while let Some(cmd) = cmd_rx.recv().await {
         // Drop handles whose tasks have finished, so a long run of one-shot timers
         // / processes can't accumulate dead entries. (fs watchers are dropped
@@ -595,6 +668,22 @@ async fn run_evloop(
                     let _ = event_tx.send(LoopEvent::HttpResult { id, result });
                 });
             }
+            LoopCommand::HttpMount {
+                id,
+                name,
+                host,
+                port,
+                timeout,
+            } => {
+                // Awaited inline rather than spawned: mounts must apply in order (a
+                // duplicate-name check racing a concurrent mount of the same name would let
+                // both through), and the bind is one fast syscall. `host`/`port` are only
+                // consulted when nothing is bound yet.
+                http_mounts.mount(id, name, &host, port, timeout).await;
+            }
+            LoopCommand::HttpRespond { req_id, reply } => http_mounts.respond(req_id, reply),
+            LoopCommand::HttpUnmount { id } => http_mounts.unmount(id),
+            LoopCommand::HttpRebind { host, port } => http_mounts.rebind(&host, port).await,
         }
         // Forget kill channels whose process tasks have closed them (the child
         // exited and the `HostProc` future dropped the receiver) — the leak guard

@@ -39,6 +39,8 @@ native = [
     "dep:nxvim-ts",
     "dep:portable-pty",
     "dep:ureq",
+    "dep:axum",
+    "dep:form_urlencoded",
 ]
 
 [dependencies]
@@ -90,6 +92,15 @@ nxvim-ts = { workspace = true, optional = true }
 # rustls TLS (the same client `nxvim-ts` uses for `:TSInstall`). Native-only: the
 # browser build routes `nx.http` to the daemon `http_op` leg or its own `fetch()`.
 ureq = { workspace = true, optional = true }
+# The `nx.http.mount` listener (`httpmount.rs`) — inbound HTTP, the twin of `ureq`'s
+# outbound. Native-only: a browser tab cannot bind a TCP port, so the wasm build
+# reaches the same mount contract through a Service Worker. Optional + `native`-gated
+# so the edit-host never compiles it.
+axum = { workspace = true, optional = true }
+# Decoding inbound query strings for `nx.http.mount` handlers (`httpmount.rs`) — the
+# same canonical `rust-url` serializer `nx.http`'s outbound `query`/`form` encoding
+# uses, read in reverse. No bespoke query parser.
+form_urlencoded = { workspace = true, optional = true }
 
 [dev-dependencies]
 # Shared black-box test harness. The single Lua backend (PUC lua54) comes from

@@ -2088,6 +2088,8 @@ impl EditHost {
             fileencodings: go.fileencodings.clone(),
             autoread: go.autoread,
             imagepreview: go.imagepreview,
+            httphost: go.httphost.clone(),
+            httpport: go.httpport,
             scrollanim: go.scrollanim,
             scrollanimduration: go.scrollanimduration as u64,
             scrollback: go.scrollback as u64,
@@ -2436,6 +2438,32 @@ impl EditHost {
                 self.fx
                     .loop_command(LoopCommand::Http { id, request, local })
             }
+            // `nx.http.mount` — publish a plugin's subroute on the editor's one listener.
+            // The address comes from the OPTIONS, read here: the Lua bridge cannot see the
+            // editor, and the actor must not (editor state is `!Send`). So this is the one
+            // place `'httphost'`/`'httpport'` are turned into a concrete bind address —
+            // which is also why they are inert until a plugin actually mounts.
+            #[cfg(feature = "native")]
+            LoopOp::HttpMount {
+                id,
+                name,
+                timeout_ms,
+            } => {
+                let (host, port) = self.http_listen_addr();
+                self.fx.loop_command(LoopCommand::HttpMount {
+                    id,
+                    name,
+                    host,
+                    port,
+                    timeout: std::time::Duration::from_millis(timeout_ms),
+                })
+            }
+            #[cfg(feature = "native")]
+            LoopOp::HttpRespond { req_id, reply } => self
+                .fx
+                .loop_command(LoopCommand::HttpRespond { req_id, reply }),
+            #[cfg(feature = "native")]
+            LoopOp::HttpUnmount { id } => self.fx.loop_command(LoopCommand::HttpUnmount { id }),
             // The browser build has no tokio event loop; timers ride the Worker-side
             // wheel instead (slice 5d) — `vim.defer_fn` / `nx.timer` arm and fire there.
             #[cfg(not(feature = "native"))]
@@ -2655,6 +2683,36 @@ impl EditHost {
             // `local` (`nx.http.fetch_local`) forces the browser `fetch()`, bypassing the daemon.
             #[cfg(not(feature = "native"))]
             LoopOp::Http { id, request, local } => self.fx.http_op(id, request, local),
+            // `nx.http.mount` on wasm: a browser tab cannot bind a TCP port, and unlike
+            // `fetch()` there is no universal fallback to degrade to — so this fails LOUD
+            // (the `LoopOp::Spawn` / `FsWatch` precedent) rather than handing back a URL
+            // that would 404. Phase 3 of the mount plan gives the web build real parity via
+            // a Service Worker on the page's own origin, which satisfies this same
+            // `HttpServerRequest`/`HttpServerReply` contract.
+            #[cfg(not(feature = "native"))]
+            LoopOp::HttpMount { id, .. } => {
+                // Reject the mount promise rather than dropping the callback and leaving it
+                // pending forever — a plugin that mounts on the web must SEE that it did
+                // not, not hang.
+                let result = Err(nxvim_lua::HttpMountError {
+                    message: "nx.http.mount: unsupported on the browser build (a tab cannot \
+                              bind a TCP port)"
+                        .to_string(),
+                });
+                if let Err(e) =
+                    self.lua
+                        .run_callback(id, false, CallbackArgs::HttpMountResult { result })
+                {
+                    self.editor
+                        .echo(format!("E5108: Error in nx.http.mount handler: {e}"));
+                }
+                self.apply_lua_effects();
+            }
+            // Unreachable in practice: no mount can exist to respond to or close, since
+            // every `HttpMount` above rejected. Explicit rather than a catch-all so the
+            // Service Worker phase gets a compile error here instead of a silent no-op.
+            #[cfg(not(feature = "native"))]
+            LoopOp::HttpRespond { .. } | LoopOp::HttpUnmount { .. } => {}
         }
     }
 
@@ -2798,6 +2856,89 @@ impl EditHost {
                     self.editor
                         .echo(format!("E5108: Error in nx.fs handler: {e}"));
                 }
+                self.apply_lua_effects();
+            }
+            LoopEvent::HttpMountResult { id, result } => {
+                // `nx.http.mount` settled: resolve with the bound origin, or reject.
+                if result.is_ok() {
+                    // The listener is up (this mount bound it, or an earlier one did).
+                    // Record the options it bound under: this is both the gate and the
+                    // baseline for the per-tick option check. A failed mount sets nothing —
+                    // it opened nothing. (The origin itself is mirrored into Lua by the
+                    // resolve, so it is not duplicated here.)
+                    self.http_serving = Some(self.http_listen_addr());
+                }
+                let result = result.map_err(|message| nxvim_lua::HttpMountError { message });
+                if let Err(e) =
+                    self.lua
+                        .run_callback(id, false, CallbackArgs::HttpMountResult { result })
+                {
+                    self.editor
+                        .echo(format!("E5108: Error in nx.http.mount handler: {e}"));
+                }
+                self.apply_lua_effects();
+            }
+            LoopEvent::HttpServerRequest {
+                id,
+                req_id,
+                request,
+            } => {
+                // An inbound request for a mount: run the plugin's `on_request` on this
+                // thread. Its `respond` queues a `LoopOp::HttpRespond` that
+                // `apply_lua_effects` hands back to the parked axum handler.
+                if let Err(e) = self.lua.run_http_server_request(id, req_id, request) {
+                    self.editor
+                        .echo(format!("E5108: Error in nx.http.mount handler: {e}"));
+                }
+                self.apply_lua_effects();
+            }
+            LoopEvent::HttpServerTimeout { req_id } => {
+                if let Err(e) = self.lua.run_http_server_timeout(req_id) {
+                    self.editor
+                        .echo(format!("E5108: Error in nx.http.mount handler: {e}"));
+                }
+                self.apply_lua_effects();
+            }
+            LoopEvent::HttpRebound { origin, host, port } => {
+                // The listener moved; every mount is still live. Record what actually bound
+                // (as reported, not as currently configured — a second `:set` may already be
+                // in flight) and update the one place `Mount:origin()` reads.
+                self.http_serving = Some((host.clone(), port));
+                if self.http_rebind_inflight == Some((host, port)) {
+                    self.http_rebind_inflight = None;
+                }
+                if let Err(e) = self.lua.run_http_rebound(&origin) {
+                    self.editor
+                        .echo(format!("E5108: Error in nx.http.mount handler: {e}"));
+                }
+                self.apply_lua_effects();
+            }
+            LoopEvent::HttpRebindErr {
+                message,
+                host,
+                port,
+            } => {
+                // The rebind failed and nothing moved — the old listener still serves. Put
+                // the option back, so `:set httpport?` can never disagree with the live
+                // address, and say so: a silently ignored `:set` is exactly the lie the
+                // fail-loud rule exists to prevent.
+                if self.http_rebind_inflight == Some((host.clone(), port)) {
+                    self.http_rebind_inflight = None;
+                }
+                // Only revert if the failed address is still what the options say — the user
+                // may have already moved on to a third value, whose own rebind is in flight
+                // and must not be clobbered by this older failure.
+                let stale = (
+                    self.editor.options.httphost.clone(),
+                    self.editor.options.httpport,
+                ) != (host, port);
+                if !stale {
+                    if let Some((good_host, good_port)) = self.http_serving.clone() {
+                        self.editor.options.httphost = good_host;
+                        self.editor.options.httpport = good_port;
+                    }
+                }
+                self.editor.echo(format!("E5109: {message}"));
                 self.apply_lua_effects();
             }
             LoopEvent::HttpResult { id, result } => {
@@ -3015,6 +3156,53 @@ impl EditHost {
     /// event that only updated cached state); a callback that queued work always
     /// repaints. Factored out so the syntax/LSP/loop arms share one tail and no
     /// off-tick callback's deferred `vim.cmd` is left undriven.
+    /// The address `nx.http.mount` should listen on — the `'httphost'` / `'httpport'`
+    /// options, read live off the editor. This is the *only* place those options are turned
+    /// into a bind address: the Lua bridge cannot see the editor, and the event-loop actor
+    /// must not (editor state is `!Send`), so both are handed a concrete address from here.
+    #[cfg(feature = "native")]
+    fn http_listen_addr(&self) -> (String, u16) {
+        (
+            self.editor.options.httphost.clone(),
+            self.editor.options.httpport,
+        )
+    }
+
+    /// Notice an `'httphost'` / `'httpport'` write while mounts are serving, and move the
+    /// listener to match.
+    ///
+    /// A `:set httpport=9000` must not silently do nothing: the listener lives for the
+    /// session, so "takes effect at the next bind" would be a lie — there is no next bind.
+    /// The actor binds the new address before dropping the old, so a failure changes nothing
+    /// and comes back as [`LoopEvent::HttpRebindErr`], which reverts the option.
+    ///
+    /// There is no `OptionSet` event in the tree, so this compares on the tick. Gated on a
+    /// listener actually existing — a config with no HTTP plugin never gets past the first
+    /// line. Called from [`run_pending`](Self::run_pending), which every input / ex-command
+    /// / callback path funnels through (a `:set` never touches Lua, so an
+    /// `apply_lua_effects` hook would miss it).
+    #[cfg(feature = "native")]
+    fn sync_http_listen_addr(&mut self) {
+        let Some(serving) = self.http_serving.clone() else {
+            return; // nothing bound — the options stay inert until a plugin mounts
+        };
+        let want = self.http_listen_addr();
+        if want == serving {
+            return;
+        }
+        // Already asked for exactly this — don't re-send it every tick while the actor
+        // works. `http_serving` stays the last-GOOD address until `HttpRebound` confirms the
+        // move, so that a failure has something true to revert the option to.
+        if self.http_rebind_inflight.as_ref() == Some(&want) {
+            return;
+        }
+        self.http_rebind_inflight = Some(want.clone());
+        self.fx.loop_command(LoopCommand::HttpRebind {
+            host: want.0,
+            port: want.1,
+        });
+    }
+
     pub(crate) fn settle_events(&mut self, dirty: bool) {
         // Hold a restored session's focus through startup: re-pin the layer it was quit from
         // BEFORE this settle's repaint, so a sidebar plugin's async dock-(re)build — which
@@ -3569,6 +3757,11 @@ impl EditHost {
         // segments — and, when the window layout changed, all of them — per window,
         // now that the topology has settled. Last, so it sees the final windows.
         self.refresh_statusline_segments();
+        // An `'httphost'`/`'httpport'` write this convergence (a `:set`, which never
+        // touches Lua, or an `nx.o` assignment) moves the mount listener. Cheap and
+        // gated: returns on the first line unless a plugin has actually mounted.
+        #[cfg(feature = "native")]
+        self.sync_http_listen_addr();
     }
 
     /// Re-render the custom `nx.statusline` segments whose cache is stale and fold

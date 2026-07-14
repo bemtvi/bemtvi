@@ -18,11 +18,12 @@ use crate::install::fs_stat_table;
 use crate::install::{install_runtime_api, install_vim};
 use crate::ops::{
     BufOp, CallbackArgs, CompletePush, CompleteSetupReq, ConfirmReq, DecorPublish, DiagnosticData,
-    DockOp, ExtmarkOp, FeedKeysOp, FsValue, GlobalOptionOp, HlSet, InlayHintMirrorData, LayerOp,
-    LoopOp, LspClientData, LspOp, NamedListOp, PanelOp, PickerOpenReq, PickerPush, QfSetOp,
-    RawKeymap, RawRhs, RegisterSetOp, SemanticTokenData, SnippetAddReq, SnippetSetupReq,
-    StatuslinePublishReq, StatuslineSetupReq, TabOp, TerminalOpenReq, TsOp, UiFloatReq, UiInputReq,
-    UiSelectReq, ViewOp, WindowOp, WorkspaceOptionOp,
+    DockOp, ExtmarkOp, FeedKeysOp, FsValue, GlobalOptionOp, HlSet, HttpServerRequest,
+    InlayHintMirrorData, LayerOp, LoopOp, LspClientData, LspOp, NamedListOp, PanelOp,
+    PickerOpenReq, PickerPush, QfSetOp, RawKeymap, RawRhs, RegisterSetOp, SemanticTokenData,
+    SnippetAddReq, SnippetSetupReq, StatuslinePublishReq, StatuslineSetupReq, TabOp,
+    TerminalOpenReq, TsOp, UiFloatReq, UiInputReq, UiSelectReq, ViewOp, WindowOp,
+    WorkspaceOptionOp,
 };
 
 /// `skip_serializing_if` predicate: drop a `false` flag from the serialized
@@ -387,6 +388,12 @@ pub struct GoMirror {
     /// `'imagepreview'` — whether image files open as rendered previews rather than
     /// raw bytes. Backs `vim.o.imagepreview` / `nx.o.imagepreview`.
     pub imagepreview: bool,
+    /// `'httphost'` — the interface `nx.http.mount` binds its listener on. Backs
+    /// `vim.o.httphost` / `nx.o.httphost`.
+    pub httphost: String,
+    /// `'httpport'` — the port `nx.http.mount` binds its listener on (`0` picks a free
+    /// one). Backs `vim.o.httpport` / `nx.o.httpport`.
+    pub httpport: u16,
     /// `'scrollanim'` — whether viewport scrolls animate as a slide. Backs
     /// `vim.o.scrollanim`.
     pub scrollanim: bool,
@@ -503,6 +510,13 @@ const PRELUDE_MODULES: &[(&str, &str)] = &[
     // bridge. After promise.lua (returns a promise) and stdlib.lua (uses nx.json for
     // JSON bodies / `res:json()`).
     ("nxvim:prelude/http", include_str!("prelude/http.lua")),
+    // nx.http.mount: the plugin HTTP *server* surface — the inbound twin of the fetch
+    // client just above, which it extends the `nx.http` table with (so it must load
+    // after it). Promise for the one-shot mount, handler for the request stream.
+    (
+        "nxvim:prelude/httpmount",
+        include_str!("prelude/httpmount.lua"),
+    ),
     // nx.hash: the hashing surface (one-shot string digests + the incremental
     // nx.hash.new) over the nx._hash / nx._hash_new bridges. After fs.lua, which
     // defines the sibling nx.hash.file (the streamed file digest, an fs op).
@@ -2054,6 +2068,23 @@ impl LuaRuntime {
                     }
                 }
             }
+            CallbackArgs::HttpMountResult { result } => {
+                // `nx.http.mount` settle: fire `nx._run_cb(id, false, err, origin)`. Unlike
+                // the fetch twin there is no "resolved failure" case — a mount either
+                // published (and carries the bound origin, e.g. "http://127.0.0.1:53124")
+                // or it didn't (a taken port, a duplicate name), which rejects loud.
+                match result {
+                    Ok(origin) => {
+                        let origin = self.lua.create_string(&origin)?;
+                        run.call::<()>((id, keep, mlua::Value::Nil, origin))
+                    }
+                    Err(e) => {
+                        let err = self.lua.create_table()?;
+                        err.set("message", e.message)?;
+                        run.call::<()>((id, keep, mlua::Value::Table(err), mlua::Value::Nil))
+                    }
+                }
+            }
         }
     }
 
@@ -2147,6 +2178,67 @@ impl LuaRuntime {
             None => mlua::Value::Nil,
         };
         run.call::<()>((id, err))
+    }
+
+    /// Deliver an inbound request to a mount's `on_request`
+    /// (`nx._http_request(id, req_id, req)`), where `req` is the marshalled
+    /// `{ name, method, path, raw_path, query, headers, body }` table. Persistent — a
+    /// mount serves until `:close()`, so this fires once per request, unlike the one-shot
+    /// `nx._run_cb` a fetch settles through.
+    ///
+    /// `req_id` is what the handler's `respond` closure carries back
+    /// ([`LoopOp::HttpRespond`](crate::LoopOp::HttpRespond)); the Lua side tracks it as an
+    /// open slot so a double-`respond` (or one after a timeout) can notify loud instead of
+    /// vanishing.
+    pub fn run_http_server_request(
+        &self,
+        id: u64,
+        req_id: u64,
+        request: HttpServerRequest,
+    ) -> mlua::Result<()> {
+        let nx = self.nx()?;
+        let run: mlua::Function = nx.get("_http_request")?;
+        let req = self.lua.create_table()?;
+        req.set("name", request.name)?;
+        req.set("method", request.method)?;
+        req.set("path", request.path)?;
+        req.set("raw_path", request.raw_path)?;
+        // Query params and headers as `{ [name] = value }` maps — the shape a handler
+        // actually reads (`req.query.v`, `req.headers["content-type"]`). A repeated name
+        // keeps the last value, matching how `fetch`'s own `Headers` collapses them.
+        let query = self.lua.create_table()?;
+        for (name, value) in &request.query {
+            query.set(name.as_str(), value.as_str())?;
+        }
+        req.set("query", query)?;
+        let headers = self.lua.create_table()?;
+        for (name, value) in &request.headers {
+            headers.set(name.as_str(), value.as_str())?;
+        }
+        req.set("headers", headers)?;
+        // Binary-safe: a POST of an image is a Lua string of raw bytes, not UTF-8.
+        req.set("body", self.lua.create_string(&request.body)?)?;
+        run.call::<()>((id, req_id, req))
+    }
+
+    /// Tell the Lua side the mount listener moved to a new origin
+    /// (`nx._http_rebound(origin)`) after an `'httphost'` / `'httpport'` write. Every mount
+    /// is still mounted — only the origin changed — so this updates the one place
+    /// `Mount:origin()` reads and every live mount's `:url()` follows at once.
+    pub fn run_http_rebound(&self, origin: &str) -> mlua::Result<()> {
+        let nx = self.nx()?;
+        let run: mlua::Function = nx.get("_http_rebound")?;
+        run.call::<()>(origin)
+    }
+
+    /// Tell the Lua side an in-flight request timed out (`nx._http_timeout(req_id)`) — the
+    /// client already got its `504` and the actor has dropped the slot. Closes the open
+    /// slot so a late `respond` reports "already timed out" rather than silently doing
+    /// nothing, and notifies loud (a handler that never responds is a plugin bug).
+    pub fn run_http_server_timeout(&self, req_id: u64) -> mlua::Result<()> {
+        let nx = self.nx()?;
+        let run: mlua::Function = nx.get("_http_timeout")?;
+        run.call::<()>(req_id)
     }
 
     /// Fire a `nx.fs.watch` stream's pump (`nx._run_fs_watch(id, ev, err)`): an `ev`

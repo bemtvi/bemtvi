@@ -116,6 +116,29 @@ pub struct Options {
     /// [`crate::view::ImageView`] the client renders as a picture. When off, an
     /// image file opens as ordinary (binary) text, exactly as before.
     pub imagepreview: bool,
+    /// The interface `nx.http.mount` binds its listener on (nxvim's `'httphost'`, not
+    /// a standard vim option). `"127.0.0.1"` (the default) is **loopback only** — the
+    /// mounts a plugin serves are reachable from this machine and nowhere else.
+    ///
+    /// Setting `"0.0.0.0"` exposes every mounted plugin to the LAN. A mount's handler
+    /// is arbitrary Lua running with the editor's full authority, so that is a real
+    /// capability to hand out (the reasoning [`crate`]'s daemon transport spells out:
+    /// an unauthenticated listener over arbitrary code is remote code execution by
+    /// design). It is a *user* option precisely so that decision is the human's and
+    /// not something a plugin can take on their behalf by loading.
+    ///
+    /// Read when the listener binds — the first [`nx.http.mount`]. Writing it while
+    /// mounts are live rebinds them onto the new address.
+    ///
+    /// [`nx.http.mount`]: https://docs.rs/nxvim-lua
+    pub httphost: String,
+    /// The port `nx.http.mount` binds its listener on (nxvim's `'httpport'`, not a
+    /// standard vim option). `0` (the default) picks a free ephemeral port, so two
+    /// nxvim instances never collide; set it for a stable, bookmarkable URL.
+    ///
+    /// Read when the listener binds — the first `nx.http.mount`. Until a plugin
+    /// mounts, this is inert: setting it opens nothing.
+    pub httpport: u16,
     /// Animate viewport scrolls (`<C-d>`/`<C-u>`/`<C-f>`/`<C-b>`, the wheel, and
     /// off-screen jumps) as a slide instead of a teleport (nxvim's `'scrollanim'`,
     /// not a standard vim option — neoscroll.nvim's behavior built in). On by
@@ -265,12 +288,18 @@ impl Options {
             ("timeoutlen", Num(n)) => self.timeoutlen = *n as usize,
             ("scrollanimduration", Num(n)) => self.scrollanimduration = *n as usize,
             ("scrollback", Num(n)) => self.scrollback = *n as usize,
+            // Clamped rather than wrapped as a last line of defense — an out-of-range
+            // value is rejected loud (E474) by `Editor::set_global_option_num` before it
+            // reaches here, so this only guards a direct `set_scalar` caller (a shada
+            // restore of a hand-edited file) from a `as u16` wrap binding port 33903.
+            ("httpport", Num(n)) => self.httpport = (*n).clamp(0, u16::MAX as i64) as u16,
             ("history", Num(n)) => self.history = *n as usize,
             ("persisthistory", Str(s)) => self.persisthistory = s.clone(),
             ("statusline", Str(s)) => self.statusline = s.clone(),
             ("tabline", Str(s)) => self.tabline = s.clone(),
             ("guifont", Str(s)) => self.guifont = s.clone(),
             ("mouse", Str(s)) => self.mouse = s.clone(),
+            ("httphost", Str(s)) => self.httphost = s.clone(),
             ("mousemodel", Str(s)) => self.mousemodel = s.clone(),
             ("mousescroll", Str(s)) => self.mousescroll = s.clone(),
             ("regexsyntax", Str(s)) => self.regexsyntax = s.clone(),
@@ -312,12 +341,14 @@ impl Options {
             "timeoutlen" => Num(self.timeoutlen as i64),
             "scrollanimduration" => Num(self.scrollanimduration as i64),
             "scrollback" => Num(self.scrollback as i64),
+            "httpport" => Num(self.httpport as i64),
             "history" => Num(self.history as i64),
             "persisthistory" => Str(self.persisthistory.clone()),
             "statusline" => Str(self.statusline.clone()),
             "tabline" => Str(self.tabline.clone()),
             "guifont" => Str(self.guifont.clone()),
             "mouse" => Str(self.mouse.clone()),
+            "httphost" => Str(self.httphost.clone()),
             "mousemodel" => Str(self.mousemodel.clone()),
             "mousescroll" => Str(self.mousescroll.clone()),
             "regexsyntax" => Str(self.regexsyntax.clone()),
@@ -442,6 +473,10 @@ impl Default for Options {
             autoread: true,
             // Show image files as text, not pictures, until a config opts in.
             imagepreview: false,
+            // Plugin HTTP mounts stay on loopback, and pick a free port, until the
+            // user says otherwise. Both inert until a plugin actually mounts.
+            httphost: "127.0.0.1".to_string(),
+            httpport: 0,
             // Slide the viewport on scroll commands (neoscroll-style), capped at
             // 160ms — the per-scroll duration scales with distance up to this.
             scrollanim: true,
@@ -1636,6 +1671,20 @@ static OPTIONS: &[OptionInfo] = {
             kind: Bool,
             scope: Global,
             doc: "Render image files as images instead of raw bytes.",
+        },
+        OptionInfo {
+            name: "httphost",
+            abbrev: None,
+            kind: Str,
+            scope: Global,
+            doc: "Interface nx.http plugin mounts listen on; 0.0.0.0 exposes them to the LAN.",
+        },
+        OptionInfo {
+            name: "httpport",
+            abbrev: None,
+            kind: Num,
+            scope: Global,
+            doc: "Port nx.http plugin mounts listen on; 0 picks a free one.",
         },
         OptionInfo {
             name: "showtabline",

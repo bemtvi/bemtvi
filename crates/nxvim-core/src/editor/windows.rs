@@ -1567,6 +1567,21 @@ impl Editor {
     /// shrinks the reserved tabline / global-statusline row. An unknown name is a
     /// no-op (the Lua side forwards only the canonical wired set).
     pub fn set_global_option_num(&mut self, name: &str, value: i64) {
+        // `'httpport'` is a port number: bounded like the block below, but by the port
+        // space rather than a handful of modes, and with no relayout to do (nothing on
+        // screen depends on it). Validated rather than clamped — silently binding 65535
+        // because the user typed 99999 would serve their plugin somewhere they never asked
+        // for.
+        if name == "httpport" {
+            if !(0..=u16::MAX as i64).contains(&value) {
+                self.echo(format!("E474: Invalid argument: {name}={value}"));
+                return;
+            }
+            self.global_base
+                .set_scalar(name, &crate::options::OptionScalar::Num(value));
+            self.recompute_effective_options();
+            return;
+        }
         // `mousetime` is an unbounded non-negative millisecond count — it doesn't
         // share `showtabline`/`laststatus`'s small-range, relayout-on-change shape,
         // so handle it before the bounded block.

@@ -201,6 +201,19 @@ tree-sitter-md = "=0.5.3"
 # deflate via its `deflate-flate2` feature so we don't pull a second inflate
 # stack). `sha2` verifies the pinned Zig checksum before we execute it.
 ureq = { version = "=2.12.0", default-features = false, features = ["tls"] }
+# The `nx.http.mount` listener (`nxvim-server`'s `httpmount` module) — the INBOUND
+# twin of `ureq` above, which is outbound-only. One editor-owned origin serves every
+# plugin's mounted subroute (`/plugin/<name>/*`); see
+# `docs/plans/2026-07-14-nx-http-mount.md`. `axum` rather than a hand-rolled HTTP/1.1
+# parser because inbound framing (chunked bodies, keep-alive, header edge cases) is a
+# well-known footgun class, and rather than bare `hyper` because `axum::serve` is the
+# one thing we need from it. `default-features = false` + `http1`/`tokio` keeps the
+# tree to hyper/tower/http-body-util: no multipart, no ws, no macros, no `tower-http`,
+# and NO tokio `rt-multi-thread` (the server is a current-thread runtime — axum needs
+# a running reactor, not a threaded one). Native-gated in `nxvim-server` exactly like
+# `ureq`: a browser tab cannot bind a port, so the wasm build reaches the same mount
+# contract through a Service Worker instead.
+axum = { version = "=0.8.9", default-features = false, features = ["http1", "tokio"] }
 tar = "=0.4.46"
 flate2 = "=1.1.9"
 xz2 = "=0.1.7"

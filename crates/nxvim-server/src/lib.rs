@@ -64,6 +64,11 @@ mod folds;
 mod host;
 #[cfg(feature = "native")]
 mod http;
+// The `nx.http.mount` listener — inbound HTTP, the twin of `http`'s outbound. Native only:
+// a browser tab cannot bind a TCP port, so the wasm build reaches the same mount contract
+// through a Service Worker instead.
+#[cfg(feature = "native")]
+mod httpmount;
 #[cfg(feature = "native")]
 mod inbound;
 // The LSP consumer subtree is synchronous and tick-driven — shared by the native
@@ -1221,6 +1226,26 @@ pub struct EditHost {
     /// Set where `DirState` is seeded from a daemon cwd (`run_server` native / `apply_remote_config`
     /// wasm); this is the correct daemon-fs gate, unlike `host_fs_offtick()` (true for OPFS too).
     remote_cwd_seeded: bool,
+    /// The `'httphost'`/`'httpport'` values as of the last successful bind, or `None` until
+    /// a plugin mounts (nothing binds before that).
+    ///
+    /// Deliberately the *option* values and not the resolved address: with `'httpport' = 0`
+    /// the listener lands on some ephemeral port, and comparing that against the option
+    /// would read as a change on every tick and rebind forever. What this answers is "have
+    /// the options moved since we bound?", so it must be in the options' own terms.
+    ///
+    /// Compared against the live options each tick to notice a `:set` — there is no
+    /// `OptionSet` event to hook. `Some` is also the gate for that check, so a config with
+    /// no HTTP plugin pays nothing for it. The resolved origin is mirrored into Lua as
+    /// `nx._http_origin` (the one place `Mount:url()` reads), not held here.
+    #[cfg(feature = "native")]
+    http_serving: Option<(String, u16)>,
+    /// A rebind asked for and not yet answered — the `'httphost'`/`'httpport'` values sent
+    /// as a [`LoopCommand::HttpRebind`]. Without it the per-tick check would re-send the
+    /// same rebind every tick until the reply landed, since `http_serving` still holds the
+    /// old address until then.
+    #[cfg(feature = "native")]
+    http_rebind_inflight: Option<(String, u16)>,
     /// The wasm build's timer wheel (slice 5d): pending `vim.defer_fn` / `nx.timer`
     /// timers, fired by the Worker when their [`due_ms`](WasmTimer::due_ms) passes on the
     /// JS clock — the serverless analogue of the tokio timers the native build arms via
@@ -1364,6 +1389,10 @@ impl EditHost {
             next_chdir_token: 0,
             published_cwd: None,
             remote_cwd_seeded: false,
+            #[cfg(feature = "native")]
+            http_serving: None,
+            #[cfg(feature = "native")]
+            http_rebind_inflight: None,
             #[cfg(not(feature = "native"))]
             wasm_timers: Vec::new(),
             #[cfg(not(feature = "native"))]

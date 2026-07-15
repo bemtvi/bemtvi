@@ -96,6 +96,12 @@ fi
 # postMessage and timers never fire.
 cp "$here/web/_headers" "$site/_headers"
 
+# The `nx.http.mount` Service Worker, at the publish ROOT rather than beside the page in
+# web/: a Service Worker's scope cannot rise above the path it was served from, and mounts
+# live at /plugin/*. The `Service-Worker-Allowed: /` header that lets it register with that
+# scope rides in `_headers` above.
+cp "$here/web/nx-sw.js" "$site/nx-sw.js"
+
 # Send the bare root to /web/ (the app's imports resolve relative to that document URL).
 # A `_redirects` file at the publish root so this holds on any `_headers`/`_redirects` host
 # (Netlify / Cloudflare Pages) without a per-site netlify.toml — important for the demo site.

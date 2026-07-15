@@ -254,10 +254,6 @@ pub enum LoopEvent {
         req_id: u64,
         request: HttpServerRequest,
     },
-    /// A mount handler left `req_id` unanswered past its timeout. The client already has its
-    /// `504` and the actor has dropped the slot; this tells the Lua side so it can close its
-    /// own slot and notify (a silent 504 would leave a plugin author nothing to debug).
-    HttpServerTimeout { req_id: u64 },
     /// The listener moved to a new origin after an `'httphost'`/`'httpport'` write. Every
     /// mount stayed live; only the origin changed, so the Lua side updates the one place
     /// `Mount:origin()` reads.

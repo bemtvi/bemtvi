@@ -34,9 +34,10 @@
 //! ```
 //!
 //! Every way that round-trip can *not* complete is a distinct status rather than a hung
-//! socket: the mount closed (`503`), the handler threw (`500`, sent by the Lua side), or it
-//! never responded (`504` at `opts.timeout`, which also notifies — see
-//! [`LoopEvent::HttpServerTimeout`]).
+//! socket: the mount closed (`503`), the handler threw (`500`), or it never responded
+//! (`504`) — all three sent by the Lua side, which owns the plugin-facing contract and so
+//! keeps it identical on the browser build. This module's only deadline is [`Route`]'s
+//! `backstop`, for when the editor never runs that Lua at all.
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -48,7 +49,7 @@ use axum::body::Bytes;
 use axum::extract::{Request, State};
 use axum::http::{HeaderName, HeaderValue, StatusCode};
 use axum::response::Response;
-use nxvim_lua::{HttpServerReply, HttpServerRequest};
+use nxvim_lua::HttpServerReply;
 use tokio::net::TcpListener;
 use tokio::sync::mpsc::UnboundedSender;
 use tokio::sync::oneshot;
@@ -62,9 +63,11 @@ use crate::evloop::LoopEvent;
 /// the plugin does with it.
 const MAX_BODY: usize = 16 * 1024 * 1024;
 
-/// The path prefix reserved for plugin mounts. Everything under it routes by mount name;
-/// the editor keeps `/` and any future `/_nx/*` for itself.
-const MOUNT_PREFIX: &str = "/plugin/";
+/// How much longer than a mount's own `opts.timeout` the listener holds a parked request
+/// before reclaiming its socket. The Lua deadline answers `504` at `opts.timeout`; this only
+/// fires when the editor never ran that deadline at all, so it needs enough slack that a
+/// merely-busy editor is never cut off mid-answer.
+const BACKSTOP_GRACE: Duration = Duration::from_secs(30);
 
 /// A parked request: the mount it routed to, and the channel its axum handler is blocked
 /// on. Dropping the sender (an `unmount`) resolves that handler's `await` with an error,
@@ -75,14 +78,21 @@ struct Pending {
     tx: oneshot::Sender<HttpServerReply>,
 }
 
-/// One live mount: which Lua callback id owns it, and how long its handler may take.
+/// One live mount: which Lua callback id owns it, and the backstop for its requests.
 #[derive(Clone)]
 struct Route {
     /// The `nx.http.mount` callback id — what [`LoopEvent::HttpServerRequest`] carries so
     /// the Lua side can find the plugin's `on_request`.
     id: u64,
-    /// `opts.timeout` — how long this mount's handler may leave a request unanswered.
-    timeout: Duration,
+    /// How long a parked request may hold this listener's socket before it is reclaimed.
+    ///
+    /// **Not** `opts.timeout`. The Lua side owns that: it arms a deadline per request and
+    /// answers `504` itself, so the browser build — which has no listener at all — inherits
+    /// the identical contract. This is the strictly-longer backstop for the one case a Lua
+    /// deadline cannot cover: the editor thread never runs it. `opts.timeout` +
+    /// [`BACKSTOP_GRACE`], so a well-behaved editor always hits the plugin's own deadline
+    /// first and this never fires.
+    backstop: Duration,
 }
 
 /// State the axum handler shares with the actor. All of it is behind `Arc` so a **rebind**
@@ -174,11 +184,13 @@ impl HttpMounts {
                 }
             }
         }
-        self.shared
-            .routes
-            .lock()
-            .unwrap()
-            .insert(name, Route { id, timeout });
+        self.shared.routes.lock().unwrap().insert(
+            name,
+            Route {
+                id,
+                backstop: timeout + BACKSTOP_GRACE,
+            },
+        );
         let origin = self.origin().expect("bound above");
         self.send_mount_result(id, Ok(origin));
     }
@@ -300,14 +312,11 @@ async fn handle(State(shared): State<Arc<Shared>>, request: Request) -> Response
     // Split `/plugin/<name>/<rest>`. Everything outside the reserved prefix, and every
     // unmounted name, is a 404 the editor answers itself — Lua is never entered, so an
     // unmounted path costs nothing.
-    let Some(rest) = path.strip_prefix(MOUNT_PREFIX) else {
+    // The prefix split lives in `nxvim-lua` beside the request type, shared with the
+    // browser's Service Worker path — a plugin's `req.path` must mean the same thing in
+    // both worlds, so the rules have exactly one home.
+    let Some((name, _)) = nxvim_lua::split_mount_path(&path) else {
         return text_response(StatusCode::NOT_FOUND, "nxvim: no plugin mount here\n");
-    };
-    let (name, rel) = match rest.find('/') {
-        Some(i) => (&rest[..i], &rest[i..]),
-        // A bare `/plugin/example` is the mount root: normalize to "/" so a handler's
-        // `req.path == "/"` check works with or without the trailing slash.
-        None => (rest, "/"),
     };
     let Some(route) = shared.routes.lock().unwrap().get(name).cloned() else {
         return text_response(
@@ -328,30 +337,29 @@ async fn handle(State(shared): State<Arc<Shared>>, request: Request) -> Response
         }
     };
 
-    let server_request = HttpServerRequest {
-        name: name.to_string(),
-        method: parts.method.as_str().to_uppercase(),
-        path: rel.to_string(),
-        raw_path: path.clone(),
-        query: parts
-            .uri
-            .query()
-            .map(|q| form_urlencoded::parse(q.as_bytes()).into_owned().collect())
-            .unwrap_or_default(),
-        headers: parts
-            .headers
-            .iter()
-            .map(|(name, value)| {
-                (
-                    name.as_str().to_ascii_lowercase(),
-                    // A non-UTF-8 header value is lossy rather than fatal: dropping the
-                    // request over one odd header would be worse than a mangled value the
-                    // handler can ignore.
-                    String::from_utf8_lossy(value.as_bytes()).into_owned(),
-                )
-            })
-            .collect(),
-        body: body.to_vec(),
+    let headers = parts
+        .headers
+        .iter()
+        .map(|(name, value)| {
+            (
+                name.as_str().to_string(),
+                // A non-UTF-8 header value is lossy rather than fatal: dropping the request
+                // over one odd header would be worse than a mangled value the handler can
+                // ignore.
+                String::from_utf8_lossy(value.as_bytes()).into_owned(),
+            )
+        })
+        .collect();
+    let Some(server_request) = nxvim_lua::build_server_request(
+        parts.method.as_str(),
+        &path,
+        parts.uri.query(),
+        headers,
+        body.to_vec(),
+    ) else {
+        // Unreachable — `split_mount_path` above already accepted this path — but a
+        // silent unwrap here would be a panic in the listener rather than a 404.
+        return text_response(StatusCode::NOT_FOUND, "nxvim: no plugin mount here\n");
     };
 
     // Park: hand the request to the server thread and await the plugin's `respond`.
@@ -380,7 +388,7 @@ async fn handle(State(shared): State<Arc<Shared>>, request: Request) -> Response
         );
     }
 
-    match tokio::time::timeout(route.timeout, rx).await {
+    match tokio::time::timeout(route.backstop, rx).await {
         Ok(Ok(reply)) => build_response(reply),
         // The sender was dropped without a reply: the mount closed (or the editor is going
         // away) while this request was in flight.
@@ -389,15 +397,14 @@ async fn handle(State(shared): State<Arc<Shared>>, request: Request) -> Response
             "nxvim: the plugin mount closed while handling this request\n",
         ),
         Err(_) => {
-            // The handler never responded. Reclaim the slot and tell the Lua side, which
-            // notifies — a silent 504 would leave a plugin author nothing to debug from.
+            // The BACKSTOP fired, which means the editor never even ran this mount's own
+            // deadline — that would have answered 504 at `opts.timeout` long before now.
+            // Reclaim the socket. Nothing to tell Lua: if it is this stuck it cannot listen,
+            // and its slot is cleaned up by its own deadline whenever it runs again.
             shared.pending.lock().unwrap().remove(&req_id);
-            let _ = shared
-                .event_tx
-                .send(LoopEvent::HttpServerTimeout { req_id });
             text_response(
                 StatusCode::GATEWAY_TIMEOUT,
-                "nxvim: the plugin mount did not respond in time\n",
+                "nxvim: the editor never answered this request (its tick is not running)\n",
             )
         }
     }

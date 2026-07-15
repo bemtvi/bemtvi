@@ -66,6 +66,29 @@ const server = createServer(async (req, res) => {
     }
   }
   // The app lives under /web/; redirect the bare root there rather than serving
+  // The `nx.http.mount` Service Worker. Two special cases, both about SCOPE:
+  //
+  //  * it is served from the ROOT path even though the source lives in web/, because a SW's
+  //    default scope is its own directory — from /web/ it could not see /plugin/* at all;
+  //  * `Service-Worker-Allowed: /` is what lets it *register* with scope "/" while being
+  //    fetched from this path. Without the header the browser rejects the registration.
+  //
+  // Netlify's `_headers` / netlify.toml carry the same header for the deployed site.
+  if (urlPath === "/nx-sw.js") {
+    try {
+      const body = await readFile(join(ROOT, "web/nx-sw.js"));
+      res.writeHead(200, {
+        "Content-Type": "text/javascript",
+        "Service-Worker-Allowed": "/",
+        // A stale SW would serve a mount contract the editor no longer speaks.
+        "Cache-Control": "no-cache",
+      });
+      res.end(body);
+    } catch {
+      res.writeHead(404).end("not found");
+    }
+    return;
+  }
   // index.html *at* `/` — the page loads `./worker.mjs` / `../dist/eh.mjs` relative to
   // the document URL, so it only resolves correctly when that URL is under /web/.
   if (urlPath === "/") {

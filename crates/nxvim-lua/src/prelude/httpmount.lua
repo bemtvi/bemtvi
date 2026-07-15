@@ -55,11 +55,14 @@ nx.http = nx.http or {}
 -- a mount serves until `:close()`, unlike the one-shot `nx._cb_fns` a fetch settles through.
 nx._http_mounts = nx._http_mounts or {}
 
--- Request ids the editor is still waiting on, `[req_id] = true`. A slot is cleared by the
--- first `respond`, or by `nx._http_timeout` when the client already gave up. What makes a
--- double-`respond` (or a late one) notify LOUD instead of silently vanishing into an actor
--- that no longer knows the id. Ids are globally unique across mounts (one counter in the
--- actor), so one flat table covers every mount.
+-- Request ids the editor is still waiting on: `[req_id] = <the deadline timer>`. A slot is
+-- cleared (and its timer stopped) by the first `respond`, or by the timer itself firing.
+-- What makes a double-`respond` (or a late one) notify LOUD instead of silently vanishing
+-- into a transport that no longer knows the id. Ids are globally unique across mounts (one
+-- counter per listener), so one flat table covers every mount.
+--
+-- The VALUE being the timer is what lets `opts.timeout` live here rather than in each
+-- transport — see `nx._http_request`.
 nx._http_open = nx._http_open or {}
 
 -- ----- Mount handle ----------------------------------------------------------
@@ -108,21 +111,44 @@ end
 
 -- ----- Native callbacks ------------------------------------------------------
 
--- Native callback: an inbound request routed to mount `id`. Builds the one-shot `respond`
--- closure and hands both to the plugin's handler.
+-- Native callback: an inbound request routed to mount `id`. Arms the request's deadline,
+-- builds the one-shot `respond` closure, and hands both to the plugin's handler.
 --
 -- A handler that THROWS answers 500 and notifies — never swallowed into a bare status the
--- plugin author cannot see. A handler that never responds is caught by the actor's
--- timeout (`nx._http_timeout`), not here.
+-- plugin author cannot see. A handler that never RESPONDS is caught by the deadline armed
+-- here.
+--
+-- `opts.timeout` is enforced HERE, in Lua, and not by whatever is carrying the bytes. It is
+-- the plugin's contract ("your handler did not answer in time"), so it belongs where the
+-- contract is — one implementation every transport inherits, rather than one per transport
+-- that must each be told the mount's timeout and each drift from it. (The transports keep
+-- their own far-longer backstop for the case Lua cannot run AT ALL — a wedged tick, or a
+-- build whose timers cannot fire. That is resource safety, a different concern that merely
+-- shares a unit.)
 function nx._http_request(id, req_id, req)
   local mount = nx._http_mounts[id]
   if not mount then
-    -- The mount closed between the actor routing this and the tick running it. Drop the
-    -- slot so the actor's 503 is the whole story.
+    -- The mount closed between the transport routing this and the tick running it. Drop the
+    -- slot so the transport's 503 is the whole story.
     nx._http_open[req_id] = nil
     return
   end
-  nx._http_open[req_id] = true
+
+  -- The deadline. Fires only if nothing answered first — `nx._http_reply` stops it.
+  nx._http_open[req_id] = nx.timer(function()
+    if not nx._http_open[req_id] then
+      return
+    end
+    nx._http_open[req_id] = nil
+    nx._http_respond(req_id, 504, { { "content-type", "text/plain; charset=utf-8" } }, "")
+    nx.notify(
+      ("nx.http.mount(%q): on_request did not respond within %dms; the client got a 504. "):format(
+        mount.name,
+        mount.timeout
+      ) .. "Every request must call respond() exactly once.",
+      nx.log.levels.ERROR
+    )
+  end, mount.timeout)
 
   local ok, err = pcall(mount.on_request, req, function(res)
     nx._http_reply(req_id, res)
@@ -130,7 +156,9 @@ function nx._http_request(id, req_id, req)
   if not ok then
     -- The handler threw. Answer 500 if it had not already responded, and surface the
     -- error: a plugin bug must not read as an ordinary error status to the browser.
-    if nx._http_open[req_id] then
+    local deadline = nx._http_open[req_id]
+    if deadline then
+      deadline:stop()
       nx._http_open[req_id] = nil
       nx._http_respond(req_id, 500, {}, "")
     end
@@ -141,24 +169,10 @@ function nx._http_request(id, req_id, req)
   end
 end
 
--- Native callback: the actor gave up on `req_id` (the client already got its 504). Closes
--- the slot and notifies — a handler that never calls `respond` is a plugin bug, and a
--- silent 504 would leave nothing to debug from.
-function nx._http_timeout(req_id)
-  if not nx._http_open[req_id] then
-    return
-  end
-  nx._http_open[req_id] = nil
-  nx.notify(
-    "nx.http.mount: on_request did not respond in time; the client got a 504. "
-      .. "Every request must call respond() exactly once.",
-    nx.log.levels.ERROR
-  )
-end
-
 -- The `respond` a handler is called with. Validates, closes the slot, queues the reply.
 function nx._http_reply(req_id, res)
-  if not nx._http_open[req_id] then
+  local deadline = nx._http_open[req_id]
+  if not deadline then
     -- Already answered, or timed out. Loud: silently dropping the second reply is how a
     -- double-respond bug survives to production.
     nx.notify(
@@ -193,6 +207,8 @@ function nx._http_reply(req_id, res)
     headers[#headers + 1] = { name, tostring(value) }
   end
 
+  -- Answered: stop the deadline so a live timer per in-flight request cannot pile up.
+  deadline:stop()
   nx._http_open[req_id] = nil
   nx._http_respond(req_id, status, headers, body)
 end
@@ -298,7 +314,7 @@ function nx.http.mount(opts)
     end
     -- Register BEFORE the bridge: the actor can route a request to this mount as soon as
     -- the listener is up, and the reply arrives on a later tick either way.
-    nx._http_mounts[id] = { on_request = opts.on_request, name = name }
+    nx._http_mounts[id] = { on_request = opts.on_request, name = name, timeout = timeout }
     nx._http_mount(id, name, timeout)
   end)
 end

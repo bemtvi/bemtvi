@@ -162,6 +162,7 @@ node verify-connect.mjs      # headless-browser proof of runtime `:connect nxvim
 node verify-fs.mjs           # headless-browser proof of the real local-FS picker (:eo/:wo/bare :w)
 node verify-luafile.mjs      # headless-browser proof of the Lua-source picker (:luafile/:source)
 node verify-http.mjs         # headless-browser proof of serverless nx.http.fetch (browser fetch())
+node verify-http-mount.mjs   # headless-browser proof of nx.http.mount (the Service Worker leg)
 
 # daemon mode by hand: start a daemon, then either open the page with its connect URI…
 #   cargo run -p nxvim -- --daemon --listen 127.0.0.1:8765   # prints nxvim://…?cert=…

@@ -2231,16 +2231,6 @@ impl LuaRuntime {
         run.call::<()>(origin)
     }
 
-    /// Tell the Lua side an in-flight request timed out (`nx._http_timeout(req_id)`) — the
-    /// client already got its `504` and the actor has dropped the slot. Closes the open
-    /// slot so a late `respond` reports "already timed out" rather than silently doing
-    /// nothing, and notifies loud (a handler that never responds is a plugin bug).
-    pub fn run_http_server_timeout(&self, req_id: u64) -> mlua::Result<()> {
-        let nx = self.nx()?;
-        let run: mlua::Function = nx.get("_http_timeout")?;
-        run.call::<()>(req_id)
-    }
-
     /// Fire a `nx.fs.watch` stream's pump (`nx._run_fs_watch(id, ev, err)`): an `ev`
     /// table `{ kind, paths }` on a change, or `err` (a string) when the watch failed
     /// to arm / a backend error ended it. Persistent until the stream is `:stop()`ed

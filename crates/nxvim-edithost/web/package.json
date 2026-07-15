@@ -16,6 +16,8 @@
     "verify-treesitter-indent": "node verify-treesitter-indent.mjs",
     "verify-treesitter-folds": "node verify-treesitter-folds.mjs",
     "verify-clipboard": "node verify-clipboard.mjs",
+    "verify-http": "node verify-http.mjs",
+    "verify-http-mount": "node verify-http-mount.mjs",
     "verify-proc": "node verify-proc.mjs",
     "verify-lsp": "node verify-lsp.mjs",
     "verify-terminal": "node verify-terminal.mjs",

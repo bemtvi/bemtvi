@@ -11,3 +11,12 @@
   Cross-Origin-Opener-Policy: same-origin
   Cross-Origin-Embedder-Policy: require-corp
   Cross-Origin-Resource-Policy: same-origin
+
+# The `nx.http.mount` Service Worker (nx-sw.js), which serves a plugin's mounted subroutes
+# at /plugin/*. It is served from this root, but a Service Worker's scope defaults to its
+# own directory — `Service-Worker-Allowed` is what lets it register with scope "/" so it can
+# see /plugin/* at all. Without this the registration is REJECTED and every mount 404s.
+# `no-cache` because a stale worker would serve a mount contract the editor no longer speaks.
+/nx-sw.js
+  Service-Worker-Allowed: /
+  Cache-Control: no-cache

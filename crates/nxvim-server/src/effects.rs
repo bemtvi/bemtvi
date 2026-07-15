@@ -2689,30 +2689,26 @@ impl EditHost {
             // that would 404. Phase 3 of the mount plan gives the web build real parity via
             // a Service Worker on the page's own origin, which satisfies this same
             // `HttpServerRequest`/`HttpServerReply` contract.
+            // `nx.http.mount` on wasm: a tab cannot bind a port, so the Worker registers a
+            // Service Worker that intercepts `/plugin/*` on the page's own origin and relays
+            // each request back in — the same contract as the native listener. No host gate:
+            // a Service Worker needs no daemon, only a secure origin (and an insecure one
+            // rejects the mount, inbound, rather than handing back a URL that would 404).
+            //
+            // The name→id route table is kept HERE rather than in JS so the browser and the
+            // native listener resolve a mount the same way.
             #[cfg(not(feature = "native"))]
-            LoopOp::HttpMount { id, .. } => {
-                // Reject the mount promise rather than dropping the callback and leaving it
-                // pending forever — a plugin that mounts on the web must SEE that it did
-                // not, not hang.
-                let result = Err(nxvim_lua::HttpMountError {
-                    message: "nx.http.mount: unsupported on the browser build (a tab cannot \
-                              bind a TCP port)"
-                        .to_string(),
-                });
-                if let Err(e) =
-                    self.lua
-                        .run_callback(id, false, CallbackArgs::HttpMountResult { result })
-                {
-                    self.editor
-                        .echo(format!("E5108: Error in nx.http.mount handler: {e}"));
-                }
-                self.apply_lua_effects();
+            LoopOp::HttpMount { id, name, .. } => {
+                self.http_routes.insert(name.clone(), id);
+                self.fx.http_mount(id, name);
             }
-            // Unreachable in practice: no mount can exist to respond to or close, since
-            // every `HttpMount` above rejected. Explicit rather than a catch-all so the
-            // Service Worker phase gets a compile error here instead of a silent no-op.
             #[cfg(not(feature = "native"))]
-            LoopOp::HttpRespond { .. } | LoopOp::HttpUnmount { .. } => {}
+            LoopOp::HttpRespond { req_id, reply } => self.fx.http_respond(req_id, reply),
+            #[cfg(not(feature = "native"))]
+            LoopOp::HttpUnmount { id } => {
+                self.http_routes.retain(|_, mount| *mount != id);
+                self.fx.http_unmount(id);
+            }
         }
     }
 
@@ -2887,13 +2883,6 @@ impl EditHost {
                 // thread. Its `respond` queues a `LoopOp::HttpRespond` that
                 // `apply_lua_effects` hands back to the parked axum handler.
                 if let Err(e) = self.lua.run_http_server_request(id, req_id, request) {
-                    self.editor
-                        .echo(format!("E5108: Error in nx.http.mount handler: {e}"));
-                }
-                self.apply_lua_effects();
-            }
-            LoopEvent::HttpServerTimeout { req_id } => {
-                if let Err(e) = self.lua.run_http_server_timeout(req_id) {
                     self.editor
                         .echo(format!("E5108: Error in nx.http.mount handler: {e}"));
                 }

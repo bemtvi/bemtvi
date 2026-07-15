@@ -208,6 +208,35 @@ pub trait HostEffects {
     #[cfg(not(feature = "native"))]
     fn http_op(&mut self, id: u64, request: nxvim_lua::HttpRequest, local: bool);
 
+    /// `nx.http.mount` — publish a plugin's subroute, the wasm twin of the native
+    /// `loop_command(LoopCommand::HttpMount)`. A tab cannot bind a TCP port, so there is no
+    /// listener here: the Worker registers a **Service Worker** that intercepts `fetch` for
+    /// the reserved `/plugin/` namespace on the page's own origin and relays each request
+    /// back in. Same `HttpServerRequest`/`HttpServerReply` contract as the native listener,
+    /// so a plugin's handler is unchanged between worlds — only `:url()` differs (the page's
+    /// origin rather than `127.0.0.1:<port>`).
+    ///
+    /// Fire-and-forget: the bound origin (or the reason there isn't one — an insecure origin
+    /// has no Service Worker) returns *inbound* via
+    /// [`EditHost::http_mount_result`](crate::EditHost::http_mount_result), which settles the
+    /// mount promise. Carries no address — `'httphost'`/`'httpport'` are native-only
+    /// concepts; the browser's origin is whatever served the page.
+    #[cfg(not(feature = "native"))]
+    fn http_mount(&mut self, id: u64, name: String);
+
+    /// `respond(res)` in a mount handler — hand the reply for the in-flight request `req_id`
+    /// back to the Worker, which posts it down the Service Worker's `MessageChannel` port.
+    /// The wasm twin of `loop_command(LoopCommand::HttpRespond)`. Fire-and-forget; `req_id`
+    /// is unique across every mount, so no mount id rides along.
+    #[cfg(not(feature = "native"))]
+    fn http_respond(&mut self, req_id: u64, reply: nxvim_lua::HttpServerReply);
+
+    /// `mount:close()` — retire the route owned by `id`. The wasm twin of
+    /// `loop_command(LoopCommand::HttpUnmount)`. The Service Worker registration itself stays
+    /// (it costs nothing and outlives the page anyway); requests for a retired mount 404.
+    #[cfg(not(feature = "native"))]
+    fn http_unmount(&mut self, id: u64);
+
     /// Arm a streaming `nx.fs.watch` over the daemon `luafs_watch` leg (Phase 3b) — the wasm twin
     /// of the native `loop_command(LoopCommand::FsEventStart)`. Fire-and-forget: change batches
     /// return *inbound* via [`EditHost::fs_watch_event`](crate::EditHost::fs_watch_event) and a

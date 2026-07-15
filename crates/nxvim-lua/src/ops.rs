@@ -584,6 +584,62 @@ pub struct HttpServerRequest {
     pub body: Vec<u8>,
 }
 
+/// The path prefix reserved for plugin mounts. Everything under it routes by mount name;
+/// the editor keeps `/` and any future `/_nx/*` for itself. Shared by both worlds — the
+/// native listener's router and the browser's Service Worker carve the same namespace.
+pub const MOUNT_PREFIX: &str = "/plugin/";
+
+/// Split a request path into its mount `name` and the **mount-relative** rest, or `None`
+/// when it is not under [`MOUNT_PREFIX`] at all.
+///
+/// `/plugin/example/style.css` → `("example", "/style.css")`, and a bare `/plugin/example`
+/// → `("example", "/")` — normalized so a handler's `req.path == "/"` check works with or
+/// without the trailing slash.
+pub fn split_mount_path(path: &str) -> Option<(&str, &str)> {
+    let rest = path.strip_prefix(MOUNT_PREFIX)?;
+    if rest.is_empty() {
+        return None; // a bare `/plugin/` names no mount
+    }
+    Some(match rest.find('/') {
+        Some(i) => (&rest[..i], &rest[i..]),
+        None => (rest, "/"),
+    })
+}
+
+/// Build the [`HttpServerRequest`] a mount handler sees, from the raw pieces every
+/// transport has: the method, the full path, the raw query string, the headers, and the
+/// body. Returns `None` when `path` names no mount (the caller answers `404`).
+///
+/// **Shared by both worlds on purpose.** The native listener gets these pieces from `axum`
+/// and the browser gets them from a Service Worker's `fetch` interception, but a plugin's
+/// handler must see *identical* input either way — so the prefix split, the `"/"`
+/// normalization, the query decoding, and the header lower-casing all happen here, once.
+/// Duplicating these rules per transport is how `req.path` quietly comes to mean two
+/// different things.
+pub fn build_server_request(
+    method: &str,
+    path: &str,
+    query: Option<&str>,
+    headers: Vec<(String, String)>,
+    body: Vec<u8>,
+) -> Option<HttpServerRequest> {
+    let (name, rel) = split_mount_path(path)?;
+    Some(HttpServerRequest {
+        name: name.to_string(),
+        method: method.to_uppercase(),
+        path: rel.to_string(),
+        raw_path: path.to_string(),
+        query: query
+            .map(|q| form_urlencoded::parse(q.as_bytes()).into_owned().collect())
+            .unwrap_or_default(),
+        headers: headers
+            .into_iter()
+            .map(|(n, v)| (n.to_ascii_lowercase(), v))
+            .collect(),
+        body,
+    })
+}
+
 /// The reply an [`HttpServerRequest`] is answered with — what a mount handler passes to
 /// its `respond(res)`. The inbound twin of [`HttpResponse`]; separate for the same reason
 /// [`HttpServerRequest`] is (no `ok` / `statusText` — those are things a *client* reads

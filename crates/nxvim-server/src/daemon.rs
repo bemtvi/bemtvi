@@ -1461,7 +1461,6 @@ pub async fn serve_proc_daemon_on(
                 | LoopEvent::HttpResult { .. }
                 | LoopEvent::HttpMountResult { .. }
                 | LoopEvent::HttpServerRequest { .. }
-                | LoopEvent::HttpServerTimeout { .. }
                 | LoopEvent::HttpRebound { .. }
                 | LoopEvent::HttpRebindErr { .. }
                 | LoopEvent::ProcOut { .. }

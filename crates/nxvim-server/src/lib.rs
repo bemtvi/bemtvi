@@ -1246,6 +1246,14 @@ pub struct EditHost {
     /// old address until then.
     #[cfg(feature = "native")]
     http_rebind_inflight: Option<(String, u16)>,
+    /// Live `nx.http.mount` routes on the wasm build: mount name (`example`) → its callback
+    /// id. The browser analogue of the native actor's route map, and kept on THIS side
+    /// rather than in JS on purpose: the Service Worker hands in a raw path, and resolving
+    /// it — the `/plugin/<name>/<rest>` split, the miss→404 — must work exactly as the
+    /// native listener does, which it can only do by sharing
+    /// [`nxvim_lua::split_mount_path`] with it.
+    #[cfg(not(feature = "native"))]
+    http_routes: std::collections::HashMap<String, u64>,
     /// The wasm build's timer wheel (slice 5d): pending `vim.defer_fn` / `nx.timer`
     /// timers, fired by the Worker when their [`due_ms`](WasmTimer::due_ms) passes on the
     /// JS clock — the serverless analogue of the tokio timers the native build arms via
@@ -1393,6 +1401,8 @@ impl EditHost {
             http_serving: None,
             #[cfg(feature = "native")]
             http_rebind_inflight: None,
+            #[cfg(not(feature = "native"))]
+            http_routes: std::collections::HashMap::new(),
             #[cfg(not(feature = "native"))]
             wasm_timers: Vec::new(),
             #[cfg(not(feature = "native"))]
@@ -2143,6 +2153,95 @@ impl EditHost {
         self.apply_lua_effects();
         self.settle_events(true);
     }
+    /// Settle an `nx.http.mount` promise from the Worker's Service Worker registration: `ok`
+    /// resolves it with `text` as the page's origin, else rejects with `text` as the reason.
+    /// The wasm twin of the native [`LoopEvent::HttpMountResult`].
+    ///
+    /// A reject is load-bearing rather than defensive: a Service Worker needs a secure
+    /// context, so a plain-`http://` non-localhost origin genuinely cannot serve mounts, and
+    /// the plugin has to learn that instead of receiving a URL that would 404.
+    #[cfg(not(feature = "native"))]
+    pub fn http_mount_result(&mut self, id: u64, ok: bool, text: String) {
+        if !ok {
+            // The mount never published — drop the route so a later request cannot find a
+            // handler the browser can never reach.
+            self.http_routes.retain(|_, mount| *mount != id);
+        }
+        let result = if ok {
+            Ok(text)
+        } else {
+            Err(nxvim_lua::HttpMountError { message: text })
+        };
+        if let Err(e) = self.lua.run_callback(
+            id,
+            false,
+            nxvim_lua::CallbackArgs::HttpMountResult { result },
+        ) {
+            self.editor
+                .echo(format!("E5108: Error in nx.http.mount handler: {e}"));
+        }
+        self.apply_lua_effects();
+        self.settle_events(true);
+    }
+
+    /// Run one Service-Worker-intercepted request through its mount's handler — the wasm twin
+    /// of the native listener's axum handler, and the browser's entry into the *same*
+    /// `HttpServerRequest` contract.
+    ///
+    /// Takes the raw pieces rather than the Worker's JSON: the JSON boundary belongs to
+    /// `nxvim-edithost`, which owns every other `eh_*` conversion.
+    ///
+    /// The routing is deliberately here rather than in JS: the `/plugin/<name>/<rest>` split,
+    /// the mount lookup, and the miss→`404` all go through the same
+    /// [`nxvim_lua::build_server_request`] the native listener uses, so `req.path` cannot come
+    /// to mean two different things in the two worlds.
+    #[cfg(not(feature = "native"))]
+    pub fn http_server_request(
+        &mut self,
+        req_id: u64,
+        method: &str,
+        path: &str,
+        query: &str,
+        headers: Vec<(String, String)>,
+        body: Vec<u8>,
+    ) {
+        let query = (!query.is_empty()).then_some(query);
+        let request = nxvim_lua::build_server_request(method, path, query, headers, body);
+        let mount = request
+            .as_ref()
+            .and_then(|r| self.http_routes.get(r.name.as_str()).copied());
+        let (Some(request), Some(id)) = (request, mount) else {
+            // No mount by that name (or not under /plugin/ at all): the editor's own 404,
+            // without entering Lua — exactly what the native listener answers.
+            self.reply_http_server(req_id, 404, "nxvim: no plugin mounted here\n");
+            return;
+        };
+        if let Err(e) = self.lua.run_http_server_request(id, req_id, request) {
+            self.editor
+                .echo(format!("E5108: Error in nx.http.mount handler: {e}"));
+        }
+        self.apply_lua_effects();
+        self.settle_events(true);
+    }
+
+    /// Answer a Service-Worker request the editor itself is refusing (a `404`), bypassing Lua
+    /// — the browser twin of the native listener's `text_response`. Queued on the same reply
+    /// path a handler's `respond` uses, so the Worker relays it identically.
+    #[cfg(not(feature = "native"))]
+    fn reply_http_server(&mut self, req_id: u64, status: u16, body: &str) {
+        self.fx.http_respond(
+            req_id,
+            nxvim_lua::HttpServerReply {
+                status,
+                headers: vec![(
+                    "content-type".to_string(),
+                    "text/plain; charset=utf-8".to_string(),
+                )],
+                body: body.as_bytes().to_vec(),
+            },
+        );
+    }
+
     /// Feed one `lsp_stdout` push (the LSP leg's daemon→edit-host direction) into the
     /// [`SyncLspClient`](nxvim_lsp::SyncLspClient), then drain the events it produced —
     /// the wasm twin of the native run loop's `lsp_events` arm ([`on_lsp_events`]). The

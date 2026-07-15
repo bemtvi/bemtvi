@@ -598,6 +598,74 @@
       if (useSAB) pushFrame(8, enc(text));
       else worker.postMessage({ type: "clipboard_push", text });
     }
+
+    // ---- nx.http.mount: the Service Worker relay ---------------------------
+    //
+    // A tab cannot bind a port, so where the native build runs a listener the web build runs
+    // a Service Worker (nx-sw.js) that intercepts `/plugin/*` on this origin. The SW is a
+    // third context and cannot reach the Worker that holds the wasm, so the window is the
+    // relay: SW → here → the ring → the editor → back.
+    //
+    // The request rides a ring frame rather than a postMessage because the SAB run loop parks
+    // on `Atomics.wait`; only the ring's SEQ bump can wake it. That is the whole reason this
+    // path exists in this shape.
+    const httpPorts = new Map(); // req_id → the MessagePort the SW is parked on
+    let nextHttpReqId = 1;
+    let swReady = null;          // memoized: one registration for every mount
+
+    // Register the SW and resolve with the origin mounts are served from. Rejects loudly —
+    // a plugin must learn its mount cannot be served rather than get a URL that would 404.
+    function ensureServiceWorker() {
+      if (swReady) return swReady;
+      swReady = (async () => {
+        if (!("serviceWorker" in navigator)) {
+          throw new Error("this browser has no Service Worker support");
+        }
+        if (!self.isSecureContext) {
+          // The real constraint, and a common own-goal: a plain http:// origin that is not
+          // localhost gets no Service Worker at all, so mounts genuinely cannot be served.
+          throw new Error("nx.http.mount needs a secure context (https:// or localhost)");
+        }
+        // Scope "/" so the SW covers /plugin/* even though this page is served from /web/.
+        // Requires `Service-Worker-Allowed: /` on the script response (see serve.mjs).
+        // Registered from the ROOT path, not from /web/ beside this page: a SW's scope
+        // cannot rise above the path it was served from, and mounts live at /plugin/*.
+        await navigator.serviceWorker.register("/nx-sw.js", { scope: "/" });
+        await navigator.serviceWorker.ready;
+        // `ready` means "there is an active worker", NOT "it controls this page" — on a first
+        // visit the page loaded uncontrolled. The SW's clients.claim() fixes that, but until
+        // it lands a mount fetch would bypass the SW and 404, so wait for it.
+        if (!navigator.serviceWorker.controller) {
+          await new Promise((res) =>
+            navigator.serviceWorker.addEventListener("controllerchange", res, { once: true })
+          );
+        }
+        return location.origin;
+      })();
+      return swReady;
+    }
+
+    // Answer the Worker's mount publication with the origin (or why there is none).
+    function httpMountResultOp(id, ok, text) {
+      const json = JSON.stringify({ id, ok, text });
+      if (useSAB) pushFrame(10, enc(json));
+      else worker.postMessage({ type: "http_mount_result", json });
+    }
+
+    // The SW hands each intercepted request here, with a MessagePort to answer on.
+    if ("serviceWorker" in navigator) {
+      navigator.serviceWorker.addEventListener("message", (ev) => {
+        const msg = ev.data;
+        if (!msg || msg.type !== "nx-http-request") return;
+        const port = ev.ports && ev.ports[0];
+        if (!port) return;
+        const reqId = nextHttpReqId++;
+        httpPorts.set(reqId, port);
+        const json = JSON.stringify({ req_id: reqId, ...msg.request });
+        if (useSAB) pushFrame(9, enc(json));
+        else worker.postMessage({ type: "nx_http_request", json });
+      });
+    }
     // Refresh the editor's `"+`/`"*` read mirror from `navigator.clipboard`. The editor's
     // synchronous register read can't await the (async, Window-only) clipboard, so we push its
     // contents *ahead* of a paste — on focus / tab-return, when the document is focused and
@@ -662,6 +730,28 @@
     }
     worker.onmessage = async (ev) => {
       const msg = ev.data;
+      // `nx.http.mount` published a route: ensure the Service Worker, then report the origin
+      // it will be served from — or why it cannot be, which rejects the plugin's promise.
+      if (msg.type === "nx-http-mount") {
+        ensureServiceWorker().then(
+          (origin) => httpMountResultOp(msg.id, true, origin),
+          (e) => httpMountResultOp(msg.id, false, String((e && e.message) || e))
+        );
+        return;
+      }
+      // A mount handler answered: hand the reply to the SW's parked fetch, closing the loop.
+      if (msg.type === "nx-http-reply") {
+        for (const r of msg.replies || []) {
+          const port = httpPorts.get(r.req_id);
+          if (!port) continue; // already answered / timed out SW-side
+          httpPorts.delete(r.req_id);
+          port.postMessage({ status: r.status, headers: r.headers, body: r.body });
+        }
+        return;
+      }
+      // `mount:close()`: the editor already dropped the route (a later request 404s from
+      // Rust), so there is nothing window-side to forget — the ports are per-request.
+      if (msg.type === "nx-http-unmount") return;
       // Real-FS picker plumbing: the Worker routes a bound path's read/write here (its
       // handle is UI-side) and we fulfill it against the real file, then report back.
       if (msg.type === "fs_read") {

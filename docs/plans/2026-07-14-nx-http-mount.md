@@ -87,7 +87,8 @@ response's body".
     namespace is reserved for mounts so the editor keeps `/` and `/_nx/*` for itself.
   - `opts.on_request(req, respond)` — **required**; the request handler.
   - `opts.timeout` — ms a request may sit unanswered before the client gets a `504` and the
-    slot is reclaimed (default `30000`). Guards a handler that never responds.
+    slot is reclaimed (default `30000`). Guards a handler that never responds. Enforced in
+    Lua, so it means the same thing on every build (see *Web*).
 - `req` = `{ method, path, query, headers, body, name, raw_path }`.
   - **`req.path` is mount-relative** — `GET /plugin/example/style.css?v=2` gives
     `path = "/style.css"`, `query = { v = "2" }`, `raw_path = "/plugin/example/style.css"`.
@@ -194,7 +195,7 @@ Types live in `nxvim-lua` (`ops.rs`), transport-free and wasm-safe, beside
 
 New `LoopOp`s — the `SockConnect`/`SockWrite`/`SockClose` triple is the template:
 
-- `LoopOp::HttpMount { id, name, host, port, timeout_ms }` — ensure the listener, add the
+- `LoopOp::HttpMount { id, name, timeout_ms }` — ensure the listener, add the
   route. `host`/`port` are the `'httphost'`/`'httpport'` values, read off the editor by the
   effects layer at mount time — the actor is told the address, it never reads options.
 - `LoopOp::HttpRespond { id, req_id, reply }` — answer one in-flight request.
@@ -302,20 +303,69 @@ the same shape as `http_op`. This is the **no-gate** row of the three degradatio
 strategies after all, not the loud-failure row the first draft assumed: a SW is always
 available on the demo origin, so a serverless session needs no daemon and no listener.
 
+**The wake is the hard part** (found in build, not design). `http_op` is *editor-initiated*:
+the tick enqueues, the Worker drains. A mount request is the mirror — *browser-initiated* —
+and the Worker's run loop **parks on `Atomics.wait`**, which blocks its event loop entirely.
+A `postMessage` would sit undelivered until some unrelated keystroke happened to wake it. So
+the relayed request rides the **SAB ring as a frame** (type 9), exactly like a keystroke:
+the ring's `SEQ` bump is the only thing that can wake a parked loop. The mount result rides
+back as frame type 10. Under the postMessage fallback (5c) the loop never parks, so plain
+messages are used there.
+
+**Routing lives in Rust, not JS.** The Worker relays the *full* path and the edit-host does
+the `/plugin/<name>/<rest>` split, the mount lookup, and the miss→`404` — through the same
+`nxvim_lua::build_server_request` the native listener calls. Doing it in JS would have been
+easier and would have quietly let `req.path` mean two different things in the two worlds.
+
+**Cross-origin isolation.** The editor page is COEP `require-corp` (the SharedArrayBuffer
+prerequisite), and a document embedded in such a page must assert COEP itself — so an
+`<iframe>` of a mount, the whole point of serving a real URL, fails without it. The SW
+therefore defaults `cross-origin-embedder-policy: require-corp` +
+`cross-origin-resource-policy: same-origin` on every mount reply, letting an explicit plugin
+header win. The editor knows it is isolated; a plugin should not have to.
+
+**Scope.** A Service Worker's scope cannot rise above the path it was served from, so
+`nx-sw.js` is served from the **root** (`/nx-sw.js`) even though its source lives in `web/`
+— `serve.mjs` special-cases it, `package-site.sh` stages it at the publish root. Registering
+it with `scope: "/"` additionally needs a **`Service-Worker-Allowed: /`** header on the
+script response, or the browser rejects the registration outright and every mount 404s; that
+header is in `serve.mjs` and in `web/_headers` for the deployed site.
+
 **Constraints, honestly.** A SW needs a secure context (HTTPS or `localhost`) — met by the
-demo site, and a plain-`http://` non-localhost origin fails loud at `mount`. The first
-`navigator.serviceWorker.register` only controls the page after activation, so `nx.http.mount`
-awaits `navigator.serviceWorker.ready` before resolving; that is precisely why `mount`
-returns a promise rather than a synchronous handle, and the API absorbs the wait with no
+demo site, and a plain-`http://` non-localhost origin rejects at `mount`. `serviceWorker.ready`
+means "there is an active worker", *not* "it controls this page": on a first visit the page
+loaded uncontrolled, so the registration also waits for `controllerchange` (the SW's
+`clients.claim()`), or the first mount would 404 until a reload. All of that is why `mount`
+returns a promise rather than a synchronous handle — the API absorbs the wait with no
 plugin-visible difference. A hard reload with the SW bypassed serves no mounts, which is
 correct: no editor, no content.
+
+**`opts.timeout` needs no transport at all.** It is enforced in **Lua**: `nx._http_request`
+arms a deadline per request, and on expiry answers `504` and notifies. So the browser build
+inherits the contract exactly, with no listener to enforce it and nothing to keep in sync.
+
+That split is the point. `opts.timeout` is the **plugin's contract** — "your handler did not
+answer in time" — and only Lua knows it, so one implementation there is inherited by every
+transport. What each transport keeps is a far-longer **backstop** for the one case a Lua
+deadline cannot cover: the editor never runs it (a wedged tick; or the postMessage fallback,
+where Lua timers never fire at all). That is *resource safety* — reclaiming a socket or a
+parked `fetch` — a different concern that merely shares a unit. Native's backstop is
+`opts.timeout + 30s` (exact, since the listener knows the mount); the SW's is a flat 5
+minutes, which caps a mount asking for more than that — worth knowing, not worth plumbing a
+per-mount value through a Service Worker for.
+
+An earlier draft had the listener enforce `opts.timeout` and the SW apply its own fixed 30s
+backstop, which made the option native-only *and* let a legitimately slow web handler be cut
+off at 30s. Moving it to Lua deleted a `LoopEvent`, a runtime call, and a Lua callback — the
+web parity came out as a consequence rather than as more code.
 
 ## Fail loud
 
 - Bind failure, duplicate mount name, or a bad `name` **rejects** the promise. No silent
   fallback to another port or a suffixed name.
 - A throwing `on_request` responds `500` **and** notifies — never swallowed into a status.
-- A handler that never responds yields `504` at `opts.timeout` and notifies.
+- A handler that never responds yields `504` at `opts.timeout` and notifies — from Lua, so
+  identically on every build.
 - A second `respond` on the same request notifies rather than silently dropping.
 - An `'httphost'`/`'httpport'` write while serving rebinds or notifies-and-reverts — it
   never silently fails to apply, and never leaves the option disagreeing with reality.
@@ -332,7 +382,7 @@ correct: no editor, no content.
 2. **Example** — `examples/nx-http-mount/`: a markdown renderer plugin serving the current
    buffer as styled HTML, end-to-end runnable.
 3. **Web** — `nx-sw.js`, the window-client relay, the `HostEffects` seam + FFI exports,
-   `verify-http-mount.mjs` in headless Chromium.
+   `verify-http-mount.mjs` in headless Chromium. **Done.**
 
 ## Tests (`crates/nxvim-server/tests/http_mount.rs`)
 
@@ -347,7 +397,9 @@ with a real client:
 - custom `status` + `headers` reach the client
 - an unmounted `/plugin/<name>` is a `404`; `:close()` makes a live mount start 404ing
 - a duplicate `name` **rejects**; a bad `name` **rejects**
-- a throwing handler yields `500`; a silent handler yields `504` at a short `timeout`
+- a throwing handler yields `500`; a silent handler yields `504` at a short `timeout` (which
+  the listener's `opts.timeout + 30s` backstop could not have produced — so a pass proves the
+  Lua deadline is what fired)
 - **`'httpport'` is honored** — set it before mounting and the listener binds that exact port
 - **a rebind while serving** — `:set httpport=<free>` moves the origin and every mount stays
   live on the new one; the old address stops answering

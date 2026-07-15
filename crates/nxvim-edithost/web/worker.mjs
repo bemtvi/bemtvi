@@ -89,6 +89,16 @@ const eh_fs_op_result = M.cwrap("eh_fs_op_result", null, ["number", "number", "n
 // pointer+length (re-encoded msgpack — a response body is raw bytes Rust decodes).
 const eh_take_http_requests = M.cwrap("eh_take_http_requests", "number", ["number"]);
 const eh_http_result = M.cwrap("eh_http_result", null, ["number", "number", "number", "number"]);
+
+// `nx.http.mount` (the Service Worker leg): the browser twin of the native listener. The
+// direction is the mirror of `http_op` above — a mount request is BROWSER-initiated, so
+// `eh_http_server_request` STARTS a round-trip (relayed in from the window, which the SW
+// posted to) and the handler's reply LEAVES through `eh_take_http_server_replies`.
+const eh_take_http_mounts = M.cwrap("eh_take_http_mounts", "number", ["number"]);
+const eh_take_http_unmounts = M.cwrap("eh_take_http_unmounts", "number", ["number"]);
+const eh_http_mount_result = M.cwrap("eh_http_mount_result", null, ["number", "number", "number", "string"]);
+const eh_http_server_request = M.cwrap("eh_http_server_request", null, ["number", "string"]);
+const eh_take_http_server_replies = M.cwrap("eh_take_http_server_replies", "number", ["number"]);
 // Streaming `nx.fs.watch` over the daemon (Phase 3b): the editor arms/disarms a recursive watch
 // off-tick (only with a daemon — serverless has no change source); the Worker forwards each over
 // WebTransport (`luafs_watch`/`luafs_unwatch`) and lands the daemon's `luafs_change`/`luafs_watch_err`
@@ -1693,6 +1703,51 @@ function landFsOpResult(id, reply) {
 // to msgpack and lands via `eh_http_result` (resolving the promise). Drained sequentially,
 // looping until dry — landing a result can fire a chained fetch in the continuation. Returns
 // whether any request was handled (so the caller repaints).
+// ---- nx.http.mount (the Service Worker leg) --------------------------------
+//
+// The window owns the Service Worker registration (a Worker cannot register one for a page
+// it does not control) and the MessageChannel ports the SW is parked on, so the Worker's job
+// here is only: ask the window to ensure the SW when a plugin mounts, and hand it back each
+// reply the editor produces.
+
+// Publications waiting on the window's `navigator.serviceWorker.ready`. The window answers
+// with `http_mount_result`, which settles the plugin's promise.
+async function drainHttpMounts() {
+  const mounts = JSON.parse(readStr(eh_take_http_mounts(h)));
+  if (mounts.length === 0) return false;
+  for (const m of mounts) {
+    // The window replies asynchronously (registration + activation take a turn); it lands the
+    // result via the `http_mount_result` frame / message, not here.
+    postMessage({ type: "nx-http-mount", id: m.id, name: m.name });
+  }
+  return true;
+}
+
+// `mount:close()` — the route is already gone editor-side (a later request 404s from Rust);
+// this only lets the window drop its own bookkeeping for the mount.
+function drainHttpUnmounts() {
+  const ids = JSON.parse(readStr(eh_take_http_unmounts(h)));
+  if (ids.length === 0) return false;
+  postMessage({ type: "nx-http-unmount", ids });
+  return true;
+}
+
+// Handler replies (`respond(res)`) → the window → the SW's parked port → the browser.
+function drainHttpServerReplies() {
+  const replies = JSON.parse(readStr(eh_take_http_server_replies(h)));
+  if (replies.length === 0) return false;
+  postMessage({ type: "nx-http-reply", replies });
+  return true;
+}
+
+// Every mount-leg drain, in one call for the run loop. Returns whether anything moved (the
+// caller repaints on true — a handler may well have touched the editor).
+function drainHttpMountWork() {
+  const unmounted = drainHttpUnmounts();
+  const replied = drainHttpServerReplies();
+  return unmounted || replied;
+}
+
 async function drainHttpRequests() {
   let didWork = false;
   for (;;) {
@@ -2045,7 +2100,14 @@ async function maybeCheckpoint5c() {
 // data: Uint8Array ring. Frames are [type:u8][reqId:u32][len:u32][payload:len]:
 //   type 0 = feed (payload = vim notation), 1 = exec_lua (payload = code),
 //   2 = attach (payload = cols:u32, rows:u32),
-//   3 = mouse (payload = JSON {b:button, a:action, m:modifier, r:row, c:col}).
+//   3 = mouse (payload = JSON {b:button, a:action, m:modifier, r:row, c:col}),
+//   9 = nx-http-request (payload = JSON, a Service Worker request for an nx.http.mount),
+//   10 = http_mount_result (payload = JSON, the window's answer to a mount publication).
+//
+// 9/10 ride the ring rather than postMessage for the reason the ring exists at all: this loop
+// PARKS on `Atomics.wait`, which blocks the Worker's event loop, so a postMessage would sit
+// undelivered until some unrelated keystroke happened to wake us. A mount request has to wake
+// the editor by itself, and the ring's SEQ bump is what does that.
 // =============================================================================
 const SEQ = 0, WRITE = 1, READ = 2;
 
@@ -2110,6 +2172,22 @@ async function runLoopSAB(ctrl, data) {
         // earns neither an ack nor a repaint (the cache update is invisible until a paste).
         eh_clipboard_push(h, utf8(payload));
         continue;
+      } else if (type === 9) {
+        // nx-http-request: a Service-Worker-intercepted request the window relayed in. It
+        // rides the RING rather than a postMessage because that is the only thing a run loop
+        // parked on `Atomics.wait` can see — the park blocks the Worker's event loop, so a
+        // postMessage would sit undelivered until some unrelated keystroke woke us.
+        // Fire-and-forget: the handler's reply leaves via `drainHttpServerReplies` (this pass
+        // if the handler answered synchronously, a later one if it awaited).
+        eh_http_server_request(h, utf8(payload));
+        continue;
+      } else if (type === 10) {
+        // http_mount_result: the window's answer to a mount publication — the page's origin,
+        // or why there is none (no Service Worker on an insecure origin). Settles the
+        // plugin's `nx.http.mount` promise.
+        const r = JSON.parse(utf8(payload));
+        eh_http_mount_result(h, r.id, r.ok ? 1 : 0, String(r.text || ""));
+        continue;
       }
       acks.push(reqId);
     }
@@ -2161,6 +2239,12 @@ async function runLoopSAB(ctrl, data) {
     // connected, else the browser's own `fetch()` (serverless — no daemon needed). Each reply
     // lands before the repaint below, so the fetch's promise resolves and the UI sees its effect.
     const httpWork = await drainHttpRequests();
+    // `nx.http.mount`: hand the window any new publications (it owns the Service Worker
+    // registration) and any handler replies (it owns the SW's parked ports). A mount's
+    // inbound REQUEST does not arrive here — it rides the ring as a frame, like a keystroke,
+    // because nothing else can reach a run loop parked on `Atomics.wait`.
+    await drainHttpMounts();
+    const mountWork = drainHttpMountWork();
     // Forward any watches the tick armed/disarmed (file-backed buffers opened/closed) to the
     // daemon, so it begins/stops pushing `fs_changed` for them.
     await drainWatchRequests();
@@ -2182,7 +2266,7 @@ async function runLoopSAB(ctrl, data) {
     drainTsRequests();
     // Forward any `"+`/`"*` yanks/deletes to the UI thread to write to navigator.clipboard.
     drainClipboardWrites();
-    if (fired || acks.length || fsWork || fsOpWork || httpWork || notified || tsLanded || termFlushed) {
+    if (fired || acks.length || fsWork || fsOpWork || httpWork || mountWork || notified || tsLanded || termFlushed) {
       postMessage(redrawMsg({ acks, results }));
     }
     // Persistence (shada): any input this pass arms the debounced checkpoint; a requested
@@ -2365,6 +2449,22 @@ onmessage = async (ev) => {
   // No repaint: the cache change is invisible until a paste consumes it.
   if (msg.type === "clipboard_push") {
     eh_clipboard_push(h, String(msg.text ?? ""));
+    return;
+  }
+  // `nx.http.mount` (5c; SAB routes these as ring type-9 / type-10 frames in `drain()`).
+  // Under 5c the loop never parks, so a plain message is delivered fine.
+  if (msg.type === "nx_http_request") {
+    eh_http_server_request(h, String(msg.json ?? "{}"));
+    drainHttpMountWork();
+    postMessage(redrawMsg({ acks: [], results: [] }));
+    return;
+  }
+  if (msg.type === "http_mount_result") {
+    const r = JSON.parse(String(msg.json ?? "{}"));
+    eh_http_mount_result(h, r.id, r.ok ? 1 : 0, String(r.text || ""));
+    await drainHttpMounts();
+    drainHttpMountWork();
+    postMessage(redrawMsg({ acks: [], results: [] }));
     return;
   }
   // Out-of-band image-preview byte fetch (`'imagepreview'`): the editor core never reads an

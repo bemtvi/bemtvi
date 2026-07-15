@@ -151,6 +151,21 @@ struct Sink {
     /// Each is `(id, request, local)` — `local` (`nx.http.fetch_local`) forces the browser's
     /// own `fetch()` even when a daemon is connected (the Worker routes on it).
     http_ops: Vec<(u64, nxvim_lua::HttpRequest, bool)>,
+    /// `nx.http.mount` publications the editor enqueued this convergence: `(cb_id, name)` per
+    /// mount, recorded by [`http_mount`](HostEffects::http_mount). Drained by
+    /// [`eh_take_http_mounts`]; the Worker registers the Service Worker that intercepts
+    /// `/plugin/*` on the page's origin and lands the bound origin (or the reason there is
+    /// none) via [`eh_http_mount_result`].
+    http_mounts: Vec<(u64, String)>,
+    /// `mount:close()` retirements enqueued this convergence: the mount's `cb_id`. Drained by
+    /// [`eh_take_http_unmounts`]. The route itself is already gone from the editor's table (so
+    /// a later request 404s); this only lets the Worker forget its own per-mount bookkeeping.
+    http_unmounts: Vec<u64>,
+    /// Mount-handler replies enqueued this convergence: `(req_id, reply)` per `respond(res)`,
+    /// recorded by [`http_respond`](HostEffects::http_respond). Drained by
+    /// [`eh_take_http_server_replies`]; the Worker relays each to the window, which posts it
+    /// down the Service Worker's `MessageChannel` port and completes the browser's request.
+    http_server_replies: Vec<(u64, nxvim_lua::HttpServerReply)>,
     /// Streaming `nx.fs.watch` arms the editor enqueued this convergence (the `luafs_watch` leg —
     /// Phase 3b): `(stream_id, path, recursive)` per `nx.fs.watch`, recorded by
     /// [`fs_watch_stream`](HostEffects::fs_watch_stream). Drained by [`eh_take_fs_watch_requests`]
@@ -678,6 +693,26 @@ impl HostEffects for WasmEffects {
         // (unless `local` — `nx.http.fetch_local` — which forces the browser `fetch()`), else
         // the browser's own `fetch()`. The typed result returns via `eh_http_result`.
         self.sink.borrow_mut().http_ops.push((id, request, local));
+    }
+
+    fn http_mount(&mut self, id: u64, name: String) {
+        // `nx.http.mount`: record it for the Worker, which ensures the Service Worker is
+        // registered and active and reports the page's origin back via `eh_http_mount_result`.
+        // A tab has no port to bind, so there is nothing to do here but ask.
+        self.sink.borrow_mut().http_mounts.push((id, name));
+    }
+
+    fn http_respond(&mut self, req_id: u64, reply: nxvim_lua::HttpServerReply) {
+        // A mount handler's `respond(res)`: record it for the Worker to relay back to the
+        // Service Worker's parked `fetch` handler.
+        self.sink
+            .borrow_mut()
+            .http_server_replies
+            .push((req_id, reply));
+    }
+
+    fn http_unmount(&mut self, id: u64) {
+        self.sink.borrow_mut().http_unmounts.push(id);
     }
 
     fn fs_watch_stream(&mut self, id: u64, path: String, recursive: bool) {
@@ -2023,6 +2058,184 @@ pub unsafe extern "C" fn eh_take_http_requests(h: *mut WasmEditHost) -> *mut c_c
         .map(|(id, req, local)| http_request_to_json(*id, req, *local))
         .collect();
     into_owned_cstr(serde_json::Value::Array(ops).to_string())
+}
+
+// =============================================================================
+// `nx.http.mount` — the Service Worker leg.
+//
+// The browser twin of the native `httpmount` listener. A tab cannot bind a TCP port, so a
+// Service Worker intercepts `fetch` for the reserved `/plugin/` namespace on the page's own
+// origin and relays each request in here; the same `HttpServerRequest`/`HttpServerReply`
+// contract the native listener serves, so a plugin's Lua is identical between worlds.
+//
+// The direction is the interesting difference from the `http_op` leg above. `fetch` is
+// editor-initiated (drain → fulfil → land); a mount is BROWSER-initiated, so the inbound
+// `eh_http_server_request` is the start of the round-trip, not the end of one, and the reply
+// leaves through a drain rather than arriving through a call.
+// =============================================================================
+
+/// Drain the `nx.http.mount` publications the editor enqueued since the last call, as a JSON
+/// array (`[{ id, name }, …]`), emptying the queue so each is handled exactly once. The
+/// Worker registers/awaits the Service Worker and reports the resulting origin (or the reason
+/// there is none) via [`eh_http_mount_result`]. Caller frees with [`eh_free_string`].
+///
+/// # Safety
+/// `h` must come from [`eh_new`] and not yet be freed.
+#[no_mangle]
+pub unsafe extern "C" fn eh_take_http_mounts(h: *mut WasmEditHost) -> *mut c_char {
+    let Some(handle) = h.as_mut() else {
+        return into_owned_cstr("[]".into());
+    };
+    {
+        if handle.sink.borrow().http_mounts.is_empty() {
+            return into_owned_cstr("[]".into());
+        }
+    }
+    let mounts: Vec<serde_json::Value> = std::mem::take(&mut handle.sink.borrow_mut().http_mounts)
+        .into_iter()
+        .map(|(id, name)| serde_json::json!({ "id": id, "name": name }))
+        .collect();
+    into_owned_cstr(serde_json::Value::Array(mounts).to_string())
+}
+
+/// Drain the `mount:close()` retirements the editor enqueued since the last call, as a JSON
+/// array of mount ids. The editor has already dropped the route (a later request 404s); this
+/// only lets the Worker forget its own bookkeeping. Caller frees with [`eh_free_string`].
+///
+/// # Safety
+/// `h` must come from [`eh_new`] and not yet be freed.
+#[no_mangle]
+pub unsafe extern "C" fn eh_take_http_unmounts(h: *mut WasmEditHost) -> *mut c_char {
+    let Some(handle) = h.as_mut() else {
+        return into_owned_cstr("[]".into());
+    };
+    {
+        if handle.sink.borrow().http_unmounts.is_empty() {
+            return into_owned_cstr("[]".into());
+        }
+    }
+    let ids: Vec<serde_json::Value> = std::mem::take(&mut handle.sink.borrow_mut().http_unmounts)
+        .into_iter()
+        .map(|id| serde_json::json!(id))
+        .collect();
+    into_owned_cstr(serde_json::Value::Array(ids).to_string())
+}
+
+/// Settle an `nx.http.mount` promise: `ok` non-zero resolves it with `text` as the bound
+/// origin (`"https://demo.nxvim.dev"` — the page's own), zero rejects it with `text` as the
+/// reason (no Service Worker on an insecure origin, a registration failure). Rejecting is
+/// what keeps a browser mount honest: a plugin must never be handed a URL that would 404.
+///
+/// # Safety
+/// `h` must come from [`eh_new`] and not yet be freed; `text` must be a valid C string.
+#[no_mangle]
+pub unsafe extern "C" fn eh_http_mount_result(
+    h: *mut WasmEditHost,
+    id: f64,
+    ok: i32,
+    text: *const c_char,
+) {
+    let Some(handle) = h.as_mut() else { return };
+    let text = as_str(text).to_string();
+    handle
+        .host
+        .http_mount_result(id.max(0.0) as u64, ok != 0, text);
+}
+
+/// Feed one Service-Worker-intercepted request into a mount's handler. `json` is
+/// `{ req_id, method, path, query, headers: [[name, value], …], body: [<bytes>] }` — `path`
+/// is the FULL path (`/plugin/example/style.css`), which the editor splits and routes exactly
+/// as the native listener does. The handler's `respond(res)` leaves via
+/// [`eh_take_http_server_replies`], keyed by the same `req_id`.
+///
+/// A path naming no live mount replies `404` immediately, without entering Lua — the same
+/// answer the native listener gives.
+///
+/// # Safety
+/// `h` must come from [`eh_new`] and not yet be freed; `json` must be a valid C string.
+#[no_mangle]
+pub unsafe extern "C" fn eh_http_server_request(h: *mut WasmEditHost, json: *const c_char) {
+    let Some(handle) = h.as_mut() else { return };
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(as_str(json)) else {
+        // The Worker builds this, so a malformed relay is a bug in our own JS — and with no
+        // usable `req_id` there is nothing to answer, so it must not pass silently.
+        // emscripten routes stderr to the browser console — the only loud channel available
+        // here, since there is no `req_id` to answer with and no editor message line reachable
+        // from this side of the FFI.
+        eprintln!("nxvim: nx.http.mount got a malformed request relay from the Worker");
+        return;
+    };
+    let req_id = v.get("req_id").and_then(|x| x.as_u64()).unwrap_or(0);
+    let method = v.get("method").and_then(|x| x.as_str()).unwrap_or("GET");
+    let path = v.get("path").and_then(|x| x.as_str()).unwrap_or("/");
+    let query = v.get("query").and_then(|x| x.as_str()).unwrap_or("");
+    let headers = v
+        .get("headers")
+        .and_then(|x| x.as_array())
+        .map(|list| {
+            list.iter()
+                .filter_map(|pair| {
+                    let pair = pair.as_array()?;
+                    Some((
+                        pair.first()?.as_str()?.to_string(),
+                        pair.get(1)?.as_str()?.to_string(),
+                    ))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    let body: Vec<u8> = v
+        .get("body")
+        .and_then(|x| x.as_array())
+        .map(|list| {
+            list.iter()
+                .filter_map(|b| b.as_u64())
+                .map(|b| b as u8)
+                .collect()
+        })
+        .unwrap_or_default();
+    handle
+        .host
+        .http_server_request(req_id, method, path, query, headers, body);
+}
+
+/// Drain the mount-handler replies the editor produced since the last call, as a JSON array
+/// (`[{ req_id, status, headers: [[name, value], …], body: [<bytes>] }, …]`). The Worker
+/// relays each to the window, which posts it down the Service Worker's `MessageChannel` port.
+/// Caller frees with [`eh_free_string`].
+///
+/// A body rides as a JSON byte array rather than a string: a mount serves images and fonts,
+/// not just text, and a lossy UTF-8 round-trip would corrupt them.
+///
+/// # Safety
+/// `h` must come from [`eh_new`] and not yet be freed.
+#[no_mangle]
+pub unsafe extern "C" fn eh_take_http_server_replies(h: *mut WasmEditHost) -> *mut c_char {
+    let Some(handle) = h.as_mut() else {
+        return into_owned_cstr("[]".into());
+    };
+    {
+        if handle.sink.borrow().http_server_replies.is_empty() {
+            return into_owned_cstr("[]".into());
+        }
+    }
+    let replies: Vec<serde_json::Value> =
+        std::mem::take(&mut handle.sink.borrow_mut().http_server_replies)
+            .into_iter()
+            .map(|(req_id, reply)| {
+                serde_json::json!({
+                    "req_id": req_id,
+                    "status": reply.status,
+                    "headers": reply
+                        .headers
+                        .iter()
+                        .map(|(n, v)| serde_json::json!([n, v]))
+                        .collect::<Vec<_>>(),
+                    "body": reply.body,
+                })
+            })
+            .collect();
+    into_owned_cstr(serde_json::Value::Array(replies).to_string())
 }
 
 /// Land the typed result of an off-tick `nx.http.fetch` (the `http_op` leg's reply, or the

@@ -77,6 +77,8 @@ mod inbound;
 mod lsp;
 #[cfg(feature = "native")]
 mod quic;
+#[cfg(feature = "native")]
+mod reconnect;
 // Un-gated: the materialize half + the wire decoder are shared by the native edit-host
 // and the wasm one (the browser fetches the bundle over WebTransport, then materializes
 // it into emscripten's in-memory FS exactly as the native client stages it on disk).
@@ -128,6 +130,10 @@ pub use daemon::{
     ReconnectHandle, ReconnectPolicy, RemoteConfig, RemoteFsJobs, RemoteHostFs, RemoteHostProc,
     RemoteHostTerm, RemoteHttp, RemoteLspTransport, WatchEvent,
 };
+/// The parsed `nx_session_reconnect` spec (§B): the client-persistent session-swap request
+/// both native front ends decode and act on. See [`reconnect`].
+#[cfg(feature = "native")]
+pub use reconnect::{ReconnectSpec, ReconnectTransport, SpawnCommand};
 /// Materialize a fetched bundle onto the per-process cache resolved from the environment
 /// (`$XDG_CACHE_HOME`/`$HOME`) — the native edit-host's entry point.
 #[cfg(feature = "native")]

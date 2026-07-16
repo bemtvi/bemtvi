@@ -41,7 +41,7 @@ mod test_runner;
 use nxvim_server::{
     bind_quic_listener, connect_daemon_reconnecting, connect_quic_reconnecting, mint_token,
     run as run_server, run_daemon_io as run_server_daemon_io, serve_quic, ConfigSource,
-    DaemonClient, ReconnectHandle, ReconnectPolicy, ServerInit,
+    DaemonClient, ReconnectHandle, ReconnectPolicy, ReconnectSpec, ReconnectTransport, ServerInit,
 };
 
 /// The shada-namespace + workspace options derived from the command line. The namespace
@@ -760,41 +760,141 @@ fn main() -> Result<()> {
 
     // The client (terminal UI) runs on the main thread; when it exits the dropped
     // stream signals the server to wind down, and a server-thread panic surfaces as
-    // exit 101 (see `drive_tui_and_join`).
-    drive_tui_and_join(client_end, server_thread)
+    // exit 101 (see `drive_tui_with_swaps`).
+    drive_tui_with_swaps(client_end, server_thread)
 }
 
-/// Run the terminal UI client on the main thread until it exits, then join the
-/// server thread. When the client exits, the dropped `client_end` stream signals
-/// the server to wind down. A server-thread failure is surfaced as a non-zero exit,
-/// taking precedence over a clean client `result`, since a crashed server is the
-/// more important failure: a *panic* exits 101 (Rust's conventional panic code), an
-/// `Err` return (a failed daemon connect, an edit-host setup error) exits 1 with the
-/// message on stderr. (The old code discarded both — a panic *or* error exited 0 and
-/// looked exactly like a clean `:q`.) Both checks run after the TUI has restored the
-/// terminal. Shared by the default and edit-host roles.
-fn drive_tui_and_join(
+/// Run the terminal UI client on the main thread until it exits, keeping the window across
+/// `nx.session.reconnect` swaps (§B), then join every server thread (the initial one plus
+/// each swap's). When the client exits, dropping its transport signals the server to wind
+/// down. A server-thread failure is surfaced as a non-zero exit, taking precedence over a
+/// clean client `result`, since a crashed server is the more important failure: a *panic*
+/// exits 101 (Rust's conventional panic code), an `Err` return (a failed daemon connect, an
+/// edit-host setup error) exits 1 with the message on stderr. Both checks run after the TUI
+/// has restored the terminal. Shared by the default and edit-host roles.
+fn drive_tui_with_swaps(
     client_end: tokio::io::DuplexStream,
     server_thread: std::thread::JoinHandle<Result<()>>,
 ) -> Result<()> {
+    use std::sync::{Arc, Mutex};
+
+    // Every server thread this window drives: the initial one, plus one per swap. Shared with
+    // the builder (which pushes each swap's) so we can join them all at teardown.
+    let threads: Arc<Mutex<Vec<std::thread::JoinHandle<Result<()>>>>> =
+        Arc::new(Mutex::new(vec![server_thread]));
+    let threads_for_build = threads.clone();
+    // The session builder the TUI swap loop calls on a `nx_session_reconnect`: parse the wire
+    // spec, bring up the new backend (blocking on its handshake, so a connect failure is an
+    // Err that leaves the current session intact), record its server thread, and hand back the
+    // new client transport.
+    let builder: nxvim_tui::SessionBuilder<tokio::io::DuplexStream> =
+        Arc::new(move |params: Vec<rmpv::Value>| {
+            // The builder serves both swap notifications (§B/§C). `nx_session_reconnect`
+            // sends a normalized spec MAP; `nx_connect_fallback` (a `:connect <url>` with no
+            // provider) sends the raw URL STRING — its default direct dial. Distinguish by
+            // the param's type, then bring up the backend the same way.
+            let param = params
+                .first()
+                .ok_or_else(|| anyhow!("session swap: missing spec/url"))?;
+            let spec = match param.as_str() {
+                Some(url) => ReconnectSpec::fallback_from_url(url)?,
+                None => ReconnectSpec::from_value(param)?,
+            };
+            let (stream, handle) = build_session_from_spec(spec)?;
+            threads_for_build.lock().unwrap().push(handle);
+            Ok(stream)
+        });
+
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_time()
         .build()?;
-    let result = runtime.block_on(nxvim_tui::run(client_end));
+    let result = runtime.block_on(nxvim_tui::run(client_end, builder));
 
-    match server_thread.join() {
-        Err(payload) => {
-            eprintln!(
-                "nxvim: server thread panicked: {}",
-                panic_message(payload.as_ref())
-            );
-            std::process::exit(101);
+    // Join every server thread. A panic / error takes precedence over the client result.
+    let handles: Vec<_> = std::mem::take(&mut *threads.lock().unwrap());
+    for handle in handles {
+        match handle.join() {
+            Err(payload) => {
+                eprintln!(
+                    "nxvim: server thread panicked: {}",
+                    panic_message(payload.as_ref())
+                );
+                std::process::exit(101);
+            }
+            Ok(Err(err)) => {
+                eprintln!("nxvim: {err:#}");
+                std::process::exit(1);
+            }
+            Ok(Ok(())) => {}
         }
-        Ok(Err(err)) => {
-            eprintln!("nxvim: {err:#}");
-            std::process::exit(1);
+    }
+    result
+}
+
+/// Build the daemon session a `nx.session.reconnect(spec)` requested (§B): the wire spec's
+/// transport chooses the dialer and `spec.config_source` (§D) drives config resolution. The
+/// system-plugin tier (§A) is re-seeded regardless (in [`spawn_edit_host_session`]). A
+/// swapped session is a plain (non-workspace) session — it does not inherit the launching
+/// session's workspace identity. **Blocking** on the handshake, so a failed provision/spawn
+/// is an `Err` the swap loop reports while leaving the current session intact.
+fn build_session_from_spec(
+    spec: ReconnectSpec,
+) -> Result<(tokio::io::DuplexStream, std::thread::JoinHandle<Result<()>>)> {
+    if spec.keep_buffers {
+        // The swap always brings up a fresh session (buffers come from the new backend);
+        // carrying local buffers across is not implemented. Say so loudly rather than
+        // dropping them silently.
+        bail!("nx.session.reconnect: keep_buffers = true is not supported yet");
+    }
+    let config_source = spec.config_source;
+    let shada = ShadaOpts {
+        namespace: None,
+        restore: false,
+        workspace: false,
+        workspace_dir: None,
+    };
+    match spec.transport {
+        ReconnectTransport::Spawn { command } => {
+            spawn_edit_host_session(None, shada, config_source, move || {
+                // Reconnecting stdio child running the spec's command (structured argv, or a
+                // `sh -c` line like `run_with_daemon`'s `$NXVIM_DAEMON_CMD`). The current child
+                // lives on the link thread; each (re)dial replaces + reaps it.
+                let slot: std::sync::Arc<std::sync::Mutex<Option<tokio::process::Child>>> =
+                    std::sync::Arc::new(std::sync::Mutex::new(None));
+                let make = move || {
+                    let slot = slot.clone();
+                    let command = command.clone();
+                    async move {
+                        let mut child = command
+                            .to_command()
+                            .stdin(Stdio::piped())
+                            .stdout(Stdio::piped())
+                            .stderr(daemon_log_stderr())
+                            .kill_on_drop(true)
+                            .spawn()?;
+                        let stdout = child.stdout.take().expect("daemon stdout piped");
+                        let stdin = child.stdin.take().expect("daemon stdin piped");
+                        *slot.lock().unwrap() = Some(child);
+                        Ok((stdout, stdin))
+                    }
+                };
+                let (client, handle) =
+                    connect_daemon_reconnecting(make, ReconnectPolicy::default())?;
+                Ok((client, Some(handle), Box::new(())))
+            })
         }
-        Ok(Ok(())) => result,
+        ReconnectTransport::Quic { addr } => {
+            let (url, cert_hash, token) = parse_connect_uri(&addr)?;
+            spawn_edit_host_session(None, shada, config_source, move || {
+                let (client, handle) = connect_quic_reconnecting(
+                    &url,
+                    &cert_hash,
+                    &token,
+                    ReconnectPolicy::default(),
+                )?;
+                Ok((client, Some(handle), Box::new(())))
+            })
+        }
     }
 }
 
@@ -951,13 +1051,10 @@ fn run_with_daemon_quic(
     })
 }
 
-/// The shared edit-host runtime: build the in-process editor↔TUI duplex, run the embedded
-/// server (with its host seams pointed at whatever `connect` returns) on its own thread,
-/// and drive the terminal UI on the main thread. `connect` runs inside the server runtime
-/// and yields the [`DaemonClient`] plus a guard kept alive for the whole session (the
-/// stdio child, so `kill_on_drop` reaps it on quit; `()` for QUIC). Config + plugins
-/// are fetched from the daemon and materialized locally (so the session runs the
-/// remote's config); the keystroke path stays local; fs/process/watch/LSP cross the wire.
+/// The shared edit-host runtime: spawn the server + drive the TUI. Delegates the session
+/// build to [`spawn_edit_host_session`] (blocking on the handshake) and then the swap-capable
+/// TUI driver. The editor keystroke path stays local; only fs/process/watch/LSP cross the
+/// wire, and config comes from `config_source` (the daemon's, or this machine's).
 fn run_edit_host_session<F>(
     file: Option<String>,
     shada: ShadaOpts,
@@ -972,115 +1069,188 @@ where
         )> + Send
         + 'static,
 {
-    let (server_end, client_end) = tokio::io::duplex(1 << 16);
+    let (client_end, server_thread) = spawn_edit_host_session(file, shada, config_source, connect)?;
+    // The client (terminal UI) runs on the main thread, exactly as the default role, and
+    // keeps the window across any `nx.session.reconnect` swap.
+    drive_tui_with_swaps(client_end, server_thread)
+}
 
-    let server_thread = std::thread::spawn(move || {
+/// Build the in-process editor↔TUI duplex, run the embedded server (host seams from
+/// `connect`) on its own thread, and **block until its daemon handshake + config resolution
+/// succeed** — so a connect failure is an `Err` HERE (before the UI starts, or before a swap
+/// commits), leaving any current session intact. Returns the client transport + the server
+/// thread handle (joined by the caller). `connect` runs inside the server runtime and yields
+/// the [`DaemonClient`] plus a guard kept alive for the whole session (the stdio child, so
+/// `kill_on_drop` reaps it on quit; `()` for QUIC). Shared by the startup daemon roles and
+/// the `nx.session.reconnect` swap builder ([`build_session_from_spec`]).
+fn spawn_edit_host_session<F>(
+    file: Option<String>,
+    shada: ShadaOpts,
+    config_source: ConfigSource,
+    connect: F,
+) -> Result<(tokio::io::DuplexStream, std::thread::JoinHandle<Result<()>>)>
+where
+    F: FnOnce() -> Result<(
+            DaemonClient,
+            Option<ReconnectHandle>,
+            Box<dyn std::any::Any + Send>,
+        )> + Send
+        + 'static,
+{
+    let (server_end, client_end) = tokio::io::duplex(1 << 16);
+    // Carries only the handshake/setup outcome back here; the thread then owns the duplex's
+    // server end + the daemon guard for the session's lifetime.
+    let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<()>>();
+    let server_thread = std::thread::spawn(move || -> Result<()> {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_io()
             .enable_time()
             .build()
             .expect("failed to build server runtime");
-        let result: Result<()> = runtime.block_on(async move {
-            let (client, daemon_link, _guard) = connect()?;
-            // Resolve the session's config from the chosen source. `Remote`
-            // (`--remote-config`) fetches the daemon's config surface (one `config_bundle`
-            // round trip) and materializes it onto a local per-process cache, then points
-            // `config_dir`/`runtimepath` at that copy — the editor loads the remote's
-            // config + plugins locally (Lua's synchronous `require`/runtimepath can't await
-            // the daemon, so the files must be local). `Local` (the default) runs this
-            // machine's own config and fetches only the daemon's cwd / parser set. Either
-            // way the cwd seeds `DirState` so `:pwd`/`:cd`/`getcwd` operate on the daemon's
-            // dir (`docs/plans/2026-06-23-remote-cwd.md`), and tree-sitter parsers are
-            // compiled locally on demand. A broken link or an unstageable cache is loud
-            // (the session can't run a config it couldn't resolve), not a silent fall back.
-            let resolved = client.config.resolve(config_source).await.map_err(|e| {
-                anyhow!("could not resolve the session config from the daemon: {e}")
-            })?;
-            // A `--workspace` daemon session derives its identity (shada namespace + root)
-            // from the *daemon's* cwd, now that we know it — the workspace lives on the
-            // remote machine. This fills `shada.namespace` (so the store below is keyed by
-            // the remote path, local OR remote) and the root surfaced to `nx.workspace`. A
-            // non-workspace launch / explicit `--shada-namespace` is left as-is.
-            let mut shada = shada;
-            shada.resolve_remote_workspace(resolved.remote_cwd.as_deref());
-            // Shada follows the config source. `Remote` keeps it on the daemon (Approach
-            // A): download its store into a local staging dir now (before `client.host_fs`
-            // is moved below) and sync it back after each flush. A download error disables
-            // remote shada — fall back to the local store rather than risk clobbering the
-            // daemon's copy with a fresh empty one. `Local` uses the local store as before
-            // (the `--shada-namespace` workspace store + session).
-            let (shada_store, remote_shada) = nxvim_server::resolve_session_shada(
-                &client.host_fs,
-                config_source,
-                resolved.state_dir.as_deref(),
-                shada.namespace(),
-                shada.store(),
-            )
-            .await;
-            let init = ServerInit {
-                file,
-                config_dir: resolved.config_dir,
-                shada: Some(shada_store),
-                // A remote/daemon session keeps the existing single-store behavior — the
-                // global history dual-write is native + local only.
-                global_shada: None,
-                remote_shada,
-                workspace_session: shada.capture(),
-                restore_session: shada.do_restore(),
-                session_save_layout: shada.session_save_layout(),
-                // The namespace + root reported by `nx.shada.namespace()` / `nx.workspace` —
-                // for a workspace daemon session these are the remote-cwd-derived values.
-                shada_namespace: shada.namespace().map(str::to_owned),
-                workspace_dir: shada.workspace_dir.clone(),
-                // A daemon session's workspace cd happens on the daemon (remote cwd); the
-                // local half never cds.
-                workspace_cwd: false,
-                runtimepath: resolved.runtimepath,
-                clipboard: nxvim_server::ClipboardProvider::System,
-                mouse_clock: None,
-                // The local disk is unused for buffers in a daemon session — every
-                // fs/process/LSP/Lua-fs path is routed to the daemon below.
-                host_fs: None,
-                host_proc: Some(Box::new(client.host_proc)),
-                host_fs_async: Some(Box::new(client.host_fs)),
-                lsp_transport: Some(Box::new(client.lsp_transport)),
-                // `:terminal` opens its PTY on the daemon (where the files are), not locally.
-                host_term: Some(client.host_term),
-                fs_jobs: Some(client.fs_jobs),
-                // Route `nx.http.fetch` to the daemon (which owns the network) over `http_op`.
-                http_jobs: Some(client.http),
-                // A daemon-backed session is still the interactive editor — offer the
-                // built-in default recommended set on first run, and enable
-                // command-line completion by default (a config's setup{} still wins).
-                offer_default_recommended: true,
-                // Seed the client-owned system-plugin tier into the daemon session too:
-                // system plugins load into the LOCAL VM via the local runtimepath (like the
-                // remote-aware plugin manager), so a connector persists across the reload.
-                system_plugins: nxvim_server::discover_system_plugins(),
-                cmdline_complete_default: true,
-                // Interactive: `print` shows on the message line, not stdout.
-                lua_stdio: false,
-                // Mirror the daemon's installed tree-sitter parsers locally.
-                ts_autoinstall: resolved.ts_autoinstall,
-                // Seed the working directory from the daemon (remote-cwd).
-                remote_cwd: resolved.remote_cwd,
-                // The TUI registers no client-intercepted virtual commands.
-                client_init_lua: None,
-                // The reconnecting daemon link (ssh/stdio) — its status flows into
-                // `nx.daemon.status()` and `:reconnect`/`:disconnect` drive it. `None` for a
-                // one-shot QUIC connect.
-                daemon_link,
-            };
-            // `_guard` (the stdio child, or `()` for QUIC) lives until the editor quits.
-            run_server(server_end, init).await
-        });
-        // Surfaced (message + non-zero exit) by `drive_tui_and_join` after the TUI
-        // has wound down and restored the terminal.
-        result.map_err(|err| anyhow!("edit-host error: {err}"))
+        runtime.block_on(async move {
+            // Connect + resolve config/shada + assemble the ServerInit. A failure is reported
+            // to the waiting caller via `ready_tx` (so it returns Err and keeps the current
+            // session) and ends the thread cleanly — the error is surfaced once, not again at
+            // join. `_guard` (the stdio child, or `()`) lives until the editor quits.
+            let (init, _guard) =
+                match assemble_edit_host_init(file, shada, config_source, connect).await {
+                    Ok(pair) => pair,
+                    Err(e) => {
+                        let _ = ready_tx.send(Err(e));
+                        return Ok(());
+                    }
+                };
+            if ready_tx.send(Ok(())).is_err() {
+                return Ok(()); // caller gave up waiting; nothing to serve
+            }
+            run_server(server_end, init)
+                .await
+                .map_err(|err| anyhow!("edit-host error: {err}"))
+        })
     });
 
-    // The client (terminal UI) runs on the main thread, exactly as the default role.
-    drive_tui_and_join(client_end, server_thread)
+    match ready_rx.recv() {
+        Ok(Ok(())) => Ok((client_end, server_thread)),
+        // The thread reported a handshake/setup failure and is winding down; join it and
+        // surface the error rather than returning a dead session.
+        Ok(Err(e)) => {
+            let _ = server_thread.join();
+            Err(e)
+        }
+        Err(_) => {
+            let _ = server_thread.join();
+            Err(anyhow!("edit-host server thread exited before connecting"))
+        }
+    }
+}
+
+/// Connect to the daemon, resolve the session config + shada from `config_source`, and
+/// assemble the [`ServerInit`] for an edit-host TUI session, returning it alongside the
+/// session guard (kept alive by the caller). Config + plugins are fetched from the daemon
+/// and materialized locally for `Remote`; the client-owned system-plugin tier (§A) is
+/// re-seeded either way. A broken link / unstageable cache is loud (the session can't run a
+/// config it couldn't resolve), not a silent fall back.
+async fn assemble_edit_host_init<F>(
+    file: Option<String>,
+    shada: ShadaOpts,
+    config_source: ConfigSource,
+    connect: F,
+) -> Result<(ServerInit, Box<dyn std::any::Any + Send>)>
+where
+    F: FnOnce() -> Result<(
+        DaemonClient,
+        Option<ReconnectHandle>,
+        Box<dyn std::any::Any + Send>,
+    )>,
+{
+    let (client, daemon_link, guard) = connect()?;
+    // Resolve the session's config from the chosen source. `Remote` (`--remote-config`)
+    // fetches the daemon's config surface (one `config_bundle` round trip) and materializes
+    // it onto a local per-process cache, then points `config_dir`/`runtimepath` at that copy
+    // — the editor loads the remote's config + plugins locally (Lua's synchronous
+    // `require`/runtimepath can't await the daemon, so the files must be local). `Local` (the
+    // default) runs this machine's own config and fetches only the daemon's cwd / parser set.
+    // Either way the cwd seeds `DirState` so `:pwd`/`:cd`/`getcwd` operate on the daemon's dir
+    // (`docs/plans/2026-06-23-remote-cwd.md`), and tree-sitter parsers are compiled locally on
+    // demand.
+    let resolved = client
+        .config
+        .resolve(config_source)
+        .await
+        .map_err(|e| anyhow!("could not resolve the session config from the daemon: {e}"))?;
+    // A `--workspace` daemon session derives its identity (shada namespace + root) from the
+    // *daemon's* cwd, now that we know it — the workspace lives on the remote machine. A
+    // non-workspace launch / explicit `--shada-namespace` is left as-is.
+    let mut shada = shada;
+    shada.resolve_remote_workspace(resolved.remote_cwd.as_deref());
+    // Shada follows the config source. `Remote` keeps it on the daemon (Approach A):
+    // download its store into a local staging dir now (before `client.host_fs` is moved
+    // below) and sync it back after each flush. A download error disables remote shada —
+    // fall back to the local store rather than clobber the daemon's copy. `Local` uses the
+    // local store (the `--shada-namespace` workspace store + session).
+    let (shada_store, remote_shada) = nxvim_server::resolve_session_shada(
+        &client.host_fs,
+        config_source,
+        resolved.state_dir.as_deref(),
+        shada.namespace(),
+        shada.store(),
+    )
+    .await;
+    let init = ServerInit {
+        file,
+        config_dir: resolved.config_dir,
+        shada: Some(shada_store),
+        // A remote/daemon session keeps the existing single-store behavior — the
+        // global history dual-write is native + local only.
+        global_shada: None,
+        remote_shada,
+        workspace_session: shada.capture(),
+        restore_session: shada.do_restore(),
+        session_save_layout: shada.session_save_layout(),
+        // The namespace + root reported by `nx.shada.namespace()` / `nx.workspace` —
+        // for a workspace daemon session these are the remote-cwd-derived values.
+        shada_namespace: shada.namespace().map(str::to_owned),
+        workspace_dir: shada.workspace_dir.clone(),
+        // A daemon session's workspace cd happens on the daemon (remote cwd); the
+        // local half never cds.
+        workspace_cwd: false,
+        runtimepath: resolved.runtimepath,
+        clipboard: nxvim_server::ClipboardProvider::System,
+        mouse_clock: None,
+        // The local disk is unused for buffers in a daemon session — every
+        // fs/process/LSP/Lua-fs path is routed to the daemon below.
+        host_fs: None,
+        host_proc: Some(Box::new(client.host_proc)),
+        host_fs_async: Some(Box::new(client.host_fs)),
+        lsp_transport: Some(Box::new(client.lsp_transport)),
+        // `:terminal` opens its PTY on the daemon (where the files are), not locally.
+        host_term: Some(client.host_term),
+        fs_jobs: Some(client.fs_jobs),
+        // Route `nx.http.fetch` to the daemon (which owns the network) over `http_op`.
+        http_jobs: Some(client.http),
+        // A daemon-backed session is still the interactive editor — offer the
+        // built-in default recommended set on first run, and enable
+        // command-line completion by default (a config's setup{} still wins).
+        offer_default_recommended: true,
+        // Seed the client-owned system-plugin tier into the daemon session too:
+        // system plugins load into the LOCAL VM via the local runtimepath (like the
+        // remote-aware plugin manager), so a connector persists across the reload.
+        system_plugins: nxvim_server::discover_system_plugins(),
+        cmdline_complete_default: true,
+        // Interactive: `print` shows on the message line, not stdout.
+        lua_stdio: false,
+        // Mirror the daemon's installed tree-sitter parsers locally.
+        ts_autoinstall: resolved.ts_autoinstall,
+        // Seed the working directory from the daemon (remote-cwd).
+        remote_cwd: resolved.remote_cwd,
+        // The TUI registers no client-intercepted virtual commands.
+        client_init_lua: None,
+        // The reconnecting daemon link (ssh/stdio) — its status flows into
+        // `nx.daemon.status()` and `:reconnect`/`:disconnect` drive it. `None` for a
+        // one-shot QUIC connect.
+        daemon_link,
+    };
+    Ok((init, guard))
 }
 
 /// Parse a `nxvim://HOST:PORT/TOKEN?cert=HASH` connect URI into the pieces

@@ -365,4 +365,93 @@ function nx._set_daemon_status(phase)
   nx.autocmd.exec("User", { pattern = "DaemonStatusChanged" })
 end
 
+-- nx.session.* — the client-persistent session swap ("reload window"): tear down the
+-- server/VM behind this window and bring up a new one against a different backend, keeping
+-- the window alive. A plugin (e.g. a remote connector) calls this from inside the running
+-- VM once it has resolved a transport; the client (TUI/GUI) performs the actual reload. See
+-- docs/plans/2026-07-05-remote-connectors-and-system-plugins.md → §B.
+nx.session = nx.session or {}
+
+-- `nx.session.reconnect(spec)` — swap the current client onto `spec`. `spec` is:
+--   {
+--     transport = { kind = "spawn", argv = { "ssh", "host", "nxvim", "--daemon" } }
+--                                                              -- structured, no shell
+--              or { kind = "spawn", cmd = "ssh host nxvim --daemon" }  -- `sh -c` line
+--              or { kind = "quic",  addr = "nxvim://host:port/token?cert=…" },
+--     config_source = "remote" | "local",   -- optional; default "remote" (§D)
+--     keep_buffers  = true | false,         -- optional; default false
+--   }
+-- `config_source` (§D) picks whose config the swapped session runs, independent of the
+-- transport: `"remote"` (default) materializes the daemon's config + plugins locally and
+-- keeps shada on the daemon; `"local"` keeps THIS machine's `init.lua` / plugins and the
+-- daemon backs only the fs / process / LSP seams (the dev-container shape — local editor
+-- settings, the container's toolchain). Either way the client-owned system-plugin tier (§A)
+-- is re-seeded, so a connector persists across the swap regardless. `"merged"` (local UI
+-- config layered over the remote's project config) is RESERVED but not implemented yet — it
+-- fails loud rather than silently picking one side.
+--
+-- Prefer `argv` (a list run WITHOUT a shell, so nothing can be smuggled through shell
+-- metacharacters); `cmd` is the `sh -c` convenience for ssh/docker one-liners (as safe as
+-- its origin — this runs in the LOCAL VM, which already has arbitrary execution). The client
+-- carries the system-plugin tier (§A) forward across the swap and feeds the command into the
+-- reconnecting dialer so a dropped link re-runs it. Fails LOUD on a malformed spec (a bad
+-- transport is a bug, not a silent no-op); a provisioning / spawn FAILURE surfaces later and
+-- leaves the current session intact (the client resolves fully, then swaps). Returns nothing.
+function nx.session.reconnect(spec)
+  if type(spec) ~= "table" then
+    error("nx.session.reconnect: spec must be a table", 2)
+  end
+  local t = spec.transport
+  if type(t) ~= "table" then
+    error("nx.session.reconnect: spec.transport must be a table", 2)
+  end
+  if t.kind == "spawn" then
+    local has_argv = type(t.argv) == "table" and #t.argv > 0
+    local has_cmd = type(t.cmd) == "string" and t.cmd ~= ""
+    if not has_argv and not has_cmd then
+      error(
+        'nx.session.reconnect: a "spawn" transport needs a non-empty `argv` list or `cmd` string',
+        2
+      )
+    end
+    if type(t.argv) == "table" then
+      for _, a in ipairs(t.argv) do
+        if type(a) ~= "string" then
+          error("nx.session.reconnect: spawn `argv` entries must be strings", 2)
+        end
+      end
+    end
+  elseif t.kind == "quic" then
+    if type(t.addr) ~= "string" or t.addr == "" then
+      error('nx.session.reconnect: a "quic" transport needs a non-empty `addr` string', 2)
+    end
+  else
+    error(
+      'nx.session.reconnect: transport.kind must be "spawn" or "quic", got ' .. tostring(t.kind),
+      2
+    )
+  end
+  local cs = spec.config_source
+  if cs == "merged" then
+    -- Reserved (§D): local UI config layered over the remote's project config. Not built
+    -- yet — fail loud rather than silently falling back to "remote" or "local".
+    error(
+      'nx.session.reconnect: config_source "merged" is not implemented yet — use "remote" or "local"',
+      2
+    )
+  elseif cs ~= nil and cs ~= "remote" and cs ~= "local" then
+    error(
+      'nx.session.reconnect: config_source must be "remote" or "local", got ' .. tostring(cs),
+      2
+    )
+  end
+  -- Normalize into the wire form the client parses (only the known fields, defaults filled),
+  -- so a stray key in the caller's table never reaches the transport builder.
+  nx._session_reconnect({
+    transport = { kind = t.kind, argv = t.argv, cmd = t.cmd, addr = t.addr },
+    config_source = cs or "remote",
+    keep_buffers = spec.keep_buffers == true,
+  })
+end
+
 return nx

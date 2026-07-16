@@ -1,6 +1,6 @@
 # Remote connectors + system-plugin tier: VS Code-style "install a connector, reload onto the remote"
 
-**Status:** planned · **Date:** 2026-07-05
+**Status:** ✅ complete (Phases 1–5; `merged` config-source deferred) · **Date:** 2026-07-05
 
 ## Goal
 
@@ -182,17 +182,21 @@ The Lua surface the connector uses.
 - `nx.connect.register(scheme_or_matcher, resolver)` — register an async resolver
   keyed by URL scheme (or a host-pattern matcher). Lives in a system plugin so it is
   registered before any `:connect`.
-- `:connect <url>` (now live in both clients) routes through the local VM: the
-  client sends a **resolve-connect** request → the matching resolver runs (async,
-  may provision, may stream progress) → returns a **transport spec** → the client
-  performs the swap (§B). With no matching provider, `:connect` falls back to
-  today's direct dial (QUIC URI / bare `connect_daemon`), so nothing regresses.
+- `:connect <url>` (now live in both clients) is a **real ex-command that runs in the
+  local VM** (not client-intercepted): it calls `nx.connect.connect(url)`, the matching
+  resolver runs (async, may provision, may stream progress) → returns a **transport spec**
+  → the VM swaps via `nx.session.reconnect` (§B). *As built:* routing lives in the VM rather
+  than in a client resolve-request round-trip, so both front ends share one path and the
+  command gets normal completion / history. With **no matching provider**, the VM pushes a
+  `nx_connect_fallback` notification carrying the raw URL, and the client runs its own
+  built-in direct dial (QUIC URI / ssh host) — the GUI keeps its `SSH_ASKPASS` path, so
+  nothing regresses.
 - `nx.session.reconnect(spec)` — the imperative form: a plugin swaps the current
   client to `spec` directly (skipping URL routing), e.g. after building a container.
   This is what the connector calls once provisioning is done.
-- **Progress.** The resolver may emit progress (`nx.notify` / a dedicated progress
-  channel) — "detecting arch… installing binary… starting daemon…" — carried on the
-  resolve round-trip so the user sees the bootstrap.
+- **Progress.** The resolver may emit progress (`nx.notify`) — "detecting arch… installing
+  binary… starting daemon…" — shown on the message line as it runs in the VM, so the user
+  sees the bootstrap.
 
 ### D. Config-source policy after the swap
 
@@ -207,7 +211,7 @@ local editor settings + the container's toolchain. Make it a knob on the swap:
 - Independent of config source, the **system tier is always the client's** (§A), so
   the connector persists regardless.
 
-### E. The `remote-containers` connector (first consumer)
+### E. The `nxvim-remotes` connector (first consumer)
 
 A pure-Lua system plugin proving the stack end-to-end:
 
@@ -253,26 +257,121 @@ Each phase is committed and paused for review before the next
   default-empty set, config module shadows a same-named system module, sourced
   exactly once) + `tests/plugins.rs` (`nx.plugins.system`/`promote` clone into the
   system dir and load; unknown-plugin promote rejects).
-- **Phase 2 — Client-persistent, Lua-triggerable swap (§B).** The
-  `nx_session_reconnect` control message, the shared client swap routine (GUI
-  generalized + TUI taught), carrying `system_plugins` forward and feeding
-  `connect_daemon_reconnecting`. Test: a driven swap between two local `--daemon`
-  targets keeps the window and reloads.
-- **Phase 3 — `nx.connect` + `nx.session.reconnect` (§C).** Provider registry,
-  live `:connect` routing through the local VM with fallback, progress on the
-  resolve round-trip.
-- **Phase 4 — Config-source policy (§D).** `config_source = remote|local` on the
-  spec (merged deferred).
-- **Phase 5 — `remote-containers` connector (§E).** The connector plugin (in
-  `~/work/nxvim-plugins/remote-containers`), long-lived proc handles, an example
-  under `examples/`, hermetic tests using a local `nxvim --daemon` as the "remote."
+- **Phase 2 — Client-persistent, Lua-triggerable swap (§B).**
+  - **2a — control-message seam. ✅ DONE.** `nx.session.reconnect(spec)` (prelude
+    `nx.lua`, fail-loud spec validation + normalization) → a `session_reconnects`
+    bucket on the Lua `Shared` store (`nx._session_reconnect`, `take_session_reconnects`)
+    → drained in `apply_lua_effects` into a `fx.notify("nx_session_reconnect", [spec])`
+    client notification (the spec rides verbatim as an `rmpv::Value`; the server/Lua
+    stay agnostic to transport semantics). Test: `tests/session_reconnect.rs` (the
+    notification fires with the normalized spawn/quic spec + defaults; a malformed spec
+    fails loud and emits nothing).
+  - **2b — client swap consumers. ✅ DONE (needs manual verification).** Shared spec
+    parser `nxvim_server::ReconnectSpec::from_value` (`reconnect.rs`) — the wire form
+    both front ends decode. **GUI:** a `nx_session_reconnect` arm in the IO swap loop
+    (`nxvim-gui/lib.rs`) builds the session from the spec (`session::spawn_session_from_spec`)
+    and reuses the existing teardown+re-attach. **TUI:** `nxvim-tui::run` gains a swap
+    loop that keeps the terminal up across swaps; `event_loop` returns an `Outcome`
+    (`Exit`/`Swap`), builds the new backend off the event loop (so the current session
+    keeps rendering; failure is reported and leaves it intact — no half-swap), and
+    forwards the raw spec params to a builder the binary supplies. **Binary:**
+    `drive_tui_with_swaps` + `build_session_from_spec` + a factored
+    `spawn_edit_host_session`/`assemble_edit_host_init` (blocks on the handshake, so a
+    connect failure is loud and non-committing), carrying `system_plugins` forward and
+    feeding `cmd`/`addr` into `connect_daemon_reconnecting`/`connect_quic_reconnecting`.
+    Both fire on `nx_session_reconnect`; `keep_buffers = true` is rejected loudly (not
+    yet implemented — the swap starts fresh from the new backend). A `spawn` transport
+    accepts a structured `argv = {…}` (run without a shell — `SpawnCommand::Argv`, the
+    preferred form) or a `cmd` shell line (`sh -c`, `SpawnCommand::Shell`, mirroring
+    `NXVIM_DAEMON_CMD` for ssh/docker one-liners). Client code, not
+    harness-testable (the GUI is not screencapturable) → **verify by driving the real
+    binaries**: from a running session, `:lua nx.session.reconnect{ transport = { kind
+    = "spawn", cmd = "<path>/nxvim --daemon" } }` should keep the window and reload onto
+    the daemon-backed session.
+- **Phase 3 — `nx.connect` + `nx.session.reconnect` (§C). ✅ DONE (client swap needs
+  manual verification).** The provider registry + `:connect` routing live in a new
+  prelude module (`prelude/connect.lua`, loaded after `nx.lua`): `nx.connect.register(
+  scheme_or_matcher, resolver)` (a scheme string or a `fn(url)->bool` matcher; the resolver
+  returns a spec or a **promise** of one and may `nx.notify` progress), `nx.connect._resolve`
+  (newest-registration-wins scan), and `nx.connect.connect(url)` — the entry point behind a
+  real `:connect` ex-command that routes **through the VM**. A matching resolver runs via
+  `nx.promise.try` (sync return / async promise / thrown error all fold into one chain) and
+  its spec swaps the window through the existing `nx.session.reconnect` seam (§B); with **no
+  provider**, `nx._connect_fallback(url)` queues a new `connect_fallbacks` bucket
+  (`runtime.rs`/`install.rs`) drained in `effects.rs` into a `nx_connect_fallback` client
+  notification carrying the raw URL, so each front end keeps its **own** built-in direct
+  dial. **GUI:** `:connect` dropped from `CLIENT_INIT_LUA` + the client-side cmdline intercept
+  (now a real VM command); a `nx_connect_fallback` arm dials via the pre-existing
+  `spawn_session` path (so the `SSH_ASKPASS` dialog is preserved), parsing with the extracted
+  `remote::connect_target`. **TUI:** gains `:connect` for free; a `nx_connect_fallback` arm
+  forwards to the same builder, which disambiguates a fallback URL (a string →
+  `ReconnectSpec::fallback_from_url`: `nxvim://` QUIC / `[user@]host[:port]` ssh argv, `-`
+  host + remote-file + unknown-scheme rejected loud) from a `nx.session.reconnect` spec (a
+  map). Tests: `nxvim-server/tests/connect.rs` (sync + async resolver → `nx_session_reconnect`;
+  no-provider + real `:connect` → `nx_connect_fallback`; a failing resolver swaps nothing;
+  the `fallback_from_url` parser). Example: `examples/connect/` (a `demo://` connector onto a
+  local `nxvim --daemon`). Client swap is client code (not harness-testable) → verify by
+  driving the real binaries: with the example config, `:connect demo://here` should reload the
+  window onto the daemon-backed session (`:lua print(nx.daemon.status())` → `"connected"`).
+- **Phase 4 — Config-source policy (§D). ✅ DONE (merged deferred).** The
+  `config_source = remote|local` **mechanism already landed** across Phase 2b + the
+  remote-config plan (`2026-06-26-remote-config-and-shada-choice.md`): the swap spec's
+  `config_source` threads through both client builders (TUI `assemble_edit_host_init`, GUI
+  `server_init`) into `RemoteConfig::resolve(config_source)`, which for `Remote` fetches +
+  materializes the daemon's config/plugins (and keeps shada on the daemon) and for `Local`
+  runs `default_runtime()` + local shada, fetching only the daemon's cwd / parser set
+  (`daemon.rs` `resolve`: `.fetch(matches!(source, Remote))`). Independent of the source, both
+  builders re-seed the client-owned system-plugin tier (§A) — `system_plugins:
+  discover_system_plugins()` — so a connector persists across the swap regardless. This phase
+  closes it out: a resolver's spec `config_source` (§C) is carried through to the swap; the
+  deferred **`"merged"`** value is now RESERVED and fails loud (a targeted "not implemented
+  yet" at both the Lua `nx.session.reconnect` seam and `ReconnectSpec::from_value`) rather than
+  silently picking a side; and the docs (`nx.session.reconnect` / `nx.connect.register`
+  docstrings) spell out the remote/local/merged semantics. Tests:
+  `tests/connect.rs::a_resolver_can_pick_the_config_source` (a resolver's `config_source =
+  "local"` rides through to `nx_session_reconnect`) + `tests/session_reconnect.rs::
+  config_source_merged_is_reserved_and_fails_loud`. (Honoring `Local` vs `Remote` config
+  resolution is the daemon-config leg, covered by `tests/remote_config.rs`.)
+- **Phase 5 — `nxvim-remotes` connector (§E). ✅ DONE.** The connector plugin
+  lives in its own repo `~/work/nxvim-plugins/nxvim-remotes` (renamed from
+  `nxvim-remote-containers` — it does ssh hosts too, not just containers; pure Lua, built on
+  the public seams). It registers `nx.connect` providers for `container://` (docker exec) and
+  `ssh://` (multiplexed) in its `plugin/` script; on invoke it provisions FROM THE LOCAL
+  MACHINE over the **public local-always seam** delivered in Phase 5a (`nx.run_local` /
+  `nx.fs_local` / `nx.http.fetch_local`): detects the remote's arch/OS (`uname -sm`, doubling
+  as a reachability check), resolves the nxvim daemon command (assume it's on the remote PATH,
+  or fetch the matching release binary to a local cache + `docker cp`/`scp` in + `chmod`), and
+  returns a structured-argv spawn transport with `config_source` (§D). Progress rides
+  `nx.notify`. Layout: `lua/nxvim-remotes/{init,provision,backends}.lua` (a
+  backend-agnostic engine + per-transport descriptors), `plugin/`, `examples/init.lua`,
+  README.
+  - **Long-lived proc handle — not needed.** The plan expected a new core primitive for the
+    ssh control-master; instead the connector uses ssh's own multiplexing (`ControlMaster=auto`
+    + a per-host `ControlPath` + `ControlPersist`): the master is created by the first call,
+    reused by the daemon spawn + every reconnect, and self-expires. `:RemoteContainersClean` /
+    `M.disconnect` close masters via `ssh -O exit`, keyed by on-disk `.host` sidecars that
+    survive a session swap (Lua state doesn't). So no long-lived-local-process API was added.
+  - **Tests (hermetic, `nxvim --test-plugin .` → 19 passed):** `backends_spec` (URL parsing +
+    argv for docker/ssh, option-injection rejection, control-master options), `provision_spec`
+    (platform mapping + release-URL template), `resolve_spec` (the full resolve flow against a
+    fake `docker` /bin/sh script — arch detect, spawn spec, `config_source`, unreachable → loud,
+    install-policy reuse). No Docker / network / host. Verified end-to-end that
+    `:connect container://<name>` routes through `nx.connect` to `nx.session.reconnect` with the
+    right spawn spec.
+- **Phase 5a — public local-always seam (prerequisite for Phase 5). ✅ DONE.** Exposed
+  `nx.run_local` / `nx.fs_local` (twins of `nx.run` / `nx.fs`, forced onto the client machine;
+  `nx.http.fetch_local` already existed) as a public prelude module (`localseam.lua`), so
+  connectors — and the plugin manager, which now dogfoods them — share one surface instead of
+  the manager's old privates. Tests: `nxvim-server/tests/local_seam.rs`.
 
 ## Open decisions
 
 - **System dir location** — `$NXVIM_DATA/system/` vs `$NXVIM_CONFIG/system/`. Lean
   DATA (managed artifacts, not hand-edited config).
-- **Config `merged` semantics** — deferred; spec the seam in Phase 4, implement
-  later once a concrete need exists.
+- **Config `merged` semantics** — seam specced in Phase 4 (the value is reserved and
+  fails loud at the `nx.session.reconnect` / wire boundary, with the intended "local UI
+  config over the remote's project config" semantics documented). Implementation still
+  deferred until a concrete need exists.
 - **First-run install of the connector** — leave it a pure user install
   (`nx.plugins.system{...}`), or have the interactive binary offer to clone it into
   the system dir on first run (like the recommended-set welcome). Lean user-install

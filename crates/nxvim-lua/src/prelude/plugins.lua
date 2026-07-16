@@ -57,72 +57,14 @@ M._watchers = M._watchers or {} -- on_change callbacks, fired on any state trans
 -- Runtime plugin code is untouched: a loaded plugin's own `nx.fs` / `nx.run` still route to
 -- the session (remote), because it edits the remote's files. See
 -- docs/plans/2026-07-03-remote-aware-plugin-manager.md.
-local function local_fs_op(job)
-  return nx.promise.new(function(resolve, reject)
-    local id = nx._next_cb_id()
-    nx._cb_fns[id] = function(err, value)
-      if err ~= nil then
-        reject(err)
-      else
-        resolve(value)
-      end
-    end
-    nx._local_fs_op(job, id)
-  end)
-end
-
--- The subset of `nx.fs` the manager uses, forced onto the local disk. Same job shapes and
--- promise contract as `nx.fs.*` (see prelude/fs.lua) — only the routing differs.
-local lfs = {
-  exists = function(path)
-    return local_fs_op({ op = "exists", path = path })
-  end,
-  readdir = function(path)
-    return local_fs_op({ op = "readdir", path = path })
-  end,
-  read_text = function(path)
-    return local_fs_op({ op = "read_text", path = path })
-  end,
-  write = function(path, data)
-    return local_fs_op({ op = "write", path = path, data = data })
-  end,
-  append = function(path, data)
-    return local_fs_op({ op = "append", path = path, data = data })
-  end,
-  mkdir = function(path, opts)
-    return local_fs_op({ op = "mkdir", path = path, recursive = opts and opts.recursive or false })
-  end,
-  remove = function(path, opts)
-    return local_fs_op({ op = "remove", path = path, recursive = opts and opts.recursive or false })
-  end,
-}
-
--- The local twin of `nx.run` (one-shot child, resolves { code, stdout, stderr }) — the
--- manager's git runs on the local host so a clone lands on the local disk.
-local function local_run(spec)
-  return nx.promise.new(function(resolve)
-    local id = nx._next_cb_id()
-    nx._cb_fns[id] = function(result)
-      resolve({
-        code = result.code,
-        stdout = result.stdout or "",
-        stderr = result.stderr or "",
-      })
-    end
-    local cmd = spec.cmd
-    if type(cmd) == "string" then
-      cmd = { cmd }
-    end
-    local argv = {}
-    for _, c in ipairs(cmd) do
-      argv[#argv + 1] = c
-    end
-    for _, a in ipairs(spec.args or {}) do
-      argv[#argv + 1] = a
-    end
-    nx._local_system_async(id, argv, spec.cwd, spec.env, spec.stdin)
-  end)
-end
+-- The manager's fs + proc use the public LOCAL-ALWAYS seam (prelude/localseam.lua):
+-- `nx.fs_local` / `nx.run_local`, the twins of `nx.fs` / `nx.run` forced onto the client
+-- disk. A plugin loads into THIS (local) Lua VM via the local runtimepath, so the manager
+-- must clone / discover / source locally even in a daemon session (the session's `nx.fs` /
+-- `nx.run` route to the *remote*, where the plugin would be cloned but never loaded). Runtime
+-- plugin code that edits the remote's files still uses the session-routed `nx.fs` / `nx.run`.
+local lfs = nx.fs_local
+local local_run = nx.run_local
 
 -- Fire every change watcher (a load completing, a task transitioning). Wrapped in
 -- pcall so one bad observer can't break the manager. The UI uses this to re-render.

@@ -150,13 +150,36 @@ impl<W: Write> Drop for BracketedPaste<W> {
     }
 }
 
-/// Run the client over a connected stream until the server exits or disconnects.
+/// Builds a replacement backend for a `nx.session.reconnect` swap (§B). The swap loop
+/// hands it the raw `nx_session_reconnect` params and gets back the client-side transport
+/// of a fresh session (same stream type). The binary provides it — it owns session +
+/// server-thread lifecycle — so the TUI stays agnostic to the transport and spec shape,
+/// forwarding the params verbatim. Runs on the blocking pool (the handshake can take
+/// seconds), so the current session keeps rendering while it builds.
+pub type SessionBuilder<S> = std::sync::Arc<dyn Fn(Vec<Value>) -> Result<S> + Send + Sync>;
+
+/// What [`event_loop`] reports back to the swap loop in [`run`].
+enum Outcome<S> {
+    /// The server asked the UI to exit, or the connection closed.
+    Exit,
+    /// A `nx.session.reconnect` build succeeded — re-attach onto this new transport,
+    /// keeping the terminal (the "reload window").
+    Swap(S),
+}
+
+/// Run the client, keeping the window across `nx.session.reconnect` swaps (§B).
 ///
-/// ratatui's `init`/`restore` own raw mode and the alternate screen (and a panic
-/// hook that restores the terminal), so the user's shell is never left broken.
-/// Mouse capture is ours to manage — a [`MouseCapture`] guard disables it on
-/// drop so even a panic in the event loop can't leave mouse reporting on.
-pub async fn run<S>(stream: S) -> Result<()>
+/// The terminal (raw mode, alternate screen, mouse capture, the panic-restore hook) is set
+/// up ONCE here and reused across swaps, so a reload onto a new backend never tears the
+/// screen down. The inner [`event_loop`] runs on the current transport until the server
+/// exits or a swap build succeeds; on a swap we re-attach onto the new transport (the old
+/// one drops, winding its server down). `build` brings up the replacement session.
+///
+/// ratatui's `init`/`restore` own raw mode and the alternate screen (and a panic hook that
+/// restores the terminal), so the user's shell is never left broken. Mouse capture is ours
+/// to manage — a [`MouseCapture`] guard disables it on drop so even a panic in the event
+/// loop can't leave mouse reporting on.
+pub async fn run<S>(initial: S, build: SessionBuilder<S>) -> Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
@@ -176,7 +199,16 @@ where
     let cursor = CursorStyleGuard::new(std::io::stdout());
     // Receive a paste as one event instead of one keystroke per character.
     let paste = BracketedPaste::enable(std::io::stdout());
-    let result = event_loop(stream, &mut terminal).await;
+    // Swap loop: re-attach onto each new transport a session-reconnect delivers, keeping
+    // the terminal up. Exit / a fatal error ends it.
+    let mut stream = initial;
+    let result = loop {
+        match event_loop(stream, &mut terminal, build.clone()).await {
+            Ok(Outcome::Exit) => break Ok(()),
+            Ok(Outcome::Swap(next)) => stream = next,
+            Err(e) => break Err(e),
+        }
+    };
     // Restore terminal modes before leaving the alternate screen.
     drop(cursor); // reset cursor shape
     drop(paste); // disable bracketed paste
@@ -185,13 +217,21 @@ where
     result
 }
 
-async fn event_loop<S>(stream: S, terminal: &mut DefaultTerminal) -> Result<()>
+async fn event_loop<S>(
+    stream: S,
+    terminal: &mut DefaultTerminal,
+    build: SessionBuilder<S>,
+) -> Result<Outcome<S>>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
     let size = terminal.size()?;
     let (reader, writer) = tokio::io::split(stream);
     let (rpc, mut incoming) = connect(reader, writer);
+
+    // A `nx.session.reconnect` build (spawned on the blocking pool) delivers its result
+    // here — `Ok(stream)` to swap onto, or `Err` to report and keep the current session.
+    let (built_tx, mut built_rx) = tokio::sync::mpsc::unbounded_channel::<Result<S>>();
 
     // Fail loud if the attach itself fails (a broken transport / a server-side
     // error): swallowing it would leave the client running unattached — it would
@@ -334,7 +374,7 @@ where
                     _ => {}
                 },
                 Some(Ok(_)) => {}
-                Some(Err(_)) | None => break,
+                Some(Err(_)) | None => return Ok(Outcome::Exit),
             },
             message = incoming.recv() => match message {
                 Some(Incoming::Notification { method, params }) => match method.as_str() {
@@ -350,11 +390,47 @@ where
                             cursor_shape = Some(want);
                         }
                     }
-                    "nxvim_exit" => break,
+                    "nxvim_exit" => return Ok(Outcome::Exit),
+                    // `nx.session.reconnect(spec)` from inside the VM (§B): bring up the new
+                    // backend OFF the event loop (the handshake can take seconds) so this
+                    // session keeps rendering meanwhile; the result arrives on `built_rx`.
+                    // The spec params are forwarded verbatim to the binary's builder.
+                    "nx_session_reconnect" => {
+                        let build = build.clone();
+                        let tx = built_tx.clone();
+                        tokio::task::spawn_blocking(move || {
+                            let _ = tx.send(build(params));
+                        });
+                    }
+                    // `:connect <url>` with no matching connect-provider (§C): the raw URL
+                    // rides as the single param. Forwarded verbatim to the SAME builder — it
+                    // distinguishes a fallback URL (a string) from a `nx.session.reconnect`
+                    // spec (a map) and dials it directly (nxvim:// / ssh host). Built off the
+                    // event loop so this session keeps rendering while the handshake runs.
+                    "nx_connect_fallback" => {
+                        let build = build.clone();
+                        let tx = built_tx.clone();
+                        tokio::task::spawn_blocking(move || {
+                            let _ = tx.send(build(params));
+                        });
+                    }
                     _ => {}
                 },
                 Some(Incoming::Request { id, .. }) => rpc.respond(id, Ok(Value::Nil)),
-                None => break,
+                None => return Ok(Outcome::Exit),
+            },
+            // A session-reconnect build finished. On success, swap onto the new transport
+            // (this session's `rpc`/`incoming` drop as we return, winding its server down);
+            // on failure, keep the current session and report why — no half-swap.
+            built = built_rx.recv() => match built {
+                Some(Ok(next)) => return Ok(Outcome::Swap(next)),
+                Some(Err(e)) => {
+                    let line = format!("session reconnect failed: {e:#}")
+                        .replace('\n', "; ")
+                        .replace('\'', "''");
+                    rpc.notify("nx_command", vec![Value::from(format!("echoerr '{line}'"))]);
+                }
+                None => {} // `built_tx` is held above; unreachable
             },
             // Animation frame tick (~60fps). Disabled when nothing is animating,
             // so the future is never even created in the idle case.
@@ -411,8 +487,6 @@ where
             },
         }
     }
-
-    Ok(())
 }
 
 /// Text-area height = terminal height minus the chrome rows we render ourselves.

@@ -16,7 +16,8 @@ use std::thread::JoinHandle;
 use anyhow::{anyhow, Result};
 use nxvim_server::{
     connect_daemon_reconnecting, connect_quic_reconnecting, run as run_server, ClipboardProvider,
-    ConfigSource, DaemonClient, ReconnectHandle, ReconnectPolicy, ServerInit,
+    ConfigSource, DaemonClient, ReconnectHandle, ReconnectPolicy, ReconnectSpec,
+    ReconnectTransport, ServerInit,
 };
 use tokio::io::DuplexStream;
 
@@ -132,6 +133,59 @@ pub fn spawn_stdio_daemon_session(
         let (client, handle) = connect_daemon_reconnecting(make, ReconnectPolicy::default())?;
         Ok((Some(client), Some(handle), no_guard()))
     })
+}
+
+/// Build the session a `nx.session.reconnect(spec)` requested (§B): the wire spec's
+/// transport chooses the seam builder, and `spec.config_source` — not the session-wide
+/// choice — drives config resolution, so a connector can ask for the daemon's config or
+/// the local one per swap. The system-plugin tier (§A) is re-seeded by `server_init`
+/// regardless. **Blocking** on the handshake, like every other builder, so a failed
+/// provision/spawn is an `Err` here and the *current* session is left intact.
+pub fn spawn_session_from_spec(spec: ReconnectSpec) -> Result<Session> {
+    if spec.keep_buffers {
+        // The swap always brings up a fresh session (buffers come from the new backend);
+        // carrying local buffers across is not implemented. Say so loudly rather than
+        // dropping them silently — the caller can decide whether to proceed.
+        return Err(anyhow!(
+            "nx.session.reconnect: keep_buffers = true is not supported yet"
+        ));
+    }
+    let config_source = spec.config_source;
+    match spec.transport {
+        ReconnectTransport::Spawn { command } => {
+            spawn_server(true, None, None, config_source, move || async move {
+                // Reconnecting, like `spawn_stdio_daemon_session`: re-launch the command on
+                // each (re)dial and hold the current child on the link thread (kill_on_drop
+                // reaps the previous). The daemon's stderr goes to a private log (it can't
+                // share the GUI's terminal).
+                let child_slot: DaemonChildSlot = Arc::new(Mutex::new(None));
+                let make = move || {
+                    let slot = child_slot.clone();
+                    let command = command.clone();
+                    async move {
+                        let mut child = command
+                            .to_command()
+                            .stdin(Stdio::piped())
+                            .stdout(Stdio::piped())
+                            .stderr(daemon_log_stderr())
+                            .kill_on_drop(true)
+                            .spawn()
+                            .map_err(|e| anyhow!(e).context("spawning the daemon"))?;
+                        let stdout = child.stdout.take().expect("daemon stdout piped");
+                        let stdin = child.stdin.take().expect("daemon stdin piped");
+                        *slot.lock().unwrap() = Some(child);
+                        Ok((stdout, stdin))
+                    }
+                };
+                let (client, handle) =
+                    connect_daemon_reconnecting(make, ReconnectPolicy::default())?;
+                Ok((Some(client), Some(handle), no_guard()))
+            })
+        }
+        ReconnectTransport::Quic { addr } => {
+            spawn_session(Some(ConnectTarget::Quic(addr)), None, config_source)
+        }
+    }
 }
 
 /// Spawn a local **workspace** session rooted at `dir`: an embedded (local-disk) session
@@ -281,8 +335,10 @@ where
     }
 }
 
-/// Spawn the stdio daemon child (see [`spawn_stdio_daemon_session`]). Must run inside a
-/// tokio runtime (the child's pipes bind to it).
+/// Spawn the stdio daemon child for a `--connect-daemon` startup: `$NXVIM_DAEMON_CMD`
+/// through `sh -c`, else the sibling `nxvim --daemon`. (A `nx.session.reconnect` spawn
+/// transport uses [`SpawnCommand::to_command`] instead.) Must run inside a tokio runtime
+/// (the child's pipes bind to it).
 fn spawn_stdio_daemon() -> Result<tokio::process::Child> {
     use tokio::process::Command;
     // The daemon's stderr goes to a private log the user can `tail` to diagnose the
@@ -530,15 +586,17 @@ async fn server_init(
 }
 
 /// Lua run at session startup (via [`ServerInit::client_init_lua`]) to register the GUI's
-/// `:connect` / `:workspace` as no-op user commands — so the command line completes their
-/// names, shows their help, saves them to history, and offers directory completion for
-/// `:workspace`'s argument. The window intercepts both on `<CR>` to perform the real
-/// session swap before this no-op body ever runs (and still lets the keystroke through so
-/// the command is recorded in history).
+/// `:workspace` as a no-op user command — so the command line completes its name, shows its
+/// help, saves it to history, and offers directory completion for its argument. The window
+/// intercepts it on `<CR>` to perform the real session swap before this no-op body ever runs
+/// (and still lets the keystroke through so the command is recorded in history).
+///
+/// `:connect` is NOT here: it is a real prelude command (`nx.connect`, §C) that routes
+/// through the VM so a connector's resolver can claim it. When no provider matches, the
+/// server pushes a `nx_connect_fallback` notification and the GUI dials the URL directly
+/// (see [`crate::run`]) — the same ssh/quic path, now triggered by the notification instead
+/// of a client-side `<CR>` intercept.
 const CLIENT_INIT_LUA: &str = r#"
-nx.user_command.create("connect", function() end, {
-  desc = "Connect to a daemon: :connect [user@]host[:port][/file] | nxvim://host:port/token?cert=hash",
-})
 nx.user_command.create("workspace", function() end, {
   desc = "Open a directory as a workspace: :workspace [dir]",
   complete = "dir",

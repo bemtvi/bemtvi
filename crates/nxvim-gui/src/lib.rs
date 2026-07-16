@@ -326,6 +326,61 @@ pub fn run(
                                     let _ = proxy.send_event(UserEvent::Exit);
                                     break 'session;
                                 }
+                                // `nx.session.reconnect(spec)` from inside the VM (§B): a
+                                // plugin initiates the reload. Parse the wire spec and build
+                                // the new session off the UI thread (like `:connect`), then
+                                // `built_rx` swaps onto it. A bad spec / failed build is
+                                // reported and leaves the current session intact.
+                                "nx_session_reconnect" => {
+                                    match params.first().ok_or_else(|| {
+                                        anyhow::anyhow!("nx_session_reconnect: missing spec")
+                                    }).and_then(nxvim_server::ReconnectSpec::from_value) {
+                                        Ok(spec) => {
+                                            let tx = built_tx.clone();
+                                            tokio::task::spawn_blocking(move || {
+                                                let built = session::spawn_session_from_spec(spec);
+                                                let _ = tx.send((":reconnect", built));
+                                            });
+                                        }
+                                        Err(err) => report_session_error(&rpc, ":reconnect", &err),
+                                    }
+                                }
+                                // `:connect <url>` with no matching connect-provider (§C): the
+                                // VM hands the raw URL back for the GUI's built-in direct dial.
+                                // Parse it into an ssh/quic target and build off the UI thread
+                                // (like `SessionRequest::Connect` — the ssh handshake and its
+                                // askpass dialog can take seconds); the swap arrives on
+                                // `built_rx`. An unparseable URL is reported, not swallowed.
+                                "nx_connect_fallback" => {
+                                    match params.first().and_then(Value::as_str) {
+                                        Some(url) => match remote::connect_target(url) {
+                                            Some(target) => {
+                                                let tx = built_tx.clone();
+                                                tokio::task::spawn_blocking(move || {
+                                                    let file = target.embedded_file();
+                                                    let built = session::spawn_session(
+                                                        Some(target),
+                                                        file,
+                                                        config_source,
+                                                    );
+                                                    let _ = tx.send((":connect", built));
+                                                });
+                                            }
+                                            None => report_session_error(
+                                                &rpc,
+                                                ":connect",
+                                                &anyhow::anyhow!(
+                                                    "not a connect target: {url:?} (expected nxvim://… or [user@]host[:port][/file])"
+                                                ),
+                                            ),
+                                        },
+                                        None => report_session_error(
+                                            &rpc,
+                                            ":connect",
+                                            &anyhow::anyhow!("nx_connect_fallback: missing url"),
+                                        ),
+                                    }
+                                }
                                 _ => {}
                             },
                             // Answer server-initiated requests with nil, like the TUI.
@@ -1395,18 +1450,19 @@ impl ApplicationHandler<UserEvent> for App {
                     // server's picker untouched).
                     && self.view.menu.is_none()
                 {
-                    // `:connect [user@]host[:port][/file]` / `:connect nxvim://…` switches
-                    // this window to an edit-host (daemon) session, and `:workspace [dir]`
-                    // swaps it onto a fresh local session rooted at the directory. Both are
-                    // client affordances, but they are *also* registered server-side as
-                    // no-op virtual commands (see [`session::CLIENT_INIT_LUA`]) so they get
-                    // completion, help, and history. So request the swap here, but DON'T
-                    // swallow the `<CR>`: let it fall through and submit the command line
+                    // `:workspace [dir]` swaps this window onto a fresh local session rooted
+                    // at the directory. It is a client affordance, *also* registered
+                    // server-side as a no-op virtual command (see [`session::CLIENT_INIT_LUA`])
+                    // so it gets completion, help, and history. So request the swap here, but
+                    // DON'T swallow the `<CR>`: let it fall through and submit the command line
                     // normally, which records it in `:` history and runs the harmless no-op
                     // body. The swap then arrives async (see `UserEvent::Connected`).
-                    if let Some(target) = remote::connect_command(&self.view.cmdline) {
-                        let _ = self.reconnect.send(SessionRequest::Connect(target));
-                    } else if let Some(dir) = remote::workspace_command(&self.view.cmdline) {
+                    //
+                    // `:connect` is NOT intercepted here: it is a real prelude command (§C)
+                    // that routes through the VM so a connector can claim it, then swaps via a
+                    // `nx_session_reconnect` (provider) or `nx_connect_fallback` (direct dial)
+                    // notification handled in [`crate::run`].
+                    if let Some(dir) = remote::workspace_command(&self.view.cmdline) {
                         let _ = self
                             .reconnect
                             .send(SessionRequest::Workspace(PathBuf::from(dir)));

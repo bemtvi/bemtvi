@@ -517,6 +517,15 @@ const PRELUDE_MODULES: &[(&str, &str)] = &[
         "nxvim:prelude/httpmount",
         include_str!("prelude/httpmount.lua"),
     ),
+    // The local-always seam: nx.run_local / nx.fs_local, the twins of nx.run / nx.fs that
+    // always act on the client machine even in a daemon session (nx.http.fetch_local is the
+    // HTTP twin, in http.lua above). After promise.lua (every op returns a promise); before
+    // plugins.lua and any connector, which build on it. Backs the plugin manager + remote
+    // connectors' client-side machinery.
+    (
+        "nxvim:prelude/localseam",
+        include_str!("prelude/localseam.lua"),
+    ),
     // nx.hash: the hashing surface (one-shot string digests + the incremental
     // nx.hash.new) over the nx._hash / nx._hash_new bridges. After fs.lua, which
     // defines the sibling nx.hash.file (the streamed file digest, an fs op).
@@ -580,6 +589,12 @@ const PRELUDE_MODULES: &[(&str, &str)] = &[
     // async). The variable/option/dispatch/keymap nouns are authored as `nx.*`
     // directly in the chunks above, each aliasing `vim.*` onto itself.
     ("nxvim:prelude/nx", include_str!("prelude/nx.lua")),
+    // nx.connect: the connect-provider registry + live `:connect` routing (§C of the
+    // remote-connectors plan). Loads AFTER nx.lua (needs `nx.session.reconnect` /
+    // `nx.command` / `nx.notify`) and after promise.lua (a resolver may be async). A
+    // connector registers a scheme resolver here; `:connect` routes through the VM and
+    // swaps the window via `nx.session.reconnect`, or falls back to the client's direct dial.
+    ("nxvim:prelude/connect", include_str!("prelude/connect.lua")),
     // Built-in `.editorconfig` support. Loads AFTER nx.lua: it builds on `nx.on` /
     // `nx.augroup` (events) plus `nx.fs` (async, above), `nx.bo` (buffer options,
     // state.lua) and the `vim.g` / `vim.b` variable toggle. On by default; switch
@@ -679,6 +694,20 @@ pub(crate) struct Shared {
     /// Layer crosses from `nx.open` / `nx.layer.*`, applied to the core after the
     /// chunk.
     pub(crate) layer_ops: Vec<LayerOp>,
+    /// Client-directed session-swap requests from `nx.session.reconnect(spec)`. Unlike
+    /// every other bucket (which mutates the editor), the server drains these into a
+    /// `nx_session_reconnect` notification pushed OUT to the client (`fx.notify`), which
+    /// owns the window + transport and performs the actual reload. The spec is carried
+    /// verbatim as an `rmpv::Value` map (transport / config_source / keep_buffers) — the
+    /// server and Lua stay agnostic to the transport semantics the client interprets. See
+    /// docs/plans/2026-07-05-remote-connectors-and-system-plugins.md → §B.
+    pub(crate) session_reconnects: Vec<rmpv::Value>,
+    /// Fallback connect requests from `nx._connect_fallback(url)` (§C): a `:connect <url>`
+    /// with no matching connect-provider. Like [`Self::session_reconnects`] these do not
+    /// touch the editor — the server drains them into a `nx_connect_fallback` notification
+    /// carrying the URL string, and the client performs its built-in direct dial (QUIC URI /
+    /// ssh host). See docs/plans/2026-07-05-remote-connectors-and-system-plugins.md → §C.
+    pub(crate) connect_fallbacks: Vec<rmpv::Value>,
     /// `nx.view` content / mount / lifecycle requests, applied to the core after the
     /// chunk.
     pub(crate) view_ops: Vec<ViewOp>,
@@ -1281,6 +1310,20 @@ impl LuaRuntime {
         /// Take the layer crosses queued by `nx.open` / `nx.layer.*` since the last
         /// drain, for the server to apply to the core's layer machine.
         take_layer_ops -> Vec<LayerOp> = layer_ops
+    }
+
+    take_queue! {
+        /// Take the session-swap requests queued by `nx.session.reconnect` since the
+        /// last drain, for the server to push out to the client as `nx_session_reconnect`
+        /// notifications (the client owns the window + transport and performs the reload).
+        take_session_reconnects -> Vec<rmpv::Value> = session_reconnects
+    }
+
+    take_queue! {
+        /// Take the fallback-connect requests queued by `nx._connect_fallback` since the last
+        /// drain, for the server to push out to the client as `nx_connect_fallback`
+        /// notifications (the client dials the URL directly — §C).
+        take_connect_fallbacks -> Vec<rmpv::Value> = connect_fallbacks
     }
 
     take_queue! {

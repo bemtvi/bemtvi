@@ -127,13 +127,20 @@ pub fn connect_command(cmdline: &str) -> Option<ConnectTarget> {
         Some("connect") | Some("Connect") => {}
         _ => return None,
     }
-    let arg = parts.next()?;
+    connect_target(parts.next()?)
+}
+
+/// Parse a single `:connect` argument — an `nxvim://…` QUIC URI or a bare
+/// `[user@]host[:port][/file]` ssh target — into a [`ConnectTarget`], or `None` if it is
+/// neither. This is the arg half of [`connect_command`], reused for the fallback dial: when
+/// `:connect <url>` finds no connect-provider, the server pushes the raw URL back as a
+/// `nx_connect_fallback` notification and the GUI dials it through here (keeping the
+/// `SSH_ASKPASS` path for ssh targets). A `scheme://` other than `nxvim://` is rejected
+/// rather than mis-read as a nonsense ssh host.
+pub fn connect_target(arg: &str) -> Option<ConnectTarget> {
     if is_connect_uri(arg) {
         return Some(ConnectTarget::Quic(arg.to_string()));
     }
-    // A `scheme://…` argument is a URI; the only one we speak is `nxvim://` (above).
-    // Reject any other (e.g. a mistyped `nvim://`) rather than letting `parse_target`
-    // read it as a nonsense SSH host (`nvim:` / `//…`).
     if arg.contains("://") {
         return None;
     }

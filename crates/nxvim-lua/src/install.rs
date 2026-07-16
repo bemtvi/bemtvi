@@ -355,6 +355,34 @@ pub(crate) fn install_vim(lua: &Lua, shared: &Rc<RefCell<Shared>>) -> mlua::Resu
     nx.set("cmd", cmd.clone())?;
     vim.set("cmd", cmd)?;
 
+    // `nx._session_reconnect(spec)`: queue a client-directed session swap. The prelude's
+    // `nx.session.reconnect` validates the spec, then hands the table here; we convert it
+    // to an `rmpv::Value` (the wire form) and push it onto the `session_reconnects` bucket,
+    // which the server drains into a `nx_session_reconnect` notification to the client (the
+    // client owns the window + transport and performs the reload). Carried verbatim, so the
+    // Rust side stays agnostic to the transport semantics the client interprets.
+    let sh = shared.clone();
+    let session_reconnect = lua.create_function(move |_, spec: mlua::Value| {
+        let value = crate::convert::lua_to_rmpv(&spec)?;
+        sh.borrow_mut().session_reconnects.push(value);
+        Ok(())
+    })?;
+    nx.set("_session_reconnect", session_reconnect)?;
+
+    // `nx._connect_fallback(url)`: no connect-provider owns `url` (§C), so ask the client to
+    // dial it with its built-in direct connect (an `nxvim://…` QUIC URI, or an `[user@]host`
+    // ssh target — the GUI's path keeps its `SSH_ASKPASS` dialog). The URL rides verbatim as
+    // a `nx_connect_fallback` notification (drained in `effects.rs`); each front end owns how
+    // it dials, so the Rust side here just carries the string across.
+    let sh = shared.clone();
+    let connect_fallback = lua.create_function(move |_, url: String| {
+        sh.borrow_mut()
+            .connect_fallbacks
+            .push(rmpv::Value::from(url));
+        Ok(())
+    })?;
+    nx.set("_connect_fallback", connect_fallback)?;
+
     vim.set("version", "nxvim 0.1.0")?;
 
     // An empty `vim.api` namespace; the prelude fills it with `nvim_*` aliases onto

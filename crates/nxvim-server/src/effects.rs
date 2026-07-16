@@ -463,6 +463,23 @@ impl EditHost {
                 },
             }
         }
+        // Client-directed session swaps from `nx.session.reconnect(spec)`. Unlike the
+        // other buckets, these do not touch the editor: each is pushed OUT to the client
+        // as a `nx_session_reconnect` notification (the client owns the window + transport
+        // and tears down / rebuilds the session, keeping the window). The spec rides
+        // verbatim as the single notification param. A plugin can thus initiate the reload
+        // from inside the running VM (§B). Sent AS the chunk drains — the client dropping
+        // the old transport is what winds this server down, so no loop-break is needed here.
+        for spec in self.lua.take_session_reconnects() {
+            self.fx.notify("nx_session_reconnect", vec![spec]);
+        }
+        // Fallback connects from `:connect <url>` with no matching provider (§C): pushed OUT
+        // as a `nx_connect_fallback` notification so the client dials the URL with its
+        // built-in direct connect (QUIC URI / ssh host). The URL rides verbatim as the single
+        // param; like the swap above, no editor state changes here.
+        for url in self.lua.take_connect_fallbacks() {
+            self.fx.notify("nx_connect_fallback", vec![url]);
+        }
         // `nx.view` requests from the view handle methods drive the core's view
         // registry (plugin-owned, read-only content surfaces). Drained *before* the
         // layer crosses below so a `v:mount{...}` (which focuses the view) followed by

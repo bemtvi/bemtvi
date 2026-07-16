@@ -131,6 +131,18 @@ fn status_of(response: &str) -> u16 {
         .unwrap_or(0)
 }
 
+/// The value of response header `name` (case-insensitive), or `None`.
+fn header_value(response: &str, name: &str) -> Option<String> {
+    let head = response
+        .split_once("\r\n\r\n")
+        .map(|(h, _)| h)
+        .unwrap_or(response);
+    head.lines().skip(1).find_map(|line| {
+        let (k, v) = line.split_once(':')?;
+        (k.trim().eq_ignore_ascii_case(name)).then(|| v.trim().to_string())
+    })
+}
+
 /// The body — everything past the blank line.
 fn body_of(response: &str) -> String {
     response
@@ -267,22 +279,76 @@ async fn request_fidelity() {
     );
 }
 
-/// A bare `/plugin/<name>` (no trailing slash) normalizes to `path == "/"`, so a handler's
-/// root check works with or without the slash.
+/// The trailing-slash form serves the handler with `path == "/"`.
 #[tokio::test]
-async fn bare_mount_path_normalizes_to_root() {
+async fn mount_root_serves_path_slash() {
     let (rpc, _incoming) = start().await;
     let url = mount(
         &rpc,
         "root",
         r#"function(req, respond) respond({ body = req.path }) end"#,
     )
-    .await;
-    let base = url.trim_end_matches('/').to_string(); // …/plugin/root  (no trailing slash)
-    let response = tokio::task::spawn_blocking(move || get(&base))
+    .await; // url ends in /plugin/root/
+    let response = tokio::task::spawn_blocking(move || get(&url))
         .await
         .unwrap();
+    assert_eq!(status_of(&response), 200);
     assert_eq!(body_of(&response), "/");
+}
+
+/// A bare `/plugin/<name>` (no trailing slash) 308-redirects to the slash form, so a page
+/// served there resolves its relative URLs against the mount rather than against `/plugin/`.
+/// The query string rides along.
+#[tokio::test]
+async fn bare_mount_root_redirects_to_slash() {
+    let (rpc, _incoming) = start().await;
+    let url = mount(
+        &rpc,
+        "app",
+        r#"function(req, respond) respond({ body = "served" }) end"#,
+    )
+    .await;
+    let origin = split_url(&url).0;
+
+    // …/plugin/app  (no trailing slash) → 308 → …/plugin/app/
+    let bare = format!("http://{origin}/plugin/app");
+    let response = tokio::task::spawn_blocking(move || get(&bare))
+        .await
+        .unwrap();
+    assert_eq!(
+        status_of(&response),
+        308,
+        "a bare mount root must redirect:\n{response}"
+    );
+    let location = header_value(&response, "location").expect("a Location header");
+    assert_eq!(location, "/plugin/app/");
+    assert!(
+        body_of(&response).is_empty(),
+        "a redirect has no body:\n{response}"
+    );
+
+    // The query survives the redirect (`?v=2` → …/plugin/app/?v=2).
+    let withq = format!("http://{origin}/plugin/app?v=2&x=y");
+    let response = tokio::task::spawn_blocking(move || get(&withq))
+        .await
+        .unwrap();
+    assert_eq!(status_of(&response), 308);
+    assert_eq!(
+        header_value(&response, "location").as_deref(),
+        Some("/plugin/app/?v=2&x=y")
+    );
+
+    // A sub-path is NOT redirected — it is the plugin's own routing.
+    let sub = format!("http://{origin}/plugin/app/thing");
+    let response = tokio::task::spawn_blocking(move || get(&sub))
+        .await
+        .unwrap();
+    assert_eq!(
+        status_of(&response),
+        200,
+        "a sub-path must reach the handler, not redirect"
+    );
+    assert_eq!(body_of(&response), "served");
 }
 
 /// Two plugins on one origin route independently by name — the core of the mount model.

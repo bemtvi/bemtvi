@@ -104,6 +104,15 @@ response's body".
 
 Unmounted paths under `/plugin/` get a `404` from the editor, not from any plugin.
 
+A **bare mount root** (`/plugin/example`, no trailing slash) `308`-redirects to
+`/plugin/example/` — the same trailing-slash redirect a web server does for a directory.
+Without it, a page served at `/plugin/example` resolves a relative URL (`fetch("source")`)
+against its parent `/plugin/`, hitting `/plugin/source` (the wrong mount); the slash makes
+the mount root the base. The redirect is applied by the editor before the handler runs, in
+both worlds (the native listener and the browser's `EditHost`, via one shared
+`nxvim_lua::mount_root_redirect`), so a plugin serving an index page at its root needs no
+`<base>` tag or absolute paths. A sub-path is left alone — it is the plugin's own routing.
+
 ## User options: `'httphost'` and `'httpport'`
 
 Where mounts listen is the **user's** call, not a plugin's — it is their machine, their
@@ -270,27 +279,29 @@ self.addEventListener("fetch", (event) => {
 });
 
 async function routeToEditHost(request) {
-  const clients = await self.clients.matchAll({ type: "window", includeUncontrolled: true });
-  const client = clients[0];
+  const client = await pickClient();
   // Fail loud: a mount whose edit-host is gone is a 503, never a silent empty 200.
   if (!client) return new Response("nxvim: no edit-host client", { status: 503 });
 
   const channel = new MessageChannel();
   const reply = new Promise((resolve) => { channel.port1.onmessage = (e) => resolve(e.data); });
-  client.postMessage({
-    type: "nx-http-request",
-    request: {
-      method: request.method,
-      path: url.pathname,                       // the host splits /plugin/<name>/<rest>
-      headers: Object.fromEntries(request.headers),
-      body: new Uint8Array(await request.arrayBuffer()),
-    },
-  }, [channel.port2]);
-
+  client.postMessage({ type: "nx-http-request", request: { … } }, [channel.port2]);
   const res = await reply;
   return new Response(res.body, { status: res.status, headers: res.headers });
 }
 ```
+
+**Which window to relay to is not obvious, and getting it wrong hangs the load.** The tab a
+user *opens the mount URL in* is itself a same-origin, focused window client — so a naive
+`clients[0]` (or a pick-by-focus) relays the request to that very tab, which is loading the
+mount page and has no relay listener, and the load spins until the backstop. So `pickClient`
+does not guess: it **probes** every window (`postMessage` a `nx-edithost-probe` with a reply
+port) and relays to the first that answers. Only a tab running the editor's message handler
+answers, so the requesting tab — and any other non-editor page on the origin — is never
+chosen. Statelessly asking each time also survives a Service Worker restart, which a
+registration table would not. (This one only showed up when the mount was opened in a
+*separate* tab; a same-page fetch never hit it, which is why `verify-http-mount.mjs` now
+drives the multi-tab path explicitly.)
 
 The window client forwards to the edit-host Worker and posts the reply back down the port.
 `eh_take_http_server_requests` / `eh_http_server_reply` mirror the fetch pair

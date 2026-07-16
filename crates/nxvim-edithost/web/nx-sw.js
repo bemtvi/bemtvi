@@ -112,13 +112,43 @@ async function routeToEditHost(request, url) {
   });
 }
 
-// The window client to relay through. Prefers a focused/visible one so that, with several
-// tabs open, the request lands on the editor the user is actually looking at.
+// The window client to relay through — a window that is actually RUNNING the editor, found
+// by asking, not by guessing from focus.
+//
+// The subtlety this exists for: the tab that OPENS a mount URL is itself a same-origin,
+// focused window client. Picking by focus/visibility would relay the request to that very
+// tab — which is loading the mount page and has no relay listener — so nothing ever answers
+// and the load spins. Instead we probe every window: only a tab running the editor's message
+// handler replies, so the requesting tab (and any other non-editor page on the origin) is
+// never chosen. With several editor tabs open, the first to answer wins — fine, any of them
+// can serve.
 async function pickClient() {
   const clients = await self.clients.matchAll({ type: "window", includeUncontrolled: true });
   if (clients.length === 0) return null;
-  return clients.find((c) => c.focused) || clients.find((c) => c.visibilityState === "visible") || clients[0];
+  // The first window to answer "yes" wins. A non-editor tab never answers, so its probe only
+  // settles (to null) at the timeout — an editor's fast "yes" always beats that. Null when no
+  // editor answers at all (every tab closed, or all still mid-navigation).
+  const winner = await Promise.race([...clients.map(probeIsEditor), timeout(PROBE_TIMEOUT_MS)]);
+  return winner || null;
 }
+
+// Ask one window whether it is running the editor. Resolves with the client if it says yes,
+// else `null` (a non-editor page, or a tab mid-navigation, never replies — so it times out).
+function probeIsEditor(client) {
+  return new Promise((resolve) => {
+    const channel = new MessageChannel();
+    const done = setTimeout(() => resolve(null), PROBE_TIMEOUT_MS);
+    channel.port1.onmessage = (e) => {
+      clearTimeout(done);
+      resolve(e.data && e.data.nxEdithost ? client : null);
+    };
+    client.postMessage({ type: "nx-edithost-probe" }, [channel.port2]);
+  });
+}
+
+// How long to wait for a window to identify itself as the editor. A local postMessage
+// round-trip is sub-millisecond; this only bounds the case where NO editor is running.
+const PROBE_TIMEOUT_MS = 2000;
 
 const timeout = (ms) => new Promise((resolve) => setTimeout(() => resolve(null), ms));
 

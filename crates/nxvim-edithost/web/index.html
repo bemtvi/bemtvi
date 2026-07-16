@@ -656,6 +656,13 @@
     if ("serviceWorker" in navigator) {
       navigator.serviceWorker.addEventListener("message", (ev) => {
         const msg = ev.data;
+        // "Are you the editor?" — answer yes. This is how the SW finds the window to relay
+        // to WITHOUT guessing from focus: only a tab running this handler replies, so a tab
+        // that is merely loading a mount page is never mistaken for the editor.
+        if (msg && msg.type === "nx-edithost-probe" && ev.ports && ev.ports[0]) {
+          ev.ports[0].postMessage({ nxEdithost: true });
+          return;
+        }
         if (!msg || msg.type !== "nx-http-request") return;
         const port = ev.ports && ev.ports[0];
         if (!port) return;

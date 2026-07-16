@@ -106,7 +106,11 @@ try {
   );
 
   const browser = await chromium.launch({ executablePath: chromiumPath(), headless: true });
-  const page = await browser.newPage();
+  // An explicit context so a second tab can share this one's Service Worker registration and
+  // OPFS — a fresh `browser.newPage()` context forbids extra pages, and a separate context
+  // would get its own SW, defeating the multi-tab test below.
+  const context = await browser.newContext();
+  const page = await context.newPage();
   page.on("console", (m) => {
     if (m.type() === "error") console.log("      [console.error]", m.text());
   });
@@ -242,7 +246,52 @@ try {
   check("a silent handler 504s at opts.timeout (Lua's deadline, not the backstop)", timedOut === 504, `status ${timedOut}`);
   check("…and at the mount's own deadline, not 5 minutes later", elapsed < 15000, `took ${elapsed}ms`);
 
-  // ---- 8. mount:close() stops it -----------------------------------------
+  // ---- bare mount root redirects to the slash form -----------------------
+  // Opening /plugin/demo (no slash) must 308 to /plugin/demo/, or a page served there would
+  // resolve its relative URLs (fetch("source")) against /plugin/ and 404. redirect:"manual"
+  // so we see the 308 itself rather than the browser silently following it.
+  const redir = await page.evaluate(async (o) => {
+    const r = await fetch(o + "/plugin/demo", { cache: "no-store", redirect: "manual" });
+    return { type: r.type, status: r.status };
+  }, ORIGIN);
+  // A "manual"-redirect fetch reports an opaqueredirect response (status 0) when a redirect
+  // was returned — which, followed, lands on the slash form.
+  check(
+    "bare mount root redirects (so relative URLs resolve against the mount)",
+    redir.type === "opaqueredirect",
+    JSON.stringify(redir)
+  );
+  // And following it (the default) lands on the page.
+  const followed = await page.evaluate(
+    (o) => fetch(o + "/plugin/demo", { cache: "no-store" }).then((r) => r.text()),
+    ORIGIN
+  );
+  check("…and following it serves the page", followed === "<h1>from lua</h1>", JSON.stringify(followed));
+
+  // ---- 8. a SEPARATE tab loads the mount (the real user path) -------------
+  // The whole point of a real URL is opening it in another tab. That tab is a focused,
+  // same-origin window client — so a Service Worker that picked the relay target by focus
+  // would relay to the requesting tab itself (no editor there) and the load would spin
+  // forever. This is the regression guard for exactly that: the request must reach the
+  // EDITOR tab, never the one that asked.
+  const otherTab = await context.newPage();
+  await otherTab.goto(`${ORIGIN}/web/health-probe-not-the-editor`).catch(() => {}); // a same-origin, non-editor page
+  await otherTab.bringToFront(); // the editor tab is now backgrounded, this one is focused
+  const fromOtherTab = await otherTab.evaluate(async (u) => {
+    const r = await Promise.race([
+      fetch(u, { cache: "no-store" }).then((res) => res.text().then((b) => ({ status: res.status, body: b }))),
+      new Promise((res) => setTimeout(() => res({ status: 0, body: "TIMEOUT" }), 10000)),
+    ]);
+    return r;
+  }, url);
+  check(
+    "a focused non-editor tab still reaches the editor (no spin)",
+    fromOtherTab.status === 200 && fromOtherTab.body === "<h1>from lua</h1>",
+    JSON.stringify(fromOtherTab)
+  );
+  await otherTab.close();
+
+  // ---- 9. mount:close() stops it -----------------------------------------
   await luaResult(page, `_G.demo:close(); return true`);
   await page.evaluate(() => window.__nxvim.feed("<Esc>"));
   await sleep(150);

@@ -2216,12 +2216,38 @@ impl EditHost {
             self.reply_http_server(req_id, 404, "nxvim: no plugin mounted here\n");
             return;
         };
+        // A live mount's bare root redirects to the trailing-slash form, so a page served
+        // there resolves its relative URLs against the mount — the same rule the native
+        // listener applies, via the same shared helper.
+        if let Some(location) = nxvim_lua::mount_root_redirect(path) {
+            let location = match query {
+                Some(q) => format!("{location}?{q}"),
+                None => location,
+            };
+            self.redirect_http_server(req_id, &location);
+            return;
+        }
         if let Err(e) = self.lua.run_http_server_request(id, req_id, request) {
             self.editor
                 .echo(format!("E5108: Error in nx.http.mount handler: {e}"));
         }
         self.apply_lua_effects();
         self.settle_events(true);
+    }
+
+    /// Redirect a Service-Worker request to `location` (a `308`), bypassing Lua — the browser
+    /// twin of the native listener's trailing-slash redirect. Queued on the same reply path a
+    /// handler's `respond` uses, so the Worker relays it identically and the browser follows.
+    #[cfg(not(feature = "native"))]
+    fn redirect_http_server(&mut self, req_id: u64, location: &str) {
+        self.fx.http_respond(
+            req_id,
+            nxvim_lua::HttpServerReply {
+                status: 308,
+                headers: vec![("location".to_string(), location.to_string())],
+                body: Vec::new(),
+            },
+        );
     }
 
     /// Answer a Service-Worker request the editor itself is refusing (a `404`), bypassing Lua

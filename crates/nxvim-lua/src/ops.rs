@@ -606,6 +606,27 @@ pub fn split_mount_path(path: &str) -> Option<(&str, &str)> {
     })
 }
 
+/// If `path` is a **bare mount root** (`/plugin/<name>` — no trailing slash, no sub-path),
+/// the location it should redirect to (`/plugin/<name>/`); `None` for anything already
+/// slash-terminated or deeper.
+///
+/// This is the "directory URL needs a trailing slash" rule every web server applies. A page
+/// served at `/plugin/preview` resolves a relative URL (`fetch("source")`) against its
+/// *parent* `/plugin/`, giving `/plugin/source` — the wrong mount. The trailing slash makes
+/// the mount root the base, so `source` resolves to `/plugin/preview/source`. Redirecting is
+/// how `nginx`/Apache fix the identical problem for a real directory; a mount root is the
+/// virtual equivalent.
+///
+/// Only the bare root is touched — a *sub*-path (`/plugin/preview/thing`) is the plugin's own
+/// routing, and whether it is "a directory" is unknowable here, so it is left alone.
+pub fn mount_root_redirect(path: &str) -> Option<String> {
+    let rest = path.strip_prefix(MOUNT_PREFIX)?;
+    if rest.is_empty() || rest.contains('/') {
+        return None; // a bare `/plugin/`, an already-slashed root, or a deeper path
+    }
+    Some(format!("{MOUNT_PREFIX}{rest}/"))
+}
+
 /// Build the [`HttpServerRequest`] a mount handler sees, from the raw pieces every
 /// transport has: the method, the full path, the raw query string, the headers, and the
 /// body. Returns `None` when `path` names no mount (the caller answers `404`).

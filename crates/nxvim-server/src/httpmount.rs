@@ -325,6 +325,21 @@ async fn handle(State(shared): State<Arc<Shared>>, request: Request) -> Response
         );
     };
 
+    // A live mount's bare root (`/plugin/<name>` with no trailing slash) redirects to the
+    // slash form, so a page served there resolves its relative URLs against the mount rather
+    // than against `/plugin/`. The query rides along. (Shared with the browser path.)
+    if let Some(location) = nxvim_lua::mount_root_redirect(&path) {
+        let location = match parts.uri.query() {
+            Some(q) => format!("{location}?{q}"),
+            None => location,
+        };
+        return Response::builder()
+            .status(StatusCode::PERMANENT_REDIRECT)
+            .header("location", location)
+            .body(axum::body::Body::empty())
+            .expect("a redirect response is always well-formed");
+    }
+
     // Buffer the body — a mount handler reads it as one Lua string. Bounded: an unbounded
     // upload must not be able to make the editor allocate without limit.
     let body = match axum::body::to_bytes(body, MAX_BODY).await {

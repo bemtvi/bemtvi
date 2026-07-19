@@ -2243,6 +2243,14 @@ impl Editor {
                 // Drop the tab; a surviving tab's tree becomes live and its window's
                 // buffer becomes current. The closed tree (the only windows on
                 // `target`) is gone, so the sweep below only touches other tabs/layers.
+                //
+                // A surviving window can itself be on `target`: a *previous* delete
+                // in the same command (`:%bd` deletes every listed buffer) rebound it
+                // onto the then-current buffer through the sweep below, and that is
+                // the buffer now being freed. Sweep *before* closing, because closing
+                // makes one of those windows current and `close_tab` relayouts through
+                // the current buffer — a dangling id there panics the store.
+                self.rebind_windows_off_buffer(target);
                 self.close_tab();
             } else {
                 match replacement {
@@ -2252,18 +2260,7 @@ impl Editor {
                     // No sibling buffer remains in this layer: open a fresh, empty one
                     // in the window rather than borrowing another layer's buffer. This
                     // also covers the never-leave-zero-buffers case.
-                    None => {
-                        let id = self.add_buffer(Buffer::empty());
-                        self.set_cur_buffer(id);
-                        self.alternate = None;
-                        self.cursor = Cursor::default();
-                        self.top = 0;
-                        self.leftcol = 0;
-                        self.mode = Mode::Normal;
-                        self.reset_pending();
-                        self.scroll_from = None;
-                        self.pending_scroll = None;
-                    }
+                    None => self.open_empty_in_window(),
                 }
             }
         }
@@ -2275,6 +2272,23 @@ impl Editor {
         true
     }
 
+    /// Open a fresh, empty buffer in the focused window and land on it in a clean
+    /// normal-mode state — the `:bdelete` fallback for when the layer has no sibling
+    /// buffer left to fall back to, which is also what keeps the store from ever
+    /// going empty.
+    fn open_empty_in_window(&mut self) {
+        let id = self.add_buffer(Buffer::empty());
+        self.set_cur_buffer(id);
+        self.alternate = None;
+        self.cursor = Cursor::default();
+        self.top = 0;
+        self.leftcol = 0;
+        self.mode = Mode::Normal;
+        self.reset_pending();
+        self.scroll_from = None;
+        self.pending_scroll = None;
+    }
+
     /// After `target` has been removed from the store, rebind every window across
     /// every layer and tab that still shows it to a valid buffer, so none dangles on
     /// the freed id. Each affected window gets a replacement from **its own** layer
@@ -2283,8 +2297,15 @@ impl Editor {
     /// has already handled the focused window itself.
     fn rebind_windows_off_buffer(&mut self, target: BufferId) {
         // A tiny per-layer replacement cache (layers number ≤ 5, so a Vec beats a
-        // map). Seed the focused layer with the buffer the current window now shows.
-        let mut repl: Vec<(Layer, BufferId)> = vec![(self.focused_layer, self.cur_buffer())];
+        // map). Seed the focused layer with the buffer the current window now shows —
+        // unless that window is itself still on `target` (the pre-`close_tab` sweep,
+        // where the caller has *not* moved the current window off yet). Seeding with
+        // the freed id would "rebind" the other windows right back onto it, so leave
+        // the layer unseeded and let it resolve a real surviving buffer below.
+        let mut repl: Vec<(Layer, BufferId)> = Vec::new();
+        if self.cur_buffer() != target {
+            repl.push((self.focused_layer, self.cur_buffer()));
+        }
         for (layer, idx) in self.all_layer_tabs() {
             let affected = self
                 .layer_tab_tree(layer, idx)

@@ -863,6 +863,33 @@ async fn bdelete_of_a_tabs_only_buffer_closes_the_tab() {
     let _ = std::fs::remove_file(&b);
 }
 
+/// `:%bd` with a buffer per tab deletes every buffer in one command. The
+/// earlier deletes rebind the *other* tabs' windows onto the buffer that is
+/// still current — which the final delete then frees. The 'bdclosetab' path
+/// must not leave the surviving tab's window on that freed id (it used to, and
+/// the next read panicked in the buffer store).
+#[tokio::test]
+async fn percent_bdelete_across_tabs_leaves_a_valid_buffer() {
+    let a = temp_file("pbd_a", "aaa\n");
+    let b = temp_file("pbd_b", "bbb\n");
+    let (rpc, _incoming) = start().await;
+
+    feed_sync(&rpc, &format!(":edit {a}<CR>")).await; // tab 1 shows A
+    feed_sync(&rpc, &format!(":tabedit {b}<CR>")).await; // tab 2 shows B, focused
+
+    feed_sync(&rpc, ":%bdelete<CR>").await;
+
+    // Every listed buffer is gone, so what remains is a fresh `[No Name]`.
+    assert_eq!(
+        cur_lines(&rpc).await,
+        vec![""],
+        "an empty buffer replaces the deleted ones"
+    );
+
+    let _ = std::fs::remove_file(&a);
+    let _ = std::fs::remove_file(&b);
+}
+
 /// `:set nobdclosetab` restores the classic vim behavior: `:bd` keeps the tab
 /// open and loads a sibling buffer into its window.
 #[tokio::test]

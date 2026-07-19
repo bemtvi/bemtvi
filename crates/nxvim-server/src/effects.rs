@@ -8,8 +8,8 @@ use crate::{EditHost, WindowStatusline};
 use nxvim_core::highlight::HlDef;
 use nxvim_core::{
     command_pending_after, parse_color, parse_keys, BorderStyle, BufferId, CommandContinuation,
-    DecorViewport, FloatAnchor, FloatConfig, FloatRelative, QfAction, QfEntry, QfWhich, TabId,
-    UndoEntry, UndoTreeView, WindowConfigSpec, WindowId,
+    DecorViewport, DeferredCmd, FloatAnchor, FloatConfig, FloatRelative, QfAction, QfEntry,
+    QfWhich, TabId, UndoEntry, UndoTreeView, WindowConfigSpec, WindowId,
 };
 use nxvim_lua::FsJob;
 use nxvim_lua::{
@@ -2004,6 +2004,12 @@ impl EditHost {
             self.editor.mode.short_code(),
             self.editor.cmdline_type(),
         );
+        // The alternate file name (`#`), the twin of the `%` name in the current-buffer
+        // snapshot — refreshed here so `vim.fn.expand("#")` tracks the same `#` the
+        // ex-command token expands to.
+        let _ = self
+            .lua
+            .set_alt_file(&self.editor.alternate_file_name().unwrap_or_default());
         let _ = self.lua.set_bo_mirror(&bo);
         let _ = self.lua.set_extmark_mirror(&extmarks);
         // The highlight registry, mirrored so `nvim_get_hl` reads live group
@@ -3438,7 +3444,17 @@ impl EditHost {
                 self.apply_lua_effects();
             }
             for cmd in std::mem::take(&mut self.editor.deferred_commands) {
-                self.resolve_command(&cmd);
+                match cmd {
+                    DeferredCmd::Server(c) => self.resolve_command(&c),
+                    // The tail of a `|` chain, held back until the segment ahead of it
+                    // resolved (just above). Vim abandons the rest of a command line
+                    // once a command errors, so a failed segment drops its tail.
+                    DeferredCmd::Chain(c) => {
+                        if !self.editor.message_error {
+                            self.editor.command(&c);
+                        }
+                    }
+                }
             }
             // `<CR>` selections on a focused `nx.view` buffer: fire the view's Lua
             // `on_select(line, userdata)` handler. The callback may itself queue lua /

@@ -756,3 +756,120 @@ async fn huge_substitute_count_means_to_end_of_file() {
         "the count clamps to the end of the file"
     );
 }
+
+// ----- `|` command chaining (vim's `:bar`) -------------------------------------
+
+#[tokio::test]
+async fn bar_chains_ex_commands_on_one_line() {
+    // `:cmd1|cmd2` runs both, left to right — the shape behind idioms like
+    // `:%bd|e#` and `:w|q`.
+    let (rpc, _i) = range_fixture().await;
+    feed(&rpc, ":1d|1d<CR>");
+    assert_eq!(
+        lines(&rpc).await,
+        vec!["three", "    four", "five"],
+        "both chained deletes run"
+    );
+}
+
+#[tokio::test]
+async fn bar_chain_aborts_after_a_failing_command() {
+    // vim abandons the rest of the line once a command errors, so a chain can't
+    // apply its tail to a state the failed command never established.
+    let (rpc, _i) = range_fixture().await;
+    feed(&rpc, ":nosuchcommand|1d<CR>");
+    assert_eq!(
+        lines(&rpc).await,
+        vec!["one", "two", "three", "    four", "five"],
+        "the delete after a failed command must not run"
+    );
+}
+
+#[tokio::test]
+async fn escaped_bar_is_not_a_command_separator() {
+    // Outside a pattern, a backslash still escapes the bar (vim's rule), so `\|` stays
+    // in the argument. If it split, the tail would run as a command and report E492.
+    let (rpc, mut incoming) = range_fixture().await;
+    feed(&rpc, ":echom 'a\\|b'<CR>");
+    let map = redraw_after(&rpc, &mut incoming, "").await;
+    let msg = field(&map, "message")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    assert!(
+        !msg.contains("E492"),
+        "an escaped bar must not split the command line, got {msg:?}"
+    );
+    assert!(
+        msg.contains('|'),
+        "the whole argument should reach `:echom`, got {msg:?}"
+    );
+}
+
+#[tokio::test]
+async fn bare_bar_is_alternation_inside_a_substitute_pattern() {
+    // nxvim's regex flavor is PCRE, so a *bare* `|` is alternation (vim's `\|`) and a
+    // `\|` is a literal bar — the reverse of vim. Command-line bar splitting must
+    // therefore not touch a bar inside `:s`'s delimited sections, or the pattern
+    // loses half of itself and the tail runs as a bogus command.
+    let (rpc, _i) = range_fixture().await;
+    feed(&rpc, ":%s/two|three/X/<CR>");
+    assert_eq!(
+        lines(&rpc).await,
+        vec!["one", "X", "X", "    four", "five"],
+        "a bare bar in the pattern is alternation, not a command separator"
+    );
+}
+
+#[tokio::test]
+async fn substitute_still_chains_after_its_final_delimiter() {
+    // The flip side: a bar *after* the substitute's last delimiter is a real
+    // separator, so `:s/../../|cmd` still chains.
+    let (rpc, _i) = range_fixture().await;
+    feed(&rpc, ":%s/two/X/|1d<CR>");
+    assert_eq!(
+        lines(&rpc).await,
+        vec!["X", "three", "    four", "five"],
+        "the substitute runs, then the chained delete"
+    );
+}
+
+#[tokio::test]
+async fn bare_bar_survives_a_vimgrep_pattern() {
+    // `:vimgrep /{pat}/ {file}` opens a delimited pattern section too, so the same
+    // rule applies: a bare `|` there is alternation, not a separator. If it split,
+    // the tail would run as a command and report E492.
+    let dir = temp_dir("vimgrep_bar");
+    let file = dir.join("hay.txt");
+    std::fs::write(&file, "two\nthree\nfour\n").expect("write");
+    let (rpc, mut incoming) = start(Some(file.display().to_string())).await;
+
+    feed(
+        &rpc,
+        &format!(":vimgrep /two|three/j {}<CR>", file.display()),
+    );
+    let map = redraw_after(&rpc, &mut incoming, "").await;
+    let msg = field(&map, "message")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    assert!(
+        msg.contains("2 matches"),
+        "the alternation should match both `two` and `three` (a split pattern reports \
+         E682 on the truncated `/two`), got {msg:?}"
+    );
+}
+
+#[tokio::test]
+async fn normal_takes_a_literal_bar_argument() {
+    // `:normal` is one of vim's bar-swallowing commands: the whole rest of the line
+    // is keystrokes, so the bar is typed rather than starting a new command.
+    let (rpc, _i) = range_fixture().await;
+    feed(&rpc, ":1<CR>");
+    feed(&rpc, ":normal A|x<CR>");
+    assert_eq!(
+        lines(&rpc).await,
+        vec!["one|x", "two", "three", "    four", "five"],
+        "`:normal` types the bar instead of chaining"
+    );
+}

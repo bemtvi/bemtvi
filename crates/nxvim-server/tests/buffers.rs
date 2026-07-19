@@ -974,6 +974,124 @@ async fn hash_expands_to_the_alternate_file() {
 }
 
 #[tokio::test]
+async fn hash_survives_deleting_the_buffer_it_names() {
+    // vim's `#` is a *file name*, not a live buffer handle: `:bd` unlists a buffer but
+    // leaves the alternate name intact, which is what makes the `:%bd|e#` idiom ("wipe
+    // every buffer, then reopen the one I was in") work. Deleting every buffer must
+    // therefore leave `#` naming the buffer that was current, so `:e #` reloads it.
+    let a = temp_file("haltdel", "a1\na2\n");
+    let b = temp_file("haltdel", "b1\nb2\n");
+    let (rpc, _incoming) = start().await;
+
+    command(&rpc, &format!("e {}", name(&a))).await;
+    command(&rpc, &format!("e {}", name(&b))).await;
+    // The idiom as it is actually typed — one command line, bar-chained.
+    command(&rpc, "%bd|e#|bd#").await;
+
+    assert_eq!(
+        lines(&rpc).await,
+        vec!["b1", "b2"],
+        "`:%bd` leaves `#` naming the buffer that was current, so `:e#` reopens it"
+    );
+    assert_eq!(
+        list_bufs(&rpc).await.len(),
+        1,
+        "the trailing `bd#` drops the [No Name] buffer `%bd` left behind"
+    );
+
+    std::fs::remove_file(&a).ok();
+    std::fs::remove_file(&b).ok();
+}
+
+#[tokio::test]
+async fn percent_bdelete_leaves_hash_at_the_buffer_you_were_on() {
+    // `:%bd` deletes every buffer in ascending id order, landing the window on a
+    // higher-id replacement as it sweeps. `#` must name the buffer that was current
+    // when the command *started* — the file you were editing — not whatever buffer
+    // the sweep incidentally deleted last (the highest id). Here the current buffer
+    // (`a`, id 1) is deleted first, so a sweep that clobbers `#` on every deleted-
+    // current would end pointing at `c`.
+    let a = temp_file("bdcur", "a1\na2\n");
+    let b = temp_file("bdcur", "b1\nb2\n");
+    let c = temp_file("bdcur", "c1\nc2\n");
+    let (rpc, _incoming) = start().await;
+
+    command(&rpc, &format!("e {}", name(&a))).await; // buf 1
+    command(&rpc, &format!("e {}", name(&b))).await; // buf 2
+    command(&rpc, &format!("e {}", name(&c))).await; // buf 3
+    command(&rpc, &format!("e {}", name(&a))).await; // back to buf 1, current
+
+    command(&rpc, "%bd|e#").await;
+    assert_eq!(
+        lines(&rpc).await,
+        vec!["a1", "a2"],
+        "`:%bd` leaves `#` naming the buffer you were on (`a`), so `:e#` reopens it"
+    );
+
+    std::fs::remove_file(&a).ok();
+    std::fs::remove_file(&b).ok();
+    std::fs::remove_file(&c).ok();
+}
+
+#[tokio::test]
+async fn expand_hash_returns_the_alternate_file_name() {
+    // `vim.fn.expand('#')` is the Lua twin of the ex-command `#` token: the alternate
+    // file's name, with `:<mods>` routed through fnamemodify like `%` already is.
+    let a = temp_file("hexp", "a1\n");
+    let b = temp_file("hexp", "b1\n");
+    let (rpc, _incoming) = start().await;
+
+    command(&rpc, &format!("e {}", name(&a))).await;
+    command(&rpc, &format!("e {}", name(&b))).await;
+
+    assert_eq!(
+        exec_lua(&rpc, "return vim.fn.expand('#')").await.as_str(),
+        Some(a.display().to_string().as_str()),
+        "`expand('#')` is the alternate file's name"
+    );
+    assert_eq!(
+        exec_lua(&rpc, "return vim.fn.expand('#:t')").await.as_str(),
+        a.file_name().and_then(|s| s.to_str()),
+        "`#:t` is the alternate's tail"
+    );
+
+    std::fs::remove_file(&a).ok();
+    std::fs::remove_file(&b).ok();
+}
+
+#[tokio::test]
+async fn alternate_updates_on_plain_buffer_navigation() {
+    let a = temp_file("altnav", "a1\n");
+    let b = temp_file("altnav", "b1\n");
+    let c = temp_file("altnav", "c1\n");
+    let (rpc, _incoming) = start().await;
+
+    command(&rpc, &format!("e {}", name(&a))).await; // buf 1
+    command(&rpc, &format!("e {}", name(&b))).await; // buf 2, alt=a
+    command(&rpc, &format!("e {}", name(&c))).await; // buf 3, alt=b
+
+    // Plain navigation (`:bprev`), no `:e`. The buffer we leave (c) becomes `#`.
+    command(&rpc, "bprev").await; // now on b, alt should be c
+    assert_eq!(
+        exec_lua(&rpc, "return vim.fn.expand('#')").await.as_str(),
+        Some(c.display().to_string().as_str()),
+        "after :bprev, `#` names the buffer just left"
+    );
+
+    // And `<C-^>` too.
+    feed(&rpc, "<C-^>"); // back to c, alt should be b
+    assert_eq!(
+        exec_lua(&rpc, "return vim.fn.expand('#')").await.as_str(),
+        Some(b.display().to_string().as_str()),
+        "after <C-^>, `#` names the buffer just left"
+    );
+
+    std::fs::remove_file(&a).ok();
+    std::fs::remove_file(&b).ok();
+    std::fs::remove_file(&c).ok();
+}
+
+#[tokio::test]
 async fn buf_attach_callback_effects_drain_in_the_same_batch() {
     let (rpc, mut incoming) = start().await;
 

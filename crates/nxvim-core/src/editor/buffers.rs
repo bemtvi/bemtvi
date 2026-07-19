@@ -982,7 +982,9 @@ impl Editor {
         // Leaving a buffer records its last-cursor mark `"` (vim's definition), so
         // `` `" `` returns here and shada can persist where each file was left.
         out.buffer.marks.insert('"', (cursor.line, cursor.col));
+        let out_path = out.buffer.path.clone();
         self.alternate = Some(outgoing);
+        self.alternate_name = out_path;
 
         self.enter_buffer(id);
     }
@@ -2063,8 +2065,20 @@ impl Editor {
         if range_explicit {
             match self.resolve_buffer_range(range_text) {
                 Ok(targets) => {
+                    // The whole command leaves `#` at the buffer you were on when it
+                    // started (vim's `:%bd` → `#` is the previous file). Each
+                    // individual delete of the then-current buffer sets `#` to *its*
+                    // name, so a sweep that lands the window on higher-id replacements
+                    // as it goes would otherwise end with `#` at the last-deleted
+                    // buffer, not the one you were editing. Capture the name up front
+                    // and restore it after the sweep, if that buffer was really removed.
+                    let started_on = self.cur_buffer();
+                    let started_name = self.buffers.get(started_on).buffer.path.clone();
                     for target in targets {
                         self.delete_buffer(target, bang);
+                    }
+                    if !self.buffers.map.contains_key(&started_on) {
+                        self.alternate_name = started_name;
                     }
                 }
                 Err(e) => self.echo(e),
@@ -2198,6 +2212,12 @@ impl Editor {
         }
 
         let was_current = target == self.cur_buffer();
+        // Deleting the *current* buffer makes it the alternate (vim: the buffer you
+        // just closed is the one `#`/`<C-^>`/`:e #` takes you back to). Only the name
+        // can carry that — the id is freed below — so record it before the removal.
+        // A `:%bd` sweep therefore ends with `#` naming the last buffer that was
+        // current, which is what the `:%bd|e#` idiom relies on.
+        let deleted_name = self.buffers.get(target).buffer.path.clone();
         let layer = self.focused_layer;
         let replacement = if was_current {
             self.alternate
@@ -2221,8 +2241,13 @@ impl Editor {
         // entry before calling here, so its own deletes aren't double-handled.)
         self.views.retain(|_, v| v.buf != target);
         self.syntax_close(target);
+        // The id is gone, but the *name* survives the delete, exactly as vim's
+        // unlisted-buffer `#` does — so `:e #` can still reload the file.
         if self.alternate == Some(target) {
             self.alternate = None;
+        }
+        if was_current {
+            self.alternate_name = deleted_name;
         }
 
         // `'bdclosetab'` (nxvim default): if `target` was the *only* buffer the

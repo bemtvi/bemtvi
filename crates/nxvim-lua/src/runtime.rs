@@ -2825,6 +2825,15 @@ impl LuaRuntime {
         set.call((bufnr, name, filetype))
     }
 
+    /// Publish the alternate file name (vim's `#`) into the `nx._alt_file` mirror
+    /// that `vim.fn.expand("#")` reads, `""` when there is none. Refreshed with the
+    /// buffer mirror, so a Lua getter sees the same `#` the ex-command `#` token
+    /// expands to — including after the buffer it named was deleted, since the core
+    /// tracks `#` as a name rather than a live buffer handle.
+    pub fn set_alt_file(&self, name: &str) -> mlua::Result<()> {
+        self.nx()?.set("_alt_file", name)
+    }
+
     /// Publish the editor's current effective working directory into the `nx._cwd`
     /// mirror that `vim.fn.getcwd()` reads. The server keeps this equal to
     /// [`DirState::effective`](crate) on every cwd change (startup seed, `:cd`, window /

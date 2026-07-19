@@ -75,17 +75,24 @@ vim.fn.undotree = nx.undotree.get
 -- (vim.fn.fnamemodify lives in prelude/fs.lua, alongside the other path vim.fn;
 -- this chunk's expand routes through it at call time.)
 
--- `nx.expand(expr)` [alias `vim.fn.expand`]: the `%` (current file) forms autocmd
--- callbacks and statuslines use to resolve paths, backed by the current-buffer
--- snapshot. `%` is the stored name; `%:<mods>` routes through `fnamemodify` (so `%:t`,
--- `%:p`, `%:h`, `%:r`, `%:~:.`, … all work). A non-`%` expression errors loud.
+-- `nx.expand(expr)` [alias `vim.fn.expand`]: the `%` (current file) and `#`
+-- (alternate file) forms autocmd callbacks and statuslines use to resolve paths,
+-- backed by the current-buffer snapshot and the `#` mirror. `%` / `#` are the stored
+-- names; a `:<mods>` suffix routes through `fnamemodify` (so `%:t`, `%:p`, `#:h`,
+-- `#:r`, `%:~:.`, … all work). Any other expression errors loud.
 -- (the override below extends this with cursor keywords / globs, re-binding nx.expand.)
 function nx.expand(expr)
+  -- `#` is the alternate file name, which the core tracks as a *name*: it stays
+  -- resolvable after the buffer it named was `:bdelete`d, matching vim.
   local name = (nx._cur_buf or {}).name or ""
-  if expr == "%" then
+  local pat = "^%%(:.*)$"
+  if expr:sub(1, 1) == "#" then
+    name, pat = nx._alt_file or "", "^#(:.*)$"
+  end
+  if expr == "%" or expr == "#" then
     return name
   end
-  local mods = expr:match("^%%(:.*)$")
+  local mods = expr:match(pat)
   if mods then
     -- A buffer with no file expands to "" for EVERY modifier (`%:p`, `%:h`, `%:t`, …),
     -- matching neovim — there is no path to modify. Without this, `%:p` would run
@@ -358,8 +365,8 @@ local function expand_path(p)
 end
 function nx.expand(expr, nosuf, list)
   expr = tostring(expr)
-  -- `%`-family: keep the existing snapshot-backed behavior verbatim.
-  if expr == "%" or expr:match("^%%:") then
+  -- `%` / `#` families: keep the existing snapshot-backed behavior verbatim.
+  if expr == "%" or expr:match("^%%:") or expr == "#" or expr:match("^#:") then
     return expand_pct(expr, nosuf, list)
   end
   -- Special `<...>` keywords, with an optional `:mods` filename-modifier suffix.

@@ -1302,6 +1302,11 @@ vim.fn.reg_executing = nx.reg.executing
 -- the core single-message-at-a-time it can't go stale mid-dispatch.
 nx._cur_buf = nx._cur_buf or { bufnr = 0, name = "", filetype = "" }
 
+-- `nx._alt_file`: the alternate file name (vim's `#`), refreshed by the server
+-- alongside the buffer mirror and read by `expand("#")`. A *name*, not a handle —
+-- it outlives a `:bdelete` of the buffer it named, exactly as vim's `#` does.
+nx._alt_file = nx._alt_file or ""
+
 function nx._set_cur_buf(bufnr, name, filetype)
   nx._cur_buf = { bufnr = bufnr or 0, name = name or "", filetype = filetype or "" }
 end

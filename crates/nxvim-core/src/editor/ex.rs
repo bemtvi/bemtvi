@@ -328,6 +328,163 @@ fn split_ex(cmd: &str) -> (&str, bool, &str) {
     (name, bang, args)
 }
 
+/// Commands that see a `|` as **part of their argument** rather than as a command
+/// separator — vim's `:help :bar` exception list, restricted to the commands nxvim
+/// has. Their argument is itself code or a shell/keystroke string, so a bar inside
+/// it belongs to *them*: `:g/x/s/a/b/|d` is one `:global` whose sub-command chains,
+/// and `:normal A|` types a literal bar.
+fn ex_takes_bar(name: &str) -> bool {
+    matches!(
+        name,
+        "normal"
+            | "norm"
+            | "g"
+            | "global"
+            | "v"
+            | "vglobal"
+            | "au"
+            | "autocmd"
+            | "com"
+            | "command"
+            | "func"
+            | "function"
+            | "lua"
+            | "luado"
+            | "argdo"
+            | "bufdo"
+            | "windo"
+            | "tabdo"
+            | "cdo"
+            | "ldo"
+            | "make"
+            | "h"
+            | "help"
+    )
+}
+
+/// Byte index where the command *name* starts — past a leading `:`, whitespace, and
+/// any address range. Search addresses (`/pat/`, `?pat?`) are skipped as spans so a
+/// bar inside a pattern can't be mistaken for the command name's start.
+fn ex_name_start(cmd: &str) -> usize {
+    let bytes = cmd.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b' ' | b'\t' | b':' | b'.' | b'$' | b'%' | b',' | b';' | b'+' | b'-' => i += 1,
+            b'0'..=b'9' => i += 1,
+            // `'a` — a mark address; the mark char is never a delimiter.
+            b'\'' => i += 2,
+            // A `/pat/` or `?pat?` address: skip to the closing (unescaped) delimiter.
+            d @ (b'/' | b'?') => {
+                i += 1;
+                while i < bytes.len() && bytes[i] != d {
+                    i += if bytes[i] == b'\\' { 2 } else { 1 };
+                }
+                i += 1;
+            }
+            _ => break,
+        }
+    }
+    i.min(cmd.len())
+}
+
+/// How many leading **delimited** sections a command's argument opens — sections a
+/// bar can legally appear inside, so [`split_ex_bar`] must scan past them.
+/// `:s/pat/rep/flags` has two, `:vimgrep /pat/flags files…` has one, everything else
+/// has none.
+fn ex_pattern_sections(name: &str) -> usize {
+    match name {
+        "s" | "su" | "sub" | "subs" | "subst" | "substi" | "substit" | "substitu" | "substitut"
+        | "substitute" => 2,
+        "vim" | "vimg" | "vimgr" | "vimgre" | "vimgrep" | "vimgrepa" | "vimgrepad"
+        | "vimgrepadd" | "lvim" | "lvimg" | "lvimgr" | "lvimgre" | "lvimgrep" | "lvimgrepa"
+        | "lvimgrepad" | "lvimgrepadd" => 1,
+        _ => 0,
+    }
+}
+
+/// Byte index just past a command's leading delimited sections, given the index
+/// where its argument starts and how many sections it opens
+/// ([`ex_pattern_sections`]). Bars before this point belong to the pattern
+/// ([`split_ex_bar`]); flags, file arguments, and any `|` separator follow it.
+///
+/// The delimiter is whatever non-alphanumeric char opens the argument (`:s!a!b!` is
+/// as valid as `:s/a/b/`), and `\` escapes it. An argument that opens no section — a
+/// bare `:s`, or an alphanumeric flag/count — has none, so the scan starts right at
+/// the argument. An unterminated section runs to the end of the line, exactly as
+/// [`split_substitute`] reads it.
+///
+/// Skipping the whole span (rather than reasoning about escapes inside it) is what
+/// keeps this correct under either `'regexsyntax'` engine: PCRE alternates on a bare
+/// `|`, vim's on `\|`, and neither one's bars reach the separator scan.
+fn pattern_sections_end(cmd: &str, arg_start: usize, sections: usize) -> usize {
+    let bytes = cmd.as_bytes();
+    let mut i = arg_start;
+    while i < bytes.len() && (bytes[i] == b' ' || bytes[i] == b'\t') {
+        i += 1;
+    }
+    let Some(&delim) = bytes.get(i) else {
+        return i;
+    };
+    if delim.is_ascii_alphanumeric() || delim == b'\\' || delim == b'"' || delim == b'|' {
+        return i;
+    }
+    i += 1;
+    // Each section ends at the next unescaped delimiter.
+    for _ in 0..sections {
+        while i < bytes.len() && bytes[i] != delim {
+            i += if bytes[i] == b'\\' { 2 } else { 1 };
+        }
+        if i >= bytes.len() {
+            return bytes.len();
+        }
+        i += 1;
+    }
+    i.min(bytes.len())
+}
+
+/// Split a command line at the first `|` that separates two commands, into
+/// `(first command, rest of the line)`. `None` when the whole line is one command.
+///
+/// A bar is a separator unless it is backslash-escaped, the line's command takes the
+/// bar as part of its argument ([`ex_takes_bar`]), or it sits inside a leading
+/// delimited pattern section ([`ex_pattern_sections`]).
+///
+/// That last case is where nxvim departs from vim, and it matters: nxvim's regex
+/// flavor is PCRE, so a **bare** `|` is alternation (`:s/two|three/X/`) and `\|` is a
+/// literal bar — the reverse of vim, where `\|` alternates and a bare bar always
+/// separates commands. Splitting on the bare bar would silently truncate the pattern
+/// and run its tail as a command, so the scan skips past the delimited sections and
+/// only looks for a separator after the final delimiter (`:s/a/b/|w` still chains).
+fn split_ex_bar(cmd: &str) -> Option<(&str, &str)> {
+    let bytes = cmd.as_bytes();
+    let mut i = ex_name_start(cmd);
+    // The command name, for the takes-a-bar check. `:!cmd` (filter through a shell)
+    // has no alphabetic name and takes the rest of the line verbatim.
+    if bytes.get(i) == Some(&b'!') {
+        return None;
+    }
+    let name_end = i + cmd[i..]
+        .bytes()
+        .take_while(|b| b.is_ascii_alphabetic())
+        .count();
+    if ex_takes_bar(&cmd[i..name_end]) {
+        return None;
+    }
+    let sections = ex_pattern_sections(&cmd[i..name_end]);
+    if sections > 0 {
+        i = pattern_sections_end(cmd, name_end, sections);
+    }
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\\' => i += 2,
+            b'|' => return Some((&cmd[..i], &cmd[i + 1..])),
+            _ => i += 1,
+        }
+    }
+    None
+}
+
 /// Parse a buffer-navigation count argument (`:bnext 2`). Empty / invalid / zero
 /// all mean 1, matching vim's default repeat count.
 fn parse_count_arg(args: &str) -> usize {
@@ -384,13 +541,12 @@ impl Editor {
 
     /// The alternate buffer's file name (vim's `#`), or `None` when there is no
     /// alternate or it is unnamed.
-    fn alternate_file_name(&self) -> Option<String> {
-        let id = self.alternate?;
-        self.buffers
-            .map
-            .get(&id)?
-            .buffer
-            .path
+    ///
+    /// Reads the tracked *name* rather than the alternate buffer's live path: `#` is
+    /// a file name in vim and outlives the buffer it named, so `:e #` still reloads a
+    /// file whose buffer has been `:bdelete`d (the `:%bd|e#` idiom).
+    pub fn alternate_file_name(&self) -> Option<String> {
+        self.alternate_name
             .as_ref()
             .map(|p| p.display().to_string())
             .filter(|s| !s.is_empty())
@@ -466,7 +622,50 @@ impl Editor {
         }
     }
 
+    /// Run one command line, which may chain several commands with `|` (vim's
+    /// `:bar`) — `:%bd|e#|bd#`, `:w|q`, `:e file|normal G`.
+    ///
+    /// Splitting is escape- and command-aware: `\|` is a literal bar (so `:s/a\|b/c/`
+    /// keeps its alternation), and a command that takes the bar as *part of its
+    /// argument* ([`ex_takes_bar`]) swallows the rest of the line. As in vim, a
+    /// segment that reports an error aborts the rest of the chain — `:e missing|%d`
+    /// must not delete the buffer it failed to replace.
     pub(crate) fn execute_ex(&mut self, raw: &str) {
+        if split_ex_bar(raw).is_none() {
+            // The overwhelmingly common single-command case: no split, no state to
+            // reset — run the line exactly as before.
+            self.execute_ex_one(raw);
+            return;
+        }
+        // Only a *fresh* error aborts the chain, so clear any stale flag left by an
+        // earlier command line before watching it.
+        self.message_error = false;
+        let mut rest = raw;
+        loop {
+            let (seg, tail) = match split_ex_bar(rest) {
+                Some((seg, tail)) => (seg, Some(tail)),
+                None => (rest, None),
+            };
+            let deferred_before = self.deferred_commands.len();
+            self.execute_ex_one(seg);
+            let Some(tail) = tail else { return };
+            if self.message_error {
+                return;
+            }
+            // This segment is unknown to the core and will run *after* the tick. The
+            // rest of the line has to wait for it rather than running now — otherwise
+            // `:MyCmd|w` writes before `MyCmd` has done anything. Hand the tail over
+            // to the same queue, right behind it.
+            if self.deferred_commands.len() > deferred_before {
+                self.deferred_commands
+                    .push(DeferredCmd::Chain(tail.to_string()));
+                return;
+            }
+            rest = tail;
+        }
+    }
+
+    fn execute_ex_one(&mut self, raw: &str) {
         // Escape-aware trim: a backslash-escaped trailing space (`:set
         // fillchars=eob:\ `) must survive to the per-command arg parser, so a plain
         // `raw.trim()` here (which would eat it, leaving a dangling `\`) is wrong.
@@ -820,7 +1019,9 @@ impl Editor {
             "rsh" | "rsha" | "rshad" | "rshada" => self.ex_rshada(bang, args),
             // Unknown to the core: defer to the server, which resolves it
             // against Lua user commands (or reports the unknown-command error).
-            _ => self.deferred_commands.push(rest.to_string()),
+            _ => self
+                .deferred_commands
+                .push(DeferredCmd::Server(rest.to_string())),
         }
     }
 
@@ -2069,7 +2270,9 @@ impl Editor {
                 }
             }
             "" => self.echo("E471: Argument required"),
-            _ => self.deferred_commands.push(format!("tab {args}")),
+            _ => self
+                .deferred_commands
+                .push(DeferredCmd::Server(format!("tab {args}"))),
         }
     }
 
@@ -2111,7 +2314,9 @@ impl Editor {
             }
             "new" => self.ex_new(SplitDir::Vertical),
             "" => self.echo("E471: Argument required"),
-            _ => self.deferred_commands.push(format!("vertical {args}")),
+            _ => self
+                .deferred_commands
+                .push(DeferredCmd::Server(format!("vertical {args}"))),
         }
     }
 

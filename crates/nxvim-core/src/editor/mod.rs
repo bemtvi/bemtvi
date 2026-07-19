@@ -199,6 +199,23 @@ pub struct LoggedMessage {
     pub error: bool,
 }
 
+/// A command line the core queued for the server to run after the tick.
+///
+/// The two kinds exist so a `|` chain keeps running in the order it was typed:
+/// `:MyCmd|w` must write *after* `MyCmd` has run, but the core can't run `MyCmd`
+/// itself (it lives in the Lua command table). So the core defers the segment it
+/// doesn't know and defers the rest of the line behind it, instead of racing ahead.
+#[derive(Debug, Clone)]
+pub enum DeferredCmd {
+    /// Unknown to the core: the server resolves it against Lua user commands and its
+    /// own surface (`:source`, `:make`, …) before reporting an unknown-command error.
+    Server(String),
+    /// The tail of a `|` chain, to be run back **through the core** once the deferred
+    /// segment ahead of it has resolved. Skipped when that segment errored, matching
+    /// vim's abandon-the-rest-of-the-line-on-error behavior.
+    Chain(String),
+}
+
 /// Whether `line` reads as a vim error message: the `E###:` error-code prefix
 /// (an `E` followed by one or more digits and a colon, e.g. `E486:`) every
 /// built-in error carries. Lets [`Editor::record_message`] flag the bulk of
@@ -666,6 +683,14 @@ pub struct Editor {
     /// vim's alternate buffer (`#`), the `<C-^>` target; `None` until a switch
     /// sets it.
     alternate: Option<BufferId>,
+    /// The alternate **file name** — vim's `#` as a *name* rather than a live
+    /// handle. Tracked separately from [`Self::alternate`] because the two outlive
+    /// each other differently: vim's `:bdelete` only *unlists* a buffer, so `#`
+    /// keeps naming it and `:e #` reloads it from disk. nxvim frees the buffer
+    /// outright, so the id can't survive — the name does, which is what makes the
+    /// `:%bd|e#` idiom work. Set wherever the alternate is (`switch_buffer`, and a
+    /// `:bdelete` of the current buffer, which vim makes the new alternate).
+    alternate_name: Option<PathBuf>,
     /// The global file marks `A`–`Z`: each names a `(buffer, cursor)`, so a jump
     /// can cross buffers — unlike the buffer-local lowercase marks that live on the
     /// [`Buffer`] and ride its edit choke point. Set by `m{A-Z}`; jumping to one
@@ -1291,12 +1316,10 @@ pub struct Editor {
     /// Lua chunks queued by `:lua`, drained by the server's Lua runtime.
     pub lua_queue: Vec<String>,
 
-    /// Ex-commands the core didn't recognize, handed to the server to resolve
-    /// against Lua-defined user commands (`nvim_create_user_command`) before
-    /// falling back to an unknown-command error. Keeps the core ignorant of the
-    /// Lua command table while still routing typed `:Foo` and `vim.cmd.Foo()`
-    /// through one place.
-    pub deferred_commands: Vec<String>,
+    /// Command lines queued for the server to run after the tick, in order — see
+    /// [`DeferredCmd`] for the two kinds. Keeps the core ignorant of the Lua command
+    /// table while still routing typed `:Foo` and `vim.cmd.Foo()` through one place.
+    pub deferred_commands: Vec<DeferredCmd>,
 
     /// Milliseconds the server should block after the current command, set by
     /// `:sleep` and drained via [`Editor::take_sleep`]. Models a slow editor
@@ -1624,6 +1647,7 @@ impl Editor {
             dock_chord: DockChord::default(),
             restore_mode_on_enter: false,
             alternate: None,
+            alternate_name: None,
             global_marks: HashMap::new(),
             pending_global_marks: HashMap::new(),
             pending_file_marks: HashMap::new(),

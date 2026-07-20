@@ -989,6 +989,21 @@ impl Editor {
         self.enter_buffer(id);
     }
 
+    /// Switch the current window to buffer `id` as a **jump**: record the position
+    /// we leave in the jumplist (so `<C-o>` returns here) before the swap, exactly
+    /// as vim's `do_buffer` sets the previous-context mark. Backs the buffer-list
+    /// navigation commands (`:bnext`/`:bprev`/`:bfirst`/`:blast`/`:buffer`/`<C-^>`)
+    /// that vim counts as jumps — unlike the raw [`Editor::switch_buffer`]
+    /// primitive, which the jumplist navigation itself rides and so must *not*
+    /// record. A no-op switch (already current, or an unknown id) records no jump.
+    pub(crate) fn switch_buffer_as_jump(&mut self, id: BufferId) {
+        if id == self.cur_buffer() || !self.buffers.map.contains_key(&id) {
+            return;
+        }
+        self.record_jump_context();
+        self.switch_buffer(id);
+    }
+
     /// Make `id` the current buffer and restore its saved window position,
     /// landing in normal mode with transient state cleared. Unlike
     /// [`Editor::switch_buffer`] this does *not* stash the outgoing position —
@@ -1022,7 +1037,7 @@ impl Editor {
     /// is none (e.g. only one buffer is open).
     pub(crate) fn goto_alternate(&mut self) {
         match self.alternate {
-            Some(id) => self.switch_buffer(id),
+            Some(id) => self.switch_buffer_as_jump(id),
             None => self.echo("E23: No alternate file"),
         }
     }
@@ -1603,6 +1618,20 @@ impl Editor {
         self.edit_in_current_window(path)
     }
 
+    /// [`Editor::open_path_switchbuf`] as a **jump**: record the position we leave
+    /// (so `<C-o>` returns here) before opening, unless `path` is already the
+    /// current file (picking the file you're in is not a navigation). Backs the
+    /// picker's location-less file confirm (`nx._open_switchbuf`) — the moral
+    /// equivalent of `:edit file`, which vim counts as a jump. Plain
+    /// `open_path_switchbuf` does *not* record, because the located-navigation
+    /// callers ([`Editor::jump_to`]) record their own jump first.
+    pub fn open_path_switchbuf_as_jump(&mut self, path: &Path) -> Option<BufferId> {
+        if !self.current_buffer_is(path) {
+            self.record_jump_context();
+        }
+        self.open_path_switchbuf(path)
+    }
+
     /// Switch to an already-loaded buffer honoring `'switchbuf'`: focus a window
     /// already showing it ([`Editor::switchbuf_window`]) — switching tabs for
     /// `usetab` — else swap it into the current window ([`Editor::switch_buffer`],
@@ -1616,7 +1645,9 @@ impl Editor {
         if let Some((tab_idx, win)) = self.switchbuf_window(buf) {
             self.goto_tab_window(tab_idx, win);
         } else {
-            self.switch_buffer(buf);
+            // A same-window swap is a jump (`:buffer N` / `:b #` / the picker's
+            // buffers source): record the position we leave so `<C-o>` returns.
+            self.switch_buffer_as_jump(buf);
         }
     }
 
@@ -2019,7 +2050,7 @@ impl Editor {
         let ids = self.buffers_in_layer(self.focused_layer);
         let len = ids.len();
         if let Some(i) = ids.iter().position(|id| *id == self.cur_buffer()) {
-            self.switch_buffer(ids[(i + count) % len]);
+            self.switch_buffer_as_jump(ids[(i + count) % len]);
         }
     }
 
@@ -2029,21 +2060,21 @@ impl Editor {
         let ids = self.buffers_in_layer(self.focused_layer);
         let len = ids.len();
         if let Some(i) = ids.iter().position(|id| *id == self.cur_buffer()) {
-            self.switch_buffer(ids[(i + len - count % len) % len]);
+            self.switch_buffer_as_jump(ids[(i + len - count % len) % len]);
         }
     }
 
     /// `:bfirst` — switch to the lowest-numbered buffer in the focused layer.
     pub(crate) fn ex_bfirst(&mut self) {
         if let Some(&id) = self.buffers_in_layer(self.focused_layer).first() {
-            self.switch_buffer(id);
+            self.switch_buffer_as_jump(id);
         }
     }
 
     /// `:blast` — switch to the highest-numbered buffer in the focused layer.
     pub(crate) fn ex_blast(&mut self) {
         if let Some(&id) = self.buffers_in_layer(self.focused_layer).last() {
-            self.switch_buffer(id);
+            self.switch_buffer_as_jump(id);
         }
     }
 

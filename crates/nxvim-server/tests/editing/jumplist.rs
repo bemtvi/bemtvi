@@ -236,6 +236,117 @@ async fn a_jump_target_follows_lines_deleted_above_it() {
     assert_eq!(all[line - 1], "8");
 }
 
+#[tokio::test]
+async fn enew_records_a_jump_so_ctrl_o_returns_to_the_left_position() {
+    let (rpc, _incoming) = start(None).await;
+    ten_lines(&rpc).await; // cursor on line 10
+    feed(&rpc, "gg"); // -> line 1 (records 10)
+    feed(&rpc, "5G"); // -> line 5 (records 1)
+    assert_eq!(cursor(&rpc).await.0, 5);
+    // `:enew` starts editing a new, empty buffer — a jump, so it records the
+    // position it leaves (line 5).
+    feed(&rpc, ":enew<CR>");
+    assert_eq!(lines(&rpc).await, vec![""], "landed in an empty new buffer");
+    // `<C-o>` crosses back into the old buffer and returns to line 5.
+    feed(&rpc, "<C-o>");
+    assert_eq!(cursor(&rpc).await.0, 5);
+    assert_eq!(
+        lines(&rpc).await.len(),
+        10,
+        "back in the ten-line buffer, not the empty one"
+    );
+    // `<C-i>` returns forward into the new empty buffer we jumped away from.
+    feed(&rpc, "<C-i>");
+    assert_eq!(
+        lines(&rpc).await,
+        vec![""],
+        "forward again to the new buffer"
+    );
+}
+
+/// The user's exact repro: identical lines, search, `n`, `n`, then `:enew` —
+/// `<C-o>` must return to the last match (line 4), not the previous one.
+#[tokio::test]
+async fn ctrl_o_after_enew_returns_to_the_last_search_match() {
+    let (rpc, _incoming) = start(None).await;
+    feed(&rpc, "ia<CR>a<CR>a<CR>a<CR>a<CR>a<Esc>"); // six lines of "a"
+    feed(&rpc, "gg"); // -> line 1
+    feed(&rpc, "/a<CR>"); // -> line 2
+    feed(&rpc, "n"); // -> line 3
+    feed(&rpc, "n"); // -> line 4
+    assert_eq!(cursor(&rpc).await.0, 4);
+    feed(&rpc, ":enew<CR>");
+    feed(&rpc, "<C-o>");
+    assert_eq!(
+        cursor(&rpc).await.0,
+        4,
+        "must return to the last match, not the previous one"
+    );
+}
+
+// ----- buffer-list navigation records jumps ---------------------------------
+//
+// Switching buffers via `:bnext`/`:bprev`/`:buffer`/`<C-^>` is a jump in vim
+// (`do_buffer` sets the previous-context mark), so `<C-o>` returns to the buffer
+// and position you left. These commands cross buffers, so the round trip is
+// verified by which buffer the cursor lands in.
+
+#[tokio::test]
+async fn bnext_records_a_jump_so_ctrl_o_returns_to_the_left_buffer() {
+    let (rpc, _incoming) = start(None).await;
+    ten_lines(&rpc).await; // buffer 1, cursor on line 10
+    feed(&rpc, ":enew<CR>"); // buffer 2 (empty)
+    feed(&rpc, "ihi<Esc>"); // give buffer 2 some content
+                            // `:bnext` wraps back to buffer 1 — a jump, recording buffer 2's position.
+    feed(&rpc, ":bnext<CR>");
+    assert_eq!(lines(&rpc).await.len(), 10, "on the ten-line buffer 1");
+    // `<C-o>` returns to the buffer we navigated away from.
+    feed(&rpc, "<C-o>");
+    assert_eq!(lines(&rpc).await, vec!["hi"], "<C-o> returns to buffer 2");
+}
+
+#[tokio::test]
+async fn bprev_records_a_jump() {
+    let (rpc, _incoming) = start(None).await;
+    ten_lines(&rpc).await; // buffer 1
+    feed(&rpc, ":enew<CR>"); // buffer 2
+    feed(&rpc, "ihi<Esc>");
+    // `:bprev` also wraps to buffer 1 (two buffers), likewise a jump.
+    feed(&rpc, ":bprev<CR>");
+    assert_eq!(lines(&rpc).await.len(), 10);
+    feed(&rpc, "<C-o>");
+    assert_eq!(lines(&rpc).await, vec!["hi"], "<C-o> returns to buffer 2");
+}
+
+#[tokio::test]
+async fn ctrl_caret_alternate_records_a_jump() {
+    let (rpc, _incoming) = start(None).await;
+    ten_lines(&rpc).await; // buffer 1, cursor on line 10
+    feed(&rpc, "5G"); // buffer 1 line 5 (records 10)
+    feed(&rpc, ":enew<CR>"); // buffer 2 (records buffer 1 line 5)
+    feed(&rpc, "ihi<Esc>"); // buffer 2 content
+                            // `<C-^>` returns to the alternate (buffer 1) — a jump recording buffer 2.
+    feed(&rpc, "<C-^>");
+    assert_eq!(lines(&rpc).await.len(), 10, "back on buffer 1");
+    assert_eq!(cursor(&rpc).await.0, 5, "at its saved position");
+    // `<C-o>` returns to the buffer `<C-^>` left.
+    feed(&rpc, "<C-o>");
+    assert_eq!(lines(&rpc).await, vec!["hi"], "<C-o> returns to buffer 2");
+}
+
+#[tokio::test]
+async fn buffer_number_switch_records_a_jump() {
+    let (rpc, _incoming) = start(None).await;
+    ten_lines(&rpc).await; // buffer 1
+    feed(&rpc, ":enew<CR>"); // buffer 2
+    feed(&rpc, "ihi<Esc>");
+    // `:buffer 1` swaps buffer 1 into this window — a jump recording buffer 2.
+    feed(&rpc, ":buffer 1<CR>");
+    assert_eq!(lines(&rpc).await.len(), 10, "on buffer 1");
+    feed(&rpc, "<C-o>");
+    assert_eq!(lines(&rpc).await, vec!["hi"], "<C-o> returns to buffer 2");
+}
+
 // ----- vim.fn.getjumplist ---------------------------------------------------
 //
 // `getjumplist([winnr [, tabnr]])` returns `[list, curidx]`: the jumplist as an

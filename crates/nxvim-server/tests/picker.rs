@@ -1225,6 +1225,45 @@ async fn edit_helper_opens_a_file_and_jumps_to_the_location() {
     );
 }
 
+#[tokio::test]
+async fn picker_file_open_records_a_jump_so_ctrl_o_returns() {
+    // The finder's location-less file confirm (`files` source → `nx.picker.edit`
+    // with no `row`) opens through `nx._open_switchbuf`, which — like `:edit` — is
+    // a jump: `<C-o>` must return to where we were, not one entry further back.
+    let dir = temp_dir("picker_jump");
+    let file = dir.join("other.txt");
+    std::fs::write(&file, "x\ny\nz\n").unwrap();
+    let (rpc, _incoming) = start(&dir, "").await;
+
+    // Buffer 1: six lines of "a"; search then `n` `n` lands on line 4.
+    feed(&rpc, "ia<CR>a<CR>a<CR>a<CR>a<CR>a<Esc>");
+    feed(&rpc, "gg");
+    feed(&rpc, "/a<CR>");
+    feed(&rpc, "nn");
+    assert_eq!(cursor(&rpc).await.0, 4);
+
+    // Pick a file in the finder (no location) — a plain open, still a jump.
+    exec_lua(
+        &rpc,
+        &format!("nx.picker.edit({{ path = '{}' }})", file.display()),
+    )
+    .await;
+    assert_eq!(
+        lines(&rpc).await,
+        vec!["x", "y", "z"],
+        "opened the picked file"
+    );
+
+    // `<C-o>` returns to line 4 of the original buffer.
+    feed(&rpc, "<C-o>");
+    assert_eq!(
+        cursor(&rpc).await.0,
+        4,
+        "returns to the last match, not the previous one"
+    );
+    assert_eq!(lines(&rpc).await.len(), 6, "back in the six-line buffer");
+}
+
 /// The menu's projected box size `(width, height)` in content cells.
 fn menu_size(menu: &[(Value, Value)]) -> (u64, u64) {
     (

@@ -2164,6 +2164,13 @@ impl Editor {
         // (so the first `:e` doesn't strand an empty buffer 1), or load a fresh buffer and
         // switch. The kernel routes the load off-tick in a daemon session and synchronously
         // otherwise — the same `:tabnew` / go-to / explorer share.
+        //
+        // Reaching here means the target is *not* the current file (the reload
+        // branch above returned), so this is a jump in vim's sense: record the
+        // position we leave first, so `<C-o>` returns here after the switch. (The
+        // shared `edit_in_current_window` kernel must not do this itself — the
+        // located-navigation callers, e.g. `jump_to`, record their own jump.)
+        self.record_jump_context();
         self.edit_in_current_window(&path);
     }
 
@@ -2326,6 +2333,9 @@ impl Editor {
         if self.current_is_throwaway() {
             return;
         }
+        // Starting to edit a new buffer is a jump: stash the position we leave so
+        // `<C-o>` returns here (vim records the pre-jump mark in `do_ecmd`).
+        self.record_jump_context();
         let id = self.add_buffer(Buffer::empty());
         self.switch_buffer(id);
     }

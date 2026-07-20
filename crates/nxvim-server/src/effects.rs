@@ -1483,7 +1483,10 @@ impl EditHost {
                 if to_main {
                     self.editor.ensure_main_layer();
                 }
-                self.editor.open_path_switchbuf(std::path::Path::new(&path));
+                // The picker's location-less file confirm is a jump (like `:edit`):
+                // record the position we leave so `<C-o>` returns here.
+                self.editor
+                    .open_path_switchbuf_as_jump(std::path::Path::new(&path));
             }
             WindowOp::BufSwitch {
                 buf,

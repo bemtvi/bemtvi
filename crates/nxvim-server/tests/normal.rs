@@ -88,6 +88,31 @@ async fn normal_range_is_one_undo_step() {
     assert_eq!(lines(&rpc).await, vec!["one", "two", "three"]);
 }
 
+/// A *trailing* keystroke that happens to be whitespace is still a keystroke: a
+/// literal tab (`\9`) is `<Tab>` == `<C-i>`, which walks forward in the jumplist.
+/// Regression: the ex line was whitespace-trimmed before `:normal`'s argument was
+/// parsed, so the tab was silently dropped and the command became a no-op.
+#[tokio::test]
+async fn normal_bang_trailing_tab_jumps_forward() {
+    let (rpc, _incoming) = start("1\n2\n3\n4\n5\n").await;
+    feed(&rpc, "G"); // jump 1 -> 5, recording line 1 as the position jumped from
+    assert_eq!(cursor(&rpc).await.0, 5);
+    feed(&rpc, "<C-o>"); // back to line 1
+    assert_eq!(cursor(&rpc).await.0, 1);
+    // `\9` is a literal tab — `<C-i>`, so this jumps forward to line 5 again.
+    exec_lua(&rpc, "vim.cmd('normal! \\9')").await;
+    assert_eq!(cursor(&rpc).await.0, 5);
+}
+
+/// A trailing space is likewise significant: `<Space>` is `l` in Normal mode, so
+/// `0 ` lands on column 1 rather than column 0.
+#[tokio::test]
+async fn normal_bang_trailing_space_moves_right() {
+    let (rpc, _incoming) = start("abcdef\n").await;
+    exec_lua(&rpc, "vim.cmd('normal! 0 ')").await;
+    assert_eq!(cursor(&rpc).await, (1, 1));
+}
+
 /// `:normal` is recognized via its abbreviations (`:norm`) too.
 #[tokio::test]
 async fn normal_abbreviation_norm() {

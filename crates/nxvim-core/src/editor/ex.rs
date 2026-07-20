@@ -680,6 +680,25 @@ impl Editor {
             return;
         }
 
+        // `:normal`'s argument is *literal*, so whitespace at the end of it is a
+        // real keystroke — `\t` is `<Tab>` (== `<C-i>`, jump forward) and a space
+        // is `l` — but the trim above has just eaten it. When the line did lose a
+        // trailing run, re-parse it from `raw` and dispatch `:normal` with the
+        // argument untrimmed. Only leading whitespace is skipped, which is always
+        // insignificant, and a range prefix (`%`, `2,3`) can't carry a meaningful
+        // trailing space either, so nothing significant is lost by the pre-parse.
+        // Guarded on the length change so the common no-trailing-space line keeps
+        // the single range parse below.
+        let lead = raw.trim_start();
+        if lead.len() > cmd.len() {
+            if let Ok((range, rest)) = self.parse_ex_range(lead) {
+                if let Some((bang, body)) = parse_normal_prefix(rest.trim_start()) {
+                    self.ex_normal(range, bang, body);
+                    return;
+                }
+            }
+        }
+
         // Strip and resolve any leading range (`.`, `$`, `%`, `N`, `+N`, `lo,hi`)
         // before the command name. A range with no command moves the cursor to
         // the last address; a malformed range fails loud rather than guessing.
@@ -730,10 +749,12 @@ impl Editor {
 
         // `:[range]normal[!] {commands}` runs its argument as **literal**
         // keystrokes — `<CR>` is the four chars `<`,`C`,`R`,`>` (not Enter) and
-        // whitespace is significant — so it is recognized on the raw remainder
-        // here, ahead of `split_ex`, which trims the argument and is blind to that
-        // literal shape. `:execute "normal! …"` is how special keys are embedded,
-        // exactly as in vim.
+        // whitespace is significant — so it is recognized here, ahead of
+        // `split_ex`, which trims the argument and is blind to that literal shape.
+        // `:execute "normal! …"` is how special keys are embedded, exactly as in
+        // vim. An argument ending in whitespace has already been dispatched by the
+        // pre-parse above; this arm handles the rest, where `rest` and the raw
+        // remainder agree.
         if let Some((bang, body)) = parse_normal_prefix(rest) {
             self.ex_normal(range, bang, body);
             return;

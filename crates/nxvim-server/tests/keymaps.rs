@@ -13,7 +13,7 @@
 use nxvim_rpc::{Incoming, Rpc};
 use nxvim_server::ServerInit;
 use nxvim_test_harness::{
-    attach, cursor, drain_to_latest_redraw, feed, lines, lua_bool, mode, spawn, temp_dir,
+    attach, cursor, drain_to_latest_redraw, feed, lines, lua_bool, lua_u64, mode, spawn, temp_dir,
 };
 use rmpv::Value;
 use tokio::sync::mpsc::UnboundedReceiver;
@@ -1460,4 +1460,74 @@ async fn gg_operator_sequences_survive_g_prefix_maps() {
     feed(&rpc2, "iline1<CR>line2<CR>line3<Esc>");
     feed(&rpc2, "dgg");
     assert_eq!(lines(&rpc2).await, vec![""], "dgg deleted to the top");
+}
+
+// ===== count consumption by a Lua RHS ======================================
+
+/// A count typed before a **Lua** mapping is the mapping's *argument*: it is
+/// published as `v:count` / `v:count1` and then **consumed**, so whatever the
+/// function executes starts from a clean pending command.
+///
+/// Regression: the pending state was only cleared *after* the RHS ran, so a
+/// count the function itself fed concatenated onto the typed one — the common
+/// `<C-o>` wrapper (`vim.cmd("normal! " .. vim.v.count1 .. "\15")` under
+/// `3<C-o>`) fed `3` on top of the pending `3` and jumped back 33 places, i.e.
+/// silently did nothing. A `normal!` with no count of its own inherited the
+/// typed count instead of running once.
+#[tokio::test]
+async fn a_lua_rhs_consumes_the_typed_count_before_its_effects_run() {
+    let dir = temp_dir("keymap_count_consumed");
+    let (rpc, _incoming) = start_with_config(
+        &dir,
+        r#"
+          vim.keymap.set("n", "<leader>j", function()
+            _G.count1 = vim.v.count1
+            vim.cmd("normal! " .. vim.v.count1 .. "j")
+          end)
+          vim.keymap.set("n", "<leader>k", function()
+            vim.cmd("normal! k") -- no count of its own
+          end)
+        "#,
+    )
+    .await;
+
+    feed(&rpc, "ia<CR>b<CR>c<CR>d<CR>e<CR>f<CR>g<Esc>gg"); // seven lines, cursor on 1
+    assert_eq!(cursor(&rpc).await.0, 1);
+
+    // The RHS sees the typed count …
+    feed(&rpc, "3\\j");
+    assert_eq!(
+        lua_u64(&rpc, "return _G.count1").await,
+        Some(3),
+        "the Lua RHS reads the typed count as v:count1"
+    );
+    // … and its own `normal! 3j` moves exactly 3 lines (not 33 → clamped/no-op).
+    assert_eq!(cursor(&rpc).await.0, 4, "normal! 3j moved three lines");
+
+    // A `normal!` with no count of its own runs once — the typed count was
+    // already consumed by the mapping, so it must not leak in.
+    feed(&rpc, "3\\k");
+    assert_eq!(
+        cursor(&rpc).await.0,
+        3,
+        "normal! k moved one line, not three"
+    );
+
+    // And nothing leaks into the *next* command either.
+    feed(&rpc, "j");
+    assert_eq!(cursor(&rpc).await.0, 4, "the following j moved one line");
+}
+
+/// The counterpart: a **string** RHS still gets the count prefixed to it, as in
+/// vim (`3x` with `x` mapped to `dd` deletes three lines). Only the Lua-function
+/// arm consumes the count up front.
+#[tokio::test]
+async fn a_string_rhs_still_takes_the_typed_count() {
+    let dir = temp_dir("keymap_count_string_rhs");
+    let (rpc, _incoming) =
+        start_with_config(&dir, "vim.keymap.set('n', 'X', 'dd', { remap = false })\n").await;
+
+    feed(&rpc, "ia<CR>b<CR>c<CR>d<Esc>gg");
+    feed(&rpc, "3X");
+    assert_eq!(lines(&rpc).await, vec!["d"], "3X deleted three lines");
 }

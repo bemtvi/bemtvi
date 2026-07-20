@@ -381,8 +381,21 @@ impl EditHost {
             MappingRhs::Lua(id) => {
                 // A keymap function commonly reads the cursor / buffer lines; this
                 // is a synchronous Lua entry that runs before the trailing
-                // `run_pending`, so refresh the mirror first (Phase 6).
+                // `run_pending`, so refresh the mirror first (Phase 6). This also
+                // publishes `v:count` / `v:register` from the pending state the
+                // count typed ahead of the mapping left behind.
                 self.push_buf_mirror();
+                // …and having published them, *consume* them before the function
+                // runs. A Lua RHS acts (unlike a string RHS, whose keys the count
+                // still prefixes), so vim's model is that the mapping has taken the
+                // count as its argument: anything the function then executes starts
+                // from a clean pending command. Left set, the count leaks into the
+                // RHS's own effects and **concatenates** — `3<C-o>` mapped to a
+                // function running `vim.cmd("normal! " .. vim.v.count1 .. "\15")`
+                // would feed `3` on top of the pending `3` and jump back 33, a
+                // silent no-op. (The trailing clear in `fire_mapping` still covers
+                // the string-RHS arm, where the count must survive the feed.)
+                self.editor.clear_pending_command();
                 if let Err(e) = self.lua.run_keymap(id) {
                     self.editor
                         .echo(format!("E5108: Error executing keymap: {e}"));

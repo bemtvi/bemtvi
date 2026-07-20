@@ -576,10 +576,44 @@ fn parse_special(inner: &str) -> Option<Key> {
         }
     };
 
-    Some(Key {
+    Some(canonical_ctrl_alias(Key {
         code,
         ctrl,
         alt,
         shift,
-    })
+    }))
+}
+
+/// Fold the four Ctrl-chords that share a byte with a *named* terminal key onto
+/// that named key: `<C-i>` → `<Tab>` (0x09), `<C-m>` → `<CR>` (0x0d), `<C-[>` →
+/// `<Esc>` (0x1b), `<C-h>` → `<BS>` (0x08). Vim canonicalizes these the same way,
+/// and for the same reason: a terminal cannot tell the two spellings apart, so
+/// they are one key with two names.
+///
+/// Without this the two spellings are distinct keys in the keymap layer while the
+/// TUI can only ever *produce* the named one (crossterm decodes 0x09 as
+/// `KeyCode::Tab`, with no CONTROL modifier) — so `vim.keymap.set("n", "<C-i>", …)`
+/// registers a mapping that can never fire, a silent no-op. This is the notation
+/// twin of [`key_from_control_byte`], which already resolves the same collisions
+/// for a raw control byte.
+///
+/// Only an otherwise-unmodified Ctrl-chord folds: `<C-S-i>` / `<C-A-i>` carry a
+/// modifier a terminal *can* distinguish (kitty keyboard protocol), so they stay
+/// as they are rather than silently losing the extra modifier.
+///
+/// One consequence worth knowing: in a terminal buffer, `<C-h>` now feeds the same
+/// bytes as `<BS>` (0x7f, the DEL convention a PTY expects) rather than a literal
+/// 0x08. The other three are byte-identical either way.
+fn canonical_ctrl_alias(key: Key) -> Key {
+    if !key.ctrl || key.alt || key.shift {
+        return key;
+    }
+    let code = match key.code {
+        KeyCode::Char('i') => KeyCode::Tab,
+        KeyCode::Char('m') => KeyCode::Enter,
+        KeyCode::Char('[') => KeyCode::Esc,
+        KeyCode::Char('h') => KeyCode::Backspace,
+        _ => return key,
+    };
+    Key::new(code)
 }

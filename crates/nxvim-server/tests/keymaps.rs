@@ -1531,3 +1531,69 @@ async fn a_string_rhs_still_takes_the_typed_count() {
     feed(&rpc, "3X");
     assert_eq!(lines(&rpc).await, vec!["d"], "3X deleted three lines");
 }
+
+// ===== `<C-i>`/`<Tab>`-class notation aliases ==============================
+
+/// The four Ctrl-chords that share a byte with a named terminal key — `<C-i>`
+/// (0x09), `<C-m>` (0x0d), `<C-[>` (0x1b), `<C-h>` (0x08) — are canonicalized to
+/// that named key when notation is parsed, as vim does. Either spelling on the
+/// mapping LHS therefore matches the key the client actually sends.
+///
+/// Regression: they were distinct keys in the keymap layer, while the TUI can
+/// only ever *produce* the named one (crossterm decodes 0x09 as `KeyCode::Tab`,
+/// no CONTROL modifier). A `vim.keymap.set("n", "<C-i>", …)` was a mapping that
+/// could never fire — silently dead, with the built-in acting in its place.
+#[tokio::test]
+async fn ctrl_chord_aliases_canonicalize_to_the_named_key() {
+    // (LHS spelling, the key notation a client actually sends for it)
+    for (lhs, sent) in [
+        ("<C-i>", "<Tab>"),
+        ("<Tab>", "<C-i>"),
+        ("<C-m>", "<CR>"),
+        ("<CR>", "<C-m>"),
+        ("<C-[>", "<Esc>"),
+        ("<Esc>", "<C-[>"),
+        ("<C-h>", "<BS>"),
+        ("<BS>", "<C-h>"),
+    ] {
+        let dir = temp_dir("keymap_ctrl_alias");
+        let (rpc, _incoming) = start_with_config(
+            &dir,
+            &format!("_G.fired = 0\nvim.keymap.set('n', '{lhs}', function() _G.fired = _G.fired + 1 end)\n"),
+        )
+        .await;
+
+        feed(&rpc, sent);
+        assert_eq!(
+            lua_u64(&rpc, "return _G.fired").await,
+            Some(1),
+            "a map on {lhs} fires for {sent} — they are one key with two names"
+        );
+    }
+}
+
+/// The fold applies only to an *otherwise-unmodified* Ctrl-chord: `<C-S-i>` and
+/// `<C-A-i>` carry a modifier a terminal can distinguish (kitty keyboard
+/// protocol), so they stay their own keys rather than losing the extra modifier.
+#[tokio::test]
+async fn a_further_modified_ctrl_chord_does_not_fold() {
+    let dir = temp_dir("keymap_ctrl_alias_mod");
+    let (rpc, _incoming) = start_with_config(
+        &dir,
+        "_G.fired = 0\nvim.keymap.set('n', '<C-A-i>', function() _G.fired = _G.fired + 1 end)\n",
+    )
+    .await;
+
+    feed(&rpc, "<Tab>");
+    assert_eq!(
+        lua_u64(&rpc, "return _G.fired").await,
+        Some(0),
+        "<Tab> did not fire the <C-A-i> map"
+    );
+    feed(&rpc, "<C-A-i>");
+    assert_eq!(
+        lua_u64(&rpc, "return _G.fired").await,
+        Some(1),
+        "<C-A-i> is still its own key"
+    );
+}

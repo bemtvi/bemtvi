@@ -784,18 +784,18 @@ function nx.buf.extmarks(buffer, ns, start, end_, opts)
   return out
 end
 
--- `nvim_replace_termcodes(str, from_part, do_lt, special)`: in neovim, translate
--- key notation (`<CR>`, `<C-w>`, `<lt>`, …) into the internal terminal-byte
--- encoding. nxvim represents keys as that *notation* throughout — `parse_keys` and
--- `nvim_feedkeys` consume notation directly — so the canonical internal form of a
--- key string already IS the notation, and this returns `str` unchanged. The
--- result round-trips exactly through `nvim_feedkeys` (which re-parses the notation),
--- which is the contract callers rely on (build a "feed string", later feed it).
--- The flags (`from_part` / `do_lt` / `special`) only shape neovim's byte output and are
--- accepted for call-compatibility; `<lt>` and the special names are handled by
--- `parse_keys` at feed time, so no pre-translation is needed here.
+-- `nvim_replace_termcodes(str, from_part, do_lt, special)`: translate key notation
+-- (`<CR>`, `<C-w>`, `<lt>`, …) into neovim's terminal-byte encoding — `<C-o>` →
+-- `\15`, `<CR>` → `\r`, `<Esc>` → `\27`, `<lt>` → `<` — via the native
+-- `nx._replace_termcodes`. Keys with no single ASCII byte (arrows, function keys)
+-- have no such encoding nxvim can emit (neovim uses K_SPECIAL sequences nxvim
+-- doesn't model), so they stay as `<...>` notation, which `parse_keys` still
+-- consumes — so the result round-trips exactly through `nvim_feedkeys` (build a
+-- "feed string", later feed it). The flags (`from_part` / `do_lt` / `special`) only
+-- shape neovim's byte output and are accepted for call-compatibility; nxvim always
+-- translates the special names and `<lt>`.
 function nx.replace_termcodes(str, _from_part, _do_lt, _special)
-  return tostring(str or "")
+  return nx._replace_termcodes(tostring(str or ""))
 end
 
 -- `nx.hl.define` (the canonical highlight setter) is installed from Rust — it

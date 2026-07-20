@@ -421,6 +421,32 @@ pub(crate) fn install_vim(lua: &Lua, shared: &Rc<RefCell<Shared>>) -> mlua::Resu
         "_strwidth",
         lua.create_function(|_, s: String| Ok(UnicodeWidthStr::width(s.as_str())))?,
     )?;
+    // `nx._replace_termcodes(s)` (exposed by the prelude as `nx.replace_termcodes` /
+    // `vim.api.nvim_replace_termcodes`): translate vim key-notation into the
+    // terminal-byte encoding neovim emits — Ctrl-chords (`<C-o>` → `\x0f`), the
+    // named control keys (`<CR>`/`<Esc>`/`<Tab>`/`<BS>`), `<Space>`, and `<lt>` —
+    // via the pure `nxvim_core::input::replace_termcodes`. Keys with no ASCII byte
+    // (arrows, function keys) stay as notation, which `parse_keys` still consumes,
+    // so the result round-trips through `nvim_feedkeys`.
+    nx.set(
+        "_replace_termcodes",
+        lua.create_function(|lua, s: String| {
+            lua.create_string(nxvim_core::input::replace_termcodes(&s))
+        })?,
+    )?;
+    // `nx._keytrans(s)` (exposed by the prelude as `nx.keytrans` / `vim.fn.keytrans`):
+    // the inverse of `_replace_termcodes` — decode the terminal-byte form back into
+    // readable key notation (`\x0f` → `<C-o>`), via `parse_keys` + `key_to_notation`.
+    nx.set(
+        "_keytrans",
+        lua.create_function(|lua, s: String| {
+            let out: String = nxvim_core::parse_keys(&s)
+                .into_iter()
+                .map(nxvim_core::key_to_notation)
+                .collect();
+            lua.create_string(out)
+        })?,
+    )?;
     // `nx._markdown_render(src)` (exposed by the prelude as `nx.markdown.render`):
     // parse CommonMark+GFM `src` into stripped display lines + `@markup.*` highlight
     // ranges, via the pure `nxvim_core::markdown` renderer (the same one the LSP doc

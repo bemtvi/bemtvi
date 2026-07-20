@@ -278,11 +278,95 @@ pub fn parse_keys(input: &str) -> Vec<Key> {
             out.push(Key::char('<'));
             i += 1;
         } else {
-            out.push(Key::char(chars[i]));
+            // A raw control byte (0x00–0x1f) that `nvim_replace_termcodes` emitted
+            // is decoded back into its key event, so a feed string built with
+            // `replace_termcodes` round-trips through `nvim_feedkeys`.
+            out.push(key_from_control_byte(chars[i]).unwrap_or_else(|| Key::char(chars[i])));
             i += 1;
         }
     }
     out
+}
+
+/// Decode a raw ASCII control byte (as emitted by [`replace_termcodes`], and by
+/// neovim's `nvim_replace_termcodes`) back into its [`Key`]. Returns `None` for a
+/// non-control character, which the caller keeps as a literal `Key::char`.
+///
+/// The named terminal keys take precedence over their Ctrl-letter alias at the
+/// same byte (`\r` → `<CR>` not `<C-m>`, `\t` → `<Tab>`, `\x1b` → `<Esc>`,
+/// `\x08` → `<BS>`), matching how vim canonicalizes them.
+fn key_from_control_byte(c: char) -> Option<Key> {
+    let b = c as u32;
+    let plain = |code| Key::new(code);
+    // `byte ^ 0x40` recovers the ASCII letter/symbol of a Ctrl-chord (0x0f → 'O').
+    let ctrl = |b: u32| char::from_u32(b ^ 0x40).map(|ch| Key::ctrl(ch.to_ascii_lowercase()));
+    match b {
+        0x0d => Some(plain(KeyCode::Enter)),
+        0x1b => Some(plain(KeyCode::Esc)),
+        0x09 => Some(plain(KeyCode::Tab)),
+        0x08 => Some(plain(KeyCode::Backspace)),
+        // Ctrl-@ / Ctrl-A..Z / Ctrl-\ Ctrl-] Ctrl-^ Ctrl-_ (minus the named keys above).
+        0x00..=0x1f => ctrl(b),
+        _ => None,
+    }
+}
+
+/// Translate vim key-notation into the terminal-byte encoding neovim's
+/// `nvim_replace_termcodes` produces — for the keys that HAVE a single-byte ASCII
+/// form: the Ctrl-chords (`<C-o>` → `\x0f`), the named control keys (`<CR>` →
+/// `\r`, `<Esc>` → `\x1b`, `<Tab>` → `\t`, `<BS>` → `\x08`), `<Space>`, and
+/// `<lt>` → `<`.
+///
+/// A key with no ASCII byte (`<Del>`, arrows, function keys, mouse, or an Alt-modified
+/// chord) has no encoding nxvim can emit — neovim renders those with K_SPECIAL
+/// multi-byte sequences nxvim doesn't model — so it is left as its `<...>`
+/// notation, which [`parse_keys`] still consumes so the round-trip through
+/// `nvim_feedkeys` holds.
+pub fn replace_termcodes(input: &str) -> String {
+    let mut out = String::new();
+    for key in parse_keys(input) {
+        match key_to_termcode(key) {
+            Some(c) => out.push(c),
+            None => out.push_str(&key_to_notation(key)),
+        }
+    }
+    out
+}
+
+/// The single ASCII/control byte a [`Key`] encodes to, if it has one; `None` for
+/// keys that only have a K_SPECIAL multi-byte form in vim. The inverse of
+/// [`key_from_control_byte`] over the bytes both cover.
+fn key_to_termcode(key: Key) -> Option<char> {
+    // An Alt chord has no single-byte form here (neovim uses ESC-prefix / K_SPECIAL).
+    if key.alt {
+        return None;
+    }
+    match key.code {
+        KeyCode::Char(c) => {
+            if key.ctrl {
+                // `toupper(c) ^ 0x40` is vim's CTRL_CHR: 'o'/'O' → 0x0f. Only valid
+                // when it lands in the control range (letters and @[\]^_?).
+                let u = (c.to_ascii_uppercase() as u32) ^ 0x40;
+                (u <= 0x1f || u == 0x7f)
+                    .then(|| char::from_u32(u))
+                    .flatten()
+            } else {
+                // Shift is already baked into `c`; a bare printable is itself.
+                Some(c)
+            }
+        }
+        // The named keys map to their control byte only in plain form; a modified
+        // variant (`<S-Tab>`, `<C-CR>`) is a distinct K_SPECIAL key — keep it as
+        // notation.
+        _ if key.ctrl || key.shift => None,
+        KeyCode::Enter => Some('\r'),
+        KeyCode::Esc => Some('\u{1b}'),
+        KeyCode::Tab => Some('\t'),
+        KeyCode::Backspace => Some('\u{08}'),
+        // `<Del>` and the cursor/function keys have no ASCII byte (K_SPECIAL in
+        // vim) — keep them as notation so `parse_keys` round-trips them.
+        _ => None,
+    }
 }
 
 /// Render a [`Key`] back into vim key-notation — the inverse of [`parse_keys`]

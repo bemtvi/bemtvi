@@ -377,6 +377,131 @@ async fn buf_get_keymap_separates_buffer_local_from_global() {
 
 // ============== nvim_replace_termcodes + nvim_feedkeys =====================
 
+// `nvim_replace_termcodes('<C-o>', ...)` returns the terminal-byte encoding —
+// the single control byte `\15` (0x0f) — exactly like neovim, NOT the `<C-o>`
+// notation unchanged.
+#[tokio::test]
+async fn replace_termcodes_emits_control_byte() {
+    let dir = temp_dir("rtc_ctrl");
+    let (rpc, _incoming) = start_with_config(&dir, "").await;
+
+    // Ctrl-O -> 0x0f, a one-byte string.
+    assert_eq!(
+        exec_lua(
+            &rpc,
+            "return string.byte(vim.api.nvim_replace_termcodes('<C-o>', true, true, true))",
+        )
+        .await,
+        Value::from(15u64)
+    );
+    assert_eq!(
+        exec_lua(
+            &rpc,
+            "return #vim.api.nvim_replace_termcodes('<C-o>', true, true, true)",
+        )
+        .await,
+        Value::from(1u64)
+    );
+    // The named keys map to their ASCII control byte, and `<lt>` to a bare '<'.
+    assert_eq!(
+        exec_lua(
+            &rpc,
+            "local t = vim.api.nvim_replace_termcodes\n\
+             return string.format('%d,%d,%d,%d,%d',\n\
+               string.byte(t('<CR>', true, true, true)),\n\
+               string.byte(t('<Esc>', true, true, true)),\n\
+               string.byte(t('<Tab>', true, true, true)),\n\
+               string.byte(t('<lt>', true, true, true)),\n\
+               string.byte(t('<Space>', true, true, true)))",
+        )
+        .await,
+        // \r=13, \27, \t=9, '<'=60, ' '=32
+        Value::from("13,27,9,60,32")
+    );
+    // A mixed sequence keeps printable chars and interleaves the control bytes.
+    assert_eq!(
+        exec_lua(
+            &rpc,
+            "local s = vim.api.nvim_replace_termcodes('x<C-o>y<CR>', true, true, true)\n\
+             return string.format('%d,%d,%d,%d,%d', #s, s:byte(1), s:byte(2), s:byte(3), s:byte(4))",
+        )
+        .await,
+        // 'x'=120, \15, 'y'=121, \r=13 — four bytes.
+        Value::from("4,120,15,121,13")
+    );
+}
+
+// A key with no single-byte ASCII form (arrows, function keys) has no
+// terminal-byte encoding nxvim can emit — neovim uses K_SPECIAL sequences nxvim
+// doesn't model — so it stays as `<...>` notation, which `parse_keys` still
+// consumes so the round-trip through feedkeys holds.
+#[tokio::test]
+async fn replace_termcodes_keeps_non_ascii_keys_as_notation() {
+    let dir = temp_dir("rtc_notation");
+    let (rpc, _incoming) = start_with_config(&dir, "").await;
+
+    assert_eq!(
+        exec_lua(
+            &rpc,
+            "return vim.api.nvim_replace_termcodes('<Left>', true, true, true)",
+        )
+        .await,
+        Value::from("<Left>")
+    );
+    assert_eq!(
+        exec_lua(
+            &rpc,
+            "return vim.api.nvim_replace_termcodes('<F5>', true, true, true)",
+        )
+        .await,
+        Value::from("<F5>")
+    );
+}
+
+// The result of `nvim_replace_termcodes` round-trips through feedkeys: the
+// control bytes it emits parse back into the same key events, so building a feed
+// string and later feeding it produces the intended edit.
+#[tokio::test]
+async fn replace_termcodes_round_trips_through_feedkeys() {
+    let dir = temp_dir("rtc_roundtrip");
+    let (rpc, _incoming) = start_with_config(&dir, "").await;
+
+    // `ihello<Esc>` -> "ihello\27": the 0x1b byte must re-parse as <Esc> to leave
+    // insert mode, otherwise it would be typed literally into the buffer.
+    exec_lua(
+        &rpc,
+        "local k = vim.api.nvim_replace_termcodes('ihello<Esc>', true, true, true)\n\
+         nx._feedkeys(k, false, false)",
+    )
+    .await;
+    assert_eq!(
+        exec_lua(&rpc, "return vim.api.nvim_get_current_line()").await,
+        Value::from("hello")
+    );
+    // Back in normal mode (the <Esc> byte was honored, not inserted).
+    assert_eq!(
+        exec_lua(&rpc, "return vim.api.nvim_get_mode().mode").await,
+        Value::from("n")
+    );
+}
+
+// `keytrans` is the exact inverse: it turns the internal terminal-byte form back
+// into readable key notation.
+#[tokio::test]
+async fn keytrans_inverts_replace_termcodes() {
+    let dir = temp_dir("keytrans_inv");
+    let (rpc, _incoming) = start_with_config(&dir, "").await;
+
+    assert_eq!(
+        exec_lua(&rpc, "return vim.fn.keytrans('\\15')").await,
+        Value::from("<C-o>")
+    );
+    assert_eq!(
+        exec_lua(&rpc, "return vim.fn.keytrans('\\27')").await,
+        Value::from("<Esc>")
+    );
+}
+
 // ========================= popup render surface ============================
 // The APIs a floating popup UI drives to *render* itself: highlight reads
 // (nvim_get_hl), context callbacks (nvim_buf_call / nvim_win_call), scratch-buffer

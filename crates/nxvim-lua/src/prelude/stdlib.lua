@@ -960,14 +960,13 @@ function nx.str.trans(s)
 end
 vim.fn.strtrans = nx.str.trans
 
--- `nx.keytrans(s)` [alias `vim.fn.keytrans`]: translate the internal form of a key
--- sequence to readable key notation (`<C-w>`, `<Space>`, …). nxvim represents keys
--- AS that notation throughout (`parse_keys` / `nvim_feedkeys` consume notation directly,
--- and `nvim_replace_termcodes` returns its input unchanged), so the internal form
--- already IS the notation — this returns `s` unchanged, the inverse of
--- `nvim_replace_termcodes` exactly as in vim.
+-- `nx.keytrans(s)` [alias `vim.fn.keytrans`]: translate the internal terminal-byte
+-- form of a key sequence into readable key notation (`\15` → `<C-o>`, `\r` → `<CR>`,
+-- `<Space>`, …) — the exact inverse of `nvim_replace_termcodes`, via the native
+-- `nx._keytrans` (`parse_keys` + `key_to_notation`). A string already in notation
+-- round-trips through unchanged.
 function nx.keytrans(s)
-  return tostring(s or "")
+  return nx._keytrans(tostring(s or ""))
 end
 vim.fn.keytrans = nx.keytrans
 

@@ -594,6 +594,78 @@ async fn escape_restores_the_origin_after_an_incsearch_preview() {
     assert_eq!(cursor(&rpc).await, (1, 0), "Esc restores the search origin");
 }
 
+#[tokio::test]
+async fn substitute_command_line_highlights_its_matches_while_typing() {
+    let (rpc, mut incoming) = search_fixture().await;
+    // Typing `:%s/foo` (no <CR>) lights up every "foo" the substitute would hit.
+    let map = redraw_after(&rpc, &mut incoming, ":%s/foo").await;
+    let search = view_search(&map);
+    assert_eq!(search.first().cloned().unwrap_or_default(), vec![(0, 3)]);
+    assert_eq!(search.get(1).cloned().unwrap_or_default(), vec![(4, 7)]);
+    assert_eq!(search.get(2).cloned().unwrap_or_default(), vec![(4, 7)]);
+}
+
+#[tokio::test]
+async fn substitute_preview_is_confined_to_the_addressed_range() {
+    let (rpc, mut incoming) = search_fixture().await;
+    // `:2s/foo` only ever touches line 2, so only that line's match lights up.
+    let map = redraw_after(&rpc, &mut incoming, ":2s/foo").await;
+    let search = view_search(&map);
+    assert!(search.first().cloned().unwrap_or_default().is_empty());
+    assert_eq!(search.get(1).cloned().unwrap_or_default(), vec![(4, 7)]);
+    assert!(search.get(2).cloned().unwrap_or_default().is_empty());
+}
+
+#[tokio::test]
+async fn substitute_preview_clears_when_the_command_line_closes() {
+    let (rpc, mut incoming) = search_fixture().await;
+    feed(&rpc, ":%s/foo");
+    let _ = lines(&rpc).await; // barrier: flush the preview redraw
+                               // Abandoning the command line takes the preview highlight with it — nothing
+                               // was ever searched, so `hlsearch` has nothing to keep lit.
+    let map = redraw_after(&rpc, &mut incoming, "<Esc>").await;
+    let search = view_search(&map);
+    assert!(
+        search.iter().all(Vec::is_empty),
+        "Esc clears the substitute preview, got {search:?}"
+    );
+}
+
+#[tokio::test]
+async fn global_command_line_highlights_its_matches_while_typing() {
+    let (rpc, mut incoming) = search_fixture().await;
+    // `:g/pat/cmd` previews like `:s` does, over its default whole-file range.
+    let map = redraw_after(&rpc, &mut incoming, ":g/foo").await;
+    let search = view_search(&map);
+    assert_eq!(search.first().cloned().unwrap_or_default(), vec![(0, 3)]);
+    assert_eq!(search.get(2).cloned().unwrap_or_default(), vec![(4, 7)]);
+}
+
+#[tokio::test]
+async fn a_non_pattern_command_line_previews_nothing() {
+    let (rpc, mut incoming) = search_fixture().await;
+    // `:set` starts with `s` but isn't `:substitute`; nothing lights up.
+    let map = redraw_after(&rpc, &mut incoming, ":set foo").await;
+    let search = view_search(&map);
+    assert!(
+        search.iter().all(Vec::is_empty),
+        ":set is not a pattern command, got {search:?}"
+    );
+}
+
+#[tokio::test]
+async fn substitute_preview_honors_noincsearch() {
+    let (rpc, mut incoming) = search_fixture().await;
+    feed(&rpc, ":set noincsearch<CR>");
+    let _ = lines(&rpc).await; // barrier
+    let map = redraw_after(&rpc, &mut incoming, ":%s/foo").await;
+    let search = view_search(&map);
+    assert!(
+        search.iter().all(Vec::is_empty),
+        "'noincsearch' turns the substitute preview off, got {search:?}"
+    );
+}
+
 // ----- regex patterns (phase 4) ---------------------------------------------
 
 #[tokio::test]

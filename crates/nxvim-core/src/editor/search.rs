@@ -649,10 +649,22 @@ impl Editor {
             && search_dir.is_some()
             && self.options.incsearch
             && !self.cmdline.is_empty();
+        // A `:` command line previews too: while `:[range]s/pat…` (or `:g`/`:v`)
+        // is being typed, its pattern lights up over the lines it would act on,
+        // so `:%s/test` shows what is about to be replaced. Same `'incsearch'`
+        // switch and same focused-window rule as the `/` preview above.
+        let ex_preview = focused
+            && self.mode == Mode::Command
+            && self.cmdline_kind == CmdlineKind::Ex
+            && self.options.incsearch;
+        let mut ex_range = None;
         let pattern = if incsearch {
             // Highlight the pattern only, not the `/pat/offset` suffix being typed.
             let sep = search_dir.map_or('/', SearchDir::prefix);
             Some(split_search_offset(&self.cmdline, sep).0)
+        } else if let Some((p, lo, hi)) = ex_preview.then(|| self.ex_preview_pattern()).flatten() {
+            ex_range = Some((lo, hi));
+            Some(p)
         } else if self.options.hlsearch && self.search_active {
             self.last_search.as_ref().map(|(p, _, _)| p.clone())
         } else {
@@ -671,6 +683,10 @@ impl Editor {
             let buf_line = base + row;
             if buf_line >= line_count {
                 break;
+            }
+            // The `:s`/`:g` preview only lights the lines its range covers.
+            if ex_range.is_some_and(|(lo, hi)| buf_line < lo || buf_line > hi) {
+                continue;
             }
             let text = buf.line_cow(buf_line);
             let ts = buf.options.effective_tabstop();

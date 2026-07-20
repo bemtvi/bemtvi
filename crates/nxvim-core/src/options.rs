@@ -1656,7 +1656,8 @@ static OPTIONS: &[OptionInfo] = {
             abbrev: Some("is"),
             kind: Bool,
             scope: Global,
-            doc: "Show where the search pattern matches as you type it.",
+            doc: "Show where the search pattern matches as you type it (also \
+                  previews a `:s` / `:g` pattern on its command line).",
         },
         OptionInfo {
             name: "autoread",

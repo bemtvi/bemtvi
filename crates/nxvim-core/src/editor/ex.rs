@@ -1289,6 +1289,92 @@ impl Editor {
         Ok(Some(line))
     }
 
+    /// The pattern a *still-being-typed* `:` command line would match, with the
+    /// line range it applies to — vim's `'incsearch'` preview extended to the
+    /// pattern commands: `:[range]s/{pat}…` and `:[range]g[!]/{pat}/…` (plus
+    /// `:v`). Returns `(pattern, lo, hi)` with `lo`/`hi` the resolved 0-based
+    /// inclusive range (`:g`'s default is the whole file, `:s`'s the current
+    /// line). An empty typed pattern (`:%s//`) falls back to the last search and
+    /// a bare `:s` to the last substitute's pattern — what submitting would run.
+    /// `None` when the line isn't one of those commands, has no usable pattern,
+    /// or carries a malformed range.
+    pub(crate) fn ex_preview_pattern(&self) -> Option<(String, usize, usize)> {
+        let cmd = self.cmdline.trim_start_matches([':', ' ']);
+        let (range, rest) = self.parse_ex_range(cmd).ok()?;
+        // Split the name by hand rather than through `split_ex`: that trims the
+        // argument, and a trailing space is part of the pattern being typed
+        // (`:%s/foo ` must preview "foo ", not "foo").
+        let rest = rest.trim_start();
+        let name_len = rest.bytes().take_while(u8::is_ascii_alphabetic).count();
+        let name = &rest[..name_len];
+        let after = &rest[name_len..];
+        let args = after.strip_prefix('!').unwrap_or(after).trim_start();
+
+        let subst = matches!(
+            name,
+            "s" | "su"
+                | "sub"
+                | "subs"
+                | "subst"
+                | "substi"
+                | "substit"
+                | "substitu"
+                | "substitut"
+                | "substitute"
+        );
+        let global = matches!(
+            name,
+            "g" | "gl"
+                | "glo"
+                | "glob"
+                | "globa"
+                | "global"
+                | "v"
+                | "vg"
+                | "vgl"
+                | "vglo"
+                | "vglob"
+                | "vgloba"
+                | "vglobal"
+        );
+        if !subst && !global {
+            return None;
+        }
+
+        let pat = match args.chars().next() {
+            // The delimiter is whatever non-alphanumeric char follows the name,
+            // exactly as `:s` / `:g` read it (`\` and `"` are never delimiters).
+            Some(d) if !d.is_alphanumeric() && d != '\\' && d != '"' => {
+                let body = &args[d.len_utf8()..];
+                if subst {
+                    split_substitute(body, d).0
+                } else {
+                    split_global(body, d).0
+                }
+            }
+            // A bare `:s` (or `:s{flags}`) repeats the last substitute's pattern.
+            _ if subst => self.last_substitute.as_ref()?.0.clone(),
+            _ => return None,
+        };
+        let pattern = if pat.is_empty() {
+            self.last_search.as_ref()?.0.clone()
+        } else {
+            pat
+        };
+        if pattern.is_empty() {
+            return None;
+        }
+
+        let (lo, hi) = if range.explicit {
+            (range.lo, range.hi)
+        } else if global {
+            (0, self.last_line())
+        } else {
+            (self.cursor.line, self.cursor.line)
+        };
+        Some((pattern, lo, hi))
+    }
+
     /// `:[range]s/{pat}/{rep}/[flags] [count]` — substitute matches of `pat`
     /// with `rep` over the range (canonical regex, the `/`-search dialect).
     /// Flags: `g` (every match on a line), `i`/`I` (force ignore/match case),

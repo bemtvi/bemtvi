@@ -3446,6 +3446,13 @@ impl EditHost {
                 }
                 self.apply_lua_effects();
             }
+            // `:={expr}` / `:lua= {expr}` queued a `vim.print` chunk above (its output
+            // has now landed in `:messages` via `apply_lua_effects`); pop the messages
+            // panel so the printed value is visible. Ordered after the drain so the
+            // panel shows the freshly-recorded line, not the state before it.
+            if std::mem::take(&mut self.editor.open_messages_after_lua) {
+                self.editor.ex_messages();
+            }
             for cmd in std::mem::take(&mut self.editor.deferred_commands) {
                 match cmd {
                     DeferredCmd::Server(c) => self.resolve_command(&c),

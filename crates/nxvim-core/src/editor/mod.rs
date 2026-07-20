@@ -1316,6 +1316,11 @@ pub struct Editor {
     /// Lua chunks queued by `:lua`, drained by the server's Lua runtime.
     pub lua_queue: Vec<String>,
 
+    /// Set by `:={expr}` / `:lua= {expr}`: after the queued `vim.print` chunk has
+    /// run (and its output landed in `:messages`), the server pops the `:messages`
+    /// panel so the printed value is visible. Drained right after [`lua_queue`].
+    pub open_messages_after_lua: bool,
+
     /// Command lines queued for the server to run after the tick, in order — see
     /// [`DeferredCmd`] for the two kinds. Keeps the core ignorant of the Lua command
     /// table while still routing typed `:Foo` and `vim.cmd.Foo()` through one place.
@@ -1776,6 +1781,7 @@ impl Editor {
             snippet_keys: snippet::SnippetKeys::default(),
             lua_queue: Vec::new(),
             deferred_commands: Vec::new(),
+            open_messages_after_lua: false,
             pending_sleep: None,
             syntax: None,
             syntax_opened: HashMap::new(),

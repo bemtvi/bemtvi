@@ -1938,7 +1938,7 @@ impl Editor {
 
     /// `:messages` — show the message history in a read-only scratch listing,
     /// opened scrolled to the end with the newest line selected.
-    pub(crate) fn ex_messages(&mut self) {
+    pub fn ex_messages(&mut self) {
         let lines: Vec<String> = self.messages.iter().map(|m| m.text.clone()).collect();
         let errors: Vec<bool> = self.messages.iter().map(|m| m.error).collect();
         let last = lines.len().saturating_sub(1);

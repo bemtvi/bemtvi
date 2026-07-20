@@ -35,6 +35,43 @@ async fn messages_command_opens_a_panel_with_the_history() {
     );
 }
 
+// `:={expr}` — neovim's shorthand for `:lua vim.print({expr})`. It evaluates the
+// Lua expression, pretty-prints the result onto the message history, *and* (nxvim's
+// own touch) opens the `:messages` panel so the value is visible even when it spans
+// many lines.
+#[tokio::test]
+async fn equals_evaluates_a_lua_expr_prints_it_and_opens_the_messages_panel() {
+    let (rpc, _incoming) = start(None).await;
+
+    feed(&rpc, ":=1+1<CR>");
+
+    assert!(panel_is_open(&rpc).await, "`:=` opens the messages panel");
+    let shown = lines(&rpc).await;
+    assert!(
+        shown.contains(&"2".to_string()),
+        "`:=1+1` prints its value into the panel; history was: {shown:?}"
+    );
+}
+
+#[tokio::test]
+async fn equals_pretty_prints_a_table_and_lua_eq_is_the_same() {
+    let (rpc, _incoming) = start(None).await;
+
+    // A table is inspected (multi-line), which is exactly the case the panel exists
+    // for. `:lua= {expr}` is the same shorthand with the explicit `lua` prefix.
+    feed(&rpc, ":lua= { a = 1 }<CR>");
+
+    assert!(
+        panel_is_open(&rpc).await,
+        "`:lua=` opens the messages panel"
+    );
+    let shown = lines(&rpc).await;
+    assert!(
+        shown.iter().any(|l| l.contains("a = 1")),
+        "`:lua= {{ a = 1 }}` inspects the table into the panel; history was: {shown:?}"
+    );
+}
+
 /// Whether the `:messages` panel paints `ErrorMsg` on the (only) screen row whose
 /// text contains `needle`. Scans every window's parallel `lines`/`highlights`
 /// arrays (the panel is a bottom split, not necessarily `windows[0]`), so it finds

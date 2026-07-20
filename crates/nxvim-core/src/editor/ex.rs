@@ -464,6 +464,12 @@ fn split_ex_bar(cmd: &str) -> Option<(&str, &str)> {
     if bytes.get(i) == Some(&b'!') {
         return None;
     }
+    // `:={expr}` evaluates a Lua expression, so a `|` inside it is the operand it is
+    // in Lua (5.4 bitwise-or), not a command separator — the whole rest is the expr,
+    // exactly as `:lua` swallows its chunk.
+    if bytes.get(i) == Some(&b'=') {
+        return None;
+    }
     let name_end = i + cmd[i..]
         .bytes()
         .take_while(|b| b.is_ascii_alphabetic())
@@ -711,6 +717,17 @@ impl Editor {
             return;
         }
 
+        // `:={expr}` — neovim's shorthand for `:lua vim.print({expr})`: evaluate the
+        // Lua expression and pretty-print the result. Like `:&`, it has no alphabetic
+        // name, so it's matched on the raw remainder ahead of `split_ex`. nxvim's own
+        // touch: it also pops the `:messages` panel so a multi-line value is fully
+        // visible. (`:lua= {expr}` is the same shorthand with an explicit prefix,
+        // handled in the `lua` arm below.)
+        if let Some(expr) = rest.strip_prefix('=') {
+            self.print_lua_expr(expr);
+            return;
+        }
+
         // `:[range]normal[!] {commands}` runs its argument as **literal**
         // keystrokes — `<CR>` is the four chars `<`,`C`,`R`,`>` (not Enter) and
         // whitespace is significant — so it is recognized on the raw remainder
@@ -950,7 +967,12 @@ impl Editor {
                 let which = self.loclist_which();
                 self.ex_vimgrep(which, args, action);
             }
-            "lua" => self.lua_queue.push(args.to_string()),
+            // `:lua {chunk}` runs the chunk; `:lua= {expr}` is the `:=` shorthand
+            // spelled out (pretty-print the expression, then open `:messages`).
+            "lua" => match args.strip_prefix('=') {
+                Some(expr) => self.print_lua_expr(expr),
+                None => self.lua_queue.push(args.to_string()),
+            },
             "sleep" | "sl" => match parse_sleep(args) {
                 Ok(ms) => self.pending_sleep = Some(ms),
                 Err(e) => self.echo(e),
@@ -1023,6 +1045,20 @@ impl Editor {
                 .deferred_commands
                 .push(DeferredCmd::Server(rest.to_string())),
         }
+    }
+
+    /// `:={expr}` / `:lua= {expr}` — the shorthand for `:lua vim.print({expr})`.
+    /// Queues the pretty-print as a Lua chunk (so `{expr}` is evaluated by the Lua
+    /// runtime, not the Vim-expression evaluator) and arms the follow-up that opens
+    /// the `:messages` panel once the value has been recorded. An empty expression
+    /// (`:=` alone) is a no-op, matching `:lua` with no chunk.
+    fn print_lua_expr(&mut self, expr: &str) {
+        let expr = expr.trim();
+        if expr.is_empty() {
+            return;
+        }
+        self.lua_queue.push(format!("vim.print({expr})"));
+        self.open_messages_after_lua = true;
     }
 
     /// `:echo` / `:echomsg` / `:echoerr` — evaluate the argument as a Vim

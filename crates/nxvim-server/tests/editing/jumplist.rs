@@ -475,6 +475,81 @@ async fn getjumplist_accepts_a_window_id_or_number() {
     );
 }
 
+// ----- a new tab copies the jumplist ----------------------------------------
+//
+// vim's jumplist is per-window, and a new window created *from* another inherits
+// a copy of its parent's list (`win_init` → `copy_jumplist`). That covers splits
+// and a new tab page alike: `:tabnew` seeds the new tab's window with a copy of
+// the departing window's jumplist. Because `:tabnew` also *leaves* the current
+// buffer for a fresh one, it records the departure position as the newest jump —
+// so the copy gains one trailing entry (`:tab split`, which clones the same
+// buffer/view in place, does not).
+
+#[tokio::test]
+async fn tabnew_copies_the_jumplist_and_records_the_departure() {
+    let (rpc, _incoming) = start(None).await;
+    ten_lines(&rpc).await; // buffer 1, cursor on line 10
+    feed(&rpc, "gg"); // records 10, on line 1
+    feed(&rpc, "5G"); // records 1, on line 5
+                      // Parent window: jumps [10, 1], sitting at the present.
+    assert_eq!(
+        lua_u64(&rpc, "return #vim.fn.getjumplist()[1]").await,
+        Some(2)
+    );
+
+    // `:tabnew` opens a fresh empty buffer in a new tab. Its window inherits the
+    // copy [10, 1] plus the departure line 5 -> [10, 1, 5], pointer at the end.
+    feed(&rpc, ":tabnew<CR>");
+    assert_eq!(lines(&rpc).await, vec![""], "landed in a new empty tab");
+    assert_eq!(
+        lua_u64(&rpc, "return #vim.fn.getjumplist()[1]").await,
+        Some(3),
+        "the new tab inherits a copy of the jumplist plus the departure"
+    );
+    assert_eq!(
+        lua_u64(&rpc, "return vim.fn.getjumplist()[2]").await,
+        Some(3),
+        "curidx sits at the present (end of the list)"
+    );
+    for (i, lnum) in [(1, 10), (2, 1), (3, 5)] {
+        assert_eq!(
+            lua_u64(&rpc, &format!("return vim.fn.getjumplist()[1][{i}].lnum")).await,
+            Some(lnum),
+            "entry {i} (oldest-first) is line {lnum}"
+        );
+    }
+    // `<C-o>` from the empty new tab crosses back into buffer 1 at the departure.
+    feed(&rpc, "<C-o>");
+    assert_eq!(lines(&rpc).await.len(), 10, "<C-o> returns to buffer 1");
+    assert_eq!(cursor(&rpc).await.0, 5, "at the position we left it");
+}
+
+#[tokio::test]
+async fn tab_split_copies_the_jumplist_without_a_departure() {
+    let (rpc, _incoming) = start(None).await;
+    ten_lines(&rpc).await; // cursor on line 10
+    feed(&rpc, "gg"); // records 10
+    feed(&rpc, "5G"); // records 1, on line 5
+
+    // `:tab split` clones the *same* buffer and view into a new tab, so its
+    // window inherits the jumplist copy [10, 1] with no extra departure entry.
+    feed(&rpc, ":tab split<CR>");
+    assert_eq!(cursor(&rpc).await.0, 5, "the cloned view keeps line 5");
+    assert_eq!(
+        lua_u64(&rpc, "return #vim.fn.getjumplist()[1]").await,
+        Some(2),
+        "a pure copy, no departure jump recorded"
+    );
+    assert_eq!(
+        lua_u64(&rpc, "return vim.fn.getjumplist()[1][1].lnum").await,
+        Some(10)
+    );
+    assert_eq!(
+        lua_u64(&rpc, "return vim.fn.getjumplist()[1][2].lnum").await,
+        Some(1)
+    );
+}
+
 #[tokio::test]
 async fn deleting_a_jump_targets_line_drops_it_from_the_list() {
     let (rpc, _incoming) = start(None).await;

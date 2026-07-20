@@ -59,6 +59,15 @@ impl Editor {
             line: self.cursor.line,
             col: self.cursor.col,
         };
+        self.push_jump_entry(entry);
+    }
+
+    /// Push an explicit [`JumpEntry`] onto the focused window's jumplist, applying
+    /// the same dedup / cap / pointer-reset rules as [`Editor::push_jump`]. Used
+    /// when the position to record is *not* the live cursor — e.g. a new tab
+    /// records the buffer/position it was opened *from* onto its own (freshly
+    /// copied) list, matching vim's departure jump on `:tabnew`.
+    pub(crate) fn push_jump_entry(&mut self, entry: JumpEntry) {
         let win = self.windows.cur_mut();
         win.jumps
             .retain(|e| !(e.buf == entry.buf && e.line == entry.line));

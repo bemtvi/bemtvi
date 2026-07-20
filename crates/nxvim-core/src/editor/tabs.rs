@@ -296,6 +296,20 @@ impl Editor {
     /// make it active. The outgoing tab's layout is stashed first. The caller
     /// follows up (e.g. `:enew` for an empty `:tabnew`, `:edit` for a file).
     pub(crate) fn new_tab(&mut self, buf: BufferId, options: WindowOptions) {
+        // vim's jumplist is per-window, and a window opened *from* another inherits
+        // a copy of its parent's list (`win_init` → `copy_jumplist`). Capture the
+        // departing window's list and the position we're leaving *before* the swap,
+        // so the new tab's window can seed its own copy plus the departure jump —
+        // `:tabnew` opens a fresh buffer, which vim records as a jump (`:tab split`,
+        // which clones the same view in place, overwrites this to drop it).
+        let src = self.windows.current;
+        let parent_jumps = self.windows.get(src).jumps.clone();
+        let parent_jump_idx = self.windows.get(src).jump_idx;
+        let departure = JumpEntry {
+            buf: self.cur_buffer(),
+            line: self.cursor.line,
+            col: self.cursor.col,
+        };
         // A new tab installs a fresh tree in the *focused* layer's stack, directly
         // after its active tab — so `:tabnew` in a dock adds a dock tab.
         self.stash_focused_view();
@@ -308,8 +322,18 @@ impl Editor {
         stack.tabs[stack.current].tree = Some(outgoing);
         stack.tabs.insert(insert_at, TabSlot { id, tree: None });
         stack.current = insert_at;
-        // The new window is live; sync the editor's live buffer + view to it and
-        // lay the (now one-row-shorter, if the tabline just appeared) area out.
+        // The new window is live; seed its jumplist with the parent's copy, then
+        // record the departure position (as vim's `:tabnew` does on leaving the
+        // old buffer). The focused window is now the new one, so `push_jump_entry`
+        // acts on it.
+        {
+            let w = self.windows.get_mut(new_win);
+            w.jumps = parent_jumps;
+            w.jump_idx = parent_jump_idx;
+        }
+        self.push_jump_entry(departure);
+        // Sync the editor's live buffer + view to the new window and lay the (now
+        // one-row-shorter, if the tabline just appeared) area out.
         self.set_cur_buffer(buf);
         self.cursor = Cursor::default();
         self.top = 0;
@@ -332,7 +356,17 @@ impl Editor {
         let buf = self.current_buffer_id();
         let options = self.windows.cur().options.clone();
         let (cursor, top, leftcol) = (self.cursor, self.top, self.leftcol);
+        // A clone-in-place inherits a *pure* copy of the jumplist — the same
+        // buffer/view stays open, so there is no departure jump (unlike `:tabnew`).
+        let jumps = self.windows.cur().jumps.clone();
+        let jump_idx = self.windows.cur().jump_idx;
         self.new_tab(buf, options);
+        let cur = self.windows.current;
+        {
+            let w = self.windows.get_mut(cur);
+            w.jumps = jumps;
+            w.jump_idx = jump_idx;
+        }
         self.cursor = cursor;
         self.top = top;
         self.leftcol = leftcol;
@@ -572,17 +606,27 @@ impl Editor {
         if self.windows.leaves().len() <= 1 {
             return;
         }
-        // Capture the moving window's buffer, options, and live view before it is
-        // removed from this tab.
+        // Capture the moving window's buffer, options, live view, and jumplist
+        // before it is removed from this tab.
         let cur = self.windows.current;
         let buf = self.windows.get(cur).buffer;
         let options = self.windows.get(cur).options.clone();
         let (cursor, top, leftcol) = (self.cursor, self.top, self.leftcol);
+        // The window *moves* rather than being reopened, so it carries its own
+        // jumplist unchanged — no copy from a sibling, no departure jump.
+        let jumps = self.windows.get(cur).jumps.clone();
+        let jump_idx = self.windows.get(cur).jump_idx;
         // Remove it here; a survivor takes focus and the live view becomes theirs.
         self.remove_window(cur);
         // Open the new tab around the captured buffer, then restore the moved
-        // window's own view into its (now live) single window.
+        // window's own view and jumplist into its (now live) single window.
         self.new_tab(buf, options);
+        let new_cur = self.windows.current;
+        {
+            let w = self.windows.get_mut(new_cur);
+            w.jumps = jumps;
+            w.jump_idx = jump_idx;
+        }
         self.cursor = cursor;
         self.top = top;
         self.leftcol = leftcol;

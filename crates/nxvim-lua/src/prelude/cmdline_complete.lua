@@ -118,6 +118,8 @@ local BUILTIN = {
   { "delete", ":delete [x]", "Delete lines in the range (into register [x])." },
   { "print", ":print", "Print the lines in the range." },
   { "put", ":put [x]", "Insert the contents of register [x] after the line." },
+  { "move", ":move {addr}", "Move the lines in the range to below {addr} (`:m0` = to the top)." },
+  { "copy", ":copy {addr}", "Copy the lines in the range to below {addr} (also `:t`)." },
   { "highlight", ":highlight {group}", "Define or show highlight group {group}." },
   { "helptags", ":helptags {dir}", "Generate the help tags file for {dir}." },
   -- Working directory / sourcing / colours (server-level commands — `excmd.rs`).

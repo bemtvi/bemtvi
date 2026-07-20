@@ -1039,6 +1039,10 @@ impl Editor {
                 self.ex_global(range, true, args)
             }
             "d" | "de" | "del" | "dele" | "delet" | "delete" => self.ex_delete(range),
+            // `:[range]m[ove] {addr}` / `:[range]co[py] {addr}` (`:t` is `:copy`)
+            // relocate / duplicate the range below the addressed line.
+            "m" | "mo" | "mov" | "move" => self.ex_move(range, args),
+            "t" | "co" | "cop" | "copy" => self.ex_copy(range, args),
             "p" | "pr" | "pri" | "prin" | "print" => self.ex_print(range),
             // `:[line]pu[t] [x]` inserts register `x` (default unnamed) as whole
             // lines below the addressed line — always linewise, regardless of the
@@ -1197,6 +1201,20 @@ impl Editor {
         i: &mut usize,
         base: usize,
     ) -> Result<Option<usize>, String> {
+        let raw = self.parse_ex_address_raw(cmd, i, base)?;
+        Ok(raw.map(|line| line.clamp(0, self.last_line() as i64) as usize))
+    }
+
+    /// The body of [`Self::parse_ex_address`], before the clamp to the buffer.
+    /// Kept separate because a *destination* address (`:move` / `:copy`) has one
+    /// extra legal value the range form doesn't: line `0`, "above the first
+    /// line", which resolves to `-1` here and would otherwise clamp into line 1.
+    fn parse_ex_address_raw(
+        &self,
+        cmd: &str,
+        i: &mut usize,
+        base: usize,
+    ) -> Result<Option<i64>, String> {
         let bytes = cmd.as_bytes();
         let start = *i;
         let mut line = base as i64;
@@ -1268,7 +1286,7 @@ impl Editor {
             *i = start;
             return Ok(None);
         }
-        Ok(Some(line.clamp(0, self.last_line() as i64) as usize))
+        Ok(Some(line))
     }
 
     /// `:[range]s/{pat}/{rep}/[flags] [count]` — substitute matches of `pat`
@@ -1667,6 +1685,132 @@ impl Editor {
         self.cursor.line = range.lo.min(self.last_line());
         self.cursor.col = self.first_non_blank(self.cursor.line);
         self.clamp_cursor();
+    }
+
+    /// Parse the destination address of `:move` / `:copy` — the whole argument,
+    /// which must be exactly one address (`3`, `$`, `.`, `'>+1`, `-2`, …) and
+    /// nothing else. Returned 0-based and *signed*: unlike a range address, vim
+    /// lets a destination be line `0`, "above the first line", which lands here
+    /// as `-1`. Fails loud on a missing (*E14*) or trailing-junk (*E488*)
+    /// argument rather than guessing a destination.
+    fn parse_ex_dest(&self, args: &str) -> Result<i64, String> {
+        let arg = args.trim();
+        if arg.is_empty() {
+            return Err("E14: Invalid address".to_string());
+        }
+        let mut i = 0;
+        let dest = self.parse_ex_address_raw(arg, &mut i, self.cursor.line)?;
+        if arg[i..].trim().is_empty() {
+            // `0` is the only address below the first line; anything further
+            // down (`:m -5` from line 1) just pins there, as vim does.
+            dest.map(|line| line.clamp(-1, self.last_line() as i64))
+                .ok_or_else(|| "E14: Invalid address".to_string())
+        } else {
+            Err("E488: Trailing characters".to_string())
+        }
+    }
+
+    /// The range's lines as one linewise chunk (always newline-terminated, since
+    /// the rope keeps a trailing `\n`), plus the byte span they occupy.
+    fn linewise_span(&self, range: ExRange) -> (String, std::ops::Range<usize>) {
+        let start = self.buffer().line_start(range.lo);
+        // Up to the start of the line after the range — or the buffer end when
+        // the range runs to the last line, so the block's final newline goes too.
+        let end = if range.hi < self.last_line() {
+            self.buffer().line_start(range.hi + 1)
+        } else {
+            self.buffer().len_bytes()
+        };
+        (self.buffer().text.slice(start..end).to_string(), start..end)
+    }
+
+    /// Splice `chunk` (a whole number of lines) in below the 0-based line `dest`,
+    /// where `dest == -1` means "above the first line", and land the cursor on
+    /// the last spliced line at its first non-blank — the shared tail of
+    /// [`Self::ex_move`] and [`Self::ex_copy`]. Returns the line the chunk's
+    /// first line landed on.
+    fn splice_lines_below(&mut self, dest: i64, chunk: &str) -> usize {
+        let at_line = (dest + 1).max(0) as usize;
+        let at = self
+            .buffer()
+            .line_start(at_line.min(self.buffer().line_count()));
+        self.buffer_mut().insert(at, chunk);
+        self.buffer_mut().normalize();
+        self.buffer_mut().modified = true;
+        self.cursor.line = (at_line + chunk.matches('\n').count()).saturating_sub(1);
+        self.cursor.line = self.cursor.line.min(self.last_line());
+        self.cursor.col = self.first_non_blank(self.cursor.line);
+        self.clamp_cursor();
+        at_line
+    }
+
+    /// `:[range]m[ove] {addr}` — move the range's lines (default: the current
+    /// line) to just below `addr`; `:m0` lifts them to the top of the buffer.
+    /// The cursor lands on the last moved line. Moving a range into itself is
+    /// *E134*, as in vim.
+    fn ex_move(&mut self, range: ExRange, args: &str) {
+        if !self.modifiable() {
+            self.refuse_edit();
+            return;
+        }
+        let dest = match self.parse_ex_dest(args) {
+            Ok(dest) => dest,
+            Err(e) => return self.echo_err(e),
+        };
+        // Landing anywhere from just-above the range through its last line would
+        // be a no-op at best and a self-overlapping splice at worst.
+        if dest >= range.lo as i64 - 1 && dest <= range.hi as i64 {
+            return self.echo_err("E134: Cannot move a range of lines into itself");
+        }
+        self.push_undo();
+        let (chunk, span) = self.linewise_span(range);
+        // Marks *inside* the moved block have to ride it to its new home (vim's
+        // `mark_adjust`), or the lift below would drop them as deleted lines. This
+        // is what makes the `:m '>+1<CR>gv=gv` idiom repeat: `` '< ``/`` '> ``
+        // follow the block, so `gv` reselects the lines that just moved. The `.`
+        // last-change mark is excluded — the splice itself is the last change.
+        let carried: Vec<(char, usize, usize)> = self
+            .buffer()
+            .marks
+            .iter()
+            .filter(|(&name, &(line, _))| name != '.' && (range.lo..=range.hi).contains(&line))
+            .map(|(&name, &(line, col))| (name, line - range.lo, col))
+            .collect();
+        for &(name, _, _) in &carried {
+            self.buffer_mut().marks.remove(&name);
+        }
+        self.buffer_mut().remove(span);
+        self.buffer_mut().normalize();
+        // Lines below the lifted block shifted up by its height, so a destination
+        // past the block has to shift with them.
+        let lifted = (range.hi - range.lo + 1) as i64;
+        let dest = if dest > range.hi as i64 {
+            dest - lifted
+        } else {
+            dest
+        };
+        let landed = self.splice_lines_below(dest, &chunk);
+        for (name, offset, col) in carried {
+            self.buffer_mut().marks.insert(name, (landed + offset, col));
+        }
+    }
+
+    /// `:[range]co[py] {addr}` (also `:t`) — copy the range's lines (default: the
+    /// current line) to just below `addr`, leaving the originals in place. The
+    /// cursor lands on the last copy. Unlike `:move`, copying a range into
+    /// itself is legal.
+    fn ex_copy(&mut self, range: ExRange, args: &str) {
+        if !self.modifiable() {
+            self.refuse_edit();
+            return;
+        }
+        let dest = match self.parse_ex_dest(args) {
+            Ok(dest) => dest,
+            Err(e) => return self.echo_err(e),
+        };
+        self.push_undo();
+        let (chunk, _) = self.linewise_span(range);
+        self.splice_lines_below(dest, &chunk);
     }
 
     /// `:[line]pu[t] [x]` — insert register `x` (default the unnamed register) as

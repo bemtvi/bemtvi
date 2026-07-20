@@ -27,6 +27,8 @@ mod core_editing;
 mod dot_repeat;
 #[path = "editing/encoding.rs"]
 mod encoding;
+#[path = "editing/ex_move.rs"]
+mod ex_move;
 #[path = "editing/ex_substitute.rs"]
 mod ex_substitute;
 #[path = "editing/explorer.rs"]

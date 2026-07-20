@@ -197,6 +197,34 @@ impl Editor {
             .find(|(_, t)| t.try_get(id).is_some())
     }
 
+    /// The `(layer, tab index)` of the tab that owns window `id`, scanning every
+    /// open layer's whole tab stack (not just its active tab). `None` if no open
+    /// tab of any open layer holds `id`. Lets a focus request name a window in
+    /// another tab and be routed there ([`Editor::set_current_window`]).
+    pub(crate) fn tab_of_window(&self, id: WindowId) -> Option<(Layer, usize)> {
+        self.open_layers().into_iter().find_map(|layer| {
+            let n = self.stack(layer).map_or(0, |s| s.tabs.len());
+            (0..n)
+                .find(|&idx| {
+                    self.layer_tab_tree(layer, idx)
+                        .is_some_and(|t| t.try_get(id).is_some())
+                })
+                .map(|idx| (layer, idx))
+        })
+    }
+
+    /// [`Editor::tree_of_window`] widened across **tabs**: the layer and tree that
+    /// own `id` in *any* tab, the current one reading its live tree and an inactive
+    /// one its stashed tree. `tree_of_window` only sees the current tab, so every
+    /// read keyed off it (`window_buffer`, `window_cursor`, …) would answer `None`
+    /// for a perfectly live window that merely sits in another tab — which vim and
+    /// neovim both report on (`win_findbuf` spans tabpages). Read-only: a stashed
+    /// tree's window carries its state as of the last time that tab was focused.
+    pub(crate) fn any_tab_tree_of_window(&self, id: WindowId) -> Option<(Layer, &WindowTree)> {
+        let (layer, idx) = self.tab_of_window(id)?;
+        Some((layer, self.layer_tab_tree(layer, idx)?))
+    }
+
     /// The [`Window`] for `id` in whichever open layer owns it (the main tree or
     /// any open dock), or `None` if no open layer holds it. This is the
     /// layer-aware counterpart to `self.windows.get`, which only sees the

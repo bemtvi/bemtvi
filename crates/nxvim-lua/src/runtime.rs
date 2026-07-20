@@ -2872,7 +2872,10 @@ impl LuaRuntime {
     /// mirror in Lua so a read-after-write within one chunk stays consistent.
     ///
     /// `bufs` is `(bufnr, lines, name)` per open buffer. `wins` is one
-    /// [`WindowMirror`] per open window in layout order, `win` the focused id, and
+    /// [`WindowMirror`] per open window **across every tab** (so a window in
+    /// another tab is a valid, findable handle from Lua, as in neovim), `cur_wins`
+    /// the current tab's ids in layout order (what the per-tab window-*number*
+    /// surface — `winnr()` / `win_getid()` — counts), `win` the focused id, and
     /// `next_win` the id the next `nvim_open_win` will mint (so the Lua side can
     /// return the new handle synchronously while the real window is created when
     /// the queued op drains). `mode` is the editor's current `mode()` short code
@@ -2887,6 +2890,7 @@ impl LuaRuntime {
         cursor: (u64, u64),
         win: u64,
         wins: &[WindowMirror],
+        cur_wins: &[u64],
         next_win: u64,
         mode: &str,
         cmdtype: &str,
@@ -2900,9 +2904,18 @@ impl LuaRuntime {
         // serializes to the table shape `nvim_win_get_config` returns, the nested
         // float included.
         let win_arr = self.to_lua(wins)?;
+        let cur_win_arr = self.to_lua(cur_wins)?;
         let set: mlua::Function = nx.get("_set_buf_mirror")?;
         set.call((
-            entries, cursor.0, cursor.1, win, win_arr, next_win, mode, cmdtype,
+            entries,
+            cursor.0,
+            cursor.1,
+            win,
+            win_arr,
+            cur_win_arr,
+            next_win,
+            mode,
+            cmdtype,
         ))
     }
 

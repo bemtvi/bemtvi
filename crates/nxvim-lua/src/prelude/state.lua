@@ -1347,6 +1347,7 @@ function nx._set_bo_mirror(entries)
 end
 
 nx._wins = nx._wins or {}
+nx._win_all = nx._win_all or { 1000 }
 nx._win_order = nx._win_order or { 1000 }
 nx._next_win = nx._next_win or 1001
 -- Tab mirror (Phase 3): `nx._tabs[id]` = per-tab record ({ id, windows,
@@ -1491,7 +1492,7 @@ function nx._set_hl_mirror_ns(by_ns)
   nx._hl_defs_ns = by_ns or {}
 end
 
-function nx._set_buf_mirror(entries, row, col, win, wins, next_win, mode, cmdtype)
+function nx._set_buf_mirror(entries, row, col, win, wins, cur_wins, next_win, mode, cmdtype)
   nx._cur_mode = mode or "n"
   nx._cur_cmdtype = cmdtype or ""
   -- The server omits `lines` for a buffer whose changedtick is unchanged (the
@@ -1508,16 +1509,20 @@ function nx._set_buf_mirror(entries, row, col, win, wins, next_win, mode, cmdtyp
   nx._bufs = entries
   nx._cur_cursor = { row = row or 1, col = col or 0 }
   nx._cur_win = win or 1000
-  -- The window snapshot (Phase 5): `nx._wins[id]` = per-window record, and
-  -- `nx._win_order` the layout order `nvim_list_wins` returns. `nx._next_win`
-  -- is the id the next `nvim_open_win` will get, so it can return synchronously.
+  -- The window snapshot (Phase 5): `nx._wins[id]` = per-window record for every
+  -- window in *every* tab, and `nx._win_all` that whole set in the order
+  -- `nvim_list_wins` returns. `nx._win_order` is the narrower current-tab layout
+  -- order the window-*number* surface (`winnr()` / `win_getid()`) counts, since a
+  -- window number is per-tab. `nx._next_win` is the id the next `nvim_open_win`
+  -- will get, so it can return synchronously.
   local by_id, order = {}, {}
   for _, w in ipairs(wins or {}) do
     by_id[w.id] = w
     order[#order + 1] = w.id
   end
   nx._wins = by_id
-  nx._win_order = order
+  nx._win_all = order
+  nx._win_order = cur_wins or order
   nx._next_win = next_win or nx._next_win
 end
 

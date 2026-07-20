@@ -1914,11 +1914,15 @@ impl EditHost {
         );
         // The window snapshot (Phase 5): one entry per window in layout order,
         // each carrying its buffer, cursor (1-based row / 0-based col), and text
-        // dimensions, so the `nvim_win_*` getters read live state from Lua.
+        // dimensions, so the `nvim_win_*` getters read live state from Lua. It
+        // spans *every* tab (like `nvim_list_wins` / `win_findbuf` in neovim), so
+        // a window in another tab is still a valid, findable handle from Lua; the
+        // current tab's layout order is pushed alongside it (`cur_wins`) for the
+        // window-*number* surface (`winnr()` / `win_getid()`), which is per-tab.
         let global_scrollanim = self.editor.global_options().scrollanim;
         let wins: Vec<WindowMirror> = self
             .editor
-            .window_ids()
+            .all_window_ids()
             .into_iter()
             .map(|id| {
                 let buffer = self.editor.window_buffer(id).map(|b| b.0).unwrap_or(0);
@@ -1998,11 +2002,13 @@ impl EditHost {
             mp.line,
             mp.column,
         );
+        let cur_wins: Vec<u64> = self.editor.window_ids().into_iter().map(|w| w.0).collect();
         let _ = self.lua.set_buf_mirror(
             &bufs,
             cursor,
             cur_win,
             &wins,
+            &cur_wins,
             next_win,
             self.editor.mode.short_code(),
             self.editor.cmdline_type(),

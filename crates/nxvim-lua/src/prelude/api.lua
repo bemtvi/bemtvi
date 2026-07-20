@@ -81,7 +81,9 @@ function nx.win.current()
 end
 
 function nx.win.list()
-  return nx._win_order or { nx._cur_win or 1000 }
+  -- Spans every tab, matching `nvim_list_wins` (and its RPC twin); the per-tab
+  -- window *number* order is `nx._win_order`.
+  return nx._win_all or { nx._cur_win or 1000 }
 end
 
 -- `nx.win.set_current(win)`: focus `win` (make it the current window) [alias
@@ -1295,10 +1297,10 @@ end
 vim.fn.win_getid = nx.win.getid
 
 -- `nx.win.findbuf(bufnr)` [alias `vim.fn.win_findbuf`]: the ids of every window currently
--- displaying `bufnr`.
+-- displaying `bufnr`, in *any* tab (vim spans tabpages here).
 function nx.win.findbuf(bufnr)
   local out = {}
-  for _, id in ipairs(nx._win_order or {}) do
+  for _, id in ipairs(nx._win_all or {}) do
     local w = nx._wins[id]
     if w and w.buffer == bufnr then
       out[#out + 1] = id

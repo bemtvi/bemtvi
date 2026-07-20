@@ -212,10 +212,10 @@ impl Editor {
     /// 1-based `lnum`), paired with the navigation pointer `curidx` — the index
     /// `<C-o>` walks back from, equal to `entries.len()` when sitting at the present
     /// (not navigating), matching vim's `w_jumplistidx`. `None` for an unknown
-    /// window id. Only current-tab windows resolve here, the set the server
-    /// mirrors; an off-tab window is out of reach (as for every `nvim_win_*` read).
+    /// window id; a window in an inactive tab resolves to its stashed jumplist.
     pub fn window_jumplist(&self, id: WindowId) -> Option<(Vec<JumpView>, usize)> {
-        let win = self.windows.try_get(id)?;
+        let (_, tree) = self.any_tab_tree_of_window(id)?;
+        let win = tree.try_get(id)?;
         let entries = win.jumps.iter().map(|e| (e.buf.0, e.line, e.col)).collect();
         Some((entries, win.jump_idx))
     }

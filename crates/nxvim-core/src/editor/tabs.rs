@@ -387,6 +387,17 @@ impl Editor {
         self.set_current_window(win);
     }
 
+    /// Focus window `win` living in tab `tab_idx` of `layer`, crossing to that
+    /// layer and tab first. The layer-explicit twin of [`Editor::goto_tab_window`]
+    /// (which is main-only), used by [`Editor::set_current_window`] to travel to a
+    /// window that isn't in the live tree. `layer` must be open — callers get it
+    /// from [`Editor::tab_of_window`], which only scans open layers.
+    pub(crate) fn goto_layer_tab_window(&mut self, layer: Layer, tab_idx: usize, win: WindowId) {
+        self.switch_layer(layer);
+        self.switch_tab(tab_idx);
+        self.focus_window(win);
+    }
+
     /// `gt` / `:tabnext` — go to the next tab (wrapping), or, with a count, to that
     /// absolute 1-based tab number (`{count}gt`, `:tabnext {count}`).
     pub(crate) fn goto_tab_next(&mut self, count: Option<usize>) {

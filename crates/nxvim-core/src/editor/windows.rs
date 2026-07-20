@@ -1278,23 +1278,26 @@ impl Editor {
     }
 
     /// Make window `id` the focused one (`nvim_set_current_win`). A no-op if `id`
-    /// is not open or already current. When `id` lives in a different layer (a
-    /// dock, or the main tree while a dock is focused), cross to that layer first.
+    /// is not open or already current. When `id` lives elsewhere, focus travels to
+    /// it: to another layer (a dock, or the main tree while a dock is focused) and
+    /// to another **tab** — `nvim_set_current_win` is not tab-scoped in neovim, so
+    /// naming an off-tab window switches to that tab rather than doing nothing.
     pub fn set_current_window(&mut self, id: WindowId) {
         if self.windows.try_get(id).is_some() {
             self.focus_window(id);
             return;
         }
-        if let Some((layer, _)) = self.tree_of_window(id) {
-            self.switch_layer(layer);
-            self.focus_window(id);
+        if let Some((layer, tab)) = self.tab_of_window(id) {
+            self.goto_layer_tab_window(layer, tab, id);
         }
     }
 
     /// The buffer window `id` shows (`nvim_win_get_buf`), or `None` if there is
-    /// no such window.
+    /// no such window. Resolves across tabs — a window in an inactive tab reports
+    /// the buffer it was left showing.
     pub fn window_buffer(&self, id: WindowId) -> Option<BufferId> {
-        self.tree_of_window(id).map(|(_, t)| t.get(id).buffer)
+        self.any_tab_tree_of_window(id)
+            .map(|(_, t)| t.get(id).buffer)
     }
 
     /// The first `(tab index, window id)` whose tiled window shows `buf`,
@@ -1375,9 +1378,10 @@ impl Editor {
     }
 
     /// Window `id`'s window-local options (the number gutter), or `None` for an
-    /// unknown id. The server snapshots these into the `vim.wo` mirror.
+    /// unknown id (any tab's window resolves). The server snapshots these into the
+    /// `vim.wo` mirror.
     pub fn window_options(&self, id: WindowId) -> Option<WindowOptions> {
-        self.tree_of_window(id)
+        self.any_tab_tree_of_window(id)
             .map(|(_, t)| t.get(id).options.clone())
     }
 
@@ -1672,9 +1676,9 @@ impl Editor {
 
     /// Window `id`'s cursor as `(0-based line, byte col)` — the live cursor for
     /// the focused window, the stashed one otherwise (`nvim_win_get_cursor`).
-    /// `None` if there is no such window.
+    /// `None` if there is no such window (any tab's window resolves).
     pub fn window_cursor(&self, id: WindowId) -> Option<(usize, usize)> {
-        let (_, t) = self.tree_of_window(id)?;
+        let (_, t) = self.any_tab_tree_of_window(id)?;
         let c = if id == self.windows.current {
             self.cursor
         } else {
@@ -1715,7 +1719,7 @@ impl Editor {
     /// reports its live offset; an inactive window its stashed one. `None` for an
     /// unknown id. Backs `vim.fn.winsaveview`'s `topline`/`leftcol`.
     pub fn window_scroll(&self, id: WindowId) -> Option<(usize, usize)> {
-        let (_, t) = self.tree_of_window(id)?;
+        let (_, t) = self.any_tab_tree_of_window(id)?;
         Some(if id == self.windows.current {
             (self.top, self.leftcol)
         } else {
@@ -1822,7 +1826,7 @@ impl Editor {
     /// row when one is shown. Mirrors the [`crate::view::window_view`] /
     /// [`Editor::text_height`] content math so the API agrees with what is drawn.
     pub fn window_content_size(&self, id: WindowId) -> Option<(usize, usize)> {
-        let (layer, t) = self.tree_of_window(id)?;
+        let (layer, t) = self.any_tab_tree_of_window(id)?;
         let w = t.get(id);
         let inset = matches!(&w.float, Some(cfg) if cfg.border != BorderStyle::None) as usize;
         let status =
@@ -1953,7 +1957,8 @@ impl Editor {
     /// `id` is a tiled window or not open. The server formats it into neovim's
     /// config map (`{ relative = "" }` for a tiled window).
     pub fn window_float_config(&self, id: WindowId) -> Option<FloatConfig> {
-        self.windows.windows.get(&id).and_then(|w| w.float.clone())
+        self.any_tab_tree_of_window(id)
+            .and_then(|(_, t)| t.get(id).float.clone())
     }
 
     /// `nvim_win_set_config(win, config)` — reconfigure window `id` from a partial
@@ -2646,7 +2651,7 @@ impl Editor {
     /// The window analogue of [`Editor::switch_buffer`]: stash the focused
     /// window's live view position, then make `id` current and restore its view.
     /// A no-op if `id` is already focused or not a live window.
-    fn focus_window(&mut self, id: WindowId) {
+    pub(crate) fn focus_window(&mut self, id: WindowId) {
         if id == self.windows.current || !self.windows.windows.contains_key(&id) {
             return;
         }

@@ -1103,3 +1103,85 @@ async fn buffer_command_with_empty_switchbuf_stays_in_current_tab() {
     let _ = std::fs::remove_file(&a);
     let _ = std::fs::remove_file(&b);
 }
+
+// ----- the Lua window mirror spans every tab --------------------------------
+
+/// `win_findbuf` reports windows in *other* tabs too (neovim spans tabpages), so
+/// the Lua window mirror has to carry the whole window set, not just the current
+/// tab's. A buffer shown only in tab 1 must still be found from tab 2.
+#[tokio::test]
+async fn win_findbuf_spans_tabs() {
+    let a = temp_file("findbuf_a", "alpha\nbeta\n");
+    let b = temp_file("findbuf_b", "one\ntwo\n");
+    let (rpc, _incoming) = start().await;
+
+    feed_sync(&rpc, &format!(":edit {a}<CR>")).await; // tab 1 shows A
+    let a_buf = cur_buf(&rpc).await;
+    let a_win = handle(&req(&rpc, "nvim_get_current_win", vec![]).await);
+    feed_sync(&rpc, &format!(":tabedit {b}<CR>")).await; // tab 2 shows B (focused)
+
+    let found = exec_lua(&rpc, &format!("return vim.fn.win_findbuf({a_buf})")).await;
+    assert_eq!(
+        handles(&found),
+        vec![a_win],
+        "the window showing A lives in tab 1 but must still be found from tab 2"
+    );
+
+    // The Lua `nvim_list_wins` spans tabs the same way its RPC twin does.
+    let listed = exec_lua(&rpc, "return #vim.api.nvim_list_wins()").await;
+    assert_eq!(handle(&listed), 2, "both tabs' windows are listed");
+
+    // A window in a non-current tab is still a valid handle.
+    let valid = exec_lua(&rpc, &format!("return vim.api.nvim_win_is_valid({a_win})")).await;
+    assert_eq!(valid, Value::from(true), "tab 1's window is still valid");
+
+    let _ = std::fs::remove_file(&a);
+    let _ = std::fs::remove_file(&b);
+}
+
+/// Focusing a window that lives in *another* tab crosses to that tab, as in
+/// neovim (`nvim_set_current_win` is not tab-scoped) — over the Lua queue-and-drain
+/// path and over the direct RPC.
+#[tokio::test]
+async fn set_current_win_crosses_tabs() {
+    let a = temp_file("setwin_a", "alpha\nbeta\n");
+    let b = temp_file("setwin_b", "one\ntwo\n");
+    let (rpc, _incoming) = start().await;
+
+    feed_sync(&rpc, &format!(":edit {a}<CR>")).await; // tab 1 shows A
+    let a_buf = cur_buf(&rpc).await;
+    let a_win = handle(&req(&rpc, "nvim_get_current_win", vec![]).await);
+    feed_sync(&rpc, &format!(":tabedit {b}<CR>")).await; // tab 2 shows B (focused)
+    let b_win = handle(&req(&rpc, "nvim_get_current_win", vec![]).await);
+    assert_eq!(cur_tab(&rpc).await, 2);
+
+    // Lua: the queued window op crosses back to tab 1.
+    lua_sync(&rpc, &format!("vim.api.nvim_set_current_win({a_win})")).await;
+    assert_eq!(
+        cur_tab(&rpc).await,
+        1,
+        "focus follows the window to its tab"
+    );
+    assert_eq!(
+        handle(&req(&rpc, "nvim_get_current_win", vec![]).await),
+        a_win
+    );
+    assert_eq!(
+        cur_buf(&rpc).await,
+        a_buf,
+        "and the tab's buffer is current"
+    );
+    assert_eq!(tab_order(&rpc).await, vec![1, 2], "no tab is created");
+
+    // The RPC twin crosses the other way.
+    req(&rpc, "nvim_set_current_win", vec![Value::from(b_win)]).await;
+    req(&rpc, "nvim_get_mode", vec![]).await;
+    assert_eq!(cur_tab(&rpc).await, 2, "the RPC path crosses tabs too");
+    assert_eq!(
+        handle(&req(&rpc, "nvim_get_current_win", vec![]).await),
+        b_win
+    );
+
+    let _ = std::fs::remove_file(&a);
+    let _ = std::fs::remove_file(&b);
+}

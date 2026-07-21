@@ -3,7 +3,7 @@
 
 use crate::keymap::{MappingRhs, MatchScope, Step};
 use crate::EditHost;
-use nxvim_core::{parse_keys, Key, KeyCode};
+use nxvim_core::{parse_keys, parse_keys_raw, Key, KeyCode};
 
 impl EditHost {
     /// Whether this session will CAPTURE the window/tab layout on exit — a workspace
@@ -34,7 +34,17 @@ impl EditHost {
         // cached trie (design §6). A map a callback sets mid-batch takes effect on
         // the next batch, an accepted ordering.
         self.refresh_keymaps();
-        for key in parse_keys(keys) {
+        // Parse this batch faithfully when the client's kitty keyboard protocol is
+        // on, so a distinct `<C-i>`/`<C-m>`/`<C-[>`/`<C-h>` reaches the matcher rather
+        // than being folded onto `<Tab>`/`<CR>`/`<Esc>`/`<BS>` (the keymap LHS is
+        // parsed the same way in `build_for`, so the two sides agree). A legacy
+        // terminal already sends the named byte, so the fold is the right default.
+        let parsed = if self.keyboard_protocol {
+            parse_keys_raw(keys)
+        } else {
+            parse_keys(keys)
+        };
+        for key in parsed {
             self.process_key(key);
         }
         self.run_pending();

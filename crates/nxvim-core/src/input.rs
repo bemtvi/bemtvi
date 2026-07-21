@@ -260,7 +260,28 @@ fn parse_mouse_modifier(modifier: &str) -> Result<(bool, bool, bool), String> {
 ///
 /// Recognizes literal characters and `<...>` special forms with optional
 /// `C-`, `S-`, `A-`/`M-` modifier prefixes. Unknown `<...>` names are skipped.
+///
+/// Folds the four Ctrl-chords that share a byte with a named terminal key onto that
+/// key (`<C-i>`→`<Tab>`, `<C-m>`→`<CR>`, `<C-[>`→`<Esc>`, `<C-h>`→`<BS>`; see
+/// [`canonical_ctrl_alias`]) — the right default for a terminal that cannot tell the
+/// two spellings apart. A caller that KNOWS the terminal disambiguates them (the
+/// kitty keyboard protocol is active) parses with [`parse_keys_raw`] instead, so a
+/// distinct `<C-i>` is preserved.
 pub fn parse_keys(input: &str) -> Vec<Key> {
+    parse_keys_inner(input, true)
+}
+
+/// [`parse_keys`] WITHOUT the terminal-alias fold: `<C-i>` stays a distinct
+/// Ctrl-`i`, not `<Tab>`, and likewise for `<C-m>`/`<C-[>`/`<C-h>`. Used at the two
+/// boundaries that see real terminal semantics — the keymap LHS and the live input
+/// stream — when the client has the kitty keyboard protocol on and so CAN deliver
+/// those chords apart from their named twins. Everywhere else (feedkeys, mapping
+/// RHS, the command-grammar lookahead) keeps [`parse_keys`]'s legacy fold.
+pub fn parse_keys_raw(input: &str) -> Vec<Key> {
+    parse_keys_inner(input, false)
+}
+
+fn parse_keys_inner(input: &str, fold_aliases: bool) -> Vec<Key> {
     let chars: Vec<char> = input.chars().collect();
     let mut out = Vec::new();
     let mut i = 0;
@@ -269,7 +290,14 @@ pub fn parse_keys(input: &str) -> Vec<Key> {
             if let Some(end) = chars[i + 1..].iter().position(|&c| c == '>') {
                 let inner: String = chars[i + 1..i + 1 + end].iter().collect();
                 if let Some(key) = parse_special(&inner) {
-                    out.push(key);
+                    // The fold collapses `<C-i>`→`<Tab>` &c.; the raw path keeps
+                    // them distinct (protocol-on terminals). A raw *control byte*
+                    // (below) already arrives as its named key, so it needs neither.
+                    out.push(if fold_aliases {
+                        canonical_ctrl_alias(key)
+                    } else {
+                        key
+                    });
                     i += end + 2;
                     continue;
                 }
@@ -496,6 +524,9 @@ fn parse_mouse_notation(rest: &str) -> Option<(MouseButton, u8, MouseKind)> {
     Some((button, clicks, kind))
 }
 
+/// Parse the inside of a `<...>` notation form into a faithful [`Key`] — no
+/// terminal-alias fold. [`parse_keys_inner`] applies [`canonical_ctrl_alias`] on top
+/// when folding is requested, so `<C-i>` &c. stay distinct here.
 fn parse_special(inner: &str) -> Option<Key> {
     let mut ctrl = false;
     let mut shift = false;
@@ -576,34 +607,37 @@ fn parse_special(inner: &str) -> Option<Key> {
         }
     };
 
-    Some(canonical_ctrl_alias(Key {
+    Some(Key {
         code,
         ctrl,
         alt,
         shift,
-    }))
+    })
 }
 
 /// Fold the four Ctrl-chords that share a byte with a *named* terminal key onto
 /// that named key: `<C-i>` → `<Tab>` (0x09), `<C-m>` → `<CR>` (0x0d), `<C-[>` →
 /// `<Esc>` (0x1b), `<C-h>` → `<BS>` (0x08). Vim canonicalizes these the same way,
-/// and for the same reason: a terminal cannot tell the two spellings apart, so
-/// they are one key with two names.
+/// and for the same reason: a *legacy* terminal cannot tell the two spellings apart,
+/// so they are one key with two names.
 ///
-/// Without this the two spellings are distinct keys in the keymap layer while the
-/// TUI can only ever *produce* the named one (crossterm decodes 0x09 as
-/// `KeyCode::Tab`, with no CONTROL modifier) — so `vim.keymap.set("n", "<C-i>", …)`
-/// registers a mapping that can never fire, a silent no-op. This is the notation
-/// twin of [`key_from_control_byte`], which already resolves the same collisions
-/// for a raw control byte.
+/// This is applied by [`parse_keys`] (the legacy default) but NOT by
+/// [`parse_keys_raw`]: when the kitty keyboard protocol is active a terminal *can*
+/// deliver `<C-i>` distinct from `<Tab>`, and the server parses the LHS + live input
+/// with the raw variant so the two stay separate keys (vim/neovim do the same once
+/// the protocol is on). Without the fold on the legacy path, a client that can only
+/// *produce* the named form (crossterm decodes 0x09 as `KeyCode::Tab`, no CONTROL)
+/// would leave `vim.keymap.set("n", "<C-i>", …)` a mapping that can never fire — a
+/// silent no-op. This is the notation twin of [`key_from_control_byte`], which
+/// resolves the same collisions for a raw control byte.
 ///
 /// Only an otherwise-unmodified Ctrl-chord folds: `<C-S-i>` / `<C-A-i>` carry a
 /// modifier a terminal *can* distinguish (kitty keyboard protocol), so they stay
 /// as they are rather than silently losing the extra modifier.
 ///
-/// One consequence worth knowing: in a terminal buffer, `<C-h>` now feeds the same
-/// bytes as `<BS>` (0x7f, the DEL convention a PTY expects) rather than a literal
-/// 0x08. The other three are byte-identical either way.
+/// One consequence worth knowing: in a terminal buffer, `<C-h>` on the folded path
+/// feeds the same bytes as `<BS>` (0x7f, the DEL convention a PTY expects) rather
+/// than a literal 0x08. The other three are byte-identical either way.
 fn canonical_ctrl_alias(key: Key) -> Key {
     if !key.ctrl || key.alt || key.shift {
         return key;

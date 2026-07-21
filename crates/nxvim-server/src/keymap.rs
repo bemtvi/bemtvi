@@ -41,7 +41,8 @@
 use std::collections::HashMap;
 
 use nxvim_core::{
-    command_status, key_to_notation, parse_keys, CommandStatus, Key, KeyContext, Mode,
+    command_status, key_to_notation, parse_keys, parse_keys_raw, CommandStatus, Key, KeyContext,
+    Mode,
 };
 use nxvim_lua::{RawKeymap, RawRhs};
 
@@ -370,6 +371,12 @@ pub struct Keymaps {
     /// of looping. It is a *shared* budget across the whole expansion tree, not a
     /// per-branch depth, so a fan-out remap (`a`→`bb`, `b`→`a`) stays linear.
     remap_budget: usize,
+    /// Whether the connected client has the kitty keyboard protocol active (reported
+    /// at `nx_ui_attach`). When set, an LHS is parsed with [`parse_keys_raw`] so
+    /// `<C-i>`/`<C-m>`/`<C-[>`/`<C-h>` stay distinct from `<Tab>`/`<CR>`/`<Esc>`/`<BS>`
+    /// — the terminal can now deliver them apart. Off (the default, and every legacy
+    /// terminal) folds them together via [`parse_keys`].
+    keyboard_protocol: bool,
 }
 
 /// The recursive-remap re-feed cap (vim's `maxmapdepth` is 1000; a smaller cap is
@@ -390,6 +397,17 @@ impl Keymaps {
         snapshot.sort_by_key(|e| (e.buffer.is_some(), !e.default, e.seq));
         self.snapshot = snapshot;
         self.built_buffer = None;
+    }
+
+    /// Record whether the client's kitty keyboard protocol is active and, if that
+    /// changed, mark the tries stale so the next [`build_for`] re-parses every LHS
+    /// with the matching fold (raw when on, folded when off). Called once from
+    /// `nx_ui_attach`; a no-op when the value is unchanged.
+    pub fn set_keyboard_protocol(&mut self, active: bool) {
+        if self.keyboard_protocol != active {
+            self.keyboard_protocol = active;
+            self.built_buffer = None;
+        }
     }
 
     /// Whether the cached tries need a (re)build for `buffer` — true after a
@@ -414,7 +432,15 @@ impl Keymaps {
             if matches!(entry.buffer, Some(b) if b != buffer) {
                 continue;
             }
-            let lhs = parse_keys(&entry.lhs);
+            // A protocol-on terminal can deliver `<C-i>`/`<C-m>`/`<C-[>`/`<C-h>`
+            // apart from `<Tab>`/`<CR>`/`<Esc>`/`<BS>`, so parse the LHS faithfully;
+            // otherwise fold the aliases together (the terminal can't tell them apart
+            // anyway, and a bare `<C-i>` map must still fire on the `<Tab>` byte).
+            let lhs = if self.keyboard_protocol {
+                parse_keys_raw(&entry.lhs)
+            } else {
+                parse_keys(&entry.lhs)
+            };
             if lhs.is_empty() {
                 continue;
             }

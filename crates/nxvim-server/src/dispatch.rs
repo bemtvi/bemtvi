@@ -102,6 +102,23 @@ impl EditHost {
                 let h = geom(params.get(1), 24);
                 self.ui = Some((w, h));
                 self.editor.resize(w, h);
+                // The third arg is a capabilities map. `keyboard_protocol = true` says
+                // the client has the kitty keyboard protocol on, so distinct
+                // `<C-i>`/`<C-m>`/`<C-[>`/`<C-h>` reach us; mirror it into the input
+                // parser and the keymap registry (which restamps its tries so a
+                // mapping's LHS is parsed to match). Absent/false ⇒ legacy folding.
+                let kbd = params
+                    .get(2)
+                    .and_then(|v| match v {
+                        Value::Map(m) => m
+                            .iter()
+                            .find(|(k, _)| k.as_str() == Some("keyboard_protocol"))
+                            .and_then(|(_, val)| val.as_bool()),
+                        _ => None,
+                    })
+                    .unwrap_or(false);
+                self.keyboard_protocol = kbd;
+                self.keymaps.set_keyboard_protocol(kbd);
                 // The resize assigns the window its first rect, so a `nx.decor`
                 // provider's viewport is only now known. Drive `run_pending` to
                 // dispatch it (and any other off-tick work the size change queued)

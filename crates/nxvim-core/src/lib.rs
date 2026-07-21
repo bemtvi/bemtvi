@@ -52,8 +52,8 @@ pub use extmark::{
 pub use highlight::{parse_color, Highlights, HlDef, Rgb, Style, WinHl};
 pub use host::{DirEntry, FileStat, HostFs, StdHostFs};
 pub use input::{
-    key_to_notation, parse_keys, replace_termcodes, Key, KeyCode, MouseAction, MouseButton,
-    MouseEvent, MouseKind, WheelDir,
+    key_to_notation, parse_keys, parse_keys_raw, replace_termcodes, Key, KeyCode, MouseAction,
+    MouseButton, MouseEvent, MouseKind, WheelDir,
 };
 pub use mode::{KeyContext, Mode};
 pub use options::{

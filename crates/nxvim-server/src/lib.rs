@@ -809,6 +809,13 @@ pub struct EditHost {
     remote_shada: Option<RemoteShadaSync>,
     /// Attached UI dimensions `(width, height)`, once a client has attached.
     ui: Option<(usize, usize)>,
+    /// Whether the attached client has the kitty keyboard protocol active (reported
+    /// in the `nx_ui_attach` capabilities map). Gates faithful key parsing in
+    /// [`input`](Self::input) so a protocol-on terminal's `<C-i>`/`<C-m>`/`<C-[>`/
+    /// `<C-h>` reach the matcher distinct from `<Tab>`/`<CR>`/`<Esc>`/`<BS>`; mirrored
+    /// into the keymap registry so a mapping's LHS is parsed to match. Off by default
+    /// (every legacy terminal, and until a client reports otherwise).
+    keyboard_protocol: bool,
     /// Per-buffer highlight memo, keyed by buffer id (created lazily on first
     /// redraw of a buffer, dropped when the buffer is deleted). The parse tree
     /// itself lives in the editor's [`nxvim_core::SyntaxEngine`]; this is only the
@@ -1318,6 +1325,7 @@ impl EditHost {
             #[cfg(feature = "native")]
             remote_shada: None,
             ui: None,
+            keyboard_protocol: false,
             #[cfg(feature = "native")]
             syntax_states: HashMap::new(),
             #[cfg(feature = "native")]

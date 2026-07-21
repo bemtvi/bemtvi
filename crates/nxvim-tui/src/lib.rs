@@ -256,7 +256,7 @@ where
     // the terminal up. Exit / a fatal error ends it.
     let mut stream = initial;
     let result = loop {
-        match event_loop(stream, &mut terminal, build.clone()).await {
+        match event_loop(stream, &mut terminal, build.clone(), keyboard.is_some()).await {
             Ok(Outcome::Exit) => break Ok(()),
             Ok(Outcome::Swap(next)) => stream = next,
             Err(e) => break Err(e),
@@ -275,6 +275,7 @@ async fn event_loop<S>(
     stream: S,
     terminal: &mut DefaultTerminal,
     build: SessionBuilder<S>,
+    keyboard_protocol: bool,
 ) -> Result<Outcome<S>>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
@@ -295,7 +296,13 @@ where
         vec![
             Value::from(size.width as u64),
             Value::from(text_height(size.height) as u64),
-            Value::Map(vec![]),
+            // Capabilities map: tell the server the kitty keyboard protocol is on so
+            // it parses distinct `<C-i>`/`<C-m>`/`<C-[>`/`<C-h>` instead of folding
+            // them onto their named twins.
+            Value::Map(vec![(
+                Value::from("keyboard_protocol"),
+                Value::from(keyboard_protocol),
+            )]),
         ],
     )
     .await

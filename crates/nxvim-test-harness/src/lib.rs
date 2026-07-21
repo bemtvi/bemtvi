@@ -81,6 +81,27 @@ pub async fn attach(rpc: &Rpc, cols: u16, rows: u16) {
     .expect("ui attach");
 }
 
+/// [`attach`] a UI that declares the **kitty keyboard protocol** active
+/// (`keyboard_protocol = true` in the capabilities map), so the server parses
+/// distinct `<C-i>`/`<C-m>`/`<C-[>`/`<C-h>` instead of folding them onto their named
+/// twins — the way a modern client attaches. Plain [`attach`] leaves it off (a
+/// legacy terminal), which is what the default harness setup exercises.
+pub async fn attach_keyboard_protocol(rpc: &Rpc, cols: u16, rows: u16) {
+    rpc.request(
+        "nx_ui_attach",
+        vec![
+            Value::from(cols as u64),
+            Value::from(rows as u64),
+            Value::Map(vec![(
+                Value::from("keyboard_protocol"),
+                Value::Boolean(true),
+            )]),
+        ],
+    )
+    .await
+    .expect("ui attach");
+}
+
 /// [`spawn`] the server with `init` and [`attach`] a `cols` × `rows` UI.
 pub async fn start_attached(
     init: ServerInit,

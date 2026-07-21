@@ -1572,6 +1572,89 @@ async fn ctrl_chord_aliases_canonicalize_to_the_named_key() {
     }
 }
 
+/// Start a server with `init_lua` but attach a UI that declares the **kitty
+/// keyboard protocol** active, so the four Ctrl-chords are NOT folded onto their
+/// named twins — the modern-terminal path.
+async fn start_with_config_kbd(
+    dir: &std::path::Path,
+    init_lua: &str,
+) -> (Rpc, UnboundedReceiver<Incoming>) {
+    std::fs::write(dir.join("init.lua"), init_lua).expect("write init.lua");
+    let init = ServerInit {
+        config_dir: Some(dir.to_path_buf()),
+        runtimepath: vec![dir.to_path_buf()],
+        ..Default::default()
+    };
+    let (rpc, incoming) = spawn(init);
+    nxvim_test_harness::attach_keyboard_protocol(&rpc, 80, 24).await;
+    (rpc, incoming)
+}
+
+/// With the kitty keyboard protocol on, the four Ctrl-chords are kept DISTINCT from
+/// their named twins: a `<C-i>` map fires only for a `<C-i>` the terminal can now
+/// deliver, and a plain `<Tab>` does *not* trigger it (nor vice versa). This is the
+/// modern-terminal counterpart to `ctrl_chord_aliases_canonicalize_to_the_named_key`
+/// (which covers the legacy fold when the protocol is off).
+#[tokio::test]
+async fn ctrl_chords_stay_distinct_under_the_keyboard_protocol() {
+    // (LHS spelling, the twin key that must NOT trigger it, the key that must)
+    for (lhs, other, same) in [
+        ("<C-i>", "<Tab>", "<C-i>"),
+        ("<Tab>", "<C-i>", "<Tab>"),
+        ("<C-m>", "<CR>", "<C-m>"),
+        ("<CR>", "<C-m>", "<CR>"),
+        ("<C-[>", "<Esc>", "<C-[>"),
+        ("<C-h>", "<BS>", "<C-h>"),
+    ] {
+        let dir = temp_dir("keymap_ctrl_distinct");
+        let (rpc, _incoming) = start_with_config_kbd(
+            &dir,
+            &format!("_G.fired = 0\nvim.keymap.set('n', '{lhs}', function() _G.fired = _G.fired + 1 end)\n"),
+        )
+        .await;
+
+        feed(&rpc, other);
+        assert_eq!(
+            lua_u64(&rpc, "return _G.fired").await,
+            Some(0),
+            "{other} must NOT fire the {lhs} map — the protocol keeps them apart"
+        );
+        feed(&rpc, same);
+        assert_eq!(
+            lua_u64(&rpc, "return _G.fired").await,
+            Some(1),
+            "{same} fires its own {lhs} map"
+        );
+    }
+}
+
+/// The user's real case: on a protocol-capable terminal, `<C-i>` and `<Tab>` can be
+/// bound to *different* actions and each fires only for its own key.
+#[tokio::test]
+async fn ctrl_i_and_tab_bind_independently_under_the_protocol() {
+    let dir = temp_dir("keymap_ci_tab_split");
+    let (rpc, _incoming) = start_with_config_kbd(
+        &dir,
+        "_G.ci = 0\n_G.tab = 0\n\
+         vim.keymap.set('n', '<C-i>', function() _G.ci = _G.ci + 1 end)\n\
+         vim.keymap.set('n', '<Tab>', function() _G.tab = _G.tab + 1 end)\n",
+    )
+    .await;
+
+    feed(&rpc, "<C-i>");
+    feed(&rpc, "<Tab><Tab>");
+    assert_eq!(
+        lua_u64(&rpc, "return _G.ci").await,
+        Some(1),
+        "<C-i> map fired once"
+    );
+    assert_eq!(
+        lua_u64(&rpc, "return _G.tab").await,
+        Some(2),
+        "<Tab> map fired twice, independently of <C-i>"
+    );
+}
+
 /// The fold applies only to an *otherwise-unmodified* Ctrl-chord: `<C-S-i>` and
 /// `<C-A-i>` carry a modifier a terminal can distinguish (kitty keyboard
 /// protocol), so they stay their own keys rather than losing the extra modifier.

@@ -60,6 +60,20 @@ pub const LISTING_HL_NS: u32 = u32::MAX - 3;
 /// right after the content loads. Sits just below [`LISTING_HL_NS`].
 pub const DOC_MD_NS: u32 = u32::MAX - 4;
 
+/// Reserved namespace for the live `:s///` **substitute preview** (the diff
+/// overlay shown while a `:[range]s/pat/rep` command line is being typed). Each
+/// match gets a range extmark over the matched bytes carrying the
+/// `NxSubstituteDelete` group (the "removed" side) plus — when the replacement is
+/// non-empty and single-line — an [`Inline`](VirtTextPos::Inline) `virt_text`
+/// extmark at the match end holding the replacement text in `NxSubstituteAdd`
+/// (the "added" side). Populated / cleared by
+/// [`Editor::refresh_subst_preview`](crate::editor::Editor::refresh_subst_preview)
+/// as the command line changes and torn down when it closes, so — like the other
+/// reserved decoration namespaces — it never persists, never enters an undo
+/// snapshot, and is kept out of the user-facing extmark mirror. Sits just below
+/// [`DOC_MD_NS`].
+pub const SUBST_PREVIEW_NS: u32 = u32::MAX - 5;
+
 /// neovim's `DEFAULT_PRIO` for extmark highlights — above the treesitter
 /// highlighter's baseline ([`TS_HL_PRIORITY`]), so a plugin / semantic-token
 /// mark wins over the base syntax color by default.

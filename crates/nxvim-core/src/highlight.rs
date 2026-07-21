@@ -240,7 +240,15 @@ impl Highlights {
         };
         let mut current = name;
         for _ in 0..MAX_LINK_DEPTH {
-            let def = lookup(current)?;
+            let Some(def) = lookup(current) else {
+                // Undefined in every table: a small set of nx-internal groups still
+                // carry a built-in style so their feature renders with no colorscheme
+                // loaded (like the client's built-in Search/Visual fallback). A real
+                // `nvim_set_hl` of the same name lands in `groups` and wins above, and
+                // `iter`/`get` (the `nvim_get_hl` mirror) read only the real tables, so
+                // this stays a pure render-time fallback.
+                return builtin_default_style(current);
+            };
             if let Some(link) = &def.link {
                 current = link;
                 continue;
@@ -261,6 +269,31 @@ impl Highlights {
         capture_fallbacks(capture)
             .into_iter()
             .find_map(|group| self.resolve(&group))
+    }
+}
+
+/// The built-in style for an nx-internal highlight group the renderer must be
+/// able to show even with **no colorscheme loaded** — the highlight-registry twin
+/// of the clients' hard-coded Search/Visual fallback. Only the substitute-preview
+/// diff groups are defined here today: `NxSubstituteDelete` (the removed text — a
+/// red foreground struck through) and `NxSubstituteAdd` (the inline replacement —
+/// a green foreground). A colorscheme (or user `nvim_set_hl`) defining either name
+/// lands in the real table and wins ahead of this, so themes stay in control.
+/// Any other name yields `None` — this is a narrow, closed fallback, not a default
+/// scheme.
+fn builtin_default_style(name: &str) -> Option<Style> {
+    let rgb = |r, g, b| Some(Rgb { r, g, b });
+    match name {
+        "NxSubstituteDelete" => Some(Style {
+            fg: rgb(0xf3, 0x8b, 0xa8), // red
+            strikethrough: true,
+            ..Style::default()
+        }),
+        "NxSubstituteAdd" => Some(Style {
+            fg: rgb(0xa6, 0xe3, 0xa1), // green
+            ..Style::default()
+        }),
+        _ => None,
     }
 }
 

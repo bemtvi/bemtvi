@@ -3,6 +3,7 @@
 
 use super::*;
 use crate::buffer::Buffer;
+use crate::extmark::{VirtChunk, VirtDecor, VirtTextPos, DEFAULT_PRIORITY, SUBST_PREVIEW_NS};
 use crate::input::{Key, KeyCode};
 use crate::search::SearchRegex;
 use std::path::PathBuf;
@@ -98,6 +99,23 @@ fn expand_tilde(rep: &str, prev: Option<&str>) -> Result<String, ()> {
         }
     }
     Ok(out)
+}
+
+/// Whether `body` (a substitute body, everything after the opening delimiter)
+/// contains an **unescaped** `delim` — i.e. the replacement half has been opened
+/// (`:s/pat/…`). A `\delim` is a literal delimiter and doesn't count; any other
+/// `\x` skips its escaped char. Used to hand the match off from the plain pattern
+/// preview to the richer replacement diff preview.
+fn has_unescaped_delim(body: &str, delim: char) -> bool {
+    let mut chars = body.chars();
+    while let Some(c) = chars.next() {
+        if c == '\\' {
+            chars.next(); // skip the escaped char (incl. an escaped delimiter)
+        } else if c == delim {
+            return true;
+        }
+    }
+    false
 }
 
 fn split_substitute(body: &str, delim: char) -> (String, String, String) {
@@ -1347,6 +1365,13 @@ impl Editor {
             Some(d) if !d.is_alphanumeric() && d != '\\' && d != '"' => {
                 let body = &args[d.len_utf8()..];
                 if subst {
+                    // Once the replacement half has been opened (`:s/pat/…`), the
+                    // richer diff preview (`refresh_subst_preview`) owns the match —
+                    // showing the removed text struck through and the replacement
+                    // inline — so the plain yellow pattern highlight yields to it.
+                    if has_unescaped_delim(body, d) {
+                        return None;
+                    }
                     split_substitute(body, d).0
                 } else {
                     split_global(body, d).0
@@ -1373,6 +1398,195 @@ impl Editor {
             (self.cursor.line, self.cursor.line)
         };
         Some((pattern, lo, hi))
+    }
+
+    /// The resolved live `:s/pat/rep/flags` **replacement preview**, once a
+    /// substitute command line has opened its replacement half (`:s/pat/…`).
+    /// Returns the compiled pattern, the (tilde-expanded) replacement, whether the
+    /// `g` flag is set, and the resolved 0-based inclusive line range — everything
+    /// [`refresh_subst_preview`](Self::refresh_subst_preview) needs to lay the diff
+    /// overlay. `None` when the line isn't such a substitute, when the pattern can't
+    /// be resolved / compiled (still mid-edit), or when `'incsearch'` is off.
+    fn subst_preview(&self) -> Option<(SearchRegex, String, bool, usize, usize)> {
+        // Only a live, focused ex command line previews; the mode/kind guard also
+        // makes the teardown callers a clean no-op once the line has closed.
+        if !self.options.incsearch
+            || self.mode != Mode::Command
+            || self.cmdline_kind != CmdlineKind::Ex
+        {
+            return None;
+        }
+        let cmd = self.cmdline.trim_start_matches([':', ' ']);
+        let (range, rest) = self.parse_ex_range(cmd).ok()?;
+        let rest = rest.trim_start();
+        let name_len = rest.bytes().take_while(u8::is_ascii_alphabetic).count();
+        if !matches!(
+            &rest[..name_len],
+            "s" | "su"
+                | "sub"
+                | "subs"
+                | "subst"
+                | "substi"
+                | "substit"
+                | "substitu"
+                | "substitut"
+                | "substitute"
+        ) {
+            return None;
+        }
+        let after = &rest[name_len..];
+        let args = after.strip_prefix('!').unwrap_or(after).trim_start();
+        // An opening delimiter, and its replacement half actually opened.
+        let delim = args
+            .chars()
+            .next()
+            .filter(|&d| !d.is_alphanumeric() && d != '\\' && d != '"')?;
+        let body = &args[delim.len_utf8()..];
+        if !has_unescaped_delim(body, delim) {
+            return None;
+        }
+        let (pat, rep, flags) = split_substitute(body, delim);
+        // Empty pattern reuses the last search pattern — what submitting would run.
+        let pattern = if pat.is_empty() {
+            self.last_search.as_ref()?.0.clone()
+        } else {
+            pat
+        };
+        if pattern.is_empty() {
+            return None;
+        }
+        // `~` recalls the previous replacement; a bare `~` with no history drops the
+        // added side (deleted-only is still a useful preview) rather than erroring.
+        let prev_rep = self.last_substitute.as_ref().map(|(_, r, _)| r.clone());
+        let rep = expand_tilde(&rep, prev_rep.as_deref()).unwrap_or_default();
+        // Only `g` (every match on a line) and `i`/`I` (force case) change what the
+        // preview shows; a trailing space / count / other flag ends the flag run.
+        let mut global = false;
+        let mut icase: Option<bool> = None;
+        for b in flags.bytes() {
+            match b {
+                b'g' => global = true,
+                b'i' => icase = Some(true),
+                b'I' => icase = Some(false),
+                b' ' | b'\t' | b'0'..=b'9' => break,
+                _ => {}
+            }
+        }
+        let ignorecase = icase.unwrap_or_else(|| self.search_ignorecase(&pattern));
+        let re = SearchRegex::compile(&pattern, ignorecase, self.search_engine()).ok()?;
+        let (lo, hi) = if range.explicit {
+            (range.lo, range.hi)
+        } else {
+            (self.cursor.line, self.cursor.line)
+        };
+        Some((re, rep, global, lo, hi))
+    }
+
+    /// Recompute the live `:s` replacement diff overlay ([`SUBST_PREVIEW_NS`]) from
+    /// the command line: clear the previous marks, then — while a substitute command
+    /// line has its replacement half open — lay a `NxSubstituteDelete` range over
+    /// every match with an inline `NxSubstituteAdd` `virt_text` holding the
+    /// replacement spliced in right after it. Called wherever the command line
+    /// changes, and (as a pure teardown) when it closes. A no-op teardown when the
+    /// line isn't such a substitute.
+    pub(crate) fn refresh_subst_preview(&mut self) {
+        self.clear_subst_preview();
+        let Some((re, rep, global, lo, hi)) = self.subst_preview() else {
+            return;
+        };
+        // Only visible rows are ever painted, so a mark cap keeps a `:%s` over a
+        // giant file cheap while still covering any realistic viewport.
+        const MAX_MARKS: usize = 1000;
+        let hi = hi.min(self.buffer().line_count().saturating_sub(1));
+        let mut marks = 0usize;
+        'lines: for l in lo..=hi {
+            let line = self.buffer().line(l);
+            let line_start = self.buffer().line_start(l);
+            let mut from = 0;
+            while let Some((s, e, repl)) = re.match_replacement(&line, from, &rep) {
+                self.set_subst_preview_marks(line_start + s, line_start + e, &repl);
+                marks += 1 + usize::from(!repl.is_empty() && !repl.contains('\n'));
+                if marks >= MAX_MARKS {
+                    break 'lines;
+                }
+                if !global {
+                    break;
+                }
+                // Step past this match; a zero-width match advances one char so the
+                // scan can't spin in place.
+                from = if e > s {
+                    e
+                } else {
+                    match line[e..].chars().next() {
+                        Some(c) => e + c.len_utf8(),
+                        None => break,
+                    }
+                };
+                if from > line.len() {
+                    break;
+                }
+            }
+        }
+    }
+
+    /// Lay one match's diff overlay into [`SUBST_PREVIEW_NS`]: a
+    /// `NxSubstituteDelete` range over the matched bytes `[start, end)` (the
+    /// removed side, struck through) and — when `repl` is non-empty and single
+    /// line — an inline `NxSubstituteAdd` `virt_text` at `end` holding the
+    /// replacement (the added side). A `\r`-splitting replacement can't be shown
+    /// inline (it would split the row), so only its removed side is drawn. Shared
+    /// by the typed-line preview ([`refresh_subst_preview`](Self::refresh_subst_preview))
+    /// and the `:s///c` confirm walk's current match.
+    fn set_subst_preview_marks(&mut self, start: usize, end: usize, repl: &str) {
+        let bid = self.cur_buffer();
+        let buf = &mut self.buffers.get_mut(bid).buffer;
+        buf.extmarks.set(
+            SUBST_PREVIEW_NS,
+            None,
+            start,
+            Some(end),
+            Some("NxSubstituteDelete".to_string()),
+            DEFAULT_PRIORITY,
+            None,
+        );
+        if !repl.is_empty() && !repl.contains('\n') {
+            let decor = VirtDecor {
+                virt_text: vec![VirtChunk {
+                    text: repl.to_string(),
+                    hl_group: Some("NxSubstituteAdd".to_string()),
+                }],
+                virt_text_pos: VirtTextPos::Inline,
+                ..VirtDecor::default()
+            };
+            buf.extmarks.set(
+                SUBST_PREVIEW_NS,
+                None,
+                end,
+                None,
+                None,
+                DEFAULT_PRIORITY,
+                Some(Box::new(decor)),
+            );
+        }
+    }
+
+    /// Clear the `:s` diff overlay ([`SUBST_PREVIEW_NS`]) from the current buffer.
+    fn clear_subst_preview(&mut self) {
+        let bid = self.cur_buffer();
+        self.buffers
+            .get_mut(bid)
+            .buffer
+            .extmarks
+            .clear(SUBST_PREVIEW_NS, None);
+    }
+
+    /// The current `:s///c` match as `(line, byte_start)` while a confirm prompt is
+    /// showing — for the renderer to drop the plain match highlight on it so the
+    /// diff overlay (`set_subst_preview_marks`) reads cleanly. `None` when no
+    /// confirm walk is paused on a match.
+    pub(crate) fn subst_confirm_current(&self) -> Option<(usize, usize)> {
+        let sc = self.subst_confirm.as_ref()?;
+        sc.cur.as_ref().map(|(s, _, _)| (sc.line, *s))
     }
 
     /// `:[range]s/{pat}/{rep}/[flags] [count]` — substitute matches of `pat`
@@ -2014,6 +2228,14 @@ impl Editor {
                     self.cursor.col = s;
                     self.clamp_cursor();
                     self.ensure_visible();
+                    // Show the diff on the match being prompted, exactly like the
+                    // typed-line preview: strike the matched text and splice the
+                    // replacement in after it. Repopulated each seek, so it always
+                    // tracks the current match; the plain match highlight is dropped
+                    // from this one span (see `subst_confirm_current`).
+                    let line_start = self.buffer().line_start(line);
+                    self.clear_subst_preview();
+                    self.set_subst_preview_marks(line_start + s, line_start + e, &repl);
                     // Set the prompt directly, not via `echo`: it's a transient
                     // question, kept off the `:messages` history (like vim).
                     self.message_error = false;
@@ -2166,6 +2388,8 @@ impl Editor {
     /// changed line (vim's resting place), then report the count — silent for a
     /// lone single substitution, just like the non-confirm path.
     fn subst_confirm_finish(&mut self) {
+        // Drop the current-match diff overlay before the walk ends.
+        self.clear_subst_preview();
         let sc = self.subst_confirm.take().expect("confirm active");
         if let Some(last) = sc.last_changed {
             self.buffer_mut().normalize();

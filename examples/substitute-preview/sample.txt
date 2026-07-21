@@ -1,0 +1,10 @@
+Type a :substitute and watch teh preview before you hit Enter.
+
+The color of teh sky is one color; teh color of grass is another color.
+A color here, a color there, teh same color everywhere.
+Pick a color, any color, and teh preview shows teh change live.
+
+foo bar foo — an empty replacement (:%s/foo//) previews a deletion.
+foo baz foo — each foo is struck through, nothing added.
+
+Try:  :%s/teh/the/g   then   :2,4s/color/colour/g   then   :%s/foo//

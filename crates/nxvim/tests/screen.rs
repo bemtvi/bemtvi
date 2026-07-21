@@ -378,6 +378,99 @@ async fn search_matches_are_highlighted_on_screen() {
     );
 }
 
+/// Whether a painted cell is struck through (the removed side of the `:s` diff
+/// preview carries `Modifier::CROSSED_OUT`).
+fn crossed(buf: &Buffer, x: u16, y: u16) -> bool {
+    buf.cell((x, y))
+        .map(|c| c.style().add_modifier.contains(Modifier::CROSSED_OUT))
+        .unwrap_or(false)
+}
+
+#[tokio::test]
+async fn substitute_replacement_preview_paints_a_diff_on_screen() {
+    let (rpc, mut incoming) = start(None).await;
+    feed(&rpc, "ifoo and foo<Esc>");
+    // Type the substitute WITHOUT submitting: the live diff preview strikes each
+    // "foo" (removed, red) and splices "xyz" after it (added, green). `/g` so both
+    // matches on the line preview.
+    feed(&rpc, ":%s/foo/xyz/g");
+    let buf = screen(&rpc, &mut incoming).await;
+
+    // The row now reads as the diff: struck "foo" with "xyz" spliced in after each
+    // (past the `1   ` number gutter).
+    assert_eq!(
+        row_text(&buf, 0).trim_end(),
+        "1   fooxyz and fooxyz",
+        "the removed text stays, the replacement is shown inline after it"
+    );
+
+    let red = Color::Rgb(0xf3, 0x8b, 0xa8);
+    let green = Color::Rgb(0xa6, 0xe3, 0xa1);
+    // The first "foo" (cols GUTTER..+3) is struck through in red.
+    for dx in 0..3 {
+        assert_eq!(fg(&buf, GUTTER + dx, 0), Some(red), "removed 'foo' is red");
+        assert!(crossed(&buf, GUTTER + dx, 0), "removed 'foo' is struck");
+    }
+    // The inserted "xyz" (cols GUTTER+3..+6) is green and not struck.
+    assert_eq!(row_text(&buf, 0).get(4 + 3..4 + 6), Some("xyz"));
+    for dx in 3..6 {
+        assert_eq!(
+            fg(&buf, GUTTER + dx, 0),
+            Some(green),
+            "added 'xyz' is green"
+        );
+        assert!(!crossed(&buf, GUTTER + dx, 0), "added text is not struck");
+    }
+
+    // Submitting applies the real substitute and clears the overlay.
+    feed(&rpc, "<CR>");
+    let buf = screen(&rpc, &mut incoming).await;
+    assert_eq!(row_text(&buf, 0).trim_end(), "1   xyz and xyz");
+    assert!(
+        !crossed(&buf, GUTTER, 0),
+        "no strike-through remains after submit"
+    );
+}
+
+#[tokio::test]
+async fn substitute_confirm_paints_the_diff_on_the_current_match() {
+    let (rpc, mut incoming) = start(None).await;
+    feed(&rpc, "ifoo foo<Esc>");
+    // `:s/foo/xyz/gc` opens the confirm prompt on the first match; that match shows
+    // the diff (struck "foo" red + inline "xyz" green) while the pending one stays
+    // on the plain yellow search highlight.
+    feed(&rpc, ":s/foo/xyz/gc<CR>");
+    let buf = screen(&rpc, &mut incoming).await;
+
+    assert_eq!(row_text(&buf, 0).trim_end(), "1   fooxyz foo");
+    let red = Color::Rgb(0xf3, 0x8b, 0xa8);
+    let green = Color::Rgb(0xa6, 0xe3, 0xa1);
+    // The current match: struck red "foo", then green "xyz", and NOT the yellow
+    // search background (it yielded to the diff).
+    assert_eq!(fg(&buf, GUTTER, 0), Some(red), "current match is red");
+    assert!(crossed(&buf, GUTTER, 0), "current match is struck");
+    assert_ne!(
+        bg(&buf, GUTTER, 0),
+        Some(Color::Yellow),
+        "no yellow under the diff"
+    );
+    assert_eq!(
+        fg(&buf, GUTTER + 3, 0),
+        Some(green),
+        "the inline 'xyz' is green"
+    );
+    // The pending second match ("foo" at text cols 8..11 after the "xyz" splice)
+    // keeps its yellow search highlight.
+    assert_eq!(
+        bg(&buf, GUTTER + 8, 0),
+        Some(Color::Yellow),
+        "the pending match keeps the plain highlight"
+    );
+
+    // Prompt is up on the command row.
+    assert!(row_text(&buf, ROWS - 1).contains("replace with xyz"));
+}
+
 #[tokio::test]
 async fn wide_chars_align_on_screen() {
     let (rpc, mut incoming) = start(None).await;

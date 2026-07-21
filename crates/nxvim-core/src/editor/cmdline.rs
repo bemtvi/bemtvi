@@ -152,10 +152,12 @@ impl Editor {
             other => return Err(format!("unknown cmdline action {other:?}")),
         }
         // The command line still has focus: refresh the live incsearch preview
-        // for the just-edited search pattern (a no-op for an ex command line).
+        // for the just-edited search pattern (a no-op for an ex command line), and
+        // the `:s///` replacement diff overlay (a no-op teardown for anything else).
         if let CmdlineKind::Search(dir) = self.cmdline_kind {
             self.update_incsearch_preview(dir);
         }
+        self.refresh_subst_preview();
         // An edit / cursor move refreshes an open completion popup against the new
         // token (a no-op when no cmdline menu is open — typing never opens it).
         self.cmdline_complete_refresh();
@@ -176,6 +178,10 @@ impl Editor {
         self.cmdline_col = 0;
         let kind = self.cmdline_kind;
         self.mode = self.cmdline_return_mode;
+        // Drop the live `:s///` diff overlay now the line is taken — before any
+        // `execute_ex` below pushes the real substitute's undo snapshot, so the
+        // ephemeral preview marks are never captured in it.
+        self.refresh_subst_preview();
         match kind {
             CmdlineKind::Ex => {
                 self.remember_ex(&text);
@@ -242,6 +248,7 @@ impl Editor {
             if let CmdlineKind::Search(dir) = self.cmdline_kind {
                 self.update_incsearch_preview(dir);
             }
+            self.refresh_subst_preview();
             return;
         }
         // The residual text fallthrough: an unmapped printable key inserts into the
@@ -252,6 +259,7 @@ impl Editor {
                 if let CmdlineKind::Search(dir) = self.cmdline_kind {
                     self.update_incsearch_preview(dir);
                 }
+                self.refresh_subst_preview();
                 // Narrow an open completion popup against the new prefix (no-op when
                 // none is open — typing never opens the wildmenu, only `<Tab>` does).
                 self.cmdline_complete_refresh();
@@ -283,6 +291,9 @@ impl Editor {
         self.mode = self.cmdline_return_mode;
         self.cmdline.clear();
         self.cmdline_col = 0;
+        // Tear down any live `:s///` replacement diff overlay — the line has closed
+        // (mode restored, text cleared), so this only clears the marks.
+        self.refresh_subst_preview();
     }
 
     /// The mode an *ex* command line (`:`) opened now should restore when it

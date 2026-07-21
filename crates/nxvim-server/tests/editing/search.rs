@@ -666,6 +666,315 @@ async fn substitute_preview_honors_noincsearch() {
     );
 }
 
+// ----- :s replacement diff preview (inccommand-style) -----------------------
+
+/// Per visible row, the screen-column spans `[start, end)` carrying the
+/// `NxSubstituteDelete` group — the "removed" side of the live `:s` diff preview.
+fn subst_deleted(view: &[(Value, Value)]) -> Vec<Vec<(u64, u64)>> {
+    view_get(view, "highlights")
+        .and_then(Value::as_array)
+        .map(|rows| {
+            rows.iter()
+                .map(|row| {
+                    row.as_array()
+                        .map(|spans| {
+                            spans
+                                .iter()
+                                .filter_map(|s| {
+                                    let s = s.as_array()?;
+                                    (s.get(2).and_then(Value::as_str) == Some("NxSubstituteDelete"))
+                                        .then(|| {
+                                            (s[0].as_u64().unwrap_or(0), s[1].as_u64().unwrap_or(0))
+                                        })
+                                })
+                                .collect()
+                        })
+                        .unwrap_or_default()
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Whether every `NxSubstituteDelete` span in the frame resolved to a concrete
+/// palette style (a non-nil `style_id`) — i.e. the built-in red fallback painted
+/// even with no colorscheme loaded.
+fn subst_deleted_all_styled(view: &[(Value, Value)]) -> bool {
+    view_get(view, "highlights")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_array)
+        .flatten()
+        .filter_map(Value::as_array)
+        .filter(|s| s.get(2).and_then(Value::as_str) == Some("NxSubstituteDelete"))
+        .all(|s| s.get(3).is_some_and(|v| !v.is_nil()))
+}
+
+/// Per visible row, the inline `virt_text` additions as `(anchor_col, text)` — the
+/// "added" replacement side of the diff preview.
+fn subst_added(view: &[(Value, Value)]) -> Vec<Vec<(u64, String)>> {
+    view_get(view, "virt_text")
+        .and_then(Value::as_array)
+        .map(|rows| {
+            rows.iter()
+                .map(|row| {
+                    row.as_array()
+                        .map(|places| {
+                            places
+                                .iter()
+                                .filter_map(|p| {
+                                    let p = p.as_array()?;
+                                    (p[0].as_u64()? == 1).then_some(())?; // inline
+                                    let col = p[1].as_u64()?;
+                                    let text = p[3]
+                                        .as_array()?
+                                        .iter()
+                                        .filter_map(|c| c.as_array()?[0].as_str())
+                                        .collect::<String>();
+                                    Some((col, text))
+                                })
+                                .collect()
+                        })
+                        .unwrap_or_default()
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+#[tokio::test]
+async fn substitute_replacement_preview_marks_deleted_and_added() {
+    let (rpc, mut incoming) = search_fixture().await;
+    // `:%s/foo/xyz` (no <CR>): every "foo" is struck as deleted, and "xyz" is
+    // shown inline right after each match as the added text.
+    let map = redraw_after(&rpc, &mut incoming, ":%s/foo/xyz").await;
+
+    let deleted = subst_deleted(&map);
+    assert_eq!(deleted.first().cloned().unwrap_or_default(), vec![(0, 3)]);
+    assert_eq!(deleted.get(1).cloned().unwrap_or_default(), vec![(4, 7)]);
+    assert_eq!(deleted.get(2).cloned().unwrap_or_default(), vec![(4, 7)]);
+
+    let added = subst_added(&map);
+    assert_eq!(
+        added.first().cloned().unwrap_or_default(),
+        vec![(3, "xyz".to_string())]
+    );
+    assert_eq!(
+        added.get(1).cloned().unwrap_or_default(),
+        vec![(7, "xyz".to_string())]
+    );
+
+    // The plain yellow pattern highlight yields to the diff preview.
+    assert!(
+        view_search(&map).iter().all(Vec::is_empty),
+        "the yellow match highlight is suppressed once the replacement opens"
+    );
+    // The removed side is colored even with no colorscheme (built-in red fallback).
+    assert!(
+        subst_deleted_all_styled(&map),
+        "NxSubstituteDelete resolves to a concrete style via the built-in fallback"
+    );
+    // Nothing is actually edited by the preview.
+    assert_eq!(
+        lines(&rpc).await,
+        vec!["foo bar", "baz foo", "qux foo"],
+        "the preview never touches the buffer"
+    );
+}
+
+#[tokio::test]
+async fn substitute_replacement_preview_respects_g_flag_and_range() {
+    let (rpc, mut incoming) = search_fixture().await;
+    // `:2s/o/0/g` — line 2 only ("baz foo"), every "o" (cols 5 and 6).
+    let map = redraw_after(&rpc, &mut incoming, ":2s/o/0/g").await;
+
+    // Both "o"s are struck; adjacent same-group spans merge in the highlight
+    // projection, so the removed side reads as one [5, 7) region.
+    let deleted = subst_deleted(&map);
+    assert!(deleted.first().cloned().unwrap_or_default().is_empty());
+    assert_eq!(deleted.get(1).cloned().unwrap_or_default(), vec![(5, 7)]);
+    assert!(deleted.get(2).cloned().unwrap_or_default().is_empty());
+
+    // The added side keeps one placement per match — proof the `g` flag found both.
+    let added = subst_added(&map);
+    assert_eq!(
+        added.get(1).cloned().unwrap_or_default(),
+        vec![(6, "0".to_string()), (7, "0".to_string())],
+    );
+    assert!(
+        added.first().cloned().unwrap_or_default().is_empty()
+            && added.get(2).cloned().unwrap_or_default().is_empty(),
+        "the range confines the preview to line 2"
+    );
+}
+
+#[tokio::test]
+async fn substitute_deletion_preview_shows_only_the_deleted_side() {
+    let (rpc, mut incoming) = search_fixture().await;
+    // An empty replacement (`:%s/foo/`) is a deletion: matches struck, nothing added.
+    let map = redraw_after(&rpc, &mut incoming, ":%s/foo/").await;
+    assert_eq!(
+        subst_deleted(&map).first().cloned().unwrap_or_default(),
+        vec![(0, 3)]
+    );
+    assert!(
+        subst_added(&map).iter().all(Vec::is_empty),
+        "an empty replacement adds no inline text"
+    );
+}
+
+#[tokio::test]
+async fn pattern_preview_hands_off_to_the_replacement_diff() {
+    let (rpc, mut incoming) = search_fixture().await;
+    // Before the second delimiter, the pattern preview is the yellow match highlight.
+    let map = redraw_after(&rpc, &mut incoming, ":%s/foo").await;
+    assert_eq!(
+        view_search(&map).first().cloned().unwrap_or_default(),
+        vec![(0, 3)]
+    );
+    assert!(
+        subst_deleted(&map).iter().all(Vec::is_empty),
+        "no diff overlay until the replacement half opens"
+    );
+
+    // Opening the replacement (`/`) hands the match to the red/green diff overlay.
+    let map = redraw_after(&rpc, &mut incoming, "/").await;
+    assert!(
+        view_search(&map).iter().all(Vec::is_empty),
+        "the yellow highlight is gone once the replacement opens"
+    );
+    assert_eq!(
+        subst_deleted(&map).first().cloned().unwrap_or_default(),
+        vec![(0, 3)]
+    );
+}
+
+#[tokio::test]
+async fn substitute_replacement_preview_clears_on_cancel() {
+    let (rpc, mut incoming) = search_fixture().await;
+    feed(&rpc, ":%s/foo/xyz");
+    let _ = lines(&rpc).await; // barrier: flush the preview redraw
+    let map = redraw_after(&rpc, &mut incoming, "<Esc>").await;
+    assert!(
+        subst_deleted(&map).iter().all(Vec::is_empty)
+            && subst_added(&map).iter().all(Vec::is_empty),
+        "cancelling the command line tears the diff overlay down"
+    );
+    assert_eq!(
+        lines(&rpc).await,
+        vec!["foo bar", "baz foo", "qux foo"],
+        "cancel leaves the buffer untouched"
+    );
+}
+
+#[tokio::test]
+async fn substitute_replacement_preview_clears_on_submit_and_applies() {
+    let (rpc, mut incoming) = search_fixture().await;
+    let map = redraw_after(&rpc, &mut incoming, ":%s/foo/xyz<CR>").await;
+    assert!(
+        subst_deleted(&map).iter().all(Vec::is_empty)
+            && subst_added(&map).iter().all(Vec::is_empty),
+        "submitting clears the preview overlay"
+    );
+    assert_eq!(
+        lines(&rpc).await,
+        vec!["xyz bar", "baz xyz", "qux xyz"],
+        "the real substitute is applied on <CR>"
+    );
+}
+
+#[tokio::test]
+async fn substitute_confirm_shows_the_diff_on_the_current_match() {
+    let (rpc, mut incoming) = search_fixture().await;
+    // `:%s/foo/xyz/c` prompts on the first match; that match wears the diff (struck
+    // "foo" + inline "xyz"), the pending matches keep the plain yellow highlight.
+    let map = redraw_after(&rpc, &mut incoming, ":%s/foo/xyz/c<CR>").await;
+    assert_eq!(
+        field(&map, "message").and_then(Value::as_str),
+        Some("replace with xyz (y/n/a/l/q/^E/^Y)?"),
+        "the confirm prompt is up"
+    );
+    // Current match (line 0): the diff overlay.
+    assert_eq!(
+        subst_deleted(&map).first().cloned().unwrap_or_default(),
+        vec![(0, 3)]
+    );
+    assert_eq!(
+        subst_added(&map).first().cloned().unwrap_or_default(),
+        vec![(3, "xyz".to_string())]
+    );
+    // ...and its plain match highlight is dropped, while the pending matches on
+    // lines 1 and 2 keep theirs.
+    let search = view_search(&map);
+    assert!(
+        search.first().cloned().unwrap_or_default().is_empty(),
+        "the current match drops its yellow highlight for the diff"
+    );
+    assert_eq!(search.get(1).cloned().unwrap_or_default(), vec![(4, 7)]);
+    assert_eq!(search.get(2).cloned().unwrap_or_default(), vec![(4, 7)]);
+    // The buffer is untouched until answered.
+    assert_eq!(lines(&rpc).await, vec!["foo bar", "baz foo", "qux foo"]);
+}
+
+#[tokio::test]
+async fn substitute_confirm_diff_advances_with_the_walk() {
+    let (rpc, mut incoming) = search_fixture().await;
+    feed(&rpc, ":%s/foo/xyz/c<CR>"); // prompt on line 0
+    let _ = lines(&rpc).await; // barrier
+                               // Answer `y`: line 0 is replaced, and the diff moves to the next match (line 1).
+    let map = redraw_after(&rpc, &mut incoming, "y").await;
+    assert_eq!(
+        subst_deleted(&map).get(1).cloned().unwrap_or_default(),
+        vec![(4, 7)],
+        "the diff now sits on the second match"
+    );
+    assert_eq!(
+        subst_added(&map).get(1).cloned().unwrap_or_default(),
+        vec![(7, "xyz".to_string())]
+    );
+    assert!(
+        subst_deleted(&map)
+            .first()
+            .cloned()
+            .unwrap_or_default()
+            .is_empty(),
+        "the answered match no longer carries the overlay"
+    );
+}
+
+#[tokio::test]
+async fn substitute_confirm_diff_clears_when_the_walk_ends() {
+    let (rpc, mut incoming) = search_fixture().await;
+    feed(&rpc, ":%s/foo/xyz/c<CR>");
+    let _ = lines(&rpc).await; // barrier
+                               // `q` quits the walk without touching the current match.
+    let map = redraw_after(&rpc, &mut incoming, "q").await;
+    assert!(
+        subst_deleted(&map).iter().all(Vec::is_empty)
+            && subst_added(&map).iter().all(Vec::is_empty),
+        "ending the confirm walk tears the diff overlay down"
+    );
+    assert_eq!(
+        lines(&rpc).await,
+        vec!["foo bar", "baz foo", "qux foo"],
+        "q leaves the buffer untouched"
+    );
+}
+
+#[tokio::test]
+async fn substitute_replacement_preview_honors_noincsearch() {
+    let (rpc, mut incoming) = search_fixture().await;
+    feed(&rpc, ":set noincsearch<CR>");
+    let _ = lines(&rpc).await; // barrier
+    let map = redraw_after(&rpc, &mut incoming, ":%s/foo/xyz").await;
+    assert!(
+        subst_deleted(&map).iter().all(Vec::is_empty)
+            && subst_added(&map).iter().all(Vec::is_empty),
+        "'noincsearch' turns the replacement diff preview off too"
+    );
+}
+
 // ----- regex patterns (phase 4) ---------------------------------------------
 
 #[tokio::test]

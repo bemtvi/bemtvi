@@ -678,6 +678,10 @@ impl Editor {
             return (matches, current);
         };
         let line_count = buf.line_count();
+        // During a `:s///c` confirm walk the match being prompted wears the diff
+        // overlay instead (struck removed + inline added), so drop the plain match
+        // highlight from that one span to keep it clean.
+        let confirm_cur = self.subst_confirm_current();
 
         for (row, row_spans) in matches.iter_mut().enumerate() {
             let buf_line = base + row;
@@ -692,6 +696,9 @@ impl Editor {
             let ts = buf.options.effective_tabstop();
             let mut vc = unicode::LineVirtcol::new(&text, ts);
             for (s, e) in re.find_all(&text) {
+                if confirm_cur == Some((buf_line, s)) {
+                    continue;
+                }
                 let span = (vc.at(s), vc.at(e));
                 row_spans.push(span);
                 // The preview cursor sits on the start of its match, so an exact

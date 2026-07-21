@@ -1027,6 +1027,96 @@ fn cursorline_without_a_theme_falls_back_to_a_visible_tint() {
 }
 
 #[test]
+fn colorcolumn_tints_the_configured_columns_with_the_themed_background() {
+    // `'colorcolumn'` rulers at text columns 3 and 6 (no gutter → screen cells 2 and
+    // 5) and a `ColorColumn` chrome style (palette entry 0): those columns take the
+    // tint down every text row — empty cells past end-of-text too — while neighbours
+    // keep the plain background.
+    let v = view(vec![
+        ("lines", lines(&["alpha", "bravo"])),
+        (
+            "colorcolumn",
+            Value::Array(vec![Value::from(3u64), Value::from(6u64)]),
+        ),
+        (
+            "styles",
+            Value::Array(vec![style(vec![("bg", rgb(0x33, 0x2a, 0x2a))])]),
+        ),
+        ("chrome", chrome(vec![("colorcolumn", 0)])),
+    ]);
+    let buf = paint(&v, 20, 5);
+    let tint = Some(Color::Rgb(0x33, 0x2a, 0x2a));
+    for row in 0..3 {
+        assert_eq!(
+            bg(&buf, 2, row),
+            tint,
+            "column 3 (cell 2) tinted, row {row}"
+        );
+        assert_eq!(
+            bg(&buf, 5, row),
+            tint,
+            "column 6 (cell 5) tinted, row {row}"
+        );
+        assert_ne!(
+            bg(&buf, 3, row),
+            tint,
+            "the cell between the rulers is not tinted, row {row}"
+        );
+    }
+}
+
+#[test]
+fn colorcolumn_without_a_theme_falls_back_to_a_visible_tint() {
+    // `'colorcolumn'` set but the colorscheme leaves `ColorColumn` undefined (no
+    // chrome entry): the ruler still paints with the built-in fallback (Indexed 236)
+    // so it's visible out of the box.
+    let v = view(vec![
+        ("lines", lines(&["alpha"])),
+        ("colorcolumn", Value::Array(vec![Value::from(2u64)])),
+    ]);
+    let buf = paint(&v, 20, 5);
+    assert_eq!(
+        bg(&buf, 1, 0),
+        Some(Color::Indexed(236)),
+        "no ColorColumn theme → the built-in fallback tint"
+    );
+}
+
+#[test]
+fn colorcolumn_offsets_by_the_gutter_and_horizontal_scroll() {
+    // Number gutter width 4 and `leftcol` 1: column 6 lands at cell 4 + (6-1) - 1 = 8.
+    // Column 1 is scrolled off the left (text column 0 < leftcol 1), so it paints
+    // nothing — the ruler tracks the text under `nowrap` horizontal scroll.
+    let v = view(vec![
+        ("lines", lines(&["a really long line here"])),
+        ("number", Value::from(true)),
+        ("number_width", Value::from(4u64)),
+        ("leftcol", Value::from(1u64)),
+        (
+            "colorcolumn",
+            Value::Array(vec![Value::from(1u64), Value::from(6u64)]),
+        ),
+        (
+            "styles",
+            Value::Array(vec![style(vec![("bg", rgb(0x33, 0x2a, 0x2a))])]),
+        ),
+        ("chrome", chrome(vec![("colorcolumn", 0)])),
+    ]);
+    let buf = paint(&v, 20, 5);
+    let tint = Some(Color::Rgb(0x33, 0x2a, 0x2a));
+    assert_eq!(
+        bg(&buf, 8, 0),
+        tint,
+        "column 6 lands at gutter(4) + (6-1) - leftcol(1) = 8"
+    );
+    assert_ne!(
+        bg(&buf, 3, 0),
+        tint,
+        "the column scrolled off the left paints nothing"
+    );
+}
+
+#[test]
 fn the_visual_style_replaces_reverse_video_when_themed() {
     let sel = Value::Array(vec![Value::Array(vec![
         Value::from(0u64),

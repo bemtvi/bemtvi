@@ -457,6 +457,12 @@ pub struct WindowView {
     /// client paints the cursor row's background with the `CursorLine` group; the
     /// cursor's screen row is [`cursor_row`](WindowView::cursor_row).
     pub cursorline: bool,
+    /// `'colorcolumn'` — the 1-based text columns to highlight with the
+    /// `ColorColumn` group (a vertical ruler down the text body), resolved from the
+    /// window option and sorted ascending. Empty (no ruler) by default. The client
+    /// paints each column at screen cell `text_origin + (col - 1) - leftcol` when
+    /// that lands within the text area, across every text row.
+    pub colorcolumn: Vec<usize>,
     /// Width in cells of the number column (`0` when both options are off).
     pub number_width: usize,
     /// `'foldcolumn'` width in cells (`0` when off) — how many cells the client
@@ -1103,6 +1109,7 @@ fn window_view(ed: &Editor, w: &WindowLayout) -> WindowView {
         number: w.options.number,
         relativenumber: w.options.relativenumber,
         cursorline: w.options.cursorline,
+        colorcolumn: w.options.colorcolumns(),
         number_width,
         foldcolumn_width,
         foldcolumn,

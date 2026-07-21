@@ -1473,6 +1473,11 @@ impl Editor {
             // is the loud path). A window-local value overrides the dock's, if any —
             // see `Editor::effective_winhighlight`.
             opts.winhighlight = value.to_string();
+        } else if name == "colorcolumn" {
+            // The raw ruler-column list (`'colorcolumn'` / `'cc'`). Stored verbatim
+            // and resolved to columns at projection (like `fillchars`/`winhighlight`);
+            // junk entries are skipped there, so there's nothing to reject here.
+            opts.colorcolumn = value.to_string();
         } else if name == "padding" {
             // An invalid spec is ignored (the no-op-on-bad-input bridge contract;
             // `:set padding=` is the loud-error path).

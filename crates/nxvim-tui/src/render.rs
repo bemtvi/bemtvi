@@ -85,6 +85,15 @@ fn cursorline_style(win: &WindowView, view: &View) -> Style {
         .unwrap_or_else(|| Style::default().bg(Color::Indexed(236)))
 }
 
+/// The style painted down each `'colorcolumn'` ruler. Prefers the colorscheme's
+/// `ColorColumn` group; with none resolved it falls back to a subtle dark-gray
+/// background so the ruler is still visible out of the box (like `cursorline_style`).
+fn colorcolumn_style(win: &WindowView, view: &View) -> Style {
+    win.color_column_bg(view)
+        .map(rt)
+        .unwrap_or_else(|| Style::default().bg(Color::Indexed(236)))
+}
+
 /// The base style for status-line-tinted chrome — the per-window/global status
 /// bars, the split separators, and the permanent-dock border lines. The theme's
 /// `StatusLine` group when a colorscheme defines it, else reverse-video (vim's
@@ -1123,6 +1132,34 @@ fn render_window(
     } else {
         gutter_area
     };
+
+    // `'colorcolumn'`: paint a vertical ruler down the text body at each configured
+    // column. Screen cell = text origin + (col - 1) - leftcol; a column scrolled off
+    // the left under `nowrap`, or past the right edge, is skipped. Painted after the
+    // gutter split (so it stays within the text area) and before the text (so glyphs
+    // and overlays draw on top — vim's behind-the-text tint, the `'cursorline'` model).
+    if !win.colorcolumn.is_empty() {
+        let style = colorcolumn_style(win, view);
+        for &col in &win.colorcolumn {
+            let text_col = col.saturating_sub(1);
+            if text_col < win.leftcol {
+                continue; // scrolled off the left edge
+            }
+            let x = text_inner.x + (text_col - win.leftcol);
+            if x >= text_inner.right() {
+                continue; // past the right edge of the text area
+            }
+            frame.render_widget(
+                Block::default().style(style),
+                Rect {
+                    x,
+                    y: text_inner.y,
+                    width: 1,
+                    height: text_inner.height,
+                },
+            );
+        }
+    }
 
     // Token style ids index a palette captured with the frame they belong to:
     // the in-flight animation's snapshot while sliding, else the live view's. The

@@ -1011,6 +1011,44 @@ impl Renderer {
         self.build_cmdline(view, cmd_row, quads, items);
     }
 
+    /// `'colorcolumn'` rulers: a 1-cell vertical tint behind the text body at each
+    /// configured column. Screen cell = text origin (`text_x0`) + (col - 1) - leftcol;
+    /// a column scrolled off the left under `nowrap`, or past the window's right edge,
+    /// is skipped, so the ruler tracks the text. Falls back to a subtle lightening of
+    /// `normal_bg` when the theme leaves `ColorColumn` undefined. Shared by the settled
+    /// and sliding paint paths (the rulers are fixed columns, so they must not blink
+    /// out for the duration of a smooth scroll).
+    #[allow(clippy::too_many_arguments)]
+    fn push_colorcolumn(
+        &self,
+        quads: &mut Vec<Quad>,
+        win: &WindowView,
+        view: &View,
+        ox: u16,
+        oy: u16,
+        text_x0: u16,
+        wcols: u16,
+        text_rows: u16,
+        normal_bg: u32,
+    ) {
+        if win.colorcolumn.is_empty() {
+            return;
+        }
+        let cc_bg =
+            style_bg(&win.color_column_bg(view)).unwrap_or_else(|| lighten(normal_bg, 0x12));
+        for &col in &win.colorcolumn {
+            let text_col = col.saturating_sub(1);
+            if text_col < win.leftcol {
+                continue;
+            }
+            let x = text_x0 + (text_col - win.leftcol);
+            if x >= ox + wcols {
+                continue;
+            }
+            self.fill_rect(quads, x, oy, 1, text_rows, cc_bg);
+        }
+    }
+
     /// Paint one window: gutter numbers, text rows (syntax-colored), the visual
     /// selection and search highlights, its status bar, and — if focused — the
     /// cursor.
@@ -1096,6 +1134,13 @@ impl Renderer {
             Some(s) => {
                 let clip = self.text_bounds(ox, oy, wcols, text_rows);
                 let slide_bg = style_bg(&view.normal).unwrap_or(DEFAULT_BG);
+                // `'colorcolumn'` rulers ride through the slide too: they're fixed
+                // screen columns (they don't scroll), so paint them behind the band
+                // exactly as the settled path does — otherwise they blink out for the
+                // duration of every smooth scroll.
+                self.push_colorcolumn(
+                    quads, win, view, ox, oy, text_x0, wcols, text_rows, slide_bg,
+                );
                 let sel_bg = style_bg(&view.visual).unwrap_or(0x33_47_5b);
                 let search_bg = style_bg(&view.search_style).unwrap_or(0x6a_5a_1a);
                 let inc_bg = style_bg(&view.incsearch_style).unwrap_or(0x8a_6d_1a);
@@ -1216,8 +1261,17 @@ impl Renderer {
                     }
                     let hl = s.highlights.get(k).map(Vec::as_slice).unwrap_or(&[]);
                     let vtext = s.virt_text.get(k).map(Vec::as_slice).unwrap_or(&[]);
+                    // A `~` end-of-buffer filler row (`numbers[k] == None`) in the band
+                    // paints with the theme's `EndOfBuffer` foreground, like the settled
+                    // path — otherwise the fillers flash to the plain text `fg` for the
+                    // duration of the slide.
+                    let row_fg = if matches!(s.numbers.get(k), Some(None)) {
+                        style_fg(&view.end_of_buffer).unwrap_or(fg)
+                    } else {
+                        fg
+                    };
                     let mut segments =
-                        row_segments(&display, hl, s.styles, fg, slide_bg, win.leftcol);
+                        row_segments(&display, hl, s.styles, row_fg, slide_bg, win.leftcol);
                     // Splice the band row's inlay hints and inline/overlay virt_text in,
                     // like the settled path, so they slide with the text instead of
                     // flashing out and back when the slide settles. (eol / right_align /
@@ -1229,7 +1283,7 @@ impl Renderer {
                         apply_row_virt(segments, inlay, vtext, win.leftcol, s.styles, fg)
                     };
                     let x = text_run_origin(text_x0, win.leftcol) as f32 * self.cell_w;
-                    self.push_text(items, &segments, (x, y), fg, clip);
+                    self.push_text(items, &segments, (x, y), row_fg, clip);
 
                     // Diagnostic sign + underlines ride the band too, at the row's
                     // sub-pixel offset, so they slide with the text instead of
@@ -1308,6 +1362,11 @@ impl Renderer {
                         }
                     }
                 }
+                // `'colorcolumn'` rulers (painted in both the settled and sliding
+                // paths — the rulers are fixed screen columns, they don't scroll).
+                self.push_colorcolumn(
+                    quads, win, view, ox, oy, text_x0, wcols, text_rows, normal_bg,
+                );
                 for (i, raw) in win.lines.iter().enumerate() {
                     let row = oy as usize + i;
 

@@ -724,6 +724,14 @@ pub struct WindowOptions {
     /// edge while horizontally scrolling (vim's `sidescrolloff`). `0` by default —
     /// the cursor may sit on the very edge.
     pub sidescrolloff: usize,
+    /// Minimum number of screen lines to keep above and below the cursor (vim's
+    /// `scrolloff`). `0` by default — the cursor may sit on the very top/bottom
+    /// text row. A larger value scrolls the viewport early so the cursor stays in a
+    /// band that many rows in from either edge (clamped to half the text height so
+    /// it can't demand a margin the window can't give). The vertical analogue of
+    /// [`sidescrolloff`](WindowOptions::sidescrolloff); honored by the viewport math
+    /// in [`crate::Editor::ensure_visible`].
+    pub scrolloff: usize,
     /// Soft-wrap long lines: a buffer line wider than the text area is laid out
     /// across several screen rows (continuation rows) rather than scrolled
     /// horizontally. `false` (nxvim's historical `nowrap`) keeps one screen row per
@@ -894,6 +902,9 @@ impl Default for WindowOptions {
             // neovim's horizontal-scroll defaults: scroll a minimal step, no margin.
             sidescroll: 1,
             sidescrolloff: 0,
+            // No vertical margin out of the box — the cursor may reach the top/bottom
+            // text row, matching vim's `scrolloff=0` default.
+            scrolloff: 0,
             // nxvim has historically been `nowrap`-only; wrap is opt-in (`:set wrap`)
             // so the existing horizontal-scroll behavior is the default.
             wrap: false,
@@ -1473,6 +1484,13 @@ static OPTIONS: &[OptionInfo] = {
             kind: Num,
             scope: Window,
             doc: "Minimum columns to keep to the left and right of the cursor.",
+        },
+        OptionInfo {
+            name: "scrolloff",
+            abbrev: Some("so"),
+            kind: Num,
+            scope: Window,
+            doc: "Minimum screen lines to keep above and below the cursor.",
         },
         // ---- Buffer-local --------------------------------------------------------
         OptionInfo {

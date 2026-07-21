@@ -1192,3 +1192,84 @@ async fn malformed_glob_class_does_not_abort_the_event_fire() {
         "the malformed class must not raise mid-fire (skipping later autocmds); the exact spelling still matches"
     );
 }
+
+/// Log the basename of every buffer that fires `BufWinEnter`. Shared init for the
+/// tests below; the accumulated `_G.bwe` is read back with `print`.
+const BWE_INIT: &str = "_G.bwe = {}\n\
+     vim.api.nvim_create_autocmd('BufWinEnter', { callback = function(a)\n\
+     \x20 local f = a.file\n\
+     \x20 _G.bwe[#_G.bwe+1] = (f ~= nil and f ~= '') and f:match('[^/]+$') or 'noname'\n\
+     end })\n";
+
+#[tokio::test]
+async fn bufwinenter_fires_once_per_file_when_first_shown_in_a_window() {
+    // BufWinEnter fires for the startup file (like BufReadPost), then once for a
+    // second file when it's first displayed in a window. A no-arg `:split` (the
+    // buffer is already displayed) and merely switching focus between windows do
+    // NOT re-fire it — it tracks a buffer's window-visibility going 0 -> >=1.
+    let dir = temp_dir("au_bwe_basic");
+    let a = dir.join("a.rs");
+    let b = dir.join("b.rs");
+    std::fs::write(&a, "fn main() {}\n").expect("write a");
+    std::fs::write(&b, "fn other() {}\n").expect("write b");
+    let (rpc, mut incoming) = start_with_file_and_config(&dir, a.to_str().unwrap(), BWE_INIT).await;
+    // startup: a.rs displayed -> [a.rs]
+    // :vsplit -> new window shows a.rs (already displayed) -> no fire
+    redraw_after(&rpc, &mut incoming, ":vsplit<CR>").await;
+    // :edit b.rs in the (current) split -> b.rs first shown -> [a.rs, b.rs]
+    redraw_after(&rpc, &mut incoming, &format!(":edit {}<CR>", b.display())).await;
+    // <C-w>w back to the other window (a.rs) -> already displayed -> no fire
+    redraw_after(&rpc, &mut incoming, "<C-w>w").await;
+    redraw_after(&rpc, &mut incoming, "<C-w>w").await;
+    let msg = lua_message(&rpc, &mut incoming, "print(table.concat(_G.bwe, ','))").await;
+    assert_eq!(msg, "a.rs,b.rs");
+}
+
+#[tokio::test]
+async fn bufwinenter_fires_for_a_buffer_shown_in_a_non_current_window() {
+    // The restore case: a buffer displayed in a window that is NOT the current
+    // window still fires BufWinEnter, even though the current-buffer
+    // BufReadPost/BufEnter diff never visits it. Reproduced without a full shada
+    // restore by planting a fresh buffer into a background window via
+    // `nvim_win_set_buf` while a different window holds focus.
+    let dir = temp_dir("au_bwe_bg");
+    let a = dir.join("a.rs");
+    std::fs::write(&a, "fn a() {}\n").expect("write a");
+    let (rpc, mut incoming) = start_with_file_and_config(&dir, a.to_str().unwrap(), BWE_INIT).await;
+    // The startup window (shows a.rs) — capture it before the split moves focus.
+    let win_a = rpc
+        .request("nvim_get_current_win", vec![])
+        .await
+        .unwrap()
+        .as_u64()
+        .unwrap();
+    // A no-arg :split duplicates a.rs into a new (now current) window; a.rs is
+    // already displayed so BufWinEnter does NOT fire. Focus is now on the split,
+    // leaving win_a in the background. bwe stays [a.rs].
+    redraw_after(&rpc, &mut incoming, ":split<CR>").await;
+    let cur = rpc
+        .request("nvim_get_current_win", vec![])
+        .await
+        .unwrap()
+        .as_u64()
+        .unwrap();
+    assert_ne!(cur, win_a, "the split holds focus, not win_a");
+    // Create a fresh (unnamed) buffer and plant it into win_a — the background
+    // window. It transitions from shown-in-no-window to shown, so BufWinEnter must
+    // fire for it (as 'noname'), even though win_a is not the current window and
+    // its buffer never became the current buffer.
+    let newbuf = rpc
+        .request("nvim_create_buf", vec![])
+        .await
+        .unwrap()
+        .as_u64()
+        .unwrap();
+    rpc.request(
+        "nvim_win_set_buf",
+        vec![Value::from(win_a), Value::from(newbuf)],
+    )
+    .await
+    .unwrap();
+    let msg = lua_message(&rpc, &mut incoming, "print(table.concat(_G.bwe, ','))").await;
+    assert_eq!(msg, "a.rs,noname");
+}

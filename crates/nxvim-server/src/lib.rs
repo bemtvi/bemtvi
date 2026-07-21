@@ -1000,6 +1000,19 @@ pub struct EditHost {
     /// Every window id seen at the last diff, in layout order. Ids added since
     /// fire `WinNew`; ids gone fire `WinClosed`.
     known_windows: Vec<WindowId>,
+    /// Each (non-doc-float) window's displayed buffer at the last diff. A buffer
+    /// whose window-visibility went from shown-in-no-window to shown fires
+    /// `BufWinEnter` (once per newly-displayed buffer). This is the event a
+    /// session / workspace restore needs: restore fills *non-current* windows,
+    /// which the current-buffer `BufReadPost`/`BufEnter` diff never visits. A
+    /// no-arg `:split` (buffer already displayed) and merely focusing another
+    /// window don't fire it; a buffer hidden then shown again does (matching
+    /// neovim's "hidden buffer displayed"). Rebuilt every diff so the baseline
+    /// stays current even with no handler; the *fire* is gated on a registered
+    /// handler, like `WinScrolled`. Not seeded at boot, so the first emit fires it
+    /// for the startup / restored windows (as `BufReadPost` fires for the startup
+    /// file).
+    known_window_buffers: HashMap<WindowId, BufferId>,
     /// Each window's `(id, x, y, w, h)` rect at the last diff; a change fires
     /// `WinResized` (splits, `<C-w>`-resizes, terminal resizes). `None` until the
     /// seed so the first emit doesn't spuriously fire it.
@@ -1368,6 +1381,7 @@ impl EditHost {
             last_mode: Mode::Normal,
             last_window_id: None,
             known_windows: Vec::new(),
+            known_window_buffers: HashMap::new(),
             last_window_rects: None,
             last_window_scroll: None,
             last_tab_id: None,

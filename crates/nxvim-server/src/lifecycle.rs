@@ -295,6 +295,11 @@ impl EditHost {
     /// fires on a transition *into* insert (covering `i/a/o/C/cc/s/…` without
     /// touching the core insert chokepoints — the diff sees the result). A cheap
     /// no-op for the vast majority of keys, which change neither buffer nor mode.
+    ///
+    /// `BufWinEnter` is the exception that walks **every** window, not just the
+    /// current buffer: it fires once for each buffer whose window-visibility went
+    /// 0 → ≥1 this diff, so a session/workspace restore (which fills non-current
+    /// windows the current-buffer path never visits) fires it per restored file.
     pub(crate) fn emit_lifecycle_events(&mut self) {
         // Buffers the editor read from a file *in place* this tick (a local `:edit`
         // reusing the throwaway `[No Name]`, or a `:e` / `:e!` reload of the current
@@ -437,6 +442,18 @@ impl EditHost {
             })
         });
 
+        // BufWinEnter diff: any window now displaying a buffer other than what the
+        // baseline recorded for it — including an *existing, non-current* window
+        // whose buffer was swapped (`nvim_win_set_buf`, a session restore filling
+        // background windows). None of the other signals above catch that (the
+        // current buffer / focus / rects / scroll are all unchanged), so it must be
+        // folded into the fast-path guard or a background display change is
+        // swallowed. Computed unconditionally (like `scrolled`), so the baseline is
+        // rebuilt below even when no handler is registered; the *fire* is gated.
+        let bufwin_changed = wins
+            .iter()
+            .any(|w| self.editor.window_buffer(*w) != self.known_window_buffers.get(w).copied());
+
         // Tab diff (Phase 3): tabs added/closed and the active-tab change since the
         // last emit. A tab transition always coincides with a window transition (a
         // switch changes the focused window; create/close add or drop windows), but
@@ -485,6 +502,7 @@ impl EditHost {
             && closed_tabs.is_empty()
             && !tab_changed
             && closed_bufs.is_empty()
+            && !bufwin_changed
         {
             return; // fast path: nothing transitioned
         }
@@ -596,6 +614,38 @@ impl EditHost {
             self.last_window_id = Some(cur_win);
             let b = self.editor.window_buffer(cur_win);
             self.fire_window("WinEnter", cur_win, b);
+        }
+
+        // ----- BufWinEnter: a buffer first becoming displayed in a window -----
+        // Fires once per buffer whose window-visibility went 0 -> >=1 this diff.
+        // Unlike the current-buffer `BufReadPost`/`BufEnter` events above, this
+        // walks *every* window, so a session/workspace restore — which fills
+        // non-current windows the current-buffer diff never visits — fires it for
+        // each restored file. A no-arg `:split` (the buffer is already displayed)
+        // and merely focusing another window don't fire it; a buffer hidden then
+        // re-shown does (neovim's "hidden buffer displayed"). The baseline
+        // (`known_window_buffers`) is rebuilt every diff so it stays current even
+        // with no handler; the fire is gated on a registered handler, like
+        // `WinScrolled` — so a no-handler session never enters Lua here.
+        let mut shown: std::collections::HashSet<BufferId> =
+            self.known_window_buffers.values().copied().collect();
+        let mut newly_shown: Vec<BufferId> = Vec::new();
+        let mut new_map: HashMap<WindowId, BufferId> = HashMap::new();
+        // `wins` was moved into `known_windows` above; it is the same filtered
+        // (doc-floats excluded) list.
+        for &w in &self.known_windows {
+            if let Some(b) = self.editor.window_buffer(w) {
+                new_map.insert(w, b);
+                if shown.insert(b) {
+                    newly_shown.push(b);
+                }
+            }
+        }
+        self.known_window_buffers = new_map;
+        if self.au_active_events.contains("BufWinEnter") {
+            for b in newly_shown {
+                self.fire_buf_win_enter(b);
+            }
         }
         if resized {
             let b = self.editor.window_buffer(cur_win);
@@ -1132,6 +1182,24 @@ impl EditHost {
         self.push_buf_mirror();
         let r = self.lua.fire_autocmd_buf(event, &pattern, bufnr, &file);
         self.report_autocmd_err(event, r);
+        self.apply_lua_effects();
+    }
+
+    /// Fire `BufWinEnter` for `buf` becoming displayed in a window. Unlike the
+    /// generic [`fire_lifecycle`](Self::fire_lifecycle) — which keys the buffer
+    /// snapshot off the *current* buffer — this resolves the name and filetype
+    /// from `buf` itself, since a restore fires it for buffers displayed in
+    /// non-current windows. The `<amatch>`/`<afile>` is `buf`'s name (a buffer
+    /// event, so a `*.md`-patterned or `buffer = N` autocmd matches correctly).
+    pub(crate) fn fire_buf_win_enter(&mut self, buf: BufferId) {
+        let name = self.editor.buffer_name(buf).unwrap_or_default();
+        let ft = self.editor.buffer_filetype(buf).unwrap_or_default();
+        let _ = self.lua.set_buf_snapshot(buf.0, &name, &ft);
+        self.push_buf_mirror();
+        let r = self
+            .lua
+            .fire_autocmd_buf("BufWinEnter", &name, buf.0, &name);
+        self.report_autocmd_err("BufWinEnter", r);
         self.apply_lua_effects();
     }
 

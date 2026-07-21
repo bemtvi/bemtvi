@@ -2953,6 +2953,38 @@ async fn builtin_native_sources_drive_without_config() {
             .any(|r| r.contains("boom") && r.contains("ERROR")),
         "the set diagnostic appears in the picker, got {items:?}"
     );
+    feed(&rpc, "<Esc>");
+
+    // keymaps: a space-leader map's lhs renders as `<Space>` notation, not a
+    // hard-to-see literal blank (nx.keytrans), so the row is legible.
+    exec_lua(
+        &rpc,
+        "vim.g.mapleader = ' '; nx.keymap.set('n', '<leader>xy', function() end, \
+         { desc = 'space leader probe' })",
+    )
+    .await;
+    exec_lua(&rpc, "nx.picker.open('keymaps')").await;
+    poll_menu(&rpc, &mut incoming).await.expect("keymaps opens");
+    // Filter to the probe map (the list windows its projection, so type to surface it).
+    feed(&rpc, "xy");
+    let mut rows = Vec::new();
+    for _ in 0..40 {
+        if let Some(m) = poll_menu(&rpc, &mut incoming).await {
+            rows = menu_items(&menu_of(&m));
+            if rows.iter().any(|r| r.contains("xy")) {
+                break;
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert!(
+        rows.iter().any(|r| r.contains("<Space>xy")),
+        "the space-leader map shows as <Space>xy, got {rows:?}"
+    );
+    assert!(
+        !rows.iter().any(|r| r.contains("  xy ")),
+        "the lhs is not rendered with a literal leading space, got {rows:?}"
+    );
 }
 
 /// `nx.mark.list` reads the server-pushed `nx._marks` mirror, and the built-in
@@ -3007,5 +3039,52 @@ async fn builtin_marks_list_and_picker_jump() {
     assert_eq!(
         line, 2,
         "confirming mark a jumps the cursor to line 2 (1-based)"
+    );
+}
+
+/// The built-in `jumplist` picker reads the window jumplist mirror
+/// (`nx.jumplist.get`), lists the focused window's jump history newest-first with
+/// each entry's line text, and confirming a row jumps the cursor there. Bare
+/// server: build a jump from line 2, then jump away — the recorded departure shows
+/// up and picking it returns the cursor to it.
+#[tokio::test]
+async fn builtin_jumplist_picker_lists_and_jumps() {
+    let dir = temp_dir("picker_jumplist");
+    let (rpc, mut incoming) = start(&dir, "").await;
+
+    // Ships built-in with no config.
+    let ok = exec_lua(&rpc, "return tostring(nx.picker._sources.jumplist ~= nil)").await;
+    assert_eq!(ok.as_str(), Some("true"), "jumplist source ships built-in");
+
+    // Three lines; sit on the uniquely-worded middle line, then `G` (a jump) records
+    // it as a departure the jumplist remembers.
+    feed(&rpc, "iaaa first<CR>zzz middle<CR>ccc last<Esc>2GG");
+
+    // The picker lists the recorded departure (line 2, its text); filter, confirm.
+    exec_lua(&rpc, "nx.picker.open('jumplist')").await;
+    poll_menu(&rpc, &mut incoming)
+        .await
+        .expect("jumplist picker opens");
+    feed(&rpc, "zzz");
+    let mut rows = Vec::new();
+    for _ in 0..40 {
+        if let Some(m) = poll_menu(&rpc, &mut incoming).await {
+            rows = menu_items(&menu_of(&m));
+            if rows.iter().any(|r| r.contains("zzz middle")) {
+                break;
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert!(
+        rows.iter()
+            .any(|r| r.contains("2:") && r.contains("zzz middle")),
+        "the jumplist picker lists the line-2 departure, got {rows:?}"
+    );
+    feed(&rpc, "<CR>");
+    let (line, _) = cursor(&rpc).await;
+    assert_eq!(
+        line, 2,
+        "confirming the jumplist row jumps the cursor back to line 2 (1-based)"
     );
 }

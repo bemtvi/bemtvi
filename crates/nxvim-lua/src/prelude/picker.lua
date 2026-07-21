@@ -849,8 +849,11 @@ nx.picker.source({
 })
 
 -- keymaps: every global mapping in normal / visual / insert mode (telescope's
--- `keymaps`), read from `nx.keymap.get`. Confirm re-feeds the `lhs` with remapping
--- on, so picking a mapping *runs* it, exactly like telescope.
+-- `keymaps`), read from `nx.keymap.get`. The displayed `lhs` runs through
+-- `nx.keytrans` so special keys read as notation (a space leader shows `<Space>`,
+-- not a hard-to-see literal blank; likewise `<Tab>`, `<C-x>`, …); the raw `lhs` is
+-- kept for the confirm feed. Confirm re-feeds it with remapping on, so picking a
+-- mapping *runs* it, exactly like telescope.
 nx.picker.source({
   name = "keymaps",
   title = "Keymaps",
@@ -859,7 +862,7 @@ nx.picker.source({
     for _, mode in ipairs({ "n", "v", "i" }) do
       for _, k in ipairs(nx.keymap.get(mode)) do
         ctx.push({
-          text = string.format("%s  %-16s %s", mode, k.lhs, k.desc or ""),
+          text = string.format("%s  %-16s %s", mode, nx.keytrans(k.lhs), k.desc or ""),
           lhs = k.lhs,
         })
       end
@@ -927,6 +930,53 @@ nx.picker.source({
   end,
 })
 
+-- jumplist: the focused window's jump history (telescope's `jumplist`), read from
+-- `nx.jumplist.get` — the same `<C-o>`/`<C-i>` list `:jumps` shows. Listed
+-- newest-first (the freshest jump on top, as telescope does), so item 1 is where a
+-- single `<C-o>` would take you. Like `:jumps`, an entry in the *current* buffer
+-- shows its line's text; one in another buffer shows the file name (arbitrary
+-- buffers' lines aren't mirrored). `location` preview scrolls to the entry; confirm
+-- jumps via `nx.picker.edit` when the entry names a file, else moves the cursor
+-- directly for a mark in an unnamed current buffer. Mirror entries are 1-based
+-- `lnum` / 0-based `col`, so the pushed item's `col` adds 1.
+nx.picker.source({
+  name = "jumplist",
+  title = "Jumplist",
+  layer = "main",
+  preview = "location",
+  items = function(ctx)
+    local cur = nx.buf.current()
+    local curlines = nx.buf.lines(cur, 0, -1)
+    local list = nx.jumplist.get()[1]
+    -- Newest-first: walk the oldest-first mirror in reverse.
+    for i = #list, 1, -1 do
+      local e = list[i]
+      local path = nx.buf.name(e.bufnr)
+      local detail
+      if e.bufnr == cur then
+        detail = (curlines[e.lnum] or ""):gsub("%s+$", "")
+      else
+        detail = path ~= "" and path or "[No Name]"
+      end
+      -- Fixed-width `line:col` prefix so the detail text lines up (line right-aligned
+      -- to 6, matching `curbuf`/`marks`; col left-padded to 4).
+      ctx.push({
+        text = string.format("%6d:%-4d %s", e.lnum, e.col, detail),
+        path = path,
+        row = e.lnum,
+        col = e.col + 1,
+      })
+    end
+  end,
+  confirm = function(item, mode, layer)
+    if item.path ~= "" then
+      nx.picker.edit(item, mode, layer)
+    else
+      nx.pos.set(".", { 0, item.row, item.col })
+    end
+  end,
+})
+
 -- ----- default leader maps ---------------------------------------------------
 -- Bind the three shipped sources to `<leader>f{f,g,b}` out of the box. Registered
 -- on VimEnter (after `init.lua` runs) so `<leader>` expands with the user's
@@ -947,6 +997,7 @@ nx.autocmd.create("VimEnter", {
       { "<leader>fd", "diagnostics", "Find diagnostics" },
       { "<leader>fi", "pickers", "Find pickers" },
       { "<leader>fm", "marks", "Find marks" },
+      { "<leader>fj", "jumplist", "Find jumplist" },
       { "<leader>f/", "curbuf", "Fuzzy find in current buffer" },
     }) do
       local source = m[2]

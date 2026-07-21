@@ -60,7 +60,7 @@ use nxvim_core::{
     FileChangelist, FileFolds, FileMarkEntry, GlobalMarkEntry, InputHistoryEntry, JumpPos,
     NumberedMark, PersistState, PluginEntry, PluginNamespace, RegisterEntry,
 };
-use redb::{Database, ReadableTable, TableDefinition, TableError};
+use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition, TableError};
 use serde::{Deserialize, Serialize};
 
 /// The per-history entry cap (newest-N kept) applied on merge, mirroring vim's

@@ -2858,7 +2858,7 @@ impl LuaRuntime {
     /// to build, so nothing on the Lua side (length, `pairs`, `getmetatable`) sees
     /// a difference.
     fn to_lua<T: Serialize + ?Sized>(&self, value: &T) -> mlua::Result<mlua::Value> {
-        let opts = mlua::SerializeOptions::new().set_array_metatable(false);
+        let opts = mlua::serde::SerializeOptions::new().set_array_metatable(false);
         self.lua.to_value_with(value, opts)
     }
 

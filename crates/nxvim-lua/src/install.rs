@@ -40,7 +40,7 @@ type HttpArgs = (
     String,
     String,
     Vec<Vec<String>>,
-    mlua::String,
+    mlua::LuaString,
     Option<u64>,
     String,
     Option<u32>,
@@ -97,7 +97,7 @@ struct LuaRegex {
 
 impl UserData for LuaRegex {
     fn add_methods<M: UserDataMethods<Self>>(methods: &mut M) {
-        methods.add_method("match_str", |_, this, text: mlua::String| {
+        methods.add_method("match_str", |_, this, text: mlua::LuaString| {
             let text = text.to_str()?;
             // A compile error is already caught by `vim.regex`; a match-time error
             // (interrupt/timeout) is rare but raised rather than swallowed.
@@ -137,7 +137,7 @@ struct LuaHasher {
 
 impl UserData for LuaHasher {
     fn add_methods<M: UserDataMethods<Self>>(methods: &mut M) {
-        methods.add_method_mut("update", |_, this, data: mlua::String| {
+        methods.add_method_mut("update", |_, this, data: mlua::LuaString| {
             this.inner.update(&data.as_bytes());
             Ok(())
         });
@@ -978,7 +978,7 @@ pub(crate) fn install_vim(lua: &Lua, shared: &Rc<RefCell<Shared>>) -> mlua::Resu
                 Vec<String>,
                 Option<String>,
                 Option<Table>,
-                Option<mlua::String>,
+                Option<mlua::LuaString>,
             )| {
                 let env = env_pairs(env)?;
                 let stdin = stdin.map(|s| s.as_bytes().to_vec()).unwrap_or_default();
@@ -1009,7 +1009,7 @@ pub(crate) fn install_vim(lua: &Lua, shared: &Rc<RefCell<Shared>>) -> mlua::Resu
                 Vec<String>,
                 Option<String>,
                 Option<Table>,
-                Option<mlua::String>,
+                Option<mlua::LuaString>,
             )| {
                 let env = env_pairs(env)?;
                 let stdin = stdin.map(|s| s.as_bytes().to_vec()).unwrap_or_default();
@@ -1086,7 +1086,7 @@ pub(crate) fn install_vim(lua: &Lua, shared: &Rc<RefCell<Shared>>) -> mlua::Resu
     let sh = shared.clone();
     nx.set(
         "_proc_write",
-        lua.create_function(move |_, (id, data): (u64, mlua::String)| {
+        lua.create_function(move |_, (id, data): (u64, mlua::LuaString)| {
             let data = data.as_bytes().to_vec();
             sh.borrow_mut()
                 .loop_ops
@@ -1123,7 +1123,7 @@ pub(crate) fn install_vim(lua: &Lua, shared: &Rc<RefCell<Shared>>) -> mlua::Resu
     let sh = shared.clone();
     nx.set(
         "_sock_write",
-        lua.create_function(move |_, (id, data): (u64, mlua::String)| {
+        lua.create_function(move |_, (id, data): (u64, mlua::LuaString)| {
             let data = data.as_bytes().to_vec();
             sh.borrow_mut()
                 .loop_ops
@@ -1564,7 +1564,7 @@ pub(crate) fn install_runtime_api(
     // so binary input is fine). An unknown `algo` errors.
     nx.set(
         "_hash",
-        lua.create_function(|_, (algo, data): (String, mlua::String)| {
+        lua.create_function(|_, (algo, data): (String, mlua::LuaString)| {
             let mut hasher = crate::luafs::new_digest(&algo).ok_or_else(|| {
                 mlua::Error::runtime(format!("nx.hash: unknown algorithm '{algo}'"))
             })?;
@@ -1785,7 +1785,13 @@ pub(crate) fn install_runtime_api(
     nx.set(
         "_http_respond",
         lua.create_function(
-            move |_, (req_id, status, headers, body): (u64, u16, Vec<Vec<String>>, mlua::String)| {
+            move |_,
+                  (req_id, status, headers, body): (
+                u64,
+                u16,
+                Vec<Vec<String>>,
+                mlua::LuaString,
+            )| {
                 sh.borrow_mut().loop_ops.push(LoopOp::HttpRespond {
                     req_id,
                     reply: HttpServerReply {
@@ -1835,7 +1841,7 @@ pub(crate) fn install_runtime_api(
     // crate (`rust-url`); backs `nx.http.encode_uri_component`.
     nx.set(
         "_url_encode_component",
-        lua.create_function(|lua, s: mlua::String| {
+        lua.create_function(|lua, s: mlua::LuaString| {
             // encodeURIComponent leaves the unreserved marks unencoded — start from
             // "encode everything non-alphanumeric" and carve those four back out.
             const COMPONENT: &percent_encoding::AsciiSet = &percent_encoding::NON_ALPHANUMERIC
@@ -3720,7 +3726,7 @@ pub(crate) fn install_runtime_api(
 fn fs_job_from_table(job: &Table) -> mlua::Result<FsJob> {
     let op: String = job.get("op")?;
     let bytes = |key: &str| -> mlua::Result<Vec<u8>> {
-        let s: mlua::String = job.get(key)?;
+        let s: mlua::LuaString = job.get(key)?;
         Ok(s.as_bytes().to_vec())
     };
     let recursive =

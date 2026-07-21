@@ -53,8 +53,8 @@ nxvim-regex = { path = "crates/nxvim-regex" }
 nxvim-test-harness = { path = "crates/nxvim-test-harness" }
 
 # Direct dependencies are pinned to exact versions (`=x.y.z`) for reproducible
-# builds. Pre-release lines (ropey 2.0-beta, mlua 0.12-rc) are intentionally
-# avoided in favor of the latest stable releases.
+# builds. Stable releases are preferred; a pre-release line is pinned only where
+# there is no stable equivalent yet (e.g. ropey, still on 2.0.0-beta).
 #
 # Lua backend: vendored PUC Lua 5.4, the single backend (LuaJIT was dropped —
 # nxvim is PUC-Lua-only, matching the wasm build, which never supported LuaJIT).
@@ -62,7 +62,7 @@ nxvim-test-harness = { path = "crates/nxvim-test-harness" }
 # yieldable `pcall`, and a generational GC over the old 5.1 baseline. `lua54` is
 # selected here so every crate that links mlua shares it; there is no backend
 # toggle to thread anymore.
-anyhow = "=1.0.102"
+anyhow = "=1.0.103"
 # CLI argument parsing for the `nxvim` binary (the only consumer): the `derive`
 # feature gives a struct-driven parser that validates flags, errors on unknown
 # options, and auto-generates `--help`/`--version`.
@@ -95,7 +95,7 @@ percent-encoding = "=2.3.2"
 # and compiles under emscripten for the wasm edit-host.
 pulldown-cmark = { version = "=0.13.4", default-features = false }
 crossterm = { version = "=0.29.0", features = ["event-stream"] }
-ratatui = "=0.30.1"
+ratatui = "=0.30.2"
 # In-terminal image rendering for the TUI client's `'imagepreview'` (Phase 2): a
 # ratatui widget over Kitty/Sixel/iTerm2 graphics protocols, with a unicode
 # halfblocks fallback. `chafa` (the higher-quality halfblocks encoder) is left OFF
@@ -105,7 +105,7 @@ ratatui = "=0.30.1"
 # >=0.30.1. `image` is the decoder (a direct dep so the client builds the
 # `DynamicImage` the picker turns into a protocol); pinned to share one compiled
 # copy with ratatui-image's `^0.25.6`.
-ratatui-image = { version = "=11.0.4", default-features = false, features = [
+ratatui-image = { version = "=11.0.6", default-features = false, features = [
     "image-defaults",
     "crossterm",
 ] }
@@ -149,7 +149,7 @@ winresource = "=0.1.31"
 # Build-dependency of nxvim-regex: compiles the vendored vim/neovim regexp
 # engine (csrc/) into the crate. Plain C99; also builds for
 # wasm32-unknown-emscripten (the nxvim-edithost target).
-cc = "=1.2.63"
+cc = "=1.2.66"
 tokio = { version = "=1.52.3", features = ["rt", "macros", "io-util", "io-std", "net", "sync", "time", "process"] }
 # Cross-platform filesystem notification backing `vim.uv.fs_event` in the server's
 # event-loop actor. `macos_kqueue` selects the kqueue backend on macOS instead of
@@ -162,26 +162,26 @@ tokio = { version = "=1.52.3", features = ["rt", "macros", "io-util", "io-std", 
 notify = { version = "=8.2.0", features = ["macos_kqueue"] }
 futures = "=0.3.32"
 rmpv = "=1.3.1"
-mlua = { version = "=0.11.6", features = ["vendored", "serde", "lua54"] }
+mlua = { version = "=0.12.0", features = ["vendored", "serde", "lua54"] }
 serde = { version = "=1.0.228", features = ["derive"] }
 # Persistence (shada). `redb` is the pure-Rust, ACID, single-file embedded store
 # each daemon's per-instance shada file lives in; `rmp-serde` encodes the table
 # values as msgpack. Both server-only (the wasm core never links them). See
 # docs/plans/2026-06-11-shada-persistence.md.
-redb = "=2.2.0"
-rmp-serde = "=1.3.0"
+redb = "=4.1.0"
+rmp-serde = "=1.3.1"
 unicode-width = "=0.2.2"
-unicode-segmentation = "=1.13.2"
+unicode-segmentation = "=1.13.3"
 # The GUI's custom font fallback (`UserFallback`) implements cosmic-text's
 # `Fallback` trait, whose `script_fallback` is keyed by `unicode_script::Script`.
 # Pinned to the version cosmic-text resolves so the trait's `Script` type unifies.
 unicode-script = "=0.5.8"
-regex = "=1.12.3"
+regex = "=1.12.4"
 portable-pty = "=0.9.0"
 vt100 = "=0.16.2"
-tree-sitter = "=0.26.9"
+tree-sitter = "=0.26.10"
 streaming-iterator = "=0.1.9"
-libloading = "=0.8.9"
+libloading = "=0.9.0"
 # Dev-only: real grammars compiled into a test fixture (never linked into the
 # editor — nxvim loads grammars dynamically at runtime). `tree-sitter-md` is a host
 # grammar that injects (markdown fenced code blocks → the fence's language), so the
@@ -217,13 +217,13 @@ axum = { version = "=0.8.9", default-features = false, features = ["http1", "tok
 tar = "=0.4.46"
 flate2 = "=1.1.9"
 xz2 = "=0.1.7"
-zip = { version = "=4.2.0", default-features = false, features = ["deflate-flate2"] }
-sha2 = "=0.10.9"
+zip = { version = "=8.6.0", default-features = false, features = ["deflate-flate2"] }
+sha2 = "=0.11.0"
 # Hash digests for the `nx.hash.*` Lua utilities (alongside `sha2`, which doubles
 # as the zig-checksum verifier above). All RustCrypto, pure Rust and wasm-safe;
-# they share the `digest = 0.10` trait surface so one `Digest` import covers all.
-sha1 = "=0.10.6"
-md-5 = "=0.10.6"
+# they share the `digest = 0.11` trait surface so one `Digest` import covers all.
+sha1 = "=0.11.0"
+md-5 = "=0.11.0"
 
 # LSP client stack — reached only through `nxvim-lsp` (Decision 1/2 of the LSP
 # design). async-lsp owns the JSON-RPC `MainLoop`, framing, id correlation, and
@@ -251,7 +251,7 @@ wtransport = "=0.7.1"
 # CSPRNG for the launch-minted daemon bearer token (the sole auth gate — an
 # unauthenticated daemon listener is RCE by design, Open Decision #2). Already in the
 # tree transitively (ring/quinn); pulled in directly for `getrandom::fill`.
-getrandom = "=0.3.4"
+getrandom = "=0.4.3"
 
 [profile.release]
 lto = "thin"

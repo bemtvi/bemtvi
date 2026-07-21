@@ -293,8 +293,8 @@ pub fn buf_search(lua: &Lua, lines: Table, pattern: String, opts: Table) -> mlua
     // `Compiled` scanners take `&str`, so reading the bytes in place avoids a fresh
     // Rust `String` allocation per scanned line (a no-match scan would otherwise
     // allocate one owned line for the whole buffer).
-    let line_str = |i: usize| -> mlua::Result<Option<mlua::String>> {
-        lines.get::<Option<mlua::String>>(i as i64)
+    let line_str = |i: usize| -> mlua::Result<Option<mlua::LuaString>> {
+        lines.get::<Option<mlua::LuaString>>(i as i64)
     };
 
     if backward {
@@ -403,7 +403,7 @@ impl UserData for NxRegex {
         // inclusive) or nil — like `string.find` in `plain=false` mode.
         methods.add_method(
             "find",
-            |lua, this, (text, init): (mlua::String, Option<i64>)| {
+            |lua, this, (text, init): (mlua::LuaString, Option<i64>)| {
                 let s = text.to_str()?;
                 let from = norm_init(init, s.len());
                 let Some(hit) = this.re.first_from(&s, from) else {
@@ -425,7 +425,7 @@ impl UserData for NxRegex {
         // the pattern has no captures, or nil — like `string.match`.
         methods.add_method(
             "match",
-            |lua, this, (text, init): (mlua::String, Option<i64>)| {
+            |lua, this, (text, init): (mlua::LuaString, Option<i64>)| {
                 let s = text.to_str()?;
                 let from = norm_init(init, s.len());
                 let Some(hit) = this.re.first_from(&s, from) else {
@@ -448,7 +448,7 @@ impl UserData for NxRegex {
 
         // `re:gmatch(s)` -> an iterator yielding each match's captures (or the
         // whole match when the pattern has no captures) — like `string.gmatch`.
-        methods.add_method("gmatch", |lua, this, text: mlua::String| {
+        methods.add_method("gmatch", |lua, this, text: mlua::LuaString| {
             let s = text.to_str()?;
             let mut items: Vec<Vec<String>> = Vec::new();
             for hit in this.re.all(&s) {
@@ -478,7 +478,7 @@ impl UserData for NxRegex {
         // function called with the captures, or a table keyed by the first capture.
         methods.add_method(
             "gsub",
-            |lua, this, (text, repl, n): (mlua::String, Value, Option<i64>)| {
+            |lua, this, (text, repl, n): (mlua::LuaString, Value, Option<i64>)| {
                 let s = text.to_str()?;
                 let max = n.filter(|&n| n >= 0).map(|n| n as usize);
                 let mut out = String::new();
@@ -503,7 +503,7 @@ impl UserData for NxRegex {
         );
 
         // `re:test(s)` -> bool: does the pattern match anywhere.
-        methods.add_method("test", |_, this, text: mlua::String| {
+        methods.add_method("test", |_, this, text: mlua::LuaString| {
             Ok(this.re.is_match(&text.to_str()?))
         });
     }

@@ -34,7 +34,8 @@ use anyhow::Result;
 use crossterm::cursor::SetCursorStyle;
 use crossterm::event::{
     DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture, Event,
-    EventStream, KeyEventKind, KeyModifiers, MouseButton, MouseEventKind,
+    EventStream, KeyEventKind, KeyModifiers, KeyboardEnhancementFlags, MouseButton, MouseEventKind,
+    PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
 };
 use futures::StreamExt;
 use nxvim_rpc::{connect, Incoming, Rpc};
@@ -150,6 +151,47 @@ impl<W: Write> Drop for BracketedPaste<W> {
     }
 }
 
+/// RAII guard for the **kitty keyboard protocol** (progressive enhancement): pushes
+/// the `DISAMBIGUATE_ESCAPE_CODES` flag on creation and **pops it on drop**,
+/// including on a panic unwind. With it on, a supporting terminal reports modified
+/// keys the legacy encoding cannot express — `<S-CR>`, `<C-CR>`, `<C-S-…>`, a lone
+/// `<Esc>` unambiguously — as CSI-u sequences crossterm decodes back into the right
+/// `KeyEvent`. Without it those chords are byte-identical to their unmodified form
+/// (Shift+Enter == Enter), so a `<S-CR>` mapping can never fire.
+///
+/// Only `DISAMBIGUATE_ESCAPE_CODES` is requested — deliberately *not*
+/// `REPORT_EVENT_TYPES` / `REPORT_ALL_KEYS_AS_ESCAPE_CODES`, which would add
+/// key-repeat / release events and re-encode plain text, changing far more of the
+/// input stream than we want. This is the same conservative level neovim enables.
+///
+/// The push itself is unconditional here; the caller ([`run`]) only constructs the
+/// guard after [`crossterm::terminal::supports_keyboard_enhancement`] confirms the
+/// terminal speaks the protocol, so an unsupporting terminal is never sent the
+/// sequence. Like [`MouseCapture`] the guard is generic over the writer for
+/// in-memory testing; production uses `std::io::stdout()`.
+pub struct KeyboardEnhancement<W: Write> {
+    out: W,
+}
+
+impl<W: Write> KeyboardEnhancement<W> {
+    /// Push the `DISAMBIGUATE_ESCAPE_CODES` enhancement flag on `out`; the returned
+    /// guard pops it on drop. Only call once the terminal is known to support the
+    /// protocol (see [`run`]).
+    pub fn push(mut out: W) -> Self {
+        let _ = crossterm::execute!(
+            out,
+            PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
+        );
+        Self { out }
+    }
+}
+
+impl<W: Write> Drop for KeyboardEnhancement<W> {
+    fn drop(&mut self) {
+        let _ = crossterm::execute!(self.out, PopKeyboardEnhancementFlags);
+    }
+}
+
 /// Builds a replacement backend for a `nx.session.reconnect` swap (§B). The swap loop
 /// hands it the raw `nx_session_reconnect` params and gets back the client-side transport
 /// of a fresh session (same stream type). The binary provides it — it owns session +
@@ -192,6 +234,17 @@ where
     // cells the first frame leaves blank are never painted, so stale content shows
     // through as "render leftover". The explicit clear makes the baseline real.
     let _ = terminal.clear();
+    // Enable the kitty keyboard protocol when the terminal supports it, so modified
+    // keys the legacy encoding can't express (`<S-CR>`, `<C-CR>`, `<C-S-…>`) reach
+    // the server. Detection queries the terminal and reads its reply — safe here
+    // because raw mode is already on (`ratatui::init`) and the `EventStream` that
+    // would contend for that reply isn't created until `event_loop` below. An
+    // unsupporting terminal (or a query that times out) leaves it off, so we never
+    // push a sequence it wouldn't understand. `None` ⇒ nothing to pop on exit.
+    let keyboard = match crossterm::terminal::supports_keyboard_enhancement() {
+        Ok(true) => Some(KeyboardEnhancement::push(std::io::stdout())),
+        _ => None,
+    };
     // Capture mouse events so the panel's `[X]` is clickable.
     let mouse = MouseCapture::enable(std::io::stdout());
     // Restore the user's cursor shape on the way out — the loop switches it to a
@@ -213,6 +266,7 @@ where
     drop(cursor); // reset cursor shape
     drop(paste); // disable bracketed paste
     drop(mouse); // disable mouse capture
+    drop(keyboard); // pop the kitty keyboard protocol flags (no-op if never pushed)
     ratatui::restore();
     result
 }

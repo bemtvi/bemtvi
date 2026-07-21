@@ -19,12 +19,16 @@ pub fn encode_key(ev: KeyEvent) -> Option<String> {
 
     // A legacy terminal sends the C0 control bytes 0x1C..=0x1F for CTRL-\, CTRL-],
     // CTRL-^ and CTRL-_, but crossterm decodes them as Ctrl+'4'..'7' (its unix
-    // parse.rs maps `c - 0x1C + b'4'`). nxvim doesn't enable the kitty keyboard
-    // protocol, so a real digit can't reach here carrying CONTROL — these always
-    // came from those bytes (an ESC-prefixed one additionally carries ALT). Remap
-    // them to vim's canonical notation so bindings like <C-]> (help tag jump) and
-    // <C-^> (alternate file) actually fire instead of arriving as <C-5>/<C-6> and
-    // matching nothing; the Alt modifier rides along (`<C-A-]>`).
+    // parse.rs maps `c - 0x1C + b'4'`). This is the fallback for when the kitty
+    // keyboard protocol is *off* (a terminal that doesn't support it, or a query
+    // that timed out — see `KeyboardEnhancement` in lib.rs): without the protocol a
+    // real digit can't reach here carrying CONTROL, so these always came from those
+    // bytes (an ESC-prefixed one additionally carries ALT). Remap them to vim's
+    // canonical notation so bindings like <C-]> (help tag jump) and <C-^> (alternate
+    // file) actually fire instead of arriving as <C-5>/<C-6> and matching nothing;
+    // the Alt modifier rides along (`<C-A-]>`). When the protocol *is* on, the
+    // terminal reports `<C-\>` &c. directly as their real char + CONTROL, so this
+    // branch never matches and is harmlessly inert.
     if ctrl {
         if let KeyCode::Char(c @ '4'..='7') = ev.code {
             let name = match c {

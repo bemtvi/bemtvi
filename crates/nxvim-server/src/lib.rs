@@ -1443,6 +1443,12 @@ impl EditHost {
     /// resize path — a re-attach at a new size repaints.
     pub fn attach_ui(&mut self, width: usize, height: usize) {
         self.ui = Some((width, height));
+        // A browser delivers Ctrl+I distinct from Tab (keydown `code` + `ctrlKey`),
+        // like a native window — so the serverless edit host always has full keyboard
+        // disambiguation. Declare it so `<C-i>`/`<C-m>`/`<C-[>`/`<C-h>` stay apart from
+        // `<Tab>`/`<CR>`/`<Esc>`/`<BS>` (mirrors the TUI/GUI reporting it at attach).
+        self.keyboard_protocol = true;
+        self.keymaps.set_keyboard_protocol(true);
         self.redraw();
     }
 

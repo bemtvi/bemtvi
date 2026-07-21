@@ -803,10 +803,21 @@ impl App {
         } else {
             "nx_ui_try_resize"
         };
-        self.rpc.notify(
-            method,
-            vec![Value::from(cols), Value::from(win_rows), Value::Map(vec![])],
-        );
+        // A native window always has full key disambiguation (winit reports Ctrl+I as
+        // `Character("i")` + control, distinct from `Tab`), so declare the keyboard
+        // protocol active at attach — the server then keeps `<C-i>`/`<C-m>`/`<C-[>`/
+        // `<C-h>` apart from `<Tab>`/`<CR>`/`<Esc>`/`<BS>`. The map is read only at
+        // attach; a resize passes an empty one.
+        let caps = if attach {
+            Value::Map(vec![(
+                Value::from("keyboard_protocol"),
+                Value::Boolean(true),
+            )])
+        } else {
+            Value::Map(vec![])
+        };
+        self.rpc
+            .notify(method, vec![Value::from(cols), Value::from(win_rows), caps]);
     }
 
     /// Read the system clipboard and feed it to the server as one `nx_input` via

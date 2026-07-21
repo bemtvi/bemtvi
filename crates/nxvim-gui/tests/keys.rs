@@ -74,6 +74,36 @@ fn ctrl_and_alt_get_prefixed() {
 }
 
 #[test]
+fn ctrl_chords_that_alias_a_named_key_stay_ctrl_chords() {
+    // winit reports Ctrl+I / Ctrl+M / Ctrl+[ / Ctrl+H as the base `Character` +
+    // CONTROL — distinct from `NamedKey::Tab`/`Enter`/`Escape`/`Backspace` — so the
+    // GUI sends `<C-i>` &c., not the named twin. A native window always disambiguates,
+    // and the client declares the keyboard protocol active at attach, so the server
+    // keeps these apart from `<Tab>`/`<CR>`/`<Esc>`/`<BS>` (see the keymap tests).
+    assert_eq!(
+        note(ch("i"), ModifiersState::CONTROL).as_deref(),
+        Some("<C-i>")
+    );
+    assert_eq!(
+        note(ch("m"), ModifiersState::CONTROL).as_deref(),
+        Some("<C-m>")
+    );
+    assert_eq!(
+        note(ch("["), ModifiersState::CONTROL).as_deref(),
+        Some("<C-[>")
+    );
+    assert_eq!(
+        note(ch("h"), ModifiersState::CONTROL).as_deref(),
+        Some("<C-h>")
+    );
+    // ...while the named keys themselves are still their own notation.
+    assert_eq!(
+        note(Key::Named(NamedKey::Tab), ModifiersState::empty()).as_deref(),
+        Some("<Tab>")
+    );
+}
+
+#[test]
 fn multi_char_character_is_sent_literally() {
     // Some layouts / compose fallbacks deliver several characters in one keystroke
     // (winit's `Key::Character` is a string, not a char). The whole payload must

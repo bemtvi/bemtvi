@@ -54,6 +54,7 @@ mod persist;
 mod quickfix;
 mod registers;
 mod search;
+mod select;
 mod signature;
 pub mod snippet;
 mod syntax;
@@ -1219,6 +1220,16 @@ pub struct Editor {
     /// [`Editor::handle_insert`] / [`Editor::handle_command`].
     awaiting_register: bool,
     visual_anchor: Cursor,
+    /// Where `<Esc>` from [`Mode::Select`] lands (set per-entry by
+    /// [`Editor::select_range_in_window`]): `true` keeps the default and parks in
+    /// Insert past it (the snippet-placeholder UX), `false` keeps it and drops to
+    /// Normal (vim's `v_CTRL-G`). Only meaningful while in Select mode.
+    select_escape_insert: bool,
+    /// Whether the active [`Mode::Select`] is *linewise* (`gH` / a `<C-g>` toggle
+    /// from Visual-Line) rather than charwise (`gh` / `nx.win.select_range`). Threads
+    /// into the selection projection and the replace so a linewise Select highlights
+    /// and replaces whole lines. Only meaningful while in Select mode.
+    select_linewise: bool,
     /// State for the in-flight left-button gesture: the multi-click counter that
     /// escalates char → word → line on same-cell presses within `'mousetime'`, and
     /// the anchor a drag extends from. Held across a press → drag → release and the
@@ -1561,6 +1572,9 @@ impl Editor {
         match self.insert_normal {
             Some(Mode::Replace) => "niR",
             Some(_) => "niI",
+            // Linewise Select (`gH`) reports vim's `S` (charwise is `s`); the keymap
+            // engine still selects the `'s'` trie off the raw [`Mode`] enum for both.
+            None if self.mode == Mode::Select && self.select_linewise => "S",
             None => self.mode.short_code(),
         }
     }
@@ -1573,6 +1587,7 @@ impl Editor {
         match self.insert_normal {
             Some(Mode::Replace) => "(REPLACE)",
             Some(_) => "(INSERT)",
+            None if self.mode == Mode::Select && self.select_linewise => "S-LINE",
             None => self.mode.label(),
         }
     }
@@ -1796,6 +1811,8 @@ impl Editor {
             soft_tab: None,
             awaiting_register: false,
             visual_anchor: Cursor::default(),
+            select_escape_insert: false,
+            select_linewise: false,
             mouse_select: None,
             statusline_click_seq: None,
             mouse_resize: None,
@@ -2077,6 +2094,9 @@ impl Editor {
         match self.mode {
             Mode::Insert | Mode::Replace => self.handle_insert(key),
             Mode::Command => self.handle_command(key),
+            // Select mode's printable-replaces keys route through their own handler,
+            // not the Normal/Visual command grammar (see [`Editor::handle_select`]).
+            Mode::Select => self.handle_select(key),
             _ => self.handle_normal(key),
         }
 
@@ -2391,6 +2411,16 @@ impl Editor {
     pub(crate) fn rendered_visual_mode(&self) -> Option<Mode> {
         if self.mode.is_visual() {
             return Some(self.mode);
+        }
+        // Select mode ([`Mode::Select`], the P6 snippet primitive) highlights its
+        // range like a Visual selection, so it borrows the Visual projection —
+        // reported as `VisualLine` when linewise (`gH`), else charwise `Visual`.
+        if self.mode == Mode::Select {
+            return Some(if self.select_linewise {
+                Mode::VisualLine
+            } else {
+                Mode::Visual
+            });
         }
         let searching =
             self.mode == Mode::Command && matches!(self.cmdline_kind, CmdlineKind::Search(_));

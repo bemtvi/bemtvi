@@ -26,6 +26,14 @@ pub(crate) struct SnippetEntry {
 /// edit-host's pointer width), so it can't overflow there.
 pub(crate) const SNIPPET_COMPLETE_KEY_BASE: usize = 1 << 28;
 
+/// `MenuItem.key` offset for a **plugin `on_accept`** row (a `nx.complete.source`
+/// item carrying an `on_accept` callback), disjoint from and *above* the snippet
+/// base so the delegated-accept drain routes by range — plugin first, then snippet,
+/// then the `lsp` source's raw-index keys. `1 << 29` leaves the whole `[1<<28, 1<<29)`
+/// band to snippets and stays within a 32-bit `usize` (the wasm edit-host's pointer
+/// width), so it can't overflow there.
+pub(crate) const PLUGIN_ACCEPT_KEY_BASE: usize = 1 << 29;
+
 impl EditHost {
     /// Push the registered snippets for the current buffer's filetype into the open
     /// completion menu at generation `gen`. The engine's matcher ranks them against
@@ -112,8 +120,9 @@ impl EditHost {
 
 /// Byte offset within `line` where the word ending at `cursor` begins — the run of
 /// `[A-Za-z0-9_]` immediately left of the cursor (its start, or `cursor` if the
-/// char left isn't a word char). The trigger word the `snippets` accept replaces.
-fn trigger_word_start(line: &str, cursor: usize) -> usize {
+/// char left isn't a word char). The trigger word the `snippets` accept replaces
+/// (and the plugin `on_accept` range — see [`EditHost::complete_plugin_accept`]).
+pub(crate) fn trigger_word_start(line: &str, cursor: usize) -> usize {
     let col = cursor.min(line.len());
     line[..col]
         .char_indices()

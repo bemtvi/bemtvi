@@ -747,7 +747,7 @@ fn mode_key(mode: Mode) -> char {
 
 /// The editor-mode trie buckets a declared map-mode code lands in — the build-time
 /// counterpart of [`mode_key`]. A `'v'`/`'x'` map covers both Visual and
-/// Visual-Line (nxvim has no Select mode, so they coincide); `'m'` is the
+/// Visual-Line; `'m'` is the
 /// nxvim-specific multi-cursor *placement* bucket; `''` (vim's `:map`) covers
 /// normal + visual + placement (every normal-ish mode). Operator-pending (`'o'`)
 /// is **deferred**: nxvim has no
@@ -761,6 +761,12 @@ fn mode_buckets(code: &str) -> &'static [char] {
         "i" => &['i'],
         "c" => &['c'],
         "v" | "x" => &['v', 'V'],
+        // Vim's Select mode (`Mode::Select`, the P6 snippet primitive) — its trie key
+        // is lowercase `'s'` (`mode_key(Mode::Select)`), distinct from the uppercase
+        // `'S'` widget bucket below, so a `vim.keymap.set('s', …)` (a snippet engine
+        // binding `<Tab>`/`<S-Tab>` to jump while a placeholder is selected) fires only
+        // in Select mode and never leaks into the `nx.ui.select` widget.
+        "s" => &['s'],
         "m" => &['m'],
         // Grabbing-widget buckets (configurable widget keys): a `vim.keymap.set
         // ('picker', …)` lands here, and the matcher selects it via a `Widget` scope

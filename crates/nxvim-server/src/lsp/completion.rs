@@ -343,6 +343,43 @@ impl EditHost {
         self.apply_lua_effects();
     }
 
+    /// Apply a delegated **plugin `on_accept`** accept (P4): a `nx.complete.source`
+    /// item carried an `on_accept` callback, so its accept was delegated here instead
+    /// of core splicing `insert`. Run the callback (via [`LuaRuntime::run_complete_accept`]),
+    /// handing it the trigger RANGE it should replace — the word under the cursor,
+    /// computed exactly as the snippet accept does (`word_start..cursor`, extended over
+    /// the rest of the word under a `Replace` accept). The callback owns the edit (it
+    /// typically `nx.buf.set_text`s an expansion, or `nx.snippet.expand`s a body); any
+    /// buffer ops it queues drain in the enclosing `run_pending` fixpoint, kicked here
+    /// by `apply_lua_effects` so a synchronous callback lands on this same key.
+    pub(crate) fn complete_plugin_accept(&mut self, id: usize) {
+        // A `Replace`-behavior accept (caret mid-word) hands us the word end; taken up
+        // front so an early return can't leak it into the next accept.
+        let extend_to = self.editor.complete_accept_extend_to.take();
+        let row = self.editor.cursor.line;
+        let col = self.editor.cursor.col;
+        let line = self.editor.buffer().line(row);
+        let word_start = crate::snippet::trigger_word_start(&line, col);
+        let line_start = self.editor.buffer().line_start(row);
+        let end_byte = extend_to.map_or(line_start + col, |e| (line_start + col).max(e));
+        let end_row = self.editor.buffer().byte_to_line(end_byte);
+        let end_col = end_byte - self.editor.buffer().line_start(end_row);
+        let buf = self.editor.current_buffer_id().0;
+        if let Err(e) = self.lua.run_complete_accept(
+            id as u64,
+            buf,
+            row as u64,
+            word_start as u64,
+            end_row as u64,
+            end_col as u64,
+        ) {
+            self.editor
+                .echo(format!("E5108: Error in nx.complete on_accept: {e}"));
+            return;
+        }
+        self.apply_lua_effects();
+    }
+
     /// Apply a `completionItem/resolve` reply (Phase 4-D): fill the resolved
     /// `documentation` / `detail` into the cached item the docs sidebar reads, keyed by
     /// the row the resolve was issued for ([`EditHost::lsp_complete_resolve_key`]).

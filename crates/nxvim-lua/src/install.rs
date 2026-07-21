@@ -1958,10 +1958,13 @@ pub(crate) fn install_runtime_api(
     // (prelude) has resolved `bufnr`, allocated the id, and updated its
     // `nx._extmarks` mirror (write-through); the server converts the 0-based
     // `(row, col)` positions to byte offsets against the live rope.
-    // `(bufnr, ns, id, row, col, end_row, end_col, hl_group, priority, decoration)`
-    // — the positional payload the prelude's `nvim_buf_set_extmark` forwards.
-    // `decoration` is the accepted-but-previously-unrendered virtual-text table
-    // (`virt_text` / `virt_lines` / …), lowered here into a [`VirtDecorData`].
+    // `(bufnr, ns, id, row, col, end_row, end_col, hl_group, priority, decoration,
+    //   right_gravity, end_right_gravity)` — the positional payload the prelude's
+    // `nvim_buf_set_extmark` forwards. `decoration` is the accepted-but-previously-
+    // unrendered virtual-text table (`virt_text` / `virt_lines` / …), lowered here
+    // into a [`VirtDecorData`]; the two trailing bools carry anchor gravity
+    // (defaults `true` / `false`), so a plugin snippet engine can place a *growing*
+    // tabstop range (see [`nxvim_core::Extmark::right_gravity`]).
     type ExtmarkSetArgs = (
         u64,
         u32,
@@ -1973,12 +1976,28 @@ pub(crate) fn install_runtime_api(
         Option<String>,
         u32,
         Option<Table>,
+        bool,
+        bool,
     );
     let sh = shared.clone();
     nx.set(
         "_extmark_set",
         lua.create_function(
-            move |_, (bufnr, ns, id, row, col, end_row, end_col, hl_group, priority, decoration): ExtmarkSetArgs| {
+            move |_,
+                  (
+                bufnr,
+                ns,
+                id,
+                row,
+                col,
+                end_row,
+                end_col,
+                hl_group,
+                priority,
+                decoration,
+                right_gravity,
+                end_right_gravity,
+            ): ExtmarkSetArgs| {
                 let decor = match decoration {
                     Some(t) => virt_decor_from_table(&t)?.map(Box::new),
                     None => None,
@@ -1994,6 +2013,8 @@ pub(crate) fn install_runtime_api(
                     hl_group,
                     priority,
                     decor,
+                    right_gravity,
+                    end_right_gravity,
                 });
                 Ok(())
             },
@@ -2070,6 +2091,29 @@ pub(crate) fn install_runtime_api(
                     bufnr,
                     start: start.max(0) as usize,
                     end: end.max(0) as usize,
+                    lines,
+                });
+                Ok(())
+            },
+        )?,
+    )?;
+
+    // `nx._buf_set_text(bufnr, sr, sc, er, ec, lines)`: queue a [`BufOp::SetText`] for the
+    // server to apply via `Editor::api_set_text` (the precise sub-line text mutation). The
+    // prelude (`nx.buf.set_text` / `nvim_buf_set_text`) has validated the shape (a list of
+    // newline-free strings, a modifiable buffer); here we only marshal the `lines` table and
+    // clamp the coordinates non-negative (the core clamps them into the rope).
+    let sh = shared.clone();
+    nx.set(
+        "_buf_set_text",
+        lua.create_function(
+            move |_, (bufnr, sr, sc, er, ec, lines): (u64, i64, i64, i64, i64, Vec<String>)| {
+                sh.borrow_mut().buf_ops.push(BufOp::SetText {
+                    bufnr,
+                    start_row: sr.max(0) as usize,
+                    start_col: sc.max(0) as usize,
+                    end_row: er.max(0) as usize,
+                    end_col: ec.max(0) as usize,
                     lines,
                 });
                 Ok(())
@@ -2155,6 +2199,31 @@ pub(crate) fn install_runtime_api(
                 .push(WindowOp::SetCursor { win, line, col });
             Ok(())
         })?,
+    )?;
+    let sh = shared.clone();
+    nx.set(
+        "_win_select_range",
+        lua.create_function(
+            move |_,
+                  (win, s_row, s_col, e_row, e_col, escape_insert): (
+                u64,
+                usize,
+                usize,
+                usize,
+                usize,
+                bool,
+            )| {
+                sh.borrow_mut().window_ops.push(WindowOp::SelectRange {
+                    win,
+                    s_row,
+                    s_col,
+                    e_row,
+                    e_col,
+                    escape_insert,
+                });
+                Ok(())
+            },
+        )?,
     )?;
     let sh = shared.clone();
     nx.set(
@@ -2983,37 +3052,44 @@ pub(crate) fn install_runtime_api(
             Ok(())
         })?,
     )?;
-    // `nx._complete_push(gen, labels, inserts, docs)`: queue a BATCH of streamed async
-    // completion candidates ([`CompletePush`]) — parallel `labels` (display) /
-    // `inserts` (applied on accept) / `docs` (inline docs-sidebar text, `""` ⇒ none)
-    // arrays, stamped with the trigger `gen`eration. The server drops a batch whose
-    // `gen` is behind the live prefix and appends the rest to the open completion
-    // popup. Phase 4-B; `docs` added 4-E.
+    // `nx._complete_push(gen, labels, inserts, docs, resolves, accepts)`: queue a BATCH
+    // of streamed async completion candidates ([`CompletePush`]) — parallel `labels`
+    // (display) / `inserts` (applied on accept) / `docs` (inline docs-sidebar text,
+    // `""` ⇒ none) / `resolves` (lazy-docs id, `0` ⇒ none) / `accepts` (on_accept id,
+    // `0` ⇒ literal insert) arrays, stamped with the trigger `gen`eration. The server
+    // drops a batch whose `gen` is behind the live prefix and appends the rest to the
+    // open completion popup. Phase 4-B; `docs` 4-E; `accepts` (P4).
+    // Parallel per-candidate arrays of one `_complete_push` batch: gen, then labels /
+    // inserts / docs / resolve-ids / accept-ids (see the doc comment above).
+    type CompletePushArgs = (
+        u64,
+        Vec<String>,
+        Vec<String>,
+        Vec<String>,
+        Vec<u64>,
+        Vec<u64>,
+    );
     let sh = shared.clone();
     nx.set(
         "_complete_push",
         lua.create_function(
-            move |_,
-                  (gen, labels, inserts, docs, resolves): (
-                u64,
-                Vec<String>,
-                Vec<String>,
-                Vec<String>,
-                Vec<u64>,
-            )| {
+            move |_, (gen, labels, inserts, docs, resolves, accepts): CompletePushArgs| {
                 let mut sh = sh.borrow_mut();
                 sh.complete_pushes.reserve(labels.len());
                 for (i, (label, insert)) in labels.into_iter().zip(inserts).enumerate() {
-                    // `docs` / `resolves` are parallel to `labels`: an empty doc string
-                    // ⇒ no inline docs; a `0` resolve id ⇒ no lazy-docs handle.
+                    // `docs` / `resolves` / `accepts` are parallel to `labels`: an empty
+                    // doc string ⇒ no inline docs; a `0` resolve id ⇒ no lazy-docs handle;
+                    // a `0` accept id ⇒ a plain literal-insert row (no delegated accept).
                     let doc = docs.get(i).filter(|d| !d.is_empty()).cloned();
                     let resolve = resolves.get(i).copied().filter(|&r| r != 0);
+                    let accept = accepts.get(i).copied().filter(|&a| a != 0);
                     sh.complete_pushes.push(CompletePush {
                         gen,
                         label,
                         insert,
                         doc,
                         resolve,
+                        accept,
                     });
                 }
                 Ok(())

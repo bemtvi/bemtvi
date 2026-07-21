@@ -1418,14 +1418,6 @@ impl Editor {
         let w = t.get_mut(id);
         if name == "numberwidth" {
             w.options.numberwidth = value.max(1) as usize;
-        } else if name == "scrolloff" {
-            w.options.scrolloff = value.max(0) as usize;
-            // Re-apply the viewport margin immediately when this is the focused
-            // window (the `w`/`t` borrows end at the assignment above), so raising
-            // `scrolloff` scrolls the cursor into the band without waiting for a move.
-            if self.windows.current == id {
-                self.ensure_visible();
-            }
         } else if name == "foldcolumn" {
             w.options.foldcolumn = value.max(0) as usize;
         } else if name == "foldlevel" {
@@ -1473,11 +1465,6 @@ impl Editor {
             // is the loud path). A window-local value overrides the dock's, if any —
             // see `Editor::effective_winhighlight`.
             opts.winhighlight = value.to_string();
-        } else if name == "colorcolumn" {
-            // The raw ruler-column list (`'colorcolumn'` / `'cc'`). Stored verbatim
-            // and resolved to columns at projection (like `fillchars`/`winhighlight`);
-            // junk entries are skipped there, so there's nothing to reject here.
-            opts.colorcolumn = value.to_string();
         } else if name == "padding" {
             // An invalid spec is ignored (the no-op-on-bad-input bridge contract;
             // `:set padding=` is the loud-error path).

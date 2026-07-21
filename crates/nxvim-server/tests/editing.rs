@@ -19,8 +19,6 @@ mod support;
 mod changelist;
 #[path = "editing/clipboard.rs"]
 mod clipboard;
-#[path = "editing/colorcolumn.rs"]
-mod colorcolumn;
 #[path = "editing/commenting.rs"]
 mod commenting;
 #[path = "editing/core_editing.rs"]
@@ -63,8 +61,6 @@ mod padding;
 mod registers;
 #[path = "editing/rendering.rs"]
 mod rendering;
-#[path = "editing/scrolloff.rs"]
-mod scrolloff;
 #[path = "editing/search.rs"]
 mod search;
 #[path = "editing/shift.rs"]

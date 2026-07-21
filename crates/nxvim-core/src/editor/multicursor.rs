@@ -71,7 +71,7 @@ impl Editor {
     /// The [`Cursor`] at byte offset `idx`, clamped onto the last real character.
     /// Used to turn a stored anchor byte back into the `(line, col)` the visual
     /// range helpers expect.
-    fn cursor_at_byte(&self, idx: usize) -> Cursor {
+    pub(crate) fn cursor_at_byte(&self, idx: usize) -> Cursor {
         let idx = idx.min(self.last_char_idx());
         let line = self.buffer().byte_to_line(idx);
         Cursor {

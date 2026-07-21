@@ -24,7 +24,6 @@
     --bg: #1e2127; --fg: #abb2bf; --gutter: #4b5263; --gutter-cur: #e5c07b;
     --sel: #3e4451; --search: #e5c07b; --status-bg: #2c313a; --status-fg: #9da5b4;
     --cursor: #61afef; --eob: #4b5263; --accent: #e5c07b; --cursorline: #2c313a;
-    --colorcolumn: #2c313a;
   }
   html, body { margin: 0; height: 100%; background: var(--bg); overflow: hidden; }
   #grid {
@@ -33,10 +32,6 @@
     white-space: pre; color: var(--fg); background: var(--bg); overflow: hidden; outline: none;
   }
   #grid .row { position: absolute; left: 0; height: var(--ch); line-height: var(--ch); }
-  /* `'colorcolumn'`: a thin vertical ruler down the text body, painted behind the
-     text rows (which draw on top) so glyphs sit over the tint — the column analogue
-     of the per-row `--cursorline` tint. */
-  .colorcolumn { position: absolute; top: 0; background: var(--colorcolumn); }
   .win { position: absolute; overflow: hidden; }
   /* A floating window's opaque chrome box (blocks the tiled windows beneath). */
   .float-win { background: #21252b; }
@@ -1408,10 +1403,6 @@
       const gutterW = w.number_width || 0;
       const winSpans = jsHl ? spansForWindow(w) : null;
 
-      // `'colorcolumn'` rulers: added first so they sit behind the rows / scroll band
-      // appended below (rows draw on top, so glyphs and cursorline win over the tint).
-      renderColorColumn(box, w, rect, gutterW, textRows);
-
       if (scrollAnim && w.focused) {
         renderScrollBand(box, w, rect, winSpans);
       } else {
@@ -1469,31 +1460,6 @@
         // The JS-synthesized line is only a fallback for a frame that carries no segments.
         if (w.status?.length) renderStatusSegments(box, w.status, textRows, rect.width, w.focused);
         else renderStatus(box, w, textRows);
-      }
-    }
-
-    // `'colorcolumn'`: append a thin vertical ruler to the window box for each
-    // configured 1-based column. Screen cell = text origin (fold + sign + number
-    // gutters) + (col - 1) - leftcol; a column scrolled off the left under `nowrap`,
-    // or past the window's right edge, is skipped, so the ruler tracks the text.
-    // Painted behind the rows (appended before them) and spanning the text body.
-    function renderColorColumn(box, w, rect, gutterW, textRows) {
-      const cols = w.colorcolumn;
-      if (!cols || !cols.length) return;
-      const leftcol = w.leftcol || 0;
-      const textOrigin = (w.foldcolumn_width || 0) + (w.sign_width || 0) + gutterW;
-      const h = textRows * ch;
-      for (const col of cols) {
-        const textCol = col - 1;
-        if (textCol < leftcol) continue;               // scrolled off the left
-        const xCell = textOrigin + (textCol - leftcol);
-        if (xCell >= rect.width) continue;             // past the right edge
-        const ruler = document.createElement("div");
-        ruler.className = "colorcolumn";
-        ruler.style.left = xCell * cw + "px";
-        ruler.style.width = cw + "px";
-        ruler.style.height = h + "px";
-        box.appendChild(ruler);
       }
     }
 
@@ -1844,7 +1810,6 @@
         if (col) box.style.setProperty(name, col);
       };
       setVar("--cursorline", c.cursorline, "bg");
-      setVar("--colorcolumn", c.colorcolumn, "bg");
       setVar("--gutter", c.line_nr, "fg");
       setVar("--gutter-cur", c.cursor_line_nr, "fg");
       setVar("--eob", c.end_of_buffer, "fg");
@@ -1872,7 +1837,6 @@
       setVar("--sel", "visual", "bg");
       setVar("--search", "search", "bg");
       setVar("--cursorline", "cursorline", "bg");
-      setVar("--colorcolumn", "colorcolumn", "bg");
       setVar("--cursor", "cursor", "bg");
     }
     function cellBaseCss(col, hlSpans, diagSpans) {

@@ -16,6 +16,16 @@ pub enum Mode {
     /// cursors (`c` / `{count}c{motion}`); leaving with `<Esc>` keeps the placed
     /// cursors and returns to Normal, where motions and edits act on them all.
     MultiCursor,
+    /// Vim's *Select* mode (`v_CTRL-G`): a byte range is highlighted like a Visual
+    /// selection, but a printable / `<CR>` / `<BS>` **replaces** it — deleting the
+    /// range and entering Insert with that input — the type-over-default behavior a
+    /// snippet engine (or a rename/paired-edit widget) wants for a placeholder. Its
+    /// selection reuses the Visual anchor (`visual_anchor`/`cursor`, charwise) but
+    /// its keys route through a dedicated handler, not the Visual command grammar,
+    /// so it is *not* reported by [`Mode::is_visual`]. Entered over a range with
+    /// `nx.win.select_range` (there is no keystroke to enter it from Normal — it is a
+    /// primitive a plugin drives, not a muscle-memory mode).
+    Select,
     /// Terminal-job mode: the current buffer hosts a live PTY child process and
     /// keystrokes are forwarded to it as input bytes (vim/neovim's `t` mode).
     /// `<C-\><C-n>` leaves to Normal, where the terminal buffer reads as ordinary
@@ -57,6 +67,7 @@ impl Mode {
             Mode::VisualLine => "V-LINE",
             Mode::Command => "COMMAND",
             Mode::MultiCursor => "MULTICURSOR",
+            Mode::Select => "SELECT",
             Mode::Terminal => "TERMINAL",
         }
     }
@@ -76,6 +87,11 @@ impl Mode {
             // `ModeChanged` (`n:m`). Editing behaviour is still normal-like (motions
             // move the primary cursor); only the *reported* code differs.
             Mode::MultiCursor => "m",
+            // Vim's Select-mode code. Reported so a `mode()`-reading plugin (the
+            // statusline, a snippet engine watching `ModeChanged`) can tell it apart
+            // from Visual (`v`), and so the keymap engine selects an `'s'` trie for it
+            // (see `nxvim-server`'s `mode_key`) rather than leaking Visual (`v`) maps in.
+            Mode::Select => "s",
             Mode::Terminal => "t",
         }
     }

@@ -493,6 +493,78 @@ impl Editor {
         Ok(())
     }
 
+    /// Replace the **character range** `(start_row, start_col)..(end_row, end_col)`
+    /// — 0-based, end-exclusive, columns byte offsets within the line — with
+    /// `replacement` (a list of lines joined by `\n`, with **no** trailing newline
+    /// added, unlike [`api_set_lines`](Self::api_set_lines)). The precise sub-line
+    /// counterpart of `nvim_buf_set_text`: the edit a snippet / structural-edit
+    /// plugin uses to splice a body over a trigger word or update a mirror inline.
+    ///
+    /// Goes through the same single edit choke point as every other mutation, so
+    /// extmarks shift correctly (honoring their gravity) and it folds into an open
+    /// insert-undo group when one exists (a completion-accept expansion is one undo
+    /// step), else opens its own. Fails loud on a read-only / `nomodifiable` buffer
+    /// or an inverted span. Positions past the buffer / line end clamp into range,
+    /// matching neovim's tolerance.
+    pub fn api_set_text(
+        &mut self,
+        id: BufferId,
+        start_row: usize,
+        start_col: usize,
+        end_row: usize,
+        end_col: usize,
+        replacement: &[String],
+    ) -> Result<(), String> {
+        // Resolve the byte span under an immutable borrow, then drop it before mutating.
+        let (from, to) = {
+            let buf = match self.buffer_of(id) {
+                Some(b) => b,
+                None => return Err(format!("invalid buffer id: {}", id.0)),
+            };
+            if buf.read_only() || !buf.options.modifiable {
+                return Err("E21: Cannot make changes, 'modifiable' is off".to_string());
+            }
+            // (row, col) → byte offset, clamped into the rope (mirrors the server's
+            // `byte_of` for extmark positions), so an out-of-range coordinate lands at
+            // the nearest valid byte rather than erroring.
+            let byte_at = |row: usize, col: usize| -> usize {
+                let n = buf.line_count();
+                let row = row.min(n);
+                let line_len = if row < n { buf.line_len(row) } else { 0 };
+                buf.line_start(row) + col.min(line_len)
+            };
+            let from = byte_at(start_row, start_col);
+            let to = byte_at(end_row, end_col);
+            if to < from {
+                return Err("E5555: nvim_buf_set_text: 'end' is before 'start'".to_string());
+            }
+            (from, to)
+        };
+        // A quickfix / location-list display buffer is read-only too (editor-side registry).
+        if self.qf_context_of_buffer(id).is_some() {
+            return Err("E21: Cannot make changes, 'modifiable' is off".to_string());
+        }
+
+        // set_text splices the lines verbatim — join with `\n` but add NO trailing one
+        // (an empty list is a pure deletion). `normalize` restores the phantom trailing `\n`.
+        let chunk = replacement.join("\n");
+
+        self.push_undo_for(id);
+        let buf = self
+            .buffer_of_mut(id)
+            .expect("buffer existed under the borrow above");
+        buf.remove(from..to);
+        if !chunk.is_empty() {
+            buf.insert(from, &chunk);
+        }
+        buf.normalize();
+        buf.modified = true;
+        if id == self.cur_buffer() {
+            self.clamp_cursor();
+        }
+        Ok(())
+    }
+
     /// Buffer `id`'s `changedtick` (bumped on every edit / resync), or `None` if no
     /// such buffer is open. The server keys its per-buffer highlight memo on this so
     /// an edit invalidates the cached spans for *that* buffer specifically — not just

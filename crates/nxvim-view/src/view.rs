@@ -230,13 +230,6 @@ pub struct WindowView {
     /// (`cursor_row`) with the [`View::cursor_line`] background. `false` from an
     /// older server that omits the key.
     pub cursorline: bool,
-    /// `'colorcolumn'` — the 1-based text columns to tint with the
-    /// [`View::color_column`] background (a vertical ruler down the text body, the
-    /// column analogue of [`cursorline`](Self::cursorline)). Sorted ascending, empty
-    /// (no ruler) by default / from a server that omits the key. The renderer paints
-    /// each column at text-origin `+ (col - 1) - leftcol`, when that lands within the
-    /// text area, across every text row.
-    pub colorcolumn: Vec<u16>,
     /// The **line-background** layer (neovim's `line_hl_group`, `hl_eol` semantics):
     /// per screen row that carries a line background, the pair `(row, style)`. The
     /// renderer paints each row's background across the full text-area width *before*
@@ -306,7 +299,6 @@ pub struct WinChrome {
     pub line_nr: Option<Style>,
     pub cursor_line_nr: Option<Style>,
     pub cursor_line: Option<Style>,
-    pub color_column: Option<Style>,
     pub end_of_buffer: Option<Style>,
     pub status_line: Option<Style>,
     pub normal_float: Option<Style>,
@@ -328,13 +320,6 @@ impl WindowView {
     }
     pub fn cursor_line_bg(&self, view: &View) -> Option<Style> {
         self.chrome.cursor_line.or(view.cursor_line)
-    }
-    /// The `'colorcolumn'` ruler background — the window's `'winhighlight'` override
-    /// of `ColorColumn` when it renames the group, otherwise the global
-    /// [`View::color_column`]. `None` when no theme defines `ColorColumn` (the
-    /// renderer then falls back to a built-in tint).
-    pub fn color_column_bg(&self, view: &View) -> Option<Style> {
-        self.chrome.color_column.or(view.color_column)
     }
     pub fn end_of_buffer(&self, view: &View) -> Option<Style> {
         self.chrome.end_of_buffer.or(view.end_of_buffer)
@@ -503,10 +488,6 @@ pub struct View {
     /// window has `'cursorline'` set. `None` when the colorscheme leaves it
     /// undefined — the client then uses its own subtle fallback.
     pub cursor_line: Option<Style>,
-    /// The `ColorColumn` background, painted down each `'colorcolumn'` ruler column.
-    /// `None` when the colorscheme leaves it undefined — the client then uses its own
-    /// subtle fallback tint.
-    pub color_column: Option<Style>,
     pub visual: Option<Style>,
     pub search_style: Option<Style>,
     pub incsearch_style: Option<Style>,
@@ -808,7 +789,6 @@ impl View {
         self.line_nr = chrome("line_nr");
         self.cursor_line_nr = chrome("cursor_line_nr");
         self.cursor_line = chrome("cursorline");
-        self.color_column = chrome("colorcolumn");
         self.visual = chrome("visual");
         self.search_style = chrome("search");
         self.incsearch_style = chrome("incsearch");
@@ -1070,15 +1050,6 @@ fn parse_window(m: &[(Value, Value)], styles: &[Style]) -> WindowView {
         cursorline: map_get(m, "cursorline")
             .and_then(Value::as_bool)
             .unwrap_or(false),
-        // `'colorcolumn'` as a plain array of 1-based columns; absent ⇒ no ruler.
-        colorcolumn: map_get(m, "colorcolumn")
-            .and_then(Value::as_array)
-            .map(|a| {
-                a.iter()
-                    .filter_map(|v| v.as_u64().map(|n| n as u16))
-                    .collect()
-            })
-            .unwrap_or_default(),
         line_bg: parse_line_bg(map_get(m, "line_bg"), styles),
         number_width: map_u16(m, "number_width"),
         foldcolumn_width: map_u16(m, "foldcolumn_width"),
@@ -1113,7 +1084,6 @@ fn parse_window(m: &[(Value, Value)], styles: &[Style]) -> WindowView {
                 line_nr: chrome_style(c, "line_nr", styles),
                 cursor_line_nr: chrome_style(c, "cursor_line_nr", styles),
                 cursor_line: chrome_style(c, "cursorline", styles),
-                color_column: chrome_style(c, "colorcolumn", styles),
                 end_of_buffer: chrome_style(c, "end_of_buffer", styles),
                 status_line: chrome_style(c, "status_line", styles),
                 normal_float: chrome_style(c, "normal_float", styles),

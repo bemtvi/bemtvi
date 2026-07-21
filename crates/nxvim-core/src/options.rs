@@ -724,14 +724,6 @@ pub struct WindowOptions {
     /// edge while horizontally scrolling (vim's `sidescrolloff`). `0` by default —
     /// the cursor may sit on the very edge.
     pub sidescrolloff: usize,
-    /// Minimum number of screen lines to keep above and below the cursor (vim's
-    /// `scrolloff`). `0` by default — the cursor may sit on the very top/bottom
-    /// text row. A larger value scrolls the viewport early so the cursor stays in a
-    /// band that many rows in from either edge (clamped to half the text height so
-    /// it can't demand a margin the window can't give). The vertical analogue of
-    /// [`sidescrolloff`](WindowOptions::sidescrolloff); honored by the viewport math
-    /// in [`crate::Editor::ensure_visible`].
-    pub scrolloff: usize,
     /// Soft-wrap long lines: a buffer line wider than the text area is laid out
     /// across several screen rows (continuation rows) rather than scrolled
     /// horizontally. `false` (nxvim's historical `nowrap`) keeps one screen row per
@@ -802,48 +794,9 @@ pub struct WindowOptions {
     /// state of *computed* folds (`indent`/…); changing it re-derives which folds
     /// are open. Manual folds track their own `zo`/`zc` state and ignore it.
     pub foldlevel: usize,
-    /// `'colorcolumn'` (abbrev `cc`): a comma-separated list of text columns to
-    /// highlight with the `ColorColumn` group — a vertical ruler (or several) drawn
-    /// down the text body, the column analogue of [`cursorline`](WindowOptions::cursorline).
-    /// Stored as the raw option string (empty ⇒ no rulers, the default); the
-    /// resolved 1-based columns are computed lazily by
-    /// [`colorcolumns`](WindowOptions::colorcolumns) at projection time (like
-    /// [`fillchars`](WindowOptions::fillchars)). nxvim honors **absolute** column
-    /// numbers (`"80,120"`); vim's `'textwidth'`-relative `+N`/`-N` entries are
-    /// accepted but skipped, since nxvim models no `'textwidth'`.
-    pub colorcolumn: String,
 }
 
 impl WindowOptions {
-    /// The resolved 1-based text columns from this window's
-    /// [`'colorcolumn'`](WindowOptions::colorcolumn), sorted ascending and
-    /// de-duplicated — the columns the client paints with the `ColorColumn` group.
-    /// Only **absolute** entries are honored: a `'textwidth'`-relative `+N`/`-N`
-    /// entry (vim's form) is skipped because nxvim has no `'textwidth'` to anchor it
-    /// to, and a non-numeric or `0` entry is ignored. An empty option yields no
-    /// columns (no ruler).
-    pub fn colorcolumns(&self) -> Vec<usize> {
-        let mut cols: Vec<usize> = self
-            .colorcolumn
-            .split(',')
-            .filter_map(|piece| {
-                let p = piece.trim();
-                // Only a plain absolute column counts. Reject `'textwidth'`-relative
-                // `+N`/`-N` (nxvim has no `'textwidth'` to anchor them) and any
-                // non-digit junk — `usize::parse` would otherwise accept a leading
-                // `+`, turning `+1` into column 1.
-                if p.is_empty() || !p.bytes().all(|b| b.is_ascii_digit()) {
-                    return None;
-                }
-                p.parse::<usize>().ok()
-            })
-            .filter(|&n| n >= 1)
-            .collect();
-        cols.sort_unstable();
-        cols.dedup();
-        cols
-    }
-
     /// Whether `'breakindentopt'` contains the `sbr` flag — draw `'showbreak'` within
     /// the breakindent rather than added on top (see [`WindowOptions::breakindentopt`]).
     pub fn breakindent_sbr(&self) -> bool {
@@ -941,11 +894,6 @@ impl Default for WindowOptions {
             // neovim's horizontal-scroll defaults: scroll a minimal step, no margin.
             sidescroll: 1,
             sidescrolloff: 0,
-            // No vertical margin out of the box — the cursor may reach the top/bottom
-            // text row, matching vim's `scrolloff=0` default.
-            scrolloff: 0,
-            // No column rulers by default (vim's empty `colorcolumn`).
-            colorcolumn: String::new(),
             // nxvim has historically been `nowrap`-only; wrap is opt-in (`:set wrap`)
             // so the existing horizontal-scroll behavior is the default.
             wrap: false,
@@ -1525,20 +1473,6 @@ static OPTIONS: &[OptionInfo] = {
             kind: Num,
             scope: Window,
             doc: "Minimum columns to keep to the left and right of the cursor.",
-        },
-        OptionInfo {
-            name: "scrolloff",
-            abbrev: Some("so"),
-            kind: Num,
-            scope: Window,
-            doc: "Minimum screen lines to keep above and below the cursor.",
-        },
-        OptionInfo {
-            name: "colorcolumn",
-            abbrev: Some("cc"),
-            kind: Str,
-            scope: Window,
-            doc: "Comma-separated text columns to highlight (a vertical ruler).",
         },
         // ---- Buffer-local --------------------------------------------------------
         OptionInfo {

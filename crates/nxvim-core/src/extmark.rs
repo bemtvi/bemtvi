@@ -201,6 +201,20 @@ pub struct Extmark {
     pub hl_group: Option<String>,
     pub priority: u32,
     pub decor: Option<Box<VirtDecor>>,
+    /// Which way [`start`](Self::start) is dragged when text is inserted *at* it
+    /// (neovim's `right_gravity`, default `true`). `true` ⇒ the anchor slides right
+    /// with the inserted text (the insert lands to its *left*, outside a range);
+    /// `false` ⇒ it stays put (the insert lands to its *right*, growing a range from
+    /// the left edge). See [`ExtmarkStore::shift`].
+    pub right_gravity: bool,
+    /// Which way [`end`](Self::end) is dragged when text is inserted *at* it
+    /// (neovim's `end_right_gravity`, default `false`). `false` ⇒ the end stays put
+    /// (the insert lands to its *right*, outside a range); `true` ⇒ it slides right,
+    /// growing a range from the right edge. The two flags together let an *active*
+    /// snippet tabstop (`right_gravity = false`, `end_right_gravity = true`) grow
+    /// from an empty range as the user types into it — the case fixed gravity can't
+    /// express.
+    pub end_right_gravity: bool,
 }
 
 /// Marks within one namespace, plus that namespace's monotonic id allocator.
@@ -239,6 +253,28 @@ impl ExtmarkStore {
         priority: u32,
         decor: Option<Box<VirtDecor>>,
     ) -> u64 {
+        // Default gravity (neovim's): start right-gravity, end left-gravity — a range
+        // that does *not* grow when text is typed at either boundary.
+        self.set_with_gravity(ns, id, start, end, hl_group, priority, decor, true, false)
+    }
+
+    /// Like [`set`](Self::set) but with explicit anchor gravity (see
+    /// [`Extmark::right_gravity`] / [`Extmark::end_right_gravity`]). The `nx.buf.set_extmark`
+    /// bridge routes through here so a plugin snippet engine can place a *growing*
+    /// tabstop; the internal callers use [`set`](Self::set)'s default gravity.
+    #[allow(clippy::too_many_arguments)] // positional mark setter; fields mirror neovim's
+    pub fn set_with_gravity(
+        &mut self,
+        ns: u32,
+        id: Option<u64>,
+        start: usize,
+        end: Option<usize>,
+        hl_group: Option<String>,
+        priority: u32,
+        decor: Option<Box<VirtDecor>>,
+        right_gravity: bool,
+        end_right_gravity: bool,
+    ) -> u64 {
         let slot = self.by_ns.entry(ns).or_default();
         let id = match id {
             Some(id) => {
@@ -260,6 +296,8 @@ impl ExtmarkStore {
                 hl_group,
                 priority,
                 decor,
+                right_gravity,
+                end_right_gravity,
             },
         );
         id
@@ -339,21 +377,32 @@ impl ExtmarkStore {
     /// content ending at `new_end`. Called from the buffer's single edit choke
     /// point, so every edit path keeps marks correct.
     ///
-    /// Gravity is fixed to neovim's defaults: `start` is **right-gravity** (text
-    /// inserted exactly at the mark's start lands *before* it, so the start
-    /// slides right), `end` is **left-gravity** (text inserted at the end lands
-    /// *after* it, so the end stays). Net effect: typing at either boundary of a
-    /// highlighted range leaves the highlighted text unchanged. An anchor swallowed
-    /// by a deletion collapses to the deletion point rather than vanishing.
+    /// Gravity is **per mark** (neovim's defaults — `start` right-gravity, `end`
+    /// left-gravity — unless the mark opted out via
+    /// [`set_with_gravity`](Self::set_with_gravity)): a right-gravity anchor slides
+    /// with text inserted exactly at it, a left-gravity one stays put. With the
+    /// defaults, typing at either boundary of a highlighted range leaves the
+    /// highlighted text unchanged; with `start` left-gravity + `end` right-gravity a
+    /// range instead *grows* to swallow text typed at either edge (a live snippet
+    /// tabstop). An anchor swallowed by a deletion collapses to the deletion point
+    /// rather than vanishing.
     pub fn shift(&mut self, start: usize, old_end: usize, new_end: usize) {
         if old_end == start && new_end == start {
             return; // no-op edit
         }
         for slot in self.by_ns.values_mut() {
             for m in slot.marks.values_mut() {
-                m.start = shift_right_gravity(m.start, start, old_end, new_end);
+                m.start = if m.right_gravity {
+                    shift_right_gravity(m.start, start, old_end, new_end)
+                } else {
+                    shift_left_gravity(m.start, start, old_end, new_end)
+                };
                 if let Some(e) = m.end {
-                    let e = shift_left_gravity(e, start, old_end, new_end);
+                    let e = if m.end_right_gravity {
+                        shift_right_gravity(e, start, old_end, new_end)
+                    } else {
+                        shift_left_gravity(e, start, old_end, new_end)
+                    };
                     // Keep the range non-inverted if a deletion crossed it.
                     m.end = Some(e.max(m.start));
                 }

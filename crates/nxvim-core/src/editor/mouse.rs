@@ -2283,6 +2283,8 @@ impl Editor {
             // same `n` flag (independent of its now-distinct `mode()` code `m`).
             Mode::Normal | Mode::MultiCursor => 'n',
             Mode::Visual | Mode::VisualLine => 'v',
+            // Vim gates Select-mode mouse on the `s` flag.
+            Mode::Select => 's',
             Mode::Insert | Mode::Replace => 'i',
             Mode::Command => 'c',
             // vim gates terminal-mode mouse on the `t` flag (we treat it like

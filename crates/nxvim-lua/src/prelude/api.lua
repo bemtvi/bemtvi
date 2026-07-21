@@ -7,11 +7,14 @@
 -- read/define (nx.hl), namespaces (nx.ns), and the extmark decoration layer. The
 -- matching vim.api.nvim_* / vim.fn.* names are aliased onto each native.
 --
--- The buffer-TEXT mutation entry point is nx.buf.set_lines (alias nvim_buf_set_lines) —
--- the ONE whole-line write, an async promise queued through the nx._buf_set_lines bridge
--- (see below). The rest of the lifecycle surface — set_text / set_name, nvim_create_buf /
--- nvim_buf_delete, and the nvim_buf_attach change channel — stays absent until a real
--- need lands. (The window / tab / float create-and-modify API — nvim_open_win,
+-- The buffer-TEXT mutations are nx.buf.set_lines (alias nvim_buf_set_lines) — the
+-- whole-line write — and nx.buf.set_text (alias nvim_buf_set_text) — the precise
+-- sub-line range write; both async promises queued through the nx._buf_set_lines /
+-- nx._buf_set_text bridges (see below). The buffer CHANGE stream is nx.buf.attach —
+-- the server's on_bytes byte-delta channel, wired for on_bytes / on_reload (the
+-- nvim_buf_attach on_lines / on_detach callbacks and a vim.api.nvim_buf_attach alias
+-- stay deferred). The rest of the lifecycle surface — set_name, nvim_create_buf /
+-- nvim_buf_delete — stays absent until a real need lands. (The window / tab / float create-and-modify API — nvim_open_win,
 -- nvim_win_set_*, nvim_set_current_* — is queued through nx._open_win / nx._win_*.)
 --
 -- Reads the mirror state / resolvers from prelude/state.lua (loaded just before
@@ -442,6 +445,183 @@ function nx.buf.set_lines(bufnr, start, end_, strict, replacement)
   end)
 end
 
+-- `nx.buf.set_text(bufnr, start_row, start_col, end_row, end_col, replacement)` -> promise
+-- [alias `nvim_buf_set_text`]: replace the CHARACTER range
+-- `(start_row, start_col)`..`(end_row, end_col)` of `bufnr` (0/nil = current) with
+-- `replacement` (a list of lines). 0-based; rows are line indices, columns are byte
+-- offsets within the line; the range is end-EXCLUSIVE. Unlike `set_lines` this is a
+-- precise SUB-LINE edit: `set_text(0, 4, 0, 7, { "xy" })` replaces bytes 4..7 of line 0
+-- in place, and `replacement` is spliced verbatim (its lines joined by `\n`, with NO
+-- trailing newline added). The precise edit a snippet / structural-edit plugin uses to
+-- swap a trigger word for an expanded body, or to update a mirror inline.
+--
+-- Like `set_lines` this is the editor's ONE buffer-text mutation and is ASYNCHRONOUS:
+-- the edit is QUEUED and applied right after this chunk, and the returned promise fulfils
+-- (with nil) on the next tick — once the mirror reflects it — so
+-- `nx.await(nx.buf.set_text(…))` is the point a following read sees the new content. The
+-- shape and modifiability are validated SYNCHRONOUSLY and raise before anything is queued
+-- (a non-table replacement, a non-string / newline-bearing line, an unknown or
+-- `nomodifiable` buffer); the server refuses a read-only KIND (terminal / `nx.view` /
+-- quickfix) and an inverted span loudly. Out-of-range coordinates clamp into the buffer.
+function nx.buf.set_text(bufnr, start_row, start_col, end_row, end_col, replacement)
+  local buf = nx._resolve_bufnr(bufnr)
+  local mirror = nx._bufs[buf]
+  if not mirror or not mirror.lines then
+    error("nvim_buf_set_text: invalid buffer id " .. tostring(buf), 2)
+  end
+  local bo = nx._bo_mirror[buf]
+  if bo and bo.modifiable == false then
+    error("nvim_buf_set_text: buffer " .. tostring(buf) .. " is not 'modifiable'", 2)
+  end
+  if type(replacement) ~= "table" then
+    error("nvim_buf_set_text: replacement must be a list of strings", 2)
+  end
+  for i = 1, #replacement do
+    local line = replacement[i]
+    if type(line) ~= "string" then
+      error(("nvim_buf_set_text: replacement[%d] is not a string"):format(i), 2)
+    end
+    if line:find("\n", 1, true) then
+      error(("nvim_buf_set_text: replacement[%d] contains a newline"):format(i), 2)
+    end
+  end
+  nx._buf_set_text(buf, start_row, start_col, end_row, end_col, replacement)
+  return nx.promise.new(function(resolve)
+    nx.on_next_tick(resolve)
+  end)
+end
+
+-- ===== Buffer change notifications (nvim_buf_attach `on_bytes`) =============
+-- The server projects every applied edit into neovim's `on_bytes` byte-delta tuple
+-- and fires it here (a resync — undo/redo/`:e`, where deltas are meaningless — fires
+-- `on_reload` instead). `nx.buf.attach` is the public subscriber: a plugin that keeps
+-- derived state in sync as the user types (a snippet engine mirroring/transforming a
+-- tabstop, a live structural editor) reacts to the precise delta rather than
+-- re-scanning the whole buffer each keystroke.
+--
+-- `nx.buf._attached[bufnr] = { [handle] = { on_bytes = fn, on_reload = fn } }`.
+nx.buf._attached = nx.buf._attached or {}
+nx.buf._attach_next = nx.buf._attach_next or 0
+
+-- `nx.buf.attach(buffer, { on_bytes = fn, on_reload = fn })` -> detach()
+-- [partial alias `nvim_buf_attach`]: subscribe to `buffer`'s (0/nil = current) change
+-- stream. At least one callback is required; an unsupported key fails loud (only
+-- `on_bytes` / `on_reload` are wired — `on_lines` / `on_detach` / `on_changedtick`
+-- stay deferred). Returns a `detach()` closure that removes this subscription; a
+-- callback may also return `true` to detach itself (neovim's convention). The
+-- callbacks fire on the editor thread AFTER every mirror is consistent, so one may
+-- read `nx.buf.lines` / `nx.buf.extmarks` and see the post-edit state.
+--
+-- `on_bytes` is called
+-- `on_bytes("bytes", bufnr, changedtick, start_row, start_col, start_byte,
+--            old_end_row, old_end_col, old_end_byte,
+--            new_end_row, new_end_col, new_end_byte)` — the exact neovim tuple (rows
+-- 0-based, `*_byte` a total buffer byte offset, the `old_*` / `new_*` the removed /
+-- inserted extent). `on_reload` is called `on_reload("reload", bufnr)` when the whole
+-- rope was replaced (the delta stream is invalid — re-read the buffer whole).
+function nx.buf.attach(buffer, opts)
+  if type(opts) ~= "table" then
+    error("nx.buf.attach: opts must be a table of callbacks", 2)
+  end
+  local allowed = { on_bytes = true, on_reload = true }
+  for k, v in pairs(opts) do
+    if not allowed[k] then
+      error(
+        "nx.buf.attach: unsupported callback '"
+          .. tostring(k)
+          .. "' (only on_bytes / on_reload are wired)",
+        2
+      )
+    end
+    if type(v) ~= "function" then
+      error("nx.buf.attach: " .. k .. " must be a function, got " .. type(v), 2)
+    end
+  end
+  if not opts.on_bytes and not opts.on_reload then
+    error("nx.buf.attach: at least one of on_bytes / on_reload is required", 2)
+  end
+  local b = nx._resolve_bufnr(buffer)
+  nx.buf._attached[b] = nx.buf._attached[b] or {}
+  nx.buf._attach_next = nx.buf._attach_next + 1
+  local handle = nx.buf._attach_next
+  nx.buf._attached[b][handle] = { on_bytes = opts.on_bytes, on_reload = opts.on_reload }
+  return function()
+    local subs = nx.buf._attached[b]
+    if subs then
+      subs[handle] = nil
+      if next(subs) == nil then
+        nx.buf._attached[b] = nil
+      end
+    end
+  end
+end
+
+-- Run one attached callback, surfacing an error like the other dispatchers (a bad
+-- callback must not kill the others or the edit loop). A callback returning `true`
+-- detaches itself; returns whether to drop the subscription.
+local function fire_attach_cb(fn, kind, ...)
+  local ok, res = pcall(fn, ...)
+  if not ok then
+    nx.notify("E5108: Error in nx.buf.attach " .. kind .. " callback: " .. tostring(res), "error")
+    return false
+  end
+  return res == true
+end
+
+-- Dispatcher for the server's `on_bytes` firing — the byte-delta tuple, per attached
+-- subscriber. Kept an early return when the buffer has no subscribers, so the common
+-- (unattached) edit pays nothing beyond the table lookup.
+function nx._buf_bytes_changed(buf, tick, sr, sc, sb, oer, oec, oeb, ner, nec, neb)
+  local subs = nx.buf._attached[buf]
+  if not subs then
+    return
+  end
+  for handle, cb in pairs(subs) do
+    if cb.on_bytes then
+      local drop = fire_attach_cb(
+        cb.on_bytes,
+        "on_bytes",
+        "bytes",
+        buf,
+        tick,
+        sr,
+        sc,
+        sb,
+        oer,
+        oec,
+        oeb,
+        ner,
+        nec,
+        neb
+      )
+      if drop then
+        subs[handle] = nil
+      end
+    end
+  end
+  if next(subs) == nil then
+    nx.buf._attached[buf] = nil
+  end
+end
+
+-- Dispatcher for the server's `on_reload` firing (a wholesale rope replace).
+function nx._buf_reloaded(buf)
+  local subs = nx.buf._attached[buf]
+  if not subs then
+    return
+  end
+  for handle, cb in pairs(subs) do
+    if cb.on_reload then
+      if fire_attach_cb(cb.on_reload, "on_reload", "reload", buf) then
+        subs[handle] = nil
+      end
+    end
+  end
+  if next(subs) == nil then
+    nx.buf._attached[buf] = nil
+  end
+end
+
 -- `nx.buf.search(bufnr, pattern, opts)` -> match | nil: find `pattern` in `bufnr`
 -- (0/nil = current) over the buffer mirror, line by line. The native counterpart to
 -- scanning lines in Lua — it runs the match in Rust (the `regex` crate or the vim
@@ -548,6 +728,12 @@ local EXTMARK_OPT_OK = {
   end_col = true,
   hl_group = true,
   priority = true,
+  -- Anchor gravity (neovim's `right_gravity` / `end_right_gravity`) — HONORED end
+  -- to end: threaded to the core `ExtmarkStore` so the mark tracks edits per its
+  -- gravity, letting a plugin place a *growing* range (a live snippet tabstop) that
+  -- swallows text typed at its edges. Defaults `true` / `false`.
+  right_gravity = true,
+  end_right_gravity = true,
 }
 -- Decoration options nxvim ACCEPTS and STORES (so nvim_buf_get_extmarks(…,
 -- {details=true}) returns them), forwarded to the server as the `decoration` payload.
@@ -565,8 +751,10 @@ local EXTMARK_OPT_OK = {
 -- RENDERS — projected as the per-window `line_bg` layer painted under the text, the
 -- `'cursorline'` model — so a plugin can back a whole line (e.g. a markdown code block
 -- with `@markup.raw.block`) end to end. The remainder — signs' `sign_hl_group`,
--- conceal, the other line-highlight groups, and the gravity flags — are likewise
--- accepted and stored but unpainted. A documented approximation (the matchadd /
+-- conceal, and the other line-highlight groups — are likewise
+-- accepted and stored but unpainted. (The gravity flags `right_gravity` /
+-- `end_right_gravity` are NOT in this bucket — they are honored end to end; see
+-- `EXTMARK_OPT_OK` and `nx.buf.set_extmark`.) A documented approximation (the matchadd /
 -- winblend pattern): a plugin that decorates with, say, gutter signs loads and runs;
 -- those supplementary glyphs just aren't painted yet. Rejecting them loud would instead
 -- break the plugin's render path. The core extmark store still tracks the mark's
@@ -595,8 +783,6 @@ local EXTMARK_OPT_DECORATION = {
   spell = true,
   ui_watched = true,
   url = true,
-  right_gravity = true,
-  end_right_gravity = true,
   strict = true,
   undo_restore = true,
   invalidate = true,
@@ -609,6 +795,13 @@ local EXTMARK_OPT_DECORATION = {
 -- ranged mark, `hl_group`, `priority`, … — and an unsupported decoration key fails
 -- loud rather than being ignored. Returns the mark id. The mutation is queued for
 -- the server, but the mirror is written through, so a read later in this chunk sees it.
+--
+-- `right_gravity` (default `true`) and `end_right_gravity` (default `false`) set the
+-- anchor gravity — the direction each edge is dragged when text is inserted *at* it —
+-- and are HONORED against the live rope, not just stored. The default is a range that
+-- does NOT grow when you type at its edges (a highlight span); `right_gravity = false`
+-- with `end_right_gravity = true` makes an (even empty) range GROW to swallow text
+-- typed at either edge — the anchor shape a live snippet tabstop needs.
 function nx.buf.set_extmark(buffer, ns, line, col, opts)
   local b = nx._resolve_bufnr(buffer)
   opts = opts or {}
@@ -638,6 +831,21 @@ function nx.buf.set_extmark(buffer, ns, line, col, opts)
     error("nvim_buf_set_extmark: end_row/end_line and end_col must be given together", 2)
   end
   local priority = opts.priority or 4096
+  -- Anchor gravity — neovim's defaults (start right-gravity, end left-gravity) unless
+  -- the caller opts into a growing range. `false` / `true` makes an empty range grow
+  -- to swallow text typed at its edges (a live snippet tabstop).
+  local right_gravity = opts.right_gravity
+  if right_gravity == nil then
+    right_gravity = true
+  elseif type(right_gravity) ~= "boolean" then
+    error("nvim_buf_set_extmark: right_gravity must be a boolean", 2)
+  end
+  local end_right_gravity = opts.end_right_gravity
+  if end_right_gravity == nil then
+    end_right_gravity = false
+  elseif type(end_right_gravity) ~= "boolean" then
+    error("nvim_buf_set_extmark: end_right_gravity must be a boolean", 2)
+  end
 
   nx._extmark_next[b] = nx._extmark_next[b] or {}
   local mark_id = opts.id or nx._extmark_next[b][ns] or 1
@@ -655,8 +863,23 @@ function nx.buf.set_extmark(buffer, ns, line, col, opts)
     hl_group = hl_group,
     priority = priority,
     decoration = decoration,
+    right_gravity = right_gravity,
+    end_right_gravity = end_right_gravity,
   }
-  nx._extmark_set(b, ns, mark_id, line, col, end_row, opts.end_col, hl_group, priority, decoration)
+  nx._extmark_set(
+    b,
+    ns,
+    mark_id,
+    line,
+    col,
+    end_row,
+    opts.end_col,
+    hl_group,
+    priority,
+    decoration,
+    right_gravity,
+    end_right_gravity
+  )
   return mark_id
 end
 
@@ -745,6 +968,8 @@ function nx.buf.extmarks(buffer, ns, start, end_, opts)
             end_col = m.end_col,
             hl_group = m.hl_group,
             priority = m.priority,
+            right_gravity = m.right_gravity,
+            end_right_gravity = m.end_right_gravity,
           }
           -- Spread any accepted-but-unrendered decoration payload (virt_text, …)
           -- into the details dict at top level, matching neovim's shape.
@@ -859,6 +1084,7 @@ end
 -- `nx.*` native defined above (same function object, same signature).
 vim.api.nvim_buf_get_lines = nx.buf.lines
 vim.api.nvim_buf_set_lines = nx.buf.set_lines
+vim.api.nvim_buf_set_text = nx.buf.set_text
 vim.api.nvim_buf_get_text = nx.buf.text
 vim.api.nvim_buf_get_name = nx.buf.name
 vim.api.nvim_buf_get_offset = nx.buf.offset
@@ -939,9 +1165,41 @@ end
 
 -- `nx.win.set_cursor(win, line[, col])`: move `win`'s cursor to `line` (1-based) /
 -- `col` (0-based byte column, default 0). The explicit-win counterpart of the
--- (intentionally-absent) `nvim_win_set_cursor`.
+-- (intentionally-absent) `nvim_win_set_cursor`, and the sanctioned caret primitive a
+-- pure-Lua editor feature drives with. It works mid-**insert** (a `col` one past the
+-- last char is legal there), so a snippet engine owning its own tabstop session jumps
+-- between tabstops by calling this from its insert-mode jump key — the caret moves and
+-- further typing lands at the new spot.
 function nx.win.set_cursor(win, line, col)
   nx._win_set_cursor(win or 0, math.max(0, (line or 1) - 1), math.max(0, col or 0))
+end
+
+-- `nx.win.select_range(win, s_row, s_col, e_row, e_col[, opts])`: enter **Select mode**
+-- over the 0-based, end-exclusive byte range `(s_row, s_col)` .. `(e_row, e_col)` in `win`.
+-- The range is highlighted like a charwise Visual selection, but the next printable key /
+-- `<CR>` / `<BS>` **replaces** it (deletes the range and enters Insert with that input) —
+-- vim's `v_CTRL-G` behavior. This is the Select-mode sibling of `nx.win.set_cursor` and the
+-- P6 snippet-engine primitive: a consumer selecting a **non-empty** placeholder `${1:default}`
+-- calls this (so typing replaces the default); an empty range degrades to caret-plus-Insert
+-- at the start (an empty tabstop uses `nx.win.set_cursor` instead).
+--
+-- `opts.on_escape` controls where `<Esc>` (with nothing typed) leaves the kept selection:
+--
+-- ```
+-- "normal"   -- (default) keep the text, drop to Normal on the selection — vim's v_CTRL-G
+-- "insert"   -- keep the text, park the caret in Insert past it (a snippet engine wants this,
+--            --   so it can keep editing the placeholder)
+-- ```
+function nx.win.select_range(win, s_row, s_col, e_row, e_col, opts)
+  local escape_insert = (opts and opts.on_escape) == "insert"
+  nx._win_select_range(
+    win or 0,
+    math.max(0, s_row or 0),
+    math.max(0, s_col or 0),
+    math.max(0, e_row or 0),
+    math.max(0, e_col or 0),
+    escape_insert
+  )
 end
 
 -- `nx.win.restview(win, view)`: restore `win`'s view from a `winsaveview`-shaped table

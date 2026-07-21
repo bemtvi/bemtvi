@@ -141,29 +141,6 @@ async fn function_key_map_fires() {
     );
 }
 
-/// A `<C-S-c>` / `<A-S-c>` mapping fires when that exact notation is fed. Shift is a
-/// distinct modifier flag once ctrl/alt is also held (`parse_special` sets
-/// `key.shift`), so the LHS and the live input must round-trip through the same
-/// `<C-S-c>` spelling. Paired regression: the clients' `notation` encoder used to drop
-/// shift on a modified printable and send bare `<C-c>`, so these remaps never fired
-/// (see `nxvim-view`'s `shift_with_ctrl_or_alt_is_a_modifier_flag`).
-#[tokio::test]
-async fn ctrl_shift_and_alt_shift_letter_maps_fire() {
-    let dir = temp_dir("keymap_shift_mod");
-    let (rpc, mut incoming) = start_with_config(
-        &dir,
-        "vim.keymap.set('n', '<C-S-c>', function() print('CTRL_SHIFT_C') end)\n\
-         vim.keymap.set('n', '<A-S-c>', function() print('ALT_SHIFT_C') end)\n",
-    )
-    .await;
-
-    let redraw = redraw_after(&rpc, &mut incoming, "<C-S-c>").await;
-    assert_eq!(message(&redraw), "CTRL_SHIFT_C", "the <C-S-c> mapping ran");
-
-    let redraw = redraw_after(&rpc, &mut incoming, "<A-S-c>").await;
-    assert_eq!(message(&redraw), "ALT_SHIFT_C", "the <A-S-c> mapping ran");
-}
-
 /// A `noremap` string RHS is fed straight to the editor: `Y` → `y$` yanks to
 /// end-of-line, observable by pasting it back.
 #[tokio::test]

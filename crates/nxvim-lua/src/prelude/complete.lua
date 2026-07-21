@@ -187,6 +187,12 @@ function nx.complete.setup(opts)
     -- `nx._complete_resolve(id)` looks the callback + original item up in.
     resolve_next = 0,
     resolve_items = {},
+    -- `on_accept` bookkeeping, shaped like the resolve map: a monotonic id stamped
+    -- onto each pushed row that carries an `on_accept`, and a map id → { on_accept,
+    -- item } the server's `nx._complete_run_accept(id, …)` looks the callback up in
+    -- when that row is accepted (its accept is delegated so core doesn't splice).
+    accept_next = 0,
+    accept_items = {},
   }
   -- The server-native `lsp` and `snippets` sources both dispatch off the input
   -- path, so either (like a Lua async source) needs the `(gen, ctx)` emit.
@@ -276,6 +282,16 @@ end
 -- item with no `doc`, and when the user selects it the engine calls `resolve(item)`,
 -- which returns a PROMISE of the docs — a doc string, or an item whose `.doc` is
 -- used. Use it when computing docs up front for every candidate is wasteful.
+--
+-- A pushed item may carry `on_accept = function(item, ctx)` — a per-item callback that
+-- OWNS the edit when that row is accepted, run INSTEAD of core splicing the item's
+-- `insert`. `ctx` is `{ buf, start_row, start_col, end_row, end_col }` — the trigger
+-- word RANGE under the cursor (0-based, byte columns, end-exclusive), ready to hand to
+-- `nx.buf.set_text`. This is the seam a snippet engine uses: match a trigger, then on
+-- accept `nx.buf.set_text(ctx.buf, ctx.start_row, ctx.start_col, ctx.end_row,
+-- ctx.end_col, {""})` and `nx.snippet.expand(body)` (or drive its own tabstop session).
+-- Not a snippet-only hook — additionalTextEdits, post-accept commands, and any
+-- non-literal expander use it too.
 function nx.complete.source(spec)
   if type(spec) ~= "table" or type(spec.name) ~= "string" then
     error("nx.complete.source: requires a { name = <string>, complete = <fn> } table", 2)
@@ -371,9 +387,10 @@ function nx._complete_run(gen, ctx)
   end
   complete_cancel_inflight(c)
   c.gen = gen
-  -- A fresh run rebuilds the menu, so the previous run's resolve handles are dead
-  -- (their rows are gone); drop them before the new pushes assign fresh ids.
+  -- A fresh run rebuilds the menu, so the previous run's resolve / accept handles are
+  -- dead (their rows are gone); drop them before the new pushes assign fresh ids.
   c.resolve_items = {}
+  c.accept_items = {}
   -- Only the sources whose trigger gate matches this prefix run; the rest are
   -- dormant, so they owe no `done()`.
   local active = {}
@@ -419,11 +436,11 @@ function nx._complete_run(gen, ctx)
           end
         end,
       }
-      local labels, inserts, docs, resolves, batched = {}, {}, {}, {}, 0
+      local labels, inserts, docs, resolves, accepts, batched = {}, {}, {}, {}, {}, 0
       local function flush()
         if batched > 0 then
-          nx._complete_push(gen, labels, inserts, docs, resolves)
-          labels, inserts, docs, resolves, batched = {}, {}, {}, {}, 0
+          nx._complete_push(gen, labels, inserts, docs, resolves, accepts)
+          labels, inserts, docs, resolves, accepts, batched = {}, {}, {}, {}, {}, 0
         end
       end
       local function push(item)
@@ -431,7 +448,7 @@ function nx._complete_run(gen, ctx)
         if nx._complete ~= c or c.gen ~= gen then
           return
         end
-        local label, insert, doc, resolve_id = nil, nil, nil, 0
+        local label, insert, doc, resolve_id, accept_id = nil, nil, nil, 0, 0
         if type(item) == "table" then
           label = item.text or item.label or tostring(item.insert)
           insert = item.insert or label
@@ -444,6 +461,17 @@ function nx._complete_run(gen, ctx)
             resolve_id = c.resolve_next
             c.resolve_items[resolve_id] = { resolve = source.resolve, item = item }
           end
+          -- A per-item `on_accept` delegates this row's accept to Lua: it runs the
+          -- callback (which owns the edit — e.g. a snippet expansion over the trigger
+          -- range) INSTEAD of core splicing `insert`. Assign it an accept id the
+          -- delegated-accept drain resolves back to the callback + item.
+          if type(item.on_accept) == "function" then
+            c.accept_next = c.accept_next + 1
+            accept_id = c.accept_next
+            c.accept_items[accept_id] = { on_accept = item.on_accept, item = item }
+          elseif item.on_accept ~= nil then
+            error("nx.complete source item: on_accept must be a function", 2)
+          end
         else
           label = tostring(item)
           insert = label
@@ -453,6 +481,7 @@ function nx._complete_run(gen, ctx)
         inserts[batched] = insert
         docs[batched] = doc or ""
         resolves[batched] = resolve_id
+        accepts[batched] = accept_id
         if batched >= FLUSH_N then
           flush()
         end
@@ -519,4 +548,31 @@ function nx._complete_resolve(id)
     -- Stamp it resolved-but-docless so the server never re-fires for this row.
     nx._complete_resolve_done(id, "")
   end)
+end
+
+-- nx._complete_run_accept(id, buf, start_row, start_col, end_row, end_col): the server
+-- accepted a plugin row whose item carried an `on_accept`. Look the callback + item up
+-- and run it, handing it the item and a `ctx` describing the buffer and the trigger
+-- RANGE it should replace (the word under the cursor — `(start_row, start_col)` to
+-- `(end_row, end_col)`, 0-based, byte columns). The callback owns the edit: it typically
+-- `nx.buf.set_text`s an expansion over that range, or `nx.snippet.expand`s a body. A
+-- no-op for an unknown / stale id (the producing run was superseded).
+function nx._complete_run_accept(id, buf, start_row, start_col, end_row, end_col)
+  local c = nx._complete
+  local entry = c and c.accept_items and c.accept_items[id]
+  if not entry then
+    return
+  end
+  local ctx = {
+    buf = buf,
+    -- The trigger range to replace (end-exclusive), ready to hand to nx.buf.set_text.
+    start_row = start_row,
+    start_col = start_col,
+    end_row = end_row,
+    end_col = end_col,
+  }
+  local ok, err = pcall(entry.on_accept, entry.item, ctx)
+  if not ok then
+    nx.notify("nx.complete: on_accept error: " .. tostring(err), "error")
+  end
 end

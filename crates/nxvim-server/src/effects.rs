@@ -1198,15 +1198,17 @@ impl EditHost {
                 .filter(|p| p.gen == live)
                 .map(|p| nxvim_core::MenuItem {
                     label: p.label,
-                    // The wrapper key is unused for completion (accept is native, by
-                    // `insert`); a stable per-batch index keeps `MenuItem` well-formed.
-                    key: 0,
+                    // A plain row inserts natively by `insert` (key unused). A row whose
+                    // item carried an `on_accept` delegates its accept to Lua: it rides a
+                    // key in the plugin-accept range and `source_accept = true`, so core
+                    // records the accept for the drain rather than splicing `insert`.
+                    key: p
+                        .accept
+                        .map_or(0, |id| crate::snippet::PLUGIN_ACCEPT_KEY_BASE + id as usize),
                     preview: None,
                     insert: Some(p.insert),
-                    // Async Lua sources insert natively (priority merge / delegated
-                    // accept are for the built-in `lsp` source; 4-E may extend them).
                     priority: 0,
-                    source_accept: false,
+                    source_accept: p.accept.is_some(),
                     // A plugin source can attach inline docs (`push { doc = … }`),
                     // rendered beside the popup for the selected row (Phase 4-E).
                     doc: p.doc,
@@ -1351,6 +1353,27 @@ impl EditHost {
                     self.editor.echo(e);
                 }
             }
+            BufOp::SetText {
+                bufnr,
+                start_row,
+                start_col,
+                end_row,
+                end_col,
+                lines,
+            } => {
+                // The precise-range text mutation. Like `api_set_lines` it fails loud on
+                // a read-only / gone buffer or an inverted span — surface it as a message.
+                if let Err(e) = self.editor.api_set_text(
+                    BufferId(bufnr),
+                    start_row,
+                    start_col,
+                    end_row,
+                    end_col,
+                    &lines,
+                ) {
+                    self.editor.echo(e);
+                }
+            }
         }
     }
 
@@ -1372,6 +1395,8 @@ impl EditHost {
                 hl_group,
                 priority,
                 decor,
+                right_gravity,
+                end_right_gravity,
             } => {
                 let bid = BufferId(bufnr);
                 let Some(buf) = self.editor.buffer_of(bid) else {
@@ -1384,8 +1409,17 @@ impl EditHost {
                 };
                 let decor = decor.map(|d| Box::new(virt_decor_to_core(*d)));
                 if let Some(buf) = self.editor.buffer_of_mut(bid) {
-                    buf.extmarks
-                        .set(ns, Some(id), start, end, hl_group, priority, decor);
+                    buf.extmarks.set_with_gravity(
+                        ns,
+                        Some(id),
+                        start,
+                        end,
+                        hl_group,
+                        priority,
+                        decor,
+                        right_gravity,
+                        end_right_gravity,
+                    );
                 }
             }
             ExtmarkOp::Del { bufnr, ns, id } => {
@@ -1449,6 +1483,18 @@ impl EditHost {
             WindowOp::SetCursor { win, line, col } => {
                 let id = resolve_win(self, win);
                 self.editor.set_window_cursor(id, line, col);
+            }
+            WindowOp::SelectRange {
+                win,
+                s_row,
+                s_col,
+                e_row,
+                e_col,
+                escape_insert,
+            } => {
+                let id = resolve_win(self, win);
+                self.editor
+                    .select_range_in_window(id, s_row, s_col, e_row, e_col, escape_insert);
             }
             WindowOp::Jump {
                 path,
@@ -1868,6 +1914,8 @@ impl EditHost {
                                 sign_hl_group,
                                 line_fill_text,
                                 line_fill_hl,
+                                right_gravity: m.right_gravity,
+                                end_right_gravity: m.end_right_gravity,
                             }
                         })
                         .collect();
@@ -1948,8 +1996,6 @@ impl EditHost {
                     wrap: opts.wrap,
                     scrollanim: opts.scrollanim.unwrap_or(global_scrollanim),
                     numberwidth: opts.numberwidth as u64,
-                    scrolloff: opts.scrolloff as u64,
-                    colorcolumn: opts.colorcolumn.clone(),
                     signcolumn: opts.signcolumn.to_string(),
                     fillchars: opts.fillchars.clone(),
                     padding: opts.padding.to_string(),
@@ -3175,6 +3221,9 @@ impl EditHost {
                 // nx.decor providers publish hl-only marks; virtual text on a
                 // provider mark is a separate, not-yet-wired surface.
                 decor: None,
+                // Default gravity — a decoration span, not a growing tabstop.
+                right_gravity: true,
+                end_right_gravity: false,
             });
         }
     }
@@ -3430,19 +3479,21 @@ impl EditHost {
             // aware edits). Drained in `run_pending` (not `apply_lua_effects`) because
             // the accept keystroke queues no Lua, so `apply_lua_effects` may not run —
             // but `run_pending` always does, once, after every key.
-            // A `snippets`-source row's key is offset by `SNIPPET_COMPLETE_KEY_BASE`
-            // so it routes here (feature-agnostic — the engine is in core) rather than
-            // to the LSP applier; expand its body into the tabstop session.
-            if self
-                .editor
-                .complete_accept_request
-                .is_some_and(|key| key >= crate::snippet::SNIPPET_COMPLETE_KEY_BASE)
-            {
-                let key = self.editor.complete_accept_request.take().unwrap();
-                self.complete_snippet_accept(key - crate::snippet::SNIPPET_COMPLETE_KEY_BASE);
-            }
-            if let Some(key) = self.editor.complete_accept_request.take() {
-                self.complete_lsp_accept(key);
+            // Route the delegated key by its range (highest base first): a **plugin**
+            // `on_accept` row (`PLUGIN_ACCEPT_KEY_BASE`) runs its Lua callback; a
+            // `snippets`-source row (`SNIPPET_COMPLETE_KEY_BASE`, feature-agnostic —
+            // the engine is in core) expands its body into the tabstop session; a bare
+            // key is an `lsp` row whose `textEdit` the LSP applier applies.
+            if let Some(key) = self.editor.complete_accept_request {
+                self.editor.complete_accept_request.take();
+                if key >= crate::snippet::PLUGIN_ACCEPT_KEY_BASE {
+                    #[cfg(feature = "native")]
+                    self.complete_plugin_accept(key - crate::snippet::PLUGIN_ACCEPT_KEY_BASE);
+                } else if key >= crate::snippet::SNIPPET_COMPLETE_KEY_BASE {
+                    self.complete_snippet_accept(key - crate::snippet::SNIPPET_COMPLETE_KEY_BASE);
+                } else {
+                    self.complete_lsp_accept(key);
+                }
             }
             // The docs sidebar's lazy-docs fetch (Phase 4-D): when the highlighted
             // `lsp` row has unresolved docs, issue a `completionItem/resolve`. Like the

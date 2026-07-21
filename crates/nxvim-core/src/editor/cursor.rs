@@ -297,32 +297,21 @@ impl Editor {
     }
 
     /// `<C-e>` / `<C-y>`: scroll the viewport one line, keeping the cursor on its
-    /// buffer line unless the scroll pushes it within the `'scrolloff'` margin of the
-    /// edge — then pull it back to the margin boundary (`scrolloff` lines in from the
-    /// visible edge), at its remembered desired column. Placing it at the boundary
-    /// (rather than the edge) keeps the following [`ensure_visible`](Self::ensure_visible)
-    /// — which enforces the same margin — from fighting the scroll. Unlike
-    /// [`Self::scroll_by`] (`<C-d>`/`<C-f>`), the cursor does *not* travel with the
-    /// view while it stays outside the margin.
+    /// buffer line unless the scroll pushes it off-screen — then pull it to the
+    /// nearest visible edge (scrolloff is 0), at its remembered desired column.
+    /// Unlike [`Self::scroll_by`] (`<C-d>`/`<C-f>`), the cursor does *not* travel
+    /// with the view while it stays visible.
     pub(crate) fn scroll_line(&mut self, down: bool) {
         if !self.scroll_view_line(down) {
             return;
         }
-        let th = self.text_height();
-        let so = self
-            .windows
-            .cur()
-            .options
-            .scrolloff
-            .min(th.saturating_sub(1) / 2);
-        let top_edge = self.top + so;
-        let bottom = (self.top + th).saturating_sub(1).saturating_sub(so);
-        if self.cursor.line < top_edge {
-            self.cursor.line = top_edge.min(self.last_line());
+        let bottom = self.top + self.text_height() - 1;
+        if self.cursor.line < self.top {
+            self.cursor.line = self.top;
         } else if self.cursor.line > bottom {
             self.cursor.line = bottom.min(self.last_line());
         } else {
-            return; // cursor still outside the margin — leave it (and its curswant) put
+            return; // cursor still on screen — leave it (and its curswant) put
         }
         self.settle_desired_col(false);
         self.preserve_desired = true;
@@ -382,41 +371,15 @@ impl Editor {
 
     pub(crate) fn ensure_visible(&mut self) {
         let th = self.text_height();
-        // `'scrolloff'`: keep at least this many text rows above and below the cursor.
-        // Clamped to half the text height so a top *and* bottom margin can both fit
-        // (vim clamps the same way); `0` (the default) reduces every step below to the
-        // historical no-margin behavior.
-        let so = self
-            .windows
-            .cur()
-            .options
-            .scrolloff
-            .min(th.saturating_sub(1) / 2);
-
-        // The largest useful `top`: the last buffer line resting on the bottom text
-        // row. The bottom scrolloff margin is only honored while real content sits
-        // below the cursor to justify it — never scroll past this to open blank rows
-        // under end-of-file (vim pins the last line to the bottom edge and lets the
-        // cursor sit inside the margin there).
-        let max_top = self.scroll_top_for_bottom(self.last_line(), th);
-
-        // The band of acceptable `top` values that keeps the cursor `so` rows in from
-        // either text edge: `top_max` keeps `so` rows above it (else scroll up),
-        // `top_min` keeps `so` rows below it (else scroll down), capped by `max_top`.
-        // With `so == 0` this is exactly `[scroll_top_for_bottom(cursor, th),
-        // cursor.line]` — the historical bottom-scroll / cursor-above-top behavior.
-        let top_max = self.scroll_top_for_row_above(self.cursor.line, so);
-        let top_min = self
-            .scroll_top_for_bottom(self.cursor.line, th - so)
-            .min(max_top);
-        // Panic-safe clamp: a pathological `virt_lines` layout could invert the
-        // bounds, in which case keeping the cursor visible (the bottom target) wins.
-        self.top = if top_min <= top_max {
-            self.top.clamp(top_min, top_max)
-        } else {
-            top_min
-        };
-
+        if self.cursor.line < self.top {
+            self.top = self.cursor.line;
+        } else if self.cursor_screen_row() >= th {
+            // The cursor's text row fell off the bottom — pull `top` down (up the
+            // buffer) far enough that the cursor and every line above it (with their
+            // `virt_lines`) fit in `th` rows, leaving the cursor on the last row, as
+            // vim does. Without `virt_lines` this is exactly `top = cursor + 1 - th`.
+            self.top = self.scroll_top_for_bottom(self.cursor.line, th);
+        }
         // Horizontal scroll follows the cursor on the same beat as the vertical
         // one, so every motion that calls `ensure_visible` also keeps the cursor's
         // column on screen under `nowrap`.
@@ -557,38 +520,6 @@ impl Editor {
             if rows + p > th {
                 break;
             }
-            rows += p;
-            top = prev_top;
-        }
-        top
-    }
-
-    /// The largest `top` (≤ `target`) that keeps at least `above` screen rows above
-    /// the cursor's row on line `target` — the top-margin (`'scrolloff'`) analogue of
-    /// [`scroll_top_for_bottom`](Self::scroll_top_for_bottom). Walks up from `target`,
-    /// counting each preceding line's `virt_lines` and soft-wrap rows (a closed fold
-    /// as one row), until `above` rows have accumulated or the buffer top is reached.
-    /// With `above == 0` it returns `target` (the cursor on the top text row, no
-    /// margin) so a zero `scrolloff` leaves the historical behavior untouched.
-    fn scroll_top_for_row_above(&self, target: usize, above: usize) -> usize {
-        let buf = self.buffer();
-        let virt = buf.virt_lines_by_line();
-        // Rows already above the cursor within its own line: its `virt_lines_above`
-        // and the wrap segments preceding the cursor's segment.
-        let mut rows = virt.get(&target).map_or(0, |r| r.above.len()) + self.cursor_wrap_seg();
-        let mut top = target;
-        while rows < above && top > 0 {
-            let prev = top - 1;
-            // A closed fold above the cursor is one screen row (matching the folded
-            // rendering); step over its whole hidden range.
-            let (p, prev_top) = match self.collapsing_fold_at(prev) {
-                Some(f) => (1, f.start),
-                None => (
-                    self.line_text_rows(prev)
-                        + virt.get(&prev).map_or(0, |r| r.above.len() + r.below.len()),
-                    prev,
-                ),
-            };
             rows += p;
             top = prev_top;
         }

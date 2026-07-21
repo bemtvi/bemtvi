@@ -861,10 +861,11 @@ pub enum LoopOp {
 /// [`crate::LuaRuntime::set_buf_mirror`] before running Lua.
 ///
 /// Buffer mutations a config / plugin reaches: a buffer-local option write (`vim.bo`)
-/// and the buffer-*text* `set_lines` write (`nx.buf.set_lines` / `nvim_buf_set_lines`).
-/// Both are queued here and applied after the chunk (the Lua VM can't touch the live
-/// editor mid-chunk). The broader lifecycle surface (`set_text`, `nvim_create_buf`,
-/// `nvim_buf_delete`) is still absent — added when a real need lands.
+/// and the buffer-*text* writes — whole-line `set_lines` (`nx.buf.set_lines` /
+/// `nvim_buf_set_lines`) and precise-range `set_text` (`nx.buf.set_text` /
+/// `nvim_buf_set_text`). All are queued here and applied after the chunk (the Lua VM
+/// can't touch the live editor mid-chunk). The rest of the lifecycle surface
+/// (`nvim_create_buf`, `nvim_buf_delete`) is still absent — added when a real need lands.
 #[derive(Clone, Debug)]
 pub enum BufOp {
     /// `vim.bo[bufnr].<opt> = value` / `nvim_set_option_value(name, value, {buf})`
@@ -888,6 +889,22 @@ pub enum BufOp {
         bufnr: u64,
         start: usize,
         end: usize,
+        lines: Vec<String>,
+    },
+    /// `nx.buf.set_text(bufnr, sr, sc, er, ec, lines)` / `nvim_buf_set_text` — replace
+    /// the character range `(sr, sc)..(er, ec)` (0-based, end-exclusive, columns byte
+    /// offsets) with `lines` joined by `\n` (no trailing newline). The precise sub-line
+    /// counterpart of [`SetLines`](Self::SetLines); the Lua front validates the shape
+    /// (a list of newline-free strings, a modifiable buffer) synchronously and fails
+    /// loud, and the server applies it via
+    /// [`Editor::api_set_text`](nxvim_core::Editor::api_set_text), which fails loud on a
+    /// read-only buffer or an inverted span.
+    SetText {
+        bufnr: u64,
+        start_row: usize,
+        start_col: usize,
+        end_row: usize,
+        end_col: usize,
         lines: Vec<String>,
     },
 }
@@ -958,6 +975,11 @@ pub enum ExtmarkOp {
         hl_group: Option<String>,
         priority: u32,
         decor: Option<Box<VirtDecorData>>,
+        /// Anchor gravity (neovim's `right_gravity` / `end_right_gravity`; defaults
+        /// `true` / `false`). A plugin sets `false` / `true` for a range that grows
+        /// as text is typed into it — see [`nxvim_core::Extmark::right_gravity`].
+        right_gravity: bool,
+        end_right_gravity: bool,
     },
     /// Delete mark `(bufnr, ns, id)`.
     Del { bufnr: u64, ns: u32, id: u64 },
@@ -1189,6 +1211,20 @@ pub enum WindowOp {
     /// `line` is 0-based (the prelude converts neovim's 1-based row); `col` is the
     /// 0-based byte column.
     SetCursor { win: u64, line: usize, col: usize },
+    /// `nx.win.select_range(win, s_row, s_col, e_row, e_col, opts)` — enter Select
+    /// mode over the 0-based, end-exclusive byte range in window `win` (the P6
+    /// snippet-engine placeholder primitive; see [`Editor::select_range_in_window`]).
+    /// `escape_insert` picks where `<Esc>` lands: `true` keeps the default and parks in
+    /// Insert (`on_escape = "insert"`, the default), `false` keeps it and drops to
+    /// Normal (`on_escape = "normal"`, vim's `v_CTRL-G`).
+    SelectRange {
+        win: u64,
+        s_row: usize,
+        s_col: usize,
+        e_row: usize,
+        e_col: usize,
+        escape_insert: bool,
+    },
     /// `nx._jump_to(path, line, col[, mode])` — navigate to `path` and land the
     /// cursor at the 0-based `(line, col)` (byte column). The non-reloading
     /// navigation primitive behind `nx.picker.edit`'s located jump: unlike a
@@ -1831,6 +1867,12 @@ pub struct CompletePush {
     /// docs (`nx._complete_resolve(id)`) once the row is selected. `None` for an
     /// inline-doc / no-resolve row. Phase 4-E.
     pub resolve: Option<u64>,
+    /// Optional **on_accept handle** — set when this row's item carried an `on_accept`
+    /// callback. Its accept is delegated back to Lua (`nx._complete_run_accept(id, …)`)
+    /// rather than core splicing `insert`, so the callback owns the edit (a snippet
+    /// expansion over the trigger range, additionalTextEdits, …). `None` for a plain
+    /// literal-insert row.
+    pub accept: Option<u64>,
 }
 
 /// The preview target a picker push carries for one candidate, when the source

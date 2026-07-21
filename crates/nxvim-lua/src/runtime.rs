@@ -33,6 +33,12 @@ fn is_false(b: &bool) -> bool {
     !*b
 }
 
+/// Serde skip helper: omit a `true`-valued field (e.g. the default `right_gravity`),
+/// so only the non-default gravity rides the extmark-mirror wire.
+fn is_true(b: &bool) -> bool {
+    *b
+}
+
 /// `skip_serializing_if` predicate for the float's `win`: omit it when `0` (no
 /// parent), the sentinel the server uses for a non-`relative="win"` float.
 fn is_zero(n: &u64) -> bool {
@@ -96,13 +102,6 @@ pub struct WindowMirror {
     /// `numberwidth` — the minimum number-gutter width (so `vim.wo`/`vim.o` read it
     /// back).
     pub numberwidth: u64,
-    /// `'scrolloff'` — the vertical scroll margin kept above/below the cursor (so
-    /// `vim.wo`/`vim.o` read it back; the write path reaches the core through the
-    /// `nx._win_set_option` bridge like the other window options).
-    pub scrolloff: u64,
-    /// `'colorcolumn'` as its raw comma-separated column list (empty ⇒ no ruler),
-    /// for `vim.wo`/`vim.o` read-back.
-    pub colorcolumn: String,
     /// `signcolumn` in its string form (`no`/`auto`/`auto:1-3`/`yes`/`yes:2`),
     /// for `vim.wo`/`vim.o` read-back.
     pub signcolumn: String,
@@ -237,6 +236,15 @@ pub struct ExtmarkMirror {
     pub line_fill_text: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub line_fill_hl: Option<String>,
+    /// Anchor gravity — round-tripped so a `get_extmarks(details=true)` after the tick
+    /// surfaces the same flags the write-through stored. Only the *non-default* value
+    /// rides the wire (start defaults right-gravity `true`, end defaults left-gravity,
+    /// i.e. `end_right_gravity == false`); the Lua rebuilder fills the default when a
+    /// field is absent.
+    #[serde(skip_serializing_if = "is_true")]
+    pub right_gravity: bool,
+    #[serde(skip_serializing_if = "is_false")]
+    pub end_right_gravity: bool,
 }
 
 /// One highlight group's row in the Rust→Lua highlight mirror (`nx._hl_defs`),
@@ -1960,6 +1968,34 @@ impl LuaRuntime {
         let nx = self.nx()?;
         let run: mlua::Function = nx.get("_complete_resolve")?;
         run.call::<()>(lua_int(id as i64))
+    }
+
+    /// Run a plugin completion row's `on_accept` callback (P4): the server delegated
+    /// this row's accept (`nx._complete_run_accept`). The wrapper looks up the stored
+    /// `(on_accept, item)` for `id` and calls it with the item and a `ctx` carrying the
+    /// buffer and the trigger RANGE `(start_row, start_col)..(end_row, end_col)` to
+    /// replace (0-based, byte columns). The callback owns the edit; any buffer ops it
+    /// queues drain in the server's enclosing fixpoint. A no-op for an unknown / stale id.
+    #[allow(clippy::too_many_arguments)] // positional range; mirrors the on_bytes tuple shape
+    pub fn run_complete_accept(
+        &self,
+        id: u64,
+        buf: u64,
+        start_row: u64,
+        start_col: u64,
+        end_row: u64,
+        end_col: u64,
+    ) -> mlua::Result<()> {
+        let nx = self.nx()?;
+        let run: mlua::Function = nx.get("_complete_run_accept")?;
+        run.call::<()>((
+            lua_int(id as i64),
+            lua_int(buf as i64),
+            lua_int(start_row as i64),
+            lua_int(start_col as i64),
+            lua_int(end_row as i64),
+            lua_int(end_col as i64),
+        ))
     }
 
     /// Deliver the picker's outcome to the active source: the chosen item's

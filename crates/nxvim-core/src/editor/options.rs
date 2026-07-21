@@ -166,8 +166,8 @@ impl Editor {
                 }
                 let min = match name {
                     "tabstop" | "numberwidth" | "foldnestmax" => 1,
-                    "shiftwidth" | "sidescroll" | "sidescrolloff" | "scrolloff" | "foldcolumn"
-                    | "foldlevel" | "foldminlines" => 0,
+                    "shiftwidth" | "sidescroll" | "sidescrolloff" | "foldcolumn" | "foldlevel"
+                    | "foldminlines" => 0,
                     "softtabstop" => -1,
                     // A wiring gap (see `apply_set_bool`): a numeric option `resolve_set`
                     // accepted but no arm handles. Fail loud, never a silent no-op.
@@ -183,7 +183,6 @@ impl Editor {
                 match name {
                     "sidescroll" => self.windows.cur_mut().options.sidescroll = v as usize,
                     "sidescrolloff" => self.windows.cur_mut().options.sidescrolloff = v as usize,
-                    "scrolloff" => self.windows.cur_mut().options.scrolloff = v as usize,
                     "numberwidth" => self.windows.cur_mut().options.numberwidth = v as usize,
                     "foldcolumn" => self.windows.cur_mut().options.foldcolumn = v as usize,
                     // `foldlevel` re-derives which *computed* folds display closed; route
@@ -218,7 +217,6 @@ impl Editor {
                 let v: i64 = match name {
                     "sidescroll" => self.windows.cur().options.sidescroll as i64,
                     "sidescrolloff" => self.windows.cur().options.sidescrolloff as i64,
-                    "scrolloff" => self.windows.cur().options.scrolloff as i64,
                     "numberwidth" => self.windows.cur().options.numberwidth as i64,
                     "foldcolumn" => self.windows.cur().options.foldcolumn as i64,
                     "foldlevel" => self.windows.cur().options.foldlevel as i64,
@@ -551,22 +549,6 @@ impl Editor {
                 StrOp::Query => {
                     let v = self.windows.cur().options.breakindentopt.clone();
                     self.echo(format!("breakindentopt={v}"));
-                }
-            }
-            return;
-        }
-        // `colorcolumn` is window-local (like `showbreak`): the raw comma-separated
-        // ruler-column list. The value is stored verbatim (unmodeled `+N`/`-N` and
-        // junk entries are simply skipped when the projection resolves the columns —
-        // matching vim, which ignores bad entries rather than erroring). `&` clears
-        // the rulers; `?` echoes the raw list.
-        if name == "colorcolumn" {
-            match op {
-                StrOp::Set(value) => self.windows.cur_mut().options.colorcolumn = value,
-                StrOp::Reset => self.windows.cur_mut().options.colorcolumn.clear(),
-                StrOp::Query => {
-                    let v = self.windows.cur().options.colorcolumn.clone();
-                    self.echo(format!("colorcolumn={v}"));
                 }
             }
             return;

@@ -93,19 +93,6 @@ local O_WIN = {
   rnu = true,
   cursorline = true,
   cul = true,
-  -- Soft-wrap is a window option the core fully honors (`:set wrap` / `vim.wo.wrap`).
-  -- It has no abbreviation. Listed here so the `vim.o` / `vim.opt` surfaces forward
-  -- it to `vim.wo` (reaching the core) instead of warn-and-storing it as unmodeled.
-  wrap = true,
-  -- Vertical scroll margin (vim's `'scrolloff'`, abbrev `so`), the analogue of
-  -- `sidescrolloff`. Window-local in nxvim (like `sidescrolloff`); `vim.o.scrolloff`
-  -- forwards to the current window.
-  scrolloff = true,
-  so = true,
-  -- Column rulers (vim's `'colorcolumn'`, abbrev `cc`): a comma-separated column
-  -- list highlighted with the `ColorColumn` group. Window-local.
-  colorcolumn = true,
-  cc = true,
   numberwidth = true,
   nuw = true,
   signcolumn = true,
@@ -562,8 +549,6 @@ local OPT_LIST = {
   cpt = true,
   wildmode = true,
   wim = true,
-  colorcolumn = true,
-  cc = true,
 }
 local OPT_MAP = {
   listchars = true,
@@ -1092,10 +1077,6 @@ local WIN_OPT_CANON = {
   cursorline = "cursorline",
   cul = "cursorline",
   wrap = "wrap",
-  scrolloff = "scrolloff",
-  so = "scrolloff",
-  colorcolumn = "colorcolumn",
-  cc = "colorcolumn",
   -- A per-window override of the global `'scrollanim'`: `vim.wo[win].scrollanim = false`
   -- makes that window's scrolls snap (the side-by-side diff opts its panes out
   -- so a synced scroll doesn't desync). `vim.o.scrollanim` stays the global default.
@@ -1126,8 +1107,6 @@ local WIN_OPT_DEFAULT = {
   relativenumber = true,
   cursorline = false,
   wrap = false,
-  scrolloff = 0,
-  colorcolumn = "",
   scrollanim = true, -- resolved default before the mirror lands (global default is on)
   numberwidth = 4,
   signcolumn = "auto",
@@ -1471,6 +1450,10 @@ function nx._set_extmark_mirror(entries)
         hl_group = m.hl_group,
         priority = m.priority,
         decoration = decoration,
+        -- Only the non-default gravity rides the wire; fill the default when absent
+        -- (start defaults right-gravity `true`, end defaults left-gravity → `false`).
+        right_gravity = m.right_gravity ~= false,
+        end_right_gravity = m.end_right_gravity == true,
       }
     end
     marks[bufnr] = by_ns

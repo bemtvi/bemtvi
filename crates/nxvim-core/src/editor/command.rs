@@ -480,6 +480,8 @@ enum NormalCmd {
     ToggleCase,             // ~
     EnterVisual,            // v
     EnterVisualLine,        // V
+    EnterSelect(bool),      // gh / gH (Select mode; true = linewise)
+    ToggleVisualSelect,     // <C-g> (toggle Visual <-> Select, keeping the selection)
     VisualSwapEnds,         // o / O (move to other end of selection)
     ReselectVisual,         // gv (reselect the last Visual selection)
     EnterCommand,           // :
@@ -1191,6 +1193,10 @@ fn parse_step(mode: Mode, pending: &PendingCommand, key: Key) -> ParseStep {
             Some('0') => return Complete(ResolvedCommand::Motion(Motion::DisplayLineStart)),
             Some('^') => return Complete(ResolvedCommand::Motion(Motion::DisplayFirstNonBlank)),
             Some('$') => return Complete(ResolvedCommand::Motion(Motion::DisplayLineEnd)),
+            // `gh` / `gH` start Select mode (vim's charwise / linewise select) — the
+            // keyboard entry to the mode `nx.win.select_range` drives programmatically.
+            Some('h') => return Complete(ResolvedCommand::Normal(NormalCmd::EnterSelect(false))),
+            Some('H') => return Complete(ResolvedCommand::Normal(NormalCmd::EnterSelect(true))),
             // `gv` reselects the last Visual selection (its area *and* its
             // charwise/linewise shape), read back from the `` `< `` / `` `> ``
             // marks and the buffer's recorded last-visual kind.
@@ -1332,6 +1338,10 @@ fn parse_command(mode: Mode, pending: &PendingCommand, key: Key, gpending: bool)
             KeyCode::Char('o') if mode == Mode::Normal => Complete(RC::Normal(N::JumpBack)),
             KeyCode::Char('i') if mode == Mode::Normal => Complete(RC::Normal(N::JumpForward)),
             KeyCode::Char('^') | KeyCode::Char('6') => Complete(RC::Normal(N::AltBuffer)),
+            // `<C-g>` in Visual toggles to Select mode, keeping the selection (vim's
+            // Visual↔Select switch). In Normal it is left unbound (falls through to
+            // Reset), as the toggle only makes sense with a live selection.
+            KeyCode::Char('g') if mode.is_visual() => Complete(RC::Normal(N::ToggleVisualSelect)),
             _ => Reset,
         };
     }
@@ -2027,6 +2037,7 @@ impl Editor {
             Mode::Terminal => self.handle_terminal_key(key),
             Mode::Insert | Mode::Replace => self.handle_insert(key),
             Mode::Command => self.handle_command(key),
+            Mode::Select => self.handle_select(key),
             _ => self.handle_normal(key),
         }
     }
@@ -2039,6 +2050,14 @@ impl Editor {
         match self.mode {
             Mode::Insert | Mode::Replace => self.handle_insert(Key::new(KeyCode::Esc)),
             Mode::Visual | Mode::VisualLine => self.handle_normal(Key::new(KeyCode::Esc)),
+            // Select mode carries a live selection like Visual; crossing into a dock
+            // drops it back to Normal (its `<Esc>`-to-Insert is not what a *nav* cross
+            // wants — it should leave the buffer clean, like Visual's `<Esc>`).
+            Mode::Select => {
+                self.record_visual_marks();
+                self.mode = Mode::Normal;
+                self.clamp_cursor();
+            }
             // The `<Esc>` cancel is a `cmdline` keymap now, not a `handle_command`
             // arm, so close the line directly (this path never goes through the
             // matcher).
@@ -2327,6 +2346,27 @@ impl Editor {
                     self.begin_visual_anchors();
                 }
                 self.mode = Mode::Visual;
+            }
+            // `gh` / `gH`: start Select mode (the keyboard entry to the mode). From
+            // Normal (or on top of an existing selection) anchor at the cursor for a
+            // 1-wide selection, like `v`/`V` but Select; `<Esc>` defaults to Normal
+            // (vim's `v_CTRL-G`). `linewise` picks charwise (`gh`) vs linewise (`gH`).
+            NormalCmd::EnterSelect(linewise) => {
+                if !self.mode.is_visual() && self.mode != Mode::Select {
+                    self.visual_anchor = self.cursor;
+                    self.begin_visual_anchors();
+                }
+                self.select_linewise = linewise;
+                self.select_escape_insert = false;
+                self.mode = Mode::Select;
+            }
+            // `<C-g>`: toggle Visual → Select, keeping the current selection and its
+            // charwise/linewise shape (the Select → Visual half lives in
+            // `handle_select`). `<Esc>` from the toggled-in Select defaults to Normal.
+            NormalCmd::ToggleVisualSelect => {
+                self.select_linewise = self.mode == Mode::VisualLine;
+                self.select_escape_insert = false;
+                self.mode = Mode::Select;
             }
             NormalCmd::VisualSwapEnds => self.visual_swap_ends(),
             NormalCmd::ReselectVisual => self.reselect_visual(),

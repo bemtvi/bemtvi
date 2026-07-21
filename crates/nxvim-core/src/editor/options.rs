@@ -555,6 +555,22 @@ impl Editor {
             }
             return;
         }
+        // `colorcolumn` is window-local (like `showbreak`): the raw comma-separated
+        // ruler-column list. The value is stored verbatim (unmodeled `+N`/`-N` and
+        // junk entries are simply skipped when the projection resolves the columns —
+        // matching vim, which ignores bad entries rather than erroring). `&` clears
+        // the rulers; `?` echoes the raw list.
+        if name == "colorcolumn" {
+            match op {
+                StrOp::Set(value) => self.windows.cur_mut().options.colorcolumn = value,
+                StrOp::Reset => self.windows.cur_mut().options.colorcolumn.clear(),
+                StrOp::Query => {
+                    let v = self.windows.cur().options.colorcolumn.clone();
+                    self.echo(format!("colorcolumn={v}"));
+                }
+            }
+            return;
+        }
         // `fillchars` is window-local (like `showbreak`): the `key:char` list
         // choosing structural fill characters. nxvim honors only `eob` (the
         // end-of-buffer `~` filler) today, but the whole value is validated so a

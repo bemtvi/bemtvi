@@ -102,6 +102,10 @@ local O_WIN = {
   -- forwards to the current window.
   scrolloff = true,
   so = true,
+  -- Column rulers (vim's `'colorcolumn'`, abbrev `cc`): a comma-separated column
+  -- list highlighted with the `ColorColumn` group. Window-local.
+  colorcolumn = true,
+  cc = true,
   numberwidth = true,
   nuw = true,
   signcolumn = true,
@@ -558,6 +562,8 @@ local OPT_LIST = {
   cpt = true,
   wildmode = true,
   wim = true,
+  colorcolumn = true,
+  cc = true,
 }
 local OPT_MAP = {
   listchars = true,
@@ -1088,6 +1094,8 @@ local WIN_OPT_CANON = {
   wrap = "wrap",
   scrolloff = "scrolloff",
   so = "scrolloff",
+  colorcolumn = "colorcolumn",
+  cc = "colorcolumn",
   -- A per-window override of the global `'scrollanim'`: `vim.wo[win].scrollanim = false`
   -- makes that window's scrolls snap (the side-by-side diff opts its panes out
   -- so a synced scroll doesn't desync). `vim.o.scrollanim` stays the global default.
@@ -1119,6 +1127,7 @@ local WIN_OPT_DEFAULT = {
   cursorline = false,
   wrap = false,
   scrolloff = 0,
+  colorcolumn = "",
   scrollanim = true, -- resolved default before the mirror lands (global default is on)
   numberwidth = 4,
   signcolumn = "auto",

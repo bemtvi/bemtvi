@@ -1949,6 +1949,7 @@ impl EditHost {
                     scrollanim: opts.scrollanim.unwrap_or(global_scrollanim),
                     numberwidth: opts.numberwidth as u64,
                     scrolloff: opts.scrolloff as u64,
+                    colorcolumn: opts.colorcolumn.clone(),
                     signcolumn: opts.signcolumn.to_string(),
                     fillchars: opts.fillchars.clone(),
                     padding: opts.padding.to_string(),

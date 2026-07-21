@@ -581,6 +581,17 @@ impl EditHost {
                 Value::from(win.relativenumber),
             ),
             (Value::from("cursorline"), Value::from(win.cursorline)),
+            // `'colorcolumn'`: the 1-based text columns painted with the `ColorColumn`
+            // group (a vertical ruler). Empty array unless the option is set.
+            (
+                Value::from("colorcolumn"),
+                Value::Array(
+                    win.colorcolumn
+                        .iter()
+                        .map(|&c| Value::from(c as u64))
+                        .collect(),
+                ),
+            ),
             (
                 Value::from("number_width"),
                 Value::from(win.number_width as u64),
@@ -1183,6 +1194,7 @@ const CHROME: &[(&str, &str)] = &[
     ("line_nr", "LineNr"),
     ("cursor_line_nr", "CursorLineNr"),
     ("cursorline", "CursorLine"),
+    ("colorcolumn", "ColorColumn"),
     ("visual", "Visual"),
     ("search", "Search"),
     ("incsearch", "IncSearch"),

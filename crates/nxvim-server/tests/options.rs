@@ -378,3 +378,48 @@ async fn scrolloff_round_trips_through_set_and_vim_o() {
         "vim.opt.so = 3 reaches the core, got {echo:?}"
     );
 }
+
+/// `'colorcolumn'` (abbrev `cc`) is a modeled window option: `:set colorcolumn=`,
+/// `vim.o.colorcolumn`, and `vim.opt.colorcolumn` all reach the core and read back,
+/// without the unknown-option warning. (The ruler *rendering* is covered by the TUI
+/// paint tests and the projection test; this pins the option plumbing.)
+#[tokio::test]
+async fn colorcolumn_round_trips_through_set_and_vim_o() {
+    let (rpc, mut incoming) = start().await;
+
+    // Defaults empty (no ruler), readable through the `:set …?` echo.
+    let echo = set_message(&rpc, &mut incoming, "colorcolumn?").await;
+    assert!(
+        echo.contains("colorcolumn="),
+        "colorcolumn defaults empty, got {echo:?}"
+    );
+
+    // A write through `vim.o` must not warn and must reach the core.
+    exec_lua(&rpc, "vim.o.colorcolumn = '80,120'").await;
+    rpc.request("nvim_get_mode", vec![]).await.expect("barrier");
+    let frame = drain_to_latest_redraw(&mut incoming, |_| true).expect("a redraw arrived");
+    assert!(
+        !message(&frame).to_lowercase().contains("unknown option"),
+        "vim.o.colorcolumn must not warn, got {:?}",
+        message(&frame)
+    );
+    let echo = set_message(&rpc, &mut incoming, "colorcolumn?").await;
+    assert!(
+        echo.contains("colorcolumn=80,120"),
+        "vim.o.colorcolumn reaches the core, got {echo:?}"
+    );
+    assert_eq!(
+        exec_lua(&rpc, "return vim.wo.colorcolumn").await.as_str(),
+        Some("80,120"),
+        "vim.wo.colorcolumn reads the core value back"
+    );
+
+    // The `cc` abbreviation and the rich `vim.opt` (list) surface reach the same
+    // slot — a Lua array encodes to the comma string.
+    exec_lua(&rpc, "vim.opt.cc = { 100 }").await;
+    let echo = set_message(&rpc, &mut incoming, "colorcolumn?").await;
+    assert!(
+        echo.contains("colorcolumn=100"),
+        "vim.opt.cc = {{100}} reaches the core, got {echo:?}"
+    );
+}

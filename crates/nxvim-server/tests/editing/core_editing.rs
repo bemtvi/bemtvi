@@ -995,3 +995,104 @@ async fn visual_d_on_an_empty_line_deletes_the_line_break() {
     feed(&rpc, "2ggvd");
     assert_eq!(lines(&rpc).await, vec!["a", "b"]);
 }
+
+// ---- `i_CTRL-O`: one Normal command from Insert, then resume Insert ----------
+
+#[tokio::test]
+async fn insert_ctrl_o_runs_one_motion_then_resumes_insert() {
+    // `<C-o>` from Insert drops to Normal for exactly one command; here a `$`
+    // motion, which resumes Insert *after* the last char (ready to append).
+    let (rpc, _incoming) = start(None).await;
+    feed(&rpc, "ihello<Esc>0i"); // insert at column 0 of "hello"
+    feed(&rpc, "<C-o>$");
+    feed(&rpc, "!");
+    assert_eq!(lines(&rpc).await, vec!["hello!"]);
+    assert_eq!(
+        mode(&rpc).await,
+        "i",
+        "we are back in Insert after the one command"
+    );
+}
+
+#[tokio::test]
+async fn insert_ctrl_o_reports_ni_insert_until_the_command_completes() {
+    // While the one-shot is pending, `mode()` reports `niI` (Normal-for-one,
+    // resuming Insert) — not a plain `n`; the command settles it back to `i`.
+    let (rpc, _incoming) = start(None).await;
+    feed(&rpc, "iab<Esc>A"); // append at end of "ab"
+    feed(&rpc, "<C-o>");
+    assert_eq!(mode(&rpc).await, "niI", "insert-normal reports niI");
+    feed(&rpc, "0"); // the one command (a motion to column 0)
+    assert_eq!(mode(&rpc).await, "i", "resumed Insert once the command ran");
+    feed(&rpc, "X");
+    assert_eq!(lines(&rpc).await, vec!["Xab"]);
+}
+
+#[tokio::test]
+async fn insert_ctrl_o_edit_deletes_then_resumes_the_same_session() {
+    // A one-shot *edit* (`x`) runs and then hands input straight back to the
+    // interrupted Insert session at the cursor's new position.
+    let (rpc, _incoming) = start(None).await;
+    feed(&rpc, "ihello<Esc>0i"); // insert at column 0
+    feed(&rpc, "<C-o>x"); // delete the 'h', back to Insert at column 0
+    feed(&rpc, "Z");
+    assert_eq!(lines(&rpc).await, vec!["Zello"]);
+    assert_eq!(mode(&rpc).await, "i");
+}
+
+#[tokio::test]
+async fn insert_ctrl_o_spans_an_operator_motion() {
+    // The "one command" is a whole operator+motion (`dw`), which unfolds across
+    // two keystrokes before Insert resumes — the flag stays armed until it settles.
+    let (rpc, _incoming) = start(None).await;
+    feed(&rpc, "ifoo bar<Esc>0i"); // insert at column 0 of "foo bar"
+    feed(&rpc, "<C-o>dw"); // delete "foo ", resume Insert at column 0
+    feed(&rpc, "X");
+    assert_eq!(lines(&rpc).await, vec!["Xbar"]);
+    assert_eq!(mode(&rpc).await, "i");
+}
+
+#[tokio::test]
+async fn insert_ctrl_o_dd_deletes_the_line_then_resumes_insert() {
+    let (rpc, _incoming) = start(None).await;
+    feed(&rpc, "ifoo<Esc>obar<Esc>I"); // two lines, insert at start of "bar"
+    feed(&rpc, "<C-o>dd"); // delete "bar", land on "foo", resume Insert
+    feed(&rpc, "X");
+    assert_eq!(lines(&rpc).await, vec!["Xfoo"]);
+    assert_eq!(mode(&rpc).await, "i");
+}
+
+#[tokio::test]
+async fn insert_ctrl_o_open_line_stays_in_insert_without_a_second_shot() {
+    // When the one-shot command enters Insert on its own (`o`), the pending
+    // return is simply consumed — you keep typing, and a later Normal command
+    // does *not* wrongly bounce back into Insert.
+    let (rpc, _incoming) = start(None).await;
+    feed(&rpc, "ifoo<Esc>A"); // append at end of "foo"
+    feed(&rpc, "<C-o>obar"); // open a line below and type into it
+    assert_eq!(lines(&rpc).await, vec!["foo", "bar"]);
+    assert_eq!(mode(&rpc).await, "i");
+    // Leaving Insert and running a plain Normal command must stay in Normal —
+    // proving the one-shot flag was not left dangling.
+    feed(&rpc, "<Esc>x");
+    assert_eq!(mode(&rpc).await, "n");
+    assert_eq!(lines(&rpc).await, vec!["foo", "ba"]);
+}
+
+#[tokio::test]
+async fn replace_ctrl_o_resumes_replace_not_insert() {
+    // From Replace mode, `<C-o>` returns to Replace (reported `niR`), not Insert.
+    let (rpc, _incoming) = start(None).await;
+    feed(&rpc, "ihello<Esc>0R"); // Replace mode at column 0
+    assert_eq!(mode(&rpc).await, "R");
+    feed(&rpc, "<C-o>");
+    assert_eq!(
+        mode(&rpc).await,
+        "niR",
+        "insert-normal from Replace reports niR"
+    );
+    feed(&rpc, "l"); // one motion command
+    assert_eq!(mode(&rpc).await, "R", "resumed Replace, not Insert");
+    feed(&rpc, "X"); // overtypes rather than inserts
+    assert_eq!(lines(&rpc).await, vec!["hXllo"]);
+}

@@ -284,6 +284,18 @@ impl Editor {
             // `<C-r>` arms register insertion: the next keystroke (handled at the
             // top of this fn) names the register to pull in.
             KeyCode::Char('r') if key.ctrl => self.awaiting_register = true,
+            // `i_CTRL-O`: drop to Normal for exactly one command, then resume Insert
+            // here. Remember the insert flavour (Insert / Replace) to return to; the
+            // resume happens in [`Editor::input`] once the one-shot command settles.
+            // Unlike `<Esc>` there is no cursor backstep — the command acts from the
+            // current insert position, and an EOL-append column survives via the
+            // `insert_normal` allowance in `clamp_cursor`.
+            KeyCode::Char('o') if key.ctrl => {
+                self.end_snippet();
+                self.close_completion();
+                self.insert_normal = Some(self.mode);
+                self.mode = Mode::Normal;
+            }
             // A typed character lands at every cursor (the primary and any
             // secondary multi-cursors); with none, `for_each_cursor` is just the
             // single-cursor insert. The `".` last-insert register records the

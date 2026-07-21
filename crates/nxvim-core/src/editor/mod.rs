@@ -736,6 +736,14 @@ pub struct Editor {
     /// Drained by [`Editor::materialize_pending_jumplist`].
     pending_jumplist: Vec<(PathBuf, usize, usize)>,
     pub mode: Mode,
+    /// `i_CTRL-O` one-shot: while `Some`, the editor is in "insert-normal" — it left
+    /// Insert (or Replace) for exactly one Normal-mode command and must resume the
+    /// stored mode the moment that command settles at a clean Normal boundary. The
+    /// value is the mode to return to ([`Mode::Insert`] or [`Mode::Replace`]).
+    /// `None` the rest of the time. Consulted by [`Editor::mode_code`] (reports
+    /// `niI`/`niR`) and [`Editor::clamp_cursor`] (keeps the EOL-append column, like
+    /// `virtualedit=onemore`, so returning to Insert lands past the last char).
+    pub(crate) insert_normal: Option<Mode>,
     pub cursor: Cursor,
     /// First visible buffer line (vertical scroll offset).
     pub top: usize,
@@ -1543,6 +1551,31 @@ impl Editor {
         Editor::with_buffer(Buffer::empty())
     }
 
+    /// The `mode()` short code for `nvim_get_mode`, accounting for the `i_CTRL-O`
+    /// one-shot: while an insert-normal command is pending, vim reports `niI` / `niR`
+    /// (Normal for one command, then resuming Insert / Replace), not a plain `n`. The
+    /// keymap engine still selects the Normal trie off the raw [`Mode`] enum, so a
+    /// `<C-o>`-launched command uses Normal-mode maps.
+    pub fn mode_code(&self) -> &'static str {
+        match self.insert_normal {
+            Some(Mode::Replace) => "niR",
+            Some(_) => "niI",
+            None => self.mode.short_code(),
+        }
+    }
+
+    /// The uppercase status-line mode label, accounting for the `i_CTRL-O` one-shot:
+    /// vim shows `-- (insert) --` / `-- (replace) --` while a single Normal command
+    /// runs from Insert. The enum is [`Mode::Normal`] then, so [`Mode::label`] alone
+    /// would read `NORMAL` and hide the fact that Insert resumes next.
+    pub fn mode_label(&self) -> &'static str {
+        match self.insert_normal {
+            Some(Mode::Replace) => "(REPLACE)",
+            Some(_) => "(INSERT)",
+            None => self.mode.label(),
+        }
+    }
+
     /// Install the filesystem backend the editor reads/writes through. The server
     /// can hand over a remote (daemon-backed) [`HostFs`]; the default is the local
     /// [`StdHostFs`]. Mirrors [`Editor::set_syntax_engine`] / [`Editor::set_clipboard`].
@@ -1661,6 +1694,7 @@ impl Editor {
             pending_folds: HashMap::new(),
             pending_jumplist: Vec::new(),
             mode: Mode::Normal,
+            insert_normal: None,
             cursor: Cursor::default(),
             top: 0,
             leftcol: 0,
@@ -2052,6 +2086,31 @@ impl Editor {
         // `handle_insert` calls grow `insert_text` from empty.
         if matches!(self.mode, Mode::Insert | Mode::Replace) && !was_insert {
             self.insert_text.clear();
+        }
+
+        // `i_CTRL-O`: resume the interrupted insert session once the one-shot Normal
+        // command has settled. `!was_insert` skips the `<C-o>` keystroke itself
+        // (which armed the flag *from* Insert); a command still unfolding across
+        // keystrokes (operator-pending, visual, cmdline) stays armed until it either
+        // returns to a clean Normal boundary — resume the stored Insert/Replace — or
+        // enters Insert on its own (`o`/`a`/`cc`/…), which simply consumes the flag.
+        // Runs before the dot-repeat `done` check below so the completing keystroke
+        // isn't mistaken for the end of the change: the insert session continues.
+        if self.insert_normal.is_some() && !was_insert {
+            if self.mode.is_insert() {
+                self.insert_normal = None;
+            } else if self.mode == Mode::Normal && self.pending.is_clean() {
+                self.mode = self.insert_normal.take().expect("armed above");
+                // `<C-o>$` resumes Insert *after* the last char, ready to append: the
+                // `$` motion itself lands *on* the last char (Normal's EOL), but the
+                // pending eol-request means the user asked for the line end, so honour
+                // it in Insert terms (one past). Now that `mode` is Insert again,
+                // `clamp_cursor` permits the append column.
+                if self.eol_request {
+                    self.cursor.col = self.line_len();
+                }
+                self.clamp_cursor();
+            }
         }
 
         if recording {

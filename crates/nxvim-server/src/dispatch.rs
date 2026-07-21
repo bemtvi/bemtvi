@@ -228,7 +228,7 @@ impl EditHost {
             }
             "nvim_get_mode" => Ok(Value::Map(vec![(
                 Value::from("mode"),
-                Value::from(self.editor.mode.short_code()),
+                Value::from(self.editor.mode_code()),
             )])),
             // ----- windows --------------------------------------------------
             "nvim_list_wins" => Ok(Value::Array(

@@ -692,7 +692,7 @@ impl View {
             current_tab: ed.current_tab_index(),
             region_tablines: ed.region_tablines(),
             separators: ed.all_separators(),
-            mode_label: ed.mode.label().to_string(),
+            mode_label: ed.mode_label().to_string(),
             command_mode: ed.mode == Mode::Command,
             pending_replace: ed.pending_replace(),
             cmdline: ed.cmdline.clone(),

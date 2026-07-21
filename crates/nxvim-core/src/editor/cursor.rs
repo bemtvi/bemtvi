@@ -251,8 +251,14 @@ impl Editor {
         let len = self.line_len();
         // Insert mode and terminal-job mode both let the cursor sit one past the last
         // char — in a terminal that "next write position" is exactly where the child's
-        // cursor is (after the last typed char), not on top of it.
-        let max_col = if self.mode.is_insert() || self.mode == crate::mode::Mode::Terminal {
+        // cursor is (after the last typed char), not on top of it. An `i_CTRL-O`
+        // one-shot (`insert_normal`) does too, behaving like `virtualedit=onemore` so
+        // an EOL-append column survives the Normal command and resuming Insert lands
+        // past the last char.
+        let max_col = if self.mode.is_insert()
+            || self.mode == crate::mode::Mode::Terminal
+            || self.insert_normal.is_some()
+        {
             len
         } else {
             len.saturating_sub(1)

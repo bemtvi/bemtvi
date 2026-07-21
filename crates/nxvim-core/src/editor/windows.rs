@@ -1418,6 +1418,14 @@ impl Editor {
         let w = t.get_mut(id);
         if name == "numberwidth" {
             w.options.numberwidth = value.max(1) as usize;
+        } else if name == "scrolloff" {
+            w.options.scrolloff = value.max(0) as usize;
+            // Re-apply the viewport margin immediately when this is the focused
+            // window (the `w`/`t` borrows end at the assignment above), so raising
+            // `scrolloff` scrolls the cursor into the band without waiting for a move.
+            if self.windows.current == id {
+                self.ensure_visible();
+            }
         } else if name == "foldcolumn" {
             w.options.foldcolumn = value.max(0) as usize;
         } else if name == "foldlevel" {

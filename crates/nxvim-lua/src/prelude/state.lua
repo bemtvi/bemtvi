@@ -93,6 +93,15 @@ local O_WIN = {
   rnu = true,
   cursorline = true,
   cul = true,
+  -- Soft-wrap is a window option the core fully honors (`:set wrap` / `vim.wo.wrap`).
+  -- It has no abbreviation. Listed here so the `vim.o` / `vim.opt` surfaces forward
+  -- it to `vim.wo` (reaching the core) instead of warn-and-storing it as unmodeled.
+  wrap = true,
+  -- Vertical scroll margin (vim's `'scrolloff'`, abbrev `so`), the analogue of
+  -- `sidescrolloff`. Window-local in nxvim (like `sidescrolloff`); `vim.o.scrolloff`
+  -- forwards to the current window.
+  scrolloff = true,
+  so = true,
   numberwidth = true,
   nuw = true,
   signcolumn = true,
@@ -1077,6 +1086,8 @@ local WIN_OPT_CANON = {
   cursorline = "cursorline",
   cul = "cursorline",
   wrap = "wrap",
+  scrolloff = "scrolloff",
+  so = "scrolloff",
   -- A per-window override of the global `'scrollanim'`: `vim.wo[win].scrollanim = false`
   -- makes that window's scrolls snap (the side-by-side diff opts its panes out
   -- so a synced scroll doesn't desync). `vim.o.scrollanim` stays the global default.
@@ -1107,6 +1118,7 @@ local WIN_OPT_DEFAULT = {
   relativenumber = true,
   cursorline = false,
   wrap = false,
+  scrolloff = 0,
   scrollanim = true, -- resolved default before the mirror lands (global default is on)
   numberwidth = 4,
   signcolumn = "auto",

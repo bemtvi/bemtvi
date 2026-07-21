@@ -61,6 +61,8 @@ mod padding;
 mod registers;
 #[path = "editing/rendering.rs"]
 mod rendering;
+#[path = "editing/scrolloff.rs"]
+mod scrolloff;
 #[path = "editing/search.rs"]
 mod search;
 #[path = "editing/shift.rs"]

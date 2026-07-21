@@ -96,6 +96,10 @@ pub struct WindowMirror {
     /// `numberwidth` — the minimum number-gutter width (so `vim.wo`/`vim.o` read it
     /// back).
     pub numberwidth: u64,
+    /// `'scrolloff'` — the vertical scroll margin kept above/below the cursor (so
+    /// `vim.wo`/`vim.o` read it back; the write path reaches the core through the
+    /// `nx._win_set_option` bridge like the other window options).
+    pub scrolloff: u64,
     /// `signcolumn` in its string form (`no`/`auto`/`auto:1-3`/`yes`/`yes:2`),
     /// for `vim.wo`/`vim.o` read-back.
     pub signcolumn: String,

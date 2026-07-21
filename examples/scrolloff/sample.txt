@@ -1,0 +1,62 @@
+scrolloff demo — this buffer is deliberately taller than your window.
+Hold j to fall down it and watch the viewport scroll 8 lines EARLY, so
+you always see what is coming.  Press G to leap to the very last line.
+
+This is a long paragraph line, wider than the window, kept here so that after :Wrap you can see soft-wrap lay it across several screen rows instead of clipping it and panning the viewport sideways the way nowrap does — move onto it with j and then press $ to feel the difference between the two modes.
+
+line 05 — keep pressing j; the window slides once the cursor is 8 rows from the edge
+line 06 — keep pressing j; the window slides once the cursor is 8 rows from the edge
+line 07 — keep pressing j; the window slides once the cursor is 8 rows from the edge
+line 08 — keep pressing j; the window slides once the cursor is 8 rows from the edge
+line 09 — keep pressing j; the window slides once the cursor is 8 rows from the edge
+line 10 — keep pressing j; the window slides once the cursor is 8 rows from the edge
+line 11 — keep pressing j; the window slides once the cursor is 8 rows from the edge
+line 12 — keep pressing j; the window slides once the cursor is 8 rows from the edge
+line 13 — keep pressing j; the window slides once the cursor is 8 rows from the edge
+line 14 — keep pressing j; the window slides once the cursor is 8 rows from the edge
+line 15 — keep pressing j; the window slides once the cursor is 8 rows from the edge
+line 16 — keep pressing j; the window slides once the cursor is 8 rows from the edge
+line 17 — keep pressing j; the window slides once the cursor is 8 rows from the edge
+line 18 — keep pressing j; the window slides once the cursor is 8 rows from the edge
+line 19 — keep pressing j; the window slides once the cursor is 8 rows from the edge
+line 20 — keep pressing j; the window slides once the cursor is 8 rows from the edge
+line 21 — keep pressing j; the window slides once the cursor is 8 rows from the edge
+line 22 — keep pressing j; the window slides once the cursor is 8 rows from the edge
+line 23 — keep pressing j; the window slides once the cursor is 8 rows from the edge
+line 24 — keep pressing j; the window slides once the cursor is 8 rows from the edge
+line 25 — keep pressing j; the window slides once the cursor is 8 rows from the edge
+line 26 — keep pressing j; the window slides once the cursor is 8 rows from the edge
+line 27 — keep pressing j; the window slides once the cursor is 8 rows from the edge
+line 28 — keep pressing j; the window slides once the cursor is 8 rows from the edge
+line 29 — keep pressing j; the window slides once the cursor is 8 rows from the edge
+line 30 — keep pressing j; the window slides once the cursor is 8 rows from the edge
+line 31 — keep pressing j; the window slides once the cursor is 8 rows from the edge
+line 32 — keep pressing j; the window slides once the cursor is 8 rows from the edge
+line 33 — keep pressing j; the window slides once the cursor is 8 rows from the edge
+line 34 — keep pressing j; the window slides once the cursor is 8 rows from the edge
+line 35 — keep pressing j; the window slides once the cursor is 8 rows from the edge
+line 36 — keep pressing j; the window slides once the cursor is 8 rows from the edge
+line 37 — keep pressing j; the window slides once the cursor is 8 rows from the edge
+line 38 — keep pressing j; the window slides once the cursor is 8 rows from the edge
+line 39 — keep pressing j; the window slides once the cursor is 8 rows from the edge
+line 40 — keep pressing j; the window slides once the cursor is 8 rows from the edge
+line 41 — keep pressing j; the window slides once the cursor is 8 rows from the edge
+line 42 — keep pressing j; the window slides once the cursor is 8 rows from the edge
+line 43 — keep pressing j; the window slides once the cursor is 8 rows from the edge
+line 44 — keep pressing j; the window slides once the cursor is 8 rows from the edge
+line 45 — keep pressing j; the window slides once the cursor is 8 rows from the edge
+line 46 — keep pressing j; the window slides once the cursor is 8 rows from the edge
+line 47 — keep pressing j; the window slides once the cursor is 8 rows from the edge
+line 48 — keep pressing j; the window slides once the cursor is 8 rows from the edge
+line 49 — keep pressing j; the window slides once the cursor is 8 rows from the edge
+line 50 — keep pressing j; the window slides once the cursor is 8 rows from the edge
+line 51 — keep pressing j; the window slides once the cursor is 8 rows from the edge
+line 52 — keep pressing j; the window slides once the cursor is 8 rows from the edge
+line 53 — keep pressing j; the window slides once the cursor is 8 rows from the edge
+line 54 — keep pressing j; the window slides once the cursor is 8 rows from the edge
+line 55 — keep pressing j; the window slides once the cursor is 8 rows from the edge
+line 56 — keep pressing j; the window slides once the cursor is 8 rows from the edge
+line 57 — keep pressing j; the window slides once the cursor is 8 rows from the edge
+line 58 — keep pressing j; the window slides once the cursor is 8 rows from the edge
+line 59 — keep pressing j; the window slides once the cursor is 8 rows from the edge
+line 60 — keep pressing j; the window slides once the cursor is 8 rows from the edge

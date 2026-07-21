@@ -4,10 +4,58 @@
 //! runtime; here we hand `mask_segments` the byte ranges directly and check it holds
 //! the grid by substituting cell-width spaces.)
 
-use nxvim_gui::{mask_segments, Seg};
+use nxvim_gui::{mask_segments, offgrid_clusters, Seg};
 
 fn seg(text: &str, fg: u32) -> Seg {
     Seg::plain(text.to_string(), fg)
+}
+
+// `offgrid_clusters(text, glyphs)` decides which grapheme clusters the renderer must
+// mask to spaces (and redraw separately) because the font's shaped advance disagrees
+// with the editor's display-width grid. `glyphs` is `(start_byte, advance_in_cells)`.
+
+#[test]
+fn flags_a_wide_grapheme_whose_glyph_snapped_narrow() {
+    // "❤️" (U+2764 U+FE0F) is display-width 2, but a monospace font renders its base
+    // as a single-cell dingbat and cosmic-text splits off the VS16 as a zero-advance
+    // glyph. The cluster's total advance (1) disagrees with its width (2), so it must
+    // be flagged — else the text after it slides a cell left of the 2-cell cursor.
+    let heart = "\u{2764}\u{FE0F}"; // bytes 0..6
+    let glyphs = [(0usize, 1.0f32), (3usize, 0.0f32)];
+    assert_eq!(offgrid_clusters(heart, &glyphs), vec![(0, 6)]);
+}
+
+#[test]
+fn flags_a_narrow_grapheme_whose_glyph_is_double_wide() {
+    // The mirror case: a width-1 symbol (a Powerline separator, U+E0B0) that a fallback
+    // font draws two cells wide. Advance 2 ≠ width 1 → flag it, so it doesn't shove the
+    // rest of the line a cell right.
+    let sep = "\u{E0B0}"; // bytes 0..3, display width 1
+    let glyphs = [(0usize, 2.0f32)];
+    assert_eq!(offgrid_clusters(sep, &glyphs), vec![(0, 3)]);
+}
+
+#[test]
+fn leaves_a_correctly_snapped_wide_grapheme_inline() {
+    // A CJK char whose glyph snapped to two cells matches its width — stays inline.
+    let cjk = "\u{4F60}"; // 你, bytes 0..3, width 2
+    let glyphs = [(0usize, 2.0f32)];
+    assert!(offgrid_clusters(cjk, &glyphs).is_empty());
+}
+
+#[test]
+fn leaves_ascii_inline() {
+    let glyphs = [(0usize, 1.0f32), (1, 1.0), (2, 1.0)];
+    assert!(offgrid_clusters("abc", &glyphs).is_empty());
+}
+
+#[test]
+fn flags_an_emoji_with_a_fractional_advance() {
+    // A colour-emoji glyph from a non-monospace font keeps its native (unsnapped)
+    // advance — 1.6 cells here — which is neither its width (2) nor a whole number.
+    let grin = "\u{1F600}"; // 😀, bytes 0..4, width 2
+    let glyphs = [(0usize, 1.6f32)];
+    assert_eq!(offgrid_clusters(grin, &glyphs), vec![(0, 4)]);
 }
 
 #[test]

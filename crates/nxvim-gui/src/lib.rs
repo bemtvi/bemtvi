@@ -58,7 +58,7 @@ pub use render::{inlay_shift, splice_inlay, Seg, DEFAULT_INLAY};
 pub use render::{col_to_screen, group_fallback, rect_subtract, row_segments, text_run_origin};
 // The wide-glyph mask (replace an off-grid emoji cluster with cell-width spaces), so
 // the Tier-1 `wide` test can exercise it without shaping / a GPU.
-pub use render::mask_segments;
+pub use render::{mask_segments, offgrid_clusters};
 // The pure caret-cell math for the command line and the picker prompt (char-offset
 // wire fields → display-width cells), exported for the Tier-1 `caret` test.
 pub use render::{cmdline_caret_col, query_caret_col};

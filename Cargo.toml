@@ -118,17 +118,18 @@ libc = "=0.2.186"
 # Native GUI client stack (`nxvim-gui`). winit owns the window + input event loop,
 # wgpu the GPU surface, and glyphon the text rendering (it re-exports cosmic-text,
 # so the GUI reaches `FontSystem`/`Buffer`/`Attrs`/… through `glyphon::`). glyphon
-# 0.9 builds against wgpu 25 — bump the two together. `pollster` blocks on wgpu's
+# 0.11 builds against wgpu 29 — bump the two together (glyphon 0.12 wants wgpu 30
+# but is newer than our 2-week-old dependency floor). `pollster` blocks on wgpu's
 # async device/adapter requests from the synchronous winit setup path.
 winit = "=0.30.13"
-wgpu = "=25.0.2"
-glyphon = "=0.9.0"
+wgpu = "=29.0.4"
+glyphon = "=0.11.0"
 # Pulled in directly (same instance glyphon uses) only to enable `monospace_fallback`:
 # without it cosmic-text's `Buffer::set_monospace_width` is a silent no-op, so wide
 # (CJK/emoji) glyphs keep their font-native advance — not snapped to two cells — and
 # the text after them drifts off the cell grid. The feature lets the shaper scale each
-# glyph to a whole number of cells. Version must match glyphon's `cosmic-text` (0.14).
-cosmic-text = { version = "=0.14.2", features = ["monospace_fallback"] }
+# glyph to a whole number of cells. Version must match glyphon's `cosmic-text` (0.18).
+cosmic-text = { version = "=0.18.2", features = ["monospace_fallback"] }
 pollster = "=0.4.0"
 # Native system file dialog for the GUI's `:eo`/`:wn`/… pickers — all three
 # desktop platforms, no GTK: NSOpenPanel on macOS, the Win32 `IFileDialog` on

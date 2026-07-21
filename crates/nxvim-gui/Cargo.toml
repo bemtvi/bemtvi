@@ -33,6 +33,10 @@ unicode-script.workspace = true
 # Cell-width accounting for the wide-glyph / emoji renderer (render.rs): how many
 # grid cells a cluster occupies, matching the server's column model.
 unicode-width.workspace = true
+# Grapheme-cluster segmentation for the same renderer: the off-grid test compares a
+# whole cluster's shaped advance against its display width, so a base char + its VS16
+# / combining marks (e.g. `❤️`) are weighed as one unit, not per glyph.
+unicode-segmentation.workspace = true
 pollster.workspace = true
 nxvim-rpc.workspace = true
 nxvim-view.workspace = true

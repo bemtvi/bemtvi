@@ -344,7 +344,11 @@ impl Renderer {
         let size = window.inner_size();
         let scale = window.scale_factor() as f32;
 
-        let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor::default());
+        // wgpu 29's `InstanceDescriptor` gained a `display` handle field and lost its
+        // `Default` impl; `new_without_display_handle_from_env()` is the equivalent of
+        // the old `::default()` — no display handle, backend picked from the env.
+        let instance =
+            wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle_from_env());
         let surface = instance.create_surface(window)?;
         let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
             power_preference: wgpu::PowerPreference::default(),
@@ -360,6 +364,7 @@ impl Renderer {
                 required_features: wgpu::Features::empty(),
                 required_limits: adapter.limits(),
                 memory_hints: wgpu::MemoryHints::default(),
+                experimental_features: wgpu::ExperimentalFeatures::disabled(),
                 trace: wgpu::Trace::Off,
             }))?;
         let max_dim = device.limits().max_texture_dimension_2d;
@@ -613,14 +618,24 @@ impl Renderer {
         scroll: Option<&ScrollFrame>,
         doc_scroll: u16,
     ) -> anyhow::Result<()> {
+        // wgpu 29 replaced the `Result<SurfaceTexture, SurfaceError>` this used to
+        // return with the `CurrentSurfaceTexture` enum. `Suboptimal` still hands back
+        // a usable frame (draw it, don't drop it); `Lost`/`Outdated` reconfigure and
+        // skip; the transient skips (`Timeout`/`Occluded`) drop this frame; `Validation`
+        // is a real error we surface loudly.
         let frame = match self.surface.get_current_texture() {
-            Ok(f) => f,
-            Err(wgpu::SurfaceError::Lost | wgpu::SurfaceError::Outdated) => {
+            wgpu::CurrentSurfaceTexture::Success(f)
+            | wgpu::CurrentSurfaceTexture::Suboptimal(f) => f,
+            wgpu::CurrentSurfaceTexture::Lost | wgpu::CurrentSurfaceTexture::Outdated => {
                 self.surface.configure(&self.device, &self.config);
                 return Ok(());
             }
-            Err(wgpu::SurfaceError::Timeout) => return Ok(()),
-            Err(e) => return Err(e.into()),
+            wgpu::CurrentSurfaceTexture::Timeout | wgpu::CurrentSurfaceTexture::Occluded => {
+                return Ok(())
+            }
+            wgpu::CurrentSurfaceTexture::Validation => {
+                anyhow::bail!("wgpu surface get_current_texture raised a validation error")
+            }
         };
         let target = frame
             .texture
@@ -747,6 +762,7 @@ impl Renderer {
                 label: Some("nxvim-gui pass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                     view: &target,
+                    depth_slice: None,
                     resolve_target: None,
                     ops: wgpu::Operations {
                         load: wgpu::LoadOp::Clear(wgpu::Color {
@@ -761,6 +777,7 @@ impl Renderer {
                 depth_stencil_attachment: None,
                 timestamp_writes: None,
                 occlusion_query_set: None,
+                multiview_mask: None,
             });
             // Base layer first, then the overlay layer on top: each layer's quads
             // then its text, so an overlay background occludes the base text under it.
@@ -3306,7 +3323,8 @@ impl Renderer {
             return (key, e.nonsnapped.is_empty());
         }
         let buffer = self.shape_segments(segments);
-        let nonsnapped = nonsnapped_clusters(&buffer, self.cell_w);
+        let full: String = segments.iter().map(|s| s.text.as_str()).collect();
+        let nonsnapped = nonsnapped_clusters(&buffer, self.cell_w, &full);
         let snapped = nonsnapped.is_empty();
         self.cache.insert(
             key,
@@ -4094,6 +4112,7 @@ fn measure_cell(
         "M",
         &Attrs::new().family(family),
         Shaping::Advanced,
+        None,
     );
     buf.shape_until_scroll(font_system, false);
     let advance = buf
@@ -4104,29 +4123,70 @@ fn measure_cell(
     (advance.max(1.0), line_height.max(1.0))
 }
 
-/// Byte ranges (into the buffer's line text) of glyph clusters whose advance did
+/// Byte ranges (into the shaped line's `text`) of grapheme clusters whose advance did
 /// **not** land on the cell grid — emoji *and* monochrome symbols (Nerd Font icons,
 /// powerline separators) from non-monospace fallback fonts that `set_monospace_width`
-/// leaves at their native advance. A glyph is on-grid when its advance is ~a whole
-/// number of `cell_w`; a (near-)zero-advance glyph (a combining mark / joiner) is
-/// skipped. Consecutive off-grid glyphs with touching byte ranges merge into one
-/// cluster, so a multi-glyph emoji (a flag, a ligated ZWJ sequence) is one unit.
-fn nonsnapped_clusters(buf: &Buffer, cell_w: f32) -> Vec<(usize, usize)> {
+/// leaves at their native advance, plus the subtler case a bare-advance check misses:
+/// a cluster the font shapes to a whole number of cells that still disagrees with its
+/// display width (`❤️` — a width-2 emoji whose monospace glyph is one cell). Adapts the
+/// shaped `buf` into `(start_byte, advance_in_cells)` glyphs and defers the grid
+/// decision to [`offgrid_clusters`], which weighs whole grapheme clusters (so a base +
+/// its VS16 are one unit) against their [`UnicodeWidthStr::width`].
+fn nonsnapped_clusters(buf: &Buffer, cell_w: f32, text: &str) -> Vec<(usize, usize)> {
+    let glyphs: Vec<(usize, f32)> = buf
+        .layout_runs()
+        .flat_map(|run| {
+            run.glyphs
+                .iter()
+                .map(move |g| (g.start.min(g.end), g.w / cell_w))
+        })
+        .collect();
+    offgrid_clusters(text, &glyphs)
+}
+
+/// Grid tolerance: how far a cluster's summed glyph advance may sit from its display
+/// width (in cells) before it counts as off-grid. Absorbs sub-pixel snapping slop.
+const GRID_TOL: f32 = 0.15;
+
+/// Byte ranges (into `text`) of grapheme clusters whose shaped glyph advance disagrees
+/// with the editor's display-width grid, so the renderer must mask them to spaces and
+/// redraw them separately to keep the rest of the line — and the cursor — aligned.
+///
+/// `glyphs` is every shaped glyph as `(start_byte, advance_in_cells)` in visual order;
+/// each glyph's advance is credited to the grapheme cluster containing its start byte,
+/// so a base char and its zero-advance combining marks / VS16 (e.g. `❤️`) are weighed
+/// as one unit. A cluster is off-grid when its summed advance differs from its
+/// [`UnicodeWidthStr::width`] by more than [`GRID_TOL`]: the emoji the font draws one
+/// cell wide though the editor reserves two, the fractional-advance Powerline glyph,
+/// the icon a fallback font draws double-wide. Touching off-grid clusters merge. Pure,
+/// so it's unit-tested in `tests/wide.rs`.
+pub fn offgrid_clusters(text: &str, glyphs: &[(usize, f32)]) -> Vec<(usize, usize)> {
+    use unicode_segmentation::UnicodeSegmentation;
+    use unicode_width::UnicodeWidthStr;
+    let clusters: Vec<(usize, usize, usize)> = text
+        .grapheme_indices(true)
+        .map(|(off, g)| (off, off + g.len(), g.width()))
+        .collect();
+    let mut adv = vec![0.0f32; clusters.len()];
+    for &(gstart, cells) in glyphs {
+        if let Some(i) = clusters
+            .iter()
+            .position(|&(s, e, _)| gstart >= s && gstart < e)
+        {
+            adv[i] += cells;
+        }
+    }
     let mut out: Vec<(usize, usize)> = Vec::new();
-    for run in buf.layout_runs() {
-        for g in run.glyphs.iter() {
-            let cells = g.w / cell_w;
-            if cells < 0.5 || (cells - cells.round()).abs() <= 0.15 {
-                continue; // narrow/zero advance, or already a whole cell-count wide
-            }
-            let (s, e) = (g.start.min(g.end), g.start.max(g.end));
-            match out.last_mut() {
-                Some(last) if s <= last.1 => {
-                    last.0 = last.0.min(s);
-                    last.1 = last.1.max(e);
-                }
-                _ => out.push((s, e)),
-            }
+    for (i, &(s, e, uw)) in clusters.iter().enumerate() {
+        if uw == 0 {
+            continue; // zero-width cluster reserves no cell
+        }
+        if (adv[i] - uw as f32).abs() <= GRID_TOL {
+            continue; // advance matches the reserved cells — on grid
+        }
+        match out.last_mut() {
+            Some(last) if s <= last.1 => last.1 = last.1.max(e),
+            _ => out.push((s, e)),
         }
     }
     out
@@ -4359,7 +4419,7 @@ impl RectPipeline {
         let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("nxvim-gui rect layout"),
             bind_group_layouts: &[],
-            push_constant_ranges: &[],
+            immediate_size: 0,
         });
         let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("nxvim-gui rect pipeline"),
@@ -4398,7 +4458,7 @@ impl RectPipeline {
             primitive: wgpu::PrimitiveState::default(),
             depth_stencil: None,
             multisample: wgpu::MultisampleState::default(),
-            multiview: None,
+            multiview_mask: None,
             cache: None,
         });
         let capacity = VERTEX_BYTES * 6 * 256;

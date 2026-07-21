@@ -79,6 +79,12 @@ Then `:PluginSync` (clone missing + update), `:PluginInstall`, `:PluginUpdate`,
 `lazy = true`) loads on first use; `config` runs after the plugin is on the
 runtimepath, `init` runs at startup regardless.
 
+Git submodules are initialised by default — the manager clones with
+`--recurse-submodules` and runs `git submodule update --init --recursive` on update,
+so a plugin that vendors its dependencies as submodules lands complete. Set
+`submodules = false` on a spec to opt a plugin out (skips the extra git work for one
+you know has none).
+
 **By hand.** Drop the plugin under `<config>/pack/*/start/*` and `require` it from
 `init.lua` — the runtimepath picks it up with no manager involved.
 

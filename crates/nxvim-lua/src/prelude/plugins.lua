@@ -233,6 +233,13 @@ local function normalize(spec)
   local commit = spec.commit
   local tag = spec.tag or spec.version
 
+  -- Init/update the plugin's git submodules on install & update. DEFAULT ON —
+  -- submodule-bearing plugins are common and an un-recursed clone silently ships a
+  -- broken plugin (its vendored deps missing). Opt out with `submodules = false`
+  -- for a plugin you know has none, to skip the extra git call. (A dev `dir` plugin
+  -- is never cloned, so this only affects managed clones.)
+  local submodules = spec.submodules ~= false
+
   -- Dependencies: declare each (so it is installable) and remember its name. A
   -- dependency is loaded before its dependent.
   local deps = {}
@@ -259,6 +266,7 @@ local function normalize(spec)
     branch = spec.branch,
     commit = commit,
     tag = tag,
+    submodules = submodules,
     -- Resolved install directory: an explicit `dir` (a local/dev checkout, never
     -- cloned; `~` already expanded) or root()/name.
     dir = dir, -- local-dev marker (nil for a managed clone)
@@ -631,6 +639,11 @@ function M._install(name)
       args[#args + 1] = "--branch"
       args[#args + 1] = ref
     end
+    if spec.submodules then
+      -- Fetch + check out the plugin's submodules as part of the clone, so a
+      -- submodule-bearing plugin lands complete. (A no-op for a plugin with none.)
+      args[#args + 1] = "--recurse-submodules"
+    end
     if not spec.commit then
       -- Shallow unless we must reach an arbitrary commit (which a shallow clone
       -- may not contain).
@@ -652,6 +665,16 @@ function M._install(name)
           "nx.plugins: git checkout " .. spec.commit .. " failed for " .. name .. ": " .. co.stderr,
           0
         )
+      end
+      if spec.submodules then
+        -- The clone's `--recurse-submodules` synced submodules to the clone's
+        -- default HEAD; after detaching onto an arbitrary commit they must be
+        -- re-synced to THAT commit's gitlinks.
+        local sm = nx.await(git({ "submodule", "update", "--init", "--recursive" }, spec._dir))
+        if sm.code ~= 0 then
+          set_task(name, "install", "error", sm.stderr)
+          error("nx.plugins: git submodule update failed for " .. name .. ": " .. sm.stderr, 0)
+        end
       end
     end
     set_task(name, "install", "done", "installed")
@@ -678,6 +701,15 @@ function M._update(name)
     if res.code ~= 0 then
       set_task(name, "update", "error", res.stderr)
       error("nx.plugins: git pull failed for " .. name .. ": " .. res.stderr, 0)
+    end
+    if spec.submodules then
+      -- Pick up any submodule bumps the fast-forward brought in (a no-op when the
+      -- pull moved nothing, or the plugin has no submodules).
+      local sm = nx.await(git({ "submodule", "update", "--init", "--recursive" }, spec._dir))
+      if sm.code ~= 0 then
+        set_task(name, "update", "error", sm.stderr)
+        error("nx.plugins: git submodule update failed for " .. name .. ": " .. sm.stderr, 0)
+      end
     end
     -- "Already up to date." means no movement; show the calmer word so the UI does
     -- not imply a change that did not happen.
@@ -1034,6 +1066,9 @@ serialize_spec = function(s)
   end
   if s.enabled ~= nil and type(s.enabled) ~= "function" then
     fields[#fields + 1] = "enabled = " .. tostring(s.enabled)
+  end
+  if s.submodules ~= nil then
+    fields[#fields + 1] = "submodules = " .. tostring(s.submodules)
   end
   -- Hooks are strings here (recommend() enforced it); emit as real functions.
   for _, k in ipairs({ "config", "init" }) do

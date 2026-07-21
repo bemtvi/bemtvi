@@ -505,6 +505,96 @@ async fn git_runs_noninteractive_with_terminal_prompt_disabled() {
     );
 }
 
+// ----- submodules are initialised on install and update ----------------------
+
+// A plugin may vendor its dependencies as git submodules. The manager clones with
+// `--recurse-submodules` and, on update, runs `git submodule update --init
+// --recursive`, so a submodule-bearing plugin lands complete (never a half-cloned
+// checkout missing its vendored deps). It is DEFAULT ON; `submodules = false` opts a
+// plugin out (skipping the extra git work for one you know has none). A fake `git`
+// logs each invocation's argv so we can assert on the exact commands the manager ran
+// — and, crucially, that the opt-out plugin's clone omits the recurse flag.
+#[cfg(unix)]
+#[tokio::test]
+async fn submodules_are_recursed_on_install_and_update() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let (rpc, _i) = start().await;
+    let dir = temp_dir("plug_submodules");
+    let log = dir.join("git_argv.log");
+    let fake = dir.join("fakegit.sh");
+    // Log every invocation's argv (space-joined), and on `clone` create the
+    // destination dir (the last argv) so the manager's later steps don't error.
+    std::fs::write(
+        &fake,
+        format!(
+            "#!/bin/sh\n\
+             printf '%s\\n' \"$*\" >> \"{log}\"\n\
+             if [ \"$1\" = clone ]; then for a in \"$@\"; do dest=\"$a\"; done; mkdir -p \"$dest\"; fi\n\
+             exit 0\n",
+            log = q(&log)
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let root = dir.join("install");
+    // One default (submodules on) plugin and one that opts out.
+    exec_lua(
+        &rpc,
+        &format!(
+            "nx.plugins.setup_manager({{ root = \"{root}\", git = \"{git}\" }})\n\
+             nx.plugins {{\n\
+               {{ \"file:///no/such/withsub\", name = \"withsub\" }},\n\
+               {{ \"file:///no/such/nosub\", name = \"nosub\", submodules = false }} }}\n\
+             nx.plugins.sync():next(function() _G.synced = true end)\n\
+               :catch(function(e) _G.err = tostring(e and e.message or e) end)",
+            root = q(&root),
+            git = q(&fake)
+        ),
+    )
+    .await;
+
+    assert!(
+        poll_true(&rpc, "return _G.synced == true").await,
+        "sync should complete; err={:?}",
+        exec_lua(&rpc, "return _G.err").await
+    );
+
+    let logged = std::fs::read_to_string(&log).unwrap_or_default();
+    let clone_line = |name: &str| -> String {
+        logged
+            .lines()
+            .find(|l| l.starts_with("clone ") && l.ends_with(&format!("/{name}")))
+            .unwrap_or_else(|| panic!("no clone line for {name} in {logged:?}"))
+            .to_string()
+    };
+
+    // The default plugin clones WITH --recurse-submodules and, on the update pass,
+    // runs a recursive submodule update.
+    assert!(
+        clone_line("withsub").contains("--recurse-submodules"),
+        "a default plugin must clone with --recurse-submodules (got: {:?})",
+        clone_line("withsub")
+    );
+    let submodule_updates = logged
+        .lines()
+        .filter(|l| l == &"submodule update --init --recursive")
+        .count();
+    assert_eq!(
+        submodule_updates, 1,
+        "exactly the one default plugin's update runs `submodule update --init \
+         --recursive` (the opted-out plugin must not); log: {logged:?}"
+    );
+
+    // The opted-out plugin's clone omits the flag entirely.
+    assert!(
+        !clone_line("nosub").contains("--recurse-submodules"),
+        "submodules = false must omit --recurse-submodules (got: {:?})",
+        clone_line("nosub")
+    );
+}
+
 // ----- first-run recommended-set bootstrap -----------------------------------
 
 // Point the manager's install root + config dir at temp dirs (hermetic).

@@ -36,10 +36,14 @@ pub enum Key {
 /// wrapped (`<C-x>`, `<A-x>`, `<C-A-x>`). Named keys are always wrapped, carrying
 /// the same modifier prefix.
 ///
-/// `shift` is notated **only for named keys** (`<S-Tab>`): on a printable character
-/// the platform layout has already folded shift into the character itself (`A` for
-/// Shift+a), so it adds no `S-` there. This mirrors core's `key_to_notation`, and is
-/// what lets Shift+Tab reach the server as `<S-Tab>` rather than a bare `<Tab>`.
+/// `shift` on a **bare** printable character adds no `S-`: the platform layout has
+/// already folded it into the character itself (`A` for Shift+a). But a printable
+/// with a ctrl/alt modifier *does* carry `S-` (`<C-S-c>`), because there the kitty
+/// keyboard protocol reports shift as a separate modifier rather than folding it in —
+/// and the letter is lowercased so it matches neovim's case-insensitive modified-key
+/// model. Named keys always notate shift as `S-` (`<S-Tab>`). This mirrors core's
+/// `key_to_notation`, and is what lets Shift+Tab reach the server as `<S-Tab>` and
+/// Ctrl+Shift+c as `<C-S-c>` rather than bare `<Tab>` / `<C-c>`.
 pub fn notation(ctrl: bool, alt: bool, shift: bool, key: Key) -> String {
     let mut prefix = String::new();
     if ctrl {
@@ -59,15 +63,24 @@ pub fn notation(ctrl: bool, alt: bool, shift: bool, key: Key) -> String {
     match key {
         Key::Char(c) => {
             if !prefix.is_empty() {
+                // With a ctrl/alt modifier held, shift is a *distinct* modifier
+                // the kitty keyboard protocol reports separately — it is NOT
+                // folded into the character the way a bare `Shift+a` → `A` is.
+                // Carry it as the explicit `S-` flag (`named_prefix`) and lowercase
+                // the letter (the platform upcases `Shift+c` to `C`), matching
+                // neovim's model and the server's `parse_special`, so a `<C-S-c>` /
+                // `<A-S-c>` mapping actually matches. Dropping it here sent a bare
+                // `<C-c>` and the remap could never fire.
+                let c = if shift { c.to_ascii_lowercase() } else { c };
                 // A literal '>' would terminate the `<...>` form early on the
                 // server (its scan ends at the first '>', so `<C->>` falls apart
                 // into five literal keys); use the `gt` named escape, which the
                 // server resolves back to '>'. A '<' inside the form is
                 // unambiguous and stays inline (`<C-<>`), matching core.
                 if c == '>' {
-                    format!("<{prefix}gt>")
+                    format!("<{named_prefix}gt>")
                 } else {
-                    format!("<{prefix}{c}>")
+                    format!("<{named_prefix}{c}>")
                 }
             } else if c == '<' {
                 "<lt>".to_string()

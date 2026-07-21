@@ -505,7 +505,21 @@ pub fn run(
         reconnect_tx,
         fetch_tx,
     );
-    event_loop.run_app(&mut app)?;
+    let run_result = event_loop.run_app(&mut app);
+
+    // Leak the renderer instead of dropping it. wgpu's GLES/EGL backend segfaults inside
+    // `eglTerminate` when its `Instance` drops on Wayland + Mesa — an upstream wgpu/Mesa
+    // teardown bug: the EGL display teardown marshals a request onto an already-invalid
+    // Wayland proxy (`terminate_display` → `eglTerminate` → `wl_proxy_marshal_flags` →
+    // SIGSEGV). wgpu instantiates the GL/EGL backend even when Vulkan is the chosen
+    // adapter, so restricting the adapter wouldn't dodge it. `run` only ever returns as
+    // the process is about to exit (see `main` — every path tail-calls it), so forgetting
+    // the renderer — and with it every wgpu handle plus the surface's `Arc<Window>` — is
+    // safe: the OS reclaims the GPU/driver resources at exit anyway. Everything else in
+    // `app` (the RPC handle, the channel senders) still drops normally, so the IO thread's
+    // shutdown handshake below is unaffected. Done before `?` so an errored run leaks too.
+    std::mem::forget(app.renderer.take());
+    run_result?;
 
     // The UI is done: stop the IO thread and wait for it, so the streams are dropped
     // (servers see EOF) and their threads are joined before returning.

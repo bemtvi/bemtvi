@@ -347,6 +347,108 @@ impl Editor {
         }
         self.open_scratch_listing("[Marks]", lines, 0);
     }
+
+    /// Structured twin of [`Self::ex_marks`] for the Lua `nx._marks` mirror that
+    /// backs `nx.mark.list` and the `marks` picker. Same membership and order as
+    /// `:marks` — the current buffer's specials then `a`–`z`, the global `A`–`Z`,
+    /// then the numbered `0`–`9` — but each row carries the fields a jump needs:
+    /// the target `bufnr` (`0` when the mark is pending, its file not yet
+    /// reopened), a `path` to open (empty for an unnamed current buffer), the
+    /// 0-based `line`/`col`, and a `text` detail (the line's text, or the file for
+    /// a mark pointing outside the current buffer).
+    pub fn marks_mirror(&self) -> Vec<MarkMirrorEntry> {
+        let cur = self.cur_buffer();
+        let cur_name = self.buffer_name(cur).unwrap_or_default();
+        let mut out = Vec::new();
+
+        // Buffer-local marks (specials first, then a–z): line/col + the line text.
+        for name in SPECIAL_MARKS.iter().copied().chain('a'..='z') {
+            if let Some(&(line, col)) = self.buffer().marks.get(&name) {
+                let text = self
+                    .buffer()
+                    .line(line.min(self.last_line()))
+                    .trim_end()
+                    .to_string();
+                out.push(MarkMirrorEntry {
+                    name,
+                    bufnr: cur.0,
+                    line,
+                    col,
+                    path: cur_name.clone(),
+                    text,
+                });
+            }
+        }
+
+        // Global marks A–Z: text is the line when they point into the current
+        // buffer, else the file name; a shada-pending one lists by its stored path.
+        for name in 'A'..='Z' {
+            if let Some(&(buf, pos)) = self.global_marks.get(&name) {
+                let (path, text) = if buf == cur {
+                    let t = self
+                        .buffer()
+                        .line(pos.line.min(self.last_line()))
+                        .trim_end()
+                        .to_string();
+                    (cur_name.clone(), t)
+                } else {
+                    let n = self
+                        .buffer_name(buf)
+                        .filter(|n| !n.is_empty())
+                        .unwrap_or_else(|| "[No Name]".to_string());
+                    (n.clone(), n)
+                };
+                out.push(MarkMirrorEntry {
+                    name,
+                    bufnr: buf.0,
+                    line: pos.line,
+                    col: pos.col,
+                    path,
+                    text,
+                });
+            } else if let Some((path, pos)) = self.pending_global_marks.get(&name) {
+                let p = path.display().to_string();
+                out.push(MarkMirrorEntry {
+                    name,
+                    bufnr: 0,
+                    line: pos.line,
+                    col: pos.col,
+                    path: p.clone(),
+                    text: p,
+                });
+            }
+        }
+
+        // Numbered marks 0–9 — shada-restored last-exit positions, always pending.
+        for name in '0'..='9' {
+            if let Some((path, pos)) = self.numbered_marks.get(&name) {
+                let p = path.display().to_string();
+                out.push(MarkMirrorEntry {
+                    name,
+                    bufnr: 0,
+                    line: pos.line,
+                    col: pos.col,
+                    path: p.clone(),
+                    text: p,
+                });
+            }
+        }
+
+        out
+    }
+}
+
+/// One row of the `nx._marks` mirror (`nx.mark.list` / the `marks` picker). The
+/// structured counterpart of a `:marks` display line: `line`/`col` are 0-based,
+/// `bufnr` is `0` for a pending (not-yet-reopened) mark, and `path` is empty when
+/// the current buffer has no file.
+pub struct MarkMirrorEntry {
+    pub name: char,
+    pub bufnr: u64,
+    pub line: usize,
+    pub col: usize,
+    pub path: String,
+    pub text: String,
 }
 
 /// One `:marks` row in vim's layout: the mark name, its 1-based line, 0-based

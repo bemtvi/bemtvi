@@ -85,6 +85,7 @@ pub(crate) use self::multicursor::PlacementSnapshot;
 pub use self::buffers::{
     FileChangeAction, FileChangeReason, PendingOpen, PendingQuitAll, PendingSave,
 };
+pub use self::marks::MarkMirrorEntry;
 pub use self::persist::{
     FileChangelist, FileFolds, FileMarkEntry, GlobalMarkEntry, InputHistoryEntry, JumpPos,
     NumberedMark, PersistState, PluginEntry, PluginNamespace, RegisterEntry, SessionDock,

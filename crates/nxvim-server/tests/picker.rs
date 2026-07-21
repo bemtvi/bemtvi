@@ -2847,3 +2847,165 @@ async fn resume_replays_the_snapshot_without_rerunning_a_dynamic_source() {
         "a query edit after resume re-runs the live source",
     );
 }
+
+/// The shipped `examples/telescope-parity` config loads end-to-end and its custom
+/// sources actually drive (so it can't rot): every ported source registers, the
+/// LSP picker verbs are functions, and two of the hand-written sources are exercised
+/// for real — `curbuf` navigates the cursor, and the visual-selection → register
+/// mechanism the `with_selection` prompt-seeder relies on captures the selection.
+#[tokio::test]
+async fn example_telescope_parity_config_drives() {
+    let root =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/telescope-parity");
+    let init = ServerInit {
+        config_dir: Some(root.clone()),
+        runtimepath: vec![root],
+        ..Default::default()
+    };
+    let (rpc, mut incoming) = spawn(init);
+    attach(&rpc, 80, 24).await;
+
+    // Every ported source registered, and the LSP verbs are wired.
+    let ok = exec_lua(
+        &rpc,
+        r#"local s = nx.picker._sources
+           local names = { "files","git_files","live_grep","live_grep_uu","live_grep_ex",
+                           "curbuf","diagnostics","keymaps","pickers" }
+           for _, n in ipairs(names) do
+             if s[n] == nil then return "missing:" .. n end
+           end
+           return type(nx.lsp.references) .. "|" .. type(nx.lsp.document_symbol)"#,
+    )
+    .await;
+    assert_eq!(
+        ok.as_str(),
+        Some("function|function"),
+        "all ported sources register and the LSP verbs are functions"
+    );
+
+    // Give the buffer some lines, then drive `curbuf`: move down one row and confirm.
+    feed(&rpc, "ihello world<CR>foo bar<CR>baz qux<Esc>gg");
+    exec_lua(&rpc, "nx.picker.open('curbuf')").await;
+    poll_menu(&rpc, &mut incoming).await.expect("curbuf opens");
+    feed(&rpc, "<C-n>"); // apple -> second row
+    feed(&rpc, "<CR>");
+    let (line, _) = cursor(&rpc).await;
+    assert_eq!(
+        line, 2,
+        "confirming the second curbuf row jumps the cursor to line 2"
+    );
+
+    // The visual-selection capture behind `with_selection`: select a word, yank it
+    // into register z (exactly what the seeder feeds), read it back.
+    feed(&rpc, "gg0viw\"zy");
+    let sel = exec_lua(&rpc, "return nx.reg.get('z')").await;
+    assert_eq!(
+        sel.as_str(),
+        Some("hello"),
+        "the visual selection lands in register z for prompt seeding"
+    );
+}
+
+/// The `curbuf` / `diagnostics` / `keymaps` / `pickers` sources are shipped
+/// built-in (no config needed) and drive for real on a bare server: `curbuf`
+/// navigates the cursor, and `diagnostics` lists a set diagnostic.
+#[tokio::test]
+async fn builtin_native_sources_drive_without_config() {
+    let dir = temp_dir("picker_builtin_native");
+    let (rpc, mut incoming) = start(&dir, "").await;
+
+    // All four register out of the box.
+    let ok = exec_lua(
+        &rpc,
+        r#"local s = nx.picker._sources
+           for _, n in ipairs({ "curbuf","diagnostics","keymaps","pickers" }) do
+             if s[n] == nil then return "missing:" .. n end
+           end
+           return "ok""#,
+    )
+    .await;
+    assert_eq!(ok.as_str(), Some("ok"), "native sources ship built-in");
+
+    // curbuf: give the buffer lines, pick the second row, cursor jumps to line 2.
+    feed(&rpc, "ione<CR>two<CR>three<Esc>gg");
+    exec_lua(&rpc, "nx.picker.open('curbuf')").await;
+    poll_menu(&rpc, &mut incoming).await.expect("curbuf opens");
+    feed(&rpc, "<C-n>");
+    feed(&rpc, "<CR>");
+    let (line, _) = cursor(&rpc).await;
+    assert_eq!(line, 2, "confirming the second curbuf row jumps to line 2");
+
+    // diagnostics: set one, then it shows up in the diagnostics picker.
+    exec_lua(
+        &rpc,
+        "nx.diagnostic.set(1, 0, { { lnum = 1, col = 0, message = 'boom', \
+         severity = nx.diagnostic.severity.ERROR } })",
+    )
+    .await;
+    exec_lua(&rpc, "nx.picker.open('diagnostics')").await;
+    let m = poll_menu(&rpc, &mut incoming)
+        .await
+        .expect("diagnostics opens");
+    let items = menu_items(&menu_of(&m));
+    assert!(
+        items
+            .iter()
+            .any(|r| r.contains("boom") && r.contains("ERROR")),
+        "the set diagnostic appears in the picker, got {items:?}"
+    );
+}
+
+/// `nx.mark.list` reads the server-pushed `nx._marks` mirror, and the built-in
+/// `marks` picker lists + jumps to a set mark. Bare server, driven for real:
+/// set mark `a` on a distinct line, confirm it via the picker, cursor lands there.
+#[tokio::test]
+async fn builtin_marks_list_and_picker_jump() {
+    let dir = temp_dir("picker_marks");
+    let (rpc, mut incoming) = start(&dir, "").await;
+
+    // Three lines; put mark `a` on the middle (uniquely-worded) one, cursor back up.
+    feed(&rpc, "iaaa first<CR>zzz middle<CR>ccc last<Esc>2Gma gg");
+
+    // nx.mark.list surfaces mark `a` at the 0-based middle line (1) with its text.
+    let info = exec_lua(
+        &rpc,
+        r#"for _, m in ipairs(nx.mark.list()) do
+             if m.name == "a" then return m.line .. "|" .. m.text end
+           end
+           return "no-a""#,
+    )
+    .await;
+    assert_eq!(
+        info.as_str(),
+        Some("1|zzz middle"),
+        "nx.mark.list reports mark a at line 1 (0-based) with the line's text"
+    );
+
+    // The picker lists it; filter to the unique word and confirm the jump.
+    exec_lua(&rpc, "nx.picker.open('marks')").await;
+    poll_menu(&rpc, &mut incoming)
+        .await
+        .expect("marks picker opens");
+    feed(&rpc, "zzz");
+    let mut rows = Vec::new();
+    for _ in 0..40 {
+        if let Some(m) = poll_menu(&rpc, &mut incoming).await {
+            rows = menu_items(&menu_of(&m));
+            if rows.iter().any(|r| r.contains("zzz middle")) {
+                break;
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert!(
+        rows.iter()
+            .any(|r| r.starts_with("a  ") && r.contains("zzz middle")),
+        "the marks picker lists mark a, got {rows:?}"
+    );
+    feed(&rpc, "<CR>");
+    let (line, _) = cursor(&rpc).await;
+    assert_eq!(
+        line, 2,
+        "confirming mark a jumps the cursor to line 2 (1-based)"
+    );
+}

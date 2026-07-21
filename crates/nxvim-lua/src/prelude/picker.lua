@@ -788,6 +788,145 @@ nx.picker.source({
   end,
 })
 
+-- curbuf: fuzzy-find a line in the *current* buffer (telescope's
+-- `current_buffer_fuzzy_find`). A static, in-memory source over the focused
+-- buffer's lines (read from the `nx.buf` mirror, never live state); each item
+-- carries its 1-based `row` and confirm just moves the cursor there — no path, so
+-- it works for an unnamed buffer too, and there is no preview pane (the line is
+-- already on screen). Read `nx.buf.current()` at open, before the picker float
+-- grabs input, so it is the underlying buffer, not the prompt.
+nx.picker.source({
+  name = "curbuf",
+  title = "Buffer Lines",
+  layer = "main",
+  items = function(ctx)
+    for i, line in ipairs(nx.buf.lines(nx.buf.current(), 0, -1)) do
+      -- Right-align the line number in a 6-wide field so the text starts at the
+      -- same column for any file up to 999999 lines; past that it just wraps wider.
+      ctx.push({ text = string.format("%6d: %s", i, line), row = i })
+    end
+  end,
+  confirm = function(item)
+    nx.pos.set(".", { 0, item.row, 1 })
+  end,
+})
+
+-- Relativize `path` against the cwd for a compact diagnostics label; the cwd is
+-- escaped so a path-magic char in it (`.`, `-`, `(`, …) can't corrupt the anchor.
+local function relpath(path)
+  local cwd = vim.fn.getcwd()
+  local anchor = cwd:gsub("[%(%)%.%%%+%-%*%?%[%]%^%$]", "%%%1")
+  return (path or ""):gsub("^" .. anchor .. "/", "")
+end
+
+-- diagnostics: every diagnostic across all buffers (telescope's `diagnostics`), the
+-- merged `nx.diagnostic.get()` set — LSP-pushed plus every client namespace. Static
+-- and in-memory; `location` preview scrolls to and highlights the match, confirm
+-- jumps via `nx.picker.edit`. Diagnostic records are 0-based (`lnum`/`col`), so the
+-- pushed item's `row`/`col` add 1 to reach the picker's 1-based convention.
+nx.picker.source({
+  name = "diagnostics",
+  title = "Diagnostics",
+  layer = "main",
+  preview = "location",
+  items = function(ctx)
+    for _, d in ipairs(nx.diagnostic.get()) do
+      local name = nx.buf.name(d.bufnr)
+      local sev = nx.diagnostic.severity[d.severity] or "?"
+      -- Lead with the severity left-padded to 5 (the widest, `ERROR`) so the
+      -- `file:line` column lines up; the message trails the (variable-width) path.
+      ctx.push({
+        text = string.format("%-5s %s:%d  %s", sev, relpath(name), d.lnum + 1, d.message),
+        path = name,
+        row = d.lnum + 1,
+        col = d.col + 1,
+      })
+    end
+  end,
+  confirm = function(item, mode, layer)
+    nx.picker.edit(item, mode, layer)
+  end,
+})
+
+-- keymaps: every global mapping in normal / visual / insert mode (telescope's
+-- `keymaps`), read from `nx.keymap.get`. Confirm re-feeds the `lhs` with remapping
+-- on, so picking a mapping *runs* it, exactly like telescope.
+nx.picker.source({
+  name = "keymaps",
+  title = "Keymaps",
+  layer = "main",
+  items = function(ctx)
+    for _, mode in ipairs({ "n", "v", "i" }) do
+      for _, k in ipairs(nx.keymap.get(mode)) do
+        ctx.push({
+          text = string.format("%s  %-16s %s", mode, k.lhs, k.desc or ""),
+          lhs = k.lhs,
+        })
+      end
+    end
+  end,
+  confirm = function(item)
+    nx._feedkeys(item.lhs, true, false)
+  end,
+})
+
+-- pickers: a picker of pickers (telescope's `builtin`) — every registered source
+-- name, confirm opens the chosen one. Opening a picker from inside a `confirm` has
+-- to wait for this picker to tear down first, so it defers to `nx.on_next_tick`.
+nx.picker.source({
+  name = "pickers",
+  title = "Pickers",
+  layer = "main",
+  items = function(ctx)
+    local names = {}
+    for name in pairs(nx.picker._sources) do
+      names[#names + 1] = name
+    end
+    table.sort(names)
+    for _, name in ipairs(names) do
+      ctx.push({ text = name, source = name })
+    end
+  end,
+  confirm = function(item)
+    nx.on_next_tick(function()
+      nx.picker.open(item.source)
+    end)
+  end,
+})
+
+-- marks: the set marks (telescope's `marks`), read from `nx.mark.list` — the
+-- current buffer's specials + `a`–`z`, the globals `A`–`Z`, then the numbered
+-- `0`–`9`. `location` preview scrolls to the mark; confirm jumps via
+-- `nx.picker.edit` when the mark names a file, or moves the cursor directly for a
+-- mark in an unnamed current buffer (no path to open). Mirror positions are 0-based,
+-- so the pushed item's `row`/`col` add 1.
+nx.picker.source({
+  name = "marks",
+  title = "Marks",
+  layer = "main",
+  preview = "location",
+  items = function(ctx)
+    for _, m in ipairs(nx.mark.list()) do
+      -- Fixed-width `name  line:col` prefix so the detail text lines up: the mark
+      -- name is always one char, the line right-aligned to 6 (files up to 999999
+      -- lines, matching `curbuf`), the col left-padded to 4.
+      ctx.push({
+        text = string.format("%s  %6d:%-4d %s", m.name, m.line + 1, m.col, m.text),
+        path = m.path,
+        row = m.line + 1,
+        col = m.col + 1,
+      })
+    end
+  end,
+  confirm = function(item, mode, layer)
+    if item.path ~= "" then
+      nx.picker.edit(item, mode, layer)
+    else
+      nx.pos.set(".", { 0, item.row, item.col })
+    end
+  end,
+})
+
 -- ----- default leader maps ---------------------------------------------------
 -- Bind the three shipped sources to `<leader>f{f,g,b}` out of the box. Registered
 -- on VimEnter (after `init.lua` runs) so `<leader>` expands with the user's
@@ -804,6 +943,11 @@ nx.autocmd.create("VimEnter", {
       { "<leader>ff", "files", "Find files" },
       { "<leader>fg", "live_grep", "Live grep" },
       { "<leader>fb", "buffers", "Find buffers" },
+      { "<leader>fk", "keymaps", "Find keymaps" },
+      { "<leader>fd", "diagnostics", "Find diagnostics" },
+      { "<leader>fi", "pickers", "Find pickers" },
+      { "<leader>fm", "marks", "Find marks" },
+      { "<leader>f/", "curbuf", "Fuzzy find in current buffer" },
     }) do
       local source = m[2]
       nx.keymap.set("n", m[1], function()

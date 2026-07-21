@@ -248,6 +248,16 @@ function nx._set_reg_mirror(t)
   nx._registers = t or {}
 end
 
+-- Rust→Lua mirror of the set marks (the current buffer's locals, the globals, and
+-- the numbered marks), refreshed by the server (`nx._set_marks_mirror`) before any
+-- Lua that can read it — so `nx.mark.list` sees positions that shift with edits and
+-- restore on undo. Each row is `{ name, bufnr, line, col, path, text }` with 0-based
+-- `line`/`col`. Reads only (marks are set with `m{x}` / the shada), like `nx._bufs`.
+nx._marks = nx._marks or {}
+function nx._set_marks_mirror(list)
+  nx._marks = list or {}
+end
+
 -- Rust→Lua mirror of the core quickfix list, refreshed by the server
 -- (`nx._set_qflist_mirror`) before any Lua that can read it. `nx._qflist` is the
 -- array of entry dicts in list order; `nx._qflist_title` the list title. Backs
@@ -1294,6 +1304,41 @@ function nx.reg.executing()
 end
 vim.fn.reg_recording = nx.reg.recording
 vim.fn.reg_executing = nx.reg.executing
+
+-- `nx.mark.list`([opts]) -> the set marks, current-buffer-relative like `:marks`:
+-- the current buffer's automatic specials (`"`, `` ` ``, `.`, `^`, `[`, `]`, `<`,
+-- `>`) and lowercase `a`–`z`, then the global `A`–`Z`, then the numbered `0`–`9`.
+-- Reads the server-pushed `nx._marks` mirror (never live state). Each entry is:
+--
+-- ```lua
+-- { name = "a",           -- the mark's one-character name
+--   bufnr = 3,            -- the buffer it points into (0 for a pending mark)
+--   line = 11,            -- 0-based line
+--   col = 4,              -- 0-based byte column
+--   path = "src/x.rs",    -- file to open on a jump ("" for an unnamed buffer)
+--   text = "let x = 1" }  -- the line's text, or the file for an out-of-buffer mark
+-- ```
+--
+-- `opts.names` (a string) filters to just those mark names, like `:marks aB`.
+nx.mark = nx.mark or {}
+function nx.mark.list(opts)
+  opts = opts or {}
+  local names = opts.names
+  local out = {}
+  for _, m in ipairs(nx._marks or {}) do
+    if names == nil or names:find(m.name, 1, true) then
+      out[#out + 1] = {
+        name = m.name,
+        bufnr = m.bufnr,
+        line = m.line,
+        col = m.col,
+        path = m.path,
+        text = m.text,
+      }
+    end
+  end
+  return out
+end
 
 -- `nx._cur_buf`: the current-buffer snapshot the server refreshes (via
 -- `nx._set_cur_buf`) immediately before firing a buffer/mode autocmd, so a

@@ -2166,6 +2166,11 @@ impl EditHost {
         // (a handful of short strings), so it isn't gated on a dirty flag.
         let regs = self.editor.register_mirror();
         let _ = self.lua.set_reg_mirror(&regs);
+        // The set marks (current buffer's locals + globals + numbered), mirrored so
+        // `nx.mark.list` / the `marks` picker read the core's live positions — which
+        // shift with edits and restore on undo. Small (a few dozen short rows).
+        let marks = self.editor.marks_mirror();
+        let _ = self.lua.set_marks_mirror(&marks);
         // The `vim.v.*` predefined variables sourced from the pending-command
         // state (`v:count` / `v:count1` / `v:register` / `v:operator`), so a
         // keymap RHS / `<expr>` reading them reflects the count/register typed

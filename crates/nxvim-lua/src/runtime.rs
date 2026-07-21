@@ -3049,6 +3049,29 @@ impl LuaRuntime {
         set.call(entries)
     }
 
+    /// Refresh the `nx._marks` mirror that `nx.mark.list` (and the `marks` picker)
+    /// read — the current buffer's marks, the globals, and the numbered marks, each
+    /// with the fields a jump needs. `line`/`col` are 0-based, matching the core.
+    pub fn set_marks_mirror(
+        &self,
+        marks: &[nxvim_core::editor::MarkMirrorEntry],
+    ) -> mlua::Result<()> {
+        let nx = self.nx()?;
+        let arr = self.lua.create_table()?;
+        for (i, m) in marks.iter().enumerate() {
+            let e = self.lua.create_table()?;
+            e.set("name", m.name.to_string())?;
+            e.set("bufnr", m.bufnr)?;
+            e.set("line", m.line as u64)?;
+            e.set("col", m.col as u64)?;
+            e.set("path", m.path.as_str())?;
+            e.set("text", m.text.as_str())?;
+            arr.set(i + 1, e)?;
+        }
+        let set: mlua::Function = nx.get("_set_marks_mirror")?;
+        set.call(arr)
+    }
+
     /// Refresh the `nx._qflist` mirror that `vim.fn.getqflist()` reads. Each entry
     /// is one dict in list order (`{filename, lnum, col, text, type, …}`); the
     /// prelude stores the array and the title behind `nx._qflist`.

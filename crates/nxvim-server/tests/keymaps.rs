@@ -1572,6 +1572,43 @@ async fn ctrl_chord_aliases_canonicalize_to_the_named_key() {
     }
 }
 
+/// The kitty keyboard protocol's real payoff: `<S-CR>` / `<C-CR>` are their OWN keys
+/// (`<Enter>` + a modifier the fold never touches), distinct from `<CR>` — and so
+/// from a `<C-m>` map, which folds onto `<CR>` (`<C-m>` ≡ `<CR>`, as in vim/neovim).
+/// A protocol-capable terminal delivers Shift/Ctrl+Enter as these, and the map must
+/// not swallow them: pressing `<S-CR>`/`<C-CR>` inserts a line, it does not fire the
+/// `<CR>` mapping. (Without the protocol the terminal can't send them at all — they
+/// arrive as a plain `<CR>` and do fire it; enabling the protocol is what makes them
+/// distinguishable, see the TUI client.)
+#[tokio::test]
+async fn shift_and_ctrl_enter_are_distinct_from_a_cr_map() {
+    let dir = temp_dir("keymap_scr_distinct");
+    let (rpc, _incoming) = start_with_config(
+        &dir,
+        "_G.fired = 0\nvim.keymap.set('i', '<C-m>', function() _G.fired = _G.fired + 1 end)\n",
+    )
+    .await;
+    feed(&rpc, "i"); // insert mode, where the map lives
+
+    // A plain `<CR>` fires the `<C-m>` map — they are one key (vim's ASCII aliasing).
+    feed(&rpc, "<CR>");
+    assert_eq!(
+        lua_u64(&rpc, "return _G.fired").await,
+        Some(1),
+        "<CR> fires the <C-m> map (the two are folded together)"
+    );
+
+    // `<S-CR>` / `<C-CR>` carry a modifier on `<Enter>` the fold never collapses, so
+    // they are distinct keys and do NOT fire the `<C-m>`/`<CR>` map.
+    feed(&rpc, "<S-CR>");
+    feed(&rpc, "<C-CR>");
+    assert_eq!(
+        lua_u64(&rpc, "return _G.fired").await,
+        Some(1),
+        "<S-CR>/<C-CR> are their own keys, not the <C-m>/<CR> mapping"
+    );
+}
+
 /// Start a server with `init_lua` but attach a UI that declares the **kitty
 /// keyboard protocol** active, so the four Ctrl-chords are NOT folded onto their
 /// named twins — the modern-terminal path.

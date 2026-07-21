@@ -39,7 +39,8 @@ fn sequence(cmd: impl crossterm::Command) -> Vec<u8> {
 
 fn push_sequence() -> Vec<u8> {
     sequence(PushKeyboardEnhancementFlags(
-        KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES,
+        KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
+            | KeyboardEnhancementFlags::REPORT_EVENT_TYPES,
     ))
 }
 

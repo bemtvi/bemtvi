@@ -159,28 +159,36 @@ impl<W: Write> Drop for BracketedPaste<W> {
 /// `KeyEvent`. Without it those chords are byte-identical to their unmodified form
 /// (Shift+Enter == Enter), so a `<S-CR>` mapping can never fire.
 ///
-/// Only `DISAMBIGUATE_ESCAPE_CODES` is requested — deliberately *not*
-/// `REPORT_EVENT_TYPES` / `REPORT_ALL_KEYS_AS_ESCAPE_CODES`, which would add
-/// key-repeat / release events and re-encode plain text, changing far more of the
-/// input stream than we want. This is the same conservative level neovim enables.
+/// `DISAMBIGUATE_ESCAPE_CODES | REPORT_EVENT_TYPES` is requested — byte-identical to
+/// what neovim pushes (`CSI > 3 u`). `DISAMBIGUATE` is what makes Ctrl+I/Ctrl+M/… CSI-u
+/// (distinct from Tab/Enter/…); some terminals only actually switch on the enhanced
+/// encoding once `REPORT_EVENT_TYPES` rides along, so we match neovim's pair rather
+/// than pushing `DISAMBIGUATE` alone (which left Ctrl+I arriving as a bare `<Tab>` on
+/// real terminals). `REPORT_ALL_KEYS_AS_ESCAPE_CODES` is deliberately NOT set — that
+/// re-encodes plain text too. The extra key-*release* events `REPORT_EVENT_TYPES`
+/// adds are dropped in the input loop (`key.kind != Release`); a *repeat* is treated
+/// as a press, exactly like the legacy repeated-press autorepeat.
 ///
-/// The push itself is unconditional here; the caller ([`run`]) only constructs the
-/// guard after [`crossterm::terminal::supports_keyboard_enhancement`] confirms the
-/// terminal speaks the protocol, so an unsupporting terminal is never sent the
-/// sequence. Like [`MouseCapture`] the guard is generic over the writer for
-/// in-memory testing; production uses `std::io::stdout()`.
+/// The caller ([`run`]) constructs this only when [`kitty_keyboard_enabled`] says the
+/// terminal supports the protocol (detected, or forced via `NXVIM_KITTY_KEYBOARD`), so
+/// the same decision drives both the push here and the `keyboard_protocol` capability
+/// reported to the server — the two must agree or a distinct `<C-i>` the terminal
+/// can't send would be parsed anyway. Like [`MouseCapture`] the guard is generic over
+/// the writer for in-memory testing; production uses `std::io::stdout()`.
 pub struct KeyboardEnhancement<W: Write> {
     out: W,
 }
 
 impl<W: Write> KeyboardEnhancement<W> {
     /// Push the `DISAMBIGUATE_ESCAPE_CODES` enhancement flag on `out`; the returned
-    /// guard pops it on drop. Only call once the terminal is known to support the
-    /// protocol (see [`run`]).
+    /// guard pops it on drop.
     pub fn push(mut out: W) -> Self {
         let _ = crossterm::execute!(
             out,
-            PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
+            PushKeyboardEnhancementFlags(
+                KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
+                    | KeyboardEnhancementFlags::REPORT_EVENT_TYPES
+            )
         );
         Self { out }
     }
@@ -189,6 +197,26 @@ impl<W: Write> KeyboardEnhancement<W> {
 impl<W: Write> Drop for KeyboardEnhancement<W> {
     fn drop(&mut self) {
         let _ = crossterm::execute!(self.out, PopKeyboardEnhancementFlags);
+    }
+}
+
+/// Whether to enable the kitty keyboard protocol at startup. By default this
+/// **detects** terminal support with [`crossterm::terminal::supports_keyboard_enhancement`]
+/// — so it must be called with raw mode already on but *before* the input
+/// [`EventStream`] exists (both true where [`run`] calls it), since the probe reads
+/// the terminal's reply off the same tty the stream would drain.
+///
+/// `NXVIM_KITTY_KEYBOARD` overrides detection in either direction: a falsey value
+/// (`0`/`false`/`off`/`no`, case-insensitive, or empty) forces it **off** for a
+/// terminal that mishandles the flags; any other value forces it **on**, the escape
+/// hatch for a supporting terminal whose probe reply raced and read as unsupported.
+fn kitty_keyboard_enabled() -> bool {
+    match std::env::var("NXVIM_KITTY_KEYBOARD").ok().as_deref() {
+        Some(v) => !matches!(
+            v.trim().to_ascii_lowercase().as_str(),
+            "" | "0" | "false" | "off" | "no"
+        ),
+        None => crossterm::terminal::supports_keyboard_enhancement().unwrap_or(false),
     }
 }
 
@@ -234,17 +262,19 @@ where
     // cells the first frame leaves blank are never painted, so stale content shows
     // through as "render leftover". The explicit clear makes the baseline real.
     let _ = terminal.clear();
-    // Enable the kitty keyboard protocol when the terminal supports it, so modified
-    // keys the legacy encoding can't express (`<S-CR>`, `<C-CR>`, `<C-S-…>`) reach
-    // the server. Detection queries the terminal and reads its reply — safe here
-    // because raw mode is already on (`ratatui::init`) and the `EventStream` that
-    // would contend for that reply isn't created until `event_loop` below. An
-    // unsupporting terminal (or a query that times out) leaves it off, so we never
-    // push a sequence it wouldn't understand. `None` ⇒ nothing to pop on exit.
-    let keyboard = match crossterm::terminal::supports_keyboard_enhancement() {
-        Ok(true) => Some(KeyboardEnhancement::push(std::io::stdout())),
-        _ => None,
-    };
+    // Enable the kitty keyboard protocol WHEN THE TERMINAL SUPPORTS IT, so modified
+    // keys the legacy encoding can't express (`<S-CR>`, `<C-CR>`, `<C-S-…>`, an
+    // unambiguous lone `<Esc>`) reach the server as distinct keys. Gating on real
+    // support is load-bearing, not just politeness: the client reports the same
+    // decision to the server as its `keyboard_protocol` capability, and the server
+    // then parses a *distinct* `<C-i>` / `<C-m>` / … only when the terminal can
+    // actually deliver one. Push-and-assume on a terminal that ignores the push (e.g.
+    // WezTerm with `enable_kitty_keyboard` off) would desync the two: the terminal
+    // still sends `<Tab>` for Ctrl+I while the server waits for a `<C-i>` that never
+    // comes, so the map dies. Detection must run here — raw mode is on (`ratatui::init`)
+    // but the `EventStream` that would race for the query reply isn't up until
+    // `event_loop`. `None` ⇒ legacy encoding, and nothing to pop on exit.
+    let keyboard = kitty_keyboard_enabled().then(|| KeyboardEnhancement::push(std::io::stdout()));
     // Capture mouse events so the panel's `[X]` is clickable.
     let mouse = MouseCapture::enable(std::io::stdout());
     // Restore the user's cursor shape on the way out — the loop switches it to a

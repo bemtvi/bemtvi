@@ -47,6 +47,19 @@ Downloads ship with checksums and SLSA build provenance — see
 > **Truecolor terminal recommended.** nxvim emits 24-bit color escapes; use a
 > modern terminal with truecolor support.
 
+> **Distinct modified keys need the kitty keyboard protocol.** Chords the legacy
+> terminal encoding can't tell apart — `<C-i>` vs `<Tab>`, `<C-m>` vs `<CR>`,
+> `<C-[>` vs `<Esc>`, and combos like `<S-CR>` / `<C-CR>` — are only distinguishable
+> when the terminal speaks the [kitty keyboard
+> protocol](https://sw.kovidgoyal.net/kitty/keyboard-protocol/). nxvim turns it on
+> automatically when the terminal advertises support: **kitty**, **Ghostty**, and
+> **foot** enable it by default, but **WezTerm** needs `enable_kitty_keyboard = true`.
+> Without it those chords fold onto their legacy twin
+> (`<C-i>` acts as `<Tab>`), exactly like classic vim — so bindings still work, they
+> just can't be told apart. (Unlike neovim, nxvim's terminal layer only speaks the
+> kitty protocol, not xterm's older `modifyOtherKeys`.) Force the decision either way
+> with `NXVIM_KITTY_KEYBOARD=1` / `=0`.
+
 The terminal editor is the whole thing in one binary: it embeds the server on
 its own thread and runs the client on the main thread, joined over the same
 msgpack-RPC the UI clients speak.

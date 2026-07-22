@@ -647,9 +647,10 @@ pub struct MenuData {
     /// for a kind-less row (a `buffer` word). Empty when no row carries a kind (every
     /// non-completion menu): the server omits the `kinds` key entirely then.
     pub kinds: Vec<Option<String>>,
-    /// The content column where every row's kind label starts (just past the widest
-    /// label), so the kinds align into one column. `None` ⇒ no kind column projected;
-    /// the client then right-aligns each kind on its own row (the fallback).
+    /// The content column just past the widest label — the label-truncation boundary
+    /// and the start of the widest kind. Clients right-align each row's kind flush to
+    /// the box's right edge; this column keeps even the widest kind clear of the label.
+    /// `None` ⇒ no kind column projected (kind-less menu, or a box too narrow for one).
     pub kind_col: Option<u16>,
     /// The picker preview pane (Phase 3), present when the source declared a
     /// `preview` kind. `None` for a `select` / preview-less picker — then the box is

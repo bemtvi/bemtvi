@@ -2676,10 +2676,10 @@ impl Renderer {
             // match spans are remapped onto the elided string to stay aligned.
             let empty = Vec::new();
             let spans = menu.match_spans.get(idx).unwrap_or(&empty);
-            // Aligned kind column (`Snippet`, `Function`, …): the server projects
-            // `kind_col` — the column every kind starts at, just past the widest label —
-            // so they line up. The label region ends there (its padding is the gap); a
-            // kind-less row still reserves it so labels stay aligned.
+            // Kind column (`Snippet`, `Function`, …), right-aligned flush to the box's
+            // right edge. The label region is truncated at `kind_col` — the widest kind's
+            // start, just past the widest label — so even the widest kind clears the label;
+            // shorter kinds sit further right, each touching the edge.
             let kind = menu
                 .kinds
                 .get(idx)
@@ -2696,7 +2696,11 @@ impl Renderer {
                     } else {
                         blend(fg, popup_bg)
                     };
-                    self.push_plain(items, k, self.cell_px(cx + kc, row), kind_fg, full);
+                    // Start column = right edge minus the kind's width, clamped so it
+                    // never overlaps the label region.
+                    let kind_w = k.chars().count() as u16;
+                    let kind_x = list_w.saturating_sub(kind_w).max(kc);
+                    self.push_plain(items, k, self.cell_px(cx + kind_x, row), kind_fg, full);
                 }
             }
             // Overdraw the matched characters in the accent color (monospace, so

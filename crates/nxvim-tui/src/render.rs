@@ -3025,11 +3025,11 @@ fn menu_row_line(
         out.push(Span::styled(glyph.to_string(), st));
         used += 2;
     }
-    // Aligned **kind** column (`Snippet`, `Function`, …): the server projects `kind_col`
-    // — the column every row's kind starts at, just past the widest label — so they line
-    // up. The label region ends there (its trailing padding is the gap before the kind);
-    // a kind-less row still reserves the column so labels stay aligned. Absent ⇒ the box
-    // was too narrow for a kind column, so no kind is drawn (the label fills the row).
+    // **Kind** column (`Snippet`, `Function`, …), right-aligned flush to the box's right
+    // edge. The label region is truncated at `kind_col` — the widest kind's start, just
+    // past the widest label — so even the widest kind clears the label; shorter kinds sit
+    // further right, each touching the edge. Absent ⇒ the box was too narrow for a kind
+    // column, so no kind is drawn (the label fills the row).
     let kind = kind.filter(|k| !k.is_empty());
     let label_end = kind_col.map_or(width, |kc| kc.min(width));
     // Path-priority truncation: when the row overflows, keep the file name (the
@@ -3061,18 +3061,20 @@ fn menu_row_line(
         let style = if run_matched { matched } else { base };
         out.push(Span::styled(run, style));
     }
-    // Pad the label region out to the kind column (this padding is the gap before the
-    // kind). A kind-less row pads to the same column so the kinds stay aligned.
-    if used < label_end {
-        out.push(Span::styled(" ".repeat(label_end - used), base));
-        used = label_end;
-    }
-    // The kind at `kind_col` (dim, so it recedes behind the label), truncated to what's
-    // left. Only drawn when the row carries a kind and the column was projected.
+    // The kind right-aligned to the box's right edge (dim, so it recedes behind the
+    // label): pad the gap after the label out to where the kind starts (`width - kind
+    // width`), then draw it flush-right, truncated to what's left. Only drawn when the
+    // row carries a kind and the column was projected; a kind-less row skips straight to
+    // the fill below.
     if let Some(k) = kind.filter(|_| kind_col.is_some()) {
         let text: String = k.chars().take(width.saturating_sub(used)).collect();
-        used += text.chars().count();
+        let kind_w = text.chars().count();
+        let kind_start = width.saturating_sub(kind_w).max(used);
+        if used < kind_start {
+            out.push(Span::styled(" ".repeat(kind_start - used), base));
+        }
         out.push(Span::styled(text, base.add_modifier(Modifier::DIM)));
+        used = kind_start + kind_w;
     }
     // Fill any remainder so a selected row's background reaches the box edge.
     if used < width {

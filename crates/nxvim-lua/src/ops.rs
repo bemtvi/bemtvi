@@ -1850,6 +1850,10 @@ pub struct CompleteSetupReq {
     /// swaps the whole word, `"insert"` keeps the suffix past the cursor. The server
     /// maps this to [`AcceptBehavior`](nxvim_core::AcceptBehavior).
     pub accept: String,
+    /// Whether the confirm key accepts the first row when nothing is selected yet
+    /// (Enter-to-accept). `false` (default) keeps the noselect popup inert until a row
+    /// is navigated to, so a mapped `<CR>` stays a newline.
+    pub confirm_first: bool,
 }
 
 /// A `nx.snippet.setup{}` request: the tabstop-jump keys as vim notation lists

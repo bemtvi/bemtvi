@@ -115,6 +115,14 @@ pub struct CompleteConfig {
     /// merged view ranks higher-priority sources (e.g. `lsp`) first. `0` when the
     /// `buffer` source is not configured.
     pub buffer_priority: i32,
+    /// Whether the confirm key accepts the **first** row when nothing is selected yet
+    /// (Enter-to-accept). The popup opens *noselect* — nothing highlighted until you
+    /// navigate. With this off (default), confirm is inert until you pick a row, so a
+    /// mapped `<CR>` still inserts a newline while the popup is up. With it on, confirm
+    /// takes the top row even without navigating (an explicit selection still wins). A
+    /// manual trigger preselects row 0 regardless, so this only changes the auto-typed,
+    /// un-navigated case.
+    pub confirm_first: bool,
     /// Show the **docs sidebar** beside the popup (the widget-spec `preview =
     /// "markdown"` kind): the selected item's documentation, rendered by the server
     /// from its LSP item cache (`completionItem/resolve` for lazy docs). On by
@@ -146,6 +154,7 @@ impl Default for CompleteConfig {
             accept: AcceptBehavior::default(),
             has_async: false,
             buffer_priority: 0,
+            confirm_first: false,
             docs: true,
             docs_wrap: true,
             trigger_chars: Vec::new(),

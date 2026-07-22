@@ -185,7 +185,7 @@ local function reconcile()
 
   nx._complete_setup(
     cfg.auto == true,
-    -- `{ open, buffer, lsp, snippets }` min_chars gates (a single tuple slot): the
+    -- `{ open, buffer, lsp, snippets }` min_chars gates (one packed tuple slot): the
     -- global open gate plus each native source's own threshold. Lua sources carry
     -- theirs on `nx._complete.sources` (gated in `nx._complete_run`).
     { min_chars, buffer_min_chars, lsp_min_chars, snippets_min_chars },
@@ -195,14 +195,14 @@ local function reconcile()
     key_list(keys.abort, "abort"),
     has_async,
     saw_lsp,
-    buffer_priority,
-    lsp_priority,
+    -- `{ buffer, lsp, snippets }` merge priorities (one packed tuple slot).
+    { buffer_priority, lsp_priority, snippets_priority },
     cfg.docs == true,
     cfg.docs_wrap == true,
     trigger_chars,
     saw_snippets,
-    snippets_priority,
-    cfg.accept
+    cfg.accept,
+    cfg.confirm_first == true
   )
 end
 
@@ -228,6 +228,10 @@ end
 -- keys do when the caret is in the *middle* of a word: `"replace"` swaps the whole
 -- word, `"insert"` keeps the suffix past the cursor. `nx.complete.accept{ behavior }`
 -- overrides it for a specific key (bind one key to each behavior).
+-- `confirm` (default `"selected"`) decides what a confirm key does when **nothing is
+-- selected** — the popup is noselect until you navigate. `"selected"` keeps confirm
+-- inert (a mapped `<CR>` still inserts a newline until you pick a row); `"first"` accepts
+-- the top row un-navigated (Enter-to-accept). An explicit selection confirms either way.
 function nx.complete.setup(opts)
   opts = opts or {}
   if type(opts) ~= "table" then
@@ -308,6 +312,18 @@ function nx.complete.setup(opts)
   elseif accept ~= "insert" and accept ~= "replace" then
     error("nx.complete.setup: `accept` must be 'insert' or 'replace', got " .. tostring(accept))
   end
+  -- `confirm` (default "selected") decides what a confirm key (`keys.confirm`) does when
+  -- **nothing is selected yet** — the popup opens *noselect* (nothing highlighted until
+  -- you navigate with `<C-n>`/`<C-p>`). "selected" leaves confirm inert until you pick a
+  -- row, so a mapped `<CR>` still inserts a newline while the popup is up (the safe
+  -- default). "first" makes confirm accept the *top* row even un-navigated (Enter-to-
+  -- accept). An explicit selection always confirms under either mode.
+  local confirm = opts.confirm
+  if confirm == nil then
+    confirm = "selected"
+  elseif confirm ~= "selected" and confirm ~= "first" then
+    error("nx.complete.setup: `confirm` must be 'selected' or 'first', got " .. tostring(confirm))
+  end
 
   -- Capture the engine config so a later `nx.complete.source{}` can reconcile the
   -- active set against it without a fresh `setup{}`. `reconcile` derives everything
@@ -318,6 +334,7 @@ function nx.complete.setup(opts)
     docs = docs,
     docs_wrap = docs_wrap,
     accept = accept,
+    confirm_first = confirm == "first",
     top_min = top_min,
     keys = opts.keys or {},
     exclusive = opts.exclusive == true,

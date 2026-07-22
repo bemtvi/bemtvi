@@ -505,6 +505,48 @@ async fn cr_accepts_once_you_have_navigated() {
     assert_eq!(lines(&rpc).await, vec!["hello hello"]);
 }
 
+/// `nx.complete.setup { confirm = "first" }` flips the noselect default: a confirm
+/// key accepts the TOP row even when nothing has been navigated to (Enter-to-accept).
+#[tokio::test]
+async fn confirm_first_accepts_the_top_row_unnavigated() {
+    let dir = temp_dir("complete_confirm_first");
+    let (rpc, mut incoming) = start(
+        &dir,
+        "nx.complete.setup { sources = { { 'buffer', min_chars = 2 } }, confirm = 'first' }",
+    )
+    .await;
+
+    // Popup opens with nothing selected — but under `confirm = "first"`, <CR> accepts
+    // the first row instead of inserting a newline.
+    feed(&rpc, "ihello he");
+    let menu = menu_of(&poll_menu(&rpc, &mut incoming).await.expect("popup opens"));
+    assert_eq!(
+        map_get(&menu, "selected_active").and_then(Value::as_bool),
+        Some(false),
+        "still noselect — nothing is preselected"
+    );
+    feed(&rpc, "<CR>");
+    assert_eq!(lines(&rpc).await, vec!["hello hello"]);
+}
+
+/// The default (`confirm = "selected"`, unset) is unchanged by the new option: an
+/// unnavigated `<CR>` still makes a newline. Guards that the flag defaults off.
+#[tokio::test]
+async fn confirm_selected_is_the_default_and_keeps_the_newline() {
+    let dir = temp_dir("complete_confirm_selected_default");
+    // Explicit `confirm = "selected"` — must behave exactly like the built-in default.
+    let (rpc, mut incoming) = start(
+        &dir,
+        "nx.complete.setup { sources = { { 'buffer', min_chars = 2 } }, confirm = 'selected' }",
+    )
+    .await;
+
+    feed(&rpc, "ihello he");
+    poll_menu(&rpc, &mut incoming).await.expect("popup opens");
+    feed(&rpc, "<CR>");
+    assert_eq!(lines(&rpc).await, vec!["hello he", ""]);
+}
+
 fn menu_col(menu: &[(Value, Value)]) -> u64 {
     map_get(menu, "col")
         .and_then(Value::as_u64)

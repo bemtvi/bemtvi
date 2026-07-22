@@ -1254,11 +1254,20 @@ impl Editor {
     /// insert handling, so `<CR>` makes a newline rather than accepting a row the
     /// user never picked. The caller applies the edit (replacing `[anchor .. cursor)`).
     pub(crate) fn complete_take_accept(&mut self) -> Option<CompleteAcceptance> {
+        let confirm_first = self.complete_config.confirm_first;
         let m = self.completion_menu_mut()?;
-        if !m.selected_active {
+        // Which view row to accept: the active selection when the user has navigated to
+        // one; otherwise — only when `confirm_first` is set — the first row (Enter-to-
+        // accept). A noselect menu with `confirm_first` off accepts nothing, so the
+        // caller lets the confirm key fall through (e.g. `<CR>` inserts a newline).
+        let view_idx = if m.selected_active {
+            m.cursor
+        } else if confirm_first && m.view_len() > 0 {
+            0
+        } else {
             return None;
-        }
-        let row = m.all_items.get(m.item_at(m.cursor))?;
+        };
+        let row = m.all_items.get(m.item_at(view_idx))?;
         let acc = CompleteAcceptance {
             anchor: m.anchor,
             insert: row.insert.clone().unwrap_or_else(|| row.label.clone()),

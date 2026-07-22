@@ -1084,6 +1084,7 @@ impl EditHost {
                 accept: parse_accept_behavior(&req.accept),
                 has_async: req.has_async,
                 buffer_priority: req.buffer_priority,
+                confirm_first: req.confirm_first,
                 docs: req.docs,
                 docs_wrap: req.docs_wrap,
                 trigger_chars: req.trigger_chars.chars().collect(),

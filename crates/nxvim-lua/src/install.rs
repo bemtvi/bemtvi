@@ -2979,19 +2979,22 @@ pub(crate) fn install_runtime_api(
         })?,
     )?;
 
-    // `nx._complete_setup(auto, min_chars, next, prev, confirm, abort, has_async)`:
+    // `nx._complete_setup(auto, min_chars, next, prev, confirm, abort, has_async, lsp,
+    // priorities, docs, docs_wrap, trigger_chars, snippets, accept, confirm_first)`:
     // queue a native completion-engine configuration ([`CompleteSetupReq`]). Each key
     // argument is a list of vim notation strings (`{ "<C-n>", "<Tab>" }`); an empty
     // list keeps that action's built-in default. `has_async` is true when at least one
     // configured source is a Lua `complete` function (`nx.complete.source{}`), so the
-    // engine dispatches it off the input path. The Lua wrapper (`prelude/complete.lua`)
-    // validates the source list before calling this.
+    // engine dispatches it off the input path. `confirm_first` accepts the top row when
+    // nothing is selected. The Lua wrapper (`prelude/complete.lua`) validates the source
+    // list before calling this.
     let sh = shared.clone();
-    // `min_chars` is passed as a fixed 4-element list `{ open, buffer, lsp, snippets }`
-    // (a single tuple slot — mlua caps `create_function` tuples at 16, and this call
-    // already uses all 16): the global open gate plus each native source's own gate.
-    // Missing / short entries default to `1`. Per-source `min_chars` for *Lua* sources
-    // rides `nx._complete.sources` instead (gated in `nx._complete_run`).
+    // Two args are **packed lists** so the whole config fits mlua's 16-element
+    // `create_function` tuple cap: `min_chars` is `{ open, buffer, lsp, snippets }` (the
+    // global open gate plus each native source's own gate; missing entries default to
+    // `1`), and `priorities` is `{ buffer, lsp, snippets }` (merge rank per native
+    // source; missing entries default to `0`). Per-source `min_chars` / `priority` for
+    // *Lua* sources ride `nx._complete.sources` instead (gated in `nx._complete_run`).
     type CompleteSetupArgs = (
         bool,
         Vec<usize>,
@@ -3001,14 +3004,13 @@ pub(crate) fn install_runtime_api(
         Vec<String>,
         bool,
         bool,
-        i32,
-        i32,
+        Vec<i32>,
         bool,
         bool,
         String,
         bool,
-        i32,
         String,
+        bool,
     );
     nx.set(
         "_complete_setup",
@@ -3023,16 +3025,16 @@ pub(crate) fn install_runtime_api(
                 abort,
                 has_async,
                 lsp,
-                buffer_priority,
-                lsp_priority,
+                priorities,
                 docs,
                 docs_wrap,
                 trigger_chars,
                 snippets,
-                snippets_priority,
                 accept,
+                confirm_first,
             ): CompleteSetupArgs| {
                 let mc = |i: usize| min_chars.get(i).copied().unwrap_or(1);
+                let prio = |i: usize| priorities.get(i).copied().unwrap_or(0);
                 sh.borrow_mut().complete_setups.push(CompleteSetupReq {
                     auto,
                     min_chars: mc(0),
@@ -3045,14 +3047,15 @@ pub(crate) fn install_runtime_api(
                     abort,
                     has_async,
                     lsp,
-                    buffer_priority,
-                    lsp_priority,
+                    buffer_priority: prio(0),
+                    lsp_priority: prio(1),
                     docs,
                     docs_wrap,
                     trigger_chars,
                     snippets,
-                    snippets_priority,
+                    snippets_priority: prio(2),
                     accept,
+                    confirm_first,
                 });
                 Ok(())
             },

@@ -680,6 +680,72 @@ nx.complete.setup { sources = { { 'echo' } }, min_chars = 2 }";
     assert_eq!(lines(&rpc).await, vec!["abc"]);
 }
 
+/// A source registered with `nx.complete.source{}` **after** `nx.complete.setup{}` has
+/// already run — and never named in `setup{ sources }` — still joins the live engine
+/// and contributes candidates. This is the incremental seam a plugin relies on: it adds
+/// completions by registering, without the user re-listing every source up front.
+#[tokio::test]
+async fn a_source_registered_after_setup_joins_the_live_engine() {
+    let dir = temp_dir("complete_incremental_join");
+    // Set the engine up with only `buffer` — no async source, so `has_async` starts
+    // false and no off-input dispatch is armed.
+    let (rpc, mut incoming) = start(&dir, "nx.complete.setup { sources = { { 'buffer' } } }").await;
+
+    // Now register an echo source at *runtime*, after setup. `reconcile` (called from
+    // `source{}`) must re-derive the active set — flipping `has_async` on and arming the
+    // dispatch — even though the user never touched `setup{}` again.
+    exec_lua(
+        &rpc,
+        "nx.complete.source {\n\
+           name = 'late', debounce = 0,\n\
+           complete = function(ctx)\n\
+             if ctx.prefix ~= '' then ctx.push(ctx.prefix .. '_late') end\n\
+           end,\n\
+         }",
+    )
+    .await;
+
+    // Typing dispatches the just-registered source; its candidate lands in the popup.
+    feed(&rpc, "iab");
+    let menu = menu_of(&poll_menu(&rpc, &mut incoming).await.expect("popup opens"));
+    assert!(
+        menu_items(&menu).contains(&"ab_late".to_string()),
+        "the after-setup source contributes: {:?}",
+        menu_items(&menu)
+    );
+}
+
+/// `nx.complete.setup { exclusive = true }` opts out of auto-join: a registered source
+/// that is *not* named in `setup{ sources }` stays dormant, restoring tight control for
+/// a config that wants exactly its listed sources and nothing a plugin registers.
+#[tokio::test]
+async fn exclusive_setup_ignores_an_unlisted_registered_source() {
+    let dir = temp_dir("complete_exclusive");
+    let init = "\
+nx.complete.source {\n\
+  name = 'echo', debounce = 0,\n\
+  complete = function(ctx)\n\
+    if ctx.prefix ~= '' then ctx.push(ctx.prefix .. '_async') end\n\
+  end,\n\
+}\n\
+nx.complete.setup { sources = { { 'buffer', min_chars = 2 } }, exclusive = true }";
+    let (rpc, mut incoming) = start(&dir, init).await;
+
+    // `hello` is a buffer word; typing `he` opens the popup on the buffer match alone —
+    // the registered-but-unlisted `echo` source does NOT contribute under `exclusive`.
+    feed(&rpc, "ihello he");
+    let menu = menu_of(&poll_menu(&rpc, &mut incoming).await.expect("popup opens"));
+    let items = menu_items(&menu);
+    assert!(
+        items.contains(&"hello".to_string()),
+        "the listed buffer source still contributes: {items:?}"
+    );
+    assert!(
+        !items.contains(&"he_async".to_string()),
+        "the unlisted source is dormant under exclusive: {items:?}"
+    );
+}
+
 /// Entering Select mode (`nx.win.select_range`, the seam a plugin snippet engine uses
 /// to land on a tabstop) closes any open completion popup — otherwise a popup left up
 /// from typing would linger and follow the cursor to the next tabstop.

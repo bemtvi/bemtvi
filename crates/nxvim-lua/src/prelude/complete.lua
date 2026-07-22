@@ -7,10 +7,15 @@
 -- per keystroke (ADR 0002 rule 4); the `lsp` source is server-native; `snippets` is
 -- a built-in; and plugin sources register via `nx.complete.source{}`.
 --
--- `nx.complete.setup{}` validates the configured sources, resolves the options, and
--- hands them to the server via `nx._complete_setup`. `nx.complete.source{}` registers
--- an async plugin source and `nx.complete.trigger()` opens the popup manually; an
--- unknown source name fails loud rather than silently no-opping.
+-- `nx.complete.setup{}` captures the engine options (keys, `auto`, the built-in
+-- sources) and hands them to the server via `nx._complete_setup`. `nx.complete.source{}`
+-- registers an async plugin source **and joins it to the live engine incrementally** —
+-- a source registered after `setup{}` (or lazy-loaded) starts contributing without the
+-- user re-listing it, so a plugin adds completions by registering, not by asking the
+-- user to route it. Both funnel through `reconcile()`, which derives the active set
+-- from the captured config plus the whole source registry and re-pushes it to the
+-- server. `nx.complete.trigger()` opens the popup manually; a source name explicitly
+-- listed in `setup{ sources }` that is neither built-in nor registered fails loud.
 
 nx.complete = nx.complete or {}
 -- Registered async sources (`nx.complete.source{}`), keyed by name. Each is a
@@ -57,12 +62,161 @@ local function key_list(spec, action)
   error("nx.complete.setup: keys." .. action .. " must be a string or list of strings")
 end
 
+-- reconcile(): derive the ACTIVE completion set from the engine config captured by
+-- the last `nx.complete.setup{}` (`nx.complete._config`) plus **every** source
+-- registered with `nx.complete.source{}`, then (re)push it to the server. `setup{}`
+-- calls it once; every later `source{}` calls it again — so a plugin source
+-- registered *after* the user's `setup{}` (or lazy-loaded) joins the live engine
+-- without the user re-listing it. A no-op until `setup{}` has run (the config it
+-- reads doesn't exist yet); a `source{}` registered first is picked up when `setup{}`
+-- eventually reconciles. A registered source is active by default; `setup{ exclusive
+-- = true }` restricts the active set to only the sources named in `setup{ sources }`.
+local function reconcile()
+  local cfg = nx.complete._config
+  if not cfg then
+    return
+  end
+
+  -- The native sources' gates/priorities (defaults leave `buffer` seeding at 1, as
+  -- core always scans it) and the min across every active source (the global open
+  -- gate). `all_min` starts nil and lowers as sources are seen.
+  local buffer_min_chars, lsp_min_chars, snippets_min_chars = 1, 1, 1
+  local buffer_priority, lsp_priority, snippets_priority = 0, 0, 0
+  local saw_lsp, saw_snippets = false, false
+  local all_min = nil
+  local function lower(mc)
+    all_min = math.min(all_min or mc, mc)
+  end
+
+  local bi = cfg.builtins
+  if bi.buffer then
+    buffer_priority, buffer_min_chars = bi.buffer.priority, bi.buffer.min_chars
+    lower(bi.buffer.min_chars)
+  end
+  if bi.lsp then
+    saw_lsp, lsp_priority, lsp_min_chars = true, bi.lsp.priority, bi.lsp.min_chars
+    lower(bi.lsp.min_chars)
+  end
+  if bi.snippets then
+    saw_snippets, snippets_priority, snippets_min_chars =
+      true, bi.snippets.priority, bi.snippets.min_chars
+    lower(bi.snippets.min_chars)
+  end
+
+  -- Every registered plugin source joins the active set (that is the incremental
+  -- seam) unless `exclusive` mode limits it to the named ones, or it was opted out
+  -- with `enabled = false` (on the spec or the `setup{}` entry). Per-source options
+  -- resolve override (the `setup{}` entry) → the source's own default → the global
+  -- fallback. The union of their trigger chars is handed to the engine.
+  local async = {}
+  local trigger_set, trigger_chars = {}, ""
+  for name, registered in pairs(nx.complete._sources) do
+    local override = cfg.overrides[name]
+    local off = registered.enabled == false or (override and override.enabled == false)
+    local active = not off and ((not cfg.exclusive) or override ~= nil)
+    if active then
+      -- Merge priority: the `setup{}` entry's explicit override wins, else the source's
+      -- own declared `priority`, else the plugin-source default (0). Higher wins.
+      local priority = (override and override.priority) or registered.priority or 0
+      -- Per-source `min_chars`: the entry override, else the source's own declared
+      -- default, else the top-level `min_chars`, else 1. The source contributes only
+      -- once the prefix reaches it (checked in `nx._complete_run`); a trigger-char
+      -- source or a manual trigger bypasses it.
+      local min_chars = (override and override.min_chars)
+        or registered.min_chars
+        or cfg.top_min
+        or 1
+      -- Debounce: the entry override wins over the source's own (resolved to the
+      -- global default at run time when both are nil).
+      local debounce = (override and override.debounce) or registered.debounce
+      local chars = registered.trigger and registered.trigger.chars or nil
+      if chars then
+        for _, c in ipairs(chars) do
+          if not trigger_set[c] then
+            trigger_set[c] = true
+            trigger_chars = trigger_chars .. c
+          end
+        end
+      end
+      lower(min_chars)
+      async[#async + 1] = {
+        name = name,
+        complete = registered.complete,
+        resolve = registered.resolve,
+        debounce = debounce,
+        chars = chars,
+        min_chars = min_chars,
+        priority = priority,
+      }
+    end
+  end
+  -- The global open gate: the popup opens at the lowest per-source threshold (each
+  -- source then filters by its own). Falls back to the top-level / default when empty.
+  local min_chars = all_min or cfg.top_min or 1
+
+  -- (Re)publish the active async sources for `nx._complete_run`. A live reconcile (a
+  -- late `source{}`) preserves the in-flight lazy-docs / on_accept bookkeeping and the
+  -- current generation so an open popup mid-resolve isn't torn down; a first setup
+  -- starts them fresh (`prev` is nil).
+  local prev = nx._complete
+  nx._complete = {
+    sources = async,
+    gen = prev and prev.gen or 0,
+    debounce = nx.complete.debounce,
+    -- The global trigger-char set: in a trigger context a *plain* source (no
+    -- `trigger`) stays quiet, so it doesn't compete with the trigger-char source.
+    triggers = trigger_set,
+    -- Lazy-docs (`resolve`) bookkeeping: a monotonic id stamped onto each resolvable
+    -- pushed row and a map id → { resolve, item } the server's
+    -- `nx._complete_resolve(id)` looks the callback + original item up in.
+    resolve_next = prev and prev.resolve_next or 0,
+    resolve_items = prev and prev.resolve_items or {},
+    -- `on_accept` bookkeeping, shaped like the resolve map: a monotonic id stamped
+    -- onto each pushed row that carries an `on_accept`, and a map id → { on_accept,
+    -- item } the server's `nx._complete_run_accept(id, …)` looks the callback up in
+    -- when that row is accepted (its accept is delegated so core doesn't splice).
+    accept_next = prev and prev.accept_next or 0,
+    accept_items = prev and prev.accept_items or {},
+  }
+  -- The server-native `lsp` and `snippets` sources both dispatch off the input path,
+  -- so either (like a Lua async source) needs the `(gen, ctx)` emit.
+  local has_async = #async > 0 or saw_lsp or saw_snippets
+  local keys = cfg.keys
+
+  nx._complete_setup(
+    cfg.auto == true,
+    -- `{ open, buffer, lsp, snippets }` min_chars gates (a single tuple slot): the
+    -- global open gate plus each native source's own threshold. Lua sources carry
+    -- theirs on `nx._complete.sources` (gated in `nx._complete_run`).
+    { min_chars, buffer_min_chars, lsp_min_chars, snippets_min_chars },
+    key_list(keys.next, "next"),
+    key_list(keys.prev, "prev"),
+    key_list(keys.confirm, "confirm"),
+    key_list(keys.abort, "abort"),
+    has_async,
+    saw_lsp,
+    buffer_priority,
+    lsp_priority,
+    cfg.docs == true,
+    cfg.docs_wrap == true,
+    trigger_chars,
+    saw_snippets,
+    snippets_priority,
+    cfg.accept
+  )
+end
+
 -- nx.complete.setup { sources = { { `"buffer"`, min_chars = 3 } }, auto = true,
 --   keys = { next = `"<C-n>"`, prev = `"<C-p>"`, confirm = { `"<C-y>"`, `"<CR>"` }, abort = `"<C-e>"` } }
 -- (`confirm` accepts the highlighted row; `<CR>` only accepts once you've navigated
 --  to one — an unnavigated popup is noselect, so Enter still inserts a newline.)
--- Enables the engine. `sources` is a list of `{ name, opts... }` entries — a
--- built-in (`buffer` / `lsp` / `snippets`) or a registered plugin source.
+-- Enables the engine and captures its options. `sources` is a list of `{ name, opts... }`
+-- entries — a built-in (`buffer` / `lsp` / `snippets`) or a registered plugin source.
+-- Listing a plugin source is **optional**: every source registered with
+-- `nx.complete.source{}` is active by default, so a plugin adds completions just by
+-- registering (even after this call). List it only to override its options (`min_chars`
+-- / `priority` / `debounce`) or to name it under `exclusive` mode. `exclusive = true`
+-- restricts the active set to only the sources named here (opt out of auto-join).
 -- `min_chars` gates how many prefix chars a source needs before it contributes, and is
 -- honored **per source**: `{ "buffer", min_chars = 3 }, { "nxsnip", min_chars = 2 }`
 -- shows snippets from 2 chars while buffer words wait for 3. A top-level `min_chars`
@@ -85,30 +239,15 @@ function nx.complete.setup(opts)
     error("nx.complete.setup: `sources` must be a list")
   end
 
-  -- Validate every source name; resolve each source's `min_chars` (per-source override,
-  -- else the top-level `opts.min_chars`, else 1), the per-source merge priority, whether
-  -- the `lsp`/`snippets` sources are configured, and the active async sources (registered
-  -- via `nx.complete.source{}`). `min_chars` is now honored **per source** — a source
-  -- contributes only once the prefix reaches its own threshold; the popup opens at the
-  -- minimum across all of them (the global open gate).
+  -- Split the listed sources into built-in activations (`buffer` / `lsp` / `snippets`,
+  -- with their resolved priority + gate) and per-plugin-source option overrides. A
+  -- *listed* name that is neither built-in nor registered fails loud; an *unlisted*
+  -- registered source still auto-joins (via `reconcile`).
   local top_min = opts.min_chars
-  local function resolve_mc(src)
-    local m = type(src) == "table" and src.min_chars or nil
-    return m or top_min or 1
-  end
-  -- The native sources' own gates (default 1); the min across every source is the
-  -- global open gate. `all_min` starts nil and lowers as sources are seen.
-  local buffer_min_chars, lsp_min_chars, snippets_min_chars = 1, 1, 1
-  local all_min = nil
-  local async = {}
-  local saw_lsp = false
-  local saw_snippets = false
-  local buffer_priority, lsp_priority, snippets_priority = 0, 0, 0
-  -- The union of every active source's trigger chars, as a set (dedup) and an
-  -- ordered string handed to the engine (`trigger_chars`). Each char wakes only the
-  -- source(s) that declared it; the engine folds it into the prefix/anchor.
-  local trigger_set, trigger_chars = {}, ""
+  local builtins = {}
+  local overrides = {}
   for _, src in ipairs(sources) do
+    local o = type(src) == "table" and src or {}
     local name = type(src) == "table" and src[1] or src
     if type(name) ~= "string" then
       error("nx.complete.setup: each source needs a string name as element [1]")
@@ -119,65 +258,28 @@ function nx.complete.setup(opts)
         "nx.complete source '"
           .. name
           .. "' not found — register it with nx.complete.source{} first, or use a "
-          .. "built-in ('buffer' / 'lsp'). See docs/plans/2026-06-15-nx-complete-completion-engine.md"
+          .. "built-in ('buffer' / 'lsp' / 'snippets'). "
+          .. "See docs/plans/2026-06-15-nx-complete-completion-engine.md"
       )
     end
-    -- Resolve this entry's merge priority: the setup entry's explicit override wins,
-    -- else the registered source's own `priority` (an async source declares its rank at
-    -- `nx.complete.source{ priority = … }`), else the built-in default, else 0. Higher
-    -- wins in the merged view (priority descending, then fuzzy score).
-    local priority = (type(src) == "table" and src.priority)
-      or (registered and registered.priority)
-      or DEFAULT_PRIORITY[name]
-      or 0
-    local smc = resolve_mc(src)
-    all_min = math.min(all_min or smc, smc)
-    if name == "buffer" then
-      buffer_priority = priority
-      buffer_min_chars = smc
-    elseif name == "lsp" then
-      saw_lsp = true
-      lsp_priority = priority
-      lsp_min_chars = smc
-    elseif name == "snippets" then
-      saw_snippets = true
-      snippets_priority = priority
-      snippets_min_chars = smc
-    end
-    if registered then
-      -- A per-entry `debounce` override (`{ "name", debounce = N }`) wins over the
-      -- source's own, which wins over the global default (resolved at run time).
-      local debounce = (type(src) == "table" and src.debounce) or registered.debounce
-      -- The source's trigger chars (if any) gate its dispatch (`nx._complete_run`)
-      -- and join the engine's `trigger_chars` so core folds them into the prefix.
-      local chars = registered.trigger and registered.trigger.chars or nil
-      if chars then
-        for _, c in ipairs(chars) do
-          if not trigger_set[c] then
-            trigger_set[c] = true
-            trigger_chars = trigger_chars .. c
-          end
-        end
-      end
-      async[#async + 1] = {
-        name = name,
-        complete = registered.complete,
-        resolve = registered.resolve,
-        debounce = debounce,
-        chars = chars,
-        -- The source contributes only once the prefix reaches its own gate (checked in
-        -- `nx._complete_run`); a trigger-char source or a manual trigger bypasses it.
-        min_chars = smc,
-        -- The merge priority stamped onto every row this source pushes, so an async
-        -- source (a snippet engine) ranks against `buffer` / `lsp` by priority, not
-        -- always at the `0` floor.
-        priority = priority,
+    if BUILTIN_SOURCES[name] then
+      -- A built-in's priority resolves from the entry, else its default; its gate from
+      -- the entry, else the top-level `min_chars`, else 1.
+      builtins[name] = {
+        priority = o.priority or DEFAULT_PRIORITY[name] or 0,
+        min_chars = o.min_chars or top_min or 1,
+      }
+    else
+      -- Only carry the explicitly-set overrides; `reconcile` fills the rest from the
+      -- source's own declared defaults so an unlisted source resolves identically.
+      overrides[name] = {
+        priority = o.priority,
+        min_chars = o.min_chars,
+        debounce = o.debounce,
+        enabled = o.enabled,
       }
     end
   end
-  -- The global open gate: the popup opens at the lowest per-source threshold (each
-  -- source then filters by its own). Falls back to the top-level / default when empty.
-  local min_chars = all_min or top_min or 1
 
   local auto = opts.auto
   if auto == nil then
@@ -206,56 +308,25 @@ function nx.complete.setup(opts)
   elseif accept ~= "insert" and accept ~= "replace" then
     error("nx.complete.setup: `accept` must be 'insert' or 'replace', got " .. tostring(accept))
   end
-  local keys = opts.keys or {}
 
-  -- Activate the async sources for `nx._complete_run`; `has_async` (a Lua async
-  -- source OR the server-native `lsp` source) tells the engine (core) to emit a
-  -- `(gen, ctx)` per trigger so the server dispatches off the input path.
-  nx._complete = {
-    sources = async,
-    gen = 0,
-    debounce = nx.complete.debounce,
-    -- The global trigger-char set: in a trigger context a *plain* source (no
-    -- `trigger`) stays quiet, so it doesn't compete with the trigger-char source.
-    triggers = trigger_set,
-    -- Lazy-docs (`resolve`) bookkeeping: a monotonic id stamped onto each
-    -- resolvable pushed row and a map id → { resolve, item } the server's
-    -- `nx._complete_resolve(id)` looks the callback + original item up in.
-    resolve_next = 0,
-    resolve_items = {},
-    -- `on_accept` bookkeeping, shaped like the resolve map: a monotonic id stamped
-    -- onto each pushed row that carries an `on_accept`, and a map id → { on_accept,
-    -- item } the server's `nx._complete_run_accept(id, …)` looks the callback up in
-    -- when that row is accepted (its accept is delegated so core doesn't splice).
-    accept_next = 0,
-    accept_items = {},
+  -- Capture the engine config so a later `nx.complete.source{}` can reconcile the
+  -- active set against it without a fresh `setup{}`. `reconcile` derives everything
+  -- source-related (the async list, trigger chars, `has_async`, the open gate) from
+  -- this plus the source registry.
+  nx.complete._config = {
+    auto = auto,
+    docs = docs,
+    docs_wrap = docs_wrap,
+    accept = accept,
+    top_min = top_min,
+    keys = opts.keys or {},
+    exclusive = opts.exclusive == true,
+    builtins = builtins,
+    overrides = overrides,
   }
-  -- The server-native `lsp` and `snippets` sources both dispatch off the input
-  -- path, so either (like a Lua async source) needs the `(gen, ctx)` emit.
-  local has_async = #async > 0 or saw_lsp or saw_snippets
+  reconcile()
 
-  nx._complete_setup(
-    auto == true,
-    -- `{ open, buffer, lsp, snippets }` min_chars gates (a single tuple slot): the
-    -- global open gate plus each native source's own threshold. Lua sources carry
-    -- theirs on `nx._complete.sources` (gated in `nx._complete_run`).
-    { min_chars, buffer_min_chars, lsp_min_chars, snippets_min_chars },
-    key_list(keys.next, "next"),
-    key_list(keys.prev, "prev"),
-    key_list(keys.confirm, "confirm"),
-    key_list(keys.abort, "abort"),
-    has_async,
-    saw_lsp,
-    buffer_priority,
-    lsp_priority,
-    docs == true,
-    docs_wrap == true,
-    trigger_chars,
-    saw_snippets,
-    snippets_priority,
-    accept
-  )
-
+  local keys = nx.complete._config.keys
   -- `keys.trigger` (a string or list) installs the insert-mode mapping(s) that open
   -- the popup on demand — the keypress half of "trigger by keypress / Lua API".
   -- Unset, it defaults to `<C-Space>` / `<C-x><C-o>`, installed as overridable
@@ -339,8 +410,15 @@ end
 -- The source runs off the input path (debounced by `debounce` ms, default
 -- `nx.complete.debounce`), and its results are generation-gated: a reply for a
 -- prefix the user has typed past is dropped. Register a `ctx.on_cancel(fn)` reaper
--- to kill an in-flight job when the next prefix supersedes this one. Activate the
--- source by listing its name in `nx.complete.setup{ sources = { ... } }`.
+-- to kill an in-flight job when the next prefix supersedes this one.
+--
+-- Registering **activates** the source: it joins the live engine immediately (or when
+-- `nx.complete.setup{}` next runs, if it hasn't yet) — a plugin adds completions by
+-- calling this, with no need for the user to list it in `setup{ sources }`. The spec's
+-- own `priority` (merge rank, default 0), `min_chars` (its prefix gate), and `debounce`
+-- become the source's defaults; a `setup{ sources }` entry for the same name overrides
+-- any of them, and `enabled = false` (here or on that entry) opts it out. A `setup{
+-- exclusive = true }` engine ignores unlisted sources.
 --
 -- `trigger = { chars = { ":" } }` (optional) gates the source: the engine wakes it
 -- only when the completion prefix leads with one of those chars (the emoji shape),
@@ -369,6 +447,9 @@ function nx.complete.source(spec)
   if spec.resolve ~= nil and type(spec.resolve) ~= "function" then
     error("nx.complete.source('" .. spec.name .. "'): resolve must be a function", 2)
   end
+  if spec.min_chars ~= nil and type(spec.min_chars) ~= "number" then
+    error("nx.complete.source('" .. spec.name .. "'): min_chars must be a number", 2)
+  end
   if BUILTIN_SOURCES[spec.name] then
     error("nx.complete.source: '" .. spec.name .. "' is a reserved built-in source name", 2)
   end
@@ -393,6 +474,10 @@ function nx.complete.source(spec)
     end
   end
   nx.complete._sources[spec.name] = spec
+  -- Join it to the live engine now (or leave it for `setup{}` to pick up if the engine
+  -- isn't configured yet — `reconcile` no-ops until then). This is the incremental seam:
+  -- a source registered after `setup{}` starts contributing without a re-`setup{}`.
+  reconcile()
 end
 
 -- Batch async candidates to the server (one bridge crossing per chunk, like the

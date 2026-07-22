@@ -254,6 +254,17 @@ wtransport = "=0.7.1"
 # tree transitively (ring/quinn); pulled in directly for `getrandom::fill`.
 getrandom = "=0.4.3"
 
+# Debug/test builds are dominated by DWARF debug info, not code: a test binary's
+# `.text` is ~3MB while its debug sections are ~430MB, and the workspace produces
+# hundreds of statically-linked test binaries — so full debuginfo balloons `target/`
+# to tens of GB. `line-tables-only` keeps file/line in panic backtraces (what we
+# actually need when a test fails) but drops the type/variable DWARF that made up
+# the bulk. `split-debuginfo = "unpacked"` keeps that remaining debuginfo in shared
+# object files under deps/ instead of copying it into every binary.
+[profile.dev]
+debug = "line-tables-only"
+split-debuginfo = "unpacked"
+
 [profile.release]
 lto = "thin"
 codegen-units = 1

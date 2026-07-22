@@ -336,9 +336,9 @@ impl MotionResult {
 
 /// A normal/visual cursor motion. The motion *alphabet* (which keys are motions)
 /// lives in [`classify_motion`]; where each motion *lands* lives in
-/// [`Editor::resolve_motion`]. Note `w`/`W`, `b`/`B`, `e`/`E` collapse to one
-/// variant each — nxvim does not yet implement `WORD` motions, so the big-word
-/// keys behave identically to their small-word counterparts (preserved here).
+/// [`Editor::resolve_motion`]. The word motions carry a `big` flag: `false` for
+/// the small-word keys (`w`/`b`/`e`, which stop at punctuation) and `true` for
+/// the WORD keys (`W`/`B`/`E`, which treat a run of non-blank chars as one word).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Motion {
     Left,                         // h, <Left>, <BS>
@@ -355,9 +355,9 @@ pub(crate) enum Motion {
     DisplayLineEnd,               // g$ — last column of the display row
     GotoLine,                     // G  (count = target line, default last)
     GotoTop,                      // gg (count = target line, default first)
-    Word,                         // w / W
-    BackWord,                     // b / B
-    EndWord,                      // e / E
+    Word(bool),                   // w (small) / W (big/WORD)
+    BackWord(bool),               // b (small) / B (big/WORD)
+    EndWord(bool),                // e (small) / E (big/WORD)
     Find(FindKind, char),         // f/t/F/T {char}
     FindRepeat { reverse: bool }, // ; (same) / , (reversed)
     MarkJumpExact(char, bool),    // `{mark}  (charwise exclusive); bool = set jumplist
@@ -740,9 +740,12 @@ fn classify_motion(key: Key) -> Option<Motion> {
         (KeyCode::Down, _) | (_, Some('j')) | (_, Some('\r')) => Motion::Down,
         (KeyCode::Up, _) | (_, Some('k')) => Motion::Up,
         (_, Some('G')) => Motion::GotoLine,
-        (_, Some('w')) | (_, Some('W')) => Motion::Word,
-        (_, Some('b')) | (_, Some('B')) => Motion::BackWord,
-        (_, Some('e')) | (_, Some('E')) => Motion::EndWord,
+        (_, Some('w')) => Motion::Word(false),
+        (_, Some('W')) => Motion::Word(true),
+        (_, Some('b')) => Motion::BackWord(false),
+        (_, Some('B')) => Motion::BackWord(true),
+        (_, Some('e')) => Motion::EndWord(false),
+        (_, Some('E')) => Motion::EndWord(true),
         (_, Some(';')) => Motion::FindRepeat { reverse: false },
         (_, Some(',')) => Motion::FindRepeat { reverse: true },
         _ => return None,

@@ -217,18 +217,18 @@ impl Editor {
                 let l = raw.map(|n| n - 1).unwrap_or(last_line).min(last_line);
                 MotionResult::linewise(self.buffer().line_start(l), MoveAxis::LineAnchor)
             }
-            Motion::Word => self.word_motion(count),
-            Motion::BackWord => {
+            Motion::Word(big) => self.word_motion(count, big),
+            Motion::BackWord(big) => {
                 let mut idx = self.cursor_char();
                 for _ in 0..count {
-                    idx = self.word_backward(idx);
+                    idx = self.word_backward(idx, big);
                 }
                 MotionResult::exclusive(idx)
             }
-            Motion::EndWord => {
+            Motion::EndWord(big) => {
                 let mut idx = self.cursor_char();
                 for _ in 0..count {
-                    idx = self.word_end(idx);
+                    idx = self.word_end(idx, big);
                 }
                 MotionResult::inclusive(idx)
             }
@@ -239,7 +239,7 @@ impl Editor {
     /// Resolve a `w`/`W` word motion. Special case: `cw` on a non-blank acts like
     /// `ce` — it changes to the end of the word without swallowing the trailing
     /// space — so it returns an inclusive end-of-word target instead.
-    fn word_motion(&self, count: usize) -> MotionResult {
+    fn word_motion(&self, count: usize, big: bool) -> MotionResult {
         let mut idx = self.cursor_char();
         // `cw` on an empty line changes nothing — vim empties the motion (the
         // line break is never swallowed) but still enters Insert mode.
@@ -251,12 +251,12 @@ impl Editor {
             && char_class(self.char_at(idx)) != CharClass::Blank
         {
             for _ in 0..count {
-                idx = self.word_end(idx);
+                idx = self.word_end(idx, big);
             }
             MotionResult::inclusive(idx)
         } else {
             for _ in 0..count {
-                idx = self.word_forward(idx);
+                idx = self.word_forward(idx, big);
             }
             MotionResult::exclusive(idx)
         }
@@ -425,38 +425,41 @@ impl Editor {
         }
     }
 
-    fn word_forward(&self, mut idx: usize) -> usize {
+    // The word motions classify chars through [`span_class`] so `big` (the WORD
+    // keys `W`/`B`/`E`) collapses punctuation into the non-blank class, while the
+    // small-word keys keep word/punct distinct. Class `0` is blank throughout.
+    fn word_forward(&self, mut idx: usize, big: bool) -> usize {
         let last = self.last_char_idx();
         if idx >= last {
             return idx;
         }
-        let start = char_class(self.char_at(idx));
-        if start != CharClass::Blank {
-            while idx < last && char_class(self.char_at(idx)) == start {
+        let start = self.span_class(idx, big);
+        if start != 0 {
+            while idx < last && self.span_class(idx, big) == start {
                 idx = self.next_grapheme_idx(idx);
             }
         }
-        while idx < last && char_class(self.char_at(idx)) == CharClass::Blank {
+        while idx < last && self.span_class(idx, big) == 0 {
             idx = self.next_grapheme_idx(idx);
         }
         idx
     }
 
-    fn word_backward(&self, mut idx: usize) -> usize {
+    fn word_backward(&self, mut idx: usize, big: bool) -> usize {
         if idx == 0 {
             return 0;
         }
         idx = self.prev_grapheme_idx(idx);
-        while idx > 0 && char_class(self.char_at(idx)) == CharClass::Blank {
+        while idx > 0 && self.span_class(idx, big) == 0 {
             idx = self.prev_grapheme_idx(idx);
         }
         if idx == 0 {
             return 0;
         }
-        let cls = char_class(self.char_at(idx));
+        let cls = self.span_class(idx, big);
         while idx > 0 {
             let prev = self.prev_grapheme_idx(idx);
-            if char_class(self.char_at(prev)) != cls {
+            if self.span_class(prev, big) != cls {
                 break;
             }
             idx = prev;
@@ -464,19 +467,19 @@ impl Editor {
         idx
     }
 
-    fn word_end(&self, mut idx: usize) -> usize {
+    fn word_end(&self, mut idx: usize, big: bool) -> usize {
         let last = self.last_char_idx();
         if idx >= last {
             return idx;
         }
         idx = self.next_grapheme_idx(idx);
-        while idx < last && char_class(self.char_at(idx)) == CharClass::Blank {
+        while idx < last && self.span_class(idx, big) == 0 {
             idx = self.next_grapheme_idx(idx);
         }
-        let cls = char_class(self.char_at(idx));
+        let cls = self.span_class(idx, big);
         while idx < last {
             let next = self.next_grapheme_idx(idx);
-            if next > last || char_class(self.char_at(next)) != cls {
+            if next > last || self.span_class(next, big) != cls {
                 break;
             }
             idx = next;

@@ -1096,3 +1096,34 @@ async fn replace_ctrl_o_resumes_replace_not_insert() {
     feed(&rpc, "X"); // overtypes rather than inserts
     assert_eq!(lines(&rpc).await, vec!["hXllo"]);
 }
+
+#[tokio::test]
+async fn big_word_motions_span_punctuation() {
+    // `W`/`B`/`E` treat a run of non-blank chars as one WORD, so they skip the
+    // punctuation their small-word siblings (`w`/`b`/`e`) stop at.
+    let (rpc, _incoming) = start(None).await;
+    // cols: f0 o1 o2 .3 b4 a5 r6 <sp>7 b8 a9 z10
+    feed(&rpc, "ifoo.bar baz<Esc>");
+
+    // `w` stops at the `.` inside `foo.bar`; `W` skips the whole WORD to `baz`.
+    feed(&rpc, "0w");
+    assert_eq!(cursor(&rpc).await, (1, 3), "w stops at punctuation");
+    feed(&rpc, "0W");
+    assert_eq!(cursor(&rpc).await, (1, 8), "W jumps past foo.bar to baz");
+
+    // `e` ends on `foo`; `E` ends on the whole `foo.bar` WORD (the `r`).
+    feed(&rpc, "0e");
+    assert_eq!(cursor(&rpc).await, (1, 2), "e ends foo");
+    feed(&rpc, "0E");
+    assert_eq!(cursor(&rpc).await, (1, 6), "E ends foo.bar");
+
+    // From `baz`, `b` walks back only to `bar`; `B` walks back over the whole WORD.
+    feed(&rpc, "0Wb");
+    assert_eq!(cursor(&rpc).await, (1, 4), "b stops at bar");
+    feed(&rpc, "0WB");
+    assert_eq!(
+        cursor(&rpc).await,
+        (1, 0),
+        "B jumps back to start of foo.bar"
+    );
+}

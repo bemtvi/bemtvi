@@ -43,6 +43,48 @@ fn hl_flag(map: &[(Value, Value)], key: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// WCAG relative luminance (0.0–1.0) of an `0xRRGGBB` color.
+fn luminance(rgb: u64) -> f64 {
+    let chan = |c: u64| {
+        let s = (c & 0xff) as f64 / 255.0;
+        if s <= 0.03928 {
+            s / 12.92
+        } else {
+            ((s + 0.055) / 1.055).powf(2.4)
+        }
+    };
+    0.2126 * chan(rgb >> 16) + 0.7152 * chan(rgb >> 8) + 0.0722 * chan(rgb)
+}
+
+/// WCAG contrast ratio (1.0–21.0) between two `0xRRGGBB` colors.
+fn contrast(a: u64, b: u64) -> f64 {
+    let (la, lb) = (luminance(a), luminance(b));
+    let (hi, lo) = (la.max(lb), la.min(lb));
+    (hi + 0.05) / (lo + 0.05)
+}
+
+#[tokio::test]
+async fn nxvim_scheme_completion_match_is_visible_on_the_selected_row() {
+    // Regression: in the built-in `nxvim` scheme the fuzzy-match accent must stay
+    // readable on a *selected* completion/picker row. The clients paint the
+    // selected row with `PmenuSel`'s bg and overdraw the matched characters with
+    // the match accent (the `CmpItemAbbrMatch` → `Special` chain, resolving to
+    // `Special` here). If those two colors have near-identical luminance the
+    // matched letters vanish into the selection background.
+    let dir = temp_dir("nxvim_scheme_match");
+    let (rpc, _incoming) = start_with_config(&dir, "vim.cmd.colorscheme('nxvim')\n").await;
+
+    let sel_bg = hl_color(&get_hl(&rpc, "PmenuSel").await, "bg").expect("PmenuSel bg");
+    let match_fg = hl_color(&get_hl(&rpc, "Special").await, "fg").expect("match (Special) fg");
+
+    let ratio = contrast(match_fg, sel_bg);
+    assert!(
+        ratio >= 2.0,
+        "matched chars (fg {match_fg:06x}) must stand out from the selected-row bg \
+         ({sel_bg:06x}); WCAG contrast was only {ratio:.2}"
+    );
+}
+
 #[tokio::test]
 async fn nvim_set_hl_stores_resolved_colors_and_attrs() {
     // catppuccin-mocha-ish: Normal carries fg+bg, Comment fg+italic. The

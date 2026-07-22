@@ -50,7 +50,11 @@ hl(0, "SignColumn",   { bg = p.bg })
 hl(0, "ColorColumn",  { bg = p.cursor_line })
 hl(0, "MatchParen",   { fg = p.cyan, bold = true })
 hl(0, "Pmenu",        { fg = p.fg, bg = p.bg_dark })
-hl(0, "PmenuSel",     { fg = p.bg, bg = p.blue })
+-- Selected row: a lighter grey highlight, NOT a saturated fill. A bright-blue
+-- selection bg collides with the cyan match accent below (both land at the same
+-- luminance), hiding the fuzzy-match letters on the selected row; a neutral
+-- selection keeps the accent (and the row text) readable on top of it.
+hl(0, "PmenuSel",     { fg = p.fg, bg = p.gutter })
 -- The accent the completion popup / picker paints matched (fuzzy-hit) characters
 -- with, the terminus of the `CmpItemAbbrMatch` / `TelescopeMatching` fallback chain
 -- so the built-in scheme themes them even without those plugin groups defined.

@@ -7,16 +7,28 @@
 --
 -- nxvim ships its own One Dark colorscheme — the truecolor sibling of the look
 -- the GUI and the browser edit-host paint by default — so a plain terminal can
--- reach the same colors with no plugin, no download, no config beyond this line:
+-- reach the same colors with no plugin, no download, and no config at all.
 --
---     vim.cmd.colorscheme('nxvim')
+-- ON A TRUECOLOR TERMINAL IT LOADS AUTOMATICALLY. When the terminal advertises
+-- 24-bit color (via `COLORTERM=truecolor`/`24bit`, which every modern terminal
+-- exports), nxvim defaults the `nxvim` scheme in at startup — you get real
+-- colors on a fresh install with an empty config. Your config still wins: set
+-- `vim.cmd.colorscheme('...')` in `init.lua` and that scheme is used instead,
+-- never overridden. A 256-color / legacy terminal keeps its own tuned palette
+-- (a downgraded truecolor scheme reads worse than the terminal's ANSI set).
+--
+-- So the line below is REDUNDANT on a truecolor terminal — it's here only to
+-- (a) force the scheme on a terminal that doesn't set `COLORTERM`, or (b) show
+-- how you'd pin it explicitly. Comment it out and, on a truecolor terminal,
+-- you'll still see colors — that's the auto-default at work. To *suppress* the
+-- auto-default (start with no styling), launch with `NXVIM_TRUECOLOR=0`.
 --
 -- It's bundled in the binary (not sourced off the runtimepath), so this works
 -- on a fresh install. A user `colors/nxvim.lua` on the runtimepath still wins,
 -- so you can fork the palette by dropping your own file there.
 --
 -- TRY IT interactively:
---   :colorscheme nxvim        load it live (already loaded by this config)
+--   :colorscheme nxvim        load it live
 --   :hi clear                 strip it back to the terminal's own colors
 --   :colorscheme nxvim        bring it back
 --

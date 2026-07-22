@@ -322,6 +322,54 @@ fn catppuccin_repaints_the_editor_in_truecolor() {
     let _ = std::fs::remove_dir_all(&base);
 }
 
+/// The zero-config payoff: on a **truecolor** terminal, with an *empty* config,
+/// nxvim defaults its bundled `nxvim` One Dark colorscheme in at startup — the
+/// client detects 24-bit support (`COLORTERM=truecolor`), reports it on attach, and
+/// the server auto-loads the scheme, so plain text paints in the theme's `Normal`.
+/// Fully hermetic (the scheme is baked into the binary — no plugin checkout): the
+/// truecolor twin of `catppuccin_repaints_the_editor_in_truecolor`, minus the user
+/// config. `COLORTERM` is set explicitly so the outcome never depends on the
+/// terminal the test itself runs under.
+#[test]
+#[ignore = "PTY/terminal e2e; needs a real controlling terminal. Run with --ignored. See module header."]
+fn truecolor_terminal_defaults_in_the_nxvim_colorscheme() {
+    let base = std::env::temp_dir().join(format!("nxvim_e2e_tc_{}", std::process::id()));
+    std::fs::create_dir_all(&base).unwrap();
+    // A plain-text buffer (no grammar), so its glyphs paint in the theme's `Normal`
+    // foreground rather than a treesitter capture color.
+    let file = base.join("hello.txt");
+    std::fs::write(&file, "hello\n").unwrap();
+
+    // No NXVIM_CONFIG override ⇒ the harness points at a fresh *empty* config dir,
+    // so nothing loads a colorscheme — the auto-default is the only thing that can.
+    let mut s = Session::spawn_with_env(
+        &[file.to_str().unwrap()],
+        &[("COLORTERM", "truecolor")],
+        80,
+        24,
+    );
+
+    // nxvim One Dark: Normal foreground #abb2bf, background #282c34.
+    let text_fg = vt100::Color::Rgb(0xab, 0xb2, 0xbf);
+    let base_bg = vt100::Color::Rgb(0x28, 0x2c, 0x34);
+    let themed = |scr: &vt100::Screen| {
+        (0..80).any(|col| {
+            scr.cell(0, col).is_some_and(|c| {
+                c.contents() == "h" && c.fgcolor() == text_fg && c.bgcolor() == base_bg
+            })
+        })
+    };
+    let ok = s.wait_until(Duration::from_secs(10), themed);
+    assert!(
+        ok,
+        "the bundled nxvim scheme never auto-loaded on a truecolor terminal:\n{}",
+        s.screen_text()
+    );
+
+    s.send(b":q!\r");
+    let _ = std::fs::remove_dir_all(&base);
+}
+
 #[test]
 #[ignore = "PTY/terminal e2e; needs a real controlling terminal. Run with --ignored. See module header."]
 fn a_server_thread_panic_exits_nonzero() {

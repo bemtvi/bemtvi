@@ -820,13 +820,16 @@ impl App {
         // A native window always has full key disambiguation (winit reports Ctrl+I as
         // `Character("i")` + control, distinct from `Tab`), so declare the keyboard
         // protocol active at attach — the server then keeps `<C-i>`/`<C-m>`/`<C-[>`/
-        // `<C-h>` apart from `<Tab>`/`<CR>`/`<Esc>`/`<BS>`. The map is read only at
-        // attach; a resize passes an empty one.
+        // `<C-h>` apart from `<Tab>`/`<CR>`/`<Esc>`/`<BS>`. It also paints 24-bit color
+        // natively, so declare `truecolor` too — the server then defaults in the
+        // bundled `nxvim` colorscheme (giving `Normal` a real background, not just the
+        // renderer's syntax fallback) when the config hasn't chosen one. The map is
+        // read only at attach; a resize passes an empty one.
         let caps = if attach {
-            Value::Map(vec![(
-                Value::from("keyboard_protocol"),
-                Value::Boolean(true),
-            )])
+            Value::Map(vec![
+                (Value::from("keyboard_protocol"), Value::Boolean(true)),
+                (Value::from("truecolor"), Value::Boolean(true)),
+            ])
         } else {
             Value::Map(vec![])
         };

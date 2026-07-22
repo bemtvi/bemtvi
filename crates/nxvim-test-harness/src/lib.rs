@@ -102,6 +102,24 @@ pub async fn attach_keyboard_protocol(rpc: &Rpc, cols: u16, rows: u16) {
     .expect("ui attach");
 }
 
+/// [`attach`] a UI that declares **truecolor** (24-bit color) support
+/// (`truecolor = true` in the capabilities map), the way a rich terminal attaches.
+/// The server defaults in the bundled `nxvim` colorscheme on such an attach when
+/// the config hasn't already chosen one. Plain [`attach`] leaves it off (a
+/// 256-color / legacy terminal), so the registry stays empty by default.
+pub async fn attach_truecolor(rpc: &Rpc, cols: u16, rows: u16) {
+    rpc.request(
+        "nx_ui_attach",
+        vec![
+            Value::from(cols as u64),
+            Value::from(rows as u64),
+            Value::Map(vec![(Value::from("truecolor"), Value::Boolean(true))]),
+        ],
+    )
+    .await
+    .expect("ui attach");
+}
+
 /// [`spawn`] the server with `init` and [`attach`] a `cols` × `rows` UI.
 pub async fn start_attached(
     init: ServerInit,

@@ -529,6 +529,84 @@ async fn builtin_nxvim_colorscheme_shows_eob_tildes() {
 }
 
 #[tokio::test]
+async fn truecolor_attach_defaults_in_the_nxvim_colorscheme() {
+    // A client that declares truecolor support (`truecolor = true` in the attach
+    // capabilities) with no config-chosen scheme lands on the bundled `nxvim` One
+    // Dark palette automatically — a rich terminal reaches real colors with zero
+    // config. Nothing was typed; the default is applied at attach.
+    let dir = temp_dir("truecolor_default");
+    std::fs::write(dir.join("init.lua"), "").expect("write init.lua");
+    let (rpc, _incoming) = spawn(ServerInit {
+        config_dir: Some(dir.clone()),
+        runtimepath: vec![dir.clone()],
+        ..Default::default()
+    });
+    attach_truecolor(&rpc, 80, 25).await;
+    let normal = get_hl(&rpc, "Normal").await;
+    assert_eq!(
+        hl_color(&normal, "fg"),
+        Some(hex("abb2bf")),
+        "a truecolor attach defaults in the nxvim scheme's Normal fg"
+    );
+    assert_eq!(hl_color(&normal, "bg"), Some(hex("282c34")));
+    // `g:colors_name` records the auto-loaded scheme, so a re-attach won't reapply
+    // and tooling (statusline, etc.) sees the active theme.
+    assert_eq!(
+        exec_lua(&rpc, "return vim.g.colors_name").await.as_str(),
+        Some("nxvim")
+    );
+}
+
+#[tokio::test]
+async fn non_truecolor_attach_leaves_the_registry_empty() {
+    // A legacy / 256-color terminal (no `truecolor` capability) keeps its own tuned
+    // palette — the registry stays empty and no scheme is defaulted in. This is the
+    // plain `attach` the default harness setup uses.
+    let dir = temp_dir("no_truecolor_default");
+    let (rpc, _incoming) = start_with_config(&dir, "").await;
+    assert!(
+        get_hl(&rpc, "Normal").await.is_empty(),
+        "no colorscheme is defaulted in on a non-truecolor attach"
+    );
+    assert_eq!(
+        exec_lua(&rpc, "return vim.g.colors_name").await,
+        Value::Nil,
+        "g:colors_name stays unset with no scheme loaded"
+    );
+}
+
+#[tokio::test]
+async fn truecolor_attach_respects_a_config_chosen_colorscheme() {
+    // If the user's config picked a scheme, the truecolor default must not clobber
+    // it: `init.lua` runs before attach, so `g:colors_name` is already set and the
+    // auto-default is skipped. The user's `cat` wins, not the bundled `nxvim`.
+    let dir = temp_dir("truecolor_respects_config");
+    std::fs::create_dir_all(dir.join("colors")).expect("create colors dir");
+    std::fs::write(
+        dir.join("colors").join("cat.lua"),
+        "vim.api.nvim_set_hl(0, 'Normal', { fg = '#cdd6f4', bg = '#1e1e2e' })\n",
+    )
+    .expect("write colorscheme");
+    std::fs::write(dir.join("init.lua"), "vim.cmd.colorscheme('cat')\n").expect("write init.lua");
+    let (rpc, _incoming) = spawn(ServerInit {
+        config_dir: Some(dir.clone()),
+        runtimepath: vec![dir.clone()],
+        ..Default::default()
+    });
+    attach_truecolor(&rpc, 80, 25).await;
+    let normal = get_hl(&rpc, "Normal").await;
+    assert_eq!(
+        hl_color(&normal, "bg"),
+        Some(hex("1e1e2e")),
+        "the config-chosen scheme wins over the truecolor default"
+    );
+    assert_eq!(
+        exec_lua(&rpc, "return vim.g.colors_name").await.as_str(),
+        Some("cat")
+    );
+}
+
+#[tokio::test]
 async fn user_colors_file_overrides_the_builtin_scheme() {
     // A `colors/nxvim.lua` on the runtimepath shadows the bundled scheme — the
     // runtimepath is searched first, the built-in is only the fallback.

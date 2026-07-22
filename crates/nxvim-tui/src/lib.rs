@@ -220,6 +220,33 @@ fn kitty_keyboard_enabled() -> bool {
     }
 }
 
+/// Whether the terminal supports truecolor (24-bit RGB), the "rich colors" the
+/// server's bundled `nxvim` colorscheme needs. Detected from `COLORTERM`, the de
+/// facto capability signal every modern truecolor terminal exports (`truecolor`
+/// or `24bit`). Reported to the server as the `truecolor` attach capability, which
+/// auto-loads `:colorscheme nxvim` when the user's config hasn't already picked one
+/// — so a rich terminal lands on real colors with zero config, while a legacy /
+/// 256-color terminal keeps its own palette (a downgraded truecolor scheme reads
+/// worse than the terminal's tuned ANSI set).
+///
+/// `NXVIM_TRUECOLOR` overrides detection in either direction, matching
+/// [`kitty_keyboard_enabled`]: a falsey value (`0`/`false`/`off`/`no`, or empty)
+/// forces it **off**; any other value forces it **on** — the escape hatch for a
+/// truecolor terminal that doesn't set `COLORTERM` (e.g. some `TERM=*-direct`
+/// setups), or to suppress the default scheme on a terminal that does.
+fn truecolor_enabled() -> bool {
+    match std::env::var("NXVIM_TRUECOLOR").ok().as_deref() {
+        Some(v) => !matches!(
+            v.trim().to_ascii_lowercase().as_str(),
+            "" | "0" | "false" | "off" | "no"
+        ),
+        None => matches!(
+            std::env::var("COLORTERM").ok().as_deref(),
+            Some("truecolor") | Some("24bit")
+        ),
+    }
+}
+
 /// Builds a replacement backend for a `nx.session.reconnect` swap (§B). The swap loop
 /// hands it the raw `nx_session_reconnect` params and gets back the client-side transport
 /// of a fresh session (same stream type). The binary provides it — it owns session +
@@ -275,6 +302,11 @@ where
     // but the `EventStream` that would race for the query reply isn't up until
     // `event_loop`. `None` ⇒ legacy encoding, and nothing to pop on exit.
     let keyboard = kitty_keyboard_enabled().then(|| KeyboardEnhancement::push(std::io::stdout()));
+    // Whether this terminal can show 24-bit color, reported to the server so it can
+    // default in the bundled `nxvim` colorscheme (see `truecolor_enabled`). A pure
+    // capability report — no terminal state to set up or tear down — so unlike the
+    // guards above it's just a bool carried into each `event_loop`/attach.
+    let truecolor = truecolor_enabled();
     // Capture mouse events so the panel's `[X]` is clickable.
     let mouse = MouseCapture::enable(std::io::stdout());
     // Restore the user's cursor shape on the way out — the loop switches it to a
@@ -286,7 +318,15 @@ where
     // the terminal up. Exit / a fatal error ends it.
     let mut stream = initial;
     let result = loop {
-        match event_loop(stream, &mut terminal, build.clone(), keyboard.is_some()).await {
+        match event_loop(
+            stream,
+            &mut terminal,
+            build.clone(),
+            keyboard.is_some(),
+            truecolor,
+        )
+        .await
+        {
             Ok(Outcome::Exit) => break Ok(()),
             Ok(Outcome::Swap(next)) => stream = next,
             Err(e) => break Err(e),
@@ -306,6 +346,7 @@ async fn event_loop<S>(
     terminal: &mut DefaultTerminal,
     build: SessionBuilder<S>,
     keyboard_protocol: bool,
+    truecolor: bool,
 ) -> Result<Outcome<S>>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
@@ -329,10 +370,15 @@ where
             // Capabilities map: tell the server the kitty keyboard protocol is on so
             // it parses distinct `<C-i>`/`<C-m>`/`<C-[>`/`<C-h>` instead of folding
             // them onto their named twins.
-            Value::Map(vec![(
-                Value::from("keyboard_protocol"),
-                Value::from(keyboard_protocol),
-            )]),
+            Value::Map(vec![
+                (
+                    Value::from("keyboard_protocol"),
+                    Value::from(keyboard_protocol),
+                ),
+                // 24-bit color support: lets the server default in the bundled
+                // `nxvim` colorscheme on a rich terminal (see `truecolor_enabled`).
+                (Value::from("truecolor"), Value::from(truecolor)),
+            ]),
         ],
     )
     .await

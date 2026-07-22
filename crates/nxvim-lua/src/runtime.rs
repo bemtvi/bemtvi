@@ -2591,6 +2591,13 @@ impl LuaRuntime {
         g.set(key, value)
     }
 
+    /// Read a string-valued `vim.g[key]` from Rust, or `None` when it's unset (or
+    /// not a string). Used to check whether the user's config already picked a
+    /// colorscheme (`g:colors_name`) before defaulting one in at UI attach.
+    pub fn get_global_var(&self, key: &str) -> Option<String> {
+        self.vim().ok()?.get::<Table>("g").ok()?.get(key).ok()
+    }
+
     /// Install the `nx.test` plugin-test framework. `prelude/test.lua` builds the
     /// framework but exposes it only through `nx._install_test`, leaving `nx.test`
     /// nil in a normal session; the server calls this when the `--test-plugin` runner

@@ -102,23 +102,38 @@ impl EditHost {
                 let h = geom(params.get(1), 24);
                 self.ui = Some((w, h));
                 self.editor.resize(w, h);
-                // The third arg is a capabilities map. `keyboard_protocol = true` says
-                // the client has the kitty keyboard protocol on, so distinct
-                // `<C-i>`/`<C-m>`/`<C-[>`/`<C-h>` reach us; mirror it into the input
-                // parser and the keymap registry (which restamps its tries so a
-                // mapping's LHS is parsed to match). Absent/false ⇒ legacy folding.
-                let kbd = params
-                    .get(2)
-                    .and_then(|v| match v {
-                        Value::Map(m) => m
-                            .iter()
-                            .find(|(k, _)| k.as_str() == Some("keyboard_protocol"))
-                            .and_then(|(_, val)| val.as_bool()),
-                        _ => None,
-                    })
-                    .unwrap_or(false);
+                // The third arg is a capabilities map the client reports about its
+                // terminal. Look up a boolean capability by key (absent ⇒ `false`).
+                let cap = |name: &str| {
+                    params
+                        .get(2)
+                        .and_then(|v| match v {
+                            Value::Map(m) => m
+                                .iter()
+                                .find(|(k, _)| k.as_str() == Some(name))
+                                .and_then(|(_, val)| val.as_bool()),
+                            _ => None,
+                        })
+                        .unwrap_or(false)
+                };
+                // `keyboard_protocol = true` says the client has the kitty keyboard
+                // protocol on, so distinct `<C-i>`/`<C-m>`/`<C-[>`/`<C-h>` reach us;
+                // mirror it into the input parser and the keymap registry (which
+                // restamps its tries so a mapping's LHS is parsed to match).
+                // Absent/false ⇒ legacy folding.
+                let kbd = cap("keyboard_protocol");
                 self.keyboard_protocol = kbd;
                 self.keymaps.set_keyboard_protocol(kbd);
+                // `truecolor = true` says the terminal can show 24-bit color, so
+                // default in the bundled `nxvim` colorscheme — a rich terminal reaches
+                // real colors with zero config. Only when the user's config hasn't
+                // already chosen a scheme (`g:colors_name`), so `:colorscheme foo` in
+                // `init.lua` (sourced before attach) still wins; and once we set it,
+                // `colors_name` is `"nxvim"`, so a reconnect's re-attach won't reapply.
+                // A non-truecolor / 256-color terminal keeps its own tuned palette.
+                if cap("truecolor") && self.lua.get_global_var("colors_name").is_none() {
+                    self.set_colorscheme("nxvim");
+                }
                 // The resize assigns the window its first rect, so a `nx.decor`
                 // provider's viewport is only now known. Drive `run_pending` to
                 // dispatch it (and any other off-tick work the size change queued)

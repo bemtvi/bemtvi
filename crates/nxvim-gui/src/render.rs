@@ -2676,9 +2676,29 @@ impl Renderer {
             // match spans are remapped onto the elided string to stay aligned.
             let empty = Vec::new();
             let spans = menu.match_spans.get(idx).unwrap_or(&empty);
-            let (label, spans) = elide_keep_tail(label, spans, list_w as usize);
-            let text = pmenu_row(&label, "", list_w as usize);
+            // Aligned kind column (`Snippet`, `Function`, …): the server projects
+            // `kind_col` — the column every kind starts at, just past the widest label —
+            // so they line up. The label region ends there (its padding is the gap); a
+            // kind-less row still reserves it so labels stay aligned.
+            let kind = menu
+                .kinds
+                .get(idx)
+                .and_then(Option::as_deref)
+                .filter(|k| !k.is_empty());
+            let label_w = menu.kind_col.map_or(list_w, |kc| kc.min(list_w));
+            let (label, spans) = elide_keep_tail(label, spans, label_w as usize);
+            let text = pmenu_row(&label, "", label_w as usize);
             self.push_plain(items, &text, self.cell_px(cx, row), row_fg, full);
+            if let (Some(k), Some(kc)) = (kind, menu.kind_col) {
+                if kc < list_w {
+                    let kind_fg = if sel == Some(idx) {
+                        blend(row_fg, sel_bg)
+                    } else {
+                        blend(fg, popup_bg)
+                    };
+                    self.push_plain(items, k, self.cell_px(cx + kc, row), kind_fg, full);
+                }
+            }
             // Overdraw the matched characters in the accent color (monospace, so
             // char `i` sits at column `cx + i`).
             for (i, ch) in label.chars().enumerate() {
@@ -3523,6 +3543,14 @@ pub fn rect_subtract(
 fn lighten(c: u32, d: u8) -> u32 {
     let f = |b: u8| b.saturating_add(d) as u32;
     (f((c >> 16) as u8) << 16) | (f((c >> 8) as u8) << 8) | f(c as u8)
+}
+
+/// Mix two `0x00RRGGBB` colors evenly — a theme-agnostic "dim" (used for the
+/// completion popup's kind column: `fg` blended halfway to the popup background so
+/// it recedes behind the label in both light and dark schemes, unlike a fixed gray).
+fn blend(a: u32, b: u32) -> u32 {
+    let ch = |sh: u32| (((a >> sh) & 0xFFu32) + ((b >> sh) & 0xFFu32)) / 2;
+    (ch(16) << 16) | (ch(8) << 8) | ch(0)
 }
 
 /// The opaque background for an overlay surface (a float / popup box): the

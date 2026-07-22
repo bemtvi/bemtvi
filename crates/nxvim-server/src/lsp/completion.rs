@@ -130,6 +130,9 @@ impl EditHost {
                     insert: Some(label.clone()),
                     label,
                     key,
+                    // The LSP `CompletionItemKind` name (`"Function"`, `"Variable"`, …);
+                    // `None` when the server sent no kind (code `0`).
+                    kind: item.kind_label().map(str::to_string),
                     preview: None,
                     priority,
                     source_accept: true,

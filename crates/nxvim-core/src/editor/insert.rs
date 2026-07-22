@@ -168,6 +168,12 @@ impl Editor {
                     // the popup eating it; other confirm keys (`<C-y>`) just dismiss
                     // without self-inserting.
                     if self.complete_accept() {
+                        // Accepting inside a snippet tabstop (a choice pick, or any
+                        // completion) replaces the value — mirror it into the stop's
+                        // other occurrences (the tail sync hook is past this `return`).
+                        if self.snippet_active() {
+                            self.snippet_sync();
+                        }
                         return;
                     }
                     self.close_completion();

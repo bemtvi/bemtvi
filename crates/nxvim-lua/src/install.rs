@@ -20,12 +20,13 @@ use crate::convert::{
 };
 use crate::host::{get_runtime_file, stdpath};
 use crate::ops::{
-    BufOp, CompletePush, CompleteSetupReq, ConfirmReq, DecorMark, DecorPublish, DiagnosticData,
-    DockOp, ExtmarkOp, FeedKeysOp, FsJob, GlobalOptionOp, HlSet, HttpRequest, HttpServerReply,
-    LayerOp, LoopOp, LspOp, NamedListOp, PanelOp, PickerOpenReq, PickerPush, PreviewPush, QfItem,
-    QfSetOp, RegisterSetOp, SnippetAddReq, SnippetSetupReq, StatuslineKind, StatuslinePublishReq,
-    StatuslineSetupReq, StatuslineTarget, TabOp, TerminalOpenReq, TsOp, UiFloatReq, UiInputReq,
-    UiSelectReq, ViewOp, VirtChunkData, VirtDecorData, WindowOp, WorkspaceOptionOp,
+    BufOp, ChoiceMenuReq, CompletePush, CompleteSetupReq, ConfirmReq, DecorMark, DecorPublish,
+    DiagnosticData, DockOp, ExtmarkOp, FeedKeysOp, FsJob, GlobalOptionOp, HlSet, HttpRequest,
+    HttpServerReply, LayerOp, LoopOp, LspOp, NamedListOp, PanelOp, PickerOpenReq, PickerPush,
+    PreviewPush, QfItem, QfSetOp, RegisterSetOp, SnippetAddReq, SnippetSetupReq, StatuslineKind,
+    StatuslinePublishReq, StatuslineSetupReq, StatuslineTarget, TabOp, TerminalOpenReq, TsOp,
+    UiFloatReq, UiInputReq, UiSelectReq, ViewOp, VirtChunkData, VirtDecorData, WindowOp,
+    WorkspaceOptionOp,
 };
 use crate::runtime::{OutputLine, Shared};
 use crate::vimregex;
@@ -2841,6 +2842,28 @@ pub(crate) fn install_runtime_api(
         )?,
     )?;
 
+    // `nx._choice_menu(items, sr, sc, er, ec)`: queue a non-grabbing cursor choice
+    // dropdown ([`ChoiceMenuReq`]) over the 0-based byte range `(sr,sc)..(er,ec)`. The
+    // server opens it via `Editor::open_choice_menu`; accepting a row splices the pick
+    // over the range natively — no callback, so a plugin snippet engine's own `on_bytes`
+    // reacts (e.g. to sync mirrors). The `nx.complete.choice` wrapper adds the API.
+    let sh = shared.clone();
+    nx.set(
+        "_choice_menu",
+        lua.create_function(
+            move |_, (items, sr, sc, er, ec): (Vec<String>, usize, usize, usize, usize)| {
+                sh.borrow_mut().choice_menus.push(ChoiceMenuReq {
+                    items,
+                    sr,
+                    sc,
+                    er,
+                    ec,
+                });
+                Ok(())
+            },
+        )?,
+    )?;
+
     // `nx._ui_float(id, lines, title, border, editor)`: queue a `nx.ui.float`
     // open/update request ([`UiFloatReq`]). The server opens the list-less content
     // float rendering `lines` with the given border / placement. `id == 0` is the
@@ -3069,7 +3092,8 @@ pub(crate) fn install_runtime_api(
     // drops a batch whose `gen` is behind the live prefix and appends the rest to the
     // open completion popup. Phase 4-B; `docs` 4-E; `accepts` (P4).
     // Parallel per-candidate arrays of one `_complete_push` batch: gen, then labels /
-    // inserts / docs / resolve-ids / accept-ids (see the doc comment above).
+    // inserts / docs / resolve-ids / accept-ids / kinds, then the batch's merge
+    // `priority` (one value — a source stamps the same rank on all its rows).
     type CompletePushArgs = (
         u64,
         Vec<String>,
@@ -3077,21 +3101,26 @@ pub(crate) fn install_runtime_api(
         Vec<String>,
         Vec<u64>,
         Vec<u64>,
+        Vec<String>,
+        i32,
     );
     let sh = shared.clone();
     nx.set(
         "_complete_push",
         lua.create_function(
-            move |_, (gen, labels, inserts, docs, resolves, accepts): CompletePushArgs| {
+            move |_,
+                  (gen, labels, inserts, docs, resolves, accepts, kinds, priority): CompletePushArgs| {
                 let mut sh = sh.borrow_mut();
                 sh.complete_pushes.reserve(labels.len());
                 for (i, (label, insert)) in labels.into_iter().zip(inserts).enumerate() {
-                    // `docs` / `resolves` / `accepts` are parallel to `labels`: an empty
-                    // doc string ⇒ no inline docs; a `0` resolve id ⇒ no lazy-docs handle;
-                    // a `0` accept id ⇒ a plain literal-insert row (no delegated accept).
+                    // `docs` / `resolves` / `accepts` / `kinds` are parallel to `labels`: an
+                    // empty doc string ⇒ no inline docs; a `0` resolve id ⇒ no lazy-docs
+                    // handle; a `0` accept id ⇒ a plain literal-insert row (no delegated
+                    // accept); an empty kind string ⇒ no kind column for the row.
                     let doc = docs.get(i).filter(|d| !d.is_empty()).cloned();
                     let resolve = resolves.get(i).copied().filter(|&r| r != 0);
                     let accept = accepts.get(i).copied().filter(|&a| a != 0);
+                    let kind = kinds.get(i).filter(|k| !k.is_empty()).cloned();
                     sh.complete_pushes.push(CompletePush {
                         gen,
                         label,
@@ -3099,6 +3128,8 @@ pub(crate) fn install_runtime_api(
                         doc,
                         resolve,
                         accept,
+                        priority,
+                        kind,
                     });
                 }
                 Ok(())

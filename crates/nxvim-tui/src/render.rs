@@ -2714,12 +2714,15 @@ fn render_menu(
                 let empty = Vec::new();
                 let spans = menu.match_spans.get(idx).unwrap_or(&empty);
                 let marked = any_marked.then(|| menu.marked.get(idx).copied().unwrap_or(false));
+                let kind = menu.kinds.get(idx).and_then(Option::as_deref);
                 menu_row_line(
                     label,
                     spans,
                     sel == Some(idx),
                     width,
                     marked,
+                    kind,
+                    menu.kind_col.map(usize::from),
                     sel_style,
                     match_style,
                 )
@@ -2981,12 +2984,15 @@ fn preview_line(
 /// `selected`, with the matched-character `spans` (half-open **char** ranges)
 /// bold+underlined so the fuzzy match stands out. Char-indexed to match the
 /// server's char-based spans.
+#[allow(clippy::too_many_arguments)]
 fn menu_row_line(
     label: &str,
     spans: &[(u16, u16)],
     selected: bool,
     width: usize,
     marked: Option<bool>,
+    kind: Option<&str>,
+    kind_col: Option<usize>,
     sel_style: Option<Style>,
     match_style: Option<Style>,
 ) -> Line<'static> {
@@ -3019,11 +3025,18 @@ fn menu_row_line(
         out.push(Span::styled(glyph.to_string(), st));
         used += 2;
     }
+    // Aligned **kind** column (`Snippet`, `Function`, …): the server projects `kind_col`
+    // — the column every row's kind starts at, just past the widest label — so they line
+    // up. The label region ends there (its trailing padding is the gap before the kind);
+    // a kind-less row still reserves the column so labels stay aligned. Absent ⇒ the box
+    // was too narrow for a kind column, so no kind is drawn (the label fills the row).
+    let kind = kind.filter(|k| !k.is_empty());
+    let label_end = kind_col.map_or(width, |kc| kc.min(width));
     // Path-priority truncation: when the row overflows, keep the file name (the
     // path tail) on screen by dropping leading directory components behind a `…`,
     // rather than the plain head-cut below that would hide the name. Rows that fit
     // — and non-path rows — fall through unchanged; `spans` are remapped to match.
-    let (label, spans) = elide_keep_tail(label, spans, width.saturating_sub(used));
+    let (label, spans) = elide_keep_tail(label, spans, label_end.saturating_sub(used));
     let (label, spans) = (label.as_str(), spans.as_slice());
     // Coalesce runs of identically-styled chars into one span (the same walk
     // `preview_line` does) instead of a per-char span — a picker frame renders
@@ -3031,7 +3044,7 @@ fn menu_row_line(
     let mut run = String::new();
     let mut run_matched = false;
     for (i, ch) in label.chars().enumerate() {
-        if used >= width {
+        if used >= label_end {
             break;
         }
         let i = i as u16;
@@ -3048,6 +3061,20 @@ fn menu_row_line(
         let style = if run_matched { matched } else { base };
         out.push(Span::styled(run, style));
     }
+    // Pad the label region out to the kind column (this padding is the gap before the
+    // kind). A kind-less row pads to the same column so the kinds stay aligned.
+    if used < label_end {
+        out.push(Span::styled(" ".repeat(label_end - used), base));
+        used = label_end;
+    }
+    // The kind at `kind_col` (dim, so it recedes behind the label), truncated to what's
+    // left. Only drawn when the row carries a kind and the column was projected.
+    if let Some(k) = kind.filter(|_| kind_col.is_some()) {
+        let text: String = k.chars().take(width.saturating_sub(used)).collect();
+        used += text.chars().count();
+        out.push(Span::styled(text, base.add_modifier(Modifier::DIM)));
+    }
+    // Fill any remainder so a selected row's background reaches the box edge.
     if used < width {
         out.push(Span::styled(" ".repeat(width - used), base));
     }

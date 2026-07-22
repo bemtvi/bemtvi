@@ -28,7 +28,10 @@ local BUILTIN_SOURCES = { buffer = true, lsp = true, snippets = true }
 
 -- Default merge priority per built-in source — higher wins, so `lsp` candidates lead
 -- `buffer` words of equal match quality. An entry's explicit `priority` overrides.
-local DEFAULT_PRIORITY = { lsp = 100, snippets = 90, buffer = 10 }
+-- Per-source **bias** added to a row's fuzzy score to break near-ties (the merge is
+-- fuzzy-first, then this bias). Small on purpose: a clearly better match from any
+-- source still wins; equally-good candidates just tip toward lsp > snippets > buffer.
+local DEFAULT_PRIORITY = { lsp = 8, snippets = 5, buffer = 0 }
 
 -- The default debounce (ms) before an async source re-runs on a prefix edit — the
 -- global knob, overridable per source (`debounce = N`). `0` runs on every
@@ -119,9 +122,14 @@ function nx.complete.setup(opts)
           .. "built-in ('buffer' / 'lsp'). See docs/plans/2026-06-15-nx-complete-completion-engine.md"
       )
     end
-    -- Resolve this entry's merge priority (explicit override, else the built-in
-    -- default, else 0). Higher wins in the merged view.
-    local priority = (type(src) == "table" and src.priority) or DEFAULT_PRIORITY[name] or 0
+    -- Resolve this entry's merge priority: the setup entry's explicit override wins,
+    -- else the registered source's own `priority` (an async source declares its rank at
+    -- `nx.complete.source{ priority = … }`), else the built-in default, else 0. Higher
+    -- wins in the merged view (priority descending, then fuzzy score).
+    local priority = (type(src) == "table" and src.priority)
+      or (registered and registered.priority)
+      or DEFAULT_PRIORITY[name]
+      or 0
     local smc = resolve_mc(src)
     all_min = math.min(all_min or smc, smc)
     if name == "buffer" then
@@ -160,6 +168,10 @@ function nx.complete.setup(opts)
         -- The source contributes only once the prefix reaches its own gate (checked in
         -- `nx._complete_run`); a trigger-char source or a manual trigger bypasses it.
         min_chars = smc,
+        -- The merge priority stamped onto every row this source pushes, so an async
+        -- source (a snippet engine) ranks against `buffer` / `lsp` by priority, not
+        -- always at the `0` floor.
+        priority = priority,
       }
     end
   end
@@ -289,11 +301,39 @@ function nx.complete.accept(behavior)
   nx._complete_accept(behavior or "")
 end
 
+-- `nx.complete.choice(items, opts)` — open a **non-grabbing** dropdown at the cursor
+-- listing `items` (strings), the completion-popup widget rather than the grabbing
+-- `nx.ui.select`: `<C-n>`/`<C-p>` move, `<C-y>`/`<CR>` pick, and typing / `<Esc>`
+-- dismiss it (input keeps flowing to the buffer). Accepting a row **replaces**
+-- `opts.range` — `{ start_row, start_col, end_row, end_col }`, 0-based byte cols — with
+-- the pick; the row already sitting in that range is preselected. There is no callback:
+-- the splice is a normal buffer edit, so a caller watching the buffer (`nx.buf.attach`
+-- `on_bytes`) reacts to it — how a plugin snippet engine drives a `${1|a,b,c|}` choice
+-- tabstop and syncs its mirrors. Defaults the range to the empty span at the cursor
+-- (inserting the pick) when `opts.range` is omitted.
+function nx.complete.choice(items, opts)
+  if type(items) ~= "table" then
+    error("nx.complete.choice: items must be a list of strings", 2)
+  end
+  if #items == 0 then
+    return
+  end
+  opts = opts or {}
+  local r = opts.range
+  if r == nil then
+    local pos = nx.win.cursor(0) -- { row (1-based), col (0-based byte) }
+    r = { pos[1] - 1, pos[2], pos[1] - 1, pos[2] }
+  end
+  nx._choice_menu(items, r[1], r[2], r[3], r[4])
+end
+
 -- nx.complete.source { name, complete = function(ctx)[, debounce] }: register an
 -- **async** completion source. `complete` streams candidates for the prefix in
 -- `ctx` ({ prefix, buf, row, col }): it calls `ctx.push(item)` per result — a
 -- string (used as both the menu label and the inserted text) or a table
--- { text = <label>, insert = <applied on accept> } — and signals completion by
+-- { text = <label>, insert = <applied on accept>[, kind = <label>] } — where an
+-- optional `kind` is the short category shown right-aligned on the row (`"Function"`,
+-- `"Module"`, …), like an LSP item's kind — and signals completion by
 -- *returning* (an `nx.async` source returns its promise; a synchronous one just
 -- returns — nx is promise-only, so there is no `done` callback).
 -- The source runs off the input path (debounced by `debounce` ms, default
@@ -475,11 +515,20 @@ function nx._complete_run(gen, ctx)
           end
         end,
       }
-      local labels, inserts, docs, resolves, accepts, batched = {}, {}, {}, {}, {}, 0
+      local labels, inserts, docs, resolves, accepts, kinds, batched = {}, {}, {}, {}, {}, {}, 0
       local function flush()
         if batched > 0 then
-          nx._complete_push(gen, labels, inserts, docs, resolves, accepts)
-          labels, inserts, docs, resolves, accepts, batched = {}, {}, {}, {}, {}, 0
+          nx._complete_push(
+            gen,
+            labels,
+            inserts,
+            docs,
+            resolves,
+            accepts,
+            kinds,
+            source.priority or 0
+          )
+          labels, inserts, docs, resolves, accepts, kinds, batched = {}, {}, {}, {}, {}, {}, 0
         end
       end
       local function push(item)
@@ -487,10 +536,13 @@ function nx._complete_run(gen, ctx)
         if nx._complete ~= c or c.gen ~= gen then
           return
         end
-        local label, insert, doc, resolve_id, accept_id = nil, nil, nil, 0, 0
+        local label, insert, doc, resolve_id, accept_id, kind = nil, nil, nil, 0, 0, nil
         if type(item) == "table" then
           label = item.text or item.label or tostring(item.insert)
           insert = item.insert or label
+          -- The short kind label shown right-aligned on the row (`"Function"`,
+          -- `"Snippet"`, …); `nil` ⇒ the row shows no kind column.
+          kind = item.kind
           -- Inline docs for the sidebar (`""` ⇒ none); a source with a `resolve`
           -- callback instead gets a resolve id, so the server fetches docs lazily
           -- (only for the row the user actually lands on).
@@ -521,6 +573,7 @@ function nx._complete_run(gen, ctx)
         docs[batched] = doc or ""
         resolves[batched] = resolve_id
         accepts[batched] = accept_id
+        kinds[batched] = kind or ""
         if batched >= FLUSH_N then
           flush()
         end

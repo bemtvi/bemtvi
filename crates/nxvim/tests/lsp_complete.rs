@@ -365,3 +365,71 @@ async fn lsp_completion_docs_resolve_fills_the_sidebar() {
 
     std::env::remove_var("NXVIM_LSP_CMD");
 }
+
+/// The latest menu's `(label, kind)` pairs — the projected `items` array zipped with
+/// the parallel `kinds` array (`None` per row where the key/entry is absent).
+async fn poll_menu_rows(
+    rpc: &Rpc,
+    incoming: &mut UnboundedReceiver<Incoming>,
+) -> Option<Vec<(String, Option<String>)>> {
+    nxvim_test_harness::barrier(rpc).await;
+    let map = drain_to_latest_redraw(incoming, |m| {
+        matches!(map_get(m, "menu"), Some(Value::Map(_)))
+    })?;
+    let Some(Value::Map(menu)) = map_get(&map, "menu") else {
+        return None;
+    };
+    let labels = match map_get(menu, "items") {
+        Some(Value::Array(items)) => items
+            .iter()
+            .map(|row| match row {
+                Value::Array(a) => a.first().and_then(Value::as_str).unwrap_or("").to_string(),
+                Value::String(s) => s.as_str().unwrap_or("").to_string(),
+                _ => String::new(),
+            })
+            .collect::<Vec<_>>(),
+        _ => return None,
+    };
+    let kinds = match map_get(menu, "kinds") {
+        Some(Value::Array(a)) => a.iter().map(|v| v.as_str().map(str::to_string)).collect(),
+        _ => vec![None; labels.len()],
+    };
+    Some(labels.into_iter().zip(kinds).collect())
+}
+
+/// An `lsp` completion row projects its `CompletionItemKind` as a readable kind
+/// label (`3`→`"Function"`, `6`→`"Variable"`), so the popup shows what each item is.
+/// A kind-less item (no `kind` field) projects `None`.
+#[tokio::test]
+async fn lsp_completion_projects_item_kind_labels() {
+    let _guard = serial_lock().lock().await;
+    let dir = temp_dir("lsp_complete_kind");
+    // SAFETY: serialized on `serial_lock`.
+    std::env::set_var(
+        "NXVIM_LSP_CMD",
+        format!("{NXVIM_BIN} --__lsp-mock {}/mock.json", dir.display()),
+    );
+
+    let completion = r#"[ { "label": "println", "insertText": "println", "kind": 3 },
+                          { "label": "print_flag", "insertText": "print_flag", "kind": 6 },
+                          { "label": "print_bare", "insertText": "print_bare" } ]"#;
+    let (rpc, mut incoming) = start_typed(&dir, completion, "print").await;
+
+    // Wait until the async reply lands and the popup shows the items.
+    await_items(&rpc, &mut incoming, "println").await;
+    let rows = poll_menu_rows(&rpc, &mut incoming)
+        .await
+        .expect("menu rows with kinds");
+    let kind_of = |label: &str| {
+        rows.iter()
+            .find(|(l, _)| l == label)
+            .map(|(_, k)| k.clone())
+            .unwrap_or_else(|| panic!("row {label:?} not in menu: {rows:?}"))
+    };
+    assert_eq!(kind_of("println").as_deref(), Some("Function"));
+    assert_eq!(kind_of("print_flag").as_deref(), Some("Variable"));
+    // An item without a `kind` field projects no label (not a bogus one).
+    assert_eq!(kind_of("print_bare"), None);
+
+    std::env::remove_var("NXVIM_LSP_CMD");
+}

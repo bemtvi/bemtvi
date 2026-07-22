@@ -41,15 +41,28 @@ impl Editor {
         if self.windows.try_get(id).is_none() {
             return;
         }
-        self.select_escape_insert = escape_insert;
         if id != self.windows.current {
             self.set_current_window(id);
         }
         let lo = self.clamp_to_byte(s_row, s_col);
         let hi = self.clamp_to_byte(e_row, e_col);
-        // An empty (or inverted) range: nothing to highlight. Park the caret at the
-        // start in Insert — the empty-tabstop case the engine drives with
-        // `set_cursor` + Insert, handled here so `select_range` is total.
+        self.select_bytes(lo, hi, escape_insert);
+    }
+
+    /// Enter Select mode over the byte range `[lo, hi)` of the current buffer — the
+    /// window-agnostic core shared by [`select_range_in_window`](Self::select_range_in_window)
+    /// and the snippet engine (which selects a placeholder default so the first
+    /// keystroke replaces it). `escape_insert` sets where `<Esc>` lands (Insert past
+    /// the selection vs. Normal on its head). An empty / inverted range highlights
+    /// nothing: it parks the caret at `lo` in Insert — the empty-placeholder path — so
+    /// callers can hand it any range uniformly.
+    pub(crate) fn select_bytes(&mut self, lo: usize, hi: usize, escape_insert: bool) {
+        // A completion popup and Select mode are incompatible input contexts — in Select
+        // the popup's `<C-n>`/`<C-p>` don't route to it — so a popup left open (e.g. a
+        // plugin snippet engine jumping to the next tabstop while completion is up) would
+        // just linger, following the cursor. Close it before entering Select.
+        self.close_completion();
+        self.select_escape_insert = escape_insert;
         if hi <= lo {
             self.mode = Mode::Insert;
             self.set_cursor_char_insert(lo);
@@ -86,6 +99,14 @@ impl Editor {
     /// vanishes).
     pub(crate) fn handle_select(&mut self, key: Key) {
         self.message.clear();
+        // While a snippet session is live, the jump keys (`<Tab>`/`<S-Tab>`) move to
+        // the next/previous tabstop straight from a selected placeholder — skipping it
+        // without editing, keeping its default — rather than falling through to the
+        // Normal-mode re-dispatch below (which would end the session's Insert context).
+        if let Some(dir) = self.snippet_jump_for(&key) {
+            self.snippet_jump(dir);
+            return;
+        }
         // `<C-g>` toggles back to Visual, keeping the selection and its shape (the
         // Visual → Select half is `NormalCmd::ToggleVisualSelect`).
         if key.ctrl && key.code == KeyCode::Char('g') {
@@ -120,7 +141,15 @@ impl Editor {
                 self.select_replace();
                 self.handle_insert(Key::new(KeyCode::Enter));
             }
-            KeyCode::Backspace | KeyCode::Delete => self.select_replace(),
+            KeyCode::Backspace | KeyCode::Delete => {
+                self.select_replace();
+                // `<BS>`/`<Del>` clear a placeholder without going through
+                // `handle_insert`, so sync the (now-empty) tabstop into its mirrors
+                // here — the printable / `<CR>` arms sync via `handle_insert`.
+                if self.snippet_active() {
+                    self.snippet_sync();
+                }
+            }
             // Any other key (motion, `<C-*>`, an unmapped named key) ends Select and
             // is handled as an ordinary Normal-mode key from the selection head.
             _ => {

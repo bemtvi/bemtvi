@@ -642,6 +642,15 @@ pub struct MenuData {
     /// Per visible row (parallel to `items`), whether the row is **marked** by the
     /// picker's multi-select (`<Tab>`). All-false (or empty) when nothing is marked.
     pub marked: Vec<bool>,
+    /// Per visible row (parallel to `items`), the short **kind** label the client
+    /// draws in the kind column — `"Snippet"`, `"Function"`, `"Variable"`, … `None`
+    /// for a kind-less row (a `buffer` word). Empty when no row carries a kind (every
+    /// non-completion menu): the server omits the `kinds` key entirely then.
+    pub kinds: Vec<Option<String>>,
+    /// The content column where every row's kind label starts (just past the widest
+    /// label), so the kinds align into one column. `None` ⇒ no kind column projected;
+    /// the client then right-aligns each kind on its own row (the fallback).
+    pub kind_col: Option<u16>,
     /// The picker preview pane (Phase 3), present when the source declared a
     /// `preview` kind. `None` for a `select` / preview-less picker — then the box is
     /// the list alone, exactly as before.
@@ -904,6 +913,15 @@ impl View {
                     }
                     _ => Vec::new(),
                 },
+                kinds: match map_get(m, "kinds") {
+                    Some(Value::Array(a)) => {
+                        a.iter().map(|v| v.as_str().map(str::to_string)).collect()
+                    }
+                    _ => Vec::new(),
+                },
+                kind_col: map_get(m, "kind_col")
+                    .and_then(Value::as_u64)
+                    .map(|n| n as u16),
                 preview: match map_get(m, "preview") {
                     Some(Value::Map(p)) => Some(MenuPreview {
                         lines: map_str_array(p, "lines"),

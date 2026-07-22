@@ -17,12 +17,12 @@ use crate::host::seed_package_path;
 use crate::install::fs_stat_table;
 use crate::install::{install_runtime_api, install_vim};
 use crate::ops::{
-    BufOp, CallbackArgs, CompletePush, CompleteSetupReq, ConfirmReq, DecorPublish, DiagnosticData,
-    DockOp, ExtmarkOp, FeedKeysOp, FsValue, GlobalOptionOp, HlSet, HttpServerRequest,
-    InlayHintMirrorData, LayerOp, LoopOp, LspClientData, LspOp, NamedListOp, PanelOp,
-    PickerOpenReq, PickerPush, QfSetOp, RawKeymap, RawRhs, RegisterSetOp, SemanticTokenData,
-    SnippetAddReq, SnippetSetupReq, StatuslinePublishReq, StatuslineSetupReq, TabOp,
-    TerminalOpenReq, TsOp, UiFloatReq, UiInputReq, UiSelectReq, ViewOp, WindowOp,
+    BufOp, CallbackArgs, ChoiceMenuReq, CompletePush, CompleteSetupReq, ConfirmReq, DecorPublish,
+    DiagnosticData, DockOp, ExtmarkOp, FeedKeysOp, FsValue, GlobalOptionOp, HlSet,
+    HttpServerRequest, InlayHintMirrorData, LayerOp, LoopOp, LspClientData, LspOp, NamedListOp,
+    PanelOp, PickerOpenReq, PickerPush, QfSetOp, RawKeymap, RawRhs, RegisterSetOp,
+    SemanticTokenData, SnippetAddReq, SnippetSetupReq, StatuslinePublishReq, StatuslineSetupReq,
+    TabOp, TerminalOpenReq, TsOp, UiFloatReq, UiInputReq, UiSelectReq, ViewOp, WindowOp,
     WorkspaceOptionOp,
 };
 
@@ -797,6 +797,9 @@ pub(crate) struct Shared {
     /// `nx.ui.select` requests, drained by the server into the editor's floating
     /// selectable-list widget (`Editor::open_menu`) after the chunk.
     pub(crate) ui_selects: Vec<UiSelectReq>,
+    /// `nx.complete.choice` requests, drained by the server into the non-grabbing
+    /// cursor choice popup (`Editor::open_choice_menu`) after the chunk.
+    pub(crate) choice_menus: Vec<ChoiceMenuReq>,
     /// `nx.ui.float` requests, drained by the server into the editor's list-less
     /// content float (`Editor::open_content_float`) after the chunk.
     pub(crate) ui_floats: Vec<UiFloatReq>,
@@ -1463,6 +1466,12 @@ impl LuaRuntime {
         /// Take the `nx.ui.select` requests queued since the last drain, for the
         /// server to open as floating selectable-list menus.
         take_ui_selects -> Vec<UiSelectReq> = ui_selects
+    }
+
+    take_queue! {
+        /// Take the `nx.complete.choice` requests queued since the last drain, for the
+        /// server to open as non-grabbing cursor choice popups.
+        take_choice_menus -> Vec<ChoiceMenuReq> = choice_menus
     }
 
     take_queue! {

@@ -863,6 +863,13 @@ impl EditHost {
                 .open_menu(req.items, nxvim_core::MenuPlacement::Cursor, 0);
             self.pending_ui_select = Some(req.cb_id);
         }
+        // `nx.complete.choice`: a non-grabbing cursor dropdown over a byte range —
+        // accepting a row splices the pick over the range natively (no callback), so a
+        // plugin snippet engine's own `on_bytes` reacts. The last queued wins.
+        for req in self.lua.take_choice_menus() {
+            self.editor
+                .open_choice_menu(req.sr, req.sc, req.er, req.ec, req.items);
+        }
         // `nx.ui.float`: open / update / close the list-less content float. A
         // transient float (`id == 0`) is fire-and-forget and dismissed by the next
         // key; a persistent one (`id != 0`) survives keystrokes until its handle
@@ -1162,6 +1169,8 @@ impl EditHost {
                 .map(|p| nxvim_core::MenuItem {
                     label: p.label,
                     key: p.key,
+                    // A picker row renders no kind column.
+                    kind: None,
                     preview: p.preview.map(|pv| nxvim_core::PreviewTarget {
                         path: pv.path,
                         loc: pv.loc,
@@ -1208,9 +1217,14 @@ impl EditHost {
                     key: p
                         .accept
                         .map_or(0, |id| crate::snippet::PLUGIN_ACCEPT_KEY_BASE + id as usize),
+                    // A plugin source's declared kind (`push { kind = … }`), shown
+                    // right-aligned on the row; `None` when the item omits it.
+                    kind: p.kind,
                     preview: None,
                     insert: Some(p.insert),
-                    priority: 0,
+                    // The source's merge priority, so an async source ranks against
+                    // buffer/lsp by priority instead of pinning at the `0` floor.
+                    priority: p.priority,
                     source_accept: p.accept.is_some(),
                     // A plugin source can attach inline docs (`push { doc = … }`),
                     // rendered beside the popup for the selected row (Phase 4-E).

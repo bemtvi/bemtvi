@@ -680,6 +680,199 @@ nx.complete.setup { sources = { { 'echo' } }, min_chars = 2 }";
     assert_eq!(lines(&rpc).await, vec!["abc"]);
 }
 
+/// Entering Select mode (`nx.win.select_range`, the seam a plugin snippet engine uses
+/// to land on a tabstop) closes any open completion popup — otherwise a popup left up
+/// from typing would linger and follow the cursor to the next tabstop.
+#[tokio::test]
+async fn entering_select_mode_closes_the_completion_popup() {
+    let dir = temp_dir("complete_select_closes");
+    let (rpc, mut incoming) = start(&dir, BUFFER_INIT).await;
+
+    // A buffer word `hello`, then a matching prefix `he` opens the popup.
+    feed(&rpc, "ihello he");
+    assert!(
+        poll_menu(&rpc, &mut incoming).await.is_some(),
+        "the completion popup opens"
+    );
+    // Enter Select mode over `he` (as a tabstop jump would); the popup must close.
+    exec_lua(
+        &rpc,
+        "nx.win.select_range(0, 0, 0, 0, 2, { on_escape = 'insert' })",
+    )
+    .await;
+    assert!(
+        poll_no_menu(&rpc, &mut incoming).await,
+        "the popup closes when Select mode is entered"
+    );
+}
+
+/// The merged view is **fuzzy-first**: a clearly better match wins regardless of
+/// source. A buffer word that matches the prefix well outranks a low-priority-source
+/// row that only scatter-matches it — despite the source's bias.
+#[tokio::test]
+async fn merge_is_fuzzy_first_a_better_match_beats_source_bias() {
+    let dir = temp_dir("complete_blend_fuzzy_first");
+    let init = "\
+nx.complete.source {\n\
+  name = 'snip', priority = 5, debounce = 0,\n\
+  complete = function(ctx) if ctx.prefix ~= '' then ctx.push { text = 'supreme' } end end,\n\
+}\n\
+nx.complete.setup { sources = { { 'buffer', min_chars = 2 }, { 'snip' } } }";
+    let (rpc, mut incoming) = start(&dir, init).await;
+
+    // `prefix` is a buffer word (a strong prefix match for `pre`); the snippet source
+    // pushes `supreme` (a weak scattered match). The strong match wins despite the bias.
+    feed(&rpc, "iprefix pre");
+    let menu = menu_of(&poll_menu(&rpc, &mut incoming).await.expect("popup opens"));
+    let items = menu_items(&menu);
+    assert!(
+        items.contains(&"supreme".to_string()),
+        "the source row is present: {items:?}"
+    );
+    assert_eq!(
+        items[0], "prefix",
+        "the better fuzzy match (buffer) outranks the biased weak match: {items:?}"
+    );
+}
+
+/// Among **equally-good** matches, the source bias breaks the tie: a snippet-source
+/// row (bias 5) edges out a buffer word (bias 0) with the same fuzzy score.
+#[tokio::test]
+async fn merge_source_bias_breaks_a_tie() {
+    let dir = temp_dir("complete_blend_tiebreak");
+    let init = "\
+nx.complete.source {\n\
+  name = 'snip', priority = 5, debounce = 0,\n\
+  complete = function(ctx) if ctx.prefix ~= '' then ctx.push { text = 'copy' } end end,\n\
+}\n\
+nx.complete.setup { sources = { { 'buffer', min_chars = 2 }, { 'snip' } } }";
+    let (rpc, mut incoming) = start(&dir, init).await;
+
+    // Both `count` (buffer) and `copy` (snippet) are clean prefix matches for `co` — the
+    // same fuzzy score — so the snippet's bias tips it to the top.
+    feed(&rpc, "icount co");
+    let menu = menu_of(&poll_menu(&rpc, &mut incoming).await.expect("popup opens"));
+    let items = menu_items(&menu);
+    assert!(
+        items.contains(&"count".to_string()) && items.contains(&"copy".to_string()),
+        "both rows are present: {items:?}"
+    );
+    assert_eq!(
+        items[0], "copy",
+        "the equally-good snippet row edges out the buffer word via its bias: {items:?}"
+    );
+}
+
+/// The kind labels align in one column: the server projects `kind_col` just past the
+/// widest label, and sizes the box to `widest_label + gap + widest_kind`.
+#[tokio::test]
+async fn kinds_align_in_a_single_column() {
+    let dir = temp_dir("complete_kind_align");
+    let init = "\
+nx.complete.source {\n\
+  name = 'k', debounce = 0,\n\
+  complete = function(ctx) if ctx.prefix ~= '' then\n\
+    ctx.push { text = 'ab', kind = 'Snippet' }\n\
+    ctx.push { text = 'abcdefgh', kind = 'X' }\n\
+  end end,\n\
+}\n\
+nx.complete.setup { sources = { { 'k' } }, min_chars = 1 }";
+    let (rpc, mut incoming) = start(&dir, init).await;
+
+    feed(&rpc, "iab");
+    let menu = menu_of(&poll_menu(&rpc, &mut incoming).await.expect("popup opens"));
+    // Kinds start just past the widest label (`abcdefgh` = 8) → column 9, for every row.
+    assert_eq!(
+        map_get(&menu, "kind_col").and_then(Value::as_u64),
+        Some(9),
+        "kind_col aligns past the widest label"
+    );
+    // The box holds widest label + a gap + widest kind (`Snippet` = 7): 8 + 1 + 7 = 16.
+    assert_eq!(map_get(&menu, "width").and_then(Value::as_u64), Some(16));
+}
+
+/// A `buffer`-source word carries the `Text` kind in the popup's kind column.
+#[tokio::test]
+async fn buffer_words_carry_the_text_kind() {
+    let dir = temp_dir("complete_buffer_text_kind");
+    let (rpc, mut incoming) = start(&dir, BUFFER_INIT).await;
+
+    feed(&rpc, "ihello he");
+    let menu = menu_of(&poll_menu(&rpc, &mut incoming).await.expect("popup opens"));
+    let kinds = menu_kinds(&menu);
+    assert!(
+        !kinds.is_empty() && kinds.iter().all(|k| k.as_deref() == Some("Text")),
+        "every buffer row shows the Text kind: {kinds:?}"
+    );
+}
+
+/// `nx.complete.choice(items, { range })` opens a non-grabbing cursor dropdown; a pick
+/// splices the chosen alternative over the range (the seam a plugin snippet engine's
+/// `${1|a,b,c|}` choice tabstop rides). It is NOT the grabbing `nx.ui.select`.
+#[tokio::test]
+async fn choice_api_opens_nongrabbing_popup_and_replaces_the_range() {
+    let dir = temp_dir("complete_choice_api");
+    let (rpc, mut incoming) = start(&dir, "nx.complete.setup{}").await;
+
+    // A line `x = a`; open a choice over the `a` (cols 4..5) offering a/b/c.
+    feed(&rpc, "ix = a");
+    exec_lua(
+        &rpc,
+        "nx.complete.choice({ 'a', 'b', 'c' }, { range = { 0, 4, 0, 5 } })",
+    )
+    .await;
+    let menu = menu_of(
+        &poll_menu(&rpc, &mut incoming)
+            .await
+            .expect("choice popup opens"),
+    );
+    assert_eq!(menu_items(&menu), vec!["a", "b", "c"]);
+    // The popup is non-grabbing (a completion popup): typing/editing still flows to the
+    // buffer, and the document holds the seeded text while it's open.
+    assert_eq!(lines(&rpc).await, vec!["x = a"]);
+
+    // Preselected on the current value `a`; <C-n> moves to `b`, <C-y> accepts — the pick
+    // replaces the range.
+    feed(&rpc, "<C-n><C-y>");
+    assert_eq!(lines(&rpc).await, vec!["x = b"]);
+}
+
+/// The menu's per-row kind labels (the `kinds` array), parallel to [`menu_items`];
+/// empty when the key is absent (no row carries a kind).
+fn menu_kinds(menu: &[(Value, Value)]) -> Vec<Option<String>> {
+    match map_get(menu, "kinds") {
+        Some(Value::Array(a)) => a.iter().map(|v| v.as_str().map(str::to_string)).collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// A `nx.complete.source` item's `kind` field rides the push wire and projects onto
+/// the row's kind column (`menu.kinds`), the same surface the native `lsp`/`snippets`
+/// sources use — so a plugin source can label its rows (`"Module"`, `"Function"`, …).
+#[tokio::test]
+async fn async_source_item_kind_projects_to_the_menu() {
+    let dir = temp_dir("complete_async_kind");
+    // A source that pushes a table item carrying an explicit `kind`.
+    let init = "\
+nx.complete.source {\n\
+  name = 'kinded', debounce = 0,\n\
+  complete = function(ctx)\n\
+    if ctx.prefix ~= '' then ctx.push { text = ctx.prefix .. '_mod', kind = 'Module' } end\n\
+  end,\n\
+}\n\
+nx.complete.setup { sources = { { 'kinded' } }, min_chars = 2 }";
+    let (rpc, mut incoming) = start(&dir, init).await;
+
+    feed(&rpc, "iab");
+    let menu = menu_of(&poll_menu(&rpc, &mut incoming).await.expect("popup opens"));
+    assert_eq!(menu_items(&menu), vec!["ab_mod"]);
+    assert_eq!(
+        menu_kinds(&menu),
+        vec![Some("Module".to_string())],
+        "the source item's kind reaches the row's kind column"
+    );
+}
+
 #[tokio::test]
 async fn async_source_with_no_matches_closes_the_confirmed_empty_popup() {
     let dir = temp_dir("complete_async_empty");
@@ -893,6 +1086,36 @@ async fn poll_docs_lines(
     poll_docs_win(rpc, incoming, |_| true)
         .await
         .map(|w| win_lines(&w))
+}
+
+/// A source that pushes a **fenced code block** as its `doc` (the shape a plugin
+/// snippet engine uses to preview a snippet body) renders that body in the docs float
+/// when the row is selected — the "function docs" surface, for snippet rows.
+#[tokio::test]
+async fn async_source_fenced_body_doc_previews_in_the_float() {
+    let dir = temp_dir("complete_fenced_doc");
+    let init = "\
+nx.complete.source {\n\
+  name = 'snip', debounce = 0,\n\
+  complete = function(ctx)\n\
+    if ('logg'):find(ctx.prefix, 1, true) == 1 then\n\
+      ctx.push { text = 'logg', doc = '```lua\\nLOGBODY($1)$0\\n```' }\n\
+    end\n\
+  end,\n\
+}\n\
+nx.complete.setup { sources = { { 'snip' } } }";
+    let (rpc, mut incoming) = start(&dir, init).await;
+
+    feed(&rpc, "ilog");
+    let _ = poll_menu(&rpc, &mut incoming).await.expect("popup opens");
+    feed(&rpc, "<C-n>");
+    let lines = poll_docs_lines(&rpc, &mut incoming)
+        .await
+        .expect("docs float appears");
+    assert!(
+        lines.iter().any(|l| l.contains("LOGBODY($1)$0")),
+        "the fenced snippet body renders in the docs float: {lines:?}"
+    );
 }
 
 /// Inline `code` in the docs float renders with the colorscheme's `@markup.raw` style

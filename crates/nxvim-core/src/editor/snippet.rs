@@ -54,6 +54,9 @@ impl Default for SnippetKeys {
 struct SessionStop {
     index: u32,
     marks: Vec<u64>,
+    /// The choice alternatives for a `${N|a,b,c|}` stop, else empty. Landing on such
+    /// a stop opens a dropdown of these instead of selecting a default.
+    choices: Vec<String>,
 }
 
 /// An in-flight snippet expansion. `stops` is in tab order (1, 2, …, then the
@@ -143,6 +146,7 @@ impl Editor {
             stops.push(SessionStop {
                 index: stop.index,
                 marks,
+                choices: stop.choices.clone(),
             });
         }
 
@@ -192,9 +196,12 @@ impl Editor {
         true
     }
 
-    /// Park the cursor on the current stop's primary occurrence (at its end, so any
-    /// default text is kept), set the live left-edge anchor, and recolour so only
-    /// the current stop's marks read as active.
+    /// Move onto the current stop's primary occurrence and set the live left-edge
+    /// anchor, recolouring so only the current stop's marks read as active. A stop
+    /// with a non-empty **default** is *selected* (Select mode), so the first
+    /// keystroke replaces it (vim's select-mode placeholder — the type-over-default
+    /// behaviour); an empty tabstop just parks the caret there in Insert. `<Esc>` from
+    /// the selection keeps the default and continues editing it in Insert.
     fn snippet_place_current(&mut self) {
         let Some(sess) = self.snippet.as_ref() else {
             return;
@@ -210,9 +217,24 @@ impl Editor {
             self.recolor_snippet_mark(mark, active);
         }
         let primary = self.snippet.as_ref().unwrap().stops[cur].marks[0];
+        let choices = self.snippet.as_ref().unwrap().stops[cur].choices.clone();
         if let Some((start, end)) = self.snippet_mark_range(primary) {
             self.snippet.as_mut().unwrap().anchor = start;
-            self.set_cursor_char_insert(end);
+            if choices.is_empty() {
+                // `select_bytes` selects a non-empty default and parks an empty stop
+                // in Insert at `start`, so either way the session's anchor stays `start`.
+                self.select_bytes(start, end, true);
+            } else {
+                // A choice stop: park the caret past the current value (Insert) and
+                // drop a dropdown of the alternatives — accepting one replaces the
+                // value `[start..end)` and syncs mirrors, `<Tab>` keeps the current
+                // value and jumps on. Preselect the alternative already in the buffer.
+                self.mode = Mode::Insert;
+                self.set_cursor_char_insert(end);
+                let current = self.buffer().text.slice(start..end).to_string();
+                let active = choices.iter().position(|c| *c == current).unwrap_or(0);
+                self.open_snippet_choice_menu(start, &choices, active);
+            }
         }
     }
 
@@ -236,18 +258,26 @@ impl Editor {
         let mirrors: Vec<u64> = self.snippet.as_ref().unwrap().stops[cur].marks[1..].to_vec();
 
         // Apply mirror replacements high-offset-first so an earlier edit never shifts
-        // a later one; an edit wholly left of the anchor shifts the live region.
-        let mut edits: Vec<(usize, usize)> = mirrors
+        // a later one; an edit wholly left of the anchor shifts the live region. Each
+        // edit keeps its mark id so we can reset the mark onto the freshly-written
+        // content — `remove` + `insert` over the exact mark range would otherwise
+        // collapse it to a degenerate point, so the *next* keystroke's mirror sync
+        // would target the wrong span and duplicate the text.
+        let mut edits: Vec<(u64, usize, usize)> = mirrors
             .iter()
-            .filter_map(|&m| self.snippet_mark_range(m))
-            .filter(|&(s, e)| self.buffer().text.slice(s..e) != content.as_str())
+            .filter_map(|&m| self.snippet_mark_range(m).map(|(s, e)| (m, s, e)))
+            .filter(|&(_, s, e)| self.buffer().text.slice(s..e) != content.as_str())
             .collect();
-        edits.sort_by_key(|&(s, _)| std::cmp::Reverse(s));
-        for (s, e) in edits {
+        edits.sort_by_key(|&(_, s, _)| std::cmp::Reverse(s));
+        for (mark, s, e) in edits {
             self.buffer_mut().remove(s..e);
             if !content.is_empty() {
                 self.buffer_mut().insert(s, &content);
             }
+            // Re-anchor the mirror's mark to the text just written (mirrors of the
+            // active stop render as active, like its primary). A subsequent lower edit
+            // shifts this fully-right mark cleanly, so processing high-first is safe.
+            self.set_snippet_mark(Some(mark), s, s + content.len(), true);
             if s < anchor {
                 let delta = content.len() as isize - (e - s) as isize;
                 anchor = (anchor as isize + delta).max(0) as usize;

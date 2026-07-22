@@ -1786,6 +1786,7 @@ impl EditHost {
             rows,
             selected,
             start,
+            kind_col,
             ..
         } = geom;
 
@@ -1804,6 +1805,18 @@ impl EditHost {
             .iter()
             .map(|(label, _)| Value::from(label.as_str()))
             .collect();
+        // Per-row **kind** labels (parallel to `items`): the short category the client
+        // right-aligns on each completion row (`"Snippet"`, `"Function"`, …). `Nil` for
+        // a kind-less row (a `buffer` word) and for every non-completion menu. Omitted
+        // entirely when no row carries a kind, so a `select` / picker map is unchanged.
+        let row_kinds = self.editor.menu_kinds_window(start, rows.len());
+        let any_kind = row_kinds.iter().any(Option::is_some);
+        let kinds = Value::Array(
+            row_kinds
+                .into_iter()
+                .map(|k| k.map_or(Value::Nil, Value::from))
+                .collect(),
+        );
         // Multi-select: a bool per visible row (parallel to `items`) flagging the
         // user-marked rows (`<Tab>`), so the client can mark them. Always present;
         // all-false when nothing is marked.
@@ -1847,6 +1860,17 @@ impl EditHost {
             (Value::from("match_spans"), match_spans),
             (Value::from("marked"), marked),
         ];
+        // Only completion popups carry kinds; omit the key when every row is kind-less
+        // so `select` / picker / cmdline maps are byte-for-byte unchanged.
+        if any_kind {
+            map.push((Value::from("kinds"), kinds));
+            // The aligned kind column's start (just past the widest label): every row's
+            // kind renders here so they line up. Absent ⇒ the client falls back to
+            // right-aligning per row.
+            if let Some(kc) = kind_col {
+                map.push((Value::from("kind_col"), Value::from(kc as u64)));
+            }
+        }
         // Themeable colors for the widget (bg / selection / matched chars / border,
         // plus prompt + title for a picker), resolved from nvim-cmp / telescope
         // groups. The completion popup and the command-line wildmenu follow cmp; a

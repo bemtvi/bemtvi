@@ -539,6 +539,43 @@ pub struct CompletionItemData {
     pub resolve_data: Option<serde_json::Value>,
 }
 
+impl CompletionItemData {
+    /// The human-readable name of this item's `CompletionItemKind` for the popup's
+    /// kind column — `1`→`"Text"`, `3`→`"Function"`, `15`→`"Snippet"`, … matching the
+    /// LSP enum. `None` for `0` (unspecified — the server sent no kind) so the row
+    /// renders no kind label rather than a bogus one.
+    pub fn kind_label(&self) -> Option<&'static str> {
+        Some(match self.kind {
+            1 => "Text",
+            2 => "Method",
+            3 => "Function",
+            4 => "Constructor",
+            5 => "Field",
+            6 => "Variable",
+            7 => "Class",
+            8 => "Interface",
+            9 => "Module",
+            10 => "Property",
+            11 => "Unit",
+            12 => "Value",
+            13 => "Enum",
+            14 => "Keyword",
+            15 => "Snippet",
+            16 => "Color",
+            17 => "File",
+            18 => "Reference",
+            19 => "Folder",
+            20 => "EnumMember",
+            21 => "Constant",
+            22 => "Struct",
+            23 => "Event",
+            24 => "Operator",
+            25 => "TypeParameter",
+            _ => return None,
+        })
+    }
+}
+
 /// Server → editor, delivered to the main loop's `select!`. The distilled events
 /// the editor acts on; lifecycle/framing/id-correlation are handled inside the
 /// manager by `async-lsp` and never surface here.

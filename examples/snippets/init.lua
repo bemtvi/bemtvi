@@ -29,11 +29,29 @@ nx.snippet.add("lua", {
   { trigger = "if", body = "if ${1:cond} then\n\t$0\nend" },
   -- A mirror: the local name is echoed in the assignment.
   { trigger = "loc", body = "local ${1:x} = ${1:x}" },
+  { trigger = "alts", body = "local aaa = ${1|a,b,c|}" },
 })
 
 -- Offer the snippets as completion candidates (alongside buffer words). Type a
 -- trigger, pick the row with <C-n>/<C-p>, accept with <C-y> — the body expands and
 -- the cursor lands on the first tabstop. <Tab>/<S-Tab> move between tabstops.
+--
+-- A tabstop with a DEFAULT (`${1:name}`, and the `loc` snippet's `${1:x}`) lands
+-- SELECTED, so your first keystroke REPLACES the default (vscode/LuaSnip style) —
+-- type `loc<C-y>` then `count` to get `local count = count`. Press <Esc> instead to
+-- keep the default and edit it, or <Tab> to skip the placeholder untouched.
+--
+-- A CHOICE tabstop (`${1|a,b,c|}`, the `alts` snippet) opens a DROPDOWN of its
+-- alternatives on land: expand `alts`, then <C-n>/<C-p> to move and <C-y> to pick —
+-- `local aaa = b`. <Tab> keeps the current alternative and jumps on.
+--
+-- TYPE `fn` in insert mode and watch the popup:
+--   • Each snippet row shows a right-aligned "Snippet" KIND label (dimmed), so you
+--     can tell it apart from a plain "buffer" word (which shows no kind). LSP rows
+--     would likewise show "Function" / "Variable" / … here.
+--   • Move onto the snippet row (<C-n>) and a DOCS FLOAT opens beside the popup
+--     previewing the body you're about to expand — `function ${1:name}(${2})…` — the
+--     same surface LSP items use for their documentation.
 nx.complete.setup {
   sources = {
     { "snippets" },

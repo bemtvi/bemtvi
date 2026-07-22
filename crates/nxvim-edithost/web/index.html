@@ -80,6 +80,9 @@
   .pmenu-sel { background: var(--sel); color: #e6e6e6; }
   .pmenu-match { color: #e5c07b; font-weight: bold; }
   .pmenu-prompt { color: #abb2bf; }
+  /* The right-aligned completion kind column ("Snippet", "Function", …): dimmed so
+     it recedes behind the label. Overridden inline when the theme carries a fg. */
+  .pmenu-kind { opacity: 0.6; }
   .pmenu-doc { position: absolute; background: #21252b; z-index: 10; white-space: pre; color: var(--status-fg); }
   #grid .pmenu-doc .row { position: static; height: var(--ch); line-height: var(--ch); }
   /* A tiny boot/transport indicator, hidden shortly after the first frame. */
@@ -2384,10 +2387,17 @@
         // Path-priority truncation: keep the file name (path tail) on screen when the
         // row overflows, dropping leading directories behind a `…` and remapping spans.
         const rawSpans = (menu.match_spans && menu.match_spans[idx]) || [];
-        const [elidedLabel, spans] = elideKeepTail(label, rawSpans, listW);
-        const chars = [...elidedLabel].slice(0, listW);
+        // Aligned kind column (`Snippet`, `Function`, …): the server projects `kind_col`
+        // — the column every kind starts at, just past the widest label — so they line
+        // up. The label region ends there (its padding is the gap); a kind-less row still
+        // reserves it so labels stay aligned.
+        const kindStr = (menu.kinds && menu.kinds[idx]) || "";
+        const hasKindCol = typeof menu.kind_col === "number" && menu.kind_col < listW;
+        const labelW = hasKindCol ? menu.kind_col : listW;
+        const [elidedLabel, spans] = elideKeepTail(label, rawSpans, labelW);
+        const chars = [...elidedLabel].slice(0, labelW);
         if (spans.length === 0) {
-          rowEl.textContent = chars.join("").padEnd(listW);
+          rowEl.textContent = chars.join("").padEnd(labelW);
         } else {
           chars.forEach((chr, ci) => {
             const matched = spans.some(([s, e]) => ci >= s && ci < e);
@@ -2401,8 +2411,16 @@
               rowEl.appendChild(document.createTextNode(chr));
             }
           });
-          const pad = listW - chars.length;
+          const pad = labelW - chars.length;
           if (pad > 0) rowEl.appendChild(document.createTextNode(" ".repeat(pad)));
+        }
+        // The kind at `kind_col` — the label was padded to `labelW` (= kind_col), whose
+        // trailing space is the gap, so render the kind text with no extra leading space.
+        if (hasKindCol && kindStr) {
+          const k = document.createElement("span");
+          k.className = "pmenu-kind";
+          k.textContent = kindStr;
+          rowEl.appendChild(k);
         }
         listEls.push(rowEl);
       }

@@ -160,15 +160,23 @@ pub type CmdlineCandidate = (String, String, Option<String>, Option<(usize, usiz
 pub struct MenuItem {
     pub label: String,
     pub key: usize,
+    /// A short **kind** label shown right-aligned on the row (`Complete` menus only):
+    /// the candidate's category — `"Snippet"` for a snippet row, an LSP
+    /// `CompletionItemKind` name (`"Function"`, `"Variable"`, `"Field"`, …) for an
+    /// `lsp` row, or whatever a plugin source declares (`push { kind = … }`). `None`
+    /// for a `buffer` word (no kind) and for every `select` / picker / cmdline row —
+    /// those render no kind column.
+    pub kind: Option<String>,
     pub preview: Option<PreviewTarget>,
     /// The text a completion row inserts when accepted (`Complete` menus only).
     /// `None` ⇒ use `label`. `Select` / picker rows leave this `None` — they
     /// round-trip the opaque `key` to Lua, which applies the choice itself.
     pub insert: Option<String>,
-    /// Source priority for the merged completion view (`Complete` menus only): the
-    /// effective order is **priority descending, then fuzzy score** — so an `lsp`
-    /// row (high priority) outranks a `buffer` word with the same match quality.
-    /// `0` for `select` / picker rows (a single source, no merge).
+    /// Source **bias** for the merged completion view (`Complete` menus only): a small
+    /// number ADDED to the row's fuzzy score to break near-ties in the source's favour
+    /// (`lsp` 8 > snippets 5 > buffer 0). The order is fuzzy-first — a clearly better
+    /// buffer word still outranks a mediocre `lsp` match — so this only tips *equally-
+    /// good* candidates. `0` for `select` / picker rows (single source, no merge).
     pub priority: i32,
     /// Whether accepting this row is **delegated to the source** rather than applied
     /// natively (`Complete` menus only). `false` ⇒ core replaces `[anchor..cursor)`
@@ -494,28 +502,47 @@ impl Menu {
         }
     }
 
-    /// Re-order the ranked view by **source priority** (descending), preserving the
-    /// fuzzy order within each priority — so a merged completion menu lists an `lsp`
-    /// row (priority 100) above a `buffer` word (priority 10) of equal match quality.
-    /// A stable sort over the parallel `filtered` / `match_spans`. Called by
-    /// [`Editor::menu_push`] for [`MenuKind::Complete`] menus only (a single-source
-    /// picker keeps pure fuzzy order). Cheap — completion lists are small.
+    /// Re-order the merged completion view by a **blended** key: each row's raw fuzzy
+    /// score against the prefix plus its source's small `priority` bias, descending. So
+    /// the list is fuzzy-first — a clearly better buffer word beats a mediocre `lsp`
+    /// match — but among *equally-good* matches the higher-priority source edges ahead
+    /// (`lsp` bias 8 > snippets 5 > buffer 0). This replaces the old strict priority
+    /// tiers, which pinned every buffer word below every snippet regardless of quality.
+    ///
+    /// Re-scores via [`crate::fuzzy::rank_scored`] over the (small) filtered label set —
+    /// the streamed spans are kept; only the order changes. A stable sort over the
+    /// parallel `filtered` / `match_spans`. Called by [`Editor::menu_push`] for
+    /// [`MenuKind::Complete`] menus only (a single-source picker keeps pure fuzzy order).
     fn sort_complete_view(&mut self) {
         if self.filtered.is_none() {
             return;
         }
         let filtered = self.filtered.take().unwrap();
         let spans = std::mem::take(&mut self.match_spans);
-        let mut rows: Vec<(usize, Vec<Range<usize>>)> = filtered.into_iter().zip(spans).collect();
-        // Descending priority; stable, so equal-priority rows keep their fuzzy order.
-        rows.sort_by(|a, b| {
-            self.all_items[b.0]
-                .priority
-                .cmp(&self.all_items[a.0].priority)
-        });
-        let (filtered, spans): (Vec<usize>, Vec<Vec<Range<usize>>>) = rows.into_iter().unzip();
-        self.filtered = Some(filtered);
-        self.match_spans = spans;
+        // The blend needs each row's fuzzy score against the live prefix; re-rank the
+        // filtered labels to recover it (they all match, so every position gets a score).
+        let query = self.match_query().to_string();
+        let labels: Vec<&str> = filtered
+            .iter()
+            .map(|&i| self.all_items[i].label.as_str())
+            .collect();
+        let mut score_of = vec![0i32; filtered.len()];
+        for (pos, sc, _) in crate::fuzzy::rank_scored(&query, &labels) {
+            score_of[pos] = sc as i32;
+        }
+        let mut rows: Vec<(usize, Vec<Range<usize>>, i32)> = filtered
+            .into_iter()
+            .zip(spans)
+            .enumerate()
+            .map(|(pos, (idx, sp))| {
+                let key = score_of[pos] + self.all_items[idx].priority;
+                (idx, sp, key)
+            })
+            .collect();
+        // Descending blended key; stable, so equal keys keep their streamed order.
+        rows.sort_by_key(|r| std::cmp::Reverse(r.2));
+        self.filtered = Some(rows.iter().map(|r| r.0).collect());
+        self.match_spans = rows.into_iter().map(|r| r.1).collect();
     }
 
     /// The [`PreviewTarget`] for the highlighted row, when this picker carries a
@@ -582,6 +609,7 @@ impl Editor {
             .map(|(key, label)| MenuItem {
                 label,
                 key,
+                kind: None,
                 preview: None,
                 insert: None,
                 priority: 0,
@@ -732,6 +760,8 @@ impl Editor {
             all_items.push(MenuItem {
                 label,
                 key,
+                // A cmdline wildmenu row renders no kind column.
+                kind: None,
                 preview: None,
                 insert: Some(insert),
                 priority: 0,
@@ -1021,6 +1051,8 @@ impl Editor {
                 insert: Some(label.clone()),
                 label,
                 key,
+                // A buffer word completes to plain text — the LSP `Text` kind.
+                kind: Some("Text".to_string()),
                 preview: None,
                 priority,
                 // The `buffer` source inserts its word natively (no source edit).
@@ -1060,6 +1092,103 @@ impl Editor {
             // The docs sidebar follows the engine config; the server fills it from
             // its LSP item cache for the selected row (a `buffer` row has no docs).
             docs: self.complete_config.docs,
+            generation: gen,
+            items_gen: gen,
+            marked: Vec::new(),
+            width: None,
+            height: None,
+            align: None,
+            margin: Margin::default(),
+            title: None,
+            multiselect: false,
+            resumable: false,
+        });
+    }
+
+    /// Open a **snippet-choice** dropdown: a [`MenuKind::Complete`] popup listing a
+    /// choice tabstop's alternatives (`${1|a,b,c|}`), anchored at the tabstop start
+    /// `anchor` so accepting a row replaces the whole current value `[anchor..cursor)`.
+    /// Preselects `active` (the alternative already in the buffer) so `<C-y>`/`<CR>`
+    /// accepts at once and `<C-n>`/`<C-p>` steps from it. Unlike the engine popup this
+    /// bypasses prefix fuzzy-ranking — every alternative is shown regardless of the
+    /// Open a non-grabbing choice dropdown over the byte range `(sr,sc)..(er,ec)` — the
+    /// Lua-facing entry (`nx.complete.choice`) behind a plugin snippet engine's choice
+    /// tabstops. Enters Insert, parks the caret at the range end, and opens the
+    /// [`open_snippet_choice_menu`](Self::open_snippet_choice_menu) popup anchored at the
+    /// start, so accepting a row replaces exactly `[start..end)` with the pick (the
+    /// popup is non-grabbing, so a plugin's `on_bytes` then syncs any mirrors natively).
+    /// Preselects the alternative already sitting in the range. Rows/cols are 0-based.
+    pub fn open_choice_menu(
+        &mut self,
+        sr: usize,
+        sc: usize,
+        er: usize,
+        ec: usize,
+        choices: Vec<String>,
+    ) {
+        if choices.is_empty() {
+            return;
+        }
+        let start = self.buffer().byte_at(sr, sc);
+        let end = self.buffer().byte_at(er, ec).max(start);
+        self.mode = Mode::Insert;
+        self.set_cursor_char_insert(end);
+        let current = self.buffer().text.slice(start..end).to_string();
+        let active = choices.iter().position(|c| *c == current).unwrap_or(0);
+        self.open_snippet_choice_menu(start, &choices, active);
+        self.ensure_visible();
+    }
+
+    /// value already sitting in the tabstop — and carries no docs sidebar.
+    pub(crate) fn open_snippet_choice_menu(
+        &mut self,
+        anchor: usize,
+        choices: &[String],
+        active: usize,
+    ) {
+        self.complete_gen += 1;
+        let gen = self.complete_gen;
+        let value = self
+            .buffer()
+            .text
+            .slice(anchor..self.cursor_char())
+            .to_string();
+        let all_items: Vec<MenuItem> = choices
+            .iter()
+            .enumerate()
+            .map(|(key, c)| MenuItem {
+                label: c.clone(),
+                key,
+                kind: None,
+                preview: None,
+                insert: Some(c.clone()),
+                priority: 0,
+                source_accept: false,
+                doc: None,
+                resolve: None,
+                replace: None,
+            })
+            .collect();
+        let n = all_items.len();
+        self.menu = Some(Menu {
+            kind: MenuKind::Complete,
+            anchor,
+            anchor_width: crate::unicode::display_width(&value),
+            all_items,
+            filtered: Some((0..n).collect()),
+            match_spans: vec![Vec::new(); n],
+            cursor: active.min(n.saturating_sub(1)),
+            // Preselected: a choice dropdown is an explicit pick, so `<C-y>`/`<CR>`
+            // accepts the highlighted alternative straight away.
+            selected_active: true,
+            placement: MenuPlacement::Cursor,
+            prompt: None,
+            complete_prefix: String::new(),
+            prompt_pos: PromptPos::default(),
+            dynamic: false,
+            preview: false,
+            preview_scroll: None,
+            docs: false,
             generation: gen,
             items_gen: gen,
             marked: Vec::new(),
@@ -1698,6 +1827,21 @@ impl Editor {
             .collect()
     }
 
+    /// The per-row **kind** label for the visible window `[start, start + count)`,
+    /// parallel to [`Editor::menu_rows`] — the short category the client right-aligns
+    /// on each completion row (`"Snippet"`, `"Function"`, …). `None` for a row whose
+    /// source declares no kind (`buffer` words, `select` / picker rows); empty when no
+    /// menu is open.
+    pub fn menu_kinds_window(&self, start: usize, count: usize) -> Vec<Option<String>> {
+        let Some(m) = self.menu.as_ref() else {
+            return Vec::new();
+        };
+        let end = start.saturating_add(count).min(m.view_len());
+        (start..end)
+            .map(|i| m.all_items[m.item_at(i)].kind.clone())
+            .collect()
+    }
+
     /// Whether each row in the visible window `[start, start + count)` is **marked**
     /// (multi-select), parallel to [`Editor::menu_rows`] — so the client can flag the
     /// marked rows. All `false` when nothing is marked (the common case); empty when
@@ -1745,19 +1889,35 @@ impl Editor {
         // rows themselves, and the highlighted row rebased into that window — only
         // the visible slice is materialized, so a 100k-item picker costs the same
         // per frame as a 10-item one.
-        let (row, col, width, height, start, rows, selected) = match m.placement {
+        let (row, col, width, height, start, rows, selected, kind_col) = match m.placement {
             MenuPlacement::Cursor => {
                 // `select` is small — project the whole list (no scrolling subtlety)
                 // and let the client place the cursor; keeps the four-tier flip exact.
                 let rows = self.menu_rows(0, m.total);
                 let count = (rows.len() + prompt_rows).min(MAX_H);
-                let content_w = rows
+                // Reserve a single ALIGNED kind column: the box holds the widest label,
+                // a 1-col gap, then the widest kind, so every `Snippet`/`Function`/`Text`
+                // label lines up in one column (not each floating flush-right on its own
+                // row). A kind-less menu (`select`) adds nothing — its kinds are all `None`.
+                let kinds = self.menu_kinds_window(0, m.total);
+                let max_label = rows
                     .iter()
                     .map(|(l, _)| l.chars().count())
                     .max()
-                    .unwrap_or(1)
-                    .max(query_w)
-                    .max(1);
+                    .unwrap_or(0);
+                let max_kind = kinds
+                    .iter()
+                    .flatten()
+                    .map(|k| k.chars().count())
+                    .max()
+                    .unwrap_or(0);
+                let content_w = if max_kind > 0 {
+                    max_label + 1 + max_kind
+                } else {
+                    max_label
+                }
+                .max(query_w)
+                .max(1);
                 // Anchor under the start of the word being completed (the caret
                 // minus the typed prefix's display width), not under the caret —
                 // so the list lines up with the text it will replace. `anchor_offset`
@@ -1770,6 +1930,12 @@ impl Editor {
                     .saturating_sub(m.anchor_offset);
                 let max_w = text_width.saturating_sub(anchor_col).max(1);
                 let width = content_w.min(max_w);
+                // Where every kind label starts — just past the widest label, so they
+                // align into one column. Clamped so the kinds still fit if the box was
+                // capped at the screen edge (labels then truncate into the reserved gap);
+                // `None` for a kind-less popup or a box too narrow to hold any kind.
+                let kind_col = (max_kind > 0 && width > max_kind)
+                    .then(|| (max_label + 1).min(width - max_kind));
                 // The vertical border chrome: 2 (top + bottom) normally, 1 for the
                 // top-borderless completion popup. Drives both the fit test and the
                 // above-placement origin.
@@ -1798,7 +1964,9 @@ impl Editor {
                     m.selected_active.then_some(m.selected),
                     height.saturating_sub(chrome),
                 );
-                (row, anchor_col, width, height, start, rows, m.selected)
+                (
+                    row, anchor_col, width, height, start, rows, m.selected, kind_col,
+                )
             }
             // `Bottom` is a content-float-only placement; a menu never requests it, so
             // it falls in with the centered `Editor` box here.
@@ -1859,7 +2027,16 @@ impl Editor {
                 };
                 start = start.min(m.total.saturating_sub(list_rows));
                 let rows = self.menu_rows(start, list_rows);
-                (row, col, width, height, start, rows, m.selected - start)
+                (
+                    row,
+                    col,
+                    width,
+                    height,
+                    start,
+                    rows,
+                    m.selected - start,
+                    None,
+                )
             }
             MenuPlacement::Cmdline => {
                 // The `nx.cmdline_complete` wildmenu: a bordered list floating just
@@ -1887,7 +2064,7 @@ impl Editor {
                 let height = count.min(text_height.saturating_sub(VCHROME).max(1));
                 let row = text_height.saturating_sub(height + VCHROME);
                 let start = menu_start(m.selected_active.then_some(m.selected), height);
-                (row, col, width, height, start, rows, m.selected)
+                (row, col, width, height, start, rows, m.selected, None)
             }
         };
         MenuGeom {
@@ -1898,6 +2075,7 @@ impl Editor {
             selected,
             start,
             rows,
+            kind_col,
         }
     }
 }
@@ -1955,4 +2133,8 @@ pub struct MenuGeom {
     pub start: usize,
     /// The visible rows `[start, start + rows.len())`: label + matched-char spans.
     pub rows: Vec<(String, Vec<Range<usize>>)>,
+    /// The content column where the aligned **kind** labels start (just past the widest
+    /// label), for a completion popup that carries kinds. `None` for a kind-less popup,
+    /// a `select` / picker / cmdline menu, or a box too narrow to hold a kind column.
+    pub kind_col: Option<usize>,
 }

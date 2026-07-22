@@ -1614,6 +1614,21 @@ pub struct UiSelectReq {
     pub cb_id: u64,
 }
 
+/// A `nx.complete.choice(items, { range })` request: open a **non-grabbing** cursor
+/// dropdown of `items` over the 0-based byte range `(sr,sc)..(er,ec)`. Unlike
+/// [`UiSelectReq`] there is no callback — accepting a row splices the pick over the
+/// range natively (the caller's own `on_bytes` reacts, e.g. to sync snippet mirrors).
+/// Queued in [`crate::runtime::Shared::choice_menus`], drained by the server into
+/// [`Editor::open_choice_menu`](nxvim_core::Editor::open_choice_menu).
+#[derive(Clone, Debug)]
+pub struct ChoiceMenuReq {
+    pub items: Vec<String>,
+    pub sr: usize,
+    pub sc: usize,
+    pub er: usize,
+    pub ec: usize,
+}
+
 /// A `nx.ui.float(contents, opts)` request: open (or update / close) the
 /// list-less **content float** rendering `lines` (the sibling of the
 /// selectable-list widget — hover / signature help / arbitrary plugin content).
@@ -1882,6 +1897,15 @@ pub struct CompletePush {
     /// expansion over the trigger range, additionalTextEdits, …). `None` for a plain
     /// literal-insert row.
     pub accept: Option<u64>,
+    /// The source's **merge priority** (from `nx.complete.source{ priority }` / the
+    /// setup entry), stamped on every row it pushes so the merged view ranks it against
+    /// `buffer` / `lsp` by priority — descending, then fuzzy score — rather than pinning
+    /// every async row at the `0` floor (which sank a snippet source below buffer words).
+    pub priority: i32,
+    /// Optional **kind** label (`push { kind = … }`) — the short category shown
+    /// right-aligned on the row (`"Function"`, `"Module"`, …), like an LSP item's
+    /// kind. `None` for a bare candidate or a source that omits it.
+    pub kind: Option<String>,
 }
 
 /// The preview target a picker push carries for one candidate, when the source

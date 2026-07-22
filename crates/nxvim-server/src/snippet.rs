@@ -58,12 +58,15 @@ impl EditHost {
             .map(|(i, e)| nxvim_core::MenuItem {
                 label: e.trigger.clone(),
                 key: SNIPPET_COMPLETE_KEY_BASE + i,
+                kind: Some("Snippet".to_string()),
                 preview: None,
                 insert: Some(e.trigger.clone()),
                 priority,
                 source_accept: true,
-                // Snippets carry no docs sidebar / lazy-resolve.
-                doc: None,
+                // Preview the expansion in the docs float (like an LSP row's docs):
+                // the snippet body fenced as code, tagged with the buffer's filetype so
+                // it syntax-highlights. Renders when this row is selected.
+                doc: Some(snippet_preview_doc(&e.body, &ft)),
                 resolve: None,
                 // The snippet trigger replaces the buffer prefix, not a cmdline span.
                 replace: None,
@@ -116,6 +119,16 @@ impl EditHost {
             list.push(SnippetEntry { trigger, body });
         }
     }
+}
+
+/// The docs-float markdown previewing a snippet: its `body` fenced as a code block,
+/// tagged with the buffer's filetype (`ft`) so the markdown renderer syntax-colours
+/// the template. Tabstops (`$1`, `${1:default}`, `$0`) are shown verbatim — the
+/// preview is the template you're about to expand, not a filled-in copy. An empty
+/// `ft` fences plainly (no language tag). Fed to [`Editor::open_completion_docs_float`]
+/// through the row's [`MenuItem::doc`], exactly like a plugin source's inline docs.
+fn snippet_preview_doc(body: &str, ft: &str) -> String {
+    format!("```{ft}\n{body}\n```")
 }
 
 /// Byte offset within `line` where the word ending at `cursor` begins — the run of

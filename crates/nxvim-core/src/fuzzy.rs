@@ -27,8 +27,21 @@ use nucleo_matcher::{Config, Matcher, Utf32Str};
 /// An empty `query` matches everything in original order with no spans — the
 /// "just opened, nothing typed yet" view.
 pub fn rank(query: &str, candidates: &[&str]) -> Vec<(usize, Vec<Range<usize>>)> {
+    rank_scored(query, candidates)
+        .into_iter()
+        .map(|(i, _, spans)| (i, spans))
+        .collect()
+}
+
+/// Like [`rank`], but keeps each match's **raw fuzzy score** — `(index, score,
+/// spans)`, best score first. The score lets a consumer *blend* fuzzy quality with
+/// its own signal (the completion merge adds a small per-source bias so `lsp`/
+/// snippet rows edge out equally-good buffer words, without a strong match from a
+/// lower-ranked source being buried). An empty query returns score `0` for every
+/// candidate in original order.
+pub fn rank_scored(query: &str, candidates: &[&str]) -> Vec<(usize, u32, Vec<Range<usize>>)> {
     if query.is_empty() {
-        return (0..candidates.len()).map(|i| (i, Vec::new())).collect();
+        return (0..candidates.len()).map(|i| (i, 0, Vec::new())).collect();
     }
 
     let mut matcher = Matcher::new(Config::DEFAULT);
@@ -52,7 +65,7 @@ pub fn rank(query: &str, candidates: &[&str]) -> Vec<(usize, Vec<Range<usize>>)>
 
     // Higher score first; equal scores keep input order (stable streaming).
     scored.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
-    scored.into_iter().map(|(i, _, spans)| (i, spans)).collect()
+    scored
 }
 
 /// Collapse a sorted, de-duplicated list of matched `char` positions into the

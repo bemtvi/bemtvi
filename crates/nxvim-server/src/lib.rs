@@ -880,6 +880,10 @@ pub struct EditHost {
     complete_lsp_active: bool,
     /// Merge priority of the `lsp` source (rows rank above lower-priority sources).
     complete_lsp_priority: i32,
+    /// The `lsp` source's own `min_chars`: it is dispatched only once the prefix
+    /// reaches this length (a manual trigger bypasses). Independent per-source gate,
+    /// so `lsp` can fire from 1 char while `buffer` waits for 3. Default 1.
+    complete_lsp_min_chars: usize,
     /// The current LSP completion's raw items + word anchor, indexed by the
     /// `MenuItem.key` the engine carries, so a delegated accept can apply the chosen
     /// item's `textEdit` / `additionalTextEdits`. `None` when no LSP completion is in
@@ -930,6 +934,11 @@ pub struct EditHost {
     complete_snippets_active: bool,
     /// Merge priority of the `snippets` source (rows rank against other sources).
     complete_snippets_priority: i32,
+    /// The `snippets` source's own `min_chars` (see [`complete_lsp_min_chars`]; a
+    /// manual trigger bypasses). Default 1.
+    ///
+    /// [`complete_lsp_min_chars`]: Self::complete_lsp_min_chars
+    complete_snippets_min_chars: usize,
     /// The snippet entries last pushed as completion candidates this trigger, indexed
     /// by `MenuItem.key - SNIPPET_COMPLETE_KEY_BASE`, so a delegated accept finds the
     /// body to expand.
@@ -1356,6 +1365,7 @@ impl EditHost {
             inlay_resolve_seq: 0,
             complete_lsp_active: false,
             complete_lsp_priority: 0,
+            complete_lsp_min_chars: 1,
             lsp_complete: None,
             lsp_complete_resolve_key: None,
             complete_resolve_docs: std::collections::HashMap::new(),
@@ -1367,6 +1377,7 @@ impl EditHost {
             snippet_store: HashMap::new(),
             complete_snippets_active: false,
             complete_snippets_priority: 0,
+            complete_snippets_min_chars: 1,
             snippet_complete: Vec::new(),
             statusline_layout: None,
             statusline_window: HashMap::new(),

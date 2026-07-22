@@ -1781,8 +1781,17 @@ pub struct StatuslinePublishReq {
 pub struct CompleteSetupReq {
     /// Complete as you type (the engine auto-opens / refreshes on word keystrokes).
     pub auto: bool,
-    /// The prefix must reach this many characters before the menu opens.
+    /// The **global open gate** — the prefix must reach this many characters before the
+    /// menu opens. Resolved Lua-side as the *minimum* per-source `min_chars`, so the
+    /// popup can open for the lowest-threshold source; each source then contributes only
+    /// once its own gate (below) is met.
     pub min_chars: usize,
+    /// The native `buffer` source's own `min_chars` gate.
+    pub buffer_min_chars: usize,
+    /// The `lsp` source's own `min_chars` gate.
+    pub lsp_min_chars: usize,
+    /// The `snippets` source's own `min_chars` gate.
+    pub snippets_min_chars: usize,
     /// Key notation (`"<C-n>"`, `"<Tab>"`, …) for each engine action; empty ⇒ keep
     /// the built-in default for that action.
     pub next: Vec<String>,

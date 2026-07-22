@@ -702,6 +702,56 @@ nx.complete.setup { sources = { { 'silent' } }, min_chars = 2 }";
 }
 
 #[tokio::test]
+async fn per_source_min_chars_gates_each_source_independently() {
+    let dir = temp_dir("complete_per_source_min");
+    // Buffer at min_chars=3, an async echo at min_chars=2. The two thresholds are
+    // honored *independently*: at 2 chars only the async row shows (buffer gated);
+    // at 3 the buffer word joins. Proves per-source min_chars (not the old single
+    // global gate that only read the `buffer` source).
+    let init = "\
+nx.complete.source {\n\
+  name = 'echo', debounce = 0,\n\
+  complete = function(ctx) if ctx.prefix ~= '' then ctx.push(ctx.prefix .. '_async') end end,\n\
+}\n\
+nx.complete.setup { sources = { { 'buffer', min_chars = 3 }, { 'echo', min_chars = 2 } } }";
+    let (rpc, mut incoming) = start(&dir, init).await;
+
+    // Seed a buffer word, then complete on a fresh line below it.
+    feed(&rpc, "iheythere<Esc>o");
+
+    // Two chars: the echo source (min 2) fires; the buffer word (min 3) is gated out —
+    // the popup opens for the lower-threshold source alone.
+    feed(&rpc, "he");
+    let menu = menu_of(
+        &poll_menu(&rpc, &mut incoming)
+            .await
+            .expect("popup opens at 2"),
+    );
+    let items = menu_items(&menu);
+    assert!(
+        items.contains(&"he_async".to_string()),
+        "async source (min 2) fires at 2 chars: {items:?}"
+    );
+    assert!(
+        !items.iter().any(|i| i == "heythere"),
+        "buffer source (min 3) is gated at 2 chars: {items:?}"
+    );
+
+    // Third char: the buffer source now meets its own gate and contributes the word.
+    feed(&rpc, "y");
+    let menu = menu_of(&poll_menu(&rpc, &mut incoming).await.expect("popup at 3"));
+    let items = menu_items(&menu);
+    assert!(
+        items.contains(&"heythere".to_string()),
+        "buffer word appears once the prefix reaches min 3: {items:?}"
+    );
+    assert!(
+        items.contains(&"hey_async".to_string()),
+        "async source still present at 3: {items:?}"
+    );
+}
+
+#[tokio::test]
 async fn registering_a_reserved_builtin_name_fails_loud() {
     let dir = temp_dir("complete_reserved");
     let (rpc, _incoming) = start(&dir, "").await;

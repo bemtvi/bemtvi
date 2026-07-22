@@ -89,8 +89,18 @@ pub struct CompleteConfig {
     pub enabled: bool,
     /// Complete as you type (the engine opens/refreshes on each word keystroke).
     pub auto: bool,
-    /// The prefix must be at least this many characters before the menu opens.
+    /// The **global open gate**: the popup opens once the prefix reaches this many
+    /// characters — the *minimum* `min_chars` across every configured source (Lua
+    /// resolves per-source `min_chars` and sends the min here), so the lowest-threshold
+    /// source can show. Each source then contributes only once *its own* threshold is
+    /// met (the native `buffer` seed by [`buffer_min_chars`](Self::buffer_min_chars),
+    /// the async/native sources by their own gate server-side).
     pub min_chars: usize,
+    /// The native `buffer` word source's own `min_chars`: its candidates are seeded
+    /// only once the prefix reaches this length (independent of the global open gate,
+    /// so `buffer` can sit at 3 while a snippet source shows from 2). A manual trigger
+    /// (`<C-Space>`) bypasses it, like the global gate.
+    pub buffer_min_chars: usize,
     pub keys: CompleteKeys,
     /// What the confirm keys do when the caret sits mid-word: replace the whole word
     /// (default) or only the typed prefix. See [`AcceptBehavior`].
@@ -131,6 +141,7 @@ impl Default for CompleteConfig {
             enabled: false,
             auto: true,
             min_chars: 1,
+            buffer_min_chars: 1,
             keys: CompleteKeys::default(),
             accept: AcceptBehavior::default(),
             has_async: false,
@@ -158,6 +169,10 @@ pub struct CompleteCtx {
     /// The word prefix left of the cursor being completed (also the match query
     /// the streamed candidates are ranked against, in core).
     pub prefix: String,
+    /// A **manual** trigger (`<C-Space>` / `nx.complete.trigger()`) — it offers
+    /// whatever is there, so every source bypasses its `min_chars` gate (both the Lua
+    /// `nx._complete_run` gate and the native `lsp`/`snippets` gates read this).
+    pub manual: bool,
 }
 
 /// Which engine control key a keystroke matched (while a completion menu is open).
@@ -274,7 +289,13 @@ impl Editor {
         // trigger char, so they'd never match anyway, and skipping the rope scan
         // hands the popup cleanly to the trigger-char source(s). A plain prefix seeds
         // the buffer words as before.
-        let candidates = if self.prefix_triggered(&prefix) {
+        // The native `buffer` source has its own `min_chars`: seed its words only once
+        // the prefix is long enough (a manual trigger bypasses, offering everything).
+        // The global open gate above is the *min* across sources, so the popup can be
+        // open — for a lower-threshold source — before `buffer` contributes.
+        let buffer_gated =
+            !preselect && prefix.chars().count() < self.complete_config.buffer_min_chars;
+        let candidates = if self.prefix_triggered(&prefix) || buffer_gated {
             Vec::new()
         } else {
             self.buffer_candidates(&prefix)
@@ -299,6 +320,7 @@ impl Editor {
                     row: self.cursor.line,
                     col: self.cursor.col,
                     prefix,
+                    manual: preselect,
                 },
             ));
         }

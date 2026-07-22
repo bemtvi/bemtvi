@@ -1694,6 +1694,7 @@ impl LuaRuntime {
         buf: u64,
         row: usize,
         col: usize,
+        manual: bool,
     ) -> mlua::Result<()> {
         let nx = self.nx()?;
         let run: mlua::Function = nx.get("_complete_run")?;
@@ -1702,6 +1703,8 @@ impl LuaRuntime {
         t.set("buf", lua_int(buf as i64))?;
         t.set("row", lua_int(row as i64))?;
         t.set("col", lua_int(col as i64))?;
+        // A manual trigger bypasses every source's `min_chars` gate (offers everything).
+        t.set("manual", manual)?;
         run.call::<()>((lua_int(gen as i64), t))
     }
 

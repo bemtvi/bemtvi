@@ -60,8 +60,13 @@ end
 --  to one — an unnavigated popup is noselect, so Enter still inserts a newline.)
 -- Enables the engine. `sources` is a list of `{ name, opts... }` entries — a
 -- built-in (`buffer` / `lsp` / `snippets`) or a registered plugin source.
--- `min_chars` (from a source, or the top level) gates the prefix length before the
--- popup opens. `auto` (default true) completes as you type. `keys` overrides any of
+-- `min_chars` gates how many prefix chars a source needs before it contributes, and is
+-- honored **per source**: `{ "buffer", min_chars = 3 }, { "nxsnip", min_chars = 2 }`
+-- shows snippets from 2 chars while buffer words wait for 3. A top-level `min_chars`
+-- sets the default for sources that don't override it; the popup opens at the *minimum*
+-- across all sources (each then filters by its own). A trigger-char source and a manual
+-- trigger (`nx.complete.trigger()`) bypass the gate. `auto` (default true) completes as
+-- you type. `keys` overrides any of
 -- the four control actions. `accept` (default `"replace"`) decides what the confirm
 -- keys do when the caret is in the *middle* of a word: `"replace"` swaps the whole
 -- word, `"insert"` keeps the suffix past the cursor. `nx.complete.accept{ behavior }`
@@ -77,10 +82,21 @@ function nx.complete.setup(opts)
     error("nx.complete.setup: `sources` must be a list")
   end
 
-  -- Validate every source name; capture the buffer source's min_chars override, the
-  -- per-source merge priority, whether the `lsp` source is configured, and the active
-  -- async sources (registered via `nx.complete.source{}`).
-  local min_chars = opts.min_chars
+  -- Validate every source name; resolve each source's `min_chars` (per-source override,
+  -- else the top-level `opts.min_chars`, else 1), the per-source merge priority, whether
+  -- the `lsp`/`snippets` sources are configured, and the active async sources (registered
+  -- via `nx.complete.source{}`). `min_chars` is now honored **per source** — a source
+  -- contributes only once the prefix reaches its own threshold; the popup opens at the
+  -- minimum across all of them (the global open gate).
+  local top_min = opts.min_chars
+  local function resolve_mc(src)
+    local m = type(src) == "table" and src.min_chars or nil
+    return m or top_min or 1
+  end
+  -- The native sources' own gates (default 1); the min across every source is the
+  -- global open gate. `all_min` starts nil and lowers as sources are seen.
+  local buffer_min_chars, lsp_min_chars, snippets_min_chars = 1, 1, 1
+  local all_min = nil
   local async = {}
   local saw_lsp = false
   local saw_snippets = false
@@ -106,17 +122,19 @@ function nx.complete.setup(opts)
     -- Resolve this entry's merge priority (explicit override, else the built-in
     -- default, else 0). Higher wins in the merged view.
     local priority = (type(src) == "table" and src.priority) or DEFAULT_PRIORITY[name] or 0
+    local smc = resolve_mc(src)
+    all_min = math.min(all_min or smc, smc)
     if name == "buffer" then
       buffer_priority = priority
-      if type(src) == "table" and src.min_chars ~= nil then
-        min_chars = src.min_chars
-      end
+      buffer_min_chars = smc
     elseif name == "lsp" then
       saw_lsp = true
       lsp_priority = priority
+      lsp_min_chars = smc
     elseif name == "snippets" then
       saw_snippets = true
       snippets_priority = priority
+      snippets_min_chars = smc
     end
     if registered then
       -- A per-entry `debounce` override (`{ "name", debounce = N }`) wins over the
@@ -139,9 +157,15 @@ function nx.complete.setup(opts)
         resolve = registered.resolve,
         debounce = debounce,
         chars = chars,
+        -- The source contributes only once the prefix reaches its own gate (checked in
+        -- `nx._complete_run`); a trigger-char source or a manual trigger bypasses it.
+        min_chars = smc,
       }
     end
   end
+  -- The global open gate: the popup opens at the lowest per-source threshold (each
+  -- source then filters by its own). Falls back to the top-level / default when empty.
+  local min_chars = all_min or top_min or 1
 
   local auto = opts.auto
   if auto == nil then
@@ -200,7 +224,10 @@ function nx.complete.setup(opts)
 
   nx._complete_setup(
     auto == true,
-    min_chars or 1,
+    -- `{ open, buffer, lsp, snippets }` min_chars gates (a single tuple slot): the
+    -- global open gate plus each native source's own threshold. Lua sources carry
+    -- theirs on `nx._complete.sources` (gated in `nx._complete_run`).
+    { min_chars, buffer_min_chars, lsp_min_chars, snippets_min_chars },
     key_list(keys.next, "next"),
     key_list(keys.prev, "prev"),
     key_list(keys.confirm, "confirm"),
@@ -373,6 +400,18 @@ local function source_wakes(c, source, prefix)
   return lead == "" or not c.triggers[lead]
 end
 
+-- Whether `source` has met its own `min_chars` gate for this run. A manual trigger
+-- (`ctx.manual`) offers everything, and a trigger-char source is woken by the char
+-- itself — both bypass. Otherwise the prefix must reach the source's `min_chars`
+-- (counted in characters, so a multibyte prefix is measured correctly).
+local function source_meets_min(source, ctx)
+  if ctx.manual or source.chars then
+    return true
+  end
+  local n = utf8.len(ctx.prefix) or #ctx.prefix
+  return n >= (source.min_chars or 1)
+end
+
 -- nx._complete_run(gen, ctx): dispatch the active async sources whose trigger gate
 -- the prefix satisfies, under `gen`. Called by the server once per trigger that has
 -- an async source. Each source is debounced (a new prefix cancels the in-flight run
@@ -395,7 +434,7 @@ function nx._complete_run(gen, ctx)
   -- dormant, so they owe no `done()`.
   local active = {}
   for _, source in ipairs(c.sources) do
-    if source_wakes(c, source, ctx.prefix) then
+    if source_wakes(c, source, ctx.prefix) and source_meets_min(source, ctx) then
       active[#active + 1] = source
     end
   end

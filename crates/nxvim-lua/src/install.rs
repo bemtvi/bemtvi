@@ -2964,9 +2964,14 @@ pub(crate) fn install_runtime_api(
     // engine dispatches it off the input path. The Lua wrapper (`prelude/complete.lua`)
     // validates the source list before calling this.
     let sh = shared.clone();
+    // `min_chars` is passed as a fixed 4-element list `{ open, buffer, lsp, snippets }`
+    // (a single tuple slot — mlua caps `create_function` tuples at 16, and this call
+    // already uses all 16): the global open gate plus each native source's own gate.
+    // Missing / short entries default to `1`. Per-source `min_chars` for *Lua* sources
+    // rides `nx._complete.sources` instead (gated in `nx._complete_run`).
     type CompleteSetupArgs = (
         bool,
-        usize,
+        Vec<usize>,
         Vec<String>,
         Vec<String>,
         Vec<String>,
@@ -3004,9 +3009,13 @@ pub(crate) fn install_runtime_api(
                 snippets_priority,
                 accept,
             ): CompleteSetupArgs| {
+                let mc = |i: usize| min_chars.get(i).copied().unwrap_or(1);
                 sh.borrow_mut().complete_setups.push(CompleteSetupReq {
                     auto,
-                    min_chars,
+                    min_chars: mc(0),
+                    buffer_min_chars: mc(1),
+                    lsp_min_chars: mc(2),
+                    snippets_min_chars: mc(3),
                     next,
                     prev,
                     confirm,

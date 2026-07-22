@@ -1072,6 +1072,7 @@ impl EditHost {
                 enabled: true,
                 auto: req.auto,
                 min_chars: req.min_chars,
+                buffer_min_chars: req.buffer_min_chars,
                 keys,
                 accept: parse_accept_behavior(&req.accept),
                 has_async: req.has_async,
@@ -1089,10 +1090,12 @@ impl EditHost {
             // native build — the same `request_lsp`/`on_completion_reply` round-trip.
             self.complete_lsp_active = req.lsp;
             self.complete_lsp_priority = req.lsp_priority;
+            self.complete_lsp_min_chars = req.lsp_min_chars;
             // The built-in `snippets` source is feature-agnostic (the engine is in
             // core), so it works on the wasm build too.
             self.complete_snippets_active = req.snippets;
             self.complete_snippets_priority = req.snippets_priority;
+            self.complete_snippets_min_chars = req.snippets_min_chars;
         }
         // `nx.cmdline_complete.setup{}`: enable the command-line completion engine
         // (the float-list widget's fifth orchestration). The last config wins; `docs`
@@ -3595,19 +3598,30 @@ impl EditHost {
                     self.complete_resolve_docs.clear();
                     self.complete_resolve_inflight = None;
                 }
-                if let Err(e) =
-                    self.lua
-                        .run_complete_run(gen, &ctx.prefix, ctx.buf, ctx.row, ctx.col)
-                {
+                if let Err(e) = self.lua.run_complete_run(
+                    gen,
+                    &ctx.prefix,
+                    ctx.buf,
+                    ctx.row,
+                    ctx.col,
+                    ctx.manual,
+                ) {
                     self.editor
                         .echo(format!("E5108: Error in nx.complete source: {e}"));
                 }
+                // Each native source honors its own `min_chars` too: contribute only
+                // once the prefix reaches its threshold (a manual trigger bypasses).
+                let plen = ctx.prefix.chars().count();
                 // The built-in `lsp` source is server-native: issue (or re-serve a
                 // cached) `textDocument/completion` for this trigger; the reply
                 // streams into the menu (gen-gated) via `on_completion_reply`.
-                self.complete_lsp_dispatch(gen);
+                if ctx.manual || plen >= self.complete_lsp_min_chars {
+                    self.complete_lsp_dispatch(gen);
+                }
                 // The built-in `snippets` source is feature-agnostic (core engine).
-                self.complete_snippet_dispatch(gen);
+                if ctx.manual || plen >= self.complete_snippets_min_chars {
+                    self.complete_snippet_dispatch(gen);
+                }
                 self.apply_lua_effects();
             }
             // Signature-help auto-trigger: a trigger keystroke (`(` / `,`) raised a

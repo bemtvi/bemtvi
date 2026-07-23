@@ -123,6 +123,37 @@ async fn buf_name(rpc: &Rpc, handle: u64) -> String {
         .to_string()
 }
 
+// Regression: `:e ~/file` must expand a leading `~` to `$HOME` (vim filename
+// expansion), exactly like `vim.fn.expand`. Before the fix the tilde reached the
+// buffer verbatim, so the buffer was named `~/...` and the real file under home was
+// never resolved. We open a *nonexistent* unique path under HOME (so nothing on disk
+// is touched or created — `:e <missing>` just makes a new-file buffer) and assert the
+// buffer's name is the home-expanded absolute path, not the literal tilde.
+#[tokio::test]
+async fn editing_expands_a_leading_tilde_to_home() {
+    let home = std::env::var("HOME").expect("HOME set in dev/CI env");
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let fname = format!(
+        "nxvim_tilde_{}_{}.txt",
+        std::process::id(),
+        COUNTER.fetch_add(1, Ordering::Relaxed)
+    );
+    let expected = format!("{home}/{fname}");
+    assert!(
+        !Path::new(&expected).exists(),
+        "the test path must not exist on disk"
+    );
+
+    let (rpc, _incoming) = start().await;
+    feed(&rpc, &format!(":e ~/{fname}<CR>"));
+    let buf = current_buf(&rpc).await;
+    let got = buf_name(&rpc, buf).await;
+    assert_eq!(
+        got, expected,
+        "`:e ~/…` should open the home-expanded path, not a literal `~`"
+    );
+}
+
 #[tokio::test]
 async fn editing_a_nonexistent_file_does_not_storm_the_file_watch() {
     // Regression: `:e <missing>` opens a new-file buffer whose path has nothing on

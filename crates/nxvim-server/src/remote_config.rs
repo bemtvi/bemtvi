@@ -47,10 +47,16 @@ pub struct RemoteConfigBundle {
     /// shada over the fs seam. `None` when an older peer omitted it — remote shada is
     /// then unavailable (the session falls back to local shada).
     pub state_dir: Option<String>,
+    /// The daemon's home directory, so a leading `~` in a file argument (`:e ~/x`)
+    /// expands against the **daemon's** `$HOME` — the read lands on the daemon even
+    /// though the core runs on the client. `None` when the daemon couldn't read it (or
+    /// an older peer omitted it) — the edit-host then falls back to its own `$HOME`.
+    pub home: Option<String>,
 }
 
 /// Decode a `config_bundle` reply (the inverse of the daemon's `encode_config_bundle`):
-/// the `[config_dir?, [runtimepath…], [[abspath, bytes], …], [ts_lang…], cwd?]` array.
+/// the `[config_dir?, [runtimepath…], [[abspath, bytes], …], [ts_lang…], cwd?, state_dir?,
+/// home?]` array.
 /// Any shape mismatch is a loud error string — never a silently-empty bundle that would
 /// look like "the remote has no config". Shared by the native daemon client and the wasm
 /// edit-host (via [`decode_config_bundle_bytes`]).
@@ -118,6 +124,12 @@ pub fn decode_config_bundle(v: Value) -> Result<RemoteConfigBundle, String> {
         None | Some(Value::Nil) => None,
         Some(v) => Some(v.as_str().ok_or_else(|| bad("state_dir"))?.to_owned()),
     };
+    // The daemon's home dir; absent (an older peer) decodes as `None` (a leading `~`
+    // then expands against the edit-host's own `$HOME`).
+    let home = match it.next() {
+        None | Some(Value::Nil) => None,
+        Some(v) => Some(v.as_str().ok_or_else(|| bad("home"))?.to_owned()),
+    };
     Ok(RemoteConfigBundle {
         config_dir,
         runtimepath,
@@ -125,6 +137,7 @@ pub fn decode_config_bundle(v: Value) -> Result<RemoteConfigBundle, String> {
         ts_languages,
         cwd,
         state_dir,
+        home,
     })
 }
 

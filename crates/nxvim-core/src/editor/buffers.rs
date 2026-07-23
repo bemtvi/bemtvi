@@ -683,6 +683,16 @@ impl Editor {
         self.host_fs_offtick = on;
     }
 
+    /// Seed the home directory a leading `~` in a file argument expands against — the
+    /// **daemon's** `$HOME` in a remote session, where the file read lands on the daemon
+    /// even though the core runs on the client. The edit-host sets this at connect from
+    /// the `config_bundle` handshake (alongside the daemon's cwd). A local session leaves
+    /// it `None`, so `~` expands against this process's own `$HOME`. See
+    /// [`Editor::expand_file_arg`](crate::Editor).
+    pub fn set_remote_home(&mut self, home: std::path::PathBuf) {
+        self.remote_home = Some(home);
+    }
+
     /// Mirror whether a `BufReadCmd` autocmd handler is registered (the server reads
     /// this from its `au_active_events` cache). When on, a file open is deferred so the
     /// server can fire `BufReadCmd` before the default read — see

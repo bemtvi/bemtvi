@@ -1444,6 +1444,14 @@ pub struct Editor {
     /// by default — local builds do buffer I/O synchronously. Set via
     /// [`Editor::set_host_fs_offtick`].
     host_fs_offtick: bool,
+    /// The home directory a leading `~` in a file argument expands against
+    /// ([`Editor::expand_file_arg`]). `None` (the default) — the local case — reads
+    /// `$HOME` from this process's env. In a remote session the core runs on the
+    /// client but the file read lands on the **daemon**, so `~` must mean the daemon's
+    /// home; the edit-host seeds the daemon's `$HOME` here at connect (over the same
+    /// `config_bundle` handshake that carries the daemon's cwd) via
+    /// [`Editor::set_remote_home`].
+    remote_home: Option<std::path::PathBuf>,
     /// Whether this session will CAPTURE the window/tab layout on exit — i.e. a
     /// layout-capturing workspace session (`workspace_session && session_save_layout`,
     /// both server-side). The server mirrors it in via [`Editor::set_session_captures_layout`]
@@ -1857,6 +1865,7 @@ impl Editor {
             clipboard: None,
             host_fs: Rc::new(StdHostFs),
             host_fs_offtick: false,
+            remote_home: None,
             session_captures_layout: false,
             bufreadcmd_active: false,
             pending_saves: Vec::new(),

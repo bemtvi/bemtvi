@@ -3557,17 +3557,21 @@ fn serve_config_bundle(params: &[Value]) -> Result<Value, Value> {
             // The daemon's shada base dir, where a `Remote`-config session stages + syncs
             // its shada over the fs seam (the daemon itself runs no shada logic).
             state_dir,
+            // The daemon's home dir, so a leading `~` in a file argument (`:e ~/x`)
+            // expands against the daemon's `$HOME` — where the file read lands.
+            std::env::var_os("HOME").map(PathBuf::from),
         )),
         Err(e) => Err(Value::from(format!("config_bundle: {e}"))),
     }
 }
 
-/// `[config_dir?, [runtimepath…], [[abspath, bytes], …], [ts_lang…], cwd?, state_dir?]` —
-/// the bundle on the wire ([`decode_config_bundle`] is the inverse). Paths are the
-/// daemon's absolute paths; the edit-host rebases the config roots onto its local cache.
-/// `cwd` is the daemon's working directory and `state_dir` its shada base dir — both
+/// `[config_dir?, [runtimepath…], [[abspath, bytes], …], [ts_lang…], cwd?, state_dir?,
+/// home?]` — the bundle on the wire ([`decode_config_bundle`] is the inverse). Paths are
+/// the daemon's absolute paths; the edit-host rebases the config roots onto its local
+/// cache. `cwd` is the daemon's working directory, `state_dir` its shada base dir, and
+/// `home` its `$HOME` (the base a leading `~` in a file argument expands against) — all
 /// trailing fields an older peer omits (→ the edit-host keeps its local cwd / has no
-/// remote shada).
+/// remote shada / expands `~` against its own `$HOME`).
 fn encode_config_bundle(
     config_dir: Option<PathBuf>,
     runtimepath: Vec<PathBuf>,
@@ -3575,6 +3579,7 @@ fn encode_config_bundle(
     ts_languages: Vec<String>,
     cwd: Option<PathBuf>,
     state_dir: PathBuf,
+    home: Option<PathBuf>,
 ) -> Value {
     let path_str = |p: PathBuf| Value::from(p.to_string_lossy().into_owned());
     Value::Array(vec![
@@ -3589,6 +3594,7 @@ fn encode_config_bundle(
         Value::Array(ts_languages.into_iter().map(Value::from).collect()),
         cwd.map_or(Value::Nil, &path_str),
         path_str(state_dir),
+        home.map_or(Value::Nil, &path_str),
     ])
 }
 
@@ -3674,6 +3680,7 @@ impl RemoteConfig {
             .fetch(matches!(source, crate::ConfigSource::Remote))
             .await?;
         let remote_cwd = bundle.cwd.clone().map(std::path::PathBuf::from);
+        let remote_home = bundle.home.clone().map(std::path::PathBuf::from);
         let ts_autoinstall = bundle.ts_languages.clone();
         let state_dir = bundle.state_dir.clone();
         let (config_dir, runtimepath) = match source {
@@ -3685,6 +3692,7 @@ impl RemoteConfig {
             config_dir,
             runtimepath,
             remote_cwd,
+            remote_home,
             ts_autoinstall,
             state_dir,
         })

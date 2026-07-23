@@ -114,6 +114,8 @@ fn spawn_server(plugin_dir: PathBuf) -> (Rpc, UnboundedReceiver<Incoming>) {
             ts_autoinstall: Vec::new(),
             // No daemon: seed the cwd from the local process.
             remote_cwd: None,
+            // No daemon: a leading `~` expands against the local process's `$HOME`.
+            remote_home: None,
             // The plugin-test runner is not an interactive client — no virtual commands.
             client_init_lua: None,
             // No daemon link in the plugin-test runner.

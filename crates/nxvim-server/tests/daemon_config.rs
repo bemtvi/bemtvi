@@ -140,6 +140,15 @@ async fn config_bundle_ships_the_daemons_config_and_plugins() {
         "the bundle reports the daemon's working directory (remote-cwd seed)"
     );
 
+    // The bundle also carries the daemon's home, the base a leading `~` in a file
+    // argument expands against (`:e ~/x` reads on the daemon). Served in-process, so the
+    // daemon's `$HOME` is this test process's `$HOME`.
+    assert_eq!(
+        bundle.home.as_deref(),
+        std::env::var("HOME").ok().as_deref(),
+        "the bundle reports the daemon's home (the `~`-expansion base)"
+    );
+
     // Look a fetched file up by the path suffix it must carry, asserting its bytes.
     let find = |suffix: &str| -> Option<Vec<u8>> {
         bundle

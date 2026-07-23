@@ -404,6 +404,12 @@ pub struct ServerInit {
     /// `set_current_dir`'d locally; it lives only in `DirState` + the `nx._cwd`
     /// mirror, and `:cd` moves it over the wire (`fs_chdir`).
     pub remote_cwd: Option<PathBuf>,
+    /// The daemon's home directory, the base a leading `~` in a file argument (`:e ~/x`)
+    /// expands against. `None` (the default) — a local session — expands `~` against this
+    /// process's own `$HOME`. When set (fetched over the `config_bundle` handshake, like
+    /// [`remote_cwd`](Self::remote_cwd)), `~` resolves on the **daemon**, where the file
+    /// read lands even though the core runs on the client.
+    pub remote_home: Option<PathBuf>,
     /// A Lua chunk the **client** wants run at startup, after the prelude/built-in
     /// opt-ins and *before* `init.lua` — so a config can still override it. `None` (the
     /// default) for the TUI and tests. The GUI uses it to register its client-handled
@@ -578,6 +584,9 @@ pub struct ResolvedConfig {
     pub runtimepath: Vec<PathBuf>,
     /// The daemon's working directory, to seed `DirState` (`None` = keep local cwd).
     pub remote_cwd: Option<PathBuf>,
+    /// The daemon's home directory, the base a leading `~` in a file argument expands
+    /// against (`None` = expand `~` against the edit-host's own `$HOME`).
+    pub remote_home: Option<PathBuf>,
     /// The daemon's installed tree-sitter parser languages, auto-installed locally.
     pub ts_autoinstall: Vec<String>,
     /// The daemon's shada base dir, where a `Remote`-config session stages + syncs its
@@ -1559,6 +1568,7 @@ impl EditHost {
         // Read the fields materialize doesn't consume before it takes the bundle by value.
         let ts_languages = bundle.ts_languages.clone();
         let remote_cwd = bundle.cwd.clone().map(PathBuf::from);
+        let remote_home = bundle.home.clone().map(PathBuf::from);
         let (config_dir, runtimepath) =
             materialize_remote_config_into(Path::new(WASM_REMOTE_CACHE_ROOT), bundle)
                 .map_err(|e| format!("staging remote config failed: {e}"))?;
@@ -1572,6 +1582,10 @@ impl EditHost {
             // mark it for the `apply_loop_op` relative-path rebase. A serverless session
             // has `remote_cwd == None` and stays `false` (OPFS is root-relative, cwd-less).
             self.remote_cwd_seeded = true;
+        }
+        // A leading `~` in a file argument expands against the daemon's home over the wire.
+        if let Some(home) = remote_home {
+            self.editor.set_remote_home(home);
         }
 
         // Point `require` / runtime-file lookup at the staged copy: each rebased entry's
@@ -3344,6 +3358,12 @@ where
         // This session's `nx.fs` runs against the daemon; mark it so `apply_loop_op`
         // rebases relative paths against `DirState` before they cross the wire.
         host.remote_cwd_seeded = true;
+    }
+    // A leading `~` in a file argument (`:e ~/x`) must expand against the daemon's home,
+    // not the local process's — the read lands on the daemon. Seed it from the same
+    // `config_bundle` handshake that carried the cwd above.
+    if let Some(home) = init.remote_home {
+        host.editor.set_remote_home(home);
     }
     // Publish the seeded effective dir into the `nx._cwd` mirror so `vim.fn.getcwd`
     // reads the authoritative cwd from the very first config line (a remote session's

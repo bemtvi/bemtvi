@@ -101,6 +101,36 @@ fn expand_tilde(rep: &str, prev: Option<&str>) -> Result<String, ()> {
     Ok(out)
 }
 
+/// Expand a leading `~` / `~/…` in a file argument to the home directory (vim
+/// filename expansion). Only the argument's leading tilde is special; `~` anywhere
+/// else is a literal path character. `~user` (a passwd lookup, which the core has no
+/// way to resolve) and a `~` with no resolvable home are left verbatim. Borrows when
+/// there is nothing to expand.
+///
+/// `home_override` is the **daemon's** home in a remote session (seeded at connect):
+/// the core runs on the client but the read lands on the daemon, so `~` must mean the
+/// daemon's home there. `None` — the local case — reads `$HOME` from this process.
+fn expand_leading_tilde<'a>(
+    arg: &'a str,
+    home_override: Option<&std::path::Path>,
+) -> std::borrow::Cow<'a, str> {
+    let Some(rest) = arg.strip_prefix('~') else {
+        return std::borrow::Cow::Borrowed(arg);
+    };
+    // `~` alone or `~/…`; `~user` (a non-empty, non-`/` remainder) is not ours.
+    if !(rest.is_empty() || rest.starts_with('/')) {
+        return std::borrow::Cow::Borrowed(arg);
+    }
+    let home = match home_override {
+        Some(h) => Some(h.to_string_lossy().into_owned()),
+        None => std::env::var_os("HOME").map(|h| h.to_string_lossy().into_owned()),
+    };
+    match home {
+        Some(home) => std::borrow::Cow::Owned(format!("{home}{rest}")),
+        None => std::borrow::Cow::Borrowed(arg),
+    }
+}
+
 /// Whether `body` (a substitute body, everything after the opening delimiter)
 /// contains an **unescaped** `delim` — i.e. the replacement half has been opened
 /// (`:s/pat/…`). A `\delim` is a literal delimiter and doesn't count; any other
@@ -581,12 +611,20 @@ impl Editor {
     /// (`:h` head, `:t` tail, `:r` root, `:e` extension). `\%` / `\#` are literal.
     /// A `:` not introducing a known modifier ends the run and stays literal.
     ///
+    /// A leading `~` / `~/…` first expands to `$HOME` (vim filename expansion): only
+    /// the argument's leading tilde is special (`~` elsewhere is literal), and `~user`
+    /// — a passwd lookup — is left verbatim. Reading `$HOME` from the env here matches
+    /// [`absolutize_normalize`](super::absolutize_normalize) reading the process cwd:
+    /// the core resolves paths against the process it runs in (the daemon's, for a
+    /// remote session), which is where the file read lands.
+    ///
     /// Returns the rewritten argument, or a vim-style error string when a token
-    /// has no name to substitute, or when an env-dependent modifier (`:p` / `:~` /
-    /// `:.`) is used — those need the working directory / `$HOME`, which the pure
-    /// core deliberately can't read, so they fail loud rather than mis-expand.
+    /// has no name to substitute, or when an env-dependent *modifier* (`:p` / `:~` /
+    /// `:.`) is used — those need the working directory, which the pure core
+    /// deliberately can't reconstruct, so they fail loud rather than mis-expand.
     pub(crate) fn expand_file_arg(&self, arg: &str) -> Result<String, String> {
-        let chars: Vec<char> = arg.chars().collect();
+        let expanded = expand_leading_tilde(arg, self.remote_home.as_deref());
+        let chars: Vec<char> = expanded.chars().collect();
         let mut out = String::new();
         let mut i = 0;
         while i < chars.len() {

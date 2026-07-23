@@ -42,6 +42,7 @@ fn materialize_mirrors_files_and_rebases_the_roots() {
         ts_languages: Vec::new(),
         cwd: None,
         state_dir: None,
+        home: None,
     };
 
     let (config_dir, runtimepath) = materialize_remote_config_into(&cache, bundle).unwrap();
@@ -95,6 +96,7 @@ fn materialize_is_fresh_each_connect() {
         ts_languages: Vec::new(),
         cwd: None,
         state_dir: None,
+        home: None,
     };
     materialize_remote_config_into(&cache, first).unwrap();
     assert!(cache.join("r/cfg/old.lua").exists());
@@ -106,6 +108,7 @@ fn materialize_is_fresh_each_connect() {
         ts_languages: Vec::new(),
         cwd: None,
         state_dir: None,
+        home: None,
     };
     materialize_remote_config_into(&cache, second).unwrap();
 

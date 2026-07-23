@@ -94,6 +94,18 @@ impl HostFs for DaemonFs {
 /// (backed by `fake`) over an in-process duplex, opening `file`. UI-attached. The
 /// notification receiver is returned (not dropped: dropping it would stop the server).
 async fn spawn_with_daemon_fs(fake: DaemonFs, file: &str) -> (Rpc, UnboundedReceiver<Incoming>) {
+    spawn_with_daemon_fs_home(fake, file, None).await
+}
+
+/// [`spawn_with_daemon_fs`] with the daemon's home seeded (`ServerInit::remote_home`) —
+/// what the `config_bundle` handshake carries in a real session — so a leading `~` in a
+/// file argument expands against the daemon's home rather than the edit-host's local
+/// `$HOME`.
+async fn spawn_with_daemon_fs_home(
+    fake: DaemonFs,
+    file: &str,
+    remote_home: Option<&str>,
+) -> (Rpc, UnboundedReceiver<Incoming>) {
     let (edit_host_end, daemon_end) = tokio::io::duplex(1 << 16);
     let (daemon_reader, daemon_writer) = tokio::io::split(daemon_end);
     tokio::spawn(async move {
@@ -105,6 +117,7 @@ async fn spawn_with_daemon_fs(fake: DaemonFs, file: &str) -> (Rpc, UnboundedRece
     let init = ServerInit {
         file: Some(file.to_string()),
         host_fs_async: Some(Box::new(remote)),
+        remote_home: remote_home.map(PathBuf::from),
         ..Default::default()
     };
     let (rpc, incoming) = spawn(init);
@@ -131,6 +144,35 @@ async fn buf_name(rpc: &Rpc) -> String {
         .as_str()
         .unwrap_or_default()
         .to_string()
+}
+
+/// A leading `~` in a file argument expands against the **daemon's** home, not the
+/// edit-host's local `$HOME` — the file read lands on the daemon even though the core
+/// runs on the client. The session is seeded with the daemon's home (`/daemon/home`,
+/// what the `config_bundle` handshake carries in a real remote session); `:e ~/other.txt`
+/// must fetch `/daemon/home/other.txt` over the wire. Expanding against the local `$HOME`
+/// would name a path the daemon fs doesn't have, so the buffer would come back empty —
+/// exactly the mutation this guards against.
+#[tokio::test]
+async fn edit_expands_tilde_against_the_daemon_home() {
+    let fake = DaemonFs::default();
+    fake.set("/daemon/home/note.txt", "start\n")
+        .set("/daemon/home/other.txt", "daemon\nhome\nfile\n");
+    let (rpc, _incoming) =
+        spawn_with_daemon_fs_home(fake, "/daemon/home/note.txt", Some("/daemon/home")).await;
+    await_lines(&rpc, &["start"]).await;
+
+    feed(&rpc, ":edit ~/other.txt<CR>");
+    assert_eq!(
+        await_lines(&rpc, &["daemon", "home", "file"]).await,
+        vec!["daemon", "home", "file"],
+        "`:e ~/…` must expand against the daemon's home and fetch that file over the wire"
+    );
+    assert_eq!(
+        buf_name(&rpc).await,
+        "/daemon/home/other.txt",
+        "the buffer is named for the daemon-home-expanded path, not a local $HOME expansion"
+    );
 }
 
 /// `:e /virtual/other.txt` fetches a *second* file's bytes over the wire into a new

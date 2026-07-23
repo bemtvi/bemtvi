@@ -733,6 +733,8 @@ fn main() -> Result<()> {
         // Local session: seed the working directory from the local process cwd
         // (`EditHost::new`'s default), not a daemon.
         remote_cwd: None,
+        // Local session: a leading `~` expands against this process's own `$HOME`.
+        remote_home: None,
         // The TUI handles `:connect`/`:workspace` only at startup (flags), not as live
         // client-intercepted commands, so it registers no virtual commands.
         client_init_lua: None,
@@ -1243,6 +1245,8 @@ where
         ts_autoinstall: resolved.ts_autoinstall,
         // Seed the working directory from the daemon (remote-cwd).
         remote_cwd: resolved.remote_cwd,
+        // A leading `~` in a file argument expands against the daemon's home.
+        remote_home: resolved.remote_home,
         // The TUI registers no client-intercepted virtual commands.
         client_init_lua: None,
         // The reconnecting daemon link (ssh/stdio) — its status flows into

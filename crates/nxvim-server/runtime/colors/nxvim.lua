@@ -21,6 +21,7 @@ local p = {
   green       = "#98c379", -- strings
   orange      = "#d19a66", -- numbers, constants, booleans
   yellow      = "#e5c07b", -- types, constructors, attributes
+  search      = "#4d4636", -- muted amber for hlsearch fill (see Search below)
   blue        = "#61afef", -- functions, labels
   purple      = "#c678dd", -- keywords
   cyan        = "#56b6c2", -- operators, escapes, builtin functions
@@ -39,7 +40,12 @@ hl(0, "LineNr",       { fg = p.gutter })
 hl(0, "CursorLine",   { bg = p.cursor_line })
 hl(0, "CursorLineNr", { fg = p.fg })
 hl(0, "Visual",       { bg = p.visual })
-hl(0, "Search",       { fg = p.bg, bg = p.yellow })
+-- hlsearch fill: a muted, low-saturation amber that sits close to the editor's
+-- luminance rather than a bright yellow block — every match tinted subtly, with
+-- the normal foreground kept on top so text stays readable. The *current* match
+-- (IncSearch / CurSearch) still gets the loud orange fill, so it stands out
+-- against the sea of dimmer hlsearch hits.
+hl(0, "Search",       { fg = p.fg, bg = p.search })
 hl(0, "IncSearch",    { fg = p.bg, bg = p.orange })
 hl(0, "CurSearch",    { fg = p.bg, bg = p.orange })
 hl(0, "StatusLine",   { fg = p.fg, bg = p.bg_dark })

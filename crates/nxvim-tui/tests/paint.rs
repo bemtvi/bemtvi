@@ -1145,6 +1145,53 @@ fn the_visual_style_replaces_reverse_video_when_themed() {
 }
 
 #[test]
+fn a_search_match_shows_through_the_visual_selection() {
+    // "hello" fully selected, with a search match on "el" [1,3). Where the two
+    // overlap the cell must take the `Search` background, not the `Visual` one — the
+    // selection paints under the match so `hlsearch` stays visible in the selection
+    // (vim's behavior, and what the GUI already does). Palette: 0 = Visual bg,
+    // 1 = Search bg.
+    let visual_bg = Color::Rgb(0x45, 0x47, 0x5a);
+    let search_bg = Color::Rgb(0x4d, 0x46, 0x36);
+    let sel = Value::Array(vec![Value::Array(vec![
+        Value::from(0u64),
+        Value::from(5u64),
+    ])]);
+    let search = Value::Array(vec![Value::Array(vec![Value::Array(vec![
+        Value::from(1u64),
+        Value::from(3u64),
+    ])])]);
+    let v = view(vec![
+        ("lines", lines(&["hello"])),
+        ("selection", sel),
+        ("search", search),
+        (
+            "styles",
+            Value::Array(vec![
+                style(vec![("bg", rgb(0x45, 0x47, 0x5a))]),
+                style(vec![("bg", rgb(0x4d, 0x46, 0x36))]),
+            ]),
+        ),
+        ("chrome", chrome(vec![("visual", 0), ("search", 1)])),
+    ]);
+    let buf = paint(&v, 20, 5);
+    // Selected-but-unmatched cells wear Visual...
+    assert_eq!(bg(&buf, 0, 0), Some(visual_bg), "col 0: selection only");
+    assert_eq!(bg(&buf, 4, 0), Some(visual_bg), "col 4: selection only");
+    // ...and the matched cells inside the selection wear Search, not Visual.
+    assert_eq!(
+        bg(&buf, 1, 0),
+        Some(search_bg),
+        "col 1: the search match shows through the selection"
+    );
+    assert_eq!(
+        bg(&buf, 2, 0),
+        Some(search_bg),
+        "col 2: match over selection"
+    );
+}
+
+#[test]
 fn no_colorscheme_falls_back_to_the_builtin_theme() {
     // A span with a Nil style id and no palette: the client paints from its own
     // built-in `group_style` (keyword → magenta), and the selection reverts to

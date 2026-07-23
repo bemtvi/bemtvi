@@ -7,8 +7,8 @@
 //! it depends on, and mirror the TUI's inline splice (whose paint *is* black-box
 //! tested over RPC).
 
-use nxvim_gui::{inlay_shift, splice_inlay, Seg, DEFAULT_INLAY};
-use nxvim_view::{InlayHint, Style};
+use nxvim_gui::{inlay_shift, splice_inlay, virt_inline_shift, Seg, DEFAULT_INLAY};
+use nxvim_view::{InlayHint, Style, VirtPlacement};
 
 /// A hint at `col` with `text` and no resolved style (the dim-fallback case).
 fn hint(col: u16, text: &str) -> InlayHint {
@@ -67,6 +67,71 @@ fn shift_sums_multiple_hints_up_to_the_column() {
     assert_eq!(inlay_shift(&hints, 0, 3, true), 3);
     // The whole row's inserted width (every hint at/after leftcol).
     assert_eq!(inlay_shift(&hints, 0, u16::MAX, true), 6);
+}
+
+// --- virt_inline_shift: inline virt_text shifts the overlays too ------------
+// The `:s///g` diff preview lays an inline `virt_text` (the replacement) after each
+// match, so a later match's struck-deletion overlay must shift right by the earlier
+// replacements' width — the bug where the "red slash" landed cells too far left.
+
+/// An inline `virt_text` placement at column `col` carrying `text` (one chunk).
+fn ivirt(col: u16, text: &str) -> VirtPlacement {
+    VirtPlacement {
+        pos: 1, // VIRT_POS_INLINE
+        col,
+        hl_mode: 0,
+        chunks: vec![(text.to_string(), None)],
+    }
+}
+
+#[test]
+fn virt_shift_is_zero_with_no_placements() {
+    assert_eq!(virt_inline_shift(&[], 0, 10, true), 0);
+    assert_eq!(virt_inline_shift(&[], 0, 10, false), 0);
+}
+
+#[test]
+fn virt_shift_counts_inline_chunk_width_in_cells() {
+    // A replacement "aaaa" (4 cells) inlined at column 5.
+    let v = [ivirt(5, "aaaa")];
+    assert_eq!(virt_inline_shift(&v, 0, 9, true), 4);
+    assert_eq!(virt_inline_shift(&v, 0, 9, false), 4);
+}
+
+#[test]
+fn virt_shift_boundary_matches_the_inlay_convention() {
+    // A placement at column 4 sits before the glyph at column 4. A left edge / start
+    // at 4 clears it (inclusive); a span's right edge at 4 does not (exclusive).
+    let v = [ivirt(4, "XX")];
+    assert_eq!(virt_inline_shift(&v, 0, 4, true), 2);
+    assert_eq!(virt_inline_shift(&v, 0, 4, false), 0);
+    assert_eq!(virt_inline_shift(&v, 0, 5, false), 2);
+}
+
+#[test]
+fn virt_shift_only_counts_inline_placements() {
+    // Only VIRT_POS_INLINE shifts the glyphs; an overlay/eol placement doesn't.
+    let overlay = VirtPlacement {
+        pos: 2, // VIRT_POS_OVERLAY
+        col: 2,
+        hl_mode: 0,
+        chunks: vec![("zz".into(), None)],
+    };
+    assert_eq!(virt_inline_shift(&[overlay], 0, u16::MAX, true), 0);
+}
+
+#[test]
+fn virt_shift_matches_the_subst_diff_layout() {
+    // `:%s/e/aaaa/g` over "the theme": matches at the two 'e's (cols 2 and 6), each
+    // with an "aaaa" replacement inlined right after (at cols 3 and 7). The second
+    // struck 'e' at [6,7) must shift right by the first replacement's 4 cells.
+    let v = [ivirt(3, "aaaa"), ivirt(7, "aaaa")];
+    // First match [2,3): nothing inlined before it → no shift.
+    assert_eq!(virt_inline_shift(&v, 0, 2, true), 0); // start
+    assert_eq!(virt_inline_shift(&v, 0, 3, false), 0); // end (its own virt at 3 excluded)
+                                                       // Second match [6,7): the first "aaaa" (at col 3) precedes it → shift by 4.
+    assert_eq!(virt_inline_shift(&v, 0, 6, true), 4); // start shifts
+    assert_eq!(virt_inline_shift(&v, 0, 7, false), 4); // end shifts (its own virt at 7 excluded)
 }
 
 // --- splice_inlay: inserting hint text into the row's colored runs ----------

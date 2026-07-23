@@ -666,6 +666,43 @@ async fn substitute_preview_honors_noincsearch() {
     );
 }
 
+#[tokio::test]
+async fn substitute_preview_replaces_a_prior_search_highlight() {
+    let (rpc, mut incoming) = search_fixture().await;
+    // A committed `/bar` lights up "bar" via hlsearch.
+    feed(&rpc, "/bar<CR>");
+    let _ = lines(&rpc).await; // barrier: flush the search redraw
+                               // Now type `:%s/foo` — the substitute pattern is "foo", so the preview
+                               // must light up the "foo" matches and *drop* the stale "bar" highlight
+                               // (vim's incsearch retargets the highlight to the command being typed).
+    let map = redraw_after(&rpc, &mut incoming, ":%s/foo").await;
+    let search = view_search(&map);
+    assert_eq!(
+        search.first().cloned().unwrap_or_default(),
+        vec![(0, 3)],
+        "line 1 lights its 'foo', not the stale 'bar' at (4,7): {search:?}"
+    );
+    assert_eq!(search.get(1).cloned().unwrap_or_default(), vec![(4, 7)]);
+    assert_eq!(search.get(2).cloned().unwrap_or_default(), vec![(4, 7)]);
+}
+
+#[tokio::test]
+async fn substitute_diff_preview_hides_a_prior_search_highlight() {
+    let (rpc, mut incoming) = search_fixture().await;
+    // A committed `/bar` lights up "bar" via hlsearch.
+    feed(&rpc, "/bar<CR>");
+    let _ = lines(&rpc).await; // barrier
+                               // Opening the replacement half (`:%s/foo/X`) hands every match to the
+                               // richer diff overlay (struck removed + inline added). The plain Search
+                               // highlight must go silent — including the leftover "bar" from before.
+    let map = redraw_after(&rpc, &mut incoming, ":%s/foo/X").await;
+    let search = view_search(&map);
+    assert!(
+        search.iter().all(Vec::is_empty),
+        "the diff overlay owns the matches; no Search-bg span (incl. stale 'bar') should remain: {search:?}"
+    );
+}
+
 // ----- :s replacement diff preview (inccommand-style) -----------------------
 
 /// Per visible row, the screen-column spans `[start, end)` carrying the

@@ -665,6 +665,14 @@ impl Editor {
         } else if let Some((p, lo, hi)) = ex_preview.then(|| self.ex_preview_pattern()).flatten() {
             ex_range = Some((lo, hi));
             Some(p)
+        } else if ex_preview && self.subst_preview_active() {
+            // The replacement half is open (`:s/pat/rep…`), so the richer diff
+            // overlay (struck removed + inline added) owns every match — that is
+            // exactly why `ex_preview_pattern` yielded `None` above. Don't let the
+            // stale `hlsearch` of a prior `/search` paint over it: retarget to the
+            // command being typed like vim's incsearch does, which here means no
+            // plain Search highlight at all.
+            None
         } else if self.options.hlsearch && self.search_active {
             self.last_search.as_ref().map(|(p, _, _)| p.clone())
         } else {

@@ -52,10 +52,12 @@ pub use session::{
 };
 // The pure inline-inlay-hint geometry (the shift math) and the segment splice, so
 // the Tier-1 `inlay` test can exercise them without a GPU — like the mouse helpers.
-pub use render::{inlay_shift, splice_inlay, Seg, DEFAULT_INLAY};
+pub use render::{inlay_shift, splice_inlay, virt_inline_shift, Seg, DEFAULT_INLAY};
 // The pure per-row syntax-coloring layer (run splitting + the no-colorscheme group
 // fallback), exported so the Tier-1 `syntax` test can exercise it without a GPU.
-pub use render::{col_to_screen, group_fallback, rect_subtract, row_segments, text_run_origin};
+pub use render::{
+    apply_search_fg, col_to_screen, group_fallback, rect_subtract, row_segments, text_run_origin,
+};
 // The wide-glyph mask (replace an off-grid emoji cluster with cell-width spaces), so
 // the Tier-1 `wide` test can exercise it without shaping / a GPU.
 pub use render::{mask_segments, offgrid_clusters};

@@ -1222,6 +1222,7 @@ impl Renderer {
                                 *span,
                                 win.leftcol,
                                 inlay,
+                                &[],
                                 sel_bg,
                                 clip.top as f32,
                                 clip.bottom as f32,
@@ -1239,6 +1240,7 @@ impl Renderer {
                                 *span,
                                 win.leftcol,
                                 inlay,
+                                &[],
                                 sel_bg,
                                 clip.top as f32,
                                 clip.bottom as f32,
@@ -1258,6 +1260,7 @@ impl Renderer {
                                 *span,
                                 win.leftcol,
                                 inlay,
+                                &[],
                                 search_bg,
                                 clip.top as f32,
                                 clip.bottom as f32,
@@ -1272,6 +1275,7 @@ impl Renderer {
                             *span,
                             win.leftcol,
                             inlay,
+                            &[],
                             inc_bg,
                             clip.top as f32,
                             clip.bottom as f32,
@@ -1338,6 +1342,7 @@ impl Renderer {
                                 (*ds, *de),
                                 win.leftcol,
                                 inlay,
+                                &[],
                                 color,
                             );
                         }
@@ -1438,10 +1443,23 @@ impl Renderer {
                     // same inserted width, so they ride through `inlay` (an empty
                     // slice, the common case, reduces every shift to zero).
                     let inlay = win.inlay_hints.get(i).map(Vec::as_slice).unwrap_or(&[]);
+                    // The row's inline `virt_text` (e.g. the `:s` diff's replacement
+                    // side) shifts every cell-keyed overlay below — selection, search,
+                    // underline, strike — right, exactly as it shifts the glyphs.
+                    let vtext = win.virt_text.get(i).map(Vec::as_slice).unwrap_or(&[]);
 
                     // Selection band(s) for this row.
                     if let Some(Some(span)) = win.selection.get(i) {
-                        self.push_span_quad(quads, text_x0, row, *span, win.leftcol, inlay, sel_bg);
+                        self.push_span_quad(
+                            quads,
+                            text_x0,
+                            row,
+                            *span,
+                            win.leftcol,
+                            inlay,
+                            vtext,
+                            sel_bg,
+                        );
                     }
                     // Secondary multi-cursor selections, painted with the same
                     // `Visual` background as the primary (the server resolves which
@@ -1455,6 +1473,7 @@ impl Renderer {
                                 *span,
                                 win.leftcol,
                                 inlay,
+                                vtext,
                                 sel_bg,
                             );
                         }
@@ -1469,6 +1488,7 @@ impl Renderer {
                                 *span,
                                 win.leftcol,
                                 inlay,
+                                vtext,
                                 search_bg,
                             );
                         }
@@ -1476,7 +1496,16 @@ impl Renderer {
                     // The live incsearch preview match rides on top of `hlsearch`.
                     if let Some(Some(span)) = win.incsearch.get(i) {
                         let inc_bg = style_bg(&view.incsearch_style).unwrap_or(0x8a_6d_1a);
-                        self.push_span_quad(quads, text_x0, row, *span, win.leftcol, inlay, inc_bg);
+                        self.push_span_quad(
+                            quads,
+                            text_x0,
+                            row,
+                            *span,
+                            win.leftcol,
+                            inlay,
+                            vtext,
+                            inc_bg,
+                        );
                     }
 
                     // The diagnostic sign in the far-left 2-cell column (when this
@@ -1536,8 +1565,7 @@ impl Renderer {
                     // Reverse fills (a foreground-colored quad behind the inverted
                     // glyph) go under the text; underline/strikethrough rules go over
                     // it. Both walk the same highlight spans (see the methods).
-                    self.push_reverse_fills(quads, win, view, text_x0, row, hl, inlay);
-                    let vtext = win.virt_text.get(i).map(Vec::as_slice).unwrap_or(&[]);
+                    self.push_reverse_fills(quads, win, view, text_x0, row, hl, inlay, vtext);
                     // `~` end-of-buffer filler rows (`numbers[i] == None`, no tokens)
                     // paint with the theme's `EndOfBuffer` foreground rather than the
                     // `Normal` text fg — matching the TUI and vim's default look.
@@ -1548,6 +1576,19 @@ impl Renderer {
                     };
                     let mut segments =
                         row_segments(&display, hl, &view.styles, row_fg, normal_bg, win.leftcol);
+                    // Recolor the glyphs under a search match to the `Search` /
+                    // `IncSearch` foreground (the TUI does this) — done on the base
+                    // segments, in the same column space the search spans use, so the
+                    // splice below shifts glyph and recolor together. The bg quads are
+                    // painted separately above.
+                    segments = apply_search_fg(
+                        segments,
+                        win.search.get(i).map(Vec::as_slice).unwrap_or(&[]),
+                        win.incsearch.get(i).copied().flatten(),
+                        win.leftcol,
+                        style_fg(&view.search_style),
+                        style_fg(&view.incsearch_style),
+                    );
                     // Inline + overlay extmark `virt_text` transform the base segments
                     // (shift / overwrite); inlay hints splice in too. The common no-virt
                     // row keeps the cheaper inlay-only splice (tested path, untouched).
@@ -1575,7 +1616,7 @@ impl Renderer {
                         row,
                         (ox + wcols) as f32 * self.cell_w,
                     );
-                    self.push_attr_rules(quads, win, view, text_x0, row, hl, inlay);
+                    self.push_attr_rules(quads, win, view, text_x0, row, hl, inlay, vtext);
 
                     // LSP diagnostic underlines, painted last so they survive over
                     // the syntax/selection: a thin colored rule under the cells.
@@ -1589,6 +1630,7 @@ impl Renderer {
                                 (*s, *e),
                                 win.leftcol,
                                 inlay,
+                                vtext,
                                 color,
                             );
                         }
@@ -1631,7 +1673,8 @@ impl Renderer {
                         if !vtext.is_empty() {
                             let right_px = (ox + wcols) as f32 * self.cell_w;
                             let inlay_inserted = inlay_shift(inlay, win.leftcol, u16::MAX, true);
-                            let virt_inserted = virt_inline_shift(vtext, win.leftcol, u16::MAX);
+                            let virt_inserted =
+                                virt_inline_shift(vtext, win.leftcol, u16::MAX, true);
                             let painted =
                                 (display.chars().count().saturating_sub(win.leftcol as usize)
                                     + inlay_inserted as usize
@@ -1753,7 +1796,7 @@ impl Renderer {
                         .map(Vec::as_slice)
                         .unwrap_or(&[]);
                     inlay_shift(row_inlay, win.leftcol, win.cursor_screen_col, true)
-                        + virt_inline_shift(row_vtext, win.leftcol, win.cursor_screen_col)
+                        + virt_inline_shift(row_vtext, win.leftcol, win.cursor_screen_col, true)
                 }
                 Some(s) => {
                     let idx = s.cursor_row.round() as usize; // cursor's band-row index
@@ -2948,10 +2991,21 @@ impl Renderer {
         span: (u16, u16),
         leftcol: u16,
         inlay: &[InlayHint],
+        vtext: &[VirtPlacement],
     ) -> Option<(u16, u16)> {
         let (s, e) = span;
-        let start = base + s.saturating_sub(leftcol) + inlay_shift(inlay, leftcol, s, true);
-        let end = base + e.saturating_sub(leftcol) + inlay_shift(inlay, leftcol, e, false);
+        // A cell-keyed overlay (selection, search, underline, strike) rides the same
+        // inline splice the glyphs do, so it shifts by BOTH the inlay hints and the
+        // inline `virt_text` before its columns — otherwise e.g. a `:s///g` diff's
+        // struck deletion past the first inline replacement lands cells too far left.
+        let start = base
+            + s.saturating_sub(leftcol)
+            + inlay_shift(inlay, leftcol, s, true)
+            + virt_inline_shift(vtext, leftcol, s, true);
+        let end = base
+            + e.saturating_sub(leftcol)
+            + inlay_shift(inlay, leftcol, e, false)
+            + virt_inline_shift(vtext, leftcol, e, false);
         (end > start).then_some((start, end))
     }
 
@@ -2967,10 +3021,11 @@ impl Renderer {
         span: (u16, u16),
         leftcol: u16,
         inlay: &[InlayHint],
+        vtext: &[VirtPlacement],
         color: u32,
     ) {
         let (_, py) = self.cell_px(0, row as u16);
-        self.push_underline_at(quads, base, py, span, leftcol, inlay, color);
+        self.push_underline_at(quads, base, py, span, leftcol, inlay, vtext, color);
     }
 
     /// [`push_underline`] at an explicit pixel `y` (the scroll band's interpolated
@@ -2985,9 +3040,10 @@ impl Renderer {
         span: (u16, u16),
         leftcol: u16,
         inlay: &[InlayHint],
+        vtext: &[VirtPlacement],
         color: u32,
     ) {
-        let Some((start, end)) = self.span_cols(base, span, leftcol, inlay) else {
+        let Some((start, end)) = self.span_cols(base, span, leftcol, inlay, vtext) else {
             return;
         };
         let h = (self.cell_h * 0.08).max(1.0);
@@ -3012,9 +3068,10 @@ impl Renderer {
         span: (u16, u16),
         leftcol: u16,
         inlay: &[InlayHint],
+        vtext: &[VirtPlacement],
         color: u32,
     ) {
-        let Some((start, end)) = self.span_cols(base, span, leftcol, inlay) else {
+        let Some((start, end)) = self.span_cols(base, span, leftcol, inlay, vtext) else {
             return;
         };
         let (px, py) = self.cell_px(start, row as u16);
@@ -3042,6 +3099,7 @@ impl Renderer {
         row: usize,
         hl: &[nxvim_view::HlSpan],
         inlay: &[InlayHint],
+        vtext: &[VirtPlacement],
     ) {
         let base_fg = style_fg(&view.normal).unwrap_or(DEFAULT_FG);
         for hs in hl {
@@ -3055,6 +3113,7 @@ impl Renderer {
                         (hs.0, hs.1),
                         win.leftcol,
                         inlay,
+                        vtext,
                         color,
                     );
                 }
@@ -3076,6 +3135,7 @@ impl Renderer {
         row: usize,
         hl: &[nxvim_view::HlSpan],
         inlay: &[InlayHint],
+        vtext: &[VirtPlacement],
     ) {
         let base_fg = style_fg(&view.normal).unwrap_or(DEFAULT_FG);
         for hs in hl {
@@ -3085,11 +3145,11 @@ impl Renderer {
             let span = (hs.0, hs.1);
             if st.underline || st.undercurl {
                 let color = st.sp.or(st.fg).unwrap_or(base_fg);
-                self.push_underline(quads, text_x0, row, span, win.leftcol, inlay, color);
+                self.push_underline(quads, text_x0, row, span, win.leftcol, inlay, vtext, color);
             }
             if st.strikethrough {
                 let color = st.fg.unwrap_or(base_fg);
-                self.push_strike(quads, text_x0, row, span, win.leftcol, inlay, color);
+                self.push_strike(quads, text_x0, row, span, win.leftcol, inlay, vtext, color);
             }
         }
     }
@@ -3109,9 +3169,10 @@ impl Renderer {
         span: (u16, u16),
         leftcol: u16,
         inlay: &[InlayHint],
+        vtext: &[VirtPlacement],
         color: u32,
     ) {
-        let Some((start, end)) = self.span_cols(base, span, leftcol, inlay) else {
+        let Some((start, end)) = self.span_cols(base, span, leftcol, inlay, vtext) else {
             return;
         };
         let (px, py) = self.cell_px(start, row as u16);
@@ -3138,11 +3199,12 @@ impl Renderer {
         span: (u16, u16),
         leftcol: u16,
         inlay: &[InlayHint],
+        vtext: &[VirtPlacement],
         color: u32,
         clip_top: f32,
         clip_bottom: f32,
     ) {
-        let Some((start, end)) = self.span_cols(base, span, leftcol, inlay) else {
+        let Some((start, end)) = self.span_cols(base, span, leftcol, inlay, vtext) else {
             return;
         };
         let top = y.max(clip_top);
@@ -3851,6 +3913,66 @@ pub fn row_segments(
     segments
 }
 
+/// Recolor the glyphs under `hlsearch` / `incsearch` matches to the theme's
+/// `Search` / `IncSearch` **foreground**, so a search highlight paints its intended
+/// text color. The TUI applies this; without it the GUI kept each glyph's syntax fg
+/// under the match, so a `Search` group written dark-on-bright (or the current-match
+/// `IncSearch`) rendered light-on-bright and was nearly invisible. `search_fg` /
+/// `inc_fg` are `None` when the group leaves the foreground unset — then the run
+/// keeps its own color and only the background quad paints. `incsearch` (the current
+/// match) wins over `hlsearch` on a shared cell. Operates in `base`'s column space —
+/// the pre-inlay/virt-splice space the search spans share — so a later splice shifts
+/// glyph and recolor together. Returns `segments` untouched when there's nothing to
+/// recolor. The renderer's one-column-per-char convention (see [`inlay_shift`]) keys
+/// the walk.
+pub fn apply_search_fg(
+    segments: Vec<Seg>,
+    search: &[(u16, u16)],
+    incsearch: Option<(u16, u16)>,
+    leftcol: u16,
+    search_fg: Option<u32>,
+    inc_fg: Option<u32>,
+) -> Vec<Seg> {
+    let does_search = search_fg.is_some() && !search.is_empty();
+    let does_inc = inc_fg.is_some() && incsearch.is_some();
+    if !does_search && !does_inc {
+        return segments;
+    }
+    let in_span = |col: u16, (s, e): (u16, u16)| col >= s && col < e;
+    let mut out: Vec<Seg> = Vec::with_capacity(segments.len());
+    let mut col = leftcol;
+    for seg in &segments {
+        for ch in seg.text.chars() {
+            let fg = if does_inc && in_span(col, incsearch.unwrap()) {
+                inc_fg.unwrap()
+            } else if does_search && search.iter().any(|&sp| in_span(col, sp)) {
+                search_fg.unwrap()
+            } else {
+                seg.fg
+            };
+            match out.last_mut() {
+                Some(last)
+                    if last.fg == fg
+                        && last.bg == seg.bg
+                        && last.bold == seg.bold
+                        && last.italic == seg.italic =>
+                {
+                    last.text.push(ch);
+                }
+                _ => out.push(Seg {
+                    text: ch.to_string(),
+                    fg,
+                    bg: seg.bg,
+                    bold: seg.bold,
+                    italic: seg.italic,
+                }),
+            }
+            col += 1;
+        }
+    }
+    out
+}
+
 /// Built-in syntax color for a treesitter capture `group` when no colorscheme
 /// resolved it (`style_id` is `None`) — the GUI's truecolor analogue of the TUI's
 /// `group_style`, so a buffer highlights even with no colorscheme loaded. Keys off
@@ -4031,14 +4153,21 @@ fn virt_overlay_fg(chunk_fg: u32, under_fg: u32, mode: u8) -> u32 {
     }
 }
 
-/// The combined cell width of the inline `virt_text` placements on a row at or
-/// before screen column `col` (with placements scrolled off the left excluded) —
-/// how far the inline splice pushes a glyph/cursor at `col` to the right. The
-/// `virt_text` analogue of [`inlay_shift`]; the cursor adds both.
-fn virt_inline_shift(vtext: &[VirtPlacement], leftcol: u16, col: u16) -> u16 {
+/// The combined cell width of the inline `virt_text` placements on a row before
+/// screen column `col` — at or before it when `inclusive` (a placement *at* the
+/// column sits before that glyph and pushes it right), strictly before it otherwise
+/// — with placements scrolled off the left excluded. How far the inline splice
+/// pushes a glyph/cursor/overlay at `col` to the right; the `virt_text` analogue of
+/// [`inlay_shift`], with the same edge convention (a left edge / the cursor is
+/// inclusive, a span's right edge is exclusive). The cursor adds both.
+pub fn virt_inline_shift(vtext: &[VirtPlacement], leftcol: u16, col: u16, inclusive: bool) -> u16 {
     vtext
         .iter()
-        .filter(|p| p.pos == VIRT_POS_INLINE && p.col >= leftcol && p.col <= col)
+        .filter(|p| {
+            p.pos == VIRT_POS_INLINE
+                && p.col >= leftcol
+                && (if inclusive { p.col <= col } else { p.col < col })
+        })
         .flat_map(|p| p.chunks.iter())
         .map(|(t, _)| t.chars().count() as u16)
         .sum()

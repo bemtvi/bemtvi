@@ -1438,6 +1438,48 @@ impl Editor {
         Some((pattern, lo, hi))
     }
 
+    /// Whether the command line is a substitute whose **replacement half is open**
+    /// (`:s/pat/…`), i.e. the diff overlay ([`refresh_subst_preview`]) owns the
+    /// matches. A structural check only — unlike [`subst_preview`] it never compiles
+    /// the pattern, so it still holds for a mid-edit (not-yet-valid) pattern. The
+    /// hlsearch projection consults it to stay silent while the diff overlay is live,
+    /// rather than leaking a prior `/search`'s stale highlight underneath it.
+    pub(crate) fn subst_preview_active(&self) -> bool {
+        if self.mode != Mode::Command || self.cmdline_kind != CmdlineKind::Ex {
+            return false;
+        }
+        let cmd = self.cmdline.trim_start_matches([':', ' ']);
+        let Ok((_range, rest)) = self.parse_ex_range(cmd) else {
+            return false;
+        };
+        let rest = rest.trim_start();
+        let name_len = rest.bytes().take_while(u8::is_ascii_alphabetic).count();
+        if !matches!(
+            &rest[..name_len],
+            "s" | "su"
+                | "sub"
+                | "subs"
+                | "subst"
+                | "substi"
+                | "substit"
+                | "substitu"
+                | "substitut"
+                | "substitute"
+        ) {
+            return false;
+        }
+        let after = &rest[name_len..];
+        let args = after.strip_prefix('!').unwrap_or(after).trim_start();
+        // An opening delimiter whose replacement half has actually opened (a second
+        // unescaped delimiter typed) — the same gate `subst_preview` uses.
+        match args.chars().next() {
+            Some(delim) if !delim.is_alphanumeric() && delim != '\\' && delim != '"' => {
+                has_unescaped_delim(&args[delim.len_utf8()..], delim)
+            }
+            _ => false,
+        }
+    }
+
     /// The resolved live `:s/pat/rep/flags` **replacement preview**, once a
     /// substitute command line has opened its replacement half (`:s/pat/…`).
     /// Returns the compiled pattern, the (tilde-expanded) replacement, whether the

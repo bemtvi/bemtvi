@@ -2233,19 +2233,23 @@ fn cell_style(
             break; // spans don't overlap
         }
     }
-    // Search-match highlights ride on top of the syntax token: every match in
-    // the `Search` color, then the live incsearch match in `IncSearch` over it.
     let in_span = |span: (u16, u16)| col >= span.0 as usize && col < span.1 as usize;
+    // The visual selection paints under the search highlight — the primary's `sel`,
+    // plus any secondary multi-cursor selection covering this cell (same `Visual`
+    // style). Applied *before* the search match so `hlsearch` shows through the
+    // selection (vim's "let search highlight show in Visual area", and what the GUI
+    // already does — its search quad paints over the selection quad); otherwise the
+    // `Visual` background hides every match under the selection.
+    if sel.is_some_and(in_span) || secondary_sel.iter().copied().any(in_span) {
+        style = selection_style(style, theme);
+    }
+    // Search-match highlights ride on top: every match in the `Search` color, then
+    // the live incsearch match in `IncSearch` over it.
     if search.iter().copied().any(in_span) {
         style = search_style(style, theme.search, Color::Yellow);
     }
     if incsearch.is_some_and(in_span) {
         style = search_style(style, theme.incsearch, Color::LightYellow);
-    }
-    // The visual selection sits on top of everything — the primary's `sel`, plus
-    // any secondary multi-cursor selection covering this cell (same `Visual` style).
-    if sel.is_some_and(in_span) || secondary_sel.iter().copied().any(in_span) {
-        style = selection_style(style, theme);
     }
     // A diagnostic adds its underline last, so it survives the selection: the
     // cell keeps its syntax fg and selection bg and gains the severity's

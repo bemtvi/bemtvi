@@ -282,6 +282,17 @@ impl Editor {
         }
     }
 
+    /// The buffer lines a line-background capture (`@markup.raw.block`) covers, from
+    /// the engine's most recent [`highlights`](Self::highlights) call for `buf` — the
+    /// source of the `line_bg` layer under a markdown fenced code block. Empty when
+    /// there is no engine. Read right after `highlights`, so it needs no sync.
+    pub fn line_background_lines(&self, buf: BufferId) -> Vec<usize> {
+        match self.syntax.as_ref() {
+            Some(engine) => engine.line_background_lines(buf),
+            None => Vec::new(),
+        }
+    }
+
     /// Highlight an **off-buffer** snippet — `text` in `language`, over `[first,
     /// last)` — without registering a buffer. For read-only surfaces (the picker
     /// preview pane) that paint a file which is not an open buffer. Empty when there

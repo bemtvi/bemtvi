@@ -73,6 +73,12 @@ pub(crate) struct SyntaxState {
     key: Option<(u64, usize, usize, Option<String>)>,
     /// Latest spans from the engine, keyed by absolute buffer line.
     spans: HashMap<usize, Vec<ByteSpan>>,
+    /// Absolute buffer lines a line-background capture (`@markup.raw.block`) covers,
+    /// from the same engine query as `spans`. Projected by
+    /// [`line_bg_for`](crate::EditHost::line_bg_for) into the `line_bg` layer so a
+    /// markdown fenced code block reads as a solid region under the per-token syntax
+    /// the winner-takes-cell merge otherwise paints over its background.
+    pub(crate) block_bg_lines: std::collections::HashSet<usize>,
 }
 
 impl EditHost {
@@ -152,6 +158,13 @@ impl EditHost {
         // Miss: re-query the engine (this also drains the buffer's edit journal
         // into the engine and reparses incrementally) and re-index by line.
         let spans = self.editor.highlights(buffer, first, last);
+        // Read the line-background lines this same query produced (markdown fenced
+        // code blocks) — the engine stashed them during `highlights` above.
+        let block_bg_lines = self
+            .editor
+            .line_background_lines(buffer)
+            .into_iter()
+            .collect();
         let mut by_line: HashMap<usize, Vec<ByteSpan>> = HashMap::new();
         for s in spans {
             by_line.entry(s.line).or_default().push(ByteSpan {
@@ -163,6 +176,7 @@ impl EditHost {
         let state = self.syntax_states.entry(buffer).or_default();
         state.key = Some(key);
         state.spans = by_line;
+        state.block_bg_lines = block_bg_lines;
     }
 
     /// Resolve a language's runtimepath treesitter queries once and push them to

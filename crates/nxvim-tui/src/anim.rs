@@ -55,6 +55,10 @@ pub(crate) struct Animation {
     /// squiggles and signs slide with the text instead of blanking for the slide.
     pub(crate) diagnostics: Vec<Vec<DiagSpan>>,
     pub(crate) diagnostics_signs: Vec<Option<DiagSign>>,
+    /// The line-background layer for the band as `(band_row, style)`, so a code
+    /// block's tint slides with the text instead of jumping to the settled position
+    /// during the slide (the band sibling of the per-window `line_bg`).
+    pub(crate) line_bg: Vec<(u16, Style)>,
     /// Palette snapshot the band's style ids index into (see [`ScrollData`]).
     pub(crate) styles: Vec<Style>,
 }
@@ -83,6 +87,7 @@ impl Animation {
             diagnostics_virt: s.diagnostics_virt.clone(),
             diagnostics: s.diagnostics.clone(),
             diagnostics_signs: s.diagnostics_signs.clone(),
+            line_bg: s.line_bg.clone(),
             styles: s.styles.clone(),
         }
     }

@@ -88,6 +88,21 @@ pub trait SyntaxEngine {
     /// Highlight spans for the line range `[first, last)`.
     fn highlights(&mut self, buffer: BufferId, first: usize, last: usize) -> Vec<Span>;
 
+    /// Buffer lines (0-based, absolute) a **line-background** capture covers — the
+    /// markdown fenced/indented code block's `@markup.raw.block`. These feed the
+    /// separate `line_bg` layer the client paints *under* the text, so the whole
+    /// block reads as a solid region even on cells where a narrower injected token
+    /// overwrites the block's own background (the paint is winner-takes-cell, so
+    /// the background would otherwise survive only on the un-tokenized cells —
+    /// spaces). Reflects the range of the **most recent [`highlights`] call** for
+    /// this buffer (the server reads it immediately after `highlights`); an engine
+    /// that paints no such backgrounds returns nothing (the default).
+    ///
+    /// [`highlights`]: Self::highlights
+    fn line_background_lines(&self, _buffer: BufferId) -> Vec<usize> {
+        Vec::new()
+    }
+
     /// Whether `buffer`'s parse is still in progress — a large file whose parse was
     /// cancelled by the engine's per-frame deadline and is being resumed across
     /// frames. The server polls this after a redraw to keep scheduling frames (each

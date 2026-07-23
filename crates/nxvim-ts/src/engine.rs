@@ -64,6 +64,11 @@ struct BufferState {
     /// ships no injection query or no region matches. See
     /// [`Engine::rebuild_injection_layers`].
     injections: Vec<InjectionLayer>,
+    /// Lines a full-line-background capture ([`LINE_BACKGROUND_GROUPS`]) touched in
+    /// the most recent [`Engine::highlights`] call — read back by the server via
+    /// [`line_background_lines`](nxvim_core::syntax::SyntaxEngine::line_background_lines)
+    /// to paint the `line_bg` layer under a markdown fenced code block.
+    line_bg_lines: Vec<usize>,
 }
 
 /// One injected sub-language layer: a child grammar's parse of the host buffer
@@ -610,6 +615,7 @@ impl Engine {
             language: lang.to_string(),
             incomplete: false,
             injections: Vec::new(),
+            line_bg_lines: Vec::new(),
         };
         state.reparse();
         self.buffers.insert(buffer, state);
@@ -725,37 +731,51 @@ impl Engine {
             self.rebuild_injection_layers(buffer);
         }
 
-        let Some(state) = self.buffers.get(&buffer) else {
-            return Vec::new();
-        };
-        let Some(tree) = state.tree.as_ref() else {
-            return Vec::new();
-        };
-        let Some(Slot::Loaded(host)) = self.grammars.get(&state.language) else {
-            return Vec::new();
-        };
-
-        // Layer 0 is the host tree. Each loaded injected child contributes a deeper
-        // layer that paints over it; all layers' nodes are in buffer coordinates
-        // (the children parse through `included_ranges`), so the painter reads every
-        // layer's predicate text from the one shadow. A child whose grammar isn't
-        // loaded contributes nothing (the host paint stands).
-        let mut layers = Vec::with_capacity(1 + state.injections.len());
-        layers.push(Layer {
-            query: &host.query,
-            tree,
-            ranges: &[], // the host covers the whole buffer — no clipping
-        });
-        for inj in &state.injections {
-            if let Some(Slot::Loaded(child)) = self.grammars.get(&inj.language) {
-                layers.push(Layer {
-                    query: &child.query,
-                    tree: &inj.tree,
-                    ranges: &inj.ranges,
-                });
-            }
+        // Reset the line-background memo up front, so a buffer with no tree / grammar
+        // (the early returns below) reports no backgrounds rather than a stale set.
+        if let Some(state) = self.buffers.get_mut(&buffer) {
+            state.line_bg_lines.clear();
         }
-        extract_spans(&layers, &state.shadow, first_line, last_line)
+        let (spans, bg_lines) = {
+            let Some(state) = self.buffers.get(&buffer) else {
+                return Vec::new();
+            };
+            let Some(tree) = state.tree.as_ref() else {
+                return Vec::new();
+            };
+            let Some(Slot::Loaded(host)) = self.grammars.get(&state.language) else {
+                return Vec::new();
+            };
+
+            // Layer 0 is the host tree. Each loaded injected child contributes a deeper
+            // layer that paints over it; all layers' nodes are in buffer coordinates
+            // (the children parse through `included_ranges`), so the painter reads every
+            // layer's predicate text from the one shadow. A child whose grammar isn't
+            // loaded contributes nothing (the host paint stands).
+            let mut layers = Vec::with_capacity(1 + state.injections.len());
+            layers.push(Layer {
+                query: &host.query,
+                tree,
+                ranges: &[], // the host covers the whole buffer — no clipping
+            });
+            for inj in &state.injections {
+                if let Some(Slot::Loaded(child)) = self.grammars.get(&inj.language) {
+                    layers.push(Layer {
+                        query: &child.query,
+                        tree: &inj.tree,
+                        ranges: &inj.ranges,
+                    });
+                }
+            }
+            extract_spans(&layers, &state.shadow, first_line, last_line)
+        };
+        // Stash the line-background lines for the server to read (via
+        // `line_background_lines`) immediately after this call — the source of the
+        // `line_bg` layer under a markdown fenced code block.
+        if let Some(state) = self.buffers.get_mut(&buffer) {
+            state.line_bg_lines = bg_lines;
+        }
+        spans
     }
 
     /// Highlight an off-buffer snippet (`text` in `lang`) over `[first_line,
@@ -798,7 +818,9 @@ impl Engine {
             tree: &tree,
             ranges: &[],
         }];
-        extract_spans(&layers, &shadow, first_line, last_line)
+        // The off-buffer preview needs only the spans; its surface has no `line_bg`
+        // layer, so the block-background lines are discarded.
+        extract_spans(&layers, &shadow, first_line, last_line).0
     }
 
     /// Target indent **width in columns** for the 0-indexed `line`, by running the
@@ -1127,6 +1149,13 @@ impl SyntaxEngine for Engine {
         Engine::highlights(self, buffer, first, last)
     }
 
+    fn line_background_lines(&self, buffer: BufferId) -> Vec<usize> {
+        self.buffers
+            .get(&buffer)
+            .map(|s| s.line_bg_lines.clone())
+            .unwrap_or_default()
+    }
+
     fn parse_pending(&self, buffer: BufferId) -> bool {
         Engine::parse_pending(self, buffer)
     }
@@ -1248,19 +1277,38 @@ fn match_satisfies_lua_predicates(query: &Query, m: &QueryMatch, shadow: &Rope) 
 }
 
 /// Run each layer's query over the byte range covering the visible lines and
+/// Capture groups whose highlight is a **full-line background** — markdown's fenced
+/// and indented code blocks (`(fenced_code_block) @markup.raw.block`). The per-cell
+/// paint below is winner-takes-cell, so a narrower injected token (the code's own
+/// syntax) overwrites the block's background on the cells it covers, leaving the
+/// background only on un-tokenized cells (spaces). [`extract_spans`] therefore also
+/// reports which lines such a group *touches*, so the server can paint them as the
+/// separate `line_bg` layer *under* the text — the same background the doc-float
+/// renderer sets as a `line_hl_group` extmark. Keep this to genuine block
+/// backgrounds: inline code (`markup.raw`) must not tile a whole line. The names
+/// are tree-sitter **capture** names, so no leading `@` (the server re-adds it when
+/// resolving the `line_bg` group against the colorscheme).
+const LINE_BACKGROUND_GROUPS: &[&str] = &["markup.raw.block"];
+
 /// resolve the captures into per-line byte spans. Within a layer the most-specific
 /// (narrowest) capture wins; across layers a deeper (injected) layer overwrites a
 /// shallower one inside its region — so injected highlighting paints over the host.
+///
+/// Returns the per-line spans plus the absolute line numbers a
+/// [`LINE_BACKGROUND_GROUPS`] capture touches (for the `line_bg` layer). The line
+/// list is recorded when a background capture is bucketed onto a line — *before* the
+/// per-cell overwrite — so a line stays listed even where an injected token covers
+/// every cell (e.g. a `}` at column 0 with no surrounding space).
 fn extract_spans(
     layers: &[Layer],
     shadow: &Rope,
     first_line: usize,
     last_line: usize,
-) -> Vec<Span> {
+) -> (Vec<Span>, Vec<usize>) {
     let line_count = shadow.len_lines(LINE_TYPE).saturating_sub(1);
     let last_line = last_line.min(line_count);
     if first_line >= last_line {
-        return Vec::new();
+        return (Vec::new(), Vec::new());
     }
     let lo = shadow.line_to_byte_idx(first_line, LINE_TYPE);
     let hi = shadow.line_to_byte_idx(last_line, LINE_TYPE);
@@ -1355,6 +1403,9 @@ fn extract_spans(
     // bucket's entries stay in the same relative order the old loop applied them, so
     // the last-write-wins paint per cell is byte-for-byte unchanged.
     let mut buckets: Vec<Vec<(usize, usize, &str)>> = vec![Vec::new(); n_lines];
+    // Lines a full-line-background group touches, recorded here (pre-overwrite) so a
+    // line stays flagged even when injected tokens later cover every one of its cells.
+    let mut bg_line = vec![false; n_lines];
     for &(s, e, name, _) in &raw {
         if e == 0 {
             continue;
@@ -1364,10 +1415,14 @@ fn extract_spans(
         if lo_line > hi_line {
             continue;
         }
+        let line_bg = LINE_BACKGROUND_GROUPS.contains(&name);
         for line in lo_line..=hi_line {
             let (line_start, content_len) = line_geom[line - first_line];
             if e <= line_start || s >= line_start + content_len {
                 continue;
+            }
+            if line_bg {
+                bg_line[line - first_line] = true;
             }
             buckets[line - first_line].push((s, e, name));
         }
@@ -1414,7 +1469,12 @@ fn extract_spans(
             }
         }
     }
-    out
+    let block_bg_lines = bg_line
+        .iter()
+        .enumerate()
+        .filter_map(|(i, &on)| on.then_some(first_line + i))
+        .collect();
+    (out, block_bg_lines)
 }
 
 /// Run the injection `query` over `tree` and resolve each match to its

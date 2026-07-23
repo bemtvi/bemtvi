@@ -85,6 +85,11 @@ pub struct ScrollData {
     /// the signs slide with the text. Same shape as the per-window
     /// `diagnostics_signs`.
     pub diagnostics_signs: Vec<Option<DiagSign>>,
+    /// The line-background layer for the band as `(band_row, style)` — the sibling
+    /// of [`WindowView::line_bg`], so a code block's tint slides *with* the text
+    /// instead of jumping to the settled position (or vanishing) during the slide.
+    /// Band-row indexed, resolved against this gesture's snapshot palette.
+    pub line_bg: Vec<(u16, Style)>,
     /// The style palette captured with this gesture. Snapshotted (not read live
     /// from [`View::styles`]) because a delayed highlight redraw arriving
     /// mid-slide replaces the live palette, which would leave the band's frozen
@@ -1035,6 +1040,7 @@ fn parse_window(m: &[(Value, Value)], styles: &[Style]) -> WindowView {
             diagnostics: parse_diagnostics(map_get(s, "diagnostics")),
             diagnostics_signs: parse_diagnostics_signs(map_get(s, "diagnostics_signs")),
             diagnostics_virt: parse_diagnostics_virt(map_get(s, "diagnostics_virt")),
+            line_bg: parse_line_bg(map_get(s, "line_bg"), styles),
             // The band's ids index this redraw's palette — snapshot it now, since
             // a later redraw will replace the live `styles`.
             styles: styles.to_vec(),

@@ -1136,6 +1136,84 @@ async fn markdown_injects_rust_into_a_fenced_code_block() {
     );
 }
 
+/// The screen rows carrying a `line_bg` background from a redraw map (`[row, …]`).
+fn line_bg_rows(params: &[Value]) -> Vec<u64> {
+    window0(params)
+        .and_then(|win| win.iter().find(|(k, _)| k.as_str() == Some("line_bg")))
+        .and_then(|(_, v)| v.as_array())
+        .map(|rows| {
+            rows.iter()
+                .filter_map(|r| r.as_array()?.first()?.as_u64())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// A `colors/mdbg.lua` that gives `@markup.raw.block` a background so the `line_bg`
+/// layer (which only emits rows whose group resolves to a style) has something to
+/// paint — the fenced-code-block tint.
+const MD_BG_COLORS_FIXTURE: &str = "\
+vim.api.nvim_set_hl(0, 'Normal', { fg = '#cdd6f4', bg = '#1e1e2e' })\n\
+vim.api.nvim_set_hl(0, '@markup.raw.block', { bg = '#313244' })\n";
+
+/// Regression: a markdown fenced code block's background must back the **whole**
+/// block via the `line_bg` layer, not just the cells the injected language leaves
+/// un-tokenized. The injected rust paints foreground-only tokens over the content,
+/// which under the winner-takes-cell span merge would drop the block background on
+/// those cells (the reported bug: tint showing only on spaces). The engine reports
+/// the block's lines separately so the server paints them as `line_bg` under the
+/// text — so every row of the block carries the background.
+#[tokio::test]
+async fn fenced_code_block_backs_the_whole_block_via_line_bg() {
+    let _guard = test_lock().lock().await;
+    fixture_data_dir();
+
+    // A runtimepath overlay: extend the markdown highlights query so the fenced block
+    // is captured as `@markup.raw.block` (the group the real nvim-treesitter query
+    // uses; the bundled 0.5.3 fixture query tags it `@text.literal`), plus a
+    // colorscheme giving that group a background so `line_bg` resolves it.
+    let dir = std::env::temp_dir().join(format!("nxvim-mdbg-{}", std::process::id()));
+    std::fs::create_dir_all(dir.join("after").join("queries").join("markdown")).unwrap();
+    std::fs::write(
+        dir.join("after")
+            .join("queries")
+            .join("markdown")
+            .join("highlights.scm"),
+        "((fenced_code_block) @markup.raw.block)\n",
+    )
+    .unwrap();
+    std::fs::create_dir_all(dir.join("colors")).unwrap();
+    std::fs::write(dir.join("colors").join("mdbg.lua"), MD_BG_COLORS_FIXTURE).unwrap();
+
+    // A 3-line fenced rust block: rows 0 (```rust), 1 (fn z() {}), 2 (```). The whole
+    // `fenced_code_block` node — delimiters and content — is the background region.
+    let file = write_temp("mdbg", "md", "```rust\nfn z() {}\n```\n");
+    let (rpc, mut incoming) = start_with(Some(file), vec![dir]).await;
+
+    feed(&rpc, ":colorscheme mdbg<CR>");
+
+    // Poll until the block-background rows resolve (theme load + highlight populate are
+    // independent async events). Every row of the block must be backed.
+    let mut rows = Vec::new();
+    for _ in 0..100 {
+        barrier(&rpc).await;
+        tokio::task::yield_now().await;
+        if let Some(params) = drain_latest_redraw(&mut incoming) {
+            rows = line_bg_rows(&params);
+            if [0u64, 1, 2].iter().all(|r| rows.contains(r)) {
+                break;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    for r in [0u64, 1, 2] {
+        assert!(
+            rows.contains(&r),
+            "row {r} of the fenced code block must carry a line_bg background; got {rows:?}"
+        );
+    }
+}
+
 /// The floating window (the rendered-markdown popup) from a redraw, or `None`.
 fn float_win(params: &[Value]) -> Option<Vec<(Value, Value)>> {
     let Value::Map(map) = params.first()? else {

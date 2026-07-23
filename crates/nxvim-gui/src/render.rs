@@ -175,6 +175,11 @@ pub struct ScrollFrame<'a> {
     /// squiggles and signs slide with the text instead of blanking for the slide.
     pub diagnostics: &'a [Vec<DiagSpan>],
     pub diagnostics_signs: &'a [Option<DiagSign>],
+    /// The line-background layer for the band as `(band_row, style)`, so a code
+    /// block's tint slides with the text instead of vanishing for the slide (the
+    /// settled window paints its own `line_bg`; the band branch skips it, so without
+    /// this the fenced-code background blinks out for the ~150ms animation).
+    pub line_bg: &'a [(u16, Style)],
     pub styles: &'a [Style],
 }
 
@@ -1141,6 +1146,28 @@ impl Renderer {
                 self.push_colorcolumn(
                     quads, win, view, ox, oy, text_x0, wcols, text_rows, slide_bg,
                 );
+                // The line-background layer rides the slide: paint each band row's tint
+                // at its sub-pixel offset across the whole window, clamped to the text
+                // area — the `'cursorline'` model, pushed under the band text/overlays so
+                // syntax composes on top. Without this the fenced-code tint vanishes for
+                // the duration of the slide and snaps back on settle.
+                for &(brow, style) in s.line_bg {
+                    let Some(bg) = style_bg(&Some(style)) else {
+                        continue;
+                    };
+                    let ly = (oy as f32 + brow as f32 - s.row_off) * self.cell_h;
+                    let top = ly.max(clip.top as f32);
+                    let bottom = (ly + self.cell_h).min(clip.bottom as f32);
+                    if bottom > top {
+                        quads.push(Quad {
+                            x: clip.left as f32,
+                            y: top,
+                            w: (clip.right - clip.left) as f32,
+                            h: bottom - top,
+                            color: color_to_rgba(srgb_to_color(bg)),
+                        });
+                    }
+                }
                 let sel_bg = style_bg(&view.visual).unwrap_or(0x33_47_5b);
                 let search_bg = style_bg(&view.search_style).unwrap_or(0x6a_5a_1a);
                 let inc_bg = style_bg(&view.incsearch_style).unwrap_or(0x8a_6d_1a);

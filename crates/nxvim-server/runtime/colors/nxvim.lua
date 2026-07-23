@@ -140,7 +140,9 @@ hl(0, "@markup.strikethrough", { strikethrough = true })
 -- fenced ```block``` reads as code via its per-language syntax colouring; the
 -- `@markup.raw.block` background additionally backs each fenced code-block line as a
 -- full-width `line_hl_group` region (the doc-float hover / completion / cmdline docs
--- surfaces paint it via the `line_bg` layer), and will back markdown-typed *buffers*.
+-- surfaces paint it via the `line_bg` layer), and backs markdown-typed *buffers* the
+-- same way (the treesitter `@markup.raw.block` capture feeds that `line_bg` layer, so
+-- the block tint survives on cells an injected token would otherwise overwrite).
 hl(0, "@markup.raw",         { fg = p.green, bg = p.cursor_line })
 hl(0, "@markup.raw.block",   { bg = p.cursor_line })
 hl(0, "@markup.link.label",  { fg = p.blue })

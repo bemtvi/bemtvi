@@ -866,6 +866,10 @@ fn render_window(
     let anim_signs: Vec<Option<DiagSign>>;
     let anim_search: SearchSpans;
     let anim_incsearch: IncSearchSpans;
+    // The line-background layer rides the band too (sliced to the visible window like
+    // the highlights), so a code block's tint slides with the text instead of jumping
+    // to the settled position. `(band_row, style)` pairs remapped to visible rows.
+    let anim_line_bg: Vec<(u16, nxvim_view::Style)>;
     let frame_lines: &[String];
     let frame_sel: &[Option<(u16, u16)>];
     let frame_secondary_sel: &SearchSpans;
@@ -892,6 +896,7 @@ fn render_window(
     // snapshots are initialized), like `frame_hl`.
     let frame_search: &SearchSpans;
     let frame_incsearch: &IncSearchSpans;
+    let frame_line_bg: &[(u16, nxvim_view::Style)];
     let cursor_row: u16;
     // 1-based buffer line the cursor sits on, used to compute relative numbers.
     // During a slide it tracks the interpolated cursor so the gutter stays in
@@ -1005,6 +1010,16 @@ fn render_window(
             // the highlights, so `hlsearch` stays lit on the moving text.
             anim_search = a.search.iter().skip(off).take(height).cloned().collect();
             anim_incsearch = a.incsearch.iter().skip(off).take(height).copied().collect();
+            // Remap band-row line backgrounds to visible screen rows: a `(band_row,
+            // style)` at `off <= band_row < off + height` lands at `band_row - off`.
+            anim_line_bg = a
+                .line_bg
+                .iter()
+                .filter_map(|&(brow, style)| {
+                    let br = brow as usize;
+                    (br >= off && br < off + height).then(|| ((br - off) as u16, style))
+                })
+                .collect();
             frame_lines = &anim_lines;
             frame_sel = &anim_sel;
             frame_secondary_sel = &anim_secondary_sel;
@@ -1019,6 +1034,7 @@ fn render_window(
             frame_signs = &anim_signs;
             frame_search = &anim_search;
             frame_incsearch = &anim_incsearch;
+            frame_line_bg = &anim_line_bg;
             // The cursor's row within the viewport and its buffer line (for relative
             // numbers) come from the band: `cur_row - off` rows down, and the band's
             // `numbers` at the cursor row gives the 1-based buffer line.
@@ -1040,6 +1056,7 @@ fn render_window(
             frame_signs = &win.diagnostics_signs;
             frame_search = &win.search;
             frame_incsearch = &win.incsearch;
+            frame_line_bg = &win.line_bg;
             cursor_row = win.cursor_row;
             current_line = win.cursor_line;
         }
@@ -1060,7 +1077,9 @@ fn render_window(
     // and overlays, so those all draw on top and syntax colouring composes with the
     // tint). Painted *before* the cursorline tint so the cursor's active line still
     // wins on a row that carries both. Rows the server didn't mark add nothing.
-    for &(brow, style) in &win.line_bg {
+    // During a slide this is the band's line background (sliced to the visible rows),
+    // so the tint slides with the text instead of jumping to the settled position.
+    for &(brow, style) in frame_line_bg {
         let row = text_area.y + brow.min(text_area.height.saturating_sub(1));
         let line_area = Rect {
             x: text_area.x,

@@ -1383,6 +1383,69 @@ fn search_matches_keep_highlighting_while_the_view_slides() {
     );
 }
 
+#[test]
+fn the_line_background_slides_with_the_band_instead_of_settling_early() {
+    // Regression: a code block's `line_bg` tint must ride the scroll band, not stay
+    // at the settled window position (TUI jumped the tint to its final row) or vanish
+    // (GUI). The band carries its own `line_bg` (band-row indexed); the client must
+    // paint *that* while sliding, ignoring the settled window's `line_bg`. Palette:
+    // entry 0 = the code-block bg (rides the band), entry 1 = a decoy the settled
+    // window carries but that must NOT show mid-slide.
+    let styles = Value::Array(vec![
+        style(vec![("bg", rgb(0x30, 0x32, 0x44))]), // 0: block bg
+        style(vec![("bg", rgb(0xaa, 0x00, 0x00))]), // 1: settled-window decoy
+    ]);
+    // Band line background on band row 1 (→ screen row 1 at t≈0, off=0).
+    let band_line_bg = Value::Array(vec![Value::Array(vec![
+        Value::from(1u64),
+        Value::from(0u64),
+    ])]);
+    let scroll = Value::Map(vec![
+        (Value::from("from_row"), Value::from(0u64)),
+        (Value::from("to_row"), Value::from(3u64)),
+        (Value::from("from_cursor_row"), Value::from(0u64)),
+        (Value::from("to_cursor_row"), Value::from(3u64)),
+        (Value::from("duration_ms"), Value::from(10_000u64)), // long: paint at t≈0
+        (
+            Value::from("lines"),
+            lines(&["l0", "l1", "l2", "l3", "l4", "l5", "l6", "l7"]),
+        ),
+        (Value::from("line_bg"), band_line_bg),
+    ]);
+    // The settled window carries a *different* line_bg (row 2, decoy palette 1). It
+    // must not be painted while the slide is in flight.
+    let win_line_bg = Value::Array(vec![Value::Array(vec![
+        Value::from(2u64),
+        Value::from(1u64),
+    ])]);
+    let params = redraw(vec![
+        ("lines", lines(&["l3", "l4", "l5"])),
+        ("styles", styles),
+        ("line_bg", win_line_bg),
+        ("scroll", scroll),
+    ]);
+
+    let mut client = ScrollHarness::new();
+    client.on_redraw(&params);
+    assert!(client.animating(), "a non-zero scroll gesture must animate");
+
+    let buf = client.paint(20, 10);
+    // The band's tint paints on its sliding row (full window width, so any column
+    // carries it) — without the fix the band `line_bg` is dropped and this is `None`.
+    assert_eq!(
+        bg(&buf, 5, 1),
+        Some(Color::Rgb(0x30, 0x32, 0x44)),
+        "the code-block background rides the sliding band at row 1"
+    );
+    // The settled window's line_bg must NOT show mid-slide (it would be the jump /
+    // wrong-position bug).
+    assert_ne!(
+        bg(&buf, 5, 2),
+        Some(Color::Rgb(0xaa, 0x00, 0x00)),
+        "the settled window line_bg must not paint while the band slides"
+    );
+}
+
 /// Build a `tabline` array value from `(label, modified, window_count)` triples.
 fn tabline(tabs: &[(&str, bool, u64)]) -> Value {
     Value::Array(

@@ -350,6 +350,19 @@ impl EditHost {
                 })
                 .or_insert((group, m.priority));
         }
+        // Treesitter line-background lines (a markdown fenced code block's
+        // `@markup.raw.block`) tint the whole line the same way a `line_hl_group`
+        // extmark does — the block background the winner-takes-cell syntax merge
+        // otherwise drops on tokenized cells. A real `line_hl_group` extmark on the
+        // same line already present above wins (it was set explicitly); these fill in
+        // the rest at the treesitter priority.
+        if let Some(st) = self.syntax_states.get(&buffer) {
+            for &line in &st.block_bg_lines {
+                by_line
+                    .entry(line)
+                    .or_insert(("@markup.raw.block", nxvim_core::TS_HL_PRIORITY));
+            }
+        }
         if by_line.is_empty() {
             return empty();
         }

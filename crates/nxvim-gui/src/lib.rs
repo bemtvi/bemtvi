@@ -588,6 +588,9 @@ struct ScrollAnim {
     /// squiggles and signs slide with the text instead of blanking for the slide.
     diagnostics: Vec<Vec<DiagSpan>>,
     diagnostics_signs: Vec<Option<DiagSign>>,
+    /// The line-background layer for the band as `(band_row, style)`, so a code
+    /// block's tint slides with the text instead of vanishing for the slide.
+    line_bg: Vec<(u16, Style)>,
     styles: Vec<Style>,
 }
 
@@ -614,6 +617,7 @@ impl ScrollAnim {
             virt_lines: s.virt_lines.clone(),
             diagnostics: s.diagnostics.clone(),
             diagnostics_signs: s.diagnostics_signs.clone(),
+            line_bg: s.line_bg.clone(),
             styles: s.styles.clone(),
         }
     }
@@ -652,6 +656,7 @@ impl ScrollAnim {
             virt_lines: &self.virt_lines,
             diagnostics: &self.diagnostics,
             diagnostics_signs: &self.diagnostics_signs,
+            line_bg: &self.line_bg,
             styles: &self.styles,
         }
     }

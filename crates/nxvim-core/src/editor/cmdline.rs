@@ -11,6 +11,9 @@ impl Editor {
         // `'<` / `'>` selection marks and prefills the line with `'<,'>` so the
         // typed command (`:'<,'>d`, `:'<,'>s/…`) addresses exactly those lines.
         let from_visual = self.mode.is_visual();
+        // Keep the selection painted while the `:'<,'>` line is being typed (vim
+        // leaves it highlighted); the cursor/anchor stay put, so it renders static.
+        self.cmdline_from_visual = from_visual.then_some(self.mode);
         if from_visual {
             self.record_visual_marks();
         }
@@ -34,6 +37,7 @@ impl Editor {
     /// (`3/foo` finds the 3rd match), stashed for submit since `reset_pending`
     /// clears it.
     pub(crate) fn enter_search(&mut self, dir: SearchDir, count: usize) {
+        self.cmdline_from_visual = self.mode.is_visual().then_some(self.mode);
         self.cmdline_return_mode = self.search_return_mode();
         self.mode = Mode::Command;
         self.cmdline.clear();
@@ -337,6 +341,7 @@ impl Editor {
         complete_docs: bool,
     ) {
         self.cmdline_return_mode = Mode::Normal;
+        self.cmdline_from_visual = None;
         self.mode = Mode::Command;
         self.cmdline = default;
         self.cmdline_col = self.cmdline.len();
@@ -364,6 +369,7 @@ impl Editor {
     /// when it drains a queued confirm request.
     pub fn open_confirm(&mut self, label: String, accelerators: Vec<String>, default: i64) {
         self.cmdline_return_mode = Mode::Normal;
+        self.cmdline_from_visual = None;
         self.mode = Mode::Command;
         self.cmdline.clear();
         self.cmdline_col = 0;

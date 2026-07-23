@@ -220,6 +220,23 @@ async fn escaping_a_visual_search_restores_the_original_selection() {
 }
 
 #[tokio::test]
+async fn ex_command_from_visual_keeps_the_selection_visible() {
+    let (rpc, mut incoming) = start(None).await;
+    feed(&rpc, "ifoo<CR>bar<Esc>gg0");
+    // Select the first two chars, then open a `:` command line over the selection.
+    // vim leaves the selection highlighted while the `:'<,'>` line is being typed.
+    feed(&rpc, "vl:");
+    let _ = lines(&rpc).await; // barrier so the redraw is buffered
+    let view = latest_view(&mut incoming).expect("a redraw view");
+
+    // The command line is open (`:'<,'>` prefilled) but the selection persists.
+    assert_eq!(mode(&rpc).await, "c", "in command-line mode");
+    let sel = view_selection(&view);
+    assert_eq!(sel.first().copied().flatten(), Some((0, 2)));
+    assert!(sel.iter().skip(1).all(Option::is_none));
+}
+
+#[tokio::test]
 async fn leaving_visual_mode_clears_the_selection() {
     let (rpc, mut incoming) = start(None).await;
     feed(&rpc, "ihello<Esc>");

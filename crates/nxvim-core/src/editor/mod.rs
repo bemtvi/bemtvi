@@ -769,6 +769,15 @@ pub struct Editor {
     /// but a `/`-search opened from [`Mode::MultiCursor`] returns there, so you can
     /// `/`-navigate to a match and keep dropping cursors. Set on entry.
     cmdline_return_mode: Mode,
+    /// The visual mode a [`Mode::Command`] line was opened *from* ([`Mode::Visual`]
+    /// / [`Mode::VisualLine`]), or `None` when it wasn't opened over a selection.
+    /// vim keeps the selection painted while the command line is open — both a
+    /// `/`,`?` search (whose moving end tracks the incsearch preview) and a `:` ex
+    /// command (`:'<,'>…`, static selection) — so [`Self::rendered_visual_mode`]
+    /// consults this to keep the selection visible. Distinct from
+    /// [`Self::cmdline_return_mode`], which governs the *restore* mode on close (a
+    /// `:` returns to Normal, unlike a search). Set on entry.
+    cmdline_from_visual: Option<Mode>,
     /// The label shown ahead of the command line for a [`CmdlineKind::Prompt`]
     /// (`vim.ui.input`'s `opts.prompt`); empty for `:`/`/`/`?` (those use the
     /// single-char [`Editor::cmdline_prefix`]). Cleared when the prompt closes.
@@ -1718,6 +1727,7 @@ impl Editor {
             cmdline_col: 0,
             cmdline_kind: CmdlineKind::Ex,
             cmdline_return_mode: Mode::Normal,
+            cmdline_from_visual: None,
             cmdline_prompt: String::new(),
             prompt_results: Vec::new(),
             confirm_accelerators: Vec::new(),
@@ -2403,11 +2413,12 @@ impl Editor {
     }
 
     /// The visual mode governing the rendered selection, or `None` when none
-    /// should show. Normally just [`Self::mode`] when it's visual — but a `/`,`?`
-    /// search *opened from* Visual keeps the selection live (it returns to that
-    /// mode on `<CR>`), so while the search command line is open the selection
-    /// still renders, extended to the incsearch preview at [`Self::cursor`]. Drives
-    /// the View's selection highlight.
+    /// should show. Normally just [`Self::mode`] when it's visual — but a command
+    /// line *opened from* Visual keeps the selection painted while it's open, so
+    /// [`Self::cmdline_from_visual`] carries the originating mode: a `/`,`?` search
+    /// (its moving end tracks the incsearch preview at [`Self::cursor`]) and a `:`
+    /// ex command (`:'<,'>…`, a static selection — the cursor/anchor don't move)
+    /// both keep it lit. Drives the View's selection highlight.
     pub(crate) fn rendered_visual_mode(&self) -> Option<Mode> {
         if self.mode.is_visual() {
             return Some(self.mode);
@@ -2422,9 +2433,10 @@ impl Editor {
                 Mode::Visual
             });
         }
-        let searching =
-            self.mode == Mode::Command && matches!(self.cmdline_kind, CmdlineKind::Search(_));
-        (searching && self.cmdline_return_mode.is_visual()).then_some(self.cmdline_return_mode)
+        if self.mode == Mode::Command {
+            return self.cmdline_from_visual;
+        }
+        None
     }
 
     // ----- pending-state mirror (vim.v.*) ----------------------------------

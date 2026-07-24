@@ -2987,6 +2987,80 @@ async fn builtin_native_sources_drive_without_config() {
     );
 }
 
+/// The `keymaps` picker also lists the CURRENT buffer's buffer-local maps (not just
+/// the globals), so a plugin's on-buffer bindings are discoverable while its buffer
+/// is focused — the "what does `a` do in the tree?" case. A buffer-local map shadows
+/// a global one at the same lhs, and buffer-local rows carry a `@` marker.
+#[tokio::test]
+async fn keymaps_picker_lists_buffer_local_and_shadows_globals() {
+    let dir = temp_dir("picker_keymaps_buflocal");
+    let (rpc, mut incoming) = start(&dir, "").await;
+
+    // A plugin-style buffer-local map on the current buffer (the `a` → create case),
+    // a GLOBAL map at `gx`, and a BUFFER-LOCAL map at the same `gx` that must shadow
+    // the global (only the binding that actually fires should appear).
+    exec_lua(
+        &rpc,
+        "nx.keymap.set('n', 'aa', function() end, \
+           { buffer = 0, desc = 'nxvim-tree: Create a file' })
+         nx.keymap.set('n', 'gx', function() end, { desc = 'global probe' })
+         nx.keymap.set('n', 'gx', function() end, \
+           { buffer = 0, desc = 'buflocal shadow probe' })",
+    )
+    .await;
+
+    // The buffer-local plugin map is discoverable: filter to it and it shows with the
+    // `@` buffer-local marker and its friendly description.
+    exec_lua(&rpc, "nx.picker.open('keymaps')").await;
+    poll_menu(&rpc, &mut incoming).await.expect("keymaps opens");
+    feed(&rpc, "Create");
+    let mut rows = Vec::new();
+    for _ in 0..40 {
+        if let Some(m) = poll_menu(&rpc, &mut incoming).await {
+            rows = menu_items(&menu_of(&m));
+            if rows.iter().any(|r| r.contains("Create a file")) {
+                break;
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert!(
+        rows.iter().any(|r| r.contains("@")
+            && r.contains("aa")
+            && r.contains("nxvim-tree: Create a file")),
+        "the buffer-local plugin map shows with a @ marker and friendly desc, got {rows:?}"
+    );
+    feed(&rpc, "<Esc>");
+
+    // Shadowing: `gx` has both a global and a buffer-local map. Only the buffer-local
+    // one (which is what fires) appears — the global `gx` is dropped.
+    exec_lua(&rpc, "nx.picker.open('keymaps')").await;
+    poll_menu(&rpc, &mut incoming)
+        .await
+        .expect("keymaps reopens");
+    feed(&rpc, "gx");
+    let mut rows = Vec::new();
+    for _ in 0..40 {
+        if let Some(m) = poll_menu(&rpc, &mut incoming).await {
+            rows = menu_items(&menu_of(&m));
+            if rows.iter().any(|r| r.contains("gx")) {
+                break;
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    let gx: Vec<&String> = rows.iter().filter(|r| r.contains("gx")).collect();
+    assert!(
+        gx.iter().any(|r| r.contains("buflocal shadow probe")),
+        "the buffer-local gx map is listed, got {rows:?}"
+    );
+    assert!(
+        !gx.iter().any(|r| r.contains("global probe")),
+        "the global gx map is shadowed by the buffer-local one and not listed, got {rows:?}"
+    );
+    feed(&rpc, "<Esc>");
+}
+
 /// `nx.mark.list` reads the server-pushed `nx._marks` mirror, and the built-in
 /// `marks` picker lists + jumps to a set mark. Bare server, driven for real:
 /// set mark `a` on a distinct line, confirm it via the picker, cursor lands there.

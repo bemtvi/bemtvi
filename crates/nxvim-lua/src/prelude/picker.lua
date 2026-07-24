@@ -848,23 +848,46 @@ nx.picker.source({
   end,
 })
 
--- keymaps: every global mapping in normal / visual / insert mode (telescope's
--- `keymaps`), read from `nx.keymap.get`. The displayed `lhs` runs through
--- `nx.keytrans` so special keys read as notation (a space leader shows `<Space>`,
--- not a hard-to-see literal blank; likewise `<Tab>`, `<C-x>`, …); the raw `lhs` is
--- kept for the confirm feed. Confirm re-feeds it with remapping on, so picking a
--- mapping *runs* it, exactly like telescope.
+-- keymaps: every mapping that applies right now, across normal / visual / insert
+-- mode (telescope's `keymaps`). This lists BOTH the current buffer's buffer-local
+-- maps AND the global ones — so a plugin's on-buffer bindings are discoverable while
+-- its buffer is focused (e.g. focus the nxvim-tree sidebar and `a` shows as
+-- "nxvim-tree: Create a file"). A buffer-local map shadows a global one at the same
+-- lhs+mode, so only the binding that would actually fire is shown; buffer-local rows
+-- are flagged with a `@` marker in the mode column.
+--
+-- Filter-by-plugin is a `desc` convention rather than a new registry field: a plugin
+-- prefixes each description with `"<plugin>: "` (`nxvim-tree`, `nx.complete`, …), so
+-- typing the plugin name in the prompt narrows the list to its maps — the prefix is
+-- part of the fuzzy-matched row text.
+--
+-- The displayed `lhs` runs through `nx.keytrans` so special keys read as notation (a
+-- space leader shows `<Space>`, not a hard-to-see literal blank; likewise `<Tab>`,
+-- `<C-x>`, …); the raw `lhs` is kept for the confirm feed. Confirm re-feeds it with
+-- remapping on, so picking a mapping *runs* it, exactly like telescope.
 nx.picker.source({
   name = "keymaps",
   title = "Keymaps",
   layer = "main",
   items = function(ctx)
+    local buf = nx._resolve_bufnr(0)
+    local function push(mode, k, local_marker)
+      ctx.push({
+        text = string.format("%s%s %-16s %s", mode, local_marker, nx.keytrans(k.lhs), k.desc or ""),
+        lhs = k.lhs,
+      })
+    end
     for _, mode in ipairs({ "n", "v", "i" }) do
+      -- Buffer-local first, recording each lhs so the matching global is skipped.
+      local shadowed = {}
+      for _, k in ipairs(nx.keymap.buf_get(buf, mode)) do
+        shadowed[k.lhs] = true
+        push(mode, k, "@")
+      end
       for _, k in ipairs(nx.keymap.get(mode)) do
-        ctx.push({
-          text = string.format("%s  %-16s %s", mode, nx.keytrans(k.lhs), k.desc or ""),
-          lhs = k.lhs,
-        })
+        if not shadowed[k.lhs] then
+          push(mode, k, " ")
+        end
       end
     end
   end,

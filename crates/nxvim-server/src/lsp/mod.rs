@@ -325,6 +325,12 @@ pub(crate) struct PendingLspReq {
     /// action return edits computed against this text; applying them after any
     /// edit would corrupt the buffer). Unused by the cursor-based kinds.
     pub(crate) tick: u64,
+    /// The `nx._cb_fns` id that settles the issuing verb's promise, or `0` for a
+    /// fire-and-forget request (an internal refresh, an auto-trigger, or a keymap
+    /// verb the user didn't `:next` on). Carried so a **superseding** request of
+    /// the same `kind` can settle the promise it replaces (resolve `nil`), and the
+    /// reply can settle it on apply. Mirrors [`ReqToken::cb_id`].
+    pub(crate) cb_id: u64,
 }
 
 /// The negotiated runtime state of one server, learned from its `initialize`

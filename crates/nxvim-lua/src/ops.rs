@@ -272,17 +272,35 @@ pub enum LspOp {
     BufRequest {
         /// `LspReqKind::as_u16` of the position-family feature to request.
         kind: u16,
+        /// The `nx._cb_fns` id that settles the verb's promise when the reply lands
+        /// (`0` = fire-and-forget, no promise). The async verbs pass a real id so a
+        /// chain can run after the jump/picker/float is presented; see
+        /// [`CallbackArgs::LspReply`].
+        cb_id: u64,
     },
     /// `nx.lsp.format()` — request `textDocument/formatting`.
-    Format,
+    Format {
+        /// The `nx._cb_fns` id that settles the promise once the edits apply (`0` =
+        /// fire-and-forget).
+        cb_id: u64,
+    },
     /// `nx.lsp.rename(name)` — request `textDocument/rename` with `new_name`.
     Rename {
         /// The new identifier (the required argument; `nx.lsp.rename()` with no name
         /// prompts via `nx.ui.input` in Lua, so a non-empty name always reaches here).
         new_name: String,
+        /// The `nx._cb_fns` id that settles the promise once the workspace edit
+        /// applies (`0` = fire-and-forget).
+        cb_id: u64,
     },
     /// `nx.lsp.code_action()` — request `textDocument/codeAction` at the cursor.
-    CodeAction,
+    CodeAction {
+        /// The `nx._cb_fns` id that settles the promise (`0` = fire-and-forget). Unlike
+        /// the other verbs the reply only *opens the chooser menu*; the promise settles
+        /// later — once the user picks an action and its edit applies (through a
+        /// `codeAction/resolve` round-trip if lazy), or `nil` if the menu is cancelled.
+        cb_id: u64,
+    },
     /// `nx.lsp.signature_help_autotrigger(enable)` — opt into (or out of) auto-showing
     /// signature help as you type a call, driven by the server's advertised trigger
     /// chars. The server latches the flag and pushes the trigger set into core.
@@ -428,6 +446,9 @@ pub enum LspOp {
     WorkspaceSymbol {
         /// The symbol search query (may be empty — some servers return everything).
         query: String,
+        /// The `nx._cb_fns` id that settles the promise with the matched symbol items
+        /// once the reply lands (`0` = fire-and-forget).
+        cb_id: u64,
     },
 }
 

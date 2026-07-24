@@ -1131,6 +1131,14 @@ pub struct EditHost {
     /// Mutually exclusive with `pending_ui_select` / `picker_active`: one widget at a time.
     #[cfg(feature = "native")]
     pending_code_action: bool,
+    /// The async `nx.lsp.code_action()` promise's `nx._cb_fns` id, stashed while the
+    /// chooser menu is open (`0` = none / a fire-and-forget request). Set alongside
+    /// `pending_code_action` when the menu opens; settled (resolve `nil`) when the
+    /// picked action's edit applies — through a `codeAction/resolve` round-trip if the
+    /// action is lazy — or when the menu is cancelled. Set only on the native confirm
+    /// path, but the field is unconditional so `apply_code_action` (not cfg-gated)
+    /// compiles under the wasm edit-host too.
+    code_action_cb: u64,
     /// The picker preview pane's read cache (Phase 3): the file last read for the
     /// preview, so moving the selection within the results — or simply re-projecting
     /// every frame — re-reads only when the selected row's target *path* changes.
@@ -1423,6 +1431,7 @@ impl EditHost {
             pending_ui_select: None,
             #[cfg(feature = "native")]
             pending_code_action: false,
+            code_action_cb: 0,
             picker_active: false,
             preview_cache: redraw::PreviewCache::default(),
             preview_scroll: 0,

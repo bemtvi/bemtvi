@@ -33,22 +33,25 @@ impl EditHost {
                 self.restart_lsp_servers(&name, init_options, settings, capabilities);
                 return;
             }
-            LspOp::BufRequest { kind } => {
-                if let Some(kind) = LspReqKind::from_u16(kind) {
-                    self.request_lsp(kind);
+            LspOp::BufRequest { kind, cb_id } => {
+                match LspReqKind::from_u16(kind) {
+                    Some(kind) => self.request_lsp(kind, cb_id),
+                    // An unknown kind can't be issued — settle its promise (resolve
+                    // `nil`) rather than leak it.
+                    None => self.settle_lsp_promise(cb_id, serde_json::Value::Null),
                 }
                 return;
             }
-            LspOp::Format => {
-                self.request_lsp_format();
+            LspOp::Format { cb_id } => {
+                self.request_lsp_format(cb_id);
                 return;
             }
-            LspOp::Rename { new_name } => {
-                self.request_lsp_rename(&new_name);
+            LspOp::Rename { new_name, cb_id } => {
+                self.request_lsp_rename(&new_name, cb_id);
                 return;
             }
-            LspOp::CodeAction => {
-                self.request_lsp_code_action();
+            LspOp::CodeAction { cb_id } => {
+                self.request_lsp_code_action(cb_id);
                 return;
             }
             LspOp::SignatureAutoTrigger { enable } => {
@@ -58,8 +61,8 @@ impl EditHost {
                 self.refresh_signature_autotrigger();
                 return;
             }
-            LspOp::WorkspaceSymbol { query } => {
-                self.request_lsp_workspace_symbol(&query);
+            LspOp::WorkspaceSymbol { query, cb_id } => {
+                self.request_lsp_workspace_symbol(&query, cb_id);
                 return;
             }
             LspOp::DiagnosticGoto { forward, severity } => {

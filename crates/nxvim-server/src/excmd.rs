@@ -94,20 +94,22 @@ impl EditHost {
             },
             // Phase-3: go-to / references as ex-commands (the keymap-free path;
             // the reply jumps the cursor or opens a panel location list).
-            "LspDefinition" => self.request_lsp(LspReqKind::Definition),
-            "LspDeclaration" => self.request_lsp(LspReqKind::Declaration),
-            "LspTypeDefinition" => self.request_lsp(LspReqKind::TypeDefinition),
-            "LspImplementation" => self.request_lsp(LspReqKind::Implementation),
-            "LspReferences" => self.request_lsp(LspReqKind::References),
+            // The ex-command path is fire-and-forget (no Lua promise), so each
+            // passes `cb_id = 0`.
+            "LspDefinition" => self.request_lsp(LspReqKind::Definition, 0),
+            "LspDeclaration" => self.request_lsp(LspReqKind::Declaration, 0),
+            "LspTypeDefinition" => self.request_lsp(LspReqKind::TypeDefinition, 0),
+            "LspImplementation" => self.request_lsp(LspReqKind::Implementation, 0),
+            "LspReferences" => self.request_lsp(LspReqKind::References, 0),
             // Phase-4: hover docs into the panel, signature help on the message
             // line (the keymap-free path for `K` / `<C-k>`).
-            "LspHover" => self.request_lsp(LspReqKind::Hover),
-            "LspSignatureHelp" => self.request_lsp(LspReqKind::SignatureHelp),
+            "LspHover" => self.request_lsp(LspReqKind::Hover, 0),
+            "LspSignatureHelp" => self.request_lsp(LspReqKind::SignatureHelp, 0),
             // Phase-6: buffer-mutating features. Format/code-action take no
             // argument; rename reads the new name the dispatcher split off — or,
             // with no name, prompts for it through `vim.lsp.buf.rename()`
             // (`vim.ui.input`, Phase 8) instead of erroring.
-            "LspFormat" => self.request_lsp_format(),
+            "LspFormat" => self.request_lsp_format(0),
             "LspRename" if args.trim().is_empty() => {
                 if let Err(e) = self.lua.exec("vim.lsp.buf.rename()") {
                     self.editor
@@ -115,8 +117,8 @@ impl EditHost {
                 }
                 self.apply_lua_effects();
             }
-            "LspRename" => self.request_lsp_rename(args),
-            "LspCodeAction" => self.request_lsp_code_action(),
+            "LspRename" => self.request_lsp_rename(args, 0),
+            "LspCodeAction" => self.request_lsp_code_action(0),
             // `:au[tocmd]` / `:aug[roup]` / `:doau[tocmd]` (with abbreviations and
             // an optional `!`) drive the Lua autocmd registry. The core defers
             // them here; the prelude parses the argument line so the `:`-command

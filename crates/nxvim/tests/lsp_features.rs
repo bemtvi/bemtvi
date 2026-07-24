@@ -1229,3 +1229,481 @@ async fn lsp_folding_range_folds_the_buffer() {
 
     std::env::remove_var("NXVIM_LSP_CMD");
 }
+
+// ===== Phase 1: async `nx.lsp.*` verbs return promises ===================
+// docs/plans/2026-07-23-async-lsp-verbs.md — the verbs resolve when the round-trip
+// completes and its effect is applied/presented, so actions can be sequenced.
+
+/// `format()` returns a promise that resolves only AFTER the server's edits are
+/// applied: a `:next` continuation reads the buffer and sees the *formatted* text,
+/// proving the resolution happens post-apply (not when the request is merely sent).
+#[tokio::test]
+async fn format_promise_resolves_after_edits_apply() {
+    let _guard = serial_lock().lock().await;
+    let dir = temp_dir("lsp_async_fmt");
+    arm_mock(
+        &dir,
+        r#"{
+            "formatting": [
+                { "range": { "start": { "line": 0, "character": 0 }, "end": { "line": 0, "character": 8 } }, "newText": "let x = 1" }
+            ]
+        }"#,
+    );
+    let (rpc, _incoming) = open_with_server(&dir, "let  x=1\n").await;
+    assert!(
+        await_lua_eq(&rpc, "#nx.lsp.clients({ bufnr = 0 })", "1").await,
+        "the mock server should attach"
+    );
+
+    // Issue once; the reply lands async and settles the promise, whose continuation
+    // records the line text it sees at resolution time.
+    exec_lua(
+        &rpc,
+        r#"
+        _G.fmt_seen = nil
+        _G.fmt_done = false
+        nx.lsp.format():next(function()
+            _G.fmt_seen = (vim.api.nvim_buf_get_lines(0, 0, 1, false))[1]
+            _G.fmt_done = true
+        end)
+        "#,
+    )
+    .await;
+    assert!(
+        await_lua_eq(&rpc, "tostring(_G.fmt_done)", "true").await,
+        "the format promise should resolve"
+    );
+    assert_eq!(
+        exec_lua(&rpc, "return _G.fmt_seen").await.as_str(),
+        Some("let x = 1"),
+        "the continuation runs after the edits applied (it sees formatted text)"
+    );
+}
+
+/// `references()` resolves its promise with the `{ text, path, row, col }` item
+/// list — the same rows the picker shows — so a handler can consume the locations.
+#[tokio::test]
+async fn references_promise_resolves_with_the_item_list() {
+    let _guard = serial_lock().lock().await;
+    let dir = temp_dir("lsp_async_refs");
+    let uri = file_uri(&dir, "a.rs");
+    arm_mock(
+        &dir,
+        &format!(
+            r#"{{
+                "references": [
+                    {{ "uri": "{uri}", "range": {{ "start": {{ "line": 0, "character": 4 }}, "end": {{ "line": 0, "character": 7 }} }} }},
+                    {{ "uri": "{uri}", "range": {{ "start": {{ "line": 1, "character": 0 }}, "end": {{ "line": 1, "character": 3 }} }} }}
+                ]
+            }}"#
+        ),
+    );
+    let (rpc, _incoming) = open_with_server(&dir, "let foo = bar()\nfoo()\n").await;
+    assert!(
+        await_lua_eq(&rpc, "#nx.lsp.clients({ bufnr = 0 })", "1").await,
+        "the mock server should attach"
+    );
+
+    exec_lua(
+        &rpc,
+        r#"
+        _G.ref_items = nil
+        nx.lsp.references():next(function(items) _G.ref_items = items end)
+        "#,
+    )
+    .await;
+    assert!(
+        await_lua_eq(&rpc, "tostring(_G.ref_items and #_G.ref_items or 0)", "2").await,
+        "the references promise should resolve with 2 location items"
+    );
+    // Each item carries the fields a picker row / a `nx.picker.edit` jump needs.
+    assert!(
+        await_lua_eq(
+            &rpc,
+            "tostring(_G.ref_items[1].path ~= nil and _G.ref_items[1].row ~= nil and _G.ref_items[1].col ~= nil)",
+            "true"
+        )
+        .await,
+        "each resolved item should carry path/row/col"
+    );
+    assert!(
+        await_lua_eq(
+            &rpc,
+            "tostring(string.find(_G.ref_items[1].path, 'a.rs', 1, true) ~= nil)",
+            "true"
+        )
+        .await,
+        "the item path should be the referenced file"
+    );
+}
+
+/// The headline: two edit verbs run in SEQUENCE — `format():next(-> rename())` runs
+/// the rename only after the format edits land, and the final `:next` only after the
+/// rename lands. The continuations witness the buffer at each step, proving ordering.
+#[tokio::test]
+async fn edit_verbs_chain_in_sequence() {
+    let _guard = serial_lock().lock().await;
+    let dir = temp_dir("lsp_async_chain");
+    let uri = file_uri(&dir, "a.rs");
+    // format rewrites line 1 ("x" -> "y"); rename rewrites "foo" -> "bar" on line 0.
+    // The two touch different lines so each edit's range stays valid at apply time.
+    arm_mock(
+        &dir,
+        &format!(
+            r#"{{
+                "formatting": [
+                    {{ "range": {{ "start": {{ "line": 1, "character": 0 }}, "end": {{ "line": 1, "character": 1 }} }}, "newText": "y" }}
+                ],
+                "rename": {{
+                    "changes": {{
+                        "{uri}": [
+                            {{ "range": {{ "start": {{ "line": 0, "character": 0 }}, "end": {{ "line": 0, "character": 3 }} }}, "newText": "bar" }}
+                        ]
+                    }}
+                }}
+            }}"#
+        ),
+    );
+    let (rpc, _incoming) = open_with_server(&dir, "foo\nx\n").await;
+    assert!(
+        await_lua_eq(&rpc, "#nx.lsp.clients({ bufnr = 0 })", "1").await,
+        "the mock server should attach"
+    );
+
+    exec_lua(
+        &rpc,
+        r#"
+        _G.chain = {}
+        local function snap()
+            return table.concat(vim.api.nvim_buf_get_lines(0, 0, -1, false), "|")
+        end
+        nx.lsp.format():next(function()
+            table.insert(_G.chain, snap())      -- after format, before rename
+            return nx.lsp.rename("bar")
+        end):next(function()
+            table.insert(_G.chain, snap())      -- after rename
+        end)
+        "#,
+    )
+    .await;
+    assert!(
+        await_lua_eq(&rpc, "tostring(#_G.chain)", "2").await,
+        "both continuations should run (rename ran after format's promise resolved)"
+    );
+    // Step 1 sees format applied (x->y) but NOT yet the rename; step 2 sees both.
+    assert_eq!(
+        exec_lua(&rpc, "return _G.chain[1]").await.as_str(),
+        Some("foo|y"),
+        "the first continuation sees the format applied and the rename not yet"
+    );
+    assert_eq!(
+        exec_lua(&rpc, "return _G.chain[2]").await.as_str(),
+        Some("bar|y"),
+        "the second continuation sees the rename applied on top of the format"
+    );
+    assert_eq!(
+        lines(&rpc).await,
+        vec!["bar", "y"],
+        "the buffer reflects both edits, applied in order"
+    );
+}
+
+/// A superseded request settles its promise (resolve `nil`) rather than hanging:
+/// two `references()` calls in one tick — the second bumps the generation, so the
+/// first's promise resolves `nil` at supersede time while the second resolves with
+/// the items.
+#[tokio::test]
+async fn superseded_request_settles_its_promise() {
+    let _guard = serial_lock().lock().await;
+    let dir = temp_dir("lsp_async_supersede");
+    let uri = file_uri(&dir, "a.rs");
+    arm_mock(
+        &dir,
+        &format!(
+            r#"{{
+                "references": [
+                    {{ "uri": "{uri}", "range": {{ "start": {{ "line": 0, "character": 0 }}, "end": {{ "line": 0, "character": 3 }} }} }}
+                ]
+            }}"#
+        ),
+    );
+    let (rpc, _incoming) = open_with_server(&dir, "foo\nbar\n").await;
+    assert!(
+        await_lua_eq(&rpc, "#nx.lsp.clients({ bufnr = 0 })", "1").await,
+        "the mock server should attach"
+    );
+
+    exec_lua(
+        &rpc,
+        r#"
+        _G.sup_a = false          -- first (superseded) request's promise
+        _G.sup_b = "unset"        -- second (live) request's promise
+        nx.lsp.references():next(function() _G.sup_a = true end)
+        nx.lsp.references():next(function(items) _G.sup_b = items end)
+        "#,
+    )
+    .await;
+    assert!(
+        await_lua_eq(&rpc, "tostring(_G.sup_a)", "true").await,
+        "the superseded request's promise should still settle (resolve nil)"
+    );
+    assert!(
+        await_lua_eq(
+            &rpc,
+            "tostring((type(_G.sup_b) == 'table') and #_G.sup_b or -1)",
+            "1"
+        )
+        .await,
+        "the live request's promise should resolve with the item list"
+    );
+}
+
+/// A verb issued with no language server attached settles its promise (resolve
+/// `nil`) instead of hanging forever — so a chain built on it still proceeds.
+#[tokio::test]
+async fn verb_with_no_server_resolves_nil() {
+    let _guard = serial_lock().lock().await;
+    let dir = temp_dir("lsp_async_noserver");
+    // No mock, no `nx.lsp.enable` — the buffer has no server attached.
+    std::env::remove_var("NXVIM_LSP_CMD");
+    let file_path = dir.join("a.txt");
+    std::fs::write(&file_path, "hello\n").expect("write test file");
+    let init = ServerInit {
+        file: Some(file_path.to_string_lossy().into_owned()),
+        ..Default::default()
+    };
+    let (rpc, _incoming) = spawn(init);
+    attach(&rpc, 80, 24).await;
+
+    exec_lua(
+        &rpc,
+        r#"
+        _G.ns_done = false
+        _G.ns_res = "unset"
+        nx.lsp.format():next(function(res)
+            _G.ns_res = res
+            _G.ns_done = true
+        end)
+        "#,
+    )
+    .await;
+    assert!(
+        await_lua_eq(&rpc, "tostring(_G.ns_done)", "true").await,
+        "the promise should settle even with no server attached"
+    );
+    assert!(
+        exec_lua(&rpc, "return _G.ns_res == nil").await.as_bool() == Some(true),
+        "with no server the verb resolves nil"
+    );
+}
+
+// ===== Phase 2: async `code_action` — resolves after the picked edit applies =====
+// docs/plans/2026-07-23-async-lsp-verbs.md. Unlike the other verbs the reply only
+// opens the chooser; the promise settles on the user's pick + apply (or nil on cancel).
+
+/// The headline: `code_action():next(-> format())` chains — the format runs only
+/// after the chosen code action's edit applies, and the final `:next` only after the
+/// format lands. Proves the code-action promise settles post-apply (chainable), the
+/// "organize imports then format" pattern.
+#[tokio::test]
+async fn code_action_chains_into_format() {
+    let _guard = serial_lock().lock().await;
+    let dir = temp_dir("lsp_async_ca_chain");
+    let uri = file_uri(&dir, "a.rs");
+    // code action rewrites line 0 (foo -> bar, eager edit); format rewrites line 1
+    // (x -> y). Different lines so each edit's range stays valid at apply time.
+    arm_mock(
+        &dir,
+        &format!(
+            r#"{{
+                "code_action": [
+                    {{
+                        "title": "Rename foo to bar",
+                        "edit": {{ "changes": {{ "{uri}": [
+                            {{ "range": {{ "start": {{ "line": 0, "character": 0 }}, "end": {{ "line": 0, "character": 3 }} }}, "newText": "bar" }}
+                        ] }} }}
+                    }}
+                ],
+                "formatting": [
+                    {{ "range": {{ "start": {{ "line": 1, "character": 0 }}, "end": {{ "line": 1, "character": 1 }} }}, "newText": "y" }}
+                ]
+            }}"#
+        ),
+    );
+    let (rpc, mut incoming) = open_with_server(&dir, "foo\nx\n").await;
+    assert!(
+        await_lua_eq(&rpc, "#nx.lsp.clients({ bufnr = 0 })", "1").await,
+        "the mock server should attach"
+    );
+
+    // Issue once, chaining format after the code action. The chooser opens; picking
+    // the row applies the edit and settles the promise, running the chain.
+    exec_lua(
+        &rpc,
+        r#"
+        _G.chain2 = {}
+        local function snap()
+            return table.concat(vim.api.nvim_buf_get_lines(0, 0, -1, false), "|")
+        end
+        nx.lsp.code_action():next(function()
+            table.insert(_G.chain2, snap())     -- after the code action, before format
+            return nx.lsp.format()
+        end):next(function()
+            table.insert(_G.chain2, snap())     -- after format
+        end)
+        "#,
+    )
+    .await;
+    // Wait for the chooser to list the action, then pick it (noselect ⇒ highlight first).
+    let listed = poll_menu_items(&rpc, &mut incoming)
+        .await
+        .is_some_and(|rows| rows.iter().any(|r| r.contains("Rename foo to bar")));
+    assert!(listed, "the code action should appear in the chooser");
+    feed(&rpc, "<C-n>");
+    feed(&rpc, "<CR>");
+
+    assert!(
+        await_lua_eq(&rpc, "tostring(#_G.chain2)", "2").await,
+        "both continuations should run (format ran after the code action's promise resolved)"
+    );
+    assert_eq!(
+        exec_lua(&rpc, "return _G.chain2[1]").await.as_str(),
+        Some("bar|x"),
+        "the first continuation sees the code action applied, format not yet"
+    );
+    assert_eq!(
+        exec_lua(&rpc, "return _G.chain2[2]").await.as_str(),
+        Some("bar|y"),
+        "the second continuation sees the format applied on top of the code action"
+    );
+    assert_eq!(
+        lines(&rpc).await,
+        vec!["bar", "y"],
+        "the buffer reflects both edits, applied in order"
+    );
+}
+
+/// A LAZY code action (no eager edit, resolved via `codeAction/resolve`) settles its
+/// promise only after the resolve round-trip lands and applies the edit.
+#[tokio::test]
+async fn code_action_lazy_resolve_settles_after_the_roundtrip() {
+    let _guard = serial_lock().lock().await;
+    let dir = temp_dir("lsp_async_ca_lazy");
+    let uri = file_uri(&dir, "a.rs");
+    arm_mock(
+        &dir,
+        &format!(
+            r#"{{
+                "code_action": [
+                    {{ "title": "Lazy fix", "data": {{ "id": 1 }} }}
+                ],
+                "code_action_resolve": {{
+                    "title": "Lazy fix",
+                    "edit": {{ "changes": {{ "{uri}": [
+                        {{ "range": {{ "start": {{ "line": 0, "character": 4 }}, "end": {{ "line": 0, "character": 7 }} }}, "newText": "bar" }}
+                    ] }} }}
+                }}
+            }}"#
+        ),
+    );
+    let (rpc, mut incoming) = open_with_server(&dir, "let foo = 1\n").await;
+    assert!(
+        await_lua_eq(&rpc, "#nx.lsp.clients({ bufnr = 0 })", "1").await,
+        "the mock server should attach"
+    );
+
+    exec_lua(
+        &rpc,
+        r#"
+        _G.lazy_seen = nil
+        _G.lazy_done = false
+        nx.lsp.code_action():next(function()
+            _G.lazy_seen = (vim.api.nvim_buf_get_lines(0, 0, 1, false))[1]
+            _G.lazy_done = true
+        end)
+        "#,
+    )
+    .await;
+    let listed = poll_menu_items(&rpc, &mut incoming)
+        .await
+        .is_some_and(|rows| rows.iter().any(|r| r.contains("Lazy fix")));
+    assert!(listed, "the lazy code action should appear in the chooser");
+    feed(&rpc, "<C-n>");
+    feed(&rpc, "<CR>");
+
+    assert!(
+        await_lua_eq(&rpc, "tostring(_G.lazy_done)", "true").await,
+        "the lazy code action's promise should settle after the resolve round-trip"
+    );
+    assert_eq!(
+        exec_lua(&rpc, "return _G.lazy_seen").await.as_str(),
+        Some("let bar = 1"),
+        "the continuation runs after the resolved edit applied"
+    );
+}
+
+/// Cancelling the chooser (Esc) settles the promise with `nil` — a chain built on it
+/// still proceeds rather than hanging.
+#[tokio::test]
+async fn code_action_cancel_resolves_nil() {
+    let _guard = serial_lock().lock().await;
+    let dir = temp_dir("lsp_async_ca_cancel");
+    let uri = file_uri(&dir, "a.rs");
+    arm_mock(
+        &dir,
+        &format!(
+            r#"{{
+                "code_action": [
+                    {{
+                        "title": "Replace with bar",
+                        "edit": {{ "changes": {{ "{uri}": [
+                            {{ "range": {{ "start": {{ "line": 0, "character": 4 }}, "end": {{ "line": 0, "character": 7 }} }}, "newText": "bar" }}
+                        ] }} }}
+                    }}
+                ]
+            }}"#
+        ),
+    );
+    let (rpc, mut incoming) = open_with_server(&dir, "let foo = 1\n").await;
+    assert!(
+        await_lua_eq(&rpc, "#nx.lsp.clients({ bufnr = 0 })", "1").await,
+        "the mock server should attach"
+    );
+
+    exec_lua(
+        &rpc,
+        r#"
+        _G.cancel_done = false
+        _G.cancel_res = "unset"
+        nx.lsp.code_action():next(function(res)
+            _G.cancel_res = res
+            _G.cancel_done = true
+        end)
+        "#,
+    )
+    .await;
+    let listed = poll_menu_items(&rpc, &mut incoming)
+        .await
+        .is_some_and(|rows| rows.iter().any(|r| r.contains("Replace with bar")));
+    assert!(listed, "the code action should appear in the chooser");
+    // Cancel instead of confirming.
+    feed(&rpc, "<Esc>");
+
+    assert!(
+        await_lua_eq(&rpc, "tostring(_G.cancel_done)", "true").await,
+        "cancelling the chooser should still settle the promise"
+    );
+    assert!(
+        exec_lua(&rpc, "return _G.cancel_res == nil")
+            .await
+            .as_bool()
+            == Some(true),
+        "a cancelled code action resolves nil"
+    );
+    // And no edit was applied.
+    assert_eq!(
+        lines(&rpc).await.first().map(String::as_str),
+        Some("let foo = 1"),
+        "cancelling applies no edit"
+    );
+}

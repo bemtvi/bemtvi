@@ -245,9 +245,13 @@ impl EditHost {
     /// `vim.ui.select` model) and stash the actions so confirming applies the chosen
     /// one (`pending_code_action`, keyed by the chosen index). An empty reply shows a
     /// brief message instead of an empty menu.
-    pub(crate) fn show_code_actions(&mut self, actions: Vec<CodeActionData>) {
+    /// `cb_id` (`0` = fire-and-forget) is the async `code_action` promise: it is
+    /// *stashed* onto the chooser (settled later on the confirm/cancel path), or
+    /// settled `nil` now on an empty reply.
+    pub(crate) fn show_code_actions(&mut self, actions: Vec<CodeActionData>, cb_id: u64) {
         if actions.is_empty() {
             self.editor.echo(LspReqKind::CodeAction.empty_message());
+            self.settle_lsp_promise(cb_id, serde_json::Value::Null);
             return;
         }
         let lines: Vec<String> = actions.iter().map(|a| a.title.clone()).collect();
@@ -260,7 +264,18 @@ impl EditHost {
         #[cfg(feature = "native")]
         {
             self.pending_code_action = true;
+            // Take over the promise stash. A prior chooser still awaiting confirm is
+            // superseded (a second `code_action` before picking) — settle its promise
+            // `nil` so it can't hang.
+            let prev = std::mem::replace(&mut self.code_action_cb, cb_id);
+            if prev != 0 {
+                self.settle_lsp_promise(prev, serde_json::Value::Null);
+            }
         }
+        // On the wasm edit-host there is no confirm→apply path, so the promise would
+        // never settle — resolve it `nil` now rather than leave it hanging.
+        #[cfg(not(feature = "native"))]
+        self.settle_lsp_promise(cb_id, serde_json::Value::Null);
     }
 
     /// Apply the code action selected (by index) in the code-action panel: apply
@@ -269,9 +284,14 @@ impl EditHost {
     /// command) a brief message. Clears the stashed actions either way; the select
     /// menu has already closed itself on confirm.
     pub(crate) fn apply_code_action(&mut self, index: usize) {
+        // The stashed async `code_action` promise (`0` = fire-and-forget). Taken here
+        // so every terminal branch settles it exactly once — except the lazy-resolve
+        // branch, which hands it to `resolve_code_action` to settle when its reply lands.
+        let cb = std::mem::take(&mut self.code_action_cb);
         let action = self.lsp_code_actions.get(index).cloned();
         self.lsp_code_actions.clear();
         let Some(action) = action else {
+            self.settle_lsp_promise(cb, serde_json::Value::Null);
             return;
         };
         let has_edit = action.edit.is_some();
@@ -285,15 +305,22 @@ impl EditHost {
         // `workspace/executeCommand` (Phase 8).
         if let Some(command) = action.command {
             self.dispatch_lsp_command(command);
+            // Edit applied + command dispatched — the action's effect is done.
+            self.settle_lsp_promise(cb, serde_json::Value::Null);
         } else if !has_edit {
             if let Some(raw) = action.resolve {
                 // A lazy action: ask the server to fill in its edit, then apply
-                // when the reply lands (reply-as-event, like format/rename).
-                self.resolve_code_action(raw);
+                // when the reply lands (reply-as-event, like format/rename). The
+                // promise rides the resolve request and settles on that reply.
+                self.resolve_code_action(raw, cb);
             } else {
                 self.editor.echo("Code action has no edit");
                 self.lsp_dirty = true;
+                self.settle_lsp_promise(cb, serde_json::Value::Null);
             }
+        } else {
+            // An eager edit with no command / resolve — applied above; done.
+            self.settle_lsp_promise(cb, serde_json::Value::Null);
         }
     }
 
@@ -324,12 +351,19 @@ impl EditHost {
 
     /// Fire a `codeAction/resolve` for a lazy action, recording it as a pending
     /// apply request (content-version guarded, like format/rename); its resolved
-    /// edit is applied in [`EditHost::on_lsp_reply`].
-    pub(crate) fn resolve_code_action(&mut self, action: Box<nxvim_lsp::lsp_types::CodeAction>) {
+    /// edit is applied in [`EditHost::on_lsp_reply`]. `cb_id` (`0` = fire-and-forget)
+    /// is the async `code_action` promise, carried on the request so the resolve reply
+    /// settles it once the edit applies (no server ⇒ settle `nil` now).
+    pub(crate) fn resolve_code_action(
+        &mut self,
+        action: Box<nxvim_lsp::lsp_types::CodeAction>,
+        cb_id: u64,
+    ) {
         let Some((key, _uri, _encoding)) = self.lsp_target_or_echo() else {
+            self.settle_lsp_promise(cb_id, serde_json::Value::Null);
             return;
         };
-        let token = self.register_lsp_request(LspReqKind::ResolveCodeAction);
+        let token = self.register_lsp_request(LspReqKind::ResolveCodeAction, cb_id);
         self.fx
             .lsp_request(key, token, LspRequest::ResolveCodeAction { action });
     }

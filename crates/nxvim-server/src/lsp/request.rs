@@ -20,18 +20,22 @@ impl EditHost {
     /// the same kind, or the cursor moving before the reply lands, invalidates
     /// it. No-op (with a brief message) if the current buffer has no server that
     /// has finished `initialize`, since the negotiated encoding isn't known yet.
-    pub(crate) fn request_lsp(&mut self, kind: LspReqKind) {
+    pub(crate) fn request_lsp(&mut self, kind: LspReqKind, cb_id: u64) {
         // Flush any pending document edits as a `didChange` *before* the request,
         // so the server computes against the current buffer text. Requests are
         // fired during input — ahead of `redraw`'s own `sync_lsp` — so without
         // this the server would answer a stale document (e.g. completion ranges
         // computed against text the user already changed).
         let Some((key, uri, encoding)) = self.lsp_target_or_echo() else {
+            // No server: the request never goes, so settle the promise now
+            // (resolve `nil`) rather than leave it hanging for a reply that
+            // won't come.
+            self.settle_lsp_promise(cb_id, serde_json::Value::Null);
             return;
         };
         let (row, col) = (self.editor.cursor.line, self.editor.cursor.col);
         let position = self.lsp_position(encoding, row, col);
-        let token = self.register_lsp_request(kind);
+        let token = self.register_lsp_request(kind, cb_id);
         let req = match kind {
             LspReqKind::Definition => LspRequest::Definition { uri, position },
             LspReqKind::Declaration => LspRequest::Declaration { uri, position },
@@ -107,7 +111,7 @@ impl EditHost {
             return;
         }
         if self.current_buffer_has_signature_trigger() {
-            self.request_lsp(LspReqKind::SignatureHelp);
+            self.request_lsp(LspReqKind::SignatureHelp, 0);
         } else {
             self.editor.end_signature_session();
         }
@@ -124,24 +128,57 @@ impl EditHost {
     /// Bump the request generation and register the in-flight request for `kind`
     /// (buffer/cursor/`changedtick` at issue time), returning its [`ReqToken`].
     /// The single home for the staleness bookkeeping every issue function shares.
-    pub(crate) fn register_lsp_request(&mut self, kind: LspReqKind) -> ReqToken {
+    /// `cb_id` (`0` = fire-and-forget) settles the issuing verb's promise; a new
+    /// request of the same `kind` **supersedes** the one it replaces, so that
+    /// pending's still-live promise is settled `nil` (a benign no-op) here rather
+    /// than left to hang — its reply, if it ever lands, is dropped on the
+    /// generation mismatch.
+    pub(crate) fn register_lsp_request(&mut self, kind: LspReqKind, cb_id: u64) -> ReqToken {
         self.lsp_req_gen += 1;
         let generation = self.lsp_req_gen;
-        self.lsp_requests.insert(
+        if let Some(prev) = self.lsp_requests.insert(
             kind,
             PendingLspReq {
                 generation,
                 buffer: self.editor.current_buffer_id(),
                 cursor: (self.editor.cursor.line, self.editor.cursor.col),
                 tick: self.editor.buffer().changedtick,
+                cb_id,
             },
-        );
+        ) {
+            self.settle_lsp_promise(prev.cb_id, serde_json::Value::Null);
+        }
         ReqToken {
             kind: kind.as_u16(),
             generation,
-            // Native typed requests dispatch by kind/generation, never by callback.
-            cb_id: 0,
+            cb_id,
         }
+    }
+
+    /// Settle an async `nx.lsp.*` verb's promise: run its `nx._cb_fns[cb_id]`
+    /// resolver with `(nil, result)` (the resolve-only [`CallbackArgs::LspReply`]
+    /// contract — the built-in verbs never reject), then drain the effects the
+    /// resolver queued so a verb chained in a `:next` handler issues its request in
+    /// this same convergence (mirrors [`on_client_request_reply`](Self::on_client_request_reply)).
+    /// A `cb_id` of `0` (a fire-and-forget request) is a no-op.
+    pub(crate) fn settle_lsp_promise(&mut self, cb_id: u64, result: serde_json::Value) {
+        if cb_id == 0 {
+            return;
+        }
+        // Refresh the buffer mirror so the promise's continuation reads the *applied*
+        // effect. The LSP-reply path (format/rename/resolve) gets a fresh push at the
+        // next `run_pending` entry before its microtask drains, but the code-action
+        // apply runs mid-`run_pending` (after that entry push), so its edit would be
+        // invisible to the continuation without this. Cheap: gated on `changedtick`.
+        self.push_buf_mirror();
+        if let Err(e) =
+            self.lua
+                .run_callback(cb_id, false, CallbackArgs::LspReply { err: None, result })
+        {
+            self.editor
+                .echo(format!("E5108: Error settling nx.lsp promise: {e}"));
+        }
+        self.apply_lua_effects();
     }
 
     /// Resolve a Lua `client_id` to its server [`ServerKey`] — the reverse of the
@@ -203,11 +240,12 @@ impl EditHost {
     /// `:LspFormat` — request `textDocument/formatting` for the current buffer.
     /// On reply, the `TextEdit[]` is applied iff the buffer hasn't changed since
     /// (the content-version guard in [`EditHost::on_lsp_reply`]).
-    pub(crate) fn request_lsp_format(&mut self) {
+    pub(crate) fn request_lsp_format(&mut self, cb_id: u64) {
         let Some((key, uri, _encoding)) = self.lsp_target_or_echo() else {
+            self.settle_lsp_promise(cb_id, serde_json::Value::Null);
             return;
         };
-        let token = self.register_lsp_request(LspReqKind::Formatting);
+        let token = self.register_lsp_request(LspReqKind::Formatting, cb_id);
         self.fx.lsp_request(
             key,
             token,
@@ -222,11 +260,12 @@ impl EditHost {
     /// `nx.lsp.workspace_symbol(query)` — request `workspace/symbol` for `query`.
     /// Unlike the cursor-anchored requests it carries the user's fuzzy query, not a
     /// position; on reply the matching symbols open in the picker (`apply_lsp_symbols`).
-    pub(crate) fn request_lsp_workspace_symbol(&mut self, query: &str) {
+    pub(crate) fn request_lsp_workspace_symbol(&mut self, query: &str, cb_id: u64) {
         let Some((key, _uri, _encoding)) = self.lsp_target_or_echo() else {
+            self.settle_lsp_promise(cb_id, serde_json::Value::Null);
             return;
         };
-        let token = self.register_lsp_request(LspReqKind::WorkspaceSymbol);
+        let token = self.register_lsp_request(LspReqKind::WorkspaceSymbol, cb_id);
         self.fx.lsp_request(
             key,
             token,
@@ -239,19 +278,21 @@ impl EditHost {
     /// `:LspRename {newname}` — request `textDocument/rename` at the cursor with
     /// the new name. On reply the returned `WorkspaceEdit` is applied across the
     /// open buffers it touches.
-    pub(crate) fn request_lsp_rename(&mut self, new_name: &str) {
+    pub(crate) fn request_lsp_rename(&mut self, new_name: &str, cb_id: u64) {
         let new_name = new_name.trim();
         if new_name.is_empty() {
             self.editor
                 .echo("E471: Argument required: :LspRename {newname}");
+            self.settle_lsp_promise(cb_id, serde_json::Value::Null);
             return;
         }
         let Some((key, uri, encoding)) = self.lsp_target_or_echo() else {
+            self.settle_lsp_promise(cb_id, serde_json::Value::Null);
             return;
         };
         let (row, col) = (self.editor.cursor.line, self.editor.cursor.col);
         let position = self.lsp_position(encoding, row, col);
-        let token = self.register_lsp_request(LspReqKind::Rename);
+        let token = self.register_lsp_request(LspReqKind::Rename, cb_id);
         self.fx.lsp_request(
             key,
             token,
@@ -265,15 +306,18 @@ impl EditHost {
 
     /// `:LspCodeAction` — request `textDocument/codeAction` at the cursor, passing
     /// the diagnostics under the cursor as context. On reply the action titles are
-    /// listed in the panel; `<CR>` applies the chosen action's eager edit.
-    pub(crate) fn request_lsp_code_action(&mut self) {
+    /// listed in the panel; `<CR>` applies the chosen action's eager edit. `cb_id`
+    /// (`0` = fire-and-forget) is the promise the reply *stashes* onto the chooser menu
+    /// and settles once the picked action's edit applies (or `nil` on cancel).
+    pub(crate) fn request_lsp_code_action(&mut self, cb_id: u64) {
         let Some((key, uri, encoding)) = self.lsp_target_or_echo() else {
+            self.settle_lsp_promise(cb_id, serde_json::Value::Null);
             return;
         };
         let (row, col) = (self.editor.cursor.line, self.editor.cursor.col);
         let position = self.lsp_position(encoding, row, col);
         let diagnostics = self.diagnostics_at_cursor();
-        let token = self.register_lsp_request(LspReqKind::CodeAction);
+        let token = self.register_lsp_request(LspReqKind::CodeAction, cb_id);
         self.fx.lsp_request(
             key,
             token,
@@ -345,6 +389,13 @@ impl EditHost {
         // staleness above.
         let req_buffer = pending.buffer;
         let req_tick = pending.tick;
+        // The async verb's promise callback (`0` = fire-and-forget). Settled on a
+        // successful apply (with the result value) or on a staleness drop (`nil`) so
+        // it never hangs. The generation-mismatch / missing-pending drops above
+        // don't settle it — a superseded request was already settled in
+        // `register_lsp_request`, and a second reply for a handled kind has no live
+        // promise. `code_action` stays fire-and-forget until Phase 2 (`cb_id == 0`).
+        let cb_id = pending.cb_id;
         self.lsp_requests.remove(&kind);
 
         match reply {
@@ -359,61 +410,80 @@ impl EditHost {
             }
             LspReply::Locations(locations) => {
                 if buffer_changed || cursor_moved {
+                    self.settle_lsp_promise(cb_id, serde_json::Value::Null);
                     return;
                 }
-                self.apply_lsp_locations(kind, locations);
+                let result = self.apply_lsp_locations(kind, locations);
                 self.lsp_dirty = true;
+                self.settle_lsp_promise(cb_id, result);
             }
             LspReply::Symbols(symbols) => {
                 // A symbol list is browsed, not anchored to the cursor — drop it
                 // only on a buffer switch (the request's buffer is gone), not on a
                 // mere cursor move within it.
                 if buffer_changed {
+                    self.settle_lsp_promise(cb_id, serde_json::Value::Null);
                     return;
                 }
-                self.apply_lsp_symbols(kind, symbols);
+                let result = self.apply_lsp_symbols(kind, symbols);
                 self.lsp_dirty = true;
+                self.settle_lsp_promise(cb_id, result);
             }
             LspReply::Hover(lines) => {
                 if buffer_changed || cursor_moved {
+                    self.settle_lsp_promise(cb_id, serde_json::Value::Null);
                     return;
                 }
-                self.show_hover(lines);
+                let result = self.show_hover(lines);
                 self.lsp_dirty = true;
+                self.settle_lsp_promise(cb_id, result);
             }
             LspReply::SignatureHelp {
                 signature,
                 active_parameter,
             } => {
                 if buffer_changed || cursor_moved {
+                    self.settle_lsp_promise(cb_id, serde_json::Value::Null);
                     return;
                 }
-                self.show_signature_help(signature, active_parameter);
+                let result = self.show_signature_help(signature, active_parameter);
                 self.lsp_dirty = true;
+                self.settle_lsp_promise(cb_id, result);
             }
             LspReply::Edits(edits) => {
                 if buffer_changed || tick_changed {
+                    self.settle_lsp_promise(cb_id, serde_json::Value::Null);
                     return;
                 }
                 self.apply_formatting_edits(edits);
                 self.lsp_dirty = true;
+                // A mutation verb resolves `nil` — the effect is the buffer change.
+                self.settle_lsp_promise(cb_id, serde_json::Value::Null);
             }
             LspReply::WorkspaceEdit(changes) => {
                 if buffer_changed || tick_changed {
+                    self.settle_lsp_promise(cb_id, serde_json::Value::Null);
                     return;
                 }
                 self.apply_workspace_edit(changes);
                 self.lsp_dirty = true;
+                self.settle_lsp_promise(cb_id, serde_json::Value::Null);
             }
             LspReply::CodeActions(actions) => {
                 if buffer_changed || tick_changed {
+                    self.settle_lsp_promise(cb_id, serde_json::Value::Null);
                     return;
                 }
-                self.show_code_actions(actions);
+                // The reply only opens the chooser; `show_code_actions` takes over the
+                // promise (stashes `cb_id` onto the menu, or settles `nil` on an empty
+                // reply), so it is NOT settled here. It resolves on the confirm/cancel
+                // path (Phase 2).
+                self.show_code_actions(actions, cb_id);
                 self.lsp_dirty = true;
             }
             LspReply::ResolvedCodeAction(edit) => {
                 if buffer_changed || tick_changed {
+                    self.settle_lsp_promise(cb_id, serde_json::Value::Null);
                     return;
                 }
                 match edit {
@@ -423,6 +493,9 @@ impl EditHost {
                         .echo(LspReqKind::ResolveCodeAction.empty_message()),
                 }
                 self.lsp_dirty = true;
+                // The lazy resolve landed and applied — settle the code-action promise
+                // (`cb_id` rode the `ResolveCodeAction` request from `apply_code_action`).
+                self.settle_lsp_promise(cb_id, serde_json::Value::Null);
             }
             LspReply::ResolvedCompletion {
                 documentation,
@@ -495,13 +568,17 @@ impl EditHost {
     /// renders through [`Editor::open_markdown_float`]: the markup is *rendered*
     /// (stripped + styled) rather than shown verbatim. An empty reply shows a brief
     /// message instead of an empty float.
-    pub(crate) fn show_hover(&mut self, lines: Vec<String>) {
+    ///
+    /// Returns the shown markup as a JSON string an async `hover` promise resolves
+    /// with; `Null` when the reply was empty.
+    pub(crate) fn show_hover(&mut self, lines: Vec<String>) -> serde_json::Value {
         if lines.is_empty() {
             self.editor.echo(LspReqKind::Hover.empty_message());
-            return;
+            return serde_json::Value::Null;
         }
-        self.editor
-            .open_markdown_float("[Hover]", &lines.join("\n"));
+        let text = lines.join("\n");
+        self.editor.open_markdown_float("[Hover]", &text);
+        serde_json::Value::String(text)
     }
 
     /// Render a signature-help reply in the cursor-anchored **doc float** (the same
@@ -510,11 +587,14 @@ impl EditHost {
     /// (the float renders plain lines, so the parameter can't be styled inline yet).
     /// Triggered manually in insert mode, so it stays out of the way until asked for.
     /// Empty ⇒ a brief message.
+    ///
+    /// Returns the shown signature line as a JSON string an async `signature_help`
+    /// promise resolves with; `Null` when the reply was empty.
     pub(crate) fn show_signature_help(
         &mut self,
         signature: Option<String>,
         active_parameter: Option<String>,
-    ) {
+    ) -> serde_json::Value {
         let Some(signature) = signature else {
             // An auto-trigger session reaching an empty reply means you left the call
             // (typed past the `)`, or the cursor moved out): close the sticky float
@@ -524,7 +604,7 @@ impl EditHost {
             } else {
                 self.editor.echo(LspReqKind::SignatureHelp.empty_message());
             }
-            return;
+            return serde_json::Value::Null;
         };
         let line = match active_parameter {
             Some(param) if !param.is_empty() => format!("{signature}    [{param}]"),
@@ -538,7 +618,8 @@ impl EditHost {
             .buffer_filetype(self.editor.current_buffer_id())
             .unwrap_or_default();
         self.editor
-            .open_doc_float("[Signature]", vec![line], &filetype);
+            .open_doc_float("[Signature]", vec![line.clone()], &filetype);
+        serde_json::Value::String(line)
     }
 
     /// Act on a reply's target locations: a single goto result jumps the cursor;
@@ -546,19 +627,43 @@ impl EditHost {
     /// list; an empty result shows a brief message. The encoding is captured from
     /// the *source* buffer before any jump switches buffers — a server reports
     /// target positions in its own negotiated encoding.
-    pub(crate) fn apply_lsp_locations(&mut self, kind: LspReqKind, locations: Vec<Location>) {
+    ///
+    /// Returns the resolved locations as the `{ text, path, row, col }` item list
+    /// (JSON) an async `nx.lsp.*` verb resolves its promise with — a 1-element list
+    /// for a single goto jump, the full list for a picker; `Null` when empty.
+    pub(crate) fn apply_lsp_locations(
+        &mut self,
+        kind: LspReqKind,
+        locations: Vec<Location>,
+    ) -> serde_json::Value {
         if locations.is_empty() {
             self.editor.echo(kind.empty_message());
-            return;
+            return serde_json::Value::Null;
         }
         let encoding = self
             .current_lsp_target()
             .map_or(PositionEncoding::Utf8, |(_, _, e)| e);
+        // Build the `path:line:col` items once — they feed both the picker and the
+        // promise's resolved value.
+        let mut items: Vec<(String, String, u32, u32)> = Vec::with_capacity(locations.len());
+        for loc in &locations {
+            let Some(path) = uri_to_path(&loc.uri) else {
+                continue;
+            };
+            let row = loc.range.start.line as usize;
+            let character = loc.range.start.character as usize;
+            let byte = self.location_byte_col(&path, row, character, encoding);
+            let nav = path.to_string_lossy().into_owned();
+            let shown = super::display_path(&path);
+            let text = format!("{shown}:{}:{}", row + 1, byte + 1);
+            items.push((text, nav, (row + 1) as u32, (byte + 1) as u32));
+        }
         if !kind.is_list() && locations.len() == 1 {
             self.jump_to_lsp_location(&locations[0], encoding);
         } else {
-            self.open_locations_panel(kind, &locations, encoding);
+            self.present_lsp_picker(kind, items.clone(), "location");
         }
+        location_items_to_json(&items)
     }
 
     /// Open `nx.picker` over already-built picker `items` (`(text, nav-path, 1-based
@@ -588,10 +693,18 @@ impl EditHost {
     /// `name  [Kind]  path:line`, jumping to the symbol's location on confirm. Like
     /// the location picker this dogfreeds the shared engine; the symbol's `name` and
     /// `kind` make the rows readable (a bare `path:line` would not).
-    pub(crate) fn apply_lsp_symbols(&mut self, kind: LspReqKind, symbols: Vec<SymbolData>) {
+    ///
+    /// Returns the symbol `{ text, path, row, col }` item list (JSON) an async
+    /// `document_symbol` / `workspace_symbol` promise resolves with; `Null` when
+    /// empty.
+    pub(crate) fn apply_lsp_symbols(
+        &mut self,
+        kind: LspReqKind,
+        symbols: Vec<SymbolData>,
+    ) -> serde_json::Value {
         if symbols.is_empty() {
             self.editor.echo(kind.empty_message());
-            return;
+            return serde_json::Value::Null;
         }
         let encoding = self
             .current_lsp_target()
@@ -611,7 +724,9 @@ impl EditHost {
             let text = format!("{}  [{}]  {shown}:{}", sym.name, sym.kind, row + 1);
             items.push((text, nav, (row + 1) as u32, (byte + 1) as u32));
         }
+        let json = location_items_to_json(&items);
         self.present_lsp_picker(kind, items, "symbol");
+        json
     }
 
     /// Jump the cursor to one LSP [`Location`]. Opens/switches to the target on
@@ -632,36 +747,6 @@ impl EditHost {
             let byte = byte_col(encoding, &text, character);
             self.editor.jump_to(&path, landed, byte);
         }
-    }
-
-    /// Open `nx.picker` over `locations` (one `path:line:col` row each), with the
-    /// built-in "location" preview (scroll + range-highlight the match) and a
-    /// confirm that jumps — design principle 4: goto-with-many-hits / references /
-    /// symbols dogfood the shared picker rather than a bespoke loclist. The picker
-    /// open is a Lua effect, so this drains it (`apply_lua_effects`) like
-    /// `fire_lsp_attach` does for an `on_attach` body.
-    pub(crate) fn open_locations_panel(
-        &mut self,
-        kind: LspReqKind,
-        locations: &[Location],
-        encoding: PositionEncoding,
-    ) {
-        // Picker items: `(text, path, 1-based row, 1-based col)` — `nx.picker.edit`
-        // reads the 1-based row/col, and the "location" preview needs the path.
-        let mut items: Vec<(String, String, u32, u32)> = Vec::with_capacity(locations.len());
-        for loc in locations {
-            let Some(path) = uri_to_path(&loc.uri) else {
-                continue;
-            };
-            let row = loc.range.start.line as usize;
-            let character = loc.range.start.character as usize;
-            let byte = self.location_byte_col(&path, row, character, encoding);
-            let nav = path.to_string_lossy().into_owned();
-            let shown = super::display_path(&path);
-            let text = format!("{shown}:{}:{}", row + 1, byte + 1);
-            items.push((text, nav, (row + 1) as u32, (byte + 1) as u32));
-        }
-        self.present_lsp_picker(kind, items, "location");
     }
 
     /// Best-effort LSP char→byte column for a target location: exact when the
@@ -691,4 +776,20 @@ impl EditHost {
         let (key, _, _) = self.current_lsp_target()?;
         self.lsp_servers.get(&key).map(|r| r.client_id)
     }
+}
+
+/// Marshal a picker item list (`(text, path, 1-based row, 1-based col)`) into the
+/// JSON array an async navigation/symbol verb resolves its promise with: one
+/// `{ text, path, row, col }` object per item. The shape matches the `nx.picker`
+/// location items so a `nx.lsp.references():next(function(items) … end)` handler
+/// sees the same fields the picker rows carry.
+fn location_items_to_json(items: &[(String, String, u32, u32)]) -> serde_json::Value {
+    serde_json::Value::Array(
+        items
+            .iter()
+            .map(|(text, path, row, col)| {
+                serde_json::json!({ "text": text, "path": path, "row": row, "col": col })
+            })
+            .collect(),
+    )
 }

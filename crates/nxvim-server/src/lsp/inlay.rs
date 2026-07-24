@@ -340,6 +340,8 @@ impl EditHost {
                 buffer,
                 cursor: (self.editor.cursor.line, self.editor.cursor.col),
                 tick,
+                // Whole-buffer refresh, not a user verb — no promise to settle.
+                cb_id: 0,
             },
         );
         nxvim_lsp::ReqToken {

@@ -451,34 +451,78 @@ function nx.lsp.start(cfg, opts)
   start_resolved(cfg.name or "?", cfg, bufnr, ft, cfg.root_dir)
 end
 
--- ----- language verbs — thin enqueues; the server owns the result surface -----
+-- ----- language verbs — async; return a promise, the server owns the surface ----
 -- Each verb queues an `LspOp` the server drains on the same input tick (reading the
 -- cursor where the key fired) and routes into its existing surface: a single
--- location jumps, many open the loclist; hover/signature open the cursor float;
--- code actions open the select menu; format/rename apply edits. There is no reply
--- handling in Lua. The verbs are *bare* (no implicit args) so
--- `nx.keymap.set("n", "gd", nx.lsp.definition)` works. `kind` ints mirror
--- `LspReqKind::as_u16` (crates/nxvim-server/src/lsp/mod.rs) — keep the two in step.
+-- location jumps, many open the picker; hover/signature open the cursor float;
+-- format/rename apply edits. Each returns an `nx.promise` that **resolves** when the
+-- round-trip completes and its effect is applied/presented, so actions can be run in
+-- sequence:
+--
+-- ```lua
+-- nx.lsp.format():next(function()
+--   return nx.lsp.rename("Foo")   -- runs only after format's edits land
+-- end)
+-- nx.lsp.references():next(function(items) --[[ items = { {text,path,row,col}, … } ]] end)
+-- ```
+--
+-- The promise is **resolve-only** — it never rejects, so a bare keymap use
+-- (`nx.keymap.set("n", "gd", nx.lsp.definition)`, the common case) can't raise an
+-- unhandled-rejection warning. A benign no-op (no server attached, the request
+-- superseded by a newer one, the cursor moving / buffer changing before the reply, an
+-- empty result, a cancelled prompt) resolves `nil`. Navigation/symbol verbs resolve
+-- with the `{ text, path, row, col }` item list (a 1-element list for a single goto
+-- jump); `hover`/`signature_help` with the shown text; `format`/`rename` with `nil`.
+-- `kind` ints mirror `LspReqKind::as_u16` (crates/nxvim-server/src/lsp/mod.rs) — keep
+-- the two in step.
+--
+-- Build the promise a verb returns: `issue(cb_id)` queues the op with the callback id;
+-- the server settles it by running `nx._cb_fns[cb_id](nil, result)` once the effect is
+-- applied. Resolve-only (the `err` arg is always nil), matching the contract above.
+local function lsp_promise(issue)
+  return nx.promise.new(function(fulfil)
+    local id = nx._next_cb_id()
+    nx._cb_fns[id] = function(_err, result)
+      fulfil(result)
+    end
+    issue(id)
+  end)
+end
+
 function nx.lsp.definition()
-  nx._lsp_buf(0)
+  return lsp_promise(function(id)
+    nx._lsp_buf(0, id)
+  end)
 end
 function nx.lsp.declaration()
-  nx._lsp_buf(1)
+  return lsp_promise(function(id)
+    nx._lsp_buf(1, id)
+  end)
 end
 function nx.lsp.type_definition()
-  nx._lsp_buf(2)
+  return lsp_promise(function(id)
+    nx._lsp_buf(2, id)
+  end)
 end
 function nx.lsp.implementation()
-  nx._lsp_buf(3)
+  return lsp_promise(function(id)
+    nx._lsp_buf(3, id)
+  end)
 end
 function nx.lsp.references()
-  nx._lsp_buf(4)
+  return lsp_promise(function(id)
+    nx._lsp_buf(4, id)
+  end)
 end
 function nx.lsp.hover()
-  nx._lsp_buf(5)
+  return lsp_promise(function(id)
+    nx._lsp_buf(5, id)
+  end)
 end
 function nx.lsp.signature_help()
-  nx._lsp_buf(6)
+  return lsp_promise(function(id)
+    nx._lsp_buf(6, id)
+  end)
 end
 
 -- `nx.lsp.signature_help_autotrigger(enable)`: opt into auto-showing signature help as
@@ -489,30 +533,51 @@ end
 function nx.lsp.signature_help_autotrigger(enable)
   nx._signature_autotrigger(enable ~= false)
 end
+-- `nx.lsp.format()`: format the buffer, resolving `nil` once the edits apply.
 function nx.lsp.format()
-  nx._lsp_buf_format()
+  return lsp_promise(function(id)
+    nx._lsp_buf_format(id)
+  end)
 end
+-- `nx.lsp.code_action()`: open the code-action chooser. Unlike the other verbs the
+-- reply only *opens the menu*; the returned promise resolves once you pick an action
+-- and its edit applies (through a `codeAction/resolve` round-trip if the action is
+-- lazy), or `nil` if you cancel the chooser (Esc) — so you can, e.g., organize imports
+-- then format:
+--
+-- ```lua
+-- nx.lsp.code_action():next(function() return nx.lsp.format() end)
+-- ```
 function nx.lsp.code_action()
-  nx._lsp_buf_code_action()
+  return lsp_promise(function(id)
+    nx._lsp_buf_code_action(id)
+  end)
 end
 
 -- `nx.lsp.document_symbol()`: the symbols defined in the current document, opened in
--- `nx.picker` (kind 16 mirrors `LspReqKind::DocumentSymbol::as_u16`).
+-- `nx.picker` (kind 16 mirrors `LspReqKind::DocumentSymbol::as_u16`). Resolves with the
+-- symbol `{ text, path, row, col }` item list.
 function nx.lsp.document_symbol()
-  nx._lsp_buf(16)
+  return lsp_promise(function(id)
+    nx._lsp_buf(16, id)
+  end)
 end
 
 -- `nx.lsp.workspace_symbol(query)`: symbols across the workspace matching `query`,
 -- opened in `nx.picker`. With no query, prompt for one via `nx.ui.input` (non-blocking)
--- — an empty/cancelled prompt does nothing.
+-- — an empty/cancelled prompt resolves `nil`. Returns a promise of the matched symbol
+-- item list.
 function nx.lsp.workspace_symbol(query)
   if type(query) == "string" then
-    nx._lsp_workspace_symbol(query)
-    return
+    return lsp_promise(function(id)
+      nx._lsp_workspace_symbol(query, id)
+    end)
   end
-  nx.ui.input({ prompt = "Workspace symbol: " }):next(function(q)
+  return nx.ui.input({ prompt = "Workspace symbol: " }):next(function(q)
     if type(q) == "string" and q ~= "" then
-      nx._lsp_workspace_symbol(q)
+      return lsp_promise(function(id)
+        nx._lsp_workspace_symbol(q, id)
+      end)
     end
   end)
 end
@@ -521,16 +586,19 @@ end
 -- it straight away; with none (the bare
 -- `nx.keymap.set("n", "<leader>rn", nx.lsp.rename)` case), prompt for it via
 -- `nx.ui.input` (non-blocking promise), prefilled with the symbol under the cursor, and
--- rename on confirm. An empty /
--- cancelled prompt does nothing.
+-- rename on confirm. Returns a promise that resolves `nil` once the rename applies (or
+-- immediately, `nil`, on an empty / cancelled prompt).
 function nx.lsp.rename(new_name)
   if type(new_name) == "string" and new_name ~= "" then
-    nx._lsp_buf_rename(new_name)
-    return
+    return lsp_promise(function(id)
+      nx._lsp_buf_rename(new_name, id)
+    end)
   end
-  nx.ui.input({ prompt = "New Name: ", default = cursor_word() }):next(function(name)
+  return nx.ui.input({ prompt = "New Name: ", default = cursor_word() }):next(function(name)
     if type(name) == "string" and name ~= "" then
-      nx._lsp_buf_rename(name)
+      return lsp_promise(function(id)
+        nx._lsp_buf_rename(name, id)
+      end)
     end
   end)
 end

@@ -3764,6 +3764,11 @@ impl EditHost {
                 if std::mem::take(&mut self.pending_code_action) {
                     if let Some(idx) = result {
                         self.apply_code_action(idx);
+                    } else {
+                        // Cancelled the chooser (Esc): settle the async `code_action`
+                        // promise `nil` (no effect) rather than leave it hanging.
+                        let cb = std::mem::take(&mut self.code_action_cb);
+                        self.settle_lsp_promise(cb, nxvim_lsp::serde_json::Value::Null);
                     }
                     self.apply_lua_effects();
                     continue;

@@ -68,7 +68,7 @@ impl EditHost {
         }
         // Cache miss / incomplete / moved word: ask the server. The reply pushes into
         // whatever generation is live when it lands.
-        self.request_lsp(LspReqKind::Completion);
+        self.request_lsp(LspReqKind::Completion, 0);
     }
 
     /// Handle a `textDocument/completion` reply (already past the generation / buffer
@@ -307,7 +307,7 @@ impl EditHost {
         let Some((server_key, _uri, _enc)) = self.current_lsp_target() else {
             return;
         };
-        let token = self.register_lsp_request(LspReqKind::CompletionResolve);
+        let token = self.register_lsp_request(LspReqKind::CompletionResolve, 0);
         self.lsp_complete_resolve_key = Some(key);
         self.fx.lsp_request(
             server_key,

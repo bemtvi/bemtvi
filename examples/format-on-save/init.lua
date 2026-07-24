@@ -12,9 +12,12 @@
 -- an async formatter (e.g. `nx.lsp.buf.format()`) usable for format-on-save.
 --
 -- Buffer text is mutated the vim way — `vim.cmd` running an ex-command — since the
--- Lua `nvim_*` surface is read-only. nxvim's `:s` has no `e` flag, so each handler
--- first checks (reading the buffer mirror) whether there's anything to change and
--- only substitutes when there is — a no-op save stays quiet.
+-- Lua `nvim_*` surface is read-only. Two nxvim details to note:
+--   * Regex is PCRE by default (`'regexsyntax'`), so one-or-more is a bare `+`:
+--     the trailing-whitespace pattern is `\s+$`, NOT vim's `\s\+$`.
+--   * `:s` has no `e` flag, so each handler first checks (reading the buffer
+--     mirror) whether there's anything to change and only substitutes when there
+--     is — a no-op save stays quiet.
 
 -- Run `excmd` only if some line matches the Lua pattern `needle` — the guard that
 -- replaces vim's `:s///e` "no error if no match".
@@ -36,10 +39,9 @@ end
 -- SEE:   the trailing spaces are gone in the buffer AND on disk (`:e` re-reads it)
 vim.api.nvim_create_autocmd("BufWritePre", {
   pattern = "*.txt",
-  callback = function()
-    -- `\s*$` matches the (possibly empty) run of trailing whitespace on every line,
-    -- so it always matches — no "pattern not found", no guard needed.
-    vim.cmd([[%s/\s*$//]])
+  callback = function(args)
+    -- PCRE `\s+$` (bare `+`), guarded so a save with no trailing space stays quiet.
+    sub_if(args.buf, "%s+$", [[%s/\s+$//]])
   end,
 })
 

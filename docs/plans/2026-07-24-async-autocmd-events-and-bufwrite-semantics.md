@@ -202,10 +202,10 @@ handler would corrupt the current buffer. So `:wall`/`:wqa` keep firing `BufWrit
 after the bytes (notifications work; buffer-mutating format-on-save via `:wall` does not) —
 tracked as the remaining gap. The overwhelmingly common trigger, `:w`, is fully correct.
 
-**Found along the way (separate bug, not fixed here):** nxvim's vim-regex engine
-mishandles `\+` (one-or-more) anchored at `$` — `%s/\s\+$//` does not trim trailing
-whitespace, while `%s/\s*$//`, `%s/[ ]*$//`, and `%s/  *$//` all work. The example uses
-the working `\s*$` form. Worth a dedicated fix in `nxvim-regex`.
+**Not a bug — a syntax mismatch (learning recorded in CLAUDE.md):** `'regexsyntax'`
+defaults to **PCRE**, so `%s/\s\+$//` does not trim trailing whitespace — `\+` is a
+literal `+` in PCRE. The correct pattern is `%s/\s+$//` (bare `+`). The example uses the
+PCRE form.
 
 ### (Original Phase 3 plan, for reference)
 

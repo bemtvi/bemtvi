@@ -146,13 +146,15 @@ pub(crate) async fn issue_request(
                 work_done_progress_params: Default::default(),
                 partial_result_params: Default::default(),
             };
-            match sock.document_symbol(params).await {
-                Ok(resp) => LspReply::Symbols(document_symbols(&uri, resp)),
-                Err(e) => {
-                    log.log(LogLevel::Warn, name, &format!("documentSymbol failed: {e}"));
-                    LspReply::Symbols(Vec::new())
-                }
-            }
+            LspReply::Symbols(document_symbols(
+                &uri,
+                unwrap_logged(
+                    sock.document_symbol(params).await,
+                    log,
+                    name,
+                    "documentSymbol",
+                ),
+            ))
         }
         LspRequest::FoldingRange { uri } => {
             let params = FoldingRangeParams {
@@ -160,13 +162,10 @@ pub(crate) async fn issue_request(
                 work_done_progress_params: Default::default(),
                 partial_result_params: Default::default(),
             };
-            match sock.folding_range(params).await {
-                Ok(ranges) => LspReply::Folds(folding_ranges(ranges.unwrap_or_default())),
-                Err(e) => {
-                    log.log(LogLevel::Warn, name, &format!("foldingRange failed: {e}"));
-                    LspReply::Folds(Vec::new())
-                }
-            }
+            LspReply::Folds(folding_ranges(
+                unwrap_logged(sock.folding_range(params).await, log, name, "foldingRange")
+                    .unwrap_or_default(),
+            ))
         }
         LspRequest::WorkspaceSymbol { query } => {
             let params = WorkspaceSymbolParams {
@@ -174,17 +173,12 @@ pub(crate) async fn issue_request(
                 work_done_progress_params: Default::default(),
                 partial_result_params: PartialResultParams::default(),
             };
-            match sock.symbol(params).await {
-                Ok(resp) => LspReply::Symbols(workspace_symbols(resp)),
-                Err(e) => {
-                    log.log(
-                        LogLevel::Warn,
-                        name,
-                        &format!("workspace/symbol failed: {e}"),
-                    );
-                    LspReply::Symbols(Vec::new())
-                }
-            }
+            LspReply::Symbols(workspace_symbols(unwrap_logged(
+                sock.symbol(params).await,
+                log,
+                name,
+                "workspace/symbol",
+            )))
         }
         LspRequest::References {
             uri,
@@ -199,14 +193,10 @@ pub(crate) async fn issue_request(
                     include_declaration,
                 },
             };
-            let locations = match sock.references(params).await {
-                Ok(locs) => locs.unwrap_or_default(),
-                Err(e) => {
-                    log.log(LogLevel::Warn, name, &format!("references failed: {e}"));
-                    Vec::new()
-                }
-            };
-            LspReply::Locations(locations)
+            LspReply::Locations(
+                unwrap_logged(sock.references(params).await, log, name, "references")
+                    .unwrap_or_default(),
+            )
         }
         LspRequest::Hover { uri, position } => {
             let params = HoverParams {
@@ -252,13 +242,10 @@ pub(crate) async fn issue_request(
                 options: formatting_options(tab_size, insert_spaces),
                 work_done_progress_params: Default::default(),
             };
-            match sock.formatting(params).await {
-                Ok(edits) => LspReply::Edits(edits.unwrap_or_default()),
-                Err(e) => {
-                    log.log(LogLevel::Warn, name, &format!("formatting failed: {e}"));
-                    LspReply::Edits(Vec::new())
-                }
-            }
+            LspReply::Edits(
+                unwrap_logged(sock.formatting(params).await, log, name, "formatting")
+                    .unwrap_or_default(),
+            )
         }
         LspRequest::Rename {
             uri,
@@ -270,14 +257,11 @@ pub(crate) async fn issue_request(
                 new_name,
                 work_done_progress_params: Default::default(),
             };
-            match sock.rename(params).await {
-                Ok(Some(edit)) => LspReply::WorkspaceEdit(normalize_workspace_edit(edit)),
-                Ok(None) => LspReply::WorkspaceEdit(Vec::new()),
-                Err(e) => {
-                    log.log(LogLevel::Warn, name, &format!("rename failed: {e}"));
-                    LspReply::WorkspaceEdit(Vec::new())
-                }
-            }
+            LspReply::WorkspaceEdit(
+                unwrap_logged(sock.rename(params).await, log, name, "rename")
+                    .map(normalize_workspace_edit)
+                    .unwrap_or_default(),
+            )
         }
         LspRequest::CodeAction {
             uri,
@@ -299,13 +283,10 @@ pub(crate) async fn issue_request(
                 work_done_progress_params: Default::default(),
                 partial_result_params: Default::default(),
             };
-            match sock.code_action(params).await {
-                Ok(resp) => LspReply::CodeActions(code_actions(resp.unwrap_or_default())),
-                Err(e) => {
-                    log.log(LogLevel::Warn, name, &format!("codeAction failed: {e}"));
-                    LspReply::CodeActions(Vec::new())
-                }
-            }
+            LspReply::CodeActions(code_actions(
+                unwrap_logged(sock.code_action(params).await, log, name, "codeAction")
+                    .unwrap_or_default(),
+            ))
         }
         LspRequest::ResolveCodeAction { action } => match sock.code_action_resolve(*action).await {
             Ok(resolved) => {
@@ -358,15 +339,13 @@ pub(crate) async fn issue_request(
                 range,
                 work_done_progress_params: Default::default(),
             };
-            match sock.inlay_hint(params).await {
-                Ok(hints) => {
-                    LspReply::InlayHints(hints.unwrap_or_default().iter().map(inlay_hint).collect())
-                }
-                Err(e) => {
-                    log.log(LogLevel::Warn, name, &format!("inlayHint failed: {e}"));
-                    LspReply::InlayHints(Vec::new())
-                }
-            }
+            LspReply::InlayHints(
+                unwrap_logged(sock.inlay_hint(params).await, log, name, "inlayHint")
+                    .unwrap_or_default()
+                    .iter()
+                    .map(inlay_hint)
+                    .collect(),
+            )
         }
         LspRequest::ResolveInlayHint { hint } => {
             resolve_inlay_hint_reply(sock, hint, log, name).await

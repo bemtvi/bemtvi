@@ -166,15 +166,15 @@ pub fn run(script_path: &str) {
             if let (Some(rid), Some(want)) = (msg.get("id").and_then(Value::as_i64), config_req_id)
             {
                 if rid == want {
-                    record_named(&script, "_config_response", msg.get("result"));
+                    append_record(&script, "_config_response", msg.get("result"));
                 }
             }
             continue;
         }
         // Record every client→server message (so tests can read back what the
         // client advertised at `initialize` and which notifications it sent).
-        record(&script, &msg);
         let method = msg.get("method").and_then(Value::as_str).unwrap_or("");
+        append_record(&script, method, msg.get("params"));
         let id = msg.get("id").cloned();
         match method {
             "initialize" => {
@@ -523,33 +523,16 @@ fn initialize_result(script: &Value) -> Value {
     })
 }
 
-/// Append a received message (anything carrying a `method`) to the script's
-/// `record` file as one JSON line.
-fn record(script: &Value, msg: &Value) {
+/// Append one `{method, params}` JSON line to the script's `record` file (when
+/// scripted). Called with each received message's own method, and with a
+/// synthetic method (`_config_response`) to capture the *response* to a
+/// server→client request the mock originated (e.g. the editor's
+/// `workspace/configuration` answer), which carries no method of its own.
+fn append_record(script: &Value, method: &str, params: Option<&Value>) {
     let Some(path) = script.get("record").and_then(Value::as_str) else {
         return;
     };
-    let Some(method) = msg.get("method") else {
-        return;
-    };
-    let line = json!({ "method": method, "params": msg.get("params") });
-    if let Ok(mut f) = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)
-    {
-        let _ = writeln!(f, "{line}");
-    }
-}
-
-/// Append a synthetic record line under `method` with `params` — used to capture
-/// the *response* to a server→client request the mock originated (e.g. the editor's
-/// `workspace/configuration` answer), which `record` skips since it has no method.
-fn record_named(script: &Value, method: &str, params: Option<&Value>) {
-    let Some(path) = script.get("record").and_then(Value::as_str) else {
-        return;
-    };
-    let line = json!({ "method": method, "params": params.cloned().unwrap_or(Value::Null) });
+    let line = json!({ "method": method, "params": params });
     if let Ok(mut f) = std::fs::OpenOptions::new()
         .create(true)
         .append(true)

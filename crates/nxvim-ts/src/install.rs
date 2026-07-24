@@ -481,12 +481,8 @@ fn fetch_query_set(data_dir: &Path, lang: &str) -> Result<(Vec<String>, Vec<Stri
     std::fs::create_dir_all(&dir).with_context(|| format!("create {}", dir.display()))?;
     let mut written = Vec::new();
     let mut inherits = Vec::new();
-    for name in QUERY_FILES {
-        let url = format!(
-            "https://raw.githubusercontent.com/nvim-treesitter/nvim-treesitter/{}/runtime/queries/{lang}/{name}.scm",
-            nvim_ts_ref()
-        );
-        if let Some(bytes) = fetch_opt(&url)? {
+    let mut fetch_one = |url: &str, name: &str| -> Result<()> {
+        if let Some(bytes) = fetch_opt(url)? {
             if let Ok(text) = std::str::from_utf8(&bytes) {
                 for l in parse_inherits_modeline(text) {
                     if !inherits.contains(&l) {
@@ -496,8 +492,16 @@ fn fetch_query_set(data_dir: &Path, lang: &str) -> Result<(Vec<String>, Vec<Stri
             }
             std::fs::write(dir.join(format!("{name}.scm")), &bytes)
                 .with_context(|| format!("write {name}.scm"))?;
-            written.push((*name).to_string());
+            written.push(name.to_string());
         }
+        Ok(())
+    };
+    for name in QUERY_FILES {
+        let url = format!(
+            "https://raw.githubusercontent.com/nvim-treesitter/nvim-treesitter/{}/runtime/queries/{lang}/{name}.scm",
+            nvim_ts_ref()
+        );
+        fetch_one(&url, name)?;
     }
     // `textobjects.scm` is not in nvim-treesitter core — fetch it from the separate
     // nvim-treesitter-textobjects repo (different repo *and* path), writing it beside
@@ -506,18 +510,7 @@ fn fetch_query_set(data_dir: &Path, lang: &str) -> Result<(Vec<String>, Vec<Stri
         "https://raw.githubusercontent.com/nvim-treesitter/nvim-treesitter-textobjects/{}/queries/{lang}/textobjects.scm",
         nvim_ts_textobjects_ref()
     );
-    if let Some(bytes) = fetch_opt(&to_url)? {
-        if let Ok(text) = std::str::from_utf8(&bytes) {
-            for l in parse_inherits_modeline(text) {
-                if !inherits.contains(&l) {
-                    inherits.push(l);
-                }
-            }
-        }
-        std::fs::write(dir.join("textobjects.scm"), &bytes)
-            .with_context(|| "write textobjects.scm".to_string())?;
-        written.push("textobjects".to_string());
-    }
+    fetch_one(&to_url, "textobjects")?;
     Ok((written, inherits))
 }
 

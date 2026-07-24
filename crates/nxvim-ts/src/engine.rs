@@ -260,7 +260,7 @@ impl Engine {
         // grammar each frame. Skipped on a compile failure (handled above), so a
         // bad query leaves the prior layers in place rather than dropping them.
         if name == "injections" {
-            self.rebuild_injection_layers_for_lang(lang);
+            self.rebuild_all_injection_layers();
         }
         Ok(())
     }
@@ -366,7 +366,7 @@ impl Engine {
     /// injection query must refresh A too. A query change is config-time and rare,
     /// so rebuilding every buffer is cheap enough. Buffer ids are collected first so
     /// the per-buffer rebuild can take `&mut self`.
-    fn rebuild_injection_layers_for_lang(&mut self, _lang: &str) {
+    fn rebuild_all_injection_layers(&mut self) {
         let ids: Vec<BufferId> = self.buffers.keys().copied().collect();
         for id in ids {
             self.rebuild_injection_layers(id);

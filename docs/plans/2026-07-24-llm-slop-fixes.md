@@ -251,13 +251,22 @@ Stale docs describing removed worlds:
 
 ## H. Engines (small)
 
-- [ ] **H1.** lsp/dispatch.rs:143-369 — route the 8 hand-inlined arms through
-  `unwrap_logged` (all but ResolveCodeAction qualify).
-- [ ] **H2.** mock.rs:494-526 `record`/`record_named` → one `append_record`.
-- [ ] **H3.** ts install.rs:245-281 textobjects stanza → closure over (url, name);
-  engine.rs:369 unused `_lang` param → rename `rebuild_all_injection_layers()`.
-- [ ] **H4.** XDG dir resolution ×4 crates (lsp log.rs:158, ts lib.rs:29,
-  lua host.rs:130, server shada.rs:1273) — consider one shared helper.
+- [x] **H1.** DONE — all 8 arms (documentSymbol, foldingRange, workspace/symbol,
+  references, formatting, rename, codeAction, inlayHint) route through
+  `unwrap_logged`; log lines and empty-reply degradation byte-identical.
+  ResolveCodeAction keeps its hand match (non-`Option` Ok type).
+- [x] **H2.** DONE — one `append_record(script, method, params)`; the received-message
+  call site passes `msg`'s method (the has-method guard was already enforced by the
+  dispatch loop's method-is-none `continue` above it).
+- [x] **H3.** DONE — `fetch_query_set`'s fetch/inherits/write body is one `fetch_one`
+  closure over `(url, name)`; `rebuild_injection_layers_for_lang(_lang)` renamed
+  `rebuild_all_injection_layers()`.
+- [x] **H4.** CONSIDERED, cross-crate helper REJECTED: the four resolutions use
+  different XDG vars with genuinely different last-resort fallbacks (`.nxvim` vs
+  `nxvim` vs `.local/state` vs `temp_dir()`), and nxvim-lsp deliberately depends on
+  no workspace crate — a shared helper needs a new dependency edge (or micro-crate)
+  plus a parameter for everything that differs. DONE instead: the intra-file dup in
+  server shada.rs (`shada_dir` + `remote_shada_staging` stanzas) → one `xdg_base`.
 
 ## Cross-world duplicates noted for awareness (not necessarily actionable)
 

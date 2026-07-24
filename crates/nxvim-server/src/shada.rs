@@ -1119,17 +1119,27 @@ fn now_ms() -> u64 {
         .unwrap_or(0)
 }
 
+/// The XDG base dir named by `var`, else `$HOME/<home_sub>`, else `last` — the
+/// resolution shared by [`shada_dir`] (state) and `remote_shada_staging` (cache).
+fn xdg_base(var: &str, home_sub: &str, last: PathBuf) -> PathBuf {
+    if let Some(dir) = std::env::var_os(var) {
+        PathBuf::from(dir)
+    } else if let Some(home) = std::env::var_os("HOME") {
+        PathBuf::from(home).join(home_sub)
+    } else {
+        last
+    }
+}
+
 /// The default shada directory for the real binary: `stdpath("state")/shada`,
 /// i.e. `$XDG_STATE_HOME/nxvim/shada` (or `$HOME/.local/state/nxvim/shada`). Tests
 /// build a [`RedbFileStore`] over a temp dir instead, so they never touch this one.
 pub fn shada_dir() -> PathBuf {
-    let base = if let Some(dir) = std::env::var_os("XDG_STATE_HOME") {
-        PathBuf::from(dir)
-    } else if let Some(home) = std::env::var_os("HOME") {
-        PathBuf::from(home).join(".local/state")
-    } else {
-        PathBuf::from(".local/state")
-    };
+    let base = xdg_base(
+        "XDG_STATE_HOME",
+        ".local/state",
+        PathBuf::from(".local/state"),
+    );
     base.join("nxvim").join("shada")
 }
 
@@ -1271,13 +1281,7 @@ fn remote_shada_dir(state_dir: &str, namespace: Option<&str>) -> String {
 /// remote-shada/<pid>` (else `$HOME/.cache/…`, else a temp dir).
 #[cfg(feature = "native")]
 fn remote_shada_staging() -> std::io::Result<PathBuf> {
-    let base = if let Some(d) = std::env::var_os("XDG_CACHE_HOME") {
-        PathBuf::from(d)
-    } else if let Some(h) = std::env::var_os("HOME") {
-        PathBuf::from(h).join(".cache")
-    } else {
-        std::env::temp_dir()
-    };
+    let base = xdg_base("XDG_CACHE_HOME", ".cache", std::env::temp_dir());
     let dir = base
         .join("nxvim")
         .join("remote-shada")

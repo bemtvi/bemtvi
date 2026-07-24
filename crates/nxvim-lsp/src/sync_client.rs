@@ -780,15 +780,23 @@ fn request_wire(req: LspRequest) -> (String, Value, ReqKind) {
             uri,
             range,
             diagnostics,
-        } => (
-            "textDocument/codeAction".into(),
-            json!({
-                "textDocument": {"uri": uri},
-                "range": range,
-                "context": {"diagnostics": diagnostics},
-            }),
-            ReqKind::CodeAction,
-        ),
+            only,
+        } => {
+            // `only` is omitted when empty — an empty list would ask for *no* kinds.
+            let mut context = json!({ "diagnostics": diagnostics });
+            if !only.is_empty() {
+                context["only"] = json!(only);
+            }
+            (
+                "textDocument/codeAction".into(),
+                json!({
+                    "textDocument": {"uri": uri},
+                    "range": range,
+                    "context": context,
+                }),
+                ReqKind::CodeAction,
+            )
+        }
         LspRequest::ResolveCodeAction { action } => (
             "codeAction/resolve".into(),
             serde_json::to_value(*action).unwrap_or(Value::Null),

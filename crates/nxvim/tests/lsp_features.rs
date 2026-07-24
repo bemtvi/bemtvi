@@ -1707,3 +1707,374 @@ async fn code_action_cancel_resolves_nil() {
         "cancelling applies no edit"
     );
 }
+
+// ===== `nx.lsp.code_action(opts)` — kind filter + one-shot apply =====
+// docs/plans/2026-07-23-code-action-filter-apply.md. `context.only` narrows which
+// actions are offered (sent to the server AND re-applied to the reply); `apply` skips
+// the chooser when exactly ONE action survives — the difference between a one-shot
+// action and one with options.
+
+/// A two-action mock script: a `source.fixAll.mock` action rewriting line 0 and an
+/// unrelated `quickfix` action rewriting line 1, so which one ran is visible in the
+/// buffer. `extra` splices in further script fields.
+fn two_kind_mock(uri: &str, extra: &str) -> String {
+    format!(
+        r#"{{
+            {extra}
+            "code_action": [
+                {{
+                    "title": "Fix all mock issues",
+                    "kind": "source.fixAll.mock",
+                    "edit": {{ "changes": {{ "{uri}": [
+                        {{ "range": {{ "start": {{ "line": 0, "character": 0 }}, "end": {{ "line": 0, "character": 3 }} }}, "newText": "FIXED" }}
+                    ] }} }}
+                }},
+                {{
+                    "title": "Quick fix this line",
+                    "kind": "quickfix",
+                    "edit": {{ "changes": {{ "{uri}": [
+                        {{ "range": {{ "start": {{ "line": 1, "character": 0 }}, "end": {{ "line": 1, "character": 3 }} }}, "newText": "QUICK" }}
+                    ] }} }}
+                }}
+            ]
+        }}"#
+    )
+}
+
+/// `context.only` goes out **on the wire** as the request's `context.only`, not just as
+/// a client-side filter: the mock echoes back what it received as the action's title.
+#[tokio::test]
+async fn code_action_only_is_sent_to_the_server() {
+    let _guard = serial_lock().lock().await;
+    let dir = temp_dir("lsp_ca_wire");
+    arm_mock(&dir, r#"{ "code_action_echo_only": true }"#);
+    let (rpc, mut incoming) = open_with_server(&dir, "aaa\n").await;
+    assert!(
+        await_lua_eq(&rpc, "#nx.lsp.clients({ bufnr = 0 })", "1").await,
+        "the mock server should attach"
+    );
+
+    // No `apply`, so the chooser opens and shows the echoed title.
+    exec_lua(
+        &rpc,
+        r#"nx.lsp.code_action({ context = { only = { "source.fixAll", "quickfix" } } })"#,
+    )
+    .await;
+    let rows = poll_menu_items(&rpc, &mut incoming)
+        .await
+        .expect("the echoed action should open the chooser");
+    assert!(
+        rows.iter()
+            .any(|r| r.contains("only=[source.fixAll,quickfix]")),
+        "the server should have received context.only verbatim, got {rows:?}"
+    );
+    feed(&rpc, "<Esc>");
+}
+
+/// The headline: `{ context = { only = … }, apply = true }` with a single surviving
+/// action applies it **with no chooser** — nothing is typed, no menu is answered, and
+/// only the filtered action's edit lands. This is what makes `code_action` usable as a
+/// save action. Here the mock is compliant (it honors `context.only` and drops the
+/// `quickfix` action itself), and `source.fixAll` matches the hierarchy below it
+/// (`source.fixAll.mock`).
+#[tokio::test]
+async fn code_action_only_and_apply_is_a_one_shot_with_no_chooser() {
+    let _guard = serial_lock().lock().await;
+    let dir = temp_dir("lsp_ca_oneshot");
+    let uri = file_uri(&dir, "a.rs");
+    arm_mock(&dir, &two_kind_mock(&uri, ""));
+    let (rpc, _incoming) = open_with_server(&dir, "aaa\nbbb\n").await;
+    assert!(
+        await_lua_eq(&rpc, "#nx.lsp.clients({ bufnr = 0 })", "1").await,
+        "the mock server should attach"
+    );
+
+    exec_lua(
+        &rpc,
+        r#"
+        _G.shot_done = false
+        nx.lsp.code_action({ context = { only = { "source.fixAll" } }, apply = true })
+            :next(function() _G.shot_done = true end)
+        "#,
+    )
+    .await;
+
+    assert!(
+        await_lua_eq(&rpc, "tostring(_G.shot_done)", "true").await,
+        "the one-shot promise settles without any pick"
+    );
+    assert_eq!(
+        lines(&rpc).await,
+        vec!["FIXED", "bbb"],
+        "only the filtered action applied, and it applied without the chooser"
+    );
+}
+
+/// The counterpart: when the filter leaves **more than one** action there is a real
+/// choice to make, so `apply` still opens the chooser rather than guessing. Both
+/// matching actions are listed; picking one applies it.
+#[tokio::test]
+async fn code_action_apply_with_several_matches_still_opens_the_chooser() {
+    let _guard = serial_lock().lock().await;
+    let dir = temp_dir("lsp_ca_multi");
+    let uri = file_uri(&dir, "a.rs");
+    // Both actions are under `source.fixAll`, so the filter can't narrow to one.
+    arm_mock(
+        &dir,
+        &format!(
+            r#"{{
+                "code_action": [
+                    {{
+                        "title": "Fix all with mock",
+                        "kind": "source.fixAll.mock",
+                        "edit": {{ "changes": {{ "{uri}": [
+                            {{ "range": {{ "start": {{ "line": 0, "character": 0 }}, "end": {{ "line": 0, "character": 3 }} }}, "newText": "FIRST" }}
+                        ] }} }}
+                    }},
+                    {{
+                        "title": "Fix all with other",
+                        "kind": "source.fixAll.other",
+                        "edit": {{ "changes": {{ "{uri}": [
+                            {{ "range": {{ "start": {{ "line": 0, "character": 0 }}, "end": {{ "line": 0, "character": 3 }} }}, "newText": "SECOND" }}
+                        ] }} }}
+                    }}
+                ]
+            }}"#
+        ),
+    );
+    let (rpc, mut incoming) = open_with_server(&dir, "aaa\nbbb\n").await;
+    assert!(
+        await_lua_eq(&rpc, "#nx.lsp.clients({ bufnr = 0 })", "1").await,
+        "the mock server should attach"
+    );
+
+    exec_lua(
+        &rpc,
+        r#"
+        _G.multi_done = false
+        nx.lsp.code_action({ context = { only = { "source.fixAll" } }, apply = true })
+            :next(function() _G.multi_done = true end)
+        "#,
+    )
+    .await;
+
+    let rows = poll_menu_items(&rpc, &mut incoming).await;
+    let rows = rows.expect("two matching actions must still open the chooser");
+    assert!(
+        rows.iter().any(|r| r.contains("Fix all with mock"))
+            && rows.iter().any(|r| r.contains("Fix all with other")),
+        "both surviving actions are offered, got {rows:?}"
+    );
+    // The chooser opens noselect, so highlight then confirm.
+    feed(&rpc, "<C-n>");
+    feed(&rpc, "<CR>");
+    assert!(
+        await_lua_eq(&rpc, "tostring(_G.multi_done)", "true").await,
+        "picking an action settles the promise"
+    );
+    assert_eq!(
+        lines(&rpc).await.first().map(String::as_str),
+        Some("FIRST"),
+        "the picked action applied"
+    );
+}
+
+/// Honoring `context.only` is a protocol *should*, so the editor re-applies the filter
+/// to the reply. With a server that returns everything regardless
+/// (`code_action_ignore_only`), the one-shot still applies the right action — the
+/// client-side filter carries it, including the `source.fixAll` → `source.fixAll.mock`
+/// hierarchy match.
+#[tokio::test]
+async fn code_action_only_is_enforced_client_side_when_the_server_ignores_it() {
+    let _guard = serial_lock().lock().await;
+    let dir = temp_dir("lsp_ca_noncompliant");
+    let uri = file_uri(&dir, "a.rs");
+    arm_mock(
+        &dir,
+        &two_kind_mock(&uri, r#""code_action_ignore_only": true,"#),
+    );
+    let (rpc, _incoming) = open_with_server(&dir, "aaa\nbbb\n").await;
+    assert!(
+        await_lua_eq(&rpc, "#nx.lsp.clients({ bufnr = 0 })", "1").await,
+        "the mock server should attach"
+    );
+
+    exec_lua(
+        &rpc,
+        r#"
+        _G.ncf_done = false
+        nx.lsp.code_action({ context = { only = { "source.fixAll" } }, apply = true })
+            :next(function() _G.ncf_done = true end)
+        "#,
+    )
+    .await;
+
+    assert!(
+        await_lua_eq(&rpc, "tostring(_G.ncf_done)", "true").await,
+        "the one-shot settles even though the server returned both actions"
+    );
+    assert_eq!(
+        lines(&rpc).await,
+        vec!["FIXED", "bbb"],
+        "the editor's own filter dropped the unmatched `quickfix` action, leaving one"
+    );
+}
+
+/// A filter nothing matches is the existing empty-reply path: a message, no edit, and
+/// the promise resolves `nil` (so a save chain proceeds rather than hanging).
+#[tokio::test]
+async fn code_action_only_with_no_match_resolves_nil() {
+    let _guard = serial_lock().lock().await;
+    let dir = temp_dir("lsp_ca_nomatch");
+    let uri = file_uri(&dir, "a.rs");
+    arm_mock(
+        &dir,
+        &two_kind_mock(&uri, r#""code_action_ignore_only": true,"#),
+    );
+    let (rpc, _incoming) = open_with_server(&dir, "aaa\nbbb\n").await;
+    assert!(
+        await_lua_eq(&rpc, "#nx.lsp.clients({ bufnr = 0 })", "1").await,
+        "the mock server should attach"
+    );
+
+    exec_lua(
+        &rpc,
+        r#"
+        _G.nomatch_done = false
+        _G.nomatch_res = "unset"
+        nx.lsp.code_action({ context = { only = { "source.organizeImports" } }, apply = true })
+            :next(function(res)
+                _G.nomatch_res = res
+                _G.nomatch_done = true
+            end)
+        "#,
+    )
+    .await;
+
+    assert!(
+        await_lua_eq(&rpc, "tostring(_G.nomatch_done)", "true").await,
+        "a filter with no match still settles the promise"
+    );
+    assert_eq!(
+        exec_lua(&rpc, "return _G.nomatch_res == nil")
+            .await
+            .as_bool(),
+        Some(true),
+        "no matching action resolves nil"
+    );
+    assert_eq!(
+        lines(&rpc).await,
+        vec!["aaa", "bbb"],
+        "no action matched, so nothing was applied"
+    );
+}
+
+/// The one-shot chains like any other verb: `code_action(...):next(format)` — the
+/// canonical fixAll-then-format save chain, with no interaction anywhere in it.
+#[tokio::test]
+async fn code_action_one_shot_chains_into_format() {
+    let _guard = serial_lock().lock().await;
+    let dir = temp_dir("lsp_ca_shot_chain");
+    let uri = file_uri(&dir, "a.rs");
+    arm_mock(
+        &dir,
+        &format!(
+            r#"{{
+                "code_action": [
+                    {{
+                        "title": "Fix all mock issues",
+                        "kind": "source.fixAll.mock",
+                        "edit": {{ "changes": {{ "{uri}": [
+                            {{ "range": {{ "start": {{ "line": 0, "character": 0 }}, "end": {{ "line": 0, "character": 3 }} }}, "newText": "FIXED" }}
+                        ] }} }}
+                    }}
+                ],
+                "formatting": [
+                    {{ "range": {{ "start": {{ "line": 1, "character": 0 }}, "end": {{ "line": 1, "character": 3 }} }}, "newText": "FMT" }}
+                ]
+            }}"#
+        ),
+    );
+    let (rpc, _incoming) = open_with_server(&dir, "aaa\nbbb\n").await;
+    assert!(
+        await_lua_eq(&rpc, "#nx.lsp.clients({ bufnr = 0 })", "1").await,
+        "the mock server should attach"
+    );
+
+    exec_lua(
+        &rpc,
+        r#"
+        _G.shot_chain = {}
+        local function snap()
+            return table.concat(vim.api.nvim_buf_get_lines(0, 0, -1, false), "|")
+        end
+        nx.lsp.code_action({ context = { only = { "source.fixAll" } }, apply = true })
+            :next(function()
+                table.insert(_G.shot_chain, snap())   -- fixAll applied, format not yet
+                return nx.lsp.format()
+            end):next(function()
+                table.insert(_G.shot_chain, snap())   -- format applied on top
+            end)
+        "#,
+    )
+    .await;
+
+    assert!(
+        await_lua_eq(&rpc, "tostring(#_G.shot_chain)", "2").await,
+        "both continuations run with no interaction at all"
+    );
+    assert_eq!(
+        exec_lua(&rpc, "return _G.shot_chain[1]").await.as_str(),
+        Some("FIXED|bbb"),
+        "the first continuation sees the one-shot action applied"
+    );
+    assert_eq!(
+        lines(&rpc).await,
+        vec!["FIXED", "FMT"],
+        "fixAll then format, in order"
+    );
+}
+
+/// An option nxvim doesn't model fails LOUD rather than being silently dropped — a
+/// quietly-ignored `filter` would apply the wrong action.
+#[tokio::test]
+async fn code_action_rejects_unsupported_options() {
+    let _guard = serial_lock().lock().await;
+    let dir = temp_dir("lsp_ca_badopts");
+    arm_mock(&dir, "{}");
+    let (rpc, _incoming) = open_with_server(&dir, "aaa\n").await;
+
+    for (expr, want) in [
+        (
+            "nx.lsp.code_action({ filter = function() end })",
+            "unsupported option 'filter'",
+        ),
+        (
+            "nx.lsp.code_action({ only = { 'source.fixAll' } })",
+            "unsupported option 'only'",
+        ),
+        (
+            "nx.lsp.code_action({ context = { diagnostics = {} } })",
+            "unsupported option 'context.diagnostics'",
+        ),
+        (
+            "nx.lsp.code_action({ context = { only = 'source.fixAll' } })",
+            "must be a list of kind strings",
+        ),
+        (
+            "nx.lsp.code_action({ apply = 'yes' })",
+            "opts.apply must be a boolean",
+        ),
+    ] {
+        let got = exec_lua(
+            &rpc,
+            &format!("local ok, err = pcall(function() {expr} end) return tostring(ok) .. '|' .. tostring(err)"),
+        )
+        .await;
+        let got = got.as_str().unwrap_or("");
+        assert!(
+            got.starts_with("false|") && got.contains(want),
+            "`{expr}` should fail loud with {want:?}, got {got:?}"
+        );
+    }
+}

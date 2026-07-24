@@ -118,7 +118,9 @@ impl EditHost {
                 self.apply_lua_effects();
             }
             "LspRename" => self.request_lsp_rename(args, 0),
-            "LspCodeAction" => self.request_lsp_code_action(0),
+            // The ex-command is always the interactive, unfiltered form — the kind
+            // filter / one-shot apply are `nx.lsp.code_action(opts)` options.
+            "LspCodeAction" => self.request_lsp_code_action(0, Default::default()),
             // `:au[tocmd]` / `:aug[roup]` / `:doau[tocmd]` (with abbreviations and
             // an optional `!`) drive the Lua autocmd registry. The core defers
             // them here; the prelude parses the argument line so the `:`-command

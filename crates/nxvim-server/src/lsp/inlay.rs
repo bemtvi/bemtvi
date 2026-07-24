@@ -329,7 +329,7 @@ impl EditHost {
     /// shape): bump the generation and record the issuing `buffer` + `changedtick`,
     /// so a reply computed against superseded text is dropped.
     fn register_inlay_request(&mut self, buffer: BufferId) -> nxvim_lsp::ReqToken {
-        use super::{LspReqKind, PendingLspReq};
+        use super::{CodeActionOpts, LspReqKind, PendingLspReq};
         self.lsp_req_gen += 1;
         let generation = self.lsp_req_gen;
         let tick = self.editor.buffer_of(buffer).map_or(0, |b| b.changedtick);
@@ -342,6 +342,7 @@ impl EditHost {
                 tick,
                 // Whole-buffer refresh, not a user verb — no promise to settle.
                 cb_id: 0,
+                code_action: CodeActionOpts::default(),
             },
         );
         nxvim_lsp::ReqToken {

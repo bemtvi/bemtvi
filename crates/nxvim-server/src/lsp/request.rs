@@ -134,6 +134,17 @@ impl EditHost {
     /// than left to hang — its reply, if it ever lands, is dropped on the
     /// generation mismatch.
     pub(crate) fn register_lsp_request(&mut self, kind: LspReqKind, cb_id: u64) -> ReqToken {
+        self.register_lsp_request_with(kind, cb_id, CodeActionOpts::default())
+    }
+
+    /// [`register_lsp_request`](Self::register_lsp_request) carrying the code-action
+    /// options (`only` / `apply`) the reply needs; every other kind uses the default.
+    pub(crate) fn register_lsp_request_with(
+        &mut self,
+        kind: LspReqKind,
+        cb_id: u64,
+        code_action: CodeActionOpts,
+    ) -> ReqToken {
         self.lsp_req_gen += 1;
         let generation = self.lsp_req_gen;
         if let Some(prev) = self.lsp_requests.insert(
@@ -144,6 +155,7 @@ impl EditHost {
                 cursor: (self.editor.cursor.line, self.editor.cursor.col),
                 tick: self.editor.buffer().changedtick,
                 cb_id,
+                code_action,
             },
         ) {
             self.settle_lsp_promise(prev.cb_id, serde_json::Value::Null);
@@ -309,7 +321,12 @@ impl EditHost {
     /// listed in the panel; `<CR>` applies the chosen action's eager edit. `cb_id`
     /// (`0` = fire-and-forget) is the promise the reply *stashes* onto the chooser menu
     /// and settles once the picked action's edit applies (or `nil` on cancel).
-    pub(crate) fn request_lsp_code_action(&mut self, cb_id: u64) {
+    ///
+    /// `opts` carries the caller's kind filter and one-shot request
+    /// (`nx.lsp.code_action{ context = { only = … }, apply = true }`): `only` rides the
+    /// request as `context.only` **and** is re-applied to the reply, and `apply` skips
+    /// the chooser when exactly one action survives ([`EditHost::show_code_actions`]).
+    pub(crate) fn request_lsp_code_action(&mut self, cb_id: u64, opts: CodeActionOpts) {
         let Some((key, uri, encoding)) = self.lsp_target_or_echo() else {
             self.settle_lsp_promise(cb_id, serde_json::Value::Null);
             return;
@@ -317,7 +334,8 @@ impl EditHost {
         let (row, col) = (self.editor.cursor.line, self.editor.cursor.col);
         let position = self.lsp_position(encoding, row, col);
         let diagnostics = self.diagnostics_at_cursor();
-        let token = self.register_lsp_request(LspReqKind::CodeAction, cb_id);
+        let only = opts.only.clone();
+        let token = self.register_lsp_request_with(LspReqKind::CodeAction, cb_id, opts);
         self.fx.lsp_request(
             key,
             token,
@@ -330,6 +348,7 @@ impl EditHost {
                     end: position,
                 },
                 diagnostics,
+                only,
             },
         );
     }
@@ -396,6 +415,9 @@ impl EditHost {
         // `register_lsp_request`, and a second reply for a handled kind has no live
         // promise. `code_action` stays fire-and-forget until Phase 2 (`cb_id == 0`).
         let cb_id = pending.cb_id;
+        // The code-action request's `only`/`apply` options, needed to filter this reply
+        // and to decide chooser-vs-one-shot. Default (and unused) for every other kind.
+        let code_action = pending.code_action.clone();
         self.lsp_requests.remove(&kind);
 
         match reply {
@@ -477,8 +499,9 @@ impl EditHost {
                 // The reply only opens the chooser; `show_code_actions` takes over the
                 // promise (stashes `cb_id` onto the menu, or settles `nil` on an empty
                 // reply), so it is NOT settled here. It resolves on the confirm/cancel
-                // path (Phase 2).
-                self.show_code_actions(actions, cb_id);
+                // path (Phase 2) — or right away when the request's `apply` option and a
+                // single surviving action make it a one-shot.
+                self.show_code_actions(actions, cb_id, code_action);
                 self.lsp_dirty = true;
             }
             LspReply::ResolvedCodeAction(edit) => {

@@ -11,7 +11,7 @@
 
 use async_lsp::{LanguageServer, ServerSocket};
 use lsp_types::{
-    CodeActionContext, CodeActionParams, CompletionItem, CompletionParams,
+    CodeActionContext, CodeActionKind, CodeActionParams, CompletionItem, CompletionParams,
     DidChangeTextDocumentParams, DidCloseTextDocumentParams, DidOpenTextDocumentParams,
     DidSaveTextDocumentParams, DocumentFormattingParams, DocumentSymbolParams, FoldingRangeParams,
     FormattingOptions, GotoDefinitionParams, HoverParams, InlayHint, InlayHintParams,
@@ -283,13 +283,17 @@ pub(crate) async fn issue_request(
             uri,
             range,
             diagnostics,
+            only,
         } => {
             let params = CodeActionParams {
                 text_document: TextDocumentIdentifier { uri },
                 range,
                 context: CodeActionContext {
                     diagnostics,
-                    only: None,
+                    // The caller's kind filter, when they asked for one. Omitted (not an
+                    // empty list — which would mean "no kinds at all") when they didn't.
+                    only: (!only.is_empty())
+                        .then(|| only.into_iter().map(CodeActionKind::from).collect()),
                     trigger_kind: None,
                 },
                 work_done_progress_params: Default::default(),

@@ -331,6 +331,38 @@ pub(crate) struct PendingLspReq {
     /// the same `kind` can settle the promise it replaces (resolve `nil`), and the
     /// reply can settle it on apply. Mirrors [`ReqToken::cb_id`].
     pub(crate) cb_id: u64,
+    /// The caller's `nx.lsp.code_action{ context = { only = … }, apply = … }` options,
+    /// needed at *reply* time (which actions survive the filter, and whether a single
+    /// survivor is applied without the chooser). Default (no filter, no auto-apply) for
+    /// every other kind.
+    pub(crate) code_action: CodeActionOpts,
+}
+
+/// The options a `nx.lsp.code_action(opts)` call carries from Lua to the reply:
+/// `only` is the kind filter (empty ⇒ every kind) and `apply` asks for a **one-shot**
+/// application when exactly one action survives that filter (more than one still opens
+/// the chooser — there is a choice to make). Sent with the request *and* enforced on the
+/// reply, since honoring `context.only` is a protocol *should*.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct CodeActionOpts {
+    pub(crate) only: Vec<String>,
+    pub(crate) apply: bool,
+}
+
+impl CodeActionOpts {
+    /// Whether `kind` satisfies the filter. No filter ⇒ everything passes. Otherwise the
+    /// action must declare a kind that *is* one of the requested kinds or sits under it
+    /// in the LSP dot-hierarchy (`source.fixAll` accepts `source.fixAll.ruff`, but not
+    /// `source.fixAllTheThings`). A kind-less action never matches a filter.
+    pub(crate) fn matches(&self, kind: Option<&str>) -> bool {
+        if self.only.is_empty() {
+            return true;
+        }
+        let Some(kind) = kind else { return false };
+        self.only
+            .iter()
+            .any(|want| kind == want || kind.starts_with(&format!("{want}.")))
+    }
 }
 
 /// The negotiated runtime state of one server, learned from its `initialize`

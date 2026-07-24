@@ -50,8 +50,8 @@ impl EditHost {
                 self.request_lsp_rename(&new_name, cb_id);
                 return;
             }
-            LspOp::CodeAction { cb_id } => {
-                self.request_lsp_code_action(cb_id);
+            LspOp::CodeAction { cb_id, only, apply } => {
+                self.request_lsp_code_action(cb_id, CodeActionOpts { only, apply });
                 return;
             }
             LspOp::SignatureAutoTrigger { enable } => {

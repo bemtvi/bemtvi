@@ -14,7 +14,7 @@
 use nxvim_core::BufferId;
 use nxvim_lsp::FoldRangeData;
 
-use super::{LspReqKind, PendingLspReq};
+use super::{CodeActionOpts, LspReqKind, PendingLspReq};
 use crate::EditHost;
 
 impl EditHost {
@@ -121,6 +121,7 @@ impl EditHost {
                 tick,
                 // Whole-buffer refresh, not a user verb — no promise to settle.
                 cb_id: 0,
+                code_action: CodeActionOpts::default(),
             },
         );
         nxvim_lsp::ReqToken {

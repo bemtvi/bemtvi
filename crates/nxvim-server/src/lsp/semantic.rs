@@ -233,7 +233,7 @@ impl EditHost {
     /// The cursor field is filled with the current cursor only to satisfy the
     /// shared [`PendingLspReq`] shape; the whole-buffer reply ignores it.
     fn register_semantic_request(&mut self, buffer: BufferId) -> nxvim_lsp::ReqToken {
-        use super::{LspReqKind, PendingLspReq};
+        use super::{CodeActionOpts, LspReqKind, PendingLspReq};
         self.lsp_req_gen += 1;
         let generation = self.lsp_req_gen;
         let tick = self.editor.buffer_of(buffer).map_or(0, |b| b.changedtick);
@@ -246,6 +246,7 @@ impl EditHost {
                 tick,
                 // Whole-buffer refresh, not a user verb — no promise to settle.
                 cb_id: 0,
+                code_action: CodeActionOpts::default(),
             },
         );
         nxvim_lsp::ReqToken {

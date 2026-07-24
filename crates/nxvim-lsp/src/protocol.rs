@@ -222,6 +222,11 @@ pub enum LspRequest {
         uri: Url,
         range: Range,
         diagnostics: Vec<Diagnostic>,
+        /// The caller's kind filter (`nx.lsp.code_action{ context = { only = … } }`),
+        /// sent as the request's `context.only`. Empty ⇒ omitted (every kind).
+        /// Honoring it is a *should* in the protocol, so the editor filters the reply
+        /// by [`CodeActionData::kind`] as well — this is the hint, not the guarantee.
+        only: Vec<String>,
     },
     /// `codeAction/resolve` — populate a lazy action's `edit`. The full original
     /// [`CodeAction`] (incl. its `data`) is round-tripped to the server, which
@@ -472,6 +477,12 @@ pub struct FoldRangeData {
 #[derive(Clone, Debug)]
 pub struct CodeActionData {
     pub title: String,
+    /// The action's `kind` (`"quickfix"`, `"source.fixAll.ruff"`, …), verbatim from the
+    /// server. Carried so the editor can apply the caller's `only` filter itself rather
+    /// than trusting the server to have honored `context.only`. `None` for a bare
+    /// `Command` action, and for a `CodeAction` that declared no kind — neither can
+    /// match a filter.
+    pub kind: Option<String>,
     pub edit: Option<WorkspaceEditData>,
     pub resolve: Option<Box<CodeAction>>,
     pub command: Option<lsp_types::Command>,

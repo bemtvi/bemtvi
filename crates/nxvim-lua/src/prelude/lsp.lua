@@ -539,18 +539,81 @@ function nx.lsp.format()
     nx._lsp_buf_format(id)
   end)
 end
--- `nx.lsp.code_action()`: open the code-action chooser. Unlike the other verbs the
--- reply only *opens the menu*; the returned promise resolves once you pick an action
--- and its edit applies (through a `codeAction/resolve` round-trip if the action is
--- lazy), or `nil` if you cancel the chooser (Esc) — so you can, e.g., organize imports
--- then format:
+-- `nx.lsp.code_action(opts)`: run a code action at the cursor. Bare, it is
+-- interactive — the reply only *opens the chooser menu*, and the returned promise
+-- resolves once you pick an action and its edit applies (through a
+-- `codeAction/resolve` round-trip if the action is lazy), or `nil` if you cancel the
+-- chooser (Esc) — so you can, e.g., organize imports then format:
 --
 -- ```lua
 -- nx.lsp.code_action():next(function() return nx.lsp.format() end)
 -- ```
-function nx.lsp.code_action()
+--
+-- `opts` narrows it to a specific action, which is what makes it usable
+-- **non-interactively** (a format-on-save chain, say):
+--
+-- ```lua
+-- nx.lsp.code_action({ context = { only = { "source.fixAll" } }, apply = true })
+-- ```
+--
+-- ```
+-- context.only   list of code-action kinds to ask for; sent as the request's
+--                `context.only` AND re-applied to the reply (honoring it is a
+--                protocol "should", so a server that ignores it can't turn a
+--                one-shot into a chooser). Matching follows the LSP kind
+--                hierarchy: `"source.fixAll"` matches the kind `source.fixAll`
+--                and `source.fixAll.ruff`. An action with no kind never matches.
+-- apply          when exactly ONE action survives the filter, apply it directly
+--                with no chooser. Two or more still open the chooser (there is a
+--                real choice to make); none echoes "No code actions available"
+--                and the promise resolves `nil`.
+-- ```
+--
+-- Anything else in `opts` (neovim's `filter`, `range`, `context.diagnostics`,
+-- `context.triggerKind`) is **rejected loudly** rather than silently ignored — nxvim
+-- doesn't model it yet, and a quietly-dropped filter would silently do the wrong thing.
+function nx.lsp.code_action(opts)
+  local only, apply = {}, false
+  if opts ~= nil then
+    if type(opts) ~= "table" then
+      error("nx.lsp.code_action: opts must be a table, got " .. type(opts), 2)
+    end
+    for k in pairs(opts) do
+      if k ~= "context" and k ~= "apply" then
+        error("nx.lsp.code_action: unsupported option '" .. tostring(k) .. "'", 2)
+      end
+    end
+    if opts.apply ~= nil then
+      if type(opts.apply) ~= "boolean" then
+        error("nx.lsp.code_action: opts.apply must be a boolean", 2)
+      end
+      apply = opts.apply
+    end
+    local ctx = opts.context
+    if ctx ~= nil then
+      if type(ctx) ~= "table" then
+        error("nx.lsp.code_action: opts.context must be a table", 2)
+      end
+      for k in pairs(ctx) do
+        if k ~= "only" then
+          error("nx.lsp.code_action: unsupported option 'context." .. tostring(k) .. "'", 2)
+        end
+      end
+      if ctx.only ~= nil then
+        if type(ctx.only) ~= "table" then
+          error("nx.lsp.code_action: opts.context.only must be a list of kind strings", 2)
+        end
+        for _, kind in ipairs(ctx.only) do
+          if type(kind) ~= "string" then
+            error("nx.lsp.code_action: opts.context.only must be a list of kind strings", 2)
+          end
+          only[#only + 1] = kind
+        end
+      end
+    end
+  end
   return lsp_promise(function(id)
-    nx._lsp_buf_code_action(id)
+    nx._lsp_buf_code_action(id, only, apply)
   end)
 end
 
@@ -890,8 +953,11 @@ vim.lsp.buf.signature_help = nx.lsp.signature_help
 vim.lsp.buf.format = function(_opts)
   return nx.lsp.format()
 end
-vim.lsp.buf.code_action = function(_opts)
-  return nx.lsp.code_action()
+-- The alias forwards `opts` — `context.only` / `apply` are modeled (see
+-- `nx.lsp.code_action`); neovim's `filter` / `range` are not, and are rejected there
+-- rather than silently dropped.
+vim.lsp.buf.code_action = function(opts)
+  return nx.lsp.code_action(opts)
 end
 vim.lsp.buf.rename = function(name, _opts)
   return nx.lsp.rename(name)

@@ -293,13 +293,20 @@ pub enum LspOp {
         /// applies (`0` = fire-and-forget).
         cb_id: u64,
     },
-    /// `nx.lsp.code_action()` — request `textDocument/codeAction` at the cursor.
+    /// `nx.lsp.code_action(opts)` — request `textDocument/codeAction` at the cursor.
     CodeAction {
         /// The `nx._cb_fns` id that settles the promise (`0` = fire-and-forget). Unlike
         /// the other verbs the reply only *opens the chooser menu*; the promise settles
         /// later — once the user picks an action and its edit applies (through a
         /// `codeAction/resolve` round-trip if lazy), or `nil` if the menu is cancelled.
         cb_id: u64,
+        /// `opts.context.only` — the kind filter (`{"source.fixAll"}`, …). Sent as the
+        /// request's `context.only` *and* re-applied to the reply. Empty ⇒ every kind.
+        only: Vec<String>,
+        /// `opts.apply` — apply the action without the chooser when exactly **one**
+        /// survives the filter. Two or more still open the chooser (a real choice);
+        /// none echoes "No code actions available".
+        apply: bool,
     },
     /// `nx.lsp.signature_help_autotrigger(enable)` — opt into (or out of) auto-showing
     /// signature help as you type a call, driven by the server's advertised trigger

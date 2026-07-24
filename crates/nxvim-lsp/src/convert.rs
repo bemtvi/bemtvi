@@ -47,6 +47,9 @@ pub(crate) fn code_actions(resp: CodeActionResponse) -> Vec<CodeActionData> {
         .map(|item| match item {
             CodeActionOrCommand::CodeAction(mut ca) => {
                 let title = ca.title.clone();
+                // The kind rides along so the editor can enforce the caller's `only`
+                // filter itself (a server may ignore the request's `context.only`).
+                let kind = ca.kind.as_ref().map(|k| k.as_str().to_string());
                 // Move the edit/command out rather than cloning (a `WorkspaceEdit`
                 // is a deep tree); the `resolve` branch below only fires when both
                 // are `None`, so the boxed original is unchanged by taking them.
@@ -57,6 +60,7 @@ pub(crate) fn code_actions(resp: CodeActionResponse) -> Vec<CodeActionData> {
                 let resolve = (edit.is_none() && command.is_none()).then(|| Box::new(ca));
                 CodeActionData {
                     title,
+                    kind,
                     edit,
                     resolve,
                     command,
@@ -64,6 +68,8 @@ pub(crate) fn code_actions(resp: CodeActionResponse) -> Vec<CodeActionData> {
             }
             CodeActionOrCommand::Command(cmd) => CodeActionData {
                 title: cmd.title.clone(),
+                // A bare `Command` carries no kind — it can never match an `only` filter.
+                kind: None,
                 edit: None,
                 resolve: None,
                 command: Some(cmd),

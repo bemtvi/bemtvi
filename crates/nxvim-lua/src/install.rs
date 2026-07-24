@@ -2502,13 +2502,18 @@ pub(crate) fn install_runtime_api(
         })?,
     )?;
 
-    // `nx._lsp_buf_code_action(cb_id)`: queue [`LspOp::CodeAction`]. `cb_id` (`0` =
-    // fire-and-forget) settles the promise once the picked action's edit applies.
+    // `nx._lsp_buf_code_action(cb_id, only, apply)`: queue [`LspOp::CodeAction`].
+    // `cb_id` (`0` = fire-and-forget) settles the promise once the picked (or
+    // one-shot-applied) action's edit applies. `only` is the kind filter the prelude
+    // extracted from `opts.context.only` (an empty list = no filter) and `apply` asks
+    // for the chooser to be skipped when exactly one action survives it.
     let sh = shared.clone();
     nx.set(
         "_lsp_buf_code_action",
-        lua.create_function(move |_, cb_id: u64| {
-            sh.borrow_mut().lsp_ops.push(LspOp::CodeAction { cb_id });
+        lua.create_function(move |_, (cb_id, only, apply): (u64, Vec<String>, bool)| {
+            sh.borrow_mut()
+                .lsp_ops
+                .push(LspOp::CodeAction { cb_id, only, apply });
             Ok(())
         })?,
     )?;

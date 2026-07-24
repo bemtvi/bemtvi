@@ -46,7 +46,16 @@
 //! - `code_action`: the `(CodeAction | Command)[]` returned for
 //!   `textDocument/codeAction` (tests script `CodeAction`s carrying an eager
 //!   `edit`, or lazy ones with only `data` to drive `codeAction/resolve`). Absent
-//!   ⇒ `null` (no actions).
+//!   ⇒ `null` (no actions). The list is **filtered by the request's
+//!   `context.only`** (kind hierarchy: `source.fixAll` matches `source.fixAll.ruff`)
+//!   the way a compliant server filters, so a test can tell whether the editor sent
+//!   the filter at all.
+//! - `code_action_ignore_only`: `true` scripts a **non-compliant** server that
+//!   returns every scripted action even when the request carried `context.only` —
+//!   the case the editor's own reply-side filter has to cover.
+//! - `code_action_echo_only`: `true` replies with a single action whose *title* is
+//!   the `context.only` the request carried (`only=[source.fixAll]`), so a test can
+//!   read what actually went over the wire off the chooser.
 //! - `code_action_resolve`: the resolved `CodeAction` (with its `edit` filled in)
 //!   returned for `codeAction/resolve`. Absent ⇒ `null`.
 //! - `completion_resolve`: the resolved `CompletionItem` (its lazy
@@ -247,7 +256,63 @@ pub fn run(script_path: &str) {
             "textDocument/signatureHelp" => reply_scripted(&stdout, id, &script, "signature_help"),
             "textDocument/formatting" => reply_scripted(&stdout, id, &script, "formatting"),
             "textDocument/rename" => reply_scripted(&stdout, id, &script, "rename"),
-            "textDocument/codeAction" => reply_scripted(&stdout, id, &script, "code_action"),
+            // Code actions: a REAL server honors the request's `context.only`, so the
+            // mock does too — the scripted `code_action` list is filtered by the kinds
+            // the editor asked for (LSP kind hierarchy: `source.fixAll` matches
+            // `source.fixAll.ruff`). That makes "did the editor send `only`?" observable.
+            // `code_action_ignore_only` scripts the *non-compliant* server that returns
+            // everything regardless — the case the editor's own filter has to cover.
+            "textDocument/codeAction" => {
+                if let Some(id) = id {
+                    let actions = script.get("code_action").cloned().unwrap_or(Value::Null);
+                    let only = msg
+                        .pointer("/params/context/only")
+                        .and_then(Value::as_array)
+                        .cloned()
+                        .unwrap_or_default();
+                    let ignore_only = script
+                        .get("code_action_ignore_only")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false);
+                    // `code_action_echo_only`: reply with a single action whose TITLE is
+                    // the `context.only` the request carried, so a test can read the
+                    // wire off the chooser (the kinds are echoed as the action's kind
+                    // too, so it survives the editor's own filter).
+                    if script
+                        .get("code_action_echo_only")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false)
+                    {
+                        let kinds: Vec<&str> = only.iter().filter_map(Value::as_str).collect();
+                        write_response(
+                            &stdout,
+                            id,
+                            json!([{
+                                "title": format!("only=[{}]", kinds.join(",")),
+                                "kind": kinds.first().copied().unwrap_or("quickfix"),
+                            }]),
+                        );
+                        continue;
+                    }
+                    let result = match (&actions, only.is_empty() || ignore_only) {
+                        (Value::Array(list), false) => Value::Array(
+                            list.iter()
+                                .filter(|a| {
+                                    let kind = a.get("kind").and_then(Value::as_str);
+                                    only.iter().any(|o| {
+                                        o.as_str().zip(kind).is_some_and(|(o, k)| {
+                                            k == o || k.starts_with(&format!("{o}."))
+                                        })
+                                    })
+                                })
+                                .cloned()
+                                .collect(),
+                        ),
+                        _ => actions,
+                    };
+                    write_response(&stdout, id, result);
+                }
+            }
             "codeAction/resolve" => reply_scripted(&stdout, id, &script, "code_action_resolve"),
             // Completion: a `completion_sequence` entry (one per request) wins over
             // the single `completion` field, so a test can narrow the list on the

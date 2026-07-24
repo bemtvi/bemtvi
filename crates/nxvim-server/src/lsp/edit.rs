@@ -248,10 +248,46 @@ impl EditHost {
     /// `cb_id` (`0` = fire-and-forget) is the async `code_action` promise: it is
     /// *stashed* onto the chooser (settled later on the confirm/cancel path), or
     /// settled `nil` now on an empty reply.
-    pub(crate) fn show_code_actions(&mut self, actions: Vec<CodeActionData>, cb_id: u64) {
+    ///
+    /// `opts` is the caller's `nx.lsp.code_action{ context = { only = … }, apply = … }`:
+    /// the reply is filtered by `only` here as well as at the server (honoring
+    /// `context.only` is a protocol *should*, so a non-compliant server must not turn a
+    /// one-shot into a chooser), and `apply` distinguishes the **one-shot** case from
+    /// the one with **options** — a single survivor is applied straight away, two or
+    /// more still open the chooser because there is a genuine choice to make.
+    pub(crate) fn show_code_actions(
+        &mut self,
+        actions: Vec<CodeActionData>,
+        cb_id: u64,
+        opts: CodeActionOpts,
+    ) {
+        let actions: Vec<CodeActionData> = actions
+            .into_iter()
+            .filter(|a| opts.matches(a.kind.as_deref()))
+            .collect();
         if actions.is_empty() {
             self.editor.echo(LspReqKind::CodeAction.empty_message());
             self.settle_lsp_promise(cb_id, serde_json::Value::Null);
+            return;
+        }
+        // One-shot: exactly one action survived a filter the caller asked to auto-apply.
+        // Apply it directly — no menu, so this works headlessly (a save action) and on
+        // the wasm edit-host, which has no confirm→apply path at all.
+        if opts.apply && actions.len() == 1 {
+            self.lsp_code_actions = actions;
+            // A chooser still awaiting a pick is superseded by this apply; settle its
+            // promise `nil` so it can't hang, then take the stash for our own —
+            // `apply_code_action` settles `cb_id` once the edit (or its lazy resolve)
+            // lands, exactly as the confirm path does.
+            let prev = std::mem::replace(&mut self.code_action_cb, cb_id);
+            if prev != 0 {
+                self.settle_lsp_promise(prev, serde_json::Value::Null);
+            }
+            #[cfg(feature = "native")]
+            {
+                self.pending_code_action = false;
+            }
+            self.apply_code_action(0);
             return;
         }
         let lines: Vec<String> = actions.iter().map(|a| a.title.clone()).collect();

@@ -951,6 +951,94 @@ async fn rejecting_async_bufwritepre_still_writes() {
     );
 }
 
+// ----- non-gating events are async-tolerant (promise tracked, not awaited) --
+
+#[tokio::test]
+async fn non_gating_event_async_handler_runs_in_background() {
+    // Only `BufWritePre` *awaits* its handlers; every other event is *async-tolerant*
+    // — a handler may return a promise and the fire returns without blocking, but the
+    // async work must still run to completion (it isn't dropped). Here a `User` handler
+    // flips `_G.ran` a tick after a timer; firing the event returns at once, yet the
+    // background side effect lands. Mutation-test: change the fire path to drop/cancel
+    // the returned promise and `_G.ran` never flips.
+    let dir = temp_dir("au_async_bg");
+    let (rpc, _incoming) = start_with_config(
+        &dir,
+        "_G.ran = false\n\
+         vim.api.nvim_create_autocmd('User', { pattern = 'Bg',\n\
+         \x20 callback = function()\n\
+         \x20   return nx.promise.delay(20):next(function() _G.ran = true end)\n\
+         \x20 end })\n",
+    )
+    .await;
+    // Fire the event; the handler returns its promise and the fire returns immediately.
+    exec_lua(
+        &rpc,
+        "vim.api.nvim_exec_autocmds('User', { pattern = 'Bg' })",
+    )
+    .await;
+    // The timer resolves a tick later; poll for the background side effect. Each
+    // `exec_lua` round-trip also drives a server tick, draining the settled timer.
+    let mut ran = false;
+    for _ in 0..100 {
+        if exec_lua(&rpc, "return _G.ran").await.as_bool() == Some(true) {
+            ran = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    assert!(
+        ran,
+        "an async non-gating handler's promise must run to completion in the background"
+    );
+}
+
+#[tokio::test]
+async fn non_gating_event_async_rejection_surfaces() {
+    // An async-tolerant handler whose promise *rejects* (a failed request, a throw in a
+    // `:next`) must not vanish silently — the fire path tracks it and surfaces the
+    // rejection on the message line, named for the event that raised it. The test
+    // captures `nx.notify` (the reporter the tracker calls); without the tracker's
+    // `:catch` this contextual message never appears (the generic unhandled-rejection
+    // reporter would fire via `vim.notify` instead, which this recorder doesn't see).
+    let dir = temp_dir("au_async_reject");
+    let (rpc, _incoming) = start_with_config(
+        &dir,
+        "_G.notified = {}\n\
+         local orig = nx.notify\n\
+         nx.notify = function(msg, level)\n\
+         \x20 _G.notified[#_G.notified+1] = tostring(msg)\n\
+         \x20 return orig(msg, level)\n\
+         end\n\
+         vim.api.nvim_create_autocmd('User', { pattern = 'Boom',\n\
+         \x20 callback = function()\n\
+         \x20   return nx.promise.delay(20):next(function() error('kaboom') end)\n\
+         \x20 end })\n",
+    )
+    .await;
+    exec_lua(
+        &rpc,
+        "vim.api.nvim_exec_autocmds('User', { pattern = 'Boom' })",
+    )
+    .await;
+    let mut msg = String::new();
+    for _ in 0..100 {
+        msg = exec_lua(&rpc, "return _G.notified[1] or ''")
+            .await
+            .as_str()
+            .unwrap_or("")
+            .to_string();
+        if !msg.is_empty() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    assert!(
+        msg.contains("User") && msg.contains("rejected") && msg.contains("kaboom"),
+        "a rejecting non-gating handler must surface a contextual rejection; got {msg:?}"
+    );
+}
+
 #[tokio::test]
 async fn wall_fires_bufwritepre_before_bytes_per_buffer() {
     // `:wall` must fire `BufWritePre` before each buffer's bytes — and with that buffer

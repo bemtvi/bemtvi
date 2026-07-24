@@ -388,12 +388,33 @@ local function au_dispatch(event, pattern, buf, run)
   end
 end
 
+-- Track the promise a non-gating handler returned. The editor does **not** block on
+-- it — only `BufWritePre` awaits (`nx._fire_gated`); every other event is
+-- *async-tolerant*: a handler may kick off async work (an LSP request from
+-- `CursorMoved`, a `nx.fs` write from `BufWritePost`) and the fire returns without
+-- waiting. But an async-tolerant return must not be *silently dropped* — a handler
+-- whose promise rejects (a failed request, a throw in a `:next`) has to surface, not
+-- vanish. Attaching this `:catch` marks the promise handled, so the generic
+-- unhandled-rejection reporter (`promise.lua`) steps aside and the error lands on the
+-- message line **named for the event that raised it** — which handler failed is the
+-- whole point of surfacing it. A non-promise return is ignored (the common case).
+local function track_au_promise(ret, event)
+  if nx._is_promise(ret) then
+    ret:catch(function(err)
+      nx.notify(
+        "nxvim: autocmd " .. tostring(event) .. " handler rejected: " .. tostring(err),
+        "error"
+      )
+    end)
+  end
+end
+
 function nx._fire(event, pattern, buf, file, data)
   local any = false
   au_dispatch(event, pattern, buf, function(au)
     local cb = au.opts.callback
     if type(cb) == "function" then
-      cb({
+      local ret = cb({
         id = au.id,
         event = event,
         match = pattern,
@@ -401,6 +422,7 @@ function nx._fire(event, pattern, buf, file, data)
         file = file or pattern,
         data = data,
       })
+      track_au_promise(ret, event)
       any = true
     elseif type(au.opts.command) == "string" then
       vim.cmd(au.opts.command)

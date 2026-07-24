@@ -1236,6 +1236,17 @@ pub enum TsOp {
         name: String,
         text: Option<String>,
     },
+    /// `nx.treesitter.highlight(lang, text)`: highlight the off-buffer snippet `text`
+    /// in `lang` (the stateless preview highlighter, injections included) and settle
+    /// the promise `cb_id` with the resulting spans. Lets a plugin token-colour an
+    /// arbitrary snippet — the help window's `>lua` code blocks — without opening a
+    /// buffer. Runs wherever the editor's engine lives; on the wasm serverless build
+    /// (JS-side highlighter) it resolves to no spans, so the caller degrades to plain.
+    Highlight {
+        lang: String,
+        text: String,
+        cb_id: u64,
+    },
 }
 
 /// Where a [`WindowOp::Jump`] opens its target — the picker's confirm gesture.
@@ -1490,6 +1501,16 @@ pub enum CallbackArgs {
     HttpMountResult {
         /// `Ok(origin)` resolves the promise with the bound origin; `Err` rejects it.
         result: Result<String, HttpMountError>,
+    },
+    /// The settled result of a [`TsOp::Highlight`] (`nx.treesitter.highlight`): the
+    /// callback runs as `nx._run_cb(id, false, nil, spans)` where `spans` is an array
+    /// of `{ line, col_start, col_end, group }` tables — 0-based line within the
+    /// snippet, byte columns (`col_end` exclusive), and the tree-sitter capture name.
+    /// Resolve-only; a snippet with no grammar simply settles with an empty array.
+    TsHighlight {
+        /// `(line, col_start_byte, col_end_byte, group)` per span, in snippet
+        /// coordinates — the engine's raw byte offsets, mapped to columns by the caller.
+        spans: Vec<(usize, usize, usize, String)>,
     },
 }
 

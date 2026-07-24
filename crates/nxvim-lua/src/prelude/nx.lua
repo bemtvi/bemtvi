@@ -334,6 +334,26 @@ function nx.treesitter.foldexpr(_lnum)
   )
 end
 
+-- `nx.treesitter.highlight(lang, text)` -> promise of the tree-sitter highlight
+-- spans for the off-buffer snippet `text` in language `lang` — the same stateless
+-- highlighter (injections included) the picker preview uses, exposed so a plugin can
+-- token-colour an arbitrary snippet without opening a buffer (the help window's
+-- `>lua` code blocks are the motivating case). Resolves with an array of
+-- `{ line = <0-based row>, col_start = <byte>, col_end = <byte>, group = <capture> }`
+-- (`col_end` exclusive); the columns are byte offsets within each snippet line, which
+-- a caller maps to extmark columns. Resolve-only: a language with no installed grammar
+-- (and the wasm serverless build, whose highlighter is JS-side) settles with an empty
+-- array, so the caller simply paints nothing.
+function nx.treesitter.highlight(lang, text)
+  return nx.promise.new(function(resolve)
+    local id = nx._next_cb_id()
+    nx._cb_fns[id] = function(_err, spans)
+      resolve(spans or {})
+    end
+    nx._ts_highlight(lang or "", text or "", id)
+  end)
+end
+
 -- vim.* muscle-memory alias (ADR 0002 §4 whitelist): neovim's canonical spelling
 -- `v:lua.vim.treesitter.foldexpr()`. Same native marker — nxvim recognizes both
 -- the `vim.` and `nx.` references.

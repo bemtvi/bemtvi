@@ -721,16 +721,39 @@ impl EditHost {
             }
         }
         // Treesitter bridges from `nx.treesitter`: the query-override push
-        // (`nx.treesitter.set_query`). Highlight on/off and the language are
-        // declarative buffer state now (`nx.bo.ts_highlight` / `nx.bo.filetype`),
-        // not ops. Applying an override drops every buffer's highlight memo so the
-        // next redraw re-queries the engine — the change isn't reflected in any
-        // buffer's changedtick. Native only — the in-process treesitter engine
-        // isn't built for wasm (the browser highlights JS-side in `nxvim-edithost`);
-        // a treesitter op fails loud there.
-        #[cfg(feature = "native")]
+        // (`nx.treesitter.set_query`) and the off-buffer snippet highlighter
+        // (`nx.treesitter.highlight`). `SetQuery` mutates the in-process engine — native
+        // only (the browser highlights JS-side), so it fails loud on wasm; `Highlight`
+        // runs the editor's off-buffer highlighter, which exists in *both* builds (it
+        // just returns no spans on the wasm JS-side engine), so it settles its promise
+        // everywhere and never fails loud.
         for op in self.lua.take_ts_ops() {
             match op {
+                TsOp::Highlight { lang, text, cb_id } => {
+                    // Normalize to the engine's phantom-line invariant (a trailing
+                    // newline: the last line is treated as phantom) and count the content
+                    // lines, then run the same stateless highlighter the preview uses
+                    // (injections included) and settle the promise with the spans.
+                    let text = if text.ends_with('\n') {
+                        text
+                    } else {
+                        format!("{text}\n")
+                    };
+                    let nlines = text.matches('\n').count();
+                    let (spans, _bg) = self.editor.preview_highlights_bg(&lang, &text, 0, nlines);
+                    let spans = spans
+                        .into_iter()
+                        .map(|s| (s.line, s.start_byte, s.end_byte, s.group))
+                        .collect();
+                    if let Err(e) =
+                        self.lua
+                            .run_callback(cb_id, false, CallbackArgs::TsHighlight { spans })
+                    {
+                        self.editor
+                            .echo(format!("E: nx.treesitter.highlight callback: {e}"));
+                    }
+                }
+                #[cfg(feature = "native")]
                 TsOp::SetQuery { lang, name, text } => {
                     // `nx.treesitter.set_query`: install the override on the engine
                     // directly — no Lua merge/resolution. A compile failure echoes
@@ -741,12 +764,13 @@ impl EditHost {
                     self.editor.set_ts_query(&lang, &name, text);
                     self.syntax_states.clear();
                 }
+                #[cfg(not(feature = "native"))]
+                TsOp::SetQuery { .. } => {
+                    self.editor.echo(
+                        "E: nx.treesitter.set_query is not available in the browser build yet",
+                    );
+                }
             }
-        }
-        #[cfg(not(feature = "native"))]
-        if !self.lua.take_ts_ops().is_empty() {
-            self.editor
-                .echo("E: vim.treesitter is not available in the browser build yet");
         }
         // User tree-sitter text-object bindings from `nx.textobject.map`: applied to
         // the editor's text-object registry. Plain editor state (not engine state),
@@ -1923,6 +1947,7 @@ impl EditHost {
                                     Some(f) => (Some(f.text.clone()), f.hl_group.clone()),
                                     None => (None, None),
                                 };
+                            let line_hl_group = d.and_then(|d| d.line_hl_group.clone());
                             ExtmarkMirror {
                                 ns,
                                 id: m.id,
@@ -1936,6 +1961,7 @@ impl EditHost {
                                 sign_hl_group,
                                 line_fill_text,
                                 line_fill_hl,
+                                line_hl_group,
                                 right_gravity: m.right_gravity,
                                 end_right_gravity: m.end_right_gravity,
                             }

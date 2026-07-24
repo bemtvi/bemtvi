@@ -809,3 +809,45 @@ async fn line_hl_group_extmark_renders_as_a_line_bg_layer() {
         "only the marked line is backed, not its neighbours: {line_bg:?}"
     );
 }
+
+#[tokio::test]
+async fn line_hl_group_survives_the_mirror_refresh_in_get_extmarks() {
+    // Regression: `nvim_buf_get_extmarks(details = true)` must keep returning a mark's
+    // `line_hl_group` AFTER the tick, once the server has refreshed the `nx._extmarks`
+    // mirror from the core store — not just from the same-chunk write-through. The
+    // server's `ExtmarkMirror` push dropped `line_hl_group` (only `sign_text` /
+    // `line_fill` round-tripped), so a details read in a *later* chunk lost it — which
+    // broke, e.g., nxvim-help's async code-block token overlay (it reads the code row's
+    // marks a tick after placing them). Set the mark in one chunk, read it in another.
+    let dir = temp_dir("decor_line_hl_roundtrip");
+    let file = dir.join("a.txt");
+    std::fs::write(&file, "one\ntwo\nthree\n").expect("write file");
+    let init = ServerInit {
+        config_dir: Some(dir.to_path_buf()),
+        file: Some(file.to_string_lossy().into_owned()),
+        ..Default::default()
+    };
+    let (rpc, _incoming) = spawn(init);
+    attach(&rpc, 80, 24).await;
+
+    // Chunk 1: place the mark (its `ns` is stable across chunks by name).
+    exec_lua(
+        &rpc,
+        "nx.buf.set_extmark(0, nx.ns.create('rt'), 1, 0, { line_hl_group = 'NxRtBg' })",
+    )
+    .await;
+
+    // Chunk 2 (a fresh tick — the server refreshed the mirror in between): the details
+    // read must still surface `line_hl_group`.
+    let got = exec_lua(
+        &rpc,
+        "local m = nx.buf.extmarks(0, nx.ns.create('rt'), 0, -1, { details = true })\n\
+         return m[1] and m[1][4] and m[1][4].line_hl_group",
+    )
+    .await;
+    assert_eq!(
+        got.as_str(),
+        Some("NxRtBg"),
+        "line_hl_group must round-trip through the server mirror refresh; got {got:?}"
+    );
+}

@@ -1471,6 +1471,10 @@ function nx._set_extmark_mirror(entries)
         decoration = decoration or {}
         decoration.line_fill = { text = m.line_fill_text, hl_group = m.line_fill_hl }
       end
+      if m.line_hl_group ~= nil then
+        decoration = decoration or {}
+        decoration.line_hl_group = m.line_hl_group
+      end
       by_ns[m.ns][m.id] = {
         row = m.row,
         col = m.col,

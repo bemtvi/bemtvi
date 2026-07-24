@@ -243,6 +243,13 @@ pub struct ExtmarkMirror {
     pub line_fill_text: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub line_fill_hl: Option<String>,
+    /// The full-line background group (`line_hl_group`) — round-tripped like the
+    /// signs / line-fill so a `get_extmarks(details=true)` AFTER the tick (once the
+    /// server refreshes this mirror) still surfaces it, not just the same-chunk
+    /// write-through. It RENDERS via the per-window `line_bg` layer, so it is real
+    /// state a details read must keep returning.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub line_hl_group: Option<String>,
     /// Anchor gravity — round-tripped so a `get_extmarks(details=true)` after the tick
     /// surfaces the same flags the write-through stored. Only the *non-default* value
     /// rides the wire (start defaults right-gravity `true`, end defaults left-gravity,
@@ -2420,6 +2427,22 @@ impl LuaRuntime {
                         run.call::<()>((id, keep, mlua::Value::Table(err), mlua::Value::Nil))
                     }
                 }
+            }
+            CallbackArgs::TsHighlight { spans } => {
+                // `nx.treesitter.highlight` settle: fire `nx._run_cb(id, false, nil,
+                // spans)` with an array of `{ line, col_start, col_end, group }` tables
+                // (0-based line, byte columns). Resolve-only — an ungrammar'd snippet
+                // settles with an empty array, so the caller just paints nothing.
+                let arr = self.lua.create_table()?;
+                for (i, (line, start, end, group)) in spans.into_iter().enumerate() {
+                    let t = self.lua.create_table()?;
+                    t.set("line", line)?;
+                    t.set("col_start", start)?;
+                    t.set("col_end", end)?;
+                    t.set("group", self.lua.create_string(&group)?)?;
+                    arr.set(i + 1, t)?;
+                }
+                run.call::<()>((id, keep, mlua::Value::Nil, mlua::Value::Table(arr)))
             }
         }
     }

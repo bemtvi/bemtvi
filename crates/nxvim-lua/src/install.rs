@@ -3846,6 +3846,22 @@ pub(crate) fn install_runtime_api(
         )?,
     )?;
 
+    // `nx._ts_highlight(lang, text, cb_id)`: the native highlighter behind the
+    // promise `nx.treesitter.highlight`. Queues a [`TsOp::Highlight`] the server
+    // runs through the off-buffer tree-sitter path (injections included) and settles
+    // `cb_id` with the resulting spans. Lets a plugin token-colour a snippet — the
+    // help window's `>lua` code blocks — with no buffer.
+    let sh = shared.clone();
+    nx.set(
+        "_ts_highlight",
+        lua.create_function(move |_, (lang, text, cb_id): (String, String, u64)| {
+            sh.borrow_mut()
+                .ts_ops
+                .push(TsOp::Highlight { lang, text, cb_id });
+            Ok(())
+        })?,
+    )?;
+
     // `nx._textobject_map(lhs, capture|nil)`: the native setter behind
     // `nx.textobject.map`. Queues a [`TextObjectOp`] the server applies to the
     // editor's text-object registry — bind `lhs` (`"il"`, `"af"`) to the exact

@@ -467,21 +467,28 @@ impl EditHost {
         }
     }
 
-    /// The cached diagnostics whose range covers the cursor, cloned as the
-    /// `context.diagnostics` for a code-action request (empty when none / no
-    /// server). They are already in the server's negotiated encoding, as the
-    /// server sent them.
-    pub(crate) fn diagnostics_at_cursor(&self) -> Vec<Diagnostic> {
+    /// The cached diagnostics **overlapping** the 0-based, end-exclusive buffer range
+    /// `(start_row, start_col, end_row, end_col)` — the `context.diagnostics` a
+    /// code-action request carries, so a quickfix action offered over a selection is
+    /// given the very diagnostics that selection covers. An empty range (a point at
+    /// the cursor) reads as one byte wide, which is what makes the cursor case
+    /// "the diagnostics under the cursor"; a zero-width *diagnostic* is likewise
+    /// treated as one byte wide, so it can still be hit.
+    pub(crate) fn diagnostics_in_range(
+        &self,
+        (s_row, s_col, e_row, e_col): (usize, usize, usize, usize),
+    ) -> Vec<Diagnostic> {
         let Some((diags, encoding)) = self.current_diagnostics() else {
             return Vec::new();
         };
-        let (row, col) = (self.editor.cursor.line, self.editor.cursor.col);
-        let line = self.editor.buffer().line(row);
+        let buffer = self.editor.buffer();
+        let lo = buffer.byte_at(s_row, s_col);
+        let hi = buffer.byte_at(e_row, e_col).max(lo);
         diags
             .iter()
             .filter(|d| {
-                self.diag_row_span(d, encoding, row, &line)
-                    .is_some_and(|(s, e)| col >= s && col < e.max(s + 1))
+                let span = self.lsp_range_to_bytes(&d.range, encoding);
+                span.start < hi.max(lo + 1) && lo < span.end.max(span.start + 1)
             })
             .cloned()
             .collect()

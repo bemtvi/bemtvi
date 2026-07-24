@@ -2078,3 +2078,234 @@ async fn code_action_rejects_unsupported_options() {
         );
     }
 }
+
+// ===== `code_action` over a RANGE — the visual selection / `:'<,'>` / `opts.range` =====
+// A `textDocument/codeAction` request carries a range, and the range-scoped refactors
+// (`refactor.extract`, `refactor.inline`) are the ones a server gates on a non-empty
+// one. The request used to collapse to a point at the cursor; these read the range
+// that actually went over the wire back off the chooser (`code_action_echo_range`).
+
+/// Issue a code action with `setup` (keys fed first, then `lua` run) and return the
+/// chooser's single echoed title — the `range=[…] diags=N` the mock saw. Dismisses
+/// the chooser before returning so the next call starts clean.
+async fn echoed_range(
+    rpc: &Rpc,
+    incoming: &mut UnboundedReceiver<Incoming>,
+    keys: &str,
+    lua: &str,
+) -> String {
+    if !keys.is_empty() {
+        feed(rpc, keys);
+    }
+    exec_lua(rpc, lua).await;
+    let rows = poll_menu_items(rpc, incoming)
+        .await
+        .expect("the echoed action should open the chooser");
+    feed(rpc, "<Esc>");
+    barrier(rpc).await;
+    // Flush the frames this call queued (including its own menu) so a following
+    // `poll_menu_items` can't read *this* chooser back as the next one's.
+    drain_to_latest_redraw(incoming, |_| true);
+    rows.first().cloned().unwrap_or_default()
+}
+
+/// The headline: a **charwise Visual selection** rides the request as its range.
+/// `v` at `(0,0)` down-and-right to `(1,1)` sends `(0,0)..(1,2)` — end-exclusive, so
+/// the character under the cursor is included, exactly like the selection paints.
+#[tokio::test]
+async fn code_action_sends_the_visual_selection_range() {
+    let _guard = serial_lock().lock().await;
+    let dir = temp_dir("lsp_ca_vrange");
+    arm_mock(&dir, r#"{ "code_action_echo_range": true }"#);
+    let (rpc, mut incoming) = open_with_server(&dir, "aaa\nbbb\nccc\n").await;
+    assert!(
+        await_lua_eq(&rpc, "#nx.lsp.clients({ bufnr = 0 })", "1").await,
+        "the mock server should attach"
+    );
+
+    let title = echoed_range(&rpc, &mut incoming, "ggvjl", "nx.lsp.code_action()").await;
+    assert!(
+        title.contains("range=[0,0-1,2]"),
+        "the visual selection should ride the request, got {title:?}"
+    );
+    // The selection is consumed: the editor is back in Normal (vim leaves Visual on a
+    // command that acts on the selection), with the `'<` / `'>` marks stamped.
+    assert_eq!(
+        exec_lua(&rpc, "return nx.mode().mode").await.as_str(),
+        Some("n"),
+        "issuing the action should leave Visual"
+    );
+}
+
+/// A **linewise** (`V`) selection spans whole lines: `V j` over lines 0-1 sends
+/// `(0,0)..(2,0)` — the start of the line after the last selected one, the linewise
+/// range a server expects for a "extract these lines" refactor.
+#[tokio::test]
+async fn code_action_visual_line_selection_spans_whole_lines() {
+    let _guard = serial_lock().lock().await;
+    let dir = temp_dir("lsp_ca_vlrange");
+    arm_mock(&dir, r#"{ "code_action_echo_range": true }"#);
+    let (rpc, mut incoming) = open_with_server(&dir, "aaa\nbbb\nccc\n").await;
+    assert!(
+        await_lua_eq(&rpc, "#nx.lsp.clients({ bufnr = 0 })", "1").await,
+        "the mock server should attach"
+    );
+
+    let title = echoed_range(&rpc, &mut incoming, "ggVj", "nx.lsp.code_action()").await;
+    assert!(
+        title.contains("range=[0,0-2,0]"),
+        "a linewise selection should span whole lines, got {title:?}"
+    );
+}
+
+/// `:'<,'>LspCodeAction` — the ex surface takes the addressed **line** range (vim's
+/// `:` model: an address is a line, not a column), so the whole of lines 0-1 goes out.
+/// Typing `:` from Visual prefills `'<,'>`, which is how this is reached in practice.
+#[tokio::test]
+async fn code_action_ex_range_uses_the_addressed_lines() {
+    let _guard = serial_lock().lock().await;
+    let dir = temp_dir("lsp_ca_exrange");
+    arm_mock(&dir, r#"{ "code_action_echo_range": true }"#);
+    let (rpc, mut incoming) = open_with_server(&dir, "aaa\nbbb\nccc\n").await;
+    assert!(
+        await_lua_eq(&rpc, "#nx.lsp.clients({ bufnr = 0 })", "1").await,
+        "the mock server should attach"
+    );
+
+    feed(&rpc, "ggVj:LspCodeAction<CR>");
+    let rows = poll_menu_items(&rpc, &mut incoming)
+        .await
+        .expect("the echoed action should open the chooser");
+    let title = rows.first().cloned().unwrap_or_default();
+    feed(&rpc, "<Esc>");
+    assert!(
+        title.contains("range=[0,0-1,3]"),
+        "`:'<,'>LspCodeAction` should send the addressed lines, got {title:?}"
+    );
+}
+
+/// A bare `:LspCodeAction` (no address) is still a point at the cursor — an ex range
+/// only applies when one was actually given.
+#[tokio::test]
+async fn code_action_without_a_range_is_a_point_at_the_cursor() {
+    let _guard = serial_lock().lock().await;
+    let dir = temp_dir("lsp_ca_point");
+    arm_mock(&dir, r#"{ "code_action_echo_range": true }"#);
+    let (rpc, mut incoming) = open_with_server(&dir, "aaa\nbbb\nccc\n").await;
+    assert!(
+        await_lua_eq(&rpc, "#nx.lsp.clients({ bufnr = 0 })", "1").await,
+        "the mock server should attach"
+    );
+
+    let title = echoed_range(&rpc, &mut incoming, "ggjll", "nx.lsp.code_action()").await;
+    assert!(
+        title.contains("range=[1,2-1,2]"),
+        "with no selection the request is a point at the cursor, got {title:?}"
+    );
+}
+
+/// `opts.range` is the explicit, non-interactive form — 0-based rows / byte columns,
+/// end-exclusive (the `nx.win.select_range` convention) — and it wins over both the
+/// cursor and any live selection.
+#[tokio::test]
+async fn code_action_explicit_range_wins_over_the_selection() {
+    let _guard = serial_lock().lock().await;
+    let dir = temp_dir("lsp_ca_optrange");
+    arm_mock(&dir, r#"{ "code_action_echo_range": true }"#);
+    let (rpc, mut incoming) = open_with_server(&dir, "aaa\nbbb\nccc\n").await;
+    assert!(
+        await_lua_eq(&rpc, "#nx.lsp.clients({ bufnr = 0 })", "1").await,
+        "the mock server should attach"
+    );
+
+    let title = echoed_range(
+        &rpc,
+        &mut incoming,
+        "ggvl",
+        "nx.lsp.code_action({ range = { start_row = 1, start_col = 1, end_row = 2, end_col = 2 } })",
+    )
+    .await;
+    assert!(
+        title.contains("range=[1,1-2,2]"),
+        "opts.range should win over the live selection, got {title:?}"
+    );
+}
+
+/// `context.diagnostics` is range-aware too: a selection covering a diagnostic on
+/// another line carries it, where a point at the cursor carries none. Without this a
+/// quickfix action over a selection would be offered no diagnostic to fix.
+#[tokio::test]
+async fn code_action_range_carries_the_diagnostics_it_covers() {
+    let _guard = serial_lock().lock().await;
+    let dir = temp_dir("lsp_ca_rangediag");
+    arm_mock(
+        &dir,
+        r#"{
+            "code_action_echo_range": true,
+            "diagnostics": [
+                { "range": { "start": { "line": 1, "character": 0 },
+                             "end":   { "line": 1, "character": 3 } },
+                  "severity": 1, "message": "bad bbb" }
+            ]
+        }"#,
+    );
+    let (rpc, mut incoming) = open_with_server(&dir, "aaa\nbbb\nccc\n").await;
+    assert!(
+        await_lua_eq(&rpc, "#nx.diagnostic.get(0)", "1").await,
+        "the mock's diagnostic should land"
+    );
+
+    let cursor_only = echoed_range(&rpc, &mut incoming, "gg0", "nx.lsp.code_action()").await;
+    assert!(
+        cursor_only.contains("diags=0"),
+        "line 0 has no diagnostic under the cursor, got {cursor_only:?}"
+    );
+    // Selected *upward* (line 1 → line 0), so the cursor ends on the clean line and
+    // only the selection's other end covers the diagnostic — the range is doing the
+    // work here, not the cursor.
+    let selected = echoed_range(&rpc, &mut incoming, "ggjVk", "nx.lsp.code_action()").await;
+    assert!(
+        selected.contains("diags=1"),
+        "a selection covering line 1 should carry its diagnostic, got {selected:?}"
+    );
+}
+
+/// A malformed `range` fails LOUD rather than being silently dropped or half-read —
+/// a quietly-ignored range would send a point request and offer the wrong actions.
+#[tokio::test]
+async fn code_action_rejects_a_malformed_range() {
+    let _guard = serial_lock().lock().await;
+    let dir = temp_dir("lsp_ca_badrange");
+    arm_mock(&dir, "{}");
+    let (rpc, _incoming) = open_with_server(&dir, "aaa\n").await;
+
+    for (expr, want) in [
+        (
+            "nx.lsp.code_action({ range = { start_row = 0 } })",
+            "opts.range must be a table",
+        ),
+        (
+            "nx.lsp.code_action({ range = { 0, 0, 1, 1 } })",
+            "opts.range must be a table",
+        ),
+        (
+            "nx.lsp.code_action({ range = { start_row = 0, start_col = 0, end_row = 1, end_col = -1 } })",
+            "opts.range must be a table",
+        ),
+        (
+            "nx.lsp.code_action({ range = 'lines' })",
+            "opts.range must be a table",
+        ),
+    ] {
+        let got = exec_lua(
+            &rpc,
+            &format!("local ok, err = pcall(function() {expr} end) return tostring(ok) .. '|' .. tostring(err)"),
+        )
+        .await;
+        let got = got.as_str().unwrap_or("");
+        assert!(
+            got.starts_with("false|") && got.contains(want),
+            "`{expr}` should fail loud with {want:?}, got {got:?}"
+        );
+    }
+}

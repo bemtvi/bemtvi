@@ -1132,9 +1132,13 @@ impl Editor {
             "rsh" | "rsha" | "rshad" | "rshada" => self.ex_rshada(bang, args),
             // Unknown to the core: defer to the server, which resolves it
             // against Lua user commands (or reports the unknown-command error).
-            _ => self
-                .deferred_commands
-                .push(DeferredCmd::Server(rest.to_string())),
+            // An *explicit* address (`:'<,'>LspCodeAction`) rides along resolved —
+            // only the core can resolve it, and a range-taking server command
+            // (`:LspCodeAction`) would otherwise silently act on the cursor line.
+            _ => self.deferred_commands.push(DeferredCmd::Server {
+                cmd: rest.to_string(),
+                range: range.explicit.then_some((range.lo, range.hi)),
+            }),
         }
     }
 
@@ -2878,9 +2882,10 @@ impl Editor {
                 }
             }
             "" => self.echo("E471: Argument required"),
-            _ => self
-                .deferred_commands
-                .push(DeferredCmd::Server(format!("tab {args}"))),
+            _ => self.deferred_commands.push(DeferredCmd::Server {
+                cmd: format!("tab {args}"),
+                range: None,
+            }),
         }
     }
 
@@ -2922,9 +2927,10 @@ impl Editor {
             }
             "new" => self.ex_new(SplitDir::Vertical),
             "" => self.echo("E471: Argument required"),
-            _ => self
-                .deferred_commands
-                .push(DeferredCmd::Server(format!("vertical {args}"))),
+            _ => self.deferred_commands.push(DeferredCmd::Server {
+                cmd: format!("vertical {args}"),
+                range: None,
+            }),
         }
     }
 

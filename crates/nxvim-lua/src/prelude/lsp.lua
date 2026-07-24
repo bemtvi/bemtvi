@@ -556,6 +556,18 @@ end
 -- nx.lsp.code_action({ context = { only = { "source.fixAll" } }, apply = true })
 -- ```
 --
+-- A code action is asked about a **range**, and the refactor kinds
+-- (`refactor.extract`, `refactor.inline`) are exactly the ones a server offers only
+-- over a non-empty one. Called with a live Visual / Select selection — from a
+-- `"v"`-mode keymap, say — the selection *is* the range (and is consumed, like any
+-- `:` command acting on a selection); `opts.range` states one explicitly; with
+-- neither, the request is a point at the cursor. `:'<,'>LspCodeAction` is the
+-- ex-command form, scoped to the addressed **whole lines**.
+--
+-- ```lua
+-- nx.keymap.set({ "n", "v" }, "<leader>ca", function() nx.lsp.code_action() end)
+-- ```
+--
 -- ```
 -- context.only   list of code-action kinds to ask for; sent as the request's
 --                `context.only` AND re-applied to the reply (honoring it is a
@@ -567,20 +579,45 @@ end
 --                with no chooser. Two or more still open the chooser (there is a
 --                real choice to make); none echoes "No code actions available"
 --                and the promise resolves `nil`.
+-- range          the range to ask about, stated outright:
+--                { start_row = 0, start_col = 0, end_row = 2, end_col = 0 }
+--                0-based rows, 0-based BYTE columns, end-EXCLUSIVE (the
+--                `nx.win.select_range` convention). All four fields are
+--                required, and it wins over both a live selection and the
+--                cursor — the non-interactive way to act on a computed span.
 -- ```
 --
--- Anything else in `opts` (neovim's `filter`, `range`, `context.diagnostics`,
+-- Anything else in `opts` (neovim's `filter`, `context.diagnostics`,
 -- `context.triggerKind`) is **rejected loudly** rather than silently ignored — nxvim
 -- doesn't model it yet, and a quietly-dropped filter would silently do the wrong thing.
 function nx.lsp.code_action(opts)
-  local only, apply = {}, false
+  local only, apply, range = {}, false, nil
   if opts ~= nil then
     if type(opts) ~= "table" then
       error("nx.lsp.code_action: opts must be a table, got " .. type(opts), 2)
     end
     for k in pairs(opts) do
-      if k ~= "context" and k ~= "apply" then
+      if k ~= "context" and k ~= "apply" and k ~= "range" then
         error("nx.lsp.code_action: unsupported option '" .. tostring(k) .. "'", 2)
+      end
+    end
+    if opts.range ~= nil then
+      local r = opts.range
+      local shape = "opts.range must be a table "
+        .. "{ start_row =, start_col =, end_row =, end_col = } of non-negative integers"
+      if type(r) ~= "table" then
+        error("nx.lsp.code_action: " .. shape .. ", got " .. type(r), 2)
+      end
+      range = {}
+      for i, field in ipairs({ "start_row", "start_col", "end_row", "end_col" }) do
+        local v = r[field]
+        if type(v) ~= "number" or v < 0 or v % 1 ~= 0 then
+          error(
+            "nx.lsp.code_action: " .. shape .. " ('" .. field .. "' is " .. tostring(v) .. ")",
+            2
+          )
+        end
+        range[i] = v
       end
     end
     if opts.apply ~= nil then
@@ -613,7 +650,7 @@ function nx.lsp.code_action(opts)
     end
   end
   return lsp_promise(function(id)
-    nx._lsp_buf_code_action(id, only, apply)
+    nx._lsp_buf_code_action(id, only, apply, range)
   end)
 end
 
@@ -953,9 +990,10 @@ vim.lsp.buf.signature_help = nx.lsp.signature_help
 vim.lsp.buf.format = function(_opts)
   return nx.lsp.format()
 end
--- The alias forwards `opts` — `context.only` / `apply` are modeled (see
--- `nx.lsp.code_action`); neovim's `filter` / `range` are not, and are rejected there
--- rather than silently dropped.
+-- The alias forwards `opts` — `context.only` / `apply` / `range` are modeled (see
+-- `nx.lsp.code_action`, whose `range` is nxvim's own 0-based end-exclusive shape, NOT
+-- neovim's mark-style one); neovim's `filter` is not, and is rejected there rather
+-- than silently dropped.
 vim.lsp.buf.code_action = function(opts)
   return nx.lsp.code_action(opts)
 end

@@ -3568,7 +3568,7 @@ impl EditHost {
             }
             for cmd in std::mem::take(&mut self.editor.deferred_commands) {
                 match cmd {
-                    DeferredCmd::Server(c) => self.resolve_command(&c),
+                    DeferredCmd::Server { cmd, range } => self.resolve_command(&cmd, range),
                     // The tail of a `|` chain, held back until the segment ahead of it
                     // resolved (just above). Vim abandons the rest of a command line
                     // once a command errors, so a failed segment drops its tail.

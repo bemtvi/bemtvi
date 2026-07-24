@@ -293,7 +293,8 @@ pub enum LspOp {
         /// applies (`0` = fire-and-forget).
         cb_id: u64,
     },
-    /// `nx.lsp.code_action(opts)` — request `textDocument/codeAction` at the cursor.
+    /// `nx.lsp.code_action(opts)` — request `textDocument/codeAction` over `range`,
+    /// the live Visual / Select selection, or (with neither) a point at the cursor.
     CodeAction {
         /// The `nx._cb_fns` id that settles the promise (`0` = fire-and-forget). Unlike
         /// the other verbs the reply only *opens the chooser menu*; the promise settles
@@ -307,6 +308,11 @@ pub enum LspOp {
         /// survives the filter. Two or more still open the chooser (a real choice);
         /// none echoes "No code actions available".
         apply: bool,
+        /// `opts.range` — the explicit range to ask about, as
+        /// `(start_row, start_col, end_row, end_col)`: 0-based rows, **byte** columns,
+        /// end-exclusive (the `nx.win.select_range` convention). `None` falls back to
+        /// the live selection, then to a point at the cursor.
+        range: Option<(usize, usize, usize, usize)>,
     },
     /// `nx.lsp.signature_help_autotrigger(enable)` — opt into (or out of) auto-showing
     /// signature help as you type a call, driven by the server's advertised trigger

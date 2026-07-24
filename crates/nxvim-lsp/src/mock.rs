@@ -56,6 +56,10 @@
 //! - `code_action_echo_only`: `true` replies with a single action whose *title* is
 //!   the `context.only` the request carried (`only=[source.fixAll]`), so a test can
 //!   read what actually went over the wire off the chooser.
+//! - `code_action_echo_range`: `true` replies with a single action whose *title* is
+//!   the request's `range` and the number of `context.diagnostics` it carried
+//!   (`range=[0,0-1,2] diags=1`) — the range twin of `code_action_echo_only`, so a
+//!   test can read the selection the editor actually sent off the chooser.
 //! - `code_action_resolve`: the resolved `CodeAction` (with its `edit` filled in)
 //!   returned for `codeAction/resolve`. Absent ⇒ `null`.
 //! - `completion_resolve`: the resolved `CompletionItem` (its lazy
@@ -290,6 +294,36 @@ pub fn run(script_path: &str) {
                             json!([{
                                 "title": format!("only=[{}]", kinds.join(",")),
                                 "kind": kinds.first().copied().unwrap_or("quickfix"),
+                            }]),
+                        );
+                        continue;
+                    }
+                    // `code_action_echo_range`: reply with a single action whose TITLE
+                    // is the request's `range` plus how many `context.diagnostics` rode
+                    // with it, so a test can read the selection off the chooser.
+                    if script
+                        .get("code_action_echo_range")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false)
+                    {
+                        let at =
+                            |p: &str| msg.pointer(p).and_then(Value::as_u64).unwrap_or(u64::MAX);
+                        let diags = msg
+                            .pointer("/params/context/diagnostics")
+                            .and_then(Value::as_array)
+                            .map_or(0, Vec::len);
+                        write_response(
+                            &stdout,
+                            id,
+                            json!([{
+                                "title": format!(
+                                    "range=[{},{}-{},{}] diags={diags}",
+                                    at("/params/range/start/line"),
+                                    at("/params/range/start/character"),
+                                    at("/params/range/end/line"),
+                                    at("/params/range/end/character"),
+                                ),
+                                "kind": "quickfix",
                             }]),
                         );
                         continue;

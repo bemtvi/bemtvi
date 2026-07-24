@@ -215,7 +215,14 @@ pub struct LoggedMessage {
 pub enum DeferredCmd {
     /// Unknown to the core: the server resolves it against Lua user commands and its
     /// own surface (`:source`, `:make`, …) before reporting an unknown-command error.
-    Server(String),
+    /// `range` is the **explicitly addressed** 0-based inclusive line range the
+    /// command carried (`:'<,'>Cmd`, `:5,10Cmd`), or `None` when no address was given
+    /// — the core resolves the addresses (it owns the marks and the buffer), the
+    /// server's command decides what to do with them.
+    Server {
+        cmd: String,
+        range: Option<(usize, usize)>,
+    },
     /// The tail of a `|` chain, to be run back **through the core** once the deferred
     /// segment ahead of it has resolved. Skipped when that segment errored, matching
     /// vim's abandon-the-rest-of-the-line-on-error behavior.
@@ -2531,6 +2538,57 @@ impl Editor {
     /// Only meaningful while [`Self::mode`] is a visual mode.
     pub(crate) fn visual_anchor(&self) -> Cursor {
         self.visual_anchor
+    }
+
+    /// The live selection's extent as `(start_row, start_col, end_row, end_col)` —
+    /// 0-based rows, **byte** columns, end-**exclusive** (the `nx.win.select_range`
+    /// convention) — or `None` when nothing is selected. Charwise ([`Mode::Visual`] /
+    /// [`Mode::Select`]) spans anchor..cursor with the character *under* the cursor
+    /// included; linewise ([`Mode::VisualLine`]) spans whole lines, so the end is
+    /// column 0 of the row after the last selected one.
+    ///
+    /// The extent, not the text: what a range-scoped request built from the selection
+    /// needs (LSP `textDocument/codeAction` over a selection — nxvim's answer to
+    /// neovim's `range_from_selection`), where the operators want the byte range
+    /// ([`Self::visual_range_lw`]) instead.
+    pub fn selection_extent(&self) -> Option<(usize, usize, usize, usize)> {
+        let linewise = match self.mode {
+            Mode::Visual => false,
+            Mode::VisualLine => true,
+            Mode::Select => self.select_linewise,
+            _ => return None,
+        };
+        let (lo, hi, _) = self.visual_range_lw(linewise);
+        let buffer = self.buffer();
+        let s_row = buffer.byte_to_line(lo);
+        let e_row = buffer.byte_to_line(hi);
+        let e_col = hi - buffer.line_start(e_row);
+        // A charwise selection ends one *byte* past the cursor (the char under it is
+        // selected), which lands mid-cluster on anything multi-byte — and a position
+        // inside a character is not a legal LSP one (and its byte→UTF-16/32 column
+        // conversion would be wrong or panic). Snap forward to the cluster boundary,
+        // taking the whole grapheme the selection paints.
+        let line = buffer.line(e_row);
+        let e_col = if crate::unicode::floor_grapheme(&line, e_col) == e_col {
+            e_col
+        } else {
+            crate::unicode::next_grapheme(&line, e_col)
+        };
+        Some((s_row, lo - buffer.line_start(s_row), e_row, e_col))
+    }
+
+    /// Consume the live selection: stamp the `` `< `` / `` `> `` marks and drop to
+    /// Normal on the selection head. What a command that *acts on* the selection and
+    /// then edits the buffer does — vim leaves Visual on `:`, and leaving before an
+    /// edit lands keeps a stale anchor from surviving into the changed text. A no-op
+    /// outside Visual / Select.
+    pub fn leave_selection(&mut self) {
+        if !self.mode.is_visual() && self.mode != Mode::Select {
+            return;
+        }
+        self.record_visual_marks();
+        self.mode = Mode::Normal;
+        self.clamp_cursor();
     }
 
     /// The visual mode governing the rendered selection, or `None` when none

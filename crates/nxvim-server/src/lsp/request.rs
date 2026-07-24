@@ -326,14 +326,37 @@ impl EditHost {
     /// (`nx.lsp.code_action{ context = { only = … }, apply = true }`): `only` rides the
     /// request as `context.only` **and** is re-applied to the reply, and `apply` skips
     /// the chooser when exactly one action survives ([`EditHost::show_code_actions`]).
-    pub(crate) fn request_lsp_code_action(&mut self, cb_id: u64, opts: CodeActionOpts) {
+    ///
+    /// `range` is the caller's explicit `opts.range` (0-based rows / byte columns,
+    /// end-exclusive) or the line range an ex address resolved to; with none, a **live
+    /// Visual / Select selection** supplies it and is consumed (the marks are stamped
+    /// and the editor drops to Normal, as vim does for a `:` command on a selection).
+    /// With neither, the request is a point at the cursor. The range matters: the
+    /// refactor kinds (`refactor.extract`, `refactor.inline`) are exactly the actions a
+    /// server gates on a non-empty one.
+    pub(crate) fn request_lsp_code_action(
+        &mut self,
+        cb_id: u64,
+        opts: CodeActionOpts,
+        range: Option<(usize, usize, usize, usize)>,
+    ) {
         let Some((key, uri, encoding)) = self.lsp_target_or_echo() else {
             self.settle_lsp_promise(cb_id, serde_json::Value::Null);
             return;
         };
-        let (row, col) = (self.editor.cursor.line, self.editor.cursor.col);
-        let position = self.lsp_position(encoding, row, col);
-        let diagnostics = self.diagnostics_at_cursor();
+        let selection = range.or_else(|| self.editor.selection_extent());
+        // A selection that fed the request is consumed here, *before* the reply's edit
+        // can land on it (`leave_selection` is a no-op when the range came from `opts`).
+        self.editor.leave_selection();
+        let extent = selection.unwrap_or_else(|| {
+            let (row, col) = (self.editor.cursor.line, self.editor.cursor.col);
+            (row, col, row, col)
+        });
+        let range = Range {
+            start: self.lsp_position(encoding, extent.0, extent.1),
+            end: self.lsp_position(encoding, extent.2, extent.3),
+        };
+        let diagnostics = self.diagnostics_in_range(extent);
         let only = opts.only.clone();
         let token = self.register_lsp_request_with(LspReqKind::CodeAction, cb_id, opts);
         self.fx.lsp_request(
@@ -341,12 +364,7 @@ impl EditHost {
             token,
             LspRequest::CodeAction {
                 uri,
-                // A point range at the cursor; a visual-selection range is a
-                // follow-up (needs the selection extent threaded through).
-                range: Range {
-                    start: position,
-                    end: position,
-                },
+                range,
                 diagnostics,
                 only,
             },

@@ -23,7 +23,11 @@ impl EditHost {
     /// Resolve an ex-command the core didn't recognize: load a colorscheme,
     /// dispatch a Lua user command if one is registered under that name, or
     /// report the standard unknown-command error. `cmd` is the trimmed line.
-    pub(crate) fn resolve_command(&mut self, cmd: &str) {
+    ///
+    /// `range` is the explicitly addressed 0-based inclusive line range the core
+    /// resolved off the head of the line (`:'<,'>LspCodeAction`, `:5,10LspCodeAction`),
+    /// or `None` when the command carried no address.
+    pub(crate) fn resolve_command(&mut self, cmd: &str, range: Option<(usize, usize)>) {
         let name = cmd.split_whitespace().next().unwrap_or("");
         let args = cmd.get(name.len()..).unwrap_or("").trim_start();
         // A trailing `!` is the command's bang, not part of its name; split it off
@@ -119,8 +123,16 @@ impl EditHost {
             }
             "LspRename" => self.request_lsp_rename(args, 0),
             // The ex-command is always the interactive, unfiltered form — the kind
-            // filter / one-shot apply are `nx.lsp.code_action(opts)` options.
-            "LspCodeAction" => self.request_lsp_code_action(0, Default::default()),
+            // filter / one-shot apply are `nx.lsp.code_action(opts)` options. An
+            // address (`:'<,'>LspCodeAction`, typed straight off a Visual selection)
+            // scopes the request to those **whole lines** — an ex address is a line,
+            // not a column, so the range runs to the end of the last addressed one.
+            // With no address the request falls back to the cursor (or, called from a
+            // Lua keymap, to the live selection).
+            "LspCodeAction" => {
+                let range = range.map(|(lo, hi)| (lo, 0, hi, self.editor.buffer().line_len(hi)));
+                self.request_lsp_code_action(0, Default::default(), range)
+            }
             // `:au[tocmd]` / `:aug[roup]` / `:doau[tocmd]` (with abbreviations and
             // an optional `!`) drive the Lua autocmd registry. The core defers
             // them here; the prelude parses the argument line so the `:`-command

@@ -567,15 +567,24 @@ impl Editor {
     /// Buffer `buf`'s **buftype** — vim's buffer-kind noun, as the string the
     /// `buftype` option reports. nxvim models the kinds it actually distinguishes:
     /// `"quickfix"` for a quickfix **or** location-list display buffer (both report
-    /// `quickfix` in vim), `"terminal"` for a terminal buffer, and `""` for an ordinary
-    /// file / scratch buffer. This is what `nx.decor`'s `bufs.buftype` filter keys off
-    /// (so a provider can target — or avoid — the quickfix window). Other vim buftypes
-    /// (`help`, `nofile`, `prompt`, …) aren't modelled yet, so they read as `""`.
+    /// `quickfix` in vim), `"terminal"` for a terminal buffer, `"nofile"` for a
+    /// non-file scratch surface (a plugin `nx.view`, a built-in panel/listing like
+    /// `:messages` / `:registers` / `[Buffers]`, or a completion/signature doc-float
+    /// — everything that isn't a listed document), and `""` for an ordinary file /
+    /// scratch buffer. This is what `nx.decor`'s `bufs.buftype` filter keys off (so a
+    /// provider can target — or avoid — those surfaces), and what `vim.bo.buftype`
+    /// reports through the buffer-option mirror. Other vim buftypes (`help`, `prompt`,
+    /// …) aren't modelled yet, so they read as `""`.
     pub fn buffer_buftype(&self, buf: BufferId) -> &'static str {
         if self.qf_context_of_buffer(buf).is_some() {
             "quickfix"
         } else if self.buffer_of(buf).is_some_and(|b| b.is_terminal()) {
             "terminal"
+        } else if self.buffer_of(buf).is_some() && !self.is_listed_buffer(buf) {
+            // A surface that exists but isn't a listed document — an `nx.view`, a
+            // built-in panel/listing, or a doc-float — is vim's `nofile`: no file
+            // backing, never written. (Terminals are listed and handled above.)
+            "nofile"
         } else {
             ""
         }

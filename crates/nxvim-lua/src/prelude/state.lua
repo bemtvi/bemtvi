@@ -1015,6 +1015,14 @@ local function bo_get(bufnr, opt)
     end
     return true
   end
+  -- `buftype` is read-only buffer *kind* state ("" ordinary, "nofile" scratch
+  -- surface, "quickfix", "terminal"), derived by the core and mirrored by the
+  -- server so a statusline / plugin can gate on it the neovim way (`buftype ~= ""`
+  -- means "not a real file buffer"). Empty string until the first push.
+  if opt == "buftype" or opt == "bt" then
+    local mirror = nx._bo_mirror[bufnr]
+    return (mirror ~= nil and mirror.buftype) or ""
+  end
   local store = nx._bo_store[bufnr]
   if store ~= nil and store[opt] ~= nil then
     return store[opt]

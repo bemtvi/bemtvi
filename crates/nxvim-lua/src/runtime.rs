@@ -361,6 +361,11 @@ pub struct BoMirror {
     /// `nx.buf.set_lines` can fail loud *before* queueing an edit a `nomodifiable`
     /// buffer would refuse.
     pub modifiable: bool,
+    /// The buffer's `'buftype'` (`""` ordinary, `"nofile"` scratch surface,
+    /// `"quickfix"`, `"terminal"`), mirrored so `vim.bo.buftype` / `nx.bo.buftype`
+    /// read the core's value — the neovim-idiomatic "is this a real file buffer"
+    /// signal a plugin filters on (e.g. skip git/statusline work on a scratch panel).
+    pub buftype: String,
 }
 
 /// One buffer change projected into neovim's `nvim_buf_attach` `on_bytes`

@@ -1898,6 +1898,7 @@ impl EditHost {
                     ts_highlight: self.editor.ts_highlight_enabled(id),
                     commentstring: self.editor.effective_commentstring(id),
                     modifiable: o.modifiable,
+                    buftype: self.editor.buffer_buftype(id).to_string(),
                 });
                 if !b.extmarks.is_empty() {
                     let marks = b

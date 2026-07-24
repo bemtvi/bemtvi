@@ -299,6 +299,29 @@ async fn q_and_esc_dismiss_the_panel() {
 }
 
 #[tokio::test]
+async fn scratch_panels_report_buftype_nofile() {
+    let (rpc, _incoming) = start(None).await;
+
+    // An ordinary (No Name) buffer is a real file buffer: buftype "".
+    assert_eq!(
+        lua_bool(&rpc, r#"return nx.bo[0].buftype == """#).await,
+        Some(true),
+        "an ordinary buffer reports buftype \"\""
+    );
+
+    // A built-in scratch listing (`:messages`) is a `nofile` surface — the neovim
+    // signal a statusline/plugin gates on (`buftype ~= ""`) so it doesn't treat the
+    // panel as a file (e.g. resolve a git branch against the launch cwd).
+    feed(&rpc, ":messages<CR>");
+    assert!(panel_is_open(&rpc).await, "`:messages` opens a panel");
+    assert_eq!(
+        lua_bool(&rpc, r#"return nx.bo[0].buftype == "nofile""#).await,
+        Some(true),
+        "the :messages panel reports buftype \"nofile\""
+    );
+}
+
+#[tokio::test]
 async fn nx_panel_open_mounts_a_scripted_panel_with_buffer_local_keys() {
     let (rpc, _incoming) = start(None).await;
 

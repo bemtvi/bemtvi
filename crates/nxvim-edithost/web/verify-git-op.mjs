@@ -9,7 +9,10 @@
 //   (1) nx.git.head returns the daemon repo's branch (main);
 //   (2) nx.git.show returns a file's HEAD blob from the daemon's object store, NOT the edited
 //       working-tree content, proving it read git objects over the wire;
-//   (3) nx.git.discover on a non-repo path REJECTS with err.code == "ENOREPO".
+//   (3) nx.git.discover on a non-repo path REJECTS with err.code == "ENOREPO";
+//   (4) nx.git.clone (a Phase-2 MUTATION verb) runs daemon-side over the wire and lands a real
+//       worktree on the daemon's disk with the committed HEAD content — proving the mutation
+//       verbs ride the same git_op leg as the reads.
 //
 // Prereqs: ./build.sh (dist/eh.mjs + eh.wasm + vendor/msgpack), `cargo build -p nxvim`
 // (target/debug/nxvim), a Chromium for Playwright, and `git` on PATH. Run: node verify-git-op.mjs
@@ -17,7 +20,7 @@ import { chromium } from "playwright";
 import { spawn, spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { setTimeout as sleep } from "node:timers/promises";
-import { globSync, mkdtempSync, writeFileSync, mkdirSync } from "node:fs";
+import { globSync, mkdtempSync, writeFileSync, mkdirSync, existsSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -85,6 +88,9 @@ git(root, ["commit", "-q", "-m", "initial"]);
 writeFileSync(trackedFile, "EDITED-IN-WORKTREE\n");
 // A non-repo directory (outside the repo) for the ENOREPO reject.
 const noRepo = mkdtempSync(join(tmpdir(), "nxvim-norepo-"));
+// A fresh (non-existent) destination the browser will clone the daemon repo INTO, over the
+// wire — the clone runs daemon-side, so it lands on the daemon's disk (this process's disk).
+const cloneDir = join(mkdtempSync(join(tmpdir(), "nxvim-gitclone-")), "cloned");
 
 // ── Spawn the real daemon (cwd = the repo) ───────────────────────────────────────────────────
 const daemon = spawn(NXVIM, ["--daemon", "--listen", "127.0.0.1:0"], { cwd: root, stdio: ["ignore", "pipe", "pipe"] });
@@ -162,6 +168,22 @@ try {
   check("nx.git.discover outside a repo rejects with err.code == ENOREPO over the wire",
     /ENOREPO/.test(String(code)), `code=${JSON.stringify(code)}`);
 
+  // ── 4. clone (a MUTATION verb) runs daemon-side, landing a real worktree over the wire ────
+  await luaResult(page, `_G.__c, _G.__cerr = nil, nil
+     nx.git.clone("${root}", "${cloneDir}"):next(
+       function(dir) _G.__c = dir end,
+       function(e) _G.__cerr = e.code end)
+     return 1`);
+  const cloned = await until(page,
+    () => window.__nxvim.execLua("return tostring(_G.__c or _G.__cerr)").then((r) => r.result),
+    (v) => !/^nil$/.test(String(v)), 20000);
+  const fileOnDisk = existsSync(join(cloneDir, "file.txt"));
+  // The clone checked out HEAD (committed "a\nb\nc\n"), NOT the daemon repo's edited worktree.
+  const content = fileOnDisk ? readFileSync(join(cloneDir, "file.txt"), "utf8") : "";
+  check("nx.git.clone (mutation verb) resolves over the wire + lands the worktree on the daemon disk",
+    fileOnDisk && content === "a\nb\nc\n" && !/E[A-Z]/.test(String(cloned)),
+    `cloned=${JSON.stringify(cloned)} fileOnDisk=${fileOnDisk} content=${JSON.stringify(content)}`);
+
   await browser.close();
 } catch (e) {
   console.error("verify-git-op error:", e);
@@ -172,6 +194,6 @@ try {
 }
 
 console.log(failures === 0
-  ? "\nALL PASS — browser nx.git runs on a real nxvim --daemon over WebTransport (head, show-from-object-store, ENOREPO reject)"
+  ? "\nALL PASS — browser nx.git runs on a real nxvim --daemon over WebTransport (head, show-from-object-store, ENOREPO reject, clone)"
   : `\n${failures} FAILED`);
 process.exit(failures === 0 ? 0 : 1);

@@ -478,6 +478,11 @@ fn update_submodules_of(
         Some(iter) => iter,
         None => return Ok(()), // no .gitmodules — nothing to do
     };
+    // Base for resolving *relative* submodule URLs (`../dep`, common on GitHub): git
+    // resolves them against the superproject's remote — see `resolve_submodule_url`. A
+    // nested submodule's base is its OWN remote, which is the absolute URL we clone it
+    // from below, so the `recursive` descent stays correct.
+    let base_url = superproject_base_url(repo);
     for sm in submodules {
         let name = sm.name().to_string();
         // The commit the parent's index pins this submodule to (its gitlink). Without
@@ -489,11 +494,12 @@ fn update_submodules_of(
         // `work_dir()` is already joined onto the superproject worktree — an absolute
         // path when the parent has a worktree (always true here).
         let abs = sm.work_dir().map_err(|e| egit("submodule path", e))?;
-        let url = sm
+        let raw_url = sm
             .url()
             .map_err(|e| egit("submodule url", e))?
             .to_bstring()
             .to_string();
+        let url = resolve_submodule_url(base_url.as_deref(), &raw_url);
 
         // Open the submodule if already cloned; otherwise clone it (only under `init`,
         // matching `--init`). A missing, un-init'd submodule is left alone.
@@ -519,6 +525,64 @@ fn update_submodules_of(
         }
     }
     Ok(())
+}
+
+/// The base URL a `repo`'s *relative* submodule URLs resolve against — git uses the
+/// superproject's fetch remote, falling back to its worktree path when there is no
+/// remote (a purely local superproject still resolves `../dep` against its own dir).
+fn superproject_base_url(repo: &gix::Repository) -> Option<String> {
+    if let Ok(remote) = repo.find_fetch_remote(None) {
+        if let Some(url) = remote.url(gix::remote::Direction::Fetch) {
+            return Some(url.to_bstring().to_string());
+        }
+    }
+    repo.workdir().map(|p| p.to_string_lossy().into_owned())
+}
+
+/// Resolve a submodule's `.gitmodules` URL the way git does. A `./` / `../`-prefixed URL
+/// is **relative to the superproject's remote** (`base`); anything else — a real URL,
+/// scp-like `git@host:owner/repo`, or an absolute path — is used verbatim. Each `../`
+/// drops the last path segment of `base`; `./` is a no-op level. Without this, gix would
+/// try to clone `../dep` relative to the process CWD and fail — the exact break a GitHub
+/// plugin with relative submodule URLs hit.
+fn resolve_submodule_url(base: Option<&str>, raw: &str) -> String {
+    if !(raw.starts_with("./") || raw.starts_with("../")) {
+        return raw.to_string();
+    }
+    let base = match base {
+        Some(b) => b.trim_end_matches('/'),
+        None => return raw.to_string(), // nothing to resolve against — let the clone fail loud
+    };
+    let mut base = base.to_string();
+    let mut rel = raw;
+    loop {
+        if let Some(r) = rel.strip_prefix("../") {
+            base = drop_last_path_segment(&base);
+            rel = r;
+        } else if let Some(r) = rel.strip_prefix("./") {
+            rel = r;
+        } else {
+            break;
+        }
+    }
+    let base = base.trim_end_matches('/');
+    if base.is_empty() {
+        rel.to_string()
+    } else {
+        format!("{base}/{rel}")
+    }
+}
+
+/// Drop the final path segment of a URL/path string — `.../owner/repo` → `.../owner`.
+/// Falls back to the scp-like `host:` boundary when there is no `/` past it.
+fn drop_last_path_segment(base: &str) -> String {
+    match base.rfind('/') {
+        Some(i) => base[..i].to_string(),
+        None => match base.rfind(':') {
+            Some(i) => base[..=i].to_string(), // keep `host:`
+            None => String::new(),
+        },
+    }
 }
 
 // ----- helpers ---------------------------------------------------------------

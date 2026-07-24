@@ -2063,6 +2063,45 @@ fn git_job_to_json(id: u64, job: &nxvim_lua::GitJob, local: bool) -> serde_json:
             put("op", "status".into());
             put("path", path.clone().into());
         }
+        // Phase-2 mutation / network verbs. Optional `depth`/`branch` are included only
+        // when set, so the daemon decoder reads them back as `None` (matching the rmpv
+        // `git_job_to_value` codec) rather than a spurious 0 / empty string.
+        GitJob::Clone {
+            url,
+            dir,
+            depth,
+            branch,
+        } => {
+            put("op", "clone".into());
+            put("url", url.clone().into());
+            put("dir", dir.clone().into());
+            if let Some(d) = depth {
+                put("depth", serde_json::json!(d));
+            }
+            if let Some(b) = branch {
+                put("branch", b.clone().into());
+            }
+        }
+        GitJob::Checkout { dir, rev, detach } => {
+            put("op", "checkout".into());
+            put("dir", dir.clone().into());
+            put("rev", rev.clone().into());
+            put("detach", serde_json::json!(detach));
+        }
+        GitJob::Pull { dir } => {
+            put("op", "pull".into());
+            put("dir", dir.clone().into());
+        }
+        GitJob::SubmoduleUpdate {
+            dir,
+            init,
+            recursive,
+        } => {
+            put("op", "submodule_update".into());
+            put("dir", dir.clone().into());
+            put("init", serde_json::json!(init));
+            put("recursive", serde_json::json!(recursive));
+        }
     }
     serde_json::Value::Object(o)
 }

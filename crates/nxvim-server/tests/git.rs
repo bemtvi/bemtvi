@@ -769,6 +769,115 @@ async fn submodule_update_matches_git_oracle() {
     );
 }
 
+/// Oracle: a submodule declared with a RELATIVE url (`../dep` — common on GitHub, where
+/// a repo's submodules live under the same owner) resolves against the superproject's
+/// remote. `nx.git_local.submodule_update` must check it out to the same content as `git
+/// submodule update --init --recursive` (which resolves the relative url too). Guards the
+/// relative-URL resolution gix's `sm.url()` does NOT do for us.
+#[tokio::test]
+async fn submodule_relative_url_matches_git_oracle() {
+    if !have_git() {
+        eprintln!("skip: git not on PATH");
+        return;
+    }
+    let (rpc, _incoming) = start().await;
+    let base = temp_dir("git_sm_rel");
+    // A sibling `dep` repo the super references *relatively*.
+    let dep = base.join("dep");
+    std::fs::create_dir_all(&dep).unwrap();
+    git(&dep, &["init", "-q", "-b", "main"]);
+    commit_file(
+        &dep,
+        "reldep.txt",
+        "relative submodule content\n",
+        "dep initial",
+    );
+
+    // The super embeds dep at vendored/, then rewrites the committed `.gitmodules` url to
+    // a RELATIVE `../dep`, so a cloner must resolve it against the super's origin.
+    let super_repo = base.join("super");
+    std::fs::create_dir_all(&super_repo).unwrap();
+    git(&super_repo, &["init", "-q", "-b", "main"]);
+    std::fs::write(super_repo.join("file.txt"), "super\n").unwrap();
+    git(&super_repo, &["add", "-A"]);
+    git(&super_repo, &["commit", "-q", "-m", "super initial"]);
+    let dep_s = dep.to_string_lossy().to_string();
+    git(
+        &super_repo,
+        &[
+            "-c",
+            "protocol.file.allow=always",
+            "submodule",
+            "add",
+            &dep_s,
+            "vendored",
+        ],
+    );
+    git(
+        &super_repo,
+        &[
+            "config",
+            "-f",
+            ".gitmodules",
+            "submodule.vendored.url",
+            "../dep",
+        ],
+    );
+    git(&super_repo, &["add", ".gitmodules"]);
+    git(
+        &super_repo,
+        &["commit", "-q", "-m", "relative submodule url"],
+    );
+
+    // Oracle: git clone (no recurse) + recursive submodule update (git resolves `../dep`).
+    let git_wt = git_clone(&super_repo, "git_sm_rel_git");
+    git(
+        &git_wt,
+        &[
+            "-c",
+            "protocol.file.allow=always",
+            "submodule",
+            "update",
+            "--init",
+            "--recursive",
+        ],
+    );
+
+    // Mine: nx.git_local.clone + submodule_update (my resolver resolves `../dep`).
+    let mine = temp_dir("git_sm_rel_mine").join("wt");
+    let mine_s = mine.to_string_lossy().to_string();
+    exec_lua(
+        &rpc,
+        &format!(
+            "nx.async(function()\n\
+               nx.await(nx.git_local.clone({super_repo:?}, {mine:?}))\n\
+               nx.await(nx.git_local.submodule_update({mine:?}, {{ init = true, recursive = true }}))\n\
+               _G.done = true\n\
+             end)():catch(function(e) _G.err = e end)",
+        ),
+    )
+    .await;
+    tokio::time::sleep(Duration::from_millis(2500)).await;
+    assert_eq!(
+        exec_lua(&rpc, "return _G.err and _G.err.message")
+            .await
+            .as_str(),
+        None,
+        "relative-url submodule_update rejected"
+    );
+    // The relative-url submodule was really checked out (non-empty) AND matches git.
+    let mine_dep = Path::new(&mine_s).join("vendored").join("reldep.txt");
+    assert!(
+        mine_dep.exists(),
+        "relative-url submodule not checked out at {mine_dep:?}"
+    );
+    assert_eq!(
+        snapshot_worktree(&git_wt.join("vendored")),
+        snapshot_worktree(&Path::new(&mine_s).join("vendored")),
+        "relative-url submodule worktree differs from `git submodule update`"
+    );
+}
+
 /// A non-repo path rejects loud with `ENOREPO` (never a silent empty result).
 #[tokio::test]
 async fn discover_rejects_outside_a_repo() {

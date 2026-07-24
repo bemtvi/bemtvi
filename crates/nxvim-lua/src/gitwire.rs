@@ -17,14 +17,18 @@
 //!
 //! ### Wire shapes
 //!
-//! **Request** — `{ op = "discover", path }`, `{ op = "head", path }`, `{ op = "show",
-//! file, rev }`, `{ op = "diff_file", path, file }`, `{ op = "status", path }`.
+//! **Request (read)** — `{ op = "discover", path }`, `{ op = "head", path }`, `{ op =
+//! "show", file, rev }`, `{ op = "diff_file", path, file }`, `{ op = "status", path }`.
+//! **Request (mutation)** — `{ op = "clone", url, dir, depth?, branch? }`, `{ op =
+//! "checkout", dir, rev, detach }`, `{ op = "pull", dir }`, `{ op = "submodule_update",
+//! dir, init, recursive }`.
 //!
 //! **Reply** — `["ok", <git-value>]` on success, `["err", code, message]` on a reject.
-//! The `<git-value>` is a tagged array: `["nil"]` / `["bytes", <bin>]` / `["discover",
-//! root, git_dir, prefix]` / `["head", branch|nil, detached, sha]` / `["diff", added,
-//! changed, removed, [[o_start,o_count,n_start,n_count], …]]` / `["status", dirty,
-//! [[path, index, worktree], …]]`.
+//! The `<git-value>` is a tagged array: `["nil"]` / `["cloned", dir]` / `["pull",
+//! updated, sha]` / `["bytes", <bin>]` / `["discover", root, git_dir, prefix]` /
+//! `["head", branch|nil, detached, sha]` / `["diff", added, changed, removed,
+//! [[o_start,o_count,n_start,n_count], …]]` / `["status", dirty, [[path, index,
+//! worktree], …]]`.
 
 use crate::ops::{GitError, GitHunk, GitJob, GitStatusEntry, GitValue};
 use rmpv::Value;
@@ -59,6 +63,27 @@ pub fn git_job_from_value(v: &Value) -> Result<GitJob, String> {
         },
         "status" => GitJob::Status {
             path: str_field("path")?,
+        },
+        "clone" => GitJob::Clone {
+            url: str_field("url")?,
+            dir: str_field("dir")?,
+            // `depth`/`branch` are optional; a missing key is None (full history /
+            // remote-default branch), not an error.
+            depth: get("depth").and_then(Value::as_u64).map(|d| d as u32),
+            branch: get("branch").and_then(Value::as_str).map(str::to_string),
+        },
+        "checkout" => GitJob::Checkout {
+            dir: str_field("dir")?,
+            rev: str_field("rev")?,
+            detach: get("detach").and_then(Value::as_bool).unwrap_or(false),
+        },
+        "pull" => GitJob::Pull {
+            dir: str_field("dir")?,
+        },
+        "submodule_update" => GitJob::SubmoduleUpdate {
+            dir: str_field("dir")?,
+            init: get("init").and_then(Value::as_bool).unwrap_or(false),
+            recursive: get("recursive").and_then(Value::as_bool).unwrap_or(false),
         },
         other => return Err(format!("git_op: unknown op '{other}'")),
     })
@@ -95,6 +120,44 @@ pub fn git_job_to_value(job: &GitJob) -> Value {
         GitJob::Status { path } => m(vec![
             ("op", "status".into()),
             ("path", path.as_str().into()),
+        ]),
+        GitJob::Clone {
+            url,
+            dir,
+            depth,
+            branch,
+        } => {
+            let mut pairs = vec![
+                ("op", "clone".into()),
+                ("url", url.as_str().into()),
+                ("dir", dir.as_str().into()),
+            ];
+            // Only send the optional keys when set, so the daemon side decodes them
+            // back to None rather than a spurious 0 / empty string.
+            if let Some(d) = depth {
+                pairs.push(("depth", Value::from(*d)));
+            }
+            if let Some(b) = branch {
+                pairs.push(("branch", b.as_str().into()));
+            }
+            m(pairs)
+        }
+        GitJob::Checkout { dir, rev, detach } => m(vec![
+            ("op", "checkout".into()),
+            ("dir", dir.as_str().into()),
+            ("rev", rev.as_str().into()),
+            ("detach", Value::from(*detach)),
+        ]),
+        GitJob::Pull { dir } => m(vec![("op", "pull".into()), ("dir", dir.as_str().into())]),
+        GitJob::SubmoduleUpdate {
+            dir,
+            init,
+            recursive,
+        } => m(vec![
+            ("op", "submodule_update".into()),
+            ("dir", dir.as_str().into()),
+            ("init", Value::from(*init)),
+            ("recursive", Value::from(*recursive)),
         ]),
     }
 }
@@ -145,6 +208,14 @@ pub fn git_result_from_value(v: &Value) -> Result<GitValue, GitError> {
 fn git_value_to_value(value: &GitValue) -> Value {
     match value {
         GitValue::Nil => Value::Array(vec![Value::from("nil")]),
+        GitValue::Cloned(dir) => {
+            Value::Array(vec![Value::from("cloned"), Value::from(dir.as_str())])
+        }
+        GitValue::Pull { updated, sha } => Value::Array(vec![
+            Value::from("pull"),
+            Value::from(*updated),
+            Value::from(sha.as_str()),
+        ]),
         GitValue::Bytes(bytes) => {
             Value::Array(vec![Value::from("bytes"), Value::Binary(bytes.clone())])
         }
@@ -226,6 +297,11 @@ fn git_value_from_value(v: &Value) -> Result<GitValue, GitError> {
     let u32_at = |i: usize| arr.get(i).and_then(Value::as_u64).unwrap_or(0) as u32;
     Ok(match tag {
         "nil" => GitValue::Nil,
+        "cloned" => GitValue::Cloned(str_at(1)),
+        "pull" => GitValue::Pull {
+            updated: arr.get(1).and_then(Value::as_bool).unwrap_or(false),
+            sha: str_at(2),
+        },
         "bytes" => GitValue::Bytes(arr.get(1).map(value_to_bytes).unwrap_or_default()),
         "discover" => GitValue::Discover {
             root: str_at(1),

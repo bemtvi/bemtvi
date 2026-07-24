@@ -27,6 +27,12 @@ gix = { workspace = true, features = [
     "revision",
     "worktree-mutation",
 ] }
+# gix sub-crates for the hand-rolled `reset --hard` (checkout / ff-pull worktree
+# update): build a fresh index from the target tree, then write it over the worktree.
+# gix has no high-level reset, and its internal `gix_worktree_state::checkout` isn't
+# re-exported — so we call it directly, at the exact versions gix 0.86 uses.
+gix-index.workspace = true
+gix-worktree-state.workspace = true
 # The typed GitJob / GitValue / GitError this executor runs (wasm-safe plain data,
 # defined in nxvim-lua so the Lua bridge and the daemon wire codec share them).
 nxvim-lua.workspace = true

@@ -153,6 +153,46 @@ async fn nx_git_show_fetches_head_blob_over_the_wire() {
     );
 }
 
+/// A Phase-2 mutation verb crosses the wire: `nx.git_local.clone` runs on the daemon
+/// (the actor has no local git), and the cloned worktree really lands on disk with the
+/// source's committed content. Proves the mutation `GitJob`s ride the same `git_op` leg
+/// as the reads.
+#[tokio::test]
+async fn nx_git_clone_runs_on_the_daemon_over_the_wire() {
+    if !have_git() {
+        eprintln!("skip: git not on PATH");
+        return;
+    }
+    let src = make_repo("daemon_git_clone_src");
+    let src_str = src.to_string_lossy().replace('\\', "\\\\");
+    let dest = temp_dir("daemon_git_clone_dest").join("cloned");
+    let dest_str = dest.to_string_lossy().replace('\\', "\\\\");
+    let (rpc, _incoming) = spawn_with_daemon_git().await;
+
+    exec_lua(
+        &rpc,
+        &format!(
+            r#"_G.__c = nil
+               nx.git_local.clone("{src_str}", "{dest_str}"):next(
+                 function(dir) _G.__c = "ok" end,
+                 function(e) _G.__c = "err:" .. tostring(e.code) end)
+               return 1"#,
+        ),
+    )
+    .await;
+
+    assert!(
+        await_lua_eq(&rpc, "_G.__c", "ok").await,
+        "clone should resolve over the wire; got {:?}",
+        exec_lua(&rpc, "return tostring(_G.__c)").await.as_str(),
+    );
+    // The daemon ran the clone against the real fs — the worktree is on disk.
+    assert_eq!(
+        std::fs::read_to_string(dest.join("file.txt")).unwrap(),
+        "a\nb\nc\n"
+    );
+}
+
 /// A non-repo path rejects loud (ENOREPO) over the wire — never a silent empty result.
 #[tokio::test]
 async fn nx_git_discover_rejects_outside_a_repo_over_the_wire() {

@@ -1157,6 +1157,13 @@ fn fs_value_to_lua(lua: &Lua, value: FsValue) -> mlua::Result<mlua::Value> {
 fn git_value_to_lua(lua: &Lua, value: GitValue) -> mlua::Result<mlua::Value> {
     Ok(match value {
         GitValue::Nil => mlua::Value::Nil,
+        GitValue::Cloned(dir) => mlua::Value::String(lua.create_string(dir)?),
+        GitValue::Pull { updated, sha } => {
+            let t = lua.create_table()?;
+            t.set("updated", updated)?;
+            t.set("sha", sha)?;
+            mlua::Value::Table(t)
+        }
         GitValue::Bytes(b) => mlua::Value::String(lua.create_string(b)?),
         GitValue::Discover {
             root,

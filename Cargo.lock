@@ -4015,6 +4015,8 @@ name = "nxvim-git"
 version = "0.1.0"
 dependencies = [
  "gix",
+ "gix-index",
+ "gix-worktree-state",
  "nxvim-lua",
 ]
 

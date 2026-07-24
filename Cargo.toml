@@ -188,6 +188,13 @@ libloading = "=0.9.0"
 # In-process git (nxvim-git, native-only). Feature set is chosen per crate;
 # default-features off keeps the network/tls tree opt-in.
 gix = { version = "=0.86.0", default-features = false }
+# Sub-crates of gix used directly by nxvim-git's hand-rolled reset --hard (build an
+# index from a tree, then check it out over the worktree). Pinned to the EXACT versions
+# gix 0.86 resolves internally so the `gix_index::State` we pass into
+# `gix_worktree_state::checkout` is the same type gix uses (type identity across the
+# shared dep — a mismatched minor would be a distinct, incompatible type).
+gix-index = { version = "=0.54.0", default-features = false }
+gix-worktree-state = { version = "=0.33.0", default-features = false }
 # Dev-only: real grammars compiled into a test fixture (never linked into the
 # editor — nxvim loads grammars dynamically at runtime). `tree-sitter-md` is a host
 # grammar that injects (markdown fenced code blocks → the fence's language), so the

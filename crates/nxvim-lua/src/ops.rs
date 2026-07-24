@@ -581,6 +581,45 @@ pub enum GitJob {
     /// each entry a `{ path, index, worktree }` porcelain-`XY`-style pair. A canonical
     /// working-tree signal so plugins stop re-deriving one from `diff` output.
     Status { path: String },
+
+    // --- Phase 2: mutation / network verbs (plugin-manager backing) ---
+    /// `nx.git_local.clone(url, dir, opts)` — clone `url` into `dir` and check out its
+    /// worktree. Replaces `git clone` in the plugin manager. `depth` caps history
+    /// (shallow; `Some(1)` = only the tip commit, the default for an unpinned plugin);
+    /// `branch` checks out a specific branch or tag instead of the remote's default
+    /// HEAD. Resolves the created `dir`. Note: git's `--filter=blob:none` (partial
+    /// clone) has no `gix` analog — shallow `depth` supplies the equivalent speed-up.
+    Clone {
+        url: String,
+        dir: String,
+        depth: Option<u32>,
+        branch: Option<String>,
+    },
+    /// `nx.git_local.checkout(dir, rev, opts)` — check out `rev` in the repo at `dir`,
+    /// updating the worktree and index to match its tree. `detach` (the only mode we
+    /// need — the plugin pins arbitrary commits) points HEAD straight at the resolved
+    /// commit rather than moving a branch. Replaces `git checkout --detach <sha>`.
+    Checkout {
+        dir: String,
+        rev: String,
+        detach: bool,
+    },
+    /// `nx.git_local.pull(dir)` — fetch the repo's remote and **fast-forward only** the
+    /// current branch to its upstream, updating the worktree. Rejects (never merges)
+    /// when the update is not a fast-forward, matching `git pull --ff-only`. Resolves
+    /// `{ updated, sha }` — `updated` false when already current. Replaces `git pull
+    /// --ff-only`.
+    Pull { dir: String },
+    /// `nx.git_local.submodule_update(dir, opts)` — clone-if-missing (`init`) and check
+    /// out every submodule of the repo at `dir` to the commit its gitlink records,
+    /// `recursive`-ly descending into nested submodules. Replaces `git submodule update
+    /// --init --recursive`. `gix` has no one-call form; this is hand-rolled over its
+    /// submodule reads + the same clone/checkout primitives.
+    SubmoduleUpdate {
+        dir: String,
+        init: bool,
+        recursive: bool,
+    },
 }
 
 /// One line of [`GitValue::Status`]: a changed path and its porcelain `XY` state.
@@ -612,8 +651,15 @@ pub struct GitHunk {
 /// variants carry each verb's fields.
 #[derive(Clone, Debug)]
 pub enum GitValue {
-    /// A unit result (reserved for the Phase-2 mutation verbs).
+    /// A unit result — the resolved value of `checkout` / `submodule_update` (nothing
+    /// to report but success).
     Nil,
+    /// `nx.git_local.clone` — the absolute `dir` the clone landed in (echoed back so a
+    /// caller can chain on it).
+    Cloned(String),
+    /// `nx.git_local.pull` — `updated` is true only on a real fast-forward (false when
+    /// already current), `sha` the full oid the branch now points at.
+    Pull { updated: bool, sha: String },
     /// `nx.git.show` — the blob's raw bytes at the requested revision.
     Bytes(Vec<u8>),
     /// `nx.git.discover` — the repo layout paths (all absolute except `prefix`, which

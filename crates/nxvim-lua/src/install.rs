@@ -4094,6 +4094,28 @@ fn git_job_from_table(job: &Table) -> mlua::Result<GitJob> {
         "status" => GitJob::Status {
             path: job.get("path")?,
         },
+        // Mutation / network verbs. Optional fields (`depth`/`branch`/`detach`/`init`/
+        // `recursive`) come through as `nil` → the Rust `Option`/`bool` default when the
+        // Lua caller omits them.
+        "clone" => GitJob::Clone {
+            url: job.get("url")?,
+            dir: job.get("dir")?,
+            depth: job.get::<Option<u32>>("depth")?,
+            branch: job.get::<Option<String>>("branch")?,
+        },
+        "checkout" => GitJob::Checkout {
+            dir: job.get("dir")?,
+            rev: job.get("rev")?,
+            detach: job.get::<Option<bool>>("detach")?.unwrap_or(false),
+        },
+        "pull" => GitJob::Pull {
+            dir: job.get("dir")?,
+        },
+        "submodule_update" => GitJob::SubmoduleUpdate {
+            dir: job.get("dir")?,
+            init: job.get::<Option<bool>>("init")?.unwrap_or(false),
+            recursive: job.get::<Option<bool>>("recursive")?.unwrap_or(false),
+        },
         other => {
             return Err(mlua::Error::runtime(format!(
                 "nx._git_op: unknown git op '{other}'"

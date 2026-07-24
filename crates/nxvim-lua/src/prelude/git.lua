@@ -84,6 +84,52 @@ local function define(surface, bridge)
   function surface.status(path)
     return run_git(bridge, { op = "status", path = path })
   end
+
+  -- ----- mutation / network verbs (plugin-manager backing) -----
+
+  -- `clone(url, dir, opts)` -> promise of the created `dir`. `opts.depth` makes it a
+  -- shallow clone (`1` = only the tip commit); `opts.branch` checks out a named branch
+  -- or tag instead of the remote default. Replaces `git clone`. (git's
+  -- `--filter=blob:none` has no `gix` analog — a shallow `depth` supplies the same
+  -- speed-up.) Rejects (`EGIT`) on any clone/fetch failure.
+  function surface.clone(url, dir, opts)
+    opts = opts or {}
+    return run_git(bridge, {
+      op = "clone",
+      url = url,
+      dir = dir,
+      depth = opts.depth,
+      branch = opts.branch,
+    })
+  end
+
+  -- `checkout(dir, rev, opts)` -> promise resolving nil. Checks out `rev` (a sha, tag,
+  -- or ref) in the repo at `dir`, updating the worktree. `opts.detach` (the supported
+  -- mode) detaches HEAD onto the commit. Replaces `git checkout --detach <sha>`.
+  function surface.checkout(dir, rev, opts)
+    opts = opts or {}
+    return run_git(bridge, { op = "checkout", dir = dir, rev = rev, detach = opts.detach })
+  end
+
+  -- `pull(dir)` -> promise of { updated, sha }. Fetches the repo's remote and
+  -- **fast-forwards only** the current branch (rejecting `ENOTFF` on a divergence,
+  -- never merging). `updated` is false when already current. Replaces `git pull
+  -- --ff-only`.
+  function surface.pull(dir)
+    return run_git(bridge, { op = "pull", dir = dir })
+  end
+
+  -- `submodule_update(dir, opts)` -> promise resolving nil. Clones-if-missing
+  -- (`opts.init`) and checks out every submodule to its recorded commit,
+  -- `opts.recursive`-ly into nested ones. Replaces `git submodule update --init
+  -- --recursive`.
+  function surface.submodule_update(dir, opts)
+    opts = opts or {}
+    return run_git(
+      bridge,
+      { op = "submodule_update", dir = dir, init = opts.init, recursive = opts.recursive }
+    )
+  end
 end
 
 define(nx.git, nx._git_op)

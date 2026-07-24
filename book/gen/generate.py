@@ -171,6 +171,18 @@ DECL_RE = re.compile(
     r"^\s*(?:function\s+(nx\.[A-Za-z0-9_.]+)\s*\(([^)]*)\)"
     r"|(nx\.[A-Za-z0-9_.]+)\s*=\s*function\s*\(([^)]*)\))"
 )
+# `nx.NS = {` opening a namespace table literal whose fields are the public
+# functions (e.g. `nx.fs_local = { exists = function(path) … }` in localseam.lua).
+TABLE_OPEN_RE = re.compile(r"^\s*(nx\.[A-Za-z0-9_.]+)\s*=\s*\{\s*$")
+FIELD_FN_RE = re.compile(r"^\s*([A-Za-z_][A-Za-z0-9_]*)\s*=\s*function\s*\(([^)]*)\)")
+# A factory that installs the SAME verb table onto several `nx.*` surfaces via a
+# local parameter (e.g. `local function define(surface, bridge)` in git.lua, with
+# `function surface.head(path)` methods, invoked as `define(nx.git, …)` /
+# `define(nx.git_local, …)`). One verb table, two surfaces, no drift.
+LOCAL_FACTORY_RE = re.compile(r"^\s*local\s+function\s+([A-Za-z_][A-Za-z0-9_]*)\s*\(([^)]*)\)")
+SURFACE_METHOD_RE = re.compile(
+    r"^\s*function\s+([A-Za-z_][A-Za-z0-9_]*)\.([A-Za-z0-9_]+)\s*\(([^)]*)\)"
+)
 SEP_RE = re.compile(r"^\s*--+\s*-{3,}")  # `-- ----- section -----` separators
 CODE_SPAN_RE = re.compile(r"(`+)(.*?)\1", re.DOTALL)
 
@@ -233,6 +245,76 @@ def doc_above(lines, idx):
     return "\n".join(cleaned)
 
 
+def _brace_delta(line):
+    """Net `{`/`}` count on a line, ignoring a trailing `-- comment`."""
+    code = line.split("--", 1)[0]
+    return code.count("{") - code.count("}")
+
+
+def collect_table_literals(lines):
+    """Yield (name, args, decl_idx) for `nx.NS = { field = function(args) }` decls.
+
+    Only fields at the table's top level (brace depth 1) count, so nested tables
+    and inline `{ … }` values inside a field body are never mistaken for methods.
+    """
+    for i, line in enumerate(lines):
+        m = TABLE_OPEN_RE.match(line)
+        if not m:
+            continue
+        ns_name = m.group(1)
+        depth = 1
+        j = i + 1
+        while j < len(lines) and depth > 0:
+            fld = FIELD_FN_RE.match(lines[j])
+            if depth == 1 and fld:
+                yield ("%s.%s" % (ns_name, fld.group(1)), fld.group(2), j)
+            depth += _brace_delta(lines[j])
+            j += 1
+
+
+def collect_surface_factories(lines):
+    """Yield (name, args, decl_idx) for the twin-surface factory pattern.
+
+    A `local function F(p1, …)` whose body adds `function p1.method(args)` and is
+    later called as `F(nx.git, …)` / `F(nx.git_local, …)` installs one verb table
+    onto every `nx.*` surface passed at p1's argument position. We emit each method
+    under every such surface, so both twins are documented from the single source.
+    """
+    # param name -> (factory F, 0-based position of that param)
+    surface_params = {}
+    for line in lines:
+        f = LOCAL_FACTORY_RE.match(line)
+        if not f:
+            continue
+        params = [p.strip() for p in f.group(2).split(",") if p.strip()]
+        for pos, pname in enumerate(params):
+            surface_params[pname] = (f.group(1), pos)
+
+    # For each factory, the `nx.*` surfaces bound to each param position across all
+    # of its call sites: factory F -> { pos -> [nx.NS, …] }.
+    factory_surfaces = {}
+    for line in lines:
+        for pname, (factory, pos) in surface_params.items():
+            call = re.match(r"^\s*%s\s*\((.*)\)\s*$" % re.escape(factory), line)
+            if not call:
+                continue
+            argv = [a.strip() for a in call.group(1).split(",")]
+            if pos < len(argv) and re.match(r"^nx\.[A-Za-z0-9_]+$", argv[pos]):
+                factory_surfaces.setdefault(factory, {}).setdefault(pos, []).append(argv[pos])
+
+    for i, line in enumerate(lines):
+        meth = SURFACE_METHOD_RE.match(line)
+        if not meth:
+            continue
+        holder, name, args = meth.group(1), meth.group(2), meth.group(3)
+        binding = surface_params.get(holder)
+        if not binding:
+            continue
+        factory, pos = binding
+        for surface in factory_surfaces.get(factory, {}).get(pos, []):
+            yield ("%s.%s" % (surface, name), args, i)
+
+
 def extract_api():
     if not os.path.isdir(PRELUDE_DIR):
         die("prelude dir not found: %s" % PRELUDE_DIR)
@@ -243,12 +325,24 @@ def extract_api():
     for fname in files:
         with open(os.path.join(PRELUDE_DIR, fname), encoding="utf-8") as f:
             lines = f.read().split("\n")
+        # Gather every public declaration from the three real prelude shapes:
+        # direct `function nx.NS.name` / `nx.NS.name = function`, namespace table
+        # literals, and twin-surface factories. Sort by source line so a page's
+        # entries stay in file order regardless of which collector found them.
+        decls = []
         for i, line in enumerate(lines):
             m = DECL_RE.match(line)
-            if not m:
-                continue
-            name = m.group(1) or m.group(3)
-            args = m.group(2) if m.group(1) else m.group(4)
+            if m:
+                name = m.group(1) or m.group(3)
+                args = m.group(2) if m.group(1) else m.group(4)
+                decls.append((i, name, args))
+        for name, args, i in collect_table_literals(lines):
+            decls.append((i, name, args))
+        for name, args, i in collect_surface_factories(lines):
+            decls.append((i, name, args))
+        decls.sort(key=lambda d: d[0])
+
+        for i, name, args in decls:
             if is_private(name) or name in seen:
                 continue
             seen.add(name)

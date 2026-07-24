@@ -707,16 +707,23 @@ impl EditHost {
     }
 }
 
+/// The color schemes bundled in the binary: `(name, Lua source)`, with the source
+/// embedded from the `runtime/colors/` tree. The single source of truth for both
+/// [`builtin_colorscheme`] (loads one) and the `:colorscheme` completion catalog
+/// (the server hands the names to Lua as `nx._builtin_colorschemes`) — add a scheme
+/// here and both pick it up. They ship embedded so `:colorscheme <name>` works with
+/// no user config (and on the wasm build, which has no filesystem).
+pub(crate) const BUILTIN_COLORSCHEMES: &[(&str, &str)] =
+    &[("nxvim", include_str!("../runtime/colors/nxvim.lua"))];
+
 /// The Lua source of a colorscheme bundled in the binary, by name, or `None`
-/// for an unknown name. These ship in the embedded `runtime/colors/` tree so
-/// `:colorscheme <name>` works with no user config (and on the wasm build,
-/// which has no filesystem). A user file on the runtimepath shadows these — the
+/// for an unknown name. A user file on the runtimepath shadows these — the
 /// caller searches the runtimepath first.
 fn builtin_colorscheme(name: &str) -> Option<&'static str> {
-    match name {
-        "nxvim" => Some(include_str!("../runtime/colors/nxvim.lua")),
-        _ => None,
-    }
+    BUILTIN_COLORSCHEMES
+        .iter()
+        .find(|(n, _)| *n == name)
+        .map(|(_, src)| *src)
 }
 
 /// `:sil[ent]` and its abbreviations (`sil`, `sile`, `silen`, `silent`). The

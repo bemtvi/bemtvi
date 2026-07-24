@@ -3236,6 +3236,23 @@ where
         .collect();
     lua.set_options_catalog(&option_rows)
         .map_err(|e| anyhow::anyhow!("option catalog init failed: {e}"))?;
+    // Hand the binary's bundled color-scheme names to Lua so `:colorscheme <Tab>` can
+    // offer them (the embedded `runtime/colors/` tree is not on the runtimepath, so the
+    // completer's `colors/*.lua` glob can't discover them). The builtins are static.
+    let builtin_schemes: Vec<String> = crate::excmd::BUILTIN_COLORSCHEMES
+        .iter()
+        .map(|(name, _)| name.to_string())
+        .collect();
+    lua.set_builtin_colorschemes(&builtin_schemes)
+        .map_err(|e| anyhow::anyhow!("colorscheme catalog init failed: {e}"))?;
+    // Hand the recognized filetype names to Lua so `:setfiletype <Tab>` can offer them
+    // (core's extension-detection table is the single source of truth).
+    let filetypes: Vec<String> = nxvim_core::known_filetypes()
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+    lua.set_filetypes(&filetypes)
+        .map_err(|e| anyhow::anyhow!("filetype catalog init failed: {e}"))?;
     // Seed the layout-capture opt-in before any config runs. `--workspace` turns it on so
     // a directory session captures its window/tab layout without needing a plugin to call
     // `nx.shada.save_layout`; a plain `--shada-namespace` launch leaves it off (the config

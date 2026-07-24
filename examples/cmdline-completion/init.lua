@@ -73,11 +73,37 @@
 --   :cd <Tab>          the dir-taking commands (`:cd` / `:lcd` / `:tcd`) list
 --                      directories only, titled "Select directory"
 --
+-- NAME ARGUMENT COMPLETION — buffers, color schemes, highlight groups (inline, like
+-- `:set`, sourced from what the editor already knows so it can never drift):
+--   :buffer <Tab>      list the loaded buffers by name (`:bdelete` / `:bwipeout`
+--                      share it); type to fuzzy-narrow, <CR> accepts a name
+--   :colorscheme <Tab> list every available color scheme — the bundled `nxvim` plus
+--                      any `colors/<name>.lua` on the runtimepath (a plugin theme
+--                      shows the instant it's installed)
+--   :highlight <Tab>   list the defined highlight groups (e.g. `:highlight Comment`)
+--   :setfiletype <Tab> list the filetypes nxvim recognizes (`rust`, `lua`, `python`, …)
+--   :TSInstall <Tab>   list the tree-sitter languages nxvim can highlight (`:TSUpdate`
+--                      shares it) — takes several, so every argument completes
+--   :autocmd <Tab>     list the autocmd events nxvim emits (`:autocmd BufWrite<Tab>`);
+--                      `:augroup <Tab>` lists the defined autocommand groups
+--   :put <Tab>         list the registers that currently hold content (with a preview)
+--   :move <Tab>        list address landmarks — `.`, `$`, `0`, and the current
+--                      buffer's marks as `'x` (`:copy` shares it)
+--
+-- MODIFIER WRAPPERS — completion recurses through `:vertical` / `:tab` / `:silent`:
+--   :vertical spl<Tab> the modifier is stripped and the NESTED command completes —
+--                      `split` is offered (not treated as an argument)
+--   :tab e <Tab>       the wrapped `:e` hands its file argument to the picker, and
+--                      confirming keeps the `tab ` prefix (`:tab e src/foo.rs`)
+--   :silent <Tab>      chained modifiers recurse, e.g. `:tab vertical split`
+--
 -- The completer dispatches on the command word: `:set`/`:setlocal` arguments
--- complete option names (sourced from core's documented catalog — the same single
--- source of truth `:set` itself accepts, so the two can never drift); file/dir
--- commands hand off to the picker (above); any other command's arguments have no
--- completer yet, so the wildmenu just stays closed.
+-- complete option names, `:buffer`/`:colorscheme`/`:highlight`/`:setfiletype`/`:TSInstall`
+-- and the `:autocmd`/`:augroup`/`:put`/`:move` first argument complete their respective
+-- names (each from an authoritative in-memory source, so it can never drift from what
+-- the command accepts); a `:vertical`/`:tab`/`:silent` modifier is stripped and the
+-- wrapped command completes; file/dir commands hand off to the picker (above); any
+-- other command's arguments have no completer yet, so the wildmenu just stays closed.
 
 -- Command-line completion is ON BY DEFAULT in the interactive editor, so this call
 -- is optional — it's here to TUNE the engine. A bare `setup {}` is the default

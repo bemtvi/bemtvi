@@ -32,8 +32,8 @@ pub mod view;
 pub use buffer::{dir_listing, Buffer, BufferEdit, BufferKind, DiskChange, EditBatch};
 pub use clipboard::Clipboard;
 pub use editor::{
-    command_pending_after, command_status, language_of_help_doc, language_of_path, place_aligned,
-    AcceptBehavior, Align, BorderStyle, BufferId, ClickSurface, CmdlineCandidate,
+    command_pending_after, command_status, known_filetypes, language_of_help_doc, language_of_path,
+    place_aligned, AcceptBehavior, Align, BorderStyle, BufferId, ClickSurface, CmdlineCandidate,
     CmdlineCompleteReq, CommandContinuation, CommandPending, CommandStatus, CompleteConfig,
     CompleteKeys, Cursor, DecorViewport, DeferredCmd, Editor, Extent, FileChangeAction,
     FileChangeReason, FileChangelist, FileFolds, FileMarkEntry, FloatAnchor, FloatConfig,

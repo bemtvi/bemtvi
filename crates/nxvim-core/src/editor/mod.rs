@@ -2698,32 +2698,59 @@ impl Default for Editor {
     }
 }
 
+/// The extension → treesitter-language / filetype table — the single seam where
+/// more languages plug in. Both [`language_of_path`] (an extension → filetype
+/// lookup) and [`known_filetypes`] (the distinct filetype names, for `:setfiletype`
+/// completion) read it, so the two can never drift.
+const EXT_FILETYPE: &[(&str, &str)] = &[
+    ("rs", "rust"),
+    ("py", "python"),
+    ("js", "javascript"),
+    ("mjs", "javascript"),
+    ("cjs", "javascript"),
+    ("ts", "typescript"),
+    ("json", "json"),
+    ("toml", "toml"),
+    ("md", "markdown"),
+    ("markdown", "markdown"),
+    ("c", "c"),
+    ("h", "c"),
+    ("cpp", "cpp"),
+    ("cc", "cpp"),
+    ("cxx", "cpp"),
+    ("hpp", "cpp"),
+    ("go", "go"),
+    ("lua", "lua"),
+    ("html", "html"),
+    ("css", "css"),
+    ("yaml", "yaml"),
+    ("yml", "yaml"),
+    ("zig", "zig"),
+    ("sh", "bash"),
+    ("bash", "bash"),
+];
+
 /// Map a file path's extension to a treesitter language / filetype name, or
 /// `None` for an unknown (or absent) extension — in which case the buffer has no
-/// highlighting and no treesitter indentation. This is the single seam where
-/// more languages plug in; the server's `filetype_of` (FileType autocmd, LSP)
-/// delegates here so the table lives in exactly one place.
+/// highlighting and no treesitter indentation. The server's `filetype_of` (FileType
+/// autocmd, LSP) delegates here, so the [`EXT_FILETYPE`] table lives in one place.
 pub fn language_of_path(path: Option<&Path>) -> Option<&'static str> {
     let ext = path?.extension()?.to_str()?;
-    Some(match ext {
-        "rs" => "rust",
-        "py" => "python",
-        "js" | "mjs" | "cjs" => "javascript",
-        "ts" => "typescript",
-        "json" => "json",
-        "toml" => "toml",
-        "md" | "markdown" => "markdown",
-        "c" | "h" => "c",
-        "cpp" | "cc" | "cxx" | "hpp" => "cpp",
-        "go" => "go",
-        "lua" => "lua",
-        "html" => "html",
-        "css" => "css",
-        "yaml" | "yml" => "yaml",
-        "zig" => "zig",
-        "sh" | "bash" => "bash",
-        _ => return None,
-    })
+    EXT_FILETYPE
+        .iter()
+        .find(|(e, _)| *e == ext)
+        .map(|(_, ft)| *ft)
+}
+
+/// The distinct filetype names nxvim recognizes (the value set of [`EXT_FILETYPE`]),
+/// sorted. These are the highlighting-capable filetypes `:setfiletype` completion
+/// offers — the same source of truth extension detection uses, so the list is never
+/// stale. A buffer can still be forced to any string; this is just the known set.
+pub fn known_filetypes() -> Vec<&'static str> {
+    let mut fts: Vec<&'static str> = EXT_FILETYPE.iter().map(|(_, ft)| *ft).collect();
+    fts.sort_unstable();
+    fts.dedup();
+    fts
 }
 
 /// The treesitter grammar for a vim **help** file, or `None` when `path` isn't one.

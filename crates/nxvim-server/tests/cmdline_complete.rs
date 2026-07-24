@@ -927,6 +927,455 @@ async fn command_with_no_arg_completer_opens_no_menu() {
     );
 }
 
+// ---- Argument completion for `:buffer` / `:colorscheme` / `:highlight` -------------
+// Three commands whose argument is a name the editor already knows (a buffer, a color
+// scheme, a highlight group), completed inline from an authoritative in-memory source.
+
+#[tokio::test]
+async fn buffer_arg_completes_buffer_names() {
+    let dir = temp_dir("cmdcomplete_buf");
+    std::fs::write(dir.join("alpha.txt"), "A\n").unwrap();
+    std::fs::write(dir.join("beta.txt"), "B\n").unwrap();
+    let (rpc, mut incoming) = start(&dir, INIT).await;
+
+    // Load two named buffers.
+    for f in ["alpha.txt", "beta.txt"] {
+        rpc.request(
+            "nx_command",
+            vec![Value::from(format!("e {}", dir.join(f).display()))],
+        )
+        .await
+        .expect("edit");
+        barrier(&rpc).await;
+    }
+
+    // `:buffer <Tab>` lists the named buffers (by name), not command names.
+    feed(&rpc, ":buffer <Tab>");
+    let map = poll_menu(&rpc, &mut incoming)
+        .await
+        .expect("a buffer-name menu after :buffer <Tab>");
+    let items = menu_items(&map);
+    assert!(
+        items.iter().any(|i| i.contains("alpha.txt")),
+        "items: {items:?}"
+    );
+    assert!(
+        items.iter().any(|i| i.contains("beta.txt")),
+        "items: {items:?}"
+    );
+    // The context switched: command names are gone, only buffers are offered.
+    assert!(!items.iter().any(|i| i == "buffer"), "items: {items:?}");
+    assert!(!items.iter().any(|i| i == "edit"), "items: {items:?}");
+}
+
+#[tokio::test]
+async fn bdelete_arg_also_completes_buffer_names() {
+    let dir = temp_dir("cmdcomplete_bd");
+    std::fs::write(dir.join("gamma.txt"), "G\n").unwrap();
+    let (rpc, mut incoming) = start(&dir, INIT).await;
+    rpc.request(
+        "nx_command",
+        vec![Value::from(format!(
+            "e {}",
+            dir.join("gamma.txt").display()
+        ))],
+    )
+    .await
+    .expect("edit");
+    barrier(&rpc).await;
+
+    // The `:bdelete` (unload) family shares the buffer-argument completer with `:buffer`.
+    feed(&rpc, ":bd <Tab>");
+    let map = poll_menu(&rpc, &mut incoming)
+        .await
+        .expect("a buffer-name menu after :bd <Tab>");
+    assert!(
+        menu_items(&map).iter().any(|i| i.contains("gamma.txt")),
+        "items: {:?}",
+        menu_items(&map)
+    );
+}
+
+#[tokio::test]
+async fn colorscheme_arg_completes_scheme_names() {
+    let dir = temp_dir("cmdcomplete_colo");
+    // A user scheme on the runtimepath (the config dir is on it): `colors/mytheme.lua`.
+    std::fs::create_dir_all(dir.join("colors")).unwrap();
+    std::fs::write(dir.join("colors").join("mytheme.lua"), "-- theme\n").unwrap();
+    let (rpc, mut incoming) = start(&dir, INIT).await;
+
+    feed(&rpc, ":colorscheme <Tab>");
+    let map = poll_menu(&rpc, &mut incoming)
+        .await
+        .expect("a colorscheme menu after :colorscheme <Tab>");
+    let items = menu_items(&map);
+    // The runtimepath scheme (discovered via the `colors/*.lua` glob)…
+    assert!(items.contains(&"mytheme".to_string()), "items: {items:?}");
+    // …and the scheme bundled in the binary (injected as `nx._builtin_colorschemes`).
+    assert!(items.contains(&"nxvim".to_string()), "items: {items:?}");
+    // Context switched — no command names.
+    assert!(!items.contains(&"edit".to_string()), "items: {items:?}");
+
+    // The `:colo` abbreviation completes the same set (both spellings core dispatches).
+    let colo = exec_lua(
+        &rpc,
+        "local out = {}\n\
+         for _, c in ipairs(nx._cmdline_complete_run('colo ', 5)) do out[#out + 1] = c.label end\n\
+         return out",
+    )
+    .await;
+    let colo_names: Vec<String> = match colo {
+        Value::Array(a) => a
+            .iter()
+            .map(|v| v.as_str().unwrap_or("").to_string())
+            .collect(),
+        other => panic!("expected an array, got {other:?}"),
+    };
+    assert!(
+        colo_names.contains(&"mytheme".to_string()) && colo_names.contains(&"nxvim".to_string()),
+        ":colo completes schemes too: {colo_names:?}"
+    );
+}
+
+#[tokio::test]
+async fn highlight_arg_completes_group_names() {
+    let dir = temp_dir("cmdcomplete_hi");
+    let (rpc, mut incoming) = start(&dir, INIT).await;
+
+    // Define a highlight group, then synchronize on the mirror reflecting it (the
+    // `nvim_set_hl` write folds into the core registry and pushes `nx._hl_defs` on a
+    // later tick) so the <Tab> completion reads a populated mirror.
+    exec_lua(
+        &rpc,
+        "vim.api.nvim_set_hl(0, 'MyCoolGroup', { fg = 0xff0000 })",
+    )
+    .await;
+    let mut ready = false;
+    for _ in 0..60 {
+        if exec_lua(&rpc, "return nx.hl.exists('MyCoolGroup')")
+            .await
+            .as_bool()
+            == Some(true)
+        {
+            ready = true;
+            break;
+        }
+        barrier(&rpc).await;
+    }
+    assert!(ready, "the highlight mirror never reflected the new group");
+
+    feed(&rpc, ":highlight My<Tab>");
+    let map = poll_menu(&rpc, &mut incoming)
+        .await
+        .expect("a highlight-group menu after :highlight My<Tab>");
+    let items = menu_items(&map);
+    assert!(
+        items.contains(&"MyCoolGroup".to_string()),
+        "items: {items:?}"
+    );
+    // Context switched — no command names.
+    assert!(!items.contains(&"edit".to_string()), "items: {items:?}");
+}
+
+#[tokio::test]
+async fn setfiletype_arg_completes_filetype_names() {
+    let dir = temp_dir("cmdcomplete_setf");
+    let (rpc, mut incoming) = start(&dir, INIT).await;
+
+    // `:setfiletype <Tab>` offers the filetype names core recognizes (injected as
+    // `nx._filetypes` from `nxvim_core::known_filetypes` — the extension table).
+    feed(&rpc, ":setfiletype <Tab>");
+    let map = poll_menu(&rpc, &mut incoming)
+        .await
+        .expect("a filetype menu after :setfiletype <Tab>");
+    let items = menu_items(&map);
+    for ft in ["rust", "python", "lua", "markdown"] {
+        assert!(items.contains(&ft.to_string()), "missing {ft}: {items:?}");
+    }
+    // Context switched — no command names.
+    assert!(!items.contains(&"edit".to_string()), "items: {items:?}");
+
+    // The `:setf` abbreviation shares the completer.
+    let setf = exec_lua(
+        &rpc,
+        "local out = {}\n\
+         for _, c in ipairs(nx._cmdline_complete_run('setf ', 5)) do out[#out + 1] = c.label end\n\
+         return out",
+    )
+    .await;
+    let setf_names: Vec<String> = match setf {
+        Value::Array(a) => a
+            .iter()
+            .map(|v| v.as_str().unwrap_or("").to_string())
+            .collect(),
+        other => panic!("expected an array, got {other:?}"),
+    };
+    assert!(
+        setf_names.contains(&"rust".to_string()),
+        ":setf completes filetypes too: {setf_names:?}"
+    );
+}
+
+/// Coverage guard: every filetype the `:setfiletype` completer offers must be one
+/// core actually recognizes — both read `nxvim_core::known_filetypes`, so this proves
+/// the bridge (`nx._filetypes`) is wired and non-empty.
+#[tokio::test]
+async fn completed_filetypes_are_the_core_known_set() {
+    let dir = temp_dir("cmdcomplete_setf2");
+    let (rpc, _incoming) = start(&dir, INIT).await;
+    let value = exec_lua(&rpc, "return #(nx._filetypes or {})").await;
+    let n = value.as_u64().expect("a count");
+    assert!(n >= 10, "the filetype catalog is unexpectedly small: {n}");
+}
+
+#[tokio::test]
+async fn tsinstall_arg_completes_languages_in_every_argument() {
+    let dir = temp_dir("cmdcomplete_ts");
+    let (rpc, mut incoming) = start(&dir, INIT).await;
+
+    // `:TSInstall <Tab>` offers tree-sitter language names (the filetypes nxvim can
+    // highlight — the offline set; the full catalog is behind a network fetch).
+    feed(&rpc, ":TSInstall <Tab>");
+    let map = poll_menu(&rpc, &mut incoming)
+        .await
+        .expect("a language menu after :TSInstall <Tab>");
+    let items = menu_items(&map);
+    for lang in ["rust", "python", "lua"] {
+        assert!(
+            items.contains(&lang.to_string()),
+            "missing {lang}: {items:?}"
+        );
+    }
+    assert!(!items.contains(&"edit".to_string()), "items: {items:?}");
+
+    // `:TSInstall` takes MULTIPLE languages, so a SECOND argument completes too (unlike
+    // the first-arg-only completers): after `rust `, languages are still offered.
+    feed(&rpc, "rust <Tab>");
+    let map = poll_menu(&rpc, &mut incoming)
+        .await
+        .expect("a language menu on the second :TSInstall argument");
+    assert!(
+        menu_items(&map).contains(&"python".to_string()),
+        "the second argument still completes languages: {:?}",
+        menu_items(&map)
+    );
+
+    // `:TSUpdate` shares the completer.
+    feed(&rpc, "<Esc><Esc>");
+    poll_no_menu(&rpc, &mut incoming).await;
+    feed(&rpc, ":TSUpdate <Tab>");
+    let map = poll_menu(&rpc, &mut incoming)
+        .await
+        .expect("a language menu after :TSUpdate <Tab>");
+    assert!(
+        menu_items(&map).contains(&"go".to_string()),
+        "items: {:?}",
+        menu_items(&map)
+    );
+}
+
+// ---- Argument completion for `:autocmd` / `:augroup` / `:put` / `:move` ------------
+// First-argument name completers, each gated to its own argument slot.
+
+#[tokio::test]
+async fn autocmd_arg_completes_event_names_on_the_first_arg_only() {
+    let dir = temp_dir("cmdcomplete_au");
+    let (rpc, mut incoming) = start(&dir, INIT).await;
+
+    // `:autocmd Buf<Tab>` — the first argument is an event; fuzzy `Buf` ranks the
+    // Buf* events in. Command names are gone (context switched).
+    feed(&rpc, ":autocmd Buf<Tab>");
+    let map = poll_menu(&rpc, &mut incoming)
+        .await
+        .expect("an event menu after :autocmd Buf<Tab>");
+    let items = menu_items(&map);
+    assert!(items.contains(&"BufEnter".to_string()), "items: {items:?}");
+    assert!(
+        items.contains(&"BufWritePre".to_string()),
+        "items: {items:?}"
+    );
+    assert!(!items.contains(&"edit".to_string()), "items: {items:?}");
+
+    // The SECOND argument (the pattern) is not an event slot — no event menu opens.
+    feed(&rpc, "<Esc><Esc>");
+    poll_no_menu(&rpc, &mut incoming).await;
+    feed(&rpc, ":autocmd BufEnter <Tab>");
+    let map = poll_no_menu(&rpc, &mut incoming)
+        .await
+        .expect("no event menu on the :autocmd pattern (second) argument");
+    assert_eq!(cmdline_text(&map).as_deref(), Some("autocmd BufEnter "));
+}
+
+#[tokio::test]
+async fn augroup_arg_completes_defined_group_names() {
+    let dir = temp_dir("cmdcomplete_aug");
+    let (rpc, mut incoming) = start(&dir, INIT).await;
+
+    // Define a group, then synchronize on the registry reflecting it.
+    exec_lua(&rpc, "nx.augroup.create('MyPluginGroup')").await;
+    let mut ready = false;
+    for _ in 0..60 {
+        if exec_lua(&rpc, "return nx._augroups['MyPluginGroup'] ~= nil")
+            .await
+            .as_bool()
+            == Some(true)
+        {
+            ready = true;
+            break;
+        }
+        barrier(&rpc).await;
+    }
+    assert!(ready, "the augroup registry never reflected the new group");
+
+    feed(&rpc, ":augroup <Tab>");
+    let map = poll_menu(&rpc, &mut incoming)
+        .await
+        .expect("a group menu after :augroup <Tab>");
+    assert!(
+        menu_items(&map).contains(&"MyPluginGroup".to_string()),
+        "items: {:?}",
+        menu_items(&map)
+    );
+}
+
+#[tokio::test]
+async fn put_arg_completes_registers_that_hold_content() {
+    let dir = temp_dir("cmdcomplete_put");
+    let (rpc, mut incoming) = start(&dir, INIT).await;
+
+    // Fill a couple of registers; `:put <Tab>` offers the ones with content.
+    exec_lua(&rpc, "vim.fn.setreg('a', 'alpha contents')").await;
+    exec_lua(&rpc, "vim.fn.setreg('z', 'zeta contents')").await;
+    let mut ready = false;
+    for _ in 0..60 {
+        if exec_lua(
+            &rpc,
+            "return nx._registers['a'] ~= nil and nx._registers['z'] ~= nil",
+        )
+        .await
+        .as_bool()
+            == Some(true)
+        {
+            ready = true;
+            break;
+        }
+        barrier(&rpc).await;
+    }
+    assert!(ready, "the register mirror never reflected the writes");
+
+    feed(&rpc, ":put <Tab>");
+    let map = poll_menu(&rpc, &mut incoming)
+        .await
+        .expect("a register menu after :put <Tab>");
+    let items = menu_items(&map);
+    assert!(items.contains(&"a".to_string()), "items: {items:?}");
+    assert!(items.contains(&"z".to_string()), "items: {items:?}");
+    // A register that was never written is not offered.
+    assert!(!items.contains(&"q".to_string()), "items: {items:?}");
+}
+
+#[tokio::test]
+async fn move_arg_completes_addresses_and_current_buffer_marks() {
+    let dir = temp_dir("cmdcomplete_move");
+    let (rpc, mut incoming) = start(&dir, INIT).await;
+
+    // Two lines, set mark `t` on line 1, cursor elsewhere.
+    feed(&rpc, "ione<CR>two<Esc>");
+    assert_eq!(lines(&rpc).await, vec!["one", "two"]);
+    feed(&rpc, "ggmt");
+    let mut ready = false;
+    for _ in 0..60 {
+        let has = exec_lua(
+            &rpc,
+            "for _, m in ipairs(nx.mark.list()) do if m.name == 't' then return true end end\n\
+             return false",
+        )
+        .await;
+        if has.as_bool() == Some(true) {
+            ready = true;
+            break;
+        }
+        barrier(&rpc).await;
+    }
+    assert!(ready, "the marks mirror never reflected mark t");
+
+    // `:move <Tab>` offers the special addresses and the `'t` mark.
+    feed(&rpc, ":move <Tab>");
+    let map = poll_menu(&rpc, &mut incoming)
+        .await
+        .expect("an address menu after :move <Tab>");
+    let items = menu_items(&map);
+    assert!(items.contains(&".".to_string()), "items: {items:?}");
+    assert!(items.contains(&"$".to_string()), "items: {items:?}");
+    assert!(items.contains(&"'t".to_string()), "items: {items:?}");
+}
+
+// ---- Command modifiers wrap a nested command (`:vertical` / `:tab` / `:silent`) -----
+
+#[tokio::test]
+async fn modifier_completes_the_nested_command_name() {
+    let dir = temp_dir("cmdcomplete_wrap");
+    let (rpc, mut incoming) = start(&dir, INIT).await;
+
+    // `:vertical spl<Tab>` completes the WRAPPED command name — `split` is offered
+    // (the `vertical ` modifier is stripped), not treated as an argument.
+    feed(&rpc, ":vertical spl<Tab>");
+    let map = poll_menu(&rpc, &mut incoming)
+        .await
+        .expect("a command menu after :vertical spl<Tab>");
+    assert!(
+        menu_items(&map).contains(&"split".to_string()),
+        "items: {:?}",
+        menu_items(&map)
+    );
+
+    // `:silent ene<Tab>` likewise completes the nested `:enew`.
+    feed(&rpc, "<Esc><Esc>");
+    poll_no_menu(&rpc, &mut incoming).await;
+    feed(&rpc, ":silent ene<Tab>");
+    let map = poll_menu(&rpc, &mut incoming)
+        .await
+        .expect("a command menu after :silent ene<Tab>");
+    assert!(
+        menu_items(&map).contains(&"enew".to_string()),
+        "items: {:?}",
+        menu_items(&map)
+    );
+}
+
+#[tokio::test]
+async fn modifier_hands_the_nested_file_argument_to_the_picker() {
+    let dir = temp_dir("cmdcomplete_wrap_file");
+    let tree = dir.join("tree");
+    std::fs::create_dir_all(&tree).unwrap();
+    std::fs::write(tree.join("only.txt"), "X\n").unwrap();
+    let (rpc, mut incoming) = start(&dir, INIT).await;
+    rpc.request(
+        "nx_command",
+        vec![Value::from(format!("cd {}", tree.display()))],
+    )
+    .await
+    .expect("cd");
+    barrier(&rpc).await;
+
+    // `:tab e <Tab>` strips `tab ` and completes the wrapped `:e` file argument — the
+    // file picker opens (titled "Select file"), listing the cwd.
+    feed(&rpc, ":tab e <Tab>");
+    let items = poll_menu_nonempty(&rpc, &mut incoming).await;
+    assert_eq!(items, vec!["only.txt"], "the picker lists the cwd");
+    let map = poll_menu(&rpc, &mut incoming).await.expect("a menu frame");
+    assert_eq!(menu_title(&map).as_deref(), Some("Select file"));
+
+    // Confirm pastes the chosen path back into the still-open command line, KEEPING the
+    // `tab ` modifier prefix (the paste replaces only the argument token).
+    feed(&rpc, "<CR>");
+    let map = poll_cmdline_eq(&rpc, &mut incoming, "tab e only.txt").await;
+    assert!(
+        command_mode(&map),
+        "the command line stays open after the paste"
+    );
+}
+
 /// Poll for the latest redraw whose `menu` map carries at least one item (the
 /// picker streams its rows in asynchronously after opening, so the first frame can
 /// be empty).

@@ -9,7 +9,8 @@
 --
 -- Phase 1 shipped command NAMES; Phase 3 added the docs pane (each entry carries a
 -- synopsis + one-line description); Phase 4 folded in the user-command merge.
--- `:set <opt>` completes option names inline.
+-- `:set <opt>` completes option names inline; likewise `:buffer <name>` (buffers),
+-- `:colorscheme <name>` (schemes), and `:highlight <group>` (highlight groups).
 --
 -- A **file argument** (`:e <Tab>`, `:split`, `:cd`, …) is different: instead of the
 -- inline wildmenu it hands off to the full `nx.picker` overlay (a fuzzy finder with
@@ -243,7 +244,7 @@ end
 
 -- The `:set`-family commands whose arguments are option names. All four share the
 -- same `ex_set` handler in core (`editor/ex.rs`); `:setfiletype` completes filetypes,
--- not options, so it is deliberately excluded.
+-- not options, so it is excluded here and has its own completer (`SETFILETYPE_COMMANDS`).
 local SET_COMMANDS = { set = true, se = true, setlocal = true, setl = true }
 
 -- Friendlier spellings for the docs pane's metadata line.
@@ -271,6 +272,320 @@ local function option_candidates()
     }
   end
   return out
+end
+
+-- ----- buffer / colorscheme / highlight argument completion (inline wildmenu) ----
+-- Three commands whose argument is a name the editor already knows: a buffer, a
+-- color scheme, or a highlight group. Each returns candidates straight to the inline
+-- wildmenu (like `:set`), read from an authoritative in-memory source — never a
+-- filesystem or name heuristic — so it can never drift from what the command accepts.
+
+-- The buffer-taking commands whose argument is a buffer: `:buffer` and its unload
+-- twins (`:bdelete`/`:bwipeout`). Core's `resolve_buffer` accepts a bufnr or any
+-- unique substring of a buffer's path, so completing the full buffer name resolves.
+local BUFFER_COMMANDS = {}
+for _, c in ipairs({
+  "b",
+  "bu",
+  "buf",
+  "buffer",
+  "bd",
+  "bdel",
+  "bdelete",
+  "bw",
+  "bwipe",
+  "bwipeout",
+}) do
+  BUFFER_COMMANDS[c] = true
+end
+
+-- The candidate set for a buffer argument: every named buffer, by name, from the
+-- authoritative buffer mirror (`nx._bufs`). The name is both the shown label and the
+-- inserted token (`:buffer {name}` resolves it by substring), and the docs pane shows
+-- the buffer number. Unnamed buffers are skipped — there is no name to complete to
+-- (switch to one by number) — matching the `buffers` picker source.
+local function buffer_candidates()
+  local out = {}
+  local bufs = nx._bufs or {}
+  for _, b in ipairs(nx.buf.list()) do
+    local entry = bufs[b]
+    local name = (entry and entry.name) or nx.buf.name(b)
+    if name and name ~= "" then
+      out[#out + 1] = { label = name, insert = name, doc = ":buffer " .. b .. "\n\n" .. name }
+    end
+  end
+  return out
+end
+
+-- `:colorscheme` (and its `:colo` abbreviation — the only two spellings core
+-- dispatches, see `excmd.rs`) completes color scheme names.
+local COLORSCHEME_COMMANDS = { colo = true, colorscheme = true }
+
+-- The candidate set for a `:colorscheme` argument: every `colors/<name>.lua` on the
+-- live runtimepath (found synchronously via `nx.runtime_file`, so a plugin-installed
+-- scheme shows the instant it lands on disk) plus the schemes bundled in the binary
+-- (`nx._builtin_colorschemes`, injected by the server — the embedded `runtime/colors/`
+-- tree is not a real runtimepath directory, so the glob cannot see it). Sorted, deduped.
+local function colorscheme_candidates()
+  local names, seen = {}, {}
+  local function add(name)
+    if name and name ~= "" and not seen[name] then
+      seen[name] = true
+      names[#names + 1] = name
+    end
+  end
+  for _, name in ipairs(nx._builtin_colorschemes or {}) do
+    add(name)
+  end
+  for _, path in ipairs(nx.runtime_file("colors/*.lua", true)) do
+    add(path:match("([^/]+)%.lua$"))
+  end
+  table.sort(names)
+  local out = {}
+  for _, name in ipairs(names) do
+    out[#out + 1] = { label = name, insert = name }
+  end
+  return out
+end
+
+-- `:highlight` / `:hi` completes highlight group names.
+local HIGHLIGHT_COMMANDS = { hi = true, highlight = true }
+
+-- The candidate set for a `:highlight` argument: every defined highlight group, by
+-- name, from the highlight-registry mirror (`nx._hl_defs`, the same table `nx.hl.get`
+-- reads). Sorted for a stable menu.
+local function highlight_candidates()
+  local names = {}
+  for name in pairs(nx._hl_defs or {}) do
+    names[#names + 1] = name
+  end
+  table.sort(names)
+  local out = {}
+  for _, name in ipairs(names) do
+    out[#out + 1] = { label = name, insert = name }
+  end
+  return out
+end
+
+-- `:setfiletype` completes a filetype name. (It is deliberately NOT in `SET_COMMANDS`
+-- — its argument is a filetype, not an option.)
+local SETFILETYPE_COMMANDS = {}
+for _, c in ipairs({
+  "setf",
+  "setfi",
+  "setfil",
+  "setfile",
+  "setfilet",
+  "setfilety",
+  "setfiletyp",
+  "setfiletype",
+}) do
+  SETFILETYPE_COMMANDS[c] = true
+end
+
+-- The candidate set for a `:setfiletype` argument: the filetype names nxvim recognizes
+-- (`nx._filetypes`, injected by the server from core's extension-detection table — the
+-- single source of truth). A buffer can still be forced to any string; this is the
+-- known/highlighting-capable set offered for convenience.
+local function filetype_candidates()
+  local out = {}
+  for _, ft in ipairs(nx._filetypes or {}) do
+    out[#out + 1] = { label = ft, insert = ft }
+  end
+  return out
+end
+
+-- `:TSInstall` / `:TSUpdate` install / update tree-sitter parsers by LANGUAGE name.
+-- The full installable catalog is nvim-treesitter's (~hundreds, behind a network
+-- fetch), so it can't be listed synchronously — but a filetype name IS the tree-sitter
+-- language name in nxvim (`language_of_path`), and those are exactly the languages
+-- nxvim highlights, so `nx._filetypes` is the meaningful, offline candidate set. Both
+-- commands take MULTIPLE space-separated languages, so the completer is NOT first-arg
+-- gated — every argument word completes a language.
+local TS_COMMANDS = { TSInstall = true, TSUpdate = true }
+
+-- ----- autocmd events / augroups, registers, addresses (first-argument completers) --
+-- These commands complete a name in their FIRST argument slot only — an event, an
+-- augroup, a register, or an address landmark — so `on_first_arg` gates them (a later
+-- word, e.g. an `:autocmd` pattern or command, has no completer and stays closed).
+
+-- Whether the cursor sits on the FIRST argument of the command — no completed
+-- argument word precedes the partial being typed. Skips a leading range (the command
+-- word is the first letter-run), so `:'<,'>move <Tab>` still counts as first-argument.
+local function on_first_arg(before)
+  local after = before:match("%a%w*%s+(.*)$")
+  return after ~= nil and not after:match("%S%s")
+end
+
+-- `:autocmd` / `:doautocmd` complete an event name in their first argument
+-- (`:autocmd BufWrite<Tab>`); `:augroup` completes a defined group name.
+local AUTOCMD_EVENT_COMMANDS = {}
+for _, c in ipairs({
+  "au",
+  "aut",
+  "auto",
+  "autoc",
+  "autocm",
+  "autocmd",
+  "doau",
+  "doaut",
+  "doauto",
+  "doautoc",
+  "doautocm",
+  "doautocmd",
+}) do
+  AUTOCMD_EVENT_COMMANDS[c] = true
+end
+local AUGROUP_COMMANDS = {}
+for _, c in ipairs({ "aug", "augr", "augro", "augrou", "augroup" }) do
+  AUGROUP_COMMANDS[c] = true
+end
+
+-- The autocmd events nxvim emits, plus the accepted aliases (canonicalized on
+-- registration). Hand-curated to mirror `docs/autocmd-events.md` — the authoritative
+-- catalog, since nxvim has no runtime registry of the *emitted* set to source from —
+-- so keep the two in sync when an event is added (like the `BUILTIN` command catalog).
+local AUTOCMD_EVENTS = {
+  -- Buffer lifecycle
+  "BufAdd",
+  "BufDelete",
+  "BufEnter",
+  "BufLeave",
+  "BufNewFile",
+  "BufReadCmd",
+  "BufReadPost",
+  "BufWinEnter",
+  "FileType",
+  -- Writing
+  "BufWritePost",
+  "BufWritePre",
+  -- Window & tab
+  "TabClosed",
+  "TabEnter",
+  "TabLeave",
+  "TabNew",
+  "WinClosed",
+  "WinEnter",
+  "WinLeave",
+  "WinNew",
+  "WinResized",
+  "WinScrolled",
+  -- Mode
+  "InsertEnter",
+  "InsertLeave",
+  "ModeChanged",
+  -- Editing & cursor
+  "CursorMoved",
+  "CursorMovedI",
+  "TextChanged",
+  "TextChangedI",
+  -- LSP
+  "LspAttach",
+  "LspDetach",
+  -- Files & environment
+  "ColorScheme",
+  "DirChanged",
+  "EncodingChanged",
+  "FileChangedShell",
+  "FileChangedShellPost",
+  -- Startup & plugins
+  "PluginLoaded",
+  "PluginsLoaded",
+  "VimEnter",
+  -- Accepted aliases (each canonicalizes to a real emitted event)
+  "BufCreate",
+  "BufRead",
+  "BufWrite",
+  "FileEncoding",
+}
+
+local function autocmd_event_candidates()
+  local out = {}
+  for _, name in ipairs(AUTOCMD_EVENTS) do
+    out[#out + 1] = { label = name, insert = name }
+  end
+  return out
+end
+
+-- The candidate set for `:augroup`: every currently-defined autocommand group, from
+-- the live `nx._augroups` registry (name -> id). Sorted for a stable menu.
+local function augroup_candidates()
+  local names = {}
+  for name in pairs(nx._augroups or {}) do
+    names[#names + 1] = name
+  end
+  table.sort(names)
+  local out = {}
+  for _, name in ipairs(names) do
+    out[#out + 1] = { label = name, insert = name }
+  end
+  return out
+end
+
+-- `:put` READS a register, so its argument completes to the registers that hold
+-- content. `:delete`/`:yank` WRITE their register, so completing existing-content
+-- registers there would mislead — they are deliberately excluded.
+local REGISTER_COMMANDS = { pu = true, put = true }
+
+-- The candidate set for a `:put` register argument: every register that holds content,
+-- from the register mirror (`nx._registers`, name -> { text, type }). The single-char
+-- name is the label/insert; the docs pane previews the register's first line.
+local function register_candidates()
+  local names = {}
+  for name in pairs(nx._registers or {}) do
+    names[#names + 1] = name
+  end
+  table.sort(names)
+  local out = {}
+  for _, name in ipairs(names) do
+    local reg = nx._registers[name]
+    local first = ((reg and reg.text) or ""):match("^[^\n]*") or ""
+    if #first > 60 then
+      first = first:sub(1, 57) .. "..."
+    end
+    out[#out + 1] = { label = name, insert = name, doc = 'register "' .. name .. '"\n\n' .. first }
+  end
+  return out
+end
+
+-- `:move` / `:copy` (`:m` / `:t`) relocate the range below an address; complete the
+-- addressable landmarks — the specials `.`/`$`/`0` and the marks set in the CURRENT
+-- buffer (as `'x` addresses).
+local ADDRESS_COMMANDS = {}
+for _, c in ipairs({ "m", "mo", "mov", "move", "t", "co", "cop", "copy" }) do
+  ADDRESS_COMMANDS[c] = true
+end
+
+local function address_candidates()
+  local out = {
+    { label = ".", insert = ".", doc = "the current line" },
+    { label = "$", insert = "$", doc = "the last line" },
+    { label = "0", insert = "0", doc = "above the first line" },
+  }
+  local cur = nx.buf.current()
+  for _, m in ipairs(nx.mark.list()) do
+    -- A `'x` address references a line in the CURRENT buffer, so skip marks pointing
+    -- elsewhere (an out-of-buffer global mark, an unset one). `line` is 0-based here.
+    if m.bufnr == cur and m.name:match("^%a$") then
+      out[#out + 1] = {
+        label = "'" .. m.name,
+        insert = "'" .. m.name,
+        doc = "mark " .. m.name .. " — line " .. (m.line + 1) .. "\n\n" .. (m.text or ""),
+      }
+    end
+  end
+  return out
+end
+
+-- ----- command modifiers that wrap a nested command --------------------------------
+-- `:vertical` / `:tab` / `:silent` take a nested command as their argument. Once the
+-- modifier word is complete, `nx._cmdline_complete_run` strips it and completes the
+-- REMAINDER — so the nested command's name and arguments complete as if typed bare,
+-- and chained modifiers recurse (`:tab vertical split …`). These are the only three
+-- the core / server dispatch (nxvim has no `:aboveleft`/`:keepjumps`/… modifiers).
+local WRAPPER_COMMANDS = {}
+for _, c in ipairs({ "ver", "vert", "vertical", "tab", "sil", "sile", "silen", "silent" }) do
+  WRAPPER_COMMANDS[c] = true
 end
 
 -- ----- file-path completion via the picker --------------------------------------
@@ -586,7 +901,10 @@ end
 -- command name or, once whitespace separates it, the current argument word; this
 -- source picks the candidate set from `line` / `col`:
 --   * still in the command name  → the command catalog (built-ins + user commands);
+--   * behind a `:vertical`/`:tab`/`:silent` modifier → strip it and complete the rest;
 --   * in a `:set` argument        → option names (with docs);
+--   * a `:buffer`/`:colorscheme`/`:highlight` argument → that name set;
+--   * an `:autocmd`/`:augroup`/`:put`/`:move` first argument → event/group/register/addr;
 --   * in a file/dir argument      → launch the file picker, return the sentinel;
 --   * any other command's args    → nothing yet (core closes the menu).
 --
@@ -637,10 +955,51 @@ function nx._cmdline_complete_run(line, col)
   -- The command word and its trailing space are ASCII, so this byte scan of the
   -- char-offset-truncated prefix is exact for the only structure we test.
   local before = line:sub(1, col)
+  -- A command modifier (`:vertical`/`:tab`/`:silent`, optional `!`) wraps a nested
+  -- command: once past the modifier word, strip it (and its trailing whitespace) and
+  -- complete the REMAINDER, so the nested command completes as if typed bare. The
+  -- prefix is leading ASCII, so removing `#prefix` bytes from both `line` and `col`
+  -- is exact; chained modifiers recurse (`:tab vertical split …`).
+  local wrap_prefix = before:match("^(%a%w*!?%s+)")
+  if wrap_prefix and WRAPPER_COMMANDS[wrap_prefix:match("^(%a%w*)")] then
+    local n = #wrap_prefix
+    return nx._cmdline_complete_run(line:sub(n + 1), col - n)
+  end
   if before:match("%S+%s") then
     local cmd = line:match("(%a%w*)") -- the first word — the command name
     if cmd and SET_COMMANDS[cmd] then
       return option_candidates()
+    end
+    if cmd and BUFFER_COMMANDS[cmd] then
+      return buffer_candidates()
+    end
+    if cmd and COLORSCHEME_COMMANDS[cmd] then
+      return colorscheme_candidates()
+    end
+    if cmd and HIGHLIGHT_COMMANDS[cmd] then
+      return highlight_candidates()
+    end
+    if cmd and SETFILETYPE_COMMANDS[cmd] then
+      return on_first_arg(before) and filetype_candidates() or {}
+    end
+    -- `:TSInstall`/`:TSUpdate` complete a tree-sitter language in EVERY argument (they
+    -- take several), sharing the filetype names (a filetype IS the language name here).
+    if cmd and TS_COMMANDS[cmd] then
+      return filetype_candidates()
+    end
+    -- First-argument name completers (event / group / register / address). Gated on
+    -- `on_first_arg` so they fire only for their own slot, not a later word.
+    if cmd and AUTOCMD_EVENT_COMMANDS[cmd] then
+      return on_first_arg(before) and autocmd_event_candidates() or {}
+    end
+    if cmd and AUGROUP_COMMANDS[cmd] then
+      return on_first_arg(before) and augroup_candidates() or {}
+    end
+    if cmd and REGISTER_COMMANDS[cmd] then
+      return on_first_arg(before) and register_candidates() or {}
+    end
+    if cmd and ADDRESS_COMMANDS[cmd] then
+      return on_first_arg(before) and address_candidates() or {}
     end
     if cmd and (FILE_COMMANDS[cmd] or DIR_COMMANDS[cmd]) then
       return launch_path_picker(before, DIR_COMMANDS[cmd] == true)

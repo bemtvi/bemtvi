@@ -1849,6 +1849,37 @@ impl LuaRuntime {
         Ok(())
     }
 
+    /// Populate `nx._builtin_colorschemes` with the color scheme names bundled in the
+    /// binary, so the `nx.cmdline_complete` source can offer them after `:colorscheme`.
+    /// The runtimepath glob the completer runs (`nx.runtime_file("colors/*.lua")`)
+    /// discovers user / plugin schemes, but the embedded `runtime/colors/` tree is not
+    /// a real runtimepath directory, so the builtins must be handed over separately.
+    /// Set once at startup from the server's `BUILTIN_COLORSCHEMES` — they are static.
+    pub fn set_builtin_colorschemes(&self, names: &[String]) -> mlua::Result<()> {
+        let nx = self.nx()?;
+        let list = self.lua.create_table()?;
+        for (i, name) in names.iter().enumerate() {
+            list.set(i + 1, name.as_str())?;
+        }
+        nx.set("_builtin_colorschemes", list)?;
+        Ok(())
+    }
+
+    /// Populate `nx._filetypes` with the filetype names nxvim recognizes, so the
+    /// `nx.cmdline_complete` source can offer them after `:setfiletype`. Set once at
+    /// startup from core's single source of truth (`nxvim_core::known_filetypes`, the
+    /// extension-detection table) — nxvim-lua stays decoupled from core, so the names
+    /// arrive as plain strings.
+    pub fn set_filetypes(&self, names: &[String]) -> mlua::Result<()> {
+        let nx = self.nx()?;
+        let list = self.lua.create_table()?;
+        for (i, name) in names.iter().enumerate() {
+            list.set(i + 1, name.as_str())?;
+        }
+        nx.set("_filetypes", list)?;
+        Ok(())
+    }
+
     /// Whether any `nx.decor` provider is registered — the gate the server checks
     /// before dispatching a viewport-change signal off-tick. Cheap (a `bool` read),
     /// so the common no-provider config never slices visible lines or re-enters Lua

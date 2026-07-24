@@ -2157,18 +2157,28 @@ impl EditHost {
                 let cache = &self.preview_cache;
                 let end = (start + pane_h).min(len);
                 let win = cache.lines.get(start..end).unwrap_or(&[]);
+                // Expand each visible line's tabs to spaces up front. The preview
+                // renders char-by-char with each cell one column, but a raw `\t` handed
+                // to the client paints as nothing (a zero-width control), so tab-indented
+                // content — help code blocks, aligned source — would collapse leftward.
+                // Expanding here (the window text does the same via `expand_tabs`) keeps
+                // the sliced lines, the `max_w` clamp, and the byte→column span mapping
+                // all in one consistent expanded-column space for every client.
+                let exp: Vec<std::borrow::Cow<'_, str>> =
+                    win.iter().map(|l| expand_preview_tabs(l)).collect();
                 // Horizontal scroll: clamp the manual column offset to the widest visible
                 // line (so a short window can't stay scrolled past its longest row), fold
                 // the clamp back like the vertical offset, then slice each line + the
                 // match column from there. `preview_w` is the visible column count.
-                let max_w = win.iter().map(|l| l.chars().count()).max().unwrap_or(0);
+                let max_w = exp.iter().map(|l| l.chars().count()).max().unwrap_or(0);
                 let hscroll = self.preview_hscroll.min(max_w.saturating_sub(preview_w));
                 self.preview_hscroll = hscroll;
                 // Per windowed line, the cached tree-sitter spans mapped to char
                 // columns + per-frame style ids — the same `[start, end, group,
                 // style_id]` shape as a window's text highlights, so the clients reuse
                 // their span renderer. Empty rows (no grammar / blank line) stay plain.
-                // Spans rebase by `hscroll` to match the sliced line.
+                // The raw line is passed so the byte→column mapping expands tabs to match
+                // `exp`; spans rebase by `hscroll` to match the sliced line.
                 let highlights = Value::Array(
                     win.iter()
                         .enumerate()
@@ -2183,10 +2193,10 @@ impl EditHost {
                         })
                         .collect(),
                 );
-                // Slice each visible line to the horizontal window (the client renders
-                // from column 0 and truncates to the pane width, as before — so at
-                // `hscroll == 0` this is the unchanged full line).
-                let shown: Vec<String> = win
+                // Slice each visible (tab-expanded) line to the horizontal window (the
+                // client renders from column 0 and truncates to the pane width — so at
+                // `hscroll == 0` this is the whole line).
+                let shown: Vec<String> = exp
                     .iter()
                     .map(|l| l.chars().skip(hscroll).collect())
                     .collect();
@@ -2400,6 +2410,57 @@ pub(crate) struct PreviewCache {
 /// file stalling the frame, not a UI limit (the pane only shows a window anyway).
 const MAX_PREVIEW_BYTES: u64 = 2 * 1024 * 1024;
 
+/// Tab width the preview pane expands tabs at. The pane previews an *unopened* file,
+/// so there's no buffer `'tabstop'` to honour; 8 is vim's global default (and what
+/// help `doc/*.txt` — the common tab-indented preview — declares via `ts=8`).
+const PREVIEW_TABSTOP: usize = 8;
+
+/// Expand a preview line's tabs to spaces at [`PREVIEW_TABSTOP`], counting each
+/// non-tab char as one display column. The preview renders char-by-char (each cell
+/// one column — wide chars included, a pre-existing limitation), so column tracking
+/// here is char-based to match; a raw `\t` would otherwise paint as a zero-width
+/// control and collapse tab indentation. Borrows the (common) tab-free line untouched.
+fn expand_preview_tabs(line: &str) -> std::borrow::Cow<'_, str> {
+    use std::borrow::Cow;
+    if !line.contains('\t') {
+        return Cow::Borrowed(line);
+    }
+    let mut out = String::with_capacity(line.len() + PREVIEW_TABSTOP);
+    let mut col = 0;
+    for ch in line.chars() {
+        if ch == '\t' {
+            let n = PREVIEW_TABSTOP - (col % PREVIEW_TABSTOP);
+            for _ in 0..n {
+                out.push(' ');
+            }
+            col += n;
+        } else {
+            out.push(ch);
+            col += 1;
+        }
+    }
+    Cow::Owned(out)
+}
+
+/// Char column of original byte offset `byte` in the [`expand_preview_tabs`]
+/// rendering of `line` — the mapping that rebases the tree-sitter spans (raw byte
+/// offsets) onto the expanded, char-rendered preview line. `byte` past end-of-line
+/// clamps to the expanded width.
+fn expanded_col_at(line: &str, byte: usize) -> usize {
+    let mut col = 0;
+    for (i, ch) in line.char_indices() {
+        if i >= byte {
+            break;
+        }
+        if ch == '\t' {
+            col += PREVIEW_TABSTOP - (col % PREVIEW_TABSTOP);
+        } else {
+            col += 1;
+        }
+    }
+    col
+}
+
 /// Read a file's lines for the read-only preview pane through the editor's host FS,
 /// capped at [`MAX_PREVIEW_BYTES`]. Returns `(lines, ok)`; `ok = false` (with a
 /// single visible placeholder line) when the FS is off-tick (daemon/wasm — preview
@@ -2482,10 +2543,13 @@ fn preview_line_spans(
         spans
             .iter()
             .filter_map(|s| {
-                // Byte → char column within the line; skip a span that doesn't land
-                // on char boundaries (defensive — engine spans always should).
-                let start = text.get(..s.start_byte)?.chars().count();
-                let end = text.get(..s.end_byte)?.chars().count();
+                // Byte → char column within the tab-expanded line (matching the
+                // `expand_preview_tabs` rendering the client paints); skip a span that
+                // doesn't land on char boundaries (defensive — engine spans always should).
+                text.get(..s.start_byte)?;
+                text.get(..s.end_byte)?;
+                let start = expanded_col_at(text, s.start_byte);
+                let end = expanded_col_at(text, s.end_byte);
                 // Rebase into the horizontally-scrolled window: a span fully left of
                 // the first visible column is dropped, the rest shift left by `hscroll`
                 // (the client renders the sliced line from column 0).

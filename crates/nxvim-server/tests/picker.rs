@@ -1637,6 +1637,41 @@ nx.picker.source {{
     assert_eq!(lines(&rpc).await, vec![""]);
 }
 
+/// A tab-indented preview line is expanded to spaces (at the default tabstop of 8)
+/// before it reaches the client. The preview paints char-by-char with each cell one
+/// column, so a raw `\t` would render as a zero-width control and collapse the
+/// indentation of tab-indented content (help code blocks, aligned source) leftward.
+#[tokio::test]
+async fn preview_expands_tabs_to_spaces() {
+    let dir = temp_dir("picker_preview_tabs");
+    // A leading tab (→ column 8) and a mid-line tab from column 2 (→ column 8: 6 spaces).
+    std::fs::write(dir.join("t.txt"), "\tindented\nab\tcd\n").unwrap();
+    let t = dir.join("t.txt");
+    let src = format!(
+        r#"
+nx.picker.source {{
+  name = "tabs_test",
+  preview = "file",
+  items = function(ctx) ctx.push {{ text = "t.txt", path = "{t}" }} end,
+  confirm = function(item) _G.picked = item.path end,
+}}
+"#,
+        t = t.display(),
+    );
+    let (rpc, mut incoming) = start(&dir, &src).await;
+
+    exec_lua(&rpc, "nx.picker.open('tabs_test')").await;
+    let menu = menu_of(&poll_menu(&rpc, &mut incoming).await.expect("menu opens"));
+    let preview = preview_of(&menu).expect("file picker carries a preview pane");
+    let lines = preview_lines(&preview);
+
+    // The leading tab becomes 8 spaces; the mid-line tab pads column 2 out to 8 (6
+    // spaces). No `\t` survives into the painted lines.
+    assert_eq!(lines[0], "        indented");
+    assert_eq!(lines[1], "ab      cd");
+    assert!(lines.iter().all(|l| !l.contains('\t')));
+}
+
 #[tokio::test]
 async fn location_preview_windows_to_the_match_and_marks_it() {
     let dir = temp_dir("picker_preview_loc");

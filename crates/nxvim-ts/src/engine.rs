@@ -803,22 +803,124 @@ impl Engine {
         let shadow = Rope::from_str(text);
         // Parse under the same wall-clock deadline as `reparse`, so a pathologically
         // large preview file can't stall the frame (it just renders plain).
-        let mut budget = deadline_budget(Instant::now(), PARSE_DEADLINE);
+        let started = Instant::now();
+        let mut budget = deadline_budget(started, PARSE_DEADLINE);
         let options = ParseOptions::new().progress_callback(&mut budget);
         let mut callback = |byte: usize, _: Point| -> &[u8] { read_chunk(&shadow, byte) };
         let Some(tree) = parser.parse_with_options(&mut callback, None, Some(options)) else {
             return Vec::new();
         };
-        // Re-borrow the grammar's compiled query immutably (the `&mut self` from
-        // `grammar` has ended); the host covers the whole snippet — no injections.
-        let Some(Slot::Loaded(host)) = self.grammars.get(lang) else {
-            return Vec::new();
-        };
-        let layers = vec![Layer {
-            query: &host.query,
-            tree: &tree,
-            ranges: &[],
+
+        // Build the layer trees, host first, then injected children — a **stateless**
+        // mirror of the buffer path's `build_injection_layers` (no `BufferId`, no
+        // incremental reuse, no `line_bg` stash). Owned here for the duration so the
+        // `Layer` borrows below stay valid; each child parses through its
+        // `included_ranges`, so all trees share the one `shadow` coordinate space and
+        // `extract_spans` paints a deeper (injected) layer over the shallower host.
+        // Lets a help `>lua` block, a markdown fenced block, … show real per-language
+        // tokens in the preview, exactly as in an open buffer.
+        struct OwnedLayer {
+            language: String,
+            tree: Tree,
+            ranges: Vec<Range<usize>>,
+            depth: usize,
+            /// The language that injected this layer (`injection.parent`); `None` for
+            /// the host.
+            injector: Option<String>,
+        }
+        let mut owned = vec![OwnedLayer {
+            language: lang.to_string(),
+            tree,
+            ranges: Vec::new(), // the host covers the whole snippet — no clipping
+            depth: 0,
+            injector: None,
         }];
+        // Breadth-first: index `i` walks the growing list, appending the regions each
+        // layer injects. The whole child pass shares one `INJECTION_DEADLINE` budget,
+        // so a pathological (or cyclic) config can't stall the preview frame.
+        let mut i = 0;
+        while i < owned.len() {
+            let (this_lang, this_depth, injector) = {
+                let l = &owned[i];
+                (l.language.clone(), l.depth, l.injector.clone())
+            };
+            i += 1;
+            if this_depth >= MAX_INJECTION_DEPTH {
+                continue;
+            }
+            // Regions this layer injects, resolved through its own grammar's injection
+            // query (`injection.self` = this layer's language, `injection.parent` = the
+            // language that injected it).
+            let regions = match self.grammars.get(&this_lang) {
+                Some(Slot::Loaded(g)) => match g.injections.as_ref() {
+                    Some(query) => collect_injection_regions(
+                        query,
+                        &owned[i - 1].tree,
+                        &shadow,
+                        Some(&this_lang),
+                        injector.as_deref(),
+                    ),
+                    None => Vec::new(),
+                },
+                _ => Vec::new(),
+            };
+            for (child_lang, mut ranges) in regions {
+                let child_language = match self.grammar(&child_lang) {
+                    Slot::Loaded(g) => g.language.clone(),
+                    _ => continue, // missing/broken child grammar → region keeps host paint
+                };
+                let mut child_parser = Parser::new();
+                if child_parser.set_language(&child_language).is_err() {
+                    continue;
+                }
+                // `included_ranges` must be ascending and non-overlapping — merge any
+                // overlap into its union (same as the buffer path), or the layer drops.
+                ranges.sort_by_key(|r| r.start);
+                ranges.dedup_by(|next, prev| {
+                    if next.start <= prev.end {
+                        prev.end = prev.end.max(next.end);
+                        true
+                    } else {
+                        false
+                    }
+                });
+                let included: Vec<tree_sitter::Range> =
+                    ranges.iter().map(|r| ts_range(&shadow, r)).collect();
+                if included.is_empty() || child_parser.set_included_ranges(&included).is_err() {
+                    continue;
+                }
+                let mut budget = deadline_budget(started, INJECTION_DEADLINE);
+                let options = ParseOptions::new().progress_callback(&mut budget);
+                let mut callback = |byte: usize, _: Point| -> &[u8] { read_chunk(&shadow, byte) };
+                let Some(child_tree) =
+                    child_parser.parse_with_options(&mut callback, None, Some(options))
+                else {
+                    continue; // budget exhausted / cancelled: region keeps host paint
+                };
+                owned.push(OwnedLayer {
+                    language: child_lang,
+                    tree: child_tree,
+                    ranges,
+                    depth: this_depth + 1,
+                    injector: Some(this_lang.clone()),
+                });
+            }
+        }
+
+        // Re-borrow each layer's compiled query immutably (the `&mut self` grammar
+        // loads have ended) and assemble the layer list in owned order (host first, so
+        // its rank is shallowest and children win over it).
+        let layers: Vec<Layer> = owned
+            .iter()
+            .filter_map(|l| match self.grammars.get(&l.language) {
+                Some(Slot::Loaded(g)) => Some(Layer {
+                    query: &g.query,
+                    tree: &l.tree,
+                    ranges: &l.ranges,
+                }),
+                _ => None,
+            })
+            .collect();
         // The off-buffer preview needs only the spans; its surface has no `line_bg`
         // layer, so the block-background lines are discarded.
         extract_spans(&layers, &shadow, first_line, last_line).0

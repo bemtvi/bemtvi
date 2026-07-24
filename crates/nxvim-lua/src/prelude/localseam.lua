@@ -103,6 +103,11 @@ nx.fs_local = {
   mkdir = function(path, opts)
     return local_fs_op({ op = "mkdir", path = path, recursive = opts and opts.recursive or false })
   end,
+  -- `nx.fs_local.rename(from, to)` -> promise (resolves nil). Atomic on a POSIX
+  -- filesystem, so a write-temp-then-rename gives a torn-read-free local update.
+  rename = function(from, to)
+    return local_fs_op({ op = "rename", from = from, to = to })
+  end,
   -- `nx.fs_local.remove(path[, { recursive }])` -> promise; removes the file/dir.
   remove = function(path, opts)
     return local_fs_op({ op = "remove", path = path, recursive = opts and opts.recursive or false })

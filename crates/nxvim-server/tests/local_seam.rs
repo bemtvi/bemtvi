@@ -122,3 +122,42 @@ async fn fs_local_round_trips_the_client_disk() {
         "fs_local.read_text reads it back",
     );
 }
+
+// The local seam can atomically rename on the client disk (write-temp-then-rename), the
+// primitive a torn-read-free local update is built on.
+#[tokio::test]
+async fn fs_local_rename_moves_on_the_client_disk() {
+    let (rpc, _incoming) = start().await;
+    let dir = temp_dir("fs_local_rename");
+    let tmp = dir.join("record.json.tmp");
+    let final_path = dir.join("record.json");
+    let tmp_lua = tmp.to_string_lossy().replace('\\', "\\\\");
+    let final_lua = final_path.to_string_lossy().replace('\\', "\\\\");
+
+    exec_lua(
+        &rpc,
+        &format!(
+            "_G.done = nil\n\
+             nx.async(function()\n\
+             \x20 nx.await(nx.fs_local.write('{tmp_lua}', 'atomic-payload'))\n\
+             \x20 nx.await(nx.fs_local.rename('{tmp_lua}', '{final_lua}'))\n\
+             \x20 _G.done = true\n\
+             end)()",
+        ),
+    )
+    .await;
+
+    for _ in 0..150 {
+        if lua_bool(&rpc, "return _G.done").await == Some(true) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    assert!(!tmp.exists(), "the temp file was renamed away");
+    assert_eq!(
+        fs::read_to_string(&final_path).ok().as_deref(),
+        Some("atomic-payload"),
+        "fs_local.rename moved the temp file over the target on the real filesystem",
+    );
+}

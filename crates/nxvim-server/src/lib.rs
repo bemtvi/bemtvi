@@ -831,6 +831,21 @@ pub struct EditHost {
     /// slim span cache the redraw projects.
     #[cfg(feature = "native")]
     syntax_states: HashMap<BufferId, SyntaxState>,
+    /// Buffers whose *first* treesitter highlight has been deferred off the
+    /// first-paint frame. A buffer's first highlight pays the one-time,
+    /// synchronous cost of loading its language's grammar (dlopen + compiling every
+    /// `.scm` query — tens of ms for a big grammar like Python) plus the initial
+    /// full-buffer parse. Doing that inside the `redraw` that first shows the buffer
+    /// blocks first paint, so a freshly-opened file visibly stalls before appearing.
+    /// Instead, the first time a highlightable buffer is seen we skip the query for
+    /// one frame (it paints instantly as plain text, like a buffer with no grammar),
+    /// record it here, and arm the parse-resume timer; the next frame — now that the
+    /// buffer is present in this set — runs the real query, so grammar-load + parse
+    /// land *after* first paint and the colour fills in a few ms later. Cleared per
+    /// buffer on close (`reap_closed_buffers`). A buffer only defers once; every
+    /// later miss (edit, scroll) re-queries synchronously as before.
+    #[cfg(feature = "native")]
+    first_highlight_deferred: HashSet<BufferId>,
     /// Languages whose runtimepath treesitter queries (`queries/<lang>/*.scm` +
     /// `after/queries/<lang>/*.scm`, `;; extends`) have already been resolved and
     /// pushed to the engine — the query-bridge's push-once guard, so resolution
@@ -1391,6 +1406,8 @@ impl EditHost {
             keyboard_protocol: false,
             #[cfg(feature = "native")]
             syntax_states: HashMap::new(),
+            #[cfg(feature = "native")]
+            first_highlight_deferred: HashSet::new(),
             #[cfg(feature = "native")]
             resolved_ts_langs: HashSet::new(),
             lsp_states: HashMap::new(),
@@ -2580,7 +2597,7 @@ pub(crate) const PARSE_RESUME_TIMER_ID: u64 = 1 << 50;
 /// yield back to the run loop between budgets — short enough to converge quickly,
 /// non-zero so input/other events can interleave.
 #[cfg(feature = "native")]
-const PARSE_RESUME_DELAY: std::time::Duration = std::time::Duration::from_millis(5);
+pub(crate) const PARSE_RESUME_DELAY: std::time::Duration = std::time::Duration::from_millis(5);
 
 /// Whether `event` is the progressive-parse resume timer firing (vs. the shada
 /// checkpoint or a real Lua timer / process / watch event).

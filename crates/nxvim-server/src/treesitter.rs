@@ -155,6 +155,27 @@ impl EditHost {
             return;
         }
 
+        // Defer a highlightable buffer's *first* query off this (first-paint) frame.
+        // That query is where the language's grammar is dlopen'd and every `.scm`
+        // is compiled (tens of ms for Python) plus the whole buffer is parsed —
+        // running it here blocks first paint, so the file visibly stalls before it
+        // appears. Skip once: the buffer paints instantly as plain text this frame,
+        // we record it, and arm the parse-resume timer to wake us right back. Next
+        // frame the buffer is in the set, so we fall through and run the real query —
+        // grammar-load + parse now happen *after* first paint, and the colour fills
+        // in a few ms later (the Sublime "paint now, highlight after" model). Only
+        // buffers that actually have a grammar defer; a no-grammar buffer (plain
+        // text) has nothing to skip and paints as before.
+        if key.3.is_some() && self.first_highlight_deferred.insert(buffer) {
+            self.fx
+                .loop_command(crate::evloop::LoopCommand::TimerStart {
+                    id: crate::PARSE_RESUME_TIMER_ID,
+                    delay: crate::PARSE_RESUME_DELAY,
+                    repeat: std::time::Duration::ZERO,
+                });
+            return;
+        }
+
         // Miss: re-query the engine (this also drains the buffer's edit journal
         // into the engine and reparses incrementally) and re-index by line.
         let spans = self.editor.highlights(buffer, first, last);
@@ -274,6 +295,8 @@ impl EditHost {
     pub(crate) fn reap_closed_buffers(&mut self) {
         let live = self.editor.buffer_ids();
         self.syntax_states.retain(|id, _| live.contains(id));
+        // A recycled buffer id must be able to defer its first highlight afresh.
+        self.first_highlight_deferred.retain(|id| live.contains(id));
     }
 
     /// Build a per-row `highlights` payload from a row→buffer-line mapping

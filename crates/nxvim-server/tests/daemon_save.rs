@@ -278,6 +278,30 @@ async fn offtick_bufwritepre_fires_once_before_the_wire_write() {
     );
 }
 
+/// Over the wire, an **async** `BufWritePre` handler is awaited before the bytes are
+/// pushed: the write waits for the handler's promise to settle, so its mutation is what
+/// the daemon receives — the async format-on-save contract, working remotely too.
+#[tokio::test]
+async fn offtick_async_bufwritepre_settles_before_the_wire_write() {
+    let dir = temp_dir("daemon_async_bufwritepre");
+    let fake = DaemonFs::with("/virtual/n.txt", "hello\n");
+    let mut init = config_init(
+        &dir,
+        "vim.api.nvim_create_autocmd('BufWritePre', {\n\
+         \x20 callback = function()\n\
+         \x20   return nx.promise.delay(30):next(function() vim.cmd([[%s/hello/HELLO/]]) end)\n\
+         \x20 end })\n",
+    );
+    init.file = Some("/virtual/n.txt".to_string());
+    let (rpc, _incoming) = spawn_with_daemon_fs_init(fake.clone(), init).await;
+    await_lines(&rpc, &["hello"]).await;
+
+    feed(&rpc, ":w<CR>");
+
+    // The daemon holds the mutated bytes — the wire write waited for the async handler.
+    await_daemon_content(&fake, "/virtual/n.txt", "HELLO\n").await;
+}
+
 /// `:wq` defers its quit until the write acks, then exits — and the daemon has the
 /// bytes (so the quit really did wait for the save to land, not race ahead of it).
 #[tokio::test]

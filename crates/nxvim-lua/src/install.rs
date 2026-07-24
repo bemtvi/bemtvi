@@ -939,6 +939,17 @@ pub(crate) fn install_vim(lua: &Lua, shared: &Rc<RefCell<Shared>>) -> mlua::Resu
             Ok(())
         })?,
     )?;
+    // `nx._au_gate_done(id)`: signal that an awaited autocmd gate (`BufWritePre`) has
+    // had all its handler promises settle, so the server can run the deferred write it
+    // parked under `id` (`nx._fire_gated`'s `all_settled` continuation calls this).
+    let sh = shared.clone();
+    nx.set(
+        "_au_gate_done",
+        lua.create_function(move |_, id: u64| {
+            sh.borrow_mut().loop_ops.push(LoopOp::AuGateDone { id });
+            Ok(())
+        })?,
+    )?;
     // `nx._timer_start(id, delay_ms, repeat_ms)`: arm a timer firing callback
     // `id` after `delay_ms`, then every `repeat_ms` (`0` ⇒ one-shot).
     let sh = shared.clone();

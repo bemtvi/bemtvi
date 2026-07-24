@@ -16,6 +16,13 @@ event by the path tail, one containing a `/` matches the whole path, and `"*"` (
 an omitted pattern) matches everything. A pattern with no glob metacharacter is an
 exact compare — so a `FileType rust` autocmd never glob-matches a path.
 
+**Handlers may be async.** A `callback` can return a promise (`nx.promise`, or the
+result of an `nx.*` async call). Most events are fire-and-forget — the promise simply
+runs in the background and the editor does not wait. One event is **awaited**:
+`BufWritePre` holds the write until every handler's promise settles, so an async
+format-on-save works (see [Writing](#writing)). A returned promise is never dropped; a
+rejection surfaces the same way an unhandled `nx.promise` rejection does.
+
 ## Buffer lifecycle
 
 | Event | When it fires | Notes |
@@ -35,7 +42,7 @@ Ordering on opening a file is `BufAdd` → `BufReadPost` (or `BufNewFile` for a 
 
 | Event | When it fires | Notes |
 | --- | --- | --- |
-| `BufWritePre` | **Before** the buffer is serialized to disk, on a `:w` / `:wq` / `:x`. A handler may mutate the buffer (format-on-save, trim trailing whitespace) and the mutation is what gets written — vim's pre-write contract. | `match` / `file` is the path; glob-matchable (`*.rs`). The buffer is still `modified` here (it is clean by `BufWritePost`). Firing order is `Pre` → *write* → `Post`. Caveat: `:wall` and finalized off-tick (daemon/web) saves still fire `BufWritePre` *after* the bytes for now — the multi-buffer/remote pre-write split is in progress. |
+| `BufWritePre` | **Before** the buffer is serialized to disk, on a `:w` / `:wq` / `:x`. A handler may mutate the buffer (format-on-save, trim trailing whitespace) and the mutation is what gets written — vim's pre-write contract. A handler may also be **async**: return a promise (e.g. an async LSP format) and the write **waits** for every handler to settle before serializing. | `match` / `file` is the path; glob-matchable (`*.rs`). The buffer is still `modified` here (it is clean by `BufWritePost`). Firing order is `Pre` → *await handlers* → *write* → `Post`, locally and over the daemon/web wire. A handler whose promise *rejects* does not block the write (a failing formatter still saves). Caveat: `:wall` still fires `BufWritePre` *after* the bytes for now — the multi-buffer pre-write split is in progress. |
 | `BufWrite` | Same point as `BufWritePre` — the bare-name spelling. | An alias for `BufWritePre` (see [Event aliases](#event-aliases)); handlers on both spellings fire once. |
 | `BufWritePost` | After a successful write. | The hook "reload affected tools" plugins use. |
 

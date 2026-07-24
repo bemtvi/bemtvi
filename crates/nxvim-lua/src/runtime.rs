@@ -2994,6 +2994,28 @@ impl LuaRuntime {
         fire.call((event, pattern, buf, file))
     }
 
+    /// Fire an **awaited** buffer autocmd (currently `BufWritePre`): run every matching
+    /// handler like [`fire_autocmd_buf`](Self::fire_autocmd_buf), but a handler may
+    /// return a promise the caller must wait on before proceeding. Returns `true` when
+    /// every handler settled **synchronously** (no promise pending) — the caller commits
+    /// its follow-up (the write) at once, preserving the sync path's timing. Returns
+    /// `false` when a handler returned a still-pending promise: `nx._fire_gated` has
+    /// registered an `nx.promise.all_settled(...):next(…)` that will call
+    /// `nx._au_gate_done(gate_id)` once they all settle, and the caller defers its
+    /// follow-up until that signal ([`LoopOp::AuGateDone`](crate::ops::LoopOp::AuGateDone))
+    /// lands. `gate_id` is the caller's key for the parked follow-up.
+    pub fn fire_autocmd_buf_gated(
+        &self,
+        event: &str,
+        pattern: &str,
+        buf: u64,
+        file: &str,
+        gate_id: u64,
+    ) -> mlua::Result<bool> {
+        let fire: mlua::Function = self.nx()?.get("_fire_gated")?;
+        fire.call((event, pattern, buf, file, gate_id))
+    }
+
     /// Fire a **`*Cmd`** autocmd (currently `BufReadCmd`) and report whether any
     /// handler matched/ran — the "claimed the read" signal. Like
     /// [`fire_autocmd_buf`](Self::fire_autocmd_buf) but it captures `nx._fire`'s

@@ -466,6 +466,12 @@ setmetatable(M, {
 -- to match the rest of `nx.*`).
 M.allSettled = M.all_settled
 
+-- Whether `v` is one of our promises — exposed so other prelude modules (e.g. the
+-- autocmd dispatcher deciding whether a handler's return must be awaited) can test a
+-- handler's return value without re-deriving the metatable check.
+M.is_promise = is_promise
+nx._is_promise = is_promise
+
 nx.promise = M
 
 -- ----- nx.async / nx.await: coroutine sugar over the same promises -----------

@@ -2442,6 +2442,11 @@ impl EditHost {
             // `vim.schedule` needs no event loop — the id queues for the trailing
             // `run_pending` drain — so it works in every build.
             LoopOp::Schedule { id } => self.scheduled.push_back(id),
+            // An awaited autocmd gate (`BufWritePre`) settled — queue the id for the
+            // `run_pending` drain, which commits the parked write. Like `Schedule`, no
+            // event loop is involved (the wait happened on the Lua promise), so it works
+            // in every build.
+            LoopOp::AuGateDone { id } => self.au_gate_done.push(id),
             // Timers / processes ride the tokio event loop. Native only for now; the
             // Worker-side timer wheel is slice 5d. (The internal per-buffer file watch
             // is armed directly from lifecycle, not via a `LoopOp`.)
@@ -3498,10 +3503,18 @@ impl EditHost {
                 reconciled = true;
                 self.reconcile_file_change(buf);
             }
+            // Async `BufWritePre` gates that settled since the last round: commit each
+            // parked write now that its handler promises have all resolved. Ordered first
+            // so the commit's completed-write (BufWritePost) is picked up by
+            // `drain_write_events` below in the same round.
+            self.drain_au_gate_done();
             // Pre-write intents recorded this convergence (`:w` / `:wq`): fire (and
-            // synchronously settle) `BufWritePre` before committing each write, so a
-            // handler's buffer mutation is what lands on disk. Ordered *before*
-            // `drain_write_events` so a commit's `BufWritePost` fires this same round.
+            // await) `BufWritePre` before committing each write, so a handler's buffer
+            // mutation is what lands on disk. A write whose handlers settle synchronously
+            // commits here; one with a pending async handler is parked and committed by
+            // `drain_au_gate_done` above on a later round. Ordered *before*
+            // `drain_write_events` so a synchronous commit's `BufWritePost` fires this
+            // same round.
             self.drain_pre_writes();
             // Writes completed this convergence (a committed `:w` / `:wall`, or a
             // finalized off-tick save): fire each one's `BufWritePost` (and `BufWritePre`
@@ -3849,6 +3862,7 @@ impl EditHost {
                 && self.scheduled.is_empty()
                 && !self.editor.has_pending_checktime()
                 && !self.editor.has_pending_pre_writes()
+                && self.au_gate_done.is_empty()
                 && !self.editor.has_write_events()
             {
                 break;
@@ -3868,6 +3882,7 @@ impl EditHost {
                 self.editor.complete_query_changes.clear();
                 self.editor.take_pending_checktime();
                 self.editor.take_pending_pre_writes();
+                self.au_gate_done.clear();
                 self.editor.take_write_events();
                 self.scheduled.clear();
                 self.editor

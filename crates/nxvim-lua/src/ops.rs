@@ -748,6 +748,11 @@ pub enum LoopOp {
     /// `vim.schedule(fn)` — run callback `id` once, at the end of the current
     /// convergence (no wall-clock wait, no actor; serviced inside `run_pending`).
     Schedule { id: u64 },
+    /// `nx._au_gate_done(id)` — an awaited autocmd gate (currently `BufWritePre`) has
+    /// had all its handler promises settle. The server pops the parked follow-up (the
+    /// deferred write) keyed by `id` and runs it. Same-convergence like `Schedule`; no
+    /// actor (the wait already happened on the Lua promise).
+    AuGateDone { id: u64 },
     /// `nx.timer` (`vim.defer_fn`) handle `:start` — arm a timer that fires callback
     /// `id` after `delay_ms`, then every `repeat_ms` while `repeat_ms > 0` (a
     /// one-shot when `repeat_ms == 0`). Forwarded to the event-loop actor.

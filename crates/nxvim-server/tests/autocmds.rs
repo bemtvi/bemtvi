@@ -885,6 +885,73 @@ async fn bufwritepre_mutation_reaches_disk() {
 }
 
 #[tokio::test]
+async fn async_bufwritepre_settles_before_the_write() {
+    // A BufWritePre handler may be *async*: it returns a promise, and the write must wait
+    // for that promise to settle before serializing. Here the handler upcases the line
+    // only after a timer resolves (a tick later); the write is deferred until then, so
+    // the mutated text still reaches disk. This is the async format-on-save contract.
+    let dir = temp_dir("au_write_pre_async");
+    let file = dir.join("note.txt");
+    std::fs::write(&file, "hello\n").expect("seed file");
+    let (rpc, mut incoming) = start_with_file_and_config(
+        &dir,
+        file.to_str().unwrap(),
+        "vim.api.nvim_create_autocmd('BufWritePre', {\n\
+         \x20 callback = function()\n\
+         \x20   return nx.promise.delay(30):next(function() vim.cmd([[%s/hello/HELLO/]]) end)\n\
+         \x20 end })\n",
+    )
+    .await;
+    redraw_after(&rpc, &mut incoming, ":w<CR>").await;
+    // The write lands a tick after the async handler settles; poll for the on-disk bytes.
+    let mut on_disk = String::new();
+    for _ in 0..100 {
+        on_disk = std::fs::read_to_string(&file).expect("read back");
+        if on_disk == "HELLO\n" {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    assert_eq!(
+        on_disk, "HELLO\n",
+        "the write must wait for the async BufWritePre handler to settle before serializing"
+    );
+}
+
+#[tokio::test]
+async fn rejecting_async_bufwritepre_still_writes() {
+    // `all_settled` never rejects, so a BufWritePre handler whose async work *fails* (a
+    // formatter that blows up) must not block the save — the write still lands. Edit the
+    // buffer first so the written bytes are observably the edited content.
+    let dir = temp_dir("au_write_pre_reject");
+    let file = dir.join("note.txt");
+    std::fs::write(&file, "hello\n").expect("seed file");
+    let (rpc, mut incoming) = start_with_file_and_config(
+        &dir,
+        file.to_str().unwrap(),
+        "vim.api.nvim_create_autocmd('BufWritePre', {\n\
+         \x20 callback = function()\n\
+         \x20   return nx.promise.delay(20):next(function() error('formatter blew up') end)\n\
+         \x20 end })\n",
+    )
+    .await;
+    redraw_after(&rpc, &mut incoming, "A world<Esc>").await;
+    redraw_after(&rpc, &mut incoming, ":w<CR>").await;
+    let mut on_disk = String::new();
+    for _ in 0..100 {
+        on_disk = std::fs::read_to_string(&file).expect("read back");
+        if on_disk == "hello world\n" {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    assert_eq!(
+        on_disk, "hello world\n",
+        "a rejecting async BufWritePre handler must not block the write"
+    );
+}
+
+#[tokio::test]
 async fn bufwritepost_sees_the_written_buffer_as_unmodified() {
     // After a `:w`, the BufWritePost callback resolves the saved buffer via the
     // snapshot and `vim.bo.modified` reads the now-cleared `[+]` flag.

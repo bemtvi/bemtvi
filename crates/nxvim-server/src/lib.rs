@@ -193,7 +193,7 @@ use lsp::{
 };
 use nxvim_core::{
     BufferId, Editor, FileStat, HostFs, Key, Mode, PendingSave, PluginEntry, PluginNamespace,
-    ShadaRequest, StdHostFs, TabId, WindowId,
+    PreWrite, ShadaRequest, StdHostFs, TabId, WindowId,
 };
 #[cfg(feature = "native")]
 use nxvim_lsp::LspManager;
@@ -1178,6 +1178,22 @@ pub struct EditHost {
     /// path, but the field is unconditional so `apply_code_action` (not cfg-gated)
     /// compiles under the wasm edit-host too.
     code_action_cb: u64,
+    /// Writes whose `BufWritePre` returned an *async* handler promise: the [`PreWrite`]
+    /// is parked here, keyed by the `gate_id` handed to Lua, until every handler settles.
+    /// Lua then signals `nx._au_gate_done(gate_id)` (a [`LoopOp::AuGateDone`]) which lands
+    /// in [`Self::au_gate_done`]; `drain_au_gate_done` pops the parked write and commits
+    /// it. Parked writes do **not** keep the fixpoint spinning (that would busy-wait); the
+    /// commit is driven by the settle signal, exactly as an LSP/fs promise settles.
+    pending_gated_writes: HashMap<u64, PreWrite>,
+    /// Monotonic id minting for the `BufWritePre` await gate (`pending_gated_writes` keys
+    /// / the `gate_id` passed to `nx._fire_gated`). Distinct per fired gated event so two
+    /// concurrent async `BufWritePre`s can't collide.
+    next_gate_id: u64,
+    /// Gate ids whose `BufWritePre` handlers have all settled (Lua's
+    /// `nx._au_gate_done(id)` → [`LoopOp::AuGateDone`]), drained in `run_pending` to commit
+    /// the parked [`PreWrite`]. Kept on the loop's break condition so a settle that lands
+    /// mid-convergence commits and fires `BufWritePost` in the same pass.
+    au_gate_done: Vec<u64>,
     /// The picker preview pane's read cache (Phase 3): the file last read for the
     /// preview, so moving the selection within the results — or simply re-projecting
     /// every frame — re-reads only when the selected row's target *path* changes.
@@ -1485,6 +1501,9 @@ impl EditHost {
             #[cfg(feature = "native")]
             pending_code_action: false,
             code_action_cb: 0,
+            pending_gated_writes: HashMap::new(),
+            next_gate_id: 0,
+            au_gate_done: Vec::new(),
             picker_active: false,
             preview_cache: redraw::PreviewCache::default(),
             preview_scroll: 0,

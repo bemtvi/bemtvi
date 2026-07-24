@@ -39,10 +39,11 @@ pub use editor::{
     FileChangeReason, FileChangelist, FileFolds, FileMarkEntry, FloatAnchor, FloatConfig,
     FloatRelative, GlobalMarkEntry, InputHistoryEntry, JumpPos, LocListEntry, Margin, MenuGeom,
     MenuItem, MenuMetrics, MenuPlacement, MouseClick, MousePos, NumberedMark, PendingOpen,
-    PendingQuitAll, PendingSave, PersistState, PluginEntry, PluginNamespace, PreviewScroll,
-    PreviewTarget, PromptPos, QfAction, QfEntry, QfList, QfStack, QfWhich, RegisterEntry,
-    SessionDock, SessionState, SessionTab, SessionWindow, ShadaRequest, StatuslineClick, TabId,
-    TerminalOp, UndoEntry, UndoTreeView, WheelGesture, WindowConfigSpec, WindowId,
+    PendingQuitAll, PendingSave, PersistState, PluginEntry, PluginNamespace, PreWrite,
+    PreviewScroll, PreviewTarget, PromptPos, QfAction, QfEntry, QfList, QfStack, QfWhich,
+    RegisterEntry, SessionDock, SessionState, SessionTab, SessionWindow, ShadaRequest,
+    StatuslineClick, TabId, TerminalOp, UndoEntry, UndoTreeView, WheelGesture, WindowConfigSpec,
+    WindowId, WriteEvent,
 };
 pub use encoding::Encoding;
 pub use extmark::{

@@ -359,36 +359,25 @@ end
 -- Returns whether any autocmd actually ran — the `apply_autocmds()` boolean
 -- neovim's `buf_check_timestamp` branches on (an autocmd ran → honor v:fcs_choice;
 -- none → default warning). Callers that ignore the return value are unaffected.
-function nx._fire(event, pattern, buf, file, data)
-  local any = false
+-- Shared matcher for the event fire paths: call `run(au)` for each registered autocmd
+-- matching (`event`, `pattern`, `buf`) in registration order, then drop any `++once`
+-- ones that fired (collected during the pass and removed after it, so the live `ipairs`
+-- isn't mutated underneath). `nx._fire` / `nx._fire_gated` each supply their own
+-- per-handler `run` (they differ only in what they do with the callback's return value).
+local function au_dispatch(event, pattern, buf, run)
   local fired -- ids of `++once` autocmds to drop after this pass (nil = none)
   for _, au in ipairs(nx._autocmds) do
     local ev = au.event
     local ev_ok = ev == event or (type(ev) == "table" and vim.tbl_contains(ev, event))
-    if ev_ok then
-      local pat = au.opts.pattern
-      local pat_ok = au_pattern_matches(pat, pattern)
-      local buf_ok = au.buffer == nil or au.buffer == buf
-      if pat_ok and buf_ok then
-        local cb = au.opts.callback
-        if type(cb) == "function" then
-          cb({
-            id = au.id,
-            event = event,
-            match = pattern,
-            buf = buf,
-            file = file or pattern,
-            data = data,
-          })
-          any = true
-        elseif type(au.opts.command) == "string" then
-          vim.cmd(au.opts.command)
-          any = true
-        end
-        if au.opts.once then
-          fired = fired or {}
-          fired[au.id] = true
-        end
+    if
+      ev_ok
+      and au_pattern_matches(au.opts.pattern, pattern)
+      and (au.buffer == nil or au.buffer == buf)
+    then
+      run(au)
+      if au.opts.once then
+        fired = fired or {}
+        fired[au.id] = true
       end
     end
   end
@@ -397,7 +386,70 @@ function nx._fire(event, pattern, buf, file, data)
       return not fired[au.id]
     end, nx._autocmds)
   end
+end
+
+function nx._fire(event, pattern, buf, file, data)
+  local any = false
+  au_dispatch(event, pattern, buf, function(au)
+    local cb = au.opts.callback
+    if type(cb) == "function" then
+      cb({
+        id = au.id,
+        event = event,
+        match = pattern,
+        buf = buf,
+        file = file or pattern,
+        data = data,
+      })
+      any = true
+    elseif type(au.opts.command) == "string" then
+      vim.cmd(au.opts.command)
+      any = true
+    end
+  end)
   return any
+end
+
+-- Fire an **awaited** event: run every matching handler like `nx._fire`, but a handler
+-- may return a promise the caller must wait on before proceeding. Currently drives
+-- `BufWritePre` — the write waits for format/trim-on-save (including *async* handlers,
+-- e.g. an LSP format that resolves a tick later) to settle before the bytes serialize.
+-- Collects each handler's returned promise; if none are pending, returns `true` so the
+-- caller commits synchronously (identical timing to the plain `nx._fire` path). Otherwise
+-- waits for all of them via `nx.promise.all_settled` and, once settled, signals the
+-- server through `nx._au_gate_done(gate_id)` (the parked follow-up's key), returning
+-- `false` so the caller defers until that signal. `all_settled` never rejects, so a
+-- handler whose promise *rejects* still lets the write proceed (its rejection surfaces via
+-- the normal unhandled-path) — a failing formatter must not silently block saving.
+function nx._fire_gated(event, pattern, buf, file, gate_id, data)
+  local promises -- nil until a handler returns a pending promise
+  au_dispatch(event, pattern, buf, function(au)
+    local cb = au.opts.callback
+    local ret
+    if type(cb) == "function" then
+      ret = cb({
+        id = au.id,
+        event = event,
+        match = pattern,
+        buf = buf,
+        file = file or pattern,
+        data = data,
+      })
+    elseif type(au.opts.command) == "string" then
+      vim.cmd(au.opts.command)
+    end
+    if nx._is_promise(ret) then
+      promises = promises or {}
+      promises[#promises + 1] = ret
+    end
+  end)
+  if not promises then
+    return true
+  end
+  nx.promise.all_settled(promises):next(function()
+    nx._au_gate_done(gate_id)
+  end)
+  return false
 end
 
 -- Fire a `*Cmd` autocmd (currently `BufReadCmd`) and return whether a handler

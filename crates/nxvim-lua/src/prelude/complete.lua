@@ -43,23 +43,10 @@ local DEFAULT_PRIORITY = { lsp = 8, snippets = 5, buffer = 0 }
 -- keystroke. The native `buffer` source is never debounced (it is pure core).
 nx.complete.debounce = nx.complete.debounce or 120
 
--- Normalize a `keys` entry to a list of notation strings: a bare string becomes a
--- one-element list, a list passes through, nil becomes empty (the server keeps
--- that action's built-in default). Anything else is a config error.
+-- Normalize a `keys` entry to a list of notation strings (nil → empty: the server
+-- keeps that action's built-in default) — the shared `nx.utils.str_list`.
 local function key_list(spec, action)
-  if spec == nil then
-    return {}
-  elseif type(spec) == "string" then
-    return { spec }
-  elseif type(spec) == "table" then
-    for _, k in ipairs(spec) do
-      if type(k) ~= "string" then
-        error("nx.complete.setup: keys." .. action .. " must be string(s), got " .. type(k))
-      end
-    end
-    return spec
-  end
-  error("nx.complete.setup: keys." .. action .. " must be a string or list of strings")
+  return nx.utils.str_list(spec, "nx.complete.setup: keys." .. action)
 end
 
 -- reconcile(): derive the ACTIVE completion set from the engine config captured by

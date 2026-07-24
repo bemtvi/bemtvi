@@ -37,17 +37,18 @@ end
 -- ----- spec display helpers ---------------------------------------------------
 
 -- The short display name for a RAW spec (string shorthand or table): its `name`, or
--- the basename of its source / dir. Mirrors normalize()'s naming so the checklist
--- labels match what gets installed.
+-- the basename of its source / dir — via the manager's own naming helper
+-- (`nx.plugins._source_name`), so the checklist labels match exactly what
+-- normalize() would install.
 local function spec_label(s)
   if type(s) == "string" then
-    return (s:gsub("%.git$", ""):gsub("[/\\]+$", ""):match("[^/\\]+$")) or s
+    return nx.plugins._source_name(s) or s
   end
   if s.name then
     return s.name
   end
   local src = s.src or s.url or s[1] or s.dir
-  return src and ((src:gsub("%.git$", ""):gsub("[/\\]+$", ""):match("[^/\\]+$")) or src) or "?"
+  return src and (nx.plugins._source_name(src) or src) or "?"
 end
 
 -- The source string for a raw spec ("owner/repo" / url / dir), shown dimmed.

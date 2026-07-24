@@ -20,22 +20,9 @@
 local vim = vim
 nx = nx or {}
 
--- Build an argv list from `{ cmd = string|list, args = list }` — `cmd` is a string or an
--- argv list, `args` is appended. Mirrors `nx.run`'s builder (kept in step with prelude/process.lua).
-local function build_argv(spec)
-  local cmd = spec.cmd
-  if type(cmd) == "string" then
-    cmd = { cmd }
-  end
-  local argv = {}
-  for _, c in ipairs(cmd) do
-    argv[#argv + 1] = c
-  end
-  for _, a in ipairs(spec.args or {}) do
-    argv[#argv + 1] = a
-  end
-  return argv
-end
+-- Argv normalization is the same shared `nx.utils.argv` `nx.run` uses
+-- (prelude/utils.lua, loaded above) — the local twin takes identical specs.
+local build_argv = nx.utils.argv
 
 -- `nx.run_local { cmd, args, cwd, env, stdin }` -> promise of `{ code, stdout, stderr }`.
 -- The local-always twin of `nx.run`: runs a one-shot child to completion on THIS machine,

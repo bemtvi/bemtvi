@@ -294,10 +294,6 @@ end
 
 -- ----- application -----------------------------------------------------------
 
-local function dirname(path)
-  return (path:gsub("/[^/]*$", ""))
-end
-
 -- Apply merged EditorConfig properties to buffer `bufnr`'s options.
 local function apply(bufnr, props)
   if props.indent_style == "tab" then
@@ -348,8 +344,7 @@ end
 M._run = nx.async(function(bufnr, file)
   -- (dir, cfg) pairs, nearest directory first.
   local chain = {}
-  local dir = dirname(file)
-  while dir and dir ~= "" do
+  for dir in nx.utils.ancestors(file) do
     local ok, text = pcall(nx.await, nx.fs.read_text(dir .. "/.editorconfig"))
     if ok and type(text) == "string" then
       local cfg = parse(text)
@@ -358,11 +353,6 @@ M._run = nx.async(function(bufnr, file)
         break
       end
     end
-    local parent = dirname(dir)
-    if parent == dir then
-      break
-    end
-    dir = parent
   end
 
   -- Merge farthest-first (so nearer overrides), section order preserved.

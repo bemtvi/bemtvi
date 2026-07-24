@@ -160,10 +160,11 @@ function nx.on_next_tick(fn)
   return nx.timer(fn, 0)
 end
 
--- pid registry for async `vim.system` handles. The event-loop actor reports a
--- spawned child's OS pid back to the server, which records it here keyed by the
--- handle's callback id; the handle's `.pid` reads through this table (nil until
--- the spawn lands, since it can't be known synchronously on a single thread).
+-- pid registry for spawned children (`nx.run` / `nx.run_stream`). The event-loop
+-- actor reports a spawned child's OS pid back to the server, which records it here
+-- keyed by the spawn's callback id; `stream:pid()` (prelude/process.lua) reads
+-- through this table (nil until the spawn lands, since it can't be known
+-- synchronously on a single thread).
 nx._proc_pids = nx._proc_pids or {}
 function nx._set_proc_pid(id, pid)
   nx._proc_pids[id] = pid

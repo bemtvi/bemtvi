@@ -171,25 +171,12 @@ local aslist, aslist_triggers
 
 -- The basename of a git source or local dir, sans a trailing ".git" — the plugin's
 -- default `name` (its directory under the install root, and its require key).
+-- Exported as `M._source_name` so the dashboard (plugins_ui.lua) labels raw specs
+-- with exactly the name normalize() would install them under.
 local function basename(s)
-  return (s:gsub("%.git$", ""):gsub("[/\\]+$", ""):match("[^/\\]+$"))
+  return nx.utils.basename((s:gsub("%.git$", "")))
 end
-
--- Expand a leading `~` / `~/` to $HOME so a spec can point `dir` at a dev checkout
--- under the home directory (`dir = "~/work/foo"`). Only the leading tilde is
--- touched — a mid-path `~` is a literal path component — and with no $HOME the
--- path is returned unchanged rather than mangled.
-local function expanduser(p)
-  local home = os.getenv("HOME")
-  if not home or home == "" then
-    return p
-  elseif p == "~" then
-    return home
-  elseif p:sub(1, 2) == "~/" then
-    return home .. p:sub(2)
-  end
-  return p
-end
+M._source_name = basename
 
 -- True for a string that already names a transport (a full URL or scp-form
 -- `git@host:owner/repo`), as opposed to the "owner/repo" GitHub shorthand.
@@ -229,7 +216,7 @@ local function normalize(spec)
 
   -- A local-dev `dir` may use `~`/`~/` for the home directory; expand it once here
   -- so every later step (the require key, the rtp entry) sees an absolute path.
-  local dir = spec.dir and expanduser(spec.dir) or nil
+  local dir = spec.dir and nx.utils.expanduser(spec.dir) or nil
 
   local name = spec.name or (src and basename(src)) or basename(dir)
   local url = src and (is_full_url(src) and src or M._opts.github:format(src)) or nil

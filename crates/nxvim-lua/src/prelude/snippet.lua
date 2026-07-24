@@ -22,20 +22,10 @@ function nx.snippet.setup(opts)
   if type(opts) ~= "table" then
     error("nx.snippet.setup: expected a table, got " .. type(opts))
   end
+  -- Either key may be a string or list of strings; the shared `nx.utils.str_list`
+  -- normalizes (nil → {} keeps that key's default).
   local function key_list(spec, name)
-    if spec == nil then
-      return {}
-    elseif type(spec) == "string" then
-      return { spec }
-    elseif type(spec) == "table" then
-      for _, k in ipairs(spec) do
-        if type(k) ~= "string" then
-          error("nx.snippet.setup: " .. name .. " must be string(s), got " .. type(k))
-        end
-      end
-      return spec
-    end
-    error("nx.snippet.setup: " .. name .. " must be a string or list of strings")
+    return nx.utils.str_list(spec, "nx.snippet.setup: " .. name)
   end
   nx._snippet_setup(key_list(opts.jump_next, "jump_next"), key_list(opts.jump_prev, "jump_prev"))
 end

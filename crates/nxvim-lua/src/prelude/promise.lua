@@ -286,17 +286,12 @@ function M.try(fn, ...)
   end)
 end
 
--- Count a 1..n list (combinators take array-like tables of promises/values).
-local function list_len(t)
-  return #t
-end
-
 -- `nx.promise.all(list)`: fulfils with the array of every value once ALL fulfil, in
 -- input order; rejects as soon as ANY rejects (with that reason). An empty list
 -- fulfils immediately with `{}`.
 function M.all(list)
   return M.new(function(resolve, reject)
-    local n = list_len(list)
+    local n = #list
     if n == 0 then
       return resolve({})
     end
@@ -319,7 +314,7 @@ end
 -- or `{ status = "rejected", reason = e }`. Never rejects.
 function M.all_settled(list)
   return M.new(function(resolve)
-    local n = list_len(list)
+    local n = #list
     if n == 0 then
       return resolve({})
     end
@@ -347,7 +342,7 @@ end
 -- browser).
 function M.race(list)
   return M.new(function(resolve, reject)
-    for i = 1, list_len(list) do
+    for i = 1, #list do
       M.resolve(list[i]):next(resolve, reject)
     end
   end)
@@ -357,7 +352,7 @@ end
 -- ALL reject, with an aggregate `{ errors = {...} }`. An empty list rejects at once.
 function M.any(list)
   return M.new(function(resolve, reject)
-    local n = list_len(list)
+    local n = #list
     if n == 0 then
       return reject({ message = "All promises were rejected", errors = {} })
     end

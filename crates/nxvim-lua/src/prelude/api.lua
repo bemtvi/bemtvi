@@ -1696,10 +1696,8 @@ function nx.bufinfo.get(arg)
   local opts = type(arg) == "table" and arg or {}
   local out = {}
   for id, buf in pairs(nx._bufs or {}) do
+    -- `buflisted=1` filters nothing: every buffer is listed (no buftype model).
     local keep = true
-    if opts.buflisted == 1 then
-      keep = true
-    end -- every buffer is listed (no buftype model)
     if opts.bufloaded == 1 and not buf.loaded then
       keep = false
     end

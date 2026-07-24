@@ -328,30 +328,17 @@ local function cursor_word(big)
   end
   return line:sub(b, e)
 end
--- The path of the script currently being sourced — vim's `<sfile>`/`<script>`.
--- Walk the Lua call stack to the nearest real-file chunk: nxvim sources every
--- config / plugin / `require`d file with a `@<path>` chunk name (lifecycle.rs /
--- Lua's own loadfile), while the embedded prelude chunks are named
--- `nxvim:prelude/*` (no `@`) and C frames carry `=[C]`. So the first `@`-prefixed
--- source above this function is the user script whose code is running. Returns ""
--- when no script is on the stack (a bare `:lua` / RPC / callback context),
--- matching neovim's empty `<sfile>` outside a sourced file.
+-- The path of the script currently being sourced — vim's `<sfile>`/`<script>`,
+-- via the shared stack walker (`nx.utils.caller_source`). Returns "" when no
+-- script is on the stack (a bare `:lua` / RPC / callback context), matching
+-- neovim's empty `<sfile>` outside a sourced file.
 local function sourced_file()
-  for lvl = 2, 40 do
-    local info = debug.getinfo(lvl, "S")
-    if not info then
-      break
-    end
-    if info.source:sub(1, 1) == "@" then
-      return info.source:sub(2)
-    end
-  end
-  return ""
+  return nx.utils.caller_source() or ""
 end
 local function expand_path(p)
-  if p:sub(1, 1) == "~" then
-    p = (os.getenv("HOME") or "") .. p:sub(2)
-  end
+  -- Leading `~` / `~/` → `$HOME` via the shared helper; a `~user` form stays
+  -- literal (vim leaves an unknown user's `~user` unexpanded too).
+  p = nx.utils.expanduser(p)
   -- Environment variables, both the `${VAR}` and bare `$VAR` forms vim accepts.
   -- Braces first, so `${VAR}` isn't half-eaten by the bare pass; an unset var is
   -- left verbatim (matching vim, and what plugins probe for).

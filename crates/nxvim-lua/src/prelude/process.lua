@@ -11,22 +11,9 @@
 -- newline-delimited batches (`nx.run_stream`). Loaded after promise.lua — `nx.run*`
 -- build on `nx.promise` / `nx.async` / `nx.await`.
 
--- Build an argv list from `{ cmd = string|list, args = list }` — `cmd` is a string
--- or an argv list, `args` is appended.
-local function build_argv(spec)
-  local cmd = spec.cmd
-  if type(cmd) == "string" then
-    cmd = { cmd }
-  end
-  local argv = {}
-  for _, c in ipairs(cmd) do
-    argv[#argv + 1] = c
-  end
-  for _, a in ipairs(spec.args or {}) do
-    argv[#argv + 1] = a
-  end
-  return argv
-end
+-- Argv normalization (`{ cmd = string|list, args = list }` → flat argv) is the
+-- shared `nx.utils.argv` (prelude/utils.lua, loaded above).
+local build_argv = nx.utils.argv
 
 -- `nx.run { cmd, args, cwd, env, stdin }` -> promise of `{ code, stdout, stderr }`.
 -- Runs a child to completion off the input tick, buffering all of its stdout and
@@ -64,6 +51,7 @@ function nx.run(spec)
   return nx.promise.new(function(resolve)
     local id = nx._next_cb_id()
     nx._cb_fns[id] = function(result)
+      nx._proc_pids[id] = nil -- the pid registry entry dies with the child
       resolve({
         code = result.code,
         stdout = result.stdout or "",
@@ -99,6 +87,16 @@ end
 
 function Stream:kill()
   nx._system_kill(self._id)
+end
+
+-- `stream:pid()`: the running child's OS pid, or `nil`. The pid is reported
+-- asynchronously by the event-loop actor (it can't be known synchronously on the
+-- single-threaded runtime) into the `nx._proc_pids` registry this reads — so `nil`
+-- before the spawn lands, on a failed spawn, and again after the child exits (the
+-- registry entry dies with the child). Handy for signalling the child out-of-band
+-- (e.g. `kill -USR1`) where `:kill()`'s reap is too blunt.
+function Stream:pid()
+  return nx._proc_pids[self._id]
 end
 
 -- `nx.run_stream { cmd, args, cwd, env }` -> Stream. Spawns a child and streams its
@@ -141,6 +139,7 @@ function nx.run_stream(spec)
   -- One-shot exit: mark done and wake any parked waiter with nil (end-of-stream).
   nx._cb_fns[id] = function(result)
     nx._stdout_fns[id] = nil
+    nx._proc_pids[id] = nil -- the pid registry entry dies with the child
     self._done = true
     self._exit = result
     local waiter = self._waiter

@@ -693,13 +693,7 @@ local function resolve_dir(base, cwd)
   if base == "" then
     return cwd
   end
-  local p = base
-  if p == "~" or p:sub(1, 2) == "~/" then
-    local home = os.getenv("HOME")
-    if home then
-      p = home .. p:sub(2)
-    end
-  end
+  local p = nx.utils.expanduser(base)
   if p:sub(1, 1) ~= "/" then
     p = (cwd:gsub("/$", "")) .. "/" .. p
   end

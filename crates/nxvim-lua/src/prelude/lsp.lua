@@ -77,32 +77,6 @@ local function nonempty(t)
   return nil
 end
 
--- The directory part of a path (strip the trailing `/component`); `""` at the root.
-local function dirname(path)
-  return (path:gsub("/[^/]*$", ""))
-end
-
--- The keyword run (`[%w_]`) under the cursor — neovim's `<cword>`, used to prefill
--- the rename prompt. Empty when the cursor isn't on a word char (ASCII-keyword
--- approximation; multibyte identifiers aren't expanded).
-local function cursor_word()
-  local pos = vim.api.nvim_win_get_cursor(0)
-  local row, col = pos[1], pos[2]
-  local line = (vim.api.nvim_buf_get_lines(0, row - 1, row, false))[1] or ""
-  local b = col + 1 -- 1-based byte index of the char under the cursor
-  if not line:sub(b, b):match("[%w_]") then
-    return ""
-  end
-  local s, e = b, b
-  while s > 1 and line:sub(s - 1, s - 1):match("[%w_]") do
-    s = s - 1
-  end
-  while e < #line and line:sub(e + 1, e + 1):match("[%w_]") do
-    e = e + 1
-  end
-  return line:sub(s, e)
-end
-
 -- Upward `root_markers` search from the buffer's file, walking the project tree
 -- through the async `nx.fs` seam (local on native-bare, the daemon's `luafs_op` over
 -- the wire otherwise — so this works on every front end with NO editor-thread block).
@@ -117,8 +91,7 @@ local find_root = nx.async(function(bufnr, markers)
   if type(file) ~= "string" or file == "" then
     return nil
   end
-  local dir = dirname(file)
-  while dir and dir ~= "" do
+  for dir in nx.utils.ancestors(file) do
     local present = {}
     local entries = nx.await(nx.fs.readdir(dir):catch(function()
       return {}
@@ -131,11 +104,6 @@ local find_root = nx.async(function(bufnr, markers)
         return dir
       end
     end
-    local parent = dirname(dir)
-    if parent == dir then
-      break
-    end
-    dir = parent
   end
   return nil
 end)
@@ -694,7 +662,9 @@ function nx.lsp.rename(new_name)
       nx._lsp_buf_rename(new_name, id)
     end)
   end
-  return nx.ui.input({ prompt = "New Name: ", default = cursor_word() }):next(function(name)
+  -- Prefill with the identifier under the cursor — `nx.expand("<cword>")` (vimfn.lua,
+  -- loaded after this module; only called at prompt time).
+  return nx.ui.input({ prompt = "New Name: ", default = nx.expand("<cword>") }):next(function(name)
     if type(name) == "string" and name ~= "" then
       return lsp_promise(function(id)
         nx._lsp_buf_rename(name, id)

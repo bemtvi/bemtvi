@@ -16,7 +16,7 @@ use std::time::Duration;
 
 use nxvim_rpc::{Incoming, Rpc};
 use nxvim_server::ServerInit;
-use nxvim_test_harness::{exec_lua, lua_bool, lua_u64, start_attached};
+use nxvim_test_harness::{exec_lua, lua_bool, lua_u64, poll_true, start_attached};
 use tokio::sync::mpsc::UnboundedReceiver;
 
 /// Start a server on its own thread (its runtime has timers enabled, so the
@@ -301,6 +301,40 @@ async fn nx_run_stream_exit_carries_stderr() {
             .as_str(),
         Some("oops\n"),
         "the streaming exit result must carry the child's stderr"
+    );
+}
+
+#[tokio::test]
+async fn nx_run_stream_pid_resolves_while_running_and_dies_with_the_child() {
+    let (rpc, _incoming) = start().await;
+    // `stream:pid()` reads the pid the event-loop actor reports asynchronously
+    // after the spawn: nil at first (single-threaded runtime — it can't be known
+    // inline), then the real OS pid while the child runs, then nil again once the
+    // exit lands (the registry entry dies with the child, so it can't grow
+    // unboundedly across spawns).
+    exec_lua(
+        &rpc,
+        "_G.s = nx.run_stream({ cmd = 'sh', args = { '-c', 'sleep 30' } })\n\
+         _G.pid_inline = _G.s:pid()",
+    )
+    .await;
+    assert_eq!(
+        lua_bool(&rpc, "return _G.pid_inline == nil").await,
+        Some(true),
+        "the pid cannot be known synchronously at spawn"
+    );
+    assert!(
+        poll_true(
+            &rpc,
+            "return type(_G.s:pid()) == 'number' and _G.s:pid() > 0"
+        )
+        .await,
+        "the actor's spawn report must land a real pid"
+    );
+    exec_lua(&rpc, "_G.s:kill()").await;
+    assert!(
+        poll_true(&rpc, "return _G.s:pid() == nil").await,
+        "the registry entry must be cleared when the child exits"
     );
 }
 

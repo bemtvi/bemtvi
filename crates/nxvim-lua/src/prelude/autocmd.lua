@@ -144,30 +144,19 @@ function nx.user_command.buf_create(buffer, name, command, opts)
   if buffer == nil or buffer == 0 then
     buffer = nx._cur_buf and nx._cur_buf.bufnr or 0
   end
-  local cmds = nx._buf_user_commands[buffer]
-  if not cmds then
-    cmds = {}
-    nx._buf_user_commands[buffer] = cmds
+  -- Lazily materialize the buffer's slot in each per-bufnr registry.
+  local function slot(registry)
+    local t = registry[buffer]
+    if not t then
+      t = {}
+      registry[buffer] = t
+    end
+    return t
   end
-  cmds[name] = command
-  local descs = nx._buf_user_command_desc[buffer]
-  if not descs then
-    descs = {}
-    nx._buf_user_command_desc[buffer] = descs
-  end
-  descs[name] = type(opts) == "table" and opts.desc or nil
-  local completes = nx._buf_user_command_complete[buffer]
-  if not completes then
-    completes = {}
-    nx._buf_user_command_complete[buffer] = completes
-  end
-  completes[name] = type(opts) == "table" and opts.complete or nil
-  local usages = nx._buf_user_command_usage[buffer]
-  if not usages then
-    usages = {}
-    nx._buf_user_command_usage[buffer] = usages
-  end
-  usages[name] = type(opts) == "table" and opts.usage or nil
+  slot(nx._buf_user_commands)[name] = command
+  slot(nx._buf_user_command_desc)[name] = type(opts) == "table" and opts.desc or nil
+  slot(nx._buf_user_command_complete)[name] = type(opts) == "table" and opts.complete or nil
+  slot(nx._buf_user_command_usage)[name] = type(opts) == "table" and opts.usage or nil
 end
 
 -- Resolve a typed `:Name` to its command definition for buffer `bufnr` (0 =

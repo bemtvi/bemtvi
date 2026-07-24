@@ -494,6 +494,10 @@ const PRELUDE_MODULES: &[(&str, &str)] = &[
     // picker / complete / nx.ui), so it loads early — right after the runtime
     // services it needs and before any of them.
     ("nxvim:prelude/promise", include_str!("prelude/promise.lua")),
+    // nx.utils: the general helper namespace (nx.utils.debounce, the path helpers,
+    // …) — builds on the timer and promise surfaces just above, and loads before
+    // every editor-facing surface so any of them can lean on a util.
+    ("nxvim:prelude/utils", include_str!("prelude/utils.lua")),
     // The Rust↔Lua mirror state, shared resolvers, context lock, and the scalar
     // surfaces (variables / options / registers) the entity API reads.
     ("nxvim:prelude/state", include_str!("prelude/state.lua")),
@@ -563,9 +567,6 @@ const PRELUDE_MODULES: &[(&str, &str)] = &[
         "nxvim:prelude/markdown",
         include_str!("prelude/markdown.lua"),
     ),
-    // nx.utils: the general helper namespace (nx.utils.debounce, …) — may build on
-    // the timer and promise surfaces loaded just above.
-    ("nxvim:prelude/utils", include_str!("prelude/utils.lua")),
     // nx.test: the plugin test framework (describe/it/expect + an async-aware test
     // context). Inert until a spec registers tests and the `--test-plugin` runner
     // calls `nx.test._run()`; builds on nx.async/await/wait_for/on_next_tick (promise
@@ -2618,10 +2619,10 @@ impl LuaRuntime {
         run.call::<()>((cmd, efm, title, open, jump, loclist_win))
     }
 
-    /// Record the OS pid of an async `vim.system` child (keyed by its callback
-    /// `id`) so the handle's `.pid` field resolves it. Delivered by the event-loop
+    /// Record the OS pid of a spawned child (`nx.run` / `nx.run_stream`, keyed by
+    /// its callback `id`) so `stream:pid()` resolves it. Delivered by the event-loop
     /// actor shortly after the spawn — the pid can't be known synchronously on the
-    /// single-threaded runtime, so the handle reads `nil` until this lands.
+    /// single-threaded runtime, so `stream:pid()` reads `nil` until this lands.
     pub fn set_process_pid(&self, id: u64, pid: Option<u32>) -> mlua::Result<()> {
         let nx = self.nx()?;
         let set: mlua::Function = nx.get("_set_proc_pid")?;

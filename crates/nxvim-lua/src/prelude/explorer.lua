@@ -67,10 +67,10 @@ nx.decor.provider({
 -- (prelude/keymap.lua), which fires the moment either fill path sets the filetype.
 -- ============================================================================
 
--- Escape a path for use as a bare `:edit` argument (spaces and the cmdline-special
--- `\ # % |` bytes). Enough for the paths the explorer hands back to `:edit`.
+-- Escaping a path for use as a bare `:edit` argument is `nx.fname.escape`
+-- (vimfn.lua — loaded after this module, referenced only at open time).
 local function edit_escape(path)
-  return (path:gsub("[ \\#%%|]", "\\%0"))
+  return nx.fname.escape(path)
 end
 
 -- Render a `nx.fs.readdir` result into listing lines — the Lua twin of the server's

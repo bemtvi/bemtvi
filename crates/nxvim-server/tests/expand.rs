@@ -119,6 +119,18 @@ async fn plain_path_still_expands_env() {
         Some(want.as_str()),
         "a plain $VAR path must still expand, not fail loud"
     );
+
+    // Only a LEADING `~` / `~/` expands (the shared nx.utils.expanduser edge):
+    // a `~user` form is not resolved — vim leaves an unknown user's `~user`
+    // literal too — and a mid-path `~` is an ordinary path component.
+    let tilde = exec_lua(&rpc, "return vim.fn.expand('~/x')").await;
+    assert_eq!(tilde.as_str(), Some(format!("{home}/x").as_str()));
+    let user = exec_lua(&rpc, "return vim.fn.expand('~nobody/x')").await;
+    assert_eq!(
+        user.as_str(),
+        Some("~nobody/x"),
+        "an unresolvable ~user path stays literal, not $HOME-mangled"
+    );
 }
 
 // Both env-var spellings expand — bare `$VAR` and the `${VAR}` brace form vim also

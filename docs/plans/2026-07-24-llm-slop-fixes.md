@@ -181,25 +181,43 @@ Functions inserted above another fn's `///` block — docs attached to wrong ite
 Stale docs describing removed worlds:
 - [ ] luafs.rs:1-35 (BlockingSystem/sync-vim.fn/RemoteLuaFs all gone)
 - [ ] nxvim-ts engine.rs:228-231 + loader.rs:7-11,41-46 (folds/textobjects now engine-side)
-- [ ] stale `vim.system`/`nx._system` naming: convert.rs:315, runtime.lua:163,
-  install.rs:965, runtime.rs:2431
+- [ ] stale `vim.system`/`nx._system` naming: convert.rs:315, install.rs:965
+  (runtime.lua:163 + runtime.rs:2431 already rewritten with F8)
 
 ## F. Lua prelude dedup (promote per the nx.utils rule)
 
-- [ ] **F1.** `dirname` ×2 (editorconfig.lua:297, lsp.lua:81) + walk-up-ancestor loop ×2
-- [ ] **F2.** basename chain ×3 (stdlib.lua:146, plugins.lua:174, plugins_ui.lua:42 —
-  inlined twice in one function)
-- [ ] **F3.** `~`-expansion ×3, divergent edges (cmdline_complete.lua:381, vimfn.lua:351,
-  plugins.lua:182)
-- [ ] **F4.** `build_argv` ×2 (process.lua:16, localseam.lua:25)
-- [ ] **F5.** `key_list` keys-spec normalizer ×2 (complete.lua:49, snippet.lua:25)
-- [ ] **F6.** caller-source stack walker ×2 (stdlib.lua:159, vimfn.lua:339)
-- [ ] **F7.** lsp.lua:88-105 `cursor_word` → use `nx.expand("<cword>")`;
-  explorer.lua:72 `edit_escape` → use `nx.fname.escape`
-- [ ] **F8. Dead:** `nx._proc_pids` write-only registry + Rust plumbing
-  (runtime.lua:163-170, runtime.rs:2431, lib.rs:2145, effects.rs:2853) — delete or
-  expose `.pid`; api.lua:1699 dead no-op branch; promise.lua:290 `list_len` wrapper;
-  autocmd.lua:143-171 4× lazy-init stanza
+- [x] **F1.** DONE — `nx.utils.dirname` + `nx.utils.ancestors` (an iterator; both
+  walk loops become `for dir in nx.utils.ancestors(file)`). utils.lua now loads
+  right after promise.lua so every surface can lean on it; stdlib references it
+  lazily (call-time only).
+- [x] **F2.** DONE — `nx.utils.basename`; plugins.lua's `.git`-stripping wrapper
+  is exported as `nx.plugins._source_name` so plugins_ui labels via the SAME
+  function (no more mirrors-normalize()-by-copy).
+- [x] **F3.** DONE — `nx.utils.expanduser`, unified on the strictest edge
+  (leading `~`/`~/` only; `~user` stays literal — vimfn previously mangled it to
+  `$HOME<user>`; no-`$HOME` returns unchanged). Locked by expand.rs +
+  nx_utils.rs.
+- [x] **F4.** DONE — `nx.utils.argv` (public: plugin-composed run-family specs
+  share the shape); both `build_argv` locals are one-line aliases.
+- [x] **F5.** DONE — `nx.utils.str_list(spec, what)`; complete/snippet pass their
+  option-naming prefix as `what` (messages preserved verbatim).
+- [x] **F6.** DONE — `nx.utils.caller_source`; vimfn's `sourced_file` is
+  `caller_source() or ""`. NOTE learned en route: whether a bare RPC `exec_lua`
+  chunk is visible to the walker is INCIDENTAL — the chunk is `@`-named after its
+  Rust load site, but a `return f()` tail call elides that frame — so no test
+  asserts it; the sourced-file contract is locked by expand.rs.
+- [x] **F7.** DONE — rename prompt prefills via `nx.expand("<cword>")` (also
+  gains vim's scan-forward-to-next-word behavior); explorer escapes via
+  `nx.fname.escape` (full fnameescape set, superset of the old 5 bytes).
+- [x] **F8.** DONE — `.pid` EXPOSED rather than deleted (the plumbing spans the
+  daemon wire + wasm FFI; deleting it would rip a protocol message through three
+  worlds): `stream:pid()` on `nx.run_stream` handles reads the registry, and both
+  exit callbacks now clear the entry (the registry no longer grows unboundedly).
+  Test: async_runtime.rs::nx_run_stream_pid_resolves_while_running_and_dies_with_the_child.
+  Also: api.lua dead `buflisted` no-op branch folded to a comment; promise.lua
+  `list_len` inlined; autocmd.lua buf_create's 4× lazy-init stanza → one `slot()`
+  helper; runtime.lua/runtime.rs stale `vim.system` pid docs rewritten (the
+  E-series entries for those two files are covered).
 
 ## G. Test-suite cleanup
 

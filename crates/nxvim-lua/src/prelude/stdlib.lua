@@ -141,33 +141,13 @@ vim.json = nx.json
 -- save_layout), but guard so this module never depends on load order.
 nx.shada = nx.shada or {}
 
--- The basename of a path (its last `/`- or `\`-separated component, sans a trailing
--- separator). The plugin's directory name is its assigned shada namespace.
-local function path_basename(p)
-  return (p:gsub("[/\\]+$", ""):match("[^/\\]+$"))
-end
-
--- The source path of the chunk that called into us: walk up the stack to the nearest
--- file-named frame. nxvim sources every config / plugin / `require`d file with an
--- `@<path>` chunk name, while the embedded prelude chunks (this file included) are
--- named `nxvim:prelude/*` with no `@`, and C frames carry `=[C]` — so the first
--- `@`-prefixed source above this function is the chunk that called us. `nil` only
--- when nothing on the stack is `@`-named. (A bare `:lua` / RPC `exec_lua` / test chunk
--- IS `@`-named — mlua labels it after its Rust call site, e.g. `@crates/…` — but that
--- path is under no runtimepath entry, so `assign_namespace` returns nil for it and the
--- caller treats it as a no-identity context.)
-local function caller_source()
-  for lvl = 2, 40 do
-    local info = debug.getinfo(lvl, "S")
-    if not info then
-      break
-    end
-    if info.source:sub(1, 1) == "@" then
-      return info.source:sub(2)
-    end
-  end
-  return nil
-end
+-- The caller-attribution and basename helpers live in `nx.utils`
+-- (`nx.utils.caller_source` / `nx.utils.basename` — prelude/utils.lua, loaded after
+-- this module but before any user code, and only ever called from user-code paths).
+-- Attribution note: a bare `:lua` / RPC `exec_lua` / test chunk can be `@`-named too
+-- (mlua labels it after its Rust call site, e.g. `@crates/…`), but that path is
+-- under no runtimepath entry, so `assign_namespace` returns nil for it and the
+-- caller treats it as a no-identity context.
 
 -- Assign a namespace to a caller `src` by attributing it to the runtimepath entry
 -- (plugin root) that contains it — the longest matching prefix wins, so a plugin dir
@@ -209,7 +189,7 @@ local function assign_namespace(src)
   if config and trim(best) == trim(config) then
     return "user"
   end
-  return path_basename(best)
+  return nx.utils.basename(best)
 end
 
 -- `nx._resolve_namespace(dev_namespace, what)` -> the persistence namespace for the
@@ -227,7 +207,7 @@ end
 function nx._resolve_namespace(dev_namespace, what)
   -- Attribute the caller's source to its runtimepath entry. `nil` for a context with
   -- no attributable script (REPL / exec / test, or code outside every rtp entry).
-  local src = caller_source()
+  local src = nx.utils.caller_source()
   local assigned = src and assign_namespace(src) or nil
   if assigned then
     if dev_namespace ~= nil and dev_namespace ~= assigned then

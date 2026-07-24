@@ -10,7 +10,9 @@
 
 use nxvim_rpc::{Incoming, Rpc};
 use nxvim_server::ServerInit;
-use nxvim_test_harness::{attach, drain_to_latest_redraw, exec_lua, message, spawn, temp_dir};
+use nxvim_test_harness::{
+    attach, command, drain_to_latest_redraw, exec_lua, message, spawn, temp_dir,
+};
 use rmpv::Value;
 use tokio::sync::mpsc::UnboundedReceiver;
 
@@ -280,6 +282,73 @@ async fn lifecycle_order_is_bufreadpost_filetype_bufenter() {
     .await;
     let msg = lua_message(&rpc, &mut incoming, "print(table.concat(_G.log, ','))").await;
     assert_eq!(msg, "read,ft,enter");
+}
+
+#[tokio::test]
+async fn bufread_alias_fires_as_bufreadpost() {
+    // `BufRead` is neovim's muscle-memory alias for `BufReadPost`. Registering on
+    // it must fire on the startup read, and — matching neovim — the callback sees
+    // the *canonical* event name, since the alias is normalized at registration.
+    let dir = temp_dir("au_bufread_alias");
+    let file = dir.join("main.rs");
+    std::fs::write(&file, "fn main() {}\n").expect("write source file");
+    let (rpc, mut incoming) = start_with_file_and_config(
+        &dir,
+        file.to_str().unwrap(),
+        "_G.log = {}\n\
+         vim.api.nvim_create_autocmd('BufRead', {\n\
+         \x20 callback = function(a) _G.log[#_G.log+1] = a.event end })\n",
+    )
+    .await;
+    let msg = lua_message(&rpc, &mut incoming, "print(table.concat(_G.log, ','))").await;
+    assert_eq!(msg, "BufReadPost");
+}
+
+#[tokio::test]
+async fn bufwrite_alias_fires_as_bufwritepre() {
+    // `BufWrite` is neovim's alias for `BufWritePre`. A real `:w` must fire the
+    // aliased handler exactly once, reported under the canonical name — and a
+    // handler registered on `BufWritePre` sees the same single fire (proving the
+    // alias collapses onto one event rather than double-firing).
+    let dir = temp_dir("au_bufwrite_alias");
+    let file = dir.join("main.rs");
+    std::fs::write(&file, "fn main() {}\n").expect("write source file");
+    let (rpc, mut incoming) = start_with_file_and_config(
+        &dir,
+        file.to_str().unwrap(),
+        "_G.log = {}\n\
+         local function rec(a) _G.log[#_G.log+1] = a.event end\n\
+         vim.api.nvim_create_autocmd('BufWrite', { callback = rec })\n\
+         vim.api.nvim_create_autocmd('BufWritePre', { callback = rec })\n",
+    )
+    .await;
+    command(&rpc, "w").await;
+    let msg = lua_message(&rpc, &mut incoming, "print(table.concat(_G.log, ','))").await;
+    assert_eq!(msg, "BufWritePre,BufWritePre");
+}
+
+#[tokio::test]
+async fn exec_autocmds_accepts_event_alias() {
+    // `nvim_exec_autocmds('BufRead')` must fire handlers registered under either
+    // spelling — the alias is canonicalized on the manual-fire path too, so an
+    // exec of the alias and an exec of the canonical name are interchangeable.
+    let dir = temp_dir("au_exec_alias");
+    let (rpc, mut incoming) = start_with_config(
+        &dir,
+        "_G.log = {}\n\
+         vim.api.nvim_create_autocmd('BufReadPost', {\n\
+         \x20 callback = function() _G.log[#_G.log+1] = 'canon' end })\n\
+         vim.api.nvim_create_autocmd('BufRead', {\n\
+         \x20 callback = function() _G.log[#_G.log+1] = 'alias' end })\n",
+    )
+    .await;
+    let msg = lua_message(
+        &rpc,
+        &mut incoming,
+        "vim.api.nvim_exec_autocmds('BufRead', {}); print(table.concat(_G.log, ','))",
+    )
+    .await;
+    assert_eq!(msg, "canon,alias");
 }
 
 #[tokio::test]

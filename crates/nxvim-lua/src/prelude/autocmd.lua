@@ -60,6 +60,36 @@ function nx._au_touch()
   nx._au_version = nx._au_version + 1
 end
 
+-- neovim autocmd-event aliases → the canonical event nxvim actually fires
+-- (neovim's `src/nvim/auevents.lua` alias table). Registering, firing, querying,
+-- or clearing by an alias behaves exactly as if the canonical name were used, so a
+-- config that does `autocmd BufRead` (muscle memory for `BufReadPost`) still fires.
+-- Limited to aliases whose target nxvim emits — an alias pointing at an unemitted
+-- event would just be a silent no-op, so we don't pretend to support it. (neovim's
+-- `BufCreate`→`BufAdd` and `FileEncoding`→`EncodingChanged` are omitted for that
+-- reason; add them here if/when those events start firing.)
+local EVENT_ALIASES = {
+  BufRead = "BufReadPost",
+  BufWrite = "BufWritePre",
+}
+
+-- Canonicalize an event name (string) or list of names: each alias maps to its
+-- real event, everything else passes through unchanged. Preserves the shape of the
+-- input (string in → string out, list in → list out) so callers stay simple.
+---@overload fun(ev: string): string
+---@overload fun(ev: string[]): string[]
+local function au_canon_event(ev)
+  if type(ev) == "table" then
+    local out = {}
+    for i, e in ipairs(ev) do
+      out[i] = EVENT_ALIASES[e] or e
+    end
+    return out
+  end
+  return EVENT_ALIASES[ev] or ev
+end
+nx._canon_event = au_canon_event
+
 -- The distinct event names any registered autocmd listens for (an autocmd may name
 -- a single event or a list). The server caches this — refreshed only when
 -- nx._au_version advances — so its per-key lifecycle diff can skip computing /
@@ -216,7 +246,8 @@ end
 -- `nx.autocmd.del` to remove it). `event` is an event name (`"FileType"`,
 -- `"BufEnter"`, …) or a list of names to share one handler — see the
 -- [autocommand events](../plugins/autocmd-events.md) reference for the events
--- nxvim emits and what each carries.
+-- nxvim emits and what each carries. neovim aliases (`"BufRead"` -> `BufReadPost`,
+-- `"BufWrite"` -> `BufWritePre`) are accepted and canonicalized to the real event.
 --
 -- `opts` fields:
 --   * `callback` — a function run when the event fires; OR `command` — an
@@ -245,6 +276,7 @@ end
 -- ```
 function nx.autocmd.create(event, opts)
   opts = opts or {}
+  event = au_canon_event(event)
   autocmd_seq = autocmd_seq + 1
   local group = opts.group
   if type(group) == "string" then
@@ -464,7 +496,7 @@ end
 -- as `args.data` (e.g. `nx.autocmd.exec("User", { pattern = "MyEvent", data = … })`).
 function nx.autocmd.exec(event, opts)
   opts = opts or {}
-  local events = type(event) == "table" and event or { event }
+  local events = au_canon_event(type(event) == "table" and event or { event })
   local buf = opts.buffer
   if buf == nil then
     buf = nx._cur_buf and nx._cur_buf.bufnr or nil
@@ -495,7 +527,8 @@ end
 -- `:lua print(vim.inspect(nx.autocmd.get({})))`.
 function nx.autocmd.get(opts)
   opts = opts or {}
-  local want_events = opts.event and (type(opts.event) == "table" and opts.event or { opts.event })
+  local want_events = opts.event
+    and au_canon_event(type(opts.event) == "table" and opts.event or { opts.event })
   local want_group = opts.group
   if type(want_group) == "string" then
     want_group = nx._augroups[want_group]
@@ -1010,7 +1043,8 @@ vim.api.nvim_exec = nx.exec
 -- `nx.autocmd.get`'s matching.
 function nx.autocmd.clear(opts)
   opts = opts or {}
-  local want_events = opts.event and (type(opts.event) == "table" and opts.event or { opts.event })
+  local want_events = opts.event
+    and au_canon_event(type(opts.event) == "table" and opts.event or { opts.event })
   local want_group = opts.group
   if type(want_group) == "string" then
     want_group = nx._augroups[want_group]

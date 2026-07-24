@@ -20,7 +20,7 @@ exact compare — so a `FileType rust` autocmd never glob-matches a path.
 
 | Event | When it fires | Notes |
 | --- | --- | --- |
-| `BufReadPost` | A file-backed buffer is first shown after reading an existing file from disk. | Fires **once** per buffer (gated by the "announced" set). `buf` / `file` set. |
+| `BufReadPost` | A file-backed buffer is first shown after reading an existing file from disk. | Fires **once** per buffer (gated by the "announced" set). `buf` / `file` set. `BufRead` is an accepted alias (see [Event aliases](#event-aliases)). |
 | `BufNewFile` | A buffer is opened for a path with **no file on disk** — fires instead of `BufReadPost`. | `buf` / `file` set. |
 | `FileType` | A buffer is first announced **and** whenever its filetype changes. | `match` is the filetype (e.g. `"rust"`); `file` is the path. Where ftplugins and `vim.lsp.enable` attach. |
 | `BufEnter` / `BufLeave` | A buffer becomes / stops being the current one (including plain switches with no read). | `buf` / `file` set. |
@@ -33,7 +33,7 @@ Ordering on opening a file is `BufReadPost` (or `BufNewFile` for a new path) →
 | Event | When it fires | Notes |
 | --- | --- | --- |
 | `BufWritePre` | Before a buffer is written to disk (`:w`, `:wall`, and finalized off-tick saves). | `match` / `file` is the path; glob-matchable, e.g. a `*.rs` format-on-save hook. |
-| `BufWrite` | Same point as `BufWritePre` — the bare-name spelling. | |
+| `BufWrite` | Same point as `BufWritePre` — the bare-name spelling. | An alias for `BufWritePre` (see [Event aliases](#event-aliases)); handlers on both spellings fire once. |
 | `BufWritePost` | After a successful write. | The hook format-on-save and "reload affected tools" plugins use. |
 
 ## Window & tab
@@ -98,3 +98,22 @@ Fired by the built-in plugin manager (`nx.plugins`). See [Writing nxvim plugins]
 | --- | --- | --- |
 | `PluginsLoaded` | Once, after **every eager (non-lazy) plugin declared by your config has fully loaded and settled** — its `plugin/` scripts sourced and its `config` run, an async `config` awaited to completion. Gated on `VimEnter`, so it never fires before startup finishes. | The "all my plugins are ready" hook — run setup that depends on several eager plugins here. Fires once; a plugin a later `:PluginSync` installs still emits its own `PluginLoaded` but does not re-fire this. Lazy plugins are **not** waited for. |
 | `PluginLoaded` | Each time **any one plugin** finishes loading — eager at startup, or lazy the moment its `cmd`/`event`/`ft`/`keys` trigger loads it. | `match` (and `data.name`) is the plugin name, so `nx.on("PluginLoaded", { pattern = "my-plugin" }, …)` hooks just that plugin's load. |
+
+## Event aliases
+
+A handful of neovim event names are aliases for another event. nxvim honors these
+by **canonicalizing the alias to its real event at registration** — so a config
+that does `nx.autocmd.create("BufRead", …)` (muscle memory from neovim) behaves
+exactly as if it had used `"BufReadPost"`, and the callback's `event` field reports
+the canonical name. Aliases are accepted anywhere an event name is (`create`,
+`exec`, `get`, `clear`).
+
+| Alias | Canonical event |
+| --- | --- |
+| `BufRead` | `BufReadPost` |
+| `BufWrite` | `BufWritePre` |
+
+Only aliases whose target nxvim actually emits are supported; neovim's
+`BufCreate` (→ `BufAdd`) and `FileEncoding` (→ `EncodingChanged`) are omitted
+because those target events don't fire here yet (a "no silent no-ops" choice —
+registering on an unsupported name is better left visible than quietly accepted).

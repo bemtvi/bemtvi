@@ -1259,7 +1259,9 @@ impl EditHost {
         let ft = filetype_of(Some(Path::new(path))).unwrap_or("");
         let _ = self.lua.set_buf_snapshot(buf.0, path, ft);
         self.push_buf_mirror();
-        for event in ["BufWritePre", "BufWrite", "BufWritePost"] {
+        // `BufWrite` is a neovim alias for `BufWritePre` (canonicalized at
+        // registration in `autocmd.lua`), so we fire only the two canonical events.
+        for event in ["BufWritePre", "BufWritePost"] {
             let r = self.lua.fire_autocmd_buf(event, path, buf.0, path);
             self.report_autocmd_err(event, r);
         }

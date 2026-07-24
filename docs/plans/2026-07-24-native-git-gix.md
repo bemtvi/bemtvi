@@ -1,6 +1,19 @@
 # Native git via `gix` — a first-party `nx.git` API, no `git` binary
 
-Status: **planned**. Author-date: 2026-07-24.
+Status: **done** (Phase 1 + Phase 2 shipped). Author-date: 2026-07-24.
+
+**Phase 2 landed (mutation/network verbs + plugin port).** `nx.git_local.clone /
+checkout / pull / submodule_update` are implemented in `nxvim-git` over gix's fetch /
+worktree-state / reference primitives (gix has no one-call clone-`--filter`, submodule
+update, or `reset --hard`, so those are hand-rolled — see each `fn` in
+`crates/nxvim-git/src/lib.rs`). `--filter=blob:none` has no gix analog; shallow `depth`
+substitutes. The plugin manager (`prelude/plugins.lua`) is ported entirely onto
+`nx.git_local.*` — `GIT_ENV`, the `git` executable opt, and the `nx.run_local` git
+wrapper are gone; **no `git` process anywhere in nxvim**. Tests: `git.rs` +8 including
+three DIFFERENTIAL oracle tests (hand-rolled checkout / pull / submodule produce
+byte-identical worktrees to real `git`); `daemon_git.rs` +1 (clone over the wire);
+`plugins.rs` argv-inspection tests rewritten as behavior tests. Commits: `870e2c5a`
+(engine), `07fa8113` (plugin port).
 
 ## Goal
 

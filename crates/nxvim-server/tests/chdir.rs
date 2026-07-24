@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 use nxvim_rpc::{Incoming, Rpc};
 use nxvim_server::ServerInit;
 use nxvim_test_harness::{
-    barrier, command, exec_lua, feed, message, serial_lock, start_attached, temp_dir, wait_redraw,
+    barrier, command, exec_lua, feed, message_after, serial_lock, start_attached, temp_dir,
 };
 use tokio::sync::mpsc::UnboundedReceiver;
 
@@ -57,18 +57,6 @@ fn canon(p: &Path) -> String {
         .expect("canonicalize")
         .to_string_lossy()
         .into_owned()
-}
-
-/// Feed an ex-command line and return the resulting message-line text.
-async fn message_after(
-    rpc: &Rpc,
-    incoming: &mut UnboundedReceiver<Incoming>,
-    line: &str,
-) -> String {
-    feed(rpc, line);
-    barrier(rpc).await;
-    let map = wait_redraw(incoming, |m| !message(m).is_empty()).await;
-    message(&map)
 }
 
 #[tokio::test]

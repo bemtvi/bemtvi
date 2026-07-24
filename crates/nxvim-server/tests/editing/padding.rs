@@ -85,25 +85,6 @@ async fn padding_rejects_bad_value_and_keeps_the_old_one() {
     assert_eq!(padding(&map), vec![2, 2, 2, 2]);
 }
 
-/// The shipped `examples/padding/init.lua` actually applies its margin — guards
-/// the example against bit-rot (see the project's example-config convention).
-#[tokio::test]
-async fn example_config_applies_padding() {
-    let init = std::fs::read_to_string(concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/../../examples/padding/init.lua"
-    ))
-    .expect("read examples/padding/init.lua");
-    let dir = temp_dir("padding-example");
-    let (rpc, mut incoming) = start_with_config(&dir, &init).await;
-    let map = redraw_after(&rpc, &mut incoming, "<Esc>").await;
-    assert_eq!(
-        padding(&map),
-        vec![2, 2, 2, 2],
-        "the example's `vim.wo.padding = 2` reaches the window"
-    );
-}
-
 #[tokio::test]
 async fn padding_round_trips_through_vim_wo() {
     let (rpc, mut incoming) = start(None).await;

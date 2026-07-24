@@ -334,92 +334,73 @@ async fn wrap_reaches_core_via_vim_opt_and_vim_o() {
     );
 }
 
-/// `'scrolloff'` (abbrev `so`) is a modeled window option: `:set scrolloff=`,
-/// `vim.o.scrolloff`, and `vim.opt.scrolloff` all reach the core and read back,
-/// without the unknown-option warning. (The margin *behavior* is covered by the
-/// `editing::scrolloff` suite; this pins the option plumbing.)
+/// `'scrolloff'` (abbrev `so`, numeric) and `'colorcolumn'` (abbrev `cc`,
+/// comma-list) are modeled window options: `:set <name>=`, `vim.o.<name>`, and
+/// `vim.opt.<abbrev>` all reach the core and read back through the `:set …?`
+/// echo and the `vim.wo` mirror, without the unknown-option warning. (The margin
+/// / ruler *behavior* is covered by the `editing::scrolloff` suite and the TUI
+/// paint tests; this pins the option plumbing. `vim.opt.cc = { 100 }` also pins
+/// the rich list surface — a Lua array encodes to the comma string.)
 #[tokio::test]
-async fn scrolloff_round_trips_through_set_and_vim_o() {
-    let (rpc, mut incoming) = start().await;
+async fn window_options_round_trip_through_set_and_vim_o() {
+    for (name, default_echo, o_write, want_echo, wo_want, opt_write, opt_echo) in [
+        (
+            "scrolloff",
+            "scrolloff=0",
+            "vim.o.scrolloff = 8",
+            "scrolloff=8",
+            "8",
+            "vim.opt.so = 3",
+            "scrolloff=3",
+        ),
+        (
+            "colorcolumn",
+            "colorcolumn=",
+            "vim.o.colorcolumn = '80,120'",
+            "colorcolumn=80,120",
+            "80,120",
+            "vim.opt.cc = { 100 }",
+            "colorcolumn=100",
+        ),
+    ] {
+        let (rpc, mut incoming) = start().await;
 
-    // Defaults off (vim's `scrolloff=0`), readable through the `:set …?` echo.
-    let echo = set_message(&rpc, &mut incoming, "scrolloff?").await;
-    assert!(
-        echo.contains("scrolloff=0"),
-        "scrolloff defaults to 0, got {echo:?}"
-    );
+        // The default, readable through the `:set …?` echo.
+        let echo = set_message(&rpc, &mut incoming, &format!("{name}?")).await;
+        assert!(
+            echo.contains(default_echo),
+            "[{name}] default, got {echo:?}"
+        );
 
-    // A write through `vim.o` must not warn and must reach the core (the `:set …?`
-    // echo is the authoritative readout, and the `vim.wo` mirror reflects it).
-    exec_lua(&rpc, "vim.o.scrolloff = 8").await;
-    rpc.request("nvim_get_mode", vec![]).await.expect("barrier");
-    let frame = drain_to_latest_redraw(&mut incoming, |_| true).expect("a redraw arrived");
-    assert!(
-        !message(&frame).to_lowercase().contains("unknown option"),
-        "vim.o.scrolloff must not warn, got {:?}",
-        message(&frame)
-    );
-    let echo = set_message(&rpc, &mut incoming, "scrolloff?").await;
-    assert!(
-        echo.contains("scrolloff=8"),
-        "vim.o.scrolloff = 8 reaches the core, got {echo:?}"
-    );
-    assert_eq!(
-        exec_lua(&rpc, "return vim.wo.scrolloff").await.as_u64(),
-        Some(8),
-        "vim.wo.scrolloff reads the core value back"
-    );
+        // A write through `vim.o` must not warn and must reach the core (the
+        // `:set …?` echo is the authoritative readout; `vim.wo` mirrors it).
+        exec_lua(&rpc, o_write).await;
+        rpc.request("nvim_get_mode", vec![]).await.expect("barrier");
+        let frame = drain_to_latest_redraw(&mut incoming, |_| true).expect("a redraw arrived");
+        assert!(
+            !message(&frame).to_lowercase().contains("unknown option"),
+            "[{name}] {o_write} must not warn, got {:?}",
+            message(&frame)
+        );
+        let echo = set_message(&rpc, &mut incoming, &format!("{name}?")).await;
+        assert!(
+            echo.contains(want_echo),
+            "[{name}] {o_write} reaches the core, got {echo:?}"
+        );
+        assert_eq!(
+            exec_lua(&rpc, &format!("return tostring(vim.wo.{name})"))
+                .await
+                .as_str(),
+            Some(wo_want),
+            "[{name}] vim.wo reads the core value back"
+        );
 
-    // The `so` abbreviation and the rich `vim.opt` surface reach the same slot.
-    exec_lua(&rpc, "vim.opt.so = 3").await;
-    let echo = set_message(&rpc, &mut incoming, "scrolloff?").await;
-    assert!(
-        echo.contains("scrolloff=3"),
-        "vim.opt.so = 3 reaches the core, got {echo:?}"
-    );
-}
-
-/// `'colorcolumn'` (abbrev `cc`) is a modeled window option: `:set colorcolumn=`,
-/// `vim.o.colorcolumn`, and `vim.opt.colorcolumn` all reach the core and read back,
-/// without the unknown-option warning. (The ruler *rendering* is covered by the TUI
-/// paint tests and the projection test; this pins the option plumbing.)
-#[tokio::test]
-async fn colorcolumn_round_trips_through_set_and_vim_o() {
-    let (rpc, mut incoming) = start().await;
-
-    // Defaults empty (no ruler), readable through the `:set …?` echo.
-    let echo = set_message(&rpc, &mut incoming, "colorcolumn?").await;
-    assert!(
-        echo.contains("colorcolumn="),
-        "colorcolumn defaults empty, got {echo:?}"
-    );
-
-    // A write through `vim.o` must not warn and must reach the core.
-    exec_lua(&rpc, "vim.o.colorcolumn = '80,120'").await;
-    rpc.request("nvim_get_mode", vec![]).await.expect("barrier");
-    let frame = drain_to_latest_redraw(&mut incoming, |_| true).expect("a redraw arrived");
-    assert!(
-        !message(&frame).to_lowercase().contains("unknown option"),
-        "vim.o.colorcolumn must not warn, got {:?}",
-        message(&frame)
-    );
-    let echo = set_message(&rpc, &mut incoming, "colorcolumn?").await;
-    assert!(
-        echo.contains("colorcolumn=80,120"),
-        "vim.o.colorcolumn reaches the core, got {echo:?}"
-    );
-    assert_eq!(
-        exec_lua(&rpc, "return vim.wo.colorcolumn").await.as_str(),
-        Some("80,120"),
-        "vim.wo.colorcolumn reads the core value back"
-    );
-
-    // The `cc` abbreviation and the rich `vim.opt` (list) surface reach the same
-    // slot — a Lua array encodes to the comma string.
-    exec_lua(&rpc, "vim.opt.cc = { 100 }").await;
-    let echo = set_message(&rpc, &mut incoming, "colorcolumn?").await;
-    assert!(
-        echo.contains("colorcolumn=100"),
-        "vim.opt.cc = {{100}} reaches the core, got {echo:?}"
-    );
+        // The abbreviation via the rich `vim.opt` surface reaches the same slot.
+        exec_lua(&rpc, opt_write).await;
+        let echo = set_message(&rpc, &mut incoming, &format!("{name}?")).await;
+        assert!(
+            echo.contains(opt_echo),
+            "[{name}] {opt_write} reaches the core, got {echo:?}"
+        );
+    }
 }

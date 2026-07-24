@@ -14,16 +14,8 @@
 //! them). The fix rebuilds `package.path` in runtimepath order (config dir first), so a
 //! plugin can never outrank a user config module.
 
-use std::path::Path;
-
 use nxvim_server::ServerInit;
-use nxvim_test_harness::{exec_lua, start_attached, temp_dir};
-
-fn q(path: &Path) -> String {
-    path.to_string_lossy()
-        .replace('\\', "\\\\")
-        .replace('"', "\\\"")
-}
+use nxvim_test_harness::{exec_lua, q, start_attached, temp_dir};
 
 #[tokio::test]
 async fn a_loaded_plugin_does_not_shadow_the_users_require_of_a_config_module() {

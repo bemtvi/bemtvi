@@ -6,7 +6,7 @@
 
 use nxvim_rpc::{Incoming, Rpc};
 use nxvim_server::ServerInit;
-use nxvim_test_harness::{exec_lua, feed, start_attached, write_temp};
+use nxvim_test_harness::{exec_lua, start_attached};
 use rmpv::Value;
 use tokio::sync::mpsc::UnboundedReceiver;
 
@@ -244,63 +244,6 @@ async fn ignorecase_option() {
     )
     .await;
     assert_eq!(out, "true");
-}
-
-/// The shipped `examples/regex/` config must load and every command must run its
-/// full body over the shipped sample buffer without error — not just parse. Mirrors
-/// the project's "verified end-to-end" example convention.
-#[tokio::test]
-async fn shipped_example_loads_and_runs_on_the_sample() {
-    let sample = include_str!("../../../examples/regex/sample.txt");
-    let path = write_temp("regex_example", "txt", sample);
-    let init = ServerInit {
-        file: Some(path),
-        ..Default::default()
-    };
-    let (rpc, _inc) = start_attached(init, 80, 24).await;
-
-    // Load the example config verbatim — defines :Emails / :Numbers / :Phones / :Redact.
-    // Run it as an explicit chunk: `nvim_exec_lua` evaluates in expression-mode-first
-    // (mlua prepends `return `), which misparses a chunk that opens with a comment, so
-    // we `load()` it as a statement block instead.
-    let init_lua = include_str!("../../../examples/regex/init.lua");
-    let loaded = run(
-        &rpc,
-        &format!(
-            "assert(load([==[\n{init_lua}\n]==], '@examples/regex/init.lua'))()\nreturn 'loaded'"
-        ),
-    )
-    .await;
-    assert_eq!(loaded, "loaded");
-
-    // The extraction is correct over the real buffer: both addresses, captures
-    // intact (the substance of :Emails, asserted on values notify can't return).
-    let emails = run(
-        &rpc,
-        r#"local re = nx.regex([[([\w.+-]+)@([\w-]+\.[\w.-]+)]])
-           local out = {}
-           for _, line in ipairs(nx.buf.lines(0, 0, -1)) do
-             for user, host in re:gmatch(line) do out[#out + 1] = user .. "@" .. host end
-           end
-           return table.concat(out, ",")"#,
-    )
-    .await;
-    assert_eq!(emails, "jane.doe@acme.io,j.smith+work@mail.example.com");
-
-    // Every command runs its full body (gmatch / gsub / test / match + notify) over
-    // the real sample without raising. :Redact reads the cursor, so park it on a line.
-    feed(&rpc, "9G");
-    let ran = run(
-        &rpc,
-        r#"local out = "ok"
-           for _, c in ipairs({ "Emails", "Numbers", "Phones", "Redact" }) do
-             local ok, err = pcall(vim.cmd, c)
-             if not ok then out = c .. ": " .. tostring(err) break end
-           end
-           return out"#,
-    )
-    .await;
-    assert_eq!(ran, "ok");
 }
 
 #[tokio::test]

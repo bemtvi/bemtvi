@@ -13,19 +13,11 @@
 use nxvim_rpc::{Incoming, Rpc};
 use nxvim_server::ServerInit;
 use nxvim_test_harness::{
-    cursor, drain_to_latest_redraw, exec_lua, lines, map_get, message, start_attached, write_temp,
+    buf_name, cursor, exec_lua, lines, map_get, message_after, redraw_after, start_attached,
+    write_temp,
 };
 use rmpv::Value;
 use tokio::sync::mpsc::UnboundedReceiver;
-
-/// The current window's buffer name (`nvim_buf_get_name`).
-async fn buf_name(rpc: &Rpc) -> String {
-    rpc.request("nvim_buf_get_name", vec![Value::from(0u64)])
-        .await
-        .ok()
-        .and_then(|v| v.as_str().map(str::to_string))
-        .unwrap_or_default()
-}
 
 /// The number of open windows (`nvim_list_wins`).
 async fn win_count(rpc: &Rpc) -> usize {
@@ -48,47 +40,6 @@ async fn set_then_read(rpc: &Rpc, set_code: &str, read_code: &str) -> String {
         .as_str()
         .unwrap_or("<not a string>")
         .to_string()
-}
-
-/// Feed `keys`, then return the message line off the most-recent queued `redraw`
-/// (take-latest, per the harness convention).
-async fn message_after(
-    rpc: &Rpc,
-    incoming: &mut UnboundedReceiver<Incoming>,
-    keys: &str,
-) -> String {
-    while incoming.try_recv().is_ok() {}
-    rpc.request("nx_input", vec![Value::from(keys)])
-        .await
-        .expect("input");
-    rpc.request("nvim_get_mode", vec![]).await.expect("barrier");
-    for _ in 0..200 {
-        if let Some(map) = drain_to_latest_redraw(incoming, |_| true) {
-            return message(&map);
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-    }
-    panic!("no redraw arrived for {keys:?}");
-}
-
-/// Feed `keys`, settle, and return the most-recent queued `redraw` map.
-async fn redraw_after(
-    rpc: &Rpc,
-    incoming: &mut UnboundedReceiver<Incoming>,
-    keys: &str,
-) -> Vec<(Value, Value)> {
-    while incoming.try_recv().is_ok() {}
-    rpc.request("nx_input", vec![Value::from(keys)])
-        .await
-        .expect("input");
-    rpc.request("nvim_get_mode", vec![]).await.expect("barrier");
-    for _ in 0..200 {
-        if let Some(map) = drain_to_latest_redraw(incoming, |_| true) {
-            return map;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-    }
-    panic!("no redraw arrived for {keys:?}");
 }
 
 /// The `region` string of every window painted in a `redraw` map (`"main"` /

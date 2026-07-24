@@ -14,8 +14,8 @@ use std::time::Duration;
 use nxvim_rpc::{Incoming, Rpc};
 use nxvim_server::ServerInit;
 use nxvim_test_harness::{
-    attach, barrier, cursor, drain_to_latest_redraw, exec_lua, feed, lines, map_get, serial_lock,
-    spawn, temp_dir, window0_field,
+    attach, barrier, cursor, drain_to_latest_redraw, exec_lua, feed, lines, menu_items, menu_of,
+    poll_menu, serial_lock, spawn, temp_dir, window0_field,
 };
 use rmpv::Value;
 use tokio::sync::mpsc::UnboundedReceiver;
@@ -33,32 +33,7 @@ async fn poll_menu_items(
     rpc: &Rpc,
     incoming: &mut UnboundedReceiver<Incoming>,
 ) -> Option<Vec<String>> {
-    for _ in 0..80 {
-        nxvim_test_harness::barrier(rpc).await;
-        if let Some(map) = drain_to_latest_redraw(incoming, |m| {
-            matches!(map_get(m, "menu"), Some(Value::Map(_)))
-        }) {
-            let Some(Value::Map(menu)) = map_get(&map, "menu") else {
-                continue;
-            };
-            if let Some(Value::Array(items)) = map_get(menu, "items") {
-                return Some(
-                    items
-                        .iter()
-                        .map(|row| match row {
-                            Value::Array(a) => {
-                                a.first().and_then(Value::as_str).unwrap_or("").to_string()
-                            }
-                            Value::String(s) => s.as_str().unwrap_or("").to_string(),
-                            _ => String::new(),
-                        })
-                        .collect(),
-                );
-            }
-        }
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
-    None
+    Some(menu_items(&menu_of(&poll_menu(rpc, incoming).await?)))
 }
 
 /// Byte offset of an (ASCII) LSP `(line, character)` position in `text`, clamped to

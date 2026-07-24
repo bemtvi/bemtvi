@@ -16,7 +16,7 @@ use std::time::Duration;
 
 use nxvim_rpc::{Incoming, Rpc};
 use nxvim_server::ServerInit;
-use nxvim_test_harness::{exec_lua, lua_bool, lua_u64, start_attached, temp_dir};
+use nxvim_test_harness::{exec_lua, lua_bool, lua_u64, q, start_attached, temp_dir};
 use tokio::sync::mpsc::UnboundedReceiver;
 
 async fn start() -> (Rpc, UnboundedReceiver<Incoming>) {
@@ -53,13 +53,6 @@ async fn poll_done(rpc: &Rpc) {
         }
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
-}
-
-/// Lua-escape a path for embedding in a double-quoted string literal.
-fn q(path: &std::path::Path) -> String {
-    path.to_string_lossy()
-        .replace('\\', "\\\\")
-        .replace('"', "\\\"")
 }
 
 // ----- listing ----------------------------------------------------------------

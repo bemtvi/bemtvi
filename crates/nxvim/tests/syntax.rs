@@ -17,7 +17,7 @@ use nxvim_rpc::{Incoming, Rpc};
 use nxvim_server::ServerInit;
 use nxvim_test_harness::{
     drain_latest_redraw, exec_lua, feed, message_of, serial_lock as test_lock, start_attached,
-    window0, write_temp,
+    temp_dir, window0, write_temp,
 };
 use nxvim_tui::paint;
 use nxvim_view::View;
@@ -139,8 +139,7 @@ async fn start_with(
 }
 
 /// As [`start_with`], but also sources `config_dir/init.lua` at startup — the
-/// real config-load path, used to exercise an `examples/<feature>/init.lua`
-/// end-to-end (so the shipped example can't rot).
+/// real config-load path, used to exercise a test-written config end-to-end.
 async fn start_full(
     file: Option<String>,
     runtimepath: Vec<PathBuf>,
@@ -1276,23 +1275,49 @@ fn win_hl(win: &[(Value, Value)]) -> Vec<Vec<(u64, u64, String)>> {
         .unwrap_or_default()
 }
 
-/// End-to-end proof that the shipped `examples/markdown/` float highlights its code
-/// blocks in their own language: the example keeps the ```rust fence in the view buffer
-/// and types it `markdown`, so the grammar's injection paints `fn` inside the block as a
-/// rust keyword — exactly the native path, no bespoke highlighting in the config.
+/// End-to-end proof that a rendered-markdown float highlights its code blocks in
+/// their own language: an `nx.view.component` over `nx.markdown.to_view` keeps the
+/// ```rust fence in the view buffer and types it `markdown`, so the grammar's
+/// injection paints `fn` inside the block as a rust keyword — exactly the native
+/// path, no bespoke highlighting in the config (the `examples/markdown` recipe).
 #[tokio::test]
-async fn markdown_example_float_injects_rust_into_code_blocks() {
+async fn rendered_markdown_float_injects_rust_into_code_blocks() {
     let _guard = test_lock().lock().await;
     fixture_data_dir();
-    let example_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/markdown");
+    // The config: render the current buffer's markdown into a float typed `markdown`,
+    // mapped to `K` — written to a throwaway config dir and sourced at startup.
+    let config_dir = temp_dir("md-ex-config");
+    std::fs::write(
+        config_dir.join("init.lua"),
+        r#"
+        local MarkdownFloat = nx.view.component({
+          setup = function(ctx)
+            return { src = ctx.props.src }
+          end,
+          render = function(state)
+            return nx.markdown.to_view(state.src)
+          end,
+        })
+        nx.keymap.set("n", "K", function()
+          local src = table.concat(nx.buf.lines(nx.buf.current(), 0, -1), "\n")
+          MarkdownFloat.mount({
+            name = "[Rendered Markdown]",
+            filetype = "markdown",
+            props = { src = src },
+            float = { relative = "editor", width = "80%", height = "80%", align = "center" },
+          })
+        end)
+        "#,
+    )
+    .expect("write init.lua");
     let file = write_temp(
         "md-ex",
         "md",
         "# Title\n\nprose here.\n\n```rust\nfn zzz() {}\n```\n",
     );
-    let (rpc, mut incoming) = start_full(Some(file), Vec::new(), Some(example_dir)).await;
+    let (rpc, mut incoming) = start_full(Some(file), Vec::new(), Some(config_dir)).await;
 
-    // The example maps `K` to render the current buffer into the float.
+    // The config maps `K` to render the current buffer into the float.
     feed(&rpc, "K");
 
     // Poll for the float whose `fn zzz` code row carries a rust `@keyword` span — the

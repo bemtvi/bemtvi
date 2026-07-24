@@ -18,8 +18,8 @@ use std::path::Path;
 use nxvim_rpc::{Incoming, Rpc};
 use nxvim_server::ServerInit;
 use nxvim_test_harness::{
-    attach, cursor, drain_to_latest_redraw, exec_lua, feed, lines, map_get, serial_lock, spawn,
-    temp_dir,
+    attach, cursor, drain_to_latest_redraw, exec_lua, feed, lines, map_get, menu_items, menu_of,
+    serial_lock, spawn, temp_dir,
 };
 use rmpv::Value;
 use tokio::sync::mpsc::UnboundedReceiver;
@@ -43,26 +43,13 @@ async fn poll_menu_items(
     rpc: &Rpc,
     incoming: &mut UnboundedReceiver<Incoming>,
 ) -> Option<Vec<String>> {
+    // Single-shot (one barrier + drain), NOT the harness's retrying `poll_menu`:
+    // the callers run their own retry loops around this.
     nxvim_test_harness::barrier(rpc).await;
     let map = drain_to_latest_redraw(incoming, |m| {
         matches!(map_get(m, "menu"), Some(Value::Map(_)))
     })?;
-    let Some(Value::Map(menu)) = map_get(&map, "menu") else {
-        return None;
-    };
-    match map_get(menu, "items") {
-        Some(Value::Array(items)) => Some(
-            items
-                .iter()
-                .map(|row| match row {
-                    Value::Array(a) => a.first().and_then(Value::as_str).unwrap_or("").to_string(),
-                    Value::String(s) => s.as_str().unwrap_or("").to_string(),
-                    _ => String::new(),
-                })
-                .collect(),
-        ),
-        _ => Some(Vec::new()),
-    }
+    Some(menu_items(&menu_of(&map)))
 }
 
 /// The completion **docs float window** (`[CompletionDocs]`) lines of the latest redraw
@@ -376,21 +363,9 @@ async fn poll_menu_rows(
     let map = drain_to_latest_redraw(incoming, |m| {
         matches!(map_get(m, "menu"), Some(Value::Map(_)))
     })?;
-    let Some(Value::Map(menu)) = map_get(&map, "menu") else {
-        return None;
-    };
-    let labels = match map_get(menu, "items") {
-        Some(Value::Array(items)) => items
-            .iter()
-            .map(|row| match row {
-                Value::Array(a) => a.first().and_then(Value::as_str).unwrap_or("").to_string(),
-                Value::String(s) => s.as_str().unwrap_or("").to_string(),
-                _ => String::new(),
-            })
-            .collect::<Vec<_>>(),
-        _ => return None,
-    };
-    let kinds = match map_get(menu, "kinds") {
+    let menu = menu_of(&map);
+    let labels = menu_items(&menu);
+    let kinds = match map_get(&menu, "kinds") {
         Some(Value::Array(a)) => a.iter().map(|v| v.as_str().map(str::to_string)).collect(),
         _ => vec![None; labels.len()],
     };

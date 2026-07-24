@@ -3,22 +3,11 @@
 //! the other suites; the buffer is seeded from a temp file so its mirror lines are
 //! the haystack.
 
-use nxvim_rpc::{Incoming, Rpc};
-use nxvim_server::ServerInit;
-use nxvim_test_harness::{exec_lua, start_attached, write_temp};
+use nxvim_rpc::Rpc;
+use nxvim_test_harness::{exec_lua, start_with_file as open};
 use rmpv::Value;
-use tokio::sync::mpsc::UnboundedReceiver;
 
 const CONTENT: &str = "alpha beta\nFoo = 42\nfoo bar foo\n<<<<<<< HEAD\nthe end\n";
-
-async fn open(content: &str) -> (Rpc, UnboundedReceiver<Incoming>) {
-    let path = write_temp("buf_search", "txt", content);
-    let init = ServerInit {
-        file: Some(path),
-        ..Default::default()
-    };
-    start_attached(init, 80, 24).await
-}
 
 /// Run `nx.buf.search(0, <args>)` and format the result as
 /// "line:col:end_col:text:cap1,cap2" (or "nil"), so one string assertion covers the

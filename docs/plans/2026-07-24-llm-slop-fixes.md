@@ -185,27 +185,33 @@ Stale docs describing removed worlds:
 
 ## G. Test-suite cleanup
 
-- [ ] **G1. Remove/convert the 16 examples-loading tests** (violate CLAUDE.md rule):
-  picker.rs:486,514,2857; cmdline_complete.rs:1411; autocmds.rs:870; complete.rs:2150;
-  diagnostic_nav.rs:166; dock.rs:1144; folds_example.rs (whole file); markdown.rs:404;
-  regex.rs:253; session.rs:809; shada.rs:1088; editing/padding.rs:91;
-  editing/indent_pairs.rs:172; nxvim/tests/syntax.rs:1284. Three are also
-  existence-only "loads≠works" asserts (picker.rs:486,514, cmdline_complete.rs:1411).
-- [ ] **G2. Promote to nxvim-test-harness** (then delete local copies):
-  `DaemonFs` fake + `spawn_with_daemon_fs` (×9 files), `await_lines` (×12),
-  `poll_menu`/`menu_of`/`menu_items` (×8 suites), `start_with_config` (×13; canonical
-  editing/support.rs:473), `redraw_after` (×4 — makes CLAUDE.md's claim true),
-  `message_after` (×6, two divergent impls), `feed_sync` (×3), `start_clocked` (×3),
-  `q()` lua-escape (×5), `open(content)` (×5), `buf_name` (×5), `poll_true` (×3),
-  `await_server_exit` (×3); migrate `temp_file` ×2 → harness `write_temp`.
-- [ ] **G3.** Harness dead code: `drain_all_redraws` (lib.rs:357), `window0_get`
-  (lib.rs:467), editing/support.rs:532 `drain_notify`; scope away the blanket
-  `#![allow(dead_code)]` in editing/support.rs:8. Collapse `attach*` ×3 variants into
-  `attach_with_caps` + wrappers (lib.rs:71-121).
-- [ ] **G4.** Fold ~5 near-duplicate test clusters table-driven (keymaps.rs:1047/1302/1328;
-  editing/encoding.rs:486/519; options.rs:342/387).
-- [ ] **G5.** CLAUDE.md: either hoist `redraw_after` (G2) or fix the sentence claiming
-  it lives in the harness.
+- [x] **G1. Remove/convert the 16 examples-loading tests** — DONE. Deleted 12 whose
+  behavior non-example tests already cover (picker ×3, cmdline_complete, autocmds,
+  complete, diagnostic_nav, folds_example.rs whole file — editing/folds.rs covers
+  indent folds —, regex, session, shada, padding) plus the now-orphaned
+  `example_dir`/`pump_until_any_window_has` helpers; converted 4 with unique coverage
+  to inline configs (dock winhighlight *render*, markdown float via inline
+  `nx.view.component`, smart-indent `vim.o` defaults, syntax float rust-injection via
+  a test-written config dir).
+- [x] **G2. Promote to nxvim-test-harness** — DONE (3 commits). `DaemonFs` is one
+  superset fake (files + optional dirs + `fail_writes` + all the mutators the nine
+  copies had grown); `spawn_with_daemon_fs(_init)`, `await_lines(_where)`,
+  `poll_menu`/`poll_no_menu`/`menu_of`/`menu_items`, `start_with_config` (+
+  `config_init` + file variant), `redraw_after(_matching)`, `message_after`
+  (divergent chdir/tabs impls folded into the canonical drain-to-latest),
+  `feed_sync`, `start_clocked(_init)`, `start_with_file` (the `open(content)`
+  fixture), `buf_name(_of)`, `q()`, `poll_true`, `await_server_exit` all hoisted;
+  `temp_file` ×2 → `write_temp`. Divergent-geometry / divergent-convention call
+  sites keep one-line local adapters (editing/support 80×25, whole-frame
+  `menu_items`, single-shot lsp_complete poller).
+- [x] **G3.** DONE — `drain_all_redraws`/`window0_get`/`drain_notify` deleted (zero
+  callers), `attach*` trio collapsed onto `attach_with_caps`, and the blanket
+  `#![allow(dead_code)]` in editing/support.rs removed outright (nothing left dead).
+- [x] **G4.** DONE — keymaps' three visual-`gg`-under-collision tests, encoding's
+  Shift_JIS/EUC-JP round-trips, and options' scrolloff/colorcolumn round-trips are
+  each one table-driven test.
+- [x] **G5.** DONE via G2 — `redraw_after` now genuinely lives in the harness, so
+  CLAUDE.md's sentence is true as written.
 
 ## H. Engines (small)
 

@@ -20,7 +20,7 @@ use std::time::Duration;
 
 use nxvim_rpc::{connect, Incoming, Rpc};
 use nxvim_server::{RemoteHostTerm, ServerInit};
-use nxvim_test_harness::{attach, buf_lines, feed, spawn, temp_dir};
+use nxvim_test_harness::{attach, await_lines_where, buf_lines, feed, spawn, temp_dir};
 use rmpv::Value;
 use tokio::sync::mpsc::UnboundedReceiver;
 
@@ -52,19 +52,11 @@ async fn spawn_remote_term(remote_cwd: &str) -> (Rpc, UnboundedReceiver<Incoming
     (rpc, incoming)
 }
 
-/// Poll the current buffer (`bufnr` 0) until its text contains `needle` or the budget runs
-/// out. Matches against the lines **concatenated** (no separator) so a needle wrapped across
-/// the terminal's fixed-width rows — a long path split at column 80 — is still found. Returns
-/// the raw lines either way so a failure shows what *did* arrive.
+/// Poll the current buffer until its text contains `needle`. Matches against the lines
+/// **concatenated** (no separator) so a needle wrapped across the terminal's fixed-width
+/// rows — a long path split at column 80 — is still found.
 async fn await_lines_contains(rpc: &Rpc, needle: &str) -> Vec<String> {
-    for _ in 0..200 {
-        let lines = buf_lines(rpc, 0).await;
-        if lines.concat().contains(needle) {
-            return lines;
-        }
-        tokio::time::sleep(Duration::from_millis(25)).await;
-    }
-    buf_lines(rpc, 0).await
+    await_lines_where(rpc, |lines| lines.concat().contains(needle)).await
 }
 
 /// A daemon session's `:terminal` opens its PTY on the **remote** (daemon) host, in the

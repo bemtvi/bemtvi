@@ -11,7 +11,6 @@
 //! feeding navigation keys (which act on the filled buffer).
 
 use crate::support::*;
-use std::time::Duration;
 
 /// A fresh temp directory pre-populated with two files and one sub-directory
 /// (itself holding one file). Returns the directory's path as a string.
@@ -22,19 +21,6 @@ fn fixture_dir(tag: &str) -> String {
     std::fs::create_dir(dir.join("sub")).expect("mkdir sub");
     std::fs::write(dir.join("sub").join("inner.txt"), "inner-body\n").expect("write inner");
     dir.to_string_lossy().into_owned()
-}
-
-/// Poll the current buffer's lines until they match `want` or the budget runs out — the
-/// async-fill counterpart of a synchronous assert (the listing fills a tick or two after
-/// the open, when `nx.fs.readdir` settles). Returns the final lines either way.
-async fn await_lines(rpc: &Rpc, want: &[&str]) -> Vec<String> {
-    for _ in 0..100 {
-        if lines(rpc).await == want {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
-    lines(rpc).await
 }
 
 /// The standard fixture listing, after the async fill.

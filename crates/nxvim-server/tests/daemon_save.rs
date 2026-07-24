@@ -16,139 +16,11 @@
 //! Black-box like the rest: a real server over the in-process RPC pipe, asserting on
 //! buffer lines, `vim.bo.modified`, the daemon's stored bytes, and the redraw message.
 
-use std::collections::HashMap;
-use std::io::{self, Cursor, Read};
-use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use nxvim_core::{DirEntry, FileStat, HostFs};
 use nxvim_rpc::{Incoming, Rpc};
-use nxvim_server::{RemoteHostFs, ServerInit};
-use nxvim_test_harness::{attach, buf_lines, exec_lua, feed, message_of, spawn};
+use nxvim_test_harness::{await_lines, exec_lua, feed, message_of, spawn_with_daemon_fs, DaemonFs};
 use tokio::sync::mpsc::UnboundedReceiver;
-
-/// An in-memory [`HostFs`] for the **daemon** side: path → bytes, plus a switch that
-/// makes every write fail (to exercise the loud-failure / quit-cancel contract).
-/// `read_dir` errors on every path (it models no directories), so a stored path
-/// classifies as a file and an absent one as a new-file — never a directory.
-#[derive(Clone, Default)]
-struct DaemonFs {
-    files: Arc<Mutex<HashMap<PathBuf, Vec<u8>>>>,
-    fail_writes: bool,
-}
-
-impl DaemonFs {
-    fn with(path: &str, contents: &str) -> Self {
-        let me = DaemonFs::default();
-        me.files
-            .lock()
-            .unwrap()
-            .insert(PathBuf::from(path), contents.as_bytes().to_vec());
-        me
-    }
-
-    /// Seed several `(path, contents)` files at once — for the multi-buffer `:wall` /
-    /// `:wqa` tests, which open and edit more than one remote file.
-    fn with_files(entries: &[(&str, &str)]) -> Self {
-        let me = DaemonFs::default();
-        {
-            let mut files = me.files.lock().unwrap();
-            for (path, contents) in entries {
-                files.insert(PathBuf::from(*path), contents.as_bytes().to_vec());
-            }
-        }
-        me
-    }
-
-    /// The bytes currently stored at `path`, as a string (the daemon's view of the
-    /// file the editor wrote across the wire). `None` if nothing is stored there.
-    fn content(&self, path: &str) -> Option<String> {
-        self.files
-            .lock()
-            .unwrap()
-            .get(Path::new(path))
-            .map(|b| String::from_utf8_lossy(b).into_owned())
-    }
-}
-
-impl HostFs for DaemonFs {
-    fn exists(&self, path: &Path) -> bool {
-        self.files.lock().unwrap().contains_key(path)
-    }
-
-    fn open_read(&self, path: &Path) -> io::Result<Box<dyn Read>> {
-        match self.files.lock().unwrap().get(path) {
-            Some(bytes) => Ok(Box::new(Cursor::new(bytes.clone()))),
-            None => Err(io::Error::new(io::ErrorKind::NotFound, "no such file")),
-        }
-    }
-
-    fn stat(&self, path: &Path) -> Option<FileStat> {
-        self.files.lock().unwrap().get(path).map(|b| FileStat {
-            mtime: None,
-            size: b.len() as u64,
-        })
-    }
-
-    fn write_atomic(&self, path: &Path, contents: &[u8]) -> io::Result<()> {
-        if self.fail_writes {
-            // A loud failure the edit-host must surface — never a silent success.
-            return Err(io::Error::new(
-                io::ErrorKind::PermissionDenied,
-                "daemon refuses the write",
-            ));
-        }
-        self.files
-            .lock()
-            .unwrap()
-            .insert(path.to_path_buf(), contents.to_vec());
-        Ok(())
-    }
-
-    fn read_dir(&self, _dir: &Path) -> io::Result<Vec<DirEntry>> {
-        Err(io::Error::new(io::ErrorKind::NotFound, "not a directory"))
-    }
-
-    fn canonicalize(&self, path: &Path) -> io::Result<PathBuf> {
-        Ok(path.to_path_buf())
-    }
-}
-
-/// Start a server whose async fs is a [`RemoteHostFs`] talking to a `serve_fs_daemon`
-/// (backed by `fake`) over an in-process duplex, opening `file`. UI-attached. Returns
-/// the client RPC handle and its notification receiver (kept, not dropped: dropping it
-/// would tear the client connection down and stop the server).
-async fn spawn_with_daemon_fs(fake: DaemonFs, file: &str) -> (Rpc, UnboundedReceiver<Incoming>) {
-    let (edit_host_end, daemon_end) = tokio::io::duplex(1 << 16);
-    let (daemon_reader, daemon_writer) = tokio::io::split(daemon_end);
-    tokio::spawn(async move {
-        let _ = nxvim_server::serve_fs_daemon(daemon_reader, daemon_writer, Box::new(fake)).await;
-    });
-
-    let (host_reader, host_writer) = tokio::io::split(edit_host_end);
-    let remote = RemoteHostFs::connect(host_reader, host_writer);
-    let init = ServerInit {
-        file: Some(file.to_string()),
-        host_fs_async: Some(Box::new(remote)),
-        ..Default::default()
-    };
-    let (rpc, incoming) = spawn(init);
-    attach(&rpc, 80, 24).await;
-    (rpc, incoming)
-}
-
-/// Poll `nvim_buf_get_lines` until it matches `want` (the off-tick initial open lands
-/// a moment after attach), so a test can edit a loaded buffer rather than racing it.
-async fn await_lines(rpc: &Rpc, want: &[&str]) {
-    for _ in 0..100 {
-        if buf_lines(rpc, 0).await == want {
-            return;
-        }
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
-    assert_eq!(buf_lines(rpc, 0).await, want, "initial buffer never loaded");
-}
 
 /// Whether the current buffer reports `modified` (the mirrored `vim.bo.modified`).
 async fn modified(rpc: &Rpc) -> bool {
@@ -193,10 +65,8 @@ async fn await_daemon_content(fake: &DaemonFs, path: &str, want: &str) {
 /// content a stub couldn't invent and the local disk can't hold (the `/virtual/...`
 /// faithfulness argument the rest of this suite makes).
 async fn two_edited_buffers(fail_writes: bool) -> (DaemonFs, Rpc, UnboundedReceiver<Incoming>) {
-    let fake = DaemonFs {
-        fail_writes,
-        ..DaemonFs::with_files(&[("/virtual/a.txt", "aaa\n"), ("/virtual/b.txt", "bbb\n")])
-    };
+    let fake = DaemonFs::with_files(&[("/virtual/a.txt", "aaa\n"), ("/virtual/b.txt", "bbb\n")]);
+    fake.fail_writes(fail_writes);
     let (rpc, incoming) = spawn_with_daemon_fs(fake.clone(), "/virtual/a.txt").await;
     await_lines(&rpc, &["aaa"]).await;
     feed(&rpc, "ggIA <Esc>");
@@ -415,10 +285,8 @@ async fn wq_saves_over_the_wire_then_quits() {
 /// bytes. Proves the quit is gated on a *successful* ack, not fired optimistically.
 #[tokio::test]
 async fn failing_write_cancels_the_quit_and_keeps_the_buffer_modified() {
-    let fake = DaemonFs {
-        fail_writes: true,
-        ..DaemonFs::with("/virtual/f.txt", "data\n")
-    };
+    let fake = DaemonFs::with("/virtual/f.txt", "data\n");
+    fake.fail_writes(true);
     let (rpc, mut incoming) = spawn_with_daemon_fs(fake.clone(), "/virtual/f.txt").await;
     await_lines(&rpc, &["data"]).await;
 

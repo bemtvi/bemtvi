@@ -12,7 +12,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use nxvim_rpc::{Incoming, Rpc};
 use nxvim_server::ServerInit;
 use nxvim_test_harness::{
-    buf_lines, command, cursor, exec_lua, feed, field, lines, start_attached,
+    buf_lines, buf_name_of, command, cursor, exec_lua, feed, field, lines, start_attached,
+    write_temp,
 };
 use rmpv::Value;
 use tokio::sync::mpsc::UnboundedReceiver;
@@ -65,18 +66,14 @@ async fn unnamed(rpc: &Rpc, incoming: &mut UnboundedReceiver<Incoming>) -> bool 
     flag
 }
 
-/// A uniquely-named temp file path with the given contents. `.txt` so no
-/// treesitter grammar is involved (keeps these tests free of the syntax worker).
-fn temp_file(tag: &str, contents: &str) -> PathBuf {
-    static COUNTER: AtomicU64 = AtomicU64::new(0);
-    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-    let path = std::env::temp_dir().join(format!("nxvim_buf_{tag}_{}_{n}.txt", std::process::id()));
-    std::fs::write(&path, contents).unwrap();
-    path
+fn name(path: impl AsRef<Path>) -> String {
+    path.as_ref().to_string_lossy().into_owned()
 }
 
-fn name(path: &Path) -> String {
-    path.to_string_lossy().into_owned()
+/// A seeded temp file as a `PathBuf` (the harness `write_temp`, path-typed —
+/// these tests lean on `Path` methods like `with_extension`).
+fn temp_file(tag: &str, contents: &str) -> PathBuf {
+    PathBuf::from(write_temp(tag, "txt", contents))
 }
 
 // ----- buffer RPC API helpers -------------------------------------------------
@@ -114,15 +111,6 @@ async fn create_buf(rpc: &Rpc) -> u64 {
         .expect("u64")
 }
 
-async fn buf_name(rpc: &Rpc, handle: u64) -> String {
-    rpc.request("nvim_buf_get_name", vec![Value::from(handle)])
-        .await
-        .expect("buf_get_name")
-        .as_str()
-        .unwrap_or("")
-        .to_string()
-}
-
 // Regression: `:e ~/file` must expand a leading `~` to `$HOME` (vim filename
 // expansion), exactly like `vim.fn.expand`. Before the fix the tilde reached the
 // buffer verbatim, so the buffer was named `~/...` and the real file under home was
@@ -147,7 +135,7 @@ async fn editing_expands_a_leading_tilde_to_home() {
     let (rpc, _incoming) = start().await;
     feed(&rpc, &format!(":e ~/{fname}<CR>"));
     let buf = current_buf(&rpc).await;
-    let got = buf_name(&rpc, buf).await;
+    let got = buf_name_of(&rpc, buf).await;
     assert_eq!(
         got, expected,
         "`:e ~/…` should open the home-expanded path, not a literal `~`"
@@ -182,7 +170,7 @@ async fn editing_a_nonexistent_file_does_not_storm_the_file_watch() {
     // itself still works — a new-file buffer, current, named, one empty line.
     assert_eq!(lines(&rpc).await, vec![""]);
     let cur = current_buf(&rpc).await;
-    assert_eq!(buf_name(&rpc, cur).await, name(&missing));
+    assert_eq!(buf_name_of(&rpc, cur).await, name(&missing));
 
     // Drain whatever the open queued, then watch a quiet window. With the storm the
     // watch keeps repainting forever, so the channel never goes quiet; fixed, the
@@ -609,7 +597,7 @@ async fn bdelete_last_buffer_leaves_a_fresh_no_name() {
     assert_eq!(bufs.len(), 1);
     assert_ne!(bufs[0], 1, "the deleted id is not reused");
     assert_eq!(lines(&rpc).await, vec![""]);
-    assert_eq!(buf_name(&rpc, 0).await, "");
+    assert_eq!(buf_name_of(&rpc, 0).await, "");
 }
 
 /// Deleting a buffer that is *also* shown in another window (a split) must rebind
@@ -706,7 +694,7 @@ async fn buffer_rpc_api_lists_reads_switches_and_creates() {
 
     assert_eq!(list_bufs(&rpc).await, vec![1, 2]);
     assert_eq!(current_buf(&rpc).await, 2);
-    assert_eq!(buf_name(&rpc, 1).await, name(&a));
+    assert_eq!(buf_name_of(&rpc, 1).await, name(&a));
     // Read a non-current buffer by handle.
     assert_eq!(buf_lines(&rpc, 1).await, vec!["a1", "a2"]);
 

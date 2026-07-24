@@ -17,8 +17,9 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use nxvim_server::{is_store_file, PersistState, RedbFileStore, ServerInit, ShadaStore};
-use nxvim_test_harness::{cursor, exec_lua, feed, lines, start_attached, temp_dir, write_temp};
-use tokio::sync::mpsc::UnboundedReceiver;
+use nxvim_test_harness::{
+    await_server_exit, cursor, exec_lua, feed, lines, start_attached, temp_dir, write_temp,
+};
 
 /// A server that persists into `dir` via the native redb store.
 fn init_with_store(dir: &Path, file: Option<String>) -> ServerInit {
@@ -39,14 +40,6 @@ fn init_workspace(primary: &Path, global: &Path, file: Option<String>) -> Server
         workspace_session: true,
         ..Default::default()
     }
-}
-
-/// Drain the client's incoming channel until it closes. The channel closes only
-/// when the server thread has fully returned from `run_server` — which happens
-/// *after* the final shada flush — so awaiting this is a reliable "the store has
-/// been written" barrier, with no reliance on wall-clock timing.
-async fn await_server_exit(mut incoming: UnboundedReceiver<nxvim_rpc::Incoming>) {
-    while incoming.recv().await.is_some() {}
 }
 
 /// A probe [`ShadaStore`] that records every flushed snapshot in memory, so a test
@@ -1072,78 +1065,6 @@ async fn plugin_namespace_tolerates_a_trailing_slash_rtp_entry() {
         Some("slashed"),
         "a trailing-slash rtp entry still attributes its files (basename namespace)"
     );
-}
-
-/// Resolve `examples/<name>` to an absolute path from this crate's manifest dir, so
-/// the example tests load the real shipped config regardless of the test cwd.
-fn example_dir(name: &str) -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../../examples")
-        .join(name)
-        .canonicalize()
-        .expect("example dir exists")
-}
-
-#[tokio::test]
-async fn example_plugin_shada_remembers_files_across_sessions() {
-    // Drive the shipped `examples/plugin-shada/` end-to-end through the real startup
-    // sourcing (init.lua + the auto-sourced `pack/*/start/*` plugin), proving the
-    // example actually persists per-plugin data in its assigned namespace.
-    let cfg = example_dir("plugin-shada");
-    let plugin = cfg.join("pack/demo/start/recent-files");
-    let sample = cfg.join("sample.txt");
-    let store_dir = temp_dir("shada_example_plugin");
-
-    let init = |file: Option<String>| ServerInit {
-        file,
-        config_dir: Some(cfg.clone()),
-        runtimepath: vec![cfg.clone(), plugin.clone()],
-        shada: Some(Box::new(RedbFileStore::new(store_dir.to_path_buf()))),
-        ..Default::default()
-    };
-
-    // Session 1: open the sample file (the plugin's VimEnter sweep remembers it), quit.
-    {
-        let (rpc, incoming) =
-            start_attached(init(Some(sample.to_string_lossy().into_owned())), 80, 25).await;
-        // Barrier: the sample buffer is loaded (so startup, incl. VimEnter, has run).
-        assert!(!lines(&rpc).await.is_empty());
-        feed(&rpc, ":qa!<CR>");
-        await_server_exit(incoming).await;
-    }
-
-    // Session 2: a fresh server against the same store. The plugin's "recent-files"
-    // namespace holds the sample path, and the config's store counted two launches —
-    // two isolated stores, both restored.
-    {
-        let (rpc, _incoming) = start_attached(init(None), 80, 25).await;
-        let files = exec_lua(
-            &rpc,
-            r#"return nx.json.encode(nx._shada_plugin_get("recent-files", "files"))"#,
-        )
-        .await;
-        let files = files.as_str().unwrap_or("");
-        assert!(
-            files.contains("sample.txt"),
-            "the recent-files plugin remembered the sample across the restart (got {files:?})"
-        );
-
-        // The config's launch counter persisted + incremented. Under this harness the
-        // config attributes to its dir basename (no NXVIM_CONFIG is set, so it isn't
-        // stdpath("config")); the real binary launched with NXVIM_CONFIG maps the same
-        // code to the reserved `user` namespace instead.
-        let cfg_ns = cfg.file_name().unwrap().to_string_lossy().into_owned();
-        let launches = exec_lua(
-            &rpc,
-            &format!(r#"return nx._shada_plugin_get({cfg_ns:?}, "launches")"#),
-        )
-        .await;
-        assert_eq!(
-            launches.as_u64(),
-            Some(2),
-            "the config counted both launches"
-        );
-    }
 }
 
 #[tokio::test]

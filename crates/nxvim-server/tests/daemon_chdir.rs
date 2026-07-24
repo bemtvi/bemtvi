@@ -11,108 +11,15 @@
 //! remote cwd, not the local process's — the faithfulness argument the sibling daemon
 //! suites make.
 
-use std::collections::HashMap;
-use std::io::{self, Cursor, Read};
-use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::path::PathBuf;
 use std::time::Duration;
 
-use nxvim_core::{DirEntry, FileStat, HostFs};
 use nxvim_rpc::{Incoming, Rpc};
-use nxvim_server::{RemoteHostFs, ServerInit};
-use nxvim_test_harness::{attach, barrier, buf_lines, exec_lua, feed, message, spawn, wait_redraw};
+use nxvim_server::ServerInit;
+use nxvim_test_harness::{
+    await_lines, barrier, exec_lua, feed, message, spawn_with_daemon_fs_init, wait_redraw, DaemonFs,
+};
 use tokio::sync::mpsc::UnboundedReceiver;
-
-/// An in-memory daemon filesystem modeling files and directories (the same shape
-/// `daemon_explorer.rs` uses): a path is a file (with bytes), a directory (with entries),
-/// or absent. `read_dir` succeeds only for a directory, so a directory classifies as a
-/// listing and a file as a file — exactly as the real `StdHostFs` does.
-#[derive(Clone, Default)]
-struct DaemonFs {
-    inner: Arc<Mutex<Tree>>,
-}
-
-#[derive(Default)]
-struct Tree {
-    files: HashMap<PathBuf, Vec<u8>>,
-    dirs: HashMap<PathBuf, Vec<(bool, String)>>,
-}
-
-impl DaemonFs {
-    fn file(&self, path: &str, contents: &str) -> &Self {
-        self.inner
-            .lock()
-            .unwrap()
-            .files
-            .insert(PathBuf::from(path), contents.as_bytes().to_vec());
-        self
-    }
-
-    fn dir(&self, path: &str, entries: &[(bool, &str)]) -> &Self {
-        let entries = entries
-            .iter()
-            .map(|(is_dir, name)| (*is_dir, name.to_string()))
-            .collect();
-        self.inner
-            .lock()
-            .unwrap()
-            .dirs
-            .insert(PathBuf::from(path), entries);
-        self
-    }
-}
-
-impl HostFs for DaemonFs {
-    fn exists(&self, path: &Path) -> bool {
-        let t = self.inner.lock().unwrap();
-        t.files.contains_key(path) || t.dirs.contains_key(path)
-    }
-
-    fn open_read(&self, path: &Path) -> io::Result<Box<dyn Read>> {
-        match self.inner.lock().unwrap().files.get(path) {
-            Some(bytes) => Ok(Box::new(Cursor::new(bytes.clone()))),
-            None => Err(io::Error::new(io::ErrorKind::NotFound, "no such file")),
-        }
-    }
-
-    fn stat(&self, path: &Path) -> Option<FileStat> {
-        self.inner
-            .lock()
-            .unwrap()
-            .files
-            .get(path)
-            .map(|b| FileStat {
-                mtime: None,
-                size: b.len() as u64,
-            })
-    }
-
-    fn write_atomic(&self, path: &Path, contents: &[u8]) -> io::Result<()> {
-        self.inner
-            .lock()
-            .unwrap()
-            .files
-            .insert(path.to_path_buf(), contents.to_vec());
-        Ok(())
-    }
-
-    fn read_dir(&self, dir: &Path) -> io::Result<Vec<DirEntry>> {
-        match self.inner.lock().unwrap().dirs.get(dir) {
-            Some(entries) => Ok(entries
-                .iter()
-                .map(|(is_dir, name)| DirEntry {
-                    is_dir: *is_dir,
-                    name: name.clone(),
-                })
-                .collect()),
-            None => Err(io::Error::new(io::ErrorKind::NotFound, "not a directory")),
-        }
-    }
-
-    fn canonicalize(&self, path: &Path) -> io::Result<PathBuf> {
-        Ok(path.to_path_buf())
-    }
-}
 
 /// A fake daemon fs with `/virtual/proj` (holding `src/` and a README) and
 /// `/virtual/proj/src` (holding `main.rs`).
@@ -120,8 +27,8 @@ fn fixture() -> DaemonFs {
     let fs = DaemonFs::default();
     fs.dir("/virtual/proj", &[(true, "src"), (false, "README.md")])
         .dir("/virtual/proj/src", &[(false, "main.rs")])
-        .file("/virtual/proj/README.md", "# Readme\n")
-        .file("/virtual/proj/src/main.rs", "fn main() {}\n");
+        .set("/virtual/proj/README.md", "# Readme\n")
+        .set("/virtual/proj/src/main.rs", "fn main() {}\n");
     fs
 }
 
@@ -129,23 +36,15 @@ fn fixture() -> DaemonFs {
 /// (backed by `fake`) over an in-process duplex, opening `file` with the daemon's cwd
 /// seeded to `cwd`. UI-attached.
 async fn spawn_remote(fake: DaemonFs, cwd: &str, file: &str) -> (Rpc, UnboundedReceiver<Incoming>) {
-    let (edit_host_end, daemon_end) = tokio::io::duplex(1 << 16);
-    let (daemon_reader, daemon_writer) = tokio::io::split(daemon_end);
-    tokio::spawn(async move {
-        let _ = nxvim_server::serve_fs_daemon(daemon_reader, daemon_writer, Box::new(fake)).await;
-    });
-
-    let (host_reader, host_writer) = tokio::io::split(edit_host_end);
-    let remote = RemoteHostFs::connect(host_reader, host_writer);
-    let init = ServerInit {
-        file: Some(file.to_string()),
-        host_fs_async: Some(Box::new(remote)),
-        remote_cwd: Some(PathBuf::from(cwd)),
-        ..Default::default()
-    };
-    let (rpc, incoming) = spawn(init);
-    attach(&rpc, 80, 24).await;
-    (rpc, incoming)
+    spawn_with_daemon_fs_init(
+        fake,
+        ServerInit {
+            file: Some(file.to_string()),
+            remote_cwd: Some(PathBuf::from(cwd)),
+            ..Default::default()
+        },
+    )
+    .await
 }
 
 /// The cwd as the server reports it through `vim.fn.getcwd`.
@@ -167,18 +66,6 @@ async fn await_getcwd(rpc: &Rpc, want: &str) -> String {
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
     getcwd(rpc).await
-}
-
-/// Poll `nvim_buf_get_lines` until it matches `want` or the budget runs out (an off-tick
-/// open lands a moment after the command).
-async fn await_lines(rpc: &Rpc, want: &[&str]) -> Vec<String> {
-    for _ in 0..100 {
-        if buf_lines(rpc, 0).await == want {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
-    buf_lines(rpc, 0).await
 }
 
 /// A remote session seeds its working directory from the daemon: `vim.fn.getcwd()`

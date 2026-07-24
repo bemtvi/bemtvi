@@ -7,8 +7,7 @@
 
 use nxvim_rpc::{Incoming, Rpc};
 use nxvim_server::ServerInit;
-use nxvim_test_harness::{attach, drain_to_latest_redraw, exec_lua, message, spawn, temp_dir};
-use rmpv::Value;
+use nxvim_test_harness::{attach, exec_lua, message_after, spawn, temp_dir};
 use tokio::sync::mpsc::UnboundedReceiver;
 
 async fn start(dir: &std::path::Path) -> (Rpc, UnboundedReceiver<Incoming>) {
@@ -21,31 +20,6 @@ async fn start(dir: &std::path::Path) -> (Rpc, UnboundedReceiver<Incoming>) {
     let (rpc, incoming) = spawn(init);
     attach(&rpc, 80, 24).await;
     (rpc, incoming)
-}
-
-/// Feed `keys`, then return the message line off the most-recent queued `redraw`
-/// (take-latest, per the harness convention — a stale frame can sit ahead of this
-/// input's under load).
-async fn message_after(
-    rpc: &Rpc,
-    incoming: &mut UnboundedReceiver<Incoming>,
-    keys: &str,
-) -> String {
-    while incoming.try_recv().is_ok() {}
-    rpc.request("nx_input", vec![Value::from(keys)])
-        .await
-        .expect("input");
-    rpc.request("nvim_get_mode", vec![]).await.expect("barrier");
-    if let Some(map) = drain_to_latest_redraw(incoming, |_| true) {
-        return message(&map);
-    }
-    for _ in 0..200 {
-        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        if let Some(map) = drain_to_latest_redraw(incoming, |_| true) {
-            return message(&map);
-        }
-    }
-    panic!("no redraw arrived for {keys:?}");
 }
 
 /// `:silent! {cmd}` swallows the error a bare `{cmd}` would echo — a plugin manager

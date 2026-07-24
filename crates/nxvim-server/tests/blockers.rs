@@ -10,28 +10,8 @@
 //! The `start_with_config` / `feed` / `exec_lua` helpers are copied from the
 //! established pattern (integration-test files don't share a module).
 
-use nxvim_rpc::{Incoming, Rpc};
-use nxvim_server::ServerInit;
-use nxvim_test_harness::{attach, exec_lua, feed, spawn, temp_dir};
+use nxvim_test_harness::{exec_lua, feed, start_with_config, temp_dir};
 use rmpv::Value;
-use tokio::sync::mpsc::UnboundedReceiver;
-
-/// Start a server on its own thread, sourcing `init_lua` from a throwaway config
-/// dir (also the runtimepath), and return a connected client.
-async fn start_with_config(
-    dir: &std::path::Path,
-    init_lua: &str,
-) -> (Rpc, UnboundedReceiver<Incoming>) {
-    std::fs::write(dir.join("init.lua"), init_lua).expect("write init.lua");
-    let init = ServerInit {
-        config_dir: Some(dir.to_path_buf()),
-        runtimepath: vec![dir.to_path_buf()],
-        ..Default::default()
-    };
-    let (rpc, incoming) = spawn(init);
-    attach(&rpc, 80, 24).await;
-    (rpc, incoming)
-}
 
 fn as_str(v: &Value) -> String {
     v.as_str().unwrap_or("").to_string()

@@ -11,30 +11,12 @@
 //! so the `start*/feed/...` helpers are copied from the established pattern.
 
 use nxvim_rpc::{Incoming, Rpc};
-use nxvim_server::ServerInit;
 use nxvim_test_harness::{
-    attach, cursor, drain_to_latest_redraw, exec_lua, feed, lines, lua_bool, lua_u64, mode, spawn,
-    temp_dir,
+    config_init, cursor, exec_lua, feed, lines, lua_bool, lua_u64, mode, redraw_after,
+    start_with_config, temp_dir,
 };
 use rmpv::Value;
 use tokio::sync::mpsc::UnboundedReceiver;
-
-/// Start a server on its own thread, sourcing `init_lua` from a throwaway config
-/// dir (also the runtimepath), and return a connected client.
-async fn start_with_config(
-    dir: &std::path::Path,
-    init_lua: &str,
-) -> (Rpc, UnboundedReceiver<Incoming>) {
-    std::fs::write(dir.join("init.lua"), init_lua).expect("write init.lua");
-    let init = ServerInit {
-        config_dir: Some(dir.to_path_buf()),
-        runtimepath: vec![dir.to_path_buf()],
-        ..Default::default()
-    };
-    let (rpc, incoming) = spawn(init);
-    attach(&rpc, 80, 24).await;
-    (rpc, incoming)
-}
 
 /// Send the synthetic idle flush (`nxvim_input_flush`) the TUI fires after
 /// `timeoutlen` with no further input — resolving any key the matcher withheld as
@@ -45,42 +27,6 @@ async fn flush(rpc: &Rpc) {
     rpc.request("nxvim_input_flush", vec![])
         .await
         .expect("input flush");
-}
-
-/// Feed `keys`, then return the `redraw` map the server emitted for that input.
-///
-/// The server processes messages serially, writing each message's response then
-/// its `redraw`; we send `nx_input` then a `nvim_get_mode` barrier, so once the
-/// barrier `.await` resolves the input's redraw is already queued. We take the
-/// *most recent* queued redraw, not the first: a frame still in flight from
-/// earlier in the test (the startup frame, or a previous call's trailing barrier
-/// repaint) can land in `incoming` after the pre-drain below when the reader task
-/// lags under load, and taking the first would then return that stale frame. The
-/// input's redraw is the newest one present (the barrier changes no state and its
-/// repaint trails), so draining to the latest skips the stragglers.
-async fn redraw_after(
-    rpc: &Rpc,
-    incoming: &mut UnboundedReceiver<Incoming>,
-    keys: &str,
-) -> Vec<(Value, Value)> {
-    while incoming.try_recv().is_ok() {} // drop notifications buffered earlier
-    rpc.request("nx_input", vec![Value::from(keys)])
-        .await
-        .expect("input");
-    rpc.request("nvim_get_mode", vec![]).await.expect("barrier");
-    if let Some(map) = drain_to_latest_redraw(incoming, |_| true) {
-        return map;
-    }
-    // The barrier guarantees the input's redraw is queued before its response, so
-    // the drain above should have found it. Under heavy load the reader task can
-    // lag; poll a bounded while rather than failing on the first miss.
-    for _ in 0..200 {
-        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        if let Some(map) = drain_to_latest_redraw(incoming, |_| true) {
-            return map;
-        }
-    }
-    panic!("no redraw arrived for {keys:?}");
 }
 
 fn field<'a>(map: &'a [(Value, Value)], key: &str) -> Option<&'a Value> {
@@ -1042,29 +988,55 @@ async fn text_object_diw_fires_instantly_under_a_colliding_object_map() {
 }
 
 /// Mode-awareness: the same `gh` map collides in **both** normal and visual, and
-/// the oracle uses the mode-conditioned grammar. In visual, `gg` extends the
-/// selection to the top instantly (motions are identical across modes).
+/// the oracle uses the mode-conditioned grammar — `gg` extends the selection to
+/// its target instantly in charwise and linewise visual alike, with or without a
+/// count (the count is not a map prefix, so it reaches the editor immediately
+/// and its own pending count carries `3gg` to line 3).
 #[tokio::test]
-async fn visual_gg_extends_to_top_instantly_under_a_colliding_g_map() {
-    let dir = temp_dir("keymap_visual_gg");
-    let (rpc, _incoming) = start_with_config(
-        &dir,
-        "vim.keymap.set({ 'n', 'v' }, 'gh', function() print('GH') end)\n",
-    )
-    .await;
+async fn visual_gg_variants_extend_instantly_under_a_colliding_g_map() {
+    for (tag, seed, start_line, keys, want_line, want_mode) in [
+        (
+            "charwise",
+            "iline1<CR>line2<CR>line3<Esc>",
+            3,
+            "vgg",
+            1,
+            "v",
+        ),
+        (
+            "linewise",
+            "iline1<CR>line2<CR>line3<Esc>",
+            3,
+            "Vgg",
+            1,
+            "V",
+        ),
+        ("counted", "ia<CR>b<CR>c<CR>d<CR>e<Esc>", 5, "v3gg", 3, "v"),
+    ] {
+        let dir = temp_dir("keymap_visual_gg");
+        let (rpc, _incoming) = start_with_config(
+            &dir,
+            "vim.keymap.set({ 'n', 'v' }, 'gh', function() print('GH') end)\n",
+        )
+        .await;
 
-    feed(&rpc, "iline1<CR>line2<CR>line3<Esc>");
-    assert_eq!(cursor(&rpc).await.0, 3, "cursor starts on the last line");
+        feed(&rpc, seed);
+        assert_eq!(
+            cursor(&rpc).await.0,
+            start_line,
+            "[{tag}] cursor starts on the last line"
+        );
 
-    // `v` enters visual, then `gg` extends to the top instantly — the second `g`
-    // releases as a built-in under the visual `gh` collision.
-    feed(&rpc, "vgg");
-    assert_eq!(
-        cursor(&rpc).await.0,
-        1,
-        "visual gg extended the selection to the top, instantly"
-    );
-    assert_eq!(mode(&rpc).await, "v", "still in visual mode");
+        // Enter visual, then `gg` resolves instantly — the second `g` releases as
+        // a built-in under the visual `gh` collision, no idle flush.
+        feed(&rpc, keys);
+        assert_eq!(
+            cursor(&rpc).await.0,
+            want_line,
+            "[{tag}] {keys} extended the selection instantly"
+        );
+        assert_eq!(mode(&rpc).await, want_mode, "[{tag}] visual mode kept");
+    }
 }
 
 /// Mode-awareness for text objects: in visual `i`/`a` start an object, and with
@@ -1335,57 +1307,6 @@ async fn remap_to_a_builtin_is_instant() {
         (1, 0),
         "Q remapped to gg, which resolved to the built-in go-to-top instantly"
     );
-}
-
-/// Visual-**line** mode is covered too: with `gh` mapped in visual, `V` then `gg`
-/// extends the line selection to the top instantly. The oracle is mode-aware —
-/// it classifies against the `VisualLine` grammar (motions are identical there).
-#[tokio::test]
-async fn visual_line_gg_extends_to_top_instantly_under_a_colliding_g_map() {
-    let dir = temp_dir("keymap_vline_gg");
-    let (rpc, _incoming) = start_with_config(
-        &dir,
-        "vim.keymap.set({ 'n', 'v' }, 'gh', function() print('GH') end)\n",
-    )
-    .await;
-
-    feed(&rpc, "iline1<CR>line2<CR>line3<Esc>");
-    assert_eq!(cursor(&rpc).await.0, 3, "cursor starts on the last line");
-
-    // `V` enters visual-line; `gg` extends the selection to the top, instantly.
-    feed(&rpc, "Vgg");
-    assert_eq!(
-        cursor(&rpc).await.0,
-        1,
-        "visual-line gg extended the selection to the top, instantly"
-    );
-    assert_eq!(mode(&rpc).await, "V", "still in visual-line mode");
-}
-
-/// Count + selection: a count typed before the colliding built-in still lands.
-/// The count is not a map prefix, so it reaches the editor immediately; the `gg`
-/// then resolves via the oracle, and the editor's own pending count makes `3gg`
-/// go to line 3 while extending the visual selection.
-#[tokio::test]
-async fn visual_count_gg_under_a_colliding_g_map() {
-    let dir = temp_dir("keymap_vcount_gg");
-    let (rpc, _incoming) = start_with_config(
-        &dir,
-        "vim.keymap.set({ 'n', 'v' }, 'gh', function() print('GH') end)\n",
-    )
-    .await;
-
-    feed(&rpc, "ia<CR>b<CR>c<CR>d<CR>e<Esc>"); // five lines; cursor on line 5
-    assert_eq!(cursor(&rpc).await.0, 5, "cursor starts on the last line");
-
-    // `v` selects; `3gg` jumps to line 3 (count carried by the editor), instantly.
-    feed(&rpc, "v3gg");
-    assert_eq!(
-        cursor(&rpc).await.0,
-        3,
-        "count + gg landed on line 3 under the colliding gh map, no flush"
-    );
-    assert_eq!(mode(&rpc).await, "v", "still in visual mode");
 }
 
 /// The search-operator hand-off (`d/{pattern}`) is instant under a colliding `d`
@@ -1681,13 +1602,7 @@ async fn start_with_config_kbd(
     dir: &std::path::Path,
     init_lua: &str,
 ) -> (Rpc, UnboundedReceiver<Incoming>) {
-    std::fs::write(dir.join("init.lua"), init_lua).expect("write init.lua");
-    let init = ServerInit {
-        config_dir: Some(dir.to_path_buf()),
-        runtimepath: vec![dir.to_path_buf()],
-        ..Default::default()
-    };
-    let (rpc, incoming) = spawn(init);
+    let (rpc, incoming) = nxvim_test_harness::spawn(config_init(dir, init_lua));
     nxvim_test_harness::attach_keyboard_protocol(&rpc, 80, 24).await;
     (rpc, incoming)
 }

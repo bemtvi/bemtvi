@@ -9,10 +9,10 @@
 
 use nxvim_rpc::{Incoming, Rpc};
 use nxvim_server::ServerInit;
-use nxvim_test_harness::{exec_lua, feed, map_get, start_attached};
+use nxvim_test_harness::{
+    exec_lua, feed, feed_sync, map_get, message_after, start_attached, write_temp,
+};
 use rmpv::Value;
-use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::sync::mpsc::UnboundedReceiver;
 
 /// Start a server on its own thread and return a connected client.
@@ -111,25 +111,6 @@ async fn splits_grow_the_current_tabs_window_set() {
 }
 
 // ----- Phase 2: creation & switching ----------------------------------------
-
-/// A unique temp file seeded with `contents`, returned as an absolute path
-/// string. Unique per call so parallel tests don't collide.
-fn temp_file(tag: &str, contents: &str) -> String {
-    static N: AtomicU64 = AtomicU64::new(0);
-    let n = N.fetch_add(1, Ordering::Relaxed);
-    let path: PathBuf =
-        std::env::temp_dir().join(format!("nxvim_tab_{tag}_{}_{n}.txt", std::process::id()));
-    std::fs::write(&path, contents).expect("write temp file");
-    path.display().to_string()
-}
-
-/// Feed `keys` and wait for the editor to settle (a `nvim_get_mode` barrier).
-async fn feed_sync(rpc: &Rpc, keys: &str) {
-    rpc.request("nx_input", vec![Value::from(keys)])
-        .await
-        .expect("input");
-    rpc.request("nvim_get_mode", vec![]).await.expect("barrier");
-}
 
 #[tokio::test]
 async fn tabnew_creates_a_second_tab_and_switches_to_it() {
@@ -365,7 +346,7 @@ async fn tabline_is_empty_with_one_tab() {
 
 #[tokio::test]
 async fn tabline_lists_both_tabs_with_labels_and_active_index() {
-    let file = temp_file("label", "hello\n");
+    let file = write_temp("label", "txt", "hello\n");
     let (rpc, mut incoming) = start().await;
 
     let (cells, current) =
@@ -459,35 +440,6 @@ async fn showtabline_two_shows_the_tabline_with_one_tab() {
     );
     assert_eq!(current, 0, "the only tab is active (index 0)");
     assert_eq!(cells[0].label, "[No Name]");
-}
-
-/// Feed `keys`, settle, and return the freshest redraw's `message` line.
-async fn message_after(
-    rpc: &Rpc,
-    incoming: &mut UnboundedReceiver<Incoming>,
-    keys: &str,
-) -> String {
-    while incoming.try_recv().is_ok() {}
-    feed_sync(rpc, keys).await;
-    for _ in 0..200 {
-        let mut latest = None;
-        while let Ok(msg) = incoming.try_recv() {
-            if let Incoming::Notification { method, params } = msg {
-                if method == "redraw" {
-                    if let Some(Value::Map(map)) = params.into_iter().next() {
-                        latest = map_get(&map, "message")
-                            .and_then(Value::as_str)
-                            .map(str::to_string);
-                    }
-                }
-            }
-        }
-        if let Some(m) = latest {
-            return m;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-    }
-    panic!("no redraw with a message arrived for {keys:?}");
 }
 
 #[tokio::test]
@@ -743,7 +695,7 @@ async fn tab_split_clones_the_current_buffer_and_view_into_a_new_tab() {
 
 #[tokio::test]
 async fn drop_focuses_an_existing_window_in_another_tab() {
-    let file = temp_file("drop_jump", "alpha\nbeta\n");
+    let file = write_temp("drop_jump", "txt", "alpha\nbeta\n");
     let (rpc, _incoming) = start().await;
 
     feed_sync(&rpc, &format!(":tabedit {file}<CR>")).await; // tab 2 shows the file
@@ -770,7 +722,7 @@ async fn drop_focuses_an_existing_window_in_another_tab() {
 
 #[tokio::test]
 async fn drop_edits_the_file_in_place_when_not_open_anywhere() {
-    let file = temp_file("drop_edit", "alpha\nbeta\n");
+    let file = write_temp("drop_edit", "txt", "alpha\nbeta\n");
     let (rpc, _incoming) = start().await;
 
     feed_sync(&rpc, &format!(":drop {file}<CR>")).await;
@@ -791,7 +743,7 @@ async fn drop_edits_the_file_in_place_when_not_open_anywhere() {
 
 #[tokio::test]
 async fn tab_drop_opens_an_unopened_file_in_a_new_tab() {
-    let file = temp_file("tabdrop_new", "alpha\nbeta\n");
+    let file = write_temp("tabdrop_new", "txt", "alpha\nbeta\n");
     let (rpc, _incoming) = start().await;
 
     feed_sync(&rpc, &format!(":tab drop {file}<CR>")).await;
@@ -809,7 +761,7 @@ async fn tab_drop_opens_an_unopened_file_in_a_new_tab() {
 
 #[tokio::test]
 async fn tab_drop_focuses_an_existing_window_instead_of_opening_a_tab() {
-    let file = temp_file("tabdrop_jump", "alpha\nbeta\n");
+    let file = write_temp("tabdrop_jump", "txt", "alpha\nbeta\n");
     let (rpc, _incoming) = start().await;
 
     feed_sync(&rpc, &format!(":tabedit {file}<CR>")).await; // tab 2 shows the file
@@ -837,8 +789,8 @@ async fn tab_drop_focuses_an_existing_window_instead_of_opening_a_tab() {
 /// surviving tab showing its own buffer.
 #[tokio::test]
 async fn bdelete_of_a_tabs_only_buffer_closes_the_tab() {
-    let a = temp_file("bd_a", "aaa\n");
-    let b = temp_file("bd_b", "bbb\n");
+    let a = write_temp("bd_a", "txt", "aaa\n");
+    let b = write_temp("bd_b", "txt", "bbb\n");
     let (rpc, _incoming) = start().await;
 
     feed_sync(&rpc, &format!(":edit {a}<CR>")).await; // tab 1 shows A
@@ -870,8 +822,8 @@ async fn bdelete_of_a_tabs_only_buffer_closes_the_tab() {
 /// the next read panicked in the buffer store).
 #[tokio::test]
 async fn percent_bdelete_across_tabs_leaves_a_valid_buffer() {
-    let a = temp_file("pbd_a", "aaa\n");
-    let b = temp_file("pbd_b", "bbb\n");
+    let a = write_temp("pbd_a", "txt", "aaa\n");
+    let b = write_temp("pbd_b", "txt", "bbb\n");
     let (rpc, _incoming) = start().await;
 
     feed_sync(&rpc, &format!(":edit {a}<CR>")).await; // tab 1 shows A
@@ -894,8 +846,8 @@ async fn percent_bdelete_across_tabs_leaves_a_valid_buffer() {
 /// open and loads a sibling buffer into its window.
 #[tokio::test]
 async fn nobdclosetab_keeps_the_tab_and_loads_a_sibling() {
-    let a = temp_file("nbd_a", "aaa\n");
-    let b = temp_file("nbd_b", "bbb\n");
+    let a = write_temp("nbd_a", "txt", "aaa\n");
+    let b = write_temp("nbd_b", "txt", "bbb\n");
     let (rpc, _incoming) = start().await;
 
     feed_sync(&rpc, &format!(":edit {a}<CR>")).await; // tab 1 shows A
@@ -919,8 +871,8 @@ async fn nobdclosetab_keeps_the_tab_and_loads_a_sibling() {
 /// closes a tab only when its every window showed the deleted buffer.
 #[tokio::test]
 async fn bdelete_does_not_close_a_tab_with_other_buffers_in_a_split() {
-    let a = temp_file("bds_a", "aaa\n");
-    let b = temp_file("bds_b", "bbb\n");
+    let a = write_temp("bds_a", "txt", "aaa\n");
+    let b = write_temp("bds_b", "txt", "bbb\n");
     let (rpc, _incoming) = start().await;
 
     feed_sync(&rpc, &format!(":edit {a}<CR>")).await; // tab 1 shows A
@@ -954,8 +906,8 @@ async fn lua_sync(rpc: &Rpc, code: &str) {
 /// switches to that tab — the default `'switchbuf'` is `usetab`.
 #[tokio::test]
 async fn jump_with_usetab_switches_to_the_tab_already_showing_the_buffer() {
-    let a = temp_file("swb_usetab_a", "alpha\nbeta\ngamma\n");
-    let b = temp_file("swb_usetab_b", "one\ntwo\n");
+    let a = write_temp("swb_usetab_a", "txt", "alpha\nbeta\ngamma\n");
+    let b = write_temp("swb_usetab_b", "txt", "one\ntwo\n");
     let (rpc, _incoming) = start().await;
 
     feed_sync(&rpc, &format!(":edit {a}<CR>")).await; // tab 1 shows A
@@ -991,8 +943,8 @@ async fn jump_with_usetab_switches_to_the_tab_already_showing_the_buffer() {
 /// solely in another tab is opened in the current window instead.
 #[tokio::test]
 async fn jump_with_useopen_stays_in_the_current_tab() {
-    let a = temp_file("swb_useopen_a", "alpha\nbeta\n");
-    let b = temp_file("swb_useopen_b", "one\ntwo\n");
+    let a = write_temp("swb_useopen_a", "txt", "alpha\nbeta\n");
+    let b = write_temp("swb_useopen_b", "txt", "one\ntwo\n");
     let (rpc, _incoming) = start().await;
 
     feed_sync(&rpc, &format!(":edit {a}<CR>")).await; // tab 1 shows A
@@ -1021,8 +973,8 @@ async fn jump_with_useopen_stays_in_the_current_tab() {
 /// buffer is shown in another tab (the gating guard).
 #[tokio::test]
 async fn jump_with_empty_switchbuf_opens_in_current_window() {
-    let a = temp_file("swb_empty_a", "alpha\nbeta\n");
-    let b = temp_file("swb_empty_b", "one\ntwo\n");
+    let a = write_temp("swb_empty_a", "txt", "alpha\nbeta\n");
+    let b = write_temp("swb_empty_b", "txt", "one\ntwo\n");
     let (rpc, _incoming) = start().await;
 
     feed_sync(&rpc, &format!(":edit {a}<CR>")).await;
@@ -1056,8 +1008,8 @@ async fn switchbuf_defaults_to_usetab() {
 /// swapping it into the current window.
 #[tokio::test]
 async fn buffer_command_with_usetab_switches_to_the_existing_tab() {
-    let a = temp_file("swb_b_a", "alpha\nbeta\n");
-    let b = temp_file("swb_b_b", "one\ntwo\n");
+    let a = write_temp("swb_b_a", "txt", "alpha\nbeta\n");
+    let b = write_temp("swb_b_b", "txt", "one\ntwo\n");
     let (rpc, _incoming) = start().await;
 
     feed_sync(&rpc, &format!(":edit {a}<CR>")).await; // tab 1 shows A
@@ -1086,8 +1038,8 @@ async fn buffer_command_with_usetab_switches_to_the_existing_tab() {
 /// With `'switchbuf'` empty, `:buffer N` swaps into the current window — no tab hop.
 #[tokio::test]
 async fn buffer_command_with_empty_switchbuf_stays_in_current_tab() {
-    let a = temp_file("swb_be_a", "alpha\nbeta\n");
-    let b = temp_file("swb_be_b", "one\ntwo\n");
+    let a = write_temp("swb_be_a", "txt", "alpha\nbeta\n");
+    let b = write_temp("swb_be_b", "txt", "one\ntwo\n");
     let (rpc, _incoming) = start().await;
 
     feed_sync(&rpc, &format!(":edit {a}<CR>")).await;
@@ -1111,8 +1063,8 @@ async fn buffer_command_with_empty_switchbuf_stays_in_current_tab() {
 /// tab's. A buffer shown only in tab 1 must still be found from tab 2.
 #[tokio::test]
 async fn win_findbuf_spans_tabs() {
-    let a = temp_file("findbuf_a", "alpha\nbeta\n");
-    let b = temp_file("findbuf_b", "one\ntwo\n");
+    let a = write_temp("findbuf_a", "txt", "alpha\nbeta\n");
+    let b = write_temp("findbuf_b", "txt", "one\ntwo\n");
     let (rpc, _incoming) = start().await;
 
     feed_sync(&rpc, &format!(":edit {a}<CR>")).await; // tab 1 shows A
@@ -1144,8 +1096,8 @@ async fn win_findbuf_spans_tabs() {
 /// path and over the direct RPC.
 #[tokio::test]
 async fn set_current_win_crosses_tabs() {
-    let a = temp_file("setwin_a", "alpha\nbeta\n");
-    let b = temp_file("setwin_b", "one\ntwo\n");
+    let a = write_temp("setwin_a", "txt", "alpha\nbeta\n");
+    let b = write_temp("setwin_b", "txt", "one\ntwo\n");
     let (rpc, _incoming) = start().await;
 
     feed_sync(&rpc, &format!(":edit {a}<CR>")).await; // tab 1 shows A

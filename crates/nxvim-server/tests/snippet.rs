@@ -9,7 +9,8 @@
 use nxvim_rpc::{Incoming, Rpc};
 use nxvim_server::ServerInit;
 use nxvim_test_harness::{
-    attach, cursor, drain_to_latest_redraw, exec_lua, feed, lines, map_get, spawn, temp_dir,
+    attach, cursor, drain_to_latest_redraw, exec_lua, feed, lines, map_get, menu_of, poll_menu,
+    spawn, temp_dir,
 };
 use rmpv::Value;
 use tokio::sync::mpsc::UnboundedReceiver;
@@ -158,22 +159,6 @@ async fn multiline_body_reindents_continuation_lines() {
     );
 }
 
-/// Poll for the latest redraw carrying a completion `menu` map.
-async fn poll_menu(rpc: &Rpc, incoming: &mut UnboundedReceiver<Incoming>) -> bool {
-    for _ in 0..60 {
-        nxvim_test_harness::barrier(rpc).await;
-        if drain_to_latest_redraw(incoming, |m| {
-            matches!(map_get(m, "menu"), Some(Value::Map(_)))
-        })
-        .is_some()
-        {
-            return true;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-    }
-    false
-}
-
 #[tokio::test]
 async fn snippets_completion_source_expands_on_accept() {
     let dir = temp_dir("snippet-source");
@@ -185,29 +170,15 @@ async fn snippets_completion_source_expands_on_accept() {
     let (rpc, mut incoming) = start(&dir, init).await;
 
     feed(&rpc, "ifn");
-    assert!(poll_menu(&rpc, &mut incoming).await, "snippet menu opened");
+    assert!(
+        poll_menu(&rpc, &mut incoming).await.is_some(),
+        "snippet menu opened"
+    );
 
     // Select the row and accept: the trigger word is replaced by the expanded body.
     feed(&rpc, "<C-n>");
     feed(&rpc, "<C-y>");
     assert_eq!(lines(&rpc).await, vec!["function () end".to_string()]);
-}
-
-/// Poll for the latest redraw carrying a completion `menu` map, returning the map.
-async fn poll_menu_map(
-    rpc: &Rpc,
-    incoming: &mut UnboundedReceiver<Incoming>,
-) -> Option<Vec<(Value, Value)>> {
-    for _ in 0..60 {
-        nxvim_test_harness::barrier(rpc).await;
-        if let Some(map) = drain_to_latest_redraw(incoming, |m| {
-            matches!(map_get(m, "menu"), Some(Value::Map(_)))
-        }) {
-            return Some(map);
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-    }
-    None
 }
 
 /// The `menu.kinds` array (per-row kind labels), or empty when the key is absent.
@@ -235,7 +206,7 @@ async fn snippet_row_projects_snippet_kind() {
     // `label + " Snippet"`, so the client can render the kind column (a too-narrow box
     // is what hid the kind for the short `loc` trigger in examples/snippets).
     feed(&rpc, "ifn");
-    let map = poll_menu_map(&rpc, &mut incoming)
+    let map = poll_menu(&rpc, &mut incoming)
         .await
         .expect("snippet menu opened");
     let menu = menu_of(&map);
@@ -250,29 +221,9 @@ async fn snippet_row_projects_snippet_kind() {
         "the popup must be wide enough for label + kind (got width {width})"
     );
 }
-
-/// The `menu` submap of a redraw (panics if absent), for width/geometry assertions.
-fn menu_of(map: &[(Value, Value)]) -> Vec<(Value, Value)> {
-    match map_get(map, "menu") {
-        Some(Value::Map(m)) => m.clone(),
-        other => panic!("expected a menu map, got {other:?}"),
-    }
-}
-
-/// The menu's visible row labels, in order.
+/// The visible row labels of the redraw map's menu (harness pair, whole-frame form).
 fn menu_items(map: &[(Value, Value)]) -> Vec<String> {
-    let menu = menu_of(map);
-    match map_get(&menu, "items") {
-        Some(Value::Array(items)) => items
-            .iter()
-            .map(|row| match row {
-                Value::Array(a) => a.first().and_then(Value::as_str).unwrap_or("").to_string(),
-                Value::String(s) => s.as_str().unwrap_or("").to_string(),
-                other => panic!("unexpected menu row {other:?}"),
-            })
-            .collect(),
-        other => panic!("expected menu items array, got {other:?}"),
-    }
+    nxvim_test_harness::menu_items(&menu_of(map))
 }
 
 /// A choice tabstop (`${1|a,b,c|}`) opens a dropdown of its alternatives; navigating
@@ -288,7 +239,7 @@ async fn choice_tabstop_dropdown_pick_replaces_and_mirrors() {
     assert_eq!(lines(&rpc).await, vec!["a-a".to_string()]);
 
     // A dropdown of the alternatives is open.
-    let map = poll_menu_map(&rpc, &mut incoming)
+    let map = poll_menu(&rpc, &mut incoming)
         .await
         .expect("choice dropdown opens");
     assert_eq!(menu_items(&map), vec!["a", "b", "c"]);
@@ -307,7 +258,10 @@ async fn choice_tabstop_tab_keeps_value_and_jumps() {
 
     expand(&rpc, "x=${1|a,b,c|};$0").await;
     assert_eq!(lines(&rpc).await, vec!["x=a;".to_string()]);
-    assert!(poll_menu(&rpc, &mut incoming).await, "dropdown opens");
+    assert!(
+        poll_menu(&rpc, &mut incoming).await.is_some(),
+        "dropdown opens"
+    );
 
     // Tab keeps `a` and jumps to $0 (after the `;`), ending the session there.
     feed(&rpc, "<Tab>");
@@ -365,7 +319,10 @@ async fn selecting_a_snippet_row_previews_its_body_in_the_docs_float() {
     let (rpc, mut incoming) = start(&dir, init).await;
 
     feed(&rpc, "ifn");
-    assert!(poll_menu(&rpc, &mut incoming).await, "snippet menu opened");
+    assert!(
+        poll_menu(&rpc, &mut incoming).await.is_some(),
+        "snippet menu opened"
+    );
     // Highlight the snippet row so its docs float opens (the popup is noselect until
     // navigated).
     feed(&rpc, "<C-n>");

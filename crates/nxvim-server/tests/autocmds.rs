@@ -9,84 +9,12 @@
 //! here are copied from the `editing.rs` pattern rather than imported.
 
 use nxvim_rpc::{Incoming, Rpc};
-use nxvim_server::ServerInit;
 use nxvim_test_harness::{
-    attach, command, drain_to_latest_redraw, exec_lua, message, spawn, temp_dir,
+    command, exec_lua, message, redraw_after, start_with_config, start_with_file_and_config,
+    temp_dir,
 };
 use rmpv::Value;
 use tokio::sync::mpsc::UnboundedReceiver;
-
-/// Start a server on its own thread, sourcing `init_lua` from a throwaway config
-/// dir (also used as the runtimepath), and return a connected client.
-async fn start_with_config(
-    dir: &std::path::Path,
-    init_lua: &str,
-) -> (Rpc, UnboundedReceiver<Incoming>) {
-    std::fs::write(dir.join("init.lua"), init_lua).expect("write init.lua");
-    let init = ServerInit {
-        config_dir: Some(dir.to_path_buf()),
-        runtimepath: vec![dir.to_path_buf()],
-        ..Default::default()
-    };
-    let (rpc, incoming) = spawn(init);
-    attach(&rpc, 80, 24).await;
-    (rpc, incoming)
-}
-
-/// Like [`start_with_config`] but also opens `file` in the initial buffer, so the
-/// startup lifecycle seed (`BufReadPost`→`FileType`→`BufEnter`) fires for it.
-async fn start_with_file_and_config(
-    dir: &std::path::Path,
-    file: &str,
-    init_lua: &str,
-) -> (Rpc, UnboundedReceiver<Incoming>) {
-    std::fs::write(dir.join("init.lua"), init_lua).expect("write init.lua");
-    let init = ServerInit {
-        file: Some(file.to_string()),
-        config_dir: Some(dir.to_path_buf()),
-        runtimepath: vec![dir.to_path_buf()],
-        ..Default::default()
-    };
-    let (rpc, incoming) = spawn(init);
-    attach(&rpc, 80, 24).await;
-    (rpc, incoming)
-}
-
-/// Feed `keys`, then return the `redraw` map the server emitted for that input.
-///
-/// The server processes messages serially, writing each message's response then
-/// its `redraw`; we send `nx_input` then a `nvim_get_mode` barrier, so once the
-/// barrier `.await` resolves the input's redraw is already queued. We take the
-/// *most recent* queued redraw, not the first: a frame still in flight from
-/// earlier in the test (the startup frame, or a previous call's trailing barrier
-/// repaint) can land in `incoming` after the pre-drain below when the reader task
-/// lags under load, and taking the first would then return that stale frame. The
-/// input's redraw is the newest one present (the barrier changes no state and its
-/// repaint trails), so draining to the latest skips the stragglers.
-async fn redraw_after(
-    rpc: &Rpc,
-    incoming: &mut UnboundedReceiver<Incoming>,
-    keys: &str,
-) -> Vec<(Value, Value)> {
-    while incoming.try_recv().is_ok() {} // drop notifications buffered earlier
-    rpc.request("nx_input", vec![Value::from(keys)])
-        .await
-        .expect("input");
-    rpc.request("nvim_get_mode", vec![]).await.expect("barrier");
-    if let Some(map) = drain_to_latest_redraw(incoming, |_| true) {
-        return map;
-    }
-    // The barrier guarantees the input's redraw is queued before its response, so
-    // the drain above should have found it. Under heavy load the reader task can
-    // lag; poll a bounded while rather than failing on the first miss.
-    for _ in 0..200 {
-        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        if let Some(map) = drain_to_latest_redraw(incoming, |_| true) {
-            return map;
-        }
-    }
-    panic!("no redraw arrived for {keys:?}");
-}
 
 /// Feed a `:lua <chunk><CR>` line and return the resulting message line — the
 /// channel a fired callback's `print` lands on.
@@ -900,40 +828,6 @@ async fn ex_augroup_bang_deletes_the_group_and_its_autocmds() {
     assert_eq!(gone.as_u64(), Some(0), "the group's autocmd was removed");
     let id = exec_lua(&rpc, "return nx._augroups.Foo == nil").await;
     assert_eq!(id.as_bool(), Some(true), "the group name was deleted");
-}
-
-#[tokio::test]
-async fn example_autocmd_config_loads_and_lifecycle_events_fire() {
-    // The shipped examples/autocmd config must load, and its §5 lifecycle autocmds
-    // must fire end-to-end: editing the buffer triggers TextChanged (notified onto
-    // the message line) and `:w` triggers the `*.txt` BufWritePost. The example's
-    // `init.lua` is copied into a throwaway dir alongside a throwaway `.txt` sample,
-    // so the test's `:w` never touches the shipped file (hermetic — see the harness).
-    let example = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../../examples/autocmd/init.lua")
-        .canonicalize()
-        .expect("examples/autocmd/init.lua");
-    let init_lua = std::fs::read_to_string(&example).expect("read example init.lua");
-    let dir = temp_dir("au_example");
-    let sample = dir.join("sample.txt");
-    std::fs::write(&sample, "hello from the autocmd example\n").expect("write sample");
-    let (rpc, mut incoming) =
-        start_with_file_and_config(&dir, sample.to_str().unwrap(), &init_lua).await;
-
-    // A Normal-mode edit fires the example's TextChanged handler.
-    let changed = message(&redraw_after(&rpc, &mut incoming, "x").await);
-    assert_eq!(
-        changed, "buffer changed",
-        "TextChanged notify reached the line"
-    );
-
-    // Saving the `.txt` sample fires the `*.txt` BufWritePost handler.
-    let saved = message(&redraw_after(&rpc, &mut incoming, ":w<CR>").await);
-    assert_eq!(
-        saved,
-        format!("saved {}", sample.display()),
-        "the *.txt BufWritePost glob fired on save"
-    );
 }
 
 // ----- write events: BufWritePre / BufWritePost -----------------------------

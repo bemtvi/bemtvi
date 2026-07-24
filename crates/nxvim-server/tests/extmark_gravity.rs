@@ -13,20 +13,9 @@
 //! back off the refreshed mirror. Flipping the flags flips the outcome — a genuine
 //! mutation test, not a tautology.
 
-use nxvim_rpc::{Incoming, Rpc};
-use nxvim_server::ServerInit;
-use nxvim_test_harness::{exec_lua, feed, start_attached, write_temp};
+use nxvim_rpc::Rpc;
+use nxvim_test_harness::{exec_lua, feed, start_with_file as open};
 use rmpv::Value;
-use tokio::sync::mpsc::UnboundedReceiver;
-
-async fn open(content: &str) -> (Rpc, UnboundedReceiver<Incoming>) {
-    let path = write_temp("extmark_gravity", "txt", content);
-    let init = ServerInit {
-        file: Some(path),
-        ..Default::default()
-    };
-    start_attached(init, 80, 24).await
-}
 
 /// `"row,col,end_row,end_col"` of mark `id` in the test namespace `_G.__ns`, read off
 /// the (server-refreshed) extmark mirror. `"nil"` if the mark is gone.

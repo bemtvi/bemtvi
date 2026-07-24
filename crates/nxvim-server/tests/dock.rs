@@ -11,8 +11,8 @@
 use nxvim_rpc::{Incoming, Rpc};
 use nxvim_server::ServerInit;
 use nxvim_test_harness::{
-    command, cursor, drain_to_latest_redraw, exec_lua, feed, feed_mouse, lines, lua_u64, map_get,
-    message, mode, serial_lock, start_attached, wait_redraw, write_temp,
+    command, cursor, drain_to_latest_redraw, exec_lua, feed, feed_mouse, feed_sync, lines, lua_u64,
+    map_get, message, mode, serial_lock, start_attached, wait_redraw, write_temp,
 };
 use rmpv::Value;
 use tokio::sync::mpsc::UnboundedReceiver;
@@ -23,15 +23,6 @@ async fn start() -> (Rpc, UnboundedReceiver<Incoming>) {
 
 async fn req(rpc: &Rpc, method: &str, args: Vec<Value>) -> Value {
     rpc.request(method, args).await.expect(method)
-}
-
-/// Feed `keys` and wait for the editor to settle (a `nvim_get_mode` barrier), so a
-/// following redraw drain sees this input's frame rather than a stale one.
-async fn feed_sync(rpc: &Rpc, keys: &str) {
-    rpc.request("nx_input", vec![Value::from(keys)])
-        .await
-        .expect("input");
-    rpc.request("nvim_get_mode", vec![]).await.expect("barrier");
 }
 
 /// `nvim_list_wins` as a vec of handles.
@@ -1137,18 +1128,19 @@ async fn nx_wo_winhighlight_remaps_a_plain_window() {
     );
 }
 
-// The shipped examples/dock-winhighlight config must load and render the sidebar:
-// its left dock carries the `Normal:NormalSB` override resolving NormalSB's
-// background (#181825), proving the example works end-to-end (not just that it loads).
+// A dock-scope `winhighlight` remap actually *renders*: the left dock's chrome
+// paints on the remapped `NormalSB` background (the VSCode-sidebar look), not just
+// round-trips through `nx.dock.opt` (covered above).
 #[tokio::test]
-async fn example_dock_winhighlight_config_renders_the_sidebar() {
+async fn dock_winhighlight_remap_renders_the_dock_chrome() {
     let (rpc, mut incoming) = start().await;
-    let example = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../../examples/dock-winhighlight/init.lua")
-        .canonicalize()
-        .expect("examples/dock-winhighlight/init.lua");
-    let init_lua = std::fs::read_to_string(&example).expect("read example init.lua");
-    exec_lua(&rpc, &init_lua).await;
+    exec_lua(
+        &rpc,
+        r##"nx.hl.define(0, "NormalSB", { bg = "#181825", fg = "#cdd6f4" })
+            nx.dock.open({ side = "left", size = 30 })
+            nx.dock.opt("left").winhighlight = "Normal:NormalSB""##,
+    )
+    .await;
     let rd = wait_redraw(&mut incoming, |m| {
         region_chrome_bg(m, "dock_left", "normal").is_some()
     })
@@ -1156,7 +1148,7 @@ async fn example_dock_winhighlight_config_renders_the_sidebar() {
     assert_eq!(
         region_chrome_bg(&rd, "dock_left", "normal"),
         Some(0x181825),
-        "the example's left dock paints on the NormalSB sidebar background"
+        "the left dock paints on the NormalSB sidebar background"
     );
 }
 

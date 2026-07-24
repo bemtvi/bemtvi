@@ -16,34 +16,11 @@
 
 use nxvim_rpc::{Incoming, Rpc};
 use nxvim_server::ServerInit;
-use nxvim_test_harness::{
-    drain_to_latest_redraw, exec_lua, lines, message, start_attached, temp_dir, write_temp,
-};
-use rmpv::Value;
+use nxvim_test_harness::{exec_lua, lines, message_after, start_attached, temp_dir, write_temp};
 use tokio::sync::mpsc::UnboundedReceiver;
 
 async fn start() -> (Rpc, UnboundedReceiver<Incoming>) {
     start_attached(ServerInit::default(), 80, 24).await
-}
-
-/// Feed `keys`, barrier, and return the latest redraw's message line.
-async fn message_after(
-    rpc: &Rpc,
-    incoming: &mut UnboundedReceiver<Incoming>,
-    keys: &str,
-) -> String {
-    while incoming.try_recv().is_ok() {}
-    rpc.request("nx_input", vec![Value::from(keys)])
-        .await
-        .expect("input");
-    rpc.request("nvim_get_mode", vec![]).await.expect("barrier");
-    for _ in 0..200 {
-        if let Some(map) = drain_to_latest_redraw(incoming, |_| true) {
-            return message(&map);
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-    }
-    panic!("no redraw arrived for {keys:?}");
 }
 
 /// Run the whole ex-command edit battery against the focused read-only buffer and

@@ -16,7 +16,7 @@ use nxvim_rpc::{Incoming, Rpc};
 use nxvim_server::ServerInit;
 use nxvim_test_harness::{
     attach, command, cursor, drain_to_latest_redraw, exec_lua, feed, feed_mouse, feed_mouse_mod,
-    lines, map_get, spawn, temp_dir,
+    lines, map_get, menu_items, menu_of, poll_menu, spawn, temp_dir,
 };
 use rmpv::Value;
 use tokio::sync::mpsc::UnboundedReceiver;
@@ -31,23 +31,6 @@ async fn start(dir: &std::path::Path, init_lua: &str) -> (Rpc, UnboundedReceiver
     let (rpc, incoming) = spawn(init);
     attach(&rpc, 80, 24).await;
     (rpc, incoming)
-}
-
-/// Poll for the latest redraw whose `menu` key is a map (the take-latest pattern).
-async fn poll_menu(
-    rpc: &Rpc,
-    incoming: &mut UnboundedReceiver<Incoming>,
-) -> Option<Vec<(Value, Value)>> {
-    for _ in 0..60 {
-        nxvim_test_harness::barrier(rpc).await;
-        if let Some(map) = drain_to_latest_redraw(incoming, |m| {
-            matches!(map_get(m, "menu"), Some(Value::Map(_)))
-        }) {
-            return Some(map);
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-    }
-    None
 }
 
 /// The `region` string of every window painted in a redraw map (`"main"` /
@@ -76,13 +59,6 @@ fn menu_marked(menu: &[(Value, Value)]) -> Vec<bool> {
     match map_get(menu, "marked") {
         Some(Value::Array(a)) => a.iter().map(|v| v.as_bool().unwrap_or(false)).collect(),
         _ => Vec::new(),
-    }
-}
-
-fn menu_of(map: &[(Value, Value)]) -> Vec<(Value, Value)> {
-    match map_get(map, "menu") {
-        Some(Value::Map(m)) => m.clone(),
-        other => panic!("expected a menu map, got {other:?}"),
     }
 }
 
@@ -144,22 +120,6 @@ async fn picker_styles_resolve_from_telescope_groups() {
         Some(0x0058_5b70),
         "the box border uses TelescopeBorder's fg"
     );
-}
-
-/// The menu's visible row labels, in order.
-fn menu_items(menu: &[(Value, Value)]) -> Vec<String> {
-    match map_get(menu, "items") {
-        Some(Value::Array(items)) => items
-            .iter()
-            .map(|row| match row {
-                // A row is `[label, ...]` or a bare label string.
-                Value::Array(a) => a.first().and_then(Value::as_str).unwrap_or("").to_string(),
-                Value::String(s) => s.as_str().unwrap_or("").to_string(),
-                other => panic!("unexpected menu row {other:?}"),
-            })
-            .collect(),
-        other => panic!("expected menu items array, got {other:?}"),
-    }
 }
 
 /// Register a static source over a fixed list of `{ text=… }` items.
@@ -477,61 +437,6 @@ nx.picker.source {{
         "jumped into the first entry's file (main layer)"
     );
     assert_eq!(cursor(&rpc).await.0, 1, "landed on the entry's line");
-}
-
-/// The shipped `examples/picker-to-named-list` config loads end-to-end (so it can't
-/// rot): sourcing its `init.lua` registers the custom source, the `nx.qf.send_*`
-/// API is present, and `'qfdock'` reads on by default.
-#[tokio::test]
-async fn example_picker_to_named_list_config_loads() {
-    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../../examples/picker-to-named-list");
-    let init = ServerInit {
-        config_dir: Some(root.clone()),
-        runtimepath: vec![root],
-        ..Default::default()
-    };
-    let (rpc, _incoming) = spawn(init);
-    attach(&rpc, 80, 24).await;
-    let ok = exec_lua(
-        &rpc,
-        r#"return tostring(nx.picker._sources.marks ~= nil)
-             .. "|" .. type(nx.qf.send_to_loclist)
-             .. "|" .. tostring(nx.o.qfdock)"#,
-    )
-    .await;
-    assert_eq!(
-        ok.as_str(),
-        Some("true|function|true"),
-        "example loaded: marks source + send_to_loclist + qfdock default-on"
-    );
-}
-
-/// The shipped `examples/ui-picker` config loads end-to-end (so it can't rot):
-/// its custom sources register, the `confirm_tab` (`<C-t>`) picker action exists,
-/// and `'switchbuf'` reads the `usetab` default.
-#[tokio::test]
-async fn example_ui_picker_config_loads() {
-    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/ui-picker");
-    let init = ServerInit {
-        config_dir: Some(root.clone()),
-        runtimepath: vec![root],
-        ..Default::default()
-    };
-    let (rpc, _incoming) = spawn(init);
-    attach(&rpc, 80, 24).await;
-    let ok = exec_lua(
-        &rpc,
-        r#"return tostring(nx.picker._sources.preview ~= nil)
-             .. "|" .. type(nx.picker.actions.confirm_tab)
-             .. "|" .. tostring(nx.o.switchbuf)"#,
-    )
-    .await;
-    assert_eq!(
-        ok.as_str(),
-        Some("true|function|usetab"),
-        "example loaded: preview source + confirm_tab action + switchbuf=usetab default"
-    );
 }
 
 /// Phase 5: `<Tab>` multi-selects picker rows (marking them and advancing), the
@@ -2913,64 +2818,6 @@ async fn resume_replays_the_snapshot_without_rerunning_a_dynamic_source() {
         exec_lua(&rpc, "return _G.run").await,
         Value::from(2),
         "a query edit after resume re-runs the live source",
-    );
-}
-
-/// The shipped `examples/telescope-parity` config loads end-to-end and its custom
-/// sources actually drive (so it can't rot): every ported source registers, the
-/// LSP picker verbs are functions, and two of the hand-written sources are exercised
-/// for real — `curbuf` navigates the cursor, and the visual-selection → register
-/// mechanism the `with_selection` prompt-seeder relies on captures the selection.
-#[tokio::test]
-async fn example_telescope_parity_config_drives() {
-    let root =
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/telescope-parity");
-    let init = ServerInit {
-        config_dir: Some(root.clone()),
-        runtimepath: vec![root],
-        ..Default::default()
-    };
-    let (rpc, mut incoming) = spawn(init);
-    attach(&rpc, 80, 24).await;
-
-    // Every ported source registered, and the LSP verbs are wired.
-    let ok = exec_lua(
-        &rpc,
-        r#"local s = nx.picker._sources
-           local names = { "files","git_files","live_grep","live_grep_uu","live_grep_ex",
-                           "curbuf","diagnostics","keymaps","pickers" }
-           for _, n in ipairs(names) do
-             if s[n] == nil then return "missing:" .. n end
-           end
-           return type(nx.lsp.references) .. "|" .. type(nx.lsp.document_symbol)"#,
-    )
-    .await;
-    assert_eq!(
-        ok.as_str(),
-        Some("function|function"),
-        "all ported sources register and the LSP verbs are functions"
-    );
-
-    // Give the buffer some lines, then drive `curbuf`: move down one row and confirm.
-    feed(&rpc, "ihello world<CR>foo bar<CR>baz qux<Esc>gg");
-    exec_lua(&rpc, "nx.picker.open('curbuf')").await;
-    poll_menu(&rpc, &mut incoming).await.expect("curbuf opens");
-    feed(&rpc, "<C-n>"); // apple -> second row
-    feed(&rpc, "<CR>");
-    let (line, _) = cursor(&rpc).await;
-    assert_eq!(
-        line, 2,
-        "confirming the second curbuf row jumps the cursor to line 2"
-    );
-
-    // The visual-selection capture behind `with_selection`: select a word, yank it
-    // into register z (exactly what the seeder feeds), read it back.
-    feed(&rpc, "gg0viw\"zy");
-    let sel = exec_lua(&rpc, "return nx.reg.get('z')").await;
-    assert_eq!(
-        sel.as_str(),
-        Some("hello"),
-        "the visual selection lands in register z for prompt seeding"
     );
 }
 

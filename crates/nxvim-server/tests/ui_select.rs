@@ -16,7 +16,7 @@
 use nxvim_rpc::{Incoming, Rpc};
 use nxvim_server::ServerInit;
 use nxvim_test_harness::{
-    attach, command, drain_to_latest_redraw, exec_lua, feed, feed_mouse, map_get, spawn, temp_dir,
+    attach, command, exec_lua, feed, feed_mouse, map_get, menu_of, poll_menu, spawn, temp_dir,
 };
 use rmpv::Value;
 use tokio::sync::mpsc::UnboundedReceiver;
@@ -33,35 +33,6 @@ async fn start(dir: &std::path::Path, init_lua: &str) -> (Rpc, UnboundedReceiver
     let (rpc, incoming) = spawn(init);
     attach(&rpc, 80, 24).await;
     (rpc, incoming)
-}
-
-/// Poll for the latest redraw whose `menu` key is a map, retrying a bounded
-/// number of times so the client reader task has settled (the take-latest
-/// pattern the harness conventions require). `None` once the channel is dry and
-/// no menu redraw was seen.
-async fn poll_menu(
-    rpc: &Rpc,
-    incoming: &mut UnboundedReceiver<Incoming>,
-) -> Option<Vec<(Value, Value)>> {
-    for _ in 0..40 {
-        // A barrier flushes the server's queued redraw onto the wire.
-        nxvim_test_harness::barrier(rpc).await;
-        if let Some(map) = drain_to_latest_redraw(incoming, |m| {
-            matches!(map_get(m, "menu"), Some(Value::Map(_)))
-        }) {
-            return Some(map);
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-    }
-    None
-}
-
-/// The `menu` sub-map of a redraw (already known to be a map).
-fn menu_of(map: &[(Value, Value)]) -> Vec<(Value, Value)> {
-    match map_get(map, "menu") {
-        Some(Value::Map(m)) => m.clone(),
-        other => panic!("expected a menu map, got {other:?}"),
-    }
 }
 
 #[tokio::test]

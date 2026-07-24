@@ -12,7 +12,7 @@
 use nxvim_rpc::{Incoming, Rpc};
 use nxvim_server::ServerInit;
 use nxvim_test_harness::{
-    attach, cursor, exec_lua, feed, lines, panel_is_open, spawn, temp_dir, write_n_lines,
+    attach, cursor, exec_lua, feed, lines, panel_is_open, spawn, write_n_lines,
 };
 use tokio::sync::mpsc::UnboundedReceiver;
 
@@ -153,56 +153,5 @@ async fn user_map_overrides_the_default() {
         cursor(&rpc).await.0,
         1,
         "the overridden default did not also jump"
-    );
-}
-
-/// The shipped `examples/diagnostic-nav/` config must load, seed its diagnostics on
-/// the sample buffer, and drive the built-in motions end-to-end — the project's
-/// "verified end-to-end" example convention. Loaded exactly as a user runs it:
-/// `NXVIM_CONFIG=examples/diagnostic-nav cargo run -p nxvim -- .../sample.txt`, i.e.
-/// the config dir's `init.lua` sources at startup, then the sample file opens and
-/// its `BufReadPost`/`BufEnter` autocmd seeds the diagnostics.
-#[tokio::test]
-async fn shipped_example_loads_and_navigates() {
-    let example_dir =
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/diagnostic-nav");
-
-    // Copy the sample into a temp file named `sample.txt` (the autocmd pattern is
-    // `*sample.txt`), so the test never edits the checked-in sample.
-    let sample = include_str!("../../../examples/diagnostic-nav/sample.txt");
-    let dir = temp_dir("diag_example");
-    let path = dir.join("sample.txt");
-    std::fs::write(&path, sample).expect("write sample");
-
-    let init = ServerInit {
-        config_dir: Some(example_dir),
-        file: Some(path.to_string_lossy().into_owned()),
-        ..Default::default()
-    };
-    let (rpc, _incoming) = spawn(init);
-    attach(&rpc, 80, 24).await;
-
-    // The config's autocmd seeded all seven diagnostics on the opened sample.
-    assert_eq!(
-        exec_lua(&rpc, "return #nx.diagnostic.get(0)")
-            .await
-            .as_u64(),
-        Some(7),
-        "the example seeds its diagnostics when the sample opens"
-    );
-
-    // The built-in motions drive them: `]d` lands on the first flagged line (0-based
-    // lnum 2 -> 1-based line 3), and `]e` from the top skips straight to an error.
-    feed(&rpc, "]d");
-    assert_eq!(cursor(&rpc).await.0, 3, "`]d` reaches the first diagnostic");
-    feed(&rpc, "gg");
-    feed(&rpc, "]e");
-    assert_eq!(cursor(&rpc).await.0, 3, "`]e` reaches the first error");
-
-    // `<C-w>d` shows the cursor line's diagnostic in a float.
-    feed(&rpc, "<C-w>d");
-    assert!(
-        panel_is_open(&rpc).await,
-        "`<C-w>d` opens the diagnostic float"
     );
 }

@@ -20,20 +20,13 @@ use nxvim_rpc::{Incoming, Rpc};
 use nxvim_server::ServerInit;
 use nxvim_test_harness::{
     attach, barrier, cursor, drain_to_latest_redraw, exec_lua, feed, lines, lua_bool, map_get,
-    spawn, start_attached, temp_dir,
+    poll_true, q, spawn, start_attached, temp_dir,
 };
 use rmpv::Value;
 use tokio::sync::mpsc::UnboundedReceiver;
 
 async fn start() -> (Rpc, UnboundedReceiver<Incoming>) {
     start_attached(ServerInit::default(), 80, 24).await
-}
-
-/// Lua-escape a path for embedding in a double-quoted string literal.
-fn q(path: &Path) -> String {
-    path.to_string_lossy()
-        .replace('\\', "\\\\")
-        .replace('"', "\\\"")
 }
 
 /// Run `git` with `args` in `cwd`, with a fixed identity and no host config
@@ -90,18 +83,6 @@ fn make_repo(base: &Path, name: &str) -> PathBuf {
     git(&repo, &["add", "-A"]);
     git(&repo, &["commit", "-q", "-m", "initial"]);
     repo
-}
-
-/// Poll a `return`-style chunk until it is `true` (~3s). Async manager steps settle
-/// over later ticks, so the flag a plugin's scripts set is nil until then.
-async fn poll_true(rpc: &Rpc, code: &str) -> bool {
-    for _ in 0..200 {
-        if lua_bool(rpc, code).await == Some(true) {
-            return true;
-        }
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
-    false
 }
 
 /// Poll (via the redraw `float` surface) for the content float being present

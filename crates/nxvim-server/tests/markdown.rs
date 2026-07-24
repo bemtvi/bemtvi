@@ -395,36 +395,67 @@ fn float_window_groups(win: &[(Value, Value)]) -> Vec<String> {
     out
 }
 
-/// The shipped `examples/markdown/` config must load and render its sample buffer:
-/// pressing `K` runs the config's `nx.markdown.render` → `nx.view.component` glue and
-/// opens a **real floating window** whose content is the *stripped* markdown — the
-/// "verified end-to-end" example convention. Being a real window (not an overlay) is
-/// what makes it scroll.
+/// The `nx.markdown.to_view` → `nx.view.component` glue renders a buffer's markdown
+/// into a **real floating window** whose content is the *stripped* markdown — being a
+/// real window (not an overlay) is what makes it scroll. This is the composition the
+/// `examples/markdown` config wires to `K`, covered here with an inline config.
 #[tokio::test]
-async fn shipped_example_renders_the_buffer_into_a_float() {
-    let example_dir =
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/markdown");
-    let sample = include_str!("../../../examples/markdown/sample.md");
+async fn a_view_component_renders_markdown_into_a_float() {
+    // A heading + bold prose up top, a rust fence past the first screenful (so the
+    // `G` scroll below genuinely reveals it in the 80%-tall float).
+    let mut sample = String::from("# Markdown rendering\n\nProse with **bold** words.\n\n");
+    for n in 0..40 {
+        sample.push_str(&format!("Filler paragraph {n}.\n\n"));
+    }
+    sample.push_str("```rust\nfn zzz() {}\n```\n");
     let dir = temp_dir("md_example");
     let path = dir.join("sample.md");
-    std::fs::write(&path, sample).expect("write sample");
+    std::fs::write(&path, &sample).expect("write sample");
 
     let init = ServerInit {
-        config_dir: Some(example_dir),
         file: Some(path.to_string_lossy().into_owned()),
         ..Default::default()
     };
     let (rpc, mut incoming) = spawn(init);
     attach(&rpc, 100, 40).await;
     // A theme so the rendered `@markup.*` groups (and the code-block `@markup.raw.block`
-    // line background) resolve to styles — the example itself leaves the colorscheme to
-    // the user.
+    // line background) resolve to styles.
     exec_lua(&rpc, "vim.cmd('colorscheme nxvim')").await;
 
-    // The config maps `K` to render the current buffer into a floating window. The view
-    // buffer/window and the component's first render arrive over the next few ticks (the
-    // `nx._view_buf`/`_view_win` mirror + the reactive lifecycle), so poll for it.
-    feed(&rpc, "K");
+    // The example config's glue, inline: a component whose `render` maps the source
+    // markdown to `nx.markdown.to_view`, mounted as a float typed `markdown` (so the
+    // grammar's code-fence injections fire in the view buffer).
+    exec_lua(
+        &rpc,
+        r#"
+        local MarkdownFloat = nx.view.component({
+          setup = function(ctx)
+            ctx.wo.wrap = true
+            return { src = ctx.props.src }
+          end,
+          render = function(state)
+            return nx.markdown.to_view(state.src)
+          end,
+        })
+        local src = table.concat(nx.buf.lines(nx.buf.current(), 0, -1), "\n")
+        MarkdownFloat.mount({
+          name = "[Rendered Markdown]",
+          filetype = "markdown",
+          props = { src = src },
+          float = {
+            relative = "editor",
+            width = "80%",
+            height = "80%",
+            align = "center",
+            border = "rounded",
+          },
+        })
+        "#,
+    )
+    .await;
+
+    // The view buffer/window and the component's first render arrive over the next few
+    // ticks (the `nx._view_buf`/`_view_win` mirror + the reactive lifecycle), so poll.
     let mut win = None;
     for _ in 0..60 {
         barrier(&rpc).await;
@@ -442,7 +473,7 @@ async fn shipped_example_renders_the_buffer_into_a_float() {
         }
         tokio::time::sleep(std::time::Duration::from_millis(5)).await;
     }
-    let win = win.expect("the example's markdown float window opens with styling");
+    let win = win.expect("the markdown float window opens with styling");
     let lines = win_lines(&win);
 
     assert!(
@@ -469,7 +500,7 @@ async fn shipped_example_renders_the_buffer_into_a_float() {
         "markdown",
         "the rendered-markdown view is filetype=markdown so injections fire"
     );
-    // The sample's fenced code block lives lower in the document; scroll the focused float
+    // The fenced code block lives lower in the document; scroll the focused float
     // to it (`G`) and confirm: it reads as a code region (a resolved `line_bg` background),
     // its ```rust fence is KEPT in the buffer (so injection can fire) but HIDDEN by an
     // overlay so it reads as rendered.

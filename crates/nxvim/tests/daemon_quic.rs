@@ -22,7 +22,7 @@ use nxvim_server::{
     bind_quic_listener, connect_quic_reconnecting, mint_token, serve_quic, ListenerInfo,
     ReconnectPolicy, ServerInit,
 };
-use nxvim_test_harness::{attach, buf_lines, exec_lua, feed, spawn, temp_dir};
+use nxvim_test_harness::{attach, await_lines, buf_lines, exec_lua, feed, spawn, temp_dir};
 
 /// Bind a QUIC daemon listener on an ephemeral loopback port and serve it on its own
 /// thread + runtime — the stand-in for a separate `nxvim --daemon --listen` process. The
@@ -98,18 +98,6 @@ async fn the_bearer_token_gates_the_connection() {
         "the correct token must connect: {:?}",
         accepted.err()
     );
-}
-
-/// Poll `nvim_buf_get_lines` until it matches `want` or the budget runs out — the off-tick
-/// fetch (initial open) lands a moment after attach.
-async fn await_lines(rpc: &nxvim_rpc::Rpc, want: &[&str]) -> Vec<String> {
-    for _ in 0..100 {
-        if buf_lines(rpc, 0).await == want {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
-    buf_lines(rpc, 0).await
 }
 
 /// The legs split across **separate** QUIC streams (Control / Proc / Lsp / Term) all carry

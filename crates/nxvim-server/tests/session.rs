@@ -10,8 +10,10 @@
 use std::path::Path;
 
 use nxvim_server::{RedbFileStore, ServerInit};
-use nxvim_test_harness::{cursor, exec_lua, feed, lines, start_attached, temp_dir, write_temp};
-use tokio::sync::mpsc::UnboundedReceiver;
+use nxvim_test_harness::{
+    await_server_exit, cursor, exec_lua, feed, lines, poll_true, q, start_attached, temp_dir,
+    write_temp,
+};
 
 /// A server persisting into `dir`. `session` turns on BOTH capture and restore (the
 /// `--shada-namespace` + `--restore-session` combination the wrapper uses).
@@ -23,10 +25,6 @@ fn init(dir: &Path, file: Option<String>, session: bool) -> ServerInit {
         restore_session: session,
         ..Default::default()
     }
-}
-
-async fn await_server_exit(mut incoming: UnboundedReceiver<nxvim_rpc::Incoming>) {
-    while incoming.recv().await.is_some() {}
 }
 
 /// "name1|name2|…" of every window's buffer, sorted — a stable layout fingerprint.
@@ -472,13 +470,6 @@ async fn session_collapses_a_persisted_view_with_no_handler() {
     }
 }
 
-/// Lua-escape a path for embedding in a double-quoted string literal.
-fn q(path: &Path) -> String {
-    path.to_string_lossy()
-        .replace('\\', "\\\\")
-        .replace('"', "\\\"")
-}
-
 /// Write a throwaway plugin dir at `<base>` whose `lua/<name>/init.lua` exposes a `setup`
 /// that registers an `nx.view.on_restore` handler (rebuilding a persisted view from the
 /// plugin's own shada). Declared to `nx.plugins` with `name = <name>`, so the manager keys
@@ -508,18 +499,6 @@ return M
     )
     .unwrap();
     base.to_path_buf()
-}
-
-/// Poll `code` (a `return`-style chunk) until it is `true` (~4s), driving a tick each round
-/// so the async plugin load settles. Returns whether it landed.
-async fn poll_true(rpc: &nxvim_rpc::Rpc, code: &str) -> bool {
-    for _ in 0..200 {
-        if exec_lua(rpc, code).await.as_bool() == Some(true) {
-            return true;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-    }
-    false
 }
 
 #[tokio::test]
@@ -771,81 +750,6 @@ async fn session_restores_a_persisted_view_component() {
             .unwrap_or(-1);
         assert_eq!(pending, 0, "the reserved slot was adopted, not collapsed");
         assert_eq!(window_count(&rpc).await, 2, "the Notes dock came back");
-    }
-}
-
-/// Resolve `examples/<name>` to an absolute path from this crate's manifest dir, so the
-/// example test loads the real shipped config regardless of the test cwd.
-fn example_dir(name: &str) -> std::path::PathBuf {
-    std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../../examples")
-        .join(name)
-        .canonicalize()
-        .expect("example dir exists")
-}
-
-/// The "|"-joined lines of whichever window's buffer currently matches `want`, polled until
-/// it lands (the component's async mount/restore has settled) — `true` if found.
-async fn pump_until_any_window_has(rpc: &nxvim_rpc::Rpc, want: &str) -> bool {
-    let probe = format!(
-        r#"
-        for _, w in ipairs(nx.win.list()) do
-          local txt = table.concat(nx.buf.lines(nx.win.buf(w), 0, -1, false), "|")
-          if txt == {want:?} then return true end
-        end
-        return false
-        "#
-    );
-    for _ in 0..200 {
-        if exec_lua(rpc, &probe).await.as_bool() == Some(true) {
-            return true;
-        }
-        rpc.request("nvim_get_mode", vec![]).await.expect("barrier");
-    }
-    false
-}
-
-#[tokio::test]
-async fn example_view_persist_restores_notes_across_sessions() {
-    // Drive the shipped `examples/view-persist/` end-to-end through the REAL startup
-    // sourcing (its `init.lua` mounts a persistent `nx.view.component`). Without
-    // NXVIM_CONFIG the config attributes to its dir basename `view-persist` (the binary
-    // launched with NXVIM_CONFIG maps the same code to `user`); seed the component's own
-    // store under that namespace, restart, and assert the restored sidebar rebuilt from it.
-    let cfg = example_dir("view-persist");
-    let store_dir = temp_dir("session_example_view_persist");
-    let init = || ServerInit {
-        config_dir: Some(cfg.clone()),
-        runtimepath: vec![cfg.clone()],
-        shada: Some(Box::new(RedbFileStore::new(store_dir.to_path_buf()))),
-        workspace_session: true,
-        restore_session: true,
-        ..Default::default()
-    };
-
-    // Session 1: the component mounts fresh in its dock; seed known notes into its store.
-    {
-        let (rpc, incoming) = start_attached(init(), 80, 25).await;
-        assert!(
-            pump_until_any_window_has(&rpc, "Welcome! Press <leader>na to add a note.").await,
-            "the example mounted its Notes sidebar with the first-run default"
-        );
-        exec_lua(
-            &rpc,
-            r#"nx.shada.plugin("view-persist"):set("view:notes", { "alpha", "beta" })"#,
-        )
-        .await;
-        feed(&rpc, ":qa<CR>");
-        await_server_exit(incoming).await;
-    }
-
-    // Session 2: the restore adopts the reserved slot and the component rebuilds the notes.
-    {
-        let (rpc, _incoming) = start_attached(init(), 80, 25).await;
-        assert!(
-            pump_until_any_window_has(&rpc, "alpha|beta").await,
-            "the example's sidebar came back with the persisted notes, no on_restore in sight"
-        );
     }
 }
 

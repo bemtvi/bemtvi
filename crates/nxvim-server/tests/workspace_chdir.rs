@@ -13,8 +13,9 @@
 use std::path::PathBuf;
 
 use nxvim_server::{RedbFileStore, ServerInit};
-use nxvim_test_harness::{exec_lua, feed, lines, serial_lock, start_attached, temp_dir};
-use tokio::sync::mpsc::UnboundedReceiver;
+use nxvim_test_harness::{
+    await_lines, await_server_exit, buf_name, exec_lua, feed, serial_lock, start_attached, temp_dir,
+};
 
 /// Restore the process cwd on drop, even if the test panics mid-way.
 struct CwdGuard(PathBuf);
@@ -22,25 +23,6 @@ impl Drop for CwdGuard {
     fn drop(&mut self) {
         let _ = std::env::set_current_dir(&self.0);
     }
-}
-
-/// Poll the current buffer's lines until they match `want` or the budget runs out (a file
-/// fill / session restore can land a tick after attach).
-async fn await_lines(rpc: &nxvim_rpc::Rpc, want: &[&str]) -> Vec<String> {
-    for _ in 0..100 {
-        if lines(rpc).await == want {
-            break;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-    }
-    lines(rpc).await
-}
-
-async fn buf_name(rpc: &nxvim_rpc::Rpc) -> Option<String> {
-    exec_lua(rpc, "return vim.api.nvim_buf_get_name(0)")
-        .await
-        .as_str()
-        .map(str::to_owned)
 }
 
 async fn getcwd(rpc: &nxvim_rpc::Rpc) -> Option<String> {
@@ -91,8 +73,8 @@ async fn workspace_cd_at_boot_resolves_a_relative_file_against_the_root() {
         "the relative positional resolved against the workspace root"
     );
     assert_eq!(
-        buf_name(&rpc).await.as_deref(),
-        Some("aaa"),
+        buf_name(&rpc).await,
+        "aaa",
         "the opened file keeps its relative name (relative `:ls` in a workspace)"
     );
 }
@@ -122,10 +104,6 @@ async fn workspace_no_cwd_keeps_the_launch_cwd() {
         Some(parent.to_string_lossy().as_ref()),
         "--workspace-no-cwd leaves the launch cwd untouched"
     );
-}
-
-async fn await_server_exit(mut incoming: UnboundedReceiver<nxvim_rpc::Incoming>) {
-    while incoming.recv().await.is_some() {}
 }
 
 /// A workspace session stores buffer paths RELATIVE to the workspace root (a portable shada).
@@ -163,7 +141,7 @@ async fn workspace_session_restores_a_relative_file_against_the_root() {
     {
         let (rpc, incoming) = start_attached(ws_init(Some("aaa".to_string())), 80, 24).await;
         assert_eq!(await_lines(&rpc, &["hello"]).await, vec!["hello"]);
-        assert_eq!(buf_name(&rpc).await.as_deref(), Some("aaa"));
+        assert_eq!(buf_name(&rpc).await, "aaa");
         feed(&rpc, ":qa<CR>");
         await_server_exit(incoming).await;
     }
@@ -180,8 +158,8 @@ async fn workspace_session_restores_a_relative_file_against_the_root() {
             "the restored file came back with its real bytes, not a blank buffer"
         );
         assert_eq!(
-            buf_name(&rpc).await.as_deref(),
-            Some("aaa"),
+            buf_name(&rpc).await,
+            "aaa",
             "the restored buffer keeps its relative name (portable shada + relative `:ls`)"
         );
     }

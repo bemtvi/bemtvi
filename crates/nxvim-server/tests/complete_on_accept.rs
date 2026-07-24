@@ -8,9 +8,7 @@
 
 use nxvim_rpc::{Incoming, Rpc};
 use nxvim_server::ServerInit;
-use nxvim_test_harness::{
-    attach, drain_to_latest_redraw, exec_lua, feed, lines, map_get, spawn, temp_dir,
-};
+use nxvim_test_harness::{attach, exec_lua, feed, lines, poll_menu, spawn, temp_dir};
 use rmpv::Value;
 use tokio::sync::mpsc::UnboundedReceiver;
 
@@ -24,22 +22,6 @@ async fn start(dir: &std::path::Path, init_lua: &str) -> (Rpc, UnboundedReceiver
     let (rpc, incoming) = spawn(init);
     attach(&rpc, 80, 24).await;
     (rpc, incoming)
-}
-
-/// Poll for the latest redraw whose `menu` key is a map (the popup is open).
-async fn poll_menu(rpc: &Rpc, incoming: &mut UnboundedReceiver<Incoming>) -> bool {
-    for _ in 0..60 {
-        nxvim_test_harness::barrier(rpc).await;
-        if drain_to_latest_redraw(incoming, |m| {
-            matches!(map_get(m, "menu"), Some(Value::Map(_)))
-        })
-        .is_some()
-        {
-            return true;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-    }
-    false
 }
 
 /// A source whose single candidate carries an `on_accept` that stashes the handed-in
@@ -66,7 +48,10 @@ nx.complete.setup { sources = { { 'snip' } }, min_chars = 2 }";
 /// Open the popup on a 2-char prefix, select row 0, accept.
 async fn type_and_accept(rpc: &Rpc, incoming: &mut UnboundedReceiver<Incoming>, prefix: &str) {
     feed(rpc, &format!("i{prefix}"));
-    assert!(poll_menu(rpc, incoming).await, "popup opens on the prefix");
+    assert!(
+        poll_menu(rpc, incoming).await.is_some(),
+        "popup opens on the prefix"
+    );
     feed(rpc, "<C-n>"); // select row 0 (noselect → first activates)
     feed(rpc, "<C-y>"); // accept
 }

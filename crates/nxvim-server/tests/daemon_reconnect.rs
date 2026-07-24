@@ -24,18 +24,15 @@
 //!
 //! Hermetic: a real server over the in-process RPC pipe, an in-memory remote fs, no disk.
 
-use std::collections::HashMap;
-use std::io::{self, Cursor, Read};
-use std::path::{Path, PathBuf};
+use std::io;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use nxvim_core::{DirEntry, FileStat, HostFs};
 use nxvim_server::{
     DaemonClient, DaemonStatus, FsRead, HostFsAsync, ReconnectHandle, ReconnectPolicy, ServerInit,
 };
-use nxvim_test_harness::{attach, buf_lines, exec_lua, feed, spawn};
+use nxvim_test_harness::{attach, await_lines, buf_lines, exec_lua, feed, spawn, DaemonFs};
 use tokio::io::{DuplexStream, ReadHalf, WriteHalf};
 use tokio::task::JoinHandle;
 
@@ -44,81 +41,6 @@ type DialFut =
     std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<DialEnds>> + Send>>;
 /// The edit-host reader/writer halves a successful dial hands back.
 type DialEnds = (ReadHalf<DuplexStream>, WriteHalf<DuplexStream>);
-
-/// An in-memory [`HostFs`] for the **daemon** side: path → bytes, behind an `Arc` so the
-/// *same* remote fs survives a re-dial (a reconnect must not lose the remote's files).
-/// `read_dir` errors on every path, so a stored path classifies as a file and an absent one
-/// as a new-file — never a directory.
-#[derive(Clone, Default)]
-struct DaemonFs {
-    files: Arc<Mutex<HashMap<PathBuf, Vec<u8>>>>,
-}
-
-impl DaemonFs {
-    fn with(path: &str, contents: &str) -> Self {
-        let me = DaemonFs::default();
-        me.files
-            .lock()
-            .unwrap()
-            .insert(PathBuf::from(path), contents.as_bytes().to_vec());
-        me
-    }
-
-    /// Overwrite (or create) `path`'s bytes — an *external* writer changing the remote file
-    /// (e.g. while the editor's link is down), distinct from a save coming across the wire.
-    fn set(&self, path: &str, contents: &str) {
-        self.files
-            .lock()
-            .unwrap()
-            .insert(PathBuf::from(path), contents.as_bytes().to_vec());
-    }
-
-    /// The bytes currently stored at `path`, as a string — the remote's view of what the
-    /// editor wrote across the wire. `None` if nothing is stored there.
-    fn content(&self, path: &str) -> Option<String> {
-        self.files
-            .lock()
-            .unwrap()
-            .get(Path::new(path))
-            .map(|b| String::from_utf8_lossy(b).into_owned())
-    }
-}
-
-impl HostFs for DaemonFs {
-    fn exists(&self, path: &Path) -> bool {
-        self.files.lock().unwrap().contains_key(path)
-    }
-
-    fn open_read(&self, path: &Path) -> io::Result<Box<dyn Read>> {
-        match self.files.lock().unwrap().get(path) {
-            Some(bytes) => Ok(Box::new(Cursor::new(bytes.clone()))),
-            None => Err(io::Error::new(io::ErrorKind::NotFound, "no such file")),
-        }
-    }
-
-    fn stat(&self, path: &Path) -> Option<FileStat> {
-        self.files.lock().unwrap().get(path).map(|b| FileStat {
-            mtime: None,
-            size: b.len() as u64,
-        })
-    }
-
-    fn write_atomic(&self, path: &Path, contents: &[u8]) -> io::Result<()> {
-        self.files
-            .lock()
-            .unwrap()
-            .insert(path.to_path_buf(), contents.to_vec());
-        Ok(())
-    }
-
-    fn read_dir(&self, _dir: &Path) -> io::Result<Vec<DirEntry>> {
-        Err(io::Error::new(io::ErrorKind::NotFound, "not a directory"))
-    }
-
-    fn canonicalize(&self, path: &Path) -> io::Result<PathBuf> {
-        Ok(path.to_path_buf())
-    }
-}
 
 /// Test control over the re-dial factory: the shared remote fs, the spawned daemon tasks
 /// (newest last — the test severs by aborting the most recent), and a `fail` switch that
@@ -184,21 +106,6 @@ fn fast_policy() -> ReconnectPolicy {
         base: Duration::from_millis(20),
         cap: Duration::from_millis(60),
     }
-}
-
-/// Poll `nvim_buf_get_lines` until it matches `want`.
-async fn await_lines(rpc: &nxvim_rpc::Rpc, want: &[&str]) {
-    for _ in 0..100 {
-        if buf_lines(rpc, 0).await == want {
-            return;
-        }
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
-    assert_eq!(
-        buf_lines(rpc, 0).await,
-        want,
-        "buffer never reached {want:?}"
-    );
 }
 
 /// Whether the current buffer reports `modified`.

@@ -169,15 +169,16 @@ async fn autopairs_option_writes_through_vim_bo() {
 }
 
 #[tokio::test]
-async fn example_config_enables_smart_indent_end_to_end() {
-    // Load the shipped `examples/smart-indent/init.lua` verbatim and confirm its
-    // `vim.o` defaults reach the live buffer — auto-pairs + smartindent both work
-    // with no further `:set`. This guards the example against bit-rot.
-    let example = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../../examples/smart-indent/init.lua");
-    let init = std::fs::read_to_string(&example).expect("read example init.lua");
+async fn config_vim_o_defaults_enable_smart_indent_end_to_end() {
+    // A config's `vim.o` writes (the `examples/smart-indent` recipe) set the
+    // buffer-local defaults, so auto-pairs + smartindent work in a fresh buffer
+    // with no further `:set`.
+    let init = "vim.o.expandtab = true\n\
+                vim.o.tabstop = 2\n\
+                vim.o.smartindent = true\n\
+                vim.o.autopairs = true\n";
     let dir = temp_dir("smart_indent_example");
-    let (rpc, _incoming) = start_with_config(&dir, &init).await;
+    let (rpc, _incoming) = start_with_config(&dir, init).await;
 
     // Auto-pairs closes the `{`, and `<CR>` between the pair expands a
     // two-space-indented block with the `}` laid back at column 0 (the example

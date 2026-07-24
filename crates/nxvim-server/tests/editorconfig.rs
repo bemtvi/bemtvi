@@ -9,7 +9,9 @@
 
 use nxvim_rpc::{Incoming, Rpc};
 use nxvim_server::ServerInit;
-use nxvim_test_harness::{command, exec_lua, lua_bool, lua_u64, start_attached, temp_dir};
+use nxvim_test_harness::{
+    command, exec_lua, lua_bool, lua_u64, poll_true, start_attached, temp_dir,
+};
 use rmpv::Value;
 use std::path::Path;
 use std::time::Duration;
@@ -39,17 +41,6 @@ async fn edit(rpc: &Rpc, dir: &Path, name: &str) {
 async fn reload(rpc: &Rpc, dir: &Path, name: &str) {
     let path = dir.join(name);
     command(rpc, &format!("edit! {}", path.to_string_lossy())).await;
-}
-
-/// Poll `code` (a `return <bool>`) until it is true, up to ~4s.
-async fn poll_true(rpc: &Rpc, code: &str) -> bool {
-    for _ in 0..200 {
-        if lua_bool(rpc, code).await == Some(true) {
-            return true;
-        }
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
-    false
 }
 
 /// Let the async EditorConfig chain run to completion (for negative assertions).

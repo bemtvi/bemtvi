@@ -20,7 +20,7 @@ use std::sync::Arc;
 use nxvim_lua::{LuaDirEntry, LuaFs, LuaStat, StdLuaFs};
 use nxvim_rpc::{Incoming, Rpc};
 use nxvim_server::{RemoteFsJobs, ServerInit};
-use nxvim_test_harness::{attach, exec_lua, lua_bool, spawn, temp_dir};
+use nxvim_test_harness::{attach, exec_lua, lua_bool, q, spawn, temp_dir};
 use tokio::sync::mpsc::UnboundedReceiver;
 
 /// A [`LuaFs`] that delegates to a real [`StdLuaFs`] but counts every op it serves.
@@ -117,13 +117,6 @@ impl LuaFs for CountingFs {
         self.tick();
         self.inner.which(name)
     }
-}
-
-/// Lua-escape a path for a double-quoted string literal.
-fn q(path: &std::path::Path) -> String {
-    path.to_string_lossy()
-        .replace('\\', "\\\\")
-        .replace('"', "\\\"")
 }
 
 /// Start a daemon-backed session whose `nx.fs` seam is a [`RemoteFsJobs`] answered by a

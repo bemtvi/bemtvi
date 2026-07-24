@@ -6,10 +6,7 @@
 //! handler in `init.lua` claims paths by a marker, and we assert on the resulting
 //! buffer lines.
 
-use nxvim_rpc::{Incoming, Rpc};
-use nxvim_server::ServerInit;
-use nxvim_test_harness::{attach, command, exec_lua, lines, spawn, temp_dir, write_temp};
-use tokio::sync::mpsc::UnboundedReceiver;
+use nxvim_test_harness::{command, exec_lua, lines, start_with_config, temp_dir, write_temp};
 
 /// A `BufReadCmd` handler scoped to `*` that claims any path ending in `.special`
 /// (filling the buffer with a sentinel) and **declines** everything else (returning
@@ -27,21 +24,6 @@ nx.autocmd.create("BufReadCmd", {
   end,
 })
 "#;
-
-async fn start_with_config(
-    dir: &std::path::Path,
-    init_lua: &str,
-) -> (Rpc, UnboundedReceiver<Incoming>) {
-    std::fs::write(dir.join("init.lua"), init_lua).expect("write init.lua");
-    let init = ServerInit {
-        config_dir: Some(dir.to_path_buf()),
-        runtimepath: vec![dir.to_path_buf()],
-        ..Default::default()
-    };
-    let (rpc, incoming) = spawn(init);
-    attach(&rpc, 80, 24).await;
-    (rpc, incoming)
-}
 
 #[tokio::test]
 async fn a_handler_claims_a_matching_read() {

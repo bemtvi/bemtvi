@@ -16,7 +16,8 @@
 use nxvim_rpc::{Incoming, Rpc};
 use nxvim_server::ServerInit;
 use nxvim_test_harness::{
-    attach, drain_to_latest_redraw, exec_lua, feed, feed_mouse, lines, map_get, spawn, temp_dir,
+    attach, drain_to_latest_redraw, exec_lua, feed, feed_mouse, lines, map_get, menu_items,
+    menu_of, poll_menu, poll_no_menu, spawn, temp_dir,
 };
 use rmpv::Value;
 use tokio::sync::mpsc::UnboundedReceiver;
@@ -36,60 +37,6 @@ async fn start(dir: &std::path::Path, init_lua: &str) -> (Rpc, UnboundedReceiver
 /// Enable the engine with the `buffer` source and a 2-char trigger gate (so
 /// typing single letters during setup never opens a spurious popup).
 const BUFFER_INIT: &str = "nx.complete.setup { sources = { { 'buffer', min_chars = 2 } } }";
-
-/// Poll for the latest redraw whose `menu` key is a map (the take-latest pattern).
-async fn poll_menu(
-    rpc: &Rpc,
-    incoming: &mut UnboundedReceiver<Incoming>,
-) -> Option<Vec<(Value, Value)>> {
-    for _ in 0..60 {
-        nxvim_test_harness::barrier(rpc).await;
-        if let Some(map) = drain_to_latest_redraw(incoming, |m| {
-            matches!(map_get(m, "menu"), Some(Value::Map(_)))
-        }) {
-            return Some(map);
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-    }
-    None
-}
-
-/// Poll for the latest redraw whose `menu` key is *absent / nil* — i.e. no popup.
-async fn poll_no_menu(rpc: &Rpc, incoming: &mut UnboundedReceiver<Incoming>) -> bool {
-    for _ in 0..60 {
-        nxvim_test_harness::barrier(rpc).await;
-        if let Some(map) = drain_to_latest_redraw(incoming, |m| {
-            !matches!(map_get(m, "menu"), Some(Value::Map(_)))
-        }) {
-            let _ = map;
-            return true;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-    }
-    false
-}
-
-fn menu_of(map: &[(Value, Value)]) -> Vec<(Value, Value)> {
-    match map_get(map, "menu") {
-        Some(Value::Map(m)) => m.clone(),
-        other => panic!("expected a menu map, got {other:?}"),
-    }
-}
-
-/// The menu's visible row labels, in order.
-fn menu_items(menu: &[(Value, Value)]) -> Vec<String> {
-    match map_get(menu, "items") {
-        Some(Value::Array(items)) => items
-            .iter()
-            .map(|row| match row {
-                Value::Array(a) => a.first().and_then(Value::as_str).unwrap_or("").to_string(),
-                Value::String(s) => s.as_str().unwrap_or("").to_string(),
-                other => panic!("unexpected menu row {other:?}"),
-            })
-            .collect(),
-        other => panic!("expected menu items array, got {other:?}"),
-    }
-}
 
 fn menu_selected(menu: &[(Value, Value)]) -> u64 {
     map_get(menu, "selected")
@@ -196,7 +143,7 @@ async fn buffer_completion_opens_then_accepts_without_touching_the_buffer_until_
     assert_eq!(lines(&rpc).await, vec!["hello hello"]);
     // The popup is gone after accept.
     assert!(
-        poll_no_menu(&rpc, &mut incoming).await,
+        poll_no_menu(&rpc, &mut incoming).await.is_some(),
         "popup closes on accept"
     );
 }
@@ -362,7 +309,7 @@ async fn trigger_key_opens_the_popup() {
     // false` the popup stays shut as we type.
     feed(&rpc, "ihello<CR>he");
     assert!(
-        poll_no_menu(&rpc, &mut incoming).await,
+        poll_no_menu(&rpc, &mut incoming).await.is_some(),
         "auto = false: typing must not open the popup"
     );
 
@@ -389,7 +336,7 @@ async fn abort_closes_the_popup_and_keeps_the_typed_prefix() {
 
     feed(&rpc, "<C-e>");
     assert!(
-        poll_no_menu(&rpc, &mut incoming).await,
+        poll_no_menu(&rpc, &mut incoming).await.is_some(),
         "popup closes on abort"
     );
     // Nothing was inserted — the prefix stands.
@@ -435,7 +382,7 @@ async fn backspacing_below_min_chars_closes_the_popup() {
     // One backspace leaves a 1-char prefix (`h`), below the 2-char gate → closed.
     feed(&rpc, "<BS>");
     assert!(
-        poll_no_menu(&rpc, &mut incoming).await,
+        poll_no_menu(&rpc, &mut incoming).await.is_some(),
         "popup closes below min_chars"
     );
     assert_eq!(lines(&rpc).await, vec!["hello h"]);
@@ -612,7 +559,7 @@ async fn manual_trigger_opens_even_with_auto_off_and_below_min_chars() {
     // auto = false → typing a matching prefix opens nothing on its own.
     feed(&rpc, "ialpha al");
     assert!(
-        poll_no_menu(&rpc, &mut incoming).await,
+        poll_no_menu(&rpc, &mut incoming).await.is_some(),
         "no auto popup when auto = false"
     );
 
@@ -634,7 +581,10 @@ async fn a_mapped_trigger_key_opens_the_popup() {
 
     // No auto popup as we type; the mapped key opens it on demand.
     feed(&rpc, "ialpha al");
-    assert!(poll_no_menu(&rpc, &mut incoming).await, "no auto popup");
+    assert!(
+        poll_no_menu(&rpc, &mut incoming).await.is_some(),
+        "no auto popup"
+    );
     feed(&rpc, "<C-b>");
     let menu = menu_of(
         &poll_menu(&rpc, &mut incoming)
@@ -809,7 +759,7 @@ async fn entering_select_mode_closes_the_completion_popup() {
     )
     .await;
     assert!(
-        poll_no_menu(&rpc, &mut incoming).await,
+        poll_no_menu(&rpc, &mut incoming).await.is_some(),
         "the popup closes when Select mode is entered"
     );
 }
@@ -996,7 +946,7 @@ nx.complete.setup { sources = { { 'silent' } }, min_chars = 2 }";
 
     feed(&rpc, "iab");
     assert!(
-        poll_no_menu(&rpc, &mut incoming).await,
+        poll_no_menu(&rpc, &mut incoming).await.is_some(),
         "a source that streams nothing leaves no popup open"
     );
     assert_eq!(lines(&rpc).await, vec!["ab"]);
@@ -1845,7 +1795,7 @@ async fn clicking_a_completion_row_selects_it_then_accepts_on_a_second_click() {
     feed_mouse(&rpc, "left", "press", row0 + 1, col);
     assert_eq!(lines(&rpc).await, vec![format!("hello hero {}", items[1])]);
     assert!(
-        poll_no_menu(&rpc, &mut incoming).await,
+        poll_no_menu(&rpc, &mut incoming).await.is_some(),
         "the popup closes on accept"
     );
 }
@@ -1898,7 +1848,7 @@ async fn clicking_away_closes_the_completion_popup() {
     // popup must close instead of following.
     feed_mouse(&rpc, "left", "press", row0 + 4, 0);
     assert!(
-        poll_no_menu(&rpc, &mut incoming).await,
+        poll_no_menu(&rpc, &mut incoming).await.is_some(),
         "clicking away closes the completion popup"
     );
 }
@@ -1917,7 +1867,7 @@ async fn scrolling_the_text_closes_the_completion_popup() {
     // must close instead of trailing the cursor.
     feed_mouse(&rpc, "wheel", "down", row0 + 4, 0);
     assert!(
-        poll_no_menu(&rpc, &mut incoming).await,
+        poll_no_menu(&rpc, &mut incoming).await.is_some(),
         "scrolling the text closes the completion popup"
     );
 }
@@ -2144,42 +2094,6 @@ async fn wheeling_the_docs_sidebar_hit_tests_in_global_cells_past_a_dock() {
         "three notches over the global box advanced the docs by 3×3 lines: {:?}",
         win_lines(&scrolled)
     );
-}
-
-#[tokio::test]
-async fn example_mouse_widgets_config_loads_and_completion_is_clickable() {
-    // The shipped examples/mouse-widgets config must load (mouse=a + the four widget
-    // setups) and its completion popup must be mouse-clickable end-to-end.
-    let example = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../../examples/mouse-widgets")
-        .canonicalize()
-        .expect("examples/mouse-widgets dir");
-    let init = ServerInit {
-        config_dir: Some(example.clone()),
-        runtimepath: vec![example],
-        ..Default::default()
-    };
-    let (rpc, mut incoming) = spawn(init);
-    attach(&rpc, 80, 24).await;
-    nxvim_test_harness::command(&rpc, "set nonumber norelativenumber").await;
-
-    // Seed a word, then type a matching prefix — the example's `nx.complete` (buffer
-    // source) opens a popup; `mouse=a` from the config lets the click land.
-    feed(&rpc, "ifunction fun");
-    let menu = menu_of(
-        &poll_menu(&rpc, &mut incoming)
-            .await
-            .expect("the example opens a popup"),
-    );
-    assert_eq!(menu_items(&menu), vec!["function"]);
-    let col = menu_col(&menu) as usize;
-    let row0 = menu_row(&menu) as usize;
-
-    // Click the row to select it, then click it again to accept — the prefix `fun`
-    // is replaced by `function`, proving the example's widget is core-mouse-driven.
-    feed_mouse(&rpc, "left", "press", row0, col);
-    feed_mouse(&rpc, "left", "press", row0, col);
-    assert_eq!(lines(&rpc).await, vec!["function function"]);
 }
 
 /// The docs float window's `line_bg` layer as `(row, style_id)` pairs — the per-row

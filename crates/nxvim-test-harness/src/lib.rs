@@ -20,7 +20,7 @@
 //!
 //! - **params convention** — functions take the raw notification params
 //!   (`&[Value]`) and index `params[0]` themselves: [`drain_latest_redraw`],
-//!   [`redraw_get`], [`window0_get`], [`window0`], [`message_of`].
+//!   [`redraw_get`], [`window0`], [`message_of`].
 //! - **map convention** — functions take the already-extracted map
 //!   (`&[(Value, Value)]`): [`field`], [`map_get`], [`window0_field`], [`u64_at`],
 //!   [`message`], plus the predicate-driven [`drain_to_latest_redraw`].
@@ -67,18 +67,25 @@ pub fn spawn(init: ServerInit) -> (Rpc, UnboundedReceiver<Incoming>) {
     connect(reader, writer)
 }
 
-/// Attach a UI of `cols` × `rows`, so the server begins emitting `redraw`s.
-pub async fn attach(rpc: &Rpc, cols: u16, rows: u16) {
+/// Attach a UI of `cols` × `rows` declaring the given capability map entries —
+/// the general form behind [`attach`] and its capability-declaring wrappers.
+pub async fn attach_with_caps(rpc: &Rpc, cols: u16, rows: u16, caps: Vec<(Value, Value)>) {
     rpc.request(
         "nx_ui_attach",
         vec![
             Value::from(cols as u64),
             Value::from(rows as u64),
-            Value::Map(vec![]),
+            Value::Map(caps),
         ],
     )
     .await
     .expect("ui attach");
+}
+
+/// Attach a UI of `cols` × `rows` with no declared capabilities (a legacy
+/// terminal), so the server begins emitting `redraw`s.
+pub async fn attach(rpc: &Rpc, cols: u16, rows: u16) {
+    attach_with_caps(rpc, cols, rows, vec![]).await;
 }
 
 /// [`attach`] a UI that declares the **kitty keyboard protocol** active
@@ -87,19 +94,13 @@ pub async fn attach(rpc: &Rpc, cols: u16, rows: u16) {
 /// twins — the way a modern client attaches. Plain [`attach`] leaves it off (a
 /// legacy terminal), which is what the default harness setup exercises.
 pub async fn attach_keyboard_protocol(rpc: &Rpc, cols: u16, rows: u16) {
-    rpc.request(
-        "nx_ui_attach",
-        vec![
-            Value::from(cols as u64),
-            Value::from(rows as u64),
-            Value::Map(vec![(
-                Value::from("keyboard_protocol"),
-                Value::Boolean(true),
-            )]),
-        ],
+    attach_with_caps(
+        rpc,
+        cols,
+        rows,
+        vec![(Value::from("keyboard_protocol"), Value::Boolean(true))],
     )
-    .await
-    .expect("ui attach");
+    .await;
 }
 
 /// [`attach`] a UI that declares **truecolor** (24-bit color) support
@@ -108,16 +109,13 @@ pub async fn attach_keyboard_protocol(rpc: &Rpc, cols: u16, rows: u16) {
 /// the config hasn't already chosen one. Plain [`attach`] leaves it off (a
 /// 256-color / legacy terminal), so the registry stays empty by default.
 pub async fn attach_truecolor(rpc: &Rpc, cols: u16, rows: u16) {
-    rpc.request(
-        "nx_ui_attach",
-        vec![
-            Value::from(cols as u64),
-            Value::from(rows as u64),
-            Value::Map(vec![(Value::from("truecolor"), Value::Boolean(true))]),
-        ],
+    attach_with_caps(
+        rpc,
+        cols,
+        rows,
+        vec![(Value::from("truecolor"), Value::Boolean(true))],
     )
-    .await
-    .expect("ui attach");
+    .await;
 }
 
 /// [`spawn`] the server with `init` and [`attach`] a `cols` × `rows` UI.
@@ -131,11 +129,90 @@ pub async fn start_attached(
     (rpc, incoming)
 }
 
+/// Start an 80×24-attached server editing a fresh temp file seeded with
+/// `content` — the standard "open a buffer with known text" fixture.
+pub async fn start_with_file(content: &str) -> (Rpc, UnboundedReceiver<Incoming>) {
+    let path = write_temp("open", "txt", content);
+    start_attached(
+        ServerInit {
+            file: Some(path),
+            ..Default::default()
+        },
+        80,
+        24,
+    )
+    .await
+}
+
+/// [`start_attached`] (80×24) with a fake mouse clock injected via
+/// [`ServerInit::mouse_clock`], so a deterministic multi-click can be driven
+/// (two presses placed inside `'mousetime'` with [`TestClock::set_ms`]).
+pub async fn start_clocked_init(
+    mut init: ServerInit,
+) -> (Rpc, TestClock, UnboundedReceiver<Incoming>) {
+    let clock = TestClock::new();
+    init.mouse_clock = Some(clock.handle());
+    let (rpc, incoming) = start_attached(init, 80, 24).await;
+    (rpc, clock, incoming)
+}
+
+/// [`start_clocked_init`] with an otherwise-default init — the common case.
+pub async fn start_clocked() -> (Rpc, TestClock, UnboundedReceiver<Incoming>) {
+    start_clocked_init(ServerInit::default()).await
+}
+
+/// Write `init_lua` to `<dir>/init.lua` and return a [`ServerInit`] sourcing it
+/// at startup (`dir` as both `config_dir` and the runtimepath).
+pub fn config_init(dir: &std::path::Path, init_lua: &str) -> ServerInit {
+    std::fs::write(dir.join("init.lua"), init_lua).expect("write init.lua");
+    ServerInit {
+        config_dir: Some(dir.to_path_buf()),
+        runtimepath: vec![dir.to_path_buf()],
+        ..Default::default()
+    }
+}
+
+/// Start an 80×24-attached server sourcing `init_lua` from the throwaway config
+/// dir `dir` (see [`config_init`]).
+pub async fn start_with_config(
+    dir: &std::path::Path,
+    init_lua: &str,
+) -> (Rpc, UnboundedReceiver<Incoming>) {
+    start_attached(config_init(dir, init_lua), 80, 24).await
+}
+
+/// Like [`start_with_config`] but also opens `file` in the initial buffer, so
+/// the startup lifecycle seed (`BufReadPost`→`FileType`→`BufEnter`) fires for it.
+pub async fn start_with_file_and_config(
+    dir: &std::path::Path,
+    file: &str,
+    init_lua: &str,
+) -> (Rpc, UnboundedReceiver<Incoming>) {
+    let mut init = config_init(dir, init_lua);
+    init.file = Some(file.to_string());
+    start_attached(init, 80, 24).await
+}
+
+/// Drain `incoming` until the server closes the connection — await a `:qa`-style
+/// exit before restarting against the same store.
+pub async fn await_server_exit(mut incoming: UnboundedReceiver<Incoming>) {
+    while incoming.recv().await.is_some() {}
+}
+
 // ===== driving the editor ====================================================
 
 /// Type a string of vim key-notation (a fire-and-forget `nx_input` notify).
 pub fn feed(rpc: &Rpc, keys: &str) {
     rpc.notify("nx_input", vec![Value::from(keys)]);
+}
+
+/// Feed `keys` as an awaited request, then a `nvim_get_mode` barrier — so the
+/// input is fully processed server-side before the following read.
+pub async fn feed_sync(rpc: &Rpc, keys: &str) {
+    rpc.request("nx_input", vec![Value::from(keys)])
+        .await
+        .expect("input");
+    rpc.request("nvim_get_mode", vec![]).await.expect("barrier");
 }
 
 /// A fake monotonic millisecond clock for mouse multi-click tests. Hand its
@@ -251,6 +328,21 @@ pub async fn buf_lines(rpc: &Rpc, handle: u64) -> Vec<String> {
     }
 }
 
+/// Buffer `handle`'s name (`nvim_buf_get_name`; handle `0` = the current buffer).
+pub async fn buf_name_of(rpc: &Rpc, handle: u64) -> String {
+    rpc.request("nvim_buf_get_name", vec![Value::from(handle)])
+        .await
+        .expect("buf_get_name")
+        .as_str()
+        .unwrap_or_default()
+        .to_string()
+}
+
+/// The current buffer's name.
+pub async fn buf_name(rpc: &Rpc) -> String {
+    buf_name_of(rpc, 0).await
+}
+
 /// Cursor position as `(1-based line, 0-based column)`.
 ///
 /// CONVENTION: the line is **1-based** — this relays `nvim_win_get_cursor`
@@ -354,25 +446,6 @@ pub fn drain_latest_redraw(incoming: &mut UnboundedReceiver<Incoming>) -> Option
     }
 }
 
-/// Drain every queued notification and return *all* `redraw` params in arrival
-/// order. *Params convention.*
-pub fn drain_all_redraws(incoming: &mut UnboundedReceiver<Incoming>) -> Vec<Vec<Value>> {
-    let mut all = Vec::new();
-    loop {
-        match incoming.try_recv() {
-            Ok(Incoming::Notification { method, params }) if method == "redraw" => {
-                all.push(params);
-            }
-            // Skip non-redraw notifications / server-initiated requests but keep
-            // draining (see `drain_latest_redraw`); stopping at the first one would
-            // silently truncate the redraw history at any interleaved FS/proc frame.
-            Ok(_) => continue,
-            Err(_) => break,
-        }
-    }
-    all
-}
-
 /// Drain every queued `redraw` and return the most recent map for which `keep`
 /// holds (skipping non-redraw notifications and rejected redraws), or `None`.
 /// *Map convention.*
@@ -464,12 +537,6 @@ pub fn window0(params: &[Value]) -> Option<&Vec<(Value, Value)>> {
     }
 }
 
-/// A per-window value (`windows[0][key]`) addressed through the raw params.
-/// *Params convention.*
-pub fn window0_get<'a>(params: &'a [Value], key: &str) -> Option<&'a Value> {
-    map_get(window0(params)?, key)
-}
-
 /// The redraw's message-line text, addressed through the raw params.
 /// *Params convention.*
 pub fn message_of(params: &[Value]) -> String {
@@ -524,6 +591,154 @@ pub fn message(map: &[(Value, Value)]) -> String {
     field_str(map, "message")
 }
 
+// ===== input → redraw ========================================================
+
+/// Feed `keys` and return the freshest resulting `redraw` map that satisfies
+/// `keep` (*map convention*).
+///
+/// The server processes messages serially, writing each message's response then
+/// its `redraw`; we send `nx_input` as a request then a `nvim_get_mode` barrier,
+/// so once the barrier `.await` resolves the input's redraw is already queued.
+/// We take the *most recent* qualifying redraw, not the first: a frame still in
+/// flight from earlier in the test (the startup frame, or a previous call's
+/// trailing barrier repaint) can land in `incoming` after the pre-drain below
+/// when the reader task lags under load, and taking the first would then return
+/// that stale frame — the source of intermittent, test-shuffling failures.
+/// `keep` lets a caller pin the exact frame it means: the default
+/// ([`redraw_after`]) takes the freshest state (the barrier's repaint is
+/// state-identical to the input's), while scroll tests pass a predicate to
+/// single out the input's own frame, the only one carrying the one-shot
+/// `scroll` gesture (which the trailing barrier repaint lacks).
+pub async fn redraw_after_matching(
+    rpc: &Rpc,
+    incoming: &mut UnboundedReceiver<Incoming>,
+    keys: &str,
+    keep: impl Fn(&[(Value, Value)]) -> bool,
+) -> Vec<(Value, Value)> {
+    while incoming.try_recv().is_ok() {} // discard notifications buffered earlier in the test
+
+    // request (not notify): the server responds *then* redraws, and the barrier
+    // below relies on that ordering
+    rpc.request("nx_input", vec![Value::from(keys)])
+        .await
+        .expect("input");
+    rpc.request("nvim_get_mode", vec![]).await.expect("barrier");
+
+    if let Some(map) = drain_to_latest_redraw(incoming, &keep) {
+        return map;
+    }
+    // The barrier guarantees the input's redraw is queued before its response, so
+    // the drain above should have found it. Under heavy load the reader task can
+    // still lag; poll a bounded while rather than failing on the first miss.
+    for _ in 0..200 {
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        if let Some(map) = drain_to_latest_redraw(incoming, &keep) {
+            return map;
+        }
+    }
+    panic!("no redraw arrived for {keys:?}");
+}
+
+/// Feed `keys` and return the freshest resulting `redraw` — the common case.
+pub async fn redraw_after(
+    rpc: &Rpc,
+    incoming: &mut UnboundedReceiver<Incoming>,
+    keys: &str,
+) -> Vec<(Value, Value)> {
+    redraw_after_matching(rpc, incoming, keys, |_| true).await
+}
+
+/// Feed `keys` and return the resulting message line ([`message`] over
+/// [`redraw_after`]).
+pub async fn message_after(
+    rpc: &Rpc,
+    incoming: &mut UnboundedReceiver<Incoming>,
+    keys: &str,
+) -> String {
+    message(&redraw_after(rpc, incoming, keys).await)
+}
+
+// ===== polling ===============================================================
+
+/// Poll the Lua expression `code` (which must `return` a boolean) until it reads
+/// `true` or the budget runs out — for state that settles asynchronously
+/// (a plugin load, an off-tick chain).
+pub async fn poll_true(rpc: &Rpc, code: &str) -> bool {
+    for _ in 0..200 {
+        if lua_bool(rpc, code).await == Some(true) {
+            return true;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    false
+}
+
+// ===== menu (picker / completion popup) ======================================
+
+/// Poll for the latest redraw whose `menu` key is a map — the widget is open —
+/// returning that frame (*map convention*), or `None` if none arrives within the
+/// poll window. Each round sends a [`barrier`] to flush the server's queued
+/// redraw onto the wire, then takes the latest matching frame.
+pub async fn poll_menu(
+    rpc: &Rpc,
+    incoming: &mut UnboundedReceiver<Incoming>,
+) -> Option<Vec<(Value, Value)>> {
+    for _ in 0..60 {
+        barrier(rpc).await;
+        if let Some(map) = drain_to_latest_redraw(incoming, |m| {
+            matches!(map_get(m, "menu"), Some(Value::Map(_)))
+        }) {
+            return Some(map);
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    None
+}
+
+/// Poll for the latest redraw whose `menu` key is *absent / nil* — no popup —
+/// returning that frame so the caller can also assert on it, or `None` if every
+/// frame in the window still carries a menu.
+pub async fn poll_no_menu(
+    rpc: &Rpc,
+    incoming: &mut UnboundedReceiver<Incoming>,
+) -> Option<Vec<(Value, Value)>> {
+    for _ in 0..60 {
+        barrier(rpc).await;
+        if let Some(map) = drain_to_latest_redraw(incoming, |m| {
+            !matches!(map_get(m, "menu"), Some(Value::Map(_)))
+        }) {
+            return Some(map);
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    None
+}
+
+/// The `menu` sub-map of a redraw map (panics when absent) — pair with
+/// [`poll_menu`], whose `Some` already guarantees it.
+pub fn menu_of(map: &[(Value, Value)]) -> Vec<(Value, Value)> {
+    match map_get(map, "menu") {
+        Some(Value::Map(m)) => m.clone(),
+        other => panic!("expected a menu map, got {other:?}"),
+    }
+}
+
+/// The menu's visible row labels, in order. Takes the `menu` **sub-map** (see
+/// [`menu_of`]); a row is `[label, ...]` or a bare label string.
+pub fn menu_items(menu: &[(Value, Value)]) -> Vec<String> {
+    match map_get(menu, "items") {
+        Some(Value::Array(items)) => items
+            .iter()
+            .map(|row| match row {
+                Value::Array(a) => a.first().and_then(Value::as_str).unwrap_or("").to_string(),
+                Value::String(s) => s.as_str().unwrap_or("").to_string(),
+                other => panic!("unexpected menu row {other:?}"),
+            })
+            .collect(),
+        other => panic!("expected menu items array, got {other:?}"),
+    }
+}
+
 // ===== temp filesystem =======================================================
 
 /// A unique suffix (`<pid>_<n>_<rand>`) for temp paths, stable within a test
@@ -556,6 +771,13 @@ fn write_new(path: &std::path::Path, content: &[u8]) {
     f.write_all(content).expect("write temp file");
 }
 
+/// Escape `path` for interpolation into a double-quoted Lua string literal.
+pub fn q(path: &std::path::Path) -> String {
+    path.to_string_lossy()
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"")
+}
+
 /// A fresh, uniquely-named `.txt` temp file path (not created).
 pub fn temp_path(tag: &str) -> PathBuf {
     std::env::temp_dir().join(format!("nxvim_test_{tag}_{}.txt", unique()))
@@ -584,6 +806,226 @@ pub fn write_n_lines(tag: &str, n: usize) -> String {
     let body: String = (1..=n).map(|i| format!("line{i}\n")).collect();
     write_new(&path, body.as_bytes());
     path.to_string_lossy().into_owned()
+}
+
+// ===== daemon wire ===========================================================
+
+/// An in-memory [`HostFs`](nxvim_core::HostFs) for the **daemon** side of the
+/// daemon-wire suites: path → bytes, plus optional directories. Paths under
+/// `/virtual/...` prove content crossed the wire — the edit-host's local disk
+/// cannot read them. Without registered directories,
+/// [`read_dir`](nxvim_core::HostFs::read_dir) errors on every path, so the
+/// daemon's file/dir/new classification resolves a stored path to a file and an
+/// absent one to a new-file — never mistaking a file for a directory.
+#[derive(Clone, Default)]
+pub struct DaemonFs {
+    inner: Arc<Mutex<DaemonFsTree>>,
+}
+
+#[derive(Default)]
+struct DaemonFsTree {
+    files: std::collections::HashMap<PathBuf, Vec<u8>>,
+    dirs: std::collections::HashMap<PathBuf, Vec<(bool, String)>>,
+    fail_writes: bool,
+}
+
+impl DaemonFs {
+    /// A fake pre-seeded with one file.
+    pub fn with(path: &str, contents: &str) -> Self {
+        let me = DaemonFs::default();
+        me.set(path, contents);
+        me
+    }
+
+    /// A fake pre-seeded with several `(path, contents)` files — for multi-buffer
+    /// tests (`:wall` / `:wqa`, cross-file LSP).
+    pub fn with_files(entries: &[(&str, &str)]) -> Self {
+        let me = DaemonFs::default();
+        for (path, contents) in entries {
+            me.set(path, contents);
+        }
+        me
+    }
+
+    /// Store (or overwrite) `path`'s contents — both a test's initial seeding and a
+    /// mid-test mutation (an external writer changing the remote file) a reload or
+    /// the file watch should then see across the wire. Chainable.
+    pub fn set(&self, path: &str, contents: &str) -> &Self {
+        self.set_bytes(path, contents.as_bytes())
+    }
+
+    /// Store raw `bytes` (not necessarily valid UTF-8) — for the encoding-seam
+    /// tests. Chainable.
+    pub fn set_bytes(&self, path: &str, bytes: &[u8]) -> &Self {
+        self.inner
+            .lock()
+            .unwrap()
+            .files
+            .insert(PathBuf::from(path), bytes.to_vec());
+        self
+    }
+
+    /// Register a directory at `path` whose entries are `(is_dir, name)` pairs.
+    /// Chainable.
+    pub fn dir(&self, path: &str, entries: &[(bool, &str)]) -> &Self {
+        let entries = entries
+            .iter()
+            .map(|(is_dir, name)| (*is_dir, name.to_string()))
+            .collect();
+        self.inner
+            .lock()
+            .unwrap()
+            .dirs
+            .insert(PathBuf::from(path), entries);
+        self
+    }
+
+    /// Make every subsequent [`write_atomic`](nxvim_core::HostFs::write_atomic)
+    /// fail loud (`PermissionDenied`) — the edit-host must surface it, never
+    /// report a silent success. Chainable.
+    pub fn fail_writes(&self, fail: bool) -> &Self {
+        self.inner.lock().unwrap().fail_writes = fail;
+        self
+    }
+
+    /// The bytes currently stored at `path`, as a string — the daemon's view of
+    /// what the editor wrote across the wire. `None` if nothing is stored there.
+    pub fn content(&self, path: &str) -> Option<String> {
+        self.inner
+            .lock()
+            .unwrap()
+            .files
+            .get(std::path::Path::new(path))
+            .map(|b| String::from_utf8_lossy(b).into_owned())
+    }
+}
+
+impl nxvim_core::HostFs for DaemonFs {
+    fn exists(&self, path: &std::path::Path) -> bool {
+        let t = self.inner.lock().unwrap();
+        t.files.contains_key(path) || t.dirs.contains_key(path)
+    }
+
+    fn open_read(&self, path: &std::path::Path) -> std::io::Result<Box<dyn std::io::Read>> {
+        match self.inner.lock().unwrap().files.get(path) {
+            Some(bytes) => Ok(Box::new(std::io::Cursor::new(bytes.clone()))),
+            None => Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "no such file",
+            )),
+        }
+    }
+
+    fn stat(&self, path: &std::path::Path) -> Option<nxvim_core::FileStat> {
+        self.inner
+            .lock()
+            .unwrap()
+            .files
+            .get(path)
+            .map(|b| nxvim_core::FileStat {
+                mtime: None,
+                size: b.len() as u64,
+            })
+    }
+
+    fn write_atomic(&self, path: &std::path::Path, contents: &[u8]) -> std::io::Result<()> {
+        let mut t = self.inner.lock().unwrap();
+        if t.fail_writes {
+            // A loud failure the edit-host must surface — never a silent success.
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "daemon refuses the write",
+            ));
+        }
+        t.files.insert(path.to_path_buf(), contents.to_vec());
+        Ok(())
+    }
+
+    fn read_dir(&self, dir: &std::path::Path) -> std::io::Result<Vec<nxvim_core::DirEntry>> {
+        match self.inner.lock().unwrap().dirs.get(dir) {
+            Some(entries) => Ok(entries
+                .iter()
+                .map(|(is_dir, name)| nxvim_core::DirEntry {
+                    is_dir: *is_dir,
+                    name: name.clone(),
+                })
+                .collect()),
+            // No directory registered: a file path must not classify as one.
+            None => Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "not a directory",
+            )),
+        }
+    }
+
+    fn canonicalize(&self, path: &std::path::Path) -> std::io::Result<PathBuf> {
+        Ok(path.to_path_buf())
+    }
+}
+
+/// Start a server whose async fs is a [`nxvim_server::RemoteHostFs`] talking to a
+/// [`nxvim_server::serve_fs_daemon`] (backed by `fake`) over an in-process duplex,
+/// with `init`'s other fields as given (`host_fs_async` is filled in here).
+/// UI-attached. The daemon task and the remote fs's RPC tasks live on the test
+/// runtime; the server runs on its own thread and reaches the daemon only through
+/// the injected async fs. The client's notification receiver is returned (not
+/// dropped: dropping it would tear the client connection down and stop the server).
+pub async fn spawn_with_daemon_fs_init(
+    fake: DaemonFs,
+    mut init: ServerInit,
+) -> (Rpc, UnboundedReceiver<Incoming>) {
+    let (edit_host_end, daemon_end) = tokio::io::duplex(1 << 16);
+    let (daemon_reader, daemon_writer) = tokio::io::split(daemon_end);
+    tokio::spawn(async move {
+        let _ = nxvim_server::serve_fs_daemon(daemon_reader, daemon_writer, Box::new(fake)).await;
+    });
+
+    let (host_reader, host_writer) = tokio::io::split(edit_host_end);
+    init.host_fs_async = Some(Box::new(nxvim_server::RemoteHostFs::connect(
+        host_reader,
+        host_writer,
+    )));
+    let (rpc, incoming) = spawn(init);
+    // `attach` returning proves startup did not block on the (deferred) file fetch.
+    attach(&rpc, 80, 24).await;
+    (rpc, incoming)
+}
+
+/// [`spawn_with_daemon_fs_init`] opening `file`, with an otherwise-default init —
+/// the common case.
+pub async fn spawn_with_daemon_fs(
+    fake: DaemonFs,
+    file: &str,
+) -> (Rpc, UnboundedReceiver<Incoming>) {
+    spawn_with_daemon_fs_init(
+        fake,
+        ServerInit {
+            file: Some(file.to_string()),
+            ..Default::default()
+        },
+    )
+    .await
+}
+
+/// Poll the current buffer's lines until `pred` accepts them or the budget runs
+/// out — an off-tick fill (initial daemon fetch, `:e` reload, async listing)
+/// lands a moment after the triggering action, so a bounded retry beats a fixed
+/// sleep. Returns the final lines either way, so a failed assert shows what
+/// *did* arrive.
+pub async fn await_lines_where(rpc: &Rpc, pred: impl Fn(&[String]) -> bool) -> Vec<String> {
+    for _ in 0..200 {
+        let lines = buf_lines(rpc, 0).await;
+        if pred(&lines) {
+            return lines;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    buf_lines(rpc, 0).await
+}
+
+/// [`await_lines_where`] for the common case: poll until the lines equal `want`.
+pub async fn await_lines(rpc: &Rpc, want: &[&str]) -> Vec<String> {
+    await_lines_where(rpc, |lines| lines == want).await
 }
 
 // ===== serialization =========================================================

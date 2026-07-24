@@ -14,7 +14,7 @@ use nxvim_rpc::{Incoming, Rpc};
 use nxvim_server::ServerInit;
 use nxvim_test_harness::{
     attach, barrier, drain_latest_redraw, drain_to_latest_redraw, exec_lua, feed, lines, map_get,
-    message_of, spawn, temp_dir, wait_redraw,
+    menu_of, message_of, poll_menu, poll_no_menu, spawn, temp_dir, wait_redraw,
 };
 use rmpv::Value;
 use tokio::sync::mpsc::UnboundedReceiver;
@@ -33,57 +33,10 @@ async fn start(dir: &std::path::Path, init_lua: &str) -> (Rpc, UnboundedReceiver
 
 const INIT: &str = "nx.cmdline_complete.setup {}";
 
-/// Poll for the latest redraw whose `menu` key is a map (the take-latest pattern).
-async fn poll_menu(
-    rpc: &Rpc,
-    incoming: &mut UnboundedReceiver<Incoming>,
-) -> Option<Vec<(Value, Value)>> {
-    for _ in 0..60 {
-        nxvim_test_harness::barrier(rpc).await;
-        if let Some(map) = drain_to_latest_redraw(incoming, |m| {
-            matches!(map_get(m, "menu"), Some(Value::Map(_)))
-        }) {
-            return Some(map);
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-    }
-    None
-}
-
-/// Poll for the latest redraw whose `menu` key is *absent / nil* (no popup), and
-/// return that frame so the caller can also assert on it (e.g. `command_mode`).
-async fn poll_no_menu(
-    rpc: &Rpc,
-    incoming: &mut UnboundedReceiver<Incoming>,
-) -> Option<Vec<(Value, Value)>> {
-    for _ in 0..60 {
-        nxvim_test_harness::barrier(rpc).await;
-        if let Some(map) = drain_to_latest_redraw(incoming, |m| {
-            !matches!(map_get(m, "menu"), Some(Value::Map(_)))
-        }) {
-            return Some(map);
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-    }
-    None
-}
-
+/// The visible row labels of the redraw map's menu — this suite's call sites all
+/// hold the whole frame, so this adapts the harness pair to that convention.
 fn menu_items(map: &[(Value, Value)]) -> Vec<String> {
-    let menu = match map_get(map, "menu") {
-        Some(Value::Map(m)) => m,
-        other => panic!("expected a menu map, got {other:?}"),
-    };
-    match map_get(menu, "items") {
-        Some(Value::Array(items)) => items
-            .iter()
-            .map(|row| match row {
-                Value::Array(a) => a.first().and_then(Value::as_str).unwrap_or("").to_string(),
-                Value::String(s) => s.as_str().unwrap_or("").to_string(),
-                other => panic!("unexpected menu row {other:?}"),
-            })
-            .collect(),
-        other => panic!("expected menu items array, got {other:?}"),
-    }
+    nxvim_test_harness::menu_items(&menu_of(map))
 }
 
 fn command_mode(map: &[(Value, Value)]) -> bool {
@@ -1850,33 +1803,6 @@ async fn space_past_a_command_closes_the_wildmenu_and_does_not_auto_open_arg_com
     assert!(
         items.contains(&"number".to_string()),
         "the option completer ran on the explicit <Tab>: {items:?}"
-    );
-}
-
-/// The shipped `examples/cmdline-completion` config loads end-to-end (so it can't
-/// rot): the engine is on and the `cmdline_files` picker source the file-path
-/// completion hands off to is registered.
-#[tokio::test]
-async fn example_cmdline_completion_config_loads() {
-    let root =
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/cmdline-completion");
-    let init = ServerInit {
-        config_dir: Some(root.clone()),
-        runtimepath: vec![root],
-        ..Default::default()
-    };
-    let (rpc, _incoming) = spawn(init);
-    attach(&rpc, 80, 24).await;
-    let ok = exec_lua(
-        &rpc,
-        "return tostring(type(nx._cmdline_complete_run))
-           .. '|' .. tostring(nx.picker._sources.cmdline_files ~= nil)",
-    )
-    .await;
-    assert_eq!(
-        ok.as_str(),
-        Some("function|true"),
-        "example loaded: completer + the cmdline_files picker source"
     );
 }
 

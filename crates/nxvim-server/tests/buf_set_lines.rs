@@ -4,20 +4,9 @@
 //! (replace / whole-buffer / delete / append), undo, the `modified` flag, and the
 //! fail-loud guards (nomodifiable, non-string line). Driven over RPC like the siblings.
 
-use nxvim_rpc::{Incoming, Rpc};
-use nxvim_server::ServerInit;
-use nxvim_test_harness::{exec_lua, start_attached, write_temp};
+use nxvim_rpc::Rpc;
+use nxvim_test_harness::{exec_lua, start_with_file as open};
 use rmpv::Value;
-use tokio::sync::mpsc::UnboundedReceiver;
-
-async fn open(content: &str) -> (Rpc, UnboundedReceiver<Incoming>) {
-    let path = write_temp("buf_set_lines", "txt", content);
-    let init = ServerInit {
-        file: Some(path),
-        ..Default::default()
-    };
-    start_attached(init, 80, 24).await
-}
 
 /// The current buffer's lines joined with `|`.
 async fn lines(rpc: &Rpc) -> String {

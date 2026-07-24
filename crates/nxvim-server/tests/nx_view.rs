@@ -11,34 +11,14 @@
 use nxvim_rpc::{Incoming, Rpc};
 use nxvim_server::ServerInit;
 use nxvim_test_harness::{
-    attach, cursor, drain_to_latest_redraw, exec_lua, feed, feed_mouse_at, lines, lua_u64, map_get,
-    mode, spawn, start_attached, write_temp, TestClock,
+    cursor, drain_to_latest_redraw, exec_lua, feed_mouse_at, feed_sync, lines, lua_u64, map_get,
+    mode, start_attached, start_clocked, write_temp,
 };
 use rmpv::Value;
 use tokio::sync::mpsc::UnboundedReceiver;
 
 async fn start() -> (Rpc, UnboundedReceiver<Incoming>) {
     start_attached(ServerInit::default(), 80, 24).await
-}
-
-/// Like [`start`], but inject a fake mouse clock so a deterministic double-click can be
-/// driven (two presses inside `'mousetime'`). The incoming channel must be kept alive.
-async fn start_clocked() -> (Rpc, TestClock, UnboundedReceiver<Incoming>) {
-    let clock = TestClock::new();
-    let init = ServerInit {
-        mouse_clock: Some(clock.handle()),
-        ..Default::default()
-    };
-    let (rpc, incoming) = spawn(init);
-    attach(&rpc, 80, 24).await;
-    (rpc, clock, incoming)
-}
-
-/// Feed `keys`, then a `nvim_get_mode` barrier so the input is fully processed
-/// before the following read.
-async fn feed_sync(rpc: &Rpc, keys: &str) {
-    feed(rpc, keys);
-    rpc.request("nvim_get_mode", vec![]).await.expect("barrier");
 }
 
 async fn win_count(rpc: &Rpc) -> usize {

@@ -5,7 +5,6 @@
 //! helpers that several submodules share (the `start*` fixtures, the redraw/view
 //! accessors, the panel and substitute conveniences). Each submodule pulls the
 //! whole surface in with a single `use crate::support::*;`.
-#![allow(dead_code)]
 // These re-exports are a single glob surface for the submodules; not every one is
 // used by every submodule, and a few (the lower-level RPC/server types) are only
 // here for completeness, so quiet the unused-import lint on the re-export block.
@@ -52,62 +51,6 @@ pub async fn start_with_clipboard() -> (Rpc, UnboundedReceiver<Incoming>, FakeCl
 }
 
 // ===== redraw / view accessors ===============================================
-
-/// Feed `keys`, then return the most recent queued `redraw` satisfying `keep`.
-///
-/// The server processes messages serially, writing each message's response and
-/// then its `redraw`. We send `nx_input` then a `nvim_get_mode` barrier; the
-/// wire order is input-response, input-redraw, barrier-response, barrier-redraw,
-/// and the client's reader task ferries it into `incoming` in that same order.
-/// So once the barrier `.await` resolves, the input's redraw is guaranteed
-/// queued.
-///
-/// We take the most recent qualifying redraw, not the first. A redraw still in
-/// flight from earlier in the test — the startup frame, or a previous call's
-/// trailing barrier repaint — can land in `incoming` after the pre-drain below
-/// when the reader task lags under load, and taking the first would then return
-/// that stale frame (the source of the intermittent failures). `keep` lets a
-/// caller pin the exact frame it means: the default takes the freshest state
-/// (the barrier's repaint is state-identical to the input's), while scroll tests
-/// pass [`has_scroll`] to single out the input's frame, the only one carrying
-/// the one-shot `scroll` gesture (which the trailing barrier repaint lacks).
-pub async fn redraw_after_matching(
-    rpc: &Rpc,
-    incoming: &mut UnboundedReceiver<Incoming>,
-    keys: &str,
-    keep: impl Fn(&[(Value, Value)]) -> bool,
-) -> Vec<(Value, Value)> {
-    while incoming.try_recv().is_ok() {} // discard any buffered notifications from earlier in the test
-
-    // request (not notify): the server responds *then* redraws, and the barrier below relies on that ordering
-    rpc.request("nx_input", vec![Value::from(keys)])
-        .await
-        .expect("input");
-    rpc.request("nvim_get_mode", vec![]).await.expect("barrier");
-
-    if let Some(map) = drain_to_latest_redraw(incoming, &keep) {
-        return map;
-    }
-    // The barrier guarantees the input's redraw is queued before its response, so
-    // the drain above should have found it. Under heavy load the reader task can
-    // still lag; poll a bounded while rather than failing on the first miss.
-    for _ in 0..200 {
-        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        if let Some(map) = drain_to_latest_redraw(incoming, &keep) {
-            return map;
-        }
-    }
-    panic!("no redraw arrived for {keys:?}");
-}
-
-/// Feed `keys` and return the freshest resulting `redraw` — the common case.
-pub async fn redraw_after(
-    rpc: &Rpc,
-    incoming: &mut UnboundedReceiver<Incoming>,
-    keys: &str,
-) -> Vec<(Value, Value)> {
-    redraw_after_matching(rpc, incoming, keys, |_| true).await
-}
 
 /// Feed `keys` and return the `redraw` carrying the one-shot `scroll` gesture —
 /// the input's own frame, not the state-only barrier repaint that trails it.
@@ -468,19 +411,13 @@ pub fn hl_color(map: &[(Value, Value)], key: &str) -> Option<u64> {
 
 // ===== config fixture ========================================================
 
-/// Start a server whose config dir / runtimepath is `dir`, after writing
-/// `init_lua` to `<dir>/init.lua`. Returns the connected client.
+/// The harness [`nxvim_test_harness::start_with_config`], at this suite's 80×25
+/// geometry (see [`start_with`]) — shadowing the glob re-export on purpose.
 pub async fn start_with_config(
     dir: &std::path::Path,
     init_lua: &str,
 ) -> (Rpc, UnboundedReceiver<Incoming>) {
-    std::fs::write(dir.join("init.lua"), init_lua).expect("write init.lua");
-    start_with(ServerInit {
-        config_dir: Some(dir.to_path_buf()),
-        runtimepath: vec![dir.to_path_buf()],
-        ..Default::default()
-    })
-    .await
+    start_with(config_init(dir, init_lua)).await
 }
 
 /// The message line from the redraw produced by a no-op input — i.e. whatever
@@ -525,24 +462,6 @@ pub async fn latest_after(
 ) -> Vec<(Value, Value)> {
     rpc.notify("nx_input", vec![Value::from(keys)]);
     drain_latest(rpc, incoming).await
-}
-
-/// Barrier, then return the params of the most recent `want` notification
-/// buffered on the connection, or `None` if none arrived.
-pub async fn drain_notify(
-    rpc: &Rpc,
-    incoming: &mut UnboundedReceiver<Incoming>,
-    want: &str,
-) -> Option<Vec<Value>> {
-    rpc.request("nvim_get_mode", vec![]).await.expect("barrier");
-    tokio::task::yield_now().await;
-    let mut found = None;
-    while let Ok(Incoming::Notification { method, params }) = incoming.try_recv() {
-        if method == want {
-            found = Some(params);
-        }
-    }
-    found
 }
 
 // ===== substitute / fixtures =================================================

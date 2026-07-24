@@ -12,71 +12,20 @@
 //! disk can't hold (a `/virtual/...` path) — so its content can only have crossed the
 //! wire. Black-box: assert on the `preview` pane in the `redraw` frame.
 
-use std::collections::HashMap;
-use std::io::{self, Cursor, Read};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
 
-use nxvim_core::{DirEntry, FileStat, HostFs};
 use nxvim_rpc::{Incoming, Rpc};
-use nxvim_server::{RemoteHostFs, ServerInit};
-use nxvim_test_harness::{attach, barrier, drain_to_latest_redraw, exec_lua, map_get, spawn};
+use nxvim_server::ServerInit;
+use nxvim_test_harness::{
+    barrier, drain_to_latest_redraw, exec_lua, map_get, spawn_with_daemon_fs_init, DaemonFs,
+};
 use rmpv::Value;
 use tokio::sync::mpsc::UnboundedReceiver;
-
-/// An in-memory multi-file [`HostFs`] for the daemon side: path → bytes. `read_dir`
-/// errors everywhere (no directories), so a stored path is a file and an absent one a
-/// new-file.
-#[derive(Clone, Default)]
-struct DaemonFs {
-    files: Arc<Mutex<HashMap<PathBuf, Vec<u8>>>>,
-}
-
-impl DaemonFs {
-    fn set(&self, path: &str, contents: &str) -> &Self {
-        self.files
-            .lock()
-            .unwrap()
-            .insert(PathBuf::from(path), contents.as_bytes().to_vec());
-        self
-    }
-}
-
-impl HostFs for DaemonFs {
-    fn exists(&self, path: &Path) -> bool {
-        self.files.lock().unwrap().contains_key(path)
-    }
-    fn open_read(&self, path: &Path) -> io::Result<Box<dyn Read>> {
-        match self.files.lock().unwrap().get(path) {
-            Some(bytes) => Ok(Box::new(Cursor::new(bytes.clone()))),
-            None => Err(io::Error::new(io::ErrorKind::NotFound, "no such file")),
-        }
-    }
-    fn stat(&self, path: &Path) -> Option<FileStat> {
-        self.files.lock().unwrap().get(path).map(|b| FileStat {
-            mtime: None,
-            size: b.len() as u64,
-        })
-    }
-    fn write_atomic(&self, path: &Path, contents: &[u8]) -> io::Result<()> {
-        self.files
-            .lock()
-            .unwrap()
-            .insert(path.to_path_buf(), contents.to_vec());
-        Ok(())
-    }
-    fn read_dir(&self, _dir: &Path) -> io::Result<Vec<DirEntry>> {
-        Err(io::Error::new(io::ErrorKind::NotFound, "no dirs"))
-    }
-    fn canonicalize(&self, path: &Path) -> io::Result<PathBuf> {
-        Ok(path.to_path_buf())
-    }
-}
 
 /// A server whose async fs is a `RemoteHostFs` over an in-process duplex to a
 /// `serve_fs_daemon(fake)` — off-tick fs on, like a daemon / the browser. `config_dir`
 /// loads `init_lua` so a test can register a custom picker source.
-async fn spawn_with_daemon_fs(
+async fn spawn_with_daemon(
     fake: DaemonFs,
     file: &str,
     config_dir: &Path,
@@ -84,25 +33,17 @@ async fn spawn_with_daemon_fs(
     remote_cwd: Option<&str>,
 ) -> (Rpc, UnboundedReceiver<Incoming>) {
     std::fs::write(config_dir.join("init.lua"), init_lua).expect("write init.lua");
-    let (edit_host_end, daemon_end) = tokio::io::duplex(1 << 16);
-    let (daemon_reader, daemon_writer) = tokio::io::split(daemon_end);
-    tokio::spawn(async move {
-        let _ = nxvim_server::serve_fs_daemon(daemon_reader, daemon_writer, Box::new(fake)).await;
-    });
-
-    let (host_reader, host_writer) = tokio::io::split(edit_host_end);
-    let remote = RemoteHostFs::connect(host_reader, host_writer);
-    let init = ServerInit {
-        file: Some(file.to_string()),
-        host_fs_async: Some(Box::new(remote)),
-        config_dir: Some(config_dir.to_path_buf()),
-        runtimepath: vec![config_dir.to_path_buf()],
-        remote_cwd: remote_cwd.map(PathBuf::from),
-        ..Default::default()
-    };
-    let (rpc, incoming) = spawn(init);
-    attach(&rpc, 80, 24).await;
-    (rpc, incoming)
+    spawn_with_daemon_fs_init(
+        fake,
+        ServerInit {
+            file: Some(file.to_string()),
+            config_dir: Some(config_dir.to_path_buf()),
+            runtimepath: vec![config_dir.to_path_buf()],
+            remote_cwd: remote_cwd.map(PathBuf::from),
+            ..Default::default()
+        },
+    )
+    .await
 }
 
 /// Poll for the latest redraw whose `menu.preview.lines` are present, returning those
@@ -157,7 +98,7 @@ nx.picker.source {
 }
 "#;
     let (rpc, mut incoming) =
-        spawn_with_daemon_fs(fake, "/virtual/start.txt", &dir, init_lua, None).await;
+        spawn_with_daemon(fake, "/virtual/start.txt", &dir, init_lua, None).await;
 
     exec_lua(&rpc, "nx.picker.open('preview_test')").await;
 
@@ -193,7 +134,7 @@ nx.picker.source {
 }
 "#;
     let (rpc, mut incoming) =
-        spawn_with_daemon_fs(fake, "/virtual/start.txt", &dir, init_lua, Some("/virtual")).await;
+        spawn_with_daemon(fake, "/virtual/start.txt", &dir, init_lua, Some("/virtual")).await;
 
     exec_lua(&rpc, "nx.picker.open('rel_test')").await;
 

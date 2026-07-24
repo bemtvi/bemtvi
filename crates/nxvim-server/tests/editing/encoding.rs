@@ -483,62 +483,40 @@ async fn c0_only_line_keys_the_special_key_overlay_at_the_token_width() {
 // so a user opts in by setting `'fileencodings'` (or `'fileencoding'`) explicitly.
 
 #[tokio::test]
-async fn shift_jis_decodes_and_round_trips_via_fileencodings() {
-    // A real Shift_JIS file (no BOM, invalid as UTF-8). With shift_jis added to
-    // 'fileencodings' *before* the read, `:e` detects it: 日本語 decodes, the buffer
-    // carries fileencoding=shift_jis, and `:w` reproduces the canonical Shift_JIS
-    // multibyte sequences byte-for-byte.
-    let path = temp_path("enc_sjis");
-    let original: &[u8] = b"\x93\xfa\x96\x7b\x8c\xea\n"; // 日本語\n in Shift_JIS
-    std::fs::write(&path, original).expect("write shift_jis file");
+async fn cjk_codecs_decode_and_round_trip_via_fileencodings() {
+    // A real CJK file per codec (no BOM, invalid as UTF-8). With the codec added
+    // to 'fileencodings' *before* the read, `:e` detects it: 日本語 decodes, the
+    // buffer carries that fileencoding, and `:w` reproduces the canonical
+    // multibyte sequences byte-for-byte — two codec families, one contract.
+    for (codec, original) in [
+        ("shift_jis", b"\x93\xfa\x96\x7b\x8c\xea\n" as &[u8]), // 日本語\n in Shift_JIS
+        ("euc-jp", b"\xc6\xfc\xcb\xdc\xb8\xec\n"),             // 日本語\n in EUC-JP
+    ] {
+        let path = temp_path("enc_cjk");
+        std::fs::write(&path, original).expect("write cjk file");
 
-    let (rpc, mut incoming) = start(None).await;
-    feed(
-        &rpc,
-        ":set fileencodings=ucs-bom,utf-8,shift_jis,latin1<CR>",
-    );
-    feed(&rpc, &format!(":e {}<CR>", path.to_string_lossy()));
+        let (rpc, mut incoming) = start(None).await;
+        feed(
+            &rpc,
+            &format!(":set fileencodings=ucs-bom,utf-8,{codec},latin1<CR>"),
+        );
+        feed(&rpc, &format!(":e {}<CR>", path.to_string_lossy()));
 
-    assert_eq!(lines(&rpc).await, vec!["日本語"]);
-    let map = redraw_after(&rpc, &mut incoming, ":set fenc?<CR>").await;
-    assert_eq!(
-        field(&map, "message").and_then(Value::as_str),
-        Some("fileencoding=shift_jis"),
-        "the file is detected as shift_jis from 'fileencodings'"
-    );
+        assert_eq!(lines(&rpc).await, vec!["日本語"], "[{codec}] decoded");
+        let map = redraw_after(&rpc, &mut incoming, ":set fenc?<CR>").await;
+        assert_eq!(
+            field(&map, "message").and_then(Value::as_str),
+            Some(format!("fileencoding={codec}").as_str()),
+            "[{codec}] detected from 'fileencodings'"
+        );
 
-    redraw_after(&rpc, &mut incoming, ":w<CR>").await;
-    assert_eq!(
-        std::fs::read(&path).expect("re-read"),
-        original,
-        "writing a Shift_JIS buffer reproduces the multibyte sequences exactly"
-    );
-}
-
-#[tokio::test]
-async fn euc_jp_decodes_and_round_trips_via_fileencodings() {
-    // A second multibyte family, to exercise the encoder for a different CJK codec.
-    let path = temp_path("enc_eucjp");
-    let original: &[u8] = b"\xc6\xfc\xcb\xdc\xb8\xec\n"; // 日本語\n in EUC-JP
-    std::fs::write(&path, original).expect("write euc-jp file");
-
-    let (rpc, mut incoming) = start(None).await;
-    feed(&rpc, ":set fileencodings=ucs-bom,utf-8,euc-jp,latin1<CR>");
-    feed(&rpc, &format!(":e {}<CR>", path.to_string_lossy()));
-
-    assert_eq!(lines(&rpc).await, vec!["日本語"]);
-    let map = redraw_after(&rpc, &mut incoming, ":set fenc?<CR>").await;
-    assert_eq!(
-        field(&map, "message").and_then(Value::as_str),
-        Some("fileencoding=euc-jp")
-    );
-
-    redraw_after(&rpc, &mut incoming, ":w<CR>").await;
-    assert_eq!(
-        std::fs::read(&path).expect("re-read"),
-        original,
-        "writing an EUC-JP buffer reproduces the multibyte sequences exactly"
-    );
+        redraw_after(&rpc, &mut incoming, ":w<CR>").await;
+        assert_eq!(
+            std::fs::read(&path).expect("re-read"),
+            original,
+            "[{codec}] writing reproduces the multibyte sequences exactly"
+        );
+    }
 }
 
 #[tokio::test]

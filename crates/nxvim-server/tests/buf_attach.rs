@@ -5,20 +5,9 @@
 //! wholesale rope replace (undo) fires `on_reload` instead, and that the shape guards
 //! fail loud. Driven over RPC; edits are fed as real keystrokes.
 
-use nxvim_rpc::{Incoming, Rpc};
-use nxvim_server::ServerInit;
-use nxvim_test_harness::{exec_lua, feed, start_attached, write_temp};
+use nxvim_rpc::Rpc;
+use nxvim_test_harness::{exec_lua, feed, start_with_file as open};
 use rmpv::Value;
-use tokio::sync::mpsc::UnboundedReceiver;
-
-async fn open(content: &str) -> (Rpc, UnboundedReceiver<Incoming>) {
-    let path = write_temp("buf_attach", "txt", content);
-    let init = ServerInit {
-        file: Some(path),
-        ..Default::default()
-    };
-    start_attached(init, 80, 24).await
-}
 
 /// A string read back from a Lua global.
 async fn read(rpc: &Rpc, expr: &str) -> String {

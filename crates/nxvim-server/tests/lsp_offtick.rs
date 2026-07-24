@@ -13,109 +13,7 @@
 //! edit-host's *local* disk cannot read — so the renamed content appearing in its
 //! buffer can only have come across the wire from the daemon's fs.
 
-use std::collections::HashMap;
-use std::io::{self, Cursor, Read};
-use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
-use std::time::Duration;
-
-use nxvim_core::{DirEntry, FileStat, HostFs};
-use nxvim_rpc::{Incoming, Rpc};
-use nxvim_server::{RemoteHostFs, ServerInit};
-use nxvim_test_harness::{attach, buf_lines, command, exec_lua, spawn};
-use tokio::sync::mpsc::UnboundedReceiver;
-
-/// An in-memory [`HostFs`] for the **daemon** side: path -> bytes. `read_dir` errors
-/// on every path (it models no directories), so a stored path classifies as a file
-/// and an absent one as a new-file — never a directory. (Mirrors the fake in
-/// `daemon_fs.rs`.)
-#[derive(Clone, Default)]
-struct DaemonFs {
-    files: Arc<Mutex<HashMap<PathBuf, Vec<u8>>>>,
-}
-
-impl DaemonFs {
-    fn with(entries: &[(&str, &str)]) -> Self {
-        let me = DaemonFs::default();
-        let mut map = me.files.lock().unwrap();
-        for (path, contents) in entries {
-            map.insert(PathBuf::from(path), contents.as_bytes().to_vec());
-        }
-        drop(map);
-        me
-    }
-}
-
-impl HostFs for DaemonFs {
-    fn exists(&self, path: &Path) -> bool {
-        self.files.lock().unwrap().contains_key(path)
-    }
-
-    fn open_read(&self, path: &Path) -> io::Result<Box<dyn Read>> {
-        match self.files.lock().unwrap().get(path) {
-            Some(bytes) => Ok(Box::new(Cursor::new(bytes.clone()))),
-            None => Err(io::Error::new(io::ErrorKind::NotFound, "no such file")),
-        }
-    }
-
-    fn stat(&self, path: &Path) -> Option<FileStat> {
-        self.files.lock().unwrap().get(path).map(|b| FileStat {
-            mtime: None,
-            size: b.len() as u64,
-        })
-    }
-
-    fn write_atomic(&self, path: &Path, contents: &[u8]) -> io::Result<()> {
-        self.files
-            .lock()
-            .unwrap()
-            .insert(path.to_path_buf(), contents.to_vec());
-        Ok(())
-    }
-
-    fn read_dir(&self, _dir: &Path) -> io::Result<Vec<DirEntry>> {
-        Err(io::Error::new(io::ErrorKind::NotFound, "not a directory"))
-    }
-
-    fn canonicalize(&self, path: &Path) -> io::Result<PathBuf> {
-        Ok(path.to_path_buf())
-    }
-}
-
-/// Start a server whose async fs is a [`RemoteHostFs`] talking to a `serve_fs_daemon`
-/// (backed by `fake`) over an in-process duplex, opening `file`. UI-attached. The
-/// `incoming` receiver is returned (not dropped): dropping it tears the connection
-/// down and stops the server.
-async fn spawn_with_daemon_fs(fake: DaemonFs, file: &str) -> (Rpc, UnboundedReceiver<Incoming>) {
-    let (edit_host_end, daemon_end) = tokio::io::duplex(1 << 16);
-    let (daemon_reader, daemon_writer) = tokio::io::split(daemon_end);
-    tokio::spawn(async move {
-        let _ = nxvim_server::serve_fs_daemon(daemon_reader, daemon_writer, Box::new(fake)).await;
-    });
-
-    let (host_reader, host_writer) = tokio::io::split(edit_host_end);
-    let remote = RemoteHostFs::connect(host_reader, host_writer);
-    let init = ServerInit {
-        file: Some(file.to_string()),
-        host_fs_async: Some(Box::new(remote)),
-        ..Default::default()
-    };
-    let (rpc, incoming) = spawn(init);
-    attach(&rpc, 80, 24).await;
-    (rpc, incoming)
-}
-
-/// Poll the current buffer's lines until they match `want` or the budget runs out.
-async fn await_lines(rpc: &Rpc, want: &[&str]) -> Vec<String> {
-    for _ in 0..150 {
-        let got = buf_lines(rpc, 0).await;
-        if got == want {
-            return got;
-        }
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
-    buf_lines(rpc, 0).await
-}
+use nxvim_test_harness::{await_lines, command, exec_lua, spawn_with_daemon_fs, DaemonFs};
 
 /// A rename's `WorkspaceEdit` touches the open file *and* a file that was never
 /// opened, in a daemon session. The unopened file's bytes are fetched over the wire,
@@ -123,7 +21,7 @@ async fn await_lines(rpc: &Rpc, want: &[&str]) -> Vec<String> {
 /// reaches unopened files off-tick, not just locally.
 #[tokio::test]
 async fn workspace_edit_reaches_an_unopened_file_off_tick() {
-    let fake = DaemonFs::with(&[
+    let fake = DaemonFs::with_files(&[
         ("/virtual/a.rs", "let foo = 1\n"),
         ("/virtual/b.rs", "use a::foo;\nfn g() { foo() }\n"),
     ]);

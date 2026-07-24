@@ -11,25 +11,14 @@ use std::time::Duration;
 use nxvim_rpc::{Incoming, Rpc};
 use nxvim_server::ServerInit;
 use nxvim_test_harness::{
-    attach, command, cursor, drain_to_latest_redraw, exec_lua, feed, lines, map_get, mode,
-    serial_lock, spawn, start_attached, temp_dir, wait_redraw, window0_field, write_temp,
-    TestClock,
+    buf_name, command, cursor, drain_to_latest_redraw, exec_lua, feed, lines, map_get, mode,
+    serial_lock, start_attached, start_clocked, temp_dir, wait_redraw, window0_field, write_temp,
 };
 use rmpv::Value;
 use tokio::sync::mpsc::UnboundedReceiver;
 
 async fn start() -> (Rpc, UnboundedReceiver<Incoming>) {
     start_attached(ServerInit::default(), 80, 24).await
-}
-
-/// The current buffer's reported name (`nvim_buf_get_name`).
-async fn buf_name(rpc: &Rpc) -> String {
-    rpc.request("nvim_buf_get_name", vec![Value::from(0u64)])
-        .await
-        .expect("get_name")
-        .as_str()
-        .unwrap_or_default()
-        .to_string()
 }
 
 /// Poll the current buffer until `pred` holds, or panic after ~10s. PTY output is
@@ -413,19 +402,6 @@ async fn live_terminal_buffer_is_read_only() {
         before_dead,
         "a dead terminal buffer is editable"
     );
-}
-
-/// Start a clocked terminal session so the triple-`<Esc>` chord window is driven
-/// deterministically (no wall-clock timing in the test).
-async fn start_clocked() -> (Rpc, TestClock, UnboundedReceiver<Incoming>) {
-    let clock = TestClock::new();
-    let init = ServerInit {
-        mouse_clock: Some(clock.handle()),
-        ..Default::default()
-    };
-    let (rpc, incoming) = spawn(init);
-    attach(&rpc, 80, 24).await;
-    (rpc, clock, incoming)
 }
 
 /// Triple-`<Esc>` in quick succession (each press within the chord window) leaves

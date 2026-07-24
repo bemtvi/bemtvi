@@ -17,7 +17,7 @@ use nxvim_rpc::{Incoming, Rpc};
 use nxvim_server::ServerInit;
 use nxvim_test_harness::{
     attach, command, cursor, exec_lua, feed, feed_mouse, feed_mouse_at, field, lines, message,
-    mode, spawn, temp_dir, wait_redraw, write_temp, FakeClipboard, TestClock,
+    mode, spawn, start_clocked_init, temp_dir, wait_redraw, write_temp, FakeClipboard, TestClock,
 };
 use rmpv::Value;
 use tokio::sync::mpsc::UnboundedReceiver;
@@ -41,15 +41,11 @@ async fn start(content: &str) -> (Rpc, UnboundedReceiver<Incoming>) {
 /// [`feed_mouse_at`] to place clicks inside or outside `'mousetime'`.
 async fn start_clocked(content: &str) -> (Rpc, TestClock, UnboundedReceiver<Incoming>) {
     let path = write_temp("mouse", "txt", content);
-    let clock = TestClock::new();
-    let init = ServerInit {
+    start_clocked_init(ServerInit {
         file: Some(path),
-        mouse_clock: Some(clock.handle()),
         ..Default::default()
-    };
-    let (rpc, incoming) = spawn(init);
-    attach(&rpc, 80, 24).await;
-    (rpc, clock, incoming)
+    })
+    .await
 }
 
 /// Send a left-press with the `modifier` string (e.g. `"S"` for shift) — the

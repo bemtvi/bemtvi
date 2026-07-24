@@ -13,7 +13,8 @@
 use nxvim_rpc::{Incoming, Rpc};
 use nxvim_server::ServerInit;
 use nxvim_test_harness::{
-    attach, cursor, drain_to_latest_redraw, feed, lines, lua_bool, lua_u64, mode, spawn, temp_dir,
+    attach, cursor, drain_to_latest_redraw, exec_lua, feed, lines, lua_bool, lua_u64, mode, spawn,
+    temp_dir,
 };
 use rmpv::Value;
 use tokio::sync::mpsc::UnboundedReceiver;
@@ -1258,6 +1259,47 @@ async fn expr_map_sandbox_blocks_editor_mutation() {
         message(&redraw).contains("E5555") || message(&redraw).contains("Error"),
         "the textlock violation surfaced an error, got {:?}",
         message(&redraw)
+    );
+}
+
+/// The `<expr>` sandbox discards *every* effect queue, not just the handful the
+/// Lua textlock already blocks. Feedkeys is not stopped by `nx._expr_lock` (it
+/// only queues), so an expr RHS that calls it relies entirely on the server's
+/// post-fire discard: only the *returned* keys may reach the editor. A leak here
+/// applies the queued keys on the next effect drain — the `dd` below would eat
+/// the whole line.
+#[tokio::test]
+async fn expr_map_discards_queued_effects() {
+    let dir = temp_dir("keymap_expr_discard");
+    let (rpc, _incoming) = start_with_config(
+        &dir,
+        "vim.keymap.set('n', 'Q', function()\n\
+           nx._feedkeys('dd', false, false)\n\
+           return 'x'\n\
+         end, { expr = true })\n",
+    )
+    .await;
+
+    feed(&rpc, "ihello<Esc>0");
+    assert_eq!(lines(&rpc).await, vec!["hello"]);
+
+    // Q's RHS queues `dd` via feedkeys and returns `x`: the returned key deletes
+    // one char; the queued `dd` must be thrown away by the sandbox, not applied
+    // by the next drain.
+    feed(&rpc, "Q");
+    assert_eq!(
+        lines(&rpc).await,
+        vec!["ello"],
+        "only the expr's returned keys ran — the queued feedkeys leaked through"
+    );
+
+    // The discard is scoped to that fire: feedkeys queued outside an expr RHS
+    // still applies (the sandbox didn't break the normal path).
+    exec_lua(&rpc, "nx._feedkeys('x', false, false) return 0").await;
+    assert_eq!(
+        lines(&rpc).await,
+        vec!["llo"],
+        "feedkeys outside the expr sandbox still runs"
     );
 }
 

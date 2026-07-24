@@ -2309,3 +2309,71 @@ async fn code_action_rejects_a_malformed_range() {
         );
     }
 }
+
+// ----- didSave: exactly one per write, never on a reload ---------------------
+
+/// Count the `textDocument/didSave` notifications the mock has recorded.
+fn did_save_count(record: &Path) -> usize {
+    std::fs::read_to_string(record)
+        .unwrap_or_default()
+        .lines()
+        .filter(|l| l.contains("\"textDocument/didSave\""))
+        .count()
+}
+
+/// Poll (with a sync barrier) until the record holds `want` didSave lines, so an
+/// in-flight notification isn't miscounted; returns the settled count.
+async fn await_did_saves(rpc: &Rpc, record: &Path, want: usize) -> usize {
+    for _ in 0..80 {
+        barrier(rpc).await;
+        if did_save_count(record) >= want {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    did_save_count(record)
+}
+
+/// `didSave` fires exactly when bytes reach disk: once per `:w` (a repeat `:w`
+/// with no edit is still a write, as vim's `BufWritePost` fires per write) and
+/// **never** for a reload. `:e!` replaces the `Buffer`, whose fresh `save_tick`
+/// restarted at 0 — the sync's `!=` comparison then read the reload as a "save"
+/// and fired a spurious `didSave` for a pure disk read (the load paths'
+/// `save_tick = changedtick` assignment in `mark_clean` was the same
+/// instability). `save_tick` is carried across reloads and bumped only by real
+/// saves.
+#[tokio::test]
+async fn did_save_fires_per_write_and_never_on_reload() {
+    let _guard = serial_lock().lock().await;
+    let dir = temp_dir("lsp_features_didsave");
+    let record = dir.join("rec.jsonl");
+    arm_mock(&dir, &format!(r#"{{ "record": "{}" }}"#, record.display()));
+    let (rpc, _incoming) = open_with_server(&dir, "let balance = 1\n").await;
+    assert!(
+        await_lua_eq(&rpc, "#nx.lsp.clients({ bufnr = 0 })", "1").await,
+        "the mock server should attach"
+    );
+
+    feed(&rpc, ":w<CR>");
+    assert_eq!(await_did_saves(&rpc, &record, 1).await, 1, "first :w");
+
+    // A repeat `:w` with no intervening edit is still a write.
+    feed(&rpc, ":w<CR>");
+    assert_eq!(await_did_saves(&rpc, &record, 2).await, 2, "repeat :w");
+
+    // A reload is a read, not a save: the count must not move. Poll a few settled
+    // barriers so a spurious notification would have landed before the assert.
+    // (`:e!` needs the file name — the bare form is E32 — and the current-file
+    // check is cwd-aware, so the absolute path reloads in place.)
+    feed(&rpc, &format!(":e! {}<CR>", dir.join("a.rs").display()));
+    for _ in 0..8 {
+        barrier(&rpc).await;
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert_eq!(
+        did_save_count(&record),
+        2,
+        ":e! must not fire a didSave — a reload is not a save"
+    );
+    std::env::remove_var("NXVIM_LSP_CMD");
+}

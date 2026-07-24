@@ -267,3 +267,81 @@ async fn closing_last_tiled_window_with_focused_float_refocuses_the_survivor() {
     let cur = req(&rpc, "nvim_win_get_cursor", vec![Value::from(tiled)]).await;
     assert!(matches!(cur, Value::Array(_)), "server still answers");
 }
+
+// ----- float-config policy parity between the RPC and Lua-op decoders --------
+
+/// The `title` value of a `nvim_win_get_config` reply, if present.
+fn title_of(cfg: &Value) -> Option<String> {
+    let Value::Map(m) = cfg else { return None };
+    m.iter()
+        .find(|(k, _)| k.as_str() == Some("title"))
+        .and_then(|(_, v)| v.as_str())
+        .map(str::to_string)
+}
+
+/// A non-string `border` (neovim's array-of-chars form, or garbage) on the
+/// msgpack path is a loud error — the decoder once did `as_str().unwrap_or
+/// ("none")`, silently opening a borderless float where the Lua-op decoder
+/// errors, so the two surfaces disagreed and a typo'd border looked fine.
+#[tokio::test]
+async fn open_win_non_string_border_errors_loudly() {
+    let (rpc, _incoming) = start().await;
+    let config = Value::Map(vec![
+        (Value::from("relative"), Value::from("editor")),
+        (Value::from("row"), Value::from(1u64)),
+        (Value::from("col"), Value::from(1u64)),
+        (Value::from("width"), Value::from(10u64)),
+        (Value::from("height"), Value::from(5u64)),
+        // neovim's per-side char-list border spec, which nxvim doesn't model.
+        (
+            Value::from("border"),
+            Value::Array(vec![Value::from("+"), Value::from("-")]),
+        ),
+    ]);
+    let res = rpc
+        .request(
+            "nvim_open_win",
+            vec![Value::from(0u64), Value::from(false), config],
+        )
+        .await;
+    assert!(
+        res.is_err(),
+        "a non-string border must error loudly, not silently drop to 'none'"
+    );
+    assert_eq!(win_handles(&rpc).await.len(), 1, "no float was opened");
+}
+
+/// An empty `title` means *no title* on the Lua-op decode path exactly as on the
+/// msgpack path: the `SetConfig` arm once stored `Some("")` (an empty-string
+/// title) where `nvim_win_set_config` over RPC cleared it, so the two decoders
+/// drifted. Driven through the private `nx._open_float` / `nx._win_set_config`
+/// bridges (the ops' only entry), asserted against the server's own config read.
+#[tokio::test]
+async fn empty_title_clears_on_the_lua_op_path() {
+    let (rpc, _incoming) = start().await;
+    exec_lua(
+        &rpc,
+        "nx._open_float({ buf = 0, enter = true, relative = 'editor', anchor = 'NW', \
+         row = 1, col = 1, width = '10', height = '5', zindex = 50, focusable = true, \
+         border = 'single', title = 'hello' }) return 0",
+    )
+    .await;
+    let float = req(&rpc, "nvim_get_current_win", vec![])
+        .await
+        .as_u64()
+        .expect("float handle");
+    let cfg = req(&rpc, "nvim_win_get_config", vec![Value::from(float)]).await;
+    assert_eq!(title_of(&cfg).as_deref(), Some("hello"), "the title landed");
+
+    exec_lua(
+        &rpc,
+        &format!("nx._win_set_config({float}, {{ title = '' }}) return 0"),
+    )
+    .await;
+    let cfg = req(&rpc, "nvim_win_get_config", vec![Value::from(float)]).await;
+    assert_eq!(
+        title_of(&cfg),
+        None,
+        "an empty title clears the title — msgpack-path parity"
+    );
+}

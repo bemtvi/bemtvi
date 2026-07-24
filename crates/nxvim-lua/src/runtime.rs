@@ -968,6 +968,150 @@ pub(crate) struct Shared {
     pub(crate) feedkeys: Vec<FeedKeysOp>,
 }
 
+impl Shared {
+    /// Reset every server-drained effect queue to empty, throwing the queued
+    /// effects away unapplied — the `<expr>` sandbox's backstop. The server calls
+    /// this (via [`LuaRuntime::discard_all_effects`]) after running an `<expr>`
+    /// mapping RHS: only the keys the RHS *returned* may reach the editor, so
+    /// anything it queued anyway is dropped here before the next drain would
+    /// apply it.
+    ///
+    /// Exhaustive destructuring, deliberately no `..`: adding a field to
+    /// [`Shared`] fails to compile here until it is classified — a drained
+    /// effect queue joins the cleared bindings, anything else joins the ignored
+    /// (`: _`) list below with a reason. That is what keeps this discard from
+    /// silently drifting out of sync with the `take_*` drains (it once covered 7
+    /// of them while `apply_lua_effects` drained 50-odd, leaking the rest
+    /// through the textlock).
+    pub(crate) fn discard_effects(&mut self) {
+        let Shared {
+            commands,
+            output,
+            highlights,
+            dock_ops,
+            layer_ops,
+            session_reconnects,
+            connect_fallbacks,
+            view_ops,
+            panel_ops,
+            terminal_ops,
+            lsp_ops,
+            buf_ops,
+            extmark_ops,
+            window_ops,
+            tab_ops,
+            global_ops,
+            workspace_option_ops,
+            ts_ops,
+            reg_ops,
+            textobject_ops,
+            clipboard_seeds,
+            qf_ops,
+            named_list_ops,
+            ui_inputs,
+            prompt_complete_results,
+            ui_selects,
+            choice_menus,
+            ui_floats,
+            picker_opens,
+            picker_resume,
+            complete_setups,
+            cmdline_complete_setups,
+            cmdline_set_args,
+            complete_triggers,
+            complete_accepts,
+            complete_pushes,
+            complete_finishes,
+            complete_resolve_dones,
+            statusline_setups,
+            statusline_publishes,
+            statusline_invalidates,
+            snippet_setups,
+            snippet_adds,
+            snippet_expands,
+            picker_pushes,
+            picker_finishes,
+            picker_actions,
+            select_actions,
+            view_actions,
+            qf_actions,
+            cmdline_actions,
+            helix_actions,
+            decor_publishes,
+            confirms,
+            feedkeys,
+            // `nx.schedule` / `nx.timer` / `nx.run` requests survive the discard:
+            // deferring work to after the lock lifts is vim.schedule's documented
+            // job in a textlocked context, so an `<expr>` RHS may legitimately
+            // queue here — the deferred callback runs outside the sandbox and its
+            // own effects apply normally.
+            loop_ops: _,
+            // Persistent state, not per-drain effect queues:
+            decor_active: _,
+            session_save_layout: _,
+            shada_namespace: _,
+            workspace_dir: _,
+            plugin_shada: _,
+            key_pending_active: _,
+        } = self;
+        *commands = Default::default();
+        *output = Default::default();
+        *highlights = Default::default();
+        *dock_ops = Default::default();
+        *layer_ops = Default::default();
+        *session_reconnects = Default::default();
+        *connect_fallbacks = Default::default();
+        *view_ops = Default::default();
+        *panel_ops = Default::default();
+        *terminal_ops = Default::default();
+        *lsp_ops = Default::default();
+        *buf_ops = Default::default();
+        *extmark_ops = Default::default();
+        *window_ops = Default::default();
+        *tab_ops = Default::default();
+        *global_ops = Default::default();
+        *workspace_option_ops = Default::default();
+        *ts_ops = Default::default();
+        *reg_ops = Default::default();
+        *textobject_ops = Default::default();
+        *clipboard_seeds = Default::default();
+        *qf_ops = Default::default();
+        *named_list_ops = Default::default();
+        *ui_inputs = Default::default();
+        *prompt_complete_results = Default::default();
+        *ui_selects = Default::default();
+        *choice_menus = Default::default();
+        *ui_floats = Default::default();
+        *picker_opens = Default::default();
+        *picker_resume = false;
+        *complete_setups = Default::default();
+        *cmdline_complete_setups = Default::default();
+        *cmdline_set_args = Default::default();
+        *complete_triggers = Default::default();
+        *complete_accepts = Default::default();
+        *complete_pushes = Default::default();
+        *complete_finishes = Default::default();
+        *complete_resolve_dones = Default::default();
+        *statusline_setups = Default::default();
+        *statusline_publishes = Default::default();
+        *statusline_invalidates = Default::default();
+        *snippet_setups = Default::default();
+        *snippet_adds = Default::default();
+        *snippet_expands = Default::default();
+        *picker_pushes = Default::default();
+        *picker_finishes = Default::default();
+        *picker_actions = Default::default();
+        *select_actions = Default::default();
+        *view_actions = Default::default();
+        *qf_actions = Default::default();
+        *cmdline_actions = Default::default();
+        *helix_actions = Default::default();
+        *decor_publishes = Default::default();
+        *confirms = Default::default();
+        *feedkeys = Default::default();
+    }
+}
+
 /// Marshal a settled [`FsValue`] (the success payload of an off-tick `nx.fs` op)
 /// into the Lua value the promise resolves with. The per-op shape that used to live
 /// in the inline `nx._fs_*` bridges now lives here, run once on the result whether it
@@ -1678,6 +1822,16 @@ impl LuaRuntime {
         /// for the server to parse and feed (through the mapping engine or straight to
         /// the editor).
         take_feedkeys -> Vec<FeedKeysOp> = feedkeys
+    }
+
+    /// Drop every queued-but-unapplied side effect — the whole set the `take_*`
+    /// drains above would hand the server — without applying any of them. The
+    /// `<expr>` mapping sandbox calls this after running the RHS, so only the
+    /// returned keys ever reach the editor. See [`Shared::discard_effects`] for
+    /// the exhaustive (compile-checked) queue list and the deliberate survivors
+    /// (`nx.schedule` requests and persistent state).
+    pub fn discard_all_effects(&self) {
+        self.shared.borrow_mut().discard_effects();
     }
 
     /// Deliver a `vim.ui.input` result to its callback `id`: the typed line

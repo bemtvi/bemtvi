@@ -245,7 +245,20 @@ impl SyncLspClient {
         if !self.servers.contains_key(&key) {
             return;
         }
-        // Best-effort graceful stop before the kill (mirrors the native serve loop).
+        // Best-effort graceful stop before the kill, mirroring the native serve
+        // loop's `shutdown` request → `exit` notification. Fire-and-forget: the
+        // request id is minted like any other, but the whole server state is
+        // removed below, so a late reply is dropped with the connection.
+        if let Some(state) = self.servers.get_mut(&key) {
+            let rid = state.next_req_id;
+            state.next_req_id += 1;
+            let wire_id = state.id;
+            let body = json!({"jsonrpc": "2.0", "id": rid, "method": "shutdown", "params": null});
+            self.wire.push(WireOp::Stdin {
+                id: wire_id,
+                bytes: frame(&body),
+            });
+        }
         self.send_notification(&key, "exit", json!(null));
         if let Some(state) = self.servers.remove(&key) {
             self.by_id.remove(&state.id);

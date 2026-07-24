@@ -374,17 +374,14 @@ impl EditHost {
 
     /// Drop every side effect the last Lua chunk queued without applying any of them
     /// — the `<expr>` sandbox's safety net: an `<expr>` RHS that printed, set a
-    /// highlight, or queued a panel op despite the textlock has those effects thrown
-    /// away here, so only its returned keys ever reach the editor. Mirrors the drains
-    /// in [`apply_lua_effects`](Self::apply_lua_effects), but discards each.
+    /// highlight, or queued a panel op / feedkeys despite the textlock has those
+    /// effects thrown away here, so only its returned keys ever reach the editor.
+    /// The queue list lives with the queues (`Shared::discard_effects`, exhaustive
+    /// by destructuring) so it cannot drift from the [`apply_lua_effects`]
+    /// (Self::apply_lua_effects) drains; `nx.schedule` requests deliberately
+    /// survive (vim.schedule is the documented textlock escape hatch).
     pub(crate) fn discard_lua_effects(&mut self) {
-        let _ = self.lua.take_highlights();
-        let _ = self.lua.take_commands();
-        let _ = self.lua.take_output();
-        let _ = self.lua.take_picker_actions();
-        let _ = self.lua.take_select_actions();
-        let _ = self.lua.take_cmdline_actions();
-        let _ = self.lua.take_helix_actions();
+        self.lua.discard_all_effects();
     }
 
     pub(crate) fn fire_mapping_inner(&mut self, rhs: MappingRhs) {

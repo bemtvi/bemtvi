@@ -675,6 +675,10 @@ impl Editor {
             buf.set_path(Some(std::path::PathBuf::from(name)));
         }
         buf.mark_clean();
+        // A completed external write is a save: advance the write counter like
+        // `Buffer::write`/`mark_written` do, so a `save_tick` consumer (LSP
+        // `didSave`) sees every save — including a repeat save with no edit.
+        buf.save_tick += 1;
     }
 
     /// Turn on **off-tick filesystem mode**: `:w` (and the write half of `:wq` / `:x`)
@@ -739,8 +743,11 @@ impl Editor {
         let read = self.read_buffer(&path);
         self.forced_read_encoding = None;
         match read {
-            Ok(buf) => {
+            Ok(mut buf) => {
                 let ob = self.buffers.get_mut(buffer);
+                // Carry `save_tick` across the swap — a deferred read landing is
+                // not a save (see `load_into_current`).
+                buf.save_tick = ob.buffer.save_tick;
                 ob.buffer = buf;
                 ob.undo = UndoTree::new(&ob.buffer);
                 ob.saved_seq = Some(ob.undo.cur_seq());
@@ -1271,11 +1278,15 @@ impl Editor {
     /// because it is freshly read from disk).
     pub(crate) fn load_into_current(&mut self, path: &Path) {
         match self.read_buffer(path) {
-            Ok(buf) => {
+            Ok(mut buf) => {
                 self.cursor = Cursor::default();
                 self.top = 0;
                 self.leftcol = 0;
                 let ob = self.cur_mut();
+                // The fresh `Buffer` restarts `save_tick` at 0; carry the old
+                // buffer's count across so a consumer diffing it (LSP `didSave`)
+                // doesn't read the reload as a save.
+                buf.save_tick = ob.buffer.save_tick;
                 ob.buffer = buf;
                 // Reloaded from disk: discard the old history and start a fresh
                 // tree rooted at the reloaded text — a state that is, by
@@ -1325,6 +1336,10 @@ impl Editor {
         let is_current = buffer == self.cur_buffer();
         {
             let ob = self.buffers.get_mut(buffer);
+            // Carry `save_tick` across the swap — an autoread/`:checktime` reload
+            // is not a save (see `load_into_current`).
+            let mut new_buf = new_buf;
+            new_buf.save_tick = ob.buffer.save_tick;
             ob.buffer = new_buf;
             // Reloaded from disk: discard the old history and start a fresh tree
             // rooted at the reloaded text, a state that is by definition saved.

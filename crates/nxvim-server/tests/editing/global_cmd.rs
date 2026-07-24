@@ -131,3 +131,40 @@ async fn global_no_match_reports_e486() {
         Some("E486: Pattern not found: zzz")
     );
 }
+
+// ----- the `:bar` exception list accepts the dispatcher's abbreviations -----
+
+/// Baseline: with the full `:global` spelling, a bar inside the argument chains
+/// sub-commands per matched line — it is NOT a command separator.
+#[tokio::test]
+async fn global_full_name_keeps_the_bar() {
+    let (rpc, _i) = start(None).await;
+    feed(&rpc, "ia<CR>b<CR>c<Esc>");
+    // For each of a,b: append `-m`, then prepend `+`. A mis-split would run the
+    // trailing `:s/^/+/` once, on the cursor line, instead of per matched line.
+    feed(&rpc, ":global/[ab]/s/$/-m/|s/^/+/<CR>");
+    assert_eq!(lines(&rpc).await, vec!["+a-m", "+b-m", "c"]);
+}
+
+/// `ex_takes_bar` must accept the same abbreviations the dispatcher does: `:glo`
+/// is `:global`, so its bar belongs to the sub-command chain exactly as the full
+/// spelling's does. (The list once held only `g`/`global`, so every intermediate
+/// spelling mis-split at the bar — the pattern was truncated and the tail ran as
+/// its own ex-command.)
+#[tokio::test]
+async fn global_abbreviation_keeps_the_bar() {
+    let (rpc, _i) = start(None).await;
+    feed(&rpc, "ia<CR>b<CR>c<Esc>");
+    feed(&rpc, ":glo/[ab]/s/$/-m/|s/^/+/<CR>");
+    assert_eq!(lines(&rpc).await, vec!["+a-m", "+b-m", "c"]);
+}
+
+/// Same drift, `:normal` family: `:norma iX|Y` types `X|Y` — the bar is part of
+/// the keystroke string for every accepted spelling, not just `norm`/`normal`.
+#[tokio::test]
+async fn normal_abbreviation_keeps_the_bar() {
+    let (rpc, _i) = start(None).await;
+    feed(&rpc, "iab<Esc>0");
+    feed(&rpc, ":norma iX|Y<CR>");
+    assert_eq!(lines(&rpc).await, vec!["X|Yab"]);
+}

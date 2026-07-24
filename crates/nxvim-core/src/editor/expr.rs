@@ -276,10 +276,10 @@ fn tokenize(src: &str) -> Result<Vec<Tok>, String> {
                 toks.push(Tok::Ident(src[start..i].to_string()));
             }
             _ => {
-                return Err(format!(
-                    "E15: Invalid expression: unexpected '{}'",
-                    c as char
-                ))
+                // Report the whole (possibly multi-byte) char, not the lead byte
+                // reinterpreted as Latin-1.
+                let ch = src[i..].chars().next().unwrap();
+                return Err(format!("E15: Invalid expression: unexpected '{ch}'"));
             }
         }
     }
@@ -306,13 +306,24 @@ fn lex_double_string(src: &str, start: usize) -> Result<(String, usize), String>
                     b'"' => out.push('"'),
                     b'0' => out.push('\0'),
                     b'e' => out.push('\x1b'),
-                    other => out.push(other as char),
+                    // An unrecognized escape keeps the escaped char itself —
+                    // the whole char, which may be multi-byte (`"\é"` is `é`),
+                    // never the lead byte reinterpreted as Latin-1.
+                    _ => {
+                        let ch = src[i..].chars().next().unwrap();
+                        out.push(ch);
+                        i += ch.len_utf8();
+                        continue;
+                    }
                 }
                 i += 1;
             }
-            other => {
-                out.push(other as char);
-                i += 1;
+            _ => {
+                // Copy the whole (possibly multi-byte) char; pushing the byte
+                // `as char` would Latin-1-mangle UTF-8 (`héllo` → `hÃ©llo`).
+                let ch = src[i..].chars().next().unwrap();
+                out.push(ch);
+                i += ch.len_utf8();
             }
         }
     }
@@ -334,8 +345,10 @@ fn lex_single_string(src: &str, start: usize) -> Result<(String, usize), String>
                 return Ok((out, i + 1));
             }
         } else {
-            out.push(bytes[i] as char);
-            i += 1;
+            // Whole (possibly multi-byte) char, not `byte as char` (Latin-1).
+            let ch = src[i..].chars().next().unwrap();
+            out.push(ch);
+            i += ch.len_utf8();
         }
     }
     Err("E115: Missing single quote".to_string())

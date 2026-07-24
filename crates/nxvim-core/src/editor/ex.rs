@@ -416,33 +416,36 @@ fn split_ex(cmd: &str) -> (&str, bool, &str) {
 /// has. Their argument is itself code or a shell/keystroke string, so a bar inside
 /// it belongs to *them*: `:g/x/s/a/b/|d` is one `:global` whose sub-command chains,
 /// and `:normal A|` types a literal bar.
+///
+/// Spelled as `(full name, minimal abbreviation length)` prefix rules — the same
+/// abbreviation model the dispatchers use — rather than a flat spelling list, so
+/// this can't drift out of sync with the spellings the dispatch arms accept (it
+/// once listed only `g`/`global` while the dispatcher took `gl`/`glo`/…, so
+/// `:glo/pat/cmd|tail` mis-split at the bar and ran `tail` as its own command).
+/// The not-yet-implemented vim-parity names (`function`, the `*do` family) keep
+/// `min == len` (exact spelling only), preserving their previous behavior.
 fn ex_takes_bar(name: &str) -> bool {
-    matches!(
-        name,
-        "normal"
-            | "norm"
-            | "g"
-            | "global"
-            | "v"
-            | "vglobal"
-            | "au"
-            | "autocmd"
-            | "com"
-            | "command"
-            | "func"
-            | "function"
-            | "lua"
-            | "luado"
-            | "argdo"
-            | "bufdo"
-            | "windo"
-            | "tabdo"
-            | "cdo"
-            | "ldo"
-            | "make"
-            | "h"
-            | "help"
-    )
+    const TAKES_BAR: &[(&str, usize)] = &[
+        ("normal", 4),   // norm..normal (parse_normal_prefix)
+        ("global", 1),   // g..global
+        ("vglobal", 1),  // v..vglobal
+        ("autocmd", 2),  // au..autocmd (server excmd)
+        ("command", 3),  // com..command (server excmd)
+        ("make", 3),     // mak|make (server excmd)
+        ("help", 1),     // h..help (server excmd)
+        ("lua", 3),      // exact
+        ("function", 4), // func..function; not dispatched yet
+        ("luado", 5),
+        ("argdo", 5),
+        ("bufdo", 5),
+        ("windo", 5),
+        ("tabdo", 5),
+        ("cdo", 3),
+        ("ldo", 3),
+    ];
+    TAKES_BAR
+        .iter()
+        .any(|&(full, min)| name.len() >= min && full.starts_with(name))
 }
 
 /// Byte index where the command *name* starts — past a leading `:`, whitespace, and

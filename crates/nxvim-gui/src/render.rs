@@ -34,8 +34,8 @@ use glyphon::{
     SwashCache, TextArea, TextAtlas, TextBounds, TextRenderer, Viewport,
 };
 use nxvim_view::{
-    Border, DiagSign, DiagSpan, Geometry, InlayHint, ResizeCursor, StatusSegment, Style, TabData,
-    View, VirtChunk, VirtPlacement, WindowRegion, WindowView,
+    Border, DiagSign, DiagSpan, DiagVirt, Geometry, InlayHint, ResizeCursor, StatusSegment, Style,
+    TabData, View, VirtChunk, VirtPlacement, WindowRegion, WindowView,
 };
 use unicode_script::Script;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
@@ -171,6 +171,9 @@ pub struct ScrollFrame<'a> {
     /// Per-row extmark `virt_lines` content (`Some(chunks)` for a virtual row),
     /// interleaved into the band so virtual rows slide with the text.
     pub virt_lines: &'a [Option<Vec<VirtChunk>>],
+    /// Per-row inline diagnostic virtual text for the band, so it slides with the
+    /// line instead of blinking out for the slide.
+    pub diagnostics_virt: &'a [Option<DiagVirt>],
     /// Per-row diagnostic underline spans / sign-column glyphs for the band, so the
     /// squiggles and signs slide with the text instead of blanking for the slide.
     pub diagnostics: &'a [Vec<DiagSpan>],
@@ -1345,6 +1348,31 @@ impl Renderer {
                                 &[],
                                 color,
                             );
+                        }
+                    }
+                    // Inline diagnostic virtual text rides the band too, after a
+                    // one-cell gap past the line's end (never on a `~` filler row),
+                    // so it slides with the line instead of blinking out for the
+                    // slide — positioned exactly like the settled path below.
+                    if !matches!(s.numbers.get(k), Some(None)) {
+                        if let Some(Some((text, severity, id))) = s.diagnostics_virt.get(k) {
+                            let inserted = inlay_shift(inlay, win.leftcol, u16::MAX, true);
+                            let painted =
+                                display.chars().count().saturating_sub(win.leftcol as usize)
+                                    + inserted as usize;
+                            let start = text_x0 + painted as u16 + 1;
+                            let limit = (ox + wcols).saturating_sub(start);
+                            if limit > 0 {
+                                let shown: String = text.chars().take(limit as usize).collect();
+                                let color = diag_color(s.styles, *id, *severity, false);
+                                self.push_plain(
+                                    items,
+                                    &shown,
+                                    (start as f32 * self.cell_w, y),
+                                    color,
+                                    clip,
+                                );
+                            }
                         }
                     }
                 }

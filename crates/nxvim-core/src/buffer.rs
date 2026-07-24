@@ -333,14 +333,16 @@ impl Buffer {
         matches!(self.kind, BufferKind::Image)
     }
 
-    /// Mark the buffer as matching its backing store: clear `modified` and pin the
-    /// save point (`save_tick`) at the current change. This is the state right after
-    /// a load or a save — `[+]` clears and any later `disk_changed` check has a
-    /// baseline. (A normal `:w` does this inside [`Buffer::write`]; the in-memory
-    /// open/save paths call it directly, since their I/O happens elsewhere.)
+    /// Mark the buffer as matching its backing store: clear `modified`. This is the
+    /// state right after a load or a save — `[+]` clears and any later
+    /// `disk_changed` check has a baseline. Deliberately does **not** touch
+    /// `save_tick`: that counter advances only when bytes are actually written
+    /// ([`Buffer::write`] / [`Buffer::mark_written`] / the editor's `mark_saved`) —
+    /// a load is not a save, and a consumer diffing `save_tick` (LSP `didSave`)
+    /// must not see one. (This once did `save_tick = changedtick`, which both
+    /// faked a save on every load and swallowed a repeat save with no edit.)
     pub fn mark_clean(&mut self) {
         self.modified = false;
-        self.save_tick = self.changedtick;
     }
 
     /// Load a buffer from `path`, decoding its bytes by trying `fileencodings` (the

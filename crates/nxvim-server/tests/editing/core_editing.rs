@@ -808,6 +808,18 @@ async fn echo_shows_a_string_literal_on_the_message_line() {
 }
 
 #[tokio::test]
+async fn echo_keeps_non_ascii_intact() {
+    // The string lexers must slice UTF-8, not reinterpret bytes: pushing each
+    // byte `as char` (Latin-1) renders `héllo` as `hÃ©llo` and `中` as `ä¸­`.
+    let (rpc, mut incoming) = start(None).await;
+    let msg = message(&redraw_after(&rpc, &mut incoming, ":echo \"héllo 中\"<CR>").await);
+    assert_eq!(msg, "héllo 中");
+    // Single-quoted strings share the lexer shape (and shared the bug).
+    let msg = message(&redraw_after(&rpc, &mut incoming, ":echo 'naïve'<CR>").await);
+    assert_eq!(msg, "naïve");
+}
+
+#[tokio::test]
 async fn echo_evaluates_concatenation_and_arithmetic() {
     // `.` concatenates; arithmetic respects precedence (1 + 2*3 = 7).
     let (rpc, mut incoming) = start(None).await;

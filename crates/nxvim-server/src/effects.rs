@@ -304,8 +304,17 @@ fn build_float_config(
         zindex,
         focusable,
         border,
-        title,
+        title: normalize_title(title),
     })
+}
+
+/// Normalize a float `title`: an empty string means *no title*. The single home
+/// of that policy — both decode surfaces (the msgpack `parse_title` and the
+/// Lua-op arms below) route through it, so "empty clears" can't drift between
+/// them again (the `SetConfig` arm once stored `Some("")` where the msgpack
+/// path cleared).
+pub(crate) fn normalize_title(title: Option<String>) -> Option<String> {
+    title.filter(|t| !t.is_empty())
 }
 
 /// Build a core [`Margin`] from the `[top, right, bottom, left]` cell counts the
@@ -1781,7 +1790,9 @@ impl EditHost {
                 spec.col = col.map(|v| v as isize);
                 spec.zindex = zindex;
                 spec.focusable = focusable;
-                spec.title = title.map(Some);
+                // A present title key sets (or, empty, clears) it — the same
+                // `normalize_title` policy as the msgpack decoder.
+                spec.title = title.map(|t| normalize_title(Some(t)));
                 self.editor.set_window_config(id, spec);
             }
         }

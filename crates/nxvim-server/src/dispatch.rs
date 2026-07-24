@@ -1,7 +1,7 @@
 //! The `nvim_*` / `nxvim_*` RPC surface: the request/notification handler and
 //! the method dispatch table that defines the API clients call.
 
-use crate::effects::{build_margin, parse_align, parse_extent};
+use crate::effects::{build_margin, normalize_title, parse_align, parse_extent};
 use crate::redraw::{lines_value, style_value};
 use crate::EditHost;
 use nxvim_core::{
@@ -873,7 +873,12 @@ fn text(v: Option<&Value>) -> String {
 /// `border` (neovim's per-edge glyph array) is not rendered yet; it falls back to
 /// the default `none` rather than erroring. An unknown keyword is a loud error.
 fn parse_border(v: &Value, ctx: &str) -> Result<BorderStyle, String> {
-    let kw = v.as_str().unwrap_or("none");
+    // Loud on a non-string (neovim's per-side char-list spec, or garbage): the
+    // Lua-op decoder errors on anything but a known keyword, and silently
+    // dropping to `none` here made a typo'd border look fine on this path only.
+    let kw = v
+        .as_str()
+        .ok_or_else(|| format!("{ctx}: 'border' must be a style keyword string"))?;
     BorderStyle::from_keyword(kw)
         .ok_or_else(|| format!("{ctx}: 'border' style '{kw}' is not supported yet"))
 }
@@ -885,7 +890,8 @@ fn flag(v: Option<&Value>, default: bool) -> bool {
 /// Parse a `nvim_open_win` `title`: either a plain string, or neovim's
 /// `[[text, hl], …]` chunk list (we keep the text, drop the per-chunk highlight
 /// — Phase 2 paints the title in the border style, not per-chunk). `None` for an
-/// absent or empty title.
+/// absent or empty title (the shared [`normalize_title`] policy, so "empty
+/// clears" agrees with the Lua-op decoder).
 fn parse_title(v: Option<&Value>) -> Option<String> {
     let title = match v {
         Some(Value::String(s)) => s.as_str().unwrap_or("").to_string(),
@@ -900,5 +906,5 @@ fn parse_title(v: Option<&Value>) -> Option<String> {
             .collect(),
         _ => return None,
     };
-    (!title.is_empty()).then_some(title)
+    normalize_title(Some(title))
 }

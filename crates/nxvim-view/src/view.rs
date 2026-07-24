@@ -25,7 +25,7 @@ use crate::style::{Border, Style};
 /// `rows[off .. off + height]` per frame. A client that animates scrolling drives
 /// this; one that doesn't can ignore it. Because the band is screen rows,
 /// interleaved `virt_lines` slide correctly (they are just more rows).
-#[derive(Clone)]
+#[derive(Clone, Default)]
 pub struct ScrollData {
     /// Screen-row offset of the viewport's top row into the band at slide start /
     /// end (`rows[0]` is the topmost line's first screen row).

@@ -75,8 +75,8 @@ use std::time::{Duration, Instant};
 use anyhow::Result;
 use nxvim_rpc::{connect, Incoming, Rpc};
 use nxvim_view::{
-    DiagSign, DiagSpan, HlSpan, InlayHint, ResizeCursor, ScrollData, Style, View, VirtChunk,
-    VirtPlacement,
+    DiagSign, DiagSpan, DiagVirt, HlSpan, InlayHint, ResizeCursor, ScrollData, Style, View,
+    VirtChunk, VirtPlacement,
 };
 use rmpv::Value;
 use winit::application::ApplicationHandler;
@@ -556,7 +556,7 @@ fn report_session_error(rpc: &Rpc, label: &str, err: &anyhow::Error) {
 /// arrays are the over-scanned screen rows the slide reveals, and the slide is a
 /// screen-row offset (`from_row` → `to_row`) into them, so interleaved
 /// `virt_lines` slide with the text instead of snapping.
-struct ScrollAnim {
+pub struct ScrollAnim {
     from_row: f32,
     to_row: f32,
     from_cursor_row: f32,
@@ -586,6 +586,8 @@ struct ScrollAnim {
     /// Extmark `virt_lines` content per band row, so the interleaved virtual rows
     /// slide with the text instead of only appearing once the slide settles.
     virt_lines: Vec<Option<Vec<VirtChunk>>>,
+    /// Inline diagnostic virtual text per band row, sliding with the line.
+    diagnostics_virt: Vec<Option<DiagVirt>>,
     /// Diagnostic underline spans / sign-column glyphs per band row, so the
     /// squiggles and signs slide with the text instead of blanking for the slide.
     diagnostics: Vec<Vec<DiagSpan>>,
@@ -597,7 +599,7 @@ struct ScrollAnim {
 }
 
 impl ScrollAnim {
-    fn new(s: &ScrollData) -> Self {
+    pub fn new(s: &ScrollData) -> Self {
         Self {
             from_row: s.from_row,
             to_row: s.to_row,
@@ -617,6 +619,7 @@ impl ScrollAnim {
             inlay_hints: s.inlay_hints.clone(),
             virt_text: s.virt_text.clone(),
             virt_lines: s.virt_lines.clone(),
+            diagnostics_virt: s.diagnostics_virt.clone(),
             diagnostics: s.diagnostics.clone(),
             diagnostics_signs: s.diagnostics_signs.clone(),
             line_bg: s.line_bg.clone(),
@@ -630,7 +633,7 @@ impl ScrollAnim {
 
     /// The interpolated frame at the current instant (ease-out cubic, matching
     /// the TUI's feel).
-    fn frame(&self) -> ScrollFrame<'_> {
+    pub fn frame(&self) -> ScrollFrame<'_> {
         let raw = if self.duration.is_zero() {
             1.0
         } else {
@@ -656,6 +659,7 @@ impl ScrollAnim {
             inlay_hints: &self.inlay_hints,
             virt_text: &self.virt_text,
             virt_lines: &self.virt_lines,
+            diagnostics_virt: &self.diagnostics_virt,
             diagnostics: &self.diagnostics,
             diagnostics_signs: &self.diagnostics_signs,
             line_bg: &self.line_bg,

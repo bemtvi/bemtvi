@@ -619,6 +619,13 @@ where
     W: AsyncWrite + Unpin + Send + 'static,
 {
     let (rpc, incoming) = connect(reader, writer);
+    split_groups(rpc, incoming)
+}
+
+/// Fan one already-connected single-stream link into the four leg-group
+/// [`GroupLink`]s (spawning the [`split_incoming`] demux) — the body shared by
+/// [`split_single_stream`] and the one-shot [`serve_daemon_link`].
+fn split_groups(rpc: Rpc, incoming: UnboundedReceiver<Incoming>) -> DialedConnection {
     let (ctrl_tx, ctrl_rx) = unbounded_channel::<Incoming>();
     let (proc_tx, proc_rx) = unbounded_channel::<Incoming>();
     let (lsp_tx, lsp_rx) = unbounded_channel::<Incoming>();
@@ -1692,29 +1699,7 @@ fn decode_spawn(mut params: Vec<Value>) -> Option<(u64, ProcSpec)> {
     if params.len() < 5 {
         return None;
     }
-    let id = params[0].as_u64()?;
-    let argv = match std::mem::replace(&mut params[1], Value::Nil) {
-        Value::Array(a) => a
-            .into_iter()
-            .filter_map(|v| v.as_str().map(str::to_string))
-            .collect(),
-        _ => return None,
-    };
-    let cwd = params[2].as_str().map(str::to_string);
-    let env = match std::mem::replace(&mut params[3], Value::Nil) {
-        Value::Array(a) => a
-            .into_iter()
-            .filter_map(|pair| match pair {
-                Value::Array(kv) => {
-                    let k = kv.first()?.as_str()?.to_string();
-                    let v = kv.get(1)?.as_str()?.to_string();
-                    Some((k, v))
-                }
-                _ => None,
-            })
-            .collect(),
-        _ => Vec::new(),
-    };
+    let (id, argv, cwd, env) = decode_proc_head(&mut params)?;
     let stdin = match std::mem::replace(&mut params[4], Value::Nil) {
         Value::Binary(b) => b,
         _ => Vec::new(),
@@ -1732,6 +1717,39 @@ fn decode_spawn(mut params: Vec<Value>) -> Option<(u64, ProcSpec)> {
             stream,
         },
     ))
+}
+
+/// The `(id, argv, cwd?, env)` head the two process-open wires share
+/// (`proc_spawn` params 0–3, the whole of `dproc_open`).
+type ProcHead = (u64, Vec<String>, Option<String>, Vec<(String, String)>);
+
+/// Decode the shared [`ProcHead`]. The caller has already checked its own
+/// minimum length; `None` on a malformed id/argv.
+fn decode_proc_head(params: &mut [Value]) -> Option<ProcHead> {
+    let id = params[0].as_u64()?;
+    let argv = match std::mem::replace(&mut params[1], Value::Nil) {
+        Value::Array(a) => a
+            .into_iter()
+            .filter_map(|v| v.as_str().map(str::to_string))
+            .collect(),
+        _ => return None,
+    };
+    let cwd = params[2].as_str().map(str::to_string);
+    let env = match std::mem::replace(&mut params[3], Value::Nil) {
+        Value::Array(pairs) => pairs
+            .into_iter()
+            .filter_map(|pair| match pair {
+                Value::Array(kv) => {
+                    let k = kv.first()?.as_str()?.to_string();
+                    let v = kv.get(1)?.as_str()?.to_string();
+                    Some((k, v))
+                }
+                _ => None,
+            })
+            .collect(),
+        _ => Vec::new(),
+    };
+    Some((id, argv, cwd, env))
 }
 
 /// `proc_spawned` params → `(id, Spawned)`. A nil/absent pid means the spawn failed.
@@ -2923,38 +2941,14 @@ fn decode_lsp_exited(params: &[Value]) -> Option<(u64, Option<i32>, Option<i32>)
 // its [`LoopEvent`]s into wire notifications. The wasm edit-host forwards the identical
 // requests over WebTransport; one leg, one shape.
 
-/// A decoded `dproc_open`: `(id, argv, cwd?, env)`.
-type DprocOpen = (u64, Vec<String>, Option<String>, Vec<(String, String)>);
-
-/// `dproc_open` params → `(id, argv, cwd?, env)`. Mirrors [`decode_spawn`]'s shape.
-fn decode_dproc_open(mut params: Vec<Value>) -> Option<DprocOpen> {
+/// `dproc_open` params → `(id, argv, cwd?, env)` — exactly the shared
+/// [`ProcHead`] [`decode_proc_head`] decodes (`proc_spawn` carries stdin/stream
+/// on top).
+fn decode_dproc_open(mut params: Vec<Value>) -> Option<ProcHead> {
     if params.len() < 4 {
         return None;
     }
-    let id = params[0].as_u64()?;
-    let argv = match std::mem::replace(&mut params[1], Value::Nil) {
-        Value::Array(a) => a
-            .into_iter()
-            .filter_map(|v| v.as_str().map(str::to_string))
-            .collect(),
-        _ => return None,
-    };
-    let cwd = params[2].as_str().map(str::to_string);
-    let env = match std::mem::replace(&mut params[3], Value::Nil) {
-        Value::Array(pairs) => pairs
-            .into_iter()
-            .filter_map(|p| match p {
-                Value::Array(kv) => {
-                    let k = kv.first()?.as_str()?.to_string();
-                    let v = kv.get(1)?.as_str()?.to_string();
-                    Some((k, v))
-                }
-                _ => None,
-            })
-            .collect(),
-        _ => Vec::new(),
-    };
-    Some((id, argv, cwd, env))
+    decode_proc_head(&mut params)
 }
 
 /// The `dproc_*` leg's connection-agnostic core (see [`serve_proc_daemon_on`] for the
@@ -3162,6 +3156,35 @@ async fn run_fs_jobs(rpc: LinkRpc, mut req_rx: UnboundedReceiver<FsJobReq>) {
     }
 }
 
+/// Spawn a dedicated link thread (its own current-thread runtime + the RPC link) that
+/// drives `serve` over the freshly-connected transport — the shared body of the
+/// standalone single-leg `connect` forms ([`RemoteFsJobs::connect`] /
+/// [`RemoteHttp::connect`]). A runtime that can't build means the link is dead on
+/// arrival: the thread returns, `serve`'s captured receiver drops, and every job sees
+/// the channel closed and rejects loudly. These legs have no daemon→edit-host pushes,
+/// so `incoming` is drained (dropping the receiver would tear the connection down).
+fn spawn_leg_thread<R, W, F, Fut>(reader: R, writer: W, serve: F)
+where
+    R: AsyncRead + Unpin + Send + 'static,
+    W: AsyncWrite + Unpin + Send + 'static,
+    F: FnOnce(LinkRpc) -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = ()>,
+{
+    std::thread::spawn(move || {
+        let Ok(rt) = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+        else {
+            return;
+        };
+        rt.block_on(async move {
+            let (rpc, mut incoming) = connect(reader, writer);
+            tokio::spawn(async move { while incoming.recv().await.is_some() {} });
+            serve(LinkRpc::fixed(rpc)).await;
+        });
+    });
+}
+
 /// The edit-host side of the `luafs_op` leg for a **native-daemon** session — the actor
 /// sends a whole [`FsJob`](nxvim_lua::FsJob) here and `await`s its typed result. Holds a
 /// tokio sender to the shared link runtime's [`run_fs_jobs`]; `Clone` so each `nx.fs` op
@@ -3184,24 +3207,7 @@ impl RemoteFsJobs {
         W: AsyncWrite + Unpin + Send + 'static,
     {
         let (req_tx, req_rx) = unbounded_channel::<FsJobReq>();
-        std::thread::spawn(move || {
-            let rt = match tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-            {
-                Ok(rt) => rt,
-                // A runtime we can't build means the link is dead on arrival; `req_rx`
-                // drops, so every `run` sees the channel closed and rejects loudly.
-                Err(_) => return,
-            };
-            rt.block_on(async move {
-                let (rpc, mut incoming) = connect(reader, writer);
-                // The luafs_op leg has no daemon→edit-host pushes; drain so the connection
-                // isn't torn down (dropping the receiver would).
-                tokio::spawn(async move { while incoming.recv().await.is_some() {} });
-                run_fs_jobs(LinkRpc::fixed(rpc), req_rx).await;
-            });
-        });
+        spawn_leg_thread(reader, writer, move |rpc| run_fs_jobs(rpc, req_rx));
         RemoteFsJobs { req_tx }
     }
 
@@ -3277,24 +3283,7 @@ impl RemoteHttp {
         W: AsyncWrite + Unpin + Send + 'static,
     {
         let (req_tx, req_rx) = unbounded_channel::<HttpJobReq>();
-        std::thread::spawn(move || {
-            let rt = match tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-            {
-                Ok(rt) => rt,
-                // A runtime we can't build means the link is dead on arrival; `req_rx` drops,
-                // so every `run` sees the channel closed and rejects loudly.
-                Err(_) => return,
-            };
-            rt.block_on(async move {
-                let (rpc, mut incoming) = connect(reader, writer);
-                // The http_op leg has no daemon→edit-host pushes; drain so the connection
-                // isn't torn down (dropping the receiver would).
-                tokio::spawn(async move { while incoming.recv().await.is_some() {} });
-                run_http_jobs(LinkRpc::fixed(rpc), req_rx).await;
-            });
-        });
+        spawn_leg_thread(reader, writer, move |rpc| run_http_jobs(rpc, req_rx));
         RemoteHttp { req_tx }
     }
 
@@ -3833,31 +3822,7 @@ pub(crate) async fn serve_daemon_link(
     incoming: UnboundedReceiver<Incoming>,
     client_tx: std::sync::mpsc::Sender<DaemonClient>,
 ) {
-    let (ctrl_tx, ctrl_rx) = unbounded_channel::<Incoming>();
-    let (proc_tx, proc_rx) = unbounded_channel::<Incoming>();
-    let (lsp_tx, lsp_rx) = unbounded_channel::<Incoming>();
-    let (term_tx, term_rx) = unbounded_channel::<Incoming>();
-    tokio::spawn(split_incoming(incoming, ctrl_tx, proc_tx, lsp_tx, term_tx));
-    serve_daemon_link_inner(
-        GroupLink {
-            rpc: rpc.clone(),
-            incoming: ctrl_rx,
-        },
-        GroupLink {
-            rpc: rpc.clone(),
-            incoming: proc_rx,
-        },
-        GroupLink {
-            rpc: rpc.clone(),
-            incoming: lsp_rx,
-        },
-        GroupLink {
-            rpc,
-            incoming: term_rx,
-        },
-        client_tx,
-    )
-    .await;
+    serve_daemon_link_inner(split_groups(rpc, incoming), client_tx).await;
 }
 
 /// Fan a single-stream link's one inbound stream into the four per-group channels by
@@ -3901,10 +3866,7 @@ async fn split_incoming(
 /// the same seam construction ([`build_link`]) and per-connection demuxes ([`run_connection`])
 /// but loops over re-dials instead.
 pub(crate) async fn serve_daemon_link_inner(
-    control: GroupLink,
-    proc: GroupLink,
-    lsp: GroupLink,
-    term: GroupLink,
+    conn: DialedConnection,
     client_tx: std::sync::mpsc::Sender<DaemonClient>,
 ) {
     let (mut state, client) = build_link();
@@ -3924,16 +3886,7 @@ pub(crate) async fn serve_daemon_link_inner(
         return;
     }
     // Serve this single connection until every group's stream EOFs, then return.
-    run_connection(
-        &state,
-        DialedConnection {
-            control,
-            proc,
-            lsp,
-            term,
-        },
-    )
-    .await;
+    run_connection(&state, conn).await;
     clear_cells(&state);
 }
 

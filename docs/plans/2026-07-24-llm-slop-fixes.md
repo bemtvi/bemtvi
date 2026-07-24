@@ -90,33 +90,37 @@ check items off as they land; delete when done. Bug fixes follow the TDD rule
 
 ## C. Server-src dedup
 
-- [ ] **C1. `load_replica_wasm` vs `load_replica_bytes`** — lib.rs:2014-2052 vs
-  lifecycle.rs:102-136: identical 10-step bodies under opposite cfgs; extract one
-  un-cfg'd `load_replica_common`.
-- [ ] **C2. `ts_install` cfg twins** — excmd.rs:470-486 vs 494-508 byte-identical;
-  collapse (divergence already lives behind `fx.ts_install`).
-- [ ] **C3. LSP `register_*_request` ×3** — lsp/folding.rs:112, lsp/semantic.rs:235,
-  lsp/inlay.rs:331 → one `register_buffer_scoped_request(kind, buffer)`.
-- [ ] **C4. shada `merge_*` ×6** — shada.rs:885-1160 → generic
-  `merge_table<K,V: HasTs>`; also kill the duplicated
-  `Err(TableDoesNotExist)/Err(_)` double arms and the per-table `write_state` stanzas.
-- [ ] **C5. effects.rs small dups** — six identical action-drain loops (407-449);
-  statusline-publish stanza duplicated (1055-1068 vs 3988-4001).
-- [ ] **C6. lifecycle `fire_*` tail ×6** — lifecycle.rs:1265-1388; merge
-  `fire_buf_win_enter`/`fire_buf_add` (identical but for event name).
-- [ ] **C7. daemon.rs mirror pairs** — `decode_spawn`(1653) vs `decode_dproc_open`(2892);
-  `split_single_stream`(616) vs `serve_daemon_link`(3793); `RemoteFsJobs::connect`(3143)
-  vs `RemoteHttp::connect`(3236).
-- [ ] **C8. dispatch.rs** — buffer-handle resolution pasted ×3 (487,520,745 →
-  `resolve_buf` sibling of `resolve_win`); `nvim_exec_lua` silently drops non-empty
-  `args` (218-244) — error loud per no-silent-stub rule.
-- [ ] **C9. `statusline_click_at` re-derives `render_statusline`'s format-resolution**
-  — redraw.rs:750-778 vs 795-875 → shared `resolve_fmt_and_pieces`.
-- [ ] **C10. redraw hot-path clones** — redraw.rs:1655-1675 `unbundle_rows` clones
-  `secondary_selection`/`search`/`virt_lines` per row per frame; borrow instead.
-  Also delete dead `let _ = text_width;` (redraw.rs:229).
-- [ ] **C11. `:colorscheme` no-arg is a silent no-op** — excmd.rs:598-607; doc says
-  "report the active colorscheme". Implement the report or echo loud.
+- [x] **C1** — DONE. `load_replica_bytes` un-cfg'd + `pub(crate)`; the wasm twin
+  deleted, `complete_fs_read` retargeted.
+- [x] **C2** — DONE. One `ts_install` (divergence behind `fx.ts_install`); the two
+  cfg-twin `:TSInstall`/`:TSInstallInfo` dispatch arms collapsed too.
+- [x] **C3** — DONE. `register_buffer_scoped_request(kind, buffer)` in
+  lsp/request.rs beside `register_lsp_request`; three per-file twins deleted.
+- [x] **C4** — DONE. Generic `merge_best<K, MK, V: HasTs>` (7 fns → 1 + closures
+  at the call site); double `Err` arms → let-else; `write_rows`/`write_rows_pair`
+  replace the seven per-table `write_state` stanzas.
+- [x] **C5** — DONE. Free `drain_widget_actions(editor, actions, apply)` behind the
+  five `nx._*_action` loops (helix keeps its count-carrying shape);
+  `fold_statusline_invalidates`/`fold_statusline_publishes` for both stanza sites.
+- [x] **C6** — DONE. `fire_and_drain` tail shared by fire_window/tab/lifecycle/
+  buf_delete; `fire_buf_win_enter`+`fire_buf_add` merged into
+  `fire_buf_event(event, buf)`.
+- [x] **C7** — DONE. `decode_proc_head` (+`ProcHead` alias) shared by
+  `decode_spawn`/`decode_dproc_open`; `split_groups` shared by
+  `split_single_stream`/`serve_daemon_link` (`serve_daemon_link_inner` now takes a
+  `DialedConnection`); `spawn_leg_thread` behind both single-leg `connect`s.
+- [x] **C8** — DONE. `resolve_buf` sibling of `resolve_win` (×3 sites);
+  `nvim_exec_lua` non-empty `args` now errors loud
+  (test: blockers.rs::exec_lua_with_args_errors_loudly).
+- [x] **C9** — DONE. `expand_statusline_fmt` (default-fallback + parse + expand)
+  and `segment_render_inputs` (diag-filled ctx + custom-cache lookup) shared by
+  `render_statusline` and `statusline_click_at`.
+- [x] **C10** — DONE. `RowArrays` borrows `secondary_selection`/`search`/
+  `virt_lines` (`multi_spans_value`/`virt_lines_value` take slices); stale
+  `let _ = text_width;` deleted (the variable is genuinely used below it).
+- [x] **C11** — DONE. `:colorscheme` no-arg reports `g:colors_name` (`default`
+  before any scheme loads); test:
+  excmd.rs::colorscheme_no_arg_reports_the_active_scheme.
 
 ## D. Core dedup / cleanup
 

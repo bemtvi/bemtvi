@@ -141,3 +141,35 @@ async fn echoerr_reports_message_not_e492() {
         "the echohl-bar form should fail with E492 on echohl, got {broken:?}"
     );
 }
+
+/// `:colorscheme` with no argument reports the active scheme on the message line
+/// (the documented query form) — never a silent no-op. Before any scheme loads it
+/// reports `default`, like vim.
+#[tokio::test]
+async fn colorscheme_no_arg_reports_the_active_scheme() {
+    let dir = temp_dir("excmd_colo_report");
+    std::fs::create_dir_all(dir.join("colors")).expect("mkdir colors");
+    std::fs::write(
+        dir.join("colors").join("cat.lua"),
+        "vim.api.nvim_set_hl(0, 'Normal', { fg = '#ffffff' })\n",
+    )
+    .expect("write colorscheme");
+    let (rpc, mut incoming) = start(&dir).await;
+
+    // No scheme loaded yet (the test attach advertises no truecolor, so the
+    // default-scheme auto-apply doesn't run): the query reports `default`.
+    let before = message_after(&rpc, &mut incoming, ":colorscheme<CR>").await;
+    assert_eq!(
+        before.trim(),
+        "default",
+        "no-scheme query should report 'default', got {before:?}"
+    );
+
+    let _ = message_after(&rpc, &mut incoming, ":colorscheme cat<CR>").await;
+    let after = message_after(&rpc, &mut incoming, ":colorscheme<CR>").await;
+    assert_eq!(
+        after.trim(),
+        "cat",
+        "the query should report the loaded scheme, got {after:?}"
+    );
+}

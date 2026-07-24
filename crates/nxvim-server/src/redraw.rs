@@ -226,7 +226,6 @@ impl EditHost {
         // The legacy `pmenu` key is retired (Phase 4-C): all completion — including
         // the `lsp` source — now renders through the unified `menu` widget below, so
         // this is always `Nil`. Kept as a key for client wire compatibility.
-        let _ = text_width;
         let pmenu = Value::Nil;
         // The floating selectable-list menu (`nx.ui.select`; later the picker),
         // `Nil` when none is open. Geometry is computed here from the focused
@@ -748,15 +747,34 @@ impl EditHost {
         // so each window shows its own cell — no per-frame Lua (ADR 0002 rule 4).
         // The tabline caller passes `None` (it never uses a segment layout).
         if let Some(spec) = layout {
-            let mut seg_ctx = ctx.clone();
-            seg_ctx.diag_counts =
-                self.statusline_diag_counts(nxvim_core::BufferId(ctx.bufnr as u64));
-            let cache = &self.statusline_cache;
-            let custom = |name: &str| cache.get(&(win_id, name.to_string())).cloned();
+            let (seg_ctx, custom) = self.segment_render_inputs(win_id, ctx);
             let segments = statusline::compose_segments(spec, &seg_ctx, mode_label, width, &custom);
             return self.project_status_segments(&segments, styles);
         }
 
+        let pieces = match self.expand_statusline_fmt(statusline_fmt, mode_label, ctx) {
+            Ok(pieces) => pieces,
+            // A malformed 'statusline' shows its own error text rather than a
+            // blank line — loud, not silent (per CLAUDE.md).
+            Err(err) => return Value::Array(vec![segment_value(&err, Value::Nil)]),
+        };
+        let segments = statusline::layout(&pieces, width);
+        self.project_status_segments(&segments, styles)
+    }
+
+    /// Resolve the effective `'statusline'` `%`-format (empty ⇒ the built-in
+    /// default look) and expand it into layout-ready [`Piece`](statusline::Piece)s
+    /// for `ctx` — the exact resolution shared by the render path
+    /// ([`render_statusline`](Self::render_statusline)) and the click-resolution
+    /// path ([`statusline_click_at`](Self::statusline_click_at)), so the painted
+    /// line and the recomputed click spans always agree. `Err` carries a malformed
+    /// format's parse-error text.
+    fn expand_statusline_fmt(
+        &self,
+        statusline_fmt: &str,
+        mode_label: &str,
+        ctx: &nxvim_core::statusline::StatuslineCtx,
+    ) -> Result<Vec<statusline::Piece>, String> {
         let default;
         let fmt = if statusline_fmt.is_empty() {
             default = default_statusline(mode_label, &ctx.fileencoding, ctx.bomb);
@@ -764,18 +782,28 @@ impl EditHost {
         } else {
             statusline_fmt
         };
-
-        let items = match statusline::parse(fmt) {
-            Ok(items) => items,
-            // A malformed 'statusline' shows its own error text rather than a
-            // blank line — loud, not silent (per CLAUDE.md).
-            Err(err) => return Value::Array(vec![segment_value(&err, Value::Nil)]),
-        };
-
+        let items = statusline::parse(fmt)?;
         let mut eval = |_kind: ExprKind, raw: &str| self.eval_statusline_expr(raw, ctx);
-        let pieces = statusline::expand(&items, ctx, &mut eval);
-        let segments = statusline::layout(&pieces, width);
-        self.project_status_segments(&segments, styles)
+        Ok(statusline::expand(&items, ctx, &mut eval))
+    }
+
+    /// The two inputs a segment-layout render needs, built identically on the
+    /// render and click paths: `ctx` cloned with its diagnostic counts filled in,
+    /// and the custom-segment lookup over the per-`(window, name)` cache the Lua
+    /// re-renders populate.
+    fn segment_render_inputs<'a>(
+        &'a self,
+        win_id: u64,
+        ctx: &nxvim_core::statusline::StatuslineCtx,
+    ) -> (
+        nxvim_core::statusline::StatuslineCtx,
+        impl Fn(&str) -> Option<Vec<nxvim_core::statusline::StatusSegment>> + 'a,
+    ) {
+        let mut seg_ctx = ctx.clone();
+        seg_ctx.diag_counts = self.statusline_diag_counts(nxvim_core::BufferId(ctx.bufnr as u64));
+        let cache = &self.statusline_cache;
+        let custom = move |name: &str| cache.get(&(win_id, name.to_string())).cloned();
+        (seg_ctx, custom)
     }
 
     /// Resolve a status/tabline click in window `win_id` at display column `col` to
@@ -837,11 +865,7 @@ impl EditHost {
                 if let Some(layout) = self.resolve_window_layout(win_id) {
                     // Segment layout: a clickable cell carries an `on_click` handler,
                     // which `compose_segments_with_clicks` turns into a column span.
-                    let mut seg_ctx = ctx.clone();
-                    seg_ctx.diag_counts =
-                        self.statusline_diag_counts(nxvim_core::BufferId(ctx.bufnr as u64));
-                    let cache = &self.statusline_cache;
-                    let custom = |name: &str| cache.get(&(win_id, name.to_string())).cloned();
+                    let (seg_ctx, custom) = self.segment_render_inputs(win_id, ctx);
                     let (_segments, clicks) = statusline::compose_segments_with_clicks(
                         layout,
                         &seg_ctx,
@@ -852,17 +876,10 @@ impl EditHost {
                     clicks
                 } else {
                     let statusline_fmt = self.editor.global_options().statusline;
-                    let default;
-                    let fmt = if statusline_fmt.is_empty() {
-                        default = default_statusline(&view.mode_label, &ctx.fileencoding, ctx.bomb);
-                        &default
-                    } else {
-                        &statusline_fmt
-                    };
                     // A malformed format renders as its error text (no click regions).
-                    let items = statusline::parse(fmt).ok()?;
-                    let mut eval = |_kind: ExprKind, raw: &str| self.eval_statusline_expr(raw, ctx);
-                    let pieces = statusline::expand(&items, ctx, &mut eval);
+                    let pieces = self
+                        .expand_statusline_fmt(&statusline_fmt, &view.mode_label, ctx)
+                        .ok()?;
                     let (_segments, clicks) = statusline::layout_with_clicks(&pieces, width);
                     clicks
                 }
@@ -1643,10 +1660,12 @@ struct RowArrays<'a> {
     /// number.
     continuation: Vec<bool>,
     selection: Vec<Option<(usize, usize)>>,
-    secondary_selection: Vec<Vec<(usize, usize)>>,
-    search: Vec<Vec<(usize, usize)>>,
+    /// Per-row span lists / virt-line chunk runs, borrowed like `lines` — these
+    /// are projected every frame, so cloning them per row would be pure waste.
+    secondary_selection: Vec<&'a [(usize, usize)]>,
+    search: Vec<&'a [(usize, usize)]>,
     incsearch: Vec<Option<(usize, usize)>>,
-    virt_lines: Vec<Option<Vec<VirtChunk>>>,
+    virt_lines: Vec<Option<&'a [VirtChunk]>>,
 }
 
 /// Unbundle a [`RenderRow`] slice into the parallel per-row arrays the wire
@@ -1667,10 +1686,13 @@ fn unbundle_rows(rows: &[RenderRow]) -> RowArrays<'_> {
             .collect(),
         continuation: rows.iter().map(|r| r.is_continuation()).collect(),
         selection: rows.iter().map(|r| r.selection).collect(),
-        secondary_selection: rows.iter().map(|r| r.secondary_selection.clone()).collect(),
-        search: rows.iter().map(|r| r.search.clone()).collect(),
+        secondary_selection: rows
+            .iter()
+            .map(|r| r.secondary_selection.as_slice())
+            .collect(),
+        search: rows.iter().map(|r| r.search.as_slice()).collect(),
         incsearch: rows.iter().map(|r| r.incsearch).collect(),
-        virt_lines: rows.iter().map(|r| r.virt_line.clone()).collect(),
+        virt_lines: rows.iter().map(|r| r.virt_line.as_deref()).collect(),
     }
 }
 
@@ -2507,7 +2529,7 @@ fn spans_value(spans: &[Option<(usize, usize)>]) -> Value {
 /// Encode per-row *multiple* spans (the search-match highlight) as an array with
 /// one entry per visible row, each an array of `[start, end]` screen-column
 /// pairs (empty for rows with no match).
-fn multi_spans_value(rows: &[Vec<(usize, usize)>]) -> Value {
+fn multi_spans_value(rows: &[&[(usize, usize)]]) -> Value {
     Value::Array(
         rows.iter()
             .map(|row| {

@@ -21,7 +21,7 @@ use nxvim_lsp::lsp_types::{SemanticToken, SemanticTokensEdit};
 use nxvim_lsp::{PositionEncoding, SemanticLegend, SemanticTokensData};
 use nxvim_lua::SemanticTokenData;
 
-use super::{byte_col, SemanticSpan};
+use super::{byte_col, LspReqKind, SemanticSpan};
 use crate::extmarks::HlInterval;
 use crate::EditHost;
 
@@ -97,7 +97,7 @@ impl EditHost {
             }
             _ => nxvim_lsp::LspRequest::SemanticTokensFull { uri },
         };
-        let token = self.register_semantic_request(buffer);
+        let token = self.register_buffer_scoped_request(LspReqKind::SemanticTokens, buffer);
         self.fx.lsp_request(key, token, request);
     }
 
@@ -222,38 +222,6 @@ impl EditHost {
                 })
             })
             .collect()
-    }
-}
-
-impl EditHost {
-    /// Register a **buffer-scoped** pending semantic-tokens request (unlike the
-    /// cursor-scoped position requests `register_lsp_request` issues for the
-    /// *current* buffer): bump the generation and record the issuing `buffer` and
-    /// its `changedtick`, so a reply computed against superseded text is dropped.
-    /// The cursor field is filled with the current cursor only to satisfy the
-    /// shared [`PendingLspReq`] shape; the whole-buffer reply ignores it.
-    fn register_semantic_request(&mut self, buffer: BufferId) -> nxvim_lsp::ReqToken {
-        use super::{CodeActionOpts, LspReqKind, PendingLspReq};
-        self.lsp_req_gen += 1;
-        let generation = self.lsp_req_gen;
-        let tick = self.editor.buffer_of(buffer).map_or(0, |b| b.changedtick);
-        self.lsp_requests.insert(
-            LspReqKind::SemanticTokens,
-            PendingLspReq {
-                generation,
-                buffer,
-                cursor: (self.editor.cursor.line, self.editor.cursor.col),
-                tick,
-                // Whole-buffer refresh, not a user verb — no promise to settle.
-                cb_id: 0,
-                code_action: CodeActionOpts::default(),
-            },
-        );
-        nxvim_lsp::ReqToken {
-            kind: LspReqKind::SemanticTokens.as_u16(),
-            generation,
-            cb_id: 0,
-        }
     }
 }
 

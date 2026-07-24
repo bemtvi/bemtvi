@@ -8,7 +8,7 @@ use crate::{EditHost, WindowStatusline};
 use nxvim_core::highlight::HlDef;
 use nxvim_core::{
     command_pending_after, parse_color, parse_keys, BorderStyle, BufferId, CommandContinuation,
-    DecorViewport, DeferredCmd, FloatAnchor, FloatConfig, FloatRelative, QfAction, QfEntry,
+    DecorViewport, DeferredCmd, Editor, FloatAnchor, FloatConfig, FloatRelative, QfAction, QfEntry,
     QfWhich, TabId, UndoEntry, UndoTreeView, WindowConfigSpec, WindowId,
 };
 use nxvim_lua::FsJob;
@@ -372,6 +372,22 @@ fn float_mirror(cfg: FloatConfig, width: usize, height: usize) -> FloatMirror {
     }
 }
 
+/// Apply one keymap bucket's batch of named widget actions through its core
+/// handler (`apply`). An unknown action name fails loud (core returns `Err`)
+/// and is surfaced on the message line rather than silently ignored — the one
+/// drain loop behind every `nx._*_action` bucket.
+fn drain_widget_actions(
+    editor: &mut Editor,
+    actions: Vec<String>,
+    apply: impl Fn(&mut Editor, &str) -> Result<(), String>,
+) {
+    for action in actions {
+        if let Err(e) = apply(editor, &action) {
+            editor.echo(format!("E5108: {e}"));
+        }
+    }
+}
+
 impl EditHost {
     /// Apply the side effects the last Lua chunk left in the runtime: highlight
     /// definitions fold into the core registry, queued ex-commands run against
@@ -410,44 +426,34 @@ impl EditHost {
                 (false, true) => self.editor.echo_err(line.text),
             }
         }
-        // Picker actions a `picker`-bucket keymap fired (`nx._picker_action`): apply
-        // each to the open picker. An unknown action name fails loud (core returns
-        // `Err`) and is surfaced here rather than silently ignored.
-        for action in self.lua.take_picker_actions() {
-            if let Err(e) = self.editor.apply_picker_action(&action) {
-                self.editor.echo(format!("E5108: {e}"));
-            }
-        }
-        // Select actions a `select`-bucket keymap fired (`nx._select_action`): apply
-        // each to the open `nx.ui.select` list. Unknown names fail loud.
-        for action in self.lua.take_select_actions() {
-            if let Err(e) = self.editor.apply_select_action(&action) {
-                self.editor.echo(format!("E5108: {e}"));
-            }
-        }
-        // View actions a view buffer-local keymap fired (`nx._view_action`): apply
-        // each to the focused `nx.view` buffer (`<CR>` confirm). Unknown names fail
-        // loud.
-        for action in self.lua.take_view_actions() {
-            if let Err(e) = self.editor.apply_view_action(&action) {
-                self.editor.echo(format!("E5108: {e}"));
-            }
-        }
-        // Quickfix actions a `FileType qf` buffer-local keymap fired
-        // (`nx._qf_action`): apply each to the focused quickfix / loclist display
-        // (`<CR>` jump). Unknown names fail loud.
-        for action in self.lua.take_qf_actions() {
-            if let Err(e) = self.editor.apply_qf_action(&action) {
-                self.editor.echo(format!("E5108: {e}"));
-            }
-        }
-        // Cmdline actions a `cmdline`-bucket keymap fired (`nx._cmdline_action`):
-        // apply each to the open command line. Unknown names fail loud.
-        for action in self.lua.take_cmdline_actions() {
-            if let Err(e) = self.editor.apply_cmdline_action(&action) {
-                self.editor.echo(format!("E5108: {e}"));
-            }
-        }
+        // Named widget actions the keymap buckets fired, one batch per surface —
+        // picker (`nx._picker_action`), `nx.ui.select` list, focused `nx.view`
+        // buffer (`<CR>` confirm), quickfix / loclist display (`<CR>` jump), and
+        // the open command line. Each applies through its core handler; an unknown
+        // action name fails loud (core returns `Err`) and is surfaced rather than
+        // silently ignored.
+        let editor = &mut self.editor;
+        drain_widget_actions(
+            editor,
+            self.lua.take_picker_actions(),
+            Editor::apply_picker_action,
+        );
+        drain_widget_actions(
+            editor,
+            self.lua.take_select_actions(),
+            Editor::apply_select_action,
+        );
+        drain_widget_actions(
+            editor,
+            self.lua.take_view_actions(),
+            Editor::apply_view_action,
+        );
+        drain_widget_actions(editor, self.lua.take_qf_actions(), Editor::apply_qf_action);
+        drain_widget_actions(
+            editor,
+            self.lua.take_cmdline_actions(),
+            Editor::apply_cmdline_action,
+        );
         // Helix actions a `helix`-bucket keymap fired (`nx._helix_action`): apply each
         // named verb (with its optional count) to the editor. Unknown names fail loud.
         for (action, count) in self.lua.take_helix_actions() {
@@ -1052,29 +1058,12 @@ impl EditHost {
         // Custom-segment invalidations (`nx.statusline.invalidate`, and the autocmd
         // callbacks a declared `events` list installs): fold into the pending set,
         // re-rendered per window once the input settles.
-        for name in self.lua.take_statusline_invalidates() {
-            if self.statusline_custom.contains(&name) {
-                self.statusline_pending.insert(name);
-            }
-        }
+        self.fold_statusline_invalidates();
         // Custom-segment cell publishes (`nx._statusline_publish`): fold each into
         // the per-`(win, name)` cache the redraw path reads. Produced only while
         // `refresh_statusline_segments` re-renders, so this is empty on the common
         // path.
-        for req in self.lua.take_statusline_publishes() {
-            let cells = req
-                .cells
-                .into_iter()
-                .map(
-                    |(text, group, on_click)| nxvim_core::statusline::StatusSegment {
-                        text,
-                        group,
-                        on_click,
-                    },
-                )
-                .collect();
-            self.statusline_cache.insert((req.win, req.name), cells);
-        }
+        self.fold_statusline_publishes();
         // `nx.complete.setup{}`: apply the native completion-engine config. Key
         // notation is parsed here (core stays parser-aware only via `parse_keys`);
         // an empty list keeps that action's built-in default.
@@ -3959,11 +3948,7 @@ impl EditHost {
         }
         // Fold in invalidations queued since the last drain (including any the final
         // `emit_lifecycle_events` above fired into the autocmd dispatch).
-        for name in self.lua.take_statusline_invalidates() {
-            if self.statusline_custom.contains(&name) {
-                self.statusline_pending.insert(name);
-            }
-        }
+        self.fold_statusline_invalidates();
 
         // The current window layout: `(window id, buffer id)` per window plus the
         // focused window. A change re-renders every custom segment (so per-window
@@ -3997,6 +3982,36 @@ impl EditHost {
                     .echo(format!("E5108: Error rendering statusline segment: {e}"));
             }
         }
+        self.fold_statusline_publishes();
+
+        // A segment's `render` may DEFINE highlight groups and reference them in the
+        // cells it just published — a powerline statusline (nxvim-line) lazily creates
+        // its separator/transition groups this way. `take_highlights` ran at the top of
+        // `run_pending`, before these renders, so those defines are still queued; fold
+        // them now so the redraw that projects these cells resolves their colours on the
+        // first frame. Without this they resolve to the base look for one tick — an
+        // uncoloured-separator flicker until the next tick folds them.
+        for hl in self.lua.take_highlights() {
+            self.editor.highlights.set_ns(hl.ns, &hl.name, hl_def(&hl));
+        }
+    }
+
+    /// Fold queued custom-segment invalidations (`nx.statusline.invalidate`, and
+    /// the autocmd callbacks a declared `events` list installs) into the pending
+    /// set; each dirty segment re-renders per window once the input settles.
+    fn fold_statusline_invalidates(&mut self) {
+        for name in self.lua.take_statusline_invalidates() {
+            if self.statusline_custom.contains(&name) {
+                self.statusline_pending.insert(name);
+            }
+        }
+    }
+
+    /// Fold queued custom-segment cell publishes (`nx._statusline_publish`) into
+    /// the per-`(win, name)` cache the redraw path reads. Produced only while
+    /// `refresh_statusline_segments` re-renders, so this is empty on the common
+    /// path.
+    fn fold_statusline_publishes(&mut self) {
         for req in self.lua.take_statusline_publishes() {
             let cells = req
                 .cells
@@ -4010,17 +4025,6 @@ impl EditHost {
                 )
                 .collect();
             self.statusline_cache.insert((req.win, req.name), cells);
-        }
-
-        // A segment's `render` may DEFINE highlight groups and reference them in the
-        // cells it just published — a powerline statusline (nxvim-line) lazily creates
-        // its separator/transition groups this way. `take_highlights` ran at the top of
-        // `run_pending`, before these renders, so those defines are still queued; fold
-        // them now so the redraw that projects these cells resolves their colours on the
-        // first frame. Without this they resolve to the base look for one tick — an
-        // uncoloured-separator flicker until the next tick folds them.
-        for hl in self.lua.take_highlights() {
-            self.editor.highlights.set_ns(hl.ns, &hl.name, hl_def(&hl));
         }
     }
 

@@ -441,7 +441,7 @@ impl EditHost {
     /// what order) is already decided in core — this only resolves the chunk styles.
     pub(crate) fn virt_lines_value(
         &self,
-        virt_lines: &[Option<Vec<VirtChunk>>],
+        virt_lines: &[Option<&[VirtChunk]>],
         winhl: &WinHl,
         styles: &mut StyleTable,
     ) -> Value {

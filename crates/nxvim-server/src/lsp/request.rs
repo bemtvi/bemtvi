@@ -167,6 +167,42 @@ impl EditHost {
         }
     }
 
+    /// Register a **buffer-scoped** pending request — the semantic-tokens /
+    /// inlay-hints / folding-range shape, unlike the cursor-scoped
+    /// [`register_lsp_request`](Self::register_lsp_request) which issues for the
+    /// *current* buffer: bump the generation and record the issuing `buffer` and
+    /// its `changedtick`, so a reply computed against superseded text is dropped.
+    /// The cursor field is filled with the current cursor only to satisfy the
+    /// shared [`PendingLspReq`] shape; the whole-buffer replies ignore it. These
+    /// are background refreshes, not user verbs — no promise to settle
+    /// (`cb_id = 0`; a superseded pending of these kinds is fire-and-forget too,
+    /// so there is nothing to settle on replace).
+    pub(crate) fn register_buffer_scoped_request(
+        &mut self,
+        kind: LspReqKind,
+        buffer: BufferId,
+    ) -> ReqToken {
+        self.lsp_req_gen += 1;
+        let generation = self.lsp_req_gen;
+        let tick = self.editor.buffer_of(buffer).map_or(0, |b| b.changedtick);
+        self.lsp_requests.insert(
+            kind,
+            PendingLspReq {
+                generation,
+                buffer,
+                cursor: (self.editor.cursor.line, self.editor.cursor.col),
+                tick,
+                cb_id: 0,
+                code_action: CodeActionOpts::default(),
+            },
+        );
+        ReqToken {
+            kind: kind.as_u16(),
+            generation,
+            cb_id: 0,
+        }
+    }
+
     /// Settle an async `nx.lsp.*` verb's promise: run its `nx._cb_fns[cb_id]`
     /// resolver with `(nil, result)` (the resolve-only [`CallbackArgs::LspReply`]
     /// contract — the built-in verbs never reject), then drain the effects the

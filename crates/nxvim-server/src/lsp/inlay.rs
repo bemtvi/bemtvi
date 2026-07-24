@@ -88,7 +88,7 @@ impl EditHost {
                 character: 0,
             },
         };
-        let token = self.register_inlay_request(buffer);
+        let token = self.register_buffer_scoped_request(LspReqKind::InlayHints, buffer);
         self.fx
             .lsp_request(key, token, nxvim_lsp::LspRequest::InlayHint { uri, range });
     }
@@ -323,33 +323,6 @@ impl EditHost {
             })
             .collect();
         Value::Array(rows)
-    }
-
-    /// Register a **buffer-scoped** pending inlay-hint request (the semantic-tokens
-    /// shape): bump the generation and record the issuing `buffer` + `changedtick`,
-    /// so a reply computed against superseded text is dropped.
-    fn register_inlay_request(&mut self, buffer: BufferId) -> nxvim_lsp::ReqToken {
-        use super::{CodeActionOpts, LspReqKind, PendingLspReq};
-        self.lsp_req_gen += 1;
-        let generation = self.lsp_req_gen;
-        let tick = self.editor.buffer_of(buffer).map_or(0, |b| b.changedtick);
-        self.lsp_requests.insert(
-            LspReqKind::InlayHints,
-            PendingLspReq {
-                generation,
-                buffer,
-                cursor: (self.editor.cursor.line, self.editor.cursor.col),
-                tick,
-                // Whole-buffer refresh, not a user verb — no promise to settle.
-                cb_id: 0,
-                code_action: CodeActionOpts::default(),
-            },
-        );
-        nxvim_lsp::ReqToken {
-            kind: LspReqKind::InlayHints.as_u16(),
-            generation,
-            cb_id: 0,
-        }
     }
 }
 

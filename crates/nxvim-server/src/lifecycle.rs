@@ -102,9 +102,9 @@ impl EditHost {
     /// `emit_lifecycle_events` checks `buffer_is_new_file` — so the remote read fires
     /// `BufReadPost`, not `BufNewFile`, and the watch leg's `fs_changed` compares against an
     /// accurate snapshot. A new file keeps its `None` stat (fires `BufNewFile`, as
-    /// `vim newfile` does).
-    #[cfg(feature = "native")]
-    fn load_replica_bytes(
+    /// `vim newfile` does). A serverless OPFS read carries no stat either way
+    /// ([`EditHost::complete_fs_read`] passes `None` — a size-only baseline).
+    pub(crate) fn load_replica_bytes(
         &mut self,
         buffer: BufferId,
         path: String,
@@ -600,7 +600,7 @@ impl EditHost {
         // startup fire `BufAdd`, matching how `WinNew`/`TabNew` skip the initial ones.
         if self.startup_bufs_seeded {
             for b in &new_bufs {
-                self.fire_buf_add(*b);
+                self.fire_buf_event("BufAdd", *b);
             }
         }
 
@@ -745,7 +745,7 @@ impl EditHost {
         self.known_window_buffers = new_map;
         if self.au_active_events.contains("BufWinEnter") {
             for b in newly_shown {
-                self.fire_buf_win_enter(b);
+                self.fire_buf_event("BufWinEnter", b);
             }
         }
         if resized {
@@ -1280,44 +1280,24 @@ impl EditHost {
             Some(b) => (b.0, self.editor.buffer_name(b).unwrap_or_default()),
             None => (0, String::new()),
         };
-        // Keep the buffer mirror in lockstep, as the buffer-event path does.
-        self.push_buf_mirror();
-        let r = self.lua.fire_autocmd_buf(event, &pattern, bufnr, &file);
-        self.report_autocmd_err(event, r);
-        self.apply_lua_effects();
+        self.fire_and_drain(event, &pattern, bufnr, &file);
     }
 
-    /// Fire `BufWinEnter` for `buf` becoming displayed in a window. Unlike the
-    /// generic [`fire_lifecycle`](Self::fire_lifecycle) — which keys the buffer
-    /// snapshot off the *current* buffer — this resolves the name and filetype
-    /// from `buf` itself, since a restore fires it for buffers displayed in
-    /// non-current windows. The `<amatch>`/`<afile>` is `buf`'s name (a buffer
-    /// event, so a `*.md`-patterned or `buffer = N` autocmd matches correctly).
-    pub(crate) fn fire_buf_win_enter(&mut self, buf: BufferId) {
+    /// Fire a buffer-lifecycle event (`BufWinEnter` for `buf` becoming displayed
+    /// in a window; `BufAdd` — neovim alias `BufCreate` — for a buffer just added
+    /// to the list). Unlike the generic [`fire_lifecycle`](Self::fire_lifecycle)
+    /// — which keys the buffer snapshot off the *current* buffer — this resolves
+    /// the name and filetype from `buf` itself: a restore fires `BufWinEnter` for
+    /// buffers displayed in non-current windows, and a `:badd` never enters the
+    /// buffer it adds. The `<amatch>`/`<afile>` is `buf`'s name (a buffer event,
+    /// so a `*.md`-patterned or `buffer = N` autocmd matches correctly); a
+    /// `[No Name]` buffer fires with an empty name, matching neovim (`BufAdd`
+    /// fires for scratch buffers too).
+    pub(crate) fn fire_buf_event(&mut self, event: &str, buf: BufferId) {
         let name = self.editor.buffer_name(buf).unwrap_or_default();
         let ft = self.editor.buffer_filetype(buf).unwrap_or_default();
         let _ = self.lua.set_buf_snapshot(buf.0, &name, &ft);
-        self.push_buf_mirror();
-        let r = self
-            .lua
-            .fire_autocmd_buf("BufWinEnter", &name, buf.0, &name);
-        self.report_autocmd_err("BufWinEnter", r);
-        self.apply_lua_effects();
-    }
-
-    /// Fire `BufAdd` (neovim alias `BufCreate`) for a buffer just added to the list.
-    /// Uses the added buffer's own name / filetype as context (`<afile>`), so a
-    /// `:badd` that never enters the buffer still carries it — mirroring
-    /// [`fire_buf_win_enter`](Self::fire_buf_win_enter). A `[No Name]` buffer fires it
-    /// with an empty name, matching neovim (`BufAdd` fires for scratch buffers too).
-    pub(crate) fn fire_buf_add(&mut self, buf: BufferId) {
-        let name = self.editor.buffer_name(buf).unwrap_or_default();
-        let ft = self.editor.buffer_filetype(buf).unwrap_or_default();
-        let _ = self.lua.set_buf_snapshot(buf.0, &name, &ft);
-        self.push_buf_mirror();
-        let r = self.lua.fire_autocmd_buf("BufAdd", &name, buf.0, &name);
-        self.report_autocmd_err("BufAdd", r);
-        self.apply_lua_effects();
+        self.fire_and_drain(event, &name, buf.0, &name);
     }
 
     /// Fire a tab-lifecycle autocmd (`TabNew`/`TabEnter`/`TabLeave`/`TabClosed`).
@@ -1335,11 +1315,7 @@ impl EditHost {
             Some(b) => (b.0, self.editor.buffer_name(b).unwrap_or_default()),
             None => (0, String::new()),
         };
-        // Keep the buffer mirror in lockstep, as the window-event path does.
-        self.push_buf_mirror();
-        let r = self.lua.fire_autocmd_buf(event, &pattern, bufnr, &file);
-        self.report_autocmd_err(event, r);
-        self.apply_lua_effects();
+        self.fire_and_drain(event, &pattern, bufnr, &file);
     }
 
     /// Push the current-buffer snapshot into the VM, fire `event` for `pattern` /
@@ -1349,10 +1325,16 @@ impl EditHost {
     pub(crate) fn fire_lifecycle(&mut self, event: &str, pattern: &str, buf: BufferId, file: &str) {
         let ft = filetype_of(self.editor.buffer().path.as_deref()).unwrap_or("");
         let _ = self.lua.set_buf_snapshot(buf.0, file, ft);
-        // Keep the buffer mirror in lockstep: an autocmd callback runs here before
-        // the caller's `run_pending`, so refresh `nx._bufs` / the cursor too.
+        self.fire_and_drain(event, pattern, buf.0, file);
+    }
+
+    /// The shared tail of every `fire_*`: refresh the buffer mirror (an autocmd
+    /// callback runs before the caller's `run_pending`, so `nx._bufs` / the cursor
+    /// must be current), fire the autocmd with buffer context, surface any
+    /// callback error, and fold in the Lua effects the callbacks left.
+    fn fire_and_drain(&mut self, event: &str, pattern: &str, bufnr: u64, file: &str) {
         self.push_buf_mirror();
-        let r = self.lua.fire_autocmd_buf(event, pattern, buf.0, file);
+        let r = self.lua.fire_autocmd_buf(event, pattern, bufnr, file);
         self.report_autocmd_err(event, r);
         self.apply_lua_effects();
     }
@@ -1393,10 +1375,7 @@ impl EditHost {
     /// buffer-local `BufDelete` autocmd on that buffer still runs.
     pub(crate) fn fire_buf_delete(&mut self, buf: BufferId) {
         let pattern = buf.0.to_string();
-        self.push_buf_mirror();
-        let r = self.lua.fire_autocmd_buf("BufDelete", &pattern, buf.0, "");
-        self.report_autocmd_err("BufDelete", r);
-        self.apply_lua_effects();
+        self.fire_and_drain("BufDelete", &pattern, buf.0, "");
     }
 
     /// Drain the buffers written this convergence (core's [`Editor::take_write_events`])

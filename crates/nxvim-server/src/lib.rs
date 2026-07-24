@@ -1262,7 +1262,7 @@ pub struct EditHost {
     /// ([`drain_pending_opens`](Self::drain_pending_opens)) fires the fetch and the bytes
     /// land later in [`apply_open`](Self::apply_open) / the wasm read reply, keyed only by
     /// buffer. This bridges that gap — the drain stashes the encoding here and the landing
-    /// (`load_replica_bytes` / `load_replica_wasm`) removes it and passes it to
+    /// (`load_replica_bytes`) removes it and passes it to
     /// [`Editor::load_bytes_into_enc`](nxvim_core::Editor), so `++enc` decodes a remote
     /// file exactly as it does a local one. Empty for ordinary opens and local sessions.
     forced_fetch_enc: HashMap<BufferId, String>,
@@ -1306,7 +1306,7 @@ pub struct EditHost {
     /// not open in a buffer must, in a daemon / web session, fetch that file across the
     /// wire before its edits can apply; the edits (still in LSP form, plus the
     /// originating server's encoding) wait here and [`apply_pending_replica_edit`] drains
-    /// the entry when the fetch lands (`load_replica_bytes` / `load_replica_wasm`). Empty
+    /// the entry when the fetch lands (`load_replica_bytes`). Empty
     /// in a local session — there the file is read synchronously and edited inline.
     ///
     /// [`apply_pending_replica_edit`]: EditHost::apply_pending_replica_edit
@@ -2008,9 +2008,9 @@ impl EditHost {
         match kind {
             // kind 0 = an existing file (real bytes); kind 1 = a new file that wasn't on
             // disk. The flag stamps the read-from-disk baseline for the former so it fires
-            // `BufReadPost`, not `BufNewFile` (see `load_replica_wasm`).
-            0 => self.load_replica_wasm(buffer, path, bytes, true, stat),
-            1 => self.load_replica_wasm(buffer, path, b"", false, None),
+            // `BufReadPost`, not `BufNewFile` (see `load_replica_bytes`).
+            0 => self.load_replica_bytes(buffer, path, bytes, true, stat),
+            1 => self.load_replica_bytes(buffer, path, b"", false, None),
             2 => {
                 // A workspace edit never targets a directory; drop any stranded stash.
                 self.pending_replica_edits.remove(&buffer);
@@ -2032,63 +2032,6 @@ impl EditHost {
             }
         }
         self.redraw();
-    }
-
-    /// Load the OPFS file's raw `bytes` into `buffer` as a freshly-read replica of `path`,
-    /// then fire the lifecycle a read implies — the wasm-eligible subset of the native
-    /// `load_replica_bytes`: [`Editor::load_bytes_into`](nxvim_core::Editor) decodes through
-    /// the shared encoding seam (so a browser open matches native/daemon — latin1/utf-16/BOM
-    /// detection + invalid-UTF-8 resilience) and replaces the buffer in place; clearing it
-    /// from `announced` lets the now-named buffer's `BufReadPost` / `FileType` fire (the
-    /// latter drives syntax); then refresh the Lua snapshot / mirror and drain any
-    /// autocmd-queued work (which may itself enqueue further opens/saves the Worker picks up
-    /// next).
-    ///
-    /// `existed` distinguishes an existing-file read (kind 0) from a `:e new-file` (kind 1):
-    /// the wasm read carries no synchronous stat, so an existing file would otherwise look
-    /// like a new file (no `disk_stat`) and fire `BufNewFile`. Stamp a read-from-disk
-    /// baseline for it — before `emit_lifecycle_events` checks `buffer_is_new_file` — so it
-    /// fires `BufReadPost`, the event config keys diagnostics / LSP attach off of.
-    fn load_replica_wasm(
-        &mut self,
-        buffer: BufferId,
-        path: String,
-        bytes: &[u8],
-        existed: bool,
-        stat: Option<FileStat>,
-    ) {
-        // A `:e ++enc=` override the drain stashed for this in-flight OPFS/daemon fetch
-        // forces the decode; ordinary opens have no entry and use `'fileencodings'`.
-        let force_enc = self.forced_fetch_enc.remove(&buffer);
-        self.editor
-            .load_bytes_into_enc(buffer, Some(path.clone()), bytes, force_enc.as_deref());
-        if existed {
-            // Stamp the read-from-disk baseline so the read fires `BufReadPost`, not
-            // `BufNewFile`. A *daemon* read carries the remote's real stat (threaded here from
-            // `fs_read`'s reply) so the reconnect re-stat can compare against an accurate
-            // snapshot; a serverless OPFS read has no stat (`None`) — a size-only baseline.
-            self.editor.mark_replica_read_from_disk(buffer, stat);
-        }
-        // A project-wide rename / code action whose edits reached this (off-tick) file
-        // stashed them while the OPFS fetch was in flight; apply them now the real
-        // contents have landed, before lifecycle events fire (mirrors `load_replica_bytes`).
-        self.apply_pending_replica_edit(buffer);
-        self.announced.remove(&buffer);
-        self.fired_filetype.remove(&buffer);
-        // The landed bytes re-detect the encoding; drop the baseline so the post-load
-        // emit re-seeds it silently instead of firing `EncodingChanged` for the read.
-        self.fired_encoding.remove(&buffer);
-        let ft = filetype_of(Some(Path::new(&path))).unwrap_or("");
-        let _ = self.lua.set_buf_snapshot(buffer.0, &path, ft);
-        self.push_buf_mirror();
-        self.emit_lifecycle_events();
-        // A remote watch reload (the daemon `fs_changed` leg) deferred its
-        // `FileChangedShellPost` to this landing point — fire it now, before `run_pending`,
-        // so a handler's queued work drains in the same convergence (mirrors `load_replica`).
-        if self.reload_posts.remove(&buffer) {
-            self.fire_file_changed_post(buffer);
-        }
-        self.run_pending();
     }
 
     /// Apply a finished off-tick OPFS directory landing into `buffer` — the wasm analogue

@@ -190,32 +190,19 @@ impl EditHost {
                 Ok(out) => self.editor.echo(out),
                 Err(e) => self.editor.echo(format!("E5108: Error in :command: {e}")),
             },
-            // `:TSInstall <lang>…` / `:TSUpdate <lang>…` — fetch + compile a
-            // treesitter grammar into the data dir (see `nxvim_ts::install`). The
-            // guard defers to a real nvim-treesitter plugin: if the user loaded one
-            // and it registered `:TSInstall`, this arm is skipped and the
+            // `:TSInstall <lang>…` / `:TSUpdate <lang>…` — install a treesitter
+            // grammar through the per-world `ts_install` effect (native: fetch +
+            // compile into the data dir, see `nxvim_ts::install`; browser: the JS
+            // host fetches a prebuilt `.wasm` grammar, see [`Self::ts_install`]).
+            // The guard defers to a real nvim-treesitter plugin: if the user loaded
+            // one and it registered `:TSInstall`, this arm is skipped and the
             // user-command arm below runs the plugin's instead (no silent shadow).
-            #[cfg(feature = "native")]
             "TSInstall" | "TSUpdate" if !self.lua.has_user_command(name, cur_buf) => {
                 self.ts_install(args)
             }
-            // The browser build can't compile/`dlopen` a native grammar, but it
-            // highlights JS-side (web-tree-sitter), so `:TSInstall` fetches a *prebuilt*
-            // grammar `.wasm` + queries at runtime through the `ts_install` effect — the
-            // JS host does the fetch/cache/register (see edithost's `WasmEffects`). Same
-            // defer-to-plugin guard: a real nvim-treesitter `:TSInstall` shadows this.
-            #[cfg(not(feature = "native"))]
-            "TSInstall" | "TSUpdate" if !self.lua.has_user_command(name, cur_buf) => {
-                self.ts_install(args)
-            }
-            // `:TSInstallInfo` — list the parsers installed across the search path.
-            // Same defer-to-plugin guard as the install commands.
-            #[cfg(feature = "native")]
-            "TSInstallInfo" if !self.lua.has_user_command(name, cur_buf) => self.ts_install_info(),
-            // `:TSInstallInfo` on the browser build — list the grammars available to the
-            // JS highlighter (the offline bundle + whatever `:TSInstall` cached in OPFS),
-            // the wasm analogue of native's on-disk parser scan.
-            #[cfg(not(feature = "native"))]
+            // `:TSInstallInfo` — list the installed grammars (native: the on-disk
+            // parser scan; browser: what the JS highlighter can load). Same
+            // defer-to-plugin guard as the install commands.
             "TSInstallInfo" if !self.lua.has_user_command(name, cur_buf) => self.ts_install_info(),
             // `:help [topic]` — the help system ships as the optional `nxvim-help`
             // plugin (it registers `:help` / `:h`, handled by the user-command arm
@@ -473,37 +460,16 @@ impl EditHost {
             .collect()
     }
 
-    /// `:TSInstall <lang>…` — fetch + compile each named grammar into the data dir
-    /// off the editor thread. The work (network + a C compile) can take seconds, so
-    /// each language runs on a `spawn_blocking` worker; its result returns on the
-    /// `install_events` `select!` arm ([`EditHost::on_install_done`]). We echo a
-    /// "installing…" line now so the user sees the command took. Native only — the
-    /// browser build's `:TSInstall` arm calls the wasm `ts_install` below instead.
-    #[cfg(feature = "native")]
-    fn ts_install(&mut self, args: &str) {
-        let langs = self.ts_install_langs(args);
-        if langs.is_empty() {
-            self.editor.echo(
-                "TSInstall: usage: :TSInstall <language>… (or open a file to install its language)",
-            );
-            return;
-        }
-        self.editor
-            .echo(format!("TSInstall: installing {}…", langs.join(", ")));
-        for lang in langs {
-            // Off-tick fetch+compile through the effect seam; the outcome returns on the
-            // run loop's install arm ([`EditHost::on_install_done`]).
-            self.fx.ts_install(lang);
-        }
-    }
-
-    /// `:TSInstall <lang>…` on the browser build — fetch each named *prebuilt* grammar
-    /// (`.wasm` + queries) at runtime through the same `ts_install` effect, only here it
-    /// crosses to the JS host (web-tree-sitter lives UI-side), which fetches from a CDN,
-    /// caches in OPFS, and registers it. Fire-and-forget like the native path: the
-    /// outcome lands later via [`EditHost::complete_ts_install`]. No C compiler / `dlopen`
-    /// is involved — the browser loads a `.wasm` grammar, not a native `.so`.
-    #[cfg(not(feature = "native"))]
+    /// `:TSInstall <lang>…` — fetch each named grammar off the editor thread,
+    /// fire-and-forget through the `ts_install` effect seam (we echo an
+    /// "installing…" line now so the user sees the command took). What the effect
+    /// *does* is per-world: native fetches + C-compiles into the data dir on a
+    /// `spawn_blocking` worker, returning on the `install_events` `select!` arm
+    /// ([`EditHost::on_install_done`]); the browser build crosses to the JS host
+    /// (web-tree-sitter lives UI-side), which fetches a *prebuilt* `.wasm`
+    /// grammar and its queries from a CDN, caches in OPFS, and registers it —
+    /// landing later via [`EditHost::complete_ts_install`]. One command body;
+    /// the divergence lives behind `fx.ts_install`.
     fn ts_install(&mut self, args: &str) {
         let langs = self.ts_install_langs(args);
         if langs.is_empty() {
@@ -515,18 +481,23 @@ impl EditHost {
         // A repo spec (`owner/repo`) means compiling arbitrary source — impossible in
         // the browser build (prebuilt `.wasm` grammars from a CDN, no C compiler). Fail
         // loud rather than silently no-op (there is no CDN entry for a custom repo).
-        let (repos, langs): (Vec<String>, Vec<String>) =
-            langs.into_iter().partition(|l| l.contains('/'));
-        if !repos.is_empty() {
-            self.editor.echo(format!(
-                "TSInstall: installing from a GitHub repo ({}) needs a C compiler and \
-                 isn't supported in the browser build — use a native nxvim",
-                repos.join(", ")
-            ));
-        }
-        if langs.is_empty() {
-            return;
-        }
+        // Native `install()` dispatches repo specs itself, so they pass straight through.
+        #[cfg(not(feature = "native"))]
+        let langs = {
+            let (repos, langs): (Vec<String>, Vec<String>) =
+                langs.into_iter().partition(|l| l.contains('/'));
+            if !repos.is_empty() {
+                self.editor.echo(format!(
+                    "TSInstall: installing from a GitHub repo ({}) needs a C compiler and \
+                     isn't supported in the browser build — use a native nxvim",
+                    repos.join(", ")
+                ));
+            }
+            if langs.is_empty() {
+                return;
+            }
+            langs
+        };
         self.editor
             .echo(format!("TSInstall: installing {}…", langs.join(", ")));
         for lang in langs {
@@ -637,7 +608,15 @@ impl EditHost {
     /// theme queues is still resolved.
     pub(crate) fn set_colorscheme(&mut self, name: &str) {
         if name.is_empty() {
-            return; // `:colorscheme` with no arg is a query we don't surface yet
+            // The query form: report the active scheme (`g:colors_name`, which
+            // every load below records), `default` before any scheme loads — vim's
+            // behavior for `:colorscheme` with no argument.
+            let active = self
+                .lua
+                .get_global_var("colors_name")
+                .unwrap_or_else(|| "default".to_string());
+            self.editor.echo(active);
+            return;
         }
         // A `colors/<name>.lua` on the runtimepath wins (so a user can shadow a
         // bundled scheme); otherwise fall back to a scheme embedded in the

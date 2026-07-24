@@ -14,7 +14,7 @@
 use nxvim_core::BufferId;
 use nxvim_lsp::FoldRangeData;
 
-use super::{CodeActionOpts, LspReqKind, PendingLspReq};
+use super::LspReqKind;
 use crate::EditHost;
 
 impl EditHost {
@@ -43,7 +43,7 @@ impl EditHost {
         if !rt.folding_range {
             return;
         }
-        let token = self.register_folding_request(buffer);
+        let token = self.register_buffer_scoped_request(LspReqKind::FoldingRange, buffer);
         self.fx
             .lsp_request(key, token, nxvim_lsp::LspRequest::FoldingRange { uri });
     }
@@ -102,32 +102,5 @@ impl EditHost {
             .collect();
         self.editor.set_lsp_folds(buffer, req_tick, ranges);
         self.lsp_dirty = true;
-    }
-
-    /// Register a **buffer-scoped** pending folding-range request (the semantic-
-    /// tokens / inlay-hints shape): bump the generation and record the issuing
-    /// `buffer` + `changedtick`, so a reply computed against superseded text is
-    /// dropped.
-    fn register_folding_request(&mut self, buffer: BufferId) -> nxvim_lsp::ReqToken {
-        self.lsp_req_gen += 1;
-        let generation = self.lsp_req_gen;
-        let tick = self.editor.buffer_of(buffer).map_or(0, |b| b.changedtick);
-        self.lsp_requests.insert(
-            LspReqKind::FoldingRange,
-            PendingLspReq {
-                generation,
-                buffer,
-                cursor: (self.editor.cursor.line, self.editor.cursor.col),
-                tick,
-                // Whole-buffer refresh, not a user verb — no promise to settle.
-                cb_id: 0,
-                code_action: CodeActionOpts::default(),
-            },
-        );
-        nxvim_lsp::ReqToken {
-            kind: LspReqKind::FoldingRange.as_u16(),
-            generation,
-            cb_id: 0,
-        }
     }
 }

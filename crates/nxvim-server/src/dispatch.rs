@@ -219,8 +219,22 @@ impl EditHost {
             // value over RPC — the entry point for synchronous getters like
             // `vim.diagnostic.get`. Effects the chunk queued (LSP ops, panel,
             // commands) drain afterward, exactly like a `:lua` chunk. `args` is
-            // accepted for call-compatibility but not yet threaded into the chunk.
+            // accepted only as an empty list: nothing threads values into the
+            // chunk, so a non-empty `args` fails the request loudly rather than
+            // evaluating with its parameters silently missing.
             "nvim_exec_lua" => {
+                let has_args = match params.get(1) {
+                    None | Some(Value::Nil) => false,
+                    Some(Value::Array(a)) => !a.is_empty(),
+                    Some(_) => true,
+                };
+                if has_args {
+                    return Err(
+                        "nvim_exec_lua: args are not supported — pass an empty list and \
+                         interpolate values into the chunk instead"
+                            .to_string(),
+                    );
+                }
                 let code = text(params.first());
                 // Refresh the buffer mirror before the eval: this is the one
                 // synchronous-getter entry that reads buffer state *before* its
@@ -484,13 +498,7 @@ impl EditHost {
             }
             "nvim_buf_get_lines" => Ok(self.get_lines(params)),
             "nvim_buf_line_count" => {
-                // params[0] is the buffer handle: 0 = current, else a specific buffer.
-                let handle = params.first().and_then(Value::as_u64).unwrap_or(0);
-                let id = if handle == 0 {
-                    self.editor.current_buffer_id()
-                } else {
-                    BufferId(handle)
-                };
+                let id = self.resolve_buf(params.first());
                 Ok(Value::from(
                     self.editor.line_count_of(id).unwrap_or(0) as u64
                 ))
@@ -517,12 +525,7 @@ impl EditHost {
                 // terminal-job buffer reports its window title (the child's OSC title,
                 // like neovim's `term://…`), a plugin view (`nx.view`) reports its
                 // create name, otherwise the file path — so the API matches the bar.
-                let handle = uint(params.first(), 0) as u64;
-                let id = if handle == 0 {
-                    self.editor.current_buffer_id()
-                } else {
-                    BufferId(handle)
-                };
+                let id = self.resolve_buf(params.first());
                 let name = self.editor.display_name(id);
                 Ok(Value::from(name))
             }
@@ -574,6 +577,16 @@ impl EditHost {
             self.editor.current_window_id()
         } else {
             WindowId(w)
+        }
+    }
+
+    /// Resolve a buffer handle the way neovim does: `0` (or absent) is the
+    /// current buffer, anything else is that handle verbatim (the buffer sibling
+    /// of [`resolve_win`](Self::resolve_win) / [`resolve_tabpage`](Self::resolve_tabpage)).
+    fn resolve_buf(&self, v: Option<&Value>) -> BufferId {
+        match v.and_then(Value::as_u64) {
+            Some(0) | None => self.editor.current_buffer_id(),
+            Some(n) => BufferId(n),
         }
     }
 
@@ -740,16 +753,10 @@ impl EditHost {
     }
 
     pub(crate) fn get_lines(&self, params: &[Value]) -> Value {
-        // params[0] is the buffer handle: 0 = current, else a specific buffer.
         // An unknown handle yields an empty list rather than erroring.
-        let handle = params.first().and_then(Value::as_u64).unwrap_or(0);
-        let lines = if handle == 0 {
-            self.editor.lines()
-        } else {
-            match self.editor.lines_of(BufferId(handle)) {
-                Some(lines) => lines,
-                None => return Value::Array(Vec::new()),
-            }
+        let lines = match self.editor.lines_of(self.resolve_buf(params.first())) {
+            Some(lines) => lines,
+            None => return Value::Array(Vec::new()),
         };
         let n = lines.len() as i64;
         let norm = |i: i64| -> i64 {

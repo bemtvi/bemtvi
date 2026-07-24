@@ -215,8 +215,8 @@ impl EditHost {
 
     /// Apply the workspace edits stashed for an **off-tick** replica buffer once its
     /// bytes have landed — the deferred tail of [`apply_workspace_edit`], called from
-    /// both fetch-landing sites (`load_replica_bytes` native, `load_replica_wasm`
-    /// wasm). Converts each stashed edit's LSP range to bytes against the now-filled
+    /// the fetch-landing site (`load_replica_bytes`, shared native/wasm).
+    /// Converts each stashed edit's LSP range to bytes against the now-filled
     /// buffer, in the originating server's encoding (a freshly-fetched replica has no
     /// server of its own yet), applies as one undo step, and re-syncs. A no-op when
     /// nothing is stashed for `buffer` — the common case on every other open.

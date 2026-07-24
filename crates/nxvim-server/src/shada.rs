@@ -398,141 +398,152 @@ impl ShadaStore for RedbFileStore {
     }
 }
 
+/// Rewrite one `&str`-keyed table from `rows`: when `clear`, empty it first (so
+/// a row dropped this session doesn't linger and resurrect on the next merge),
+/// then serialize and insert each `(key, stored)` pair.
+fn write_rows<V: serde::Serialize>(
+    wtxn: &redb::WriteTransaction,
+    def: TableDefinition<&str, &[u8]>,
+    clear: bool,
+    rows: impl IntoIterator<Item = (String, V)>,
+) -> std::io::Result<()> {
+    let mut table = wtxn.open_table(def).map_err(std::io::Error::other)?;
+    if clear {
+        table.retain(|_, _| false).map_err(std::io::Error::other)?;
+    }
+    for (key, stored) in rows {
+        let bytes = rmp_serde::to_vec(&stored).map_err(std::io::Error::other)?;
+        table
+            .insert(key.as_str(), bytes.as_slice())
+            .map_err(std::io::Error::other)?;
+    }
+    Ok(())
+}
+
+/// [`write_rows`] for a `(&str, &str)`-composite-keyed table (per-file marks,
+/// plugin data). Always clears first — both composite tables rewrite wholesale
+/// so a dropped row doesn't resurrect.
+fn write_rows_pair<V: serde::Serialize>(
+    wtxn: &redb::WriteTransaction,
+    def: TableDefinition<(&str, &str), &[u8]>,
+    rows: impl IntoIterator<Item = ((String, String), V)>,
+) -> std::io::Result<()> {
+    let mut table = wtxn.open_table(def).map_err(std::io::Error::other)?;
+    table.retain(|_, _| false).map_err(std::io::Error::other)?;
+    for ((a, b), stored) in rows {
+        let bytes = rmp_serde::to_vec(&stored).map_err(std::io::Error::other)?;
+        table
+            .insert((a.as_str(), b.as_str()), bytes.as_slice())
+            .map_err(std::io::Error::other)?;
+    }
+    Ok(())
+}
+
 /// Write a snapshot into `db` in one transaction, stamping each row with the
 /// current time (the merge key a later instance reads). Shared by the startup
 /// carry-forward flush and the exit flush.
 fn write_state(db: &Database, state: &PersistState) -> std::io::Result<()> {
     let ts = now_ms();
     let wtxn = db.begin_write().map_err(std::io::Error::other)?;
-    {
-        let mut table = wtxn.open_table(REGISTERS).map_err(std::io::Error::other)?;
-        for entry in &state.registers {
+    // Registers and global marks key on the name and only ever upsert (the merge
+    // resolves recency); the rest rewrite wholesale (`clear`) so a row dropped
+    // this session doesn't linger: per-file marks/plugin data key on a composite,
+    // numbered marks must not leave stale higher digits, changelists/folds key on
+    // path and a file whose list emptied must drop out.
+    write_rows(
+        &wtxn,
+        REGISTERS,
+        false,
+        state.registers.iter().map(|entry| {
             let stored = StoredRegister {
                 text: entry.text.clone(),
                 linewise: entry.linewise,
                 ts,
             };
-            let bytes = rmp_serde::to_vec(&stored).map_err(std::io::Error::other)?;
-            let key = entry.name.to_string();
-            table
-                .insert(key.as_str(), bytes.as_slice())
-                .map_err(std::io::Error::other)?;
-        }
-    }
-    {
-        let mut table = wtxn
-            .open_table(MARKS_GLOBAL)
-            .map_err(std::io::Error::other)?;
-        for entry in &state.global_marks {
+            (entry.name.to_string(), stored)
+        }),
+    )?;
+    write_rows(
+        &wtxn,
+        MARKS_GLOBAL,
+        false,
+        state.global_marks.iter().map(|entry| {
             let stored = StoredMark {
                 path: entry.path.to_string_lossy().into_owned(),
                 line: entry.line,
                 col: entry.col,
                 ts,
             };
-            let bytes = rmp_serde::to_vec(&stored).map_err(std::io::Error::other)?;
-            let key = entry.name.to_string();
-            table
-                .insert(key.as_str(), bytes.as_slice())
-                .map_err(std::io::Error::other)?;
-        }
-    }
-    {
-        // Cleared before rewrite: per-file marks key on `(path, name)`, so a mark
-        // dropped this session (its line deleted) must not linger and resurrect.
-        let mut table = wtxn.open_table(MARKS_FILE).map_err(std::io::Error::other)?;
-        table.retain(|_, _| false).map_err(std::io::Error::other)?;
-        for entry in &state.file_marks {
+            (entry.name.to_string(), stored)
+        }),
+    )?;
+    write_rows_pair(
+        &wtxn,
+        MARKS_FILE,
+        state.file_marks.iter().map(|entry| {
             let stored = StoredFileMark {
                 line: entry.line,
                 col: entry.col,
                 ts,
             };
-            let bytes = rmp_serde::to_vec(&stored).map_err(std::io::Error::other)?;
-            let path = entry.path.to_string_lossy().into_owned();
-            let name = entry.name.to_string();
-            table
-                .insert((path.as_str(), name.as_str()), bytes.as_slice())
-                .map_err(std::io::Error::other)?;
-        }
-    }
-    {
-        // Numbered marks key on the digit (stable), but a shorter set must not
-        // leave stale higher digits behind — clear before rewrite.
-        let mut table = wtxn
-            .open_table(MARKS_NUMBERED)
-            .map_err(std::io::Error::other)?;
-        table.retain(|_, _| false).map_err(std::io::Error::other)?;
-        for mark in &state.numbered_marks {
+            let key = (
+                entry.path.to_string_lossy().into_owned(),
+                entry.name.to_string(),
+            );
+            (key, stored)
+        }),
+    )?;
+    write_rows(
+        &wtxn,
+        MARKS_NUMBERED,
+        true,
+        state.numbered_marks.iter().map(|mark| {
             let stored = StoredMark {
                 path: mark.path.to_string_lossy().into_owned(),
                 line: mark.line,
                 col: mark.col,
                 ts,
             };
-            let bytes = rmp_serde::to_vec(&stored).map_err(std::io::Error::other)?;
-            let key = mark.digit.to_string();
-            table
-                .insert(key.as_str(), bytes.as_slice())
-                .map_err(std::io::Error::other)?;
-        }
-    }
-    {
-        // Changelists key on path; clear so a file whose list emptied drops out.
-        let mut table = wtxn
-            .open_table(CHANGELIST_FILE)
-            .map_err(std::io::Error::other)?;
-        table.retain(|_, _| false).map_err(std::io::Error::other)?;
-        for cl in &state.file_changelists {
+            (mark.digit.to_string(), stored)
+        }),
+    )?;
+    write_rows(
+        &wtxn,
+        CHANGELIST_FILE,
+        true,
+        state.file_changelists.iter().map(|cl| {
             let stored = StoredChangelist {
                 entries: cl.entries.clone(),
                 ts,
             };
-            let bytes = rmp_serde::to_vec(&stored).map_err(std::io::Error::other)?;
-            let path = cl.path.to_string_lossy().into_owned();
-            table
-                .insert(path.as_str(), bytes.as_slice())
-                .map_err(std::io::Error::other)?;
-        }
-    }
-    {
-        // Manual folds key on path; clear so a file whose folds were all deleted
-        // drops out (mirrors the changelist table).
-        let mut table = wtxn.open_table(FOLDS_FILE).map_err(std::io::Error::other)?;
-        table.retain(|_, _| false).map_err(std::io::Error::other)?;
-        for ff in &state.file_folds {
+            (cl.path.to_string_lossy().into_owned(), stored)
+        }),
+    )?;
+    write_rows(
+        &wtxn,
+        FOLDS_FILE,
+        true,
+        state.file_folds.iter().map(|ff| {
             let stored = StoredFolds {
                 folds: ff.folds.clone(),
                 ts,
             };
-            let bytes = rmp_serde::to_vec(&stored).map_err(std::io::Error::other)?;
-            let path = ff.path.to_string_lossy().into_owned();
-            table
-                .insert(path.as_str(), bytes.as_slice())
-                .map_err(std::io::Error::other)?;
-        }
-    }
-    {
-        // Plugin data keys on `(namespace, key)`; clear before rewrite so a key a
-        // plugin deleted this session drops out (mirrors the per-file marks).
-        let mut table = wtxn.open_table(PLUGIN).map_err(std::io::Error::other)?;
-        table.retain(|_, _| false).map_err(std::io::Error::other)?;
-        for ns in &state.plugin_data {
-            for entry in &ns.entries {
+            (ff.path.to_string_lossy().into_owned(), stored)
+        }),
+    )?;
+    write_rows_pair(
+        &wtxn,
+        PLUGIN,
+        state.plugin_data.iter().flat_map(|ns| {
+            ns.entries.iter().map(|entry| {
                 let stored = StoredPlugin {
                     value: entry.value.clone(),
                     ts,
                 };
-                let bytes = rmp_serde::to_vec(&stored).map_err(std::io::Error::other)?;
-                table
-                    .insert(
-                        (ns.namespace.as_str(), entry.key.as_str()),
-                        bytes.as_slice(),
-                    )
-                    .map_err(std::io::Error::other)?;
-            }
-        }
-    }
+                ((ns.namespace.clone(), entry.key.clone()), stored)
+            })
+        }),
+    )?;
     {
         // The jumplist is rewritten wholesale (keys 0..N), so clear first lest a
         // now-shorter list leave stale tail rows.
@@ -691,13 +702,23 @@ struct MergedRaw {
 fn collect_merge<'a>(dbs: impl IntoIterator<Item = &'a Database>) -> MergedRaw {
     let mut m = MergedRaw::default();
     for db in dbs {
-        merge_registers(db, &mut m.regs);
-        merge_global_marks(db, &mut m.global_marks);
-        merge_file_marks(db, &mut m.file_marks);
-        merge_numbered_marks(db, &mut m.numbered);
-        merge_changelists(db, &mut m.changelist);
-        merge_folds(db, &mut m.folds);
-        merge_plugin(db, &mut m.plugin);
+        merge_best(db, REGISTERS, &mut m.regs, |name| name.chars().next());
+        merge_best(db, MARKS_GLOBAL, &mut m.global_marks, |name| {
+            name.chars().next()
+        });
+        merge_best(db, MARKS_FILE, &mut m.file_marks, |(path, name)| {
+            name.chars().next().map(|n| (path.to_string(), n))
+        });
+        merge_best(db, MARKS_NUMBERED, &mut m.numbered, |digit| {
+            digit.chars().next()
+        });
+        merge_best(db, CHANGELIST_FILE, &mut m.changelist, |path| {
+            Some(path.to_string())
+        });
+        merge_best(db, FOLDS_FILE, &mut m.folds, |path| Some(path.to_string()));
+        merge_best(db, PLUGIN, &mut m.plugin, |(ns, key)| {
+            Some((ns.to_string(), key.to_string()))
+        });
         merge_history(db, HIST_SEARCH, &mut m.hist_search);
         merge_history(db, HIST_EX, &mut m.hist_ex);
         merge_input_history(db, &mut m.hist_input);
@@ -881,100 +902,61 @@ fn numbered_passthrough(marks: std::collections::HashMap<char, StoredMark>) -> V
         .collect()
 }
 
-/// Fold one store's `registers` table into the running best-by-timestamp map.
-fn merge_registers(db: &Database, best: &mut std::collections::HashMap<char, StoredRegister>) {
-    let Ok(rtxn) = db.begin_read() else {
-        return;
-    };
-    let table = match rtxn.open_table(REGISTERS) {
-        Ok(table) => table,
-        // A store written before any register existed has no table — not an error.
-        Err(TableError::TableDoesNotExist(_)) => return,
-        Err(_) => return,
-    };
-    let Ok(iter) = table.iter() else {
-        return;
-    };
-    for row in iter.flatten() {
-        let (key, value) = row;
-        let Some(name) = key.value().chars().next() else {
-            continue;
-        };
-        let Ok(stored) = rmp_serde::from_slice::<StoredRegister>(value.value()) else {
-            continue;
-        };
-        match best.get(&name) {
-            Some(existing) if existing.ts >= stored.ts => {}
-            _ => {
-                best.insert(name, stored);
-            }
-        }
-    }
+/// The recency stamp every merged shada row carries — the merge key
+/// [`merge_best`] compares (newest wins).
+trait HasTs {
+    fn ts(&self) -> u64;
 }
 
-/// Fold one store's `marks_global` table into the running best-by-timestamp map.
-/// Identical recency discipline to [`merge_registers`]: newest `ts` per mark name
-/// wins; a store predating any global mark has no table, which is not an error.
-fn merge_global_marks(db: &Database, best: &mut std::collections::HashMap<char, StoredMark>) {
-    let Ok(rtxn) = db.begin_read() else {
-        return;
-    };
-    let table = match rtxn.open_table(MARKS_GLOBAL) {
-        Ok(table) => table,
-        Err(TableError::TableDoesNotExist(_)) => return,
-        Err(_) => return,
-    };
-    let Ok(iter) = table.iter() else {
-        return;
-    };
-    for row in iter.flatten() {
-        let (key, value) = row;
-        let Some(name) = key.value().chars().next() else {
-            continue;
-        };
-        let Ok(stored) = rmp_serde::from_slice::<StoredMark>(value.value()) else {
-            continue;
-        };
-        match best.get(&name) {
-            Some(existing) if existing.ts >= stored.ts => {}
-            _ => {
-                best.insert(name, stored);
-            }
-        }
-    }
+macro_rules! has_ts {
+    ($($ty:ty),+) => { $(impl HasTs for $ty { fn ts(&self) -> u64 { self.ts } })+ };
 }
+has_ts!(
+    StoredRegister,
+    StoredMark,
+    StoredFileMark,
+    StoredChangelist,
+    StoredFolds,
+    StoredPlugin
+);
 
-/// Fold one store's `marks_file` table into the running best-by-timestamp map,
-/// keyed `(path, mark-name)`. Same recency discipline as the other marks.
-fn merge_file_marks(
+/// Fold one store's `def` table into the running best-by-timestamp map: each row
+/// deserializes to a `V` (rows that don't parse are skipped), keys through
+/// `key_of` (`None` skips), and the newest [`ts`](HasTs) per key wins. A store
+/// written before the table's feature existed has no table
+/// ([`TableError::TableDoesNotExist`]) — not an error; any other open/read
+/// failure is equally non-fatal for a merge read.
+fn merge_best<K, MK, V>(
     db: &Database,
-    best: &mut std::collections::HashMap<(String, char), StoredFileMark>,
-) {
+    def: TableDefinition<K, &[u8]>,
+    best: &mut std::collections::HashMap<MK, V>,
+    key_of: impl for<'a> Fn(<K as redb::Value>::SelfType<'a>) -> Option<MK>,
+) where
+    K: redb::Key + 'static,
+    MK: std::hash::Hash + Eq,
+    V: serde::de::DeserializeOwned + HasTs,
+{
     let Ok(rtxn) = db.begin_read() else {
         return;
     };
-    let table = match rtxn.open_table(MARKS_FILE) {
-        Ok(table) => table,
-        Err(TableError::TableDoesNotExist(_)) => return,
-        Err(_) => return,
+    let Ok(table) = rtxn.open_table(def) else {
+        return;
     };
     let Ok(iter) = table.iter() else {
         return;
     };
     for row in iter.flatten() {
         let (key, value) = row;
-        let (path, name_str) = key.value();
-        let Some(name) = name_str.chars().next() else {
+        let Some(k) = key_of(key.value()) else {
             continue;
         };
-        let Ok(stored) = rmp_serde::from_slice::<StoredFileMark>(value.value()) else {
+        let Ok(stored) = rmp_serde::from_slice::<V>(value.value()) else {
             continue;
         };
-        let composite = (path.to_string(), name);
-        match best.get(&composite) {
-            Some(existing) if existing.ts >= stored.ts => {}
+        match best.get(&k) {
+            Some(existing) if existing.ts() >= stored.ts() => {}
             _ => {
-                best.insert(composite, stored);
+                best.insert(k, stored);
             }
         }
     }
@@ -1013,10 +995,9 @@ fn merge_history(db: &Database, def: TableDefinition<u64, &[u8]>, merge: &mut Hi
     let Ok(rtxn) = db.begin_read() else {
         return;
     };
-    let table = match rtxn.open_table(def) {
-        Ok(table) => table,
-        Err(TableError::TableDoesNotExist(_)) => return,
-        Err(_) => return,
+    // A store predating the table has no table — not an error (see `merge_best`).
+    let Ok(table) = rtxn.open_table(def) else {
+        return;
     };
     let Ok(iter) = table.iter() else {
         return;
@@ -1037,10 +1018,9 @@ fn merge_input_history(db: &Database, merge: &mut std::collections::HashMap<Stri
     let Ok(rtxn) = db.begin_read() else {
         return;
     };
-    let table = match rtxn.open_table(HIST_INPUT) {
-        Ok(table) => table,
-        Err(TableError::TableDoesNotExist(_)) => return,
-        Err(_) => return,
+    // A store predating the table has no table — not an error (see `merge_best`).
+    let Ok(table) = rtxn.open_table(HIST_INPUT) else {
+        return;
     };
     let Ok(iter) = table.iter() else {
         return;
@@ -1055,133 +1035,6 @@ fn merge_input_history(db: &Database, merge: &mut std::collections::HashMap<Stri
             .entry(namespace.to_string())
             .or_default()
             .observe(stored.text, seq);
-    }
-}
-
-/// Fold one store's `marks_numbered` table into the best-by-timestamp map, keyed by
-/// the digit `'0'`–`'9'`. Same recency discipline as the other marks.
-fn merge_numbered_marks(db: &Database, best: &mut std::collections::HashMap<char, StoredMark>) {
-    let Ok(rtxn) = db.begin_read() else {
-        return;
-    };
-    let table = match rtxn.open_table(MARKS_NUMBERED) {
-        Ok(table) => table,
-        Err(TableError::TableDoesNotExist(_)) => return,
-        Err(_) => return,
-    };
-    let Ok(iter) = table.iter() else {
-        return;
-    };
-    for row in iter.flatten() {
-        let (key, value) = row;
-        let Some(digit) = key.value().chars().next() else {
-            continue;
-        };
-        let Ok(stored) = rmp_serde::from_slice::<StoredMark>(value.value()) else {
-            continue;
-        };
-        match best.get(&digit) {
-            Some(existing) if existing.ts >= stored.ts => {}
-            _ => {
-                best.insert(digit, stored);
-            }
-        }
-    }
-}
-
-/// Fold one store's `changelist_file` table into the best-by-timestamp map, keyed
-/// by path (newest `ts` per file wins — a changelist persists as one row).
-fn merge_changelists(
-    db: &Database,
-    best: &mut std::collections::HashMap<String, StoredChangelist>,
-) {
-    let Ok(rtxn) = db.begin_read() else {
-        return;
-    };
-    let table = match rtxn.open_table(CHANGELIST_FILE) {
-        Ok(table) => table,
-        Err(TableError::TableDoesNotExist(_)) => return,
-        Err(_) => return,
-    };
-    let Ok(iter) = table.iter() else {
-        return;
-    };
-    for row in iter.flatten() {
-        let (key, value) = row;
-        let path = key.value().to_string();
-        let Ok(stored) = rmp_serde::from_slice::<StoredChangelist>(value.value()) else {
-            continue;
-        };
-        match best.get(&path) {
-            Some(existing) if existing.ts >= stored.ts => {}
-            _ => {
-                best.insert(path, stored);
-            }
-        }
-    }
-}
-
-/// Fold one store's `folds_file` table into the best-by-timestamp map, keyed by
-/// path (newest `ts` per file wins — a file's manual folds persist as one row,
-/// like its changelist).
-fn merge_folds(db: &Database, best: &mut std::collections::HashMap<String, StoredFolds>) {
-    let Ok(rtxn) = db.begin_read() else {
-        return;
-    };
-    let table = match rtxn.open_table(FOLDS_FILE) {
-        Ok(table) => table,
-        Err(TableError::TableDoesNotExist(_)) => return,
-        Err(_) => return,
-    };
-    let Ok(iter) = table.iter() else {
-        return;
-    };
-    for row in iter.flatten() {
-        let (key, value) = row;
-        let path = key.value().to_string();
-        let Ok(stored) = rmp_serde::from_slice::<StoredFolds>(value.value()) else {
-            continue;
-        };
-        match best.get(&path) {
-            Some(existing) if existing.ts >= stored.ts => {}
-            _ => {
-                best.insert(path, stored);
-            }
-        }
-    }
-}
-
-/// Fold one store's `plugin` table into the best-by-timestamp map, keyed
-/// `(namespace, key)` (newest `ts` per pair wins). Same recency discipline as the
-/// file marks; a store predating any opted-in plugin has no table (not an error).
-fn merge_plugin(
-    db: &Database,
-    best: &mut std::collections::HashMap<(String, String), StoredPlugin>,
-) {
-    let Ok(rtxn) = db.begin_read() else {
-        return;
-    };
-    let table = match rtxn.open_table(PLUGIN) {
-        Ok(table) => table,
-        Err(TableError::TableDoesNotExist(_)) => return,
-        Err(_) => return,
-    };
-    let Ok(iter) = table.iter() else {
-        return;
-    };
-    for row in iter.flatten() {
-        let (key, value) = row;
-        let (namespace, name) = key.value();
-        let Ok(stored) = rmp_serde::from_slice::<StoredPlugin>(value.value()) else {
-            continue;
-        };
-        let composite = (namespace.to_string(), name.to_string());
-        match best.get(&composite) {
-            Some(existing) if existing.ts >= stored.ts => {}
-            _ => {
-                best.insert(composite, stored);
-            }
-        }
     }
 }
 

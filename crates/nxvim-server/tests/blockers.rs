@@ -626,3 +626,35 @@ async fn string_width_and_character_builtins() {
         Value::from(4u64)
     );
 }
+
+// ===================== nvim_exec_lua args contract ==========================
+
+/// `nvim_exec_lua` takes `args` only as an empty list: nxvim has no channel that
+/// threads values into the chunk, so a non-empty `args` must fail the request
+/// loudly — silently evaluating the chunk with its parameters missing would make
+/// every `...`-read a nil (the no-silent-stub rule). The empty-args form (what
+/// every harness `exec_lua` call sends) keeps working.
+#[tokio::test]
+async fn exec_lua_with_args_errors_loudly() {
+    let dir = temp_dir("exec_lua_args");
+    let (rpc, _incoming) = start_with_config(&dir, "").await;
+
+    let r = rpc
+        .request(
+            "nvim_exec_lua",
+            vec![Value::from("return 1"), Value::Array(vec![Value::from(1)])],
+        )
+        .await;
+    assert!(
+        r.is_err(),
+        "non-empty args must fail the request loudly, got {r:?}"
+    );
+
+    // The supported empty-args form still evaluates.
+    let ok = exec_lua(&rpc, "return 1").await;
+    assert_eq!(
+        ok.as_i64(),
+        Some(1),
+        "empty-args exec_lua should still work"
+    );
+}

@@ -761,11 +761,16 @@ impl Buffer {
         self.save_tick += 1;
     }
 
-    /// Stamp `stat` as the disk baseline directly — for a buffer whose content the
-    /// editor deliberately does *not* hold (an `'imagepreview'` image: the bytes are
-    /// never read into the rope, but the redraw's image marker still carries the file's
-    /// size/mtime). Unlike [`mark_written`](Buffer::mark_written) it touches only the
-    /// snapshot, not the name / `modified` / `save_tick`.
+    /// Stamp `stat` as the disk baseline directly — unlike
+    /// [`mark_written`](Buffer::mark_written) it touches only the snapshot, not the
+    /// name / `modified` / `save_tick`. Two callers need exactly that: a buffer whose
+    /// content the editor deliberately does *not* hold (an `'imagepreview'` image: the
+    /// bytes are never read into the rope, but the redraw's image marker still carries
+    /// the file's size/mtime), and an off-tick replica load (daemon / wasm) that landed
+    /// an *existing* file's bytes but — unlike a local [`Buffer::from_file`] read — has
+    /// no synchronous stat, so it records a size-only baseline (`mtime: None`); without
+    /// it [`disk_stat`](Buffer::disk_stat) stays `None` and the server fires
+    /// `BufNewFile` instead of `BufReadPost` for a file that plainly exists.
     pub fn stamp_disk(&mut self, stat: Option<FileStat>) {
         self.disk = stat;
     }
@@ -776,16 +781,6 @@ impl Buffer {
     /// re-arms whenever the file we track changes identity (a load/reload/save).
     pub fn disk_stat(&self) -> Option<FileStat> {
         self.disk
-    }
-
-    /// Stamp the disk snapshot directly. For an off-tick replica load (daemon / wasm)
-    /// that landed an *existing* file's bytes but — unlike a local [`Buffer::from_file`]
-    /// read — has no synchronous stat: it records a size-only baseline (`mtime: None`)
-    /// so the buffer counts as read-from-disk, not a `:e new-file`. Without it
-    /// [`disk_stat`](Buffer::disk_stat) stays `None` and the server fires `BufNewFile`
-    /// instead of `BufReadPost` for a file that plainly exists.
-    pub fn set_disk_stat(&mut self, stat: Option<FileStat>) {
-        self.disk = stat;
     }
 
     /// Whether the bound file changed on disk since nxvim last read or wrote it —

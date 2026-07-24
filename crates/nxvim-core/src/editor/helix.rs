@@ -272,9 +272,8 @@ struct SurroundOp {
 }
 
 impl SurroundOp {
-    /// A delete/insert with no replacement text (`md`) — `new_len` documents the
-    /// intent but a delete carries empty text.
-    fn new(at: usize, old_len: usize, _new_len: usize) -> Self {
+    /// A plain delete (`md`): the `old_len` delimiter bytes at `at` are removed.
+    fn delete(at: usize, old_len: usize) -> Self {
         SurroundOp {
             at,
             old_len,
@@ -316,6 +315,12 @@ fn helix_word_big(m: Motion) -> bool {
     )
 }
 
+/// A selection's pre-edit span in a multi-span splice-and-refit transform:
+/// `(lo, hi_excl, orig_idx, head_high)` — the grapheme-extended byte bounds, the
+/// index back into the unsorted range set, and whether the head sat at the high
+/// end. Built (sorted ascending) by [`Editor::selection_spans`].
+type SelSpan = (usize, usize, usize, bool);
+
 /// Where a Helix insert-entry action ([`Editor::helix_enter_insert`]) collapses each
 /// selection before opening Insert: `i` before the selection, `a` one grapheme past
 /// its end, `I` at the line's first non-blank, `A` at end of line.
@@ -332,13 +337,7 @@ impl Editor {
     /// vim's Normal mode: start from a single point selection at the cursor.
     pub(crate) fn enter_helix(&mut self) {
         self.reset_pending();
-        self.helix_count = None;
-        self.helix_find = None;
-        self.helix_replace = false;
-        self.helix_view = false;
-        self.helix_register = false;
-        self.helix_match = None;
-        self.helix_surround_orig = None;
+        self.reset_helix_pending();
         self.clear_secondary_cursors();
         self.helix = true;
         self.mode = Mode::HelixNormal;
@@ -349,6 +348,18 @@ impl Editor {
     /// Leave Helix mode back to vim's Normal mode, collapsing to the single primary
     /// cursor. The inverse of [`Editor::enter_helix`] (the `:helix` toggle).
     pub(crate) fn leave_helix(&mut self) {
+        self.reset_helix_pending();
+        self.clear_secondary_cursors();
+        self.helix = false;
+        self.mode = Mode::Normal;
+        self.clamp_cursor();
+    }
+
+    /// Clear every in-flight Helix sub-grammar state — the pending count, the
+    /// `f`/`t` find target, `r` replace, `z` view, `"` register, `m` match mode,
+    /// and the surround-edit origin. The shared teardown of entering/leaving Helix
+    /// and `<Esc>` ([`helix_escape`](Self::helix_escape)).
+    fn reset_helix_pending(&mut self) {
         self.helix_count = None;
         self.helix_find = None;
         self.helix_replace = false;
@@ -356,10 +367,6 @@ impl Editor {
         self.helix_register = false;
         self.helix_match = None;
         self.helix_surround_orig = None;
-        self.clear_secondary_cursors();
-        self.helix = false;
-        self.mode = Mode::Normal;
-        self.clamp_cursor();
     }
 
     /// The Normal-family mode to return to when a mode ends (Insert, an ex command
@@ -681,13 +688,7 @@ impl Editor {
     /// selection); from normal, collapse the primary range to a point and drop any
     /// secondary selections.
     fn helix_escape(&mut self) {
-        self.helix_count = None;
-        self.helix_find = None;
-        self.helix_replace = false;
-        self.helix_view = false;
-        self.helix_register = false;
-        self.helix_match = None;
-        self.helix_surround_orig = None;
+        self.reset_helix_pending();
         if self.mode == Mode::HelixSelect {
             self.mode = Mode::HelixNormal;
             return;
@@ -1504,6 +1505,77 @@ impl Editor {
         self.clamp_cursor();
     }
 
+    /// Every selection's pre-edit span as `(lo, hi_excl, orig_idx, head_high)`,
+    /// sorted ascending by `lo` (document order) — the shape the multi-span
+    /// splice-and-refit transforms share: edits then apply descending (so raw byte
+    /// offsets stay valid) and [`refit_selections_over_spans`]
+    /// (Self::refit_selections_over_spans) walks the running shift ascending.
+    fn selection_spans(&self, sel: &Selections) -> Vec<SelSpan> {
+        let mut spans: Vec<SelSpan> = sel
+            .ranges
+            .iter()
+            .enumerate()
+            .map(|(i, r)| {
+                let a = self.anchor_byte(r.anchor);
+                let h = self.anchor_byte(r.head);
+                (a.min(h), self.next_grapheme_idx(a.max(h)), i, h >= a)
+            })
+            .collect();
+        spans.sort_by_key(|&(lo, ..)| lo);
+        spans
+    }
+
+    /// Re-place the selection set after a per-span edit pass, in one shared walk of
+    /// the offset math (the highest silent-corruption risk of the transform family
+    /// — keep exactly one copy). For ascending span `k`, `fit(k, span)` describes
+    /// its edit: `(own_shift, new_len, delta)` — how far the span's own edit pushed
+    /// its start right (pad inserted *before* it), the span content's new byte
+    /// length, and the net buffer-length change it contributes to every later
+    /// span's position. Each selection keeps its original index and head
+    /// orientation; empty new content collapses to a point (Helix's width-1
+    /// minimum applies otherwise).
+    fn refit_selections_over_spans(
+        &mut self,
+        sel: &Selections,
+        spans: &[SelSpan],
+        mut fit: impl FnMut(usize, SelSpan) -> (usize, usize, i64),
+    ) {
+        let mut ranges = sel.ranges.clone();
+        let mut cum: i64 = 0;
+        for (k, &span) in spans.iter().enumerate() {
+            let (lo, _hi, idx, head_high) = span;
+            let (own_shift, new_len, delta) = fit(k, span);
+            let start = (lo as i64 + cum) as usize + own_shift;
+            let end = start + new_len;
+            let (low, high) = if new_len == 0 {
+                let p = self.cursor_at_byte(start);
+                (p, p)
+            } else {
+                (
+                    self.cursor_at_byte(start),
+                    self.cursor_at_byte(self.prev_grapheme_idx(end)),
+                )
+            };
+            ranges[idx] = if head_high {
+                Range {
+                    anchor: low,
+                    head: high,
+                }
+            } else {
+                Range {
+                    anchor: high,
+                    head: low,
+                }
+            };
+            cum += delta;
+        }
+        self.set_selections(&Selections {
+            ranges,
+            primary: sel.primary,
+        });
+        self.clamp_cursor();
+    }
+
     /// `Alt-)` / `Alt-(` — rotate the *text contents* among the selections: forward
     /// moves each selection's text to the next selection in document order (wrapping),
     /// backward the other way. Unlike `)`/`(` (which move only *which* selection is
@@ -1520,20 +1592,7 @@ impl Editor {
             self.refuse_edit();
             return;
         }
-        // Each selection's span `(lo, hi_excl, orig_idx, head_high)`, ascending by `lo`
-        // (document order) so both the rotation index and the running edit offset walk
-        // left-to-right.
-        let mut spans: Vec<(usize, usize, usize, bool)> = sel
-            .ranges
-            .iter()
-            .enumerate()
-            .map(|(i, r)| {
-                let a = self.anchor_byte(r.anchor);
-                let h = self.anchor_byte(r.head);
-                (a.min(h), self.next_grapheme_idx(a.max(h)), i, h >= a)
-            })
-            .collect();
-        spans.sort_by_key(|&(lo, ..)| lo);
+        let spans = self.selection_spans(&sel);
         // The current text of each span, in document order.
         let texts: Vec<String> = spans
             .iter()
@@ -1559,44 +1618,15 @@ impl Editor {
             self.buffer_mut().insert(lo, rotated[k]);
         }
         self.buffer_mut().modified = true;
-        // Re-fit each selection over its span's new content. `cum` is the net byte
-        // delta from earlier (lower) spans whose replacement changed length.
-        let mut ranges = sel.ranges.clone();
-        let mut cum: i64 = 0;
-        for k in 0..n {
-            let (lo, hi, idx, head_high) = spans[k];
-            let old_len = hi - lo;
-            let new_len = rotated[k].len();
-            let start = (lo as i64 + cum) as usize;
-            let end = start + new_len;
-            // Keep Helix's width-1 minimum: empty content collapses to a point.
-            let (low, high) = if new_len == 0 {
-                let p = self.cursor_at_byte(start);
-                (p, p)
-            } else {
-                (
-                    self.cursor_at_byte(start),
-                    self.cursor_at_byte(self.prev_grapheme_idx(end)),
-                )
-            };
-            ranges[idx] = if head_high {
-                Range {
-                    anchor: low,
-                    head: high,
-                }
-            } else {
-                Range {
-                    anchor: high,
-                    head: low,
-                }
-            };
-            cum += new_len as i64 - old_len as i64;
-        }
-        self.set_selections(&Selections {
-            ranges,
-            primary: sel.primary,
+        // Each span holds its rotated content in place: no pad before it, the new
+        // length is the rotated text's, and later spans shift by the length change.
+        self.refit_selections_over_spans(&sel, &spans, |k, (lo, hi, ..)| {
+            (
+                0,
+                rotated[k].len(),
+                rotated[k].len() as i64 - (hi - lo) as i64,
+            )
         });
-        self.clamp_cursor();
     }
 
     /// `&` — align every selection's start onto the same column by inserting spaces
@@ -1608,25 +1638,17 @@ impl Editor {
     /// A no-op when every start already shares a column. One undo group.
     fn helix_align_selections(&mut self) {
         let sel = self.selections();
-        // Each selection's `(lo, col, orig_idx, head_high, width)` — `col` is the byte
-        // column of the start within its line, `width` the span's byte length.
-        let mut spans: Vec<(usize, usize, usize, bool, usize)> = sel
-            .ranges
+        let spans = self.selection_spans(&sel);
+        // Each span's byte column within its line, parallel to `spans`.
+        let cols: Vec<usize> = spans
             .iter()
-            .enumerate()
-            .map(|(i, r)| {
-                let a = self.anchor_byte(r.anchor);
-                let h = self.anchor_byte(r.head);
-                let lo = a.min(h);
-                let hi = self.next_grapheme_idx(a.max(h));
+            .map(|&(lo, ..)| {
                 let line = self.buffer().byte_to_line(lo);
-                let line_start = self.buffer().byte_at(line, 0);
-                (lo, lo - line_start, i, h >= a, hi - lo)
+                lo - self.buffer().byte_at(line, 0)
             })
             .collect();
-        spans.sort_by_key(|&(lo, ..)| lo);
-        let target = spans.iter().map(|&(_, col, ..)| col).max().unwrap_or(0);
-        if spans.iter().all(|&(_, col, ..)| col == target) {
+        let target = cols.iter().copied().max().unwrap_or(0);
+        if cols.iter().all(|&col| col == target) {
             return;
         }
         if !self.modifiable() {
@@ -1635,40 +1657,19 @@ impl Editor {
         }
         self.push_undo();
         // Insert descending so lower byte offsets stay valid.
-        for &(lo, col, ..) in spans.iter().rev() {
+        for (&(lo, ..), &col) in spans.iter().zip(&cols).rev() {
             let pad = target - col;
             if pad > 0 {
                 self.buffer_mut().insert(lo, &" ".repeat(pad));
             }
         }
         self.buffer_mut().modified = true;
-        // Re-place each selection, shifted right by the cumulative pad inserted at or
-        // before its start (its own pad is inserted *before* it, so it is included).
-        let mut ranges = sel.ranges.clone();
-        let mut cum = 0usize;
-        for &(lo, col, idx, head_high, width) in &spans {
-            cum += target - col;
-            let start = lo + cum;
-            let end = start + width;
-            let low = self.cursor_at_byte(start);
-            let high = self.cursor_at_byte(self.prev_grapheme_idx(end));
-            ranges[idx] = if head_high {
-                Range {
-                    anchor: low,
-                    head: high,
-                }
-            } else {
-                Range {
-                    anchor: high,
-                    head: low,
-                }
-            };
-        }
-        self.set_selections(&Selections {
-            ranges,
-            primary: sel.primary,
+        // Each span keeps its content but its own pad is inserted *before* it, so
+        // the pad shifts its start and every later span alike.
+        self.refit_selections_over_spans(&sel, &spans, |k, (lo, hi, ..)| {
+            let pad = target - cols[k];
+            (pad, hi - lo, pad as i64)
         });
-        self.clamp_cursor();
     }
 
     // ----- match mode (`m`): goto match / text objects / surround ------------
@@ -1791,19 +1792,7 @@ impl Editor {
         let (open, close) = surround_pair(delim);
         let (o, c) = (open.len_utf8(), close.len_utf8());
         let sel = self.selections();
-        // `(lo, hi_excl, orig_idx, head_high)` for each selection, ascending by `lo`
-        // so the running insert offset (`cum`) accumulates left-to-right.
-        let mut spans: Vec<(usize, usize, usize, bool)> = sel
-            .ranges
-            .iter()
-            .enumerate()
-            .map(|(i, r)| {
-                let a = self.anchor_byte(r.anchor);
-                let h = self.anchor_byte(r.head);
-                (a.min(h), self.next_grapheme_idx(a.max(h)), i, h >= a)
-            })
-            .collect();
-        spans.sort_by_key(|&(lo, ..)| lo);
+        let spans = self.selection_spans(&sel);
         // Insert descending (highest span first) so each selection's original byte
         // offsets stay valid until it is wrapped.
         self.push_undo();
@@ -1812,33 +1801,12 @@ impl Editor {
             self.buffer_mut().insert(lo, &open.to_string());
         }
         self.buffer_mut().modified = true;
-        // Re-place each selection over its whole wrapped span. `cum` is the total
-        // delimiter bytes inserted by earlier (lower) selections.
-        let mut ranges = sel.ranges.clone();
-        let mut cum = 0usize;
-        for &(lo, hi, idx, head_high) in &spans {
-            let start = lo + cum; // the opening delimiter
-            let end = hi + cum + o + c; // exclusive, one past the closing delimiter
-            let low = self.cursor_at_byte(start);
-            let high = self.cursor_at_byte(self.prev_grapheme_idx(end));
-            ranges[idx] = if head_high {
-                Range {
-                    anchor: low,
-                    head: high,
-                }
-            } else {
-                Range {
-                    anchor: high,
-                    head: low,
-                }
-            };
-            cum += o + c;
-        }
-        self.set_selections(&Selections {
-            ranges,
-            primary: sel.primary,
+        // Each span grows by its own delimiters — which become part of it: the new
+        // span starts at the opener (no shift before it) and its length includes
+        // both delimiter chars, so the head lands on the closer.
+        self.refit_selections_over_spans(&sel, &spans, |_, (lo, hi, ..)| {
+            (0, hi - lo + o + c, (o + c) as i64)
         });
-        self.clamp_cursor();
     }
 
     /// `md{char}` — delete the `char` pair surrounding **each** selection (a bracket
@@ -1860,8 +1828,8 @@ impl Editor {
                 continue;
             }
             seen.push(p.lo);
-            ops.push(SurroundOp::new(p.lo, p.io - p.lo, 0)); // opener → nothing
-            ops.push(SurroundOp::new(p.cl, p.hi - p.cl, 0)); // closer → nothing
+            ops.push(SurroundOp::delete(p.lo, p.io - p.lo)); // opener → nothing
+            ops.push(SurroundOp::delete(p.cl, p.hi - p.cl)); // closer → nothing
         }
         if ops.is_empty() {
             return;

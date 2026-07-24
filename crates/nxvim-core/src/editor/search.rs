@@ -821,11 +821,3 @@ impl Editor {
         (matches, current)
     }
 }
-
-/// Trim a history ring to its newest `cap` entries (dropping the oldest from the
-/// front). `cap == 0` empties it — `'history'` of 0 disables that history.
-fn cap_ring(ring: &mut Vec<String>, cap: usize) {
-    if ring.len() > cap {
-        ring.drain(0..ring.len() - cap);
-    }
-}

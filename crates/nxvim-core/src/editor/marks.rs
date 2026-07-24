@@ -287,73 +287,32 @@ impl Editor {
         self.settle_cursor_byte(self.buffer().byte_at(line, col));
     }
 
-    /// `:marks [names]` — list the set marks into a read-only scratch listing, mirroring vim's
-    /// `mark line col file/text` table. Order: the automatic specials, then the
-    /// buffer-local `a`–`z`, then the global `A`–`Z`. An argument filters to the
-    /// named marks (`:marks aB`). A buffer-local row shows its line's text; a global
-    /// row shows the file (or its text when it points into the current buffer).
+    /// `:marks [names]` — list the set marks into a read-only scratch listing,
+    /// mirroring vim's `mark line col file/text` table. An argument filters to the
+    /// named marks (`:marks aB`). Rendered straight off [`Self::marks_mirror`] —
+    /// the one copy of the membership/order/detail walk — whose `text` field is
+    /// exactly this table's file/text column.
     pub(crate) fn ex_marks(&mut self, args: &str) {
         let filter: Vec<char> = args.chars().filter(|c| !c.is_whitespace()).collect();
-        let wanted = |name: char| filter.is_empty() || filter.contains(&name);
-
         let mut lines = vec!["mark line  col file/text".to_string()];
-        // Buffer-local marks (specials first, then a–z): line/col + the line text.
-        let local = SPECIAL_MARKS.iter().copied().chain('a'..='z');
-        for name in local {
-            if !wanted(name) {
-                continue;
-            }
-            if let Some(&(line, col)) = self.buffer().marks.get(&name) {
-                let text = self.buffer().line(line.min(self.last_line()));
-                lines.push(format_mark_line(name, line, col, text.trim_end()));
-            }
-        }
-        // Global marks: their stored line/col, and the file they point into (its
-        // text when that buffer is current, else its path). A mark still *pending*
-        // from a shada restore (its file not yet reopened) lists by its stored
-        // path, exactly as vim shows a restored global mark before its file loads.
-        for name in ('A'..='Z').filter(|&n| wanted(n)) {
-            let (line, col, detail) = if let Some(&(buf, cur)) = self.global_marks.get(&name) {
-                let detail = if buf == self.cur_buffer() {
-                    self.buffer()
-                        .line(cur.line.min(self.last_line()))
-                        .trim_end()
-                        .to_string()
-                } else {
-                    self.buffer_name(buf)
-                        .filter(|n| !n.is_empty())
-                        .unwrap_or_else(|| "[No Name]".to_string())
-                };
-                (cur.line, cur.col, detail)
-            } else if let Some((path, cur)) = self.pending_global_marks.get(&name) {
-                (cur.line, cur.col, path.display().to_string())
-            } else {
-                continue;
-            };
-            lines.push(format_mark_line(name, line, col, &detail));
-        }
-        // Numbered marks `'0`–`'9` — the shada-restored last-exit positions. They
-        // always point into a past session's file (never yet reopened), so they
-        // list by their stored path, like a pending global mark.
-        for name in ('0'..='9').filter(|&n| wanted(n)) {
-            if let Some((path, cur)) = self.numbered_marks.get(&name) {
-                lines.push(format_mark_line(
-                    name,
-                    cur.line,
-                    cur.col,
-                    &path.display().to_string(),
-                ));
+        for row in self.marks_mirror() {
+            if filter.is_empty() || filter.contains(&row.name) {
+                lines.push(format_mark_line(row.name, row.line, row.col, &row.text));
             }
         }
         self.open_scratch_listing("[Marks]", lines, 0);
     }
 
-    /// Structured twin of [`Self::ex_marks`] for the Lua `nx._marks` mirror that
-    /// backs `nx.mark.list` and the `marks` picker. Same membership and order as
-    /// `:marks` — the current buffer's specials then `a`–`z`, the global `A`–`Z`,
-    /// then the numbered `0`–`9` — but each row carries the fields a jump needs:
-    /// the target `bufnr` (`0` when the mark is pending, its file not yet
-    /// reopened), a `path` to open (empty for an unnamed current buffer), the
+    /// The structured mark listing behind both `:marks` ([`Self::ex_marks`]) and
+    /// the Lua `nx._marks` mirror (`nx.mark.list` / the `marks` picker).
+    /// Membership and order: the current buffer's specials then `a`–`z`, the
+    /// global `A`–`Z` (their stored line/col and the file they point into — its
+    /// line text when that buffer is current; a mark still *pending* from a shada
+    /// restore, its file not yet reopened, lists by its stored path, exactly as
+    /// vim shows a restored global mark before its file loads), then the numbered
+    /// `0`–`9` (shada-restored last-exit positions, always pending). Each row
+    /// carries the fields a jump needs: the target `bufnr` (`0` when the mark is
+    /// pending), a `path` to open (empty for an unnamed current buffer), the
     /// 0-based `line`/`col`, and a `text` detail (the line's text, or the file for
     /// a mark pointing outside the current buffer).
     pub fn marks_mirror(&self) -> Vec<MarkMirrorEntry> {
@@ -392,10 +351,7 @@ impl Editor {
                         .to_string();
                     (cur_name.clone(), t)
                 } else {
-                    let n = self
-                        .buffer_name(buf)
-                        .filter(|n| !n.is_empty())
-                        .unwrap_or_else(|| "[No Name]".to_string());
+                    let n = self.buffer_fallback_name(buf);
                     (n.clone(), n)
                 };
                 out.push(MarkMirrorEntry {

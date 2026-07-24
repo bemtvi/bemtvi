@@ -380,6 +380,15 @@ impl Editor {
         })
     }
 
+    /// [`buffer_name`](Self::buffer_name) with vim's listing fallback: `[No Name]`
+    /// for an unknown id or an unnamed (scratch) buffer. The one spelling of the
+    /// fallback the `:jumps` / mark-listing / which-key detail columns share.
+    pub(crate) fn buffer_fallback_name(&self, id: BufferId) -> String {
+        self.buffer_name(id)
+            .filter(|n| !n.is_empty())
+            .unwrap_or_else(|| "[No Name]".to_string())
+    }
+
     /// The buffer's user-facing *display* name — the same precedence the rendered
     /// statusline and tab label use (see [`crate::view`]'s `file_name`): a terminal
     /// buffer's window title, else a plugin view's (`nx.view`) `name`, else the file
@@ -941,7 +950,7 @@ impl Editor {
             mtime: None,
             size: ob.buffer.len_bytes() as u64,
         });
-        ob.buffer.set_disk_stat(Some(stat));
+        ob.buffer.stamp_disk(Some(stat));
     }
 
     /// Enqueue an off-tick fetch of `path` into `buffer` (an already-created, empty
@@ -1041,6 +1050,38 @@ impl Editor {
     /// the command replaces the content in place.
     pub fn open_scratch_listing(&mut self, name: &str, lines: Vec<String>, cursor: usize) {
         self.open_named_panel(name, lines, cursor, "nxlisting", LISTING_HEIGHT);
+    }
+
+    /// Open a vim *navigable-position* listing (`:jumps` / `:changes`) as a scratch
+    /// listing: `header` then one row per `(line, col, detail)` entry, oldest-first.
+    /// The leading column counts the presses (`<C-o>`/`g;` above, `<C-i>`/`g,`
+    /// below) to reach each row from the current position `idx`, which `>` marks —
+    /// as a trailing bare `>` when `idx` sits past the newest entry ("at the
+    /// present, not navigating").
+    pub(crate) fn open_position_listing(
+        &mut self,
+        name: &str,
+        header: &str,
+        idx: usize,
+        rows: &[(usize, usize, String)],
+    ) {
+        let mut lines = vec![header.to_string()];
+        for (i, &(line, col, ref detail)) in rows.iter().enumerate() {
+            let marker = if i == idx { '>' } else { ' ' };
+            let count = if i == idx {
+                String::new()
+            } else {
+                (idx as isize - i as isize).abs().to_string()
+            };
+            lines.push(format!(
+                "{marker}{count:>3} {:>4} {col:>4} {detail}",
+                line + 1
+            ));
+        }
+        if idx >= rows.len() {
+            lines.push(">".to_string());
+        }
+        self.open_scratch_listing(name, lines, 0);
     }
 
     /// `:ls` / `:buffers` — open the buffer list as the `[Buffers]` panel whose `<CR>`
@@ -1161,10 +1202,7 @@ impl Editor {
         self.top = saved_top;
         self.leftcol = saved_leftcol;
         self.mode = Mode::Normal;
-        self.reset_pending();
-        self.scroll_from = None;
-        self.pending_scroll = None;
-        self.message.clear();
+        self.reset_transient_state();
         self.clamp_cursor();
         self.ensure_visible();
         // A reopened file gets its shada-restored manual folds back when it becomes
@@ -1192,15 +1230,7 @@ impl Editor {
     pub(crate) fn move_buffer_to_layer(&mut self, target: Layer) {
         let buf = self.cur_buffer();
         let src_layer = self.focused_layer;
-        let replacement = self
-            .alternate
-            .filter(|a| {
-                *a != buf
-                    && self.buffers.map.contains_key(a)
-                    && self.buffers.get(*a).layer == src_layer
-            })
-            .or_else(|| self.neighbor_of(buf, src_layer));
-        match replacement {
+        match self.replacement_in_layer(buf, src_layer) {
             Some(rep) => self.switch_buffer(rep),
             None => {
                 let id = self.add_buffer(Buffer::empty());
@@ -1210,6 +1240,22 @@ impl Editor {
         // Cross to the target layer and show `buf` there, restoring its saved view.
         self.switch_layer(target);
         self.switch_buffer(buf);
+    }
+
+    /// The buffer the focused window falls back to when `excluding` leaves it: the
+    /// alternate if it's a distinct, still-open buffer homed in `layer` (vim's
+    /// behavior), else the nearest same-layer sibling by id. `None` when the layer
+    /// holds no other buffer — the caller then opens a fresh `[No Name]`. Staying
+    /// within `layer` matters: replacing a closing/moving document must never pull
+    /// in a dock's buffer (or vice versa).
+    fn replacement_in_layer(&self, excluding: BufferId, layer: Layer) -> Option<BufferId> {
+        self.alternate
+            .filter(|a| {
+                *a != excluding
+                    && self.buffers.map.contains_key(a)
+                    && self.buffers.get(*a).layer == layer
+            })
+            .or_else(|| self.neighbor_of(excluding, layer))
     }
 
     /// The id of an already-open buffer bound to `path`, if any. Matches by
@@ -2396,11 +2442,8 @@ impl Editor {
             return false;
         }
 
-        // When removing the current buffer, move to the alternate if it's a
-        // distinct, still-open buffer (vim's behavior), else the nearest id —
-        // **within the same layer**: closing a document in the main area must never
-        // pull in a dock's buffer (or vice versa). The replacement layer is the
-        // focused one, since the focused window is the one losing `target`.
+        // When removing the current buffer, move to `replacement_in_layer`'s pick.
+        // The layer is the focused one, since the focused window is losing `target`.
         // Deleting a **live** terminal buffer takes its PTY child with it: enqueue
         // the kill for the server's effect loop, or the child would be orphaned (a
         // leaked process per wiped terminal). Only for a still-live session — an
@@ -2420,13 +2463,7 @@ impl Editor {
         let deleted_name = self.buffers.get(target).buffer.path.clone();
         let layer = self.focused_layer;
         let replacement = if was_current {
-            self.alternate
-                .filter(|a| {
-                    *a != target
-                        && self.buffers.map.contains_key(a)
-                        && self.buffers.get(*a).layer == layer
-                })
-                .or_else(|| self.neighbor_of(target, layer))
+            self.replacement_in_layer(target, layer)
         } else {
             None
         };
@@ -2509,9 +2546,9 @@ impl Editor {
         self.top = 0;
         self.leftcol = 0;
         self.mode = Mode::Normal;
-        self.reset_pending();
-        self.scroll_from = None;
-        self.pending_scroll = None;
+        // The shared reset also clears the message line — the previously-divergent
+        // copy here left a stale message up after the `:bd`-to-empty fallback.
+        self.reset_transient_state();
     }
 
     /// After `target` has been removed from the store, rebind every window across

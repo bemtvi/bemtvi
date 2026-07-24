@@ -445,7 +445,41 @@ fn ex_takes_bar(name: &str) -> bool {
     ];
     TAKES_BAR
         .iter()
-        .any(|&(full, min)| name.len() >= min && full.starts_with(name))
+        .any(|&(full, min)| ex_name_matches(name, full, min))
+}
+
+/// Whether `name` spells the command `full` at one of its accepted abbreviation
+/// lengths — a prefix of `full` at least `min` bytes long, the dispatchers'
+/// abbreviation model (same hazard class as [`ex_takes_bar`]'s table: a flat
+/// spelling list re-typed per site drifts).
+fn ex_name_matches(name: &str, full: &str, min: usize) -> bool {
+    name.len() >= min && full.starts_with(name)
+}
+
+/// Whether `name` spells `:s[ubstitute]` at any accepted abbreviation. The ONE
+/// substitute-name check every recognizing site shares — dispatch, the bar
+/// splitter's section count ([`ex_pattern_sections`]), and the three `:s` preview
+/// paths — so a spelling can't land in one and drift from the others.
+fn is_substitute_name(name: &str) -> bool {
+    ex_name_matches(name, "substitute", 1)
+}
+
+/// The argument's opening pattern delimiter, if its first char can open one — any
+/// non-alphanumeric char except `\` and `"`, exactly as `:s` / `:g` read it.
+fn subst_delim(args: &str) -> Option<char> {
+    args.chars()
+        .next()
+        .filter(|&d| !d.is_alphanumeric() && d != '\\' && d != '"')
+}
+
+/// The substitute argument's delimiter and body once its **replacement half has
+/// opened** — an opening delimiter with a second unescaped one typed after it
+/// (`:s/pat/…`). The gate the diff-preview paths share ([`Editor::subst_preview`]
+/// and its structural twin [`Editor::subst_preview_active`]).
+fn open_subst_body(args: &str) -> Option<(char, &str)> {
+    let delim = subst_delim(args)?;
+    let body = &args[delim.len_utf8()..];
+    has_unescaped_delim(body, delim).then_some((delim, body))
 }
 
 /// Byte index where the command *name* starts — past a leading `:`, whitespace, and
@@ -479,13 +513,15 @@ fn ex_name_start(cmd: &str) -> usize {
 /// `:s/pat/rep/flags` has two, `:vimgrep /pat/flags files…` has one, everything else
 /// has none.
 fn ex_pattern_sections(name: &str) -> usize {
-    match name {
-        "s" | "su" | "sub" | "subs" | "subst" | "substi" | "substit" | "substitu" | "substitut"
-        | "substitute" => 2,
-        "vim" | "vimg" | "vimgr" | "vimgre" | "vimgrep" | "vimgrepa" | "vimgrepad"
-        | "vimgrepadd" | "lvim" | "lvimg" | "lvimgr" | "lvimgre" | "lvimgrep" | "lvimgrepa"
-        | "lvimgrepad" | "lvimgrepadd" => 1,
-        _ => 0,
+    if is_substitute_name(name) {
+        2
+    } else if ex_name_matches(name, "vimgrepadd", 3) || ex_name_matches(name, "lvimgrepadd", 4) {
+        // vim..vimgrep and vimgrepa..vimgrepadd are all ≥3-byte prefixes of
+        // `vimgrepadd` (likewise the `l` forms of `lvimgrepadd`), and both commands
+        // open the same single `/pat/` section.
+        1
+    } else {
+        0
     }
 }
 
@@ -1134,8 +1170,7 @@ impl Editor {
             },
             "red" | "redo" => self.redo(),
             "noh" | "nohlsearch" => self.search_active = false,
-            "s" | "su" | "sub" | "subs" | "subst" | "substi" | "substit" | "substitu"
-            | "substitut" | "substitute" => self.ex_substitute(range, args),
+            name if is_substitute_name(name) => self.ex_substitute(range, args),
             // `:[range]g[!]/pat/cmd` runs `cmd` on every line matching `pat`
             // (default range = whole file); `:g!` and `:v` invert to non-matching.
             "g" | "gl" | "glo" | "glob" | "globa" | "global" => self.ex_global(range, bang, args),
@@ -1406,53 +1441,33 @@ impl Editor {
     /// a bare `:s` to the last substitute's pattern — what submitting would run.
     /// `None` when the line isn't one of those commands, has no usable pattern,
     /// or carries a malformed range.
-    pub(crate) fn ex_preview_pattern(&self) -> Option<(String, usize, usize)> {
+    /// The live `:` command line split as far as every preview path needs: past
+    /// the leading `:`/spaces and the address range, the alphabetic command name,
+    /// and the argument with any `!` stripped. The name is split by hand rather
+    /// than through `split_ex`: that trims the argument, and a trailing space is
+    /// part of a pattern being typed (`:%s/foo ` must preview `"foo "`, not
+    /// `"foo"`). `None` on a malformed range.
+    fn cmdline_ex_parts(&self) -> Option<(ExRange, &str, &str)> {
         let cmd = self.cmdline.trim_start_matches([':', ' ']);
         let (range, rest) = self.parse_ex_range(cmd).ok()?;
-        // Split the name by hand rather than through `split_ex`: that trims the
-        // argument, and a trailing space is part of the pattern being typed
-        // (`:%s/foo ` must preview "foo ", not "foo").
         let rest = rest.trim_start();
         let name_len = rest.bytes().take_while(u8::is_ascii_alphabetic).count();
-        let name = &rest[..name_len];
         let after = &rest[name_len..];
         let args = after.strip_prefix('!').unwrap_or(after).trim_start();
+        Some((range, &rest[..name_len], args))
+    }
 
-        let subst = matches!(
-            name,
-            "s" | "su"
-                | "sub"
-                | "subs"
-                | "subst"
-                | "substi"
-                | "substit"
-                | "substitu"
-                | "substitut"
-                | "substitute"
-        );
-        let global = matches!(
-            name,
-            "g" | "gl"
-                | "glo"
-                | "glob"
-                | "globa"
-                | "global"
-                | "v"
-                | "vg"
-                | "vgl"
-                | "vglo"
-                | "vglob"
-                | "vgloba"
-                | "vglobal"
-        );
+    pub(crate) fn ex_preview_pattern(&self) -> Option<(String, usize, usize)> {
+        let (range, name, args) = self.cmdline_ex_parts()?;
+
+        let subst = is_substitute_name(name);
+        let global = ex_name_matches(name, "global", 1) || ex_name_matches(name, "vglobal", 1);
         if !subst && !global {
             return None;
         }
 
-        let pat = match args.chars().next() {
-            // The delimiter is whatever non-alphanumeric char follows the name,
-            // exactly as `:s` / `:g` read it (`\` and `"` are never delimiters).
-            Some(d) if !d.is_alphanumeric() && d != '\\' && d != '"' => {
+        let pat = match subst_delim(args) {
+            Some(d) => {
                 let body = &args[d.len_utf8()..];
                 if subst {
                     // Once the replacement half has been opened (`:s/pat/…`), the
@@ -1468,8 +1483,8 @@ impl Editor {
                 }
             }
             // A bare `:s` (or `:s{flags}`) repeats the last substitute's pattern.
-            _ if subst => self.last_substitute.as_ref()?.0.clone(),
-            _ => return None,
+            None if subst => self.last_substitute.as_ref()?.0.clone(),
+            None => return None,
         };
         let pattern = if pat.is_empty() {
             self.last_search.as_ref()?.0.clone()
@@ -1500,36 +1515,12 @@ impl Editor {
         if self.mode != Mode::Command || self.cmdline_kind != CmdlineKind::Ex {
             return false;
         }
-        let cmd = self.cmdline.trim_start_matches([':', ' ']);
-        let Ok((_range, rest)) = self.parse_ex_range(cmd) else {
-            return false;
-        };
-        let rest = rest.trim_start();
-        let name_len = rest.bytes().take_while(u8::is_ascii_alphabetic).count();
-        if !matches!(
-            &rest[..name_len],
-            "s" | "su"
-                | "sub"
-                | "subs"
-                | "subst"
-                | "substi"
-                | "substit"
-                | "substitu"
-                | "substitut"
-                | "substitute"
-        ) {
-            return false;
-        }
-        let after = &rest[name_len..];
-        let args = after.strip_prefix('!').unwrap_or(after).trim_start();
         // An opening delimiter whose replacement half has actually opened (a second
         // unescaped delimiter typed) — the same gate `subst_preview` uses.
-        match args.chars().next() {
-            Some(delim) if !delim.is_alphanumeric() && delim != '\\' && delim != '"' => {
-                has_unescaped_delim(&args[delim.len_utf8()..], delim)
-            }
-            _ => false,
-        }
+        self.cmdline_ex_parts()
+            .filter(|(_, name, _)| is_substitute_name(name))
+            .and_then(|(_, _, args)| open_subst_body(args))
+            .is_some()
     }
 
     /// The resolved live `:s/pat/rep/flags` **replacement preview**, once a
@@ -1548,35 +1539,12 @@ impl Editor {
         {
             return None;
         }
-        let cmd = self.cmdline.trim_start_matches([':', ' ']);
-        let (range, rest) = self.parse_ex_range(cmd).ok()?;
-        let rest = rest.trim_start();
-        let name_len = rest.bytes().take_while(u8::is_ascii_alphabetic).count();
-        if !matches!(
-            &rest[..name_len],
-            "s" | "su"
-                | "sub"
-                | "subs"
-                | "subst"
-                | "substi"
-                | "substit"
-                | "substitu"
-                | "substitut"
-                | "substitute"
-        ) {
+        let (range, name, args) = self.cmdline_ex_parts()?;
+        if !is_substitute_name(name) {
             return None;
         }
-        let after = &rest[name_len..];
-        let args = after.strip_prefix('!').unwrap_or(after).trim_start();
         // An opening delimiter, and its replacement half actually opened.
-        let delim = args
-            .chars()
-            .next()
-            .filter(|&d| !d.is_alphanumeric() && d != '\\' && d != '"')?;
-        let body = &args[delim.len_utf8()..];
-        if !has_unescaped_delim(body, delim) {
-            return None;
-        }
+        let (delim, body) = open_subst_body(args)?;
         let (pat, rep, flags) = split_substitute(body, delim);
         // Empty pattern reuses the last search pattern — what submitting would run.
         let pattern = if pat.is_empty() {
@@ -2104,15 +2072,8 @@ impl Editor {
             return;
         }
         self.push_undo();
-        let start = self.buffer().line_start(range.lo);
-        // Up to the start of the line after the range — or the buffer end when the
-        // range runs to the last line, so the deleted block's newlines go too.
-        let end = if range.hi < self.last_line() {
-            self.buffer().line_start(range.hi + 1)
-        } else {
-            self.buffer().len_bytes()
-        };
-        self.buffer_mut().remove(start..end);
+        let span = self.linewise_byte_span(range);
+        self.buffer_mut().remove(span);
         self.buffer_mut().normalize();
         self.cursor.line = range.lo.min(self.last_line());
         self.cursor.col = self.first_non_blank(self.cursor.line);
@@ -2142,18 +2103,25 @@ impl Editor {
         }
     }
 
-    /// The range's lines as one linewise chunk (always newline-terminated, since
-    /// the rope keeps a trailing `\n`), plus the byte span they occupy.
-    fn linewise_span(&self, range: ExRange) -> (String, std::ops::Range<usize>) {
+    /// The byte span the range's lines occupy, including their newlines: up to the
+    /// start of the line after the range — or the buffer end when the range runs
+    /// to the last line, so the block's final newline goes too. The span
+    /// `:delete` removes and [`Self::linewise_span`] copies.
+    fn linewise_byte_span(&self, range: ExRange) -> std::ops::Range<usize> {
         let start = self.buffer().line_start(range.lo);
-        // Up to the start of the line after the range — or the buffer end when
-        // the range runs to the last line, so the block's final newline goes too.
         let end = if range.hi < self.last_line() {
             self.buffer().line_start(range.hi + 1)
         } else {
             self.buffer().len_bytes()
         };
-        (self.buffer().text.slice(start..end).to_string(), start..end)
+        start..end
+    }
+
+    /// The range's lines as one linewise chunk (always newline-terminated, since
+    /// the rope keeps a trailing `\n`), plus the byte span they occupy.
+    fn linewise_span(&self, range: ExRange) -> (String, std::ops::Range<usize>) {
+        let span = self.linewise_byte_span(range);
+        (self.buffer().text.slice(span.clone()).to_string(), span)
     }
 
     /// Splice `chunk` (a whole number of lines) in below the 0-based line `dest`,

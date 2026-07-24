@@ -77,8 +77,7 @@ impl Editor {
     /// tab, not just the focused one. `None` if `id` names no open tab.
     pub fn tab_window_buffers(&self, id: TabId) -> Option<Vec<crate::BufferId>> {
         let tree = self.tab_tree(id)?;
-        let mut ids = tree.leaves();
-        ids.extend(tree.floats.iter().copied());
+        let ids = self.tab_window_ids(id)?;
         Some(ids.into_iter().map(|w| tree.get(w).buffer).collect())
     }
 
@@ -339,10 +338,7 @@ impl Editor {
         self.top = 0;
         self.leftcol = 0;
         self.mode = Mode::Normal;
-        self.reset_pending();
-        self.scroll_from = None;
-        self.pending_scroll = None;
-        self.message.clear();
+        self.reset_transient_state();
         self.relayout();
         self.clamp_cursor();
         self.ensure_visible();

@@ -74,33 +74,22 @@ impl Editor {
         self.settle_cursor_at(line, col);
     }
 
-    /// `:changes` — list the current buffer's change list into a read-only scratch listing,
-    /// mirroring vim's `change line  col text` table. Entries run oldest-first; the
-    /// `change` column is the count of `g;` (above the marker) / `g,` (below) presses
-    /// to reach that row, and `>` marks the current position.
+    /// `:changes` — list the current buffer's change list into a read-only scratch
+    /// listing, mirroring vim's `change line  col text` table (rendered by the
+    /// shared [`Editor::open_position_listing`]; the detail column is the entry
+    /// line's text).
     pub(crate) fn ex_changes(&mut self, _args: &str) {
         let idx = self.buffer().changelistidx;
-        let entries = self.buffer().changelist.clone();
-
-        let mut lines = vec![" change line  col text".to_string()];
-        for (i, &(line, col)) in entries.iter().enumerate() {
-            let marker = if i == idx { '>' } else { ' ' };
-            let count = if i == idx {
-                String::new()
-            } else {
-                (idx as isize - i as isize).abs().to_string()
-            };
-            let text = self.buffer().line(line.min(self.last_line()));
-            lines.push(format!(
-                "{marker}{count:>3} {:>4} {:>4} {}",
-                line + 1,
-                col,
-                text.trim_end()
-            ));
-        }
-        if idx >= entries.len() {
-            lines.push(">".to_string());
-        }
-        self.open_scratch_listing("[Changes]", lines, 0);
+        let rows: Vec<(usize, usize, String)> = self
+            .buffer()
+            .changelist
+            .clone()
+            .into_iter()
+            .map(|(line, col)| {
+                let text = self.buffer().line(line.min(self.last_line()));
+                (line, col, text.trim_end().to_string())
+            })
+            .collect();
+        self.open_position_listing("[Changes]", " change line  col text", idx, &rows);
     }
 }

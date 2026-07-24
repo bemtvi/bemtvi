@@ -124,38 +124,48 @@ check items off as they land; delete when done. Bug fixes follow the TDD rule
 
 ## D. Core dedup / cleanup
 
-- [ ] **D1. `stamp_disk` == `set_disk_stat`** — buffer.rs:767-769 vs 785-787 byte-identical;
-  delete one, retarget caller (editor/buffers.rs:959/923).
-- [ ] **D2. Menu/MenuItem/Window literals** — `Menu` (~28 fields) ×5
-  (menu.rs:623,696,776,1070,1173), `MenuItem` ×4, `Window` (15 fields) ×5
-  (windows.rs:544,587,1937,2198,2241) → `Default`/constructor + struct-update.
-- [ ] **D3. Substitute-name list ×5 + subst parse prologue ×3** — ex.rs:445,1099,1379,
-  1467,1513; `ex_preview_pattern`/`subst_preview_active`/`subst_preview` share
-  trim→range→name→bang→delimiter prologue → `is_substitute_name()` +
-  `parse_subst_cmdline()`. (Same hazard class as A2.)
-- [ ] **D4. Replacement-buffer pick ×2** — buffers.rs:1146-1160 vs 2356-2366+2418 →
-  `replacement_in_layer(excluding, layer)`.
-- [ ] **D5. helix pending-reset ×3** — helix.rs:334,351,684 → `reset_helix_pending()`.
-- [ ] **D6. helix splice-and-refit ×3(+1)** — `helix_surround_add`(1786),
-  `helix_rotate_contents`(1513), `helix_align_selections`(1609) (+`apply_surround_ops`
-  1964 variant) share (lo,hi,idx,head_high) sort/splice/cum-shift/refit → one helper.
-  Offset math = highest silent-corruption risk of the dup family.
-- [ ] **D7. marks/jumps/changes listing dups** — `ex_marks` vs `marks_mirror`
-  (marks.rs:295 vs 359) full walk ×2; `ex_changes`(changelist.rs:81) vs
-  `ex_jumps`(jumps.rs:229) marker/count table; `buffer_display_name` fallback pasted
-  ×3 (jumps.rs:248, marks.rs:323,396).
-- [ ] **D8. Scroll row-walk ×2** — cursor.rs:536-564 vs 573-596 identical
-  fold/virt/wrap per-line step → extract.
-- [ ] **D9. Misc small** — ex_delete re-derives `linewise_span` (ex.rs:2059 vs 2103);
-  transient-state reset stanza ×4 with one divergent copy missing `message.clear()`
-  (windows.rs:2739, buffers.rs:1114, tabs.rs:341, buffers.rs:2445 ← divergent);
-  `cap_ring` inlined at cmdline.rs:539 + mod.rs:2430; `tab_window_buffers` re-derives
-  `tab_window_ids` (tabs.rs:66 vs 78); 3 identical win-str option stanzas
-  (options.rs:536-620 → `set_win_str`); fold.rs:893 `let _ = buf;` dead;
-  fold.rs:1320-1359 parses each foldexpr value twice; helix.rs:277 dead `_new_len`
-  param on `SurroundOp::new`; dock.rs:416-423 `show_dock` double-relayout no-ops;
-  mouse.rs menu press/wheel handler pairs ×2 (1675/1760, 1696/1778); mouse.rs mid-band
-  geometry derived ×3 (1007,1024,1209 → `mid_band()`).
+- [x] **D1. `stamp_disk` == `set_disk_stat`** — DONE. `set_disk_stat` deleted, its
+  doc rationale merged into `stamp_disk`, the one caller retargeted.
+- [x] **D2. Menu/MenuItem/Window literals** — DONE. `Menu::new(kind, placement)` +
+  `MenuItem::new(label, key)` (also used by the 4 server-side literals in
+  lsp/completion.rs, effects.rs ×2, snippet.rs) + struct-update at every site;
+  `WindowTree::tiled_window` promoted to the base all five `Window` sites build on.
+  EN-ROUTE FIX (own commit, TDD): the split literal used `FoldState::default()`
+  while the field doc promised a split inherits a clone of the parent's folds —
+  the split now inherits; test
+  `editing/folds.rs::split_inherits_a_clone_of_the_parents_folds` (which needed a
+  focused-window `numbers` reader — `view_numbers` falls back to `windows[0]`).
+- [x] **D3. Substitute-name list ×5 + subst parse prologue ×3** — DONE.
+  `ex_name_matches(name, full, min)` (the A2 prefix model, now also used by
+  `ex_takes_bar` + the vimgrep arm of `ex_pattern_sections`) + `is_substitute_name`;
+  the three preview fns share `cmdline_ex_parts()` (trim→range→name→bang) and
+  `subst_delim`/`open_subst_body`.
+- [x] **D4. Replacement-buffer pick ×2** — DONE. `replacement_in_layer(excluding,
+  layer)`.
+- [x] **D5. helix pending-reset ×3** — DONE. `reset_helix_pending()`.
+- [x] **D6. helix splice-and-refit ×3(+1)** — DONE. `selection_spans` (the sorted
+  `SelSpan` build) + `refit_selections_over_spans(sel, spans, fit)` where `fit`
+  returns `(own_shift, new_len, delta)` — one copy of the cum-shift/refit offset
+  math; rotate/align/surround-add each reduced to their edit loop + a 3-line fit
+  closure. `apply_surround_ops` keeps its (genuinely different) endpoint-shift
+  model.
+- [x] **D7. marks/jumps/changes listing dups** — DONE. `ex_marks` renders straight
+  off `marks_mirror` (one walk); `open_position_listing` shared by
+  `ex_jumps`/`ex_changes`; `buffer_fallback_name` (named to avoid the existing
+  `buffer_display_name`) replaces the pasted `[No Name]` chain ×3
+  (marks mirror, jumps, command.rs which-key marks).
+- [x] **D8. Scroll row-walk ×2** — DONE. `rows_of_line_above(top, &virt)` shared by
+  `scroll_top_for_bottom`/`scroll_top_for_row_above`.
+- [x] **D9. Misc small** — DONE. `linewise_byte_span` (ex_delete no longer copies
+  the chunk it deletes); `reset_transient_state()` ×4 (the divergent
+  `open_empty_in_window` copy now clears the message line too); generic
+  `cap_ring<T>` moved to mod.rs (search rings + cmdline prompt rings + `:messages`);
+  `tab_window_buffers` → `tab_window_ids`; `set_win_str` + a slot table for the
+  three verbatim window-local strings; fold.rs dead `let _ = buf` deleted;
+  foldexpr value parsed once per line; `SurroundOp::new(_new_len)` →
+  `SurroundOp::delete`; `show_dock` = `focus_dock` (the double relayout and
+  double un-hide dropped); `mouse_popup_press`/`mouse_popup_wheel` shared by the
+  completion popup and the wildmenu; `mid_band()` ×3.
 
 ## E. Doc-comment repairs (mechanical, one commit)
 

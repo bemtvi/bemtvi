@@ -220,47 +220,32 @@ impl Editor {
         Some((entries, win.jump_idx))
     }
 
-    /// `:jumps` — list the focused window's jumplist into a read-only scratch listing,
-    /// mirroring vim's `jump line  col file/text` table. Entries run oldest-first;
-    /// the `jump` column is the count of `<C-o>` (above the marker) or `<C-i>`
-    /// (below) presses to reach that row, and `>` marks the current position. A row
-    /// in the current buffer shows its line's text; one in another buffer shows the
-    /// file.
+    /// `:jumps` — list the focused window's jumplist into a read-only scratch
+    /// listing, mirroring vim's `jump line  col file/text` table (rendered by the
+    /// shared [`Editor::open_position_listing`]). A row in the current buffer shows
+    /// its line's text as the detail; one in another buffer shows the file.
     pub(crate) fn ex_jumps(&mut self, _args: &str) {
         let idx = self.windows.cur().jump_idx;
-        let entries: Vec<JumpEntry> = self.windows.cur().jumps.clone();
         let cur_buf = self.cur_buffer();
-
-        let mut lines = vec![" jump line  col file/text".to_string()];
-        for (i, e) in entries.iter().enumerate() {
-            let marker = if i == idx { '>' } else { ' ' };
-            let count = if i == idx {
-                String::new()
-            } else {
-                (idx as isize - i as isize).abs().to_string()
-            };
-            let detail = if e.buf == cur_buf {
-                self.buffer()
-                    .line(e.line.min(self.last_line()))
-                    .trim_end()
-                    .to_string()
-            } else {
-                self.buffer_name(e.buf)
-                    .filter(|n| !n.is_empty())
-                    .unwrap_or_else(|| "[No Name]".to_string())
-            };
-            lines.push(format!(
-                "{marker}{count:>3} {:>4} {:>4} {detail}",
-                e.line + 1,
-                e.col
-            ));
-        }
-        // The pointer at the end of the list (not navigating): mark the present
-        // below the newest entry, vim's trailing `>`.
-        if idx >= entries.len() {
-            lines.push(">".to_string());
-        }
-        self.open_scratch_listing("[Jumps]", lines, 0);
+        let rows: Vec<(usize, usize, String)> = self
+            .windows
+            .cur()
+            .jumps
+            .clone()
+            .into_iter()
+            .map(|e| {
+                let detail = if e.buf == cur_buf {
+                    self.buffer()
+                        .line(e.line.min(self.last_line()))
+                        .trim_end()
+                        .to_string()
+                } else {
+                    self.buffer_fallback_name(e.buf)
+                };
+                (e.line, e.col, detail)
+            })
+            .collect();
+        self.open_position_listing("[Jumps]", " jump line  col file/text", idx, &rows);
     }
 }
 

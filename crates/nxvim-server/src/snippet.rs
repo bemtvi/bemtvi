@@ -56,10 +56,7 @@ impl EditHost {
             .iter()
             .enumerate()
             .map(|(i, e)| nxvim_core::MenuItem {
-                label: e.trigger.clone(),
-                key: SNIPPET_COMPLETE_KEY_BASE + i,
                 kind: Some("Snippet".to_string()),
-                preview: None,
                 insert: Some(e.trigger.clone()),
                 priority,
                 source_accept: true,
@@ -67,9 +64,7 @@ impl EditHost {
                 // the snippet body fenced as code, tagged with the buffer's filetype so
                 // it syntax-highlights. Renders when this row is selected.
                 doc: Some(snippet_preview_doc(&e.body, &ft)),
-                resolve: None,
-                // The snippet trigger replaces the buffer prefix, not a cmdline span.
-                replace: None,
+                ..nxvim_core::MenuItem::new(e.trigger.clone(), SNIPPET_COMPLETE_KEY_BASE + i)
             })
             .collect();
         if !items.is_empty() {

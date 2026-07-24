@@ -534,26 +534,14 @@ impl Editor {
     /// segments below the cursor's) may spill past the bottom. Used to scroll down
     /// just enough to reveal a cursor below the fold.
     fn scroll_top_for_bottom(&self, target: usize, th: usize) -> usize {
-        let buf = self.buffer();
-        let virt = buf.virt_lines_by_line();
+        let virt = self.buffer().virt_lines_by_line();
         // The target line spends its `virt_lines_above` + the wrap segments up to and
         // including the cursor's at the bottom of the window; deeper segments and its
         // `virt_lines_below` overflow.
         let mut rows = virt.get(&target).map_or(0, |r| r.above.len()) + self.cursor_wrap_seg() + 1;
         let mut top = target;
         while top > 0 {
-            let prev = top - 1;
-            // A closed fold above the target is one screen row; counting it as such
-            // (and stepping over its whole range) keeps the scroll-to-bottom math in
-            // step with the folded rendering.
-            let (p, prev_top) = match self.collapsing_fold_at(prev) {
-                Some(f) => (1, f.start),
-                None => (
-                    self.line_text_rows(prev)
-                        + virt.get(&prev).map_or(0, |r| r.above.len() + r.below.len()),
-                    prev,
-                ),
-            };
+            let (p, prev_top) = self.rows_of_line_above(top, &virt);
             if rows + p > th {
                 break;
             }
@@ -561,6 +549,29 @@ impl Editor {
             top = prev_top;
         }
         top
+    }
+
+    /// One upward step of a scroll-top walk: the screen rows the buffer line just
+    /// above `top` occupies, and the line the walk continues from. A closed fold is
+    /// ONE screen row and the walk steps over its whole hidden range to its start —
+    /// keeping the scroll math in step with the folded rendering; an unfolded line
+    /// counts its soft-wrap rows plus its `virt_lines` above and below (`virt` is
+    /// the caller's [`Buffer::virt_lines_by_line`] map, built once per walk).
+    /// Caller ensures `top > 0`.
+    fn rows_of_line_above(
+        &self,
+        top: usize,
+        virt: &std::collections::BTreeMap<usize, crate::extmark::VirtLineRows>,
+    ) -> (usize, usize) {
+        let prev = top - 1;
+        match self.collapsing_fold_at(prev) {
+            Some(f) => (1, f.start),
+            None => (
+                self.line_text_rows(prev)
+                    + virt.get(&prev).map_or(0, |r| r.above.len() + r.below.len()),
+                prev,
+            ),
+        }
     }
 
     /// The largest `top` (≤ `target`) that keeps at least `above` screen rows above
@@ -571,24 +582,13 @@ impl Editor {
     /// With `above == 0` it returns `target` (the cursor on the top text row, no
     /// margin) so a zero `scrolloff` leaves the historical behavior untouched.
     fn scroll_top_for_row_above(&self, target: usize, above: usize) -> usize {
-        let buf = self.buffer();
-        let virt = buf.virt_lines_by_line();
+        let virt = self.buffer().virt_lines_by_line();
         // Rows already above the cursor within its own line: its `virt_lines_above`
         // and the wrap segments preceding the cursor's segment.
         let mut rows = virt.get(&target).map_or(0, |r| r.above.len()) + self.cursor_wrap_seg();
         let mut top = target;
         while rows < above && top > 0 {
-            let prev = top - 1;
-            // A closed fold above the cursor is one screen row (matching the folded
-            // rendering); step over its whole hidden range.
-            let (p, prev_top) = match self.collapsing_fold_at(prev) {
-                Some(f) => (1, f.start),
-                None => (
-                    self.line_text_rows(prev)
-                        + virt.get(&prev).map_or(0, |r| r.above.len() + r.below.len()),
-                    prev,
-                ),
-            };
+            let (p, prev_top) = self.rows_of_line_above(top, &virt);
             rows += p;
             top = prev_top;
         }

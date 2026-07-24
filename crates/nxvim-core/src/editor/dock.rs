@@ -414,12 +414,11 @@ impl Editor {
     /// restore; open a fresh dock with [`Editor::open_dock`] instead). Backs
     /// `nx.dock.show` / `:DockShow`.
     pub(crate) fn show_dock(&mut self, side: DockSide) {
-        if !self.dock_exists(side) {
-            return;
-        }
-        self.dock_hidden[side.idx()] = false;
+        // `focus_dock` is the whole job: it guards on the dock existing, clears the
+        // hidden flag, and crosses layers (`switch_layer` relayouts). A hidden dock
+        // is never the focused layer, so the cross never short-circuits with the
+        // band still collapsed.
         self.focus_dock(side);
-        self.relayout();
     }
 
     /// Toggle the dock on `side`: a visible dock is hidden, a hidden one is shown

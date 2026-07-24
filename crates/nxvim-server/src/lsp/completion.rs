@@ -128,20 +128,14 @@ impl EditHost {
                 let label = item.label.clone();
                 nxvim_core::MenuItem {
                     insert: Some(label.clone()),
-                    label,
-                    key,
                     // The LSP `CompletionItemKind` name (`"Function"`, `"Variable"`, …);
                     // `None` when the server sent no kind (code `0`).
                     kind: item.kind_label().map(str::to_string),
-                    preview: None,
                     priority,
-                    source_accept: true,
                     // The docs sidebar reads an `lsp` row's docs from the server's
                     // item cache (`source_accept`), not an inline `doc` / `resolve`.
-                    doc: None,
-                    resolve: None,
-                    // LSP completion edits the buffer (`textEdit`), not a cmdline span.
-                    replace: None,
+                    source_accept: true,
+                    ..nxvim_core::MenuItem::new(label, key)
                 }
             })
             .collect();

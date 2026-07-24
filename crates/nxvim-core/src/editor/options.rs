@@ -530,45 +530,22 @@ impl Editor {
             }
             return;
         }
-        // `showbreak` / `breakindentopt` are window-local (like `wrap`), so they live
-        // on the focused window's options rather than a global string slot.
-        // `:set sbr=↪` sets the marker; `:set briopt=sbr` aligns it within the indent.
-        if name == "showbreak" {
-            match op {
-                StrOp::Set(value) => self.windows.cur_mut().options.showbreak = value,
-                StrOp::Reset => self.windows.cur_mut().options.showbreak.clear(),
-                StrOp::Query => {
-                    let v = self.windows.cur().options.showbreak.clone();
-                    self.echo(format!("showbreak={v}"));
-                }
-            }
-            return;
-        }
-        if name == "breakindentopt" {
-            match op {
-                StrOp::Set(value) => self.windows.cur_mut().options.breakindentopt = value,
-                StrOp::Reset => self.windows.cur_mut().options.breakindentopt.clear(),
-                StrOp::Query => {
-                    let v = self.windows.cur().options.breakindentopt.clone();
-                    self.echo(format!("breakindentopt={v}"));
-                }
-            }
-            return;
-        }
-        // `colorcolumn` is window-local (like `showbreak`): the raw comma-separated
-        // ruler-column list. The value is stored verbatim (unmodeled `+N`/`-N` and
-        // junk entries are simply skipped when the projection resolves the columns —
-        // matching vim, which ignores bad entries rather than erroring). `&` clears
-        // the rulers; `?` echoes the raw list.
-        if name == "colorcolumn" {
-            match op {
-                StrOp::Set(value) => self.windows.cur_mut().options.colorcolumn = value,
-                StrOp::Reset => self.windows.cur_mut().options.colorcolumn.clear(),
-                StrOp::Query => {
-                    let v = self.windows.cur().options.colorcolumn.clone();
-                    self.echo(format!("colorcolumn={v}"));
-                }
-            }
+        // The verbatim window-local string options, living on the focused window's
+        // options rather than a global string slot (like `wrap`):
+        // - `showbreak` (`:set sbr=↪`) — the wrapped-line marker; `breakindentopt`
+        //   (`:set briopt=sbr`) aligns it within the indent.
+        // - `colorcolumn` — the raw comma-separated ruler-column list, stored
+        //   verbatim (unmodeled `+N`/`-N` and junk entries are simply skipped when
+        //   the projection resolves the columns — matching vim, which ignores bad
+        //   entries rather than erroring).
+        let win_str_slot: Option<fn(&mut WindowOptions) -> &mut String> = match name {
+            "showbreak" => Some(|o| &mut o.showbreak),
+            "breakindentopt" => Some(|o| &mut o.breakindentopt),
+            "colorcolumn" => Some(|o| &mut o.colorcolumn),
+            _ => None,
+        };
+        if let Some(slot) = win_str_slot {
+            self.set_win_str(name, op, slot);
             return;
         }
         // `fillchars` is window-local (like `showbreak`): the `key:char` list
@@ -653,6 +630,22 @@ impl Editor {
                     }
                     _ => unknown(self),
                 }
+            }
+        }
+    }
+
+    /// Apply a `:set` op to a **verbatim** window-local string option: `set`
+    /// stores the value unvalidated in the focused window's `slot`, `&` clears it
+    /// (the empty-string default), `?` echoes `name=value`. Validated window-local
+    /// strings (`fillchars`, `padding`) keep their own arms — they must fail loud
+    /// on a bad value instead of storing it.
+    fn set_win_str(&mut self, name: &str, op: StrOp, slot: fn(&mut WindowOptions) -> &mut String) {
+        match op {
+            StrOp::Set(value) => *slot(&mut self.windows.cur_mut().options) = value,
+            StrOp::Reset => slot(&mut self.windows.cur_mut().options).clear(),
+            StrOp::Query => {
+                let v = slot(&mut self.windows.cur_mut().options).clone();
+                self.echo(format!("{name}={v}"));
             }
         }
     }

@@ -1179,20 +1179,11 @@ impl EditHost {
                 .into_iter()
                 .filter(|p| p.gen == live)
                 .map(|p| nxvim_core::MenuItem {
-                    label: p.label,
-                    key: p.key,
-                    // A picker row renders no kind column.
-                    kind: None,
                     preview: p.preview.map(|pv| nxvim_core::PreviewTarget {
                         path: pv.path,
                         loc: pv.loc,
                     }),
-                    insert: None,
-                    priority: 0,
-                    source_accept: false,
-                    doc: None,
-                    resolve: None,
-                    replace: None,
+                    ..nxvim_core::MenuItem::new(p.label, p.key)
                 })
                 .collect();
             if !items.is_empty() {
@@ -1221,18 +1212,9 @@ impl EditHost {
                 .into_iter()
                 .filter(|p| p.gen == live)
                 .map(|p| nxvim_core::MenuItem {
-                    label: p.label,
-                    // A plain row inserts natively by `insert` (key unused). A row whose
-                    // item carried an `on_accept` delegates its accept to Lua: it rides a
-                    // key in the plugin-accept range and `source_accept = true`, so core
-                    // records the accept for the drain rather than splicing `insert`.
-                    key: p
-                        .accept
-                        .map_or(0, |id| crate::snippet::PLUGIN_ACCEPT_KEY_BASE + id as usize),
                     // A plugin source's declared kind (`push { kind = … }`), shown
                     // right-aligned on the row; `None` when the item omits it.
                     kind: p.kind,
-                    preview: None,
                     insert: Some(p.insert),
                     // The source's merge priority, so an async source ranks against
                     // buffer/lsp by priority instead of pinning at the `0` floor.
@@ -1243,7 +1225,15 @@ impl EditHost {
                     doc: p.doc,
                     // Or a lazy-docs `resolve` handle, resolved on selection.
                     resolve: p.resolve,
-                    replace: None,
+                    // A plain row inserts natively by `insert` (key unused). A row whose
+                    // item carried an `on_accept` delegates its accept to Lua: it rides a
+                    // key in the plugin-accept range and `source_accept = true`, so core
+                    // records the accept for the drain rather than splicing `insert`.
+                    ..nxvim_core::MenuItem::new(
+                        p.label,
+                        p.accept
+                            .map_or(0, |id| crate::snippet::PLUGIN_ACCEPT_KEY_BASE + id as usize),
+                    )
                 })
                 .collect();
             if !items.is_empty() {

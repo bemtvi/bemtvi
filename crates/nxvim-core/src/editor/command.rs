@@ -1770,10 +1770,7 @@ impl Editor {
         }
         // Global file marks (`A`–`Z`): position plus the file / buffer they point at.
         for (&name, &(buf, cur)) in &self.global_marks {
-            let detail = self
-                .buffer_name(buf)
-                .filter(|n| !n.is_empty())
-                .unwrap_or_else(|| "[No Name]".to_string());
+            let detail = self.buffer_fallback_name(buf);
             out.push(CommandContinuation {
                 key: name.to_string(),
                 desc: format!("{}:{}  {}", cur.line + 1, cur.col, detail),

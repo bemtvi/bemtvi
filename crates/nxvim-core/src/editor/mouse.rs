@@ -1008,6 +1008,15 @@ impl Editor {
         if !self.global_statusline_visible() {
             return None;
         }
+        let (mid_y, mid_h) = self.mid_band();
+        Some(mid_y.saturating_add(mid_h))
+    }
+
+    /// The middle band's (left dock | main | right dock) absolute top row and
+    /// height this frame: below the top dock band and the main tabline, above the
+    /// bottom band and the global chrome (main tabline + global status bar). The
+    /// one copy of the band math every mouse hit-test derives its geometry from.
+    fn mid_band(&self) -> (usize, usize) {
         let bands = self.dock_bands();
         let main_tabline = self.tabline_rows();
         let chrome = main_tabline + self.global_statusline_rows();
@@ -1018,23 +1027,16 @@ impl Editor {
             .saturating_sub(bands.reserved_bottom())
             .saturating_sub(chrome)
             .max(1);
-        Some(mid_y.saturating_add(mid_h))
+        (mid_y, mid_h)
     }
 
     fn region_geoms(&self) -> Vec<RegionGeom> {
         let bands = self.dock_bands();
         let main_tabline = self.tabline_rows();
         let gstatus = self.global_statusline_rows();
-        let chrome = main_tabline + gstatus;
-        // The middle band (left dock | main | right docks): its top row, height, and
-        // the main tree's width — what's left after the docks and the global chrome.
-        let mid_y = bands.reserved_top().saturating_add(main_tabline);
-        let mid_h = self
-            .height
-            .saturating_sub(bands.reserved_top())
-            .saturating_sub(bands.reserved_bottom())
-            .saturating_sub(chrome)
-            .max(1);
+        // The middle band: its top row and height ([`Self::mid_band`]), plus the
+        // main tree's width — what's left after the docks and the global chrome.
+        let (mid_y, mid_h) = self.mid_band();
         let main_w = self
             .width
             .saturating_sub(bands.reserved_left())
@@ -1208,17 +1210,7 @@ impl Editor {
     /// are disjoint.
     fn dock_handle_at(&self, row: usize, col: usize) -> Option<DockSide> {
         let bands = self.dock_bands();
-        let main_tabline = self.tabline_rows();
-        let gstatus = self.global_statusline_rows();
-        let chrome = main_tabline + gstatus;
-        // The middle band (left dock | main | right dock): its top row and height.
-        let mid_y = bands.reserved_top().saturating_add(main_tabline);
-        let mid_h = self
-            .height
-            .saturating_sub(bands.reserved_top())
-            .saturating_sub(bands.reserved_bottom())
-            .saturating_sub(chrome)
-            .max(1);
+        let (mid_y, mid_h) = self.mid_band();
         let in_mid = (mid_y..mid_y.saturating_add(mid_h)).contains(&row);
         // Left/right dock edges are vertical separators spanning the middle band;
         // top/bottom edges are horizontal separators spanning the full width.
@@ -1668,11 +1660,18 @@ impl Editor {
         self.set_cursor_char(cursor);
     }
 
-    /// A left-press on the open completion popup: clicking the already-highlighted
-    /// row accepts it (like `<C-y>`); clicking any other row highlights it (like
-    /// navigating to it with `<C-n>`/`<C-p>`). A press on the box border / a blank
+    /// The shared left-press logic of the two **noselect** popups (the insert
+    /// completion popup and the cmdline wildmenu): clicking the already-highlighted
+    /// row runs `accept` (like `<C-y>`/`<CR>` on it); clicking any other row runs
+    /// `select` on it (like navigating there). A press on the box border / a blank
     /// filler is consumed but selects nothing. Never starts a text drag underneath.
-    fn mouse_complete_press(&mut self, row: usize, col: usize) {
+    fn mouse_popup_press(
+        &mut self,
+        row: usize,
+        col: usize,
+        accept: impl FnOnce(&mut Self),
+        select: impl FnOnce(&mut Self, usize),
+    ) {
         self.mouse_select = None;
         let Some(MenuHit::Item(idx)) = self.menu_hit(row, col) else {
             return;
@@ -1681,23 +1680,17 @@ impl Editor {
             .menu_view()
             .and_then(|m| m.selected_active.then_some(m.selected));
         if selected == Some(idx) {
-            self.complete_accept();
+            accept(self);
         } else {
-            self.complete_select_index(idx);
+            select(self, idx);
         }
     }
 
-    /// A wheel notch over the completion popup box moves the highlight one row,
-    /// non-wrapping (like dragging a scrollbar — it stops at the ends, unlike
-    /// `<C-n>`'s wrap). A noselect popup highlights the first row. A horizontal notch
-    /// over the list does nothing — the list has no horizontal extent. (The docs float
-    /// beside the popup is a real window; a wheel over it scrolls it via the native
-    /// window mouse path, not here.)
-    fn mouse_complete_wheel(&mut self, positive: bool, horizontal: bool, _row: usize, _col: usize) {
-        if horizontal {
-            return;
-        }
-        let down = positive;
+    /// The shared wheel logic of the two noselect popups: a notch moves the
+    /// highlight one row via `select`, non-wrapping (like dragging a scrollbar — it
+    /// stops at the ends, unlike `<C-n>`'s wrap); a noselect popup highlights the
+    /// first row.
+    fn mouse_popup_wheel(&mut self, down: bool, select: impl FnOnce(&mut Self, usize)) {
         let Some(m) = self.menu_view() else {
             return;
         };
@@ -1710,7 +1703,32 @@ impl Editor {
             Some(i) => i.saturating_sub(1),
             None => 0,
         };
-        self.complete_select_index(next);
+        select(self, next);
+    }
+
+    /// A left-press on the open completion popup ([`Self::mouse_popup_press`] with
+    /// the completion verbs).
+    fn mouse_complete_press(&mut self, row: usize, col: usize) {
+        self.mouse_popup_press(
+            row,
+            col,
+            |e| {
+                e.complete_accept();
+            },
+            |e, idx| e.complete_select_index(idx),
+        );
+    }
+
+    /// A wheel notch over the completion popup box ([`Self::mouse_popup_wheel`]
+    /// with the completion select). A horizontal notch over the list does nothing —
+    /// the list has no horizontal extent. (The docs float beside the popup is a
+    /// real window; a wheel over it scrolls it via the native window mouse path,
+    /// not here.)
+    fn mouse_complete_wheel(&mut self, positive: bool, horizontal: bool, _row: usize, _col: usize) {
+        if horizontal {
+            return;
+        }
+        self.mouse_popup_wheel(positive, |e, idx| e.complete_select_index(idx));
     }
 
     /// A left-press while an input-grabbing menu (picker / `select`) is open: click a
@@ -1753,42 +1771,23 @@ impl Editor {
         }
     }
 
-    /// A left-press on the command-line wildmenu: clicking the highlighted candidate
-    /// accepts it into the command line (like `<CR>` on it); clicking any other
-    /// candidate highlights it (and previews it on the line). A press on the box
-    /// border / a filler is consumed but selects nothing.
+    /// A left-press on the command-line wildmenu ([`Self::mouse_popup_press`] with
+    /// the wildmenu verbs: accept into the command line, or highlight-and-preview).
     fn mouse_cmdline_press(&mut self, row: usize, col: usize) {
-        self.mouse_select = None;
-        let Some(MenuHit::Item(idx)) = self.menu_hit(row, col) else {
-            return;
-        };
-        if self
-            .menu_view()
-            .and_then(|m| m.selected_active.then_some(m.selected))
-            == Some(idx)
-        {
-            self.cmdline_complete_accept();
-        } else {
-            self.cmdline_complete_select_index(idx);
-        }
+        self.mouse_popup_press(
+            row,
+            col,
+            |e| {
+                e.cmdline_complete_accept();
+            },
+            |e, idx| e.cmdline_complete_select_index(idx),
+        );
     }
 
-    /// A wheel notch over the wildmenu moves the highlight one row, non-wrapping (like
-    /// a scrollbar). A noselect wildmenu highlights the first row.
+    /// A wheel notch over the wildmenu ([`Self::mouse_popup_wheel`] with the
+    /// wildmenu select).
     fn mouse_cmdline_wheel(&mut self, down: bool) {
-        let Some(m) = self.menu_view() else {
-            return;
-        };
-        let n = m.total;
-        if n == 0 {
-            return;
-        }
-        let next = match m.selected_active.then_some(m.selected) {
-            Some(i) if down => (i + 1).min(n - 1),
-            Some(i) => i.saturating_sub(1),
-            None => 0,
-        };
-        self.cmdline_complete_select_index(next);
+        self.mouse_popup_wheel(down, |e, idx| e.cmdline_complete_select_index(idx));
     }
 
     /// Resolve a **global** screen cell to a spot on the open menu overlay: a

@@ -544,21 +544,8 @@ impl WindowTree {
         windows.insert(
             id,
             Window {
-                buffer,
-                saved_cursor: Cursor::default(),
-                saved_top: 0,
-                saved_leftcol: 0,
-                saved_cursors: Vec::new(),
-                rect: Rect::default(),
                 options,
-                float: None,
-                jumps: Vec::new(),
-                jump_idx: 0,
-                resume: None,
-                loclist: None,
-                loclist_bufnr: None,
-                sign_width: 0,
-                folds: super::fold::FoldState::default(),
+                ..Self::tiled_window(buffer, Cursor::default(), 0, 0)
             },
         );
         WindowTree {
@@ -576,8 +563,11 @@ impl WindowTree {
         self.root.to_layout()
     }
 
-    /// A tiled window with the given view state and otherwise-default fields — the
-    /// restore-time twin of [`with_window`](Self::with_window)'s seed window.
+    /// A tiled window with the given view state and every other field at its
+    /// default. The base every window-creation site builds on via struct-update
+    /// (`Window { options, …, ..WindowTree::tiled_window(buf, …) }`): the seed /
+    /// restore-time windows here, plus splits, floats and the bottom window on
+    /// [`Editor`].
     pub(crate) fn tiled_window(
         buffer: BufferId,
         saved_cursor: Cursor,
@@ -1935,21 +1925,9 @@ impl Editor {
         self.windows.windows.insert(
             id,
             Window {
-                buffer: buf,
-                saved_cursor: Cursor::default(),
-                saved_top: 0,
-                saved_leftcol: 0,
-                saved_cursors: Vec::new(),
-                rect: Rect::default(),
                 options,
                 float: Some(config),
-                jumps: Vec::new(),
-                jump_idx: 0,
-                resume: None,
-                loclist: None,
-                loclist_bufnr: None,
-                sign_width: 0,
-                folds: super::fold::FoldState::default(),
+                ..WindowTree::tiled_window(buf, Cursor::default(), 0, 0)
             },
         );
         self.windows.floats.push(id);
@@ -2194,25 +2172,20 @@ impl Editor {
         // inherit the loclist *display* buffer: a fresh `:lopen` mints its own, so
         // every loclist display buffer maps back to exactly one owner window.
         let loclist = self.windows.get(cur).loclist.clone();
+        // …and a clone of the parent's manual folds, so the split opens showing the
+        // same collapsed view (vim copies fold state on split); the copies then
+        // diverge independently.
+        let folds = self.windows.get(cur).folds.clone();
         let new_id = self.alloc_window_id();
         self.windows.windows.insert(
             new_id,
             Window {
-                buffer,
-                saved_cursor: cursor,
-                saved_top: top,
-                saved_leftcol: leftcol,
-                saved_cursors: Vec::new(),
-                rect: Rect::default(),
                 options,
-                float: None,
                 jumps,
                 jump_idx,
-                resume: None,
                 loclist,
-                loclist_bufnr: None,
-                sign_width: 0,
-                folds: super::fold::FoldState::default(),
+                folds,
+                ..WindowTree::tiled_window(buffer, cursor, top, leftcol)
             },
         );
         split_leaf(&mut self.windows.root, cur, dir, new_id);
@@ -2241,21 +2214,8 @@ impl Editor {
         self.windows.windows.insert(
             new_id,
             Window {
-                buffer: buf,
-                saved_cursor: Cursor::default(),
-                saved_top: 0,
-                saved_leftcol: 0,
-                saved_cursors: Vec::new(),
-                rect: Rect::default(),
                 options,
-                float: None,
-                jumps: Vec::new(),
-                jump_idx: 0,
-                resume: None,
-                loclist: None,
-                loclist_bufnr: None,
-                sign_width: 0,
-                folds: super::fold::FoldState::default(),
+                ..WindowTree::tiled_window(buf, Cursor::default(), 0, 0)
             },
         );
         // Wrap the entire tiled layout: [existing, new] stacked vertically, the new
@@ -2738,10 +2698,7 @@ impl Editor {
             Some(r) if restore => self.reestablish_mode(r),
             _ => self.mode = Mode::Normal,
         }
-        self.reset_pending();
-        self.scroll_from = None;
-        self.pending_scroll = None;
-        self.message.clear();
+        self.reset_transient_state();
         // Restore this window's secondary multi-cursors onto its buffer (clearing
         // any leftover live marks first — a window close or tab switch can enter
         // here without the previous focus having stashed its own set).

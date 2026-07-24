@@ -241,6 +241,15 @@ fn is_error_line(line: &str) -> bool {
     digits > 0 && rest.as_bytes().get(digits) == Some(&b':')
 }
 
+/// Trim a bounded ring to its newest `cap` entries (dropping the oldest from the
+/// front) — the history rings (`'history'`; a cap of 0 disables that history)
+/// and the `:messages` log share it.
+pub(crate) fn cap_ring<T>(ring: &mut Vec<T>, cap: usize) {
+    if ring.len() > cap {
+        ring.drain(0..ring.len() - cap);
+    }
+}
+
 /// Stable identifier for an open buffer. Monotonic and 1-based (buffer 1 is the
 /// first file, or the initial `[No Name]`); an id is never reused once assigned,
 /// matching vim's buffer numbers.
@@ -2445,9 +2454,7 @@ impl Editor {
             });
         }
         // Bound the history so a long-running session can't grow it forever.
-        if self.messages.len() > MAX_MESSAGES {
-            self.messages.drain(0..self.messages.len() - MAX_MESSAGES);
-        }
+        cap_ring(&mut self.messages, MAX_MESSAGES);
     }
 
     /// The editor's total screen size in `(columns, rows)` — the text-viewport
@@ -2689,6 +2696,18 @@ impl Editor {
 
     fn reset_pending(&mut self) {
         self.pending = PendingCommand::default();
+    }
+
+    /// Clear the per-view transient state when the focused window/tab/buffer is
+    /// rebound out from under it: the pending operator/count keys, the in-flight
+    /// scroll-anim gesture, and any leftover message-line text. Callers set the
+    /// mode themselves — a dock re-entry may *restore* a non-Normal mode rather
+    /// than resetting it.
+    pub(crate) fn reset_transient_state(&mut self) {
+        self.reset_pending();
+        self.scroll_from = None;
+        self.pending_scroll = None;
+        self.message.clear();
     }
 }
 

@@ -874,7 +874,6 @@ impl Editor {
         if self.pending_folds.is_empty() {
             return;
         }
-        let buf = self.current_buffer_id();
         if self.buffer().options.foldmethod != crate::options::FoldMethod::Manual {
             return;
         }
@@ -890,7 +889,6 @@ impl Editor {
         let Some(folds) = self.pending_folds.remove(&path) else {
             return;
         };
-        let _ = buf;
         if self.windows.cur().folds.is_empty() {
             self.windows.cur_mut().folds.restore(&folds);
         }
@@ -1331,7 +1329,8 @@ fn ranges_from_foldexpr_values(
     let mut run = 0usize;
     for i in 0..n {
         let raw = values.get(i).map(String::as_str).unwrap_or("0");
-        let lvl = match parse_foldexpr_value(raw) {
+        let value = parse_foldexpr_value(raw);
+        let lvl = match value {
             FoldExprValue::Level(k) => k,
             FoldExprValue::Undefined => {
                 undefined[i] = true;
@@ -1347,7 +1346,7 @@ fn ranges_from_foldexpr_values(
         levels[i] = lvl;
         // A `<N` end leaves the *following* lines one level shallower; everything
         // else carries this line's level forward.
-        run = match parse_foldexpr_value(raw) {
+        run = match value {
             FoldExprValue::End(k) => k.saturating_sub(1).min(foldnestmax),
             _ => lvl,
         };

@@ -23,6 +23,34 @@ fn visible_numbers(map: &[(Value, Value)]) -> Vec<u64> {
     view_numbers(map).into_iter().flatten().collect()
 }
 
+/// The visible buffer-line numbers of the window carrying `focused: true` in the
+/// `windows` array. Unlike [`visible_numbers`] (which falls back to `windows[0]`,
+/// the first window in layout order) this follows focus — needed once a `:split`
+/// makes "first" and "focused" diverge.
+fn focused_numbers(map: &[(Value, Value)]) -> Vec<u64> {
+    let windows = map_get(map, "windows")
+        .and_then(Value::as_array)
+        .expect("windows array");
+    let win = windows
+        .iter()
+        .filter_map(|w| match w {
+            Value::Map(m) => Some(m),
+            _ => None,
+        })
+        .find(|m| {
+            map_get(m, "focused")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+        })
+        .expect("a focused window");
+    map_get(win, "numbers")
+        .and_then(Value::as_array)
+        .expect("numbers array")
+        .iter()
+        .filter_map(Value::as_u64)
+        .collect()
+}
+
 #[tokio::test]
 async fn zf_creates_closed_fold_that_collapses_the_range() {
     let (rpc, mut incoming) = six_lines().await;
@@ -140,6 +168,36 @@ async fn foldenable_off_shows_every_line() {
         visible_numbers(&folded),
         vec![1, 2, 5, 6],
         "foldenable re-collapses the fold"
+    );
+}
+
+#[tokio::test]
+async fn split_inherits_a_clone_of_the_parents_folds() {
+    let (rpc, mut incoming) = six_lines().await;
+    redraw_after(&rpc, &mut incoming, "2Gzf2j").await; // closed fold over 2-4
+
+    // `:split` copies the parent's fold state to the new (focused) window, as vim
+    // does — the split opens showing the same collapsed view.
+    let split = redraw_after(&rpc, &mut incoming, ":split<CR>").await;
+    assert_eq!(
+        focused_numbers(&split),
+        vec![1, 2, 5, 6],
+        "the split inherits the closed fold"
+    );
+
+    // It is a *clone*: opening the fold in the split leaves the original window's
+    // copy closed.
+    let opened = redraw_after(&rpc, &mut incoming, "zo").await;
+    assert_eq!(
+        focused_numbers(&opened),
+        vec![1, 2, 3, 4, 5, 6],
+        "zo opens the split's copy"
+    );
+    let original = redraw_after(&rpc, &mut incoming, "<C-w>w").await;
+    assert_eq!(
+        focused_numbers(&original),
+        vec![1, 2, 5, 6],
+        "the original window's fold stays closed"
     );
 }
 

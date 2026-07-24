@@ -209,6 +209,27 @@ pub struct MenuItem {
     pub replace: Option<(usize, usize)>,
 }
 
+impl MenuItem {
+    /// A bare row: `label` + `key`, every optional/completion-only field at its
+    /// neutral default (`None` / `0` / `false`). The `select` / picker shape; other
+    /// builders override the fields they care about via struct-update
+    /// (`MenuItem { insert: …, ..MenuItem::new(label, key) }`).
+    pub fn new(label: String, key: usize) -> Self {
+        MenuItem {
+            label,
+            key,
+            kind: None,
+            preview: None,
+            insert: None,
+            priority: 0,
+            source_accept: false,
+            doc: None,
+            resolve: None,
+            replace: None,
+        }
+    }
+}
+
 /// The outcome of accepting a completion row, returned by
 /// [`Editor::complete_take_accept`]. Either core applies it natively
 /// (`source_accept = false`: replace `[anchor..cursor)` with `insert`) or the server
@@ -427,6 +448,42 @@ pub(crate) struct Menu {
 }
 
 impl Menu {
+    /// An empty menu of the given `kind` / `placement` with every other field at its
+    /// neutral default: no items, passthrough view, cursor at row 0, noselect, no
+    /// prompt/prefix, generation 0, default box geometry. Each open-path builds on
+    /// this via struct-update (`Menu { all_items, …, ..Menu::new(kind, placement) }`),
+    /// overriding only what that menu shape actually diverges on.
+    fn new(kind: MenuKind, placement: MenuPlacement) -> Self {
+        Menu {
+            kind,
+            anchor: 0,
+            anchor_width: 0,
+            all_items: Vec::new(),
+            filtered: None,
+            match_spans: Vec::new(),
+            cursor: 0,
+            selected_active: false,
+            placement,
+            prompt: None,
+            complete_prefix: String::new(),
+            prompt_pos: PromptPos::default(),
+            dynamic: false,
+            preview: false,
+            preview_scroll: None,
+            docs: false,
+            generation: 0,
+            items_gen: 0,
+            marked: Vec::new(),
+            width: None,
+            height: None,
+            align: None,
+            margin: Margin::default(),
+            title: None,
+            multiselect: false,
+            resumable: false,
+        }
+    }
+
     /// The number of rows in the effective view.
     fn view_len(&self) -> usize {
         self.filtered
@@ -606,51 +663,18 @@ impl Editor {
         let all_items: Vec<MenuItem> = items
             .into_iter()
             .enumerate()
-            .map(|(key, label)| MenuItem {
-                label,
-                key,
-                kind: None,
-                preview: None,
-                insert: None,
-                priority: 0,
-                source_accept: false,
-                doc: None,
-                resolve: None,
-                replace: None,
-            })
+            .map(|(key, label)| MenuItem::new(label, key))
             .collect();
         let last = all_items.len().saturating_sub(1);
+        // Opens noselect (`selected_active` defaults `false`), like the completion
+        // popup / wildmenu: nothing is highlighted until the user navigates, so
+        // `<CR>` on a just-opened menu does nothing rather than confirming a row no
+        // one picked. The first navigation activates the highlight
+        // (`apply_select_action`).
         let mut menu = Menu {
-            kind: MenuKind::Select,
-            anchor_width: 0,
-            anchor: 0,
             all_items,
-            filtered: None,
-            match_spans: Vec::new(),
             cursor: cursor.min(last),
-            // Open noselect, like the completion popup / wildmenu: nothing is
-            // highlighted until the user navigates, so `<CR>` on a just-opened menu
-            // does nothing rather than confirming a row no one picked. The first
-            // navigation activates the highlight (`apply_select_action`).
-            selected_active: false,
-            placement,
-            prompt: None,
-            complete_prefix: String::new(),
-            prompt_pos: PromptPos::default(),
-            dynamic: false,
-            preview: false,
-            preview_scroll: None,
-            docs: false,
-            generation: 0,
-            items_gen: 0,
-            marked: Vec::new(),
-            width: None,
-            height: None,
-            align: None,
-            margin: Margin::default(),
-            title: None,
-            multiselect: false,
-            resumable: false,
+            ..Menu::new(MenuKind::Select, placement)
         };
         menu.refilter();
         self.menu = Some(menu);
@@ -694,25 +718,13 @@ impl Editor {
         // re-ranked away. An empty seed always stays in passthrough.
         let filtered = (!query.is_empty() && !dynamic).then(Vec::new);
         self.menu = Some(Menu {
-            kind: MenuKind::Picker,
-            anchor: 0,
-            anchor_width: 0,
-            all_items: Vec::new(),
             filtered,
-            match_spans: Vec::new(),
-            cursor: 0,
+            // A picker always has a highlighted row, unlike the noselect default.
             selected_active: true,
-            placement,
             prompt: Some(prompt),
-            complete_prefix: String::new(),
             prompt_pos,
             dynamic,
             preview,
-            preview_scroll: None,
-            docs: false,
-            generation: 0,
-            items_gen: 0,
-            marked: Vec::new(),
             width,
             height,
             align,
@@ -720,6 +732,7 @@ impl Editor {
             title,
             multiselect,
             resumable,
+            ..Menu::new(MenuKind::Picker, placement)
         });
     }
 
@@ -758,50 +771,26 @@ impl Editor {
         for (key, (idx, spans)) in ranked.into_iter().enumerate() {
             let (label, insert, doc, replace) = candidates[idx].clone();
             all_items.push(MenuItem {
-                label,
-                key,
-                // A cmdline wildmenu row renders no kind column.
-                kind: None,
-                preview: None,
                 insert: Some(insert),
-                priority: 0,
-                source_accept: false,
                 doc,
-                resolve: None,
                 replace,
+                ..MenuItem::new(label, key)
             });
             filtered.push(key);
             match_spans.push(spans);
         }
+        // Noselect (the `selected_active` default): nothing highlighted until the
+        // user navigates (Phase 2), so `<CR>` keeps executing the typed line until
+        // a row is chosen.
         self.menu = Some(Menu {
-            kind: MenuKind::Cmdline,
             anchor,
             anchor_width,
             all_items,
             filtered: Some(filtered),
             match_spans,
-            cursor: 0,
-            // Noselect: nothing highlighted until the user navigates (Phase 2), so
-            // `<CR>` keeps executing the typed line until a row is chosen.
-            selected_active: false,
-            placement: MenuPlacement::Cmdline,
-            prompt: None,
             complete_prefix: prefix.to_string(),
-            prompt_pos: PromptPos::default(),
-            dynamic: false,
-            preview: false,
-            preview_scroll: None,
             docs,
-            generation: 0,
-            items_gen: 0,
-            marked: Vec::new(),
-            width: None,
-            height: None,
-            align: None,
-            margin: Margin::default(),
-            title: None,
-            multiselect: false,
-            resumable: false,
+            ..Menu::new(MenuKind::Cmdline, MenuPlacement::Cmdline)
         });
     }
 
@@ -1049,26 +1038,18 @@ impl Editor {
             let label = candidates[idx].clone();
             all_items.push(MenuItem {
                 insert: Some(label.clone()),
-                label,
-                key,
-                // A buffer word completes to plain text — the LSP `Text` kind.
+                // A buffer word completes to plain text — the LSP `Text` kind. It
+                // inserts natively (no source edit) and carries no docs; async
+                // source rows (with a `doc` or a `resolve` handle) are appended
+                // later via `menu_push`.
                 kind: Some("Text".to_string()),
-                preview: None,
                 priority,
-                // The `buffer` source inserts its word natively (no source edit).
-                source_accept: false,
-                // `buffer` words carry no docs; async source rows (with a `doc` or a
-                // `resolve` handle) are appended later via `menu_push`.
-                doc: None,
-                resolve: None,
-                // Insert-mode completion replaces the buffer prefix, not a cmdline span.
-                replace: None,
+                ..MenuItem::new(label, key)
             });
             filtered.push(key);
             match_spans.push(spans);
         }
         self.menu = Some(Menu {
-            kind: MenuKind::Complete,
             anchor,
             anchor_width: crate::unicode::display_width(prefix),
             all_items,
@@ -1077,31 +1058,17 @@ impl Editor {
             // `extend_view` rather than dropping to passthrough.
             filtered: Some(filtered),
             match_spans,
-            cursor: 0,
             // Noselect by default: nothing is highlighted until the user navigates,
             // so an auto-opened popup never hijacks `<CR>` (it stays a newline). A
             // manual trigger passes `preselect = true` to highlight the first row.
             selected_active: preselect,
-            placement: MenuPlacement::Cursor,
-            prompt: None,
             complete_prefix: prefix.to_string(),
-            prompt_pos: PromptPos::default(),
-            dynamic: false,
-            preview: false,
-            preview_scroll: None,
             // The docs sidebar follows the engine config; the server fills it from
             // its LSP item cache for the selected row (a `buffer` row has no docs).
             docs: self.complete_config.docs,
             generation: gen,
             items_gen: gen,
-            marked: Vec::new(),
-            width: None,
-            height: None,
-            align: None,
-            margin: Margin::default(),
-            title: None,
-            multiselect: false,
-            resumable: false,
+            ..Menu::new(MenuKind::Complete, MenuPlacement::Cursor)
         });
     }
 
@@ -1157,21 +1124,12 @@ impl Editor {
             .iter()
             .enumerate()
             .map(|(key, c)| MenuItem {
-                label: c.clone(),
-                key,
-                kind: None,
-                preview: None,
                 insert: Some(c.clone()),
-                priority: 0,
-                source_accept: false,
-                doc: None,
-                resolve: None,
-                replace: None,
+                ..MenuItem::new(c.clone(), key)
             })
             .collect();
         let n = all_items.len();
         self.menu = Some(Menu {
-            kind: MenuKind::Complete,
             anchor,
             anchor_width: crate::unicode::display_width(&value),
             all_items,
@@ -1181,24 +1139,9 @@ impl Editor {
             // Preselected: a choice dropdown is an explicit pick, so `<C-y>`/`<CR>`
             // accepts the highlighted alternative straight away.
             selected_active: true,
-            placement: MenuPlacement::Cursor,
-            prompt: None,
-            complete_prefix: String::new(),
-            prompt_pos: PromptPos::default(),
-            dynamic: false,
-            preview: false,
-            preview_scroll: None,
-            docs: false,
             generation: gen,
             items_gen: gen,
-            marked: Vec::new(),
-            width: None,
-            height: None,
-            align: None,
-            margin: Margin::default(),
-            title: None,
-            multiselect: false,
-            resumable: false,
+            ..Menu::new(MenuKind::Complete, MenuPlacement::Cursor)
         });
     }
 

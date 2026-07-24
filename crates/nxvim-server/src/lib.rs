@@ -126,11 +126,12 @@ pub use shada::{
 pub use daemon::{
     connect_daemon, connect_daemon_reconnecting, connect_daemon_reconnecting_on, parse_connect_uri,
     serve_config_daemon, serve_config_daemon_on, serve_daemon, serve_dproc_daemon_on,
-    serve_fs_daemon, serve_fs_daemon_on, serve_http_daemon, serve_http_daemon_on, serve_lsp_daemon,
-    serve_lsp_daemon_on, serve_luafs_daemon, serve_luafs_daemon_on, serve_proc_daemon_on,
-    serve_sock_daemon_on, serve_term_daemon_on, DaemonClient, DaemonStatus, FsRead, HostFsAsync,
-    ReconnectHandle, ReconnectPolicy, RemoteConfig, RemoteFsJobs, RemoteHostFs, RemoteHostProc,
-    RemoteHostTerm, RemoteHttp, RemoteLspTransport, WatchEvent, CONNECT_URI_SCHEME,
+    serve_fs_daemon, serve_fs_daemon_on, serve_git_daemon, serve_git_daemon_on, serve_http_daemon,
+    serve_http_daemon_on, serve_lsp_daemon, serve_lsp_daemon_on, serve_luafs_daemon,
+    serve_luafs_daemon_on, serve_proc_daemon_on, serve_sock_daemon_on, serve_term_daemon_on,
+    DaemonClient, DaemonStatus, FsRead, HostFsAsync, ReconnectHandle, ReconnectPolicy,
+    RemoteConfig, RemoteFsJobs, RemoteGitJobs, RemoteHostFs, RemoteHostProc, RemoteHostTerm,
+    RemoteHttp, RemoteLspTransport, WatchEvent, CONNECT_URI_SCHEME,
 };
 /// The parsed `nx_session_reconnect` spec (§B): the client-persistent session-swap request
 /// both native front ends decode and act on. See [`reconnect`].
@@ -359,6 +360,14 @@ pub struct ServerInit {
     /// [`HttpBackend`](crate::evloop::HttpBackend). The HTTP twin of [`fs_jobs`](Self::fs_jobs).
     #[cfg(feature = "native")]
     pub http_jobs: Option<RemoteHttp>,
+    /// The async `nx.git` daemon seam. `None` (the default) runs `nx.git.*` ops on the local
+    /// disk (the actor's gix engine on its blocking pool); a daemon session injects a
+    /// daemon-backed [`RemoteGitJobs`] so a plugin queries the *remote* repo (branch / diff /
+    /// blame marks) over the `git_op` leg — the whole [`GitJob`](nxvim_lua::GitJob) crosses in
+    /// one request, run daemon-side. `run_server` turns it into the actor's
+    /// [`GitBackend`](crate::evloop::GitBackend). The git twin of [`fs_jobs`](Self::fs_jobs).
+    #[cfg(feature = "native")]
+    pub git_jobs: Option<crate::daemon::RemoteGitJobs>,
     /// Whether to offer nxvim's built-in default recommended plugin set on a fresh
     /// setup. `false` (the default) leaves the recommended set empty, so the headless
     /// test suites never trip the first-run welcome; the interactive binary sets it
@@ -3252,6 +3261,13 @@ where
         Some(remote) => evloop::HttpBackend::Remote(remote),
         None => evloop::HttpBackend::Local,
     };
+    // Where the actor runs off-tick `nx.git.*` ops: the local gix engine on the blocking
+    // pool (bare/local session), or the daemon's `git_op` leg (a daemon session — git runs
+    // where the files are). Like `fs_backend`, off the editor tick.
+    let git_backend = match init.git_jobs {
+        Some(remote) => evloop::GitBackend::Remote(remote),
+        None => evloop::GitBackend::Local,
+    };
     // Language servers are spawned through this transport — real local children by
     // default, or an injected daemon-backed tunnel. Rebuilt here, on the server thread,
     // into the shared `Arc<dyn LspTransport>` the manager holds (`ServerInit` carried it
@@ -3287,12 +3303,17 @@ where
     // See `docs/plans/2026-07-03-remote-aware-plugin-manager.md`.
     let local_host_proc: Arc<dyn HostProc> = Arc::new(StdHostProc);
     let local_fs_backend = evloop::FsBackend::Local(Arc::new(nxvim_lua::StdLuaFs::new()));
+    // The plugin manager's `nx.git_local` always runs on the local disk (its repos live
+    // there), so the local git twin is always `Local` — even in a daemon session.
+    let local_git_backend = evloop::GitBackend::Local;
     let (evloop, mut loop_events) = EventLoop::new(
         host_proc,
         fs_backend,
         http_backend,
         local_host_proc,
         local_fs_backend,
+        git_backend,
+        local_git_backend,
     );
     // The terminal actor: owns the local PTYs `:terminal` spawns, streaming their
     // output back on `term_events`. Lazily started on the first open (the `EventLoop`
@@ -3692,6 +3713,9 @@ struct DaemonLegs {
     /// The `nx.http` leg (`http_op`) — a request/response per fetch, run daemon-side. Rides
     /// the Control group's stream alongside `luafs`/`fs`/`config`.
     http: Option<tokio::sync::mpsc::UnboundedSender<Incoming>>,
+    /// The `nx.git` leg (`git_op`) — a request/response per op, run daemon-side (git runs
+    /// where the files are). Rides the Control group's stream alongside `http`/`luafs`.
+    git: Option<tokio::sync::mpsc::UnboundedSender<Incoming>>,
     config: Option<tokio::sync::mpsc::UnboundedSender<Incoming>>,
     handles: Vec<tokio::task::JoinHandle<anyhow::Result<()>>>,
 }
@@ -3716,6 +3740,7 @@ impl DaemonLegs {
             luafs: None,
             luafs_watch: None,
             http: None,
+            git: None,
             config: None,
             handles: Vec::new(),
         };
@@ -3726,6 +3751,7 @@ impl DaemonLegs {
                     let (luafs_tx, luafs_rx) = unbounded_channel();
                     let (luafs_watch_tx, luafs_watch_rx) = unbounded_channel();
                     let (http_tx, http_rx) = unbounded_channel();
+                    let (git_tx, git_rx) = unbounded_channel();
                     let (config_tx, config_rx) = unbounded_channel();
                     legs.handles.push(tokio::spawn(daemon::serve_fs_daemon_on(
                         rpc.clone(),
@@ -3747,6 +3773,10 @@ impl DaemonLegs {
                         rpc.clone(),
                         http_rx,
                     )));
+                    legs.handles.push(tokio::spawn(daemon::serve_git_daemon_on(
+                        rpc.clone(),
+                        git_rx,
+                    )));
                     legs.handles
                         .push(tokio::spawn(daemon::serve_config_daemon_on(
                             rpc.clone(),
@@ -3756,6 +3786,7 @@ impl DaemonLegs {
                     legs.luafs = Some(luafs_tx);
                     legs.luafs_watch = Some(luafs_watch_tx);
                     legs.http = Some(http_tx);
+                    legs.git = Some(git_tx);
                     legs.config = Some(config_tx);
                 }
                 LegGroup::Proc => {
@@ -3814,6 +3845,8 @@ impl DaemonLegs {
                     self.luafs_watch.as_ref()
                 } else if method == "http_op" {
                     self.http.as_ref()
+                } else if method == "git_op" {
+                    self.git.as_ref()
                 } else if method.starts_with("fs_") {
                     self.fs.as_ref()
                 } else if method.starts_with("config_") {
@@ -3849,6 +3882,7 @@ impl DaemonLegs {
             self.luafs,
             self.luafs_watch,
             self.http,
+            self.git,
             self.config,
         ));
         for handle in self.handles {

@@ -243,6 +243,14 @@ const LUAFS_OP: &str = "luafs_op";
 // (via [`RemoteHttp`]) and the wasm edit-host (over WebTransport) use this one leg.
 const HTTP_OP: &str = "http_op";
 
+// The Lua-`nx.git` off-tick leg (`git_op`): a request/response per op, carrying a whole
+// [`GitJob`](nxvim_lua::GitJob) run through `nxvim_git::run_git_job` on the daemon (which
+// owns the repo — the same reason `nx.fs` routes there). The request is a map (`{ op, path,
+// … }`), the reply the `["ok", <git-value>] | ["err", code, message]` envelope
+// `nxvim_lua::gitwire` encodes. Both the native-daemon edit-host (via [`RemoteGitJobs`]) and
+// a web edit-host use this one leg; a serverless session with no daemon rejects loud.
+const GIT_OP: &str = "git_op";
+
 // The Lua-`nx.fs.watch` streaming leg (`luafs_watch`): the wasm route for the streaming watch
 // (Phase 3b of the off-tick plan). DISTINCT from the buffer-reconcile `fs_watch` leg (a coarse
 // single-path stat-poll keyed by path): this is a recursive, change-classified watch keyed by a
@@ -336,6 +344,7 @@ impl LegGroup {
             || method.starts_with("config_")
             || method.starts_with("luafs_")
             || method.starts_with("http_")
+            || method.starts_with("git_")
         {
             Some(LegGroup::Control)
         } else if method.starts_with("proc_")
@@ -483,6 +492,8 @@ struct LinkState {
     fs_jobs_rx: Option<UnboundedReceiver<FsJobReq>>,
     /// Taken once to drive the `http_op` job server (the HTTP twin of `fs_jobs_rx`).
     http_jobs_rx: Option<UnboundedReceiver<HttpJobReq>>,
+    /// Taken once to drive the `git_op` job server (the git twin of `fs_jobs_rx`).
+    git_jobs_rx: Option<UnboundedReceiver<GitJobReq>>,
 }
 
 impl LinkState {
@@ -496,6 +507,12 @@ impl LinkState {
         self.http_jobs_rx
             .take()
             .expect("LinkState::take_http_jobs_rx called once")
+    }
+
+    fn take_git_jobs_rx(&mut self) -> UnboundedReceiver<GitJobReq> {
+        self.git_jobs_rx
+            .take()
+            .expect("LinkState::take_git_jobs_rx called once")
     }
 }
 
@@ -516,6 +533,7 @@ fn build_link() -> (LinkState, DaemonClient) {
         channel::<crate::terminal::native::TermEvent>(REMOTE_TERM_EVENT_CAP);
     let (fs_jobs_tx, fs_jobs_rx) = unbounded_channel::<FsJobReq>();
     let (http_jobs_tx, http_jobs_rx) = unbounded_channel::<HttpJobReq>();
+    let (git_jobs_tx, git_jobs_rx) = unbounded_channel::<GitJobReq>();
 
     let client = DaemonClient {
         host_fs: RemoteHostFs {
@@ -534,6 +552,9 @@ fn build_link() -> (LinkState, DaemonClient) {
         },
         host_term: RemoteHostTerm::from_parts(term_rpc.clone(), term_event_rx),
         fs_jobs: RemoteFsJobs { req_tx: fs_jobs_tx },
+        git_jobs: RemoteGitJobs {
+            req_tx: git_jobs_tx,
+        },
         http: RemoteHttp {
             req_tx: http_jobs_tx,
         },
@@ -552,6 +573,7 @@ fn build_link() -> (LinkState, DaemonClient) {
         term_event_tx,
         fs_jobs_rx: Some(fs_jobs_rx),
         http_jobs_rx: Some(http_jobs_rx),
+        git_jobs_rx: Some(git_jobs_rx),
     };
     (state, client)
 }
@@ -981,6 +1003,10 @@ where
         state.control_rpc.clone(),
         state.take_http_jobs_rx(),
     ));
+    tokio::spawn(run_git_jobs(
+        state.control_rpc.clone(),
+        state.take_git_jobs_rx(),
+    ));
     let (cmd_tx, cmd_rx) = unbounded_channel::<LinkCommand>();
     let (status_tx, status_rx) = watch::channel(DaemonStatus::Connected);
     // Publish the first connection's `Rpc`s into the cells *before* returning the client:
@@ -1083,6 +1109,10 @@ where
             tokio::spawn(run_http_jobs(
                 state.control_rpc.clone(),
                 state.take_http_jobs_rx(),
+            ));
+            tokio::spawn(run_git_jobs(
+                state.control_rpc.clone(),
+                state.take_git_jobs_rx(),
             ));
             let (cmd_tx, cmd_rx) = unbounded_channel::<LinkCommand>();
             let (status_tx, status_rx) = watch::channel(DaemonStatus::Connected);
@@ -3129,6 +3159,13 @@ type FsJobReq = (
     tokio::sync::oneshot::Sender<Result<nxvim_lua::FsValue, nxvim_lua::FsError>>,
 );
 
+/// One queued git job on the link thread — the whole [`GitJob`](nxvim_lua::GitJob) and the
+/// oneshot the awaiting actor parks on for the typed result. The git twin of [`FsJobReq`].
+type GitJobReq = (
+    nxvim_lua::GitJob,
+    tokio::sync::oneshot::Sender<Result<nxvim_lua::GitValue, nxvim_lua::GitError>>,
+);
+
 /// One queued HTTP job on the link thread — the [`HttpRequest`](nxvim_lua::HttpRequest) and
 /// the oneshot the awaiting actor parks on for the typed result. The HTTP sibling of
 /// [`FsJobReq`].
@@ -3151,6 +3188,27 @@ async fn run_fs_jobs(rpc: LinkRpc, mut req_rx: UnboundedReceiver<FsJobReq>) {
             Err(e) => Err(nxvim_lua::FsError {
                 code: "EIO".to_string(),
                 message: format!("nx.fs: daemon error: {e}"),
+            }),
+        };
+        let _ = reply_tx.send(result);
+    }
+}
+
+/// The `git_op` leg's job server: pull each whole [`GitJob`](nxvim_lua::GitJob) off `req_rx`,
+/// send it as one `git_op` request over `rpc`, decode the reply through the shared
+/// [`gitwire`](nxvim_lua) codec, and deliver the typed result to the awaiting actor. The git
+/// twin of [`run_fs_jobs`].
+async fn run_git_jobs(rpc: LinkRpc, mut req_rx: UnboundedReceiver<GitJobReq>) {
+    while let Some((job, reply_tx)) = req_rx.recv().await {
+        let result = match rpc
+            .request(GIT_OP, vec![nxvim_lua::git_job_to_value(&job)])
+            .await
+        {
+            Ok(v) => nxvim_lua::git_result_from_value(&v),
+            // A transport failure (daemon gone) rejects the promise loud — never a panic.
+            Err(e) => Err(nxvim_lua::GitError {
+                code: "EIO".to_string(),
+                message: format!("nx.git: daemon error: {e}"),
             }),
         };
         let _ = reply_tx.send(result);
@@ -3230,6 +3288,53 @@ impl RemoteFsJobs {
             Err(nxvim_lua::FsError {
                 code: "EIO".to_string(),
                 message: "nx.fs: daemon link dropped the request".to_string(),
+            })
+        })
+    }
+}
+
+/// The edit-host side of the `git_op` leg for a **native-daemon** session — the actor sends
+/// a whole [`GitJob`](nxvim_lua::GitJob) here and `await`s its typed result. The git twin of
+/// [`RemoteFsJobs`]; `Clone` so each `nx.git` op can be driven concurrently, `Send + Sync`
+/// so it rides [`ServerInit`](crate::ServerInit) onto the server thread.
+#[derive(Clone)]
+pub struct RemoteGitJobs {
+    req_tx: UnboundedSender<GitJobReq>,
+}
+
+impl RemoteGitJobs {
+    /// Connect to a daemon over `reader`/`writer` as a standalone leg (a dedicated link
+    /// thread running [`run_git_jobs`]) — the git twin of [`RemoteFsJobs::connect`], for
+    /// driving the `git_op` leg in isolation (tests). The multiplexed [`connect_daemon`]
+    /// builds a `RemoteGitJobs` directly instead, sharing one link across all legs.
+    pub fn connect<R, W>(reader: R, writer: W) -> RemoteGitJobs
+    where
+        R: AsyncRead + Unpin + Send + 'static,
+        W: AsyncWrite + Unpin + Send + 'static,
+    {
+        let (req_tx, req_rx) = unbounded_channel::<GitJobReq>();
+        spawn_leg_thread(reader, writer, move |rpc| run_git_jobs(rpc, req_rx));
+        RemoteGitJobs { req_tx }
+    }
+
+    /// Send `job` to the daemon over `git_op` and `await` the typed result. Off the editor
+    /// tick (the caller is the actor's async task), so a tokio await, not a thread park; a
+    /// dropped link rejects loud.
+    pub async fn run(
+        &self,
+        job: nxvim_lua::GitJob,
+    ) -> Result<nxvim_lua::GitValue, nxvim_lua::GitError> {
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        if self.req_tx.send((job, reply_tx)).is_err() {
+            return Err(nxvim_lua::GitError {
+                code: "ENOTCONN".to_string(),
+                message: "nx.git: daemon link is gone".to_string(),
+            });
+        }
+        reply_rx.await.unwrap_or_else(|_| {
+            Err(nxvim_lua::GitError {
+                code: "EIO".to_string(),
+                message: "nx.git: daemon link dropped the request".to_string(),
             })
         })
     }
@@ -3373,6 +3478,69 @@ pub async fn serve_luafs_daemon_on(
                         {
                             Ok(v) => Ok(v),
                             Err(e) => Err(Value::from(format!("luafs_op: join error: {e}"))),
+                        };
+                    rpc.respond(id, reply);
+                });
+            } else {
+                rpc.respond(id, Err(Value::from(format!("unknown method: {method}"))));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Run one `nx.git.*` op (the `git_op` leg): decode the request map into a
+/// [`GitJob`](nxvim_lua::GitJob), run it through `nxvim_git::run_git_job`, and shape the
+/// `["ok", <git-value>] | ["err", code, message]` reply. A request that doesn't decode is a
+/// loud `["err", …]` reply, never a silent empty result. No `fs`/backend argument — the
+/// executor discovers the repo from the job's path against the daemon's real disk.
+fn serve_git_op(params: &[Value]) -> Value {
+    let Some(req) = params.first() else {
+        return nxvim_lua::git_result_to_value(&Err(nxvim_lua::GitError {
+            code: "EWIRE".to_string(),
+            message: "git_op: request has no job".to_string(),
+        }));
+    };
+    match nxvim_lua::git_job_from_value(req) {
+        Ok(job) => nxvim_lua::git_result_to_value(&nxvim_git::run_git_job(&job)),
+        Err(message) => nxvim_lua::git_result_to_value(&Err(nxvim_lua::GitError {
+            code: "EWIRE".to_string(),
+            message,
+        })),
+    }
+}
+
+/// Run the daemon end of the `nx.git` wire over `reader`/`writer` (the standalone
+/// single-leg form, for tests — the multiplexed daemon fans `git_op` into
+/// [`serve_git_daemon_on`] instead). The git twin of [`serve_luafs_daemon`]. Returns when
+/// the connection closes.
+pub async fn serve_git_daemon<R, W>(reader: R, writer: W) -> anyhow::Result<()>
+where
+    R: AsyncRead + Unpin + Send + 'static,
+    W: AsyncWrite + Unpin + Send + 'static,
+{
+    let (rpc, incoming) = connect(reader, writer);
+    serve_git_daemon_on(rpc, incoming).await
+}
+
+/// Run the daemon end of the `nx.git` wire — serve each `git_op` request (a whole
+/// [`GitJob`](nxvim_lua::GitJob)) over the shared [`Rpc`], offloaded to the blocking pool
+/// (a repo walk shouldn't stall the reader). The git twin of [`serve_luafs_daemon_on`];
+/// needs no backend arg (gix discovers the repo from the path). Returns when the
+/// connection closes.
+pub async fn serve_git_daemon_on(
+    rpc: Rpc,
+    mut incoming: UnboundedReceiver<Incoming>,
+) -> anyhow::Result<()> {
+    while let Some(msg) = incoming.recv().await {
+        if let Incoming::Request { id, method, params } = msg {
+            if method == GIT_OP {
+                let rpc = rpc.clone();
+                tokio::spawn(async move {
+                    let reply =
+                        match tokio::task::spawn_blocking(move || serve_git_op(&params)).await {
+                            Ok(v) => Ok(v),
+                            Err(e) => Err(Value::from(format!("git_op: join error: {e}"))),
                         };
                     rpc.respond(id, reply);
                 });
@@ -3745,6 +3913,9 @@ pub struct DaemonClient {
     /// The async `nx.fs` seam (`luafs_op`) — whole-job, decomposed daemon-side. The
     /// event-loop actor `await`s it off the editor tick (no thread park).
     pub fs_jobs: RemoteFsJobs,
+    /// The async `nx.git` seam (`git_op`) — the whole op runs daemon-side (git runs where
+    /// the files are). The event-loop actor `await`s it off the editor tick.
+    pub git_jobs: RemoteGitJobs,
     /// The async `nx.http` seam (`http_op`) — the whole request runs on the daemon (which
     /// owns the network). The event-loop actor `await`s it off the editor tick.
     pub http: RemoteHttp,
@@ -3880,6 +4051,10 @@ pub(crate) async fn serve_daemon_link_inner(
     tokio::spawn(run_http_jobs(
         state.control_rpc.clone(),
         state.take_http_jobs_rx(),
+    ));
+    tokio::spawn(run_git_jobs(
+        state.control_rpc.clone(),
+        state.take_git_jobs_rx(),
     ));
     // Hand the seams out before serving; if the caller already dropped, there's nothing
     // to drive.

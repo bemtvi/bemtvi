@@ -317,6 +317,7 @@ async fn server_init(
         host_term,
         fs_jobs,
         http_jobs,
+        git_jobs,
     ) = match client {
         None => {
             let (config_dir, runtimepath) = nxvim_server::default_runtime();
@@ -330,6 +331,7 @@ async fn server_init(
                 config_dir,
                 runtimepath,
                 store,
+                None,
                 None,
                 None,
                 None,
@@ -378,6 +380,7 @@ async fn server_init(
                 Some(c.host_term),
                 Some(c.fs_jobs),
                 Some(c.http),
+                Some(c.git_jobs),
             )
         }
     };
@@ -416,6 +419,7 @@ async fn server_init(
         host_term,
         fs_jobs,
         http_jobs,
+        git_jobs,
         // The GUI is the interactive editor — offer the built-in default recommended
         // set on a fresh setup (a config's own recommend{} still overrides it), and
         // enable command-line completion by default (a config's setup{} still wins).

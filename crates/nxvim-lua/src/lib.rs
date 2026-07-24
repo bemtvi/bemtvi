@@ -25,6 +25,7 @@
 
 mod convert;
 mod fswire;
+mod gitwire;
 mod host;
 mod httpwire;
 mod install;
@@ -35,6 +36,9 @@ mod search;
 mod vimregex;
 
 pub use fswire::{fs_job_from_value, fs_job_to_value, fs_result_from_value, fs_result_to_value};
+pub use gitwire::{
+    git_job_from_value, git_job_to_value, git_result_from_value, git_result_to_value,
+};
 pub use host::stdpath;
 pub use httpwire::{
     http_request_from_value, http_request_to_value, http_result_from_value, http_result_to_value,

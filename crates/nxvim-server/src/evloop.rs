@@ -311,11 +311,13 @@ pub enum FsBackend {
 /// - [`Local`](GitBackend::Local) — native-bare / the `nx.git_local` twin: run the job
 ///   on the blocking pool against the local disk's gix engine.
 ///
-/// A `Remote` variant (the daemon `git_op` leg — git runs where the files are) is added
-/// with the daemon leg (slice 1d); until then a daemon session runs git on the client.
+/// - [`Remote`](GitBackend::Remote) — native-daemon: the whole [`GitJob`] crosses in one
+///   `git_op` request via [`RemoteGitJobs`](crate::daemon::RemoteGitJobs), run daemon-side
+///   (git runs where the files are). An `await`, not a thread park.
 #[derive(Clone)]
 pub enum GitBackend {
     Local,
+    Remote(crate::daemon::RemoteGitJobs),
 }
 
 /// Where the actor runs off-tick `nx.http.fetch` requests. The HTTP sibling of
@@ -397,6 +399,8 @@ impl EventLoop {
         http: HttpBackend,
         local_host_proc: Arc<dyn HostProc>,
         local_fs: FsBackend,
+        git: GitBackend,
+        local_git: GitBackend,
     ) -> (EventLoop, UnboundedReceiver<LoopEvent>) {
         let (cmd_tx, cmd_rx) = unbounded_channel();
         let (event_tx, event_rx) = unbounded_channel();
@@ -408,10 +412,8 @@ impl EventLoop {
             http,
             local_host_proc,
             local_fs,
-            // Local-only until the daemon leg (slice 1d) threads a `Remote` backend in
-            // from `ServerInit`; `run_git_job` needs no per-op state, so this carries none.
-            git: GitBackend::Local,
-            local_git: GitBackend::Local,
+            git,
+            local_git,
             started: false,
         };
         (evloop, event_rx)
@@ -712,6 +714,13 @@ async fn run_evloop(
                                             message: format!("nx.git op task failed: {e}"),
                                         })
                                     });
+                            let _ = event_tx.send(LoopEvent::GitResult { id, result });
+                        });
+                    }
+                    GitBackend::Remote(remote) => {
+                        let remote = remote.clone();
+                        tokio::spawn(async move {
+                            let result = remote.run(job).await;
                             let _ = event_tx.send(LoopEvent::GitResult { id, result });
                         });
                     }

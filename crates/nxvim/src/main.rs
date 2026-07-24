@@ -708,6 +708,9 @@ fn main() -> Result<()> {
         // Likewise `nx.http` runs locally (the actor's `ureq`); a daemon-backed `http_op`
         // seam is injected by the edit-host split (see the daemon-session branch below).
         http_jobs: None,
+        // `nx.git` runs locally (the actor's gix engine); a daemon session injects a
+        // `git_op` seam below.
+        git_jobs: None,
         // The interactive binary offers nxvim's built-in default recommended set on a
         // fresh setup (the first-run welcome); a config's own recommend{} overrides it.
         offer_default_recommended: true,
@@ -1118,6 +1121,8 @@ where
         fs_jobs: Some(client.fs_jobs),
         // Route `nx.http.fetch` to the daemon (which owns the network) over `http_op`.
         http_jobs: Some(client.http),
+        // Route session-scoped `nx.git.*` to the daemon (where the repo is) over `git_op`.
+        git_jobs: Some(client.git_jobs),
         // A daemon-backed session is still the interactive editor — offer the
         // built-in default recommended set on first run, and enable
         // command-line completion by default (a config's setup{} still wins).

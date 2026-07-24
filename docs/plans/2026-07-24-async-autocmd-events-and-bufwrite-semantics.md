@@ -181,7 +181,33 @@ Commit, pause for review.
 
 ---
 
-## Phase 3 — Generalize async-awareness to all events; docs + example
+## Phase 3 — Docs + example (shipped); `:wall`/`:wqa` deferred
+
+**Shipped:** `examples/format-on-save/` (sync trim-on-save + async `FIXME`→`TODO`
+formatter via a `BufWritePre` promise; verified end-to-end with a throwaway harness
+test, then removed per the examples convention). `docs/autocmd-events.md` documents the
+async-handler contract and the awaited `BufWritePre`.
+
+**Deferred — `:wall`/`:wqa` pre-before-bytes (a genuinely separate, larger piece).**
+The blocker is *not* the quit-gating (that could ride the existing `PendingQuitAll`
+seq-gate). It is that a *mutating* `BufWritePre` handler (`vim.cmd` `%s`, `nx.lsp.buf.format`)
+operates on the **current** buffer, so firing `BufWritePre` for a *non-current* `:wall`
+buffer would target the wrong buffer. Doing it correctly needs neovim's `aucmd_prepbuf`:
+temporarily make each written buffer current (saving/restoring the window's buffer **and**
+the editor-global cursor) without firing spurious `BufEnter`/`BufLeave`. `set_cur_buffer`
+swaps the window's buffer but not the cursor, and `switch_buffer` fires the full autocmd
+chain — neither is the lightweight swap this needs. An *ordering-only* conversion (fire
+before bytes without making the buffer current) would be **worse** than today: a mutating
+handler would corrupt the current buffer. So `:wall`/`:wqa` keep firing `BufWritePre`
+after the bytes (notifications work; buffer-mutating format-on-save via `:wall` does not) —
+tracked as the remaining gap. The overwhelmingly common trigger, `:w`, is fully correct.
+
+**Found along the way (separate bug, not fixed here):** nxvim's vim-regex engine
+mishandles `\+` (one-or-more) anchored at `$` — `%s/\s\+$//` does not trim trailing
+whitespace, while `%s/\s*$//`, `%s/[ ]*$//`, and `%s/  *$//` all work. The example uses
+the working `\s*$` form. Worth a dedicated fix in `nxvim-regex`.
+
+### (Original Phase 3 plan, for reference)
 
 1. Make the general (non-gating) fire path async-aware: a handler that returns a
    promise from `CursorMoved`, `BufEnter`, `FileType`, … has it **tracked** (a `:catch`

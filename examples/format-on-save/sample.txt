@@ -1,0 +1,14 @@
+Format-on-save demo buffer.
+
+Try each of these, then :w and watch what gets saved.
+
+1. Trailing whitespace on the next line is trimmed on save:
+this line has trailing spaces here ->    
+
+2. A lower-case marker is upcased on save:
+todo: turn this into TODO on write
+
+3. An async formatter rewrites FIXME after a ~50ms pause:
+FIXME later
+
+After :w, the message line shows a BufWritePost confirmation.

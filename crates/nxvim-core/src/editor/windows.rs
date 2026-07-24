@@ -1912,15 +1912,27 @@ impl Editor {
         config: FloatConfig,
         enter: bool,
     ) -> WindowId {
-        // A float defaults to a clean gutter — no line-number column — so popup
-        // content (diagnostics, hover, completion docs, plugin UIs) fills the
-        // window width instead of being squeezed/truncated by an inherited gutter.
-        // This matches how floats read in neovim; a caller that wants numbers in a
-        // floating editor re-enables them with `nvim_win_set_option(win, "number")`.
-        // The horizontal-scroll settings still come from the focused window.
+        // A float defaults to a clean frame — no number/sign/fold gutter, and none of
+        // the editing decorations painted across its body — so popup content
+        // (diagnostics, hover, completion docs, plugin UIs) fills the window width
+        // instead of being squeezed/truncated by a gutter inherited from the editing
+        // window, or crossed by a cursor-line bar and a `'colorcolumn'` ruler that mean
+        // nothing over a popup. This is neovim's `style = "minimal"` treatment of the
+        // options nxvim models: `'number'`/`'relativenumber'`/`'cursorline'` off,
+        // `'foldcolumn'` zero, `'colorcolumn'` cleared, and `'signcolumn'` reset to
+        // `auto` — *not* `no`, so a float whose own buffer carries signs (a plugin UI
+        // painting `sign_text` extmarks) still shows them, while an inherited
+        // `yes`/`yes:2` no longer reserves an empty column inside every popup. A caller
+        // that wants any of them in a floating editor re-enables it per window
+        // (`nvim_win_set_option(win, "number")` / `nx.wo[win].signcolumn`). The
+        // horizontal-scroll settings still come from the focused window.
         let mut options = self.windows.get(self.windows.current).options.clone();
         options.number = false;
         options.relativenumber = false;
+        options.signcolumn = crate::options::SignColumn::Auto { min: 1, max: 1 };
+        options.foldcolumn = 0;
+        options.cursorline = false;
+        options.colorcolumn = String::new();
         let id = self.alloc_window_id();
         self.windows.windows.insert(
             id,

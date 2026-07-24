@@ -1644,6 +1644,86 @@ nx.complete.setup { sources = { { 'doc' } } }";
         sign_width + number_width + menu_col + menu_width + 1,
         "docs float butts against the popup including the sign column"
     );
+    // ...and the float itself is a popup, not an editing window: the editing window's
+    // gutter options must NOT leak into it. Its own sign column stays collapsed, so the
+    // documentation text starts at the float's left edge instead of being inset (and
+    // truncated) by two cells of empty gutter.
+    assert_eq!(
+        mu64(&docs, "sign_width"),
+        0,
+        "the docs float must not inherit signcolumn=yes from the editing window"
+    );
+}
+
+/// A float is a popup, not an editing window: it must not inherit the editing window's
+/// **gutter and decoration** options. Regression: `open_float_window` cleared only
+/// `number` / `relativenumber`, so `set signcolumn=yes` (or a `foldcolumn`) reserved an
+/// empty gutter *inside* the completion-docs float, insetting its text and shrinking the
+/// width its content had to render into — and `cursorline` / `colorcolumn` painted a
+/// highlight bar and a vertical ruler across the popup's body.
+#[tokio::test]
+async fn docs_float_does_not_inherit_the_gutter_options() {
+    let dir = temp_dir("complete_docs_float_gutter");
+    let init = "\
+nx.complete.source {\n\
+  name = 'doc', debounce = 0,\n\
+  complete = function(ctx)\n\
+    if ('hello'):find(ctx.prefix, 1, true) == 1 then\n\
+      ctx.push { text = 'hello', doc = 'docs for hello' }\n\
+    end\n\
+  end,\n\
+}\n\
+nx.complete.setup { sources = { { 'doc' } } }";
+    let (rpc, mut incoming) = start(&dir, init).await;
+
+    // Every gutter/decoration option the editing window can carry, all on.
+    exec_lua(
+        &rpc,
+        "vim.cmd[[set signcolumn=yes:2]] vim.cmd[[set foldcolumn=2]] \
+         vim.cmd[[set number]] vim.cmd[[set relativenumber]] \
+         vim.cmd[[set cursorline]] vim.cmd[[set colorcolumn=4]]",
+    )
+    .await;
+
+    feed(&rpc, "ihel");
+    let _ = poll_menu(&rpc, &mut incoming).await.expect("popup opens");
+    feed(&rpc, "<C-n>"); // select row 0 so the docs float shows
+
+    let map = poll_menu_top_with_docs(&rpc, &mut incoming)
+        .await
+        .expect("docs float appears");
+    let docs = docs_window(&map).expect("docs float window");
+    assert_eq!(
+        mu64(&docs, "sign_width"),
+        0,
+        "the docs float must not inherit 'signcolumn'"
+    );
+    assert_eq!(
+        mu64(&docs, "number_width"),
+        0,
+        "the docs float must not inherit 'number'/'relativenumber'"
+    );
+    assert_eq!(
+        mu64(&docs, "foldcolumn_width"),
+        0,
+        "the docs float must not inherit 'foldcolumn'"
+    );
+    assert_eq!(
+        map_get(&docs, "cursorline").and_then(Value::as_bool),
+        Some(false),
+        "the docs float must not inherit 'cursorline'"
+    );
+    assert_eq!(
+        map_get(&docs, "colorcolumn"),
+        Some(&Value::Array(Vec::new())),
+        "the docs float must not inherit 'colorcolumn'"
+    );
+    // The whole float width is content: the text is flush with the left edge.
+    assert_eq!(
+        win_lines(&docs).first().map(String::as_str),
+        Some("docs for hello"),
+        "the docs text renders in full, uninset by a gutter"
+    );
 }
 
 /// With a left dock open, the sidebar's region-relative geometry must be bounded

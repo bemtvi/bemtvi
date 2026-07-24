@@ -1107,7 +1107,18 @@ pub struct Editor {
     /// cleared once the menu closes or a real edit commits the preview. See
     /// [`cmdcomplete`](crate::editor::cmdcomplete).
     cmdline_complete_saved: Option<(String, usize)>,
+    /// The final "break the run loop now" flag — set by the server once the gated exit
+    /// sequence ([`Self::exit_requested`]) has fired its `QuitPre`/`ExitPre`/`VimLeavePre`
+    /// handlers (and awaited any async ones), never by `ex_quit_all` directly.
     pub should_quit: bool,
+    /// A real editor quit has been *decided* (a committed `:qa` / last-window `:q` /
+    /// `:wq` / `:x` / `:wqa`) but not yet carried out: the server drives the gated exit
+    /// sequence off this flag (fire `QuitPre` → `ExitPre` → `VimLeavePre`, awaiting async
+    /// handlers, then `VimLeave` + `should_quit`). Kept distinct from [`Self::should_quit`]
+    /// so the core commits only the *intent* — it can't re-enter Lua to fire the events —
+    /// exactly as [`Self::pending_pre_writes`] defers `BufWritePre`. Consumed once by
+    /// [`take_exit_requested`](Self::take_exit_requested).
+    exit_requested: bool,
     /// The **effective** global options every read sees (number column, search flags,
     /// …): [`Editor::global_base`] with the per-workspace [`Editor::workspace_options`]
     /// overlay applied on top. Recomputed by [`Editor::recompute_effective_options`]
@@ -1906,6 +1917,7 @@ impl Editor {
             prompt_complete_docs: false,
             prompt_complete_request: None,
             should_quit: false,
+            exit_requested: false,
             options: Options::default(),
             // The base + overlay start equal to the effective options (no overrides yet);
             // a workspace seed or an `nx.wso` write later diverges them via recompute.

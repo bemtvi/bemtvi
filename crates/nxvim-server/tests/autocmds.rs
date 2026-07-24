@@ -1116,6 +1116,149 @@ async fn wqa_writes_all_with_bufwritepre_then_quits() {
     assert_eq!(std::fs::read_to_string(&b).expect("read b"), "b2X\n");
 }
 
+// ----- quit/exit lifecycle: QuitPre / ExitPre / VimLeavePre / VimLeave -------
+
+/// Config installing an exit-lifecycle handler on each event. Every handler appends its
+/// event name to `_G.log`; the three gating `*Pre` handlers additionally return a promise
+/// and stash its resolver in `_G.res[event]`, so a test can release the exit one stage at a
+/// time and read `_G.log` at each checkpoint — deterministic, unlike observing the exit's
+/// final redraw (which races the connection teardown).
+const EXIT_LIFECYCLE_CONFIG: &str = "_G.log = {}\n\
+     _G.res = {}\n\
+     local function gate(name) return function()\n\
+     \x20 _G.log[#_G.log+1] = name\n\
+     \x20 return nx.promise.new(function(resolve) _G.res[name] = resolve end)\n\
+     end end\n\
+     local function rec(name) return function() _G.log[#_G.log+1] = name end end\n\
+     vim.api.nvim_create_autocmd('QuitPre', { callback = gate('QuitPre') })\n\
+     vim.api.nvim_create_autocmd('ExitPre', { callback = gate('ExitPre') })\n\
+     vim.api.nvim_create_autocmd('VimLeavePre', { callback = gate('VimLeavePre') })\n\
+     vim.api.nvim_create_autocmd('VimLeave', { callback = rec('VimLeave') })\n";
+
+/// The comma-joined exit-lifecycle log so far (see [`EXIT_LIFECYCLE_CONFIG`]).
+async fn exit_log(rpc: &Rpc) -> String {
+    exec_lua(rpc, "return table.concat(_G.log, ',')")
+        .await
+        .as_str()
+        .unwrap_or("")
+        .to_string()
+}
+
+/// Drain notifications until the editor exits — an `nxvim_exit` **or** a closed channel
+/// (the quit tears the connection down, and the close can beat the racing `nxvim_exit`) —
+/// returning `true`, or `false` on a 2s timeout (the editor stayed alive).
+async fn wait_for_exit(incoming: &mut UnboundedReceiver<Incoming>) -> bool {
+    let timeout = std::time::Duration::from_secs(2);
+    loop {
+        match tokio::time::timeout(timeout, incoming.recv()).await {
+            Ok(None) => return true,
+            Ok(Some(Incoming::Notification { method, .. })) if method == "nxvim_exit" => {
+                return true
+            }
+            Ok(Some(_)) => {}
+            Err(_) => return false,
+        }
+    }
+}
+
+#[tokio::test]
+async fn qa_gated_exit_lifecycle_fires_in_order() {
+    // A clean `:qa` fires QuitPre -> ExitPre -> VimLeavePre -> VimLeave in neovim order, and
+    // each `*Pre` is an *await gate*: the exit doesn't advance to the next event until the
+    // handler's promise settles. Walked one stage at a time by releasing each gate and
+    // reading the log — so both the order and the gating are asserted. Mutation-test: drop a
+    // stage's fire and its checkpoint reads wrong; make a stage non-gating and releasing a
+    // gate over-runs (or the editor exits before VimLeavePre).
+    let dir = temp_dir("au_qa_order");
+    let (rpc, mut incoming) = start_with_config(&dir, EXIT_LIFECYCLE_CONFIG).await;
+    // Fire-and-forget the quit; it parks on the QuitPre gate.
+    feed(&rpc, ":qa<CR>");
+    assert_eq!(
+        exit_log(&rpc).await,
+        "QuitPre",
+        "the exit parks on QuitPre first"
+    );
+    // Release each gate in turn; the next event fires and parks on its own gate.
+    feed(&rpc, ":lua _G.res.QuitPre(true)<CR>");
+    assert_eq!(
+        exit_log(&rpc).await,
+        "QuitPre,ExitPre",
+        "releasing QuitPre advances to ExitPre"
+    );
+    feed(&rpc, ":lua _G.res.ExitPre(true)<CR>");
+    assert_eq!(
+        exit_log(&rpc).await,
+        "QuitPre,ExitPre,VimLeavePre",
+        "releasing ExitPre advances to VimLeavePre"
+    );
+    // Releasing the last gate runs VimLeave and exits (VimLeave is fired in the same code
+    // step that sets `should_quit`, so the observed exit proves it fired).
+    feed(&rpc, ":lua _G.res.VimLeavePre(true)<CR>");
+    assert!(
+        wait_for_exit(&mut incoming).await,
+        "releasing VimLeavePre fires VimLeave and exits the editor"
+    );
+}
+
+#[tokio::test]
+async fn async_exit_handler_gates_the_quit_until_it_settles() {
+    // The core contract: an exit handler may return a promise and the quit *waits* for it —
+    // async flush/cleanup before quitting. While the ExitPre gate is unresolved the editor is
+    // still alive (a follow-up exec_lua answers) and VimLeavePre/VimLeave have NOT fired.
+    // Mutation-test: make the exit sequence non-gating and the editor exits immediately, so
+    // the exec_lua below fails (connection gone) instead of reading "QuitPre,ExitPre".
+    let dir = temp_dir("au_qa_gate");
+    let (rpc, mut incoming) = start_with_config(&dir, EXIT_LIFECYCLE_CONFIG).await;
+    feed(&rpc, ":qa<CR>");
+    feed(&rpc, ":lua _G.res.QuitPre(true)<CR>");
+    // Parked on the ExitPre gate: QuitPre + ExitPre fired, the editor is alive, and the
+    // sequence is holding VimLeavePre/VimLeave back.
+    assert_eq!(
+        exit_log(&rpc).await,
+        "QuitPre,ExitPre",
+        "the quit must park on the async ExitPre handler, still alive, before VimLeavePre"
+    );
+    // Releasing the remaining gates settles the sequence and the editor exits.
+    feed(&rpc, ":lua _G.res.ExitPre(true)<CR>");
+    feed(&rpc, ":lua _G.res.VimLeavePre(true)<CR>");
+    assert!(
+        wait_for_exit(&mut incoming).await,
+        "resolving the exit handlers releases the gate and the editor exits"
+    );
+}
+
+#[tokio::test]
+async fn bang_quit_fires_exit_sequence_past_e37() {
+    // `:qa!` skips only the E37 modified-buffer guard — it still fires the gated exit
+    // sequence, so a VimLeavePre flush / VimLeave cleanup runs on a force-quit too. The
+    // contrast is the assertion: a bare `:qa` on a modified buffer is *refused* (E37) and
+    // fires NO exit events, while `:qa!` fires them.
+    let dir = temp_dir("au_qa_bang");
+    let (rpc, mut incoming) = start_with_config(&dir, EXIT_LIFECYCLE_CONFIG).await;
+    // Dirty the buffer so a bare `:qa` is refused.
+    redraw_after(&rpc, &mut incoming, "ihi<Esc>").await;
+    feed(&rpc, ":qa<CR>");
+    assert_eq!(
+        exit_log(&rpc).await,
+        "",
+        "a bare `:qa` on a modified buffer is refused by E37 and fires no exit events"
+    );
+    // `:qa!` overrides E37 and begins the sequence (parks on the QuitPre gate).
+    feed(&rpc, ":qa!<CR>");
+    assert_eq!(
+        exit_log(&rpc).await,
+        "QuitPre",
+        "`:qa!` fires the exit sequence past the E37 guard"
+    );
+    feed(&rpc, ":lua _G.res.QuitPre(true)<CR>");
+    feed(&rpc, ":lua _G.res.ExitPre(true)<CR>");
+    feed(&rpc, ":lua _G.res.VimLeavePre(true)<CR>");
+    assert!(
+        wait_for_exit(&mut incoming).await,
+        "`:qa!` runs the full exit sequence to exit"
+    );
+}
+
 #[tokio::test]
 async fn bufwritepost_sees_the_written_buffer_as_unmodified() {
     // After a `:w`, the BufWritePost callback resolves the saved buffer via the

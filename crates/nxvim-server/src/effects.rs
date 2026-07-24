@@ -3587,6 +3587,14 @@ impl EditHost {
             // so the commit's completed-write (BufWritePost) is picked up by
             // `drain_write_events` below in the same round.
             self.drain_au_gate_done();
+            // The gated editor-exit sequence (`QuitPre` → `ExitPre` → `VimLeavePre` →
+            // `VimLeave` + `should_quit`): begin it when core committed a quit this
+            // convergence, and advance it as each gated handler settles (an async
+            // `ExitPre`/`VimLeavePre` resumes here once `drain_au_gate_done` above cleared its
+            // `exit_gate`). Ordered right after the gate drain so a same-tick settle advances
+            // the sequence in the same round. Sets `should_quit` at the end — the run loop's
+            // quit funnel breaks on it.
+            self.drive_exit();
             // Pre-write intents recorded this convergence (`:w` / `:wq`): fire (and
             // await) `BufWritePre` before committing each write, so a handler's buffer
             // mutation is what lands on disk. A write whose handlers settle synchronously
@@ -3943,6 +3951,11 @@ impl EditHost {
                 && !self.editor.has_pending_pre_writes()
                 && self.au_gate_done.is_empty()
                 && !self.editor.has_write_events()
+                // A quit committed *inside* this fixpoint (a deferred `:qa`, a `:wqa` replay)
+                // needs another round for `drive_exit` to consume the intent and begin the
+                // gated sequence; a *parked* sequence (waiting on an async handler) has already
+                // consumed it, so the loop breaks and resumes on the settle.
+                && !self.editor.has_exit_requested()
             {
                 break;
             }
@@ -3962,6 +3975,12 @@ impl EditHost {
                 self.editor.take_pending_checktime();
                 self.editor.take_pending_pre_writes();
                 self.au_gate_done.clear();
+                // Abandon any in-flight exit sequence too: a runaway handler shouldn't wedge
+                // the editor half-quit. It stays alive/responsive (E132 below); the user can
+                // re-issue `:qa!`.
+                self.exit_stage = None;
+                self.exit_gate = None;
+                self.editor.take_exit_requested();
                 self.editor.take_write_events();
                 self.scheduled.clear();
                 self.editor

@@ -773,6 +773,23 @@ enum WindowStatusline {
     Format,
 }
 
+/// One step of the gated editor-exit sequence (`QuitPre` → `ExitPre` → `VimLeavePre` →
+/// `VimLeave` + `should_quit`). Each variant names the event [`EditHost::drive_exit`] fires
+/// *next*; the three `*Pre` stages are **awaited** (a handler may return a promise), so the
+/// sequence can span ticks. `Leaving` is the terminal step — it fires the non-gated
+/// `VimLeave` and asks the run loop to break. See the field [`EditHost::exit_stage`].
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum ExitStage {
+    /// Fire `QuitPre` (gated) next — the first hook a quit reaches.
+    QuitPre,
+    /// Fire `ExitPre` (gated) next — "the editor is really leaving".
+    ExitPre,
+    /// Fire `VimLeavePre` (gated) next — the last chance to flush before shada is written.
+    VimLeavePre,
+    /// Fire `VimLeave` (non-gated) and set [`Editor::should_quit`] — the point of exit.
+    Leaving,
+}
+
 pub struct EditHost {
     editor: Editor,
     lua: LuaRuntime,
@@ -1208,6 +1225,20 @@ pub struct EditHost {
     /// gate is advanced — which may be mid-fixpoint (a synchronous commit) where a nested
     /// `run_command("qa")` shouldn't run. Set by `advance_quit_all_gate`, taken at the tail.
     quit_all_replay: Option<bool>,
+    /// The current stage of the gated editor-exit sequence, or `None` when not exiting.
+    /// Set from [`Editor::take_exit_requested`] (`ex_quit_all` committed a quit) and advanced
+    /// by [`drive_exit`](Self::drive_exit): each stage fires one gated event
+    /// (`QuitPre`/`ExitPre`/`VimLeavePre`), awaiting async handlers; the terminal `Leaving`
+    /// stage fires `VimLeave` and sets [`Editor::should_quit`]. A sequence whose handlers all
+    /// settle synchronously runs start-to-finish in one `run_pending` convergence.
+    exit_stage: Option<ExitStage>,
+    /// The `gate_id` the exit sequence is currently parked on: an `ExitPre`/`VimLeavePre`
+    /// (or `QuitPre`) handler returned a still-pending promise, so [`drive_exit`](Self::drive_exit)
+    /// stashed the stage's gate here and returned. `nx._au_gate_done(id)` lands the id in
+    /// [`Self::au_gate_done`]; [`drain_au_gate_done`](Self::drain_au_gate_done) recognizes it,
+    /// clears this, and re-drives the sequence. `None` when the current stage settled
+    /// synchronously (or between stages).
+    exit_gate: Option<u64>,
     /// The picker preview pane's read cache (Phase 3): the file last read for the
     /// preview, so moving the selection within the results — or simply re-projecting
     /// every frame — re-reads only when the selected row's target *path* changes.
@@ -1518,6 +1549,8 @@ impl EditHost {
             pending_gated_writes: HashMap::new(),
             next_gate_id: 0,
             au_gate_done: Vec::new(),
+            exit_stage: None,
+            exit_gate: None,
             quit_all_replay: None,
             picker_active: false,
             preview_cache: redraw::PreviewCache::default(),
@@ -3654,9 +3687,7 @@ where
             // Editor input / API calls from the UI client.
             message = incoming.recv() => {
                 let Some(message) = message else { break };
-                if host.on_client_message(message).await {
-                    break;
-                }
+                host.on_client_message(message).await;
             }
             // Replies from the language servers (initialize handshakes, published
             // diagnostics, server exits, log messages). Selecting here keeps the
@@ -3678,13 +3709,9 @@ where
             // failed): reload the grammar so open buffers re-highlight/indent, echo.
             Some(outcome) = install_events.recv() => host.on_installs(outcome, &mut install_events),
             // An off-tick `:w` finished on the daemon (the save path): finalize the
-            // buffer's saved-state and replay any deferred `:wq`/`:x` quit. The replayed
-            // quit can ask the editor to exit — the one non-input arm that can.
-            Some(done) = save_done_rx.recv() => {
-                if host.on_save_dones(done, &mut save_done_rx) {
-                    break;
-                }
-            }
+            // buffer's saved-state and replay any deferred `:wq`/`:x` quit. A replayed quit
+            // may ask the editor to exit — caught by the post-`select!` quit funnel below.
+            Some(done) = save_done_rx.recv() => host.on_save_dones(done, &mut save_done_rx),
             // An off-tick `:cd` finished on the daemon (`fs_chdir`): install the resolved
             // canonical dir into `DirState` (or echo its `E344`). Idle for a local session,
             // where `:cd` resolves synchronously.
@@ -3701,6 +3728,14 @@ where
                 let status = *daemon_status_rx.borrow_and_update();
                 host.on_daemon_status(status);
             }
+        }
+        // Single quit funnel: whichever arm just ran may have completed the (possibly async)
+        // gated exit sequence — a `:qa` typed at the client, its `:wqa` write batch acking,
+        // or a timer settling an `ExitPre`/`VimLeavePre` handler's promise. Check once, here,
+        // so the break doesn't depend on which arm the settle happened to land on. `quitting`
+        // notifies the client (`nxvim_exit`) exactly once before we break.
+        if host.quitting() {
+            break;
         }
     }
     // The loop has exited (quit or client disconnect): flush the final snapshot to

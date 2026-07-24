@@ -5,7 +5,7 @@
 #[cfg(feature = "native")]
 use crate::evloop::LoopCommand;
 use crate::filetype_of;
-use crate::{EditHost, WindowRect};
+use crate::{EditHost, ExitStage, WindowRect};
 #[cfg(feature = "native")]
 use crate::{FsRead, WatchEvent, INTERNAL_WATCH_BASE};
 use nxvim_core::{
@@ -1471,7 +1471,12 @@ impl EditHost {
         }
         let mut committed_any = false;
         for id in std::mem::take(&mut self.au_gate_done) {
-            if let Some(pw) = self.pending_gated_writes.remove(&id) {
+            if self.exit_gate == Some(id) {
+                // An exit-sequence gate settled (an async `ExitPre`/`VimLeavePre`/`QuitPre`
+                // handler's promises all resolved): clear the park so `drive_exit` — next in
+                // the fixpoint — advances to the following stage.
+                self.exit_gate = None;
+            } else if let Some(pw) = self.pending_gated_writes.remove(&id) {
                 let outcome = self.editor.commit_pre_write(pw);
                 self.apply_commit_outcome(outcome);
                 committed_any = true;
@@ -1480,6 +1485,104 @@ impl EditHost {
         if committed_any {
             self.reseed_cur_snapshot();
         }
+    }
+
+    /// Drive the gated editor-exit sequence to the next point it must wait — or to the exit
+    /// itself. Begins when core commits a quit ([`Editor::take_exit_requested`], set by
+    /// `ex_quit_all` once its `E37` guard passes or `!` bypasses it); thereafter each call
+    /// fires the current stage's event and either advances (its handlers settled
+    /// synchronously) or parks on [`exit_gate`](Self::exit_gate) (a handler returned a pending
+    /// promise) and returns, so the fixpoint waits for the async settle. The three `*Pre`
+    /// stages are **awaited** — an `ExitPre`/`VimLeavePre` handler can flush/clean up
+    /// asynchronously before the editor leaves; the terminal `Leaving` stage fires the
+    /// non-gated `VimLeave` and sets [`Editor::should_quit`], which the run loop's quit funnel
+    /// then acts on. A quit whose handlers all settle synchronously (the common case — no
+    /// handlers at all) runs start-to-finish in one convergence, so `:qa!` still exits on the
+    /// same tick. Called inside [`run_pending`](EditHost::run_pending)'s fixpoint (after
+    /// [`drain_au_gate_done`](Self::drain_au_gate_done), so a just-settled gate resumes here).
+    pub(crate) fn drive_exit(&mut self) {
+        // A quit committed this convergence begins the sequence. Only `ex_quit_all` sets the
+        // flag, and a re-entrant `:qa` fired *by* an exit handler finds `exit_stage` already
+        // `Some`, so the flag it set is simply consumed and ignored — no restart, no cancel.
+        if self.exit_stage.is_none() && self.editor.take_exit_requested() {
+            self.exit_stage = Some(ExitStage::QuitPre);
+        }
+        // Never fire the next stage while a prior stage's gate is still pending (a safety
+        // net — `drain_au_gate_done` clears `exit_gate` before calling us on resume).
+        if self.exit_gate.is_some() {
+            return;
+        }
+        // Advance as far as possible, stopping at the first `*Pre` stage that parks on an
+        // async handler or at the exit. Each stage is advanced to `next` *before* its event
+        // is fired, so a parked (async) handler resumes at the following stage rather than
+        // re-firing the one that parked.
+        while let Some(stage) = self.exit_stage {
+            let (event, next) = match stage {
+                ExitStage::QuitPre => ("QuitPre", ExitStage::ExitPre),
+                ExitStage::ExitPre => ("ExitPre", ExitStage::VimLeavePre),
+                ExitStage::VimLeavePre => ("VimLeavePre", ExitStage::Leaving),
+                ExitStage::Leaving => {
+                    // The final hook, fire-and-forget (the editor is leaving — nothing awaits
+                    // it). It fires just *before* the native tail's `shada_flush_final`, not
+                    // after as in neovim: this keeps the sequence uniform with the wasm build
+                    // (whose shada flush is JS-driven on `beforeunload`, with no "after shada"
+                    // Rust hook), and is harmless — `VimLeave` is post-persist cleanup, so the
+                    // shada-relevant `VimLeavePre` above still runs before the write.
+                    self.fire_vim_leave();
+                    self.exit_stage = None;
+                    self.editor.should_quit = true;
+                    return;
+                }
+            };
+            self.exit_stage = Some(next);
+            if !self.fire_exit_event_gated(event) {
+                return; // parked on an async handler; `drain_au_gate_done` resumes us
+            }
+        }
+    }
+
+    /// Fire one gated exit event (`QuitPre`/`ExitPre`/`VimLeavePre`) for the current buffer
+    /// and report whether it settled **synchronously**. `true` ⇒ every handler resolved with
+    /// no pending promise, so [`drive_exit`](Self::drive_exit) advances at once; `false` ⇒ a
+    /// handler returned a pending promise — the gate is parked in [`exit_gate`](Self::exit_gate)
+    /// and cleared by [`drain_au_gate_done`](Self::drain_au_gate_done) once
+    /// `nx._au_gate_done(gate_id)` fires. A throwing handler is reported and treated as settled
+    /// (a broken cleanup handler must not wedge the quit), matching the `BufWritePre` gate.
+    fn fire_exit_event_gated(&mut self, event: &str) -> bool {
+        let buf = self.editor.current_buffer_id();
+        let file = self.editor.buffer_name(buf).unwrap_or_default();
+        let ft = filetype_of(self.editor.buffer().path.as_deref()).unwrap_or("");
+        let _ = self.lua.set_buf_snapshot(buf.0, &file, ft);
+        self.push_buf_mirror();
+        let gate_id = self.next_gate_id;
+        self.next_gate_id += 1;
+        let settled = match self
+            .lua
+            .fire_autocmd_buf_gated(event, &file, buf.0, &file, gate_id)
+        {
+            Ok(sync_settled) => sync_settled,
+            Err(e) => {
+                self.report_autocmd_err(event, Err::<(), _>(e));
+                true
+            }
+        };
+        // A handler's synchronous effects (an echo, a `vim.cmd`) land now; an async handler's
+        // `:next` continuation runs a tick later via `on_loop_event` → `run_pending`.
+        self.apply_lua_effects();
+        if !settled {
+            self.exit_gate = Some(gate_id);
+        }
+        settled
+    }
+
+    /// Fire the non-gated `VimLeave` for the current buffer — the last autocmd before the
+    /// editor exits. A handler's returned promise is tracked (surfaced on rejection) but not
+    /// awaited: there's nothing left to block for. Driven from
+    /// [`drive_exit`](Self::drive_exit)'s terminal stage.
+    fn fire_vim_leave(&mut self) {
+        let buf = self.editor.current_buffer_id();
+        let file = self.editor.buffer_name(buf).unwrap_or_default();
+        self.fire_lifecycle("VimLeave", &file, buf, &file);
     }
 
     /// Route a [`CommitOutcome`] to the `:wqa` quit gate: a synchronous commit advances

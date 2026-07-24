@@ -39,18 +39,20 @@ use crate::{EditHost, InstallOutcome};
 const TERM_BATCH_BYTES: usize = 256 * 1024;
 
 impl EditHost {
-    /// Apply one client message (an `nvim_*` request or notification), then report whether
-    /// it asked the editor to quit. The run loop breaks on `true`.
-    pub(crate) async fn on_client_message(&mut self, message: Incoming) -> bool {
+    /// Apply one client message (an `nvim_*` request or notification). Whether it asked the
+    /// editor to quit is decided by the run loop's single post-`select!` [`quitting`](Self::quitting)
+    /// funnel, not here — a quit may complete *asynchronously* (an `ExitPre`/`VimLeavePre`
+    /// handler awaiting a promise) on a later tick driven by a different arm, so no one arm
+    /// owns the break.
+    pub(crate) async fn on_client_message(&mut self, message: Incoming) {
         self.handle(message).await;
-        if self.quitting() {
-            return true;
-        }
         // Re-arm the debounced shada checkpoint after each message, so a crash loses at
-        // most that window rather than the whole session (Phase 5). Skipped when quitting
-        // — the clean-exit flush handles that case.
-        self.arm_shada_checkpoint();
-        false
+        // most that window rather than the whole session (Phase 5). Skipped once a quit is
+        // committed (`should_quit`, or mid-flight through the gated exit sequence) — the
+        // clean-exit flush handles that case.
+        if !self.editor.should_quit && self.exit_stage.is_none() {
+            self.arm_shada_checkpoint();
+        }
     }
 
     /// Coalesce a burst of language-server events (initialize handshakes, published
@@ -136,19 +138,15 @@ impl EditHost {
 
     /// Coalesce a burst of finished off-tick writes (the daemon save path): finalize each
     /// buffer's saved-state, echo `written`, and replay any deferred `:wq` / `:x` quit,
-    /// then settle. Reports whether a replayed quit asked the editor to exit (the one
-    /// non-input arm that can) — the run loop breaks on `true`.
-    pub(crate) fn on_save_dones(
-        &mut self,
-        first: SaveDone,
-        rx: &mut UnboundedReceiver<SaveDone>,
-    ) -> bool {
+    /// then settle. A replayed quit may ask the editor to exit — the run loop's single
+    /// post-`select!` [`quitting`](Self::quitting) funnel picks that up (the exit may also be
+    /// mid-flight through the gated `ExitPre`/`VimLeavePre` sequence).
+    pub(crate) fn on_save_dones(&mut self, first: SaveDone, rx: &mut UnboundedReceiver<SaveDone>) {
         self.apply_save_done(first);
         while let Ok(done) = rx.try_recv() {
             self.apply_save_done(done);
         }
         self.settle_events(true);
-        self.quitting()
     }
 
     /// Coalesce a burst of terminal events (a `:terminal` child's output / exit) into
@@ -275,10 +273,13 @@ impl EditHost {
         self.apply_daemon_phase(phase, reconnected);
     }
 
-    /// If the editor asked to quit, notify the client (`nxvim_exit`) and report `true` so
-    /// the run loop breaks. The single funnel both quit-capable arms (client input, the
-    /// off-tick save ack) check, so the exit notification lives in exactly one place.
-    fn quitting(&mut self) -> bool {
+    /// If the editor has asked to quit ([`Editor::should_quit`], set by the gated exit
+    /// sequence once its `ExitPre`/`VimLeavePre` handlers have all settled), notify the
+    /// client (`nxvim_exit`) and report `true` so the run loop breaks. The run loop checks
+    /// this **once per `select!` iteration**, after whichever arm ran — because a quit can
+    /// complete *asynchronously* (a handler awaiting a promise), the settling arm is not
+    /// necessarily the input/save arm that started it, so no single arm can own the break.
+    pub(crate) fn quitting(&mut self) -> bool {
         if self.editor.should_quit {
             self.fx.notify("nxvim_exit", vec![]);
             true

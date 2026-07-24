@@ -18,10 +18,13 @@ exact compare — so a `FileType rust` autocmd never glob-matches a path.
 
 **Handlers may be async.** A `callback` can return a promise (`nx.promise`, or the
 result of an `nx.*` async call). Most events are fire-and-forget — the promise simply
-runs in the background and the editor does not wait. One event is **awaited**:
-`BufWritePre` holds the write until every handler's promise settles, so an async
-format-on-save works (see [Writing](#writing)). A returned promise is never dropped; a
-rejection surfaces the same way an unhandled `nx.promise` rejection does.
+runs in the background and the editor does not wait. A few events are **awaited**: the
+write holds on `BufWritePre` until every handler's promise settles (so an async
+format-on-save works — see [Writing](#writing)), and the editor exit holds on `QuitPre`
+/ `ExitPre` / `VimLeavePre` until they settle (so an async flush/cleanup runs before the
+process leaves — see [Quitting & exit](#quitting--exit)). A returned promise is never
+dropped; a rejection surfaces the same way an unhandled `nx.promise` rejection does,
+named for the event that raised it.
 
 ## Buffer lifecycle
 
@@ -100,6 +103,25 @@ no autocmd listens for them they cost nothing.
 | Event | When it fires | Notes |
 | --- | --- | --- |
 | `VimEnter` | Once, after the editor has finished starting (config sourced, first frame imminent). | `vim.v.vim_did_enter` is `1` from this point on. The built-in plugin manager's first-run prompt hooks it. |
+
+## Quitting & exit
+
+Fired when the editor is really leaving — a committed `:qa` / last-window `:q` / `:wq` /
+`:x` / `:wqa` (`!` skips only the modified-buffer `E37` guard, not these events). The
+three `*Pre` events are **awaited**: a handler may return a promise and the exit waits
+for every handler to settle before advancing, so an async flush/cleanup runs before the
+process leaves. They fire in order.
+
+| Event | When it fires | Notes |
+| --- | --- | --- |
+| `QuitPre` | First, once the quit is committed (the `E37` guard has passed or `!` bypassed it). | **Awaited.** A handler's returned promise holds the exit until it settles. Unlike neovim, `QuitPre` does not fire when `:q` merely closes one of several windows (the editor keeps running) — only on the real editor exit. |
+| `ExitPre` | After `QuitPre` settles — "the editor is really leaving". | **Awaited.** The natural place for an async flush before quitting. |
+| `VimLeavePre` | After `ExitPre` settles — the last hook before session state (shada) is written. | **Awaited.** Modify anything you want persisted from here. |
+| `VimLeave` | After `VimLeavePre` settles, immediately before the editor exits. | **Not** awaited (nothing remains to wait for) — a returned promise is tracked but the exit does not block on it. Post-cleanup only. |
+
+A handler cannot *cancel* the quit (these events are advisory, as in neovim), and a
+handler whose promise *rejects* does not block the exit — a failing cleanup still lets
+the editor leave.
 
 ## Plugins
 

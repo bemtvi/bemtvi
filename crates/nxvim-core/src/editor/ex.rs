@@ -2613,7 +2613,7 @@ impl Editor {
     /// user sees what's blocking the quit. With no modified buffers, exit.
     fn ex_quit_all(&mut self, bang: bool) {
         if bang {
-            self.should_quit = true;
+            self.request_exit();
             return;
         }
         let cur = self.current_buffer_id();
@@ -2640,8 +2640,34 @@ impl Editor {
                     id.0
                 ));
             }
-            None => self.should_quit = true,
+            None => self.request_exit(),
         }
+    }
+
+    /// Commit the *intent* to quit the editor: the gated exit sequence
+    /// (`QuitPre`/`ExitPre`/`VimLeavePre` → `VimLeave` → [`should_quit`](Self::should_quit))
+    /// is driven server-side, since the core can't re-enter Lua to fire the events. The
+    /// `E37` guard has already passed by the time this is called (or `!` bypassed it), so
+    /// this is the point of no return — a handler can flush/clean up asynchronously, but
+    /// can't cancel. See [`take_exit_requested`](Self::take_exit_requested).
+    fn request_exit(&mut self) {
+        self.exit_requested = true;
+    }
+
+    /// Take the pending editor-exit intent (`true` once, then cleared) — the server's
+    /// signal to begin the gated exit sequence. Distinct from [`should_quit`](Self::should_quit),
+    /// which the server sets only *after* the sequence's handlers have all settled.
+    pub fn take_exit_requested(&mut self) -> bool {
+        std::mem::take(&mut self.exit_requested)
+    }
+
+    /// Whether an editor-exit intent is pending (a non-consuming peek at
+    /// [`take_exit_requested`](Self::take_exit_requested)). The server's `run_pending` keeps
+    /// its fixpoint alive on this so a `:qa` that lands *inside* the loop (a deferred command,
+    /// a `:wqa` replay) gets a further round to begin the exit sequence rather than the loop
+    /// breaking with the intent still unconsumed.
+    pub fn has_exit_requested(&self) -> bool {
+        self.exit_requested
     }
 
     /// The lowest-numbered buffer whose unsaved changes would actually be **lost** on

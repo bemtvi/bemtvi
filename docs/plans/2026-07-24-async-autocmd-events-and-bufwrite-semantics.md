@@ -234,8 +234,75 @@ PCRE form.
 5. Update the memory `editorconfig-builtin-and-bufwritepre-gotcha` — the gotcha is
    fixed; `trim_trailing_whitespace` / `insert_final_newline` are now reachable.
 
+---
+
+## Phase 4 — "all events async-aware", finished: non-gating tracking + quit/exit gating
+
+Two gaps flagged in review of Phases 1–3:
+
+1. **Non-gating events are async-tolerant but that was untested.** Every event other than
+   `BufWritePre` returns from its fire without awaiting a handler's promise; the async work
+   still runs (the promise stays alive via its own timer/loop registration), and a rejection
+   surfaces via the generic unhandled-rejection reporter. Fixed + tested in **4a** (shipped):
+   `nx._fire` now *explicitly* tracks each handler's return — a promise gets a `:catch` that
+   surfaces the rejection on the message line **named for the event** ("autocmd `<Event>`
+   handler rejected: …"). Two tests (`non_gating_event_async_handler_runs_in_background`,
+   `non_gating_event_async_rejection_surfaces`, mutation-tested).
+
+2. **No *gating* quit/exit event existed.** The events that should be able to block the
+   editor exit on async work — `QuitPre` / `ExitPre` / `VimLeavePre` (async flush/cleanup
+   before quitting) — didn't exist. **4b** (this phase) adds them + `VimLeave`.
+
+### 4b design — the gated exit sequence
+
+Events fire on the real editor-exit path (a committed `:qa` / `:q` on the last window /
+`:wq` / `:x` / `:wqa`). `QuitPre` → `ExitPre` → `VimLeavePre` are **gated**: a handler may
+return a promise and the exit awaits every handler (`nx.promise.all_settled`) before
+advancing — the same await machinery `BufWritePre` uses (`nx._fire_gated` + `gate_id` +
+`nx._au_gate_done` → `au_gate_done`). `VimLeave` is the final non-gated notification.
+
+- **Core** (`nxvim-core`): `Editor::exit_requested` + `request_exit()` / `take_exit_requested()`.
+  `ex_quit_all`'s two `should_quit = true` sites become `request_exit()`. The `E37`
+  modified-buffer guard is unchanged — it still runs *before* the sequence, so a refused
+  `:qa` fires no exit events (a deliberate simplification over neovim, which fires
+  QuitPre/ExitPre *before* the check; nxvim only fires them once the quit is committed).
+- **Server** (shared `effects.rs` / `lifecycle.rs`, so native **and** wasm get it):
+  `exit_stage` (`QuitPre`/`ExitPre`/`VimLeavePre`/`Leaving`) + `exit_gate: Option<u64>`.
+  `drive_exit()` — driven in the `run_pending` fixpoint — begins on `take_exit_requested()`,
+  fires each stage gated, parks on `exit_gate` when a handler is pending, and at `Leaving`
+  fires `VimLeave` then sets `should_quit`. `drain_au_gate_done` recognizes the exit gate id
+  (clears `exit_gate`, re-drives) alongside the write gates. A sequence with no async
+  handlers settles synchronously in one convergence — `:qa!` still exits on the same tick.
+- **Native run loop**: the quit funnel is unified — `quitting()` is checked *once* after the
+  `select!`, so an async exit that completes on **any** arm (a timer settling a `VimLeavePre`
+  promise, an LSP/fs settle) breaks the loop, not just the input / save-done arms.
+  `on_client_message` / `on_save_dones` no longer call `quitting()` themselves.
+- **Ordering note**: `VimLeave` fires from `drive_exit` (before `should_quit`), i.e. just
+  *before* the native tail's `shada_flush_final`, rather than after it as in neovim. This
+  keeps the sequence uniform across native + wasm (wasm's shada flush is JS-driven on
+  `beforeunload`, with no "after shada" Rust hook) and is harmless — `VimLeave` is
+  last-cleanup, shada-order-independent. `VimLeavePre` (the shada-relevant one) still fires
+  before the flush.
+
+### 4b tests
+
+- `qa_fires_quitpre_exitpre_vimleavepre_vimleave_in_order` — a clean `:qa` fires all four in
+  neovim order (recorded into a global, read back before the connection tears down).
+- `async_exitpre_handler_defers_the_quit` — an `ExitPre`/`VimLeavePre` handler that returns
+  `nx.promise.delay(ms):next(...)` blocks the exit until it settles; mutation-tested (the
+  editor must *not* have exited before the promise resolved).
+- `vimleave_still_fires_on_bang_quit` — `:qa!` fires the sequence too (bang skips only E37).
+- Verify `--no-default-features` compiles and a wasm-eligible test still passes.
+
 ## Out of scope (note, don't silently drop)
 
 - `BufWriteCmd` (a handler *claiming* the whole write) — a natural follow-on to the
   async-claim generalization, but not required here.
 - `textwidth`/`max_line_length` editorconfig key (no `textwidth` option exists yet).
+- Per-window `QuitPre` on a non-exiting `:q` (closing one of several windows). neovim fires
+  it there too, but the core can't re-enter Lua mid-command to fire before the synchronous
+  window close, and no current plugin needs it — QuitPre fires on the editor-exit path only.
+- An `ExitPre`/`VimLeavePre` handler that *cancels* the quit, or that saves a buffer to clear
+  the `E37` block (the check already ran). neovim's events are advisory too; nxvim's don't
+  cancel.
+- `v:exitreason` / `v:exiting` vim vars (neovim sets them around these events).

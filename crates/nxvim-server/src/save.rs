@@ -127,7 +127,8 @@ impl EditHost {
     /// deferred `:wq` / `:x` quit, and dispatch the next queued write for that buffer.
     /// On failure, surface it loudly and **fail the buffer's whole queue** — a later
     /// snapshot must never silently stand in for a write that didn't land. A replayed
-    /// quit may set `should_quit`; the `select!` arm checks it after this returns.
+    /// quit begins the gated exit sequence; the run loop's post-`select!` quit funnel breaks
+    /// once it completes (which may be a later tick, if an exit handler awaits a promise).
     pub(crate) fn apply_save_done(&mut self, done: SaveDone) {
         let SaveDone {
             save,

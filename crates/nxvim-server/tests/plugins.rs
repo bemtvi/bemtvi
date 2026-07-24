@@ -1632,3 +1632,106 @@ async fn eager_local_dir_plugin_sources_plugin_scripts_once() {
         "an eager local-dir plugin's plugin/ script must be sourced exactly once",
     );
 }
+
+// ----- PluginsLoaded: fires once after every eager plugin has settled --------
+
+// `PluginsLoaded` is the "all my non-lazy plugins are ready" hook. It fires once,
+// after every eager plugin's config — including an ASYNC config that `nx.await`s — has
+// run to completion. The realistic flow: a config's `init.lua` registers the handler
+// AND declares its plugins (so both happen before the startup `VimEnter`), then the
+// handler fires once the eager loads settle. It snapshots whether the async config had
+// finished when it fired — proving "settled", not merely "load started".
+#[tokio::test]
+async fn plugins_loaded_event_fires_after_all_eager_settle() {
+    let base = temp_dir("plug_allloaded");
+
+    // A local plugin dir whose module init.lua has real content (the async config reads
+    // it, so the config only settles a few ticks after the load starts).
+    let plugin_dir = base.join("sigma");
+    std::fs::create_dir_all(plugin_dir.join("lua").join("sigma")).unwrap();
+    std::fs::write(
+        plugin_dir.join("lua").join("sigma").join("init.lua"),
+        "return { marker = true }\n",
+    )
+    .unwrap();
+    let sigma_init = plugin_dir.join("lua").join("sigma").join("init.lua");
+
+    let config = base.join("config");
+    std::fs::create_dir_all(&config).unwrap();
+    std::fs::write(
+        config.join("init.lua"),
+        format!(
+            "nx.on(\"PluginsLoaded\", {{}}, function()\n\
+               _G.all_loaded = true\n\
+               _G.cfg_done_at_fire = _G.sigma_cfg == true\n\
+             end)\n\
+             nx.plugins {{ {{ name = \"sigma\", dir = \"{dir}\", config = function()\n\
+               local txt = nx.await(nx.fs.read_text(\"{f}\"))\n\
+               _G.sigma_cfg = #txt > 0\n\
+             end }} }}\n",
+            dir = q(&plugin_dir),
+            f = q(&sigma_init)
+        ),
+    )
+    .unwrap();
+
+    let init = ServerInit {
+        config_dir: Some(config.clone()),
+        runtimepath: vec![config.clone()],
+        ..Default::default()
+    };
+    let (rpc, _incoming) = start_attached(init, 80, 24).await;
+
+    assert!(
+        poll_true(&rpc, "return _G.all_loaded == true").await,
+        "PluginsLoaded should fire after the eager plugin loads"
+    );
+    assert_eq!(
+        lua_bool(&rpc, "return _G.cfg_done_at_fire == true").await,
+        Some(true),
+        "PluginsLoaded must fire only after the async config had settled"
+    );
+}
+
+// ----- PluginLoaded: per-plugin, fires when a specific plugin loads -----------
+
+// `PluginLoaded` lets a config hook a SPECIFIC plugin's load — including a lazy one,
+// which loads only when its trigger fires. The event's `pattern` is the plugin name
+// (so an `nx.on("PluginLoaded", { pattern = name }, …)` handler targets just that one)
+// and `args.data.name` carries it too.
+#[tokio::test]
+async fn plugin_loaded_event_fires_per_plugin_including_lazy() {
+    let (rpc, _i) = start().await;
+    let src = temp_dir("plug_perload");
+    let repo = make_repo(&src, "omega");
+    setup_root(&rpc, "plug_perload").await;
+
+    // A local `dir` plugin (no clone) made lazy by a `cmd` trigger.
+    exec_lua(
+        &rpc,
+        &format!(
+            "nx.on(\"PluginLoaded\", {{ pattern = \"omega\" }}, function(ev)\n\
+               _G.omega_evt = ev.data and ev.data.name or ev.match\n\
+             end)\n\
+             nx.plugins {{ {{ name = \"omega\", dir = \"{dir}\", cmd = \"OmegaGo\",\n\
+               config = function() require(\"omega\").setup() end }} }}",
+            dir = q(&repo)
+        ),
+    )
+    .await;
+
+    // Lazy: not loaded, so the per-plugin event has not fired yet.
+    assert_eq!(
+        lua_bool(&rpc, "return _G.omega_evt == nil").await,
+        Some(true),
+        "a lazy plugin must not fire PluginLoaded before its trigger"
+    );
+
+    // Invoke the command that lazy-loads it.
+    exec_lua(&rpc, "vim.cmd('OmegaGo')").await;
+
+    assert!(
+        poll_true(&rpc, "return _G.omega_evt == \"omega\"").await,
+        "PluginLoaded should fire carrying the plugin name when the lazy plugin loads"
+    );
+}

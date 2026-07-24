@@ -1,0 +1,25 @@
+Plugin lifecycle events demo
+============================
+
+This config (examples/plugin-events/init.lua) declares three local-dir plugins and
+hooks the two events the built-in plugin manager fires:
+
+  PluginsLoaded  — once, after ALL eager (non-lazy) plugins have loaded and settled
+                   (including an async config awaited to completion).
+  PluginLoaded   — each time one plugin finishes loading; pattern = the plugin name,
+                   so you can target a single (even lazy) plugin.
+
+Try this:
+
+  1. On startup you should already see a "PluginsLoaded: eager plugins ready" notice.
+     Confirm both eager configs ran:
+         :lua print(_G.alpha_ready, _G.beta_ready, _G.alpha_bytes)
+     → prints:  true  true  <a number>
+
+  2. gamma is LAZY (nothing loaded it yet):
+         :lua print(_G.gamma_ready)     → prints:  nil
+
+  3. Trigger gamma's lazy load:
+         :GammaHello
+     → you'll see gamma's own greeting AND a "PluginLoaded: 'gamma' just loaded" notice.
+         :lua print(_G.gamma_ready)     → now prints:  true

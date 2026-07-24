@@ -89,3 +89,12 @@ no autocmd listens for them they cost nothing.
 | Event | When it fires | Notes |
 | --- | --- | --- |
 | `VimEnter` | Once, after the editor has finished starting (config sourced, first frame imminent). | `vim.v.vim_did_enter` is `1` from this point on. The built-in plugin manager's first-run prompt hooks it. |
+
+## Plugins
+
+Fired by the built-in plugin manager (`nx.plugins`). See [Writing nxvim plugins](plugin-authoring.md).
+
+| Event | When it fires | Notes |
+| --- | --- | --- |
+| `PluginsLoaded` | Once, after **every eager (non-lazy) plugin declared by your config has fully loaded and settled** — its `plugin/` scripts sourced and its `config` run, an async `config` awaited to completion. Gated on `VimEnter`, so it never fires before startup finishes. | The "all my plugins are ready" hook — run setup that depends on several eager plugins here. Fires once; a plugin a later `:PluginSync` installs still emits its own `PluginLoaded` but does not re-fire this. Lazy plugins are **not** waited for. |
+| `PluginLoaded` | Each time **any one plugin** finishes loading — eager at startup, or lazy the moment its `cmd`/`event`/`ft`/`keys` trigger loads it. | `match` (and `data.name`) is the plugin name, so `nx.on("PluginLoaded", { pattern = "my-plugin" }, …)` hooks just that plugin's load. |

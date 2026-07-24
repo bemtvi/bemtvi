@@ -29,6 +29,11 @@ M._order = M._order or {} -- declaration order (names), for deterministic sync
 M._loaded = M._loaded or {} -- name -> true once fully loaded (config ran)
 M._loading = M._loading or {} -- name -> true while a load is in flight (cycle guard)
 
+-- The startup "all my non-lazy plugins are ready" signal — see `maybe_fire_plugins_loaded`.
+M._eager_pending = M._eager_pending or 0 -- eager (non-lazy) loads currently in flight
+M._plugins_loaded_fired = M._plugins_loaded_fired or false -- `PluginsLoaded` fired once
+M._vim_entered = M._vim_entered or false -- the startup point (VimEnter) has passed
+
 -- The SYSTEM-PLUGIN TIER: `name -> { name = , dir = }` for plugins the client seeds into
 -- every session (before `init.lua`), plus any promoted at runtime via `M.system` / `M.promote`.
 -- Kept SEPARATE from `M._specs`/`M._order` so the managed verbs (sync/update/clean) never
@@ -427,6 +432,12 @@ function M.load(name)
     end
     M._loaded[name] = true
     notify_change() -- a UI watching load state repaints this plugin as loaded
+    -- Per-plugin "this one finished loading" hook: fires for eager AND lazy plugins
+    -- (both route through here), the moment the plugin — its `plugin/` scripts and
+    -- `config`, async config awaited above — is fully ready. The event's `pattern`
+    -- is the plugin name (so `nx.on("PluginLoaded", { pattern = name }, …)` targets
+    -- one), and `args.data.name` carries it too.
+    nx.autocmd.exec("PluginLoaded", { pattern = name, data = { name = name } })
     return true
   end)()
   -- The in-flight guard must drop on EVERY exit — success, "not installed", a
@@ -510,6 +521,24 @@ local function arm_lazy(spec)
   end
 end
 
+-- Fire `PluginsLoaded` exactly once, when every eager (non-lazy) plugin that began
+-- loading at startup has settled AND the startup point (`VimEnter`) has passed. This
+-- is the "all my plugins are ready" hook a config taps to run *after* every eager
+-- plugin's `config` — an async config is awaited before its load counts as settled
+-- (see `M.load`), so this waits on those too. Gated on `VimEnter` so the transient
+-- moments the pending count touches zero *between* successive `nx.plugins{…}` calls
+-- during config sourcing don't fire it early; by `VimEnter` every config-declared
+-- spec is registered. It fires once — an eager plugin a later `:PluginSync` installs
+-- still emits its own per-plugin `PluginLoaded`, but does not re-fire this.
+local function maybe_fire_plugins_loaded()
+  if M._plugins_loaded_fired or not M._vim_entered or M._eager_pending > 0 then
+    return
+  end
+  M._plugins_loaded_fired = true
+  nx.autocmd.exec("PluginsLoaded", {})
+end
+nx._maybe_fire_plugins_loaded = maybe_fire_plugins_loaded
+
 -- Load every enabled, eager (non-lazy), already-installed plugin that is not yet
 -- loaded — at startup and again after a sync brings new ones onto disk.
 local function activate_eager()
@@ -522,6 +551,8 @@ local function activate_eager()
       -- (Balanced by the `:finally` below, whichever way the load resolves.) See
       -- `nx._maybe_collapse_view_restores`.
       nx._view_restore_pending_loads = (nx._view_restore_pending_loads or 0) + 1
+      -- Same in-flight accounting for the `PluginsLoaded` signal (fired when this hits 0).
+      M._eager_pending = M._eager_pending + 1
       nx.async(function()
         if spec.dir ~= nil or nx.await(lfs.exists(spec._dir)) then
           nx.await(M.load(name))
@@ -535,6 +566,8 @@ local function activate_eager()
           if nx._maybe_collapse_view_restores then
             nx._maybe_collapse_view_restores()
           end
+          M._eager_pending = math.max(0, M._eager_pending - 1)
+          maybe_fire_plugins_loaded()
         end)
     end
   end
@@ -1278,6 +1311,11 @@ end, { desc = "List declared plugins and their install/load state (nx.plugins.st
 -- server after init.lua + plugin scripts), run the bootstrap — it self-gates to a
 -- truly fresh setup with a recommended set and only ever asks once.
 nx.on("VimEnter", {}, function()
+  -- The startup point has passed: every eager plugin declared by the config is now
+  -- registered, so `PluginsLoaded` may fire as soon as their loads settle (now, if
+  -- they already have).
+  M._vim_entered = true
+  maybe_fire_plugins_loaded()
   M.bootstrap()
 end)
 

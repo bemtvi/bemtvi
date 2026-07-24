@@ -460,7 +460,8 @@ end
 -- list of events) manually. `opts.pattern` (string or list) is matched as in
 -- registration; `opts.buffer` supplies the buffer context (defaulting to the
 -- current snapshot buffer), and the callback's `args.file` is the snapshot name
--- when firing for it.
+-- when firing for it. `opts.data` is an arbitrary payload delivered to each handler
+-- as `args.data` (e.g. `nx.autocmd.exec("User", { pattern = "MyEvent", data = … })`).
 function nx.autocmd.exec(event, opts)
   opts = opts or {}
   local events = type(event) == "table" and event or { event }
@@ -473,13 +474,14 @@ function nx.autocmd.exec(event, opts)
     file = nx._cur_buf.name
   end
   local patterns = opts.pattern
+  local data = opts.data
   for _, ev in ipairs(events) do
     if type(patterns) == "table" then
       for _, p in ipairs(patterns) do
-        nx._fire(ev, p, buf, file)
+        nx._fire(ev, p, buf, file, data)
       end
     else
-      nx._fire(ev, patterns, buf, file)
+      nx._fire(ev, patterns, buf, file, data)
     end
   end
 end

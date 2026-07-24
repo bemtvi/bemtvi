@@ -63,6 +63,11 @@ pub struct InstallReport {
     pub inherited: Vec<String>,
     /// Human description of the compiler used (`$NXVIM_CC`, `cc`, `zig (fetched)`…).
     pub compiler: String,
+    /// File extensions the grammar declares it applies to (from a repo install's
+    /// `tree-sitter.json` / `package.json` `grammars[].file-types`), e.g. `["rb"]`.
+    /// Empty for a catalog install (the static `EXT_FILETYPE` table already covers
+    /// those) or a repo that declares none. Phase 2 registers these for detection.
+    pub file_types: Vec<String>,
 }
 
 /// The `install_info` we need out of `parsers.lua`.
@@ -73,8 +78,20 @@ struct ParserEntry {
     location: Option<String>,
 }
 
-/// Install grammar `lang` into `data_dir`. See the module docs for the flow.
-pub fn install(data_dir: &Path, lang: &str) -> Result<InstallReport> {
+/// Install grammar `spec` into `data_dir`. `spec` is either a catalog **language
+/// name** (`rust`) resolved through nvim-treesitter's `parsers.lua`, or a GitHub
+/// **repo spec** (`owner/repo` or `owner/repo@ref`) built straight from the repo.
+/// A spec containing `/` is treated as a repo. See the module docs for the flow.
+pub fn install(data_dir: &Path, spec: &str) -> Result<InstallReport> {
+    if let Some(repo) = parse_repo_spec(spec) {
+        return install_from_repo(data_dir, &repo);
+    }
+    install_from_catalog(data_dir, spec)
+}
+
+/// Install a catalog language (the original flow): resolve `parsers.lua`, build the
+/// grammar at the pinned revision, copy nvim-treesitter's matched query sets.
+fn install_from_catalog(data_dir: &Path, lang: &str) -> Result<InstallReport> {
     if !crate::loader::is_valid_language(lang) {
         bail!("invalid language name '{lang}' (letters, digits, '_' and '-' only)");
     }
@@ -106,16 +123,11 @@ pub fn install(data_dir: &Path, lang: &str) -> Result<InstallReport> {
     if let Some(loc) = &entry.location {
         src_root = src_root.join(loc);
     }
+    // A repo that commits only `grammar.js` is generated with the `tree-sitter` CLI
+    // if the user has it (else this fails loud naming what's missing).
+    ensure_parser_c(&src_root, &format!("grammar '{lang}'"))?;
     let src_dir = src_root.join("src");
     let parser_c = src_dir.join("parser.c");
-    if !parser_c.exists() {
-        bail!(
-            "grammar '{lang}' has no src/parser.c at {} — it likely needs \
-             `tree-sitter generate`, which nxvim can't do; install it with the \
-             nvim-treesitter CLI instead",
-            src_dir.display()
-        );
-    }
 
     // 2. Resolve a compiler and build the shared object.
     let (cc, compiler_desc) = resolve_compiler(data_dir)?;
@@ -138,7 +150,234 @@ pub fn install(data_dir: &Path, lang: &str) -> Result<InstallReport> {
         queries,
         inherited,
         compiler: compiler_desc,
+        file_types: Vec::new(),
     })
+}
+
+// ---------------------------------------------------------------------------
+// Repo install (`:TSInstall owner/repo[@ref]`)
+// ---------------------------------------------------------------------------
+
+/// A parsed `owner/repo[@ref]` GitHub grammar spec. `git_ref` defaults to `HEAD`
+/// (GitHub's archive endpoint resolves it to the repo's default branch).
+struct RepoSpec {
+    owner: String,
+    repo: String,
+    git_ref: String,
+}
+
+/// Parse `owner/repo` or `owner/repo@ref` into a [`RepoSpec`], or `None` if `spec`
+/// is not repo-shaped (no `/` → a catalog language name). `ref` may be a branch,
+/// tag, or sha and can itself contain `/` (e.g. `feature/x`); only the part before
+/// the first `@` is `owner/repo`. Owner/repo are restricted to GitHub's name
+/// charset so a malformed spec fails here rather than as a confusing 404.
+fn parse_repo_spec(spec: &str) -> Option<RepoSpec> {
+    let (path, git_ref) = match spec.split_once('@') {
+        Some((p, r)) => (p, r),
+        None => (spec, "HEAD"),
+    };
+    let (owner, repo) = path.split_once('/')?;
+    let name_ok = |s: &str| {
+        !s.is_empty()
+            && s.chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+    };
+    if !name_ok(owner) || !name_ok(repo) {
+        return None;
+    }
+    // A ref must be a single non-empty token (branches/tags/shas never contain
+    // whitespace); slashes are allowed, but a `..` or leading `/` is not a ref.
+    if git_ref.is_empty() || git_ref.split_whitespace().count() != 1 || git_ref.contains("..") {
+        return None;
+    }
+    Some(RepoSpec {
+        owner: owner.to_string(),
+        repo: repo.to_string(),
+        git_ref: git_ref.to_string(),
+    })
+}
+
+/// A grammar's own declared metadata, read from `tree-sitter.json` (modern) or a
+/// `package.json` `tree-sitter` array (older). `path` is the grammar dir relative
+/// to the repo root (`.` unless a monorepo places it in a subdir).
+struct GrammarMeta {
+    lang: String,
+    file_types: Vec<String>,
+    path: String,
+}
+
+/// Install a grammar straight from a GitHub repo: download + unpack the tarball at
+/// `ref`, read the grammar's declared name / file-types / subdir, compile its
+/// pre-generated `src/parser.c`, and copy the repo's own queries. Unlike the
+/// catalog path this consults **no** nvim-treesitter data — the repo is the source
+/// of truth — and it surfaces the declared `file_types` so detection can be wired.
+fn install_from_repo(data_dir: &Path, spec: &RepoSpec) -> Result<InstallReport> {
+    let RepoSpec {
+        owner,
+        repo,
+        git_ref,
+    } = spec;
+
+    // 1. Download + unpack the repo source at `ref`.
+    let build_dir = data_dir.join(".ts-build").join(format!("{owner}__{repo}"));
+    let _ = std::fs::remove_dir_all(&build_dir);
+    std::fs::create_dir_all(&build_dir)
+        .with_context(|| format!("create build dir {}", build_dir.display()))?;
+    let tarball = fetch(&format!(
+        "https://github.com/{owner}/{repo}/archive/{git_ref}.tar.gz"
+    ))
+    .with_context(|| {
+        format!("download {owner}/{repo}@{git_ref} — is the repo/ref spelled right?")
+    })?;
+    unpack_tar_gz(&tarball, &build_dir)
+        .with_context(|| format!("unpack {owner}/{repo} source tarball"))?;
+    let root = single_subdir(&build_dir)
+        .with_context(|| format!("locating unpacked {owner}/{repo} source"))?;
+
+    // 2. Read the grammar's declared metadata (name, file-types, subdir).
+    let meta = read_grammar_metadata(&root, repo);
+    if !crate::loader::is_valid_language(&meta.lang) {
+        bail!(
+            "derived language name '{}' is invalid (letters, digits, '_' and '-' only) — \
+             the repo's tree-sitter.json `name` or repo name is unusable",
+            meta.lang
+        );
+    }
+
+    // 3. Compile the (pre-generated) parser.
+    let grammar_root = if meta.path == "." {
+        root.clone()
+    } else {
+        root.join(&meta.path)
+    };
+    ensure_parser_c(&grammar_root, &format!("repo {owner}/{repo}"))?;
+    let src_dir = grammar_root.join("src");
+    let parser_c = src_dir.join("parser.c");
+    let (cc, compiler_desc) = resolve_compiler(data_dir)?;
+    let parser_dir = data_dir.join("parser");
+    std::fs::create_dir_all(&parser_dir)
+        .with_context(|| format!("create {}", parser_dir.display()))?;
+    let out = parser_dir.join(format!("{}.so", meta.lang));
+    compile(&cc, &src_dir, &parser_c, &out)?;
+
+    // 4. Copy the repo's own queries (custom grammars aren't in nvim-treesitter).
+    let queries = copy_repo_queries(data_dir, &meta.lang, &grammar_root)?;
+
+    let _ = std::fs::remove_dir_all(&build_dir);
+
+    Ok(InstallReport {
+        lang: meta.lang,
+        revision: git_ref.clone(),
+        parser: out,
+        queries,
+        inherited: Vec::new(),
+        compiler: compiler_desc,
+        file_types: meta.file_types,
+    })
+}
+
+/// Read a grammar's declared metadata from the repo `root`. Prefers a modern
+/// `tree-sitter.json` (`{ grammars: [ { name, file-types, path } ] }`); falls back
+/// to an older `package.json` `tree-sitter` array of the same shape. When neither
+/// declares a name, the language is derived from the repo name (a `tree-sitter-`
+/// prefix stripped, `-`→`_`), and `file_types` is left empty (no auto-detection —
+/// Phase 2 fails loud on that, telling the user to `:set ft=`).
+fn read_grammar_metadata(root: &Path, repo: &str) -> GrammarMeta {
+    let from_entry = |g: &serde_json::Value| -> GrammarMeta {
+        let lang = g
+            .get("name")
+            .and_then(|n| n.as_str())
+            .map(sanitize_lang)
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| lang_from_repo(repo));
+        let file_types = g
+            .get("file-types")
+            .and_then(|f| f.as_array())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|x| x.as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let path = g
+            .get("path")
+            .and_then(|p| p.as_str())
+            .filter(|s| !s.is_empty())
+            .unwrap_or(".")
+            .to_string();
+        GrammarMeta {
+            lang,
+            file_types,
+            path,
+        }
+    };
+
+    // `tree-sitter.json` → `grammars: [ … ]`.
+    if let Ok(bytes) = std::fs::read(root.join("tree-sitter.json")) {
+        if let Ok(v) = serde_json::from_slice::<serde_json::Value>(&bytes) {
+            if let Some(g) = v
+                .get("grammars")
+                .and_then(|g| g.as_array())
+                .and_then(|a| a.first())
+            {
+                return from_entry(g);
+            }
+        }
+    }
+    // Older `package.json` → `tree-sitter: [ … ]`.
+    if let Ok(bytes) = std::fs::read(root.join("package.json")) {
+        if let Ok(v) = serde_json::from_slice::<serde_json::Value>(&bytes) {
+            if let Some(g) = v
+                .get("tree-sitter")
+                .and_then(|g| g.as_array())
+                .and_then(|a| a.first())
+            {
+                return from_entry(g);
+            }
+        }
+    }
+
+    GrammarMeta {
+        lang: lang_from_repo(repo),
+        file_types: Vec::new(),
+        path: ".".to_string(),
+    }
+}
+
+/// Derive a language name from a repo name: drop a leading `tree-sitter-` (or
+/// `tree-sitter_`) prefix and map `-` → `_` (nvim's convention). `tree-sitter-c-sharp`
+/// → `c_sharp`, `nx-lang` → `nx_lang`.
+fn lang_from_repo(repo: &str) -> String {
+    let stem = repo
+        .strip_prefix("tree-sitter-")
+        .or_else(|| repo.strip_prefix("tree-sitter_"))
+        .unwrap_or(repo);
+    sanitize_lang(stem)
+}
+
+/// Normalize a declared/derived grammar name into a language token: lowercase and
+/// `-` → `_`. (Validity is checked separately by `is_valid_language`.)
+fn sanitize_lang(name: &str) -> String {
+    name.trim().to_ascii_lowercase().replace('-', "_")
+}
+
+/// Copy a repo's own `queries/<name>.scm` (the standard basenames + `textobjects`)
+/// into `<data>/queries/<lang>/`, skipping any it doesn't ship. Returns the
+/// basenames written.
+fn copy_repo_queries(data_dir: &Path, lang: &str, grammar_root: &Path) -> Result<Vec<String>> {
+    let src = grammar_root.join("queries");
+    let dst = data_dir.join("queries").join(lang);
+    std::fs::create_dir_all(&dst).with_context(|| format!("create {}", dst.display()))?;
+    let mut written = Vec::new();
+    for name in QUERY_FILES.iter().chain(std::iter::once(&"textobjects")) {
+        let from = src.join(format!("{name}.scm"));
+        if from.exists() {
+            std::fs::copy(&from, dst.join(format!("{name}.scm")))
+                .with_context(|| format!("copy {name}.scm"))?;
+            written.push((*name).to_string());
+        }
+    }
+    Ok(written)
 }
 
 /// Fetch nvim-treesitter's `parsers.lua` and pull out `lang`'s `install_info`.
@@ -392,6 +631,63 @@ fn resolve_compiler(data_dir: &Path) -> Result<(Vec<String>, String)> {
 
 /// Whether running `name <probe…>` succeeds (the compiler/toolchain is present).
 /// `--version` for the cc family, `version` for zig.
+/// Ensure `<grammar_root>/src/parser.c` exists, generating it from `grammar.js`
+/// when the repo committed only the grammar definition. nxvim can't generate a
+/// parser itself — that needs the **`tree-sitter` CLI** and its JS toolchain — so if
+/// `grammar.js` is present we shell out to a `tree-sitter` on PATH (override with
+/// `$NXVIM_TREE_SITTER_CLI`). Every branch fails *loud* naming what's missing: no
+/// sources to build, the CLI absent, or `generate` itself erroring.
+fn ensure_parser_c(grammar_root: &Path, what: &str) -> Result<()> {
+    let src_dir = grammar_root.join("src");
+    if src_dir.join("parser.c").exists() {
+        return Ok(());
+    }
+    if !grammar_root.join("grammar.js").exists() {
+        bail!(
+            "{what} ships neither src/parser.c nor grammar.js at {} — nothing to build",
+            grammar_root.display()
+        );
+    }
+    let Some(cli) = tree_sitter_cli() else {
+        bail!(
+            "{what} ships grammar.js but no generated src/parser.c. Generating one \
+             needs the `tree-sitter` CLI (https://tree-sitter.github.io) — install it \
+             and re-run, or install a repo that commits the generated parser"
+        );
+    };
+    let output = Command::new(&cli)
+        .arg("generate")
+        .current_dir(grammar_root)
+        .output()
+        .with_context(|| format!("run `{cli} generate` in {}", grammar_root.display()))?;
+    if !output.status.success() {
+        bail!(
+            "`{cli} generate` failed in {} — {what} may need a newer CLI or a JS \
+             runtime for its grammar.js:\n{}",
+            grammar_root.display(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    if !src_dir.join("parser.c").exists() {
+        bail!(
+            "`{cli} generate` ran but produced no src/parser.c in {}",
+            grammar_root.display()
+        );
+    }
+    Ok(())
+}
+
+/// The `tree-sitter` CLI to invoke, or `None` if unavailable. `$NXVIM_TREE_SITTER_CLI`
+/// (a path or program name) wins; otherwise a `tree-sitter` on PATH.
+fn tree_sitter_cli() -> Option<String> {
+    if let Ok(p) = std::env::var("NXVIM_TREE_SITTER_CLI") {
+        if !p.trim().is_empty() {
+            return Some(p);
+        }
+    }
+    program_exists("tree-sitter", &["--version"]).then(|| "tree-sitter".to_string())
+}
+
 fn program_exists(name: &str, args: &[&str]) -> bool {
     let probe = if args.is_empty() {
         &["--version"][..]

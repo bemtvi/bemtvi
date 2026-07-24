@@ -512,6 +512,21 @@ impl EditHost {
             );
             return;
         }
+        // A repo spec (`owner/repo`) means compiling arbitrary source — impossible in
+        // the browser build (prebuilt `.wasm` grammars from a CDN, no C compiler). Fail
+        // loud rather than silently no-op (there is no CDN entry for a custom repo).
+        let (repos, langs): (Vec<String>, Vec<String>) =
+            langs.into_iter().partition(|l| l.contains('/'));
+        if !repos.is_empty() {
+            self.editor.echo(format!(
+                "TSInstall: installing from a GitHub repo ({}) needs a C compiler and \
+                 isn't supported in the browser build — use a native nxvim",
+                repos.join(", ")
+            ));
+        }
+        if langs.is_empty() {
+            return;
+        }
         self.editor
             .echo(format!("TSInstall: installing {}…", langs.join(", ")));
         for lang in langs {
@@ -598,8 +613,15 @@ impl EditHost {
                 } else {
                     format!(" +inherited[{}]", report.inherited.join(", "))
                 };
+                // A repo install surfaces the grammar's declared file-types (Phase 2
+                // will register these for detection); a catalog install has none.
+                let file_types = if report.file_types.is_empty() {
+                    String::new()
+                } else {
+                    format!(" file-types[{}]", report.file_types.join(", "))
+                };
                 self.editor.echo(format!(
-                    "TSInstall: installed {} @ {short} [{}] (queries: {queries}{inherited})",
+                    "TSInstall: installed {} @ {short} [{}] (queries: {queries}{inherited}){file_types}",
                     report.lang, report.compiler
                 ));
             }

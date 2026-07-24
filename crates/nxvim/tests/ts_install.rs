@@ -542,3 +542,237 @@ async fn ts_install_defers_to_a_registered_user_command() {
         "native :TSInstall shadowed the registered user command"
     );
 }
+
+// ----- repo install (`:TSInstall owner/repo`) -------------------------------
+
+/// Build a GitHub *repo* tarball fixture for `:TSInstall owner/repo`: the rust
+/// grammar `src/` (a real, pre-generated `parser.c` to compile) plus the repo's
+/// **own** `tree-sitter.json` (declaring name + file-types) and
+/// `queries/highlights.scm`, packed with `top_dir/` on top — exactly what
+/// `github.com/<owner>/<repo>/archive/<ref>.tar.gz` serves. Unlike the catalog
+/// fixture there is no `parsers.lua`: the repo is the sole source of truth.
+fn build_repo_tarball(out: &Path, top_dir: &str, tree_sitter_json: &str) {
+    std::fs::create_dir_all(out.parent().unwrap()).unwrap();
+    let stage = out.parent().unwrap().join(format!(
+        "stage-{}",
+        out.file_name().unwrap().to_string_lossy()
+    ));
+    let _ = std::fs::remove_dir_all(&stage);
+    let pkg = stage.join(top_dir);
+    std::fs::create_dir_all(&pkg).unwrap();
+    let status = std::process::Command::new("cp")
+        .arg("-R")
+        .arg(grammar_src_dir().join("src"))
+        .arg(pkg.join("src"))
+        .status()
+        .expect("cp -R grammar src");
+    assert!(status.success(), "staging grammar src failed");
+    write_under(&pkg.join("tree-sitter.json"), tree_sitter_json.as_bytes());
+    write_under(
+        &pkg.join("queries/highlights.scm"),
+        tree_sitter_rust::HIGHLIGHTS_QUERY.as_bytes(),
+    );
+    let status = std::process::Command::new("tar")
+        .arg("czf")
+        .arg(out)
+        .arg("-C")
+        .arg(&stage)
+        .arg(top_dir)
+        .status()
+        .expect("tar czf");
+    assert!(status.success(), "building repo tarball failed");
+}
+
+/// Mirror a repo at `acme/tree-sitter-demo` at `git_ref` (the archive filename and
+/// the tarball's top dir both key off the ref, as GitHub serves them) with the given
+/// `tree-sitter.json`, and export the installer env. Returns `data_dir`.
+fn repo_fixture(tag: &str, git_ref: &str, tree_sitter_json: &str) -> PathBuf {
+    let base = std::env::temp_dir().join(format!("nxvim-tsinstall-repo-{tag}"));
+    let _ = std::fs::remove_dir_all(&base);
+    let data_dir = base.join("data");
+    let mirror = base.join("mirror");
+    std::fs::create_dir_all(&data_dir).unwrap();
+    build_repo_tarball(
+        &mirror
+            .join("github.com/acme/tree-sitter-demo/archive")
+            .join(format!("{git_ref}.tar.gz")),
+        &format!("tree-sitter-demo-{git_ref}"),
+        tree_sitter_json,
+    );
+    std::env::set_var("NXVIM_DATA_DIR", &data_dir);
+    std::env::set_var("NXVIM_TS_MIRROR", &mirror);
+    std::env::set_var(
+        "NXVIM_CC",
+        std::env::var("CC").unwrap_or_else(|_| "cc".into()),
+    );
+    data_dir
+}
+
+#[tokio::test]
+async fn ts_install_from_github_repo_reads_declared_file_types() {
+    let _guard = test_lock().lock().await;
+    // `owner/repo` (no `@ref` → default branch, `HEAD`). The grammar declares its
+    // own name `demo` and `file-types: ["demo"]` in tree-sitter.json — nothing about
+    // it is in nvim-treesitter's catalog. The reader honours that declaration.
+    // The grammar declares `name: "rust"` (its parser.c exports `tree_sitter_rust`)
+    // with a custom `file-types` — proving both that the declared file-types are read
+    // and that the declared `name` wins over the repo dir name (`tree-sitter-demo`).
+    let data_dir = repo_fixture(
+        "declared",
+        "HEAD",
+        r#"{ "grammars": [ { "name": "rust", "scope": "source.rust", "file-types": ["rz", "rzz"] } ] }"#,
+    );
+
+    // Rust source opened as plain `.txt` (Phase 1 doesn't auto-detect yet — that's
+    // Phase 2), set to the `rust` filetype *before* the grammar exists. The install
+    // then reloads `rust` and drops the highlight memo, so the already-open buffer
+    // lights up from the install alone — proof the parser + queries actually loaded.
+    let file = write_temp("tsinstall_repo", "txt", "fn main() {\n    let x = 1;\n}\n");
+    let (rpc, mut incoming) = start(Some(file)).await;
+    feed(&rpc, ":set filetype=rust<CR>");
+
+    feed(&rpc, ":TSInstall acme/tree-sitter-demo<CR>");
+    let msg = wait_for_message(&rpc, &mut incoming, "TSInstall: installed").await;
+    assert!(
+        msg.contains("installed rust"),
+        "repo install should use the declared grammar name: {msg:?}"
+    );
+    assert!(
+        msg.contains("file-types[rz, rzz]"),
+        "install must surface the grammar's declared file-types: {msg:?}"
+    );
+    assert!(
+        data_dir.join("parser/rust.so").exists(),
+        "repo grammar didn't compile to parser/rust.so"
+    );
+    assert!(
+        data_dir.join("queries/rust/highlights.scm").exists(),
+        "the repo's own queries weren't copied under the declared language name"
+    );
+
+    let spans = wait_for_highlights(&rpc, &mut incoming).await;
+    assert!(
+        spans > 0,
+        "custom repo grammar produced no highlights after install"
+    );
+}
+
+#[tokio::test]
+async fn ts_install_repo_without_declared_name_derives_from_repo() {
+    let _guard = test_lock().lock().await;
+    // A repo whose tree-sitter.json omits `name`/`file-types` (or ships none): the
+    // language falls back to the repo name minus `tree-sitter-` (`demo`), and the
+    // install still succeeds — it just reports no declared file-types.
+    let data_dir = repo_fixture(
+        "noname",
+        "main",
+        r#"{ "grammars": [ { "scope": "source.x" } ] }"#,
+    );
+    let (rpc, mut incoming) = start(None).await;
+
+    feed(&rpc, ":TSInstall acme/tree-sitter-demo@main<CR>");
+    let msg = wait_for_message(&rpc, &mut incoming, "TSInstall: installed").await;
+    assert!(
+        msg.contains("installed demo") && !msg.contains("file-types["),
+        "expected a name derived from the repo and no declared file-types: {msg:?}"
+    );
+    assert!(data_dir.join("parser/demo.so").exists());
+}
+
+/// A minimal self-contained tree-sitter grammar definition (no external DSL
+/// helpers), so the CLI generates it with just its built-in JS engine.
+const DEMO_GRAMMAR_JS: &str = "module.exports = grammar({\n\
+     \x20 name: 'demo',\n\
+     \x20 rules: {\n\
+     \x20   source_file: $ => repeat($.word),\n\
+     \x20   word: $ => /[A-Za-z]+/,\n\
+     \x20 }\n\
+     });\n";
+
+const DEMO_TS_JSON: &str = "{ \"grammars\": [ { \"name\": \"demo\", \"scope\": \"source.demo\", \
+     \"file-types\": [\"demo\"] } ], \"metadata\": { \"version\": \"0.0.1\" } }";
+
+/// Build a repo tarball that ships `grammar.js` + `tree-sitter.json` + a query but
+/// **no** generated `src/` — exercising the `tree-sitter generate` fallback.
+fn build_grammar_js_repo_tarball(out: &Path, top_dir: &str) {
+    std::fs::create_dir_all(out.parent().unwrap()).unwrap();
+    let stage = out.parent().unwrap().join(format!(
+        "stage-{}",
+        out.file_name().unwrap().to_string_lossy()
+    ));
+    let _ = std::fs::remove_dir_all(&stage);
+    let pkg = stage.join(top_dir);
+    std::fs::create_dir_all(&pkg).unwrap();
+    write_under(&pkg.join("grammar.js"), DEMO_GRAMMAR_JS.as_bytes());
+    write_under(&pkg.join("tree-sitter.json"), DEMO_TS_JSON.as_bytes());
+    write_under(&pkg.join("queries/highlights.scm"), b"(word) @variable\n");
+    let status = std::process::Command::new("tar")
+        .arg("czf")
+        .arg(out)
+        .arg("-C")
+        .arg(&stage)
+        .arg(top_dir)
+        .status()
+        .expect("tar czf");
+    assert!(status.success(), "building grammar.js repo tarball failed");
+}
+
+/// Whether the `tree-sitter` CLI is on PATH — the generate path needs it.
+fn tree_sitter_cli_present() -> bool {
+    std::process::Command::new("tree-sitter")
+        .arg("--version")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+#[tokio::test]
+async fn ts_install_repo_generates_parser_from_grammar_js_via_cli() {
+    let _guard = test_lock().lock().await;
+    // The repo commits only `grammar.js` (no generated parser). nxvim can't generate
+    // one itself, but shells out to the user's `tree-sitter` CLI when present. Skip
+    // if it isn't installed (the convention for an unavailable external dependency).
+    if !tree_sitter_cli_present() {
+        eprintln!("skip: `tree-sitter` CLI not installed (needed for the generate path)");
+        return;
+    }
+    let base = std::env::temp_dir().join("nxvim-tsinstall-repo-generate");
+    let _ = std::fs::remove_dir_all(&base);
+    let data_dir = base.join("data");
+    let mirror = base.join("mirror");
+    std::fs::create_dir_all(&data_dir).unwrap();
+    build_grammar_js_repo_tarball(
+        &mirror.join("github.com/acme/tree-sitter-demo/archive/HEAD.tar.gz"),
+        "tree-sitter-demo-HEAD",
+    );
+    std::env::set_var("NXVIM_DATA_DIR", &data_dir);
+    std::env::set_var("NXVIM_TS_MIRROR", &mirror);
+    std::env::set_var(
+        "NXVIM_CC",
+        std::env::var("CC").unwrap_or_else(|_| "cc".into()),
+    );
+
+    let file = write_temp("tsinstall_gen", "txt", "hello world of demo\n");
+    let (rpc, mut incoming) = start(Some(file)).await;
+    feed(&rpc, ":set filetype=demo<CR>");
+    feed(&rpc, ":TSInstall acme/tree-sitter-demo<CR>");
+
+    // "installed" | "failed" is the terminal state (not the transient "installing…").
+    let msg = wait_for_message(&rpc, &mut incoming, "TSInstall: installed").await;
+    assert!(
+        msg.contains("installed demo"),
+        "generate-from-grammar.js install failed: {msg:?}"
+    );
+    assert!(
+        data_dir.join("parser/demo.so").exists(),
+        "the generated grammar didn't compile to parser/demo.so"
+    );
+    // Proof the generated + compiled parser actually loads and highlights.
+    let spans = wait_for_highlights(&rpc, &mut incoming).await;
+    assert!(
+        spans > 0,
+        "the CLI-generated grammar produced no highlights"
+    );
+}

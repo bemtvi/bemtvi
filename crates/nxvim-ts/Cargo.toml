@@ -17,6 +17,7 @@ streaming-iterator.workspace = true
 libloading.workspace = true
 # `:TSInstall` grammar fetch + compile (src/install.rs).
 ureq.workspace = true
+serde_json.workspace = true
 tar.workspace = true
 flate2.workspace = true
 xz2.workspace = true

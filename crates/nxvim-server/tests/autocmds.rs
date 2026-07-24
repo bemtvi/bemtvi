@@ -265,6 +265,42 @@ async fn opening_a_file_fires_filetype_with_filetype_and_path() {
 }
 
 #[tokio::test]
+async fn extension_detection_covers_installable_treesitter_grammars() {
+    // `EXT_FILETYPE` (nxvim-core) maps a file extension to its tree-sitter language
+    // noun, which is also the filetype. Its coverage is the installable
+    // nvim-treesitter grammar set, so opening a file of any such language detects the
+    // filetype (and highlights once the grammar is `:TSInstall`ed). This guards the
+    // expansion beyond the original core-16: each extension below was NOT recognized
+    // before, so an empty/reverted table fails. `.rs` anchors the pre-existing set.
+    let dir = temp_dir("au_ext_detect");
+    let cases = [
+        ("main.rs", "rust"), // pre-existing anchor
+        ("app.rb", "ruby"),
+        ("Main.kt", "kotlin"),
+        ("lib.hs", "haskell"),
+        ("build.gradle", "groovy"),
+        ("query.sql", "sql"),
+        ("component.tsx", "tsx"),
+        ("style.scss", "scss"),
+    ];
+    for (name, _) in cases {
+        std::fs::write(dir.join(name), "x\n").expect("write source file");
+    }
+    let (rpc, _incoming) = start_with_file_and_config(&dir, "main.rs", "").await;
+    for (name, want) in cases {
+        let path = dir.join(name);
+        nxvim_test_harness::feed(&rpc, &format!(":edit {}<CR>", path.display()));
+        let _ = rpc.request("nvim_get_mode", vec![]).await;
+        let got = exec_lua(&rpc, "return vim.bo.filetype").await;
+        assert_eq!(
+            got.as_str().unwrap_or("<nil>"),
+            want,
+            "{name} should detect filetype {want}"
+        );
+    }
+}
+
+#[tokio::test]
 async fn lifecycle_order_is_bufreadpost_filetype_bufenter() {
     // First open of a file fires the three events in neovim's order.
     let dir = temp_dir("au_order");

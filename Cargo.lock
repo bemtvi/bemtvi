@@ -2968,6 +2968,7 @@ dependencies = [
  "libloading 0.9.0",
  "nxvim-core",
  "ropey",
+ "serde_json",
  "sha2 0.11.0",
  "streaming-iterator",
  "tar",

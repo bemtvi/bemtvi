@@ -340,6 +340,55 @@ end
 vim.treesitter = vim.treesitter or {}
 vim.treesitter.foldexpr = nx.treesitter.foldexpr
 
+-- `nx.textobject` — user-defined tree-sitter text objects.
+--
+-- Bind a full `i`/`a` + object-key sequence to an exact `textobjects.scm` capture,
+-- so operators and visual mode can select it. After
+-- `nx.textobject.map("il", "@loop.inner")`, `vil` selects inside the enclosing loop
+-- (and `dil` deletes it); add `nx.textobject.map("al", "@loop.outer")` for `val`.
+--
+-- The four built-ins (`f` function, `a` argument, `c` comment, `t` type) need no
+-- registration. Use this to add MORE objects — `@loop`, `@call`, `@block`,
+-- `@conditional`, `@return`, `@assignment`, … that queries already capture — or to
+-- override a built-in key.
+--
+-- The capture is used **verbatim**, so you pick the convention: nxvim's own
+-- `.inner`/`.outer`, or Helix's `.inside`/`.around` if you drop Helix's
+-- `textobjects.scm` on your runtimepath, or any custom capture your query defines. A
+-- leading `@` is optional (`"@loop.inner"` and `"loop.inner"` are equivalent).
+nx.textobject = nx.textobject or {}
+
+-- `nx.textobject.map(lhs, capture)` binds one sequence; `nx.textobject.map(tbl)`
+-- binds many from an `lhs -> capture` table, e.g.
+-- `nx.textobject.map({ il = "@loop.inner", al = "@loop.outer" })`.
+function nx.textobject.map(lhs, capture)
+  if type(lhs) == "table" then
+    for k, v in pairs(lhs) do
+      nx.textobject.map(k, v)
+    end
+    return
+  end
+  assert(
+    type(lhs) == "string" and #lhs == 2 and (lhs:sub(1, 1) == "i" or lhs:sub(1, 1) == "a"),
+    "nx.textobject.map: lhs must be a 2-char sequence starting with 'i' or 'a' (e.g. 'il', 'af')"
+  )
+  assert(
+    type(capture) == "string" and #capture > 0,
+    "nx.textobject.map: capture must be a non-empty string (e.g. '@loop.inner')"
+  )
+  nx._textobject_map(lhs, capture)
+end
+
+-- `nx.textobject.unmap(lhs)` removes a binding; a previously-overridden built-in key
+-- reverts to its built-in behavior.
+function nx.textobject.unmap(lhs)
+  assert(
+    type(lhs) == "string" and #lhs == 2,
+    "nx.textobject.unmap: lhs must be a 2-char sequence (e.g. 'il')"
+  )
+  nx._textobject_map(lhs, nil)
+end
+
 -- nx.daemon.* — the reconnecting remote-daemon link's connection status, surfaced so a
 -- plugin (e.g. a statusline component) can show it. A daemon session runs the editor
 -- locally and reaches the remote only through the link; when it drops, the supervisor

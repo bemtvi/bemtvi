@@ -24,9 +24,9 @@ use crate::ops::{
     DiagnosticData, DockOp, ExtmarkOp, FeedKeysOp, FsJob, GlobalOptionOp, HlSet, HttpRequest,
     HttpServerReply, LayerOp, LoopOp, LspOp, NamedListOp, PanelOp, PickerOpenReq, PickerPush,
     PreviewPush, QfItem, QfSetOp, RegisterSetOp, SnippetAddReq, SnippetSetupReq, StatuslineKind,
-    StatuslinePublishReq, StatuslineSetupReq, StatuslineTarget, TabOp, TerminalOpenReq, TsOp,
-    UiFloatReq, UiInputReq, UiSelectReq, ViewOp, VirtChunkData, VirtDecorData, WindowOp,
-    WorkspaceOptionOp,
+    StatuslinePublishReq, StatuslineSetupReq, StatuslineTarget, TabOp, TerminalOpenReq,
+    TextObjectOp, TsOp, UiFloatReq, UiInputReq, UiSelectReq, ViewOp, VirtChunkData, VirtDecorData,
+    WindowOp, WorkspaceOptionOp,
 };
 use crate::runtime::{OutputLine, Shared};
 use crate::vimregex;
@@ -3787,6 +3787,22 @@ pub(crate) fn install_runtime_api(
                 Ok(())
             },
         )?,
+    )?;
+
+    // `nx._textobject_map(lhs, capture|nil)`: the native setter behind
+    // `nx.textobject.map`. Queues a [`TextObjectOp`] the server applies to the
+    // editor's text-object registry — bind `lhs` (`"il"`, `"af"`) to the exact
+    // `textobjects.scm` capture, or unbind with `nil`. The prelude wrapper validates
+    // `lhs` (a 2-char `i`/`a` + key sequence) before calling this.
+    let sh = shared.clone();
+    nx.set(
+        "_textobject_map",
+        lua.create_function(move |_, (lhs, capture): (String, Option<String>)| {
+            sh.borrow_mut()
+                .textobject_ops
+                .push(TextObjectOp { lhs, capture });
+            Ok(())
+        })?,
     )?;
 
     // `vim.regex(pat)`: compile a vim pattern into a regex object exposing

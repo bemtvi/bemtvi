@@ -353,6 +353,7 @@ impl Engine {
             "indents" => g.indents = compile_opt(src, "indents")?,
             "injections" => g.injections = compile_opt(src, "injections")?,
             "folds" => g.folds = compile_opt(src, "folds")?,
+            "textobjects" => g.textobjects = compile_opt(src, "textobjects")?,
             _ => unreachable!("guarded above"),
         }
         Ok(())
@@ -1001,6 +1002,67 @@ impl Engine {
         }
         out
     }
+
+    /// Byte ranges of `buffer`'s `textobjects.scm` nodes captured as exactly
+    /// `capture` (e.g. `"function.inner"`) that **contain** `byte`
+    /// (`start <= byte < end`), innermost (smallest span) first — so a `count`
+    /// selects successively larger enclosing scopes. Empty when there is no
+    /// grammar, no textobjects query, or nothing matches. This is the tree-sitter
+    /// source behind the `vif` / `daf` / `dia` text objects; the core picks the
+    /// `count`-th range and hands it to the shared text-object applier. Host-tree
+    /// only — injected sub-language layers are not consulted.
+    pub fn text_objects_at(
+        &self,
+        buffer: BufferId,
+        capture: &str,
+        byte: usize,
+    ) -> Vec<(usize, usize)> {
+        let Some(state) = self.buffers.get(&buffer) else {
+            return Vec::new();
+        };
+        let Some(tree) = state.tree.as_ref() else {
+            return Vec::new();
+        };
+        let Some(Slot::Loaded(grammar)) = self.grammars.get(&state.language) else {
+            return Vec::new();
+        };
+        let Some(query) = grammar.textobjects.as_ref() else {
+            return Vec::new();
+        };
+        let rope = &state.shadow;
+        let root = tree.root_node();
+        let names = query.capture_names();
+        let mut out: Vec<(usize, usize)> = Vec::new();
+        let mut cursor = QueryCursor::new();
+        let mut matches = cursor.matches(query, root, node_text_provider(rope));
+        while let Some(m) = matches.next() {
+            // An nvim-treesitter textobject region can span *several* nodes captured
+            // under one name within a single match — `_+ @function.inner` tags every
+            // statement between the braces, and the inner object is their combined
+            // extent (min start … max end), not any one statement. So union this
+            // match's `capture` nodes rather than treating each as its own range.
+            let mut lo = usize::MAX;
+            let mut hi = 0usize;
+            for cap in m.captures {
+                if names[cap.index as usize] != capture {
+                    continue;
+                }
+                let r = cap.node.byte_range();
+                lo = lo.min(r.start);
+                hi = hi.max(r.end);
+            }
+            // `lo < hi` skips a match that captured nothing under this name; then keep
+            // only regions that actually surround the cursor.
+            if lo < hi && lo <= byte && byte < hi {
+                out.push((lo, hi));
+            }
+        }
+        // Innermost (smallest span) first; ties broken by start. Dedup collapses a
+        // region two patterns produce identically.
+        out.sort_by_key(|(s, e)| (e - s, *s));
+        out.dedup();
+        out
+    }
 }
 
 /// One indent capture's `#set!` directives that the algorithm consults.
@@ -1189,6 +1251,25 @@ impl SyntaxEngine for Engine {
         matches!(
             self.grammars.get(&state.language),
             Some(Slot::Loaded(g)) if g.folds.is_some()
+        )
+    }
+
+    fn text_objects_at(
+        &mut self,
+        buffer: BufferId,
+        capture: &str,
+        byte: usize,
+    ) -> Vec<(usize, usize)> {
+        Engine::text_objects_at(self, buffer, capture, byte)
+    }
+
+    fn text_objects_available(&self, buffer: BufferId) -> bool {
+        let Some(state) = self.buffers.get(&buffer) else {
+            return false;
+        };
+        matches!(
+            self.grammars.get(&state.language),
+            Some(Slot::Loaded(g)) if g.textobjects.is_some()
         )
     }
 
@@ -1729,8 +1810,12 @@ fn point((row, col): (usize, usize)) -> Point {
 /// paint-relevant names), so a resolution-bridge push for it lands on the grammar.
 /// `highlights` and `indents` drive the paint directly; `injections` drives the
 /// sub-language layers built on top of the root tree; `folds` drives the
-/// `foldmethod=expr` tree-sitter fold source. Every other resolved name
-/// (`textobjects`, …) stays Lua-side and is a no-op here.
+/// `foldmethod=expr` tree-sitter fold source; `textobjects` drives the tree-sitter
+/// text objects (`vif`, `daf`, …). Every other resolved name stays Lua-side and is
+/// a no-op here.
 fn is_engine_query(name: &str) -> bool {
-    matches!(name, "highlights" | "indents" | "injections" | "folds")
+    matches!(
+        name,
+        "highlights" | "indents" | "injections" | "folds" | "textobjects"
+    )
 }

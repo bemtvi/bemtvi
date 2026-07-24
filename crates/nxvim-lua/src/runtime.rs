@@ -22,8 +22,8 @@ use crate::ops::{
     HttpServerRequest, InlayHintMirrorData, LayerOp, LoopOp, LspClientData, LspOp, NamedListOp,
     PanelOp, PickerOpenReq, PickerPush, QfSetOp, RawKeymap, RawRhs, RegisterSetOp,
     SemanticTokenData, SnippetAddReq, SnippetSetupReq, StatuslinePublishReq, StatuslineSetupReq,
-    TabOp, TerminalOpenReq, TsOp, UiFloatReq, UiInputReq, UiSelectReq, ViewOp, WindowOp,
-    WorkspaceOptionOp,
+    TabOp, TerminalOpenReq, TextObjectOp, TsOp, UiFloatReq, UiInputReq, UiSelectReq, ViewOp,
+    WindowOp, WorkspaceOptionOp,
 };
 
 /// `skip_serializing_if` predicate: drop a `false` flag from the serialized
@@ -773,6 +773,9 @@ pub(crate) struct Shared {
     /// editor's register file after the chunk. Reads resolve from the
     /// `nx._registers` mirror, so only the write needs an op.
     pub(crate) reg_ops: Vec<RegisterSetOp>,
+    /// User tree-sitter text-object bindings from `nx.textobject.map`, drained by the
+    /// server into the editor's text-object registry (`Some` = bind, `None` = unbind).
+    pub(crate) textobject_ops: Vec<TextObjectOp>,
     /// Clipboard seeds from `nx.test.clipboard.seed` (plugin-test seam), drained by
     /// the server into the editor's clipboard provider — `(text, linewise)`.
     pub(crate) clipboard_seeds: Vec<(String, bool)>,
@@ -1443,6 +1446,12 @@ impl LuaRuntime {
         /// Take the register writes queued by `vim.fn.setreg` since the last drain,
         /// for the server to apply to the editor's register file.
         take_reg_ops -> Vec<RegisterSetOp> = reg_ops
+    }
+
+    take_queue! {
+        /// Take the user text-object bindings queued by `nx.textobject.map` since the
+        /// last drain, for the server to apply to the editor's text-object registry.
+        take_textobject_ops -> Vec<TextObjectOp> = textobject_ops
     }
 
     take_queue! {

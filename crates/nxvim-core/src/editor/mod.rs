@@ -1392,6 +1392,16 @@ pub struct Editor {
     /// dark. Written by `nx.bo.ts_highlight` / `:set ts_highlight` (and the
     /// [`Editor::ts_start`] / [`Editor::ts_stop`] helpers).
     ts_enabled: HashMap<BufferId, bool>,
+    /// User-registered tree-sitter text objects, keyed by the **full** `i`/`a` +
+    /// object-key sequence (`"il"`, `"af"`, …) → the exact `textobjects.scm` capture
+    /// to select (`"loop.inner"`, `"function.around"`; a leading `@` is stripped on
+    /// lookup). Set from Lua via `nx.textobject.map`. Consulted *before* the built-in
+    /// object alphabet in [`Editor::resolve_text_object`], so a user can bind new
+    /// keys (`il` → `@loop.inner`) *and* override a built-in (`if` →
+    /// `@function.inside`, e.g. to drive Helix's queries whose captures use
+    /// `.inside`/`.around` rather than nxvim's `.inner`/`.outer`). Empty by default —
+    /// the four built-ins (`f`/`a`/`c`/`t`) need no entry here.
+    textobject_map: HashMap<String, String>,
     /// Per-buffer **`'commentstring'`** override — the comment template the
     /// `gc`/`gcc` operator wraps lines with (vim's `<left> %s <right>` form, e.g.
     /// `"// %s"` or `"/* %s */"`). Absent: the buffer falls back to its filetype's
@@ -1862,6 +1872,7 @@ impl Editor {
             foldmarkers: HashMap::new(),
             external_folds: HashMap::new(),
             ts_enabled: HashMap::new(),
+            textobject_map: HashMap::new(),
             clipboard: None,
             host_fs: Rc::new(StdHostFs),
             host_fs_offtick: false,

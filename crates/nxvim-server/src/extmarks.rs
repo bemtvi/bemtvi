@@ -356,6 +356,10 @@ impl EditHost {
         // otherwise drops on tokenized cells. A real `line_hl_group` extmark on the
         // same line already present above wins (it was set explicitly); these fill in
         // the rest at the treesitter priority.
+        // Native-only: the `syntax_states` highlight memo (and its `block_bg_lines`)
+        // exists only in the native build — on wasm, highlighting is a JS-side overlay,
+        // so there is no such tree-sitter block background to fill in here.
+        #[cfg(feature = "native")]
         if let Some(st) = self.syntax_states.get(&buffer) {
             for &line in &st.block_bg_lines {
                 by_line

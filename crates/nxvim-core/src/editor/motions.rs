@@ -505,7 +505,126 @@ impl Editor {
             ObjectKind::Quote(q) => charwise(self.quote_object(ia, q)),
             ObjectKind::Sentence => charwise(self.sentence_object(ia, count)),
             ObjectKind::Paragraph => self.paragraph_object(ia, count), // linewise
+            // Tree-sitter objects need to query the (mutable) syntax engine, so they
+            // resolve through the `&mut self` path [`Editor::ts_text_object_range`],
+            // called by the executor *before* this `&self` resolver. Never here.
+            ObjectKind::TsCapture(_) => None,
         }
+    }
+
+    /// Resolve a tree-sitter text object's charwise byte range `[start, end)` from
+    /// the syntax engine. `ia` is `'i'` (inner) / `'a'` (around); `base` is the
+    /// `textobjects.scm` capture base (`"function"`, `"parameter"`, `"comment"`,
+    /// `"class"`). Selects the `count`-th **innermost** `<base>.<inner|outer>` node
+    /// containing the cursor, so `2if` targets the 2nd enclosing function. When an
+    /// `.inner` capture matches nothing it falls back to `.outer` (upstream queries
+    /// often omit `@x.inner`, e.g. rust's `@comment`). `None` when no such object
+    /// surrounds the cursor (or there is no grammar / `textobjects.scm`) — the
+    /// executor then keeps the visual selection / no-ops the operator, as for any
+    /// absent object. Always charwise (`linewise = false`).
+    pub(crate) fn ts_text_object_range(
+        &mut self,
+        ia: char,
+        base: &str,
+        count: usize,
+    ) -> Option<(usize, usize, bool)> {
+        let buf = self.current_buffer_id();
+        let byte = self.cursor_char();
+        let suffix = if ia == 'i' { "inner" } else { "outer" };
+        let mut ranges = self.ts_text_objects_at(buf, &format!("{base}.{suffix}"), byte);
+        if ranges.is_empty() && ia == 'i' {
+            ranges = self.ts_text_objects_at(buf, &format!("{base}.outer"), byte);
+        }
+        let (lo, hi) = ranges.into_iter().nth(count.saturating_sub(1))?;
+        Some((lo, hi, false))
+    }
+
+    /// Resolve a tree-sitter text object from an **explicit** capture name (a user
+    /// registry entry — `nx.textobject.map`), e.g. `"loop.inner"` or
+    /// `"function.around"`. Unlike [`ts_text_object_range`], the capture is used
+    /// verbatim — no `i`/`a` → `.inner`/`.outer` suffixing and no inner→outer
+    /// fallback — so the user's chosen convention (nxvim's `.inner`/`.outer`, Helix's
+    /// `.inside`/`.around`, or anything their query defines) is honored exactly. A
+    /// leading `@` is stripped (both `"@loop.inner"` and `"loop.inner"` work). Picks
+    /// the `count`-th innermost containing region; always charwise.
+    ///
+    /// [`ts_text_object_range`]: Self::ts_text_object_range
+    fn ts_text_object_range_capture(
+        &mut self,
+        capture: &str,
+        count: usize,
+    ) -> Option<(usize, usize, bool)> {
+        let capture = capture.strip_prefix('@').unwrap_or(capture);
+        let buf = self.current_buffer_id();
+        let byte = self.cursor_char();
+        let (lo, hi) = self
+            .ts_text_objects_at(buf, capture, byte)
+            .into_iter()
+            .nth(count.saturating_sub(1))?;
+        Some((lo, hi, false))
+    }
+
+    /// Resolve the object named by the introducer `ia` (`'i'`/`'a'`) and the object
+    /// key `key` to its byte range. The single dispatch both the executor and the
+    /// multi-cursor path use. Resolution order:
+    ///
+    /// 1. A **user registry** entry for the full `{ia}{key}` sequence
+    ///    (`nx.textobject.map`) — checked first, so it can bind new keys *and*
+    ///    override a built-in (e.g. remap `if` to a Helix `@function.inside`).
+    /// 2. The **built-in** object alphabet ([`ObjectKind::from_key`]): the four
+    ///    tree-sitter objects (`f`/`a`/`c`/`t`) and the vim objects (word, pairs,
+    ///    quotes, sentence, paragraph).
+    /// 3. `None` for an unknown key — the executor then cancels the operator / keeps
+    ///    the visual selection, exactly as for any object that matches nothing.
+    pub(crate) fn resolve_text_object(
+        &mut self,
+        ia: char,
+        key: char,
+        count: usize,
+    ) -> Option<(usize, usize, bool)> {
+        if let Some(capture) = self.textobject_map.get(&format!("{ia}{key}")).cloned() {
+            return self.ts_text_object_range_capture(&capture, count);
+        }
+        match ObjectKind::from_key(key) {
+            Some(ObjectKind::TsCapture(base)) => self.ts_text_object_range(ia, base, count),
+            Some(kind) => self.text_object_range(ia, kind, count),
+            None => None,
+        }
+    }
+
+    /// Register (or, with `capture = None`, unregister) a user tree-sitter text
+    /// object: bind the full `i`/`a` + object-key sequence `lhs` (`"il"`, `"af"`, …)
+    /// to the exact `textobjects.scm` capture to select. Set from Lua via
+    /// `nx.textobject.map`; consulted by [`resolve_text_object`](Self::resolve_text_object).
+    pub fn set_textobject_map(&mut self, lhs: &str, capture: Option<String>) {
+        match capture {
+            Some(c) => {
+                self.textobject_map.insert(lhs.to_string(), c);
+            }
+            None => {
+                self.textobject_map.remove(lhs);
+            }
+        }
+    }
+
+    /// The user text-object registry entries whose introducer is `ia` (`'i'`/`'a'`),
+    /// as `(object_key, capture)` pairs sorted by key — for the which-key object menu
+    /// ([`Editor::command_pending`]), so registered objects appear alongside the
+    /// built-ins under the `i`/`a` introducer.
+    pub(crate) fn textobject_map_entries(&self, ia: char) -> Vec<(char, String)> {
+        let mut out: Vec<(char, String)> = self
+            .textobject_map
+            .iter()
+            .filter_map(|(lhs, cap)| {
+                let mut chars = lhs.chars();
+                match (chars.next(), chars.next(), chars.next()) {
+                    (Some(i), Some(k), None) if i == ia => Some((k, cap.clone())),
+                    _ => None,
+                }
+            })
+            .collect();
+        out.sort_by_key(|(k, _)| *k);
+        out
     }
 
     /// Apply the pending operator (or extend the visual selection) to a text

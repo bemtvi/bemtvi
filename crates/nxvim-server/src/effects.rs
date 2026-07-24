@@ -726,6 +726,12 @@ impl EditHost {
             self.editor
                 .echo("E: vim.treesitter is not available in the browser build yet");
         }
+        // User tree-sitter text-object bindings from `nx.textobject.map`: applied to
+        // the editor's text-object registry. Plain editor state (not engine state),
+        // so — unlike `ts_ops` above — it applies in every build, native or wasm.
+        for op in self.lua.take_textobject_ops() {
+            self.editor.set_textobject_map(&op.lhs, op.capture);
+        }
         // Register writes from `vim.fn.setreg`: applied to the editor's register
         // file after the chunk — the same store yanks/deletes write. The Lua side
         // already rejected read-only specials and resolved uppercase/`a` append.

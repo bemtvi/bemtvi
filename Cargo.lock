@@ -2942,6 +2942,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tokio",
+ "tree-sitter-rust",
  "ureq",
  "vt100",
  "wtransport",

@@ -206,7 +206,7 @@ impl EditHost {
         }
         let rtp = self.lua.runtimepath().to_vec();
         let mut applied = false;
-        for name in ["highlights", "indents", "injections"] {
+        for name in ["highlights", "indents", "injections", "textobjects"] {
             let mut visited = std::collections::HashSet::new();
             let parts = self.collect_query_parts(lang, name, &rtp, &mut visited);
             if parts.is_empty() {

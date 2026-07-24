@@ -22,7 +22,7 @@
 // the renderer already does).
 
 import { Parser, Language, Query } from './vendor/web-tree-sitter/web-tree-sitter.js';
-import { EXT, FT, REGISTRY, QUERY_KINDS, highlightSources, indentSource, foldSource, versionOf, resolveName } from './grammars.js';
+import { EXT, FT, REGISTRY, QUERY_KINDS, highlightSources, fetchQueryMerged, versionOf, resolveName } from './grammars.js';
 import { sanitize } from './ts-sanitize.js';
 
 // Resolve vendored assets relative to THIS module, not the page, so the demo still
@@ -230,22 +230,31 @@ export function createHighlighter({ onReady } = {}) {
     const extras = {};
     for (const kind of QUERY_KINDS) {
       if (kind === 'highlights') continue;
+      // Indents come from nvim-treesitter (the grammar packages don't ship a usable one),
+      // with the `; inherits:` chain merged (so `javascript` picks up `ecma`/`jsx`); fall
+      // back to the grammar package's own if nvim-treesitter has none.
       if (kind === 'indents') {
-        try { extras.indents = await fetchText(indentSource(name, GH_BASE)); }
-        catch {
-          try { extras.indents = await fetchText(`${CDN_BASE}/${cfg.pkg}@${ver}/queries/indents.scm`); }
-          catch { /* no indents from either source */ }
-        }
+        const merged = await fetchQueryMerged(name, 'indents', fetchText, GH_BASE);
+        if (merged.trim()) { extras.indents = merged; continue; }
+        try { extras.indents = await fetchText(`${CDN_BASE}/${cfg.pkg}@${ver}/queries/indents.scm`); }
+        catch { /* no indents from either source */ }
         continue;
       }
-      // Folds, like indents, come from nvim-treesitter so the browser matches native
-      // (the grammar package's own folds.scm, if any, can differ); fall back to it.
+      // Folds, like indents, come (inherit-merged) from nvim-treesitter so the browser
+      // matches native (the grammar package's own folds.scm, if any, can differ); fall back.
       if (kind === 'folds') {
-        try { extras.folds = await fetchText(foldSource(name, GH_BASE)); }
-        catch {
-          try { extras.folds = await fetchText(`${CDN_BASE}/${cfg.pkg}@${ver}/queries/folds.scm`); }
-          catch { /* no folds from either source */ }
-        }
+        const merged = await fetchQueryMerged(name, 'folds', fetchText, GH_BASE);
+        if (merged.trim()) { extras.folds = merged; continue; }
+        try { extras.folds = await fetchText(`${CDN_BASE}/${cfg.pkg}@${ver}/queries/folds.scm`); }
+        catch { /* no folds from either source */ }
+        continue;
+      }
+      // Text objects come from the SEPARATE nvim-treesitter-textobjects repo (neither
+      // nvim-treesitter core nor the grammar package ships them), also inherit-merged; the
+      // worker's text-object runner (web/ts-textobjects.js) consumes them. Best-effort.
+      if (kind === 'textobjects') {
+        const merged = await fetchQueryMerged(name, 'textobjects', fetchText, GH_BASE);
+        if (merged.trim()) extras.textobjects = merged;
         continue;
       }
       try { extras[kind] = await fetchText(`${CDN_BASE}/${cfg.pkg}@${ver}/queries/${kind}.scm`); }

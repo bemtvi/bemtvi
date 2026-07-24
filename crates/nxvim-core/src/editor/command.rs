@@ -436,10 +436,15 @@ pub(crate) enum ObjectKind {
     Quote(char),      // " ' `
     Sentence,         // s
     Paragraph,        // p
+    /// A tree-sitter text object, carrying the `textobjects.scm` capture *base*
+    /// name (`"function"`, `"parameter"`, `"comment"`, `"class"`). `i`/`a` picks the
+    /// `.inner`/`.outer` suffix; the range comes from the syntax engine via
+    /// [`Editor::ts_text_object_range`]. `f`/`a`/`c`/`t` in [`ObjectKind::from_key`].
+    TsCapture(&'static str),
 }
 
 impl ObjectKind {
-    fn from_key(c: char) -> Option<ObjectKind> {
+    pub(crate) fn from_key(c: char) -> Option<ObjectKind> {
         Some(match c {
             'w' => ObjectKind::Word(false),
             'W' => ObjectKind::Word(true),
@@ -450,6 +455,12 @@ impl ObjectKind {
             '"' | '\'' | '`' => ObjectKind::Quote(c),
             's' => ObjectKind::Sentence,
             'p' => ObjectKind::Paragraph,
+            // Tree-sitter text objects (Helix-style mnemonics): function, argument,
+            // comment, type/class. Resolved against the buffer's `textobjects.scm`.
+            'f' => ObjectKind::TsCapture("function"),
+            'a' => ObjectKind::TsCapture("parameter"),
+            'c' => ObjectKind::TsCapture("comment"),
+            't' => ObjectKind::TsCapture("class"),
             _ => return None,
         })
     }
@@ -634,8 +645,12 @@ enum ResolvedCommand {
     DoubledOperator(char),
     /// An operator awaiting a search motion (`d/`, `c?`): open the search prompt.
     OperatorSearch { op: char, dir: SearchDir },
-    /// A text object in operator-pending or visual mode (`diw`, `va(`).
-    TextObject { ia: char, kind: ObjectKind },
+    /// A text object in operator-pending or visual mode (`diw`, `va(`, `dif`).
+    /// Carries the raw object *key* (the char after `i`/`a`), not a resolved
+    /// [`ObjectKind`]: the object is resolved at execution time by
+    /// [`Editor::resolve_text_object`], which consults the user registry
+    /// (`nx.textobject.map`) before the built-in alphabet.
+    TextObject { ia: char, key: char },
     /// `r{char}`.
     Replace(char),
     /// `m{mark}` — set a mark at the cursor.
@@ -1008,6 +1023,10 @@ fn text_object_continuations() -> Vec<CommandContinuation> {
         ("`", "backticks"),
         ("b", "() block"),
         ("B", "{} block"),
+        ("f", "function (tree-sitter)"),
+        ("a", "argument (tree-sitter)"),
+        ("c", "comment (tree-sitter)"),
+        ("t", "type (tree-sitter)"),
     ])
 }
 
@@ -1043,8 +1062,14 @@ fn parse_step(mode: Mode, pending: &PendingCommand, key: Key) -> ParseStep {
             };
         }
         Stage::TextObjectPending(ia) => {
-            return match key.as_char().and_then(ObjectKind::from_key) {
-                Some(kind) => Complete(ResolvedCommand::TextObject { ia, kind }),
+            // Any character is a candidate object key: the built-in alphabet and the
+            // user registry (`nx.textobject.map`) are both consulted at execution
+            // time (`resolve_text_object`), which the pure grammar can't see. An
+            // unknown key resolves to nothing there and cancels, the same outcome as
+            // `AbortObject`. A non-character key (only reachable if `<Esc>` didn't
+            // already cancel above) still aborts.
+            return match key.as_char() {
+                Some(key) => Complete(ResolvedCommand::TextObject { ia, key }),
                 None => AbortObject,
             };
         }
@@ -1662,6 +1687,21 @@ impl Editor {
             Stage::MarkJumpPending(..) | Stage::MarkSetPending => {
                 hint.continuations = self.set_mark_continuations()
             }
+            // Append the user's registered tree-sitter objects (`nx.textobject.map`)
+            // to the object menu, so a bound `il`/`af`/… shows in which-key beside the
+            // built-ins. A registration that overrides a built-in key replaces its row
+            // (keyed dedup, the override winning) rather than duplicating it.
+            Stage::TextObjectPending(ia) => {
+                for (key, capture) in self.textobject_map_entries(ia) {
+                    let key = key.to_string();
+                    hint.continuations.retain(|c| c.key != key);
+                    hint.continuations.push(CommandContinuation {
+                        key,
+                        desc: capture,
+                        group: false,
+                    });
+                }
+            }
             _ => {}
         }
         Some(hint)
@@ -1929,16 +1969,16 @@ impl Editor {
                 self.search_operator = Some(op);
                 self.enter_search(dir, count);
             }
-            ResolvedCommand::TextObject { ia, kind } => {
+            ResolvedCommand::TextObject { ia, key } => {
                 let count = self.effective_count();
                 // Multi-cursor (Normal mode only): operate over the object at every
                 // cursor, as one undo group.
                 if self.has_secondary_cursors() && self.mode == Mode::Normal {
-                    self.edit_each_cursor(|ed| ed.apply_text_object_once(ia, kind, count));
+                    self.edit_each_cursor(|ed| ed.apply_text_object_once(ia, key, count));
                     self.reset_pending();
                     return;
                 }
-                if let Some((lo, hi, linewise)) = self.text_object_range(ia, kind, count) {
+                if let Some((lo, hi, linewise)) = self.resolve_text_object(ia, key, count) {
                     self.apply_text_object(lo, hi, linewise);
                 } else if self.mode.is_visual() {
                     // No object at the cursor: keep the selection (and count).
@@ -2513,8 +2553,8 @@ impl Editor {
     /// Apply the pending operator over the text object at the current cursor
     /// (`diw`/`ci"`/…). Per-cursor (reads pending, never resets it); a no-op when
     /// no object is found at this cursor.
-    fn apply_text_object_once(&mut self, ia: char, kind: ObjectKind, count: usize) {
-        let Some((lo, hi, linewise)) = self.text_object_range(ia, kind, count) else {
+    fn apply_text_object_once(&mut self, ia: char, key: char, count: usize) {
+        let Some((lo, hi, linewise)) = self.resolve_text_object(ia, key, count) else {
             return;
         };
         let Some(op) = self.pending.operator else {

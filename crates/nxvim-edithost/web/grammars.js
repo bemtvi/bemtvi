@@ -23,9 +23,7 @@ export const NVIM_TS_REF = '4916d6592ede8c07973490d9322f187e07dfefac';
 // is the registry's own canonical name (rust, python, c_sharp, …); a grammar that
 // reuses another's parser (the FT map) still has its own query dir there.
 export function indentSource(name, base) {
-  if (!REGISTRY[name]) return null;
-  const root = base || 'https://cdn.jsdelivr.net/gh';
-  return `${root}/nvim-treesitter/nvim-treesitter@${NVIM_TS_REF}/runtime/queries/${name}/indents.scm`;
+  return REGISTRY[name] ? queryUrl(name, 'indents', base) : null;
 }
 
 // The jsDelivr URL for `lang`'s nvim-treesitter `folds.scm` at the pinned ref, or null
@@ -33,9 +31,71 @@ export function indentSource(name, base) {
 // (not the grammar npm package) so the browser folds match native exactly — native's
 // `install.rs` copies the same nvim-treesitter `runtime/queries/<lang>/folds.scm`.
 export function foldSource(name, base) {
-  if (!REGISTRY[name]) return null;
+  return REGISTRY[name] ? queryUrl(name, 'folds', base) : null;
+}
+
+// nvim-treesitter-textobjects commit the TEXT-OBJECT queries are read from — pinned to
+// match `nxvim-ts`'s native `install.rs` `NVIM_TS_TEXTOBJECTS_REF`, so the browser's
+// textobjects.scm is the same revision the ported range logic (web/ts-textobjects.js)
+// expects. These queries live in a SEPARATE repo from nvim-treesitter core (which ships
+// none), under `queries/<lang>/textobjects.scm` — a different repo AND path than folds.
+export const NVIM_TS_TEXTOBJECTS_REF = '898ee307df58f854d11cd7edd06472574d48014e';
+
+// The jsDelivr URL for `lang`'s nvim-treesitter-textobjects `textobjects.scm` at the
+// pinned ref, or null for a language not in the registry. `base` overrides the CDN host.
+export function textobjectsSource(name, base) {
+  return REGISTRY[name] ? queryUrl(name, 'textobjects', base) : null;
+}
+
+// The raw query URL for ANY language name (not registry-guarded, so inherited
+// pseudo-languages like `ecma`/`jsx` — which are not grammars — resolve too). `kind`
+// picks the source repo: `textobjects` from nvim-treesitter-textobjects, everything
+// else (`indents`/`folds`/…) from nvim-treesitter core.
+function queryUrl(lang, kind, base) {
   const root = base || 'https://cdn.jsdelivr.net/gh';
-  return `${root}/nvim-treesitter/nvim-treesitter@${NVIM_TS_REF}/runtime/queries/${name}/folds.scm`;
+  return kind === 'textobjects'
+    ? `${root}/nvim-treesitter/nvim-treesitter-textobjects@${NVIM_TS_TEXTOBJECTS_REF}/queries/${lang}/textobjects.scm`
+    : `${root}/nvim-treesitter/nvim-treesitter@${NVIM_TS_REF}/runtime/queries/${lang}/${kind}.scm`;
+}
+
+// Languages named in a query file's leading `; inherits: a,b` modeline(s) — the ones
+// whose same-kind query this one builds on (`javascript` → `ecma`,`jsx`). Only the
+// leading comment block is scanned. Mirrors the native `parse_inherits`
+// (nxvim-server/src/treesitter.rs) so the browser merges exactly the set native does.
+export function parseInherits(text) {
+  const out = [];
+  for (const raw of text.split('\n')) {
+    const line = raw.trim();
+    if (line === '') continue;
+    if (!line[0] || line[0] !== ';') break; // past the leading comment block
+    const body = line.replace(/^;+/, '').trim();
+    const m = body.match(/^inherits\s*:\s*(.+)$/);
+    if (m) for (const l of m[1].split(',')) { const s = l.trim(); if (s) out.push(s); }
+  }
+  return out;
+}
+
+// Fetch `lang`'s `kind` query with its full `; inherits:` chain merged — inherited
+// languages FIRST, the language's own LAST, so its own patterns override what it
+// inherits (tree-sitter precedence favors later patterns), matching the native
+// resolver. `fetchText(url)` GETs a URL (throwing on 404); `base` overrides the CDN
+// host. Returns the merged text, or `''` when the language ships no such query. `seen`
+// guards the inherit graph against cycles. This is what makes `javascript`'s
+// inherits-only `indents`/`folds`/`textobjects` (just `; inherits: ecma,jsx`) resolve
+// to real patterns on the web path, the same way native does.
+export async function fetchQueryMerged(lang, kind, fetchText, base, seen = new Set()) {
+  if (seen.has(lang)) return '';
+  seen.add(lang);
+  let own;
+  try { own = await fetchText(queryUrl(lang, kind, base)); }
+  catch { return ''; } // no such query for this language (a 404) — nothing to merge
+  const parts = [];
+  for (const inh of parseInherits(own)) {
+    const merged = await fetchQueryMerged(inh, kind, fetchText, base, seen);
+    if (merged.trim()) parts.push(merged);
+  }
+  if (own.trim()) parts.push(own);
+  return parts.join('\n');
 }
 
 // Pinned package versions — MUST stay in lockstep with treesitter/package.json (the
@@ -230,7 +290,7 @@ export const BUNDLED = ['rust', 'lua', 'json', 'javascript', 'typescript', 'pyth
 // above; `indents` comes from nvim-treesitter (see `indentSource`, since the grammar
 // packages don't ship a usable one); the others come from the grammar package's own
 // `queries/` dir, all best-effort (a missing file is skipped, not an error).
-export const QUERY_KINDS = ['highlights', 'injections', 'indents', 'folds', 'locals'];
+export const QUERY_KINDS = ['highlights', 'injections', 'indents', 'folds', 'locals', 'textobjects'];
 
 // Resolve the [pkg, file] query sources for a language's highlights.scm. Defaults to
 // the grammar package's own queries/highlights.scm when no override list is given.

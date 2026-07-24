@@ -163,6 +163,33 @@ pub trait SyntaxEngine {
         false
     }
 
+    /// Absolute byte ranges `[start, end)` of `buffer`'s `textobjects.scm` nodes
+    /// captured as exactly `capture` (e.g. `"function.inner"`, `"parameter.outer"`)
+    /// that **contain** `byte` (`start <= byte < end`), **innermost (smallest span)
+    /// first** — so a `count` picks successively larger enclosing scopes. The
+    /// tree-sitter source behind the `vif` / `daf` / `dia` text objects: the editor
+    /// selects the `count`-th range and feeds it to the shared text-object applier.
+    /// Empty when there is no grammar, no `textobjects.scm`, or nothing matches. The
+    /// default returns nothing — an engine that can't run the query (the wasm
+    /// JS-side highlighter) simply offers no tree-sitter text objects.
+    fn text_objects_at(
+        &mut self,
+        _buffer: BufferId,
+        _capture: &str,
+        _byte: usize,
+    ) -> Vec<(usize, usize)> {
+        Vec::new()
+    }
+
+    /// Whether tree-sitter text objects are *available* for `buffer` — a grammar
+    /// with a `textobjects.scm` is loaded. Lets the editor tell "the query is loaded
+    /// but matched nothing at the cursor" apart from "no tree-sitter text objects
+    /// here at all", so it can fall through to nothing rather than a vim object. The
+    /// default is `false`.
+    fn text_objects_available(&self, _buffer: BufferId) -> bool {
+        false
+    }
+
     /// Install (or, with `text = None`, clear) a resolved query override for
     /// `(lang, name)` — the engine half of the query-resolution bridge. The Lua
     /// API has already merged `query.set` / `after/queries` / `;extends` into the

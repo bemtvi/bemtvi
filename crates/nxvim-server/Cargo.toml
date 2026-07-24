@@ -113,3 +113,7 @@ nxvim-test-harness.workspace = true
 # a real grammar into a temp data dir. It is a feature-gated *runtime* dep above; a
 # dev-dep makes its `install` reachable from the integration tests unconditionally.
 nxvim-ts.workspace = true
+# The rust grammar's C sources + bundled highlights query, so the tree-sitter
+# text-object e2e can compile a real parser into a temp data dir *hermetically* (no
+# network `:TSInstall`), the same fixture pattern nxvim-ts's engine tests use.
+tree-sitter-rust.workspace = true

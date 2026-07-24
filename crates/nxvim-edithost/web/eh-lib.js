@@ -90,4 +90,42 @@ addToLibrary({
       return 0;
     }
   },
+
+  // Byte ranges of `text`'s `textobjects.scm` nodes captured as `capture` that contain
+  // byte offset `byte`, written into the `cap`-int `out` buffer as flat `[start, end, …]`
+  // byte pairs, innermost first. Returns the total ints needed (may exceed `cap`), or -1
+  // when no runner / grammar / textobjects.scm. The worker runner converts UTF-16↔byte.
+  eh_js_ts_textobjects: function (langPtr, textPtr, capturePtr, byte, outPtr, cap) {
+    try {
+      var f = globalThis.__nxvimTsTextObjects;
+      if (!f) return -1;
+      var pairs = f(UTF8ToString(langPtr), UTF8ToString(textPtr), UTF8ToString(capturePtr), byte | 0);
+      if (!pairs) return -1;
+      var idx = outPtr >> 2; // i32 index into HEAP32
+      var total = 0;
+      for (var i = 0; i < pairs.length; i++) {
+        var s = pairs[i][0] | 0, e = pairs[i][1] | 0;
+        // Write only while both ints of this pair fit; keep counting so the core can grow.
+        if (total + 1 < cap) {
+          HEAP32[idx + total] = s;
+          HEAP32[idx + total + 1] = e;
+        }
+        total += 2;
+      }
+      return total;
+    } catch (e) {
+      return -1;
+    }
+  },
+
+  // Whether tree-sitter text objects are available for the language (a grammar with a
+  // textobjects.scm is loaded), as 1/0.
+  eh_js_ts_textobjects_available: function (langPtr) {
+    try {
+      var f = globalThis.__nxvimTsTextObjectsAvailable;
+      return (f && f(UTF8ToString(langPtr))) ? 1 : 0;
+    } catch (e) {
+      return 0;
+    }
+  },
 });

@@ -617,6 +617,93 @@ async fn text_object_introducer_lists_object_kinds() {
     );
 }
 
+/// The text-object introducer also lists the **tree-sitter** objects Phase 1 added
+/// (`f`/`a`/`c`/`t` → function/argument/comment/type), so a which-key popup shows the
+/// full object menu. Like the bracket/quote objects, they are listed as the object
+/// *alphabet* — always offered, not gated on whether a grammar is loaded (`di(` is
+/// shown with no paren at the cursor too).
+#[tokio::test]
+async fn text_object_introducer_lists_treesitter_kinds() {
+    let (rpc, _incoming) = start().await;
+    exec_lua(&rpc, RECORDER).await;
+    feed(&rpc, "ihello world<Esc>0");
+    feed(&rpc, "di"); // delete + inner-object introducer
+    let ev = events(&rpc).await;
+    let frame = ev.rsplit(";;").next().unwrap();
+    assert!(frame.starts_with("n|di|"), "keys are `di`: {frame}");
+    for (key, kind) in [
+        ("f", "function"),
+        ("a", "argument"),
+        ("c", "comment"),
+        ("t", "type"),
+    ] {
+        assert!(
+            frame.contains(&format!("{key}/{kind} (tree-sitter)/map")),
+            "tree-sitter {kind} object listed: {frame}"
+        );
+    }
+}
+
+/// The same tree-sitter objects appear when the introducer is armed from **visual**
+/// mode (`vi`), not just operator-pending — the which-key menu is identical, since
+/// both arm `Stage::TextObjectPending`.
+#[tokio::test]
+async fn visual_text_object_introducer_lists_treesitter_kinds() {
+    let (rpc, _incoming) = start().await;
+    exec_lua(&rpc, RECORDER).await;
+    feed(&rpc, "ihello world<Esc>0");
+    feed(&rpc, "vi"); // visual + inner-object introducer
+    let ev = events(&rpc).await;
+    let frame = ev.rsplit(";;").next().unwrap();
+    // In visual mode the introducer's own key (`i`) is the shown prefix — there is
+    // no pending operator ahead of it as in `di`.
+    assert!(
+        frame.starts_with("v|i|"),
+        "keys are `i` in visual mode: {frame}"
+    );
+    assert!(
+        frame.contains("f/function (tree-sitter)/map"),
+        "function object: {frame}"
+    );
+    assert!(
+        frame.contains("t/type (tree-sitter)/map"),
+        "type object: {frame}"
+    );
+}
+
+/// A user-registered object (`nx.textobject.map`) shows in the which-key object menu
+/// under its introducer, keyed by its object key with the capture as the description;
+/// a registration overriding a built-in key replaces that row (no duplicate).
+#[tokio::test]
+async fn text_object_menu_lists_user_registered_objects() {
+    let (rpc, _incoming) = start().await;
+    exec_lua(&rpc, RECORDER).await;
+    exec_lua(
+        &rpc,
+        "nx.textobject.map('il', '@loop.inner')\n\
+         nx.textobject.map('if', '@function.inside')", // override the built-in `if`
+    )
+    .await;
+    feed(&rpc, "ihello<Esc>0");
+    feed(&rpc, "di");
+    let ev = events(&rpc).await;
+    let frame = ev.rsplit(";;").next().unwrap();
+    // New key `l` appears with its capture as the description.
+    assert!(
+        frame.contains("l/@loop.inner/map"),
+        "registered loop object: {frame}"
+    );
+    // The overridden `if` shows the user's capture, and only once (built-in replaced).
+    assert!(
+        frame.contains("f/@function.inside/map"),
+        "overridden function object: {frame}"
+    );
+    assert!(
+        !frame.contains("f/function (tree-sitter)/map"),
+        "the built-in `f` row is replaced by the override, not duplicated: {frame}"
+    );
+}
+
 /// `"` (register-pending) lists the registers that actually hold text (Phase 3),
 /// keyed to a one-line content preview — not the bare a–z alphabet. After yanking a
 /// line into register `a`, pressing `"` surfaces `a` with its contents.

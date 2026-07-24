@@ -20,9 +20,9 @@ use tree_sitter::{Language, Parser, Query};
 /// The query-text overrides the engine holds, keyed by `(lang, query_name)` —
 /// the store [`Grammar::load`] consults in place of the on-disk query, and the
 /// landing point of the query-resolution bridge (Lua resolves the merged string,
-/// the engine compiles + caches + executes it). Only the paint-relevant names
-/// `highlights` / `indents` / `injections` are ever present. See
-/// [`Engine::set_query`](crate::engine::Engine::set_query).
+/// the engine compiles + caches + executes it). Only the engine-executed names
+/// (`highlights` / `indents` / `injections` / `folds` / `textobjects`) are ever
+/// present. See [`Engine::set_query`](crate::engine::Engine::set_query).
 pub type QueryOverrides = HashMap<(String, String), String>;
 
 /// Why [`Grammar::load`] didn't return a grammar, so the engine (and the editor
@@ -45,8 +45,8 @@ pub enum LoadError {
 /// text as another language). Both optionals are absent when the language ships no
 /// `indents.scm` / `injections.scm`.
 pub struct Grammar {
-    // Field order matters: `language`/`query`/`indents`/`injections`/`folds` drop
-    // before `_lib`, so the loaded code outlives anything pointing into it.
+    // Field order matters: every query field drops before `_lib`, so the loaded
+    // code outlives anything pointing into it.
     pub language: Language,
     pub query: Query,
     pub indents: Option<Query>,
@@ -55,6 +55,11 @@ pub struct Grammar {
     /// when the language ships no fold query. Drives `foldmethod=expr` with the
     /// tree-sitter foldexpr (the core builds per-line levels from the ranges).
     pub folds: Option<Query>,
+    /// Compiled `textobjects.scm` (`@function.inner/outer`, `@parameter.*`,
+    /// `@class.*`, `@comment.*`, … captures → syntactic text-object ranges), or
+    /// `None` when the language ships no textobjects query. Drives the tree-sitter
+    /// text objects (`vif`, `daf`, `dia`, …).
+    pub textobjects: Option<Query>,
     _lib: libloading::Library,
 }
 
@@ -120,6 +125,7 @@ impl Grammar {
         let indents = load_optional_query(data_dir, lang, &language, "indents", overrides)?;
         let injections = load_optional_query(data_dir, lang, &language, "injections", overrides)?;
         let folds = load_optional_query(data_dir, lang, &language, "folds", overrides)?;
+        let textobjects = load_optional_query(data_dir, lang, &language, "textobjects", overrides)?;
 
         Ok(Grammar {
             language,
@@ -127,6 +133,7 @@ impl Grammar {
             indents,
             injections,
             folds,
+            textobjects,
             _lib: lib,
         })
     }

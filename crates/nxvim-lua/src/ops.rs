@@ -1045,6 +1045,19 @@ pub struct RegisterSetOp {
     pub append: bool,
 }
 
+/// A user tree-sitter text-object binding queued by `nx.textobject.map`. `lhs` is
+/// the full `i`/`a` + object-key sequence (`"il"`, `"af"`); `capture` is the exact
+/// `textobjects.scm` capture to select (`Some("loop.inner")`, `Some("function.around")`)
+/// or `None` to unbind. The server applies it to the editor's text-object registry
+/// (`Editor::set_textobject_map`). Not treesitter-engine state, so it flows in its
+/// own op queue rather than [`TsOp`] (which is native-only) — the binding is plain
+/// editor state and applies in every build.
+#[derive(Clone, Debug)]
+pub struct TextObjectOp {
+    pub lhs: String,
+    pub capture: Option<String>,
+}
+
 /// A `nvim_feedkeys(keys, mode, …)` request: enqueue `keys` (vim key-notation)
 /// into the server's typeahead, to be processed at the end of the current input
 /// batch / off-tick settle. `remap` (the `m`/default flag, cleared by `n`) routes

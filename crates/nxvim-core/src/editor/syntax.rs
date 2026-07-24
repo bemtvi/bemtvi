@@ -332,6 +332,24 @@ impl Editor {
             .is_some_and(|engine| engine.folds_available(buf))
     }
 
+    /// Byte ranges of `buf`'s `textobjects.scm` nodes captured as `capture` (e.g.
+    /// `"function.inner"`) that contain `byte`, innermost first — the tree-sitter
+    /// text-object source (`vif`, `daf`, …). Syncs the engine's shadow to the latest
+    /// edits first, like every other engine query. Empty with no engine / grammar /
+    /// query. See [`Editor::ts_text_object_range`](crate::Editor::ts_text_object_range).
+    pub(crate) fn ts_text_objects_at(
+        &mut self,
+        buf: BufferId,
+        capture: &str,
+        byte: usize,
+    ) -> Vec<(usize, usize)> {
+        self.sync_syntax_engine(buf);
+        match self.syntax.as_mut() {
+            Some(engine) => engine.text_objects_at(buf, capture, byte),
+            None => Vec::new(),
+        }
+    }
+
     /// Whether `buf`'s treesitter parse is still in progress — a large file whose
     /// parse was cancelled by the engine's per-frame deadline and is being resumed
     /// across frames. The server reads this after a redraw to keep scheduling frames

@@ -33,6 +33,12 @@ use anyhow::{anyhow, bail, Context, Result};
 /// transitively. Override with `$NXVIM_TS_REF` (a branch, tag, or sha).
 const NVIM_TS_REF: &str = "4916d6592ede8c07973490d9322f187e07dfefac";
 
+/// nvim-treesitter-textobjects commit the install reads `textobjects.scm` from.
+/// The textobjects queries live in this **separate** repo (nvim-treesitter core
+/// ships none), under `queries/<lang>/textobjects.scm` — a different path than the
+/// core repo's `runtime/queries/`. Pinned; override with `$NXVIM_TS_TEXTOBJECTS_REF`.
+const NVIM_TS_TEXTOBJECTS_REF: &str = "898ee307df58f854d11cd7edd06472574d48014e";
+
 /// Zig version fetched when no system compiler is found. The per-target archive
 /// + SHA-256 are pinned in [`zig_target`]; bump all three together.
 const ZIG_VERSION: &str = "0.15.2";
@@ -253,6 +259,25 @@ fn fetch_query_set(data_dir: &Path, lang: &str) -> Result<(Vec<String>, Vec<Stri
                 .with_context(|| format!("write {name}.scm"))?;
             written.push((*name).to_string());
         }
+    }
+    // `textobjects.scm` is not in nvim-treesitter core — fetch it from the separate
+    // nvim-treesitter-textobjects repo (different repo *and* path), writing it beside
+    // the core queries so the engine reads it off the same `<data>/queries/<lang>/`.
+    let to_url = format!(
+        "https://raw.githubusercontent.com/nvim-treesitter/nvim-treesitter-textobjects/{}/queries/{lang}/textobjects.scm",
+        nvim_ts_textobjects_ref()
+    );
+    if let Some(bytes) = fetch_opt(&to_url)? {
+        if let Ok(text) = std::str::from_utf8(&bytes) {
+            for l in parse_inherits_modeline(text) {
+                if !inherits.contains(&l) {
+                    inherits.push(l);
+                }
+            }
+        }
+        std::fs::write(dir.join("textobjects.scm"), &bytes)
+            .with_context(|| "write textobjects.scm".to_string())?;
+        written.push("textobjects".to_string());
     }
     Ok((written, inherits))
 }
@@ -518,6 +543,13 @@ fn verify_sha256(bytes: &[u8], expected: &str) -> Result<()> {
 /// pinning a different snapshot via `$NXVIM_TS_REF`).
 fn nvim_ts_ref() -> String {
     std::env::var("NXVIM_TS_REF").unwrap_or_else(|_| NVIM_TS_REF.to_string())
+}
+
+/// nvim-treesitter-textobjects ref to read `textobjects.scm` from (pinned
+/// [`NVIM_TS_TEXTOBJECTS_REF`], overridable via `$NXVIM_TS_TEXTOBJECTS_REF`).
+fn nvim_ts_textobjects_ref() -> String {
+    std::env::var("NXVIM_TS_TEXTOBJECTS_REF")
+        .unwrap_or_else(|_| NVIM_TS_TEXTOBJECTS_REF.to_string())
 }
 
 /// GET `url` into bytes, failing on any non-success status. With `$NXVIM_TS_MIRROR`

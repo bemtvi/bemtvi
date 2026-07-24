@@ -199,12 +199,29 @@ import("./ts-folds.js")
   .catch((e) => postMessage({ type: "config_error", error: "ts-folds unavailable: " + (e && e.stack ? e.stack : e) }))
   .finally(() => { folderSettled = true; });
 
-// One `:TSInstall <lang>` evicts BOTH tree-sitter runners' caches for that language, so the
-// next indent/fold query reloads the freshly installed parser + queries. The single
-// `eh_js_ts_reload` FFI export (lib.rs) forwards here.
+// Tree-sitter TEXT OBJECTS (web/ts-textobjects.js) — the same in-tick story: `vif`/`daf`/
+// `dia` ask the core for a syntactic range while converging the keystroke, so the runner
+// answers HERE, synchronously, through the `eh_js_ts_textobjects*` FFI bridge. Loaded
+// dynamically + guarded: a failure degrades to "no tree-sitter text objects" (the core
+// falls through to nothing), never aborts the worker.
+let textobjects = null;
+let textobjectsSettled = false;
+import("./ts-textobjects.js")
+  .then(({ createTextObjects }) => {
+    textobjects = createTextObjects();
+    globalThis.__nxvimTsTextObjects = (lang, text, capture, byte) => textobjects.textObjectsAt(lang, text, capture, byte);
+    globalThis.__nxvimTsTextObjectsAvailable = (lang) => textobjects.available(lang);
+  })
+  .catch((e) => postMessage({ type: "config_error", error: "ts-textobjects unavailable: " + (e && e.stack ? e.stack : e) }))
+  .finally(() => { textobjectsSettled = true; });
+
+// One `:TSInstall <lang>` evicts ALL tree-sitter runners' caches for that language, so the
+// next indent/fold/text-object query reloads the freshly installed parser + queries. The
+// single `eh_js_ts_reload` FFI export (lib.rs) forwards here.
 globalThis.__nxvimTsReload = (lang) => {
   if (indenter) indenter.reload(lang);
   if (folder) folder.reload(lang);
+  if (textobjects) textobjects.reload(lang);
 };
 
 // Whether the tree-sitter runners have async work the SAB run loop must stay event-loop-live
@@ -215,8 +232,10 @@ globalThis.__nxvimTsReload = (lang) => {
 const indenterBusy = () =>
   !indenterSettled ||
   !folderSettled ||
+  !textobjectsSettled ||
   (indenter !== null && indenter.pendingLoads() > 0) ||
-  (folder !== null && folder.pendingLoads() > 0);
+  (folder !== null && folder.pendingLoads() > 0) ||
+  (textobjects !== null && textobjects.pendingLoads() > 0);
 
 const h = eh_new();
 if (h === 0) {
@@ -392,6 +411,8 @@ function currentFrame() {
     // Likewise warm the fold runner so tree-sitter folds are ready before the user enables
     // `foldmethod=expr`. Same async/idempotent contract as the indenter.
     if (folder) folder.ensureForFrame(frame);
+    // And the text-object runner, so `vif`/`daf` resolve on the first try. Same contract.
+    if (textobjects) textobjects.ensureForFrame(frame);
     return frame;
   } catch (e) {
     postMessage({ type: "fatal", error: `redraw JSON parse failed: ${e}` });

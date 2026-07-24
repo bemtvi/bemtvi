@@ -70,6 +70,23 @@ extern "C" {
     fn eh_js_ts_folds(lang: *const c_char, text: *const c_char, out: *mut i32, cap: i32) -> i32;
     /// `1` if a grammar with a `folds.scm` is loaded for `lang`, else `0`.
     fn eh_js_ts_folds_available(lang: *const c_char) -> i32;
+    /// Byte ranges of `text`'s `textobjects.scm` nodes captured as `capture` (e.g.
+    /// `function.inner`) that contain byte offset `byte`, written into the `cap`-int
+    /// `out` buffer as flat `[start, end, …]` **byte** pairs, innermost (smallest
+    /// span) first. Returns the total number of i32s needed (may exceed `cap` — the
+    /// caller grows + retries); `-1` if no tree-sitter text objects are available (no
+    /// runner / grammar loading / no `textobjects.scm`). The JS side converts between
+    /// the core's UTF-8 byte offsets and web-tree-sitter's UTF-16 units.
+    fn eh_js_ts_textobjects(
+        lang: *const c_char,
+        text: *const c_char,
+        capture: *const c_char,
+        byte: i32,
+        out: *mut i32,
+        cap: i32,
+    ) -> i32;
+    /// `1` if a grammar with a `textobjects.scm` is loaded for `lang`, else `0`.
+    fn eh_js_ts_textobjects_available(lang: *const c_char) -> i32;
 }
 
 /// The outbound effects the wasm edit-host captures for the UI to drain. The
@@ -484,6 +501,62 @@ impl SyntaxEngine for WasmSyntax {
     fn folds_available(&self, buffer: BufferId) -> bool {
         self.lang_for(buffer)
             .is_some_and(|lang| unsafe { eh_js_ts_folds_available(lang.as_ptr()) != 0 })
+    }
+
+    fn text_objects_at(
+        &mut self,
+        buffer: BufferId,
+        capture: &str,
+        byte: usize,
+    ) -> Vec<(usize, usize)> {
+        let Some(state) = self.buffers.get(&buffer) else {
+            return Vec::new();
+        };
+        let (Some(lang), Ok(text), Ok(capture)) = (
+            Self::lang_cstr(&state.language),
+            CString::new(state.shadow.as_str()),
+            CString::new(capture),
+        ) else {
+            return Vec::new();
+        };
+        // Same grow-and-retry protocol as `folds`: the worker writes flat `[start, end,
+        // …]` byte pairs and returns the count needed; grow once past the initial 512
+        // ranges if a query is unusually rich. The `MAX` cap defends against a hostile
+        // runner returning an inflated count sizing a multi-GB `Vec` (32-bit wasm).
+        const MAX_INTS: usize = 1 << 20;
+        let mut buf = vec![0i32; 1024];
+        loop {
+            let needed = unsafe {
+                eh_js_ts_textobjects(
+                    lang.as_ptr(),
+                    text.as_ptr(),
+                    capture.as_ptr(),
+                    byte as i32,
+                    buf.as_mut_ptr(),
+                    buf.len() as i32,
+                )
+            };
+            if needed < 0 {
+                return Vec::new(); // no tree-sitter text objects available
+            }
+            let needed = needed as usize;
+            if needed <= buf.len() {
+                buf.truncate(needed);
+                break;
+            }
+            if buf.len() >= MAX_INTS {
+                break;
+            }
+            buf = vec![0i32; needed.min(MAX_INTS)];
+        }
+        buf.chunks_exact(2)
+            .map(|c| (c[0].max(0) as usize, c[1].max(0) as usize))
+            .collect()
+    }
+
+    fn text_objects_available(&self, buffer: BufferId) -> bool {
+        self.lang_for(buffer)
+            .is_some_and(|lang| unsafe { eh_js_ts_textobjects_available(lang.as_ptr()) != 0 })
     }
 
     fn set_query(&mut self, _lang: &str, _name: &str, _text: Option<String>) -> Result<(), String> {

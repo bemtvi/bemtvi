@@ -1951,19 +1951,42 @@ impl Editor {
         Some((geom.col, geom.row, geom.width, win))
     }
 
-    /// The open cmdline **wildmenu** box's `menu_geom` row/col/width/height (windows-area
-    /// frame) plus the editor width — what the server's cmdline-docs sync needs to place
-    /// the docs float beside / below it (the same inputs the old `project_cmdline_docs`
-    /// received at redraw). `None` unless a [`MenuPlacement::Cmdline`] menu is open.
+    /// The open cmdline **wildmenu** box's placement — `(box_row, box_col, box_w, box_h,
+    /// bound_w)` in the focused window's **region cells** — for the server's cmdline-docs
+    /// sync to place the docs float beside / above it. `None` unless a
+    /// [`MenuPlacement::Cmdline`] menu is open.
+    ///
+    /// The box is anchored to the **command line** (frame bottom), not the focused
+    /// window: the client draws it against `cmd_area`, growing upward, and discards
+    /// `menu_geom`'s `row` (which is focused-window-text-area relative). The docs float,
+    /// though, is a real [`FloatRelative::Editor`](super::windows::FloatRelative) window
+    /// laid out in the focused window's region (origin `0,0`, height the region's tree
+    /// height), so it needs region-relative geometry — not the raw `menu_geom` row, which
+    /// would place it at a focused-window-relative row treated as region-absolute. With a
+    /// split that pulled the float up into the active pane (the half-height `text_height`),
+    /// and even without one left it several rows off the command line. So bottom-align the
+    /// box to the region's tree bottom (just above the command line) and rebase the token
+    /// column into the region, mirroring where the client actually draws the box — the
+    /// cmdline twin of [`complete_docs_geom`](Self::complete_docs_geom)'s region rebasing.
     pub fn cmdline_menu_box(&self) -> Option<(usize, usize, usize, usize, usize)> {
         let m = self.menu_view()?;
         if !matches!(m.placement, MenuPlacement::Cmdline) {
             return None;
         }
-        let (metrics, _win, _num) = self.menu_anchor()?;
+        let (metrics, win, _num) = self.menu_anchor()?;
         let geom = self.menu_geom(&m, metrics);
-        let (editor_w, _) = self.screen_size();
-        Some((geom.row, geom.col, geom.width, geom.height, editor_w))
+        // The region (layer) `win` lives in, laid out at origin `0,0`: its tree width /
+        // height bound the float and give the command-line row (tree bottom); its screen
+        // x rebases the token column (measured from the full-width command line's start).
+        let (layer, _) = self.tree_of_window(win)?;
+        let (region_x, _region_y, region_w, region_h) = self
+            .region_geoms()
+            .into_iter()
+            .find(|g| g.layer == layer)?
+            .tree;
+        let box_row = region_h.saturating_sub(geom.height);
+        let box_col = geom.col.saturating_sub(region_x);
+        Some((box_row, box_col, geom.width, geom.height, region_w))
     }
 
     /// The completion **docs float**'s placement beside the popup box: its outer

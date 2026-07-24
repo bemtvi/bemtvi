@@ -606,6 +606,67 @@ async fn cmdline_docs_use_the_whole_editor_width_not_the_focused_window() {
     );
 }
 
+/// The wildmenu docs float's outer **bottom edge** (`rect.y + rect.height`), or `None`
+/// when no docs float is open.
+fn menu_docs_bottom(map: &[(Value, Value)]) -> Option<u64> {
+    let win = cmdline_docs_window(map)?;
+    let Some(Value::Map(r)) = map_get(&win, "rect") else {
+        return None;
+    };
+    let y = map_get(r, "y").and_then(Value::as_u64)?;
+    let h = map_get(r, "height").and_then(Value::as_u64)?;
+    Some(y + h)
+}
+
+/// Open the wildmenu on `:ed`, select `edit` (row 0), and return the frame that carries
+/// both the active selection and the `[CmdlineDocs]` float — the shared setup for the
+/// anchoring test's two phases.
+async fn open_edit_docs(
+    rpc: &Rpc,
+    incoming: &mut UnboundedReceiver<Incoming>,
+) -> Vec<(Value, Value)> {
+    feed(rpc, ":ed<Tab>");
+    poll_menu(rpc, incoming).await.expect("wildmenu");
+    feed(rpc, "<Tab>");
+    wait_redraw(incoming, |m| {
+        menu_sel_is(m, 0, true) && cmdline_docs_window(m).is_some()
+    })
+    .await
+}
+
+/// The wildmenu docs float anchors to the command line (frame bottom), NOT the focused
+/// window — so a horizontal split, which halves the focused window's height, must not
+/// pull the docs float up into the active split. Regression: the placement derived the
+/// box row from the focused window's `text_height` (a split's half-height) rather than
+/// the editor region, so with a split the float drew mid-screen over the active pane
+/// (and, being several rows off the command line, was misaligned even without a split).
+#[tokio::test]
+async fn cmdline_docs_anchor_to_the_command_line_not_the_focused_split() {
+    let dir = temp_dir("cmdcomplete_hsplit");
+    let (rpc, mut incoming) = start(&dir, INIT).await;
+
+    // Baseline: no split. Record the docs float's bottom edge.
+    let map = open_edit_docs(&rpc, &mut incoming).await;
+    let bottom_no_split = menu_docs_bottom(&map).expect("a docs float without a split");
+
+    // Leave command mode (Esc closes the popup, a second Esc exits the line).
+    feed(&rpc, "<Esc><Esc>");
+    barrier(&rpc).await;
+
+    // Split horizontally — the focused (top) window is now ~half the editor's height —
+    // and repeat. The docs float rides the same command-line row regardless of the split.
+    feed(&rpc, ":split<CR>");
+    barrier(&rpc).await;
+    let map = open_edit_docs(&rpc, &mut incoming).await;
+    let bottom_split = menu_docs_bottom(&map).expect("a docs float with a split");
+
+    assert_eq!(
+        bottom_split, bottom_no_split,
+        "the cmdline docs float must anchor to the command line (frame bottom), not the \
+         focused split: no-split bottom {bottom_no_split}, split bottom {bottom_split}"
+    );
+}
+
 #[tokio::test]
 async fn cmdline_docs_keep_a_usable_width_instead_of_a_one_column_sliver() {
     let dir = temp_dir("cmdcomplete_sliver");

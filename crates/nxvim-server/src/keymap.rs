@@ -73,10 +73,14 @@ impl MatchScope {
         }
     }
 
-    /// The editor mode for the disambiguation oracle, or `None` for a widget scope
-    /// (where the oracle does not apply).
+    /// The editor mode for the disambiguation oracle, or `None` when the oracle does
+    /// not apply — a widget scope, or a Helix mode (the oracle is a fold over the
+    /// *vim* command grammar via [`command_status`], which does not describe Helix's
+    /// selection-first grammar; the native `handle_helix` handler owns disambiguation
+    /// there, so a mapped Helix prefix must never be released early by the vim oracle).
     fn oracle_mode(self) -> Option<Mode> {
         match self {
+            MatchScope::Editing(mode) if mode.is_helix() => None,
             MatchScope::Editing(mode) => Some(mode),
             MatchScope::Widget(_) => None,
         }
@@ -768,6 +772,11 @@ fn mode_buckets(code: &str) -> &'static [char] {
         // in Select mode and never leaks into the `nx.ui.select` widget.
         "s" => &['s'],
         "m" => &['m'],
+        // The Helix selection-first modes share one bucket (`mode_key` maps both
+        // `HelixNormal`/`HelixSelect` to `'h'`). A `nx.keymap.set('helix', …)` lands
+        // here; unmapped keys fall through to the native `handle_helix` grammar (like
+        // the `'m'` placement bucket), so Helix stays usable without the plugin.
+        "helix" => &['h'],
         // Grabbing-widget buckets (configurable widget keys): a `vim.keymap.set
         // ('picker', …)` lands here, and the matcher selects it via a `Widget` scope
         // while that widget grabs input (see [`widget_bucket`]). Distinct from every

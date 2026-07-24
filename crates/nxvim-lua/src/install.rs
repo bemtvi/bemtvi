@@ -3486,6 +3486,20 @@ pub(crate) fn install_runtime_api(
             Ok(())
         })?,
     )?;
+    // `nx._helix_action(name, count?)`: a `helix`-bucket (`'h'`) keymap fired the
+    // named Helix verb (goto/space menus, insert entry, the selection verbs); the
+    // server applies it via `Editor::apply_helix_action`. The Helix sibling of
+    // `nx._select_action`; `count` is the optional map count (usually nil).
+    let sh = shared.clone();
+    nx.set(
+        "_helix_action",
+        lua.create_function(move |_, (name, count): (String, Option<i64>)| {
+            sh.borrow_mut()
+                .helix_actions
+                .push((name, count.map(|c| c.max(0) as usize)));
+            Ok(())
+        })?,
+    )?;
 
     // `nx._decor_register()`: a `nx.decor.provider` was registered — flip the live
     // gate so the server starts dispatching viewport-change signals to providers.

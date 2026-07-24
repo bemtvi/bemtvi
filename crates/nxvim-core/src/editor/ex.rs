@@ -862,6 +862,16 @@ impl Editor {
             "hid" | "hide" => self.close_window(),
             "on" | "only" => self.only_window(),
             "ter" | "term" | "termi" | "termin" | "termina" | "terminal" => self.ex_terminal(args),
+            // Toggle Helix's selection-first editing model on the editor (opt-in;
+            // the Phase-5 plugin drives this the configurable way). Entered/left via
+            // the mode's own state (see `editor::helix`).
+            "helix" => {
+                if self.mode.is_helix() {
+                    self.leave_helix();
+                } else {
+                    self.enter_helix();
+                }
+            }
             "tabnew" | "tabe" | "tabed" | "tabedit" => {
                 if let Some(a) = self.expand_file_arg_or_echo(args) {
                     self.ex_tabnew(&a);

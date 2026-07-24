@@ -384,6 +384,7 @@ impl EditHost {
         let _ = self.lua.take_picker_actions();
         let _ = self.lua.take_select_actions();
         let _ = self.lua.take_cmdline_actions();
+        let _ = self.lua.take_helix_actions();
     }
 
     pub(crate) fn fire_mapping_inner(&mut self, rhs: MappingRhs) {

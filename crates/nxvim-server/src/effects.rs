@@ -439,6 +439,13 @@ impl EditHost {
                 self.editor.echo(format!("E5108: {e}"));
             }
         }
+        // Helix actions a `helix`-bucket keymap fired (`nx._helix_action`): apply each
+        // named verb (with its optional count) to the editor. Unknown names fail loud.
+        for (action, count) in self.lua.take_helix_actions() {
+            if let Err(e) = self.editor.apply_helix_action(&action, count) {
+                self.editor.echo(format!("E5108: {e}"));
+            }
+        }
         // Dock requests from `nx.dock.*` drive the core's dock (edge-panel) state.
         for op in self.lua.take_dock_ops() {
             match op {
@@ -3134,8 +3141,15 @@ impl EditHost {
                 // reached the editor). A leader like `<Space>` folds to a complete
                 // motion, so `command_pending_after` returns `None` and nothing merges.
                 Some(kp) => {
-                    if let Some(cp) = command_pending_after(mode, &parse_keys(&kp.keys)) {
-                        merge_builtin_continuations(kp, &cp.continuations);
+                    // Merge the built-in vim grammar's continuations for a mapped prefix
+                    // that is *also* a built-in (`g`, withheld by the LSP `gd`/… maps) —
+                    // but NOT in Helix: the vim `g`/`z`/… grammar doesn't describe Helix,
+                    // so the Helix `g`/`<Space>` menus are fully defined by their trie
+                    // maps (source A) and must not gain stray vim rows (`gj`/`g#`/tabs).
+                    if !mode.is_helix() {
+                        if let Some(cp) = command_pending_after(mode, &parse_keys(&kp.keys)) {
+                            merge_builtin_continuations(kp, &cp.continuations);
+                        }
                     }
                 }
                 // Nothing withheld: source B is the whole context. The built-in
@@ -3144,7 +3158,15 @@ impl EditHost {
                 // the built-in grammar) is surfaced too, flagged unavailable — kept
                 // visible so the popup doesn't drop rows the user couldn't read yet.
                 None => {
-                    if let Some(cp) = self.editor.command_pending() {
+                    // Source B: the built-in grammar mid-command. In Helix the native
+                    // sub-grammars (`m`/`z`/`f`/`"`/`r`) live outside the vim
+                    // `PendingCommand`, so ask the Helix projection instead.
+                    let pending = if mode.is_helix() {
+                        self.editor.helix_command_pending()
+                    } else {
+                        self.editor.command_pending()
+                    };
+                    if let Some(cp) = pending {
                         let mut continuations: Vec<crate::keymap::Continuation> = cp
                             .continuations
                             .iter()

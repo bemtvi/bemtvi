@@ -2281,8 +2281,10 @@ impl Editor {
         let flag = match self.mode {
             // MultiCursor is a normal-like placement mode: mouse maps gate on the
             // same `n` flag (independent of its now-distinct `mode()` code `m`).
-            Mode::Normal | Mode::MultiCursor => 'n',
-            Mode::Visual | Mode::VisualLine => 'v',
+            // Helix-normal gates like normal, Helix-select like visual (both are
+            // selection-first, but mouse maps reuse the vim `n`/`v` flags).
+            Mode::Normal | Mode::MultiCursor | Mode::HelixNormal => 'n',
+            Mode::Visual | Mode::VisualLine | Mode::HelixSelect => 'v',
             // Vim gates Select-mode mouse on the `s` flag.
             Mode::Select => 's',
             Mode::Insert | Mode::Replace => 'i',

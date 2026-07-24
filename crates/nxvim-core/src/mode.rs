@@ -26,6 +26,18 @@ pub enum Mode {
     /// `nx.win.select_range` (there is no keystroke to enter it from Normal — it is a
     /// primitive a plugin drives, not a muscle-memory mode).
     Select,
+    /// Helix's selection-first *normal* mode (opt-in — see the helix editing model
+    /// plan). Every cursor is a persistent `anchor..head` range, not a point: a
+    /// motion *re-selects* (word/find motions set the anchor to the old head; plain
+    /// h/j/k/l motions collapse the range to a 1-wide block at the target).
+    /// Distinct from [`Mode::Normal`] because the same motion keys mean something
+    /// different here (noun→verb, no operator-pending wait). `v` toggles
+    /// [`Mode::HelixSelect`].
+    HelixNormal,
+    /// Helix's *select* (extend) mode — [`Mode::HelixNormal`] with every motion
+    /// growing the selection: only the `head` moves, the `anchor` stays put. `v`
+    /// enters it from Helix-normal, `<Esc>` returns.
+    HelixSelect,
     /// Terminal-job mode: the current buffer hosts a live PTY child process and
     /// keystrokes are forwarded to it as input bytes (vim/neovim's `t` mode).
     /// `<C-\><C-n>` leaves to Normal, where the terminal buffer reads as ordinary
@@ -68,6 +80,8 @@ impl Mode {
             Mode::Command => "COMMAND",
             Mode::MultiCursor => "MULTICURSOR",
             Mode::Select => "SELECT",
+            Mode::HelixNormal => "HELIX",
+            Mode::HelixSelect => "HELIX-SEL",
             Mode::Terminal => "TERMINAL",
         }
     }
@@ -92,6 +106,13 @@ impl Mode {
             // from Visual (`v`), and so the keymap engine selects an `'s'` trie for it
             // (see `nxvim-server`'s `mode_key`) rather than leaking Visual (`v`) maps in.
             Mode::Select => "s",
+            // nxvim-specific Helix modes — no vim equivalent, so they report their
+            // own multi-char codes (`hn`/`hs`). Distinct from `n`/`v` so a
+            // Normal↔Helix swap is a real `ModeChanged` and a plugin can tell them
+            // apart; the keymap *bucket* is decided separately (see
+            // `keymap::mode_key`), so the reported code need not be a single char.
+            Mode::HelixNormal => "hn",
+            Mode::HelixSelect => "hs",
             Mode::Terminal => "t",
         }
     }
@@ -107,5 +128,19 @@ impl Mode {
 
     pub fn is_visual(self) -> bool {
         matches!(self, Mode::Visual | Mode::VisualLine)
+    }
+
+    /// Whether this is one of the Helix selection-first modes (normal or select).
+    pub fn is_helix(self) -> bool {
+        matches!(self, Mode::HelixNormal | Mode::HelixSelect)
+    }
+
+    /// Whether a persistent selection highlight (anchor→head) should render in this
+    /// mode: vim's visual modes *and* the Helix modes, whose primary range lives in
+    /// `visual_anchor`/`cursor` exactly like a visual selection. The seam the
+    /// selection projection and the shared [`Range`](crate::editor) model consult
+    /// so Helix selections reuse the visual-selection rendering wholesale.
+    pub fn shows_selection(self) -> bool {
+        self.is_visual() || self.is_helix()
     }
 }

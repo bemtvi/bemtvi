@@ -617,6 +617,12 @@ const PRELUDE_MODULES: &[(&str, &str)] = &[
     // connector registers a scheme resolver here; `:connect` routes through the VM and
     // swaps the window via `nx.session.reconnect`, or falls back to the client's direct dial.
     ("nxvim:prelude/connect", include_str!("prelude/connect.lua")),
+    // The Helix selection-first keymap plugin (opt-in — `nx.helix.enable`). Loads
+    // AFTER nx.lua / lsp.lua / picker.lua: it registers `helix`-bucket default maps
+    // that defer to `nx.lsp.*` / `nx.picker.open` (resolved at call time) and drive
+    // the native selection engine through the `nx._helix_action` seam. Inert until a
+    // Helix mode is entered. See docs/plans/2026-07-21-helix-editing-model.md (Phase 5).
+    ("nxvim:prelude/helix", include_str!("prelude/helix.lua")),
     // Built-in `.editorconfig` support. Loads AFTER nx.lua: it builds on `nx.on` /
     // `nx.augroup` (events) plus `nx.fs` (async, above), `nx.bo` (buffer options,
     // state.lua) and the `vim.g` / `vim.b` variable toggle. On by default; switch
@@ -899,6 +905,12 @@ pub(crate) struct Shared {
     /// — the rebindable command-line keys (cancel / submit / backspace / delete /
     /// cursor motion / history / `<C-r>` register arm).
     pub(crate) cmdline_actions: Vec<String>,
+    /// Named Helix actions a `helix`-bucket (`'h'`) keymap fired (`nx._helix_action`),
+    /// drained by the server into `Editor::apply_helix_action` — the named-verb seam
+    /// the Helix-keymap plugin binds (goto/space menus, insert entry, the selection
+    /// verbs). Each carries the optional count the map passed (usually `None`, so the
+    /// verb reads the digits typed before it).
+    pub(crate) helix_actions: Vec<(String, Option<usize>)>,
     /// Marks a `nx.decor` provider published for a window's viewport
     /// (`nx._decor_publish`), drained by the server (generation-gated) into the
     /// provider's namespace in the extmark layer. Empty for a no-provider config.
@@ -1642,6 +1654,12 @@ impl LuaRuntime {
         /// Take the named cmdline actions fired since the last drain, for the server
         /// to apply to the open command line via `Editor::apply_cmdline_action`.
         take_cmdline_actions -> Vec<String> = cmdline_actions
+    }
+
+    take_queue! {
+        /// Take the named Helix actions fired since the last drain, for the server to
+        /// apply via `Editor::apply_helix_action` (name + optional count).
+        take_helix_actions -> Vec<(String, Option<usize>)> = helix_actions
     }
 
     take_queue! {

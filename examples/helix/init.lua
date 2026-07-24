@@ -1,0 +1,81 @@
+-- ~~~ nxvim helix: the selection-first editing model (opt-in) ~~~
+--
+-- Run it (from the repo root) against the sample buffer:
+--
+--     NXVIM_CONFIG=examples/helix \
+--       cargo run -p nxvim -- examples/helix/sample.txt
+--
+-- Helix is a *selection-first* editing model: where vim is verb->noun on a point
+-- cursor (`d` waits for a motion), Helix is noun->verb on a persistent
+-- `anchor..head` RANGE — a motion re-selects on every keystroke, and a verb acts
+-- on the current selection immediately, with no operator-pending wait. Every
+-- cursor is a selection; a bare cursor is a width-1 selection.
+--
+-- The engine (the selection set + the grammar) is native; the KEY LAYOUT ships as
+-- the bundled `nx.helix` plugin (docs/plans/2026-07-21-helix-editing-model.md,
+-- Phase 5). This config just turns it on and shows how to rebind a verb.
+
+-- 1. Turn the model on. `nx.helix.enable()` enters Helix normal mode
+--    (`Mode::HelixNormal`) — the statusline shows `HELIX`. It is opt-in and
+--    idempotent; `:helix` also toggles it interactively. Leave it off and nxvim
+--    stays a plain vim.
+nx.helix.enable()
+
+-- 2. Rebind a verb by name. The plugin routes every key through the named-action
+--    seam `nx.helix.actions.<name>` (-> `nx._helix_action` -> the engine), so any
+--    verb is rebindable in the `helix` keymap mode. Here we add `X` as an alias
+--    for `x` (extend the selection to the whole line). `default = true` is omitted
+--    so this user map wins over any built-in.
+nx.keymap.set("helix", "X", nx.helix.actions.extend_line_below, { desc = "Extend line (alias)" })
+
+-- 3. Add your own goto entry. `gm` jumps to the last line (like the built-in
+--    `ge`) — a named action bound in the goto menu. Any `nx.helix.actions.*` verb
+--    works here; a count typed before the key still applies.
+nx.keymap.set("helix", "gm", nx.helix.actions.goto_last_line, { desc = "Go to last line" })
+
+--------------------------------------------------------------------------------
+-- Try it (in sample.txt, opens in HELIX mode):
+--
+-- Navigation re-selects as you move (watch the highlight follow the cursor):
+--   w              -> selects the word + trailing space, up to the next word
+--   b / e          -> select back a word / to the end of the word
+--   f.             -> select forward to the next "."
+--   x              -> select the whole line;  x again -> grow one line down
+--   X              -> same (your rebind from section 2)
+--
+-- Verbs act on the selection NOW (no motion wait):
+--   wd             -> select a word, then delete it
+--   wc  Xyz <Esc>  -> select a word, change it to "Xyz", <Esc> resumes HELIX
+--   wy             -> yank the selection (it stays highlighted, Helix-style)
+--   ~              -> switch case of the selection
+--
+-- Multi-selection (Helix's always-on default):
+--   %              -> select the whole file
+--   s the <CR>     -> spawn one selection per match of /the/ inside the selection
+--   d              -> delete them all at once
+--   ,              -> collapse back to just the primary selection
+--   C              -> copy the selection onto the next line (a second cursor)
+--
+-- Document search (the whole MATCH is selected, unlike vim's point cursor):
+--   /the <CR>      -> jump to the next "the" and select it  (? searches backward)
+--   n / N          -> next / previous match, re-selecting each
+--   v then /the    -> in select mode search KEEPS your selection and ADDS each match
+--                     as a new one (a multi-selection); every n adds the next too.
+--                     Your selection stays visible while you type the pattern.
+--   Search is smart-case here (a lowercase /the matches "The") — a self-contained
+--   Helix default that never touches :set ignorecase. Turn it off in section 1 with
+--   nx.helix.enable{ smart_case = false }, or any time via nx.helix.smart_case(false).
+--
+-- Insert entry (from the plugin — the cursor moves to the selection edge first):
+--   i / a          -> insert before / append after the selection
+--   I / A          -> insert at first-non-blank / end of line
+--   o / O          -> open a line below / above
+--
+-- Menus (the plugin's layers):
+--   gg / ge / gm   -> go to file start / last line / last line (your rebind)
+--   gh / gl        -> go to line start / end
+--   <Space>f       -> file picker      <Space>/  -> global search
+--   <Space>b       -> buffer picker    <Space>d  -> diagnostics
+--   u / U          -> undo / redo
+--
+-- Toggle back to vim at any time with  :helix  (or `nx.helix.disable()`).

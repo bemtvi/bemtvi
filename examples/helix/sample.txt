@@ -1,0 +1,18 @@
+Helix editing model — a scratch buffer to practice on.
+
+The quick brown fox jumps over the lazy dog.
+The quick brown fox jumps over the lazy dog.
+The quick brown fox jumps over the lazy dog.
+
+Selections are the noun. A motion re-selects; a verb acts on the selection now.
+Try `w` to select a word, then `d` to delete it — no motion wait in between.
+
+    let greeting = "hello";
+    let target = "world";
+    let message = greeting .. " " .. target;
+
+Multi-selection is the default, not a mode:
+  - `%` selects the whole file
+  - `s` spawns one selection per regex match inside the selection
+  - `C` copies the selection onto the next line
+Then a single verb (`d`, `c`, `~`) acts on every selection at once.

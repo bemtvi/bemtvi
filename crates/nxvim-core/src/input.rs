@@ -598,6 +598,11 @@ fn parse_special(inner: &str) -> Option<Key> {
             KeyCode::Function(fk[1..].parse().ok()?)
         }
         other => {
+            // A single character. nxvim follows neovim's model: a *modified* key
+            // does not distinguish letter casing (`<A-C>` == `<A-c>`); shift is
+            // carried by the `S-` modifier flag (`<A-S-c>`, `<C-S-x>`) — already set
+            // by the strip loop above — not by an uppercase letter. So the char is
+            // taken from the lowercased match string.
             let mut it = other.chars();
             let c = it.next()?;
             if it.next().is_some() {

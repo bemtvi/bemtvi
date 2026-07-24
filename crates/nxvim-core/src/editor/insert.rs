@@ -220,7 +220,9 @@ impl Editor {
             KeyCode::Esc => {
                 // Leaving Insert ends any snippet session (its tabstops are dropped).
                 self.end_snippet();
-                self.mode = Mode::Normal;
+                // In a Helix session (an Insert opened by `c`/`i`/…) return to
+                // HelixNormal, not vim Normal.
+                self.mode = self.base_normal_mode();
                 // Scrub an auto-indent the cursor never typed into (vim's did_ai):
                 // `o`/`O`/`<CR>` then `<Esc>` leaves a *truly* empty line, not a run
                 // of trailing whitespace. Opt out with `indentemptylines`.
@@ -245,6 +247,16 @@ impl Editor {
                     }
                 });
                 self.clamp_cursor();
+                // Helix leaves a caret at each cursor after an insert (`c`/`i`/`o`/…),
+                // never a span stretched over the inserted text. Collapse *every*
+                // selection onto its head — anchor == head, marks kept: a mark-less
+                // secondary would make the next operator span from its head back to the
+                // primary's anchor (`for_each_cursor` only restores `visual_anchor` from
+                // a present mark). This covers `o`/`O`, whose fresh line moves each head
+                // off the line its anchor sat on.
+                if self.mode.is_helix() {
+                    self.helix_collapse_to_cursor();
+                }
                 self.snapshot_taken = false;
             }
             // `Enter` and `Backspace`, like a typed `Char`, run at every cursor via

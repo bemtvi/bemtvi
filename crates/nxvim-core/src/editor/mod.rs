@@ -40,6 +40,7 @@ mod ex;
 pub mod expr;
 mod float;
 mod fold;
+mod helix;
 mod insert;
 mod jumps;
 mod marks;
@@ -55,6 +56,7 @@ mod quickfix;
 mod registers;
 mod search;
 mod select;
+mod selection;
 mod signature;
 pub mod snippet;
 mod syntax;
@@ -82,6 +84,8 @@ pub use self::menu::{
 };
 pub use self::mouse::{ClickSurface, MouseClick, MousePos, StatuslineClick, WheelGesture};
 pub(crate) use self::multicursor::PlacementSnapshot;
+// The shared selection vocabulary both grammars read (see `editor::selection`).
+pub(crate) use self::selection::{Range, Selections};
 // The off-tick save / open requests (the daemon / edit-host fs path, Phase 3e/3f).
 pub use self::buffers::{
     FileChangeAction, FileChangeReason, PendingOpen, PendingQuitAll, PendingSave,
@@ -306,6 +310,24 @@ enum CmdlineKind {
     /// same channel `Prompt` uses; the Lua side reads it back as a number). The
     /// rendered message + buttons are held in [`Editor::cmdline_prompt`].
     Confirm,
+    /// A Helix selection-regex prompt (`s`/`S`/`K`/`Alt-K`): the typed pattern is
+    /// applied to the current selection set on `<CR>` via
+    /// [`Editor::helix_apply_regex`] (`<Esc>` cancels). Opened from a Helix mode,
+    /// it resumes [`Mode::HelixNormal`] on close. See [`crate::editor::helix`].
+    HelixRegex(HelixRegexOp),
+}
+
+/// Which selection transform a [`CmdlineKind::HelixRegex`] prompt drives.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum HelixRegexOp {
+    /// `s` — replace each selection with one selection per regex match within it.
+    Select,
+    /// `S` — split each selection on the regex (the gaps between matches).
+    Split,
+    /// `K` — keep only the selections that contain a match.
+    Keep,
+    /// `Alt-K` — keep only the selections that do *not* contain a match.
+    Remove,
 }
 
 /// The full materialized state at one undo point: text plus the bits vim keeps
@@ -1239,6 +1261,58 @@ pub struct Editor {
     /// into the selection projection and the replace so a linewise Select highlights
     /// and replaces whole lines. Only meaningful while in Select mode.
     select_linewise: bool,
+    /// Whether the editor is in a Helix *session* — the selection-first editing
+    /// model is active (entered with `:helix`; the Phase-5 plugin drives it the
+    /// configurable way). Persists across an Insert session opened by a Helix verb
+    /// (`c`), so leaving Insert returns to [`Mode::HelixNormal`] rather than vim's
+    /// Normal (see [`Editor::base_normal_mode`]). `false` in the default vim model.
+    helix: bool,
+    /// Whether Helix-session search defaults to **smart-case** (case-insensitive
+    /// unless the pattern carries an uppercase char) — Helix's own default, kept
+    /// self-contained from the global `'ignorecase'`/`'smartcase'` that vim-mode
+    /// search reads (so entering Helix never mutates them). Consulted only while
+    /// [`Editor::helix`] is set (see [`Editor::search_ignorecase`]); toggled by the
+    /// `smart_case_on` / `smart_case_off` Helix actions (`nx.helix.smart_case`,
+    /// `nx.helix.enable{ smart_case = … }`). Default `true`.
+    helix_smart_case: bool,
+    /// The count digits accumulated in a Helix mode (`3w`), awaiting a motion.
+    /// Kept **out** of the vim [`PendingCommand`] on purpose — the two grammars
+    /// disagree about what a motion does, so Helix input never threads through the
+    /// operator-pending state machine (see [`crate::editor::helix`]). `None` when no
+    /// count is pending.
+    helix_count: Option<usize>,
+    /// A Helix find-char motion (`f`/`t`/`F`/`T`) awaiting its target character —
+    /// the next key completes it. `None` the rest of the time.
+    helix_find: Option<FindKind>,
+    /// Whether a Helix `r` (replace) is awaiting its replacement character — the
+    /// next key overwrites every selected character with it (newlines preserved).
+    /// Read raw like [`Self::helix_find`], so a target a `helix`-bucket keymap also
+    /// binds is consumed here rather than firing that map.
+    helix_replace: bool,
+    /// Whether a Helix `z` (view) is awaiting its second key (`zz`/`zt`/`zb`) — a
+    /// viewport reposition that leaves the selection put. Read raw like
+    /// [`Self::helix_replace`]. `false` outside a `z` sequence.
+    helix_view: bool,
+    /// Whether a Helix `"` is awaiting its register name — the next key sets
+    /// [`PendingCommand::register`] so the following verb (`y`/`d`/`c`/`p`/`P`/`R`)
+    /// reads/writes that register. Read raw like [`Self::helix_replace`]. `false`
+    /// outside a `"` sequence.
+    helix_register: bool,
+    /// The in-flight Helix match-mode (`m`) sub-state, awaiting its next key: `mm`
+    /// (goto match), `mi`/`ma` (text objects), `ms`/`md`/`mr` (surround add / delete
+    /// / replace). Multi-key, so — like [`Self::helix_find`] — it is read raw via
+    /// [`Self::awaiting_command_continuation`]. `None` outside a match sequence.
+    helix_match: Option<helix::HelixMatch>,
+    /// The selection stashed while a Helix surround-replace (`mr{from}`) previews its
+    /// target delimiters: after `{from}` is typed the delimiters light up (the live
+    /// selection becomes them), and `{to}` restores this original selection once the
+    /// swap applies. `None` unless an `mr` is mid-sequence (also restored on `<Esc>`).
+    helix_surround_orig: Option<Selections>,
+    /// The selection byte ranges `(lo, hi_exclusive)` captured when a Helix
+    /// selection-regex prompt (`s`/`S`/`K`/`Alt-K`) opened, so the live preview can
+    /// light up the pattern's matches *within* the selections as the pattern is
+    /// typed (`search_highlights_in`). Empty outside such a prompt.
+    helix_regex_ranges: Vec<(usize, usize)>,
     /// State for the in-flight left-button gesture: the multi-click counter that
     /// escalates char → word → line on same-cell presses within `'mousetime'`, and
     /// the anchor a drag extends from. Held across a press → drag → release and the
@@ -1841,6 +1915,16 @@ impl Editor {
             visual_anchor: Cursor::default(),
             select_escape_insert: false,
             select_linewise: false,
+            helix: false,
+            helix_smart_case: true,
+            helix_count: None,
+            helix_find: None,
+            helix_replace: false,
+            helix_view: false,
+            helix_register: false,
+            helix_match: None,
+            helix_surround_orig: None,
+            helix_regex_ranges: Vec::new(),
             mouse_select: None,
             statusline_click_seq: None,
             mouse_resize: None,
@@ -2127,6 +2211,7 @@ impl Editor {
             // Select mode's printable-replaces keys route through their own handler,
             // not the Normal/Visual command grammar (see [`Editor::handle_select`]).
             Mode::Select => self.handle_select(key),
+            Mode::HelixNormal | Mode::HelixSelect => self.handle_helix(key),
             _ => self.handle_normal(key),
         }
 
@@ -2423,7 +2508,23 @@ impl Editor {
     /// the fix is to route that chord through the grammar's `WindowLayerPending`, not to
     /// re-introduce a bespoke clause.
     pub fn awaiting_command_continuation(&self) -> bool {
-        self.pending.operator.is_some() || self.pending.stage != Stage::Start
+        self.pending.operator.is_some()
+            || self.pending.stage != Stage::Start
+            // A pending Helix `f`/`t`/`F`/`T` awaits its target character, read raw
+            // exactly like vim's `f{char}` — otherwise a target that a `helix`-bucket
+            // keymap also binds (`a`/`i`/`g`/…) would fire that verb instead of being
+            // consumed as the find target. The `pending_empty()` gate at the caller
+            // keeps this from clashing with map disambiguation.
+            || self.helix_find.is_some()
+            // A pending Helix `r` awaits its replacement character, read raw for the
+            // same reason (`a`/`i`/`g`/… may be mapped in the `helix` bucket).
+            || self.helix_replace
+            // A pending Helix `z` (view) awaits its placement key raw (`t`/`z`/`b`).
+            || self.helix_view
+            // A pending Helix `"` awaits its register-name key raw.
+            || self.helix_register
+            // Match mode (`m…`) awaits its next key raw for the same reason.
+            || self.helix_match.is_some()
     }
 
     /// The fixed end of the visual selection (the other end is [`Self::cursor`]).
@@ -2453,6 +2554,16 @@ impl Editor {
                 Mode::Visual
             });
         }
+        // A Helix selection (`anchor..head`) renders exactly like a charwise visual
+        // selection — inclusive of the head — so it reuses the same projection.
+        if self.mode.is_helix() {
+            return Some(Mode::Visual);
+        }
+        // A command line opened over a Visual / Helix selection keeps it painted:
+        // `cmdline_from_visual` carries the mode to render (a Helix origin is stored
+        // as charwise `Visual`). A `/`,`?` search (its moving end tracks the
+        // incsearch preview at `cursor`, except in a Helix session where the
+        // selection stays put) and a `:'<,'>...` ex command both stay lit.
         if self.mode == Mode::Command {
             return self.cmdline_from_visual;
         }

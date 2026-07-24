@@ -81,7 +81,7 @@ impl Editor {
     }
 
     /// The byte offset of [`Cursor`] `c` in the current buffer.
-    fn anchor_byte(&self, c: Cursor) -> usize {
+    pub(crate) fn anchor_byte(&self, c: Cursor) -> usize {
         self.buffer().byte_at(c.line, c.col)
     }
 
@@ -101,27 +101,95 @@ impl Editor {
         }
     }
 
+    /// Project the live cursor state into the unified [`Selections`] view both
+    /// editing grammars read: the **primary** ([`Editor::cursor`], paired with
+    /// [`Editor::visual_anchor`] inside a visual mode, else a point) as range 0,
+    /// then every **secondary** cursor extmark ([`CURSOR_NS`] head + its paired
+    /// [`ANCHOR_NS`] anchor, falling back to the head for an unpaired mark),
+    /// ordered by head byte. Always non-empty — the primary is always present.
+    /// The inverse of [`Editor::set_selections`]; see [`crate::editor::selection`].
+    pub(crate) fn selections(&self) -> Selections {
+        // Whether the primary carries a distinct anchor (a visual selection or a
+        // Helix range); otherwise it's a point at the cursor.
+        let anchored = self.mode.shows_selection();
+        let primary = Range {
+            anchor: if anchored {
+                self.visual_anchor
+            } else {
+                self.cursor
+            },
+            head: self.cursor,
+        };
+        // Collect the secondary (head, anchor) byte pairs first — chaining a
+        // `self.anchor_mark_pos` inside the `cursor_marks` iterator is fine (both
+        // are shared borrows), matching `secondary_selections`.
+        let mut secs: Vec<(usize, usize)> = self
+            .cursor_marks()
+            .map(|m| (m.start, self.anchor_mark_pos(m.id).unwrap_or(m.start)))
+            .collect();
+        secs.sort_unstable_by_key(|&(head, _)| head);
+        let mut ranges = Vec::with_capacity(1 + secs.len());
+        ranges.push(primary);
+        for (head, anchor) in secs {
+            ranges.push(Range {
+                anchor: self.cursor_at_byte(anchor),
+                head: self.cursor_at_byte(head),
+            });
+        }
+        Selections { ranges, primary: 0 }
+    }
+
+    /// Write a [`Selections`] set back into the live state — the inverse of
+    /// [`Editor::selections`]. The primary range lands in [`Editor::cursor`] (and
+    /// [`Editor::visual_anchor`] when the mode carries a selection); every **other**
+    /// range is rebuilt as a secondary [`CURSOR_NS`] head (with a paired
+    /// [`ANCHOR_NS`] anchor). The secondary set is rebuilt wholesale, so extmark ids
+    /// are *not* stable across a write — callers must not rely on them.
+    pub(crate) fn set_selections(&mut self, sel: &Selections) {
+        let anchored = self.mode.shows_selection();
+        let primary = sel.primary();
+        self.cursor = primary.head;
+        if anchored {
+            self.visual_anchor = primary.anchor;
+        }
+        let bid = self.cur_buffer();
+        self.buffers
+            .get_mut(bid)
+            .buffer
+            .extmarks
+            .clear(CURSOR_NS, None);
+        self.buffers
+            .get_mut(bid)
+            .buffer
+            .extmarks
+            .clear(ANCHOR_NS, None);
+        for (i, r) in sel.ranges.iter().enumerate() {
+            if i == sel.primary {
+                continue;
+            }
+            let head = self.anchor_byte(r.head);
+            let id = self.set_cursor_mark(None, head);
+            if anchored {
+                let anchor = self.anchor_byte(r.anchor);
+                self.set_anchor_mark(id, anchor);
+            }
+        }
+    }
+
     /// Visual `o`/`O`: move the cursor to the **other end** of the selection,
     /// swapping head and anchor so the side you started from becomes the movable
-    /// one. The primary swaps [`Editor::cursor`] with [`Editor::visual_anchor`];
-    /// each secondary swaps its [`CURSOR_NS`] head with its paired [`ANCHOR_NS`]
-    /// anchor. The selection span is unchanged — only which end moves. A no-op
-    /// outside a visual mode.
+    /// one — at the primary and every secondary alike. The selection spans are
+    /// unchanged; only which end moves. Expressed as a round-trip through the
+    /// shared [`Selections`] seam (flip every range). A no-op outside a visual mode.
     pub(crate) fn visual_swap_ends(&mut self) {
         if !self.mode.is_visual() {
             return;
         }
-        std::mem::swap(&mut self.cursor, &mut self.visual_anchor);
-        // Swap each secondary's head and anchor. Collect first (the swap mutates
-        // the same store we're iterating).
-        let pairs: Vec<(u64, usize, usize)> = self
-            .cursor_marks()
-            .filter_map(|m| Some((m.id, m.start, self.anchor_mark_pos(m.id)?)))
-            .collect();
-        for (id, head, anchor) in pairs {
-            self.set_cursor_mark(Some(id), anchor);
-            self.set_anchor_mark(id, head);
+        let mut sel = self.selections();
+        for r in &mut sel.ranges {
+            *r = r.flipped();
         }
+        self.set_selections(&sel);
         self.clamp_cursor();
     }
 
@@ -396,11 +464,12 @@ impl Editor {
             return;
         }
 
-        // In a visual mode each cursor carries its own anchor; restore it into
-        // `visual_anchor` before each `f` so an operator brackets that cursor's
-        // own selection. Captured up front because an editing `f` (visual `c`)
-        // flips the mode out of visual mid-sweep.
-        let visual = self.mode.is_visual();
+        // In a selection-carrying mode (visual, or a Helix mode — the
+        // `shows_selection` seam) each cursor carries its own anchor; restore it
+        // into `visual_anchor` before each `f` so an operator brackets that
+        // cursor's own selection. Captured up front because an editing `f`
+        // (visual/Helix `c`) flips the mode out of it mid-sweep.
+        let visual = self.mode.shows_selection();
 
         // Park the primary as a head mark too (so it rides the same auto-shift and
         // is handled like any other cursor), plus its anchor when in visual.

@@ -206,6 +206,23 @@ impl Editor {
             return;
         };
         let dir = if same { last_dir } else { last_dir.opposite() };
+        // In Helix a search leaves the whole match *selected*, so the head sits on
+        // its last char. A repeat must start from the selection *edge* the search
+        // is heading away from — the end for a forward repeat, the start for a
+        // backward one — else a backward `N` from the head re-finds the very match
+        // the cursor still sits inside.
+        if self.mode.is_helix() {
+            let r = self.selections().primary();
+            let (lo, hi) = {
+                let a = self.anchor_byte(r.anchor);
+                let h = self.anchor_byte(r.head);
+                (a.min(h), a.max(h))
+            };
+            self.cursor = self.cursor_at_byte(match dir {
+                SearchDir::Forward => hi,
+                SearchDir::Backward => lo,
+            });
+        }
         self.run_search(&pattern, dir, offset, count.max(1), None);
     }
 
@@ -276,6 +293,14 @@ impl Editor {
     /// it stays case-sensitive). This is the default the regex compiler starts
     /// from; an embedded `\c`/`\C` in the pattern overrides it.
     pub(crate) fn search_ignorecase(&self, pattern: &str) -> bool {
+        // A Helix session defaults to its own smart-case, self-contained from the
+        // global `'ignorecase'`/`'smartcase'` (which vim-mode search reads and this
+        // never touches). Gated on the session flag, not the mode, so the live
+        // incsearch preview — typed with the command line in `Mode::Command`, not a
+        // Helix mode — stays consistent with the committed search.
+        if self.helix && self.helix_smart_case {
+            return !pattern.chars().any(|c| c.is_uppercase());
+        }
         self.options.ignorecase
             && !(self.options.smartcase && pattern.chars().any(|c| c.is_uppercase()))
     }
@@ -314,7 +339,7 @@ impl Editor {
     }
 
     /// Compile `pattern` with this editor's case options and active regex engine.
-    fn compile_search(&self, pattern: &str) -> Result<SearchRegex, String> {
+    pub(crate) fn compile_search(&self, pattern: &str) -> Result<SearchRegex, String> {
         SearchRegex::compile(
             pattern,
             self.search_ignorecase(pattern),
@@ -455,8 +480,13 @@ impl Editor {
         // A committed search / `n` / `*` in Normal mode abandons a multi-cursor
         // session — navigating away collapses to the primary. In MULTICURSOR
         // placement mode the search instead *navigates to* a match so you can drop
-        // a cursor there, so the placed cursors are kept.
-        if self.mode != Mode::MultiCursor {
+        // a cursor there, so the placed cursors are kept. Helix **select** mode
+        // (`v`) *accumulates* — a search adds each match as a new selection — so it
+        // keeps the set too; its pre-search selections are captured now (before any
+        // cursor move) to append onto below.
+        let helix_add = op.is_none() && self.mode == Mode::HelixSelect;
+        let pre_sel = helix_add.then(|| self.selections());
+        if self.mode != Mode::MultiCursor && !helix_add {
             self.clear_secondary_cursors();
         }
         // A committed search turns on `hlsearch` highlighting (cleared by `:noh`).
@@ -514,6 +544,28 @@ impl Editor {
             self.record_jump_context();
         }
         self.place_with_offset(ms, me, offset);
+        // In a Helix mode a document search acts on the whole match, not a point
+        // cursor. In **select** mode (`v`) it *adds* the match as a new selection —
+        // keeping every existing one — so a search / `n` accumulates a
+        // multi-selection. In normal mode it *replaces* the selection with the match
+        // (anchor at its start, head on its last grapheme). Only a plain movement
+        // search re-selects; an operator's search-motion (`d/pat`) leaves the range
+        // to `apply_operator` below.
+        if op.is_none() && self.mode.is_helix() && me > ms {
+            let match_range = Range {
+                anchor: self.cursor_at_byte(ms),
+                head: self.cursor_at_byte(self.prev_grapheme_idx(me)),
+            };
+            if let Some(mut sel) = pre_sel {
+                sel.ranges.push(match_range);
+                sel.primary = sel.ranges.len() - 1;
+                self.set_selections(&sel);
+            } else {
+                self.visual_anchor = match_range.anchor;
+                self.cursor = match_range.head;
+            }
+            self.clamp_cursor();
+        }
         if let Some(op) = op {
             // The cursor now rests on the (offset-adjusted) match; the operator
             // spans from there back to where the search began.
@@ -593,6 +645,15 @@ impl Editor {
         if !self.options.incsearch {
             return;
         }
+        // A Helix search does not move the primary while typing: it *adds* the match
+        // as a new selection (select mode) or replaces it only on commit (normal).
+        // Hopping the cursor to the preview would drag the live selection along —
+        // making it look like it is extending — so leave it put. The pattern's
+        // matches still light up via the `Search` highlight channel, and the commit
+        // path re-runs the search from `search_origin` regardless.
+        if self.helix {
+            return;
+        }
         self.cursor = self.search_origin;
         // Preview the pattern only; a trailing `/offset` repositions the preview.
         let (core, offset) = split_search_offset(&self.cmdline, dir.prefix());
@@ -638,9 +699,50 @@ impl Editor {
         let mut matches = vec![Vec::new(); count];
         let mut current = vec![None; count];
 
+        // Helix selection-regex prompt (`s`/`S`/`K`/`Alt-K`): preview the pattern's
+        // matches *within* the captured selection ranges as it is typed — the
+        // would-be new selections. Reuses the `Search` highlight channel (no cursor
+        // hop, no client change); the ranges were snapshotted when the prompt opened.
+        if focused
+            && self.mode == Mode::Command
+            && matches!(self.cmdline_kind, CmdlineKind::HelixRegex(_))
+            && self.options.incsearch
+            && !self.cmdline.is_empty()
+            && !self.helix_regex_ranges.is_empty()
+        {
+            if let Ok(re) = self.compile_search_cached(&self.cmdline) {
+                let line_count = buf.line_count();
+                for (row, row_spans) in matches.iter_mut().enumerate() {
+                    let buf_line = base + row;
+                    if buf_line >= line_count {
+                        break;
+                    }
+                    let ls = buf.line_start(buf_line);
+                    let text = buf.line_cow(buf_line);
+                    let ts = buf.options.effective_tabstop();
+                    let mut vc = unicode::LineVirtcol::new(&text, ts);
+                    for (s, e) in re.find_all(&text) {
+                        let (abs_s, abs_e) = (ls + s, ls + e);
+                        if e > s
+                            && self
+                                .helix_regex_ranges
+                                .iter()
+                                .any(|&(lo, hi)| abs_s >= lo && abs_e <= hi)
+                        {
+                            row_spans.push((vc.at(s), vc.at(e)));
+                        }
+                    }
+                }
+            }
+            return (matches, current);
+        }
+
         let search_dir = match self.cmdline_kind {
             CmdlineKind::Search(dir) => Some(dir),
-            CmdlineKind::Ex | CmdlineKind::Prompt | CmdlineKind::Confirm => None,
+            CmdlineKind::Ex
+            | CmdlineKind::Prompt
+            | CmdlineKind::Confirm
+            | CmdlineKind::HelixRegex(_) => None,
         };
         // The live incsearch preview belongs to the focused window (the command
         // line is there); `hlsearch` is global and shows in every window.

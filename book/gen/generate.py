@@ -54,6 +54,7 @@ def write(path, text):
 # (source doc relative to repo root) -> (book page relative to SRC_DIR)
 IMPORTS = [
     ("docs/features.md", "features/index.md"),
+    ("docs/features/helix-mode.md", "features/helix-mode.md"),
     ("docs/features/multicursor.md", "features/multicursor.md"),
     ("docs/features/smooth-scrolling.md", "features/smooth-scrolling.md"),
     ("docs/features/image-previews.md", "features/image-previews.md"),

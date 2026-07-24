@@ -229,6 +229,16 @@ the paragraph/sentence motions (`{ } ( )`), the screen motions (`H M L`), the
 
 Things nxvim has that neovim doesn't:
 
+- **Helix mode (selection-first editing).** An opt-in `noun→verb` model
+  ([`docs/features/helix-mode.md`](docs/features/helix-mode.md)) alongside the vim
+  grammar: `:helix` (or `nx.helix.enable()`) enters `HELIX`, where every cursor is
+  a persistent `anchor..head` selection, motions re-select as you move (`w`
+  selects the next word), and verbs act on the selection immediately with no
+  operator-pending wait (`wd` deletes a word). Multi-selection is the default;
+  match mode (`m` + tree-sitter text objects), surround, regex-select (`s`/`S`),
+  per-selection insert/paste, and content rotate/align are all there. The engine
+  is native; the key layout is the bundled `nx.helix` plugin, so every verb is
+  rebindable by name (`nx.helix.actions.*`).
 - **Multi-cursor (Helix-style placement mode).** `<A-c>` enters a `MULTICURSOR`
   placement mode and drops a cursor at the current position. There, motions move
   only the active cursor — you navigate (including `/`-search) and drop more

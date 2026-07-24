@@ -13,6 +13,7 @@ the one-liner is the elevator pitch.
 
 | Feature | What it is |
 | --- | --- |
+| [Helix mode (selection-first)](features/helix-mode.md) | An opt-in selection-first editing model (`:helix`): noun→verb on a persistent `anchor..head` range, multi-selection as the default. Motions re-select, verbs act now with no operator-pending wait — match mode, surround, regex-select, and per-selection everything. |
 | [Multi-cursor mode](features/multicursor.md) | Helix/Sublime-style multi-editing: drop N cursors in a dedicated placement mode, then have motions, operators, visual mode, and insert all act on every cursor at once. |
 | [Smooth scrolling](features/smooth-scrolling.md) | Viewport scrolls slide instead of teleporting (neoscroll.nvim built in), interpolated client-side so it stays smooth even over a remote link. On by default. |
 | [Image previews](features/image-previews.md) | Open an image file and the picture renders inline — ratatui-image in the terminal, a GPU texture in the GUI, an `<img>` in the browser. |

@@ -5,7 +5,7 @@ use crate::mode::Mode;
 use crate::unicode;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum CharClass {
+pub(crate) enum CharClass {
     Blank,
     Word,
     Punct,
@@ -20,7 +20,7 @@ enum DisplayCol {
     End,
 }
 
-fn char_class(c: char) -> CharClass {
+pub(crate) fn char_class(c: char) -> CharClass {
     if c == ' ' || c == '\t' || c == '\n' || c == '\r' {
         CharClass::Blank
     } else if c.is_alphanumeric() || c == '_' {
@@ -847,7 +847,12 @@ impl Editor {
     /// Scan backward from `from` (inclusive) for the `open` bracket that
     /// encloses it, honoring nesting. A `close` on `from` itself is the closing
     /// half of the wanted pair, so it is not counted.
-    fn find_unmatched_open(&self, open: char, close: char, from: usize) -> Option<usize> {
+    pub(crate) fn find_unmatched_open(
+        &self,
+        open: char,
+        close: char,
+        from: usize,
+    ) -> Option<usize> {
         let mut idx = from;
         let mut depth = 0i32;
         loop {
@@ -868,7 +873,12 @@ impl Editor {
     }
 
     /// Scan forward from `open_idx` for its matching `close`, honoring nesting.
-    fn find_match_close(&self, open: char, close: char, open_idx: usize) -> Option<usize> {
+    pub(crate) fn find_match_close(
+        &self,
+        open: char,
+        close: char,
+        open_idx: usize,
+    ) -> Option<usize> {
         let last = self.last_char_idx();
         let mut idx = open_idx;
         let mut depth = 0i32;

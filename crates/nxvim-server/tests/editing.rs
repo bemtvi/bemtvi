@@ -41,6 +41,22 @@ mod fileformat;
 mod folds;
 #[path = "editing/global_cmd.rs"]
 mod global_cmd;
+#[path = "editing/helix_actions.rs"]
+mod helix_actions;
+#[path = "editing/helix_match.rs"]
+mod helix_match;
+#[path = "editing/helix_motions.rs"]
+mod helix_motions;
+#[path = "editing/helix_multi.rs"]
+mod helix_multi;
+#[path = "editing/helix_regex.rs"]
+mod helix_regex;
+#[path = "editing/helix_search.rs"]
+mod helix_search;
+#[path = "editing/helix_selections.rs"]
+mod helix_selections;
+#[path = "editing/helix_verbs.rs"]
+mod helix_verbs;
 #[path = "editing/highlights.rs"]
 mod highlights;
 #[path = "editing/indent_pairs.rs"]

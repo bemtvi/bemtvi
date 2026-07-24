@@ -851,3 +851,141 @@ async fn pending_keys_render_modified_gt_as_named_escape() {
         "must never emit <C->> (it re-parses as literal chars), got {got:?}"
     );
 }
+
+// ----- source B: Helix native sub-grammars ---------------------------------
+//
+// Helix's multi-key states (`m` match mode, `z` view, `f`/`t`/`F`/`T` find, `r`
+// replace, `"` register) are driven by `handle_helix`'s own pending fields, outside
+// the vim `PendingCommand`, so `Editor::command_pending` can't see them. The server
+// asks `Editor::helix_command_pending` instead when the mode is Helix, so a
+// which-key still lights up for the native Helix grammar. These assert the projected
+// continuations / labels, mode `hn`. A `flush` after the probe key resolves the
+// matcher's trailing single-key batch and lets the async `on_key_pending` handler
+// settle before the event log is read.
+
+/// Recorder + content + enter Helix, returning after the mode-change event is dropped.
+async fn start_helix(recorder: &str) -> (Rpc, UnboundedReceiver<Incoming>) {
+    let (rpc, incoming) = start().await;
+    exec_lua(&rpc, recorder).await;
+    feed(&rpc, "ihello world<Esc>0:helix<CR>");
+    exec_lua(&rpc, "_G.kp = {}").await;
+    (rpc, incoming)
+}
+
+/// Feed a native Helix sub-grammar prefix and return the settled event log.
+async fn helix_pending_after(rpc: &Rpc, keys: &str) -> String {
+    feed(rpc, keys);
+    flush(rpc).await;
+    events(rpc).await
+}
+
+/// `m` (match mode) enumerates its sub-keys: `mm` goto-match completes (a map);
+/// `mi`/`ma`/`ms`/`md`/`mr` only arm a further stage (groups), sorted by key.
+#[tokio::test]
+async fn helix_match_mode_lists_its_continuations() {
+    let (rpc, _i) = start_helix(RECORDER).await;
+    assert_eq!(
+        helix_pending_after(&rpc, "m").await,
+        "hn|m|\
+         a/Around text object/group,\
+         d/Surround delete/group,\
+         i/Inside text object/group,\
+         m/Goto matching bracket/map,\
+         r/Surround replace/group,\
+         s/Surround add/group"
+    );
+}
+
+/// `mi` lists the text-object alphabet — the vim objects AND the tree-sitter captures
+/// (`f`/`a`/`c`/`t`), the same set `resolve_text_object` accepts.
+#[tokio::test]
+async fn helix_match_inside_lists_the_object_alphabet() {
+    let (rpc, _i) = start_helix(RECORDER).await;
+    let ev = helix_pending_after(&rpc, "mi").await;
+    assert!(ev.contains("hn|mi|"), "keys carry the `mi` prefix: {ev:?}");
+    for row in [
+        "w/Word/map",
+        "p/Paragraph/map",
+        "f/Function/map",
+        "a/Argument/map",
+        "c/Comment/map",
+        "t/Class/map",
+        "(/Parentheses/map",
+    ] {
+        assert!(ev.contains(row), "object menu must list {row:?}: {ev:?}");
+    }
+}
+
+/// `z` (view menu) lists the Helix `zt`/`zz`/`zb` viewport keys — not the wider vim
+/// `z` alphabet.
+#[tokio::test]
+async fn helix_view_menu_lists_zt_zz_zb() {
+    let (rpc, _i) = start_helix(RECORDER).await;
+    assert_eq!(
+        helix_pending_after(&rpc, "z").await,
+        "hn|z|\
+         b/Cursor line to bottom/map,\
+         t/Cursor line to top/map,\
+         z/Cursor line to center/map"
+    );
+}
+
+/// A pending Helix `f` (find) is an any-character leaf: it carries a `label`, no
+/// continuations (source-B recorder shows the label).
+#[tokio::test]
+async fn helix_find_fires_a_label() {
+    let (rpc, _i) = start_helix(RECORDER_B).await;
+    assert_eq!(helix_pending_after(&rpc, "f").await, "hn|f|Find character");
+}
+
+/// A pending Helix `r` (replace-char) carries its label likewise.
+#[tokio::test]
+async fn helix_replace_fires_a_label() {
+    let (rpc, _i) = start_helix(RECORDER_B).await;
+    assert_eq!(
+        helix_pending_after(&rpc, "r").await,
+        "hn|r|Replace character"
+    );
+}
+
+/// A pending Helix `"` (register select) lists the live registers, reusing the same
+/// projection vim's `"` does.
+#[tokio::test]
+async fn helix_register_lists_live_registers() {
+    let (rpc, _i) = start_helix(RECORDER).await;
+    exec_lua(&rpc, "vim.fn.setreg('a', 'hi')").await;
+    exec_lua(&rpc, "_G.kp = {}").await;
+    let ev = helix_pending_after(&rpc, "\"").await;
+    assert!(
+        ev.contains("hn|\"|"),
+        "keys carry the `\"` prefix in Helix normal: {ev:?}"
+    );
+    assert!(
+        ev.contains("a/hi/map"),
+        "the `a` register (contents `hi`) must be listed: {ev:?}"
+    );
+}
+
+/// The Helix `g` goto menu (plugin-mapped, source A) is NOT polluted with the vim
+/// `g`-grammar rows: the built-in merge is skipped in Helix, so `gj`/`g#`/tab keys —
+/// which don't mean the vim thing in Helix — never appear.
+#[tokio::test]
+async fn helix_goto_menu_has_no_stray_vim_rows() {
+    let (rpc, _i) = start_helix(RECORDER).await;
+    let ev = helix_pending_after(&rpc, "g").await;
+    assert!(
+        ev.contains("g/Go to file start/map"),
+        "the Helix goto menu is present: {ev:?}"
+    );
+    for stray in [
+        "Down one display line",
+        "Up one display line",
+        "Next tab",
+        "Search word forward",
+    ] {
+        assert!(
+            !ev.contains(stray),
+            "vim `g`-grammar row {stray:?} must NOT leak into Helix: {ev:?}"
+        );
+    }
+}

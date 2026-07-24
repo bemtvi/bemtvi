@@ -108,11 +108,7 @@ impl Editor {
         // operator before any text is touched (vim beeps and does nothing), and a
         // clipboard target with no provider aborts loudly rather than deleting.
         if matches!(op, 'd' | 'y' | 'c') {
-            if self.register_write_blocked() {
-                return;
-            }
-            if self.clipboard_write_unavailable() {
-                self.echo(CLIPBOARD_UNAVAILABLE);
+            if self.yank_write_blocked() {
                 return;
             }
             // The `` `[ `` / `` `] `` change-bound marks bracket the affected text.
@@ -329,12 +325,7 @@ impl Editor {
         // A read-only register target aborts the operation; vim beeps and stays
         // in visual mode with the selection intact. A clipboard target with no
         // provider aborts loudly, likewise leaving the selection untouched.
-        if self.register_write_blocked() {
-            self.reset_pending();
-            return;
-        }
-        if self.clipboard_write_unavailable() {
-            self.echo(CLIPBOARD_UNAVAILABLE);
+        if self.yank_write_blocked() {
             self.reset_pending();
             return;
         }
@@ -490,16 +481,9 @@ impl Editor {
     fn visual_operate_multi(&mut self, op: char) {
         // `d`/`y`/`c` write a register; a read-only or unavailable-clipboard target
         // aborts the whole operation, leaving the selection intact (vim beeps).
-        if matches!(op, 'd' | 'y' | 'c') {
-            if self.register_write_blocked() {
-                self.reset_pending();
-                return;
-            }
-            if self.clipboard_write_unavailable() {
-                self.echo(CLIPBOARD_UNAVAILABLE);
-                self.reset_pending();
-                return;
-            }
+        if matches!(op, 'd' | 'y' | 'c') && self.yank_write_blocked() {
+            self.reset_pending();
+            return;
         }
         let linewise = self.mode == Mode::VisualLine;
         // Stamp the primary selection's `` `< `` / `` `> `` marks before leaving.
@@ -670,6 +654,288 @@ impl Editor {
         self.clamp_cursor();
     }
 
+    /// Apply a Helix verb to the current (primary) selection **immediately** — no
+    /// operator-pending wait. Helix selections are charwise, so the range is the
+    /// `visual_anchor`..`cursor` span inclusive of the head (`visual_range_lw(false)`).
+    /// `d`/`c`/`y` write a register; `>`/`<`/`=` act on the lines the selection
+    /// touches; `~` switches case. Afterwards the mode returns to
+    /// [`Mode::HelixNormal`] — `d`/`>`/`<`/`=` collapse the selection to a point at
+    /// the cursor, `y`/`~` keep it, and `c` opens Insert (resuming Helix on `<Esc>`).
+    ///
+    /// With multiple selections placed (`C`/`s`/…), the verb runs over every
+    /// selection as one undo group; this body is the single-selection path.
+    pub(crate) fn helix_operate(&mut self, op: char) {
+        if self.cursors_active() {
+            self.helix_operate_multi(op);
+            return;
+        }
+        // `d`/`c`/`y` write a register — a read-only or unavailable-clipboard target
+        // aborts the whole verb, leaving the selection intact (as vim's visual does).
+        if matches!(op, 'd' | 'c' | 'y') && self.yank_write_blocked() {
+            return;
+        }
+        let (lo, hi, _first) = self.visual_range_lw(false);
+        match op {
+            // Yank keeps the selection and the cursor put (Helix leaves the selection
+            // highlighted after a yank), so it can't go through `apply_operator_to_range`
+            // (which moves the cursor to the range start).
+            'y' => {
+                self.record_change_bounds(lo, hi);
+                self.yank_range(lo, hi, false);
+                self.mode = Mode::HelixNormal;
+            }
+            // Switch case in place, keeping the selection.
+            '~' => {
+                self.toggle_case_range(lo, hi);
+                self.mode = Mode::HelixNormal;
+            }
+            // `c` deletes then enters Insert; `d`/`>`/`<`/`=` mutate and settle in
+            // Normal. All flow through the shared range operator (which yanks, guards
+            // `modifiable`, and handles the empty-range change → Insert case).
+            'c' => {
+                self.apply_operator_to_range('c', lo, hi, false, 0);
+                // `apply_operator_to_range` set Insert; `<Esc>` resumes HelixNormal
+                // via `base_normal_mode`. Collapse the anchor so no stale span renders.
+                self.visual_anchor = self.cursor;
+            }
+            'd' | '>' | '<' | '=' => {
+                self.apply_operator_to_range(op, lo, hi, false, 0);
+                self.mode = Mode::HelixNormal;
+                self.visual_anchor = self.cursor;
+            }
+            _ => {}
+        }
+        self.helix_count = None;
+        self.clamp_cursor();
+    }
+
+    /// Apply a Helix verb over **every** selection as one undo group. Helix
+    /// selections share the visual selection's representation
+    /// (`visual_anchor`/`cursor` + secondary [`CURSOR_NS`]/[`ANCHOR_NS`] extmarks),
+    /// so the sweep reuses the visual multi-cursor machinery as-is:
+    /// [`for_each_cursor`](Editor::for_each_cursor) pairs each cursor's own anchor
+    /// into `visual_range_lw` in any mode that carries selections
+    /// ([`Mode::shows_selection`] — visual *and* Helix). `d`/`>`/`<`/`=` collapse
+    /// each selection to a point at its head; `c` opens a multi-cursor Insert;
+    /// `y`/`~` keep the selections.
+    fn helix_operate_multi(&mut self, op: char) {
+        if matches!(op, 'd' | 'c' | 'y') && self.yank_write_blocked() {
+            return;
+        }
+        let keep_selection = matches!(op, 'y' | '~');
+        if op == '~' {
+            self.edit_each_cursor(|ed| {
+                let (lo, hi, _) = ed.visual_range_lw(false);
+                ed.toggle_case_range(lo, hi);
+            });
+        } else {
+            self.edit_each_cursor(|ed| ed.visual_operate_once(op, false));
+        }
+        self.mode = if op == 'c' {
+            Mode::Insert
+        } else {
+            Mode::HelixNormal
+        };
+        // `d`/`>`/`<`/`=` collapse each selection to a point at its head; drop the
+        // per-cursor anchors so no stale span renders. `y`/`~` keep the anchors.
+        if !keep_selection && op != 'c' {
+            self.clear_anchor_marks();
+            self.visual_anchor = self.cursor;
+        }
+        self.helix_count = None;
+        self.clamp_cursor();
+    }
+
+    /// Helix `p` / `P` — paste the register **after** / **before** the selection,
+    /// rather than after the cursor character as vim does. Each selection is
+    /// collapsed to a point at its high (`after`) or low (`!after`) end, then the
+    /// shared vim paste runs there. With multiple selections, every selection pastes
+    /// its **own** slice from the last multi-yank (via [`paste_multi`], keyed by
+    /// document order) — or the unnamed register at each when the counts don't line
+    /// up. The selections settle onto the paste points.
+    pub(crate) fn helix_paste(&mut self, after: bool, count: usize) {
+        // Collapse every selection to a point at the end it pastes against.
+        let mut sel = self.selections();
+        for r in &mut sel.ranges {
+            let a = self.anchor_byte(r.anchor);
+            let h = self.anchor_byte(r.head);
+            let pt = self.cursor_at_byte(if after { a.max(h) } else { a.min(h) });
+            r.anchor = pt;
+            r.head = pt;
+        }
+        self.set_selections(&sel);
+
+        if self.cursors_active() {
+            // Each collapsed head is a paste point; `paste_multi` pairs each with its
+            // own captured slice (ascending document order) when the counts match.
+            self.paste_multi(after, count);
+        } else {
+            self.paste(after, count);
+        }
+        self.mode = Mode::HelixNormal;
+        self.visual_anchor = self.cursor;
+        self.helix_count = None;
+        self.clamp_cursor();
+    }
+
+    /// Toggle the case of every character in `[lo, hi)` in a single undo step — the
+    /// Helix `~` verb over a selection. The span is replaced wholesale, so a
+    /// width-changing case fold stays correct; the cursor/selection are the caller's.
+    pub(crate) fn toggle_case_range(&mut self, lo: usize, hi: usize) {
+        let (lo, hi) = self.snap_range(lo, hi);
+        if lo >= hi {
+            return;
+        }
+        if !self.modifiable() {
+            self.refuse_edit();
+            return;
+        }
+        self.push_undo();
+        let swapped: String = self
+            .buffer()
+            .text
+            .slice(lo..hi)
+            .to_string()
+            .chars()
+            .map(|c| {
+                if c.is_uppercase() {
+                    c.to_lowercase().collect::<String>()
+                } else if c.is_lowercase() {
+                    c.to_uppercase().collect::<String>()
+                } else {
+                    c.to_string()
+                }
+            })
+            .collect();
+        self.buffer_mut().remove(lo..hi);
+        self.buffer_mut().insert(lo, &swapped);
+        self.buffer_mut().modified = true;
+        self.clamp_cursor();
+    }
+
+    /// Helix `r{char}` — overwrite every character in each selection with `char`,
+    /// preserving newlines (only real characters are replaced) and **keeping** the
+    /// selection. Runs over every selection as one undo group when several are
+    /// placed; the single-selection path is the common one.
+    ///
+    /// Like [`Editor::toggle_case_range`], the selection is unmoved: for the usual
+    /// ASCII replacement the byte layout is unchanged, so the head/anchor stay
+    /// exactly on their characters; a width-changing (multi-byte) replacement is
+    /// re-clamped, matching `~`.
+    pub(crate) fn helix_replace_selection(&mut self, c: char) {
+        if self.cursors_active() {
+            self.edit_each_cursor(|ed| {
+                let (lo, hi, _) = ed.visual_range_lw(false);
+                ed.helix_replace_range(lo, hi, c);
+            });
+        } else {
+            let (lo, hi, _) = self.visual_range_lw(false);
+            self.helix_replace_range(lo, hi, c);
+        }
+        self.mode = Mode::HelixNormal;
+        self.helix_count = None;
+        self.clamp_cursor();
+    }
+
+    /// Overwrite `[lo, hi)` character-for-character with `c`, leaving newlines
+    /// intact, in one undo step — the Helix `r` core (a keep-selection in-place
+    /// edit, like [`Editor::toggle_case_range`]). The caller owns the cursor.
+    fn helix_replace_range(&mut self, lo: usize, hi: usize, c: char) {
+        let (lo, hi) = self.snap_range(lo, hi);
+        if lo >= hi {
+            return;
+        }
+        if !self.modifiable() {
+            self.refuse_edit();
+            return;
+        }
+        let replaced: String = self
+            .buffer()
+            .text
+            .slice(lo..hi)
+            .to_string()
+            .chars()
+            .map(|ch| if ch == '\n' { '\n' } else { c })
+            .collect();
+        self.push_undo();
+        self.buffer_mut().remove(lo..hi);
+        self.buffer_mut().insert(lo, &replaced);
+        self.buffer_mut().modified = true;
+    }
+
+    /// Helix `R` — replace each selection with the last yank (the unnamed
+    /// register), leaving the spliced text selected. With multiple selections every
+    /// one receives the same register text (per-selection multi-yank pairing, as
+    /// `p` does, is a future refinement); an empty register is a no-op.
+    pub(crate) fn helix_replace_with_yanked(&mut self) {
+        let Some((text, _kind)) = self.register_text(self.pending.register) else {
+            return;
+        };
+        if self.cursors_active() {
+            self.edit_each_cursor(|ed| ed.helix_splice_selection(&text));
+        } else {
+            self.helix_splice_selection(&text);
+        }
+        self.mode = Mode::HelixNormal;
+        self.helix_count = None;
+        self.clamp_cursor();
+    }
+
+    /// Replace this selection's span with `text`, leaving `text` selected (anchor at
+    /// its start, head on its last grapheme). The per-selection core of Helix `R`;
+    /// its own undo step is coalesced inside [`Editor::edit_each_cursor`].
+    fn helix_splice_selection(&mut self, text: &str) {
+        let (lo, hi, _) = self.visual_range_lw(false);
+        let (lo, hi) = self.snap_range(lo, hi);
+        if !self.modifiable() {
+            self.refuse_edit();
+            return;
+        }
+        self.push_undo();
+        self.buffer_mut().remove(lo..hi);
+        self.buffer_mut().insert(lo, text);
+        self.buffer_mut().modified = true;
+        let end = lo + text.len();
+        self.visual_anchor = self.cursor_at_byte(lo);
+        let head = if end > lo {
+            self.prev_grapheme_idx(end)
+        } else {
+            lo
+        };
+        self.cursor = self.cursor_at_byte(head);
+    }
+
+    /// Helix `J` — join the lines each selection spans into one (space-separated,
+    /// leading whitespace of the joined lines collapsed), then collapse the
+    /// selection to a point at the join. A single-line selection joins with the line
+    /// below; `count` raises the floor on how many lines are pulled up. Runs over
+    /// every selection as one undo group.
+    pub(crate) fn helix_join(&mut self, count: usize) {
+        if self.cursors_active() {
+            self.edit_each_cursor(|ed| ed.helix_join_once(count));
+        } else {
+            self.helix_join_once(count);
+        }
+        self.mode = Mode::HelixNormal;
+        self.clear_anchor_marks();
+        self.visual_anchor = self.cursor;
+        self.helix_count = None;
+        self.clamp_cursor();
+    }
+
+    /// Join the lines this cursor's selection spans, delegating to the shared
+    /// [`Editor::join_lines`] from the selection's top line. One selection's slice of
+    /// Helix `J` (see [`Editor::helix_join`]); opens no undo group of its own.
+    fn helix_join_once(&mut self, count: usize) {
+        let top = self.visual_anchor.line.min(self.cursor.line);
+        let bot = self.visual_anchor.line.max(self.cursor.line);
+        let joins = (bot - top).max(count.max(1));
+        self.cursor.line = top;
+        self.cursor.col = 0;
+        // `join_lines(n)` performs `n - 1` joins (min 1), so `+ 1` yields `joins`.
+        self.join_lines(joins + 1);
+    }
+
     pub(crate) fn toggle_case(&mut self, count: usize) {
         if self.cursor.col >= self.line_len() {
             return;
@@ -831,6 +1097,22 @@ impl Editor {
     /// no bell, the abort is the whole signal. See [`is_readonly_register`].
     fn register_write_blocked(&self) -> bool {
         self.pending.register.is_some_and(is_readonly_register)
+    }
+
+    /// The shared abort guard in front of every register-writing operator
+    /// (`d`/`c`/`y`, vim and Helix alike): true when the write cannot proceed — a
+    /// read-only register target (silent, vim beeps), or a clipboard target with
+    /// no provider (echoes [`CLIPBOARD_UNAVAILABLE`]). The caller bails, leaving
+    /// the selection/text untouched.
+    fn yank_write_blocked(&mut self) -> bool {
+        if self.register_write_blocked() {
+            return true;
+        }
+        if self.clipboard_write_unavailable() {
+            self.echo(CLIPBOARD_UNAVAILABLE);
+            return true;
+        }
+        false
     }
 
     /// The register file projected for the Lua `getreg` / `getregtype` mirror:

@@ -37,7 +37,15 @@ impl Editor {
     /// (`3/foo` finds the 3rd match), stashed for submit since `reset_pending`
     /// clears it.
     pub(crate) fn enter_search(&mut self, dir: SearchDir, count: usize) {
-        self.cmdline_from_visual = self.mode.is_visual().then_some(self.mode);
+        // Keep the selection painted while the line is open (vim leaves a Visual
+        // search's selection lit). A Helix search opened over a selection is the
+        // same — stored as charwise `Visual`, since a Helix range renders that way
+        // (and its head stays put, the incsearch cursor-hop being suppressed).
+        self.cmdline_from_visual = if self.mode.is_helix() {
+            Some(Mode::Visual)
+        } else {
+            self.mode.is_visual().then_some(self.mode)
+        };
         self.cmdline_return_mode = self.search_return_mode();
         self.mode = Mode::Command;
         self.cmdline.clear();
@@ -64,6 +72,7 @@ impl Editor {
             CmdlineKind::Search(SearchDir::Forward) => "/",
             CmdlineKind::Search(SearchDir::Backward) => "?",
             CmdlineKind::Prompt | CmdlineKind::Confirm => "@",
+            CmdlineKind::HelixRegex(_) => "/",
         }
     }
 
@@ -206,6 +215,11 @@ impl Editor {
                 self.cmdline_prompt.clear();
                 self.prompt_results.push(Some(text));
             }
+            CmdlineKind::HelixRegex(op) => {
+                // The mode was already restored to HelixNormal above, so the
+                // transform reads the live selection set correctly.
+                self.helix_apply_regex(op, &text);
+            }
             CmdlineKind::Confirm => {}
         }
     }
@@ -280,6 +294,8 @@ impl Editor {
     pub fn cancel_cmdline(&mut self) {
         // Abandoning the line also dismisses any open completion popup.
         self.close_cmdline_menu();
+        // Drop any Helix selection-regex preview ranges (an abandoned `s`/`S`/… line).
+        self.helix_regex_ranges = Vec::new();
         if matches!(self.cmdline_kind, CmdlineKind::Search(_)) {
             self.cursor = self.search_origin;
             self.clamp_cursor();
@@ -306,8 +322,10 @@ impl Editor {
     /// from Visual, which vim leaves on `:` (the `'<,'>` range carries the
     /// selection into the command).
     fn command_return_mode(&self) -> Mode {
-        if self.mode == Mode::MultiCursor {
-            Mode::MultiCursor
+        if self.mode == Mode::MultiCursor || self.mode.is_helix() {
+            // Keep placement / Helix mode across a `:`-command so it resumes on
+            // close (a `:helix`-toggle running last then swaps it deliberately).
+            self.mode
         } else {
             Mode::Normal
         }
@@ -323,6 +341,9 @@ impl Editor {
     fn search_return_mode(&self) -> Mode {
         match self.mode {
             Mode::Visual | Mode::VisualLine | Mode::MultiCursor => self.mode,
+            // A Helix-mode search resumes Helix, where `run_search` re-selects the
+            // whole match (anchor at its start, head on its last char).
+            m if m.is_helix() => m,
             _ => Mode::Normal,
         }
     }
@@ -492,7 +513,7 @@ impl Editor {
     fn active_history(&self) -> &[String] {
         match self.cmdline_kind {
             CmdlineKind::Ex => &self.ex_history,
-            CmdlineKind::Search(_) => &self.search_history,
+            CmdlineKind::Search(_) | CmdlineKind::HelixRegex(_) => &self.search_history,
             CmdlineKind::Confirm => &[],
             CmdlineKind::Prompt => self
                 .prompt_history_key
@@ -567,6 +588,8 @@ impl Editor {
         match self.cmdline_kind {
             CmdlineKind::Ex => ':',
             CmdlineKind::Search(dir) => dir.prefix(),
+            // The Helix selection-regex prompt reads like a search — a `/` prefix.
+            CmdlineKind::HelixRegex(_) => '/',
             // A `vim.ui.input` prompt and a `vim.fn.confirm` dialog render their
             // multi-char label via `cmdline_prompt()` instead; the single-char
             // prefix is unused (a space keeps the projection well-formed).

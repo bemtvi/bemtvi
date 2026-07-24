@@ -375,7 +375,7 @@ pub(crate) enum FindKind {
 }
 
 impl FindKind {
-    fn from_key(c: char) -> Option<FindKind> {
+    pub(crate) fn from_key(c: char) -> Option<FindKind> {
         Some(match c {
             'f' => FindKind::Find,
             't' => FindKind::Till,
@@ -1719,7 +1719,7 @@ impl Editor {
     /// valid paste sources you can type at the `"` prompt, so the popup lists them
     /// alongside the stored registers; the parallel `register_mirror` (the
     /// `getreg` projection) covers the same specials.
-    fn register_continuations(&self) -> Vec<CommandContinuation> {
+    pub(crate) fn register_continuations(&self) -> Vec<CommandContinuation> {
         let mut out: Vec<CommandContinuation> = self
             .registers
             .entries()

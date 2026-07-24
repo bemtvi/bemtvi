@@ -22,6 +22,7 @@
 # Beyond vim
 
 - [What nxvim adds](features/index.md)
+  - [Helix mode (selection-first)](features/helix-mode.md)
   - [Multi-cursor mode](features/multicursor.md)
   - [Smooth scrolling](features/smooth-scrolling.md)
   - [Image previews](features/image-previews.md)

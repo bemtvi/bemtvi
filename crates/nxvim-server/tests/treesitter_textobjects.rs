@@ -259,3 +259,65 @@ async fn unmap_reverts_to_the_builtin() {
     assert!(!text.contains('1'), "only the inner body deleted: {text:?}");
     assert!(text.contains("fn outer"), "outer fn untouched: {text:?}");
 }
+
+// ----- Helix match-mode tree-sitter text objects ---------------------------
+//
+// The Helix editing model reaches the same syntactic objects through match mode
+// (`maf` / `mif` / `mia`), routed through the shared `resolve_text_object`
+// dispatch — so the tree-sitter captures and the `nx.textobject.map` registry
+// work identically under `:helix`. In Helix, `mi`/`ma` *select* the object at
+// each selection's head; a following `d` deletes the selection.
+
+#[tokio::test]
+async fn helix_maf_selects_the_innermost_function() {
+    let (rpc, _incoming, _g, _d) = open_sample!("to_hx_maf");
+    // Cursor on the inner body literal `1`, enter Helix, select-around-function,
+    // then delete the selection.
+    feed(&rpc, "/1<CR>:helix<CR>");
+    feed(&rpc, "mafd");
+    let text = lines(&rpc).await.join("\n");
+    assert!(!text.contains("fn inner"), "inner fn removed: {text:?}");
+    assert!(text.contains("fn outer"), "outer fn kept: {text:?}");
+    assert!(text.contains("alpha"), "outer body kept: {text:?}");
+}
+
+#[tokio::test]
+async fn helix_count_maf_selects_the_enclosing_function() {
+    let (rpc, _incoming, _g, _d) = open_sample!("to_hx_count");
+    // From inside `inner`, `2maf` selects the *2nd* enclosing function — `outer`,
+    // which contains everything, so deleting the selection empties the buffer.
+    feed(&rpc, "/1<CR>:helix<CR>");
+    feed(&rpc, "2mafd");
+    let text = lines(&rpc).await.join("\n");
+    assert!(!text.contains("fn outer"), "outer fn removed: {text:?}");
+    assert!(
+        !text.contains("fn inner"),
+        "inner fn removed with it: {text:?}"
+    );
+}
+
+#[tokio::test]
+async fn helix_mia_selects_the_argument_under_the_cursor() {
+    let (rpc, _incoming, _g, _d) = open_sample!("to_hx_mia");
+    // `/alpha<CR>` lands on the signature's `alpha`; `mia` selects the parameter.
+    feed(&rpc, "/alpha<CR>:helix<CR>");
+    feed(&rpc, "miad");
+    let first = lines(&rpc).await[0].clone();
+    assert_eq!(first, "fn outer() -> i32 {", "parameter deleted: {first:?}");
+}
+
+#[tokio::test]
+async fn helix_user_registered_object_key_resolves() {
+    let (rpc, _incoming, _g, _d) = open_sample!("to_hx_map");
+    // The `nx.textobject.map` registry feeds Helix match mode too: bind `g` to
+    // @function.outer, then `mig` deletes the whole innermost function.
+    exec_lua(&rpc, "nx.textobject.map('ig', '@function.outer')").await;
+    feed(&rpc, "/1<CR>:helix<CR>");
+    feed(&rpc, "migd");
+    let text = lines(&rpc).await.join("\n");
+    assert!(
+        !text.contains("fn inner"),
+        "user-mapped `ig` selected the fn: {text:?}"
+    );
+    assert!(text.contains("fn outer"), "outer fn kept: {text:?}");
+}

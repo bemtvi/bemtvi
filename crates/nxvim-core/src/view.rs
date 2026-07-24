@@ -845,13 +845,26 @@ fn window_view(ed: &Editor, w: &WindowLayout) -> WindowView {
                 buf, base_line, max_top, line_count, wrap, width, tabstop, wp,
             );
             let band_height = lead + height;
-            // The selection rides the band at the *maximal* extent the slide touches:
-            // anchor → whichever scroll endpoint is furthest from the anchor. Projecting
-            // the destination cursor's extent would carry the *small* end while
-            // shrinking, so the rows the cursor sweeps back across would flash instead of
-            // sliding; the client reveals/hides them per the interpolated cursor (see
-            // `sel_extends_down`). `sel_head` feeds that extent into `render_rows`.
-            let (sel_head, sel_extends_down) = if ed.mode.is_visual() {
+            // How the selection rides the band, by selection kind. `sel_head` feeds
+            // the extent into `render_rows`; `sel_extends_down` tells the client which
+            // side of the interpolated cursor to clip so it slides instead of snapping.
+            let (sel_head, sel_extends_down) = if ed.mode == Mode::HelixNormal {
+                // A Helix-normal selection is *collapsed* — a 1-wide block that moves
+                // with the cursor (both ends follow it), so there is no fixed anchor to
+                // sweep from. Rendered at the destination it would jump ahead of the
+                // sliding cursor. Clip it "past" the interpolated cursor (down when the
+                // scroll goes down, up otherwise) so the block stays hidden through the
+                // slide — the terminal cursor animates in its place — and reappears only
+                // on the settled frame, where the cursor has arrived.
+                (ed.cursor, Some(ps.to_cursor >= ps.from_cursor))
+            } else if ed.mode.is_visual() || ed.mode == Mode::HelixSelect {
+                // An extending selection (Visual, or Helix select mode): the anchor is
+                // fixed and the head sweeps. Carry the selection at the *maximal* extent
+                // the slide touches — anchor → whichever scroll endpoint is furthest —
+                // and let the client reveal/hide the moving edge per the interpolated
+                // cursor (`sel_extends_down`). Projecting the destination cursor's extent
+                // would carry the *small* end while shrinking, so the rows the cursor
+                // sweeps back across would flash instead of sliding.
                 let anchor_line = ed.visual_anchor().line;
                 let far_line =
                     if anchor_line.abs_diff(ps.from_cursor) >= anchor_line.abs_diff(ps.to_cursor) {
@@ -1551,10 +1564,16 @@ fn secondary_selection_spans(
     count: usize,
 ) -> Vec<Vec<(usize, usize)>> {
     let mut rows = vec![Vec::new(); count];
-    if !ed.mode.is_visual() || !ed.has_secondary_cursors() {
+    // Show secondaries whenever the primary selection shows — including while a
+    // search command line is open over a Helix / visual selection — so the whole
+    // multi-selection stays visible together (issue: a Helix `/` must not hide it).
+    let Some(visual_mode) = ed
+        .rendered_visual_mode()
+        .filter(|_| ed.has_secondary_cursors())
+    else {
         return rows;
-    }
-    let linewise = ed.mode == Mode::VisualLine;
+    };
+    let linewise = visual_mode == Mode::VisualLine;
     let ts = ed.tabstop();
     for (anchor, head) in ed.secondary_selections() {
         let (start, end) = order_selection(anchor, head);

@@ -311,6 +311,25 @@ impl Editor {
         }
     }
 
+    /// [`preview_highlights`](Self::preview_highlights) plus the 0-based lines a
+    /// full-line-background capture (`@markup.raw.block`) touches — the preview's
+    /// `line_bg` under-layer, so a fenced code block's background survives the
+    /// per-cell token merge (and the injected `>lua` syntax) instead of showing
+    /// only on the whitespace between tokens. Empty backgrounds with no engine /
+    /// grammar.
+    pub fn preview_highlights_bg(
+        &mut self,
+        language: &str,
+        text: &str,
+        first: usize,
+        last: usize,
+    ) -> (Vec<crate::syntax::Span>, Vec<usize>) {
+        match self.syntax.as_mut() {
+            Some(engine) => engine.highlight_text_bg(language, text, first, last),
+            None => (Vec::new(), Vec::new()),
+        }
+    }
+
     /// Tree-sitter foldable ranges for `buf` (`folds.scm` `@fold` captures),
     /// synced to the buffer's current content. Empty when there is no engine, no
     /// grammar, or no `folds.scm`. The fold source (`editor::fold`) turns these into

@@ -2865,6 +2865,18 @@ impl Renderer {
                     break;
                 }
                 let row = content_y0 + 1 + i as u16;
+                // The line-background layer (a fenced code block): tint the whole row
+                // under the text so its background survives the token spans, painted
+                // before the glyphs the same way a window's `line_bg` is. The loc match
+                // row's selection tint takes precedence over it.
+                if let Some(bg) = pv
+                    .line_bg
+                    .iter()
+                    .find(|(r, _)| *r as usize == i)
+                    .and_then(|(_, s)| style_bg(&Some(*s)))
+                {
+                    self.fill_cells(quads, px0, row, preview_w, bg);
+                }
                 if pv.loc.is_some_and(|(r, _)| r as usize == i) {
                     self.fill_cells(quads, px0, row, preview_w, sel_bg);
                 }

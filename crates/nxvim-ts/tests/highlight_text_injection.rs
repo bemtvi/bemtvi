@@ -47,3 +47,49 @@ fn highlight_text_paints_injected_language_in_a_fenced_block() {
         "highlight_text must inject rust and paint `fn` as keyword on line 1; got {spans:?}"
     );
 }
+
+/// The stateless twin of the open-buffer `line_background` regression: a fenced
+/// code block's `@markup.raw.block` background is a *line* layer, so
+/// `highlight_text_bg` must report every block line. Without it the injected tokens
+/// (foreground-only) overwrite the block background in the per-cell spans and the
+/// preview tint survives only on the whitespace between tokens — the reported bug.
+#[test]
+fn highlight_text_bg_reports_fenced_block_background_lines() {
+    let data = TempDir::new("highlight_text_bg");
+    install_rust_grammar(&data.0);
+    install_markdown_grammar(&data.0);
+    std::env::set_var("NXVIM_DATA_DIR", &data.0);
+
+    let mut engine = Engine::new(data.0.clone());
+    // Pin the block capture to `@markup.raw.block` (the group the engine treats as a
+    // line background), as the real nvim-treesitter install does.
+    engine
+        .set_query(
+            "markdown",
+            "highlights",
+            Some("((fenced_code_block) @markup.raw.block)".to_string()),
+        )
+        .expect("install the fenced-block background highlights query");
+
+    // Line 1 (`0..9`) is fully covered by rust tokens with no gap — the case that lost
+    // its tint entirely in the span-only rendering.
+    let text = "```rust\n0..9\nlet x = 1\n```\n";
+    let (spans, bg) = engine.highlight_text_bg("markdown", text, 0, 4);
+    let bg: std::collections::HashSet<usize> = bg.into_iter().collect();
+
+    // The injected rust paints foreground-only tokens over the content cells — proof
+    // those cells would lose the block background without a separate line layer.
+    assert!(
+        spans
+            .iter()
+            .any(|s| (s.line == 1 || s.line == 2) && s.group != "markup.raw.block"),
+        "the rust injection must paint tokens over the block content; got {spans:?}"
+    );
+    // Every line of the fenced block is reported as a background line.
+    for line in 0..=3 {
+        assert!(
+            bg.contains(&line),
+            "line {line} of the fenced block must be a background line; got {bg:?}"
+        );
+    }
+}

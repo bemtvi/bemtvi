@@ -2893,25 +2893,36 @@ fn render_preview(frame: &mut Frame, area: Rect, pv: &MenuPreview, palette: &[St
         }
         let is_loc = pv.loc.is_some_and(|(r, _)| r as usize == i);
         let hl = pv.highlights.get(i).unwrap_or(&empty);
-        lines.push(preview_line(text, hl, palette, is_loc, w));
+        // The row's line background (a fenced code block), painted under the text so
+        // its tint survives the token spans instead of showing only between them.
+        let bg = pv
+            .line_bg
+            .iter()
+            .find(|(r, _)| *r as usize == i)
+            .map(|(_, s)| rt(*s))
+            .unwrap_or_default();
+        lines.push(preview_line(text, hl, palette, is_loc, w, bg));
     }
     frame.render_widget(Paragraph::new(Text::from(lines)), area);
 }
 
 /// One preview line: each char coloured by the tree-sitter span covering it (char
 /// columns, no tab expansion — matching the server's char-based spans), padded to
-/// `width`. The `loc` match line is reverse-video over the syntax colours.
+/// `width`. `bg` is the row's line background (a code block) — the base every cell
+/// composes over, so an injected token's foreground paints on top of the block tint
+/// rather than replacing it. The `loc` match line is reverse-video over both.
 fn preview_line(
     text: &str,
     hl: &[HlSpan],
     palette: &[Style],
     loc: bool,
     width: usize,
+    bg: Style,
 ) -> Line<'static> {
     let base = if loc {
-        Style::default().add_modifier(Modifier::REVERSED)
+        bg.add_modifier(Modifier::REVERSED)
     } else {
-        Style::default()
+        bg
     };
     let mut spans: Vec<Span> = Vec::new();
     let mut run = String::new();
@@ -2924,12 +2935,18 @@ fn preview_line(
         let token = hl
             .iter()
             .find(|(s, e, _, _)| ci >= *s as usize && ci < *e as usize);
+        // Patch the token style onto the line background so a token that sets only a
+        // foreground keeps the block's background; a cell with no token is the bare
+        // background.
         let mut style = match token {
-            Some((_, _, group, id)) => match id {
-                Some(i) => palette.get(*i).copied().unwrap_or_default(),
-                None => group_style(group),
-            },
-            None => Style::default(),
+            Some((_, _, group, id)) => {
+                let tok = match id {
+                    Some(i) => palette.get(*i).copied().unwrap_or_default(),
+                    None => group_style(group),
+                };
+                bg.patch(tok)
+            }
+            None => bg,
         };
         if loc {
             style = style.add_modifier(Modifier::REVERSED);

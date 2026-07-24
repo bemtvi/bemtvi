@@ -2109,7 +2109,7 @@ impl EditHost {
             .max(1);
         let pane_h = box_h.max(1);
 
-        let (lines, first_line, loc, title, highlights, filetype) = match &m.preview {
+        let (lines, first_line, loc, title, highlights, filetype, line_bg) = match &m.preview {
             Some(target) => {
                 self.ensure_preview(&target.path);
                 let len = self.preview_cache.lines.len();
@@ -2209,6 +2209,30 @@ impl EditHost {
                     _ => None,
                 };
                 let filetype = cache.lang.clone();
+                // The line-background layer: each visible row whose file line carries a
+                // full-line-background capture (`@markup.raw.block` — a fenced code
+                // block) as `[row, style_id]`, the group resolved into this frame's
+                // palette. The client paints it under the text so the block background
+                // survives the token spans instead of showing only between them.
+                // Resolved once (one group for every row); empty when the colorscheme
+                // leaves `@markup.raw.block` undefined.
+                let line_bg = match self.editor.highlights.resolve("@markup.raw.block") {
+                    Some(style) => {
+                        let style_id = styles.intern(style) as u64;
+                        Value::Array(
+                            (start..end)
+                                .filter(|line| cache.block_bg_lines.contains(line))
+                                .map(|line| {
+                                    Value::Array(vec![
+                                        Value::from((line - start) as u64),
+                                        Value::from(style_id),
+                                    ])
+                                })
+                                .collect(),
+                        )
+                    }
+                    None => Value::Array(Vec::new()),
+                };
                 (
                     shown,
                     start + 1,
@@ -2216,6 +2240,7 @@ impl EditHost {
                     target.path.clone(),
                     highlights,
                     filetype,
+                    line_bg,
                 )
             }
             // The picker has a preview pane, but this row carries no target.
@@ -2228,6 +2253,7 @@ impl EditHost {
                     String::new(),
                     Value::Array(Vec::new()),
                     String::new(),
+                    Value::Array(Vec::new()),
                 )
             }
         };
@@ -2249,6 +2275,11 @@ impl EditHost {
             // The treesitter language the pane was highlighted as (empty ⇒ no grammar),
             // mirroring a window's `filetype`. Lets a help `doc/*.txt` report `vimdoc`.
             (Value::from("filetype"), Value::from(filetype.as_str())),
+            // The line-background layer: `[row, style_id]` per visible row backing a
+            // fenced code block (`@markup.raw.block`), painted under the text so its
+            // background isn't overwritten by the (injected) token spans. Empty when
+            // the colorscheme leaves the group undefined.
+            (Value::from("line_bg"), line_bg),
         ]))
     }
 
@@ -2330,22 +2361,29 @@ impl EditHost {
         } else {
             None
         };
-        let highlights = lang.map_or_else(HashMap::new, |lang| {
-            // Trailing newline to match the engine's buffer invariant (it treats
-            // the last line as a phantom: `len_lines - 1`); without it a
-            // single-line file parses to zero lines and drops every span.
-            let text = lines.join("\n") + "\n";
-            let mut by_line: HashMap<usize, Vec<nxvim_core::Span>> = HashMap::new();
-            for span in self.editor.preview_highlights(lang, &text, 0, lines.len()) {
-                by_line.entry(span.line).or_default().push(span);
-            }
-            by_line
-        });
+        let (highlights, block_bg_lines) = lang.map_or_else(
+            || (HashMap::new(), std::collections::HashSet::new()),
+            |lang| {
+                // Trailing newline to match the engine's buffer invariant (it treats
+                // the last line as a phantom: `len_lines - 1`); without it a
+                // single-line file parses to zero lines and drops every span.
+                let text = lines.join("\n") + "\n";
+                let (spans, bg) = self
+                    .editor
+                    .preview_highlights_bg(lang, &text, 0, lines.len());
+                let mut by_line: HashMap<usize, Vec<nxvim_core::Span>> = HashMap::new();
+                for span in spans {
+                    by_line.entry(span.line).or_default().push(span);
+                }
+                (by_line, bg.into_iter().collect())
+            },
+        );
         self.preview_cache = PreviewCache {
             path: Some(p.to_path_buf()),
             lines,
             ok,
             highlights,
+            block_bg_lines,
             lang: lang.unwrap_or_default().to_string(),
         };
     }
@@ -2399,6 +2437,12 @@ pub(crate) struct PreviewCache {
     /// file is parsed on a path miss). `project_preview` maps the windowed slice to
     /// char columns + per-frame style ids; an empty map ⇒ no grammar (plain preview).
     highlights: HashMap<usize, Vec<nxvim_core::Span>>,
+    /// 0-based file lines a full-line-background capture (`@markup.raw.block` — a
+    /// fenced code block) touches. Projected as the preview's `line_bg` layer so the
+    /// block background is painted *under* the text rather than left in the per-cell
+    /// spans, where the winner-takes-cell merge (and a `>lua` block's injected token
+    /// spans) would overwrite it on every non-blank cell.
+    block_bg_lines: std::collections::HashSet<usize>,
     /// The treesitter language the preview was highlighted as (`"rust"`, `"vimdoc"`,
     /// …), or empty when the path has no known grammar. Surfaced to clients as the
     /// preview's `filetype`, mirroring a window's — and the seam that lets a help

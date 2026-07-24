@@ -131,6 +131,24 @@ pub trait SyntaxEngine {
         Vec::new()
     }
 
+    /// Like [`highlight_text`](Self::highlight_text), but also returns the 0-based
+    /// lines a **full-line-background** capture (`@markup.raw.block` — a fenced code
+    /// block) touches. A preview surface paints those as a separate line-background
+    /// layer *under* the text, so the winner-takes-cell token spans (a `>lua`
+    /// block's injected syntax among them) don't overwrite the block background on
+    /// every non-blank cell — the "background only on the whitespace" artifact. The
+    /// default reuses `highlight_text` and reports no backgrounds (an engine with no
+    /// tree-sitter block backgrounds, e.g. the wasm JS-side highlighter).
+    fn highlight_text_bg(
+        &mut self,
+        language: &str,
+        text: &str,
+        first: usize,
+        last: usize,
+    ) -> (Vec<Span>, Vec<usize>) {
+        (self.highlight_text(language, text, first, last), Vec::new())
+    }
+
     /// Target indent **width in columns** for `line`, or `None` when there is no
     /// grammar / no `indents.scm` / the query is inconclusive — in which case the
     /// caller falls back (copy-previous-line autoindent, then column 0).

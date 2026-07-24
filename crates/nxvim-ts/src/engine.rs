@@ -781,10 +781,9 @@ impl Engine {
 
     /// Highlight an off-buffer snippet (`text` in `lang`) over `[first_line,
     /// last_line)` — a **stateless** full parse with no `BufferId`, no incremental
-    /// reuse, and no injection layers (the host grammar only). For the picker
-    /// preview pane, which paints a file that is not an open buffer. Returns the
-    /// host highlight spans in `text` coordinates, or empty when no grammar is
-    /// installed for `lang` or the parse is cancelled / fails.
+    /// reuse. For the picker preview pane, which paints a file that is not an open
+    /// buffer. Returns the host + injected highlight spans in `text` coordinates,
+    /// or empty when no grammar is installed for `lang` or the parse is cancelled.
     pub fn highlight_text(
         &mut self,
         lang: &str,
@@ -792,13 +791,31 @@ impl Engine {
         first_line: usize,
         last_line: usize,
     ) -> Vec<Span> {
+        self.highlight_text_bg(lang, text, first_line, last_line).0
+    }
+
+    /// [`highlight_text`](Self::highlight_text) plus the 0-based lines a
+    /// full-line-background capture (`@markup.raw.block` — a fenced code block)
+    /// touches. The block background must be painted as a separate under-layer, not
+    /// left in the per-cell spans: the winner-takes-cell merge (and, in a `>lua`
+    /// block, the injected token spans) would otherwise overwrite it on every
+    /// non-blank cell, leaving the background only on the whitespace between tokens.
+    /// The caller (the preview projection) tints those lines the way a window's
+    /// `line_hl_group` does. Empty background list when no grammar / no block.
+    pub fn highlight_text_bg(
+        &mut self,
+        lang: &str,
+        text: &str,
+        first_line: usize,
+        last_line: usize,
+    ) -> (Vec<Span>, Vec<usize>) {
         let language = match self.grammar(lang) {
             Slot::Loaded(g) => g.language.clone(),
-            _ => return Vec::new(), // silent: no grammar (or load failed)
+            _ => return (Vec::new(), Vec::new()), // silent: no grammar (or load failed)
         };
         let mut parser = Parser::new();
         if parser.set_language(&language).is_err() {
-            return Vec::new();
+            return (Vec::new(), Vec::new());
         }
         let shadow = Rope::from_str(text);
         // Parse under the same wall-clock deadline as `reparse`, so a pathologically
@@ -808,7 +825,7 @@ impl Engine {
         let options = ParseOptions::new().progress_callback(&mut budget);
         let mut callback = |byte: usize, _: Point| -> &[u8] { read_chunk(&shadow, byte) };
         let Some(tree) = parser.parse_with_options(&mut callback, None, Some(options)) else {
-            return Vec::new();
+            return (Vec::new(), Vec::new());
         };
 
         // Build the layer trees, host first, then injected children — a **stateless**
@@ -921,9 +938,11 @@ impl Engine {
                 _ => None,
             })
             .collect();
-        // The off-buffer preview needs only the spans; its surface has no `line_bg`
-        // layer, so the block-background lines are discarded.
-        extract_spans(&layers, &shadow, first_line, last_line).0
+        // Return the spans plus the full-line-background lines (`@markup.raw.block`)
+        // so the preview can paint them under the text as its own `line_bg` layer —
+        // otherwise the token spans (a `>lua` block's injected lua) overwrite the
+        // block background on every non-blank cell.
+        extract_spans(&layers, &shadow, first_line, last_line)
     }
 
     /// Target indent **width in columns** for the 0-indexed `line`, by running the
@@ -1326,6 +1345,16 @@ impl SyntaxEngine for Engine {
 
     fn highlight_text(&mut self, lang: &str, text: &str, first: usize, last: usize) -> Vec<Span> {
         Engine::highlight_text(self, lang, text, first, last)
+    }
+
+    fn highlight_text_bg(
+        &mut self,
+        lang: &str,
+        text: &str,
+        first: usize,
+        last: usize,
+    ) -> (Vec<Span>, Vec<usize>) {
+        Engine::highlight_text_bg(self, lang, text, first, last)
     }
 
     fn indent(&mut self, buffer: BufferId, line: usize, p: &IndentParams) -> Option<usize> {

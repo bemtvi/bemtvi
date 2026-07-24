@@ -744,6 +744,12 @@ pub struct MenuPreview {
     /// client reuses its span renderer. Empty inner vecs for unhighlighted lines
     /// (and for a preview the server couldn't highlight, e.g. an unknown filetype).
     pub highlights: Vec<Vec<HlSpan>>,
+    /// The line-background layer — `(row, Style)` for each windowed row backing a
+    /// fenced code block (`@markup.raw.block`). Painted under the text (like a
+    /// window's [`WindowView::line_bg`]) so the block background survives the token
+    /// spans instead of showing only on the whitespace between them. Empty when the
+    /// colorscheme leaves the group undefined.
+    pub line_bg: Vec<(u16, Style)>,
 }
 
 /// One tabline cell mirrored from the server's redraw: the buffer label, its
@@ -936,6 +942,7 @@ impl View {
                         width: map_u16(p, "width"),
                         loc: parse_pair(map_get(p, "loc")),
                         highlights: parse_highlights(map_get(p, "highlights")),
+                        line_bg: parse_line_bg(map_get(p, "line_bg"), &self.styles),
                     }),
                     _ => None,
                 },
